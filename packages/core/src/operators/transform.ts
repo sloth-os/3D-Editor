@@ -272,12 +272,17 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
         value: z.number().default(0),
         orient_axis: axisEnum.default('Z'),
         orient_type: orientEnum,
+        axis: vec3.optional().describe('Arbitrary world-space rotation axis (overrides orient_axis)'),
         center: vec3.optional().describe('Optional world-space pivot override'),
       }),
       poll: pollTransform,
       execute(ctx, p) {
         const base: Vec3 = p.orient_axis === 'X' ? [1, 0, 0] : p.orient_axis === 'Y' ? [0, 1, 0] : [0, 0, 1];
-        const axis = p.orient_type === 'LOCAL' ? normalize3(transformDirection3(orientAxes(ctx, 'LOCAL'), base)) : base;
+        let axis = p.orient_type === 'LOCAL' ? normalize3(transformDirection3(orientAxes(ctx, 'LOCAL'), base)) : base;
+        if (p.axis) {
+          axis = normalize3(p.axis as Vec3);
+          if (axis[0] === 0 && axis[1] === 0 && axis[2] === 0) throw new OperatorError('Rotation axis must not be zero', 'INVALID_PARAMS');
+        }
         transformSelection(ctx, axisAngle4(axis, p.value), p.center as Vec3 | undefined);
       },
     }),

@@ -24,7 +24,10 @@ export interface OperatorDef<S extends z.ZodType = z.ZodType> {
    */
   poll?: (ctx: OperatorContext) => true | string;
   execute(ctx: OperatorContext, params: z.infer<S>): unknown;
-  /** Whether the operator modifies the document and should create an undo step (default true). */
+  /**
+   * Whether the operator modifies the document and should create an undo step (default true).
+   * Operators with `undo: false` must not modify the document; they run outside a transaction.
+   */
   undo?: boolean;
   /** Whether the "Adjust Last Operation" panel can re-run it with different params. */
   redoable?: boolean;
@@ -162,9 +165,15 @@ export class OperatorRegistry {
       const p = this.poll(ctx, id);
       if (p !== true) throw new OperatorError(p, 'POLL_FAILED');
       let result: unknown;
-      ctx.doc.transact(() => {
+      if (def!.undo === false) {
+        // Non-undoable operators (selection, view, undo/redo itself) run outside a transaction so
+        // they can drive the undo manager or read the document without creating undo steps.
         result = def!.execute(wrapped, parsed);
-      }, ctx.origin);
+      } else {
+        ctx.doc.transact(() => {
+          result = def!.execute(wrapped, parsed);
+        }, ctx.origin);
+      }
       return finish(true, result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
