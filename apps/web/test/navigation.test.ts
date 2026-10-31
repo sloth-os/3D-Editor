@@ -8,11 +8,11 @@ describe('viewport navigation', () => {
     p.target.set(0, 0, 0);
     p.distance = 10;
     Object.assign(p, axisViewAngles('FRONT'));
-    expect(posePosition(p).toArray().map((v) => Math.round(v))).toEqual([0, -10, 0]);
+    expect(posePosition(p).toArray().map((v) => Math.round(v) + 0)).toEqual([0, -10, 0]);
     Object.assign(p, axisViewAngles('RIGHT'));
-    expect(posePosition(p).toArray().map((v) => Math.round(v))).toEqual([10, 0, 0]);
+    expect(posePosition(p).toArray().map((v) => Math.round(v) + 0)).toEqual([10, 0, 0]);
     Object.assign(p, axisViewAngles('TOP'));
-    expect(posePosition(p).toArray().map((v) => Math.round(v))).toEqual([0, 0, 10]);
+    expect(posePosition(p).toArray().map((v) => Math.round(v) + 0)).toEqual([0, 0, 10]);
     // basis stays orthonormal at the pole
     const b = poseBasis(p);
     expect(Math.abs(b.right.dot(b.up))).toBeLessThan(1e-9);
