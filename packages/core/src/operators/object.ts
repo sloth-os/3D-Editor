@@ -26,6 +26,8 @@ import {
   vec3,
 } from './helpers';
 import { transformRoots } from './transform';
+import { ARMATURE_PARENT_TYPES, armatureParentSet, clearBoneParent } from './armature';
+import { convertCurveObject } from './curve';
 
 const placement = {
   location: vec3.optional().describe('World location (defaults to the 3D cursor)'),
@@ -779,9 +781,20 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.parent_set',
       label: 'Set Parent',
-      description: 'Parent the selected objects to the active object (keeping their world transform).',
+      description:
+        'Parent the selected objects to the active object (keeping their world transform). type OBJECT (default), ' +
+        'or with an armature as the active object: ARMATURE (adds an Armature modifier), ARMATURE_NAME (+ empty ' +
+        'vertex groups for the deform bones), ARMATURE_ENVELOPE (+ weights from bone envelopes), ARMATURE_AUTO ' +
+        '(+ automatic weights) or BONE (the child rigidly follows `bone`).',
       category: 'Object',
-      schema: z.object({ keep_transform: z.boolean().default(true) }),
+      schema: z.object({
+        type: z
+          .enum(['OBJECT', ...ARMATURE_PARENT_TYPES])
+          .default('OBJECT')
+          .describe('Parent type'),
+        keep_transform: z.boolean().default(true).describe('Keep the world transform of the children'),
+        bone: z.string().default('').describe('BONE: name of the parent bone (default: the only bone)'),
+      }),
       poll: (ctx) => {
         if (pollObjectMode(ctx) !== true) return pollObjectMode(ctx);
         return ctx.state.activeId && selectedObjects(ctx).length > 1
@@ -790,9 +803,18 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       },
       execute(ctx, p) {
         const parent = ctx.state.activeId!;
+        if (p.type !== 'OBJECT')
+          return armatureParentSet(
+            ctx,
+            selectedObjects(ctx).map((o) => o.id),
+            parent,
+            p.type,
+            p,
+          );
         for (const o of selectedObjects(ctx)) {
           if (o.id === parent) continue;
           if (ctx.doc.isAncestor(o.id, parent)) throw new OperatorError('Loop in parents', 'FAILED');
+          if (o.parent_type === 'BONE') clearBoneParent(ctx, o.id, p.keep_transform);
           ctx.doc.setParent(o.id, parent, p.keep_transform);
         }
       },
@@ -802,18 +824,36 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.parent_to',
       label: 'Parent To',
-      description: 'Set (or clear with parent=null) the parent of objects by id/name.',
+      description:
+        'Set (or clear with parent=null) the parent of objects by id/name. type as in object.parent_set ' +
+        '(ARMATURE_AUTO binds meshes to an armature with automatic weights, BONE follows `bone`).',
       category: 'Object',
       schema: z.object({
-        objects: z.array(z.string()).optional(),
-        parent: z.string().nullable(),
-        keep_transform: z.boolean().default(true),
+        objects: z
+          .array(z.string())
+          .optional()
+          .describe('Child object ids or names (default: the selection)'),
+        parent: z.string().nullable().describe('Parent object id or name (null clears the parent)'),
+        keep_transform: z.boolean().default(true).describe('Keep the world transform of the children'),
+        type: z
+          .enum(['OBJECT', ...ARMATURE_PARENT_TYPES])
+          .default('OBJECT')
+          .describe('Parent type'),
+        bone: z.string().default('').describe('BONE: name of the parent bone (default: the only bone)'),
       }),
       execute(ctx, p) {
         const ids = resolveObjectIds(ctx, p.objects);
         const parent = p.parent ? ctx.doc.resolveObject(p.parent)?.id : null;
         if (p.parent && !parent) throw new OperatorError(`Parent '${p.parent}' not found`, 'NOT_FOUND');
-        for (const id of ids) if (id !== parent) ctx.doc.setParent(id, parent ?? null, p.keep_transform);
+        if (p.type !== 'OBJECT') {
+          if (!parent) throw new OperatorError(`Parent type ${p.type} needs a parent`, 'INVALID_PARAMS');
+          return armatureParentSet(ctx, ids, parent, p.type, p);
+        }
+        for (const id of ids) {
+          if (id === parent) continue;
+          if (ctx.doc.getObject(id)?.parent_type === 'BONE') clearBoneParent(ctx, id, p.keep_transform);
+          ctx.doc.setParent(id, parent ?? null, p.keep_transform);
+        }
       },
     }),
   );
@@ -826,8 +866,10 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       schema: z.object({ type: z.enum(['CLEAR', 'CLEAR_KEEP_TRANSFORM']).default('CLEAR_KEEP_TRANSFORM') }),
       poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
       execute(ctx, p) {
-        for (const o of selectedObjects(ctx))
-          if (o.parent) ctx.doc.setParent(o.id, null, p.type === 'CLEAR_KEEP_TRANSFORM');
+        for (const o of selectedObjects(ctx)) {
+          if (o.parent_type === 'BONE') clearBoneParent(ctx, o.id, p.type === 'CLEAR_KEEP_TRANSFORM');
+          else if (o.parent) ctx.doc.setParent(o.id, null, p.type === 'CLEAR_KEEP_TRANSFORM');
+        }
       },
     }),
   );
@@ -883,20 +925,39 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.convert',
       label: 'Convert to Mesh',
-      description: 'Apply all modifiers of the selected mesh objects (bake the evaluated mesh).',
+      description:
+        'Convert the selected objects. MESH: bake the evaluated geometry — applies the modifiers of mesh objects; ' +
+        'curve and text objects become meshes (surface, or loose edges for plain wires) keeping name, transform and ' +
+        'materials. CURVE: turns text objects into 2D curve objects of their glyph outlines. ' +
+        'Returns {converted: [{object, name, type}]}.',
       category: 'Object',
-      schema: z.object({ target: z.enum(['MESH']).default('MESH') }),
+      schema: z.object({
+        target: z.enum(['MESH', 'CURVE']).default('MESH').describe('Object type to convert to'),
+        keep_original: z
+          .boolean()
+          .default(false)
+          .describe('Curves/text: keep the original object and add the converted copy (selected afterwards)'),
+      }),
       poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
-      execute(ctx) {
+      execute(ctx, p) {
         const ev = new SceneEvaluator(ctx.doc).evaluate(ctx.state.frame);
+        const converted: { object: string; name: string; type: string }[] = [];
         for (const o of selectedObjects(ctx)) {
-          if (o.type !== 'MESH' || !o.data || o.modifiers.length === 0) continue;
+          if (o.type === 'CURVE' || o.type === 'FONT') {
+            const r = convertCurveObject(ctx, o, p.target, ev, p.keep_original);
+            if (r) converted.push(r);
+            continue;
+          }
+          if (p.target !== 'MESH' || o.type !== 'MESH' || !o.data || o.modifiers.length === 0) continue;
           const mesh = ev.byId.get(o.id)?.mesh;
           if (!mesh) continue;
           const meshId = singleUserMesh(ctx, o);
           ctx.doc.setMesh(meshId, cloneMesh(mesh));
           ctx.doc.updateObject(o.id, { modifiers: [] });
         }
+        const convertedIds = converted.map((c) => c.object);
+        if (p.keep_original && convertedIds.length) setSelection(ctx, convertedIds);
+        return { converted };
       },
     }),
   );

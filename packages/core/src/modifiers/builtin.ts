@@ -17,6 +17,8 @@ import { screwModifier } from './screw';
 import { buildModifier, edgeSplitModifier } from './edge-split';
 import { shrinkwrapModifier } from './shrinkwrap';
 import { bevelModifier } from './bevel';
+import { armatureModifier } from './armature';
+import { curveModifier } from './curve';
 
 /** All built-in modifier types, in "Add Modifier" menu order. */
 const BUILTIN: ModifierDef<any>[] = [
@@ -35,7 +37,9 @@ const BUILTIN: ModifierDef<any>[] = [
   weldModifier,
   wireframeModifier,
   // Deform
+  armatureModifier,
   castModifier,
+  curveModifier,
   displaceModifier,
   shrinkwrapModifier,
   simpleDeformModifier,
@@ -55,9 +59,11 @@ const DEFAULT_NAMES: Record<string, string> = {
 
 /** Parameters that reference other objects (stored as object ids), per modifier type. */
 const OBJECT_PARAMS: Record<string, string[]> = {
+  ARMATURE: ['object'],
   ARRAY: ['offset_object', 'start_cap', 'end_cap'],
   BOOLEAN: ['object'],
   CAST: ['object'],
+  CURVE: ['object'],
   MIRROR: ['mirror_object'],
   SCREW: ['object'],
   SHRINKWRAP: ['target'],

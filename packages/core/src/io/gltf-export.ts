@@ -28,6 +28,10 @@ import {
 } from './gltf-types';
 import { sniffImageMime } from './image-info';
 import type { ExportOptions, ExportResult } from './types';
+import { bakeMaterialTextures, proceduralBakeNeedsGeometry } from './bake-procedural';
+import { hasProceduralTextures } from '../material/surface';
+import { meshBounds } from '../mesh/types';
+import { encodePNG, type PNGImage } from '../render/png';
 
 /*
  * glTF 2.0 export (.glb binary container or .gltf with an embedded base64 buffer).
@@ -42,6 +46,9 @@ import type { ExportOptions, ExportResult } from './types';
  *   spot cone angles from spot_size/spot_blend; area lights become point lights (with a warning).
  * - Animation: object location/rotation/scale curves are sampled once per frame over the scene
  *   frame range at the scene fps (LINEAR; rotations as normalized, sign-continuous quaternions).
+ * - Procedural texture slots are baked to PNG images in UV space (bake-procedural.ts); materials
+ *   whose bake depends on the geometry (GENERATED/OBJECT mapping, bump) get one glTF material per
+ *   mesh.
  */
 
 const ANIM_PATHS = ['location', 'rotation_euler', 'scale'] as const;
@@ -216,8 +223,19 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     textureOf.set(imageId, index);
     return index;
   };
+  /** Embeds a baked RGBA8 image as a PNG texture; returns the texture index. */
+  const pngTexture = (img: PNGImage, name: string): number => {
+    if (!json.samplers)
+      json.samplers = [
+        { magFilter: GL.LINEAR, minFilter: GL.LINEAR_MIPMAP_LINEAR, wrapS: GL.REPEAT, wrapT: GL.REPEAT },
+      ];
+    images.push({ name, mimeType: 'image/png', bufferView: w.bufferView(encodePNG(img)) });
+    textures.push({ sampler: 0, source: images.length - 1 });
+    return textures.length - 1;
+  };
   const textureInfo = (slot: TextureSlot | null | undefined): GltfTextureInfo | undefined => {
-    if (!slot || !slot.image) return undefined;
+    // procedural slots are baked separately (see materialIndex)
+    if (!slot || !slot.image || slot.procedural) return undefined;
     const index = textureIndex(slot.image);
     if (index < 0) return undefined;
     const info: GltfTextureInfo = { index };
@@ -235,9 +253,20 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
 
   const materials: GltfMaterial[] = [];
   const materialOf = new Map<string, number>();
-  const materialIndex = (m: MaterialData): number => {
-    const cached = materialOf.get(m.id);
+  const meshTokens = new Map<MeshData, number>();
+  const materialIndex = (m: MaterialData, it: ExportItem): number => {
+    // procedural bakes that depend on the geometry are made per mesh
+    const perMesh = !!it.mesh && proceduralBakeNeedsGeometry(m);
+    let token = perMesh ? meshTokens.get(it.mesh!) : undefined;
+    if (perMesh && token === undefined) meshTokens.set(it.mesh!, (token = meshTokens.size));
+    const key = perMesh ? `${m.id}|${token}` : m.id;
+    const cached = materialOf.get(key);
     if (cached !== undefined) return cached;
+    const tex = it.ev.baseMesh ? meshBounds(it.ev.baseMesh) : null;
+    const baked = hasProceduralTextures(m)
+      ? bakeMaterialTextures(m, it.mesh ? { mesh: it.mesh, texMin: tex?.min, texMax: tex?.max } : null)
+      : null;
+    if (baked) warnings.push(...baked.warnings);
     const out: GltfMaterial = { name: m.name };
     const pbr: NonNullable<GltfMaterial['pbrMetallicRoughness']> = {};
     const bc = [
@@ -252,6 +281,12 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     const t = m.textures ?? {};
     const base = textureInfo(t.base_color);
     if (base) pbr.baseColorTexture = base;
+    if (baked?.baseColor) {
+      pbr.baseColorTexture = { index: pngTexture(baked.baseColor, `${m.name} base color`) };
+      const f = (baked.baseColorFactor ?? [1, 1, 1, 1]).map(clamp01);
+      if (isDefault(f, [1, 1, 1, 1])) delete pbr.baseColorFactor;
+      else pbr.baseColorFactor = f;
+    }
     const mr = t.roughness ?? t.metallic;
     if (t.roughness && t.metallic && t.roughness.image !== t.metallic.image)
       warnings.push(
@@ -259,16 +294,30 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       );
     const mrInfo = textureInfo(mr);
     if (mrInfo) pbr.metallicRoughnessTexture = mrInfo;
+    if (baked?.metallicRoughness) {
+      // absolute values in the texture (G = roughness, B = metallic), factors 1
+      pbr.metallicRoughnessTexture = {
+        index: pngTexture(baked.metallicRoughness, `${m.name} metallic roughness`),
+      };
+      delete pbr.metallicFactor;
+      delete pbr.roughnessFactor;
+    }
     out.pbrMetallicRoughness = pbr;
     const normal = textureInfo(t.normal);
     if (normal) {
       if (m.normal_strength !== 1) normal.scale = m.normal_strength;
       out.normalTexture = normal;
     }
+    if (baked?.normal) out.normalTexture = { index: pngTexture(baked.normal, `${m.name} normal`) };
     // emission: factor in [0, 1], anything brighter goes to KHR_materials_emissive_strength
     // an emission texture replaces the emission color (like a texture plugged into Emission Color)
     const es = Math.max(0, m.emission_strength);
-    const emissiveTex = es > 0 ? textureInfo(t.emission) : undefined;
+    const emissiveTex =
+      es > 0
+        ? baked?.emissive
+          ? { index: pngTexture(baked.emissive, `${m.name} emission`) }
+          : textureInfo(t.emission)
+        : undefined;
     const ec: Vec3 = emissiveTex
       ? [1, 1, 1]
       : [m.emission_color[0], m.emission_color[1], m.emission_color[2]];
@@ -321,7 +370,7 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       w.extensionsUsed.add('KHR_materials_clearcoat');
     }
     materials.push(out);
-    materialOf.set(m.id, materials.length - 1);
+    materialOf.set(key, materials.length - 1);
     return materials.length - 1;
   };
 
@@ -367,7 +416,7 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
           indices: w.indices(rb.indices.subarray(g.start, g.start + g.count), nv),
         };
         const mat = it.materials[g.materialIndex];
-        if (mat) prim.material = materialIndex(mat);
+        if (mat) prim.material = materialIndex(mat, it);
         primitives.push(prim);
       }
     }

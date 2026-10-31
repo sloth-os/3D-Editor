@@ -8,6 +8,7 @@ import { evaluateDriver } from '../anim/drivers';
 import { computePose } from '../armature/pose';
 import type { ArmaturePose } from '../armature/types';
 import { solveConstraints } from '../constraints/solve';
+import { constraintObjectInfo } from '../constraints/context';
 import type { ConstraintError } from '../constraints/types';
 import { buildCurvePath, type CurvePath } from '../curve/path';
 
@@ -212,6 +213,9 @@ export class FrameState {
           getWorldMatrix: (t) => this.world(t),
           getBoneMatrix: (a, b) => this.boneMatrix(a, b),
           getCurvePath: (c) => this.curvePath(c),
+          ownerId: id,
+          getObjectInfo: (t) => constraintObjectInfo(this, t),
+          getArmaturePose: (a) => this.pose(a),
         });
         m = res.matrix;
         if (res.errors.length) this.constraintErrors.set(id, res.errors);

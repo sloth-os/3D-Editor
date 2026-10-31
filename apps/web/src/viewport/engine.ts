@@ -16,6 +16,7 @@ import {
 } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
 import { SceneObjects } from './scene-objects';
+import { ViewportSky } from './sky';
 import { EditOverlay } from './edit-overlay';
 import { createGrid, updateGrid } from './grid';
 import {
@@ -96,6 +97,8 @@ export class ViewportEngine {
   private ambient = new THREE.AmbientLight(0xffffff, 0);
   private envTexture: THREE.Texture | null = null;
   private pmrem: THREE.PMREMGenerator;
+  /** World sky (environment SKY) and mist. */
+  private sky: ViewportSky;
   private dirty = true;
   private needsSync = true;
   private raf = 0;
@@ -119,6 +122,7 @@ export class ViewportEngine {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.sky = new ViewportSky(this.pmrem);
     this.objects = new SceneObjects(this.scene, this.overlay, () => this.requestRender());
     this.scene.add(this.ambient);
     this.overlay.add(this.grid, this.edit.group, this.peerBoxes);
@@ -431,6 +435,9 @@ export class ViewportEngine {
       this.scene.background = VIEWPORT_BG;
       this.ambient.intensity = 0;
     }
+    this.scene.backgroundIntensity = 1;
+    // procedural sky (Rendered) and mist (Material Preview / Rendered) override the above
+    this.sky.apply(this.scene, ev, shading, r.shadowMap.enabled);
   }
 
   // ------------------------------------------------------------------ cameras & render
@@ -781,6 +788,7 @@ export class ViewportEngine {
     this.objects.dispose();
     this.edit.dispose();
     this.composer.dispose();
+    this.sky.dispose();
     this.pmrem.dispose();
     this.envTexture?.dispose();
     this.renderer.dispose();

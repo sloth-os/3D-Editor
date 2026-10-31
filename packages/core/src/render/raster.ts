@@ -1,8 +1,11 @@
-import type { Mat4 } from '../math/types';
-import { normalMatrix4 } from '../math/mat4';
+import type { Mat4, Vec3 } from '../math/types';
+import { invert4, normalMatrix4 } from '../math/mat4';
 import type { MeshData } from '../mesh/types';
 import { meshBounds } from '../mesh/types';
 import { buildRenderBuffers, type RenderBuffers } from '../mesh/render-buffers';
+import { sampleCompiled, type CompiledProcedural } from '../material/procedural';
+import { bumpNormal, compiledCoord, type ProceduralSurface } from '../material/surface';
+import { evalSkyIrradiance, sampleSkyModel, type SkyModel } from './sky';
 import type { RenderView } from './view';
 
 /*
@@ -39,6 +42,20 @@ export interface SurfaceMaterial {
   tex: SampledTexture | null;
   texScale: [number, number];
   texOffset: [number, number];
+  /**
+   * Procedural texture channels (MATERIAL shading, see material/surface.ts). With a procedural
+   * alpha channel `alpha` must exclude the material alpha (the texture replaces it).
+   */
+  procedural?: ProceduralSurface | null;
+  /** Emission strength (multiplies a procedural emission colour). */
+  emissionStrength?: number;
+}
+
+/** Procedural sky lighting: diffuse irradiance SH (E/π) and the sky for reflections, × scale. */
+export interface SkyLighting {
+  sh: Float64Array;
+  model: SkyModel;
+  scale: number;
 }
 
 export interface SampledTexture {
@@ -81,6 +98,43 @@ export class Rasterizer {
   /** Wireframe overlay: half line width in samples and color/opacity. */
   wireHalfWidth = 0;
   wireColor: [number, number, number, number] = [0, 0, 0, 0.6];
+  /** Procedural sky lighting (environment SKY); replaces the uniform `ambient` when set. */
+  sky: SkyLighting | null = null;
+  /** World mist (MATERIAL shading): 1 − exp(−(density·depth)²) towards `mistColor`; 0 disables. */
+  mistDensity = 0;
+  mistColor: [number, number, number] = [0, 0, 0];
+  /** Current object: world → object matrix and GENERATED texture space (procedural textures). */
+  private invWorld: Mat4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+  private texMin: Vec3 = [0, 0, 0];
+  private texSize: Vec3 = [1, 1, 1];
+  /** Per-pixel material with procedural overrides (only the fields shadeMaterial reads). */
+  private readonly pm: SurfaceMaterial = {
+    r: 0,
+    g: 0,
+    b: 0,
+    alpha: 1,
+    metallic: 0,
+    roughness: 0.5,
+    er: 0,
+    eg: 0,
+    eb: 0,
+    blend: 0,
+    threshold: 0.5,
+    cull: false,
+    vertexColors: false,
+    tex: null,
+    texScale: [1, 1],
+    texOffset: [0, 0],
+  };
+  private readonly pxv = new Float64Array(4);
+  private readonly pc: Vec3 = [0, 0, 0];
+  private readonly pcx: Vec3 = [0, 0, 0];
+  private readonly pcy: Vec3 = [0, 0, 0];
+  private readonly ppx: Vec3 = [0, 0, 0];
+  private readonly ppy: Vec3 = [0, 0, 0];
+  private readonly pn: Vec3 = [0, 0, 0];
+  private readonly skyTmp = new Float64Array(3);
+  private readonly skyTmp2 = new Float64Array(3);
   private readonly scr = new Float64Array(VS * 16);
   private clipA = new Float64Array(VS * 16);
   private clipB = new Float64Array(VS * 16);
@@ -124,9 +178,26 @@ export class Rasterizer {
     ]);
   }
 
-  /** Draws a mesh object. `materials` is indexed by material slot; `fallback` is used for empty slots. */
-  drawMesh(mesh: MeshData, world: Mat4, materials: SurfaceMaterial[], fallback: SurfaceMaterial): void {
+  /**
+   * Draws a mesh object. `materials` is indexed by material slot; `fallback` is used for empty slots.
+   * `texSpace` is the GENERATED texture space of procedural textures (default: the mesh bounds).
+   */
+  drawMesh(
+    mesh: MeshData,
+    world: Mat4,
+    materials: SurfaceMaterial[],
+    fallback: SurfaceMaterial,
+    texSpace?: { min: Readonly<Vec3>; max: Readonly<Vec3> } | null,
+  ): void {
     if (!mesh.faces.length || this.offscreen(mesh, world)) return;
+    if (materials.some((m) => m?.procedural)) {
+      this.invWorld = invert4(world);
+      const ts = texSpace ?? meshBounds(mesh) ?? { min: [0, 0, 0], max: [1, 1, 1] };
+      for (let k = 0; k < 3; k++) {
+        this.texMin[k] = ts.min[k];
+        this.texSize[k] = ts.max[k] - ts.min[k];
+      }
+    }
     const rb = buildRenderBuffers(mesh);
     const nv = rb.positions.length / 3;
     const tris = rb.indices.length / 3;
@@ -421,6 +492,11 @@ export class Rasterizer {
     const zMin = this.zMin;
     const blend = mat.blend;
     const tex = this.mode === SHADE_MATERIAL ? mat.tex : null;
+    const proc = this.mode === SHADE_MATERIAL ? (mat.procedural ?? null) : null;
+    // barycentric increments per pixel row (neighbour pixels for the procedural bump)
+    const b0 = (x2 - x1) * inv;
+    const b1 = (x0 - x2) * inv;
+    const b2 = (x1 - x0) * inv;
     const depth = this.depth;
     const color = this.color;
     const cov = this.cov;
@@ -465,6 +541,47 @@ export class Rasterizer {
           cb *= this.texB;
           ca *= this.texA;
         }
+        // procedural channels override the material values per sample
+        let sm = mat;
+        let br = mat.r;
+        let bg = mat.g;
+        let bb = mat.b;
+        if (proc) {
+          const pm = this.pm;
+          const pv = this.pxv;
+          pm.metallic = mat.metallic;
+          pm.roughness = mat.roughness;
+          pm.er = mat.er;
+          pm.eg = mat.eg;
+          pm.eb = mat.eb;
+          if (proc.base_color) {
+            this.sampleChannel(proc.base_color, l0, l1, l2, oa, ob, oc, pv);
+            br = pv[0] > 0 ? pv[0] : 0;
+            bg = pv[1] > 0 ? pv[1] : 0;
+            bb = pv[2] > 0 ? pv[2] : 0;
+            ca *= clamp01(pv[3]);
+          }
+          if (proc.alpha) {
+            this.sampleChannel(proc.alpha, l0, l1, l2, oa, ob, oc, pv);
+            ca *= clamp01(pv[0]);
+          }
+          if (proc.metallic) {
+            this.sampleChannel(proc.metallic, l0, l1, l2, oa, ob, oc, pv);
+            pm.metallic = clamp01(pv[0]);
+          }
+          if (proc.roughness) {
+            this.sampleChannel(proc.roughness, l0, l1, l2, oa, ob, oc, pv);
+            pm.roughness = clamp01(pv[0]);
+          }
+          if (proc.emission) {
+            this.sampleChannel(proc.emission, l0, l1, l2, oa, ob, oc, pv);
+            const es = mat.emissionStrength ?? 0;
+            pm.er = (pv[0] > 0 ? pv[0] : 0) * es;
+            pm.eg = (pv[1] > 0 ? pv[1] : 0) * es;
+            pm.eb = (pv[2] > 0 ? pv[2] : 0) * es;
+          }
+          sm = pm;
+        }
         if (blend) {
           const alpha = mat.alpha * ca;
           if (blend === 1 ? alpha < mat.threshold : alpha <= BAYER4[((py & 3) << 2) | (px & 3)]) continue;
@@ -480,11 +597,39 @@ export class Rasterizer {
         const wx = l0 * S[oa + 7] + l1 * S[ob + 7] + l2 * S[oc + 7];
         const wy = l0 * S[oa + 8] + l1 * S[ob + 8] + l2 * S[oc + 8];
         const wz = l0 * S[oa + 9] + l1 * S[ob + 9] + l2 * S[oc + 9];
+        if (proc?.normal && proc.bump !== 0) {
+          // offsets to the neighbour pixels (like the shader's dFdx/dFdy), then Mikkelsen bump
+          const pn = this.pn;
+          pn[0] = nx;
+          pn[1] = ny;
+          pn[2] = nz;
+          this.coordAt(proc.normal, l0, l1, l2, oa, ob, oc, this.pc);
+          if (
+            this.neighbour(proc.normal, w0 + a0, w1 + a1, w2 + a2, q0, q1, q2, oa, ob, oc, wx, wy, wz, 0) &&
+            this.neighbour(proc.normal, w0 + b0, w1 + b1, w2 + b2, q0, q1, q2, oa, ob, oc, wx, wy, wz, 1)
+          ) {
+            bumpNormal(proc.normal, proc.bump, this.pc, this.pcx, this.pcy, this.ppx, this.ppy, pn, pn);
+            nx = pn[0];
+            ny = pn[1];
+            nz = pn[2];
+          }
+        }
         if (this.mode === SHADE_SOLID) this.shadeSolid(mat, nx, ny, nz);
-        else this.shadeMaterial(mat, nx, ny, nz, wx, wy, wz, mat.r * cr, mat.g * cg, mat.b * cb);
+        else this.shadeMaterial(sm, nx, ny, nz, wx, wy, wz, br * cr, bg * cg, bb * cb);
         let r = this.outR;
         let g = this.outG;
         let b = this.outB;
+        if (this.mistDensity > 0 && this.mode === SHADE_MATERIAL) {
+          // FogExp2 over the planar view depth (as three.js scene fog)
+          const e = this.view.eye;
+          const f = this.view.forward;
+          const k = this.mistDensity * ((wx - e[0]) * f[0] + (wy - e[1]) * f[1] + (wz - e[2]) * f[2]);
+          const m = 1 - Math.exp(-k * k);
+          const mc = this.mistColor;
+          r += (mc[0] - r) * m;
+          g += (mc[1] - g) * m;
+          b += (mc[2] - b) * m;
+        }
         if (wire) {
           let d = Infinity;
           if (d0 >= 0) d = w0 * d0;
@@ -503,6 +648,101 @@ export class Rasterizer {
         cov[row] = 1;
       }
     }
+  }
+
+  /** Texture coordinate of a procedural channel at perspective-correct barycentrics l0..l2. */
+  private coordAt(
+    c: CompiledProcedural,
+    l0: number,
+    l1: number,
+    l2: number,
+    oa: number,
+    ob: number,
+    oc: number,
+    out: Vec3,
+  ): void {
+    const S = this.scr;
+    const u = l0 * S[oa + 14] + l1 * S[ob + 14] + l2 * S[oc + 14];
+    const v = l0 * S[oa + 15] + l1 * S[ob + 15] + l2 * S[oc + 15];
+    if (c.mapping === 2) {
+      compiledCoord(2, 0, 0, 0, this.texMin, this.texSize, u, v, out);
+      return;
+    }
+    const wx = l0 * S[oa + 7] + l1 * S[ob + 7] + l2 * S[oc + 7];
+    const wy = l0 * S[oa + 8] + l1 * S[ob + 8] + l2 * S[oc + 8];
+    const wz = l0 * S[oa + 9] + l1 * S[ob + 9] + l2 * S[oc + 9];
+    const M = this.invWorld;
+    compiledCoord(
+      c.mapping,
+      M[0] * wx + M[4] * wy + M[8] * wz + M[12],
+      M[1] * wx + M[5] * wy + M[9] * wz + M[13],
+      M[2] * wx + M[6] * wy + M[10] * wz + M[14],
+      this.texMin,
+      this.texSize,
+      u,
+      v,
+      out,
+    );
+  }
+
+  /** Samples a procedural channel at the current pixel into `out` (linear RGBA). */
+  private sampleChannel(
+    c: CompiledProcedural,
+    l0: number,
+    l1: number,
+    l2: number,
+    oa: number,
+    ob: number,
+    oc: number,
+    out: Float64Array,
+  ): void {
+    const p = this.pc;
+    this.coordAt(c, l0, l1, l2, oa, ob, oc, p);
+    sampleCompiled(c, p[0], p[1], p[2], out);
+  }
+
+  /**
+   * World-position and texture-coordinate offsets from the current pixel (world position wx..wz,
+   * coordinate `pc`) to a neighbour with screen-linear barycentrics w0..w2 (`axis` 0 → x, 1 → y).
+   * False when the neighbour lies beyond the triangle plane's horizon.
+   */
+  private neighbour(
+    c: CompiledProcedural,
+    w0: number,
+    w1: number,
+    w2: number,
+    q0: number,
+    q1: number,
+    q2: number,
+    oa: number,
+    ob: number,
+    oc: number,
+    wx: number,
+    wy: number,
+    wz: number,
+    axis: number,
+  ): boolean {
+    let l0 = w0 * q0;
+    let l1 = w1 * q1;
+    let l2 = w2 * q2;
+    const sum = l0 + l1 + l2;
+    if (!(sum > 1e-12)) return false;
+    const s = 1 / sum;
+    l0 *= s;
+    l1 *= s;
+    l2 *= s;
+    const S = this.scr;
+    const dp = axis ? this.ppy : this.ppx;
+    const dc = axis ? this.pcy : this.pcx;
+    dp[0] = l0 * S[oa + 7] + l1 * S[ob + 7] + l2 * S[oc + 7] - wx;
+    dp[1] = l0 * S[oa + 8] + l1 * S[ob + 8] + l2 * S[oc + 8] - wy;
+    dp[2] = l0 * S[oa + 9] + l1 * S[ob + 9] + l2 * S[oc + 9] - wz;
+    this.coordAt(c, l0, l1, l2, oa, ob, oc, dc);
+    const pc = this.pc;
+    dc[0] -= pc[0];
+    dc[1] -= pc[1];
+    dc[2] -= pc[2];
+    return true;
   }
 
   /** Bilinear, repeat-wrapped texture lookup in linear space (editor UVs have V up). */
@@ -578,9 +818,28 @@ export class Rasterizer {
     else if (shin > 4096) shin = 4096;
     const specK = ((shin + 8) / (8 * Math.PI)) * (1 - rough);
     const amb = this.ambient;
-    let r = amb[0] * (dr + f0r) + m.er;
-    let g = amb[1] * (dg + f0g) + m.eg;
-    let b = amb[2] * (db + f0b) + m.eb;
+    let r: number;
+    let g: number;
+    let b: number;
+    const sky = this.sky;
+    if (sky) {
+      // diffuse: SH irradiance; specular: the sky in the mirror direction, blurred towards the
+      // irradiance with roughness (the sun disc is a separate light)
+      const d = this.skyTmp;
+      const sp = this.skyTmp2;
+      evalSkyIrradiance(sky.sh, nx, ny, nz, d);
+      const ndv = nx * vx + ny * vy + nz * vz;
+      sampleSkyModel(sky.model, 2 * ndv * nx - vx, 2 * ndv * ny - vy, 2 * ndv * nz - vz, false, sp);
+      const k = sky.scale;
+      const t = rough;
+      r = k * (d[0] * dr + (sp[0] + t * (d[0] - sp[0])) * f0r) + m.er;
+      g = k * (d[1] * dg + (sp[1] + t * (d[1] - sp[1])) * f0g) + m.eg;
+      b = k * (d[2] * db + (sp[2] + t * (d[2] - sp[2])) * f0b) + m.eb;
+    } else {
+      r = amb[0] * (dr + f0r) + m.er;
+      g = amb[1] * (dg + f0g) + m.eg;
+      b = amb[2] * (db + f0b) + m.eb;
+    }
     const L = this.lights;
     for (let i = 0; i < this.lightCount; i++) {
       const o = i * LIGHT_STRIDE;
@@ -666,6 +925,10 @@ export class Rasterizer {
     this.outG = m.g * diff + spec;
     this.outB = m.b * diff + spec;
   }
+}
+
+function clamp01(v: number): number {
+  return v > 0 ? (v < 1 ? v : 1) : 0;
 }
 
 function loadClip(

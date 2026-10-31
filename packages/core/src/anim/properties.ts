@@ -51,6 +51,10 @@ export const ANIMATABLE: Record<AnimTargetType, Record<string, number>> = {
     size: 1,
     space_character: 1,
     shear: 1,
+    space_line: 1,
+    space_word: 1,
+    offset_x: 1,
+    offset_y: 1,
   },
 };
 
@@ -63,6 +67,7 @@ const PATTERNS: Partial<Record<AnimTargetType, RegExp[]>> = {
     /^particle_systems\[(["']).+\1\]\.\w+$/,
   ],
   mesh: [/^shape_keys\[(["']).+\1\]\.value$/],
+  curve: [/^splines\[\d+\]\.points\[\d+\]\.(co|handle_left|handle_right|radius|tilt|weight)$/],
   material: [/^textures\.\w+\.procedural\.\w+$/],
 };
 

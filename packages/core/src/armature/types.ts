@@ -1,5 +1,15 @@
 import type { Mat4, Vec3 } from '../math/types';
 
+/** Envelope deform settings of a bone (armature space, metres). */
+export interface BoneEnvelope {
+  /** Falloff distance beyond the radius (Blender `envelope_distance`). */
+  distance: number;
+  /** Envelope weight multiplier (Blender `envelope_multiplier`/`envelope_weight`). */
+  weight: number;
+  headRadius: number;
+  tailRadius: number;
+}
+
 /** Evaluated bone: rest and posed matrices in armature (object) space. */
 export interface PoseBoneMatrix {
   name: string;
@@ -12,12 +22,24 @@ export interface PoseBoneMatrix {
   /** Posed head/tail positions (armature space). */
   head: Vec3;
   tail: Vec3;
+  /** Rest head/tail positions (armature space; a connected bone's head is its parent's tail). */
+  restHead?: Vec3;
+  restTail?: Vec3;
+  /** Whether the bone deforms meshes (BoneData.use_deform). */
+  deform?: boolean;
+  /** Envelope settings (used by envelope skinning and envelope weights). */
+  envelope?: BoneEnvelope;
 }
 
 export interface ArmaturePose {
   bones: Map<string, PoseBoneMatrix>;
   /** Bone names ordered parents-first. */
   order: string[];
+  /**
+   * Non-fatal problems found while posing (invalid bone data, missing constraint targets,
+   * dependency cycles…). Evaluation never throws for bad user data.
+   */
+  errors?: string[];
 }
 
 export interface PoseContext {
@@ -26,4 +48,12 @@ export interface PoseContext {
   armatureMatrix: Mat4;
   /** Final world matrix of another object (IK / constraint targets), null if missing or cyclic. */
   getWorldMatrix(id: string): Mat4 | null;
+  /**
+   * Optional: id of the armature object being posed. Constraint targets equal to it (with a
+   * `subtarget`) address bones of this armature. Without it, a target whose world matrix equals
+   * `armatureMatrix` and that names one of this armature's bones is treated as self-targeting.
+   */
+  armatureId?: string;
+  /** Optional: world-space posed matrix of a bone of another armature object (bone subtargets). */
+  getBoneMatrix?(armatureObjectId: string, bone: string): { matrix: Mat4; length: number } | null;
 }

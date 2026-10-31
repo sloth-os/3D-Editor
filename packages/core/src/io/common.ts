@@ -8,6 +8,7 @@ import type { MeshData } from '../mesh/types';
 import { cloneMesh } from '../mesh/types';
 import { buildRenderBuffers } from '../mesh/render-buffers';
 import { faceNormalRaw } from '../mesh/normals';
+import { instanceExportItems } from '../instancing/export';
 import type { ExportOptions } from './types';
 
 /** One object selected for export. */
@@ -17,6 +18,8 @@ export interface ExportItem {
   mesh: MeshData | null;
   /** Material per slot (null for empty slots). */
   materials: (MaterialData | null)[];
+  /** Set for collection/particle instances (pseudo objects sharing the source's mesh). */
+  instance?: { ownerId: string; sourceId: string };
 }
 
 export interface ExportCollection {
@@ -43,11 +46,13 @@ export function collectExport(doc: SceneDoc, opts: ExportOptions): ExportCollect
     }
     picked = scene.objects.filter((o) => want.has(o.id));
   } else picked = scene.objects.filter((o) => o.renderVisible);
-  const items = picked.map((ev) => ({
+  const items: ExportItem[] = picked.map((ev) => ({
     ev,
     mesh: ev.mesh ? ((apply ? ev.mesh : ev.baseMesh) ?? null) : null,
     materials: ev.materials,
   }));
+  // instances of exported instancers (collection instances, particles) share their source's mesh
+  for (const it of instanceExportItems(scene, new Set(picked.map((o) => o.id)), apply)) items.push(it);
   return { scene, items, ids: new Set(items.map((i) => i.ev.id)) };
 }
 
