@@ -10,10 +10,17 @@ import {
   type MeshData,
 } from '../src';
 import { defaultProcedural } from '../src/material/procedural';
+import { defaultSpline, defaultSplinePoint } from '../src/doc/defaults';
 import { SceneEvaluator } from '../src/eval/evaluate';
 import { renderItems } from '../src/eval/renderables';
 import { viewFromCamera } from '../src/render/view';
-import { compileScene, PathTracer, PrincipledBSDF, studioRadiance } from '../src/render/pathtrace';
+import {
+  compileScene,
+  PathTracer,
+  PrincipledBSDF,
+  renderPathTracedImage,
+  studioRadiance,
+} from '../src/render/pathtrace';
 import { at, mean, topCamera, traceLinear, tracerFor } from './pathtrace-helpers';
 
 /*
@@ -140,6 +147,47 @@ describe('path tracer: refraction and reflection', () => {
     expect(Math.abs(rough[0] - expected) / expected).toBeLessThan(0.01);
     expect(expected).toBeLessThan(1.8);
   });
+
+  it('filter glossy (default) finds caustics of small lamps through glass at low sample counts', () => {
+    const doc = blackWorld();
+    plane(doc, 'Floor', 20, lambert(doc));
+    const ball = createUVSphere({ segments: 32, ring_count: 16, radius: 0.5 });
+    ball.faceSmooth = ball.faceSmooth.map(() => true);
+    doc.addObject({
+      type: 'MESH',
+      name: 'Glass',
+      data: doc.addMesh('Glass', ball),
+      location: [0, 0, 1],
+      material_slots: [
+        doc.addMaterial({ base_color: [1, 1, 1, 1], transmission: 1, roughness: 0, ior: 1.5 }),
+      ],
+    });
+    // a small lamp up and to the right: the caustic lands on the floor left of the ball
+    doc.addObject({
+      type: 'LIGHT',
+      name: 'Lamp',
+      data: doc.addLight({ type: 'POINT', energy: 300, shadow_soft_size: 0.05 }),
+      location: [2, 0, 4],
+    });
+    topCamera(doc, 3, 6);
+    // mean of the caustic region around x ≈ −0.7 m (the ball covers x ∈ ±0.5 m)
+    const caustic = (filter: number, seed: number) => {
+      const { img } = traceLinear(doc, {
+        width: 24,
+        height: 24,
+        samples: 32,
+        seed,
+        options: { filter_glossy: filter },
+      });
+      return mean(img, 24, 2, 9, 10, 15)[0];
+    };
+    // without the filter the caustic is (almost) never found: only the indirect light remains
+    const none = caustic(0, 1);
+    const a = caustic(1, 1);
+    const b = caustic(1, 2);
+    expect(a).toBeGreaterThan(2 * none);
+    expect(Math.abs(a - b) / a).toBeLessThan(0.2);
+  }, 30_000);
 });
 
 describe('path tracer: instancing', () => {
@@ -222,6 +270,50 @@ describe('path tracer: instancing', () => {
     expect(tracer.scene.geometries).toHaveLength(1);
     for (const x of [6, 16, 26]) expect(at(img, 32, x, 16)[3], `column ${x}`).toBe(1);
     expect(at(img, 32, 11, 16)[3]).toBe(0);
+  });
+
+  it('renders evaluated curve and text geometry with its materials', () => {
+    const doc = blackWorld();
+    doc.updateRender({ film_transparent: true });
+    const red = emissive(doc, [1, 0, 0]);
+    const green = emissive(doc, [0, 1, 0]);
+    // a beveled circle (CURVE) around the origin and the word "Hi" (FONT) right of it
+    const circle = defaultSpline(
+      'BEZIER',
+      [
+        [-1, 0, 0],
+        [0, 1, 0],
+        [1, 0, 0],
+        [0, -1, 0],
+      ].map((co) => defaultSplinePoint(co as [number, number, number])),
+    );
+    circle.use_cyclic_u = true;
+    doc.addObject({
+      type: 'CURVE',
+      name: 'Ring',
+      data: doc.addCurve({ splines: [circle], bevel_depth: 0.25 }),
+      material_slots: [red],
+    });
+    doc.addObject({
+      type: 'FONT',
+      name: 'Sign',
+      data: doc.addCurve({ body: 'Hi', size: 2, fill_mode: 'BOTH', extrude: 0.05 }),
+      location: [1.6, -0.7, 0],
+      material_slots: [green],
+    });
+    doc.updateObject(topCamera(doc, 6, 5), { location: [1.2, 0, 5] });
+    const { img } = traceLinear(doc, { width: 48, height: 32, samples: 4 });
+    let redPx = 0;
+    let greenPx = 0;
+    for (let i = 0; i < 48 * 32; i++) {
+      if (img[i * 4 + 3] < 0.5) continue;
+      if (img[i * 4] > 0.4 && img[i * 4 + 1] === 0) redPx++;
+      if (img[i * 4 + 1] > 0.4 && img[i * 4] === 0) greenPx++;
+    }
+    expect(redPx).toBeGreaterThan(60);
+    expect(greenPx).toBeGreaterThan(20);
+    // the ring is hollow: its centre stays empty
+    expect(at(img, 48, Math.round(((0 - 1.2) / 6 + 0.5) * 48), 16)[3]).toBe(0);
   });
 });
 
@@ -417,9 +509,26 @@ describe('path tracer: transparency, culling and film', () => {
     const t = run();
     expect(at(t, 8, 0, 0)[3]).toBe(0);
     expect(at(t, 8, 4, 4)[3]).toBe(1);
+    // an explicit background leaves the film transparent; it is composited after the display
+    // transform, so it shows exactly the requested display colour whatever the view transform
     const bg = run({ background: [1, 0, 0, 0.5] });
-    expect(at(bg, 8, 0, 0)[3]).toBeCloseTo(0.5, 6);
-    expect(at(bg, 8, 0, 0)[0]).toBeCloseTo(0.5, 6); // premultiplied
+    expect(at(bg, 8, 0, 0)[3]).toBe(0);
+    doc.updateRender({ film_transparent: false, view_transform: 'AGX', exposure: 1.5 });
+    const scene = new SceneEvaluator(doc).evaluate(1, { forRender: true });
+    const cam = scene.activeCamera!;
+    const img = renderPathTracedImage({
+      scene,
+      items: renderItems(scene, { forRender: true }),
+      view: viewFromCamera(cam.camera!, cam.worldMatrix, 1),
+      camera: cam.camera!,
+      width: 8,
+      height: 8,
+      images: { get: () => null },
+      options: { samples: 2, denoise: false, background: [1, 0.5, 0, 0.5] },
+    });
+    expect([...img.data.subarray(0, 4)]).toEqual([255, 128, 0, 128]);
+    const centre = (4 * 8 + 4) * 4;
+    expect(img.data[centre + 3]).toBe(255);
   });
 });
 
@@ -521,6 +630,33 @@ describe('path tracer: environments, camera and mist', () => {
     }).img;
     const p = at(bg, 4, 2, 0);
     expect(p[2]).toBeGreaterThan(p[0]);
+  }, 20_000);
+
+  it('orients the sky by sun_rotation only (environment_rotation turns studio and image worlds)', () => {
+    const doc = SceneDoc.create({ empty: true });
+    doc.updateWorld({ environment: 'SKY', sun_elevation: 0.4, sun_rotation: 1, sun_intensity: 2 });
+    plane(doc, 'Floor', 100, lambert(doc));
+    const ball = createUVSphere({ segments: 16, ring_count: 8, radius: 0.5 });
+    doc.addObject({
+      type: 'MESH',
+      name: 'Ball',
+      data: doc.addMesh('Ball', ball),
+      location: [0, 0, 0.5],
+      material_slots: [lambert(doc)],
+    });
+    topCamera(doc, 3, 5);
+    const run = () => traceLinear(doc, { width: 8, height: 8, samples: 8, maxBounces: 2 });
+    const a = run();
+    expect(a.tracer.scene.environment.rotation).toBe(0);
+    doc.updateWorld({ environment_rotation: 1.3 });
+    const b = run();
+    expect(b.tracer.scene.environment.rotation).toBe(0);
+    expect(b.img).toEqual(a.img);
+    // the sun direction does turn it: the shadow moves
+    doc.updateWorld({ sun_rotation: 2.5 });
+    expect(run().img).not.toEqual(a.img);
+    doc.updateWorld({ environment: 'STUDIO' });
+    expect(run().tracer.scene.environment.rotation).toBeCloseTo(1.3, 12);
   }, 20_000);
 
   it('depth of field blurs out-of-focus edges only', () => {

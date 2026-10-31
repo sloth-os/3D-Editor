@@ -39,7 +39,7 @@ export interface EnvironmentData {
   color: Vec3;
   /** Multiplier of the studio / sky / image radiance. */
   scale: number;
-  /** Rotation about +Z in radians (studio and image). */
+  /** Rotation about +Z in radians (studio and image; 0 for the sky). */
   rotation: number;
   /** Prepared procedural sky (ENV_SKY). */
   sky: SkyModel | null;
@@ -160,7 +160,11 @@ export function buildEnvironment(input: EnvironmentInput, warnings: string[]): E
     finiteNonNeg(world.color?.[1], 0) * strength,
     finiteNonNeg(world.color?.[2], 0) * strength,
   ];
-  const rotation = Number.isFinite(world.environment_rotation) ? world.environment_rotation : 0;
+  // the procedural sky ignores environment_rotation (sun_rotation orients it, like the viewport)
+  const rotation =
+    world.environment !== 'SKY' && Number.isFinite(world.environment_rotation)
+      ? world.environment_rotation
+      : 0;
   const env: EnvironmentData = {
     kind: ENV_UNIFORM,
     color,

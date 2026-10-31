@@ -5,6 +5,7 @@ import {
   SceneEvaluator,
   createEditorState,
   createOperatorRegistry,
+  evaluateCurveSplines,
   isClosedManifold,
   type OperatorContext,
 } from '../src';
@@ -75,10 +76,14 @@ describe('curve primitives', () => {
     const path = doc.getCurve(ok('curve.primitive_nurbs_path_add').curve)!;
     expect(path.splines[0]).toMatchObject({ type: 'NURBS', order_u: 5, use_endpoint_u: true });
     expect(path.splines[0].points.map((p) => p.co[0])).toEqual([-2, -1, 0, 1, 2]);
-    const ncircle = doc.getCurve(ok('curve.primitive_nurbs_circle_add').curve)!;
-    expect(ncircle.splines[0].points.filter((p) => Math.abs(p.weight - Math.SQRT1_2) < 1e-12)).toHaveLength(
-      4,
-    );
+    const ncircle = doc.getCurve(ok('curve.primitive_nurbs_circle_add', { radius: 2 }).curve)!;
+    expect(
+      ncircle.splines[0].points.filter((p) => Math.abs(p.weight - 0.25 * Math.SQRT2) < 1e-12),
+    ).toHaveLength(4);
+    // Blender's corner weights make the order-4 NURBS circle round within 1%
+    const radii = evaluateCurveSplines(ncircle)[0].points.map((p) => Math.hypot(p[0], p[1]));
+    expect(Math.min(...radii)).toBeGreaterThan(2 * 0.99);
+    expect(Math.max(...radii)).toBeLessThan(2 * 1.01);
     expect(doc.getCurve(ok('curve.primitive_nurbs_curve_add').curve)!.splines[0].use_endpoint_u).toBe(false);
   });
 
@@ -173,7 +178,7 @@ describe('spline editing', () => {
     ok('curve.spline_set_points', {
       object: r.name,
       spline_index: 0,
-      points: [[0, 0, 0], { co: [2, 0, 0], radius: 0.5 }, [2, 2, 0]],
+      points: [[0, 0, 0], { co: [2, 0, 0], radius: 0.5, tilt: 0.3 }, [2, 2, 0]],
       cyclic: true,
     });
     let c = doc.getCurve(r.curve)!;
@@ -188,6 +193,8 @@ describe('spline editing', () => {
       [2, 0, 0],
       [0, 0, 0],
     ]);
+    // tilt is measured around the direction of travel, so reversing negates it (like Blender)
+    expect(c.splines[0].points.map((p) => p.tilt)).toEqual([0, -0.3, 0]);
     ok('curve.cyclic_toggle', { spline_index: 0 });
     expect(doc.getCurve(r.curve)!.splines[0].use_cyclic_u).toBe(false);
     ok('curve.cyclic_toggle', { cyclic: true });

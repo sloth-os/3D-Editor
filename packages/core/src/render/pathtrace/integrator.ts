@@ -41,6 +41,12 @@ export interface IntegratorSettings {
   maxTransparentLayers: number;
   /** Largest per-sample contribution of indirect light (max rgb component); 0 disables. */
   clampIndirect: number;
+  /**
+   * Filter Glossy (Cycles): after blurry bounces, microfacet lobes are blurred to
+   * α ≥ √(1 − pdf_min / filterGlossy) / 2, where pdf_min is the smallest BSDF pdf on the path so
+   * far. Removes most caustic fireflies at the cost of blurrier indirect reflections; 0 disables.
+   */
+  filterGlossy: number;
   seed: number;
   background: number;
   /** Linear background colour (premultiplied by `bgA`) for BACKGROUND_COLOR. */
@@ -483,15 +489,15 @@ export class PathIntegrator {
     let ox = 0;
     let oy = 0;
     let oz = 0;
-    const bw = [b0, b1, b2];
     for (let k = 0; k < 3; k++) {
       const n = g.vidx[tri * 3 + k] * 3;
       const d =
         (px - V[o + k * 3]) * N[n] + (py - V[o + k * 3 + 1]) * N[n + 1] + (pz - V[o + k * 3 + 2]) * N[n + 2];
       if (d < 0) {
-        ox -= bw[k] * d * N[n];
-        oy -= bw[k] * d * N[n + 1];
-        oz -= bw[k] * d * N[n + 2];
+        const w = (k === 0 ? b0 : k === 1 ? b1 : b2) * d;
+        ox -= w * N[n];
+        oy -= w * N[n + 1];
+        oz -= w * N[n + 2];
       }
     }
     const X = s.instances.xform;
@@ -872,6 +878,8 @@ export class PathIntegrator {
     let prevNZ = 1;
     let prevTwoSided = false;
     let prevTotal = 0;
+    // smallest BSDF pdf along the path (filter glossy)
+    let minPdf = Infinity;
     // denoising guides
     let aovPending = true;
     let aovSpecular = 0;
@@ -1187,12 +1195,18 @@ export class PathIntegrator {
       const t2x = fb;
       const t2y = sgn + sny * sny * fa;
       const t2z = -sny;
+      let blurAlpha = 0;
+      if (st.filterGlossy > 0 && minPdf < Infinity) {
+        const blurPdf = minPdf / st.filterGlossy;
+        if (blurPdf < 1) blurAlpha = Math.sqrt(1 - blurPdf) * 0.5;
+      }
       bsdf.setup(
         shader,
         wox * t1x + woy * t1y + woz * t1z,
         wox * t2x + woy * t2y + woz * t2z,
         wox * snx + woy * sny + woz * snz,
         frontFacing,
+        blurAlpha,
       );
       if (aovPending) {
         if (bsdf.singular && aovSpecular < 2) {
@@ -1212,12 +1226,14 @@ export class PathIntegrator {
       if (!bsdf.active) break;
       const dimBase = DIM_VERTEX + 3 * scatters;
       const eps = EPS_SCALE * (1 + Math.max(Math.abs(this.px), Math.abs(this.py), Math.abs(this.pz)));
+      // light selection and BSDF lobe choice share one 2D point
+      smp.next2D(dimBase + 2);
+      const uSel = smp.u0;
+      const uLobe = smp.u1;
       // ---- next-event estimation
       let selTotal = 0;
       if (!bsdf.singular && lights.count > 0) {
         selTotal = lights.prepare(this.px, this.py, this.pz, gnx, gny, gnz, transmissive);
-        smp.next2D(dimBase + 2);
-        const uSel = smp.u0;
         const group = lights.pick(uSel);
         if (group >= 0) {
           const pSel = lights.prob;
@@ -1308,10 +1324,7 @@ export class PathIntegrator {
       }
       // ---- BSDF sampling
       smp.next2D(dimBase);
-      const u0 = smp.u0;
-      const u1 = smp.u1;
-      smp.next2D(dimBase + 2);
-      if (!bsdf.sample(u0, u1, smp.u1)) break;
+      if (!bsdf.sample(smp.u0, smp.u1, uLobe)) break;
       const transmission = bsdf.sampledTransmission;
       // beyond the bounce limit the ray is still traced, but only to find the light it hits
       // (completes the MIS of this vertex's direct lighting), not to scatter again
@@ -1333,6 +1346,7 @@ export class PathIntegrator {
         etaScale *= eta * eta;
       } else bounces++;
       prevPdf = bsdf.pdf;
+      if (bsdf.pdf < minPdf) minPdf = bsdf.pdf;
       prevSingular = bsdf.singular;
       prevX = this.px;
       prevY = this.py;

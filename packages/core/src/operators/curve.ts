@@ -600,7 +600,8 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
   primitive(
     'curve.primitive_nurbs_circle_add',
     'Nurbs Circle',
-    'Add a closed NURBS circle (8 control points on a square, corner weights √½) of the given radius. Returns {object, name, curve}.',
+    'Add a closed NURBS circle of the given radius in the local XY plane (8 control points on a square, order 4, ' +
+      "corner weights ¼√2 like Blender's, within 1% of a true circle). Returns {object, name, curve}.",
     'NurbsCircle',
     (r) => {
       const square: [number, number][] = [
@@ -615,7 +616,7 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
       ];
       const s = defaultSpline(
         'NURBS',
-        square.map(([x, y], i) => scaledPoint([x, y, 0], r, { weight: i % 2 ? Math.SQRT1_2 : 1 })),
+        square.map(([x, y], i) => scaledPoint([x, y, 0], r, { weight: i % 2 ? 0.25 * Math.SQRT2 : 1 })),
       );
       s.use_cyclic_u = true;
       s.order_u = 4;
@@ -831,8 +832,9 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
   splineEdit(
     'curve.switch_direction',
     'Switch Direction',
-    'Reverse the direction of splines (point order and handles swapped); affects bevel_factor, tilt direction and ' +
-      'paths. Returns {changed}.',
+    'Reverse the direction of splines: point order reversed, left/right handles swapped and tilts negated (so ' +
+      'the bevel keeps its twist, as in Blender). Affects bevel_factor_start/end, paths (Follow Path, Curve ' +
+      'modifier) and the side positive offsets go to on open curves. Returns {changed}.',
     {},
     (s) => ({
       ...s,
@@ -845,6 +847,7 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
           handle_right: pt.handle_left,
           handle_left_type: pt.handle_right_type,
           handle_right_type: pt.handle_left_type,
+          tilt: pt.tilt ? -pt.tilt : 0,
         })),
     }),
   );

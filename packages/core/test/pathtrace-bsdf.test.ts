@@ -158,4 +158,29 @@ describe('principled BSDF', () => {
     expect(m.wz).toBeCloseTo(1, 3);
     expect(m.fR / m.pdf).toBeCloseTo(0.9, 2);
   });
+
+  it('filter glossy (minimum α) widens near-specular lobes and leaves rough ones alone', () => {
+    const blurred = (p: Partial<BSDFInputs>, minAlpha: number) => {
+      const b = new PrincipledBSDF();
+      b.setup({ ...WHITE, ...p }, Math.sqrt(1 - 0.7 * 0.7), 0, 0.7, true, minAlpha);
+      return b;
+    };
+    // smooth glass and mirrors become glossy: light sampling applies again
+    expect(blurred({ transmission: 1, roughness: 0 }, 0.4).singular).toBe(false);
+    expect(blurred({ metallic: 1, roughness: 0 }, 0.4).singular).toBe(false);
+    // the blurred lobe still conserves energy (lossless white metal)
+    expect(sampledAlbedo(blurred({ metallic: 1, roughness: 0 }, 0.4))).toBeCloseTo(1, 1);
+    // a lobe rougher than the blur is unchanged
+    const a = blurred({ metallic: 1, roughness: 0.8 }, 0);
+    const b = blurred({ metallic: 1, roughness: 0.8 }, 0.4);
+    for (const [x, y, z] of [
+      [0.3, 0.1, 0.9],
+      [-0.5, 0.2, 0.6],
+    ]) {
+      a.eval(x, y, z);
+      b.eval(x, y, z);
+      expect(b.fR).toBe(a.fR);
+      expect(b.pdf).toBe(a.pdf);
+    }
+  });
 });

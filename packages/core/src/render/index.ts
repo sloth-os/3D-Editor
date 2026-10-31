@@ -57,6 +57,7 @@ import { renderPathTracedImage, viewCameraData, type PathTraceProgress } from '.
 export { decodePNG } from './png';
 export { autoFrameView } from './view';
 export * from './sky';
+export * from './animation';
 export {
   PathTracer,
   pathTracerSettings,
@@ -64,6 +65,9 @@ export {
   preparePathTrace,
   renderPathTracedImage,
   filmToRGBA8,
+  applyViewTransform,
+  viewTransformOf,
+  VIEW_TRANSFORMS,
   PathFilm,
   createPathTile,
   pathTileTransferables,
@@ -73,6 +77,8 @@ export {
   type PathTraceProgress,
   type PathTraceStats,
   type PathTile,
+  type PreparedPathTrace,
+  type DisplayBackground,
   type PathTraceRenderInput,
   type PathTraceRenderOptions,
   type PathTracedImage,
@@ -100,7 +106,8 @@ export interface SoftwareRenderOptions {
   /**
    * Render engine (default: the scene's render `engine`). PATHTRACER is a physically based CPU path
    * tracer (soft shadows, reflections, refraction, global illumination); it is used for MATERIAL
-   * shading only (SOLID and the wireframe overlay always rasterize).
+   * shading only (SOLID and the wireframe overlay always rasterize). Its output applies the scene's
+   * exposure and `view_transform` (AgX by default, like Blender); the rasterizer uses Standard.
    */
   engine?: RenderEngine;
   /** PATHTRACER: maximum diffuse/glossy bounces (default: render settings `max_bounces`). */

@@ -1,6 +1,7 @@
 /*
  * CPU path tracer (Cycles-like): two-level BVH, principled BSDF, Blender light units, next-event
- * estimation with MIS, procedural/image textures, environment lighting and an à-trous denoiser.
+ * estimation with MIS, procedural/image textures, environment lighting, an à-trous denoiser and
+ * Blender's view transforms for display.
  * Pure TypeScript, no DOM; all scene and film data are plain typed arrays so the work can be split
  * over worker threads with `PathTracer.renderRows`.
  */
@@ -32,11 +33,18 @@ export {
   type PathTraceStats,
 } from './tracer';
 export {
+  filmToRGBA8,
+  applyViewTransform,
+  viewTransformOf,
+  VIEW_TRANSFORMS,
+  type DisplayBackground,
+} from './display';
+export {
   renderPathTracedImage,
   preparePathTrace,
-  filmToRGBA8,
   viewCameraData,
   sceneLights,
+  type PreparedPathTrace,
   type PathTraceRenderInput,
   type PathTraceRenderOptions,
   type PathTracedImage,

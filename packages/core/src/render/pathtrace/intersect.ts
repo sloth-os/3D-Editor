@@ -101,6 +101,12 @@ export class SceneIntersector {
     let sp = 0;
     let node = 0;
     if (slab(B, 0, ox, oy, oz, ix, iy, iz, this.t) === Infinity) return;
+    const nX = ix < 0 ? 3 : 0;
+    const nY = iy < 0 ? 4 : 1;
+    const nZ = iz < 0 ? 5 : 2;
+    const fX = 3 - nX;
+    const fY = 5 - nY;
+    const fZ = 7 - nZ;
     const I = inst.inv;
     for (;;) {
       const cnt = K[node];
@@ -118,9 +124,34 @@ export class SceneIntersector {
           if (this.traverseMesh(i, inst.geom[i], lox, loy, loz, ldx, ldy, ldz) && this.any) return;
         }
       } else {
+        // both children (adjacent boxes): slab tests with the near/far planes known from the signs
         const l = C[node];
-        const tl = slab(B, l, ox, oy, oz, ix, iy, iz, this.t);
-        const tr = slab(B, l + 1, ox, oy, oz, ix, iy, iz, this.t);
+        const o = l * 6;
+        const tBest = this.t;
+        let lo = (B[o + nX] - ox) * ix;
+        let hi = (B[o + fX] - ox) * ix;
+        let t0 = (B[o + nY] - oy) * iy;
+        let t1 = (B[o + fY] - oy) * iy;
+        if (t0 > lo) lo = t0;
+        if (t1 < hi) hi = t1;
+        t0 = (B[o + nZ] - oz) * iz;
+        t1 = (B[o + fZ] - oz) * iz;
+        if (t0 > lo) lo = t0;
+        if (t1 < hi) hi = t1;
+        if (lo < 0) lo = 0;
+        const tl = lo <= hi * BOX_EPS && lo < tBest ? lo : Infinity;
+        lo = (B[o + 6 + nX] - ox) * ix;
+        hi = (B[o + 6 + fX] - ox) * ix;
+        t0 = (B[o + 6 + nY] - oy) * iy;
+        t1 = (B[o + 6 + fY] - oy) * iy;
+        if (t0 > lo) lo = t0;
+        if (t1 < hi) hi = t1;
+        t0 = (B[o + 6 + nZ] - oz) * iz;
+        t1 = (B[o + 6 + fZ] - oz) * iz;
+        if (t0 > lo) lo = t0;
+        if (t1 < hi) hi = t1;
+        if (lo < 0) lo = 0;
+        const tr = lo <= hi * BOX_EPS && lo < tBest ? lo : Infinity;
         if (tl !== Infinity) {
           if (tr !== Infinity) {
             if (tl <= tr) {
@@ -175,6 +206,13 @@ export class SceneIntersector {
     const iy = 1 / (Math.abs(dy) < TINY ? (dy < 0 ? -TINY : TINY) : dy);
     const iz = 1 / (Math.abs(dz) < TINY ? (dz < 0 ? -TINY : TINY) : dz);
     if (slab(B, 0, ox, oy, oz, ix, iy, iz, this.t) === Infinity) return false;
+    // near / far box planes per axis (min or max coordinate) from the direction signs
+    const nX = ix < 0 ? 3 : 0;
+    const nY = iy < 0 ? 4 : 1;
+    const nZ = iz < 0 ? 5 : 2;
+    const fX = 3 - nX;
+    const fY = 5 - nY;
+    const fZ = 7 - nZ;
     // watertight setup: kz = dominant axis, shear so the ray becomes +z
     const ax = Math.abs(dx);
     const ay = Math.abs(dy);
@@ -249,9 +287,34 @@ export class SceneIntersector {
           if (this.any) return true;
         }
       } else {
+        // both children (adjacent boxes): slab tests with the near/far planes known from the signs
         const l = C[node];
-        const tl = slab(B, l, ox, oy, oz, ix, iy, iz, this.t);
-        const tr = slab(B, l + 1, ox, oy, oz, ix, iy, iz, this.t);
+        const o = l * 6;
+        const tBest = this.t;
+        let lo = (B[o + nX] - ox) * ix;
+        let hi = (B[o + fX] - ox) * ix;
+        let t0 = (B[o + nY] - oy) * iy;
+        let t1 = (B[o + fY] - oy) * iy;
+        if (t0 > lo) lo = t0;
+        if (t1 < hi) hi = t1;
+        t0 = (B[o + nZ] - oz) * iz;
+        t1 = (B[o + fZ] - oz) * iz;
+        if (t0 > lo) lo = t0;
+        if (t1 < hi) hi = t1;
+        if (lo < 0) lo = 0;
+        const tl = lo <= hi * BOX_EPS && lo < tBest ? lo : Infinity;
+        lo = (B[o + 6 + nX] - ox) * ix;
+        hi = (B[o + 6 + fX] - ox) * ix;
+        t0 = (B[o + 6 + nY] - oy) * iy;
+        t1 = (B[o + 6 + fY] - oy) * iy;
+        if (t0 > lo) lo = t0;
+        if (t1 < hi) hi = t1;
+        t0 = (B[o + 6 + nZ] - oz) * iz;
+        t1 = (B[o + 6 + fZ] - oz) * iz;
+        if (t0 > lo) lo = t0;
+        if (t1 < hi) hi = t1;
+        if (lo < 0) lo = 0;
+        const tr = lo <= hi * BOX_EPS && lo < tBest ? lo : Infinity;
         if (tl !== Infinity) {
           if (tr !== Infinity) {
             if (tl <= tr) {

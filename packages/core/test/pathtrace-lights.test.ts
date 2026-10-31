@@ -130,6 +130,8 @@ describe('path tracer: Blender light units', () => {
 
   it('agrees with the rasterizer on the brightness of a lamp-lit diffuse surface', () => {
     const doc = floorScene();
+    // the rasterizer only has the Standard display transform
+    doc.updateRender({ view_transform: 'STANDARD' });
     doc.addObject({
       type: 'LIGHT',
       name: 'Lamp',
@@ -263,7 +265,13 @@ describe('path tracer: Blender light units', () => {
           data: doc.addMesh('Panel', createPlane({ size: 0.6 })),
           location: [0, 2, 1.5],
           rotation_euler: [1, 0, 0],
-          material_slots: [doc.addMaterial({ base_color: [0, 0, 0, 1], emission_color: [0.5, 0.7, 1], emission_strength: 15 })],
+          material_slots: [
+            doc.addMaterial({
+              base_color: [0, 0, 0, 1],
+              emission_color: [0.5, 0.7, 1],
+              emission_strength: 15,
+            }),
+          ],
         });
       const { img } = traceLinear(doc, { width: 8, height: 8, samples: 512, maxBounces: 2 });
       return mean(img, 8, 0, 0, 8, 8);

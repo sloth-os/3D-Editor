@@ -314,6 +314,60 @@ describe('2D fill', () => {
       expect(countInconsistentEdges(mesh(holed(extra)))).toBe(0);
   });
 
+  it('closes caps along straight sampled runs and holes bridged along a shared line', () => {
+    // straight Bezier segments are sampled into exactly collinear points, which earcut skips
+    const corner = (x: number, y: number) =>
+      pt([x, y, 0], { handle_left_type: 'VECTOR', handle_right_type: 'VECTOR' });
+    const vsquare = (s: number) =>
+      spline('BEZIER', [corner(-s, -s), corner(s, -s), corner(s, s), corner(-s, s)], { use_cyclic_u: true });
+    const frame = mesh(curve([vsquare(1), vsquare(0.5)], { dimensions: '2D', extrude: 0.1 }));
+    expect(isClosedManifold(frame)).toBe(true);
+    expect(countInconsistentEdges(frame)).toBe(0);
+    expect(volume(frame)).toBeCloseTo(3 * 0.2);
+    // order-2 NURBS (a polygon sampled at resolution 12) with a hole, beveled
+    const nurbs = spline('NURBS', square(1).points, { use_cyclic_u: true, order_u: 2 });
+    const beveled = mesh(curve([nurbs, square(0.4)], { dimensions: '2D', extrude: 0.1, bevel_depth: 0.05 }));
+    expect(isClosedManifold(beveled)).toBe(true);
+    // a hole whose bottom edge continues an edge of the outline (earcut bridges along that line)
+    const outline = spline(
+      'POLY',
+      [pt([0, 0, 0]), pt([6, 0, 0]), pt([6, 6, 0]), pt([2, 6, 0]), pt([2, 4, 0]), pt([0, 4, 0])],
+      {
+        use_cyclic_u: true,
+      },
+    );
+    const hole = spline('POLY', [pt([3, 4, 0]), pt([5, 4, 0]), pt([5, 5, 0]), pt([3, 5, 0])], {
+      use_cyclic_u: true,
+    });
+    const notched = mesh(curve([outline, hole], { dimensions: '2D', extrude: 0.5 }));
+    expect(isClosedManifold(notched)).toBe(true);
+    expect(volume(notched)).toBeCloseTo((36 - 4 - 2) * 1);
+  });
+
+  it('keeps caps watertight when an outline folds over itself', () => {
+    // a small bow-tie on the top edge (like the folds of strongly offset text)
+    const folded = spline(
+      'POLY',
+      [
+        [0, 0],
+        [4, 0],
+        [4, 4],
+        [2.6, 4],
+        [1.6, 3.7],
+        [2.4, 3.7],
+        [1.4, 4],
+        [0, 4],
+      ].map(([x, y]) => pt([x, y, 0])),
+      { use_cyclic_u: true },
+    );
+    const hole = spline('POLY', [pt([1.5, 1, 0]), pt([2.5, 1, 0]), pt([2.5, 2, 0]), pt([1.5, 2, 0])], {
+      use_cyclic_u: true,
+    });
+    const m = mesh(curve([folded, hole], { dimensions: '2D', extrude: 0.2 }));
+    expect(isClosedManifold(m)).toBe(true);
+    expect(countInconsistentEdges(m)).toBe(0);
+  });
+
   it('keeps open splines of filled curves as wires (lines + loose edges)', () => {
     const c = curve([square(1), line(2, 3)], { dimensions: '2D' });
     const r = build(c);

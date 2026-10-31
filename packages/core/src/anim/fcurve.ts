@@ -75,7 +75,9 @@ export function evaluateFCurve(fc: FCurve, frame: number): number | undefined {
     if (span > 0 && (f < a || f > a + span)) f = a + ((((f - a) % span) + span) % span);
   }
   const v = evaluateKeys(fc, keys, f);
-  return fc.modifiers?.length ? applyFModifiers(fc.modifiers, frame, v) : v;
+  // time modifiers (STEPPED, LIMITS x) resample the unmodified curve at another frame
+  const sample = (t: number) => evaluateFCurve({ ...fc, keyframes: keys, modifiers: [] }, t) ?? v;
+  return fc.modifiers?.length ? applyFModifiers(fc.modifiers, frame, v, sample) : v;
 }
 
 function evaluateKeys(fc: FCurve, keys: Keyframe[], frame: number): number {

@@ -21,6 +21,8 @@ export interface PathTracerSettings {
   maxTransmissionBounces: number;
   /** Indirect light clamp (max rgb component per sample, default 10; 0 disables). */
   clampIndirect: number;
+  /** Cycles' Filter Glossy: blur glossy lobes after blurry bounces (default 1; 0 disables). */
+  filterGlossy: number;
   /** Noise pattern seed (default 0). */
   seed: number;
   /**
@@ -75,6 +77,7 @@ export function pathTracerSettings(
       Math.min(1024, Math.floor(fin(s.maxTransmissionBounces, Math.max(8, maxBounces)))),
     ),
     clampIndirect: Math.max(0, fin(s.clampIndirect, 10)),
+    filterGlossy: Math.max(0, fin(s.filterGlossy, 1)),
     seed: Math.floor(fin(s.seed, 0)) >>> 0,
     background: s.background === 'COLOR' || s.background === 'TRANSPARENT' ? s.background : 'ENVIRONMENT',
     backgroundColor: [
@@ -117,6 +120,7 @@ export class PathTracer {
       maxTransmissionBounces: s.maxTransmissionBounces,
       maxTransparentLayers: 16,
       clampIndirect: s.clampIndirect,
+      filterGlossy: s.filterGlossy,
       seed: s.seed,
       background:
         s.background === 'COLOR'

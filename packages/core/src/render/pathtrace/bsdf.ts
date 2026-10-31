@@ -357,16 +357,20 @@ export class PrincipledBSDF {
   /**
    * Prepares the closure. `wo` is the local outgoing direction (wz > 0); `entering` is true when
    * wo is outside the object (front face), which decides the IOR ratio for transmission.
+   * `minAlpha` raises the GGX α of every microfacet lobe to at least that value (path
+   * regularization, Cycles' "Filter Glossy").
    */
-  setup(p: BSDFInputs, wox: number, woy: number, woz: number, entering: boolean): void {
+  setup(p: BSDFInputs, wox: number, woy: number, woz: number, entering: boolean, minAlpha = 0): void {
     this.wox = wox;
     this.woy = woy;
     this.woz = Math.max(1e-6, woz);
     const mu = this.woz;
-    const rough = clamp01(p.roughness);
+    // roughness = √α: a blurred lobe also uses the albedo tables of its effective roughness
+    const minRough = minAlpha > 0 ? Math.sqrt(Math.min(1, minAlpha)) : 0;
+    const rough = Math.max(clamp01(p.roughness), minRough);
     this.alpha = Math.max(ALPHA_MIN, rough * rough);
     this.a2 = this.alpha * this.alpha;
-    const cr = clamp01(p.coatRoughness);
+    const cr = Math.max(clamp01(p.coatRoughness), minRough);
     this.alphaC = Math.max(ALPHA_MIN, cr * cr);
     this.a2C = this.alphaC * this.alphaC;
     const ior = p.ior > 1e-3 && Number.isFinite(p.ior) ? p.ior : 1.5;

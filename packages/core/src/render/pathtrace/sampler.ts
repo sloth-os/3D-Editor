@@ -104,24 +104,50 @@ export class Sampler {
   private pixelSeed = 0;
   private sampleSeed = 0;
   private index = 0;
+  private indexReversed = 0;
+  private px = -1;
+  private py = -1;
+  /**
+   * Per-pixel scramble seeds of the Sobol pairs (index shuffle, first and second coordinate),
+   * filled lazily: `seedGen[dim] === gen` marks the entries valid for the current pixel.
+   */
+  private readonly seeds = new Uint32Array(SOBOL_PAIRS * 3);
+  private readonly seedGen = new Int32Array(SOBOL_PAIRS);
+  private gen = 0;
 
   constructor(private readonly seed = 0) {}
 
   start(px: number, py: number, sampleIndex: number): void {
-    this.pixelSeed = hash2(hash2(px >>> 0, py >>> 0), this.seed >>> 0);
+    if (px !== this.px || py !== this.py || this.gen === 0) {
+      // new pixel: its seeds (consecutive samples of one pixel share them)
+      this.px = px;
+      this.py = py;
+      this.pixelSeed = hash2(hash2(px >>> 0, py >>> 0), this.seed >>> 0);
+      this.gen = (this.gen + 1) | 0 || 1;
+    }
     this.index = sampleIndex >>> 0;
+    this.indexReversed = reverseBits(this.index);
     this.sampleSeed = hash2(this.pixelSeed, this.index);
   }
 
   next2D(dim: number): void {
-    const s = hash32(this.pixelSeed ^ Math.imul(dim + 1, 0x9e3779b9));
     if (dim < SOBOL_PAIRS) {
+      const k = dim * 3;
+      const seeds = this.seeds;
+      if (this.seedGen[dim] !== this.gen) {
+        const s = hash32(this.pixelSeed ^ Math.imul(dim + 1, 0x9e3779b9));
+        seeds[k] = s;
+        seeds[k + 1] = hash32(s + 1);
+        seeds[k + 2] = hash32(s + 2);
+        this.seedGen[dim] = this.gen;
+      }
       // shuffle the sample index (first 2^m indices map onto an aligned block of 2^m) …
-      const idx = dim === 0 ? this.index : reverseBits(scrambleLow(reverseBits(this.index), s));
+      const idx = dim === 0 ? this.index : reverseBits(scrambleLow(this.indexReversed, seeds[k]));
       // … then scramble both coordinates (dimension 0 of Sobol is the bit-reversed index)
-      this.u0 = reverseBits(scrambleLow(idx, hash32(s + 1))) * INV_2_32;
-      this.u1 = reverseBits(scrambleLow(sobol1Reversed(idx), hash32(s + 2))) * INV_2_32;
+      this.u0 = reverseBits(scrambleLow(idx, seeds[k + 1])) * INV_2_32;
+      this.u1 = reverseBits(scrambleLow(sobol1Reversed(idx), seeds[k + 2])) * INV_2_32;
     } else {
+      const s = hash32(this.pixelSeed ^ Math.imul(dim + 1, 0x9e3779b9));
       const h = hash2(this.sampleSeed, s);
       this.u0 = h * INV_2_32;
       this.u1 = hash32(h + 0x3c6ef372) * INV_2_32;

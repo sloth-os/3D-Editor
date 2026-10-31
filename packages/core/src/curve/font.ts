@@ -42,6 +42,34 @@ const BIG = 5000;
 
 type Pt = [number, number];
 
+/**
+ * Point where a line from `p` touches the ellipse (cx, cy, rx, ry): the touching point on the left
+ * (`left`) or right of the direction from `p` to the centre (the centre itself if `p` is inside).
+ */
+function tangentPoint(cx: number, cy: number, rx: number, ry: number, p: Pt, left: boolean): Pt {
+  const f = (t: number) => {
+    const ex = cx + rx * Math.cos(t) - p[0];
+    const ey = cy + ry * Math.sin(t) - p[1];
+    return ex * ry * Math.cos(t) + ey * rx * Math.sin(t);
+  };
+  const N = 720;
+  let best: Pt | null = null;
+  for (let i = 0; i < N; i++) {
+    let a = (i / N) * Math.PI * 2;
+    let b = ((i + 1) / N) * Math.PI * 2;
+    if (f(a) * f(b) > 0) continue;
+    for (let it = 0; it < 60; it++) {
+      const m = (a + b) / 2;
+      if (f(a) * f(m) <= 0) b = m;
+      else a = m;
+    }
+    const e: Pt = [cx + rx * Math.cos(a), cy + ry * Math.sin(a)];
+    const side = (cx - p[0]) * (e[1] - p[1]) - (cy - p[1]) * (e[0] - p[0]);
+    if (side > 0 === left) best = e;
+  }
+  return best ?? [cx, cy];
+}
+
 /** Construction kit bound to an arc resolution (segments per quarter circle). */
 class Kit {
   constructor(readonly seg: number) {}
@@ -98,6 +126,38 @@ class Kit {
     return intersect(this.ring(cx, cy, rx, ry, wx, wy), this.wedge(cx, cy, a0, a1));
   }
 
+  /**
+   * Monoline wave (tilde): a stroke of width w centred on y = cy + amp·sin(t) for t from t0 to t1
+   * (radians), spread over x0..x1, with ends cut square to the stroke.
+   */
+  wave(
+    x0: number,
+    x1: number,
+    cy: number,
+    amp: number,
+    w: number,
+    t0 = -0.3 * Math.PI,
+    t1 = 2.3 * Math.PI,
+  ): Shape {
+    const n = Math.max(8, this.seg * 4);
+    const sx = (x1 - x0) / (t1 - t0);
+    const left: Vec2[] = [];
+    const right: Vec2[] = [];
+    for (let i = 0; i <= n; i++) {
+      const t = t0 + ((t1 - t0) * i) / n;
+      const px = x0 + (t - t0) * sx;
+      const py = cy + amp * Math.sin(t);
+      const dx = sx;
+      const dy = amp * Math.cos(t);
+      const l = Math.hypot(dx, dy) || 1;
+      const nx = (-dy / l) * (w / 2);
+      const ny = (dx / l) * (w / 2);
+      left.push([px + nx, py + ny]);
+      right.push([px - nx, py - ny]);
+    }
+    return polygon([...right, ...left.reverse()]);
+  }
+
   /** Straight stroke of width w along a centre line, extended by `ext` beyond both ends. */
   stroke(x0: number, y0: number, x1: number, y1: number, w = V, ext = 0): Shape {
     const dx = x1 - x0;
@@ -134,7 +194,10 @@ class Kit {
     );
   }
 
-  /** Chevron whose arms run from `tip` through `a` and `b`, extended far beyond them (cut with `clip`/`band`). */
+  /**
+   * Chevron whose arms run from `tip` through `a` and `b`, extended far beyond them (cut with
+   * `clip`/`band`).
+   */
   fork(tip: Pt, a: Pt, b: Pt, w = V): Shape {
     const far = (p: Pt): Pt => {
       const dx = p[0] - tip[0];
@@ -152,27 +215,7 @@ class Kit {
    * side of the tangent line.
    */
   tangentStroke(cx: number, cy: number, rx: number, ry: number, p: Pt, left: boolean, w = V): Shape {
-    const f = (t: number) => {
-      const ex = cx + rx * Math.cos(t) - p[0];
-      const ey = cy + ry * Math.sin(t) - p[1];
-      return ex * ry * Math.cos(t) + ey * rx * Math.sin(t);
-    };
-    const N = 720;
-    let best: Pt | null = null;
-    for (let i = 0; i < N; i++) {
-      let a = (i / N) * Math.PI * 2;
-      let b = ((i + 1) / N) * Math.PI * 2;
-      if (f(a) * f(b) > 0) continue;
-      for (let it = 0; it < 60; it++) {
-        const m = (a + b) / 2;
-        if (f(a) * f(m) <= 0) b = m;
-        else a = m;
-      }
-      const e: Pt = [cx + rx * Math.cos(a), cy + ry * Math.sin(a)];
-      const side = (cx - p[0]) * (e[1] - p[1]) - (cy - p[1]) * (e[0] - p[0]);
-      if (side > 0 === left) best = e;
-    }
-    const e = best ?? [cx, cy];
+    const e = tangentPoint(cx, cy, rx, ry, p, left);
     const dx = e[0] - p[0];
     const dy = e[1] - p[1];
     const l = Math.hypot(dx, dy) || 1;
@@ -319,24 +362,33 @@ const grave = (k: Kit, cx: number, base: number) =>
   k.band(k.leg(cx + 45, base - 10, cx - 70, base + 160, 72), base, base + 150);
 const circumflex = (k: Kit, cx: number, base: number) =>
   k.chevron([cx, base + 150], [cx - 120, base], [cx + 120, base], 70);
-const diaeresis = (k: Kit, cx: number, base: number) =>
-  union(k.dot(cx - 100, base + 50, 50), k.dot(cx + 100, base + 50, 50));
+/** Two dots; `narrow` letters (i, I) get closer, smaller dots that stay within their advance. */
+const diaeresis = (k: Kit, cx: number, base: number, narrow = false) => {
+  const d = narrow ? 76 : 100;
+  const r = narrow ? 44 : 50;
+  return union(k.dot(cx - d, base + 50, r), k.dot(cx + d, base + 50, r));
+};
 const ringAccent = (k: Kit, cx: number, base: number) => k.ring(cx, base + 80, 78, 78, 52, 52);
-function tildeShape(k: Kit, cx: number, cy: number, rx: number, ry: number, w: number): Shape {
-  // two ring sectors joined end to end: a hump on the left, a dip on the right (S-shaped wave)
-  const c1 = cx - rx + w / 2;
-  const c2 = c1 + 2 * rx - w;
-  return union(k.arc(c1, cy, rx, ry, 0, 150, w, w * 0.8), k.arc(c2, cy, rx, ry, 180, 330, w, w * 0.8));
-}
-const tildeAccent = (k: Kit, cx: number, base: number) => tildeShape(k, cx, base + 60, 104, 66, 58);
+const tildeAccent = (k: Kit, cx: number, base: number) =>
+  k.wave(cx - 120, cx + 120, base + 58, 28, 54, -0.2 * Math.PI, 2.2 * Math.PI);
+/**
+ * Cedilla hanging from the baseline at cx: a short stem turning into a hook that curls back left
+ * (the hook's cut end is flush with the stem's right edge).
+ */
 const cedilla = (k: Kit, cx: number) =>
-  union(k.rect(cx - 26, -76, cx + 26, 10), k.arc(cx, -132, 74, 66, -150, 110, 52, 46));
+  union(k.rect(cx - 26, -110, cx + 20, 10), k.arc(cx + 20, -134, 78, 66, -150, 90, 48, 42));
+
+/**
+ * Left parenthesis: the left half of a tall elliptical ring, cut flat above the capitals and below
+ * the baseline.
+ */
+const paren = (k: Kit) => k.band(k.clip(k.ring(350, 305, 260, 520, 84, 40), -BIG, -BIG, 350, BIG), -150, 760);
 
 // ------------------------------------------------------------------ glyph table
 
 const G: Record<string, GlyphDef> = {
   ' ': { adv: 260 },
-  ' ': { adv: 260 },
+  '\u00a0': { adv: 260 }, // no-break space
 
   // ---------------------------------------------------------------- uppercase
   A: {
@@ -376,7 +428,8 @@ const G: Record<string, GlyphDef> = {
     draw: (k) =>
       union(
         difference(k.ring(380, 350, 325, 350 + OV), k.wedge(380, 350, 0, 44)),
-        k.rect(400, 350 - H, 705, 350),
+        // the bar ends flush with the round outline
+        intersect(k.rect(400, 350 - H, 705, 350), k.ellipse(380, 350, 325, 350 + OV)),
       ),
   },
   H: {
@@ -687,16 +740,53 @@ const G: Record<string, GlyphDef> = {
   },
   '&': {
     adv: 720,
-    draw: (k) =>
-      union(
-        k.ring(250, 552, 128, CAP + OV - 552, 82, 72),
-        k.arc(276, 214, 226, 214 + OV, 110, 380),
-        k.band(k.leg(232, 440, 650, 0, V + 4), 0, 440),
-      ),
+    draw: (k) => {
+      // a loop on top, a leg leaving the loop's lower left tangentially for the baseline, and a bowl
+      // whose upper end joins the leg and which curls round to a tail on the right
+      const lx = 284;
+      const ly = 552;
+      const lrx = 118;
+      const lry = CAP + OV - ly;
+      const p: Pt = [590, 0];
+      const w = V + 4;
+      const e = tangentPoint(lx, ly, lrx, lry, p, true);
+      const ul = Math.hypot(e[0] - p[0], e[1] - p[1]) || 1;
+      let nx = -(e[1] - p[1]) / ul;
+      let ny = (e[0] - p[0]) / ul;
+      if ((lx - e[0]) * nx + (ly - e[1]) * ny < 0) {
+        nx = -nx;
+        ny = -ny;
+      }
+      // signed distance from the leg's centre line
+      const dist = (q: Pt) => (q[0] - p[0] - (nx * w) / 2) * nx + (q[1] - p[1] - (ny * w) / 2) * ny;
+      const bx = 298;
+      const by = 212;
+      const brx = 226;
+      const bry = by + OV;
+      const mid = (a: number): Pt => [
+        bx + (brx - V / 2) * Math.cos(a * DEG),
+        by + (bry - H / 2) * Math.sin(a * DEG),
+      ];
+      // the bowl's upper end is centred on the leg (first crossing going up its left side), so the
+      // cut end is hidden inside the leg
+      let a1 = 180;
+      while (a1 > 30 && dist(mid(a1 - 2)) * dist(mid(180)) > 0) a1 -= 2;
+      let a0 = a1 - 2;
+      for (let i = 0; i < 30; i++) {
+        const m = (a0 + a1) / 2;
+        if (dist(mid(a0)) * dist(mid(m)) <= 0) a1 = m;
+        else a0 = m;
+      }
+      const leg = difference(
+        k.clip(k.tangentStroke(lx, ly, lrx, lry, p, true, w), -BIG, 0, BIG, BIG),
+        k.ellipse(lx, ly, lrx - 78, lry - 72),
+      );
+      return union(k.ring(lx, ly, lrx, lry, 78, 72), leg, k.arc(bx, by, brx, bry, (a0 + a1) / 2, 394));
+    },
   },
   "'": { adv: 220, draw: (k) => k.rect(70, 470, 150, CAP) },
-  '(': { adv: 320, draw: (k) => k.arc(330, 290, 230, 520, 118, 242, 84, 84) },
-  ')': { adv: 320, draw: (k) => mirrorX(k.arc(330, 290, 230, 520, 118, 242, 84, 84), 160) },
+  '(': { adv: 330, draw: (k) => paren(k) },
+  ')': { adv: 330, draw: (k) => mirrorX(paren(k), 165) },
   '*': {
     adv: 500,
     draw: (k) =>
@@ -780,14 +870,14 @@ const G: Record<string, GlyphDef> = {
         175,
       ),
   },
-  '~': { adv: 600, draw: (k) => tildeShape(k, 300, 300, 132, 100, 70) },
+  '~': { adv: 600, draw: (k) => k.wave(90, 510, 310, 46, 72, -0.2 * Math.PI, 2.2 * Math.PI) },
 };
 
 // ------------------------------------------------------------------ Latin-1 additions
 
 const LOWER_ACCENT = 570;
 const UPPER_ACCENT = 765;
-type AccentFn = (k: Kit, cx: number, base: number) => Shape;
+type AccentFn = (k: Kit, cx: number, base: number, narrow?: boolean) => Shape;
 const ACCENTS: Record<string, AccentFn> = {
   grave,
   acute,
@@ -862,7 +952,7 @@ Object.assign(G, {
       union(
         k.rect(76, 0, 76 + V, 560),
         k.arc(262, 560, 186, ASC + OV - 560, -90, 180),
-        k.arc(262, 217, 240, 229, -118, 90),
+        k.arc(262, 217, 240, 229, -136, 90),
       ),
   },
   Ø: {
@@ -889,7 +979,7 @@ Object.assign(G, {
       const cut = intersect(k.wedge(cx, 250, -44, 0), k.rect(-BIG, -BIG, BIG, yb));
       return union(
         bowl(k, 278),
-        k.rect(278 + BOWL_RX - V, -OV, 278 + BOWL_RX, XH + OV),
+        k.rect(278 + BOWL_RX - V, 0, 278 + BOWL_RX, XH),
         difference(bowl(k, cx), cut, k.rect(-BIG, -BIG, 470, BIG)),
         k.rect(cx - BOWL_RX + 20, yb, cx + BOWL_RX - 10, yb + H),
       );
@@ -970,8 +1060,12 @@ Object.assign(G, {
   },
   '§': {
     adv: 560,
-    draw: (k: Kit) =>
-      union(sShape(k, 280, 160, CAP + OV, 170, 180, 78, 70), sShape(k, 280, -OV, 540, 180, 170, 78, 70)),
+    draw: (k: Kit) => {
+      // a middle loop with an S-like hook above (open to the lower right) and its 180° turn below; the
+      // hooks' cut ends lie inside the loop's stroke
+      const hook = k.arc(280, 566, 150, CAP + OV - 566, -35, 270, 76, 60);
+      return union(k.ring(280, 330, 165, 155, 76, 68), hook, rotate180(hook, 280, 330));
+    },
   },
   '¶': {
     adv: 600,
@@ -998,7 +1092,8 @@ for (const [ch, [base, accent, cx]] of Object.entries(COMPOSITES)) {
   const upper = base === base.toUpperCase() && base !== 'ı';
   G[ch] = {
     adv: G[base].adv,
-    draw: (k) => union(G[base].draw!(k), ACCENTS[accent](k, cx, upper ? UPPER_ACCENT : LOWER_ACCENT)),
+    draw: (k) =>
+      union(G[base].draw!(k), ACCENTS[accent](k, cx, upper ? UPPER_ACCENT : LOWER_ACCENT, G[base].adv < 300)),
   };
 }
 

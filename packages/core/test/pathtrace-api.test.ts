@@ -3,11 +3,16 @@ import { SceneDoc, createPlane, createUVSphere, renderSceneSoftware, type Render
 import {
   PathFilm,
   PathTracer,
+  VIEW_TRANSFORMS,
+  applyViewTransform,
   denoiseFilm,
   filmToRGBA8,
   pathTileTransferables,
   renderPathTracedImage,
+  viewTransformOf,
 } from '../src/render/pathtrace';
+import { linearToSrgb } from '../src/render/color';
+import { defaultProcedural } from '../src/material/procedural';
 import { SceneEvaluator } from '../src/eval/evaluate';
 import { renderItems } from '../src/eval/renderables';
 import { viewFromCamera } from '../src/render/view';
@@ -115,6 +120,136 @@ describe('renderSceneSoftware dispatch', () => {
   });
 });
 
+describe('display transforms', () => {
+  const out = [0, 0, 0];
+  const show = (vt: (typeof VIEW_TRANSFORMS)[number], r: number, g = r, b = r) => {
+    applyViewTransform(vt, r, g, b, out);
+    return [...out];
+  };
+
+  it('STANDARD is the sRGB transfer function; the filmic transforms keep middle grey and roll off highlights', () => {
+    for (const v of [0, 0.002, 0.05, 0.18, 0.7, 1, 3])
+      expect(show('STANDARD', v)[0]).toBeCloseTo(linearToSrgb(v), 12);
+    for (const vt of ['AGX', 'FILMIC', 'ACES'] as const) {
+      expect(show(vt, 0.18)[0]).toBeCloseTo(linearToSrgb(0.18), 6);
+      // neutral in, neutral out, monotonic over 23 stops, within [0, 1]
+      let prev = 0;
+      for (let e = -14; e <= 9; e += 0.05) {
+        const [r, g, b] = show(vt, 2 ** e);
+        expect(r).toBeGreaterThanOrEqual(prev);
+        expect(r).toBeLessThanOrEqual(1);
+        expect(g).toBeCloseTo(r, 12);
+        expect(b).toBeCloseTo(r, 12);
+        prev = r;
+      }
+      // scene white stays below display white, +4 stops are still distinguishable, +8 stops clip
+      expect(show(vt, 1)[0]).toBeGreaterThan(0.7);
+      expect(show(vt, 1)[0]).toBeLessThan(0.85);
+      expect(show(vt, 16)[0]).toBeGreaterThan(show(vt, 8)[0]);
+      expect(show(vt, 64)[0]).toBe(1);
+    }
+  });
+
+  it('AgX and Filmic take very bright saturated colours to white; Standard and ACES keep them saturated', () => {
+    for (const vt of ['AGX', 'FILMIC'] as const) {
+      const [r, g, b] = show(vt, 64, 0, 0);
+      expect(r).toBeGreaterThan(0.99);
+      expect(Math.min(g, b)).toBeGreaterThan(0.6);
+      // moderately bright colours keep their hue
+      const [r1, g1, b1] = show(vt, 1, 0.3, 0.05);
+      expect(r1).toBeGreaterThan(g1);
+      expect(g1).toBeGreaterThan(b1);
+    }
+    expect(show('STANDARD', 64, 0, 0)).toEqual([1, 0, 0]);
+    expect(show('ACES', 64, 0, 0)).toEqual([1, 0, 0]);
+  });
+
+  it('NEUTRAL is almost the identity below its compression start and compresses the peak above', () => {
+    // Khronos PBR Neutral: a 0.04 offset above 0.08, nothing else below 0.76
+    expect(show('NEUTRAL', 0.5)[0]).toBeCloseTo(linearToSrgb(0.46), 12);
+    // below 0.08 the offset x − 6.25x² leaves 6.25x² (a smooth toe)
+    expect(show('NEUTRAL', 0.02)[0]).toBeCloseTo(linearToSrgb(6.25 * 0.02 * 0.02), 12);
+    const [r, g, b] = show('NEUTRAL', 20, 10, 5);
+    expect(r).toBeLessThan(1);
+    expect(r).toBeGreaterThan(g);
+    expect(g).toBeGreaterThan(b);
+  });
+
+  it('maps negative and non-finite input to black and unknown names to STANDARD', () => {
+    for (const vt of VIEW_TRANSFORMS) expect(show(vt, NaN, -1, Infinity)).toEqual([0, 0, 0]);
+    expect(viewTransformOf('AGX')).toBe('AGX');
+    expect(viewTransformOf('Filmic Log')).toBe('STANDARD');
+    expect(viewTransformOf(undefined)).toBe('STANDARD');
+  });
+
+  it('applies the scene view transform to path traced renders (the linear film is unchanged)', () => {
+    const doc = SceneDoc.create({ empty: true });
+    doc.updateWorld({ environment: 'NONE', color: [0, 0, 0] });
+    // a camera-filling emitter with radiance 3
+    doc.addObject({
+      type: 'MESH',
+      name: 'Glow',
+      data: doc.addMesh('Glow', createPlane({ size: 20 })),
+      material_slots: [
+        doc.addMaterial({
+          base_color: [0, 0, 0, 1],
+          ior: 1,
+          emission_color: [1, 0.25, 0.1],
+          emission_strength: 3,
+        }),
+      ],
+    });
+    topCamera(doc, 2, 5);
+    doc.updateRender({ engine: 'PATHTRACER', samples: 2, use_denoising: false });
+    const opts = { width: 4, height: 4 };
+    const expected = (vt: (typeof VIEW_TRANSFORMS)[number], r: number, g: number, b: number) =>
+      show(vt, r, g, b).map((v) => Math.round(v * 255));
+    const near = (a: number[], b: number[]) =>
+      a.forEach((v, i) => expect(Math.abs(v - b[i])).toBeLessThanOrEqual(1));
+    const seen = new Set<string>();
+    for (const vt of VIEW_TRANSFORMS) {
+      doc.updateRender({ view_transform: vt });
+      const c = centre(renderSceneSoftware(doc, opts));
+      near(c.slice(0, 3), expected(vt, 3, 0.75, 0.3));
+      expect(c[3]).toBe(255);
+      seen.add(c.join());
+    }
+    expect(seen.size).toBe(VIEW_TRANSFORMS.length);
+    // Standard clips the red channel, AgX keeps it below white
+    doc.updateRender({ view_transform: 'STANDARD' });
+    expect(centre(renderSceneSoftware(doc, opts))[0]).toBe(255);
+    doc.updateRender({ view_transform: 'AGX' });
+    expect(centre(renderSceneSoftware(doc, opts))[0]).toBeLessThan(250);
+    // exposure is applied before the transform
+    doc.updateRender({ exposure: -2 });
+    near(centre(renderSceneSoftware(doc, opts)).slice(0, 3), expected('AGX', 0.75, 0.1875, 0.075));
+  });
+
+  it('filmToRGBA8 composites a display-space background behind partial coverage', () => {
+    // pixel 0: half-covered mid grey; pixel 1: empty
+    const lin = new Float32Array([0.09, 0.09, 0.09, 0.5, 0, 0, 0, 0]);
+    const grey = Math.round(linearToSrgb(0.18) * 255);
+    const mix = Math.round((linearToSrgb(0.18) + 1) * 0.5 * 255);
+    for (const vt of ['STANDARD', 'AGX'] as const) {
+      expect([...filmToRGBA8(lin, 2, 1, 1, vt)]).toEqual([grey, grey, grey, 128, 0, 0, 0, 0]);
+      expect([...filmToRGBA8(lin, 2, 1, 1, vt, [1, 1, 1, 1])]).toEqual([
+        mix,
+        mix,
+        mix,
+        255,
+        255,
+        255,
+        255,
+        255,
+      ]);
+      // a half transparent background
+      const half = filmToRGBA8(lin, 2, 1, 1, vt, [0, 0, 1, 0.5]);
+      expect([...half.subarray(4)]).toEqual([0, 0, 255, 128]);
+      expect(half[3]).toBe(191);
+    }
+  });
+});
+
 describe('work splitting', () => {
   it('gives the same samples for any row partition and on a structured-cloned scene (workers)', () => {
     const doc = emitterLitFloor();
@@ -135,6 +270,50 @@ describe('work splitting', () => {
     const s1 = tracer.renderRows(0, 9, 2, 4);
     for (let i = 0; i < full.color.length; i++)
       expect(s0.color[i] + s1.color[i]).toBeCloseTo(full.color[i], 4);
+  });
+
+  it('structured-clones scenes with a procedural sky, procedural textures and emitters', () => {
+    const doc = SceneDoc.create({ empty: true });
+    doc.updateWorld({ environment: 'SKY', show_environment_background: true });
+    const slot = (type: 'CHECKER' | 'NOISE', mapping: 'OBJECT' | 'GENERATED') => ({
+      image: '',
+      scale: [1, 1] as [number, number],
+      offset: [0, 0] as [number, number],
+      procedural: defaultProcedural(type, { mapping, scale: 3 }),
+    });
+    doc.addObject({
+      type: 'MESH',
+      name: 'Ground',
+      data: doc.addMesh('Ground', createPlane({ size: 20 })),
+      material_slots: [
+        doc.addMaterial({
+          textures: { base_color: slot('CHECKER', 'OBJECT'), normal: slot('NOISE', 'GENERATED') },
+        }),
+      ],
+    });
+    doc.addObject({
+      type: 'MESH',
+      name: 'Ball',
+      data: doc.addMesh('Ball', createUVSphere({ segments: 16, ring_count: 8 })),
+      location: [0, 0, 1],
+      material_slots: [
+        doc.addMaterial({
+          emission_strength: 2,
+          emission_color: [1, 0.5, 0.2],
+          textures: { emission: slot('NOISE', 'GENERATED') },
+        }),
+      ],
+    });
+    const tracer = tracerFor(doc, {
+      width: 12,
+      height: 8,
+      samples: 2,
+      view: { position: [0, -6, 2.5], target: [0, 0, 0.5] },
+    });
+    expect(tracer.scene.environment.kind).toBe(2);
+    expect(tracer.scene.emitters).toHaveLength(1);
+    const clone = new PathTracer(structuredClone(tracer.scene), structuredClone(tracer.settings));
+    expect(clone.renderRows(0, 8, 0, 2).color).toEqual(tracer.renderRows(0, 8, 0, 2).color);
   });
 
   it('accumulates tiles in a film and tracks samples per row', () => {

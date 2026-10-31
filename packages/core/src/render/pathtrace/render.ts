@@ -1,12 +1,12 @@
 import type { Vec4 } from '../../math/types';
 import type { SceneDoc } from '../../doc/scene-doc';
-import type { CameraData } from '../../doc/types';
+import type { CameraData, ViewTransform } from '../../doc/types';
 import type { EvaluatedScene } from '../../eval/evaluate';
 import type { RenderItem } from '../../eval/renderables';
-import { linearToSrgbByte, srgbToLinear } from '../color';
 import type { SampledTexture } from '../raster';
 import type { RenderView } from '../view';
 import { compileScene, type CompiledScene, type SceneLight } from './compile';
+import { filmToRGBA8, viewTransformOf, type DisplayBackground } from './display';
 import {
   PathTracer,
   pathTracerSettings,
@@ -27,8 +27,15 @@ export interface PathTraceRenderOptions {
   time_limit?: number;
   /** Noise pattern seed (default 0). */
   seed?: number;
-  /** RGBA background in 0..1 display (sRGB) values instead of the world (alpha < 1 = transparent). */
+  /**
+   * RGBA background in 0..1 display (sRGB) values instead of the world (alpha < 1 = transparent),
+   * composited after the view transform so it shows exactly this colour.
+   */
   background?: Vec4;
+  /** Display transform (default: render settings `view_transform`). */
+  view_transform?: ViewTransform;
+  /** Cycles' Filter Glossy: blur glossy lobes after blurry bounces against caustic noise (default 1, 0 = off). */
+  filter_glossy?: number;
   /** Called after every progressive pass; return false to stop early. */
   onProgress?: (p: PathTraceProgress) => boolean | void;
 }
@@ -82,16 +89,24 @@ export function sceneLights(scene: EvaluatedScene): SceneLight[] {
 
 const fin = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
 
+/** Everything a (possibly distributed) render needs; see `preparePathTrace`. */
+export interface PreparedPathTrace {
+  scene: CompiledScene;
+  settings: PathTracerSettings;
+  /** Exposure factor 2^exposure for the display conversion. */
+  exposure: number;
+  /** View transform for the display conversion (`filmToRGBA8`). */
+  viewTransform: ViewTransform;
+  /** Explicit display-space background to composite in `filmToRGBA8`, or null. */
+  displayBackground: DisplayBackground | null;
+}
+
 /**
  * Compiles the scene and the tracer settings of a render (render settings, world background,
  * film transparency, mist and the option overrides). The result is plain data: post it to workers
  * and construct a `PathTracer` from it on each of them.
  */
-export function preparePathTrace(input: PathTraceRenderInput): {
-  scene: CompiledScene;
-  settings: PathTracerSettings;
-  exposure: number;
-} {
+export function preparePathTrace(input: PathTraceRenderInput): PreparedPathTrace {
   const ev = input.scene;
   const render = ev.render;
   const world = ev.world;
@@ -108,23 +123,23 @@ export function preparePathTrace(input: PathTraceRenderInput): {
     image: (id) => input.images.get(id),
   });
   let background: PathTracerSettings['background'] = 'COLOR';
-  let backgroundColor: PathTracerSettings['backgroundColor'];
+  let displayBackground: DisplayBackground | null = null;
   const ws = Math.max(0, fin(world.strength, 1));
+  const backgroundColor: PathTracerSettings['backgroundColor'] = [
+    Math.max(0, fin(world.color?.[0], 0)) * ws,
+    Math.max(0, fin(world.color?.[1], 0)) * ws,
+    Math.max(0, fin(world.color?.[2], 0)) * ws,
+    1,
+  ];
   if (o.background) {
-    // display values like the rasterizer: not affected by the exposure
+    // display values like the rasterizer (not affected by exposure or view transform): the film
+    // stays transparent where camera rays escape and the colour is composited after display
+    background = 'TRANSPARENT';
     const b = o.background;
-    const c = (v: number) => srgbToLinear(Math.min(1, Math.max(0, fin(v, 0)))) / exposure;
-    backgroundColor = [c(b[0]), c(b[1]), c(b[2]), Math.min(1, Math.max(0, fin(b[3], 1)))];
-  } else {
-    if (render.film_transparent) background = 'TRANSPARENT';
-    else if (world.show_environment_background && world.environment !== 'NONE') background = 'ENVIRONMENT';
-    backgroundColor = [
-      Math.max(0, fin(world.color?.[0], 0)) * ws,
-      Math.max(0, fin(world.color?.[1], 0)) * ws,
-      Math.max(0, fin(world.color?.[2], 0)) * ws,
-      1,
-    ];
-  }
+    const c = (v: unknown) => Math.min(1, Math.max(0, fin(v, 0)));
+    displayBackground = [c(b[0]), c(b[1]), c(b[2]), Math.min(1, Math.max(0, fin(b[3], 1)))];
+  } else if (render.film_transparent) background = 'TRANSPARENT';
+  else if (world.show_environment_background && world.environment !== 'NONE') background = 'ENVIRONMENT';
   const settings = pathTracerSettings({
     width: input.width,
     height: input.height,
@@ -133,49 +148,31 @@ export function preparePathTrace(input: PathTraceRenderInput): {
     denoise: o.denoise ?? render.use_denoising,
     timeLimit: o.time_limit ?? 0,
     seed: o.seed ?? 0,
+    filterGlossy: o.filter_glossy ?? 1,
     background,
     backgroundColor,
     mistDensity: fin(world.mist_density, 0),
     mistColor: world.mist_color ?? [0, 0, 0],
   });
-  return { scene: compiled, settings, exposure };
-}
-
-/**
- * Converts a linear premultiplied RGBA film to RGBA8 with the software renderers' display
- * transform (exposure, linear → sRGB), un-premultiplying partially covered pixels.
- */
-export function filmToRGBA8(
-  linear: Float32Array,
-  width: number,
-  height: number,
-  exposure = 1,
-): Uint8ClampedArray {
-  const out = new Uint8ClampedArray(width * height * 4);
-  for (let i = 0; i < width * height; i++) {
-    const a = Math.min(1, Math.max(0, linear[i * 4 + 3]));
-    const o = i * 4;
-    if (a > 0) {
-      const k = exposure / a;
-      out[o] = linearToSrgbByte(linear[o] * k);
-      out[o + 1] = linearToSrgbByte(linear[o + 1] * k);
-      out[o + 2] = linearToSrgbByte(linear[o + 2] * k);
-    }
-    out[o + 3] = Math.round(a * 255);
-  }
-  return out;
+  return {
+    scene: compiled,
+    settings,
+    exposure,
+    viewTransform: viewTransformOf(o.view_transform ?? render.view_transform),
+    displayBackground,
+  };
 }
 
 /** Path traces an evaluated scene and returns display-ready RGBA8 pixels. */
 export function renderPathTracedImage(input: PathTraceRenderInput): PathTracedImage {
-  const { scene, settings, exposure } = preparePathTrace(input);
+  const { scene, settings, exposure, viewTransform, displayBackground } = preparePathTrace(input);
   const tracer = new PathTracer(scene, settings);
   const stats = tracer.render(settings.samples, input.options?.onProgress);
   const linear = tracer.resolve();
   return {
     width: settings.width,
     height: settings.height,
-    data: filmToRGBA8(linear, settings.width, settings.height, exposure),
+    data: filmToRGBA8(linear, settings.width, settings.height, exposure, viewTransform, displayBackground),
     stats: { ...stats, warnings: [...scene.warnings] },
   };
 }

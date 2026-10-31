@@ -4,6 +4,7 @@ import {
   FONT_DESCENT,
   SceneDoc,
   SceneEvaluator,
+  countInconsistentEdges,
   curveToMesh,
   defaultCurve,
   faceNormalRaw,
@@ -115,7 +116,13 @@ describe('built-in font', () => {
     };
     for (const [ch, n] of Object.entries(expected)) expect(holes(ch), ch).toBe(n);
     expect(holes('@')).toBeGreaterThanOrEqual(1);
-    expect(holes('&')).toBeGreaterThanOrEqual(1);
+    // & = loop + bowl counters; § = one middle loop between two open hooks
+    expect([outers('&'), holes('&')]).toEqual([1, 2]);
+    expect([outers('§'), holes('§')]).toEqual([1, 1]);
+    for (const ch of '()~[]{}çÇ') expect(holes(ch), ch).toBe(0);
+    expect(holes('ß')).toBe(1);
+    for (const ch of '()~çÇ') expect(outers(ch), ch).toBe(1);
+    expect(holes('æ')).toBe(2);
     expect(outers('i')).toBe(2);
     expect(outers('j')).toBe(2);
     expect(outers('!')).toBe(2);
@@ -152,6 +159,17 @@ describe('built-in font', () => {
     for (const ch of 'pq') expect(box(ch).y0, ch).toBeCloseTo(-220);
     // ink stays within the advance (small overhangs allowed for f, j)
     for (const ch of 'ABCDEHKMNOSUVWXZabcdeghkmnopqsuvwxz0123456789') {
+      const b = box(ch);
+      expect(b.x0, ch).toBeGreaterThanOrEqual(0);
+      expect(b.x1, ch).toBeLessThanOrEqual(glyphAdvance(ch));
+    }
+    // brackets reach below the baseline and above the capitals
+    for (const ch of '()[]{}') {
+      expect(box(ch).y0, ch).toBeLessThan(-100);
+      expect(box(ch).y1, ch).toBeGreaterThan(740);
+    }
+    // symbols and narrow accented letters keep their ink within the advance
+    for (const ch of '&§()~ïÏíÍçÇæ') {
       const b = box(ch);
       expect(b.x0, ch).toBeGreaterThanOrEqual(0);
       expect(b.x1, ch).toBeLessThanOrEqual(glyphAdvance(ch));
@@ -301,6 +319,23 @@ describe('text geometry', () => {
     expect(m.faceSmooth.some(Boolean)).toBe(true);
     expect(m.faceSmooth.some((s) => !s)).toBe(true);
     expect(Object.keys(m.edgeAttrs).length).toBeGreaterThan(0);
+  });
+
+  it('extrudes every glyph into a watertight solid, also beveled, bolder or thinner', () => {
+    const configs: Partial<CurveData>[] = [
+      { extrude: 0.05 },
+      { extrude: 0.05, bevel_depth: 0.01, bevel_resolution: 2 },
+      { extrude: 0.04, offset: -0.008 },
+      { extrude: 0.04, bevel_depth: 0.008, bevel_resolution: 1, offset: 0.008 },
+    ];
+    for (const extra of configs)
+      for (const ch of fontCharacters()) {
+        if (ch.trim() === '') continue;
+        const m = curveToMesh(text(ch, extra), { forRender: false, isText: true }).mesh!;
+        const label = `${ch} ${JSON.stringify(extra)}`;
+        expect(isClosedManifold(m), label).toBe(true);
+        expect(countInconsistentEdges(m), label).toBe(0);
+      }
   });
 
   it('shows outlines only with fill_mode NONE and offsets make text bolder', () => {

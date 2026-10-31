@@ -59,7 +59,7 @@ function finite(v: unknown, fallback: number): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 }
 
-const isSpace = (ch: string) => ch === ' ' || ch === ' ' || ch === '\t';
+const isSpace = (ch: string) => ch === ' ' || ch === '\u00a0' || ch === '\t';
 
 /** Lays out the text of a FONT datablock (positions of every character, object space). */
 export function layoutText(t: TextSettings): TextLayout {
