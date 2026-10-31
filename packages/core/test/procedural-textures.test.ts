@@ -126,9 +126,17 @@ describe('sampleProcedural', () => {
     expect(new Set(m).size).toBe(5);
     for (let i = 1; i < m.length; i++) expect(m[i]).toBeLessThan(m[i - 1]);
     // EASE is symmetric, CONSTANT holds the colour of the stop at or below the factor
-    expect(red(tex('GRADIENT', { ramp_low: 1, ramp_high: 0, params: { ramp_interpolation: 'EASE' } }), [0.25, 0, 0]))
-      .toBeCloseTo(1 - 0.15625, 12);
-    const step = tex('GRADIENT', { ramp_low: 0.6, ramp_high: 0.2, params: { ramp_interpolation: 'CONSTANT' } });
+    expect(
+      red(
+        tex('GRADIENT', { ramp_low: 1, ramp_high: 0, params: { ramp_interpolation: 'EASE' } }),
+        [0.25, 0, 0],
+      ),
+    ).toBeCloseTo(1 - 0.15625, 12);
+    const step = tex('GRADIENT', {
+      ramp_low: 0.6,
+      ramp_high: 0.2,
+      params: { ramp_interpolation: 'CONSTANT' },
+    });
     expect(red(step, [0.1, 0, 0])).toBe(1);
     expect(red(step, [0.59, 0, 0])).toBe(1);
     expect(red(step, [0.6, 0, 0])).toBe(0);
@@ -244,7 +252,11 @@ describe('sampleProcedural', () => {
       const t = edge(metric);
       let zeros = 0;
       for (let i = 0; i < 4000; i++) {
-        const c: Vec3 = [Math.sin(i * 12.9898) * 43.7, Math.sin(i * 78.233) * 17.3, Math.sin(i * 39.425) * 29.1];
+        const c: Vec3 = [
+          Math.sin(i * 12.9898) * 43.7,
+          Math.sin(i * 78.233) * 17.3,
+          Math.sin(i * 39.425) * 29.1,
+        ];
         const e = red(t, c);
         if (e === 0) zeros++;
         expect(e).toBe(red(euclid, c));

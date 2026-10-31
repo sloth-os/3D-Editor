@@ -204,7 +204,7 @@ describe('STEPPED', () => {
     expect(at(s({ use_influence: true, influence: 0.5 }), 7)).toBe(5.5);
   });
 
-  it('applies time modifiers last-to-first and steps the value modifiers below', () => {
+  it('applies time modifiers last-to-first and steps every value modifier, wherever it is listed', () => {
     const coarseFirst = linearCurve([mod('STEPPED', { frame_step: 10 }), mod('STEPPED', { frame_step: 4 })]);
     expect(at(coarseFirst, 17)).toBe(10); // 17 → 16 (step 4) → 10 (step 10)
     const fineFirst = linearCurve([mod('STEPPED', { frame_step: 4 }), mod('STEPPED', { frame_step: 10 })]);
@@ -213,23 +213,75 @@ describe('STEPPED', () => {
     expect(at(steppedNoise, 5)).toBe(at(steppedNoise, 4));
     expect(at(steppedNoise, 7)).toBe(at(steppedNoise, 4));
     expect(at(steppedNoise, 8)).not.toBe(at(steppedNoise, 4));
+    // like Blender, a value modifier listed before the time modifier is stepped as well
+    const generatorFirst = linearCurve([
+      mod('GENERATOR', { coefficients: [0, 0.5], use_additive: true }),
+      mod('STEPPED', { frame_step: 4 }),
+    ]);
+    expect([8, 9, 10, 11].map((f) => at(generatorFirst, f))).toEqual([12, 12, 12, 12]); // 8 + 0.5 · 8
+    const noiseFirst = constantCurve(0, [mod('NOISE', { strength: 3 }), mod('STEPPED', { frame_step: 4 })]);
+    expect(at(noiseFirst, 7)).toBe(at(noiseFirst, 4));
+    // the descriptions say so (they used to claim only modifiers listed after it were affected)
+    const stepped = FMODIFIER_TYPE_INFO.find((i) => i.type === 'STEPPED')!.description;
+    expect(stepped).toMatch(/wherever it is in the stack/);
+    expect(stepped).not.toMatch(/listed after/);
   });
 
-  it('works with cyclic extrapolation and needs the sampler', () => {
+  it('works with cyclic extrapolation like a Cycles modifier at the top of the stack', () => {
     let fc = createFCurve({ target_type: 'object', target_id: 'x', path: 'location', index: 0 });
     fc = insertKeyframe(fc, 0, 0, 'LINEAR');
     fc = insertKeyframe(fc, 10, 10, 'LINEAR');
     const cyc: FCurve = { ...fc, extrapolation: 'CYCLIC', modifiers: [mod('STEPPED', { frame_step: 3 })] };
     expect(at(cyc, 14)).toBe(2); // stepped to 12, cycled to 2
-    // value modifiers see the real frame: the keys repeat every 10 frames, the noise does not
+    // value modifiers see the cycled time: they repeat with the keys, before them too
     const noisy: FCurve = { ...fc, extrapolation: 'CYCLIC', modifiers: [mod('NOISE')] };
     const plain: FCurve = { ...noisy, modifiers: [] };
     expect(at(plain, 13)).toBe(at(plain, 3));
-    expect(at(noisy, 13) - at(plain, 13)).toBeCloseTo(refNoise(13) - 0.5, 12);
-    expect(at(noisy, 13)).not.toBeCloseTo(at(noisy, 3), 6);
+    expect(at(noisy, 13)).toBe(at(noisy, 3));
+    expect(at(noisy, -7)).toBe(at(noisy, 3));
+    expect(at(noisy, 13) - at(plain, 13)).toBeCloseTo(refNoise(3) - 0.5, 12);
+    // not cyclic: the real frame
+    const held: FCurve = { ...noisy, extrapolation: 'CONSTANT' };
+    expect(at(held, 13) - 10).toBeCloseTo(refNoise(13) - 0.5, 12);
+    // a generator becomes a repeating ramp; restricted ranges are tested at the cycled time
+    const gen: FCurve = { ...fc, extrapolation: 'CYCLIC', modifiers: [mod('GENERATOR', { coefficients: [0, 2] })] };
+    expect([4, 14, 24, -6].map((f) => at(gen, f))).toEqual([8, 8, 8, 8]);
+    const ranged: FCurve = {
+      ...fc,
+      extrapolation: 'CYCLIC',
+      modifiers: [
+        mod('GENERATOR', {
+          coefficients: [100],
+          use_additive: true,
+          use_restricted_range: true,
+          frame_start: 2,
+          frame_end: 4,
+        }),
+      ],
+    };
+    expect([at(ranged, 3), at(ranged, 13), at(ranged, 16)]).toEqual([103, 103, 6]);
+    // time modifiers first, then the cycle: 14 → 12 (stepped) → 2 (cycled), for keys and noise
+    const steppedNoise: FCurve = {
+      ...fc,
+      extrapolation: 'CYCLIC',
+      modifiers: [mod('NOISE'), mod('STEPPED', { frame_step: 3 })],
+    };
+    expect(at(steppedNoise, 14)).toBeCloseTo(2 + refNoise(2) - 0.5, 12);
     // without a sampler (plain value API) time modifiers cannot resample: unchanged
     expect(applyFModifiers([mod('STEPPED', { frame_step: 4 })], 7, 7)).toBe(7);
     expect(applyFModifiers([mod('STEPPED', { frame_step: 4 })], 7, 7, (t) => t * 10)).toBe(40);
+    // `cycle` wraps the time the value modifiers see; a non-finite result is ignored
+    expect(applyFModifiers([mod('GENERATOR')], 17, 0, undefined, (t) => t % 10)).toBe(7);
+    expect(applyFModifiers([mod('GENERATOR')], 17, 0, undefined, () => Number.NaN)).toBe(17);
+  });
+
+  it('repeats a NOISE camera shake on a cyclic loop with every cycle', () => {
+    let fc = createFCurve({ target_type: 'object', target_id: 'a', path: 'location', index: 0 });
+    fc = insertKeyframe(insertKeyframe(insertKeyframe(fc, 1, 0, 'LINEAR'), 13, 1, 'LINEAR'), 25, 0, 'LINEAR');
+    const curve: FCurve = { ...fc, extrapolation: 'CYCLIC', modifiers: [mod('NOISE', { scale: 5, strength: 1 })] };
+    const first = [1, 5, 10, 24].map((f) => at(curve, f));
+    expect([25 + 24, 29, 34, 48].map((f) => at(curve, f))).toEqual(first); // frame 49 starts cycle 3 like 1
+    expect([-23, -19, -14, 0].map((f) => at(curve, f))).toEqual(first);
   });
 });
 

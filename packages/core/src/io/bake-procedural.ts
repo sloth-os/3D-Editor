@@ -586,11 +586,8 @@ export function bakeGeometryKey(geometry: BakeGeometry): string {
     for (const u of m.uvs ?? []) uvs.push(u.length, ...u);
     return `${hashNumbers(m.positions)}/${hashNumbers(faces)}/${m.uvs ? hashNumbers(uvs) : '-'}`;
   });
-  const orco = geometry.orco
-    ? typeof geometry.orco === 'object'
-      ? cachedHash(geometry.orco, () => hashNumbers(geometry.orco!))
-      : '-'
-    : '-';
+  const o = geometry.orco;
+  const orco = o ? cachedHash(o, () => hashNumbers(o)) : '-';
   const space = geometry.texMin && geometry.texMax ? [...geometry.texMin, ...geometry.texMax].join(',') : '-';
   return `${mesh}|${orco}|${space}`;
 }

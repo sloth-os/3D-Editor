@@ -48,6 +48,8 @@ export function pathFromSpline(s: EvaluatedSpline, opts: PathOptions = {}): Curv
         ? [...s.tangents, s.tangents[0]]
         : s.tangents
       : null;
+  // straight spans (Bezier segments between VECTOR handles) keep their own direction
+  const straight = s.straight && s.straight.length === s.points.length ? s.straight : null;
   if (pts.length < 2) return null;
   const cum = [0];
   for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + distance3(pts[i - 1], pts[i]));
@@ -84,7 +86,7 @@ export function pathFromSpline(s: EvaluatedSpline, opts: PathOptions = {}): Curv
       const span = cum[hi] - cum[lo] || 1;
       const f = Math.min(1, Math.max(0, (d - cum[lo]) / span));
       let tangent = segTangent(lo);
-      if (tans) {
+      if (tans && !straight?.[lo]) {
         const smooth = normalize3(lerp3(tans[lo], tans[hi], f));
         if (smooth[0] || smooth[1] || smooth[2]) tangent = smooth;
       }

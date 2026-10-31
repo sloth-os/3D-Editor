@@ -385,11 +385,7 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     // an emission texture replaces the emission color (like a texture plugged into Emission Color)
     const es = Math.max(0, m.emission_strength);
     const emissiveTex =
-      es > 0
-        ? b?.emissive !== undefined
-          ? { index: b.emissive }
-          : imageTexture(t.emission)
-        : undefined;
+      es > 0 ? (b?.emissive !== undefined ? { index: b.emissive } : imageTexture(t.emission)) : undefined;
     const ec: Vec3 = emissiveTex
       ? [1, 1, 1]
       : (b?.emissiveColor ?? [m.emission_color[0], m.emission_color[1], m.emission_color[2]]);

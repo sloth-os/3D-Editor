@@ -85,7 +85,7 @@ export interface EvaluatedScene {
   activeCamera: EvaluatedObject | null;
   /** Instances from collection instances and particle systems (see `renderItems`). */
   instances: EvaluatedInstance[];
-  /** Non-fatal evaluation problems (drivers, poses, instancing, physics). */
+  /** Non-fatal evaluation problems (drivers, poses, curves, instancing, physics). */
   errors: EvalError[];
 }
 
@@ -187,6 +187,15 @@ export class SceneEvaluator {
         ? evaluateCurveSplines(c, forRender).map((s) => s.points.map((p): Vec2 => [p[0], p[1]]))
         : null;
     };
+    // exact profiles (open vs cyclic splines), scaled by the bevel object's X/Y scale like Blender
+    const bevelCurveOf = (cid: string): CurveData | null => {
+      const co = fs.byId.get(cid);
+      return co?.type === 'CURVE' && co.data ? fs.curve(co.data) : null;
+    };
+    const bevelScaleOf = (cid: string): Vec2 | null => {
+      const s = fs.byId.get(cid)?.scale;
+      return s ? [s[0], s[1]] : null;
+    };
     const evalCurve = (o: ObjectData): CurveCacheEntry | null => {
       if (curveResults.has(o.id)) return curveResults.get(o.id)!;
       const curve = o.data ? fs.curve(o.data) : null;
@@ -200,6 +209,7 @@ export class SceneEvaluator {
           forRender ? 'R' : 'V',
           stableStringify(curve),
           bevelCurve ? stableStringify(bevelCurve) : '',
+          bevelObj ? `${bevelObj.scale[0]},${bevelObj.scale[1]}` : '',
         ].join('#');
         const cached = this.curveCache.get(o.id);
         if (cached && cached.key === key) entry = cached;
@@ -208,10 +218,14 @@ export class SceneEvaluator {
             forRender,
             isText: o.type === 'FONT',
             getBevelProfile: bevelProfile,
+            getBevelCurve: bevelCurveOf,
+            getBevelScale: bevelScaleOf,
           });
           entry = { key, token: ++this.curveCounter, result };
           this.curveCache.set(o.id, entry);
         }
+        // curve problems (missing bevel object, surface too dense, …) are reported every evaluation
+        for (const message of entry.result.errors ?? []) fs.errors.push({ source: `curve:${o.id}`, message });
       }
       curveResults.set(o.id, entry);
       return entry;

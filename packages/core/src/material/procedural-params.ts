@@ -268,8 +268,22 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       max: 1000,
       description: 'mortar colour red (linear, black by default like Blender)',
     },
-    { key: 'mortar_g', kind: 'number', default: 0, min: 0, max: 1000, description: 'mortar colour green (linear)' },
-    { key: 'mortar_b', kind: 'number', default: 0, min: 0, max: 1000, description: 'mortar colour blue (linear)' },
+    {
+      key: 'mortar_g',
+      kind: 'number',
+      default: 0,
+      min: 0,
+      max: 1000,
+      description: 'mortar colour green (linear)',
+    },
+    {
+      key: 'mortar_b',
+      kind: 'number',
+      default: 0,
+      min: 0,
+      max: 1000,
+      description: 'mortar colour blue (linear)',
+    },
   ],
   MARBLE: [
     {
@@ -293,7 +307,8 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       kind: 'enum',
       default: 'RINGS',
       values: ['RINGS', 'BANDS'],
-      description: 'RINGS = growth rings around the texture Z axis, BANDS = straight bands along the XYZ diagonal',
+      description:
+        'RINGS = growth rings around the texture Z axis, BANDS = straight bands along the XYZ diagonal',
     },
     {
       key: 'wave_profile',

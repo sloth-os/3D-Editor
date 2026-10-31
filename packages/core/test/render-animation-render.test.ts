@@ -4,11 +4,13 @@ import {
   SceneDoc,
   contactSheet,
   contactSheetGrid,
+  contactSheetLayout,
   createFCurve,
   decodePNG,
   insertKeyframe,
   renderAnimation,
   renderSceneSoftware,
+  sampleFrameIndices,
   sequenceFrameName,
 } from '../src';
 import { decodeAPNG, decodeGIF, solidFrame } from './render-animation-helpers';
@@ -107,7 +109,11 @@ describe('renderAnimation', () => {
     });
     const once = decodeGIF(renderAnimation(doc, { format: 'GIF', frame_end: 2, loop: 1, colors: 16 }).data!);
     expect(once.loopCount).toBeNull();
-    expect(once.palette.length).toBeLessThanOrEqual(16 * 3);
+    // at most 16 colours, plus the transparent index of the optimized second frame
+    const used = new Set<number>();
+    for (const f of once.frames) for (const v of f.indices) if (v !== f.transparentIndex) used.add(v);
+    expect(used.size).toBeLessThanOrEqual(16);
+    expect(once.palette.length).toBeLessThanOrEqual(32 * 3);
   });
 
   it('writes PNG sequences named like Blender frame numbers', () => {
@@ -159,6 +165,115 @@ describe('renderAnimation', () => {
     expect(() => renderAnimation(doc, { format: 'GIF', width: 4096, height: 4096, frame_end: 10 })).toThrow(
       /too large/,
     );
+  });
+
+  it('uses one automatic view for every frame without a camera, so motion shows', () => {
+    const doc = SceneDoc.create();
+    const cube = doc.findObjectByName('Cube')!.id;
+    let fc = createFCurve({ target_type: 'object', target_id: cube, path: 'location', index: 0 });
+    fc = insertKeyframe(fc, 1, -3, 'LINEAR');
+    fc = insertKeyframe(fc, 5, 3, 'LINEAR');
+    doc.setFCurve(fc);
+    doc.updateScene({ frame_start: 1, frame_end: 5, fps: 12, camera: null });
+    const res = renderAnimation(doc, { width: 64, height: 36 });
+    const apng = decodeAPNG(res.data!);
+    // the cube moves 6 m to the right, and so it does in the image
+    const xs = apng.canvases.map((c) => centreX(c, 64, 36));
+    for (let k = 1; k < xs.length; k++) expect(xs[k]).toBeGreaterThan(xs[k - 1] + 2);
+    expect(xs[4] - xs[0]).toBeGreaterThan(15);
+    // every frame is the render from that one view, which frames both ends of the motion
+    expect(res.view).toBeDefined();
+    const view = { position: res.view!.position, target: res.view!.target, fovY: res.view!.fovY };
+    expect(view.target[0]).toBeCloseTo(0, 6); // centre of the swept range x ∈ [-4, 4]
+    res.frames.forEach((frame, k) =>
+      same(apng.canvases[k], renderSceneSoftware(doc, { width: 64, height: 36, frame, view }).data),
+    );
+    // the cube is fully inside the image at both ends: the image border shows only background
+    for (const k of [0, 4]) {
+      const c = apng.canvases[k];
+      for (let x = 0; x < 64; x++)
+        for (const y of [0, 35]) expect(Math.abs(c[(y * 64 + x) * 4] - c[0])).toBeLessThan(13);
+    }
+    // a scene camera or an explicit camera is used as it is
+    doc.updateScene({ camera: doc.findObjectByName('Camera')!.id });
+    expect(renderAnimation(doc, { width: 16, height: 9, frame_end: 2 }).view).toBeUndefined();
+    doc.updateScene({ camera: null });
+    expect(renderAnimation(doc, { width: 16, height: 9, frame_end: 2, camera: 'Camera' }).view).toBeUndefined();
+    // nothing to frame: the default view
+    const empty = SceneDoc.create({ empty: true });
+    expect(renderAnimation(empty, { width: 16, height: 9, frame_end: 2 }).view?.target).toEqual([0, 0, 0]);
+  });
+
+  it('samples long frame ranges for the automatic view without aliasing periodic motion', () => {
+    expect(sampleFrameIndices(5, 64)).toEqual([0, 1, 2, 3, 4]);
+    expect(sampleFrameIndices(0, 64)).toEqual([]);
+    const s = sampleFrameIndices(630, 64);
+    expect(s.length).toBeLessThanOrEqual(64);
+    expect(s.length).toBeGreaterThan(50);
+    expect([s[0], s[s.length - 1]]).toEqual([0, 629]);
+    for (let k = 1; k < s.length; k++) expect(s[k]).toBeGreaterThan(s[k - 1]);
+    // a motion repeating every 10 frames is seen at many phases (even strides would hit only one)
+    expect(new Set(s.slice(1, -1).map((i) => i % 10)).size).toBeGreaterThanOrEqual(8);
+    expect(sampleFrameIndices(630, 64)).toEqual(s);
+  });
+
+  it('rejects contact sheets that would be too large before rendering anything', () => {
+    const doc = SceneDoc.create({ empty: true });
+    doc.updateScene({ frame_start: 1, frame_end: 13 });
+    let rendered = 0;
+    expect(() =>
+      renderAnimation(doc, {
+        format: 'CONTACT_SHEET',
+        width: 2048,
+        height: 2048,
+        samples: 1,
+        onFrame: () => {
+          rendered++;
+        },
+      }),
+    ).toThrow(/would be 8202×8202 pixels, too large/);
+    expect(rendered).toBe(0);
+    expect(contactSheetLayout(13, 2048, 2048)).toEqual({
+      columns: 4,
+      rows: 4,
+      gap: 2,
+      width: 8202,
+      height: 8202,
+    });
+  });
+
+  it('keeps a whole-render time budget, also inside path traced frames', () => {
+    const doc = slidingCube();
+    const traced = { engine: 'PATHTRACER', width: 96, height: 54, samples: 4096, denoise: false } as const;
+    // a single frame: only the time limit passed into the frame can stop it (4096 samples per
+    // pixel would take far longer)
+    let t0 = performance.now();
+    const one = renderAnimation(doc, { ...traced, frame_end: 1, total_time_limit: 0.3 });
+    expect((performance.now() - t0) / 1000).toBeLessThan(2.5);
+    expect(one).toMatchObject({
+      frames: [1],
+      cancelled: false,
+      time_limit_reached: true,
+      undersampled_frames: [1],
+    });
+    // several frames: the budget is shared and no frame starts after it is used up
+    t0 = performance.now();
+    const res = renderAnimation(doc, { ...traced, frame_end: 3, total_time_limit: 0.5 });
+    expect((performance.now() - t0) / 1000).toBeLessThan(3);
+    expect(res.time_limit_reached).toBe(true);
+    expect(res.frames.length).toBeGreaterThanOrEqual(1);
+    expect(res.cancelled).toBe(res.frames.length < 3);
+    expect(res.undersampled_frames.length).toBeGreaterThanOrEqual(1);
+    expect(decodeAPNG(res.data!).numFrames).toBe(res.frames.length);
+    // raster frames: no frame is started once the budget is used up, but one is always rendered
+    const quick = renderAnimation(doc, { width: 16, height: 9, total_time_limit: 1e-9 });
+    expect(quick).toMatchObject({ frames: [1], cancelled: true, time_limit_reached: true });
+    expect(quick.undersampled_frames).toEqual([]);
+    const free = renderAnimation(doc, { width: 16, height: 9, total_time_limit: 0 });
+    expect(free).toMatchObject({ frames: [1, 2, 3, 4, 5], cancelled: false, time_limit_reached: false });
+    // enough time: every sample is rendered
+    const full = renderAnimation(doc, { ...traced, samples: 2, frame_end: 2, total_time_limit: 600 });
+    expect(full).toMatchObject({ frames: [1, 2], time_limit_reached: false, undersampled_frames: [] });
   });
 
   it('passes the engine and its settings to every frame', () => {

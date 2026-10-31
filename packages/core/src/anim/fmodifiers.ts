@@ -8,17 +8,17 @@ import { gradientNoise3 } from './expression';
  *
  * - Time modifiers (STEPPED, and LIMITS with use_min_x / use_max_x) change the time at which the
  *   keyframes are sampled. They are applied from the last modifier to the first (Blender's
- *   "macro to micro" order), and the value modifiers see the modified time — so a NOISE below a
- *   STEPPED modifier is stepped too.
+ *   "macro to micro" order), and every value modifier is evaluated at the resulting time, wherever
+ *   it is in the stack — a NOISE listed above a STEPPED modifier is stepped too.
  * - Value modifiers (NOISE, GENERATOR, ENVELOPE, LIMITS with use_min_y / use_max_y) then change the
  *   sampled value from the first modifier to the last.
  * - Every modifier can be muted (`mute`), blended with the unmodified result by `influence` (when
  *   `use_influence`), and — except STEPPED, whose `frame_start` / `frame_end` configure the stepping
  *   like in Blender's Python API — restricted to a frame range with linear fade ramps
  *   (`use_restricted_range`, `frame_start`, `frame_end`, `blend_in`, `blend_out`; inclusive).
- * - A curve's CYCLIC extrapolation (a curve setting here, not a modifier) repeats the keyframes
- *   only: time modifiers resample the repeated curve, but value modifiers see the real frame, so
- *   e.g. NOISE keeps varying from one cycle to the next instead of repeating with it.
+ * - A curve's CYCLIC extrapolation acts like Blender's Cycles modifier at the top of the stack: it
+ *   wraps the time last (after the other time modifiers), and the value modifiers see the wrapped
+ *   time, so they repeat with every cycle (e.g. NOISE gives the same values in each cycle).
  *
  * Parameters use Blender's Python names and defaults and are validated by the exported schemas.
  * List-valued parameters are stored as JSON arrays: GENERATOR `coefficients` (numbers) and
@@ -291,7 +291,8 @@ export const FMODIFIER_TYPE_INFO: readonly FModifierTypeInfo[] = [
     label: 'Stepped Interpolation',
     description:
       'Holds the curve value for frame_step frames (sampling it at frame_offset + k * frame_step), for a ' +
-      'stop-motion / "on twos" look. Modifiers listed after it see the stepped time too.',
+      'stop-motion / "on twos" look. Every value modifier of the curve (NOISE, GENERATOR, ENVELOPE, LIMITS y) ' +
+      'is evaluated at the stepped time too, wherever it is in the stack, so it is stepped as well.',
     affects: 'TIME',
   },
   {
@@ -307,7 +308,8 @@ export const FMODIFIER_TYPE_INFO: readonly FModifierTypeInfo[] = [
     label: 'Limits',
     description:
       'Clamps the value to [min_y, max_y] (use_min_y / use_max_y) and/or holds the curve outside the frames ' +
-      '[min_x, max_x] (use_min_x / use_max_x).',
+      '[min_x, max_x] (use_min_x / use_max_x; like STEPPED, this clamped time is what every value modifier ' +
+      'of the curve sees).',
     affects: 'TIME_AND_VALUE',
   },
   {
@@ -656,14 +658,18 @@ function prepared(m: FModifierData): Prepared | null {
 /**
  * Applies an F-curve's modifier stack. `value` is the curve evaluated at `frame`; `sample`, when
  * given, evaluates the unmodified curve (keyframes and extrapolation) at another time, which the
- * time modifiers (STEPPED, LIMITS x) need — without it they are ignored. Muted, unknown and invalid
- * modifiers are skipped; the result is always finite when `value` is.
+ * time modifiers (STEPPED, LIMITS x) need — without it they are ignored. `cycle`, for a curve with
+ * CYCLIC extrapolation, maps a time into the repeated keyframe range: the value modifiers are
+ * evaluated (and their restricted ranges tested) at the time the time modifiers produced, wrapped
+ * by `cycle`, so they repeat with every cycle like below Blender's Cycles modifier. Muted, unknown
+ * and invalid modifiers are skipped; the result is always finite when `value` is.
  */
 export function applyFModifiers(
   mods: FModifierData[],
   frame: number,
   value: number,
   sample?: (frame: number) => number,
+  cycle?: (frame: number) => number,
 ): number {
   if (!Array.isArray(mods) || mods.length === 0) return value;
   const list = mods.map(prepared);
@@ -684,7 +690,12 @@ export function applyFModifiers(
     const s = sample(t);
     if (Number.isFinite(s)) v = s;
   }
-  // value modifiers, first to last, at the modified time
+  // value modifiers, first to last (wherever the time modifiers are), at the modified time —
+  // wrapped into the keyed range of a cyclic curve, where the Cycles modifier would put it
+  if (cycle) {
+    const c = cycle(t);
+    if (Number.isFinite(c)) t = c;
+  }
   for (const m of list) {
     if (!m?.value) continue;
     const w = influenceAt(m, t);

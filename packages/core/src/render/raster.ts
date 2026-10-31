@@ -3,12 +3,7 @@ import { invert4, normalMatrix4 } from '../math/mat4';
 import type { MeshData } from '../mesh/types';
 import { meshBounds } from '../mesh/types';
 import { buildRenderBuffers, type RenderBuffers } from '../mesh/render-buffers';
-import {
-  PATTERN_STRIDE,
-  rampPattern,
-  samplePattern,
-  type CompiledProcedural,
-} from '../material/procedural';
+import { PATTERN_STRIDE, rampPattern, samplePattern, type CompiledProcedural } from '../material/procedural';
 import { bumpNormal, compiledCoord, type ProceduralSurface } from '../material/surface';
 import { evalSkyIrradiance, sampleSkyModel, type SkyModel } from './sky';
 import type { RenderView } from './view';

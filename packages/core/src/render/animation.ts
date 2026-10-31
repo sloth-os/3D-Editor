@@ -1,9 +1,13 @@
 import { zlibSync } from 'fflate';
-import type { Vec4 } from '../math/types';
+import type { Vec3, Vec4 } from '../math/types';
 import type { SceneDoc } from '../doc/scene-doc';
 import type { RenderEngine } from '../doc/types';
-import { SceneEvaluator } from '../eval/evaluate';
+import { SceneEvaluator, type EvaluatedScene } from '../eval/evaluate';
+import { renderItems } from '../eval/renderables';
+import { evaluatedBounds } from '../io/common';
 import { crc32, encodePNG } from './png';
+import { autoFrameView } from './view';
+import type { PathTraceProgress } from './pathtrace';
 import { renderSceneSoftware, type SoftwareRenderOptions } from './index';
 
 /*
@@ -16,8 +20,9 @@ import { renderSceneSoftware, type SoftwareRenderOptions } from './index';
  *   median cut on a 5-bit-per-channel histogram refined with k-means, optional Floyd–Steinberg or
  *   ordered (Bayer) dithering, NETSCAPE2.0 looping, LZW with code size growth and clear codes;
  *   later frames only store changed pixels (unchanged ones become transparent).
- * - renderAnimation renders a frame range with the software renderer into APNG, GIF or a PNG
- *   sequence.
+ * - renderAnimation renders a frame range with the software renderer into APNG, GIF, a PNG
+ *   sequence or a labelled contact sheet; without a camera every frame uses one automatic view
+ *   framing the whole animation, so motion shows.
  */
 
 /** One RGBA8 image of an animation (row-major, top row first). */
@@ -337,7 +342,11 @@ export interface GIFOptions {
   loop?: number;
   /** Dithering (default FLOYD_STEINBERG). */
   dither?: GIFDither;
-  /** Palette size 2..256 (default 256; one entry is reserved for transparency when needed). */
+  /**
+   * Number of colours 2..256 (default 256). A transparent index, when needed (pixels with alpha
+   * < 128, or unchanged pixels of optimized later frames), is added on top of them — except at
+   * 256, the most a GIF colour table holds, where it takes the place of one colour.
+   */
   colors?: number;
   /** Store only the changed pixels of later frames (default true). */
   optimize?: boolean;
@@ -782,6 +791,9 @@ export function lzwEncode(indices: Uint8Array, minCodeSize: number): Uint8Array 
       prefix = k;
     }
     emit(prefix);
+    // the decoder adds a table entry for this last code too (unless it follows a clear code): grow
+    // like it does, or the end code would be written one bit narrower than it is read
+    if (next >= 1 << codeSize && codeSize < 12) codeSize++;
   }
   emit(endCode);
   if (bits > 0) out.byte(acc & 0xff);
@@ -821,8 +833,9 @@ export function encodeGIF(frames: readonly AnimationFrame[], fps: number, opts: 
     for (let o = 3; o < width * height * 4 && !hasAlpha; o += 4) if (d[o] < 128) hasAlpha = true;
     if (hasAlpha) break;
   }
+  // the transparent index comes on top of the requested colours (a table holds at most 256)
   const reserve = hasAlpha || (optimize && frames.length > 1) ? 1 : 0;
-  const palette = quantizePalette(frames, colors - reserve);
+  const palette = quantizePalette(frames, Math.min(colors, 256 - reserve));
   const used = palette.length / 3;
   const transparent = reserve ? used : -1;
   let tableBits = 1;
@@ -995,6 +1008,24 @@ export function contactSheetGrid(
   return { columns: c, rows: Math.ceil(n / c) };
 }
 
+/** Grid, gap and image size of a contact sheet of `count` tiles of w×h (see {@link contactSheet}). */
+export function contactSheetLayout(
+  count: number,
+  w: number,
+  h: number,
+  opts: Pick<ContactSheetOptions, 'columns' | 'gap'> = {},
+): { columns: number; rows: number; gap: number; width: number; height: number } {
+  const { columns, rows } = contactSheetGrid(count, w, h, opts.columns);
+  const gap = Math.max(0, Math.min(64, Math.floor(opts.gap ?? 2) || 0));
+  return {
+    columns,
+    rows,
+    gap,
+    width: columns * w + (columns + 1) * gap,
+    height: rows * h + (rows + 1) * gap,
+  };
+}
+
 /**
  * Tiles RGBA frames (all the same size) into one image, left to right and top to bottom, with an
  * optional label per tile — a single picture showing a whole animation at a glance. Throws for
@@ -1008,10 +1039,7 @@ export function contactSheet(
   const { width: w, height: h } = frames[0];
   checkSize(w, h, 65535, 'Contact sheet');
   for (const f of frames) checkFrame(f, w, h, 'Contact sheet');
-  const { columns, rows } = contactSheetGrid(frames.length, w, h, opts.columns);
-  const gap = Math.max(0, Math.min(64, Math.floor(opts.gap ?? 2) || 0));
-  const W = columns * w + (columns + 1) * gap;
-  const H = rows * h + (rows + 1) * gap;
+  const { columns, gap, width: W, height: H } = contactSheetLayout(frames.length, w, h, opts);
   if (W * H > MAX_SHEET_PIXELS)
     throw new Error(`Contact sheet of ${W}×${H} pixels is too large: use fewer or smaller frames`);
   const out = new Uint8ClampedArray(W * H * 4);
@@ -1051,7 +1079,10 @@ export interface AnimationRenderOptions {
   fps?: number;
   /** Render engine (default: the scene's render engine). */
   engine?: RenderEngine;
-  /** Camera object id or name (default: the scene camera). */
+  /**
+   * Camera object id or name (default: the scene camera). Without any camera, every frame uses the
+   * same automatic 3/4 view framing the geometry of all rendered frames (sampled), so motion shows.
+   */
   camera?: string;
   shading?: 'SOLID' | 'MATERIAL';
   /** Anti-aliasing supersampling (raster) or samples per pixel (path tracer). */
@@ -1062,6 +1093,13 @@ export interface AnimationRenderOptions {
   denoise?: boolean;
   /** PATHTRACER: wall-clock budget per frame in seconds (0 / unset = none). */
   time_limit?: number;
+  /**
+   * Wall-clock budget of the whole render in seconds (0 / unset = none). Each path traced frame
+   * gets at most the remaining time as its time limit (it then stops sampling early, after at
+   * least one sample), and no frame is started once the budget is used up: the frames rendered so
+   * far are encoded and `cancelled` is true. At least one frame is always rendered.
+   */
+  total_time_limit?: number;
   /** PATHTRACER: noise pattern seed (default 0). */
   seed?: number;
   /**
@@ -1075,7 +1113,7 @@ export interface AnimationRenderOptions {
   loop?: number;
   /** GIF dithering (default FLOYD_STEINBERG). */
   dither?: GIFDither;
-  /** GIF palette size 2..256 (default 256). */
+  /** GIF: number of colours 2..256 (default 256; see {@link GIFOptions.colors}). */
   colors?: number;
   /** CONTACT_SHEET: tiles per row (default: a roughly square sheet). */
   columns?: number;
@@ -1100,8 +1138,17 @@ export interface AnimationRenderResult {
   files?: { frame: number; name: string; data: Uint8Array }[];
   /** CONTACT_SHEET: size and grid of the sheet image. */
   sheet?: { width: number; height: number; columns: number; rows: number };
-  /** True when onFrame stopped the render early. */
+  /** The fixed automatic view (fovY in radians) every frame used, when there was no camera. */
+  view?: { position: Vec3; target: Vec3; fovY: number };
+  /** True when onFrame or total_time_limit stopped the render before its last frame. */
   cancelled: boolean;
+  /**
+   * True when total_time_limit cut the render short: later frames were skipped and/or a path
+   * traced frame stopped sampling early because of it.
+   */
+  time_limit_reached: boolean;
+  /** Path traced frames that stopped sampling before the requested samples (a time limit ran out). */
+  undersampled_frames: number[];
 }
 
 /** Most frames one animation render accepts. */
@@ -1118,11 +1165,74 @@ export function sequenceFrameName(frame: number): string {
   return `frame_${f < 0 ? '-' : ''}${String(Math.abs(f)).padStart(4, '0')}.png`;
 }
 
+/** Most frames evaluated to frame the automatic view of an animation without a camera. */
+const AUTO_VIEW_SAMPLES = 64;
+
+const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+/**
+ * Indices of at most `max` of `count` frames: all of them when there are few enough, otherwise the
+ * first, the last and one per stratum in between, at golden-ratio offsets within the strata so
+ * that periodic motion is not always sampled at the same phase. Sorted and deterministic.
+ */
+export function sampleFrameIndices(count: number, max: number): number[] {
+  const n = Math.max(0, Math.floor(count));
+  const m = Math.max(2, Math.floor(max));
+  if (n <= m) return Array.from({ length: n }, (_, i) => i);
+  const out = new Set<number>([0, n - 1]);
+  const strata = m - 2;
+  for (let j = 0; j < strata; j++) {
+    const r = (j * 0.6180339887498949) % 1;
+    out.add(Math.min(n - 1, Math.floor(((j + r) * n) / strata)));
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
+/** True when an evaluated scene has a usable scene camera (what `renderSceneSoftware` would use). */
+function hasSceneCamera(scene: EvaluatedScene): boolean {
+  const cam = scene.activeCamera;
+  return !!(cam && cam.type === 'CAMERA' && cam.camera);
+}
+
+/**
+ * The fixed automatic view of an animation rendered without a camera: the default 3/4 view framing
+ * the union of the rendered geometry of the frames (up to AUTO_VIEW_SAMPLES of them, stopping
+ * early when `expired`). Framing each frame on its own would follow moving objects, so that they
+ * would seem to stand still.
+ */
+function animationAutoView(
+  evaluator: SceneEvaluator,
+  frames: readonly number[],
+  first: EvaluatedScene,
+  aspect: number,
+  expired: () => boolean,
+): { position: Vec3; target: Vec3; up: Vec3; fovY: number } {
+  const min: Vec3 = [Infinity, Infinity, Infinity];
+  const max: Vec3 = [-Infinity, -Infinity, -Infinity];
+  let any = false;
+  for (const i of sampleFrameIndices(frames.length, AUTO_VIEW_SAMPLES)) {
+    const scene = i === 0 ? first : evaluator.evaluate(frames[i], { forRender: true });
+    const meshes = renderItems(scene, { forRender: true }).filter((o) => o.mesh.faces.length > 0);
+    const b = evaluatedBounds(meshes);
+    if (b && b.min.every(Number.isFinite) && b.max.every(Number.isFinite)) {
+      for (let k = 0; k < 3; k++) {
+        min[k] = Math.min(min[k], b.min[k]);
+        max[k] = Math.max(max[k], b.max[k]);
+      }
+      any = true;
+    }
+    if (expired()) break;
+  }
+  return autoFrameView(any ? { min, max } : null, aspect);
+}
+
 /**
  * Renders frames `frame_start`..`frame_end` (every `frame_step`) with the software renderer
  * (`renderSceneSoftware`, so the engine option and its settings apply) and encodes them as an
  * animated PNG, a GIF, a sequence of PNG files or a contact sheet. One scene evaluator is shared
- * by all frames, so unchanged geometry is evaluated once. Throws for invalid ranges and sizes.
+ * by all frames, so unchanged geometry is evaluated once. Without a camera (option or scene
+ * camera) all frames share one automatic view framing the whole animation. Throws for invalid
+ * ranges and sizes (before rendering anything).
  */
 export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}): AnimationRenderResult {
   const format = opts.format ?? 'APNG';
@@ -1157,12 +1267,36 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
       `A ${format === 'GIF' ? 'GIF' : 'contact sheet'} of ${total} frames at ${width}×${height} is too large ` +
         `(at most ${MAX_GIF_PIXELS} pixels in all): reduce the size or the number of frames`,
     );
+  if (format === 'CONTACT_SHEET') {
+    // the grid with its gaps is known now: fail before rendering, not after (a stopped render
+    // only ever gives a smaller sheet)
+    const sheet = contactSheetLayout(total, width, height, { columns: opts.columns });
+    if (sheet.width * sheet.height > MAX_SHEET_PIXELS)
+      throw new Error(
+        `A contact sheet of ${total} frames at ${width}×${height} would be ${sheet.width}×${sheet.height} ` +
+          `pixels, too large (at most ${MAX_SHEET_PIXELS}): reduce the size or the number of frames`,
+      );
+  }
   const fps = opts.fps ?? (scene.fps || 24) / step;
   checkFps(fps, 'Animation');
+  const budget = typeof opts.total_time_limit === 'number' && opts.total_time_limit > 0 ? opts.total_time_limit : 0;
+  const t0 = now();
+  const left = () => budget - (now() - t0) / 1000;
+  const expired = () => budget > 0 && left() <= 0;
+  const evaluator = new SceneEvaluator(doc);
+  const frameList = Array.from({ length: total }, (_, i) => start + i * step);
+  // without a camera, one automatic view for every frame (framing each frame alone would follow
+  // the moving objects and hide their motion)
+  let view: ReturnType<typeof animationAutoView> | undefined;
+  if (!opts.camera) {
+    const first = evaluator.evaluate(frameList[0], { forRender: true });
+    if (!hasSceneCamera(first)) view = animationAutoView(evaluator, frameList, first, width / height, expired);
+  }
   const base: SoftwareRenderOptions = {
     width,
     height,
     cameraId: opts.camera,
+    view,
     shading: opts.shading,
     samples: opts.samples,
     background: opts.background,
@@ -1170,27 +1304,51 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
     max_bounces: opts.max_bounces,
     denoise: opts.denoise,
     time_limit: opts.time_limit,
-    evaluator: new SceneEvaluator(doc),
+    evaluator,
   };
   const seed = opts.seed ?? 0;
   const apng = format === 'APNG' ? new APNGEncoder(width, height, fps, { loop: opts.loop }) : null;
   const kept: AnimationFrame[] = [];
   const files: { frame: number; name: string; data: Uint8Array }[] = [];
   const frames: number[] = [];
+  const undersampled: number[] = [];
   let cancelled = false;
+  let budgetHit = false;
   for (let i = 0; i < total; i++) {
-    const frame = start + i * step;
+    const frame = frameList[i];
+    let timeLimit = opts.time_limit;
+    let budgetBound = false;
+    if (budget > 0) {
+      // a path traced frame may use the rest of the budget (at least one sample is rendered)
+      const rest = Math.max(1e-3, left());
+      if (!(typeof timeLimit === 'number' && timeLimit > 0 && timeLimit <= rest)) {
+        timeLimit = rest;
+        budgetBound = true;
+      }
+    }
+    const progress: { last?: PathTraceProgress } = {};
     const img = renderSceneSoftware(doc, {
       ...base,
       frame,
+      time_limit: timeLimit,
       seed: opts.animated_seed ? seed + Math.round(frame) : seed,
+      onProgress: (p) => {
+        progress.last = p;
+      },
     });
     frames.push(frame);
+    if (progress.last && progress.last.samples < progress.last.total) {
+      undersampled.push(frame);
+      if (budgetBound) budgetHit = true;
+    }
     if (apng) apng.addFrame(img);
     else if (keepFrames) kept.push(img);
     else files.push({ frame, name: sequenceFrameName(frame), data: encodePNG(img) });
-    if (opts.onFrame?.({ frame, index: i, total }) === false && i < total - 1) {
+    const stopped = opts.onFrame?.({ frame, index: i, total }) === false;
+    const outOfTime = expired();
+    if ((stopped || outOfTime) && i < total - 1) {
       cancelled = true;
+      if (outOfTime) budgetHit = true;
       break;
     }
   }
@@ -1202,7 +1360,10 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
     fps,
     frames,
     cancelled,
+    time_limit_reached: budgetHit,
+    undersampled_frames: undersampled,
   };
+  if (view) result.view = { position: view.position, target: view.target, fovY: view.fovY };
   if (apng) result.data = apng.finish();
   else if (format === 'GIF')
     result.data = encodeGIF(kept, fps, { loop: opts.loop, dither: opts.dither, colors: opts.colors });

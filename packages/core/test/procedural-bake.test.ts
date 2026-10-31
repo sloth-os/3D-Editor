@@ -351,8 +351,9 @@ describe('glTF export: texture bindings, deduplication and deformation', () => {
     expect(m.pbrMetallicRoughness.baseColorFactor.slice(0, 3)).toEqual([c[0], c[1], c[2]]);
     expect(m.pbrMetallicRoughness.roughnessFactor).toBeCloseTo(0.3, 9);
     const e = sampleProcedural(defaultProcedural('VORONOI', { mapping: 'UV' }), [0, 0, 0]);
-    expect(m.emissiveFactor[0] * (m.extensions?.KHR_materials_emissive_strength?.emissiveStrength ?? 1))
-      .toBeCloseTo(e[0] * 2, 6);
+    expect(
+      m.emissiveFactor[0] * (m.extensions?.KHR_materials_emissive_strength?.emissiveStrength ?? 1),
+    ).toBeCloseTo(e[0] * 2, 6);
     // image textures cannot be bound either: skipped with a warning
     const png = encodePNG({ width: 1, height: 1, data: new Uint8ClampedArray(4) });
     const img = doc.addImage({ name: 'Img', mime: 'image/png', width: 1, height: 1, data: png });
@@ -402,7 +403,9 @@ describe('glTF export: texture bindings, deduplication and deformation', () => {
     const doc = SceneDoc.create({ empty: true });
     const mat = doc.addMaterial({
       name: 'Gen',
-      textures: { base_color: slot(defaultProcedural('GRADIENT', { params: { gradient_type: 'DIAGONAL' } })) },
+      textures: {
+        base_color: slot(defaultProcedural('GRADIENT', { params: { gradient_type: 'DIAGONAL' } })),
+      },
     });
     const twist = {
       id: 'tw',

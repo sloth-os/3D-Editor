@@ -15,6 +15,12 @@ export interface EvaluatedSpline {
    * splines, whose direction is the polyline itself). Zero vectors mark undefined tangents.
    */
   tangents?: Vec3[];
+  /**
+   * BEZIER splines: true where the span from this sample to the next one (wrapping for cyclic
+   * splines) is a straight segment between two VECTOR handles. Such segments are sampled with their
+   * start point only, like Blender; paths use the segment direction along them.
+   */
+  straight?: boolean[];
 }
 
 const SPLINE_TYPES: readonly SplineType[] = ['POLY', 'BEZIER', 'NURBS'];
@@ -217,7 +223,9 @@ export function setNurbsEvaluator(fn: NurbsEvaluator | null): void {
 /**
  * Samples a spline into a polyline. POLY splines use their points directly; BEZIER splines are
  * sampled with `resolution` steps per segment (Blender handle rules, tilt and radius interpolated
- * linearly per segment); NURBS splines with `resolution` steps per control-point segment.
+ * linearly per segment), except straight segments between two VECTOR handles, which contribute
+ * only their start point (as in Blender); NURBS splines with `resolution` steps per control-point
+ * segment.
  */
 export function evaluateSpline(spline: Spline, resolution: number): EvaluatedSpline {
   const s = sanitizeSpline(spline);
@@ -240,6 +248,7 @@ export function evaluateSpline(spline: Spline, resolution: number): EvaluatedSpl
     const h = bezierHandles(s);
     const segs = cyclic ? n : n - 1;
     const tangents: Vec3[] = [];
+    const straight: boolean[] = [];
     let carried: Vec3 | null = null; // end tangent of the previous segment
     let firstStart: Vec3 | null = null;
     for (let i = 0; i < segs; i++) {
@@ -248,8 +257,12 @@ export function evaluateSpline(spline: Spline, resolution: number): EvaluatedSpl
       const p1 = h[i].right;
       const p2 = h[j].left;
       const p3 = pts[j].co;
-      for (let k = 0; k < res; k++) {
-        const t = k / res;
+      // between two VECTOR handles the segment is a straight line: one point is enough
+      const line = pts[i].handle_right_type === 'VECTOR' && pts[j].handle_left_type === 'VECTOR';
+      const steps = line ? 1 : res;
+      for (let k = 0; k < steps; k++) {
+        const t = k / steps;
+        straight.push(line);
         out.points.push(k === 0 ? [p0[0], p0[1], p0[2]] : cubic(p0, p1, p2, p3, t));
         out.tilts.push(pts[i].tilt + (pts[j].tilt - pts[i].tilt) * t);
         out.radii.push(pts[i].radius + (pts[j].radius - pts[i].radius) * t);
@@ -270,8 +283,10 @@ export function evaluateSpline(spline: Spline, resolution: number): EvaluatedSpl
       out.tilts.push(last.tilt);
       out.radii.push(last.radius);
       tangents.push(carried ?? [0, 0, 0]);
+      straight.push(false);
     }
     out.tangents = tangents;
+    if (straight.includes(true)) out.straight = straight;
     return out;
   }
   if (s.type === 'NURBS' && n > 1) return nurbsEvaluator ? nurbsEvaluator(s, res) : evaluateNurbs(s, res);

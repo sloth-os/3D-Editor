@@ -179,7 +179,9 @@ const proceduralInput = z.object({
     .min(-1e3)
     .max(1e3)
     .optional()
-    .describe('Colour ramp stop of color_b: texture factor at which the colour is exactly color_b (default 1).'),
+    .describe(
+      'Colour ramp stop of color_b: texture factor at which the colour is exactly color_b (default 1).',
+    ),
   seed: z
     .number()
     .int()

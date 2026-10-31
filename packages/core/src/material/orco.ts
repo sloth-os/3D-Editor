@@ -152,7 +152,8 @@ export function evaluatedOrco(
   const orco = orcoMesh({
     object: ev.data,
     base,
-    hasShapeKeys: ev.type === 'MESH' && !!ev.data.data && doc.meshAttrVersion(ev.data.data, 'shape_keys') !== 0,
+    hasShapeKeys:
+      ev.type === 'MESH' && !!ev.data.data && doc.meshAttrVersion(ev.data.data, 'shape_keys') !== 0,
     forRender,
     frame: scene?.frame,
     objectMatrix: ev.worldMatrix,

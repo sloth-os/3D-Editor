@@ -157,6 +157,30 @@ describe('GIF LZW', () => {
     expect(() => lzwEncode(Uint8Array.from([4]), 2)).toThrow(/does not fit/);
     expect(() => lzwEncode(new Uint8Array(1), 1)).toThrow(/minimum code size/);
   });
+
+  it('writes the end code with the code size the decoder has grown to after the last data code', () => {
+    // the decoder adds a table entry for the last data code as well: here that entry is the
+    // eighth one, so it reads the end code with 4 bits instead of 3
+    roundTrip(Uint8Array.from([0, 0, 1, 0, 2, 0, 3, 1, 1, 2, 1]), 2);
+    // many short streams end exactly at a code size boundary
+    let s = 99;
+    const rnd = () => (s = (Math.imul(s, 1103515245) + 12345) >>> 0) / 2 ** 32;
+    for (let k = 0; k < 4000; k++) {
+      const bits = 2 + Math.floor(rnd() * 3);
+      const n = 1 + Math.floor(rnd() * 60);
+      roundTrip(
+        Uint8Array.from({ length: n }, () => Math.floor(rnd() * (1 << bits))),
+        bits,
+      );
+    }
+    // through the file format: a strict decoder needs the end code
+    const colours: RGBA[] = [BG, RED, GREEN, [250, 250, 250, 255]];
+    for (let k = 0; k < 300; k++) {
+      const frame = solidFrame(11, 1, BG);
+      for (let x = 0; x < 11; x++) frame.data.set(colours[Math.floor(rnd() * 4)], x * 4);
+      same(decodeGIF(encodeGIF([frame], 10, { dither: 'NONE' })).canvases[0], frame.data);
+    }
+  });
 });
 
 describe('GIF palette and dithering', () => {
@@ -261,6 +285,41 @@ describe('encodeGIF', () => {
     same(still.canvases[1], solidFrame(4, 4, BG).data);
     const full = decodeGIF(encodeGIF(movingSquare(3), 10, { optimize: false, dither: 'NONE' }));
     expect(full.frames.every((f) => f.width === 24 && f.transparentIndex === null)).toBe(true);
+  });
+
+  it('adds the transparent index on top of the requested number of colours', () => {
+    const black: RGBA = [0, 0, 0, 255];
+    const white: RGBA = [255, 255, 255, 255];
+    const a = solidFrame(16, 16, black, [{ x: 0, y: 0, w: 8, h: 16, color: white }]);
+    const b = solidFrame(16, 16, black, [{ x: 8, y: 0, w: 8, h: 16, color: white }]);
+    // two colours plus the transparent index of the optimized second frame: a 4-entry table
+    const gif = decodeGIF(encodeGIF([a, b], 2, { colors: 2, dither: 'NONE' }));
+    expect(gif.palette.length).toBe(4 * 3);
+    expect(gif.frames[1].transparentIndex).toBe(2);
+    gif.canvases.forEach((c, k) => same(c, [a, b][k].data));
+    // no transparency needed: exactly the requested colours
+    const still = decodeGIF(encodeGIF([a], 2, { colors: 2, dither: 'NONE' }));
+    expect(still.palette.length).toBe(2 * 3);
+    same(still.canvases[0], a.data);
+    // 16 colours of a 20-colour animation: 16 used plus the transparent index
+    const bars = (shift: number) =>
+      solidFrame(
+        20,
+        4,
+        black,
+        Array.from({ length: 20 }, (_, i) => ({
+          x: (i + shift) % 20,
+          y: 0,
+          w: 1,
+          h: 4,
+          color: [i * 12, 255 - i * 12, (i * 37) % 256, 255] as RGBA,
+        })),
+      );
+    const sixteen = decodeGIF(encodeGIF([bars(0), bars(1)], 2, { colors: 16, dither: 'NONE' }));
+    const used = new Set<number>();
+    for (const f of sixteen.frames) for (const v of f.indices) if (v !== f.transparentIndex) used.add(v);
+    expect(used.size).toBe(16);
+    expect(sixteen.frames[1].transparentIndex).toBe(16);
   });
 
   it('keeps transparency with restore-to-background frames', () => {

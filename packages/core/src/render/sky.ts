@@ -115,8 +115,7 @@ export function prepareSky(world: Partial<WorldSettings>): SkyModel {
   const rot = num(world.sun_rotation, Math.PI / 4);
   const sun = sunDirection({ sun_elevation: el, sun_rotation: rot });
   const hl = Math.hypot(sun[0], sun[1]);
-  const sunH: [number, number] =
-    hl > 1e-9 ? [sun[0] / hl, sun[1] / hl] : [-Math.sin(rot), Math.cos(rot)];
+  const sunH: [number, number] = hl > 1e-9 ? [sun[0] / hl, sun[1] / hl] : [-Math.sin(rot), Math.cos(rot)];
   const s = sun[2];
   const T = sunTransmittance(s);
   const sunColor = col(world.sun_color, [1, 0.95, 0.88]);

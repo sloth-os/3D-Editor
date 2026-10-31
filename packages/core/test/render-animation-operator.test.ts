@@ -94,6 +94,64 @@ describe('render.render_animation', () => {
     expect(reports.some((r) => /Stopped after 1 of 6 frames/.test(r))).toBe(true);
   });
 
+  it('bounds a single path traced frame by time_limit and reports the missing samples', () => {
+    const { ok, reports } = setup();
+    const t0 = performance.now();
+    const res = ok({
+      format: 'APNG',
+      engine: 'PATHTRACER',
+      frame_end: 1,
+      width: 96,
+      height: 54,
+      samples: 4096,
+      time_limit: 0.3,
+    });
+    expect((performance.now() - t0) / 1000).toBeLessThan(2.5);
+    expect(res).toMatchObject({ frames: [1], truncated: false, undersampled_frames: [1] });
+    expect(reports.some((r) => /time_limit \(0\.3 s\) ran out: frame 1 stopped path tracing/.test(r))).toBe(
+      true,
+    );
+    // with enough time nothing is reported
+    const fine = ok({ format: 'APNG', engine: 'PATHTRACER', frame_end: 1, width: 16, height: 9, samples: 2 });
+    expect(fine.undersampled_frames).toBeUndefined();
+  });
+
+  it('keeps the render aspect when the derived side would exceed 2048 pixels', () => {
+    const { doc, ok } = setup();
+    doc.updateRender({ resolution_x: 1920, resolution_y: 1080, resolution_percentage: 100 });
+    const wide = ok({ format: 'APNG', frame_end: 1, height: 2048, samples: 1 });
+    expect([wide.width, wide.height]).toEqual([2048, 1152]);
+    doc.updateRender({ resolution_x: 1080, resolution_y: 1920 });
+    const tall = ok({ format: 'APNG', frame_end: 1, width: 2048, samples: 1 });
+    expect([tall.width, tall.height]).toEqual([1152, 2048]);
+    // within the limit the given side is kept exactly
+    expect(ok({ format: 'APNG', frame_end: 1, width: 90, samples: 1 })).toMatchObject({ width: 90, height: 160 });
+  });
+
+  it('renders camera-less scenes from one fixed view and returns it', () => {
+    const { doc, ok } = setup();
+    doc.updateScene({ camera: null });
+    const res = ok({ format: 'APNG' });
+    expect(res.view.fov_degrees).toBeGreaterThan(10);
+    expect(res.view.fov_degrees).toBeLessThan(90);
+    expect(res.view.position).toHaveLength(3);
+    // the cube slides from x = -1.5 to 1.5: its image moves to the right
+    const a = decodeAPNG(base64Decode(res.data_base64));
+    const centre = (c: Uint8Array) => {
+      let sum = 0;
+      let n = 0;
+      for (let i = 0; i < 64 * 36; i++)
+        if (Math.abs(c[i * 4] - c[0]) + Math.abs(c[i * 4 + 1] - c[1]) + Math.abs(c[i * 4 + 2] - c[2]) > 12) {
+          sum += i % 64;
+          n++;
+        }
+      return sum / n;
+    };
+    expect(centre(a.canvases[5]) - centre(a.canvases[0])).toBeGreaterThan(5);
+    // with the scene camera no view is returned
+    expect(setup().ok({ frame_end: 1 }).view).toBeUndefined();
+  });
+
   it('validates the range and the camera', () => {
     const { doc, run } = setup();
     expect(run({ frame_start: 5, frame_end: 2 }).error).toMatch(/before frame_start/);

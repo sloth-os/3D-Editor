@@ -370,7 +370,7 @@ export function samplePattern(
   const s = c.seed;
   const mode = c.mode;
   const k0 = c.k0;
-  let f = 0;
+  let f: number;
   let fg = 0;
   let fb = 0;
   let mortar = 0;

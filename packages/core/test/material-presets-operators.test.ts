@@ -355,7 +355,9 @@ describe('material.procedural_set', () => {
     doc.addMaterial({ name: 'M' });
     expect(run('material.procedural_set', { material: 'M', channel: 'alpha', procedural: {} }).ok).toBe(true);
     expect(reports.some((r) => r.level === 'WARNING' && /blend_method OPAQUE/.test(r.message))).toBe(true);
-    expect(run('material.procedural_set', { material: 'M', channel: 'emission', procedural: {} }).ok).toBe(true);
+    expect(run('material.procedural_set', { material: 'M', channel: 'emission', procedural: {} }).ok).toBe(
+      true,
+    );
     expect(reports.some((r) => r.level === 'WARNING' && /emission_strength 0/.test(r.message))).toBe(true);
     // no warnings once the material can show them
     reports.length = 0;

@@ -438,11 +438,13 @@ const MAX_BAKE_FRAMES = 10000;
 /** Largest number of frames render.render_animation renders in one run. */
 const MAX_RENDER_FRAMES = 1000;
 
-const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+/** Largest frame width / height of render.render_animation. */
+const MAX_RENDER_SIZE = 2048;
 
 /**
  * Default frame size of render.render_animation: the render resolution (with its percentage)
  * scaled so its long side is `fit` pixels at most; an explicit width or height keeps the aspect.
+ * A derived side above MAX_RENDER_SIZE scales both sides down, keeping the aspect.
  */
 function animationFrameSize(
   doc: SceneDoc,
@@ -463,9 +465,11 @@ function animationFrameSize(
     h = fh * s;
   } else if (!h) h = w! / aspect;
   else if (!w) w = h * aspect;
+  // explicit sides are within the limit already; a derived one may not be
+  const s = Math.min(1, MAX_RENDER_SIZE / Math.max(w!, h!));
   return {
-    width: Math.max(1, Math.min(2048, Math.round(w!))),
-    height: Math.max(1, Math.min(2048, Math.round(h!))),
+    width: Math.max(1, Math.min(MAX_RENDER_SIZE, Math.round(w! * s))),
+    height: Math.max(1, Math.min(MAX_RENDER_SIZE, Math.round(h! * s))),
   };
 }
 
@@ -706,8 +710,12 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         'Add an F-curve modifier (Blender FModifier) at the end of the modifier stack of the animation curve of ' +
         '`path` / `index` (index -1: every channel of the property). A channel without a curve gets one with a single ' +
         'keyframe holding its current value at the current frame, so e.g. NOISE can shake a static camera. Time ' +
-        'modifiers (STEPPED, LIMITS min_x/max_x) apply from the last to the first and the value modifiers below ' +
-        'them see the modified time; value modifiers apply in stack order. Params: ' +
+        'modifiers (STEPPED, LIMITS min_x/max_x) apply first, from the last to the first, and every value ' +
+        'modifier (NOISE, GENERATOR, ENVELOPE, LIMITS min_y/max_y) is then evaluated at the modified time ' +
+        'wherever it is in the stack (a NOISE listed before a STEPPED is stepped too); value modifiers apply in ' +
+        'stack order. On a curve with CYCLIC extrapolation the value modifiers repeat with every cycle (like ' +
+        "below Blender's Cycles modifier). A driven channel ignores its curve and modifiers while the driver is " +
+        'active (a warning is reported). Params: ' +
         FMOD_PARAM_HELP +
         '. Returns the added modifiers (curve key, stack position, validated params) and the created curves.',
       category: 'Animation',
@@ -928,9 +936,12 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
       description:
         'Set how the animation curves of objects continue before their first and after their last keyframe: ' +
         'CONSTANT (hold the end values), LINEAR (continue with the slope of the end segments) or CYCLIC (repeat the ' +
-        'keyed range forever, e.g. for loops; keep the first and last key equal for a seamless loop). Affects the ' +
-        "objects' curves (optionally only `path` / `index`), and with include_data also their object data " +
-        '(light, camera, curve, mesh shape keys) and materials. Returns the number of curves.',
+        'keyed range forever, e.g. for loops; keep the first and last key equal for a seamless loop). Like ' +
+        "Blender's Cycles modifier, CYCLIC also repeats the curve's F-modifiers with every cycle: a NOISE gives the " +
+        'same values in each cycle and jumps back at the cycle boundary unless faded out there (NOISE ' +
+        "use_restricted_range with blend_in / blend_out). Affects the objects' curves (optionally only `path` / " +
+        '`index`), and with include_data also their object data (light, camera, curve, mesh shape keys) and ' +
+        'materials. Returns the number of curves.',
       category: 'Animation',
       schema: z.object({
         objects: z
@@ -1443,13 +1454,17 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         'APNG (animated PNG, lossless) or PNG_SEQUENCE (one PNG per frame). Frames frame_start..frame_end every ' +
         `frame_step (default: the scene frame range; at most ${MAX_RENDER_FRAMES} frames; use frame_step to ` +
         'sample long animations, e.g. 12-24 tiles for a contact sheet). Camera: `camera`, else the scene camera, ' +
-        'else an automatic view. Frame size defaults to the render resolution scaled to fit 480 px (contact ' +
-        'sheet tiles: up to 240 px, smaller for many frames). The PATHTRACER engine is far slower than RASTER: keep ' +
-        'size, samples and frame count small. Rendering stops after time_limit seconds and returns the frames ' +
-        'rendered so far (truncated: true). Returns { format, mime, data_base64, bytes, width, height (of one ' +
-        'frame), fps, frames (rendered frame numbers), frame_count, truncated }, plus sheet { width, height, ' +
-        'columns, rows } for CONTACT_SHEET, or files [{ frame, name, data_base64 }] instead of data_base64 for ' +
-        'PNG_SEQUENCE.',
+        'else one fixed automatic 3/4 view framing the geometry of all rendered frames (so moving objects move ' +
+        'in the image; returned as view). Frame size defaults to the render resolution scaled to fit 480 px ' +
+        '(contact sheet tiles: up to 240 px, smaller for many frames). The PATHTRACER engine is far slower than ' +
+        'RASTER: keep size, samples and frame count small. time_limit bounds the whole render: a path traced ' +
+        'frame stops sampling when it runs out (noisier, at least 1 sample per pixel), no frame starts after it, ' +
+        'and the frames rendered so far are returned (truncated: true). Returns { format, mime, data_base64, ' +
+        'bytes, width, height (of one frame), fps, frames (rendered frame numbers), frame_count, truncated }, ' +
+        'plus sheet { width, height, columns, rows } for CONTACT_SHEET, files [{ frame, name, data_base64 }] ' +
+        'instead of data_base64 for PNG_SEQUENCE, view { position, target, fov_degrees } (usable as a still ' +
+        'render viewpoint) when the automatic view was used, and undersampled_frames (path traced frames that ' +
+        'ran out of time) when there are any.',
       category: 'Render',
       undo: false,
       schema: z.object({
@@ -1526,7 +1541,10 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           .min(0)
           .max(3600)
           .default(120)
-          .describe('Stop rendering after this many seconds (0 = no limit); the frames so far are returned'),
+          .describe(
+            'Wall-clock budget of the whole render in seconds (0 = no limit): a path traced frame stops ' +
+              'sampling when it is used up, no further frame is started, and the frames so far are returned',
+          ),
       }),
       execute(ctx, p) {
         const doc = ctx.doc;
@@ -1553,7 +1571,6 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
             ? Math.max(48, Math.min(240, Math.floor(2048 / Math.ceil(Math.sqrt(total)))))
             : 480;
         const size = animationFrameSize(doc, p.width, p.height, fit);
-        const t0 = now();
         let res: ReturnType<typeof renderAnimation>;
         try {
           res = renderAnimation(doc, {
@@ -1572,16 +1589,28 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
             dither: p.dither,
             colors: p.colors,
             columns: p.columns,
-            onFrame: () => p.time_limit <= 0 || now() - t0 < p.time_limit * 1000,
+            // also bounds each path traced frame, not only the gaps between frames
+            total_time_limit: p.time_limit,
           });
         } catch (e) {
           throw new OperatorError((e as Error).message, 'INVALID_PARAMS');
         }
+        const short = res.undersampled_frames;
+        const shortNote = short.length
+          ? `frame${short.length > 1 ? 's' : ''} ${short.join(', ')} stopped path tracing with fewer samples ` +
+            'than requested'
+          : '';
         if (res.cancelled)
           ctx.report(
             'WARNING',
-            `Stopped after ${res.frames.length} of ${total} frames (time_limit ${p.time_limit} s): raise time_limit, ` +
-              'or render fewer or smaller frames',
+            `Stopped after ${res.frames.length} of ${total} frames (time_limit ${p.time_limit} s)` +
+              (shortNote ? `; ${shortNote}` : '') +
+              ': raise time_limit, or render fewer or smaller frames (or fewer samples)',
+          );
+        else if (shortNote)
+          ctx.report(
+            'WARNING',
+            `time_limit (${p.time_limit} s) ran out: ${shortNote}; raise time_limit or lower samples`,
           );
         return {
           format: res.format,
@@ -1592,6 +1621,16 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           frames: res.frames,
           frame_count: res.frames.length,
           truncated: res.cancelled,
+          ...(res.undersampled_frames.length ? { undersampled_frames: res.undersampled_frames } : {}),
+          ...(res.view
+            ? {
+                view: {
+                  position: res.view.position,
+                  target: res.view.target,
+                  fov_degrees: (res.view.fovY * 180) / Math.PI,
+                },
+              }
+            : {}),
           ...(res.sheet ? { sheet: res.sheet } : {}),
           ...(res.data ? { bytes: res.data.length, data_base64: base64Encode(res.data) } : {}),
           ...(res.files

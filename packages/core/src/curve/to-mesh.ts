@@ -27,6 +27,11 @@ export interface CurveMeshOptions {
    * tells open and cyclic profile splines apart exactly.
    */
   getBevelCurve?(curveObjectId: string): CurveData | null;
+  /**
+   * Optional: the bevel object's (animated) X/Y object scale. Blender scales the profile by it, so
+   * scaling the profile curve in Object Mode makes the tube thinner or wider.
+   */
+  getBevelScale?(curveObjectId: string): Vec2 | null;
 }
 
 export interface CurveMeshResult {
@@ -284,19 +289,20 @@ function lerpSample(c: Contour, f: CurveFrames, i: number, j: number, t: number,
 }
 
 /**
- * Samples of the swept part of a contour (bevel_factor_start/end trim by arc length). Returns null
- * when nothing remains; `closed` is true for untrimmed cyclic contours.
+ * Samples of the swept part of a contour (bevel_factor_start/end trim by arc length, unless `whole`).
+ * Returns null when nothing remains; `closed` is true for untrimmed cyclic contours.
  */
 function sweepSamples(
   c: Contour,
   f: CurveFrames,
   st: Settings,
+  whole: boolean,
 ): { samples: Sample[]; closed: boolean } | null {
   const { s, total } = arcLengths(c);
   if (!(total > 0)) return null;
   const n = c.points.length;
-  if (st.factorEnd - st.factorStart <= 1e-9) return null;
-  const trimmed = st.factorStart > 1e-9 || st.factorEnd < 1 - 1e-9;
+  if (!whole && st.factorEnd - st.factorStart <= 1e-9) return null;
+  const trimmed = !whole && (st.factorStart > 1e-9 || st.factorEnd < 1 - 1e-9);
   if (!trimmed)
     return { samples: c.points.map((_, i) => pointSample(c, f, i, s[i] / total)), closed: c.cyclic };
   const a = st.factorStart * total;
@@ -334,10 +340,20 @@ function profileOffset(sm: Sample, f: CurveFrames, x: number, y: number): Vec3 {
   return v;
 }
 
-/** Sweeps one profile along a contour: walls, optional end caps, and the 2D fill-cap boundaries. */
-function sweep(b: Builder, c: Contour, f: CurveFrames, prof: BevelProfile, st: Settings): SweepResult {
+/**
+ * Sweeps one profile along a contour: walls, optional end caps, and the 2D fill-cap boundaries.
+ * `whole` sweeps the full contour whatever the bevel factors (outlines of 2D fills).
+ */
+function sweep(
+  b: Builder,
+  c: Contour,
+  f: CurveFrames,
+  prof: BevelProfile,
+  st: Settings,
+  whole: boolean,
+): SweepResult {
   const res: SweepResult = { back: null, front: null };
-  const sw = sweepSamples(c, f, st);
+  const sw = sweepSamples(c, f, st, whole);
   if (!sw) return res;
   const { samples, closed } = sw;
   const m = prof.points.length;
@@ -484,20 +500,29 @@ function fillLoops(
   }
 }
 
-/** Profiles of the bevel object (bevel_mode OBJECT). */
+/** Profiles of the bevel object (bevel_mode OBJECT), scaled by the bevel object's X/Y scale. */
 function objectProfiles(curve: CurveData, opts: CurveMeshOptions): BevelProfile[] {
   const id = curve.bevel_object;
   if (!id) return [];
+  const sc = opts.getBevelScale?.(id);
+  const sx = sc && Number.isFinite(sc[0]) ? sc[0] : 1;
+  const sy = sc && Number.isFinite(sc[1]) ? sc[1] : 1;
+  const scaled = (polys: Vec2[][]): Vec2[][] =>
+    sx === 1 && sy === 1
+      ? polys
+      : polys.map((poly) =>
+          Array.isArray(poly) ? poly.map((p) => (Array.isArray(p) ? ([p[0] * sx, p[1] * sy] as Vec2) : p)) : [],
+        );
   const bc = opts.getBevelCurve?.(id);
   if (bc) {
     const splines = evaluateCurveSplines(bc, opts.forRender);
     return objectBevelProfiles(
-      splines.map((s) => s.points.map((p): Vec2 => [p[0], p[1]])),
+      scaled(splines.map((s) => s.points.map((p): Vec2 => [p[0], p[1]]))),
       splines.map((s) => s.cyclic),
     );
   }
   const polys = opts.getBevelProfile?.(id);
-  return polys ? objectBevelProfiles(polys) : [];
+  return polys ? objectBevelProfiles(scaled(polys)) : [];
 }
 
 /** Contours of a curve's splines or of a text's glyph outlines. */
@@ -611,13 +636,18 @@ function buildCurveMesh(curve: CurveData, opts: CurveMeshOptions): CurveMeshResu
     front: null,
   }));
 
+  // Outlines of 2D fill regions are swept whole when fill caps are built on them: the caps need the
+  // complete outline (Blender ignores the bevel factors of cyclic splines altogether; here they
+  // still trim unfilled closed curves, for "growing" outlines).
+  const capsOnOutlines = st.is2D && st.fill2D !== 'NONE' && profiles.length > 0 && !profiles[0].closed;
   // swept surfaces (bevel / extrusion)
   contours.forEach((c, i) => {
     const f = frames[i];
     if (!f || profiles.length === 0) return;
     surfaced[i] = true;
+    const whole = capsOnOutlines && !!c.filled;
     profiles.forEach((prof, k) => {
-      const r = sweep(b, c, f, prof, st);
+      const r = sweep(b, c, f, prof, st, whole);
       if (k === 0) capLoops[i] = r;
     });
   });

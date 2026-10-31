@@ -68,16 +68,20 @@ function easeValue(t: number, easing: Easing | undefined): number {
 export function evaluateFCurve(fc: FCurve, frame: number): number | undefined {
   const keys = sortedKeys(fc);
   if (keys.length === 0) return undefined;
-  let f = frame;
-  if (fc.extrapolation === 'CYCLIC' && keys.length > 1) {
-    const a = keys[0].frame;
-    const span = keys[keys.length - 1].frame - a;
-    if (span > 0 && (f < a || f > a + span)) f = a + ((((f - a) % span) + span) % span);
-  }
-  const v = evaluateKeys(fc, keys, f);
-  // time modifiers (STEPPED, LIMITS x) resample the unmodified curve at another frame
+  const cycle = fc.extrapolation === 'CYCLIC' ? cycleTime(keys) : undefined;
+  const v = evaluateKeys(fc, keys, cycle ? cycle(frame) : frame);
+  // time modifiers (STEPPED, LIMITS x) resample the unmodified curve at another frame; value
+  // modifiers see the cycled time, so they repeat with the keys (Blender's Cycles modifier)
   const sample = (t: number) => evaluateFCurve({ ...fc, keyframes: keys, modifiers: [] }, t) ?? v;
-  return fc.modifiers?.length ? applyFModifiers(fc.modifiers, frame, v, sample) : v;
+  return fc.modifiers?.length ? applyFModifiers(fc.modifiers, frame, v, sample, cycle) : v;
+}
+
+/** Maps frames into the keyed range that CYCLIC extrapolation repeats (undefined: no range). */
+function cycleTime(keys: Keyframe[]): ((frame: number) => number) | undefined {
+  const a = keys[0].frame;
+  const span = keys[keys.length - 1].frame - a;
+  if (!(span > 0)) return undefined;
+  return (f) => (f < a || f > a + span ? a + ((((f - a) % span) + span) % span) : f);
 }
 
 function evaluateKeys(fc: FCurve, keys: Keyframe[], frame: number): number {

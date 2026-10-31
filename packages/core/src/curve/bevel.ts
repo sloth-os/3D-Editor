@@ -39,7 +39,17 @@ function dedupe(points: Vec2[], closed: boolean): Vec2[] {
   return out;
 }
 
-function finish(points: Vec2[], closed: boolean, back: number, front: number): BevelProfile | null {
+/**
+ * Completes a profile: texture v by length and the sharp points (turns above SHARP_ANGLE). `smooth`
+ * profiles (sampled circles) have no sharp points at any resolution.
+ */
+function finish(
+  points: Vec2[],
+  closed: boolean,
+  back: number,
+  front: number,
+  smooth = false,
+): BevelProfile | null {
   const n = points.length;
   if (n < 2) return null;
   const v: number[] = [0];
@@ -53,7 +63,7 @@ function finish(points: Vec2[], closed: boolean, back: number, front: number): B
     : total;
   for (let i = 0; i < n; i++) v[i] = full > 0 ? v[i] / full : i / Math.max(1, n - 1);
   const sharp = points.map((p, i) => {
-    if (!closed && (i === 0 || i === n - 1)) return false;
+    if (smooth || (!closed && (i === 0 || i === n - 1))) return false;
     const a = points[(i - 1 + n) % n];
     const b = points[(i + 1) % n];
     const d1 = [p[0] - a[0], p[1] - a[1]];
@@ -66,11 +76,19 @@ function finish(points: Vec2[], closed: boolean, back: number, front: number): B
   return { points, closed, v, sharp, back, front };
 }
 
+/** Cosine / sine with exact zeros on the axes (avoids cos(π/2) ≈ 6e-17 drift). */
+function axisExact(a: number): Vec2 {
+  const c = Math.cos(a);
+  const s = Math.sin(a);
+  return [Math.abs(c) < 1e-12 ? 0 : c, Math.abs(s) < 1e-12 ? 0 : s];
+}
+
 /**
- * Blender's ROUND bevel: quarter circles of radius `depth` (with `resolution` intermediate points)
- * around the extrusion (−extrude…+extrude along y). FULL is the closed loop; HALF the outer half
- * (from the bottom over +x to the top), FRONT / BACK only its upper / lower quarter plus the
- * straight extruded side.
+ * Blender's ROUND bevel. Without extrusion the FULL profile is a plain circle of `4 + 2 × resolution`
+ * points (Blender's full-circle special case; at angles k·2π/n, starting at the bottom). Otherwise
+ * quarter circles of radius `depth` (`resolution + 1` segments each) surround the extrusion
+ * (−extrude…+extrude along y): FULL is the closed loop; HALF the outer half (from the bottom over +x
+ * to the top), FRONT / BACK only its upper / lower quarter plus the straight extruded side.
  */
 export function roundBevelProfile(
   depth: number,
@@ -82,14 +100,22 @@ export function roundBevelProfile(
   const e = Math.max(0, extrude);
   if (!(r > 0)) return null;
   const q = Math.max(0, Math.min(32, Math.round(resolution)));
+  if (fill === 'FULL' && e === 0) {
+    const n = 4 + 2 * q;
+    // Blender's points sit at multiples of 2π/n; start at (or just after) the bottom like the
+    // quarter-based profiles, so the texture seam stays underneath
+    const first = Math.ceil((3 * n) / 4);
+    const pts: Vec2[] = [];
+    for (let k = 0; k < n; k++) {
+      const [c, s] = axisExact((((first + k) % n) * 2 * Math.PI) / n);
+      pts.push([r * c, r * s]);
+    }
+    return finish(pts, true, -1, -1, true);
+  }
   const arc = (cy: number, a0: number, a1: number): Vec2[] => {
     const out: Vec2[] = [];
     for (let k = 0; k <= q + 1; k++) {
-      const quarter = k / (q + 1);
-      const a = a0 + (a1 - a0) * quarter;
-      // exact axis points (avoid cos(π/2) ≈ 6e-17 drift)
-      const c = Math.abs(Math.cos(a)) < 1e-12 ? 0 : Math.cos(a);
-      const s = Math.abs(Math.sin(a)) < 1e-12 ? 0 : Math.sin(a);
+      const [c, s] = axisExact(a0 + ((a1 - a0) * k) / (q + 1));
       out.push([r * c, cy + r * s]);
     }
     return out;
@@ -102,19 +128,19 @@ export function roundBevelProfile(
   switch (fill) {
     case 'FULL': {
       const pts = dedupe([...bottomOuter, ...topOuter, ...topInner, ...bottomInner], true);
-      return finish(pts, true, -1, -1);
+      return finish(pts, true, -1, -1, true);
     }
     case 'HALF': {
       const pts = dedupe([...bottomOuter, ...topOuter], false);
-      return finish(pts, false, 0, pts.length - 1);
+      return finish(pts, false, 0, pts.length - 1, true);
     }
     case 'FRONT': {
       const pts = dedupe([[r, -e], ...topOuter], false);
-      return finish(pts, false, -1, pts.length - 1);
+      return finish(pts, false, -1, pts.length - 1, true);
     }
     case 'BACK': {
       const pts = dedupe([...bottomOuter, [r, e]], false);
-      return finish(pts, false, 0, -1);
+      return finish(pts, false, 0, -1, true);
     }
   }
 }

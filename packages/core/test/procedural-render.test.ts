@@ -6,9 +6,16 @@ import {
   createPlane,
   createUVSphere,
   defaultProcedural,
+  PATTERN_STRIDE,
   evaluatedOrco,
+  getMaterialPreset,
   orcoMesh,
+  presetMaterialValues,
+  proceduralSurface,
+  rampPattern,
   renderSceneSoftware,
+  sampleCompiled,
+  samplePattern,
   sampleProcedural,
   type MaterialData,
   type ModifierData,
@@ -228,7 +235,8 @@ const modifier = (id: string, type: string, params: Record<string, unknown>): Mo
   show_expanded: true,
   params,
 });
-const twist = () => modifier('tw', 'SIMPLE_DEFORM', { deform_method: 'TWIST', angle: Math.PI / 4, deform_axis: 'Z' });
+const twist = () =>
+  modifier('tw', 'SIMPLE_DEFORM', { deform_method: 'TWIST', angle: Math.PI / 4, deform_axis: 'Z' });
 
 describe('GENERATED coordinates of deformed meshes (orco)', () => {
   it('stick to the surface under deform modifiers in the CPU renderer', () => {
@@ -313,7 +321,78 @@ describe('GENERATED coordinates of deformed meshes (orco)', () => {
     // generate modifiers that read other objects need the scene
     const boolean = modifier('b', 'BOOLEAN', { object: plain, operation: 'UNION' });
     expect(
-      orcoMesh({ object: { type: 'MESH', modifiers: [boolean, twist()] }, base, hasShapeKeys: false, forRender: true }),
+      orcoMesh({
+        object: { type: 'MESH', modifiers: [boolean, twist()] },
+        base,
+        hasShapeKeys: false,
+        forRender: true,
+      }),
     ).toBeNull();
   });
+});
+
+describe('CPU renderer: procedural shading cost', () => {
+  it('evaluates a pattern shared by several channels once (patternKey)', () => {
+    const rusty = presetMaterialValues(getMaterialPreset('rusty_iron')!);
+    const s = proceduralSurface({ ...rusty, id: 'r', name: 'Rusty' })!;
+    // one noise drives colour, metallic, roughness and bump
+    expect(s.patterns).toHaveLength(1);
+    expect(Object.values(s.patternOf)).toEqual([0, 0, 0, 0, -1, -1]);
+    // brick colour and bump share the brick layout although their mortar colours differ
+    const brick = proceduralSurface({
+      ...presetMaterialValues(getMaterialPreset('brick')!),
+      id: 'b',
+      name: 'B',
+    })!;
+    expect(brick.patterns).toHaveLength(1);
+    // the shared stage reproduces every channel exactly
+    const pat = new Float64Array(PATTERN_STRIDE);
+    const a = new Float64Array(4);
+    const b = new Float64Array(4);
+    for (const c of [
+      [0.3, 0.7, 0.1],
+      [-2.5, 4.1, 0.9],
+    ]) {
+      samplePattern(s.patterns[0], c[0], c[1], c[2], pat);
+      for (const ch of ['base_color', 'metallic', 'roughness', 'normal'] as const) {
+        rampPattern(s[ch]!, pat, 0, a);
+        sampleCompiled(s[ch]!, c[0], c[1], c[2], b);
+        expect([...a]).toEqual([...b]);
+      }
+    }
+  });
+
+  it('shades procedural channels once per output pixel when supersampling', () => {
+    // regression: every channel was evaluated for every supersample (≈ 8× slower than flat)
+    const ground = (preset: string | null) => {
+      const doc = SceneDoc.create({ empty: true });
+      const id = doc.addMaterial({
+        name: 'M',
+        ...(preset ? presetMaterialValues(getMaterialPreset(preset)!) : { base_color: [0.4, 0.4, 0.4, 1] }),
+      });
+      doc.addObject({
+        type: 'MESH',
+        name: 'Ground',
+        data: doc.addMesh('Ground', createPlane({ size: 30 })),
+        material_slots: [id],
+      });
+      return doc;
+    };
+    const view = { position: [0, -9, 4] as Vec3, target: [0, 0, 0.5] as Vec3 };
+    const time = (doc: SceneDoc, samples: number) => {
+      renderSceneSoftware(doc, { width: 64, height: 36, samples, view }); // warm-up
+      const t = performance.now();
+      const img = renderSceneSoftware(doc, { width: 320, height: 180, samples, view });
+      return { ms: performance.now() - t, img };
+    };
+    const rock = ground('rock');
+    const s1 = time(rock, 1);
+    const s4 = time(rock, 4);
+    // 16 samples per pixel share one evaluation: far less than 16× the single-sample cost
+    expect(s4.ms).toBeLessThan(s1.ms * 6);
+    // and the image is the same texture (anti-aliased geometry only)
+    let diff = 0;
+    for (let i = 0; i < s1.img.data.length; i += 4) diff += Math.abs(s1.img.data[i] - s4.img.data[i]);
+    expect(diff / (s1.img.data.length / 4)).toBeLessThan(12);
+  }, 60_000);
 });
