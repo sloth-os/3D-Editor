@@ -15,3 +15,4 @@ export * from './constraints';
 export * from './armature';
 export * from './instancing';
 export * from './physics';
+export * from './material';

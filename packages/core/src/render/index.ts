@@ -45,6 +45,7 @@ import {
 
 export { decodePNG } from './png';
 export { autoFrameView } from './view';
+export * from './sky';
 
 export interface SoftwareRenderOptions {
   width: number;
