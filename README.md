@@ -107,6 +107,7 @@ smoke-tests the image and publishes multi-arch images to GHCR on `main` and vers
 
 ## Documentation
 
+* [Feature matrix vs. Blender](docs/features.md)
 * [Architecture](docs/architecture.md)
 * [Storage, offline and sync](docs/storage-and-sync.md)
 * [MCP / AI agents](docs/mcp.md)
