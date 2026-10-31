@@ -74,7 +74,9 @@ export function runOperator(
   };
   const before = { selectedIds: session.state.selectedIds, activeId: session.state.activeId, meshSelection: session.state.meshSelection };
   session.undo.stopCapturing();
+  session.currentOperator = id;
   const res = registry.run(ctx, id, params);
+  session.currentOperator = null;
   session.undo.stopCapturing();
   span.setAttribute('operator.status', res.ok ? 'ok' : 'error');
   if (res.ok) {

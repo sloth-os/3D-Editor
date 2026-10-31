@@ -54,6 +54,8 @@ export class ProjectSession {
   /** Origin used for WebDAV merges (not tracked by undo, not re-pushed). */
   readonly storageOrigin = { type: 'storage' };
   thumbnailProvider: (() => string | null) | null = null;
+  /** Operator currently executing (recorded on undo steps for telemetry). */
+  currentOperator: string | null = null;
 
   private constructor(readonly id: string) {
     this.doc = new SceneDoc(new Y.Doc(), { type: 'local' });
@@ -78,6 +80,7 @@ export class ProjectSession {
     // Edit-mode selection travels with undo steps.
     this.undo.on('stack-item-added', (e: { stackItem: { meta: Map<string, unknown> } }) => {
       e.stackItem.meta.set('mode', this.state.mode);
+      e.stackItem.meta.set('operator', this.currentOperator ?? 'unknown');
       e.stackItem.meta.set('selection', selectionToJSON(this.state.meshSelection));
       this.undoRevision.value++;
     });

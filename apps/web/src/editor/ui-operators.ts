@@ -9,6 +9,7 @@ import { importFromFilePicker } from '../io/import-export';
 import { shareLink } from '../project/manager';
 import { nearestEdge, projectEditVerts } from '../viewport/picking';
 import { takePendingStroke } from '../viewport/interaction';
+import { telemetry } from '../telemetry/telemetry';
 
 function engine() {
   const e = viewport.engine;
@@ -30,7 +31,11 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       execute() {
         const s = session.value!;
         if (!s.undo.canUndo()) throw new Error('Nothing to undo');
+        const item = s.undo.undoStack[s.undo.undoStack.length - 1];
+        const undone = String(item?.meta.get('operator') ?? 'unknown');
         s.undo.undo();
+        // Which operators get undone right away is a strong signal of UX friction.
+        telemetry.count('editor.undo', 1, { 'undo.operator': undone });
       },
     }),
   );
@@ -45,7 +50,9 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       execute() {
         const s = session.value!;
         if (!s.undo.canRedo()) throw new Error('Nothing to redo');
+        const item = s.undo.redoStack[s.undo.redoStack.length - 1];
         s.undo.redo();
+        telemetry.count('editor.redo', 1, { 'undo.operator': String(item?.meta.get('operator') ?? 'unknown') });
       },
     }),
   );
