@@ -1,0 +1,50 @@
+# Storage, offline and multi-device sync
+
+## Where projects are saved
+
+| Configuration | Saved to |
+| --- | --- |
+| No WebDAV configured (default) | The browser (IndexedDB). |
+| Server started with `WEBDAV_URL` | WebDAV, through the server's `/dav` proxy (credentials stay on the server, no CORS needed). The server also persists the live sync rooms there. |
+| WebDAV URL entered in *Preferences → Storage* | WebDAV, accessed directly from the browser (the WebDAV server must send CORS headers). |
+
+Projects are **always** cached in IndexedDB as well, which is what makes the app work offline.
+When WebDAV is configured the local copy is merged with the WebDAV copy on open, a moment
+after each change, every 20 s (to pick up other devices) and when the tab is hidden.
+
+Saving is a CRDT merge (`ProjectFileStore.syncDocument`): read the stored state, merge it into
+the local document, and write the merged state back with `If-Match` (retrying on HTTP 412).
+Concurrent writers — several browsers, the server, an MCP agent — never lose each other's edits,
+even after long offline periods.
+
+Layout on WebDAV (and in the server's `DATA_DIR` for `SYNC_PERSISTENCE=disk`):
+
+```
+<base>/projects/<project-id>/project.json     name, timestamps, stats, thumbnail
+<base>/projects/<project-id>/document.ybin    Yjs document state
+```
+
+## Real-time sync
+
+Every open project connects a WebSocket to `/sync/<project-id>` on the editor server. The
+protocol is Yjs sync + awareness (presence) plus JSON RPC and control frames
+(`packages/core/src/sync/protocol.ts`). Tabs of the same browser additionally talk over
+`BroadcastChannel`, which also works offline.
+
+* Changes appear on every device that has the project open, typically within one network round
+  trip. Peers are shown as avatars; click one to follow that user's viewport.
+* A device that was offline merges automatically when it reconnects.
+* Share a project with *File → Copy Share Link*; opening the link on another device joins the same
+  live session (and, with WebDAV, the project also shows up in that device's project list).
+
+`SYNC_PERSISTENCE` controls what the server does with live rooms: `memory` (default without
+WebDAV: rooms live while devices are connected plus `ROOM_IDLE_TTL_SECONDS`; browsers keep their
+own copies), `disk` (`DATA_DIR`, recommended for Docker so MCP-created projects survive restarts),
+or `webdav`.
+
+## Offline / PWA
+
+The service worker precaches the whole application, so after the first visit the editor starts
+without a network connection. It can be installed as an app (desktop and mobile) and registers
+file handlers for `.glb`, `.gltf`, `.obj`, `.stl` and `.ply`. When a new version is deployed the
+top bar offers to reload.
