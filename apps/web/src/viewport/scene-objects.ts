@@ -40,6 +40,12 @@ export const COLORS = {
 
 let rectInit = false;
 
+/**
+ * Converts Blender-style watts (W / 4π ≈ candela) into three.js intensities. The factor is
+ * calibrated so the default 1000 W lamp lights the default scene like Blender's EEVEE.
+ */
+const LIGHT_SCALE = 12;
+
 export function geometryFromMesh(mesh: MeshData): { geometry: THREE.BufferGeometry; triFace: Uint32Array } {
   const rb = buildRenderBuffers(mesh);
   const g = new THREE.BufferGeometry();
@@ -287,7 +293,7 @@ export class SceneObjects {
       light.intensity = l.energy * 2.5;
       light.castShadow = shadows;
     } else if (light instanceof THREE.SpotLight) {
-      light.intensity = (l.energy / (4 * Math.PI)) * 4;
+      light.intensity = (l.energy / (4 * Math.PI)) * LIGHT_SCALE;
       light.angle = Math.min(Math.PI / 2, l.spot_size / 2);
       light.penumbra = Math.min(1, l.spot_blend);
       light.decay = 2;
@@ -297,9 +303,9 @@ export class SceneObjects {
       const h = l.shape === 'RECTANGLE' || l.shape === 'ELLIPSE' ? l.size_y : l.size;
       light.width = w;
       light.height = h;
-      light.intensity = (l.energy / (4 * Math.PI * Math.max(0.01, w * h))) * 4;
+      light.intensity = (l.energy / (4 * Math.PI * Math.max(0.01, w * h))) * LIGHT_SCALE;
     } else if (light instanceof THREE.PointLight) {
-      light.intensity = (l.energy / (4 * Math.PI)) * 4;
+      light.intensity = (l.energy / (4 * Math.PI)) * LIGHT_SCALE;
       light.decay = 2;
       light.castShadow = shadows;
     }

@@ -387,7 +387,8 @@ export class ViewportEngine {
       }
     }
     this.scene.environment = wantEnv ? this.envTexture : null;
-    this.scene.environmentIntensity = shading === 'RENDERED' ? world.environment_strength * world.strength : 1;
+    // In Rendered mode the studio environment acts as soft fill light; lamps provide the key light.
+    this.scene.environmentIntensity = shading === 'RENDERED' ? world.environment_strength * world.strength * 0.35 : 1;
     const envRot = shading === 'RENDERED' ? world.environment_rotation : 0;
     this.scene.environmentRotation.set(Math.PI / 2, 0, envRot);
     this.scene.backgroundRotation.set(Math.PI / 2, 0, envRot);
@@ -623,7 +624,8 @@ export class ViewportEngine {
       this.session.view.overlays.value = false;
       this.sync();
       const target = new THREE.WebGLRenderTarget(width, height, { samples: 8, type: THREE.HalfFloatType });
-      const out = new THREE.WebGLRenderTarget(width, height, { type: THREE.UnsignedByteType, colorSpace: THREE.SRGBColorSpace });
+      // The composer output is already tone mapped and sRGB encoded, so copy it raw (linear target).
+      const out = new THREE.WebGLRenderTarget(width, height, { type: THREE.UnsignedByteType });
       const comp = new EffectComposer(this.renderer, target);
       comp.renderToScreen = false;
       comp.setPixelRatio(1);
@@ -636,11 +638,16 @@ export class ViewportEngine {
       comp.render();
       // copy result (composer read buffer) into a byte target via a fullscreen quad
       const readTarget = comp.readBuffer;
-      const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.MeshBasicMaterial({ map: readTarget.texture, transparent: true }));
+      const quad = new THREE.Mesh(
+        new THREE.PlaneGeometry(2, 2),
+        new THREE.MeshBasicMaterial({ map: readTarget.texture, transparent: true, toneMapped: false, depthTest: false }),
+      );
       const qs = new THREE.Scene();
       qs.add(quad);
       const qc = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
       const prevTm = this.renderer.toneMapping;
+      const prevClear = this.renderer.getClearColor(new THREE.Color());
+      const prevAlpha = this.renderer.getClearAlpha();
       this.renderer.toneMapping = THREE.NoToneMapping;
       this.renderer.setRenderTarget(out);
       this.renderer.setClearColor(0x000000, 0);
@@ -650,6 +657,7 @@ export class ViewportEngine {
       this.renderer.readRenderTargetPixels(out, 0, 0, width, height, pixels);
       this.renderer.setRenderTarget(null);
       this.renderer.toneMapping = prevTm;
+      this.renderer.setClearColor(prevClear, prevAlpha);
       this.scene.background = prevBg;
       target.dispose();
       out.dispose();
