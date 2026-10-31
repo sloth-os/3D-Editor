@@ -97,18 +97,8 @@ export class ProjectSession {
       await s.idb.whenSynced;
       if (opts.initial) Y.applyUpdate(s.doc.ydoc, opts.initial.encodeState(), s.storageOrigin);
       s.setupPresence();
-      const cfg = serverConfig.value;
-      if (cfg?.features.sync && prefs.value.sync.enabled) {
-        s.provider = new SyncProvider(id, s.doc.ydoc, s.awareness, () => wsUrl(`/sync/${id}`));
-      } else {
-        s.provider = new SyncProvider(id, s.doc.ydoc, s.awareness, null);
-      }
-      const target = resolveWebDAV();
-      if (target) {
-        s.webdav = new WebDAVSync(target, id, s.doc, () => s.projectInfo(), s.storageOrigin);
-        // Do not block opening on the network; merge in the background.
-        void s.webdav.syncNow();
-      }
+      s.provider = new SyncProvider(id, s.doc.ydoc, s.awareness, null);
+      s.attachRemotes();
       // If nothing exists locally yet (opening a remote project on a fresh device), wait briefly for
       // the server/WebDAV so the UI does not flash an empty scene.
       if (!opts.initial && s.doc.listObjects().length === 0 && s.doc.getMeta().created_at === '') {
@@ -124,6 +114,25 @@ export class ProjectSession {
       throw err;
     } finally {
       span.end();
+    }
+  }
+
+  /**
+   * Connects real-time sync and WebDAV storage when they are (or become) available. Called on
+   * open and again whenever the server becomes reachable (e.g. the app started offline).
+   */
+  attachRemotes(): void {
+    const cfg = serverConfig.value;
+    if (this.provider && !this.provider.enabled && cfg?.features.sync && prefs.value.sync.enabled) {
+      this.provider.enable(() => wsUrl(`/sync/${this.id}`));
+    }
+    if (!this.webdav) {
+      const target = resolveWebDAV();
+      if (target) {
+        this.webdav = new WebDAVSync(target, this.id, this.doc, () => this.projectInfo(), this.storageOrigin);
+        // Do not block opening on the network; merge in the background.
+        void this.webdav.syncNow();
+      }
     }
   }
 

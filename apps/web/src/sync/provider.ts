@@ -48,7 +48,7 @@ export class SyncProvider {
     readonly projectId: string,
     readonly doc: Y.Doc,
     readonly awareness: awarenessProtocol.Awareness,
-    private readonly url: (() => string) | null,
+    private url: (() => string) | null,
     private readonly capabilities: string[] = ['render', 'ui'],
   ) {
     doc.on('update', this.onDocUpdate);
@@ -69,6 +69,18 @@ export class SyncProvider {
       window.addEventListener('offline', this.onOffline);
     }
     if (url) this.connect();
+  }
+
+  /** Starts using a server (e.g. after it became reachable). No-op if already configured. */
+  enable(url: () => string): void {
+    if (this.url || this.destroyed) return;
+    this.url = url;
+    this.retries = 0;
+    this.connect();
+  }
+
+  get enabled(): boolean {
+    return !!this.url;
   }
 
   setRpcHandler(h: RpcHandler | null): void {

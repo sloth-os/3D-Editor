@@ -1,7 +1,7 @@
 import { render } from 'preact';
 import { App } from './ui/App';
 import './ui/styles.css';
-import { serverConfig, serverChecked, toast } from './app/store';
+import { serverConfig, serverChecked, session, toast } from './app/store';
 import { fetchServerConfig } from './app/server-config';
 import { setupTelemetry } from './telemetry/setup';
 import { registerUiOperators } from './editor/ui-operators';
@@ -32,6 +32,16 @@ async function boot(): Promise<void> {
       toast(`Could not open project: ${err instanceof Error ? err.message : err}`, 'error');
     }
   }
+  // If the server was unreachable at start (offline), keep probing and attach once it is back.
+  const reprobe = async () => {
+    if (serverConfig.value) return;
+    const cfg = await fetchServerConfig();
+    if (!cfg) return;
+    serverConfig.value = cfg;
+    session.value?.attachRemotes();
+  };
+  window.addEventListener('online', () => void reprobe());
+  setInterval(() => void reprobe(), 15_000);
   // Files opened through the OS (PWA file handlers)
   const lq = (window as unknown as { launchQueue?: { setConsumer(cb: (p: { files: FileSystemFileHandle[] }) => void): void } }).launchQueue;
   lq?.setConsumer(async (params) => {
