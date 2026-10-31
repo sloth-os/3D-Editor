@@ -3,4 +3,11 @@
  * module; `registerBuiltinModifiers` is idempotent and is called by the evaluator.
  */
 export * from './registry';
-export { registerBuiltinModifiers } from './builtin';
+export {
+  registerBuiltinModifiers,
+  defaultModifierName,
+  describeModifierTypes,
+  modifierObjectParams,
+  type ModifierTypeInfo,
+} from './builtin';
+export { csgMeshBoolean, type CsgOperation } from './csg';

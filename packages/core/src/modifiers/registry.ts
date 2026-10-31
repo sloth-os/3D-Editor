@@ -14,6 +14,11 @@ export interface ModifierContext {
    * Returns null if the object does not exist, is not a mesh or would create a cycle.
    */
   getObjectMesh(id: string): { mesh: MeshData; matrix: Mat4 } | null;
+  /**
+   * Optional: world matrix of any object (including empties), e.g. a Mirror/Array/Cast helper object.
+   * Modifiers fall back to `getObjectMesh(id).matrix` when the evaluator does not provide it.
+   */
+  getObjectMatrix?(id: string): Mat4 | null;
   /** True when evaluating for final render (uses `show_render` instead of `show_viewport`). */
   forRender: boolean;
   /** True when the owning object is in edit mode. */
@@ -89,7 +94,10 @@ export interface ModifierStackResult {
 }
 
 /** Whether a modifier is active in the given evaluation mode. */
-export function isModifierEnabled(mod: ModifierData, ctx: Pick<ModifierContext, 'forRender' | 'editMode'>): boolean {
+export function isModifierEnabled(
+  mod: ModifierData,
+  ctx: Pick<ModifierContext, 'forRender' | 'editMode'>,
+): boolean {
   if (ctx.forRender) return mod.show_render !== false;
   if (mod.show_viewport === false) return false;
   if (ctx.editMode && mod.show_in_editmode === false) return false;
@@ -97,7 +105,11 @@ export function isModifierEnabled(mod: ModifierData, ctx: Pick<ModifierContext, 
 }
 
 /** Applies the enabled modifiers in order. Failing modifiers are skipped and reported. */
-export function evaluateModifierStack(mesh: MeshData, modifiers: ModifierData[], ctx: ModifierContext): ModifierStackResult {
+export function evaluateModifierStack(
+  mesh: MeshData,
+  modifiers: ModifierData[],
+  ctx: ModifierContext,
+): ModifierStackResult {
   let cur = mesh;
   const errors: ModifierStackResult['errors'] = [];
   for (const mod of modifiers) {
@@ -107,9 +119,16 @@ export function evaluateModifierStack(mesh: MeshData, modifiers: ModifierData[],
       errors.push({ modifierId: mod.id, message: `Unknown modifier type ${mod.type}` });
       continue;
     }
+    const parsed = def.schema.safeParse(mod.params ?? {});
+    if (!parsed.success) {
+      const issues = parsed.error.issues
+        .map((i) => `${i.path.join('.') || '(params)'}: ${i.message}`)
+        .join('; ');
+      errors.push({ modifierId: mod.id, message: `Invalid parameters: ${issues}` });
+      continue;
+    }
     try {
-      const params = def.schema.parse(mod.params ?? {});
-      cur = def.apply(cur, params, ctx);
+      cur = def.apply(cur, parsed.data, ctx);
     } catch (err) {
       errors.push({ modifierId: mod.id, message: err instanceof Error ? err.message : String(err) });
     }
