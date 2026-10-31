@@ -131,3 +131,40 @@ describe('SceneDoc', () => {
     expect(ev2.byId.get(p)!.data.location[2]).toBeCloseTo(10);
   });
 });
+
+describe('modifier helper objects', () => {
+  it('uses an Empty as the mirror object and re-evaluates when it moves', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const mesh = doc.addMesh('C', createCube({ size: 1 }));
+    const empty = doc.addObject({ type: 'EMPTY', name: 'MirrorCenter', location: [3, 0, 0] });
+    const cube = doc.addObject({
+      type: 'MESH',
+      name: 'Cube',
+      data: mesh,
+      location: [1, 0, 0],
+      modifiers: [
+        {
+          id: 'm1',
+          name: 'Mirror',
+          type: 'MIRROR',
+          show_viewport: true,
+          show_render: true,
+          show_in_editmode: true,
+          show_expanded: true,
+          params: { mirror_object: empty, use_mirror_merge: false },
+        },
+      ],
+    });
+    const ev = new SceneEvaluator(doc);
+    const maxX = () =>
+      Math.max(
+        ...ev
+          .evaluate(1)
+          .byId.get(cube)!
+          .mesh!.positions.filter((_, i) => i % 3 === 0),
+      );
+    expect(maxX()).toBeCloseTo(4.5);
+    doc.updateObject(empty, { location: [5, 0, 0] });
+    expect(maxX()).toBeCloseTo(8.5);
+  });
+});

@@ -1,6 +1,7 @@
 import {
   listModifierDefs,
   getModifierDef,
+  modifierObjectParams,
   safeJsonSchema,
   type ModifierData,
   type ObjectData,
@@ -164,6 +165,7 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
                 schema={safeJsonSchema(def.schema)}
                 values={m.params}
                 doc={s.doc}
+                objectKeys={modifierObjectParams(m.type)}
                 testIdPrefix={`mod-${m.type.toLowerCase()}`}
                 onChange={(k, v, final) => setParam(s, o, m, k, v, final)}
               />

@@ -53,8 +53,11 @@ export function SchemaForm(p: {
   doc?: SceneDoc;
   exclude?: string[];
   testIdPrefix?: string;
+  /** Parameter names holding object references (rendered as object pickers). */
+  objectKeys?: string[];
 }) {
   const schema = p.schema as JsonSchema;
+  const objectKeys = new Set([...OBJECT_REF_KEYS, ...(p.objectKeys ?? [])]);
   const props = schema?.properties ?? {};
   const rows = Object.entries(props).filter(([k]) => !p.exclude?.includes(k));
   return (
@@ -64,7 +67,7 @@ export function SchemaForm(p: {
         const value = p.values[key] ?? s.default;
         const label = humanize(key);
         const tid = p.testIdPrefix ? `${p.testIdPrefix}-${key}` : undefined;
-        if (OBJECT_REF_KEYS.has(key) && p.doc) {
+        if (objectKeys.has(key) && p.doc) {
           const objs = p.doc.listObjects();
           return (
             <Row key={key} label={label}>

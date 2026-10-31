@@ -194,14 +194,16 @@ export class SceneEvaluator {
           deps.push(...modifierDependencies(m));
           if (isModifierTimeDependent(m)) timeDep = true;
         }
+        // Dependencies may be meshes (Boolean operand) or any object used only for its transform
+        // (Mirror/Array/Cast helpers, often Empties): key on both so either change re-evaluates.
         const depKeys: string[] = deps.map((d): string => {
           const r: MeshResult | null = evalMesh(d);
-          return r
-            ? `${d}:${r.key}:${worldM
-                .get(d)
-                ?.map((x) => x.toFixed(5))
-                .join(',')}`
-            : `${d}:none`;
+          const m =
+            worldM
+              .get(d)
+              ?.map((x) => x.toFixed(5))
+              .join(',') ?? 'missing';
+          return `${d}:${r ? r.key : 'nomesh'}:${m}`;
         });
         const key: string = [
           baseToken,
@@ -232,6 +234,7 @@ export class SceneEvaluator {
             const r: MeshResult | null = evalMesh(dep);
             return r ? { mesh: r.mesh, matrix: worldM.get(dep)! } : null;
           },
+          getObjectMatrix: (dep) => worldM.get(dep) ?? null,
         });
         this.meshCache.set(id, { key, mesh: res.mesh, errors: res.errors });
         const r: MeshResult = { mesh: res.mesh, key, errors: res.errors, base };
