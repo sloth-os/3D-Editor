@@ -1,0 +1,359 @@
+import {
+  SceneEvaluator,
+  cloneMesh,
+  evaluateModifierStack,
+  getModifierDef,
+  listModifierDefs,
+  newId,
+  registerBuiltinModifiers,
+  safeJsonSchema,
+  uniqueName,
+  defaultModifierParams,
+  type ModifierData,
+  type ObjectData,
+  type OperatorRegistry,
+} from '@3d-editor/core';
+import { ToolError, type AgentProject } from './agent';
+
+/*
+ * Modifier stack editing for MCP tools. The operators `object.modifier_add|set|remove|apply`
+ * are used when registered (they are the single entry point for user actions); their parameter
+ * names are matched against the operator's schema, and the outcome is verified against the
+ * document. Missing operators fall back to equivalent direct document edits.
+ */
+
+export type ModifierPatch = {
+  name?: string;
+  params?: Record<string, unknown>;
+  show_viewport?: boolean;
+  show_render?: boolean;
+  show_in_editmode?: boolean;
+};
+
+export interface ModifierChange {
+  modifier: ModifierData | null;
+  /** How the change was made. */
+  via: 'operator' | 'document' | 'operator+document';
+  /** Parameter keys not known to the modifier type (ignored). */
+  ignored?: string[];
+}
+
+const SETTINGS_KEYS = ['params', 'settings', 'values', 'properties'];
+const REF_KEYS = ['modifier', 'modifier_id', 'modifier_name'];
+const FLAG_KEYS = ['show_viewport', 'show_render', 'show_in_editmode'] as const;
+
+export function modifierTypes(): { type: string; label: string; category: string; description: string }[] {
+  registerBuiltinModifiers();
+  return listModifierDefs()
+    .map((d) => ({ type: d.type, label: d.label, category: d.category, description: d.description }))
+    .sort((a, b) => a.type.localeCompare(b.type));
+}
+
+/** JSON schema of a modifier type's parameters (for error messages). */
+export function modifierParamsSchema(type: string): unknown {
+  registerBuiltinModifiers();
+  const def = getModifierDef(type);
+  return def ? safeJsonSchema(def.schema) : null;
+}
+
+export function findModifier(o: ObjectData, ref: string): ModifierData | null {
+  return (
+    o.modifiers.find((m) => m.id === ref) ??
+    o.modifiers.find((m) => m.name === ref) ??
+    o.modifiers.find((m) => m.name.toLowerCase() === ref.toLowerCase()) ??
+    null
+  );
+}
+
+export function requireModifier(o: ObjectData, ref: string): ModifierData {
+  const m = findModifier(o, ref);
+  if (!m) {
+    const names = o.modifiers.map((x) => `'${x.name}' (${x.type})`).join(', ');
+    throw new ToolError(
+      `Modifier '${ref}' not found on '${o.name}'.${names ? ` Its modifiers: ${names}.` : ' It has no modifiers.'}`,
+    );
+  }
+  return m;
+}
+
+function operatorParamNames(registry: OperatorRegistry, id: string): Set<string> | null {
+  const def = registry.get(id);
+  if (!def) return null;
+  const schema = safeJsonSchema(def.schema) as { properties?: Record<string, unknown> };
+  return new Set(Object.keys(schema.properties ?? {}));
+}
+
+function selectOnly(p: AgentProject, objectId: string): void {
+  p.state.mode = 'OBJECT';
+  p.state.selectedIds = [objectId];
+  p.state.activeId = objectId;
+}
+
+function buildParams(
+  names: Set<string>,
+  opts: { objectId: string; modifierRef?: string; type?: string; name?: string; patch?: ModifierPatch },
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (names.has('object')) out.object = opts.objectId;
+  else if (names.has('objects')) out.objects = [opts.objectId];
+  if (opts.type !== undefined && names.has('type')) out.type = opts.type;
+  let refKey: string | undefined;
+  if (opts.modifierRef !== undefined) {
+    refKey = REF_KEYS.find((k) => names.has(k)) ?? (names.has('name') ? 'name' : undefined);
+    if (refKey) out[refKey] = opts.modifierRef;
+  }
+  const patch = opts.patch ?? {};
+  const newName = opts.name ?? patch.name;
+  if (newName !== undefined) {
+    if (names.has('new_name')) out.new_name = newName;
+    else if (refKey !== 'name' && names.has('name')) out.name = newName;
+  }
+  for (const k of FLAG_KEYS) if (patch[k] !== undefined && names.has(k)) out[k] = patch[k];
+  if (patch.params && Object.keys(patch.params).length) {
+    const settingsKey = SETTINGS_KEYS.find((k) => names.has(k));
+    if (settingsKey) out[settingsKey] = patch.params;
+    else for (const [k, v] of Object.entries(patch.params)) if (names.has(k) && !(k in out)) out[k] = v;
+  }
+  return out;
+}
+
+/** Validates a parameter patch against the modifier type; returns merged params and ignored keys. */
+function mergeParams(mod: Pick<ModifierData, 'type' | 'params'>, params: Record<string, unknown> = {}) {
+  registerBuiltinModifiers();
+  const def = getModifierDef(mod.type);
+  const merged = { ...mod.params, ...params };
+  if (!def) return { params: merged, ignored: [] as string[] };
+  const known = new Set(Object.keys((def.schema as { shape?: Record<string, unknown> }).shape ?? {}));
+  const ignored = Object.keys(params).filter((k) => known.size > 0 && !known.has(k));
+  const res = def.schema.safeParse(merged);
+  if (!res.success) {
+    const msg = res.error.issues.map((i) => `${i.path.join('.') || 'params'}: ${i.message}`).join('; ');
+    throw new ToolError(
+      `Invalid parameters for ${mod.type} modifier: ${msg}. Schema: ${JSON.stringify(safeJsonSchema(def.schema))}`,
+    );
+  }
+  return { params: res.data as Record<string, unknown>, ignored };
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/** Applies a patch with direct document edits (fallback / completing operator results). */
+function patchDirect(p: AgentProject, objectId: string, modId: string, patch: ModifierPatch): string[] {
+  let ignored: string[] = [];
+  p.transact(() => {
+    const o = p.scene.getObject(objectId);
+    if (!o) throw new ToolError('object disappeared');
+    const mods = o.modifiers.map((m) => {
+      if (m.id !== modId) return m;
+      const next: ModifierData = { ...m };
+      if (patch.params) {
+        const merged = mergeParams(m, patch.params);
+        next.params = merged.params;
+        ignored = merged.ignored;
+      }
+      for (const k of FLAG_KEYS) if (patch[k] !== undefined) next[k] = patch[k]!;
+      if (patch.name !== undefined && patch.name !== m.name) {
+        next.name = uniqueName(
+          patch.name,
+          o.modifiers.filter((x) => x.id !== m.id).map((x) => x.name),
+        );
+      }
+      return next;
+    });
+    p.scene.updateObject(objectId, { modifiers: mods });
+  });
+  return ignored;
+}
+
+/** Whether the modifier already reflects the patch. */
+function satisfies(mod: ModifierData, patch: ModifierPatch): boolean {
+  if (patch.name !== undefined && mod.name !== patch.name) return false;
+  for (const k of FLAG_KEYS) if (patch[k] !== undefined && mod[k] !== patch[k]) return false;
+  for (const [k, v] of Object.entries(patch.params ?? {})) if (!sameValue(mod.params[k], v)) return false;
+  return true;
+}
+
+export function addModifier(
+  p: AgentProject,
+  registry: OperatorRegistry,
+  object: ObjectData,
+  type: string,
+  opts: { name?: string; params?: Record<string, unknown> } = {},
+): ModifierChange {
+  registerBuiltinModifiers();
+  const lower = type.toLowerCase();
+  const def =
+    getModifierDef(type) ??
+    getModifierDef(type.toUpperCase()) ??
+    listModifierDefs().find((d) => d.label.toLowerCase() === lower);
+  if (!def) {
+    const types = modifierTypes()
+      .map((t) => t.type)
+      .join(', ');
+    throw new ToolError(`Unknown modifier type '${type}'. Available types: ${types || '(none registered)'}.`);
+  }
+  if (object.type !== 'MESH')
+    throw new ToolError(`Modifiers can only be added to mesh objects ('${object.name}' is ${object.type}).`);
+  type = def.type;
+  if (opts.params) mergeParams({ type, params: defaultModifierParams(type) }, opts.params); // validate early
+  return p.step(() => {
+    const before = new Set(object.modifiers.map((m) => m.id));
+    const names = operatorParamNames(registry, 'object.modifier_add');
+    let via: ModifierChange['via'] = 'document';
+    let added: ModifierData | null = null;
+    if (names) {
+      selectOnly(p, object.id);
+      const res = p.run(
+        'object.modifier_add',
+        buildParams(names, { objectId: object.id, type, name: opts.name, patch: { params: opts.params } }),
+      );
+      if (!res.ok) throw new ToolError(`object.modifier_add failed: ${res.error}`);
+      added =
+        p.scene.getObject(object.id)?.modifiers.find((m) => !before.has(m.id) && m.type === type) ?? null;
+      if (added) via = 'operator';
+    }
+    if (!added) {
+      const o = p.scene.getObject(object.id)!;
+      const mod: ModifierData = {
+        id: newId(),
+        name: uniqueName(
+          opts.name ?? def.label,
+          o.modifiers.map((m) => m.name),
+        ),
+        type,
+        show_viewport: true,
+        show_render: true,
+        show_in_editmode: true,
+        show_expanded: true,
+        params: defaultModifierParams(type),
+      };
+      p.transact(() => p.scene.updateObject(o.id, { modifiers: [...o.modifiers, mod] }));
+      added = mod;
+    }
+    const patch: ModifierPatch = { name: opts.name, params: opts.params };
+    let ignored: string[] = [];
+    if (!satisfies(added, patch)) {
+      ignored = patchDirect(p, object.id, added.id, patch);
+      if (via === 'operator') via = 'operator+document';
+    } else if (opts.params) ignored = mergeParams(added, opts.params).ignored;
+    const final = p.scene.getObject(object.id)?.modifiers.find((m) => m.id === added!.id) ?? added;
+    return { modifier: final, via, ...(ignored.length ? { ignored } : {}) };
+  });
+}
+
+export function updateModifier(
+  p: AgentProject,
+  registry: OperatorRegistry,
+  object: ObjectData,
+  mod: ModifierData,
+  patch: ModifierPatch,
+): ModifierChange {
+  if (patch.params) mergeParams(mod, patch.params); // validate early
+  return p.step(() => {
+    const names = operatorParamNames(registry, 'object.modifier_set');
+    let via: ModifierChange['via'] = 'document';
+    if (names) {
+      selectOnly(p, object.id);
+      const res = p.run(
+        'object.modifier_set',
+        buildParams(names, { objectId: object.id, modifierRef: mod.name, patch }),
+      );
+      if (!res.ok) throw new ToolError(`object.modifier_set failed: ${res.error}`);
+      via = 'operator';
+    }
+    let current = p.scene.getObject(object.id)?.modifiers.find((m) => m.id === mod.id) ?? null;
+    if (!current) throw new ToolError(`Modifier '${mod.name}' disappeared while updating it.`);
+    let ignored: string[] = [];
+    if (!satisfies(current, patch)) {
+      ignored = patchDirect(p, object.id, mod.id, patch);
+      via = via === 'operator' ? 'operator+document' : 'document';
+      current = p.scene.getObject(object.id)?.modifiers.find((m) => m.id === mod.id) ?? current;
+    } else if (patch.params) ignored = mergeParams(current, patch.params).ignored;
+    return { modifier: current, via, ...(ignored.length ? { ignored } : {}) };
+  });
+}
+
+export function removeModifier(
+  p: AgentProject,
+  registry: OperatorRegistry,
+  object: ObjectData,
+  mod: ModifierData,
+): ModifierChange {
+  return p.step(() => {
+    const names = operatorParamNames(registry, 'object.modifier_remove');
+    let via: ModifierChange['via'] = 'document';
+    const stillThere = () => !!p.scene.getObject(object.id)?.modifiers.some((m) => m.id === mod.id);
+    if (names) {
+      selectOnly(p, object.id);
+      const res = p.run(
+        'object.modifier_remove',
+        buildParams(names, { objectId: object.id, modifierRef: mod.name }),
+      );
+      if (!res.ok) throw new ToolError(`object.modifier_remove failed: ${res.error}`);
+      via = 'operator';
+    }
+    if (stillThere()) {
+      p.transact(() => {
+        const o = p.scene.getObject(object.id)!;
+        p.scene.updateObject(o.id, { modifiers: o.modifiers.filter((m) => m.id !== mod.id) });
+      });
+      via = via === 'operator' ? 'operator+document' : 'document';
+    }
+    return { modifier: mod, via };
+  });
+}
+
+/** Bakes one modifier into the mesh (Blender "Apply") without operators. */
+function applyDirect(p: AgentProject, object: ObjectData, mod: ModifierData): void {
+  if (!object.data) throw new ToolError(`'${object.name}' has no mesh data`);
+  const base = p.scene.getMesh(object.data);
+  if (!base) throw new ToolError(`'${object.name}' has no mesh data`);
+  const ev = new SceneEvaluator(p.scene).evaluate(p.state.frame);
+  const res = evaluateModifierStack(base, [{ ...mod, show_viewport: true }], {
+    frame: p.state.frame,
+    objectMatrix: ev.byId.get(object.id)?.worldMatrix ?? p.scene.worldMatrix(object.id),
+    getObjectMesh: (id) => {
+      const e = ev.byId.get(id);
+      return e?.mesh && id !== object.id ? { mesh: e.mesh, matrix: e.worldMatrix } : null;
+    },
+    getObjectMatrix: (id) => ev.byId.get(id)?.worldMatrix ?? null,
+    forRender: false,
+    editMode: false,
+  });
+  if (res.errors.length)
+    throw new ToolError(`Applying '${mod.name}' failed: ${res.errors.map((e) => e.message).join('; ')}`);
+  p.transact(() => {
+    const o = p.scene.getObject(object.id)!;
+    let meshId = o.data!;
+    if (p.scene.dataUsers(meshId) > 1) {
+      meshId = p.scene.addMesh(p.scene.getMeshBlock(meshId)?.name ?? o.name, cloneMesh(res.mesh));
+      p.scene.updateObject(o.id, { data: meshId });
+    } else p.scene.setMesh(meshId, cloneMesh(res.mesh));
+    p.scene.updateObject(o.id, { modifiers: o.modifiers.filter((m) => m.id !== mod.id) });
+  });
+}
+
+export function applyModifier(
+  p: AgentProject,
+  registry: OperatorRegistry,
+  object: ObjectData,
+  mod: ModifierData,
+): ModifierChange {
+  return p.step(() => {
+    const names = operatorParamNames(registry, 'object.modifier_apply');
+    if (names) {
+      selectOnly(p, object.id);
+      const res = p.run(
+        'object.modifier_apply',
+        buildParams(names, { objectId: object.id, modifierRef: mod.name }),
+      );
+      if (!res.ok) throw new ToolError(`object.modifier_apply failed: ${res.error}`);
+      if (!p.scene.getObject(object.id)?.modifiers.some((m) => m.id === mod.id))
+        return { modifier: mod, via: 'operator' };
+    }
+    applyDirect(p, p.scene.getObject(object.id) ?? object, mod);
+    return { modifier: mod, via: names ? 'operator+document' : 'document' };
+  });
+}

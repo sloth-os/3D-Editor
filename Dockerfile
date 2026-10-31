@@ -21,13 +21,20 @@ COPY apps/web apps/web
 COPY apps/server apps/server
 ARG APP_VERSION=0.1.0
 ENV APP_VERSION=${APP_VERSION}
-RUN npm run build -w @3d-editor/web && npm run build -w @3d-editor/server
+RUN npm run build -w @3d-editor/web && npm run build -w @3d-editor/server && mkdir -p /out/data
 
-# Production dependencies of the server (pure JavaScript, so installable on any platform).
+# Production dependencies of the server, exactly as locked (pure JavaScript, so they can be
+# installed on the build platform and copied into every target architecture).
 FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-bookworm-slim AS deps
-WORKDIR /deps
-COPY --from=build /src/apps/server/dist/package.json ./package.json
-RUN --mount=type=cache,target=/root/.npm npm install --omit=dev --no-audit --no-fund --ignore-scripts && npm cache clean --force
+WORKDIR /src
+COPY package.json package-lock.json ./
+COPY packages/core/package.json packages/core/
+COPY apps/web/package.json apps/web/
+COPY apps/server/package.json apps/server/
+COPY e2e/package.json e2e/
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --workspace @3d-editor/server --include-workspace-root=false --no-audit --no-fund --ignore-scripts \
+ && rm -rf node_modules/@3d-editor
 
 FROM node:${NODE_VERSION}-alpine AS runtime
 ARG APP_VERSION=0.1.0
@@ -42,14 +49,15 @@ ENV NODE_ENV=production \
     DATA_DIR=/data \
     APP_VERSION=${APP_VERSION}
 WORKDIR /app
-RUN apk add --no-cache tini wget && mkdir -p /data && chown -R node:node /data
-COPY --from=deps --chown=node:node /deps/node_modules ./node_modules
+# The runtime stage only copies files (no RUN), so building for arm64/armv7 needs no emulation.
+# The server handles SIGTERM/SIGINT itself (graceful shutdown), so no init process is required.
+COPY --from=build --chown=node:node /out/data /data
+COPY --from=deps --chown=node:node /src/node_modules ./node_modules
 COPY --from=build --chown=node:node /src/apps/server/dist ./
 COPY --from=build --chown=node:node /src/apps/web/dist ./public
 USER node
 EXPOSE 8080
 VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- "http://127.0.0.1:${PORT}/healthz" >/dev/null || exit 1
-ENTRYPOINT ["/sbin/tini", "--"]
+  CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
 CMD ["node", "main.js"]

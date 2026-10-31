@@ -6,6 +6,7 @@ services:
   editor:
     image: ghcr.io/sloth-os/3d-editor:latest
     build: .
+    init: true
     ports:
       - '8080:8080'
     environment:
