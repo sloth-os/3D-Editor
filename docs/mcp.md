@@ -15,7 +15,13 @@ Claude Code:
 claude mcp add --transport http 3d-editor http://localhost:8080/mcp
 ```
 
-Any MCP client that supports Streamable HTTP can connect the same way. If the server runs with
+Any MCP client that supports Streamable HTTP can connect the same way. Clients that only
+speak stdio can use a generic HTTP bridge, e.g. in a desktop client's config:
+
+```json
+{ "mcpServers": { "3d-editor": { "command": "npx", "args": ["-y", "mcp-remote", "http://localhost:8080/mcp"] } } }
+```
+ If the server runs with
 `AUTH_TOKEN` (or `MCP_TOKEN`), send `Authorization: Bearer <token>`:
 
 ```bash
