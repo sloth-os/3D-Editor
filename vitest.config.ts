@@ -44,7 +44,9 @@ export default defineConfig({
     ],
     coverage: {
       provider: 'v8',
-      include: ['packages/core/src/**', 'apps/server/src/**', 'apps/web/src/**'],
+      // resolved relative to each project's root (packages/core, apps/server, apps/web)
+      include: ['src/**/*.{ts,tsx}'],
+      exclude: ['**/node_modules/**', '**/dist/**', '**/test/**', '**/*.d.ts'],
       reporter: ['text-summary', 'html', 'lcov'],
     },
   },
