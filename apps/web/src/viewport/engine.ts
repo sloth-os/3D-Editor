@@ -175,6 +175,8 @@ export class ViewportEngine {
         void v.showWireframe.value;
         void v.overlays.value;
         void v.showGrid.value;
+        void v.tool.value;
+        void v.snapping.value;
         void s.peers.value;
         this.invalidate();
       }),

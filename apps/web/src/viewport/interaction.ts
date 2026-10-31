@@ -81,7 +81,10 @@ export class ViewportInteraction {
     const st = this.session.state;
     const hasSel = st.mode === 'EDIT' ? st.meshSelection.verts.size > 0 : st.selectedIds.length > 0;
     if (!gmode || !hasSel || this.modal || st.mode === 'SCULPT' || st.mode === 'VERTEX_PAINT') {
-      if (this.gizmo.object) this.gizmo.detach();
+      if (this.gizmo.object) {
+        this.gizmo.detach();
+        this.engine.requestRender();
+      }
       return;
     }
     if (this.gizmoStart) return;
@@ -96,7 +99,10 @@ export class ViewportInteraction {
     this.gizmoProxy.quaternion.identity();
     this.gizmoProxy.scale.set(1, 1, 1);
     this.gizmoProxy.updateMatrixWorld(true);
-    if (this.gizmo.object !== this.gizmoProxy) this.gizmo.attach(this.gizmoProxy);
+    if (this.gizmo.object !== this.gizmoProxy) {
+      this.gizmo.attach(this.gizmoProxy);
+      this.engine.requestRender();
+    }
   };
 
   private onGizmoDragging(dragging: boolean): void {
