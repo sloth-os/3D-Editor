@@ -276,6 +276,8 @@ describe('rigidbody.bake_to_keyframes', () => {
       ],
       extrapolation: 'CONSTANT',
       mute: false,
+      // would add noise on top of the baked motion
+      modifiers: [{ type: 'NOISE', params: { scale: 2, strength: 3 } }],
     });
     t.doc.setDriver({
       target_type: 'object',
@@ -295,9 +297,14 @@ describe('rigidbody.bake_to_keyframes', () => {
     expect(r.ok).toBe(true);
     expect(r.result.frames).toBe(4);
     expect(r.result.removed_drivers).toBe(1);
+    expect(r.result.removed_modifiers).toBe(1);
+    expect(t.reports.some((m) => /Removed 1 F-curve modifier/.test(m))).toBe(true);
     const fx = t.doc.getFCurve(`object:${t.box}:location:0`)!;
     expect(fx.keyframes.map((k) => k.frame)).toEqual([-10, 1, 11, 21, 31, 300]);
+    expect(fx.modifiers ?? []).toEqual([]);
     expect(t.doc.getDriver(`object:${t.box}:location:1`)).toBeNull();
+    // the keys alone give the object's transform inside the baked range
+    expect(new FrameState(t.doc, 21).world(t.box)![12]).toBeCloseTo(fx.keyframes[3].value, 9);
   });
 
   it('rejects bad ranges, missing bodies and a disabled world', () => {

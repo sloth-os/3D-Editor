@@ -14,6 +14,7 @@ import {
   PROCEDURAL_MAPPINGS,
   PROCEDURAL_TYPE_DOCS,
   PROCEDURAL_TYPES,
+  describeProceduralParam,
   describeProceduralParams,
   validateProceduralParams,
 } from '../material/procedural-params';
@@ -72,12 +73,45 @@ function materialRef(ctx: OperatorContext, id: string): { id: string; name: stri
   return { id, name: ctx.doc.getMaterial(id)?.name ?? '' };
 }
 
+const fmt = (v: number) => String(Math.round(v * 1000) / 1000);
+
+/**
+ * Warns about objects using `materialIds` whose world scale is not 1: OBJECT-mapped procedural
+ * textures are sized in object space before the object's scale (like Blender), so their pattern is
+ * stretched by that scale.
+ */
+function warnScaledUsers(ctx: OperatorContext, materialIds: readonly string[], what: string): void {
+  if (!materialIds.length) return;
+  const ids = new Set(materialIds);
+  for (const o of ctx.doc.listObjects()) {
+    if (!o.material_slots.some((s) => s !== null && ids.has(s))) continue;
+    const m = ctx.doc.worldMatrix(o.id);
+    const s = [Math.hypot(m[0], m[1], m[2]), Math.hypot(m[4], m[5], m[6]), Math.hypot(m[8], m[9], m[10])];
+    if (s.every((v) => Math.abs(v - 1) <= 1e-3)) continue;
+    ctx.report(
+      'WARNING',
+      `Object '${o.name}' is scaled by (${s.map(fmt).join(', ')}): ${what} use OBJECT mapping, which is sized in object space before the object's scale, so the pattern is stretched by that scale. Apply the scale (object.transform_apply with scale=true) for true metric sizes.`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------- procedural texture input
 
-const proceduralParamsDoc = PROCEDURAL_TYPES.map((t) => `${t}: ${describeProceduralParams(t)}`).join('; ');
-const commonParamsDoc = PROCEDURAL_COMMON_PARAMS.map((p) =>
-  p.kind === 'enum' ? `${p.key}=${p.values!.join('|')} (${p.default})` : `${p.key} (${p.default})`,
-).join(', ');
+const proceduralParamsDoc = PROCEDURAL_TYPES.map((t) => `${t}: ${describeProceduralParams(t)}`).join('.\n');
+const commonParamsDoc = PROCEDURAL_COMMON_PARAMS.map(describeProceduralParam).join('; ');
+
+/**
+ * Per-type defaults of a shared field, generated from the type defaults: the most common value and
+ * the exceptions, e.g. "5 (GRADIENT 1, MARBLE 2, WOOD 8)".
+ */
+function typeDefaultsDoc(field: 'scale' | 'detail' | 'roughness' | 'distortion'): string {
+  const values = PROCEDURAL_TYPES.map((t) => [t, defaultProcedural(t)[field]] as const);
+  const counts = new Map<number, number>();
+  for (const [, v] of values) counts.set(v, (counts.get(v) ?? 0) + 1);
+  const common = [...counts.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  const exceptions = values.filter(([, v]) => v !== common).map(([t, v]) => `${t} ${v}`);
+  return exceptions.length ? `${common} (${exceptions.join(', ')})` : `${common}`;
+}
 
 const proceduralInput = z.object({
   type: z
@@ -92,7 +126,7 @@ const proceduralInput = z.object({
     .enum(PROCEDURAL_MAPPINGS as ['GENERATED', 'OBJECT', 'UV'])
     .optional()
     .describe(
-      'Texture coordinates: GENERATED = position normalised to the object bounding box (0..1 per axis, default), OBJECT = object-space position in metres (pattern size independent of object size), UV = the mesh UV map (u, v, 0).',
+      "Texture coordinates (default GENERATED): GENERATED = undeformed position normalised to the object's base-mesh bounding box (0..1 per axis; the pattern stretches with the object's proportions and sticks to the surface under deformation); OBJECT = object-space (local) position in metres before the object's scale, as in Blender: a scaled object stretches the pattern by its scale, so apply the scale (object.transform_apply scale=true) for true metric sizes; UV = the mesh UV map (u, v, 0).",
     ),
   scale: z
     .number()
@@ -100,29 +134,52 @@ const proceduralInput = z.object({
     .max(1e6)
     .optional()
     .describe(
-      'Coordinate multiplier (pattern repetitions per coordinate unit). Type defaults: 5 (GRADIENT 1, MARBLE 2, WOOD 8).',
+      `Coordinate multiplier: pattern repetitions per coordinate unit (per metre of object space for OBJECT, per bounding box for GENERATED, per UV unit for UV). Type defaults: ${typeDefaultsDoc('scale')}.`,
     ),
   detail: z
     .number()
     .min(0)
     .max(15)
     .optional()
-    .describe('Noise octaves 0..15 (NOISE, WAVE/MARBLE/WOOD distortion noise) or MAGIC depth (default 2).'),
-  roughness: z.number().min(0).max(1).optional().describe('Octave amplitude falloff 0..1 (default 0.5).'),
+    .describe(
+      `Noise octaves 0..15 (NOISE; WAVE, MARBLE and WOOD distortion noise; fractional values blend in one more octave) or MAGIC depth 0..10; unused by VORONOI, CHECKER, GRADIENT and BRICK. Type defaults: ${typeDefaultsDoc('detail')}.`,
+    ),
+  roughness: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .describe(
+      `Amplitude falloff between noise octaves 0..1 (higher = grainier; same users as detail). Type defaults: ${typeDefaultsDoc('roughness')}.`,
+    ),
   distortion: z
     .number()
     .min(-1000)
     .max(1000)
     .optional()
-    .describe('Domain warp / turbulence amount (default 0; MARBLE 2, WOOD 0.6, MAGIC 1).'),
+    .describe(
+      `Domain warp (NOISE, VORONOI), noise distortion amount (WAVE, MARBLE turbulence, WOOD ring wobble) or folding (MAGIC); unused by CHECKER, GRADIENT and BRICK. Type defaults: ${typeDefaultsDoc('distortion')}.`,
+    ),
   color_a: color
     .optional()
     .describe(
       'Linear RGB(A) colour at ramp factor 0 (ramp_low). Scalar channels (roughness, metallic, alpha, bump height) use the red component.',
     ),
   color_b: color.optional().describe('Linear RGB(A) colour at ramp factor 1 (ramp_high).'),
-  ramp_low: z.number().min(-1e3).max(1e3).optional().describe('Factor mapped to color_a (default 0).'),
-  ramp_high: z.number().min(-1e3).max(1e3).optional().describe('Factor mapped to color_b (default 1).'),
+  ramp_low: z
+    .number()
+    .min(-1e3)
+    .max(1e3)
+    .optional()
+    .describe(
+      'Colour ramp stop of color_a: texture factor at which the colour is exactly color_a (default 0). Factors beyond the stops keep the nearest stop colour; ramp_low > ramp_high inverts the ramp.',
+    ),
+  ramp_high: z
+    .number()
+    .min(-1e3)
+    .max(1e3)
+    .optional()
+    .describe('Colour ramp stop of color_b: texture factor at which the colour is exactly color_b (default 1).'),
   seed: z
     .number()
     .int()
@@ -132,7 +189,7 @@ const proceduralInput = z.object({
     .record(z.string(), z.union([z.number(), z.string(), z.null()]))
     .optional()
     .describe(
-      `Type-specific options, merged into the existing ones (a null value removes a key). ${proceduralParamsDoc}. All types: ${commonParamsDoc}.`,
+      `Type-specific options as { key: value }, merged into the existing ones (a null value removes a key; unknown keys, wrong kinds and out-of-range values are rejected). "Scaled texture units" = texture coordinate × scale.\n${proceduralParamsDoc}.\nAll types: ${commonParamsDoc}.`,
     ),
 });
 
@@ -338,7 +395,7 @@ export function registerShadingOperators(reg: OperatorRegistry): void {
       id: 'material.preset_apply',
       label: 'Apply Material Preset',
       description:
-        'Apply a built-in material preset (ids from material.preset_list). Default: create ONE new material from the preset and put it into slot `slot` of every target object (objects by id or exact name; default: the selected objects; MESH, CURVE and FONT objects only). mode OVERWRITE instead rewrites the material already in that slot of each target; `material` rewrites an existing material in place. Overwriting resets every principled value and texture slot to the preset (the name is kept). Procedural presets use OBJECT mapping with sizes in metres. Returns { preset, materials: [{ id, name }], objects: [ids] }.',
+        "Apply a built-in material preset (ids from material.preset_list). Default: create ONE new material from the preset and put it into slot `slot` of every target object (objects by id or exact name; default: the selected objects; MESH, CURVE and FONT objects only). mode OVERWRITE instead rewrites the material already in that slot of each target; `material` rewrites an existing material in place. Overwriting resets every principled value and texture slot to the preset (the name is kept). Procedural presets use OBJECT mapping with real-world pattern sizes in metres of object space, i.e. before the object's scale (as in Blender): on a scaled object (e.g. a cube scaled to a wall) the pattern stretches with the scale, so apply the scale first (object.transform_apply scale=true); a WARNING is reported for every scaled user. Returns { preset, materials: [{ id, name }], objects: [ids] }.",
       category: 'Material',
       schema: z.object({
         preset: z.enum(PRESET_IDS).describe(`Preset id: ${PRESET_IDS.join(', ')}.`),
@@ -412,6 +469,8 @@ export function registerShadingOperators(reg: OperatorRegistry): void {
             else assignSlot(ctx, o, p.slot, create());
           }
         }
+        if (MATERIAL_TEXTURE_CHANNELS.some((ch) => channelProcedural(values, ch)?.mapping === 'OBJECT'))
+          warnScaledUsers(ctx, materials, `the procedural textures of preset '${preset.id}'`);
         return {
           preset: preset.id,
           materials: materials.map((id) => materialRef(ctx, id)),
@@ -426,7 +485,7 @@ export function registerShadingOperators(reg: OperatorRegistry): void {
       id: 'material.procedural_set',
       label: 'Set Procedural Texture',
       description:
-        "Set (or clear) the procedural texture of a material channel. The texture's ramp colour drives the channel like a texture plugged into a Principled BSDF input: base_color RGB replaces the base colour (its alpha multiplies the alpha), emission RGB replaces the emission colour (emission_strength still applies), metallic/roughness/alpha use the red component, normal uses the red component as a bump height (× params.bump_distance m × material normal_strength). Given fields are merged into the channel's existing procedural texture (unless replace=true); changing the type keeps colours, mapping, ramp, seed and common params. Evaluated identically by the viewport, the CPU renderers and the path tracer; glTF export bakes it to PNG. Returns { material: { id, name }, channel, procedural }.",
+        "Set (or clear) the procedural texture of a material channel. The texture's ramp colour drives the channel like a texture plugged into a Principled BSDF input: base_color RGB replaces the base colour (its alpha multiplies the alpha), emission RGB replaces the emission colour (only visible with material emission_strength > 0, which still scales it), metallic/roughness/alpha use the red component (alpha only has an effect when the material blend_method is CLIP or BLEND; set it with material.update), normal uses the red component as a bump height (× params.bump_distance m × material normal_strength). Given fields are merged into the channel's existing procedural texture (unless replace=true); changing the type keeps colours, mapping, ramp, seed and common params. An image texture in the same slot is kept but ignored while the procedural is set. WARNING reports flag settings without a visible effect (OPAQUE alpha, zero emission strength, OBJECT mapping on scaled objects). Evaluated identically by the viewport, the CPU renderers and the path tracer; glTF export bakes it to PNG. Returns { material: { id, name }, channel, procedural }.",
       category: 'Material',
       schema: z.object({
         material: z
@@ -483,13 +542,27 @@ export function registerShadingOperators(reg: OperatorRegistry): void {
           return { material: materialRef(ctx, id), channel: p.channel, procedural: null };
         }
         const tex = buildProcedural(existing, p.procedural, p.replace);
+        // an image in the slot is kept (the procedural takes precedence while it is set)
         textures[p.channel] = {
-          image: '',
+          image: slot?.image ?? '',
           scale: slot?.scale ?? [1, 1],
           offset: slot?.offset ?? [0, 0],
           procedural: tex,
         };
         ctx.doc.updateMaterial(id, { textures });
+        // channels without a visible effect in the material's current setup
+        if (p.channel === 'alpha' && m.blend_method !== 'CLIP' && m.blend_method !== 'BLEND')
+          ctx.report(
+            'WARNING',
+            `Material '${m.name}' uses blend_method OPAQUE, which ignores alpha: the alpha texture has no visible effect until blend_method is CLIP (cut-outs at alpha_threshold) or BLEND (material.update)`,
+          );
+        if (p.channel === 'emission' && !(m.emission_strength > 0))
+          ctx.report(
+            'WARNING',
+            `Material '${m.name}' has emission_strength 0: the emission texture has no visible effect until emission_strength > 0 (material.update)`,
+          );
+        if (tex.mapping === 'OBJECT' && existing?.mapping !== 'OBJECT')
+          warnScaledUsers(ctx, [id], `procedural textures`);
         return { material: materialRef(ctx, id), channel: p.channel, procedural: tex };
       },
     }),
@@ -500,7 +573,7 @@ export function registerShadingOperators(reg: OperatorRegistry): void {
       id: 'world.sky_set',
       label: 'Set Sky',
       description:
-        'Use the analytic procedural sky as the world (environment SKY) and/or change it: optional preset (NOON, CLEAR_DAY, MORNING, SUNSET, DUSK, NIGHT, OVERCAST) then explicit values. The sky lights the scene (sky ambient + its sun as a directional light of sun_intensity W/m², reddened near the horizon) and is the render background; sky radiance is scaled by world strength × environment_strength in every renderer. Sun direction: elevation above the horizon, rotation = azimuth counter-clockwise from −Y (0 → sun towards −Y, π/2 → +X). Returns the sky settings with sun_direction (unit vector towards the sun) and sun_irradiance (W/m² per channel after extinction).',
+        "Use the analytic procedural sky as the world (environment SKY) and/or change it: optional preset (NOON, CLEAR_DAY, MORNING, SUNSET, DUSK, NIGHT, OVERCAST; presets keep sun_rotation) then explicit values. The sky lights the scene (sky ambient + its sun as a directional light of sun_intensity W/m², reddened near the horizon) and is the render background; sky radiance is scaled by world strength × environment_strength in every renderer. Sun direction (Blender's Sky Texture convention): elevation above the horizon, rotation = azimuth counter-clockwise from +Y seen from above (0 → sun towards +Y, π/2 → −X, π → −Y, 3π/2 → +X); the unit vector towards the sun is (−cos(e)·sin(r), cos(e)·cos(r), sin(e)). For front light on a scene seen from Blender's default camera (at −Y, +X) use rotation ≈ 3.9 (225°). Returns the sky settings with sun_direction (unit vector towards the sun) and sun_irradiance (W/m² per channel after extinction).",
       category: 'World',
       schema: z.object({
         preset: z
@@ -538,7 +611,7 @@ export function registerShadingOperators(reg: OperatorRegistry): void {
           .max(1000)
           .optional()
           .describe(
-            'Sun azimuth in radians, counter-clockwise from −Y seen from above (0 → −Y, π/2 → +X, π → +Y; default unchanged).',
+            "Sun azimuth in radians, counter-clockwise from +Y seen from above like Blender's Sky Texture (0 → sun towards +Y, π/2 → −X, π → −Y, 3π/2 → +X; default unchanged).",
           ),
         sun_intensity: z
           .number()
@@ -554,7 +627,7 @@ export function registerShadingOperators(reg: OperatorRegistry): void {
           .max(Math.PI / 2)
           .optional()
           .describe(
-            'Angular diameter of the sun disc in radians (doc default 0.0095 = 0.545°; larger = softer).',
+            'Angular diameter of the sun disc in radians, 0..π/2 (doc default 0.0095 = 0.545°; larger = softer shadows and a bigger disc).',
           ),
         sun_color: vec3
           .optional()

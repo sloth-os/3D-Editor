@@ -9,6 +9,12 @@ import type { Mat4, Quat, Vec3 } from '../math/types';
 /** Row-major 3x3 matrix. */
 export type Mat3 = number[];
 
+/**
+ * Length of (x, y, z). Used instead of Math.hypot in the narrow phase's hot loops (several
+ * times faster in V8; scene coordinates are far from the overflow range hypot guards against).
+ */
+export const len3 = (x: number, y: number, z: number): number => Math.sqrt(x * x + y * y + z * z);
+
 export function isFiniteVec(v: ArrayLike<number>): boolean {
   for (let i = 0; i < v.length; i++) if (!Number.isFinite(v[i])) return false;
   return true;

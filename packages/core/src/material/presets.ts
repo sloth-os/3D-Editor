@@ -8,7 +8,8 @@ import { defaultProcedural } from './procedural';
  * Physically plausible material presets (original values). Colours are linear; metals use typical
  * measured normal-incidence reflectance (F0) as base colour. Procedural presets use OBJECT mapping
  * with scales in metres (scale = pattern repetitions per metre of object space), so patterns keep
- * a realistic size on objects of any shape.
+ * a realistic size on objects of any shape. Object space is before the object's scale (as in
+ * Blender): scaled objects need their scale applied for true metric pattern sizes.
  */
 
 export type MaterialPresetCategory =

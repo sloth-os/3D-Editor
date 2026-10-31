@@ -6,14 +6,18 @@ import {
   bakeProcedural,
   compileProcedural,
   createCube,
+  createEditorState,
+  createOperatorRegistry,
   createPlane,
   decodePNG,
+  encodePNG,
   defaultMaterial,
   defaultProcedural,
   exportScene,
   proceduralBakeNeedsGeometry,
   sampleProcedural,
   type MaterialData,
+  type OperatorContext,
   type ProceduralTexture,
   type TextureSlot,
 } from '../src';
@@ -202,12 +206,17 @@ describe('bakeMaterialTextures', () => {
     const full = bakeMaterialTextures(m, plane, { width: 8 });
     expect(full.baseColorFactor).toEqual([1, 1, 1, 1]);
     expect(full.baseColor && full.emissive && full.normal).toBeTruthy();
+    // without UVs no image can be bound: UV-mapped channels become their constant value at uv (0, 0)
+    // (what the renderers show on such meshes), the others are skipped with a warning
     const noUv = bakeMaterialTextures(m, { mesh: { ...plane.mesh, uvs: null } }, { width: 8 });
     expect(noUv.baseColor).toBeUndefined();
     expect(noUv.normal).toBeUndefined();
-    expect(noUv.emissive).toBeTruthy();
+    expect(noUv.emissive).toBeUndefined();
+    const e0 = sampleProcedural(defaultProcedural('VORONOI', { mapping: 'UV' }), [0, 0, 0]);
+    expect(noUv.emissiveColor).toEqual([e0[0], e0[1], e0[2]]);
     expect(noUv.warnings.join('\n')).toMatch(/base_color needs a UV-mapped mesh/);
     expect(noUv.warnings.join('\n')).toMatch(/normal needs a UV-mapped mesh/);
+    expect(noUv.warnings.join('\n')).not.toMatch(/emission/);
     const uvOnly = material({
       textures: { base_color: slot(defaultProcedural('CHECKER', { mapping: 'UV' })) },
     });
@@ -302,5 +311,128 @@ describe('glTF export of procedural materials', () => {
     const json = JSON.parse(new TextDecoder().decode(res.data));
     expect(json.images).toBeUndefined();
     expect(json.materials[0].pbrMetallicRoughness.baseColorTexture).toBeUndefined();
+  });
+});
+
+describe('glTF export: texture bindings, deduplication and deformation', () => {
+  const primitives = (json: { meshes: { primitives: { attributes: Record<string, number> }[] }[] }) =>
+    json.meshes.flatMap((m) => m.primitives);
+
+  it('never binds textures to primitives without TEXCOORD_0 (constant factors instead)', () => {
+    // regression: UV-mapped bakes were bound to UV-less primitives (invalid glTF), without warning
+    const doc = SceneDoc.create({ empty: true });
+    const mat = doc.addMaterial({
+      name: 'UvMat',
+      emission_strength: 2,
+      textures: {
+        base_color: slot(defaultProcedural('CHECKER', { mapping: 'UV', scale: 4 })),
+        roughness: slot(defaultProcedural('GRADIENT', { mapping: 'UV', color_a: [0.3, 0, 0, 1] })),
+        normal: slot(defaultProcedural('NOISE', { mapping: 'UV' })),
+        emission: slot(defaultProcedural('VORONOI', { mapping: 'UV' })),
+      },
+    });
+    doc.addObject({
+      type: 'MESH',
+      name: 'NoUV',
+      data: doc.addMesh('NoUV', { ...createCube({ size: 2 }), uvs: null }),
+      material_slots: [mat],
+    });
+    const res = exportScene(doc, 'gltf', {});
+    const json = JSON.parse(new TextDecoder().decode(res.data));
+    expect(Object.keys(primitives(json)[0].attributes)).not.toContain('TEXCOORD_0');
+    const m = json.materials[0];
+    expect(m.pbrMetallicRoughness.baseColorTexture).toBeUndefined();
+    expect(m.pbrMetallicRoughness.metallicRoughnessTexture).toBeUndefined();
+    expect(m.normalTexture).toBeUndefined();
+    expect(m.emissiveTexture).toBeUndefined();
+    expect(json.images).toBeUndefined();
+    // the constants the renderers show at uv (0, 0)
+    const c = sampleProcedural(defaultProcedural('CHECKER', { mapping: 'UV', scale: 4 }), [0, 0, 0]);
+    expect(m.pbrMetallicRoughness.baseColorFactor.slice(0, 3)).toEqual([c[0], c[1], c[2]]);
+    expect(m.pbrMetallicRoughness.roughnessFactor).toBeCloseTo(0.3, 9);
+    const e = sampleProcedural(defaultProcedural('VORONOI', { mapping: 'UV' }), [0, 0, 0]);
+    expect(m.emissiveFactor[0] * (m.extensions?.KHR_materials_emissive_strength?.emissiveStrength ?? 1))
+      .toBeCloseTo(e[0] * 2, 6);
+    // image textures cannot be bound either: skipped with a warning
+    const png = encodePNG({ width: 1, height: 1, data: new Uint8ClampedArray(4) });
+    const img = doc.addImage({ name: 'Img', mime: 'image/png', width: 1, height: 1, data: png });
+    doc.updateMaterial(mat, { textures: { base_color: { image: img, scale: [1, 1], offset: [0, 0] } } });
+    const res2 = exportScene(doc, 'gltf', {});
+    const json2 = JSON.parse(new TextDecoder().decode(res2.data));
+    expect(json2.materials[0].pbrMetallicRoughness.baseColorTexture).toBeUndefined();
+    expect((res2.warnings ?? []).join('\n')).toMatch(/image textures need UVs/);
+  });
+
+  it('bakes identical meshes once and shares the material (content-keyed)', () => {
+    // regression: one bake and one material per mesh object made exports of copies very slow
+    const doc = SceneDoc.create({ empty: true });
+    const reg = createOperatorRegistry();
+    const ctx: OperatorContext = {
+      doc,
+      state: createEditorState(),
+      origin: doc.origin,
+      source: 'test',
+      report: () => undefined,
+    };
+    const ids: string[] = [];
+    for (let i = 0; i < 12; i++)
+      ids.push(
+        doc.addObject({
+          type: 'MESH',
+          name: `C${i}`,
+          data: doc.addMesh(`C${i}`, createCube({ size: 1 })),
+          location: [i * 2, 0, 0],
+        }),
+      );
+    expect(reg.run(ctx, 'material.preset_apply', { preset: 'concrete', objects: ids }).ok).toBe(true);
+    const t0 = performance.now();
+    const res = exportScene(doc, 'glb');
+    const seconds = (performance.now() - t0) / 1000;
+    const { json } = readGLB(res.data);
+    expect((json.materials as unknown[]).length).toBe(1);
+    expect((json.images as unknown[]).length).toBe(2); // base colour + normal
+    expect(seconds).toBeLessThan(6);
+    // a different mesh still gets its own bake
+    doc.updateObject(ids[3], { data: doc.addMesh('Big', createCube({ size: 3 })) });
+    const res2 = exportScene(doc, 'glb');
+    expect((readGLB(res2.data).json.materials as unknown[]).length).toBe(2);
+  }, 60_000);
+
+  it('bakes GENERATED textures of deformed meshes from the undeformed positions (orco)', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const mat = doc.addMaterial({
+      name: 'Gen',
+      textures: { base_color: slot(defaultProcedural('GRADIENT', { params: { gradient_type: 'DIAGONAL' } })) },
+    });
+    const twist = {
+      id: 'tw',
+      name: 'Twist',
+      type: 'SIMPLE_DEFORM',
+      show_viewport: true,
+      show_render: true,
+      show_in_editmode: true,
+      show_expanded: true,
+      params: { deform_method: 'TWIST', angle: Math.PI / 3, deform_axis: 'Z' },
+    };
+    const mesh = createCube({ size: 2 });
+    doc.addObject({ type: 'MESH', name: 'Plain', data: doc.addMesh('Plain', mesh), material_slots: [mat] });
+    doc.addObject({
+      type: 'MESH',
+      name: 'Twisted',
+      data: doc.addMesh('Twisted', mesh),
+      material_slots: [mat],
+      modifiers: [twist],
+      location: [4, 0, 0],
+    });
+    const { json, bin } = readGLB(exportScene(doc, 'glb').data);
+    const images = json.images as { bufferView: number }[];
+    const views = json.bufferViews as { byteOffset?: number; byteLength: number }[];
+    const png = (i: number) => {
+      const v = views[images[i].bufferView];
+      return decodePNG(bin!.subarray(v.byteOffset ?? 0, (v.byteOffset ?? 0) + v.byteLength)).data;
+    };
+    // the twisted copy has other positions, hence its own bake, but the same (undeformed) texture
+    expect(images).toHaveLength(2);
+    expect(Buffer.from(png(1)).equals(Buffer.from(png(0)))).toBe(true);
   });
 });

@@ -105,7 +105,11 @@ export const armatureModifier: ModifierDef<typeof schema> = {
       const w = decodeFloat32(mg.weights);
       if (w.length !== n)
         throw new Error(`vertex group "${p.vertex_group}" does not match the mesh (${n} vertices)`);
-      mask = p.invert_vertex_group ? w.map((x) => 1 - x) : w;
+      // weights clamped to 0..1; invalid (non-finite) ones count as "not in the group"
+      mask = w.map((x) => {
+        const c = Number.isFinite(x) ? Math.min(1, Math.max(0, x)) : 0;
+        return p.invert_vertex_group ? 1 - c : c;
+      });
     }
     const skinned = skinPositions(pos, weights, bones, {
       preserveVolume: p.use_deform_preserve_volume,

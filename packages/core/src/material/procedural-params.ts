@@ -41,17 +41,28 @@ export const PROCEDURAL_COMMON_PARAMS: readonly ProceduralParamSpec[] = [
     key: 'offset_x',
     kind: 'number',
     default: 0,
-    description: 'texture-space X translation added to the coordinate before scaling',
+    description:
+      'X translation added to the texture coordinate before `scale` (coordinate units: object-space metres for OBJECT, bounding-box fractions for GENERATED, UV units for UV)',
   },
-  { key: 'offset_y', kind: 'number', default: 0, description: 'texture-space Y translation' },
-  { key: 'offset_z', kind: 'number', default: 0, description: 'texture-space Z translation' },
+  {
+    key: 'offset_y',
+    kind: 'number',
+    default: 0,
+    description: 'Y translation added to the texture coordinate before `scale` (units as offset_x)',
+  },
+  {
+    key: 'offset_z',
+    kind: 'number',
+    default: 0,
+    description: 'Z translation added to the texture coordinate before `scale` (units as offset_x)',
+  },
   {
     key: 'ramp_interpolation',
     kind: 'enum',
     default: 'LINEAR',
     values: RAMP_INTERPOLATIONS,
     description:
-      'colour ramp between the stops ramp_low (color_a) and ramp_high (color_b): LINEAR, EASE (smoothstep) or CONSTANT (hard step at ramp_high)',
+      'colour ramp between the stops ramp_low (color_a) and ramp_high (color_b): LINEAR, EASE (smoothstep) or CONSTANT (hard step at the upper stop)',
   },
   {
     key: 'bump_distance',
@@ -80,7 +91,7 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 2,
       min: 1,
       max: 8,
-      description: 'frequency multiplier between octaves',
+      description: 'frequency multiplier between successive octaves (Blender Lacunarity)',
     },
   ],
   VORONOI: [
@@ -90,14 +101,15 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 'F1',
       values: ['F1', 'F2', 'DISTANCE_TO_EDGE', 'CELL'],
       description:
-        'factor: F1 distance to the nearest cell point, F2 second nearest, DISTANCE_TO_EDGE distance to the cell border, CELL a random value per cell',
+        'factor: F1 distance to the nearest cell point, F2 to the second nearest, DISTANCE_TO_EDGE distance to the cell border, CELL a random value per cell (distances in cells: 1 = one cell = 1/scale coordinate units)',
     },
     {
       key: 'distance',
       kind: 'enum',
       default: 'EUCLIDEAN',
       values: ['EUCLIDEAN', 'MANHATTAN', 'CHEBYSHEV'],
-      description: 'distance metric for F1/F2',
+      description:
+        'distance metric of F1, F2 and CELL (DISTANCE_TO_EDGE always measures Euclidean cells, like Blender)',
     },
     {
       key: 'randomness',
@@ -141,9 +153,15 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 'X',
       values: ['X', 'Y', 'Z', 'DIAGONAL', 'SPHERICAL'],
       description:
-        'BANDS: X/Y/Z/DIAGONAL axis of variation; RINGS: X/Y/Z axis the rings go around or SPHERICAL (DIAGONAL rings and SPHERICAL bands fall back to SPHERICAL/DIAGONAL)',
+        'BANDS vary along X, Y, Z or DIAGONAL, RINGS go around the X, Y or Z axis or are SPHERICAL (DIAGONAL rings and SPHERICAL bands fall back to SPHERICAL and DIAGONAL)',
     },
-    { key: 'wave_profile', kind: 'enum', default: 'SIN', values: PROFILES, description: 'wave shape' },
+    {
+      key: 'wave_profile',
+      kind: 'enum',
+      default: 'SIN',
+      values: PROFILES,
+      description: 'wave shape: SIN, SAW (rising ramp) or TRI (triangle)',
+    },
     {
       key: 'phase',
       kind: 'number',
@@ -156,7 +174,8 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 1,
       min: 0,
       max: 1000,
-      description: 'scale of the distortion noise',
+      description:
+        'frequency multiplier of the distortion noise relative to the wave coordinate (Blender Detail Scale)',
     },
   ],
   BRICK: [
@@ -166,7 +185,7 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 'XY',
       values: ['XY', 'WALL'],
       description:
-        'XY: bricks along X, rows along Y (Blender, floors); WALL: rows along Z, bricks along X+Y (vertical walls facing ±X or ±Y)',
+        'XY = bricks along X and rows along Y (Blender, floors), WALL = rows along Z and bricks along X+Y (vertical walls facing ±X or ±Y)',
     },
     {
       key: 'mortar_size',
@@ -174,7 +193,8 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 0.02,
       min: 0,
       max: 0.5,
-      description: 'mortar width in scaled texture units',
+      description:
+        'mortar width on each side of a joint in scaled texture units (coordinate × scale, joint width = 2 × mortar_size)',
     },
     {
       key: 'mortar_smooth',
@@ -182,7 +202,7 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 0.1,
       min: 0,
       max: 1,
-      description: 'softness of the brick/mortar transition',
+      description: 'softness of the brick/mortar transition as a fraction of mortar_size (0 = hard edge)',
     },
     {
       key: 'brick_width',
@@ -190,7 +210,7 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 0.5,
       min: 0.001,
       max: 1000,
-      description: 'brick length (scaled texture units, along X)',
+      description: 'brick length in scaled texture units (along X, along X+Y for plane WALL)',
     },
     {
       key: 'row_height',
@@ -198,7 +218,7 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 0.25,
       min: 0.001,
       max: 1000,
-      description: 'row height (scaled texture units, along Y)',
+      description: 'row (course) height in scaled texture units (along Y, along Z for plane WALL)',
     },
     {
       key: 'offset',
@@ -243,13 +263,13 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
     {
       key: 'mortar_r',
       kind: 'number',
-      default: 0.5,
+      default: 0,
       min: 0,
       max: 1000,
-      description: 'mortar colour red (linear)',
+      description: 'mortar colour red (linear, black by default like Blender)',
     },
-    { key: 'mortar_g', kind: 'number', default: 0.5, min: 0, max: 1000, description: 'mortar colour green' },
-    { key: 'mortar_b', kind: 'number', default: 0.5, min: 0, max: 1000, description: 'mortar colour blue' },
+    { key: 'mortar_g', kind: 'number', default: 0, min: 0, max: 1000, description: 'mortar colour green (linear)' },
+    { key: 'mortar_b', kind: 'number', default: 0, min: 0, max: 1000, description: 'mortar colour blue (linear)' },
   ],
   MARBLE: [
     {
@@ -259,7 +279,13 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       values: ['SOFT', 'SHARP', 'SHARPER'],
       description: 'vein sharpness (factor 0 = vein → color_a)',
     },
-    { key: 'wave_profile', kind: 'enum', default: 'SIN', values: PROFILES, description: 'band shape' },
+    {
+      key: 'wave_profile',
+      kind: 'enum',
+      default: 'SIN',
+      values: PROFILES,
+      description: 'vein band shape: SIN, SAW or TRI',
+    },
   ],
   WOOD: [
     {
@@ -267,16 +293,22 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       kind: 'enum',
       default: 'RINGS',
       values: ['RINGS', 'BANDS'],
-      description: 'RINGS: growth rings around the texture Z axis; BANDS: straight bands along the diagonal',
+      description: 'RINGS = growth rings around the texture Z axis, BANDS = straight bands along the XYZ diagonal',
     },
-    { key: 'wave_profile', kind: 'enum', default: 'SAW', values: PROFILES, description: 'ring shape' },
+    {
+      key: 'wave_profile',
+      kind: 'enum',
+      default: 'SAW',
+      values: PROFILES,
+      description: 'ring profile: SAW (sharp growth-ring edges), SIN or TRI',
+    },
     {
       key: 'grain',
       kind: 'number',
       default: 0.3,
       min: 0,
       max: 1,
-      description: 'strength of fine fibre streaks along Z',
+      description: 'strength of fine fibre streaks along Z (0 = none, 1 = strong)',
     },
   ],
   MAGIC: [],
@@ -306,15 +338,12 @@ export const PROCEDURAL_TYPE_DEFAULTS: Readonly<
 > = {
   NOISE: { scale: 5, detail: 2, roughness: 0.5, distortion: 0 },
   VORONOI: { scale: 5, detail: 0, roughness: 0.5, distortion: 0 },
-  CHECKER: { scale: 5, color_a: [0.8, 0.8, 0.8, 1], color_b: [0.2, 0.2, 0.2, 1] },
+  // Blender: factor 1 (Color1, 0.8) on cells with odd x+y+z, factor 0 (Color2, 0.2) on the others
+  CHECKER: { scale: 5, color_a: [0.2, 0.2, 0.2, 1], color_b: [0.8, 0.8, 0.8, 1] },
   GRADIENT: { scale: 1 },
   WAVE: { scale: 5, detail: 2, roughness: 0.5, distortion: 0 },
-  BRICK: {
-    scale: 5,
-    detail: 0,
-    color_a: [0.32, 0.08, 0.04, 1],
-    color_b: [0.5, 0.17, 0.08, 1],
-  },
+  // Blender: tint 0 → Color1 (0.8), tint 1 → Color2 (0.2), black mortar (mortar_r/g/b)
+  BRICK: { scale: 5, detail: 0, color_a: [0.8, 0.8, 0.8, 1], color_b: [0.2, 0.2, 0.2, 1] },
   MARBLE: {
     scale: 2,
     detail: 4,
@@ -372,10 +401,23 @@ export function validateProceduralParams(type: ProceduralType, params: Record<st
   return problems;
 }
 
-/** Compact one-line description of the params of a type (for operator descriptions). */
+/**
+ * Self-contained description of one param for AI agents and UIs: key, value kind with its range or
+ * allowed values, default and meaning, e.g.
+ * `mortar_size (number in [0, 0.5], default 0.02): mortar width in scaled texture units`.
+ */
+export function describeProceduralParam(p: ProceduralParamSpec): string {
+  let kind: string;
+  if (p.kind === 'enum') kind = `one of ${p.values!.join('|')}`;
+  else {
+    kind = p.kind === 'int' ? 'integer' : 'number';
+    if (p.min !== undefined || p.max !== undefined) kind += ` in [${p.min ?? '-∞'}, ${p.max ?? '∞'}]`;
+  }
+  return `${p.key} (${kind}, default ${p.default}): ${p.description}`;
+}
+
+/** Description of every type-specific param of a type (for operator descriptions). */
 export function describeProceduralParams(type: ProceduralType): string {
-  const parts = PROCEDURAL_TYPE_PARAMS[type].map((p) =>
-    p.kind === 'enum' ? `${p.key}=${p.values!.join('|')} (${p.default})` : `${p.key}=${p.default}`,
-  );
-  return parts.length ? parts.join(', ') : 'none';
+  const parts = PROCEDURAL_TYPE_PARAMS[type].map(describeProceduralParam);
+  return parts.length ? parts.join('; ') : 'none';
 }

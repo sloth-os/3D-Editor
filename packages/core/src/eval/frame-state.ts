@@ -188,9 +188,15 @@ export class FrameState {
     if (cached) return cached;
     const o = this.byId.get(id);
     if (!o || this.computing.has(id)) return null;
-    // a top-level request evaluates the object's dependencies first (dependency order), so long
-    // parent / constraint chains never recurse deeply
-    if (!this.computing.size) for (const dep of dependencyGraph(this).evaluationOrder(id)) this.world(dep);
+    // the object's dependencies not handed out yet are evaluated first (dependency order), so long
+    // parent / constraint chains never recurse deeply, also when a pose bone reads an object while
+    // another object is being evaluated
+    for (const dep of dependencyGraph(this).evaluationOrder(id)) this.world(dep);
+    // a dependency may have evaluated this object already, through a relation inside an armature
+    // pose (a cycle the object graph cannot see): keep that result, so every object is solved once
+    // and its constraint errors match its matrix whatever the evaluation order
+    const done = this.worldM.get(id);
+    if (done) return done;
     this.computing.add(id);
     try {
       const local = compose4(o.location, o.rotation_euler, o.scale);

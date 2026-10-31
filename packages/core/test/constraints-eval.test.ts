@@ -137,7 +137,9 @@ describe('constraints in scene evaluation', () => {
     const hand = doc.addObject({ type: 'EMPTY', name: 'Hand', parent: arm, location: [0, 5, 0] });
     addConstraint(doc, arm, createConstraint('DAMPED_TRACK', { target: hand }));
     const ev = evaluator(doc)();
-    expect(ev.byId.get(arm)!.constraintErrors[0].message).toMatch(/^Target 'Hand' is part of a dependency cycle/);
+    expect(ev.byId.get(arm)!.constraintErrors[0].message).toMatch(
+      /^Target 'Hand' is part of a dependency cycle/,
+    );
     expectVec(loc(ev.byId.get(hand)!.worldMatrix), [10, 5, 0]);
     expectVec(ev.byId.get(arm)!.worldMatrix, translation4([10, 0, 0]));
   });
@@ -167,7 +169,9 @@ describe('constraints in scene evaluation', () => {
     expect(errorsByName(ev)).toEqual({
       Prop: [],
       Rider: ["Target 'Track' is part of a dependency cycle: Rider [Follow Path] → Track [parent] → Rider"],
-      Rig: ["Target 'Prop' is part of a dependency cycle: Rig [Copy Location] → Prop [parent bone 'Bone'] → Rig"],
+      Rig: [
+        "Target 'Prop' is part of a dependency cycle: Rig [Copy Location] → Prop [parent bone 'Bone'] → Rig",
+      ],
       Track: [],
     });
     expectVec(loc(ev.byId.get(rider)!.worldMatrix), [0, 0, 1]);
@@ -199,7 +203,10 @@ describe('constraints in scene evaluation', () => {
     const rig = doc.addObject({ type: 'ARMATURE', name: 'Rig', data: arm });
     const goal = doc.addObject({ type: 'EMPTY', name: 'Goal' });
     addConstraint(doc, goal, createConstraint('COPY_LOCATION', { target: rig, subtarget: 'Chest' }));
-    const ik = { ...createConstraint('IK' as ConstraintData['type'], { target: goal }), params: { chain_count: 1 } };
+    const ik = {
+      ...createConstraint('IK' as ConstraintData['type'], { target: goal }),
+      params: { chain_count: 1 },
+    };
     doc.updateObject(rig, { pose: { bones: { Arm: { ...defaultPoseBone(), constraints: [ik] } } } });
     const ev2 = evaluator(doc)();
     expect(ev2.byId.get(goal)!.constraintErrors).toEqual([]);
@@ -228,11 +235,15 @@ describe('constraints in scene evaluation', () => {
     const ids: string[] = [];
     doc.transact(() => {
       for (let i = 0; i < n; i++)
-        ids.push(doc.addObject({ type: 'EMPTY', name: `N${String(i).padStart(5, '0')}`, location: [1, 0, 0] }));
+        ids.push(
+          doc.addObject({ type: 'EMPTY', name: `N${String(i).padStart(5, '0')}`, location: [1, 0, 0] }),
+        );
       // each object copies the next one's location and adds its own: the head ends at x = n
       for (let i = 0; i < n - 1; i++)
         doc.updateObject(ids[i], {
-          constraints: [createConstraint('COPY_LOCATION', { target: ids[i + 1], params: { use_offset: true } })],
+          constraints: [
+            createConstraint('COPY_LOCATION', { target: ids[i + 1], params: { use_offset: true } }),
+          ],
         });
     });
     const ev = evaluator(doc)();
@@ -252,6 +263,158 @@ describe('constraints in scene evaluation', () => {
       "Target 'N00001' is part of a dependency cycle (a loop through 1500 objects, including 'N00000')",
     );
     for (const id of ids) expect(ring.byId.get(id)!.worldMatrix[12]).toBe(1);
+  });
+
+  it('evaluates long chains a pose bone reads while another object is being evaluated', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const n = 1500;
+    const ids: string[] = [];
+    doc.transact(() => {
+      for (let i = 0; i < n; i++)
+        ids.push(
+          doc.addObject({ type: 'EMPTY', name: `N${String(i).padStart(5, '0')}`, location: [1, 0, 0] }),
+        );
+      for (let i = 0; i < n - 1; i++)
+        doc.updateObject(ids[i], {
+          constraints: [
+            createConstraint('COPY_LOCATION', { target: ids[i + 1], params: { use_offset: true } }),
+          ],
+        });
+    });
+    // bone B copies the chain head; 'AAA' (evaluated first) hangs from bone B, so the chain is
+    // first asked for from inside the evaluation of AAA
+    const rig = doc.addObject({
+      type: 'ARMATURE',
+      name: 'Rig',
+      data: doc.addArmature({ bones: [defaultBone('B', [0, 0, 0], [0, 0, 1])] }),
+    });
+    const copy = createConstraint('COPY_LOCATION', { target: ids[0] });
+    doc.updateObject(rig, { pose: { bones: { B: { ...defaultPoseBone(), constraints: [copy] } } } });
+    const child = doc.addObject({
+      type: 'EMPTY',
+      name: 'AAA',
+      parent: rig,
+      parent_type: 'BONE',
+      parent_bone: 'B',
+    });
+    const ev = evaluator(doc)();
+    expect(ev.objects.flatMap((o) => o.constraintErrors)).toEqual([]);
+    expect(ev.errors).toEqual([]);
+    expect(ev.byId.get(ids[0])!.worldMatrix[12]).toBeCloseTo(n, 6);
+    expectVec(loc(ev.byId.get(child)!.worldMatrix), [n, 0, 1]); // at the tail of the bone
+  });
+
+  it('solves an object once when a cycle closes inside an armature pose, whatever the order', () => {
+    // A copies D, D hangs from bone B, bone B copies A: a cycle the object graph cannot see (pose
+    // relations are resolved bone by bone). A's constraint reports it and is skipped; no stale
+    // error next to a constrained result, and the same result for every evaluation order.
+    for (const names of [
+      { a: 'A', d: 'D', r: 'R' },
+      { a: 'Z', d: 'D', r: 'R' },
+      { a: 'A', d: 'Z', r: 'R' },
+      { a: 'B', d: 'C', r: 'A' },
+    ]) {
+      const doc = SceneDoc.create({ empty: true });
+      const r = doc.addObject({
+        type: 'ARMATURE',
+        name: names.r,
+        data: doc.addArmature({ bones: [defaultBone('B', [0, 0, 0], [0, 0, 1])] }),
+      });
+      const a = doc.addObject({ type: 'EMPTY', name: names.a, location: [7, 0, 0] });
+      const d = doc.addObject({
+        type: 'EMPTY',
+        name: names.d,
+        parent: r,
+        parent_type: 'BONE',
+        parent_bone: 'B',
+      });
+      doc.updateObject(a, { constraints: [createConstraint('COPY_LOCATION', { target: d })] });
+      const copy = createConstraint('COPY_LOCATION', { target: a });
+      doc.updateObject(r, { pose: { bones: { B: { ...defaultPoseBone(), constraints: [copy] } } } });
+      const cycle = [`Target '${names.d}' is part of a dependency cycle`];
+      const ev = evaluator(doc)();
+      expect(ev.byId.get(a)!.constraintErrors.map((e) => e.message)).toEqual(cycle);
+      expectVec(loc(ev.byId.get(a)!.worldMatrix), [7, 0, 0]);
+      expectVec(loc(ev.byId.get(d)!.worldMatrix), [7, 0, 1]);
+      // a fresh frame state asked for A first (what operators do) agrees
+      const fs = new FrameState(doc, 1);
+      expectVec(loc(fs.world(a)!), [7, 0, 0]);
+      expect(fs.constraintErrors.get(a)!.map((e) => e.message)).toEqual(cycle);
+    }
+  });
+
+  it('gives the same result for any object names in random scenes (seeded)', () => {
+    let seed = 7;
+    const rnd = () => {
+      seed = (seed * 16807) % 2147483647;
+      return seed / 2147483647;
+    };
+    const pick = <T>(list: readonly T[]): T => list[Math.floor(rnd() * list.length)];
+    const types = [
+      'COPY_LOCATION',
+      'COPY_ROTATION',
+      'COPY_TRANSFORMS',
+      'TRACK_TO',
+      'DAMPED_TRACK',
+      'LOCKED_TRACK',
+      'CHILD_OF',
+      'LIMIT_DISTANCE',
+      'FOLLOW_PATH',
+      'CLAMP_TO',
+    ] as const;
+    let cyclic = 0;
+    const snapshot = (doc: SceneDoc, ids: string[]) => {
+      const ev = evaluator(doc)();
+      return ids.map((id) => {
+        const o = ev.byId.get(id)!;
+        expect(o.worldMatrix.every(Number.isFinite)).toBe(true);
+        cyclic += o.constraintErrors.filter((e) => /dependency cycle/.test(e.message)).length;
+        return [
+          o.worldMatrix.map((v) => Math.round(v * 1e6) / 1e6),
+          o.constraintErrors.map((e) => e.constraintId),
+        ];
+      });
+    };
+    for (let scene = 0; scene < 120; scene++) {
+      const doc = SceneDoc.create({ empty: true });
+      const rand3 = (): Vec3 => [rnd() * 4 - 2, rnd() * 4 - 2, rnd() * 4 - 2];
+      const ids = Array.from({ length: 7 }, (_, i) =>
+        doc.addObject({ type: 'EMPTY', name: `O${i}`, location: rand3(), rotation_euler: rand3() }),
+      );
+      const bones = [
+        defaultBone('B0', [0, 0, 0], [0, 0, 1]),
+        { ...defaultBone('B1', [0, 0, 1], [0, 1, 2]), parent: 'B0' },
+      ];
+      const rig = doc.addObject({ type: 'ARMATURE', name: 'Rig', data: doc.addArmature({ bones }) });
+      const points = [
+        defaultSplinePoint([0, 0, 0]),
+        defaultSplinePoint([3, 0, 0]),
+        defaultSplinePoint([3, 3, 0]),
+      ];
+      const data = doc.addCurve({ splines: [{ ...defaultSpline('POLY'), points }] });
+      const curve = doc.addObject({ type: 'CURVE', name: 'Path', data });
+      const all = [...ids, rig, curve];
+      // random object / bone parents (no parent loops) and constraints on objects, bones of the rig
+      // and the curve - including cycles through constraints and parents and self targets
+      all.forEach((id, i) => {
+        const parent = i > 0 && rnd() < 0.35 ? all[Math.floor(rnd() * i)] : null;
+        if (parent === rig && rnd() < 0.7)
+          doc.updateObject(id, { parent, parent_type: 'BONE', parent_bone: pick(['B0', 'B1']) });
+        else if (parent) doc.updateObject(id, { parent });
+        const constraints = Array.from({ length: Math.floor(rnd() * 3) }, () => {
+          const type = pick(types);
+          const target = type === 'FOLLOW_PATH' || type === 'CLAMP_TO' ? curve : pick(all);
+          const subtarget = target === rig && rnd() < 0.7 ? pick(['B0', 'B1']) : '';
+          return createConstraint(type, { target, subtarget, influence: rnd() < 0.3 ? 0.5 : 1 });
+        });
+        doc.updateObject(id, { constraints });
+      });
+      const before = snapshot(doc, all);
+      // reverse the evaluation order (objects are evaluated by name)
+      all.forEach((id, i) => doc.updateObject(id, { name: `Z${99 - i}` }));
+      expect(snapshot(doc, all)).toEqual(before);
+    }
+    expect(cyclic).toBeGreaterThan(50); // the scenes do exercise cycles
   });
 
   it('evaluates chains of constrained objects independent of evaluation order', () => {

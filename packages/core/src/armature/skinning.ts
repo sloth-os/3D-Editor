@@ -155,7 +155,7 @@ function prepareBone(b: PoseBoneMatrix, dqs: boolean): DeformBone {
 export interface SkinOptions {
   /** Dual quaternion skinning (Blender "Preserve Volume"). */
   preserveVolume: boolean;
-  /** Optional per-vertex influence of the whole deformation (0..1). */
+  /** Optional per-vertex influence of the whole deformation (0..1; missing or non-finite = 0). */
   mask?: ArrayLike<number> | null;
 }
 
@@ -184,7 +184,9 @@ export function skinPositions(
     let total = 0;
     for (let i = s; i < e; i++) total += bw[i];
     if (!(total > MIN_CONTRIB)) continue;
-    const mask = opts.mask ? Math.min(1, Math.max(0, opts.mask[v] ?? 0)) : 1;
+    // invalid (non-finite) mask weights count as 0, like a vertex outside the mask group
+    const mv = opts.mask ? opts.mask[v] : 1;
+    const mask = Number.isFinite(mv) ? Math.min(1, Math.max(0, mv)) : 0;
     if (mask === 0) continue;
     const x = positions[v * 3];
     const y = positions[v * 3 + 1];

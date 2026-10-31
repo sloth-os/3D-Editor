@@ -10,7 +10,7 @@ import {
   type MotionMode,
   type WorldParams,
 } from './settings';
-import type { CollisionShape } from '../doc/types';
+import type { AnimTargetType, CollisionShape, DriverData, FCurve } from '../doc/types';
 import { Simulation, type BodyInput, type RigidBodyIssue } from './simulation';
 
 export type { RigidBodyIssue } from './simulation';
@@ -54,7 +54,9 @@ export interface RigidBodyCacheInfo {
  * hash) and the transforms at frame_start form a signature, and a different signature starts a
  * new simulation. Animated (kinematic) bodies are compared frame by frame against the
  * transforms the cache was built with, up to the frame being evaluated; a difference re-runs
- * the simulation.
+ * the simulation. That check is only repeated after edits that can change those transforms
+ * (see `animationInputsKey`), so editing unrelated objects, materials or meshes at a late frame
+ * does not re-evaluate every cached frame.
  */
 
 interface CacheEntry {
@@ -64,6 +66,8 @@ interface CacheEntry {
   token: string | null;
   /** Kinematic transforms of cached frames are verified up to this frame since that check. */
   kinematicVerified: number;
+  /** `animationInputsKey` of the animated bodies the verified frames were checked with. */
+  kinematicKey: string;
 }
 
 const caches = new WeakMap<object, CacheEntry>();
@@ -129,6 +133,95 @@ function meshKey(mesh: MeshData): string {
   return key;
 }
 
+/**
+ * Fingerprint of everything the unsimulated world matrices of the given objects can depend on at
+ * any frame: the objects, their parents, every object mentioned in their constraints or armature
+ * poses (constraint / bone constraint targets), the datablocks driver variables read, armature
+ * and curve data (bone parents, follow-path curves), transitively, with the F-curves and drivers
+ * of all of these. It over-approximates (any object id found in constraint or pose data counts),
+ * so an unchanged key means unchanged transforms.
+ */
+export function animationInputsKey(doc: SceneDoc, ids: readonly string[]): string {
+  if (!ids.length) return '';
+  const objects = new Map(doc.listObjects().map((o) => [o.id, o]));
+  const group = <T extends { target_type: AnimTargetType; target_id: string }>(list: T[]) => {
+    const out = new Map<string, T[]>();
+    for (const it of list) {
+      const k = `${it.target_type}:${it.target_id}`;
+      const l = out.get(k);
+      if (l) l.push(it);
+      else out.set(k, [it]);
+    }
+    return out;
+  };
+  const fcurves = group<FCurve>(doc.listFCurves());
+  const drivers = group<DriverData>(doc.listDrivers());
+  const seen = new Set<string>();
+  const queue: string[] = [];
+  const visit = (key: string) => {
+    if (seen.has(key)) return;
+    seen.add(key);
+    queue.push(key);
+  };
+  const visitIdsIn = (v: unknown, depth = 0): void => {
+    if (depth > 32) return;
+    if (typeof v === 'string') {
+      if (objects.has(v)) visit(`object:${v}`);
+    } else if (Array.isArray(v)) for (const x of v) visitIdsIn(x, depth + 1);
+    else if (v && typeof v === 'object') for (const x of Object.values(v)) visitIdsIn(x, depth + 1);
+  };
+  for (const id of ids) visit(`object:${id}`);
+  const parts: string[] = [];
+  while (queue.length) {
+    const key = queue.pop()!;
+    const sep = key.indexOf(':');
+    const type = key.slice(0, sep);
+    const id = key.slice(sep + 1);
+    let data: unknown = null;
+    switch (type) {
+      case 'object': {
+        const o = objects.get(id);
+        data = o ?? null;
+        if (!o) break;
+        if (o.parent) visit(`object:${o.parent}`);
+        visitIdsIn(o.constraints);
+        visitIdsIn(o.pose);
+        if (o.data && o.type === 'ARMATURE') visit(`armature:${o.data}`);
+        if (o.data && o.type === 'CURVE') visit(`curve:${o.data}`);
+        break;
+      }
+      case 'armature':
+        data = doc.getArmature(id);
+        break;
+      case 'curve':
+        data = doc.getCurve(id);
+        break;
+      case 'material':
+        data = doc.getMaterial(id);
+        break;
+      case 'light':
+        data = doc.getLight(id);
+        break;
+      case 'camera':
+        data = doc.getCamera(id);
+        break;
+      case 'world':
+        data = doc.getWorld();
+        break;
+      case 'scene':
+        data = doc.getScene();
+        break;
+      case 'mesh':
+        data = doc.getShapeKeys(id);
+        break;
+    }
+    const ds = drivers.get(key) ?? [];
+    for (const d of ds) for (const v of d.variables ?? []) visit(`${v.target_type}:${v.target_id}`);
+    parts.push(`${key}=${stableStringify([data, fcurves.get(key) ?? [], ds])}`);
+  }
+  return parts.sort().join('|');
+}
+
 /** Rigid body objects of the scene (validated settings, id order) and the signature of all inputs. */
 function collectInputs(
   doc: SceneDoc,
@@ -153,6 +246,11 @@ function collectInputs(
   return { inputs, signature: parts.join('|') };
 }
 
+/** `animationInputsKey` of a simulation's animated (kinematic) bodies ('' when it has none). */
+function kinematicKeyOf(doc: SceneDoc, sim: Simulation | null): string {
+  return animationInputsKey(doc, sim?.kinematic.map((b) => b.id) ?? []);
+}
+
 /**
  * The document's cache entry, checked against the current inputs: when the document may have
  * changed (change token), the inputs are re-read and a different signature starts a new
@@ -171,17 +269,23 @@ function validEntry(
     const collected = collectInputs(doc, host, params);
     inputs = collected.inputs;
     if (!entry || entry.signature !== collected.signature) {
+      const sim = inputs.length ? new Simulation(inputs, params) : null;
       entry = {
-        sim: inputs.length ? new Simulation(inputs, params) : null,
+        sim,
         signature: collected.signature,
         token,
         kinematicVerified: params.frameStart,
+        kinematicKey: kinematicKeyOf(doc, sim),
       };
       caches.set(key, entry);
     } else {
       entry.token = token;
       // the animation of kinematic bodies may have changed: re-check cached frames lazily
-      entry.kinematicVerified = params.frameStart;
+      const animation = kinematicKeyOf(doc, entry.sim);
+      if (animation !== entry.kinematicKey) {
+        entry.kinematicKey = animation;
+        entry.kinematicVerified = params.frameStart;
+      }
     }
   }
   return { entry, inputs };

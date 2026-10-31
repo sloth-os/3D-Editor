@@ -170,6 +170,101 @@ describe('incremental cache', () => {
     expect(loc(new RigidBodySimulator().evaluate(t.doc, 80, hostOf(t.doc))!.get(t.box)!)[2]).toBe(lifted);
   });
 
+  it('re-checks animated bodies only after edits that can move them', () => {
+    // the lift is moved indirectly; each change only affects frames after frame_start
+    const keyZ = (t: ReturnType<typeof dropScene>, id: string, path: string, index: number, at40: number) =>
+      t.doc.setFCurve({
+        target_type: 'object',
+        target_id: id,
+        path,
+        index,
+        keyframes: [
+          { frame: 1, value: 0, interpolation: 'LINEAR' },
+          { frame: 40, value: at40, interpolation: 'LINEAR' },
+        ],
+        extrapolation: 'CONSTANT',
+        mute: false,
+      });
+    const scenarios: [string, (t: ReturnType<typeof dropScene>, lift: string) => () => void][] = [
+      [
+        'parent animation',
+        (t, lift) => {
+          const carrier = t.doc.addObject({ type: 'EMPTY', name: 'Carrier' });
+          t.doc.updateObject(lift, { parent: carrier });
+          keyZ(t, carrier, 'location', 2, 0);
+          return () => keyZ(t, carrier, 'location', 2, 3.5);
+        },
+      ],
+      [
+        'constraint target animation',
+        (t, lift) => {
+          const guide = t.doc.addObject({ type: 'EMPTY', name: 'Guide', location: [0, 0, -2] });
+          const c = { id: 'c1', name: 'Copy Location', type: 'COPY_LOCATION' as const, mute: false };
+          t.doc.updateObject(lift, {
+            constraints: [
+              { ...c, influence: 1, target: guide, subtarget: '', show_expanded: true, params: {} },
+            ],
+          });
+          return () =>
+            t.doc.setFCurve({
+              target_type: 'object',
+              target_id: guide,
+              path: 'location',
+              index: 2,
+              keyframes: [
+                { frame: 1, value: -2, interpolation: 'LINEAR' },
+                { frame: 40, value: 1.5, interpolation: 'LINEAR' },
+              ],
+              extrapolation: 'CONSTANT',
+              mute: false,
+            });
+        },
+      ],
+      [
+        'driver variable',
+        (t, lift) => {
+          const knob = t.doc.addObject({ type: 'EMPTY', name: 'Knob' });
+          t.doc.setDriver({
+            target_type: 'object',
+            target_id: lift,
+            path: 'location',
+            index: 2,
+            expression: '-2 + k * min(frame - 1, 39) / 39',
+            variables: [{ name: 'k', target_type: 'object', target_id: knob, path: 'location', index: 0 }],
+            mute: false,
+          });
+          return () => t.doc.updateObject(knob, { location: [3.5, 0, 0] });
+        },
+      ],
+    ];
+    for (const [what, build] of scenarios) {
+      const t = dropScene();
+      const lift = t.add('Lift', t.cube(1), rb('PASSIVE', { kinematic: true }), { location: [0, 0, -2] });
+      const change = build(t, lift);
+      const deco = t.doc.addObject({ type: 'EMPTY', name: 'Deco' });
+      let calls = 0;
+      const host = hostOf(t.doc);
+      const counting = { ...host, transformsAt: (f: number) => (calls++, host.transformsAt(f)) };
+      const sim = new RigidBodySimulator();
+      expect(loc(sim.evaluate(t.doc, 80, counting)!.get(t.box)!)[2], what).toBeCloseTo(0.5, 2);
+      // edits that cannot move the lift keep the verified cache: no transforms are re-read
+      t.doc.updateObject(deco, { location: [4, 4, 4] });
+      t.doc.addMaterial({ name: 'Paint' });
+      t.doc.setMesh(t.doc.getObject(t.ground)!.data!, t.doc.getMesh(t.doc.getObject(t.ground)!.data!)!);
+      calls = 0;
+      expect(loc(sim.evaluate(t.doc, 80, counting)!.get(t.box)!)[2], what).toBeCloseTo(0.5, 2);
+      expect(calls, what).toBeLessThanOrEqual(1); // at most the frame_start transforms
+      // an indirect change of the lift's motion re-simulates
+      change();
+      const lifted = loc(sim.evaluate(t.doc, 80, counting)!.get(t.box)!)[2];
+      expect(lifted, what).toBeGreaterThan(2);
+      freeRigidBodyCache(t.doc);
+      expect(loc(new RigidBodySimulator().evaluate(t.doc, 80, hostOf(t.doc))!.get(t.box)!)[2], what).toBe(
+        lifted,
+      );
+    }
+  });
+
   it('sees changes made earlier in the same transaction', () => {
     const t = dropScene();
     const before = t.evaluate(40)!.get(t.box)!;

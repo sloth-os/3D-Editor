@@ -1,5 +1,5 @@
 import type { Vec3 } from '../math/types';
-import { perpendicular } from './vmath';
+import { len3, perpendicular } from './vmath';
 
 /*
  * GJK (distance between convex sets) and EPA (penetration depth of overlapping convex sets),
@@ -124,18 +124,20 @@ function closestTriangle(s: SimplexVertex[], i: number, j: number, k: number): C
   };
 }
 
+/** Faces of a tetrahedron (three vertices) with the vertex opposite to each. */
+const TETRA_FACES: readonly (readonly [number, number, number, number])[] = [
+  [0, 1, 2, 3],
+  [0, 2, 3, 1],
+  [0, 3, 1, 2],
+  [1, 3, 2, 0],
+];
+
 /** Closest point of a tetrahedron to the origin; null when the origin is inside. */
 function closestTetra(s: SimplexVertex[]): Closest | null {
-  const faces: [number, number, number, number][] = [
-    [0, 1, 2, 3],
-    [0, 2, 3, 1],
-    [0, 3, 1, 2],
-    [1, 3, 2, 0],
-  ];
   let best: Closest | null = null;
   let bestD = Infinity;
   let anyOutside = false;
-  for (const [i, j, k, l] of faces) {
+  for (const [i, j, k, l] of TETRA_FACES) {
     const a = s[i].w;
     const n = cross(sub(s[j].w, a), sub(s[k].w, a));
     const sp = -dot(a, n);
@@ -159,7 +161,7 @@ function closestTetra(s: SimplexVertex[]): Closest | null {
  * towards B's centre).
  */
 export function gjk(supA: SupportFn, supB: SupportFn, dir: Readonly<Vec3>): GjkResult {
-  let d: Vec3 = Math.hypot(dir[0], dir[1], dir[2]) > 1e-12 ? [-dir[0], -dir[1], -dir[2]] : [1, 0, 0];
+  let d: Vec3 = len3(dir[0], dir[1], dir[2]) > 1e-12 ? [-dir[0], -dir[1], -dir[2]] : [1, 0, 0];
   let simplex: SimplexVertex[] = [supportVertex(supA, supB, d[0], d[1], d[2])];
   let lambda = [1];
   let v: Vec3 = [...simplex[0].w];
@@ -204,7 +206,7 @@ function finish(simplex: SimplexVertex[], lambda: number[], overlap: boolean): G
       pb[k] += s.b[k] * l;
     }
   });
-  const distance = overlap ? 0 : Math.hypot(pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]);
+  const distance = overlap ? 0 : len3(pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]);
   return { overlap, distance, pa, pb, simplex };
 }
 
@@ -230,7 +232,7 @@ export function epa(supA: SupportFn, supB: SupportFn, seed: SimplexVertex[]): Ep
   const makeFace = (i: number, j: number, k: number): EpaFace | null => {
     const a = verts[i].w;
     const n = cross(sub(verts[j].w, a), sub(verts[k].w, a));
-    const l = Math.hypot(n[0], n[1], n[2]);
+    const l = len3(n[0], n[1], n[2]);
     if (!(l > 1e-300)) return null;
     n[0] /= l;
     n[1] /= l;
@@ -304,7 +306,7 @@ export function epa(supA: SupportFn, supB: SupportFn, seed: SimplexVertex[]): Ep
 /** Grows a simplex to a non-degenerate tetrahedron; false when the Minkowski difference is flat. */
 function blowUp(supA: SupportFn, supB: SupportFn, verts: SimplexVertex[]): boolean {
   const eps = 1e-10;
-  const scaleOf = () => Math.max(1e-9, ...verts.map((p) => Math.hypot(p.w[0], p.w[1], p.w[2])));
+  const scaleOf = () => Math.max(1e-9, ...verts.map((p) => len3(p.w[0], p.w[1], p.w[2])));
   if (verts.length === 0) verts.push(supportVertex(supA, supB, 1, 0, 0));
   if (verts.length === 1) {
     for (const d of [

@@ -46,7 +46,8 @@ export function collectionUsers(doc: SceneDoc): Map<string, string[]> {
     for (const ps of Array.isArray(o.particle_systems) ? o.particle_systems : []) {
       if (!ps || typeof ps !== 'object') continue;
       const s = normalizeParticleSettings(ps.settings).settings;
-      if (s.instance_type === 'COLLECTION') add(s.instance_collection, `particle system '${ps.name}' of '${o.name}'`);
+      if (s.instance_type === 'COLLECTION')
+        add(s.instance_collection, `particle system '${ps.name}' of '${o.name}'`);
     }
   }
   return out;

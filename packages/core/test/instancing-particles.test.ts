@@ -15,6 +15,7 @@ import {
   expandInstances,
   newId,
   normalizeParticleSettings,
+  scatterParticles,
   type EvaluatedInstance,
   type Mat4,
   type MeshData,
@@ -281,6 +282,38 @@ describe('particle distribution', () => {
     expect(placed).toBeLessThan(500);
     expect(placed).toBeGreaterThan(5);
     expect(errorsOf(doc, emitter).join()).toMatch(/min_distance 0.5: placed only \d+ of 500/);
+  });
+
+  it('stays fast and exact for a min_distance far below the emitter size', () => {
+    // regression: a hash grid with cells of min_distance overflowed its 32-bit cell hash, put every
+    // particle into one bucket and turned the rejection test quadratic (20k particles: ~5 s)
+    const mesh = createGrid({ x_subdivisions: 50, y_subdivisions: 50, size: 1 });
+    const settings = (extra: Partial<ParticleSettings>) =>
+      normalizeParticleSettings({ count: 20000, distribution: 'RANDOM', ...extra }).settings;
+    const t0 = performance.now();
+    const tiny = scatterParticles({
+      mesh,
+      settings: settings({ min_distance: 1e-30 }),
+      density: null,
+      metric: null,
+    });
+    expect(performance.now() - t0).toBeLessThan(1500);
+    // no two particles are that close: exactly the particles of a scatter without min_distance
+    const plain = scatterParticles({ mesh, settings: settings({}), density: null, metric: null });
+    expect(tiny.samples.count).toBe(20000);
+    expect(tiny.errors).toEqual([]);
+    expect(Array.from(tiny.samples.ids)).toEqual(Array.from(plain.samples.ids));
+
+    // far from the object origin the hash cells are wider than min_distance (at least 2⁻²⁰ of the
+    // largest coordinate, ≈ 2.9 m here): the spacing still holds
+    const far = createGrid({ x_subdivisions: 4, y_subdivisions: 4, size: 2 });
+    for (let i = 0; i < far.positions.length; i += 3) far.positions[i] += 3e6;
+    const { doc, emitter } = basic({ count: 150, min_distance: 0.1, distribution: 'RANDOM' }, far);
+    const p = expectInstances(doc, emitter, 150).map((i) => pos(i.matrix));
+    for (let a = 0; a < p.length; a++)
+      for (let b = a + 1; b < p.length; b++)
+        expect(len([p[a][0] - p[b][0], p[a][1] - p[b][1], p[a][2] - p[b][2]])).toBeGreaterThanOrEqual(0.1);
+    expect(Math.min(...p.map((v) => v[0]))).toBeGreaterThan(3e6 - 1.01);
   });
 
   it('emits from vertices', () => {
@@ -590,6 +623,63 @@ describe('particle placement', () => {
     }
   });
 
+  it('keeps the ratio of fractional weights when picking in order', () => {
+    // regression: in-order repeat counts were Math.round(weight), so a weight below 0.5 was never picked
+    const doc = SceneDoc.create({ empty: true });
+    const coll = doc.addCollection({ name: 'Rocks' });
+    const a = meshObject(doc, 'A', createCube({ size: 0.1 }), { collection: coll });
+    const b = meshObject(doc, 'B', createCube({ size: 0.1 }), { collection: coll });
+    const c = meshObject(doc, 'C', createCube({ size: 0.1 }), { collection: coll });
+    const emitter = meshObject(doc, 'Ground', createPlane({ size: 10 }));
+    const pick = (count: number, weights: [string, number][]) => {
+      updateSettings(doc, emitter, {
+        count,
+        instance_weights: weights.map(([object, weight]) => ({ object, weight })),
+      });
+      return instancesOf(doc, emitter).map((i) => i.sourceId);
+    };
+    addSystem(doc, emitter, { instance_type: 'COLLECTION', instance_collection: coll });
+    // 0.4 : 1 : 0 = 2 : 5 : 0 slots per cycle
+    expect(
+      pick(14, [
+        [a, 0.4],
+        [b, 1],
+        [c, 0],
+      ]),
+    ).toEqual([a, a, b, b, b, b, b, a, a, b, b, b, b, b]);
+    const many = pick(1000, [
+      [a, 0.4],
+      [b, 1],
+      [c, 0],
+    ]);
+    expect(many.filter((s) => s === a)).toHaveLength(286); // 142 full cycles + 2 of the last 6
+    expect(many.filter((s) => s === c)).toHaveLength(0);
+    // without a small whole-number ratio the counts are proportional (here 1 : √2 over 10000 slots)
+    const irrational = pick(10000, [
+      [a, 1],
+      [b, Math.SQRT2],
+      [c, 0],
+    ]);
+    const na = irrational.filter((s) => s === a).length;
+    expect(Math.abs(na / (10000 - na) - Math.SQRT1_2)).toBeLessThan(1e-3);
+    // a tiny positive weight still gets its slot
+    expect(
+      pick(5, [
+        [a, 1e-6],
+        [b, 1],
+        [c, 0],
+      ]),
+    ).toEqual([a, b, b, b, b]);
+    // names are accepted for hand-written weights
+    expect(
+      pick(4, [
+        ['A', 3],
+        ['B', 1],
+        ['C', 0],
+      ]),
+    ).toEqual([a, a, a, b]);
+  });
+
   it('expands nested instancers used as instance objects', () => {
     const doc = SceneDoc.create({ empty: true });
     const inner = doc.addCollection({ name: 'Inner', hide_viewport: true });
@@ -611,6 +701,25 @@ describe('particle placement', () => {
       expect(i.matrix[14]).toBeCloseTo(1, 9); // K sits 1 above the empty → 1 above the particle
       expect(Math.abs(i.matrix[12])).toBeLessThanOrEqual(1);
     }
+  });
+
+  it('resolves instance_object and instance_collection stored as names', () => {
+    // operators store ids; hand-written data and generic property edits may store exact names
+    const { doc, cube, emitter } = basic({ count: 12, instance_object: 'Cube' });
+    expect(new Set(expectInstances(doc, emitter, 12).map((i) => i.sourceId))).toEqual(new Set([cube]));
+    expect(errorsOf(doc, emitter)).toEqual([]);
+    const coll = doc.addCollection({ name: 'Rocks' });
+    const rock = meshObject(doc, 'Rock', createCube({ size: 0.1 }), { collection: coll });
+    updateSettings(doc, emitter, { instance_type: 'COLLECTION', instance_collection: 'Rocks' });
+    expect(new Set(expectInstances(doc, emitter, 12).map((i) => i.sourceId))).toEqual(new Set([rock]));
+    expect(errorsOf(doc, emitter)).toEqual([]);
+    // a name that matches nothing is reported like a dangling id
+    updateSettings(doc, emitter, { instance_collection: 'Boulders' });
+    expectInstances(doc, emitter, 0);
+    expect(errorsOf(doc, emitter).join()).toMatch(/instance collection Boulders not found/);
+    updateSettings(doc, emitter, { instance_type: 'OBJECT', instance_object: 'Pebble' });
+    expectInstances(doc, emitter, 0);
+    expect(errorsOf(doc, emitter).join()).toMatch(/instance object Pebble not found/);
   });
 
   it('reports problems without failing the evaluation', () => {

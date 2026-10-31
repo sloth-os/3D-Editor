@@ -22,7 +22,7 @@ function world(patch: Partial<WorldSettings> = {}): WorldSettings {
 }
 
 function dirFrom(elevation: number, azimuth: number): Vec3 {
-  // same azimuth convention as sun_rotation (counter-clockwise from −Y)
+  // same azimuth convention as sun_rotation (counter-clockwise from +Y)
   return sunDirection({ sun_elevation: elevation, sun_rotation: azimuth });
 }
 
@@ -30,21 +30,43 @@ const close3 = (a: readonly number[], b: readonly number[], tol: number) =>
   a.every((v, i) => Math.abs(v - b[i]) <= tol);
 
 describe('sunDirection', () => {
-  it('follows the documented convention (azimuth counter-clockwise from −Y)', () => {
+  it("follows Blender's Sky Texture convention (azimuth counter-clockwise from +Y)", () => {
     const d0 = sunDirection({ sun_elevation: 0, sun_rotation: 0 });
     expect(d0[0]).toBeCloseTo(0, 12);
-    expect(d0[1]).toBeCloseTo(-1, 12);
+    expect(d0[1]).toBeCloseTo(1, 12);
     expect(d0[2]).toBeCloseTo(0, 12);
     const d90 = sunDirection({ sun_elevation: 0, sun_rotation: Math.PI / 2 });
-    expect(d90[0]).toBeCloseTo(1, 12);
+    expect(d90[0]).toBeCloseTo(-1, 12);
     expect(d90[1]).toBeCloseTo(0, 12);
     const d180 = sunDirection({ sun_elevation: 0, sun_rotation: Math.PI });
-    expect(d180[1]).toBeCloseTo(1, 12);
+    expect(d180[1]).toBeCloseTo(-1, 12);
+    const d270 = sunDirection({ sun_elevation: 0, sun_rotation: (3 * Math.PI) / 2 });
+    expect(d270[0]).toBeCloseTo(1, 12);
     const up = sunDirection({ sun_elevation: Math.PI / 2, sun_rotation: 1 });
     expect(up[2]).toBeCloseTo(1, 12);
     const d = sunDirection({ sun_elevation: deg(30), sun_rotation: deg(70) });
     expect(Math.hypot(...d)).toBeCloseTo(1, 12);
     expect(d[2]).toBeCloseTo(0.5, 12);
+  });
+
+  it("matches Cycles' geographical_to_direction(elevation, rotation + π/2)", () => {
+    // sky_radiance_nishita: sun_dir = (cos(lat)·cos(lon), cos(lat)·sin(lon), sin(lat))
+    const geo = (lat: number, lon: number) => [
+      Math.cos(lat) * Math.cos(lon),
+      Math.cos(lat) * Math.sin(lon),
+      Math.sin(lat),
+    ];
+    for (const [e, r] of [
+      [deg(15), 0],
+      [deg(35), deg(45)],
+      [deg(-5), deg(200)],
+      [deg(70), -2.5],
+      [deg(5), 11],
+    ]) {
+      const d = sunDirection({ sun_elevation: e, sun_rotation: r });
+      const g = geo(e, r + Math.PI / 2);
+      for (let k = 0; k < 3; k++) expect(d[k]).toBeCloseTo(g[k], 12);
+    }
   });
 });
 

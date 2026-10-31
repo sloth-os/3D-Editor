@@ -154,7 +154,8 @@ float pfxFractal(vec3 p, float detail, float roughness, float lacunarity, uint s
   return value;
 }
 
-// res = (F1, F2, distance to edge); returns the hash of the nearest feature point's cell
+// res = (F1, F2, distance to edge); returns the hash of the nearest feature point's cell (the
+// Euclidean nearest one when edge is set: the edge distance always uses Euclidean cells)
 uint pfxVoronoi(vec3 p, float randomness, int metric, uint s, bool edge, out vec3 res) {
   vec3 fl = floor(p);
   ivec3 c = ivec3(fl);
@@ -162,7 +163,9 @@ uint pfxVoronoi(vec3 p, float randomness, int metric, uint s, bool edge, out vec
   float d1 = 1e30;
   float d2 = 1e30;
   uint h1 = 0u;
-  int b1 = 0;
+  float dE = 1e30;
+  int bE = 0;
+  uint hE = 0u;
   vec3 pts[27];
   int n = 0;
   for (int k = -1; k <= 1; k++) {
@@ -178,26 +181,31 @@ uint pfxVoronoi(vec3 p, float randomness, int metric, uint s, bool edge, out vec
         );
         pts[n] = q;
         vec3 dv = q - f;
+        float e2 = dv.x * dv.x + dv.y * dv.y + dv.z * dv.z;
         float d;
         if (metric == 1) d = abs(dv.x) + abs(dv.y) + abs(dv.z);
         else if (metric == 2) d = max(max(abs(dv.x), abs(dv.y)), abs(dv.z));
-        else d = sqrt(dv.x * dv.x + dv.y * dv.y + dv.z * dv.z);
+        else d = sqrt(e2);
         if (d < d1) {
           d2 = d1;
           d1 = d;
           h1 = h;
-          b1 = n;
         } else if (d < d2) d2 = d;
+        if (e2 < dE) {
+          dE = e2;
+          bE = n;
+          hE = h;
+        }
         n++;
       }
     }
   }
   float e = 0.0;
   if (edge) {
-    vec3 a = pts[b1];
+    vec3 a = pts[bE];
     float best = 1e30;
     for (int m = 0; m < 27; m++) {
-      if (m == b1) continue;
+      if (m == bE) continue;
       vec3 dq = pts[m] - a;
       float len = sqrt(dq.x * dq.x + dq.y * dq.y + dq.z * dq.z);
       if (len < 1e-6) continue;
@@ -205,6 +213,7 @@ uint pfxVoronoi(vec3 p, float randomness, int metric, uint s, bool edge, out vec
       best = min(best, (mid.x * dq.x + mid.y * dq.y + mid.z * dq.z) / len);
     }
     e = best > 1e29 ? 0.0 : max(0.0, best);
+    h1 = hE;
   }
   res = vec3(d1, d2, e);
   return h1;
@@ -223,10 +232,9 @@ float pfxWaveProfile(float n, int profile) {
 }
 
 float pfxRampT(float f, float lo, float hi, int interp) {
-  if (interp == 2) return f >= hi ? 1.0 : 0.0;
   float span = hi - lo;
-  float t = span > 1e-9 ? (f - lo) / span : (f >= hi ? 1.0 : 0.0);
-  t = clamp(t, 0.0, 1.0);
+  if (interp == 2 || !(span > 1e-9 || span < -1e-9)) return span < 0.0 ? (f >= lo ? 0.0 : 1.0) : (f >= hi ? 1.0 : 0.0);
+  float t = clamp((f - lo) / span, 0.0, 1.0);
   return interp == 1 ? t * t * (3.0 - 2.0 * t) : t;
 }
 
@@ -455,9 +463,12 @@ function insertAfter(src: string, anchor: string, code: string): string {
 
 /**
  * Injects procedural texture evaluation for `channels` into a MeshStandard/MeshPhysical shader:
- * varyings with the object-space position and UV, the GLSL library, one `PfxTex` uniform per channel
- * (`pfxBaseColor`, `pfxMetallic`, …) plus `pfxTexMin`/`pfxTexSize` (GENERATED texture space),
- * `pfxHasUv`, `pfxBumpDistance` and `pfxEmissionStrength`.
+ * varyings with the object-space position, the undeformed position and UV, the GLSL library, one
+ * `PfxTex` uniform per channel (`pfxBaseColor`, `pfxMetallic`, …) plus `pfxTexMin`/`pfxTexSize`
+ * (GENERATED texture space), `pfxHasUv`, `pfxBumpDistance`, `pfxEmissionStrength` and
+ * `pfxOrco`/`pfxOrcoWidth`: an RGBA float texture holding the undeformed (orco) position of render
+ * vertex i at texel (i mod width, i div width), read with `gl_VertexID` for GENERATED coordinates
+ * (width 0: the vertex position is undeformed).
  */
 export function injectProceduralShader(
   shader: ShaderSource,
@@ -467,16 +478,27 @@ export function injectProceduralShader(
   shader.vertexShader = insertAfter(
     shader.vertexShader,
     '#include <common>',
-    'varying vec3 vPfxObj;\nvarying vec2 vPfxUv;',
+    [
+      'varying vec3 vPfxObj;',
+      'varying vec3 vPfxGen;',
+      'varying vec2 vPfxUv;',
+      'uniform highp sampler2D pfxOrco;',
+      'uniform int pfxOrcoWidth;',
+    ].join('\n'),
   );
   shader.vertexShader = insertAfter(
     shader.vertexShader,
     '#include <begin_vertex>',
-    'vPfxObj = position;\nvPfxUv = uv;',
+    [
+      'vPfxObj = position;',
+      'vPfxGen = pfxOrcoWidth > 0 ? texelFetch(pfxOrco, ivec2(gl_VertexID % pfxOrcoWidth, gl_VertexID / pfxOrcoWidth), 0).xyz : position;',
+      'vPfxUv = uv;',
+    ].join('\n'),
   );
   const uniforms = channels.map((ch) => `uniform PfxTex ${UNIFORM[ch]};`).join('\n');
   const head = /* glsl */ `
 varying vec3 vPfxObj;
+varying vec3 vPfxGen;
 varying vec2 vPfxUv;
 uniform vec3 pfxTexMin;
 uniform vec3 pfxTexSize;
@@ -488,10 +510,11 @@ ${uniforms}
 vec3 pfxCoord(int mapping) {
   if (mapping == 2) return vec3(vPfxUv * pfxHasUv, 0.0);
   if (mapping == 1) return vPfxObj;
+  // GENERATED: undeformed position in the base mesh bounds (sticks to deforming surfaces)
   return vec3(
-    pfxTexSize.x > 1e-12 ? (vPfxObj.x - pfxTexMin.x) / pfxTexSize.x : 0.5,
-    pfxTexSize.y > 1e-12 ? (vPfxObj.y - pfxTexMin.y) / pfxTexSize.y : 0.5,
-    pfxTexSize.z > 1e-12 ? (vPfxObj.z - pfxTexMin.z) / pfxTexSize.z : 0.5
+    pfxTexSize.x > 1e-12 ? (vPfxGen.x - pfxTexMin.x) / pfxTexSize.x : 0.5,
+    pfxTexSize.y > 1e-12 ? (vPfxGen.y - pfxTexMin.y) / pfxTexSize.y : 0.5,
+    pfxTexSize.z > 1e-12 ? (vPfxGen.z - pfxTexMin.z) / pfxTexSize.z : 0.5
   );
 }
 `;

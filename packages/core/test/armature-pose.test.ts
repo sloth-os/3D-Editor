@@ -574,7 +574,9 @@ describe('bone constraints', () => {
       rig(),
       {
         Driver: poseBone({ rotation_euler: [0.7, 0, 0] }),
-        Follower: poseBone({ constraints: [constraint('COPY_ROTATION', {}, { target: 'rig', subtarget: 'Driver' })] }),
+        Follower: poseBone({
+          constraints: [constraint('COPY_ROTATION', {}, { target: 'rig', subtarget: 'Driver' })],
+        }),
       },
       ctx(),
     );

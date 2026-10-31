@@ -77,7 +77,10 @@ function numberRanges(schema: z.ZodObject<z.ZodRawShape>): [string, number, numb
  * ranges of the type's schema, like Blender's RNA does for animated and scripted values (e.g. an
  * animated `offset_factor` of 1.2 acts as 1). Returns a new object; other values are kept as is.
  */
-export function clampConstraintParams(type: string, values: Record<string, unknown>): Record<string, unknown> {
+export function clampConstraintParams(
+  type: string,
+  values: Record<string, unknown>,
+): Record<string, unknown> {
   const info = getConstraintTypeInfo(type);
   const out = { ...values };
   if (!info) return out;

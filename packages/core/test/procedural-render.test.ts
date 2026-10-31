@@ -1,12 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
   SceneDoc,
+  SceneEvaluator,
+  createCube,
   createPlane,
   createUVSphere,
   defaultProcedural,
+  evaluatedOrco,
+  orcoMesh,
   renderSceneSoftware,
   sampleProcedural,
   type MaterialData,
+  type ModifierData,
   type ProceduralTexture,
   type RenderedImage,
   type TextureSlot,
@@ -210,5 +215,105 @@ describe('CPU renderer: procedural textures', () => {
     doc.updateMaterial(mat, { normal_strength: 0 });
     const flat = renderSceneSoftware(doc, { width: 48, height: 48, samples: 1, view });
     expect(Buffer.from(flat.data).equals(Buffer.from(smooth.data))).toBe(true);
+  });
+});
+
+const modifier = (id: string, type: string, params: Record<string, unknown>): ModifierData => ({
+  id,
+  name: id,
+  type,
+  show_viewport: true,
+  show_render: true,
+  show_in_editmode: true,
+  show_expanded: true,
+  params,
+});
+const twist = () => modifier('tw', 'SIMPLE_DEFORM', { deform_method: 'TWIST', angle: Math.PI / 4, deform_axis: 'Z' });
+
+describe('GENERATED coordinates of deformed meshes (orco)', () => {
+  it('stick to the surface under deform modifiers in the CPU renderer', () => {
+    // regression: GENERATED used the deformed position, so textures swam through twisted surfaces
+    const doc = SceneDoc.create({ empty: true });
+    doc.updateWorld({ color: [0, 0, 0] });
+    const tex = defaultProcedural('GRADIENT', { color_a: [0, 0, 0, 1], color_b: [1, 1, 1, 1] });
+    const mat = doc.addMaterial({ name: 'M', ...emissive(tex) });
+    doc.addObject({
+      type: 'MESH',
+      name: 'Cube',
+      data: doc.addMesh('Cube', createCube({ size: 2 })),
+      material_slots: [mat],
+      modifiers: [twist()],
+    });
+    // the top face (z = 1) is rotated by π/4: undo the twist to get the undeformed position
+    const W: Vec3 = [0, 0.6, 1];
+    const a = -Math.PI / 4;
+    const orco = [W[0] * Math.cos(a) - W[1] * Math.sin(a), W[0] * Math.sin(a) + W[1] * Math.cos(a)];
+    const img = renderSceneSoftware(doc, {
+      width: 33,
+      height: 33,
+      samples: 1,
+      view: { position: [0, 0.6, 5], target: W, up: [0, 1, 0], fovY: 0.3 },
+    });
+    const expected = sampleProcedural(tex, [(orco[0] + 1) / 2, (orco[1] + 1) / 2, 1]);
+    const deformed = sampleProcedural(tex, [(W[0] + 1) / 2, (W[1] + 1) / 2, 1]);
+    expect(Math.abs(expected[0] - deformed[0])).toBeGreaterThan(0.1);
+    expectPixel(img, 16, 16, expected);
+  });
+
+  it('ignore shape keys and deform modifiers but follow generate modifiers (Blender orco)', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const base = createCube({ size: 2 });
+    const meshId = doc.addMesh('Cube', base);
+    const sub = () => modifier('sub', 'SUBSURF', { levels: 1, render_levels: 1 });
+    const add = (name: string, modifiers: ModifierData[], data = meshId) =>
+      doc.addObject({ type: 'MESH', name, data, modifiers });
+    const deformOnly = add('DeformOnly', [twist()]);
+    const mixed = add('Mixed', [sub(), twist()]);
+    const generateOnly = add('GenerateOnly', [sub()]);
+    const plain = add('Plain', []);
+    // shape keys: a key moving every vertex up by 0.5
+    const keyMesh = doc.addMesh('Keyed', createCube({ size: 2 }));
+    const moved = Float32Array.from(base.positions, (v, i) => (i % 3 === 2 ? v + 0.5 : v));
+    doc.setShapeKeys(keyMesh, [
+      {
+        name: 'Up',
+        value: 1,
+        slider_min: 0,
+        slider_max: 1,
+        mute: false,
+        relative_key: '',
+        data: new Uint8Array(moved.buffer),
+      },
+    ]);
+    const keyed = add('Keyed', [], keyMesh);
+    for (const forRender of [true, false]) {
+      const scene = new SceneEvaluator(doc).evaluate(1, { forRender });
+      const ev = (id: string) => scene.byId.get(id)!;
+      const orco = (id: string) => evaluatedOrco(doc, scene, ev(id), forRender);
+      // nothing deforms: the evaluated positions are the orco
+      expect(orco(plain)).toBeNull();
+      expect(orco(generateOnly)).toBeNull();
+      // deform-only stacks and shape keys: the base positions
+      expect(orco(deformOnly)).toEqual(base.positions);
+      expect(ev(keyed).mesh!.positions).not.toEqual(base.positions);
+      expect(orco(keyed)).toEqual(base.positions);
+      // generate + deform: the generate modifiers applied to the undeformed mesh
+      expect(ev(mixed).mesh!.positions).not.toEqual(ev(generateOnly).mesh!.positions);
+      expect(orco(mixed)).toEqual(ev(generateOnly).mesh!.positions);
+    }
+    // a hidden deform modifier does not deform
+    expect(
+      orcoMesh({
+        object: { type: 'MESH', modifiers: [{ ...twist(), show_render: false }] },
+        base,
+        hasShapeKeys: false,
+        forRender: true,
+      }),
+    ).toBeNull();
+    // generate modifiers that read other objects need the scene
+    const boolean = modifier('b', 'BOOLEAN', { object: plain, operation: 'UNION' });
+    expect(
+      orcoMesh({ object: { type: 'MESH', modifiers: [boolean, twist()] }, base, hasShapeKeys: false, forRender: true }),
+    ).toBeNull();
   });
 });

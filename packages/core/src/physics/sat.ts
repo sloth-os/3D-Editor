@@ -1,7 +1,7 @@
 import type { Vec3 } from '../math/types';
 import type { Polyhedron } from './shapes';
 import { clipFeatures, reduceManifold, type ContactCandidate } from './manifold';
-import type { Mat3 } from './vmath';
+import { len3, type Mat3 } from './vmath';
 
 /*
  * Separating axis test between convex polyhedra (boxes, convex hulls, mesh triangles), after
@@ -143,7 +143,7 @@ function fillArcs(P: Polyhedron, negate: boolean, buf: Float64Array): void {
     let ox = dy * nz - dz * ny;
     let oy = dz * nx - dx * nz;
     let oz = dx * ny - dy * nx;
-    const ol = Math.hypot(ox, oy, oz) || 1;
+    const ol = len3(ox, oy, oz) || 1;
     // outward in-plane edge normal (inward for −P)
     const side =
       (ox * ((v[a] + v[b]) / 2 - cx) +
@@ -219,7 +219,7 @@ function queryEdges(A: Polyhedron, B: Polyhedron, maxSep: number): EdgeQuery {
     const ex = va[a1] - va[a0];
     const ey = va[a1 + 1] - va[a0 + 1];
     const ez = va[a1 + 2] - va[a0 + 2];
-    const el = Math.hypot(ex, ey, ez);
+    const el = len3(ex, ey, ez);
     const oa = i * ARC_STRIDE;
     const twoA = !Number.isNaN(arcsA[oa + 6]);
     for (let j = 0; j < nB; j++) {
@@ -242,9 +242,9 @@ function queryEdges(A: Polyhedron, B: Polyhedron, maxSep: number): EdgeQuery {
       let ax = ey * fz - ez * fy;
       let ay = ez * fx - ex * fz;
       let az = ex * fy - ey * fx;
-      const len = Math.hypot(ax, ay, az);
+      const len = len3(ax, ay, az);
       // parallel edges: the face axes cover this case
-      if (len < 1e-6 * el * Math.hypot(fx, fy, fz)) continue;
+      if (len < 1e-6 * el * len3(fx, fy, fz)) continue;
       ax /= len;
       ay /= len;
       az /= len;
@@ -372,7 +372,7 @@ export function collidePolyhedra(
     const s = dot(eq.axis, [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]]);
     if (!(s <= maxSep)) return false;
     // the segments' closest points must be the touching features (not ends far apart)
-    const gap = Math.hypot(pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]);
+    const gap = len3(pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]);
     if (gap > 1.5 * Math.abs(s) + Math.max(maxSep, 0) + 1e-3) return false;
     contacts.push({ pa, pb, n: eq.axis, s });
     return true;

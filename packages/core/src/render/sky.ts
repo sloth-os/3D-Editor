@@ -21,14 +21,15 @@ import type { WorldSettings } from '../doc/types';
 /**
  * Unit direction towards the sun (world space, Z up) from `sun_elevation` (radians above the
  * horizon) and `sun_rotation` (azimuth in radians, counter-clockwise seen from above, measured from
- * the −Y axis): rotation 0 puts the sun towards −Y (behind the camera of Blender's front view),
- * π/2 towards +X, π towards +Y.
+ * the +Y axis) — Blender's Sky Texture convention (Cycles: geographical direction at longitude
+ * rotation + π/2): rotation 0 puts the sun towards +Y (in front of the camera of Blender's front
+ * view, i.e. back light), π/2 towards −X, π towards −Y and 3π/2 towards +X.
  */
 export function sunDirection(world: Pick<WorldSettings, 'sun_elevation' | 'sun_rotation'>): Vec3 {
   const ce = Math.cos(world.sun_elevation);
   return [
-    ce * Math.sin(world.sun_rotation),
-    -ce * Math.cos(world.sun_rotation),
+    -ce * Math.sin(world.sun_rotation),
+    ce * Math.cos(world.sun_rotation),
     Math.sin(world.sun_elevation),
   ];
 }
@@ -45,7 +46,7 @@ const NIGHT = 0.02;
 export interface SkyModel {
   /** Unit direction towards the sun. */
   sun: Vec3;
-  /** Horizontal unit direction of the sun (−Y when it is at the zenith). */
+  /** Horizontal unit direction of the sun (its azimuth, also when it is at the zenith). */
   sunH: [number, number];
   zenith: Vec3;
   horizon: Vec3;
@@ -91,18 +92,37 @@ export function sunTransmittance(sinElevation: number): Vec3 {
 
 const lum = (c: Readonly<Vec3>) => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
 
+/**
+ * Mean limb-darkening factor over a spherical cap of angular radius `r` (solid-angle weighted;
+ * 1 − LIMB/3 for a small, flat disc), so the disc delivers its irradiance exactly at any size.
+ */
+function meanLimb(r: number): number {
+  const n = 64;
+  let sum = 0;
+  let weight = 0;
+  for (let i = 0; i < n; i++) {
+    const q = (i + 0.5) / n;
+    const w = Math.sin(q * r);
+    sum += (1 - LIMB * (1 - Math.sqrt(1 - q * q))) * w;
+    weight += w;
+  }
+  return weight > 0 ? sum / weight : 1 - LIMB / 3;
+}
+
 /** Precomputes the sky of a world (invalid values fall back to the defaults). Pure. */
 export function prepareSky(world: Partial<WorldSettings>): SkyModel {
   const el = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, num(world.sun_elevation, (35 * Math.PI) / 180)));
   const rot = num(world.sun_rotation, Math.PI / 4);
   const sun = sunDirection({ sun_elevation: el, sun_rotation: rot });
   const hl = Math.hypot(sun[0], sun[1]);
-  const sunH: [number, number] = hl > 1e-9 ? [sun[0] / hl, sun[1] / hl] : [0, -1];
+  const sunH: [number, number] =
+    hl > 1e-9 ? [sun[0] / hl, sun[1] / hl] : [-Math.sin(rot), Math.cos(rot)];
   const s = sun[2];
   const T = sunTransmittance(s);
   const sunColor = col(world.sun_color, [1, 0.95, 0.88]);
   const intensity = Math.max(0, num(world.sun_intensity, 3));
-  const radius = Math.min(0.5, Math.max(1e-4, num(world.sun_size, (0.545 * Math.PI) / 180) / 2));
+  // angular diameter 0..π/2 (Blender's sun_size range)
+  const radius = Math.min(Math.PI / 4, Math.max(1e-4, num(world.sun_size, (0.545 * Math.PI) / 180) / 2));
   const cosR = Math.cos(radius);
   // effective sunlight colour and its chromaticity (warm when the sun is low)
   const lit: Vec3 = [sunColor[0] * T[0], sunColor[1] * T[1], sunColor[2] * T[2]];
@@ -127,7 +147,7 @@ export function prepareSky(world: Partial<WorldSettings>): SkyModel {
   }
   const visible = Math.max(0, Math.min(1, (el + radius) / (2 * radius)));
   const solidAngle = 2 * Math.PI * (1 - cosR);
-  const discNorm = 1 / (solidAngle * (1 - LIMB / 3));
+  const discNorm = 1 / (solidAngle * meanLimb(radius));
   const sunIrradiance: Vec3 = [intensity * lit[0], intensity * lit[1], intensity * lit[2]];
   // forward scattering is only lit while (part of) the sun is up
   const haloK = smoothstep(-0.08, 0.02, s);

@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  PROCEDURAL_COMMON_PARAMS,
   PROCEDURAL_TYPES,
   PROCEDURAL_TYPE_ID,
+  PROCEDURAL_TYPE_PARAMS,
   compileProcedural,
   defaultProcedural,
+  describeProceduralParam,
   describeProceduralParams,
   proceduralCoord,
   sampleProcedural,
@@ -107,6 +110,31 @@ describe('sampleProcedural', () => {
     expect(c).toEqual([0.75, 0, 0.25, 0.25]);
   });
 
+  it('inverts the ramp when ramp_low > ramp_high (Blender ColorRamp with swapped stops)', () => {
+    // regression: a negative span used to collapse to a hard step (constant color_b)
+    const inv = tex('GRADIENT', { ramp_low: 1, ramp_high: 0 });
+    const v = [0.1, 0.5, 0.9].map((x) => red(inv, [x, 0, 0]));
+    expect(v[0]).toBeCloseTo(0.9, 12);
+    expect(v[1]).toBeCloseTo(0.5, 12);
+    expect(v[2]).toBeCloseTo(0.1, 12);
+    // stops inside the range: color_b below ramp_high, color_a above ramp_low, smooth in between
+    const mid = tex('GRADIENT', { ramp_low: 0.8, ramp_high: 0.2 });
+    const m = [0.1, 0.25, 0.5, 0.75, 0.9].map((x) => red(mid, [x, 0, 0]));
+    expect(m[0]).toBe(1);
+    expect(m[4]).toBe(0);
+    expect(m[2]).toBeCloseTo(0.5, 12);
+    expect(new Set(m).size).toBe(5);
+    for (let i = 1; i < m.length; i++) expect(m[i]).toBeLessThan(m[i - 1]);
+    // EASE is symmetric, CONSTANT holds the colour of the stop at or below the factor
+    expect(red(tex('GRADIENT', { ramp_low: 1, ramp_high: 0, params: { ramp_interpolation: 'EASE' } }), [0.25, 0, 0]))
+      .toBeCloseTo(1 - 0.15625, 12);
+    const step = tex('GRADIENT', { ramp_low: 0.6, ramp_high: 0.2, params: { ramp_interpolation: 'CONSTANT' } });
+    expect(red(step, [0.1, 0, 0])).toBe(1);
+    expect(red(step, [0.59, 0, 0])).toBe(1);
+    expect(red(step, [0.6, 0, 0])).toBe(0);
+    expect(red(step, [0.9, 0, 0])).toBe(0);
+  });
+
   it('CHECKER alternates per scaled unit and keeps boundary faces consistent', () => {
     const t = tex('CHECKER', { scale: 1 });
     expect(red(t, [0.5, 0.5, 0.5])).toBe(0);
@@ -117,6 +145,22 @@ describe('sampleProcedural', () => {
     // GENERATED coordinate 1 (bounding box face) lies in the same cell as 0.99
     expect(red(t5, [1, 0.5, 0.5])).toBe(red(t5, [0.99, 0.5, 0.5]));
     expect(red(t5, [0, 0.5, 0.5])).toBe(red(t5, [0.01, 0.5, 0.5]));
+  });
+
+  it("uses Blender's default colours for CHECKER and BRICK", () => {
+    // Blender svm_checker: cell (0,0,0) has factor 0 → Color2 (0.2); its neighbours Color1 (0.8)
+    const checker = defaultProcedural('CHECKER');
+    expect(sampleProcedural(checker, [0.01, 0.01, 0.01])).toEqual([0.2, 0.2, 0.2, 1]);
+    expect(sampleProcedural(checker, [0.21, 0.01, 0.01])).toEqual([0.8, 0.8, 0.8, 1]);
+    // Blender brick: Color1 0.8 (tint 0), Color2 0.2 (tint 1), black mortar
+    const brick = defaultProcedural('BRICK');
+    expect(brick.color_a).toEqual([0.8, 0.8, 0.8, 1]);
+    expect(brick.color_b).toEqual([0.2, 0.2, 0.2, 1]);
+    expect(compileProcedural(brick).k2.slice(0, 3)).toEqual([0, 0, 0]);
+    expect(sampleProcedural(brick, [0.0005, 0.0005, 0])).toEqual([0, 0, 0, 1]);
+    const tint = red(brick, [0.02, 0.025, 0]); // inside a brick
+    expect(tint).toBeGreaterThanOrEqual(0.2);
+    expect(tint).toBeLessThanOrEqual(0.8);
   });
 
   it('GRADIENT implements every gradient_type', () => {
@@ -189,6 +233,28 @@ describe('sampleProcedural', () => {
     const col2 = v({ color_randomness: 1, feature: 'F2' }, [0.3, 0.6, 0.2]);
     expect(col).toEqual(col2);
     expect(new Set(col.slice(0, 3)).size).toBeGreaterThan(1);
+  });
+
+  it('VORONOI DISTANCE_TO_EDGE measures Euclidean cells whatever the metric', () => {
+    // regression: with MANHATTAN/CHEBYSHEV ~16 % of the surface used to clamp to exactly 0
+    const edge = (distance: string) =>
+      defaultProcedural('VORONOI', { ...BW, scale: 1, params: { feature: 'DISTANCE_TO_EDGE', distance } });
+    const euclid = edge('EUCLIDEAN');
+    for (const metric of ['MANHATTAN', 'CHEBYSHEV']) {
+      const t = edge(metric);
+      let zeros = 0;
+      for (let i = 0; i < 4000; i++) {
+        const c: Vec3 = [Math.sin(i * 12.9898) * 43.7, Math.sin(i * 78.233) * 17.3, Math.sin(i * 39.425) * 29.1];
+        const e = red(t, c);
+        if (e === 0) zeros++;
+        expect(e).toBe(red(euclid, c));
+      }
+      expect(zeros / 4000).toBeLessThan(0.01);
+    }
+    // F1 still follows the metric
+    const f1 = (distance: string) => red(tex('VORONOI', { scale: 1, params: { distance } }), [0.3, 0.6, 0.2]);
+    expect(f1('MANHATTAN')).toBeGreaterThanOrEqual(f1('EUCLIDEAN'));
+    expect(f1('CHEBYSHEV')).toBeLessThanOrEqual(f1('EUCLIDEAN'));
   });
 
   it('MARBLE sharpness, WOOD rings and MAGIC channels', () => {
@@ -330,7 +396,21 @@ describe('param specification', () => {
     expect(validateProceduralParams('WAVE', { phase: 'x' })[0]).toMatch(/finite number/);
     expect(validateProceduralParams('BOGUS' as ProceduralType, {})[0]).toMatch(/unknown procedural type/);
     expect(describeProceduralParams('CHECKER')).toBe('none');
-    expect(describeProceduralParams('GRADIENT')).toMatch(/gradient_type=LINEAR\|/);
+    expect(describeProceduralParams('GRADIENT')).toMatch(
+      /^gradient_type \(one of LINEAR\|QUADRATIC\|EASING\|DIAGONAL\|SPHERICAL\|QUADRATIC_SPHERE\|RADIAL, default LINEAR\): LINEAR x, /,
+    );
+    // every param is self-describing (kind + range/values, default and meaning), one per '; ' part
+    for (const type of PROCEDURAL_TYPES) {
+      const specs = [...PROCEDURAL_TYPE_PARAMS[type], ...PROCEDURAL_COMMON_PARAMS];
+      for (const spec of specs) {
+        expect(spec.description).not.toContain(';');
+        expect(describeProceduralParam(spec)).toMatch(
+          /^[a-z_]+ \((one of [A-Z_|0-9]+|integer|number)( in \[[^\]]+\])?, default [^)]+\): \S/,
+        );
+      }
+      const parts = describeProceduralParams(type).split('; ');
+      expect(parts.length).toBe(Math.max(1, PROCEDURAL_TYPE_PARAMS[type].length));
+    }
   });
 
   it('builds complete textures with per-type defaults', () => {

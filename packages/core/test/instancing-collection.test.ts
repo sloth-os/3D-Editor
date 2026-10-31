@@ -225,6 +225,59 @@ describe('collection instances', () => {
     expect(ev.instances.length).toBeLessThan(50);
   });
 
+  it('expands a member instancing its own collection the same way whatever the name order', () => {
+    // regression: the members memoized for the inner empty (which skips itself) were reused for the
+    // outer instancer when the inner one was expanded first (by name), dropping its nested instances
+    const results: { inner: number[][]; outer: number[][] }[] = [];
+    for (const [innerName, outerName] of [
+      ['A_Inner', 'B_Outer'],
+      ['B_Inner', 'A_Outer'],
+    ]) {
+      const doc = SceneDoc.create({ empty: true });
+      const c = doc.addCollection({ name: 'C' });
+      cubeObject(doc, 'M', c);
+      const inner = instancer(doc, innerName, c, { in: c, location: [10, 0, 0] });
+      const outer = instancer(doc, outerName, c, { location: [0, 50, 0] });
+      const ev = evaluate(doc);
+      const positions = (owner: string) =>
+        ev.instances
+          .filter((i) => i.ownerId === owner)
+          .map((i) => i.matrix.slice(12, 15))
+          .sort((p, q) => p[0] - q[0]);
+      results.push({ inner: positions(inner), outer: positions(outer) });
+    }
+    // the inner empty instances M only; the outer one sees M and the inner empty's instance of M
+    for (const r of results) {
+      expect(r.inner).toEqual([[10, 0, 0]]);
+      expect(r.outer).toEqual([
+        [0, 50, 0],
+        [10, 50, 0],
+      ]);
+    }
+  });
+
+  it('resolves instance_collection references stored as names', () => {
+    // operators store ids; hand-written data and generic property edits may store the exact name
+    const doc = SceneDoc.create({ empty: true });
+    const c = doc.addCollection({ name: 'Trees' });
+    const trunk = cubeObject(doc, 'Trunk', c, { location: [0, 0, 1] });
+    const byName = instancer(doc, 'ByName', 'Trees', { location: [5, 0, 0] });
+    const byId = instancer(doc, 'ById', c, { location: [5, 0, 0] });
+    let ev = evaluate(doc);
+    const of = (owner: string) => ev.instances.filter((i) => i.ownerId === owner);
+    expect(of(byName).map((i) => i.sourceId)).toEqual([trunk]);
+    expectMatrix(of(byName)[0].matrix, of(byId)[0].matrix);
+    expect(ev.errors.filter((e) => e.source === `instances:${byName}`)).toEqual([]);
+    // renaming the collection breaks the name reference, which is reported like a dangling id
+    doc.updateCollection(c, { name: 'Forest' });
+    ev = evaluate(doc);
+    expect(of(byName)).toEqual([]);
+    expect(of(byId)).toHaveLength(1);
+    expect(ev.errors.find((e) => e.source === `instances:${byName}`)?.message).toMatch(
+      /missing collection \(Trees\)/,
+    );
+  });
+
   it('reports invalid setups without failing the evaluation', () => {
     const doc = SceneDoc.create({ empty: true });
     const c = doc.addCollection({ name: 'C' });

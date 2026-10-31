@@ -11,7 +11,7 @@ import {
   collideSphereBox,
   type BoxFrame,
 } from './boxes';
-import { mulMat3, mulMat3TVec, transpose3, type Mat3 } from './vmath';
+import { len3, mulMat3, mulMat3TVec, transpose3, type Mat3 } from './vmath';
 
 /*
  * Narrow phase: contact points between two bodies' collision shapes. Pairs are computed in the
@@ -212,14 +212,14 @@ function collideRounded(a: Placed, b: Placed, maxSep: number, out: ContactCandid
   const [b0, b1] = coreSegment(b);
   const [pa, pb] = closestSegmentPoints(a0, a1, b0, b1);
   const d: Vec3 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
-  const dist = Math.hypot(d[0], d[1], d[2]);
+  const dist = len3(d[0], d[1], d[2]);
   if (dist - rA - rB > maxSep) return;
   let n: Vec3;
   if (dist > 1e-9) n = [d[0] / dist, d[1] / dist, d[2] / dist];
   else {
     // concentric cores: push apart perpendicular to A's axis (or along +Z)
     const ax: Vec3 = [a1[0] - a0[0], a1[1] - a0[1], a1[2] - a0[2]];
-    const l = Math.hypot(ax[0], ax[1], ax[2]);
+    const l = len3(ax[0], ax[1], ax[2]);
     n =
       l > 1e-9
         ? Math.abs(ax[0] / l) < 0.9
@@ -228,8 +228,8 @@ function collideRounded(a: Placed, b: Placed, maxSep: number, out: ContactCandid
         : [0, 0, 1];
   }
   const r = rA + rB;
-  const lenA = Math.hypot(a1[0] - a0[0], a1[1] - a0[1], a1[2] - a0[2]);
-  const lenB = Math.hypot(b1[0] - b0[0], b1[1] - b0[1], b1[2] - b0[2]);
+  const lenA = len3(a1[0] - a0[0], a1[1] - a0[1], a1[2] - a0[2]);
+  const lenB = len3(b1[0] - b0[0], b1[1] - b0[1], b1[2] - b0[2]);
   if (lenA > 1e-9 && lenB > 1e-9) {
     const tmp: ContactCandidate[] = [];
     if (clipFeatures([...a0, ...a1], [...b0, ...b1], n, maxSep + r, tmp) > 1) {
@@ -252,7 +252,7 @@ function collideRounded(a: Placed, b: Placed, maxSep: number, out: ContactCandid
 }
 
 function normalized(v: Vec3): Vec3 {
-  const l = Math.hypot(v[0], v[1], v[2]) || 1;
+  const l = len3(v[0], v[1], v[2]) || 1;
   return [v[0] / l, v[1] / l, v[2] / l];
 }
 
@@ -378,6 +378,9 @@ const scratchTri: Polyhedron = {
 };
 const extentTmp = new Float64Array(3);
 const boxTri = new Float64Array(9);
+/** Per-triangle contact lists of collideMesh (contacts are copied out before reuse). */
+const meshTmp: ContactCandidate[] = [];
+const meshLocalTmp: ContactCandidate[] = [];
 
 /**
  * Updates the planes (front and back face) and centroid of a flat two-sided triangle
@@ -394,7 +397,7 @@ function setTrianglePlanes(tp: Polyhedron): Polyhedron {
   let nx = uy * wz - uz * wy;
   let ny = uz * wx - ux * wz;
   let nz = ux * wy - uy * wx;
-  const l = Math.hypot(nx, ny, nz);
+  const l = len3(nx, ny, nz);
   if (l > 0) {
     nx /= l;
     ny /= l;
@@ -424,7 +427,7 @@ function normalAllowed(m: Vec3, nT: Vec3, tri: Float64Array, active: number): bo
   const tx = m[0] - k * nT[0];
   const ty = m[1] - k * nT[1];
   const tz = m[2] - k * nT[2];
-  const tl = Math.hypot(tx, ty, tz);
+  const tl = len3(tx, ty, tz);
   if (tl < 0.02 && k > 0) return true;
   if (active === 0) return false;
   const cx = (tri[0] + tri[3] + tri[6]) / 3;
@@ -449,7 +452,7 @@ function normalAllowed(m: Vec3, nT: Vec3, tri: Float64Array, active: number): bo
       oy = -oy;
       oz = -oz;
     }
-    const ol = Math.hypot(ox, oy, oz) || 1;
+    const ol = len3(ox, oy, oz) || 1;
     const c = (tx * ox + ty * oy + tz * oz) / (tl * ol);
     if (c > 0.05) {
       if (!(active & (1 << e))) return false;
@@ -494,6 +497,10 @@ function collideMesh(C: CollisionPose, M: CollisionPose, maxSep: number, out: Co
   const all: ContactCandidate[] = [];
   const mv = mesh.verts;
   const v = scratchTri.verts;
+  // internal (inactive) edges of the current triangle must not produce edge contacts
+  let activeMask = 0;
+  const skipEdge = (e: number) => !(activeMask & (1 << e));
+  const tmp = meshTmp;
   for (const tri of candidates) {
     for (let k = 0; k < 3; k++) {
       const vi = mesh.tris[tri * 3 + k] * 3;
@@ -527,12 +534,13 @@ function collideMesh(C: CollisionPose, M: CollisionPose, maxSep: number, out: Co
     const bottom = nx * extentTmp[0] + ny * extentTmp[1] + nz * extentTmp[2] - rC;
     if (bottom - d > maxSep || d - top > maxSep) continue;
     const active = mesh.activeEdges[tri];
-    const tmp: ContactCandidate[] = [];
+    activeMask = active;
+    tmp.length = 0;
     if (sc.kind === 'sphere') {
       // closest point on the triangle (on the front side when the centre lies in its plane)
       const c = sc.center;
       const q = closestPointOnTriangle(c, [v[0], v[1], v[2]], [v[3], v[4], v[5]], [v[6], v[7], v[8]]);
-      const dist = Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]);
+      const dist = len3(q[0] - c[0], q[1] - c[1], q[2] - c[2]);
       if (dist - sc.radius > maxSep) continue;
       const n: Vec3 =
         dist > 1e-12
@@ -542,8 +550,7 @@ function collideMesh(C: CollisionPose, M: CollisionPose, maxSep: number, out: Co
       tmp.push({ pa, pb: q, n, s: dist - sc.radius });
     } else if (sc.kind === 'poly' && sc.box) {
       const box = sc.box;
-      const skip = (e: number) => !(active & (1 << e));
-      if (box.aligned) collideBoxTriangle(box.half, v, maxSep, tmp, skip);
+      if (box.aligned) collideBoxTriangle(box.half, v, maxSep, tmp, skipEdge);
       else {
         // triangle into the box's own frame and the contacts back
         const A = box.axes;
@@ -556,12 +563,13 @@ function collideMesh(C: CollisionPose, M: CollisionPose, maxSep: number, out: Co
           boxTri[k + 1] = A[1] * x + A[4] * y + A[7] * z;
           boxTri[k + 2] = A[2] * x + A[5] * y + A[8] * z;
         }
-        const local: ContactCandidate[] = [];
-        collideBoxTriangle(box.half, boxTri, maxSep, local, skip);
+        const local = meshLocalTmp;
+        local.length = 0;
+        collideBoxTriangle(box.half, boxTri, maxSep, local, skipEdge);
         for (const k of local) tmp.push(placeContact(k, A, c));
       }
     } else if (sc.kind === 'poly' && edgeCount(sc.poly) * 3 <= SAT_EDGE_PAIRS)
-      collidePolyhedra(sc.poly, tp, maxSep, tmp, (e) => !(active & (1 << e)));
+      collidePolyhedra(sc.poly, tp, maxSep, tmp, skipEdge);
     else
       collideGeneric(
         { shape: sc, r: null, t: [0, 0, 0] },
@@ -583,7 +591,7 @@ function collideMesh(C: CollisionPose, M: CollisionPose, maxSep: number, out: Co
     const n: Vec3 = [-nT[0], -nT[1], -nT[2]];
     const face = supportingFace(sc, n[0], n[1], n[2]);
     const fixed: ContactCandidate[] = [];
-    clipFeatures(face, Array.from(v), n, maxSep + rC, fixed);
+    clipFeatures(face, v, n, maxSep + rC, fixed);
     for (const c of fixed) {
       const s = c.s - rC;
       if (s > maxSep) continue;

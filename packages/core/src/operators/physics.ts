@@ -398,8 +398,9 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
         '(Blender Object > Rigid Body > Bake to Keyframes): the objects then follow the keys without ' +
         'physics, e.g. to edit the motion or export it. Keys are relative to the parent; keys whose value ' +
         'equals both neighbours (within 1e-4) are dropped; existing keys of those channels inside the range ' +
-        'are replaced and drivers on them removed. Other rigid bodies stay simulated (without the baked ' +
-        'objects). Returns the keyframes written per object.',
+        'are replaced, and drivers and F-curve modifiers on them are removed so the keys reproduce the ' +
+        'simulation. Other rigid bodies stay simulated (without the baked objects). Returns the keyframes ' +
+        'written per object.',
       category: 'Physics',
       poll: pollObjectMode,
       schema: z.object({
@@ -473,6 +474,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
 
         const results: { object: string; name: string; keyframes: number }[] = [];
         let removedDrivers = 0;
+        let removedModifiers = 0;
         for (const o of targets) {
           const s = samples.get(o.id)!;
           let keyframes = 0;
@@ -489,7 +491,11 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
                   interpolation: 'LINEAR',
                 })),
               );
-              doc.setFCurve({ ...fc, keyframes: [...kept, ...baked].sort((a, b) => a.frame - b.frame) });
+              // F-curve modifiers (noise, cycles, …) would distort the baked motion
+              removedModifiers += fc.modifiers?.length ?? 0;
+              const curve = { ...fc, keyframes: [...kept, ...baked].sort((a, b) => a.frame - b.frame) };
+              delete curve.modifiers;
+              doc.setFCurve(curve);
               keyframes += baked.length;
               if (doc.getDriver(key)) {
                 doc.removeDriver(key);
@@ -502,6 +508,8 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
           results.push({ object: o.id, name: o.name, keyframes });
         }
         if (removedDrivers) ctx.report('WARNING', `Removed ${removedDrivers} driver(s) on baked channels`);
+        if (removedModifiers)
+          ctx.report('WARNING', `Removed ${removedModifiers} F-curve modifier(s) on baked channels`);
         return {
           objects: results,
           frame_start: start,
@@ -509,6 +517,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
           step: p.step,
           frames: frames.length,
           removed_drivers: removedDrivers,
+          removed_modifiers: removedModifiers,
         };
       },
     }),

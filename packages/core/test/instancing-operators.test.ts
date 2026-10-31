@@ -122,6 +122,34 @@ describe('collection instance operators', () => {
       /recurse/,
     );
   });
+
+  it('instances a collection named through a generic property edit (Blender-style assignment)', () => {
+    // regression: `instance_collection = 'Trees'` stored by data.set_property was looked up by id only
+    const { ok, run, doc, a, b, instances } = forest();
+    const e = doc.addObject({ type: 'EMPTY', name: 'E', location: [4, 0, 0] });
+    ok('data.set_property', {
+      kind: 'objects',
+      target: 'E',
+      values: { instance_type: 'COLLECTION', instance_collection: 'Trees' },
+    });
+    expect(doc.getObject(e)!.instance_collection).toBe('Trees');
+    expect(
+      instances(e)
+        .map((i) => i.sourceId)
+        .sort(),
+    ).toEqual([a, b].sort());
+    // recursion checks follow stored names: Trees ∋ E → 'Other' (a name) ∋ Target
+    const other = ok('collection.create', { name: 'Other' }).collection as string;
+    const target = ok('object.empty_add', { name: 'Target' }).object as string;
+    doc.updateObject(target, { collection: other });
+    doc.updateObject(e, { collection: doc.getObject(a)!.collection, instance_collection: 'Other' });
+    expect(run('object.instance_collection_set', { object: target, collection: 'Trees' }).error).toMatch(
+      /recurse/,
+    );
+    // making the named instance real works like for an id reference
+    doc.updateObject(e, { collection: ROOT_COLLECTION_ID, instance_collection: 'Trees' });
+    expect(ok('object.duplicates_make_real', { objects: ['E'] }).count).toBe(2);
+  });
 });
 
 describe('particle system operators', () => {
@@ -434,9 +462,12 @@ describe('object.scatter_add safety', () => {
   /** Rocks above the origin and two ground planes. */
   function rocks() {
     const t = setup();
-    const a = t.ok('mesh.primitive_cube_add', { name: 'RockA', size: 0.2, location: [0, 0, 5] }).object as string;
-    const b = t.ok('mesh.primitive_cube_add', { name: 'RockB', size: 0.3, location: [0, 0, 5] }).object as string;
-    const c = t.ok('mesh.primitive_cube_add', { name: 'RockC', size: 0.4, location: [0, 0, 5] }).object as string;
+    const a = t.ok('mesh.primitive_cube_add', { name: 'RockA', size: 0.2, location: [0, 0, 5] })
+      .object as string;
+    const b = t.ok('mesh.primitive_cube_add', { name: 'RockB', size: 0.3, location: [0, 0, 5] })
+      .object as string;
+    const c = t.ok('mesh.primitive_cube_add', { name: 'RockC', size: 0.4, location: [0, 0, 5] })
+      .object as string;
     const g1 = t.ok('mesh.primitive_plane_add', { name: 'Ground1', size: 10 }).object as string;
     const g2 = t.ok('mesh.primitive_plane_add', { name: 'Ground2', size: 10, location: [20, 0, 0] })
       .object as string;
@@ -446,6 +477,7 @@ describe('object.scatter_add safety', () => {
 
   it('keeps earlier scatters intact: sources of instanced collections are duplicated, not moved', () => {
     const { ok, doc, a, b, c, g1, g2, sources } = rocks();
+    ok('rigidbody.object_add', { objects: ['RockA'], type: 'ACTIVE' });
     const first = ok('object.scatter_add', { surface: g1, objects: ['RockA', 'RockB'], count: 200 });
     expect(first).toMatchObject({ moved: [a, b], duplicated: [], notes: [] });
     expect(sources(g1)).toEqual(new Set([a, b]));
@@ -462,9 +494,14 @@ describe('object.scatter_add safety', () => {
       collection: r.collection,
       hide_viewport: true,
       hide_render: true,
+      // a hidden source must not join the simulation (it would overlap and push the original)
+      rigid_body: null,
     });
+    expect(doc.getObject(a)!.rigid_body).toMatchObject({ type: 'ACTIVE' });
     expect(sources(g2)).toEqual(new Set([dup.duplicate, c]));
-    expect(r.notes.join('\n')).toMatch(/'RockA' stays in collection 'Scatter Sources' \(instanced by particle system/);
+    expect(r.notes.join('\n')).toMatch(
+      /'RockA' stays in collection 'Scatter Sources' \(instanced by particle system/,
+    );
     expect(doc.getCollection(r.collection)!.name).toBe('Scatter Sources.001');
   });
 
@@ -484,7 +521,9 @@ describe('object.scatter_add safety', () => {
     expect(t.doc.getObject(door)).toMatchObject({ hide_viewport: false, hide_render: false });
     expect(t.doc.getCollection(t.doc.getObject(door)!.collection)!.name).toBe('House');
     expect(r.duplicated.map((d: any) => d.object)).toEqual([door]);
-    expect(r.notes.join()).toMatch(/'Door' stays in collection 'House' \(instanced by 'House' \(collection instance\)\)/);
+    expect(r.notes.join()).toMatch(
+      /'Door' stays in collection 'House' \(instanced by 'House' \(collection instance\)\)/,
+    );
     // a single source in an instanced collection is instanced directly and left visible
     const one = t.ok('object.scatter_add', { surface: ground, objects: ['Walls'], count: 5, name: 'Solo' });
     expect(one).toMatchObject({ instance_object: walls, hidden: [] });
@@ -536,8 +575,12 @@ describe('object.scatter_add safety', () => {
     const info = reg.describe().find((o) => o.id === 'object.scatter_add')! as any;
     expect(info.description).toMatch(/ORIGIN is put on the surface/);
     expect(info.description).toMatch(/scale of the surface object along its normal/);
-    expect(info.parameters.properties.count.description).toMatch(/Number of particles.*instances = count × objects/);
-    expect(info.parameters.properties.size.description).toMatch(/surface scaled ×10, size 0.1 gives the original size/);
+    expect(info.parameters.properties.count.description).toMatch(
+      /Number of particles.*instances = count × objects/,
+    );
+    expect(info.parameters.properties.size.description).toMatch(
+      /surface scaled ×10, size 0.1 gives the original size/,
+    );
     // the documented size rule
     ok('mesh.primitive_cube_add', { name: 'Rock', size: 1, location: [0, 0, 5] });
     const ground = ok('mesh.primitive_plane_add', { name: 'Ground', size: 2 }).object as string;
@@ -586,7 +629,8 @@ describe('particle operator reports and edits', () => {
     ok('object.move_to_collection', { collection: 'C' });
     ok('object.collection_instance_add', { collection: 'C', name: 'E', location: [20, 0, 0] });
     expect(
-      run('object.particle_system_add', { object: ground, settings: { instance_object: 'E', count: 5 } }).error,
+      run('object.particle_system_add', { object: ground, settings: { instance_object: 'E', count: 5 } })
+        .error,
     ).toMatch(/instance_object 'E' instances 'Ground' itself .*would recurse/);
     // the emitter as a direct member of its own instance collection is fine (it is skipped)
     ok('mesh.primitive_cube_add', { name: 'Pebble', size: 0.1 });
@@ -600,7 +644,9 @@ describe('particle operator reports and edits', () => {
     // the operators also report cycles found in stored data
     const sys = doc.getObject(ground)!.particle_systems[0];
     doc.updateObject(ground, {
-      particle_systems: [{ ...sys, settings: { ...sys.settings, instance_type: 'OBJECT', instance_object: 'E' } }],
+      particle_systems: [
+        { ...sys, settings: { ...sys.settings, instance_type: 'OBJECT', instance_object: 'E' } },
+      ],
     });
     const r = ok('object.particle_system_update', { object: ground, settings: { count: 6 } });
     expect(r.errors.join('\n')).toMatch(/Instancing cycle: 'Ground' ends up instancing itself/);
@@ -610,7 +656,11 @@ describe('particle operator reports and edits', () => {
     const { ok, doc } = setup();
     ok('mesh.primitive_cube_add', { name: 'Rock', size: 0.2 });
     const ground = ok('mesh.primitive_plane_add', { name: 'Ground', size: 10 }).object as string;
-    ok('object.particle_system_add', { object: ground, name: 'Grass', settings: { count: 10, instance_object: 'Rock' } });
+    ok('object.particle_system_add', {
+      object: ground,
+      name: 'Grass',
+      settings: { count: 10, instance_object: 'Rock' },
+    });
     doc.setFCurve({
       target_type: 'object',
       target_id: ground,
@@ -629,7 +679,15 @@ describe('particle operator reports and edits', () => {
       path: 'particle_systems["Grass"].seed',
       index: 0,
       expression: 'n',
-      variables: [{ name: 'n', target_type: 'object', target_id: ground, path: 'particle_systems["Grass"].count', index: 0 }],
+      variables: [
+        {
+          name: 'n',
+          target_type: 'object',
+          target_id: ground,
+          path: 'particle_systems["Grass"].count',
+          index: 0,
+        },
+      ],
       mute: false,
     });
     const at11 = () =>

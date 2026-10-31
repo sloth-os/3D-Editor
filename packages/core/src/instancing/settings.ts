@@ -142,7 +142,9 @@ const FIELDS = {
   instance_weights: z
     .array(weightSchema)
     .describe(
-      'COLLECTION: relative frequency per object, e.g. [{"object":"Rock","weight":3}]; objects not listed weigh 1.',
+      'COLLECTION: relative frequency per object, e.g. [{"object":"Rock","weight":3}]; objects not listed weigh 1. ' +
+        'Random picks use the weights as probabilities; in-order picks repeat each object in proportion to its ' +
+        'weight (0.4 and 1 give the pattern A A B B B B B).',
     ),
   particle_size: z
     .number()
@@ -201,8 +203,10 @@ const FIELDS = {
   use_modifier_stack: z
     .boolean()
     .describe(
-      'true (default): emit from the evaluated mesh (after shape keys and modifiers); false: distribute on the original ' +
-        'mesh, following deforming modifiers that keep its topology.',
+      'true (default): emit from the evaluated surface (generative modifiers such as Subdivision applied). Particles ' +
+        'are distributed once on its rest shape and then ride shape keys and deforming modifiers (armature, wave, ' +
+        'displace) without being re-scattered. false: distribute on the original mesh; deformations that keep its ' +
+        'vertex count are followed, otherwise particles stay on the original surface.',
     ),
   display_percentage: z
     .number()

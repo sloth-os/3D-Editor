@@ -300,26 +300,65 @@ function waveProfile(n: number, profile: number): number {
   return 0.5 - 0.5 * Math.cos(n);
 }
 
-/** Two-stop colour ramp position of factor `f`. */
+/**
+ * Two-stop colour ramp position (0 = color_a, 1 = color_b) of factor `f`, like Blender's ColorRamp
+ * with color_a at `low` and color_b at `high`. The stops may be in either order (low > high inverts
+ * the ramp). CONSTANT (and coincident stops) hold the colour of the stop at or below the factor, i.e.
+ * a hard step at the upper stop.
+ */
 function rampT(f: number, low: number, high: number, interp: number): number {
   if (!(f === f)) f = 0;
-  if (interp === RAMP_CONSTANT) return f >= high ? 1 : 0;
   const span = high - low;
-  let t = span > 1e-9 ? (f - low) / span : f >= high ? 1 : 0;
+  if (interp === RAMP_CONSTANT || !(span > 1e-9 || span < -1e-9))
+    return span < 0 ? (f >= low ? 0 : 1) : f >= high ? 1 : 0;
+  let t = (f - low) / span;
   t = t < 0 ? 0 : t > 1 ? 1 : t;
   return interp === RAMP_EASE ? t * t * (3 - 2 * t) : t;
 }
 
 /**
- * Evaluates a compiled procedural texture at a texture coordinate (the texture's offset and scale
- * are applied here) and writes linear RGBA (after the colour ramp) into `out[0..3]`.
+ * Number of values `samplePattern` writes per sample: [0] factor (MAGIC: red factor), [1..2] MAGIC
+ * green/blue factors, [3] BRICK mortar amount, [4..6] VORONOI random cell colour.
  */
-export function sampleCompiled(
+export const PATTERN_STRIDE = 7;
+
+/**
+ * Key of the pattern part of a compiled texture (everything `samplePattern` reads): textures with
+ * equal keys produce equal patterns at equal texture coordinates and differ at most in their colour
+ * ramp, mortar colour or cell-colour amount, so renderers can evaluate the pattern once for several
+ * channels (e.g. one noise driving colour, roughness and bump).
+ */
+export function patternKey(c: CompiledProcedural): string {
+  const voronoi = c.type === T_VORONOI;
+  return [
+    c.type,
+    c.mapping,
+    c.mode[0],
+    c.mode[1],
+    c.mode[2],
+    ...c.basic,
+    ...c.offset,
+    c.k0[0],
+    voronoi ? 0 : c.k0[1],
+    c.k0[2],
+    c.k0[3],
+    ...c.k1,
+    c.seed,
+  ].join(',');
+}
+
+/**
+ * Pattern stage of `sampleCompiled`: evaluates the texture's factor(s) at a texture coordinate (the
+ * texture's offset and scale are applied here) into `pat[o .. o + PATTERN_STRIDE)`; `rampPattern`
+ * then turns them into colours.
+ */
+export function samplePattern(
   c: CompiledProcedural,
   cx: number,
   cy: number,
   cz: number,
-  out: Float64Array | number[],
+  pat: Float64Array | number[],
+  o = 0,
 ): void {
   const scale = c.basic[0];
   const x = sanitizeCoord((cx + c.offset[0]) * scale);
@@ -332,14 +371,12 @@ export function sampleCompiled(
   const mode = c.mode;
   const k0 = c.k0;
   let f = 0;
-  let magic = false;
-  let fr = 0;
   let fg = 0;
   let fb = 0;
-  let over = 0;
-  let or = 0;
-  let og = 0;
-  let ob = 0;
+  let mortar = 0;
+  let cr = 0;
+  let cg = 0;
+  let cb = 0;
   switch (c.type) {
     case T_NOISE:
     case T_VORONOI: {
@@ -366,12 +403,9 @@ export function sampleCompiled(
             : feature === 3
               ? hashUnit(hashStream(h, PFX_STREAM_CELL))
               : vor[VORONOI_F1];
-      if (k0[1] > 0) {
-        over = k0[1];
-        or = hashUnit(hashStream(h, PFX_STREAM_CELL_R));
-        og = hashUnit(hashStream(h, PFX_STREAM_CELL_G));
-        ob = hashUnit(hashStream(h, PFX_STREAM_CELL_B));
-      }
+      cr = hashUnit(hashStream(h, PFX_STREAM_CELL_R));
+      cg = hashUnit(hashStream(h, PFX_STREAM_CELL_G));
+      cb = hashUnit(hashStream(h, PFX_STREAM_CELL_B));
       break;
     }
     case T_CHECKER: {
@@ -425,15 +459,12 @@ export function sampleCompiled(
       f = tint < 0 ? 0 : tint > 1 ? 1 : tint;
       const md = Math.min(lx, ly, width - lx, rh - ly);
       if (md < mortarSize) {
-        if (smooth <= 0) over = 1;
+        if (smooth <= 0) mortar = 1;
         else {
           const m = (1 - md / mortarSize) / smooth;
           const t = m < 0 ? 0 : m > 1 ? 1 : m;
-          over = t * t * (3 - 2 * t);
+          mortar = t * t * (3 - 2 * t);
         }
-        or = c.k2[0];
-        og = c.k2[1];
-        ob = c.k2[2];
       }
       break;
     }
@@ -469,8 +500,7 @@ export function sampleCompiled(
         else a = Math.cos(a + b + cc) * gain;
       }
       const inv = gain !== 0 ? 1 / gain : 0;
-      magic = true;
-      fr = 0.5 + 0.5 * a * inv;
+      f = 0.5 + 0.5 * a * inv;
       fg = 0.5 + 0.5 * b * inv;
       fb = 0.5 + 0.5 * cc * inv;
       break;
@@ -478,12 +508,35 @@ export function sampleCompiled(
     default:
       f = 0;
   }
+  pat[o] = f;
+  pat[o + 1] = fg;
+  pat[o + 2] = fb;
+  pat[o + 3] = mortar;
+  pat[o + 4] = cr;
+  pat[o + 5] = cg;
+  pat[o + 6] = cb;
+}
+
+/**
+ * Colour stage of `sampleCompiled`: maps the pattern values at `pat[o]` (from `samplePattern` of a
+ * texture with the same `patternKey`) through the colour ramp of `c` and applies its mortar or cell
+ * colours; writes linear RGBA into `out[0..3]`.
+ */
+export function rampPattern(
+  c: CompiledProcedural,
+  pat: Float64Array | number[],
+  o: number,
+  out: Float64Array | number[],
+): void {
   const A = c.colorA;
   const B = c.colorB;
   const low = c.ramp[0];
   const high = c.ramp[1];
-  const interp = mode[3];
-  if (magic) {
+  const interp = c.mode[3];
+  if (c.type === T_MAGIC) {
+    const fr = pat[o];
+    const fg = pat[o + 1];
+    const fb = pat[o + 2];
     const tr = rampT(fr, low, high, interp);
     const tg = rampT(fg, low, high, interp);
     const tb = rampT(fb, low, high, interp);
@@ -493,11 +546,26 @@ export function sampleCompiled(
     out[2] = A[2] + tb * (B[2] - A[2]);
     out[3] = A[3] + ta * (B[3] - A[3]);
   } else {
-    const t = rampT(f, low, high, interp);
+    const t = rampT(pat[o], low, high, interp);
     out[0] = A[0] + t * (B[0] - A[0]);
     out[1] = A[1] + t * (B[1] - A[1]);
     out[2] = A[2] + t * (B[2] - A[2]);
     out[3] = A[3] + t * (B[3] - A[3]);
+  }
+  let over = 0;
+  let or = 0;
+  let og = 0;
+  let ob = 0;
+  if (c.type === T_BRICK) {
+    over = pat[o + 3];
+    or = c.k2[0];
+    og = c.k2[1];
+    ob = c.k2[2];
+  } else if (c.type === T_VORONOI && c.k0[1] > 0) {
+    over = c.k0[1];
+    or = pat[o + 4];
+    og = pat[o + 5];
+    ob = pat[o + 6];
   }
   if (over > 0) {
     out[0] += over * (or - out[0]);
@@ -505,6 +573,23 @@ export function sampleCompiled(
     out[2] += over * (ob - out[2]);
     out[3] += over * (1 - out[3]);
   }
+}
+
+const patScratch = new Float64Array(PATTERN_STRIDE);
+
+/**
+ * Evaluates a compiled procedural texture at a texture coordinate (the texture's offset and scale
+ * are applied here) and writes linear RGBA (after the colour ramp) into `out[0..3]`.
+ */
+export function sampleCompiled(
+  c: CompiledProcedural,
+  cx: number,
+  cy: number,
+  cz: number,
+  out: Float64Array | number[],
+): void {
+  samplePattern(c, cx, cy, cz, patScratch, 0);
+  rampPattern(c, patScratch, 0, out);
 }
 
 /** Blender Gradient Texture factor of a scaled coordinate. */

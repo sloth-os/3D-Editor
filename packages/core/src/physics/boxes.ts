@@ -1,7 +1,7 @@
 import type { Vec3 } from '../math/types';
 import { clipFeatures, reduceManifold, type ContactCandidate } from './manifold';
 import { closestSegmentPoints } from './sat';
-import type { Mat3 } from './vmath';
+import { len3, type Mat3 } from './vmath';
 
 /*
  * Closed-form narrow phase tests for the most common pairs:
@@ -79,7 +79,7 @@ export function collideBoxes(
       const lx = i === 0 ? 0 : i === 1 ? bz : -by;
       const ly = i === 0 ? -bz : i === 1 ? 0 : bx;
       const lz = i === 0 ? by : i === 1 ? -bx : 0;
-      const len = Math.hypot(lx, ly, lz);
+      const len = len3(lx, ly, lz);
       // (nearly) parallel edges: the face axes cover this direction
       if (len < 1e-5) continue;
       const ra = ha[0] * Math.abs(lx) + ha[1] * Math.abs(ly) + ha[2] * Math.abs(lz);
@@ -129,7 +129,7 @@ export function collideBoxes(
     const [pa, pb] = closestSegmentPoints(a0, a1, [cx - hx, cy - hy, cz - hz], [cx + hx, cy + hy, cz + hz]);
     const s = n[0] * (pb[0] - pa[0]) + n[1] * (pb[1] - pa[1]) + n[2] * (pb[2] - pa[2]);
     if (!(s <= maxSep)) return false;
-    const gap = Math.hypot(pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]);
+    const gap = len3(pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]);
     if (gap > 1.5 * Math.abs(s) + Math.max(maxSep, 0) + 1e-3) return false;
     out.push({ pa, pb, n, s });
     return true;
@@ -210,7 +210,7 @@ export function collideBoxTriangle(
   let nx = e0y * e2z - e0z * e2y;
   let ny = e0z * e2x - e0x * e2z;
   let nz = e0x * e2y - e0y * e2x;
-  const nl = Math.hypot(nx, ny, nz);
+  const nl = len3(nx, ny, nz);
   if (!(nl > 0)) return false;
   nx /= nl;
   ny /= nl;
@@ -232,12 +232,12 @@ export function collideBoxTriangle(
     const fx = tri[b] - tri[a];
     const fy = tri[b + 1] - tri[a + 1];
     const fz = tri[b + 2] - tri[a + 2];
-    const fl = Math.hypot(fx, fy, fz);
+    const fl = len3(fx, fy, fz);
     for (let k = 0; k < 3; k++) {
       const ax = k === 0 ? 0 : k === 1 ? fz : -fy;
       const ay = k === 0 ? -fz : k === 1 ? 0 : fx;
       const az = k === 0 ? fy : k === 1 ? -fx : 0;
-      const len = Math.hypot(ax, ay, az);
+      const len = len3(ax, ay, az);
       if (len < 1e-9 * fl) continue;
       const rb = h[0] * Math.abs(ax) + h[1] * Math.abs(ay) + h[2] * Math.abs(az);
       const p0 = ax * tri[0] + ay * tri[1] + az * tri[2];
@@ -281,7 +281,7 @@ export function collideBoxTriangle(
     );
     const s = n[0] * (pb[0] - pa[0]) + n[1] * (pb[1] - pa[1]) + n[2] * (pb[2] - pa[2]);
     if (!(s <= maxSep)) return false;
-    const gap = Math.hypot(pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]);
+    const gap = len3(pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]);
     if (gap > 1.5 * Math.abs(s) + Math.max(maxSep, 0) + 1e-3) return false;
     out.push({ pa, pb, n, s });
     return true;
@@ -289,60 +289,64 @@ export function collideBoxTriangle(
 
   const maxFace = Math.max(sepF, sepT);
   if (edgeUsable && sepE > maxFace + 0.05 * Math.abs(maxFace) + 1e-3 && edgeContact()) return true;
-  const triangle = [tri[0], tri[1], tri[2], tri[3], tri[4], tri[5], tri[6], tri[7], tri[8]];
   const contacts: ContactCandidate[] = [];
   if (sepF > sepT + 0.02 * Math.abs(sepT) + 5e-4) {
     // reference: the box face facing the triangle
     const n: Vec3 = [0, 0, 0];
     n[faceK] = faceSign;
-    clipFeatures(faceOfA(h, faceK, faceSign), triangle, n, maxSep, contacts);
+    clipFeatures(faceOfA(h, faceK, faceSign), tri, n, maxSep, contacts);
   } else {
     // reference: the triangle; incident: the box face most aligned with the normal towards it
     const n: Vec3 = [nx * tSign, ny * tSign, nz * tSign];
     let k = 0;
     for (let i = 1; i < 3; i++) if (Math.abs(n[i]) > Math.abs(n[k])) k = i;
-    clipFeatures(faceOfA(h, k, n[k] > 0 ? 1 : -1), triangle, n, maxSep, contacts);
+    clipFeatures(faceOfA(h, k, n[k] > 0 ? 1 : -1), tri, n, maxSep, contacts);
   }
   if (contacts.length === 0) return edgeContact();
   for (const c of reduceManifold(contacts)) out.push(c);
   return true;
 }
 
-/** Corners (flat xyz) of A's face on axis i at side `sign`. */
-function faceOfA(h: Readonly<Vec3>, i: number, sign: number): number[] {
+// Face corner scratch (the narrow phase is not re-entrant; clipFeatures copies what it keeps).
+const faceScratchA = new Float64Array(12);
+const faceScratchB = new Float64Array(12);
+/** Corner signs (u, v) of a box face, counter-clockwise around the face axis. */
+const CORNER_U = [-1, 1, 1, -1];
+const CORNER_V = [-1, -1, 1, 1];
+
+/** Corners (flat xyz, in a shared scratch array) of A's face on axis i at side `sign`. */
+function faceOfA(h: Readonly<Vec3>, i: number, sign: number): Float64Array {
   const u = (i + 1) % 3;
   const v = (i + 2) % 3;
-  const out: number[] = [];
-  for (const [su, sv] of CORNERS) {
-    const p: Vec3 = [0, 0, 0];
-    p[i] = sign * h[i];
-    p[u] = su * h[u];
-    p[v] = sv * h[v];
-    out.push(p[0], p[1], p[2]);
+  const out = faceScratchA;
+  for (let c = 0; c < 4; c++) {
+    out[c * 3 + i] = sign * h[i];
+    out[c * 3 + u] = CORNER_U[c] * h[u];
+    out[c * 3 + v] = CORNER_V[c] * h[v];
   }
   return out;
 }
 
 /** Corners of B's face on its axis j at side `sign` (B placed by rotation r and centre t). */
-function faceOfB(h: Readonly<Vec3>, r: Readonly<Mat3>, t: Readonly<Vec3>, j: number, sign: number): number[] {
+function faceOfB(
+  h: Readonly<Vec3>,
+  r: Readonly<Mat3>,
+  t: Readonly<Vec3>,
+  j: number,
+  sign: number,
+): Float64Array {
   const u = (j + 1) % 3;
   const v = (j + 2) % 3;
-  const out: number[] = [];
-  for (const [su, sv] of CORNERS) {
+  const out = faceScratchB;
+  for (let c = 0; c < 4; c++) {
     const a = sign * h[j];
-    const b = su * h[u];
-    const c = sv * h[v];
-    for (let k = 0; k < 3; k++) out.push(t[k] + r[k * 3 + j] * a + r[k * 3 + u] * b + r[k * 3 + v] * c);
+    const b = CORNER_U[c] * h[u];
+    const d = CORNER_V[c] * h[v];
+    for (let k = 0; k < 3; k++)
+      out[c * 3 + k] = t[k] + r[k * 3 + j] * a + r[k * 3 + u] * b + r[k * 3 + v] * d;
   }
   return out;
 }
-
-const CORNERS: [number, number][] = [
-  [-1, -1],
-  [1, -1],
-  [1, 1],
-  [-1, 1],
-];
 
 /**
  * Contact between a box (axis aligned at the origin, half extents h) and a sphere with centre c
@@ -361,7 +365,7 @@ export function collideSphereBox(
   const dx = c[0] - qx;
   const dy = c[1] - qy;
   const dz = c[2] - qz;
-  const dist = Math.hypot(dx, dy, dz);
+  const dist = len3(dx, dy, dz);
   let n: Vec3;
   let pa: Vec3;
   let s: number;

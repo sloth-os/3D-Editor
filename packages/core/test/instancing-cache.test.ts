@@ -307,6 +307,44 @@ describe('instancing caches across evaluators', () => {
     expect(Math.max(...zs)).toBeGreaterThan(1);
     expect(Math.min(...zs)).toBeGreaterThanOrEqual(-1e-9);
   });
+
+  it('keeps the distribution while deforming modifiers change on a topology-changing stack', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const cube = meshObject(doc, 'Cube', createCube({ size: 0.1 }));
+    const ground = meshObject(doc, 'Ground', createGrid({ x_subdivisions: 6, y_subdivisions: 6, size: 6 }));
+    // DISPLACE without a texture lifts the surface by (1 - mid_level) · strength along Z
+    const lift = (strength: number) => ({
+      ...modifier('DISPLACE', { texture_type: 'NONE', direction: 'Z', strength, mid_level: 0.5 }),
+      id: 'lift',
+    });
+    const subsurf = (levels: number) => ({
+      ...modifier('SUBSURF', { levels, render_levels: levels }),
+      id: 'sub',
+    });
+    doc.updateObject(ground, {
+      modifiers: [subsurf(1), lift(1)],
+      particle_systems: [system({ instance_object: cube, count: 500, distribution: 'RANDOM' })],
+    });
+    const ev = new SceneEvaluator(doc);
+    const a = ev.evaluate(1).instances;
+    expect(a).toHaveLength(500);
+    const s0 = scatterCalls();
+    doc.updateObject(ground, { modifiers: [subsurf(1), lift(3)] });
+    const b = ev.evaluate(1).instances;
+    expect(scatterCalls() - s0).toBe(0);
+    // every particle rides the surface: same x/y, lifted by the change of the displacement (0.5 → 1.5)
+    const before = new Map(a.map((i) => [i.id, i.matrix]));
+    for (const i of b) {
+      const m = before.get(i.id)!;
+      expect(i.matrix[12]).toBeCloseTo(m[12], 9);
+      expect(i.matrix[13]).toBeCloseTo(m[13], 9);
+      expect(i.matrix[14] - m[14]).toBeCloseTo(1, 9);
+    }
+    // a change of the generative part (the subdivision level) distributes once more
+    doc.updateObject(ground, { modifiers: [subsurf(2), lift(3)] });
+    expect(ev.evaluate(1).instances).toHaveLength(500);
+    expect(scatterCalls() - s0).toBe(1);
+  });
 });
 
 describe('instancing operators and caches', () => {
@@ -344,14 +382,18 @@ describe('instancing operators and caches', () => {
         ],
       });
     }
-    const patio = meshObject(doc, 'Patio', createGrid({ x_subdivisions: 2, y_subdivisions: 2, size: 2 }), [
-      0, 300, 0,
-    ]);
+    const patio = meshObject(
+      doc,
+      'Patio',
+      createGrid({ x_subdivisions: 2, y_subdivisions: 2, size: 2 }),
+      [0, 300, 0],
+    );
     const viewport = new SceneEvaluator(doc);
     viewport.evaluate(1);
     const s0 = scatterCalls();
-    expect(ok('object.particle_system_add', { object: patio, settings: { instance_object: 'Rock', count: 10 } }))
-      .toMatchObject({ particles: 10, instances: 10, errors: [] });
+    expect(
+      ok('object.particle_system_add', { object: patio, settings: { instance_object: 'Rock', count: 10 } }),
+    ).toMatchObject({ particles: 10, instances: 10, errors: [] });
     expect(scatterCalls() - s0).toBe(1);
     const r = ok('object.particle_system_update', { object: 'Patio', settings: { seed: 4 } });
     expect(r).toMatchObject({ particles: 10, instances: 10 });
@@ -360,8 +402,9 @@ describe('instancing operators and caches', () => {
     expect(viewport.evaluate(1).instances.filter((i) => i.ownerId === patio)).toHaveLength(10);
     expect(scatterCalls() - s0).toBe(2);
     // display_percentage only changes the viewport placement; the full report keeps every particle
-    expect(ok('object.particle_system_update', { object: 'Patio', settings: { display_percentage: 50 } }))
-      .toMatchObject({ particles: 10 });
+    expect(
+      ok('object.particle_system_update', { object: 'Patio', settings: { display_percentage: 50 } }),
+    ).toMatchObject({ particles: 10 });
     expect(scatterCalls() - s0).toBe(2);
   });
 });

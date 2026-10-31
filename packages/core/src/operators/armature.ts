@@ -380,7 +380,10 @@ function shapeKeyPath(name: string): string {
 
 /** Shape keys of a mesh with their animated (F-curve / driver) values at the current frame. */
 function animatedShapeKeys(ctx: OperatorContext, meshId: string): ShapeKeyData[] {
-  const animated = new FrameState(ctx.doc, ctx.state.frame).get<{ shape_keys: ShapeKeyData[] }>('mesh', meshId);
+  const animated = new FrameState(ctx.doc, ctx.state.frame).get<{ shape_keys: ShapeKeyData[] }>(
+    'mesh',
+    meshId,
+  );
   return animated?.shape_keys ?? ctx.doc.getShapeKeys(meshId);
 }
 
@@ -1441,8 +1444,7 @@ function registerPoseOperators(reg: OperatorRegistry): void {
         writePoseChannel(ctx, object, p.bone, next);
         // animation of the removed constraints (e.g. keyed influence) goes with them
         const kept = new Set(rest.map((c) => c.name));
-        for (const name of removed)
-          if (!kept.has(name)) removeConstraintCurves(ctx, object.id, p.bone, name);
+        for (const name of removed) if (!kept.has(name)) removeConstraintCurves(ctx, object.id, p.bone, name);
         return { object: object.id, bone: p.bone, removed };
       },
     }),
@@ -1490,7 +1492,13 @@ function constraintPathPrefix(bone: string, constraint: string): string {
 }
 
 /** Moves the F-curves of a renamed pose bone constraint to its new name. */
-function renameConstraintCurves(ctx: OperatorContext, id: string, bone: string, from: string, to: string): void {
+function renameConstraintCurves(
+  ctx: OperatorContext,
+  id: string,
+  bone: string,
+  from: string,
+  to: string,
+): void {
   const prefix = constraintPathPrefix(bone, from);
   for (const fc of ctx.doc.listFCurves(id)) {
     if (fc.target_type !== 'object' || !fc.path.startsWith(`${prefix}.`)) continue;

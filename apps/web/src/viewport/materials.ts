@@ -1,8 +1,12 @@
 import * as THREE from 'three';
 import {
   MATERIAL_TEXTURE_CHANNELS,
+  buildRenderBuffers,
   meshBounds,
+  orcoMesh,
   proceduralSurface,
+  sceneOrcoDependencies,
+  type EvaluatedScene,
   type MaterialData,
   type MeshData,
   type ProceduralSurface,
@@ -205,10 +209,106 @@ function texSpaceOf(doc: SceneDoc, object: THREE.Object3D, geometry: THREE.Buffe
   return g;
 }
 
+const EVALUATED_SCENE = 'pfxEvaluatedScene';
+
+/**
+ * Publishes the evaluated scene on the three.js scene, where procedural materials look up the
+ * undeformed (orco) positions of the objects they draw (see `viewportOrco`). Called on every sync.
+ */
+export function setProceduralScene(scene: THREE.Scene, ev: EvaluatedScene): void {
+  scene.userData[EVALUATED_SCENE] = ev;
+}
+
+/** Undeformed positions per render vertex as an RGBA float texture (see `injectProceduralShader`). */
+export interface OrcoTexture {
+  texture: THREE.DataTexture;
+  /** Texels per row (vertex i at (i mod width, i div width)). */
+  width: number;
+  /** Render vertices. */
+  count: number;
+}
+
+/** Largest orco texture side (WebGL2 guarantees 2048). */
+const ORCO_TEXTURE_SIZE = 2048;
+/** Orco textures by orco mesh, least recently used first (disposed when evicted). */
+const orcoTextures = new Map<MeshData, OrcoTexture | null>();
+const ORCO_CACHE_SIZE = 32;
+
+/**
+ * Orco texture of a mesh: its render-vertex positions in the order `buildRenderBuffers` emits them,
+ * which is also the vertex order of the deformed geometry built from the same topology. Null for
+ * empty or too large meshes (more than 2048² render vertices).
+ */
+export function orcoTexture(orco: MeshData): OrcoTexture | null {
+  const hit = orcoTextures.get(orco);
+  if (hit !== undefined) {
+    orcoTextures.delete(orco);
+    orcoTextures.set(orco, hit);
+    return hit;
+  }
+  const rb = buildRenderBuffers(orco);
+  const count = rb.positions.length / 3;
+  const width = Math.max(1, Math.min(ORCO_TEXTURE_SIZE, count));
+  const height = Math.max(1, Math.ceil(count / width));
+  let t: OrcoTexture | null = null;
+  if (count > 0 && height <= ORCO_TEXTURE_SIZE) {
+    const data = new Float32Array(width * height * 4);
+    for (let i = 0; i < count; i++) {
+      data[i * 4] = rb.positions[i * 3];
+      data[i * 4 + 1] = rb.positions[i * 3 + 1];
+      data[i * 4 + 2] = rb.positions[i * 3 + 2];
+      data[i * 4 + 3] = 1;
+    }
+    const texture = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
+    texture.minFilter = THREE.NearestFilter;
+    texture.magFilter = THREE.NearestFilter;
+    texture.generateMipmaps = false;
+    texture.needsUpdate = true;
+    t = { texture, width, count };
+  }
+  orcoTextures.set(orco, t);
+  for (const [mesh, old] of orcoTextures) {
+    if (orcoTextures.size <= ORCO_CACHE_SIZE) break;
+    old?.texture.dispose();
+    orcoTextures.delete(mesh);
+  }
+  return t;
+}
+
+/**
+ * Orco texture of the object drawn with `geometry`, or null when its geometry is undeformed (or the
+ * orco cannot be matched to it): GENERATED coordinates then use the vertex positions.
+ */
+export function viewportOrco(
+  doc: Pick<SceneDoc, 'meshAttrVersion'>,
+  scene: THREE.Object3D,
+  object: THREE.Object3D,
+  geometry: THREE.BufferGeometry,
+): OrcoTexture | null {
+  const ev = scene.userData[EVALUATED_SCENE] as EvaluatedScene | undefined;
+  const id = (object.userData.instanceOf ?? object.userData.objectId) as string | undefined;
+  const eo = ev && id ? ev.byId.get(id) : undefined;
+  if (!ev || !eo?.mesh || !eo.baseMesh) return null;
+  const meshId = eo.type === 'MESH' ? eo.data.data : null;
+  const orco = orcoMesh({
+    object: eo.data,
+    base: eo.baseMesh,
+    hasShapeKeys: !!meshId && doc.meshAttrVersion(meshId, 'shape_keys') !== 0,
+    forRender: false,
+    frame: ev.frame,
+    objectMatrix: eo.worldMatrix,
+    deps: sceneOrcoDependencies(ev),
+  });
+  if (!orco || orco === eo.mesh) return null;
+  const t = orcoTexture(orco);
+  return t && t.count === geometry.getAttribute('position')?.count ? t : null;
+}
+
 /**
  * Evaluates the material's procedural texture slots in the shader (procedural-glsl.ts): uniforms
  * hold the compiled textures, one shader program is shared by all materials with the same set of
- * procedural channels, and the GENERATED texture space follows the object being drawn.
+ * procedural channels, and the GENERATED texture space (base mesh bounds) and undeformed positions
+ * follow the object being drawn.
  */
 function installProcedural(
   mat: THREE.MeshPhysicalMaterial,
@@ -220,12 +320,16 @@ function installProcedural(
   const texMin = { value: new THREE.Vector3(0, 0, 0) };
   const texSize = { value: new THREE.Vector3(1, 1, 1) };
   const hasUv = { value: 1 };
+  const orco = { value: null as THREE.Texture | null };
+  const orcoWidth = { value: 0 };
   const uniforms: Record<string, { value: unknown }> = {
     pfxTexMin: texMin,
     pfxTexSize: texSize,
     pfxHasUv: hasUv,
     pfxBumpDistance: { value: surface.bump },
     pfxEmissionStrength: { value: Math.max(0, d.emission_strength) },
+    pfxOrco: orco,
+    pfxOrcoWidth: orcoWidth,
   };
   for (const ch of channels)
     uniforms[proceduralUniformName(ch)] = { value: proceduralUniformValue(surface[ch]!) };
@@ -245,13 +349,18 @@ function installProcedural(
     injectProceduralShader(shader, channels);
   };
   mat.customProgramCacheKey = () => key;
-  mat.onBeforeRender = (_renderer, _scene, _camera, geometry, object) => {
+  mat.onBeforeRender = (_renderer, scene, _camera, geometry, object) => {
     const b = texSpaceOf(doc, object, geometry);
     if (b) {
       texMin.value.set(b.min[0], b.min[1], b.min[2]);
       texSize.value.set(b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]);
     }
     hasUv.value = geometry.getAttribute('uv') ? 1 : 0;
+    if (surface.usesGenerated) {
+      const t = viewportOrco(doc, scene, object, geometry);
+      orco.value = t?.texture ?? null;
+      orcoWidth.value = t?.width ?? 0;
+    }
   };
 }
 

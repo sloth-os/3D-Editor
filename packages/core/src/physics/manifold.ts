@@ -1,4 +1,5 @@
 import type { Vec3 } from '../math/types';
+import { len3 } from './vmath';
 
 /*
  * Contact manifold construction: clipping the "incident" feature of one shape against the
@@ -37,7 +38,7 @@ function newell(flat: ArrayLike<number>, count: number, out: Float64Array): void
     ny += (flat[a + 2] - flat[b + 2]) * (flat[a] + flat[b]);
     nz += (flat[a] - flat[b]) * (flat[a + 1] + flat[b + 1]);
   }
-  const l = Math.hypot(nx, ny, nz);
+  const l = len3(nx, ny, nz);
   if (l > 1e-300) {
     out[0] = nx / l;
     out[1] = ny / l;
@@ -200,7 +201,7 @@ export function clipFeatures(
       let mx = ey * uz - ez * uy;
       let my = ez * ux - ex * uz;
       let mz = ex * uy - ey * ux;
-      const ml = Math.hypot(mx, my, mz);
+      const ml = len3(mx, my, mz);
       if (!(ml > 1e-12)) continue;
       mx = (mx / ml) * sign;
       my = (my / ml) * sign;
@@ -211,21 +212,21 @@ export function clipFeatures(
     const ex = ref[3] - r0x;
     const ey = ref[4] - r0y;
     const ez = ref[5] - r0z;
-    const el = Math.hypot(ex, ey, ez);
+    const el = len3(ex, ey, ez);
     if (!(el > 1e-12)) return 0;
     if (incCount === 2) {
       // crossing segments touch in a single point: only (nearly) parallel ones form a manifold
       const fx = clipSrc[3] - clipSrc[0];
       const fy = clipSrc[4] - clipSrc[1];
       const fz = clipSrc[5] - clipSrc[2];
-      const fl = Math.hypot(fx, fy, fz);
+      const fl = len3(fx, fy, fz);
       if (!(fl > 1e-12) || Math.abs(ex * fx + ey * fy + ez * fz) < 0.98 * el * fl) return 0;
     }
     const eu = ex * ux + ey * uy + ez * uz;
     const px = ex - eu * ux;
     const py = ey - eu * uy;
     const pz = ez - eu * uz;
-    const pl = Math.hypot(px, py, pz);
+    const pl = len3(px, py, pz);
     if (!(pl > 1e-12)) return 0;
     const mx = px / pl;
     const my = py / pl;
@@ -237,7 +238,7 @@ export function clipFeatures(
     nRx = ux - (k * ex) / el;
     nRy = uy - (k * ey) / el;
     nRz = uz - (k * ez) / el;
-    const nl = Math.hypot(nRx, nRy, nRz);
+    const nl = len3(nRx, nRy, nRz);
     if (!(nl > 1e-9)) return 0;
     nRx /= nl;
     nRy /= nl;

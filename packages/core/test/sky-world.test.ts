@@ -6,8 +6,11 @@ import {
   createEditorState,
   createOperatorRegistry,
   createPlane,
+  prepareSky,
   renderSceneSoftware,
   sampleSky,
+  sampleSkyModel,
+  skySun,
   sunDirection,
   type OperatorContext,
   type RenderedImage,
@@ -50,7 +53,8 @@ describe('world.sky_set', () => {
     const dir = r.result!.sun_direction as number[];
     const expected = sunDirection(w);
     dir.forEach((v, i) => expect(v).toBeCloseTo(expected[i], 5));
-    expect(dir[0]).toBeGreaterThan(0.9);
+    // rotation 90° turns the sun from +Y to −X (Blender's convention)
+    expect(dir[0]).toBeLessThan(-0.9);
     expect((r.result!.sun_irradiance as number[]).every((v) => v > 0 && v < 4)).toBe(true);
   });
 
@@ -84,7 +88,53 @@ describe('world.sky_set', () => {
     expect(w.strength).toBe(1);
     expect(w.sky_zenith_color).toEqual([0.1, 0.2, 0.9]);
   });
+
+  it('honours every accepted sun_size up to π/2 (Blender range)', () => {
+    // regression: diameters above 1 rad used to be clamped silently to 1 rad
+    const { doc, run } = setup();
+    expect(run('world.sky_set', { sun_size: 1.5 }).ok).toBe(true);
+    expect(skySun(doc.getWorld()).angularRadius).toBeCloseTo(0.75, 12);
+    expect(run('world.sky_set', { sun_size: Math.PI / 2 }).ok).toBe(true);
+    expect(skySun(doc.getWorld()).angularRadius).toBeCloseTo(Math.PI / 4, 12);
+    expect(run('world.sky_set', { sun_size: 2 }).ok).toBe(false);
+    // even a 90° disc delivers exactly its irradiance: ∫disc L dω = sun_intensity × extinction
+    // (the limb-darkening normalisation accounts for the curvature of large caps)
+    for (const size of [0.5, 1.5, Math.PI / 2]) {
+      run('world.sky_set', { sun_size: size, sun_elevation: 0.9 });
+      const w = doc.getWorld();
+      const sun = skySun(w);
+      const m = prepareSky(w);
+      const d = sun.direction;
+      const u = normalize(cross(d, [0, 0, 1]));
+      const v = cross(d, u);
+      const withSun = new Float64Array(3);
+      const sky = new Float64Array(3);
+      const n = 300;
+      let e = 0;
+      for (let i = 0; i < n; i++)
+        for (let j = 0; j < n; j++) {
+          const theta = ((i + 0.5) / n) * m.sunRadius;
+          const phi = ((j + 0.5) / n) * 2 * Math.PI;
+          const s = Math.sin(theta);
+          const c = Math.cos(theta);
+          const dir = [0, 1, 2].map((k) => d[k] * c + (u[k] * Math.cos(phi) + v[k] * Math.sin(phi)) * s);
+          sampleSkyModel(m, dir[0], dir[1], dir[2], true, withSun);
+          sampleSkyModel(m, dir[0], dir[1], dir[2], false, sky);
+          e += (withSun[1] - sky[1]) * s * (m.sunRadius / n) * ((2 * Math.PI) / n);
+        }
+      expect(Math.abs(e / sun.irradiance[1] - 1), `sun_size ${size}`).toBeLessThan(2e-3);
+    }
+  });
 });
+
+function cross(a: readonly number[], b: readonly number[]): number[] {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+
+function normalize(v: number[]): number[] {
+  const l = Math.hypot(v[0], v[1], v[2]);
+  return [v[0] / l, v[1] / l, v[2] / l];
+}
 
 describe('world.mist_set', () => {
   it('sets density directly or from a 95 % distance, and the colour', () => {
@@ -109,7 +159,8 @@ describe('world.mist_set', () => {
 describe('CPU renderer: sky and mist', () => {
   it('draws the procedural sky as background along each camera ray', () => {
     const { doc, run } = setup();
-    run('world.sky_set', { sun_elevation: deg(40), sun_rotation: deg(180) });
+    // sun ahead of the camera (+Y), above the field of view
+    run('world.sky_set', { sun_elevation: deg(40), sun_rotation: 0 });
     const fovY = 0.8;
     const img = renderSceneSoftware(doc, {
       width: 64,

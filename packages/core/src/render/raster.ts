@@ -3,7 +3,12 @@ import { invert4, normalMatrix4 } from '../math/mat4';
 import type { MeshData } from '../mesh/types';
 import { meshBounds } from '../mesh/types';
 import { buildRenderBuffers, type RenderBuffers } from '../mesh/render-buffers';
-import { sampleCompiled, type CompiledProcedural } from '../material/procedural';
+import {
+  PATTERN_STRIDE,
+  rampPattern,
+  samplePattern,
+  type CompiledProcedural,
+} from '../material/procedural';
 import { bumpNormal, compiledCoord, type ProceduralSurface } from '../material/surface';
 import { evalSkyIrradiance, sampleSkyModel, type SkyModel } from './sky';
 import type { RenderView } from './view';
@@ -81,9 +86,17 @@ export const LIGHT_STRIDE = 13;
 
 const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16);
 
-/** Vertex record in screen space: sx, sy, depthKey, 1/w, normal xyz, world position xyz, rgba, uv. */
-const VS = 16;
+/**
+ * Vertex record in screen space: sx, sy, depthKey, 1/w, normal xyz, world position xyz, rgba, uv,
+ * undeformed object-space position xyz (GENERATED procedural coordinates).
+ */
+const VS = 19;
 const GUARD = 64;
+/**
+ * Cached procedural values per output pixel: base rgb, alpha factor, metallic, roughness, emission
+ * rgb, bumped normal xyz (NaN until computed), bump height.
+ */
+const PROC_VALUES = 13;
 const INV_PI = 1 / Math.PI;
 
 export class Rasterizer {
@@ -103,6 +116,18 @@ export class Rasterizer {
   /** World mist (MATERIAL shading): 1 − exp(−(density·depth)²) towards `mistColor`; 0 disables. */
   mistDensity = 0;
   mistColor: [number, number, number] = [0, 0, 0];
+  /**
+   * Samples per output pixel side (the caller's supersampling factor): procedural textures are
+   * evaluated once per output pixel and triangle and shared by its samples (like MSAA shading).
+   */
+  shadingBlock = 1;
+  /** Per output-pixel column: triangle serial, block row and cached procedural values. */
+  private procTri = new Int32Array(0);
+  private procRow = new Int32Array(0);
+  private procVal = new Float64Array(0);
+  private triSerial = 0;
+  /** Pattern values of the distinct patterns of the current procedural material. */
+  private patBuf = new Float64Array(PATTERN_STRIDE * 6);
   /** Current object: world → object matrix and GENERATED texture space (procedural textures). */
   private invWorld: Mat4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
   private texMin: Vec3 = [0, 0, 0];
@@ -180,17 +205,26 @@ export class Rasterizer {
 
   /**
    * Draws a mesh object. `materials` is indexed by material slot; `fallback` is used for empty slots.
-   * `texSpace` is the GENERATED texture space of procedural textures (default: the mesh bounds).
+   * `texSpace` is the GENERATED texture space of procedural textures (default: the mesh bounds) and
+   * `texSpace.orco` the undeformed position of every mesh vertex (xyz per vertex, see
+   * material/orco.ts; default: the mesh positions), from which GENERATED coordinates are computed.
    */
   drawMesh(
     mesh: MeshData,
     world: Mat4,
     materials: SurfaceMaterial[],
     fallback: SurfaceMaterial,
-    texSpace?: { min: Readonly<Vec3>; max: Readonly<Vec3> } | null,
+    texSpace?: { min: Readonly<Vec3>; max: Readonly<Vec3>; orco?: ArrayLike<number> | null } | null,
   ): void {
     if (!mesh.faces.length || this.offscreen(mesh, world)) return;
-    if (materials.some((m) => m?.procedural)) {
+    const procedural = materials.some((m) => m?.procedural);
+    if (procedural) {
+      const cols = Math.ceil(this.width / Math.max(1, this.shadingBlock | 0)) + 1;
+      if (this.procTri.length < cols) {
+        this.procTri = new Int32Array(cols);
+        this.procRow = new Int32Array(cols);
+        this.procVal = new Float64Array(cols * PROC_VALUES);
+      }
       this.invWorld = invert4(world);
       const ts = texSpace ?? meshBounds(mesh) ?? { min: [0, 0, 0], max: [1, 1, 1] };
       for (let k = 0; k < 3; k++) {
@@ -202,6 +236,21 @@ export class Rasterizer {
     const nv = rb.positions.length / 3;
     const tris = rb.indices.length / 3;
     if (!tris) return;
+    // undeformed object-space position per render vertex (GENERATED procedural coordinates)
+    let og: Float64Array | null = null;
+    if (procedural) {
+      og = Float64Array.from(rb.positions);
+      const orco = texSpace?.orco;
+      if (orco && orco.length === mesh.positions.length) {
+        const src = rb.vertexSource;
+        for (let i = 0; i < nv; i++) {
+          const s = src[i] * 3;
+          og[i * 3] = orco[s];
+          og[i * 3 + 1] = orco[s + 1];
+          og[i * 3 + 2] = orco[s + 2];
+        }
+      }
+    }
     const M = world;
     const NM = normalMatrix4(M);
     // mirroring transforms reverse the winding of world-space triangles
@@ -311,15 +360,15 @@ export class Rasterizer {
       if (back && mat.cull) continue;
       const wire = edges ? edges[t] : 0;
       if (!(gc[i0] | gc[i1] | gc[i2])) {
-        this.loadScreen(0, i0, cl, wn, wp, colors, uvs);
-        this.loadScreen(1, i1, cl, wn, wp, colors, uvs);
-        this.loadScreen(2, i2, cl, wn, wp, colors, uvs);
+        this.loadScreen(0, i0, cl, wn, wp, colors, uvs, og);
+        this.loadScreen(1, i1, cl, wn, wp, colors, uvs, og);
+        this.loadScreen(2, i2, cl, wn, wp, colors, uvs, og);
         this.fill(0, 1, 2, mat, back, wire);
       } else {
         const A = this.clipA;
-        loadClip(A, 0, i0, cl, wn, wp, colors, uvs);
-        loadClip(A, 1, i1, cl, wn, wp, colors, uvs);
-        loadClip(A, 2, i2, cl, wn, wp, colors, uvs);
+        loadClip(A, 0, i0, cl, wn, wp, colors, uvs, og);
+        loadClip(A, 1, i1, cl, wn, wp, colors, uvs, og);
+        loadClip(A, 2, i2, cl, wn, wp, colors, uvs, og);
         const n2 = this.clipPolygon(3);
         for (let j = 0; j < n2; j++) this.projectClip(j);
         for (let j = 1; j + 1 < n2; j++) this.fill(0, j, j + 1, mat, back, 0);
@@ -364,6 +413,7 @@ export class Rasterizer {
     wp: Float64Array,
     colors: Float32Array | null,
     uvs: Float32Array | null,
+    og: Float64Array | null,
   ): void {
     const S = this.scr;
     const o = slot * VS;
@@ -387,6 +437,11 @@ export class Rasterizer {
     } else S[o + 10] = S[o + 11] = S[o + 12] = S[o + 13] = 1;
     S[o + 14] = uvs ? uvs[v * 2] : 0;
     S[o + 15] = uvs ? uvs[v * 2 + 1] : 0;
+    if (og) {
+      S[o + 16] = og[v * 3];
+      S[o + 17] = og[v * 3 + 1];
+      S[o + 18] = og[v * 3 + 2];
+    }
   }
 
   /** Sutherland–Hodgman against the near plane and the guard band; result in clipA. */
@@ -493,6 +548,7 @@ export class Rasterizer {
     const blend = mat.blend;
     const tex = this.mode === SHADE_MATERIAL ? mat.tex : null;
     const proc = this.mode === SHADE_MATERIAL ? (mat.procedural ?? null) : null;
+    const serial = proc ? (this.triSerial = (this.triSerial + 1) | 0) : 0;
     // barycentric increments per pixel row (neighbour pixels for the procedural bump)
     const b0 = (x2 - x1) * inv;
     const b1 = (x0 - x2) * inv;
@@ -541,45 +597,34 @@ export class Rasterizer {
           cb *= this.texB;
           ca *= this.texA;
         }
-        // procedural channels override the material values per sample
+        // procedural channels override the material values; they are evaluated once per output
+        // pixel and triangle (cached per output-pixel column) and shared by its samples
         let sm = mat;
         let br = mat.r;
         let bg = mat.g;
         let bb = mat.b;
+        const pv = this.procVal;
+        let po = 0;
         if (proc) {
+          const blk = this.shadingBlock;
+          const slot = blk > 1 ? (px / blk) | 0 : px;
+          const rowBlk = blk > 1 ? (py / blk) | 0 : py;
+          po = slot * PROC_VALUES;
+          if (this.procTri[slot] !== serial || this.procRow[slot] !== rowBlk) {
+            this.procTri[slot] = serial;
+            this.procRow[slot] = rowBlk;
+            this.shadeProcedural(proc, mat, l0, l1, l2, oa, ob, oc, po);
+          }
+          br = pv[po];
+          bg = pv[po + 1];
+          bb = pv[po + 2];
+          ca *= pv[po + 3];
           const pm = this.pm;
-          const pv = this.pxv;
-          pm.metallic = mat.metallic;
-          pm.roughness = mat.roughness;
-          pm.er = mat.er;
-          pm.eg = mat.eg;
-          pm.eb = mat.eb;
-          if (proc.base_color) {
-            this.sampleChannel(proc.base_color, l0, l1, l2, oa, ob, oc, pv);
-            br = pv[0] > 0 ? pv[0] : 0;
-            bg = pv[1] > 0 ? pv[1] : 0;
-            bb = pv[2] > 0 ? pv[2] : 0;
-            ca *= clamp01(pv[3]);
-          }
-          if (proc.alpha) {
-            this.sampleChannel(proc.alpha, l0, l1, l2, oa, ob, oc, pv);
-            ca *= clamp01(pv[0]);
-          }
-          if (proc.metallic) {
-            this.sampleChannel(proc.metallic, l0, l1, l2, oa, ob, oc, pv);
-            pm.metallic = clamp01(pv[0]);
-          }
-          if (proc.roughness) {
-            this.sampleChannel(proc.roughness, l0, l1, l2, oa, ob, oc, pv);
-            pm.roughness = clamp01(pv[0]);
-          }
-          if (proc.emission) {
-            this.sampleChannel(proc.emission, l0, l1, l2, oa, ob, oc, pv);
-            const es = mat.emissionStrength ?? 0;
-            pm.er = (pv[0] > 0 ? pv[0] : 0) * es;
-            pm.eg = (pv[1] > 0 ? pv[1] : 0) * es;
-            pm.eb = (pv[2] > 0 ? pv[2] : 0) * es;
-          }
+          pm.metallic = pv[po + 4];
+          pm.roughness = pv[po + 5];
+          pm.er = pv[po + 6];
+          pm.eg = pv[po + 7];
+          pm.eb = pv[po + 8];
           sm = pm;
         }
         if (blend) {
@@ -598,20 +643,31 @@ export class Rasterizer {
         const wy = l0 * S[oa + 8] + l1 * S[ob + 8] + l2 * S[oc + 8];
         const wz = l0 * S[oa + 9] + l1 * S[ob + 9] + l2 * S[oc + 9];
         if (proc?.normal && proc.bump !== 0) {
-          // offsets to the neighbour pixels (like the shader's dFdx/dFdy), then Mikkelsen bump
-          const pn = this.pn;
-          pn[0] = nx;
-          pn[1] = ny;
-          pn[2] = nz;
-          this.coordAt(proc.normal, l0, l1, l2, oa, ob, oc, this.pc);
-          if (
-            this.neighbour(proc.normal, w0 + a0, w1 + a1, w2 + a2, q0, q1, q2, oa, ob, oc, wx, wy, wz, 0) &&
-            this.neighbour(proc.normal, w0 + b0, w1 + b1, w2 + b2, q0, q1, q2, oa, ob, oc, wx, wy, wz, 1)
-          ) {
-            bumpNormal(proc.normal, proc.bump, this.pc, this.pcx, this.pcy, this.ppx, this.ppy, pn, pn);
-            nx = pn[0];
-            ny = pn[1];
-            nz = pn[2];
+          if (pv[po + 9] === pv[po + 9]) {
+            // bumped normal of this pixel's first sample (not NaN)
+            nx = pv[po + 9];
+            ny = pv[po + 10];
+            nz = pv[po + 11];
+          } else {
+            // offsets to the neighbour pixels (like the shader's dFdx/dFdy), then Mikkelsen bump
+            const pn = this.pn;
+            pn[0] = nx;
+            pn[1] = ny;
+            pn[2] = nz;
+            this.coordAt(proc.normal, l0, l1, l2, oa, ob, oc, this.pc);
+            if (
+              this.neighbour(proc.normal, w0 + a0, w1 + a1, w2 + a2, q0, q1, q2, oa, ob, oc, wx, wy, wz, 0) &&
+              this.neighbour(proc.normal, w0 + b0, w1 + b1, w2 + b2, q0, q1, q2, oa, ob, oc, wx, wy, wz, 1)
+            ) {
+              const h0 = pv[po + 12];
+              bumpNormal(proc.normal, proc.bump, this.pc, this.pcx, this.pcy, this.ppx, this.ppy, pn, pn, h0);
+              nx = pn[0];
+              ny = pn[1];
+              nz = pn[2];
+            }
+            pv[po + 9] = nx;
+            pv[po + 10] = ny;
+            pv[po + 11] = nz;
           }
         }
         if (this.mode === SHADE_SOLID) this.shadeSolid(mat, nx, ny, nz);
@@ -668,6 +724,21 @@ export class Rasterizer {
       compiledCoord(2, 0, 0, 0, this.texMin, this.texSize, u, v, out);
       return;
     }
+    if (c.mapping === 0) {
+      // GENERATED: undeformed position (sticks to the surface under deformation)
+      compiledCoord(
+        0,
+        l0 * S[oa + 16] + l1 * S[ob + 16] + l2 * S[oc + 16],
+        l0 * S[oa + 17] + l1 * S[ob + 17] + l2 * S[oc + 17],
+        l0 * S[oa + 18] + l1 * S[ob + 18] + l2 * S[oc + 18],
+        this.texMin,
+        this.texSize,
+        u,
+        v,
+        out,
+      );
+      return;
+    }
     const wx = l0 * S[oa + 7] + l1 * S[ob + 7] + l2 * S[oc + 7];
     const wy = l0 * S[oa + 8] + l1 * S[ob + 8] + l2 * S[oc + 8];
     const wz = l0 * S[oa + 9] + l1 * S[ob + 9] + l2 * S[oc + 9];
@@ -685,20 +756,73 @@ export class Rasterizer {
     );
   }
 
-  /** Samples a procedural channel at the current pixel into `out` (linear RGBA). */
-  private sampleChannel(
-    c: CompiledProcedural,
+  /**
+   * Evaluates the procedural channels of a material at perspective-correct barycentrics l0..l2
+   * into `procVal[o ..]` (see PROC_VALUES): every distinct pattern once, then each channel's ramp.
+   */
+  private shadeProcedural(
+    p: ProceduralSurface,
+    mat: SurfaceMaterial,
     l0: number,
     l1: number,
     l2: number,
     oa: number,
     ob: number,
     oc: number,
-    out: Float64Array,
+    o: number,
   ): void {
-    const p = this.pc;
-    this.coordAt(c, l0, l1, l2, oa, ob, oc, p);
-    sampleCompiled(c, p[0], p[1], p[2], out);
+    const pat = this.patBuf;
+    const pc = this.pc;
+    for (let i = 0; i < p.patterns.length; i++) {
+      const c = p.patterns[i];
+      this.coordAt(c, l0, l1, l2, oa, ob, oc, pc);
+      samplePattern(c, pc[0], pc[1], pc[2], pat, i * PATTERN_STRIDE);
+    }
+    const out = this.procVal;
+    const v = this.pxv;
+    const of = p.patternOf;
+    let ca = 1;
+    if (p.base_color) {
+      rampPattern(p.base_color, pat, of.base_color * PATTERN_STRIDE, v);
+      out[o] = v[0] > 0 ? v[0] : 0;
+      out[o + 1] = v[1] > 0 ? v[1] : 0;
+      out[o + 2] = v[2] > 0 ? v[2] : 0;
+      ca *= clamp01(v[3]);
+    } else {
+      out[o] = mat.r;
+      out[o + 1] = mat.g;
+      out[o + 2] = mat.b;
+    }
+    if (p.alpha) {
+      rampPattern(p.alpha, pat, of.alpha * PATTERN_STRIDE, v);
+      ca *= clamp01(v[0]);
+    }
+    out[o + 3] = ca;
+    if (p.metallic) {
+      rampPattern(p.metallic, pat, of.metallic * PATTERN_STRIDE, v);
+      out[o + 4] = clamp01(v[0]);
+    } else out[o + 4] = mat.metallic;
+    if (p.roughness) {
+      rampPattern(p.roughness, pat, of.roughness * PATTERN_STRIDE, v);
+      out[o + 5] = clamp01(v[0]);
+    } else out[o + 5] = mat.roughness;
+    if (p.emission) {
+      rampPattern(p.emission, pat, of.emission * PATTERN_STRIDE, v);
+      const es = mat.emissionStrength ?? 0;
+      out[o + 6] = (v[0] > 0 ? v[0] : 0) * es;
+      out[o + 7] = (v[1] > 0 ? v[1] : 0) * es;
+      out[o + 8] = (v[2] > 0 ? v[2] : 0) * es;
+    } else {
+      out[o + 6] = mat.er;
+      out[o + 7] = mat.eg;
+      out[o + 8] = mat.eb;
+    }
+    // bumped normal: computed by the first shaded sample; the height at this point
+    out[o + 9] = NaN;
+    if (p.normal) {
+      rampPattern(p.normal, pat, of.normal * PATTERN_STRIDE, v);
+      out[o + 12] = v[0];
+    }
   }
 
   /**
@@ -940,6 +1064,7 @@ function loadClip(
   wp: Float64Array,
   colors: Float32Array | null,
   uvs: Float32Array | null,
+  og: Float64Array | null,
 ): void {
   const o = slot * VS;
   A[o] = cl[v * 4];
@@ -960,6 +1085,11 @@ function loadClip(
   } else A[o + 10] = A[o + 11] = A[o + 12] = A[o + 13] = 1;
   A[o + 14] = uvs ? uvs[v * 2] : 0;
   A[o + 15] = uvs ? uvs[v * 2 + 1] : 0;
+  if (og) {
+    A[o + 16] = og[v * 3];
+    A[o + 17] = og[v * 3 + 1];
+    A[o + 18] = og[v * 3 + 2];
+  }
 }
 
 /**

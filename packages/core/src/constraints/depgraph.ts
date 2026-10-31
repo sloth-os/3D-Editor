@@ -56,7 +56,10 @@ function isEvaluated(c: Record<string, unknown>): boolean {
   const info = getConstraintTypeInfo(String(c.type));
   if (!info || info.boneOnly) return false;
   const influence = c.influence;
-  if (influence !== undefined && !(typeof influence === 'number' && Number.isFinite(influence) && influence > 0))
+  if (
+    influence !== undefined &&
+    !(typeof influence === 'number' && Number.isFinite(influence) && influence > 0)
+  )
     return false;
   return parseConstraintParams(c as unknown as ConstraintData).ok;
 }
@@ -172,7 +175,12 @@ export class ConstraintDependencyGraph {
       const tw = isId(t) && t !== id ? this.index.get(t) : undefined;
       if (tw === undefined) continue;
       const name = isId(c.name) ? c.name : String(c.type);
-      this.link(w, tw, isId(c.subtarget) ? `${name}, bone '${c.subtarget}'` : name, c as unknown as ConstraintData);
+      this.link(
+        w,
+        tw,
+        isId(c.subtarget) ? `${name}, bone '${c.subtarget}'` : name,
+        c as unknown as ConstraintData,
+      );
     }
   }
 
@@ -266,7 +274,7 @@ export class ConstraintDependencyGraph {
       }
     if (!prev.has(to)) return null;
     const out: { from: number; label: string }[] = [];
-    for (let v = to; v !== from; ) {
+    for (let v = to; v !== from;) {
       const p = prev.get(v)!;
       out.push({ from: p.node, label: p.label });
       v = p.node;

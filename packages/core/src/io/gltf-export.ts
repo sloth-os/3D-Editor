@@ -1,4 +1,4 @@
-import type { Mat4, Quat, Vec3 } from '../math/types';
+import type { Mat4, Quat, Vec3, Vec4 } from '../math/types';
 import { compose4, decompose4, multiply4 } from '../math/mat4';
 import { normalizeQuat, quatFromEuler } from '../math/quat';
 import type { SceneDoc } from '../doc/scene-doc';
@@ -7,7 +7,7 @@ import { evaluateFCurve } from '../anim/fcurve';
 import { cameraFovY, orthoHalfExtents } from '../eval/camera';
 import type { MeshData } from '../mesh/types';
 import { buildRenderBuffers } from '../mesh/render-buffers';
-import { base64Encode } from '../util/json';
+import { base64Encode, stableStringify } from '../util/json';
 import { trsToYUp, type TRS } from './axes';
 import { utf8Encode } from './bytes';
 import { collectExport, type ExportItem } from './common';
@@ -28,8 +28,14 @@ import {
 } from './gltf-types';
 import { sniffImageMime } from './image-info';
 import type { ExportOptions, ExportResult } from './types';
-import { bakeMaterialTextures, proceduralBakeNeedsGeometry } from './bake-procedural';
-import { hasProceduralTextures } from '../material/surface';
+import {
+  bakeGeometryKey,
+  bakeMaterialTextures,
+  proceduralBakeNeedsGeometry,
+  type BakeGeometry,
+} from './bake-procedural';
+import { hasProceduralTextures, proceduralSurface } from '../material/surface';
+import { evaluatedOrco } from '../material/orco';
 import { meshBounds } from '../mesh/types';
 import { encodePNG, type PNGImage } from '../render/png';
 
@@ -48,7 +54,8 @@ import { encodePNG, type PNGImage } from '../render/png';
  *   frame range at the scene fps (LINEAR; rotations as normalized, sign-continuous quaternions).
  * - Procedural texture slots are baked to PNG images in UV space (bake-procedural.ts); materials
  *   whose bake depends on the geometry (GENERATED/OBJECT mapping, bump) get one glTF material per
- *   mesh.
+ *   distinct mesh content (identical meshes share one bake). Primitives without UVs cannot bind
+ *   textures (no TEXCOORD_0): their materials carry constant procedural values as factors only.
  */
 
 const ANIM_PATHS = ['location', 'rotation_euler', 'scale'] as const;
@@ -253,20 +260,69 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
 
   const materials: GltfMaterial[] = [];
   const materialOf = new Map<string, number>();
-  const meshTokens = new Map<MeshData, number>();
+  /** Texture indices and factors of one procedural bake, shared by equal materials on equal geometry. */
+  interface BakeResult {
+    baseColor?: number;
+    baseColorFactor?: Vec4;
+    metallicRoughness?: number;
+    metallicFactor?: number;
+    roughnessFactor?: number;
+    normal?: number;
+    emissive?: number;
+    emissiveColor?: Vec3;
+  }
+  const bakes = new Map<string, BakeResult>();
+  const bake = (m: MaterialData, it: ExportItem, hasUv: boolean): { result: BakeResult; key: string } => {
+    // the bake depends on the geometry for GENERATED/OBJECT mappings and bumps: key it by content so
+    // identical meshes (e.g. many copies of a cube) share one bake and one material
+    let geometry: BakeGeometry = { mesh: it.mesh! };
+    let geoKey = '';
+    if (proceduralBakeNeedsGeometry(m)) {
+      const tex = it.ev.baseMesh ? meshBounds(it.ev.baseMesh) : null;
+      const orco =
+        it.mesh === it.ev.mesh && proceduralSurface(m)?.usesGenerated
+          ? evaluatedOrco(doc, scene, it.ev, true)
+          : null;
+      geometry = { mesh: it.mesh!, texMin: tex?.min, texMax: tex?.max, orco };
+      geoKey = bakeGeometryKey(geometry);
+    }
+    const key = `${hasUv ? 'uv' : 'nouv'}|${geoKey}`;
+    const bakeKey = `${stableStringify([
+      m.textures,
+      m.base_color,
+      m.alpha,
+      m.metallic,
+      m.roughness,
+      m.emission_strength,
+      m.normal_strength,
+    ])}|${key}`;
+    let result = bakes.get(bakeKey);
+    if (!result) {
+      const baked = bakeMaterialTextures(m, geometry);
+      warnings.push(...baked.warnings);
+      result = {
+        baseColor: baked.baseColor && pngTexture(baked.baseColor, `${m.name} base color`),
+        baseColorFactor: baked.baseColorFactor,
+        metallicRoughness:
+          baked.metallicRoughness && pngTexture(baked.metallicRoughness, `${m.name} metallic roughness`),
+        metallicFactor: baked.metallicFactor,
+        roughnessFactor: baked.roughnessFactor,
+        normal: baked.normal && pngTexture(baked.normal, `${m.name} normal`),
+        emissive: baked.emissive && pngTexture(baked.emissive, `${m.name} emission`),
+        emissiveColor: baked.emissiveColor,
+      };
+      bakes.set(bakeKey, result);
+    }
+    return { result, key };
+  };
   const materialIndex = (m: MaterialData, it: ExportItem): number => {
-    // procedural bakes that depend on the geometry are made per mesh
-    const perMesh = !!it.mesh && proceduralBakeNeedsGeometry(m);
-    let token = perMesh ? meshTokens.get(it.mesh!) : undefined;
-    if (perMesh && token === undefined) meshTokens.set(it.mesh!, (token = meshTokens.size));
-    const key = perMesh ? `${m.id}|${token}` : m.id;
+    // glTF texture bindings need TEXCOORD_0: primitives without UVs get texture-less materials
+    const hasUv = !!it.mesh?.uvs && it.mesh.faces.length > 0;
+    const baked = hasProceduralTextures(m) && it.mesh ? bake(m, it, hasUv) : null;
+    const key = `${m.id}|${baked ? baked.key : hasUv ? 'uv' : 'nouv'}`;
     const cached = materialOf.get(key);
     if (cached !== undefined) return cached;
-    const tex = it.ev.baseMesh ? meshBounds(it.ev.baseMesh) : null;
-    const baked = hasProceduralTextures(m)
-      ? bakeMaterialTextures(m, it.mesh ? { mesh: it.mesh, texMin: tex?.min, texMax: tex?.max } : null)
-      : null;
-    if (baked) warnings.push(...baked.warnings);
+    const b = baked?.result ?? null;
     const out: GltfMaterial = { name: m.name };
     const pbr: NonNullable<GltfMaterial['pbrMetallicRoughness']> = {};
     const bc = [
@@ -279,48 +335,68 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     if (m.metallic !== 1) pbr.metallicFactor = clamp01(m.metallic);
     if (m.roughness !== 1) pbr.roughnessFactor = clamp01(m.roughness);
     const t = m.textures ?? {};
-    const base = textureInfo(t.base_color);
+    // image textures (procedural slots are baked, see `bake`)
+    let skippedImages = false;
+    const imageTexture = (slot: TextureSlot | null | undefined): GltfTextureInfo | undefined => {
+      if (!slot || !slot.image || slot.procedural) return undefined;
+      if (!hasUv) {
+        skippedImages = true;
+        return undefined;
+      }
+      return textureInfo(slot);
+    };
+    const base = imageTexture(t.base_color);
     if (base) pbr.baseColorTexture = base;
-    if (baked?.baseColor) {
-      pbr.baseColorTexture = { index: pngTexture(baked.baseColor, `${m.name} base color`) };
-      const f = (baked.baseColorFactor ?? [1, 1, 1, 1]).map(clamp01);
+    if (b?.baseColor !== undefined) pbr.baseColorTexture = { index: b.baseColor };
+    if (b?.baseColorFactor) {
+      const f = b.baseColorFactor.map(clamp01);
       if (isDefault(f, [1, 1, 1, 1])) delete pbr.baseColorFactor;
       else pbr.baseColorFactor = f;
     }
-    const mr = t.roughness ?? t.metallic;
-    if (t.roughness && t.metallic && t.roughness.image !== t.metallic.image)
+    const imageSlot = (slot: TextureSlot | null | undefined) =>
+      slot?.image && !slot.procedural ? slot : undefined;
+    const roughImage = imageSlot(t.roughness);
+    const metalImage = imageSlot(t.metallic);
+    if (roughImage && metalImage && roughImage.image !== metalImage.image)
       warnings.push(
         `Material '${m.name}': metallic and roughness textures must share one image in glTF; using the roughness texture`,
       );
-    const mrInfo = textureInfo(mr);
+    const mrInfo = imageTexture(roughImage ?? metalImage);
     if (mrInfo) pbr.metallicRoughnessTexture = mrInfo;
-    if (baked?.metallicRoughness) {
+    if (b?.metallicRoughness !== undefined) {
       // absolute values in the texture (G = roughness, B = metallic), factors 1
-      pbr.metallicRoughnessTexture = {
-        index: pngTexture(baked.metallicRoughness, `${m.name} metallic roughness`),
-      };
+      pbr.metallicRoughnessTexture = { index: b.metallicRoughness };
       delete pbr.metallicFactor;
       delete pbr.roughnessFactor;
     }
+    // constant procedural channels (mesh without UVs)
+    if (b?.metallicFactor !== undefined) pbr.metallicFactor = clamp01(b.metallicFactor);
+    if (b?.roughnessFactor !== undefined) pbr.roughnessFactor = clamp01(b.roughnessFactor);
+    if (pbr.metallicFactor === 1) delete pbr.metallicFactor;
+    if (pbr.roughnessFactor === 1) delete pbr.roughnessFactor;
     out.pbrMetallicRoughness = pbr;
-    const normal = textureInfo(t.normal);
+    const normal = imageTexture(t.normal);
     if (normal) {
       if (m.normal_strength !== 1) normal.scale = m.normal_strength;
       out.normalTexture = normal;
     }
-    if (baked?.normal) out.normalTexture = { index: pngTexture(baked.normal, `${m.name} normal`) };
+    if (b?.normal !== undefined) out.normalTexture = { index: b.normal };
     // emission: factor in [0, 1], anything brighter goes to KHR_materials_emissive_strength
     // an emission texture replaces the emission color (like a texture plugged into Emission Color)
     const es = Math.max(0, m.emission_strength);
     const emissiveTex =
       es > 0
-        ? baked?.emissive
-          ? { index: pngTexture(baked.emissive, `${m.name} emission`) }
-          : textureInfo(t.emission)
+        ? b?.emissive !== undefined
+          ? { index: b.emissive }
+          : imageTexture(t.emission)
         : undefined;
     const ec: Vec3 = emissiveTex
       ? [1, 1, 1]
-      : [m.emission_color[0], m.emission_color[1], m.emission_color[2]];
+      : (b?.emissiveColor ?? [m.emission_color[0], m.emission_color[1], m.emission_color[2]]);
+    if (skippedImages)
+      warnings.push(
+        `Material '${m.name}': image textures need UVs, but mesh '${it.ev.name}' has none; exported without them`,
+      );
     const f: Vec3 = [Math.max(0, ec[0] * es), Math.max(0, ec[1] * es), Math.max(0, ec[2] * es)];
     const fmax = Math.max(f[0], f[1], f[2]);
     if (fmax > 0) {

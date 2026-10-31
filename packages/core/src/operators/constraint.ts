@@ -168,7 +168,8 @@ function validateParams(
       'INVALID_PARAMS',
     );
   const merged: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(clampConstraintParams(info.type, current))) if (keys.includes(k)) merged[k] = v;
+  for (const [k, v] of Object.entries(clampConstraintParams(info.type, current)))
+    if (keys.includes(k)) merged[k] = v;
   for (const [k, v] of Object.entries(patch)) if (v !== undefined) merged[k] = v;
   const res = info.schema.safeParse(merged);
   if (!res.success) {
@@ -826,11 +827,14 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
           throw new OperatorError(`'${c.name}' is a ${c.type} constraint, not FOLLOW_PATH`, 'INVALID_PARAMS');
         const curveObj = c.target ? ctx.doc.getObject(c.target) : null;
         const curve = curveObj?.type === 'CURVE' && curveObj.data ? ctx.doc.getCurve(curveObj.data) : null;
-        if (c.target && !curve) throw new OperatorError(`Target of '${c.name}' is not a curve object`, 'FAILED');
+        if (c.target && !curve)
+          throw new OperatorError(`Target of '${c.name}' is not a curve object`, 'FAILED');
         // closed exactly when the evaluated path is (e.g. a cyclic Bezier loop of only two points)
         const cyclic = !!curve && !!buildCurvePath(curve)?.cyclic;
         const duration =
-          curve && Number.isFinite(curve.path_duration) && curve.path_duration >= 1 ? curve.path_duration : 100;
+          curve && Number.isFinite(curve.path_duration) && curve.path_duration >= 1
+            ? curve.path_duration
+            : 100;
         const fixed = c.params?.use_fixed_location === true;
         let fc: FCurve;
         let end: number;

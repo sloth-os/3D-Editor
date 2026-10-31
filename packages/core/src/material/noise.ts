@@ -206,9 +206,10 @@ const vorPts = new Float64Array(27 * 3);
 /**
  * 3D Voronoi (cellular) noise: one feature point per unit cell, jittered by `randomness` (0 = cell
  * corners, 1 = uniformly random). Writes the distance to the nearest (F1) and second nearest (F2)
- * feature point under `metric`, and — when `edge` is set — the Euclidean distance to the nearest
- * cell boundary, into `out`. Returns the hash of the nearest feature point's cell (cell identity
- * for per-cell random values via `hashStream`).
+ * feature point under `metric`, and — when `edge` is set — the distance to the nearest boundary of
+ * the Euclidean Voronoi cell (always Euclidean, like Blender's Distance to Edge, so the metric never
+ * produces negative distances), into `out`. Returns the hash of the nearest feature point's cell
+ * (the Euclidean one when `edge` is set) as cell identity for per-cell values via `hashStream`.
  */
 export function voronoi3(
   x: number,
@@ -232,7 +233,10 @@ export function voronoi3(
   let d1 = Infinity;
   let d2 = Infinity;
   let h1 = 0;
-  let b1 = 0;
+  // Euclidean nearest point (squared distance), index and hash: the cell of the edge distance
+  let dE = Infinity;
+  let bE = 0;
+  let hE = 0;
   let n = 0;
   for (let k = -1; k <= 1; k++) {
     const hz = fmix32(icz + k + s);
@@ -249,23 +253,29 @@ export function voronoi3(
         const dx = px - fx;
         const dy = py - fy;
         const dz = pz - fz;
+        const e2 = dx * dx + dy * dy + dz * dz;
         let d: number;
         if (metric === METRIC_MANHATTAN) d = Math.abs(dx) + Math.abs(dy) + Math.abs(dz);
         else if (metric === METRIC_CHEBYSHEV) d = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz));
-        else d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        else d = Math.sqrt(e2);
         if (d < d1) {
           d2 = d1;
           d1 = d;
           h1 = h;
-          b1 = n;
         } else if (d < d2) d2 = d;
+        if (e2 < dE) {
+          dE = e2;
+          bE = n;
+          hE = h;
+        }
       }
     }
   }
   out[VORONOI_F1] = d1;
   out[VORONOI_F2] = d2;
   if (edge) {
-    // distance to the bisector planes between the nearest point and every other point
+    // distance to the bisector planes between the (Euclidean) nearest point and every other point
+    const b1 = bE;
     const ax = vorPts[b1 * 3];
     const ay = vorPts[b1 * 3 + 1];
     const az = vorPts[b1 * 3 + 2];
@@ -287,6 +297,8 @@ export function voronoi3(
       if (d < e) e = d;
     }
     out[VORONOI_EDGE] = e === Infinity ? 0 : Math.max(0, e);
-  } else out[VORONOI_EDGE] = 0;
+    return hE;
+  }
+  out[VORONOI_EDGE] = 0;
   return h1;
 }

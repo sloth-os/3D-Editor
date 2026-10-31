@@ -33,7 +33,10 @@ function sameValues<T>(a: ArrayLike<T> | null | undefined, b: ArrayLike<T> | nul
   return true;
 }
 
-function sameNested(a: readonly (readonly number[])[] | null, b: readonly (readonly number[])[] | null): boolean {
+function sameNested(
+  a: readonly (readonly number[])[] | null,
+  b: readonly (readonly number[])[] | null,
+): boolean {
   if (a === b) return true;
   if (!a || !b || a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) if (!sameValues(a[i], b[i])) return false;

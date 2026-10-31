@@ -91,7 +91,9 @@ export const dampedTrackSchema = z.object({
 export const lockedTrackSchema = z.object({
   track_axis: trackAxisSchema
     .default('TRACK_Y')
-    .describe('Owner axis that points towards the target (cameras and lights: TRACK_NEGATIVE_Z, they look along -Z)'),
+    .describe(
+      'Owner axis that points towards the target (cameras and lights: TRACK_NEGATIVE_Z, they look along -Z)',
+    ),
   lock_axis: lockAxisSchema
     .default('LOCK_Z')
     .describe(

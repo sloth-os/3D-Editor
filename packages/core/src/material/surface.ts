@@ -1,6 +1,6 @@
 import type { Vec3 } from '../math/types';
 import type { MaterialData, MaterialTextureChannel, ProceduralTexture } from '../doc/types';
-import { compileProcedural, sampleCompiled, type CompiledProcedural } from './procedural';
+import { compileProcedural, patternKey, sampleCompiled, type CompiledProcedural } from './procedural';
 
 /*
  * Procedural texture slots of a material, ready for evaluation by renderers (CPU rasterizer, path
@@ -52,8 +52,18 @@ export interface ProceduralSurface {
   bump: number;
   /** Some channel uses OBJECT or GENERATED mapping (needs object-space positions). */
   usesObject: boolean;
+  /** Some channel uses GENERATED mapping (needs undeformed positions, see material/orco.ts). */
+  usesGenerated: boolean;
   /** Some channel uses UV mapping. */
   usesUv: boolean;
+  /**
+   * Distinct patterns of the channels (one representative texture per `patternKey`): renderers can
+   * evaluate each once per shading point (`samplePattern`) and colour every channel from it
+   * (`rampPattern` with `patternOf`), e.g. when one noise drives colour, roughness and bump.
+   */
+  patterns: CompiledProcedural[];
+  /** Index into `patterns` of every channel's texture (−1 for channels without one). */
+  patternOf: Record<MaterialTextureChannel, number>;
 }
 
 /** Compiles the procedural slots of a material; null when it has none. Never throws. */
@@ -72,17 +82,30 @@ export function proceduralSurface(m: MaterialData | null | undefined): Procedura
     alpha: get('alpha'),
     bump: 0,
     usesObject: false,
+    usesGenerated: false,
     usesUv: false,
+    patterns: [],
+    patternOf: { base_color: -1, metallic: -1, roughness: -1, normal: -1, emission: -1, alpha: -1 },
   };
   if (s.normal) {
     const strength =
       typeof m.normal_strength === 'number' && Number.isFinite(m.normal_strength) ? m.normal_strength : 1;
     s.bump = s.normal.bumpDistance * strength;
   }
-  for (const c of [s.base_color, s.metallic, s.roughness, s.normal, s.emission, s.alpha]) {
+  const keys: string[] = [];
+  for (const ch of MATERIAL_TEXTURE_CHANNELS) {
+    const c = s[ch];
     if (!c) continue;
     if (c.mapping === 2) s.usesUv = true;
     else s.usesObject = true;
+    if (c.mapping === 0) s.usesGenerated = true;
+    const key = patternKey(c);
+    let i = keys.indexOf(key);
+    if (i < 0) {
+      i = keys.push(key) - 1;
+      s.patterns.push(c);
+    }
+    s.patternOf[ch] = i;
   }
   return s;
 }
@@ -124,7 +147,8 @@ const tmp = new Float64Array(4);
  * Mikkelsen's surface-gradient formulation with explicit offsets, as the viewport shader does:
  * `c` is the texture coordinate at the shading point, `dcx`/`dcy` its change along two small
  * surface offsets `dpx`/`dpy` (e.g. to the neighbouring pixels). Writes the unit result to `out`
- * (`n` unchanged when the offsets are degenerate).
+ * (`n` unchanged when the offsets are degenerate). `height` is the height at `c` when the caller
+ * already has it (e.g. from a pattern shared with other channels); it is sampled otherwise.
  */
 export function bumpNormal(
   tex: CompiledProcedural,
@@ -136,9 +160,14 @@ export function bumpNormal(
   dpy: Readonly<Vec3>,
   n: Readonly<Vec3>,
   out: Vec3 | Float64Array,
+  height?: number,
 ): void {
-  sampleCompiled(tex, c[0], c[1], c[2], tmp);
-  const h0 = tmp[0];
+  let h0: number;
+  if (height !== undefined) h0 = height;
+  else {
+    sampleCompiled(tex, c[0], c[1], c[2], tmp);
+    h0 = tmp[0];
+  }
   sampleCompiled(tex, c[0] + dcx[0], c[1] + dcx[1], c[2] + dcx[2], tmp);
   const dhx = (tmp[0] - h0) * distance;
   sampleCompiled(tex, c[0] + dcy[0], c[1] + dcy[1], c[2] + dcy[2], tmp);

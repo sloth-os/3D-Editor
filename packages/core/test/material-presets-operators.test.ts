@@ -8,6 +8,8 @@ import {
   createOperatorRegistry,
   getMaterialPreset,
   presetMaterialValues,
+  proceduralSurface,
+  sampleProcedural,
   type OperatorContext,
   type ProceduralTexture,
 } from '../src';
@@ -131,6 +133,31 @@ describe('material.preset_apply', () => {
     expect(run('material.preset_apply', { preset: 'adamantium' }).ok).toBe(false);
     expect(run('material.preset_apply', { preset: 'gold', objects: ['Nope'] }).error).toMatch(/not found/);
     expect(run('material.preset_apply', { preset: 'gold', material: 'Nope' }).error).toMatch(/not found/);
+  });
+
+  it('warns about scaled users of OBJECT-mapped procedural presets (pattern stretched by the scale)', () => {
+    const { doc, run, reports } = setup();
+    const wall = doc.addObject({
+      type: 'MESH',
+      name: 'Wall',
+      data: doc.addMesh('Wall', createCube({ size: 2 })),
+      scale: [5, 0.1, 1.5],
+    });
+    const unit = doc.addObject({ type: 'MESH', name: 'Block', data: doc.addMesh('Block', createCube()) });
+    expect(run('material.preset_apply', { preset: 'brick', objects: [wall, unit] }).ok).toBe(true);
+    const warnings = reports.filter((r) => r.level === 'WARNING');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toMatch(/Object 'Wall' is scaled by \(5, 0\.1, 1\.5\)/);
+    expect(warnings[0].message).toMatch(/object\.transform_apply/);
+    // presets without OBJECT-mapped textures (or unscaled objects) do not warn
+    reports.length = 0;
+    run('material.preset_apply', { preset: 'gold', objects: [wall] });
+    run('material.preset_apply', { preset: 'wood', objects: [unit] });
+    expect(reports.filter((r) => r.level === 'WARNING')).toEqual([]);
+    // the description tells agents about it
+    const { reg } = setup();
+    const info = reg.describe().find((d) => d.id === 'material.preset_apply')!;
+    expect(info.description).toMatch(/before the object's scale/);
   });
 
   it('is one undo step and survives a snapshot round trip', () => {
@@ -260,6 +287,82 @@ describe('material.procedural_set', () => {
     expect(r.ok).toBe(true);
     expect(prepared.doc.getMaterial(id2)!.textures.normal!.image).toBe('n');
     expect(prepared.reports.some((x) => /no procedural texture/.test(x.message))).toBe(true);
+  });
+
+  it('keeps the image of a slot while a procedural is set and restores it when cleared', () => {
+    // regression: setting a procedural used to drop the image, so clearing deleted the whole slot
+    const { doc, run } = setup();
+    const id = doc.addMaterial({
+      name: 'M',
+      textures: { base_color: { image: 'IMG1', scale: [3, 2], offset: [0.5, 0] } },
+    });
+    expect(run('material.procedural_set', { material: 'M', procedural: { type: 'NOISE' } }).ok).toBe(true);
+    let slot = doc.getMaterial(id)!.textures.base_color!;
+    expect(slot.image).toBe('IMG1');
+    expect(slot.procedural?.type).toBe('NOISE');
+    expect(slot.scale).toEqual([3, 2]);
+    // the procedural takes precedence in every renderer (and in the glTF bake)
+    expect(proceduralSurface(doc.getMaterial(id))!.base_color).not.toBeNull();
+    expect(run('material.procedural_set', { material: 'M', procedural: null }).ok).toBe(true);
+    slot = doc.getMaterial(id)!.textures.base_color!;
+    expect(slot.image).toBe('IMG1');
+    expect(slot.procedural ?? null).toBeNull();
+    expect(slot.scale).toEqual([3, 2]);
+    expect(slot.offset).toEqual([0.5, 0]);
+  });
+
+  it('accepts an inverted ramp (ramp_low > ramp_high) and evaluates it inverted', () => {
+    const { doc, run } = setup();
+    doc.addMaterial({ name: 'M' });
+    const r = run('material.procedural_set', {
+      material: 'M',
+      procedural: { type: 'GRADIENT', ramp_low: 1, ramp_high: 0 },
+    });
+    expect(r.ok).toBe(true);
+    const v = [0.1, 0.5, 0.9].map((x) => sampleProcedural(r.result!.procedural, [x, 0, 0])[0]);
+    expect(v[0]).toBeCloseTo(0.9, 9);
+    expect(v[1]).toBeCloseTo(0.5, 9);
+    expect(v[2]).toBeCloseTo(0.1, 9);
+  });
+
+  it('documents type params with meaning, kind, range and default, and the real type defaults', () => {
+    // regression: params were listed as key=default only, and `detail` claimed a default of 2 for all
+    const { reg } = setup();
+    const info = reg.describe().find((d) => d.id === 'material.procedural_set')!;
+    const props = (
+      info.parameters as {
+        properties: { procedural: { anyOf: { properties: Record<string, { description: string }> }[] } };
+      }
+    ).properties.procedural.anyOf[0].properties;
+    const params = props.params.description;
+    expect(params).toContain(
+      'mortar_size (number in [0, 0.5], default 0.02): mortar width on each side of a joint',
+    );
+    expect(params).toContain('feature (one of F1|F2|DISTANCE_TO_EDGE|CELL, default F1)');
+    expect(params).toContain('offset_frequency (integer in [1, 99], default 2)');
+    expect(params).toContain('bump_distance (number in [0, 10], default 0.1): normal channel only');
+    for (const t of ['NOISE', 'VORONOI', 'CHECKER', 'GRADIENT', 'WAVE', 'BRICK', 'MARBLE', 'WOOD', 'MAGIC'])
+      expect(params).toContain(`${t}: `);
+    expect(props.detail.description).toContain('Type defaults: 2 (VORONOI 0, BRICK 0, MARBLE 4)');
+    expect(props.scale.description).toContain('Type defaults: 5 (GRADIENT 1, MARBLE 2, WOOD 8)');
+    expect(props.distortion.description).toContain('MARBLE 2, WOOD 0.6, MAGIC 1');
+    // OBJECT mapping is documented as object space before the object's scale
+    expect(props.mapping.description).toMatch(/before the object's scale/);
+  });
+
+  it('warns when a channel has no visible effect (OPAQUE alpha, zero emission strength)', () => {
+    const { doc, run, reports } = setup();
+    doc.addMaterial({ name: 'M' });
+    expect(run('material.procedural_set', { material: 'M', channel: 'alpha', procedural: {} }).ok).toBe(true);
+    expect(reports.some((r) => r.level === 'WARNING' && /blend_method OPAQUE/.test(r.message))).toBe(true);
+    expect(run('material.procedural_set', { material: 'M', channel: 'emission', procedural: {} }).ok).toBe(true);
+    expect(reports.some((r) => r.level === 'WARNING' && /emission_strength 0/.test(r.message))).toBe(true);
+    // no warnings once the material can show them
+    reports.length = 0;
+    doc.addMaterial({ name: 'Clip', blend_method: 'CLIP', emission_strength: 2 });
+    run('material.procedural_set', { material: 'Clip', channel: 'alpha', procedural: {} });
+    run('material.procedural_set', { material: 'Clip', channel: 'emission', procedural: {} });
+    expect(reports.filter((r) => r.level === 'WARNING')).toEqual([]);
   });
 
   it('describes every parameter for AI agents', () => {

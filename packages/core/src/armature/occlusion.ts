@@ -7,8 +7,15 @@
  * the bone, do not block. Queries stop at the first blocking triangle (any hit), so a vertex that
  * cannot see a bone costs about as much as one that can.
  *
+ * The ray/triangle test is watertight (the ray is sheared onto a coordinate axis and every edge
+ * is evaluated with the same operands for both triangles sharing it, after Woop, Benthin and Wald,
+ * "Watertight Ray/Triangle Intersection", 2013): a ray through a shared edge or vertex hits at
+ * least one of the triangles around it, so rays never slip through a closed surface, even when
+ * they pass exactly through its vertices (common for meshes built from the same rings).
+ *
  * The triangles are kept in a bounding volume hierarchy built with median splits along the
- * longest axis of the triangle centroids (quickselect, O(n log n)).
+ * longest axis of the triangle centroids (quickselect, O(n log n)); the boxes are inflated by a
+ * tiny relative margin (1e-12) so rounding never skips a box that the ray touches.
  */
 
 /** Triangles per leaf. */
@@ -144,13 +151,17 @@ export class FacingOccluder {
         if (z > z1) z1 = z;
       }
     }
+    // inflated a little, so the slab test never misses a box by rounding
+    const px = (Math.abs(x0) + Math.abs(x1)) * 1e-12;
+    const py = (Math.abs(y0) + Math.abs(y1)) * 1e-12;
+    const pz = (Math.abs(z0) + Math.abs(z1)) * 1e-12;
     const b = node * 6;
-    this.bounds[b] = x0;
-    this.bounds[b + 1] = y0;
-    this.bounds[b + 2] = z0;
-    this.bounds[b + 3] = x1;
-    this.bounds[b + 4] = y1;
-    this.bounds[b + 5] = z1;
+    this.bounds[b] = x0 - px;
+    this.bounds[b + 1] = y0 - py;
+    this.bounds[b + 2] = z0 - pz;
+    this.bounds[b + 3] = x1 + px;
+    this.bounds[b + 4] = y1 + py;
+    this.bounds[b + 5] = z1 + pz;
   }
 
   /** Reorders order[s..e) so that position k holds the k-th smallest centroid along `axis`. */
@@ -183,7 +194,16 @@ export class FacingOccluder {
    * True when a triangle whose front faces the ray crosses the segment o + t·d, tMin < t < tMax
    * (t is relative to `d`, which need not be normalised).
    */
-  blocked(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, tMin: number, tMax: number) {
+  blocked(
+    ox: number,
+    oy: number,
+    oz: number,
+    dx: number,
+    dy: number,
+    dz: number,
+    tMin: number,
+    tMax: number,
+  ): boolean {
     if (this.nodes === 0) return false;
     const dl = Math.hypot(dx, dy, dz);
     if (!(dl > 0) || !Number.isFinite(dl)) return false;
@@ -195,6 +215,22 @@ export class FacingOccluder {
     const iy = 1 / dy;
     const iz = 1 / dz;
     const facing = FACING * dl;
+    // watertight test setup: kz = dominant axis of the ray, (kx, ky) the other two; the shear
+    // (sx, sy) maps the ray onto the kz axis and sz scales it to unit speed along it
+    const dir = [dx, dy, dz];
+    const org = [ox, oy, oz];
+    const adx = Math.abs(dx);
+    const ady = Math.abs(dy);
+    const adz = Math.abs(dz);
+    const kz = adx >= ady && adx >= adz ? 0 : ady >= adz ? 1 : 2;
+    const kx = (kz + 1) % 3;
+    const ky = (kz + 2) % 3;
+    const sx = dir[kx] / dir[kz];
+    const sy = dir[ky] / dir[kz];
+    const sz = 1 / dir[kz];
+    const okx = org[kx];
+    const oky = org[ky];
+    const okz = org[kz];
     const stack = this.stack;
     let sp = 0;
     stack[sp++] = 0;
@@ -238,29 +274,24 @@ export class FacingOccluder {
         const pa = T[t * 3] * 3;
         const pb = T[t * 3 + 1] * 3;
         const pc = T[t * 3 + 2] * 3;
-        const e1x = P[pb] - P[pa];
-        const e1y = P[pb + 1] - P[pa + 1];
-        const e1z = P[pb + 2] - P[pa + 2];
-        const e2x = P[pc] - P[pa];
-        const e2y = P[pc + 1] - P[pa + 1];
-        const e2z = P[pc + 2] - P[pa + 2];
-        const hx = dy * e2z - dz * e2y;
-        const hy = dz * e2x - dx * e2z;
-        const hz = dx * e2y - dy * e2x;
-        const det = e1x * hx + e1y * hy + e1z * hz;
+        // vertices relative to the origin, sheared so the ray runs along the kz axis
+        const az = P[pa + kz] - okz;
+        const bz = P[pb + kz] - okz;
+        const cz = P[pc + kz] - okz;
+        const ax = P[pa + kx] - okx - sx * az;
+        const ay = P[pa + ky] - oky - sy * az;
+        const bx = P[pb + kx] - okx - sx * bz;
+        const by = P[pb + ky] - oky - sy * bz;
+        const cx = P[pc + kx] - okx - sx * cz;
+        const cy = P[pc + ky] - oky - sy * cz;
+        // edge functions: a shared edge gets exactly opposite values in its two triangles
+        const u = cx * by - cy * bx;
+        const v = ax * cy - ay * cx;
+        const w = bx * ay - by * ax;
+        if ((u < 0 || v < 0 || w < 0) && (u > 0 || v > 0 || w > 0)) continue;
+        const det = u + v + w;
         if (det === 0 || !Number.isFinite(det)) continue;
-        const inv = 1 / det;
-        const sx = ox - P[pa];
-        const sy = oy - P[pa + 1];
-        const sz = oz - P[pa + 2];
-        const u = (sx * hx + sy * hy + sz * hz) * inv;
-        if (u < 0 || u > 1) continue;
-        const qx = sy * e1z - sz * e1y;
-        const qy = sz * e1x - sx * e1z;
-        const qz = sx * e1y - sy * e1x;
-        const v = (dx * qx + dy * qy + dz * qz) * inv;
-        if (v < 0 || u + v > 1) continue;
-        const hit = (e2x * qx + e2y * qy + e2z * qz) * inv;
+        const hit = ((u * az + v * bz + w * cz) * sz) / det;
         if (hit > tMin && hit < tMax) return true;
       }
     }

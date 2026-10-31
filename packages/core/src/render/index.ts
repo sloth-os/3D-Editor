@@ -6,6 +6,7 @@ import type { MaterialData, WorldSettings } from '../doc/types';
 import type { MeshData } from '../mesh/types';
 import { meshBounds } from '../mesh/types';
 import { proceduralSurface } from '../material/surface';
+import { evaluatedOrco } from '../material/orco';
 import { prepareSky, sampleSkyPixel, skyIrradianceSH, skySun, type SkyModel } from './sky';
 import { SceneEvaluator, type EvaluatedScene } from '../eval/evaluate';
 import { evaluatedBounds } from '../io/common';
@@ -348,6 +349,7 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
   const W = width * k;
   const H = height * k;
   const r = new Rasterizer(W, H, view);
+  r.shadingBlock = k;
   const solid = opts.shading === 'SOLID';
   r.mode = solid ? SHADE_SOLID : SHADE_MATERIAL;
   const world = scene.world;
@@ -402,8 +404,13 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       fallback = surfaceFromMaterial(null, hasColors);
     }
     if (mats.some((m) => m.procedural)) {
-      // GENERATED texture space: bounds of the base (pre-modifier) mesh
-      r.drawMesh(mesh, o.worldMatrix, mats, fallback, texSpaceOf(o.object.baseMesh ?? mesh, texSpaces));
+      // GENERATED texture space: bounds of the base (pre-modifier) mesh; coordinates from the
+      // undeformed positions (orco) so textures stick to deformed surfaces
+      const ts = texSpaceOf(o.object.baseMesh ?? mesh, texSpaces);
+      const orco = mats.some((m) => m.procedural?.usesGenerated)
+        ? evaluatedOrco(doc, scene, o.object, true)
+        : null;
+      r.drawMesh(mesh, o.worldMatrix, mats, fallback, ts && { min: ts.min, max: ts.max, orco });
       continue;
     }
     r.drawMesh(mesh, o.worldMatrix, mats, fallback);

@@ -304,7 +304,12 @@ function formatPath(segs: readonly PathSegment[]): string {
  * particle system `name` (`particle_systems["name"]…`), and retargets driver variables reading it,
  * so animation follows a renamed system like in Blender.
  */
-function retargetSystemAnimation(ctx: OperatorContext, ownerId: string, name: string, newName: string | null) {
+function retargetSystemAnimation(
+  ctx: OperatorContext,
+  ownerId: string,
+  name: string,
+  newName: string | null,
+) {
   const rename = (path: string): string | null | undefined => {
     let segs: PathSegment[];
     try {
@@ -417,7 +422,9 @@ function isScatterSource(o: ObjectData): boolean {
 
 /**
  * Hidden linked duplicate of `src` in collection `cid`: same object data, materials, modifiers,
- * constraints, parent and transform (Blender Alt+D), so it instances like the original.
+ * constraints, parent and transform (Blender Alt+D), so it instances like the original. It gets no
+ * rigid body: every rigid body is simulated whether hidden or not, and a copy overlapping the
+ * original would push it away.
  */
 function linkedDuplicate(doc: SceneDoc, src: ObjectData, cid: string): string {
   const { id: _id, ...rest } = cloneJson(src);
@@ -426,6 +433,7 @@ function linkedDuplicate(doc: SceneDoc, src: ObjectData, cid: string): string {
     collection: cid,
     hide_viewport: true,
     hide_render: true,
+    rigid_body: null,
     modifiers: (rest.modifiers ?? []).map((m) => ({ ...m, id: newId() })),
     constraints: (rest.constraints ?? []).map((c) => ({ ...c, id: newId() })),
     particle_systems: (rest.particle_systems ?? []).map((s) => ({ ...s, id: newId() })),
@@ -950,7 +958,9 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
           const first = sources[0].collection;
           const members = first === ROOT_COLLECTION_ID ? [] : collectionMembers(doc, first);
           const reuse =
-            members.length === ids.length && members.every((m) => ids.includes(m.id)) && !!doc.getCollection(first);
+            members.length === ids.length &&
+            members.every((m) => ids.includes(m.id)) &&
+            !!doc.getCollection(first);
           if (reuse) {
             collectionId = first;
             const use = usedBy(sources[0]);
@@ -984,7 +994,8 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
                 if (p.hide_sources) hidden.push(o.id);
               }
             }
-            if (p.hide_sources) doc.updateCollection(collectionId, { hide_viewport: true, hide_render: true });
+            if (p.hide_sources)
+              doc.updateCollection(collectionId, { hide_viewport: true, hide_render: true });
           }
           settings = { ...settings, instance_collection: collectionId };
         } else if (given && p.hide_sources) {

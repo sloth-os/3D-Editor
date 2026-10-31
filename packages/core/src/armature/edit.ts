@@ -87,7 +87,10 @@ const RESERVED_NAMES: readonly string[] = Object.getOwnPropertyNames(Object.prot
 
 /** Unique bone name within an armature (Blender style "Bone", "Bone.001", …). */
 export function uniqueBoneName(bones: readonly BoneData[], base: string, except?: string): string {
-  return uniqueName(base, new Set([...RESERVED_NAMES, ...bones.map((b) => b.name).filter((n) => n !== except)]));
+  return uniqueName(
+    base,
+    new Set([...RESERVED_NAMES, ...bones.map((b) => b.name).filter((n) => n !== except)]),
+  );
 }
 
 function renameInConstraints(

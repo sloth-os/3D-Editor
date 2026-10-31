@@ -140,9 +140,9 @@ describe('object.constraint_add', () => {
     const c = doc.addObject({ type: 'EMPTY', name: 'C', location: [0, 5, 0] });
     const evaluatorErrors = (id: string) =>
       new SceneEvaluator(doc).evaluate(1, { noPhysics: true }).byId.get(id)!.constraintErrors;
-    expect(run('object.constraint_add', { object: 'A', type: 'COPY_LOCATION', target: 'B' }).result.errors).toEqual(
-      [],
-    );
+    expect(
+      run('object.constraint_add', { object: 'A', type: 'COPY_LOCATION', target: 'B' }).result.errors,
+    ).toEqual([]);
     const r = run('object.constraint_add', { object: 'B', type: 'COPY_LOCATION', target: 'A' });
     const cycleB = "Target 'A' is part of a dependency cycle: B [Copy Location] → A [Copy Location] → B";
     const cycleA = "Target 'B' is part of a dependency cycle: A [Copy Location] → B [Copy Location] → A";
@@ -434,7 +434,11 @@ describe('baking animated objects and parameter ranges', () => {
       params: { use_fixed_location: true, offset_factor: 0.25 },
     });
     expectVec(loc(world(o)), [2.5, 0, 0]);
-    const bad = run('constraint.update', { object: 'O', constraint: 'Follow Path', params: { offset_factor: 1.5 } });
+    const bad = run('constraint.update', {
+      object: 'O',
+      constraint: 'Follow Path',
+      params: { offset_factor: 1.5 },
+    });
     expect(bad.ok).toBe(false);
     expect(bad.error).toMatch(/offset_factor/);
     expect(constraints(o)[0].params.offset_factor).toBe(0.25);
@@ -443,7 +447,11 @@ describe('baking animated objects and parameter ranges', () => {
     doc.updateObject(o, { constraints: [{ ...c, params: { ...c.params, offset_factor: 1.5 } }] });
     expectVec(loc(world(o)), [10, 0, 0]);
     // and does not block unrelated changes
-    const ok = run('constraint.update', { object: 'O', constraint: 'Follow Path', params: { use_curve_radius: true } });
+    const ok = run('constraint.update', {
+      object: 'O',
+      constraint: 'Follow Path',
+      params: { use_curve_radius: true },
+    });
     expect(ok.ok).toBe(true);
     expect(constraints(o)[0].params.offset_factor).toBe(1);
     // animated values are clamped as well
@@ -627,7 +635,11 @@ describe('Follow Path operators', () => {
       target: 'Ring',
       params: { use_fixed_location: true },
     });
-    const r2 = run('constraint.followpath_path_animate', { object: 'P', constraint: 'Follow Path', length: 40 });
+    const r2 = run('constraint.followpath_path_animate', {
+      object: 'P',
+      constraint: 'Follow Path',
+      length: 40,
+    });
     expect(r2.result.extrapolation).toBe('CYCLIC');
     const atP = (frame: number) => {
       ctx.state.frame = frame;
@@ -681,7 +693,8 @@ describe('object.track_set and object.visual_transform_apply', () => {
     const r = run('object.track_set', { type: 'DAMPTRACK' });
     expect(r.ok).toBe(true);
     const errors = Object.fromEntries(r.result.constraints.map((c: any) => [c.object, c.errors]));
-    const cycle = "Target 'Child' is part of a dependency cycle: Parent [AutoTrack] → Child [parent] → Parent";
+    const cycle =
+      "Target 'Child' is part of a dependency cycle: Parent [AutoTrack] → Child [parent] → Parent";
     expect(errors).toEqual({ [parent]: [cycle], [other]: [] });
     expect(reports).toContain(`WARNING: Parent AutoTrack: ${cycle}`);
   });
@@ -809,10 +822,14 @@ describe('read-only constraint info operators', () => {
     const damped = run('constraint.type_list', { type: 'DAMPED_TRACK' }).result.types[0];
     expect(damped.description).toMatch(/TRACK_NEGATIVE_Z/);
     expect(damped.description).not.toMatch(/spotlight/);
-    expect(damped.parameters.properties.track_axis.description).toMatch(/TRACK_NEGATIVE_Z for cameras and lights/);
+    expect(damped.parameters.properties.track_axis.description).toMatch(
+      /TRACK_NEGATIVE_Z for cameras and lights/,
+    );
     const locked = run('constraint.type_list', { type: 'LOCKED_TRACK' }).result.types[0];
     expect(locked.description).toMatch(/TRACK_NEGATIVE_Z with lock_axis LOCK_Y/);
-    expect(locked.parameters.properties.track_axis.description).toMatch(/cameras and lights: TRACK_NEGATIVE_Z/);
+    expect(locked.parameters.properties.track_axis.description).toMatch(
+      /cameras and lights: TRACK_NEGATIVE_Z/,
+    );
     const lamp = doc.addObject({ type: 'LIGHT', name: 'Spot', location: [0, 0, 5] });
     doc.addObject({ type: 'EMPTY', name: 'Goal', location: [3, 0, 0] });
     run('object.constraint_add', { object: 'Spot', type: 'DAMPED_TRACK', target: 'Goal' });
@@ -820,7 +837,11 @@ describe('read-only constraint info operators', () => {
       'INFO: Damped Track: lights look along their -Z axis but track_axis is TRACK_Y; use params.track_axis = ' +
         '"TRACK_NEGATIVE_Z" to aim it at the target',
     );
-    run('constraint.update', { object: 'Spot', constraint: 'Damped Track', params: { track_axis: 'TRACK_NEGATIVE_Z' } });
+    run('constraint.update', {
+      object: 'Spot',
+      constraint: 'Damped Track',
+      params: { track_axis: 'TRACK_NEGATIVE_Z' },
+    });
     const m = world(lamp);
     const len = Math.hypot(3, 5);
     expectVec([-m[8], -m[9], -m[10]], [3 / len, 0, -5 / len]); // the light shines at the goal

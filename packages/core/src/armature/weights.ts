@@ -2,8 +2,8 @@ import type { Vec3 } from '../math/types';
 import type { MeshData } from '../mesh/types';
 import { vertexCount } from '../mesh/types';
 import { triangulateMesh } from '../mesh/triangulate';
-import { Bvh } from '../modifiers/bvh';
 import { vertexNormalsOf } from '../modifiers/util';
+import { FacingOccluder } from './occlusion';
 import { envelopeFactor } from './skinning';
 import { SparseLDL, nestedDissectionOrder } from './sparse';
 
@@ -11,15 +11,19 @@ import { SparseLDL, nestedDissectionOrder } from './sparse';
  * Automatic skin weights.
  *
  * "Bone heat" (like Blender's With Automatic Weights): every vertex is heated by its nearest
- * bone that it can "see" (the segment from the vertex to the closest point of the bone does not
- * cross the mesh), with a strength falling off with the squared distance, and the heat of each
- * bone diffuses over the surface. Per bone we solve the screened Poisson problem
+ * bone(s) if it can "see" them, with a strength falling off with the squared distance, and the
+ * heat of each bone diffuses over the surface. Distances are measured to the closest point of the
+ * bone and grow when the vertex normal faces the bone (a bone in front of the surface is not the
+ * one inside it). A bone is hidden when the segment from the vertex to that point crosses a
+ * triangle whose front faces the vertex; back faces never hide (the inner wall of a double-walled
+ * sleeve does not hide the bone inside it). A vertex whose nearest bones are hidden gets no heat
+ * and takes its weights from its neighbours. Per bone we solve the screened Poisson problem
  *
  *   (L + A·H) w = A·H·p
  *
  * with L the (clamped) cotangent Laplacian of the surface, A the vertex areas, H the heat
- * strengths (1 / distance²) and p the indicator of "this bone is the vertex's nearest visible
- * bone". The solutions form a partition of unity; tiny weights are dropped and the rest
+ * strengths (1 / distance²) and p the indicator of "this bone is a visible nearest bone of the
+ * vertex". The solutions form a partition of unity; tiny weights are dropped and the rest
  * renormalised. Everything is scale invariant and deterministic.
  */
 
@@ -307,6 +311,23 @@ export function computeHeatWeights(
   const warnings: string[] = [];
   const out = bones.map(() => new Float32Array(n));
   if (n === 0 || nb === 0) return { weights: out, warnings };
+  // bones with invalid coordinates get no weights (the others are computed without them)
+  const valid = bones.map((b) => [...b.head, ...b.tail].every((x) => Number.isFinite(x)));
+  if (valid.includes(false)) {
+    const kept = bones.flatMap((_, j) => (valid[j] ? [j] : []));
+    const res = computeHeatWeights(
+      mesh,
+      kept.map((j) => bones[j]),
+      opts,
+    );
+    kept.forEach((j, k) => out[j].set(res.weights[k]));
+    const names = bones.flatMap((b, j) => (valid[j] ? [] : [b.name]));
+    warnings.push(
+      `bones with invalid head/tail coordinates get no weights: ${names.join(', ')}`,
+      ...res.warnings,
+    );
+    return { weights: out, warnings };
+  }
   const P = Float64Array.from(mesh.positions);
   let invalid = 0;
   for (let i = 0; i < P.length; i++)
@@ -428,21 +449,31 @@ export function computeHeatWeights(
     if (ra !== rb) comp[Math.max(ra, rb)] = Math.min(ra, rb);
   }
 
-  // ---- heat sources: nearest visible bone(s)
+  // ---- heat sources (Blender's rule): the bone(s) at the smallest distance, if the vertex can
+  // see them. A vertex whose nearest bones are hidden behind the surface gets no heat of its own
+  // and takes its weights from its neighbours through the diffusion. Only the nearest bones are
+  // ray tested, so hidden vertices cost no more than visible ones.
   const normals = vertexNormalsOf({ ...mesh, positions: Array.from(P) });
-  const bvh = tris.length ? new Bvh(P, tris, 3) : null;
+  const occluder = tris.length ? new FacingOccluder(P, tris) : null;
+  // vertices outside every face (loose vertices and edges) always see the bones (as in Blender)
+  const onSurface = new Uint8Array(n);
+  for (let i = 0; i < tris.length; i++) onSurface[tris[i]] = 1;
   const closest = new Float64Array(nb * 3);
   const dist = new Float64Array(nb);
-  const order = new Int32Array(nb);
   const heat = new Float64Array(n);
-  const source = new Int32Array(n * Math.min(nb, 4)).fill(-1);
   const maxSources = Math.min(nb, 4);
+  const source = new Int32Array(n * maxSources).fill(-1);
   const sourceCount = new Int32Array(n);
-  /** Fills dist/closest for vertex v; returns false when every distance is invalid. */
-  const measure = (v: number) => {
+  /** Fills `dist`/`closest` for vertex v and returns the smallest distance. */
+  const measure = (v: number): number => {
     const x = P[v * 3];
     const y = P[v * 3 + 1];
     const z = P[v * 3 + 2];
+    const nx = normals[v * 3];
+    const ny = normals[v * 3 + 1];
+    const nz = normals[v * 3 + 2];
+    const nl = Math.hypot(nx, ny, nz);
+    let min = Infinity;
     for (let j = 0; j < nb; j++) {
       const b = bones[j];
       const t = segmentParam(x, y, z, b.head, b.tail);
@@ -456,19 +487,17 @@ export function computeHeatWeights(
       const dy = y - cy;
       const dz = z - cz;
       const d = Math.hypot(dx, dy, dz);
-      // bones behind the surface (normal pointing towards the bone) count as much further away
-      const nl = Math.hypot(normals[v * 3], normals[v * 3 + 1], normals[v * 3 + 2]);
-      const cos =
-        d > 0 && nl > 0
-          ? (dx * normals[v * 3] + dy * normals[v * 3 + 1] + dz * normals[v * 3 + 2]) / (d * nl)
-          : 1;
-      dist[j] = Math.max(d, minDist) / (0.5 * (cos + 1.001));
-      order[j] = j;
+      // bones in front of the surface (normal pointing towards the bone) count as much further away
+      const cos = d > 0 && nl > 0 ? (dx * nx + dy * ny + dz * nz) / (d * nl) : 1;
+      const dj = Math.max(d, minDist) / (0.5 * (cos + 1.001));
+      dist[j] = dj;
+      if (dj < min) min = dj;
     }
-    order.sort((a, b) => dist[a] - dist[b] || a - b);
+    return min;
   };
+  /** Whether the segment from vertex v to the closest point of bone j crosses no front face. */
   const visible = (v: number, j: number): boolean => {
-    if (!bvh) return true;
+    if (!occluder || !onSurface[v]) return true;
     const x = P[v * 3];
     const y = P[v * 3 + 1];
     const z = P[v * 3 + 2];
@@ -476,34 +505,25 @@ export function computeHeatWeights(
     const dy = closest[j * 3 + 1] - y;
     const dz = closest[j * 3 + 2] - z;
     if (Math.hypot(dx, dy, dz) < minDist) return true;
-    return !bvh.raycast(x, y, z, dx, dy, dz, 1e-6, 1 - 1e-6);
+    return !occluder.blocked(x, y, z, dx, dy, dz, 1e-5, 1 - 1e-5);
   };
-  const assign = (v: number, useVisibility: boolean): boolean => {
-    measure(v);
-    let best = -1;
-    for (let k = 0; k < nb; k++) {
-      const j = order[k];
-      if (!useVisibility || visible(v, j)) {
-        best = j;
-        break;
-      }
-    }
-    if (best < 0) return false;
-    const limit = dist[best] * (1 + 1e-4);
+  /** Heat sources of vertex v: its nearest bones (visible ones only with `useVisibility`). */
+  const assign = (v: number, useVisibility: boolean): void => {
+    const min = measure(v);
+    const limit = min * (1 + 1e-4);
     let count = 0;
-    for (let k = 0; k < nb && count < maxSources; k++) {
-      const j = order[k];
-      if (dist[j] > limit) break;
-      if (j !== best && useVisibility && !visible(v, j)) continue;
+    for (let j = 0; j < nb && count < maxSources; j++) {
+      if (dist[j] > limit) continue;
+      if (useVisibility && !visible(v, j)) continue;
       source[v * maxSources + count++] = j;
     }
     sourceCount[v] = count;
-    heat[v] = count / (dist[best] * dist[best]);
-    return true;
+    heat[v] = count / (min * min);
   };
-  let hidden = 0;
-  for (let v = 0; v < n; v++) if (!assign(v, true)) hidden++;
-  // components without any heat source would have no solution: use the nearest bones there
+  for (let v = 0; v < n; v++) assign(v, true);
+  // A part of the mesh (connected component) without any heat source has no solution; Blender
+  // leaves it unbound. Its vertices use their nearest bones instead (visible or not), e.g. a
+  // clothing layer enclosing the body in the same mesh.
   const compHeat = new Map<number, number>();
   for (let v = 0; v < n; v++) compHeat.set(find(v), (compHeat.get(find(v)) ?? 0) + heat[v]);
   let rescued = 0;
@@ -512,9 +532,10 @@ export function computeHeatWeights(
     assign(v, false);
     rescued++;
   }
-  if (hidden)
+  if (rescued)
     warnings.push(
-      `${hidden} vertices could not see any bone${rescued ? ` (${rescued} use their nearest bone instead)` : ''}`,
+      `${rescued} vertices are in parts of the mesh that cannot see their nearest bones (e.g. a layer ` +
+        'enclosing another part): they were bound to their nearest bone instead',
     );
 
   // ---- solve one screened Poisson problem per bone. The matrix is the same for every bone: it

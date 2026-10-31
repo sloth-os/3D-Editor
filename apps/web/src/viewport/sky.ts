@@ -7,6 +7,7 @@ import {
   type MeshData,
   type WorldSettings,
 } from '@3d-editor/core';
+import { setProceduralScene } from './materials';
 
 /*
  * World sky and mist in the viewport.
@@ -114,9 +115,11 @@ export class ViewportSky {
 
   /**
    * Updates environment, background, sun light and fog for a shading mode. Call after the engine
-   * set its own environment/background: the sky overrides them in Rendered shading.
+   * set its own environment/background (on every sync): the sky overrides them in Rendered shading.
+   * Also publishes the evaluated scene for the procedural materials (`setProceduralScene`).
    */
   apply(scene: THREE.Scene, ev: EvaluatedScene, shading: string, castShadows: boolean): void {
+    setProceduralScene(scene, ev);
     const world = ev.world;
     this.applyMist(scene, world, shading === 'MATERIAL' || shading === 'RENDERED');
     if (shading !== 'RENDERED' || world.environment !== 'SKY') {
