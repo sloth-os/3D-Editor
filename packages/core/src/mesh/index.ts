@@ -8,3 +8,4 @@ export * from './render-buffers';
 export * from './weld';
 export * from './primitives';
 export * from './ops';
+export * from './sculpt';

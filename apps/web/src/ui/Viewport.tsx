@@ -9,12 +9,36 @@ import { MenuButton } from './Menu';
 import { ADD_MENU, MESH_MENU, OBJECT_MENU, SELECT_MENU_EDIT, SELECT_MENU_OBJECT, UV_MENU, VIEW_MENU } from '../editor/menus';
 import { Icon, type IconName } from './icons';
 import { SchemaForm } from './SchemaForm';
-import { Panel, Row, SelectField, NumberField } from './fields/fields';
+import { Panel, Row, SelectField, NumberField, ColorField, Checkbox } from './fields/fields';
 import { TransformFields } from './properties/ObjectTab';
 import { NavGizmo } from './NavGizmo';
 import { importFiles } from '../io/import-export';
 import { fps } from '../telemetry/perf';
 import type { ToolId } from '../editor/state';
+
+function BrushSettings({ s }: { s: ProjectSession }) {
+  const b = s.view.brush.value;
+  const set = (patch: Partial<typeof b>) => (s.view.brush.value = { ...b, ...patch });
+  const paint = s.state.$mode.value === 'VERTEX_PAINT';
+  return (
+    <span style={{ display: 'flex', gap: '6px', alignItems: 'center' }} data-testid="brush-settings">
+      <span class="hint">Radius</span>
+      <div style={{ width: '70px' }}>
+        <NumberField value={b.radius} integer min={2} max={500} unit=" px" step={1} onChange={(v) => set({ radius: v })} />
+      </div>
+      <span class="hint">Strength</span>
+      <div style={{ width: '70px' }}>
+        <NumberField value={b.strength} min={0} max={1} slider onChange={(v) => set({ strength: v })} />
+      </div>
+      {paint && (
+        <div style={{ width: '40px' }}>
+          <ColorField value={b.color} onChange={(v) => set({ color: [v[0], v[1], v[2], 1] })} />
+        </div>
+      )}
+      <Checkbox value={b.symmetryX} label="X Sym" onChange={(v) => set({ symmetryX: v })} />
+    </span>
+  );
+}
 
 const TOOLS: { id: ToolId; icon: IconName; title: string; modes: string[] }[] = [
   { id: 'select', icon: 'select', title: 'Select Box (W)', modes: ['OBJECT', 'EDIT'] },
@@ -22,6 +46,12 @@ const TOOLS: { id: ToolId; icon: IconName; title: string; modes: string[] }[] = 
   { id: 'move', icon: 'move', title: 'Move', modes: ['OBJECT', 'EDIT'] },
   { id: 'rotate', icon: 'rotate', title: 'Rotate', modes: ['OBJECT', 'EDIT'] },
   { id: 'scale', icon: 'scale', title: 'Scale', modes: ['OBJECT', 'EDIT'] },
+  { id: 'sculpt_draw', icon: 'brush', title: 'Draw (Ctrl: subtract)', modes: ['SCULPT'] },
+  { id: 'sculpt_inflate', icon: 'solid', title: 'Inflate', modes: ['SCULPT'] },
+  { id: 'sculpt_smooth', icon: 'wire', title: 'Smooth', modes: ['SCULPT'] },
+  { id: 'sculpt_flatten', icon: 'face', title: 'Flatten', modes: ['SCULPT'] },
+  { id: 'sculpt_grab', icon: 'hand', title: 'Grab', modes: ['SCULPT'] },
+  { id: 'paint', icon: 'brush', title: 'Paint vertex colors', modes: ['VERTEX_PAINT'] },
 ];
 
 function ViewportHeader({ s }: { s: ProjectSession }) {
@@ -46,6 +76,8 @@ function ViewportHeader({ s }: { s: ProjectSession }) {
         options={[
           { value: 'OBJECT', label: 'Object Mode' },
           { value: 'EDIT', label: 'Edit Mode' },
+          { value: 'SCULPT', label: 'Sculpt Mode' },
+          { value: 'VERTEX_PAINT', label: 'Vertex Paint' },
         ]}
         onChange={(v) => run('object.mode_set', { mode: v }, 'ui')}
       />
@@ -64,9 +96,10 @@ function ViewportHeader({ s }: { s: ProjectSession }) {
         </div>
       )}
       <MenuButton label="View" items={VIEW_MENU} />
-      <MenuButton label="Select" items={mode === 'EDIT' ? SELECT_MENU_EDIT : SELECT_MENU_OBJECT} />
-      <MenuButton label="Add" items={() => ADD_MENU} />
-      {mode === 'EDIT' ? (
+      {(mode === 'SCULPT' || mode === 'VERTEX_PAINT') && <BrushSettings s={s} />}
+      {(mode === 'OBJECT' || mode === 'EDIT') && <MenuButton label="Select" items={mode === 'EDIT' ? SELECT_MENU_EDIT : SELECT_MENU_OBJECT} />}
+      {(mode === 'OBJECT' || mode === 'EDIT') && <MenuButton label="Add" items={() => ADD_MENU} />}
+      {mode !== 'OBJECT' && mode !== 'EDIT' ? null : mode === 'EDIT' ? (
         <>
           <MenuButton label="Mesh" items={MESH_MENU} />
           <MenuButton label="UV" items={UV_MENU} />
@@ -327,6 +360,11 @@ export function Viewport({ session: s }: { session: ProjectSession }) {
   }, [s]);
   const tool = s.view.tool.value;
   const mode = s.state.$mode.value;
+  useEffect(() => {
+    // pick a tool that exists in the new mode
+    const valid = TOOLS.filter((t) => t.modes.includes(mode)).map((t) => t.id);
+    if (!valid.includes(s.view.tool.value)) s.view.tool.value = valid[0] ?? 'select';
+  }, [mode, s]);
   const box = interaction?.boxRect.value;
   const hud = s.view.hud.value;
   return (
@@ -347,17 +385,21 @@ export function Viewport({ session: s }: { session: ProjectSession }) {
         style={{ cursor: tool === 'cursor' ? 'crosshair' : 'default' }}
       >
         <canvas ref={canvasRef} />
-        {s.view.toolbar.value && (mode === 'OBJECT' || mode === 'EDIT') && (
+        {s.view.toolbar.value && (
           <div class="toolbar" onPointerDown={(e) => e.stopPropagation()} data-testid="toolbar">
             {TOOLS.filter((t) => t.modes.includes(mode)).map((t) => (
               <button key={t.id} class={tool === t.id ? 'active' : ''} title={t.title} data-testid={`tool-${t.id}`} onClick={() => run('wm.tool_set', { tool: t.id }, 'toolbar')}>
                 <Icon name={t.icon} />
               </button>
             ))}
-            <div class="sep" />
-            <button title="Add (Shift+A)" onClick={(e) => (popupMenu.value = { name: 'add', x: e.clientX + 20, y: e.clientY })}>
-              <Icon name="plus" />
-            </button>
+            {(mode === 'OBJECT' || mode === 'EDIT') && (
+              <>
+                <div class="sep" />
+                <button title="Add (Shift+A)" onClick={(e) => (popupMenu.value = { name: 'add', x: e.clientX + 20, y: e.clientY })}>
+                  <Icon name="plus" />
+                </button>
+              </>
+            )}
             {mode === 'EDIT' && canRun('mesh.extrude_region_shrink_fatten') && (
               <button title="Extrude (E)" onClick={() => run('mesh.extrude_region_shrink_fatten', { value: 0.5 }, 'toolbar')}>
                 <Icon name="up" />

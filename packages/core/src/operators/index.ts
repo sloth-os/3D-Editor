@@ -8,6 +8,7 @@ import { registerDataOperators } from './data';
 import { registerMeshEditOperators } from './mesh-edit';
 import { registerModifierOperators } from './modifier';
 import { registerIOOperators } from './io';
+import { registerSculptOperators } from './sculpt';
 
 export * from './context';
 export * from './registry';
@@ -28,5 +29,6 @@ export function createOperatorRegistry(): OperatorRegistry {
   registerMeshEditOperators(reg);
   registerModifierOperators(reg);
   registerIOOperators(reg);
+  registerSculptOperators(reg);
   return reg;
 }

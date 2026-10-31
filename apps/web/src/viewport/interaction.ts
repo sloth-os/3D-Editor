@@ -18,6 +18,7 @@ import { clonePose, poseBasis } from './navigation';
 import { nearestEdge, nearestVertex, objectsInRect, pickFace, pickObject, projectEditVerts } from './picking';
 import { prefs } from '../app/prefs';
 import { telemetry } from '../telemetry/telemetry';
+import { BrushStroke } from './brush';
 
 export interface InteractionHost {
   run(id: string, params?: unknown, source?: 'hotkey' | 'ui' | 'toolbar'): boolean;
@@ -34,6 +35,7 @@ type DragMode = 'orbit' | 'pan' | 'zoom' | 'box' | 'none';
 export class ViewportInteraction {
   readonly boxRect = signal<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   modal: ModalTransform | null = null;
+  private stroke: BrushStroke | null = null;
   private drag: { mode: DragMode; x: number; y: number; startX: number; startY: number; button: number; moved: boolean; shift: boolean; ctrl: boolean } | null = null;
   private pointers = new Map<number, { x: number; y: number }>();
   private pinch: { dist: number; cx: number; cy: number } | null = null;
@@ -223,6 +225,19 @@ export class ViewportInteraction {
     }
     if (this.gizmoActive()) return;
     const emulate = prefs.value.ui.emulate3Button && e.altKey && e.button === 0;
+    const st = this.session.state;
+    const painting = st.mode === 'SCULPT' || st.mode === 'VERTEX_PAINT';
+    const brushPointer = e.pointerType === 'touch' ? this.pointers.size === 1 : e.button === 0 && !emulate;
+    if (painting && brushPointer) {
+      const o = st.activeId ? this.session.doc.getObject(st.activeId) : null;
+      if (o?.type === 'MESH' && o.data) {
+        this.stroke = new BrushStroke(this.engine, this.session, o.id, o.data, st.mode === 'VERTEX_PAINT', e.ctrlKey);
+        this.stroke.move(p.x, p.y);
+        this.el.setPointerCapture(e.pointerId);
+        e.preventDefault();
+        return;
+      }
+    }
     let mode: DragMode = 'none';
     if (e.button === 1 || emulate) mode = e.shiftKey ? 'pan' : e.ctrlKey ? 'zoom' : 'orbit';
     else if (e.button === 0) mode = e.pointerType === 'touch' ? 'orbit' : 'box';
@@ -242,6 +257,10 @@ export class ViewportInteraction {
     this.mouse.y = p.y;
     if (this.modal) {
       this.modal.update(p, { ctrl: e.ctrlKey || this.session.view.snapping.value, shift: e.shiftKey });
+      return;
+    }
+    if (this.stroke) {
+      this.stroke.move(p.x, p.y);
       return;
     }
     if (e.pointerType === 'touch' && this.pointers.has(e.pointerId)) {
@@ -272,6 +291,17 @@ export class ViewportInteraction {
   };
 
   private onPointerUp = (e: PointerEvent) => {
+    if (this.stroke) {
+      const stroke = this.stroke;
+      this.stroke = null;
+      if (e.pointerType === 'touch') this.pointers.delete(e.pointerId);
+      const mesh = stroke.finish();
+      if (mesh) {
+        pendingStroke = { objectId: stroke.objectId, meshId: stroke.meshId, mesh };
+        this.host.run('sculpt.commit_stroke', {}, 'ui');
+      }
+      return;
+    }
     if (e.pointerType === 'touch') {
       const wasPinch = !!this.pinch;
       this.pointers.delete(e.pointerId);
@@ -518,4 +548,12 @@ export class ViewportInteraction {
     this.el.removeEventListener('pointercancel', this.onPointerUp);
     this.el.removeEventListener('wheel', this.onWheel);
   }
+}
+
+/** Mesh produced by the last interactive brush stroke, consumed by `sculpt.commit_stroke`. */
+export let pendingStroke: { objectId: string; meshId: string; mesh: import('@3d-editor/core').MeshData } | null = null;
+export function takePendingStroke() {
+  const s = pendingStroke;
+  pendingStroke = null;
+  return s;
 }

@@ -8,6 +8,7 @@ import { createProject } from '../project/manager';
 import { importFromFilePicker } from '../io/import-export';
 import { shareLink } from '../project/manager';
 import { nearestEdge, projectEditVerts } from '../viewport/picking';
+import { takePendingStroke } from '../viewport/interaction';
 
 function engine() {
   const e = viewport.engine;
@@ -479,6 +480,21 @@ export function registerUiOperators(reg: OperatorRegistry): void {
         workspace.value = p.name as Workspace;
         const v = session.value?.view;
         if (v && p.name === 'Shading') v.shading.value = 'MATERIAL';
+      },
+    }),
+  );
+  reg.register(
+    defineOperator({
+      id: 'sculpt.commit_stroke',
+      label: 'Brush Stroke',
+      description: 'Commits the interactive sculpt / paint stroke (one undo step).',
+      category: 'Sculpt',
+      uiOnly: true,
+      schema: z.object({}),
+      execute(ctx) {
+        const s = takePendingStroke();
+        if (!s) throw new Error('No stroke to commit');
+        ctx.doc.setMesh(s.meshId, s.mesh);
       },
     }),
   );
