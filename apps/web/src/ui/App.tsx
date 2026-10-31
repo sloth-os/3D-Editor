@@ -208,7 +208,27 @@ function Editor({ s }: { s: ProjectSession }) {
       </div>
       <Splitter dir="v" onDrag={(d) => setRightW(Math.max(220, Math.min(window.innerWidth - 300, rightW - d)))} />
       <div class="column hide-mobile" style={{ width: `${rightW}px`, flex: 'none' }}>
-        <Area kind="outliner" style={{ height: `${outlinerH}px`, flex: 'none' }} title={<span>Outliner</span>}>
+        <Area
+          kind="outliner"
+          style={{ height: `${outlinerH}px`, flex: 'none' }}
+          title={
+            <>
+              <span>Outliner</span>
+              <span style={{ marginLeft: 'auto', display: 'flex', gap: '2px' }}>
+                <button class="btn flat icon" title="New collection" data-testid="new-collection" onClick={() => run('collection.create', { name: 'Collection' }, 'ui')}>
+                  <Icon name="collection" size={13} />
+                </button>
+                <button
+                  class="btn flat icon"
+                  title="Move selection to a new collection (M)"
+                  onClick={() => run('object.move_to_collection', { new_collection_name: 'Collection' }, 'ui')}
+                >
+                  <Icon name="plus" size={13} />
+                </button>
+              </span>
+            </>
+          }
+        >
           <Outliner session={s} />
         </Area>
         <Splitter dir="h" onDrag={(d) => setOutlinerH(Math.max(80, Math.min(window.innerHeight - 200, outlinerH + d)))} />
