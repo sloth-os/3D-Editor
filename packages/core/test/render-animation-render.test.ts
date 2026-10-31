@@ -304,6 +304,11 @@ describe('renderAnimation', () => {
       animated_seed: true,
     });
     expect(Buffer.from(decodePNG(seeded.files![0].data).data).equals(Buffer.from(b))).toBe(false);
+    // the scene's engine: `samples` still means samples per pixel (the render settings' 4096 would
+    // be used otherwise)
+    doc.updateRender({ engine: 'PATHTRACER', samples: 4096 });
+    const scene = renderAnimation(doc, { ...opts, format: 'PNG_SEQUENCE', frame_end: 1 });
+    same(decodePNG(scene.files![0].data).data, b);
   });
 });
 

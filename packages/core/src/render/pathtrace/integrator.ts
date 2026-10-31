@@ -78,6 +78,21 @@ const DIM_RR = 1 << 16;
 const DIM_ALPHA = 1 << 17;
 /** A sphere lamp counts as a point light from points closer than this squared radius factor. */
 const INSIDE_SPHERE = 1.0001;
+/** Blender's object shadow terminator "Geometry Offset" (default 0.1): see `terminatorAmount`. */
+const TERMINATOR_CUTOFF = 0.1;
+
+/**
+ * Fraction of the shadow-terminator offset applied to a shadow ray from a smooth triangle, given
+ * the cosines of the light direction to the geometric (`ngl` > 0) and shading (`nl`) normals.
+ * Like Cycles, only light at grazing angles to the facet (ngl below the cutoff) is lifted, fading
+ * in smoothly; light from higher up cannot be blocked by the neighbouring facets, and lifting its
+ * rays (by up to a large part of a coarse triangle) would make nearby contact shadows vanish.
+ */
+export function terminatorAmount(ngl: number, nl: number): number {
+  if (!(ngl < TERMINATOR_CUTOFF)) return 0;
+  const k = 2 - (ngl + nl) / TERMINATOR_CUTOFF;
+  return k > 0 ? (k < 1 ? k : 1) : 0;
+}
 
 /** Per-sample results of `PathIntegrator.trace`. */
 export class PathIntegrator {
@@ -1268,15 +1283,16 @@ export class PathIntegrator {
                   let sox = this.px + gnx * side * eps;
                   let soy = this.py + gny * side * eps;
                   let soz = this.pz + gnz * side * eps;
-                  if (this.smoothTri && side > 0 && frontFacing) {
+                  const lift = this.smoothTri && side > 0 && frontFacing ? terminatorAmount(geomSide, ilz) : 0;
+                  if (lift > 0) {
                     const lx = this.lx;
                     const ly = this.ly;
                     const lz = this.lz;
                     const ld = this.lDist;
                     this.terminatorOrigin(inst, tri, b1, b2);
-                    sox += this.lx;
-                    soy += this.ly;
-                    soz += this.lz;
+                    sox += this.lx * lift;
+                    soy += this.ly * lift;
+                    soz += this.lz * lift;
                     this.lx = lx;
                     this.ly = ly;
                     this.lz = lz;

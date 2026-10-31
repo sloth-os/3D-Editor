@@ -1,11 +1,13 @@
 import { z } from 'zod';
-import type { Vec3 } from '../math/types';
+import type { Mat4, Vec3 } from '../math/types';
+import { compose4, invert4, multiply4 } from '../math/mat4';
+import { transformPoint3 } from '../math/vec3';
 import type { CurveData, HandleType, ObjectData, Spline, SplinePoint, SplineType } from '../doc/types';
 import { defaultSpline, defaultSplinePoint } from '../doc/defaults';
 import type { MeshData } from '../mesh/types';
 import { cloneMesh } from '../mesh/types';
-import { ANIMATABLE } from '../anim/properties';
-import { sanitizeSpline } from '../curve/spline';
+import { ANIMATABLE, isAnimatable, propertyLength } from '../anim/properties';
+import { bezierHandles, sanitizeSpline } from '../curve/spline';
 import { layoutText, textOutline } from '../curve/text';
 import type { EvaluatedScene } from '../eval/evaluate';
 import { fcurveKey } from '../doc/scene-doc';
@@ -107,7 +109,10 @@ const curveFields = {
     .min(0)
     .max(32)
     .optional()
-    .describe('Extra points per quarter circle of the ROUND bevel (default 4)'),
+    .describe(
+      'Smoothness of the ROUND bevel (default 4): a plain round tube has 4 + 2 × bevel_resolution points around; ' +
+        'with extrude or a HALF/FRONT/BACK fill every quarter circle has bevel_resolution + 1 segments',
+    ),
   bevel_object: z
     .string()
     .nullable()
@@ -120,14 +125,18 @@ const curveFields = {
     .min(0)
     .max(1)
     .optional()
-    .describe('Fraction of the length (0..1) where the bevel/extrusion starts (default 0)'),
+    .describe(
+      'Fraction of the length (0..1) where the bevel/extrusion starts (default 0). Ignored for the closed ' +
+        'outlines of filled 2D curves and text (their caps need the whole outline)',
+    ),
   bevel_factor_end: z
     .number()
     .min(0)
     .max(1)
     .optional()
     .describe(
-      'Fraction of the length (0..1) where the bevel/extrusion ends (default 1); animate it to "grow" a curve',
+      'Fraction of the length (0..1) where the bevel/extrusion ends (default 1); animate it to "grow" a curve. ' +
+        'Ignored for the closed outlines of filled 2D curves and text (use fill_mode NONE to grow outlines)',
     ),
   extrude: z
     .number()
@@ -140,7 +149,11 @@ const curveFields = {
     .number()
     .optional()
     .describe(
-      'Sideways offset of the bevel/extrusion/fill outline in metres (positive = outward, i.e. bolder for 2D shapes and text)',
+      'Sideways offset of the bevel/extrusion/fill outline in metres. 2D curves and text: positive = outward ' +
+        "(bolder shapes, smaller holes). 3D curves: along the bevel frame's side axis; with Z_UP or MINIMUM twist " +
+        'that is the left of the direction of travel seen from above (+Z), so a flat counter-clockwise loop ' +
+        'shrinks and a clockwise one grows; with TANGENT twist it points into the (first) bend. Use a negative ' +
+        'value for the other side',
     ),
   fill_mode: z
     .enum(['FULL', 'HALF', 'FRONT', 'BACK', 'BOTH', 'NONE'])
@@ -359,6 +372,52 @@ function textPatch(p: TextFieldParams & { body?: string }): Partial<CurveData> {
   return patch as Partial<CurveData>;
 }
 
+/** Text layout fields: animatable on every curve datablock, but only text objects use them. */
+const TEXT_ONLY_PATHS = new Set<string>(TEXT_KEYS.filter((k) => k !== 'align_x' && k !== 'align_y'));
+const POINT_PATH = /^splines\[(\d+)\]\.points\[(\d+)\]\.(\w+)$/;
+
+/**
+ * Rejects keyframes on channels that do not exist on this curve or text object: spline points out of
+ * range, unset (AUTO) handle positions, text fields on curve objects and channel indices beyond the
+ * property's length (scalars only have index 0). Paths that are not animatable at all are left to
+ * keyProperty, which reports them.
+ */
+function checkCurveChannel(o: ObjectData, curve: CurveData, path: string, index: number): void {
+  const pt = POINT_PATH.exec(path);
+  if (pt) {
+    const splines = Array.isArray(curve.splines) ? curve.splines : [];
+    const si = Number(pt[1]);
+    const pi = Number(pt[2]);
+    if (si >= splines.length)
+      throw new OperatorError(
+        `'${o.name}' has no spline ${si} (it has ${splines.length} spline${splines.length === 1 ? '' : 's'})`,
+        'INVALID_PARAMS',
+      );
+    const points = Array.isArray(splines[si].points) ? splines[si].points : [];
+    if (pi >= points.length)
+      throw new OperatorError(
+        `Spline ${si} of '${o.name}' has no point ${pi} (it has ${points.length} point${points.length === 1 ? '' : 's'})`,
+        'INVALID_PARAMS',
+      );
+    if ((pt[3] === 'handle_left' || pt[3] === 'handle_right') && !Array.isArray(points[pi][pt[3]]))
+      throw new OperatorError(
+        `Point ${pi} of spline ${si} has no stored ${pt[3]} (AUTO and VECTOR handles are computed); set the ` +
+          'handle position with curve.spline_set_points first',
+        'INVALID_PARAMS',
+      );
+  } else if (o.type === 'CURVE' && TEXT_ONLY_PATHS.has(path)) {
+    throw new OperatorError(`'${path}' only affects text objects and '${o.name}' is a curve`, 'INVALID_PARAMS');
+  }
+  if (index < 0 || !isAnimatable('curve', path)) return;
+  const len = propertyLength('curve', path, curve as unknown as Record<string, unknown>);
+  if (len > 0 && index >= len)
+    throw new OperatorError(
+      `Index ${index} is out of range for '${path}': ` +
+        (len === 1 ? 'it is a single value (use index 0 or -1)' : `use 0..${len - 1}, or -1 for all channels`),
+      'INVALID_PARAMS',
+    );
+}
+
 /** Re-keys animated curve channels that were edited so the edit stays visible. */
 function rekeyCurve(ctx: OperatorContext, curveId: string, patch: Partial<CurveData>): void {
   const animatable = Object.keys(patch).filter((k) => k in ANIMATABLE.curve);
@@ -506,6 +565,367 @@ export function convertCurveObject(
     dropOrphanCurve(ctx, curveId);
   }
   return { object: id, name: ctx.doc.getObject(id)!.name, type: 'MESH' };
+}
+
+// ------------------------------------------------------------------ object edits (used by object.ts)
+
+/** Gives an object its own copy of shared curve data before its geometry changes (like meshes). */
+function singleUserCurve(ctx: OperatorContext, o: ObjectData): string {
+  const id = o.data!;
+  if (ctx.doc.dataUsers(id) <= 1) return id;
+  const { id: _id, ...fields } = ctx.doc.getCurve(id)!;
+  const copy = ctx.doc.addCurve(JSON.parse(JSON.stringify(fields)) as Partial<CurveData>);
+  ctx.doc.updateObject(o.id, { data: copy });
+  return copy;
+}
+
+const POINT_CHANNEL = /^splines\[\d+\]\.points\[\d+\]\.(co|handle_left|handle_right|radius)$/;
+
+const fmt = (v: number) => String(+v.toFixed(4));
+
+/**
+ * Re-maps the keyframe values of the curve datablock's F-curves so animated channels follow an edit.
+ * `map` returns the mapping of a channel, undefined for channels the edit does not touch and null for
+ * channels that cannot follow. Those, and channels with F-curve modifiers (which may add absolute
+ * values), are reported as a warning.
+ */
+function remapCurveKeys(
+  ctx: OperatorContext,
+  name: string,
+  curveId: string,
+  map: (path: string, index: number) => ((v: number) => number) | null | undefined,
+): void {
+  const inexact = new Set<string>();
+  for (const fc of ctx.doc.listFCurves(curveId)) {
+    if (fc.target_type !== 'curve') continue;
+    const f = map(fc.path, fc.index);
+    if (f === undefined) continue;
+    if (f === null || fc.modifiers?.length) inexact.add(fc.path);
+    if (f) ctx.doc.setFCurve({ ...fc, keyframes: fc.keyframes.map((k) => ({ ...k, value: f(k.value) })) });
+  }
+  if (inexact.size)
+    ctx.report('WARNING', `'${name}': the animation of ${[...inexact].join(', ')} cannot follow exactly`);
+}
+
+/** Transform components baked by object.transform_apply. */
+export interface TransformApplyParts {
+  location: boolean;
+  rotation: boolean;
+  scale: boolean;
+}
+
+/** The matrix object.transform_apply bakes into an object's data (data' = delta · data). */
+function transformApplyDelta(o: ObjectData, p: TransformApplyParts): Mat4 {
+  const kept = compose4(
+    p.location ? [0, 0, 0] : o.location,
+    p.rotation ? [0, 0, 0] : o.rotation_euler,
+    p.scale ? [1, 1, 1] : o.scale,
+  );
+  return multiply4(invert4(kept), compose4(o.location, o.rotation_euler, o.scale));
+}
+
+/** Negligible next to `ref` (round-off of composed matrices). */
+const tiny = (v: number, ref: number) => Math.abs(v) <= 1e-9 * Math.max(1, ref);
+
+/** Largest magnitude among the affine entries of a matrix. */
+const magnitude = (m: Mat4) => Math.max(...[0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14].map((i) => Math.abs(m[i])));
+
+/** Why a 2D curve or a text object cannot absorb `m` into its data (null when it can). */
+function transformApplyProblem(o: ObjectData, curve: CurveData, m: Mat4): string | null {
+  const ref = magnitude(m);
+  if (o.type === 'FONT') {
+    if (![1, 2, 4, 6, 8, 9, 12, 13, 14].every((i) => tiny(m[i], ref)))
+      return (
+        'text can only have its scale applied (it always lies in its local XY plane); apply scale only, ' +
+        'or convert it to a mesh or curve first'
+      );
+    const [sx, sy, sz] = [m[0], m[5], m[10]];
+    if (!(sx > 0 && sy > 0 && sz > 0) || Math.abs(sx - sy) > 1e-6 * Math.max(sx, sy))
+      return (
+        'text can only take a uniform, positive X/Y scale and a positive Z scale ' +
+        `(scale to apply: [${fmt(sx)}, ${fmt(sy)}, ${fmt(sz)}])`
+      );
+    return null;
+  }
+  if (curve.dimensions === '2D' && ![2, 6, 8, 9, 14].every((i) => tiny(m[i], ref)))
+    return (
+      'a 2D curve stays in its local XY plane: only a rotation about its Z axis, an X/Y location and the ' +
+      "scale can be applied (set dimensions to '3D' first)"
+    );
+  return null;
+}
+
+/**
+ * Checks, before object.transform_apply changes anything, that every curve and text object among
+ * `objects` can absorb its transform; throws an OperatorError otherwise. 2D curves stay in their local
+ * XY plane (Blender refuses rotation and location for them) and text only takes a uniform positive
+ * scale (Blender: "Text objects can only have their scale applied"). Components that change nothing,
+ * such as a zero rotation, are accepted.
+ */
+export function checkCurveTransformApply(
+  ctx: OperatorContext,
+  objects: readonly ObjectData[],
+  p: TransformApplyParts,
+): void {
+  for (const o of objects) {
+    if ((o.type !== 'CURVE' && o.type !== 'FONT') || !o.data) continue;
+    const curve = ctx.doc.getCurve(o.data);
+    const problem = curve ? transformApplyProblem(o, curve, transformApplyDelta(o, p)) : null;
+    if (problem)
+      throw new OperatorError(`Cannot apply the transform of '${o.name}': ${problem}`, 'INVALID_PARAMS');
+  }
+}
+
+/** Whether the columns are orthogonal with equal lengths (rotation, uniform scale, mirroring). */
+function isConformal(cols: number[][]): boolean {
+  const lens = cols.map((c) => Math.hypot(...c));
+  const l = Math.max(...lens);
+  if (!(l > 0)) return true;
+  for (let i = 0; i < cols.length; i++) {
+    if (Math.abs(lens[i] - l) > 1e-9 * l) return false;
+    for (let j = i + 1; j < cols.length; j++) {
+      const d = cols[i].reduce((s, v, k) => s + v * cols[j][k], 0);
+      if (Math.abs(d) > 1e-9 * l * l) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * object.transform_apply for a curve or text object: bakes `delta` (data' = delta · data) into its
+ * data, copied first when other objects share it. Curves transform their control points and handles;
+ * under non-uniform transforms AUTO handles keep their transformed positions as ALIGNED handles (FREE
+ * next to a VECTOR or FREE handle), like Blender, so the shape does not change. `properties` also
+ * scales the point radii by the mean scale (Blender's "Apply Properties"), which keeps the bevel and
+ * extrusion thickness. Text scales offset_x/offset_y and, with `properties`, size, offset and
+ * bevel_depth by its X/Y scale and extrude by its Z scale. Keyframes of these channels follow where
+ * the transform allows it (a warning is reported otherwise). Call checkCurveTransformApply first.
+ */
+export function applyCurveTransform(
+  ctx: OperatorContext,
+  o: ObjectData,
+  delta: Mat4,
+  properties: boolean,
+): void {
+  if ((o.type !== 'CURVE' && o.type !== 'FONT') || !o.data || !ctx.doc.getCurve(o.data)) return;
+  const curveId = singleUserCurve(ctx, o);
+  const curve = ctx.doc.getCurve(curveId)!;
+  const m = delta;
+  if (o.type === 'FONT') {
+    const s = m[0];
+    const sz = m[10];
+    const factors = new Map<string, number>([
+      ['offset_x', s],
+      ['offset_y', s],
+    ]);
+    if (properties)
+      for (const [k, f] of [
+        ['size', s],
+        ['offset', s],
+        ['bevel_depth', s],
+        ['extrude', sz],
+      ] as const)
+        factors.set(k, f);
+    const values = curve as unknown as Record<string, number>;
+    const patch: Record<string, number> = {};
+    for (const [k, f] of factors) patch[k] = values[k] * f;
+    ctx.doc.updateCurve(curveId, patch as Partial<CurveData>);
+    remapCurveKeys(ctx, o.name, curveId, (path) => {
+      const f = factors.get(path);
+      return f === undefined ? undefined : (v) => v * f;
+    });
+    if (properties && curve.bevel_depth > 0 && Math.abs(s - sz) > 1e-6 * Math.max(s, sz))
+      ctx.report('WARNING', `'${o.name}': the bevel of the text follows its X/Y scale, not its other Z scale`);
+    return;
+  }
+  const cols = [0, 4, 8].map((c) => [m[c], m[c + 1], m[c + 2]]);
+  // 2D splines stay at z = 0: only their X/Y deformation matters for the handles
+  const conformal = isConformal(curve.dimensions === '2D' ? cols.slice(0, 2).map((c) => c.slice(0, 2)) : cols);
+  // Blender's mat3_to_scale: length of the transformed (1, 1, 1)/√3
+  const mean =
+    Math.hypot(...[0, 1, 2].map((k) => cols[0][k] + cols[1][k] + cols[2][k])) / Math.sqrt(3);
+  const fix = (t: HandleType, other: HandleType): HandleType =>
+    t !== 'AUTO' ? t : other === 'AUTO' || other === 'ALIGNED' ? 'ALIGNED' : 'FREE';
+  const splines = (Array.isArray(curve.splines) ? curve.splines : []).map((raw): Spline => {
+    const s = sanitizeSpline(raw);
+    const handles = s.type === 'BEZIER' ? bezierHandles(s) : null;
+    return {
+      ...s,
+      points: s.points.map((pt, i) => {
+        const h = handles?.[i];
+        const left = h ? h.left : pt.handle_left;
+        const right = h ? h.right : pt.handle_right;
+        const out: SplinePoint = {
+          ...pt,
+          co: transformPoint3(m, pt.co),
+          handle_left: left ? transformPoint3(m, left) : null,
+          handle_right: right ? transformPoint3(m, right) : null,
+        };
+        if (h && !conformal) {
+          out.handle_left_type = fix(pt.handle_left_type, pt.handle_right_type);
+          out.handle_right_type = fix(pt.handle_right_type, pt.handle_left_type);
+        }
+        if (properties) out.radius = pt.radius * mean;
+        return out;
+      }),
+    };
+  });
+  ctx.doc.updateCurve(curveId, { splines });
+  // per-axis channels follow exactly when the transform does not mix the axes
+  const ref = magnitude(m);
+  const perAxis = [1, 2, 4, 6, 8, 9].every((i) => tiny(m[i], ref));
+  remapCurveKeys(ctx, o.name, curveId, (path, index) => {
+    const ch = POINT_CHANNEL.exec(path);
+    if (!ch) return undefined;
+    if (ch[1] === 'radius') return properties ? (v) => v * mean : undefined;
+    if (!perAxis || index < 0 || index > 2) return null;
+    const a = m[index * 5];
+    const t = m[12 + index];
+    return (v) => a * v + t;
+  });
+  const surface =
+    curve.bevel_depth > 0 || curve.extrude > 0 || (curve.bevel_mode === 'OBJECT' && !!curve.bevel_object);
+  if (properties && surface && !isConformal(cols))
+    ctx.report(
+      'WARNING',
+      `'${o.name}': non-uniform scale: the bevel/extrusion thickness is scaled by the mean factor ${fmt(mean)}`,
+    );
+}
+
+/** Centre of a curve's control points like Blender: MEDIAN of the points and Bezier handles, or the middle of their bounds (points padded by their radius). */
+function splineCenter(curve: CurveData, center: 'MEDIAN' | 'BOUNDS'): Vec3 | null {
+  const sum: Vec3 = [0, 0, 0];
+  const min: Vec3 = [Infinity, Infinity, Infinity];
+  const max: Vec3 = [-Infinity, -Infinity, -Infinity];
+  let count = 0;
+  const add = (p: Vec3, pad = 0) => {
+    for (let k = 0; k < 3; k++) {
+      sum[k] += p[k];
+      min[k] = Math.min(min[k], p[k] - pad);
+      max[k] = Math.max(max[k], p[k] + pad);
+    }
+    count++;
+  };
+  for (const raw of Array.isArray(curve.splines) ? curve.splines : []) {
+    const s = sanitizeSpline(raw);
+    const handles = s.type === 'BEZIER' ? bezierHandles(s) : null;
+    s.points.forEach((pt, i) => {
+      add(pt.co, pt.radius);
+      if (handles) {
+        add(handles[i].left);
+        add(handles[i].right);
+      }
+    });
+  }
+  if (!count) return null;
+  return center === 'MEDIAN'
+    ? [sum[0] / count, sum[1] / count, sum[2] / count]
+    : [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+}
+
+/** Middle of the glyph outlines' bounds (null for text without visible characters). */
+function textCenter(curve: CurveData): Vec3 | null {
+  let x0 = Infinity;
+  let y0 = Infinity;
+  let x1 = -Infinity;
+  let y1 = -Infinity;
+  for (const c of textOutline(curve).contours)
+    for (const p of c) {
+      x0 = Math.min(x0, p[0]);
+      x1 = Math.max(x1, p[0]);
+      y0 = Math.min(y0, p[1]);
+      y1 = Math.max(y1, p[1]);
+    }
+  return Number.isFinite(x0) ? [(x0 + x1) / 2, (y0 + y1) / 2, 0] : null;
+}
+
+/**
+ * object.origin_set for a curve or text object. ORIGIN_GEOMETRY / ORIGIN_CURSOR move the object origin
+ * (to the geometry centre or the 3D cursor) and shift the data back so nothing moves visually;
+ * GEOMETRY_ORIGIN moves the geometry so that its centre sits at the origin. Curves shift their control
+ * points (centre: MEDIAN of points and handles, or BOUNDS), text shifts offset_x/offset_y (centre of its
+ * glyph bounds, like Blender). 2D curves and text keep the origin in their XY plane. Animated point and
+ * offset channels follow; children keep their world transform.
+ */
+export function curveOriginSet(
+  ctx: OperatorContext,
+  o: ObjectData,
+  type: 'ORIGIN_GEOMETRY' | 'ORIGIN_CURSOR' | 'GEOMETRY_ORIGIN',
+  center: 'MEDIAN' | 'BOUNDS',
+): void {
+  if ((o.type !== 'CURVE' && o.type !== 'FONT') || !o.data) return;
+  const src = ctx.doc.getCurve(o.data);
+  if (!src) return;
+  const world = ctx.doc.worldMatrix(o.id);
+  const target =
+    type === 'ORIGIN_CURSOR'
+      ? transformPoint3(invert4(world), ctx.state.cursorLocation)
+      : o.type === 'FONT'
+        ? textCenter(src)
+        : splineCenter(src, center);
+  if (!target || !target.every(Number.isFinite)) return;
+  if (o.type === 'FONT' || src.dimensions === '2D') target[2] = 0;
+  const curveId = singleUserCurve(ctx, o);
+  const curve = ctx.doc.getCurve(curveId)!;
+  if (o.type === 'FONT') {
+    ctx.doc.updateCurve(curveId, {
+      offset_x: curve.offset_x - target[0],
+      offset_y: curve.offset_y - target[1],
+    });
+    remapCurveKeys(ctx, o.name, curveId, (path) =>
+      path === 'offset_x' ? (v) => v - target[0] : path === 'offset_y' ? (v) => v - target[1] : undefined,
+    );
+  } else {
+    const shift = (p: Vec3 | null): Vec3 | null =>
+      p ? [p[0] - target[0], p[1] - target[1], p[2] - target[2]] : null;
+    const splines = (Array.isArray(curve.splines) ? curve.splines : []).map((raw): Spline => {
+      const s = sanitizeSpline(raw);
+      return {
+        ...s,
+        points: s.points.map((pt) => ({
+          ...pt,
+          co: shift(pt.co)!,
+          handle_left: shift(pt.handle_left),
+          handle_right: shift(pt.handle_right),
+        })),
+      };
+    });
+    ctx.doc.updateCurve(curveId, { splines });
+    remapCurveKeys(ctx, o.name, curveId, (path, index) => {
+      const ch = POINT_CHANNEL.exec(path);
+      return ch && ch[1] !== 'radius' && index >= 0 && index < 3 ? (v) => v - target[index] : undefined;
+    });
+  }
+  if (type === 'GEOMETRY_ORIGIN') return;
+  // the origin moves onto the old centre, so nothing moves visually; children keep their world transform
+  const origin = transformPoint3(world, target);
+  const children = new Map(ctx.doc.childrenOf(o.id).map((c) => [c.id, ctx.doc.worldMatrix(c.id)]));
+  const w = world.slice();
+  w[12] = origin[0];
+  w[13] = origin[1];
+  w[14] = origin[2];
+  ctx.doc.setWorldMatrix(o.id, w);
+  for (const [cid, cw] of children) ctx.doc.setWorldMatrix(cid, cw);
+}
+
+/**
+ * object.shade_smooth / shade_flat for a curve object: sets use_smooth on every spline (Blender's
+ * curve smooth flag; shared data changes for all its users). Text is always smooth shaded with its
+ * shading split at sharp corners, so flat shading is reported as unsupported for it.
+ */
+export function curveShadeSet(ctx: OperatorContext, o: ObjectData, smooth: boolean): void {
+  if (o.type === 'FONT') {
+    if (!smooth)
+      ctx.report('WARNING', `'${o.name}': text is always smooth shaded (convert it to a mesh to shade it flat)`);
+    return;
+  }
+  const curve = o.type === 'CURVE' && o.data ? ctx.doc.getCurve(o.data) : null;
+  if (!curve) return;
+  const splines = (Array.isArray(curve.splines) ? curve.splines : []).map((s) => ({
+    ...sanitizeSpline(s),
+    use_smooth: smooth,
+  }));
+  ctx.doc.updateCurve(curve.id, { splines });
 }
 
 // ------------------------------------------------------------------ operators
@@ -934,7 +1354,8 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
           .describe('Interpolation from this keyframe to the next'),
       }),
       execute(ctx, p) {
-        const { curve } = curveTarget(ctx, p.object);
+        const { object: o, curve } = curveTarget(ctx, p.object);
+        checkCurveChannel(o, curve, p.path, p.index);
         const frame = p.frame ?? ctx.state.frame;
         const inserted = keyProperty(ctx, 'curve', curve.id, p.path, frame, {
           index: p.index,

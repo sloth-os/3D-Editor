@@ -101,7 +101,10 @@ export interface SoftwareRenderOptions {
   wireframe?: boolean;
   /**
    * RASTER: supersampling factor for anti-aliasing (1, 2 or 4; default 2).
-   * PATHTRACER: samples per pixel (default: render settings `samples`).
+   * PATHTRACER: samples per pixel, but only when `engine: 'PATHTRACER'` is passed explicitly. When
+   * the engine comes from the scene's render settings, `samples` keeps its anti-aliasing meaning
+   * and the path tracer renders the render settings' `samples` (callers unaware of the engine pass
+   * an anti-aliasing factor here, which must not turn into a 1–4 sample path trace).
    */
   samples?: number;
   /**
@@ -342,7 +345,8 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       width,
       height,
       images: new TextureCache(doc),
-      options: opts,
+      // a sample count only from callers that picked the path tracer themselves (see `samples`)
+      options: opts.engine === 'PATHTRACER' ? opts : { ...opts, samples: undefined },
     });
     return { width: pt.width, height: pt.height, data: pt.data };
   }

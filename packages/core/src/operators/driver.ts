@@ -71,12 +71,22 @@ const targetRef = (fallback: string) =>
         `Default: ${fallback}`,
     );
 
+/** Data path examples shared by the driver and keyframe path descriptions. */
+const PATH_EXAMPLES =
+  'object "location", "rotation_euler" (radians), "scale", "color", \'pose.bones["Bone"].rotation_euler\', ' +
+  '\'modifiers["Wave"].height\', \'constraints["Track To"].influence\'; material "base_color", "roughness", ' +
+  '"emission_strength"; light "energy", "color"; camera "lens"; world "strength"; mesh ' +
+  '\'shape_keys["Smile"].value\'; curve "bevel_depth", "eval_time"';
+
+/** Paths drivers can drive and variables can read: any numeric property, custom properties too. */
 const PATH_HELP =
-  'Data path in Blender syntax, e.g. object "location", "rotation_euler" (radians), "scale", "color", ' +
-  '\'pose.bones["Bone"].rotation_euler\', \'custom_props["amount"]\', \'modifiers["Wave"].height\', ' +
-  '\'constraints["Track To"].influence\'; material "base_color", "roughness", "emission_strength"; light ' +
-  '"energy", "color"; camera "lens"; world "strength"; mesh \'shape_keys["Smile"].value\'; curve "bevel_depth", ' +
-  '"eval_time"';
+  `Data path in Blender syntax, e.g. ${PATH_EXAMPLES}; also custom properties ('custom_props["amount"]') ` +
+  'and other numeric properties';
+
+/** Paths that can get keyframes (animatable properties; custom properties can only be driven). */
+const KEYFRAME_PATH_HELP =
+  `Animatable property, data path in Blender syntax, e.g. ${PATH_EXAMPLES}. Custom properties ` +
+  '(custom_props) cannot be keyframed: drive them with anim.driver_add instead';
 
 const KIND: Record<AnimTargetType, DatablockKind | null> = {
   object: 'objects',
@@ -189,6 +199,20 @@ function channelCount(data: Record<string, unknown>, t: Target, path: string): n
   );
 }
 
+/** INVALID_PARAMS error for a data path that cannot get keyframes, with a hint at what can. */
+function notAnimatableError(t: Target, path: string, consequence?: string): OperatorError {
+  const known = Object.keys(ANIMATABLE[t.type] ?? {});
+  const hint = /^custom_props\s*\[/.test(path)
+    ? ': custom properties can be driven (anim.driver_add) but not keyframed'
+    : known.length
+      ? ` (animatable ${t.type} properties: ${known.join(', ')}, or nested paths as in the path description)`
+      : ' (see the path description for animatable paths)';
+  return new OperatorError(
+    `Property '${path}' of ${t.type} is not animatable${consequence ? `, ${consequence}` : ''}${hint}`,
+    'INVALID_PARAMS',
+  );
+}
+
 /** Channel indices addressed by `index` (-1 = all) for a property with `count` channels. */
 function channelsOf(count: number, index: number, path: string): number[] {
   if (index < 0) return Array.from({ length: count }, (_, i) => i);
@@ -264,14 +288,29 @@ function validateDriver(expression: string, variables: DriverVariable[], channel
     );
 }
 
-/** JSON description of drivers with their evaluated property value (and error) at `frame`. */
+/**
+ * JSON description of drivers with their evaluated property value (and error) at `frame`.
+ * Tolerates malformed stored drivers (e.g. from old or foreign snapshots): they are listed with
+ * their problems as `error`, so one bad driver never hides the others.
+ */
 function describeDrivers(ctx: OperatorContext, drivers: DriverData[], frame: number) {
   const fs = new FrameState(ctx.doc, frame);
   return drivers.map((d) => {
     const key = fcurveKey(d);
-    const block = fs.get<Record<string, unknown>>(d.target_type, d.target_id);
-    const error = fs.errors.find((e) => e.source === `driver:${key}`)?.message ?? null;
-    const value = block ? (readChannel(block, d.path, d.index) ?? null) : null;
+    let value: number | null = null;
+    let error: string | null = null;
+    try {
+      const block = fs.get<Record<string, unknown>>(d.target_type, d.target_id);
+      error = fs.errors.find((e) => e.source === `driver:${key}`)?.message ?? null;
+      value = block && typeof d.path === 'string' ? (readChannel(block, d.path, d.index) ?? null) : null;
+    } catch (e) {
+      error = (e as Error).message;
+    }
+    if (!error && (!Array.isArray(d.variables) || typeof d.expression !== 'string')) {
+      const problems = driverProblems({ expression: d.expression, variables: d.variables });
+      if (problems.length) error = problems.join('; ');
+    }
+    const vars: unknown[] = Array.isArray(d.variables) ? d.variables : [];
     return {
       key,
       target_type: d.target_type,
@@ -280,10 +319,13 @@ function describeDrivers(ctx: OperatorContext, drivers: DriverData[], frame: num
       path: d.path,
       index: d.index,
       expression: d.expression,
-      variables: (d.variables ?? []).map((v) => ({
-        ...v,
-        target_name: targetName(ctx.doc, v.target_type, v.target_id),
-      })),
+      variables: vars.map((raw) => {
+        const v = raw as Partial<DriverVariable> | null;
+        if (!v || typeof v !== 'object') return { malformed: raw ?? null };
+        const name =
+          typeof v.target_id === 'string' && v.target_type ? targetName(ctx.doc, v.target_type, v.target_id) : null;
+        return { ...v, target_name: name };
+      }),
       mute: !!d.mute,
       /** Property value at the frame (driven unless muted or failing). */
       value,
@@ -302,7 +344,7 @@ function driversOf(ctx: OperatorContext, t: Target, path?: string, index = -1): 
         (path === undefined || d.path === path) &&
         (index < 0 || d.index === index),
     )
-    .sort((a, b) => a.path.localeCompare(b.path) || a.index - b.index);
+    .sort((a, b) => String(a.path).localeCompare(String(b.path)) || a.index - b.index);
 }
 
 function noDriverError(ctx: OperatorContext, t: Target, path?: string, index = -1): OperatorError {
@@ -608,7 +650,8 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         const updated: DriverData[] = found.map((d) => ({
           ...d,
           expression: p.expression ?? d.expression,
-          variables: variables ?? d.variables ?? [],
+          // a malformed stored list (evaluated as no variables) is rewritten as an empty one
+          variables: variables ?? (Array.isArray(d.variables) ? d.variables : []),
           mute: p.mute ?? !!d.mute,
         }));
         // validate every driver before writing any (e.g. new variables missing a name one uses)
@@ -717,12 +760,13 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         "below Blender's Cycles modifier). A driven channel ignores its curve and modifiers while the driver is " +
         'active (a warning is reported). Params: ' +
         FMOD_PARAM_HELP +
-        '. Returns the added modifiers (curve key, stack position, validated params) and the created curves.',
+        '. Returns the added modifiers (curve key, stack position, validated params), the created curves and, ' +
+        'when some channels are driven, driven_channels.',
       category: 'Animation',
       schema: z.object({
         target_type: targetTypeSchema,
         target: targetRef('the active object (or its data)'),
-        path: z.string().min(1).describe(`Animated property. ${PATH_HELP}`),
+        path: z.string().min(1).describe(KEYFRAME_PATH_HELP),
         index: z
           .number()
           .int()
@@ -763,10 +807,7 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         );
         if (missing.length) {
           if (!isAnimatable(t.type, p.path))
-            throw new OperatorError(
-              `Property '${p.path}' of ${t.type} is not animatable, so it cannot get an animation curve`,
-              'INVALID_PARAMS',
-            );
+            throw notAnimatableError(t, p.path, 'so it cannot get an animation curve');
           const data = targetData(ctx, t);
           for (const index of missing)
             if (readChannel(data, p.path, index) === undefined)
@@ -775,6 +816,20 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
                 'INVALID_PARAMS',
               );
         }
+        // an active driver overrides the curve of its channel, modifiers included (Blender would
+        // apply them to the driver's own curve, which drivers here do not have)
+        const driven = channels.filter((index) => {
+          const d = ctx.doc.getDriver(fcurveKey({ target_type: t.type, target_id: t.id, path: p.path, index }));
+          return !!d && !d.mute;
+        });
+        if (driven.length)
+          ctx.report(
+            'WARNING',
+            `${p.path}[${driven.join(', ')}] of '${t.name}' ${driven.length === 1 ? 'is' : 'are'} driven: the ` +
+              `driver overrides the animation curve and its modifiers, so this ${p.type} modifier has no effect ` +
+              'while the driver is active (mute or remove the driver with anim.driver_update / ' +
+              'anim.driver_remove, or put the effect into its expression, e.g. "... + noise(frame / 10)")',
+          );
         const created: string[] = [];
         const added: ReturnType<typeof modifierInfo>[] = [];
         channels.forEach((index, k) => {
@@ -799,7 +854,11 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           writeFCurve(ctx.doc, fc, modifiers);
           added.push(modifierInfo({ ...fc, modifiers }, modifiers.length - 1));
         });
-        return { modifiers: added, created_fcurves: created };
+        return {
+          modifiers: added,
+          created_fcurves: created,
+          ...(driven.length ? { driven_channels: driven } : {}),
+        };
       },
     }),
   );
@@ -1009,7 +1068,7 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
       schema: z.object({
         target_type: targetTypeSchema,
         target: targetRef('the active object (or its data)'),
-        path: z.string().min(1).describe(`Animatable property. ${PATH_HELP}`),
+        path: z.string().min(1).describe(KEYFRAME_PATH_HELP),
         index: z
           .number()
           .int()
@@ -1047,8 +1106,7 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
             'INVALID_PARAMS',
           );
         const t = resolveTarget(ctx, p.target_type, p.target);
-        if (!isAnimatable(t.type, p.path))
-          throw new OperatorError(`Property '${p.path}' of ${t.type} is not animatable`, 'INVALID_PARAMS');
+        if (!isAnimatable(t.type, p.path)) throw notAnimatableError(t, p.path);
         channelsOf(channelCount(targetData(ctx, t), t, p.path), p.index, p.path);
         const key = fcurveKey({ target_type: t.type, target_id: t.id, path: p.path, index: p.index });
         const fc =

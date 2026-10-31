@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { SceneDoc, createPlane, createUVSphere, renderSceneSoftware, type RenderedImage } from '../src';
+import {
+  SceneDoc,
+  base64Decode,
+  createEditorState,
+  createOperatorRegistry,
+  createPlane,
+  createUVSphere,
+  decodePNG,
+  renderSceneSoftware,
+  type OperatorContext,
+  type RenderedImage,
+} from '../src';
 import {
   PathFilm,
   PathTracer,
@@ -71,9 +82,10 @@ describe('renderSceneSoftware dispatch', () => {
     expect(centre(raster).slice(0, 3)).toEqual([0, 0, 0]); // no indirect light in the rasterizer
     const pt = renderSceneSoftware(doc, { ...opts, engine: 'PATHTRACER' });
     expect(centre(pt)[0]).toBeGreaterThan(40);
-    // the scene's render engine is used when the option is unset …
-    doc.updateRender({ engine: 'PATHTRACER' });
-    expect(same(renderSceneSoftware(doc, opts), pt)).toBe(true);
+    // the scene's render engine is used when the option is unset (with the render settings'
+    // samples: without an explicit engine `samples` is the anti-aliasing factor) …
+    doc.updateRender({ engine: 'PATHTRACER', samples: 16 });
+    expect(same(renderSceneSoftware(doc, { ...opts, samples: 2 }), pt)).toBe(true);
     // … and the option wins over it
     expect(same(renderSceneSoftware(doc, { ...opts, engine: 'RASTER' }), raster)).toBe(true);
     // SOLID shading and wireframe overlays always rasterize
@@ -90,11 +102,16 @@ describe('renderSceneSoftware dispatch', () => {
     const a = renderSceneSoftware(doc, base);
     expect(same(a, renderSceneSoftware(doc, base))).toBe(true); // deterministic
     expect(same(a, renderSceneSoftware(doc, { ...base, seed: 7 }))).toBe(false);
-    expect(same(a, renderSceneSoftware(doc, { ...base, samples: 4 }))).toBe(false);
+    // samples per pixel come from `samples` only with an explicit engine
+    expect(same(a, renderSceneSoftware(doc, { ...base, engine: 'PATHTRACER', samples: 4 }))).toBe(false);
+    expect(same(a, renderSceneSoftware(doc, { ...base, samples: 4 }))).toBe(true);
     expect(same(a, renderSceneSoftware(doc, { ...base, denoise: true }))).toBe(false);
-    expect(same(a, renderSceneSoftware(doc, { ...base, samples: 8, denoise: false, max_bounces: 2 }))).toBe(
-      true,
-    );
+    expect(
+      same(
+        a,
+        renderSceneSoftware(doc, { ...base, engine: 'PATHTRACER', samples: 8, denoise: false, max_bounces: 2 }),
+      ),
+    ).toBe(true);
     // zero bounces still gives direct light (Cycles semantics); bounces add indirect light
     const direct = centre(renderSceneSoftware(doc, { ...base, max_bounces: 0 }))[0];
     expect(direct).toBeGreaterThan(40);
@@ -103,6 +120,28 @@ describe('renderSceneSoftware dispatch', () => {
     const passes: number[] = [];
     renderSceneSoftware(doc, { ...base, samples: 8, onProgress: (p) => void passes.push(p.samples) });
     expect(passes).toEqual([1, 3, 7, 8]);
+  });
+
+  it('path traces operator renders with the render settings samples (their samples are anti-aliasing)', () => {
+    // regression: render.render_software passes its anti-aliasing factor (default 2) as `samples`,
+    // which made scenes with engine PATHTRACER render at 2 samples per pixel
+    const doc = emitterLitFloor();
+    doc.updateRender({ engine: 'PATHTRACER', samples: 24, use_denoising: false });
+    const reg = createOperatorRegistry();
+    const ctx: OperatorContext = {
+      doc,
+      state: createEditorState(),
+      origin: doc.origin,
+      source: 'test',
+      report: () => {},
+    };
+    const res = reg.run<{ data_base64: string }>(ctx, 'render.render_software', { width: 12, height: 12 });
+    expect(res.ok).toBe(true);
+    const img = decodePNG(base64Decode(res.result!.data_base64));
+    const opts = { width: 12, height: 12, frame: ctx.state.frame, engine: 'PATHTRACER' } as const;
+    const full = renderSceneSoftware(doc, { ...opts, samples: 24 });
+    expect(Buffer.from(img.data).equals(Buffer.from(full.data))).toBe(true);
+    expect(same(full, renderSceneSoftware(doc, { ...opts, samples: 2 }))).toBe(false);
   });
 
   it('applies the exposure like the rasterizer and returns straight alpha', () => {

@@ -12,14 +12,19 @@ import {
 } from '../src';
 import { decodeAPNG, decodeGIF } from './render-animation-helpers';
 
-/** Default scene with the cube sliding along X over frames 1..6 and a 64×36 render resolution. */
-function setup() {
-  const doc = SceneDoc.create();
-  const cube = doc.findObjectByName('Cube')!.id;
-  let fc = createFCurve({ target_type: 'object', target_id: cube, path: 'location', index: 0 });
-  fc = insertKeyframe(fc, 1, -1.5, 'LINEAR');
-  fc = insertKeyframe(fc, 6, 1.5, 'LINEAR');
-  doc.setFCurve(fc);
+/**
+ * Default scene with the cube sliding along X over frames 1..6 and a 64×36 render resolution
+ * (`empty`: no objects, for cheap renders of large frames).
+ */
+function setup(empty = false) {
+  const doc = SceneDoc.create({ empty });
+  if (!empty) {
+    const cube = doc.findObjectByName('Cube')!.id;
+    let fc = createFCurve({ target_type: 'object', target_id: cube, path: 'location', index: 0 });
+    fc = insertKeyframe(fc, 1, -1.5, 'LINEAR');
+    fc = insertKeyframe(fc, 6, 1.5, 'LINEAR');
+    doc.setFCurve(fc);
+  }
   doc.updateScene({ frame_start: 1, frame_end: 6, fps: 24 });
   doc.updateRender({ resolution_x: 64, resolution_y: 36, resolution_percentage: 100 });
   const reg = createOperatorRegistry();
@@ -117,7 +122,7 @@ describe('render.render_animation', () => {
   });
 
   it('keeps the render aspect when the derived side would exceed 2048 pixels', () => {
-    const { doc, ok } = setup();
+    const { doc, ok } = setup(true); // nothing to draw: large frames stay cheap
     doc.updateRender({ resolution_x: 1920, resolution_y: 1080, resolution_percentage: 100 });
     const wide = ok({ format: 'APNG', frame_end: 1, height: 2048, samples: 1 });
     expect([wide.width, wide.height]).toEqual([2048, 1152]);

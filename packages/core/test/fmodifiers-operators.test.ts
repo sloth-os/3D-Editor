@@ -120,6 +120,68 @@ describe('anim.fmodifier_add', () => {
     expect(new SceneEvaluator(doc).evaluate(10).byId.get(cam)!.camera!.lens).toBe(30);
   });
 
+  it('warns that a modifier on a driven channel has no effect while the driver is active', () => {
+    const { doc, ok, reports, cam } = setup();
+    ok('anim.driver_add', { path: 'location', index: 0, expression: 'frame / 10' });
+    const res = ok('anim.fmodifier_add', { path: 'location', index: 0, type: 'NOISE', params: { strength: 5 } });
+    expect(res.driven_channels).toEqual([0]);
+    expect(reports.some((r) => /location\[0\] of 'Cam' is driven: .*NOISE modifier has no effect/.test(r))).toBe(
+      true,
+    );
+    // indeed: the driver decides the value
+    const ev = new SceneEvaluator(doc);
+    expect([1, 2, 3].map((f) => ev.evaluate(f).byId.get(cam)!.data.location[0])).toEqual([0.1, 0.2, 0.3]);
+    // a muted driver does not override the curve: no warning, and the modifier works
+    ok('anim.driver_update', { path: 'location', index: 0, mute: true });
+    reports.length = 0;
+    const again = ok('anim.fmodifier_add', { path: 'location', index: 0, type: 'NOISE', params: { strength: 5 } });
+    expect(again.driven_channels).toBeUndefined();
+    expect(reports).toEqual([]);
+    // every channel of a path: only the driven ones are named
+    ok('anim.driver_add', { path: 'rotation_euler', index: 2, expression: 'frame' });
+    const all = ok('anim.fmodifier_add', { path: 'rotation_euler', type: 'STEPPED' });
+    expect(all.driven_channels).toEqual([2]);
+  });
+
+  it('explains that custom properties can be driven but not keyframed', () => {
+    const { doc, run, reg, ctx } = setup();
+    const a = doc.addObject({ type: 'EMPTY', name: 'A', custom_props: { amount: 2 } });
+    ctx.state.activeId = a;
+    ctx.state.selectedIds = [a];
+    const path = 'custom_props["amount"]';
+    for (const [id, params] of [
+      ['anim.keyframes_insert_many', { path, frames: [1, 10], values: [0, 1] }],
+      ['anim.fmodifier_add', { path, type: 'NOISE' }],
+    ] as const) {
+      const r = run(id, params);
+      expect(r.ok).toBe(false);
+      expect(r.error).toMatch(/custom properties can be driven \(anim\.driver_add\) but not keyframed/);
+    }
+    expect(run('anim.driver_add', { path, expression: 'frame * 2' }).ok).toBe(true);
+    // the keyframe operators do not advertise custom properties as example paths; drivers do
+    const desc = (id: string) =>
+      (reg.describe().find((i) => i.id === id)!.parameters as { properties: { path: { description: string } } })
+        .properties.path.description;
+    for (const id of ['anim.keyframes_insert_many', 'anim.fmodifier_add']) {
+      expect(desc(id)).toMatch(/cannot be keyframed/);
+      expect(desc(id)).not.toMatch(/'custom_props\["amount"\]'/);
+    }
+    expect(desc('anim.driver_add')).toMatch(/custom_props\["amount"\]/);
+    // other unanimatable paths name the animatable properties
+    expect(run('anim.keyframes_insert_many', { path: 'name', frames: [1], values: [0] }).error).toMatch(
+      /animatable object properties: location, rotation_euler, scale, color/,
+    );
+  });
+
+  it('documents time and cyclic modifier semantics for agents', () => {
+    const { reg } = setup();
+    const desc = (id: string) => reg.describe().find((i) => i.id === id)!.description;
+    expect(desc('anim.fmodifier_add')).toMatch(/every value modifier .* wherever it is in the stack/);
+    expect(desc('anim.fmodifier_add')).not.toMatch(/value modifiers below them/);
+    expect(desc('anim.fmodifier_add')).toMatch(/CYCLIC extrapolation the value modifiers repeat with every cycle/);
+    expect(desc('anim.extrapolation_set')).toMatch(/repeats the curve's F-modifiers with every cycle/);
+  });
+
   it('validates types, params and channels', () => {
     const { run } = setup();
     expect(run('anim.fmodifier_add', { path: 'location', type: 'CYCLES' }).error).toMatch(

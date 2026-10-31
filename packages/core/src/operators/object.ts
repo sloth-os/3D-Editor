@@ -32,7 +32,13 @@ import {
   clearBoneParent,
   remapDuplicatedReferences,
 } from './armature';
-import { convertCurveObject } from './curve';
+import {
+  applyCurveTransform,
+  checkCurveTransformApply,
+  convertCurveObject,
+  curveOriginSet,
+  curveShadeSet,
+} from './curve';
 
 const placement = {
   location: vec3.optional().describe('World location (defaults to the 3D cursor)'),
@@ -610,16 +616,28 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.transform_apply',
       label: 'Apply Transform',
-      description: "Apply the selected objects' location/rotation/scale to their mesh data (Ctrl+A).",
+      description:
+        "Apply the selected objects' location/rotation/scale to their mesh data (Ctrl+A). Curves transform " +
+        'their control points; 2D curves can only take rotations about Z and X/Y locations, text only a uniform ' +
+        'scale (the operator fails without changing anything otherwise).',
       category: 'Object',
       redoable: true,
       schema: z.object({
         location: z.boolean().default(false),
         rotation: z.boolean().default(true),
         scale: z.boolean().default(true),
+        properties: z
+          .boolean()
+          .default(true)
+          .describe(
+            'Curves and text: also scale curve point radii and font size/offset/bevel/extrude, so tubes and ' +
+              'text keep their thickness (Blender "Apply Properties")',
+          ),
       }),
       poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
       execute(ctx, p) {
+        // curves and text cannot absorb every transform: refuse before anything changes
+        checkCurveTransformApply(ctx, selectedObjects(ctx), p);
         for (const o of selectedObjects(ctx)) {
           const loc: Vec3 = p.location ? [0, 0, 0] : o.location;
           const rot: Vec3 = p.rotation ? [0, 0, 0] : o.rotation_euler;
@@ -648,7 +666,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
               if (m.uvs) m.uvs = m.uvs.map((uv) => reversePairs(uv));
             }
             ctx.doc.setMesh(meshId, m);
-          }
+          } else if (o.type === 'CURVE' || o.type === 'FONT') applyCurveTransform(ctx, o, delta, p.properties);
           // children keep their world transform
           const childWorld = new Map(ctx.doc.childrenOf(o.id).map((c) => [c.id, ctx.doc.worldMatrix(c.id)]));
           ctx.doc.updateObject(o.id, { location: loc, rotation_euler: rot, scale: scl });
@@ -672,6 +690,8 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
       execute(ctx, p) {
         for (const o of selectedObjects(ctx)) {
+          // curves move their control points, text its offset_x/offset_y
+          if (o.type === 'CURVE' || o.type === 'FONT') curveOriginSet(ctx, o, p.type, p.center);
           if (o.type !== 'MESH' || !o.data) continue;
           const meshId = singleUserMesh(ctx, o);
           const m = cloneMesh(ctx.doc.getMesh(meshId)!);
@@ -717,13 +737,19 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       defineOperator({
         id,
         label,
-        description: `Set ${smooth ? 'smooth' : 'flat'} shading on all faces of the selected mesh objects.`,
+        description:
+          `Set ${smooth ? 'smooth' : 'flat'} shading on all faces of the selected mesh objects ` +
+          '(curve objects: the use_smooth flag of every spline; text is always smooth shaded).',
         category: 'Object',
         schema: z.object({}),
         poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
         execute(ctx) {
           const done = new Set<string>();
           for (const o of selectedObjects(ctx)) {
+            if ((o.type === 'CURVE' || o.type === 'FONT') && !done.has(o.data ?? o.id)) {
+              done.add(o.data ?? o.id);
+              curveShadeSet(ctx, o, smooth);
+            }
             if (o.type !== 'MESH' || !o.data || done.has(o.data)) continue;
             done.add(o.data);
             const m = cloneMesh(ctx.doc.getMesh(o.data)!);
@@ -938,7 +964,8 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         'Convert the selected objects. MESH: bake the evaluated geometry — applies the modifiers of mesh objects; ' +
         'curve and text objects become meshes (surface, or loose edges for plain wires) keeping name, transform and ' +
         'materials. CURVE: turns text objects into 2D curve objects of their glyph outlines. ' +
-        'Returns {converted: [{object, name, type}]}.',
+        'Returns {converted: [{object, name, type}]} listing every object that changed (mesh objects whose ' +
+        'modifiers were applied included).',
       category: 'Object',
       schema: z.object({
         target: z.enum(['MESH', 'CURVE']).default('MESH').describe('Object type to convert to'),
@@ -963,6 +990,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           const meshId = singleUserMesh(ctx, o);
           ctx.doc.setMesh(meshId, cloneMesh(mesh));
           ctx.doc.updateObject(o.id, { modifiers: [] });
+          converted.push({ object: o.id, name: o.name, type: 'MESH' });
         }
         const convertedIds = converted.map((c) => c.object);
         if (p.keep_original && convertedIds.length) setSelection(ctx, convertedIds);

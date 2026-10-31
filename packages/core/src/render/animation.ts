@@ -1085,7 +1085,10 @@ export interface AnimationRenderOptions {
    */
   camera?: string;
   shading?: 'SOLID' | 'MATERIAL';
-  /** Anti-aliasing supersampling (raster) or samples per pixel (path tracer). */
+  /**
+   * Anti-aliasing supersampling (raster) or samples per pixel (path tracer, also when the engine
+   * comes from the render settings; default: render settings `samples`).
+   */
   samples?: number;
   /** PATHTRACER: maximum bounces (default: render settings `max_bounces`). */
   max_bounces?: number;
@@ -1300,7 +1303,8 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
     shading: opts.shading,
     samples: opts.samples,
     background: opts.background,
-    engine: opts.engine,
+    // explicit, so that `samples` means samples per pixel when the scene's engine path traces
+    engine: opts.engine ?? settings.engine,
     max_bounces: opts.max_bounces,
     denoise: opts.denoise,
     time_limit: opts.time_limit,

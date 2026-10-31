@@ -319,6 +319,42 @@ describe('anim.driver_update / driver_remove / driver_list', () => {
     expect(ok('anim.driver_list', { target: 'Wheel' }).drivers[0].value).toBe(10);
     expect(um.undoStack).toHaveLength(0);
   });
+
+  it('lists malformed stored drivers with their problem instead of failing', () => {
+    const { doc, ok, run, car, wheel } = setup();
+    // e.g. from an old or foreign snapshot, another client or the JavaScript console
+    const bad = (path: string, index: number, variables: unknown) =>
+      doc.setDriver({
+        target_type: 'object',
+        target_id: wheel,
+        path,
+        index,
+        expression: 'frame',
+        variables: variables as never,
+        mute: false,
+      });
+    bad('location', 0, {});
+    bad('location', 1, [null, 5, { name: 'cx', target_type: 'object', target_id: car, path: 'location', index: 0 }]);
+    bad('location', 2, undefined);
+    ok('anim.driver_add', { target: 'Car', path: 'location', index: 2, expression: 'frame * 2' });
+    expect(evalAt(doc, 3).byId.get(wheel)!.data.location[0]).toBe(3); // the evaluator copes
+    const list = ok('anim.driver_list', { frame: 3 }).drivers;
+    expect(list).toHaveLength(4);
+    const at = (target: string, index: number) =>
+      list.find((d: { target_id: string; index: number }) => d.target_id === target && d.index === index);
+    expect(at(wheel, 0)).toMatchObject({ value: 3, variables: [], error: 'Driver variables must be a list' });
+    expect(at(wheel, 1).variables).toEqual([
+      { malformed: null },
+      { malformed: 5 },
+      expect.objectContaining({ name: 'cx', target_name: 'Car' }),
+    ]);
+    expect(at(wheel, 1).error).toMatch(/Malformed driver variable/);
+    expect(at(wheel, 2)).toMatchObject({ value: 3, variables: [], error: null });
+    expect(at(car, 2)).toMatchObject({ value: 6, error: null });
+    // updating a malformed driver rewrites its variables as a valid (empty) list
+    expect(run('anim.driver_update', { path: 'location', index: 0, mute: true }).ok).toBe(true);
+    expect(doc.getDriver(`object:${wheel}:location:0`)).toMatchObject({ variables: [], mute: true });
+  });
 });
 
 describe('driver operators: undo, persistence and descriptions', () => {
