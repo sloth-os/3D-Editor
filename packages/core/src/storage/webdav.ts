@@ -159,7 +159,11 @@ export class WebDAVClient implements FileStore {
     if (res.status === 404) return null;
     if (!res.ok) throw new WebDAVError(`GET ${path} failed: ${res.status}`, res.status);
     const data = new Uint8Array(await res.arrayBuffer());
-    return { data, etag: res.headers.get('ETag') ?? undefined };
+    let etag = res.headers.get('ETag') ?? undefined;
+    // Some servers omit ETag on GET (or CORS hides it); PROPFIND still reports getetag, which keeps
+    // conditional (If-Match) writes possible.
+    if (!etag) etag = (await this.stat(path).catch(() => null))?.etag;
+    return { data, etag };
   }
 
   async stat(path: string): Promise<DavResponse | null> {

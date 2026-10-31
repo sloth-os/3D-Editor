@@ -50,7 +50,9 @@ export function ProjectList({ onOpened }: { onOpened?: () => void }) {
       setErrors(r.errors);
     });
   };
-  useEffect(refresh, []);
+  // Re-list when the server becomes known (the welcome page renders before /api/config answers).
+  const cfg = serverConfig.value;
+  useEffect(refresh, [cfg]);
   const open = async (id: string) => {
     setBusy(id);
     try {
