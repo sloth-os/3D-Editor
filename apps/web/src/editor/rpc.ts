@@ -26,6 +26,18 @@ export function installRpcHandler(): () => void {
           cameraId:
             typeof p.camera === 'string' ? (s.doc.resolveObject(p.camera)?.id ?? undefined) : undefined,
           useViewport: !!p.use_viewport,
+          view:
+            (p.view as {
+              position: number[];
+              target: number[];
+              up?: number[];
+              fov_degrees?: number;
+            } | null) ?? null,
+          shading:
+            typeof p.shading === 'string'
+              ? (p.shading.toUpperCase() as 'SOLID' | 'MATERIAL' | 'RENDERED' | 'WIREFRAME')
+              : null,
+          frame: typeof p.frame === 'number' ? p.frame : null,
         });
         return { mime: 'image/png', data_base64: r.dataUrl.split(',')[1], width: r.width, height: r.height };
       }

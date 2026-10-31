@@ -616,7 +616,18 @@ export class ViewportEngine {
 
   /** Renders the scene from the active camera into a PNG data URL at a given size (F12 / RPC). */
   async renderImage(
-    opts: { width?: number; height?: number; cameraId?: string; useViewport?: boolean } = {},
+    opts: {
+      width?: number;
+      height?: number;
+      cameraId?: string;
+      useViewport?: boolean;
+      /** Explicit viewpoint (world space, Z up); fov in degrees. */
+      view?: { position: number[]; target: number[]; up?: number[]; fov_degrees?: number } | null;
+      /** Viewport shading for the image (default RENDERED). */
+      shading?: 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED' | null;
+      /** Evaluate the scene at this frame. */
+      frame?: number | null;
+    } = {},
   ): Promise<{ dataUrl: string; width: number; height: number }> {
     const span = telemetry.startSpan('render.image');
     try {
@@ -629,7 +640,14 @@ export class ViewportEngine {
       const aspect = width / height;
       let cam: THREE.Camera;
       const camObj = opts.cameraId ? ev.byId.get(opts.cameraId) : ev.activeCamera;
-      if (!opts.useViewport && camObj?.camera) {
+      if (opts.view) {
+        const v = opts.view;
+        const pc = new THREE.PerspectiveCamera(v.fov_degrees ?? 50, aspect, 0.01, 10000);
+        pc.up.set(...((v.up ?? [0, 0, 1]) as [number, number, number]));
+        pc.position.set(...(v.position as [number, number, number]));
+        pc.lookAt(new THREE.Vector3(...(v.target as [number, number, number])));
+        cam = pc;
+      } else if (!opts.useViewport && camObj?.camera) {
         const cd = camObj.camera;
         const m = new THREE.Matrix4().fromArray(camObj.worldMatrix);
         if (cd.type === 'ORTHO') {
@@ -664,7 +682,10 @@ export class ViewportEngine {
       // final render: rendered shading, no overlays
       const prevShading = this.session.view.shading.value;
       const prevOverlays = this.session.view.overlays.value;
-      this.session.view.shading.value = 'RENDERED';
+      const prevFrame = this.session.state.frame;
+      if (typeof opts.frame === 'number' && Number.isFinite(opts.frame))
+        this.session.state.frame = opts.frame;
+      this.session.view.shading.value = opts.shading ?? 'RENDERED';
       this.session.view.overlays.value = false;
       this.sync();
       const target = new THREE.WebGLRenderTarget(width, height, { samples: 8, type: THREE.HalfFloatType });
@@ -715,6 +736,7 @@ export class ViewportEngine {
       (quad.material as THREE.Material).dispose();
       this.session.view.shading.value = prevShading;
       this.session.view.overlays.value = prevOverlays;
+      this.session.state.frame = prevFrame;
       this.invalidate();
       // flip rows (WebGL origin is bottom-left)
       const canvas = document.createElement('canvas');
