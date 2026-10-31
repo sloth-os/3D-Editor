@@ -8,3 +8,5 @@ export * from './eval';
 export * from './operators';
 export * from './sync';
 export * from './storage';
+export * from './io';
+export * from './render';
