@@ -87,6 +87,10 @@ export class ViewportInteraction {
     if (this.gizmoStart) return;
     this.gizmo.camera = this.engine.camera;
     if (this.gizmo.mode !== gmode) this.gizmo.setMode(gmode);
+    const snap = this.session.view.snapping.value;
+    this.gizmo.setTranslationSnap(snap ? (this.engine.pose.distance > 4 ? 1 : 0.1) : null);
+    this.gizmo.setRotationSnap(snap ? THREE.MathUtils.degToRad(5) : null);
+    this.gizmo.setScaleSnap(snap ? 0.1 : null);
     const p = selectionPivot(this.session.doc, st);
     this.gizmoProxy.position.set(p[0], p[1], p[2]);
     this.gizmoProxy.quaternion.identity();
