@@ -52,7 +52,7 @@ test.describe('editor', () => {
     await expect(page.getByTestId('outliner-Box')).toBeVisible();
   });
 
-  test('edit mode: select all, extrude region and loop through select modes', async ({ page }) => {
+  test('edit mode: select the top face, extrude it and return to object mode', async ({ page }) => {
     await newProject(page);
     await page.getByTestId('outliner-Cube').click();
     const vp = page.getByTestId('viewport');
@@ -60,9 +60,14 @@ test.describe('editor', () => {
     await page.keyboard.press('Tab');
     await expect(page.getByTestId('mode-select')).toHaveValue('EDIT');
     await page.keyboard.press('3');
-    await page.keyboard.press('a');
-    await runFromPalette(page, 'extrude region shrink', 'Extrude Region and Shrink/Fatten');
-    await expect.poll(() => statNumber(page, 'stats-vertices')).toBeGreaterThan(8);
+    await menuPath(page, ['Select', 'Faces Facing Up']);
+    await expect(page.getByTestId('viewport-stats')).toContainText('Faces 1 selected');
+    await menuPath(page, ['Mesh', 'Extrude Region']);
+    await expect.poll(() => statNumber(page, 'stats-vertices')).toBe(12);
+    await expect(page.getByTestId('viewport-stats')).toContainText('Faces 10');
+    // the operator can be re-run from the palette too
+    await runFromPalette(page, 'inset', 'Inset Faces');
+    await expect.poll(() => statNumber(page, 'stats-vertices')).toBe(16);
     await vp.hover();
     await page.keyboard.press('Tab');
     await expect(page.getByTestId('mode-select')).toHaveValue('OBJECT');
