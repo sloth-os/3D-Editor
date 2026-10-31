@@ -23,7 +23,6 @@ function setup() {
     source: 'test',
     report: (level, message) => reports.push({ level, message }),
   };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const run = (id: string, params?: unknown) => reg.run<any>(ctx, id, params);
   const ok = (id: string, params?: unknown) => {
     const r = run(id, params);
@@ -74,9 +73,52 @@ describe('anim.driver_add', () => {
     const again = ok('anim.driver_add', { target: 'Wheel', path: 'scale', index: 2, expression: '3' });
     expect(again.replaced).toBe(1);
     expect(doc.listDrivers(wheel)).toHaveLength(3);
-    const refused = run('anim.driver_add', { target: 'Wheel', path: 'scale', index: 2, expression: '4', replace: false });
+    const refused = run('anim.driver_add', {
+      target: 'Wheel',
+      path: 'scale',
+      index: 2,
+      expression: '4',
+      replace: false,
+    });
     expect(refused.ok).toBe(false);
     expect(refused.error).toMatch(/already has a driver.*replace: true/);
+  });
+
+  it('changes nothing when it fails part way through the channels', () => {
+    const { doc, ok, run, wheel } = setup();
+    ok('anim.driver_add', { target: 'Wheel', path: 'location', index: 1, expression: '5' });
+    const before = JSON.stringify(doc.listDrivers(wheel));
+    const refused = run('anim.driver_add', {
+      target: 'Wheel',
+      path: 'location',
+      expression: '1',
+      replace: false,
+    });
+    expect(refused.error).toMatch(/location\[1\] already has a driver/);
+    expect(JSON.stringify(doc.listDrivers(wheel))).toBe(before); // channel 0 was not added
+    // driver_update validates every driver before writing: new variables lacking a name one uses
+    ok('anim.driver_add', {
+      target: 'Wheel',
+      path: 'scale',
+      index: 0,
+      expression: 'a',
+      variables: [{ name: 'a', target: 'Car', path: 'location' }],
+    });
+    ok('anim.driver_add', {
+      target: 'Wheel',
+      path: 'scale',
+      index: 1,
+      expression: 'b',
+      variables: [{ name: 'b', target: 'Car', path: 'location' }],
+    });
+    const drivers = JSON.stringify(doc.listDrivers(wheel));
+    const bad = run('anim.driver_update', {
+      target: 'Wheel',
+      path: 'scale',
+      variables: [{ name: 'a', target: 'Car', path: 'location' }],
+    });
+    expect(bad.error).toMatch(/Invalid driver scale\[1\]: Unknown name 'b'/);
+    expect(JSON.stringify(doc.listDrivers(wheel))).toBe(drivers);
   });
 
   it('reaches object data, materials and shape keys through their objects', () => {
@@ -86,15 +128,60 @@ describe('anim.driver_add', () => {
     const mat = doc.addMaterial({ name: 'Paint' });
     const meshId = doc.addMesh('Body', createMesh({ positions: [0, 0, 0], faces: [] }));
     doc.setShapeKeys(meshId, [
-      { name: 'Dent', value: 0, slider_min: 0, slider_max: 1, mute: false, relative_key: '', data: encodeFloat32([0, 0, 1]) },
+      {
+        name: 'Dent',
+        value: 0,
+        slider_min: 0,
+        slider_max: 1,
+        mute: false,
+        relative_key: '',
+        data: encodeFloat32([0, 0, 1]),
+      },
     ]);
     const body = doc.addObject({ type: 'MESH', name: 'BodyObj', data: meshId, material_slots: [mat] });
     const x = [{ name: 'x', target: 'Car', path: 'location', index: 0 }];
-    expect(ok('anim.driver_add', { target_type: 'light', target: 'Lamp', path: 'energy', expression: 'x * 100', variables: x }).drivers[0].target_id).toBe(lightData);
-    expect(ok('anim.driver_add', { target_type: 'light', target: 'Key Light', path: 'energy', expression: 'x * 50', variables: x }).replaced).toBe(1);
-    expect(ok('anim.driver_add', { target_type: 'material', target: 'BodyObj', path: 'roughness', expression: 'x / 4', variables: x }).drivers[0].target_id).toBe(mat);
-    expect(ok('anim.driver_add', { target_type: 'mesh', target: 'BodyObj', path: 'shape_keys["Dent"].value', expression: 'x / 2', variables: x }).drivers[0].value).toBe(1);
-    ok('anim.driver_add', { target_type: 'world', path: 'strength', expression: 'v', variables: [{ name: 'v', target_type: 'light', target: 'Lamp', path: 'energy' }] });
+    expect(
+      ok('anim.driver_add', {
+        target_type: 'light',
+        target: 'Lamp',
+        path: 'energy',
+        expression: 'x * 100',
+        variables: x,
+      }).drivers[0].target_id,
+    ).toBe(lightData);
+    expect(
+      ok('anim.driver_add', {
+        target_type: 'light',
+        target: 'Key Light',
+        path: 'energy',
+        expression: 'x * 50',
+        variables: x,
+      }).replaced,
+    ).toBe(1);
+    expect(
+      ok('anim.driver_add', {
+        target_type: 'material',
+        target: 'BodyObj',
+        path: 'roughness',
+        expression: 'x / 4',
+        variables: x,
+      }).drivers[0].target_id,
+    ).toBe(mat);
+    expect(
+      ok('anim.driver_add', {
+        target_type: 'mesh',
+        target: 'BodyObj',
+        path: 'shape_keys["Dent"].value',
+        expression: 'x / 2',
+        variables: x,
+      }).drivers[0].value,
+    ).toBe(1);
+    ok('anim.driver_add', {
+      target_type: 'world',
+      path: 'strength',
+      expression: 'v',
+      variables: [{ name: 'v', target_type: 'light', target: 'Lamp', path: 'energy' }],
+    });
     const ev = evalAt(doc, 1);
     expect(ev.byId.get(lamp)!.light!.energy).toBe(100);
     expect(ev.byId.get(body)!.materials[0]!.roughness).toBe(0.5);
@@ -111,10 +198,14 @@ describe('anim.driver_add', () => {
       expect(r.ok).toBe(false);
       return r.error!;
     };
-    expect(err({ expression: 'speed * 2' })).toMatch(/Unknown name 'speed' in the expression: add a variable named 'speed'/);
+    expect(err({ expression: 'speed * 2' })).toMatch(
+      /Unknown name 'speed' in the expression: add a variable named 'speed'/,
+    );
     expect(err({ expression: 'sin(frame' })).toMatch(/Expected ',' or '\)'.* at column 10/);
     expect(err({ expression: '' })).toMatch(/Invalid parameters/);
-    expect(err({ variables: [{ name: '2x', target: 'Car', path: 'location' }] })).toMatch(/Invalid variable name '2x'/);
+    expect(err({ variables: [{ name: '2x', target: 'Car', path: 'location' }] })).toMatch(
+      /Invalid variable name '2x'/,
+    );
     expect(err({ variables: [{ name: 'frame', target: 'Car', path: 'location' }] })).toMatch(/reserved/);
     expect(
       err({
@@ -124,13 +215,21 @@ describe('anim.driver_add', () => {
         ],
       }),
     ).toMatch(/Duplicate variable name 'a'/);
-    expect(err({ variables: [{ name: 'a', target: 'Nope', path: 'location' }] })).toMatch(/Variable 'a': Object 'Nope' not found/);
+    expect(err({ variables: [{ name: 'a', target: 'Nope', path: 'location' }] })).toMatch(
+      /Variable 'a': Object 'Nope' not found/,
+    );
     expect(err({ variables: [{ name: 'a', target: 'Car', path: 'lokation' }] })).toMatch(
       /Variable 'a': Property 'lokation' does not exist on object 'Car' \(common properties: location, rotation_euler/,
     );
-    expect(err({ variables: [{ name: 'a', target: 'Car', path: 'location', index: 3 }] })).toMatch(/Index 3 is out of range/);
-    expect(err({ variables: [{ name: 'a', target_type: 'light', path: 'energy' }] })).toMatch(/`target` is required/);
-    expect(err({ path: 'location', index: 5 })).toMatch(/Index 5 is out of range for 'location' \(3 channels, 0..2\)/);
+    expect(err({ variables: [{ name: 'a', target: 'Car', path: 'location', index: 3 }] })).toMatch(
+      /Index 3 is out of range/,
+    );
+    expect(err({ variables: [{ name: 'a', target_type: 'light', path: 'energy' }] })).toMatch(
+      /`target` is required/,
+    );
+    expect(err({ path: 'location', index: 5 })).toMatch(
+      /Index 5 is out of range for 'location' \(3 channels, 0..2\)/,
+    );
     expect(err({ path: 'name' })).toMatch(/not a number, boolean or numeric vector/);
     expect(err({ path: 'location[' })).toMatch(/Invalid data path/);
     expect(err({ target: 'Ghost' })).toMatch(/Object 'Ghost' not found/);
@@ -139,7 +238,13 @@ describe('anim.driver_add', () => {
 
   it('reports keyframed channels and failing drivers', () => {
     const { doc, ok, reports, wheel } = setup();
-    doc.setFCurve(insertKeyframe(createFCurve({ target_type: 'object', target_id: wheel, path: 'location', index: 2 }), 1, 4));
+    doc.setFCurve(
+      insertKeyframe(
+        createFCurve({ target_type: 'object', target_id: wheel, path: 'location', index: 2 }),
+        1,
+        4,
+      ),
+    );
     const res = ok('anim.driver_add', { path: 'location', index: 2, expression: '1 / (frame - 1)' });
     expect(res.drivers[0].error).toMatch(/division by zero/);
     expect(res.drivers[0].value).toBe(4); // keyframed value stays
@@ -167,16 +272,25 @@ describe('anim.driver_update / driver_remove / driver_list', () => {
     expect(run('anim.driver_update', { path: 'scale', expression: '1' }).error).toMatch(
       /No driver on 'scale' of object 'Wheel' \(driven: location\[0\], location\[1\], location\[2\]\)/,
     );
-    expect(run('anim.driver_update', { path: 'location', expression: 'nope' }).error).toMatch(/Unknown name 'nope'/);
+    expect(run('anim.driver_update', { path: 'location', expression: 'nope' }).error).toMatch(
+      /Unknown name 'nope'/,
+    );
     // a failed update changes nothing
-    expect(doc.listDrivers(wheel).map((d) => d.expression).sort()).toEqual(['cx * 2', 'frame', 'frame']);
+    expect(
+      doc
+        .listDrivers(wheel)
+        .map((d) => d.expression)
+        .sort(),
+    ).toEqual(['cx * 2', 'frame', 'frame']);
   });
 
   it('removes drivers per channel, per path or all', () => {
     const { doc, ok, run, wheel } = setup();
     ok('anim.driver_add', { path: 'location', expression: 'frame' });
     ok('anim.driver_add', { path: 'scale', expression: '2' });
-    expect(ok('anim.driver_remove', { path: 'location', index: 1 }).removed).toEqual([`object:${wheel}:location:1`]);
+    expect(ok('anim.driver_remove', { path: 'location', index: 1 }).removed).toEqual([
+      `object:${wheel}:location:1`,
+    ]);
     expect(ok('anim.driver_remove', { path: 'location' }).removed).toHaveLength(2);
     expect(run('anim.driver_remove', { path: 'location' }).error).toMatch(/No driver on 'location'/);
     expect(ok('anim.driver_remove', {}).removed).toHaveLength(3);
@@ -188,7 +302,10 @@ describe('anim.driver_update / driver_remove / driver_list', () => {
     const { doc, ok, ctx, wheel, car } = setup();
     ok('anim.driver_add', { path: 'location', index: 0, expression: 'frame * 2' });
     ok('anim.driver_add', { target: 'Car', path: 'location', index: 2, expression: '1 / 0' });
-    const um = new Y.UndoManager(doc.sharedTypes(), { trackedOrigins: new Set([doc.origin]), captureTimeout: 0 });
+    const um = new Y.UndoManager(doc.sharedTypes(), {
+      trackedOrigins: new Set([doc.origin]),
+      captureTimeout: 0,
+    });
     const all = ok('anim.driver_list', { frame: 3 });
     expect(all.frame).toBe(3);
     expect(all.drivers).toHaveLength(2);
@@ -207,7 +324,10 @@ describe('anim.driver_update / driver_remove / driver_list', () => {
 describe('driver operators: undo, persistence and descriptions', () => {
   it('makes every operator one undo step', () => {
     const { doc, ok } = setup();
-    const um = new Y.UndoManager(doc.sharedTypes(), { trackedOrigins: new Set([doc.origin]), captureTimeout: 0 });
+    const um = new Y.UndoManager(doc.sharedTypes(), {
+      trackedOrigins: new Set([doc.origin]),
+      captureTimeout: 0,
+    });
     ok('anim.driver_add', { path: 'location', expression: 'frame' });
     ok('anim.driver_update', { path: 'location', expression: 'frame * 2' });
     ok('anim.driver_remove', { path: 'location', index: 0 });
@@ -241,7 +361,8 @@ describe('driver operators: undo, persistence and descriptions', () => {
     for (const info of reg.describe().filter((i) => ids.includes(i.id))) {
       expect(info.description.length).toBeGreaterThan(80);
       const props = (info.parameters as { properties: Record<string, { description?: string }> }).properties;
-      for (const [name, prop] of Object.entries(props)) expect(prop.description, `${info.id}.${name}`).toBeTruthy();
+      for (const [name, prop] of Object.entries(props))
+        expect(prop.description, `${info.id}.${name}`).toBeTruthy();
     }
     expect(reg.describe().filter((i) => ids.includes(i.id))).toHaveLength(4);
   });

@@ -117,7 +117,9 @@ export function mulMat3TVec(m: Readonly<Mat3>, v: Readonly<Vec3>): Vec3 {
 
 export function determinant3(m: Readonly<Mat3>): number {
   return (
-    m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6])
+    m[0] * (m[4] * m[8] - m[5] * m[7]) -
+    m[1] * (m[3] * m[8] - m[5] * m[6]) +
+    m[2] * (m[3] * m[7] - m[4] * m[6])
   );
 }
 
@@ -301,7 +303,11 @@ export function decomposeRigid(m: Readonly<Mat4>): { position: Vec3; rotation: M
 }
 
 /** Column-major world matrix T(position) · R · S. */
-export function composeRigid(position: Readonly<Vec3>, rotation: Readonly<Mat3>, scale: Readonly<Vec3>): Mat4 {
+export function composeRigid(
+  position: Readonly<Vec3>,
+  rotation: Readonly<Mat3>,
+  scale: Readonly<Vec3>,
+): Mat4 {
   const r = rotation;
   return [
     r[0] * scale[0],

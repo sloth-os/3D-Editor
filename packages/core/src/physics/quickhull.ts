@@ -403,7 +403,8 @@ function boundaryLoop(p: number[], tris: HullFace[], members: number[], eps: num
   for (const v of loop) d += nrm[0] * p[v * 3] + nrm[1] * p[v * 3 + 1] + nrm[2] * p[v * 3 + 2];
   d /= loop.length;
   for (const v of loop)
-    if (Math.abs(nrm[0] * p[v * 3] + nrm[1] * p[v * 3 + 1] + nrm[2] * p[v * 3 + 2] - d) > 10 * eps) return null;
+    if (Math.abs(nrm[0] * p[v * 3] + nrm[1] * p[v * 3 + 1] + nrm[2] * p[v * 3 + 2] - d) > 10 * eps)
+      return null;
   return loop;
 }
 
@@ -423,13 +424,15 @@ function planarHull(p: number[], normal: Vec3, origin: Vec3, dir: Vec3, eps: num
   const tol = eps * eps;
   const lower: typeof pts2 = [];
   for (const q of pts2) {
-    while (lower.length >= 2 && crossZ(lower[lower.length - 2], lower[lower.length - 1], q) <= tol) lower.pop();
+    while (lower.length >= 2 && crossZ(lower[lower.length - 2], lower[lower.length - 1], q) <= tol)
+      lower.pop();
     lower.push(q);
   }
   const upper: typeof pts2 = [];
   for (let k = pts2.length - 1; k >= 0; k--) {
     const q = pts2[k];
-    while (upper.length >= 2 && crossZ(upper[upper.length - 2], upper[upper.length - 1], q) <= tol) upper.pop();
+    while (upper.length >= 2 && crossZ(upper[upper.length - 2], upper[upper.length - 1], q) <= tol)
+      upper.pop();
     upper.push(q);
   }
   const ring = [...lower.slice(0, -1), ...upper.slice(0, -1)];

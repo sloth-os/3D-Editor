@@ -425,7 +425,7 @@ export class Environment {
       x = r * Math.cos(phi);
       y = r * Math.sin(phi);
     }
-    const l = Math.hypot(x, y, z) || 1;
+    const l = Math.sqrt(x * x + y * y + z * z) || 1;
     x /= l;
     y /= l;
     z /= l;

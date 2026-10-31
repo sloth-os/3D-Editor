@@ -149,24 +149,59 @@ function pickTable(options: readonly SourceOption[]): { cum: number[]; total: nu
   return { cum, total };
 }
 
-/** In-order sequence (Blender: objects cycle in order, weights act as repeat counts). */
+/** Longest in-order pick sequence (weights with extreme ratios are approximated). */
+const MAX_SEQUENCE = 10_000;
+
+/**
+ * In-order pick sequence (Blender: the objects cycle in order, an object of weight n is repeated n
+ * times). Fractional weights keep their ratio: they are scaled to the smallest whole repeat counts
+ * (0.4 : 1 → 2 : 5); ratios without a small whole-number form get proportional counts in a sequence
+ * of up to 10000 slots, at least one for every positive weight.
+ */
 function orderSequence(options: readonly SourceOption[]): number[] {
-  const reps = options.map((o) => (o.weight > 0 && Number.isFinite(o.weight) ? Math.round(o.weight) : 0));
-  const total = reps.reduce((a, b) => a + b, 0);
-  if (total === 0) {
-    // fractional weights: one slot per option with positive weight
-    const seq = options.flatMap((o, i) => (o.weight > 0 ? [i] : []));
-    return seq;
-  }
-  if (total > 10000) {
-    const k = 10000 / total;
-    for (let i = 0; i < reps.length; i++) reps[i] = reps[i] > 0 ? Math.max(1, Math.round(reps[i] * k)) : 0;
-  }
+  const w = options.map((o) => (o.weight > 0 && Number.isFinite(o.weight) ? o.weight : 0));
+  const total = w.reduce((a, b) => a + b, 0);
+  if (!(total > 0) || !Number.isFinite(total)) return [];
+  let counts = wholeRatio(w);
+  if (!counts || counts.reduce((a, b) => a + b, 0) > MAX_SEQUENCE) counts = proportional(w, total);
   const seq: number[] = [];
-  reps.forEach((r, i) => {
+  counts.forEach((r, i) => {
     for (let k = 0; k < r; k++) seq.push(i);
   });
   return seq;
+}
+
+/** Smallest whole multiples k·w (k = 1…1000) of positive weights, or null when there is none. */
+function wholeRatio(w: readonly number[]): number[] | null {
+  const out = new Array<number>(w.length);
+  for (let k = 1; k <= 1000; k++) {
+    let ok = true;
+    for (let i = 0; i < w.length && ok; i++) {
+      if (w[i] === 0) {
+        out[i] = 0;
+        continue;
+      }
+      const x = w[i] * k;
+      const r = Math.round(x);
+      if (r < 1 || Math.abs(x - r) > 1e-9 * x) ok = false;
+      else out[i] = r;
+    }
+    if (ok) return out;
+  }
+  return null;
+}
+
+/** Repeat counts proportional to `w` in about MAX_SEQUENCE slots (largest remainder rounding). */
+function proportional(w: readonly number[], total: number): number[] {
+  const exact = w.map((x) => (x / total) * MAX_SEQUENCE);
+  const counts = exact.map((x, i) => (w[i] > 0 ? Math.max(1, Math.floor(x)) : 0));
+  let left = MAX_SEQUENCE - counts.reduce((a, b) => a + b, 0);
+  const order = exact
+    .map((x, i) => ({ frac: x - Math.floor(x), i }))
+    .filter((e) => w[e.i] > 0)
+    .sort((a, b) => b.frac - a.frac || a.i - b.i);
+  for (let j = 0; j < order.length && left > 0; j++, left--) counts[order[j].i]++;
+  return counts;
 }
 
 /** Computes the instances of one particle system. */

@@ -13,9 +13,11 @@ import {
 } from '../src/math';
 import {
   CONSTRAINT_TYPES,
+  clampConstraintParams,
   constraintTargets,
   createConstraint,
   getConstraintTypeInfo,
+  parseConstraintParams,
   solveConstraints,
   type ConstraintContext,
 } from '../src/constraints';
@@ -721,6 +723,72 @@ describe('stack evaluation', () => {
     );
     expect(rest.errors).toHaveLength(1);
     expectVec(loc(rest.matrix), [0, 2, 3]);
+  });
+
+  it('skips constraints the context reports on a dependency cycle without reading their target', () => {
+    const reads: string[] = [];
+    const message = "Target 'T' is part of a dependency cycle: O [Loop] → T [Copy Location] → O";
+    const ctx = ctxWith(
+      {},
+      {
+        getWorldMatrix: (id) => {
+          reads.push(id);
+          return id === 'T' ? translation4([5, 0, 0]) : null;
+        },
+        dependencyCycle: (c) => (c.name === 'Loop' ? message : null),
+      },
+    );
+    const owner = translation4([1, 2, 3]);
+    const looped = con('COPY_LOCATION', {}, { name: 'Loop' });
+    const res = solve(
+      [looped, con('LIMIT_LOCATION', { use_max_z: true, max_z: 0 }, { target: null })],
+      owner,
+      ctx,
+    );
+    expect(res.errors).toEqual([{ constraintId: looped.id, message }]);
+    expect(reads).toEqual([]);
+    expectVec(loc(res.matrix), [1, 2, 0]); // the rest of the stack still runs
+    const fine = solve(con('COPY_LOCATION', {}, { name: 'Fine' }), owner, ctx);
+    expect(fine.errors).toEqual([]);
+    expect(reads).toEqual(['T']);
+    // muted constraints and invalid parameters are reported (or skipped) before the cycle check
+    expect(solve({ ...looped, mute: true }, owner, ctx).errors).toEqual([]);
+    expect(solve({ ...looped, params: { use_x: 3 } }, owner, ctx).errors[0].message).toMatch(/^Invalid/);
+  });
+
+  it('clamps parameters outside their range, like Blender does for animated values', () => {
+    expect(parseConstraintParams({ type: 'FOLLOW_PATH', params: { offset_factor: 1.7 } })).toMatchObject({
+      ok: true,
+      params: { offset_factor: 1 },
+    });
+    expect(parseConstraintParams({ type: 'COPY_LOCATION', params: { head_tail: -0.5 } })).toMatchObject({
+      ok: true,
+      params: { head_tail: 0 },
+    });
+    expect(parseConstraintParams({ type: 'LIMIT_DISTANCE', params: { distance: -3 } })).toMatchObject({
+      ok: true,
+      params: { distance: 0 },
+    });
+    // only numbers are clamped: other invalid values are still reported
+    expect(parseConstraintParams({ type: 'FOLLOW_PATH', params: { offset_factor: 'end' } }).ok).toBe(false);
+    expect(clampConstraintParams('FOLLOW_PATH', { offset_factor: -2, offset: -50, x: 'y' })).toEqual({
+      offset_factor: 0,
+      offset: -50,
+      x: 'y',
+    });
+    expect(clampConstraintParams('NOPE', { a: 5 })).toEqual({ a: 5 });
+    // an open path is not extrapolated past its end by an out-of-range offset_factor
+    const path = polylinePath([
+      [0, 0, 0],
+      [4, 0, 0],
+    ]);
+    const res = solve(
+      con('FOLLOW_PATH', { use_fixed_location: true, offset_factor: 1.7 }),
+      identity4(),
+      curveCtx(path),
+    );
+    expect(res.errors).toEqual([]);
+    expectVec(loc(res.matrix), [4, 0, 0]);
   });
 
   it('survives garbage data', () => {

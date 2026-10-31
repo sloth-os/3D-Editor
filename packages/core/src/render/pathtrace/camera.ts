@@ -133,7 +133,7 @@ export class CameraRays {
       dz = -1;
       tMax = c.far - c.near;
     } else {
-      const l = Math.hypot(nx, ny, nz);
+      const l = Math.sqrt(nx * nx + ny * ny + nz * nz);
       dx = nx / l;
       dy = ny / l;
       dz = nz / l;
@@ -162,7 +162,7 @@ export class CameraRays {
         dx = fx - lx;
         dy = fy - ly;
         dz = fz;
-        const dl = Math.hypot(dx, dy, dz);
+        const dl = Math.sqrt(dx * dx + dy * dy + dz * dz);
         dx /= dl;
         dy /= dl;
         dz /= dl;

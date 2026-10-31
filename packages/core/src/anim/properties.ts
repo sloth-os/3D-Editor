@@ -62,6 +62,7 @@ export const ANIMATABLE: Record<AnimTargetType, Record<string, number>> = {
 const PATTERNS: Partial<Record<AnimTargetType, RegExp[]>> = {
   object: [
     /^pose\.bones\[(["']).+\1\]\.(location|rotation_euler|scale)$/,
+    /^pose\.bones\[(["']).+\1\]\.constraints\[(["']).+\2\]\.influence$/,
     /^constraints\[(["']).+\1\]\.(influence|\w+)$/,
     /^modifiers\[(["']).+\1\]\.\w+$/,
     /^particle_systems\[(["']).+\1\]\.\w+$/,

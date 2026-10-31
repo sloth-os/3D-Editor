@@ -12,7 +12,13 @@ import {
   type DriverVariable,
 } from '../src';
 
-const v = (name: string, target_id: string, path: string, index = 0, target_type: AnimTargetType = 'object'): DriverVariable => ({
+const v = (
+  name: string,
+  target_id: string,
+  path: string,
+  index = 0,
+  target_type: AnimTargetType = 'object',
+): DriverVariable => ({
   name,
   target_type,
   target_id,
@@ -42,7 +48,11 @@ function driverError(fn: () => unknown): DriverError {
   throw new Error('expected a DriverError');
 }
 
-const table: Record<string, number> = { 'object:A:location:0': 2, 'object:A:location:1': 3, 'light:L:energy:0': 100 };
+const table: Record<string, number> = {
+  'object:A:location:0': 2,
+  'object:A:location:1': 3,
+  'light:L:energy:0': 100,
+};
 const read: DriverReadFn = (type, id, path, index) => table[`${type}:${id}:${path}:${index}`];
 
 describe('evaluateDriver', () => {
@@ -58,7 +68,10 @@ describe('evaluateDriver', () => {
   });
 
   it('reports unreadable variables, even unused ones', () => {
-    const missing = driver('B', 'location', 0, 'x + 1', [v('x', 'A', 'location', 0), v('gone', 'Z', 'scale', 2)]);
+    const missing = driver('B', 'location', 0, 'x + 1', [
+      v('x', 'A', 'location', 0),
+      v('gone', 'Z', 'scale', 2),
+    ]);
     const e = driverError(() => evaluateDriver(missing, 1, read));
     expect(e.message).toMatch(/Variable 'gone' cannot be read: object 'Z' scale\[2\] does not exist/);
     const nan = driverError(() =>
@@ -77,22 +90,34 @@ describe('evaluateDriver', () => {
     expect(driverError(() => evaluateDriver(driver('B', 'location', 0, '1 +'), 1, read)).message).toMatch(
       /Unexpected end of the expression.* at column 4/,
     );
-    expect(driverError(() => evaluateDriver(driver('B', 'location', 0, 'speed * 2'), 1, read)).message).toMatch(
-      /Unknown name 'speed'/,
+    expect(
+      driverError(() => evaluateDriver(driver('B', 'location', 0, 'speed * 2'), 1, read)).message,
+    ).toMatch(/Unknown name 'speed'/);
+    expect(
+      driverError(() => evaluateDriver(driver('B', 'location', 0, '1 / (frame - 1)'), 1, read)).message,
+    ).toMatch(/division by zero/);
+    expect(
+      driverError(() => evaluateDriver(driver('B', 'location', 0, '10 ** 400'), 1, read)).message,
+    ).toMatch(/evaluated to Infinity/);
+    expect(driverError(() => evaluateDriver(driver('B', 'location', 0, ''), 1, read)).message).toMatch(
+      /empty/,
     );
-    expect(driverError(() => evaluateDriver(driver('B', 'location', 0, '1 / (frame - 1)'), 1, read)).message).toMatch(
-      /division by zero/,
-    );
-    expect(driverError(() => evaluateDriver(driver('B', 'location', 0, '10 ** 400'), 1, read)).message).toMatch(
-      /evaluated to Infinity/,
-    );
-    expect(driverError(() => evaluateDriver(driver('B', 'location', 0, ''), 1, read)).message).toMatch(/empty/);
     const dup = driver('B', 'location', 0, 'x', [v('x', 'A', 'location', 0), v('x', 'A', 'location', 1)]);
     expect(driverError(() => evaluateDriver(dup, 1, read)).message).toMatch(/Duplicate variable name 'x'/);
-    const reserved = driver('B', 'location', 0, '1', [v('frame', 'A', 'location', 0), v('sin', 'A', 'location', 0)]);
-    expect(driverError(() => evaluateDriver(reserved, 1, read)).message).toMatch(/reserved.*built-in function/);
-    const malformed = { ...driver('B', 'location', 0, '1'), variables: [null, { name: 'q' }] } as unknown as DriverData;
-    expect(driverError(() => evaluateDriver(malformed, 1, read)).message).toMatch(/Malformed.*'q' cannot be read/);
+    const reserved = driver('B', 'location', 0, '1', [
+      v('frame', 'A', 'location', 0),
+      v('sin', 'A', 'location', 0),
+    ]);
+    expect(driverError(() => evaluateDriver(reserved, 1, read)).message).toMatch(
+      /reserved.*built-in function/,
+    );
+    const malformed = {
+      ...driver('B', 'location', 0, '1'),
+      variables: [null, { name: 'q' }],
+    } as unknown as DriverData;
+    expect(driverError(() => evaluateDriver(malformed, 1, read)).message).toMatch(
+      /Malformed.*'q' cannot be read/,
+    );
     const noVars = { ...driver('B', 'location', 0, 'frame'), variables: undefined } as unknown as DriverData;
     expect(evaluateDriver(noVars, 3, read)).toBe(3);
     const nonString = { ...driver('B', 'location', 0, ''), expression: 5 } as unknown as DriverData;
@@ -100,14 +125,23 @@ describe('evaluateDriver', () => {
   });
 
   it('lists static problems of a driver', () => {
-    expect(driverProblems(driver('B', 'location', 0, 'a + frame * pi', [v('a', 'A', 'location', 0)]))).toEqual([]);
-    const p = driverProblems(driver('B', 'location', 0, 'a + b + toString', [v('a', 'A', 'location', 0), v('a', 'A', 'scale', 0)]));
+    expect(
+      driverProblems(driver('B', 'location', 0, 'a + frame * pi', [v('a', 'A', 'location', 0)])),
+    ).toEqual([]);
+    const p = driverProblems(
+      driver('B', 'location', 0, 'a + b + toString', [v('a', 'A', 'location', 0), v('a', 'A', 'scale', 0)]),
+    );
     expect(p.join('\n')).toMatch(/Duplicate variable name 'a'/);
-    expect(p.join('\n')).toMatch(/Unknown name 'b' in the expression: add a variable named 'b' \(variables: 'a'\)/);
+    expect(p.join('\n')).toMatch(
+      /Unknown name 'b' in the expression: add a variable named 'b' \(variables: 'a'\)/,
+    );
     expect(p.join('\n')).toMatch(/Unknown name 'toString'/);
     expect(driverProblems(driver('B', 'location', 0, '(')).join()).toMatch(/Unexpected end/);
     expect(driverProblems(driver('B', 'location', 0, 'x')).join()).toMatch(/the driver has no variables/);
-    const bad = { expression: '1', variables: [{ name: 'k', path: '', target_id: 3, index: -1 }] } as unknown as DriverData;
+    const bad = {
+      expression: '1',
+      variables: [{ name: 'k', path: '', target_id: 3, index: -1 }],
+    } as unknown as DriverData;
     expect(driverProblems(bad).join('\n')).toMatch(/no data path[\s\S]*no target[\s\S]*invalid index/);
   });
 });
@@ -190,11 +224,24 @@ describe('drivers in scene evaluation', () => {
 
   it('drives every datablock type and reads custom properties', () => {
     const doc = new SceneDoc();
-    const ctrl = doc.addObject({ type: 'EMPTY', name: 'Ctrl', location: [0.25, 0, 0], custom_props: { amount: 4 } });
+    const ctrl = doc.addObject({
+      type: 'EMPTY',
+      name: 'Ctrl',
+      location: [0.25, 0, 0],
+      custom_props: { amount: 4 },
+    });
     const mat = doc.addMaterial({ name: 'M' });
     const meshId = doc.addMesh('Mesh', createMesh({ positions: [0, 0, 0], faces: [] }));
     doc.setShapeKeys(meshId, [
-      { name: 'Up', value: 0, slider_min: 0, slider_max: 1, mute: false, relative_key: '', data: encodeFloat32([0, 0, 2]) },
+      {
+        name: 'Up',
+        value: 0,
+        slider_min: 0,
+        slider_max: 1,
+        mute: false,
+        relative_key: '',
+        data: encodeFloat32([0, 0, 2]),
+      },
     ]);
     const meshObj = doc.addObject({ type: 'MESH', name: 'Obj', data: meshId, material_slots: [mat] });
     const lightData = doc.addLight({ name: 'L', energy: 10 });
@@ -206,7 +253,9 @@ describe('drivers in scene evaluation', () => {
     const x = [v('x', ctrl, 'location', 0)];
     doc.setDriver(driver(mat, 'base_color', 0, 'x * 2', x, 'material'));
     doc.setDriver(driver(lightData, 'energy', 0, 'x * 1000', x, 'light'));
-    doc.setDriver(driver(camData, 'lens', 0, '20 + amount', [v('amount', ctrl, 'custom_props["amount"]')], 'camera'));
+    doc.setDriver(
+      driver(camData, 'lens', 0, '20 + amount', [v('amount', ctrl, 'custom_props["amount"]')], 'camera'),
+    );
     doc.setDriver(driver('world', 'strength', 0, 'x * 4', x, 'world'));
     doc.setDriver(driver(meshId, 'shape_keys["Up"].value', 0, 'x * 2', x, 'mesh'));
     doc.setDriver(driver(curveData, 'bevel_depth', 0, 'x / 5', x, 'curve'));

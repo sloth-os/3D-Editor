@@ -12,10 +12,18 @@ import type { Mat3 } from './vmath';
  * handled exactly.
  */
 
-/** Transforms a polyhedron into another frame: p' = R · p + t. */
-export function transformPolyhedron(P: Polyhedron, r: Readonly<Mat3>, t: Readonly<Vec3>): Polyhedron {
+/**
+ * Transforms a polyhedron into another frame: p' = R · p + t. Writes into `out` when given
+ * (its arrays are reused when large enough), so hot loops do not allocate.
+ */
+export function transformPolyhedron(
+  P: Polyhedron,
+  r: Readonly<Mat3>,
+  t: Readonly<Vec3>,
+  out?: Polyhedron,
+): Polyhedron {
   const v = P.verts;
-  const verts = new Float64Array(v.length);
+  const verts = out && out.verts.length === v.length ? out.verts : new Float64Array(v.length);
   for (let i = 0; i < v.length; i += 3) {
     const x = v[i];
     const y = v[i + 1];
@@ -25,7 +33,7 @@ export function transformPolyhedron(P: Polyhedron, r: Readonly<Mat3>, t: Readonl
     verts[i + 2] = r[6] * x + r[7] * y + r[8] * z + t[2];
   }
   const pl = P.planes;
-  const planes = new Float64Array(pl.length);
+  const planes = out && out.planes.length === pl.length ? out.planes : new Float64Array(pl.length);
   for (let i = 0; i < pl.length; i += 4) {
     const x = pl[i];
     const y = pl[i + 1];
@@ -39,18 +47,17 @@ export function transformPolyhedron(P: Polyhedron, r: Readonly<Mat3>, t: Readonl
     planes[i + 3] = pl[i + 3] + nx * t[0] + ny * t[1] + nz * t[2];
   }
   const c = P.centroid;
-  return {
-    verts,
-    faces: P.faces,
-    planes,
-    edges: P.edges,
-    flat: P.flat,
-    centroid: [
-      r[0] * c[0] + r[1] * c[1] + r[2] * c[2] + t[0],
-      r[3] * c[0] + r[4] * c[1] + r[5] * c[2] + t[1],
-      r[6] * c[0] + r[7] * c[1] + r[8] * c[2] + t[2],
-    ],
-  };
+  const cx = r[0] * c[0] + r[1] * c[1] + r[2] * c[2] + t[0];
+  const cy = r[3] * c[0] + r[4] * c[1] + r[5] * c[2] + t[1];
+  const cz = r[6] * c[0] + r[7] * c[1] + r[8] * c[2] + t[2];
+  if (!out) return { verts, faces: P.faces, planes, edges: P.edges, flat: P.flat, centroid: [cx, cy, cz] };
+  out.verts = verts;
+  out.planes = planes;
+  out.faces = P.faces;
+  out.edges = P.edges;
+  out.flat = P.flat;
+  out.centroid = [cx, cy, cz];
+  return out;
 }
 
 interface FaceQuery {
@@ -62,7 +69,8 @@ interface FaceQuery {
 function queryFaces(P: Polyhedron, Q: Polyhedron, maxSep: number): FaceQuery {
   const pl = P.planes;
   const v = Q.verts;
-  let best: FaceQuery = { index: -1, sep: -Infinity };
+  let index = -1;
+  let best = -Infinity;
   for (let f = 0; f < P.faces.length; f++) {
     const nx = pl[f * 4];
     const ny = pl[f * 4 + 1];
@@ -73,10 +81,13 @@ function queryFaces(P: Polyhedron, Q: Polyhedron, maxSep: number): FaceQuery {
       if (d < min) min = d;
     }
     const sep = min - pl[f * 4 + 3];
-    if (sep > best.sep) best = { index: f, sep };
+    if (sep > best) {
+      best = sep;
+      index = f;
+    }
     if (sep > maxSep) break;
   }
-  return best;
+  return { index, sep: best };
 }
 
 interface EdgeQuery {
@@ -86,95 +97,143 @@ interface EdgeQuery {
   axis: Vec3;
 }
 
-type Arc = [Vec3, Vec3];
-
 const dot = (a: Readonly<Vec3>, b: Readonly<Vec3>) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-const cross = (a: Readonly<Vec3>, b: Readonly<Vec3>): Vec3 => [
-  a[1] * b[2] - a[2] * b[1],
-  a[2] * b[0] - a[0] * b[2],
-  a[0] * b[1] - a[1] * b[0],
-];
 
 function planeNormal(P: Polyhedron, f: number): Vec3 {
   return [P.planes[f * 4], P.planes[f * 4 + 1], P.planes[f * 4 + 2]];
 }
 
-/** Gauss map arcs of edge e: the arc between its two face normals (two arcs for flat polygons). */
-function edgeArcs(P: Polyhedron, e: number, negate: boolean): Arc[] {
+/** Floats per edge in an arc buffer: two arcs (start xyz, end xyz); an unused second arc starts with NaN. */
+const ARC_STRIDE = 12;
+let arcScratchA = new Float64Array(64 * ARC_STRIDE);
+let arcScratchB = new Float64Array(64 * ARC_STRIDE);
+
+/**
+ * Writes the Gauss map arcs of P's edges into `buf`: the arc between the edge's two face
+ * normals, or for flat polygons the two arcs from the front normal through the outward in-plane
+ * edge normal to the back normal. `negate` gives the arcs of −P (for the Minkowski difference).
+ */
+function fillArcs(P: Polyhedron, negate: boolean, buf: Float64Array): void {
   const E = P.edges;
-  const f0 = E[e * 4 + 2];
-  const f1 = E[e * 4 + 3];
-  const s = negate ? -1 : 1;
-  const n0 = planeNormal(P, f0).map((x) => x * s) as Vec3;
-  if (!P.flat && f1 >= 0) return [[n0, planeNormal(P, f1).map((x) => x * s) as Vec3]];
-  // flat polygon: the arc from the front normal to the back normal through the outward edge normal
-  const a = E[e * 4] * 3;
-  const b = E[e * 4 + 1] * 3;
+  const pl = P.planes;
   const v = P.verts;
-  const dir: Vec3 = [v[b] - v[a], v[b + 1] - v[a + 1], v[b + 2] - v[a + 2]];
-  let o = cross(dir, n0);
-  const ol = Math.hypot(o[0], o[1], o[2]) || 1;
-  o = [o[0] / ol, o[1] / ol, o[2] / ol];
-  const mid: Vec3 = [
-    (v[a] + v[b]) / 2 - P.centroid[0],
-    (v[a + 1] + v[b + 1]) / 2 - P.centroid[1],
-    (v[a + 2] + v[b + 2]) / 2 - P.centroid[2],
-  ];
-  // outward in-plane edge normal (inward when the arcs are negated for the Minkowski difference)
-  if (dot(o, mid) * s < 0) o = [-o[0], -o[1], -o[2]];
-  const back: Vec3 = [-n0[0], -n0[1], -n0[2]];
-  return [
-    [n0, o],
-    [o, back],
-  ];
+  const s = negate ? -1 : 1;
+  const [cx, cy, cz] = P.centroid;
+  for (let e = 0, o = 0; e < E.length / 4; e++, o += ARC_STRIDE) {
+    const f0 = E[e * 4 + 2] * 4;
+    const f1 = E[e * 4 + 3];
+    const nx = pl[f0] * s;
+    const ny = pl[f0 + 1] * s;
+    const nz = pl[f0 + 2] * s;
+    buf[o] = nx;
+    buf[o + 1] = ny;
+    buf[o + 2] = nz;
+    if (!P.flat && f1 >= 0) {
+      buf[o + 3] = pl[f1 * 4] * s;
+      buf[o + 4] = pl[f1 * 4 + 1] * s;
+      buf[o + 5] = pl[f1 * 4 + 2] * s;
+      buf[o + 6] = NaN;
+      continue;
+    }
+    const a = E[e * 4] * 3;
+    const b = E[e * 4 + 1] * 3;
+    const dx = v[b] - v[a];
+    const dy = v[b + 1] - v[a + 1];
+    const dz = v[b + 2] - v[a + 2];
+    let ox = dy * nz - dz * ny;
+    let oy = dz * nx - dx * nz;
+    let oz = dx * ny - dy * nx;
+    const ol = Math.hypot(ox, oy, oz) || 1;
+    // outward in-plane edge normal (inward for −P)
+    const side =
+      (ox * ((v[a] + v[b]) / 2 - cx) +
+        oy * ((v[a + 1] + v[b + 1]) / 2 - cy) +
+        oz * ((v[a + 2] + v[b + 2]) / 2 - cz)) *
+      s;
+    const k = side < 0 ? -1 / ol : 1 / ol;
+    ox *= k;
+    oy *= k;
+    oz *= k;
+    buf[o + 3] = ox;
+    buf[o + 4] = oy;
+    buf[o + 5] = oz;
+    buf[o + 6] = ox;
+    buf[o + 7] = oy;
+    buf[o + 8] = oz;
+    buf[o + 9] = -nx;
+    buf[o + 10] = -ny;
+    buf[o + 11] = -nz;
+  }
 }
 
-/** Whether the arcs AB and CD intersect on the unit sphere (Gregorius). */
-function isMinkowskiFace(a: Vec3, b: Vec3, c: Vec3, d: Vec3): boolean {
-  const bxa = cross(b, a);
-  const dxc = cross(d, c);
-  const cba = dot(c, bxa);
-  const dba = dot(d, bxa);
-  const adc = dot(a, dxc);
-  const bdc = dot(b, dxc);
+/** Whether the arcs AB (A[i..i+5]) and CD (B[j..j+5]) intersect on the unit sphere (Gregorius). */
+function arcsCross(A: Float64Array, i: number, B: Float64Array, j: number): boolean {
+  const ax = A[i];
+  const ay = A[i + 1];
+  const az = A[i + 2];
+  const bx = A[i + 3];
+  const by = A[i + 4];
+  const bz = A[i + 5];
+  const cx = B[j];
+  const cy = B[j + 1];
+  const cz = B[j + 2];
+  const dx = B[j + 3];
+  const dy = B[j + 4];
+  const dz = B[j + 5];
+  // b × a and d × c
+  const bax = by * az - bz * ay;
+  const bay = bz * ax - bx * az;
+  const baz = bx * ay - by * ax;
+  const dcx = dy * cz - dz * cy;
+  const dcy = dz * cx - dx * cz;
+  const dcz = dx * cy - dy * cx;
+  const cba = cx * bax + cy * bay + cz * baz;
+  const dba = dx * bax + dy * bay + dz * baz;
+  const adc = ax * dcx + ay * dcy + az * dcz;
+  const bdc = bx * dcx + by * dcy + bz * dcz;
   return cba * dba < 0 && adc * bdc < 0 && cba * bdc > 0;
 }
 
-function queryEdges(
-  A: Polyhedron,
-  B: Polyhedron,
-  maxSep: number,
-  skipEdgeB?: (e: number) => boolean,
-): EdgeQuery {
-  let best: EdgeQuery = { edgeA: -1, edgeB: -1, sep: -Infinity, axis: [0, 0, 0] };
+function queryEdges(A: Polyhedron, B: Polyhedron, maxSep: number): EdgeQuery {
+  let bestSep = -Infinity;
+  let bestA = -1;
+  let bestB = -1;
+  let bx = 0;
+  let by = 0;
+  let bz = 0;
   const EA = A.edges;
   const EB = B.edges;
   const va = A.verts;
   const vb = B.verts;
   const nA = EA.length / 4;
   const nB = EB.length / 4;
-  const arcsB: Arc[][] = [];
-  for (let j = 0; j < nB; j++) arcsB.push(skipEdgeB?.(j) ? [] : edgeArcs(B, j, true));
-  for (let i = 0; i < nA; i++) {
+  if (arcScratchA.length < nA * ARC_STRIDE) arcScratchA = new Float64Array(nA * ARC_STRIDE * 2);
+  if (arcScratchB.length < nB * ARC_STRIDE) arcScratchB = new Float64Array(nB * ARC_STRIDE * 2);
+  const arcsA = arcScratchA;
+  const arcsB = arcScratchB;
+  fillArcs(A, false, arcsA);
+  fillArcs(B, true, arcsB);
+  outer: for (let i = 0; i < nA; i++) {
     const a0 = EA[i * 4] * 3;
     const a1 = EA[i * 4 + 1] * 3;
     const ex = va[a1] - va[a0];
     const ey = va[a1 + 1] - va[a0 + 1];
     const ez = va[a1 + 2] - va[a0 + 2];
-    const arcsA = edgeArcs(A, i, false);
+    const el = Math.hypot(ex, ey, ez);
+    const oa = i * ARC_STRIDE;
+    const twoA = !Number.isNaN(arcsA[oa + 6]);
     for (let j = 0; j < nB; j++) {
-      const bArcs = arcsB[j];
-      if (bArcs.length === 0) continue;
-      let arcA: Arc | null = null;
-      for (const pa of arcsA) {
-        for (const pb of bArcs)
-          if (isMinkowskiFace(pa[0], pa[1], pb[0], pb[1])) {
-            arcA = pa;
-            break;
-          }
-        if (arcA) break;
-      }
-      if (!arcA) continue;
+      const ob = j * ARC_STRIDE;
+      const twoB = !Number.isNaN(arcsB[ob + 6]);
+      // which of A's arcs crosses one of B's arcs (−1: none → not a face of the Minkowski difference)
+      let arc = -1;
+      if (arcsCross(arcsA, oa, arcsB, ob) || (twoB && arcsCross(arcsA, oa, arcsB, ob + 6))) arc = oa;
+      else if (
+        twoA &&
+        (arcsCross(arcsA, oa + 6, arcsB, ob) || (twoB && arcsCross(arcsA, oa + 6, arcsB, ob + 6)))
+      )
+        arc = oa + 6;
+      if (arc < 0) continue;
       const b0 = EB[j * 4] * 3;
       const b1 = EB[j * 4 + 1] * 3;
       const fx = vb[b1] - vb[b0];
@@ -185,24 +244,34 @@ function queryEdges(
       let az = ex * fy - ey * fx;
       const len = Math.hypot(ax, ay, az);
       // parallel edges: the face axes cover this case
-      if (len < 1e-6 * Math.hypot(ex, ey, ez) * Math.hypot(fx, fy, fz)) continue;
+      if (len < 1e-6 * el * Math.hypot(fx, fy, fz)) continue;
       ax /= len;
       ay /= len;
       az /= len;
       // the axis lies on A's Gauss arc (outward from A)
-      if (ax * (arcA[0][0] + arcA[1][0]) + ay * (arcA[0][1] + arcA[1][1]) + az * (arcA[0][2] + arcA[1][2]) < 0) {
+      if (
+        ax * (arcsA[arc] + arcsA[arc + 3]) +
+          ay * (arcsA[arc + 1] + arcsA[arc + 4]) +
+          az * (arcsA[arc + 2] + arcsA[arc + 5]) <
+        0
+      ) {
         ax = -ax;
         ay = -ay;
         az = -az;
       }
       const sep = ax * (vb[b0] - va[a0]) + ay * (vb[b0 + 1] - va[a0 + 1]) + az * (vb[b0 + 2] - va[a0 + 2]);
-      if (sep > best.sep) {
-        best = { edgeA: i, edgeB: j, sep, axis: [ax, ay, az] };
-        if (sep > maxSep) return best;
+      if (sep > bestSep) {
+        bestSep = sep;
+        bestA = i;
+        bestB = j;
+        bx = ax;
+        by = ay;
+        bz = az;
+        if (sep > maxSep) break outer;
       }
     }
   }
-  return best;
+  return { edgeA: bestA, edgeB: bestB, sep: bestSep, axis: [bx, by, bz] };
 }
 
 /** Closest points between segments p1-q1 and p2-q2 (Ericson). */
@@ -270,8 +339,8 @@ function incidentFace(P: Polyhedron, n: Vec3): number {
 /**
  * Contacts between convex polyhedra A and B given in a common frame; normals point from A to B.
  * Contacts separated by more than `maxSep` (speculative distance) are not generated.
- * `skipEdgeB` excludes edges of B from the edge axes (inactive mesh edges).
- * Returns false when a separating axis was found.
+ * `skipEdgeB` marks edges of B that must not produce edge-edge contacts (internal mesh edges);
+ * they still take part in the separation test. Returns false when a separating axis was found.
  */
 export function collidePolyhedra(
   A: Polyhedron,
@@ -284,12 +353,13 @@ export function collidePolyhedra(
   if (fa.sep > maxSep) return false;
   const fb = queryFaces(B, A, maxSep);
   if (fb.sep > maxSep) return false;
-  const eq = queryEdges(A, B, maxSep, skipEdgeB);
+  const eq = queryEdges(A, B, maxSep);
   if (eq.sep > maxSep) return false;
   const maxFace = Math.max(fa.sep, fb.sep);
   const contacts: ContactCandidate[] = [];
+  const edgeUsable = eq.edgeA >= 0 && !skipEdgeB?.(eq.edgeB);
   const edgeContact = (): boolean => {
-    if (eq.edgeA < 0) return false;
+    if (!edgeUsable) return false;
     const E = A.edges;
     const F = B.edges;
     const pv = (P: Polyhedron, i: number): Vec3 => [P.verts[i * 3], P.verts[i * 3 + 1], P.verts[i * 3 + 2]];
@@ -301,11 +371,14 @@ export function collidePolyhedra(
     );
     const s = dot(eq.axis, [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]]);
     if (!(s <= maxSep)) return false;
+    // the segments' closest points must be the touching features (not ends far apart)
+    const gap = Math.hypot(pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]);
+    if (gap > 1.5 * Math.abs(s) + Math.max(maxSep, 0) + 1e-3) return false;
     contacts.push({ pa, pb, n: eq.axis, s });
     return true;
   };
   // prefer face contacts (stable manifolds) unless an edge axis separates clearly better
-  if (eq.edgeA >= 0 && eq.sep > maxFace + 0.05 * Math.abs(maxFace) + 1e-3) {
+  if (edgeUsable && eq.sep > maxFace + 0.05 * Math.abs(maxFace) + 1e-3) {
     if (edgeContact()) {
       out.push(...contacts);
       return true;

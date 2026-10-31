@@ -120,6 +120,11 @@ export interface SoftwareRenderOptions {
   seed?: number;
   /** PATHTRACER: called after every progressive pass; return false to stop early. */
   onProgress?: (p: PathTraceProgress) => boolean | void;
+  /**
+   * Scene evaluator of `doc` to use (default: a new one). Passing the same evaluator for every
+   * frame of an animation reuses its geometry and simulation caches.
+   */
+  evaluator?: SceneEvaluator;
 }
 
 export interface RenderedImage {
@@ -322,7 +327,7 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
   k = k >= 4 ? 4 : k >= 2 ? 2 : 1;
   while (k > 1 && width * height * k * k > MAX_SAMPLES) k = k === 4 ? 2 : 1;
   const frame = opts.frame ?? doc.getScene().frame_start;
-  const scene = new SceneEvaluator(doc).evaluate(frame, { forRender: true });
+  const scene = (opts.evaluator ?? new SceneEvaluator(doc)).evaluate(frame, { forRender: true });
   const aspect = width / height;
   const meshes = renderItems(scene, { forRender: true }).filter((o) => o.mesh.faces.length > 0);
   const bounds = evaluatedBounds(meshes);

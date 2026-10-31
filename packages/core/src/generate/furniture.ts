@@ -86,12 +86,16 @@ export function generateTable(params: Partial<TableParams> = {}): GeneratorResul
     const ly = d / 2 - inset;
     for (const sx of [-1, 1])
       for (const sy of [-1, 1])
-        addBox(b, [sx * lx - lt / 2, sy * ly - lt / 2, 0], [sx * lx + lt / 2, sy * ly + lt / 2, legH], { mat: 1 });
+        addBox(b, [sx * lx - lt / 2, sy * ly - lt / 2, 0], [sx * lx + lt / 2, sy * ly + lt / 2, legH], {
+          mat: 1,
+        });
     // aprons connecting the legs under the top
     const ah = Math.min(0.08, legH * 0.25);
     const at = Math.min(0.02, lt * 0.5);
-    for (const sy of [-1, 1]) addBox(b, [-lx, sy * ly - at / 2, legH - ah], [lx, sy * ly + at / 2, legH], { mat: 1 });
-    for (const sx of [-1, 1]) addBox(b, [sx * lx - at / 2, -ly, legH - ah], [sx * lx + at / 2, ly, legH], { mat: 1 });
+    for (const sy of [-1, 1])
+      addBox(b, [-lx, sy * ly - at / 2, legH - ah], [lx, sy * ly + at / 2, legH], { mat: 1 });
+    for (const sx of [-1, 1])
+      addBox(b, [sx * lx - at / 2, -ly, legH - ah], [sx * lx + at / 2, ly, legH], { mat: 1 });
   }
   const mesh = b.build();
   markSharpEdges(mesh, 0.7);
@@ -155,9 +159,14 @@ export function generateChair(params: Partial<ChairParams> = {}): GeneratorResul
     } else {
       const slatH = Math.min(0.06, bh * 0.18);
       for (const f of [0.35, 0.62, 0.88])
-        addBox(b, [-inner - 0.002, ly - bt / 2, sh + bh * f - slatH / 2], [inner + 0.002, ly + bt / 2, sh + bh * f + slatH / 2], {
-          mat: 0,
-        });
+        addBox(
+          b,
+          [-inner - 0.002, ly - bt / 2, sh + bh * f - slatH / 2],
+          [inner + 0.002, ly + bt / 2, sh + bh * f + slatH / 2],
+          {
+            mat: 0,
+          },
+        );
     }
   }
   const mesh = b.build();
@@ -196,7 +205,8 @@ export function generateShelf(params: Partial<ShelfParams> = {}): GeneratorResul
   const n = Math.round(clampNum(p.shelves, 2, 50, SHELF_DEFAULTS.shelves));
   const b = new MeshBuilder();
   const bt = p.back_panel ? Math.min(0.008, d * 0.1) : 0;
-  for (const sx of [-1, 1]) addBox(b, [sx > 0 ? w / 2 - t : -w / 2, -d / 2, 0], [sx > 0 ? w / 2 : -w / 2 + t, d / 2, h], { mat: 1 });
+  for (const sx of [-1, 1])
+    addBox(b, [sx > 0 ? w / 2 - t : -w / 2, -d / 2, 0], [sx > 0 ? w / 2 : -w / 2 + t, d / 2, h], { mat: 1 });
   const kick = Math.min(0.06, h * 0.1);
   const z0 = kick;
   const z1 = h - t;
@@ -204,7 +214,8 @@ export function generateShelf(params: Partial<ShelfParams> = {}): GeneratorResul
     const z = z0 + ((z1 - z0) * k) / (n - 1);
     addBox(b, [-w / 2 + t, -d / 2, z], [w / 2 - t, d / 2 - bt, z + t], { mat: 0 });
   }
-  if (kick > 0.005) addBox(b, [-w / 2 + t, -d / 2 + 0.01, 0], [w / 2 - t, -d / 2 + 0.01 + t, kick], { mat: 1 });
+  if (kick > 0.005)
+    addBox(b, [-w / 2 + t, -d / 2 + 0.01, 0], [w / 2 - t, -d / 2 + 0.01 + t, kick], { mat: 1 });
   if (bt > 0) addBox(b, [-w / 2 + t, d / 2 - bt, 0], [w / 2 - t, d / 2, h], { mat: 1 });
   return { mesh: b.build(), materials: [MATERIALS.wood, MATERIALS.woodDark] };
 }
@@ -282,9 +293,17 @@ export function generateWheel(params: Partial<WheelParams> = {}): GeneratorResul
       const a = (2 * Math.PI * k) / spokes + Math.PI / 2;
       const c = Math.cos(a);
       const s = Math.sin(a);
-      addBoxBetween(b, [hub * 0.8 * c, hub * 0.8 * s, 0], [rim * 0.9 * c, rim * 0.9 * s, 0], sw, w * 0.25, [0, 0, 1], {
-        mat: 1,
-      });
+      addBoxBetween(
+        b,
+        [hub * 0.8 * c, hub * 0.8 * s, 0],
+        [rim * 0.9 * c, rim * 0.9 * s, 0],
+        sw,
+        w * 0.25,
+        [0, 0, 1],
+        {
+          mat: 1,
+        },
+      );
     }
   } else {
     addLathe(

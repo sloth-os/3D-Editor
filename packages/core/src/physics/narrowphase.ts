@@ -1,17 +1,26 @@
 import type { Vec3 } from '../math/types';
 import type { Polyhedron, Shape, TriMesh } from './shapes';
-import { coreRadius, supportCore, supportingFace } from './shapes';
+import { coreRadius, shapeBounds, supportCore, supportingFace } from './shapes';
 import { epa, gjk, type SupportFn } from './gjk';
 import { clipFeatures, mergeContacts, reduceManifold, type ContactCandidate } from './manifold';
 import { closestSegmentPoints, collidePolyhedra, transformPolyhedron } from './sat';
-import type { Mat3 } from './vmath';
+import {
+  closestPointOnTriangle,
+  collideBoxTriangle,
+  collideBoxes,
+  collideSphereBox,
+  type BoxFrame,
+} from './boxes';
+import { mulMat3, mulMat3TVec, transpose3, type Mat3 } from './vmath';
 
 /*
  * Narrow phase: contact points between two bodies' collision shapes. Pairs are computed in the
  * frame of the first body and returned in world space with normals pointing from A to B.
  *
  * - sphere / capsule cores (point / segment) against each other: closed form;
- * - polyhedra (boxes, hulls, mesh triangles): separating axis test with clipped face manifolds;
+ * - boxes (BOX shapes and cuboid hulls) against each other: 15-axis oriented box test; spheres
+ *   against boxes and mesh triangles: closest points;
+ * - other polyhedra (hulls, mesh triangles): separating axis test with clipped face manifolds;
  * - everything else (cylinders, cones, rounded cores against polyhedra): GJK distance, EPA for
  *   overlaps, then a manifold from the shapes' supporting faces;
  * - triangle meshes: per triangle (BVH query), with normals at internal (flat or concave) mesh
@@ -29,6 +38,9 @@ export interface CollisionPose {
   R: Mat3;
   /** Radius of an origin-centred sphere containing the shape. */
   boundingRadius: number;
+  /** Body-space bounds of the shape (computed from the shape when absent). */
+  localMin?: Readonly<Vec3>;
+  localMax?: Readonly<Vec3>;
 }
 
 /** SAT is used for polyhedron pairs up to this many edge pairs; larger hulls use GJK/EPA. */
@@ -49,7 +61,11 @@ function relative(A: CollisionPose, B: CollisionPose): { r: Mat3; t: Vec3 } {
   const dz = B.pz - A.pz;
   return {
     r,
-    t: [a[0] * dx + a[3] * dy + a[6] * dz, a[1] * dx + a[4] * dy + a[7] * dz, a[2] * dx + a[5] * dy + a[8] * dz],
+    t: [
+      a[0] * dx + a[3] * dy + a[6] * dz,
+      a[1] * dx + a[4] * dy + a[7] * dz,
+      a[2] * dx + a[5] * dy + a[8] * dz,
+    ],
   };
 }
 
@@ -86,7 +102,13 @@ function placedSupport(p: Placed): SupportFn {
   const t = p.t;
   const tmp = new Float64Array(3);
   return (dx, dy, dz, out) => {
-    supportCore(s, r[0] * dx + r[3] * dy + r[6] * dz, r[1] * dx + r[4] * dy + r[7] * dz, r[2] * dx + r[5] * dy + r[8] * dz, tmp);
+    supportCore(
+      s,
+      r[0] * dx + r[3] * dy + r[6] * dz,
+      r[1] * dx + r[4] * dy + r[7] * dz,
+      r[2] * dx + r[5] * dy + r[8] * dz,
+      tmp,
+    );
     out[0] = r[0] * tmp[0] + r[1] * tmp[1] + r[2] * tmp[2] + t[0];
     out[1] = r[3] * tmp[0] + r[4] * tmp[1] + r[5] * tmp[2] + t[1];
     out[2] = r[6] * tmp[0] + r[7] * tmp[1] + r[8] * tmp[2] + t[2];
@@ -96,14 +118,25 @@ function placedSupport(p: Placed): SupportFn {
 function placedFace(p: Placed, d: Vec3): number[] {
   if (!p.r) return supportingFace(p.shape, d[0], d[1], d[2]);
   const r = p.r;
-  const face = supportingFace(p.shape, r[0] * d[0] + r[3] * d[1] + r[6] * d[2], r[1] * d[0] + r[4] * d[1] + r[7] * d[2], r[2] * d[0] + r[5] * d[1] + r[8] * d[2]);
+  const face = supportingFace(
+    p.shape,
+    r[0] * d[0] + r[3] * d[1] + r[6] * d[2],
+    r[1] * d[0] + r[4] * d[1] + r[7] * d[2],
+    r[2] * d[0] + r[5] * d[1] + r[8] * d[2],
+  );
   return xfFlat(r, p.t, face);
 }
 
 function placedCenter(p: Placed): Vec3 {
   const s = p.shape;
   const c: Vec3 =
-    s.kind === 'poly' ? s.poly.centroid : s.kind === 'mesh' ? [0, 0, 0] : s.kind === 'cone' ? [s.center[0], s.center[1], s.center[2] + s.height / 4] : s.center;
+    s.kind === 'poly'
+      ? s.poly.centroid
+      : s.kind === 'mesh'
+        ? [0, 0, 0]
+        : s.kind === 'cone'
+          ? [s.center[0], s.center[1], s.center[2] + s.height / 4]
+          : s.center;
   return p.r ? xf(p.r, p.t, c) : [...c];
 }
 
@@ -187,7 +220,12 @@ function collideRounded(a: Placed, b: Placed, maxSep: number, out: ContactCandid
     // concentric cores: push apart perpendicular to A's axis (or along +Z)
     const ax: Vec3 = [a1[0] - a0[0], a1[1] - a0[1], a1[2] - a0[2]];
     const l = Math.hypot(ax[0], ax[1], ax[2]);
-    n = l > 1e-9 ? (Math.abs(ax[0] / l) < 0.9 ? normalized([0, -ax[2], ax[1]]) : normalized([ax[2], 0, -ax[0]])) : [0, 0, 1];
+    n =
+      l > 1e-9
+        ? Math.abs(ax[0] / l) < 0.9
+          ? normalized([0, -ax[2], ax[1]])
+          : normalized([ax[2], 0, -ax[0]])
+        : [0, 0, 1];
   }
   const r = rA + rB;
   const lenA = Math.hypot(a1[0] - a0[0], a1[1] - a0[1], a1[2] - a0[2]);
@@ -224,16 +262,98 @@ function edgeCount(P: Polyhedron): number {
 
 const isRounded = (s: Shape) => s.kind === 'sphere' || s.kind === 'capsule';
 
+/** Reused polyhedron for B placed in A's frame (the narrow phase is not re-entrant). */
+const placedPoly: Polyhedron = {
+  verts: new Float64Array(0),
+  faces: [],
+  planes: new Float64Array(0),
+  edges: new Int32Array(0),
+  flat: false,
+  centroid: [0, 0, 0],
+};
+
+const IDENTITY: Mat3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
+/** Applies the rotation r and translation t to a contact's points and r to its normal. */
+function placeContact(c: ContactCandidate, r: Readonly<Mat3>, t: Readonly<Vec3>): ContactCandidate {
+  return {
+    pa: xf(r, t, c.pa),
+    pb: xf(r, t, c.pb),
+    n: [
+      r[0] * c.n[0] + r[1] * c.n[1] + r[2] * c.n[2],
+      r[3] * c.n[0] + r[4] * c.n[1] + r[5] * c.n[2],
+      r[6] * c.n[0] + r[7] * c.n[1] + r[8] * c.n[2],
+    ],
+    s: c.s,
+  };
+}
+
+/** Two boxes: B's box (placed by b) is expressed in A's box frame for the closed-form test. */
+function collideBoxPair(A: BoxFrame, B: BoxFrame, b: Placed, maxSep: number, out: ContactCandidate[]): void {
+  const br = b.r ?? IDENTITY;
+  let r: Mat3 = B.aligned ? [...br] : mulMat3(br, B.axes);
+  let t: Vec3 = B.aligned ? [...b.t] : xf(br, b.t, B.center);
+  if (A.aligned) {
+    collideBoxes(A.half, B.half, r, t, maxSep, out);
+    return;
+  }
+  r = mulMat3(transpose3(A.axes), r);
+  t = mulMat3TVec(A.axes, [t[0] - A.center[0], t[1] - A.center[1], t[2] - A.center[2]]);
+  const tmp: ContactCandidate[] = [];
+  collideBoxes(A.half, B.half, r, t, maxSep, tmp);
+  for (const c of tmp) out.push(placeContact(c, A.axes, A.center));
+}
+
+/** A sphere (in A's frame when `sphereIsA`, else placed by b) against a box (the other shape). */
+function collideSphereWithBox(
+  sphere: Extract<Shape, { kind: 'sphere' }>,
+  box: BoxFrame,
+  b: Placed,
+  sphereIsA: boolean,
+  maxSep: number,
+  out: ContactCandidate[],
+): void {
+  const br = b.r ?? IDENTITY;
+  const tmp: ContactCandidate[] = [];
+  if (sphereIsA) {
+    // sphere centre into B's body frame, then into the box frame
+    const c = sphere.center;
+    let p = mulMat3TVec(br, [c[0] - b.t[0], c[1] - b.t[1], c[2] - b.t[2]]);
+    if (!box.aligned)
+      p = mulMat3TVec(box.axes, [p[0] - box.center[0], p[1] - box.center[1], p[2] - box.center[2]]);
+    if (!collideSphereBox(p, sphere.radius, box.half, maxSep, tmp)) return;
+    const toA = box.aligned ? br : mulMat3(br, box.axes);
+    const tA = box.aligned ? b.t : xf(br, b.t, box.center);
+    for (const c0 of tmp) {
+      const w = placeContact(c0, toA, tA);
+      out.push({ pa: w.pb, pb: w.pa, n: [-w.n[0], -w.n[1], -w.n[2]], s: w.s });
+    }
+    return;
+  }
+  let p = xf(br, b.t, sphere.center);
+  if (!box.aligned)
+    p = mulMat3TVec(box.axes, [p[0] - box.center[0], p[1] - box.center[1], p[2] - box.center[2]]);
+  if (!collideSphereBox(p, sphere.radius, box.half, maxSep, tmp)) return;
+  for (const c0 of tmp) out.push(box.aligned ? c0 : placeContact(c0, box.axes, box.center));
+}
+
 /** Contacts between two convex shapes; B is placed in A's frame. */
 function collideConvex(sa: Shape, b: Placed, maxSep: number, out: ContactCandidate[]): void {
   const a: Placed = { shape: sa, r: null, t: [0, 0, 0] };
   const sb = b.shape;
   if (isRounded(sa) && isRounded(sb)) return collideRounded(a, b, maxSep, out);
-  if (sa.kind === 'poly' && sb.kind === 'poly' && edgeCount(sa.poly) * edgeCount(sb.poly) <= SAT_EDGE_PAIRS) {
-    const pb = b.r ? transformPolyhedron(sb.poly, b.r, b.t) : sb.poly;
-    collidePolyhedra(sa.poly, pb, maxSep, out);
-    return;
+  if (sa.kind === 'poly' && sb.kind === 'poly') {
+    if (sa.box && sb.box) return collideBoxPair(sa.box, sb.box, b, maxSep, out);
+    if (edgeCount(sa.poly) * edgeCount(sb.poly) <= SAT_EDGE_PAIRS) {
+      const pb = b.r ? transformPolyhedron(sb.poly, b.r, b.t, placedPoly) : sb.poly;
+      collidePolyhedra(sa.poly, pb, maxSep, out);
+      return;
+    }
   }
+  if (sa.kind === 'sphere' && sb.kind === 'poly' && sb.box)
+    return collideSphereWithBox(sa, sb.box, b, true, maxSep, out);
+  if (sb.kind === 'sphere' && sa.kind === 'poly' && sa.box)
+    return collideSphereWithBox(sb, sa.box, b, false, maxSep, out);
   const tmp: ContactCandidate[] = [];
   collideGeneric(a, b, maxSep, tmp);
   out.push(...reduceManifold(tmp));
@@ -247,8 +367,24 @@ const TRI_FACES = [
 ];
 const TRI_EDGES = Int32Array.from([0, 1, 0, 1, 1, 2, 0, 1, 2, 0, 0, 1]);
 
-/** Flat two-sided polyhedron of one triangle (vertices given in the target frame). */
-function trianglePolyhedron(v: Float64Array): Polyhedron {
+/** Reused triangle polyhedron (the narrow phase is not re-entrant). */
+const scratchTri: Polyhedron = {
+  verts: new Float64Array(9),
+  faces: TRI_FACES,
+  planes: new Float64Array(8),
+  edges: TRI_EDGES,
+  flat: true,
+  centroid: [0, 0, 0],
+};
+const extentTmp = new Float64Array(3);
+const boxTri = new Float64Array(9);
+
+/**
+ * Updates the planes (front and back face) and centroid of a flat two-sided triangle
+ * polyhedron from its vertices. Degenerate triangles get a zero normal.
+ */
+function setTrianglePlanes(tp: Polyhedron): Polyhedron {
+  const v = tp.verts;
   const ux = v[3] - v[0];
   const uy = v[4] - v[1];
   const uz = v[5] - v[2];
@@ -258,19 +394,24 @@ function trianglePolyhedron(v: Float64Array): Polyhedron {
   let nx = uy * wz - uz * wy;
   let ny = uz * wx - ux * wz;
   let nz = ux * wy - uy * wx;
-  const l = Math.hypot(nx, ny, nz) || 1;
-  nx /= l;
-  ny /= l;
-  nz /= l;
+  const l = Math.hypot(nx, ny, nz);
+  if (l > 0) {
+    nx /= l;
+    ny /= l;
+    nz /= l;
+  }
   const d = nx * v[0] + ny * v[1] + nz * v[2];
-  return {
-    verts: v,
-    faces: TRI_FACES,
-    planes: Float64Array.from([nx, ny, nz, d, -nx, -ny, -nz, -d]),
-    edges: TRI_EDGES,
-    flat: true,
-    centroid: [(v[0] + v[3] + v[6]) / 3, (v[1] + v[4] + v[7]) / 3, (v[2] + v[5] + v[8]) / 3],
-  };
+  const pl = tp.planes;
+  pl[0] = nx;
+  pl[1] = ny;
+  pl[2] = nz;
+  pl[3] = d;
+  pl[4] = -nx;
+  pl[5] = -ny;
+  pl[6] = -nz;
+  pl[7] = -d;
+  tp.centroid = [(v[0] + v[3] + v[6]) / 3, (v[1] + v[4] + v[7]) / 3, (v[2] + v[5] + v[8]) / 3];
+  return tp;
 }
 
 /**
@@ -326,36 +467,108 @@ function collideMesh(C: CollisionPose, M: CollisionPose, maxSep: number, out: Co
   const sc = C.shape;
   if (sc.kind === 'mesh') return;
   const { r, t } = relative(C, M); // mesh → C frame
-  // C's bounding sphere in mesh space
-  const rm = M.R;
-  const dx = C.px - M.px;
-  const dy = C.py - M.py;
-  const dz = C.pz - M.pz;
-  const cx = rm[0] * dx + rm[3] * dy + rm[6] * dz;
-  const cy = rm[1] * dx + rm[4] * dy + rm[7] * dz;
-  const cz = rm[2] * dx + rm[5] * dy + rm[8] * dz;
-  const ext = C.boundingRadius + maxSep;
-  const candidates = mesh.bvh.query(cx - ext, cy - ext, cz - ext, cx + ext, cy + ext, cz + ext, []);
+  // C's bounds (its frame) and their box in mesh space for the BVH query
+  let lo = C.localMin;
+  let hi = C.localMax;
+  if (!lo || !hi) ({ min: lo, max: hi } = shapeBounds(sc));
+  const lcx = (lo[0] + hi[0]) / 2;
+  const lcy = (lo[1] + hi[1]) / 2;
+  const lcz = (lo[2] + hi[2]) / 2;
+  const lex = (hi[0] - lo[0]) / 2;
+  const ley = (hi[1] - lo[1]) / 2;
+  const lez = (hi[2] - lo[2]) / 2;
+  // C frame → mesh frame is rᵀ(p − t)
+  const qx = lcx - t[0];
+  const qy = lcy - t[1];
+  const qz = lcz - t[2];
+  const mcx = r[0] * qx + r[3] * qy + r[6] * qz;
+  const mcy = r[1] * qx + r[4] * qy + r[7] * qz;
+  const mcz = r[2] * qx + r[5] * qy + r[8] * qz;
+  const mex = Math.abs(r[0]) * lex + Math.abs(r[3]) * ley + Math.abs(r[6]) * lez + maxSep;
+  const mey = Math.abs(r[1]) * lex + Math.abs(r[4]) * ley + Math.abs(r[7]) * lez + maxSep;
+  const mez = Math.abs(r[2]) * lex + Math.abs(r[5]) * ley + Math.abs(r[8]) * lez + maxSep;
+  const candidates = mesh.bvh.query(mcx - mex, mcy - mey, mcz - mez, mcx + mex, mcy + mey, mcz + mez, []);
   if (candidates.length === 0) return;
   const rC = coreRadius(sc);
   const center = placedCenter({ shape: sc, r: null, t: [0, 0, 0] });
   const all: ContactCandidate[] = [];
   const mv = mesh.verts;
+  const v = scratchTri.verts;
   for (const tri of candidates) {
-    const v = new Float64Array(9);
     for (let k = 0; k < 3; k++) {
       const vi = mesh.tris[tri * 3 + k] * 3;
-      const p = xf(r, t, [mv[vi], mv[vi + 1], mv[vi + 2]]);
-      v[k * 3] = p[0];
-      v[k * 3 + 1] = p[1];
-      v[k * 3 + 2] = p[2];
+      const x = mv[vi];
+      const y = mv[vi + 1];
+      const z = mv[vi + 2];
+      v[k * 3] = r[0] * x + r[1] * y + r[2] * z + t[0];
+      v[k * 3 + 1] = r[3] * x + r[4] * y + r[5] * z + t[1];
+      v[k * 3 + 2] = r[6] * x + r[7] * y + r[8] * z + t[2];
     }
-    const tp = trianglePolyhedron(v);
+    // cheap rejection: the triangle's bounds against C's bounds, then C's extent along the
+    // triangle normal (separating axes that need no edge tests)
+    if (
+      Math.max(v[0], v[3], v[6]) < lo[0] - maxSep ||
+      Math.min(v[0], v[3], v[6]) > hi[0] + maxSep ||
+      Math.max(v[1], v[4], v[7]) < lo[1] - maxSep ||
+      Math.min(v[1], v[4], v[7]) > hi[1] + maxSep ||
+      Math.max(v[2], v[5], v[8]) < lo[2] - maxSep ||
+      Math.min(v[2], v[5], v[8]) > hi[2] + maxSep
+    )
+      continue;
+    const tp = setTrianglePlanes(scratchTri);
+    const nx = tp.planes[0];
+    const ny = tp.planes[1];
+    const nz = tp.planes[2];
+    const d = tp.planes[3];
+    if (nx === 0 && ny === 0 && nz === 0) continue;
+    supportCore(sc, nx, ny, nz, extentTmp);
+    const top = nx * extentTmp[0] + ny * extentTmp[1] + nz * extentTmp[2] + rC;
+    supportCore(sc, -nx, -ny, -nz, extentTmp);
+    const bottom = nx * extentTmp[0] + ny * extentTmp[1] + nz * extentTmp[2] - rC;
+    if (bottom - d > maxSep || d - top > maxSep) continue;
     const active = mesh.activeEdges[tri];
     const tmp: ContactCandidate[] = [];
-    if (sc.kind === 'poly' && edgeCount(sc.poly) * 3 <= SAT_EDGE_PAIRS)
+    if (sc.kind === 'sphere') {
+      // closest point on the triangle (on the front side when the centre lies in its plane)
+      const c = sc.center;
+      const q = closestPointOnTriangle(c, [v[0], v[1], v[2]], [v[3], v[4], v[5]], [v[6], v[7], v[8]]);
+      const dist = Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]);
+      if (dist - sc.radius > maxSep) continue;
+      const n: Vec3 =
+        dist > 1e-12
+          ? [(q[0] - c[0]) / dist, (q[1] - c[1]) / dist, (q[2] - c[2]) / dist]
+          : [-tp.planes[0], -tp.planes[1], -tp.planes[2]];
+      const pa: Vec3 = [c[0] + n[0] * sc.radius, c[1] + n[1] * sc.radius, c[2] + n[2] * sc.radius];
+      tmp.push({ pa, pb: q, n, s: dist - sc.radius });
+    } else if (sc.kind === 'poly' && sc.box) {
+      const box = sc.box;
+      const skip = (e: number) => !(active & (1 << e));
+      if (box.aligned) collideBoxTriangle(box.half, v, maxSep, tmp, skip);
+      else {
+        // triangle into the box's own frame and the contacts back
+        const A = box.axes;
+        const c = box.center;
+        for (let k = 0; k < 9; k += 3) {
+          const x = v[k] - c[0];
+          const y = v[k + 1] - c[1];
+          const z = v[k + 2] - c[2];
+          boxTri[k] = A[0] * x + A[3] * y + A[6] * z;
+          boxTri[k + 1] = A[1] * x + A[4] * y + A[7] * z;
+          boxTri[k + 2] = A[2] * x + A[5] * y + A[8] * z;
+        }
+        const local: ContactCandidate[] = [];
+        collideBoxTriangle(box.half, boxTri, maxSep, local, skip);
+        for (const k of local) tmp.push(placeContact(k, A, c));
+      }
+    } else if (sc.kind === 'poly' && edgeCount(sc.poly) * 3 <= SAT_EDGE_PAIRS)
       collidePolyhedra(sc.poly, tp, maxSep, tmp, (e) => !(active & (1 << e)));
-    else collideGeneric({ shape: sc, r: null, t: [0, 0, 0] }, { shape: { kind: 'poly', poly: tp }, r: null, t: [0, 0, 0] }, maxSep, tmp);
+    else
+      collideGeneric(
+        { shape: sc, r: null, t: [0, 0, 0] },
+        { shape: { kind: 'poly', poly: tp }, r: null, t: [0, 0, 0] },
+        maxSep,
+        tmp,
+      );
     if (tmp.length === 0) continue;
     // triangle normal on the body's side
     let nT: Vec3 = [tp.planes[0], tp.planes[1], tp.planes[2]];

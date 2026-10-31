@@ -38,14 +38,23 @@ const num = (v: unknown, fallback: number, min = -Infinity, max = Infinity): num
 const bool = (v: unknown, fallback: boolean): boolean => (typeof v === 'boolean' ? v : fallback);
 
 function vec3(v: unknown, fallback: Vec3): Vec3 {
-  return Array.isArray(v) && v.length >= 3 && v.slice(0, 3).every((x) => typeof x === 'number' && Number.isFinite(x))
+  return Array.isArray(v) &&
+    v.length >= 3 &&
+    v.slice(0, 3).every((x) => typeof x === 'number' && Number.isFinite(x))
     ? [v[0], v[1], v[2]]
     : [...fallback];
 }
 
 /** Blender's rigid body world defaults. */
 export function defaultRigidBodyWorld(): RigidBodyWorld {
-  return { enabled: true, frame_start: 1, frame_end: 250, substeps_per_frame: 10, solver_iterations: 10, time_scale: 1 };
+  return {
+    enabled: true,
+    frame_start: 1,
+    frame_end: 250,
+    substeps_per_frame: 10,
+    solver_iterations: 10,
+    time_scale: 1,
+  };
 }
 
 /** A valid copy of the scene's rigid body world settings (Blender ranges). */
@@ -79,11 +88,16 @@ export function worldParams(scene: Partial<SceneSettings>): WorldParams {
 }
 
 /**
- * Blender's settings for a newly added rigid body: ACTIVE bodies use a convex hull, PASSIVE ones
- * the triangle mesh (`rigidbody.object_add`).
+ * Blender's settings for a newly added rigid body (`rigidbody.object_add`): ACTIVE bodies use a
+ * convex hull, PASSIVE ones the triangle mesh. "Dynamic" (`enabled`) is on for both types, as in
+ * Blender, so switching the type later never freezes a body.
  */
 export function newRigidBody(type: RigidBodyData['type']): RigidBodyData {
-  return { ...defaultRigidBody(type), collision_shape: type === 'PASSIVE' ? 'MESH' : 'CONVEX_HULL' };
+  return {
+    ...defaultRigidBody(type),
+    enabled: true,
+    collision_shape: type === 'PASSIVE' ? 'MESH' : 'CONVEX_HULL',
+  };
 }
 
 /**

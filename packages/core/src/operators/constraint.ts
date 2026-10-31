@@ -1,11 +1,13 @@
 import { z } from 'zod';
 import type { ConstraintData, DriverData, FCurve, ObjectData } from '../doc/types';
+import type { Vec3 } from '../math/types';
 import { fcurveKey } from '../doc/scene-doc';
 import { createFCurve, insertKeyframe } from '../anim/fcurve';
 import { parseDataPath, type PathSegment } from '../anim/path';
 import {
   CONSTRAINT_TYPES,
   childOfSetInverse,
+  clampConstraintParams,
   constraintContextFor,
   createConstraint,
   defaultConstraintName,
@@ -18,6 +20,7 @@ import {
   type ConstraintTypeInfo,
 } from '../constraints';
 import { FrameState } from '../eval/frame-state';
+import { buildCurvePath } from '../curve/path';
 import { decompose4, multiply4 } from '../math/mat4';
 import { newId } from '../util/id';
 import { uniqueName } from '../util/names';
@@ -147,7 +150,10 @@ function resolveSubtarget(
   return sub;
 }
 
-/** Merges a partial parameter patch into `current` and validates it with the type's schema. */
+/**
+ * Merges a partial parameter patch into `current` and validates it with the type's schema. Stored
+ * numbers outside their range are clamped (as evaluation does); values in `patch` must be valid.
+ */
 function validateParams(
   info: ConstraintTypeInfo,
   current: Record<string, unknown>,
@@ -162,7 +168,7 @@ function validateParams(
       'INVALID_PARAMS',
     );
   const merged: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(current)) if (keys.includes(k)) merged[k] = v;
+  for (const [k, v] of Object.entries(clampConstraintParams(info.type, current))) if (keys.includes(k)) merged[k] = v;
   for (const [k, v] of Object.entries(patch)) if (v !== undefined) merged[k] = v;
   const res = info.schema.safeParse(merged);
   if (!res.success) {
@@ -268,9 +274,17 @@ function retargetConstraintAnimation(
 
 // ---------------------------------------------------------------- evaluation helpers
 
-/** Evaluation errors of constraint `id` of object `ownerId` at the current frame. */
-function constraintErrors(ctx: OperatorContext, ownerId: string, id: string): string[] {
-  const fs = new FrameState(ctx.doc, ctx.state.frame);
+/**
+ * Evaluation errors of constraint `id` of object `ownerId` at the current frame. Constraints on a
+ * dependency cycle are found by a graph walk over the whole scene, so the result does not depend on
+ * which object is evaluated first and matches what the scene evaluator reports.
+ */
+function constraintErrors(
+  ctx: OperatorContext,
+  ownerId: string,
+  id: string,
+  fs = new FrameState(ctx.doc, ctx.state.frame),
+): string[] {
   fs.world(ownerId);
   return (fs.constraintErrors.get(ownerId) ?? []).filter((e) => e.constraintId === id).map((e) => e.message);
 }
@@ -320,12 +334,29 @@ function settleConstraint(ctx: OperatorContext, ownerId: string, constraintId: s
 
 const transformChannels = ['location', 'rotation_euler', 'scale'];
 
-/** Writes a world matrix into an object's loc/rot/scale (relative to its evaluated parent). */
-function applyWorldMatrix(ctx: OperatorContext, o: ObjectData, world: number[], parent: number[]) {
-  const t = worldMatrixToTransform(world, o.parent ? parent : null, o.rotation_euler);
+/**
+ * Writes a world matrix into an object's loc/rot/scale (relative to its evaluated parent) and
+ * re-keys animated channels. Eulers are chosen closest to `compat`, the object's animated rotation
+ * at the current frame (Blender's compatible eulers), so baking an animated object keeps its
+ * rotation curves continuous (e.g. a wheel keyed past 180° is not flipped back by a multiple of 2π).
+ */
+function applyWorldMatrix(
+  ctx: OperatorContext,
+  o: ObjectData,
+  world: number[],
+  parent: number[],
+  compat: Vec3,
+) {
+  const t = worldMatrixToTransform(world, o.parent ? parent : null, compat);
   ctx.doc.updateObject(o.id, t);
   rekeyAnimated(ctx, 'object', o.id, transformChannels);
   return t;
+}
+
+/** Animated rotation of an object at the frame of `fs` (stored rotation when not evaluated). */
+function animatedRotation(fs: FrameState, o: ObjectData): Vec3 {
+  const r = fs.byId.get(o.id)?.rotation_euler;
+  return Array.isArray(r) && r.length === 3 && r.every(Number.isFinite) ? r : o.rotation_euler;
 }
 
 export function registerConstraintOperators(reg: OperatorRegistry): void {
@@ -373,7 +404,8 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
       label: 'Describe Constraints',
       description:
         "Read-only: an object's constraint stack in evaluation order (id, name, type, target and sub-target with " +
-        'the target name, influence, mute, params) with the current evaluation error of each constraint, and the ' +
+        'the target name, influence, mute, params) with the current evaluation error of each constraint (missing ' +
+        'target, invalid parameters, dependency cycle …; identical to what scene evaluation reports), and the ' +
         "object's evaluated world location / rotation_euler (radians) / scale at the current (or given) frame. Use " +
         'it to verify that constraints do what was intended.',
       category: 'Object',
@@ -424,7 +456,9 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
         'armature. Optional `params` (Blender names) are validated per type. Like Blender, a Child Of constraint ' +
         'sets its inverse when it gets a target (the owner does not jump) and Limit Distance with distance 0 adopts ' +
         'the current distance. Returns the constraint id, its unique name ("Track To", "Track To.001"…), its index ' +
-        'and `errors` = current evaluation problems (e.g. a missing target).',
+        'and `errors` = current evaluation problems, e.g. a missing target or a dependency cycle (the target ' +
+        'depends on the owner through parenting or other constraints: every constraint on the cycle is skipped ' +
+        'and reports the objects of the loop).',
       category: 'Object',
       redoable: true,
       schema: z.object({
@@ -474,6 +508,16 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
         settleConstraint(ctx, owner.id, c.id);
         const errors = constraintErrors(ctx, owner.id, c.id);
         for (const e of errors) ctx.report('WARNING', `${c.name}: ${e}`);
+        if (
+          (owner.type === 'CAMERA' || owner.type === 'LIGHT') &&
+          (info.type === 'DAMPED_TRACK' || info.type === 'LOCKED_TRACK') &&
+          params.track_axis !== 'TRACK_NEGATIVE_Z'
+        )
+          ctx.report(
+            'INFO',
+            `${c.name}: ${owner.type === 'CAMERA' ? 'cameras' : 'lights'} look along their -Z axis but track_axis is ` +
+              `${String(params.track_axis)}; use params.track_axis = "TRACK_NEGATIVE_Z" to aim it at the target`,
+          );
         return {
           constraint: c.id,
           name: c.name,
@@ -497,7 +541,7 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
         'target (id or name; "" or null clears it), subtarget (bone name), name (renaming also updates animation ' +
         'paths) and show_expanded. Setting params.set_inverse_pending = true on a Child Of recomputes its inverse; ' +
         'params.distance = 0 on Limit Distance re-adopts the current distance. Returns the updated constraint and ' +
-        'its current evaluation `errors`.',
+        'its current evaluation `errors` (e.g. a missing target or a dependency cycle).',
       category: 'Object',
       redoable: true,
       schema: z.object({
@@ -639,7 +683,7 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
             `Cannot apply constraint '${c.name}': ${own.map((e) => e.message).join('; ')}`,
           );
         const earlier = owner.constraints.slice(0, index).some((x) => !x.mute);
-        const t = applyWorldMatrix(ctx, owner, res.matrix, res.parent);
+        const t = applyWorldMatrix(ctx, owner, res.matrix, res.parent, animatedRotation(fs, owner));
         writeConstraints(
           ctx,
           owner.id,
@@ -750,11 +794,14 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
       id: 'constraint.followpath_path_animate',
       label: 'Animate Path',
       description:
-        "Animate a Follow Path constraint: keyframes the target curve's eval_time from 0 at frame_start to the " +
-        "curve's path_duration at frame_start + length (linear), so the owner travels the whole path in `length` " +
-        'frames (cyclic paths keep looping afterwards, open paths stop at the end). An existing eval_time animation ' +
-        "is replaced. Without a target, the constraint's offset_factor is animated 0 → 1 instead and " +
-        'use_fixed_location is enabled. Returns the animated property and frame range.',
+        'Animate a Follow Path constraint so its owner travels the whole path in `length` frames. Normally keyframes ' +
+        "the target curve's eval_time from 0 at frame_start to the curve's path_duration at frame_start + length " +
+        '(linear); closed (cyclic) paths keep looping afterwards, open paths stop at the end. That timing is shared ' +
+        'by every object following the curve; an existing eval_time animation is replaced. When the constraint has ' +
+        "use_fixed_location on (its position comes from offset_factor, not eval_time) or has no target, the constraint's " +
+        'own offset_factor is keyed 0 → 1 instead (repeating on closed paths); without a target use_fixed_location ' +
+        'is switched on. Returns the animated property (target_type, target_id, path), frame and value range and the ' +
+        'extrapolation.',
       category: 'Animation',
       schema: z.object({
         constraint: constraintRef,
@@ -767,7 +814,8 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
           .max(1048574)
           .optional()
           .describe(
-            "Frames the animation takes (default: the curve's path_duration, i.e. eval_time = frame offset)",
+            "Frames one pass along the path takes (default: the curve's path_duration, so eval_time advances one " +
+              'unit per frame; 100 without a target curve)',
           ),
       }),
       execute(ctx, p) {
@@ -778,14 +826,18 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
           throw new OperatorError(`'${c.name}' is a ${c.type} constraint, not FOLLOW_PATH`, 'INVALID_PARAMS');
         const curveObj = c.target ? ctx.doc.getObject(c.target) : null;
         const curve = curveObj?.type === 'CURVE' && curveObj.data ? ctx.doc.getCurve(curveObj.data) : null;
+        if (c.target && !curve) throw new OperatorError(`Target of '${c.name}' is not a curve object`, 'FAILED');
+        // closed exactly when the evaluated path is (e.g. a cyclic Bezier loop of only two points)
+        const cyclic = !!curve && !!buildCurvePath(curve)?.cyclic;
+        const duration =
+          curve && Number.isFinite(curve.path_duration) && curve.path_duration >= 1 ? curve.path_duration : 100;
+        const fixed = c.params?.use_fixed_location === true;
         let fc: FCurve;
         let end: number;
         let length: number;
-        if (curveObj && curve) {
-          end = Number.isFinite(curve.path_duration) && curve.path_duration >= 1 ? curve.path_duration : 100;
+        if (curveObj && curve && !fixed) {
+          end = duration;
           length = p.length ?? Math.max(1, Math.round(end));
-          const first = curve.splines[0];
-          const cyclic = !!first?.use_cyclic_u && first.points.length > 2;
           const key = fcurveKey({
             target_type: 'curve',
             target_id: curveObj.data!,
@@ -797,8 +849,8 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
           fc = createFCurve({ target_type: 'curve', target_id: curveObj.data!, path: 'eval_time', index: 0 });
           fc.extrapolation = cyclic ? 'LINEAR' : 'CONSTANT';
         } else {
-          if (c.target) throw new OperatorError(`Target of '${c.name}' is not a curve object`, 'FAILED');
-          length = p.length ?? 100;
+          // the position comes from offset_factor: animate it (the curve's eval_time would have no effect)
+          length = p.length ?? (curve ? Math.max(1, Math.round(duration)) : 100);
           end = 1;
           const path = formatPath([
             { kind: 'prop', name: 'constraints' },
@@ -806,9 +858,17 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
             { kind: 'prop', name: 'offset_factor' },
           ]);
           fc = createFCurve({ target_type: 'object', target_id: owner.id, path, index: 0 });
-          const list = owner.constraints.slice();
-          list[index] = { ...c, params: { ...c.params, use_fixed_location: true } };
-          writeConstraints(ctx, owner.id, list);
+          fc.extrapolation = cyclic ? 'CYCLIC' : 'CONSTANT';
+          if (curve)
+            ctx.report(
+              'INFO',
+              `'${c.name}' uses a fixed location: animated its offset_factor instead of the eval_time of '${curve.name}'`,
+            );
+          if (!fixed) {
+            const list = owner.constraints.slice();
+            list[index] = { ...c, params: { ...c.params, use_fixed_location: true } };
+            writeConstraints(ctx, owner.id, list);
+          }
         }
         fc = insertKeyframe(fc, p.frame_start, 0, 'LINEAR');
         fc = insertKeyframe(fc, p.frame_start + length, end, 'LINEAR');
@@ -865,7 +925,8 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
         '(Track To: -Z at the target, Y up), DAMPTRACK (Damped Track: +Y, -Z for cameras/lights) or LOCKTRACK ' +
         '(Locked Track: +Y locked on Z; cameras/lights -Z locked on Y) to every object in `objects` (default: the ' +
         'selected objects) pointing at `target` (default: the active object, which is skipped). Returns the added ' +
-        'constraints.',
+        'constraints with their current evaluation `errors` (e.g. a dependency cycle when an object would track ' +
+        'its own child).',
       category: 'Object',
       schema: z.object({
         type: z
@@ -911,7 +972,14 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
           writeConstraints(ctx, id, [...constraintsOf(o), c]);
           added.push({ object: id, constraint: c.id, name: c.name });
         }
-        return { target: target.id, type, constraints: added };
+        const fs = new FrameState(ctx.doc, ctx.state.frame);
+        const constraints = added.map((a) => {
+          const errors = constraintErrors(ctx, a.object, a.constraint, fs);
+          const owner = ctx.doc.getObject(a.object)?.name ?? a.object;
+          for (const e of errors) ctx.report('WARNING', `${owner} ${a.name}: ${e}`);
+          return { ...a, errors };
+        });
+        return { target: target.id, type, constraints };
       },
     }),
   );
@@ -938,7 +1006,7 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
         for (const v of visual) {
           const o = ctx.doc.getObject(v.id)!;
           const world = v.world ?? multiply4(v.parent, fs.local(v.id));
-          out.push({ object: v.id, ...applyWorldMatrix(ctx, o, world, v.parent) });
+          out.push({ object: v.id, ...applyWorldMatrix(ctx, o, world, v.parent, animatedRotation(fs, o)) });
         }
         return { objects: out };
       },

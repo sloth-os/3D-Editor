@@ -77,7 +77,7 @@ function sampleVNDF(
   let vx = alpha * wx;
   let vy = alpha * wy;
   let vz = wz;
-  const l = 1 / Math.hypot(vx, vy, vz);
+  const l = 1 / Math.sqrt(vx * vx + vy * vy + vz * vz);
   vx *= l;
   vy *= l;
   vz *= l;
@@ -91,7 +91,7 @@ function sampleVNDF(
   let mx = alpha * hx;
   let my = alpha * hy;
   let mz = Math.max(0, hz);
-  const ml = Math.hypot(mx, my, mz);
+  const ml = Math.sqrt(mx * mx + my * my + mz * mz);
   if (ml > 0) {
     mx /= ml;
     my /= ml;
@@ -487,7 +487,7 @@ export class PrincipledBSDF {
       let hx = ox + ix;
       let hy = oy + iy;
       let hz = oz + iz;
-      const hl = Math.hypot(hx, hy, hz);
+      const hl = Math.sqrt(hx * hx + hy * hy + hz * hz);
       if (hl > 0) {
         hx /= hl;
         hy /= hl;
@@ -550,7 +550,7 @@ export class PrincipledBSDF {
       let hx = ox + eta * ix;
       let hy = oy + eta * iy;
       let hz = oz + eta * iz;
-      const hl = Math.hypot(hx, hy, hz);
+      const hl = Math.sqrt(hx * hx + hy * hy + hz * hz);
       if (hl > 0) {
         if (hz < 0) {
           hx = -hx;
@@ -642,7 +642,7 @@ export class PrincipledBSDF {
         ix = -ox / eta + k * h[0];
         iy = -oy / eta + k * h[1];
         iz = -oz / eta + k * h[2];
-        const l = Math.hypot(ix, iy, iz) || 1;
+        const l = Math.sqrt(ix * ix + iy * iy + iz * iz) || 1;
         ix /= l;
         iy /= l;
         iz /= l;

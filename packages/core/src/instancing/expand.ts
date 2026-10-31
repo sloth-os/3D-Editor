@@ -1,15 +1,24 @@
 import type { Mat4 } from '../math/types';
 import type { SceneDoc } from '../doc/scene-doc';
-import type { CollectionData, ParticleSystemData } from '../doc/types';
+import type { CollectionData, ModifierData, ParticleSystemData } from '../doc/types';
 import { ROOT_COLLECTION_ID } from '../doc/types';
 import type { EvaluatedObject } from '../eval/evaluate';
 import type { MeshData } from '../mesh/types';
 import { decodeFloat32 } from '../mesh/shape-keys';
+import {
+  evaluateModifierStack,
+  getModifierDef,
+  isModifierEnabled,
+  isModifierTimeDependent,
+  modifierDependencies,
+  registerBuiltinModifiers,
+} from '../modifiers';
 import { stableStringify } from '../util/json';
 import type { EvaluatedInstance } from './types';
 import { MAX_INSTANCES, normalizeParticleSettings, type ParticleSettings } from './settings';
 import { scatterParticles, type ScatterResult } from './sampling';
 import { placeParticles, type PlacementResult, type SourceOption, type SourceTemplate } from './particles';
+import { sameGeometry, sameSurface, sameTopology } from './mesh-compare';
 import {
   affine4,
   invertAffine,
@@ -30,8 +39,17 @@ export interface InstanceContext {
   /** Evaluated objects (meshes, matrices, visibility) of the current evaluation. */
   objects: readonly EvaluatedObject[];
   byId: ReadonlyMap<string, EvaluatedObject>;
-  /** Viewport evaluation that ignores `display_percentage` (e.g. to make every instance real). */
+  /**
+   * Viewport evaluation of everything an instancer could make real (operators: reports, make
+   * real): every particle system shown in the viewport or in renders, with all of its particles
+   * (`display_percentage` ignored).
+   */
   fullDisplay?: boolean;
+  /**
+   * Only expand these instancers (object ids); what they instance is still expanded as needed.
+   * Lets operators evaluate one emitter without expanding the whole scene.
+   */
+  owners?: ReadonlySet<string>;
 }
 
 export interface InstanceResult {
@@ -47,20 +65,52 @@ const WORK_LIMIT = 4 * MAX_INSTANCES;
 
 // ------------------------------------------------------------------ caches (keyed by content)
 
-interface PartEntry {
+/*
+ * Results are cached per document and evaluation mode (V viewport, R render, F full display),
+ * one slot per instancer / particle system. Entries are validated by content (key strings plus a
+ * comparison of the meshes they were computed from), never by object identity alone, so they stay
+ * valid across evaluators: a one-shot evaluation (operator report, export, MCP query) reuses the
+ * viewport's distributions and placements instead of recomputing them, and leaves the viewport
+ * cache intact. Content-validated entries of one mode are also valid in the others (a render
+ * reuses the viewport's distributions; full-display reports reuse viewport placements).
+ */
+
+/** Evaluation mode: viewport, render, or full display (operators). */
+type Mode = 'V' | 'R' | 'F';
+
+interface Slot<T> {
+  data: T;
+  /** Generation of the last evaluation that used the entry (unused entries are pruned). */
+  gen: number;
+}
+
+/** A particle distribution. */
+interface ScatterData {
   key: string;
+  /** Distribution mesh the samples refer to. */
+  mesh: MeshData;
+  result: ScatterResult;
+  /** Unique id of this distribution (part of the placement keys). */
+  token: number;
+}
+
+/** The instances of one collection instance or particle system. */
+interface PartData {
+  key: string;
+  /** Mesh the placement read positions and normals from (particles), null otherwise. */
+  mesh: MeshData | null;
   list: EvaluatedInstance[];
   errors: string[];
   /** False when the list was cut short by the per-evaluation work budget (never reused). */
   complete: boolean;
-  gen: number;
 }
 
-interface ScatterEntry {
+/** Rest shape of an emitter whose modifiers change the topology (see `restShape`). */
+interface RestData {
   key: string;
-  result: ScatterResult;
-  token: number;
-  gen: number;
+  /** Base mesh, then the meshes of the modifier dependencies (null for objects without one). */
+  inputs: (MeshData | null)[];
+  mesh: MeshData | null;
 }
 
 interface ListEntry {
@@ -72,41 +122,54 @@ interface ListEntry {
 
 interface ModeCache {
   gen: number;
-  scatter: Map<string, ScatterEntry>;
-  parts: Map<string, PartEntry>;
+  scatter: Map<string, Slot<ScatterData>>;
+  parts: Map<string, Slot<PartData>>;
+  rest: Map<string, Slot<RestData>>;
   lists: Map<string, ListEntry>;
   contents: Map<string, { key: string; token: number; gen: number }>;
   output: { parts: EvaluatedInstance[][]; result: EvaluatedInstance[] } | null;
 }
 
-const docCaches = new WeakMap<SceneDoc, Map<string, ModeCache>>();
-const identityTokens = new WeakMap<object, number>();
+const docCaches = new WeakMap<SceneDoc, Map<Mode, ModeCache>>();
+/** Source of unique tokens (lists, collection contents, distributions); never reused. */
 let tokenCounter = 0;
-
-/** Unique token of an (immutable) object instance: equal tokens imply identical content. */
-function identityToken(o: object): number {
-  let t = identityTokens.get(o);
-  if (t === undefined) identityTokens.set(o, (t = ++tokenCounter));
-  return t;
-}
 
 function newModeCache(): ModeCache {
   return {
     gen: 0,
     scatter: new Map(),
     parts: new Map(),
+    rest: new Map(),
     lists: new Map(),
     contents: new Map(),
     output: null,
   };
 }
 
-function modeCache(doc: SceneDoc, mode: string): ModeCache {
+/** Other modes whose cached entries a mode may reuse, most likely match first. */
+const FALLBACK_MODES: Record<Mode, Mode[]> = { V: ['F', 'R'], R: ['V', 'F'], F: ['V', 'R'] };
+
+function docModes(doc: SceneDoc): Map<Mode, ModeCache> {
   let modes = docCaches.get(doc);
   if (!modes) docCaches.set(doc, (modes = new Map()));
+  return modes;
+}
+
+function modeCache(doc: SceneDoc, mode: Mode): ModeCache {
+  const modes = docModes(doc);
   let c = modes.get(mode);
   if (!c) modes.set(mode, (c = newModeCache()));
   return c;
+}
+
+function sameInputs(a: readonly (MeshData | null)[], b: readonly (MeshData | null)[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x !== y && (!x || !y || !sameGeometry(x, y))) return false;
+  }
+  return true;
 }
 
 /** Drops cached instancing results of a document (e.g. to free memory). */
@@ -148,24 +211,25 @@ interface Member {
   nested: LocalResult | null;
 }
 
+/** Whether a particle system is shown in an evaluation mode (full display: viewport or render). */
+function systemShown(p: ParticleSystemData, mode: Mode): boolean {
+  if (mode === 'R') return p.show_render !== false;
+  if (mode === 'V') return p.show_viewport !== false;
+  return p.show_viewport !== false || p.show_render !== false;
+}
+
 /** Particle systems of an object that are enabled in this evaluation mode (tolerates corrupt data). */
-function enabledSystems(o: EvaluatedObject, forRender: boolean): ParticleSystemData[] {
+function enabledSystems(o: EvaluatedObject, mode: Mode): ParticleSystemData[] {
   const list = o.data.particle_systems;
   if (!Array.isArray(list)) return [];
-  return list.filter(
-    (p) =>
-      !!p &&
-      typeof p === 'object' &&
-      typeof p.id === 'string' &&
-      (forRender ? p.show_render !== false : p.show_viewport !== false),
-  );
+  return list.filter((p) => !!p && typeof p === 'object' && typeof p.id === 'string' && systemShown(p, mode));
 }
 
 /** True when the object generates instances in this evaluation mode. */
-function isInstancer(o: EvaluatedObject, forRender: boolean): boolean {
+function isInstancer(o: EvaluatedObject, mode: Mode): boolean {
   const d = o.data;
   if (d.instance_type === 'COLLECTION' && d.instance_collection) return true;
-  return enabledSystems(o, forRender).length > 0;
+  return enabledSystems(o, mode).length > 0;
 }
 
 /** A collection's instance offset as finite numbers (0 for invalid components). */
@@ -186,16 +250,68 @@ class Expander {
   private byCollection: Map<string, EvaluatedObject[]> | null = null;
   private childCollections: Map<string, CollectionData[]> | null = null;
   private readonly collectionData = new Map<string, CollectionData | null>();
+  private collectionNames: Map<string, string> | null = null;
+  private objectNames: Map<string, EvaluatedObject> | null = null;
   private readonly memberMemo = new Map<string, EvaluatedObject[]>();
   private readonly contentMemo = new Map<string, { members: Member[]; token: number }>();
+  /** Viewport evaluation (applies display_percentage). */
   private readonly viewport: boolean;
 
+  /**
+   * @param others caches of the document's other evaluation modes: content-validated entries found
+   *   there are reused (copied into this mode's cache) instead of being recomputed.
+   */
   constructor(
     private readonly ctx: InstanceContext,
     private readonly cache: ModeCache,
+    private readonly mode: Mode,
+    private readonly others: readonly ModeCache[],
   ) {
     this.gen = cache.gen;
-    this.viewport = !ctx.forRender && !ctx.fullDisplay;
+    this.viewport = mode === 'V';
+  }
+
+  /**
+   * Cached data of a slot that passes `valid`: this mode's entry first, then the other modes'
+   * (adopted into this mode's cache). Null when nothing valid is cached.
+   */
+  private reuse<T>(
+    pick: (c: ModeCache) => Map<string, Slot<T>>,
+    slot: string,
+    valid: (data: T) => boolean,
+  ): T | null {
+    const own = pick(this.cache);
+    const mine = own.get(slot);
+    if (mine && valid(mine.data)) {
+      mine.gen = this.gen;
+      return mine.data;
+    }
+    for (const c of this.others) {
+      const s = pick(c).get(slot);
+      if (s && valid(s.data)) {
+        own.set(slot, { data: s.data, gen: this.gen });
+        return s.data;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The mesh a slot's cached data was computed from when it has the same content as `mesh`, else
+   * `mesh`: recomputing on that identical object reuses the caches attached to it (triangulation,
+   * normals) instead of rebuilding them for another evaluator's copy.
+   */
+  private canonical<T extends { mesh: MeshData | null }>(
+    pick: (c: ModeCache) => Map<string, Slot<T>>,
+    slot: string,
+    mesh: MeshData,
+    same: (a: MeshData, b: MeshData) => boolean,
+  ): MeshData {
+    for (const c of [this.cache, ...this.others]) {
+      const prev = pick(c).get(slot)?.data.mesh;
+      if (prev && same(prev, mesh)) return prev;
+    }
+    return mesh;
   }
 
   error(objectId: string, message: string): void {
@@ -221,6 +337,31 @@ class Expander {
       this.collectionData.set(id, c);
     }
     return this.collectionData.get(id)!;
+  }
+
+  /**
+   * Id of a referenced collection: references are ids (operators store ids), exact names are
+   * accepted as well (data written by hand or by generic property tools). Null when unknown.
+   */
+  private collectionId(ref: string): string | null {
+    if (ref === ROOT_COLLECTION_ID || this.collection(ref)) return ref;
+    if (!this.collectionNames) {
+      this.collectionNames = new Map();
+      for (const c of this.ctx.doc.listCollections())
+        if (!this.collectionNames.has(c.name)) this.collectionNames.set(c.name, c.id);
+    }
+    return this.collectionNames.get(ref) ?? null;
+  }
+
+  /** Evaluated object referenced by id or exact name. */
+  private objectRef(ref: string): EvaluatedObject | undefined {
+    const hit = this.ctx.byId.get(ref);
+    if (hit) return hit;
+    if (!this.objectNames) {
+      this.objectNames = new Map();
+      for (const o of this.ctx.objects) if (!this.objectNames.has(o.name)) this.objectNames.set(o.name, o);
+    }
+    return this.objectNames.get(ref);
   }
 
   /** Objects of a collection and (recursively) its child collections, in a stable order. */
@@ -278,7 +419,7 @@ class Expander {
       }
       // a duplicated system id on one object (hand-edited data) gets an index suffix to stay unique
       const seen = new Set<string>();
-      enabledSystems(o, this.ctx.forRender).forEach((ps, i) => {
+      enabledSystems(o, this.mode).forEach((ps, i) => {
         const systemId = seen.has(ps.id) ? `${ps.id}#${i}` : ps.id;
         seen.add(ps.id);
         parts.push(this.particlePart(o, ps, systemId, budget, state));
@@ -309,7 +450,7 @@ class Expander {
     state: { maxDepth: number; hitDepth: boolean },
     ownerId: string,
   ): LocalResult | null {
-    if (!isInstancer(src, this.ctx.forRender)) return null;
+    if (!isInstancer(src, this.mode)) return null;
     if (budget <= 1) {
       state.hitDepth = true;
       this.error(
@@ -326,29 +467,44 @@ class Expander {
     return r;
   }
 
+  /**
+   * Cached instance list of one slot (`slot`), rebuilt when `key` or the content of `mesh` (the
+   * mesh the placement reads, if any) changed. `build` receives the mesh to read (`mesh`, or a
+   * cached object with the same content).
+   */
   private part(
     key: string,
-    cacheKey: string,
+    slot: string,
     ownerId: string,
     prefix: string,
-    build: (limit: number, errors: string[]) => { list: EvaluatedInstance[]; truncated: boolean },
+    mesh: MeshData | null,
+    build: (
+      limit: number,
+      errors: string[],
+      mesh: MeshData | null,
+    ) => { list: EvaluatedInstance[]; truncated: boolean },
   ): EvaluatedInstance[] {
-    const entry = this.cache.parts.get(cacheKey);
-    if (entry && entry.complete && entry.key === key) {
-      entry.gen = this.gen;
-      for (const e of entry.errors) this.error(ownerId, prefix + e);
-      return entry.list;
+    const hit = this.reuse(
+      (c) => c.parts,
+      slot,
+      (d) =>
+        d.complete && d.key === key && (d.mesh === mesh || (!!d.mesh && !!mesh && sameSurface(d.mesh, mesh))),
+    );
+    if (hit) {
+      for (const e of hit.errors) this.error(ownerId, prefix + e);
+      return hit.list;
     }
+    if (mesh) mesh = this.canonical((c) => c.parts, slot, mesh, sameSurface);
     const limit = this.remainingWork();
     const errors: string[] = [];
-    const { list, truncated } = limit > 0 ? build(limit, errors) : { list: [], truncated: true };
+    const { list, truncated } = limit > 0 ? build(limit, errors, mesh) : { list: [], truncated: true };
     const complete = !(truncated && limit < MAX_INSTANCES);
     if (truncated && complete)
       errors.push(`instance limit of ${MAX_INSTANCES} reached; some instances are skipped`);
     if (!complete)
       errors.push('too many instances in the scene; some instances are skipped (reduce counts or nesting)');
     this.noteCreated(list.length);
-    this.cache.parts.set(cacheKey, { key, list, errors, complete, gen: this.gen });
+    this.cache.parts.set(slot, { data: { key, mesh, list, errors, complete }, gen: this.gen });
     for (const e of errors) this.error(ownerId, prefix + e);
     return list;
   }
@@ -358,15 +514,17 @@ class Expander {
   /**
    * Members of an instanced collection with their nested instances (memoized per evaluation; the
    * content token changes whenever anything a collection instance reads from it changes).
-   * `selfId` is the instancer being expanded: it is skipped silently when it is inside the collection.
+   * `selfId` is the instancer being expanded: when it is inside the collection (`selfMember`) it is
+   * left out, so that content is memoized separately from the content other instancers see.
    */
   private collectionContent(
     cid: string,
     budget: number,
     state: { maxDepth: number; hitDepth: boolean },
     selfId: string,
+    selfMember: boolean,
   ) {
-    const memoKey = `${cid}|${budget}`;
+    const memoKey = selfMember ? `${cid}|${budget}|${selfId}` : `${cid}|${budget}`;
     const hit = this.contentMemo.get(memoKey);
     if (hit) {
       for (const m of hit.members)
@@ -405,25 +563,26 @@ class Expander {
 
   private collectionPart(
     o: EvaluatedObject,
-    cid: string,
+    ref: string,
     budget: number,
     state: { maxDepth: number; hitDepth: boolean },
   ): EvaluatedInstance[] {
+    const cid = this.collectionId(ref);
     if (cid === ROOT_COLLECTION_ID) {
       this.error(o.id, `'${o.name}' cannot instance the Scene Collection`);
       return [];
     }
-    const coll = this.collection(cid);
-    if (!coll) {
-      this.error(o.id, `'${o.name}' instances a missing collection (${cid})`);
+    const coll = cid ? this.collection(cid) : null;
+    if (!cid || !coll) {
+      this.error(o.id, `'${o.name}' instances a missing collection (${ref})`);
       return [];
     }
     if (!isFiniteMatrix(o.worldMatrix)) {
       this.error(o.id, `'${o.name}' has a non-finite transform; its collection instance is skipped`);
       return [];
     }
-    const content = this.collectionContent(cid, budget, state, o.id);
     const self = this.members(cid).some((m) => m.id === o.id);
+    const content = this.collectionContent(cid, budget, state, o.id, self);
     if (self)
       this.error(
         o.id,
@@ -431,7 +590,7 @@ class Expander {
       );
     const off = instanceOffset(coll);
     const key = `${matrixKey(o.worldMatrix)}|c${content.token}|${self ? 's' : ''}`;
-    return this.part(key, `C|${o.id}`, o.id, '', (limit) => {
+    return this.part(key, `C|${o.id}`, o.id, '', null, (limit) => {
       const P = mulAffine(o.worldMatrix, translate4(-off[0], -off[1], -off[2]));
       const list: EvaluatedInstance[] = [];
       for (const m of content.members) {
@@ -489,44 +648,49 @@ class Expander {
       this.error(o.id, `${prefix}the emitter transform is not finite`);
       return [];
     }
+    // Particles are distributed on the emitter's rest shape and evaluated on the current surface,
+    // so they stay attached (same triangle and barycentric weights) while shape keys and deforming
+    // modifiers move the surface, and the result never depends on which frames were evaluated.
+    // `pos` always has the topology of `dist`.
+    const deformOnly = sameTopology(evalMesh, baseMesh);
     let dist: MeshData;
     let pos: MeshData;
-    if (settings.use_modifier_stack) dist = pos = evalMesh;
-    else {
+    if (!settings.use_modifier_stack) {
       dist = baseMesh;
-      pos =
-        evalMesh !== baseMesh &&
-        evalMesh.positions.length === baseMesh.positions.length &&
-        evalMesh.faces.length === baseMesh.faces.length
-          ? evalMesh
-          : baseMesh;
+      pos = deformOnly ? evalMesh : baseMesh;
+    } else if (deformOnly) {
+      dist = baseMesh;
+      pos = evalMesh;
+    } else {
+      dist = this.restShape(o, baseMesh, evalMesh);
+      pos = evalMesh;
     }
 
     // ---- sources (keys first; templates are only built when the placement changes)
     const src = this.sources(o, settings, budget, state, prefix);
     if (!src) return [];
 
-    // ---- distribution (cached on the distribution mesh + settings)
+    // ---- distribution (cached on the distribution mesh content + settings)
     const scatter = this.scatter(o, systemId, settings, dist, prefix);
     if (!scatter) return [];
 
-    const placementSettings = stableStringify(settings);
+    // the share of particles shown: viewport placements with 100% equal full-display/render ones
+    const shown = this.viewport ? Math.max(0, Math.min(100, settings.display_percentage)) : 100;
     const key = [
       scatter.token,
-      identityToken(pos),
       matrixKey(o.worldMatrix),
-      placementSettings,
+      stableStringify(settings),
       src.key,
-      this.viewport ? 'V' : 'F',
+      `d${shown}`,
     ].join('#');
     for (const e of scatter.result.errors) this.error(o.id, prefix + e);
-    return this.part(key, `P|${o.id}|${systemId}`, o.id, prefix, (limit, errors) => {
+    return this.part(key, `P|${o.id}|${systemId}`, o.id, prefix, pos, (limit, errors, mesh) => {
       const options = src.build(errors);
       const r: PlacementResult = placeParticles({
         ownerId: o.id,
         systemId,
         samples: scatter.result.samples,
-        mesh: pos,
+        mesh: mesh ?? pos,
         matrix: o.worldMatrix,
         settings,
         options,
@@ -537,14 +701,76 @@ class Expander {
     });
   }
 
-  /** Cached distribution of one particle system. */
+  /**
+   * Distribution mesh of an emitter whose modifier stack changes the topology (use_modifier_stack):
+   * the base mesh with the enabled modifiers that are not deforming ones applied — the stack's
+   * result without shape keys and DEFORM modifiers (armature, displace, wave, …). Particles then
+   * keep their place on the surface while the emitter deforms. Returns the evaluated mesh itself
+   * when nothing deforms it, or when the rest shape does not have the evaluated mesh's topology
+   * (e.g. a merge-by-distance after an armature); then a deformation re-distributes the particles.
+   */
+  private restShape(o: EvaluatedObject, base: MeshData, evalMesh: MeshData): MeshData {
+    registerBuiltinModifiers();
+    const flags = { forRender: this.ctx.forRender, editMode: false };
+    const mods: ModifierData[] = (Array.isArray(o.data.modifiers) ? o.data.modifiers : []).filter(
+      (m) => !!m && typeof m === 'object' && isModifierEnabled(m, flags),
+    );
+    const deforming = (m: ModifierData) => getModifierDef(m.type)?.category === 'DEFORM';
+    const meshId = o.type === 'MESH' ? o.data.data : null;
+    const doc = this.ctx.doc;
+    const shapeKeys = !!meshId && doc.meshAttrVersion(meshId, 'shape_keys') !== 0;
+    if (!shapeKeys && !mods.some(deforming)) return evalMesh;
+
+    const generate = mods.filter((m) => !deforming(m));
+    const deps = [...new Set(generate.flatMap((m) => modifierDependencies(m)))];
+    const depObjects = deps.map((d) => (d === o.id ? null : (this.ctx.byId.get(d) ?? null)));
+    const key = [
+      stableStringify(generate),
+      generate.some((m) => isModifierTimeDependent(m)) ? `f${this.ctx.frame}` : '',
+      deps.length ? matrixKey(o.worldMatrix) : '',
+      deps.map((d, i) => `${d}:${matrixKey(depObjects[i]?.worldMatrix)}`).join('|'),
+      meshId ? `g${doc.meshAttrVersion(meshId, 'vertex_groups')}` : '',
+      this.ctx.forRender ? 'R' : 'V',
+    ].join('#');
+    const inputs = [base, ...depObjects.map((d) => d?.mesh ?? null)];
+    const hit = this.reuse(
+      (c) => c.rest,
+      o.id,
+      (d) => d.key === key && sameInputs(d.inputs, inputs),
+    );
+    let rest: MeshData | null;
+    if (hit) rest = hit.mesh;
+    else {
+      const byId = this.ctx.byId;
+      try {
+        rest = evaluateModifierStack(base, generate, {
+          frame: this.ctx.frame,
+          objectMatrix: o.worldMatrix,
+          forRender: this.ctx.forRender,
+          editMode: false,
+          getObjectMesh: (id) => {
+            const d = id === o.id ? undefined : byId.get(id);
+            return d?.mesh ? { mesh: d.mesh, matrix: d.worldMatrix } : null;
+          },
+          getObjectMatrix: (id) => byId.get(id)?.worldMatrix ?? null,
+          vertexGroups: meshId ? doc.getVertexGroups(meshId) : undefined,
+        }).mesh;
+      } catch {
+        rest = null;
+      }
+      this.cache.rest.set(o.id, { data: { key, inputs, mesh: rest }, gen: this.gen });
+    }
+    return rest && sameTopology(rest, evalMesh) ? rest : evalMesh;
+  }
+
+  /** Cached distribution of one particle system (validated by the content of `dist`). */
   private scatter(
     o: EvaluatedObject,
     systemId: string,
     s: ParticleSettings,
     dist: MeshData,
     prefix: string,
-  ): ScatterEntry | null {
+  ): ScatterData | null {
     const doc = this.ctx.doc;
     let groupKey = '';
     const meshId = o.type === 'MESH' ? o.data.data : null;
@@ -565,18 +791,15 @@ class Expander {
       grid: s.distribution === 'GRID' ? [s.grid_resolution, s.grid_random] : null,
       min_distance: s.min_distance,
     };
-    const key = [
-      identityToken(dist),
-      groupKey,
-      stableStringify(distSettings),
-      metric ? metric.join(',') : '',
-    ].join('#');
-    const cacheKey = `${o.id}|${systemId}`;
-    const entry = this.cache.scatter.get(cacheKey);
-    if (entry && entry.key === key) {
-      entry.gen = this.gen;
-      return entry;
-    }
+    const key = [groupKey, stableStringify(distSettings), metric ? metric.join(',') : ''].join('#');
+    const slot = `${o.id}|${systemId}`;
+    const hit = this.reuse(
+      (c) => c.scatter,
+      slot,
+      (d) => d.key === key && sameGeometry(d.mesh, dist),
+    );
+    if (hit) return hit;
+    dist = this.canonical((c) => c.scatter, slot, dist, sameGeometry);
     let density: Float32Array | null = null;
     const extraErrors: string[] = [];
     if (groupKey && meshId) {
@@ -607,9 +830,9 @@ class Expander {
       return null;
     }
     result.errors.unshift(...extraErrors);
-    const next: ScatterEntry = { key, result, token: ++tokenCounter, gen: this.gen };
-    this.cache.scatter.set(cacheKey, next);
-    return next;
+    const data: ScatterData = { key, mesh: dist, result, token: ++tokenCounter };
+    this.cache.scatter.set(slot, { data, gen: this.gen });
+    return data;
   }
 
   /**
@@ -623,7 +846,6 @@ class Expander {
     state: { maxDepth: number; hitDepth: boolean },
     prefix: string,
   ): { key: string; build: (errors: string[]) => SourceOption[] } | null {
-    const byId = this.ctx.byId;
     const describe = (ev: EvaluatedObject, nested: LocalResult | null) =>
       `${ev.id}:${ev.mesh ? 1 : 0}:${matrixKey(ev.worldMatrix)}:${nested ? nested.token : '-'}`;
     const nestedOf = (ev: EvaluatedObject) => (ev.id === o.id ? null : this.nested(ev, budget, state, o.id));
@@ -633,7 +855,7 @@ class Expander {
         this.error(o.id, `${prefix}no instance_object set`);
         return null;
       }
-      const ev = byId.get(s.instance_object);
+      const ev = this.objectRef(s.instance_object);
       if (!ev) {
         this.error(o.id, `${prefix}instance object ${s.instance_object} not found`);
         return null;
@@ -652,18 +874,19 @@ class Expander {
     }
 
     // COLLECTION
-    const cid = s.instance_collection;
-    if (!cid) {
+    const ref = s.instance_collection;
+    if (!ref) {
       this.error(o.id, `${prefix}no instance_collection set`);
       return null;
     }
-    const coll = cid === ROOT_COLLECTION_ID ? null : this.collection(cid);
-    if (!coll) {
+    const cid = this.collectionId(ref);
+    const coll = !cid || cid === ROOT_COLLECTION_ID ? null : this.collection(cid);
+    if (!cid || !coll) {
       this.error(
         o.id,
         cid === ROOT_COLLECTION_ID
           ? `${prefix}the Scene Collection cannot be instanced`
-          : `${prefix}instance collection ${cid} not found`,
+          : `${prefix}instance collection ${ref} not found`,
       );
       return null;
     }
@@ -763,10 +986,12 @@ class Expander {
   // ---------------------------------------------------------------- top level
 
   run(): EvaluatedInstance[] {
+    const filter = this.ctx.owners;
     const parts: EvaluatedInstance[][] = [];
-    const owners: string[] = [];
+    const owners: EvaluatedObject[] = [];
     for (const o of this.ctx.objects) {
-      if (!isInstancer(o, this.ctx.forRender)) continue;
+      if (filter && !filter.has(o.id)) continue;
+      if (!isInstancer(o, this.mode)) continue;
       let r: LocalResult | null = null;
       try {
         r = this.local(o, MAX_INSTANCE_DEPTH);
@@ -775,31 +1000,34 @@ class Expander {
       }
       if (r && r.list.length) {
         parts.push(r.list);
-        owners.push(o.id);
+        owners.push(o);
       }
     }
-    const prev = this.cache.output;
-    if (prev && sameArrays(prev.parts, parts)) {
-      this.reportTotal(parts, owners);
-      return prev.result;
-    }
-    const result = concatLists(parts, MAX_INSTANCES);
     this.reportTotal(parts, owners);
+    // a filtered run is not the scene's output
+    if (filter) return concatLists(parts, MAX_INSTANCES);
+    const prev = this.cache.output;
+    if (prev && sameArrays(prev.parts, parts)) return prev.result;
+    const result = concatLists(parts, MAX_INSTANCES);
     this.cache.output = { parts, result };
     return result;
   }
 
-  private reportTotal(parts: EvaluatedInstance[][], owners: string[]): void {
+  /** Reports every instancer whose instances the scene-wide limit cuts (instancers fill it in object order). */
+  private reportTotal(parts: EvaluatedInstance[][], owners: EvaluatedObject[]): void {
     let total = 0;
     for (let i = 0; i < parts.length; i++) {
+      const before = total;
       total += parts[i].length;
-      if (total > MAX_INSTANCES) {
-        this.error(
-          owners[i],
-          `the scene exceeds ${MAX_INSTANCES} instances; the instances of later objects are skipped`,
-        );
-        return;
-      }
+      if (total <= MAX_INSTANCES) continue;
+      const n = parts[i].length;
+      const skipped = Math.min(n, total - MAX_INSTANCES);
+      this.error(
+        owners[i].id,
+        `the scene exceeds the limit of ${MAX_INSTANCES} instances: ${
+          before >= MAX_INSTANCES ? `all ${n}` : `${skipped} of the ${n}`
+        } instances of '${owners[i].name}' are skipped (instancers fill the limit in name order)`,
+      );
     }
   }
 }
@@ -840,25 +1068,34 @@ function metricFactor(m: Mat4): number[] {
  * {@link MAX_INSTANCE_DEPTH}, at most {@link MAX_INSTANCES} instances; problems are reported in
  * `errors`, never thrown.
  *
- * Results are cached per document and evaluation mode, keyed by content (emitter geometry,
- * settings, transforms, sources): unchanged inputs return the identical arrays and instance
- * objects, and moving an emitter re-places particles without re-distributing them.
+ * Results are cached per document and evaluation mode, validated by content (emitter geometry,
+ * settings, transforms, sources) rather than object identity: unchanged inputs return the
+ * identical arrays and instance objects in every evaluator (viewport, one-shot evaluations of
+ * operators, exports and renders), moving an emitter re-places particles without re-distributing
+ * them, and particles are distributed on the emitter's rest shape so that they follow shape keys
+ * and deforming modifiers.
  */
 export function expandInstances(ctx: InstanceContext): InstanceResult {
-  // full-display evaluations are one-shot (operators): their results are not kept
-  const cache =
-    ctx.fullDisplay && !ctx.forRender ? newModeCache() : modeCache(ctx.doc, ctx.forRender ? 'R' : 'V');
+  const mode: Mode = ctx.forRender ? 'R' : ctx.fullDisplay ? 'F' : 'V';
+  const cache = modeCache(ctx.doc, mode);
+  const modes = docModes(ctx.doc);
+  const others = FALLBACK_MODES[mode].flatMap((m) => modes.get(m) ?? []);
   cache.gen++;
-  const ex = new Expander(ctx, cache);
+  const ex = new Expander(ctx, cache, mode, others);
   let instances: EvaluatedInstance[] = [];
   try {
     instances = ex.run();
   } catch (e) {
     ex.error('', `instancing failed: ${(e as Error).message}`);
   }
-  // prune entries that were not used by this evaluation (deleted objects, systems, collections)
-  const gen = cache.gen;
-  for (const m of [cache.scatter, cache.parts, cache.lists, cache.contents] as Map<string, { gen: number }>[])
-    for (const [k, v] of m) if (v.gen !== gen) m.delete(k);
+  // Prune entries this evaluation did not use (deleted objects, systems, collections). A filtered
+  // viewport/render run leaves the other instancers' entries alone; full-display results are only
+  // kept for the instancers of the last run (anything else falls back to the viewport cache).
+  if (!ctx.owners || mode === 'F') {
+    const gen = cache.gen;
+    const maps = [cache.scatter, cache.parts, cache.rest, cache.lists, cache.contents];
+    for (const m of maps as Map<string, { gen: number }>[])
+      for (const [k, v] of m) if (v.gen !== gen) m.delete(k);
+  }
   return { instances, errors: ex.errors };
 }

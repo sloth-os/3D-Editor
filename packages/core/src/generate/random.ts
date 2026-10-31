@@ -20,7 +20,7 @@ export function hash32(x: number): number {
 export function seedOf(seed: number, salt = 0): number {
   const s = Number.isFinite(seed) ? Math.trunc(seed) : 0;
   const lo = (s % TWO_POW_32) >>> 0;
-  const hi = Math.floor(s / TWO_POW_32) % TWO_POW_32 >>> 0;
+  const hi = (Math.floor(s / TWO_POW_32) % TWO_POW_32) >>> 0;
   return hash32(lo ^ hash32(hi ^ hash32((salt >>> 0) + 0x632be5ab)));
 }
 

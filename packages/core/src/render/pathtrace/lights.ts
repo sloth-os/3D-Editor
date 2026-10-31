@@ -379,6 +379,9 @@ const MAX_ADAPTIVE = 64;
  * Chooses which light to sample at a shading point. With few lights the probabilities are
  * per-point irradiance estimates (distance, facing and spot cone aware, exactly 0 only where a
  * light cannot contribute); with many lights they are proportional to emitted power.
+ *
+ * Usage per shading point: `prepare` (computes the weights), `pick` for light sampling, and
+ * `probability` for the MIS weight of a BSDF-sampled ray from that point that hits a light.
  */
 export class LightSelector {
   readonly count: number;
@@ -390,6 +393,14 @@ export class LightSelector {
   /** Probability of the group chosen by the last `pick`, and the remapped random number. */
   prob = 0;
   uRest = 0;
+  // shading point of the last `prepare` call (kept in fields: no boxed arguments per light)
+  private px = 0;
+  private py = 0;
+  private pz = 0;
+  private nx = 0;
+  private ny = 0;
+  private nz = 1;
+  private twoSided = false;
 
   constructor(
     readonly kinds: Int32Array,
@@ -413,19 +424,17 @@ export class LightSelector {
   }
 
   /**
-   * Irradiance-like weight of group `i` at point p with unit normal n. `twoSided` disables the
-   * horizon test (transmissive surfaces receive light from both sides).
+   * Irradiance-like weight of group `i` at the prepared point p with unit normal n. `twoSided`
+   * disables the horizon test (transmissive surfaces receive light from both sides).
    */
-  weight(
-    i: number,
-    px: number,
-    py: number,
-    pz: number,
-    nx: number,
-    ny: number,
-    nz: number,
-    twoSided: boolean,
-  ): number {
+  private weightAt(i: number): number {
+    const px = this.px;
+    const py = this.py;
+    const pz = this.pz;
+    const nx = this.nx;
+    const ny = this.ny;
+    const nz = this.nz;
+    const twoSided = this.twoSided;
     const kind = this.kinds[i];
     if (kind === GROUP_ENV) return this.envPower * 0.25;
     if (kind === GROUP_MESH) {
@@ -476,13 +485,23 @@ export class LightSelector {
     return Ll * Math.min(Math.PI, (l.area * cosL) / Math.max(d2, 1e-12));
   }
 
-  /** Computes the selection weights at a point; returns their sum. */
+  /**
+   * Computes the selection weights at a shading point (position, unit normal, two-sided for
+   * transmissive surfaces); returns their sum (0: no light can be sampled from there).
+   */
   prepare(px: number, py: number, pz: number, nx: number, ny: number, nz: number, twoSided: boolean): number {
+    this.px = px;
+    this.py = py;
+    this.pz = pz;
+    this.nx = nx;
+    this.ny = ny;
+    this.nz = nz;
+    this.twoSided = twoSided;
     let sum = 0;
     if (this.adaptive) {
       const w = this.weights;
       for (let i = 0; i < this.count; i++) {
-        const v = this.weight(i, px, py, pz, nx, ny, nz, twoSided);
+        const v = this.weightAt(i);
         w[i] = v > 0 && Number.isFinite(v) ? v : 0;
         sum += w[i];
       }
@@ -523,23 +542,12 @@ export class LightSelector {
   }
 
   /**
-   * Probability that `prepare(p, n, twoSided)` with weight sum `total` followed by `pick` selects
-   * group `i` (for MIS when a BSDF-sampled ray hits a light).
+   * Probability that `pick` selects group `i` at the point of the last `prepare` call (for the MIS
+   * weight of a BSDF-sampled ray from that point that hits a light).
    */
-  probability(
-    i: number,
-    total: number,
-    px: number,
-    py: number,
-    pz: number,
-    nx: number,
-    ny: number,
-    nz: number,
-    twoSided: boolean,
-  ): number {
-    if (i < 0 || !(total > 0)) return 0;
+  probability(i: number): number {
+    if (i < 0 || i >= this.count || !(this.total > 0)) return 0;
     if (!this.adaptive) return this.staticDist.cdf[i + 1] - this.staticDist.cdf[i];
-    const v = this.weight(i, px, py, pz, nx, ny, nz, twoSided);
-    return v > 0 && Number.isFinite(v) ? v / total : 0;
+    return this.weights[i] / this.total;
   }
 }

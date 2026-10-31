@@ -13,11 +13,12 @@ import type {
   VertexGroupData,
 } from '../doc/types';
 import { defaultBone, defaultPoseBone } from '../doc/defaults';
-import { fcurveKey } from '../doc/scene-doc';
+import { fcurveKey, type SceneDoc } from '../doc/scene-doc';
 import { vertexCount } from '../mesh/types';
 import { selectedVertexSet } from '../mesh/selection';
 import { applyShapeKeys, decodeFloat32, encodeFloat32 } from '../mesh/shape-keys';
-import { getModifierDef, registerBuiltinModifiers } from '../modifiers';
+import { getModifierDef, modifierObjectParams, registerBuiltinModifiers } from '../modifiers';
+import { getConstraintTypeInfo } from '../constraints/catalogue';
 import { FrameState } from '../eval/frame-state';
 import { computePose } from '../armature/pose';
 import { rollFromZAxis } from '../armature/bone-math';
@@ -190,8 +191,13 @@ function boneSummary(b: BoneData) {
 
 // ------------------------------------------------------------------ pose helpers
 
+/** Own (not inherited) pose channel of a bone, if any. */
+function ownChannel(bones: Record<string, PoseBone> | undefined, bone: string): PoseBone | undefined {
+  return bones && Object.hasOwn(bones, bone) ? bones[bone] : undefined;
+}
+
 function poseChannel(o: ObjectData, bone: string): PoseBone {
-  return cloneJson(o.pose?.bones?.[bone] ?? defaultPoseBone());
+  return cloneJson(ownChannel(o.pose?.bones, bone) ?? defaultPoseBone());
 }
 
 function writePoseChannel(ctx: OperatorContext, o: ObjectData, bone: string, pb: PoseBone): void {
@@ -252,8 +258,17 @@ function validateConstraintParams(
   const merged: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(current)) if (keys.includes(k)) merged[k] = v;
   for (const [k, v] of Object.entries(patch)) if (v !== undefined) merged[k] = v;
-  if (type === 'IK' && 'pole_target' in patch)
+  if (type === 'IK' && 'pole_target' in patch) {
+    if (patch.pole_target === '' && patch.pole_subtarget)
+      throw new OperatorError(
+        'pole_target "" removes the pole (and its pole_subtarget bone); to use a bone of this armature as ' +
+          'the pole, pass this armature as pole_target or give only pole_subtarget',
+        'INVALID_PARAMS',
+      );
     merged.pole_target = resolveTargetId(ctx, patch.pole_target as string | null, 'Pole target');
+    // without a pole object its bone goes too (a pole bone without an object is ignored)
+    if (!merged.pole_target && !patch.pole_subtarget) merged.pole_subtarget = '';
+  }
   const res = schema.safeParse(merged);
   if (!res.success) {
     const msg = res.error.issues.map((i) => `${i.path.join('.') || '(params)'}: ${i.message}`).join('; ');
@@ -361,6 +376,12 @@ function findKey(keys: ShapeKeyData[], ref: string, objectName: string): number 
 
 function shapeKeyPath(name: string): string {
   return `shape_keys[${JSON.stringify(name)}].value`;
+}
+
+/** Shape keys of a mesh with their animated (F-curve / driver) values at the current frame. */
+function animatedShapeKeys(ctx: OperatorContext, meshId: string): ShapeKeyData[] {
+  const animated = new FrameState(ctx.doc, ctx.state.frame).get<{ shape_keys: ShapeKeyData[] }>('mesh', meshId);
+  return animated?.shape_keys ?? ctx.doc.getShapeKeys(meshId);
 }
 
 /** Positions of a shape key, validated against the mesh vertex count. */
@@ -565,6 +586,73 @@ export function clearBoneParent(ctx: OperatorContext, id: string, keepTransform:
   }
 }
 
+/** Object references of a constraint list remapped through `remap` (null when nothing changed). */
+function remapConstraintRefs(
+  list: ConstraintData[] | undefined,
+  remap: (id: unknown) => unknown,
+): ConstraintData[] | null {
+  if (!Array.isArray(list) || !list.length) return null;
+  let changed = false;
+  const out = list.map((c) => {
+    if (!c || typeof c !== 'object') return c;
+    let next = c;
+    const t = remap(c.target);
+    if (t !== c.target) next = { ...next, target: t as string };
+    const keys = getConstraintTypeInfo(c.type)?.objectParams ?? ['pole_target'];
+    for (const k of keys) {
+      const v = c.params?.[k];
+      const r = remap(v);
+      if (r !== v) next = { ...next, params: { ...next.params, [k]: r } };
+    }
+    if (next !== c) changed = true;
+    return next;
+  });
+  return changed ? out : null;
+}
+
+/**
+ * After objects were duplicated (`map`: original id → copy id), points the copies' references to
+ * duplicated objects at the copies, like Blender: modifier objects (e.g. the Armature modifier's
+ * armature), object constraint targets and pose bone constraint targets / pole targets, so a
+ * duplicated rig and its meshes form an independent copy. Self targets (a bone constraint whose
+ * target is its own armature) follow the copy. References to objects outside the set are kept.
+ */
+export function remapDuplicatedReferences(doc: SceneDoc, map: ReadonlyMap<string, string>): void {
+  if (!map.size) return;
+  const remap = (id: unknown): unknown => (typeof id === 'string' && map.has(id) ? map.get(id)! : id);
+  for (const copy of map.values()) {
+    const o = doc.getObject(copy);
+    if (!o) continue;
+    const patch: Partial<ObjectData> = {};
+    let modsChanged = false;
+    const modifiers = o.modifiers.map((m) => {
+      let params = m.params;
+      for (const k of modifierObjectParams(m.type)) {
+        const v = params?.[k];
+        const r = remap(v);
+        if (r !== v) params = { ...params, [k]: r };
+      }
+      if (params === m.params) return m;
+      modsChanged = true;
+      return { ...m, params };
+    });
+    if (modsChanged) patch.modifiers = modifiers;
+    const cs = remapConstraintRefs(o.constraints, remap);
+    if (cs) patch.constraints = cs;
+    if (o.type === 'ARMATURE' && o.pose?.bones) {
+      let changed = false;
+      const bones = Object.entries(o.pose.bones).map(([name, pb]): [string, PoseBone] => {
+        const bc = remapConstraintRefs(pb?.constraints, remap);
+        if (!bc) return [name, pb];
+        changed = true;
+        return [name, { ...pb, constraints: bc }];
+      });
+      if (changed) patch.pose = { ...o.pose, bones: Object.fromEntries(bones) };
+    }
+    if (Object.keys(patch).length) doc.updateObject(copy, patch);
+  }
+}
+
 // ------------------------------------------------------------------ registration
 
 export function registerArmatureOperators(reg: OperatorRegistry): void {
@@ -596,7 +684,7 @@ function registerAddAndBoneOperators(reg: OperatorRegistry): void {
       }),
       poll: (ctx) => (ctx.state.mode === 'OBJECT' ? true : 'Operator requires Object Mode'),
       execute(ctx, p) {
-        const bone = defaultBone(p.bone_name, [0, 0, 0], [0, 0, p.radius]);
+        const bone = defaultBone(uniqueBoneName([], p.bone_name), [0, 0, 0], [0, 0, p.radius]);
         const data = ctx.doc.addArmature({ name: p.name, bones: [bone] });
         const id = ctx.doc.addObject({
           type: 'ARMATURE',
@@ -605,7 +693,7 @@ function registerAddAndBoneOperators(reg: OperatorRegistry): void {
           location: (p.location ?? ctx.state.cursorLocation) as Vec3,
           rotation_euler: (p.rotation ?? [0, 0, 0]) as Vec3,
           scale: (p.scale ?? [1, 1, 1]) as Vec3,
-          pose: { bones: { [bone.name]: defaultPoseBone() } },
+          pose: { bones: Object.fromEntries([[bone.name, defaultPoseBone()]]) },
         });
         setSelection(ctx, [id], id);
         return { object: id, name: ctx.doc.getObject(id)!.name, armature: data, bones: [bone.name] };
@@ -951,7 +1039,7 @@ function registerAddAndBoneOperators(reg: OperatorRegistry): void {
           armature: arm.name,
           pose_position: arm.pose_position,
           bones: arm.bones.map((b) => {
-            const pb = animated.pose?.bones?.[b.name] ?? defaultPoseBone();
+            const pb = ownChannel(animated.pose?.bones, b.name) ?? defaultPoseBone();
             const ev = pose?.bones.get(b.name);
             return {
               ...boneSummary(b),
@@ -1060,19 +1148,24 @@ function registerPoseOperators(reg: OperatorRegistry): void {
         const names = p.bones ?? arm.bones.map((b) => b.name);
         for (const n of names) findBone(arm, n);
         const cur = ctx.doc.getObject(object.id)!;
-        const bones = { ...(cur.pose?.bones ?? {}) };
+        const bones = new Map(Object.entries(cur.pose?.bones ?? {}));
+        const channels =
+          p.type === 'ALL'
+            ? ['location', 'rotation_euler', 'scale']
+            : [p.type === 'LOCATION' ? 'location' : p.type === 'ROTATION' ? 'rotation_euler' : 'scale'];
         const paths: string[] = [];
         for (const n of names) {
-          const pb = cloneJson(bones[n] ?? defaultPoseBone());
-          if (p.type === 'ALL' || p.type === 'LOCATION') pb.location = [0, 0, 0];
-          if (p.type === 'ALL' || p.type === 'ROTATION') pb.rotation_euler = [0, 0, 0];
-          if (p.type === 'ALL' || p.type === 'SCALE') pb.scale = [1, 1, 1];
-          bones[n] = pb;
-          for (const c of ['location', 'rotation_euler', 'scale']) paths.push(poseBonePath(n, c));
+          const pb = cloneJson(bones.get(n) ?? defaultPoseBone());
+          if (channels.includes('location')) pb.location = [0, 0, 0];
+          if (channels.includes('rotation_euler')) pb.rotation_euler = [0, 0, 0];
+          if (channels.includes('scale')) pb.scale = [1, 1, 1];
+          bones.set(n, pb);
+          // only the cleared channels are re-keyed (the others keep their animation untouched)
+          for (const c of channels) paths.push(poseBonePath(n, c));
         }
-        ctx.doc.updateObject(object.id, { pose: { ...cur.pose, bones } });
+        ctx.doc.updateObject(object.id, { pose: { ...cur.pose, bones: Object.fromEntries(bones) } });
         rekeyAnimated(ctx, 'object', object.id, paths);
-        return { object: object.id, cleared: names };
+        return { object: object.id, cleared: names, channels };
       },
     }),
   );
@@ -1237,8 +1330,12 @@ function registerPoseOperators(reg: OperatorRegistry): void {
       id: 'pose.constraint_set',
       label: 'Edit Bone Constraint',
       description:
-        'Change a pose bone constraint (id or name): name, influence (0..1), mute, target (id/name, "" clears), ' +
-        'subtarget and type parameters (merged with the current ones and validated).',
+        'Change a pose bone constraint (id or name): name (animation follows), influence (0..1), mute, target ' +
+        '(object id/name; "" removes the target and its sub-target bone, so the constraint does nothing), subtarget ' +
+        '(a bone of the target armature; with no target object: a bone of this armature) and type parameters ' +
+        '(merged with the current ones and validated). keyframe=true inserts a keyframe on the influence at `frame` ' +
+        '(default: the current frame), e.g. for IK/FK switching; without it an already animated influence is ' +
+        're-keyed at the current frame so the change stays visible.',
       category: 'Pose',
       redoable: true,
       schema: z.object({
@@ -1248,9 +1345,17 @@ function registerPoseOperators(reg: OperatorRegistry): void {
         name: z.string().min(1).optional().describe('New name (made unique on the bone)'),
         influence: z.number().min(0).max(1).optional().describe('Blend with the unconstrained result (0..1)'),
         mute: z.boolean().optional().describe('Disable the constraint'),
-        target: z.string().optional().describe('Target object id or name ("" clears)'),
-        subtarget: z.string().optional().describe('Target bone'),
+        target: z
+          .string()
+          .optional()
+          .describe('Target object id or name ("" removes the target and its sub-target bone)'),
+        subtarget: z
+          .string()
+          .optional()
+          .describe('Target bone (of the target armature; of this armature when there is no target object)'),
         params: z.record(z.string(), z.unknown()).optional().describe('Parameter changes (Blender names)'),
+        keyframe: z.boolean().default(false).describe('Insert a keyframe on the influence'),
+        frame: z.number().optional().describe('Frame for keyframe=true (default: the current frame)'),
       }),
       execute(ctx, p) {
         const { object, arm } = armatureTarget(ctx, p.object);
@@ -1259,11 +1364,20 @@ function registerPoseOperators(reg: OperatorRegistry): void {
         const list = pb.constraints ?? [];
         const i = findConstraint(list, p.constraint, p.bone);
         const c = { ...list[i] };
+        const oldName = c.name;
         if (p.name !== undefined)
           c.name = uniqueName(p.name, new Set(list.filter((_, k) => k !== i).map((x) => x.name)));
         if (p.influence !== undefined) c.influence = p.influence;
         if (p.mute !== undefined) c.mute = p.mute;
+        if (p.target === '' && p.subtarget)
+          throw new OperatorError(
+            'target "" removes the target object and its sub-target bone; to use a bone of this armature, pass ' +
+              'this armature as `target` (or only `subtarget` when the constraint has no target)',
+            'INVALID_PARAMS',
+          );
         if (p.target !== undefined) c.target = resolveTargetId(ctx, p.target, 'Target');
+        // no target object: the sub-target bone goes too (a constraint without a target does nothing)
+        if (p.target === '') c.subtarget = '';
         if (p.subtarget !== undefined) c.subtarget = p.subtarget;
         if (p.subtarget && !c.target) c.target = object.id;
         checkSubtarget(ctx, c.target, c.subtarget, 'Target');
@@ -1275,7 +1389,19 @@ function registerPoseOperators(reg: OperatorRegistry): void {
         }
         list[i] = c;
         writePoseChannel(ctx, object, p.bone, { ...pb, constraints: list });
-        return { object: object.id, bone: p.bone, constraint: c.id, name: c.name };
+        if (c.name !== oldName) renameConstraintCurves(ctx, object.id, p.bone, oldName, c.name);
+        const path = constraintInfluencePath(p.bone, c.name);
+        let keyframes = 0;
+        if (p.keyframe) keyframes = keyProperty(ctx, 'object', object.id, path, p.frame ?? ctx.state.frame);
+        else if (p.influence !== undefined) rekeyAnimated(ctx, 'object', object.id, [path]);
+        return {
+          object: object.id,
+          bone: p.bone,
+          constraint: c.id,
+          name: c.name,
+          influence: c.influence,
+          keyframes_inserted: keyframes,
+        };
       },
     }),
   );
@@ -1313,6 +1439,10 @@ function registerPoseOperators(reg: OperatorRegistry): void {
         if (rest.length) next.constraints = rest;
         else delete next.constraints;
         writePoseChannel(ctx, object, p.bone, next);
+        // animation of the removed constraints (e.g. keyed influence) goes with them
+        const kept = new Set(rest.map((c) => c.name));
+        for (const name of removed)
+          if (!kept.has(name)) removeConstraintCurves(ctx, object.id, p.bone, name);
         return { object: object.id, bone: p.bone, removed };
       },
     }),
@@ -1347,6 +1477,33 @@ function addBoneConstraint(
   };
   writePoseChannel(ctx, object, bone, { ...pb, constraints: [...list, c] });
   return c;
+}
+
+/** Data path of a pose bone constraint's influence, e.g. `pose.bones["Arm"].constraints["IK"].influence`. */
+function constraintInfluencePath(bone: string, constraint: string): string {
+  return poseBonePath(bone, `constraints[${JSON.stringify(constraint)}].influence`);
+}
+
+/** Prefix of the data paths of one pose bone constraint. */
+function constraintPathPrefix(bone: string, constraint: string): string {
+  return poseBonePath(bone, `constraints[${JSON.stringify(constraint)}]`);
+}
+
+/** Moves the F-curves of a renamed pose bone constraint to its new name. */
+function renameConstraintCurves(ctx: OperatorContext, id: string, bone: string, from: string, to: string): void {
+  const prefix = constraintPathPrefix(bone, from);
+  for (const fc of ctx.doc.listFCurves(id)) {
+    if (fc.target_type !== 'object' || !fc.path.startsWith(`${prefix}.`)) continue;
+    ctx.doc.removeFCurve(fcurveKey(fc));
+    ctx.doc.setFCurve({ ...fc, path: constraintPathPrefix(bone, to) + fc.path.slice(prefix.length) });
+  }
+}
+
+/** Deletes the F-curves of a removed pose bone constraint. */
+function removeConstraintCurves(ctx: OperatorContext, id: string, bone: string, name: string): void {
+  const prefix = `${constraintPathPrefix(bone, name)}.`;
+  for (const fc of ctx.doc.listFCurves(id))
+    if (fc.target_type === 'object' && fc.path.startsWith(prefix)) ctx.doc.removeFCurve(fcurveKey(fc));
 }
 
 function registerVertexGroupOperators(reg: OperatorRegistry): void {
@@ -1633,7 +1790,7 @@ function registerShapeKeyOperators(reg: OperatorRegistry): void {
       label: 'Add Shape Key',
       description:
         'Add a shape key (morph target) to a mesh. The mesh itself is the basis; the new key starts as a copy of ' +
-        'the basis (or, with from_mix=true, of the current blend of all keys). Edit it with ' +
+        'the basis (or, with from_mix=true, of the blend of all keys shown at the current frame). Edit it with ' +
         'object.shape_key_set_positions and blend it with object.shape_key_set(value). Returns the key name and index.',
       category: 'Object',
       schema: z.object({
@@ -1651,7 +1808,10 @@ function registerShapeKeyOperators(reg: OperatorRegistry): void {
         const mesh = ctx.doc.getMesh(meshId)!;
         const keys = ctx.doc.getShapeKeys(meshId);
         if (p.relative_key) findKey(keys, p.relative_key, object.name);
-        const positions = p.from_mix ? applyShapeKeys(mesh, keys).mesh.positions : mesh.positions;
+        // the mix as shown at the current frame (animated key values)
+        const positions = p.from_mix
+          ? applyShapeKeys(mesh, animatedShapeKeys(ctx, meshId)).mesh.positions
+          : mesh.positions;
         const name = uniqueName(p.name?.trim() || `Key ${keys.length + 1}`, new Set(keys.map((k) => k.name)));
         const key: ShapeKeyData = {
           name,
@@ -1674,7 +1834,8 @@ function registerShapeKeyOperators(reg: OperatorRegistry): void {
       label: 'Remove Shape Key',
       description:
         'Remove a shape key (keys relative to it become relative to the basis) or all keys with all=true; ' +
-        'apply_mix=true (with all) first bakes the current blend into the mesh. Animation of removed keys is deleted.',
+        'apply_mix=true (with all) first bakes the blend shown at the current frame into the mesh. Animation of ' +
+        'removed keys is deleted.',
       category: 'Object',
       schema: z.object({
         object: meshRef,
@@ -1693,7 +1854,7 @@ function registerShapeKeyOperators(reg: OperatorRegistry): void {
         if (p.all) {
           if (p.apply_mix && keys.length) {
             const mesh = ctx.doc.getMesh(meshId)!;
-            const mixed = applyShapeKeys(mesh, keys).mesh;
+            const mixed = applyShapeKeys(mesh, animatedShapeKeys(ctx, meshId)).mesh;
             ctx.doc.setMesh(meshId, { ...ctx.doc.getMeshCopy(meshId)!, positions: mixed.positions.slice() });
           }
           removed = keys.map((k) => k.name);

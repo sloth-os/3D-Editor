@@ -1,5 +1,5 @@
 import type { Mat4, Vec3 } from '../math/types';
-import { compose4, invert4, multiply4 } from '../math/mat4';
+import { compose4, identity4, invert4, multiply4 } from '../math/mat4';
 import type { ArmatureData, BoneData, ConstraintData, PoseBone } from '../doc/types';
 import type { ArmaturePose, PoseBoneMatrix, PoseContext } from './types';
 import { blendMatrices, boneRestMatrix, invertRigid, isFiniteMatrix, originOf, tailOf } from './bone-math';
@@ -19,9 +19,15 @@ import { solveIk, type IkBone, type IkChain } from './ik';
  * (roots: rest · basis). Connected bones keep their head on the parent's tail and ignore their
  * pose location. Bone constraints are applied in stack order after the bone's own transform; IK
  * chains are solved when the first bone of the chain is needed, on top of the chain's
- * constrained transforms, before any child outside the chain is evaluated. Evaluation is lazy and
- * dependency driven, so constraint targets inside the same armature are evaluated first;
- * dependency cycles fall back to the unconstrained pose and are reported in `errors`.
+ * constrained transforms, before any child outside the chain is evaluated.
+ *
+ * Evaluation is lazy and per bone (like Blender's per-bone dependency graph): a bone is computed
+ * when it is first needed, after the bones and targets it depends on. Constraint targets inside
+ * the same armature are therefore evaluated first, and an object parented to a bone that does not
+ * depend on it can serve as a target of other bones of the same armature. A bone needed while it
+ * is itself being evaluated closes a dependency cycle: it is reported in `errors` and its
+ * unconstrained pose is used there; results computed from such a provisional matrix are computed
+ * again once the cycle is left (at most once per bone, so evaluation stays linear).
  */
 
 interface Node {
@@ -57,6 +63,31 @@ interface Job {
   chains: ChainSpec[];
 }
 
+/** A bone evaluated on demand (`PoseEvaluation.bone`), in armature space. */
+export interface EvaluatedBone {
+  matrix: Mat4;
+  length: number;
+  /**
+   * True when the bone is being evaluated, or depends on a bone that is (a dependency cycle):
+   * `matrix` is then provisional (unconstrained where the cycle closes).
+   */
+  cyclic: boolean;
+}
+
+/**
+ * Incremental evaluation of one armature pose. Bones are computed on demand and memoised, so a
+ * caller (the scene's FrameState) can ask for single bones while other bones of the same pose are
+ * still being evaluated, e.g. for an IK target object parented to another bone of the armature.
+ */
+export interface PoseEvaluation {
+  /** Evaluates one bone and what it depends on (null for unknown bones). */
+  bone(name: string): EvaluatedBone | null;
+  /** True while a bone of this pose is being evaluated (re-entrant calls see partial results). */
+  readonly busy: boolean;
+  /** Evaluates every bone (once) and returns the pose. */
+  result(): ArmaturePose;
+}
+
 const PENDING = 0;
 const BUSY = 1;
 const DONE = 2;
@@ -65,22 +96,29 @@ function finiteOr(v: unknown, fallback: number): number {
   return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 }
 
-function matricesEqual(a: Readonly<Mat4>, b: Readonly<Mat4>, eps: number): boolean {
-  for (let i = 0; i < 16; i++) if (!(Math.abs(a[i] - b[i]) <= eps)) return false;
-  return true;
+/** Own (not inherited) entry of a record keyed by bone name, e.g. a pose channel. */
+function ownEntry<T>(rec: Readonly<Record<string, T>> | null | undefined, key: string): T | undefined {
+  return rec !== null && typeof rec === 'object' && Object.hasOwn(rec, key) ? rec[key] : undefined;
 }
 
-class PoseEvaluator {
+class PoseEvaluator implements PoseEvaluation {
   readonly errors: string[] = [];
   private readonly errorSet = new Set<string>();
   readonly nodes = new Map<string, Node>();
   readonly order: Node[] = [];
   private readonly state: number[];
   private readonly final: (Mat4 | null)[];
+  private readonly provisional: (Mat4 | null)[];
+  private readonly retried: Uint8Array;
   private readonly plainM: (Mat4 | null)[];
   private readonly jobOf: (Job | null)[];
   private readonly armInv: Mat4;
   private readonly restPosition: boolean;
+  /** Nesting depth of bone evaluations in progress. */
+  private depth = 0;
+  /** Number of dependency cycles met so far (detects provisional results). */
+  private cycles = 0;
+  private cached: ArmaturePose | null = null;
 
   constructor(
     arm: ArmatureData,
@@ -93,9 +131,15 @@ class PoseEvaluator {
     const count = this.order.length;
     this.state = new Array<number>(count).fill(PENDING);
     this.final = new Array<Mat4 | null>(count).fill(null);
+    this.provisional = new Array<Mat4 | null>(count).fill(null);
+    this.retried = new Uint8Array(count);
     this.plainM = new Array<Mat4 | null>(count).fill(null);
     this.jobOf = new Array<Job | null>(count).fill(null);
     if (!this.restPosition) this.buildJobs();
+  }
+
+  get busy(): boolean {
+    return this.depth > 0;
   }
 
   error(message: string): void {
@@ -168,7 +212,7 @@ class PoseEvaluator {
     const stack = [...roots].reverse().map((b) => ({ b, parent: null as Node | null }));
     while (stack.length) {
       const { b, parent } = stack.pop()!;
-      const node = this.makeNode(b, parent, pose[b.name]);
+      const node = this.makeNode(b, parent, ownEntry(pose, b.name));
       this.nodes.set(b.name, node);
       this.order.push(node);
       const kids = children.get(b.name) ?? [];
@@ -224,7 +268,7 @@ class PoseEvaluator {
           this.error(`bone "${node.name}" constraint "${c.name}": ${(e as Error).message}`);
           continue;
         }
-        if (!c.target && !c.subtarget) continue; // targetless IK: nothing to reach for
+        if (!c.target) continue; // targetless IK: nothing to reach for
         const tip = params.use_tail ? node : node.parent;
         if (!tip) {
           this.error(
@@ -282,6 +326,7 @@ class PoseEvaluator {
     const st = this.state[node.index];
     if (st === DONE) return this.final[node.index]!;
     if (st === BUSY) {
+      this.cycles++;
       this.error(`dependency cycle involving bone "${node.name}"`);
       return this.plain(node);
     }
@@ -289,18 +334,39 @@ class PoseEvaluator {
       this.state[node.index] = DONE;
       return (this.final[node.index] = node.rest);
     }
-    const job = this.jobOf[node.index];
-    if (job) {
-      this.runJob(job);
-      return this.final[node.index] ?? this.plain(node);
+    this.depth++;
+    try {
+      const job = this.jobOf[node.index];
+      if (job) {
+        this.runJob(job);
+        return this.final[node.index] ?? this.plain(node);
+      }
+      const cycles = this.cycles;
+      this.state[node.index] = BUSY;
+      const parentM = node.parent ? this.get(node.parent) : null;
+      const frame = parentM ? multiply4(parentM, node.offset) : node.rest;
+      const m = this.constrain(node, multiply4(frame, node.basis), frame);
+      if (this.cycles !== cycles && !this.retried[node.index]) {
+        // computed from a provisional matrix: compute it again once the cycle is left
+        this.retried[node.index] = 1;
+        this.provisional[node.index] = m;
+        this.state[node.index] = PENDING;
+      } else {
+        this.final[node.index] = m;
+        this.state[node.index] = DONE;
+      }
+      return m;
+    } finally {
+      this.depth--;
     }
-    this.state[node.index] = BUSY;
-    const parentM = node.parent ? this.get(node.parent) : null;
-    const frame = parentM ? multiply4(parentM, node.offset) : node.rest;
-    const m = this.constrain(node, multiply4(frame, node.basis), frame);
-    this.final[node.index] = m;
-    this.state[node.index] = DONE;
-    return m;
+  }
+
+  bone(name: string): EvaluatedBone | null {
+    const node = this.nodes.get(name);
+    if (!node) return null;
+    const cycles = this.cycles;
+    const matrix = this.get(node);
+    return { matrix, length: node.length, cyclic: this.cycles !== cycles };
   }
 
   /** Rest frame of a bone under its posed parent (LOCAL space basis). */
@@ -308,32 +374,29 @@ class PoseEvaluator {
     return node.parent ? multiply4(this.get(node.parent), node.offset) : node.rest;
   }
 
-  /** True when a constraint target refers to a bone of this armature. */
-  private isSelf(target: string | null, subtarget: string): boolean {
-    if (!target) return !!subtarget;
-    if (this.ctx.armatureId !== undefined) return target === this.ctx.armatureId;
-    if (!subtarget || !this.nodes.has(subtarget)) return false;
-    const w = this.ctx.getWorldMatrix(target);
-    return !!w && matricesEqual(w, this.ctx.armatureMatrix, 1e-9);
-  }
-
-  /** Resolves a target (object, or bone with subtarget) in armature space. */
-  resolveTarget(target: string | null, subtarget: string): BoneConstraintTarget | null {
-    if (!target && !subtarget) return null;
-    if (this.isSelf(target, subtarget)) {
+  /**
+   * Resolves a constraint target in armature space: a bone of this armature (`target` is this
+   * armature object, `ctx.armatureId`, and `subtarget` names the bone), a bone of another
+   * armature object (`subtarget`, read with `ctx.getBoneMatrix`) or an object. Throws an error
+   * saying why when it is not available.
+   */
+  resolveTarget(target: string | null | undefined, subtarget: string): BoneConstraintTarget {
+    if (!target) throw new Error('no target set');
+    if (this.ctx.armatureId !== undefined && target === this.ctx.armatureId) {
+      if (!subtarget) return { matrix: identity4(), frame: null, length: 0 };
       const node = this.nodes.get(subtarget);
-      if (!node) return null;
+      if (!node) throw new Error(`target bone "${subtarget}" not found`);
       return { matrix: this.get(node), frame: this.frameOf(node), length: node.length };
     }
-    const w = this.ctx.getWorldMatrix(target!);
-    if (!w || !isFiniteMatrix(w)) return null;
+    const w = this.ctx.getWorldMatrix(target);
+    if (!w) throw new Error('target not found');
+    if (!isFiniteMatrix(w)) throw new Error('target has an invalid transform');
     if (subtarget) {
-      const bm = this.ctx.getBoneMatrix?.(target!, subtarget);
-      if (bm) return { matrix: multiply4(this.armInv, bm.matrix), frame: null, length: bm.length };
-      if (this.ctx.getBoneMatrix) return null;
-      this.error(
-        `bone "${subtarget}" of another armature is not available here: using that armature's origin`,
-      );
+      if (!this.ctx.getBoneMatrix)
+        throw new Error(`target bone "${subtarget}" of another armature cannot be resolved here`);
+      const bm = this.ctx.getBoneMatrix(target, subtarget);
+      if (!bm) throw new Error(`target bone "${subtarget}" not found`);
+      return { matrix: multiply4(this.armInv, bm.matrix), frame: null, length: bm.length };
     }
     return { matrix: multiply4(this.armInv, w), frame: null, length: 0 };
   }
@@ -345,6 +408,7 @@ class PoseEvaluator {
       try {
         const res = applyBoneConstraint(c, m, {
           frame,
+          armatureMatrix: this.ctx.armatureMatrix,
           target: (cc) => this.resolveTarget(cc.target, cc.subtarget ?? ''),
         });
         const influence = Math.min(1, finiteOr(c.influence, 0));
@@ -376,16 +440,21 @@ class PoseEvaluator {
     const chains: IkChain[] = [];
     for (const s of job.chains) {
       const label = `bone "${s.owner.name}" constraint "${s.constraint.name}"`;
-      const t = this.resolveTarget(s.constraint.target, s.constraint.subtarget ?? '');
-      if (!t) {
-        this.error(`${label}: IK target not found`);
+      let t: BoneConstraintTarget;
+      try {
+        t = this.resolveTarget(s.constraint.target, s.constraint.subtarget ?? '');
+      } catch (e) {
+        this.error(`${label}: IK ${(e as Error).message}`);
         continue;
       }
       let pole: Vec3 | null = null;
-      if (s.params.pole_target || s.params.pole_subtarget) {
-        const p = this.resolveTarget(s.params.pole_target, s.params.pole_subtarget);
-        if (p) pole = originOf(p.matrix);
-        else this.error(`${label}: pole target not found`);
+      // a pole bone without a pole object is ignored (as in Blender)
+      if (s.params.pole_target) {
+        try {
+          pole = originOf(this.resolveTarget(s.params.pole_target, s.params.pole_subtarget).matrix);
+        } catch (e) {
+          this.error(`${label}: pole ${(e as Error).message}`);
+        }
       }
       chains.push({
         bones: s.nodes.map((n) => local.get(n)!),
@@ -411,10 +480,13 @@ class PoseEvaluator {
   }
 
   result(): ArmaturePose {
+    if (this.cached) return this.cached;
     for (const n of this.order) this.get(n);
+    // bones left provisional by a dependency cycle get their second (final) evaluation
+    for (const n of this.order) if (this.state[n.index] !== DONE) this.get(n);
     const bones = new Map<string, PoseBoneMatrix>();
     for (const n of this.order) {
-      const m = this.final[n.index] ?? this.plain(n);
+      const m = this.final[n.index] ?? this.provisional[n.index] ?? this.plain(n);
       const b = n.bone;
       bones.set(n.name, {
         name: n.name,
@@ -435,15 +507,31 @@ class PoseEvaluator {
         },
       });
     }
-    return { bones, order: this.order.map((n) => n.name), errors: this.errors };
+    this.cached = { bones, order: this.order.map((n) => n.name), errors: this.errors };
+    return this.cached;
   }
+}
+
+/**
+ * Starts an incremental evaluation of an armature pose: bones are computed when first asked for
+ * (`bone`), or all at once (`result`). See `computePose` for the conventions; never throws for
+ * bad data.
+ */
+export function createPoseEvaluation(
+  arm: ArmatureData,
+  pose: Record<string, PoseBone>,
+  ctx: PoseContext,
+): PoseEvaluation {
+  return new PoseEvaluator(arm, pose, ctx);
 }
 
 /**
  * Computes rest and posed bone matrices of an armature (parents first). With
  * `arm.pose_position === 'REST'` pose transforms (and constraints) are ignored. Pose bone
  * transforms are relative to the rest pose in the bone's local space (Blender convention); bone
- * constraints (IK…) apply last. Never throws for bad data: problems are listed in `errors`.
+ * constraints (IK…) apply last. Constraint targets that are this armature object (with a
+ * `subtarget` bone) need `ctx.armatureId`; bones of other armatures need `ctx.getBoneMatrix`.
+ * Never throws for bad data: problems are listed in `errors`.
  */
 export function computePose(
   arm: ArmatureData,

@@ -14,7 +14,6 @@ import {
   mix,
   placeMesh,
   profileIsClockwise,
-  rotateAbout,
   scale,
   sub,
 } from './builder';
@@ -116,7 +115,14 @@ function exactHeight(b: MeshBuilder, height: number): void {
 }
 
 /** Leafy clump: displaced low-poly sphere. */
-function addClump(b: MeshBuilder, noise: GradientNoise, c: Vec3, r: number, squash: number, seedOff: number): void {
+function addClump(
+  b: MeshBuilder,
+  noise: GradientNoise,
+  c: Vec3,
+  r: number,
+  squash: number,
+  seedOff: number,
+): void {
   addIcoSphere(b, c, [r, r, r * squash], 2, {
     mat: 1,
     smooth: true,
@@ -190,7 +196,18 @@ function addLimb(b: MeshBuilder, l: Limb, sides: number): void {
 function deciduous(p: TreeParams): GeneratorResult {
   const H = p.height;
   const rng = new Rng(p.seed, 0xdec1);
-  const trunk = growLimb([0, 0, 0], add(UP, [rng.spread(0.06), rng.spread(0.06), 0]), H * 0.6, p.trunk_radius, p.trunk_radius * 0.35, 0, 8, rng, 0, 0.12);
+  const trunk = growLimb(
+    [0, 0, 0],
+    add(UP, [rng.spread(0.06), rng.spread(0.06), 0]),
+    H * 0.6,
+    p.trunk_radius,
+    p.trunk_radius * 0.35,
+    0,
+    8,
+    rng,
+    0,
+    0.12,
+  );
   trunk.radii[0] *= 1.35;
   const limbs: Limb[] = [trunk];
   for (let qi = 0; qi < limbs.length; qi++) {
@@ -205,9 +222,23 @@ function deciduous(p: TreeParams): GeneratorResult {
       const angle = p.branch_angle * (1 + rng.spread(0.25)) * (limb.level === 0 ? 1 : 0.85);
       const dir = tilt(at.tan, angle, az0 + c * GOLDEN_ANGLE + rng.spread(0.4));
       const rel = (t - t0) / (1 - t0);
-      const length = limb.length * (limb.level === 0 ? 0.7 : 0.62) * (1.15 - 0.55 * rel) * rng.range(0.85, 1.1);
+      const length =
+        limb.length * (limb.level === 0 ? 0.7 : 0.62) * (1.15 - 0.55 * rel) * rng.range(0.85, 1.1);
       const r0 = Math.max(0.003, at.r * 0.7);
-      limbs.push(growLimb(at.p, dir, length, r0, Math.max(0.002, r0 * 0.3), limb.level + 1, Math.max(3, 6 - limb.level), rng, 0.45, 0.3));
+      limbs.push(
+        growLimb(
+          at.p,
+          dir,
+          length,
+          r0,
+          Math.max(0.002, r0 * 0.3),
+          limb.level + 1,
+          Math.max(3, 6 - limb.level),
+          rng,
+          0.45,
+          0.3,
+        ),
+      );
     }
   }
   // foliage candidates: tips (and middles) of the outermost branches
@@ -231,7 +262,8 @@ function deciduous(p: TreeParams): GeneratorResult {
   for (const l of limbs) l.pts = l.pts.map((pt) => scale(pt, f));
   for (const k of clumps) k.c = add(scale(k.c, f), [0, 0, k.r * 0.2]);
   const b = new MeshBuilder();
-  for (const l of limbs) addLimb(b, l, l.level === 0 ? p.resolution : Math.max(3, p.resolution - 2 * l.level));
+  for (const l of limbs)
+    addLimb(b, l, l.level === 0 ? p.resolution : Math.max(3, p.resolution - 2 * l.level));
   const noise = new GradientNoise(p.seed + 17);
   clumps.forEach((k, i) => addClump(b, noise, k.c, k.r, 0.8, i * 3.7));
   exactHeight(b, H);
@@ -242,7 +274,18 @@ function conifer(p: TreeParams): GeneratorResult {
   const H = p.height;
   const rng = new Rng(p.seed, 0xc0f1);
   const b = new MeshBuilder();
-  const trunk = growLimb([0, 0, 0], add(UP, [rng.spread(0.03), rng.spread(0.03), 0]), H * 0.97, p.trunk_radius, p.trunk_radius * 0.12, 0, 8, rng, 0, 0.04);
+  const trunk = growLimb(
+    [0, 0, 0],
+    add(UP, [rng.spread(0.03), rng.spread(0.03), 0]),
+    H * 0.97,
+    p.trunk_radius,
+    p.trunk_radius * 0.12,
+    0,
+    8,
+    rng,
+    0,
+    0.04,
+  );
   trunk.radii[0] *= 1.3;
   addLimb(b, trunk, p.resolution);
   if (p.leaf_density > 0) {
@@ -317,16 +360,26 @@ function palm(p: TreeParams): GeneratorResult {
     path.push(add(add(scale([0, 0, 0], (1 - t) * (1 - t)), scale(mid, 2 * t * (1 - t))), scale(top, t * t)));
   }
   // banded trunk: alternating ring radii
-  addTube(b, path, (i) => p.trunk_radius * (1.25 - 0.45 * (i / n)) * (i === 0 ? 1.2 : i % 2 ? 0.93 : 1), p.resolution, {
-    mat: 0,
-    smooth: true,
-  });
+  addTube(
+    b,
+    path,
+    (i) => p.trunk_radius * (1.25 - 0.45 * (i / n)) * (i === 0 ? 1.2 : i % 2 ? 0.93 : 1),
+    p.resolution,
+    {
+      mat: 0,
+      smooth: true,
+    },
+  );
   const crown = top;
   // coconuts under the crown
   const nutR = Math.max(0.03, p.trunk_radius * 0.55);
   for (let k = 0; k < 3; k++) {
     const a = leanAz + (2 * Math.PI * k) / 3 + 0.4;
-    const c: Vec3 = add(crown, [Math.cos(a) * p.trunk_radius * 1.1, Math.sin(a) * p.trunk_radius * 1.1, -nutR * 1.2]);
+    const c: Vec3 = add(crown, [
+      Math.cos(a) * p.trunk_radius * 1.1,
+      Math.sin(a) * p.trunk_radius * 1.1,
+      -nutR * 1.2,
+    ]);
     addIcoSphere(b, c, [nutR, nutR, nutR * 1.1], 2, { mat: 0, smooth: true });
   }
   if (p.leaf_density > 0) {
@@ -440,7 +493,14 @@ export interface GrassParams {
   seed: number;
 }
 
-export const GRASS_DEFAULTS: GrassParams = { blades: 24, height: 0.35, spread: 0.08, blade_width: 0.014, bend: 0.5, seed: 0 };
+export const GRASS_DEFAULTS: GrassParams = {
+  blades: 24,
+  height: 0.35,
+  spread: 0.08,
+  blade_width: 0.014,
+  bend: 0.5,
+  seed: 0,
+};
 
 /** Grass tuft of curved, pointed blades standing on z = 0. Slot 0: Grass. */
 export function generateGrassTuft(params: Partial<GrassParams> = {}): GeneratorResult {
@@ -462,7 +522,10 @@ export function generateGrassTuft(params: Partial<GrassParams> = {}): GeneratorR
     const lean = r.range(0.05, 0.45);
     const h = H * r.range(0.6, 1);
     const p1 = add(add(base, [0, 0, h * 0.55]), scale(out, h * lean * 0.3));
-    const p2 = add(add(base, [0, 0, h * (1 - bend * 0.35 * (0.5 + lean))]), scale(out, h * (lean * 0.8 + bend * 0.45)));
+    const p2 = add(
+      add(base, [0, 0, h * (1 - bend * 0.35 * (0.5 + lean))]),
+      scale(out, h * (lean * 0.8 + bend * 0.45)),
+    );
     const spine: Vec3[] = [];
     for (let s = 0; s <= segs; s++) {
       const t = s / segs;
@@ -470,7 +533,14 @@ export function generateGrassTuft(params: Partial<GrassParams> = {}): GeneratorR
     }
     const widths = spine.map((_, s) => (s === segs ? 0 : bw * Math.pow(1 - s / segs, 0.7)));
     const thick = widths.map((w) => w * 0.25);
-    addBlade(b, spine, widths, thick, spine.map(() => out), { mat: 0, smooth: true });
+    addBlade(
+      b,
+      spine,
+      widths,
+      thick,
+      spine.map(() => out),
+      { mat: 0, smooth: true },
+    );
   }
   const mesh = b.build();
   placeMesh(mesh, { ground: true });
@@ -532,7 +602,24 @@ export function generateFlower(params: Partial<FlowerParams> = {}): GeneratorRes
   e1 = normalize3(e1);
   const e2 = cross3(up, e1);
   const center = add(head, scale(up, hs * 0.15));
-  const m: Mat4 = [e1[0], e1[1], e1[2], 0, e2[0], e2[1], e2[2], 0, up[0], up[1], up[2], 0, center[0], center[1], center[2], 1];
+  const m: Mat4 = [
+    e1[0],
+    e1[1],
+    e1[2],
+    0,
+    e2[0],
+    e2[1],
+    e2[2],
+    0,
+    up[0],
+    up[1],
+    up[2],
+    0,
+    center[0],
+    center[1],
+    center[2],
+    1,
+  ];
   addIcoSphere(b, [0, 0, 0], [hs, hs, hs * 0.5], 2, { mat: 2, smooth: true, matrix: m });
   const a0 = rng.range(0, 2 * Math.PI);
   for (let k = 0; k < petals; k++) {
@@ -546,7 +633,14 @@ export function generateFlower(params: Partial<FlowerParams> = {}): GeneratorRes
     const widths = spine.map((_, s) => pw * Math.pow(Math.sin(Math.PI * (0.15 + 0.85 * (s / 5))), 0.7));
     widths[5] = 0;
     const thick = spine.map((_, s) => (s === 5 ? 0 : 0.0025 * (1 - (0.6 * s) / 5)));
-    addBlade(b, spine, widths, thick, spine.map(() => up), { mat: 1, smooth: true });
+    addBlade(
+      b,
+      spine,
+      widths,
+      thick,
+      spine.map(() => up),
+      { mat: 1, smooth: true },
+    );
   }
   for (let k = 0; k < leaves; k++) {
     const t = 0.22 + (0.3 * k) / Math.max(1, leaves);

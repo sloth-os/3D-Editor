@@ -156,8 +156,9 @@ export const CONSTRAINT_TYPES: readonly ConstraintTypeInfo[] = [
     'Damped Track',
     'TRACKING',
     dampedTrackSchema,
-    'Points track_axis of the owner at the target using the smallest possible rotation (no up axis; good for ' +
-      'eyes, spotlights and pointers).',
+    'Points track_axis of the owner (default +Y) at the target using the smallest possible rotation (no up ' +
+      'axis; good for eyes and pointers). Cameras and lights look along their -Z axis: give them track_axis ' +
+      'TRACK_NEGATIVE_Z (object.track_set does this automatically).',
   ),
   info(
     'IK',
@@ -174,8 +175,9 @@ export const CONSTRAINT_TYPES: readonly ConstraintTypeInfo[] = [
     'Locked Track',
     'TRACKING',
     lockedTrackSchema,
-    'Rotates the owner only around lock_axis so that track_axis points as close as possible at the target ' +
-      '(billboards, doors, turrets).',
+    'Rotates the owner only around lock_axis so that track_axis (default +Y) points as close as possible at the ' +
+      'target (billboards, doors, turrets). For cameras and lights, which look along -Z, use track_axis ' +
+      'TRACK_NEGATIVE_Z with lock_axis LOCK_Y.',
   ),
   info(
     'TRACK_TO',

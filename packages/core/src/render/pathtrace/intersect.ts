@@ -27,8 +27,12 @@ const TINY = 1e-30;
  *
  * Results of the last `intersect` call are in `t`, `inst`, `tri` (index in the geometry's BVH
  * order) and the barycentric weights `b1`, `b2` of the triangle's second and third corner.
+ * Hot loops should write the ray into `ray` and call `intersectRay` / `occludedRay`: optimized
+ * code passes typed-array elements without boxing them, unlike floating-point arguments.
  */
 export class SceneIntersector {
+  /** Ray of `intersectRay` / `occludedRay`: origin xyz, direction xyz, tMax. */
+  readonly ray = new Float64Array(7);
   t = Infinity;
   inst = -1;
   tri = -1;
@@ -46,6 +50,11 @@ export class SceneIntersector {
   private readonly tStackT: Float64Array;
   private readonly bStackN: Int32Array;
   private readonly bStackT: Float64Array;
+  /**
+   * The ray in object space of the instance being traversed (origin, direction). Passed through a
+   * typed array rather than as arguments, which optimized code would have to box.
+   */
+  private readonly local = new Float64Array(6);
   // closest-hit state while traversing one mesh
   private any = false;
 
@@ -64,12 +73,8 @@ export class SceneIntersector {
 
   /** Closest hit with 0 < t < tMax. Direction need not be normalized (t is in its units). */
   intersect(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, tMax: number): boolean {
-    this.t = tMax;
-    this.inst = -1;
-    this.tri = -1;
-    this.any = false;
-    this.traverseTop(ox, oy, oz, dx, dy, dz);
-    return this.inst >= 0;
+    this.setRay(ox, oy, oz, dx, dy, dz, tMax);
+    return this.intersectRay();
   }
 
   /**
@@ -77,18 +82,52 @@ export class SceneIntersector {
    * surfaces attenuate `transmittance` instead; the ray counts as occluded once it drops below 1e-4.
    */
   occluded(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, tMax: number): boolean {
-    this.t = tMax;
+    this.setRay(ox, oy, oz, dx, dy, dz, tMax);
+    return this.occludedRay();
+  }
+
+  /** `intersect` for the ray stored in `ray`. */
+  intersectRay(): boolean {
+    this.t = this.ray[6];
+    this.inst = -1;
+    this.tri = -1;
+    this.any = false;
+    this.traverseTop();
+    return this.inst >= 0;
+  }
+
+  /** `occluded` for the ray stored in `ray`. */
+  occludedRay(): boolean {
+    this.t = this.ray[6];
     this.inst = -1;
     this.tri = -1;
     this.any = true;
     this.transmittance = 1;
-    this.traverseTop(ox, oy, oz, dx, dy, dz);
+    this.traverseTop();
     return this.inst >= 0;
   }
 
-  private traverseTop(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number): void {
+  private setRay(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, tMax: number): void {
+    const r = this.ray;
+    r[0] = ox;
+    r[1] = oy;
+    r[2] = oz;
+    r[3] = dx;
+    r[4] = dy;
+    r[5] = dz;
+    r[6] = tMax;
+  }
+
+  private traverseTop(): void {
     const inst = this.instances;
     if (inst.count === 0) return;
+    const R = this.ray;
+    const ox = R[0];
+    const oy = R[1];
+    const oz = R[2];
+    const dx = R[3];
+    const dy = R[4];
+    const dz = R[5];
     const B = this.tlas.bounds;
     const C = this.tlas.child;
     const K = this.tlas.count;
@@ -100,7 +139,7 @@ export class SceneIntersector {
     const sT = this.tStackT;
     let sp = 0;
     let node = 0;
-    if (slab(B, 0, ox, oy, oz, ix, iy, iz, this.t) === Infinity) return;
+    if (!slab(B, 0, ox, oy, oz, ix, iy, iz, this.t)) return;
     const nX = ix < 0 ? 3 : 0;
     const nY = iy < 0 ? 4 : 1;
     const nZ = iz < 0 ? 5 : 2;
@@ -108,6 +147,7 @@ export class SceneIntersector {
     const fY = 5 - nY;
     const fZ = 7 - nZ;
     const I = inst.inv;
+    const L = this.local;
     for (;;) {
       const cnt = K[node];
       if (cnt > 0) {
@@ -115,13 +155,13 @@ export class SceneIntersector {
         for (let k = first; k < first + cnt; k++) {
           const i = prims[k];
           const o = i * 12;
-          const lox = I[o] * ox + I[o + 3] * oy + I[o + 6] * oz + I[o + 9];
-          const loy = I[o + 1] * ox + I[o + 4] * oy + I[o + 7] * oz + I[o + 10];
-          const loz = I[o + 2] * ox + I[o + 5] * oy + I[o + 8] * oz + I[o + 11];
-          const ldx = I[o] * dx + I[o + 3] * dy + I[o + 6] * dz;
-          const ldy = I[o + 1] * dx + I[o + 4] * dy + I[o + 7] * dz;
-          const ldz = I[o + 2] * dx + I[o + 5] * dy + I[o + 8] * dz;
-          if (this.traverseMesh(i, inst.geom[i], lox, loy, loz, ldx, ldy, ldz) && this.any) return;
+          L[0] = I[o] * ox + I[o + 3] * oy + I[o + 6] * oz + I[o + 9];
+          L[1] = I[o + 1] * ox + I[o + 4] * oy + I[o + 7] * oz + I[o + 10];
+          L[2] = I[o + 2] * ox + I[o + 5] * oy + I[o + 8] * oz + I[o + 11];
+          L[3] = I[o] * dx + I[o + 3] * dy + I[o + 6] * dz;
+          L[4] = I[o + 1] * dx + I[o + 4] * dy + I[o + 7] * dz;
+          L[5] = I[o + 2] * dx + I[o + 5] * dy + I[o + 8] * dz;
+          if (this.traverseMesh(i, inst.geom[i]) && this.any) return;
         }
       } else {
         // both children (adjacent boxes): slab tests with the near/far planes known from the signs
@@ -185,19 +225,17 @@ export class SceneIntersector {
     }
   }
 
-  /** Traverses one instance's mesh BVH; returns true if a hit was recorded. */
-  private traverseMesh(
-    instance: number,
-    geomIndex: number,
-    ox: number,
-    oy: number,
-    oz: number,
-    dx: number,
-    dy: number,
-    dz: number,
-  ): boolean {
+  /** Traverses one instance's mesh BVH with the object-space ray in `local`; true if a hit was recorded. */
+  private traverseMesh(instance: number, geomIndex: number): boolean {
     const g = this.geometries[geomIndex];
     if (g.triCount === 0) return false;
+    const L = this.local;
+    const ox = L[0];
+    const oy = L[1];
+    const oz = L[2];
+    const dx = L[3];
+    const dy = L[4];
+    const dz = L[5];
     const B = g.bvh.bounds;
     const C = g.bvh.child;
     const K = g.bvh.count;
@@ -205,7 +243,7 @@ export class SceneIntersector {
     const ix = 1 / (Math.abs(dx) < TINY ? (dx < 0 ? -TINY : TINY) : dx);
     const iy = 1 / (Math.abs(dy) < TINY ? (dy < 0 ? -TINY : TINY) : dy);
     const iz = 1 / (Math.abs(dz) < TINY ? (dz < 0 ? -TINY : TINY) : dz);
-    if (slab(B, 0, ox, oy, oz, ix, iy, iz, this.t) === Infinity) return false;
+    if (!slab(B, 0, ox, oy, oz, ix, iy, iz, this.t)) return false;
     // near / far box planes per axis (min or max coordinate) from the direction signs
     const nX = ix < 0 ? 3 : 0;
     const nY = iy < 0 ? 4 : 1;
@@ -348,7 +386,7 @@ export class SceneIntersector {
   }
 }
 
-/** Entry distance of a ray into box `n` if it is hit before `tMax`, else Infinity. */
+/** True when a ray enters box `n` before `tMax`. */
 function slab(
   B: Float64Array,
   n: number,
@@ -359,7 +397,7 @@ function slab(
   iy: number,
   iz: number,
   tMax: number,
-): number {
+): boolean {
   const o = n * 6;
   let t0 = (B[o] - ox) * ix;
   let t1 = (B[o + 3] - ox) * ix;
@@ -385,5 +423,5 @@ function slab(
   if (t1 < hi) hi = t1;
   hi *= BOX_EPS;
   if (lo < 0) lo = 0;
-  return lo <= hi && lo < tMax ? lo : Infinity;
+  return lo <= hi && lo < tMax;
 }

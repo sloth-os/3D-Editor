@@ -33,6 +33,8 @@ import { worldMatrixToTransform } from '../constraints/bake';
 import { RigidBodySimulator } from '../physics/rigid-body';
 import { multiply4 } from '../math/mat4';
 import type { Mat4, Vec3 } from '../math/types';
+import { renderAnimation } from '../render/animation';
+import { base64Encode } from '../util/json';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, safeJsonSchema, type OperatorRegistry } from './registry';
@@ -41,9 +43,10 @@ import { keyProperty, readTarget } from './anim';
 
 /*
  * Animation tool operators: drivers (anim.driver_*), F-curve modifiers (anim.fmodifier_*), curve
- * extrapolation, bulk keyframing, camera turntables and transform baking. Each run is one document
- * transaction (one undo step). Datablocks are referenced by id or exact name; data datablocks
- * (light, camera, mesh, curve, material) can also be reached through an object that uses them.
+ * extrapolation, bulk keyframing, camera turntables, transform baking and animation rendering
+ * (render.render_animation). Each run is one document transaction (one undo step; the render is
+ * read-only). Datablocks are referenced by id or exact name; data datablocks (light, camera, mesh,
+ * curve, material) can also be reached through an object that uses them.
  */
 
 const TARGET_TYPES = ['object', 'material', 'light', 'camera', 'world', 'scene', 'mesh', 'curve'] as const;
@@ -170,7 +173,8 @@ function channelCount(data: Record<string, unknown>, t: Target, path: string): n
   }
   const value = getPathValue(data, path);
   if (typeof value === 'number' || typeof value === 'boolean') return 1;
-  if (Array.isArray(value) && value.length > 0 && value.every((x) => typeof x === 'number')) return value.length;
+  if (Array.isArray(value) && value.length > 0 && value.every((x) => typeof x === 'number'))
+    return value.length;
   if (value === undefined) {
     const known = Object.keys(ANIMATABLE[t.type] ?? {});
     throw new OperatorError(
@@ -212,7 +216,7 @@ const variableSchema = z.object({
     .describe(
       'Datablock the variable reads (object id or exact name; for material/light/camera/mesh/curve a datablock id ' +
         'or name, or an object using it; ignored for world/scene). Default: the driven datablock, when target_type ' +
-        'is the same as the driver\'s',
+        "is the same as the driver's",
     ),
   path: z.string().min(1).describe(`Property the variable reads. ${PATH_HELP}`),
   index: z
@@ -250,9 +254,14 @@ function resolveVariables(ctx: OperatorContext, input: VariableInput[], owner: T
   return out;
 }
 
-function validateDriver(expression: string, variables: DriverVariable[]): void {
+/** Throws INVALID_PARAMS listing the problems of a driver (`channel` names it in the message). */
+function validateDriver(expression: string, variables: DriverVariable[], channel?: string): void {
   const problems = driverProblems({ expression, variables });
-  if (problems.length) throw new OperatorError(`Invalid driver: ${problems.join('; ')}`, 'INVALID_PARAMS');
+  if (problems.length)
+    throw new OperatorError(
+      `Invalid driver${channel ? ` ${channel}` : ''}: ${problems.join('; ')}`,
+      'INVALID_PARAMS',
+    );
 }
 
 /** JSON description of drivers with their evaluated property value (and error) at `frame`. */
@@ -287,7 +296,12 @@ function describeDrivers(ctx: OperatorContext, drivers: DriverData[], frame: num
 function driversOf(ctx: OperatorContext, t: Target, path?: string, index = -1): DriverData[] {
   return ctx.doc
     .listDrivers(t.id)
-    .filter((d) => d.target_type === t.type && (path === undefined || d.path === path) && (index < 0 || d.index === index))
+    .filter(
+      (d) =>
+        d.target_type === t.type &&
+        (path === undefined || d.path === path) &&
+        (index < 0 || d.index === index),
+    )
     .sort((a, b) => a.path.localeCompare(b.path) || a.index - b.index);
 }
 
@@ -306,7 +320,12 @@ function noDriverError(ctx: OperatorContext, t: Target, path?: string, index = -
 function fcurvesOf(ctx: OperatorContext, t: Target, path?: string, index = -1): FCurve[] {
   return ctx.doc
     .listFCurves(t.id)
-    .filter((fc) => fc.target_type === t.type && (path === undefined || fc.path === path) && (index < 0 || fc.index === index))
+    .filter(
+      (fc) =>
+        fc.target_type === t.type &&
+        (path === undefined || fc.path === path) &&
+        (index < 0 || fc.index === index),
+    )
     .sort((a, b) => a.path.localeCompare(b.path) || a.index - b.index);
 }
 
@@ -346,7 +365,8 @@ const FMOD_PARAM_HELP =
   '{frame_step (default 2), frame_offset, use_frame_start/frame_start, use_frame_end/frame_end}; GENERATOR ' +
   '{coefficients [c0, c1, …] = c0 + c1*frame + …, poly_order, mode POLYNOMIAL|POLYNOMIAL_FACTORISED, ' +
   'use_additive}; LIMITS {use_min_x/min_x, use_max_x/max_x (frames), use_min_y/min_y, use_max_y/max_y ' +
-  '(values)}; ENVELOPE {reference_value, default_min, default_max, control_points [{frame, min, max}]}. All ' +
+  '(values)}; ENVELOPE {reference_value, default_min (-1), default_max (1), control_points [{frame, min ' +
+  '(default -1), max (default 1)}]}. All ' +
   'types: use_influence/influence (0..1); all but STEPPED: use_restricted_range, frame_start, frame_end, ' +
   'blend_in, blend_out. anim.fmodifier_type_list returns the full parameter schemas';
 
@@ -360,12 +380,15 @@ const TURNTABLE_ELEVATION = 0.3;
  * of the whole scene), evaluated at the current frame. Objects without geometry give their origin
  * and radius 0; null when there is nothing to frame.
  */
-function framingSphere(ctx: OperatorContext, objectId: string | null): { center: Vec3; radius: number } | null {
+function framingSphere(
+  ctx: OperatorContext,
+  objectId: string | null,
+): { center: Vec3; radius: number } | null {
   const ev = new SceneEvaluator(ctx.doc).evaluate(ctx.state.frame, { forRender: true, noPhysics: true });
   let owners: Set<string> | null = null;
   if (objectId) {
     owners = new Set([objectId]);
-    for (let grew = true; grew; ) {
+    for (let grew = true; grew;) {
       grew = false;
       for (const o of ev.objects)
         if (o.data.parent && owners.has(o.data.parent) && !owners.has(o.id)) {
@@ -412,6 +435,40 @@ const hasRigidBodies = (doc: SceneDoc, objects: readonly ObjectData[]) =>
 /** Largest number of frames anim.bake_transforms samples in one run. */
 const MAX_BAKE_FRAMES = 10000;
 
+/** Largest number of frames render.render_animation renders in one run. */
+const MAX_RENDER_FRAMES = 1000;
+
+const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+/**
+ * Default frame size of render.render_animation: the render resolution (with its percentage)
+ * scaled so its long side is `fit` pixels at most; an explicit width or height keeps the aspect.
+ */
+function animationFrameSize(
+  doc: SceneDoc,
+  width: number | undefined,
+  height: number | undefined,
+  fit: number,
+): { width: number; height: number } {
+  const rs = doc.getRender();
+  const pct = (rs.resolution_percentage > 0 ? rs.resolution_percentage : 100) / 100;
+  const fw = Math.max(1, rs.resolution_x * pct || 1);
+  const fh = Math.max(1, rs.resolution_y * pct || 1);
+  const aspect = fw / fh;
+  let w = width;
+  let h = height;
+  if (!w && !h) {
+    const s = Math.min(1, fit / Math.max(fw, fh));
+    w = fw * s;
+    h = fh * s;
+  } else if (!h) h = w! / aspect;
+  else if (!w) w = h * aspect;
+  return {
+    width: Math.max(1, Math.min(2048, Math.round(w!))),
+    height: Math.max(1, Math.min(2048, Math.round(h!))),
+  };
+}
+
 export function registerDriverOperators(reg: OperatorRegistry): void {
   // ---------------------------------------------------------------- drivers
 
@@ -446,7 +503,9 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           .string()
           .min(1)
           .max(MAX_EXPRESSION_LENGTH)
-          .describe('Expression giving the property value (radians for rotations), e.g. "sin(frame / 10) * 2"'),
+          .describe(
+            'Expression giving the property value (radians for rotations), e.g. "sin(frame / 10) * 2"',
+          ),
         variables: z
           .array(variableSchema)
           .max(64)
@@ -462,31 +521,31 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         const channels = channelsOf(channelCount(targetData(ctx, t), t, p.path), p.index, p.path);
         const variables = resolveVariables(ctx, p.variables, t);
         validateDriver(p.expression, variables);
-        const drivers: DriverData[] = [];
-        let replaced = 0;
-        for (const index of channels) {
-          const d: DriverData = {
-            target_type: t.type,
-            target_id: t.id,
-            path: p.path,
-            index,
-            expression: p.expression,
-            variables,
-            mute: false,
-          };
-          const key = fcurveKey(d);
-          if (ctx.doc.getDriver(key)) {
-            if (!p.replace)
-              throw new OperatorError(
-                `${t.type} '${t.name}' ${p.path}[${index}] already has a driver (pass replace: true to overwrite it)`,
-                'INVALID_PARAMS',
-              );
-            replaced++;
-          }
-          if (ctx.doc.getFCurve(key))
-            ctx.report('WARNING', `${p.path}[${index}] of '${t.name}' is keyframed: the driver overrides its animation`);
+        const drivers: DriverData[] = channels.map((index) => ({
+          target_type: t.type,
+          target_id: t.id,
+          path: p.path,
+          index,
+          expression: p.expression,
+          variables,
+          mute: false,
+        }));
+        // check every channel before writing: a failed run must not leave some drivers behind
+        const taken = drivers.filter((d) => ctx.doc.getDriver(fcurveKey(d)));
+        if (taken.length && !p.replace)
+          throw new OperatorError(
+            `${t.type} '${t.name}' ${taken.map((d) => `${p.path}[${d.index}]`).join(', ')} already ` +
+              `${taken.length === 1 ? 'has a driver' : 'have drivers'} (pass replace: true to overwrite)`,
+            'INVALID_PARAMS',
+          );
+        const replaced = taken.length;
+        for (const d of drivers) {
+          if (ctx.doc.getFCurve(fcurveKey(d)))
+            ctx.report(
+              'WARNING',
+              `${p.path}[${d.index}] of '${t.name}' is keyframed: the driver overrides its animation`,
+            );
           ctx.doc.setDriver(d);
-          drivers.push(d);
         }
         if (t.type === 'scene')
           ctx.report(
@@ -495,7 +554,11 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           );
         const out = describeDrivers(ctx, drivers, ctx.state.frame);
         for (const d of out)
-          if (d.error) ctx.report('WARNING', `Driver ${d.path}[${d.index}] fails at frame ${ctx.state.frame}: ${d.error}`);
+          if (d.error)
+            ctx.report(
+              'WARNING',
+              `Driver ${d.path}[${d.index}] fails at frame ${ctx.state.frame}: ${d.error}`,
+            );
         return { drivers: out, replaced };
       },
     }),
@@ -514,7 +577,12 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         target_type: targetTypeSchema,
         target: targetRef('the active object (or its data)'),
         path: z.string().min(1).describe('Driven property (data path), as given to anim.driver_add'),
-        index: z.number().int().min(-1).default(-1).describe('Driven channel; -1 = every driven channel of the path'),
+        index: z
+          .number()
+          .int()
+          .min(-1)
+          .default(-1)
+          .describe('Driven channel; -1 = every driven channel of the path'),
         expression: z.string().min(1).max(MAX_EXPRESSION_LENGTH).optional().describe('New expression'),
         variables: z
           .array(variableSchema)
@@ -525,23 +593,23 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
       }),
       execute(ctx, p) {
         if (p.expression === undefined && p.variables === undefined && p.mute === undefined)
-          throw new OperatorError('Nothing to update: pass expression, variables and/or mute', 'INVALID_PARAMS');
+          throw new OperatorError(
+            'Nothing to update: pass expression, variables and/or mute',
+            'INVALID_PARAMS',
+          );
         const t = resolveTarget(ctx, p.target_type, p.target);
         const found = driversOf(ctx, t, p.path, p.index);
         if (!found.length) throw noDriverError(ctx, t, p.path, p.index);
         const variables = p.variables ? resolveVariables(ctx, p.variables, t) : null;
-        const updated: DriverData[] = [];
-        for (const d of found) {
-          const next: DriverData = {
-            ...d,
-            expression: p.expression ?? d.expression,
-            variables: variables ?? d.variables ?? [],
-            mute: p.mute ?? !!d.mute,
-          };
-          validateDriver(next.expression, next.variables);
-          ctx.doc.setDriver(next);
-          updated.push(next);
-        }
+        const updated: DriverData[] = found.map((d) => ({
+          ...d,
+          expression: p.expression ?? d.expression,
+          variables: variables ?? d.variables ?? [],
+          mute: p.mute ?? !!d.mute,
+        }));
+        // validate every driver before writing any (e.g. new variables missing a name one uses)
+        for (const d of updated) validateDriver(d.expression, d.variables, `${d.path}[${d.index}]`);
+        for (const d of updated) ctx.doc.setDriver(d);
         return { drivers: describeDrivers(ctx, updated, ctx.state.frame) };
       },
     }),
@@ -588,7 +656,9 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         target: z
           .string()
           .optional()
-          .describe('Only drivers of this datablock (id or name, or an object using it; needs target_type, default object)'),
+          .describe(
+            'Only drivers of this datablock (id or name, or an object using it; needs target_type, default object)',
+          ),
         frame: z.number().optional().describe('Frame to evaluate at (default: the current frame)'),
       }),
       execute(ctx, p) {
@@ -677,6 +747,26 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           if (!existing.length) throw e;
         }
         const channels = count ? channelsOf(count, p.index, p.path) : existing.map((fc) => fc.index);
+        // channels without a curve get one keyed at their current value: check they can be keyed
+        // before writing anything (a failed run must not leave curves or modifiers behind)
+        const missing = channels.filter(
+          (index) =>
+            !ctx.doc.getFCurve(fcurveKey({ target_type: t.type, target_id: t.id, path: p.path, index })),
+        );
+        if (missing.length) {
+          if (!isAnimatable(t.type, p.path))
+            throw new OperatorError(
+              `Property '${p.path}' of ${t.type} is not animatable, so it cannot get an animation curve`,
+              'INVALID_PARAMS',
+            );
+          const data = targetData(ctx, t);
+          for (const index of missing)
+            if (readChannel(data, p.path, index) === undefined)
+              throw new OperatorError(
+                `${p.path}[${index}] of ${t.type} '${t.name}' has no value to key`,
+                'INVALID_PARAMS',
+              );
+        }
         const created: string[] = [];
         const added: ReturnType<typeof modifierInfo>[] = [];
         channels.forEach((index, k) => {
@@ -686,7 +776,10 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
             keyProperty(ctx, t.type, t.id, p.path, ctx.state.frame, { index });
             fc = ctx.doc.getFCurve(key);
             if (!fc)
-              throw new OperatorError(`Could not create an animation curve for ${p.path}[${index}]`, 'FAILED');
+              throw new OperatorError(
+                `Could not create an animation curve for ${p.path}[${index}]`,
+                'FAILED',
+              );
             created.push(key);
           }
           let own = params;
@@ -727,36 +820,57 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         target_type: targetTypeSchema,
         target: targetRef('the active object (or its data)'),
         path: z.string().min(1).describe('Animated property (data path)'),
-        index: z.number().int().min(-1).default(-1).describe('Channel; -1 = every animated channel of the path'),
+        index: z
+          .number()
+          .int()
+          .min(-1)
+          .default(-1)
+          .describe('Channel; -1 = every animated channel of the path'),
         ...stackSelector,
         params: z.record(z.string(), z.unknown()).default({}).describe('Parameters to change'),
         mute: z.boolean().optional().describe('Disable (true) or enable (false) the modifiers'),
       }),
       execute(ctx, p) {
         if (p.modifier_index === undefined && p.type === undefined)
-          throw new OperatorError('Pass modifier_index and/or type to select the modifiers', 'INVALID_PARAMS');
+          throw new OperatorError(
+            'Pass modifier_index and/or type to select the modifiers',
+            'INVALID_PARAMS',
+          );
         const t = resolveTarget(ctx, p.target_type, p.target);
         const curves = fcurvesOf(ctx, t, p.path, p.index);
         if (!curves.length)
-          throw new OperatorError(`${t.type} '${t.name}' has no animation curve for '${p.path}'`, 'NOT_FOUND');
-        const updated: ReturnType<typeof modifierInfo>[] = [];
+          throw new OperatorError(
+            `${t.type} '${t.name}' has no animation curve for '${p.path}'`,
+            'NOT_FOUND',
+          );
+        const selected = (m: FModifierData, i: number) =>
+          (p.modifier_index === undefined || i === p.modifier_index) && (!p.type || m.type === p.type);
+        // validate every change before writing any (params valid for one type may not be for another)
+        const plan: { fc: FCurve; next: FModifierData[] }[] = [];
         for (const fc of curves) {
           const mods = fc.modifiers ?? [];
-          let changed = false;
+          if (!mods.some(selected)) continue;
           const next = mods.map((m, i) => {
-            if ((p.modifier_index !== undefined && i !== p.modifier_index) || (p.type && m.type !== p.type)) return m;
-            changed = true;
-            const params = fmodParams(m.type, p.params, (m.params ?? {}) as Record<string, unknown>);
+            if (!selected(m, i)) return m;
+            let params: FModifierParams;
+            try {
+              params = fmodParams(m.type, p.params, (m.params ?? {}) as Record<string, unknown>);
+            } catch (e) {
+              const err = e as OperatorError;
+              throw new OperatorError(`${fc.path}[${fc.index}] modifier ${i}: ${err.message}`, err.code);
+            }
             return { ...m, mute: p.mute ?? !!m.mute, params: asStored(params) };
           });
-          if (!changed) continue;
+          plan.push({ fc, next });
+        }
+        if (!plan.length) throw new OperatorError('No matching F-curve modifier found', 'NOT_FOUND');
+        const updated: ReturnType<typeof modifierInfo>[] = [];
+        for (const { fc, next } of plan) {
           writeFCurve(ctx.doc, fc, next);
           next.forEach((m, i) => {
-            if ((p.modifier_index === undefined || i === p.modifier_index) && (!p.type || m.type === p.type))
-              updated.push(modifierInfo({ ...fc, modifiers: next }, i));
+            if (selected(m, i)) updated.push(modifierInfo({ ...fc, modifiers: next }, i));
           });
         }
-        if (!updated.length) throw new OperatorError('No matching F-curve modifier found', 'NOT_FOUND');
         return { modifiers: updated };
       },
     }),
@@ -812,21 +926,30 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
       id: 'anim.extrapolation_set',
       label: 'Set Extrapolation',
       description:
-        "Set how the animation curves of objects continue before their first and after their last keyframe: " +
+        'Set how the animation curves of objects continue before their first and after their last keyframe: ' +
         'CONSTANT (hold the end values), LINEAR (continue with the slope of the end segments) or CYCLIC (repeat the ' +
         'keyed range forever, e.g. for loops; keep the first and last key equal for a seamless loop). Affects the ' +
         "objects' curves (optionally only `path` / `index`), and with include_data also their object data " +
         '(light, camera, curve, mesh shape keys) and materials. Returns the number of curves.',
       category: 'Animation',
       schema: z.object({
-        objects: z.array(z.string()).optional().describe('Object ids or names (default: the selected objects)'),
+        objects: z
+          .array(z.string())
+          .optional()
+          .describe('Object ids or names (default: the selected objects)'),
         type: z.enum(['CONSTANT', 'LINEAR', 'CYCLIC']).describe('Extrapolation mode'),
-        path: z.string().min(1).optional().describe('Only curves of this property, e.g. "rotation_euler" (default: all)'),
+        path: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Only curves of this property, e.g. "rotation_euler" (default: all)'),
         index: z.number().int().min(-1).default(-1).describe('Only this channel; -1 = all channels'),
         include_data: z
           .boolean()
           .default(false)
-          .describe("Also the curves of the objects' data (light, camera, curve, mesh) and of their materials"),
+          .describe(
+            "Also the curves of the objects' data (light, camera, curve, mesh) and of their materials",
+          ),
       }),
       execute(ctx, p) {
         const ids = resolveObjectIds(ctx, p.objects);
@@ -882,9 +1005,20 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           .min(0)
           .default(0)
           .describe('Channel of a vector property (0 = X/R, 1 = Y/G, 2 = Z/B, 3 = alpha); 0 for scalars'),
-        frames: z.array(z.number()).min(1).max(100000).describe('Frame numbers (may be fractional, any order)'),
-        values: z.array(z.number()).min(1).max(100000).describe('Value for each frame (same length as frames)'),
-        interpolation: z.enum(['CONSTANT', 'LINEAR', 'BEZIER']).default('BEZIER').describe('Interpolation of the new keys'),
+        frames: z
+          .array(z.number())
+          .min(1)
+          .max(100000)
+          .describe('Frame numbers (may be fractional, any order)'),
+        values: z
+          .array(z.number())
+          .min(1)
+          .max(100000)
+          .describe('Value for each frame (same length as frames)'),
+        interpolation: z
+          .enum(['CONSTANT', 'LINEAR', 'BEZIER'])
+          .default('BEZIER')
+          .describe('Interpolation of the new keys'),
         easing: z
           .enum(['AUTO', 'EASE_IN', 'EASE_OUT', 'EASE_IN_OUT'])
           .optional()
@@ -906,7 +1040,9 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           throw new OperatorError(`Property '${p.path}' of ${t.type} is not animatable`, 'INVALID_PARAMS');
         channelsOf(channelCount(targetData(ctx, t), t, p.path), p.index, p.path);
         const key = fcurveKey({ target_type: t.type, target_id: t.id, path: p.path, index: p.index });
-        const fc = ctx.doc.getFCurve(key) ?? createFCurve({ target_type: t.type, target_id: t.id, path: p.path, index: p.index });
+        const fc =
+          ctx.doc.getFCurve(key) ??
+          createFCurve({ target_type: t.type, target_id: t.id, path: p.path, index: p.index });
         const slot = (f: number) => Math.round(f * 1000);
         const keys = new Map<number, Keyframe>();
         if (!p.replace) for (const k of fc.keyframes) keys.set(slot(k.frame), k);
@@ -927,9 +1063,16 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           fresh.add(s);
         });
         const keyframes = [...keys.values()].sort((a, b) => a.frame - b.frame);
-        ctx.doc.setFCurve({ ...fc, keyframes, ...(p.extrapolation ? { extrapolation: p.extrapolation } : {}) });
+        ctx.doc.setFCurve({
+          ...fc,
+          keyframes,
+          ...(p.extrapolation ? { extrapolation: p.extrapolation } : {}),
+        });
         if (ctx.doc.getDriver(key))
-          ctx.report('WARNING', `${p.path}[${p.index}] of '${t.name}' has a driver, which overrides the keyframes`);
+          ctx.report(
+            'WARNING',
+            `${p.path}[${p.index}] of '${t.name}' has a driver, which overrides the keyframes`,
+          );
         return {
           fcurve: key,
           inserted: fresh.size,
@@ -957,15 +1100,31 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
       category: 'Animation',
       poll: pollObjectMode,
       schema: z.object({
-        target: z.string().optional().describe('Object id or name to orbit (its geometry and children are framed)'),
-        center: vec3.optional().describe('Orbit centre [x, y, z] in metres (overrides the centre of `target`)'),
+        target: z
+          .string()
+          .optional()
+          .describe('Object id or name to orbit (its geometry and children are framed)'),
+        center: vec3
+          .optional()
+          .describe('Orbit centre [x, y, z] in metres (overrides the centre of `target`)'),
         camera: z
           .string()
           .optional()
           .describe('Existing camera object (id or name) to use; default: create a new camera'),
-        radius: z.number().positive().optional().describe('Horizontal distance from the centre in metres (default: auto)'),
-        height: z.number().optional().describe('Camera height above the centre in metres (default: auto, ≈17° above)'),
-        frame_start: z.number().int().optional().describe('First frame of the loop (default: scene frame_start)'),
+        radius: z
+          .number()
+          .positive()
+          .optional()
+          .describe('Horizontal distance from the centre in metres (default: auto)'),
+        height: z
+          .number()
+          .optional()
+          .describe('Camera height above the centre in metres (default: auto, ≈17° above)'),
+        frame_start: z
+          .number()
+          .int()
+          .optional()
+          .describe('First frame of the loop (default: scene frame_start)'),
         frame_end: z.number().int().optional().describe('Last frame of the loop (default: scene frame_end)'),
         revolutions: z.number().positive().max(1000).default(1).describe('Full turns per loop'),
         direction: z
@@ -975,7 +1134,9 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         start_angle: z
           .number()
           .default(-Math.PI / 2)
-          .describe('Camera angle around Z at frame_start in radians (default -pi/2: in front, on the -Y side)'),
+          .describe(
+            'Camera angle around Z at frame_start in radians (default -pi/2: in front, on the -Y side)',
+          ),
         lens: z.number().positive().default(50).describe('Focal length in mm of a newly created camera'),
         set_active_camera: z.boolean().default(true).describe('Make it the scene camera'),
         set_frame_range: z
@@ -996,16 +1157,27 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           camObj = doc.resolveObject(p.camera);
           if (!camObj) throw new OperatorError(`Camera '${p.camera}' not found`, 'NOT_FOUND');
           if (camObj.type !== 'CAMERA')
-            throw new OperatorError(`'${camObj.name}' is a ${camObj.type} object, not a camera`, 'INVALID_PARAMS');
+            throw new OperatorError(
+              `'${camObj.name}' is a ${camObj.type} object, not a camera`,
+              'INVALID_PARAMS',
+            );
           if (target && camObj.id === target.id)
             throw new OperatorError('The camera cannot orbit around itself', 'INVALID_PARAMS');
         }
-        const sphere = p.center && p.radius !== undefined && p.height !== undefined ? null : framingSphere(ctx, target?.id ?? null);
-        const center: Vec3 = p.center ? [p.center[0], p.center[1], p.center[2]] : (sphere?.center ?? [0, 0, 0]);
+        const sphere =
+          p.center && p.radius !== undefined && p.height !== undefined
+            ? null
+            : framingSphere(ctx, target?.id ?? null);
+        const center: Vec3 = p.center
+          ? [p.center[0], p.center[1], p.center[2]]
+          : (sphere?.center ?? [0, 0, 0]);
         const extent = sphere && sphere.radius > 1e-6 ? sphere.radius : 1;
         // distance that fits the bounding sphere into the narrower field of view
         const render = doc.getRender();
-        const aspect = render.resolution_x > 0 && render.resolution_y > 0 ? render.resolution_x / render.resolution_y : 16 / 9;
+        const aspect =
+          render.resolution_x > 0 && render.resolution_y > 0
+            ? render.resolution_x / render.resolution_y
+            : 16 / 9;
         const camData = camObj?.data ? doc.getCamera(camObj.data) : null;
         const fovY = cameraFovY(
           {
@@ -1019,7 +1191,10 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         const distance = camData?.type === 'ORTHO' ? extent * 4 : (extent / Math.sin(fov / 2)) * 1.1;
         const radius = p.radius ?? distance * Math.cos(TURNTABLE_ELEVATION);
         const height =
-          p.height ?? (p.radius !== undefined ? p.radius * Math.tan(TURNTABLE_ELEVATION) : distance * Math.sin(TURNTABLE_ELEVATION));
+          p.height ??
+          (p.radius !== undefined
+            ? p.radius * Math.tan(TURNTABLE_ELEVATION)
+            : distance * Math.sin(TURNTABLE_ELEVATION));
         const pivot = doc.addObject({
           type: 'EMPTY',
           name: 'Turntable Pivot',
@@ -1041,10 +1216,15 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         let removedAnimation = { fcurves: 0, drivers: 0 };
         if (camObj) {
           camera = camObj.id;
-          removedAnimation = removeAnimation(doc, camera, (path) => (TRANSFORM_PATHS as readonly string[]).includes(path));
+          removedAnimation = removeAnimation(doc, camera, (path) =>
+            (TRANSFORM_PATHS as readonly string[]).includes(path),
+          );
           doc.updateObject(camera, placement);
           if (camObj.constraints?.length)
-            ctx.report('WARNING', `Camera '${camObj.name}' has constraints, which still apply on top of the orbit`);
+            ctx.report(
+              'WARNING',
+              `Camera '${camObj.name}' has constraints, which still apply on top of the orbit`,
+            );
         } else {
           const reach = Math.hypot(radius, height);
           const data = doc.addCamera({
@@ -1103,7 +1283,10 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
       category: 'Animation',
       poll: pollObjectMode,
       schema: z.object({
-        objects: z.array(z.string()).optional().describe('Object ids or names (default: the selected objects)'),
+        objects: z
+          .array(z.string())
+          .optional()
+          .describe('Object ids or names (default: the selected objects)'),
         frame_start: z.number().int().optional().describe('First frame (default: scene frame_start)'),
         frame_end: z.number().int().optional().describe('Last frame (default: scene frame_end)'),
         step: z.number().int().min(1).max(1000).default(1).describe('Frames between baked keys'),
@@ -1112,7 +1295,10 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           .min(1)
           .default(['location', 'rotation_euler', 'scale'])
           .describe('Transform properties to bake'),
-        clear_constraints: z.boolean().default(false).describe('Remove the objects\' constraints after baking'),
+        clear_constraints: z
+          .boolean()
+          .default(false)
+          .describe("Remove the objects' constraints after baking"),
         clear_parents: z
           .boolean()
           .default(false)
@@ -1142,7 +1328,12 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         // evaluate every frame first: writing keys changes what later frames evaluate to
         const all = doc.listObjects();
         const sim = hasRigidBodies(doc, all) ? new RigidBodySimulator() : null;
-        const samples = new Map(ids.map((id) => [id, { location: [] as Vec3[], rotation_euler: [] as Vec3[], scale: [] as Vec3[] }]));
+        const samples = new Map(
+          ids.map((id) => [
+            id,
+            { location: [] as Vec3[], rotation_euler: [] as Vec3[], scale: [] as Vec3[] },
+          ]),
+        );
         const previous = new Map(ids.map((id) => [id, doc.getObject(id)!.rotation_euler]));
         let simError: string | null = null;
         for (const frame of frames) {
@@ -1165,7 +1356,11 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
             const parent = fs.parent(id);
             const world = fs.world(id) ?? multiply4(parent, fs.local(id));
             const hasParent = !!fs.byId.get(id)?.parent;
-            const t = worldMatrixToTransform(world, !p.clear_parents && hasParent ? parent : null, previous.get(id));
+            const t = worldMatrixToTransform(
+              world,
+              !p.clear_parents && hasParent ? parent : null,
+              previous.get(id),
+            );
             previous.set(id, t.rotation_euler);
             const s = samples.get(id)!;
             s.location.push(t.location);
@@ -1183,7 +1378,8 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           for (const path of channels)
             for (let i = 0; i < 3; i++) {
               const key = fcurveKey({ target_type: 'object', target_id: id, path, index: i });
-              const fc = doc.getFCurve(key) ?? createFCurve({ target_type: 'object', target_id: id, path, index: i });
+              const fc =
+                doc.getFCurve(key) ?? createFCurve({ target_type: 'object', target_id: id, path, index: i });
               const kept = fc.keyframes.filter((k) => k.frame < start - 1e-3 || k.frame > end + 1e-3);
               const baked: Keyframe[] = frames.map((frame, j) => ({
                 frame,
@@ -1191,7 +1387,7 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
                 interpolation: p.interpolation,
               }));
               removedModifiers += fc.modifiers?.length ?? 0;
-              writeFCurve(doc, { ...fc, keyframes: [...kept, ...baked] }, undefined);
+              writeFCurve(doc, { ...fc, keyframes: [...kept, ...baked] }, undefined); // setFCurve sorts
               keyframes += baked.length;
               if (doc.getDriver(key)) {
                 doc.removeDriver(key);
@@ -1199,7 +1395,10 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
               }
             }
           if (o.rigid_body?.enabled && o.rigid_body.type === 'ACTIVE')
-            ctx.report('WARNING', `'${o.name}' is an active rigid body: the simulation still overrides the baked keys`);
+            ctx.report(
+              'WARNING',
+              `'${o.name}' is an active rigid body: the simulation still overrides the baked keys`,
+            );
           objects.push({ object: id, name: o.name, keyframes });
         }
         let clearedConstraints = 0;
@@ -1211,7 +1410,8 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
             const gone = removeAnimation(doc, id, (path) => path.startsWith('constraints['));
             removedDrivers += gone.drivers;
           }
-          if (p.clear_parents && o.parent) doc.updateObject(id, { parent: null, parent_type: 'OBJECT', parent_bone: '' });
+          if (p.clear_parents && o.parent)
+            doc.updateObject(id, { parent: null, parent_type: 'OBJECT', parent_bone: '' });
         }
         return {
           objects,
@@ -1224,6 +1424,185 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           cleared_parents: p.clear_parents,
           removed_drivers: removedDrivers,
           removed_modifiers: removedModifiers,
+        };
+      },
+    }),
+  );
+
+  // ---------------------------------------------------------------- animation rendering
+
+  reg.register(
+    defineOperator({
+      id: 'render.render_animation',
+      label: 'Render Animation (Software)',
+      description:
+        'Read-only: render a range of frames on the CPU and return the encoded result as base64, e.g. to check ' +
+        'motion from keyframes, drivers, F-curve modifiers, turntables or baked animation. Formats: CONTACT_SHEET ' +
+        '(default: one PNG showing every rendered frame in a grid, each labelled with its frame number in the ' +
+        'top-left corner: the easiest way to see a whole animation at once), GIF (animated, 256-colour palette), ' +
+        'APNG (animated PNG, lossless) or PNG_SEQUENCE (one PNG per frame). Frames frame_start..frame_end every ' +
+        `frame_step (default: the scene frame range; at most ${MAX_RENDER_FRAMES} frames; use frame_step to ` +
+        'sample long animations, e.g. 12-24 tiles for a contact sheet). Camera: `camera`, else the scene camera, ' +
+        'else an automatic view. Frame size defaults to the render resolution scaled to fit 480 px (contact ' +
+        'sheet tiles: up to 240 px, smaller for many frames). The PATHTRACER engine is far slower than RASTER: keep ' +
+        'size, samples and frame count small. Rendering stops after time_limit seconds and returns the frames ' +
+        'rendered so far (truncated: true). Returns { format, mime, data_base64, bytes, width, height (of one ' +
+        'frame), fps, frames (rendered frame numbers), frame_count, truncated }, plus sheet { width, height, ' +
+        'columns, rows } for CONTACT_SHEET, or files [{ frame, name, data_base64 }] instead of data_base64 for ' +
+        'PNG_SEQUENCE.',
+      category: 'Render',
+      undo: false,
+      schema: z.object({
+        format: z
+          .enum(['CONTACT_SHEET', 'GIF', 'APNG', 'PNG_SEQUENCE'])
+          .default('CONTACT_SHEET')
+          .describe('Output: labelled frame grid PNG, animated GIF, animated PNG or one PNG per frame'),
+        frame_start: z.number().int().optional().describe('First frame (default: scene frame_start)'),
+        frame_end: z.number().int().optional().describe('Last frame (default: scene frame_end)'),
+        frame_step: z.number().int().min(1).max(10000).default(1).describe('Render every n-th frame'),
+        width: z
+          .number()
+          .int()
+          .min(1)
+          .max(2048)
+          .optional()
+          .describe(
+            'Frame width in pixels (default: see description; with only height, keeps the render aspect)',
+          ),
+        height: z
+          .number()
+          .int()
+          .min(1)
+          .max(2048)
+          .optional()
+          .describe('Frame height in pixels (default: from width and the render aspect)'),
+        camera: z.string().optional().describe('Camera object id or name (default: the scene camera)'),
+        engine: z
+          .enum(['RASTER', 'PATHTRACER'])
+          .optional()
+          .describe('RASTER (fast) or PATHTRACER (physically based, slow); default: the scene render engine'),
+        shading: z
+          .enum(['MATERIAL', 'SOLID'])
+          .default('MATERIAL')
+          .describe('MATERIAL: materials and lights; SOLID: grey clay shading (always rasterized)'),
+        samples: z
+          .number()
+          .int()
+          .min(1)
+          .max(4096)
+          .optional()
+          .describe(
+            'RASTER: anti-aliasing supersampling 1, 2 or 4 (default 2); PATHTRACER: samples per pixel',
+          ),
+        fps: z
+          .number()
+          .positive()
+          .max(1000)
+          .optional()
+          .describe(
+            'GIF / APNG playback rate in frames per second (default: scene fps / frame_step = real time)',
+          ),
+        loop: z
+          .number()
+          .int()
+          .min(0)
+          .max(65535)
+          .default(0)
+          .describe('GIF / APNG play count; 0 = loop forever'),
+        dither: z
+          .enum(['FLOYD_STEINBERG', 'BAYER', 'NONE'])
+          .default('FLOYD_STEINBERG')
+          .describe('GIF dithering (BAYER: ordered, stable between frames)'),
+        colors: z.number().int().min(2).max(256).default(256).describe('GIF palette size'),
+        columns: z
+          .number()
+          .int()
+          .min(1)
+          .max(64)
+          .optional()
+          .describe('CONTACT_SHEET tiles per row (default: a roughly square sheet)'),
+        time_limit: z
+          .number()
+          .min(0)
+          .max(3600)
+          .default(120)
+          .describe('Stop rendering after this many seconds (0 = no limit); the frames so far are returned'),
+      }),
+      execute(ctx, p) {
+        const doc = ctx.doc;
+        const scene = doc.getScene();
+        const start = p.frame_start ?? scene.frame_start;
+        const end = p.frame_end ?? scene.frame_end;
+        if (end < start)
+          throw new OperatorError(`frame_end (${end}) is before frame_start (${start})`, 'INVALID_PARAMS');
+        const total = Math.floor((end - start) / p.frame_step) + 1;
+        if (total > MAX_RENDER_FRAMES)
+          throw new OperatorError(
+            `Too many frames (${total}, at most ${MAX_RENDER_FRAMES}): shorten the range or raise frame_step`,
+            'INVALID_PARAMS',
+          );
+        if (p.camera !== undefined) {
+          const cam = doc.resolveObject(p.camera);
+          if (!cam) throw new OperatorError(`Camera '${p.camera}' not found`, 'NOT_FOUND');
+          if (cam.type !== 'CAMERA')
+            throw new OperatorError(`'${cam.name}' is a ${cam.type} object, not a camera`, 'INVALID_PARAMS');
+        }
+        // contact sheets: up to 240 px tiles, smaller so that many frames stay within ~2048 px
+        const fit =
+          p.format === 'CONTACT_SHEET'
+            ? Math.max(48, Math.min(240, Math.floor(2048 / Math.ceil(Math.sqrt(total)))))
+            : 480;
+        const size = animationFrameSize(doc, p.width, p.height, fit);
+        const t0 = now();
+        let res: ReturnType<typeof renderAnimation>;
+        try {
+          res = renderAnimation(doc, {
+            format: p.format,
+            frame_start: start,
+            frame_end: end,
+            frame_step: p.frame_step,
+            width: size.width,
+            height: size.height,
+            camera: p.camera,
+            engine: p.engine,
+            shading: p.shading,
+            samples: p.samples,
+            fps: p.fps,
+            loop: p.loop,
+            dither: p.dither,
+            colors: p.colors,
+            columns: p.columns,
+            onFrame: () => p.time_limit <= 0 || now() - t0 < p.time_limit * 1000,
+          });
+        } catch (e) {
+          throw new OperatorError((e as Error).message, 'INVALID_PARAMS');
+        }
+        if (res.cancelled)
+          ctx.report(
+            'WARNING',
+            `Stopped after ${res.frames.length} of ${total} frames (time_limit ${p.time_limit} s): raise time_limit, ` +
+              'or render fewer or smaller frames',
+          );
+        return {
+          format: res.format,
+          mime: res.mime,
+          width: res.width,
+          height: res.height,
+          fps: res.fps,
+          frames: res.frames,
+          frame_count: res.frames.length,
+          truncated: res.cancelled,
+          ...(res.sheet ? { sheet: res.sheet } : {}),
+          ...(res.data ? { bytes: res.data.length, data_base64: base64Encode(res.data) } : {}),
+          ...(res.files
+            ? {
+                files: res.files.map((f) => ({
+                  frame: f.frame,
+                  name: f.name,
+                  data_base64: base64Encode(f.data),
+                })),
+              }
+            : {}),
         };
       },
     }),

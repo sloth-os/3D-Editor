@@ -1,5 +1,5 @@
 import type { Mat4 } from '../math/types';
-import type { CurveData, ObjectType } from '../doc/types';
+import type { ConstraintData, CurveData, ObjectType } from '../doc/types';
 import type { CurvePath } from '../curve/path';
 import type { ArmaturePose } from '../armature/types';
 
@@ -40,6 +40,14 @@ export interface ConstraintContext {
   getObjectInfo?(id: string): ConstraintObjectInfo | null;
   /** Optional: evaluated pose of an armature object (LOCAL target space of bone sub-targets). */
   getArmaturePose?(armatureObjectId: string): ArmaturePose | null;
+  /**
+   * Optional: why a constraint of the stack lies on a dependency cycle (its target depends on the
+   * owner, e.g. "Target 'B' is part of a dependency cycle: A [Track To] → B [Track To] → A"), or
+   * null. Scene evaluation finds cycles with a graph walk over every parent, constraint and pose
+   * relation, so every constraint on a cycle is reported and skipped - without reading its target -
+   * whatever order objects are evaluated in.
+   */
+  dependencyCycle?(constraint: ConstraintData): string | null;
 }
 
 export interface ConstraintError {

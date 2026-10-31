@@ -11,28 +11,48 @@
  * Deeper dimensions use a plain hash, where stratification hardly matters.
  */
 
-/** 32-bit avalanche hash (the MurmurHash3 finalizer). Returns an unsigned 32-bit integer. */
-export function hash32(x: number): number {
+/*
+ * The internal bit functions return signed 32-bit values: those stay small integers in optimized
+ * code, while unsigned values ≥ 2³¹ would be boxed as heap numbers whenever they cross a call.
+ * Only the final conversion to [0, 1) reads them as unsigned.
+ */
+
+/** MurmurHash3 finalizer (signed 32-bit result). */
+function mix32(x: number): number {
   x ^= x >>> 16;
   x = Math.imul(x, 0x85ebca6b);
   x ^= x >>> 13;
   x = Math.imul(x, 0xc2b2ae35);
-  x ^= x >>> 16;
-  return x >>> 0;
+  return x ^ (x >>> 16);
 }
 
-/** Hash of two 32-bit integers. */
-export function hash2(a: number, b: number): number {
-  return hash32(a ^ hash32(b + 0x6a09e667));
+/** Hash of two 32-bit integers (signed 32-bit result). */
+function mix2(a: number, b: number): number {
+  return mix32(a ^ mix32(b + 0x6a09e667));
 }
 
-/** Reverses the bit order of a 32-bit integer. */
-export function reverseBits(x: number): number {
+/** Bit reversal of a 32-bit integer (signed 32-bit result). */
+function rev32(x: number): number {
   x = ((x >>> 1) & 0x55555555) | ((x & 0x55555555) << 1);
   x = ((x >>> 2) & 0x33333333) | ((x & 0x33333333) << 2);
   x = ((x >>> 4) & 0x0f0f0f0f) | ((x & 0x0f0f0f0f) << 4);
   x = ((x >>> 8) & 0x00ff00ff) | ((x & 0x00ff00ff) << 8);
-  return ((x >>> 16) | (x << 16)) >>> 0;
+  return (x >>> 16) | (x << 16);
+}
+
+/** 32-bit avalanche hash (the MurmurHash3 finalizer). Returns an unsigned 32-bit integer. */
+export function hash32(x: number): number {
+  return mix32(x) >>> 0;
+}
+
+/** Hash of two 32-bit integers (unsigned 32-bit result). */
+export function hash2(a: number, b: number): number {
+  return mix2(a, b) >>> 0;
+}
+
+/** Reverses the bit order of a 32-bit integer (unsigned result). */
+export function reverseBits(x: number): number {
+  return rev32(x) >>> 0;
 }
 
 /**
@@ -52,40 +72,41 @@ function scrambleLow(x: number, seed: number): number {
   return x;
 }
 
-/** Owen-style scramble of a 32-bit binary fraction (most significant bit first). */
+/** Owen-style scramble of a 32-bit binary fraction (most significant bit first; unsigned result). */
 export function owenScramble(x: number, seed: number): number {
-  return reverseBits(scrambleLow(reverseBits(x), seed));
+  return rev32(scrambleLow(rev32(x), seed)) >>> 0;
 }
 
 /**
  * Second Sobol dimension, bit-reversed, as XOR tables over the 4 bytes of the index: the
  * generator matrix is Pascal's triangle mod 2 (direction numbers v_k = v_{k-1} ^ (v_{k-1} >> 1)).
  */
-const SOBOL1_REV: Uint32Array = (() => {
-  const dir = new Uint32Array(32);
+const SOBOL1_REV: Int32Array = (() => {
+  const dir = new Int32Array(32);
   let v = 0x80000000;
   for (let k = 0; k < 32; k++) {
-    dir[k] = reverseBits(v);
+    dir[k] = rev32(v);
     v = (v ^ (v >>> 1)) >>> 0;
   }
-  const t = new Uint32Array(4 * 256);
+  const t = new Int32Array(4 * 256);
   for (let b = 0; b < 4; b++)
     for (let i = 0; i < 256; i++) {
       let x = 0;
       for (let k = 0; k < 8; k++) if (i & (1 << k)) x ^= dir[b * 8 + k];
-      t[b * 256 + i] = x >>> 0;
+      t[b * 256 + i] = x;
     }
   return t;
 })();
 
+/** Second Sobol dimension of index i, bit-reversed (signed 32-bit result). */
 function sobol1Reversed(i: number): number {
   const T = SOBOL1_REV;
-  return (T[i & 255] ^ T[256 + ((i >>> 8) & 255)] ^ T[512 + ((i >>> 16) & 255)] ^ T[768 + (i >>> 24)]) >>> 0;
+  return T[i & 255] ^ T[256 + ((i >>> 8) & 255)] ^ T[512 + ((i >>> 16) & 255)] ^ T[768 + (i >>> 24)];
 }
 
 /** Unscrambled 2D Sobol point (van der Corput, second Sobol dimension) for an index, in [0, 1)². */
 export function sobol2(i: number): [number, number] {
-  return [reverseBits(i >>> 0) * 2 ** -32, reverseBits(sobol1Reversed(i >>> 0)) * 2 ** -32];
+  return [(rev32(i) >>> 0) * 2 ** -32, (rev32(sobol1Reversed(i)) >>> 0) * 2 ** -32];
 }
 
 const INV_2_32 = 2 ** -32;
@@ -111,7 +132,7 @@ export class Sampler {
    * Per-pixel scramble seeds of the Sobol pairs (index shuffle, first and second coordinate),
    * filled lazily: `seedGen[dim] === gen` marks the entries valid for the current pixel.
    */
-  private readonly seeds = new Uint32Array(SOBOL_PAIRS * 3);
+  private readonly seeds = new Int32Array(SOBOL_PAIRS * 3);
   private readonly seedGen = new Int32Array(SOBOL_PAIRS);
   private gen = 0;
 
@@ -122,12 +143,12 @@ export class Sampler {
       // new pixel: its seeds (consecutive samples of one pixel share them)
       this.px = px;
       this.py = py;
-      this.pixelSeed = hash2(hash2(px >>> 0, py >>> 0), this.seed >>> 0);
+      this.pixelSeed = mix2(mix2(px, py), this.seed);
       this.gen = (this.gen + 1) | 0 || 1;
     }
-    this.index = sampleIndex >>> 0;
-    this.indexReversed = reverseBits(this.index);
-    this.sampleSeed = hash2(this.pixelSeed, this.index);
+    this.index = sampleIndex | 0;
+    this.indexReversed = rev32(this.index);
+    this.sampleSeed = mix2(this.pixelSeed, this.index);
   }
 
   next2D(dim: number): void {
@@ -135,23 +156,33 @@ export class Sampler {
       const k = dim * 3;
       const seeds = this.seeds;
       if (this.seedGen[dim] !== this.gen) {
-        const s = hash32(this.pixelSeed ^ Math.imul(dim + 1, 0x9e3779b9));
+        const s = mix32(this.pixelSeed ^ Math.imul(dim + 1, 0x9e3779b9));
         seeds[k] = s;
-        seeds[k + 1] = hash32(s + 1);
-        seeds[k + 2] = hash32(s + 2);
+        seeds[k + 1] = mix32((s >>> 0) + 1);
+        seeds[k + 2] = mix32((s >>> 0) + 2);
         this.seedGen[dim] = this.gen;
       }
       // shuffle the sample index (first 2^m indices map onto an aligned block of 2^m) …
-      const idx = dim === 0 ? this.index : reverseBits(scrambleLow(this.indexReversed, seeds[k]));
+      const idx = dim === 0 ? this.index : rev32(scrambleLow(this.indexReversed, seeds[k]));
       // … then scramble both coordinates (dimension 0 of Sobol is the bit-reversed index)
-      this.u0 = reverseBits(scrambleLow(idx, seeds[k + 1])) * INV_2_32;
-      this.u1 = reverseBits(scrambleLow(sobol1Reversed(idx), seeds[k + 2])) * INV_2_32;
+      this.u0 = (rev32(scrambleLow(idx, seeds[k + 1])) >>> 0) * INV_2_32;
+      this.u1 = (rev32(scrambleLow(sobol1Reversed(idx), seeds[k + 2])) >>> 0) * INV_2_32;
     } else {
-      const s = hash32(this.pixelSeed ^ Math.imul(dim + 1, 0x9e3779b9));
-      const h = hash2(this.sampleSeed, s);
-      this.u0 = h * INV_2_32;
-      this.u1 = hash32(h + 0x3c6ef372) * INV_2_32;
+      const s = mix32(this.pixelSeed ^ Math.imul(dim + 1, 0x9e3779b9));
+      const h = mix2(this.sampleSeed, s);
+      this.u0 = (h >>> 0) * INV_2_32;
+      this.u1 = (mix32((h >>> 0) + 0x3c6ef372) >>> 0) * INV_2_32;
     }
+  }
+
+  /**
+   * `next2D` mapped to a pixel filter offset in pixels (both coordinates distributed like the
+   * Blackman–Harris filter), into `u0`/`u1`.
+   */
+  nextFilter(dim: number): void {
+    this.next2D(dim);
+    this.u0 = filterOffset(this.u0);
+    this.u1 = filterOffset(this.u1);
   }
 }
 

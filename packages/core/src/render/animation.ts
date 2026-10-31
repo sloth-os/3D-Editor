@@ -2,6 +2,7 @@ import { zlibSync } from 'fflate';
 import type { Vec4 } from '../math/types';
 import type { SceneDoc } from '../doc/scene-doc';
 import type { RenderEngine } from '../doc/types';
+import { SceneEvaluator } from '../eval/evaluate';
 import { crc32, encodePNG } from './png';
 import { renderSceneSoftware, type SoftwareRenderOptions } from './index';
 
@@ -78,17 +79,20 @@ class ByteWriter {
 function checkFrame(f: AnimationFrame, width: number, height: number, what: string): void {
   if (!f || f.width !== width || f.height !== height)
     throw new Error(`${what}: every frame must be ${width}×${height} (got ${f?.width}×${f?.height})`);
-  if (!f.data || f.data.length < width * height * 4) throw new Error(`${what}: frame pixel data is too short`);
+  if (!f.data || f.data.length < width * height * 4)
+    throw new Error(`${what}: frame pixel data is too short`);
 }
 
 function checkSize(width: number, height: number, max: number, what: string): void {
   if (!(Number.isInteger(width) && Number.isInteger(height) && width >= 1 && height >= 1))
     throw new Error(`${what}: invalid frame size ${width}×${height}`);
-  if (width > max || height > max) throw new Error(`${what}: frames larger than ${max}×${max} are not supported`);
+  if (width > max || height > max)
+    throw new Error(`${what}: frames larger than ${max}×${max} are not supported`);
 }
 
 function checkFps(fps: number, what: string): void {
-  if (!(Number.isFinite(fps) && fps > 0)) throw new Error(`${what}: fps must be a positive number (got ${fps})`);
+  if (!(Number.isFinite(fps) && fps > 0))
+    throw new Error(`${what}: fps must be a positive number (got ${fps})`);
 }
 
 /** Bounding rectangle of the pixels (RGBA, or 1-byte indices with bpp 1) that differ, or null. */
@@ -255,6 +259,7 @@ export class APNGEncoder {
     return this.count;
   }
 
+  /** Adds the next frame (same size as the encoder); later frames store only what changed. */
   addFrame(frame: AnimationFrame): void {
     const { width, height } = this;
     checkFrame(frame, width, height, 'APNG');
@@ -310,7 +315,11 @@ export class APNGEncoder {
 }
 
 /** Encodes RGBA frames (all the same size) as an animated PNG playing at `fps`. */
-export function encodeAPNG(frames: readonly AnimationFrame[], fps: number, opts: APNGOptions = {}): Uint8Array {
+export function encodeAPNG(
+  frames: readonly AnimationFrame[],
+  fps: number,
+  opts: APNGOptions = {},
+): Uint8Array {
   if (!frames?.length) throw new Error('APNG: no frames');
   const enc = new APNGEncoder(frames[0].width, frames[0].height, fps, opts);
   for (const f of frames) enc.addFrame(f);
@@ -614,7 +623,12 @@ const BAYER8 = (() => {
   return Float32Array.from(m.flat(), (k) => (k + 0.5) / 64 - 0.5);
 })();
 
-/** Typical distance between neighbouring palette colours (median nearest-neighbour distance). */
+/**
+ * Typical per-channel step between neighbouring palette colours: the median over the palette of
+ * the Chebyshev (largest channel) distance to the nearest other colour. Ordered dithering adds the
+ * same offset to R, G and B, so this — not the Euclidean distance, up to √3 larger along the grey
+ * diagonal — is the amplitude that spans exactly one palette step.
+ */
 function paletteSpacing(palette: Uint8Array): number {
   const n = palette.length / 3;
   if (n < 2) return 0;
@@ -623,12 +637,12 @@ function paletteSpacing(palette: Uint8Array): number {
     let best = Infinity;
     for (let j = 0; j < n; j++) {
       if (i === j) continue;
-      const dr = palette[i * 3] - palette[j * 3];
-      const dg = palette[i * 3 + 1] - palette[j * 3 + 1];
-      const db = palette[i * 3 + 2] - palette[j * 3 + 2];
-      best = Math.min(best, dr * dr + dg * dg + db * db);
+      const dr = Math.abs(palette[i * 3] - palette[j * 3]);
+      const dg = Math.abs(palette[i * 3 + 1] - palette[j * 3 + 1]);
+      const db = Math.abs(palette[i * 3 + 2] - palette[j * 3 + 2]);
+      best = Math.min(best, Math.max(dr, dg, db));
     }
-    d.push(Math.sqrt(best));
+    d.push(best);
   }
   d.sort((a, b) => a - b);
   return d[d.length >> 1];
@@ -848,7 +862,8 @@ export function encodeGIF(frames: readonly AnimationFrame[], fps: number, opts: 
     let pixels = indices;
     let disposal = 1; // leave in place
     let useTransparency = hasAlpha;
-    if (hasAlpha) disposal = 2; // restore to background: transparent areas must clear the previous frame
+    if (hasAlpha)
+      disposal = 2; // restore to background: transparent areas must clear the previous frame
     else if (optimize && prev) {
       rect = changedRect(prev, indices, width, height, 1) ?? { x: 0, y: 0, w: 1, h: 1 };
       pixels = new Uint8Array(rect.w * rect.h);
@@ -890,10 +905,138 @@ export function encodeGIF(frames: readonly AnimationFrame[], fps: number, opts: 
   return w.result();
 }
 
+// ---------------------------------------------------------------- contact sheet
+
+/** Contact sheet options. */
+export interface ContactSheetOptions {
+  /** Tiles per row (default: as many as make the sheet roughly square). */
+  columns?: number;
+  /** Label of each tile (e.g. its frame number: digits, '-' and '.'), drawn in its top-left corner. */
+  labels?: readonly (string | number)[];
+  /** Gap between and around the tiles in pixels (default 2). */
+  gap?: number;
+  /** RGBA 0..255 colour of the gaps and empty cells (default opaque white). */
+  background?: readonly [number, number, number, number];
+}
+
+/** 3×5 pixel glyphs for tile labels: 15 bits, rows top to bottom, 3 bits per row (MSB = left). */
+const LABEL_GLYPHS: Readonly<Record<string, number>> = {
+  '0': 0b111_101_101_101_111,
+  '1': 0b010_110_010_010_111,
+  '2': 0b111_001_111_100_111,
+  '3': 0b111_001_111_001_111,
+  '4': 0b101_101_111_001_001,
+  '5': 0b111_100_111_001_111,
+  '6': 0b111_100_111_101_111,
+  '7': 0b111_001_001_001_001,
+  '8': 0b111_101_111_101_111,
+  '9': 0b111_101_111_001_111,
+  '-': 0b000_000_111_000_000,
+  '.': 0b000_000_000_000_010,
+};
+
+/** Most pixels of a contact sheet image. */
+const MAX_SHEET_PIXELS = 1 << 26;
+
+/**
+ * Draws a label (white glyphs on a darkened box) at the top-left corner (x0, y0) of a tile,
+ * clipped to the tile. Characters without a glyph are skipped.
+ */
+function drawLabel(
+  out: Uint8ClampedArray,
+  sheetWidth: number,
+  x0: number,
+  y0: number,
+  tileW: number,
+  tileH: number,
+  text: string,
+  scale: number,
+): void {
+  const glyphs = [...text].map((c) => LABEL_GLYPHS[c]).filter((g) => g !== undefined);
+  if (!glyphs.length) return;
+  const boxW = Math.min(tileW, (glyphs.length * 4 + 1) * scale);
+  const boxH = Math.min(tileH, 7 * scale);
+  for (let y = 0; y < boxH; y++)
+    for (let x = 0; x < boxW; x++) {
+      const o = ((y0 + y) * sheetWidth + x0 + x) * 4;
+      out[o] *= 0.3;
+      out[o + 1] *= 0.3;
+      out[o + 2] *= 0.3;
+      out[o + 3] = 255;
+    }
+  glyphs.forEach((g, k) => {
+    for (let r = 0; r < 5; r++)
+      for (let c = 0; c < 3; c++) {
+        if (!((g >> ((4 - r) * 3 + (2 - c))) & 1)) continue;
+        const px = (1 + k * 4 + c) * scale;
+        const py = (1 + r) * scale;
+        for (let sy = 0; sy < scale && py + sy < boxH; sy++)
+          for (let sx = 0; sx < scale && px + sx < boxW; sx++) {
+            const o = ((y0 + py + sy) * sheetWidth + x0 + px + sx) * 4;
+            out.fill(255, o, o + 4);
+          }
+      }
+  });
+}
+
+/**
+ * Grid of a contact sheet of `count` tiles of w×h: `columns` when given (clamped to 1..count),
+ * otherwise as many columns as make the sheet roughly square.
+ */
+export function contactSheetGrid(
+  count: number,
+  w: number,
+  h: number,
+  columns?: number,
+): { columns: number; rows: number } {
+  const n = Math.max(1, Math.floor(count) || 1);
+  const auto = Math.ceil(Math.sqrt((n * h) / w)) || 1;
+  const c = Math.max(1, Math.min(n, Math.floor(columns ?? auto) || auto));
+  return { columns: c, rows: Math.ceil(n / c) };
+}
+
+/**
+ * Tiles RGBA frames (all the same size) into one image, left to right and top to bottom, with an
+ * optional label per tile — a single picture showing a whole animation at a glance. Throws for
+ * empty or mismatched input and sheets above 2^26 pixels.
+ */
+export function contactSheet(
+  frames: readonly AnimationFrame[],
+  opts: ContactSheetOptions = {},
+): { width: number; height: number; data: Uint8ClampedArray } {
+  if (!frames?.length) throw new Error('Contact sheet: no frames');
+  const { width: w, height: h } = frames[0];
+  checkSize(w, h, 65535, 'Contact sheet');
+  for (const f of frames) checkFrame(f, w, h, 'Contact sheet');
+  const { columns, rows } = contactSheetGrid(frames.length, w, h, opts.columns);
+  const gap = Math.max(0, Math.min(64, Math.floor(opts.gap ?? 2) || 0));
+  const W = columns * w + (columns + 1) * gap;
+  const H = rows * h + (rows + 1) * gap;
+  if (W * H > MAX_SHEET_PIXELS)
+    throw new Error(`Contact sheet of ${W}×${H} pixels is too large: use fewer or smaller frames`);
+  const out = new Uint8ClampedArray(W * H * 4);
+  const bg = opts.background ?? [255, 255, 255, 255];
+  for (let i = 0; i < W * H; i++) out.set(bg, i * 4);
+  const scale = Math.max(1, Math.floor(Math.min(w, h) / 60));
+  frames.forEach((f, k) => {
+    const x0 = gap + (k % columns) * (w + gap);
+    const y0 = gap + Math.floor(k / columns) * (h + gap);
+    for (let y = 0; y < h; y++) out.set(f.data.subarray(y * w * 4, (y + 1) * w * 4), ((y0 + y) * W + x0) * 4);
+    const label = opts.labels?.[k];
+    if (label !== undefined) drawLabel(out, W, x0, y0, w, h, String(label), scale);
+  });
+  return { width: W, height: H, data: out };
+}
+
 // ---------------------------------------------------------------- rendering
 
-export type AnimationFormat = 'APNG' | 'GIF' | 'PNG_SEQUENCE';
+/**
+ * APNG and GIF: animated images; PNG_SEQUENCE: one PNG per frame; CONTACT_SHEET: one PNG with
+ * every frame in a grid, labelled with its frame number.
+ */
+export type AnimationFormat = 'APNG' | 'GIF' | 'PNG_SEQUENCE' | 'CONTACT_SHEET';
 
+/** Options of {@link renderAnimation}. */
 export interface AnimationRenderOptions {
   /** Output format (default APNG). */
   format?: AnimationFormat;
@@ -913,6 +1056,19 @@ export interface AnimationRenderOptions {
   shading?: 'SOLID' | 'MATERIAL';
   /** Anti-aliasing supersampling (raster) or samples per pixel (path tracer). */
   samples?: number;
+  /** PATHTRACER: maximum bounces (default: render settings `max_bounces`). */
+  max_bounces?: number;
+  /** PATHTRACER: denoise every frame (default: render settings `use_denoising`). */
+  denoise?: boolean;
+  /** PATHTRACER: wall-clock budget per frame in seconds (0 / unset = none). */
+  time_limit?: number;
+  /** PATHTRACER: noise pattern seed (default 0). */
+  seed?: number;
+  /**
+   * PATHTRACER: vary the noise pattern from frame to frame (seed + frame, like Cycles' Animated
+   * Seed). Default false: the same pattern every frame, which flickers less and compresses better.
+   */
+  animated_seed?: boolean;
   /** RGBA background 0..1 (display values); alpha < 1 gives transparent frames. */
   background?: Vec4;
   /** APNG / GIF: number of plays, 0 = forever (default). */
@@ -921,68 +1077,85 @@ export interface AnimationRenderOptions {
   dither?: GIFDither;
   /** GIF palette size 2..256 (default 256). */
   colors?: number;
+  /** CONTACT_SHEET: tiles per row (default: a roughly square sheet). */
+  columns?: number;
   /** Called after each rendered frame; return false to stop (the frames so far are encoded). */
   onFrame?: (progress: { frame: number; index: number; total: number }) => boolean | void;
 }
 
+/** Result of {@link renderAnimation}. */
 export interface AnimationRenderResult {
   format: AnimationFormat;
-  /** image/apng, image/gif or image/png (one per file of a PNG sequence). */
+  /** image/apng, image/gif or image/png (PNG sequence files, contact sheet). */
   mime: string;
+  /** Size of each frame. */
   width: number;
   height: number;
   fps: number;
   /** The frames that were rendered, in order. */
   frames: number[];
-  /** The APNG or GIF file (undefined when no frame was rendered). */
+  /** The APNG, GIF or contact sheet PNG file. */
   data?: Uint8Array;
   /** PNG_SEQUENCE: one PNG per frame, named like Blender's output (frame_0001.png …). */
   files?: { frame: number; name: string; data: Uint8Array }[];
+  /** CONTACT_SHEET: size and grid of the sheet image. */
+  sheet?: { width: number; height: number; columns: number; rows: number };
   /** True when onFrame stopped the render early. */
   cancelled: boolean;
 }
 
 /** Most frames one animation render accepts. */
 export const MAX_ANIMATION_FRAMES = 10000;
-/** Most pixels (all frames together) of a GIF render, which keeps every frame in memory. */
+/** Most pixels (all frames together) of a GIF or contact sheet render, which keep every frame. */
 const MAX_GIF_PIXELS = 1 << 26;
 
-/** File name of a PNG sequence frame: frame_0001.png, frame_-001.png … */
+/**
+ * File name of a PNG sequence frame, numbered like Blender's `####` (at least 4 digits, a sign
+ * for negative frames): frame_0001.png, frame_12345.png, frame_-0001.png.
+ */
 export function sequenceFrameName(frame: number): string {
   const f = Math.round(frame);
-  const digits = String(Math.abs(f)).padStart(f < 0 ? 3 : 4, '0');
-  return `frame_${f < 0 ? '-' : ''}${digits}.png`;
+  return `frame_${f < 0 ? '-' : ''}${String(Math.abs(f)).padStart(4, '0')}.png`;
 }
 
 /**
  * Renders frames `frame_start`..`frame_end` (every `frame_step`) with the software renderer
  * (`renderSceneSoftware`, so the engine option and its settings apply) and encodes them as an
- * animated PNG, a GIF or a sequence of PNG files. Throws for invalid ranges and sizes.
+ * animated PNG, a GIF, a sequence of PNG files or a contact sheet. One scene evaluator is shared
+ * by all frames, so unchanged geometry is evaluated once. Throws for invalid ranges and sizes.
  */
 export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}): AnimationRenderResult {
   const format = opts.format ?? 'APNG';
-  if (format !== 'APNG' && format !== 'GIF' && format !== 'PNG_SEQUENCE')
-    throw new Error(`Unknown animation format '${String(format)}' (APNG, GIF or PNG_SEQUENCE)`);
+  if (format !== 'APNG' && format !== 'GIF' && format !== 'PNG_SEQUENCE' && format !== 'CONTACT_SHEET')
+    throw new Error(
+      `Unknown animation format '${String(format)}' (APNG, GIF, PNG_SEQUENCE or CONTACT_SHEET)`,
+    );
+  const keepFrames = format === 'GIF' || format === 'CONTACT_SHEET';
   const scene = doc.getScene();
   const settings = doc.getRender();
   const start = opts.frame_start ?? scene.frame_start;
   const end = opts.frame_end ?? scene.frame_end;
   const step = opts.frame_step ?? 1;
-  if (!Number.isFinite(start) || !Number.isFinite(end)) throw new Error('frame_start and frame_end must be numbers');
+  if (!Number.isFinite(start) || !Number.isFinite(end))
+    throw new Error('frame_start and frame_end must be numbers');
   if (end < start) throw new Error(`frame_end (${end}) is before frame_start (${start})`);
-  if (!(Number.isInteger(step) && step >= 1)) throw new Error(`frame_step must be a whole number >= 1 (got ${step})`);
+  if (!(Number.isInteger(step) && step >= 1))
+    throw new Error(`frame_step must be a whole number >= 1 (got ${step})`);
   const total = Math.floor((end - start) / step) + 1;
   if (total > MAX_ANIMATION_FRAMES)
-    throw new Error(`Too many frames (${total}, at most ${MAX_ANIMATION_FRAMES}): shorten the range or raise frame_step`);
+    throw new Error(
+      `Too many frames (${total}, at most ${MAX_ANIMATION_FRAMES}): shorten the range or raise frame_step`,
+    );
   const pct = (settings.resolution_percentage ?? 100) / 100;
   const width = Math.round(opts.width ?? settings.resolution_x * pct);
   const height = Math.round(opts.height ?? settings.resolution_y * pct);
   if (!(width >= 1 && height >= 1)) throw new Error(`Invalid animation size ${width}×${height}`);
-  if (format === 'GIF' && (width > 65535 || height > 65535)) throw new Error('GIF frames are limited to 65535×65535');
-  if (format === 'GIF' && width * height * total > MAX_GIF_PIXELS)
+  if (format === 'GIF' && (width > 65535 || height > 65535))
+    throw new Error('GIF frames are limited to 65535×65535');
+  if (keepFrames && width * height * total > MAX_GIF_PIXELS)
     throw new Error(
-      `A GIF of ${total} frames at ${width}×${height} is too large (at most ${MAX_GIF_PIXELS} pixels in all): ` +
-        'reduce the size or the number of frames',
+      `A ${format === 'GIF' ? 'GIF' : 'contact sheet'} of ${total} frames at ${width}×${height} is too large ` +
+        `(at most ${MAX_GIF_PIXELS} pixels in all): reduce the size or the number of frames`,
     );
   const fps = opts.fps ?? (scene.fps || 24) / step;
   checkFps(fps, 'Animation');
@@ -994,18 +1167,27 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
     samples: opts.samples,
     background: opts.background,
     engine: opts.engine,
+    max_bounces: opts.max_bounces,
+    denoise: opts.denoise,
+    time_limit: opts.time_limit,
+    evaluator: new SceneEvaluator(doc),
   };
+  const seed = opts.seed ?? 0;
   const apng = format === 'APNG' ? new APNGEncoder(width, height, fps, { loop: opts.loop }) : null;
-  const gifFrames: AnimationFrame[] = [];
+  const kept: AnimationFrame[] = [];
   const files: { frame: number; name: string; data: Uint8Array }[] = [];
   const frames: number[] = [];
   let cancelled = false;
   for (let i = 0; i < total; i++) {
     const frame = start + i * step;
-    const img = renderSceneSoftware(doc, { ...base, frame });
+    const img = renderSceneSoftware(doc, {
+      ...base,
+      frame,
+      seed: opts.animated_seed ? seed + Math.round(frame) : seed,
+    });
     frames.push(frame);
     if (apng) apng.addFrame(img);
-    else if (format === 'GIF') gifFrames.push(img);
+    else if (keepFrames) kept.push(img);
     else files.push({ frame, name: sequenceFrameName(frame), data: encodePNG(img) });
     if (opts.onFrame?.({ frame, index: i, total }) === false && i < total - 1) {
       cancelled = true;
@@ -1023,7 +1205,16 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
   };
   if (apng) result.data = apng.finish();
   else if (format === 'GIF')
-    result.data = encodeGIF(gifFrames, fps, { loop: opts.loop, dither: opts.dither, colors: opts.colors });
-  else result.files = files;
+    result.data = encodeGIF(kept, fps, { loop: opts.loop, dither: opts.dither, colors: opts.colors });
+  else if (format === 'CONTACT_SHEET') {
+    const labels = frames.map((f) => String(Math.round(f * 100) / 100));
+    const sheet = contactSheet(kept, { columns: opts.columns, labels });
+    result.sheet = {
+      width: sheet.width,
+      height: sheet.height,
+      ...contactSheetGrid(kept.length, width, height, opts.columns),
+    };
+    result.data = encodePNG(sheet);
+  } else result.files = files;
   return result;
 }

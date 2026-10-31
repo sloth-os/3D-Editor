@@ -95,6 +95,9 @@ export function pathTracerSettings(
 
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
+/** Rows per band of a progressive pass: bounds the scratch memory of `render` (tiles are per band). */
+const BAND_ROWS = 16;
+
 /**
  * CPU path tracer over a compiled scene.
  *
@@ -218,8 +221,9 @@ export class PathTracer {
 
   /**
    * Progressive render into the film until `samples` per pixel (default `settings.samples`), the
-   * time limit or a cancellation (`onProgress` returning false). Passes double in size (1, 1, 2,
-   * 4, … 16 samples) and the time limit is checked between passes using the last pass's speed.
+   * time limit or a cancellation (`onProgress` returning false). Passes double in size (1, 2, 4,
+   * 8, then 16 samples per pass), every pass covers the whole image (in bands of rows), and the
+   * time limit is checked between passes using the last pass's speed.
    */
   render(
     samples = this.settings.samples,
@@ -244,7 +248,7 @@ export class PathTracer {
         }
       }
       const tp = now();
-      this.film.add(this.renderRows(0, H, done, count));
+      for (let y = 0; y < H; y += BAND_ROWS) this.film.add(this.renderRows(y, y + BAND_ROWS, done, count));
       lastPassMs = now() - tp;
       lastPassSamples = count;
       done += count;

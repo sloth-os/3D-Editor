@@ -27,7 +27,10 @@ function quadBezier(a: Vec2, c: Vec2, b: Vec2, n: number): Vec2[] {
   for (let i = 0; i <= n; i++) {
     const t = i / n;
     const s = 1 - t;
-    out.push([s * s * a[0] + 2 * s * t * c[0] + t * t * b[0], s * s * a[1] + 2 * s * t * c[1] + t * t * b[1]]);
+    out.push([
+      s * s * a[0] + 2 * s * t * c[0] + t * t * b[0],
+      s * s * a[1] + 2 * s * t * c[1] + t * t * b[1],
+    ]);
   }
   return out;
 }
@@ -210,7 +213,12 @@ export function generateArch(params: Partial<ArchParams> = {}): GeneratorResult 
   } else {
     zs = Math.max(0, zo - hw);
     const c = circle3([-hw, zs], [0, zo], [hw, zs]);
-    curve = c ? arcPoints(c.cx, c.cy, [-hw, zs], [hw, zs], n, false) : [[-hw, zs], [hw, zs]];
+    curve = c
+      ? arcPoints(c.cx, c.cy, [-hw, zs], [hw, zs], n, false)
+      : [
+          [-hw, zs],
+          [hw, zs],
+        ];
   }
   const xo = hw + pier;
   const outline: Vec2[] = [[-xo, 0], [-hw, 0], ...curve, [hw, 0], [xo, 0], [xo, H], [-xo, H]];
@@ -348,7 +356,8 @@ export function generateStairs(params: Partial<StairsParams> = {}): GeneratorRes
           addBoxBetween(b, [x, y, z], [x, y, z + 0.9], 0.04, 0.04, [0, 1, 0], { mat: 1 });
           tops.push([x, y, z + 0.92]);
         }
-        if (tops.length >= 2) addTube(b, [tops[0], tops[tops.length - 1]], 0.025, 8, { mat: 1, smooth: true });
+        if (tops.length >= 2)
+          addTube(b, [tops[0], tops[tops.length - 1]], 0.025, 8, { mat: 1, smooth: true });
       }
     }
   }
@@ -414,7 +423,10 @@ export function generateFence(params: Partial<FenceParams> = {}): GeneratorResul
     ];
   }
   const closed = p.closed && path.length > 2;
-  if (closed && Math.hypot(path[0][0] - path[path.length - 1][0], path[0][1] - path[path.length - 1][1]) < 1e-6)
+  if (
+    closed &&
+    Math.hypot(path[0][0] - path[path.length - 1][0], path[0][1] - path[path.length - 1][1]) < 1e-6
+  )
     path.pop();
   // posts: every path point plus evenly spaced intermediate posts
   const posts: Vec3[] = [];
@@ -448,7 +460,14 @@ export function generateFence(params: Partial<FenceParams> = {}): GeneratorResul
     const l = Math.hypot(dx, dy);
     if (l < 1e-6) [dx, dy] = d0;
     else [dx, dy] = [dx / l, dy / l];
-    addBoxBetween(b, [q[0] - (dx * pw) / 2, q[1] - (dy * pw) / 2, q[2] + postTop / 2], [q[0] + (dx * pw) / 2, q[1] + (dy * pw) / 2, q[2] + postTop / 2], pw, postTop, [0, 0, 1]);
+    addBoxBetween(
+      b,
+      [q[0] - (dx * pw) / 2, q[1] - (dy * pw) / 2, q[2] + postTop / 2],
+      [q[0] + (dx * pw) / 2, q[1] + (dy * pw) / 2, q[2] + postTop / 2],
+      pw,
+      postTop,
+      [0, 0, 1],
+    );
   });
   for (let i = 0; i < bays; i++) {
     const a = posts[i];
@@ -457,13 +476,27 @@ export function generateFence(params: Partial<FenceParams> = {}): GeneratorResul
       const rails = Math.round(clampNum(p.rails, 1, 20, 2));
       for (let k = 0; k < rails; k++) {
         const h = rails === 1 ? 0.75 * H : H * (0.3 + (0.6 * k) / (rails - 1));
-        addBoxBetween(b, [a[0], a[1], a[2] + h], [c[0], c[1], c[2] + h], pw * 0.4, Math.min(pw * 0.9, H * 0.15), [0, 0, 1]);
+        addBoxBetween(
+          b,
+          [a[0], a[1], a[2] + h],
+          [c[0], c[1], c[2] + h],
+          pw * 0.4,
+          Math.min(pw * 0.9, H * 0.15),
+          [0, 0, 1],
+        );
       }
       continue;
     }
     const railT = Math.min(0.025, pw * 0.3);
     for (const f of [0.25, 0.72])
-      addBoxBetween(b, [a[0], a[1], a[2] + f * H], [c[0], c[1], c[2] + f * H], railT, Math.min(0.07, H * 0.1), [0, 0, 1]);
+      addBoxBetween(
+        b,
+        [a[0], a[1], a[2] + f * H],
+        [c[0], c[1], c[2] + f * H],
+        railT,
+        Math.min(0.07, H * 0.1),
+        [0, 0, 1],
+      );
     const L = Math.hypot(c[0] - a[0], c[1] - a[1]);
     const dx = (c[0] - a[0]) / (L || 1);
     const dy = (c[1] - a[1]) / (L || 1);

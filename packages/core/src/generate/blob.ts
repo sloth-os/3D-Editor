@@ -22,7 +22,13 @@ export function smoothMin(a: number, b: number, k: number): number {
 }
 
 /** Signed distance to the smooth union of the spheres (negative inside). */
-export function blobDistance(spheres: readonly BlobSphere[], k: number, x: number, y: number, z: number): number {
+export function blobDistance(
+  spheres: readonly BlobSphere[],
+  k: number,
+  x: number,
+  y: number,
+  z: number,
+): number {
   let d = Infinity;
   for (const s of spheres) {
     const e = Math.hypot(x - s.center[0], y - s.center[1], z - s.center[2]) - s.radius;
@@ -49,7 +55,8 @@ function meshField(
   if (triangles.length === 0) return null;
   const b = new MeshBuilder();
   for (let i = 0; i < positions.length; i += 3) b.vert([positions[i], positions[i + 1], positions[i + 2]]);
-  for (let t = 0; t < triangles.length; t += 3) b.face([triangles[t], triangles[t + 1], triangles[t + 2]], 0, true);
+  for (let t = 0; t < triangles.length; t += 3)
+    b.face([triangles[t], triangles[t + 1], triangles[t + 2]], 0, true);
   return b;
 }
 
@@ -80,7 +87,14 @@ export interface BlobParams {
   seed: number;
 }
 
-export const BLOB_DEFAULTS: BlobParams = { spheres: null, count: 6, size: 2, smoothness: 0.35, resolution: 48, seed: 0 };
+export const BLOB_DEFAULTS: BlobParams = {
+  spheres: null,
+  count: 6,
+  size: 2,
+  smoothness: 0.35,
+  resolution: 48,
+  seed: 0,
+};
 
 /**
  * Smooth union of spheres. Explicit spheres keep their coordinates; random blobs are centred on
@@ -91,7 +105,12 @@ export function generateBlob(params: Partial<BlobParams> = {}): GeneratorResult 
   const k = clampNum(p.smoothness, 0, 100, BLOB_DEFAULTS.smoothness);
   const res = Math.round(clampNum(p.resolution, 8, 160, BLOB_DEFAULTS.resolution));
   let spheres = (p.spheres ?? []).filter(
-    (s) => s && Array.isArray(s.center) && s.center.every(Number.isFinite) && Number.isFinite(s.radius) && s.radius > 0,
+    (s) =>
+      s &&
+      Array.isArray(s.center) &&
+      s.center.every(Number.isFinite) &&
+      Number.isFinite(s.radius) &&
+      s.radius > 0,
   );
   const explicit = spheres.length > 0;
   if (!explicit) {
@@ -139,7 +158,9 @@ export const CLOUD_DEFAULTS: CloudParams = {
 /** Puffy cloud centred on the Z axis with its base at z = 0. Slot 0: Cloud. */
 export function generateCloud(params: Partial<CloudParams> = {}): GeneratorResult {
   const p = { ...CLOUD_DEFAULTS, ...params };
-  const size = (p.size ?? CLOUD_DEFAULTS.size).map((v, i) => clampNum(v, 0.01, 1e4, CLOUD_DEFAULTS.size[i])) as Vec3;
+  const size = (p.size ?? CLOUD_DEFAULTS.size).map((v, i) =>
+    clampNum(v, 0.01, 1e4, CLOUD_DEFAULTS.size[i]),
+  ) as Vec3;
   const puffs = Math.round(clampNum(p.puffs, 1, 64, CLOUD_DEFAULTS.puffs));
   const res = Math.round(clampNum(p.resolution, 8, 160, CLOUD_DEFAULTS.resolution));
   const rng = new Rng(p.seed, 0xc10d);

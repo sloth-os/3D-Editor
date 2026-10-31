@@ -319,6 +319,12 @@ function applyDirect(p: AgentProject, object: ObjectData, mod: ModifierData): vo
       return e?.mesh && id !== object.id ? { mesh: e.mesh, matrix: e.worldMatrix } : null;
     },
     getObjectMatrix: (id) => ev.byId.get(id)?.worldMatrix ?? null,
+    // Armature modifier: the evaluated pose and the mesh's vertex groups
+    getArmature: (id) => {
+      const e = ev.byId.get(id);
+      return e?.pose ? { pose: e.pose, matrix: e.worldMatrix } : null;
+    },
+    vertexGroups: p.scene.getVertexGroups(object.data),
     forRender: false,
     editMode: false,
   });

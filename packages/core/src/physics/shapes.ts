@@ -14,6 +14,7 @@ import {
   type MassProperties,
 } from './mass';
 import { TriangleBVH } from './bvh';
+import type { BoxFrame } from './boxes';
 import type { Mat3 } from './vmath';
 
 /*
@@ -25,8 +26,12 @@ import type { Mat3 } from './vmath';
  * which is identical for meshes whose origin is at their centre.
  */
 
-/** Smallest half thickness of collision geometry (keeps flat meshes collidable). */
-export const MIN_HALF_EXTENT = 5e-4;
+/**
+ * Smallest half thickness of convex collision geometry: flat or degenerate meshes become 1 cm
+ * slabs / rods. Like Bullet's collision margin this keeps them from crossing (two-sided)
+ * triangle meshes, where a body without thickness could not tell which side it came from.
+ */
+export const MIN_HALF_EXTENT = 5e-3;
 /** Hull vertex budget (larger hulls are simplified to their extreme points). */
 export const MAX_HULL_VERTICES = 64;
 /** Vertex count of the polygon approximating cylinder / cone caps in contact manifolds. */
@@ -68,7 +73,8 @@ export type Shape =
   | { kind: 'cylinder'; center: Vec3; radius: number; halfHeight: number }
   /** Cone along local Z: base circle at `center`, apex at center + (0, 0, height). */
   | { kind: 'cone'; center: Vec3; radius: number; height: number }
-  | { kind: 'poly'; poly: Polyhedron }
+  /** Convex polyhedron; `box` is set when it is a cuboid (closed-form box tests apply). */
+  | { kind: 'poly'; poly: Polyhedron; box?: BoxFrame }
   | { kind: 'mesh'; mesh: TriMesh };
 
 export type ShapeKind = Shape['kind'];
@@ -126,6 +132,94 @@ const BOX_FACES = [
   [0, 2, 3, 1],
 ];
 
+/** Box frame of an axis-aligned box centred at the body origin. */
+export function alignedBox(h: Readonly<Vec3>): BoxFrame {
+  return { center: [0, 0, 0], axes: [1, 0, 0, 0, 1, 0, 0, 0, 1], half: [h[0], h[1], h[2]], aligned: true };
+}
+
+/**
+ * The oriented box a polyhedron is when it is a cuboid (six quads in three orthogonal pairs of
+ * opposite faces, eight corners), e.g. the convex hull of a cube mesh; null otherwise.
+ */
+export function cuboidFrame(p: Polyhedron): BoxFrame | null {
+  if (p.flat || p.faces.length !== 6 || p.verts.length !== 24 || p.faces.some((f) => f.length !== 4))
+    return null;
+  const pl = p.planes;
+  const n = (f: number): Vec3 => [pl[f * 4], pl[f * 4 + 1], pl[f * 4 + 2]];
+  const dot3 = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const axes: Vec3[] = [];
+  const half: number[] = [];
+  const mid: number[] = [];
+  const used = new Set<number>();
+  for (let f = 0; f < 6; f++) {
+    if (used.has(f)) continue;
+    let opp = -1;
+    for (let g = f + 1; g < 6 && opp < 0; g++) if (!used.has(g) && dot3(n(f), n(g)) < -1 + 1e-9) opp = g;
+    if (opp < 0) return null;
+    used.add(f);
+    used.add(opp);
+    // n·x ranges over [−d_opp, d_f] inside the box
+    axes.push(n(f));
+    half.push((pl[f * 4 + 3] + pl[opp * 4 + 3]) / 2);
+    mid.push((pl[f * 4 + 3] - pl[opp * 4 + 3]) / 2);
+  }
+  if (axes.length !== 3 || half.some((h) => !(h > 0))) return null;
+  for (let a = 0; a < 3; a++)
+    for (let b = a + 1; b < 3; b++) if (Math.abs(dot3(axes[a], axes[b])) > 1e-9) return null;
+  // canonical axes: positive dominant component, ordered by it (identity for axis-aligned boxes)
+  const dominant = (v: Vec3) =>
+    Math.abs(v[0]) >= Math.abs(v[1]) && Math.abs(v[0]) >= Math.abs(v[2])
+      ? 0
+      : Math.abs(v[1]) >= Math.abs(v[2])
+        ? 1
+        : 2;
+  for (let a = 0; a < 3; a++)
+    if (axes[a][dominant(axes[a])] < 0) {
+      axes[a] = [-axes[a][0], -axes[a][1], -axes[a][2]];
+      mid[a] = -mid[a];
+    }
+  const order = [0, 1, 2].sort((a, b) => dominant(axes[a]) - dominant(axes[b]));
+  if (new Set(order.map((a) => dominant(axes[a]))).size === 3) {
+    const [ax, hf, md] = [order.map((a) => axes[a]), order.map((a) => half[a]), order.map((a) => mid[a])];
+    axes.splice(0, 3, ...ax);
+    half.splice(0, 3, ...hf);
+    mid.splice(0, 3, ...md);
+  }
+  const [x, y, z] = axes;
+  const det =
+    x[0] * (y[1] * z[2] - y[2] * z[1]) -
+    x[1] * (y[0] * z[2] - y[2] * z[0]) +
+    x[2] * (y[0] * z[1] - y[1] * z[0]);
+  if (det < 0) {
+    axes[2] = [-z[0], -z[1], -z[2]];
+    mid[2] = -mid[2];
+  }
+  const center: Vec3 = [0, 1, 2].map(
+    (k) => axes[0][k] * mid[0] + axes[1][k] * mid[1] + axes[2][k] * mid[2],
+  ) as Vec3;
+  // every corner must sit at ±half along the axes
+  const size = Math.max(...half);
+  for (let i = 0; i < 24; i += 3) {
+    const v: Vec3 = [p.verts[i] - center[0], p.verts[i + 1] - center[1], p.verts[i + 2] - center[2]];
+    for (let a = 0; a < 3; a++) if (Math.abs(Math.abs(dot3(v, axes[a])) - half[a]) > 1e-7 * size) return null;
+  }
+  const m: Mat3 = [
+    axes[0][0],
+    axes[1][0],
+    axes[2][0],
+    axes[0][1],
+    axes[1][1],
+    axes[2][1],
+    axes[0][2],
+    axes[1][2],
+    axes[2][2],
+  ];
+  const identity = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const aligned =
+    m.every((v, i) => Math.abs(v - identity[i]) < 1e-12) && center.every((c) => Math.abs(c) < 1e-12 * size);
+  return { center, axes: m, half: [half[0], half[1], half[2]], aligned };
+}
+
 /** Axis-aligned box polyhedron with half extents h around `c`. */
 export function boxPolyhedron(h: Readonly<Vec3>, c: Readonly<Vec3> = [0, 0, 0]): Polyhedron {
   const verts: number[] = [];
@@ -145,7 +239,14 @@ export function coreRadius(s: Shape): number {
  * Support point of the shape's core in direction d (body space): the core point with the largest
  * projection on d. Writes into `out` (length ≥ 3) at offset `o`.
  */
-export function supportCore(s: Shape, dx: number, dy: number, dz: number, out: number[] | Float64Array, o = 0): void {
+export function supportCore(
+  s: Shape,
+  dx: number,
+  dy: number,
+  dz: number,
+  out: number[] | Float64Array,
+  o = 0,
+): void {
   switch (s.kind) {
     case 'sphere':
       out[o] = s.center[0];
@@ -226,7 +327,8 @@ export function supportingFace(s: Shape, dx: number, dy: number, dz: number): nu
     }
     case 'cylinder': {
       const [cx, cy, cz] = s.center;
-      if (Math.abs(uz) > 0.7) return capPolygon(cx, cy, cz + (uz > 0 ? s.halfHeight : -s.halfHeight), s.radius, uz > 0);
+      if (Math.abs(uz) > 0.7)
+        return capPolygon(cx, cy, cz + (uz > 0 ? s.halfHeight : -s.halfHeight), s.radius, uz > 0);
       const l = Math.hypot(ux, uy) || 1;
       const rx = cx + (ux / l) * s.radius;
       const ry = cy + (uy / l) * s.radius;
@@ -361,9 +463,13 @@ function bounds(pts: number[]): { center: Vec3; half: Vec3 } {
   };
 }
 
-const sub3 = (a: Readonly<Vec3>, b: Readonly<Vec3>): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-
-function result(shape: Shape, type: CollisionShape, mp: MassProperties, com: Vec3, notes: string[]): ShapeBuild {
+function result(
+  shape: Shape,
+  type: CollisionShape,
+  mp: MassProperties,
+  com: Vec3,
+  notes: string[],
+): ShapeBuild {
   return { shape, type, com, inertia: mp.inertia, volume: mp.volume, notes };
 }
 
@@ -385,10 +491,22 @@ export function buildCollisionShape(
   const h: Vec3 = half.map((v) => Math.max(v, MIN_HALF_EXTENT)) as Vec3;
   switch (type) {
     case 'BOX':
-      return result({ kind: 'poly', poly: boxPolyhedron(h) }, type, boxMass(h, center), center, notes);
+      return result(
+        { kind: 'poly', poly: boxPolyhedron(h), box: alignedBox(h) },
+        type,
+        boxMass(h, center),
+        center,
+        notes,
+      );
     case 'SPHERE': {
       const r = Math.max(h[0], h[1], h[2]);
-      return result({ kind: 'sphere', center: [0, 0, 0], radius: r }, type, sphereMass(r, center), center, notes);
+      return result(
+        { kind: 'sphere', center: [0, 0, 0], radius: r },
+        type,
+        sphereMass(r, center),
+        center,
+        notes,
+      );
     }
     case 'CAPSULE': {
       const r = Math.max(h[0], h[1]);
@@ -429,7 +547,14 @@ export function buildCollisionShape(
         const tm = buildTriMesh(mesh, pts, valid, scale);
         if (tm) {
           const mp = boundsMass(pts, 2 * MIN_HALF_EXTENT);
-          return { shape: { kind: 'mesh', mesh: tm }, type: 'MESH', com: [0, 0, 0], inertia: mp.inertia, volume: 0, notes };
+          return {
+            shape: { kind: 'mesh', mesh: tm },
+            type: 'MESH',
+            com: [0, 0, 0],
+            inertia: mp.inertia,
+            volume: 0,
+            notes,
+          };
         }
         notes.push('mesh has no faces, using its convex hull');
       } else notes.push('active rigid bodies cannot use the MESH shape, using CONVEX_HULL');
@@ -442,14 +567,27 @@ export function buildCollisionShape(
 }
 
 function hullShape(pts: number[], notes: string[]): ShapeBuild {
-  const hull = convexHull(pts, MAX_HULL_VERTICES);
-  const minT = 2 * MIN_HALF_EXTENT;
+  let hull = convexHull(pts, MAX_HULL_VERTICES);
+  if (hull && hull.dimension === 2) {
+    // flat mesh: a thin slab around its polygon
+    const [nx, ny, nz] = hull.normals[0];
+    const h = MIN_HALF_EXTENT;
+    const slab: number[] = [];
+    for (let i = 0; i < hull.points.length; i += 3) {
+      const [x, y, z] = [hull.points[i], hull.points[i + 1], hull.points[i + 2]];
+      slab.push(x + nx * h, y + ny * h, z + nz * h, x - nx * h, y - ny * h, z - nz * h);
+    }
+    const thick = convexHull(slab, MAX_HULL_VERTICES);
+    if (thick?.dimension === 3) hull = thick;
+  }
   if (hull && hull.dimension === 3) {
     const mp = polyhedronMass(hull.points, hull.faces);
     if (mp) {
       const verts = hull.points.map((v, i) => v - mp.com[i % 3]);
+      const poly = makePolyhedron(verts, hull.faces);
+      const box = cuboidFrame(poly);
       return {
-        shape: { kind: 'poly', poly: makePolyhedron(verts, hull.faces) },
+        shape: box ? { kind: 'poly', poly, box } : { kind: 'poly', poly },
         type: 'CONVEX_HULL',
         com: mp.com,
         inertia: mp.inertia,
@@ -459,7 +597,7 @@ function hullShape(pts: number[], notes: string[]): ShapeBuild {
     }
   }
   if (hull && hull.dimension === 2) {
-    const mp = boundsMass(hull.points, minT);
+    const mp = boundsMass(hull.points, 2 * MIN_HALF_EXTENT);
     const verts = hull.points.map((v, i) => v - mp.com[i % 3]);
     return {
       shape: { kind: 'poly', poly: makePolyhedron(verts, hull.faces, true) },
@@ -474,11 +612,25 @@ function hullShape(pts: number[], notes: string[]): ShapeBuild {
   const { center, half } = bounds(hull?.points ?? pts);
   const h: Vec3 = half.map((v) => Math.max(v, MIN_HALF_EXTENT)) as Vec3;
   notes.push('mesh vertices are collinear, using a thin box');
-  return { ...result({ kind: 'poly', poly: boxPolyhedron(h) }, 'CONVEX_HULL', boxMass(h, center), center, notes), volume: 0 };
+  return {
+    ...result(
+      { kind: 'poly', poly: boxPolyhedron(h), box: alignedBox(h) },
+      'CONVEX_HULL',
+      boxMass(h, center),
+      center,
+      notes,
+    ),
+    volume: 0,
+  };
 }
 
 /** Triangle mesh with welded adjacency, active edge flags and a BVH; null without triangles. */
-function buildTriMesh(mesh: MeshData, pts: number[], valid: Int32Array, scale: Readonly<Vec3>): TriMesh | null {
+function buildTriMesh(
+  mesh: MeshData,
+  pts: number[],
+  valid: Int32Array,
+  scale: Readonly<Vec3>,
+): TriMesh | null {
   let indices: number[];
   try {
     indices = triangulateMesh(mesh).indices;
@@ -554,7 +706,10 @@ function buildTriMesh(mesh: MeshData, pts: number[], valid: Int32Array, scale: R
         const sameDir = tris[u * 3 + oe] === a;
         const s = sameDir ? -1 : 1;
         const d =
-          s * (normals[t * 3] * normals[u * 3] + normals[t * 3 + 1] * normals[u * 3 + 1] + normals[t * 3 + 2] * normals[u * 3 + 2]);
+          s *
+          (normals[t * 3] * normals[u * 3] +
+            normals[t * 3 + 1] * normals[u * 3 + 1] +
+            normals[t * 3 + 2] * normals[u * 3 + 2]);
         if (d > COS_FLAT) isActive = false;
         else {
           // opposite vertex of the neighbour above our plane → concave (valley) edge: contacts

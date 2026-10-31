@@ -39,7 +39,8 @@ function noiseBytes(n: number, seed: number): Uint8ClampedArray {
 
 const same = (a: ArrayLike<number>, b: ArrayLike<number>) => {
   expect(a.length).toBe(b.length);
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) throw new Error(`differs at byte ${i}: ${a[i]} vs ${b[i]}`);
+  for (let i = 0; i < a.length; i++)
+    if (a[i] !== b[i]) throw new Error(`differs at byte ${i}: ${a[i]} vs ${b[i]}`);
 };
 
 describe('encodeAPNG', () => {
@@ -51,7 +52,19 @@ describe('encodeAPNG', () => {
     expect(apng.height).toBe(16);
     expect(apng.numFrames).toBe(4);
     expect(apng.numPlays).toBe(0);
-    expect(apng.chunkTypes).toEqual(['IHDR', 'acTL', 'fcTL', 'IDAT', 'fcTL', 'fdAT', 'fcTL', 'fdAT', 'fcTL', 'fdAT', 'IEND']);
+    expect(apng.chunkTypes).toEqual([
+      'IHDR',
+      'acTL',
+      'fcTL',
+      'IDAT',
+      'fcTL',
+      'fdAT',
+      'fcTL',
+      'fdAT',
+      'fcTL',
+      'fdAT',
+      'IEND',
+    ]);
     expect(apng.frames.map((f) => f.sequence)).toEqual([0, 1, 3, 5]);
     expect(apng.frames.slice(1).map((f) => f.dataSequences)).toEqual([[2], [4], [6]]);
     for (const f of apng.frames) {
@@ -88,7 +101,10 @@ describe('encodeAPNG', () => {
     expect(apngFrameDelay(12.5)).toEqual([1000, 12500]);
     expect(apngFrameDelay(0.5)).toEqual([1000, 500]);
     expect(apngFrameDelay(1e-6)).toEqual([65535, 1]);
-    expect(decodeAPNG(encodeAPNG(movingSquare(2), 29.97)).frames[0]).toMatchObject({ delayNum: 1000, delayDen: 29970 });
+    expect(decodeAPNG(encodeAPNG(movingSquare(2), 29.97)).frames[0]).toMatchObject({
+      delayNum: 1000,
+      delayDen: 29970,
+    });
   });
 
   it('encodes incrementally and validates its input', () => {
@@ -130,8 +146,14 @@ describe('GIF LZW', () => {
     roundTrip(Uint8Array.from([1]), 2);
     roundTrip(new Uint8Array(0), 4);
     // KwKwK patterns (code == next) and alternating sequences
-    roundTrip(Uint8Array.from({ length: 5000 }, (_, i) => (i % 7 === 0 ? 1 : 0)), 2);
-    roundTrip(Uint8Array.from({ length: 70000 }, (_, i) => (i * 31) & 255), 8);
+    roundTrip(
+      Uint8Array.from({ length: 5000 }, (_, i) => (i % 7 === 0 ? 1 : 0)),
+      2,
+    );
+    roundTrip(
+      Uint8Array.from({ length: 70000 }, (_, i) => (i * 31) & 255),
+      8,
+    );
     expect(() => lzwEncode(Uint8Array.from([4]), 2)).toThrow(/does not fit/);
     expect(() => lzwEncode(new Uint8Array(1), 1)).toThrow(/minimum code size/);
   });
@@ -171,20 +193,38 @@ describe('GIF palette and dithering', () => {
     for (let y = 0; y < h; y++)
       for (let x = 0; x < w; x++) data.set([x * 4, x * 4, x * 4, 255], (y * w + x) * 4);
     const frame = { width: w, height: h, data };
-    const columnError = (dither: 'NONE' | 'FLOYD_STEINBERG' | 'BAYER') => {
-      const gif = decodeGIF(encodeGIF([frame], 10, { colors: 4, dither }));
-      const c = gif.canvases[0];
+    const gif = (dither: 'NONE' | 'FLOYD_STEINBERG' | 'BAYER') =>
+      decodeGIF(encodeGIF([frame], 10, { colors: 4, dither }));
+    // 4 greys spread over the ramp (the ends 0..29 and 223..252 lie outside the palette's hull)
+    expect(Array.from(gif('NONE').palette)).toEqual([30, 30, 30, 94, 94, 94, 158, 158, 158, 222, 222, 222]);
+    /** Mean error of 8×8 block averages (one full Bayer tile each) away from the unreachable ends. */
+    const blockError = (dither: 'NONE' | 'FLOYD_STEINBERG' | 'BAYER') => {
+      const c = gif(dither).canvases[0];
       let err = 0;
-      for (let x = 0; x < w; x++) {
-        let sum = 0;
-        for (let y = 0; y < h; y++) sum += c[(y * w + x) * 4];
-        err += Math.abs(sum / h - x * 4);
-      }
-      return err / w;
+      let blocks = 0;
+      for (let by = 0; by < h; by += 8)
+        for (let bx = 8; bx < w - 8; bx += 8) {
+          let sum = 0;
+          let want = 0;
+          for (let y = by; y < by + 8; y++)
+            for (let x = bx; x < bx + 8; x++) {
+              sum += c[(y * w + x) * 4];
+              want += x * 4;
+            }
+          err += Math.abs(sum - want) / 64;
+          blocks++;
+        }
+      return err / blocks;
     };
-    const none = columnError('NONE');
-    expect(columnError('FLOYD_STEINBERG')).toBeLessThan(none / 2);
-    expect(columnError('BAYER')).toBeLessThan(none / 2);
+    expect(blockError('NONE')).toBeGreaterThan(12); // banding: whole blocks snap to one grey
+    expect(blockError('FLOYD_STEINBERG')).toBeLessThan(2);
+    expect(blockError('BAYER')).toBeLessThan(4);
+    // ordered dithering only uses the two palette greys around each source value
+    const bayer = gif('BAYER').canvases[0];
+    for (let x = 8; x < w - 8; x++) {
+      const v = x * 4;
+      for (let y = 0; y < h; y++) expect(Math.abs(bayer[(y * w + x) * 4] - v)).toBeLessThanOrEqual(64);
+    }
     const a = encodeGIF([frame], 10, { colors: 4, dither: 'BAYER' });
     expect(encodeGIF([frame], 10, { colors: 4, dither: 'BAYER' })).toEqual(a);
   });
@@ -230,7 +270,9 @@ describe('encodeGIF', () => {
       solidFrame(8, 8, clear, [{ x: 4, y: 4, w: 3, h: 3, color: RED }]),
     ];
     const gif = decodeGIF(encodeGIF(frames, 10, { dither: 'NONE' }));
-    expect(gif.frames.every((f) => f.disposal === 2 && f.width === 8 && f.transparentIndex !== null)).toBe(true);
+    expect(gif.frames.every((f) => f.disposal === 2 && f.width === 8 && f.transparentIndex !== null)).toBe(
+      true,
+    );
     gif.canvases.forEach((c, k) =>
       frames[k].data.forEach((v, i) => {
         if (i % 4 === 3) expect(c[i] > 0).toBe(v > 0);
@@ -245,12 +287,18 @@ describe('encodeGIF', () => {
     expect(gifFrameDelays(3, 100)).toEqual([2, 2, 2]);
     expect(gifFrameDelays(1, 0.001)).toEqual([65535]);
     expect(() => encodeGIF([], 10)).toThrow(/no frames/);
-    expect(() => encodeGIF([solidFrame(2, 2, BG), solidFrame(3, 2, BG)], 10)).toThrow(/every frame must be 2×2/);
+    expect(() => encodeGIF([solidFrame(2, 2, BG), solidFrame(3, 2, BG)], 10)).toThrow(
+      /every frame must be 2×2/,
+    );
     expect(() => encodeGIF([solidFrame(2, 2, BG)], Number.NaN)).toThrow(/fps/);
   });
 
   it('encodes larger noisy animations quickly and losslessly in palette space', () => {
-    const frames = Array.from({ length: 12 }, (_, k) => ({ width: 96, height: 64, data: noiseBytes(96 * 64 * 4, k + 3).map((v, i) => (i % 4 === 3 ? 255 : v)) }));
+    const frames = Array.from({ length: 12 }, (_, k) => ({
+      width: 96,
+      height: 64,
+      data: noiseBytes(96 * 64 * 4, k + 3).map((v, i) => (i % 4 === 3 ? 255 : v)),
+    }));
     const t0 = performance.now();
     const gif = decodeGIF(encodeGIF(frames, 12));
     expect(performance.now() - t0).toBeLessThan(5000);

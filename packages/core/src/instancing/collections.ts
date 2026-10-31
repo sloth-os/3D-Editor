@@ -1,11 +1,56 @@
 import type { SceneDoc } from '../doc/scene-doc';
 import type { ObjectData } from '../doc/types';
 import { ROOT_COLLECTION_ID } from '../doc/types';
-import { normalizeParticleSettings } from './settings';
+import { normalizeParticleSettings, type ParticleSettings } from './settings';
 
 /*
  * Document-level (unevaluated) collection queries used by the instancing operators.
  */
+
+/**
+ * Id of a collection reference: an id, or an exact name (stored references written by hand or by
+ * generic property tools). Null when unknown. 'Scene Collection' resolves to the root.
+ */
+export function resolveCollectionRef(doc: SceneDoc, ref: string): string | null {
+  if (!ref) return null;
+  if (ref === ROOT_COLLECTION_ID || doc.getCollection(ref)) return ref;
+  return doc.listCollections().find((c) => c.name === ref)?.id ?? null;
+}
+
+/** The collection an object is in and all its ancestors (innermost first, root excluded). */
+export function collectionAncestry(doc: SceneDoc, cid: string): string[] {
+  const out: string[] = [];
+  let cur: string | null = cid;
+  while (cur && cur !== ROOT_COLLECTION_ID && !out.includes(cur)) {
+    out.push(cur);
+    cur = doc.getCollection(cur)?.parent ?? null;
+  }
+  return out;
+}
+
+/**
+ * Collections that are instanced, with descriptions of their users: collection instance empties
+ * ("'Tree.001' (collection instance)") and particle systems ("particle system 'Grass' of 'Ground'").
+ */
+export function collectionUsers(doc: SceneDoc): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  const add = (ref: string | null, user: string) => {
+    const cid = ref ? resolveCollectionRef(doc, ref) : null;
+    if (!cid || cid === ROOT_COLLECTION_ID) return;
+    const list = out.get(cid);
+    if (list) list.push(user);
+    else out.set(cid, [user]);
+  };
+  for (const o of doc.listObjects()) {
+    if (o.instance_type === 'COLLECTION') add(o.instance_collection, `'${o.name}' (collection instance)`);
+    for (const ps of Array.isArray(o.particle_systems) ? o.particle_systems : []) {
+      if (!ps || typeof ps !== 'object') continue;
+      const s = normalizeParticleSettings(ps.settings).settings;
+      if (s.instance_type === 'COLLECTION') add(s.instance_collection, `particle system '${ps.name}' of '${o.name}'`);
+    }
+  }
+  return out;
+}
 
 /** Ids of a collection and all its descendant collections (cycle safe). */
 function collectionTree(doc: SceneDoc, cid: string): Set<string> {
@@ -39,28 +84,31 @@ export function collectionContainsObject(doc: SceneDoc, cid: string, objectId: s
   return !!o && collectionTree(doc, cid).has(o.collection);
 }
 
+type InstanceNode = { kind: 'collection' | 'object'; id: string };
+
 /**
- * True when letting `objectId` instance collection `cid` would make the object (indirectly)
- * instance itself: the collection, or anything instanced from it (nested collection instances,
- * particle instance objects and collections), contains the object.
+ * True when `target` is among the objects instanced from `start`: members of the collections, and
+ * (recursively) whatever those objects instance (collection instances, particle instance objects
+ * and collections). References are resolved by id or exact name.
  */
-export function wouldCreateInstanceCycle(doc: SceneDoc, objectId: string, cid: string): boolean {
+function instancesObject(doc: SceneDoc, start: InstanceNode[], target: string): boolean {
   const seenCollections = new Set<string>();
   const seenObjects = new Set<string>();
-  const stack: { kind: 'collection' | 'object'; id: string }[] = [{ kind: 'collection', id: cid }];
+  const stack = start.slice();
   while (stack.length) {
     const cur = stack.pop()!;
     if (cur.kind === 'collection') {
-      if (seenCollections.has(cur.id)) continue;
-      seenCollections.add(cur.id);
-      for (const o of collectionMembers(doc, cur.id)) stack.push({ kind: 'object', id: o.id });
+      const cid = resolveCollectionRef(doc, cur.id);
+      if (!cid || cid === ROOT_COLLECTION_ID || seenCollections.has(cid)) continue;
+      seenCollections.add(cid);
+      for (const o of collectionMembers(doc, cid)) stack.push({ kind: 'object', id: o.id });
       continue;
     }
-    if (cur.id === objectId) return true;
-    if (seenObjects.has(cur.id)) continue;
-    seenObjects.add(cur.id);
-    const o = doc.getObject(cur.id);
+    const o = doc.resolveObject(cur.id);
     if (!o) continue;
+    if (o.id === target) return true;
+    if (seenObjects.has(o.id)) continue;
+    seenObjects.add(o.id);
     if (o.instance_type === 'COLLECTION' && o.instance_collection)
       stack.push({ kind: 'collection', id: o.instance_collection });
     for (const ps of Array.isArray(o.particle_systems) ? o.particle_systems : []) {
@@ -71,6 +119,39 @@ export function wouldCreateInstanceCycle(doc: SceneDoc, objectId: string, cid: s
       else if (s.instance_type === 'COLLECTION' && s.instance_collection)
         stack.push({ kind: 'collection', id: s.instance_collection });
     }
+  }
+  return false;
+}
+
+/**
+ * True when letting `objectId` instance collection `cid` would make the object (indirectly)
+ * instance itself: the collection, or anything instanced from it (nested collection instances,
+ * particle instance objects and collections), contains the object.
+ */
+export function wouldCreateInstanceCycle(doc: SceneDoc, objectId: string, cid: string): boolean {
+  return instancesObject(doc, [{ kind: 'collection', id: cid }], objectId);
+}
+
+/**
+ * True when a particle system with settings `s` on `emitterId` would make the emitter instance
+ * itself through its instance object or collection (also through nested collection instances and
+ * particle systems). The emitter as a direct member of its own instance collection is not a cycle:
+ * a particle system never instances its own emitter.
+ */
+export function particleSourceCycle(
+  doc: SceneDoc,
+  emitterId: string,
+  s: Pick<ParticleSettings, 'instance_type' | 'instance_object' | 'instance_collection'>,
+): boolean {
+  if (s.instance_type === 'OBJECT' && s.instance_object)
+    return instancesObject(doc, [{ kind: 'object', id: s.instance_object }], emitterId);
+  if (s.instance_type === 'COLLECTION' && s.instance_collection) {
+    const cid = resolveCollectionRef(doc, s.instance_collection);
+    if (!cid || cid === ROOT_COLLECTION_ID) return false;
+    const start: InstanceNode[] = collectionMembers(doc, cid)
+      .filter((o) => o.id !== emitterId)
+      .map((o) => ({ kind: 'object', id: o.id }));
+    return instancesObject(doc, start, emitterId);
   }
   return false;
 }

@@ -8,7 +8,8 @@ import { crc32 } from '../src/render/png';
  * independently of the encoders.
  */
 
-const u32 = (b: Uint8Array, o: number) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+const u32 = (b: Uint8Array, o: number) =>
+  ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
 const u16be = (b: Uint8Array, o: number) => (b[o] << 8) | b[o + 1];
 const u16le = (b: Uint8Array, o: number) => b[o] | (b[o + 1] << 8);
 
@@ -103,7 +104,8 @@ export function decodeAPNG(bytes: Uint8Array): DecodedAPNG {
       case 'IHDR':
         width = u32(data, 0);
         height = u32(data, 4);
-        if (data[8] !== 8 || data[9] !== 6 || data[12] !== 0) throw new Error('expected 8-bit RGBA, not interlaced');
+        if (data[8] !== 8 || data[9] !== 6 || data[12] !== 0)
+          throw new Error('expected 8-bit RGBA, not interlaced');
         break;
       case 'acTL':
         if (seenIdat) throw new Error('acTL after IDAT');
@@ -147,7 +149,8 @@ export function decodeAPNG(bytes: Uint8Array): DecodedAPNG {
         break;
     }
   }
-  if (chunkTypes[0] !== 'IHDR' || chunkTypes[chunkTypes.length - 1] !== 'IEND') throw new Error('bad chunk order');
+  if (chunkTypes[0] !== 'IHDR' || chunkTypes[chunkTypes.length - 1] !== 'IEND')
+    throw new Error('bad chunk order');
   const first = frames[0];
   if (!first || first.x !== 0 || first.y !== 0 || first.width !== width || first.height !== height)
     throw new Error('the first frame must cover the canvas');
@@ -162,7 +165,11 @@ export function decodeAPNG(bytes: Uint8Array): DecodedAPNG {
     const prevFrame = i > 0 ? frames[i - 1] : null;
     if (prevFrame?.dispose === 1)
       for (let y = 0; y < prevFrame.height; y++)
-        canvas.fill(0, ((prevFrame.y + y) * width + prevFrame.x) * 4, ((prevFrame.y + y) * width + prevFrame.x + prevFrame.width) * 4);
+        canvas.fill(
+          0,
+          ((prevFrame.y + y) * width + prevFrame.x) * 4,
+          ((prevFrame.y + y) * width + prevFrame.x + prevFrame.width) * 4,
+        );
     else if (prevFrame?.dispose === 2 && previous) canvas.set(previous);
     previous = f.dispose === 2 ? canvas.slice() : null;
     for (let y = 0; y < f.height; y++)
@@ -186,7 +193,10 @@ export function decodeAPNG(bytes: Uint8Array): DecodedAPNG {
  * GIF LZW decoding (variable code sizes up to 12 bits, clear and end codes, the KwKwK case).
  * Returns the indices and the number of clear codes read.
  */
-export function lzwDecode(data: Uint8Array, minCodeSize: number): { indices: number[]; clears: number; ended: boolean } {
+export function lzwDecode(
+  data: Uint8Array,
+  minCodeSize: number,
+): { indices: number[]; clears: number; ended: boolean } {
   const clear = 1 << minCodeSize;
   const end = clear + 1;
   const prefix = new Int32Array(4096);
@@ -238,7 +248,8 @@ export function lzwDecode(data: Uint8Array, minCodeSize: number): { indices: num
       prev = code;
       continue;
     }
-    if (code > next || (code === next && next >= 4096)) throw new Error(`invalid code ${code} (next ${next})`);
+    if (code > next || (code === next && next >= 4096))
+      throw new Error(`invalid code ${code} (next ${next})`);
     const firstChar = code < next ? first[code] : first[prev];
     if (next < 4096) {
       prefix[next] = prev;
@@ -374,7 +385,8 @@ export function decodeGIF(bytes: Uint8Array): DecodedGIF {
       }
     canvases.push(canvas.slice());
     if (info.disposal === 2)
-      for (let yy = 0; yy < h; yy++) canvas.fill(0, ((y + yy) * width + x) * 4, ((y + yy) * width + x + w) * 4);
+      for (let yy = 0; yy < h; yy++)
+        canvas.fill(0, ((y + yy) * width + x) * 4, ((y + yy) * width + x + w) * 4);
     frames.push(info);
   }
   if (o !== bytes.length) throw new Error('data after the trailer');

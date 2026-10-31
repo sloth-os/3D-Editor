@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Mat4, Vec3 } from '../math/types';
 import { eulerFromRotation, invert4, multiply4, rotationFromEuler } from '../math/mat4';
 import { quatFromEuler } from '../math/quat';
+import { transformPoint3 } from '../math/vec3';
 import type { ConstraintData, ConstraintType } from '../doc/types';
 import { composeTRS, decomposeTRS, rotateAbout, rotationBetween, rotationPart } from './bone-math';
 
@@ -14,7 +15,8 @@ import { composeTRS, decomposeTRS, rotateAbout, rotationBetween, rotationPart } 
 const space = z
   .enum(['WORLD', 'POSE', 'LOCAL'])
   .describe(
-    'WORLD/POSE: armature space (targets converted from world space); LOCAL: the bone transform relative to its rest pose',
+    'WORLD: world space; POSE: armature (object) space; LOCAL: the bone transform relative to its rest pose ' +
+      '(object targets have no rest pose and are read in POSE space)',
   );
 
 const eulerOrder = z
@@ -181,16 +183,24 @@ export interface BoneConstraintTarget {
 export interface BoneConstraintEnv {
   /** The owner bone's rest frame under its posed parent (parent pose · bone offset); LOCAL space basis. */
   frame: Mat4;
-  /** Resolves the constraint target (null when unset or unavailable). */
+  /** World matrix of the armature object (WORLD space); identity when omitted. */
+  armatureMatrix?: Readonly<Mat4>;
+  /** Resolves the constraint target (null when unset or unavailable; may throw saying why). */
   target(c: ConstraintData): BoneConstraintTarget | null;
 }
 
-function toSpace(m: Mat4, sp: string, frame: Mat4 | null): Mat4 {
-  return sp === 'LOCAL' && frame ? multiply4(invert4(frame), m) : m;
+/** Converts an armature-space matrix into constraint space `sp` (LOCAL uses `frame` when given). */
+function toSpace(m: Mat4, sp: string, frame: Mat4 | null, env: BoneConstraintEnv): Mat4 {
+  if (sp === 'LOCAL') return frame ? multiply4(invert4(frame), m) : m;
+  if (sp === 'WORLD' && env.armatureMatrix) return multiply4(env.armatureMatrix as Mat4, m);
+  return m;
 }
 
-function fromSpace(m: Mat4, sp: string, frame: Mat4): Mat4 {
-  return sp === 'LOCAL' ? multiply4(frame, m) : m;
+/** Inverse of `toSpace` for the owner bone. */
+function fromSpace(m: Mat4, sp: string, env: BoneConstraintEnv): Mat4 {
+  if (sp === 'LOCAL') return multiply4(env.frame, m);
+  if (sp === 'WORLD' && env.armatureMatrix) return multiply4(invert4(env.armatureMatrix), m);
+  return m;
 }
 
 function targetPoint(t: BoneConstraintTarget, headTail: number): Vec3 {
@@ -239,8 +249,8 @@ export function applyBoneConstraint(c: ConstraintData, owner: Mat4, env: BoneCon
       const p = parseBoneConstraintParams('COPY_ROTATION', c.params);
       const t = env.target(c);
       if (!t) throw new Error('target not found');
-      const own = toSpace(owner, p.owner_space, env.frame);
-      const tgt = toSpace(t.matrix, p.target_space, t.frame);
+      const own = toSpace(owner, p.owner_space, env.frame, env);
+      const tgt = toSpace(t.matrix, p.target_space, t.frame, env);
       const o = decomposeTRS(own);
       const ownRot = rotationPart(own);
       const tgtRot = rotationPart(tgt);
@@ -261,17 +271,19 @@ export function applyBoneConstraint(c: ConstraintData, owner: Mat4, env: BoneCon
         else rot = multiply4(ownRot, rotationFromEuler(filtered));
       }
       const res = composeTRS({ location: o.location, rotation: decomposeTRS(rot).rotation, scale: o.scale });
-      return fromSpace(res, p.owner_space, env.frame);
+      return fromSpace(res, p.owner_space, env);
     }
     case 'COPY_LOCATION': {
       const p = parseBoneConstraintParams('COPY_LOCATION', c.params);
       const t = env.target(c);
       if (!t) throw new Error('target not found');
-      const own = toSpace(owner, p.owner_space, env.frame);
+      const own = toSpace(owner, p.owner_space, env.frame, env);
       let tp = targetPoint(t, p.head_tail);
       if (p.target_space === 'LOCAL' && t.frame) {
-        const lm = toSpace(t.matrix, 'LOCAL', t.frame);
+        const lm = toSpace(t.matrix, 'LOCAL', t.frame, env);
         tp = [lm[12], lm[13], lm[14]];
+      } else if (p.target_space === 'WORLD' && env.armatureMatrix) {
+        tp = transformPoint3(env.armatureMatrix, tp);
       }
       const use = [p.use_x, p.use_y, p.use_z];
       const inv = [p.invert_x, p.invert_y, p.invert_z];
@@ -281,7 +293,7 @@ export function applyBoneConstraint(c: ConstraintData, owner: Mat4, env: BoneCon
         const v = inv[k] ? -tp[k] : tp[k];
         res[12 + k] = p.use_offset ? own[12 + k] + v : v;
       }
-      return fromSpace(res, p.owner_space, env.frame);
+      return fromSpace(res, p.owner_space, env);
     }
     case 'DAMPED_TRACK': {
       const p = parseBoneConstraintParams('DAMPED_TRACK', c.params);
@@ -302,7 +314,7 @@ export function applyBoneConstraint(c: ConstraintData, owner: Mat4, env: BoneCon
     case 'LIMIT_ROTATION': {
       const p = parseBoneConstraintParams('LIMIT_ROTATION', c.params);
       if (!p.use_limit_x && !p.use_limit_y && !p.use_limit_z) return owner;
-      const own = toSpace(owner, p.owner_space, env.frame);
+      const own = toSpace(owner, p.owner_space, env.frame, env);
       const d = decomposeTRS(own);
       const e = eulerFromRotation(rotationPart(own));
       const lim: [boolean, number, number][] = [
@@ -323,7 +335,7 @@ export function applyBoneConstraint(c: ConstraintData, owner: Mat4, env: BoneCon
       }
       if (!changed) return owner;
       const res = composeTRS({ location: d.location, rotation: quatFromEuler(e), scale: d.scale });
-      return fromSpace(res, p.owner_space, env.frame);
+      return fromSpace(res, p.owner_space, env);
     }
     case 'IK':
       // solved by the IK chain solver

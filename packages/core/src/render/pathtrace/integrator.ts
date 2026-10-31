@@ -19,7 +19,7 @@ import {
   type LampData,
 } from './lights';
 import { ShadingContext, SurfaceShader, type PTMaterial } from './material';
-import { Sampler, filterOffset } from './sampler';
+import { Sampler } from './sampler';
 
 /*
  * Unidirectional path tracer with next-event estimation and multiple importance sampling
@@ -73,8 +73,11 @@ function powerHeuristic(a: number, b: number): number {
 const DIM_FILTER = 0;
 const DIM_LENS = 1;
 const DIM_VERTEX = 2;
-const DIM_RR = 1000;
-const DIM_ALPHA = 2000;
+// far above any vertex dimension (paths are at most a few thousand vertices long)
+const DIM_RR = 1 << 16;
+const DIM_ALPHA = 1 << 17;
+/** A sphere lamp counts as a point light from points closer than this squared radius factor. */
+const INSIDE_SPHERE = 1.0001;
 
 /** Per-sample results of `PathIntegrator.trace`. */
 export class PathIntegrator {
@@ -148,6 +151,9 @@ export class PathIntegrator {
   private lPdf = 0;
   private lDelta = false;
   private lShadow = true;
+  /** `hitLamp`: distance limit of the current ray and distance of the lamp hit. */
+  private lampLimit = Infinity;
+  private lampT = 0;
 
   constructor(
     readonly scene: CompiledScene,
@@ -233,10 +239,17 @@ export class PathIntegrator {
     return 1 - this.shadowShader.coverage(m, this.shadowCtx);
   }
 
-  /** Computes position and normals of the current intersection (ray o + t·d). */
-  private setupHit(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number): void {
+  /** Computes position and normals of the current intersection (`isect.ray` origin + t · direction). */
+  private setupHit(): void {
     const s = this.scene;
     const is = this.isect;
+    const R = is.ray;
+    const ox = R[0];
+    const oy = R[1];
+    const oz = R[2];
+    const dx = R[3];
+    const dy = R[4];
+    const dz = R[5];
     const inst = is.inst;
     const tri = is.tri;
     const g = s.geometries[s.instances.geom[inst]];
@@ -261,12 +274,12 @@ export class PathIntegrator {
     let wx = I[io] * nx + I[io + 1] * ny + I[io + 2] * nz;
     let wy = I[io + 3] * nx + I[io + 4] * ny + I[io + 5] * nz;
     let wz = I[io + 6] * nx + I[io + 7] * ny + I[io + 8] * nz;
-    let l = Math.hypot(wx, wy, wz);
+    let l = Math.sqrt(wx * wx + wy * wy + wz * wz);
     if (!(l > 0)) {
       wx = -dx;
       wy = -dy;
       wz = -dz;
-      l = Math.hypot(wx, wy, wz) || 1;
+      l = Math.sqrt(wx * wx + wy * wy + wz * wz) || 1;
     }
     this.gx = wx / l;
     this.gy = wy / l;
@@ -286,7 +299,7 @@ export class PathIntegrator {
       let sx = I[io] * ax + I[io + 1] * ay + I[io + 2] * az;
       let sy = I[io + 3] * ax + I[io + 4] * ay + I[io + 5] * az;
       let sz = I[io + 6] * ax + I[io + 7] * ay + I[io + 8] * az;
-      const sl = Math.hypot(sx, sy, sz);
+      const sl = Math.sqrt(sx * sx + sy * sy + sz * sz);
       if (sl > 0 && Number.isFinite(sl)) {
         sx /= sl;
         sy /= sl;
@@ -370,7 +383,7 @@ export class PathIntegrator {
     tx -= nx * d;
     ty -= ny * d;
     tz -= nz * d;
-    const tl = Math.hypot(tx, ty, tz);
+    const tl = Math.sqrt(tx * tx + ty * ty + tz * tz);
     if (!(tl > 0)) return;
     tx /= tl;
     ty /= tl;
@@ -388,7 +401,7 @@ export class PathIntegrator {
     let mx = tx * sh.nmx + qx * sh.nmy + nx * sh.nmz;
     let my = ty * sh.nmx + qy * sh.nmy + ny * sh.nmz;
     let mz = tz * sh.nmx + qz * sh.nmy + nz * sh.nmz;
-    const ml = Math.hypot(mx, my, mz);
+    const ml = Math.sqrt(mx * mx + my * my + mz * mz);
     if (!(ml > 0)) return;
     mx /= ml;
     my /= ml;
@@ -397,7 +410,7 @@ export class PathIntegrator {
     mx = nx + (mx - nx) * k;
     my = ny + (my - ny) * k;
     mz = nz + (mz - nz) * k;
-    const l2 = Math.hypot(mx, my, mz);
+    const l2 = Math.sqrt(mx * mx + my * my + mz * mz);
     if (!(l2 > 0)) return;
     this.sx = (mx / l2) * flip;
     this.sy = (my / l2) * flip;
@@ -425,8 +438,8 @@ export class PathIntegrator {
     if (tex.mapping === 2) {
       // UV mapping: offsets along ∂p/∂u and ∂p/∂v
       if (!this.uvTangents(inst, tri)) return;
-      const lu = Math.hypot(this.tux, this.tuy, this.tuz);
-      const lv = Math.hypot(this.tvx, this.tvy, this.tvz);
+      const lu = Math.sqrt(this.tux * this.tux + this.tuy * this.tuy + this.tuz * this.tuz);
+      const lv = Math.sqrt(this.tvx * this.tvx + this.tvy * this.tvy + this.tvz * this.tvz);
       const du = footprint / lu;
       const dv = footprint / lv;
       dpx[0] = this.tux * du;
@@ -560,7 +573,7 @@ export class PathIntegrator {
       const mask = spotMask(l, -cx / d, -cy / d, -cz / d);
       if (mask <= 0) return false;
       const r = l.radius;
-      if (r <= 0 || d2 <= r * r * 1.0001) {
+      if (r <= 0 || d2 <= r * r * INSIDE_SPHERE) {
         // point light (or inside the sphere): treat as a delta light at the centre
         const k = r > 0 ? (mask * Math.PI * r * r) / d2 : mask / d2;
         this.lx = cx / d;
@@ -659,7 +672,7 @@ export class PathIntegrator {
       const cz = l.pz - pz;
       const d2 = cx * cx + cy * cy + cz * cz;
       const r = l.radius;
-      if (r <= 0 || d2 <= r * r * 1.0001) return 0;
+      if (r <= 0 || d2 <= r * r * INSIDE_SPHERE) return 0;
       const sin2 = (r * r) / d2;
       const oneMinus = sin2 < 1e-4 ? sin2 * 0.5 + (sin2 * sin2) / 8 : 1 - Math.sqrt(1 - sin2);
       return 1 / (2 * Math.PI * oneMinus);
@@ -669,45 +682,47 @@ export class PathIntegrator {
   }
 
   /**
-   * Distance at which a ray hits lamp `l` (non-delta, not the sun), or Infinity. Also leaves the
-   * emitted radiance towards the ray origin in lr/lg/lb.
+   * True when the current ray (`isect.ray`) hits lamp `l` (non-delta, not the sun) closer than
+   * `lampLimit`: the distance goes to `lampT`, the radiance emitted towards the ray origin to
+   * lr/lg/lb.
    */
-  private hitLamp(
-    l: LampData,
-    ox: number,
-    oy: number,
-    oz: number,
-    dx: number,
-    dy: number,
-    dz: number,
-    tMax: number,
-  ): number {
+  private hitLamp(l: LampData): boolean {
+    const R = this.isect.ray;
+    const ox = R[0];
+    const oy = R[1];
+    const oz = R[2];
+    const dx = R[3];
+    const dy = R[4];
+    const dz = R[5];
+    const tMax = this.lampLimit;
     if (l.kind === LAMP_SPHERE) {
       const r = l.radius;
-      if (r <= 0) return Infinity;
+      if (r <= 0) return false;
       const cx = l.px - ox;
       const cy = l.py - oy;
       const cz = l.pz - oz;
       const tc = cx * dx + cy * dy + cz * dz;
       const d2 = cx * cx + cy * cy + cz * cz;
-      if (d2 <= r * r) return Infinity;
+      // from (almost) inside, light sampling treats the lamp as a point light: never hit it
+      if (d2 <= r * r * INSIDE_SPHERE) return false;
       const disc = r * r - (d2 - tc * tc);
-      if (disc < 0 || tc <= 0) return Infinity;
+      if (disc < 0 || tc <= 0) return false;
       const t = tc - Math.sqrt(disc);
-      if (!(t > 0) || t >= tMax) return Infinity;
+      if (!(t > 0) || t >= tMax) return false;
       const d = Math.sqrt(d2);
       const mask = spotMask(l, -cx / d, -cy / d, -cz / d);
-      if (mask <= 0) return Infinity;
+      if (mask <= 0) return false;
       this.lr = l.r * mask;
       this.lg = l.g * mask;
       this.lb = l.b * mask;
-      return t;
+      this.lampT = t;
+      return true;
     }
-    if (l.kind !== LAMP_RECT && l.kind !== LAMP_DISK) return Infinity;
+    if (l.kind !== LAMP_RECT && l.kind !== LAMP_DISK) return false;
     const dn = dx * l.nx + dy * l.ny + dz * l.nz;
-    if (dn >= 0) return Infinity; // back side: one-sided emitter
+    if (dn >= 0) return false; // back side: one-sided emitter
     const t = ((l.px - ox) * l.nx + (l.py - oy) * l.ny + (l.pz - oz) * l.nz) / dn;
-    if (!(t > 0) || t >= tMax) return Infinity;
+    if (!(t > 0) || t >= tMax) return false;
     const qx = ox + dx * t - l.px;
     const qy = oy + dy * t - l.py;
     const qz = oz + dz * t - l.pz;
@@ -718,14 +733,15 @@ export class PathIntegrator {
     const qu = qx * l.ux + qy * l.uy + qz * l.uz;
     const qv = qx * l.vx + qy * l.vy + qz * l.vz;
     const det = uu * vv - uv * uv;
-    if (!(det > 0)) return Infinity;
+    if (!(det > 0)) return false;
     const a = (qu * vv - qv * uv) / det;
     const b = (qv * uu - qu * uv) / det;
-    if (l.kind === LAMP_RECT ? Math.abs(a) > 1 || Math.abs(b) > 1 : a * a + b * b > 1) return Infinity;
+    if (l.kind === LAMP_RECT ? Math.abs(a) > 1 || Math.abs(b) > 1 : a * a + b * b > 1) return false;
     this.lr = l.r;
     this.lg = l.g;
     this.lb = l.b;
-    return t;
+    this.lampT = t;
+    return true;
   }
 
   /** Samples a point on emitter group k as seen from p (into l* fields). */
@@ -783,7 +799,7 @@ export class PathIntegrator {
     let nx = I[xo] * nx0 + I[xo + 1] * ny0 + I[xo + 2] * nz0;
     let ny = I[xo + 3] * nx0 + I[xo + 4] * ny0 + I[xo + 5] * nz0;
     let nz = I[xo + 6] * nx0 + I[xo + 7] * ny0 + I[xo + 8] * nz0;
-    const nl = Math.hypot(nx, ny, nz);
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
     if (!(nl > 0)) return false;
     nx /= nl;
     ny /= nl;
@@ -833,9 +849,9 @@ export class PathIntegrator {
     const env = this.env;
     const lights = this.lights;
     smp.start(x, y, s);
-    smp.next2D(DIM_FILTER);
-    const fx = filterOffset(smp.u0);
-    const fy = filterOffset(smp.u1);
+    smp.nextFilter(DIM_FILTER);
+    const fx = smp.u0;
+    const fy = smp.u1;
     smp.next2D(DIM_LENS);
     let Lr = 0;
     let Lg = 0;
@@ -862,6 +878,9 @@ export class PathIntegrator {
     let etaScale = 1;
     let cameraRay = true;
     let travelled = 0;
+    // distance from the last scattering vertex (or the camera) to the ray origin, which moves
+    // forward through alpha-transparent surfaces; MIS densities of lights need the full distance
+    let segT = 0;
     let scatters = 0;
     let bounces = 0;
     let transmissions = 0;
@@ -873,10 +892,7 @@ export class PathIntegrator {
     let prevX = 0;
     let prevY = 0;
     let prevZ = 0;
-    let prevNX = 0;
-    let prevNY = 0;
-    let prevNZ = 1;
-    let prevTwoSided = false;
+    // light selection weight sum at the previous vertex (> 0: `lights` still holds its weights)
     let prevTotal = 0;
     // smallest BSDF pdf along the path (filter glossy)
     let minPdf = Infinity;
@@ -891,30 +907,29 @@ export class PathIntegrator {
     const clampK = st.clampIndirect > 0 ? st.clampIndirect : Infinity;
 
     for (;;) {
-      const hit = isect.intersect(ox, oy, oz, dx, dy, dz, tMax);
+      // the ray goes through the intersector's scratch array (no boxed arguments)
+      const ray = isect.ray;
+      ray[0] = ox;
+      ray[1] = oy;
+      ray[2] = oz;
+      ray[3] = dx;
+      ray[4] = dy;
+      ray[5] = dz;
+      ray[6] = tMax;
+      const hit = isect.intersectRay();
       const hitT = hit ? isect.t : Infinity;
       // ---- lamps seen by BSDF-sampled rays (lamps are invisible to the camera, never occlude)
       if (!cameraRay && this.scene.lamps.length) {
         const lamps = this.scene.lamps;
+        this.lampLimit = hitT;
         for (let i = 0; i < lamps.length; i++) {
           const l = lamps[i];
-          if (l.kind === LAMP_SUN) continue;
-          const t = this.hitLamp(l, ox, oy, oz, dx, dy, dz, hitT);
-          if (t === Infinity) continue;
+          if (l.kind === LAMP_SUN || !this.hitLamp(l)) continue;
+          const t = this.lampT;
           let w = 1;
           if (!prevSingular) {
-            const pSel = lights.probability(
-              this.lampSel[i],
-              prevTotal,
-              prevX,
-              prevY,
-              prevZ,
-              prevNX,
-              prevNY,
-              prevNZ,
-              prevTwoSided,
-            );
-            w = powerHeuristic(prevPdf, pSel * this.lampPdf(l, prevX, prevY, prevZ, dx, dy, dz, t));
+            const pSel = prevTotal > 0 ? lights.probability(this.lampSel[i]) : 0;
+            w = powerHeuristic(prevPdf, pSel * this.lampPdf(l, prevX, prevY, prevZ, dx, dy, dz, segT + t));
           }
           let cr = tpR * this.lr * w;
           let cg = tpG * this.lg * w;
@@ -970,17 +985,7 @@ export class PathIntegrator {
           env.eval(dx, dy, dz);
           let w = 1;
           if (!prevSingular && this.envSel >= 0) {
-            const pSel = lights.probability(
-              this.envSel,
-              prevTotal,
-              prevX,
-              prevY,
-              prevZ,
-              prevNX,
-              prevNY,
-              prevNZ,
-              prevTwoSided,
-            );
+            const pSel = prevTotal > 0 ? lights.probability(this.envSel) : 0;
             w = powerHeuristic(prevPdf, pSel * env.pdf(dx, dy, dz));
           }
           let cr = tpR * env.r * w;
@@ -1007,17 +1012,7 @@ export class PathIntegrator {
           if (-(dx * l.nx + dy * l.ny + dz * l.nz) < l.cosMax) continue;
           let w = 1;
           if (!prevSingular) {
-            const pSel = lights.probability(
-              this.lampSel[i],
-              prevTotal,
-              prevX,
-              prevY,
-              prevZ,
-              prevNX,
-              prevNY,
-              prevNZ,
-              prevTwoSided,
-            );
+            const pSel = prevTotal > 0 ? lights.probability(this.lampSel[i]) : 0;
             w = powerHeuristic(prevPdf, pSel / (2 * Math.PI * (1 - l.cosMax)));
           }
           let cr = tpR * l.r * w;
@@ -1049,7 +1044,7 @@ export class PathIntegrator {
       const tri = isect.tri;
       const b1 = isect.b1;
       const b2 = isect.b2;
-      this.setupHit(ox, oy, oz, dx, dy, dz);
+      this.setupHit();
       const m = this.materialOf(inst, tri);
       this.hitMat = m;
       this.fillContext(ctx, inst, tri, b1, b2);
@@ -1066,6 +1061,7 @@ export class PathIntegrator {
       if (passThrough && layers < st.maxTransparentLayers) {
         layers++;
         travelled += hitT;
+        segT += hitT;
         const side = frontFacing ? -1 : 1;
         const eps = EPS_SCALE * (1 + Math.max(Math.abs(this.px), Math.abs(this.py), Math.abs(this.pz)));
         ox = this.px + this.gx * side * eps;
@@ -1102,7 +1098,7 @@ export class PathIntegrator {
           let ax = snx + gnx * k;
           let ay = sny + gny * k;
           let az = snz + gnz * k;
-          const al = Math.hypot(ax, ay, az);
+          const al = Math.sqrt(ax * ax + ay * ay + az * az);
           ax /= al;
           ay /= al;
           az /= al;
@@ -1144,20 +1140,11 @@ export class PathIntegrator {
             const grp = this.scene.emitters[k];
             const j = grp.lookup[tri];
             if (j >= 0) {
-              const pSel = lights.probability(
-                this.meshSel[k],
-                prevTotal,
-                prevX,
-                prevY,
-                prevZ,
-                prevNX,
-                prevNY,
-                prevNZ,
-                prevTwoSided,
-              );
+              const pSel = prevTotal > 0 ? lights.probability(this.meshSel[k]) : 0;
               const cosL = Math.abs(gnx * dx + gny * dy + gnz * dz);
+              const dist = segT + hitT;
               if (cosL > 1e-8)
-                pl = ((pSel * discretePdf(grp.dist, j)) / grp.area[j]) * ((hitT * hitT) / cosL);
+                pl = ((pSel * discretePdf(grp.dist, j)) / grp.area[j]) * ((dist * dist) / cosL);
             }
           }
           w = powerHeuristic(prevPdf, pl);
@@ -1296,7 +1283,15 @@ export class PathIntegrator {
                     this.lDist = ld;
                   }
                   const tShadow = this.lDist === Infinity ? Infinity : this.lDist * (1 - 1e-6) - eps;
-                  if (isect.occluded(sox, soy, soz, wx, wy, wz, tShadow)) visible = 0;
+                  const ray = isect.ray;
+                  ray[0] = sox;
+                  ray[1] = soy;
+                  ray[2] = soz;
+                  ray[3] = wx;
+                  ray[4] = wy;
+                  ray[5] = wz;
+                  ray[6] = tShadow;
+                  if (isect.occludedRay()) visible = 0;
                   else visible = isect.transmittance;
                 }
                 if (visible > 0) {
@@ -1351,10 +1346,6 @@ export class PathIntegrator {
       prevX = this.px;
       prevY = this.py;
       prevZ = this.pz;
-      prevNX = gnx;
-      prevNY = gny;
-      prevNZ = gnz;
-      prevTwoSided = transmissive;
       prevTotal = selTotal;
       scatters++;
       cameraRay = false;
@@ -1376,6 +1367,7 @@ export class PathIntegrator {
       dy = nwy;
       dz = nwz;
       tMax = Infinity;
+      segT = 0;
     }
     if (!(Number.isFinite(Lr) && Number.isFinite(Lg) && Number.isFinite(Lb))) {
       Lr = Lg = Lb = 0;

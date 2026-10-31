@@ -146,7 +146,8 @@ export function generateBuilding(params: Partial<BuildingParams> = {}): Generato
         for (let c = 0; c < cols; c++) {
           const sc = (c + 0.5) * pitch;
           const o: Opening = { s0: sc - ww / 2, s1: sc + ww / 2, t0, t1: t0 + winH, door: false };
-          if (hasDoor && fi === 0 && o.t0 < door.t1 + 0.2 && o.s1 > door.s0 - 0.3 && o.s0 < door.s1 + 0.3) continue;
+          if (hasDoor && fi === 0 && o.t0 < door.t1 + 0.2 && o.s1 > door.s0 - 0.3 && o.s0 < door.s1 + 0.3)
+            continue;
           f.openings.push(o);
         }
       }
@@ -165,7 +166,15 @@ export function generateBuilding(params: Partial<BuildingParams> = {}): Generato
         const sm = (f.ss[i] + f.ss[i + 1]) / 2;
         const tm = (zs[j] + zs[j + 1]) / 2;
         if (f.openings.some((o) => inside(o, sm, tm))) continue;
-        b.face([V(f, f.ss[i], zs[j]), V(f, f.ss[i + 1], zs[j]), V(f, f.ss[i + 1], zs[j + 1]), V(f, f.ss[i], zs[j + 1])], WALL);
+        b.face(
+          [
+            V(f, f.ss[i], zs[j]),
+            V(f, f.ss[i + 1], zs[j]),
+            V(f, f.ss[i + 1], zs[j + 1]),
+            V(f, f.ss[i], zs[j + 1]),
+          ],
+          WALL,
+        );
       }
     for (const o of f.openings) {
       const sIn = f.ss.filter((s) => s >= o.s0 - EPS && s <= o.s1 + EPS);
@@ -177,11 +186,48 @@ export function generateBuilding(params: Partial<BuildingParams> = {}): Generato
       // reveals (outer edge follows the facade grid so no T-junctions appear)
       if (!o.door) b.face([...sIn.map((s) => V(f, s, o.t0)), qbr, qbl], WALL);
       b.face([...tIn.map((t) => V(f, o.s1, t)), qtr, qbr], WALL);
-      b.face([...sIn.slice().reverse().map((s) => V(f, s, o.t1)), qtl, qtr], WALL);
-      b.face([...tIn.slice().reverse().map((t) => V(f, o.s0, t)), qbl, qtl], WALL);
+      b.face(
+        [
+          ...sIn
+            .slice()
+            .reverse()
+            .map((s) => V(f, s, o.t1)),
+          qtl,
+          qtr,
+        ],
+        WALL,
+      );
+      b.face(
+        [
+          ...tIn
+            .slice()
+            .reverse()
+            .map((t) => V(f, o.s0, t)),
+          qbl,
+          qtl,
+        ],
+        WALL,
+      );
       const box = (s0: number, s1: number, t0: number, t1: number, d0: number, d1: number, mat: number) => {
         // facade-aligned box: local (s, t, depth) → world
-        const m: Mat4 = [f.u[0], f.u[1], f.u[2], 0, 0, 0, 1, 0, -f.n[0], -f.n[1], -f.n[2], 0, f.origin[0], f.origin[1], 0, 1];
+        const m: Mat4 = [
+          f.u[0],
+          f.u[1],
+          f.u[2],
+          0,
+          0,
+          0,
+          1,
+          0,
+          -f.n[0],
+          -f.n[1],
+          -f.n[2],
+          0,
+          f.origin[0],
+          f.origin[1],
+          0,
+          1,
+        ];
         addBox(b, [s0, t0, d0], [s1, t1, d1], { mat, matrix: m });
       };
       if (o.door) {
@@ -193,8 +239,18 @@ export function generateBuilding(params: Partial<BuildingParams> = {}): Generato
       const gd = 0.04;
       const R = (s: number, t: number) => b.vert(P(f, s, t, inset));
       const G = (s: number, t: number) => b.vert(P(f, s, t, inset + gd));
-      const r = [R(o.s0 + fw, o.t0 + fw), R(o.s1 - fw, o.t0 + fw), R(o.s1 - fw, o.t1 - fw), R(o.s0 + fw, o.t1 - fw)];
-      const g = [G(o.s0 + fw, o.t0 + fw), G(o.s1 - fw, o.t0 + fw), G(o.s1 - fw, o.t1 - fw), G(o.s0 + fw, o.t1 - fw)];
+      const r = [
+        R(o.s0 + fw, o.t0 + fw),
+        R(o.s1 - fw, o.t0 + fw),
+        R(o.s1 - fw, o.t1 - fw),
+        R(o.s0 + fw, o.t1 - fw),
+      ];
+      const g = [
+        G(o.s0 + fw, o.t0 + fw),
+        G(o.s1 - fw, o.t0 + fw),
+        G(o.s1 - fw, o.t1 - fw),
+        G(o.s0 + fw, o.t1 - fw),
+      ];
       for (let k = 0; k < 4; k++) {
         const k1 = (k + 1) % 4;
         b.face([q[k], q[k1], r[k1], r[k]], FRAME); // frame ring

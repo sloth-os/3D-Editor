@@ -134,7 +134,8 @@ export class TriangleBVH {
     while (stack.length) {
       const node = stack.pop()!;
       const o = node * 6;
-      if (b[o] > x1 || b[o + 3] < x0 || b[o + 1] > y1 || b[o + 4] < y0 || b[o + 2] > z1 || b[o + 5] < z0) continue;
+      if (b[o] > x1 || b[o + 3] < x0 || b[o + 1] > y1 || b[o + 4] < y0 || b[o + 2] > z1 || b[o + 5] < z0)
+        continue;
       if (l[node * 3 + 2] === 1) {
         const first = l[node * 3];
         const end = first + l[node * 3 + 1];
@@ -142,7 +143,14 @@ export class TriangleBVH {
         for (let i = first; i < end; i++) {
           const t = this.order[i];
           const q = t * 6;
-          if (tb[q] > x1 || tb[q + 3] < x0 || tb[q + 1] > y1 || tb[q + 4] < y0 || tb[q + 2] > z1 || tb[q + 5] < z0)
+          if (
+            tb[q] > x1 ||
+            tb[q + 3] < x0 ||
+            tb[q + 1] > y1 ||
+            tb[q + 4] < y0 ||
+            tb[q + 2] > z1 ||
+            tb[q + 5] < z0
+          )
             continue;
           out.push(t);
         }

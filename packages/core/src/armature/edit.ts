@@ -68,22 +68,26 @@ export function syncPoseChannels(doc: SceneDoc, armatureId: string): void {
   const names = arm.bones.map((b) => b.name);
   for (const o of armatureUsers(doc, armatureId)) {
     const cur = o.pose?.bones ?? {};
-    const next: Record<string, PoseBone> = {};
     let changed = Object.keys(cur).length !== names.length;
-    for (const n of names) {
-      if (cur[n]) next[n] = cur[n];
-      else {
-        next[n] = defaultPoseBone();
-        changed = true;
-      }
-    }
-    if (changed) doc.updateObject(o.id, { pose: { ...o.pose, bones: next } });
+    // own entries only (bone names are user data: never pick up Object.prototype members)
+    const next = names.map((n): [string, PoseBone] => {
+      if (Object.hasOwn(cur, n) && cur[n]) return [n, cur[n]];
+      changed = true;
+      return [n, defaultPoseBone()];
+    });
+    if (changed) doc.updateObject(o.id, { pose: { ...o.pose, bones: Object.fromEntries(next) } });
   }
 }
 
+/**
+ * Names that cannot key a plain JavaScript object safely (`__proto__`, `constructor`, …). Pose
+ * channels are stored in an object keyed by bone name, so bones never get these names.
+ */
+const RESERVED_NAMES: readonly string[] = Object.getOwnPropertyNames(Object.prototype);
+
 /** Unique bone name within an armature (Blender style "Bone", "Bone.001", …). */
 export function uniqueBoneName(bones: readonly BoneData[], base: string, except?: string): string {
-  return uniqueName(base, new Set(bones.map((b) => b.name).filter((n) => n !== except)));
+  return uniqueName(base, new Set([...RESERVED_NAMES, ...bones.map((b) => b.name).filter((n) => n !== except)]));
 }
 
 function renameInConstraints(
@@ -141,9 +145,11 @@ export function renameBone(doc: SceneDoc, armatureId: string, from: string, to: 
     const users = new Set(userList.map((o) => o.id));
     // pose channels (keep their order)
     for (const o of userList) {
-      const bones: Record<string, PoseBone> = {};
-      for (const [k, v] of Object.entries(o.pose?.bones ?? {})) bones[k === from ? name : k] = v;
-      doc.updateObject(o.id, { pose: { ...o.pose, bones } });
+      const bones = Object.entries(o.pose?.bones ?? {}).map(([k, v]): [string, PoseBone] => [
+        k === from ? name : k,
+        v,
+      ]);
+      doc.updateObject(o.id, { pose: { ...o.pose, bones: Object.fromEntries(bones) } });
     }
     // animation curves and drivers of the armature objects
     for (const fc of doc.listFCurves()) {
@@ -179,13 +185,13 @@ export function renameBone(doc: SceneDoc, armatureId: string, from: string, to: 
       if (cs) patch.constraints = cs;
       if (o.type === 'ARMATURE' && o.pose?.bones) {
         let changed = false;
-        const bones: Record<string, PoseBone> = {};
-        for (const [k, pb] of Object.entries(o.pose.bones)) {
+        const bones = Object.entries(o.pose.bones).map(([k, pb]): [string, PoseBone] => {
           const bc = renameInConstraints(pb.constraints, users, from, name);
-          bones[k] = bc ? { ...pb, constraints: bc } : pb;
           if (bc) changed = true;
-        }
-        if (changed) patch.pose = { ...(patch.pose ?? doc.getObject(o.id)!.pose), bones };
+          return [k, bc ? { ...pb, constraints: bc } : pb];
+        });
+        if (changed)
+          patch.pose = { ...(patch.pose ?? doc.getObject(o.id)!.pose), bones: Object.fromEntries(bones) };
       }
       if (Object.keys(patch).length) doc.updateObject(o.id, patch);
       // vertex groups of meshes deformed by this armature follow the bone name

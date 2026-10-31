@@ -209,12 +209,19 @@ class MinDistanceFilter {
   private readonly r2: number;
   private readonly inv: number;
 
+  /**
+   * @param extent largest absolute coordinate of the points (metric space). Cells are at least
+   *   extent·2⁻²⁰ wide, so cell indices stay small integers that hash well: for a distance far below
+   *   the mesh size, cells of size `distance` would overflow the 32-bit hash and share one bucket.
+   */
   constructor(
-    private readonly distance: number,
+    distance: number,
     private readonly metric: readonly number[] | null,
+    extent: number,
   ) {
     this.r2 = distance * distance;
-    this.inv = 1 / distance;
+    const minCell = Number.isFinite(extent) ? extent * 2 ** -20 : 0;
+    this.inv = 1 / Math.max(distance, minCell);
   }
 
   private static key(ix: number, iy: number, iz: number): number {
@@ -278,6 +285,25 @@ function bounds(mesh: MeshData): { min: number[]; max: number[] } | null {
     if (z > max[2]) max[2] = z;
   }
   return any ? { min, max } : null;
+}
+
+/** Largest absolute coordinate of the mesh's bounding box mapped through the metric factor. */
+function metricExtent(mesh: MeshData, metric: readonly number[] | null): number {
+  const box = bounds(mesh);
+  if (!box) return 0;
+  let out = 0;
+  // the image of the box is a parallelepiped: the extreme coordinates are at its corners
+  for (let c = 0; c < 8; c++) {
+    const x = c & 1 ? box.max[0] : box.min[0];
+    const y = c & 2 ? box.max[1] : box.min[1];
+    const z = c & 4 ? box.max[2] : box.min[2];
+    const u = metric;
+    const tx = u ? u[0] * x + u[1] * y + u[2] * z : x;
+    const ty = u ? u[3] * y + u[4] * z : y;
+    const tz = u ? u[5] * z : z;
+    out = Math.max(out, Math.abs(tx), Math.abs(ty), Math.abs(tz));
+  }
+  return out;
 }
 
 /**
@@ -434,7 +460,10 @@ export function scatterParticles(input: ScatterInput): ScatterResult {
   const errors: string[] = [];
   const key = streamKey(s.seed, 0x5ca77e5);
   const out = new SampleBuilder();
-  const filter = s.min_distance > 0 ? new MinDistanceFilter(s.min_distance, input.metric) : null;
+  const filter =
+    s.min_distance > 0
+      ? new MinDistanceFilter(s.min_distance, input.metric, metricExtent(mesh, input.metric))
+      : null;
   const target = s.distribution === 'GRID' ? MAX_INSTANCES : Math.min(MAX_INSTANCES, Math.max(0, s.count));
   let tris: SurfaceTriangles | null;
   const nv = Math.floor(mesh.positions.length / 3);

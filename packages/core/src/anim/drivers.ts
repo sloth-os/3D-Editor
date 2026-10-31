@@ -49,8 +49,13 @@ export class DriverError extends Error {
 }
 
 /** Human readable description of the channel a variable reads, e.g. `object 'abc' location[2]`. */
-export function describeDriverVariable(v: Pick<DriverVariable, 'target_type' | 'target_id' | 'path' | 'index'>): string {
-  const target = v.target_type === 'world' || v.target_type === 'scene' ? v.target_type : `${v.target_type} '${v.target_id}'`;
+export function describeDriverVariable(
+  v: Pick<DriverVariable, 'target_type' | 'target_id' | 'path' | 'index'>,
+): string {
+  const target =
+    v.target_type === 'world' || v.target_type === 'scene'
+      ? v.target_type
+      : `${v.target_type} '${v.target_id}'`;
   return `${target} ${v.path}[${v.index}]`;
 }
 
@@ -70,7 +75,8 @@ function compile(expression: unknown): CompiledExpression {
 export function driverProblems(d: Pick<DriverData, 'expression' | 'variables'>): string[] {
   const problems: string[] = [];
   const vars: unknown[] = Array.isArray(d.variables) ? d.variables : [];
-  if (d.variables !== undefined && !Array.isArray(d.variables)) problems.push('Driver variables must be a list');
+  if (d.variables !== undefined && !Array.isArray(d.variables))
+    problems.push('Driver variables must be a list');
   const names = new Set<string>();
   vars.forEach((raw, i) => {
     const v = raw as Partial<DriverVariable> | null;

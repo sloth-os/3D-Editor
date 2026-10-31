@@ -18,6 +18,7 @@ export {
   type UpAxis,
 } from './schemas';
 export { constraintContextFor, constraintObjectInfo, type ConstraintEvalSource } from './context';
+export { ConstraintDependencyGraph, dependencyGraph, type DependencySource } from './depgraph';
 export { ConstraintSolveError, resolveTargetMatrix as constraintTargetMatrix } from './targets';
 export {
   childOfSetInverse,

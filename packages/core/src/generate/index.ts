@@ -29,3 +29,5 @@ export * from './architecture';
 export * from './furniture';
 export * from './mechanical';
 export * from './blob';
+export * from './layout';
+export * from './spatial';

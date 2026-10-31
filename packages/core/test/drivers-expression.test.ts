@@ -213,7 +213,15 @@ describe('expression functions and constants', () => {
 
 describe('expression variables', () => {
   it('reads variables from maps, functions and plain records', () => {
-    expect(evaluateExpression('a * 2 + b', new Map([['a', 3], ['b', 1]]))).toBe(7);
+    expect(
+      evaluateExpression(
+        'a * 2 + b',
+        new Map([
+          ['a', 3],
+          ['b', 1],
+        ]),
+      ),
+    ).toBe(7);
     expect(evaluateExpression('frame / 2', (n) => (n === 'frame' ? 10 : undefined))).toBe(5);
     expect(evaluateExpression('x - y', { x: 5, y: 2 })).toBe(3);
     // a variable may shadow a constant
@@ -315,7 +323,15 @@ describe('expression errors', () => {
 
 describe('expression sandbox', () => {
   it('cannot reach object prototypes or globals', () => {
-    for (const src of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', 'globalThis', 'process', 'Math'])
+    for (const src of [
+      'constructor',
+      'toString',
+      'valueOf',
+      'hasOwnProperty',
+      'globalThis',
+      'process',
+      'Math',
+    ])
       expect(errorOf(() => ev(src, {})).message).toMatch(/Unknown name/);
     for (const src of ['toString(1)', 'constructor(1)', 'eval(1)', 'Function(1)', 'require(1)'])
       expect(errorOf(() => compileExpression(src)).message).toMatch(/Unknown function/);

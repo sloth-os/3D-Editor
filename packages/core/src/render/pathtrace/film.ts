@@ -151,7 +151,7 @@ export class PathFilm {
         const nx = this.normal[i * 3];
         const ny = this.normal[i * 3 + 1];
         const nz = this.normal[i * 3 + 2];
-        const nl = Math.hypot(nx, ny, nz);
+        const nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
         if (nl > 1e-6) {
           normal[i * 3] = nx / nl;
           normal[i * 3 + 1] = ny / nl;

@@ -230,6 +230,50 @@ describe('path tracer: Blender light units', () => {
     expect(Math.abs(mean(img, 8, 2, 2, 6, 6)[0] - expected) / expected).toBeLessThan(0.02);
   }, 20_000);
 
+  it('a half-transparent veil in front of an area light or emitter halves the light (MIS through alpha)', () => {
+    // BSDF-sampled rays pass the veil stochastically; their MIS weights must use the full distance
+    // from the shading point to the light, not the distance from the veil
+    for (const emitter of [false, true]) {
+      const build = (veil: boolean) => {
+        const doc = floorScene();
+        // camera between the floor and the veil
+        topCamera(doc, 0.05, 0.25);
+        if (emitter) {
+          const panel = doc.addMaterial({
+            base_color: [0, 0, 0, 1],
+            emission_color: [1, 1, 1],
+            emission_strength: 40 / (Math.PI * 4),
+          });
+          doc.addObject({
+            type: 'MESH',
+            name: 'Panel',
+            data: doc.addMesh('Panel', createPlane({ size: 2 })),
+            location: [0, 0, 1],
+            material_slots: [panel],
+          });
+        } else
+          doc.addObject({
+            type: 'LIGHT',
+            name: 'Box',
+            data: doc.addLight({ type: 'AREA', energy: 40, size: 2, shape: 'SQUARE' }),
+            location: [0, 0, 1],
+          });
+        if (veil)
+          doc.addObject({
+            type: 'MESH',
+            name: 'Veil',
+            data: doc.addMesh('Veil', createPlane({ size: 6 })),
+            location: [0, 0, 0.9],
+            material_slots: [doc.addMaterial({ base_color: [1, 1, 1, 0.5], blend_method: 'BLEND' })],
+          });
+        const { img } = traceLinear(doc, { width: 8, height: 8, samples: 512, maxBounces: 0 });
+        return mean(img, 8, 2, 2, 6, 6)[0];
+      };
+      const ratio = build(true) / build(false);
+      expect(Math.abs(ratio - 0.5), emitter ? 'emissive panel' : 'area light').toBeLessThan(0.015);
+    }
+  }, 30_000);
+
   it('is linear in the lights: several lights render as the sum of each one alone (selection + MIS)', () => {
     const build = (which: string[]) => {
       const doc = floorScene(0.8, 3);

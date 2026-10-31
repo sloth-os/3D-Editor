@@ -1,9 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import { convexHull } from '../src/physics/quickhull';
-import { boxMass, capsuleMass, coneMass, cylinderMass, polyhedronMass, sphereMass } from '../src/physics/mass';
 import {
+  boxMass,
+  capsuleMass,
+  coneMass,
+  cylinderMass,
+  polyhedronMass,
+  sphereMass,
+} from '../src/physics/mass';
+import {
+  MIN_HALF_EXTENT,
   boxPolyhedron,
   buildCollisionShape,
+  cuboidFrame,
+  type Polyhedron,
   boundingRadius,
   supportCore,
   supportingFace,
@@ -14,8 +24,27 @@ import { collidePolyhedra, transformPolyhedron } from '../src/physics/sat';
 import { collide, type CollisionPose } from '../src/physics/narrowphase';
 import { TriangleBVH } from '../src/physics/bvh';
 import { clipFeatures, reduceManifold, type ContactCandidate } from '../src/physics/manifold';
-import { decomposeRigid, mat3ToQuat, quatToMat3, slerpQ, type Mat3 } from '../src/physics/vmath';
-import { createCone, createCube, createCylinder, createGrid, createIcoSphere, createPlane, createUVSphere } from '../src/mesh/primitives';
+import {
+  decomposeRigid,
+  mat3ToQuat,
+  mulMat3,
+  mulMat3TVec,
+  mulMat3Vec,
+  quatToMat3,
+  slerpQ,
+  transpose3,
+  type Mat3,
+} from '../src/physics/vmath';
+import { closestPointOnTriangle, collideBoxes, collideSphereBox } from '../src/physics/boxes';
+import {
+  createCone,
+  createCube,
+  createCylinder,
+  createGrid,
+  createIcoSphere,
+  createPlane,
+  createUVSphere,
+} from '../src/mesh/primitives';
 import { createMesh } from '../src/mesh/types';
 import { compose4 } from '../src/math/mat4';
 import { quatFromEuler } from '../src/math/quat';
@@ -34,7 +63,11 @@ function pose(shape: Shape, p: Vec3 = [0, 0, 0], euler: Vec3 = [0, 0, 0]): Colli
   };
 }
 
-function shapeOf(type: Parameters<typeof buildCollisionShape>[0], mesh = createCube({ size: 2 }), dynamic = true): Shape {
+function shapeOf(
+  type: Parameters<typeof buildCollisionShape>[0],
+  mesh = createCube({ size: 2 }),
+  dynamic = true,
+): Shape {
   const b = buildCollisionShape(type, mesh, [1, 1, 1], { dynamic });
   if ('error' in b) throw new Error(b.error);
   return b.shape;
@@ -57,7 +90,9 @@ describe('convex hull (quickhull)', () => {
     h.normals.forEach((n, i) => {
       // every vertex is on or behind every face plane
       for (let v = 0; v < 8; v++)
-        expect(n[0] * h.points[v * 3] + n[1] * h.points[v * 3 + 1] + n[2] * h.points[v * 3 + 2] - h.offsets[i]).toBeLessThan(1e-9);
+        expect(
+          n[0] * h.points[v * 3] + n[1] * h.points[v * 3 + 1] + n[2] * h.points[v * 3 + 2] - h.offsets[i],
+        ).toBeLessThan(1e-9);
       expect(Math.abs(n[0]) + Math.abs(n[1]) + Math.abs(n[2])).toBeCloseTo(1, 9);
     });
   });
@@ -116,9 +151,14 @@ describe('mass properties', () => {
   });
 
   it('approximates sphere, cylinder and cone hulls of fine meshes', () => {
-    const sph = buildCollisionShape('CONVEX_HULL', createIcoSphere({ subdivisions: 3, radius: 1 }), [1, 1, 1], {
-      dynamic: true,
-    });
+    const sph = buildCollisionShape(
+      'CONVEX_HULL',
+      createIcoSphere({ subdivisions: 3, radius: 1 }),
+      [1, 1, 1],
+      {
+        dynamic: true,
+      },
+    );
     if ('error' in sph) throw new Error();
     expect(sph.inertia[0]).toBeCloseTo(sphereMass(1).inertia[0], 1);
     const cyl = cylinderMass(1, 1);
@@ -134,9 +174,14 @@ describe('mass properties', () => {
   });
 
   it('puts the centre of mass of CONE shapes a quarter height above the base', () => {
-    const b = buildCollisionShape('CONE', createCone({ vertices: 32, radius1: 1, radius2: 0, depth: 2 }), [1, 1, 1], {
-      dynamic: true,
-    });
+    const b = buildCollisionShape(
+      'CONE',
+      createCone({ vertices: 32, radius1: 1, radius2: 0, depth: 2 }),
+      [1, 1, 1],
+      {
+        dynamic: true,
+      },
+    );
     if ('error' in b) throw new Error(b.error);
     expect(b.com[2]).toBeCloseTo(-0.5, 6);
     expect(b.shape.kind).toBe('cone');
@@ -183,9 +228,14 @@ describe('collision shapes from meshes (Blender sizing rules)', () => {
   });
 
   it('marks internal flat edges of a tessellated plane inactive and boundary edges active', () => {
-    const s = buildCollisionShape('MESH', createGrid({ x_subdivisions: 3, y_subdivisions: 3, size: 3 }), [1, 1, 1], {
-      dynamic: false,
-    });
+    const s = buildCollisionShape(
+      'MESH',
+      createGrid({ x_subdivisions: 3, y_subdivisions: 3, size: 3 }),
+      [1, 1, 1],
+      {
+        dynamic: false,
+      },
+    );
     if ('error' in s || s.shape.kind !== 'mesh') throw new Error();
     const m = s.shape.mesh;
     let activeCount = 0;
@@ -206,18 +256,34 @@ describe('collision shapes from meshes (Blender sizing rules)', () => {
 
   it('rejects meshes without usable vertices', () => {
     expect(buildCollisionShape('BOX', createMesh(), [1, 1, 1], { dynamic: true })).toHaveProperty('error');
-    expect(buildCollisionShape('BOX', createMesh({ positions: [NaN, 1, 2] }), [1, 1, 1], { dynamic: true })).toHaveProperty(
-      'error',
-    );
+    expect(
+      buildCollisionShape('BOX', createMesh({ positions: [NaN, 1, 2] }), [1, 1, 1], { dynamic: true }),
+    ).toHaveProperty('error');
   });
 
   it('keeps flat meshes collidable with a minimal thickness', () => {
     const b = buildCollisionShape('BOX', createPlane({ size: 2 }), [1, 1, 1], { dynamic: true });
-    if ('error' in b) throw new Error(b.error);
+    if ('error' in b || b.shape.kind !== 'poly') throw new Error();
     expect(b.inertia.every(Number.isFinite)).toBe(true);
+    expect(b.shape.box!.half).toEqual([1, 1, MIN_HALF_EXTENT]);
+    // a flat hull becomes a thin solid slab (a cuboid for a square plane)
     const h = buildCollisionShape('CONVEX_HULL', createPlane({ size: 2 }), [1, 1, 1], { dynamic: true });
     if ('error' in h || h.shape.kind !== 'poly') throw new Error();
-    expect(h.shape.poly.flat).toBe(true);
+    expect(h.shape.poly.flat).toBe(false);
+    expect(Math.min(...h.shape.box!.half)).toBeCloseTo(MIN_HALF_EXTENT, 12);
+    expect(Math.max(...h.shape.box!.half)).toBeCloseTo(1, 12);
+    expect(h.inertia.every(Number.isFinite)).toBe(true);
+    const tri = buildCollisionShape(
+      'CONVEX_HULL',
+      createMesh({ positions: [0, 0, 0, 1, 0, 0, 0, 1, 0], faces: [[0, 1, 2]] }),
+      [1, 1, 1],
+      {
+        dynamic: true,
+      },
+    );
+    if ('error' in tri || tri.shape.kind !== 'poly') throw new Error();
+    expect(tri.shape.poly.verts.length / 3).toBe(6);
+    expect(tri.volume).toBeCloseTo(0.5 * 2 * MIN_HALF_EXTENT, 12);
   });
 });
 
@@ -256,7 +322,11 @@ describe('GJK / EPA', () => {
     const e = epa(a, b, g.simplex)!;
     expect(e.depth).toBeCloseTo(0.2, 6);
     expect(e.normal[0]).toBeCloseTo(1, 6);
-    const s = epa(sphereSup([0, 0, 0], 1), sphereSup([0, 0, 1.5], 1), gjk(sphereSup([0, 0, 0], 1), sphereSup([0, 0, 1.5], 1), [0, 0, 1]).simplex)!;
+    const s = epa(
+      sphereSup([0, 0, 0], 1),
+      sphereSup([0, 0, 1.5], 1),
+      gjk(sphereSup([0, 0, 0], 1), sphereSup([0, 0, 1.5], 1), [0, 0, 1]).simplex,
+    )!;
     expect(s.depth).toBeCloseTo(0.5, 2);
     expect(s.normal[2]).toBeCloseTo(1, 2);
   });
@@ -354,9 +424,14 @@ describe('narrow phase', () => {
   });
 
   it('collides convex shapes with triangle meshes without ghost normals at internal edges', () => {
-    const grid = buildCollisionShape('MESH', createGrid({ x_subdivisions: 4, y_subdivisions: 4, size: 8 }), [1, 1, 1], {
-      dynamic: false,
-    });
+    const grid = buildCollisionShape(
+      'MESH',
+      createGrid({ x_subdivisions: 4, y_subdivisions: 4, size: 8 }),
+      [1, 1, 1],
+      {
+        dynamic: false,
+      },
+    );
     if ('error' in grid) throw new Error(grid.error);
     const floor = pose(grid.shape);
     // a box centred over internal edges and vertices of the tessellated floor
@@ -377,12 +452,172 @@ describe('narrow phase', () => {
   });
 });
 
+describe('closed-form box and sphere tests', () => {
+  const I: Mat3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const rotZ = (a: number): Mat3 => [Math.cos(a), -Math.sin(a), 0, Math.sin(a), Math.cos(a), 0, 0, 0, 1];
+
+  it('gives face manifolds for stacked boxes and rejects separated ones', () => {
+    const out: ContactCandidate[] = [];
+    // B (rotated 30° about Z) rests on A, penetrating 0.01
+    expect(collideBoxes([1, 1, 0.5], [0.5, 0.5, 0.5], rotZ(Math.PI / 6), [0.1, 0, 0.99], 0.05, out)).toBe(
+      true,
+    );
+    expect(out.length).toBe(4);
+    for (const c of out) {
+      expect(c.n).toEqual([0, 0, 1]);
+      expect(c.s).toBeCloseTo(-0.01, 12);
+      expect(c.pa[2]).toBeCloseTo(0.5, 12);
+    }
+    out.length = 0;
+    expect(collideBoxes([1, 1, 0.5], [0.5, 0.5, 0.5], I, [0, 0, 1.06], 0.05, out)).toBe(false);
+    expect(collideBoxes([1, 1, 0.5], [0.5, 0.5, 0.5], I, [0, 0, 1.04], 0.05, out)).toBe(true);
+    expect(out.every((c) => Math.abs(c.s - 0.04) < 1e-12)).toBe(true);
+  });
+
+  it('gives one edge-edge contact for crossed edges', () => {
+    // two unit cubes turned 45° about crossing horizontal axes touch edge on edge
+    const c = Math.SQRT1_2;
+    const rx: Mat3 = [1, 0, 0, 0, c, -c, 0, c, c];
+    const out: ContactCandidate[] = [];
+    // A rotated so an edge points up: express B relative to A (A edge along Y at x=0,z=√2/2·2)
+    const rA: Mat3 = [c, 0, -c, 0, 1, 0, c, 0, c]; // A's frame rotated -45° about Y (edge up along Y)
+    const rB = mulMat3(transpose3(rA), rx); // B rotated 45° about X (edge down along X)
+    const d = Math.SQRT2 * 0.5 * 2 - 0.01; // centres closer than the two half diagonals
+    const tB = mulMat3TVec(rA, [0, 0, d]);
+    expect(collideBoxes([0.5, 0.5, 0.5], [0.5, 0.5, 0.5], rB, tB, 0.05, out)).toBe(true);
+    expect(out.length).toBe(1);
+    expect(out[0].s).toBeCloseTo(-0.01, 9);
+    const nWorld = mulMat3Vec(rA, out[0].n);
+    expect(nWorld[2]).toBeCloseTo(1, 9);
+  });
+
+  it('matches the general SAT on random box pairs', () => {
+    let seed = 3;
+    const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1;
+    const boxA = shapeOf('BOX', createCube({ size: 2 }));
+    for (let k = 0; k < 40; k++) {
+      const hb: Vec3 = [0.3 + Math.abs(rnd()), 0.3 + Math.abs(rnd()), 0.3 + Math.abs(rnd())];
+      const q = quatFromEuler([rnd() * 3, rnd() * 3, rnd() * 3]);
+      const r = quatToMat3(q);
+      const t: Vec3 = [rnd() * 1.5, rnd() * 1.5, 1 + Math.abs(rnd()) * 1.2];
+      const special: ContactCandidate[] = [];
+      const hit = collideBoxes([1, 1, 1], hb, r, t, 0.05, special);
+      const general: ContactCandidate[] = [];
+      const pb = transformPolyhedron(boxPolyhedron(hb), r, t);
+      const hit2 = collidePolyhedra((boxA as { kind: 'poly'; poly: Polyhedron }).poly, pb, 0.05, general);
+      expect(hit).toBe(hit2);
+      if (!hit) continue;
+      const deepest = (cs: ContactCandidate[]) => Math.min(...cs.map((c) => c.s));
+      expect(deepest(special)).toBeCloseTo(deepest(general), 6);
+      expect(
+        special[0].n[0] * general[0].n[0] +
+          special[0].n[1] * general[0].n[1] +
+          special[0].n[2] * general[0].n[2],
+      ).toBeGreaterThan(0.999);
+    }
+  });
+
+  it('collides spheres with boxes inside and outside', () => {
+    const out: ContactCandidate[] = [];
+    expect(collideSphereBox([0, 0, 1.3], 0.5, [1, 1, 1], 0.05, out)).toBe(true);
+    expect(out[0]).toMatchObject({ n: [0, 0, 1] });
+    expect(out[0].s).toBeCloseTo(-0.2, 12);
+    out.length = 0;
+    // corner region: normal along the diagonal
+    collideSphereBox([1.2, 1.2, 1.2], 0.5, [1, 1, 1], 0.05, out);
+    expect(out[0].s).toBeCloseTo(Math.sqrt(3) * 0.2 - 0.5, 12);
+    expect(out[0].n[0]).toBeCloseTo(1 / Math.sqrt(3), 12);
+    out.length = 0;
+    // centre inside: pushed out through the nearest face
+    collideSphereBox([0.9, 0, 0.2], 0.5, [1, 1, 1], 0.05, out);
+    expect(out[0].n).toEqual([1, 0, 0]);
+    expect(out[0].s).toBeCloseTo(-0.6, 12);
+    expect(collideSphereBox([0, 0, 2], 0.5, [1, 1, 1], 0.05, out)).toBe(false);
+  });
+
+  it('finds closest points on triangles in every Voronoi region', () => {
+    const a: Vec3 = [0, 0, 0];
+    const b: Vec3 = [2, 0, 0];
+    const c: Vec3 = [0, 2, 0];
+    expect(closestPointOnTriangle([0.5, 0.5, 3], a, b, c)).toEqual([0.5, 0.5, 0]);
+    expect(closestPointOnTriangle([-1, -1, 0], a, b, c)).toEqual([0, 0, 0]);
+    expect(closestPointOnTriangle([3, -1, 1], a, b, c)).toEqual([2, 0, 0]);
+    expect(closestPointOnTriangle([1, -2, 0], a, b, c)).toEqual([1, 0, 0]);
+    const q = closestPointOnTriangle([2, 2, 0], a, b, c);
+    expect(q[0]).toBeCloseTo(1, 12);
+    expect(q[1]).toBeCloseTo(1, 12);
+  });
+
+  it('detects cuboid hulls, also rotated in object space', () => {
+    const cube = buildCollisionShape('CONVEX_HULL', createCube({ size: 2 }), [1, 2, 3], { dynamic: true });
+    if ('error' in cube || cube.shape.kind !== 'poly') throw new Error();
+    expect([...cube.shape.box!.half].sort()).toEqual([1, 2, 3]);
+    expect(cube.shape.box!.aligned).toBe(true);
+    const turned = createCube({ size: 2 });
+    for (let i = 0; i < turned.positions.length; i += 3) {
+      const [x, y] = [turned.positions[i], turned.positions[i + 1]];
+      turned.positions[i] = x * Math.cos(0.3) - y * Math.sin(0.3);
+      turned.positions[i + 1] = x * Math.sin(0.3) + y * Math.cos(0.3);
+    }
+    const t = buildCollisionShape('CONVEX_HULL', turned, [1, 1, 1], { dynamic: true });
+    if ('error' in t || t.shape.kind !== 'poly') throw new Error();
+    expect(t.shape.box!.aligned).toBe(false);
+    expect(t.shape.box!.half.map((h) => +h.toFixed(9))).toEqual([1, 1, 1]);
+    // a box on the ground through the oriented path agrees with the aligned one
+    const ground = pose(shapeOf('BOX', createCube({ size: 2 })), [0, 0, -1]);
+    const out: ContactCandidate[] = [];
+    collide(ground, pose(t.shape, [0, 0, 0.99], [0, 0, -0.3]), 0.05, out);
+    expect(out.length).toBe(4);
+    for (const c of out) expect(c.s).toBeCloseTo(-0.01, 9);
+    expect(cuboidFrame(boxPolyhedron([1, 1, 1]))!.aligned).toBe(true);
+    const ico = shapeOf('CONVEX_HULL', createIcoSphere({ subdivisions: 1 }));
+    expect((ico as { box?: unknown }).box).toBeUndefined();
+  });
+
+  it('never reports contacts between features far apart on large triangles (internal edges)', () => {
+    const plane = buildCollisionShape('MESH', createPlane({ size: 40 }), [1, 1, 1], { dynamic: false });
+    const domino = buildCollisionShape('BOX', createCube({ size: 1 }), [0.1, 0.5, 1], { dynamic: true });
+    if ('error' in plane || 'error' in domino) throw new Error();
+    for (const [p, e] of [
+      [
+        [1.5, 0.1, 0.12],
+        [0.3, 1.4, 0.3],
+      ],
+      [
+        [1, 0.05, 0.05],
+        [0.02, 1.5708, 0.01],
+      ],
+      [
+        [-3, 2.9, 0.2],
+        [1.2, 0.4, -0.7],
+      ],
+    ] as [Vec3, Vec3][]) {
+      const out: ContactCandidate[] = [];
+      collide(pose(plane.shape), pose(domino.shape, p, e), 0.04, out);
+      expect(out.length).toBeGreaterThan(0);
+      for (const c of out) {
+        expect(c.n[2]).toBeCloseTo(1, 6);
+        // the two witness points are the contact's own features: |pb − pa| = |separation|
+        expect(Math.hypot(c.pb[0] - c.pa[0], c.pb[1] - c.pa[1], c.pb[2] - c.pa[2])).toBeCloseTo(
+          Math.abs(c.s),
+          6,
+        );
+      }
+    }
+  });
+});
+
 describe('manifold helpers and math', () => {
   it('reduces large manifolds to the 4 most useful points', () => {
     const c: ContactCandidate[] = [];
     for (let i = 0; i < 12; i++) {
       const a = (i / 12) * Math.PI * 2;
-      c.push({ pa: [Math.cos(a), Math.sin(a), 0], pb: [Math.cos(a), Math.sin(a), -0.01], n: [0, 0, 1], s: i === 3 ? -0.02 : -0.01 });
+      c.push({
+        pa: [Math.cos(a), Math.sin(a), 0],
+        pb: [Math.cos(a), Math.sin(a), -0.01],
+        n: [0, 0, 1],
+        s: i === 3 ? -0.02 : -0.01,
+      });
     }
     const r = reduceManifold(c);
     expect(r.length).toBe(4);
@@ -391,7 +626,13 @@ describe('manifold helpers and math', () => {
 
   it('clips a polygon against a reference face', () => {
     const out: ContactCandidate[] = [];
-    clipFeatures([-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0], [0.5, 0.5, -0.01, 1.5, 0.5, -0.01, 1.5, 1.5, -0.01, 0.5, 1.5, -0.01], [0, 0, 1], 0.05, out);
+    clipFeatures(
+      [-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0],
+      [0.5, 0.5, -0.01, 1.5, 0.5, -0.01, 1.5, 1.5, -0.01, 0.5, 1.5, -0.01],
+      [0, 0, 1],
+      0.05,
+      out,
+    );
     expect(out.length).toBe(4);
     for (const c of out) {
       expect(Math.max(Math.abs(c.pa[0]), Math.abs(c.pa[1]))).toBeLessThanOrEqual(1 + 1e-12);

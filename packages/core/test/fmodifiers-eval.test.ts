@@ -28,7 +28,11 @@ function linearCurve(mods: FModifierData[], extrapolation: FCurve['extrapolation
 
 /** A curve holding `value` at every frame. */
 function constantCurve(value: number, mods: FModifierData[]): FCurve {
-  const fc = insertKeyframe(createFCurve({ target_type: 'object', target_id: 'x', path: 'location', index: 0 }), 1, value);
+  const fc = insertKeyframe(
+    createFCurve({ target_type: 'object', target_id: 'x', path: 'location', index: 0 }),
+    1,
+    value,
+  );
   return { ...fc, modifiers: mods };
 }
 
@@ -40,12 +44,24 @@ const SHIFT = [0.3183098861837907, 0.5772156649015329, 0.7236067977499789];
 /** Reference NOISE value n in [0, 1] following the documented formula. */
 function refNoise(
   t: number,
-  o: { scale?: number; phase?: number; offset?: number; depth?: number; lacunarity?: number; roughness?: number } = {},
+  o: {
+    scale?: number;
+    phase?: number;
+    offset?: number;
+    depth?: number;
+    lacunarity?: number;
+    roughness?: number;
+  } = {},
 ): number {
   const { scale = 1, phase = 1, offset = 0, depth = 0, lacunarity = 2, roughness = 0.5 } = o;
   const layer = (size: number) =>
     0.5 +
-    0.5 * gradientNoise3((1 + t - offset) / size + SHIFT[0], (1 + phase) / size + SHIFT[1], 1.1 / size + SHIFT[2]);
+    0.5 *
+      gradientNoise3(
+        (1 + t - offset) / size + SHIFT[0],
+        (1 + phase) / size + SHIFT[1],
+        1.1 / size + SHIFT[2],
+      );
   let sum = layer(scale);
   let w = 1;
   let total = 1;
@@ -63,7 +79,9 @@ describe('GENERATOR', () => {
   it('replaces the curve by a polynomial of the frame', () => {
     expect(at(constantCurve(5, [mod('GENERATOR')]), 7)).toBe(7);
     expect(at(constantCurve(5, [mod('GENERATOR', { coefficients: [1, 2, 3] })]), 2)).toBe(17);
-    expect(at(constantCurve(5, [mod('GENERATOR', { coefficients: [0, 0.5], use_additive: true })]), 4)).toBe(7);
+    expect(at(constantCurve(5, [mod('GENERATOR', { coefficients: [0, 0.5], use_additive: true })]), 4)).toBe(
+      7,
+    );
     // factorised: (2t + 1)(1t - 3) at t = 5 → 11 * 2
     const f = mod('GENERATOR', { mode: 'POLYNOMIAL_FACTORISED', coefficients: [2, 1, 1, -3] });
     expect(at(constantCurve(0, [f]), 5)).toBe(22);
@@ -81,8 +99,14 @@ describe('GENERATOR', () => {
     expect(p({ coefficients: [4] }).coefficients).toEqual([4, 0]);
     // updating the order resizes the stored coefficients; new coefficients re-derive the order
     const base = p({ coefficients: [1, 2, 3] }) as unknown as Record<string, unknown>;
-    expect((normalizeFModifierParams('GENERATOR', { poly_order: 1 }, base) as { coefficients: number[] }).coefficients).toEqual([1, 2]);
-    expect((normalizeFModifierParams('GENERATOR', { coefficients: [7] }, base) as { poly_order: number }).poly_order).toBe(1);
+    expect(
+      (normalizeFModifierParams('GENERATOR', { poly_order: 1 }, base) as { coefficients: number[] })
+        .coefficients,
+    ).toEqual([1, 2]);
+    expect(
+      (normalizeFModifierParams('GENERATOR', { coefficients: [7] }, base) as { poly_order: number })
+        .poly_order,
+    ).toBe(1);
   });
 });
 
@@ -91,7 +115,10 @@ describe('NOISE', () => {
     const t = 13;
     const n = refNoise(t);
     expect(at(constantCurve(5, [mod('NOISE', { strength: 2 })]), t)).toBeCloseTo(5 + (n - 0.5) * 2, 12);
-    expect(at(constantCurve(5, [mod('NOISE', { strength: 2, blend_type: 'ADD' })]), t)).toBeCloseTo(5 + n * 2, 12);
+    expect(at(constantCurve(5, [mod('NOISE', { strength: 2, blend_type: 'ADD' })]), t)).toBeCloseTo(
+      5 + n * 2,
+      12,
+    );
     expect(at(constantCurve(5, [mod('NOISE', { strength: 2, blend_type: 'SUBTRACT' })]), t)).toBeCloseTo(
       5 - n * 2,
       12,
@@ -108,7 +135,10 @@ describe('NOISE', () => {
       0.5 + 0.5 * gradientNoise3((1 + t) / size + SHIFT[0], 2 / size + SHIFT[1], 1.1 / size + SHIFT[2]);
     // depth 1, defaults: (n(scale) + 0.5 n(scale / 2)) / 1.5
     const d1 = (layer(4) + 0.5 * layer(2)) / 1.5;
-    expect(at(constantCurve(0, [mod('NOISE', { scale: 4, depth: 1, blend_type: 'ADD' })]), t)).toBeCloseTo(d1, 12);
+    expect(at(constantCurve(0, [mod('NOISE', { scale: 4, depth: 1, blend_type: 'ADD' })]), t)).toBeCloseTo(
+      d1,
+      12,
+    );
     // depth 2, lacunarity 3, roughness 0.25: (n(s) + 0.25 n(s/3) + 0.0625 n(s/9)) / 1.3125
     const d2 = (layer(9) + 0.25 * layer(3) + 0.0625 * layer(1)) / 1.3125;
     const m = mod('NOISE', { scale: 9, depth: 2, lacunarity: 3, roughness: 0.25, blend_type: 'ADD' });
@@ -164,7 +194,8 @@ describe('STEPPED', () => {
   });
 
   it('honours the start/end frames and influence', () => {
-    const s = (params: Record<string, unknown>) => linearCurve([mod('STEPPED', { frame_step: 4, ...params })]);
+    const s = (params: Record<string, unknown>) =>
+      linearCurve([mod('STEPPED', { frame_step: 4, ...params })]);
     expect(at(s({ use_frame_start: true, frame_start: 10 }), 7)).toBe(7);
     expect(at(s({ use_frame_start: true, frame_start: 10 }), 13)).toBe(12);
     expect(at(s({ use_frame_end: true, frame_end: 20 }), 23)).toBe(23);
@@ -190,6 +221,12 @@ describe('STEPPED', () => {
     fc = insertKeyframe(fc, 10, 10, 'LINEAR');
     const cyc: FCurve = { ...fc, extrapolation: 'CYCLIC', modifiers: [mod('STEPPED', { frame_step: 3 })] };
     expect(at(cyc, 14)).toBe(2); // stepped to 12, cycled to 2
+    // value modifiers see the real frame: the keys repeat every 10 frames, the noise does not
+    const noisy: FCurve = { ...fc, extrapolation: 'CYCLIC', modifiers: [mod('NOISE')] };
+    const plain: FCurve = { ...noisy, modifiers: [] };
+    expect(at(plain, 13)).toBe(at(plain, 3));
+    expect(at(noisy, 13) - at(plain, 13)).toBeCloseTo(refNoise(13) - 0.5, 12);
+    expect(at(noisy, 13)).not.toBeCloseTo(at(noisy, 3), 6);
     // without a sampler (plain value API) time modifiers cannot resample: unchanged
     expect(applyFModifiers([mod('STEPPED', { frame_step: 4 })], 7, 7)).toBe(7);
     expect(applyFModifiers([mod('STEPPED', { frame_step: 4 })], 7, 7, (t) => t * 10)).toBe(40);
@@ -206,7 +243,9 @@ describe('LIMITS', () => {
     expect(at(x, 3)).toBe(10);
     expect(at(x, 70)).toBe(50);
     expect(at(x, 25)).toBe(25);
-    const soft = linearCurve([mod('LIMITS', { use_max_y: true, max_y: 50, use_influence: true, influence: 0.5 })]);
+    const soft = linearCurve([
+      mod('LIMITS', { use_max_y: true, max_y: 50, use_influence: true, influence: 0.5 }),
+    ]);
     expect(at(soft, 70)).toBe(60);
     // disabled limits do nothing
     expect(at(linearCurve([mod('LIMITS', { min_y: 20, max_y: 30 })]), 70)).toBe(70);
@@ -215,7 +254,8 @@ describe('LIMITS', () => {
 
 describe('ENVELOPE', () => {
   it('maps the reference band onto interpolated control point bounds', () => {
-    const env = (params: Record<string, unknown>, value = 0.5) => constantCurve(value, [mod('ENVELOPE', params)]);
+    const env = (params: Record<string, unknown>, value = 0.5) =>
+      constantCurve(value, [mod('ENVELOPE', params)]);
     const pts = {
       control_points: [
         { frame: 10, min: 0, max: 0 },
@@ -235,13 +275,32 @@ describe('ENVELOPE', () => {
     const sorted = normalizeFModifierParams('ENVELOPE', pts) as { control_points: { frame: number }[] };
     expect(sorted.control_points.map((p) => p.frame)).toEqual([0, 10]);
   });
+
+  it('gives control points Blender defaults (min -1, max 1: identity for the default band)', () => {
+    const p = normalizeFModifierParams('ENVELOPE', {
+      control_points: [{ frame: 0 }, { frame: 10, min: 0, max: 0 }],
+    }) as { control_points: { frame: number; min: number; max: number }[] };
+    expect(p.control_points).toEqual([
+      { frame: 0, min: -1, max: 1 },
+      { frame: 10, min: 0, max: 0 },
+    ]);
+    const fc = constantCurve(0.5, [{ type: 'ENVELOPE', params: p as never }]);
+    expect(at(fc, 0)).toBe(0.5); // identity at the default point
+    expect(at(fc, 5)).toBe(0.25); // halfway to the flattened point
+    expect(at(fc, 10)).toBe(0);
+    // stored data with a point lacking min/max (written by an older client) evaluates with defaults
+    const stored = { type: 'ENVELOPE', params: { control_points: [{ frame: 0 }, { frame: 'x' }] } };
+    expect(at(constantCurve(0.5, [stored as unknown as FModifierData]), 3)).toBe(0.5);
+  });
 });
 
 describe('influence, mute, restricted range and stacking', () => {
   const ten = { coefficients: [10] };
 
   it('blends by influence and skips muted modifiers', () => {
-    expect(at(constantCurve(0, [mod('GENERATOR', { ...ten, use_influence: true, influence: 0.25 })]), 3)).toBe(2.5);
+    expect(
+      at(constantCurve(0, [mod('GENERATOR', { ...ten, use_influence: true, influence: 0.25 })]), 3),
+    ).toBe(2.5);
     expect(at(constantCurve(0, [mod('GENERATOR', { ...ten, influence: 0.25 })]), 3)).toBe(10);
     expect(at(constantCurve(0, [mod('GENERATOR', ten, true)]), 3)).toBe(0);
   });
@@ -266,6 +325,30 @@ describe('influence, mute, restricted range and stacking', () => {
     expect(at(fc, 25)).toBe(0);
   });
 
+  it('includes both ends of a restricted range without blending (like Blender)', () => {
+    const fc = constantCurve(0, [
+      mod('GENERATOR', { ...ten, use_restricted_range: true, frame_start: 10, frame_end: 20 }),
+    ]);
+    expect(at(fc, 9.999)).toBe(0);
+    expect(at(fc, 10)).toBe(10);
+    expect(at(fc, 20)).toBe(10);
+    expect(at(fc, 20.001)).toBe(0);
+    // time modifiers respect the range too: LIMITS max_x holds the curve only inside 10..20
+    const held = linearCurve([
+      mod('LIMITS', {
+        use_max_x: true,
+        max_x: 12,
+        use_restricted_range: true,
+        frame_start: 10,
+        frame_end: 20,
+      }),
+    ]);
+    expect(at(held, 5)).toBe(5);
+    expect(at(held, 15)).toBe(12);
+    expect(at(held, 20)).toBe(12);
+    expect(at(held, 21)).toBe(21);
+  });
+
   it('evaluates value modifiers in stack order', () => {
     const add = mod('GENERATOR', { coefficients: [1], use_additive: true });
     const clamp = mod('LIMITS', { use_max_y: true, max_y: 5 });
@@ -277,7 +360,10 @@ describe('influence, mute, restricted range and stacking', () => {
 describe('robustness of stored data', () => {
   it('never throws for malformed modifiers and falls back to defaults', () => {
     const defaults = at(constantCurve(0, [mod('NOISE')]), 7.5);
-    const bad = { type: 'NOISE', params: { scale: -1, strength: 'big', bogus: 1 } } as unknown as FModifierData;
+    const bad = {
+      type: 'NOISE',
+      params: { scale: -1, strength: 'big', bogus: 1 },
+    } as unknown as FModifierData;
     expect(at(constantCurve(0, [bad]), 7.5)).toBe(defaults);
     const noParams = { type: 'GENERATOR', params: null } as unknown as FModifierData;
     expect(at(constantCurve(0, [noParams]), 7)).toBe(7);
@@ -291,7 +377,9 @@ describe('robustness of stored data', () => {
     expect(at(constantCurve(3, odd), 7)).toBe(3);
     const cyclic: Record<string, unknown> = { strength: 1 };
     cyclic.self = cyclic;
-    expect(() => at(constantCurve(0, [{ type: 'NOISE', params: cyclic } as unknown as FModifierData]), 2)).not.toThrow();
+    expect(() =>
+      at(constantCurve(0, [{ type: 'NOISE', params: cyclic } as unknown as FModifierData]), 2),
+    ).not.toThrow();
     // a modifier producing a non-finite value is skipped
     expect(at(constantCurve(4, [mod('GENERATOR', { coefficients: [0, 1e308] })]), 100)).toBe(4);
     // partially valid control point lists keep their valid points
@@ -312,11 +400,18 @@ describe('robustness of stored data', () => {
     expect(() => normalizeFModifierParams('NOISE', { depth: 99 })).toThrow(/depth/);
     expect(() => normalizeFModifierParams('STEPPED', { frame_step: -1 })).toThrow(/frame_step/);
     expect(() => normalizeFModifierParams('LIMITS', { influence: 2 })).toThrow(/influence/);
-    expect(() => normalizeFModifierParams('ENVELOPE', { control_points: [{ frame: 1 }] })).toThrow(
+    expect(() => normalizeFModifierParams('ENVELOPE', { control_points: [{ min: 0, max: 1 }] })).toThrow(
+      /control_points\.0\.frame/,
+    );
+    expect(() => normalizeFModifierParams('ENVELOPE', { control_points: [{ frame: 1, mid: 0 }] })).toThrow(
       /control_points/,
     );
-    expect(() => normalizeFModifierParams('STEPPED', { use_restricted_range: true })).toThrow(/unknown parameter/);
-    expect(() => normalizeFModifierParams('CYCLES' as FModifierType, {})).toThrow(/Unknown F-curve modifier type/);
+    expect(() => normalizeFModifierParams('STEPPED', { use_restricted_range: true })).toThrow(
+      /unknown parameter/,
+    );
+    expect(() => normalizeFModifierParams('CYCLES' as FModifierType, {})).toThrow(
+      /Unknown F-curve modifier type/,
+    );
     expect(resolveFModifierType(' noise ')).toBe('NOISE');
     expect(resolveFModifierType('nope')).toBeNull();
   });
@@ -348,7 +443,11 @@ describe('scene evaluation with F-curve modifiers', () => {
     x = insertKeyframe(x, 100, 100, 'LINEAR');
     doc.setFCurve({ ...x, modifiers: [mod('STEPPED', { frame_step: 5 })] });
     doc.setFCurve({
-      ...insertKeyframe(createFCurve({ target_type: 'object', target_id: id, path: 'scale', index: 1 }), 1, 1),
+      ...insertKeyframe(
+        createFCurve({ target_type: 'object', target_id: id, path: 'scale', index: 1 }),
+        1,
+        1,
+      ),
       modifiers: [mod('ENVELOPE', { control_points: [{ frame: 0, min: 0, max: 4 }] })],
     });
     const ev = new SceneEvaluator(doc);
@@ -361,9 +460,11 @@ describe('scene evaluation with F-curve modifiers', () => {
     }
     const copy = SceneDoc.fromSnapshot(JSON.parse(JSON.stringify(doc.toSnapshot())));
     const ev2 = new SceneEvaluator(copy);
-    expect(ev2.evaluate(7).byId.get(id)!.data.location[2]).toBe(ev.evaluate(7).byId.get(id)!.data.location[2]);
-    expect(copy.listFCurves(id).find((f) => f.path === 'scale')!.modifiers![0].params.control_points).toEqual([
-      { frame: 0, min: 0, max: 4 },
-    ]);
+    expect(ev2.evaluate(7).byId.get(id)!.data.location[2]).toBe(
+      ev.evaluate(7).byId.get(id)!.data.location[2],
+    );
+    expect(copy.listFCurves(id).find((f) => f.path === 'scale')!.modifiers![0].params.control_points).toEqual(
+      [{ frame: 0, min: 0, max: 4 }],
+    );
   });
 });

@@ -3,13 +3,14 @@ import type { CurveData, ObjectData } from '../doc/types';
 import type { CurvePath } from '../curve/path';
 import type { ArmaturePose } from '../armature/types';
 import type { ConstraintContext, ConstraintObjectInfo } from './types';
+import { dependencyGraph, type DependencySource } from './depgraph';
 
 /**
  * The parts of a per-frame scene state that constraint evaluation reads. `eval/FrameState`
  * implements it; operators use the same builder on a fresh FrameState so they see exactly what the
  * evaluator sees.
  */
-export interface ConstraintEvalSource {
+export interface ConstraintEvalSource extends DependencySource {
   readonly frame: number;
   /** Animated objects by id. */
   readonly byId: ReadonlyMap<string, ObjectData>;
@@ -40,6 +41,7 @@ export function constraintObjectInfo(src: ConstraintEvalSource, id: string): Con
 /**
  * Builds the context for solving the constraint stack of object `ownerId`. `parentMatrix` defaults
  * to the owner's evaluated parent matrix; pass it when it is already known (during evaluation).
+ * Constraints on dependency cycles are found with the source's dependency graph (`dependencyGraph`).
  */
 export function constraintContextFor(
   src: ConstraintEvalSource,
@@ -55,5 +57,6 @@ export function constraintContextFor(
     getCurvePath: (id) => src.curvePath(id),
     getObjectInfo: (id) => constraintObjectInfo(src, id),
     getArmaturePose: (id) => src.pose(id),
+    dependencyCycle: (c) => dependencyGraph(src).cycle(ownerId, c),
   };
 }

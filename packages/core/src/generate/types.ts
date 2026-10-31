@@ -18,7 +18,12 @@ export interface GeneratorResult {
   materials: GeneratedMaterial[];
 }
 
-const mat = (name: string, rgb: [number, number, number], roughness: number, metallic = 0): GeneratedMaterial => ({
+const mat = (
+  name: string,
+  rgb: [number, number, number],
+  roughness: number,
+  metallic = 0,
+): GeneratedMaterial => ({
   name,
   base_color: [rgb[0], rgb[1], rgb[2], 1],
   roughness,

@@ -13,9 +13,11 @@ import type { ArmatureData, BoneData, ConstraintData, PoseBone } from '../src/do
 import { identity4, invert4, multiply4, rotationFromEuler, translation4 } from '../src/math/mat4';
 import type { Mat4, Vec3 } from '../src/math/types';
 
+/** Pose context of the armature object 'rig' (targets 'rig' + subtarget = bones of this armature). */
 const ctx = (over: Partial<PoseContext> = {}): PoseContext => ({
   frame: 1,
   armatureMatrix: identity4(),
+  armatureId: 'rig',
   getWorldMatrix: () => null,
   ...over,
 });
@@ -424,13 +426,26 @@ describe('IK constraint', () => {
     );
     expect(dist(pose.bones.get('Lower')!.tail, pose.bones.get('Hand_IK')!.head)).toBeLessThan(1e-4);
     expectVec(pose.bones.get('Hand_IK')!.head, [0.5, -1, 1.2]);
-    // without armatureId: detected by matching world matrix + bone name
-    const implicit = computePose(
+    expect(pose.errors).toEqual([]);
+    // without armatureId nothing is guessed: 'rig' is another object, whose bones need getBoneMatrix
+    const other = computePose(
       rig,
       { Lower: poseBone({ constraints: [c] }) },
-      ctx({ armatureMatrix: armMatrix, getWorldMatrix: (id) => (id === 'rig' ? armMatrix.slice() : null) }),
+      ctx({
+        armatureMatrix: armMatrix,
+        armatureId: undefined,
+        getWorldMatrix: (id) => (id === 'rig' ? armMatrix.slice() : null),
+      }),
     );
-    expect(dist(implicit.bones.get('Lower')!.tail, [0.5, -1, 1])).toBeLessThan(1e-4);
+    expect(other.errors!.join()).toMatch(/bone "Hand_IK" of another armature cannot be resolved/);
+    expectVec(other.bones.get('Lower')!.tail, [0, 0, 2]);
+    // a missing bone of this armature
+    const noBone = computePose(
+      rig,
+      { Lower: poseBone({ constraints: [ik({}, { target: 'rig', subtarget: 'Nope' })] }) },
+      ctx({ armatureMatrix: armMatrix }),
+    );
+    expect(noBone.errors).toEqual(['bone "Lower" constraint "IK": IK target bone "Nope" not found']);
     // missing target object
     const missing = computePose(rig, { Lower: poseBone({ constraints: [ik({})] }) }, ctx());
     expect(missing.errors!.join()).toMatch(/IK target not found/);
@@ -455,11 +470,13 @@ describe('IK constraint', () => {
     ]);
     const pose = computePose(
       rig,
-      { Lower: poseBone({ constraints: [ik({}, { target: null, subtarget: 'Child' })] }) },
+      { Lower: poseBone({ constraints: [ik({}, { target: 'rig', subtarget: 'Child' })] }) },
       ctx(),
     );
     expect(pose.errors!.join()).toMatch(/dependency cycle/);
     for (const b of pose.bones.values()) expect(b.matrix.every(Number.isFinite)).toBe(true);
+    // the provisional child is evaluated again once the cycle is left: it follows the solved chain
+    expect(dist(pose.bones.get('Child')!.head, pose.bones.get('Lower')!.tail)).toBeLessThan(1e-9);
   });
 
   it('solves chains that share bones together (poles are ignored there)', () => {
@@ -499,8 +516,17 @@ describe('IK constraint', () => {
       { Lower: poseBone({ constraints: [c] }) },
       ctx({ getWorldMatrix: (id) => (id === 'other' ? other : null) }),
     );
-    expect(pose.errors!.join()).toMatch(/bone "Hand" of another armature is not available/);
-    expect(dist(pose.bones.get('Lower')!.tail, [0, -1, 1])).toBeLessThan(1e-4);
+    // never the other armature's origin: the IK is skipped and the problem reported
+    expect(pose.errors!.join()).toMatch(/bone "Hand" of another armature cannot be resolved/);
+    expectVec(pose.bones.get('Lower')!.tail, [0, 0, 2]);
+    // a bone the other armature does not have
+    const missing = computePose(
+      rig,
+      { Lower: poseBone({ constraints: [c] }) },
+      ctx({ getWorldMatrix: (id) => (id === 'other' ? other : null), getBoneMatrix: () => null }),
+    );
+    expect(missing.errors).toEqual(['bone "Lower" constraint "IK": IK target bone "Hand" not found']);
+    expectVec(missing.bones.get('Lower')!.tail, [0, 0, 2]);
     // with getBoneMatrix the bone itself is used
     const withBones = computePose(
       rig,
@@ -548,7 +574,7 @@ describe('bone constraints', () => {
       rig(),
       {
         Driver: poseBone({ rotation_euler: [0.7, 0, 0] }),
-        Follower: poseBone({ constraints: [constraint('COPY_ROTATION', {}, { subtarget: 'Driver' })] }),
+        Follower: poseBone({ constraints: [constraint('COPY_ROTATION', {}, { target: 'rig', subtarget: 'Driver' })] }),
       },
       ctx(),
     );
@@ -569,7 +595,7 @@ describe('bone constraints', () => {
             constraint(
               'COPY_ROTATION',
               { target_space: 'LOCAL', owner_space: 'LOCAL', use_y: false, use_z: false },
-              { subtarget: 'Driver', influence: 0.5 },
+              { target: 'rig', subtarget: 'Driver', influence: 0.5 },
             ),
           ],
         }),
@@ -629,7 +655,7 @@ describe('bone constraints', () => {
               constraint(
                 'COPY_ROTATION',
                 { mix_mode: mix, target_space: 'LOCAL', owner_space: 'LOCAL', ...extra },
-                { subtarget: 'Driver' },
+                { target: 'rig', subtarget: 'Driver' },
               ),
             ],
           }),

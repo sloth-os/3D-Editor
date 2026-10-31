@@ -7,6 +7,7 @@ import { createEditorState, type OperatorContext } from '../src/operators/contex
 import { OperatorRegistry } from '../src/operators/registry';
 import { registerConstraintOperators } from '../src/operators/constraint';
 import { FrameState } from '../src/eval/frame-state';
+import { SceneEvaluator } from '../src/eval/evaluate';
 import { compose4, decompose4, invert4, lookAt4, multiply4, type Mat4, type Vec3 } from '../src/math';
 import { createFCurve, insertKeyframe } from '../src/anim/fcurve';
 
@@ -130,6 +131,45 @@ describe('object.constraint_add', () => {
     expect(r.ok).toBe(true);
     expect(r.result.errors).toEqual(['No target object set']);
     expect(reports.some((m) => m.startsWith('WARNING') && /No target/.test(m))).toBe(true);
+  });
+
+  it('reports dependency cycles exactly like the scene evaluator (add, update and describe)', () => {
+    const { doc, run, reports } = setup();
+    const a = doc.addObject({ type: 'EMPTY', name: 'A' });
+    const b = doc.addObject({ type: 'EMPTY', name: 'B', location: [5, 0, 0] });
+    const c = doc.addObject({ type: 'EMPTY', name: 'C', location: [0, 5, 0] });
+    const evaluatorErrors = (id: string) =>
+      new SceneEvaluator(doc).evaluate(1, { noPhysics: true }).byId.get(id)!.constraintErrors;
+    expect(run('object.constraint_add', { object: 'A', type: 'COPY_LOCATION', target: 'B' }).result.errors).toEqual(
+      [],
+    );
+    const r = run('object.constraint_add', { object: 'B', type: 'COPY_LOCATION', target: 'A' });
+    const cycleB = "Target 'A' is part of a dependency cycle: B [Copy Location] → A [Copy Location] → B";
+    const cycleA = "Target 'B' is part of a dependency cycle: A [Copy Location] → B [Copy Location] → A";
+    expect(r.result.errors).toEqual([cycleB]);
+    expect(reports).toContain(`WARNING: Copy Location: ${cycleB}`);
+    expect(evaluatorErrors(b).map((e) => e.message)).toEqual([cycleB]);
+    expect(evaluatorErrors(a).map((e) => e.message)).toEqual([cycleA]);
+    // describe agrees with the evaluator for both objects, and shows the (unconstrained) result
+    const da = run('constraint.describe', { object: 'A' }).result;
+    const db = run('constraint.describe', { object: 'B' }).result;
+    expect(da.constraints[0].error).toBe(cycleA);
+    expect(db.constraints[0].error).toBe(cycleB);
+    expect(da.world_location).toEqual([0, 0, 0]);
+    expect(db.world_location).toEqual([5, 0, 0]);
+    // breaking the cycle fixes both; closing a 3-object loop through constraint.update reports it
+    run('constraint.delete', { object: 'B', constraint: 'Copy Location' });
+    run('object.constraint_add', { object: 'B', type: 'COPY_ROTATION', target: 'C' });
+    const u0 = run('object.constraint_add', { object: 'C', type: 'COPY_SCALE' });
+    expect(u0.result.errors).toEqual(['No target object set']);
+    const u = run('constraint.update', { object: 'C', constraint: 'Copy Scale', target: 'A' });
+    expect(u.result.errors).toEqual([
+      "Target 'A' is part of a dependency cycle: C [Copy Scale] → A [Copy Location] → B [Copy Rotation] → C",
+    ]);
+    for (const id of [a, b, c]) {
+      const own = run('constraint.describe', { object: id }).result.constraints.map((x: any) => x.error);
+      expect(own).toEqual(evaluatorErrors(id).map((e) => e.message));
+    }
   });
 
   it('uses the active object by default', () => {
@@ -342,6 +382,91 @@ describe('constraint.update / delete / move / apply', () => {
   });
 });
 
+describe('baking animated objects and parameter ranges', () => {
+  it('applies constraints and visual transforms without breaking rotation curves', () => {
+    const { doc, run, ctx, world } = setup();
+    const at = (id: string, frame: number) => {
+      ctx.state.frame = frame;
+      return world(id);
+    };
+    const wheel = doc.addObject({ type: 'EMPTY', name: 'Wheel' });
+    let spin = createFCurve({ target_type: 'object', target_id: wheel, path: 'rotation_euler', index: 2 });
+    spin = insertKeyframe(spin, 1, 0, 'LINEAR');
+    spin = insertKeyframe(spin, 101, 4 * Math.PI, 'LINEAR'); // two turns
+    doc.setFCurve(spin);
+    const before = [31, 61, 81].map((f) => at(wheel, f));
+    ctx.state.frame = 61; // animated Z rotation 2.4π, stored 0
+    expect(run('object.visual_transform_apply', { objects: ['Wheel'] }).ok).toBe(true);
+    // the euler closest to the animated rotation is used, so the curve is not re-keyed with 0.4π
+    expect(doc.getObject(wheel)!.rotation_euler[2]).toBeCloseTo(2.4 * Math.PI, 9);
+    [31, 61, 81].forEach((f, i) => expectVec(at(wheel, f), before[i]));
+
+    const top = doc.addObject({ type: 'EMPTY', name: 'Top', location: [5, 0, 0] });
+    doc.setFCurve({ ...spin, target_id: top });
+    run('object.constraint_add', {
+      object: 'Top',
+      type: 'LIMIT_LOCATION',
+      params: { use_max_x: true, max_x: 2 },
+    });
+    const topBefore = [31, 81].map((f) => at(top, f));
+    ctx.state.frame = 61;
+    const r = run('constraint.apply', { object: 'Top', constraint: 'Limit Location' });
+    expect(r.ok).toBe(true);
+    expectVec(r.result.location, [2, 0, 0]);
+    expect(r.result.rotation_euler[2]).toBeCloseTo(2.4 * Math.PI, 9);
+    [31, 81].forEach((f, i) => expectVec(at(top, f), topBefore[i]));
+  });
+
+  it('limits offset_factor to 0..1 and clamps stored or animated values outside it', () => {
+    const { doc, run, ctx, world, constraints } = setup();
+    const data = doc.addCurve({
+      name: 'Line',
+      splines: [
+        { ...defaultSpline('POLY'), points: [defaultSplinePoint([0, 0, 0]), defaultSplinePoint([10, 0, 0])] },
+      ],
+    });
+    doc.addObject({ type: 'CURVE', name: 'Line', data });
+    const o = doc.addObject({ type: 'EMPTY', name: 'O' });
+    run('object.constraint_add', {
+      object: 'O',
+      type: 'FOLLOW_PATH',
+      target: 'Line',
+      params: { use_fixed_location: true, offset_factor: 0.25 },
+    });
+    expectVec(loc(world(o)), [2.5, 0, 0]);
+    const bad = run('constraint.update', { object: 'O', constraint: 'Follow Path', params: { offset_factor: 1.5 } });
+    expect(bad.ok).toBe(false);
+    expect(bad.error).toMatch(/offset_factor/);
+    expect(constraints(o)[0].params.offset_factor).toBe(0.25);
+    // a value stored directly (old data, generic property setters) acts as 1: no point past the end
+    const c = constraints(o)[0];
+    doc.updateObject(o, { constraints: [{ ...c, params: { ...c.params, offset_factor: 1.5 } }] });
+    expectVec(loc(world(o)), [10, 0, 0]);
+    // and does not block unrelated changes
+    const ok = run('constraint.update', { object: 'O', constraint: 'Follow Path', params: { use_curve_radius: true } });
+    expect(ok.ok).toBe(true);
+    expect(constraints(o)[0].params.offset_factor).toBe(1);
+    // animated values are clamped as well
+    let fc = createFCurve({
+      target_type: 'object',
+      target_id: o,
+      path: 'constraints["Follow Path"].offset_factor',
+      index: 0,
+    });
+    fc = insertKeyframe(fc, 1, -1, 'LINEAR');
+    fc = insertKeyframe(fc, 11, 2, 'LINEAR');
+    doc.setFCurve(fc);
+    for (const [frame, x] of [
+      [1, 0],
+      [5, 2],
+      [11, 10],
+    ]) {
+      ctx.state.frame = frame;
+      expectVec(loc(world(o)), [x, 0, 0]);
+    }
+  });
+});
+
 describe('Limit Distance operators', () => {
   it('initialises the distance on creation and resets it on demand', () => {
     const { doc, run, world, constraints } = setup();
@@ -425,6 +550,92 @@ describe('Follow Path operators', () => {
     expect(constraints(free)[0].params.use_fixed_location).toBe(true);
     expect(run('constraint.followpath_path_animate', { object: 'O', constraint: 'Nope' }).ok).toBe(false);
   });
+
+  it('keeps looping on closed paths, including two-point Bezier loops', () => {
+    const { doc, run, ctx, world } = setup();
+    const spline = {
+      ...defaultSpline('BEZIER'),
+      use_cyclic_u: true,
+      points: [defaultSplinePoint([-2, 0, 0]), defaultSplinePoint([2, 0, 0])],
+    };
+    const curve = doc.addObject({
+      type: 'CURVE',
+      name: 'Loop',
+      data: doc.addCurve({ name: 'Loop', splines: [spline] }),
+    });
+    const rider = doc.addObject({ type: 'EMPTY', name: 'Rider' });
+    run('object.constraint_add', { object: 'Rider', type: 'FOLLOW_PATH', target: 'Loop' });
+    expect(new FrameState(doc, 1).curvePath(curve)!.path.cyclic).toBe(true);
+    const r = run('constraint.followpath_path_animate', { object: 'Rider', constraint: 'Follow Path' });
+    expect(r.result).toMatchObject({ frame_end: 101, value_end: 100, extrapolation: 'LINEAR' });
+    const at = (frame: number) => {
+      ctx.state.frame = frame;
+      return loc(world(rider));
+    };
+    expectVec(at(51), [2, 0, 0]); // half way round
+    expectVec(at(151), at(51)); // second lap instead of parking at the start
+    expectVec(at(176), at(76));
+    expect(Math.hypot(...at(176).map((v, i) => v - at(1)[i]))).toBeGreaterThan(0.5);
+  });
+
+  it('animates offset_factor when the constraint uses a fixed location', () => {
+    const { doc, run, ctx, world, reports, constraints } = setup();
+    const data = doc.addCurve({
+      name: 'Line',
+      splines: [
+        { ...defaultSpline('POLY'), points: [defaultSplinePoint([0, 0, 0]), defaultSplinePoint([10, 0, 0])] },
+      ],
+    });
+    doc.addObject({ type: 'CURVE', name: 'Line', data });
+    const o = doc.addObject({ type: 'EMPTY', name: 'O' });
+    run('object.constraint_add', {
+      object: 'O',
+      type: 'FOLLOW_PATH',
+      target: 'Line',
+      params: { use_fixed_location: true, offset_factor: 0.25 },
+    });
+    const r = run('constraint.followpath_path_animate', { object: 'O', constraint: 'Follow Path' });
+    expect(r.ok).toBe(true);
+    expect(r.result).toEqual({
+      target_type: 'object',
+      target_id: o,
+      path: 'constraints["Follow Path"].offset_factor',
+      frame_start: 1,
+      frame_end: 101,
+      value_start: 0,
+      value_end: 1,
+      extrapolation: 'CONSTANT',
+    });
+    expect(reports.some((m) => m.startsWith('INFO:') && m.includes('offset_factor'))).toBe(true);
+    // the curve's eval_time (shared by every follower) is left alone
+    expect(doc.getFCurve(`curve:${data}:eval_time:0`)).toBeNull();
+    expect(constraints(o)[0].params.use_fixed_location).toBe(true);
+    const at = (frame: number) => {
+      ctx.state.frame = frame;
+      return loc(world(o));
+    };
+    expectVec(at(1), [0, 0, 0]);
+    expectVec(at(51), [5, 0, 0]);
+    expectVec(at(101), [10, 0, 0]);
+    expectVec(at(300), [10, 0, 0]);
+    // on a closed path the travel repeats
+    addCircle(doc, 'Ring', 2);
+    const p = doc.addObject({ type: 'EMPTY', name: 'P' });
+    run('object.constraint_add', {
+      object: 'P',
+      type: 'FOLLOW_PATH',
+      target: 'Ring',
+      params: { use_fixed_location: true },
+    });
+    const r2 = run('constraint.followpath_path_animate', { object: 'P', constraint: 'Follow Path', length: 40 });
+    expect(r2.result.extrapolation).toBe('CYCLIC');
+    const atP = (frame: number) => {
+      ctx.state.frame = frame;
+      return loc(world(p));
+    };
+    expectVec(atP(11), [0, 2, 0]); // a quarter of the way round
+    expectVec(atP(51), [0, 2, 0]); // second lap
+  });
 });
 
 describe('object.track_set and object.visual_transform_apply', () => {
@@ -458,6 +669,21 @@ describe('object.track_set and object.visual_transform_apply', () => {
     });
     select([goal], goal);
     expect(run('object.track_set').error).toMatch(/No objects to add tracking to/);
+  });
+
+  it('reports dependency cycles of the added AutoTrack constraints', () => {
+    const { doc, run, select, reports } = setup();
+    const parent = doc.addObject({ type: 'EMPTY', name: 'Parent' });
+    doc.addObject({ type: 'EMPTY', name: 'Child', parent, location: [0, 3, 0] });
+    const other = doc.addObject({ type: 'EMPTY', name: 'Other', location: [5, 0, 0] });
+    const child = doc.resolveObject('Child')!.id;
+    select([parent, other, child], child); // the others track the active child
+    const r = run('object.track_set', { type: 'DAMPTRACK' });
+    expect(r.ok).toBe(true);
+    const errors = Object.fromEntries(r.result.constraints.map((c: any) => [c.object, c.errors]));
+    const cycle = "Target 'Child' is part of a dependency cycle: Parent [AutoTrack] → Child [parent] → Parent";
+    expect(errors).toEqual({ [parent]: [cycle], [other]: [] });
+    expect(reports).toContain(`WARNING: Parent AutoTrack: ${cycle}`);
   });
 
   it('copies the visual transform into the object properties', () => {
@@ -576,6 +802,36 @@ describe('read-only constraint info operators', () => {
     expect(run('constraint.type_list', { type: 'IK' }).result.types[0].bone_only).toBe(true);
     expect(run('constraint.type_list', { type: 'nope' }).error).toMatch(/Unknown constraint type/);
     expect(doc.listObjects()).toHaveLength(0);
+  });
+
+  it('tells agents how to aim cameras and lights with Damped Track and Locked Track', () => {
+    const { doc, run, reports, world } = setup();
+    const damped = run('constraint.type_list', { type: 'DAMPED_TRACK' }).result.types[0];
+    expect(damped.description).toMatch(/TRACK_NEGATIVE_Z/);
+    expect(damped.description).not.toMatch(/spotlight/);
+    expect(damped.parameters.properties.track_axis.description).toMatch(/TRACK_NEGATIVE_Z for cameras and lights/);
+    const locked = run('constraint.type_list', { type: 'LOCKED_TRACK' }).result.types[0];
+    expect(locked.description).toMatch(/TRACK_NEGATIVE_Z with lock_axis LOCK_Y/);
+    expect(locked.parameters.properties.track_axis.description).toMatch(/cameras and lights: TRACK_NEGATIVE_Z/);
+    const lamp = doc.addObject({ type: 'LIGHT', name: 'Spot', location: [0, 0, 5] });
+    doc.addObject({ type: 'EMPTY', name: 'Goal', location: [3, 0, 0] });
+    run('object.constraint_add', { object: 'Spot', type: 'DAMPED_TRACK', target: 'Goal' });
+    expect(reports).toContain(
+      'INFO: Damped Track: lights look along their -Z axis but track_axis is TRACK_Y; use params.track_axis = ' +
+        '"TRACK_NEGATIVE_Z" to aim it at the target',
+    );
+    run('constraint.update', { object: 'Spot', constraint: 'Damped Track', params: { track_axis: 'TRACK_NEGATIVE_Z' } });
+    const m = world(lamp);
+    const len = Math.hypot(3, 5);
+    expectVec([-m[8], -m[9], -m[10]], [3 / len, 0, -5 / len]); // the light shines at the goal
+    const n = reports.length;
+    run('object.constraint_add', {
+      object: 'Spot',
+      type: 'LOCKED_TRACK',
+      target: 'Goal',
+      params: { track_axis: 'TRACK_NEGATIVE_Z', lock_axis: 'LOCK_Y' },
+    });
+    expect(reports.slice(n).filter((r) => r.includes('look along'))).toEqual([]);
   });
 
   it('describes a stack with evaluation errors and the evaluated transform', () => {

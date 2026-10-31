@@ -43,7 +43,11 @@ export function cylinderMass(r: number, h: number, center: Readonly<Vec3> = [0, 
 /** Solid cone along Z with base radius r and height H; `com` is its centre of mass (H/4 above the base). */
 export function coneMass(r: number, height: number, com: Readonly<Vec3> = [0, 0, 0]): MassProperties {
   const ixx = (3 / 20) * r * r + (3 / 80) * height * height;
-  return { volume: (Math.PI * r * r * height) / 3, com: [...com] as Vec3, inertia: diag(ixx, ixx, (3 / 10) * r * r) };
+  return {
+    volume: (Math.PI * r * r * height) / 3,
+    com: [...com] as Vec3,
+    inertia: diag(ixx, ixx, (3 / 10) * r * r),
+  };
 }
 
 /** Solid capsule along Z: radius r, cylinder half height h (total height 2h + 2r). */
@@ -64,7 +68,10 @@ export function capsuleMass(r: number, h: number, center: Readonly<Vec3> = [0, 0
  * Mass properties of a closed polyhedron given as polygons (counter-clockwise from outside)
  * indexing flat xyz `points`. Returns null when the volume is (nearly) zero.
  */
-export function polyhedronMass(points: ArrayLike<number>, faces: readonly (readonly number[])[]): MassProperties | null {
+export function polyhedronMass(
+  points: ArrayLike<number>,
+  faces: readonly (readonly number[])[],
+): MassProperties | null {
   const n = points.length / 3;
   if (n < 4 || faces.length < 4) return null;
   // reference point inside the hull improves conditioning

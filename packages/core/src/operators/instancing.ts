@@ -2,10 +2,11 @@ import { z } from 'zod';
 import * as Y from 'yjs';
 import type { Mat4, Vec3 } from '../math/types';
 import { decompose4 } from '../math/mat4';
-import type { CollectionData, ObjectData, ObjectType, ParticleSystemData } from '../doc/types';
+import type { CollectionData, DriverData, ObjectData, ObjectType, ParticleSystemData } from '../doc/types';
 import { ROOT_COLLECTION_ID } from '../doc/types';
 import { defaultObject } from '../doc/defaults';
-import type { SceneDoc } from '../doc/scene-doc';
+import { fcurveKey, type SceneDoc } from '../doc/scene-doc';
+import { parseDataPath, type PathSegment } from '../anim/path';
 import { SceneEvaluator } from '../eval/evaluate';
 import { expandInstances } from '../instancing/expand';
 import {
@@ -19,8 +20,11 @@ import {
   type ParticleSettingsPatch,
 } from '../instancing/settings';
 import {
+  collectionAncestry,
   collectionContainsObject,
   collectionMembers,
+  collectionUsers,
+  particleSourceCycle,
   wouldCreateInstanceCycle,
 } from '../instancing/collections';
 import { invertAffine, mulAffine } from '../instancing/matrix';
@@ -184,7 +188,9 @@ function mergeSettings(
     throw new OperatorError(`Invalid particle settings: ${msg}`, 'INVALID_PARAMS');
   }
   const s = res.data as ParticleSettings;
-  if (s.vertex_group_density && emitter.type === 'MESH' && emitter.data) {
+  // only what the patch sets is checked: a group removed later is reported by the evaluation
+  // ('density ignored') and must not block unrelated changes
+  if (patch?.vertex_group_density && emitter.type === 'MESH' && emitter.data) {
     const groups = ctx.doc.getVertexGroups(emitter.data);
     if (!groups.some((g) => g.name === s.vertex_group_density))
       throw new OperatorError(
@@ -194,16 +200,36 @@ function mergeSettings(
         'NOT_FOUND',
       );
   }
+  const changesSource =
+    !!patch &&
+    (patch.instance_type !== undefined ||
+      patch.instance_object !== undefined ||
+      patch.instance_collection !== undefined);
+  if (changesSource && particleSourceCycle(ctx.doc, emitter.id, s)) {
+    const what =
+      s.instance_type === 'OBJECT'
+        ? `instance_object '${ctx.doc.getObject(s.instance_object ?? '')?.name ?? s.instance_object}'`
+        : `instance_collection '${ctx.doc.getCollection(s.instance_collection ?? '')?.name ?? s.instance_collection}'`;
+    throw new OperatorError(
+      `${what} instances '${emitter.name}' itself (directly or through nested instances); the particle system would recurse`,
+      'INVALID_PARAMS',
+    );
+  }
   return s;
 }
 
 /**
- * Evaluates the scene at the current frame (viewport modifiers) and expands every instance,
- * ignoring display_percentage. `physics` runs the rigid body simulation up to the frame.
+ * Evaluates the scene at the current frame (viewport modifiers) and expands the instances of
+ * `owners` with every particle system shown in the viewport or in renders and all of its particles
+ * (display_percentage ignored). Distributions and placements are shared with the viewport through
+ * the content-validated instancing caches, so unchanged systems are not recomputed. `errors` holds
+ * the instancing problems of the scene evaluation and of the expansion. `physics` runs the rigid
+ * body simulation up to the frame.
  */
 function evaluateInstances(
   ctx: OperatorContext,
   physics: boolean,
+  owners: ReadonlySet<string>,
 ): {
   instances: EvaluatedInstance[];
   errors: { objectId: string; message: string }[];
@@ -218,17 +244,28 @@ function evaluateInstances(
     fullDisplay: true,
     objects: ev.objects,
     byId: ev.byId,
+    owners,
   });
-  return { ...res, objects: new Map(ev.objects.map((o) => [o.id, o.worldMatrix])) };
+  const errors = [...res.errors];
+  for (const e of ev.errors)
+    if (e.source.startsWith('instances:'))
+      errors.push({ objectId: e.source.slice('instances:'.length), message: e.message });
+  return { instances: res.instances, errors, objects: new Map(ev.objects.map((o) => [o.id, o.worldMatrix])) };
 }
 
-/** Particle/instance counts and problems of one particle system (all particles, viewport settings). */
+const SYSTEM_PREFIX = "Particle system '";
+
+/**
+ * Particle/instance counts and problems of one particle system (all particles, also when it is only
+ * shown in renders). Problems are the system's own plus those of its emitter (instancing cycles,
+ * nesting depth, the scene-wide instance limit); other systems' problems are left out.
+ */
 function systemReport(
   ctx: OperatorContext,
   emitterId: string,
   sys: ParticleSystemData,
 ): { particles: number; instances: number; errors: string[] } {
-  const { instances, errors } = evaluateInstances(ctx, false);
+  const { instances, errors } = evaluateInstances(ctx, false, new Set([emitterId]));
   const prefix = `${emitterId}:${sys.id}:`;
   const pids = new Set<string>();
   let count = 0;
@@ -239,12 +276,82 @@ function systemReport(
     const cut = rest.indexOf(':');
     pids.add(cut < 0 ? rest : rest.slice(0, cut));
   }
-  const tag = `Particle system '${sys.name}': `;
-  return {
-    particles: pids.size,
-    instances: count,
-    errors: errors.filter((e) => e.objectId === emitterId && e.message.startsWith(tag)).map((e) => e.message),
+  const tag = `${SYSTEM_PREFIX}${sys.name}': `;
+  const messages = new Set<string>();
+  for (const e of errors)
+    if (e.objectId === emitterId && (e.message.startsWith(tag) || !e.message.startsWith(SYSTEM_PREFIX)))
+      messages.add(e.message);
+  return { particles: pids.size, instances: count, errors: [...messages] };
+}
+
+// ------------------------------------------------------------------ animation paths of particle systems
+
+/** Serialises data path segments back into Blender path syntax. */
+function formatPath(segs: readonly PathSegment[]): string {
+  return segs
+    .map((s, i) =>
+      s.kind === 'prop'
+        ? `${i ? '.' : ''}${s.name}`
+        : s.kind === 'index'
+          ? `[${s.index}]`
+          : `["${s.key.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`,
+    )
+    .join('');
+}
+
+/**
+ * Moves (newName) or removes (null) the F-curves and drivers of object `ownerId` that address
+ * particle system `name` (`particle_systems["name"]…`), and retargets driver variables reading it,
+ * so animation follows a renamed system like in Blender.
+ */
+function retargetSystemAnimation(ctx: OperatorContext, ownerId: string, name: string, newName: string | null) {
+  const rename = (path: string): string | null | undefined => {
+    let segs: PathSegment[];
+    try {
+      segs = parseDataPath(path);
+    } catch {
+      return undefined;
+    }
+    const [a, b] = segs;
+    if (a?.kind !== 'prop' || a.name !== 'particle_systems' || b?.kind !== 'key' || b.key !== name)
+      return undefined; // not this system
+    if (newName === null) return null;
+    return formatPath([a, { kind: 'key', key: newName }, ...segs.slice(2)]);
   };
+  const doc = ctx.doc;
+  for (const fc of doc.listFCurves(ownerId)) {
+    if (fc.target_type !== 'object') continue;
+    const next = rename(fc.path);
+    if (next === undefined) continue;
+    doc.removeFCurve(fcurveKey(fc));
+    if (next !== null) doc.setFCurve({ ...fc, path: next });
+  }
+  for (const d of doc.listDrivers()) {
+    let out: DriverData | null = { ...d, variables: (d.variables ?? []).map((v) => ({ ...v })) };
+    let changed = false;
+    if (d.target_type === 'object' && d.target_id === ownerId) {
+      const next = rename(d.path);
+      if (next === null) out = null;
+      else if (next !== undefined) {
+        out.path = next;
+        changed = true;
+      }
+    }
+    if (out && newName !== null)
+      for (const v of out.variables) {
+        if (v.target_type !== 'object' || v.target_id !== ownerId) continue;
+        const next = rename(v.path);
+        if (next) {
+          v.path = next;
+          changed = true;
+        }
+      }
+    if (!out) doc.removeDriver(fcurveKey(d));
+    else if (changed) {
+      doc.removeDriver(fcurveKey(d));
+      doc.setDriver(out);
+    }
+  }
 }
 
 function writeSystems(ctx: OperatorContext, o: ObjectData, systems: ParticleSystemData[]): void {
@@ -300,6 +407,29 @@ function addObjectsBulk(
 
 function hideObject(ctx: OperatorContext, id: string): void {
   ctx.doc.updateObject(id, { hide_viewport: true, hide_render: true });
+}
+
+/** Objects a scatter can instance: geometry (mesh, curve, text) or empties instancing a collection. */
+function isScatterSource(o: ObjectData): boolean {
+  if (EMITTER_TYPES.has(o.type)) return !!o.data;
+  return o.type === 'EMPTY' && o.instance_type === 'COLLECTION' && !!o.instance_collection;
+}
+
+/**
+ * Hidden linked duplicate of `src` in collection `cid`: same object data, materials, modifiers,
+ * constraints, parent and transform (Blender Alt+D), so it instances like the original.
+ */
+function linkedDuplicate(doc: SceneDoc, src: ObjectData, cid: string): string {
+  const { id: _id, ...rest } = cloneJson(src);
+  return doc.addObject({
+    ...rest,
+    collection: cid,
+    hide_viewport: true,
+    hide_render: true,
+    modifiers: (rest.modifiers ?? []).map((m) => ({ ...m, id: newId() })),
+    constraints: (rest.constraints ?? []).map((c) => ({ ...c, id: newId() })),
+    particle_systems: (rest.particle_systems ?? []).map((s) => ({ ...s, id: newId() })),
+  });
 }
 
 // ------------------------------------------------------------------ operators
@@ -392,7 +522,9 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
         '(emit_from FACE), vertices or volume, each instancing `instance_object` (instance_type OBJECT) or objects of ' +
         '`instance_collection` (COLLECTION). Deterministic for a given seed. Settings use Blender names; omitted ' +
         `settings take their defaults (count 1000, JITTERED, particle_size 1, rotation_mode NORMAL). Valid settings: ${settingsList()}. ` +
-        'Returns the system id/name, the number of particles and instances, and any problems (errors).',
+        'Instance objects/collections that would make the emitter instance itself are refused. Returns the system ' +
+        'id/name, the number of particles and instances it generates (all particles, also when it is only shown in ' +
+        'renders) and any problems of the system or its emitter (errors), e.g. the scene-wide instance limit.',
       category: 'Object',
       redoable: true,
       schema: z.object({
@@ -435,8 +567,9 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
       label: 'Update Particle System',
       description:
         'Change a particle system: `settings` is a partial patch (only the given fields change; object/collection ' +
-        'references by id or name), plus optional name, show_viewport and show_render. ' +
-        `Valid settings: ${settingsList()}. Returns the particle and instance counts and any problems (errors).`,
+        'references by id or name), plus optional name (F-curves and drivers of the system follow a rename), ' +
+        `show_viewport and show_render. Valid settings: ${settingsList()}. Returns the particle and instance counts ` +
+        'and any problems of the system or its emitter (errors).',
       category: 'Object',
       redoable: true,
       schema: z.object({
@@ -466,6 +599,7 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
         if (p.show_render !== undefined) next.show_render = p.show_render;
         systems[i] = next;
         writeSystems(ctx, o, systems);
+        if (next.name !== cur.name) retargetSystemAnimation(ctx, o.id, cur.name, next.name);
         return { object: o.id, particle_system: next.id, name: next.name, ...systemReport(ctx, o.id, next) };
       },
     }),
@@ -475,7 +609,9 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.particle_system_remove',
       label: 'Remove Particle System',
-      description: 'Remove a particle system (id or name) from an object. Returns the removed id and name.',
+      description:
+        'Remove a particle system (id or name) from an object, together with the F-curves and drivers that ' +
+        'animate its settings. Returns the removed id and name.',
       category: 'Object',
       schema: z.object({ object: objectRef('Emitter'), particle_system: systemRef }),
       execute(ctx, p) {
@@ -488,6 +624,8 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
           o,
           systems.filter((_, k) => k !== i),
         );
+        if (!systems.some((s, k) => k !== i && s.name === removed.name))
+          retargetSystemAnimation(ctx, o.id, removed.name, null);
         return { object: o.id, removed: removed.id, name: removed.name, remaining: systems.length - 1 };
       },
     }),
@@ -501,9 +639,10 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
         'Turn the instances of the given (default: selected) instancers — collection instance empties and particle ' +
         'emitters — into real objects at the current frame (Blender object.duplicates_make_real). The new objects ' +
         "share their source's object data (linked duplicates), keep its modifiers and materials, are visible and go " +
-        "into the instancer's collection. Afterwards collection instances are switched off (instance_type NONE) and " +
-        `particle systems are hidden (show_viewport/show_render false). At most ${MAX_MAKE_REAL} objects per run; ` +
-        'every particle is used (display_percentage ignored). Returns the new object ids, which become the selection.',
+        "into the instancer's collection. Every particle system shown in the viewport or in renders is made real " +
+        'with all of its particles (display_percentage ignored). Afterwards collection instances are switched off ' +
+        `(instance_type NONE) and those particle systems are hidden (show_viewport/show_render false). At most ` +
+        `${MAX_MAKE_REAL} objects per run. Returns the new object ids, which become the selection.`,
       category: 'Object',
       schema: z.object({
         objects: z
@@ -531,7 +670,7 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
             'POLL_FAILED',
           );
         const owners = new Set(instancers.map((o) => o.id));
-        const { instances, objects } = evaluateInstances(ctx, true);
+        const { instances, objects } = evaluateInstances(ctx, true, owners);
         const mine = instances.filter((i) => owners.has(i.ownerId));
         if (mine.length > MAX_MAKE_REAL)
           throw new OperatorError(
@@ -582,8 +721,9 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
         const created = addObjectsBulk(ctx.doc, inits);
         for (const o of instancers) {
           if (o.instance_type === 'COLLECTION') ctx.doc.updateObject(o.id, { instance_type: 'NONE' });
+          // the systems that were made real (shown in the viewport or in renders) are hidden
           const systems = systemsOf(o);
-          if (systems.length)
+          if (systems.some((s) => s.show_viewport !== false || s.show_render !== false))
             ctx.doc.updateObject(o.id, {
               particle_systems: systems.map((s) => ({ ...s, show_viewport: false, show_render: false })),
             });
@@ -600,12 +740,21 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
       id: 'object.scatter_add',
       label: 'Scatter Objects',
       description:
-        'Scatter objects over a surface (agent-friendly particle system): creates a particle system on `surface` ' +
-        'that instances `objects` (one object, or several picked at random — they are moved into a new collection ' +
-        'unless they already form one collection) ' +
-        'or a `collection`, with count/seed and size/rotation randomisation. Instances stand on the surface with ' +
-        'their +Z axis along the surface normal (align_to_normal) or world up. By default the sources are hidden so ' +
-        'only the scattered copies show. Returns the particle system, the number of particles/instances and problems.',
+        'Scatter objects over a surface (agent-friendly particle system): adds a particle system to `surface` with ' +
+        '`count` particles, each instancing one of `objects` (several are picked at random) or one object of ' +
+        '`collection` (or the whole collection with whole_collection), with seed and size/rotation randomisation. ' +
+        "Placement: each instance's ORIGIN is put on the surface, its local +Z axis along the surface normal " +
+        '(align_to_normal) or world up; a source whose origin is at its centre (like mesh primitives) sinks halfway ' +
+        'into the surface, so move its origin to its base first (view3d.cursor_set at the base, then ' +
+        'object.origin_set type ORIGIN_CURSOR). Size: `size` × the source object scale × the scale of the surface ' +
+        'object along its normal (a surface scaled ×10 makes instances 10× larger; a plane stretched only in X/Y ' +
+        "does not). Several `objects` that do not already form one collection are gathered into a new '<name> " +
+        "Sources' collection: they are moved there, except objects whose collection is instanced elsewhere " +
+        '(collection instances, other scatters), which stay where they are and are replaced by hidden linked ' +
+        'duplicates. Only meshes, curves, text and empties instancing a collection can be scattered; nothing is ' +
+        'changed when the input is invalid. hide_sources hides the sources (their instances still show). Returns ' +
+        'the particle system id/name, the number of particles and instances, the objects moved/duplicated/hidden, ' +
+        'notes and problems (errors).',
       category: 'Object',
       redoable: true,
       schema: z.object({
@@ -616,11 +765,30 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
         objects: z
           .array(z.string())
           .optional()
-          .describe('Objects to scatter by id or name (give either objects or collection)'),
+          .describe(
+            'Objects to scatter by id or name: meshes, curves, text or collection-instance empties (give either objects or collection)',
+          ),
         collection: z.string().optional().describe('Collection whose objects are scattered, by id or name'),
-        count: z.number().int().min(1).max(MAX_INSTANCES).default(100).describe('Number of instances'),
+        count: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_INSTANCES)
+          .default(100)
+          .describe(
+            `Number of particles (1..${MAX_INSTANCES}). Each particle places one object, or every object of the ` +
+              'collection with whole_collection (instances = count × objects); min_distance can place fewer.',
+          ),
         seed: z.number().int().default(0).describe('Random seed (change for a different arrangement)'),
-        size: z.number().min(0).max(1e5).default(1).describe('Scale of every instance (1 = original size)'),
+        size: z
+          .number()
+          .min(0)
+          .max(1e5)
+          .default(1)
+          .describe(
+            "Instance scale relative to the source object's own size (default 1), times the surface object's scale " +
+              'along its normal: on a surface scaled ×10, size 0.1 gives the original size.',
+          ),
         size_random: z
           .number()
           .min(0)
@@ -672,10 +840,14 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
         hide_sources: z
           .boolean()
           .default(true)
-          .describe('Hide the source objects/collection (viewport and render) so only the instances show'),
+          .describe(
+            'Hide the source objects/collection (viewport and render) so only the instances show; sources whose ' +
+              'collection is instanced elsewhere are left visible',
+          ),
         name: z.string().default('Scatter').describe('Name of the particle system'),
       }),
       execute(ctx, p) {
+        const doc = ctx.doc;
         const surface = emitterObject(ctx, p.surface);
         if (!!p.objects?.length === !!p.collection)
           throw new OperatorError('Give either `objects` or `collection` to scatter', 'INVALID_PARAMS');
@@ -697,63 +869,141 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
           use_modifier_stack: true,
           vertex_group_density: p.vertex_group ?? '',
         };
-        let collectionId: string | null = null;
-        let hidden: string[] = [];
+        const systemName = p.name.trim() || 'Scatter';
+
+        // ---- validation: nothing is changed before the whole input is known to be valid
+        let sources: ObjectData[] = [];
+        let given: CollectionData | null = null;
         if (p.objects?.length) {
           const ids = [...new Set(resolveObjectIds(ctx, p.objects))];
           if (ids.includes(surface.id))
             throw new OperatorError('The surface cannot scatter itself', 'INVALID_PARAMS');
-          if (ids.length === 1) {
+          sources = ids.map((id) => doc.getObject(id)!);
+          const bad = sources.filter((o) => !isScatterSource(o));
+          if (bad.length)
+            throw new OperatorError(
+              `Cannot scatter ${bad.map((o) => `'${o.name}' (${o.type})`).join(', ')}: only mesh, curve and text ` +
+                'objects and empties instancing a collection have geometry to instance',
+              'INVALID_PARAMS',
+            );
+          for (const o of sources)
+            if (
+              particleSourceCycle(doc, surface.id, {
+                instance_type: 'OBJECT',
+                instance_object: o.id,
+                instance_collection: null,
+              })
+            )
+              throw new OperatorError(
+                `'${o.name}' instances '${surface.name}' (directly or through nested instances); scattering it ` +
+                  'over that surface would recurse',
+                'INVALID_PARAMS',
+              );
+          if (sources.length === 1) {
             patch.instance_type = 'OBJECT';
-            patch.instance_object = ids[0];
-          } else {
-            // reuse a collection holding exactly these objects (e.g. from an earlier scatter of the same set)
-            const first = ctx.doc.getObject(ids[0])!.collection;
-            const members = first === ROOT_COLLECTION_ID ? [] : collectionMembers(ctx.doc, first);
-            const same =
-              members.length === ids.length &&
-              members.every((m) => ids.includes(m.id)) &&
-              !!ctx.doc.getCollection(first);
-            if (same) collectionId = first;
-            else {
-              collectionId = ctx.doc.addCollection({ name: `${p.name} Sources`, parent: ROOT_COLLECTION_ID });
-              for (const id of ids) ctx.doc.updateObject(id, { collection: collectionId });
-            }
-            patch.instance_type = 'COLLECTION';
-            patch.instance_collection = collectionId;
-          }
-          if (p.hide_sources) {
-            if (collectionId)
-              ctx.doc.updateCollection(collectionId, { hide_viewport: true, hide_render: true });
-            else for (const id of ids) hideObject(ctx, id);
-            hidden = ids;
-          }
+            patch.instance_object = sources[0].id;
+          } else patch.instance_type = 'COLLECTION'; // the source collection is set up below
         } else {
-          const c = instanceableCollection(ctx, p.collection!);
-          collectionId = c.id;
+          given = instanceableCollection(ctx, p.collection!);
           patch.instance_type = 'COLLECTION';
-          patch.instance_collection = c.id;
-          if (p.hide_sources) {
-            if (collectionContainsObject(ctx.doc, c.id, surface.id)) {
-              // keep the surface visible: hide the other objects instead of the collection
-              for (const o of ctx.doc.listObjects())
-                if (o.id !== surface.id && collectionContainsObject(ctx.doc, c.id, o.id)) {
-                  hideObject(ctx, o.id);
-                  hidden.push(o.id);
-                }
-            } else ctx.doc.updateCollection(c.id, { hide_viewport: true, hide_render: true });
-          }
+          patch.instance_collection = given.id;
         }
-        const settings = mergeSettings(
+        // validates every setting (vertex group, references, recursion)
+        let settings = mergeSettings(
           ctx,
           surface,
           ParticleSettingsSchema.parse({}) as ParticleSettings,
           patch,
         );
+
+        // ---- changes
+        const users = collectionUsers(doc);
+        /** The instanced collection (with its users) that `o` belongs to, if any. */
+        const usedBy = (o: ObjectData) => {
+          for (const cid of collectionAncestry(doc, o.collection)) {
+            const u = users.get(cid);
+            if (u) return { name: doc.getCollection(cid)?.name ?? cid, users: u.join(', ') };
+          }
+          return null;
+        };
+        const shown = (o: ObjectData) => !o.hide_viewport && doc.isCollectionVisible(o.collection);
+        const moved: string[] = [];
+        const duplicated: { object: string; duplicate: string }[] = [];
+        const hidden: string[] = [];
+        const notes: string[] = [];
+        let collectionId: string | null = given?.id ?? null;
+        if (sources.length === 1) {
+          const o = sources[0];
+          const use = usedBy(o);
+          if (!p.hide_sources) {
+            // keep it as it is
+          } else if (!use) {
+            hideObject(ctx, o.id);
+            hidden.push(o.id);
+          } else if (shown(o))
+            notes.push(
+              `'${o.name}' was left visible: its collection '${use.name}' is instanced by ${use.users}`,
+            );
+        } else if (sources.length > 1) {
+          const ids = sources.map((o) => o.id);
+          // reuse a collection holding exactly these objects (e.g. from an earlier scatter of the same set)
+          const first = sources[0].collection;
+          const members = first === ROOT_COLLECTION_ID ? [] : collectionMembers(doc, first);
+          const reuse =
+            members.length === ids.length && members.every((m) => ids.includes(m.id)) && !!doc.getCollection(first);
+          if (reuse) {
+            collectionId = first;
+            const use = usedBy(sources[0]);
+            if (p.hide_sources && use && doc.isCollectionVisible(first))
+              notes.push(`Collection '${use.name}' was left visible: it is instanced by ${use.users}`);
+            else if (p.hide_sources && !use) {
+              doc.updateCollection(first, { hide_viewport: true, hide_render: true });
+              hidden.push(...ids);
+            }
+          } else {
+            collectionId = doc.addCollection({ name: `${systemName} Sources`, parent: ROOT_COLLECTION_ID });
+            const target = doc.getCollection(collectionId)!.name;
+            for (const o of sources) {
+              const use = usedBy(o);
+              if (use) {
+                // moving it would change what that collection instances: scatter a linked duplicate
+                const dup = linkedDuplicate(doc, o, collectionId);
+                duplicated.push({ object: o.id, duplicate: dup });
+                hidden.push(dup);
+                notes.push(
+                  `'${o.name}' stays in collection '${use.name}' (instanced by ${use.users}); its hidden linked ` +
+                    `duplicate '${doc.getObject(dup)!.name}' in '${target}' is scattered instead`,
+                );
+              } else {
+                if (o.collection !== ROOT_COLLECTION_ID)
+                  notes.push(
+                    `'${o.name}' was moved from collection '${doc.getCollection(o.collection)?.name ?? o.collection}' to '${target}'`,
+                  );
+                doc.updateObject(o.id, { collection: collectionId });
+                moved.push(o.id);
+                if (p.hide_sources) hidden.push(o.id);
+              }
+            }
+            if (p.hide_sources) doc.updateCollection(collectionId, { hide_viewport: true, hide_render: true });
+          }
+          settings = { ...settings, instance_collection: collectionId };
+        } else if (given && p.hide_sources) {
+          if (collectionContainsObject(doc, given.id, surface.id)) {
+            // keep the surface visible: hide the other objects instead of the collection
+            for (const o of doc.listObjects())
+              if (o.id !== surface.id && collectionContainsObject(doc, given.id, o.id)) {
+                hideObject(ctx, o.id);
+                hidden.push(o.id);
+              }
+          } else {
+            doc.updateCollection(given.id, { hide_viewport: true, hide_render: true });
+            for (const o of collectionMembers(doc, given.id)) hidden.push(o.id);
+          }
+        }
         const names = new Set(systemsOf(surface).map((s) => s.name));
         const sys: ParticleSystemData = {
           id: newId(),
-          name: uniqueName(p.name.trim() || 'Scatter', names),
+          name: uniqueName(systemName, names),
           show_viewport: true,
           show_render: true,
           settings: settings as unknown as Record<string, unknown>,
@@ -767,7 +1017,10 @@ export function registerInstancingOperators(reg: OperatorRegistry): void {
           instance_type: settings.instance_type,
           instance_object: settings.instance_object,
           collection: collectionId,
+          moved,
+          duplicated,
           hidden,
+          notes,
           ...systemReport(ctx, surface.id, sys),
         };
       },

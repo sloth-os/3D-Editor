@@ -44,8 +44,9 @@ export class Body {
   /** Core radius (spheres / capsules) and radius of an origin-centred bounding sphere. */
   readonly radius: number;
   readonly boundingRadius: number;
-  private readonly localMin: Vec3;
-  private readonly localMax: Vec3;
+  /** Body-space bounds of the shape (for the narrow phase against triangle meshes). */
+  readonly localMin: Vec3;
+  readonly localMax: Vec3;
 
   mode: MotionMode;
   mass = 0;
@@ -82,11 +83,10 @@ export class Body {
   maxX = 0;
   maxY = 0;
   maxZ = 0;
-  // sleeping
+  // sleeping (dynamic bodies): asleep bodies are not integrated until their island is touched
   awake = true;
+  /** Seconds the body has been slower than the sleep thresholds. */
   sleepTime = 0;
-  /** Bodies that fell asleep together wake together. */
-  sleepGroup = -1;
   // kinematic targets of the current frame (start and end pose)
   k0p: Vec3 = [0, 0, 0];
   k0q: Quat = [0, 0, 0, 1];

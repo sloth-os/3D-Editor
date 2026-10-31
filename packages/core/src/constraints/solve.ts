@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { Mat4 } from '../math/types';
 import { identity4, multiply4 } from '../math/mat4';
 import type { ConstraintData, ConstraintType } from '../doc/types';
@@ -52,7 +53,46 @@ export function constraintTargets(c: ConstraintData): string[] {
   return out;
 }
 
-/** Parsed parameters of a constraint, or a readable validation message. */
+const rangeCache = new WeakMap<object, [string, number, number][]>();
+
+/** Inclusive ranges of the number parameters of a schema that have bounds (cached per schema). */
+function numberRanges(schema: z.ZodObject<z.ZodRawShape>): [string, number, number][] {
+  let ranges = rangeCache.get(schema);
+  if (ranges) return ranges;
+  ranges = [];
+  for (const [key, field] of Object.entries(schema.shape)) {
+    let s: unknown = field;
+    while (s instanceof z.ZodDefault || s instanceof z.ZodOptional) s = s.unwrap();
+    if (!(s instanceof z.ZodNumber)) continue;
+    const min = s.minValue ?? -Infinity;
+    const max = s.maxValue ?? Infinity;
+    if (Number.isFinite(min) || Number.isFinite(max)) ranges.push([key, min, max]);
+  }
+  rangeCache.set(schema, ranges);
+  return ranges;
+}
+
+/**
+ * Clamps the number parameters of `values` (a parameter bag of constraint type `type`) to the
+ * ranges of the type's schema, like Blender's RNA does for animated and scripted values (e.g. an
+ * animated `offset_factor` of 1.2 acts as 1). Returns a new object; other values are kept as is.
+ */
+export function clampConstraintParams(type: string, values: Record<string, unknown>): Record<string, unknown> {
+  const info = getConstraintTypeInfo(type);
+  const out = { ...values };
+  if (!info) return out;
+  for (const [key, min, max] of numberRanges(info.schema)) {
+    const v = out[key];
+    if (typeof v === 'number' && Number.isFinite(v) && (v < min || v > max))
+      out[key] = Math.min(max, Math.max(min, v));
+  }
+  return out;
+}
+
+/**
+ * Parsed parameters of a constraint, or a readable validation message. Numbers outside a
+ * parameter's range (e.g. produced by animation) are clamped to it first.
+ */
 export function parseConstraintParams(
   c: Pick<ConstraintData, 'type' | 'params'>,
 ): { ok: true; params: Record<string, unknown> } | { ok: false; message: string } {
@@ -64,7 +104,7 @@ export function parseConstraintParams(
   const loose: Record<string, unknown> = {};
   const top = c as unknown as Record<string, unknown>;
   for (const key of Object.keys(info.schema.shape)) if (key in top && !(key in params)) loose[key] = top[key];
-  const res = info.schema.safeParse({ ...loose, ...params });
+  const res = info.schema.safeParse(clampConstraintParams(info.type, { ...loose, ...params }));
   if (res.success) return { ok: true, params: res.data as Record<string, unknown> };
   const issues = res.error.issues.map((i) => `${i.path.join('.') || '(params)'}: ${i.message}`).join('; ');
   return { ok: false, message: `Invalid parameters: ${issues}` };
@@ -83,7 +123,8 @@ function influenceOf(c: Record<string, unknown>): number | null {
  * result is blended with the incoming matrix by `influence` (location lerp, rotation slerp, scale
  * lerp). Muted constraints, zero influence and pose-bone-only types (IK) are skipped. Constraints
  * that cannot be solved (unknown type, invalid parameters, missing, self or cyclic targets) leave
- * the matrix unchanged and are reported in `errors`; this function never throws.
+ * the matrix unchanged and are reported in `errors`; this function never throws. Constraints that
+ * `ctx.dependencyCycle` reports are skipped without reading their target.
  */
 export function solveConstraints(
   constraints: readonly ConstraintData[],
@@ -129,6 +170,11 @@ export function solveConstraints(
       return;
     }
     try {
+      const cycle = ctx.dependencyCycle?.(c);
+      if (cycle) {
+        errors.push({ constraintId: id, message: cycle });
+        return;
+      }
       const env = createSolveEnv(ctx, c, info.label);
       const local = parsed.params.owner_space === 'LOCAL' ? frame() : null;
       let out = solver(local ? multiply4(local.inv, m) : m, parsed.params, env);

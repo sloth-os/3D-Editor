@@ -139,7 +139,8 @@ export class MeshBuilder {
     // drop sharp marks on edges that do not exist (defensive; keeps the mesh valid)
     if (this.sharp.size) {
       const edges = new Set<string>();
-      for (const f of mesh.faces) for (let i = 0; i < f.length; i++) edges.add(edgeKey(f[i], f[(i + 1) % f.length]));
+      for (const f of mesh.faces)
+        for (let i = 0; i < f.length; i++) edges.add(edgeKey(f[i], f[(i + 1) % f.length]));
       for (const k of Object.keys(mesh.edgeAttrs)) if (!edges.has(k)) delete mesh.edgeAttrs[k];
     }
     return mesh;
@@ -245,13 +246,18 @@ const BOX_FACES = [
 ];
 
 /** Closed box spanning `min`..`max` (in the helper's local space, see `matrix`). */
-export function addBox(b: MeshBuilder, min: Readonly<Vec3>, max: Readonly<Vec3>, opts: SurfaceOpts = {}): void {
+export function addBox(
+  b: MeshBuilder,
+  min: Readonly<Vec3>,
+  max: Readonly<Vec3>,
+  opts: SurfaceOpts = {},
+): void {
   const idx: number[] = [];
   for (let i = 0; i < 8; i++) {
     const p: Vec3 = [i & 4 ? max[0] : min[0], i & 2 ? max[1] : min[1], i & 1 ? max[2] : min[2]];
     idx.push(b.vert(xform(opts.matrix, p)));
   }
-  const flip = mirrored(opts.matrix) !== (max[0] < min[0]) !== (max[1] < min[1]) !== (max[2] < min[2]);
+  const flip = ((mirrored(opts.matrix) !== max[0] < min[0]) !== max[1] < min[1]) !== max[2] < min[2];
   for (const f of BOX_FACES) {
     const vs = f.map((i) => idx[i]);
     b.face(flip ? vs.reverse() : vs, opts.mat ?? 0, opts.smooth ?? false);
@@ -391,7 +397,11 @@ export interface RingSurfaceOpts extends SurfaceOpts {
  * direction the sequence advances towards; then all faces point outwards (use `flip` otherwise).
  * Side faces get UVs u = position around the ring (0..1), v = `opts.v`.
  */
-export function addRingSurface(b: MeshBuilder, rings: readonly (readonly Vec3[])[], opts: RingSurfaceOpts = {}): void {
+export function addRingSurface(
+  b: MeshBuilder,
+  rings: readonly (readonly Vec3[])[],
+  opts: RingSurfaceOpts = {},
+): void {
   const R = rings.length;
   if (R < 2) return;
   const n = Math.max(...rings.map((r) => r.length));
@@ -453,7 +463,12 @@ export interface LatheOpts extends SurfaceOpts {
  * become poles. The winding is chosen from the profile's orientation so faces always point
  * outwards. UV: u around (0..1), v = profile arc length / (2π · max radius).
  */
-export function addLathe(b: MeshBuilder, profile: readonly Vec2[], segments: number, opts: LatheOpts = {}): void {
+export function addLathe(
+  b: MeshBuilder,
+  profile: readonly Vec2[],
+  segments: number,
+  opts: LatheOpts = {},
+): void {
   const prof = dedupeOpen(profile);
   if (prof.length < 2) return;
   const n = Math.max(3, Math.floor(segments));
@@ -470,7 +485,9 @@ export function addLathe(b: MeshBuilder, profile: readonly Vec2[], segments: num
   const rMax = Math.max(1e-6, ...prof.map((p) => Math.abs(p[0])));
   const v: number[] = [0];
   for (let i = 1; i < prof.length; i++)
-    v.push(v[i - 1] + Math.hypot(prof[i][0] - prof[i - 1][0], prof[i][1] - prof[i - 1][1]) / (2 * Math.PI * rMax));
+    v.push(
+      v[i - 1] + Math.hypot(prof[i][0] - prof[i - 1][0], prof[i][1] - prof[i - 1][1]) / (2 * Math.PI * rMax),
+    );
   addRingSurface(b, rings, { ...opts, loop: opts.loop, flip: profileIsClockwise(prof), v });
 }
 
@@ -718,7 +735,7 @@ export function addIcoSphere(
       ]),
     );
   }
-  const flip = mirrored(opts.matrix) !== (radii[0] * radii[1] * radii[2] < 0);
+  const flip = mirrored(opts.matrix) !== radii[0] * radii[1] * radii[2] < 0;
   for (let f = 0; f < ico.faces.length; f++) {
     const vs = ico.faces[f].map((v) => v + base);
     const uv = ico.uvs ? ico.uvs[f].slice() : null;
@@ -748,7 +765,10 @@ export function markSharpEdges(mesh: MeshData, angle: number): void {
  * Moves a mesh in place: `ground` puts its lowest point on z = 0, `centerXY` centres its bounding
  * box on the Z axis, `centerZ` centres it vertically. Returns the applied offset.
  */
-export function placeMesh(mesh: MeshData, opts: { ground?: boolean; centerXY?: boolean; centerZ?: boolean }): Vec3 {
+export function placeMesh(
+  mesh: MeshData,
+  opts: { ground?: boolean; centerXY?: boolean; centerZ?: boolean },
+): Vec3 {
   const { min, max } = boundsOf(mesh.positions);
   const d: Vec3 = [
     opts.centerXY ? -(min[0] + max[0]) / 2 : 0,

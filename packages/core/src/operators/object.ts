@@ -26,7 +26,12 @@ import {
   vec3,
 } from './helpers';
 import { transformRoots } from './transform';
-import { ARMATURE_PARENT_TYPES, armatureParentSet, clearBoneParent } from './armature';
+import {
+  ARMATURE_PARENT_TYPES,
+  armatureParentSet,
+  clearBoneParent,
+  remapDuplicatedReferences,
+} from './armature';
 import { convertCurveObject } from './curve';
 
 const placement = {
@@ -474,7 +479,9 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       id: 'object.duplicate',
       label: 'Duplicate Objects',
       description:
-        'Duplicate selected objects (linked=true shares mesh data like Alt+D). The copies become the selection.',
+        'Duplicate selected objects (linked=true shares mesh data like Alt+D). The copies become the selection. ' +
+        'References between duplicated objects (parents, modifier objects such as the Armature modifier, ' +
+        'constraint and bone constraint targets) point at the copies.',
       category: 'Object',
       redoable: true,
       schema: z.object({ linked: z.boolean().default(false), offset: vec3.default([0, 0, 0]) }),
@@ -524,6 +531,8 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           const o = ctx.doc.getObject(src)!;
           if (o.parent && map.has(o.parent)) ctx.doc.updateObject(dst, { parent: map.get(o.parent)! });
         }
+        // modifier objects and constraint targets inside the set point at the copies too
+        remapDuplicatedReferences(ctx.doc, map);
         for (const id of transformRoots(ctx.doc, [...map.values()])) {
           const o = ctx.doc.getObject(id)!;
           if (p.offset.some((v) => v !== 0)) {

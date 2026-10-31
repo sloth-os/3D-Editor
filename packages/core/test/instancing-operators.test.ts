@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
+  MAX_INSTANCES,
   ROOT_COLLECTION_ID,
   SceneDoc,
   SceneEvaluator,
@@ -426,6 +427,257 @@ describe('object.duplicates_make_real', () => {
     const names = new Set(doc.listObjects().map((o) => o.name));
     expect(names.size).toBe(before + 3000);
     expect(names.has('Trunk.3000')).toBe(true);
+  });
+});
+
+describe('object.scatter_add safety', () => {
+  /** Rocks above the origin and two ground planes. */
+  function rocks() {
+    const t = setup();
+    const a = t.ok('mesh.primitive_cube_add', { name: 'RockA', size: 0.2, location: [0, 0, 5] }).object as string;
+    const b = t.ok('mesh.primitive_cube_add', { name: 'RockB', size: 0.3, location: [0, 0, 5] }).object as string;
+    const c = t.ok('mesh.primitive_cube_add', { name: 'RockC', size: 0.4, location: [0, 0, 5] }).object as string;
+    const g1 = t.ok('mesh.primitive_plane_add', { name: 'Ground1', size: 10 }).object as string;
+    const g2 = t.ok('mesh.primitive_plane_add', { name: 'Ground2', size: 10, location: [20, 0, 0] })
+      .object as string;
+    const sources = (owner: string) => new Set(t.instances(owner).map((i) => i.sourceId));
+    return { ...t, a, b, c, g1, g2, sources };
+  }
+
+  it('keeps earlier scatters intact: sources of instanced collections are duplicated, not moved', () => {
+    const { ok, doc, a, b, c, g1, g2, sources } = rocks();
+    const first = ok('object.scatter_add', { surface: g1, objects: ['RockA', 'RockB'], count: 200 });
+    expect(first).toMatchObject({ moved: [a, b], duplicated: [], notes: [] });
+    expect(sources(g1)).toEqual(new Set([a, b]));
+    const r = ok('object.scatter_add', { surface: g2, objects: ['RockA', 'RockC'], count: 200 });
+    // the first scatter still has both rocks
+    expect(sources(g1)).toEqual(new Set([a, b]));
+    expect(doc.getObject(a)!.collection).toBe(first.collection);
+    expect(r.moved).toEqual([c]);
+    expect(r.duplicated).toHaveLength(1);
+    const dup = r.duplicated[0];
+    expect(dup.object).toBe(a);
+    expect(doc.getObject(dup.duplicate)).toMatchObject({
+      data: doc.getObject(a)!.data,
+      collection: r.collection,
+      hide_viewport: true,
+      hide_render: true,
+    });
+    expect(sources(g2)).toEqual(new Set([dup.duplicate, c]));
+    expect(r.notes.join('\n')).toMatch(/'RockA' stays in collection 'Scatter Sources' \(instanced by particle system/);
+    expect(doc.getCollection(r.collection)!.name).toBe('Scatter Sources.001');
+  });
+
+  it('keeps collection instances intact and leaves their objects visible', () => {
+    const t = setup();
+    t.ok('collection.create', { name: 'House' });
+    const walls = t.ok('mesh.primitive_cube_add', { name: 'Walls', size: 2 }).object as string;
+    const door = t.ok('mesh.primitive_cube_add', { name: 'Door', size: 0.5 }).object as string;
+    t.ok('object.select', { objects: [walls, door] });
+    t.ok('object.move_to_collection', { collection: 'House' });
+    const e = t.ok('object.collection_instance_add', { collection: 'House', location: [10, 0, 0] }).object;
+    t.ok('mesh.primitive_ico_sphere_add', { name: 'Rock', radius: 0.2 });
+    const ground = t.ok('mesh.primitive_plane_add', { name: 'Ground', size: 10 }).object as string;
+    expect(t.instances(e)).toHaveLength(2);
+    const r = t.ok('object.scatter_add', { surface: ground, objects: ['Rock', 'Door'], count: 20 });
+    expect(t.instances(e)).toHaveLength(2);
+    expect(t.doc.getObject(door)).toMatchObject({ hide_viewport: false, hide_render: false });
+    expect(t.doc.getCollection(t.doc.getObject(door)!.collection)!.name).toBe('House');
+    expect(r.duplicated.map((d: any) => d.object)).toEqual([door]);
+    expect(r.notes.join()).toMatch(/'Door' stays in collection 'House' \(instanced by 'House' \(collection instance\)\)/);
+    // a single source in an instanced collection is instanced directly and left visible
+    const one = t.ok('object.scatter_add', { surface: ground, objects: ['Walls'], count: 5, name: 'Solo' });
+    expect(one).toMatchObject({ instance_object: walls, hidden: [] });
+    expect(one.notes.join()).toMatch(/'Walls' was left visible: its collection 'House' is instanced by/);
+    expect(t.doc.getObject(walls)!.hide_viewport).toBe(false);
+  });
+
+  it('validates everything before changing the scene', () => {
+    const { run, ok, doc, a, b, g1 } = rocks();
+    const sun = ok('object.light_add', { type: 'SUN', name: 'Sun' }).object as string;
+    const cam = ok('object.camera_add', { name: 'Cam' }).object as string;
+    const collections = () => doc.listCollections().map((c) => c.name);
+    const untouched = () => {
+      expect(collections()).toEqual(['Scene Collection']);
+      for (const id of [a, b, sun, cam])
+        expect(doc.getObject(id)).toMatchObject({
+          collection: ROOT_COLLECTION_ID,
+          hide_viewport: false,
+          hide_render: false,
+        });
+      expect(doc.getObject(g1)!.particle_systems).toEqual([]);
+    };
+    // sources without geometry
+    expect(run('object.scatter_add', { surface: g1, objects: ['RockA', 'Sun', 'Cam'] }).error).toMatch(
+      /Cannot scatter 'Sun' \(LIGHT\), 'Cam' \(CAMERA\): only mesh, curve and text objects/,
+    );
+    expect(run('object.scatter_add', { surface: g1, objects: ['Sun'] }).error).toMatch(/'Sun' \(LIGHT\)/);
+    untouched();
+    // invalid settings (a missing vertex group) for one and for several objects
+    for (const objects of [['RockA'], ['RockA', 'RockB']]) {
+      const r = run('object.scatter_add', { surface: g1, objects, vertex_group: 'Missing' });
+      expect(r.error).toMatch(/Vertex group 'Missing' not found on 'Ground1'/);
+      untouched();
+    }
+    // a source that instances the surface itself
+    ok('collection.create', { name: 'Ground Set' });
+    ok('object.select', { objects: [g1] });
+    ok('object.move_to_collection', { collection: 'Ground Set' });
+    const holder = ok('object.collection_instance_add', { collection: 'Ground Set', name: 'Holder' }).object;
+    expect(run('object.scatter_add', { surface: g1, objects: ['Holder', 'RockA'] }).error).toMatch(
+      /'Holder' instances 'Ground1'.*would recurse/,
+    );
+    expect(doc.getObject(a)!.collection).toBe(ROOT_COLLECTION_ID);
+    expect(doc.getObject(holder)!.hide_viewport).toBe(false);
+  });
+
+  it('documents placement by the origin, the size factors and count = particles', () => {
+    const { reg, ok, doc } = setup();
+    const info = reg.describe().find((o) => o.id === 'object.scatter_add')! as any;
+    expect(info.description).toMatch(/ORIGIN is put on the surface/);
+    expect(info.description).toMatch(/scale of the surface object along its normal/);
+    expect(info.parameters.properties.count.description).toMatch(/Number of particles.*instances = count × objects/);
+    expect(info.parameters.properties.size.description).toMatch(/surface scaled ×10, size 0.1 gives the original size/);
+    // the documented size rule
+    ok('mesh.primitive_cube_add', { name: 'Rock', size: 1, location: [0, 0, 5] });
+    const ground = ok('mesh.primitive_plane_add', { name: 'Ground', size: 2 }).object as string;
+    doc.updateObject(ground, { scale: [10, 10, 10] });
+    ok('object.scatter_add', { surface: ground, objects: ['Rock'], count: 5, size: 0.1 });
+    const m = new SceneEvaluator(doc).evaluate(1).instances[0].matrix;
+    expect(Math.hypot(m[0], m[1], m[2])).toBeCloseTo(1, 9);
+    // the documented origin rule: a centred cube sinks halfway into the ground
+    expect(m[14]).toBeCloseTo(0, 9);
+  });
+});
+
+describe('particle operator reports and edits', () => {
+  it('report render-only systems and emitter problems such as the scene-wide limit', () => {
+    const { ok, doc, instances } = setup();
+    ok('mesh.primitive_cube_add', { name: 'Rock', size: 0.1, location: [0, 0, 50] });
+    const field = ok('mesh.primitive_plane_add', { name: 'A_Field', size: 100 }).object as string;
+    const hidden = ok('object.particle_system_add', {
+      object: field,
+      settings: { count: 50, instance_object: 'Rock' },
+      show_viewport: false,
+    });
+    expect(hidden).toMatchObject({ particles: 50, instances: 50, errors: [] });
+    ok('object.particle_system_update', {
+      object: field,
+      settings: { count: MAX_INSTANCES, distribution: 'RANDOM' },
+      show_viewport: true,
+    });
+    ok('mesh.primitive_plane_add', { name: 'B_Patio', size: 4, location: [0, 200, 0] });
+    const r = ok('object.particle_system_add', {
+      object: 'B_Patio',
+      settings: { instance_object: 'Rock', count: 50 },
+    });
+    expect(r.particles).toBe(50);
+    expect(r.errors.join('\n')).toMatch(
+      /exceeds the limit of 200000 instances: all 50 instances of 'B_Patio' are skipped/,
+    );
+    expect(instances(doc.findObjectByName('B_Patio')!.id)).toHaveLength(0);
+  });
+
+  it('refuses instance objects and collections that would make the emitter instance itself', () => {
+    const { ok, run, doc } = setup();
+    ok('collection.create', { name: 'C' });
+    const ground = ok('mesh.primitive_plane_add', { name: 'Ground', size: 10 }).object as string;
+    ok('object.select', { objects: [ground] });
+    ok('object.move_to_collection', { collection: 'C' });
+    ok('object.collection_instance_add', { collection: 'C', name: 'E', location: [20, 0, 0] });
+    expect(
+      run('object.particle_system_add', { object: ground, settings: { instance_object: 'E', count: 5 } }).error,
+    ).toMatch(/instance_object 'E' instances 'Ground' itself .*would recurse/);
+    // the emitter as a direct member of its own instance collection is fine (it is skipped)
+    ok('mesh.primitive_cube_add', { name: 'Pebble', size: 0.1 });
+    ok('object.select', { objects: ['Pebble'] });
+    ok('object.move_to_collection', { collection: 'C' });
+    const own = ok('object.particle_system_add', {
+      object: ground,
+      settings: { instance_collection: 'C', count: 5 },
+    });
+    expect(own).toMatchObject({ particles: 5, errors: [] });
+    // the operators also report cycles found in stored data
+    const sys = doc.getObject(ground)!.particle_systems[0];
+    doc.updateObject(ground, {
+      particle_systems: [{ ...sys, settings: { ...sys.settings, instance_type: 'OBJECT', instance_object: 'E' } }],
+    });
+    const r = ok('object.particle_system_update', { object: ground, settings: { count: 6 } });
+    expect(r.errors.join('\n')).toMatch(/Instancing cycle: 'Ground' ends up instancing itself/);
+  });
+
+  it('keeps F-curves and drivers on renamed systems and removes them with the system', () => {
+    const { ok, doc } = setup();
+    ok('mesh.primitive_cube_add', { name: 'Rock', size: 0.2 });
+    const ground = ok('mesh.primitive_plane_add', { name: 'Ground', size: 10 }).object as string;
+    ok('object.particle_system_add', { object: ground, name: 'Grass', settings: { count: 10, instance_object: 'Rock' } });
+    doc.setFCurve({
+      target_type: 'object',
+      target_id: ground,
+      path: 'particle_systems["Grass"].count',
+      index: 0,
+      keyframes: [
+        { frame: 1, value: 10, interpolation: 'LINEAR' },
+        { frame: 11, value: 110, interpolation: 'LINEAR' },
+      ],
+      extrapolation: 'CONSTANT',
+      mute: false,
+    } as any);
+    doc.setDriver({
+      target_type: 'object',
+      target_id: ground,
+      path: 'particle_systems["Grass"].seed',
+      index: 0,
+      expression: 'n',
+      variables: [{ name: 'n', target_type: 'object', target_id: ground, path: 'particle_systems["Grass"].count', index: 0 }],
+      mute: false,
+    });
+    const at11 = () =>
+      new SceneEvaluator(doc).evaluate(11).instances.filter((i) => i.ownerId === ground).length;
+    expect(at11()).toBe(110);
+    ok('object.particle_system_update', { object: ground, particle_system: 'Grass', name: 'Lawn' });
+    expect(at11()).toBe(110);
+    expect(doc.listFCurves(ground).map((f) => f.path)).toEqual(['particle_systems["Lawn"].count']);
+    expect(doc.listDrivers()).toMatchObject([
+      { path: 'particle_systems["Lawn"].seed', variables: [{ path: 'particle_systems["Lawn"].count' }] },
+    ]);
+    ok('object.particle_system_remove', { object: ground, particle_system: 'Lawn' });
+    expect(doc.listFCurves(ground)).toEqual([]);
+    expect(doc.listDrivers()).toEqual([]);
+  });
+
+  it('accepts unrelated updates after the density vertex group was removed', () => {
+    const { ok, doc, instances } = setup();
+    ok('mesh.primitive_cube_add', { name: 'Rock', size: 0.2 });
+    const ground = ok('mesh.primitive_plane_add', { name: 'Ground', size: 10 }).object as string;
+    const meshId = doc.getObject(ground)!.data!;
+    const nv = doc.getMesh(meshId)!.positions.length / 3;
+    doc.setVertexGroups(meshId, [{ name: 'Density', weights: encodeFloat32(new Array(nv).fill(1)) }]);
+    ok('object.particle_system_add', {
+      object: ground,
+      settings: { count: 50, instance_object: 'Rock', vertex_group_density: 'Density' },
+    });
+    doc.setVertexGroups(meshId, []);
+    expect(instances(ground)).toHaveLength(50);
+    const r = ok('object.particle_system_update', { object: ground, settings: { count: 80 } });
+    expect(r).toMatchObject({ particles: 80 });
+    expect(r.errors.join()).toMatch(/vertex group 'Density' not found; density ignored/);
+  });
+
+  it('makes render-only particle systems real', () => {
+    const { ok, instances } = setup();
+    ok('mesh.primitive_cube_add', { name: 'Rock', size: 0.2, location: [0, 0, 5] });
+    const ground = ok('mesh.primitive_plane_add', { name: 'Ground', size: 10 }).object as string;
+    ok('object.particle_system_add', {
+      object: ground,
+      settings: { count: 50, instance_object: 'Rock' },
+      show_viewport: false,
+      show_render: true,
+    });
+    expect(instances(ground, true)).toHaveLength(50);
+    const r = ok('object.duplicates_make_real', { objects: [ground] });
+    expect(r.count).toBe(50);
+    expect(instances(ground, true)).toHaveLength(0);
   });
 });
 

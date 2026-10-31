@@ -1,0 +1,229 @@
+import type { Mat4, Vec3 } from '../math/types';
+import type { MeshData } from '../mesh/types';
+import type { RigidBodyData } from '../doc/types';
+import { Body } from './body';
+import { buildCollisionShape } from './shapes';
+import { MAX_SIMULATED_FRAMES, motionMode, type WorldParams } from './settings';
+import { PhysicsWorld } from './world';
+import { composeRigid, decomposeRigid, isFiniteVec, mat3ToQuat, quatToMat3, slerpQ } from './vmath';
+
+/*
+ * One rigid body simulation run (Blender's point cache of a rigid body world): the bodies are
+ * built from the scene at frame_start, then the world is stepped one frame at a time
+ * (`substeps_per_frame` steps of time_scale / fps / substeps seconds each). The pose of every
+ * ACTIVE, non-animated body is recorded per frame, so going back in time is a lookup.
+ */
+
+/** A problem with one rigid body object, reported instead of failing the evaluation. */
+export interface RigidBodyIssue {
+  objectId: string;
+  /** 'ERROR': the object is left out of the simulation; 'WARNING': simulated with a fallback. */
+  level: 'ERROR' | 'WARNING';
+  message: string;
+}
+
+/** A rigid body object as read from the scene at frame_start. */
+export interface BodyInput {
+  id: string;
+  /** Validated rigid body settings. */
+  rb: RigidBodyData;
+  /** Unsimulated world matrix at frame_start (null when unavailable). */
+  matrix: Mat4 | null;
+  /** Object-space mesh the collision shape is built from (null for non-mesh objects). */
+  mesh: MeshData | null;
+}
+
+export interface SimulationOptions {
+  /** Let resting bodies sleep (default true). */
+  sleeping?: boolean;
+}
+
+export class Simulation {
+  readonly world: PhysicsWorld;
+  readonly frameStart: number;
+  /** Last frame that is simulated (later frames hold its state). */
+  readonly frameEnd: number;
+  readonly substeps: number;
+  /** Length of one step in seconds. */
+  readonly dt: number;
+  readonly bodies: readonly Body[];
+  /** Bodies whose transform the simulation drives (ACTIVE and not animated), in id order. */
+  readonly outputs: readonly Body[];
+  /** Animated ("kinematic") bodies following their animation, in id order. */
+  readonly kinematic: readonly Body[];
+  readonly issues: RigidBodyIssue[] = [];
+  /** Last simulated frame (the world's state is the state at this frame). */
+  current: number;
+  /** Per frame (index = frame − frameStart): centre of mass xyz + quaternion xyzw of each output. */
+  private readonly poses: Float64Array[] = [];
+  /** Per frame: world matrices (16 per kinematic body) that drove the kinematic bodies. */
+  private readonly kinematicInputs: (Float64Array | null)[] = [null];
+
+  constructor(inputs: readonly BodyInput[], params: WorldParams, opts: SimulationOptions = {}) {
+    this.frameStart = params.frameStart;
+    this.frameEnd = Math.min(params.frameEnd, params.frameStart + MAX_SIMULATED_FRAMES);
+    this.substeps = params.substeps;
+    this.dt = params.timeScale / params.fps / params.substeps;
+    this.current = this.frameStart;
+    const bodies: Body[] = [];
+    const sorted = [...inputs].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (const input of sorted) {
+      const body = this.createBody(input, bodies.length);
+      if (body) bodies.push(body);
+    }
+    this.bodies = bodies;
+    this.outputs = bodies.filter((b) => b.mode === 'DYNAMIC' || b.mode === 'FROZEN');
+    this.kinematic = bodies.filter((b) => b.mode === 'KINEMATIC');
+    this.world = new PhysicsWorld(bodies, {
+      gravity: params.gravity,
+      iterations: params.iterations,
+      sleeping: opts.sleeping,
+    });
+    this.poses.push(this.capture());
+  }
+
+  private issue(objectId: string, level: RigidBodyIssue['level'], message: string): void {
+    this.issues.push({ objectId, level, message });
+  }
+
+  private createBody(input: BodyInput, index: number): Body | null {
+    const { id, rb, matrix, mesh } = input;
+    if (!mesh) {
+      this.issue(id, 'ERROR', 'rigid bodies need a mesh object; left out of the simulation');
+      return null;
+    }
+    if (!matrix || matrix.length < 16 || !isFiniteVec(matrix)) {
+      this.issue(
+        id,
+        'ERROR',
+        'the object has no valid transform at the start frame; left out of the simulation',
+      );
+      return null;
+    }
+    const { position: origin, rotation: R, scale } = decomposeRigid(matrix);
+    const built = buildCollisionShape(rb.collision_shape, mesh, scale, {
+      dynamic: rb.type === 'ACTIVE' && !rb.kinematic,
+    });
+    if ('error' in built) {
+      this.issue(id, 'ERROR', `${built.error}; left out of the simulation`);
+      return null;
+    }
+    for (const note of built.notes) this.issue(id, 'WARNING', note);
+    const c = built.com;
+    return new Body({
+      id,
+      index,
+      shape: built.shape,
+      shapeType: built.type,
+      com: c,
+      scale,
+      unitInertia: built.inertia,
+      mode: motionMode(rb),
+      mass: rb.mass,
+      friction: rb.friction,
+      restitution: rb.restitution,
+      margin: rb.collision_margin,
+      linearDamping: rb.linear_damping,
+      angularDamping: rb.angular_damping,
+      position: [
+        origin[0] + R[0] * c[0] + R[1] * c[1] + R[2] * c[2],
+        origin[1] + R[3] * c[0] + R[4] * c[1] + R[5] * c[2],
+        origin[2] + R[6] * c[0] + R[7] * c[1] + R[8] * c[2],
+      ],
+      orientation: mat3ToQuat(R),
+    });
+  }
+
+  private capture(): Float64Array {
+    const out = new Float64Array(this.outputs.length * 7);
+    this.outputs.forEach((b, i) => {
+      out.set([b.px, b.py, b.pz, b.qx, b.qy, b.qz, b.qw], i * 7);
+    });
+    return out;
+  }
+
+  /**
+   * Simulates the next frame. `transforms` are the unsimulated world matrices at that frame
+   * (needed when there are animated bodies; missing or invalid ones keep the body in place).
+   */
+  advance(transforms: ReadonlyMap<string, Mat4> | null): void {
+    if (this.kinematic.length) {
+      const record = new Float64Array(this.kinematic.length * 16).fill(NaN);
+      this.kinematic.forEach((b, i) => {
+        const m = transforms?.get(b.id);
+        if (m) for (let k = 0; k < 16; k++) record[i * 16 + k] = m[k];
+        if (!m || m.length < 16 || !isFiniteVec(m)) {
+          this.world.setKinematicTarget(b, [b.px, b.py, b.pz], b.orientation);
+          return;
+        }
+        const { position: o, rotation: R } = decomposeRigid(m);
+        const c = b.com;
+        this.world.setKinematicTarget(
+          b,
+          [
+            o[0] + R[0] * c[0] + R[1] * c[1] + R[2] * c[2],
+            o[1] + R[3] * c[0] + R[4] * c[1] + R[5] * c[2],
+            o[2] + R[6] * c[0] + R[7] * c[1] + R[8] * c[2],
+          ],
+          mat3ToQuat(R),
+        );
+      });
+      this.kinematicInputs.push(record);
+    } else this.kinematicInputs.push(null);
+    for (let i = 0; i < this.substeps; i++) this.world.step(this.dt, (i + 1) / this.substeps);
+    this.current++;
+    this.poses.push(this.capture());
+  }
+
+  /** Whether the animated bodies' transforms at `frame` are the ones the cache was built with. */
+  kinematicMatches(frame: number, transforms: ReadonlyMap<string, Mat4>): boolean {
+    const record = this.kinematicInputs[frame - this.frameStart];
+    if (!record) return true;
+    for (let i = 0; i < this.kinematic.length; i++) {
+      const m = transforms.get(this.kinematic[i].id);
+      for (let k = 0; k < 16; k++) {
+        const a = m && m.length >= 16 ? m[k] : NaN;
+        const b = record[i * 16 + k];
+        if (a !== b && !(Number.isNaN(a) && Number.isNaN(b))) return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * World matrices of the output bodies at a (possibly fractional) simulated frame in
+   * [frameStart, current]; between frames poses are interpolated. Scale is the object's world
+   * scale at frame_start.
+   */
+  matrices(frame: number): Map<string, Mat4> {
+    const f = Math.min(Math.max(frame, this.frameStart), this.current);
+    const lo = Math.floor(f);
+    const hi = Math.min(Math.ceil(f), this.current);
+    const t = f - lo;
+    const a = this.poses[lo - this.frameStart];
+    const b = this.poses[hi - this.frameStart];
+    const out = new Map<string, Mat4>();
+    this.outputs.forEach((body, i) => {
+      const o = i * 7;
+      let px = a[o];
+      let py = a[o + 1];
+      let pz = a[o + 2];
+      let q: [number, number, number, number] = [a[o + 3], a[o + 4], a[o + 5], a[o + 6]];
+      if (t > 0 && hi !== lo) {
+        px += (b[o] - px) * t;
+        py += (b[o + 1] - py) * t;
+        pz += (b[o + 2] - pz) * t;
+        q = slerpQ(q, [b[o + 3], b[o + 4], b[o + 5], b[o + 6]], t);
+      }
+      const R = quatToMat3(q);
+      const c = body.com;
+      const origin: Vec3 = [
+        px - (R[0] * c[0] + R[1] * c[1] + R[2] * c[2]),
+        py - (R[3] * c[0] + R[4] * c[1] + R[5] * c[2]),
+        pz - (R[6] * c[0] + R[7] * c[1] + R[8] * c[2]),
+      ];
+      out.set(body.id, composeRigid(origin, R, body.scale));
+    });
+    return out;
+  }
+}

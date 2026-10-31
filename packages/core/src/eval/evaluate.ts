@@ -160,6 +160,9 @@ export class SceneEvaluator {
             return o?.type === 'MESH' && o.data ? doc.getMesh(o.data) : null;
           },
         });
+        // per-object problems (bodies left out, shape fallbacks) do not stop the simulation
+        for (const i of this.rigidBodies.issues)
+          physicsErrors.push({ source: `rigidbody:${i.objectId}`, message: `${i.level}: ${i.message}` });
       } catch (e) {
         physicsErrors.push({ source: 'rigidbody', message: (e as Error).message });
       }
@@ -234,6 +237,9 @@ export class SceneEvaluator {
       if (o.type === 'ARMATURE') {
         const pose = fs.pose(d);
         if (pose) for (const n of pose.order) parts.push(fmtMatrix(pose.bones.get(n)!.matrix));
+        // bone data the Armature modifier reads besides the posed matrices (names, rest, deform, envelopes)
+        const arm = o.data ? doc.getArmature(o.data) : null;
+        parts.push(arm ? stableStringify(arm.bones) : 'noarm');
       } else if (o.type === 'CURVE' && o.data) {
         const c = fs.curve(o.data);
         parts.push(c ? stableStringify(c) : 'nocurve');

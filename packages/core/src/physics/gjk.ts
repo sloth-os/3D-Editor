@@ -352,7 +352,10 @@ function blowUp(supA: SupportFn, supB: SupportFn, verts: SimplexVertex[]): boole
     if (verts.length < 4) return false;
   }
   // non-degenerate volume
-  const vol = dot(sub(verts[1].w, verts[0].w), cross(sub(verts[2].w, verts[0].w), sub(verts[3].w, verts[0].w)));
+  const vol = dot(
+    sub(verts[1].w, verts[0].w),
+    cross(sub(verts[2].w, verts[0].w), sub(verts[3].w, verts[0].w)),
+  );
   const s = scaleOf();
   return Math.abs(vol) > 1e-14 * s * s * s;
 }

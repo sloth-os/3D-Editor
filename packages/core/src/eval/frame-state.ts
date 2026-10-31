@@ -5,10 +5,11 @@ import { fcurveKey, type SceneDoc } from '../doc/scene-doc';
 import { evaluateFCurve } from '../anim/fcurve';
 import { readChannel, writeChannel } from '../anim/properties';
 import { evaluateDriver } from '../anim/drivers';
-import { computePose } from '../armature/pose';
+import { createPoseEvaluation, type PoseEvaluation } from '../armature/pose';
 import type { ArmaturePose } from '../armature/types';
 import { solveConstraints } from '../constraints/solve';
-import { constraintObjectInfo } from '../constraints/context';
+import { constraintContextFor } from '../constraints/context';
+import { dependencyGraph, inParentLoop } from '../constraints/depgraph';
 import type { ConstraintError } from '../constraints/types';
 import { buildCurvePath, type CurvePath } from '../curve/path';
 
@@ -142,7 +143,8 @@ export class FrameState {
   private readonly worldM = new Map<string, Mat4>();
   private readonly computing = new Set<string>();
   private readonly poses = new Map<string, ArmaturePose | null>();
-  private readonly posing = new Set<string>();
+  /** Incremental pose evaluations (bones are evaluated on demand, see `boneMatrix`). */
+  private readonly poseEvals = new Map<string, PoseEvaluation | null>();
   private readonly paths = new Map<string, CurvePath | null>();
 
   constructor(
@@ -186,6 +188,9 @@ export class FrameState {
     if (cached) return cached;
     const o = this.byId.get(id);
     if (!o || this.computing.has(id)) return null;
+    // a top-level request evaluates the object's dependencies first (dependency order), so long
+    // parent / constraint chains never recurse deeply
+    if (!this.computing.size) for (const dep of dependencyGraph(this).evaluationOrder(id)) this.world(dep);
     this.computing.add(id);
     try {
       const local = compose4(o.location, o.rotation_euler, o.scale);
@@ -193,9 +198,16 @@ export class FrameState {
       let parent = identity4();
       if (o.parent && o.parent !== id && this.byId.has(o.parent)) {
         const pw = this.world(o.parent);
+        const boneParent = o.parent_type === 'BONE' && !!o.parent_bone;
+        // The parent (or the pose of the parent armature) is being evaluated and depends on this
+        // object: a dependency cycle through parenting. Report this object as cyclic (null, not
+        // cached) instead of caching it without its parent; only loops of parent links (corrupt
+        // data) fall back to an identity parent.
+        if (pw ? boneParent && this.boneCycle(o.parent, o.parent_bone) : !inParentLoop(this.byId, id))
+          return null;
         if (pw) {
           parent = pw;
-          if (o.parent_type === 'BONE' && o.parent_bone) {
+          if (boneParent) {
             const b = this.boneMatrix(o.parent, o.parent_bone);
             // Blender: bone children are placed relative to the bone's tail
             if (b) parent = multiply4(b.matrix, translation4([0, b.length, 0]));
@@ -207,16 +219,7 @@ export class FrameState {
       const sim = this.simulated?.get(id);
       if (sim) m = sim;
       else if (o.constraints?.length) {
-        const res = solveConstraints(o.constraints, m, {
-          frame: this.frame,
-          parentMatrix: parent,
-          getWorldMatrix: (t) => this.world(t),
-          getBoneMatrix: (a, b) => this.boneMatrix(a, b),
-          getCurvePath: (c) => this.curvePath(c),
-          ownerId: id,
-          getObjectInfo: (t) => constraintObjectInfo(this, t),
-          getArmaturePose: (a) => this.pose(a),
-        });
+        const res = solveConstraints(o.constraints, m, constraintContextFor(this, id, parent));
         m = res.matrix;
         if (res.errors.length) this.constraintErrors.set(id, res.errors);
       }
@@ -227,35 +230,68 @@ export class FrameState {
     }
   }
 
-  /** Evaluated pose of an armature object (null if not an armature, or cyclic). */
+  /**
+   * Incremental pose evaluation of an armature object (null if not an armature, or while the
+   * armature object's own transform is being computed).
+   */
+  private poseEvaluation(id: string): PoseEvaluation | null {
+    const known = this.poseEvals.get(id);
+    if (known !== undefined) return known;
+    const o = this.byId.get(id);
+    const arm = o?.type === 'ARMATURE' && o.data ? this.doc.getArmature(o.data) : null;
+    if (!o || !arm) {
+      this.poseEvals.set(id, null);
+      return null;
+    }
+    const armatureMatrix = this.world(id);
+    if (!armatureMatrix) return null;
+    let ev = this.poseEvals.get(id);
+    if (!ev) {
+      ev = createPoseEvaluation(arm, o.pose?.bones ?? {}, {
+        frame: this.frame,
+        armatureMatrix,
+        armatureId: id,
+        getWorldMatrix: (t) => this.world(t),
+        getBoneMatrix: (a, b) => this.boneMatrix(a, b),
+      });
+      this.poseEvals.set(id, ev);
+    }
+    return ev;
+  }
+
+  /**
+   * Evaluated pose of an armature object (null if not an armature, or cyclic). Pose problems are
+   * reported in `errors` (source `pose:<id>`).
+   */
   pose(id: string): ArmaturePose | null {
     if (this.poses.has(id)) return this.poses.get(id)!;
-    const o = this.byId.get(id);
-    if (!o || o.type !== 'ARMATURE' || !o.data || this.posing.has(id)) return null;
-    const arm = this.doc.getArmature(o.data);
-    if (!arm) return null;
-    this.posing.add(id);
+    const ev = this.poseEvaluation(id);
+    // asked for while one of its bones is being evaluated: a dependency cycle
+    if (!ev || ev.busy) return null;
     let pose: ArmaturePose | null = null;
     try {
-      pose = computePose(arm, o.pose?.bones ?? {}, {
-        frame: this.frame,
-        armatureMatrix: this.world(id) ?? identity4(),
-        getWorldMatrix: (t) => this.world(t),
-      });
+      pose = ev.result();
+      for (const message of pose.errors ?? []) this.errors.push({ source: `pose:${id}`, message });
     } catch (e) {
       this.errors.push({ source: `pose:${id}`, message: (e as Error).message });
-    } finally {
-      this.posing.delete(id);
     }
     this.poses.set(id, pose);
     return pose;
   }
 
-  /** World-space posed bone matrix (origin at the head, +Y along the bone). */
+  /**
+   * World-space posed bone matrix (origin at the head, +Y along the bone). Only the bone and
+   * what it depends on are evaluated, so this works while other bones of the pose are evaluated.
+   */
   boneMatrix(armatureId: string, bone: string): { matrix: Mat4; length: number } | null {
-    const b = this.pose(armatureId)?.bones.get(bone);
+    const b = this.poseEvaluation(armatureId)?.bone(bone);
     const am = b ? this.world(armatureId) : null;
     return b && am ? { matrix: multiply4(am, b.matrix), length: b.length } : null;
+  }
+
+  /** Whether a bone is being evaluated or depends on one that is (a cycle through bone parenting). */
+  private boneCycle(armatureId: string, bone: string): boolean {
+    return !!this.poseEvaluation(armatureId)?.bone(bone)?.cyclic;
   }
 
   /** Path along the first spline of a CURVE object, with its world matrix. */

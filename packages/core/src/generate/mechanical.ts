@@ -33,7 +33,13 @@ export interface GearParams {
   bore: number;
 }
 
-export const GEAR_DEFAULTS: GearParams = { teeth: 16, radius: 0.5, tooth_depth: 0.08, thickness: 0.1, bore: 0.1 };
+export const GEAR_DEFAULTS: GearParams = {
+  teeth: 16,
+  radius: 0.5,
+  tooth_depth: 0.08,
+  thickness: 0.1,
+  bore: 0.1,
+};
 
 /**
  * Spur gear lying in the XY plane, centred on the origin (z = ±thickness/2), axis = Z. Trapezoidal
@@ -108,7 +114,7 @@ export const SPRING_DEFAULTS: SpringParams = {
   closed_ends: true,
 };
 
-/** Helical coil spring around the Z axis standing on z = 0 (origin at the bottom centre). */
+/** Helical coil spring around the Z axis spanning exactly z = 0 … height (origin at the bottom centre). */
 export function generateSpring(params: Partial<SpringParams> = {}): GeneratorResult {
   const p = { ...SPRING_DEFAULTS, ...params };
   const R = clampNum(p.coil_radius, 1e-3, 1e4, SPRING_DEFAULTS.coil_radius);
@@ -137,6 +143,13 @@ export function generateSpring(params: Partial<SpringParams> = {}): GeneratorRes
   }
   const b = new MeshBuilder();
   addTube(b, path, wr, clampNum(p.wire_segments, 3, 64, 12), { smooth: true });
+  // the polygonal wire does not reach exactly z = 0 / H: snap the extremes (a sub-millimetre stretch)
+  const { min, max } = b.bounds();
+  const span = max[2] - min[2];
+  if (span > 1e-12) {
+    const P = b.positions;
+    for (let i = 2; i < P.length; i += 3) P[i] = ((P[i] - min[2]) / span) * H;
+  }
   return { mesh: b.build(), materials: [MATERIALS.steel] };
 }
 
@@ -178,7 +191,12 @@ export const PIPE_DEFAULTS: PipeParams = {
 };
 
 /** Rounds the interior corners of a polyline with circular arcs (fillets). */
-export function filletPath(points: readonly Vec3[], radius: number, segsPer90: number, cyclic: boolean): Vec3[] {
+export function filletPath(
+  points: readonly Vec3[],
+  radius: number,
+  segsPer90: number,
+  cyclic: boolean,
+): Vec3[] {
   const pts = points.filter((q, i) => i === 0 || len(sub(q, points[i - 1])) > 1e-9);
   if (cyclic) while (pts.length > 2 && len(sub(pts[0], pts[pts.length - 1])) < 1e-9) pts.pop();
   const n = pts.length;
@@ -209,7 +227,11 @@ export function filletPath(points: readonly Vec3[], radius: number, segsPer90: n
     const theta = turn(i);
     // a segment shared by two fillets is split in proportion to their wanted tangent lengths
     const share = (l: number, other: number) => (other > 0 ? (l * tl[i]) / (tl[i] + other) : l);
-    const T = Math.min(tl[i], share(len(sub(q, a)), tl[(i - 1 + n) % n]), share(len(sub(c, q)), tl[(i + 1) % n]));
+    const T = Math.min(
+      tl[i],
+      share(len(sub(q, a)), tl[(i - 1 + n) % n]),
+      share(len(sub(c, q)), tl[(i + 1) % n]),
+    );
     const r = T / Math.tan(theta / 2);
     const start = sub(q, scale(din, T));
     const axis = normalize3(cross3(din, dout));

@@ -49,11 +49,13 @@ export interface PoseContext {
   /** Final world matrix of another object (IK / constraint targets), null if missing or cyclic. */
   getWorldMatrix(id: string): Mat4 | null;
   /**
-   * Optional: id of the armature object being posed. Constraint targets equal to it (with a
-   * `subtarget`) address bones of this armature. Without it, a target whose world matrix equals
-   * `armatureMatrix` and that names one of this armature's bones is treated as self-targeting.
+   * Optional: id of the armature object being posed. Constraint targets equal to it address this
+   * armature (with a `subtarget`: one of its bones). Without it, every target is another object.
    */
   armatureId?: string;
-  /** Optional: world-space posed matrix of a bone of another armature object (bone subtargets). */
+  /**
+   * Optional: world-space posed matrix of a bone of another armature object (bone subtargets);
+   * null when the object is not an armature, has no such bone or depends on this pose (cycle).
+   */
   getBoneMatrix?(armatureObjectId: string, bone: string): { matrix: Mat4; length: number } | null;
 }

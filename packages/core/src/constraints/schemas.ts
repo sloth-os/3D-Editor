@@ -82,13 +82,16 @@ export const dampedTrackSchema = z.object({
   track_axis: trackAxisSchema
     .default('TRACK_Y')
     .describe(
-      'Owner axis that points at the target; the owner turns by the smallest rotation that achieves it',
+      'Owner axis that points at the target; the owner turns by the smallest rotation that achieves it. Use ' +
+        'TRACK_NEGATIVE_Z for cameras and lights (they look along -Z)',
     ),
   head_tail: headTail,
 });
 
 export const lockedTrackSchema = z.object({
-  track_axis: trackAxisSchema.default('TRACK_Y').describe('Owner axis that points towards the target'),
+  track_axis: trackAxisSchema
+    .default('TRACK_Y')
+    .describe('Owner axis that points towards the target (cameras and lights: TRACK_NEGATIVE_Z, they look along -Z)'),
   lock_axis: lockAxisSchema
     .default('LOCK_Z')
     .describe(
@@ -267,8 +270,13 @@ export const followPathSchema = z.object({
     .describe("Offset in frames: the position is taken at the curve's (eval_time - offset) / path_duration"),
   offset_factor: z
     .number()
+    .min(0)
+    .max(1)
     .default(0)
-    .describe('Position along the path when use_fixed_location is on: 0 = start, 1 = end'),
+    .describe(
+      'Position along the path when use_fixed_location is on: 0 = start, 1 = end (animated values are clamped ' +
+        'to 0..1)',
+    ),
   use_fixed_location: flag(
     false,
     'Stay at offset_factor instead of following the curve evaluation time (eval_time)',

@@ -173,7 +173,23 @@ export function generateTerrain(params: Partial<TerrainParams> = {}): GeneratorR
       const k1 = (k + 1) % loop.length;
       b.face([bottom[k], bottom[k1], loop[k1], loop[k]], side);
     }
-    b.face(bottom.slice().reverse(), side);
+    // The base is cut into one strip per grid column (facing down) instead of a single n-gon: the
+    // n-gon's triangulation would be hundreds of slivers spanning the whole terrain, which makes
+    // ray casts (drop to ground, snapping) against the terrain very slow.
+    const B = (i: number, j: number): number => {
+      if (j === 0 && i < n) return bottom[i];
+      if (i === n && j < n) return bottom[n + j];
+      if (j === n && i > 0) return bottom[2 * n + (n - i)];
+      return bottom[3 * n + (n - j)]; // i === 0, j > 0
+    };
+    for (let i = 0; i < n; i++) {
+      const strip: number[] = [];
+      if (i === 0) for (let j = 0; j <= n; j++) strip.push(B(0, j));
+      else strip.push(B(i, 0), B(i, n));
+      if (i === n - 1) for (let j = n; j >= 0; j--) strip.push(B(n, j));
+      else strip.push(B(i + 1, n), B(i + 1, 0));
+      b.face(strip, side);
+    }
   }
   return {
     mesh: b.build(),
@@ -215,7 +231,9 @@ function smoothMinRadius(a: number, b: number, k: number): number {
 /** Rock resting on z = 0, centred on the Z axis. Slot 0: Rock. */
 export function generateRock(params: Partial<RockParams> = {}): GeneratorResult {
   const p = { ...ROCK_DEFAULTS, ...params };
-  const size = (p.size ?? ROCK_DEFAULTS.size).map((v, k) => clampNum(v, 1e-3, 1e4, ROCK_DEFAULTS.size[k])) as Vec3;
+  const size = (p.size ?? ROCK_DEFAULTS.size).map((v, k) =>
+    clampNum(v, 1e-3, 1e4, ROCK_DEFAULTS.size[k]),
+  ) as Vec3;
   const rough = clampNum(p.roughness, 0, 1, ROCK_DEFAULTS.roughness);
   const detail = Math.round(clampNum(p.detail, 1, 6, ROCK_DEFAULTS.detail));
   const facets = Math.round(clampNum(p.facets, 0, 16, ROCK_DEFAULTS.facets));
@@ -242,7 +260,10 @@ export function generateRock(params: Partial<RockParams> = {}): GeneratorResult 
       gain: 0.5,
       type: 'RIDGED',
     });
-    const fine = noise.fractal(d[0] * 7 + off[2], d[1] * 7 + off[0], d[2] * 7 + off[1], { octaves: 2, gain: 0.5 });
+    const fine = noise.fractal(d[0] * 7 + off[2], d[1] * 7 + off[0], d[2] * 7 + off[1], {
+      octaves: 2,
+      gain: 0.5,
+    });
     let r = 1 + rough * (0.55 * big + 0.16 * ridges + 0.05 * fine);
     r = Math.max(0.35, r);
     for (const pl of planes) {

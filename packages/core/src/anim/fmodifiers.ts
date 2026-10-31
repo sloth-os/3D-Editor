@@ -15,7 +15,10 @@ import { gradientNoise3 } from './expression';
  * - Every modifier can be muted (`mute`), blended with the unmodified result by `influence` (when
  *   `use_influence`), and — except STEPPED, whose `frame_start` / `frame_end` configure the stepping
  *   like in Blender's Python API — restricted to a frame range with linear fade ramps
- *   (`use_restricted_range`, `frame_start`, `frame_end`, `blend_in`, `blend_out`).
+ *   (`use_restricted_range`, `frame_start`, `frame_end`, `blend_in`, `blend_out`; inclusive).
+ * - A curve's CYCLIC extrapolation (a curve setting here, not a modifier) repeats the keyframes
+ *   only: time modifiers resample the repeated curve, but value modifiers see the real frame, so
+ *   e.g. NOISE keeps varying from one cycle to the next instead of repeating with it.
  *
  * Parameters use Blender's Python names and defaults and are validated by the exported schemas.
  * List-valued parameters are stored as JSON arrays: GENERATOR `coefficients` (numbers) and
@@ -25,7 +28,13 @@ import { gradientNoise3 } from './expression';
  */
 
 /** F-curve modifier types, in the order they are listed to users. */
-export const FMODIFIER_TYPES: readonly FModifierType[] = ['NOISE', 'STEPPED', 'GENERATOR', 'LIMITS', 'ENVELOPE'];
+export const FMODIFIER_TYPES: readonly FModifierType[] = [
+  'NOISE',
+  'STEPPED',
+  'GENERATOR',
+  'LIMITS',
+  'ENVELOPE',
+];
 
 /** Thrown by {@link normalizeFModifierParams} / {@link createFModifier} for invalid input. */
 export class FModifierError extends Error {
@@ -57,10 +66,16 @@ const rangeShape = {
     .boolean()
     .default(false)
     .describe(
-      'Only apply the modifier strictly between frame_start and frame_end (no effect outside, nor on those two frames)',
+      'Only apply the modifier from frame_start to frame_end inclusive (no effect outside that range)',
     ),
-  frame_start: z.number().default(1).describe('Start of the restricted range (frame, with use_restricted_range)'),
-  frame_end: z.number().default(250).describe('End of the restricted range (frame, with use_restricted_range)'),
+  frame_start: z
+    .number()
+    .default(1)
+    .describe('Start of the restricted range (frame, with use_restricted_range)'),
+  frame_end: z
+    .number()
+    .default(250)
+    .describe('End of the restricted range (frame, with use_restricted_range)'),
   blend_in: z
     .number()
     .min(0)
@@ -119,7 +134,9 @@ export const noiseFModifierSchema = z.strictObject({
     .min(0)
     .max(1)
     .default(0.5)
-    .describe('Amplitude multiplier from one octave to the next: higher = more fine detail (only with depth > 0)'),
+    .describe(
+      'Amplitude multiplier from one octave to the next: higher = more fine detail (only with depth > 0)',
+    ),
   ...influenceShape,
   ...rangeShape,
 });
@@ -135,7 +152,10 @@ export const steppedFModifierSchema = z.strictObject({
     ),
   frame_offset: z.number().default(0).describe('Frame the steps are aligned to'),
   use_frame_start: z.boolean().default(false).describe('Leave the curve unchanged before frame_start'),
-  frame_start: z.number().default(0).describe('Frame before which no stepping happens (with use_frame_start)'),
+  frame_start: z
+    .number()
+    .default(0)
+    .describe('Frame before which no stepping happens (with use_frame_start)'),
   use_frame_end: z.boolean().default(false).describe('Leave the curve unchanged after frame_end'),
   frame_end: z.number().default(0).describe('Frame after which no stepping happens (with use_frame_end)'),
   ...influenceShape,
@@ -189,8 +209,14 @@ export const limitsFModifierSchema = z.strictObject({
 /** One ENVELOPE control point. */
 export const envelopeControlPointSchema = z.strictObject({
   frame: z.number().describe('Frame of the control point'),
-  min: z.number().describe('Output value that reference_value + default_min is mapped to at this frame'),
-  max: z.number().describe('Output value that reference_value + default_max is mapped to at this frame'),
+  min: z
+    .number()
+    .default(-1)
+    .describe('Output value that reference_value + default_min is mapped to at this frame (default -1)'),
+  max: z
+    .number()
+    .default(1)
+    .describe('Output value that reference_value + default_max is mapped to at this frame (default 1)'),
 });
 
 /** ENVELOPE: rescales the curve between per-frame min/max bounds (fade an oscillation in or out). */
@@ -250,6 +276,7 @@ export interface FModifierTypeInfo {
   affects: 'TIME' | 'VALUE' | 'TIME_AND_VALUE';
 }
 
+/** What each modifier type does, for menus, documentation and AI agents. */
 export const FMODIFIER_TYPE_INFO: readonly FModifierTypeInfo[] = [
   {
     type: 'NOISE',
@@ -369,7 +396,8 @@ export function normalizeFModifierParams(
     const issues = res.error.issues
       .map((i) => {
         const where = i.path.join('.') || '(params)';
-        if (i.code === 'unrecognized_keys') return `unknown parameter(s) ${i.keys.map((k) => `'${k}'`).join(', ')}`;
+        if (i.code === 'unrecognized_keys')
+          return `unknown parameter(s) ${i.keys.map((k) => `'${k}'`).join(', ')}`;
         return `${where}: ${i.message}`;
       })
       .join('; ');
@@ -422,9 +450,12 @@ function tolerantParams(type: FModifierType, raw: Record<string, unknown>): FMod
     out[key] = r.success ? r.data : field.safeParse(undefined).data;
   }
   if (type === 'ENVELOPE') {
-    // keep the valid control points of a list with a few bad ones
-    const list = Array.isArray(raw.control_points) ? raw.control_points : [];
-    out.control_points = list.filter((p) => envelopeControlPointSchema.safeParse(p).success);
+    // keep the valid control points (with their defaults filled in) of a list with a few bad ones
+    const list: unknown[] = Array.isArray(raw.control_points) ? raw.control_points : [];
+    out.control_points = list.flatMap((p) => {
+      const r = envelopeControlPointSchema.safeParse(p);
+      return r.success ? [r.data] : [];
+    });
   }
   return finishParams(type, out as unknown as FModifierParams, {});
 }
@@ -554,7 +585,12 @@ const NOISE_SHIFT_Z = 0.7236067977499789;
 function noiseLayer(size: number, x: number, y: number): number {
   return (
     0.5 +
-    0.5 * gradientNoise3((1 + x) / size + NOISE_SHIFT_X, (1 + y) / size + NOISE_SHIFT_Y, 1.1 / size + NOISE_SHIFT_Z)
+    0.5 *
+      gradientNoise3(
+        (1 + x) / size + NOISE_SHIFT_X,
+        (1 + y) / size + NOISE_SHIFT_Y,
+        1.1 / size + NOISE_SHIFT_Z,
+      )
   );
 }
 
@@ -578,13 +614,16 @@ function noiseTurbulence(n: NoiseFModifierParams, t: number): number {
   return sum / total;
 }
 
-/** Influence of a prepared modifier at time t (0 outside its restricted range, ramps inside). */
+/**
+ * Influence of a prepared modifier at time t: 0 outside its restricted range [start, end]
+ * (inclusive, like Blender), linear ramps over the blend-in / blend-out frames inside it.
+ */
 function influenceAt(m: Prepared, t: number): number {
   const r = m.range;
   if (!r) return m.influence;
-  if (!(t > r.start && t < r.end)) return 0;
-  if (r.blendIn > 0 && t < r.start + r.blendIn) return (m.influence * (t - r.start)) / r.blendIn;
-  if (r.blendOut > 0 && t > r.end - r.blendOut) return (m.influence * (r.end - t)) / r.blendOut;
+  if (!(t >= r.start && t <= r.end)) return 0;
+  if (r.blendIn > 0 && t <= r.start + r.blendIn) return (m.influence * (t - r.start)) / r.blendIn;
+  if (r.blendOut > 0 && t >= r.end - r.blendOut) return (m.influence * (r.end - t)) / r.blendOut;
   return m.influence;
 }
 
