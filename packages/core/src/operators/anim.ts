@@ -198,6 +198,54 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
       },
     }),
   );
+  const keyRef = z.object({ fcurve: z.string().describe('F-curve key "<type>:<id>:<path>:<index>"'), frame: z.number() });
+  reg.register(
+    defineOperator({
+      id: 'anim.keyframes_move',
+      label: 'Move Keyframes',
+      description: 'Move keyframes in time by `delta` frames (keys are identified by f-curve key and frame).',
+      category: 'Animation',
+      redoable: true,
+      schema: z.object({ keys: z.array(keyRef).min(1), delta: z.number().default(0) }),
+      execute(ctx, p) {
+        const byCurve = new Map<string, number[]>();
+        for (const k of p.keys) byCurve.set(k.fcurve, [...(byCurve.get(k.fcurve) ?? []), k.frame]);
+        let moved = 0;
+        for (const [key, frames] of byCurve) {
+          const fc = ctx.doc.getFCurve(key);
+          if (!fc) continue;
+          const sel = new Set(frames.map((f) => Math.round(f * 1000)));
+          const movedKeys = fc.keyframes.filter((k) => sel.has(Math.round(k.frame * 1000))).map((k) => ({ ...k, frame: k.frame + p.delta }));
+          const targets = new Set(movedKeys.map((k) => Math.round(k.frame * 1000)));
+          const rest = fc.keyframes.filter((k) => !sel.has(Math.round(k.frame * 1000)) && !targets.has(Math.round(k.frame * 1000)));
+          moved += movedKeys.length;
+          ctx.doc.setFCurve({ ...fc, keyframes: [...rest, ...movedKeys] });
+        }
+        return { moved };
+      },
+    }),
+  );
+  reg.register(
+    defineOperator({
+      id: 'anim.keyframes_remove',
+      label: 'Delete Keyframes',
+      description: 'Delete specific keyframes (by f-curve key and frame). Curves left empty are removed.',
+      category: 'Animation',
+      schema: z.object({ keys: z.array(keyRef).min(1) }),
+      execute(ctx, p) {
+        let removed = 0;
+        for (const k of p.keys) {
+          const fc = ctx.doc.getFCurve(k.fcurve);
+          if (!fc) continue;
+          const next = removeKeyframe(fc, k.frame);
+          removed += fc.keyframes.length - next.keyframes.length;
+          if (next.keyframes.length === 0) ctx.doc.removeFCurve(k.fcurve);
+          else ctx.doc.setFCurve(next);
+        }
+        return { removed };
+      },
+    }),
+  );
   reg.register(
     defineOperator({
       id: 'scene.frame_set',

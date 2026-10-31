@@ -56,3 +56,24 @@ describe('fcurves', () => {
     expect(evaluateFCurve(createFCurve({ target_type: 'object', target_id: 'x', path: 'location', index: 0 }), 3)).toBeUndefined();
   });
 });
+
+import { SceneDoc, createEditorState, createOperatorRegistry, fcurveKey, type OperatorContext } from '../src';
+
+describe('keyframe editing operators', () => {
+  it('moves and removes keyframes', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const reg = createOperatorRegistry();
+    const ctx: OperatorContext = { doc, state: createEditorState(), origin: doc.origin, source: 'test', report: () => {} };
+    reg.run(ctx, 'object.empty_add');
+    ctx.state.frame = 1;
+    reg.run(ctx, 'anim.keyframe_insert', { type: 'Location' });
+    ctx.state.frame = 10;
+    reg.run(ctx, 'anim.keyframe_insert', { type: 'Location' });
+    const id = ctx.state.activeId!;
+    const key = fcurveKey({ target_type: 'object', target_id: id, path: 'location', index: 0 });
+    expect(reg.run(ctx, 'anim.keyframes_move', { keys: [{ fcurve: key, frame: 10 }], delta: 5 }).ok).toBe(true);
+    expect(doc.getFCurve(key)!.keyframes.map((k) => k.frame)).toEqual([1, 15]);
+    expect(reg.run(ctx, 'anim.keyframes_remove', { keys: [{ fcurve: key, frame: 1 }, { fcurve: key, frame: 15 }] }).ok).toBe(true);
+    expect(doc.getFCurve(key)).toBeNull();
+  });
+});

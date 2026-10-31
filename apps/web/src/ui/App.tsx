@@ -9,6 +9,8 @@ import { Properties } from './properties/Properties';
 import { Timeline } from './Timeline';
 import { InfoLog, Console, Diagnostics } from './InfoLog';
 import { Viewport } from './Viewport';
+import { DopeSheet } from './DopeSheet';
+import { UVEditor } from './UVEditor';
 import { DialogHost, ProjectList } from './dialogs/Dialogs';
 import { hoveredArea, run } from '../editor/editor';
 import { createProject } from '../project/manager';
@@ -147,13 +149,15 @@ function Area(p: { kind: 'outliner' | 'properties' | 'timeline' | 'console' | 'o
   );
 }
 
-type BottomEditor = 'timeline' | 'info' | 'console' | 'diagnostics';
+type BottomEditor = 'timeline' | 'dopesheet' | 'uv' | 'info' | 'console' | 'diagnostics';
 
 function BottomArea({ s, initial }: { s: ProjectSession; initial: BottomEditor }) {
   const [ed, setEd] = useState<BottomEditor>(initial);
   useEffect(() => setEd(initial), [initial]);
   const tabs: { id: BottomEditor; label: string }[] = [
     { id: 'timeline', label: 'Timeline' },
+    { id: 'dopesheet', label: 'Dope Sheet' },
+    { id: 'uv', label: 'UV Editor' },
     { id: 'info', label: 'Info' },
     { id: 'console', label: 'Console' },
     { id: 'diagnostics', label: 'Diagnostics' },
@@ -169,6 +173,8 @@ function BottomArea({ s, initial }: { s: ProjectSession; initial: BottomEditor }
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
         {ed === 'timeline' && <Timeline session={s} />}
+        {ed === 'dopesheet' && <DopeSheet session={s} />}
+        {ed === 'uv' && <UVEditor session={s} />}
         {ed === 'info' && <InfoLog />}
         {ed === 'console' && <Console />}
         {ed === 'diagnostics' && <Diagnostics />}
@@ -184,8 +190,8 @@ function Editor({ s }: { s: ProjectSession }) {
   const [rightW, setRightW] = usePersistentSize('right', 330);
   const [outlinerH, setOutlinerH] = usePersistentSize('outliner', 230);
   const [bottomH, setBottomH] = usePersistentSize('bottom', 150);
-  const bottomEditor: BottomEditor = ws === 'Scripting' ? 'console' : 'timeline';
-  const showBottom = ws !== 'Modeling';
+  const bottomEditor: BottomEditor = ws === 'Scripting' ? 'console' : ws === 'Animation' ? 'dopesheet' : ws === 'Shading' ? 'uv' : 'timeline';
+  const showBottom = true;
   const bottom = ws === 'Animation' || ws === 'Scripting' ? Math.max(bottomH, 260) : bottomH;
   return (
     <div class="main">
