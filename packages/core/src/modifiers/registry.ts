@@ -1,0 +1,118 @@
+import type { z } from 'zod';
+import type { Mat4 } from '../math/types';
+import type { MeshData } from '../mesh/types';
+import type { ModifierData } from '../doc/types';
+
+/** Context available to modifiers during stack evaluation. */
+export interface ModifierContext {
+  /** Current (possibly fractional) frame. */
+  frame: number;
+  /** World matrix of the object owning the modifier stack. */
+  objectMatrix: Mat4;
+  /**
+   * Evaluated mesh + world matrix of another object (e.g. the Boolean operand).
+   * Returns null if the object does not exist, is not a mesh or would create a cycle.
+   */
+  getObjectMesh(id: string): { mesh: MeshData; matrix: Mat4 } | null;
+  /** True when evaluating for final render (uses `show_render` instead of `show_viewport`). */
+  forRender: boolean;
+  /** True when the owning object is in edit mode. */
+  editMode: boolean;
+}
+
+export type ModifierCategory = 'GENERATE' | 'DEFORM' | 'NORMALS' | 'EDIT';
+
+/**
+ * A modifier type. `schema` validates and fills in defaults for the stored `params`
+ * (`schema.parse({})` must succeed and yield the defaults). Parameter names follow Blender.
+ */
+export interface ModifierDef<S extends z.ZodObject<any> = z.ZodObject<any>> {
+  /** Blender type identifier, e.g. 'SUBSURF'. */
+  type: string;
+  /** Human readable label, e.g. 'Subdivision Surface'. */
+  label: string;
+  category: ModifierCategory;
+  description: string;
+  schema: S;
+  /** Whether the result depends on the current frame. */
+  timeDependent?: boolean | ((params: z.infer<S>) => boolean);
+  /** Object ids this modifier reads (e.g. Boolean operand, Mirror object). */
+  dependencies?: (params: z.infer<S>) => string[];
+  /** Pure function: must not mutate `mesh`. */
+  apply(mesh: MeshData, params: z.infer<S>, ctx: ModifierContext): MeshData;
+}
+
+const registry = new Map<string, ModifierDef>();
+
+export function registerModifier<S extends z.ZodObject<any>>(def: ModifierDef<S>): void {
+  registry.set(def.type, def as unknown as ModifierDef);
+}
+
+export function getModifierDef(type: string): ModifierDef | undefined {
+  return registry.get(type);
+}
+
+export function listModifierDefs(): ModifierDef[] {
+  return [...registry.values()];
+}
+
+/** Default parameters for a modifier type (empty object for unknown types). */
+export function defaultModifierParams(type: string): Record<string, unknown> {
+  const def = registry.get(type);
+  return def ? (def.schema.parse({}) as Record<string, unknown>) : {};
+}
+
+export function isModifierTimeDependent(mod: ModifierData): boolean {
+  const def = registry.get(mod.type);
+  if (!def?.timeDependent) return false;
+  if (typeof def.timeDependent === 'boolean') return def.timeDependent;
+  try {
+    return def.timeDependent(def.schema.parse(mod.params ?? {}));
+  } catch {
+    return false;
+  }
+}
+
+export function modifierDependencies(mod: ModifierData): string[] {
+  const def = registry.get(mod.type);
+  if (!def?.dependencies) return [];
+  try {
+    return def.dependencies(def.schema.parse(mod.params ?? {})).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+export interface ModifierStackResult {
+  mesh: MeshData;
+  errors: { modifierId: string; message: string }[];
+}
+
+/** Whether a modifier is active in the given evaluation mode. */
+export function isModifierEnabled(mod: ModifierData, ctx: Pick<ModifierContext, 'forRender' | 'editMode'>): boolean {
+  if (ctx.forRender) return mod.show_render !== false;
+  if (mod.show_viewport === false) return false;
+  if (ctx.editMode && mod.show_in_editmode === false) return false;
+  return true;
+}
+
+/** Applies the enabled modifiers in order. Failing modifiers are skipped and reported. */
+export function evaluateModifierStack(mesh: MeshData, modifiers: ModifierData[], ctx: ModifierContext): ModifierStackResult {
+  let cur = mesh;
+  const errors: ModifierStackResult['errors'] = [];
+  for (const mod of modifiers) {
+    if (!isModifierEnabled(mod, ctx)) continue;
+    const def = registry.get(mod.type);
+    if (!def) {
+      errors.push({ modifierId: mod.id, message: `Unknown modifier type ${mod.type}` });
+      continue;
+    }
+    try {
+      const params = def.schema.parse(mod.params ?? {});
+      cur = def.apply(cur, params, ctx);
+    } catch (err) {
+      errors.push({ modifierId: mod.id, message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return { mesh: cur, errors };
+}

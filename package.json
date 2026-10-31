@@ -1,0 +1,43 @@
+{
+  "name": "3d-editor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Web-based collaborative 3D editor (Blender-inspired) with offline PWA, WebDAV storage, real-time sync, MCP control and full observability.",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "e2e"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "npm run dev -w @3d-editor/web",
+    "dev:server": "npm run dev -w @3d-editor/server",
+    "build": "npm run build -w @3d-editor/web && npm run build -w @3d-editor/server",
+    "start": "node apps/server/dist/main.js",
+    "typecheck": "tsc -p packages/core --noEmit && tsc -p apps/server --noEmit && tsc -p apps/web --noEmit && tsc -p e2e --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run --project core --project web --project server",
+    "test:unit": "vitest run --project core --project web --project server",
+    "test:integration": "vitest run --project integration",
+    "test:coverage": "vitest run --project core --project web --project server --coverage",
+    "test:e2e": "npm run test -w @3d-editor/e2e",
+    "test:all": "npm run test:unit && npm run test:integration && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "22.20.5",
+    "@vitest/coverage-v8": "5.0.5",
+    "eslint": "10.14.0",
+    "globals": "17.13.0",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "vitest": "5.0.5"
+  }
+}

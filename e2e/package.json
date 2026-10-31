@@ -1,0 +1,19 @@
+{
+  "name": "@3d-editor/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Real end-to-end tests: built server + real browser (Playwright) + real WebDAV server + real MCP client.",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@3d-editor/core": "0.1.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@playwright/test": "1.63.0",
+    "webdav-server": "2.6.3",
+    "yjs": "13.6.33"
+  }
+}

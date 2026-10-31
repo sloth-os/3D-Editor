@@ -1,0 +1,37 @@
+{
+  "name": "@3d-editor/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser PWA for the 3D editor (Preact UI + three.js viewport).",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p . --noEmit"
+  },
+  "dependencies": {
+    "@3d-editor/core": "0.1.0",
+    "@preact/signals": "2.11.4",
+    "idb": "8.0.4",
+    "lib0": "0.2.119",
+    "preact": "10.29.8",
+    "three": "0.187.0",
+    "web-vitals": "6.2.3",
+    "workbox-window": "7.4.1",
+    "y-indexeddb": "9.0.12",
+    "y-protocols": "1.0.7",
+    "yjs": "13.6.33",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "2.10.6",
+    "@testing-library/preact": "3.2.6",
+    "@types/three": "0.187.0",
+    "fake-indexeddb": "6.2.7",
+    "happy-dom": "21.0.4",
+    "vite": "8.3.5",
+    "vite-plugin-pwa": "2.0.0"
+  }
+}
