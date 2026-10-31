@@ -516,20 +516,26 @@ export class ViewportInteraction {
     const mode = st.selectMode;
     if (mode === 'VERT') {
       const verts = new Set(extend || subtract ? cur.verts : []);
-      for (const v of inside) subtract ? verts.delete(v) : verts.add(v);
+      for (const v of inside) {
+        if (subtract) verts.delete(v);
+        else verts.add(v);
+      }
       st.meshSelection = selectionFromVerts(mesh, verts);
     } else if (mode === 'EDGE') {
       const edges = new Set(extend || subtract ? cur.edges : []);
       for (const [a, b] of this.engine.edit.edges)
         if (inside.has(a) && inside.has(b)) {
           const k = edgeKey(a, b);
-          subtract ? edges.delete(k) : edges.add(k);
+          if (subtract) edges.delete(k);
+          else edges.add(k);
         }
       st.meshSelection = selectionFromEdges(mesh, edges);
     } else {
       const faces = new Set(extend || subtract ? cur.faces : []);
       mesh.faces.forEach((f, i) => {
-        if (f.every((v) => inside.has(v))) subtract ? faces.delete(i) : faces.add(i);
+        if (!f.every((v) => inside.has(v))) return;
+        if (subtract) faces.delete(i);
+        else faces.add(i);
       });
       st.meshSelection = selectionFromFaces(mesh, faces);
     }

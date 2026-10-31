@@ -119,12 +119,11 @@ export function cameraLines(c: CameraData, aspect: number, size = 1): number[] {
   let hw: number;
   let hh: number;
   const d = size;
-  let apex: [number, number, number] = [0, 0, 0];
+  const apex: [number, number, number] = [0, 0, 0];
   if (c.type === 'ORTHO') {
     const e = orthoHalfExtents(c, aspect);
     hw = e.halfW;
     hh = e.halfH;
-    apex = [0, 0, 0];
     out.push(-hw, -hh, 0, -hw, -hh, -d, hw, -hh, 0, hw, -hh, -d, hw, hh, 0, hw, hh, -d, -hw, hh, 0, -hw, hh, -d);
   } else {
     const fov = cameraFovY(c, aspect);
