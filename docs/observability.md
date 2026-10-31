@@ -25,10 +25,19 @@ operators of a deployment can disable ingestion with `TELEMETRY_ENABLED=false`.
   are redacted.
 * **Traces**: HTTP requests, WebSocket message handling, persistence load/save, MCP tool calls and
   RPC round trips, exported with OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
-* **Metrics** (`/metrics`, Prometheus): sync connections/rooms/messages/update sizes,
-  persistence operations and latency, HTTP requests, MCP tool calls and latency, plus metrics
-  aggregated from browser telemetry (`editor_operator_executions_total{operator,source,status}`,
-  `editor_operator_duration_seconds`, client frame time, sync latency, client log counts).
+* **Metrics** (`/metrics`, Prometheus):
+  * server: `sync_connections`, `sync_rooms`, `sync_messages_total{type,direction}`,
+    `sync_update_bytes`, `sync_rpc_requests_total`, `persistence_operations_total{op,status}`,
+    `persistence_duration_seconds{op}`, `http_requests_total`, `http_request_duration_seconds`,
+    `mcp_sessions`, `mcp_tool_calls_total{tool,status}`, `mcp_tool_duration_seconds{tool}`,
+    `telemetry_payloads_total`, `telemetry_forward_failures_total`, plus Node.js runtime metrics
+  * aggregated from browsers: `editor_operator_executions_total{operator,source,status}`,
+    `editor_operator_duration_seconds{operator}`, `editor_client_spans_total`,
+    `editor_client_logs_total{severity}`, `editor_fps`, `editor_frame_time_seconds`,
+    `editor_scene_triangles`, `editor_sync_latency_seconds`, `editor_storage_save_seconds`,
+    `editor_web_vitals_{lcp,inp,fcp,ttfb}_seconds`, `editor_web_vitals_cls`
+  * undo/redo counters per operator (`editor.undo` / `editor.redo` with `undo.operator`) and other
+    client counters are forwarded to the OTLP collector for product analysis
 * **Health**: `/healthz` (liveness) and `/readyz` (persistence reachable).
 
 ## Running the stack
