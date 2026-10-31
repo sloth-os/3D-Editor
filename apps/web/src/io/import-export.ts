@@ -67,7 +67,10 @@ export function downloadBytes(bytes: Uint8Array, filename: string, mime: string)
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
-export function exportAndDownload(format: ExportFormat, opts: { selectedOnly: boolean; applyModifiers: boolean }): void {
+export function exportAndDownload(
+  format: ExportFormat,
+  opts: { selectedOnly: boolean; applyModifiers: boolean },
+): void {
   const s = session.value;
   if (!s) return;
   const span = telemetry.startSpan(`export ${format}`, { 'file.format': format });

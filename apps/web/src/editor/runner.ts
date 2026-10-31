@@ -1,5 +1,11 @@
 import { signal } from '@preact/signals';
-import type { OperatorContext, OperatorRegistry, OperatorSource, ReportLevel, RunResult } from '@3d-editor/core';
+import type {
+  OperatorContext,
+  OperatorRegistry,
+  OperatorSource,
+  ReportLevel,
+  RunResult,
+} from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
 import { telemetry } from '../telemetry/telemetry';
 import { toast } from '../app/store';
@@ -26,7 +32,11 @@ export interface LastOperator {
   /** Undo stack depth right after it ran; redo is only valid while unchanged. */
   undoDepth: number;
   /** Editor selection state captured right before the operator ran. */
-  before: { selectedIds: string[]; activeId: string | null; meshSelection: ProjectSession['state']['meshSelection'] };
+  before: {
+    selectedIds: string[];
+    activeId: string | null;
+    meshSelection: ProjectSession['state']['meshSelection'];
+  };
 }
 
 export const lastOperator = signal<LastOperator | null>(null);
@@ -72,7 +82,11 @@ export function runOperator(
       else if (level === 'WARNING') toast(message, 'warning');
     },
   };
-  const before = { selectedIds: session.state.selectedIds, activeId: session.state.activeId, meshSelection: session.state.meshSelection };
+  const before = {
+    selectedIds: session.state.selectedIds,
+    activeId: session.state.activeId,
+    meshSelection: session.state.meshSelection,
+  };
   session.undo.stopCapturing();
   session.currentOperator = id;
   const res = registry.run(ctx, id, params);
@@ -85,7 +99,13 @@ export function runOperator(
   } else span.setError(res.error ?? 'failed');
   span.end();
   if (res.ok && def?.redoable) {
-    lastOperator.value = { id, label: def.label, params: res.params, undoDepth: session.undo.undoStack.length, before };
+    lastOperator.value = {
+      id,
+      label: def.label,
+      params: res.params,
+      undoDepth: session.undo.undoStack.length,
+      before,
+    };
   } else if (res.ok && def && def.undo !== false && !def.uiOnly) {
     lastOperator.value = null;
   }
@@ -93,7 +113,11 @@ export function runOperator(
 }
 
 /** Re-runs the last redoable operator with new parameters (Adjust Last Operation). */
-export function redoLast(session: ProjectSession, registry: OperatorRegistry, params: unknown): RunResult | null {
+export function redoLast(
+  session: ProjectSession,
+  registry: OperatorRegistry,
+  params: unknown,
+): RunResult | null {
   const last = lastOperator.value;
   if (!last) return null;
   if (session.undo.undoStack.length !== last.undoDepth) {
@@ -103,7 +127,8 @@ export function redoLast(session: ProjectSession, registry: OperatorRegistry, pa
   if (last.undoDepth > 0) session.undo.undo();
   // restore the selection the operator originally ran with (operators may change it)
   session.state.selectedIds = last.before.selectedIds.filter((id) => session.doc.getObject(id));
-  session.state.activeId = last.before.activeId && session.doc.getObject(last.before.activeId) ? last.before.activeId : null;
+  session.state.activeId =
+    last.before.activeId && session.doc.getObject(last.before.activeId) ? last.before.activeId : null;
   session.state.meshSelection = last.before.meshSelection;
   const res = runOperator(session, registry, last.id, params, 'redo');
   if (res.ok) session.undo.redoStack.length = 0;

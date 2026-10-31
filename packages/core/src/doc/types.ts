@@ -13,7 +13,8 @@ export const SCHEMA_VERSION = 1;
 export const ROOT_COLLECTION_ID = 'root';
 
 export type ObjectType = 'MESH' | 'EMPTY' | 'CAMERA' | 'LIGHT';
-export type EmptyDisplayType = 'PLAIN_AXES' | 'ARROWS' | 'SINGLE_ARROW' | 'CIRCLE' | 'CUBE' | 'SPHERE' | 'CONE';
+export type EmptyDisplayType =
+  'PLAIN_AXES' | 'ARROWS' | 'SINGLE_ARROW' | 'CIRCLE' | 'CUBE' | 'SPHERE' | 'CONE';
 export type DisplayType = 'TEXTURED' | 'SOLID' | 'WIRE' | 'BOUNDS';
 
 export interface ModifierData {
@@ -107,7 +108,8 @@ export interface TextureSlot {
   offset: Vec2;
 }
 
-export type MaterialTextureChannel = 'base_color' | 'metallic' | 'roughness' | 'normal' | 'emission' | 'alpha';
+export type MaterialTextureChannel =
+  'base_color' | 'metallic' | 'roughness' | 'normal' | 'emission' | 'alpha';
 export type BlendMethod = 'OPAQUE' | 'CLIP' | 'BLEND';
 
 /** Principled-BSDF style physically based material. Colors are linear RGB(A). */
@@ -239,4 +241,5 @@ export interface SceneSnapshot {
   fcurves: FCurve[];
 }
 
-export type DatablockKind = 'objects' | 'meshes' | 'materials' | 'lights' | 'cameras' | 'images' | 'collections';
+export type DatablockKind =
+  'objects' | 'meshes' | 'materials' | 'lights' | 'cameras' | 'images' | 'collections';

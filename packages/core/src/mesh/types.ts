@@ -140,7 +140,12 @@ export interface MeshStats {
 }
 
 export function meshStats(m: MeshData): MeshStats {
-  return { vertices: vertexCount(m), edges: countEdges(m), faces: m.faces.length, triangles: countTriangles(m) };
+  return {
+    vertices: vertexCount(m),
+    edges: countEdges(m),
+    faces: m.faces.length,
+    triangles: countTriangles(m),
+  };
 }
 
 /** Axis-aligned bounding box; returns null for empty meshes. */
@@ -211,7 +216,8 @@ export function removeFaces(m: MeshData, remove: Set<number>): void {
 /** Drops edge attributes and loose edges referring to edges that no longer exist. */
 export function pruneEdgeData(m: MeshData): void {
   const faceEdges = new Set<string>();
-  for (const f of m.faces) for (let i = 0; i < f.length; i++) faceEdges.add(edgeKey(f[i], f[(i + 1) % f.length]));
+  for (const f of m.faces)
+    for (let i = 0; i < f.length; i++) faceEdges.add(edgeKey(f[i], f[(i + 1) % f.length]));
   const loose: number[] = [];
   const seen = new Set<string>();
   for (let i = 0; i < m.looseEdges.length; i += 2) {
@@ -230,7 +236,12 @@ export function pruneEdgeData(m: MeshData): void {
 }
 
 /** Appends `src` (optionally transformed by `transform`) into `dst`. Returns the vertex offset. */
-export function appendMesh(dst: MeshData, src: MeshData, transform?: (p: Vec3) => Vec3, materialOffset = 0): number {
+export function appendMesh(
+  dst: MeshData,
+  src: MeshData,
+  transform?: (p: Vec3) => Vec3,
+  materialOffset = 0,
+): number {
   const offset = vertexCount(dst);
   const n = vertexCount(src);
   for (let i = 0; i < n; i++) {

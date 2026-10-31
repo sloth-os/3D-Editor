@@ -21,7 +21,9 @@ export function UVEditor({ session: s }: { session: ProjectSession }) {
     const info = s.doc.getImage(texId);
     if (!bytes || !info) return;
     let cancelled = false;
-    void createImageBitmap(new Blob([bytes as BlobPart], { type: info.mime })).then((b) => !cancelled && setImg(b));
+    void createImageBitmap(new Blob([bytes as BlobPart], { type: info.mime })).then(
+      (b) => !cancelled && setImg(b),
+    );
     return () => {
       cancelled = true;
     };
@@ -54,7 +56,11 @@ export function UVEditor({ session: s }: { session: ProjectSession }) {
     if (!mesh?.uvs) {
       g.fillStyle = '#999';
       g.font = '12px system-ui';
-      g.fillText(mesh ? 'No UV map — use UV › Unwrap in Edit Mode' : 'Select a mesh object', ox + 10, oy + 20);
+      g.fillText(
+        mesh ? 'No UV map — use UV › Unwrap in Edit Mode' : 'Select a mesh object',
+        ox + 10,
+        oy + 20,
+      );
       return;
     }
     const onlySel = mode === 'EDIT' && sel.faces.size > 0;

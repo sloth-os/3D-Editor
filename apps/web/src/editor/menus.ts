@@ -105,8 +105,18 @@ export const HELP_MENU = (open: (k: 'shortcuts' | 'about') => void): MenuItem[] 
 ];
 
 export const VIEW_MENU = (): MenuItem[] => [
-  { label: 'Toolbar', op: 'view3d.toggle_toolbar', shortcut: 'T', checked: () => !!session.value?.view.toolbar.value },
-  { label: 'Sidebar', op: 'view3d.toggle_sidebar', shortcut: 'N', checked: () => !!session.value?.view.sidebar.value },
+  {
+    label: 'Toolbar',
+    op: 'view3d.toggle_toolbar',
+    shortcut: 'T',
+    checked: () => !!session.value?.view.toolbar.value,
+  },
+  {
+    label: 'Sidebar',
+    op: 'view3d.toggle_sidebar',
+    shortcut: 'N',
+    checked: () => !!session.value?.view.sidebar.value,
+  },
   sep,
   { label: 'Frame Selected', op: 'view3d.view_selected', shortcut: 'Numpad .' },
   { label: 'Frame All', op: 'view3d.view_all', shortcut: 'Home' },
@@ -126,9 +136,18 @@ export const VIEW_MENU = (): MenuItem[] => [
     ],
   },
   sep,
-  { label: 'X-Ray', op: 'view3d.toggle_xray', shortcut: 'Alt Z', checked: () => !!session.value?.view.xray.value },
+  {
+    label: 'X-Ray',
+    op: 'view3d.toggle_xray',
+    shortcut: 'Alt Z',
+    checked: () => !!session.value?.view.xray.value,
+  },
   { label: 'Overlays', op: 'view3d.toggle_overlays', checked: () => !!session.value?.view.overlays.value },
-  { label: 'Wireframe Overlay', op: 'view3d.toggle_wireframe_overlay', checked: () => !!session.value?.view.showWireframe.value },
+  {
+    label: 'Wireframe Overlay',
+    op: 'view3d.toggle_wireframe_overlay',
+    checked: () => !!session.value?.view.showWireframe.value,
+  },
   sep,
   { label: 'Play Animation', op: 'screen.animation_play', shortcut: 'Space' },
 ];
@@ -140,7 +159,11 @@ export const SELECT_MENU_OBJECT = (): MenuItem[] => [
   sep,
   {
     label: 'Select All by Type',
-    submenu: (['MESH', 'EMPTY', 'CAMERA', 'LIGHT'] as const).map((t) => ({ label: t.charAt(0) + t.slice(1).toLowerCase(), op: 'object.select_by_type', params: { type: t } })),
+    submenu: (['MESH', 'EMPTY', 'CAMERA', 'LIGHT'] as const).map((t) => ({
+      label: t.charAt(0) + t.slice(1).toLowerCase(),
+      op: 'object.select_by_type',
+      params: { type: t },
+    })),
   },
 ];
 
@@ -170,10 +193,26 @@ export const OBJECT_MENU = (): MenuItem[] => [
   {
     label: 'Apply',
     submenu: [
-      { label: 'Location', op: 'object.transform_apply', params: { location: true, rotation: false, scale: false } },
-      { label: 'Rotation', op: 'object.transform_apply', params: { location: false, rotation: true, scale: false } },
-      { label: 'Scale', op: 'object.transform_apply', params: { location: false, rotation: false, scale: true } },
-      { label: 'All Transforms', op: 'object.transform_apply', params: { location: true, rotation: true, scale: true } },
+      {
+        label: 'Location',
+        op: 'object.transform_apply',
+        params: { location: true, rotation: false, scale: false },
+      },
+      {
+        label: 'Rotation',
+        op: 'object.transform_apply',
+        params: { location: false, rotation: true, scale: false },
+      },
+      {
+        label: 'Scale',
+        op: 'object.transform_apply',
+        params: { location: false, rotation: false, scale: true },
+      },
+      {
+        label: 'All Transforms',
+        op: 'object.transform_apply',
+        params: { location: true, rotation: true, scale: true },
+      },
       sep,
       { label: 'Visual Geometry to Mesh', op: 'object.convert' },
     ],
@@ -205,10 +244,20 @@ export const OBJECT_MENU = (): MenuItem[] => [
     submenu: [
       { label: 'Object (Keep Transform)', op: 'object.parent_set', shortcut: 'Ctrl P' },
       { label: 'Clear Parent', op: 'object.parent_clear', params: { type: 'CLEAR' } },
-      { label: 'Clear and Keep Transform', op: 'object.parent_clear', params: { type: 'CLEAR_KEEP_TRANSFORM' }, shortcut: 'Alt P' },
+      {
+        label: 'Clear and Keep Transform',
+        op: 'object.parent_clear',
+        params: { type: 'CLEAR_KEEP_TRANSFORM' },
+        shortcut: 'Alt P',
+      },
     ],
   },
-  { label: 'Move to Collection', op: 'object.move_to_collection', params: { new_collection_name: 'Collection' }, shortcut: 'M' },
+  {
+    label: 'Move to Collection',
+    op: 'object.move_to_collection',
+    params: { new_collection_name: 'Collection' },
+    shortcut: 'M',
+  },
   sep,
   { label: 'Shade Smooth', op: 'object.shade_smooth' },
   { label: 'Shade Auto Smooth', op: 'object.shade_auto_smooth' },
@@ -231,7 +280,12 @@ export const OBJECT_MENU = (): MenuItem[] => [
     submenu: [
       { label: 'Show Hidden Objects', op: 'object.hide_view_clear', shortcut: 'Alt H' },
       { label: 'Hide Selected', op: 'object.hide_view_set', shortcut: 'H' },
-      { label: 'Hide Unselected', op: 'object.hide_view_set', params: { unselected: true }, shortcut: 'Shift H' },
+      {
+        label: 'Hide Unselected',
+        op: 'object.hide_view_set',
+        params: { unselected: true },
+        shortcut: 'Shift H',
+      },
     ],
   },
   sep,
@@ -241,7 +295,11 @@ export const OBJECT_MENU = (): MenuItem[] => [
 export const SNAP_MENU = (): MenuItem[] => [
   { title: 'Snap' },
   { label: 'Selection to Cursor', op: 'view3d.snap_selected_to_cursor' },
-  { label: 'Selection to Cursor (Keep Offset)', op: 'view3d.snap_selected_to_cursor', params: { use_offset: true } },
+  {
+    label: 'Selection to Cursor (Keep Offset)',
+    op: 'view3d.snap_selected_to_cursor',
+    params: { use_offset: true },
+  },
   { label: 'Selection to Grid', op: 'view3d.snap_selected_to_grid' },
   sep,
   { label: 'Cursor to Selected', op: 'view3d.snap_cursor_to_selected' },
@@ -286,7 +344,12 @@ export const MESH_MENU = (): MenuItem[] => [
     label: 'Normals',
     submenu: [
       { label: 'Flip', op: 'mesh.flip_normals' },
-      { label: 'Recalculate Outside', op: 'mesh.normals_make_consistent', params: { inside: false }, shortcut: 'Shift N' },
+      {
+        label: 'Recalculate Outside',
+        op: 'mesh.normals_make_consistent',
+        params: { inside: false },
+        shortcut: 'Shift N',
+      },
       { label: 'Recalculate Inside', op: 'mesh.normals_make_consistent', params: { inside: true } },
     ],
   },
@@ -349,10 +412,30 @@ export const SEPARATE_MENU = (): MenuItem[] => [
 
 export const SHADING_MENU = (): MenuItem[] => [
   { title: 'Shading' },
-  { label: 'Wireframe', op: 'view3d.toggle_shading', params: { type: 'WIREFRAME' }, checked: () => session.value?.view.shading.value === 'WIREFRAME' },
-  { label: 'Solid', op: 'view3d.toggle_shading', params: { type: 'SOLID' }, checked: () => session.value?.view.shading.value === 'SOLID' },
-  { label: 'Material Preview', op: 'view3d.toggle_shading', params: { type: 'MATERIAL' }, checked: () => session.value?.view.shading.value === 'MATERIAL' },
-  { label: 'Rendered', op: 'view3d.toggle_shading', params: { type: 'RENDERED' }, checked: () => session.value?.view.shading.value === 'RENDERED' },
+  {
+    label: 'Wireframe',
+    op: 'view3d.toggle_shading',
+    params: { type: 'WIREFRAME' },
+    checked: () => session.value?.view.shading.value === 'WIREFRAME',
+  },
+  {
+    label: 'Solid',
+    op: 'view3d.toggle_shading',
+    params: { type: 'SOLID' },
+    checked: () => session.value?.view.shading.value === 'SOLID',
+  },
+  {
+    label: 'Material Preview',
+    op: 'view3d.toggle_shading',
+    params: { type: 'MATERIAL' },
+    checked: () => session.value?.view.shading.value === 'MATERIAL',
+  },
+  {
+    label: 'Rendered',
+    op: 'view3d.toggle_shading',
+    params: { type: 'RENDERED' },
+    checked: () => session.value?.view.shading.value === 'RENDERED',
+  },
 ];
 
 export const VIEW_PIE = (): MenuItem[] => [

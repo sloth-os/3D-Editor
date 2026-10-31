@@ -26,7 +26,18 @@ export function studioMatcap(): THREE.Texture {
         }
         const n = new THREE.Vector3(nx, ny, Math.sqrt(1 - r2));
         const diff = Math.max(0, n.dot(light)) * 0.75 + Math.max(0, n.dot(fill)) * 0.25;
-        const spec = Math.pow(Math.max(0, n.clone().reflect(new THREE.Vector3(0, 0, 1)).negate().dot(light)), 24) * 0.25;
+        const spec =
+          Math.pow(
+            Math.max(
+              0,
+              n
+                .clone()
+                .reflect(new THREE.Vector3(0, 0, 1))
+                .negate()
+                .dot(light),
+            ),
+            24,
+          ) * 0.25;
         const rim = Math.pow(1 - n.z, 3) * 0.18;
         const v = Math.min(1, 0.16 + diff * 0.82 + spec + rim);
         const c = Math.round(Math.pow(v, 1 / 2.2) * 255);
@@ -92,7 +103,8 @@ export function buildMaterial(
     const mat = new THREE.MeshMatcapMaterial({ matcap: studioMatcap() });
     if (m) mat.color.setRGB(m.base_color[0], m.base_color[1], m.base_color[2]);
     else mat.color.copy(DEFAULT_GREY);
-    if (opts.objectColor && !m) mat.color.setRGB(opts.objectColor[0], opts.objectColor[1], opts.objectColor[2]);
+    if (opts.objectColor && !m)
+      mat.color.setRGB(opts.objectColor[0], opts.objectColor[1], opts.objectColor[2]);
     mat.vertexColors = !!opts.vertexColors;
     mat.side = m?.use_backface_culling ? THREE.FrontSide : THREE.DoubleSide;
     mat.polygonOffset = true;
@@ -148,6 +160,11 @@ export function buildMaterial(
   return mat;
 }
 
-export function materialKey(m: MaterialData | null, kind: ShadingKind, vertexColors: boolean, imagesRev: number): string {
+export function materialKey(
+  m: MaterialData | null,
+  kind: ShadingKind,
+  vertexColors: boolean,
+  imagesRev: number,
+): string {
   return `${kind}|${vertexColors ? 1 : 0}|${imagesRev}|${m ? JSON.stringify(m) : 'none'}`;
 }

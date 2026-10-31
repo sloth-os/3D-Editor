@@ -9,17 +9,29 @@ function curve(keys: [number, number][], interp: 'LINEAR' | 'BEZIER' | 'CONSTANT
 
 describe('fcurves', () => {
   it('interpolates linearly and holds constants outside the range', () => {
-    const fc = curve([
-      [1, 0],
-      [11, 10],
-    ], 'LINEAR');
+    const fc = curve(
+      [
+        [1, 0],
+        [11, 10],
+      ],
+      'LINEAR',
+    );
     expect(evaluateFCurve(fc, 6)).toBeCloseTo(5);
     expect(evaluateFCurve(fc, -5)).toBe(0);
     expect(evaluateFCurve(fc, 50)).toBe(10);
   });
 
   it('linear extrapolation', () => {
-    const fc = { ...curve([[0, 0], [10, 10]], 'LINEAR'), extrapolation: 'LINEAR' as const };
+    const fc = {
+      ...curve(
+        [
+          [0, 0],
+          [10, 10],
+        ],
+        'LINEAR',
+      ),
+      extrapolation: 'LINEAR' as const,
+    };
     expect(evaluateFCurve(fc, 20)).toBeCloseTo(20);
     expect(evaluateFCurve(fc, -10)).toBeCloseTo(-10);
   });
@@ -41,19 +53,30 @@ describe('fcurves', () => {
   });
 
   it('constant interpolation steps', () => {
-    const fc = curve([[0, 1], [10, 5]], 'CONSTANT');
+    const fc = curve(
+      [
+        [0, 1],
+        [10, 5],
+      ],
+      'CONSTANT',
+    );
     expect(evaluateFCurve(fc, 9.9)).toBe(1);
     expect(evaluateFCurve(fc, 10)).toBe(5);
   });
 
   it('replaces and removes keyframes', () => {
-    let fc = curve([[0, 1], [10, 5]]);
+    let fc = curve([
+      [0, 1],
+      [10, 5],
+    ]);
     fc = insertKeyframe(fc, 10, 7);
     expect(fc.keyframes).toHaveLength(2);
     expect(evaluateFCurve(fc, 10)).toBe(7);
     fc = removeKeyframe(fc, 0);
     expect(fc.keyframes).toHaveLength(1);
-    expect(evaluateFCurve(createFCurve({ target_type: 'object', target_id: 'x', path: 'location', index: 0 }), 3)).toBeUndefined();
+    expect(
+      evaluateFCurve(createFCurve({ target_type: 'object', target_id: 'x', path: 'location', index: 0 }), 3),
+    ).toBeUndefined();
   });
 });
 
@@ -63,7 +86,13 @@ describe('keyframe editing operators', () => {
   it('moves and removes keyframes', () => {
     const doc = SceneDoc.create({ empty: true });
     const reg = createOperatorRegistry();
-    const ctx: OperatorContext = { doc, state: createEditorState(), origin: doc.origin, source: 'test', report: () => {} };
+    const ctx: OperatorContext = {
+      doc,
+      state: createEditorState(),
+      origin: doc.origin,
+      source: 'test',
+      report: () => {},
+    };
     reg.run(ctx, 'object.empty_add');
     ctx.state.frame = 1;
     reg.run(ctx, 'anim.keyframe_insert', { type: 'Location' });
@@ -71,9 +100,18 @@ describe('keyframe editing operators', () => {
     reg.run(ctx, 'anim.keyframe_insert', { type: 'Location' });
     const id = ctx.state.activeId!;
     const key = fcurveKey({ target_type: 'object', target_id: id, path: 'location', index: 0 });
-    expect(reg.run(ctx, 'anim.keyframes_move', { keys: [{ fcurve: key, frame: 10 }], delta: 5 }).ok).toBe(true);
+    expect(reg.run(ctx, 'anim.keyframes_move', { keys: [{ fcurve: key, frame: 10 }], delta: 5 }).ok).toBe(
+      true,
+    );
     expect(doc.getFCurve(key)!.keyframes.map((k) => k.frame)).toEqual([1, 15]);
-    expect(reg.run(ctx, 'anim.keyframes_remove', { keys: [{ fcurve: key, frame: 1 }, { fcurve: key, frame: 15 }] }).ok).toBe(true);
+    expect(
+      reg.run(ctx, 'anim.keyframes_remove', {
+        keys: [
+          { fcurve: key, frame: 1 },
+          { fcurve: key, frame: 15 },
+        ],
+      }).ok,
+    ).toBe(true);
     expect(doc.getFCurve(key)).toBeNull();
   });
 });

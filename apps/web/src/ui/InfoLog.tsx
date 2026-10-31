@@ -60,7 +60,10 @@ export function Console() {
     };
     const span = telemetry.startSpan('console.exec');
     try {
-      const fn = new Function(...Object.keys(scope), `"use strict"; return (async () => { return (${code}); })();`);
+      const fn = new Function(
+        ...Object.keys(scope),
+        `"use strict"; return (async () => { return (${code}); })();`,
+      );
       Promise.resolve(fn(...Object.values(scope)))
         .then((r: unknown) => {
           if (r !== undefined) logInfo('INFO', typeof r === 'string' ? r : safeStringify(r), 'console');
@@ -78,7 +81,9 @@ export function Console() {
   return (
     <div class="column" style={{ height: '100%' }}>
       <div class="area-body log" ref={ref}>
-        <div class="hint">JavaScript console — type help() · e.g. ops('mesh.primitive_torus_add', {'{'} major_radius: 2 {'}'})</div>
+        <div class="hint">
+          JavaScript console — type help() · e.g. ops('mesh.primitive_torus_add', {'{'} major_radius: 2 {'}'})
+        </div>
         {lines.map((l) => (
           <div key={l.id} class={`line ${l.level}`}>
             {l.message}
@@ -118,7 +123,11 @@ export function Console() {
 
 function safeStringify(v: unknown): string {
   try {
-    const s = JSON.stringify(v, (_k, x) => (x instanceof Set ? [...x] : x instanceof Map ? Object.fromEntries(x) : x), 2);
+    const s = JSON.stringify(
+      v,
+      (_k, x) => (x instanceof Set ? [...x] : x instanceof Map ? Object.fromEntries(x) : x),
+      2,
+    );
     return s && s.length > 4000 ? `${s.slice(0, 4000)}…` : (s ?? String(v));
   } catch {
     return String(v);
@@ -137,12 +146,16 @@ export function Diagnostics() {
   return (
     <div class="area-body log">
       <div>
-        FPS {fps.value} · frame {frameTimeMs.value.toFixed(1)} ms · telemetry {telemetry.enabled ? 'on' : 'off'} · session {telemetry.sessionId}
+        FPS {fps.value} · frame {frameTimeMs.value.toFixed(1)} ms · telemetry{' '}
+        {telemetry.enabled ? 'on' : 'off'} · session {telemetry.sessionId}
       </div>
       {s && (
         <div>
-          sync {s.provider?.status.value} · peers {s.peers.value.length} · latency {s.provider?.latencyMs.value ?? '–'} ms · storage{' '}
-          {s.webdav ? `${s.webdav.status.value}${s.webdav.error.value ? ` (${s.webdav.error.value})` : ''}` : 'browser'}
+          sync {s.provider?.status.value} · peers {s.peers.value.length} · latency{' '}
+          {s.provider?.latencyMs.value ?? '–'} ms · storage{' '}
+          {s.webdav
+            ? `${s.webdav.status.value}${s.webdav.error.value ? ` (${s.webdav.error.value})` : ''}`
+            : 'browser'}
         </div>
       )}
       <div class="hint" style={{ marginTop: '6px' }}>

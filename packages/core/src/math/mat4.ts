@@ -162,7 +162,24 @@ export function invert4(m: Readonly<Mat4>): Mat4 {
 }
 
 export function transpose4(m: Readonly<Mat4>): Mat4 {
-  return [m[0], m[4], m[8], m[12], m[1], m[5], m[9], m[13], m[2], m[6], m[10], m[14], m[3], m[7], m[11], m[15]];
+  return [
+    m[0],
+    m[4],
+    m[8],
+    m[12],
+    m[1],
+    m[5],
+    m[9],
+    m[13],
+    m[2],
+    m[6],
+    m[10],
+    m[14],
+    m[3],
+    m[7],
+    m[11],
+    m[15],
+  ];
 }
 
 /** Matrix for transforming normals: inverse-transpose of the upper 3x3, returned as a 4x4. */
@@ -204,7 +221,24 @@ export function fromQuat4(q: Readonly<Quat>): Mat4 {
   const wx = w * x2;
   const wy = w * y2;
   const wz = w * z2;
-  return [1 - (yy + zz), xy + wz, xz - wy, 0, xy - wz, 1 - (xx + zz), yz + wx, 0, xz + wy, yz - wx, 1 - (xx + yy), 0, 0, 0, 0, 1];
+  return [
+    1 - (yy + zz),
+    xy + wz,
+    xz - wy,
+    0,
+    xy - wz,
+    1 - (xx + zz),
+    yz + wx,
+    0,
+    xz + wy,
+    yz - wx,
+    1 - (xx + yy),
+    0,
+    0,
+    0,
+    0,
+    1,
+  ];
 }
 
 /** Rotation of `angle` radians around a (unit) axis. */
@@ -287,7 +321,14 @@ export function perspective4(fovY: number, aspect: number, near: number, far: nu
 }
 
 /** OpenGL-style orthographic projection. */
-export function ortho4(left: number, right: number, bottom: number, top: number, near: number, far: number): Mat4 {
+export function ortho4(
+  left: number,
+  right: number,
+  bottom: number,
+  top: number,
+  near: number,
+  far: number,
+): Mat4 {
   const lr = 1 / (left - right);
   const bt = 1 / (bottom - top);
   const nf = 1 / (near - far);

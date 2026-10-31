@@ -59,7 +59,14 @@ export class MemoryFileStore implements FileStore {
       const rest = p.slice(prefix.length);
       const [first, ...more] = rest.split('/');
       if (more.length) out.set(first, { name: first, isDir: true });
-      else out.set(first, { name: first, isDir: false, size: f.data.length, etag: f.etag, lastModified: f.mtime });
+      else
+        out.set(first, {
+          name: first,
+          isDir: false,
+          size: f.data.length,
+          etag: f.etag,
+          lastModified: f.mtime,
+        });
     }
     for (const sub of this.dirs) {
       if (!sub.startsWith(prefix) || sub === d) continue;

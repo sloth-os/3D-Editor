@@ -15,7 +15,9 @@ describe('fields', () => {
 
   it('number field shows formatted values and accepts typed input', () => {
     const onChange = vi.fn();
-    const { getByTestId, container } = render(<NumberField value={1.5} unit=" m" onChange={onChange} testId="nf" />);
+    const { getByTestId, container } = render(
+      <NumberField value={1.5} unit=" m" onChange={onChange} testId="nf" />,
+    );
     expect(container.textContent).toContain('1.5 m');
     const el = getByTestId('nf');
     fireEvent.pointerDown(el, { button: 0, clientX: 10, pointerId: 1 });
@@ -43,7 +45,9 @@ describe('fields', () => {
       }),
     );
     const onChange = vi.fn();
-    const { container } = render(<SchemaForm schema={schema} values={{ levels: 2 }} onChange={onChange} testIdPrefix="f" />);
+    const { container } = render(
+      <SchemaForm schema={schema} values={{ levels: 2 }} onChange={onChange} testIdPrefix="f" />,
+    );
     expect(container.querySelector('[data-testid=f-levels]')?.textContent).toContain('2');
     expect(container.querySelector('select[data-testid=f-mode]')).not.toBeNull();
     expect(container.querySelectorAll('[data-testid^=f-offset-]').length).toBe(3);

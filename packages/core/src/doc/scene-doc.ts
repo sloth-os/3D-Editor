@@ -41,7 +41,15 @@ import { ROOT_COLLECTION_ID, SCHEMA_VERSION } from './types';
 
 export const SETTINGS_KINDS = ['meta', 'scene', 'render', 'world'] as const;
 export type SettingsKind = (typeof SETTINGS_KINDS)[number];
-export const BLOCK_KINDS: DatablockKind[] = ['objects', 'meshes', 'materials', 'lights', 'cameras', 'images', 'collections'];
+export const BLOCK_KINDS: DatablockKind[] = [
+  'objects',
+  'meshes',
+  'materials',
+  'lights',
+  'cameras',
+  'images',
+  'collections',
+];
 export type ChangeKind = DatablockKind | 'fcurves';
 
 /** Aggregated description of what changed in one Yjs transaction. */
@@ -240,7 +248,11 @@ export class SceneDoc {
     return s;
   }
 
-  private createBlock(kind: DatablockKind, fields: Record<string, unknown> & { name: string }, id = newId()): string {
+  private createBlock(
+    kind: DatablockKind,
+    fields: Record<string, unknown> & { name: string },
+    id = newId(),
+  ): string {
     const ymap = new Y.Map<any>();
     const name = uniqueName(fields.name, this.names(kind));
     this.transact(() => {
@@ -333,7 +345,8 @@ export class SceneDoc {
   }
 
   findObjectByName(name: string): ObjectData | null {
-    for (const [id, y] of this.map('objects').entries()) if ((y as Y.Map<any>).get('name') === name) return this.getObject(id);
+    for (const [id, y] of this.map('objects').entries())
+      if ((y as Y.Map<any>).get('name') === name) return this.getObject(id);
     return null;
   }
 
@@ -343,7 +356,11 @@ export class SceneDoc {
   }
 
   addObject(init: Partial<ObjectData> & { type: ObjectType; name?: string }, id = newId()): string {
-    const base = defaultObject(init.type, id, init.name ?? init.type.charAt(0) + init.type.slice(1).toLowerCase());
+    const base = defaultObject(
+      init.type,
+      id,
+      init.name ?? init.type.charAt(0) + init.type.slice(1).toLowerCase(),
+    );
     const { id: _ignore, ...fields } = { ...base, ...init, name: init.name ?? base.name };
     return this.createBlock('objects', fields, id);
   }
@@ -414,7 +431,8 @@ export class SceneDoc {
 
   /** Re-parents keeping the world transform (Blender "Object (Keep Transform)"). */
   setParent(id: string, parent: string | null, keepTransform = true): void {
-    if (parent && this.isAncestor(id, parent)) throw new Error('cannot parent an object to its own descendant');
+    if (parent && this.isAncestor(id, parent))
+      throw new Error('cannot parent an object to its own descendant');
     this.transact(() => {
       const world = this.worldMatrix(id);
       this.updateObject(id, { parent });
@@ -434,7 +452,14 @@ export class SceneDoc {
       this.map('objects').delete(id);
       for (const fc of this.listFCurves(id)) this.map('fcurves').delete(fcurveKey(fc));
       if (o.data && this.dataUsers(o.data) === 0) {
-        const kind = o.type === 'MESH' ? 'meshes' : o.type === 'LIGHT' ? 'lights' : o.type === 'CAMERA' ? 'cameras' : null;
+        const kind =
+          o.type === 'MESH'
+            ? 'meshes'
+            : o.type === 'LIGHT'
+              ? 'lights'
+              : o.type === 'CAMERA'
+                ? 'cameras'
+                : null;
         if (kind) this.map(kind).delete(o.data);
       }
       const scene = this.getScene();
@@ -455,7 +480,9 @@ export class SceneDoc {
   }
 
   listMeshBlocks(): MeshBlock[] {
-    return [...this.map('meshes').keys()].map((id) => this.getMeshBlock(id)!).sort((a, b) => a.name.localeCompare(b.name));
+    return [...this.map('meshes').keys()]
+      .map((id) => this.getMeshBlock(id)!)
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
 
   private meshBytes(id: string): Uint8Array | null {
@@ -521,7 +548,9 @@ export class SceneDoc {
   }
 
   listMaterials(): MaterialData[] {
-    return [...this.map('materials').keys()].map((id) => this.getMaterial(id)!).sort((a, b) => a.name.localeCompare(b.name));
+    return [...this.map('materials').keys()]
+      .map((id) => this.getMaterial(id)!)
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
 
   updateMaterial(id: string, patch: Partial<MaterialData>): void {
@@ -571,14 +600,23 @@ export class SceneDoc {
 
   // ---------------------------------------------------------------- images
 
-  addImage(init: { name: string; mime: string; width: number; height: number; data: Uint8Array }, id = newId()): string {
+  addImage(
+    init: { name: string; mime: string; width: number; height: number; data: Uint8Array },
+    id = newId(),
+  ): string {
     return this.createBlock('images', init, id);
   }
 
   getImage(id: string): ImageData | null {
     const y = this.map('images').get(id) as Y.Map<any> | undefined;
     if (!y) return null;
-    return { id, name: y.get('name'), mime: y.get('mime'), width: y.get('width') ?? 0, height: y.get('height') ?? 0 };
+    return {
+      id,
+      name: y.get('name'),
+      mime: y.get('mime'),
+      width: y.get('width') ?? 0,
+      height: y.get('height') ?? 0,
+    };
   }
 
   getImageBytes(id: string): Uint8Array | null {
@@ -587,7 +625,9 @@ export class SceneDoc {
   }
 
   listImages(): ImageData[] {
-    return [...this.map('images').keys()].map((id) => this.getImage(id)!).sort((a, b) => a.name.localeCompare(b.name));
+    return [...this.map('images').keys()]
+      .map((id) => this.getImage(id)!)
+      .sort((a, b) => a.name.localeCompare(b.name));
   }
 
   removeImage(id: string): void {
@@ -598,14 +638,17 @@ export class SceneDoc {
 
   /** The root "Scene Collection" is virtual and always present. */
   getCollection(id: string): CollectionData | null {
-    if (id === ROOT_COLLECTION_ID) return { ...defaultCollection(ROOT_COLLECTION_ID, 'Scene Collection', null) };
+    if (id === ROOT_COLLECTION_ID)
+      return { ...defaultCollection(ROOT_COLLECTION_ID, 'Scene Collection', null) };
     return this.readBlock(this.map('collections').get(id), defaultCollection(id, ''));
   }
 
   listCollections(): CollectionData[] {
     return [
       this.getCollection(ROOT_COLLECTION_ID)!,
-      ...[...this.map('collections').keys()].map((id) => this.getCollection(id)!).sort((a, b) => a.name.localeCompare(b.name)),
+      ...[...this.map('collections').keys()]
+        .map((id) => this.getCollection(id)!)
+        .sort((a, b) => a.name.localeCompare(b.name)),
     ];
   }
 
@@ -626,7 +669,8 @@ export class SceneDoc {
     if (!c) return;
     const parent = c.parent ?? ROOT_COLLECTION_ID;
     this.transact(() => {
-      for (const o of this.listObjects()) if (o.collection === id) this.updateObject(o.id, { collection: parent });
+      for (const o of this.listObjects())
+        if (o.collection === id) this.updateObject(o.id, { collection: parent });
       for (const cc of this.listCollections()) if (cc.parent === id) this.updateCollection(cc.id, { parent });
       this.map('collections').delete(id);
     });
@@ -754,7 +798,10 @@ export class SceneDoc {
       materials: this.listMaterials(),
       lights: [...this.map('lights').keys()].map((id) => this.getLight(id)!),
       cameras: [...this.map('cameras').keys()].map((id) => this.getCamera(id)!),
-      images: this.listImages().map((im) => ({ ...im, data_base64: base64Encode(this.getImageBytes(im.id) ?? new Uint8Array()) })),
+      images: this.listImages().map((im) => ({
+        ...im,
+        data_base64: base64Encode(this.getImageBytes(im.id) ?? new Uint8Array()),
+      })),
       collections: this.listCollections().filter((c) => c.id !== ROOT_COLLECTION_ID),
       fcurves: this.listFCurves(),
     };
@@ -788,7 +835,6 @@ export class SceneDoc {
     return doc;
   }
 }
-
 
 /** Convenience: location of the object's world-space origin from stored properties. */
 export function objectWorldLocation(doc: SceneDoc, id: string): Vec3 {

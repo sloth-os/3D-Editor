@@ -63,7 +63,8 @@ describe('primitives', () => {
   });
 
   it('spheres/cylinders have outward normals', () => {
-    for (const m of [createUVSphere(), createIcoSphere(), createCylinder(), createCone()]) expect(outwardNormals(m)).toBe(true);
+    for (const m of [createUVSphere(), createIcoSphere(), createCylinder(), createCone()])
+      expect(outwardNormals(m)).toBe(true);
   });
 
   it('torus has Euler characteristic 0', () => {
@@ -72,7 +73,10 @@ describe('primitives', () => {
 
   it('plane, grid and circle variants', () => {
     expect(meshStats(createPlane())).toMatchObject({ vertices: 4, faces: 1 });
-    expect(meshStats(createGrid({ x_subdivisions: 3, y_subdivisions: 2 }))).toMatchObject({ vertices: 12, faces: 6 });
+    expect(meshStats(createGrid({ x_subdivisions: 3, y_subdivisions: 2 }))).toMatchObject({
+      vertices: 12,
+      faces: 6,
+    });
     const ring = createCircle({ vertices: 8 });
     expect(ring.faces.length).toBe(0);
     expect(ring.looseEdges.length).toBe(16);
@@ -113,13 +117,18 @@ describe('codec', () => {
 describe('triangulation and render buffers', () => {
   it('triangulates concave n-gons with correct winding', () => {
     // L-shaped hexagon in XY plane (CCW)
-    const m = createMesh({ positions: [0, 0, 0, 2, 0, 0, 2, 1, 0, 1, 1, 0, 1, 2, 0, 0, 2, 0], faces: [[0, 1, 2, 3, 4, 5]] });
+    const m = createMesh({
+      positions: [0, 0, 0, 2, 0, 0, 2, 1, 0, 1, 1, 0, 1, 2, 0, 0, 2, 0],
+      faces: [[0, 1, 2, 3, 4, 5]],
+    });
     const { indices } = triangulateMesh(m);
     expect(indices.length).toBe(12);
     for (let t = 0; t < indices.length; t += 3) {
       const [a, b, c] = [indices[t], indices[t + 1], indices[t + 2]];
       const p = m.positions;
-      const cross = (p[b * 3] - p[a * 3]) * (p[c * 3 + 1] - p[a * 3 + 1]) - (p[b * 3 + 1] - p[a * 3 + 1]) * (p[c * 3] - p[a * 3]);
+      const cross =
+        (p[b * 3] - p[a * 3]) * (p[c * 3 + 1] - p[a * 3 + 1]) -
+        (p[b * 3 + 1] - p[a * 3 + 1]) * (p[c * 3] - p[a * 3]);
       expect(cross).toBeGreaterThan(0);
     }
   });

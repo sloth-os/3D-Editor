@@ -3,7 +3,15 @@ import type { MaterialData } from '../doc/types';
 import { cloneMesh } from '../mesh/types';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { OperatorError, type OperatorContext } from './context';
-import { activeObject, editTarget, commitEdit, resolveObjectIds, selectedObjects, vec3, vec4 } from './helpers';
+import {
+  activeObject,
+  editTarget,
+  commitEdit,
+  resolveObjectIds,
+  selectedObjects,
+  vec3,
+  vec4,
+} from './helpers';
 
 const materialProps = {
   base_color: vec4.optional().describe('Linear RGBA'),
@@ -42,14 +50,21 @@ export function registerMaterialOperators(reg: OperatorRegistry): void {
       description:
         'Create a new principled material. With assign=true it is put into the active material slot of the selected objects (a slot is added if they have none).',
       category: 'Material',
-      schema: z.object({ name: z.string().default('Material'), assign: z.boolean().default(true), ...materialProps }),
+      schema: z.object({
+        name: z.string().default('Material'),
+        assign: z.boolean().default(true),
+        ...materialProps,
+      }),
       execute(ctx, p) {
         const id = ctx.doc.addMaterial({ name: p.name, ...pickDefined(p, Object.keys(materialProps)) });
         if (p.assign) {
           for (const o of selectedObjects(ctx)) {
             if (o.type !== 'MESH') continue;
             const slots = o.material_slots.length ? [...o.material_slots] : [null];
-            const idx = Math.max(0, slots.findIndex((s) => s === null));
+            const idx = Math.max(
+              0,
+              slots.findIndex((s) => s === null),
+            );
             slots[idx === -1 ? 0 : idx] = id;
             ctx.doc.updateObject(o.id, { material_slots: slots });
           }
@@ -67,7 +82,10 @@ export function registerMaterialOperators(reg: OperatorRegistry): void {
       schema: z.object({ material: z.string(), name: z.string().optional(), ...materialProps }),
       execute(ctx, p) {
         const id = resolveMaterial(ctx, p.material);
-        ctx.doc.updateMaterial(id, { ...pickDefined(p, Object.keys(materialProps)), ...(p.name ? { name: p.name } : {}) });
+        ctx.doc.updateMaterial(id, {
+          ...pickDefined(p, Object.keys(materialProps)),
+          ...(p.name ? { name: p.name } : {}),
+        });
       },
     }),
   );
@@ -87,9 +105,14 @@ export function registerMaterialOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.material_assign',
       label: 'Assign Material',
-      description: 'Put a material (id or name) into slot `slot` of the given/selected mesh objects (slots are created as needed).',
+      description:
+        'Put a material (id or name) into slot `slot` of the given/selected mesh objects (slots are created as needed).',
       category: 'Material',
-      schema: z.object({ material: z.string().nullable(), objects: z.array(z.string()).optional(), slot: z.number().int().min(0).default(0) }),
+      schema: z.object({
+        material: z.string().nullable(),
+        objects: z.array(z.string()).optional(),
+        slot: z.number().int().min(0).default(0),
+      }),
       execute(ctx, p) {
         const mat = p.material ? resolveMaterial(ctx, p.material) : null;
         for (const id of resolveObjectIds(ctx, p.objects)) {
@@ -128,7 +151,8 @@ export function registerMaterialOperators(reg: OperatorRegistry): void {
       execute(ctx, p) {
         const o = activeObject(ctx)!;
         const index = p.index ?? o.material_slots.length - 1;
-        if (index >= o.material_slots.length) throw new OperatorError('Slot index out of range', 'INVALID_PARAMS');
+        if (index >= o.material_slots.length)
+          throw new OperatorError('Slot index out of range', 'INVALID_PARAMS');
         ctx.doc.updateObject(o.id, { material_slots: o.material_slots.filter((_, i) => i !== index) });
         if (o.data && o.type === 'MESH') {
           const m = cloneMesh(ctx.doc.getMesh(o.data)!);

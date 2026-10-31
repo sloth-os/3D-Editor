@@ -16,7 +16,16 @@ export const ANIMATABLE: Record<AnimTargetType, Record<string, number>> = {
     sheen_weight: 1,
   },
   light: { color: 3, energy: 1, spot_size: 1, spot_blend: 1, shadow_soft_size: 1, size: 1, size_y: 1 },
-  camera: { lens: 1, ortho_scale: 1, shift_x: 1, shift_y: 1, dof_focus_distance: 1, dof_aperture_fstop: 1, clip_start: 1, clip_end: 1 },
+  camera: {
+    lens: 1,
+    ortho_scale: 1,
+    shift_x: 1,
+    shift_y: 1,
+    dof_focus_distance: 1,
+    dof_aperture_fstop: 1,
+    clip_start: 1,
+    clip_end: 1,
+  },
   world: { color: 3, strength: 1, environment_rotation: 1, environment_strength: 1 },
   scene: {},
 };

@@ -1,19 +1,32 @@
 import type { ObjectData } from '@3d-editor/core';
 import type { ProjectSession } from '../../project/session';
-import { Checkbox, ColorField, NumberField, Panel, Row, SelectField, TextField, VectorField, RAD } from '../fields/fields';
+import {
+  Checkbox,
+  ColorField,
+  NumberField,
+  Panel,
+  Row,
+  SelectField,
+  TextField,
+  VectorField,
+  RAD,
+} from '../fields/fields';
 import { animState, animatedValue, setProp } from './prop-edit';
 import { run } from '../../editor/editor';
 import { Icon } from '../icons';
 
 export function TransformFields({ s, o }: { s: ProjectSession; o: ObjectData }) {
-  const vec = (path: 'location' | 'rotation_euler' | 'scale') => o[path].map((v, i) => animatedValue(s, 'object', o.id, path, i, v));
+  const vec = (path: 'location' | 'rotation_euler' | 'scale') =>
+    o[path].map((v, i) => animatedValue(s, 'object', o.id, path, i, v));
   const states = (path: string) => [0, 1, 2].map((i) => animState(s, 'object', o.id, path, i));
   const keyBtn = (path: string) => (
     <button
       class="btn flat icon"
       title={`Insert keyframe for ${path} at frame ${s.state.frame}`}
       data-testid={`key-${path}`}
-      onClick={() => run('anim.keyframe_insert_property', { target_type: 'object', target: o.id, path }, 'ui')}
+      onClick={() =>
+        run('anim.keyframe_insert_property', { target_type: 'object', target: o.id, path }, 'ui')
+      }
     >
       <Icon name="key" size={12} />
     </button>
@@ -23,7 +36,14 @@ export function TransformFields({ s, o }: { s: ProjectSession; o: ObjectData }) 
       <Row label="Location">
         <div style={{ display: 'flex', gap: '2px' }}>
           <div style={{ flex: 1 }}>
-            <VectorField value={vec('location')} unit=" m" step={0.01} states={states('location')} testId="loc" onChange={(v, f) => setProp(s, 'objects', o.id, 'location', v, f)} />
+            <VectorField
+              value={vec('location')}
+              unit=" m"
+              step={0.01}
+              states={states('location')}
+              testId="loc"
+              onChange={(v, f) => setProp(s, 'objects', o.id, 'location', v, f)}
+            />
           </div>
           {keyBtn('location')}
         </div>
@@ -31,7 +51,15 @@ export function TransformFields({ s, o }: { s: ProjectSession; o: ObjectData }) 
       <Row label="Rotation">
         <div style={{ display: 'flex', gap: '2px' }}>
           <div style={{ flex: 1 }}>
-            <VectorField value={vec('rotation_euler')} unit="°" step={1} {...RAD} states={states('rotation_euler')} testId="rot" onChange={(v, f) => setProp(s, 'objects', o.id, 'rotation_euler', v, f)} />
+            <VectorField
+              value={vec('rotation_euler')}
+              unit="°"
+              step={1}
+              {...RAD}
+              states={states('rotation_euler')}
+              testId="rot"
+              onChange={(v, f) => setProp(s, 'objects', o.id, 'rotation_euler', v, f)}
+            />
           </div>
           {keyBtn('rotation_euler')}
         </div>
@@ -39,7 +67,13 @@ export function TransformFields({ s, o }: { s: ProjectSession; o: ObjectData }) 
       <Row label="Scale">
         <div style={{ display: 'flex', gap: '2px' }}>
           <div style={{ flex: 1 }}>
-            <VectorField value={vec('scale')} step={0.01} states={states('scale')} testId="scale" onChange={(v, f) => setProp(s, 'objects', o.id, 'scale', v, f)} />
+            <VectorField
+              value={vec('scale')}
+              step={0.01}
+              states={states('scale')}
+              testId="scale"
+              onChange={(v, f) => setProp(s, 'objects', o.id, 'scale', v, f)}
+            />
           </div>
           {keyBtn('scale')}
         </div>
@@ -58,7 +92,11 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
       </div>
       <Panel title="Object">
         <Row label="Name">
-          <TextField value={o.name} testId="object-name" onChange={(v) => v && run('object.rename', { object: o.id, name: v }, 'ui')} />
+          <TextField
+            value={o.name}
+            testId="object-name"
+            onChange={(v) => v && run('object.rename', { object: o.id, name: v }, 'ui')}
+          />
         </Row>
       </Panel>
       <Panel title="Transform">
@@ -68,7 +106,10 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
         <Row label="Parent">
           <SelectField
             value={o.parent ?? ''}
-            options={[{ value: '', label: '— none —' }, ...objects.map((x) => ({ value: x.id, label: x.name }))]}
+            options={[
+              { value: '', label: '— none —' },
+              ...objects.map((x) => ({ value: x.id, label: x.name })),
+            ]}
             onChange={(v) => run('object.parent_to', { objects: [o.id], parent: v || null }, 'ui')}
           />
         </Row>
@@ -82,13 +123,25 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
       </Panel>
       <Panel title="Visibility">
         <Row label="">
-          <Checkbox value={!o.hide_viewport} label="Show in Viewports" onChange={(v) => setProp(s, 'objects', o.id, 'hide_viewport', !v)} />
+          <Checkbox
+            value={!o.hide_viewport}
+            label="Show in Viewports"
+            onChange={(v) => setProp(s, 'objects', o.id, 'hide_viewport', !v)}
+          />
         </Row>
         <Row label="">
-          <Checkbox value={!o.hide_render} label="Show in Renders" onChange={(v) => setProp(s, 'objects', o.id, 'hide_render', !v)} />
+          <Checkbox
+            value={!o.hide_render}
+            label="Show in Renders"
+            onChange={(v) => setProp(s, 'objects', o.id, 'hide_render', !v)}
+          />
         </Row>
         <Row label="">
-          <Checkbox value={!o.hide_select} label="Selectable" onChange={(v) => setProp(s, 'objects', o.id, 'hide_select', !v)} />
+          <Checkbox
+            value={!o.hide_select}
+            label="Selectable"
+            onChange={(v) => setProp(s, 'objects', o.id, 'hide_select', !v)}
+          />
         </Row>
       </Panel>
       <Panel title="Viewport Display" defaultOpen={false}>
@@ -97,12 +150,19 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
             <Row label="Display As">
               <SelectField
                 value={o.empty_display_type}
-                options={['PLAIN_AXES', 'ARROWS', 'SINGLE_ARROW', 'CIRCLE', 'CUBE', 'SPHERE', 'CONE'].map((v) => ({ value: v, label: v.replace('_', ' ').toLowerCase() }))}
+                options={['PLAIN_AXES', 'ARROWS', 'SINGLE_ARROW', 'CIRCLE', 'CUBE', 'SPHERE', 'CONE'].map(
+                  (v) => ({ value: v, label: v.replace('_', ' ').toLowerCase() }),
+                )}
                 onChange={(v) => setProp(s, 'objects', o.id, 'empty_display_type', v)}
               />
             </Row>
             <Row label="Size">
-              <NumberField value={o.empty_display_size} min={0.001} step={0.01} onChange={(v, f) => setProp(s, 'objects', o.id, 'empty_display_size', v, f)} />
+              <NumberField
+                value={o.empty_display_size}
+                min={0.001}
+                step={0.01}
+                onChange={(v, f) => setProp(s, 'objects', o.id, 'empty_display_size', v, f)}
+              />
             </Row>
           </>
         )}
@@ -119,7 +179,11 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
           />
         </Row>
         <Row label="">
-          <Checkbox value={o.show_wire} label="Wireframe" onChange={(v) => setProp(s, 'objects', o.id, 'show_wire', v)} />
+          <Checkbox
+            value={o.show_wire}
+            label="Wireframe"
+            onChange={(v) => setProp(s, 'objects', o.id, 'show_wire', v)}
+          />
         </Row>
         <Row label="Color">
           <ColorField value={o.color} onChange={(v, f) => setProp(s, 'objects', o.id, 'color', v, f)} />
@@ -133,7 +197,10 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
                 value={String(v)}
                 onChange={(nv) => {
                   const num = Number(nv);
-                  setProp(s, 'objects', o.id, 'custom_props', { ...o.custom_props, [k]: nv !== '' && Number.isFinite(num) ? num : nv });
+                  setProp(s, 'objects', o.id, 'custom_props', {
+                    ...o.custom_props,
+                    [k]: nv !== '' && Number.isFinite(num) ? num : nv,
+                  });
                 }}
               />
               <button

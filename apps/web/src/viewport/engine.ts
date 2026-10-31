@@ -109,7 +109,12 @@ export class ViewportEngine {
     readonly canvas: HTMLCanvasElement,
     readonly session: ProjectSession,
   ) {
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
+    this.renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      preserveDrawingBuffer: true,
+      powerPreference: 'high-performance',
+    });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
@@ -117,7 +122,14 @@ export class ViewportEngine {
     this.objects = new SceneObjects(this.scene, this.overlay, () => this.requestRender());
     this.scene.add(this.ambient);
     this.overlay.add(this.grid, this.edit.group, this.peerBoxes);
-    this.cursor = new THREE.Sprite(new THREE.SpriteMaterial({ map: cursorTexture(), depthTest: false, sizeAttenuation: false, transparent: true }));
+    this.cursor = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: cursorTexture(),
+        depthTest: false,
+        sizeAttenuation: false,
+        transparent: true,
+      }),
+    );
     this.cursor.scale.set(0.045, 0.045, 1);
     this.cursor.renderOrder = 20;
     this.overlay.add(this.cursor);
@@ -222,7 +234,8 @@ export class ViewportEngine {
         const frames = Math.floor((now - this.lastFrameTime) / step);
         this.lastFrameTime += frames * step;
         let f = this.session.state.frame + frames;
-        if (f > sc.frame_end) f = sc.frame_start + ((f - sc.frame_start) % Math.max(1, sc.frame_end - sc.frame_start + 1));
+        if (f > sc.frame_end)
+          f = sc.frame_start + ((f - sc.frame_start) % Math.max(1, sc.frame_end - sc.frame_start + 1));
         this.session.state.frame = f;
       }
     } else this.lastFrameTime = 0;
@@ -280,7 +293,9 @@ export class ViewportEngine {
       const o = this.ev.byId.get(editId);
       const base = this.meshOverrides.get(editId) ?? o?.baseMesh;
       if (o && base) {
-        const token = this.meshOverrides.has(editId) ? `live${this.overrideToken}` : `doc${s.doc.meshVersion(o.data.data ?? '')}`;
+        const token = this.meshOverrides.has(editId)
+          ? `live${this.overrideToken}`
+          : `doc${s.doc.meshVersion(o.data.data ?? '')}`;
         this.edit.update(base, st.meshSelection, st.selectMode, o.worldMatrix, v.xray.value, token);
       } else this.edit.hide();
     } else this.edit.hide();
@@ -344,7 +359,8 @@ export class ViewportEngine {
           if (!b) continue;
           for (const x of [b.min[0], b.max[0]])
             for (const y of [b.min[1], b.max[1]])
-              for (const z of [b.min[2], b.max[2]]) box.expandByPoint(new THREE.Vector3(...transformPoint3(o.worldMatrix, [x, y, z])));
+              for (const z of [b.min[2], b.max[2]])
+                box.expandByPoint(new THREE.Vector3(...transformPoint3(o.worldMatrix, [x, y, z])));
         } else {
           const p = new THREE.Vector3(o.worldMatrix[12], o.worldMatrix[13], o.worldMatrix[14]);
           box.setFromCenterAndSize(p, new THREE.Vector3(0.6, 0.6, 0.6));
@@ -390,7 +406,8 @@ export class ViewportEngine {
     }
     this.scene.environment = wantEnv ? this.envTexture : null;
     // In Rendered mode the studio environment acts as soft fill light; lamps provide the key light.
-    this.scene.environmentIntensity = shading === 'RENDERED' ? world.environment_strength * world.strength * 0.35 : 1;
+    this.scene.environmentIntensity =
+      shading === 'RENDERED' ? world.environment_strength * world.strength * 0.35 : 1;
     const envRot = shading === 'RENDERED' ? world.environment_rotation : 0;
     this.scene.environmentRotation.set(Math.PI / 2, 0, envRot);
     this.scene.backgroundRotation.set(Math.PI / 2, 0, envRot);
@@ -398,7 +415,12 @@ export class ViewportEngine {
       if (world.show_environment_background && wantEnv) {
         this.scene.background = this.envTexture;
         this.scene.backgroundBlurriness = 0.3;
-      } else this.scene.background = new THREE.Color(world.color[0] * world.strength, world.color[1] * world.strength, world.color[2] * world.strength);
+      } else
+        this.scene.background = new THREE.Color(
+          world.color[0] * world.strength,
+          world.color[1] * world.strength,
+          world.color[2] * world.strength,
+        );
       this.ambient.color.setRGB(world.color[0], world.color[1], world.color[2]);
       this.ambient.intensity = world.environment === 'NONE' ? world.strength * Math.PI : 0;
     } else if (shading === 'MATERIAL') {
@@ -515,7 +537,10 @@ export class ViewportEngine {
   persistPose(): void {
     this.session.schedulePresence(poseToPresence(this.pose));
     try {
-      localStorage.setItem(`3d-editor:view:${this.session.id}`, JSON.stringify({ ...this.pose, target: this.pose.target.toArray() }));
+      localStorage.setItem(
+        `3d-editor:view:${this.session.id}`,
+        JSON.stringify({ ...this.pose, target: this.pose.target.toArray() }),
+      );
     } catch {
       /* ignore */
     }
@@ -536,7 +561,9 @@ export class ViewportEngine {
   boundsOf(ids?: string[]): THREE.Sphere | null {
     if (!this.ev) this.sync();
     const box = new THREE.Box3();
-    const list = ids ? ids.map((id) => this.ev!.byId.get(id)).filter(Boolean) : this.ev!.objects.filter((o) => o.visible);
+    const list = ids
+      ? ids.map((id) => this.ev!.byId.get(id)).filter(Boolean)
+      : this.ev!.objects.filter((o) => o.visible);
     for (const o of list) {
       if (!o) continue;
       if (o.mesh) {
@@ -544,7 +571,8 @@ export class ViewportEngine {
         if (b)
           for (const x of [b.min[0], b.max[0]])
             for (const y of [b.min[1], b.max[1]])
-              for (const z of [b.min[2], b.max[2]]) box.expandByPoint(new THREE.Vector3(...transformPoint3(o.worldMatrix, [x, y, z])));
+              for (const z of [b.min[2], b.max[2]])
+                box.expandByPoint(new THREE.Vector3(...transformPoint3(o.worldMatrix, [x, y, z])));
       } else box.expandByPoint(new THREE.Vector3(o.worldMatrix[12], o.worldMatrix[13], o.worldMatrix[14]));
     }
     if (box.isEmpty()) return null;
@@ -587,7 +615,9 @@ export class ViewportEngine {
   }
 
   /** Renders the scene from the active camera into a PNG data URL at a given size (F12 / RPC). */
-  async renderImage(opts: { width?: number; height?: number; cameraId?: string; useViewport?: boolean } = {}): Promise<{ dataUrl: string; width: number; height: number }> {
+  async renderImage(
+    opts: { width?: number; height?: number; cameraId?: string; useViewport?: boolean } = {},
+  ): Promise<{ dataUrl: string; width: number; height: number }> {
     const span = telemetry.startSpan('render.image');
     try {
       if (!this.ev) this.sync();
@@ -604,11 +634,23 @@ export class ViewportEngine {
         const m = new THREE.Matrix4().fromArray(camObj.worldMatrix);
         if (cd.type === 'ORTHO') {
           const e = orthoHalfExtents(cd, aspect);
-          const oc = new THREE.OrthographicCamera(-e.halfW, e.halfW, e.halfH, -e.halfH, cd.clip_start, cd.clip_end);
+          const oc = new THREE.OrthographicCamera(
+            -e.halfW,
+            e.halfW,
+            e.halfH,
+            -e.halfH,
+            cd.clip_start,
+            cd.clip_end,
+          );
           m.decompose(oc.position, oc.quaternion, new THREE.Vector3());
           cam = oc;
         } else {
-          const pc = new THREE.PerspectiveCamera(THREE.MathUtils.radToDeg(cameraFovY(cd, aspect)), aspect, cd.clip_start, cd.clip_end);
+          const pc = new THREE.PerspectiveCamera(
+            THREE.MathUtils.radToDeg(cameraFovY(cd, aspect)),
+            aspect,
+            cd.clip_start,
+            cd.clip_end,
+          );
           m.decompose(pc.position, pc.quaternion, new THREE.Vector3());
           cam = pc;
         }
@@ -642,7 +684,12 @@ export class ViewportEngine {
       const readTarget = comp.readBuffer;
       const quad = new THREE.Mesh(
         new THREE.PlaneGeometry(2, 2),
-        new THREE.MeshBasicMaterial({ map: readTarget.texture, transparent: true, toneMapped: false, depthTest: false }),
+        new THREE.MeshBasicMaterial({
+          map: readTarget.texture,
+          transparent: true,
+          toneMapped: false,
+          depthTest: false,
+        }),
       );
       const qs = new THREE.Scene();
       qs.add(quad);
@@ -675,7 +722,8 @@ export class ViewportEngine {
       canvas.height = height;
       const ctx = canvas.getContext('2d')!;
       const img = ctx.createImageData(width, height);
-      for (let y = 0; y < height; y++) img.data.set(pixels.subarray((height - 1 - y) * width * 4, (height - y) * width * 4), y * width * 4);
+      for (let y = 0; y < height; y++)
+        img.data.set(pixels.subarray((height - 1 - y) * width * 4, (height - y) * width * 4), y * width * 4);
       if (!transparent) for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
       ctx.putImageData(img, 0, 0);
       span.setAttribute('render.width', width).setAttribute('render.height', height).setOk();

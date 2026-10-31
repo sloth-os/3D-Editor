@@ -1,4 +1,10 @@
-import { listModifierDefs, getModifierDef, safeJsonSchema, type ModifierData, type ObjectData } from '@3d-editor/core';
+import {
+  listModifierDefs,
+  getModifierDef,
+  safeJsonSchema,
+  type ModifierData,
+  type ObjectData,
+} from '@3d-editor/core';
 import type { ProjectSession } from '../../project/session';
 import { MenuButton } from '../Menu';
 import { Panel } from '../fields/fields';
@@ -10,11 +16,20 @@ import type { MenuItem } from '../../editor/menus';
 
 let dragOriginal: { key: string; modifiers: ModifierData[] } | null = null;
 
-function setParam(s: ProjectSession, o: ObjectData, mod: ModifierData, key: string, value: unknown, final: boolean): void {
+function setParam(
+  s: ProjectSession,
+  o: ObjectData,
+  mod: ModifierData,
+  key: string,
+  value: unknown,
+  final: boolean,
+): void {
   const k = `${o.id}:${mod.id}:${key}`;
   if (!final) {
     if (!dragOriginal || dragOriginal.key !== k) dragOriginal = { key: k, modifiers: o.modifiers };
-    const modifiers = o.modifiers.map((m) => (m.id === mod.id ? { ...m, params: { ...m.params, [key]: value } } : m));
+    const modifiers = o.modifiers.map((m) =>
+      m.id === mod.id ? { ...m, params: { ...m.params, [key]: value } } : m,
+    );
     s.doc.transact(() => s.doc.updateObject(o.id, { modifiers }), PREVIEW_ORIGIN);
     return;
   }
@@ -28,7 +43,12 @@ function setParam(s: ProjectSession, o: ObjectData, mod: ModifierData, key: stri
 function addMenu(o: ObjectData): MenuItem[] {
   const defs = listModifierDefs();
   const cats = ['EDIT', 'GENERATE', 'DEFORM', 'NORMALS'] as const;
-  const names: Record<string, string> = { EDIT: 'Edit', GENERATE: 'Generate', DEFORM: 'Deform', NORMALS: 'Normals' };
+  const names: Record<string, string> = {
+    EDIT: 'Edit',
+    GENERATE: 'Generate',
+    DEFORM: 'Deform',
+    NORMALS: 'Normals',
+  };
   return cats
     .map((c) => ({
       label: names[c],
@@ -50,7 +70,9 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
       <div style={{ padding: '4px 8px' }} data-testid="add-modifier">
         <MenuButton label="Add Modifier ▾" items={() => addMenu(o)} testId="add-modifier-button" />
       </div>
-      {o.modifiers.length === 0 && <div class="empty-note">No modifiers. Add one to change geometry non-destructively.</div>}
+      {o.modifiers.length === 0 && (
+        <div class="empty-note">No modifiers. Add one to change geometry non-destructively.</div>
+      )}
       {o.modifiers.map((m, i) => {
         const def = getModifierDef(m.type);
         const err = ev?.modifierErrors.find((e) => e.modifierId === m.id);
@@ -64,7 +86,13 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
                 <button
                   class={`btn flat icon ${m.show_in_editmode ? 'active' : ''}`}
                   title="Show in Edit Mode"
-                  onClick={() => run('object.modifier_set', { object: o.id, modifier: m.id, show_in_editmode: !m.show_in_editmode }, 'ui')}
+                  onClick={() =>
+                    run(
+                      'object.modifier_set',
+                      { object: o.id, modifier: m.id, show_in_editmode: !m.show_in_editmode },
+                      'ui',
+                    )
+                  }
                 >
                   <Icon name="vert" size={12} />
                 </button>
@@ -72,18 +100,35 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
                   class={`btn flat icon ${m.show_viewport ? 'active' : ''}`}
                   title="Show in Viewport"
                   data-testid={`modifier-toggle-${m.name}`}
-                  onClick={() => run('object.modifier_set', { object: o.id, modifier: m.id, show_viewport: !m.show_viewport }, 'ui')}
+                  onClick={() =>
+                    run(
+                      'object.modifier_set',
+                      { object: o.id, modifier: m.id, show_viewport: !m.show_viewport },
+                      'ui',
+                    )
+                  }
                 >
                   <Icon name="eye" size={12} />
                 </button>
                 <button
                   class={`btn flat icon ${m.show_render ? 'active' : ''}`}
                   title="Show in Render"
-                  onClick={() => run('object.modifier_set', { object: o.id, modifier: m.id, show_render: !m.show_render }, 'ui')}
+                  onClick={() =>
+                    run(
+                      'object.modifier_set',
+                      { object: o.id, modifier: m.id, show_render: !m.show_render },
+                      'ui',
+                    )
+                  }
                 >
                   <Icon name="render" size={12} />
                 </button>
-                <button class="btn flat icon" title="Move up" disabled={i === 0} onClick={() => run('object.modifier_move_up', { object: o.id, modifier: m.id }, 'ui')}>
+                <button
+                  class="btn flat icon"
+                  title="Move up"
+                  disabled={i === 0}
+                  onClick={() => run('object.modifier_move_up', { object: o.id, modifier: m.id }, 'ui')}
+                >
                   <Icon name="up" size={12} />
                 </button>
                 <button
@@ -94,10 +139,20 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
                 >
                   <Icon name="down" size={12} />
                 </button>
-                <button class="btn flat" title="Apply (bake into mesh)" data-testid={`modifier-apply-${m.name}`} onClick={() => run('object.modifier_apply', { object: o.id, modifier: m.id }, 'ui')}>
+                <button
+                  class="btn flat"
+                  title="Apply (bake into mesh)"
+                  data-testid={`modifier-apply-${m.name}`}
+                  onClick={() => run('object.modifier_apply', { object: o.id, modifier: m.id }, 'ui')}
+                >
                   Apply
                 </button>
-                <button class="btn flat icon" title="Remove" data-testid={`modifier-remove-${m.name}`} onClick={() => run('object.modifier_remove', { object: o.id, modifier: m.id }, 'ui')}>
+                <button
+                  class="btn flat icon"
+                  title="Remove"
+                  data-testid={`modifier-remove-${m.name}`}
+                  onClick={() => run('object.modifier_remove', { object: o.id, modifier: m.id }, 'ui')}
+                >
                   <Icon name="close" size={12} />
                 </button>
               </>

@@ -34,10 +34,17 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     viewport: { width: 1400, height: 860 },
     launchOptions: {
-      args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'],
+      args: [
+        '--use-gl=angle',
+        '--use-angle=swiftshader',
+        '--enable-unsafe-swiftshader',
+        '--ignore-gpu-blocklist',
+      ],
     },
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'], viewport: { width: 1400, height: 860 } } }],
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'], viewport: { width: 1400, height: 860 } } },
+  ],
   webServer: [
     {
       command: `node fixtures/webdav-server.mjs ${PORTS.webdav}`,
@@ -53,7 +60,12 @@ export default defineConfig({
       url: `http://127.0.0.1:${PORTS.plain}/healthz`,
       reuseExistingServer: false,
       timeout: 60_000,
-      env: { ...common, PORT: String(PORTS.plain), SYNC_PERSISTENCE: 'memory', DATA_DIR: mkdtempSync(resolve(tmpdir(), 'e2e-plain-')) },
+      env: {
+        ...common,
+        PORT: String(PORTS.plain),
+        SYNC_PERSISTENCE: 'memory',
+        DATA_DIR: mkdtempSync(resolve(tmpdir(), 'e2e-plain-')),
+      },
     },
     {
       command: `node ${serverMain}`,

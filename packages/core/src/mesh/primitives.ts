@@ -69,7 +69,11 @@ export interface GridParams {
   size?: number;
 }
 
-export function createGrid({ x_subdivisions = 10, y_subdivisions = 10, size = 2 }: GridParams = {}): MeshData {
+export function createGrid({
+  x_subdivisions = 10,
+  y_subdivisions = 10,
+  size = 2,
+}: GridParams = {}): MeshData {
   const nx = Math.max(1, Math.floor(x_subdivisions));
   const ny = Math.max(1, Math.floor(y_subdivisions));
   const h = size / 2;
@@ -93,7 +97,11 @@ export interface CircleParams {
   fill_type?: FillType;
 }
 
-export function createCircle({ vertices = 32, radius = 1, fill_type = 'NOTHING' }: CircleParams = {}): MeshData {
+export function createCircle({
+  vertices = 32,
+  radius = 1,
+  fill_type = 'NOTHING',
+}: CircleParams = {}): MeshData {
   const n = Math.max(3, Math.floor(vertices));
   const positions: number[] = [];
   const ring: number[] = [];
@@ -128,7 +136,11 @@ export interface UVSphereParams {
   radius?: number;
 }
 
-export function createUVSphere({ segments = 32, ring_count = 16, radius = 1 }: UVSphereParams = {}): MeshData {
+export function createUVSphere({
+  segments = 32,
+  ring_count = 16,
+  radius = 1,
+}: UVSphereParams = {}): MeshData {
   const seg = Math.max(3, Math.floor(segments));
   const rings = Math.max(3, Math.floor(ring_count));
   const positions: number[] = [0, 0, radius];
@@ -238,7 +250,10 @@ export function createIcoSphere({ subdivisions = 2, radius = 1 }: IcoSphereParam
   }
   const positions: number[] = [];
   for (const v of verts) positions.push(v[0] * radius, v[1] * radius, v[2] * radius);
-  const sphUV = (v: Vec3): [number, number] => [0.5 + Math.atan2(v[1], v[0]) / (2 * Math.PI), 0.5 + Math.asin(Math.max(-1, Math.min(1, v[2]))) / Math.PI];
+  const sphUV = (v: Vec3): [number, number] => [
+    0.5 + Math.atan2(v[1], v[0]) / (2 * Math.PI),
+    0.5 + Math.asin(Math.max(-1, Math.min(1, v[2]))) / Math.PI,
+  ];
   const uvs = tris.map((tri) => {
     const uv = tri.map((i) => sphUV(verts[i]));
     // fix seam wrap: if a triangle spans the u=0/1 seam, shift small u values up by one
@@ -256,7 +271,12 @@ export interface CylinderParams {
   end_fill_type?: FillType;
 }
 
-export function createCylinder({ vertices = 32, radius = 1, depth = 2, end_fill_type = 'NGON' }: CylinderParams = {}): MeshData {
+export function createCylinder({
+  vertices = 32,
+  radius = 1,
+  depth = 2,
+  end_fill_type = 'NGON',
+}: CylinderParams = {}): MeshData {
   return createCone({ vertices, radius1: radius, radius2: radius, depth, end_fill_type });
 }
 
@@ -329,7 +349,9 @@ export function createCone({
         const j = (i + 1) % n;
         faces.push(up ? [c, verts[i], verts[j]] : [c, verts[j], verts[i]]);
         uvs.push(
-          up ? [cx, 0.75, ...capUV(cx, i, false), ...capUV(cx, j, false)] : [cx, 0.75, ...capUV(cx, j, true), ...capUV(cx, i, true)],
+          up
+            ? [cx, 0.75, ...capUV(cx, i, false), ...capUV(cx, j, false)]
+            : [cx, 0.75, ...capUV(cx, j, true), ...capUV(cx, i, true)],
         );
       }
     }
@@ -374,7 +396,8 @@ export function createTorus({
   return createMesh({ positions, faces, uvs });
 }
 
-export type PrimitiveType = 'CUBE' | 'PLANE' | 'GRID' | 'CIRCLE' | 'UV_SPHERE' | 'ICO_SPHERE' | 'CYLINDER' | 'CONE' | 'TORUS';
+export type PrimitiveType =
+  'CUBE' | 'PLANE' | 'GRID' | 'CIRCLE' | 'UV_SPHERE' | 'ICO_SPHERE' | 'CYLINDER' | 'CONE' | 'TORUS';
 
 export function createPrimitive(type: PrimitiveType, params: Record<string, unknown> = {}): MeshData {
   switch (type) {

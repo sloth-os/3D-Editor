@@ -35,7 +35,8 @@ export function selectAllElements(m: MeshData): MeshSelection {
     const face = m.faces[f];
     for (let i = 0; i < face.length; i++) sel.edges.add(edgeKey(face[i], face[(i + 1) % face.length]));
   }
-  for (let i = 0; i < m.looseEdges.length; i += 2) sel.edges.add(edgeKey(m.looseEdges[i], m.looseEdges[i + 1]));
+  for (let i = 0; i < m.looseEdges.length; i += 2)
+    sel.edges.add(edgeKey(m.looseEdges[i], m.looseEdges[i + 1]));
   return sel;
 }
 
@@ -63,7 +64,8 @@ export function selectionFromEdges(m: MeshData, edges: Iterable<string>, topo?: 
   for (let f = 0; f < m.faces.length; f++) {
     const face = m.faces[f];
     let all = true;
-    for (let i = 0; i < face.length && all; i++) all = sel.edges.has(edgeKey(face[i], face[(i + 1) % face.length]));
+    for (let i = 0; i < face.length && all; i++)
+      all = sel.edges.has(edgeKey(face[i], face[(i + 1) % face.length]));
     if (all) sel.faces.add(f);
   }
   return sel;
@@ -88,9 +90,19 @@ export function selectionFromFaces(m: MeshData, faces: Iterable<number>): MeshSe
  * Re-derives a consistent selection according to the select mode, using the primary element
  * type of that mode as the source of truth. Also drops indices that no longer exist.
  */
-export function flushSelection(m: MeshData, sel: MeshSelection, mode: SelectMode, topo?: Topology): MeshSelection {
+export function flushSelection(
+  m: MeshData,
+  sel: MeshSelection,
+  mode: SelectMode,
+  topo?: Topology,
+): MeshSelection {
   const nv = vertexCount(m);
-  if (mode === 'VERT') return selectionFromVerts(m, [...sel.verts].filter((v) => v >= 0 && v < nv), topo);
+  if (mode === 'VERT')
+    return selectionFromVerts(
+      m,
+      [...sel.verts].filter((v) => v >= 0 && v < nv),
+      topo,
+    );
   if (mode === 'EDGE') return selectionFromEdges(m, sel.edges, topo);
   return selectionFromFaces(
     m,
@@ -99,7 +111,12 @@ export function flushSelection(m: MeshData, sel: MeshSelection, mode: SelectMode
 }
 
 /** Converts a selection when switching select modes (Blender behavior). */
-export function convertSelectMode(m: MeshData, sel: MeshSelection, from: SelectMode, to: SelectMode): MeshSelection {
+export function convertSelectMode(
+  m: MeshData,
+  sel: MeshSelection,
+  from: SelectMode,
+  to: SelectMode,
+): MeshSelection {
   if (from === to) return flushSelection(m, sel, to);
   if (to === 'VERT') return selectionFromVerts(m, sel.verts);
   if (to === 'EDGE') return selectionFromEdges(m, flushSelection(m, sel, from).edges);

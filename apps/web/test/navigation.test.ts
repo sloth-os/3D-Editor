@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import * as THREE from 'three';
-import { DEFAULT_POSE, axisViewAngles, poseBasis, posePosition, poseToPresence, presenceToPose, viewLabel, lerpPose, applyPoseToCamera } from '../src/viewport/navigation';
+import {
+  DEFAULT_POSE,
+  axisViewAngles,
+  poseBasis,
+  posePosition,
+  poseToPresence,
+  presenceToPose,
+  viewLabel,
+  lerpPose,
+  applyPoseToCamera,
+} from '../src/viewport/navigation';
 
 describe('viewport navigation', () => {
   it('front/right/top views look along the expected axes (Z up)', () => {
@@ -8,11 +18,23 @@ describe('viewport navigation', () => {
     p.target.set(0, 0, 0);
     p.distance = 10;
     Object.assign(p, axisViewAngles('FRONT'));
-    expect(posePosition(p).toArray().map((v) => Math.round(v) + 0)).toEqual([0, -10, 0]);
+    expect(
+      posePosition(p)
+        .toArray()
+        .map((v) => Math.round(v) + 0),
+    ).toEqual([0, -10, 0]);
     Object.assign(p, axisViewAngles('RIGHT'));
-    expect(posePosition(p).toArray().map((v) => Math.round(v) + 0)).toEqual([10, 0, 0]);
+    expect(
+      posePosition(p)
+        .toArray()
+        .map((v) => Math.round(v) + 0),
+    ).toEqual([10, 0, 0]);
     Object.assign(p, axisViewAngles('TOP'));
-    expect(posePosition(p).toArray().map((v) => Math.round(v) + 0)).toEqual([0, 0, 10]);
+    expect(
+      posePosition(p)
+        .toArray()
+        .map((v) => Math.round(v) + 0),
+    ).toEqual([0, 0, 10]);
     // basis stays orthonormal at the pole
     const b = poseBasis(p);
     expect(Math.abs(b.right.dot(b.up))).toBeLessThan(1e-9);

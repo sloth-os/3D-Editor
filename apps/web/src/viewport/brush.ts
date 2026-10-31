@@ -54,11 +54,16 @@ export class BrushStroke {
     const ev = engine.ev?.byId.get(objectId);
     this.world = new THREE.Matrix4().fromArray(ev?.worldMatrix ?? session.doc.worldMatrix(objectId));
     this.inv = this.world.clone().invert();
-    this.hitMesh = new THREE.Mesh(geometryFromMesh(this.mesh).geometry, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }));
+    this.hitMesh = new THREE.Mesh(
+      geometryFromMesh(this.mesh).geometry,
+      new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }),
+    );
     this.hitMesh.matrixAutoUpdate = false;
     this.hitMesh.matrix.copy(this.world);
     this.hitMesh.updateMatrixWorld(true);
-    this.span.setAttribute('brush.paint', paint).setAttribute('mesh.vertices', this.mesh.positions.length / 3);
+    this.span
+      .setAttribute('brush.paint', paint)
+      .setAttribute('mesh.vertices', this.mesh.positions.length / 3);
   }
 
   /** World radius of the brush for a screen radius at a world point. */
@@ -99,8 +104,22 @@ export class BrushStroke {
       const prev = this.last ?? this.grabStartWorld;
       const deltaWorld = target.clone().sub(prev);
       this.last = target;
-      const dl = deltaWorld.clone().transformDirection(this.inv).multiplyScalar(deltaWorld.length() / Math.max(1e-9, deltaWorld.clone().transformDirection(this.inv).length()) / this.scale());
-      applySculptDab(this.mesh, this.cache, { brush: 'GRAB', center: [0, 0, 0], radius: 1, strength: 1, grabDelta: [dl.x, dl.y, dl.z], symmetryX: b.symmetryX });
+      const dl = deltaWorld
+        .clone()
+        .transformDirection(this.inv)
+        .multiplyScalar(
+          deltaWorld.length() /
+            Math.max(1e-9, deltaWorld.clone().transformDirection(this.inv).length()) /
+            this.scale(),
+        );
+      applySculptDab(this.mesh, this.cache, {
+        brush: 'GRAB',
+        center: [0, 0, 0],
+        radius: 1,
+        strength: 1,
+        grabDelta: [dl.x, dl.y, dl.z],
+        symmetryX: b.symmetryX,
+      });
       this.preview();
       return true;
     }
@@ -122,7 +141,15 @@ export class BrushStroke {
       const l = q.clone().applyMatrix4(this.inv);
       const c: Vec3 = [l.x, l.y, l.z];
       if (this.paint) applyPaintDab(this.mesh, c, radiusWorld / scale, b.color, b.strength, b.symmetryX);
-      else applySculptDab(this.mesh, this.cache, { brush, center: c, radius: radiusWorld / scale, strength: b.strength, invert: this.invert, symmetryX: b.symmetryX });
+      else
+        applySculptDab(this.mesh, this.cache, {
+          brush,
+          center: c,
+          radius: radiusWorld / scale,
+          strength: b.strength,
+          invert: this.invert,
+          symmetryX: b.symmetryX,
+        });
       this.dabs++;
     }
     if (!this.paint) refreshSculptNormals(this.mesh, this.cache);

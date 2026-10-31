@@ -17,7 +17,13 @@ function readField(s: ProjectSession, kind: Kind, target: string | null, field: 
   return s.doc.getBlock(kind, target!)?.[field];
 }
 
-function writeField(s: ProjectSession, kind: Kind, target: string | null, field: string, value: unknown): void {
+function writeField(
+  s: ProjectSession,
+  kind: Kind,
+  target: string | null,
+  field: string,
+  value: unknown,
+): void {
   const patch = { [field]: value };
   s.doc.transact(() => {
     if (kind === 'scene') s.doc.updateScene(patch);
@@ -32,7 +38,14 @@ function writeField(s: ProjectSession, kind: Kind, target: string | null, field:
  * without undo tracking; the final value runs `data.set_property` so the whole drag becomes a
  * single undo step.
  */
-export function setProp(s: ProjectSession, kind: Kind, target: string | null, field: string, value: unknown, final = true): void {
+export function setProp(
+  s: ProjectSession,
+  kind: Kind,
+  target: string | null,
+  field: string,
+  value: unknown,
+  final = true,
+): void {
   const key = `${kind}:${target}:${field}`;
   if (!final) {
     if (!drag || drag.key !== key) drag = { key, original: readField(s, kind, target, field) };
@@ -49,14 +62,27 @@ export function setProp(s: ProjectSession, kind: Kind, target: string | null, fi
 export type FieldAnimState = 'keyed' | 'animated' | null;
 
 /** Animation state of a property channel at the current frame (for field colouring). */
-export function animState(s: ProjectSession, type: AnimTargetType, id: string, path: string, index: number): FieldAnimState {
+export function animState(
+  s: ProjectSession,
+  type: AnimTargetType,
+  id: string,
+  path: string,
+  index: number,
+): FieldAnimState {
   const fc = s.doc.getFCurve(`${type}:${id}:${path}:${index}`);
   if (!fc || fc.keyframes.length === 0) return null;
   return hasKeyframeAt(fc, s.state.frame) ? 'keyed' : 'animated';
 }
 
 /** Value of a property channel including animation. */
-export function animatedValue(s: ProjectSession, type: AnimTargetType, id: string, path: string, index: number, base: number): number {
+export function animatedValue(
+  s: ProjectSession,
+  type: AnimTargetType,
+  id: string,
+  path: string,
+  index: number,
+  base: number,
+): number {
   const fc = s.doc.getFCurve(`${type}:${id}:${path}:${index}`);
   if (!fc || fc.mute) return base;
   return evaluateFCurve(fc, s.state.frame) ?? base;

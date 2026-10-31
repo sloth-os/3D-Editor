@@ -44,7 +44,14 @@ export interface RpcResponse {
 export type RpcMessage = RpcRequest | RpcResponse;
 
 export type ControlMessage =
-  | { kind: 'hello'; connectionId: string; room: string; serverVersion: string; protocol: number; peers: number }
+  | {
+      kind: 'hello';
+      connectionId: string;
+      room: string;
+      serverVersion: string;
+      protocol: number;
+      peers: number;
+    }
   | { kind: 'client-info'; app: string; version: string; capabilities: string[]; name?: string }
   | { kind: 'peers'; count: number }
   | { kind: 'ping'; t: number }
@@ -73,7 +80,10 @@ export function encodeFrame(type: number, write: (enc: encoding.Encoder) => void
   return encoding.toUint8Array(enc);
 }
 
-export function encodeJsonFrame(type: typeof MSG_RPC | typeof MSG_CONTROL, payload: RpcMessage | ControlMessage): Uint8Array {
+export function encodeJsonFrame(
+  type: typeof MSG_RPC | typeof MSG_CONTROL,
+  payload: RpcMessage | ControlMessage,
+): Uint8Array {
   return encodeFrame(type, (enc) => encoding.writeVarString(enc, JSON.stringify(payload)));
 }
 

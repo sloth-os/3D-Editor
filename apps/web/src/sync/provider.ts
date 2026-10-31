@@ -60,7 +60,10 @@ export class SyncProvider {
       this.bcSend(encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep1(enc, doc)));
       this.bcSend(
         encodeFrame(MSG_AWARENESS, (enc) =>
-          encoding.writeVarUint8Array(enc, awarenessProtocol.encodeAwarenessUpdate(awareness, [doc.clientID])),
+          encoding.writeVarUint8Array(
+            enc,
+            awarenessProtocol.encodeAwarenessUpdate(awareness, [doc.clientID]),
+          ),
         ),
       );
     }
@@ -122,7 +125,10 @@ export class SyncProvider {
       if (states.length)
         this.send(
           encodeFrame(MSG_AWARENESS, (enc) =>
-            encoding.writeVarUint8Array(enc, awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID])),
+            encoding.writeVarUint8Array(
+              enc,
+              awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID]),
+            ),
           ),
         );
       this.send(
@@ -133,7 +139,10 @@ export class SyncProvider {
           capabilities: this.capabilities,
         }),
       );
-      this.pingTimer = setInterval(() => this.send(encodeJsonFrame(MSG_CONTROL, { kind: 'ping', t: Date.now() })), 10_000);
+      this.pingTimer = setInterval(
+        () => this.send(encodeJsonFrame(MSG_CONTROL, { kind: 'ping', t: Date.now() })),
+        10_000,
+      );
       this.send(encodeJsonFrame(MSG_CONTROL, { kind: 'ping', t: Date.now() }));
     };
     ws.onmessage = (e) => this.onMessage(new Uint8Array(e.data as ArrayBuffer), 'ws');
@@ -183,10 +192,19 @@ export class SyncProvider {
     const frame = encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeUpdate(enc, update));
     this.send(frame);
     if (origin !== 'broadcast') this.bcSend(frame);
-    telemetry.histogram('editor.sync.update_bytes', update.byteLength, {}, 'By', [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576]);
+    telemetry.histogram(
+      'editor.sync.update_bytes',
+      update.byteLength,
+      {},
+      'By',
+      [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576],
+    );
   };
 
-  private onAwarenessUpdate = ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
+  private onAwarenessUpdate = (
+    { added, updated, removed }: { added: number[]; updated: number[]; removed: number[] },
+    origin: unknown,
+  ) => {
     if (origin === this || origin === 'broadcast') return;
     const changed = [...added, ...updated, ...removed];
     const frame = encodeFrame(MSG_AWARENESS, (enc) =>
@@ -217,12 +235,19 @@ export class SyncProvider {
         break;
       }
       case MSG_AWARENESS:
-        awarenessProtocol.applyAwarenessUpdate(this.awareness, decoding.readVarUint8Array(decoder), via === 'ws' ? this : 'broadcast');
+        awarenessProtocol.applyAwarenessUpdate(
+          this.awareness,
+          decoding.readVarUint8Array(decoder),
+          via === 'ws' ? this : 'broadcast',
+        );
         break;
       case MSG_QUERY_AWARENESS:
         this.send(
           encodeFrame(MSG_AWARENESS, (enc) =>
-            encoding.writeVarUint8Array(enc, awarenessProtocol.encodeAwarenessUpdate(this.awareness, [...this.awareness.getStates().keys()])),
+            encoding.writeVarUint8Array(
+              enc,
+              awarenessProtocol.encodeAwarenessUpdate(this.awareness, [...this.awareness.getStates().keys()]),
+            ),
           ),
         );
         break;
@@ -238,7 +263,8 @@ export class SyncProvider {
   }
 
   private onControl(msg: ControlMessage): void {
-    if (msg.kind === 'hello' || msg.kind === 'peers') this.peers.value = msg.kind === 'hello' ? msg.peers : msg.count;
+    if (msg.kind === 'hello' || msg.kind === 'peers')
+      this.peers.value = msg.kind === 'hello' ? msg.peers : msg.count;
     else if (msg.kind === 'pong') {
       const rtt = Date.now() - msg.t;
       this.latencyMs.value = rtt;

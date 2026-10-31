@@ -12,13 +12,23 @@ describe('telemetry', () => {
 
   function make(enabled = true) {
     const t = new Telemetry();
-    t.configure({ endpoint: 'http://x/otlp', headers: () => ({}), enabled: () => enabled, resource: { 'service.name': 'test' } });
+    t.configure({
+      endpoint: 'http://x/otlp',
+      headers: () => ({}),
+      enabled: () => enabled,
+      resource: { 'service.name': 'test' },
+    });
     return t;
   }
 
   it('exports spans, metrics and logs as OTLP JSON', async () => {
     const t = make();
-    const span = t.startSpan('operator mesh.primitive_cube_add', { 'operator.id': 'mesh.primitive_cube_add', count: 2, ratio: 0.5, ok: true });
+    const span = t.startSpan('operator mesh.primitive_cube_add', {
+      'operator.id': 'mesh.primitive_cube_add',
+      count: 2,
+      ratio: 0.5,
+      ok: true,
+    });
     span.setOk();
     span.end();
     t.histogram('editor.frame_time_ms', 16);
@@ -27,7 +37,10 @@ describe('telemetry', () => {
     t.count('editor.select.click', 3, { mode: 'OBJECT' });
     t.log('ERROR', 'boom', { where: 'test' });
     await t.flush();
-    const bodies = fetchMock.mock.calls.map(([url, init]) => ({ url: String(url), body: JSON.parse((init as RequestInit).body as string) }));
+    const bodies = fetchMock.mock.calls.map(([url, init]) => ({
+      url: String(url),
+      body: JSON.parse((init as RequestInit).body as string),
+    }));
     const traces = bodies.find((b) => b.url.endsWith('/v1/traces'))!.body;
     const s = traces.resourceSpans[0].scopeSpans[0].spans[0];
     expect(s.name).toBe('operator mesh.primitive_cube_add');
@@ -36,14 +49,22 @@ describe('telemetry', () => {
     expect(s.status.code).toBe(1);
     expect(s.attributes).toContainEqual({ key: 'count', value: { intValue: '2' } });
     expect(s.attributes).toContainEqual({ key: 'ratio', value: { doubleValue: 0.5 } });
-    const metrics = bodies.find((b) => b.url.endsWith('/v1/metrics'))!.body.resourceMetrics[0].scopeMetrics[0].metrics;
+    const metrics = bodies.find((b) => b.url.endsWith('/v1/metrics'))!.body.resourceMetrics[0].scopeMetrics[0]
+      .metrics;
     const hist = metrics.find((m: { name: string }) => m.name === 'editor.frame_time_ms');
     expect(hist.histogram.dataPoints[0].count).toBe('2');
     expect(hist.histogram.dataPoints[0].sum).toBe(56);
-    expect(metrics.find((m: { name: string }) => m.name === 'editor.fps').gauge.dataPoints[0].asDouble).toBe(60);
-    expect(metrics.find((m: { name: string }) => m.name === 'editor.select.click').sum.dataPoints[0].asDouble).toBe(3);
+    expect(metrics.find((m: { name: string }) => m.name === 'editor.fps').gauge.dataPoints[0].asDouble).toBe(
+      60,
+    );
+    expect(
+      metrics.find((m: { name: string }) => m.name === 'editor.select.click').sum.dataPoints[0].asDouble,
+    ).toBe(3);
     const logs = bodies.find((b) => b.url.endsWith('/v1/logs'))!.body;
-    expect(logs.resourceLogs[0].scopeLogs[0].logRecords[0]).toMatchObject({ severityText: 'ERROR', body: { stringValue: 'boom' } });
+    expect(logs.resourceLogs[0].scopeLogs[0].logRecords[0]).toMatchObject({
+      severityText: 'ERROR',
+      body: { stringValue: 'boom' },
+    });
     const res = traces.resourceSpans[0].resource.attributes;
     expect(res).toContainEqual({ key: 'service.name', value: { stringValue: 'test' } });
   });

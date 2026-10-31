@@ -28,7 +28,9 @@ export function Properties({ session }: { session: ProjectSession }) {
   const activeId = session.state.$activeId.value;
   const active = activeId ? session.doc.getObject(activeId) : null;
   const [tab, setTab] = useState<Tab>(propertiesTab.current);
-  const available = TABS.filter((t) => !t.needs || (t.needs === 'object' ? !!active : active?.type === 'MESH'));
+  const available = TABS.filter(
+    (t) => !t.needs || (t.needs === 'object' ? !!active : active?.type === 'MESH'),
+  );
   const current = available.find((t) => t.id === tab) ? tab : available.find((t) => t.id === 'scene')!.id;
   return (
     <div class="properties" onPointerDown={(e) => e.stopPropagation()}>

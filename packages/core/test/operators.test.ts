@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { SceneDoc, createEditorState, createOperatorRegistry, type OperatorContext, selectAllElements } from '../src';
+import {
+  SceneDoc,
+  createEditorState,
+  createOperatorRegistry,
+  type OperatorContext,
+  selectAllElements,
+} from '../src';
 
 function setup(empty = false) {
   const doc = SceneDoc.create({ empty });
@@ -40,7 +46,10 @@ describe('operators', () => {
 
   it('runs every operator as a single undoable transaction', () => {
     const { doc, run } = setup(true);
-    const um = new Y.UndoManager(doc.sharedTypes(), { trackedOrigins: new Set([doc.origin]), captureTimeout: 0 });
+    const um = new Y.UndoManager(doc.sharedTypes(), {
+      trackedOrigins: new Set([doc.origin]),
+      captureTimeout: 0,
+    });
     run('mesh.primitive_cube_add');
     run('mesh.primitive_cube_add');
     expect(doc.listObjects()).toHaveLength(2);

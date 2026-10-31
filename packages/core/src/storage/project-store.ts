@@ -78,7 +78,9 @@ export class ProjectFileStore {
     }
     const ids = entries.filter((e) => e.isDir && isValidProjectId(e.name)).map((e) => e.name);
     const infos = await Promise.all(ids.map((id) => this.loadInfo(id).catch(() => null)));
-    return infos.filter((x): x is ProjectInfo => !!x).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    return infos
+      .filter((x): x is ProjectInfo => !!x)
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   }
 
   async loadInfo(id: string): Promise<ProjectInfo | null> {
@@ -136,7 +138,8 @@ export class ProjectFileStore {
         pulled = pulled || changed;
       }
       const local = Y.encodeStateAsUpdate(ydoc);
-      if (remote && !updateAddsToState(remote.update, local)) return { pulled, pushed: false, etag: remote.etag };
+      if (remote && !updateAddsToState(remote.update, local))
+        return { pulled, pushed: false, etag: remote.etag };
       try {
         await this.fs.mkdirp(this.projectDir(id));
         const res = await this.fs.write(this.docPath(id), local, {

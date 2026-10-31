@@ -46,7 +46,12 @@ export class ModalTransform {
   private lastAngle: number;
   private precisionOrigin: { x: number; y: number } | null = null;
   private originals = new Map<string, Mat4>();
-  private editBase: { id: string; mesh: import('@3d-editor/core').MeshData; verts: Set<number>; world: Mat4 } | null = null;
+  private editBase: {
+    id: string;
+    mesh: import('@3d-editor/core').MeshData;
+    verts: Set<number>;
+    world: Mat4;
+  } | null = null;
   current: Mat4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
   private summary = '';
 
@@ -65,9 +70,18 @@ export class ModalTransform {
     if (state.mode === 'EDIT' && state.activeId) {
       const o = doc.getObject(state.activeId);
       const mesh = o?.data ? doc.getMesh(o.data) : null;
-      if (o && mesh) this.editBase = { id: o.id, mesh, verts: selectedVertexSet(mesh, state.meshSelection), world: doc.worldMatrix(o.id) };
+      if (o && mesh)
+        this.editBase = {
+          id: o.id,
+          mesh,
+          verts: selectedVertexSet(mesh, state.meshSelection),
+          world: doc.worldMatrix(o.id),
+        };
     } else {
-      for (const id of transformRoots(doc, state.selectedIds.filter((id) => doc.getObject(id)))) {
+      for (const id of transformRoots(
+        doc,
+        state.selectedIds.filter((id) => doc.getObject(id)),
+      )) {
         const ev = engine.ev?.byId.get(id);
         this.originals.set(id, ev ? ev.worldMatrix.slice() : doc.worldMatrix(id));
       }
@@ -90,7 +104,8 @@ export class ModalTransform {
 
   typeKey(key: string): boolean {
     if (/^[0-9]$/.test(key) || key === '.') this.numeric += key;
-    else if (key === '-') this.numeric = this.numeric.startsWith('-') ? this.numeric.slice(1) : `-${this.numeric}`;
+    else if (key === '-')
+      this.numeric = this.numeric.startsWith('-') ? this.numeric.slice(1) : `-${this.numeric}`;
     else if (key === 'Backspace') this.numeric = this.numeric.slice(0, -1);
     else return false;
     this.update(this.last, { ctrl: false, shift: false });
@@ -106,7 +121,10 @@ export class ModalTransform {
     let m = mouse;
     if (mods.shift) {
       if (!this.precisionOrigin) this.precisionOrigin = { ...this.last };
-      m = { x: this.precisionOrigin.x + (mouse.x - this.precisionOrigin.x) * 0.1, y: this.precisionOrigin.y + (mouse.y - this.precisionOrigin.y) * 0.1 };
+      m = {
+        x: this.precisionOrigin.x + (mouse.x - this.precisionOrigin.x) * 0.1,
+        y: this.precisionOrigin.y + (mouse.y - this.precisionOrigin.y) * 0.1,
+      };
     } else this.precisionOrigin = null;
     this.last = { ...mouse };
     const num = this.numeric && this.numeric !== '-' && this.numeric !== '.' ? Number(this.numeric) : null;
@@ -138,7 +156,11 @@ export class ModalTransform {
     }
     if (snap && num === null) {
       const inc = this.engine.pose.distance > 4 ? 1 : 0.1;
-      delta.set(Math.round(delta.x / inc) * inc, Math.round(delta.y / inc) * inc, Math.round(delta.z / inc) * inc);
+      delta.set(
+        Math.round(delta.x / inc) * inc,
+        Math.round(delta.y / inc) * inc,
+        Math.round(delta.z / inc) * inc,
+      );
     }
     this.summary = `D: ${delta.x.toFixed(4)} m  ${delta.y.toFixed(4)} m  ${delta.z.toFixed(4)} m (${delta.length().toFixed(4)} m)`;
     return translation4([delta.x, delta.y, delta.z]);
@@ -195,7 +217,9 @@ export class ModalTransform {
     let s: Vec3 = [f, f, f];
     if (this.axis) {
       const i = { X: 0, Y: 1, Z: 2 }[this.axis];
-      s = this.planeExclude ? ([f, f, f].map((v, k) => (k === i ? 1 : v)) as Vec3) : ([1, 1, 1].map((v, k) => (k === i ? f : v)) as Vec3);
+      s = this.planeExclude
+        ? ([f, f, f].map((v, k) => (k === i ? 1 : v)) as Vec3)
+        : ([1, 1, 1].map((v, k) => (k === i ? f : v)) as Vec3);
     }
     this.scaleValue = s;
     this.summary = `Scale X: ${s[0].toFixed(4)}  Y: ${s[1].toFixed(4)}  Z: ${s[2].toFixed(4)}`;
@@ -207,16 +231,24 @@ export class ModalTransform {
     const { state } = this.session;
     const pivot: Vec3 = [this.pivot.x, this.pivot.y, this.pivot.z];
     if (this.editBase) {
-      const mesh = transformVertices(this.editBase.mesh, this.editBase.verts, this.editBase.world, this.current, pivot, {
-        proportional: state.proportionalEditing,
-        proportionalSize: state.proportionalSize,
-        falloff: state.proportionalFalloff,
-      });
+      const mesh = transformVertices(
+        this.editBase.mesh,
+        this.editBase.verts,
+        this.editBase.world,
+        this.current,
+        pivot,
+        {
+          proportional: state.proportionalEditing,
+          proportionalSize: state.proportionalSize,
+          falloff: state.proportionalFalloff,
+        },
+      );
       this.engine.setMeshOverride(this.editBase.id, mesh);
     } else {
       const out = new Map<string, number[]>();
       const pivotMode = state.pivotPoint;
-      const T = (p: Vec3) => multiply4(translation4(p), multiply4(this.current, translation4([-p[0], -p[1], -p[2]])));
+      const T = (p: Vec3) =>
+        multiply4(translation4(p), multiply4(this.current, translation4([-p[0], -p[1], -p[2]])));
       for (const [id, w0] of this.originals) {
         const p: Vec3 = pivotMode === 'INDIVIDUAL_ORIGINS' ? [w0[12], w0[13], w0[14]] : pivot;
         out.set(id, multiply4(T(p), w0));
@@ -262,7 +294,11 @@ export class ModalTransform {
       const c = this.current;
       return { operator: 'transform.translate', params: { value: [c[12], c[13], c[14]] } };
     }
-    if (this.kind === 'rotate') return { operator: 'transform.rotate', params: { value: this.rotAngle, axis: this.rotAxis, center: pivot } };
+    if (this.kind === 'rotate')
+      return {
+        operator: 'transform.rotate',
+        params: { value: this.rotAngle, axis: this.rotAxis, center: pivot },
+      };
     return { operator: 'transform.resize', params: { value: this.scaleValue, center: pivot } };
   }
 }

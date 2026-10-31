@@ -1,5 +1,11 @@
 import { signal } from '@preact/signals';
-import { ProjectFileStore, WebDAVClient, type ProjectInfo, type SceneDoc, type SyncResult } from '@3d-editor/core';
+import {
+  ProjectFileStore,
+  WebDAVClient,
+  type ProjectInfo,
+  type SceneDoc,
+  type SyncResult,
+} from '@3d-editor/core';
 import { prefs } from '../app/prefs';
 import { serverConfig } from '../app/store';
 import { authHeaders, serverBase } from '../app/server-config';
@@ -30,11 +36,24 @@ export function resolveWebDAV(): WebDAVTarget | null {
       headers: authHeaders(),
       timeoutMs: 20_000,
     });
-    return { store: new ProjectFileStore(client, cfg.webdav.basePath), label: 'WebDAV (via editor server)', viaServer: true };
+    return {
+      store: new ProjectFileStore(client, cfg.webdav.basePath),
+      label: 'WebDAV (via editor server)',
+      viaServer: true,
+    };
   }
   if (custom) {
-    const client = new WebDAVClient({ url: custom, username: p.webdav.username || undefined, password: p.webdav.password || undefined, timeoutMs: 20_000 });
-    return { store: new ProjectFileStore(client, p.webdav.basePath || '/'), label: `WebDAV (${new URL(custom, location.href).host})`, viaServer: false };
+    const client = new WebDAVClient({
+      url: custom,
+      username: p.webdav.username || undefined,
+      password: p.webdav.password || undefined,
+      timeoutMs: 20_000,
+    });
+    return {
+      store: new ProjectFileStore(client, p.webdav.basePath || '/'),
+      label: `WebDAV (${new URL(custom, location.href).host})`,
+      viaServer: false,
+    };
   }
   return null;
 }
@@ -98,7 +117,9 @@ export class WebDAVSync {
       return this.running;
     }
     this.running = (async () => {
-      const span = telemetry.startSpan('storage.webdav.sync', { 'storage.via_server': this.target.viaServer });
+      const span = telemetry.startSpan('storage.webdav.sync', {
+        'storage.via_server': this.target.viaServer,
+      });
       this.status.value = 'syncing';
       try {
         const res = await this.target.store.syncDocument(this.projectId, this.doc.ydoc, {

@@ -22,11 +22,15 @@ export function pickObject(engine: ViewportEngine, x: number, y: number): string
 }
 
 /** Objects whose geometry (or origin) projects inside a screen rectangle. */
-export function objectsInRect(engine: ViewportEngine, r: { x0: number; y0: number; x1: number; y1: number }): string[] {
+export function objectsInRect(
+  engine: ViewportEngine,
+  r: { x0: number; y0: number; x1: number; y1: number },
+): string[] {
   const out: string[] = [];
   const ev = engine.ev;
   if (!ev) return out;
-  const inside = (p: { x: number; y: number; z: number }) => p.z > -1 && p.z < 1 && p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1;
+  const inside = (p: { x: number; y: number; z: number }) =>
+    p.z > -1 && p.z < 1 && p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1;
   for (const o of ev.objects) {
     if (!o.visible || o.data.hide_select) continue;
     let hit = false;
@@ -56,7 +60,12 @@ interface Projected {
 }
 
 /** Projects all vertices of the edit mesh, testing occlusion against the cage (unless x-ray). */
-export function projectEditVerts(engine: ViewportEngine, mesh: MeshData, world: number[], xray: boolean): Projected[] {
+export function projectEditVerts(
+  engine: ViewportEngine,
+  mesh: MeshData,
+  world: number[],
+  xray: boolean,
+): Projected[] {
   const n = vertexCount(mesh);
   const out: Projected[] = new Array(n);
   const cam = engine.camera;
@@ -115,7 +124,13 @@ function segDist2(px: number, py: number, ax: number, ay: number, bx: number, by
   return qx * qx + qy * qy;
 }
 
-export function nearestEdge(proj: Projected[], edges: [number, number][], x: number, y: number, maxDist = 12): string | null {
+export function nearestEdge(
+  proj: Projected[],
+  edges: [number, number][],
+  x: number,
+  y: number,
+  maxDist = 12,
+): string | null {
   let best: string | null = null;
   let bestD = maxDist * maxDist;
   for (const [a, b] of edges) {

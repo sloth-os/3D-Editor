@@ -3,7 +3,9 @@ import preact from '@preact/preset-vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import { readFileSync } from 'node:fs';
 
-const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as { version: string };
+const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
+  version: string;
+};
 const serverTarget = process.env.EDITOR_SERVER_URL ?? 'http://127.0.0.1:8080';
 
 export default defineConfig({
@@ -49,7 +51,16 @@ export default defineConfig({
         globPatterns: ['**/*.{js,css,html,svg,png,woff2,webmanifest}'],
         maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
         navigateFallback: '/index.html',
-        navigateFallbackDenylist: [/^\/api\//, /^\/sync\//, /^\/mcp/, /^\/dav\//, /^\/otlp\//, /^\/metrics/, /^\/healthz/, /^\/readyz/],
+        navigateFallbackDenylist: [
+          /^\/api\//,
+          /^\/sync\//,
+          /^\/mcp/,
+          /^\/dav\//,
+          /^\/otlp\//,
+          /^\/metrics/,
+          /^\/healthz/,
+          /^\/readyz/,
+        ],
         cleanupOutdatedCaches: true,
         clientsClaim: true,
       },

@@ -70,7 +70,16 @@ export function buildTopology(m: MeshData): Topology {
     const b = m.looseEdges[i + 1];
     if (a !== b) getEdge(a, b);
   }
-  return { edges, edgeIndex, edgeFaces, vertEdges, vertFaces, faceEdges, faceCornerStart, cornerCount: corner };
+  return {
+    edges,
+    edgeIndex,
+    edgeFaces,
+    vertEdges,
+    vertFaces,
+    faceEdges,
+    faceCornerStart,
+    cornerCount: corner,
+  };
 }
 
 /** Edges with exactly one adjacent face. */

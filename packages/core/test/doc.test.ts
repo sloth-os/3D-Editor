@@ -103,7 +103,9 @@ describe('SceneDoc', () => {
     });
     const copy = SceneDoc.fromSnapshot(doc.toSnapshot());
     expect(copy.toSnapshot()).toEqual(doc.toSnapshot());
-    expect(copy.getFCurve(fcurveKey({ target_type: 'object', target_id: cube.id, path: 'location', index: 2 }))).not.toBeNull();
+    expect(
+      copy.getFCurve(fcurveKey({ target_type: 'object', target_id: cube.id, path: 'location', index: 2 })),
+    ).not.toBeNull();
   });
 
   it('evaluates animation and parenting', () => {

@@ -6,7 +6,15 @@ import { ViewportInteraction } from '../viewport/interaction';
 import { canRun, hoveredArea, popupMenu, registry, run, viewport } from '../editor/editor';
 import { lastOperator, redoLast } from '../editor/runner';
 import { MenuButton } from './Menu';
-import { ADD_MENU, MESH_MENU, OBJECT_MENU, SELECT_MENU_EDIT, SELECT_MENU_OBJECT, UV_MENU, VIEW_MENU } from '../editor/menus';
+import {
+  ADD_MENU,
+  MESH_MENU,
+  OBJECT_MENU,
+  SELECT_MENU_EDIT,
+  SELECT_MENU_OBJECT,
+  UV_MENU,
+  VIEW_MENU,
+} from '../editor/menus';
 import { Icon, type IconName } from './icons';
 import { SchemaForm } from './SchemaForm';
 import { Panel, Row, SelectField, NumberField, ColorField, Checkbox } from './fields/fields';
@@ -24,7 +32,15 @@ function BrushSettings({ s }: { s: ProjectSession }) {
     <span style={{ display: 'flex', gap: '6px', alignItems: 'center' }} data-testid="brush-settings">
       <span class="hint">Radius</span>
       <div style={{ width: '70px' }}>
-        <NumberField value={b.radius} integer min={2} max={500} unit=" px" step={1} onChange={(v) => set({ radius: v })} />
+        <NumberField
+          value={b.radius}
+          integer
+          min={2}
+          max={500}
+          unit=" px"
+          step={1}
+          onChange={(v) => set({ radius: v })}
+        />
       </div>
       <span class="hint">Strength</span>
       <div style={{ width: '70px' }}>
@@ -58,7 +74,11 @@ function ViewportHeader({ s }: { s: ProjectSession }) {
   const mode = s.state.$mode.value;
   const shading = s.view.shading.value;
   const selectMode = s.state.$selectMode.value;
-  const shadingBtn = (type: 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED', icon: IconName, title: string) => (
+  const shadingBtn = (
+    type: 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED',
+    icon: IconName,
+    title: string,
+  ) => (
     <button
       class={`btn icon ${shading === type ? 'active' : ''}`}
       title={title}
@@ -97,7 +117,9 @@ function ViewportHeader({ s }: { s: ProjectSession }) {
       )}
       <MenuButton label="View" items={VIEW_MENU} />
       {(mode === 'SCULPT' || mode === 'VERTEX_PAINT') && <BrushSettings s={s} />}
-      {(mode === 'OBJECT' || mode === 'EDIT') && <MenuButton label="Select" items={mode === 'EDIT' ? SELECT_MENU_EDIT : SELECT_MENU_OBJECT} />}
+      {(mode === 'OBJECT' || mode === 'EDIT') && (
+        <MenuButton label="Select" items={mode === 'EDIT' ? SELECT_MENU_EDIT : SELECT_MENU_OBJECT} />
+      )}
       {(mode === 'OBJECT' || mode === 'EDIT') && <MenuButton label="Add" items={() => ADD_MENU} />}
       {mode !== 'OBJECT' && mode !== 'EDIT' ? null : mode === 'EDIT' ? (
         <>
@@ -120,7 +142,11 @@ function ViewportHeader({ s }: { s: ProjectSession }) {
           ]}
           onChange={(v) => (s.state.pivotPoint = v)}
         />
-        <button class={`btn icon ${s.view.snapping.value ? 'active' : ''}`} title="Snap increments (Shift+Tab)" onClick={() => run('view3d.toggle_snapping', {}, 'ui')}>
+        <button
+          class={`btn icon ${s.view.snapping.value ? 'active' : ''}`}
+          title="Snap increments (Shift+Tab)"
+          onClick={() => run('view3d.toggle_snapping', {}, 'ui')}
+        >
           <Icon name="grid" />
         </button>
         {mode === 'EDIT' && (
@@ -133,10 +159,19 @@ function ViewportHeader({ s }: { s: ProjectSession }) {
           </button>
         )}
       </span>
-      <button class={`btn icon ${s.view.overlays.value ? 'active' : ''}`} title="Overlays" onClick={() => run('view3d.toggle_overlays', {}, 'ui')}>
+      <button
+        class={`btn icon ${s.view.overlays.value ? 'active' : ''}`}
+        title="Overlays"
+        onClick={() => run('view3d.toggle_overlays', {}, 'ui')}
+      >
         <Icon name="overlay" />
       </button>
-      <button class={`btn icon ${s.view.xray.value ? 'active' : ''}`} title="X-Ray (Alt+Z)" data-testid="xray" onClick={() => run('view3d.toggle_xray', {}, 'ui')}>
+      <button
+        class={`btn icon ${s.view.xray.value ? 'active' : ''}`}
+        title="X-Ray (Alt+Z)"
+        data-testid="xray"
+        onClick={() => run('view3d.toggle_xray', {}, 'ui')}
+      >
         <Icon name="xray" />
       </button>
       <div class="btn-group">
@@ -191,7 +226,13 @@ function Sidebar({ s }: { s: ProjectSession }) {
   return (
     <div class="sidebar-n" onPointerDown={(e) => e.stopPropagation()} data-testid="sidebar">
       <Panel title="Transform" id="n-transform">
-        {o && st.mode === 'OBJECT' ? <TransformFields s={s} o={o} /> : <div class="hint">{st.mode === 'EDIT' ? 'Edit-mode transforms: use G/R/S' : 'Nothing selected'}</div>}
+        {o && st.mode === 'OBJECT' ? (
+          <TransformFields s={s} o={o} />
+        ) : (
+          <div class="hint">
+            {st.mode === 'EDIT' ? 'Edit-mode transforms: use G/R/S' : 'Nothing selected'}
+          </div>
+        )}
       </Panel>
       <Panel title="3D Cursor" id="n-cursor" defaultOpen={false}>
         <Row label="Location">
@@ -216,7 +257,7 @@ function Sidebar({ s }: { s: ProjectSession }) {
       <Panel title="View" id="n-view" defaultOpen={false}>
         <Row label="Focal Length">
           <NumberField
-            value={viewport.engine ? (18 / Math.tan(viewport.engine.pose.fovY / 2)) : 50}
+            value={viewport.engine ? 18 / Math.tan(viewport.engine.pose.fovY / 2) : 50}
             min={1}
             max={500}
             unit=" mm"
@@ -253,7 +294,9 @@ function InfoOverlay({ s }: { s: ProjectSession }) {
       </div>
       {stats && (
         <div class="viewport-overlay viewport-stats" data-testid="viewport-stats">
-          <div>Objects {s.state.$selectedIds.value.length}/{stats.objects}</div>
+          <div>
+            Objects {s.state.$selectedIds.value.length}/{stats.objects}
+          </div>
           {mode === 'EDIT' ? (
             <div>
               Verts {sel.verts.size} · Edges {sel.edges.size} · Faces {sel.faces.size} selected
@@ -308,13 +351,20 @@ function PeerCursors({ s, engine }: { s: ProjectSession; engine: ViewportEngine 
       {peers
         .filter((p) => p.state.cursor3d)
         .map((p) => {
-          const pt = engine.project(transformPoint3([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], p.state.cursor3d!));
+          const pt = engine.project(
+            transformPoint3([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], p.state.cursor3d!),
+          );
           if (pt.z < -1 || pt.z > 1) return null;
           return (
             <div
               key={p.clientId}
               class="viewport-overlay"
-              style={{ left: `${pt.x + 8}px`, top: `${pt.y - 8}px`, fontSize: '11px', color: p.state.user.color }}
+              style={{
+                left: `${pt.x + 8}px`,
+                top: `${pt.y - 8}px`,
+                fontSize: '11px',
+                color: p.state.user.color,
+              }}
             >
               ◆ {p.state.user.name}
             </div>
@@ -388,20 +438,32 @@ export function Viewport({ session: s }: { session: ProjectSession }) {
         {s.view.toolbar.value && (
           <div class="toolbar" onPointerDown={(e) => e.stopPropagation()} data-testid="toolbar">
             {TOOLS.filter((t) => t.modes.includes(mode)).map((t) => (
-              <button key={t.id} class={tool === t.id ? 'active' : ''} title={t.title} data-testid={`tool-${t.id}`} onClick={() => run('wm.tool_set', { tool: t.id }, 'toolbar')}>
+              <button
+                key={t.id}
+                class={tool === t.id ? 'active' : ''}
+                title={t.title}
+                data-testid={`tool-${t.id}`}
+                onClick={() => run('wm.tool_set', { tool: t.id }, 'toolbar')}
+              >
                 <Icon name={t.icon} />
               </button>
             ))}
             {(mode === 'OBJECT' || mode === 'EDIT') && (
               <>
                 <div class="sep" />
-                <button title="Add (Shift+A)" onClick={(e) => (popupMenu.value = { name: 'add', x: e.clientX + 20, y: e.clientY })}>
+                <button
+                  title="Add (Shift+A)"
+                  onClick={(e) => (popupMenu.value = { name: 'add', x: e.clientX + 20, y: e.clientY })}
+                >
                   <Icon name="plus" />
                 </button>
               </>
             )}
             {mode === 'EDIT' && canRun('mesh.extrude_region_shrink_fatten') && (
-              <button title="Extrude (E)" onClick={() => run('mesh.extrude_region_shrink_fatten', { value: 0.5 }, 'toolbar')}>
+              <button
+                title="Extrude (E)"
+                onClick={() => run('mesh.extrude_region_shrink_fatten', { value: 0.5 }, 'toolbar')}
+              >
                 <Icon name="up" />
               </button>
             )}
@@ -415,17 +477,36 @@ export function Viewport({ session: s }: { session: ProjectSession }) {
           <button title="Frame all (Home)" onClick={() => run('view3d.view_all', {}, 'ui')}>
             <Icon name="home" />
           </button>
-          <button title="Toggle camera view (Numpad 0)" data-testid="camera-view" onClick={() => run('view3d.view_camera', {}, 'ui')}>
+          <button
+            title="Toggle camera view (Numpad 0)"
+            data-testid="camera-view"
+            onClick={() => run('view3d.view_camera', {}, 'ui')}
+          >
             <Icon name="camera" />
           </button>
-          <button title="Perspective / Orthographic (Numpad 5)" onClick={() => run('view3d.view_persportho', {}, 'ui')}>
+          <button
+            title="Perspective / Orthographic (Numpad 5)"
+            onClick={() => run('view3d.view_persportho', {}, 'ui')}
+          >
             <Icon name="grid" />
           </button>
         </div>
         {box && (
-          <div class="selection-rect" style={{ left: `${box.x0}px`, top: `${box.y0}px`, width: `${box.x1 - box.x0}px`, height: `${box.y1 - box.y0}px` }} />
+          <div
+            class="selection-rect"
+            style={{
+              left: `${box.x0}px`,
+              top: `${box.y0}px`,
+              width: `${box.x1 - box.x0}px`,
+              height: `${box.y1 - box.y0}px`,
+            }}
+          />
         )}
-        {hud && <div class="viewport-overlay viewport-hud" data-testid="hud">{hud}</div>}
+        {hud && (
+          <div class="viewport-overlay viewport-hud" data-testid="hud">
+            {hud}
+          </div>
+        )}
         {s.view.sidebar.value && <Sidebar s={s} />}
         <RedoPanel s={s} />
       </div>

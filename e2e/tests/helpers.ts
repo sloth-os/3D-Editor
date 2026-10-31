@@ -40,7 +40,9 @@ export async function runFromPalette(page: Page, query: string, label: string): 
 export async function menuPath(page: Page, path: string[]): Promise<void> {
   await page.getByTestId(`menu-button-${path[0].toLowerCase()}`).first().click();
   for (let i = 1; i < path.length; i++) {
-    const item = page.locator('.menu .menu-item', { hasText: new RegExp(`^\\s*${escapeRe(path[i])}`) }).first();
+    const item = page
+      .locator('.menu .menu-item', { hasText: new RegExp(`^\\s*${escapeRe(path[i])}`) })
+      .first();
     if (i < path.length - 1) await item.hover();
     else await item.click();
   }

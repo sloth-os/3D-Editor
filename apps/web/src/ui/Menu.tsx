@@ -8,7 +8,13 @@ function resolve(items: MenuItem['submenu']): MenuItem[] {
   return typeof items === 'function' ? items() : items;
 }
 
-export function MenuList(p: { items: MenuItem[]; x: number; y: number; onClose: () => void; level?: number }) {
+export function MenuList(p: {
+  items: MenuItem[];
+  x: number;
+  y: number;
+  onClose: () => void;
+  level?: number;
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ x: p.x, y: p.y });
   const [sub, setSub] = useState<{ index: number; x: number; y: number } | null>(null);
@@ -18,18 +24,33 @@ export function MenuList(p: { items: MenuItem[]; x: number; y: number; onClose: 
     const r = el.getBoundingClientRect();
     let x = p.x;
     let y = p.y;
-    if (x + r.width > innerWidth - 4) x = Math.max(4, (p.level ? p.x - r.width - 190 : innerWidth - r.width - 4));
+    if (x + r.width > innerWidth - 4)
+      x = Math.max(4, p.level ? p.x - r.width - 190 : innerWidth - r.width - 4);
     if (y + r.height > innerHeight - 4) y = Math.max(4, innerHeight - r.height - 4);
     setPos({ x, y });
   }, [p.x, p.y]);
   const items = availableItems(p.items);
   return (
     <>
-      <div class="menu" ref={ref} style={{ left: `${pos.x}px`, top: `${pos.y}px` }} onPointerDown={(e) => e.stopPropagation()}>
+      <div
+        class="menu"
+        ref={ref}
+        style={{ left: `${pos.x}px`, top: `${pos.y}px` }}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
         {items.map((it, i) => {
           if (it.sep) return <div key={i} class="menu-sep" />;
-          if (it.title) return <div key={i} class="menu-title">{it.title}</div>;
-          const enabled = it.enabled ? it.enabled() : it.op ? canRun(it.op) || !!registry.get(it.op)?.uiOnly : true;
+          if (it.title)
+            return (
+              <div key={i} class="menu-title">
+                {it.title}
+              </div>
+            );
+          const enabled = it.enabled
+            ? it.enabled()
+            : it.op
+              ? canRun(it.op) || !!registry.get(it.op)?.uiOnly
+              : true;
           const hasSub = !!it.submenu;
           return (
             <div
@@ -59,7 +80,13 @@ export function MenuList(p: { items: MenuItem[]; x: number; y: number; onClose: 
         })}
       </div>
       {sub && items[sub.index]?.submenu && (
-        <MenuList items={resolve(items[sub.index].submenu)} x={sub.x} y={sub.y} onClose={p.onClose} level={(p.level ?? 0) + 1} />
+        <MenuList
+          items={resolve(items[sub.index].submenu)}
+          x={sub.x}
+          y={sub.y}
+          onClose={p.onClose}
+          level={(p.level ?? 0) + 1}
+        />
       )}
     </>
   );
@@ -138,7 +165,11 @@ export function CommandPalette() {
     run(id, undefined, 'palette');
   };
   return (
-    <div class="modal-backdrop" style={{ background: 'transparent', alignItems: 'flex-start' }} onPointerDown={close}>
+    <div
+      class="modal-backdrop"
+      style={{ background: 'transparent', alignItems: 'flex-start' }}
+      onPointerDown={close}
+    >
       <div class="palette" onPointerDown={(e) => e.stopPropagation()}>
         <input
           autoFocus

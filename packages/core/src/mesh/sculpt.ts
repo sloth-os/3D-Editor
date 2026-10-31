@@ -74,7 +74,13 @@ function verticesInRadius(m: MeshData, c: Vec3, r: number): { index: number; wei
 }
 
 /** Captures the vertices a GRAB stroke will move (call at stroke start). */
-export function beginGrab(m: MeshData, cache: SculptCache, center: Vec3, radius: number, symmetryX = false): void {
+export function beginGrab(
+  m: MeshData,
+  cache: SculptCache,
+  center: Vec3,
+  radius: number,
+  symmetryX = false,
+): void {
   cache.grabbed = new Map();
   for (const { index, weight } of verticesInRadius(m, center, radius)) cache.grabbed.set(index, weight);
   if (symmetryX)
@@ -131,7 +137,8 @@ function applyOne(m: MeshData, cache: SculptCache, dab: SculptDab, mirror: boole
         let f = amount * w * sign;
         if (dab.brush === 'CLAY') {
           // clay: only raise vertices below the area plane
-          const h = (P[i * 3] - ac[0]) * an[0] + (P[i * 3 + 1] - ac[1]) * an[1] + (P[i * 3 + 2] - ac[2]) * an[2];
+          const h =
+            (P[i * 3] - ac[0]) * an[0] + (P[i * 3 + 1] - ac[1]) * an[1] + (P[i * 3 + 2] - ac[2]) * an[2];
           f = sign > 0 ? Math.max(0, Math.min(f, amount * w - h)) : Math.min(0, Math.max(f, -amount * w - h));
         }
         P[i * 3] += an[0] * f;
@@ -160,7 +167,8 @@ function applyOne(m: MeshData, cache: SculptCache, dab: SculptDab, mirror: boole
         break;
       }
       case 'FLATTEN': {
-        const h = (P[i * 3] - ac[0]) * an[0] + (P[i * 3 + 1] - ac[1]) * an[1] + (P[i * 3 + 2] - ac[2]) * an[2];
+        const h =
+          (P[i * 3] - ac[0]) * an[0] + (P[i * 3 + 1] - ac[1]) * an[1] + (P[i * 3 + 2] - ac[2]) * an[2];
         const t = Math.min(1, dab.strength * w) * sign;
         P[i * 3] -= an[0] * h * t;
         P[i * 3 + 1] -= an[1] * h * t;

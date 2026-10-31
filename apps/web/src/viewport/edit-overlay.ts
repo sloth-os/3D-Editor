@@ -33,15 +33,30 @@ export class EditOverlay {
   constructor() {
     this.group.matrixAutoUpdate = false;
     this.group.renderOrder = 10;
-    this.cage = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide }));
+    this.cage = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide }),
+    );
     this.points = new THREE.Points(
       new THREE.BufferGeometry(),
       new THREE.PointsMaterial({ size: 6, sizeAttenuation: false, vertexColors: true, depthTest: true }),
     );
-    this.lines = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ vertexColors: true, depthTest: true }));
+    this.lines = new THREE.LineSegments(
+      new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({ vertexColors: true, depthTest: true }),
+    );
     this.faces = new THREE.Mesh(
       new THREE.BufferGeometry(),
-      new THREE.MeshBasicMaterial({ color: C_SEL, transparent: true, opacity: 0.22, depthWrite: false, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }),
+      new THREE.MeshBasicMaterial({
+        color: C_SEL,
+        transparent: true,
+        opacity: 0.22,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      }),
     );
     this.faceDots = new THREE.Points(
       new THREE.BufferGeometry(),
@@ -59,11 +74,19 @@ export class EditOverlay {
     this.key = '';
   }
 
-  update(mesh: MeshData, sel: MeshSelection, mode: SelectMode, world: number[], xray: boolean, meshToken: string): void {
+  update(
+    mesh: MeshData,
+    sel: MeshSelection,
+    mode: SelectMode,
+    world: number[],
+    xray: boolean,
+    meshToken: string,
+  ): void {
     this.group.visible = true;
     this.group.matrix.fromArray(world);
     this.group.matrixWorldNeedsUpdate = true;
-    for (const m of [this.points.material, this.lines.material, this.faceDots.material] as THREE.Material[]) m.depthTest = !xray;
+    for (const m of [this.points.material, this.lines.material, this.faceDots.material] as THREE.Material[])
+      m.depthTest = !xray;
     const key = `${meshToken}|${mode}|${sel.verts.size}|${sel.edges.size}|${sel.faces.size}|${hashSel(sel)}`;
     if (key === this.key) return;
     const geometryChanged = !this.key.startsWith(`${meshToken}|`);

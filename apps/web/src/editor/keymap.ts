@@ -157,7 +157,8 @@ const EDIT_MODE: Record<string, Handler> = {
   X: () => run('wm.call_menu', { name: 'delete' }, 'hotkey'),
   Delete: () => run('wm.call_menu', { name: 'delete' }, 'hotkey'),
   E: () => {
-    if (run('mesh.extrude_region_move', { value: [0, 0, 0] }, 'hotkey')) run('view3d.transform_modal', { mode: 'translate' }, 'hotkey');
+    if (run('mesh.extrude_region_move', { value: [0, 0, 0] }, 'hotkey'))
+      run('view3d.transform_modal', { mode: 'translate' }, 'hotkey');
   },
   I: () => run('mesh.inset', {}, 'hotkey'),
   'Ctrl+B': () => run('mesh.bevel', {}, 'hotkey'),
@@ -168,7 +169,8 @@ const EDIT_MODE: Record<string, Handler> = {
   U: () => run('wm.call_menu', { name: 'uv' }, 'hotkey'),
   Y: () => run('mesh.split', {}, 'hotkey'),
   'Shift+D': () => {
-    if (run('mesh.duplicate_move', {}, 'hotkey')) run('view3d.transform_modal', { mode: 'translate' }, 'hotkey');
+    if (run('mesh.duplicate_move', {}, 'hotkey'))
+      run('view3d.transform_modal', { mode: 'translate' }, 'hotkey');
   },
   'Ctrl+T': () => run('mesh.quads_convert_to_tris', {}, 'hotkey'),
   'Alt+J': () => run('mesh.tris_convert_to_quads', {}, 'hotkey'),
@@ -188,7 +190,7 @@ function handle(map: Record<string, Handler>, key: string, e: KeyboardEvent): bo
 
 export function installKeymap(): () => void {
   const onKey = (e: KeyboardEvent) => {
-    if (isTyping(e) || e.repeat && !['ArrowLeft', 'ArrowRight'].includes(e.key)) return;
+    if (isTyping(e) || (e.repeat && !['ArrowLeft', 'ArrowRight'].includes(e.key))) return;
     // modal transform swallows keys
     if (viewport.interaction?.modal) {
       if (viewport.interaction.modalKey(e)) e.preventDefault();
@@ -240,12 +242,36 @@ export function installKeymap(): () => void {
 
 /** Shortcut reference shown in the Help dialog. */
 export const SHORTCUT_HELP: [string, string][] = [
-  ['Navigation', 'MMB drag orbit · Shift+MMB pan · Wheel/Ctrl+MMB zoom · Alt+LMB emulates MMB · touch: 1 finger orbit, 2 fingers pan/zoom'],
-  ['Views', 'Numpad 1/3/7 (Ctrl = opposite) · 5 persp/ortho · 0 camera · . frame selected · Home frame all · ` view menu'],
-  ['Select', 'LMB click/drag box · Shift extend · Ctrl subtract · A all · Alt+A none · Ctrl+I invert · Alt+click edge loop'],
-  ['Transform', 'G move · R rotate · S scale · then X/Y/Z axis (Shift = plane) · type numbers · Ctrl snap · Shift precision'],
-  ['Object', 'Shift+A add · X delete · Shift+D duplicate · Alt+D linked · Ctrl+J join · Ctrl+P parent · H hide · Ctrl+A apply'],
-  ['Edit Mode', 'Tab toggle · 1/2/3 vert/edge/face · E extrude · I inset · Ctrl+B bevel · Ctrl+R loop cut · F fill · M merge · X delete'],
-  ['Animation', 'I insert keyframe · Alt+I delete · Space play · ←/→ frame · ↑/↓ keyframes · Shift+←/→ start/end'],
-  ['General', 'Ctrl+Z undo · Ctrl+Shift+Z redo · F3 search · F12 render · Ctrl+S save · Shift+R repeat last · N sidebar · T toolbar'],
+  [
+    'Navigation',
+    'MMB drag orbit · Shift+MMB pan · Wheel/Ctrl+MMB zoom · Alt+LMB emulates MMB · touch: 1 finger orbit, 2 fingers pan/zoom',
+  ],
+  [
+    'Views',
+    'Numpad 1/3/7 (Ctrl = opposite) · 5 persp/ortho · 0 camera · . frame selected · Home frame all · ` view menu',
+  ],
+  [
+    'Select',
+    'LMB click/drag box · Shift extend · Ctrl subtract · A all · Alt+A none · Ctrl+I invert · Alt+click edge loop',
+  ],
+  [
+    'Transform',
+    'G move · R rotate · S scale · then X/Y/Z axis (Shift = plane) · type numbers · Ctrl snap · Shift precision',
+  ],
+  [
+    'Object',
+    'Shift+A add · X delete · Shift+D duplicate · Alt+D linked · Ctrl+J join · Ctrl+P parent · H hide · Ctrl+A apply',
+  ],
+  [
+    'Edit Mode',
+    'Tab toggle · 1/2/3 vert/edge/face · E extrude · I inset · Ctrl+B bevel · Ctrl+R loop cut · F fill · M merge · X delete',
+  ],
+  [
+    'Animation',
+    'I insert keyframe · Alt+I delete · Space play · ←/→ frame · ↑/↓ keyframes · Shift+←/→ start/end',
+  ],
+  [
+    'General',
+    'Ctrl+Z undo · Ctrl+Shift+Z redo · F3 search · F12 render · Ctrl+S save · Shift+R repeat last · N sidebar · T toolbar',
+  ],
 ];

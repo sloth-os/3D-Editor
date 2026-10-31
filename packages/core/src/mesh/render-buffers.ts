@@ -156,7 +156,11 @@ export function buildRenderBuffers(m: MeshData): RenderBuffers {
     const corners = triangulateFaceCorners(m, f);
     const base = topo.faceCornerStart[f];
     for (let i = 0; i < corners.length; i += 3) {
-      bucket.tris.push(cornerVertex[base + corners[i]], cornerVertex[base + corners[i + 1]], cornerVertex[base + corners[i + 2]]);
+      bucket.tris.push(
+        cornerVertex[base + corners[i]],
+        cornerVertex[base + corners[i + 1]],
+        cornerVertex[base + corners[i + 2]],
+      );
       bucket.faces.push(f);
     }
   }

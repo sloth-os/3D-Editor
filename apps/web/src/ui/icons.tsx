@@ -2,7 +2,17 @@ import type { JSX } from 'preact';
 
 /** Small original line icons (16px grid). */
 const P = (d: string) => (props: JSX.SVGAttributes<SVGSVGElement>) => (
-  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" {...props}>
+  <svg
+    width="16"
+    height="16"
+    viewBox="0 0 16 16"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.3"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    {...props}
+  >
     <path d={d} />
   </svg>
 );
@@ -12,10 +22,14 @@ export const Icons = {
   mesh: P('M2 3h12v10H2zM2 8h12M8 3v10M5 3v10M11 3v10'),
   empty: P('M8 2v12M2 8h12M4 4l8 8M12 4l-8 8'),
   camera: P('M2 5h8v6H2zM10 7l4-2v6l-4-2'),
-  light: P('M8 2a4 4 0 0 1 2.4 7.2c-.5.4-.9 1-.9 1.8H6.5c0-.8-.4-1.4-.9-1.8A4 4 0 0 1 8 2zM6.5 13h3M7 14.5h2'),
+  light: P(
+    'M8 2a4 4 0 0 1 2.4 7.2c-.5.4-.9 1-.9 1.8H6.5c0-.8-.4-1.4-.9-1.8A4 4 0 0 1 8 2zM6.5 13h3M7 14.5h2',
+  ),
   collection: P('M2 4h5l1 1.5h6V13H2z'),
   eye: P('M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8zM8 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4z'),
-  eyeOff: P('M2 2l12 12M6.4 4A6.8 6.8 0 0 1 8 3.5C12 3.5 14.5 8 14.5 8a12 12 0 0 1-2 2.6M9.6 12.1c-.5.2-1 .4-1.6.4C4 12.5 1.5 8 1.5 8A12 12 0 0 1 4 5'),
+  eyeOff: P(
+    'M2 2l12 12M6.4 4A6.8 6.8 0 0 1 8 3.5C12 3.5 14.5 8 14.5 8a12 12 0 0 1-2 2.6M9.6 12.1c-.5.2-1 .4-1.6.4C4 12.5 1.5 8 1.5 8A12 12 0 0 1 4 5',
+  ),
   select: P('M3 2l9 5-4 1 3 5-2 1-3-5-3 3z'),
   cursor: P('M8 1v4M8 11v4M1 8h4M11 8h4M8 5a3 3 0 1 1 0 6 3 3 0 0 1 0-6z'),
   move: P('M8 1v14M1 8h14M8 1 6 3M8 1l2 2M8 15l-2-2M8 15l2-2M1 8l2-2M1 8l2 2M15 8l-2-2M15 8l-2 2'),
@@ -24,7 +38,9 @@ export const Icons = {
   brush: P('M10 2l4 4-6 6-4-4zM4 8l-2 6 6-2'),
   render: P('M2 3h12v9H2zM5 15h6M8 12v3M6 6l4 1.5L6 9z'),
   scene: P('M2 13l4-6 3 4 2-3 3 5zM11 3a1.5 1.5 0 1 1 0 3 1.5 1.5 0 0 1 0-3z'),
-  world: P('M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zM1.5 8h13M8 1.5c2 2 2.5 4.3 2.5 6.5S10 12.5 8 14.5M8 1.5C6 3.5 5.5 5.8 5.5 8S6 12.5 8 14.5'),
+  world: P(
+    'M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zM1.5 8h13M8 1.5c2 2 2.5 4.3 2.5 6.5S10 12.5 8 14.5M8 1.5C6 3.5 5.5 5.8 5.5 8S6 12.5 8 14.5',
+  ),
   object: P('M3 3h10v10H3zM6 6h4v4H6z'),
   wrench: P('M10.5 2a3 3 0 0 0-2.8 4L2.5 11.2a1.4 1.4 0 0 0 2 2L9.8 8a3 3 0 0 0 4-2.8l-1.8 1.8-2-.5-.5-2z'),
   data: P('M3 3l5-1.5L13 3v10l-5 1.5L3 13zM3 3l5 1.5L13 3M8 4.5v10'),
@@ -63,17 +79,25 @@ export const Icons = {
   face: P('M3 3h10v10H3z'),
   search: P('M7 2.5a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9zM10.5 10.5 14 14'),
   menu: P('M2 4h12M2 8h12M2 12h12'),
-  share: P('M11 2.5a2 2 0 1 1 0 4 2 2 0 0 1 0-4zM5 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4zM11 9.5a2 2 0 1 1 0 4 2 2 0 0 1 0-4zM6.8 7l2.4-1.3M6.8 9l2.4 1.3'),
+  share: P(
+    'M11 2.5a2 2 0 1 1 0 4 2 2 0 0 1 0-4zM5 6a2 2 0 1 1 0 4 2 2 0 0 1 0-4zM11 9.5a2 2 0 1 1 0 4 2 2 0 0 1 0-4zM6.8 7l2.4-1.3M6.8 9l2.4 1.3',
+  ),
   grid: P('M2 2h12v12H2zM6 2v12M10 2v12M2 6h12M2 10h12'),
   home: P('M2 8l6-5.5L14 8M4 6.5V14h8V6.5'),
   zoom: P('M7 2.5a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9zM10.5 10.5 14 14M5 7h4M7 5v4'),
-  hand: P('M5 8V3.5a1 1 0 0 1 2 0V7M7 6.5V2.5a1 1 0 0 1 2 0V7M9 6.5V3.5a1 1 0 0 1 2 0V8M11 7a1 1 0 0 1 2 0v3a4.5 4.5 0 0 1-4.5 4.5H8A4 4 0 0 1 4.6 12.6L2.8 9.6a1 1 0 0 1 1.7-1L5 9.5'),
+  hand: P(
+    'M5 8V3.5a1 1 0 0 1 2 0V7M7 6.5V2.5a1 1 0 0 1 2 0V7M9 6.5V3.5a1 1 0 0 1 2 0V8M11 7a1 1 0 0 1 2 0v3a4.5 4.5 0 0 1-4.5 4.5H8A4 4 0 0 1 4.6 12.6L2.8 9.6a1 1 0 0 1 1.7-1L5 9.5',
+  ),
   info: P('M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zM8 7v4.5M8 4.5v.5'),
 };
 
 export type IconName = keyof typeof Icons;
 
-export function Icon({ name, size = 16, ...rest }: { name: IconName; size?: number } & JSX.SVGAttributes<SVGSVGElement>) {
+export function Icon({
+  name,
+  size = 16,
+  ...rest
+}: { name: IconName; size?: number } & JSX.SVGAttributes<SVGSVGElement>) {
   const C = Icons[name];
   return <C width={size} height={size} {...rest} />;
 }

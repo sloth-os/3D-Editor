@@ -3,19 +3,36 @@ import type { Vec3 } from '../math/types';
 import { invert4 } from '../math/mat4';
 import { transformPoint3, transformDirection3 } from '../math/vec3';
 import { cloneMesh } from '../mesh/types';
-import { applyPaintDab, applySculptDab, beginGrab, createSculptCache, type SculptBrush } from '../mesh/sculpt';
+import {
+  applyPaintDab,
+  applySculptDab,
+  beginGrab,
+  createSculptCache,
+  type SculptBrush,
+} from '../mesh/sculpt';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { OperatorError, type OperatorContext } from './context';
 import { vec3 } from './helpers';
 
 function target(ctx: OperatorContext, ref?: string) {
-  const o = ref ? ctx.doc.resolveObject(ref) : ctx.state.activeId ? ctx.doc.getObject(ctx.state.activeId) : null;
+  const o = ref
+    ? ctx.doc.resolveObject(ref)
+    : ctx.state.activeId
+      ? ctx.doc.getObject(ctx.state.activeId)
+      : null;
   if (!o || o.type !== 'MESH' || !o.data) throw new OperatorError('A mesh object is required', 'POLL_FAILED');
   const mesh = ctx.doc.getMesh(o.data);
   if (!mesh) throw new OperatorError('Mesh data missing');
   const world = ctx.doc.worldMatrix(o.id);
   const inv = invert4(world);
-  const scale = Math.cbrt(Math.abs(world[0] * (world[5] * world[10] - world[6] * world[9]) - world[4] * (world[1] * world[10] - world[2] * world[9]) + world[8] * (world[1] * world[6] - world[2] * world[5]))) || 1;
+  const scale =
+    Math.cbrt(
+      Math.abs(
+        world[0] * (world[5] * world[10] - world[6] * world[9]) -
+          world[4] * (world[1] * world[10] - world[2] * world[9]) +
+          world[8] * (world[1] * world[6] - world[2] * world[5]),
+      ),
+    ) || 1;
   return { o, mesh, inv, scale };
 }
 
@@ -48,10 +65,24 @@ export function registerSculptOperators(reg: OperatorRegistry): void {
         if (p.brush === 'GRAB') {
           beginGrab(m, cache, pts[0], radius, p.symmetry_x);
           const d = transformDirection3(t.inv, (p.grab_delta ?? [0, 0, 0]) as Vec3);
-          n = applySculptDab(m, cache, { brush: 'GRAB', center: pts[0], radius, strength: p.strength, grabDelta: d, symmetryX: p.symmetry_x });
+          n = applySculptDab(m, cache, {
+            brush: 'GRAB',
+            center: pts[0],
+            radius,
+            strength: p.strength,
+            grabDelta: d,
+            symmetryX: p.symmetry_x,
+          });
         } else
           for (const c of pts)
-            n += applySculptDab(m, cache, { brush: p.brush as SculptBrush, center: c, radius, strength: p.strength, invert: p.invert, symmetryX: p.symmetry_x });
+            n += applySculptDab(m, cache, {
+              brush: p.brush as SculptBrush,
+              center: c,
+              radius,
+              strength: p.strength,
+              invert: p.invert,
+              symmetryX: p.symmetry_x,
+            });
         ctx.doc.setMesh(t.o.data!, m);
         return { affected: n };
       },
@@ -75,7 +106,15 @@ export function registerSculptOperators(reg: OperatorRegistry): void {
         const t = target(ctx, p.object);
         const m = cloneMesh(t.mesh);
         let n = 0;
-        for (const q of p.points) n += applyPaintDab(m, transformPoint3(t.inv, q as Vec3), p.radius / t.scale, p.color, p.strength, p.symmetry_x);
+        for (const q of p.points)
+          n += applyPaintDab(
+            m,
+            transformPoint3(t.inv, q as Vec3),
+            p.radius / t.scale,
+            p.color,
+            p.strength,
+            p.symmetry_x,
+          );
         ctx.doc.setMesh(t.o.data!, m);
         return { affected: n };
       },
@@ -85,7 +124,8 @@ export function registerSculptOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'paint.vertex_color_set',
       label: 'Set Vertex Colors',
-      description: 'Fill all vertex colors of a mesh object with one color (or remove the color layer with clear=true).',
+      description:
+        'Fill all vertex colors of a mesh object with one color (or remove the color layer with clear=true).',
       category: 'Paint',
       schema: z.object({
         object: z.string().optional(),

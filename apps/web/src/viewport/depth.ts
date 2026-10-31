@@ -23,12 +23,21 @@ export class DepthCapture {
   width = 0;
   height = 0;
 
-  capture(renderer: THREE.WebGLRenderer, camera: THREE.Camera, objects: THREE.Object3D[], width: number, height: number): void {
+  capture(
+    renderer: THREE.WebGLRenderer,
+    camera: THREE.Camera,
+    objects: THREE.Object3D[],
+    width: number,
+    height: number,
+  ): void {
     width = Math.max(1, Math.floor(width));
     height = Math.max(1, Math.floor(height));
     if (!this.target || this.target.width !== width || this.target.height !== height) {
       this.target?.dispose();
-      this.target = new THREE.WebGLRenderTarget(width, height, { depthBuffer: true, type: THREE.UnsignedByteType });
+      this.target = new THREE.WebGLRenderTarget(width, height, {
+        depthBuffer: true,
+        type: THREE.UnsignedByteType,
+      });
       this.pixels = new Uint8Array(width * height * 4);
     }
     this.width = width;

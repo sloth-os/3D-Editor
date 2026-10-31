@@ -81,7 +81,13 @@ function indexCurves(curves: FCurve[]): AnimIndex {
   return idx;
 }
 
-function applyAnimation<T extends object>(obj: T, type: AnimTargetType, id: string, idx: AnimIndex, frame: number): T {
+function applyAnimation<T extends object>(
+  obj: T,
+  type: AnimTargetType,
+  id: string,
+  idx: AnimIndex,
+  frame: number,
+): T {
   const curves = idx.get(`${type}:${id}`);
   if (!curves) return obj;
   const out = { ...(obj as Record<string, unknown>) };
@@ -150,7 +156,12 @@ export class SceneEvaluator {
     };
 
     // --- meshes with modifier stacks (dependency aware)
-    type MeshResult = { mesh: MeshData; key: string; errors: EvaluatedObject['modifierErrors']; base: MeshData };
+    type MeshResult = {
+      mesh: MeshData;
+      key: string;
+      errors: EvaluatedObject['modifierErrors'];
+      base: MeshData;
+    };
     const evaluated = new Map<string, MeshResult>();
     const inProgress = new Set<string>();
     const evalMesh = (id: string): MeshResult | null => {
@@ -185,14 +196,24 @@ export class SceneEvaluator {
         }
         const depKeys: string[] = deps.map((d): string => {
           const r: MeshResult | null = evalMesh(d);
-          return r ? `${d}:${r.key}:${worldM.get(d)?.map((x) => x.toFixed(5)).join(',')}` : `${d}:none`;
+          return r
+            ? `${d}:${r.key}:${worldM
+                .get(d)
+                ?.map((x) => x.toFixed(5))
+                .join(',')}`
+            : `${d}:none`;
         });
         const key: string = [
           baseToken,
           stableStringify(active),
           timeDep ? `f${frame}` : '',
           depKeys.join('|'),
-          deps.length ? worldM.get(id)!.map((x) => x.toFixed(5)).join(',') : '',
+          deps.length
+            ? worldM
+                .get(id)!
+                .map((x) => x.toFixed(5))
+                .join(',')
+            : '',
           opts.forRender ? 'R' : 'V',
           editMode ? 'E' : '',
         ].join('#');

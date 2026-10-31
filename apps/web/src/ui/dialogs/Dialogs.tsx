@@ -3,7 +3,13 @@ import type { ComponentChildren } from 'preact';
 import { WebDAVClient, type ExportFormat } from '@3d-editor/core';
 import { closeDialog, dialog, dialogProps, serverConfig, session, toast } from '../../app/store';
 import { prefs, updatePrefs, type StorageMode } from '../../app/prefs';
-import { createProject, deleteProject, listProjects, openProject, type ProjectListEntry } from '../../project/manager';
+import {
+  createProject,
+  deleteProject,
+  listProjects,
+  openProject,
+  type ProjectListEntry,
+} from '../../project/manager';
 import { exportAndDownload, downloadBytes } from '../../io/import-export';
 import { viewport } from '../../editor/editor';
 import { SHORTCUT_HELP } from '../../editor/keymap';
@@ -12,10 +18,21 @@ import { Icon } from '../icons';
 import { telemetry } from '../../telemetry/telemetry';
 import { resolveWebDAV } from '../../storage/webdav';
 
-export function Modal(p: { title: string; children: ComponentChildren; footer?: ComponentChildren; width?: string; testId?: string }) {
+export function Modal(p: {
+  title: string;
+  children: ComponentChildren;
+  footer?: ComponentChildren;
+  width?: string;
+  testId?: string;
+}) {
   return (
     <div class="modal-backdrop" onPointerDown={closeDialog}>
-      <div class="modal" style={{ width: p.width }} onPointerDown={(e) => e.stopPropagation()} data-testid={p.testId}>
+      <div
+        class="modal"
+        style={{ width: p.width }}
+        onPointerDown={(e) => e.stopPropagation()}
+        data-testid={p.testId}
+      >
         <div class="modal-header">
           {p.title}
           <button class="btn flat icon close" onClick={closeDialog} title="Close">
@@ -75,7 +92,12 @@ export function ProjectList({ onOpened }: { onOpened?: () => void }) {
       {list.length === 0 && <div class="empty-note">No projects yet.</div>}
       <div class="project-grid" data-testid="project-list">
         {list.map((p) => (
-          <div key={p.id} class="project-card" data-testid={`project-card-${p.name}`} onClick={() => void open(p.id)}>
+          <div
+            key={p.id}
+            class="project-card"
+            data-testid={`project-card-${p.name}`}
+            onClick={() => void open(p.id)}
+          >
             <div class="thumb" style={p.thumbnail ? { backgroundImage: `url(${p.thumbnail})` } : undefined}>
               {!p.thumbnail && <Icon name="cube" size={36} />}
             </div>
@@ -96,7 +118,12 @@ export function ProjectList({ onOpened }: { onOpened?: () => void }) {
                     data-testid={`delete-project-${p.name}`}
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (!confirm(`Delete "${p.name}" everywhere (browser${p.sources.includes('webdav') ? ', WebDAV' : ''}${p.sources.includes('server') ? ', server' : ''})?`)) return;
+                      if (
+                        !confirm(
+                          `Delete "${p.name}" everywhere (browser${p.sources.includes('webdav') ? ', WebDAV' : ''}${p.sources.includes('server') ? ', server' : ''})?`,
+                        )
+                      )
+                        return;
                       void deleteProject(p).then(refresh);
                     }}
                   >
@@ -152,14 +179,26 @@ function PreferencesDialog() {
   const set = (fn: (x: typeof p) => void) => updatePrefs((x) => (fn(x), x));
   const target = resolveWebDAV();
   return (
-    <Modal title="Preferences" width="560px" testId="preferences-dialog" footer={<button class="btn primary" onClick={closeDialog}>Done</button>}>
+    <Modal
+      title="Preferences"
+      width="560px"
+      testId="preferences-dialog"
+      footer={
+        <button class="btn primary" onClick={closeDialog}>
+          Done
+        </button>
+      }
+    >
       <h4 style={{ margin: '4px 0 8px' }}>Storage</h4>
       <Row label="Save projects to">
         <SelectField
           value={p.storage.mode}
           testId="storage-mode"
           options={[
-            { value: 'auto', label: cfg?.webdav ? 'Auto (server WebDAV)' : 'Auto (browser unless WebDAV set)' },
+            {
+              value: 'auto',
+              label: cfg?.webdav ? 'Auto (server WebDAV)' : 'Auto (browser unless WebDAV set)',
+            },
             { value: 'browser', label: 'This browser only (IndexedDB)' },
             { value: 'webdav', label: 'WebDAV server' },
           ]}
@@ -167,16 +206,34 @@ function PreferencesDialog() {
         />
       </Row>
       <Row label="WebDAV URL">
-        <TextField value={p.storage.webdav.url} placeholder="https://dav.example.com/remote.php/dav/files/me" testId="webdav-url" onChange={(v) => set((x) => (x.storage.webdav.url = v.trim()))} />
+        <TextField
+          value={p.storage.webdav.url}
+          placeholder="https://dav.example.com/remote.php/dav/files/me"
+          testId="webdav-url"
+          onChange={(v) => set((x) => (x.storage.webdav.url = v.trim()))}
+        />
       </Row>
       <Row label="Username">
-        <TextField value={p.storage.webdav.username} testId="webdav-username" onChange={(v) => set((x) => (x.storage.webdav.username = v))} />
+        <TextField
+          value={p.storage.webdav.username}
+          testId="webdav-username"
+          onChange={(v) => set((x) => (x.storage.webdav.username = v))}
+        />
       </Row>
       <Row label="Password">
-        <TextField type="password" value={p.storage.webdav.password} testId="webdav-password" onChange={(v) => set((x) => (x.storage.webdav.password = v))} />
+        <TextField
+          type="password"
+          value={p.storage.webdav.password}
+          testId="webdav-password"
+          onChange={(v) => set((x) => (x.storage.webdav.password = v))}
+        />
       </Row>
       <Row label="Folder">
-        <TextField value={p.storage.webdav.basePath} testId="webdav-base" onChange={(v) => set((x) => (x.storage.webdav.basePath = v || '/'))} />
+        <TextField
+          value={p.storage.webdav.basePath}
+          testId="webdav-base"
+          onChange={(v) => set((x) => (x.storage.webdav.basePath = v || '/'))}
+        />
       </Row>
       <Row label="">
         <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
@@ -187,54 +244,109 @@ function PreferencesDialog() {
               const url = p.storage.webdav.url;
               if (!url) return setTest('Enter a WebDAV URL first');
               setTest('Testing…');
-              const r = await new WebDAVClient({ url, username: p.storage.webdav.username, password: p.storage.webdav.password }).check();
+              const r = await new WebDAVClient({
+                url,
+                username: p.storage.webdav.username,
+                password: p.storage.webdav.password,
+              }).check();
               setTest(r.ok ? 'Connected ✓' : `Failed: ${r.message ?? r.status}`);
             }}
           >
             Test Connection
           </button>
-          <span class="hint" data-testid="webdav-test-result">{test}</span>
+          <span class="hint" data-testid="webdav-test-result">
+            {test}
+          </span>
         </div>
       </Row>
       <div class="hint">
-        Currently saving to: <b data-testid="storage-target">{target ? target.label : 'this browser (IndexedDB)'}</b>. Projects are always cached in the browser so they work
-        offline; with WebDAV they are merged and saved to the server whenever you are online. A WebDAV server used directly from the browser must allow CORS.
-        Changes apply to projects opened from now on.
+        Currently saving to:{' '}
+        <b data-testid="storage-target">{target ? target.label : 'this browser (IndexedDB)'}</b>. Projects are
+        always cached in the browser so they work offline; with WebDAV they are merged and saved to the server
+        whenever you are online. A WebDAV server used directly from the browser must allow CORS. Changes apply
+        to projects opened from now on.
       </div>
       <h4 style={{ margin: '14px 0 8px' }}>Collaboration</h4>
       <Row label="">
-        <Checkbox value={p.sync.enabled} label="Real-time sync with the editor server" onChange={(v) => set((x) => (x.sync.enabled = v))} />
+        <Checkbox
+          value={p.sync.enabled}
+          label="Real-time sync with the editor server"
+          onChange={(v) => set((x) => (x.sync.enabled = v))}
+        />
       </Row>
       <Row label="Server URL">
-        <TextField value={p.sync.serverUrl} placeholder="(same origin)" onChange={(v) => set((x) => (x.sync.serverUrl = v.trim()))} />
+        <TextField
+          value={p.sync.serverUrl}
+          placeholder="(same origin)"
+          onChange={(v) => set((x) => (x.sync.serverUrl = v.trim()))}
+        />
       </Row>
       <Row label="Access token">
-        <TextField type="password" value={p.sync.token} placeholder="(only if the server requires one)" onChange={(v) => set((x) => (x.sync.token = v.trim()))} />
+        <TextField
+          type="password"
+          value={p.sync.token}
+          placeholder="(only if the server requires one)"
+          onChange={(v) => set((x) => (x.sync.token = v.trim()))}
+        />
       </Row>
       <Row label="Your name">
-        <TextField value={p.userName} testId="user-name" onChange={(v) => set((x) => (x.userName = v || x.userName))} />
+        <TextField
+          value={p.userName}
+          testId="user-name"
+          onChange={(v) => set((x) => (x.userName = v || x.userName))}
+        />
       </Row>
       <Row label="Color">
-        <input type="color" value={p.userColor.startsWith('#') ? p.userColor : '#e87d0d'} onInput={(e) => set((x) => (x.userColor = (e.target as HTMLInputElement).value))} />
+        <input
+          type="color"
+          value={p.userColor.startsWith('#') ? p.userColor : '#e87d0d'}
+          onInput={(e) => set((x) => (x.userColor = (e.target as HTMLInputElement).value))}
+        />
       </Row>
-      <div class="hint">Server: {cfg ? `connected (v${cfg.version}, persistence: ${cfg.persistence})` : 'not reachable — working offline/local only'}</div>
+      <div class="hint">
+        Server:{' '}
+        {cfg
+          ? `connected (v${cfg.version}, persistence: ${cfg.persistence})`
+          : 'not reachable — working offline/local only'}
+      </div>
       <h4 style={{ margin: '14px 0 8px' }}>Input</h4>
       <Row label="">
-        <Checkbox value={p.ui.emulate3Button} label="Emulate 3-button mouse (Alt+LMB navigates)" onChange={(v) => set((x) => (x.ui.emulate3Button = v))} />
+        <Checkbox
+          value={p.ui.emulate3Button}
+          label="Emulate 3-button mouse (Alt+LMB navigates)"
+          onChange={(v) => set((x) => (x.ui.emulate3Button = v))}
+        />
       </Row>
       <Row label="">
-        <Checkbox value={p.ui.invertZoom} label="Invert zoom direction" onChange={(v) => set((x) => (x.ui.invertZoom = v))} />
+        <Checkbox
+          value={p.ui.invertZoom}
+          label="Invert zoom direction"
+          onChange={(v) => set((x) => (x.ui.invertZoom = v))}
+        />
       </Row>
       <Row label="Orbit speed">
-        <NumberField value={p.ui.orbitSensitivity} min={0.1} max={4} step={0.01} slider onChange={(v) => set((x) => (x.ui.orbitSensitivity = v))} />
+        <NumberField
+          value={p.ui.orbitSensitivity}
+          min={0.1}
+          max={4}
+          step={0.01}
+          slider
+          onChange={(v) => set((x) => (x.ui.orbitSensitivity = v))}
+        />
       </Row>
       <h4 style={{ margin: '14px 0 8px' }}>Privacy</h4>
       <Row label="">
-        <Checkbox value={p.telemetry} label="Send anonymous usage & performance telemetry" testId="telemetry-toggle" onChange={(v) => set((x) => (x.telemetry = v))} />
+        <Checkbox
+          value={p.telemetry}
+          label="Send anonymous usage & performance telemetry"
+          testId="telemetry-toggle"
+          onChange={(v) => set((x) => (x.telemetry = v))}
+        />
       </Row>
       <div class="hint">
-        Telemetry contains operator names, timings, counts and errors — never geometry, names or file contents. It helps improve the editor and is only sent to
-        this app's server{cfg?.features.telemetry ? '' : ' (currently disabled by the server)'}.
+        Telemetry contains operator names, timings, counts and errors — never geometry, names or file
+        contents. It helps improve the editor and is only sent to this app's server
+        {cfg?.features.telemetry ? '' : ' (currently disabled by the server)'}.
       </div>
     </Modal>
   );
@@ -345,11 +457,14 @@ function AboutDialog() {
   return (
     <Modal title="About 3D Editor" width="460px">
       <p>
-        <b>3D Editor</b> v{__APP_VERSION__} — a collaborative, offline-capable 3D modeling, animation and rendering tool for the browser, inspired by Blender's
-        workflow.
+        <b>3D Editor</b> v{__APP_VERSION__} — a collaborative, offline-capable 3D modeling, animation and
+        rendering tool for the browser, inspired by Blender's workflow.
       </p>
       <p class="hint">
-        Server: {cfg ? `v${cfg.version} · MCP ${cfg.features.mcp ? 'enabled at /mcp' : 'disabled'} · persistence ${cfg.persistence}` : 'offline'}
+        Server:{' '}
+        {cfg
+          ? `v${cfg.version} · MCP ${cfg.features.mcp ? 'enabled at /mcp' : 'disabled'} · persistence ${cfg.persistence}`
+          : 'offline'}
       </p>
       <p class="hint">Licensed under the GNU GPL v3.</p>
     </Modal>
@@ -360,7 +475,16 @@ function ShortcutsDialog() {
   return (
     <Modal title="Keyboard & Mouse" width="760px">
       {SHORTCUT_HELP.map(([k, v]) => (
-        <div key={k} style={{ display: 'grid', gridTemplateColumns: '110px 1fr', gap: '8px', padding: '4px 0', borderBottom: '1px solid #333' }}>
+        <div
+          key={k}
+          style={{
+            display: 'grid',
+            gridTemplateColumns: '110px 1fr',
+            gap: '8px',
+            padding: '4px 0',
+            borderBottom: '1px solid #333',
+          }}
+        >
           <b>{k}</b>
           <span>{v}</span>
         </div>

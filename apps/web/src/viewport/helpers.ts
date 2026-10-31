@@ -4,7 +4,13 @@ import { cameraFovY, orthoHalfExtents } from '@3d-editor/core';
 
 /** Line-segment geometry builders for non-mesh objects (empties, lights, cameras). */
 
-function circle(out: number[], r: number, axis: 'X' | 'Y' | 'Z', segments = 32, center: [number, number, number] = [0, 0, 0]): void {
+function circle(
+  out: number[],
+  r: number,
+  axis: 'X' | 'Y' | 'Z',
+  segments = 32,
+  center: [number, number, number] = [0, 0, 0],
+): void {
   for (let i = 0; i < segments; i++) {
     const a0 = (i / segments) * Math.PI * 2;
     const a1 = ((i + 1) / segments) * Math.PI * 2;
@@ -76,7 +82,14 @@ export function lightLines(l: LightData): number[] {
       circle(out, r, 'Z', 16);
       for (let i = 0; i < 8; i++) {
         const a = (i / 8) * Math.PI * 2;
-        out.push(Math.cos(a) * r * 1.6, Math.sin(a) * r * 1.6, 0, Math.cos(a) * r * 2.6, Math.sin(a) * r * 2.6, 0);
+        out.push(
+          Math.cos(a) * r * 1.6,
+          Math.sin(a) * r * 1.6,
+          0,
+          Math.cos(a) * r * 2.6,
+          Math.sin(a) * r * 2.6,
+          0,
+        );
       }
       out.push(0, 0, 0, 0, 0, -1.5);
       break;
@@ -124,7 +137,32 @@ export function cameraLines(c: CameraData, aspect: number, size = 1): number[] {
     const e = orthoHalfExtents(c, aspect);
     hw = e.halfW;
     hh = e.halfH;
-    out.push(-hw, -hh, 0, -hw, -hh, -d, hw, -hh, 0, hw, -hh, -d, hw, hh, 0, hw, hh, -d, -hw, hh, 0, -hw, hh, -d);
+    out.push(
+      -hw,
+      -hh,
+      0,
+      -hw,
+      -hh,
+      -d,
+      hw,
+      -hh,
+      0,
+      hw,
+      -hh,
+      -d,
+      hw,
+      hh,
+      0,
+      hw,
+      hh,
+      -d,
+      -hw,
+      hh,
+      0,
+      -hw,
+      hh,
+      -d,
+    );
   } else {
     const fov = cameraFovY(c, aspect);
     hh = Math.tan(fov / 2) * d;

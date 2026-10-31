@@ -95,7 +95,10 @@ export async function openProject(id: string): Promise<ProjectSession> {
   return s;
 }
 
-export async function createProject(name = 'Untitled', opts: { empty?: boolean } = {}): Promise<ProjectSession> {
+export async function createProject(
+  name = 'Untitled',
+  opts: { empty?: boolean } = {},
+): Promise<ProjectSession> {
   const id = newUuid();
   telemetry.count('editor.project.created', 1, { empty: !!opts.empty });
   const prev = session.value;
@@ -113,9 +116,12 @@ export async function deleteProject(entry: ProjectListEntry): Promise<void> {
   if (session.value?.id === entry.id) closeProject();
   await ProjectSession.deleteLocal(entry.id).catch(() => undefined);
   const target = resolveWebDAV();
-  if (target && entry.sources.includes('webdav')) await target.store.deleteProject(entry.id).catch((e) => toast(`WebDAV delete failed: ${e}`, 'error'));
+  if (target && entry.sources.includes('webdav'))
+    await target.store.deleteProject(entry.id).catch((e) => toast(`WebDAV delete failed: ${e}`, 'error'));
   if (serverConfig.value && entry.sources.includes('server'))
-    await fetch(apiUrl(`/api/projects/${entry.id}`), { method: 'DELETE', headers: authHeaders() }).catch(() => undefined);
+    await fetch(apiUrl(`/api/projects/${entry.id}`), { method: 'DELETE', headers: authHeaders() }).catch(
+      () => undefined,
+    );
   telemetry.count('editor.project.deleted');
 }
 

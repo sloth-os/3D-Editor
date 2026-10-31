@@ -29,7 +29,11 @@ export function activeObject(ctx: OperatorContext): ObjectData | null {
 }
 
 /** Replaces the selection (and active object). */
-export function setSelection(ctx: OperatorContext, ids: string[], active: string | null = ids[ids.length - 1] ?? null): void {
+export function setSelection(
+  ctx: OperatorContext,
+  ids: string[],
+  active: string | null = ids[ids.length - 1] ?? null,
+): void {
   ctx.state.selectedIds = [...new Set(ids)];
   ctx.state.activeId = active;
 }
@@ -76,11 +80,22 @@ export function editTarget(ctx: OperatorContext): EditTarget {
   const object = activeObject(ctx)!;
   const mesh = ctx.doc.getMesh(object.data!);
   if (!mesh) throw new OperatorError('Mesh data missing', 'FAILED');
-  return { object, meshId: object.data!, mesh, selection: ctx.state.meshSelection, matrix: ctx.doc.worldMatrix(object.id) };
+  return {
+    object,
+    meshId: object.data!,
+    mesh,
+    selection: ctx.state.meshSelection,
+    matrix: ctx.doc.worldMatrix(object.id),
+  };
 }
 
 /** Writes an edited mesh back to the document and updates the (flushed) edit selection. */
-export function commitEdit(ctx: OperatorContext, target: EditTarget, mesh: MeshData, selection: MeshSelection): void {
+export function commitEdit(
+  ctx: OperatorContext,
+  target: EditTarget,
+  mesh: MeshData,
+  selection: MeshSelection,
+): void {
   ctx.doc.setMesh(target.meshId, mesh);
   ctx.state.meshSelection = flushSelection(mesh, selection, ctx.state.selectMode);
 }
@@ -91,7 +106,9 @@ export function selectedWorldVerts(target: EditTarget): Vec3[] {
   const m = target.mesh;
   for (const v of selectedVertexSet(m, target.selection)) {
     if (v >= vertexCount(m)) continue;
-    out.push(transformPoint3(target.matrix, [m.positions[v * 3], m.positions[v * 3 + 1], m.positions[v * 3 + 2]]));
+    out.push(
+      transformPoint3(target.matrix, [m.positions[v * 3], m.positions[v * 3 + 1], m.positions[v * 3 + 2]]),
+    );
   }
   return out;
 }

@@ -26,7 +26,11 @@ describe('ProjectFileStore', () => {
     await store.syncDocument('p1', a.ydoc, { lastEtag: r1.etag });
     await store.syncDocument('p1', b.ydoc);
     await store.syncDocument('p1', a.ydoc);
-    const names = (d: SceneDoc) => d.listObjects().map((o) => o.name).sort();
+    const names = (d: SceneDoc) =>
+      d
+        .listObjects()
+        .map((o) => o.name)
+        .sort();
     expect(names(a)).toEqual(names(b));
     expect(names(a)).toContain('FromA');
     expect(names(a)).toContain('FromB');

@@ -60,7 +60,10 @@ export class ProjectSession {
   private constructor(readonly id: string) {
     this.doc = new SceneDoc(new Y.Doc(), { type: 'local' });
     this.awareness = new Awareness(this.doc.ydoc);
-    this.undo = new Y.UndoManager(this.doc.sharedTypes(), { trackedOrigins: new Set([this.doc.origin]), captureTimeout: 0 });
+    this.undo = new Y.UndoManager(this.doc.sharedTypes(), {
+      trackedOrigins: new Set([this.doc.origin]),
+      captureTimeout: 0,
+    });
     this.evaluator = new SceneEvaluator(this.doc);
     this.disposers.push(
       this.doc.onChange((c) => {
@@ -189,7 +192,9 @@ export class ProjectSession {
     if (this.indexTimer) return;
     this.indexTimer = setTimeout(() => {
       this.indexTimer = null;
-      void localIndex.put({ ...this.projectInfo(), last_opened: new Date().toISOString() }).catch(() => undefined);
+      void localIndex
+        .put({ ...this.projectInfo(), last_opened: new Date().toISOString() })
+        .catch(() => undefined);
     }, 3000);
   }
 
@@ -207,7 +212,13 @@ export class ProjectSession {
       capabilities: ['render', 'ui'],
     } satisfies PresenceState);
     const push = () => this.schedulePresence();
-    for (const s of [this.state.$selectedIds, this.state.$activeId, this.state.$mode, this.state.$frame, this.state.$cursorLocation])
+    for (const s of [
+      this.state.$selectedIds,
+      this.state.$activeId,
+      this.state.$mode,
+      this.state.$frame,
+      this.state.$cursorLocation,
+    ])
       this.disposers.push(s.subscribe(push));
   }
 
@@ -248,7 +259,9 @@ export class ProjectSession {
     let vertices = 0;
     let faces = 0;
     let triangles = 0;
-    const ev = this.evaluator.evaluate(this.state.frame, { editObjectId: this.state.mode === 'EDIT' ? this.state.activeId : null });
+    const ev = this.evaluator.evaluate(this.state.frame, {
+      editObjectId: this.state.mode === 'EDIT' ? this.state.activeId : null,
+    });
     for (const o of ev.objects) {
       if (!o.mesh || !o.visible) continue;
       const s = meshStats(o.mesh);

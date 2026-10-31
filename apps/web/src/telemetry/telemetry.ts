@@ -209,12 +209,27 @@ export class Telemetry {
     this.counters.set(k, c);
   }
 
-  histogram(name: string, value: number, attrs: Attributes = {}, unit = 'ms', bounds = [1, 2, 5, 10, 16, 33, 50, 100, 250, 500, 1000, 2500, 5000]): void {
+  histogram(
+    name: string,
+    value: number,
+    attrs: Attributes = {},
+    unit = 'ms',
+    bounds = [1, 2, 5, 10, 16, 33, 50, 100, 250, 500, 1000, 2500, 5000],
+  ): void {
     if (!Number.isFinite(value)) return;
     const k = `${name}|${JSON.stringify(attrs)}`;
     let h = this.histograms.get(k);
     if (!h) {
-      h = { bounds, counts: new Array(bounds.length + 1).fill(0), sum: 0, count: 0, min: value, max: value, attrs: { ...attrs, __name: name }, unit };
+      h = {
+        bounds,
+        counts: new Array(bounds.length + 1).fill(0),
+        sum: 0,
+        count: 0,
+        min: value,
+        max: value,
+        attrs: { ...attrs, __name: name },
+        unit,
+      };
       this.histograms.set(k, h);
     }
     let i = 0;
@@ -226,7 +241,12 @@ export class Telemetry {
     h.max = Math.max(h.max, value);
   }
 
-  log(level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR', message: string, attrs: Attributes = {}, span?: ActiveSpan): void {
+  log(
+    level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR',
+    message: string,
+    attrs: Attributes = {},
+    span?: ActiveSpan,
+  ): void {
     if (!this.enabled) return;
     const sev = { DEBUG: 5, INFO: 9, WARN: 13, ERROR: 17 }[level];
     this.logs.push({
@@ -245,7 +265,10 @@ export class Telemetry {
     return { attributes: toOtlpAttrs({ ...(this.config?.resource ?? {}), 'session.id': this.sessionId }) };
   }
   private scope() {
-    return { name: '3d-editor-web', version: typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev' };
+    return {
+      name: '3d-editor-web',
+      version: typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev',
+    };
   }
 
   private buildPayloads(): { path: string; body: unknown }[] {
@@ -293,7 +316,13 @@ export class Telemetry {
       metrics.push({
         name,
         unit: (pts[0] as { unit: string }).unit,
-        gauge: { dataPoints: pts.map((p) => ({ timeUnixNano: now, asDouble: (p as { value: number }).value, attributes: strip(p.attrs) })) },
+        gauge: {
+          dataPoints: pts.map((p) => ({
+            timeUnixNano: now,
+            asDouble: (p as { value: number }).value,
+            attributes: strip(p.attrs),
+          })),
+        },
       });
     for (const [name, pts] of byName(this.counters))
       metrics.push({
@@ -302,7 +331,11 @@ export class Telemetry {
         sum: {
           aggregationTemporality: 1,
           isMonotonic: true,
-          dataPoints: pts.map((p) => ({ timeUnixNano: now, asDouble: (p as { value: number }).value, attributes: strip(p.attrs) })),
+          dataPoints: pts.map((p) => ({
+            timeUnixNano: now,
+            asDouble: (p as { value: number }).value,
+            attributes: strip(p.attrs),
+          })),
         },
       });
     for (const [name, pts] of byName(this.histograms))
@@ -327,7 +360,12 @@ export class Telemetry {
     this.counters.clear();
     this.histograms.clear();
     if (metrics.length)
-      out.push({ path: '/v1/metrics', body: { resourceMetrics: [{ resource: this.resource(), scopeMetrics: [{ scope: this.scope(), metrics }] }] } });
+      out.push({
+        path: '/v1/metrics',
+        body: {
+          resourceMetrics: [{ resource: this.resource(), scopeMetrics: [{ scope: this.scope(), metrics }] }],
+        },
+      });
     if (this.logs.length) {
       const logs = this.logs.splice(0);
       out.push({
@@ -336,7 +374,16 @@ export class Telemetry {
           resourceLogs: [
             {
               resource: this.resource(),
-              scopeLogs: [{ scope: this.scope(), logRecords: logs.map((l) => ({ ...l, body: { stringValue: l.body }, attributes: toOtlpAttrs(l.attributes) })) }],
+              scopeLogs: [
+                {
+                  scope: this.scope(),
+                  logRecords: logs.map((l) => ({
+                    ...l,
+                    body: { stringValue: l.body },
+                    attributes: toOtlpAttrs(l.attributes),
+                  })),
+                },
+              ],
             },
           ],
         },
@@ -381,7 +428,10 @@ export class Telemetry {
 
   private buffer(payloads: { path: string; body: unknown }[]): void {
     try {
-      const existing = JSON.parse(localStorage.getItem(BUFFER_KEY) ?? '[]') as { path: string; body: unknown }[];
+      const existing = JSON.parse(localStorage.getItem(BUFFER_KEY) ?? '[]') as {
+        path: string;
+        body: unknown;
+      }[];
       let all = [...existing, ...payloads];
       while (all.length && JSON.stringify(all).length > MAX_BUFFER_BYTES) all = all.slice(1);
       localStorage.setItem(BUFFER_KEY, JSON.stringify(all));

@@ -52,7 +52,9 @@ export function registerUiOperators(reg: OperatorRegistry): void {
         if (!s.undo.canRedo()) throw new Error('Nothing to redo');
         const item = s.undo.redoStack[s.undo.redoStack.length - 1];
         s.undo.redo();
-        telemetry.count('editor.redo', 1, { 'undo.operator': String(item?.meta.get('operator') ?? 'unknown') });
+        telemetry.count('editor.redo', 1, {
+          'undo.operator': String(item?.meta.get('operator') ?? 'unknown'),
+        });
       },
     }),
   );
@@ -118,7 +120,10 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       category: 'View',
       uiOnly: true,
       schema: z.object({}),
-      poll: (ctx) => (ctx.state.activeId && ctx.doc.getObject(ctx.state.activeId)?.type === 'CAMERA' ? true : 'Active object is not a camera'),
+      poll: (ctx) =>
+        ctx.state.activeId && ctx.doc.getObject(ctx.state.activeId)?.type === 'CAMERA'
+          ? true
+          : 'Active object is not a camera',
       execute(ctx) {
         ctx.doc.updateScene({ camera: ctx.state.activeId });
         session.value!.view.cameraView.value = true;
@@ -175,8 +180,20 @@ export function registerUiOperators(reg: OperatorRegistry): void {
             const box = new THREE.Box3();
             const m = new THREE.Matrix4().fromArray(ev.worldMatrix);
             const sel = ctx.state.meshSelection.verts;
-            const verts = sel.size ? [...sel] : mesh.positions.map((_, i) => i).filter((i) => i % 3 === 0).map((i) => i / 3);
-            for (const v of verts) box.expandByPoint(new THREE.Vector3(mesh.positions[v * 3], mesh.positions[v * 3 + 1], mesh.positions[v * 3 + 2]).applyMatrix4(m));
+            const verts = sel.size
+              ? [...sel]
+              : mesh.positions
+                  .map((_, i) => i)
+                  .filter((i) => i % 3 === 0)
+                  .map((i) => i / 3);
+            for (const v of verts)
+              box.expandByPoint(
+                new THREE.Vector3(
+                  mesh.positions[v * 3],
+                  mesh.positions[v * 3 + 1],
+                  mesh.positions[v * 3 + 2],
+                ).applyMatrix4(m),
+              );
             if (!box.isEmpty()) return e.frameSphere(box.getBoundingSphere(new THREE.Sphere()));
           }
         }
@@ -191,7 +208,10 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       description: 'Orbit the view in 15° steps (Numpad 4/6/8/2).',
       category: 'View',
       ...ui,
-      schema: z.object({ type: z.enum(['ORBITLEFT', 'ORBITRIGHT', 'ORBITUP', 'ORBITDOWN']), angle: z.number().default(Math.PI / 12) }),
+      schema: z.object({
+        type: z.enum(['ORBITLEFT', 'ORBITRIGHT', 'ORBITUP', 'ORBITDOWN']),
+        angle: z.number().default(Math.PI / 12),
+      }),
       execute(_ctx, p) {
         const e = engine();
         const pose = clonePose(e.pose);
@@ -216,7 +236,12 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       },
     }),
   );
-  const toggle = (id: string, label: string, key: 'xray' | 'overlays' | 'sidebar' | 'toolbar' | 'showWireframe' | 'snapping', description: string) =>
+  const toggle = (
+    id: string,
+    label: string,
+    key: 'xray' | 'overlays' | 'sidebar' | 'toolbar' | 'showWireframe' | 'snapping',
+    description: string,
+  ) =>
     reg.register(
       defineOperator({
         id,
@@ -231,11 +256,21 @@ export function registerUiOperators(reg: OperatorRegistry): void {
         },
       }),
     );
-  toggle('view3d.toggle_xray', 'Toggle X-Ray', 'xray', 'See through objects; selection also selects hidden elements (Alt+Z).');
+  toggle(
+    'view3d.toggle_xray',
+    'Toggle X-Ray',
+    'xray',
+    'See through objects; selection also selects hidden elements (Alt+Z).',
+  );
   toggle('view3d.toggle_overlays', 'Toggle Overlays', 'overlays', 'Show or hide viewport overlays.');
   toggle('view3d.toggle_sidebar', 'Sidebar', 'sidebar', 'Toggle the viewport sidebar (N).');
   toggle('view3d.toggle_toolbar', 'Toolbar', 'toolbar', 'Toggle the tool bar (T).');
-  toggle('view3d.toggle_wireframe_overlay', 'Wireframe Overlay', 'showWireframe', 'Show wireframe on top of shaded objects.');
+  toggle(
+    'view3d.toggle_wireframe_overlay',
+    'Wireframe Overlay',
+    'showWireframe',
+    'Show wireframe on top of shaded objects.',
+  );
   toggle('view3d.toggle_snapping', 'Snapping', 'snapping', 'Snap transforms to increments (Shift+Tab).');
   reg.register(
     defineOperator({
@@ -258,7 +293,21 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       description: 'Activate a toolbar tool.',
       category: 'Tools',
       ...ui,
-      schema: z.object({ tool: z.enum(['select', 'cursor', 'move', 'rotate', 'scale', 'sculpt_draw', 'sculpt_smooth', 'sculpt_grab', 'sculpt_inflate', 'sculpt_flatten', 'paint']) }),
+      schema: z.object({
+        tool: z.enum([
+          'select',
+          'cursor',
+          'move',
+          'rotate',
+          'scale',
+          'sculpt_draw',
+          'sculpt_smooth',
+          'sculpt_grab',
+          'sculpt_inflate',
+          'sculpt_flatten',
+          'paint',
+        ]),
+      }),
       execute(_ctx, p) {
         session.value!.view.tool.value = p.tool;
       },
@@ -330,10 +379,13 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       execute(ctx, p) {
         const ids = ctx.state.selectedIds.length ? ctx.state.selectedIds : ctx.doc.objectIds();
         const frames = new Set<number>();
-        for (const id of ids) for (const fc of ctx.doc.listFCurves(id)) for (const k of fc.keyframes) frames.add(k.frame);
+        for (const id of ids)
+          for (const fc of ctx.doc.listFCurves(id)) for (const k of fc.keyframes) frames.add(k.frame);
         const sorted = [...frames].sort((a, b) => a - b);
         const cur = ctx.state.frame;
-        const target = p.next ? sorted.find((f) => f > cur + 1e-6) : [...sorted].reverse().find((f) => f < cur - 1e-6);
+        const target = p.next
+          ? sorted.find((f) => f > cur + 1e-6)
+          : [...sorted].reverse().find((f) => f < cur - 1e-6);
         if (target === undefined) throw new Error('No more keyframes');
         ctx.state.frame = target;
       },
@@ -535,7 +587,6 @@ if (typeof window !== 'undefined')
     lastMouse.x = e.clientX;
     lastMouse.y = e.clientY;
   });
-
 
 function pickEdgeUnderMouse(): [number, number] | null {
   const e = viewport.engine;

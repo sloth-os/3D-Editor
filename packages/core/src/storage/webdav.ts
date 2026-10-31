@@ -64,9 +64,12 @@ export function parseMultistatus(xml: string): DavResponse[] {
     const href = tagText(body, 'href');
     if (!href) continue;
     // only use propstat blocks with 200 status
-    const propstats = [...body.matchAll(/<(?:[\w.-]+:)?propstat\b[^>]*>([\s\S]*?)<\/(?:[\w.-]+:)?propstat>/gi)].map((x) => x[1]);
+    const propstats = [
+      ...body.matchAll(/<(?:[\w.-]+:)?propstat\b[^>]*>([\s\S]*?)<\/(?:[\w.-]+:)?propstat>/gi),
+    ].map((x) => x[1]);
     const ok = propstats.filter((p) => /\s200\s/.test(tagText(p, 'status') ?? ' 200 ')).join('\n') || body;
-    const resType = /<(?:[\w.-]+:)?resourcetype\b[^>]*>([\s\S]*?)<\/(?:[\w.-]+:)?resourcetype>/i.exec(ok)?.[1] ?? '';
+    const resType =
+      /<(?:[\w.-]+:)?resourcetype\b[^>]*>([\s\S]*?)<\/(?:[\w.-]+:)?resourcetype>/i.exec(ok)?.[1] ?? '';
     const isDir = /<(?:[\w.-]+:)?collection\b/i.test(resType);
     const len = tagText(ok, 'getcontentlength');
     out.push({
@@ -109,11 +112,16 @@ export class WebDAVClient implements FileStore {
   private headers(extra: Record<string, string> = {}): Record<string, string> {
     const h: Record<string, string> = { ...(this.config.headers ?? {}), ...extra };
     if (this.config.token) h.Authorization = `Bearer ${this.config.token}`;
-    else if (this.config.username) h.Authorization = `Basic ${b64(`${this.config.username}:${this.config.password ?? ''}`)}`;
+    else if (this.config.username)
+      h.Authorization = `Basic ${b64(`${this.config.username}:${this.config.password ?? ''}`)}`;
     return h;
   }
 
-  private async request(method: string, path: string, init: { headers?: Record<string, string>; body?: BodyInit } = {}): Promise<Response> {
+  private async request(
+    method: string,
+    path: string,
+    init: { headers?: Record<string, string>; body?: BodyInit } = {},
+  ): Promise<Response> {
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
     const timer = ctrl ? setTimeout(() => ctrl.abort(), this.config.timeoutMs ?? 30000) : undefined;
     try {
@@ -135,7 +143,8 @@ export class WebDAVClient implements FileStore {
       body: PROPFIND_BODY,
     });
     if (res.status === 404) return [];
-    if (res.status !== 207 && !res.ok) throw new WebDAVError(`PROPFIND ${path} failed: ${res.status}`, res.status);
+    if (res.status !== 207 && !res.ok)
+      throw new WebDAVError(`PROPFIND ${path} failed: ${res.status}`, res.status);
     return parseMultistatus(await res.text());
   }
 
@@ -172,7 +181,9 @@ export class WebDAVClient implements FileStore {
   }
 
   async write(path: string, data: Uint8Array, opts: WriteOptions = {}): Promise<{ etag?: string }> {
-    const headers: Record<string, string> = { 'Content-Type': opts.contentType ?? 'application/octet-stream' };
+    const headers: Record<string, string> = {
+      'Content-Type': opts.contentType ?? 'application/octet-stream',
+    };
     if (opts.ifMatch) headers['If-Match'] = opts.ifMatch;
     if (opts.ifNoneMatch) headers['If-None-Match'] = opts.ifNoneMatch;
     const res = await this.request('PUT', path, { headers, body: data as unknown as BodyInit });
@@ -190,13 +201,15 @@ export class WebDAVClient implements FileStore {
 
   async remove(path: string): Promise<void> {
     const res = await this.request('DELETE', path);
-    if (!res.ok && res.status !== 404) throw new WebDAVError(`DELETE ${path} failed: ${res.status}`, res.status);
+    if (!res.ok && res.status !== 404)
+      throw new WebDAVError(`DELETE ${path} failed: ${res.status}`, res.status);
   }
 
   async mkcol(path: string): Promise<void> {
     const res = await this.request('MKCOL', path.endsWith('/') ? path : `${path}/`);
     // 405: already exists; 301: some servers redirect to the slash URL
-    if (!res.ok && res.status !== 405 && res.status !== 301) throw new WebDAVError(`MKCOL ${path} failed: ${res.status}`, res.status);
+    if (!res.ok && res.status !== 405 && res.status !== 301)
+      throw new WebDAVError(`MKCOL ${path} failed: ${res.status}`, res.status);
   }
 
   async mkdirp(dir: string): Promise<void> {

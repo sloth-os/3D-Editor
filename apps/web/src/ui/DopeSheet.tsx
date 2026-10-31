@@ -34,7 +34,13 @@ export function DopeSheet({ session: s }: { session: ProjectSession }) {
     if (!curves.length) continue;
     all.push(...curves);
     rows.push({ label: o.name, indent: 0, curves, summary: true });
-    for (const c of curves) rows.push({ label: `${c.path.replace('_euler', '')} ${AXIS[c.index] ?? c.index}`, indent: 1, curves: [c], summary: false });
+    for (const c of curves)
+      rows.push({
+        label: `${c.path.replace('_euler', '')} ${AXIS[c.index] ?? c.index}`,
+        indent: 1,
+        curves: [c],
+        summary: false,
+      });
   }
   const keyId = (fc: FCurve, f: number) => `${fcurveKey(fc)}@${f}`;
 
@@ -65,8 +71,12 @@ export function DopeSheet({ session: s }: { session: ProjectSession }) {
       g.font = `${r.summary ? 'bold ' : ''}11px system-ui`;
       g.fillText(r.label, 6 + r.indent * 12, y + 14);
       const frames = new Map<number, boolean>();
-      for (const fc of r.curves) for (const k of fc.keyframes) frames.set(k.frame, (frames.get(k.frame) ?? false) || selected.has(keyId(fc, k.frame)));
-      if (r.summary) for (const fc of r.curves) for (const k of fc.keyframes) if (selected.has(keyId(fc, k.frame))) frames.set(k.frame, true);
+      for (const fc of r.curves)
+        for (const k of fc.keyframes)
+          frames.set(k.frame, (frames.get(k.frame) ?? false) || selected.has(keyId(fc, k.frame)));
+      if (r.summary)
+        for (const fc of r.curves)
+          for (const k of fc.keyframes) if (selected.has(keyId(fc, k.frame))) frames.set(k.frame, true);
       for (const [f, sel] of frames) {
         const x = toX(f + (sel ? delta : 0), w);
         const cy = y + ROW / 2;
@@ -90,7 +100,8 @@ export function DopeSheet({ session: s }: { session: ProjectSession }) {
     g.textAlign = 'center';
     const span = range.end - range.start;
     const step = [1, 2, 5, 10, 20, 50, 100, 200, 500].find((st) => (w / span) * st > 40) ?? 1000;
-    for (let f = Math.ceil(range.start / step) * step; f <= range.end; f += step) g.fillText(String(f), toX(f, w), 12);
+    for (let f = Math.ceil(range.start / step) * step; f <= range.end; f += step)
+      g.fillText(String(f), toX(f, w), 12);
     g.textAlign = 'left';
     const px = toX(frame, w);
     g.strokeStyle = '#4772b3';
@@ -101,7 +112,13 @@ export function DopeSheet({ session: s }: { session: ProjectSession }) {
     g.stroke();
     if (!rows.length) {
       g.fillStyle = '#777';
-      g.fillText(onlySelected ? 'Select animated objects (press I in the viewport to insert keyframes)' : 'No animation in this scene', LABEL_W + 10, 40);
+      g.fillText(
+        onlySelected
+          ? 'Select animated objects (press I in the viewport to insert keyframes)'
+          : 'No animation in this scene',
+        LABEL_W + 10,
+        40,
+      );
     }
   });
 
@@ -111,18 +128,29 @@ export function DopeSheet({ session: s }: { session: ProjectSession }) {
     const r = rows[i];
     if (!r) return [];
     const out: { fc: FCurve; frame: number }[] = [];
-    for (const fc of r.curves) for (const k of fc.keyframes) if (Math.abs(toX(k.frame, w) - x) < 7) out.push({ fc, frame: k.frame });
+    for (const fc of r.curves)
+      for (const k of fc.keyframes) if (Math.abs(toX(k.frame, w) - x) < 7) out.push({ fc, frame: k.frame });
     return out;
   };
 
   const selectedRefs = () =>
-    all.flatMap((fc) => fc.keyframes.filter((k) => selected.has(keyId(fc, k.frame))).map((k) => ({ fcurve: fcurveKey(fc), frame: k.frame })));
+    all.flatMap((fc) =>
+      fc.keyframes
+        .filter((k) => selected.has(keyId(fc, k.frame)))
+        .map((k) => ({ fcurve: fcurveKey(fc), frame: k.frame })),
+    );
 
   return (
     <div class="column" style={{ height: '100%' }} onPointerDown={(e) => e.stopPropagation()}>
       <div class="area-header" style={{ gap: '8px' }}>
         <Checkbox value={onlySelected} label="Only Selected" onChange={setOnlySelected} />
-        <button class="btn flat" disabled={!selected.size} onClick={() => run('anim.keyframes_remove', { keys: selectedRefs() }, 'ui') && setSelected(new Set())}>
+        <button
+          class="btn flat"
+          disabled={!selected.size}
+          onClick={() =>
+            run('anim.keyframes_remove', { keys: selectedRefs() }, 'ui') && setSelected(new Set())
+          }
+        >
           Delete Keys
         </button>
         <button class="btn flat" onClick={() => run('anim.interpolation_type', { type: 'LINEAR' }, 'ui')}>

@@ -20,7 +20,8 @@ export function jsonEqual(a: unknown, b: unknown): boolean {
   const ka = Object.keys(a as object);
   const kb = Object.keys(b as object);
   if (ka.length !== kb.length) return false;
-  for (const k of ka) if (!jsonEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false;
+  for (const k of ka)
+    if (!jsonEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false;
   return true;
 }
 
@@ -33,7 +34,8 @@ export function stableStringify(v: unknown): string {
 }
 
 export function base64Encode(bytes: Uint8Array): string {
-  if (typeof Buffer !== 'undefined') return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
+  if (typeof Buffer !== 'undefined')
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
   let s = '';
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) s += String.fromCharCode(...bytes.subarray(i, i + chunk));

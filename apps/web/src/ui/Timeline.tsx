@@ -14,7 +14,8 @@ export function Timeline({ session }: { session: ProjectSession }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sel = st.$selectedIds.value;
   const keyFrames = new Set<number>();
-  for (const id of sel) for (const fc of session.doc.listFCurves(id)) for (const k of fc.keyframes) keyFrames.add(k.frame);
+  for (const id of sel)
+    for (const fc of session.doc.listFCurves(id)) for (const k of fc.keyframes) keyFrames.add(k.frame);
 
   const range = { start: scene.frame_start - 5, end: scene.frame_end + 5 };
   const toX = (f: number, w: number) => ((f - range.start) / (range.end - range.start)) * w;
@@ -92,23 +93,50 @@ export function Timeline({ session }: { session: ProjectSession }) {
   return (
     <div class="timeline" onPointerDown={(e) => e.stopPropagation()}>
       <div class="area-header" style={{ gap: '6px' }}>
-        <button class="btn flat icon" title="Jump to start (Shift ←)" onClick={() => run('screen.frame_jump', { end: false }, 'ui')}>
+        <button
+          class="btn flat icon"
+          title="Jump to start (Shift ←)"
+          onClick={() => run('screen.frame_jump', { end: false }, 'ui')}
+        >
           <Icon name="first" />
         </button>
-        <button class="btn flat icon" title="Previous keyframe (↓)" onClick={() => run('screen.keyframe_jump', { next: false }, 'ui')}>
+        <button
+          class="btn flat icon"
+          title="Previous keyframe (↓)"
+          onClick={() => run('screen.keyframe_jump', { next: false }, 'ui')}
+        >
           <Icon name="prev" />
         </button>
-        <button class={`btn flat icon ${playing ? 'active' : ''}`} title="Play / Pause (Space)" data-testid="play" onClick={() => run('screen.animation_play', {}, 'ui')}>
+        <button
+          class={`btn flat icon ${playing ? 'active' : ''}`}
+          title="Play / Pause (Space)"
+          data-testid="play"
+          onClick={() => run('screen.animation_play', {}, 'ui')}
+        >
           <Icon name={playing ? 'pause' : 'play'} />
         </button>
-        <button class="btn flat icon" title="Next keyframe (↑)" onClick={() => run('screen.keyframe_jump', { next: true }, 'ui')}>
+        <button
+          class="btn flat icon"
+          title="Next keyframe (↑)"
+          onClick={() => run('screen.keyframe_jump', { next: true }, 'ui')}
+        >
           <Icon name="next" />
         </button>
-        <button class="btn flat icon" title="Jump to end (Shift →)" onClick={() => run('screen.frame_jump', { end: true }, 'ui')}>
+        <button
+          class="btn flat icon"
+          title="Jump to end (Shift →)"
+          onClick={() => run('screen.frame_jump', { end: true }, 'ui')}
+        >
           <Icon name="last" />
         </button>
         <div style={{ width: '70px' }}>
-          <NumberField value={frame} integer step={1} testId="current-frame" onChange={(v) => (st.frame = v)} />
+          <NumberField
+            value={frame}
+            integer
+            step={1}
+            testId="current-frame"
+            onChange={(v) => (st.frame = v)}
+          />
         </div>
         <button
           class={`btn flat icon ${st.$autoKeying.value ? 'active' : ''}`}
@@ -119,17 +147,35 @@ export function Timeline({ session }: { session: ProjectSession }) {
         >
           ●
         </button>
-        <button class="btn flat" title="Insert keyframe on selected (I)" onClick={() => run('anim.keyframe_insert', {}, 'ui')}>
+        <button
+          class="btn flat"
+          title="Insert keyframe on selected (I)"
+          onClick={() => run('anim.keyframe_insert', {}, 'ui')}
+        >
           <Icon name="key" size={12} /> Key
         </button>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: '4px', alignItems: 'center' }}>
           <span class="hint">Start</span>
           <div style={{ width: '64px' }}>
-            <NumberField value={scene.frame_start} integer step={1} onChange={(v, f) => f && run('data.set_property', { kind: 'scene', values: { frame_start: v } }, 'ui')} />
+            <NumberField
+              value={scene.frame_start}
+              integer
+              step={1}
+              onChange={(v, f) =>
+                f && run('data.set_property', { kind: 'scene', values: { frame_start: v } }, 'ui')
+              }
+            />
           </div>
           <span class="hint">End</span>
           <div style={{ width: '64px' }}>
-            <NumberField value={scene.frame_end} integer step={1} onChange={(v, f) => f && run('data.set_property', { kind: 'scene', values: { frame_end: v } }, 'ui')} />
+            <NumberField
+              value={scene.frame_end}
+              integer
+              step={1}
+              onChange={(v, f) =>
+                f && run('data.set_property', { kind: 'scene', values: { frame_end: v } }, 'ui')
+              }
+            />
           </div>
         </div>
       </div>

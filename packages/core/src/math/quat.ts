@@ -47,7 +47,11 @@ export function rotateVec3ByQuat(q: Readonly<Quat>, v: Readonly<Vec3>): Vec3 {
   const tx = 2 * (qy * vz - qz * vy);
   const ty = 2 * (qz * vx - qx * vz);
   const tz = 2 * (qx * vy - qy * vx);
-  return [vx + qw * tx + (qy * tz - qz * ty), vy + qw * ty + (qz * tx - qx * tz), vz + qw * tz + (qx * ty - qy * tx)];
+  return [
+    vx + qw * tx + (qy * tz - qz * ty),
+    vy + qw * ty + (qz * tx - qx * tz),
+    vz + qw * tz + (qx * ty - qy * tx),
+  ];
 }
 
 export function slerpQuat(a: Readonly<Quat>, b: Readonly<Quat>, t: number): Quat {

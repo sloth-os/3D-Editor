@@ -4,7 +4,8 @@ import type { MeshSelection, SelectMode } from '../mesh/selection';
 import { emptySelection } from '../mesh/selection';
 
 export type EditorMode = 'OBJECT' | 'EDIT' | 'SCULPT' | 'VERTEX_PAINT';
-export type PivotPoint = 'MEDIAN_POINT' | 'BOUNDING_BOX_CENTER' | 'CURSOR' | 'INDIVIDUAL_ORIGINS' | 'ACTIVE_ELEMENT';
+export type PivotPoint =
+  'MEDIAN_POINT' | 'BOUNDING_BOX_CENTER' | 'CURSOR' | 'INDIVIDUAL_ORIGINS' | 'ACTIVE_ELEMENT';
 export type TransformOrientation = 'GLOBAL' | 'LOCAL' | 'NORMAL' | 'VIEW';
 
 /**
@@ -61,7 +62,8 @@ export function createEditorState(init: Partial<EditorState> = {}): EditorState 
 export type ReportLevel = 'INFO' | 'WARNING' | 'ERROR';
 
 /** Where an operator invocation came from (recorded in telemetry and the info log). */
-export type OperatorSource = 'ui' | 'menu' | 'hotkey' | 'toolbar' | 'palette' | 'redo' | 'console' | 'mcp' | 'api' | 'test';
+export type OperatorSource =
+  'ui' | 'menu' | 'hotkey' | 'toolbar' | 'palette' | 'redo' | 'console' | 'mcp' | 'api' | 'test';
 
 export interface OperatorContext {
   doc: SceneDoc;

@@ -11,7 +11,11 @@ function fmt(v: number, precision: number, unit?: string): string {
 
 /** Evaluates simple arithmetic typed into fields (e.g. "2*pi", "1/3+0.5"). */
 export function evalExpression(s: string): number | null {
-  const clean = s.trim().toLowerCase().replace(/pi/g, String(Math.PI)).replace(/[^0-9+\-*/().e\s]/g, '');
+  const clean = s
+    .trim()
+    .toLowerCase()
+    .replace(/pi/g, String(Math.PI))
+    .replace(/[^0-9+\-*/().e\s]/g, '');
   if (!clean) return null;
   try {
     const v = Function(`"use strict"; return (${clean});`)() as unknown;
@@ -98,7 +102,9 @@ export function NumberField(p: NumberFieldProps) {
     if (v !== null) p.onChange(clamp(fromD(v)), true);
   };
   const fill =
-    p.slider && p.min !== undefined && p.max !== undefined ? Math.max(0, Math.min(1, (display - toD(p.min)) / (toD(p.max) - toD(p.min) || 1))) : null;
+    p.slider && p.min !== undefined && p.max !== undefined
+      ? Math.max(0, Math.min(1, (display - toD(p.min)) / (toD(p.max) - toD(p.min) || 1)))
+      : null;
   return (
     <div
       class={`numfield ${p.state ?? ''}`}
@@ -178,12 +184,20 @@ const linearToSrgb = (c: number) => (c <= 0.0031308 ? c * 12.92 : 1.055 * Math.p
 const srgbToLinear = (c: number) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
 
 /** Color swatch editing linear RGB values through the browser color picker (sRGB). */
-export function ColorField(p: { value: number[]; onChange: (v: number[], final: boolean) => void; testId?: string }) {
+export function ColorField(p: {
+  value: number[];
+  onChange: (v: number[], final: boolean) => void;
+  testId?: string;
+}) {
   const [r, g, b] = p.value;
   const hex =
     '#' +
     [r, g, b]
-      .map((c) => Math.round(Math.max(0, Math.min(1, linearToSrgb(c))) * 255).toString(16).padStart(2, '0'))
+      .map((c) =>
+        Math.round(Math.max(0, Math.min(1, linearToSrgb(c))) * 255)
+          .toString(16)
+          .padStart(2, '0'),
+      )
       .join('');
   return (
     <div class="colorfield" style={{ background: hex }} title={hex} data-testid={p.testId}>
@@ -205,18 +219,37 @@ export function ColorField(p: { value: number[]; onChange: (v: number[], final: 
   );
 }
 
-export function Checkbox(p: { value: boolean; onChange: (v: boolean) => void; label?: string; testId?: string }) {
+export function Checkbox(p: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+  label?: string;
+  testId?: string;
+}) {
   return (
-    <label class={`checkbox ${p.value ? 'on' : ''}`} data-testid={p.testId} onClick={() => p.onChange(!p.value)}>
+    <label
+      class={`checkbox ${p.value ? 'on' : ''}`}
+      data-testid={p.testId}
+      onClick={() => p.onChange(!p.value)}
+    >
       <span class="box">{p.value ? <Icon name="check" size={11} /> : null}</span>
       {p.label}
     </label>
   );
 }
 
-export function SelectField<T extends string>(p: { value: T; options: { value: T; label: string }[]; onChange: (v: T) => void; testId?: string }) {
+export function SelectField<T extends string>(p: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+  testId?: string;
+}) {
   return (
-    <select class="select" value={p.value} data-testid={p.testId} onChange={(e) => p.onChange((e.target as HTMLSelectElement).value as T)}>
+    <select
+      class="select"
+      value={p.value}
+      data-testid={p.testId}
+      onChange={(e) => p.onChange((e.target as HTMLSelectElement).value as T)}
+    >
       {p.options.map((o) => (
         <option key={o.value} value={o.value}>
           {o.label}
@@ -226,11 +259,19 @@ export function SelectField<T extends string>(p: { value: T; options: { value: T
   );
 }
 
-export function EnumButtons<T extends string>(p: { value: T; options: { value: T; label: string }[]; onChange: (v: T) => void }) {
+export function EnumButtons<T extends string>(p: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+}) {
   return (
     <div class="enum-row">
       {p.options.map((o) => (
-        <button key={o.value} class={`btn ${p.value === o.value ? 'active' : ''}`} onClick={() => p.onChange(o.value)}>
+        <button
+          key={o.value}
+          class={`btn ${p.value === o.value ? 'active' : ''}`}
+          onClick={() => p.onChange(o.value)}
+        >
           {o.label}
         </button>
       ))}
@@ -238,7 +279,14 @@ export function EnumButtons<T extends string>(p: { value: T; options: { value: T
   );
 }
 
-export function TextField(p: { value: string; onChange: (v: string) => void; placeholder?: string; testId?: string; type?: string; commitOnBlur?: boolean }) {
+export function TextField(p: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  testId?: string;
+  type?: string;
+  commitOnBlur?: boolean;
+}) {
   const [v, setV] = useState(p.value);
   useEffect(() => setV(p.value), [p.value]);
   const commit = () => {
@@ -274,7 +322,13 @@ export function Row(p: { label?: string; children: ComponentChildren; full?: boo
   );
 }
 
-export function Panel(p: { title: string; children: ComponentChildren; defaultOpen?: boolean; actions?: ComponentChildren; id?: string }) {
+export function Panel(p: {
+  title: string;
+  children: ComponentChildren;
+  defaultOpen?: boolean;
+  actions?: ComponentChildren;
+  id?: string;
+}) {
   const key = `3d-editor:panel:${p.id ?? p.title}`;
   const [open, setOpen] = useState(() => {
     const s = localStorage.getItem(key);
@@ -302,4 +356,7 @@ export function Panel(p: { title: string; children: ComponentChildren; defaultOp
   );
 }
 
-export const RAD = { toDisplay: (v: number) => (v * 180) / Math.PI, fromDisplay: (v: number) => (v * Math.PI) / 180 };
+export const RAD = {
+  toDisplay: (v: number) => (v * 180) / Math.PI,
+  fromDisplay: (v: number) => (v * Math.PI) / 180,
+};

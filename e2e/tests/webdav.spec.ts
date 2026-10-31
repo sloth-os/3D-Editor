@@ -6,7 +6,9 @@ test.describe('WebDAV storage', () => {
     const deviceA = await browser.newContext();
     const a = await deviceA.newPage();
     const id = await newProject(a, DAV_SERVER);
-    await expect(a.getByTestId('storage-status')).toHaveAttribute('data-status', 'synced', { timeout: 30_000 });
+    await expect(a.getByTestId('storage-status')).toHaveAttribute('data-status', 'synced', {
+      timeout: 30_000,
+    });
     await menuPath(a, ['Add', 'Mesh', 'Cylinder']);
     await expect(a.getByTestId('outliner-Cylinder')).toBeVisible();
     // the real WebDAV server holds the project document and metadata
@@ -47,7 +49,9 @@ test.describe('WebDAV storage', () => {
     await expect(page.getByTestId('viewport')).toBeVisible();
     await page.waitForFunction(() => new URL(location.href).searchParams.has('project'));
     const id = new URL(page.url()).searchParams.get('project')!;
-    await expect(page.getByTestId('storage-status')).toHaveAttribute('data-status', 'synced', { timeout: 30_000 });
+    await expect(page.getByTestId('storage-status')).toHaveAttribute('data-status', 'synced', {
+      timeout: 30_000,
+    });
     await expect.poll(async () => (await davGet(`/direct/projects/${id}/document.ybin`)).status).toBe(200);
   });
 });

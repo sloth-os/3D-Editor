@@ -23,12 +23,14 @@ export function installRpcHandler(): () => void {
         const r = await e.renderImage({
           width: typeof p.width === 'number' ? p.width : undefined,
           height: typeof p.height === 'number' ? p.height : undefined,
-          cameraId: typeof p.camera === 'string' ? (s.doc.resolveObject(p.camera)?.id ?? undefined) : undefined,
+          cameraId:
+            typeof p.camera === 'string' ? (s.doc.resolveObject(p.camera)?.id ?? undefined) : undefined,
           useViewport: !!p.use_viewport,
         });
         return { mime: 'image/png', data_base64: r.dataUrl.split(',')[1], width: r.width, height: r.height };
       }
-      if (method === 'ui') return uiCommand(String(p.command ?? ''), (p.params ?? {}) as Record<string, unknown>);
+      if (method === 'ui')
+        return uiCommand(String(p.command ?? ''), (p.params ?? {}) as Record<string, unknown>);
       throw new Error(`unknown RPC method ${method}`);
     });
     return () => provider.setRpcHandler(null);
@@ -55,7 +57,9 @@ async function uiCommand(command: string, params: Record<string, unknown>): Prom
       run('view3d.toggle_shading', { type: String(params.type ?? 'SOLID').toUpperCase() }, 'mcp');
       return { ok: true };
     case 'select': {
-      const ids = (Array.isArray(params.objects) ? params.objects : []).map((r) => s.doc.resolveObject(String(r))?.id).filter(Boolean) as string[];
+      const ids = (Array.isArray(params.objects) ? params.objects : [])
+        .map((r) => s.doc.resolveObject(String(r))?.id)
+        .filter(Boolean) as string[];
       s.state.selectedIds = ids;
       s.state.activeId = ids[ids.length - 1] ?? null;
       return { selected: ids };
@@ -77,13 +81,24 @@ async function uiCommand(command: string, params: Record<string, unknown>): Prom
     }
     case 'screenshot': {
       if (!e) throw new Error('no viewport');
-      const r = await e.renderImage({ useViewport: true, width: Number(params.width) || e.width, height: Number(params.height) || e.height });
+      const r = await e.renderImage({
+        useViewport: true,
+        width: Number(params.width) || e.width,
+        height: Number(params.height) || e.height,
+      });
       return { mime: 'image/png', data_base64: r.dataUrl.split(',')[1], width: r.width, height: r.height };
     }
     case 'get_view': {
       if (!e) throw new Error('no viewport');
       const p = e.pose;
-      return { target: p.target.toArray(), distance: p.distance, yaw: p.yaw, pitch: p.pitch, ortho: p.ortho, camera_view: s.view.cameraView.value };
+      return {
+        target: p.target.toArray(),
+        distance: p.distance,
+        yaw: p.yaw,
+        pitch: p.pitch,
+        ortho: p.ortho,
+        camera_view: s.view.cameraView.value,
+      };
     }
     default:
       throw new Error(

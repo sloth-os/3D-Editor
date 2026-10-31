@@ -46,7 +46,11 @@ export function poseBasis(p: ViewPose): { right: THREE.Vector3; up: THREE.Vector
   return { right, up, back };
 }
 
-export function applyPoseToCamera(p: ViewPose, cam: THREE.PerspectiveCamera | THREE.OrthographicCamera, aspect: number): void {
+export function applyPoseToCamera(
+  p: ViewPose,
+  cam: THREE.PerspectiveCamera | THREE.OrthographicCamera,
+  aspect: number,
+): void {
   const { right, up, back } = poseBasis(p);
   cam.position.copy(posePosition(p));
   const m = new THREE.Matrix4().makeBasis(right, up, back);
@@ -132,7 +136,12 @@ export function poseToPresence(p: ViewPose) {
 }
 
 /** Reconstructs a pose from a peer's presence view. */
-export function presenceToPose(v: { position: number[]; target: number[]; fov: number; ortho: boolean }): ViewPose {
+export function presenceToPose(v: {
+  position: number[];
+  target: number[];
+  fov: number;
+  ortho: boolean;
+}): ViewPose {
   const pos = new THREE.Vector3(...(v.position as [number, number, number]));
   const target = new THREE.Vector3(...(v.target as [number, number, number]));
   const d = pos.clone().sub(target);

@@ -50,7 +50,12 @@ export function MaterialTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
               <span
                 class="dot"
                 style={{
-                  background: mat ? `rgb(${mat.base_color.slice(0, 3).map((c) => Math.round(Math.pow(c, 1 / 2.2) * 255)).join(',')})` : '#555',
+                  background: mat
+                    ? `rgb(${mat.base_color
+                        .slice(0, 3)
+                        .map((c) => Math.round(Math.pow(c, 1 / 2.2) * 255))
+                        .join(',')})`
+                    : '#555',
                   width: '10px',
                   height: '10px',
                 }}
@@ -63,7 +68,12 @@ export function MaterialTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
           <button class="btn icon" title="Add slot" onClick={() => run('object.material_slot_add', {}, 'ui')}>
             <Icon name="plus" size={12} />
           </button>
-          <button class="btn icon" title="Remove slot" disabled={!slots.length} onClick={() => run('object.material_slot_remove', { index: active }, 'ui')}>
+          <button
+            class="btn icon"
+            title="Remove slot"
+            disabled={!slots.length}
+            onClick={() => run('object.material_slot_remove', { index: active }, 'ui')}
+          >
             <Icon name="minus" size={12} />
           </button>
           {s.state.mode === 'EDIT' && (
@@ -78,8 +88,13 @@ export function MaterialTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
           <div style={{ display: 'flex', gap: '4px' }}>
             <SelectField
               value={matId ?? ''}
-              options={[{ value: '', label: '— none —' }, ...all.map((x) => ({ value: x.id, label: x.name }))]}
-              onChange={(v) => run('object.material_assign', { material: v || null, objects: [o.id], slot: active }, 'ui')}
+              options={[
+                { value: '', label: '— none —' },
+                ...all.map((x) => ({ value: x.id, label: x.name })),
+              ]}
+              onChange={(v) =>
+                run('object.material_assign', { material: v || null, objects: [o.id], slot: active }, 'ui')
+              }
             />
             <button
               class="btn"
@@ -91,7 +106,8 @@ export function MaterialTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
                 }
                 const r = runResult('material.new', { name: 'Material', assign: false }, 'ui');
                 const created = (r?.result as { material?: string } | undefined)?.material;
-                if (created) run('object.material_assign', { material: created, objects: [o.id], slot: active }, 'ui');
+                if (created)
+                  run('object.material_assign', { material: created, objects: [o.id], slot: active }, 'ui');
               }}
             >
               <Icon name="plus" size={12} /> New
@@ -100,7 +116,11 @@ export function MaterialTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
         </Row>
         {m && (
           <Row label="Name">
-            <input class="textfield" value={m.name} onChange={(e) => setProp(s, 'materials', m.id, 'name', (e.target as HTMLInputElement).value)} />
+            <input
+              class="textfield"
+              value={m.name}
+              onChange={(e) => setProp(s, 'materials', m.id, 'name', (e.target as HTMLInputElement).value)}
+            />
           </Row>
         )}
       </Panel>
@@ -116,13 +136,33 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
     <>
       <Panel title="Surface (Principled)">
         <Row label="Base Color">
-          <ColorField value={m.base_color} testId="material-base-color" onChange={(v, f) => set('base_color', v, f)} />
+          <ColorField
+            value={m.base_color}
+            testId="material-base-color"
+            onChange={(v, f) => set('base_color', v, f)}
+          />
         </Row>
         <Row label="Metallic">
-          <NumberField value={m.metallic} min={0} max={1} slider state={st('metallic')} testId="material-metallic" onChange={(v, f) => set('metallic', v, f)} />
+          <NumberField
+            value={m.metallic}
+            min={0}
+            max={1}
+            slider
+            state={st('metallic')}
+            testId="material-metallic"
+            onChange={(v, f) => set('metallic', v, f)}
+          />
         </Row>
         <Row label="Roughness">
-          <NumberField value={m.roughness} min={0} max={1} slider state={st('roughness')} testId="material-roughness" onChange={(v, f) => set('roughness', v, f)} />
+          <NumberField
+            value={m.roughness}
+            min={0}
+            max={1}
+            slider
+            state={st('roughness')}
+            testId="material-roughness"
+            onChange={(v, f) => set('roughness', v, f)}
+          />
         </Row>
         <Row label="IOR">
           <NumberField value={m.ior} min={1} max={4} step={0.01} onChange={(v, f) => set('ior', v, f)} />
@@ -131,7 +171,13 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
           <NumberField value={m.alpha} min={0} max={1} slider onChange={(v, f) => set('alpha', v, f)} />
         </Row>
         <Row label="Transmission">
-          <NumberField value={m.transmission} min={0} max={1} slider onChange={(v, f) => set('transmission', v, f)} />
+          <NumberField
+            value={m.transmission}
+            min={0}
+            max={1}
+            slider
+            onChange={(v, f) => set('transmission', v, f)}
+          />
         </Row>
       </Panel>
       <Panel title="Emission">
@@ -139,18 +185,42 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
           <ColorField value={m.emission_color} onChange={(v, f) => set('emission_color', v, f)} />
         </Row>
         <Row label="Strength">
-          <NumberField value={m.emission_strength} min={0} step={0.05} state={st('emission_strength')} onChange={(v, f) => set('emission_strength', v, f)} />
+          <NumberField
+            value={m.emission_strength}
+            min={0}
+            step={0.05}
+            state={st('emission_strength')}
+            onChange={(v, f) => set('emission_strength', v, f)}
+          />
         </Row>
       </Panel>
       <Panel title="Coat & Sheen" defaultOpen={false}>
         <Row label="Coat">
-          <NumberField value={m.coat_weight} min={0} max={1} slider onChange={(v, f) => set('coat_weight', v, f)} />
+          <NumberField
+            value={m.coat_weight}
+            min={0}
+            max={1}
+            slider
+            onChange={(v, f) => set('coat_weight', v, f)}
+          />
         </Row>
         <Row label="Coat Roughness">
-          <NumberField value={m.coat_roughness} min={0} max={1} slider onChange={(v, f) => set('coat_roughness', v, f)} />
+          <NumberField
+            value={m.coat_roughness}
+            min={0}
+            max={1}
+            slider
+            onChange={(v, f) => set('coat_roughness', v, f)}
+          />
         </Row>
         <Row label="Sheen">
-          <NumberField value={m.sheen_weight} min={0} max={1} slider onChange={(v, f) => set('sheen_weight', v, f)} />
+          <NumberField
+            value={m.sheen_weight}
+            min={0}
+            max={1}
+            slider
+            onChange={(v, f) => set('sheen_weight', v, f)}
+          />
         </Row>
         <Row label="Sheen Tint">
           <ColorField value={m.sheen_tint} onChange={(v, f) => set('sheen_tint', v, f)} />
@@ -179,8 +249,19 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
                         const info = await readImage(f);
                         if (info.bytes.length > 8 * 1024 * 1024) throw new Error('Image larger than 8 MB');
                         s.doc.transact(() => {
-                          const imageId = s.doc.addImage({ name: f.name, mime: f.type || 'image/png', width: info.width, height: info.height, data: info.bytes });
-                          s.doc.updateMaterial(m.id, { textures: { ...m.textures, [ch.id]: { image: imageId, scale: [1, 1], offset: [0, 0] } } });
+                          const imageId = s.doc.addImage({
+                            name: f.name,
+                            mime: f.type || 'image/png',
+                            width: info.width,
+                            height: info.height,
+                            data: info.bytes,
+                          });
+                          s.doc.updateMaterial(m.id, {
+                            textures: {
+                              ...m.textures,
+                              [ch.id]: { image: imageId, scale: [1, 1], offset: [0, 0] },
+                            },
+                          });
                         });
                       } catch (err) {
                         toast(`Could not load image: ${err instanceof Error ? err.message : err}`, 'error');
@@ -189,7 +270,11 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
                   />
                 </label>
                 {slot && (
-                  <button class="btn icon" title="Remove texture" onClick={() => set('textures', { ...m.textures, [ch.id]: null })}>
+                  <button
+                    class="btn icon"
+                    title="Remove texture"
+                    onClick={() => set('textures', { ...m.textures, [ch.id]: null })}
+                  >
                     <Icon name="close" size={12} />
                   </button>
                 )}
@@ -211,7 +296,11 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
           />
         </Row>
         <Row label="">
-          <Checkbox value={m.use_backface_culling} label="Backface Culling" onChange={(v) => set('use_backface_culling', v)} />
+          <Checkbox
+            value={m.use_backface_culling}
+            label="Backface Culling"
+            onChange={(v) => set('use_backface_culling', v)}
+          />
         </Row>
       </Panel>
     </>

@@ -6,7 +6,18 @@ import { OperatorError, type OperatorContext } from './context';
 import { rekeyAnimated } from './anim';
 import type { AnimTargetType } from '../doc/types';
 
-const KINDS = ['objects', 'meshes', 'materials', 'lights', 'cameras', 'images', 'collections', 'scene', 'render', 'world'] as const;
+const KINDS = [
+  'objects',
+  'meshes',
+  'materials',
+  'lights',
+  'cameras',
+  'images',
+  'collections',
+  'scene',
+  'render',
+  'world',
+] as const;
 
 /** Fields that must not be changed through the generic property setter. */
 const READONLY = new Set(['id', 'data', 'modifiers']);
@@ -59,7 +70,9 @@ export function registerDataOperators(reg: OperatorRegistry): void {
         values: z.record(z.string(), z.unknown()),
       }),
       execute(ctx, p) {
-        for (const k of Object.keys(p.values)) if (READONLY.has(k)) throw new OperatorError(`Field '${k}' cannot be set directly`, 'INVALID_PARAMS');
+        for (const k of Object.keys(p.values))
+          if (READONLY.has(k))
+            throw new OperatorError(`Field '${k}' cannot be set directly`, 'INVALID_PARAMS');
         if (p.kind === 'scene') ctx.doc.updateScene(p.values);
         else if (p.kind === 'render') ctx.doc.updateRender(p.values);
         else if (p.kind === 'world') ctx.doc.updateWorld(p.values);
@@ -68,11 +81,16 @@ export function registerDataOperators(reg: OperatorRegistry): void {
           const id = resolveBlock(ctx, p.kind, p.target);
           const current = ctx.doc.getBlock(p.kind, id)!;
           for (const [k, v] of Object.entries(p.values)) {
-            if (!(k in current)) throw new OperatorError(`Unknown field '${k}' for ${p.kind}`, 'INVALID_PARAMS');
+            if (!(k in current))
+              throw new OperatorError(`Unknown field '${k}' for ${p.kind}`, 'INVALID_PARAMS');
             const cur = current[k];
-            if (cur !== null && v !== null && typeof cur !== typeof v) throw new OperatorError(`Field '${k}' expects ${typeof cur}`, 'INVALID_PARAMS');
+            if (cur !== null && v !== null && typeof cur !== typeof v)
+              throw new OperatorError(`Field '${k}' expects ${typeof cur}`, 'INVALID_PARAMS');
             if (Array.isArray(cur) && (!Array.isArray(v) || (cur.length && v.length !== cur.length)))
-              throw new OperatorError(`Field '${k}' expects an array of length ${cur.length}`, 'INVALID_PARAMS');
+              throw new OperatorError(
+                `Field '${k}' expects an array of length ${cur.length}`,
+                'INVALID_PARAMS',
+              );
           }
           ctx.doc.updateBlockByKind(p.kind, id, p.values);
           const animType = ANIM_TYPE[p.kind];

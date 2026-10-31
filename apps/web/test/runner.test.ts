@@ -7,7 +7,10 @@ import type { ProjectSession } from '../src/project/session';
 
 function fakeSession(): ProjectSession {
   const doc = SceneDoc.create({ empty: true });
-  const undo = new Y.UndoManager(doc.sharedTypes(), { trackedOrigins: new Set([doc.origin]), captureTimeout: 0 });
+  const undo = new Y.UndoManager(doc.sharedTypes(), {
+    trackedOrigins: new Set([doc.origin]),
+    captureTimeout: 0,
+  });
   return { doc, undo, state: new EditorStateSignals(), view: new ViewState() } as unknown as ProjectSession;
 }
 

@@ -43,7 +43,11 @@ async function boot(): Promise<void> {
   window.addEventListener('online', () => void reprobe());
   setInterval(() => void reprobe(), 15_000);
   // Files opened through the OS (PWA file handlers)
-  const lq = (window as unknown as { launchQueue?: { setConsumer(cb: (p: { files: FileSystemFileHandle[] }) => void): void } }).launchQueue;
+  const lq = (
+    window as unknown as {
+      launchQueue?: { setConsumer(cb: (p: { files: FileSystemFileHandle[] }) => void): void };
+    }
+  ).launchQueue;
   lq?.setConsumer(async (params) => {
     const files = await Promise.all(params.files.map((h) => h.getFile()));
     if (files.length) await importFiles(files);

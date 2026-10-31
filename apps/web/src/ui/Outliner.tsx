@@ -4,7 +4,12 @@ import type { ProjectSession } from '../project/session';
 import { run } from '../editor/editor';
 import { Icon, type IconName } from './icons';
 
-const TYPE_ICON: Record<string, IconName> = { MESH: 'mesh', EMPTY: 'empty', CAMERA: 'camera', LIGHT: 'light' };
+const TYPE_ICON: Record<string, IconName> = {
+  MESH: 'mesh',
+  EMPTY: 'empty',
+  CAMERA: 'camera',
+  LIGHT: 'light',
+};
 
 /** Scene hierarchy: collections → objects → children, with visibility toggles, rename and drag-to-parent. */
 export function Outliner({ session }: { session: ProjectSession }) {
@@ -39,7 +44,10 @@ export function Outliner({ session }: { session: ProjectSession }) {
   const select = (o: ObjectData, e: MouseEvent) => {
     if (st.mode !== 'OBJECT' && o.id !== st.activeId) run('object.mode_set', { mode: 'OBJECT' }, 'ui');
     if (e.ctrlKey || e.shiftKey) {
-      st.selectedIds = selected.has(o.id) && !e.shiftKey ? st.selectedIds.filter((x) => x !== o.id) : [...new Set([...st.selectedIds, o.id])];
+      st.selectedIds =
+        selected.has(o.id) && !e.shiftKey
+          ? st.selectedIds.filter((x) => x !== o.id)
+          : [...new Set([...st.selectedIds, o.id])];
       st.activeId = o.id;
     } else {
       st.selectedIds = [o.id];
@@ -108,14 +116,20 @@ export function Outliner({ session }: { session: ProjectSession }) {
           <span class={`name ${o.hide_viewport ? 'hidden' : ''}`}>{o.name}</span>
         )}
         {o.modifiers.length > 0 && <Icon name="wrench" size={12} style={{ opacity: 0.6 }} />}
-        {peerColor && <span class="peer-dot" style={{ background: peerColor }} title="Selected by another user" />}
+        {peerColor && (
+          <span class="peer-dot" style={{ background: peerColor }} title="Selected by another user" />
+        )}
         <span
           class="vis"
           title={o.hide_viewport ? 'Show in viewport' : 'Hide in viewport'}
           data-testid={`outliner-vis-${o.name}`}
           onClick={(e) => {
             e.stopPropagation();
-            run('data.set_property', { kind: 'objects', target: o.id, values: { hide_viewport: !o.hide_viewport } }, 'ui');
+            run(
+              'data.set_property',
+              { kind: 'objects', target: o.id, values: { hide_viewport: !o.hide_viewport } },
+              'ui',
+            );
           }}
         >
           <Icon name={o.hide_viewport ? 'eyeOff' : 'eye'} size={13} />
@@ -156,7 +170,11 @@ export function Outliner({ session }: { session: ProjectSession }) {
             class="vis"
             onClick={(e) => {
               e.stopPropagation();
-              run('data.set_property', { kind: 'collections', target: c.id, values: { hide_viewport: !c.hide_viewport } }, 'ui');
+              run(
+                'data.set_property',
+                { kind: 'collections', target: c.id, values: { hide_viewport: !c.hide_viewport } },
+                'ui',
+              );
             }}
           >
             <Icon name={c.hide_viewport ? 'eyeOff' : 'eye'} size={13} />
@@ -165,15 +183,26 @@ export function Outliner({ session }: { session: ProjectSession }) {
       </div>,
     );
     if (isCollapsed) return;
-    for (const child of collections.filter((x) => x.parent === c.id && x.id !== c.id)) renderCollection(child, depth + 1);
-    for (const o of byParent.get(null) ?? []) if (o.collection === c.id || (c.id === ROOT_COLLECTION_ID && !collections.some((x) => x.id === o.collection))) renderObject(o, depth + 1);
+    for (const child of collections.filter((x) => x.parent === c.id && x.id !== c.id))
+      renderCollection(child, depth + 1);
+    for (const o of byParent.get(null) ?? [])
+      if (
+        o.collection === c.id ||
+        (c.id === ROOT_COLLECTION_ID && !collections.some((x) => x.id === o.collection))
+      )
+        renderObject(o, depth + 1);
   };
   renderCollection(collections[0], 0);
 
   return (
     <div class="area-body" onPointerDown={(e) => e.stopPropagation()}>
       <div style={{ padding: '4px 6px' }}>
-        <input class="textfield" placeholder="Filter…" value={filter} onInput={(e) => setFilter((e.target as HTMLInputElement).value)} />
+        <input
+          class="textfield"
+          placeholder="Filter…"
+          value={filter}
+          onInput={(e) => setFilter((e.target as HTMLInputElement).value)}
+        />
       </div>
       <div data-testid="outliner">{rows}</div>
       {objects.length === 0 && <div class="empty-note">Empty scene — press Shift+A to add objects</div>}

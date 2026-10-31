@@ -98,7 +98,11 @@ export function defaultCamera(id: string, name: string): CameraData {
   };
 }
 
-export function defaultCollection(id: string, name: string, parent: string | null = ROOT_COLLECTION_ID): CollectionData {
+export function defaultCollection(
+  id: string,
+  name: string,
+  parent: string | null = ROOT_COLLECTION_ID,
+): CollectionData {
   return { id, name, parent, hide_viewport: false, hide_render: false, color_tag: 'NONE' };
 }
 

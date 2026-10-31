@@ -11,7 +11,11 @@ export function RenderTab({ s }: { s: ProjectSession }) {
       <div class="prop-context">Scene › Render</div>
       <Panel title="Render Engine">
         <Row label="Engine">
-          <SelectField value={r.engine} options={[{ value: 'RASTER', label: 'Rasterized (real-time)' }]} onChange={(v) => set('engine', v)} />
+          <SelectField
+            value={r.engine}
+            options={[{ value: 'RASTER', label: 'Rasterized (real-time)' }]}
+            onChange={(v) => set('engine', v)}
+          />
         </Row>
         <Row label="Samples">
           <NumberField value={r.samples} integer min={1} max={64} onChange={(v, f) => set('samples', v, f)} />
@@ -20,14 +24,22 @@ export function RenderTab({ s }: { s: ProjectSession }) {
           <Checkbox value={r.use_shadows} label="Shadows" onChange={(v) => set('use_shadows', v)} />
         </Row>
         <Row label="">
-          <button class="btn primary" onClick={() => run('render.render', {}, 'ui')} data-testid="render-button">
+          <button
+            class="btn primary"
+            onClick={() => run('render.render', {}, 'ui')}
+            data-testid="render-button"
+          >
             Render Image (F12)
           </button>
         </Row>
       </Panel>
       <Panel title="Film">
         <Row label="">
-          <Checkbox value={r.film_transparent} label="Transparent" onChange={(v) => set('film_transparent', v)} />
+          <Checkbox
+            value={r.film_transparent}
+            label="Transparent"
+            onChange={(v) => set('film_transparent', v)}
+          />
         </Row>
       </Panel>
       <Panel title="Color Management">
@@ -45,7 +57,13 @@ export function RenderTab({ s }: { s: ProjectSession }) {
           />
         </Row>
         <Row label="Exposure">
-          <NumberField value={r.exposure} min={-10} max={10} step={0.05} onChange={(v, f) => set('exposure', v, f)} />
+          <NumberField
+            value={r.exposure}
+            min={-10}
+            max={10}
+            step={0.05}
+            onChange={(v, f) => set('exposure', v, f)}
+          />
         </Row>
       </Panel>
     </>
@@ -60,13 +78,37 @@ export function OutputTab({ s }: { s: ProjectSession }) {
       <div class="prop-context">Scene › Output</div>
       <Panel title="Format">
         <Row label="Resolution X">
-          <NumberField value={r.resolution_x} integer min={4} max={16384} unit=" px" step={1} onChange={(v, f) => setProp(s, 'render', null, 'resolution_x', v, f)} />
+          <NumberField
+            value={r.resolution_x}
+            integer
+            min={4}
+            max={16384}
+            unit=" px"
+            step={1}
+            onChange={(v, f) => setProp(s, 'render', null, 'resolution_x', v, f)}
+          />
         </Row>
         <Row label="Y">
-          <NumberField value={r.resolution_y} integer min={4} max={16384} unit=" px" step={1} onChange={(v, f) => setProp(s, 'render', null, 'resolution_y', v, f)} />
+          <NumberField
+            value={r.resolution_y}
+            integer
+            min={4}
+            max={16384}
+            unit=" px"
+            step={1}
+            onChange={(v, f) => setProp(s, 'render', null, 'resolution_y', v, f)}
+          />
         </Row>
         <Row label="%">
-          <NumberField value={r.resolution_percentage} integer min={1} max={100} slider unit="%" onChange={(v, f) => setProp(s, 'render', null, 'resolution_percentage', v, f)} />
+          <NumberField
+            value={r.resolution_percentage}
+            integer
+            min={1}
+            max={100}
+            slider
+            unit="%"
+            onChange={(v, f) => setProp(s, 'render', null, 'resolution_percentage', v, f)}
+          />
         </Row>
         <Row label="Frame Rate">
           <SelectField
@@ -78,10 +120,20 @@ export function OutputTab({ s }: { s: ProjectSession }) {
       </Panel>
       <Panel title="Frame Range">
         <Row label="Frame Start">
-          <NumberField value={sc.frame_start} integer step={1} onChange={(v, f) => setProp(s, 'scene', null, 'frame_start', v, f)} />
+          <NumberField
+            value={sc.frame_start}
+            integer
+            step={1}
+            onChange={(v, f) => setProp(s, 'scene', null, 'frame_start', v, f)}
+          />
         </Row>
         <Row label="End">
-          <NumberField value={sc.frame_end} integer step={1} onChange={(v, f) => setProp(s, 'scene', null, 'frame_end', v, f)} />
+          <NumberField
+            value={sc.frame_end}
+            integer
+            step={1}
+            onChange={(v, f) => setProp(s, 'scene', null, 'frame_end', v, f)}
+          />
         </Row>
       </Panel>
     </>
@@ -117,7 +169,12 @@ export function SceneTab({ s }: { s: ProjectSession }) {
           />
         </Row>
         <Row label="Unit Scale">
-          <NumberField value={sc.unit_scale_length} min={0.0001} step={0.01} onChange={(v, f) => setProp(s, 'scene', null, 'unit_scale_length', v, f)} />
+          <NumberField
+            value={sc.unit_scale_length}
+            min={0.0001}
+            step={0.01}
+            onChange={(v, f) => setProp(s, 'scene', null, 'unit_scale_length', v, f)}
+          />
         </Row>
       </Panel>
       <Panel title="Project">
@@ -149,7 +206,13 @@ export function WorldTab({ s }: { s: ProjectSession }) {
           <ColorField value={w.color} testId="world-color" onChange={(v, f) => set('color', v, f)} />
         </Row>
         <Row label="Strength">
-          <NumberField value={w.strength} min={0} max={100} step={0.01} onChange={(v, f) => set('strength', v, f)} />
+          <NumberField
+            value={w.strength}
+            min={0}
+            max={100}
+            step={0.01}
+            onChange={(v, f) => set('strength', v, f)}
+          />
         </Row>
       </Panel>
       <Panel title="Environment Lighting">
@@ -164,13 +227,29 @@ export function WorldTab({ s }: { s: ProjectSession }) {
           />
         </Row>
         <Row label="Strength">
-          <NumberField value={w.environment_strength} min={0} max={20} step={0.01} onChange={(v, f) => set('environment_strength', v, f)} />
+          <NumberField
+            value={w.environment_strength}
+            min={0}
+            max={20}
+            step={0.01}
+            onChange={(v, f) => set('environment_strength', v, f)}
+          />
         </Row>
         <Row label="Rotation">
-          <NumberField value={w.environment_rotation} unit="°" step={1} {...RAD} onChange={(v, f) => set('environment_rotation', v, f)} />
+          <NumberField
+            value={w.environment_rotation}
+            unit="°"
+            step={1}
+            {...RAD}
+            onChange={(v, f) => set('environment_rotation', v, f)}
+          />
         </Row>
         <Row label="">
-          <Checkbox value={w.show_environment_background} label="Show as Background" onChange={(v) => set('show_environment_background', v)} />
+          <Checkbox
+            value={w.show_environment_background}
+            label="Show as Background"
+            onChange={(v) => set('show_environment_background', v)}
+          />
         </Row>
       </Panel>
     </>

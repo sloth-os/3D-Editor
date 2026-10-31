@@ -36,7 +36,17 @@ export class ViewportInteraction {
   readonly boxRect = signal<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   modal: ModalTransform | null = null;
   private stroke: BrushStroke | null = null;
-  private drag: { mode: DragMode; x: number; y: number; startX: number; startY: number; button: number; moved: boolean; shift: boolean; ctrl: boolean } | null = null;
+  private drag: {
+    mode: DragMode;
+    x: number;
+    y: number;
+    startX: number;
+    startY: number;
+    button: number;
+    moved: boolean;
+    shift: boolean;
+    ctrl: boolean;
+  } | null = null;
   private pointers = new Map<number, { x: number; y: number }>();
   private pinch: { dist: number; cx: number; cy: number } | null = null;
   readonly mouse = { x: 0, y: 0, inside: false };
@@ -65,7 +75,9 @@ export class ViewportInteraction {
     this.gizmo.setSize(0.9);
     engine.overlay.add(this.gizmoProxy);
     engine.overlay.add(this.gizmo.getHelper());
-    this.gizmo.addEventListener('dragging-changed', (e) => this.onGizmoDragging(!!(e as unknown as { value: boolean }).value));
+    this.gizmo.addEventListener('dragging-changed', (e) =>
+      this.onGizmoDragging(!!(e as unknown as { value: boolean }).value),
+    );
     this.gizmo.addEventListener('objectChange', () => this.onGizmoChange());
     this.gizmo.addEventListener('change', () => engine.requestRender());
     engine.onAfterRender.add(this.updateGizmo);
@@ -76,7 +88,11 @@ export class ViewportInteraction {
 
   private updateGizmo = () => {
     const tool = this.session.view.tool.value;
-    const modeMap: Record<string, 'translate' | 'rotate' | 'scale'> = { move: 'translate', rotate: 'rotate', scale: 'scale' };
+    const modeMap: Record<string, 'translate' | 'rotate' | 'scale'> = {
+      move: 'translate',
+      rotate: 'rotate',
+      scale: 'scale',
+    };
     const gmode = modeMap[tool];
     const st = this.session.state;
     const hasSel = st.mode === 'EDIT' ? st.meshSelection.verts.size > 0 : st.selectedIds.length > 0;
@@ -107,7 +123,8 @@ export class ViewportInteraction {
 
   private onGizmoDragging(dragging: boolean): void {
     if (dragging) {
-      const kind: ModalKind = this.gizmo.mode === 'translate' ? 'translate' : this.gizmo.mode === 'rotate' ? 'rotate' : 'resize';
+      const kind: ModalKind =
+        this.gizmo.mode === 'translate' ? 'translate' : this.gizmo.mode === 'rotate' ? 'rotate' : 'resize';
       const modal = new ModalTransform(this.engine, this.session, kind, { x: this.mouse.x, y: this.mouse.y });
       this.gizmoStart = { matrix: this.gizmoProxy.matrixWorld.clone(), modal };
       return;
@@ -118,7 +135,11 @@ export class ViewportInteraction {
     const res = g.modal.finish(true);
     if (res) {
       const p = res.params;
-      if (this.gizmo.mode === 'translate') p.value = this.gizmoProxy.position.clone().sub(new THREE.Vector3().setFromMatrixPosition(g.matrix)).toArray();
+      if (this.gizmo.mode === 'translate')
+        p.value = this.gizmoProxy.position
+          .clone()
+          .sub(new THREE.Vector3().setFromMatrixPosition(g.matrix))
+          .toArray();
       else if (this.gizmo.mode === 'rotate') {
         const q = this.gizmoProxy.quaternion.clone();
         const angle = 2 * Math.acos(Math.min(1, Math.abs(q.w)));
@@ -127,7 +148,8 @@ export class ViewportInteraction {
         p.value = angle;
         p.axis = axis;
       } else p.value = this.gizmoProxy.scale.toArray();
-      if (Math.abs(Number(p.value) || 0) > 0 || Array.isArray(p.value)) this.host.run(res.operator, p, 'toolbar');
+      if (Math.abs(Number(p.value) || 0) > 0 || Array.isArray(p.value))
+        this.host.run(res.operator, p, 'toolbar');
     }
     this.updateGizmo();
   }
@@ -198,7 +220,10 @@ export class ViewportInteraction {
       const kind: ModalKind = up === 'G' ? 'translate' : up === 'R' ? 'rotate' : 'resize';
       if (kind !== m.kind) {
         m.finish(false);
-        this.modal = new ModalTransform(this.engine, this.session, kind, { x: this.mouse.x, y: this.mouse.y });
+        this.modal = new ModalTransform(this.engine, this.session, kind, {
+          x: this.mouse.x,
+          y: this.mouse.y,
+        });
       }
       return true;
     }
@@ -241,7 +266,14 @@ export class ViewportInteraction {
     if (painting && brushPointer) {
       const o = st.activeId ? this.session.doc.getObject(st.activeId) : null;
       if (o?.type === 'MESH' && o.data) {
-        this.stroke = new BrushStroke(this.engine, this.session, o.id, o.data, st.mode === 'VERTEX_PAINT', e.ctrlKey);
+        this.stroke = new BrushStroke(
+          this.engine,
+          this.session,
+          o.id,
+          o.data,
+          st.mode === 'VERTEX_PAINT',
+          e.ctrlKey,
+        );
         this.stroke.move(p.x, p.y);
         this.el.setPointerCapture(e.pointerId);
         e.preventDefault();
@@ -256,7 +288,17 @@ export class ViewportInteraction {
       else this.host.openContextMenu(e.clientX, e.clientY);
       return;
     }
-    this.drag = { mode, x: p.x, y: p.y, startX: p.x, startY: p.y, button: e.button, moved: false, shift: e.shiftKey, ctrl: e.ctrlKey };
+    this.drag = {
+      mode,
+      x: p.x,
+      y: p.y,
+      startX: p.x,
+      startY: p.y,
+      button: e.button,
+      moved: false,
+      shift: e.shiftKey,
+      ctrl: e.ctrlKey,
+    };
     this.el.setPointerCapture(e.pointerId);
     e.preventDefault();
   };
@@ -297,7 +339,12 @@ export class ViewportInteraction {
     else if (d.mode === 'pan') this.pan(dx, dy);
     else if (d.mode === 'zoom') this.zoomBy(Math.pow(1.01, dy));
     else if (d.mode === 'box' && d.moved && this.session.view.tool.value !== 'cursor')
-      this.boxRect.value = { x0: Math.min(d.startX, p.x), y0: Math.min(d.startY, p.y), x1: Math.max(d.startX, p.x), y1: Math.max(d.startY, p.y) };
+      this.boxRect.value = {
+        x0: Math.min(d.startX, p.x),
+        y0: Math.min(d.startY, p.y),
+        x1: Math.max(d.startX, p.x),
+        y1: Math.max(d.startY, p.y),
+      };
   };
 
   private onPointerUp = (e: PointerEvent) => {
@@ -327,7 +374,8 @@ export class ViewportInteraction {
     if (!d) return;
     const p = this.local(e);
     if (d.mode === 'orbit' || d.mode === 'pan' || d.mode === 'zoom') {
-      if (d.mode === 'orbit' && !d.moved && e.pointerType === 'touch') this.clickSelect(p.x, p.y, false, false);
+      if (d.mode === 'orbit' && !d.moved && e.pointerType === 'touch')
+        this.clickSelect(p.x, p.y, false, false);
       this.engine.persistPose();
       return;
     }
@@ -407,7 +455,9 @@ export class ViewportInteraction {
 
   private placeCursor(x: number, y: number): void {
     const rc = this.engine.rayAt(x, y);
-    const hits = rc.intersectObjects(this.engine.objects.pickables(), false).filter((h) => !h.object.userData.pickProxy);
+    const hits = rc
+      .intersectObjects(this.engine.objects.pickables(), false)
+      .filter((h) => !h.object.userData.pickProxy);
     let pt: THREE.Vector3 | null = hits[0]?.point ?? null;
     if (!pt) pt = this.engine.viewPlanePoint(x, y, new THREE.Vector3(...this.session.state.cursorLocation));
     if (pt) this.host.run('view3d.cursor_set', { location: [pt.x, pt.y, pt.z] }, 'ui');
@@ -505,7 +555,8 @@ export class ViewportInteraction {
       if (subtract) st.selectedIds = st.selectedIds.filter((id) => !ids.includes(id));
       else {
         st.selectedIds = extend ? [...new Set([...st.selectedIds, ...ids])] : ids;
-        if (ids.length && (!st.activeId || !st.selectedIds.includes(st.activeId))) st.activeId = ids[ids.length - 1];
+        if (ids.length && (!st.activeId || !st.selectedIds.includes(st.activeId)))
+          st.activeId = ids[ids.length - 1];
       }
       return;
     }
@@ -567,7 +618,11 @@ export class ViewportInteraction {
 }
 
 /** Mesh produced by the last interactive brush stroke, consumed by `sculpt.commit_stroke`. */
-export let pendingStroke: { objectId: string; meshId: string; mesh: import('@3d-editor/core').MeshData } | null = null;
+export let pendingStroke: {
+  objectId: string;
+  meshId: string;
+  mesh: import('@3d-editor/core').MeshData;
+} | null = null;
 export function takePendingStroke() {
   const s = pendingStroke;
   pendingStroke = null;

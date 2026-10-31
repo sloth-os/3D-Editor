@@ -39,7 +39,12 @@ function png(w, h, rgba) {
     chunk('IEND', Buffer.alloc(0)),
   ]);
 }
-const hex = (s) => [parseInt(s.slice(1, 3), 16), parseInt(s.slice(3, 5), 16), parseInt(s.slice(5, 7), 16), 255];
+const hex = (s) => [
+  parseInt(s.slice(1, 3), 16),
+  parseInt(s.slice(3, 5), 16),
+  parseInt(s.slice(5, 7), 16),
+  255,
+];
 function inside(poly, x, y) {
   let c = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -60,9 +65,33 @@ function render(size, { maskable }) {
   const off = maskable ? (512 * (1 - scale)) / 2 : 0;
   const P = (pts) => pts.map(([x, y]) => [(x * scale + off) * s, (y * scale + off) * s]);
   const shapes = [
-    [P([[256, 88], [400, 171], [256, 254], [112, 171]]), hex('#f5a04a')],
-    [P([[112, 171], [256, 254], [256, 420], [112, 337]]), hex('#e87d0d')],
-    [P([[400, 171], [256, 254], [256, 420], [400, 337]]), hex('#b35f0a')],
+    [
+      P([
+        [256, 88],
+        [400, 171],
+        [256, 254],
+        [112, 171],
+      ]),
+      hex('#f5a04a'),
+    ],
+    [
+      P([
+        [112, 171],
+        [256, 254],
+        [256, 420],
+        [112, 337],
+      ]),
+      hex('#e87d0d'),
+    ],
+    [
+      P([
+        [400, 171],
+        [256, 254],
+        [256, 420],
+        [400, 337],
+      ]),
+      hex('#b35f0a'),
+    ],
   ];
   const bg = hex('#232323');
   const out = Buffer.alloc(size * size * 4);

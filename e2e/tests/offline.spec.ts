@@ -7,9 +7,13 @@ test.describe('offline PWA', () => {
     const page = await context.newPage();
     const id = await newProject(page);
     // manifest + service worker
-    const manifest = await page.evaluate(() => (document.querySelector('link[rel=manifest]') as HTMLLinkElement | null)?.href ?? null);
+    const manifest = await page.evaluate(
+      () => (document.querySelector('link[rel=manifest]') as HTMLLinkElement | null)?.href ?? null,
+    );
     expect(manifest).toContain('manifest.webmanifest');
-    await page.waitForFunction(async () => !!(await navigator.serviceWorker.ready).active, null, { timeout: 30_000 });
+    await page.waitForFunction(async () => !!(await navigator.serviceWorker.ready).active, null, {
+      timeout: 30_000,
+    });
     // make sure the SW controls the page (reload once)
     await page.reload();
     await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 30_000 });
@@ -27,7 +31,9 @@ test.describe('offline PWA', () => {
 
     // back online: the offline edit reaches the server and other devices
     await context.setOffline(false);
-    await expect(page.getByTestId('sync-status')).toHaveAttribute('data-status', 'connected', { timeout: 40_000 });
+    await expect(page.getByTestId('sync-status')).toHaveAttribute('data-status', 'connected', {
+      timeout: 40_000,
+    });
     const other = await (await browser.newContext()).newPage();
     await openProject(other, PLAIN, id);
     await expect(other.getByTestId('outliner-Icosphere')).toBeVisible();

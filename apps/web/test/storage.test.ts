@@ -27,7 +27,12 @@ describe('storage selection', () => {
   it('uses a custom WebDAV server when configured, and nothing in browser mode', () => {
     const p = defaultPreferences();
     p.storage.mode = 'webdav';
-    p.storage.webdav = { url: 'https://dav.example.com/files/me', username: 'u', password: 'p', basePath: '/proj' };
+    p.storage.webdav = {
+      url: 'https://dav.example.com/files/me',
+      username: 'u',
+      password: 'p',
+      basePath: '/proj',
+    };
     prefs.value = p;
     serverConfig.value = null;
     const t = resolveWebDAV()!;
@@ -40,8 +45,20 @@ describe('storage selection', () => {
 
 describe('local project index (IndexedDB)', () => {
   it('stores, lists and removes entries', async () => {
-    await localIndex.put({ id: 'a', name: 'A', created_at: '2026-01-01', updated_at: '2026-01-02', schema_version: 1 });
-    await localIndex.put({ id: 'b', name: 'B', created_at: '2026-01-01', updated_at: '2026-01-03', schema_version: 1 });
+    await localIndex.put({
+      id: 'a',
+      name: 'A',
+      created_at: '2026-01-01',
+      updated_at: '2026-01-02',
+      schema_version: 1,
+    });
+    await localIndex.put({
+      id: 'b',
+      name: 'B',
+      created_at: '2026-01-01',
+      updated_at: '2026-01-03',
+      schema_version: 1,
+    });
     const list = await localIndex.list();
     expect(list.map((p) => p.id)).toEqual(['b', 'a']);
     await localIndex.patch('a', { name: 'A2' });

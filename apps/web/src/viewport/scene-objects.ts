@@ -163,16 +163,24 @@ export class SceneObjects {
     const kind: ShadingKind = opts.shading === 'SOLID' || opts.shading === 'WIREFRAME' ? 'SOLID' : 'PBR';
     const hasColors = !!v.mesh.geometry.getAttribute('color');
     const slots = o.materials.length ? o.materials : [null];
-    const usedSlots = Math.max(slots.length, ...v.mesh.geometry.groups.map((g) => (g.materialIndex ?? 0) + 1));
+    const usedSlots = Math.max(
+      slots.length,
+      ...v.mesh.geometry.groups.map((g) => (g.materialIndex ?? 0) + 1),
+    );
     const mk =
       `${opts.xray ? 'x' : ''}|${o.data.color.join(',')}|` +
-      Array.from({ length: usedSlots }, (_, i) => materialKey(slots[i] ?? null, kind, hasColors, opts.imagesRevision)).join('#');
+      Array.from({ length: usedSlots }, (_, i) =>
+        materialKey(slots[i] ?? null, kind, hasColors, opts.imagesRevision),
+      ).join('#');
     if (v.matKey !== mk) {
       const old = v.mesh.material;
       if (Array.isArray(old)) old.forEach((m) => m.dispose());
       else old.dispose();
       const mats = Array.from({ length: usedSlots }, (_, i) => {
-        const m = buildMaterial(slots[i] ?? null, kind, doc, this.textures, { objectColor: o.data.color, vertexColors: hasColors });
+        const m = buildMaterial(slots[i] ?? null, kind, doc, this.textures, {
+          objectColor: o.data.color,
+          vertexColors: hasColors,
+        });
         if (opts.xray) {
           m.transparent = true;
           m.opacity = Math.min(m.opacity, 0.45);
@@ -184,11 +192,17 @@ export class SceneObjects {
       v.matKey = mk;
     }
     const isEdit = opts.editObjectId === o.id;
-    v.mesh.visible = opts.shading !== 'WIREFRAME' && o.data.display_type !== 'WIRE' && o.data.display_type !== 'BOUNDS';
+    v.mesh.visible =
+      opts.shading !== 'WIREFRAME' && o.data.display_type !== 'WIRE' && o.data.display_type !== 'BOUNDS';
     v.mesh.castShadow = opts.castShadows;
     v.mesh.receiveShadow = opts.castShadows;
     // wireframe overlay
-    const showWire = !isEdit && (opts.shading === 'WIREFRAME' || opts.showWireOverlay || o.data.show_wire || o.data.display_type === 'WIRE');
+    const showWire =
+      !isEdit &&
+      (opts.shading === 'WIREFRAME' ||
+        opts.showWireOverlay ||
+        o.data.show_wire ||
+        o.data.display_type === 'WIRE');
     if (showWire) {
       const wk = `${v.meshKey}`;
       if (!v.wire || v.wireKey !== wk) {
@@ -196,14 +210,25 @@ export class SceneObjects {
           v.overlayRoot.remove(v.wire);
           disposeObject(v.wire);
         }
-        v.wire = new THREE.LineSegments(wireGeometry(o.mesh), new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.6 }));
+        v.wire = new THREE.LineSegments(
+          wireGeometry(o.mesh),
+          new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.6 }),
+        );
         v.wire.userData.objectId = o.id;
         v.overlayRoot.add(v.wire);
         v.wireKey = wk;
       }
       const sel = opts.selected.has(o.id);
       const mat = v.wire.material as THREE.LineBasicMaterial;
-      mat.color.copy(o.id === opts.activeId ? COLORS.active : sel ? COLORS.selected : opts.shading === 'WIREFRAME' ? new THREE.Color(0xbbbbbb) : COLORS.wire);
+      mat.color.copy(
+        o.id === opts.activeId
+          ? COLORS.active
+          : sel
+            ? COLORS.selected
+            : opts.shading === 'WIREFRAME'
+              ? new THREE.Color(0xbbbbbb)
+              : COLORS.wire,
+      );
       mat.opacity = sel || opts.shading === 'WIREFRAME' ? 0.9 : 0.5;
       mat.depthTest = !opts.xray && opts.shading !== 'WIREFRAME';
       v.wire.visible = true;
@@ -234,7 +259,10 @@ export class SceneObjects {
       v.helperKey = key;
       // invisible pick proxy (raycasting lines is unreliable on touch devices)
       if (!v.pickProxy) {
-        v.pickProxy = new THREE.Mesh(new THREE.SphereGeometry(o.type === 'CAMERA' ? 0.6 : 0.3, 8, 6), new THREE.MeshBasicMaterial({ visible: false }));
+        v.pickProxy = new THREE.Mesh(
+          new THREE.SphereGeometry(o.type === 'CAMERA' ? 0.6 : 0.3, 8, 6),
+          new THREE.MeshBasicMaterial({ visible: false }),
+        );
         v.pickProxy.userData.objectId = o.id;
         v.pickProxy.userData.pickProxy = true;
         v.overlayRoot.add(v.pickProxy);

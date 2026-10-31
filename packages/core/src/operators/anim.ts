@@ -9,7 +9,11 @@ import { defineOperator, type OperatorRegistry } from './registry';
 import { selectedObjects } from './helpers';
 
 /** Reads the current stored datablock for an animation target. */
-export function readTarget(ctx: OperatorContext, type: AnimTargetType, id: string): Record<string, unknown> | null {
+export function readTarget(
+  ctx: OperatorContext,
+  type: AnimTargetType,
+  id: string,
+): Record<string, unknown> | null {
   const d = ctx.doc;
   switch (type) {
     case 'object':
@@ -40,11 +44,13 @@ export function keyProperty(
   if (!len) throw new OperatorError(`Property '${path}' of ${type} is not animatable`, 'INVALID_PARAMS');
   const target = readTarget(ctx, type, id);
   if (!target) throw new OperatorError(`${type} '${id}' not found`, 'NOT_FOUND');
-  const indices = opts.index !== undefined && opts.index >= 0 ? [opts.index] : Array.from({ length: len }, (_, i) => i);
+  const indices =
+    opts.index !== undefined && opts.index >= 0 ? [opts.index] : Array.from({ length: len }, (_, i) => i);
   let n = 0;
   for (const index of indices) {
     const key = fcurveKey({ target_type: type, target_id: id, path, index });
-    const fc: FCurve = ctx.doc.getFCurve(key) ?? createFCurve({ target_type: type, target_id: id, path, index });
+    const fc: FCurve =
+      ctx.doc.getFCurve(key) ?? createFCurve({ target_type: type, target_id: id, path, index });
     const value = opts.value ?? readChannel(target, path, index);
     if (value === undefined) continue;
     ctx.doc.setFCurve(insertKeyframe(fc, frame, value, opts.interpolation));
@@ -61,7 +67,8 @@ export function keyProperty(
  */
 export function autoKeyTransforms(ctx: OperatorContext, ids: string[]): void {
   for (const id of ids)
-    for (const path of ['location', 'rotation_euler', 'scale']) keyProperty(ctx, 'object', id, path, ctx.state.frame);
+    for (const path of ['location', 'rotation_euler', 'scale'])
+      keyProperty(ctx, 'object', id, path, ctx.state.frame);
 }
 
 /** Updates keyframes of channels that are already animated (keeps edits visible). */
@@ -77,7 +84,9 @@ export function rekeyAnimated(ctx: OperatorContext, type: AnimTargetType, id: st
   }
 }
 
-const keyingSet = z.enum(['LocRotScale', 'Location', 'Rotation', 'Scale', 'Available']).default('LocRotScale');
+const keyingSet = z
+  .enum(['LocRotScale', 'Location', 'Rotation', 'Scale', 'Available'])
+  .default('LocRotScale');
 
 function pathsFor(type: z.infer<typeof keyingSet>): string[] {
   switch (type) {
@@ -97,7 +106,8 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'anim.keyframe_insert',
       label: 'Insert Keyframe',
-      description: 'Insert keyframes on the selected objects for the given keying set at the current (or given) frame.',
+      description:
+        'Insert keyframes on the selected objects for the given keying set at the current (or given) frame.',
       category: 'Animation',
       schema: z.object({ type: keyingSet, frame: z.number().optional() }),
       poll: (ctx) => (selectedObjects(ctx).length ? true : 'No objects selected'),
@@ -147,7 +157,8 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
       schema: z.object({}),
       poll: (ctx) => (selectedObjects(ctx).length ? true : 'No objects selected'),
       execute(ctx) {
-        for (const o of selectedObjects(ctx)) for (const fc of ctx.doc.listFCurves(o.id)) ctx.doc.removeFCurve(fcurveKey(fc));
+        for (const o of selectedObjects(ctx))
+          for (const fc of ctx.doc.listFCurves(o.id)) ctx.doc.removeFCurve(fcurveKey(fc));
       },
     }),
   );
@@ -194,11 +205,17 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
       execute(ctx, p) {
         for (const o of selectedObjects(ctx))
           for (const fc of ctx.doc.listFCurves(o.id))
-            ctx.doc.setFCurve({ ...fc, keyframes: fc.keyframes.map((k) => ({ ...k, interpolation: p.type })) });
+            ctx.doc.setFCurve({
+              ...fc,
+              keyframes: fc.keyframes.map((k) => ({ ...k, interpolation: p.type })),
+            });
       },
     }),
   );
-  const keyRef = z.object({ fcurve: z.string().describe('F-curve key "<type>:<id>:<path>:<index>"'), frame: z.number() });
+  const keyRef = z.object({
+    fcurve: z.string().describe('F-curve key "<type>:<id>:<path>:<index>"'),
+    frame: z.number(),
+  });
   reg.register(
     defineOperator({
       id: 'anim.keyframes_move',
@@ -215,9 +232,13 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
           const fc = ctx.doc.getFCurve(key);
           if (!fc) continue;
           const sel = new Set(frames.map((f) => Math.round(f * 1000)));
-          const movedKeys = fc.keyframes.filter((k) => sel.has(Math.round(k.frame * 1000))).map((k) => ({ ...k, frame: k.frame + p.delta }));
+          const movedKeys = fc.keyframes
+            .filter((k) => sel.has(Math.round(k.frame * 1000)))
+            .map((k) => ({ ...k, frame: k.frame + p.delta }));
           const targets = new Set(movedKeys.map((k) => Math.round(k.frame * 1000)));
-          const rest = fc.keyframes.filter((k) => !sel.has(Math.round(k.frame * 1000)) && !targets.has(Math.round(k.frame * 1000)));
+          const rest = fc.keyframes.filter(
+            (k) => !sel.has(Math.round(k.frame * 1000)) && !targets.has(Math.round(k.frame * 1000)),
+          );
           moved += movedKeys.length;
           ctx.doc.setFCurve({ ...fc, keyframes: [...rest, ...movedKeys] });
         }

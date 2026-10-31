@@ -23,11 +23,17 @@ export function setupTelemetry(): void {
     },
   });
   window.addEventListener('error', (e) => {
-    telemetry.log('ERROR', e.message || 'error', { 'error.source': 'window.onerror', 'code.filepath': e.filename?.split('/').pop(), 'code.lineno': e.lineno });
+    telemetry.log('ERROR', e.message || 'error', {
+      'error.source': 'window.onerror',
+      'code.filepath': e.filename?.split('/').pop(),
+      'code.lineno': e.lineno,
+    });
   });
   window.addEventListener('unhandledrejection', (e) => {
     const r = e.reason;
-    telemetry.log('ERROR', r instanceof Error ? r.message : String(r), { 'error.source': 'unhandledrejection' });
+    telemetry.log('ERROR', r instanceof Error ? r.message : String(r), {
+      'error.source': 'unhandledrejection',
+    });
   });
   const vital = (name: string) => (m: { value: number; rating?: string }) =>
     telemetry.gauge(`web_vitals.${name}`, m.value, { rating: m.rating ?? 'unknown' });

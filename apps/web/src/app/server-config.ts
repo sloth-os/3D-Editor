@@ -31,7 +31,11 @@ export async function fetchServerConfig(timeoutMs = 3500): Promise<ServerConfig 
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(apiUrl('/api/config'), { signal: ctrl.signal, headers: authHeaders(), cache: 'no-store' });
+    const res = await fetch(apiUrl('/api/config'), {
+      signal: ctrl.signal,
+      headers: authHeaders(),
+      cache: 'no-store',
+    });
     if (!res.ok) return null;
     const json = (await res.json()) as ServerConfig;
     return json && typeof json === 'object' && json.features ? json : null;

@@ -7,9 +7,17 @@ test.describe('observability', () => {
     await menuPath(page, ['Add', 'Mesh', 'Cube']);
     await expect(page.getByTestId('outliner-Cube.001')).toBeVisible();
     // flush telemetry now instead of waiting for the batch interval
-    await page.evaluate(() => (window as unknown as { __editor: { telemetry: { flush(): Promise<void> } } }).__editor.telemetry.flush());
+    await page.evaluate(() =>
+      (
+        window as unknown as { __editor: { telemetry: { flush(): Promise<void> } } }
+      ).__editor.telemetry.flush(),
+    );
     await expect
-      .poll(async () => (await (await request.get(`${PLAIN}/metrics`)).text()).includes('mesh.primitive_cube_add'), { timeout: 20_000 })
+      .poll(
+        async () =>
+          (await (await request.get(`${PLAIN}/metrics`)).text()).includes('mesh.primitive_cube_add'),
+        { timeout: 20_000 },
+      )
       .toBe(true);
     const metrics = await (await request.get(`${PLAIN}/metrics`)).text();
     expect(metrics).toMatch(/editor_operator_executions_total\{[^}]*operator="mesh.primitive_cube_add"/);

@@ -81,16 +81,31 @@ function SyncStatus({ s }: { s: ProjectSession }) {
   const wd = s.webdav;
   const wdStatus = wd?.status.value;
   const dot = st === 'connected' ? 'ok' : st === 'connecting' ? 'warn' : 'off';
-  const label = st === 'connected' ? `Live · ${s.peers.value.length + 1} device(s)` : st === 'connecting' ? 'Connecting…' : st === 'offline' ? 'Offline' : 'Local only';
+  const label =
+    st === 'connected'
+      ? `Live · ${s.peers.value.length + 1} device(s)`
+      : st === 'connecting'
+        ? 'Connecting…'
+        : st === 'offline'
+          ? 'Offline'
+          : 'Local only';
   return (
     <>
       <span title="Real-time sync" data-testid="sync-status" data-status={st}>
         <span class={`dot ${dot}`} />
         {label}
-        {s.provider?.latencyMs.value != null && st === 'connected' ? ` · ${s.provider.latencyMs.value} ms` : ''}
+        {s.provider?.latencyMs.value != null && st === 'connected'
+          ? ` · ${s.provider.latencyMs.value} ms`
+          : ''}
       </span>
-      <span title={wd?.error.value ?? 'Storage'} data-testid="storage-status" data-status={wdStatus ?? 'browser'}>
-        <span class={`dot ${!wd ? 'ok' : wdStatus === 'synced' ? 'ok' : wdStatus === 'error' ? 'err' : 'warn'}`} />
+      <span
+        title={wd?.error.value ?? 'Storage'}
+        data-testid="storage-status"
+        data-status={wdStatus ?? 'browser'}
+      >
+        <span
+          class={`dot ${!wd ? 'ok' : wdStatus === 'synced' ? 'ok' : wdStatus === 'error' ? 'err' : 'warn'}`}
+        />
         {wd ? `WebDAV ${wdStatus}` : 'Saved in browser'}
       </span>
     </>
@@ -120,7 +135,9 @@ function StatusBar() {
         </>
       ) : (
         <span class="right">
-          <span>{serverConfig.value ? `Server v${serverConfig.value.version}` : 'Standalone (no server)'}</span>
+          <span>
+            {serverConfig.value ? `Server v${serverConfig.value.version}` : 'Standalone (no server)'}
+          </span>
           <span>v{__APP_VERSION__}</span>
         </span>
       )}
@@ -140,7 +157,12 @@ function Toasts() {
   );
 }
 
-function Area(p: { kind: 'outliner' | 'properties' | 'timeline' | 'console' | 'other'; style?: Record<string, string>; children: ComponentChildren; title?: ComponentChildren }) {
+function Area(p: {
+  kind: 'outliner' | 'properties' | 'timeline' | 'console' | 'other';
+  style?: Record<string, string>;
+  children: ComponentChildren;
+  title?: ComponentChildren;
+}) {
   return (
     <div class="area" style={p.style} onPointerEnter={() => (hoveredArea.value = p.kind)}>
       {p.title && <div class="area-header">{p.title}</div>}
@@ -166,7 +188,12 @@ function BottomArea({ s, initial }: { s: ProjectSession; initial: BottomEditor }
     <div class="column" style={{ height: '100%' }}>
       <div class="area-header" style={{ height: '24px' }}>
         {tabs.map((t) => (
-          <button key={t.id} class={`menu-button ${ed === t.id ? 'open' : ''}`} data-testid={`bottom-tab-${t.id}`} onClick={() => setEd(t.id)}>
+          <button
+            key={t.id}
+            class={`menu-button ${ed === t.id ? 'open' : ''}`}
+            data-testid={`bottom-tab-${t.id}`}
+            onClick={() => setEd(t.id)}
+          >
             {t.label}
           </button>
         ))}
@@ -190,7 +217,8 @@ function Editor({ s }: { s: ProjectSession }) {
   const [rightW, setRightW] = usePersistentSize('right', 330);
   const [outlinerH, setOutlinerH] = usePersistentSize('outliner', 230);
   const [bottomH, setBottomH] = usePersistentSize('bottom', 150);
-  const bottomEditor: BottomEditor = ws === 'Scripting' ? 'console' : ws === 'Animation' ? 'dopesheet' : ws === 'Shading' ? 'uv' : 'timeline';
+  const bottomEditor: BottomEditor =
+    ws === 'Scripting' ? 'console' : ws === 'Animation' ? 'dopesheet' : ws === 'Shading' ? 'uv' : 'timeline';
   const showBottom = true;
   const bottom = ws === 'Animation' || ws === 'Scripting' ? Math.max(bottomH, 260) : bottomH;
   return (
@@ -199,14 +227,23 @@ function Editor({ s }: { s: ProjectSession }) {
         <Viewport session={s} />
         {showBottom && (
           <>
-            <Splitter dir="h" onDrag={(d) => setBottomH(Math.max(60, Math.min(window.innerHeight - 200, bottomH - d)))} />
-            <Area kind={bottomEditor === 'console' ? 'console' : 'timeline'} style={{ height: `${bottom}px`, flex: 'none' }}>
+            <Splitter
+              dir="h"
+              onDrag={(d) => setBottomH(Math.max(60, Math.min(window.innerHeight - 200, bottomH - d)))}
+            />
+            <Area
+              kind={bottomEditor === 'console' ? 'console' : 'timeline'}
+              style={{ height: `${bottom}px`, flex: 'none' }}
+            >
               <BottomArea s={s} initial={bottomEditor} />
             </Area>
           </>
         )}
       </div>
-      <Splitter dir="v" onDrag={(d) => setRightW(Math.max(220, Math.min(window.innerWidth - 300, rightW - d)))} />
+      <Splitter
+        dir="v"
+        onDrag={(d) => setRightW(Math.max(220, Math.min(window.innerWidth - 300, rightW - d)))}
+      />
       <div class="column hide-mobile" style={{ width: `${rightW}px`, flex: 'none' }}>
         <Area
           kind="outliner"
@@ -215,13 +252,20 @@ function Editor({ s }: { s: ProjectSession }) {
             <>
               <span>Outliner</span>
               <span style={{ marginLeft: 'auto', display: 'flex', gap: '2px' }}>
-                <button class="btn flat icon" title="New collection" data-testid="new-collection" onClick={() => run('collection.create', { name: 'Collection' }, 'ui')}>
+                <button
+                  class="btn flat icon"
+                  title="New collection"
+                  data-testid="new-collection"
+                  onClick={() => run('collection.create', { name: 'Collection' }, 'ui')}
+                >
                   <Icon name="collection" size={13} />
                 </button>
                 <button
                   class="btn flat icon"
                   title="Move selection to a new collection (M)"
-                  onClick={() => run('object.move_to_collection', { new_collection_name: 'Collection' }, 'ui')}
+                  onClick={() =>
+                    run('object.move_to_collection', { new_collection_name: 'Collection' }, 'ui')
+                  }
                 >
                   <Icon name="plus" size={13} />
                 </button>
@@ -231,7 +275,10 @@ function Editor({ s }: { s: ProjectSession }) {
         >
           <Outliner session={s} />
         </Area>
-        <Splitter dir="h" onDrag={(d) => setOutlinerH(Math.max(80, Math.min(window.innerHeight - 200, outlinerH + d)))} />
+        <Splitter
+          dir="h"
+          onDrag={(d) => setOutlinerH(Math.max(80, Math.min(window.innerHeight - 200, outlinerH + d)))}
+        />
         <Area kind="properties" style={{ flex: '1' }}>
           <Properties session={s} />
         </Area>
@@ -247,12 +294,23 @@ function Welcome() {
         <h1>
           <img src="/icons/icon.svg" width={32} height={32} alt="" /> 3D Editor
         </h1>
-        <div class="tagline">Model, animate and render in the browser — works offline, saves to your browser or WebDAV, and syncs live across devices.</div>
+        <div class="tagline">
+          Model, animate and render in the browser — works offline, saves to your browser or WebDAV, and syncs
+          live across devices.
+        </div>
         <div class="actions">
-          <button class="btn primary" data-testid="new-project" onClick={() => void createProject('Untitled')}>
+          <button
+            class="btn primary"
+            data-testid="new-project"
+            onClick={() => void createProject('Untitled')}
+          >
             <Icon name="plus" size={12} /> New Project
           </button>
-          <button class="btn" data-testid="new-empty-project" onClick={() => void createProject('Untitled', { empty: true })}>
+          <button
+            class="btn"
+            data-testid="new-empty-project"
+            onClick={() => void createProject('Untitled', { empty: true })}
+          >
             New Empty Project
           </button>
           <button class="btn" onClick={() => openDialog('preferences')} data-testid="open-preferences">
@@ -281,7 +339,11 @@ export function App() {
         {s && (
           <div class="workspace-tabs">
             {WORKSPACES.map((w) => (
-              <button key={w} class={ws === w ? 'active' : ''} onClick={() => run('screen.workspace_set', { name: w }, 'ui')}>
+              <button
+                key={w}
+                class={ws === w ? 'active' : ''}
+                onClick={() => run('screen.workspace_set', { name: w }, 'ui')}
+              >
                 {w}
               </button>
             ))}
@@ -302,7 +364,12 @@ export function App() {
             <button class="btn flat icon" title="Copy share link" onClick={() => run('wm.share', {}, 'ui')}>
               <Icon name="share" />
             </button>
-            <button class="btn flat icon" title="Projects" data-testid="open-projects" onClick={() => openDialog('projects')}>
+            <button
+              class="btn flat icon"
+              title="Projects"
+              data-testid="open-projects"
+              onClick={() => openDialog('projects')}
+            >
               <Icon name="menu" />
             </button>
           </>

@@ -54,10 +54,11 @@ export function encodeMesh(m: MeshData): Uint8Array {
   }
   for (let i = 0; i < V * 3; i++, o += 4) dv.setFloat32(o, m.positions[i], true);
   for (let f = 0; f < F; f++, o += 4) dv.setUint32(o, m.faces[f].length, true);
-  for (const face of m.faces) for (const v of face) {
-    dv.setUint32(o, v, true);
-    o += 4;
-  }
+  for (const face of m.faces)
+    for (const v of face) {
+      dv.setUint32(o, v, true);
+      o += 4;
+    }
   for (let f = 0; f < F; f++, o += 2) dv.setUint16(o, m.faceMaterials[f] ?? 0, true);
   for (let f = 0; f < F; f++, o += 1) dv.setUint8(o, m.faceSmooth[f] ? 1 : 0);
   if (hasUV && m.uvs) {

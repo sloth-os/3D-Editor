@@ -1,13 +1,6 @@
 import { z } from 'zod';
 import type { Mat4, Vec3 } from '../math/types';
-import {
-  axisAngle4,
-  invert4,
-  multiply4,
-  rotationFromEuler,
-  scaling4,
-  translation4,
-} from '../math/mat4';
+import { axisAngle4, invert4, multiply4, rotationFromEuler, scaling4, translation4 } from '../math/mat4';
 import { normalize3, transformDirection3, transformPoint3 } from '../math/vec3';
 import type { SceneDoc } from '../doc/scene-doc';
 import type { MeshData } from '../mesh/types';
@@ -25,7 +18,11 @@ import { autoKeyTransforms } from './anim';
  */
 
 /** World-space pivot for the current selection according to the pivot point setting. */
-export function selectionPivot(doc: SceneDoc, state: EditorState, pivot: PivotPoint = state.pivotPoint): Vec3 {
+export function selectionPivot(
+  doc: SceneDoc,
+  state: EditorState,
+  pivot: PivotPoint = state.pivotPoint,
+): Vec3 {
   if (pivot === 'CURSOR') return [...state.cursorLocation] as Vec3;
   if (state.mode === 'EDIT' && state.activeId) {
     const o = doc.getObject(state.activeId);
@@ -34,7 +31,9 @@ export function selectionPivot(doc: SceneDoc, state: EditorState, pivot: PivotPo
     const mw = doc.worldMatrix(o.id);
     const verts = [...selectedVertexSet(mesh, state.meshSelection)].filter((v) => v < vertexCount(mesh));
     if (verts.length === 0) return transformPoint3(mw, [0, 0, 0]);
-    const pts = verts.map((v) => transformPoint3(mw, [mesh.positions[v * 3], mesh.positions[v * 3 + 1], mesh.positions[v * 3 + 2]]));
+    const pts = verts.map((v) =>
+      transformPoint3(mw, [mesh.positions[v * 3], mesh.positions[v * 3 + 1], mesh.positions[v * 3 + 2]]),
+    );
     return centerOf(pts, pivot === 'BOUNDING_BOX_CENTER');
   }
   const ids = state.selectedIds.filter((id) => doc.getObject(id));
@@ -278,10 +277,12 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
       poll: pollTransform,
       execute(ctx, p) {
         const base: Vec3 = p.orient_axis === 'X' ? [1, 0, 0] : p.orient_axis === 'Y' ? [0, 1, 0] : [0, 0, 1];
-        let axis = p.orient_type === 'LOCAL' ? normalize3(transformDirection3(orientAxes(ctx, 'LOCAL'), base)) : base;
+        let axis =
+          p.orient_type === 'LOCAL' ? normalize3(transformDirection3(orientAxes(ctx, 'LOCAL'), base)) : base;
         if (p.axis) {
           axis = normalize3(p.axis as Vec3);
-          if (axis[0] === 0 && axis[1] === 0 && axis[2] === 0) throw new OperatorError('Rotation axis must not be zero', 'INVALID_PARAMS');
+          if (axis[0] === 0 && axis[1] === 0 && axis[2] === 0)
+            throw new OperatorError('Rotation axis must not be zero', 'INVALID_PARAMS');
         }
         transformSelection(ctx, axisAngle4(axis, p.value), p.center as Vec3 | undefined);
       },

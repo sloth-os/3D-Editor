@@ -22,14 +22,22 @@ const OBJECT_REF_KEYS = new Set(['object', 'mirror_object', 'offset_object', 'ta
 const ANGLE_KEYS = /angle|rotation|spot_size/;
 
 function humanize(k: string): string {
-  return k.replace(/^use_/, '').replace(/_/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
+  return k
+    .replace(/^use_/, '')
+    .replace(/_/g, ' ')
+    .replace(/^\w/, (c) => c.toUpperCase());
 }
 
 function unwrap(s: JsonSchema): JsonSchema {
   const alt = s.anyOf ?? s.oneOf;
   if (alt) {
     const nonNull = alt.find((a) => a.type !== 'null');
-    if (nonNull) return { ...nonNull, default: s.default ?? nonNull.default, description: s.description ?? nonNull.description };
+    if (nonNull)
+      return {
+        ...nonNull,
+        default: s.default ?? nonNull.default,
+        description: s.description ?? nonNull.description,
+      };
   }
   return s;
 }
@@ -63,7 +71,10 @@ export function SchemaForm(p: {
               <SelectField
                 value={(value as string) ?? ''}
                 testId={tid}
-                options={[{ value: '', label: '— none —' }, ...objs.map((o) => ({ value: o.id, label: o.name }))]}
+                options={[
+                  { value: '', label: '— none —' },
+                  ...objs.map((o) => ({ value: o.id, label: o.name })),
+                ]}
                 onChange={(v) => p.onChange(key, v || null, true)}
               />
             </Row>
@@ -85,7 +96,12 @@ export function SchemaForm(p: {
         if (type === 'boolean') {
           return (
             <Row key={key} label="">
-              <Checkbox value={!!value} label={label} testId={tid} onChange={(v) => p.onChange(key, v, true)} />
+              <Checkbox
+                value={!!value}
+                label={label}
+                testId={tid}
+                onChange={(v) => p.onChange(key, v, true)}
+              />
             </Row>
           );
         }
@@ -151,7 +167,11 @@ export function SchemaForm(p: {
         if (type === 'string') {
           return (
             <Row key={key} label={label}>
-              <TextField value={String(value ?? '')} testId={tid} onChange={(v) => p.onChange(key, v, true)} />
+              <TextField
+                value={String(value ?? '')}
+                testId={tid}
+                onChange={(v) => p.onChange(key, v, true)}
+              />
             </Row>
           );
         }

@@ -8,7 +8,8 @@ import type { Easing, FCurve, Interpolation, Keyframe } from '../doc/types';
 
 function sortedKeys(fc: FCurve): Keyframe[] {
   const k = fc.keyframes;
-  for (let i = 1; i < k.length; i++) if (k[i].frame < k[i - 1].frame) return [...k].sort((a, b) => a.frame - b.frame);
+  for (let i = 1; i < k.length; i++)
+    if (k[i].frame < k[i - 1].frame) return [...k].sort((a, b) => a.frame - b.frame);
   return k;
 }
 
@@ -21,7 +22,8 @@ function autoSlope(keys: Keyframe[], i: number): number {
   if (!prev) return 0;
   if (!next) return 0;
   // Clamp: local extremum or plateau → flat
-  if ((k.value >= prev.value && k.value >= next.value) || (k.value <= prev.value && k.value <= next.value)) return 0;
+  if ((k.value >= prev.value && k.value >= next.value) || (k.value <= prev.value && k.value <= next.value))
+    return 0;
   return (next.value - prev.value) / (next.frame - prev.frame);
 }
 
@@ -119,10 +121,20 @@ export function evaluateFCurve(fc: FCurve, frame: number): number | undefined {
 }
 
 /** Inserts or replaces a keyframe (keys within 0.001 frames are considered the same). */
-export function insertKeyframe(fc: FCurve, frame: number, value: number, interpolation: Interpolation = 'BEZIER'): FCurve {
+export function insertKeyframe(
+  fc: FCurve,
+  frame: number,
+  value: number,
+  interpolation: Interpolation = 'BEZIER',
+): FCurve {
   const keys = fc.keyframes.filter((k) => Math.abs(k.frame - frame) > 1e-3);
   const existing = fc.keyframes.find((k) => Math.abs(k.frame - frame) <= 1e-3);
-  keys.push({ frame, value, interpolation: existing?.interpolation ?? interpolation, easing: existing?.easing });
+  keys.push({
+    frame,
+    value,
+    interpolation: existing?.interpolation ?? interpolation,
+    easing: existing?.easing,
+  });
   keys.sort((x, y) => x.frame - y.frame);
   return { ...fc, keyframes: keys };
 }

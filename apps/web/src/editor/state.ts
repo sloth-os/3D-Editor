@@ -114,7 +114,18 @@ export class EditorStateSignals implements EditorState {
 }
 
 export type ShadingMode = 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED';
-export type ToolId = 'select' | 'cursor' | 'move' | 'rotate' | 'scale' | 'sculpt_draw' | 'sculpt_smooth' | 'sculpt_grab' | 'sculpt_inflate' | 'sculpt_flatten' | 'paint';
+export type ToolId =
+  | 'select'
+  | 'cursor'
+  | 'move'
+  | 'rotate'
+  | 'scale'
+  | 'sculpt_draw'
+  | 'sculpt_smooth'
+  | 'sculpt_grab'
+  | 'sculpt_inflate'
+  | 'sculpt_flatten'
+  | 'paint';
 
 /** Per-session viewport/UI state (local only). */
 export class ViewState {
@@ -135,7 +146,12 @@ export class ViewState {
   readonly ortho = signal(false);
   /** Id of the awareness client whose view we follow, or null. */
   readonly following = signal<number | null>(null);
-  readonly brush = signal({ radius: 50, strength: 0.5, color: [1, 0.2, 0.2, 1] as [number, number, number, number], symmetryX: false });
+  readonly brush = signal({
+    radius: 50,
+    strength: 0.5,
+    color: [1, 0.2, 0.2, 1] as [number, number, number, number],
+    symmetryX: false,
+  });
   /** Status text shown in the viewport header during modal operations. */
   readonly hud = signal<string | null>(null);
   readonly viewLabel = signal('User Perspective');
