@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { AnimTargetType, FCurve, Interpolation } from '../doc/types';
 import { fcurveKey } from '../doc/scene-doc';
 import { createFCurve, evaluateFCurve, hasKeyframeAt, insertKeyframe, removeKeyframe } from '../anim/fcurve';
-import { ANIMATABLE, readChannel } from '../anim/properties';
+import { isAnimatable, propertyLength, readChannel } from '../anim/properties';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
@@ -28,6 +28,12 @@ export function readTarget(
       return d.getWorld() as unknown as Record<string, unknown>;
     case 'scene':
       return d.getScene() as unknown as Record<string, unknown>;
+    case 'mesh':
+      return d.getMeshBlock(id)
+        ? ({ shape_keys: d.getShapeKeys(id) } as unknown as Record<string, unknown>)
+        : null;
+    case 'curve':
+      return d.getCurve(id) as unknown as Record<string, unknown> | null;
   }
 }
 
@@ -40,10 +46,13 @@ export function keyProperty(
   frame: number,
   opts: { index?: number; value?: number; interpolation?: Interpolation } = {},
 ): number {
-  const len = ANIMATABLE[type]?.[path];
-  if (!len) throw new OperatorError(`Property '${path}' of ${type} is not animatable`, 'INVALID_PARAMS');
+  if (!isAnimatable(type, path))
+    throw new OperatorError(`Property '${path}' of ${type} is not animatable`, 'INVALID_PARAMS');
   const target = readTarget(ctx, type, id);
   if (!target) throw new OperatorError(`${type} '${id}' not found`, 'NOT_FOUND');
+  const len = propertyLength(type, path, target);
+  if (!len || (readChannel(target, path, 0) === undefined && opts.value === undefined))
+    throw new OperatorError(`Property '${path}' does not exist on this ${type}`, 'INVALID_PARAMS');
   const indices =
     opts.index !== undefined && opts.index >= 0 ? [opts.index] : Array.from({ length: len }, (_, i) => i);
   let n = 0;

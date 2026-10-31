@@ -1,4 +1,5 @@
 import type { Easing, FCurve, Interpolation, Keyframe } from '../doc/types';
+import { applyFModifiers } from './fmodifiers';
 
 /*
  * Animation curve evaluation. Bezier segments use automatically computed, clamped handles
@@ -60,10 +61,24 @@ function easeValue(t: number, easing: Easing | undefined): number {
   }
 }
 
-/** Evaluates a curve at a (possibly fractional) frame. Returns undefined for empty curves. */
+/**
+ * Evaluates a curve at a (possibly fractional) frame: keyframes, extrapolation (CYCLIC repeats
+ * the keyed range) and F-curve modifiers. Returns undefined for curves without keyframes.
+ */
 export function evaluateFCurve(fc: FCurve, frame: number): number | undefined {
   const keys = sortedKeys(fc);
   if (keys.length === 0) return undefined;
+  let f = frame;
+  if (fc.extrapolation === 'CYCLIC' && keys.length > 1) {
+    const a = keys[0].frame;
+    const span = keys[keys.length - 1].frame - a;
+    if (span > 0 && (f < a || f > a + span)) f = a + ((((f - a) % span) + span) % span);
+  }
+  const v = evaluateKeys(fc, keys, f);
+  return fc.modifiers?.length ? applyFModifiers(fc.modifiers, frame, v) : v;
+}
+
+function evaluateKeys(fc: FCurve, keys: Keyframe[], frame: number): number {
   const first = keys[0];
   const last = keys[keys.length - 1];
   if (frame <= first.frame) {

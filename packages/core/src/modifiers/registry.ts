@@ -1,7 +1,9 @@
 import type { z } from 'zod';
 import type { Mat4 } from '../math/types';
 import type { MeshData } from '../mesh/types';
-import type { ModifierData } from '../doc/types';
+import type { ModifierData, VertexGroupData } from '../doc/types';
+import type { ArmaturePose } from '../armature/types';
+import type { CurvePath } from '../curve/path';
 
 /** Context available to modifiers during stack evaluation. */
 export interface ModifierContext {
@@ -23,6 +25,12 @@ export interface ModifierContext {
   forRender: boolean;
   /** True when the owning object is in edit mode. */
   editMode: boolean;
+  /** Optional: evaluated pose and world matrix of an armature object (Armature modifier). */
+  getArmature?(id: string): { pose: ArmaturePose; matrix: Mat4 } | null;
+  /** Optional: path (curve object space) and world matrix of a curve object (Curve modifier). */
+  getCurvePath?(id: string): { path: CurvePath; matrix: Mat4 } | null;
+  /** Vertex groups of the owner's mesh; only meaningful while the vertex count is unchanged. */
+  vertexGroups?: readonly VertexGroupData[];
 }
 
 export type ModifierCategory = 'GENERATE' | 'DEFORM' | 'NORMALS' | 'EDIT';

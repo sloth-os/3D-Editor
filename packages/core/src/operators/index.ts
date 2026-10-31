@@ -9,6 +9,15 @@ import { registerMeshEditOperators } from './mesh-edit';
 import { registerModifierOperators } from './modifier';
 import { registerIOOperators } from './io';
 import { registerSculptOperators } from './sculpt';
+import { registerCurveOperators } from './curve';
+import { registerConstraintOperators } from './constraint';
+import { registerInstancingOperators } from './instancing';
+import { registerArmatureOperators } from './armature';
+import { registerShadingOperators } from './shading';
+import { registerGenerateOperators } from './generate';
+import { registerSceneToolsOperators } from './scene-tools';
+import { registerPhysicsOperators } from './physics';
+import { registerDriverOperators } from './driver';
 
 export * from './context';
 export * from './registry';
@@ -30,5 +39,14 @@ export function createOperatorRegistry(): OperatorRegistry {
   registerModifierOperators(reg);
   registerIOOperators(reg);
   registerSculptOperators(reg);
+  registerCurveOperators(reg);
+  registerConstraintOperators(reg);
+  registerInstancingOperators(reg);
+  registerArmatureOperators(reg);
+  registerShadingOperators(reg);
+  registerGenerateOperators(reg);
+  registerSceneToolsOperators(reg);
+  registerPhysicsOperators(reg);
+  registerDriverOperators(reg);
   return reg;
 }

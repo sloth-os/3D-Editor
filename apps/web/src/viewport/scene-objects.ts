@@ -10,7 +10,7 @@ import {
   type SceneDoc,
 } from '@3d-editor/core';
 import { buildMaterial, materialKey, TextureCache, type ShadingKind } from './materials';
-import { cameraLines, emptyLines, lightLines, linesObject } from './helpers';
+import { boneLines, cameraLines, emptyLines, lightLines, linesObject } from './helpers';
 
 /** three.js representation of one document object. */
 export interface ObjectView {
@@ -92,6 +92,8 @@ export interface SyncOptions {
 /** Keeps three.js objects in sync with an evaluated scene (incremental, cached by keys). */
 export class SceneObjects {
   readonly views = new Map<string, ObjectView>();
+  /** Instanced meshes keyed by `${ownerId}|${sourceId}`. */
+  private readonly instanced = new Map<string, THREE.InstancedMesh>();
   readonly textures: TextureCache;
 
   constructor(
@@ -123,8 +125,10 @@ export class SceneObjects {
       v.overlayRoot.matrixWorldNeedsUpdate = true;
       v.root.visible = o.visible;
       v.overlayRoot.visible = o.visible;
-      if (o.type === 'MESH') this.syncMesh(doc, v, o, opts);
-      else this.syncHelper(v, o, opts);
+      // Meshes, and curves/text with a surface, draw geometry; everything else draws helpers.
+      if (o.mesh) this.syncMesh(doc, v, o, opts);
+      else this.clearMesh(v);
+      if (o.type !== 'MESH') this.syncHelper(v, o, opts);
       if (o.type === 'LIGHT' && o.light) this.syncLight(v, o.light, opts);
       else if (v.light) {
         v.root.remove(v.light);
@@ -140,6 +144,73 @@ export class SceneObjects {
       disposeObject(v.root);
       disposeObject(v.overlayRoot);
       this.views.delete(id);
+    }
+    this.syncInstances(ev, opts);
+  }
+
+  /** Collection/particle instances: one InstancedMesh per (owner, source) sharing the source's buffers. */
+  private syncInstances(ev: EvaluatedScene, opts: SyncOptions): void {
+    const groups = new Map<string, { owner: string; source: string; matrices: number[][] }>();
+    for (const inst of ev.instances) {
+      const key = `${inst.ownerId}|${inst.sourceId}`;
+      let g = groups.get(key);
+      if (!g) groups.set(key, (g = { owner: inst.ownerId, source: inst.sourceId, matrices: [] }));
+      g.matrices.push(inst.matrix);
+    }
+    const tmp = new THREE.Matrix4();
+    for (const [key, g] of groups) {
+      const src = this.views.get(g.source)?.mesh;
+      const owner = ev.byId.get(g.owner);
+      let im = this.instanced.get(key);
+      if (!src || !owner) {
+        if (im) im.visible = false;
+        continue;
+      }
+      if (!im || im.instanceMatrix.count < g.matrices.length) {
+        if (im) {
+          this.scene.remove(im);
+          im.dispose();
+        }
+        im = new THREE.InstancedMesh(src.geometry, src.material, Math.max(16, g.matrices.length));
+        im.userData.objectId = g.owner;
+        im.userData.instanceOf = g.source;
+        im.frustumCulled = false;
+        this.scene.add(im);
+        this.instanced.set(key, im);
+      }
+      im.geometry = src.geometry;
+      im.material = src.material;
+      im.count = g.matrices.length;
+      g.matrices.forEach((m, i) => im.setMatrixAt(i, tmp.fromArray(m)));
+      im.instanceMatrix.needsUpdate = true;
+      im.computeBoundingSphere();
+      im.visible = owner.visible && src.visible;
+      im.castShadow = opts.castShadows;
+      im.receiveShadow = opts.castShadows;
+    }
+    for (const [key, im] of this.instanced) {
+      if (groups.has(key)) continue;
+      // geometry and material belong to the source object's view
+      this.scene.remove(im);
+      im.dispose();
+      this.instanced.delete(key);
+    }
+  }
+
+  private clearMesh(v: ObjectView): void {
+    if (v.mesh) {
+      v.root.remove(v.mesh);
+      disposeObject(v.mesh);
+      v.mesh = undefined;
+      v.meshKey = undefined;
+      v.matKey = undefined;
+      v.triFace = undefined;
+    }
+    if (v.wire) {
+      v.overlayRoot.remove(v.wire);
+      disposeObject(v.wire);
+      v.wire = undefined;
+      v.wireKey = undefined;
     }
   }
 
@@ -247,6 +318,26 @@ export class SceneObjects {
     } else if (o.type === 'CAMERA' && o.camera) {
       key = `C${JSON.stringify(o.camera)}${opts.renderAspect.toFixed(4)}`;
       if (v.helperKey !== key) positions = cameraLines(o.camera, opts.renderAspect, 1);
+    } else if ((o.type === 'CURVE' || o.type === 'FONT') && o.lines && !o.mesh) {
+      key = `K${o.linesKey ?? ''}`;
+      if (v.helperKey !== key) positions = Array.from(o.lines);
+    } else if (o.type === 'ARMATURE' && o.pose) {
+      const pose = o.pose;
+      key = `A${pose.order
+        .map((n) =>
+          pose.bones
+            .get(n)!
+            .matrix.map((x) => x.toFixed(4))
+            .join(','),
+        )
+        .join('|')}`;
+      if (v.helperKey !== key) positions = boneLines(pose);
+    }
+    if (!key && v.helper) {
+      v.overlayRoot.remove(v.helper);
+      disposeObject(v.helper);
+      v.helper = undefined;
+      v.helperKey = undefined;
     }
     if (positions) {
       if (v.helper) {
@@ -356,10 +447,16 @@ export class SceneObjects {
       else if (v.wire?.visible) out.push(v.wire);
       if (v.pickProxy) out.push(v.pickProxy);
     }
+    for (const im of this.instanced.values()) if (im.visible) out.push(im);
     return out;
   }
 
   dispose(): void {
+    for (const im of this.instanced.values()) {
+      this.scene.remove(im);
+      im.dispose();
+    }
+    this.instanced.clear();
     for (const v of this.views.values()) {
       disposeObject(v.root);
       disposeObject(v.overlayRoot);

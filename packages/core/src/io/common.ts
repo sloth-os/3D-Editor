@@ -45,7 +45,7 @@ export function collectExport(doc: SceneDoc, opts: ExportOptions): ExportCollect
   } else picked = scene.objects.filter((o) => o.renderVisible);
   const items = picked.map((ev) => ({
     ev,
-    mesh: ev.type === 'MESH' ? ((apply ? ev.mesh : ev.baseMesh) ?? null) : null,
+    mesh: ev.mesh ? ((apply ? ev.mesh : ev.baseMesh) ?? null) : null,
     materials: ev.materials,
   }));
   return { scene, items, ids: new Set(items.map((i) => i.ev.id)) };

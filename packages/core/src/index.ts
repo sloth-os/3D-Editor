@@ -10,3 +10,8 @@ export * from './sync';
 export * from './storage';
 export * from './io';
 export * from './render';
+export * from './curve';
+export * from './constraints';
+export * from './armature';
+export * from './instancing';
+export * from './physics';

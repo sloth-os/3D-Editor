@@ -1,8 +1,8 @@
 import * as THREE from 'three';
-import type { CameraData, EmptyDisplayType, LightData } from '@3d-editor/core';
+import type { ArmaturePose, CameraData, EmptyDisplayType, LightData, Vec3 } from '@3d-editor/core';
 import { cameraFovY, orthoHalfExtents } from '@3d-editor/core';
 
-/** Line-segment geometry builders for non-mesh objects (empties, lights, cameras). */
+/** Line-segment geometry builders for non-mesh objects (empties, lights, cameras, bones). */
 
 function circle(
   out: number[],
@@ -193,4 +193,36 @@ export function linesObject(positions: number[], color: THREE.ColorRepresentatio
   const m = new THREE.LineBasicMaterial({ color, depthTest: true, transparent: true, opacity: 0.95 });
   const l = new THREE.LineSegments(g, m);
   return l;
+}
+
+/** Octahedral wire bones of an evaluated pose (armature object space). */
+export function boneLines(pose: ArmaturePose): number[] {
+  const out: number[] = [];
+  for (const name of pose.order) {
+    const b = pose.bones.get(name);
+    if (!b || !(b.length > 0)) continue;
+    const m = b.matrix;
+    const x: Vec3 = [m[0], m[1], m[2]];
+    const y: Vec3 = [m[4], m[5], m[6]];
+    const z: Vec3 = [m[8], m[9], m[10]];
+    const h = b.head;
+    const t = b.tail;
+    const w = 0.1 * b.length;
+    const ring: Vec3[] = [
+      [1, 1],
+      [-1, 1],
+      [-1, -1],
+      [1, -1],
+    ].map(([a, c]) => [
+      h[0] + y[0] * w + (x[0] * a + z[0] * c) * w,
+      h[1] + y[1] * w + (x[1] * a + z[1] * c) * w,
+      h[2] + y[2] * w + (x[2] * a + z[2] * c) * w,
+    ]);
+    for (let i = 0; i < 4; i++) {
+      const p = ring[i];
+      const q = ring[(i + 1) % 4];
+      out.push(...h, ...p, ...p, ...t, ...p, ...q);
+    }
+  }
+  return out;
 }

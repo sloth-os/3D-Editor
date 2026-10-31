@@ -473,7 +473,7 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       .filter((c) => dfsParent.get(c.ev.id) === ev.id)
       .map((c) => nodeOf.get(c.ev.id)!);
     if (kids.length) node.children = kids;
-    if (ev.type === 'MESH' && it.mesh && (it.mesh.faces.length || it.mesh.looseEdges.length)) {
+    if (it.mesh && (it.mesh.faces.length || it.mesh.looseEdges.length)) {
       const mi = exportMesh(it);
       if (mi !== undefined) node.mesh = mi;
     } else if (ev.type === 'CAMERA' && ev.camera) node.camera = cameraIndex(ev.camera);

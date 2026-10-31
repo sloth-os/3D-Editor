@@ -2,8 +2,9 @@ import type { Vec3, Vec4 } from '../math/types';
 import { normalize3 } from '../math/vec3';
 import type { SceneDoc } from '../doc/scene-doc';
 import type { MaterialData } from '../doc/types';
-import { SceneEvaluator, type EvaluatedObject, type EvaluatedScene } from '../eval/evaluate';
+import { SceneEvaluator, type EvaluatedScene } from '../eval/evaluate';
 import { evaluatedBounds } from '../io/common';
+import { renderItems, type RenderItem } from '../eval/renderables';
 import { sniffImageMime } from '../io/image-info';
 import { linearToSrgbByte, srgbToLinear } from './color';
 import { decodePNG as decodePNGImpl, encodePNG as encodePNGImpl } from './png';
@@ -251,9 +252,7 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
   const frame = opts.frame ?? doc.getScene().frame_start;
   const scene = new SceneEvaluator(doc).evaluate(frame, { forRender: true });
   const aspect = width / height;
-  const meshes = scene.objects.filter(
-    (o) => o.type === 'MESH' && o.renderVisible && o.mesh && o.mesh.faces.length > 0,
-  );
+  const meshes = renderItems(scene, { forRender: true }).filter((o) => o.mesh.faces.length > 0);
   const bounds = evaluatedBounds(meshes);
   const view = resolveView(doc, scene, opts, aspect, bounds);
   const W = width * k;
@@ -275,7 +274,7 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
     r.wireColor = solid ? [0, 0, 0, 0.55] : [0.005, 0.005, 0.005, 0.6];
   }
   // nearest objects first: cheap early depth rejection for the ones behind
-  const dist = (o: EvaluatedObject) => {
+  const dist = (o: RenderItem) => {
     const m = o.worldMatrix;
     const e = view.eye;
     return view.ortho

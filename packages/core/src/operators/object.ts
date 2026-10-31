@@ -483,12 +483,22 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         for (const o of sel) {
           let data = o.data;
           if (o.data && !p.linked) {
-            if (o.type === 'MESH')
+            if (o.type === 'MESH') {
               data = ctx.doc.addMesh(
                 ctx.doc.getMeshBlock(o.data)?.name ?? o.name,
                 ctx.doc.getMeshCopy(o.data)!,
               );
-            else if (o.type === 'LIGHT') {
+              const keys = ctx.doc.getShapeKeys(o.data);
+              if (keys.length) ctx.doc.setShapeKeys(data, keys);
+              const groups = ctx.doc.getVertexGroups(o.data);
+              if (groups.length) ctx.doc.setVertexGroups(data, groups);
+            } else if (o.type === 'CURVE' || o.type === 'FONT') {
+              const { id: _id, ...c } = ctx.doc.getCurve(o.data)!;
+              data = ctx.doc.addCurve(c);
+            } else if (o.type === 'ARMATURE') {
+              const { id: _id, ...a } = ctx.doc.getArmature(o.data)!;
+              data = ctx.doc.addArmature(a);
+            } else if (o.type === 'LIGHT') {
               const { id: _id, ...l } = ctx.doc.getLight(o.data)!;
               data = ctx.doc.addLight(l);
             } else if (o.type === 'CAMERA') {

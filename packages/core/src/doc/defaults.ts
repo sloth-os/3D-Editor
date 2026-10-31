@@ -1,5 +1,12 @@
 import type {
+  ArmatureData,
+  BoneData,
   CameraData,
+  CurveData,
+  PoseBone,
+  RigidBodyData,
+  Spline,
+  SplinePoint,
   CollectionData,
   LightData,
   LightType,
@@ -35,6 +42,127 @@ export function defaultObject(type: ObjectType, id: string, name: string): Objec
     empty_display_type: 'PLAIN_AXES',
     empty_display_size: 1,
     custom_props: {},
+    parent_type: 'OBJECT',
+    parent_bone: '',
+    constraints: [],
+    instance_type: 'NONE',
+    instance_collection: null,
+    particle_systems: [],
+    pose: { bones: {} },
+    rigid_body: null,
+  };
+}
+
+export function defaultSplinePoint(co: [number, number, number] = [0, 0, 0]): SplinePoint {
+  return {
+    co,
+    handle_left: null,
+    handle_right: null,
+    handle_left_type: 'AUTO',
+    handle_right_type: 'AUTO',
+    radius: 1,
+    tilt: 0,
+    weight: 1,
+  };
+}
+
+export function defaultSpline(type: Spline['type'] = 'BEZIER', points: SplinePoint[] = []): Spline {
+  return {
+    type,
+    points,
+    use_cyclic_u: false,
+    resolution_u: 0,
+    order_u: 4,
+    use_endpoint_u: true,
+    use_smooth: true,
+    material_index: 0,
+  };
+}
+
+export function defaultCurve(id: string, name: string): CurveData {
+  return {
+    id,
+    name,
+    dimensions: '3D',
+    splines: [],
+    resolution_u: 12,
+    render_resolution_u: 0,
+    bevel_mode: 'ROUND',
+    bevel_depth: 0,
+    bevel_resolution: 4,
+    bevel_object: null,
+    bevel_factor_start: 0,
+    bevel_factor_end: 1,
+    extrude: 0,
+    offset: 0,
+    fill_mode: 'FULL',
+    use_fill_caps: false,
+    twist_mode: 'MINIMUM',
+    path_duration: 100,
+    eval_time: 0,
+    use_path: true,
+    body: '',
+    font: 'BUILTIN',
+    size: 1,
+    space_line: 1,
+    space_word: 1,
+    space_character: 1,
+    shear: 0,
+    align_x: 'LEFT',
+    align_y: 'TOP_BASELINE',
+    offset_x: 0,
+    offset_y: 0,
+  };
+}
+
+export function defaultBone(
+  name: string,
+  head: [number, number, number] = [0, 0, 0],
+  tail: [number, number, number] = [0, 0, 1],
+): BoneData {
+  return {
+    name,
+    parent: null,
+    head,
+    tail,
+    roll: 0,
+    use_connect: false,
+    use_deform: true,
+    envelope_distance: 0.25,
+    envelope_weight: 1,
+    head_radius: 0.1,
+    tail_radius: 0.05,
+  };
+}
+
+export function defaultArmature(id: string, name: string): ArmatureData {
+  return {
+    id,
+    name,
+    bones: [],
+    display_type: 'OCTAHEDRAL',
+    show_names: false,
+    show_axes: false,
+    pose_position: 'POSE',
+  };
+}
+
+export function defaultPoseBone(): PoseBone {
+  return { location: [0, 0, 0], rotation_euler: [0, 0, 0], scale: [1, 1, 1] };
+}
+
+export function defaultRigidBody(type: RigidBodyData['type'] = 'ACTIVE'): RigidBodyData {
+  return {
+    type,
+    enabled: type === 'ACTIVE',
+    kinematic: false,
+    mass: 1,
+    friction: 0.5,
+    restitution: 0,
+    collision_shape: 'CONVEX_HULL',
+    collision_margin: 0.04,
+    linear_damping: 0.04,
+    angular_damping: 0.1,
   };
 }
 
@@ -103,7 +231,15 @@ export function defaultCollection(
   name: string,
   parent: string | null = ROOT_COLLECTION_ID,
 ): CollectionData {
-  return { id, name, parent, hide_viewport: false, hide_render: false, color_tag: 'NONE' };
+  return {
+    id,
+    name,
+    parent,
+    hide_viewport: false,
+    hide_render: false,
+    color_tag: 'NONE',
+    instance_offset: [0, 0, 0],
+  };
 }
 
 export function defaultSceneSettings(): SceneSettings {
@@ -115,6 +251,16 @@ export function defaultSceneSettings(): SceneSettings {
     fps: 24,
     unit_system: 'METRIC',
     unit_scale_length: 1,
+    use_gravity: true,
+    gravity: [0, 0, -9.81],
+    rigidbody_world: {
+      enabled: true,
+      frame_start: 1,
+      frame_end: 250,
+      substeps_per_frame: 10,
+      solver_iterations: 10,
+      time_scale: 1,
+    },
   };
 }
 
@@ -131,6 +277,8 @@ export function defaultRenderSettings(): RenderSettings {
     use_shadows: true,
     use_ambient_occlusion: false,
     use_bloom: false,
+    max_bounces: 4,
+    use_denoising: true,
   };
 }
 
@@ -143,5 +291,15 @@ export function defaultWorldSettings(): WorldSettings {
     environment_rotation: 0,
     environment_strength: 1,
     show_environment_background: false,
+    sky_zenith_color: [0.12, 0.28, 0.65],
+    sky_horizon_color: [0.62, 0.74, 0.88],
+    sky_ground_color: [0.18, 0.16, 0.14],
+    sun_elevation: (35 * Math.PI) / 180,
+    sun_rotation: (45 * Math.PI) / 180,
+    sun_intensity: 3,
+    sun_size: (0.545 * Math.PI) / 180,
+    sun_color: [1, 0.95, 0.88],
+    mist_density: 0,
+    mist_color: [0.7, 0.75, 0.8],
   };
 }

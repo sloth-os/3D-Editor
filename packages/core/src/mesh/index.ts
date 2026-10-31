@@ -9,3 +9,4 @@ export * from './weld';
 export * from './primitives';
 export * from './ops';
 export * from './sculpt';
+export * from './shape-keys';

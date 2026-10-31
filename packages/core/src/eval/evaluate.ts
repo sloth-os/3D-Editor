@@ -1,21 +1,21 @@
-import type { Mat4 } from '../math/types';
-import { compose4, identity4, multiply4 } from '../math/mat4';
+import type { Mat4, Vec2 } from '../math/types';
+import { identity4 } from '../math/mat4';
 import type { MeshData } from '../mesh/types';
+import { applyShapeKeys } from '../mesh/shape-keys';
 import type {
-  AnimTargetType,
+  ArmatureData,
   CameraData,
-  FCurve,
+  CurveData,
   LightData,
   MaterialData,
   ObjectData,
   ObjectType,
   RenderSettings,
   SceneSettings,
+  ShapeKeyData,
   WorldSettings,
 } from '../doc/types';
 import type { SceneDoc } from '../doc/scene-doc';
-import { evaluateFCurve } from '../anim/fcurve';
-import { writeChannel } from '../anim/properties';
 import {
   evaluateModifierStack,
   isModifierEnabled,
@@ -24,26 +24,52 @@ import {
   registerBuiltinModifiers,
 } from '../modifiers';
 import { stableStringify } from '../util/json';
+import type { ArmaturePose } from '../armature/types';
+import type { ConstraintError } from '../constraints/types';
+import { curveToMesh, type CurveMeshResult } from '../curve/to-mesh';
+import { evaluateCurveSplines } from '../curve/spline';
+import { expandInstances } from '../instancing/expand';
+import type { EvaluatedInstance } from '../instancing/types';
+import { RigidBodySimulator } from '../physics/rigid-body';
+import { FrameState, type EvalError } from './frame-state';
+
+export type { EvalError } from './frame-state';
 
 export interface EvaluatedObject {
   id: string;
   name: string;
   type: ObjectType;
-  /** Object properties with animation applied. */
+  /** Object properties with animation and drivers applied. */
   data: ObjectData;
   localMatrix: Mat4;
+  /** Final world matrix (parenting, constraints and rigid body simulation applied). */
   worldMatrix: Mat4;
   /** Visible in the viewport (object + collection visibility). */
   visible: boolean;
   /** Visible in final renders. */
   renderVisible: boolean;
-  /** Evaluated mesh (after modifiers) for mesh objects. Treat as immutable. */
+  /**
+   * Evaluated geometry (after shape keys and modifiers) of meshes, and of curves/text with a
+   * surface (bevel, extrude, fill, text). Treat as immutable.
+   */
   mesh?: MeshData;
-  /** Base (pre-modifier) mesh for mesh objects. Treat as immutable. */
+  /** Base (pre-modifier) geometry. Treat as immutable. */
   baseMesh?: MeshData;
   /** Changes whenever the evaluated mesh changes (for GPU buffer caching). */
   meshKey?: string;
   modifierErrors: { modifierId: string; message: string }[];
+  /** Wire display geometry (flat xyz segment pairs, object space), e.g. curve splines. */
+  lines?: Float32Array;
+  /** Changes whenever `lines` changes. */
+  linesKey?: string;
+  /** Animated curve/text data (CURVE and FONT objects). */
+  curve?: CurveData;
+  /** Armature data and evaluated pose (ARMATURE objects). */
+  armature?: ArmatureData;
+  pose?: ArmaturePose;
+  constraintErrors: ConstraintError[];
+  /** True when the rigid body simulation drives the transform at this frame. */
+  simulated: boolean;
   light?: LightData;
   camera?: CameraData;
   materials: (MaterialData | null)[];
@@ -57,45 +83,20 @@ export interface EvaluatedScene {
   render: RenderSettings;
   world: WorldSettings;
   activeCamera: EvaluatedObject | null;
+  /** Instances from collection instances and particle systems (see `renderItems`). */
+  instances: EvaluatedInstance[];
+  /** Non-fatal evaluation problems (drivers, poses, instancing, physics). */
+  errors: EvalError[];
 }
 
 export interface EvaluateOptions {
   forRender?: boolean;
-  /** Object currently in edit mode (modifiers honour `show_in_editmode`). */
+  /** Object currently in edit mode (modifiers honour `show_in_editmode`, shape keys are off). */
   editObjectId?: string | null;
   /** Live mesh override for an object (e.g. during an interactive edit-mode transform). */
   meshOverrides?: Map<string, MeshData>;
-}
-
-type AnimIndex = Map<string, FCurve[]>; // `${type}:${id}` → curves
-
-function indexCurves(curves: FCurve[]): AnimIndex {
-  const idx: AnimIndex = new Map();
-  for (const fc of curves) {
-    if (fc.mute || fc.keyframes.length === 0) continue;
-    const k = `${fc.target_type}:${fc.target_id}`;
-    const list = idx.get(k);
-    if (list) list.push(fc);
-    else idx.set(k, [fc]);
-  }
-  return idx;
-}
-
-function applyAnimation<T extends object>(
-  obj: T,
-  type: AnimTargetType,
-  id: string,
-  idx: AnimIndex,
-  frame: number,
-): T {
-  const curves = idx.get(`${type}:${id}`);
-  if (!curves) return obj;
-  const out = { ...(obj as Record<string, unknown>) };
-  for (const fc of curves) {
-    const v = evaluateFCurve(fc, frame);
-    if (v !== undefined) writeChannel(out, fc.path, fc.index, v);
-  }
-  return out as T;
+  /** Skip the rigid body simulation (transforms as animated). */
+  noPhysics?: boolean;
 }
 
 interface MeshCacheEntry {
@@ -104,14 +105,31 @@ interface MeshCacheEntry {
   errors: EvaluatedObject['modifierErrors'];
 }
 
+interface CurveCacheEntry {
+  key: string;
+  token: number;
+  result: CurveMeshResult;
+}
+
+const fmtMatrix = (m: Mat4 | null | undefined): string => (m ? m.map((x) => x.toFixed(5)).join(',') : 'none');
+
+function hasRigidBodies(doc: SceneDoc, objects: readonly ObjectData[]): boolean {
+  return !!doc.getScene().rigidbody_world?.enabled && objects.some((o) => o.rigid_body?.enabled);
+}
+
 /**
- * Evaluates the scene at a frame: animation, parenting and modifier stacks.
- * Keeps a cache of evaluated meshes so repeated evaluations only recompute what changed.
+ * Evaluates the scene at a frame: animation, drivers, parenting, armature poses, constraints,
+ * rigid bodies, shape keys, curves/text, modifier stacks and instancing. Keeps caches of
+ * evaluated geometry (and the rigid body simulation) so repeated evaluations only recompute what
+ * changed.
  */
 export class SceneEvaluator {
   private meshCache = new Map<string, MeshCacheEntry>();
+  private curveCache = new Map<string, CurveCacheEntry>();
+  private curveCounter = 0;
   private overrideTokens = new WeakMap<MeshData, number>();
   private overrideCounter = 0;
+  readonly rigidBodies = new RigidBodySimulator();
 
   constructor(private readonly doc: SceneDoc) {
     registerBuiltinModifiers();
@@ -119,71 +137,151 @@ export class SceneEvaluator {
 
   clearCache(): void {
     this.meshCache.clear();
+    this.curveCache.clear();
+    this.rigidBodies.reset();
+  }
+
+  /** Unsimulated world matrices of every object at a frame (no geometry evaluation). */
+  transformsAt(frame: number): Map<string, Mat4> {
+    return new FrameState(this.doc, frame).allWorldMatrices();
   }
 
   evaluate(frame: number, opts: EvaluateOptions = {}): EvaluatedScene {
     const doc = this.doc;
-    const anim = indexCurves(doc.listFCurves());
-    const objects = doc.listObjects().map((o) => applyAnimation(o, 'object', o.id, anim, frame));
-    const objById = new Map(objects.map((o) => [o.id, o]));
-    const localM = new Map<string, Mat4>();
-    const worldM = new Map<string, Mat4>();
-    const world = (id: string, guard = new Set<string>()): Mat4 => {
-      const cached = worldM.get(id);
-      if (cached) return cached;
-      const o = objById.get(id);
-      if (!o) return identity4();
-      const local = compose4(o.location, o.rotation_euler, o.scale);
-      localM.set(id, local);
-      let m = local;
-      if (o.parent && objById.has(o.parent) && !guard.has(o.parent)) {
-        guard.add(id);
-        m = multiply4(world(o.parent, guard), local);
+    const forRender = !!opts.forRender;
+    let simulated: Map<string, Mat4> | null = null;
+    const physicsErrors: EvalError[] = [];
+    if (!opts.noPhysics && hasRigidBodies(doc, doc.listObjects())) {
+      try {
+        simulated = this.rigidBodies.evaluate(doc, frame, {
+          transformsAt: (f) => this.transformsAt(f),
+          meshOf: (id) => {
+            const o = doc.getObject(id);
+            return o?.type === 'MESH' && o.data ? doc.getMesh(o.data) : null;
+          },
+        });
+      } catch (e) {
+        physicsErrors.push({ source: 'rigidbody', message: (e as Error).message });
       }
-      worldM.set(id, m);
-      return m;
-    };
-    for (const o of objects) world(o.id);
+    }
+    const fs = new FrameState(doc, frame, simulated);
+    fs.errors.push(...physicsErrors);
+    for (const o of fs.objects) fs.world(o.id);
 
     const materialCache = new Map<string, MaterialData | null>();
     const material = (id: string | null): MaterialData | null => {
       if (!id) return null;
-      if (!materialCache.has(id)) {
-        const m = doc.getMaterial(id);
-        materialCache.set(id, m ? applyAnimation(m, 'material', id, anim, frame) : null);
-      }
+      if (!materialCache.has(id)) materialCache.set(id, fs.get<MaterialData>('material', id));
       return materialCache.get(id)!;
     };
 
-    // --- meshes with modifier stacks (dependency aware)
+    // --- curves / text → geometry (cached on the animated curve data)
+    const curveResults = new Map<string, CurveCacheEntry | null>();
+    const bevelProfile = (cid: string): Vec2[][] | null => {
+      const co = fs.byId.get(cid);
+      const c = co?.type === 'CURVE' && co.data ? fs.curve(co.data) : null;
+      return c
+        ? evaluateCurveSplines(c, forRender).map((s) => s.points.map((p): Vec2 => [p[0], p[1]]))
+        : null;
+    };
+    const evalCurve = (o: ObjectData): CurveCacheEntry | null => {
+      if (curveResults.has(o.id)) return curveResults.get(o.id)!;
+      const curve = o.data ? fs.curve(o.data) : null;
+      let entry: CurveCacheEntry | null = null;
+      if (curve) {
+        const bevelObj =
+          curve.bevel_mode === 'OBJECT' && curve.bevel_object ? fs.byId.get(curve.bevel_object) : undefined;
+        const bevelCurve = bevelObj?.type === 'CURVE' && bevelObj.data ? fs.curve(bevelObj.data) : null;
+        const key = [
+          o.type,
+          forRender ? 'R' : 'V',
+          stableStringify(curve),
+          bevelCurve ? stableStringify(bevelCurve) : '',
+        ].join('#');
+        const cached = this.curveCache.get(o.id);
+        if (cached && cached.key === key) entry = cached;
+        else {
+          const result = curveToMesh(curve, {
+            forRender,
+            isText: o.type === 'FONT',
+            getBevelProfile: bevelProfile,
+          });
+          entry = { key, token: ++this.curveCounter, result };
+          this.curveCache.set(o.id, entry);
+        }
+      }
+      curveResults.set(o.id, entry);
+      return entry;
+    };
+
+    // --- geometry with shape keys + modifier stacks (dependency aware)
     type MeshResult = {
       mesh: MeshData;
       key: string;
       errors: EvaluatedObject['modifierErrors'];
       base: MeshData;
     };
-    const evaluated = new Map<string, MeshResult>();
+    const evaluated = new Map<string, MeshResult | null>();
     const inProgress = new Set<string>();
+
+    /** Signature of everything a dependent modifier may read from object `d`. */
+    const depSignature = (d: string): string => {
+      const o = fs.byId.get(d);
+      if (!o) return `${d}:missing`;
+      const parts = [d, fmtMatrix(fs.world(d))];
+      const r = evalMesh(d);
+      parts.push(r ? r.key : 'nomesh');
+      if (o.type === 'ARMATURE') {
+        const pose = fs.pose(d);
+        if (pose) for (const n of pose.order) parts.push(fmtMatrix(pose.bones.get(n)!.matrix));
+      } else if (o.type === 'CURVE' && o.data) {
+        const c = fs.curve(o.data);
+        parts.push(c ? stableStringify(c) : 'nocurve');
+      }
+      return parts.join(':');
+    };
+
     const evalMesh = (id: string): MeshResult | null => {
       if (evaluated.has(id)) return evaluated.get(id)!;
-      const o = objById.get(id);
-      if (!o || o.type !== 'MESH' || !o.data) return null;
-      if (inProgress.has(id)) return null; // dependency cycle
+      const o = fs.byId.get(id);
+      if (!o || !o.data || inProgress.has(id)) return null; // missing, no data or dependency cycle
+      if (o.type !== 'MESH' && o.type !== 'CURVE' && o.type !== 'FONT') return null;
       inProgress.add(id);
       try {
-        const override = opts.meshOverrides?.get(id);
-        const base = override ?? doc.getMesh(o.data);
-        if (!base) return null;
-        let baseToken: string;
-        if (override) {
-          let t = this.overrideTokens.get(override);
-          if (t === undefined) this.overrideTokens.set(override, (t = ++this.overrideCounter));
-          baseToken = `o${t}`;
-        } else baseToken = `v${doc.meshVersion(o.data)}`;
         const editMode = opts.editObjectId === id;
-        const ctxFlags = { forRender: !!opts.forRender, editMode };
+        let base: MeshData | null = null;
+        let baseToken: string;
+        let shapeKeys: ShapeKeyData[] = [];
+        if (o.type === 'MESH') {
+          const override = opts.meshOverrides?.get(id);
+          base = override ?? doc.getMesh(o.data);
+          if (override) {
+            let t = this.overrideTokens.get(override);
+            if (t === undefined) this.overrideTokens.set(override, (t = ++this.overrideCounter));
+            baseToken = `o${t}`;
+          } else baseToken = `v${doc.meshVersion(o.data)}`;
+          if (!editMode) {
+            shapeKeys = fs.get<{ shape_keys: ShapeKeyData[] }>('mesh', o.data)?.shape_keys ?? [];
+            if (shapeKeys.length) {
+              baseToken += `|k${doc.meshAttrVersion(o.data, 'shape_keys')}:${shapeKeys
+                .map((k) => `${k.value}${k.mute ? 'm' : ''}${k.relative_key}${k.slider_min}/${k.slider_max}`)
+                .join(',')}`;
+            }
+          }
+          baseToken += `|g${doc.meshAttrVersion(o.data, 'vertex_groups')}`;
+        } else {
+          const c = evalCurve(o);
+          base = c?.result.mesh ?? null;
+          baseToken = `c${c?.token ?? 0}`;
+        }
+        if (!base) {
+          evaluated.set(id, null);
+          return null;
+        }
+        const ctxFlags = { forRender, editMode };
         const active = o.modifiers.filter((m) => isModifierEnabled(m, ctxFlags));
-        if (active.length === 0) {
+        const hasKeys = shapeKeys.some((k) => !k.mute && k.value !== 0);
+        if (active.length === 0 && !hasKeys) {
           const r: MeshResult = { mesh: base, key: baseToken, errors: [], base };
           evaluated.set(id, r);
           return r;
@@ -194,29 +292,13 @@ export class SceneEvaluator {
           deps.push(...modifierDependencies(m));
           if (isModifierTimeDependent(m)) timeDep = true;
         }
-        // Dependencies may be meshes (Boolean operand) or any object used only for its transform
-        // (Mirror/Array/Cast helpers, often Empties): key on both so either change re-evaluates.
-        const depKeys: string[] = deps.map((d): string => {
-          const r: MeshResult | null = evalMesh(d);
-          const m =
-            worldM
-              .get(d)
-              ?.map((x) => x.toFixed(5))
-              .join(',') ?? 'missing';
-          return `${d}:${r ? r.key : 'nomesh'}:${m}`;
-        });
         const key: string = [
           baseToken,
           stableStringify(active),
           timeDep ? `f${frame}` : '',
-          depKeys.join('|'),
-          deps.length
-            ? worldM
-                .get(id)!
-                .map((x) => x.toFixed(5))
-                .join(',')
-            : '',
-          opts.forRender ? 'R' : 'V',
+          deps.map(depSignature).join('|'),
+          deps.length ? fmtMatrix(fs.world(id)) : '',
+          forRender ? 'R' : 'V',
           editMode ? 'E' : '',
         ].join('#');
         const cached = this.meshCache.get(id);
@@ -225,19 +307,37 @@ export class SceneEvaluator {
           evaluated.set(id, r);
           return r;
         }
-        const res = evaluateModifierStack(base, active, {
+        const errors: EvaluatedObject['modifierErrors'] = [];
+        let input = base;
+        if (hasKeys) {
+          const sk = applyShapeKeys(base, shapeKeys);
+          input = sk.mesh;
+          for (const message of sk.errors) errors.push({ modifierId: 'shape_keys', message });
+        }
+        const res = evaluateModifierStack(input, active, {
           frame,
-          objectMatrix: worldM.get(id)!,
-          forRender: !!opts.forRender,
+          objectMatrix: fs.world(id) ?? identity4(),
+          forRender,
           editMode,
           getObjectMesh: (dep) => {
             const r: MeshResult | null = evalMesh(dep);
-            return r ? { mesh: r.mesh, matrix: worldM.get(dep)! } : null;
+            return r ? { mesh: r.mesh, matrix: fs.world(dep) ?? identity4() } : null;
           },
-          getObjectMatrix: (dep) => worldM.get(dep) ?? null,
+          getObjectMatrix: (dep) => fs.world(dep),
+          getArmature: (dep) => {
+            const pose = fs.pose(dep);
+            const matrix = fs.world(dep);
+            return pose && matrix ? { pose, matrix } : null;
+          },
+          getCurvePath: (dep) => {
+            const r = fs.curvePath(dep);
+            return r ? { path: r.path, matrix: r.matrix } : null;
+          },
+          vertexGroups: o.type === 'MESH' ? doc.getVertexGroups(o.data) : undefined,
         });
-        this.meshCache.set(id, { key, mesh: res.mesh, errors: res.errors });
-        const r: MeshResult = { mesh: res.mesh, key, errors: res.errors, base };
+        errors.push(...res.errors);
+        this.meshCache.set(id, { key, mesh: res.mesh, errors });
+        const r: MeshResult = { mesh: res.mesh, key, errors, base };
         evaluated.set(id, r);
         return r;
       } finally {
@@ -251,20 +351,22 @@ export class SceneEvaluator {
       if (!visibleCollections.has(cid)) visibleCollections.set(cid, doc.isCollectionVisible(cid));
       return visibleCollections.get(cid)!;
     };
-    for (const o of objects) {
+    for (const o of fs.objects) {
       const ev: EvaluatedObject = {
         id: o.id,
         name: o.name,
         type: o.type,
         data: o,
-        localMatrix: localM.get(o.id) ?? identity4(),
-        worldMatrix: worldM.get(o.id) ?? identity4(),
+        localMatrix: fs.local(o.id),
+        worldMatrix: fs.world(o.id) ?? identity4(),
         visible: !o.hide_viewport && collectionVisible(o.collection),
         renderVisible: !o.hide_render && collectionVisible(o.collection),
         modifierErrors: [],
+        constraintErrors: fs.constraintErrors.get(o.id) ?? [],
+        simulated: !!simulated?.has(o.id),
         materials: o.material_slots.map((s) => material(s)),
       };
-      if (o.type === 'MESH') {
+      if (o.type === 'MESH' || o.type === 'CURVE' || o.type === 'FONT') {
         const r = evalMesh(o.id);
         if (r) {
           ev.mesh = r.mesh;
@@ -272,23 +374,53 @@ export class SceneEvaluator {
           ev.meshKey = r.key;
           ev.modifierErrors = r.errors;
         }
+        if (o.type !== 'MESH' && o.data) {
+          const c = evalCurve(o);
+          ev.curve = fs.curve(o.data) ?? undefined;
+          if (c?.result.lines) {
+            ev.lines = c.result.lines;
+            ev.linesKey = `c${c.token}`;
+          }
+        }
       } else if (o.type === 'LIGHT' && o.data) {
-        const l = doc.getLight(o.data);
-        if (l) ev.light = applyAnimation(l, 'light', l.id, anim, frame);
+        ev.light = fs.get<LightData>('light', o.data) ?? undefined;
       } else if (o.type === 'CAMERA' && o.data) {
-        const c = doc.getCamera(o.data);
-        if (c) ev.camera = applyAnimation(c, 'camera', c.id, anim, frame);
+        ev.camera = fs.get<CameraData>('camera', o.data) ?? undefined;
+      } else if (o.type === 'ARMATURE' && o.data) {
+        ev.armature = doc.getArmature(o.data) ?? undefined;
+        ev.pose = fs.pose(o.id) ?? undefined;
       }
       out.push(ev);
     }
     // prune cache entries of deleted objects
-    for (const id of this.meshCache.keys()) if (!objById.has(id)) this.meshCache.delete(id);
+    for (const id of this.meshCache.keys()) if (!fs.byId.has(id)) this.meshCache.delete(id);
+    for (const id of this.curveCache.keys()) if (!fs.byId.has(id)) this.curveCache.delete(id);
 
     const byId = new Map(out.map((o) => [o.id, o]));
+    let instances: EvaluatedInstance[] = [];
+    if (fs.objects.some((o) => o.instance_type === 'COLLECTION' || o.particle_systems?.length)) {
+      try {
+        const res = expandInstances({ doc, frame, forRender, objects: out, byId });
+        instances = res.instances;
+        for (const e of res.errors) fs.errors.push({ source: `instances:${e.objectId}`, message: e.message });
+      } catch (e) {
+        fs.errors.push({ source: 'instances', message: (e as Error).message });
+      }
+    }
     const scene = doc.getScene();
-    const worldSettings = applyAnimation(doc.getWorld(), 'world', 'world', anim, frame);
+    const world = fs.get<WorldSettings>('world', 'world') ?? doc.getWorld();
     const activeCamera = scene.camera ? (byId.get(scene.camera) ?? null) : null;
-    return { frame, objects: out, byId, scene, render: doc.getRender(), world: worldSettings, activeCamera };
+    return {
+      frame,
+      objects: out,
+      byId,
+      scene,
+      render: doc.getRender(),
+      world,
+      activeCamera,
+      instances,
+      errors: fs.errors,
+    };
   }
 }
 

@@ -10,6 +10,8 @@ import { newId } from '../util/id';
 import { uniqueName } from '../util/names';
 import { cloneJson, base64Decode, base64Encode } from '../util/json';
 import {
+  defaultArmature,
+  defaultCurve,
   defaultCamera,
   defaultCollection,
   defaultLight,
@@ -20,10 +22,15 @@ import {
   defaultWorldSettings,
 } from './defaults';
 import type {
+  ArmatureData,
   CameraData,
   CollectionData,
+  CurveData,
   DatablockKind,
+  DriverData,
   FCurve,
+  ShapeKeyData,
+  VertexGroupData,
   ImageData,
   LightData,
   LightType,
@@ -49,8 +56,12 @@ export const BLOCK_KINDS: DatablockKind[] = [
   'cameras',
   'images',
   'collections',
+  'curves',
+  'armatures',
 ];
-export type ChangeKind = DatablockKind | 'fcurves';
+/** Keyed maps that are not datablocks (animation curves and drivers). */
+export const CURVE_MAPS = ['fcurves', 'drivers'] as const;
+export type ChangeKind = DatablockKind | 'fcurves' | 'drivers';
 
 /** Aggregated description of what changed in one Yjs transaction. */
 export interface DocChanges {
@@ -88,7 +99,7 @@ export class SceneDoc {
   private readonly listeners = new Set<DocChangeListener>();
   private pending: DocChanges | null = null;
   private readonly meshCache = new WeakMap<Uint8Array, MeshData>();
-  private readonly blobVersions = new WeakMap<Uint8Array, number>();
+  private readonly blobVersions = new WeakMap<object, number>();
   private blobCounter = 0;
   private readonly unobserve: (() => void)[] = [];
 
@@ -131,7 +142,7 @@ export class SceneDoc {
 
   /** All top-level shared types (for undo managers). */
   sharedTypes(): Y.Map<any>[] {
-    return [...SETTINGS_KINDS, ...BLOCK_KINDS, 'fcurves' as const].map((k) => this.map(k));
+    return [...SETTINGS_KINDS, ...BLOCK_KINDS, ...CURVE_MAPS].map((k) => this.map(k));
   }
 
   transact<T>(fn: () => T, origin: unknown = this.origin): T {
@@ -180,7 +191,7 @@ export class SceneDoc {
       ymap.observeDeep(h);
       this.unobserve.push(() => ymap.unobserveDeep(h));
     }
-    for (const kind of [...BLOCK_KINDS, 'fcurves' as const]) {
+    for (const kind of [...BLOCK_KINDS, ...CURVE_MAPS]) {
       const ymap = this.map(kind);
       const h = (events: Y.YEvent<any>[]) => {
         const c = ensure();
@@ -452,16 +463,10 @@ export class SceneDoc {
       this.map('objects').delete(id);
       for (const fc of this.listFCurves(id)) this.map('fcurves').delete(fcurveKey(fc));
       if (o.data && this.dataUsers(o.data) === 0) {
-        const kind =
-          o.type === 'MESH'
-            ? 'meshes'
-            : o.type === 'LIGHT'
-              ? 'lights'
-              : o.type === 'CAMERA'
-                ? 'cameras'
-                : null;
+        const kind = dataKindOf(o.type);
         if (kind) this.map(kind).delete(o.data);
       }
+      for (const d of this.listDrivers(id)) this.map('drivers').delete(fcurveKey(d));
       const scene = this.getScene();
       if (scene.camera === id) this.updateScene({ camera: null });
     });
@@ -518,6 +523,18 @@ export class SceneDoc {
       this.blobVersions.set(bytes, v);
     }
     return v;
+  }
+
+  /** Version token of a mesh's shape keys or vertex groups (changes whenever they are replaced). */
+  meshAttrVersion(id: string, field: 'shape_keys' | 'vertex_groups'): number {
+    const v = (this.map('meshes').get(id) as Y.Map<any> | undefined)?.get(field) as unknown;
+    if (!v || typeof v !== 'object') return 0;
+    let n = this.blobVersions.get(v);
+    if (n === undefined) {
+      n = ++this.blobCounter;
+      this.blobVersions.set(v, n);
+    }
+    return n;
   }
 
   meshCounts(id: string): { vertices: number; faces: number; corners: number } | null {
@@ -719,6 +736,10 @@ export class SceneDoc {
         return this.getImage(id) as unknown as Record<string, unknown> | null;
       case 'collections':
         return this.getCollection(id) as unknown as Record<string, unknown> | null;
+      case 'curves':
+        return this.getCurve(id) as unknown as Record<string, unknown> | null;
+      case 'armatures':
+        return this.getArmature(id) as unknown as Record<string, unknown> | null;
     }
   }
 
@@ -730,6 +751,108 @@ export class SceneDoc {
     }
     if (kind === 'collections' && id === ROOT_COLLECTION_ID) return;
     this.updateBlock(kind, id, patch);
+  }
+
+  // ---------------------------------------------------------------- curves (CURVE / FONT data)
+
+  addCurve(init: Partial<CurveData> = {}, id = newId()): string {
+    const { id: _i, ...fields } = { ...defaultCurve(id, 'Curve'), ...init };
+    return this.createBlock('curves', fields, id);
+  }
+
+  getCurve(id: string): CurveData | null {
+    return this.readBlock(this.map('curves').get(id), defaultCurve(id, ''));
+  }
+
+  updateCurve(id: string, patch: Partial<CurveData>): void {
+    this.updateBlock('curves', id, patch);
+  }
+
+  listCurves(): CurveData[] {
+    return [...this.map('curves').keys()]
+      .map((id) => this.getCurve(id)!)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  // ---------------------------------------------------------------- armatures
+
+  addArmature(init: Partial<ArmatureData> = {}, id = newId()): string {
+    const { id: _i, ...fields } = { ...defaultArmature(id, 'Armature'), ...init };
+    return this.createBlock('armatures', fields, id);
+  }
+
+  getArmature(id: string): ArmatureData | null {
+    return this.readBlock(this.map('armatures').get(id), defaultArmature(id, ''));
+  }
+
+  updateArmature(id: string, patch: Partial<ArmatureData>): void {
+    this.updateBlock('armatures', id, patch);
+  }
+
+  listArmatures(): ArmatureData[] {
+    return [...this.map('armatures').keys()]
+      .map((id) => this.getArmature(id)!)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  // ---------------------------------------------------------------- shape keys (stored on meshes)
+
+  /** Shape keys of a mesh datablock (the basis is the mesh itself and is not listed). */
+  getShapeKeys(meshId: string): ShapeKeyData[] {
+    const y = this.map('meshes').get(meshId) as Y.Map<any> | undefined;
+    const keys = y?.get('shape_keys');
+    return Array.isArray(keys) ? (cloneJson(keys) as ShapeKeyData[]) : [];
+  }
+
+  setShapeKeys(meshId: string, keys: ShapeKeyData[]): void {
+    const y = this.map('meshes').get(meshId) as Y.Map<any> | undefined;
+    if (!y) throw new Error(`mesh ${meshId} not found`);
+    this.transact(() => {
+      if (keys.length) y.set('shape_keys', cloneJson(keys));
+      else y.delete('shape_keys');
+    });
+  }
+
+  // ---------------------------------------------------------------- vertex groups (stored on meshes)
+
+  /** Vertex groups (per-vertex weights) of a mesh datablock. */
+  getVertexGroups(meshId: string): VertexGroupData[] {
+    const y = this.map('meshes').get(meshId) as Y.Map<any> | undefined;
+    const groups = y?.get('vertex_groups');
+    return Array.isArray(groups) ? (cloneJson(groups) as VertexGroupData[]) : [];
+  }
+
+  setVertexGroups(meshId: string, groups: VertexGroupData[]): void {
+    const y = this.map('meshes').get(meshId) as Y.Map<any> | undefined;
+    if (!y) throw new Error(`mesh ${meshId} not found`);
+    this.transact(() => {
+      if (groups.length) y.set('vertex_groups', cloneJson(groups));
+      else y.delete('vertex_groups');
+    });
+  }
+
+  // ---------------------------------------------------------------- drivers
+
+  listDrivers(targetId?: string): DriverData[] {
+    const out: DriverData[] = [];
+    for (const v of this.map('drivers').values()) {
+      const d = v as DriverData;
+      if (!targetId || d.target_id === targetId) out.push(cloneJson(d));
+    }
+    return out;
+  }
+
+  getDriver(key: string): DriverData | null {
+    const v = this.map('drivers').get(key) as DriverData | undefined;
+    return v ? cloneJson(v) : null;
+  }
+
+  setDriver(d: DriverData): void {
+    this.transact(() => this.map('drivers').set(fcurveKey(d), cloneJson(d)));
+  }
+
+  removeDriver(key: string): void {
+    this.transact(() => this.map('drivers').delete(key));
   }
 
   // ---------------------------------------------------------------- animation curves
@@ -794,7 +917,22 @@ export class SceneDoc {
       render: this.getRender(),
       world: this.getWorld(),
       objects: this.listObjects(),
-      meshes: this.listMeshBlocks().map((b) => ({ ...b, mesh: cloneMesh(this.getMesh(b.id)!) })),
+      meshes: this.listMeshBlocks().map((b) => {
+        const keys = this.getShapeKeys(b.id);
+        const groups = this.getVertexGroups(b.id);
+        return {
+          ...b,
+          mesh: cloneMesh(this.getMesh(b.id)!),
+          ...(keys.length
+            ? { shape_keys: keys.map(({ data, ...k }) => ({ ...k, data_base64: base64Encode(data) })) }
+            : {}),
+          ...(groups.length
+            ? {
+                vertex_groups: groups.map((g) => ({ name: g.name, weights_base64: base64Encode(g.weights) })),
+              }
+            : {}),
+        };
+      }),
       materials: this.listMaterials(),
       lights: [...this.map('lights').keys()].map((id) => this.getLight(id)!),
       cameras: [...this.map('cameras').keys()].map((id) => this.getCamera(id)!),
@@ -804,6 +942,9 @@ export class SceneDoc {
       })),
       collections: this.listCollections().filter((c) => c.id !== ROOT_COLLECTION_ID),
       fcurves: this.listFCurves(),
+      curves: this.listCurves(),
+      armatures: this.listArmatures(),
+      drivers: this.listDrivers(),
     };
   }
 
@@ -821,7 +962,29 @@ export class SceneDoc {
         doc.writeFields(y, fields);
       };
       for (const c of s.collections) put('collections', c.id, c as unknown as Record<string, unknown>);
-      for (const m of s.meshes) put('meshes', m.id, { name: m.name, data: encodeMesh(m.mesh) });
+      for (const m of s.meshes)
+        put('meshes', m.id, {
+          name: m.name,
+          data: encodeMesh(m.mesh),
+          ...(m.shape_keys?.length
+            ? {
+                shape_keys: m.shape_keys.map(({ data_base64, ...k }) => ({
+                  ...k,
+                  data: base64Decode(data_base64),
+                })),
+              }
+            : {}),
+          ...(m.vertex_groups?.length
+            ? {
+                vertex_groups: m.vertex_groups.map((g) => ({
+                  name: g.name,
+                  weights: base64Decode(g.weights_base64),
+                })),
+              }
+            : {}),
+        });
+      for (const c of s.curves ?? []) put('curves', c.id, c as unknown as Record<string, unknown>);
+      for (const a of s.armatures ?? []) put('armatures', a.id, a as unknown as Record<string, unknown>);
       for (const m of s.materials) put('materials', m.id, m as unknown as Record<string, unknown>);
       for (const l of s.lights) put('lights', l.id, l as unknown as Record<string, unknown>);
       for (const c of s.cameras) put('cameras', c.id, c as unknown as Record<string, unknown>);
@@ -831,6 +994,7 @@ export class SceneDoc {
       }
       for (const o of s.objects) put('objects', o.id, o as unknown as Record<string, unknown>);
       for (const fc of s.fcurves) doc.map('fcurves').set(fcurveKey(fc), cloneJson(fc));
+      for (const d of s.drivers ?? []) doc.map('drivers').set(fcurveKey(d), cloneJson(d));
     }, SYSTEM_ORIGIN);
     return doc;
   }
@@ -840,4 +1004,23 @@ export class SceneDoc {
 export function objectWorldLocation(doc: SceneDoc, id: string): Vec3 {
   const m = doc.worldMatrix(id);
   return [m[12], m[13], m[14]];
+}
+
+/** Datablock kind holding the object data of an object type (null for empties). */
+export function dataKindOf(type: ObjectType): DatablockKind | null {
+  switch (type) {
+    case 'MESH':
+      return 'meshes';
+    case 'LIGHT':
+      return 'lights';
+    case 'CAMERA':
+      return 'cameras';
+    case 'CURVE':
+    case 'FONT':
+      return 'curves';
+    case 'ARMATURE':
+      return 'armatures';
+    default:
+      return null;
+  }
 }
