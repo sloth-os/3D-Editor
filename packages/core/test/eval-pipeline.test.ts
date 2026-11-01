@@ -36,7 +36,10 @@ describe('F-curve extrapolation', () => {
     expect(evaluateFCurve(fc, 6)).toBeCloseTo(5);
     expect(evaluateFCurve(fc, 16)).toBeCloseTo(5);
     expect(evaluateFCurve(fc, -4)).toBeCloseTo(5);
-    expect(evaluateFCurve(fc, 21)).toBeCloseTo(0);
+    // exact cycle multiples after the last key map to the last key (Blender's Cycles modifier)
+    expect(evaluateFCurve(fc, 21)).toBeCloseTo(10);
+    expect(evaluateFCurve(fc, 31)).toBeCloseTo(10);
+    expect(evaluateFCurve(fc, -9)).toBeCloseTo(0);
   });
 });
 

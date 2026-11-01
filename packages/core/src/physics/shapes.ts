@@ -32,8 +32,8 @@ import type { Mat3 } from './vmath';
  * triangle meshes, where a body without thickness could not tell which side it came from.
  */
 export const MIN_HALF_EXTENT = 5e-3;
-/** Hull vertex budget (larger hulls are simplified to their extreme points). */
-export const MAX_HULL_VERTICES = 64;
+/** Polyhedra with more vertices answer support queries by hill climbing (see `polySupport`). */
+export const HILL_CLIMB_VERTICES = 32;
 /** Vertex count of the polygon approximating cylinder / cone caps in contact manifolds. */
 const CAP_SEGMENTS = 12;
 
@@ -51,6 +51,24 @@ export interface Polyhedron {
   flat: boolean;
   /** Mean of the vertices (inside the polyhedron). */
   centroid: Vec3;
+  /** Vertex graph of large polyhedra (more than HILL_CLIMB_VERTICES vertices), else absent. */
+  graph?: VertexGraph;
+}
+
+/**
+ * Neighbourhoods of a polyhedron's vertices (CSR lists). The neighbours of vertex i,
+ * `adj[adjStart[i] … adjStart[i + 1])`, follow the edges of the fan-triangulated faces, so the
+ * edges at every vertex span its tangent cone: a vertex no neighbour of which is further along a
+ * direction is the furthest of all (hill climbing finds support points exactly).
+ */
+export interface VertexGraph {
+  adjStart: Int32Array;
+  adj: Int32Array;
+  /** Faces around vertex i: `faces[faceStart[i] … faceStart[i + 1])`. */
+  faceStart: Int32Array;
+  faces: Int32Array;
+  /** Start candidates for hill climbing: the extreme vertices along 26 fixed directions. */
+  seeds: Int32Array;
 }
 
 /** Static triangle mesh (MESH collision shape). */
@@ -97,30 +115,135 @@ export interface ShapeBuild {
 /** Builds a polyhedron (planes + edge adjacency) from polygons over flat xyz vertices. */
 export function makePolyhedron(verts: ArrayLike<number>, faces: number[][], flat = false): Polyhedron {
   const v = Float64Array.from(verts);
+  const n = v.length / 3;
   const planes = new Float64Array(faces.length * 4);
   faces.forEach((f, i) => {
-    const n = newellNormal(v, f);
+    const nrm = newellNormal(v, f);
     let d = 0;
-    for (const k of f) d += n[0] * v[k * 3] + n[1] * v[k * 3 + 1] + n[2] * v[k * 3 + 2];
-    planes.set([n[0], n[1], n[2], d / f.length], i * 4);
+    for (const k of f) d += nrm[0] * v[k * 3] + nrm[1] * v[k * 3 + 1] + nrm[2] * v[k * 3 + 2];
+    planes.set([nrm[0], nrm[1], nrm[2], d / f.length], i * 4);
   });
-  const left = new Map<string, number>();
-  faces.forEach((f, fi) => f.forEach((a, k) => left.set(`${a},${f[(k + 1) % f.length]}`, fi)));
+  // directed edge a → b keyed a·n + b (exact in doubles for any realistic vertex count)
+  const left = new Map<number, number>();
+  faces.forEach((f, fi) => f.forEach((a, k) => left.set(a * n + f[(k + 1) % f.length], fi)));
   const edges: number[] = [];
-  const done = new Set<string>();
+  const done = new Set<number>();
   faces.forEach((f, fi) =>
     f.forEach((a, k) => {
       const b = f[(k + 1) % f.length];
-      const key = a < b ? `${a},${b}` : `${b},${a}`;
+      const key = a < b ? a * n + b : b * n + a;
       if (done.has(key)) return;
       done.add(key);
-      edges.push(a, b, fi, left.get(`${b},${a}`) ?? -1);
+      edges.push(a, b, fi, left.get(b * n + a) ?? -1);
     }),
   );
-  const n = v.length / 3;
   const centroid: Vec3 = [0, 0, 0];
   for (let i = 0; i < n; i++) for (let a = 0; a < 3; a++) centroid[a] += v[i * 3 + a] / n;
-  return { verts: v, faces, planes, edges: Int32Array.from(edges), flat, centroid };
+  const poly: Polyhedron = { verts: v, faces, planes, edges: Int32Array.from(edges), flat, centroid };
+  if (n > HILL_CLIMB_VERTICES) poly.graph = vertexGraph(v, faces);
+  return poly;
+}
+
+/** Vertex graph of a polyhedron: fan-triangulated face edges, incident faces and seeds. */
+function vertexGraph(v: Float64Array, faces: number[][]): VertexGraph {
+  const n = v.length / 3;
+  const nbrs: number[][] = Array.from({ length: n }, () => []);
+  const around: number[][] = Array.from({ length: n }, () => []);
+  const link = (a: number, b: number) => {
+    nbrs[a].push(b);
+    nbrs[b].push(a);
+  };
+  faces.forEach((f, fi) => {
+    for (let k = 0; k < f.length; k++) {
+      link(f[k], f[(k + 1) % f.length]);
+      around[f[k]].push(fi);
+    }
+    for (let k = 2; k < f.length - 1; k++) link(f[0], f[k]);
+  });
+  const flatten = (lists: number[][]) => {
+    const start = new Int32Array(n + 1);
+    const out: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const sorted = lists[i].sort((a, b) => a - b);
+      sorted.forEach((x, k) => {
+        if (k === 0 || x !== sorted[k - 1]) out.push(x);
+      });
+      start[i + 1] = out.length;
+    }
+    return { start, list: Int32Array.from(out) };
+  };
+  const adj = flatten(nbrs);
+  const inc = flatten(around);
+  const seeds: number[] = [];
+  for (let x = -1; x <= 1; x++)
+    for (let y = -1; y <= 1; y++)
+      for (let z = -1; z <= 1; z++) {
+        if (!x && !y && !z) continue;
+        let best = 0;
+        let bestDot = -Infinity;
+        for (let i = 0; i < n; i++) {
+          const d = v[i * 3] * x + v[i * 3 + 1] * y + v[i * 3 + 2] * z;
+          if (d > bestDot) {
+            bestDot = d;
+            best = i;
+          }
+        }
+        if (!seeds.includes(best)) seeds.push(best);
+      }
+  return {
+    adjStart: adj.start,
+    adj: adj.list,
+    faceStart: inc.start,
+    faces: inc.list,
+    seeds: Int32Array.from(seeds),
+  };
+}
+
+/**
+ * Index of a vertex of P with the largest projection on d: steepest-ascent hill climbing over
+ * the vertex graph from the best seed for large polyhedra (exact, see `VertexGraph`), a linear
+ * scan for small ones.
+ */
+export function polySupport(P: Polyhedron, dx: number, dy: number, dz: number): number {
+  const v = P.verts;
+  const g = P.graph;
+  if (!g) {
+    let best = 0;
+    let bestDot = -Infinity;
+    for (let i = 0; i < v.length; i += 3) {
+      const d = v[i] * dx + v[i + 1] * dy + v[i + 2] * dz;
+      if (d > bestDot) {
+        bestDot = d;
+        best = i;
+      }
+    }
+    return best / 3;
+  }
+  const { adjStart, adj, seeds } = g;
+  let best = seeds[0];
+  let bestDot = v[best * 3] * dx + v[best * 3 + 1] * dy + v[best * 3 + 2] * dz;
+  for (let s = 1; s < seeds.length; s++) {
+    const i = seeds[s];
+    const d = v[i * 3] * dx + v[i * 3 + 1] * dy + v[i * 3 + 2] * dz;
+    if (d > bestDot) {
+      bestDot = d;
+      best = i;
+    }
+  }
+  // every move strictly increases the projection, so this terminates
+  for (;;) {
+    let next = -1;
+    for (let k = adjStart[best], e = adjStart[best + 1]; k < e; k++) {
+      const j = adj[k];
+      const d = v[j * 3] * dx + v[j * 3 + 1] * dy + v[j * 3 + 2] * dz;
+      if (d > bestDot) {
+        bestDot = d;
+        next = j;
+      }
+    }
+    if (next < 0) return best;
+    best = next;
+  }
 }
 
 const BOX_FACES = [
@@ -285,15 +408,7 @@ export function supportCore(
     }
     case 'poly': {
       const v = s.poly.verts;
-      let best = 0;
-      let bestDot = -Infinity;
-      for (let i = 0; i < v.length; i += 3) {
-        const d = v[i] * dx + v[i + 1] * dy + v[i + 2] * dz;
-        if (d > bestDot) {
-          bestDot = d;
-          best = i;
-        }
-      }
+      const best = polySupport(s.poly, dx, dy, dz) * 3;
       out[o] = v[best];
       out[o + 1] = v[best + 1];
       out[o + 2] = v[best + 2];
@@ -347,13 +462,19 @@ export function supportingFace(s: Shape, dx: number, dy: number, dz: number): nu
       const p = s.poly;
       let best = 0;
       let bestDot = -Infinity;
-      for (let f = 0; f < p.faces.length; f++) {
+      const consider = (f: number) => {
         const d = p.planes[f * 4] * ux + p.planes[f * 4 + 1] * uy + p.planes[f * 4 + 2] * uz;
         if (d > bestDot) {
           bestDot = d;
           best = f;
         }
-      }
+      };
+      const g = p.graph;
+      if (g) {
+        // large polyhedra: the faces around the support vertex (d lies in its normal cone)
+        const vi = polySupport(p, ux, uy, uz);
+        for (let k = g.faceStart[vi]; k < g.faceStart[vi + 1]; k++) consider(g.faces[k]);
+      } else for (let f = 0; f < p.faces.length; f++) consider(f);
       const out: number[] = [];
       for (const k of p.faces[best]) out.push(p.verts[k * 3], p.verts[k * 3 + 1], p.verts[k * 3 + 2]);
       return out;
@@ -567,7 +688,7 @@ export function buildCollisionShape(
 }
 
 function hullShape(pts: number[], notes: string[]): ShapeBuild {
-  let hull = convexHull(pts, MAX_HULL_VERTICES);
+  let hull = convexHull(pts);
   if (hull && hull.dimension === 2) {
     // flat mesh: a thin slab around its polygon
     const [nx, ny, nz] = hull.normals[0];
@@ -577,7 +698,7 @@ function hullShape(pts: number[], notes: string[]): ShapeBuild {
       const [x, y, z] = [hull.points[i], hull.points[i + 1], hull.points[i + 2]];
       slab.push(x + nx * h, y + ny * h, z + nz * h, x - nx * h, y - ny * h, z - nz * h);
     }
-    const thick = convexHull(slab, MAX_HULL_VERTICES);
+    const thick = convexHull(slab);
     if (thick?.dimension === 3) hull = thick;
   }
   if (hull && hull.dimension === 3) {

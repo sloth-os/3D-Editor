@@ -1519,8 +1519,9 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         'else one fixed automatic 3/4 view framing the geometry of all rendered frames (so moving objects move ' +
         'in the image; returned as view). Frame size defaults to the render resolution scaled to fit 480 px ' +
         '(contact sheet tiles: up to 240 px, smaller for many frames). The PATHTRACER engine is far slower than ' +
-        'RASTER: keep size, samples and frame count small. time_limit bounds the whole render: a path traced ' +
-        'frame stops sampling when it runs out (noisier, at least 1 sample per pixel), no frame starts after it, ' +
+        'RASTER: keep size, samples and frame count small. time_limit bounds the whole render: each path traced ' +
+        'frame gets an equal share of the remaining time and stops sampling when its share runs out (noisier, at ' +
+        'least 1 sample per pixel), no frame starts after the budget is used up, ' +
         'and the frames rendered so far are returned (truncated: true). Returns { format, mime, data_base64, ' +
         'bytes, width, height (of one frame), fps, frames (rendered frame numbers), frame_count, truncated }, ' +
         'plus sheet { width, height, columns, rows } for CONTACT_SHEET, files [{ frame, name, data_base64 }] ' +
@@ -1604,8 +1605,9 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           .max(3600)
           .default(120)
           .describe(
-            'Wall-clock budget of the whole render in seconds (0 = no limit): a path traced frame stops ' +
-              'sampling when it is used up, no further frame is started, and the frames so far are returned',
+            'Wall-clock budget of the whole render in seconds (0 = no limit): each path traced frame gets an ' +
+              'equal share of the remaining time and stops sampling when its share is used up; no frame is started ' +
+              'after the budget runs out, and the frames so far are returned',
           ),
       }),
       execute(ctx, p) {

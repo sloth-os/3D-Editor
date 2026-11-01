@@ -11,7 +11,7 @@ import {
   markSharpEdges,
   profileIsClockwise,
 } from './builder';
-import { MATERIALS, type GeneratorResult } from './types';
+import { MATERIALS, checkFaceBudget, type GeneratorResult } from './types';
 
 /*
  * Architectural elements: classical column, arch, stairs (straight or spiral) and fence.
@@ -411,10 +411,22 @@ export function generateFence(params: Partial<FenceParams> = {}): GeneratorResul
   const H = clampNum(p.height, 0.05, 100, FENCE_DEFAULTS.height);
   const spacing = clampNum(p.post_spacing, 0.1, 1e3, FENCE_DEFAULTS.post_spacing);
   const pw = clampNum(p.post_width, 0.005, 10, FENCE_DEFAULTS.post_width);
-  let path: Vec3[] = (p.points ?? [])
+  const given = p.points ?? [];
+  const warnings: string[] = [];
+  let path: Vec3[] = given
     .filter((q) => Array.isArray(q) && q.length >= 2 && q.slice(0, 3).every(Number.isFinite))
     .map((q) => [q[0], q[1], q[2] ?? 0]);
+  if (path.length < given.length)
+    warnings.push(`ignored ${given.length - path.length} point(s) with missing or non-finite coordinates`);
   path = path.filter((q, i) => i === 0 || Math.hypot(q[0] - path[i - 1][0], q[1] - path[i - 1][1]) > 1e-6);
+  if (given.length > 0 && path.length < 2) {
+    // the caller asked for a path: never silently build the default fence somewhere else
+    warnings.push(
+      `the path needs at least 2 points at distinct [x, y] positions (got ${path.length}); ` +
+        'give more points, or no points for a straight fence of `length`',
+    );
+    return { mesh: new MeshBuilder().build(), materials: [MATERIALS.fence], warnings };
+  }
   if (path.length < 2) {
     const L = clampNum(p.length, 0.1, 1e4, FENCE_DEFAULTS.length);
     path = [
@@ -429,13 +441,23 @@ export function generateFence(params: Partial<FenceParams> = {}): GeneratorResul
   )
     path.pop();
   // posts: every path point plus evenly spaced intermediate posts
-  const posts: Vec3[] = [];
   const segs = closed ? path.length : path.length - 1;
+  const postsPerSeg: number[] = [];
+  let postCount = closed ? 0 : 1;
   for (let s = 0; s < segs; s++) {
     const a = path[s];
     const c = path[(s + 1) % path.length];
-    const L = Math.hypot(c[0] - a[0], c[1] - a[1]);
-    const k = Math.max(1, Math.ceil(L / spacing - 1e-9));
+    const k = Math.max(1, Math.ceil(Math.hypot(c[0] - a[0], c[1] - a[1]) / spacing - 1e-9));
+    postsPerSeg.push(k);
+    postCount += k;
+  }
+  // a post is a 6-face box (checked before listing the posts: long paths can need billions)
+  checkFaceBudget(postCount * 6);
+  const posts: Vec3[] = [];
+  for (let s = 0; s < segs; s++) {
+    const a = path[s];
+    const c = path[(s + 1) % path.length];
+    const k = postsPerSeg[s];
     for (let i = 0; i < k; i++) {
       const t = i / k;
       posts.push([a[0] + (c[0] - a[0]) * t, a[1] + (c[1] - a[1]) * t, a[2] + (c[2] - a[2]) * t]);
@@ -445,6 +467,19 @@ export function generateFence(params: Partial<FenceParams> = {}): GeneratorResul
   const b = new MeshBuilder();
   const postTop = H + (p.style === 'PICKET' ? 0.06 : 0.08);
   const bays = closed ? posts.length : posts.length - 1;
+  const pk = clampNum(p.picket_width, 0.005, 1, FENCE_DEFAULTS.picket_width);
+  const gap = clampNum(p.picket_gap, 0, 1, FENCE_DEFAULTS.picket_gap);
+  const rails = Math.round(clampNum(p.rails, 1, 20, 2));
+  /** Picket boards that fit between two posts `L` metres apart. */
+  const picketsIn = (L: number) => Math.max(0, Math.floor((L - pw + gap) / (pk + gap)));
+  // the whole fence (6 faces per box, 7 per pentagonal board), before building any of it
+  let estimate = postCount * 6;
+  for (let i = 0; i < bays; i++) {
+    const a = posts[i];
+    const c = posts[(i + 1) % posts.length];
+    estimate += p.style === 'RAIL' ? rails * 6 : 12 + picketsIn(Math.hypot(c[0] - a[0], c[1] - a[1])) * 7;
+  }
+  checkFaceBudget(estimate);
   const dirOf = (i: number): Vec2 => {
     const a = posts[i % posts.length];
     const c = posts[(i + 1) % posts.length];
@@ -473,7 +508,6 @@ export function generateFence(params: Partial<FenceParams> = {}): GeneratorResul
     const a = posts[i];
     const c = posts[(i + 1) % posts.length];
     if (p.style === 'RAIL') {
-      const rails = Math.round(clampNum(p.rails, 1, 20, 2));
       for (let k = 0; k < rails; k++) {
         const h = rails === 1 ? 0.75 * H : H * (0.3 + (0.6 * k) / (rails - 1));
         addBoxBetween(
@@ -502,10 +536,7 @@ export function generateFence(params: Partial<FenceParams> = {}): GeneratorResul
     const dy = (c[1] - a[1]) / (L || 1);
     const nx = dy; // bay normal (right of the walking direction)
     const ny = -dx;
-    const pk = clampNum(p.picket_width, 0.005, 1, FENCE_DEFAULTS.picket_width);
-    const gap = clampNum(p.picket_gap, 0, 1, FENCE_DEFAULTS.picket_gap);
-    const usable = L - pw;
-    const count = Math.floor((usable + gap) / (pk + gap));
+    const count = picketsIn(L);
     if (count < 1) continue;
     const span = count * pk + (count - 1) * gap;
     const thick = 0.02;
@@ -536,7 +567,7 @@ export function generateFence(params: Partial<FenceParams> = {}): GeneratorResul
       );
     }
   }
-  return { mesh: b.build(), materials: [MATERIALS.fence] };
+  return { mesh: b.build(), materials: [MATERIALS.fence], ...(warnings.length ? { warnings } : {}) };
 }
 
 /** Lathe helper re-exported for generators that build revolved props. */

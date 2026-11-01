@@ -162,7 +162,7 @@ const DEFAULT_SURFACE: SurfaceMaterial = {
 };
 
 /** Decodes PNG base color textures once per render (other formats render with the color factor only). */
-class TextureCache {
+export class TextureCache {
   private readonly cache = new Map<string, SampledTexture | null>();
   constructor(private readonly doc: SceneDoc) {}
 
@@ -229,7 +229,8 @@ function surfaceFromMaterial(
   };
 }
 
-function resolveView(
+/** The view of a software render (`renderSceneSoftware`'s camera precedence; exported for parallel renders). */
+export function resolveView(
   doc: SceneDoc,
   scene: EvaluatedScene,
   opts: SoftwareRenderOptions,

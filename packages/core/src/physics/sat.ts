@@ -50,13 +50,23 @@ export function transformPolyhedron(
   const cx = r[0] * c[0] + r[1] * c[1] + r[2] * c[2] + t[0];
   const cy = r[3] * c[0] + r[4] * c[1] + r[5] * c[2] + t[1];
   const cz = r[6] * c[0] + r[7] * c[1] + r[8] * c[2] + t[2];
-  if (!out) return { verts, faces: P.faces, planes, edges: P.edges, flat: P.flat, centroid: [cx, cy, cz] };
+  if (!out)
+    return {
+      verts,
+      faces: P.faces,
+      planes,
+      edges: P.edges,
+      flat: P.flat,
+      centroid: [cx, cy, cz],
+      graph: P.graph,
+    };
   out.verts = verts;
   out.planes = planes;
   out.faces = P.faces;
   out.edges = P.edges;
   out.flat = P.flat;
   out.centroid = [cx, cy, cz];
+  out.graph = P.graph;
   return out;
 }
 

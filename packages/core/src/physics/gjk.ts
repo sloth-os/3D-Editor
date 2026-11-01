@@ -132,19 +132,43 @@ const TETRA_FACES: readonly (readonly [number, number, number, number])[] = [
   [1, 3, 2, 0],
 ];
 
+/**
+ * Relative height below which a tetrahedron counts as flat: its volume is then rounding noise,
+ * far above that level for coordinates up to ~10⁵ times the simplex size.
+ */
+const FLAT_TETRA = 1e-10;
+
+/** Whether a tetrahedron is flat: the height of its 4th vertex over the largest face is negligible. */
+function flatTetra(s: SimplexVertex[]): boolean {
+  let scale = 0;
+  for (const p of s) scale = Math.max(scale, Math.abs(p.w[0]), Math.abs(p.w[1]), Math.abs(p.w[2]));
+  let maxArea2 = 0;
+  for (const [i, j, k] of TETRA_FACES) {
+    const n = cross(sub(s[j].w, s[i].w), sub(s[k].w, s[i].w));
+    maxArea2 = Math.max(maxArea2, len3(n[0], n[1], n[2]));
+  }
+  const vol6 = dot(sub(s[1].w, s[0].w), cross(sub(s[2].w, s[0].w), sub(s[3].w, s[0].w)));
+  return !(Math.abs(vol6) > FLAT_TETRA * scale * maxArea2);
+}
+
 /** Closest point of a tetrahedron to the origin; null when the origin is inside. */
 function closestTetra(s: SimplexVertex[]): Closest | null {
+  // A flat tetrahedron (GJK collects one near a face of A − B, e.g. on a hull face or a mesh
+  // triangle) has no inside: the side tests below would compare rounding noise and could
+  // report an overlap of separated shapes. Its closest point is that of its best face.
+  const flat = flatTetra(s);
   let best: Closest | null = null;
   let bestD = Infinity;
   let anyOutside = false;
   for (const [i, j, k, l] of TETRA_FACES) {
-    const a = s[i].w;
-    const n = cross(sub(s[j].w, a), sub(s[k].w, a));
-    const sp = -dot(a, n);
-    const sd = dot(sub(s[l].w, a), n);
-    // origin and the fourth vertex on opposite sides (or a flat tetrahedron)
-    const outside = Math.abs(sd) < 1e-300 ? true : sp * sd < 0;
-    if (!outside) continue;
+    if (!flat) {
+      const a = s[i].w;
+      const n = cross(sub(s[j].w, a), sub(s[k].w, a));
+      const sp = -dot(a, n);
+      const sd = dot(sub(s[l].w, a), n);
+      // origin and the fourth vertex on opposite sides
+      if (!(sp * sd < 0)) continue;
+    }
     anyOutside = true;
     const c = closestTriangle(s, i, j, k);
     const d = dot(c.v, c.v);
@@ -307,6 +331,39 @@ export function epa(supA: SupportFn, supB: SupportFn, seed: SimplexVertex[]): Ep
 function blowUp(supA: SupportFn, supB: SupportFn, verts: SimplexVertex[]): boolean {
   const eps = 1e-10;
   const scaleOf = () => Math.max(1e-9, ...verts.map((p) => len3(p.w[0], p.w[1], p.w[2])));
+  // a degenerate seed shrinks to its non-degenerate part, which is grown again below: a flat
+  // tetrahedron keeps its largest face, a collinear triangle its longest edge
+  if (verts.length === 4 && flatTetra(verts)) {
+    let drop = 0;
+    let bestArea = -1;
+    for (const [i, j, k, l] of TETRA_FACES) {
+      const n = cross(sub(verts[j].w, verts[i].w), sub(verts[k].w, verts[i].w));
+      const area = len3(n[0], n[1], n[2]);
+      if (area > bestArea) {
+        bestArea = area;
+        drop = l;
+      }
+    }
+    verts.splice(drop, 1);
+  }
+  if (verts.length === 3) {
+    let longest = 0;
+    let maxLen = -1;
+    for (let e = 0; e < 3; e++) {
+      const d = sub(verts[(e + 1) % 3].w, verts[e].w);
+      const l = len3(d[0], d[1], d[2]);
+      if (l > maxLen) {
+        maxLen = l;
+        longest = e;
+      }
+    }
+    const n = cross(sub(verts[1].w, verts[0].w), sub(verts[2].w, verts[0].w));
+    if (!(len3(n[0], n[1], n[2]) > eps * scaleOf() * maxLen)) verts.splice((longest + 2) % 3, 1);
+  }
+  if (verts.length === 2) {
+    const d = sub(verts[1].w, verts[0].w);
+    if (!(len3(d[0], d[1], d[2]) > eps * scaleOf())) verts.pop();
+  }
   if (verts.length === 0) verts.push(supportVertex(supA, supB, 1, 0, 0));
   if (verts.length === 1) {
     for (const d of [

@@ -150,7 +150,8 @@ const curveFields = {
     .optional()
     .describe(
       'Sideways offset of the bevel/extrusion/fill outline in metres. 2D curves and text: positive = outward ' +
-        "(bolder shapes, smaller holes). 3D curves: along the bevel frame's side axis; with Z_UP or MINIMUM twist " +
+        'on closed outlines (bolder shapes, smaller holes), to the left of the direction of travel (seen from +Z) ' +
+        "on open splines. 3D curves: along the bevel frame's side axis; with Z_UP or MINIMUM twist " +
         'that is the left of the direction of travel seen from above (+Z), so a flat counter-clockwise loop ' +
         'shrinks and a clockwise one grows; with TANGENT twist it points into the (first) bend. Use a negative ' +
         'value for the other side',
@@ -494,6 +495,29 @@ function wireMesh(lines: Float32Array): MeshData {
   };
 }
 
+/**
+ * Copies the animation curves and drivers of curve datablock `from` to `to` (driver variables that
+ * read `from` itself read `to`), so a copy of the data keeps animating. `keep` filters channels by path.
+ */
+function copyCurveAnimation(
+  ctx: OperatorContext,
+  from: string,
+  to: string,
+  keep: (path: string) => boolean = () => true,
+): void {
+  for (const fc of ctx.doc.listFCurves(from))
+    if (fc.target_type === 'curve' && keep(fc.path)) ctx.doc.setFCurve({ ...fc, target_id: to });
+  for (const d of ctx.doc.listDrivers(from))
+    if (d.target_type === 'curve' && keep(d.path))
+      ctx.doc.setDriver({
+        ...d,
+        target_id: to,
+        variables: (Array.isArray(d.variables) ? d.variables : []).map((v) =>
+          v?.target_type === 'curve' && v.target_id === from ? { ...v, target_id: to } : v,
+        ),
+      });
+}
+
 /** Removes a curve datablock that no object uses any more (and its animation curves). */
 function dropOrphanCurve(ctx: OperatorContext, curveId: string): void {
   if (ctx.doc.dataUsers(curveId) > 0) return;
@@ -508,7 +532,8 @@ function dropOrphanCurve(ctx: OperatorContext, curveId: string): void {
  * Converts a CURVE/FONT object (Blender's Object ▸ Convert). target MESH bakes the evaluated
  * geometry (surface, or the wire as loose edges when there is none; modifiers applied) into a mesh,
  * keeping name, transform and material slots. target CURVE turns text into a 2D curve of glyph
- * outlines (POLY splines) keeping its fill/extrude/bevel settings. Returns the converted object.
+ * outlines (POLY splines) keeping its fill/extrude/bevel settings and their animation (the layout is
+ * baked at the evaluated frame). Returns the converted object.
  */
 export function convertCurveObject(
   ctx: OperatorContext,
@@ -535,6 +560,8 @@ export function convertCurveObject(
     const data: Partial<CurveData> = { ...text, splines, dimensions: '2D', body: '' };
     delete (data as { id?: string }).id;
     const newCurve = ctx.doc.addCurve({ ...data, name: text.name });
+    // the curve keeps animating its geometry settings (extrude, bevel, …); the text layout is baked
+    copyCurveAnimation(ctx, curveId, newCurve, (path) => !TEXT_ONLY_PATHS.has(path));
     let id = o.id;
     if (keepOriginal) {
       const { id: _i, name, ...rest } = o;
@@ -574,12 +601,16 @@ export function convertCurveObject(
 
 // ------------------------------------------------------------------ object edits (used by object.ts)
 
-/** Gives an object its own copy of shared curve data before its geometry changes (like meshes). */
+/**
+ * Gives an object its own copy of shared curve data before its geometry changes (like meshes). The
+ * copy keeps the data's animation curves and drivers.
+ */
 function singleUserCurve(ctx: OperatorContext, o: ObjectData): string {
   const id = o.data!;
   if (ctx.doc.dataUsers(id) <= 1) return id;
   const { id: _id, ...fields } = ctx.doc.getCurve(id)!;
   const copy = ctx.doc.addCurve(JSON.parse(JSON.stringify(fields)) as Partial<CurveData>);
+  copyCurveAnimation(ctx, id, copy);
   ctx.doc.updateObject(o.id, { data: copy });
   return copy;
 }

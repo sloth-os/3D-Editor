@@ -6,6 +6,7 @@ import { createMesh, edgeKey } from '../mesh/types';
 import { createIcoSphere } from '../mesh/primitives';
 import { buildTopology } from '../mesh/topology';
 import { faceNormal } from '../mesh/normals';
+import { GeneratorLimitError, MAX_GENERATED_FACES } from './types';
 
 /*
  * Mesh construction kit for the procedural generators. `MeshBuilder` accumulates polygons with
@@ -44,6 +45,12 @@ export class MeshBuilder {
   readonly sharp = new Set<string>();
   private keyed: Map<string, number> | null = null;
 
+  /**
+   * @param limit most faces and most vertices the mesh may get; adding more throws a
+   *   GeneratorLimitError, so oversized requests stop early instead of exhausting memory.
+   */
+  constructor(readonly limit = MAX_GENERATED_FACES) {}
+
   get vertexCount(): number {
     return this.positions.length / 3;
   }
@@ -55,6 +62,7 @@ export class MeshBuilder {
   /** Appends a vertex; non-finite coordinates are replaced by 0. Returns its index. */
   vert(p: Readonly<Vec3>): number {
     const i = this.positions.length / 3;
+    if (i >= this.limit) throw new GeneratorLimitError(null, this.limit);
     this.positions.push(fin(p[0]), fin(p[1]), fin(p[2]));
     return i;
   }
@@ -96,6 +104,7 @@ export class MeshBuilder {
       if (uvs) uvs.splice(-2, 2);
     }
     if (vs.length < 3 || new Set(vs).size !== vs.length) return -1;
+    if (this.faces.length >= this.limit) throw new GeneratorLimitError(null, this.limit);
     this.faces.push(vs);
     this.faceUVs.push(uvs);
     this.faceMats.push(Math.max(0, Math.floor(mat)));
@@ -404,7 +413,9 @@ export function addRingSurface(
 ): void {
   const R = rings.length;
   if (R < 2) return;
-  const n = Math.max(...rings.map((r) => r.length));
+  // (a loop, not Math.max(...): spreading 100k+ rings would overflow the call stack)
+  let n = 0;
+  for (const r of rings) if (r.length > n) n = r.length;
   if (n < 3 || rings.some((r) => r.length !== 1 && r.length !== n)) return;
   const m = opts.matrix;
   const flip = !!opts.flip !== mirrored(m);
@@ -482,7 +493,8 @@ export function addLathe(
     }
     return ring;
   });
-  const rMax = Math.max(1e-6, ...prof.map((p) => Math.abs(p[0])));
+  let rMax = 1e-6;
+  for (const q of prof) rMax = Math.max(rMax, Math.abs(q[0]));
   const v: number[] = [0];
   for (let i = 1; i < prof.length; i++)
     v.push(

@@ -171,10 +171,11 @@ function signedArea(p: Vec2[]): number {
 
 /**
  * Profiles from another curve's sampled splines (bevel_mode OBJECT). The bevel object's local X axis
- * maps to the negative side axis and Y to up (Blender's mapping). A polyline is closed when its last
- * point repeats the first one, or when `closed[i]` says so; without that information a polyline whose
- * closing gap is no longer than its longest segment is taken to be closed (cyclic splines are sampled
- * without repeating their first point). Closed profiles are made counter-clockwise (outward normals).
+ * maps to the negative side axis and Y to up (Blender's mapping). `closed[i]` (the spline's cyclic
+ * flag) decides exactly whether a polyline is closed; without it a polyline is taken to be closed when
+ * its last point repeats the first one or when its closing gap is no longer than its longest segment
+ * (cyclic splines are sampled without repeating their first point). Closed profiles are made
+ * counter-clockwise (outward normals).
  */
 export function objectBevelProfiles(
   polylines: readonly Vec2[][],

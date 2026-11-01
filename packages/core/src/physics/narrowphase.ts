@@ -45,6 +45,11 @@ export interface CollisionPose {
 
 /** SAT is used for polyhedron pairs up to this many edge pairs; larger hulls use GJK/EPA. */
 const SAT_EDGE_PAIRS = 4096;
+/**
+ * Against mesh triangles SAT is used for hulls with up to this many edges (about 64 vertices);
+ * finer hulls (round meshes) use GJK/EPA, whose cost does not grow with their edge count.
+ */
+const SAT_TRIANGLE_EDGES = 192;
 
 const dot = (a: Readonly<Vec3>, b: Readonly<Vec3>) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 
@@ -568,7 +573,7 @@ function collideMesh(C: CollisionPose, M: CollisionPose, maxSep: number, out: Co
         collideBoxTriangle(box.half, boxTri, maxSep, local, skipEdge);
         for (const k of local) tmp.push(placeContact(k, A, c));
       }
-    } else if (sc.kind === 'poly' && edgeCount(sc.poly) * 3 <= SAT_EDGE_PAIRS)
+    } else if (sc.kind === 'poly' && edgeCount(sc.poly) <= SAT_TRIANGLE_EDGES)
       collidePolyhedra(sc.poly, tp, maxSep, tmp, skipEdge);
     else
       collideGeneric(

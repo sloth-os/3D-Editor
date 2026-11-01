@@ -1,5 +1,5 @@
 import type { Vec3 } from '../math/types';
-import { len3 } from './vmath';
+import { len3, perpendicular } from './vmath';
 
 /*
  * Contact manifold construction: clipping the "incident" feature of one shape against the
@@ -120,11 +120,67 @@ function clipFlat(count: number, mx: number, my: number, mz: number, offset: num
   return n;
 }
 
+/** Faces with more vertices than this are simplified before clipping (see `simplifyPolygon`). */
+export const MAX_CLIP_VERTICES = 16;
+const SIMPLIFY_COS = Array.from({ length: MAX_CLIP_VERTICES }, (_, k) =>
+  Math.cos((2 * Math.PI * k) / MAX_CLIP_VERTICES),
+);
+const SIMPLIFY_SIN = Array.from({ length: MAX_CLIP_VERTICES }, (_, k) =>
+  Math.sin((2 * Math.PI * k) / MAX_CLIP_VERTICES),
+);
+
+/**
+ * A convex polygon (flat xyz, `count` points, unit normal m) reduced to its extreme vertices
+ * along MAX_CLIP_VERTICES evenly spaced directions in its plane, plus the vertex furthest along
+ * `deep` (the deepest point of an incident face) when given. The vertices keep their cyclic
+ * order, so the result is a convex polygon inside the original with the same winding, at most
+ * 2 % smaller across for round faces. Finely tessellated faces (caps of high-poly hulls) then
+ * clip in constant time; the manifold is reduced to four points afterwards anyway.
+ */
+export function simplifyPolygon(
+  poly: ArrayLike<number>,
+  count: number,
+  mx: number,
+  my: number,
+  mz: number,
+  deep: Readonly<Vec3> | null,
+): number[] {
+  const [px, py, pz] = perpendicular(mx, my, mz);
+  const qx = my * pz - mz * py;
+  const qy = mz * px - mx * pz;
+  const qz = mx * py - my * px;
+  const keep = new Uint8Array(count);
+  const extreme = (dx: number, dy: number, dz: number) => {
+    let best = 0;
+    let bestDot = -Infinity;
+    for (let i = 0; i < count; i++) {
+      const d = poly[i * 3] * dx + poly[i * 3 + 1] * dy + poly[i * 3 + 2] * dz;
+      if (d > bestDot) {
+        bestDot = d;
+        best = i;
+      }
+    }
+    keep[best] = 1;
+  };
+  for (let k = 0; k < MAX_CLIP_VERTICES; k++) {
+    const c = SIMPLIFY_COS[k];
+    const s = SIMPLIFY_SIN[k];
+    extreme(px * c + qx * s, py * c + qy * s, pz * c + qz * s);
+  }
+  if (deep) extreme(deep[0], deep[1], deep[2]);
+  const out: number[] = [];
+  for (let i = 0; i < count; i++)
+    if (keep[i]) out.push(poly[i * 3], poly[i * 3 + 1], poly[i * 3 + 2]);
+  // a degenerate (non-finite or collapsed) face stays as it was
+  return out.length >= 9 ? out : Array.from({ length: count * 3 }, (_, i) => poly[i]);
+}
+
 /**
  * Contact points between the supporting features of two shapes (flat xyz polygons, segments or
  * points in a common frame) for a contact normal n (A → B). The feature with the higher
  * dimension, or the face better aligned with n, is the reference; the other one is clipped
  * against it and projected onto it along n. Points separated by more than `maxSep` are dropped.
+ * Faces with more than MAX_CLIP_VERTICES vertices are simplified first (`simplifyPolygon`).
  * Returns the number of contacts appended (0 when the features do not form a usable manifold).
  */
 export function clipFeatures(
@@ -170,10 +226,23 @@ export function clipFeatures(
   const ux = refIsA ? nx : -nx;
   const uy = refIsA ? ny : -ny;
   const uz = refIsA ? nz : -nz;
-  const ref = refIsA ? faceA : faceB;
-  const refCount = refIsA ? cA : cB;
-  const inc = refIsA ? faceB : faceA;
+  let ref = refIsA ? faceA : faceB;
+  let refCount = refIsA ? cA : cB;
+  let inc = refIsA ? faceB : faceA;
   let incCount = refIsA ? cB : cA;
+  // large faces (both are polygons then; their normals are oriented along u and against it)
+  if (refCount > MAX_CLIP_VERTICES) {
+    ref = refIsA
+      ? simplifyPolygon(faceA, cA, nAx, nAy, nAz, null)
+      : simplifyPolygon(faceB, cB, nBx, nBy, nBz, null);
+    refCount = ref.length / 3;
+  }
+  if (incCount > MAX_CLIP_VERTICES) {
+    inc = refIsA
+      ? simplifyPolygon(faceB, cB, nBx, nBy, nBz, [-nAx, -nAy, -nAz])
+      : simplifyPolygon(faceA, cA, nAx, nAy, nAz, [-nBx, -nBy, -nBz]);
+    incCount = inc.length / 3;
+  }
   ensureClipCapacity(incCount + refCount + 1);
   for (let i = 0; i < incCount * 3; i++) clipSrc[i] = inc[i];
   const r0x = ref[0];

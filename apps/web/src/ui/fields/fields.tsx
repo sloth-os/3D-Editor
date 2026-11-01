@@ -242,12 +242,17 @@ export function SelectField<T extends string>(p: {
   options: { value: T; label: string }[];
   onChange: (v: T) => void;
   testId?: string;
+  /** Tooltip (e.g. the parameter description). */
+  title?: string;
+  disabled?: boolean;
 }) {
   return (
     <select
       class="select"
       value={p.value}
       data-testid={p.testId}
+      title={p.title}
+      disabled={p.disabled}
       onChange={(e) => p.onChange((e.target as HTMLSelectElement).value as T)}
     >
       {p.options.map((o) => (
@@ -263,14 +268,46 @@ export function EnumButtons<T extends string>(p: {
   value: T;
   options: { value: T; label: string }[];
   onChange: (v: T) => void;
+  /** Test id of the row; each button gets `${testId}-${value}`. */
+  testId?: string;
+  title?: string;
 }) {
   return (
-    <div class="enum-row">
+    <div class="enum-row" data-testid={p.testId} title={p.title}>
       {p.options.map((o) => (
         <button
           key={o.value}
           class={`btn ${p.value === o.value ? 'active' : ''}`}
+          data-testid={p.testId ? `${p.testId}-${o.value}` : undefined}
           onClick={() => p.onChange(o.value)}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Row of independent toggle buttons (Blender's X / Y / Z axis toggles): each option is a boolean
+ * shown as a pressed (active) or released button.
+ */
+export function ToggleGroup(p: {
+  options: { label: string; value: boolean; title?: string }[];
+  onChange: (index: number, value: boolean) => void;
+  /** Test id of the row; each button gets `${testId}-${index}`. */
+  testId?: string;
+}) {
+  return (
+    <div class="enum-row" data-testid={p.testId}>
+      {p.options.map((o, i) => (
+        <button
+          key={i}
+          class={`btn ${o.value ? 'active' : ''}`}
+          title={o.title}
+          aria-pressed={o.value}
+          data-testid={p.testId ? `${p.testId}-${i}` : undefined}
+          onClick={() => p.onChange(i, !o.value)}
         >
           {o.label}
         </button>
@@ -313,10 +350,16 @@ export function TextField(p: {
   );
 }
 
-export function Row(p: { label?: string; children: ComponentChildren; full?: boolean }) {
+export function Row(p: {
+  label?: string;
+  children: ComponentChildren;
+  full?: boolean;
+  /** Tooltip of the label (e.g. the property description). */
+  title?: string;
+}) {
   return (
     <div class={`prop-row ${p.full ? 'full' : ''}`}>
-      {!p.full && <label>{p.label}</label>}
+      {!p.full && <label title={p.title}>{p.label}</label>}
       <div>{p.children}</div>
     </div>
   );

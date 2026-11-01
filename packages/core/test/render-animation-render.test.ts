@@ -258,15 +258,14 @@ describe('renderAnimation', () => {
       time_limit_reached: true,
       undersampled_frames: [1],
     });
-    // several frames: the budget is shared and no frame starts after it is used up
+    // several frames: each path traced frame gets an equal share of the remaining budget, so the
+    // whole animation comes back (noisier) instead of the first frame using all of it
     t0 = performance.now();
-    const res = renderAnimation(doc, { ...traced, frame_end: 3, total_time_limit: 0.5 });
-    expect((performance.now() - t0) / 1000).toBeLessThan(6);
-    expect(res.time_limit_reached).toBe(true);
-    expect(res.frames.length).toBeGreaterThanOrEqual(1);
-    expect(res.cancelled).toBe(res.frames.length < 3);
-    expect(res.undersampled_frames.length).toBeGreaterThanOrEqual(1);
-    expect(decodeAPNG(res.data!).numFrames).toBe(res.frames.length);
+    const res = renderAnimation(doc, { ...traced, frame_end: 3, total_time_limit: 1.5 });
+    expect((performance.now() - t0) / 1000).toBeLessThan(8);
+    expect(res).toMatchObject({ frames: [1, 2, 3], cancelled: false, time_limit_reached: true });
+    expect(res.undersampled_frames).toEqual([1, 2, 3]);
+    expect(decodeAPNG(res.data!).numFrames).toBe(3);
     // raster frames: no frame is started once the budget is used up, but one is always rendered
     const quick = renderAnimation(doc, { width: 16, height: 9, total_time_limit: 1e-9 });
     expect(quick).toMatchObject({ frames: [1], cancelled: true, time_limit_reached: true });

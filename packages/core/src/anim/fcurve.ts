@@ -76,12 +76,21 @@ export function evaluateFCurve(fc: FCurve, frame: number): number | undefined {
   return fc.modifiers?.length ? applyFModifiers(fc.modifiers, frame, v, sample, cycle) : v;
 }
 
-/** Maps frames into the keyed range that CYCLIC extrapolation repeats (undefined: no range). */
+/**
+ * Maps frames into the keyed range that CYCLIC extrapolation repeats (undefined: no range). Like
+ * Blender's Cycles modifier, a frame an exact number of cycles after the last key maps to the last
+ * key (before the first key: to the first key), so non-seamless curves keep their end value there.
+ */
 function cycleTime(keys: Keyframe[]): ((frame: number) => number) | undefined {
   const a = keys[0].frame;
   const span = keys[keys.length - 1].frame - a;
   if (!(span > 0)) return undefined;
-  return (f) => (f < a || f > a + span ? a + ((((f - a) % span) + span) % span) : f);
+  return (f) => {
+    if (f >= a && f <= a + span) return f;
+    const r = (((f - a) % span) + span) % span;
+    if (r === 0) return f > a ? a + span : a;
+    return a + r;
+  };
 }
 
 function evaluateKeys(fc: FCurve, keys: Keyframe[], frame: number): number {

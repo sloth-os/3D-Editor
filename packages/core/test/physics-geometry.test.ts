@@ -330,6 +330,65 @@ describe('GJK / EPA', () => {
     expect(s.depth).toBeCloseTo(0.5, 2);
     expect(s.normal[2]).toBeCloseTo(1, 2);
   });
+
+  it('does not take a flat simplex near a face for an overlap (no dropped contacts)', () => {
+    // a sphere whose centre is 3.6 mm from a box face: GJK collects four coplanar points of that
+    // face, whose side tests are rounding noise; the generic path must match the closed form
+    const box = buildCollisionShape('BOX', createCube({ size: 1 }), [1.5, 1, 1], { dynamic: true });
+    if ('error' in box || box.shape.kind !== 'poly') throw new Error('box expected');
+    const hull: Shape = { kind: 'poly', poly: box.shape.poly };
+    const sphere = shapeOf('SPHERE', createUVSphere({ radius: 0.5 }));
+    const at = (shape: Shape, p: Vec3, q: [number, number, number, number]): CollisionPose => ({
+      shape,
+      px: p[0],
+      py: p[1],
+      pz: p[2],
+      R: quatToMat3(q),
+      boundingRadius: boundingRadius(shape),
+    });
+    const P: Vec3 = [0.2621709108352661, 0.9022690057754517, -0.03577888011932373];
+    const QA: [number, number, number, number] = [
+      0.5497542965238732, 0.5877717613386175, -0.0019024880067923641, 0.5935410268598326,
+    ];
+    const QB: [number, number, number, number] = [
+      -0.3572062461578949, 0.7924403118064235, -0.45751967805498306, 0.18739742293422298,
+    ];
+    const closed: ContactCandidate[] = [];
+    const generic: ContactCandidate[] = [];
+    collide(at(sphere, P, QB), at(box.shape, [0, 0, 0], QA), 0.1, closed);
+    collide(at(sphere, P, QB), at(hull, [0, 0, 0], QA), 0.1, generic);
+    expect(closed.length).toBe(1);
+    expect(generic.length).toBe(1);
+    expect(generic[0].s).toBeCloseTo(closed[0].s, 9);
+    for (let k = 0; k < 3; k++) expect(generic[0].n[k]).toBeCloseTo(closed[0].n[k], 9);
+  });
+
+  it('expands EPA from a flat seed simplex instead of giving up', () => {
+    const a = boxSup([0, 0, 0], [1, 1, 1]);
+    const b = boxSup([1.8, 0.2, 0.1], [1, 1, 1]);
+    // four corners of the face x = 0.2 of A − B (coplanar)
+    const seed = [
+      [1, -1, -1],
+      [1, 1, -1],
+      [1, 1, 1],
+      [1, -1, 1],
+    ].map(([x, y, z]) => {
+      const pa = new Float64Array(3);
+      const pb = new Float64Array(3);
+      a(x, y, z, pa);
+      b(-x, -y, -z, pb);
+      return {
+        a: [...pa] as Vec3,
+        b: [...pb] as Vec3,
+        w: [pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]] as Vec3,
+      };
+    });
+    expect(seed.every((v) => Math.abs(v.w[0] - 0.2) < 1e-12)).toBe(true);
+    const e = epa(a, b, seed)!;
+    expect(e).not.toBeNull();
+    expect(e.depth).toBeCloseTo(0.2, 6);
+    expect(e.normal[0]).toBeCloseTo(1, 6);
+  });
 });
 
 describe('SAT between polyhedra', () => {

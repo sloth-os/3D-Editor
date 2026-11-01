@@ -288,7 +288,8 @@ describe('STEPPED', () => {
       modifiers: [mod('NOISE', { scale: 5, strength: 1 })],
     };
     const first = [1, 5, 10, 24].map((f) => at(curve, f));
-    expect([25 + 24, 29, 34, 48].map((f) => at(curve, f))).toEqual(first); // frame 49 starts cycle 3 like 1
+    // like Blender's Cycles modifier, an exact cycle multiple after the last key (49) maps to the last key
+    expect([49, 29, 34, 48].map((f) => at(curve, f))).toEqual([at(curve, 25), ...first.slice(1)]);
     expect([-23, -19, -14, 0].map((f) => at(curve, f))).toEqual(first);
   });
 });

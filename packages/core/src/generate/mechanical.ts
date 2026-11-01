@@ -12,7 +12,7 @@ import {
   sub,
   tubeRings,
 } from './builder';
-import { MATERIALS, type GeneratorResult } from './types';
+import { MATERIALS, checkFaceBudget, type GeneratorResult } from './types';
 
 /*
  * Mechanical parts: spur gear, coil spring and pipe (circle swept along a filleted polyline).
@@ -135,6 +135,9 @@ export function generateSpring(params: Partial<SpringParams> = {}): GeneratorRes
     if (u > turns - closedTurns) return z1 - (endRise * (turns - u)) / closedTurns;
     return z0 + endRise + ((z1 - z0 - 2 * endRise) * (u - closedTurns)) / Math.max(1e-9, active);
   };
+  const sides = Math.floor(clampNum(p.wire_segments, 3, 64, 12));
+  // one ring of `sides` quads per path sample (fail before building an oversized wire)
+  checkFaceBudget(steps * sides + 2);
   const path: Vec3[] = [];
   for (let i = 0; i <= steps; i++) {
     const u = (turns * i) / steps;
@@ -142,7 +145,7 @@ export function generateSpring(params: Partial<SpringParams> = {}): GeneratorRes
     path.push([R * Math.cos(a), R * Math.sin(a), zAt(u)]);
   }
   const b = new MeshBuilder();
-  addTube(b, path, wr, clampNum(p.wire_segments, 3, 64, 12), { smooth: true });
+  addTube(b, path, wr, sides, { smooth: true });
   // the polygonal wire does not reach exactly z = 0 / H: snap the extremes (a sub-millimetre stretch)
   const { min, max } = b.bounds();
   const span = max[2] - min[2];
@@ -249,7 +252,11 @@ export function filletPath(
  */
 export function generatePipe(params: Partial<PipeParams> = {}): GeneratorResult {
   const p = { ...PIPE_DEFAULTS, ...params };
-  const pts = (p.points ?? []).filter((q) => Array.isArray(q) && q.length >= 2 && q.every(Number.isFinite));
+  const given = p.points ?? [];
+  const pts = given.filter((q) => Array.isArray(q) && q.length >= 2 && q.every(Number.isFinite));
+  const warnings: string[] = [];
+  if (pts.length < given.length)
+    warnings.push(`ignored ${given.length - pts.length} point(s) with missing or non-finite coordinates`);
   const path3: Vec3[] = pts.map((q) => [q[0], q[1], q[2] ?? 0]);
   const radius = clampNum(p.radius, 1e-4, 1e3, PIPE_DEFAULTS.radius);
   const sides = Math.round(clampNum(p.segments, 3, 128, 16));
@@ -257,8 +264,16 @@ export function generatePipe(params: Partial<PipeParams> = {}): GeneratorResult 
   const bend = p.bend_radius > 0 ? Math.max(clampNum(p.bend_radius, 0, 1e4, 0), radius * 1.05) : 0;
   const path = bend > 0 ? filletPath(path3, bend, clampNum(p.bend_segments, 1, 64, 6), cyclic) : path3;
   const b = new MeshBuilder();
-  if (path.length < 2) return { mesh: b.build(), materials: [MATERIALS.metal] };
+  const distinct = path.filter((q, i) => i === 0 || len(sub(q, path[i - 1])) >= 1e-9).length;
+  if (distinct < 2) {
+    warnings.push(
+      `the path needs at least 2 distinct points (got ${distinct}); nothing to sweep the pipe along`,
+    );
+    return { mesh: b.build(), materials: [MATERIALS.metal], warnings };
+  }
   const thickness = clampNum(p.thickness, 0, radius * 0.95, 0);
+  // one ring of `sides` quads per path point (twice for a hollow pipe); fail before sweeping
+  checkFaceBudget(path.length * sides * (thickness > 0 ? 2 : 1));
   const miter = bend <= 0;
   if (thickness <= 0) {
     addTube(b, path, radius, sides, { smooth: true, cyclic, caps: p.closed_ends, miter });
@@ -282,7 +297,7 @@ export function generatePipe(params: Partial<PipeParams> = {}): GeneratorResult 
       }
     }
   }
-  return { mesh: b.build(), materials: [MATERIALS.metal] };
+  return { mesh: b.build(), materials: [MATERIALS.metal], ...(warnings.length ? { warnings } : {}) };
 }
 
 /** Simple 2D helper used by other generators: regular polygon outline. */

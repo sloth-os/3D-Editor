@@ -345,6 +345,49 @@ describe('object.convert', () => {
     const tm = doc.getMesh(doc.getObject(t.object)!.data!)!;
     expect(isClosedManifold(tm)).toBe(true);
   });
+
+  it('keeps the geometry animation of text converted to a curve (the layout is baked)', () => {
+    const { doc, ok } = setup();
+    const t = ok('object.text_add', { body: 'Hi', extrude: 0.05, location: [0, 0, 0] });
+    ok('curve.keyframe_insert', { path: 'extrude', frame: 1, value: 0 });
+    ok('curve.keyframe_insert', { path: 'extrude', frame: 11, value: 0.2 });
+    ok('curve.keyframe_insert', { path: 'size', frame: 1, value: 1 });
+    ok('curve.keyframe_insert', { path: 'size', frame: 11, value: 2 });
+    const top = (frame: number) => {
+      const m = new SceneEvaluator(doc).evaluate(frame).byId.get(t.object)!.mesh!;
+      return Math.max(...m.positions.filter((_, i) => i % 3 === 2));
+    };
+    expect(top(11)).toBeCloseTo(0.2);
+    const r = ok('object.convert', { target: 'CURVE' });
+    expect(r.converted).toEqual([{ object: t.object, name: 'Text', type: 'CURVE' }]);
+    const data = doc.getObject(t.object)!.data!;
+    expect(data).not.toBe(t.curve);
+    // extrude keeps animating the converted curve; the text size channel is gone with the text
+    expect(doc.listFCurves(data).map((f) => f.path)).toEqual(['extrude']);
+    expect(doc.listFCurves(t.curve)).toHaveLength(0);
+    expect(top(6)).toBeCloseTo(0.1);
+    expect(top(11)).toBeCloseTo(0.2);
+  });
+
+  it('keeps the original mesh object and its modifiers with keep_original', () => {
+    const { doc, ctx, ok } = setup();
+    const m = ok('mesh.primitive_cube_add', { size: 1 });
+    const id = m.object ?? m.id;
+    ok('object.modifier_add', { object: id, type: 'SUBSURF' });
+    ctx.state.selectedIds = [id];
+    const r = ok('object.convert', { target: 'MESH', keep_original: true });
+    expect(r.converted).toHaveLength(1);
+    const copy = doc.getObject(r.converted[0].object)!;
+    expect(copy.id).not.toBe(id);
+    expect(copy).toMatchObject({ type: 'MESH', modifiers: [] });
+    expect(doc.getMesh(copy.data!)!.positions.length / 3).toBe(26);
+    // the original is untouched
+    const orig = doc.getObject(id)!;
+    expect(orig.modifiers).toHaveLength(1);
+    expect(orig.data).not.toBe(copy.data);
+    expect(doc.getMesh(orig.data!)!.positions.length / 3).toBe(8);
+    expect(ctx.state.selectedIds).toEqual([copy.id]);
+  });
 });
 
 const toWorld = (w: Mat4, p: readonly number[]): Vec3 => [
@@ -574,6 +617,53 @@ describe('object transforms of curves and text', () => {
     expect(doc.getCurve(t.curve)!.size).toBe(1);
   });
 
+  it('keeps the animation of shared curve data on the copy an applied object gets', () => {
+    const { doc, ctx, ok } = setup();
+    const a = ok('curve.add_from_points', {
+      points: [
+        [0, 0, 0],
+        [1, 0, 0],
+      ],
+      bevel_depth: 0.1,
+      location: [0, 0, 0],
+      scale: [2, 2, 2],
+    });
+    const twin = doc.addObject({ type: 'CURVE', name: 'Twin', data: a.curve, location: [0, 3, 0] });
+    ok('curve.keyframe_insert', { object: a.object, path: 'bevel_factor_end', frame: 1, value: 0 });
+    ok('curve.keyframe_insert', { object: a.object, path: 'bevel_factor_end', frame: 11, value: 1 });
+    doc.setDriver({
+      target_type: 'curve',
+      target_id: a.curve,
+      path: 'bevel_depth',
+      index: 0,
+      expression: 'var + 0.1',
+      variables: [{ name: 'var', target_type: 'curve', target_id: a.curve, path: 'extrude', index: 0 }],
+      mute: false,
+    });
+    const at6 = worldGeometry(doc, a.object, 6);
+    const twinAt6 = worldGeometry(doc, twin, 6);
+    ctx.state.selectedIds = [a.object];
+    ok('object.transform_apply');
+    const data = doc.getObject(a.object)!.data!;
+    expect(data).not.toBe(a.curve);
+    // the half-grown tube looks the same at frame 6, for both users of the data
+    expectSamePoints(at6, worldGeometry(doc, a.object, 6));
+    expectSamePoints(twinAt6, worldGeometry(doc, twin, 6));
+    expect(doc.listFCurves(data).map((f) => f.path)).toEqual(['bevel_factor_end']);
+    expect(doc.listFCurves(a.curve).map((f) => f.path)).toEqual(['bevel_factor_end']);
+    // drivers are copied too, reading the copy where they read the data itself
+    const driver = doc.listDrivers(data)[0];
+    expect(driver).toMatchObject({ path: 'bevel_depth', target_id: data });
+    expect(driver.variables[0].target_id).toBe(data);
+    expect(doc.listDrivers(a.curve)[0].variables[0].target_id).toBe(a.curve);
+    // origin_set copies shared data the same way
+    const b = doc.addObject({ type: 'CURVE', name: 'Third', data, location: [0, -3, 0] });
+    ctx.state.selectedIds = [b];
+    ok('object.origin_set', { type: 'ORIGIN_GEOMETRY' });
+    expect(doc.getObject(b)!.data).not.toBe(data);
+    expect(doc.listFCurves(doc.getObject(b)!.data!).map((f) => f.path)).toEqual(['bevel_factor_end']);
+  });
+
   it('sets the origin of curves (control points) and text (offsets) without moving them', () => {
     const { doc, ctx, ok } = setup();
     const c = ok('curve.add_from_points', {
@@ -721,10 +811,23 @@ describe('agent-facing results and validation', () => {
       location: [0, 0, 0],
     });
     expect(maxX(flat.object)).toBeGreaterThan(1.15);
+    // open 2D splines have no outside: the offset goes to the left of the direction of travel
+    const open = ok('curve.add_from_points', {
+      points: [
+        [0, 0, 0],
+        [2, 0, 0],
+      ],
+      dimensions: '2D',
+      extrude: 0.05,
+      offset: 0.2,
+      location: [0, 0, 0],
+    });
+    for (const p of worldGeometry(doc, open.object)) expect(p[1]).toBeCloseTo(0.2, 9);
     const info = reg.describe().find((i) => i.id === 'curve.properties_set')!;
     const offset = (info.parameters as { properties: Record<string, { description: string }> }).properties
       .offset;
     expect(offset.description).toMatch(/counter-clockwise loop shrinks/);
+    expect(offset.description).toMatch(/left of the direction of travel \(seen from \+Z\) on open splines/);
   });
 });
 

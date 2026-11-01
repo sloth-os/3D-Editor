@@ -17,7 +17,7 @@ import {
   scale,
   sub,
 } from './builder';
-import { MATERIALS, type GeneratedMaterial, type GeneratorResult } from './types';
+import { MATERIALS, checkFaceBudget, type GeneratedMaterial, type GeneratorResult } from './types';
 
 /*
  * Vegetation: trees (DECIDUOUS / CONIFER / PALM), bush, grass tuft and flower. Everything is built
@@ -87,7 +87,12 @@ function tilt(axis: Vec3, angle: number, az: number): Vec3 {
 function fitHeight(elements: { z: number; extra: number }[], height: number): number {
   let lo = 0.05;
   let hi = 20;
-  const top = (f: number) => Math.max(...elements.map((e) => e.z * f + e.extra));
+  // (a loop, not Math.max(...): big trees have far more elements than the call stack allows)
+  const top = (f: number) => {
+    let m = -Infinity;
+    for (const e of elements) m = Math.max(m, e.z * f + e.extra);
+    return m;
+  };
   if (top(hi) < height) return hi;
   if (top(lo) > height) return lo;
   for (let i = 0; i < 50; i++) {
@@ -193,6 +198,11 @@ function addLimb(b: MeshBuilder, l: Limb, sides: number): void {
   addTube(b, l.pts, (i) => l.radii[i], sides, { mat: 0, smooth: true });
 }
 
+/** Vertices around a limb of a branching level (the trunk uses the full resolution). */
+function limbSides(p: TreeParams, level: number): number {
+  return level === 0 ? p.resolution : Math.max(3, p.resolution - 2 * level);
+}
+
 function deciduous(p: TreeParams): GeneratorResult {
   const H = p.height;
   const rng = new Rng(p.seed, 0xdec1);
@@ -253,6 +263,11 @@ function deciduous(p: TreeParams): GeneratorResult {
     if (r.next() >= p.leaf_density) return;
     clumps.push({ c, r: (p.leaf_size / 2) * r.range(0.75, 1.2) });
   });
+  // fail fast (before meshing) when the branching makes the mesh too big: one tube per limb
+  // (sides × segments + 2 caps) and an 80-triangle icosphere per leaf clump
+  let estimate = clumps.length * 80;
+  for (const l of limbs) estimate += (l.pts.length - 1) * limbSides(p, l.level) + 2;
+  checkFaceBudget(estimate);
   // fit the skeleton so the crown top lands on the requested height
   const elements = [
     ...limbs.flatMap((l) => l.pts.map((pt, i) => ({ z: pt[2], extra: l.radii[i] }))),
@@ -262,8 +277,7 @@ function deciduous(p: TreeParams): GeneratorResult {
   for (const l of limbs) l.pts = l.pts.map((pt) => scale(pt, f));
   for (const k of clumps) k.c = add(scale(k.c, f), [0, 0, k.r * 0.2]);
   const b = new MeshBuilder();
-  for (const l of limbs)
-    addLimb(b, l, l.level === 0 ? p.resolution : Math.max(3, p.resolution - 2 * l.level));
+  for (const l of limbs) addLimb(b, l, limbSides(p, l.level));
   const noise = new GradientNoise(p.seed + 17);
   clumps.forEach((k, i) => addClump(b, noise, k.c, k.r, 0.8, i * 3.7));
   exactHeight(b, H);

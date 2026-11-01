@@ -1098,9 +1098,10 @@ export interface AnimationRenderOptions {
   time_limit?: number;
   /**
    * Wall-clock budget of the whole render in seconds (0 / unset = none). Each path traced frame
-   * gets at most the remaining time as its time limit (it then stops sampling early, after at
-   * least one sample), and no frame is started once the budget is used up: the frames rendered so
-   * far are encoded and `cancelled` is true. At least one frame is always rendered.
+   * gets at most an equal share of the remaining time (remaining / frames left) as its time limit
+   * (it then stops sampling early, after at least one sample), so long renders come back complete
+   * but noisier; no frame is started once the budget is used up: the frames rendered so far are
+   * encoded and `cancelled` is true. At least one frame is always rendered.
    */
   total_time_limit?: number;
   /** PATHTRACER: noise pattern seed (default 0). */
@@ -1325,8 +1326,9 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
     let timeLimit = opts.time_limit;
     let budgetBound = false;
     if (budget > 0) {
-      // a path traced frame may use the rest of the budget (at least one sample is rendered)
-      const rest = Math.max(1e-3, left());
+      // a path traced frame gets an equal share of the rest of the budget (at least one sample is
+      // rendered), so the animation completes instead of the first frames using it all
+      const rest = Math.max(1e-3, left() / (total - i));
       if (!(typeof timeLimit === 'number' && timeLimit > 0 && timeLimit <= rest)) {
         timeLimit = rest;
         budgetBound = true;

@@ -977,7 +977,9 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         keep_original: z
           .boolean()
           .default(false)
-          .describe('Curves/text: keep the original object and add the converted copy (selected afterwards)'),
+          .describe(
+            'Keep the original object and add the converted copy (the copies are selected afterwards)',
+          ),
       }),
       poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
       execute(ctx, p) {
@@ -992,6 +994,14 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           if (p.target !== 'MESH' || o.type !== 'MESH' || !o.data || o.modifiers.length === 0) continue;
           const mesh = ev.byId.get(o.id)?.mesh;
           if (!mesh) continue;
+          if (p.keep_original) {
+            // a copy gets the baked result; the original keeps its modifier stack
+            const { id: _id, name, ...rest } = o;
+            const copyMesh = ctx.doc.addMesh(ctx.doc.getMeshBlock(o.data)?.name ?? name, cloneMesh(mesh));
+            const id = ctx.doc.addObject({ ...rest, name, data: copyMesh, modifiers: [] });
+            converted.push({ object: id, name: ctx.doc.getObject(id)!.name, type: 'MESH' });
+            continue;
+          }
           const meshId = singleUserMesh(ctx, o);
           ctx.doc.setMesh(meshId, cloneMesh(mesh));
           ctx.doc.updateObject(o.id, { modifiers: [] });
