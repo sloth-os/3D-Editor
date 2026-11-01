@@ -695,8 +695,7 @@ function drivableChannels(s: ProjectSession, o: ObjectData): Channel[] {
   for (const t of targets.slice(1)) {
     const group = `${t.type.charAt(0).toUpperCase()}${t.type.slice(1)}: ${t.name}`;
     if (t.type === 'mesh') {
-      for (const key of s.doc.getShapeKeys(t.id))
-        add(t, group, `shape_keys[${quoteKey(key.name)}].value`, 1);
+      for (const key of s.doc.getShapeKeys(t.id)) add(t, group, `shape_keys[${quoteKey(key.name)}].value`, 1);
       continue;
     }
     for (const [prop, length] of Object.entries(ANIMATABLE[t.type] ?? {})) add(t, group, prop, length);
