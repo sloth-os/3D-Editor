@@ -116,11 +116,11 @@ describe('wire curves', () => {
 describe('round bevel', () => {
   it('sweeps a closed circle into a watertight torus with outward normals', () => {
     const m = mesh(curve([circle(1)], { bevel_depth: 0.1, bevel_resolution: 4 }));
-    // 4 Bezier segments × 12 samples, 4 × 4 + 4 profile points
-    expect(m.positions.length / 3).toBe(48 * 20);
-    expect(m.faces).toHaveLength(48 * 20);
+    // 4 Bezier segments × 12 samples, 4 + 2 × 4 profile points (Blender's full-circle bevel)
+    expect(m.positions.length / 3).toBe(48 * 12);
+    expect(m.faces).toHaveLength(48 * 12);
     expect(isClosedManifold(m)).toBe(true);
-    const ideal = (2 * Math.PI * Math.PI * 1 * 0.01 * ((20 / 2) * Math.sin((2 * Math.PI) / 20))) / Math.PI;
+    const ideal = (2 * Math.PI * Math.PI * 1 * 0.01 * ((12 / 2) * Math.sin((2 * Math.PI) / 12))) / Math.PI;
     expect(volume(m)).toBeGreaterThan(0);
     expect(volume(m) / ideal).toBeCloseTo(1, 1);
     for (let i = 0; i < m.positions.length / 3; i++) {
@@ -147,6 +147,35 @@ describe('round bevel', () => {
     expect(bounds(half).max[1]).toBeCloseTo(0.2);
   });
 
+  it("builds Blender's full-circle ring: 4 + 2 × bevel_resolution points, smooth at every resolution", () => {
+    for (let res = 0; res <= 6; res++) {
+      const prof = roundBevelProfile(0.5, 0, res, 'FULL')!;
+      const n = 4 + 2 * res;
+      expect(prof.points).toHaveLength(n);
+      expect(prof.closed).toBe(true);
+      expect(prof.sharp.some(Boolean)).toBe(false);
+      // evenly spaced on the circle at multiples of 2π/n (Blender's angles), counter-clockwise
+      const angles = prof.points.map(([x, y]) => {
+        expect(Math.hypot(x, y)).toBeCloseTo(0.5, 12);
+        return (Math.atan2(y, x) + 2 * Math.PI) % (2 * Math.PI);
+      });
+      for (const a of angles)
+        expect(Math.abs(Math.round((a * n) / (2 * Math.PI)) - (a * n) / (2 * Math.PI))).toBeLessThan(1e-9);
+      let area = 0;
+      prof.points.forEach((p, i) => {
+        const q = prof.points[(i + 1) % n];
+        area += p[0] * q[1] - q[0] * p[1];
+      });
+      expect(area).toBeGreaterThan(0);
+      // quarter-based profiles (extrusion) keep bevel_resolution + 1 segments per quarter
+      expect(roundBevelProfile(0.5, 0.2, res, 'FULL')!.points).toHaveLength(4 * (res + 1) + 2);
+    }
+    // a tube at the default resolution: 12 vertices per ring, as in Blender
+    const tube = mesh(curve([line(0, 1)], { bevel_depth: 0.1 }));
+    expect(tube.positions.length / 3).toBe(2 * 12);
+    expect(Object.keys(tube.edgeAttrs)).toHaveLength(0);
+  });
+
   it('extrudes 3D curves into ribbons (Z up) and rounds the extrusion with a bevel', () => {
     const ribbon = mesh(curve([line(0, 2)], { extrude: 0.5 }));
     expect(ribbon.positions.length / 3).toBe(4);
@@ -166,8 +195,8 @@ describe('round bevel', () => {
       use_fill_caps: true,
     });
     const m = mesh(c);
-    // 13 samples, the last one collapsed to a single vertex
-    expect(m.positions.length / 3).toBe(12 * 12 + 1);
+    // 13 samples of 4 + 2 × 2 points, the last one collapsed to a single vertex
+    expect(m.positions.length / 3).toBe(12 * 8 + 1);
     expect(isClosedManifold(m)).toBe(true);
     expect(volume(m)).toBeGreaterThan(0);
     const mid = mesh({
@@ -208,7 +237,8 @@ describe('round bevel', () => {
       if (Math.abs(v[0] - 2) < 0.2 && Math.abs(v[1]) < 0.2) far = Math.max(far, Math.hypot(v[0] - 2, v[1]));
     }
     expect(far).toBeCloseTo(0.1 * Math.SQRT2, 6);
-    expect(Object.values(m.edgeAttrs).filter((a) => a.sharp).length).toBe(20);
+    // the corner ring's 12 edges; the round profile itself stays smooth
+    expect(Object.values(m.edgeAttrs).filter((a) => a.sharp).length).toBe(12);
   });
 });
 
@@ -232,6 +262,45 @@ describe('bevel factor', () => {
     const m = mesh({ ...c, bevel_factor_start: 0 });
     for (const uv of m.uvs!)
       for (let i = 0; i < uv.length; i += 2) expect(uv[i]).toBeLessThanOrEqual(0.6 + 1e-9);
+  });
+});
+
+describe('bevel factor on filled shapes', () => {
+  it('keeps the closed outlines of filled 2D curves whole, so the solid stays closed', () => {
+    const base = curve([square(1), square(0.5)], { dimensions: '2D', extrude: 0.1 });
+    const whole = mesh(base);
+    for (const extra of [{ bevel_factor_end: 0.5 }, { bevel_factor_start: 0.3, bevel_factor_end: 0.4 }]) {
+      const m = mesh({ ...base, ...extra });
+      expect(isClosedManifold(m)).toBe(true);
+      expect(m.faces).toHaveLength(whole.faces.length);
+      expect(volume(m)).toBeCloseTo(volume(whole));
+    }
+    // even an empty range keeps the filled solid (the factors do not apply to it)
+    expect(isClosedManifold(mesh({ ...base, bevel_factor_end: 0 }))).toBe(true);
+    // beveled too
+    expect(isClosedManifold(mesh({ ...base, bevel_depth: 0.05, bevel_factor_end: 0.5 }))).toBe(true);
+  });
+
+  it('still trims outlines without fill and open splines of 2D curves (growing outlines)', () => {
+    const outline = curve([square(1)], { dimensions: '2D', extrude: 0.1, fill_mode: 'NONE' });
+    const half = mesh({ ...outline, bevel_factor_end: 0.5 });
+    // half of the four walls
+    expect(areaZ(half)).toBeCloseTo(0);
+    expect(half.faces).toHaveLength(2);
+    // an open spline next to a filled square is trimmed, the square is not
+    const mixed = mesh(
+      curve([square(1), line(3, 5)], { dimensions: '2D', extrude: 0.1, bevel_factor_end: 0.5 }),
+    );
+    expect(bounds(mixed).max[0]).toBeCloseTo(4);
+    expect(bounds(mixed).min[0]).toBeCloseTo(-1);
+  });
+
+  it('keeps extruded text closed while bevel_factor_end is animated', () => {
+    const t: CurveData = { ...defaultCurve('t', 'T'), body: 'O8', dimensions: '2D', extrude: 0.1 };
+    for (const f of [0, 0.25, 0.5, 1]) {
+      const m = curveToMesh({ ...t, bevel_factor_end: f }, { forRender: false, isText: true }).mesh!;
+      expect(isClosedManifold(m)).toBe(true);
+    }
   });
 });
 
@@ -476,6 +545,74 @@ describe('bevel objects', () => {
     );
   });
 
+  it('scales the profile by the bevel object scale (getBevelScale)', () => {
+    const c = curve([line(0, 2)], { bevel_mode: 'OBJECT', bevel_object: 'p' });
+    const plain = mesh(c, { getBevelProfile: () => [sq] });
+    expect(bounds(plain).max[2]).toBeCloseTo(0.1);
+    const scaled = mesh(c, { getBevelProfile: () => [sq], getBevelScale: () => [3, 2] });
+    // the profile's X maps to the side (Y here), its Y to up (Z)
+    expect(bounds(scaled).max[1]).toBeCloseTo(0.3);
+    expect(bounds(scaled).max[2]).toBeCloseTo(0.2);
+    // exact curves are scaled the same way
+    const prof = curve([
+      spline(
+        'POLY',
+        sq.map(([x, y]) => pt([x, y, 0])),
+        { use_cyclic_u: true },
+      ),
+    ]);
+    const exact = mesh(c, { getBevelCurve: () => prof, getBevelScale: () => [3, 2] });
+    expect(bounds(exact).max[1]).toBeCloseTo(0.3);
+    expect(isClosedManifold(mesh({ ...c, use_fill_caps: true }, { getBevelCurve: () => prof }))).toBe(true);
+    // a degenerate scale leaves no usable profile
+    expect(build(c, { getBevelProfile: () => [sq], getBevelScale: () => [0, 0] }).errors?.[0]).toMatch(
+      /bevel object/,
+    );
+  });
+
+  it('sweeps open and cyclic bevel objects exactly in the scene (no guessing from the end gap)', () => {
+    const doc = new SceneDoc();
+    // an open "U" channel whose end gap equals its longest segment, and a cyclic trapezoid whose
+    // closing edge is its longest edge: both were misclassified by the gap heuristic
+    const u = doc.addCurve({
+      splines: [
+        spline('POLY', [pt([-0.1, 0.1, 0]), pt([-0.1, -0.1, 0]), pt([0.1, -0.1, 0]), pt([0.1, 0.1, 0])]),
+      ],
+    });
+    const trap = doc.addCurve({
+      splines: [
+        spline('POLY', [pt([-0.2, 0, 0]), pt([-0.1, 0.1, 0]), pt([0.1, 0.1, 0]), pt([0.2, 0, 0])], {
+          use_cyclic_u: true,
+        }),
+      ],
+    });
+    const uId = doc.addObject({ type: 'CURVE', name: 'U', data: u, location: [5, 0, 0] });
+    const trapId = doc.addObject({ type: 'CURVE', name: 'Trap', data: trap, location: [5, 2, 0] });
+    const rail = (name: string, bevel: string, extra: Partial<CurveData> = {}) =>
+      doc.addObject({
+        type: 'CURVE',
+        name,
+        data: doc.addCurve({
+          splines: [line(0, 2)],
+          bevel_mode: 'OBJECT',
+          bevel_object: bevel,
+          ...extra,
+        }),
+      });
+    const r1 = rail('R1', uId);
+    const r2 = rail('R2', trapId, { use_fill_caps: true });
+    const ev = new SceneEvaluator(doc);
+    const a = ev.evaluate(1);
+    expect(a.byId.get(r1)!.mesh!.faces).toHaveLength(3);
+    expect(isClosedManifold(a.byId.get(r2)!.mesh!)).toBe(true);
+    expect(a.errors).toEqual([]);
+    // scaling the bevel object in Object Mode makes the tube wider, and re-evaluates
+    const before = bounds(a.byId.get(r1)!.mesh!).max[1];
+    doc.updateObject(uId, { scale: [3, 3, 3] });
+    const b = ev.evaluate(1).byId.get(r1)!.mesh!;
+    expect(bounds(b).max[1]).toBeCloseTo(3 * before);
+  });
+
   it('reports a missing bevel object and falls back to the wire', () => {
     const r = build(curve([circle(1)], { bevel_mode: 'OBJECT', bevel_object: 'gone' }), {
       getBevelProfile: () => null,
@@ -511,15 +648,46 @@ describe('robustness', () => {
   });
 
   it('falls back to a wire for absurdly dense surfaces', () => {
-    const pts = Array.from({ length: 30000 }, (_, i) => pt([i * 0.01, Math.sin(i), 0]));
+    // 50 000 points × (4 + 2 × 32) profile points is beyond the 3 000 000 vertex limit
+    const pts = Array.from({ length: 50000 }, (_, i) => pt([i * 0.01, Math.sin(i), 0]));
     const r = build(curve([spline('POLY', pts)], { bevel_depth: 0.1, bevel_resolution: 32 }));
-    expect(r.mesh).toBeNull();
+    expect(r.mesh === null).toBe(true);
     expect(r.errors?.[0]).toMatch(/too dense/);
     expect(r.lines).not.toBeNull();
   });
 });
 
 describe('scene evaluation', () => {
+  it('reports curve problems in EvaluatedScene.errors (missing bevel object, too dense)', () => {
+    const doc = new SceneDoc();
+    const prof = doc.addObject({
+      type: 'CURVE',
+      name: 'Prof',
+      data: doc.addCurve({ splines: [circle(0.1)] }),
+    });
+    const cid = doc.addCurve({ splines: [line(0, 2)], bevel_mode: 'OBJECT', bevel_object: prof });
+    const id = doc.addObject({ type: 'CURVE', name: 'Rail', data: cid });
+    const ev = new SceneEvaluator(doc);
+    expect(ev.evaluate(1).errors).toEqual([]);
+    doc.removeObject(prof);
+    const a = ev.evaluate(1);
+    expect(a.byId.get(id)!.mesh).toBeUndefined();
+    expect(a.byId.get(id)!.lines).toBeDefined();
+    expect(a.errors).toEqual([{ source: `curve:${id}`, message: expect.stringMatching(/bevel object/) }]);
+    // reported on every evaluation, also when the result comes from the cache
+    expect(ev.evaluate(2).errors).toHaveLength(1);
+    // a surface beyond the vertex limit
+    const pts = Array.from({ length: 50000 }, (_, i) => pt([i * 0.01, Math.sin(i), 0]));
+    const dense = doc.addObject({
+      type: 'CURVE',
+      name: 'Dense',
+      data: doc.addCurve({ splines: [spline('POLY', pts)], bevel_depth: 0.1, bevel_resolution: 32 }),
+    });
+    const b = ev.evaluate(1);
+    expect(b.byId.get(dense)!.mesh).toBeUndefined();
+    expect(b.errors.find((e) => e.source === `curve:${dense}`)?.message).toMatch(/too dense/);
+  });
+
   it('renders beveled curves with their materials and re-evaluates on change', () => {
     const doc = new SceneDoc();
     const mat = doc.addMaterial({ name: 'Red' });

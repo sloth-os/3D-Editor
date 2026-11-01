@@ -345,6 +345,7 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       width,
       height,
       images: new TextureCache(doc),
+      orco: (o) => evaluatedOrco(doc, scene, o.object, true),
       // a sample count only from callers that picked the path tracer themselves (see `samples`)
       options: opts.engine === 'PATHTRACER' ? opts : { ...opts, samples: undefined },
     });

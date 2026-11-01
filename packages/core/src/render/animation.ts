@@ -1282,7 +1282,8 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
   }
   const fps = opts.fps ?? (scene.fps || 24) / step;
   checkFps(fps, 'Animation');
-  const budget = typeof opts.total_time_limit === 'number' && opts.total_time_limit > 0 ? opts.total_time_limit : 0;
+  const budget =
+    typeof opts.total_time_limit === 'number' && opts.total_time_limit > 0 ? opts.total_time_limit : 0;
   const t0 = now();
   const left = () => budget - (now() - t0) / 1000;
   const expired = () => budget > 0 && left() <= 0;
@@ -1293,7 +1294,8 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
   let view: ReturnType<typeof animationAutoView> | undefined;
   if (!opts.camera) {
     const first = evaluator.evaluate(frameList[0], { forRender: true });
-    if (!hasSceneCamera(first)) view = animationAutoView(evaluator, frameList, first, width / height, expired);
+    if (!hasSceneCamera(first))
+      view = animationAutoView(evaluator, frameList, first, width / height, expired);
   }
   const base: SoftwareRenderOptions = {
     width,

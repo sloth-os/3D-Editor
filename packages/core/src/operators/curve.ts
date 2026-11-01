@@ -406,14 +406,19 @@ function checkCurveChannel(o: ObjectData, curve: CurveData, path: string, index:
         'INVALID_PARAMS',
       );
   } else if (o.type === 'CURVE' && TEXT_ONLY_PATHS.has(path)) {
-    throw new OperatorError(`'${path}' only affects text objects and '${o.name}' is a curve`, 'INVALID_PARAMS');
+    throw new OperatorError(
+      `'${path}' only affects text objects and '${o.name}' is a curve`,
+      'INVALID_PARAMS',
+    );
   }
   if (index < 0 || !isAnimatable('curve', path)) return;
   const len = propertyLength('curve', path, curve as unknown as Record<string, unknown>);
   if (len > 0 && index >= len)
     throw new OperatorError(
       `Index ${index} is out of range for '${path}': ` +
-        (len === 1 ? 'it is a single value (use index 0 or -1)' : `use 0..${len - 1}, or -1 for all channels`),
+        (len === 1
+          ? 'it is a single value (use index 0 or -1)'
+          : `use 0..${len - 1}, or -1 for all channels`),
       'INVALID_PARAMS',
     );
 }
@@ -628,7 +633,8 @@ function transformApplyDelta(o: ObjectData, p: TransformApplyParts): Mat4 {
 const tiny = (v: number, ref: number) => Math.abs(v) <= 1e-9 * Math.max(1, ref);
 
 /** Largest magnitude among the affine entries of a matrix. */
-const magnitude = (m: Mat4) => Math.max(...[0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14].map((i) => Math.abs(m[i])));
+const magnitude = (m: Mat4) =>
+  Math.max(...[0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14].map((i) => Math.abs(m[i])));
 
 /** Why a 2D curve or a text object cannot absorb `m` into its data (null when it can). */
 function transformApplyProblem(o: ObjectData, curve: CurveData, m: Mat4): string | null {
@@ -700,14 +706,23 @@ function isConformal(cols: number[][]): boolean {
  * extrusion thickness. Text scales offset_x/offset_y and, with `properties`, size, offset and
  * bevel_depth by its X/Y scale and extrude by its Z scale. Keyframes of these channels follow where
  * the transform allows it (a warning is reported otherwise). Call checkCurveTransformApply first.
+ * Returns false, with a warning and nothing changed, when the data cannot absorb `delta` after all
+ * (a selected parent applied before pushed a rotation into a 2D curve or text): the caller then keeps
+ * the object's transform.
  */
 export function applyCurveTransform(
   ctx: OperatorContext,
   o: ObjectData,
   delta: Mat4,
   properties: boolean,
-): void {
-  if ((o.type !== 'CURVE' && o.type !== 'FONT') || !o.data || !ctx.doc.getCurve(o.data)) return;
+): boolean {
+  const src = (o.type === 'CURVE' || o.type === 'FONT') && o.data ? ctx.doc.getCurve(o.data) : null;
+  if (!src) return true;
+  const problem = transformApplyProblem(o, src, delta);
+  if (problem) {
+    ctx.report('WARNING', `'${o.name}' keeps its transform: ${problem}`);
+    return false;
+  }
   const curveId = singleUserCurve(ctx, o);
   const curve = ctx.doc.getCurve(curveId)!;
   const m = delta;
@@ -735,15 +750,20 @@ export function applyCurveTransform(
       return f === undefined ? undefined : (v) => v * f;
     });
     if (properties && curve.bevel_depth > 0 && Math.abs(s - sz) > 1e-6 * Math.max(s, sz))
-      ctx.report('WARNING', `'${o.name}': the bevel of the text follows its X/Y scale, not its other Z scale`);
-    return;
+      ctx.report(
+        'WARNING',
+        `'${o.name}': the bevel of the text follows its X/Y scale, not its other Z scale`,
+      );
+    return true;
   }
   const cols = [0, 4, 8].map((c) => [m[c], m[c + 1], m[c + 2]]);
   // 2D splines stay at z = 0: only their X/Y deformation matters for the handles
-  const conformal = isConformal(curve.dimensions === '2D' ? cols.slice(0, 2).map((c) => c.slice(0, 2)) : cols);
+  const conformal = isConformal(
+    curve.dimensions === '2D' ? cols.slice(0, 2).map((c) => c.slice(0, 2)) : cols,
+  );
   // Blender's mat3_to_scale: length of the transformed (1, 1, 1)/√3
-  const mean =
-    Math.hypot(...[0, 1, 2].map((k) => cols[0][k] + cols[1][k] + cols[2][k])) / Math.sqrt(3);
+  const sum = [0, 1, 2].map((k) => cols[0][k] + cols[1][k] + cols[2][k]);
+  const mean = Math.sqrt((sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]) / 3);
   const fix = (t: HandleType, other: HandleType): HandleType =>
     t !== 'AUTO' ? t : other === 'AUTO' || other === 'ALIGNED' ? 'ALIGNED' : 'FREE';
   const splines = (Array.isArray(curve.splines) ? curve.splines : []).map((raw): Spline => {
@@ -790,9 +810,13 @@ export function applyCurveTransform(
       'WARNING',
       `'${o.name}': non-uniform scale: the bevel/extrusion thickness is scaled by the mean factor ${fmt(mean)}`,
     );
+  return true;
 }
 
-/** Centre of a curve's control points like Blender: MEDIAN of the points and Bezier handles, or the middle of their bounds (points padded by their radius). */
+/**
+ * Centre of a curve's control points like Blender: MEDIAN of the points and Bezier handles, or the
+ * middle of their BOUNDS (points padded by their radius). Null without points.
+ */
 function splineCenter(curve: CurveData, center: 'MEDIAN' | 'BOUNDS'): Vec3 | null {
   const sum: Vec3 = [0, 0, 0];
   const min: Vec3 = [Infinity, Infinity, Infinity];
@@ -916,7 +940,10 @@ export function curveOriginSet(
 export function curveShadeSet(ctx: OperatorContext, o: ObjectData, smooth: boolean): void {
   if (o.type === 'FONT') {
     if (!smooth)
-      ctx.report('WARNING', `'${o.name}': text is always smooth shaded (convert it to a mesh to shade it flat)`);
+      ctx.report(
+        'WARNING',
+        `'${o.name}': text is always smooth shaded (convert it to a mesh to shade it flat)`,
+      );
     return;
   }
   const curve = o.type === 'CURVE' && o.data ? ctx.doc.getCurve(o.data) : null;
@@ -1331,8 +1358,11 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
         "Insert a keyframe on an animatable property of a curve or text object's data: bevel_depth, " +
         'bevel_factor_start, bevel_factor_end, extrude, offset, eval_time, size, space_line, space_word, ' +
         'space_character, shear, offset_x, offset_y, or a spline point channel such as "splines[0].points[2].co", ' +
-        '"splines[0].points[2].radius" or ".tilt". The F-curve key is "curve:<curve id>:<path>:<index>" (use it with ' +
-        'anim.keyframes_move / anim.keyframes_remove). Returns {inserted, curve, fcurves}.',
+        '"splines[0].points[2].radius" or ".tilt" (size, space_*, shear and offset_x/y only on text objects). The ' +
+        'channel must exist: the spline point (and, for handle_left/right, a stored handle position) and the index ' +
+        '(0..2 for vectors, 0 for single values); otherwise nothing is keyed and an error is returned. The F-curve ' +
+        'key is "curve:<curve id>:<path>:<index>" (use it with anim.keyframes_move / anim.keyframes_remove). ' +
+        'Returns {inserted, curve, fcurves}.',
       category: 'Animation',
       schema: z.object({
         object: objectRef,
@@ -1345,7 +1375,9 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
           .int()
           .min(-1)
           .default(-1)
-          .describe('Channel of vector properties (0 = x, 1 = y, 2 = z); -1 keys all'),
+          .describe(
+            'Channel of vector properties (0 = x, 1 = y, 2 = z; single values only have 0); -1 keys all',
+          ),
         frame: z.number().optional().describe('Frame to key (default: the current frame)'),
         value: z.number().optional().describe('Value to key (default: the current value of the property)'),
         interpolation: z

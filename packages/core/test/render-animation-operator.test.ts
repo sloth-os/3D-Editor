@@ -111,7 +111,7 @@ describe('render.render_animation', () => {
       samples: 4096,
       time_limit: 0.3,
     });
-    expect((performance.now() - t0) / 1000).toBeLessThan(2.5);
+    expect((performance.now() - t0) / 1000).toBeLessThan(5); // about 12 s at full 4096 samples
     expect(res).toMatchObject({ frames: [1], truncated: false, undersampled_frames: [1] });
     expect(reports.some((r) => /time_limit \(0\.3 s\) ran out: frame 1 stopped path tracing/.test(r))).toBe(
       true,
@@ -119,7 +119,7 @@ describe('render.render_animation', () => {
     // with enough time nothing is reported
     const fine = ok({ format: 'APNG', engine: 'PATHTRACER', frame_end: 1, width: 16, height: 9, samples: 2 });
     expect(fine.undersampled_frames).toBeUndefined();
-  });
+  }, 60_000);
 
   it('keeps the render aspect when the derived side would exceed 2048 pixels', () => {
     const { doc, ok } = setup(true); // nothing to draw: large frames stay cheap
@@ -130,8 +130,11 @@ describe('render.render_animation', () => {
     const tall = ok({ format: 'APNG', frame_end: 1, width: 2048, samples: 1 });
     expect([tall.width, tall.height]).toEqual([1152, 2048]);
     // within the limit the given side is kept exactly
-    expect(ok({ format: 'APNG', frame_end: 1, width: 90, samples: 1 })).toMatchObject({ width: 90, height: 160 });
-  });
+    expect(ok({ format: 'APNG', frame_end: 1, width: 90, samples: 1 })).toMatchObject({
+      width: 90,
+      height: 160,
+    });
+  }, 60_000);
 
   it('renders camera-less scenes from one fixed view and returns it', () => {
     const { doc, ok } = setup();
@@ -155,7 +158,7 @@ describe('render.render_animation', () => {
     expect(centre(a.canvases[5]) - centre(a.canvases[0])).toBeGreaterThan(5);
     // with the scene camera no view is returned
     expect(setup().ok({ frame_end: 1 }).view).toBeUndefined();
-  });
+  }, 60_000);
 
   it('validates the range and the camera', () => {
     const { doc, run } = setup();

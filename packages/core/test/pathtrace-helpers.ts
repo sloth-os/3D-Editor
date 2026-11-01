@@ -4,6 +4,7 @@ import { evaluatedBounds } from '../src/io/common';
 import { renderItems } from '../src/eval/renderables';
 import { viewFromCamera, viewFromSpec, defaultFovY, type RenderView } from '../src/render/view';
 import { PathTracer, preparePathTrace, viewCameraData } from '../src/render/pathtrace';
+import { evaluatedOrco } from '../src/material/orco';
 import type { PathTraceRenderOptions } from '../src/render/pathtrace';
 import type { SampledTexture } from '../src/render/raster';
 import type { SceneDoc } from '../src/doc/scene-doc';
@@ -67,6 +68,7 @@ export function tracerFor(doc: SceneDoc, s: TraceSetup): PathTracer {
     width: s.width,
     height: s.height,
     images: docImages(doc),
+    orco: (item) => evaluatedOrco(doc, scene, item.object, true),
     options: {
       samples: s.samples ?? 16,
       max_bounces: s.maxBounces,

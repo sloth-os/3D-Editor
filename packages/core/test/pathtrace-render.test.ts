@@ -6,6 +6,7 @@ import {
   createPlane,
   createUVSphere,
   encodePNG,
+  renderSceneSoftware,
   type MaterialData,
   type MeshData,
 } from '../src';
@@ -21,6 +22,7 @@ import {
   renderPathTracedImage,
   studioRadiance,
 } from '../src/render/pathtrace';
+import { terminatorAmount } from '../src/render/pathtrace/integrator';
 import { at, mean, topCamera, traceLinear, tracerFor } from './pathtrace-helpers';
 
 /*
@@ -374,6 +376,70 @@ describe('path tracer: textures and vertex colours', () => {
     expect(blue).toBeGreaterThan(40);
   });
 
+  it('GENERATED coordinates stick to surfaces deformed by shape keys (orco), like the rasterizer', () => {
+    // regression: GENERATED used the deformed positions, so procedural textures swam over
+    // shape-key / deform-modifier animation (the rasterizer already used the orco)
+    const doc = blackWorld();
+    doc.updateWorld({ color: [1, 1, 1] });
+    doc.updateRender({ view_transform: 'STANDARD' });
+    const base = createPlane({ size: 2 });
+    const meshId = doc.addMesh('Plane', base);
+    const moved = Float32Array.from(base.positions, (v, i) => (i % 3 === 0 ? v + 0.5 : v));
+    const shapeKey = (value: number) =>
+      doc.setShapeKeys(meshId, [
+        {
+          name: 'Move',
+          value,
+          slider_min: 0,
+          slider_max: 1,
+          mute: false,
+          relative_key: '',
+          data: new Uint8Array(moved.buffer),
+        },
+      ]);
+    const tex = defaultProcedural('CHECKER', {
+      mapping: 'GENERATED',
+      scale: 4,
+      color_a: [1, 0, 0, 1],
+      color_b: [0, 0, 1, 1],
+    });
+    const mat = lambert(doc, [1, 1, 1], {
+      textures: { base_color: { image: '', scale: [1, 1], offset: [0, 0], procedural: tex } },
+    });
+    doc.addObject({ type: 'MESH', name: 'Plane', data: meshId, material_slots: [mat] });
+    topCamera(doc, 4, 5);
+    // red − blue along 32 pixels of the plane's own surface (16 px per metre), starting at pixel x0
+    const surface = (engine: 'PATHTRACER' | 'RASTER', x0: number) => {
+      const img = renderSceneSoftware(doc, {
+        width: 64,
+        height: 8,
+        engine,
+        samples: engine === 'RASTER' ? 1 : 16,
+        denoise: false,
+        max_bounces: 0,
+      });
+      const out: number[] = [];
+      for (let x = x0; x < x0 + 32; x++) {
+        let d = 0;
+        for (const y of [1, 2]) d += img.data[(y * 64 + x) * 4] - img.data[(y * 64 + x) * 4 + 2];
+        out.push(d / 2);
+      }
+      return out;
+    };
+    shapeKey(0);
+    const rest = surface('PATHTRACER', 16);
+    shapeKey(1); // the plane moves 0.5 m (8 px, one checker square) along +X
+    const deformed = surface('PATHTRACER', 24);
+    const raster = surface('RASTER', 24);
+    expect(Math.max(...rest)).toBeGreaterThan(150);
+    expect(Math.min(...rest)).toBeLessThan(-150);
+    rest.forEach((v, i) => {
+      if (Math.abs(v) < 100) return; // a square's edge
+      expect(Math.sign(deformed[i]), `pixel ${i}`).toBe(Math.sign(v));
+      expect(Math.sign(raster[i]), `pixel ${i}`).toBe(Math.sign(v));
+    });
+  });
+
   it('multiplies vertex colours into the base colour', () => {
     const doc = blackWorld();
     doc.updateWorld({ color: [1, 1, 1] });
@@ -472,6 +538,48 @@ describe('path tracer: transparency, culling and film', () => {
     doc.updateMaterial(veil, { blend_method: 'OPAQUE' });
     expect(lit()).toBe(0);
     void blocker;
+  });
+
+  it('keeps contact shadows on smooth-shaded low-poly surfaces (terminator offset only at grazing light)', () => {
+    // regression: the shadow-terminator lift (up to 0.67 m on a smooth 2 m cube) was applied to
+    // every shadow ray, so a box standing on a smooth cube cast almost no shadow
+    const table = (smooth: boolean) => {
+      const doc = blackWorld();
+      const white = lambert(doc);
+      const cube = createCube({ size: 2 });
+      if (smooth) cube.faceSmooth = cube.faceSmooth.map(() => true);
+      doc.addObject({ type: 'MESH', name: 'Table', data: doc.addMesh('Table', cube), material_slots: [white] });
+      doc.addObject({
+        type: 'MESH',
+        name: 'Box',
+        data: doc.addMesh('Box', createCube({ size: 1 })),
+        location: [0, 0, 1.15],
+        scale: [0.2, 0.2, 0.3],
+        material_slots: [white],
+      });
+      // sun at 45° from +X: the shadow falls on x ∈ [−0.4, −0.1], y ∈ [−0.1, 0.1] of the top
+      doc.addObject({
+        type: 'LIGHT',
+        name: 'Sun',
+        data: doc.addLight({ type: 'SUN', energy: 3 }),
+        rotation_euler: [0, Math.PI / 4, 0],
+      });
+      topCamera(doc, 2, 10);
+      const { img } = traceLinear(doc, { width: 40, height: 40, samples: 16, maxBounces: 0 });
+      return { shadow: mean(img, 40, 13, 19, 17, 21)[0], lit: mean(img, 40, 28, 10, 36, 30)[0] };
+    };
+    const flat = table(false);
+    const smooth = table(true);
+    expect(flat.shadow).toBeLessThan(0.02 * flat.lit);
+    expect(smooth.lit).toBeGreaterThan(0.3);
+    expect(smooth.shadow).toBeLessThan(0.02 * smooth.lit);
+    // the offset fades in only for light within ~6° of the facet plane (Cycles' cutoff 0.1)
+    expect(terminatorAmount(Math.SQRT1_2, Math.SQRT1_2)).toBe(0);
+    expect(terminatorAmount(0.1, 0)).toBe(0);
+    expect(terminatorAmount(0.02, 0.05)).toBe(1);
+    expect(terminatorAmount(0.05, 0.1)).toBeCloseTo(0.5, 12);
+    expect(terminatorAmount(0.05, 0.3)).toBe(0);
+    expect(terminatorAmount(NaN, 0)).toBe(0);
   });
 
   it('backface culling lets camera rays through back faces', () => {
@@ -690,6 +798,40 @@ describe('path tracer: environments, camera and mist', () => {
     doc.updateCamera(cam, { dof_use: false });
     expect(edgeWidth()).toBeLessThanOrEqual(3);
   }, 20_000);
+
+  it('depth of field also works for orthographic cameras (aperture radius 1 / (2 · f-stop) m)', () => {
+    // regression: orthographic cameras ignored dof_use
+    const doc = blackWorld();
+    doc.updateWorld({ color: [1, 1, 1] });
+    plane(doc, 'Card', 1, lambert(doc, [0, 0, 0])); // a black card at z = 0 on a white world
+    const cam = doc.addCamera({
+      type: 'ORTHO',
+      ortho_scale: 3,
+      dof_use: true,
+      dof_focus_distance: 8, // the card
+      dof_aperture_fstop: 0.5,
+    });
+    doc.updateScene({
+      camera: doc.addObject({ type: 'CAMERA', name: 'Cam', data: cam, location: [0, 0, 8] }),
+    });
+    const render = () => traceLinear(doc, { width: 32, height: 32, samples: 16, maxBounces: 0 }).img;
+    const maxDiff = (a: Float32Array, b: Float32Array) => {
+      let m = 0;
+      for (let i = 0; i < a.length; i += 4) m = Math.max(m, Math.abs(a[i] - b[i]));
+      return m;
+    };
+    const focused = render();
+    doc.updateCamera(cam, { dof_focus_distance: 4 });
+    const blurred = render();
+    doc.updateCamera(cam, { dof_use: false });
+    const pinhole = render();
+    // in focus: the rays of a pixel meet on the card (at most a sample flips at its edges); out of
+    // focus (aperture radius 1 m): the card's outline spreads over the white world
+    expect(maxDiff(focused, pinhole)).toBeLessThan(0.07);
+    expect(maxDiff(blurred, pinhole)).toBeGreaterThan(0.3);
+    expect(mean(pinhole, 32, 14, 14, 18, 18)[0]).toBe(0);
+    expect(mean(blurred, 32, 14, 14, 18, 18)[0]).toBeGreaterThan(0.1);
+  });
 
   it('fades surfaces towards the mist colour with distance', () => {
     const doc = blackWorld();

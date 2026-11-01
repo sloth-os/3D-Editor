@@ -17,6 +17,7 @@ import {
   newRigidBody,
   sanitizeRigidBody,
   sanitizeRigidBodyWorld,
+  simulatedFrameEnd,
   worldParams,
 } from '../physics/settings';
 import type { OperatorContext } from './context';
@@ -162,6 +163,24 @@ function describeSettings(o: ObjectData, rb: RigidBodyData) {
   return { object: o.id, name: o.name, ...rb };
 }
 
+/**
+ * Location and rotation_euler (closest to `oldRotation`) that reproduce the world matrix `world`
+ * for an object whose own scale is `scale`, which stays as it is. The signs of that scale are
+ * taken out of the matrix first: decomposing a mirrored matrix on its own negates all three axes,
+ * i.e. a 180° turn for an object mirrored along one or two axes.
+ */
+function keyedTransform(
+  world: Readonly<Mat4>,
+  parent: Mat4 | null,
+  scale: Readonly<Vec3>,
+  oldRotation: Vec3 | undefined,
+): { location: Vec3; rotation_euler: Vec3 } {
+  const m = [...world] as Mat4;
+  for (let c = 0; c < 3; c++) if (scale[c] < 0) for (let r = 0; r < 3; r++) m[c * 4 + r] = -m[c * 4 + r];
+  const t = worldMatrixToTransform(m, parent, oldRotation);
+  return { location: t.location, rotation_euler: t.rotation_euler };
+}
+
 /** Blender's bake clean-up: drops keys whose value equals both neighbours within 1e-4. */
 function dropRedundantKeys(keys: Keyframe[]): Keyframe[] {
   const out = [...keys];
@@ -304,7 +323,10 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
         "Change the scene's rigid body world (Blender Scene properties > Rigid Body World, Gravity): only the " +
         'settings passed change. The simulation runs from frame_start (objects keep their own transforms up ' +
         'to and including it) to frame_end (later frames hold the last state), in substeps_per_frame steps ' +
-        'of time_scale / fps seconds per frame. Returns the resulting settings and the step length in seconds.',
+        `of time_scale / fps seconds per frame. At most ${MAX_SIMULATED_FRAMES} frames after frame_start are ` +
+        'simulated: a longer range is stored but warned about, and frames after frame_start + ' +
+        `${MAX_SIMULATED_FRAMES} hold that frame's state. Returns the resulting settings, simulated_frame_end ` +
+        '(the last frame actually simulated) and the step length in seconds.',
       category: 'Physics',
       schema: z.object({
         enabled: z.boolean().optional().describe('Simulate rigid bodies at all (default true)'),
@@ -321,7 +343,10 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
           .min(-1048574)
           .max(1048574)
           .optional()
-          .describe('Last simulated frame, ≥ frame_start (Blender default 250)'),
+          .describe(
+            `Last simulated frame, ≥ frame_start (Blender default 250); at most frame_start + ${MAX_SIMULATED_FRAMES} ` +
+              'is simulated, later frames hold the last simulated state',
+          ),
         substeps_per_frame: z
           .number()
           .int()
@@ -376,8 +401,16 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
           ...(p.gravity ? { gravity: [...p.gravity] as Vec3 } : {}),
         });
         const params = worldParams(doc.getScene());
+        const simulatedEnd = simulatedFrameEnd(params);
+        if (simulatedEnd < world.frame_end)
+          ctx.report(
+            'WARNING',
+            `Only ${MAX_SIMULATED_FRAMES} frames after frame_start are simulated: frames ${simulatedEnd + 1}` +
+              `–${world.frame_end} hold the state of frame ${simulatedEnd}`,
+          );
         return {
           rigidbody_world: world,
+          simulated_frame_end: simulatedEnd,
           use_gravity: doc.getScene().use_gravity,
           gravity: doc.getScene().gravity,
           fps: params.fps,
@@ -465,7 +498,9 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
           for (const o of targets) {
             const worldM: Mat4 = fs.world(o.id) ?? fs.local(o.id);
             const parent = o.parent && fs.byId.has(o.parent) ? fs.parent(o.id) : null;
-            const t = worldMatrixToTransform(worldM, parent, previous.get(o.id));
+            // the keys must reproduce the matrix together with the object's (animated) scale there
+            const scale = fs.byId.get(o.id)?.scale ?? o.scale;
+            const t = keyedTransform(worldM, parent, scale, previous.get(o.id));
             previous.set(o.id, t.rotation_euler);
             samples.get(o.id)!.location.push(t.location);
             samples.get(o.id)!.rotation_euler.push(t.rotation_euler);
@@ -555,7 +590,8 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
       id: 'rigidbody.describe',
       label: 'Describe Rigid Bodies',
       description:
-        'Inspect the physics setup (read-only): rigid body world settings, gravity and every rigid body ' +
+        'Inspect the physics setup (read-only): rigid body world settings (simulated_frame_end: the last ' +
+        'frame actually simulated), gravity and every rigid body ' +
         '(settings, the collision shape actually simulated after fallbacks, how it moves: DYNAMIC, ' +
         'KINEMATIC (animated), FROZEN (ACTIVE with Dynamic off) or STATIC, whether it has come to rest ' +
         '(sleeping; null when unknown for that frame)) with its ' +
@@ -595,10 +631,12 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
             })
           : doc.listObjects().filter((o) => o.rigid_body);
         const issues = info?.issues ?? [];
-        const atFrame = Math.ceil(Math.min(frame, world.frame_end));
+        const simulatedEnd = simulatedFrameEnd(worldParams(scene));
+        const atFrame = Math.ceil(Math.min(frame, simulatedEnd));
         return {
           frame,
           world,
+          simulated_frame_end: simulatedEnd,
           use_gravity: scene.use_gravity,
           gravity: scene.gravity,
           fps: scene.fps,
@@ -610,7 +648,9 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
           objects: objects.map((o) => {
             const rb = sanitizeRigidBody(o.rigid_body);
             const m = fs.world(o.id);
-            const t = m ? worldMatrixToTransform(m, null, o.rotation_euler) : null;
+            const t = m
+              ? keyedTransform(m, null, fs.byId.get(o.id)?.scale ?? o.scale, o.rotation_euler)
+              : null;
             const body = motion.get(o.id);
             return {
               object: o.id,

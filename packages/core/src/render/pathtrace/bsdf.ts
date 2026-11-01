@@ -9,8 +9,10 @@
  *   base = metallic · metal (GGX, Schlick Fresnel tinted by base colour)
  *        + (1 − metallic) · transmission · glass (rough dielectric reflection + refraction, IOR)
  *        + (1 − metallic) · (1 − transmission) · (dielectric GGX specular over Lambert diffuse).
- * GGX uses α = roughness², the height-correlated Smith masking term, visible-normal sampling and a
- * single-scattering energy compensation for the reflection lobes.
+ * GGX uses α = roughness², the height-correlated Smith masking term, visible-normal sampling and an
+ * energy compensation of the single-scattering loss (like Blender's multiscatter GGX) for the
+ * reflection lobes and the glass lobe. Glass with IOR 1 does not bend light: its transmission is a
+ * delta lobe straight through the surface, whatever the roughness.
  *
  * Sampling picks one lobe in proportion to its approximate albedo and returns the full BSDF value
  * and the combined pdf of all lobes (one-sample MIS over lobes).
@@ -208,6 +210,87 @@ function lerpAt(t: Float32Array, q: number, f: number): number {
   return t[q] * (1 - f) + t[q + 1] * f;
 }
 
+/** Resolution of the glass albedo table over μ and roughness (F0 levels as `F0_N`). */
+const GLASS_N = 16;
+let glassTable: Float32Array | null = null;
+
+/**
+ * Single-scattering energy albedo (reflected plus transmitted energy, without the η² radiance
+ * scaling) of the rough dielectric lobe, over μ = cos θo, roughness and F0 = ((η − 1)/(η + 1))²
+ * (√-spaced like the dielectric table, IOR 1 … 3), for light arriving from outside (η = IOR,
+ * first half) and from inside (η = 1/IOR, total internal reflection included).
+ */
+function buildGlassTable(): void {
+  const levels = GLASS_N * GLASS_N * F0_N;
+  const t = new Float32Array(2 * levels);
+  const h = new Float64Array(3);
+  const S = 10;
+  for (let side = 0; side < 2; side++)
+    for (let k = 0; k < F0_N; k++) {
+      const r = Math.sqrt(F0_MAX) * (k / (F0_N - 1));
+      const ior = (1 + r) / (1 - r);
+      const eta = side === 0 ? ior : 1 / ior;
+      for (let j = 0; j < GLASS_N; j++) {
+        const rough = j / (GLASS_N - 1);
+        const alpha = Math.max(ALPHA_MIN, rough * rough);
+        const a2 = alpha * alpha;
+        for (let i = 0; i < GLASS_N; i++) {
+          const mu = 0.02 + (0.98 * i) / (GLASS_N - 1);
+          const wx = Math.sqrt(1 - mu * mu);
+          const lo = ggxLambda(mu, a2);
+          let E = 0;
+          for (let a = 0; a < S; a++)
+            for (let b = 0; b < S; b++) {
+              sampleVNDF(wx, 0, mu, alpha, (a + 0.5) / S, (b + 0.5) / S, h);
+              const c = wx * h[0] + mu * h[2];
+              if (c <= 0) continue;
+              const F = fresnelDielectric(c, eta);
+              // reflection and refraction through the sampled microfacet: weight G2 / G1(wo)
+              const rz = 2 * c * h[2] - mu;
+              if (rz > 0) E += (F * (1 + lo)) / (1 + lo + ggxLambda(rz, a2));
+              const cos2t = 1 - (1 - c * c) / (eta * eta);
+              if (F < 1 && cos2t > 0) {
+                const tz = -mu / eta + (c / eta - Math.sqrt(cos2t)) * h[2];
+                if (tz < 0) E += ((1 - F) * (1 + lo)) / (1 + lo + ggxLambda(-tz, a2));
+              }
+            }
+          t[side * levels + (j * GLASS_N + i) * F0_N + k] = E / (S * S);
+        }
+      }
+    }
+  glassTable = t;
+}
+
+/** Energy albedo of the rough dielectric lobe for relative IOR `eta` (see `buildGlassTable`). */
+function glassAlbedo(mu: number, rough: number, eta: number): number {
+  if (!glassTable) buildGlassTable();
+  const t = glassTable!;
+  const ior = eta < 1 ? 1 / eta : eta;
+  const f0 = ((ior - 1) / (ior + 1)) ** 2;
+  const kf = Math.min(1, Math.sqrt(f0 / F0_MAX)) * (F0_N - 1);
+  const k = Math.min(F0_N - 2, Math.floor(kf));
+  const fk = kf - k;
+  const x = Math.min(1, Math.max(0, (mu - 0.02) / 0.98)) * (GLASS_N - 1);
+  const y = Math.min(1, Math.max(0, rough)) * (GLASS_N - 1);
+  const i = Math.min(GLASS_N - 2, Math.floor(x));
+  const j = Math.min(GLASS_N - 2, Math.floor(y));
+  const fx = x - i;
+  const fy = y - j;
+  const o = (eta < 1 ? GLASS_N * GLASS_N * F0_N : 0) + (j * GLASS_N + i) * F0_N + k;
+  return (
+    lerpAt(t, o, fk) * (1 - fx) * (1 - fy) +
+    lerpAt(t, o + F0_N, fk) * fx * (1 - fy) +
+    lerpAt(t, o + GLASS_N * F0_N, fk) * (1 - fx) * fy +
+    lerpAt(t, o + (GLASS_N + 1) * F0_N, fk) * fx * fy
+  );
+}
+
+/**
+ * Relative IORs closer to 1 than this make an index-matched interface: light continues straight
+ * through it (a delta transmission, no Fresnel reflection) whatever the roughness.
+ */
+const ETA_MATCHED = 1e-4;
+
 /** Charlie sheen distribution (roughness 0.5, i.e. sin²θh / … ) times the Neubelt visibility term. */
 function sheenLobe(hz: number, wiz: number, woz: number): number {
   const s2 = Math.max(0, 1 - hz * hz);
@@ -305,6 +388,12 @@ export class PrincipledBSDF {
   /** The sampled lobe was a near-specular one / a refraction. */
   sampledSpecular = false;
   sampledTransmission = false;
+  /**
+   * The sample is a delta lobe (index-matched transmission straight through, wi = −wo): f and pdf
+   * hold its weight and selection probability, so f / pdf is the throughput factor, but `eval`
+   * never returns it and its pdf must not enter multiple importance sampling.
+   */
+  sampledDelta = false;
   /** Every lobe with non-zero weight is near-specular: light sampling is pointless. */
   singular = false;
   /** Rough albedo estimate at wo (for denoising AOVs). */
@@ -347,6 +436,9 @@ export class PrincipledBSDF {
   private compMB = 1;
   private compD = 1;
   private compC = 1;
+  private compG = 1;
+  /** Index-matched glass (|η − 1| < `ETA_MATCHED`): its transmission is a delta lobe. */
+  private passThrough = false;
   // diffuse weight (rgb, already including albedo scaling and attenuation)
   private diffR = 0;
   private diffG = 0;
@@ -423,6 +515,11 @@ export class PrincipledBSDF {
     this.compD = 1 + f0d * inv1;
     const specAlbedoD = Math.min(1, albedoDielectric(mu, rough, f0d) * this.compD);
     const kd = this.dielW * (1 - specAlbedoD);
+    // glass: index-matched interfaces pass light straight through; rough ones get the energy
+    // lost to single scattering back (white glass stays lossless at any roughness)
+    this.passThrough = this.glassW > 0 && Math.abs(this.eta - 1) < ETA_MATCHED;
+    this.compG =
+      this.glassW > 0 && !this.passThrough ? 1 / Math.max(0.2, glassAlbedo(mu, rough, this.eta)) : 1;
     this.diffR = kd * bR * this.attR;
     this.diffG = kd * bG * this.attG;
     this.diffB = kd * bB * this.attB;
@@ -440,7 +537,7 @@ export class PrincipledBSDF {
     prob[LOBE_SPEC] = lum(specR, specG, specB);
     const Fg = this.glassW > 0 ? fresnelDielectric(mu, this.eta) : 0;
     const attL = lum(this.attR, this.attG, this.attB);
-    prob[LOBE_GLASS] = this.glassW * attL * (Fg + (1 - Fg) * Math.max(0.05, lum(bR, bG, bB)));
+    prob[LOBE_GLASS] = this.glassW * this.compG * attL * (Fg + (1 - Fg) * Math.max(0.05, lum(bR, bG, bB)));
     prob[LOBE_DIFFUSE] = lum(this.diffR, this.diffG, this.diffB);
     const shR = es * this.sheenR;
     const shG = es * this.sheenG;
@@ -455,7 +552,8 @@ export class PrincipledBSDF {
     const specOnly =
       prob[LOBE_DIFFUSE] === 0 &&
       prob[LOBE_SHEEN] === 0 &&
-      (prob[LOBE_SPEC] === 0 && prob[LOBE_GLASS] === 0 ? true : this.alpha < SPECULAR_ALPHA) &&
+      (prob[LOBE_SPEC] === 0 || this.alpha < SPECULAR_ALPHA) &&
+      (prob[LOBE_GLASS] === 0 || this.passThrough || this.alpha < SPECULAR_ALPHA) &&
       (prob[LOBE_COAT] === 0 || this.alphaC < SPECULAR_ALPHA);
     this.singular = sum > 0 && specOnly;
     // albedo AOV
@@ -511,7 +609,7 @@ export class PrincipledBSDF {
           }
           if (prob[LOBE_GLASS] > 0) {
             const F = fresnelDielectric(c, this.eta);
-            const k = common * F * this.glassW;
+            const k = common * F * this.glassW * this.compG;
             fr += k * this.attR;
             fg += k * this.attG;
             fb += k * this.attB;
@@ -544,8 +642,8 @@ export class PrincipledBSDF {
         fb += this.diffB * k;
         pdf += prob[LOBE_DIFFUSE] * k;
       }
-    } else if (iz < 0 && prob[LOBE_GLASS] > 0) {
-      // ---- refraction through the rough dielectric
+    } else if (iz < 0 && prob[LOBE_GLASS] > 0 && !this.passThrough) {
+      // ---- refraction through the rough dielectric (an index-matched one is a delta lobe)
       const eta = this.eta;
       let hx = ox + eta * ix;
       let hy = oy + eta * iy;
@@ -572,7 +670,7 @@ export class PrincipledBSDF {
           const denom = sq * sq;
           if (denom > 0) {
             // f·|cos θi| = D G2 (1 − F) |i·h| |o·h| / (|o_z| denom η²)
-            const k = ((D * G2 * (1 - F) * -ci * co) / (oz * denom * eta * eta)) * this.glassW;
+            const k = ((D * G2 * (1 - F) * -ci * co) / (oz * denom * eta * eta)) * this.glassW * this.compG;
             fr += k * this.baseR * this.attR;
             fg += k * this.baseG * this.attG;
             fb += k * this.baseB * this.attB;
@@ -615,6 +713,21 @@ export class PrincipledBSDF {
     let iz: number;
     this.sampledSpecular = false;
     this.sampledTransmission = false;
+    this.sampledDelta = false;
+    if (lobe === LOBE_GLASS && this.passThrough) {
+      // index-matched glass: straight through with weight (1 − F ≈ 1) × tint, chosen with prob
+      this.wx = -ox;
+      this.wy = -oy;
+      this.wz = -oz;
+      this.sampledSpecular = true;
+      this.sampledTransmission = true;
+      this.sampledDelta = true;
+      this.fR = this.glassW * this.baseR * this.attR;
+      this.fG = this.glassW * this.baseG * this.attG;
+      this.fB = this.glassW * this.baseB * this.attB;
+      this.pdf = prob[LOBE_GLASS];
+      return this.fR + this.fG + this.fB > 0;
+    }
     if (lobe === LOBE_DIFFUSE || lobe === LOBE_SHEEN) {
       const r = Math.sqrt(u0);
       const phi = 2 * Math.PI * u1;

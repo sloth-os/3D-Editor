@@ -54,6 +54,13 @@ export interface CompiledInstances extends SceneInstances {
   gen: Float64Array;
   /** Emitter group of each instance's emissive triangles, or −1. */
   emitGroup: Int32Array;
+  /**
+   * Index into `orcos` of each instance's undeformed positions (GENERATED texture coordinates),
+   * or −1 when they are the geometry's own positions.
+   */
+  orco: Int32Array;
+  /** Undeformed object-space position (xyz) of every render vertex of a geometry. */
+  orcos: Float32Array[];
   /** Render item ids (object or instance ids). */
   ids: string[];
 }
@@ -76,6 +83,13 @@ export interface CompileInput {
   height: number;
   /** Decoded image datablock (sRGB RGBA8) or null when missing / unsupported. */
   image: (id: string) => SampledTexture | null;
+  /**
+   * Undeformed ("orco") object-space position of every vertex of an item's mesh (xyz per vertex,
+   * see material/orco.ts), or null when the mesh positions are the orco. Asked only for items with
+   * GENERATED procedural textures, so those stick to surfaces deformed by shape keys and deform
+   * modifiers (default: the evaluated positions).
+   */
+  orco?: (item: RenderItem) => ArrayLike<number> | null;
 }
 
 const lum = (r: number, g: number, b: number) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -155,7 +169,44 @@ export function compileScene(input: CompileInput): CompiledScene {
   const geometries: MeshGeometry[] = [];
   const geomIndex = new Map<MeshGeometry, number>();
   const genBoxes = new Map<MeshData, number[]>();
-  type Inst = { item: RenderItem; geom: number; M: Mat4; inv: Mat4; slots: number[]; gen: number[] };
+  // undeformed positions per render vertex, shared by the instances of one evaluated object
+  const orcos: Float32Array[] = [];
+  const orcoCache = new Map<ArrayLike<number>, { geom: MeshGeometry; index: number }>();
+  const orcoFor = (item: RenderItem, mesh: MeshData, g: MeshGeometry): number => {
+    let src: ArrayLike<number> | null;
+    try {
+      src = input.orco?.(item) ?? null;
+    } catch {
+      src = null;
+    }
+    if (!src || src.length !== mesh.positions.length) return -1;
+    const hit = orcoCache.get(src);
+    if (hit?.geom === g) return hit.index;
+    const vs = g.vertexSource;
+    const out = new Float32Array(vs.length * 3);
+    for (let i = 0; i < vs.length; i++) {
+      const s = vs[i] * 3;
+      const x = src[s];
+      const y = src[s + 1];
+      const z = src[s + 2];
+      if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z))) return -1;
+      out[i * 3] = x;
+      out[i * 3 + 1] = y;
+      out[i * 3 + 2] = z;
+    }
+    orcos.push(out);
+    orcoCache.set(src, { geom: g, index: orcos.length - 1 });
+    return orcos.length - 1;
+  };
+  type Inst = {
+    item: RenderItem;
+    geom: number;
+    M: Mat4;
+    inv: Mat4;
+    slots: number[];
+    gen: number[];
+    orco: number;
+  };
   const list: Inst[] = [];
   for (const item of input.items) {
     let mesh = item.mesh;
@@ -196,7 +247,9 @@ export function compileScene(input: CompileInput): CompiledScene {
           : [0, 0, 0, 1, 1, 1];
       genBoxes.set(base, gen);
     }
-    list.push({ item, geom: gi, M, inv, slots: item.materials.map(indexOfMaterial), gen });
+    const slots = item.materials.map(indexOfMaterial);
+    const orco = slots.some((s) => materials[s].procedural?.usesGenerated) ? orcoFor(item, mesh, g) : -1;
+    list.push({ item, geom: gi, M, inv, slots, gen, orco });
   }
   const n = list.length;
   const instances: CompiledInstances = {
@@ -209,6 +262,8 @@ export function compileScene(input: CompileInput): CompiledScene {
     slotCount: new Int32Array(n),
     gen: new Float64Array(n * 6),
     emitGroup: new Int32Array(n).fill(-1),
+    orco: Int32Array.from(list, (l) => l.orco),
+    orcos,
     ids: list.map((l) => l.item.id),
   };
   const slotList: number[] = [];

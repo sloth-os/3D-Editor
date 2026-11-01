@@ -638,7 +638,9 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       execute(ctx, p) {
         // curves and text cannot absorb every transform: refuse before anything changes
         checkCurveTransformApply(ctx, selectedObjects(ctx), p);
-        for (const o of selectedObjects(ctx)) {
+        for (const sel of selectedObjects(ctx)) {
+          // re-read: applying a selected parent changes the transforms of its children
+          const o = ctx.doc.getObject(sel.id) ?? sel;
           const loc: Vec3 = p.location ? [0, 0, 0] : o.location;
           const rot: Vec3 = p.rotation ? [0, 0, 0] : o.rotation_euler;
           const scl: Vec3 = p.scale ? [1, 1, 1] : o.scale;
@@ -666,7 +668,10 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
               if (m.uvs) m.uvs = m.uvs.map((uv) => reversePairs(uv));
             }
             ctx.doc.setMesh(meshId, m);
-          } else if (o.type === 'CURVE' || o.type === 'FONT') applyCurveTransform(ctx, o, delta, p.properties);
+          } else if (o.type === 'CURVE' || o.type === 'FONT') {
+            // false (with a warning) when its data cannot take the transform: it stays on the object
+            if (!applyCurveTransform(ctx, o, delta, p.properties)) continue;
+          }
           // children keep their world transform
           const childWorld = new Map(ctx.doc.childrenOf(o.id).map((c) => [c.id, ctx.doc.worldMatrix(c.id)]));
           ctx.doc.updateObject(o.id, { location: loc, rotation_euler: rot, scale: scl });

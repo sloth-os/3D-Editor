@@ -19,7 +19,10 @@ import {
 export interface PathTraceRenderOptions {
   /** Samples per pixel (default: render settings `samples`). */
   samples?: number;
-  /** Maximum diffuse/glossy bounces (default: render settings `max_bounces`). */
+  /**
+   * Maximum bounces of any kind (diffuse, glossy, transmission), like Blender's Total max bounces
+   * (default: render settings `max_bounces`; 0 = direct light only).
+   */
   max_bounces?: number;
   /** Denoise the result (default: render settings `use_denoising`). */
   denoise?: boolean;
@@ -51,6 +54,11 @@ export interface PathTraceRenderInput {
   height: number;
   /** Image decoder (the renderer's texture cache). */
   images: { get(id: string): SampledTexture | null };
+  /**
+   * Undeformed positions of an item's mesh for GENERATED texture coordinates (see
+   * `CompileInput.orco`; e.g. `evaluatedOrco(doc, scene, item.object, true)`).
+   */
+  orco?: (item: RenderItem) => ArrayLike<number> | null;
   options?: PathTraceRenderOptions;
 }
 
@@ -121,6 +129,7 @@ export function preparePathTrace(input: PathTraceRenderInput): PreparedPathTrace
     width: input.width,
     height: input.height,
     image: (id) => input.images.get(id),
+    orco: input.orco,
   });
   let background: PathTracerSettings['background'] = 'COLOR';
   let displayBackground: DisplayBackground | null = null;

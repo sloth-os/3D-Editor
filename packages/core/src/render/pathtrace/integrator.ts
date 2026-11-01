@@ -33,9 +33,12 @@ export const BACKGROUND_COLOR = 1;
 export const BACKGROUND_TRANSPARENT = 2;
 
 export interface IntegratorSettings {
-  /** Maximum diffuse/glossy bounces (render `max_bounces`). */
+  /**
+   * Maximum bounces of any kind (diffuse, glossy, transmission) on a path: Blender's Total max
+   * bounces (render `max_bounces`). Alpha-transparent surfaces do not count (`maxTransparentLayers`).
+   */
   maxBounces: number;
-  /** Maximum refractions (glass) on a path. */
+  /** Maximum refractions (glass) on a path, within `maxBounces`. */
   maxTransmissionBounces: number;
   /** Maximum alpha-transparent surfaces a ray passes through. */
   maxTransparentLayers: number;
@@ -222,6 +225,18 @@ export class PathIntegrator {
     const i0 = g.vidx[tri * 3];
     const i1 = g.vidx[tri * 3 + 1];
     const i2 = g.vidx[tri * 3 + 2];
+    const oi = s.instances.orco[inst];
+    if (oi >= 0) {
+      // undeformed positions: GENERATED coordinates stick to deformed surfaces
+      const O = s.instances.orcos[oi];
+      c.gx = b0 * O[i0 * 3] + b1 * O[i1 * 3] + b2 * O[i2 * 3];
+      c.gy = b0 * O[i0 * 3 + 1] + b1 * O[i1 * 3 + 1] + b2 * O[i2 * 3 + 1];
+      c.gz = b0 * O[i0 * 3 + 2] + b1 * O[i1 * 3 + 2] + b2 * O[i2 * 3 + 2];
+    } else {
+      c.gx = c.px;
+      c.gy = c.py;
+      c.gz = c.pz;
+    }
     const uv = g.uvs;
     if (uv) {
       c.hasUV = true;
@@ -1339,11 +1354,16 @@ export class PathIntegrator {
       const transmission = bsdf.sampledTransmission;
       // beyond the bounce limit the ray is still traced, but only to find the light it hits
       // (completes the MIS of this vertex's direct lighting), not to scatter again
-      if (transmission ? transmissions >= st.maxTransmissionBounces : bounces >= st.maxBounces)
+      if (
+        bounces + transmissions >= st.maxBounces ||
+        (transmission && transmissions >= st.maxTransmissionBounces)
+      )
         finalSegment = true;
-      const nwx = bsdf.wx * t1x + bsdf.wy * t2x + bsdf.wz * snx;
-      const nwy = bsdf.wx * t1y + bsdf.wy * t2y + bsdf.wz * sny;
-      const nwz = bsdf.wx * t1z + bsdf.wy * t2z + bsdf.wz * snz;
+      // (a delta pass-through, i.e. index-matched glass, continues exactly along the ray)
+      const delta = bsdf.sampledDelta;
+      const nwx = delta ? dx : bsdf.wx * t1x + bsdf.wy * t2x + bsdf.wz * snx;
+      const nwy = delta ? dy : bsdf.wx * t1y + bsdf.wy * t2y + bsdf.wz * sny;
+      const nwz = delta ? dz : bsdf.wx * t1z + bsdf.wy * t2z + bsdf.wz * snz;
       const gside = nwx * gnx + nwy * gny + nwz * gnz;
       if (transmission ? gside >= 0 : gside <= 0) break;
       const ip = 1 / bsdf.pdf;
@@ -1357,8 +1377,8 @@ export class PathIntegrator {
         etaScale *= eta * eta;
       } else bounces++;
       prevPdf = bsdf.pdf;
-      if (bsdf.pdf < minPdf) minPdf = bsdf.pdf;
-      prevSingular = bsdf.singular;
+      if (!delta && bsdf.pdf < minPdf) minPdf = bsdf.pdf;
+      prevSingular = bsdf.singular || delta;
       prevX = this.px;
       prevY = this.py;
       prevZ = this.pz;

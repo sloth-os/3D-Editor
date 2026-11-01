@@ -86,6 +86,41 @@ describe('path tracer: white furnace and emission', () => {
     expect(c[0]).toBeLessThan(0.53);
   }, 30_000);
 
+  it('index-matched (IOR 1) glass is invisible and rough glass loses no energy', () => {
+    // regressions: IOR 1 refraction had a degenerate half vector (the ball rendered at 0.07), and
+    // rough glass lacked the multiple-scattering compensation (0.33 at roughness 0.7, 0.18 at 1)
+    const furnace = (material: Partial<MaterialData>) => {
+      const doc = SceneDoc.create({ empty: true });
+      doc.updateWorld({ environment: 'NONE', color: [0.5, 0.5, 0.5], strength: 1 });
+      const sphere = createUVSphere({ segments: 48, ring_count: 24 });
+      sphere.faceSmooth = sphere.faceSmooth.map(() => true);
+      doc.addObject({
+        type: 'MESH',
+        name: 'Ball',
+        data: doc.addMesh('Ball', sphere),
+        material_slots: [doc.addMaterial(material)],
+      });
+      const { img } = traceLinear(doc, {
+        width: 16,
+        height: 16,
+        samples: 128,
+        maxBounces: 64,
+        options: { filter_glossy: 0 },
+        view: { position: [0, -5, 0], target: [0, 0, 0], fovY: 0.5 },
+      });
+      return mean(img, 16, 5, 5, 11, 11)[0];
+    };
+    const glass = { base_color: [1, 1, 1, 1] as [number, number, number, number], transmission: 1 };
+    for (const roughness of [0, 0.2, 1]) expect(furnace({ ...glass, roughness, ior: 1 })).toBeCloseTo(0.5, 4);
+    // a tinted index-matched surface filters the light passing through it (twice)
+    expect(furnace({ ...glass, base_color: [0.5, 0.5, 0.5, 1], ior: 1 })).toBeCloseTo(0.125, 4);
+    for (const roughness of [0.5, 0.7, 1]) {
+      const v = furnace({ ...glass, roughness, ior: 1.5 });
+      expect(v, `roughness ${roughness}`).toBeGreaterThan(0.475);
+      expect(v, `roughness ${roughness}`).toBeLessThan(0.515);
+    }
+  }, 60_000);
+
   it('emissive surfaces show their emission colour × strength as radiance', () => {
     const doc = SceneDoc.create({ empty: true });
     doc.updateWorld({ environment: 'NONE', color: [0, 0, 0] });

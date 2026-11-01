@@ -88,6 +88,59 @@ describe('principled BSDF', () => {
     expect(out).toBeCloseTo(F + (1 - F) * 2.25, 1);
   });
 
+  it('passes light straight through index-matched glass (IOR 1) at any roughness', () => {
+    for (const roughness of [0, 0.3, 1])
+      for (const entering of [true, false]) {
+        const b = setup({ transmission: 1, ior: 1, roughness, baseG: 0.5 }, 0.6, entering);
+        expect(b.singular).toBe(true);
+        expect(b.sample(0.3, 0.7, 0.5)).toBe(true);
+        expect(b.sampledDelta && b.sampledTransmission).toBe(true);
+        [-0.8, 0, -0.6].forEach((v, i) => expect([b.wx, b.wy, b.wz][i]).toBeCloseTo(v, 12));
+        // weight: the tint (no Fresnel reflection at IOR 1, no η² scaling)
+        expect(b.fR / b.pdf).toBeCloseTo(1, 12);
+        expect(b.fG / b.pdf).toBeCloseTo(0.5, 12);
+        // a delta lobe is never hit by an evaluated direction
+        b.eval(-0.8, 0, -0.6);
+        expect(b.fR + b.fG + b.fB + b.pdf).toBe(0);
+      }
+    // mixed with a diffuse base: light sampling still applies; the delta is picked by its probability
+    const half = setup({ transmission: 0.5, ior: 1, roughness: 0.5 }, 1);
+    expect(half.singular).toBe(false);
+    let delta = 0;
+    let sum = 0;
+    for (let i = 0; i < 400; i++) {
+      if (!half.sample((i * 0.618) % 1, (i * 0.414) % 1, (i + 0.5) / 400)) continue;
+      if (half.sampledDelta) {
+        delta++;
+        sum += half.fR / half.pdf;
+      }
+    }
+    expect(delta).toBeGreaterThan(0);
+    expect(sum / 400).toBeCloseTo(0.5, 6); // transmitted share: (1 − metallic) × transmission
+  });
+
+  it('compensates the single-scattering energy loss of rough glass (energy albedo ≈ 1)', () => {
+    // energy = reflected + transmitted (the η² radiance scaling removed)
+    const energy = (b: PrincipledBSDF, eta: number, n = 48) => {
+      let s = 0;
+      for (let i = 0; i < n; i++)
+        for (let j = 0; j < n; j++)
+          for (let k = 0; k < 4; k++)
+            if (b.sample((i + 0.5) / n, (j + 0.5) / n, (k + 0.5) / 4))
+              s += (b.fR / b.pdf) * (b.sampledTransmission ? eta * eta : 1);
+      return s / (n * n * 4);
+    };
+    for (const roughness of [0.5, 0.7, 1])
+      for (const mu of [1, 0.6, 0.3])
+        for (const entering of [true, false]) {
+          const b = setup({ transmission: 1, ior: 1.5, roughness }, mu, entering);
+          const e = energy(b, entering ? 1.5 : 1 / 1.5);
+          const what = `roughness ${roughness}, μ ${mu}, ${entering ? 'entering' : 'leaving'}`;
+          expect(e, what).toBeGreaterThan(0.95);
+          expect(e, what).toBeLessThan(1.04);
+        }
+  });
+
   it('samples directions with the pdf it reports (importance sampling equals quadrature)', () => {
     const cases: Partial<BSDFInputs>[] = [
       { roughness: 0.6 },

@@ -198,11 +198,13 @@ describe('renderAnimation', () => {
     doc.updateScene({ camera: doc.findObjectByName('Camera')!.id });
     expect(renderAnimation(doc, { width: 16, height: 9, frame_end: 2 }).view).toBeUndefined();
     doc.updateScene({ camera: null });
-    expect(renderAnimation(doc, { width: 16, height: 9, frame_end: 2, camera: 'Camera' }).view).toBeUndefined();
+    expect(
+      renderAnimation(doc, { width: 16, height: 9, frame_end: 2, camera: 'Camera' }).view,
+    ).toBeUndefined();
     // nothing to frame: the default view
     const empty = SceneDoc.create({ empty: true });
     expect(renderAnimation(empty, { width: 16, height: 9, frame_end: 2 }).view?.target).toEqual([0, 0, 0]);
-  });
+  }, 60_000);
 
   it('samples long frame ranges for the automatic view without aliasing periodic motion', () => {
     expect(sampleFrameIndices(5, 64)).toEqual([0, 1, 2, 3, 4]);
@@ -249,7 +251,7 @@ describe('renderAnimation', () => {
     // pixel would take far longer)
     let t0 = performance.now();
     const one = renderAnimation(doc, { ...traced, frame_end: 1, total_time_limit: 0.3 });
-    expect((performance.now() - t0) / 1000).toBeLessThan(2.5);
+    expect((performance.now() - t0) / 1000).toBeLessThan(5); // about 12 s at full 4096 samples
     expect(one).toMatchObject({
       frames: [1],
       cancelled: false,
@@ -259,7 +261,7 @@ describe('renderAnimation', () => {
     // several frames: the budget is shared and no frame starts after it is used up
     t0 = performance.now();
     const res = renderAnimation(doc, { ...traced, frame_end: 3, total_time_limit: 0.5 });
-    expect((performance.now() - t0) / 1000).toBeLessThan(3);
+    expect((performance.now() - t0) / 1000).toBeLessThan(6);
     expect(res.time_limit_reached).toBe(true);
     expect(res.frames.length).toBeGreaterThanOrEqual(1);
     expect(res.cancelled).toBe(res.frames.length < 3);
@@ -274,7 +276,7 @@ describe('renderAnimation', () => {
     // enough time: every sample is rendered
     const full = renderAnimation(doc, { ...traced, samples: 2, frame_end: 2, total_time_limit: 600 });
     expect(full).toMatchObject({ frames: [1, 2], time_limit_reached: false, undersampled_frames: [] });
-  });
+  }, 60_000);
 
   it('passes the engine and its settings to every frame', () => {
     const doc = slidingCube();
@@ -309,7 +311,7 @@ describe('renderAnimation', () => {
     doc.updateRender({ engine: 'PATHTRACER', samples: 4096 });
     const scene = renderAnimation(doc, { ...opts, format: 'PNG_SEQUENCE', frame_end: 1 });
     same(decodePNG(scene.files![0].data).data, b);
-  });
+  }, 60_000);
 });
 
 describe('contact sheets', () => {

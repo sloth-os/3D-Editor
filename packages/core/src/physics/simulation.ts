@@ -3,7 +3,7 @@ import type { MeshData } from '../mesh/types';
 import type { RigidBodyData } from '../doc/types';
 import { Body } from './body';
 import { buildCollisionShape } from './shapes';
-import { MAX_SIMULATED_FRAMES, motionMode, type WorldParams } from './settings';
+import { motionMode, simulatedFrameEnd, type WorldParams } from './settings';
 import { PhysicsWorld } from './world';
 import { composeRigid, decomposeRigid, isFiniteVec, mat3ToQuat, quatToMat3, slerpQ } from './vmath';
 
@@ -61,7 +61,7 @@ export class Simulation {
 
   constructor(inputs: readonly BodyInput[], params: WorldParams, opts: SimulationOptions = {}) {
     this.frameStart = params.frameStart;
-    this.frameEnd = Math.min(params.frameEnd, params.frameStart + MAX_SIMULATED_FRAMES);
+    this.frameEnd = simulatedFrameEnd(params);
     this.substeps = params.substeps;
     this.dt = params.timeScale / params.fps / params.substeps;
     this.current = this.frameStart;

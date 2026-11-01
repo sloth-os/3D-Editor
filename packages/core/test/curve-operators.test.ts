@@ -7,7 +7,9 @@ import {
   createOperatorRegistry,
   evaluateCurveSplines,
   isClosedManifold,
+  type Mat4,
   type OperatorContext,
+  type Vec3,
 } from '../src';
 
 function setup() {
@@ -342,6 +344,387 @@ describe('object.convert', () => {
     ok('object.convert');
     const tm = doc.getMesh(doc.getObject(t.object)!.data!)!;
     expect(isClosedManifold(tm)).toBe(true);
+  });
+});
+
+const toWorld = (w: Mat4, p: readonly number[]): Vec3 => [
+  w[0] * p[0] + w[4] * p[1] + w[8] * p[2] + w[12],
+  w[1] * p[0] + w[5] * p[1] + w[9] * p[2] + w[13],
+  w[2] * p[0] + w[6] * p[1] + w[10] * p[2] + w[14],
+];
+
+/** World positions of an object's evaluated mesh vertices (or of its sampled splines). */
+function worldGeometry(doc: SceneDoc, id: string, frame = 1, what: 'mesh' | 'splines' = 'mesh'): Vec3[] {
+  const e = new SceneEvaluator(doc).evaluate(frame).byId.get(id)!;
+  if (what === 'splines')
+    return evaluateCurveSplines(e.curve!).flatMap((s) => s.points.map((p) => toWorld(e.worldMatrix, p)));
+  const out: Vec3[] = [];
+  for (let i = 0; i < e.mesh!.positions.length; i += 3)
+    out.push(toWorld(e.worldMatrix, e.mesh!.positions.slice(i, i + 3)));
+  return out;
+}
+
+function expectSamePoints(a: Vec3[], b: Vec3[], digits = 9): void {
+  expect(b).toHaveLength(a.length);
+  a.forEach((p, i) => p.forEach((v, k) => expect(b[i][k]).toBeCloseTo(v, digits)));
+}
+
+describe('object transforms of curves and text', () => {
+  it('applies scale to curves and text without changing what they look like', () => {
+    const { doc, ctx, ok } = setup();
+    const c = ok('curve.add_from_points', {
+      points: [
+        [0, 0, 0],
+        [1, 0, 0],
+        [1, 1, 0.5],
+      ],
+      type: 'BEZIER',
+      bevel_depth: 0.1,
+      location: [0, 0, 0],
+      scale: [3, 3, 3],
+    });
+    const t = ok('object.text_add', {
+      body: 'Hi!',
+      location: [0, 2, 0],
+      scale: [2, 2, 2],
+      extrude: 0.05,
+      offset_x: 0.5,
+    });
+    const curveBefore = worldGeometry(doc, c.object);
+    const textBefore = worldGeometry(doc, t.object);
+    ctx.state.selectedIds = [c.object, t.object];
+    ok('object.transform_apply', { scale: true, rotation: true });
+    expect(doc.getObject(c.object)!.scale).toEqual([1, 1, 1]);
+    expect(doc.getObject(t.object)!.scale).toEqual([1, 1, 1]);
+    expectSamePoints(curveBefore, worldGeometry(doc, c.object));
+    expectSamePoints(textBefore, worldGeometry(doc, t.object));
+    // Blender's "Apply Properties": radius and font size carry the scale
+    for (const p of doc.getCurve(c.curve)!.splines[0].points) expect(p.radius).toBeCloseTo(3, 12);
+    expect(doc.getCurve(t.curve)).toMatchObject({ size: 2, extrude: 0.1, offset_x: 1 });
+    // without properties the thickness is not carried over (as asked)
+    const c2 = ok('curve.add_from_points', {
+      points: [
+        [0, 0, 0],
+        [1, 0, 0],
+      ],
+      bevel_depth: 0.1,
+      scale: [2, 2, 2],
+    });
+    ok('object.transform_apply', { properties: false });
+    expect(doc.getCurve(c2.curve)!.splines[0].points.map((p) => p.radius)).toEqual([1, 1]);
+  });
+
+  it('applies rotation, location and non-uniform scale to 3D curves (handles keep the shape)', () => {
+    const { doc, ctx, ok } = setup();
+    const c = ok('curve.add_from_points', {
+      points: [
+        [0, 0, 0],
+        [1, 0.5, 0],
+        [2, -0.5, 0.3],
+        [3, 0, 0],
+      ],
+      type: 'BEZIER',
+      location: [1, 2, 3],
+      rotation: [0.3, -0.5, 1.1],
+      scale: [1, 2, 0.5],
+    });
+    const before = worldGeometry(doc, c.object, 1, 'splines');
+    ctx.state.selectedIds = [c.object];
+    ok('object.transform_apply', { location: true, rotation: true, scale: true });
+    expect(doc.getObject(c.object)).toMatchObject({
+      location: [0, 0, 0],
+      rotation_euler: [0, 0, 0],
+      scale: [1, 1, 1],
+    });
+    expectSamePoints(before, worldGeometry(doc, c.object, 1, 'splines'));
+    // AUTO handles would be recomputed differently after a non-uniform scale: they became ALIGNED
+    const pts = doc.getCurve(c.curve)!.splines[0].points;
+    expect(pts.every((p) => p.handle_left_type === 'ALIGNED' && p.handle_right_type === 'ALIGNED')).toBe(
+      true,
+    );
+    // a uniform transform keeps AUTO handles
+    const u = ok('curve.add_from_points', {
+      points: [
+        [0, 0, 0],
+        [1, 1, 0],
+        [2, 0, 0],
+      ],
+      type: 'BEZIER',
+      rotation: [0, 0, 1],
+      scale: [2, 2, 2],
+    });
+    const ub = worldGeometry(doc, u.object, 1, 'splines');
+    ok('object.transform_apply');
+    expectSamePoints(ub, worldGeometry(doc, u.object, 1, 'splines'));
+    expect(doc.getCurve(u.curve)!.splines[0].points.every((p) => p.handle_left_type === 'AUTO')).toBe(true);
+  });
+
+  it('keeps 2D curves in their plane and text unrotated, refusing before anything changes', () => {
+    const { doc, ctx, ok, run } = setup();
+    const cube = ok('mesh.primitive_cube_add', { size: 1, scale: [2, 2, 2] });
+    const cubeId = cube.object ?? cube.id;
+    const flat = ok('curve.primitive_bezier_circle_add', {
+      dimensions: '2D',
+      extrude: 0.1,
+      location: [3, 1, 0],
+      rotation: [0, 0, 0.7],
+    });
+    const before = worldGeometry(doc, flat.object);
+    ctx.state.selectedIds = [cubeId, flat.object];
+    // a rotation about Z and an X/Y location fit the plane
+    ok('object.transform_apply', { location: true, rotation: true, scale: true });
+    expectSamePoints(before, worldGeometry(doc, flat.object));
+    expect(doc.getObject(flat.object)!.location).toEqual([0, 0, 0]);
+    // a rotation about X does not: nothing changes, not even the cube
+    ok('curve.properties_set', { object: flat.object, dimensions: '2D' });
+    doc.updateObject(flat.object, { rotation_euler: [Math.PI / 2, 0, 0] });
+    doc.updateObject(cubeId, { scale: [2, 2, 2] });
+    const r = run('object.transform_apply', { rotation: true, scale: true });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/2D curve stays in its local XY plane/);
+    expect(doc.getObject(cubeId)!.scale).toEqual([2, 2, 2]);
+    // text only takes its scale
+    const t = ok('object.text_add', { body: 'Up', rotation: [Math.PI / 2, 0, 0], scale: [2, 2, 2] });
+    const tb = worldGeometry(doc, t.object);
+    expect(run('object.transform_apply', { rotation: true, scale: true }).error).toMatch(
+      /text can only have its scale applied/,
+    );
+    ok('object.transform_apply', { rotation: false, scale: true });
+    expect(doc.getObject(t.object)!.rotation_euler[0]).toBeCloseTo(Math.PI / 2);
+    expectSamePoints(tb, worldGeometry(doc, t.object));
+    // a zero rotation is no problem, a non-uniform text scale is
+    doc.updateObject(t.object, { rotation_euler: [0, 0, 0], scale: [2, 1, 1] });
+    expect(run('object.transform_apply', { rotation: true, scale: true }).error).toMatch(
+      /uniform, positive X\/Y scale/,
+    );
+    doc.updateObject(t.object, { scale: [1.5, 1.5, 1.5] });
+    ok('object.transform_apply', { rotation: true, scale: true });
+    // size 2 (from the first apply) × 1.5
+    expect(doc.getCurve(t.curve)!.size).toBeCloseTo(3);
+  });
+
+  it('keeps hierarchies in place when parents and children are applied together', () => {
+    const { doc, ctx, ok, run } = setup();
+    const p = ok('mesh.primitive_cube_add', { size: 1, scale: [2, 2, 2] });
+    const pid = p.object ?? p.id;
+    const t = ok('object.text_add', { body: 'Hi', location: [1, 0, 0] });
+    const c = ok('curve.add_from_points', {
+      points: [
+        [0, 3, 0],
+        [1, 3, 0],
+      ],
+      bevel_depth: 0.1,
+      location: [0, 0, 0],
+    });
+    doc.setParent(t.object, pid, true);
+    doc.setParent(c.object, pid, true);
+    const tb = worldGeometry(doc, t.object);
+    const cb = worldGeometry(doc, c.object);
+    ctx.state.selectedIds = [pid, t.object, c.object];
+    ok('object.transform_apply');
+    expectSamePoints(tb, worldGeometry(doc, t.object));
+    expectSamePoints(cb, worldGeometry(doc, c.object));
+    // a rotation a parent passes down to its text child stays on the text, with a warning
+    const q = ok('mesh.primitive_cube_add', { size: 1 });
+    const qid = q.object ?? q.id;
+    const t2 = ok('object.text_add', { body: 'Yo', location: [0, 0, 2] });
+    doc.setParent(t2.object, qid, true);
+    doc.updateObject(qid, { rotation_euler: [0.6, 0, 0] });
+    const t2b = worldGeometry(doc, t2.object);
+    ctx.state.selectedIds = [qid, t2.object];
+    const r = run('object.transform_apply', { rotation: true, scale: true });
+    expect(r.ok).toBe(true);
+    expect(r.reports.some((x) => x.level === 'WARNING' && /keeps its transform/.test(x.message))).toBe(true);
+    expect(doc.getObject(qid)!.rotation_euler).toEqual([0, 0, 0]);
+    expectSamePoints(t2b, worldGeometry(doc, t2.object));
+  });
+
+  it('copies shared curve data and lets animated channels follow, in one undo step', () => {
+    const { doc, ctx, ok } = setup();
+    const um = new Y.UndoManager(doc.sharedTypes(), {
+      trackedOrigins: new Set([doc.origin]),
+      captureTimeout: 0,
+    });
+    const a = ok('curve.add_from_points', {
+      points: [
+        [0, 0, 0],
+        [1, 0, 0],
+      ],
+      bevel_depth: 0.1,
+      scale: [2, 2, 2],
+    });
+    const b = doc.addObject({ type: 'CURVE', name: 'Twin', data: a.curve, location: [0, 3, 0] });
+    const twinBefore = worldGeometry(doc, b);
+    ctx.state.selectedIds = [a.object];
+    ok('object.transform_apply');
+    expect(doc.getObject(a.object)!.data).not.toBe(a.curve);
+    expect(doc.getObject(b)!.data).toBe(a.curve);
+    expectSamePoints(twinBefore, worldGeometry(doc, b));
+    // keyframed text size and offset follow the applied scale
+    const t = ok('object.text_add', { body: 'Grow', scale: [2, 2, 2] });
+    ok('curve.keyframe_insert', { path: 'size', frame: 1, value: 1 });
+    ok('curve.keyframe_insert', { path: 'size', frame: 11, value: 3 });
+    const at11 = worldGeometry(doc, t.object, 11);
+    ok('object.transform_apply');
+    expect(doc.getFCurve(`curve:${t.curve}:size:0`)!.keyframes.map((k) => k.value)).toEqual([2, 6]);
+    expectSamePoints(at11, worldGeometry(doc, t.object, 11));
+    um.undo();
+    expect(doc.getObject(t.object)!.scale).toEqual([2, 2, 2]);
+    expect(doc.getFCurve(`curve:${t.curve}:size:0`)!.keyframes.map((k) => k.value)).toEqual([1, 3]);
+    expect(doc.getCurve(t.curve)!.size).toBe(1);
+  });
+
+  it('sets the origin of curves (control points) and text (offsets) without moving them', () => {
+    const { doc, ctx, ok } = setup();
+    const c = ok('curve.add_from_points', {
+      points: [
+        [1, 1, 0],
+        [3, 1, 0],
+        [3, 2, 1],
+      ],
+      bevel_depth: 0.1,
+      location: [5, 0, 0],
+    });
+    const before = worldGeometry(doc, c.object);
+    ctx.state.selectedIds = [c.object];
+    ok('object.origin_set', { type: 'ORIGIN_GEOMETRY', center: 'MEDIAN' });
+    const o = doc.getObject(c.object)!;
+    // the origin moves onto the median of the control points (in world space)
+    expect(o.location[0]).toBeCloseTo(5 + 7 / 3);
+    expect(o.location[1]).toBeCloseTo(4 / 3);
+    expect(o.location[2]).toBeCloseTo(1 / 3);
+    expectSamePoints(before, worldGeometry(doc, c.object));
+    // text: the offsets centre the glyphs on the origin
+    const t = ok('object.text_add', { body: 'Text', location: [0, 0, 0] });
+    const tb = worldGeometry(doc, t.object);
+    ok('object.origin_set', { type: 'ORIGIN_GEOMETRY' });
+    expectSamePoints(tb, worldGeometry(doc, t.object));
+    const text = doc.getCurve(t.curve)!;
+    expect(text.offset_x).toBeLessThan(0);
+    const xs = worldGeometry(doc, t.object).map((p) => p[0] - doc.getObject(t.object)!.location[0]);
+    expect(Math.min(...xs) + Math.max(...xs)).toBeCloseTo(0, 6);
+    // ORIGIN_CURSOR: the origin goes to the cursor, the curve stays where it is
+    ctx.state.selectedIds = [c.object];
+    ctx.state.cursorLocation = [0, 0, 0];
+    ok('object.origin_set', { type: 'ORIGIN_CURSOR' });
+    for (const v of doc.getObject(c.object)!.location) expect(v).toBeCloseTo(0, 9);
+    expectSamePoints(before, worldGeometry(doc, c.object));
+    // GEOMETRY_ORIGIN moves the geometry instead: its bounds (points ± radius) centre on the origin
+    ok('object.origin_set', { type: 'GEOMETRY_ORIGIN', center: 'BOUNDS' });
+    for (const v of doc.getObject(c.object)!.location) expect(v).toBeCloseTo(0, 9);
+    const cos = doc.getCurve(c.curve)!.splines[0].points.map((p) => p.co);
+    for (let k = 0; k < 3; k++) {
+      const lo = Math.min(...cos.map((p) => p[k])) - 1;
+      const hi = Math.max(...cos.map((p) => p[k])) + 1;
+      expect(lo + hi).toBeCloseTo(0, 9);
+    }
+    expect(worldGeometry(doc, c.object)[0][0]).not.toBeCloseTo(before[0][0], 3);
+  });
+
+  it('shades curves smooth or flat through their splines', () => {
+    const { doc, ok, run } = setup();
+    const c = ok('curve.primitive_bezier_circle_add', { bevel_depth: 0.1 });
+    ok('object.shade_flat');
+    expect(doc.getCurve(c.curve)!.splines.every((s) => s.use_smooth === false)).toBe(true);
+    const ev = new SceneEvaluator(doc);
+    expect(ev.evaluate(1).byId.get(c.object)!.mesh!.faceSmooth.some(Boolean)).toBe(false);
+    ok('object.shade_smooth');
+    expect(ev.evaluate(1).byId.get(c.object)!.mesh!.faceSmooth.every(Boolean)).toBe(true);
+    ok('object.text_add', { body: 'A' });
+    const r = run('object.shade_flat');
+    expect(r.ok).toBe(true);
+    expect(r.reports.some((x) => x.level === 'WARNING' && /always smooth/.test(x.message))).toBe(true);
+  });
+});
+
+describe('agent-facing results and validation', () => {
+  it('lists mesh objects whose modifiers object.convert applied', () => {
+    const { doc, ctx, ok } = setup();
+    const m = ok('mesh.primitive_cube_add', { size: 1 });
+    const id = m.object ?? m.id;
+    ok('object.modifier_add', { object: id, type: 'SUBSURF' });
+    const plain = ok('mesh.primitive_cube_add', { size: 1 });
+    ctx.state.selectedIds = [id, plain.object ?? plain.id];
+    const r = ok('object.convert', { target: 'MESH' });
+    expect(doc.getObject(id)!.modifiers).toHaveLength(0);
+    // the cube without modifiers had nothing to convert
+    expect(r.converted).toEqual([{ object: id, name: doc.getObject(id)!.name, type: 'MESH' }]);
+  });
+
+  it('rejects keyframes on channels that do not exist', () => {
+    const { doc, run, ok } = setup();
+    const c = ok('curve.add_from_points', {
+      name: 'C',
+      points: [
+        [0, 0, 0],
+        [1, 0, 0],
+        [2, 0, 0],
+      ],
+      bevel_depth: 0.1,
+    });
+    const err = (params: Record<string, unknown>) =>
+      run('curve.keyframe_insert', { object: 'C', frame: 1, ...params }).error;
+    expect(err({ path: 'splines[0].points[3].co', value: 2 })).toMatch(/has no point 3 \(it has 3 points\)/);
+    expect(err({ path: 'splines[1].points[0].radius', value: 2 })).toMatch(/has no spline 1/);
+    expect(err({ path: 'bevel_depth', index: 4, value: 0.5 })).toMatch(/single value/);
+    expect(err({ path: 'splines[0].points[1].co', index: 3, value: 1 })).toMatch(/use 0\.\.2/);
+    expect(err({ path: 'splines[0].points[1].handle_left', value: 1 })).toMatch(/no stored handle_left/);
+    expect(err({ path: 'size', value: 2 })).toMatch(/only affects text/);
+    expect(doc.listFCurves(c.curve)).toHaveLength(0);
+    // valid channels still work, scalars with index 0 or -1
+    expect(
+      ok('curve.keyframe_insert', { object: 'C', path: 'bevel_depth', index: 0, frame: 1 }).inserted,
+    ).toBe(1);
+    expect(
+      ok('curve.keyframe_insert', { object: 'C', path: 'splines[0].points[2].co', frame: 1 }).inserted,
+    ).toBe(3);
+    expect(
+      ok('curve.keyframe_insert', { object: 'C', path: 'splines[0].points[2].tilt', frame: 1, value: 1 })
+        .inserted,
+    ).toBe(1);
+  });
+
+  it('documents the side positive offsets go to', () => {
+    const { doc, ok, reg } = setup();
+    const ring = Array.from({ length: 16 }, (_, i) => {
+      const a = (i / 16) * 2 * Math.PI;
+      return [Math.cos(a), Math.sin(a), 0];
+    });
+    const maxX = (id: string) => Math.max(...worldGeometry(doc, id).map((p) => p[0]));
+    // counter-clockwise 3D loop: positive offsets go to the left of travel, i.e. inwards
+    const ccw = ok('curve.add_from_points', {
+      points: ring,
+      type: 'BEZIER',
+      cyclic: true,
+      bevel_depth: 0.05,
+      offset: 0.2,
+      location: [0, 0, 0],
+    });
+    expect(maxX(ccw.object)).toBeLessThan(0.9);
+    // reversed (clockwise) it grows, and 2D outlines always grow
+    const cw = ok('curve.add_from_points', {
+      points: [...ring].reverse(),
+      type: 'BEZIER',
+      cyclic: true,
+      bevel_depth: 0.05,
+      offset: 0.2,
+      location: [0, 0, 0],
+    });
+    expect(maxX(cw.object)).toBeGreaterThan(1.2);
+    const flat = ok('curve.add_from_points', {
+      points: ring,
+      type: 'BEZIER',
+      cyclic: true,
+      dimensions: '2D',
+      extrude: 0.05,
+      offset: 0.2,
+      location: [0, 0, 0],
+    });
+    expect(maxX(flat.object)).toBeGreaterThan(1.15);
+    const info = reg.describe().find((i) => i.id === 'curve.properties_set')!;
+    const offset = (info.parameters as { properties: Record<string, { description: string }> }).properties
+      .offset;
+    expect(offset.description).toMatch(/counter-clockwise loop shrinks/);
   });
 });
 

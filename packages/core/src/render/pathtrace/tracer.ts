@@ -15,9 +15,12 @@ export interface PathTracerSettings {
   height: number;
   /** Samples per pixel rendered by `render()` (default 64). */
   samples: number;
-  /** Maximum diffuse/glossy bounces (default 4). */
+  /**
+   * Maximum bounces of any kind (diffuse, glossy and transmission) on a path, like Blender's Total
+   * max bounces (default 4; 0 = direct light only). Alpha-transparent surfaces do not count.
+   */
   maxBounces: number;
-  /** Maximum refractions through glass (default max(8, maxBounces)). */
+  /** Maximum refractions through glass within `maxBounces` (default: no extra limit). */
   maxTransmissionBounces: number;
   /** Indirect light clamp (max rgb component per sample, default 10; 0 disables). */
   clampIndirect: number;
@@ -72,10 +75,7 @@ export function pathTracerSettings(
     height: Math.max(1, Math.floor(fin(s.height, 1))),
     samples: Math.max(1, Math.min(1 << 20, Math.floor(fin(s.samples, 64)))),
     maxBounces,
-    maxTransmissionBounces: Math.max(
-      0,
-      Math.min(1024, Math.floor(fin(s.maxTransmissionBounces, Math.max(8, maxBounces)))),
-    ),
+    maxTransmissionBounces: Math.max(0, Math.min(1024, Math.floor(fin(s.maxTransmissionBounces, maxBounces)))),
     clampIndirect: Math.max(0, fin(s.clampIndirect, 10)),
     filterGlossy: Math.max(0, fin(s.filterGlossy, 1)),
     seed: Math.floor(fin(s.seed, 0)) >>> 0,

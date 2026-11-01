@@ -123,20 +123,33 @@ describe('anim.fmodifier_add', () => {
   it('warns that a modifier on a driven channel has no effect while the driver is active', () => {
     const { doc, ok, reports, cam } = setup();
     ok('anim.driver_add', { path: 'location', index: 0, expression: 'frame / 10' });
-    const res = ok('anim.fmodifier_add', { path: 'location', index: 0, type: 'NOISE', params: { strength: 5 } });
+    const res = ok('anim.fmodifier_add', {
+      path: 'location',
+      index: 0,
+      type: 'NOISE',
+      params: { strength: 5 },
+    });
     expect(res.driven_channels).toEqual([0]);
-    expect(reports.some((r) => /location\[0\] of 'Cam' is driven: .*NOISE modifier has no effect/.test(r))).toBe(
-      true,
-    );
+    expect(
+      reports.some((r) => /location\[0\] of 'Cam' is driven: .*NOISE modifier has no effect/.test(r)),
+    ).toBe(true);
     // indeed: the driver decides the value
     const ev = new SceneEvaluator(doc);
     expect([1, 2, 3].map((f) => ev.evaluate(f).byId.get(cam)!.data.location[0])).toEqual([0.1, 0.2, 0.3]);
     // a muted driver does not override the curve: no warning, and the modifier works
     ok('anim.driver_update', { path: 'location', index: 0, mute: true });
     reports.length = 0;
-    const again = ok('anim.fmodifier_add', { path: 'location', index: 0, type: 'NOISE', params: { strength: 5 } });
+    const again = ok('anim.fmodifier_add', {
+      path: 'location',
+      index: 0,
+      type: 'NOISE',
+      params: { strength: 5 },
+    });
     expect(again.driven_channels).toBeUndefined();
     expect(reports).toEqual([]);
+    const shaken = [1, 2, 3].map((f) => new SceneEvaluator(doc).evaluate(f).byId.get(cam)!.data.location[0]);
+    expect(shaken).not.toEqual([0.1, 0.2, 0.3]);
+    expect(new Set(shaken).size).toBe(3);
     // every channel of a path: only the driven ones are named
     ok('anim.driver_add', { path: 'rotation_euler', index: 2, expression: 'frame' });
     const all = ok('anim.fmodifier_add', { path: 'rotation_euler', type: 'STEPPED' });
@@ -160,8 +173,11 @@ describe('anim.fmodifier_add', () => {
     expect(run('anim.driver_add', { path, expression: 'frame * 2' }).ok).toBe(true);
     // the keyframe operators do not advertise custom properties as example paths; drivers do
     const desc = (id: string) =>
-      (reg.describe().find((i) => i.id === id)!.parameters as { properties: { path: { description: string } } })
-        .properties.path.description;
+      (
+        reg.describe().find((i) => i.id === id)!.parameters as {
+          properties: { path: { description: string } };
+        }
+      ).properties.path.description;
     for (const id of ['anim.keyframes_insert_many', 'anim.fmodifier_add']) {
       expect(desc(id)).toMatch(/cannot be keyframed/);
       expect(desc(id)).not.toMatch(/'custom_props\["amount"\]'/);
@@ -178,7 +194,9 @@ describe('anim.fmodifier_add', () => {
     const desc = (id: string) => reg.describe().find((i) => i.id === id)!.description;
     expect(desc('anim.fmodifier_add')).toMatch(/every value modifier .* wherever it is in the stack/);
     expect(desc('anim.fmodifier_add')).not.toMatch(/value modifiers below them/);
-    expect(desc('anim.fmodifier_add')).toMatch(/CYCLIC extrapolation the value modifiers repeat with every cycle/);
+    expect(desc('anim.fmodifier_add')).toMatch(
+      /CYCLIC extrapolation the value modifiers repeat with every cycle/,
+    );
     expect(desc('anim.extrapolation_set')).toMatch(/repeats the curve's F-modifiers with every cycle/);
   });
 

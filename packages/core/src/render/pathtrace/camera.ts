@@ -5,8 +5,10 @@ import type { RenderView } from '../view';
 /**
  * Camera of the path tracer, derived from the same `RenderView` as the rasterizer (so lens shift,
  * sensor fit, orthographic scale and clipping match exactly). Rays start on the near clipping
- * plane and end on the far plane. Depth of field (perspective cameras with `dof_use`) samples a
- * circular aperture of radius `lens / (2 · f-stop)` (mm → m) focused at `dof_focus_distance`.
+ * plane and end on the far plane. Depth of field (`dof_use`) samples a circular aperture focused at
+ * `dof_focus_distance` from the camera, like Cycles: radius `lens / (2 · f-stop)` (mm → m) for
+ * perspective cameras and `1 / (2 · f-stop)` metres for orthographic ones (whose rays of a pixel
+ * start around its point on the near plane and meet on the focal plane).
  */
 export interface CameraModel {
   ortho: boolean;
@@ -37,10 +39,10 @@ export function buildCamera(
   if (!invProj.every(Number.isFinite)) invProj = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
   let lensRadius = 0;
   let focusDistance = 1;
-  if (cam && cam.dof_use && !view.ortho) {
+  if (cam && cam.dof_use) {
     const fstop = finite(cam.dof_aperture_fstop, 0);
     const lens = finite(cam.lens, 50);
-    if (fstop > 0 && lens > 0) lensRadius = (0.5 * lens * 1e-3) / fstop;
+    if (fstop > 0 && (view.ortho || lens > 0)) lensRadius = (view.ortho ? 0.5 : 0.5 * lens * 1e-3) / fstop;
     focusDistance = Math.max(1e-4, finite(cam.dof_focus_distance, 10));
   }
   return {
@@ -55,6 +57,28 @@ export function buildCamera(
     lensRadius,
     focusDistance,
   };
+}
+
+/** Result of `concentricDisc`. */
+const DISC = { x: 0, y: 0 };
+
+/** Maps [0, 1)² to a disc of the given radius (Shirley–Chiu concentric mapping) into `DISC`. */
+function concentricDisc(u: number, v: number, radius: number): void {
+  const a = 2 * u - 1;
+  const b = 2 * v - 1;
+  let r = 0;
+  let phi = 0;
+  if (a !== 0 || b !== 0) {
+    if (Math.abs(a) > Math.abs(b)) {
+      r = a;
+      phi = (Math.PI / 4) * (b / a);
+    } else {
+      r = b;
+      phi = Math.PI / 2 - (Math.PI / 4) * (a / b);
+    }
+  }
+  DISC.x = radius * r * Math.cos(phi);
+  DISC.y = radius * r * Math.sin(phi);
 }
 
 /** Generates primary rays into its public fields (no allocations). */
@@ -132,6 +156,20 @@ export class CameraRays {
       dy = 0;
       dz = -1;
       tMax = c.far - c.near;
+      if (c.lensRadius > 0) {
+        // start on the aperture around the pixel's near-plane point, aim at its focal-plane point
+        concentricDisc(lu, lv, c.lensRadius);
+        ox = nx + DISC.x;
+        oy = ny + DISC.y;
+        dx = -DISC.x;
+        dy = -DISC.y;
+        dz = -Math.max(1e-4, c.focusDistance - c.near);
+        const dl = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        dx /= dl;
+        dy /= dl;
+        dz /= dl;
+        tMax = (c.far - c.near) / -dz;
+      }
     } else {
       const l = Math.sqrt(nx * nx + ny * ny + nz * nz);
       dx = nx / l;
@@ -143,22 +181,9 @@ export class CameraRays {
         const fx = dx * ft;
         const fy = dy * ft;
         const fz = dz * ft;
-        // concentric disc mapping
-        const a = 2 * lu - 1;
-        const b = 2 * lv - 1;
-        let r = 0;
-        let phi = 0;
-        if (a !== 0 || b !== 0) {
-          if (Math.abs(a) > Math.abs(b)) {
-            r = a;
-            phi = (Math.PI / 4) * (b / a);
-          } else {
-            r = b;
-            phi = Math.PI / 2 - (Math.PI / 4) * (a / b);
-          }
-        }
-        const lx = c.lensRadius * r * Math.cos(phi);
-        const ly = c.lensRadius * r * Math.sin(phi);
+        concentricDisc(lu, lv, c.lensRadius);
+        const lx = DISC.x;
+        const ly = DISC.y;
         dx = fx - lx;
         dy = fy - ly;
         dz = fz;

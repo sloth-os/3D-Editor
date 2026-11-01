@@ -22,6 +22,8 @@ export interface MeshGeometry {
   normals: Float32Array;
   uvs: Float32Array | null;
   colors: Float32Array | null;
+  /** Source mesh vertex of every render vertex (e.g. to look up undeformed positions). */
+  vertexSource: Uint32Array;
   bvh: BVH;
   /** Object-space bounds: min xyz, max xyz. */
   bounds: Float64Array;
@@ -158,6 +160,7 @@ function buildMeshGeometry(mesh: MeshData): MeshGeometry {
     normals: N,
     uvs: rb.uvs,
     colors: rb.colors,
+    vertexSource: rb.vertexSource,
     bvh,
     bounds,
     skipped: total - n,

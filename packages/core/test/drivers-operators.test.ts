@@ -334,7 +334,11 @@ describe('anim.driver_update / driver_remove / driver_list', () => {
         mute: false,
       });
     bad('location', 0, {});
-    bad('location', 1, [null, 5, { name: 'cx', target_type: 'object', target_id: car, path: 'location', index: 0 }]);
+    bad('location', 1, [
+      null,
+      5,
+      { name: 'cx', target_type: 'object', target_id: car, path: 'location', index: 0 },
+    ]);
     bad('location', 2, undefined);
     ok('anim.driver_add', { target: 'Car', path: 'location', index: 2, expression: 'frame * 2' });
     expect(evalAt(doc, 3).byId.get(wheel)!.data.location[0]).toBe(3); // the evaluator copes

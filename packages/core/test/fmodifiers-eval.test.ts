@@ -244,7 +244,11 @@ describe('STEPPED', () => {
     const held: FCurve = { ...noisy, extrapolation: 'CONSTANT' };
     expect(at(held, 13) - 10).toBeCloseTo(refNoise(13) - 0.5, 12);
     // a generator becomes a repeating ramp; restricted ranges are tested at the cycled time
-    const gen: FCurve = { ...fc, extrapolation: 'CYCLIC', modifiers: [mod('GENERATOR', { coefficients: [0, 2] })] };
+    const gen: FCurve = {
+      ...fc,
+      extrapolation: 'CYCLIC',
+      modifiers: [mod('GENERATOR', { coefficients: [0, 2] })],
+    };
     expect([4, 14, 24, -6].map((f) => at(gen, f))).toEqual([8, 8, 8, 8]);
     const ranged: FCurve = {
       ...fc,
@@ -278,7 +282,11 @@ describe('STEPPED', () => {
   it('repeats a NOISE camera shake on a cyclic loop with every cycle', () => {
     let fc = createFCurve({ target_type: 'object', target_id: 'a', path: 'location', index: 0 });
     fc = insertKeyframe(insertKeyframe(insertKeyframe(fc, 1, 0, 'LINEAR'), 13, 1, 'LINEAR'), 25, 0, 'LINEAR');
-    const curve: FCurve = { ...fc, extrapolation: 'CYCLIC', modifiers: [mod('NOISE', { scale: 5, strength: 1 })] };
+    const curve: FCurve = {
+      ...fc,
+      extrapolation: 'CYCLIC',
+      modifiers: [mod('NOISE', { scale: 5, strength: 1 })],
+    };
     const first = [1, 5, 10, 24].map((f) => at(curve, f));
     expect([25 + 24, 29, 34, 48].map((f) => at(curve, f))).toEqual(first); // frame 49 starts cycle 3 like 1
     expect([-23, -19, -14, 0].map((f) => at(curve, f))).toEqual(first);

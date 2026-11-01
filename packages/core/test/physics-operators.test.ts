@@ -10,6 +10,7 @@ import { OperatorRegistry } from '../src/operators/registry';
 import { createOperatorRegistry } from '../src/operators';
 import { registerPhysicsOperators } from '../src/operators/physics';
 import { freeRigidBodyCache, rigidBodyCacheInfo } from '../src/physics/rigid-body';
+import { MAX_SIMULATED_FRAMES } from '../src/physics/settings';
 import { loc, rotationAngle, simulate } from './physics-helpers';
 
 function setup() {
@@ -199,6 +200,31 @@ describe('rigidbody.object_settings_set / world_set', () => {
     expect(t.run('rigidbody.world_set', { substeps_per_frame: 0 }).ok).toBe(false);
     expect(t.run('rigidbody.world_set', { gravity: [0, 0] }).ok).toBe(false);
   });
+
+  it('reports the simulated frame cap instead of silently freezing bodies after it', () => {
+    const t = setup();
+    const ok = t.run('rigidbody.world_set', { frame_end: 20000 });
+    expect(ok.result.simulated_frame_end).toBe(20000);
+    expect(t.reports).toEqual([]);
+    const r = t.run('rigidbody.world_set', { frame_end: 25000 });
+    expect(r.ok).toBe(true);
+    // stored as asked (Blender range), but the agent learns where the simulation stops
+    expect(r.result.rigidbody_world.frame_end).toBe(25000);
+    expect(r.result.simulated_frame_end).toBe(20001);
+    expect(t.reports).toEqual([
+      `WARNING: Only ${MAX_SIMULATED_FRAMES} frames after frame_start are simulated: frames 20002–25000 ` +
+        'hold the state of frame 20001',
+    ]);
+    t.run('rigidbody.world_set', { frame_start: 10000 });
+    expect(t.run('rigidbody.describe').result).toMatchObject({
+      world: { frame_start: 10000, frame_end: 25000 },
+      simulated_frame_end: 25000,
+    });
+    const info = t.reg.describe().find((d) => d.id === 'rigidbody.world_set')!;
+    expect(info.description).toContain(`At most ${MAX_SIMULATED_FRAMES} frames`);
+    const props = (info.parameters as { properties: Record<string, { description: string }> }).properties;
+    expect(props.frame_end.description).toContain(`${MAX_SIMULATED_FRAMES}`);
+  });
 });
 
 describe('rigidbody.bake_to_keyframes', () => {
@@ -260,6 +286,39 @@ describe('rigidbody.bake_to_keyframes', () => {
     }
     // the parented body is keyed relative to its parent
     expect(t.doc.getObject(t.child)!.parent).toBe(t.pivot);
+  });
+
+  it('keeps mirrored bodies (negative scale components) oriented as simulated', () => {
+    const scales: [number, number, number][] = [
+      [-1, 1, 1],
+      [-1, -1, 1],
+      [1, 1, -1],
+      [2, -0.5, 1],
+      [-1, -1, -1],
+    ];
+    for (const scale of scales) {
+      const t = setup();
+      t.doc.updateObject(t.box, { scale });
+      t.run('rigidbody.object_add', { objects: ['Ground'], type: 'PASSIVE' });
+      t.run('rigidbody.object_add', { objects: ['Box'] });
+      // expected matrices are taken before the bake: frame 1 is unsimulated, later frames simulated
+      const before = new FrameState(t.doc, 1).world(t.box)!;
+      const frames = Array.from({ length: 40 }, (_, i) => i + 1);
+      const sim = simulate(t.doc, frames);
+      expect(t.run('rigidbody.bake_to_keyframes', { objects: ['Box'], frame_end: 40 }).ok).toBe(true);
+      expect(t.doc.getObject(t.box)!.scale).toEqual(scale);
+      for (const f of [1, 2, 15, 40]) {
+        const expected = sim.get(f)?.get(t.box) ?? before;
+        const got = new FrameState(t.doc, f).world(t.box)!;
+        expect(rotationAngle(got, expected), `scale ${scale} frame ${f}`).toBeLessThan(5e-4);
+        for (let k = 0; k < 16; k++) expect(got[k]).toBeCloseTo(expected[k], 3);
+      }
+      // the inspection reports the object's own rotation for the unsimulated frame
+      const box = t.run('rigidbody.describe', { frame: 1, objects: ['Box'] }).result.objects[0];
+      box.world_rotation_euler.forEach((v: number, k: number) =>
+        expect(v).toBeCloseTo([0.3, 0.2, 0.1][k], 9),
+      );
+    }
   });
 
   it('bakes every `step` frames inside the range and keeps keys outside it', () => {

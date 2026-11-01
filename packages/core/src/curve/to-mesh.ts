@@ -511,7 +511,9 @@ function objectProfiles(curve: CurveData, opts: CurveMeshOptions): BevelProfile[
     sx === 1 && sy === 1
       ? polys
       : polys.map((poly) =>
-          Array.isArray(poly) ? poly.map((p) => (Array.isArray(p) ? ([p[0] * sx, p[1] * sy] as Vec2) : p)) : [],
+          Array.isArray(poly)
+            ? poly.map((p) => (Array.isArray(p) ? ([p[0] * sx, p[1] * sy] as Vec2) : p))
+            : [],
         );
   const bc = opts.getBevelCurve?.(id);
   if (bc) {

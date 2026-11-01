@@ -170,6 +170,10 @@ export class ShadingContext {
   px = 0;
   py = 0;
   pz = 0;
+  /** Undeformed object-space position (orco) for GENERATED coordinates (= px/py/pz when undeformed). */
+  gx = 0;
+  gy = 0;
+  gz = 0;
   /** Generated-coordinate box (object space) of the instance: min and size. */
   genMin: Vec3 = [0, 0, 0];
   genSize: Vec3 = [1, 1, 1];
@@ -344,13 +348,17 @@ export class SurfaceShader {
     this.emitB = eb;
   }
 
-  /** Texture coordinate of a compiled procedural's mapping at the context's point, into `out`. */
+  /**
+   * Texture coordinate of a compiled procedural's mapping at the context's point, into `out`
+   * (GENERATED from the undeformed position, OBJECT from the evaluated one, like Blender).
+   */
   textureCoord(t: CompiledProcedural, c: ShadingContext, out: Float64Array | number[]): void {
+    const gen = t.mapping === 0;
     compiledCoord(
       t.mapping,
-      c.px,
-      c.py,
-      c.pz,
+      gen ? c.gx : c.px,
+      gen ? c.gy : c.py,
+      gen ? c.gz : c.pz,
       c.genMin,
       c.genSize,
       c.hasUV ? c.u : 0,

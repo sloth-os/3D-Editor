@@ -298,7 +298,7 @@ function describeDrivers(ctx: OperatorContext, drivers: DriverData[], frame: num
   return drivers.map((d) => {
     const key = fcurveKey(d);
     let value: number | null = null;
-    let error: string | null = null;
+    let error: string | null;
     try {
       const block = fs.get<Record<string, unknown>>(d.target_type, d.target_id);
       error = fs.errors.find((e) => e.source === `driver:${key}`)?.message ?? null;
@@ -323,7 +323,9 @@ function describeDrivers(ctx: OperatorContext, drivers: DriverData[], frame: num
         const v = raw as Partial<DriverVariable> | null;
         if (!v || typeof v !== 'object') return { malformed: raw ?? null };
         const name =
-          typeof v.target_id === 'string' && v.target_type ? targetName(ctx.doc, v.target_type, v.target_id) : null;
+          typeof v.target_id === 'string' && v.target_type
+            ? targetName(ctx.doc, v.target_type, v.target_id)
+            : null;
         return { ...v, target_name: name };
       }),
       mute: !!d.mute,
@@ -819,7 +821,9 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         // an active driver overrides the curve of its channel, modifiers included (Blender would
         // apply them to the driver's own curve, which drivers here do not have)
         const driven = channels.filter((index) => {
-          const d = ctx.doc.getDriver(fcurveKey({ target_type: t.type, target_id: t.id, path: p.path, index }));
+          const d = ctx.doc.getDriver(
+            fcurveKey({ target_type: t.type, target_id: t.id, path: p.path, index }),
+          );
           return !!d && !d.mute;
         });
         if (driven.length)

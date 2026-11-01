@@ -87,6 +87,49 @@ describe('Bezier handles', () => {
     for (const p of ev.points) expect(Math.min(Math.abs(p[1]), Math.abs(p[0] - 3))).toBeLessThan(1e-12);
   });
 
+  it('samples straight segments between two VECTOR handles with their start point only (Blender)', () => {
+    const corner = (co: Vec3) => pt(co, { handle_left_type: 'VECTOR', handle_right_type: 'VECTOR' });
+    const square = spline(
+      'BEZIER',
+      [corner([-1, -1, 0]), corner([1, -1, 0]), corner([1, 1, 0]), corner([-1, 1, 0])],
+      {
+        use_cyclic_u: true,
+      },
+    );
+    const ev = evaluateSpline(square, 12);
+    expect(ev.points).toEqual([
+      [-1, -1, 0],
+      [1, -1, 0],
+      [1, 1, 0],
+      [-1, 1, 0],
+    ]);
+    expect(ev.straight).toEqual([true, true, true, true]);
+    expect(evaluateCurveSplines(curve([square]))[0].points).toHaveLength(4);
+    // an open straight line: start and end point
+    expect(evaluateSpline(spline('BEZIER', [corner([0, 0, 0]), corner([3, 0, 0])]), 12).points).toEqual([
+      [0, 0, 0],
+      [3, 0, 0],
+    ]);
+    // a VECTOR handle facing an AUTO handle is not straight: that segment keeps its samples
+    const mixed = spline('BEZIER', [corner([0, 0, 0]), corner([2, 0, 0]), pt([3, 1, 0])]);
+    const m = evaluateSpline(mixed, 6);
+    expect(m.points).toHaveLength(1 + 6 + 1);
+    expect(m.straight).toEqual([true, false, false, false, false, false, false, false]);
+    // smooth splines carry no straight flags at all
+    expect(
+      evaluateSpline(spline('BEZIER', [pt([0, 0, 0]), pt([1, 1, 0]), pt([2, 0, 0])]), 4).straight,
+    ).toBeUndefined();
+    // paths keep the segment direction along straight spans (no tangent blending across corners)
+    const path = pathFromSpline(ev)!;
+    for (const t of [0.01, 0.05, 0.1, 0.2, 0.24]) expect(path.sample(t).tangent).toEqual([1, 0, 0]);
+    for (const t of [0.26, 0.4, 0.49]) {
+      const tan = path.sample(t).tangent;
+      expect(tan[0]).toBeCloseTo(0, 12);
+      expect(tan[1]).toBeCloseTo(1, 12);
+    }
+    expect(path.sample(0.125).position).toEqual([0, -1, 0]);
+  });
+
   it('uses FREE handles as stored and keeps ALIGNED handles collinear', () => {
     const free = spline('BEZIER', [
       pt([0, 0, 0], {

@@ -72,6 +72,14 @@ export function sanitizeRigidBodyWorld(w: unknown): RigidBodyWorld {
   };
 }
 
+/**
+ * Last frame that is actually simulated: frame_end, capped at frame_start + MAX_SIMULATED_FRAMES
+ * (later frames hold the state of that frame).
+ */
+export function simulatedFrameEnd(params: Pick<WorldParams, 'frameStart' | 'frameEnd'>): number {
+  return Math.min(Math.max(params.frameStart, params.frameEnd), params.frameStart + MAX_SIMULATED_FRAMES);
+}
+
 /** Simulation parameters of a scene (world settings, gravity and frame rate). */
 export function worldParams(scene: Partial<SceneSettings>): WorldParams {
   const w = sanitizeRigidBodyWorld(scene.rigidbody_world);
