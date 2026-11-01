@@ -1,4 +1,4 @@
-import { ANIMATABLE, type AnimTargetType, type Interpolation } from '@3d-editor/core';
+import { ANIMATABLE, type AnimTargetType } from '@3d-editor/core';
 import { ToolError, type AgentProject } from './agent';
 
 /*
@@ -150,6 +150,3 @@ export function keyTargetData(
       return rec(d.getCurve(id));
   }
 }
-
-/** Interpolation values accepted by the keyframe operators. */
-export type KeyInterpolation = Interpolation;

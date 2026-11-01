@@ -2,7 +2,7 @@
 export const MCP_INSTRUCTIONS = `You control a Blender-inspired, real-time collaborative 3D editor.
 
 Conventions
-- Right-handed, Z up (the XY plane is the ground), like Blender. Lengths in metres, angles in radians (tools with \`rotation_degrees\` convert), colours linear RGB(A) 0..1.
+- Right-handed, Z is up (the XY plane is the ground), like Blender. Lengths in metres, angles in radians (tools with \`rotation_degrees\` convert), colours linear RGB(A) 0..1.
 - Operators use Blender ids and parameter names (mesh.primitive_cube_add, object.modifier_add, transform.rotate …); datablock fields follow Blender's Python API (location, rotation_euler, base_color, energy, lens, bevel_depth …). Data paths use Blender syntax: pose.bones["Arm"].rotation_euler, constraints["Track To"].influence, shape_keys["Smile"].value.
 - Names are unique per kind ("Cube", "Cube.001"); objects, materials and projects can be referenced by id or exact name.
 

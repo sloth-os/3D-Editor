@@ -1,9 +1,6 @@
 import {
   APNGEncoder,
-  contactSheet,
   contactSheetGrid,
-  encodeGIF,
-  encodePNG,
   sequenceFrameName,
   type AnimationFormat,
   type GIFDither,
@@ -15,6 +12,7 @@ import {
   RenderCancelledError,
   type AutoViewResult,
   type DocRef,
+  type EncodedResult,
   type FrameOptions,
   type ImageResult,
 } from './protocol';
@@ -95,7 +93,6 @@ export async function renderAnimationParallel(
   const budgetMs = job.timeLimit && job.timeLimit > 0 ? job.timeLimit * 1000 : 0;
   const left = () => budgetMs - (now() - t0);
   const expired = () => budgetMs > 0 && left() <= 0;
-  const keepFrames = job.format === 'GIF' || job.format === 'CONTACT_SHEET';
 
   // one automatic view for every frame when there is no camera (as core renderAnimation)
   let view: AutoViewResult = null;
@@ -150,7 +147,8 @@ export async function renderAnimationParallel(
   let budgetHit = false;
   let encoded = 0;
   const results = new Map<number, { img: ImageResult; budgetBound: boolean }>();
-  /** Encodes finished frames in order (APNG and PNG sequences do not keep the pixels). */
+  const sequence = job.format === 'PNG_SEQUENCE';
+  /** Collects finished frames in order (APNG frames are encoded at once, sequence frames are PNGs). */
   const flush = () => {
     for (let r = results.get(encoded); r; r = results.get(encoded)) {
       results.delete(encoded);
@@ -160,12 +158,17 @@ export async function renderAnimationParallel(
         undersampled.push(frame);
         if (r.budgetBound) budgetHit = true;
       }
-      const pixels = r.img.data;
-      if (!pixels) throw new Error(`frame ${frame} came back without pixels`);
-      const img = { width: r.img.width, height: r.img.height, data: pixels };
-      if (apng) apng.addFrame(img);
-      else if (keepFrames) kept.push(img);
-      else files.push({ frame, name: sequenceFrameName(frame), data: encodePNG(img) });
+      if (sequence) {
+        // PNG sequences come encoded from the render threads
+        if (!r.img.png) throw new Error(`frame ${frame} came back without its PNG`);
+        files.push({ frame, name: sequenceFrameName(frame), data: r.img.png });
+      } else {
+        const pixels = r.img.data;
+        if (!pixels) throw new Error(`frame ${frame} came back without pixels`);
+        const img = { width: r.img.width, height: r.img.height, data: pixels };
+        if (apng) apng.addFrame(img);
+        else kept.push(img);
+      }
       encoded++;
       opts.onProgress?.({ done: encoded, total, frame, elapsedMs: now() - t0 });
     }
@@ -175,13 +178,15 @@ export async function renderAnimationParallel(
     for (let i = 0; i < total; i++) {
       if (i > 0 && expired()) break;
       const { options, budgetBound } = frameOptions(i);
-      const img = await pathTraceParallel(threads, doc, options, { signal });
+      const img = await pathTraceParallel(threads, doc, options, { signal, png: sequence });
       results.set(i, { img, budgetBound });
       flush();
     }
   } else {
     await new Promise<void>((resolve, reject) => {
       const idle = [...threads];
+      /** Frames to render again because their thread stopped (crashed) while rendering them. */
+      const retry: number[] = [];
       let next = 0;
       let inFlight = 0;
       let failed = false;
@@ -196,28 +201,40 @@ export async function renderAnimationParallel(
       const pump = () => {
         if (failed) return;
         // no frame starts once the budget is used up (at least one frame is rendered)
-        while (idle.length && next < total && !(next > 0 && expired())) {
-          const i = next++;
+        while (idle.length && (retry.length || (next < total && !(next > 0 && expired())))) {
+          const i = retry.length ? retry.shift()! : next++;
           const t = idle.shift()!;
           const { options, budgetBound } = frameOptions(i);
           inFlight++;
-          t.call<ImageResult>({ type: 'image', doc, options }).then((img) => {
-            if (failed) return;
-            inFlight--;
-            idle.push(t);
-            results.set(i, { img, budgetBound });
-            try {
-              flush();
-            } catch (err) {
-              fail(err);
-              return;
-            }
-            pump();
-          }, fail);
+          t.call<ImageResult>({ type: 'image', doc, options, png: sequence }).then(
+            (img) => {
+              if (failed) return;
+              inFlight--;
+              idle.push(t);
+              results.set(i, { img, budgetBound });
+              try {
+                flush();
+              } catch (err) {
+                fail(err);
+                return;
+              }
+              pump();
+            },
+            (err: unknown) => {
+              if (failed) return;
+              inFlight--;
+              // a thread that died is dropped and its frame goes to another one; an error the
+              // render itself raised (bad data) would happen anywhere: give up
+              if (t.alive || !threads.some((x) => x.alive)) return fail(err);
+              retry.push(i);
+              pump();
+            },
+          );
         }
         if (inFlight === 0) {
           signal?.removeEventListener('abort', onAbort);
-          resolve();
+          if (retry.length) fail(new Error('every render thread stopped'));
+          else resolve();
         }
       };
       pump();
@@ -243,17 +260,34 @@ export async function renderAnimationParallel(
   };
   if (view) out.view = { position: view.position, target: view.target, fovY: view.fovY };
   if (apng) out.data = apng.finish();
-  else if (job.format === 'GIF')
-    out.data = encodeGIF(kept, job.fps, { loop: job.loop, dither: job.dither, colors: job.colors });
-  else if (job.format === 'CONTACT_SHEET') {
-    const labels = frames.map((f) => String(Math.round(f * 100) / 100));
-    const sheet = contactSheet(kept, { columns: job.columns, labels });
-    out.sheet = {
-      width: sheet.width,
-      height: sheet.height,
-      ...contactSheetGrid(kept.length, job.width, job.height, job.columns),
-    };
-    out.data = encodePNG(sheet);
+  else if (job.format === 'GIF' || job.format === 'CONTACT_SHEET') {
+    // GIF palettes and contact sheets of many frames take seconds: encode on a render thread
+    const encoder = threads.find((t) => t.alive) ?? threads[0];
+    const result = await abortable(
+      encoder.call<EncodedResult>(
+        {
+          type: 'encode',
+          frames: kept,
+          options: {
+            format: job.format,
+            fps: job.fps,
+            loop: job.loop,
+            dither: job.dither,
+            colors: job.colors,
+            columns: job.columns,
+            labels: frames.map((f) => String(Math.round(f * 100) / 100)),
+          },
+        },
+        encoder.kind === 'worker' ? kept.map((f) => f.data.buffer as ArrayBuffer) : [],
+      ),
+      signal,
+    );
+    out.data = result.data;
+    if (result.sheet)
+      out.sheet = {
+        ...result.sheet,
+        ...contactSheetGrid(kept.length, job.width, job.height, job.columns),
+      };
   } else out.files = files;
   out.elapsedMs = Math.round(now() - t0);
   return out;

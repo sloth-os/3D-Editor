@@ -955,7 +955,7 @@ function DriverBox(p: {
       </div>
       <Row label="Expression">
         <ExpressionField
-          value={d.expression}
+          value={typeof d.expression === 'string' ? d.expression : ''}
           variables={vars}
           testId={`${tid}-expression`}
           onCommit={(expression) => update({ expression })}
@@ -1132,13 +1132,9 @@ function ChannelBox({ s, o, fc, length }: { s: ProjectSession; o: ObjectData; fc
         <Icon name="key" size={11} style={{ flex: 'none', color: 'var(--key)' }} />
         <span
           style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-          title={`${fc.path}[${fc.index}]`}
+          title={`${fc.path}[${fc.index}] · ${fc.keyframes.length} keyframe${fc.keyframes.length === 1 ? '' : 's'}`}
         >
           {channelLabel(fc.path, fc.index, length)}
-          <span class="hint">
-            {' '}
-            · {fc.keyframes.length} key{fc.keyframes.length === 1 ? '' : 's'}
-          </span>
         </span>
         <SelectField
           value={fc.extrapolation}

@@ -90,8 +90,16 @@ describe('MCP feature integration', () => {
     });
     await op(id, 'curve.properties_set', { object: 'Rail', bevel_mode: 'OBJECT', bevel_object: 'Profile' });
 
+    const label = await ok('add_object', {
+      project: id,
+      type: 'text',
+      name: 'Label',
+      params: { body: 'Hi', size: 0.5 },
+      location: [0, -2, 0],
+    });
+    expect(label.object).toMatchObject({ name: 'Label', type: 'FONT', location: [0, -2, 0] });
     let scene = await ok('get_scene', { project: id });
-    expect(scene.counts.by_type).toMatchObject({ CURVE: 3, FONT: 1 });
+    expect(scene.counts.by_type).toMatchObject({ CURVE: 3, FONT: 2 });
     const path = objectOf(scene, 'Path');
     expect(path.data).toMatchObject({ kind: 'curve', splines: 1, points: 2, bevel_depth: 0.05 });
     expect(path.data.spline_types).toEqual({ BEZIER: 1 });
@@ -130,6 +138,18 @@ describe('MCP feature integration', () => {
     ).toMatch(/object\.convert/);
     await ok('remove_modifier', { project: id, object: 'Title', modifier: added.modifier.name });
     expect((await ok('get_object', { project: id, object: 'Title' })).modifiers).toEqual([]);
+
+    // materials on text objects
+    const sign = await ok('set_material', {
+      project: id,
+      object: 'Title',
+      name: 'Sign',
+      base_color: [1, 0, 0],
+    });
+    expect(sign.material).toMatchObject({ name: 'Sign', base_color: [1, 0, 0, 1] });
+    expect((await ok('get_object', { project: id, object: 'Title' })).materials[0].material.name).toBe(
+      'Sign',
+    );
 
     // a curve that grows: key the bevel factor of the curve data
     await ok('insert_keyframe', {

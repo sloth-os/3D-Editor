@@ -271,13 +271,13 @@ describe('Particles tab', () => {
     expect(ground().particle_systems).toHaveLength(0);
   });
 
-  it('is not offered for objects that cannot emit particles', () => {
+  it('particles and physics are not offered for objects that cannot use them', () => {
     ok('object.empty_add', { name: 'Empty' });
     select(s, 'Empty');
     const { container } = render(<Properties session={s} />);
     expect(byTestId(container, 'prop-tab-particles')).toBeNull();
+    expect(byTestId(container, 'prop-tab-physics')).toBeNull();
     expect(byTestId(container, 'prop-tab-constraints')).not.toBeNull();
-    expect(byTestId(container, 'prop-tab-physics')).not.toBeNull();
   });
 });
 
@@ -461,6 +461,28 @@ describe('Outliner sub-items', () => {
     const row = byTestId(container, 'outl-constraint-Cube-Track To')!;
     fireEvent.click(row.querySelector('.vis')!);
     expect(s.doc.findObjectByName('Cube')!.constraints[0].mute).toBe(true);
+  });
+});
+
+describe('malformed stored data', () => {
+  it('skips malformed constraint and particle entries instead of crashing', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.constraint_add', { object: 'Cube', type: 'LIMIT_SCALE' });
+    const cube = s.doc.findObjectByName('Cube')!;
+    s.doc.updateObject(cube.id, {
+      constraints: [null, ...cube.constraints, 'junk'] as unknown as typeof cube.constraints,
+      particle_systems: [7] as unknown as typeof cube.particle_systems,
+    });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'constraints';
+    const { container } = render(<Properties session={s} />);
+    expect(container.querySelectorAll('[data-testid="constraint-Limit Scale"]').length).toBe(1);
+    act(() => {
+      activePropertiesTab.value = 'particles';
+    });
+    expect(byTestId(container, 'particle-systems')?.textContent).toContain('No particle systems');
+    const outliner = render(<Outliner session={s} />);
+    expect(byTestId(outliner.container, 'outl-badge-Cube-constraints')).not.toBeNull();
   });
 });
 

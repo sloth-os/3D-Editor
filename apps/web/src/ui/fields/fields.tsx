@@ -300,7 +300,9 @@ export function EnumButtons<T extends string>(p: {
 
 const COMPACT_ROW = { flexWrap: 'nowrap' } as const;
 const COMPACT_BUTTON = {
-  padding: '0 2px',
+  // content-sized, sharing the spare width: long labels keep their room
+  flex: '1 1 auto',
+  padding: '0 3px',
   minWidth: 0,
   overflow: 'hidden',
   textOverflow: 'ellipsis',

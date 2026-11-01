@@ -52,6 +52,7 @@ export interface RenderProgress {
   message: string;
 }
 
+/** One image to render (see {@link Renderer.renderImage}). */
 export interface RenderImageRequest {
   scene: SceneDoc;
   /** Project id (part of the render threads' document cache key). */
@@ -61,6 +62,7 @@ export interface RenderImageRequest {
   onProgress?: (p: RenderProgress) => void;
 }
 
+/** A rendered PNG with what was rendered and how. */
 export interface RenderImageResult {
   png: Uint8Array;
   width: number;
@@ -81,6 +83,7 @@ export interface RenderImageResult {
   warnings: string[];
 }
 
+/** An animation to render (see {@link Renderer.renderAnimation}). */
 export interface RenderAnimationRequest {
   scene: SceneDoc;
   projectId: string;

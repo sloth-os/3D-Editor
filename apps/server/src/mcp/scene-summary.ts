@@ -193,7 +193,8 @@ function curveSummary(c: CurveData, type: 'CURVE' | 'FONT', detailed: boolean): 
   if (c.bevel_factor_start !== 0 || c.bevel_factor_end !== 1)
     out.bevel_factor = [round(c.bevel_factor_start), round(c.bevel_factor_end)];
   if (c.dimensions === '2D' || type === 'FONT') out.fill_mode = c.fill_mode;
-  if (c.use_path && type === 'CURVE')
+  // path animation fields (every curve has use_path on, like in Blender): when used or asked for
+  if (c.use_path && type === 'CURVE' && (detailed || c.eval_time !== 0))
     Object.assign(out, { path_duration: c.path_duration, eval_time: round(c.eval_time) });
   if (detailed) {
     Object.assign(out, {

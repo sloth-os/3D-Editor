@@ -137,9 +137,37 @@ export type WorkerRequest =
       /** Stop sampling frames for the bounds after this many milliseconds. */
       budgetMs?: number;
     }
+  /** Encodes kept animation frames as a GIF or a contact sheet PNG (frame buffers transferred). */
+  | { type: 'encode'; id: number; frames: RawFrame[]; options: EncodeOptions }
   | { type: 'ping'; id: number };
 
-export type WorkerResult = PreparedInfo | PathTile | ImageResult | AutoViewResult | { ok: true };
+/** RGBA8 pixels of one frame (top row first). */
+export interface RawFrame {
+  width: number;
+  height: number;
+  data: Uint8ClampedArray;
+}
+
+/** How `encode` writes the frames of an animation. */
+export interface EncodeOptions {
+  format: 'GIF' | 'CONTACT_SHEET';
+  fps: number;
+  loop?: number;
+  dither?: 'FLOYD_STEINBERG' | 'BAYER' | 'NONE';
+  colors?: number;
+  /** CONTACT_SHEET: tiles per row and per-tile labels. */
+  columns?: number;
+  labels?: string[];
+}
+
+/** An encoded animation file; contact sheets also report the sheet size. */
+export interface EncodedResult {
+  data: Uint8Array;
+  sheet?: { width: number; height: number };
+}
+
+export type WorkerResult =
+  PreparedInfo | PathTile | ImageResult | AutoViewResult | EncodedResult | { ok: true };
 
 export type WorkerResponse =
   { type: 'result'; id: number; result: WorkerResult } | { type: 'error'; id: number; message: string };

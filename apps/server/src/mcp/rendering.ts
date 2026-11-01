@@ -25,6 +25,7 @@ export const MAX_ANIMATION_SIZE = 2048;
 /** Most frames of one render_animation call. */
 export const MAX_RENDER_FRAMES = 1000;
 
+/** `engine` argument of the rendering tools. */
 export const engineArg = z
   .enum(['RASTER', 'PATHTRACER'])
   .optional()
@@ -34,6 +35,7 @@ export const engineArg = z
       'reflections, glass, sky, mist, AgX view transform) running in parallel on all server CPU cores — use it for final renders',
   );
 
+/** `samples` argument: samples per pixel (path tracer) or anti-aliasing (raster). */
 export const samplesArg = z
   .number()
   .int()
@@ -45,6 +47,7 @@ export const samplesArg = z
       'RASTER: anti-aliasing supersampling 1, 2 or 4 (default 2)',
   );
 
+/** `max_bounces` argument (path tracer). */
 export const maxBouncesArg = z
   .number()
   .int()
@@ -55,11 +58,13 @@ export const maxBouncesArg = z
     'PATHTRACER: maximum light bounces of any kind (default: render settings max_bounces; 0 = direct light only)',
   );
 
+/** `denoise` argument (path tracer). */
 export const denoiseArg = z
   .boolean()
   .optional()
   .describe('PATHTRACER: denoise the result (default: render settings use_denoising)');
 
+/** `seed` argument (path tracer noise pattern). */
 export const seedArg = z
   .number()
   .int()

@@ -951,6 +951,15 @@ describe('review regressions', () => {
     });
     const d = t.ok('object.drop_to_ground', { objects: ['Box'] });
     expect(d.objects[0]).toMatchObject({ surface: 'Floor', moved: -7.5, location: [1, 1, 2.5] });
+    // include_instances=false ignores them (e.g. scattered grass): down to the ground plane
+    t.doc.updateObject(box, { location: [1, 1, 10] });
+    expect(
+      t.ok('object.drop_to_ground', { objects: ['Box'], include_instances: false }).objects[0],
+    ).toMatchObject({ surface: 'ground plane', location: [1, 1, 0.5] });
+    expect(
+      t.run('object.snap_to_surface', { objects: ['Box'], ray_origin: [1, 1, 20], include_instances: false })
+        .error,
+    ).toBe('The ray hit no surface');
     t.doc.updateObject(box, { location: [3, 3, 9] });
     const s = t.ok('object.snap_to_surface', {
       objects: ['Box'],

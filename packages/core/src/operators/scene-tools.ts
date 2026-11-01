@@ -728,7 +728,14 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           .optional()
           .describe(
             'Surface objects to drop onto, by id or name, including the instances they own or are the source ' +
-              'of (default: every other visible geometry object and instance)',
+              'of (default: every other visible geometry object and instance; restrict it when geometry ' +
+              'encloses the scene, e.g. a sky dome, which would otherwise count as a solid the objects are in)',
+          ),
+        include_instances: z
+          .boolean()
+          .default(true)
+          .describe(
+            'Also rest on collection-instance and particle instances (false: e.g. ignore scattered grass)',
           ),
         ground_plane: z
           .boolean()
@@ -758,7 +765,9 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         const scene = new LayoutScene(ctx);
         const moving = scene.withDescendants(ids);
         const only = p.surface?.length ? new Set(p.surface.map((r) => resolveOne(ctx, r).id)) : null;
-        const targets = new SceneRaycaster(scene.targets({ exclude: moving, only, instances: true }));
+        const targets = new SceneRaycaster(
+          scene.targets({ exclude: moving, only, instances: p.include_instances }),
+        );
         const out = [];
         for (const id of scene.byDepth(ids)) {
           let world = scene.world(id);
@@ -862,6 +871,10 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
             'Objects the ray may hit, by id or name, including the instances they own or are the source of ' +
               '(default: every visible geometry object and instance except the moved ones)',
           ),
+        include_instances: z
+          .boolean()
+          .default(true)
+          .describe('Also hit collection-instance and particle instances'),
         align_to_normal: z
           .boolean()
           .default(false)
@@ -887,7 +900,9 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         const scene = new LayoutScene(ctx);
         const moving = scene.withDescendants(ids);
         const only = p.surface?.length ? new Set(p.surface.map((r) => resolveOne(ctx, r).id)) : null;
-        const rc = new SceneRaycaster(scene.targets({ exclude: moving, only, instances: true }));
+        const rc = new SceneRaycaster(
+          scene.targets({ exclude: moving, only, instances: p.include_instances }),
+        );
         const hit = rc.cast(p.ray_origin as Vec3, p.ray_direction as Vec3, p.max_distance);
         if (!hit) throw new OperatorError('The ray hit no surface', 'FAILED');
         const dir = p.ray_direction as Vec3;

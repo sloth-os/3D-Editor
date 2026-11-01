@@ -216,6 +216,8 @@ class MainThread implements RenderThread {
         return this.engine.image(req.doc, req.options, req.png);
       case 'finish':
         return this.engine.finish(req.film, req.options);
+      case 'encode':
+        return this.engine.encode(req.frames, req.options);
       case 'auto-view':
         return this.engine.autoView(req.doc, req.frames, req.aspect, req.camera, req.budgetMs);
       case 'ping':
@@ -245,6 +247,8 @@ export class RenderPool {
   private readonly waiters: Waiter[] = [];
   private main: MainThread | null = null;
   private booting = 0;
+  /** Threads finishing abandoned work before they return to the pool. */
+  private draining = 0;
   private nextThreadId = 1;
   /** Why worker threads are not used (they failed to start), or null. */
   private brokenReason: string | null = null;
@@ -324,7 +328,7 @@ export class RenderPool {
       }
       return;
     }
-    const leased = this.workers.size - this.booting - this.free.length;
+    const leased = this.workers.size - this.booting - this.draining - this.free.length;
     let wanted = leased;
     for (const w of this.waiters) wanted += Math.min(w.max, this.size);
     const target = Math.min(this.size, wanted);
@@ -386,8 +390,9 @@ export class RenderPool {
     if (this.closed) return;
     while (this.waiters.length && this.free.length) {
       const w = this.waiters[0];
-      // threads that are starting up will be free in a moment: wait for them when they are wanted
-      if (this.booting > 0 && this.free.length < Math.min(w.max, this.capacity)) break;
+      // threads that are starting up or finishing cancelled work will be free in a moment: wait
+      // for them when they are wanted
+      if (this.booting + this.draining > 0 && this.free.length < Math.min(w.max, this.capacity)) break;
       this.waiters.shift();
       if (w.onAbort) w.signal?.removeEventListener('abort', w.onAbort);
       const threads = this.free.splice(0, Math.min(w.max, this.free.length));
@@ -411,10 +416,15 @@ export class RenderPool {
   /** Returns a thread to the pool once its abandoned work is done (stops it when that takes too long). */
   private async giveBack(t: RenderThread): Promise<void> {
     if (t instanceof WorkerThread && t.pending > 0) {
-      const drained = await t.drain(this.drainTimeoutMs);
-      if (!drained) {
-        this.log?.warn({ thread: t.id }, 'stopping a render worker busy with cancelled work');
-        t.terminate();
+      this.draining++;
+      try {
+        const drained = await t.drain(this.drainTimeoutMs);
+        if (!drained) {
+          this.log?.warn({ thread: t.id }, 'stopping a render worker busy with cancelled work');
+          t.terminate();
+        }
+      } finally {
+        this.draining--;
       }
     }
     if (!t.alive || this.closed) {

@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
  * oldest ones are dropped when the total size exceeds `maxBytes`.
  */
 
+/** One stored file of a render. */
 export interface StoredFile {
   name: string;
   mime: string;
@@ -20,6 +21,7 @@ interface StoredRender {
   files: Map<string, StoredFile>;
 }
 
+/** Limits of a {@link RenderStore}. */
 export interface RenderStoreOptions {
   /** Total bytes kept (default 256 MiB). */
   maxBytes?: number;
@@ -27,6 +29,7 @@ export interface RenderStoreOptions {
   ttlMs?: number;
 }
 
+/** Bounded in-memory storage of rendered files, per project (see the module comment). */
 export class RenderStore {
   private readonly renders = new Map<string, StoredRender>();
   private bytes = 0;

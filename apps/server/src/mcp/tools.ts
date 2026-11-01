@@ -133,6 +133,11 @@ const ADD_OPERATORS: Record<string, string> = {
   empty: 'object.empty_add',
   camera: 'object.camera_add',
   light: 'object.light_add',
+  bezier_curve: 'curve.primitive_bezier_curve_add',
+  bezier_circle: 'curve.primitive_bezier_circle_add',
+  nurbs_path: 'curve.primitive_nurbs_path_add',
+  text: 'object.text_add',
+  armature: 'object.armature_add',
 };
 
 // ------------------------------------------------------------------ helpers
@@ -754,7 +759,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Add object',
       description:
-        "Add a primitive or object: cube, plane, grid, circle, uv_sphere, ico_sphere, cylinder, cone, torus (meshes), empty, camera or light. Placed at `location` (default: world origin) with optional rotation (radians) or rotation_degrees and scale. Type specific `params` follow Blender's operators, e.g. cube {size}, uv_sphere {segments, ring_count, radius}, cylinder {vertices, radius, depth}, torus {major_radius, minor_radius}, camera {lens}, light {energy (W), color}, empty {type: PLAIN_AXES|ARROWS|CUBE|SPHERE|...}. The new object becomes selected and active.",
+        "Add a primitive or object: cube, plane, grid, circle, uv_sphere, ico_sphere, cylinder, cone, torus (meshes), bezier_curve, bezier_circle, nurbs_path (curves), text, armature, empty, camera or light. Placed at `location` (default: world origin) with optional rotation (radians) or rotation_degrees and scale. Type specific `params` follow Blender's operators, e.g. cube {size}, uv_sphere {segments, ring_count, radius}, cylinder {vertices, radius, depth}, torus {major_radius, minor_radius}, curves {radius, bevel_depth, extrude}, text {body, size, extrude, align_x}, armature {bone_name}, camera {lens}, light {energy (W), color}, empty {type: PLAIN_AXES|ARROWS|CUBE|SPHERE|...}. Other generators (object.generate_tree, curve.add_from_points …) run through run_operator. The new object becomes selected and active.",
       annotations: EDIT,
     },
     {
@@ -769,6 +774,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         'cylinder',
         'cone',
         'torus',
+        'bezier_curve',
+        'bezier_circle',
+        'nurbs_path',
+        'text',
+        'armature',
         'empty',
         'camera',
         'light',
@@ -973,7 +983,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Set material',
       description:
-        "Give an object a principled (PBR) material in a slot (default 0): reuse an existing material (`material`), create/update one by `name`, or (without either) edit the slot's material when only this object uses it, otherwise create a new one. Properties: base_color (linear RGB/RGBA 0..1), metallic, roughness, emission_color + emission_strength, alpha, transmission, ior, blend_method. One undo step.",
+        "Give a mesh, curve or text object a principled (PBR) material in a slot (default 0; curve and text splines choose their slot with material_index): reuse an existing material (`material`), create/update one by `name`, or (without either) edit the slot's material when only this object uses it, otherwise create a new one. Properties: base_color (linear RGB/RGBA 0..1), metallic, roughness, emission_color + emission_strength, alpha, transmission, ior, blend_method. One undo step.",
       annotations: EDIT,
     },
     {
@@ -995,8 +1005,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     async (a) => {
       const p = await agent.project(a.project);
       const o = requireObject(p, a.object);
-      if (o.type !== 'MESH')
-        throw new ToolError(`'${o.name}' is a ${o.type}; materials apply to mesh objects.`);
+      if (o.type !== 'MESH' && o.type !== 'CURVE' && o.type !== 'FONT')
+        throw new ToolError(`'${o.name}' is a ${o.type}; materials apply to mesh, curve and text objects.`);
       const props: Record<string, unknown> = {};
       if (a.base_color) props.base_color = a.base_color.length === 3 ? [...a.base_color, 1] : a.base_color;
       for (const k of [

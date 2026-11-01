@@ -7,6 +7,8 @@ import {
   type SoftwareRenderOptions,
 } from '@3d-editor/core';
 import { RenderCancelledError, RenderPool, Renderer, type FrameOptions } from '../../src/render';
+import { pathTraceParallel } from '../../src/render/path-trace';
+import { renderAnimationParallel } from '../../src/render/animation';
 
 /*
  * The render pool: parallel path tracing gives exactly the single-thread image, renders can be
@@ -201,6 +203,59 @@ describe('render pool', () => {
         base: { engine: 'RASTER' },
       }),
     ).rejects.toThrow(/before frame_start/);
+  });
+
+  it('finishes renders when a worker thread dies (its work moves to the others)', async () => {
+    const r = renderer(2);
+    const doc = scene();
+    const opts = frame({ samples: 10 });
+    const stop = (t: unknown) => (t as { terminate(): void }).terminate();
+    let lease = await r.pool.lease();
+    expect(lease.threads).toHaveLength(2);
+    let killed = false;
+    const res = await pathTraceParallel(lease.threads, r.docRef('crash', doc), opts, {
+      onProgress: (p) => {
+        if (!killed && p.samples >= 1) {
+          killed = true;
+          stop(lease.threads[1]);
+        }
+      },
+    });
+    lease.release();
+    expect(killed).toBe(true);
+    expect(res.pathtrace).toMatchObject({ samples: 10, threads: 1 });
+    expect(new Uint8Array(res.data!)).toEqual(
+      new Uint8Array(renderSceneSoftware(doc, opts as SoftwareRenderOptions).data),
+    );
+    // frames of an animation are rendered again on another thread (a new worker replaces the dead one)
+    lease = await r.pool.lease();
+    expect(lease.threads).toHaveLength(2);
+    let frames = 0;
+    const anim = await renderAnimationParallel(
+      lease.threads,
+      r.docRef('crash', doc),
+      {
+        format: 'PNG_SEQUENCE',
+        frames: [1, 2, 3, 4],
+        width: 24,
+        height: 16,
+        fps: 24,
+        base: { engine: 'RASTER' },
+      },
+      {
+        onProgress: () => {
+          if (++frames === 1) stop(lease.threads[0]);
+        },
+      },
+    );
+    lease.release();
+    expect(anim.files!.map((f) => f.name)).toEqual([
+      'frame_0001.png',
+      'frame_0002.png',
+      'frame_0003.png',
+      'frame_0004.png',
+    ]);
+    expect(anim.cancelled).toBe(false);
   });
 
   it('falls back to the main thread when workers cannot start', async () => {

@@ -43,6 +43,11 @@ port.on('message', (msg: WorkerRequest) => {
         reply(msg.id, img, buffer ? [buffer as ArrayBuffer] : []);
         break;
       }
+      case 'encode': {
+        const encoded = engine.encode(msg.frames, msg.options);
+        reply(msg.id, encoded, [encoded.data.buffer as ArrayBuffer]);
+        break;
+      }
       case 'auto-view':
         reply(msg.id, engine.autoView(msg.doc, msg.frames, msg.aspect, msg.camera, msg.budgetMs));
         break;

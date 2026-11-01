@@ -4,6 +4,7 @@
  * and Object, …), so agents can also filter by these task-oriented groups.
  */
 
+/** A task-oriented group of operators (matched by operator id). */
 export interface OperatorGroup {
   name: string;
   description: string;
@@ -23,6 +24,7 @@ const any =
   (id: string) =>
     fns.some((f) => f(id));
 
+/** The feature groups `list_operators` accepts as `category`. */
 export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
   {
     name: 'Curves',
@@ -129,6 +131,7 @@ export function findOperatorGroup(name: string): OperatorGroup | null {
   return OPERATOR_GROUPS.find((g) => normalize(g.name) === n) ?? null;
 }
 
+/** Names of the feature groups, in listing order. */
 export function operatorGroupNames(): string[] {
   return OPERATOR_GROUPS.map((g) => g.name);
 }

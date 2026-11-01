@@ -45,7 +45,7 @@ const TABS: TabDef[] = [
   { id: 'object', icon: 'object', title: 'Object', available: hasObject },
   { id: 'modifiers', icon: 'wrench', title: 'Modifiers', available: isMesh },
   { id: 'particles', icon: 'particles', title: 'Particles', available: (o) => !!o && canHaveParticles(o) },
-  { id: 'physics', icon: 'physics', title: 'Physics', available: hasObject },
+  { id: 'physics', icon: 'physics', title: 'Physics', available: (o) => isMesh(o) || !!o?.rigid_body },
   { id: 'constraints', icon: 'constraint', title: 'Object Constraints', available: hasObject },
   { id: 'data', icon: 'data', title: 'Object Data', available: hasObject },
   { id: 'material', icon: 'material', title: 'Material', available: isMesh },

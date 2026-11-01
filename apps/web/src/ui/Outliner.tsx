@@ -5,6 +5,7 @@ import type { ProjectSession } from '../project/session';
 import { run } from '../editor/editor';
 import { Icon, type IconName } from './icons';
 import { activePropertiesTab, type PropertiesTabId } from './properties/Properties';
+import { validItems } from './properties/ConstraintsTab';
 
 const TYPE_ICON: Record<string, IconName> = {
   MESH: 'mesh',
@@ -73,7 +74,7 @@ export function objectSubGroups(session: ProjectSession, o: ObjectData): SubGrou
         },
       })),
     });
-  const constraints = Array.isArray(o.constraints) ? o.constraints : [];
+  const constraints = validItems(o.constraints);
   if (constraints.length)
     groups.push({
       key: 'constraints',
@@ -94,7 +95,7 @@ export function objectSubGroups(session: ProjectSession, o: ObjectData): SubGrou
         },
       })),
     });
-  const systems = Array.isArray(o.particle_systems) ? o.particle_systems : [];
+  const systems = validItems(o.particle_systems);
   if (systems.length)
     groups.push({
       key: 'particles',

@@ -4,7 +4,9 @@ import {
   SceneEvaluator,
   TextureCache,
   autoFrameView,
+  contactSheet,
   denoiseFilm,
+  encodeGIF,
   encodePNG,
   evaluatedBounds,
   evaluatedOrco,
@@ -23,11 +25,14 @@ import {
 import type {
   AutoViewResult,
   DocRef,
+  EncodeOptions,
+  EncodedResult,
   FilmBuffers,
   FinishOptions,
   FrameOptions,
   ImageResult,
   PreparedInfo,
+  RawFrame,
   Vec3Tuple,
   Vec4Tuple,
 } from './protocol';
@@ -247,6 +252,14 @@ export class RenderEngine {
       up: [...v.up] as Vec3Tuple,
       fovY: v.fovY,
     };
+  }
+
+  /** Encodes kept animation frames as a GIF or a labelled contact sheet PNG. */
+  encode(frames: RawFrame[], o: EncodeOptions): EncodedResult {
+    if (o.format === 'GIF')
+      return { data: encodeGIF(frames, o.fps, { loop: o.loop, dither: o.dither, colors: o.colors }) };
+    const sheet = contactSheet(frames, { columns: o.columns, labels: o.labels });
+    return { data: encodePNG(sheet), sheet: { width: sheet.width, height: sheet.height } };
   }
 
   /** Frees every cached document and tracer. */

@@ -126,7 +126,7 @@ export function GENERATORS_MENU(): MenuItem[] {
     'Other',
     ops.filter((d) => !used.has(d.id)).map((d) => d.id),
   );
-  return out;
+  return out.length ? out : [note('No generators available')];
 }
 
 export const ADD_MENU: MenuItem[] = [

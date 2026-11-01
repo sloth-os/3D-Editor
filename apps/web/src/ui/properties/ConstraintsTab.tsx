@@ -178,6 +178,13 @@ export function layoutConstraintParams(props: Record<string, JsonProp>): Constra
   return items;
 }
 
+/** Object entries of a stored list; malformed entries are skipped (as the core operators do). */
+export function validItems<T>(list: readonly T[] | undefined | null): T[] {
+  return Array.isArray(list)
+    ? list.filter((x) => x !== null && typeof x === 'object' && !Array.isArray(x))
+    : [];
+}
+
 const quoteKey = (k: string) => `"${k.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 
 /** Data path of a constraint property, e.g. `constraints["Track To"].influence`. */
@@ -207,7 +214,7 @@ export function ConstraintsTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const ev = panelEvaluation(s);
   const evo = ev?.byId.get(o.id);
   const errors = evo?.constraintErrors ?? [];
-  const list = Array.isArray(o.constraints) ? o.constraints : [];
+  const list = validItems(o.constraints);
   const poseErrors = o.type === 'ARMATURE' ? sourceErrors(ev, `pose:${o.id}`) : [];
   return (
     <>

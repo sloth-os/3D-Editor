@@ -15,6 +15,7 @@ import { SchemaForm, type SchemaChoice } from '../SchemaForm';
 import { Icon } from '../icons';
 import { run, runResult } from '../../editor/editor';
 import { ErrorList, dragEdit, panelEvaluation } from './ObjectTab';
+import { validItems } from './ConstraintsTab';
 
 /*
  * Particles tab (Blender's Properties > Particles): the particle systems of the active mesh, curve
@@ -97,7 +98,7 @@ function instanceObjectChoices(s: ProjectSession, emitter: ObjectData): SchemaCh
 
 export function ParticlesTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const ev = panelEvaluation(s);
-  const systems = Array.isArray(o.particle_systems) ? o.particle_systems : [];
+  const systems = validItems(o.particle_systems);
   const chosen = activeSystems.value[o.id];
   const active = systems.find((p) => p.id === chosen) ?? systems[0] ?? null;
   const select = (id: string) => (activeSystems.value = { ...activeSystems.value, [o.id]: id });
