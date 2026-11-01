@@ -211,10 +211,13 @@ export function SchemaForm(p: {
         }
         if (type === 'number' || type === 'integer') {
           const isAngle = isAngleParam(key, s, p.angleKeys);
+          // an optional parameter without default that was left out is computed by the operator
+          const unset = value === undefined || value === null;
           return (
             <Row key={key} label={label} title={s.description}>
               <NumberField
-                value={Number(value ?? 0)}
+                value={unset ? NaN : Number(value)}
+                placeholder={unset ? 'Auto' : undefined}
                 integer={type === 'integer'}
                 min={s.minimum ?? s.exclusiveMinimum}
                 max={s.maximum}

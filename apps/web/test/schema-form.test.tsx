@@ -116,6 +116,29 @@ describe('SchemaForm extensions', () => {
     expect(q(container, 'f-surface')).toBeNull();
   });
 
+  it('shows unset optional numbers as Auto and accepts a typed value', () => {
+    const schema = safeJsonSchema(
+      z.object({
+        radius: z.number().positive().optional().describe('Orbit radius (default: fit the scene)'),
+        frame_start: z.number().int().optional(),
+      }),
+    );
+    const onChange = vi.fn();
+    const { container } = render(
+      <SchemaForm schema={schema} values={{ frame_start: 12 }} testIdPrefix="f" onChange={onChange} />,
+    );
+    const radius = q(container, 'f-radius')!;
+    expect(radius.textContent).toBe('Auto');
+    expect(q(container, 'f-frame_start')?.textContent).toBe('12');
+    fireEvent.pointerDown(radius, { button: 0, clientX: 5, pointerId: 1 });
+    fireEvent.pointerUp(radius, { button: 0, clientX: 5, pointerId: 1 });
+    const input = radius.querySelector('input')!;
+    expect(input.value).toBe('');
+    fireEvent.input(input, { target: { value: '7.5' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(onChange).toHaveBeenCalledWith('radius', 7.5, true);
+  });
+
   it('toggle group reports the toggled index and its new state', () => {
     const onChange = vi.fn();
     const { container } = render(

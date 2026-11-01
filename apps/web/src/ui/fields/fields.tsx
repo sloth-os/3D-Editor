@@ -299,7 +299,12 @@ export function EnumButtons<T extends string>(p: {
 }
 
 const COMPACT_ROW = { flexWrap: 'nowrap' } as const;
-const COMPACT_BUTTON = { padding: '0 2px', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } as const;
+const COMPACT_BUTTON = {
+  padding: '0 2px',
+  minWidth: 0,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+} as const;
 
 /**
  * Row of independent toggle buttons (Blender's X / Y / Z axis toggles): each option is a boolean
