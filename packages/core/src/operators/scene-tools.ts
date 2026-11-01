@@ -12,8 +12,8 @@ import {
   translation4,
 } from '../math/mat4';
 import { transformDirection3, transformPoint3 } from '../math/vec3';
-import type { SceneDoc } from '../doc/scene-doc';
-import type { ObjectData, ObjectType } from '../doc/types';
+import { dataKindOf, type SceneDoc } from '../doc/scene-doc';
+import type { DatablockKind, ObjectData, ObjectType } from '../doc/types';
 import { defaultObject } from '../doc/defaults';
 import { meshStats, type MeshData, type MeshStats } from '../mesh/types';
 import { SceneEvaluator, type EvaluatedObject, type EvaluatedScene } from '../eval/evaluate';
@@ -25,6 +25,7 @@ import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { pollObjectMode, resolveObjectIds, setSelection, vec3 } from './helpers';
 import { autoKeyTransforms, rekeyAnimated } from './anim';
+import { remapDuplicatedReferences } from './armature';
 import { Rng } from '../generate/random';
 import {
   type AlignMode,
@@ -35,6 +36,7 @@ import {
   boundsGap,
   boundsSize,
   boundsValue,
+  decomposeCompatible,
   distributeDeltas,
   emptyBounds,
   isEmptyBounds,
@@ -46,8 +48,9 @@ import {
 } from '../generate/layout';
 import {
   SceneRaycaster,
+  WorldTriangles,
   computeDrop,
-  meshDistance,
+  triangleSetDistance,
   type RaycastTarget,
   type SceneHit,
 } from '../generate/spatial';
@@ -64,6 +67,9 @@ import {
 
 /** Most objects an array_place / scatter_on_surface run may create. */
 export const MAX_LAYOUT_OBJECTS = 10_000;
+
+/** array_place CIRCLE angles this close to ±2π (radians) count as a full turn. */
+export const FULL_TURN_TOLERANCE = 0.01;
 
 const AXES = ['X', 'Y', 'Z'] as const;
 const AXIS_INDEX = { X: 0, Y: 1, Z: 2 } as const;
@@ -202,13 +208,21 @@ class LayoutScene {
     this.record(id, translation4(delta));
   }
 
-  /** Gives an object a new world matrix (written as location / rotation / scale through its parent). */
+  /**
+   * Gives an object a new world matrix, written as location / rotation / scale through its parent
+   * with compatible eulers (closest to the current, animated rotation: consecutive edits and keys
+   * never jump by a full turn) and the current scale signs (a mirrored object stays mirrored).
+   */
   setWorld(id: string, world: Readonly<Mat4>): void {
     if (!world.every(Number.isFinite)) return;
+    const stored = this.ctx.doc.getObject(id);
+    // once edited in this run the stored value is current; before that the animated one is
+    const o = this.editedIds.has(id) ? stored : this.ev.byId.get(id)?.data;
+    if (!o || !stored) return;
     const cur = this.world(id);
     const local = multiply4(invert4(this.parentWorld(id)), world);
-    const d = decompose4(local);
-    if (![...d.location, ...d.rotation, ...d.scale].every(Number.isFinite)) return;
+    const d = decomposeCompatible(local, o.rotation_euler, o.scale);
+    if (!d) return;
     this.ctx.doc.updateObject(id, {
       location: clean3(d.location),
       rotation_euler: clean3(d.rotation),
@@ -321,7 +335,8 @@ class LayoutScene {
 
   /**
    * Visible geometry as ray cast targets (mesh, curve and text objects; optionally instances),
-   * excluding `exclude` (and instances they own), restricted to `only` when given.
+   * excluding `exclude` (and the instances they own or are the source of), restricted to `only`
+   * when given.
    */
   targets(
     opts: { exclude?: Set<string>; only?: Set<string> | null; instances?: boolean } = {},
@@ -337,7 +352,7 @@ class LayoutScene {
       for (const inst of this.ev.instances) {
         const owner = this.ev.byId.get(inst.ownerId);
         const src = this.ev.byId.get(inst.sourceId);
-        if (!owner || !src?.mesh || ex.has(owner.id)) continue;
+        if (!owner || !src?.mesh || ex.has(owner.id) || ex.has(src.id)) continue;
         if (opts.only ? !opts.only.has(owner.id) && !opts.only.has(src.id) : !owner.visible) continue;
         out.push({ id: inst.id, objectId: src.id, instancer: owner.id, mesh: src.mesh, matrix: inst.matrix });
       }
@@ -384,10 +399,13 @@ function hitInfo(ctx: OperatorContext, hit: SceneHit) {
 
 // ------------------------------------------------------------------ object creation (bulk)
 
-/** Unique Blender-style names ("Tree", "Tree.001", …) for many new objects without rescanning. */
-function objectNamer(doc: SceneDoc): (base: string) => string {
+/**
+ * Unique Blender-style names ("Tree", "Tree.001", …) for many new datablocks of one kind, without
+ * rescanning the document for every name.
+ */
+function blockNamer(doc: SceneDoc, kind: DatablockKind): (base: string) => string {
   const taken = new Set<string>();
-  for (const y of doc.map('objects').values()) taken.add(String((y as Y.Map<unknown>).get('name') ?? ''));
+  for (const y of doc.map(kind).values()) taken.add(String((y as Y.Map<unknown>).get('name') ?? ''));
   const next = new Map<string, number>();
   return (base) => {
     const clean = (base || 'Object').trim() || 'Object';
@@ -410,7 +428,7 @@ function addObjects(
   doc: SceneDoc,
   inits: (Partial<ObjectData> & { type: ObjectType; name: string })[],
 ): string[] {
-  const unique = objectNamer(doc);
+  const unique = blockNamer(doc, 'objects');
   const map = doc.map('objects');
   const ids: string[] = [];
   doc.transact(() => {
@@ -431,48 +449,85 @@ function addObjects(
   return ids;
 }
 
-/** Copy of an object's data block (for non-linked duplicates); the same id when it has none. */
-function copyData(doc: SceneDoc, o: ObjectData): string | null {
-  if (!o.data) return null;
-  switch (o.type) {
-    case 'MESH': {
-      const mesh = doc.getMeshCopy(o.data);
-      if (!mesh) return o.data;
-      const id = doc.addMesh(doc.getMeshBlock(o.data)?.name ?? o.name, mesh);
-      const keys = doc.getShapeKeys(o.data);
-      if (keys.length) doc.setShapeKeys(id, keys);
-      const groups = doc.getVertexGroups(o.data);
-      if (groups.length) doc.setVertexGroups(id, groups);
-      return id;
-    }
-    case 'CURVE':
-    case 'FONT': {
-      const c = doc.getCurve(o.data);
-      if (!c) return o.data;
-      const { id: _id, ...rest } = c;
-      return doc.addCurve(rest);
-    }
-    case 'ARMATURE': {
-      const a = doc.getArmature(o.data);
-      if (!a) return o.data;
-      const { id: _id, ...rest } = a;
-      return doc.addArmature(rest);
-    }
-    case 'LIGHT': {
-      const l = doc.getLight(o.data);
-      if (!l) return o.data;
-      const { id: _id, ...rest } = l;
-      return doc.addLight(rest);
-    }
-    case 'CAMERA': {
-      const c = doc.getCamera(o.data);
-      if (!c) return o.data;
-      const { id: _id, ...rest } = c;
-      return doc.addCamera(rest);
-    }
-    default:
-      return o.data;
+/** Most bytes of object data (meshes, curves, …) one array_place / scatter_on_surface run may copy. */
+export const MAX_COPY_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Independent copies of object data blocks for many new objects (non-linked duplicates). Each
+ * source block is read once: a mesh's encoded geometry is shared by all of its copies instead of
+ * being decoded and re-encoded per copy, and names are made unique without rescanning the document
+ * per copy, so n copies cost O(n).
+ */
+class DataCopier {
+  private readonly sources = new Map<
+    string,
+    { kind: DatablockKind; name: string; fields: [string, unknown][]; bytes: number } | null
+  >();
+  private readonly namers = new Map<DatablockKind, (base: string) => string>();
+
+  constructor(private readonly doc: SceneDoc) {}
+
+  /** Approximate stored size in bytes of one copy of the object's data (0 when it has none). */
+  size(o: ObjectData): number {
+    return this.source(o)?.bytes ?? 0;
   }
+
+  /** Id of a new copy of the object's data block (the object's own data id when there is none). */
+  copy(o: ObjectData): string | null {
+    const src = this.source(o);
+    if (!src) return o.data;
+    let namer = this.namers.get(src.kind);
+    if (!namer) this.namers.set(src.kind, (namer = blockNamer(this.doc, src.kind)));
+    const id = newId();
+    const y = new Y.Map<unknown>();
+    this.doc.map(src.kind).set(id, y);
+    y.set('id', id);
+    y.set('name', namer(src.name));
+    for (const [k, v] of src.fields) y.set(k, v instanceof Uint8Array ? v : cloneJson(v));
+    return id;
+  }
+
+  private source(o: ObjectData) {
+    if (!o.data) return null;
+    let s = this.sources.get(o.data);
+    if (s === undefined) {
+      const kind = dataKindOf(o.type);
+      const y = kind ? (this.doc.map(kind).get(o.data) as Y.Map<unknown> | undefined) : undefined;
+      s = null;
+      if (kind && y) {
+        const fields: [string, unknown][] = [];
+        let bytes = 64;
+        for (const [k, v] of y.entries()) {
+          if (k === 'id' || k === 'name') continue;
+          fields.push([k, v]);
+          bytes += v instanceof Uint8Array ? v.byteLength : JSON.stringify(v ?? null).length;
+        }
+        s = { kind, name: String(y.get('name') ?? o.name), fields, bytes };
+      }
+      this.sources.set(o.data, s);
+    }
+    return s;
+  }
+}
+
+/** Fails (before anything is created) when the planned data copies total more than MAX_COPY_BYTES. */
+function checkCopyBudget(bytes: number): void {
+  if (bytes > MAX_COPY_BYTES)
+    throw new OperatorError(
+      `Independent copies would duplicate ${(bytes / 2 ** 20).toFixed(1)} MB of object data (limit ` +
+        `${MAX_COPY_BYTES / 2 ** 20} MB): use linked=true (copies share the data) or fewer copies`,
+      'INVALID_PARAMS',
+    );
+}
+
+/**
+ * Location / rotation / scale of a new object with the given parent-relative matrix, as close as
+ * possible to the values of the object it copies (compatible eulers, same scale signs).
+ */
+function transformFields(local: Mat4, like: Pick<ObjectData, 'rotation_euler' | 'scale'>) {
+  const d = decomposeCompatible(local, like.rotation_euler, like.scale);
+  const r = d ?? decompose4(local);
+  return { location: clean3(r.location), rotation_euler: clean3(r.rotation), scale: clean3(r.scale) };
 }
 
 /** Fields of a duplicate of `o` (modifiers, constraints and particle systems get fresh ids). */
@@ -651,11 +706,15 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
       id: 'object.drop_to_ground',
       label: 'Drop to Ground',
       description:
-        'Move objects straight down (or up, out of a surface they are sunk into) until their lowest geometry rests ' +
-        'on the surface below: other visible mesh, curve and text objects (or only `surface`), using the evaluated ' +
-        'world-space geometry of both (rays from every vertex down onto the surfaces and from the surface vertices ' +
-        'under the object up onto it). The supporting surface is the first one below the top of the object, so ' +
-        'surfaces above it are ignored. Where nothing is below, the plane z = 0 is the ground (ground_plane). ' +
+        'Move objects straight down (or up, out of a surface they are sunk into or buried under) until their ' +
+        'lowest geometry rests on the surface below: other visible mesh, curve and text objects and their ' +
+        'instances (collection instances, particles), or only `surface`, using the evaluated world-space ' +
+        'geometry of both (rays from every vertex down onto the surfaces and from the surface vertices under the ' +
+        'object up onto it). The supporting surface is the first one below the top of the object whose outside ' +
+        'faces up, so surfaces above the object (a table top over a stool) are ignored, except where the object ' +
+        'is under a surface that faces up with nothing below it (buried under a terrain, inside a rock): there it ' +
+        'is lifted onto that surface, e.g. objects generated at z = 0 under a terrain. Where no surface is below ' +
+        'or above, the plane z = 0 is the ground (ground_plane; it lifts objects below it too). ' +
         'align_to_normal first tilts the object so its local +Z follows the surface normal under its centre. ' +
         'Objects are dropped independently (never onto each other). Returns per object whether it was dropped, ' +
         'the vertical move (metres), the contact point on the surface, its normal, the surface name (or ' +
@@ -668,12 +727,16 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           .array(z.string())
           .optional()
           .describe(
-            'Surface objects to drop onto, by id or name (default: every other visible geometry object)',
+            'Surface objects to drop onto, by id or name, including the instances they own or are the source ' +
+              'of (default: every other visible geometry object and instance)',
           ),
         ground_plane: z
           .boolean()
           .default(true)
-          .describe('Where no surface is below the object, use the infinite plane z = 0 as the ground'),
+          .describe(
+            'Where no surface is below (or above) the object, use the infinite plane z = 0 as the ground ' +
+              '(objects below it are lifted onto it)',
+          ),
         align_to_normal: z
           .boolean()
           .default(false)
@@ -695,7 +758,7 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         const scene = new LayoutScene(ctx);
         const moving = scene.withDescendants(ids);
         const only = p.surface?.length ? new Set(p.surface.map((r) => resolveOne(ctx, r).id)) : null;
-        const targets = new SceneRaycaster(scene.targets({ exclude: moving, only }));
+        const targets = new SceneRaycaster(scene.targets({ exclude: moving, only, instances: true }));
         const out = [];
         for (const id of scene.byDepth(ids)) {
           let world = scene.world(id);
@@ -771,7 +834,8 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
       id: 'object.snap_to_surface',
       label: 'Snap to Surface',
       description:
-        'Cast a ray (world space) against the visible geometry (or only `surface`) and place the objects at the ' +
+        'Cast a ray (world space) against the visible geometry including instances (collection instances, ' +
+        'particles), or only `surface`, and place the objects at the ' +
         'hit: the snap point of the reference object (the active one if it is among `objects`, else the first) ' +
         'lands on the hit point plus `offset` along the surface normal, and the other objects move along, keeping ' +
         "their arrangement. align_to_normal also rotates the group so the reference object's local +Z follows " +
@@ -795,7 +859,8 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           .array(z.string())
           .optional()
           .describe(
-            'Objects the ray may hit, by id or name (default: every visible geometry object except the moved ones)',
+            'Objects the ray may hit, by id or name, including the instances they own or are the source of ' +
+              '(default: every visible geometry object and instance except the moved ones)',
           ),
         align_to_normal: z
           .boolean()
@@ -822,7 +887,7 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         const scene = new LayoutScene(ctx);
         const moving = scene.withDescendants(ids);
         const only = p.surface?.length ? new Set(p.surface.map((r) => resolveOne(ctx, r).id)) : null;
-        const rc = new SceneRaycaster(scene.targets({ exclude: moving, only }));
+        const rc = new SceneRaycaster(scene.targets({ exclude: moving, only, instances: true }));
         const hit = rc.cast(p.ray_origin as Vec3, p.ray_direction as Vec3, p.max_distance);
         if (!hit) throw new OperatorError('The ray hit no surface', 'FAILED');
         const dir = p.ray_direction as Vec3;
@@ -1043,8 +1108,11 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'vertical axis through `center` (default: `radius` metres along −X from the centre of the group, so the ' +
         'originals stay on the circle), spread over `angle` radians (full circle by default); with rotate=true the ' +
         'copies turn with the circle (e.g. chairs keep facing a round table). linked=true shares the object data ' +
-        '(Alt+D, edits apply to all); false makes independent copies. Copies keep parents, collections, ' +
-        `materials and modifiers. At most ${MAX_LAYOUT_OBJECTS} new objects. Originals and copies become the ` +
+        '(Alt+D, edits apply to all); false makes independent copies (at most ' +
+        `${MAX_COPY_BYTES / 2 ** 20} MB of copied data per run). Copies keep parents, collections, materials, ` +
+        'modifiers and constraints; inside each copied group, parents, modifier objects (e.g. Armature) and ' +
+        'constraint targets point at the copies, like object.duplicate. ' +
+        `At most ${MAX_LAYOUT_OBJECTS} new objects. Originals and copies become the ` +
         'selection. Returns the new object ids per item.',
       category: 'Layout',
       redoable: true,
@@ -1079,7 +1147,11 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           .min(-4 * Math.PI)
           .max(4 * Math.PI)
           .default(2 * Math.PI)
-          .describe('CIRCLE: arc covered in radians, counter-clockwise seen from above (2π = full circle)'),
+          .describe(
+            'CIRCLE: arc covered in radians, counter-clockwise seen from above. A full circle (2π, ' +
+              `values within ${FULL_TURN_TOLERANCE} of it count, e.g. 6.28) spaces \`count\` items 2π/count ` +
+              'apart; a partial arc puts the first and last item at its ends',
+          ),
         rotate: z
           .boolean()
           .default(true)
@@ -1089,7 +1161,9 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         linked: z
           .boolean()
           .default(true)
-          .describe('Share the object data between copies (linked duplicates)'),
+          .describe(
+            `Share the object data between copies (linked duplicates); false copies it (at most ${MAX_COPY_BYTES / 2 ** 20} MB per run)`,
+          ),
       }),
       poll: pollObjectMode,
       execute(ctx, p) {
@@ -1114,8 +1188,12 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
               if (r || c) transforms.push(translation4([c * p.spacing[0], r * p.spacing[1], 0]));
         } else {
           const c: Vec3 = p.center ? (p.center as Vec3) : [gc[0] - p.radius, gc[1], gc[2]];
-          const full = Math.abs(Math.abs(p.angle) - 2 * Math.PI) < 1e-9 || Math.abs(p.angle) > 2 * Math.PI;
-          const step = full ? p.angle / items : items > 1 ? p.angle / (items - 1) : 0;
+          // a full turn (within FULL_TURN_TOLERANCE, e.g. 6.2832 or 6.28) spreads the items evenly
+          // without repeating the first one; larger angles wrap around
+          const turn = Math.abs(Math.abs(p.angle) - 2 * Math.PI) <= FULL_TURN_TOLERANCE;
+          const angle = turn ? Math.sign(p.angle) * 2 * Math.PI : p.angle;
+          const full = turn || Math.abs(angle) > 2 * Math.PI;
+          const step = full ? angle / items : items > 1 ? angle / (items - 1) : 0;
           for (let i = 1; i < items; i++) {
             const rz = axisAngle4([0, 0, 1], step * i);
             if (p.rotate)
@@ -1128,34 +1206,49 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         }
         const sources = scene.byDepth(ids).map((id) => ctx.doc.getObject(id)!);
         const inGroup = new Set(ids);
+        const copier = p.linked ? null : new DataCopier(ctx.doc);
+        // objects of the group sharing data share its copy too (like Blender's Shift+D)
+        const shared = new Map(sources.filter((o) => o.data).map((o) => [o.data!, o]));
+        if (copier)
+          checkCopyBudget(transforms.length * [...shared.values()].reduce((n, o) => n + copier.size(o), 0));
         const inits: (Partial<ObjectData> & { type: ObjectType; name: string })[] = [];
         const plan: { item: number; src: ObjectData }[] = [];
         transforms.forEach((m, item) => {
+          const dataCopies = new Map<string, string | null>();
           for (const src of sources) {
             const f = duplicateFields(src);
-            f.data = p.linked ? src.data : copyData(ctx.doc, src);
+            if (copier && src.data) {
+              if (!dataCopies.has(src.data)) dataCopies.set(src.data, copier.copy(src));
+              f.data = dataCopies.get(src.data)!;
+            } else f.data = src.data;
             if (!(src.parent && inGroup.has(src.parent))) {
-              // group roots: new world = item transform · current world, written through the same parent
+              // group roots: new world = item transform · current world, written through the same
+              // parent, with eulers continuing the (animated) rotation of the original
               const world = multiply4(m, scene.world(src.id));
-              const d = decompose4(multiply4(invert4(scene.parentWorld(src.id)), world));
-              f.location = clean3(d.location);
-              f.rotation_euler = clean3(d.rotation);
-              f.scale = clean3(d.scale);
+              Object.assign(
+                f,
+                transformFields(multiply4(invert4(scene.parentWorld(src.id)), world), scene.get(src.id).data),
+              );
             }
             inits.push(f);
             plan.push({ item, src });
           }
         });
         const created = addObjects(ctx.doc, inits);
-        // re-link parents inside each copied group
-        const copyOf = new Map<string, string>();
-        created.forEach((id, i) => copyOf.set(`${plan[i].item}:${plan[i].src.id}`, id));
+        // inside each copied group, parents, modifier objects and constraint targets point at the
+        // copies (like object.duplicate)
+        const groups = transforms.map(() => new Map<string, string>());
+        created.forEach((id, i) => groups[plan[i].item].set(plan[i].src.id, id));
         created.forEach((id, i) => {
           const { item, src } = plan[i];
           if (src.parent && inGroup.has(src.parent))
-            ctx.doc.updateObject(id, { parent: copyOf.get(`${item}:${src.parent}`) ?? src.parent });
+            ctx.doc.updateObject(id, { parent: groups[item].get(src.parent) ?? src.parent });
         });
-        const perItem = transforms.map((_, item) => created.filter((_, i) => plan[i].item === item));
+        const references = sources.some(
+          (o) => o.modifiers.length || o.constraints.length || Object.keys(o.pose?.bones ?? {}).length,
+        );
+        if (references) for (const map of groups) remapDuplicatedReferences(ctx.doc, map);
+        const perItem = groups.map((map) => [...map.values()]);
         setSelection(
           ctx,
           [...ids, ...created],
@@ -1248,7 +1341,9 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         linked: z
           .boolean()
           .default(true)
-          .describe('Share the object data with the source (linked duplicates)'),
+          .describe(
+            `Share the object data with the source (linked duplicates); false copies it (at most ${MAX_COPY_BYTES / 2 ** 20} MB per run)`,
+          ),
       }),
       poll: pollObjectMode,
       execute(ctx, p) {
@@ -1281,7 +1376,7 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           }),
         );
         const rng = new Rng(p.seed, 0x5ca770);
-        const inits: (Partial<ObjectData> & { type: ObjectType; name: string })[] = [];
+        const placed: { src: ObjectData; world: Mat4 }[] = [];
         for (const smp of samples) {
           const pick = rng.int(0, sources.length - 1);
           const heading = rng.spread(Math.PI) * p.rotation_random;
@@ -1304,19 +1399,21 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
             translation4(pos),
             multiply4(r, multiply4(scaling4([s, s, s]), linear.get(src.id)!)),
           );
-          const d = decompose4(world);
-          const f = duplicateFields(src);
-          f.data = p.linked ? src.data : copyData(ctx.doc, src);
-          inits.push({
-            ...f,
+          placed.push({ src, world });
+        }
+        const copier = p.linked ? null : new DataCopier(ctx.doc);
+        if (copier) checkCopyBudget(placed.reduce((n, c) => n + copier.size(c.src), 0));
+        const inits: (Partial<ObjectData> & { type: ObjectType; name: string })[] = placed.map(
+          ({ src, world }) => ({
+            ...duplicateFields(src),
+            data: copier ? copier.copy(src) : src.data,
             parent: null,
             parent_type: 'OBJECT',
             parent_bone: '',
-            location: clean3(d.location),
-            rotation_euler: clean3(d.rotation),
-            scale: clean3(d.scale),
-          });
-        }
+            // unparented: the world matrix is the local one (eulers continue the source's rotation)
+            ...transformFields(world, scene.get(src.id).data),
+          }),
+        );
         const created = addObjects(ctx.doc, inits);
         if (created.length) setSelection(ctx, created, created[created.length - 1]);
         if (created.length < p.count)
@@ -1333,11 +1430,13 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
       id: 'object.dimensions_set',
       label: 'Set Dimensions',
       description:
-        "Scale objects to target dimensions in metres (Blender's object.dimensions: the size of the evaluated " +
-        "geometry's bounding box along the object's own X, Y, Z axes, including its scale). Give any of x, y, z; " +
-        'proportional=true scales all three axes by one factor (the smallest needed, so the object fits within ' +
-        'every given dimension). Only the scale changes; flat axes (size 0) and objects without geometry are ' +
-        'skipped with a warning. Returns the new dimensions and scale of every object.',
+        "Scale objects to target dimensions in metres: the size of the evaluated geometry's bounding box along " +
+        "the object's own X, Y, Z axes. space=WORLD (default) measures it in the world, including the scale of " +
+        "parents (for unrotated objects it is the size scene.measure reports); space=LOCAL is Blender's " +
+        "object.dimensions (local bounding box × the object's own scale, ignoring parents). Give any of x, y, " +
+        'z; proportional=true scales all three axes by one factor (the smallest needed, so the object fits ' +
+        'within every given dimension). Only the scale changes; flat axes (size 0) and objects without geometry ' +
+        'are skipped with a warning. Returns the new dimensions (in `space`) and scale of every object.',
       category: 'Layout',
       redoable: true,
       schema: z.object({
@@ -1364,6 +1463,13 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           .boolean()
           .default(false)
           .describe('Keep the proportions: scale every axis by the same (smallest) factor'),
+        space: z
+          .enum(['WORLD', 'LOCAL'])
+          .default('WORLD')
+          .describe(
+            "WORLD: world-space sizes along the object's axes (parent scales included); LOCAL: Blender's " +
+              "object.dimensions (the object's own scale only)",
+          ),
       }),
       poll: pollObjectMode,
       execute(ctx, p) {
@@ -1381,7 +1487,14 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
             continue;
           }
           const size = boundsSize(lb);
-          const dims = size.map((v, k) => v * Math.abs(o.scale[k]));
+          // world: the length of the object's world axes (own and parent scale); local: own scale
+          const wm = scene.world(id);
+          const axisScale =
+            p.space === 'WORLD'
+              ? [0, 1, 2].map((k) => Math.hypot(wm[k * 4], wm[k * 4 + 1], wm[k * 4 + 2]))
+              : o.scale.map(Math.abs);
+          // both are proportional to the object's own scale on that axis
+          const dims = size.map((v, k) => v * axisScale[k]);
           const factor: (number | null)[] = wanted.map((w, k) => {
             if (w === undefined) return null;
             if (!(dims[k] > 1e-12)) {
@@ -1403,12 +1516,12 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           out.push({
             object: id,
             name: o.name,
-            dimensions: r3(size.map((v, k) => v * Math.abs(scale[k])) as Vec3),
+            dimensions: r3(dims.map((v, k) => v * f[k]) as Vec3),
             scale: r3(scale),
           });
         }
         scene.commit();
-        return { objects: out };
+        return { space: p.space, objects: out };
       },
     }),
   );
@@ -1420,11 +1533,14 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
       label: 'Measure',
       description:
         'Measure objects without changing anything: per object the world origin, world-space bounding box ' +
-        '(min, max, center, size) of the evaluated geometry and Blender dimensions (bounding box along its own ' +
-        'axes × scale); the bounding box around all of them; and for every pair (up to 25 objects) the distance ' +
+        '(min, max, center, size) of the evaluated geometry, Blender dimensions (bounding box along its own ' +
+        'axes × its own scale) and world_dimensions (the same box measured in the world, parent scales ' +
+        'included; what object.dimensions_set space=WORLD sets); the bounding box around all of them; and for ' +
+        'every pair (up to 25 objects) the distance ' +
         'between origins and between bounding box centres, the gap between the bounding boxes (0 when they ' +
-        'overlap) and, up to 8 objects, the closest distance between the actual surfaces with the closest points ' +
-        '(0 and intersecting=true when they cross). Units: metres.',
+        'overlap) and, up to 8 objects, the exact closest distance between the actual surfaces (meshes, curves, ' +
+        'text and the geometry of collection instances) with the closest points (0 when they touch; ' +
+        'intersecting=true when they cross). Units: metres.',
       category: 'Scene',
       undo: false,
       schema: z.object({
@@ -1461,9 +1577,26 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
             dimensions: r3(
               lb ? (boundsSize(lb).map((v, k) => v * Math.abs(o.data.scale[k])) as Vec3) : [0, 0, 0],
             ),
+            world_dimensions: r3(
+              lb
+                ? (boundsSize(lb).map((v, k) => v * Math.hypot(w[k * 4], w[k * 4 + 1], w[k * 4 + 2])) as Vec3)
+                : [0, 0, 0],
+            ),
           };
         });
         const all = ids.length ? ids.map((id) => scene.bounds(id)).reduce(unionBounds) : emptyBounds();
+        // world-space triangles per object (its mesh, or the geometry of the collection it instances),
+        // built once and shared by all pairs
+        const triangles = new Map<string, WorldTriangles | null>();
+        const trianglesOf = (id: string): WorldTriangles | null => {
+          let t = triangles.get(id);
+          if (t === undefined) {
+            const parts = scene.geometryTargets(id).map((g) => ({ mesh: g.mesh, matrix: g.matrix }));
+            t = parts.length ? new WorldTriangles(parts) : null;
+            triangles.set(id, (t = t && t.count > 0 ? t : null));
+          }
+          return t;
+        };
         const distances = [];
         if (ids.length >= 2 && ids.length <= 25) {
           for (let i = 0; i < ids.length; i++)
@@ -1485,13 +1618,10 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
                 center_distance: round(Math.hypot(ca[0] - cb[0], ca[1] - cb[1], ca[2] - cb[2])),
                 bounds_gap: round(boundsGap(ba, bb)),
               };
-              const ma = scene.get(a).mesh;
-              const mb = scene.get(b).mesh;
-              if (p.surface_distance && ids.length <= 8 && ma && mb) {
-                const d = meshDistance(
-                  { mesh: ma, matrix: scene.world(a) },
-                  { mesh: mb, matrix: scene.world(b) },
-                );
+              const ta = p.surface_distance && ids.length <= 8 ? trianglesOf(a) : null;
+              const tb = ta ? trianglesOf(b) : null;
+              if (ta && tb) {
+                const d = triangleSetDistance(ta, tb);
                 if (d) {
                   entry.surface_distance = round(d.distance);
                   entry.closest_points = [r3(d.pointA), r3(d.pointB)];

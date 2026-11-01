@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { SceneDoc } from '../src/doc/scene-doc';
 import type { RigidBodyData } from '../src/doc/types';
 import type { Mat4 } from '../src/math/types';
-import { createCube, createGrid, createIcoSphere, createPlane } from '../src/mesh/primitives';
+import { createCube, createGrid, createIcoSphere, createPlane, createUVSphere } from '../src/mesh/primitives';
 import { createMesh } from '../src/mesh/types';
 import { RigidBodySimulator, rigidBodyCacheInfo } from '../src/physics/rigid-body';
 import {
@@ -202,6 +202,53 @@ describe('contacts', () => {
       const identity: Mat4 = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
       if (d / 0.5 < Math.PI - 0.2) expect(rotationAngle(identity, m)).toBeCloseTo(d / 0.5, 1);
     }
+  });
+
+  it('collides round meshes with their full convex hull: they rest on and roll over their surface', () => {
+    // Blender (Bullet) keeps every hull vertex. A hull simplified to fewer vertices lies inside
+    // the mesh: this ball sank 4.6 cm into the ground and stuck on a facet of the ramp below.
+    const uv = createUVSphere({ radius: 1, segments: 32, ring_count: 16 });
+    const s = physicsScene();
+    s.ground({}, 40);
+    const ball = s.add(
+      'Ball',
+      s.mesh('uv', () => uv),
+      rb('ACTIVE'),
+      { location: [0, 0, 1.2] },
+    );
+    const m = simulate(s.doc, range(2, 120)).get(120)!.get(ball)!;
+    let lowest = Infinity;
+    for (let i = 0; i < uv.positions.length; i += 3) {
+      const [x, y, z] = uv.positions.slice(i, i + 3);
+      lowest = Math.min(lowest, m[2] * x + m[6] * y + m[10] * z + m[14]);
+    }
+    expect(Math.abs(lowest)).toBeLessThan(2e-3);
+    expect(m[14]).toBeCloseTo(1, 2);
+
+    // a ramp tilted down towards +X: the ball rolls straight down it, one radius above it
+    const r = physicsScene();
+    const theta = 0.15;
+    r.add('Ramp', r.plane(60), rb('PASSIVE'), { rotation_euler: [0, theta, 0] });
+    const roller = r.add(
+      'Ball',
+      r.mesh('uv', () => uv),
+      rb('ACTIVE', noDamping),
+      {
+        location: [Math.sin(theta) * 1.001, 0, Math.cos(theta) * 1.001],
+      },
+    );
+    const frames = range(2, 49);
+    const res = simulate(r.doc, frames);
+    for (const f of frames) {
+      const p = loc(res.get(f)!.get(roller)!);
+      expect(Math.abs(p[1])).toBeLessThan(1e-3);
+      expect(p[0] * Math.sin(theta) + p[2] * Math.cos(theta)).toBeGreaterThan(0.99);
+    }
+    const p = loc(res.get(49)!.get(roller)!);
+    const along = (p[0] - Math.sin(theta)) * Math.cos(theta) - (p[2] - Math.cos(theta)) * Math.sin(theta);
+    const t = 48 / FPS;
+    // rolling without slipping (5/7 g sin θ); the facets cost a little
+    expect(along / (0.5 * (5 / 7) * G * Math.sin(theta) * t * t)).toBeGreaterThan(0.93);
   });
 
   it('rests convex hulls on triangle meshes and settles in a concave valley', () => {

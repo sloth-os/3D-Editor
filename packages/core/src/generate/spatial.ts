@@ -1,7 +1,7 @@
 import type { Mat4, Vec3 } from '../math/types';
 import { determinant4, invert4 } from '../math/mat4';
 import type { MeshData } from '../mesh/types';
-import { Bvh } from '../modifiers/bvh';
+import { closestPointOnTriangle } from '../modifiers/bvh';
 import { buildBVH, type BVH } from '../render/pathtrace/bvh';
 import { surfaceTriangles, type SurfaceTriangles } from '../instancing/sampling';
 import { type Bounds, extendBounds, emptyBounds, isEmptyBounds, pointsBounds } from './layout';
@@ -9,7 +9,8 @@ import { type Bounds, extendBounds, emptyBounds, isEmptyBounds, pointsBounds } f
 /*
  * Spatial queries over evaluated scene geometry for the layout tools: ray casts against many
  * transformed meshes (one object-space BVH per mesh, shared by every object and instance using
- * it), and the closest distance between two meshes.
+ * it), the exact closest distance between two meshes (both BVHs walked together, triangle pairs
+ * compared edge to edge and vertex to face), and the drop solver of object.drop_to_ground.
  *
  * Ray casts use a binned-SAH BVH (the path tracer's builder) traversed nearest child first, which
  * stays fast on meshes mixing long sliver triangles with fine detail (e.g. a terrain with a base).
@@ -528,126 +529,410 @@ export interface MeshDistance {
   intersecting: boolean;
 }
 
-interface WorldMesh {
-  positions: Float64Array;
-  tris: SurfaceTriangles;
-  bvh: Bvh;
-  /** World bounds of the face vertices. */
-  box: Bounds;
-}
-
-function worldMesh(mesh: MeshData, m: Mat4): WorldMesh | null {
-  const tris = surfaceTriangles(mesh);
-  if (tris.count === 0) return null;
-  const positions = worldPositions(mesh, m);
-  const box = emptyBounds();
-  for (let i = 0; i < tris.verts.length; i++) {
-    const v = tris.verts[i] * 3;
-    extendBounds(box, positions[v], positions[v + 1], positions[v + 2]);
-  }
-  return { positions, tris, bvh: new Bvh(positions, tris.verts, 3), box };
-}
-
-/** Squared distance from a point to a box (0 inside). */
-function boxDist2(b: Bounds, x: number, y: number, z: number): number {
-  const dx = x < b.min[0] ? b.min[0] - x : x > b.max[0] ? x - b.max[0] : 0;
-  const dy = y < b.min[1] ? b.min[1] - y : y > b.max[1] ? y - b.max[1] : 0;
-  const dz = z < b.min[2] ? b.min[2] - z : z > b.max[2] ? z - b.max[2] : 0;
-  return dx * dx + dy * dy + dz * dz;
-}
-
-/** First crossing of an edge of `a` through a face of `b`, or null. */
-function edgeCrossing(a: WorldMesh, b: WorldMesh): Vec3 | null {
-  const P = a.positions;
-  const seen = new Set<number>();
-  const n = P.length / 3;
-  const v = a.tris.verts;
-  const bb = b.box;
-  for (let t = 0; t < a.tris.count; t++)
-    for (let k = 0; k < 3; k++) {
-      const i = v[t * 3 + k];
-      const j = v[t * 3 + ((k + 1) % 3)];
-      // only edges whose box overlaps the other mesh can cross it
-      let outside = false;
-      for (let c = 0; c < 3 && !outside; c++)
-        outside =
-          Math.max(P[i * 3 + c], P[j * 3 + c]) < bb.min[c] ||
-          Math.min(P[i * 3 + c], P[j * 3 + c]) > bb.max[c];
-      if (outside) continue;
-      const key = i < j ? i * n + j : j * n + i;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const dx = P[j * 3] - P[i * 3];
-      const dy = P[j * 3 + 1] - P[i * 3 + 1];
-      const dz = P[j * 3 + 2] - P[i * 3 + 2];
-      const len = Math.hypot(dx, dy, dz);
-      if (!(len > 1e-12)) continue;
-      const hit = b.bvh.raycast(P[i * 3], P[i * 3 + 1], P[i * 3 + 2], dx / len, dy / len, dz / len, 0, len);
-      if (hit)
-        return [
-          P[i * 3] + (dx / len) * hit.t,
-          P[i * 3 + 1] + (dy / len) * hit.t,
-          P[i * 3 + 2] + (dz / len) * hit.t,
-        ];
-    }
-  return null;
+/** A mesh placed in the world (object → world matrix). */
+export interface MeshPart {
+  mesh: MeshData;
+  matrix: Mat4;
 }
 
 /**
- * Closest vertex of `a` to the surface of `b` (only when closer than `bound`², squared). Vertices
- * are visited by their distance to `b`'s box, a lower bound, so far-away ones are never queried.
+ * The triangles of one or more placed meshes in world space (a soup: 9 coordinates per
+ * triangle) with a BVH over them, for closest-distance queries between meshes.
  */
-function closestVertexToSurface(
-  a: WorldMesh,
-  b: WorldMesh,
-  bound = Infinity,
-): { d2: number; pa: Vec3; pb: Vec3 } | null {
-  const P = a.positions;
-  const used = new Uint8Array(P.length / 3);
-  for (let i = 0; i < a.tris.verts.length; i++) used[a.tris.verts[i]] = 1;
-  const cand: number[] = [];
-  const lower: number[] = [];
-  for (let i = 0; i < used.length; i++) {
-    if (!used[i]) continue;
-    const lb = boxDist2(b.box, P[i * 3], P[i * 3 + 1], P[i * 3 + 2]);
-    if (lb >= bound) continue;
-    lower[i] = lb;
-    cand.push(i);
+export class WorldTriangles {
+  /** Corner coordinates, `count` × 9. */
+  readonly corners: Float64Array;
+  readonly count: number;
+  readonly bvh: BVH;
+
+  constructor(parts: MeshPart | readonly MeshPart[]) {
+    const list = Array.isArray(parts) ? parts : [parts as MeshPart];
+    let total = 0;
+    const tris = list.map((p) => {
+      const t = surfaceTriangles(p.mesh);
+      total += t.count;
+      return t;
+    });
+    const C = new Float64Array(total * 9);
+    let n = 0;
+    list.forEach((part, pi) => {
+      const P = part.mesh.positions;
+      const m = part.matrix;
+      const V = tris[pi].verts;
+      for (let t = 0; t < tris[pi].count; t++) {
+        const o = n * 9;
+        let ok = true;
+        for (let k = 0; k < 3; k++) {
+          const v = V[t * 3 + k] * 3;
+          const x = P[v];
+          const y = P[v + 1];
+          const z = P[v + 2];
+          const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+          const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+          const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+          if (!Number.isFinite(wx) || !Number.isFinite(wy) || !Number.isFinite(wz)) ok = false;
+          C[o + k * 3] = wx;
+          C[o + k * 3 + 1] = wy;
+          C[o + k * 3 + 2] = wz;
+        }
+        if (ok) n++;
+      }
+    });
+    this.count = n;
+    this.corners = C.subarray(0, n * 9);
+    const boxes = new Float64Array(n * 6);
+    for (let t = 0; t < n; t++) {
+      const o = t * 9;
+      for (let a = 0; a < 3; a++) {
+        boxes[t * 6 + a] = Math.min(C[o + a], C[o + 3 + a], C[o + 6 + a]);
+        boxes[t * 6 + 3 + a] = Math.max(C[o + a], C[o + 3 + a], C[o + 6 + a]);
+      }
+    }
+    this.bvh = buildBVH(boxes, n);
   }
-  cand.sort((p, q) => lower[p] - lower[q]);
-  let best: { d2: number; pa: Vec3; pb: Vec3 } | null = null;
-  for (const i of cand) {
-    if (best && lower[i] >= best.d2) break;
-    const x = P[i * 3];
-    const y = P[i * 3 + 1];
-    const z = P[i * 3 + 2];
-    const c = b.bvh.closest(x, y, z);
-    if (c && c.dist2 < bound && (!best || c.dist2 < best.d2))
-      best = { d2: c.dist2, pa: [x, y, z], pb: [c.x, c.y, c.z] };
+}
+
+/** Squared distance between box `i` of BVH `a` and box `j` of BVH `b` (0 when they overlap). */
+function nodeGap2(a: BVH, i: number, b: BVH, j: number): number {
+  const A = a.bounds;
+  const B = b.bounds;
+  let s = 0;
+  for (let k = 0; k < 3; k++) {
+    const d = Math.max(0, A[i * 6 + k] - B[j * 6 + 3 + k], B[j * 6 + k] - A[i * 6 + 3 + k]);
+    s += d * d;
   }
-  return best;
+  return s;
+}
+
+const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+/** Relative margin keeping crossings off triangle boundaries and segment ends (touching contacts). */
+const CROSS_EPS = 1e-9;
+
+/**
+ * Closest points of segments p + s·u and q + t·v (s, t in [0, 1]) into `out` [p', q'];
+ * returns the squared distance.
+ */
+function segmentPair(
+  px: number,
+  py: number,
+  pz: number,
+  ux: number,
+  uy: number,
+  uz: number,
+  qx: number,
+  qy: number,
+  qz: number,
+  vx: number,
+  vy: number,
+  vz: number,
+  out: Float64Array,
+): number {
+  // minimise |w + s·u - t·v|² with w = p - q
+  const wx = px - qx;
+  const wy = py - qy;
+  const wz = pz - qz;
+  const a = ux * ux + uy * uy + uz * uz;
+  const b = ux * vx + uy * vy + uz * vz;
+  const c = vx * vx + vy * vy + vz * vz;
+  const d = ux * wx + uy * wy + uz * wz;
+  const e = vx * wx + vy * wy + vz * wz;
+  let s = 0;
+  let t = 0;
+  if (a > 1e-30 && c > 1e-30) {
+    const den = a * c - b * b;
+    // parallel segments: any s works for the line pair; start from s = 0 and clamp below
+    s = den > 1e-12 * a * c ? clamp01((b * e - c * d) / den) : 0;
+    t = (b * s + e) / c;
+    if (t < 0) {
+      t = 0;
+      s = clamp01(-d / a);
+    } else if (t > 1) {
+      t = 1;
+      s = clamp01((b - d) / a);
+    }
+  } else if (a > 1e-30) s = clamp01(-d / a);
+  else if (c > 1e-30) t = clamp01(e / c);
+  out[0] = px + ux * s;
+  out[1] = py + uy * s;
+  out[2] = pz + uz * s;
+  out[3] = qx + vx * t;
+  out[4] = qy + vy * t;
+  out[5] = qz + vz * t;
+  return (out[0] - out[3]) ** 2 + (out[1] - out[4]) ** 2 + (out[2] - out[5]) ** 2;
 }
 
 /**
- * Closest distance between the surfaces of two transformed meshes: the minimum over the vertices of
- * each mesh of the distance to the other surface (exact up to the tessellation), and 0 when an
- * edge of one passes through a face of the other. Null when either mesh has no faces.
+ * Where segment p → p + d passes through the interior of triangle (a, b, c), excluding its end
+ * points and the triangle's boundary (so surfaces that only touch, like stacked boxes, never count
+ * as crossing); writes the point into `out` and returns true.
+ */
+function segmentCrossesTriangle(
+  C: Float64Array,
+  o: number,
+  px: number,
+  py: number,
+  pz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  out: Float64Array,
+): boolean {
+  const e1x = C[o + 3] - C[o];
+  const e1y = C[o + 4] - C[o + 1];
+  const e1z = C[o + 5] - C[o + 2];
+  const e2x = C[o + 6] - C[o];
+  const e2y = C[o + 7] - C[o + 1];
+  const e2z = C[o + 8] - C[o + 2];
+  const hx = dy * e2z - dz * e2y;
+  const hy = dz * e2x - dx * e2z;
+  const hz = dx * e2y - dy * e2x;
+  const det = e1x * hx + e1y * hy + e1z * hz;
+  // (parallel and coplanar segments never cross transversally)
+  const scale = Math.hypot(e1x, e1y, e1z) * Math.hypot(e2x, e2y, e2z) * Math.hypot(dx, dy, dz);
+  if (!(Math.abs(det) > 1e-12 * scale)) return false;
+  const inv = 1 / det;
+  const sx = px - C[o];
+  const sy = py - C[o + 1];
+  const sz = pz - C[o + 2];
+  const u = (sx * hx + sy * hy + sz * hz) * inv;
+  if (!(u > CROSS_EPS && u < 1 - CROSS_EPS)) return false;
+  const qx = sy * e1z - sz * e1y;
+  const qy = sz * e1x - sx * e1z;
+  const qz = sx * e1y - sy * e1x;
+  const v = (dx * qx + dy * qy + dz * qz) * inv;
+  if (!(v > CROSS_EPS && u + v < 1 - CROSS_EPS)) return false;
+  const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+  if (!(t > CROSS_EPS && t < 1 - CROSS_EPS)) return false;
+  out[0] = px + dx * t;
+  out[1] = py + dy * t;
+  out[2] = pz + dz * t;
+  return true;
+}
+
+/**
+ * Closest distance between the surfaces of two sets of world triangles: exact (the minimum over
+ * triangle pairs of their distance, which is an edge-edge or vertex-face distance unless they
+ * cross), found by walking both BVHs together nearest first. Distance 0 with intersecting=true when
+ * an edge of one passes through a face of the other; touching surfaces (shared faces, resting
+ * contact) give 0 with intersecting=false. Null when either set has no triangles.
+ */
+export function triangleSetDistance(A: WorldTriangles, B: WorldTriangles): MeshDistance | null {
+  if (A.count === 0 || B.count === 0) return null;
+  const CA = A.corners;
+  const CB = B.corners;
+  let best2 = Infinity;
+  const pa: Vec3 = [0, 0, 0];
+  const pb: Vec3 = [0, 0, 0];
+  const seg = new Float64Array(6);
+  const tmp = [0, 0, 0];
+  const hit = new Float64Array(3);
+  let crossing: Vec3 | null = null;
+  const take = (d2: number, ax: number, ay: number, az: number, bx: number, by: number, bz: number) => {
+    if (d2 < best2) {
+      best2 = d2;
+      pa[0] = ax;
+      pa[1] = ay;
+      pa[2] = az;
+      pb[0] = bx;
+      pb[1] = by;
+      pb[2] = bz;
+    }
+  };
+  /** Distance between triangle i of A and triangle j of B (records the best; finds crossings). */
+  const pair = (i: number, j: number) => {
+    const oa = i * 9;
+    const ob = j * 9;
+    // cheap reject: triangle boxes at least as far apart as the best distance so far
+    let gap = 0;
+    for (let k = 0; k < 3; k++) {
+      const amin = Math.min(CA[oa + k], CA[oa + 3 + k], CA[oa + 6 + k]);
+      const amax = Math.max(CA[oa + k], CA[oa + 3 + k], CA[oa + 6 + k]);
+      const bmin = Math.min(CB[ob + k], CB[ob + 3 + k], CB[ob + 6 + k]);
+      const bmax = Math.max(CB[ob + k], CB[ob + 3 + k], CB[ob + 6 + k]);
+      const d = Math.max(0, amin - bmax, bmin - amax);
+      gap += d * d;
+    }
+    if (gap > best2 || (gap === best2 && best2 > 0)) return;
+    if (gap === 0)
+      for (let k = 0; k < 3; k++) {
+        const ka = oa + k * 3;
+        const na = oa + ((k + 1) % 3) * 3;
+        if (
+          segmentCrossesTriangle(
+            CB,
+            ob,
+            CA[ka],
+            CA[ka + 1],
+            CA[ka + 2],
+            CA[na] - CA[ka],
+            CA[na + 1] - CA[ka + 1],
+            CA[na + 2] - CA[ka + 2],
+            hit,
+          )
+        ) {
+          crossing = [hit[0], hit[1], hit[2]];
+          return;
+        }
+        const kb = ob + k * 3;
+        const nb = ob + ((k + 1) % 3) * 3;
+        if (
+          segmentCrossesTriangle(
+            CA,
+            oa,
+            CB[kb],
+            CB[kb + 1],
+            CB[kb + 2],
+            CB[nb] - CB[kb],
+            CB[nb + 1] - CB[kb + 1],
+            CB[nb + 2] - CB[kb + 2],
+            hit,
+          )
+        ) {
+          crossing = [hit[0], hit[1], hit[2]];
+          return;
+        }
+      }
+    // edge pairs
+    for (let k = 0; k < 3; k++) {
+      const ka = oa + k * 3;
+      const na = oa + ((k + 1) % 3) * 3;
+      for (let l = 0; l < 3; l++) {
+        const kb = ob + l * 3;
+        const nb = ob + ((l + 1) % 3) * 3;
+        const d2 = segmentPair(
+          CA[ka],
+          CA[ka + 1],
+          CA[ka + 2],
+          CA[na] - CA[ka],
+          CA[na + 1] - CA[ka + 1],
+          CA[na + 2] - CA[ka + 2],
+          CB[kb],
+          CB[kb + 1],
+          CB[kb + 2],
+          CB[nb] - CB[kb],
+          CB[nb + 1] - CB[kb + 1],
+          CB[nb + 2] - CB[kb + 2],
+          seg,
+        );
+        take(d2, seg[0], seg[1], seg[2], seg[3], seg[4], seg[5]);
+      }
+    }
+    // vertices against the other face
+    for (let k = 0; k < 3; k++) {
+      const va = oa + k * 3;
+      closestPointOnTriangle(
+        CA[va],
+        CA[va + 1],
+        CA[va + 2],
+        CB[ob],
+        CB[ob + 1],
+        CB[ob + 2],
+        CB[ob + 3],
+        CB[ob + 4],
+        CB[ob + 5],
+        CB[ob + 6],
+        CB[ob + 7],
+        CB[ob + 8],
+        tmp,
+      );
+      take(
+        (tmp[0] - CA[va]) ** 2 + (tmp[1] - CA[va + 1]) ** 2 + (tmp[2] - CA[va + 2]) ** 2,
+        CA[va],
+        CA[va + 1],
+        CA[va + 2],
+        tmp[0],
+        tmp[1],
+        tmp[2],
+      );
+      const vb = ob + k * 3;
+      closestPointOnTriangle(
+        CB[vb],
+        CB[vb + 1],
+        CB[vb + 2],
+        CA[oa],
+        CA[oa + 1],
+        CA[oa + 2],
+        CA[oa + 3],
+        CA[oa + 4],
+        CA[oa + 5],
+        CA[oa + 6],
+        CA[oa + 7],
+        CA[oa + 8],
+        tmp,
+      );
+      take(
+        (tmp[0] - CB[vb]) ** 2 + (tmp[1] - CB[vb + 1]) ** 2 + (tmp[2] - CB[vb + 2]) ** 2,
+        tmp[0],
+        tmp[1],
+        tmp[2],
+        CB[vb],
+        CB[vb + 1],
+        CB[vb + 2],
+      );
+    }
+  };
+  const a = A.bvh;
+  const b = B.bvh;
+  /** Sum of the edge lengths of a node's box (its size, to pick the node to split). */
+  const sizeOf = (t: BVH, n: number) => {
+    const o = n * 6;
+    return (
+      t.bounds[o + 3] -
+      t.bounds[o] +
+      (t.bounds[o + 4] - t.bounds[o + 1]) +
+      (t.bounds[o + 5] - t.bounds[o + 2])
+    );
+  };
+  // node pairs to visit with their box gap, nearest popped first
+  const stack: number[] = [0, 0, nodeGap2(a, 0, b, 0)];
+  while (stack.length && !crossing) {
+    const g = stack.pop()!;
+    const j = stack.pop()!;
+    const i = stack.pop()!;
+    // once touching, only overlapping boxes can still hold a crossing
+    if (g > best2 || (g === best2 && best2 > 0)) continue;
+    const leafA = a.count[i] > 0;
+    const leafB = b.count[j] > 0;
+    if (leafA && leafB) {
+      for (let x = a.child[i]; x < a.child[i] + a.count[i] && !crossing; x++)
+        for (let y = b.child[j]; y < b.child[j] + b.count[j] && !crossing; y++) pair(a.prims[x], b.prims[y]);
+      continue;
+    }
+    // descend into the bigger box (or the one that is not a leaf)
+    const splitA = leafB || (!leafA && sizeOf(a, i) >= sizeOf(b, j));
+    const a0 = splitA ? a.child[i] : i;
+    const a1 = splitA ? a0 + 1 : i;
+    const b0 = splitA ? j : b.child[j];
+    const b1 = splitA ? j : b0 + 1;
+    const g0 = nodeGap2(a, a0, b, b0);
+    const g1 = nodeGap2(a, a1, b, b1);
+    // the farther pair goes first so the nearer one is visited next
+    if (g0 <= g1) {
+      if (g1 <= best2) stack.push(a1, b1, g1);
+      if (g0 <= best2) stack.push(a0, b0, g0);
+    } else {
+      if (g0 <= best2) stack.push(a0, b0, g0);
+      if (g1 <= best2) stack.push(a1, b1, g1);
+    }
+  }
+  if (crossing) {
+    const c = crossing as Vec3;
+    return { distance: 0, pointA: c, pointB: [c[0], c[1], c[2]], intersecting: true };
+  }
+  if (!Number.isFinite(best2)) return null;
+  return { distance: Math.sqrt(best2), pointA: pa, pointB: pb, intersecting: false };
+}
+
+/**
+ * Closest distance between the surfaces of two transformed meshes (or groups of meshes, e.g. the
+ * instances of a collection), see `triangleSetDistance`. Null when either has no faces.
  */
 export function meshDistance(
-  a: { mesh: MeshData; matrix: Mat4 },
-  b: { mesh: MeshData; matrix: Mat4 },
+  a: MeshPart | readonly MeshPart[],
+  b: MeshPart | readonly MeshPart[],
 ): MeshDistance | null {
-  const A = worldMesh(a.mesh, a.matrix);
-  const B = worldMesh(b.mesh, b.matrix);
-  if (!A || !B) return null;
-  const cross = edgeCrossing(A, B) ?? edgeCrossing(B, A);
-  if (cross) return { distance: 0, pointA: cross, pointB: [...cross] as Vec3, intersecting: true };
-  const ab = closestVertexToSurface(A, B);
-  const ba = closestVertexToSurface(B, A, ab ? ab.d2 : Infinity);
-  if (!ab && !ba) return null;
-  if (ab && (!ba || ab.d2 <= ba.d2))
-    return { distance: Math.sqrt(ab.d2), pointA: ab.pa, pointB: ab.pb, intersecting: false };
-  return { distance: Math.sqrt(ba!.d2), pointA: ba!.pb, pointB: ba!.pa, intersecting: false };
+  return triangleSetDistance(new WorldTriangles(a), new WorldTriangles(b));
 }
 
 // ------------------------------------------------------------------ drop to ground
@@ -668,15 +953,25 @@ function upward(n: Readonly<Vec3>): Vec3 {
   return n[2] < 0 ? [-n[0], -n[1], -n[2]] : [n[0], n[1], n[2]];
 }
 
+const UP: Vec3 = [0, 0, 1];
+const DOWN: Vec3 = [0, 0, -1];
+
 /**
  * Vertical offset that makes geometry rest on the surfaces beneath it. `points` are the world-space
- * vertices of the geometry (or just its origin). The supporting surface at each footprint position
- * is the first one below the top of the geometry, so geometry hanging in the air drops down and
- * geometry sunk into a surface is lifted out of it, while surfaces above the geometry (a table top
- * over a stool) are ignored. Rays go down from above every vertex onto `targets` and, when the
- * geometry's own surface is given, up from every target vertex under the footprint onto it (so
- * peaks between the vertices are found too); the largest required offset wins. With `groundPlane`
- * the plane z = 0 is the surface wherever no target lies below. Null when there is nothing below.
+ * vertices of the geometry (or just its origin). For every footprint column the supporting surface
+ * is, in this order:
+ *  1. the first surface below the top of the geometry whose outside faces up, so geometry hanging
+ *     in the air drops down and geometry sunk into a surface is lifted out of it, while surfaces
+ *     above the geometry (a table top over a stool) are ignored;
+ *  2. where the column instead starts inside a solid, or under a surface whose outside faces up
+ *     (buried: under a terrain, inside a rock), the surface above it: the geometry is lifted out;
+ *  3. a surface below that faces down (flipped normals);
+ *  4. with `groundPlane`, the plane z = 0 (which also lifts geometry that is below it).
+ * When the geometry's own surface is given, rays also go up from every target vertex under the
+ * footprint onto it (lowest first, following the geometry as it is lifted), so peaks between the
+ * geometry's vertices are found too. The largest required offset wins. Null when nothing supports
+ * the geometry. (Like every vertex-based test, a ridge or spike thinner than the vertex spacing of
+ * both meshes, with no vertex inside the other mesh, can go unnoticed.)
  */
 export function computeDrop(
   points: ArrayLike<number>,
@@ -692,18 +987,14 @@ export function computeDrop(
   const consider = (dz: number, point: Vec3, normal: Vec3, target: RaycastTarget | null) => {
     if (Number.isFinite(dz) && (!best || dz > best.dz)) best = { dz, point, normal, target };
   };
-  const down: Vec3 = [0, 0, -1];
-  /** Highest surface below `top` at (x, y). */
-  const surfaceBelow = (
-    x: number,
-    y: number,
-  ): { z: number; n: Vec3; target: RaycastTarget | null } | null => {
-    const hit = targets.cast([x, y, top], down);
-    let out: { z: number; n: Vec3; target: RaycastTarget | null } | null = hit
-      ? { z: hit.point[2], n: upward(hit.normal), target: hit.target }
-      : null;
-    if (!out && groundPlane && top > 0) out = { z: 0, n: [0, 0, 1], target: null };
-    return out;
+  /** Supporting surface of the column through (x, y) (see above). */
+  const support = (x: number, y: number): { z: number; n: Vec3; target: RaycastTarget | null } | null => {
+    const below = targets.cast([x, y, top], DOWN);
+    if (below && below.normal[2] > 0) return { z: below.point[2], n: below.normal, target: below.target };
+    const above = targets.cast([x, y, top], UP);
+    if (above && above.normal[2] > 0) return { z: above.point[2], n: above.normal, target: above.target };
+    if (below) return { z: below.point[2], n: upward(below.normal), target: below.target };
+    return groundPlane ? { z: 0, n: [0, 0, 1], target: null } : null;
   };
   // only the lowest point above each footprint position matters (walls stack many vertices)
   const lowest = new Map<string, number>();
@@ -720,17 +1011,20 @@ export function computeDrop(
     const c = key.indexOf(',');
     const x = Number(key.slice(0, c));
     const y = Number(key.slice(c + 1));
-    const s = surfaceBelow(x, y);
+    const s = support(x, y);
     if (s) consider(s.z - z, [x, y, s.z], s.n, s.target);
   }
   if (geometry && geometry.size > 0) {
+    // target vertices under the footprint, lowest first: a vertex matters while it is below the
+    // top of the geometry at its (lifted) position, and lifting brings higher ones into reach
     const from = b.min[2] - eps;
     const reach = top - from + eps;
     const all = targets.targets();
     const boxes = targets.boxes();
+    const cand: { x: number; y: number; z: number; t: RaycastTarget }[] = [];
     for (let k = 0; k < all.length; k++) {
       const box = boxes[k];
-      if (box.min[2] >= top || box.max[0] < b.min[0] || box.min[0] > b.max[0]) continue;
+      if (box.max[0] < b.min[0] || box.min[0] > b.max[0]) continue;
       if (box.max[1] < b.min[1] || box.min[1] > b.max[1]) continue;
       const t = all[k];
       const { tris } = meshBvh(t.mesh);
@@ -746,10 +1040,16 @@ export function computeDrop(
         const x = m[0] * lx + m[4] * ly + m[8] * lz + m[12];
         const y = m[1] * lx + m[5] * ly + m[9] * lz + m[13];
         const z = m[2] * lx + m[6] * ly + m[10] * lz + m[14];
-        if (!(z < top) || x < b.min[0] || x > b.max[0] || y < b.min[1] || y > b.max[1]) continue;
-        const hit = geometry.cast([x, y, from], [0, 0, 1], reach);
-        if (hit) consider(z - hit.point[2], [x, y, z], upward(hit.normal), t);
+        if (!Number.isFinite(z) || x < b.min[0] || x > b.max[0] || y < b.min[1] || y > b.max[1]) continue;
+        cand.push({ x, y, z, t });
       }
+    }
+    cand.sort((p, q) => p.z - q.z);
+    for (const { x, y, z, t } of cand) {
+      const lift = best ? Math.max(0, (best as DropResult).dz) : 0;
+      if (!(z < top + lift)) break;
+      const hit = geometry.cast([x, y, from], UP, reach);
+      if (hit) consider(z - hit.point[2], [x, y, z], upward(hit.normal), t);
     }
   }
   return best;

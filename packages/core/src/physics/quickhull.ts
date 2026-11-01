@@ -174,7 +174,7 @@ function hullOf(p: number[]): ConvexHull {
     if (f.nx * centroid[0] + f.ny * centroid[1] + f.nz * centroid[2] - f.d > 0) f = makeFace(a, c, b);
     faces.push(f);
   }
-  linkNeighbours(faces);
+  linkNeighbours(faces, n);
   const dist = (f: HullFace, i: number) => f.nx * p[i * 3] + f.ny * p[i * 3 + 1] + f.nz * p[i * 3 + 2] - f.d;
   const assign = (i: number, candidates: number[]) => {
     let bestF = -1;
@@ -287,15 +287,18 @@ function hullOf(p: number[]): ConvexHull {
   return mergeCoplanar(p, tris, eps);
 }
 
-function linkNeighbours(faces: HullFace[]): void {
-  const edges = new Map<string, [number, number]>();
+/** Directed edge a → b of a hull over n points as a number (exact in doubles). */
+const edgeKey = (a: number, b: number, n: number) => a * n + b;
+
+function linkNeighbours(faces: HullFace[], n: number): void {
+  const edges = new Map<number, number>();
   faces.forEach((f, fi) => {
-    for (let e = 0; e < 3; e++) edges.set(`${f.v[e]},${f.v[(e + 1) % 3]}`, [fi, e]);
+    for (let e = 0; e < 3; e++) edges.set(edgeKey(f.v[e], f.v[(e + 1) % 3], n), fi);
   });
   faces.forEach((f) => {
     for (let e = 0; e < 3; e++) {
-      const twin = edges.get(`${f.v[(e + 1) % 3]},${f.v[e]}`);
-      if (twin) f.nb[e] = twin[0];
+      const twin = edges.get(edgeKey(f.v[(e + 1) % 3], f.v[e], n));
+      if (twin !== undefined) f.nb[e] = twin;
     }
   });
 }
@@ -303,6 +306,7 @@ function linkNeighbours(faces: HullFace[]): void {
 /** Merges adjacent coplanar triangles into polygons and compacts the vertex list. */
 function mergeCoplanar(p: number[], tris: HullFace[], eps: number): ConvexHull {
   const m = tris.length;
+  const np = p.length / 3;
   const parent = tris.map((_, i) => i);
   const find = (i: number): number => {
     while (parent[i] !== i) {
@@ -311,14 +315,14 @@ function mergeCoplanar(p: number[], tris: HullFace[], eps: number): ConvexHull {
     }
     return i;
   };
-  const edgeOwner = new Map<string, number>();
+  const edgeOwner = new Map<number, number>();
   tris.forEach((t, ti) => {
-    for (let e = 0; e < 3; e++) edgeOwner.set(`${t.v[e]},${t.v[(e + 1) % 3]}`, ti);
+    for (let e = 0; e < 3; e++) edgeOwner.set(edgeKey(t.v[e], t.v[(e + 1) % 3], np), ti);
   });
   for (let ti = 0; ti < m; ti++) {
     const t = tris[ti];
     for (let e = 0; e < 3; e++) {
-      const o = edgeOwner.get(`${t.v[(e + 1) % 3]},${t.v[e]}`);
+      const o = edgeOwner.get(edgeKey(t.v[(e + 1) % 3], t.v[e], np));
       if (o === undefined || o <= ti) continue;
       const u = tris[o];
       if (t.nx * u.nx + t.ny * u.ny + t.nz * u.nz > 1 - 1e-9) {
@@ -369,10 +373,11 @@ function mergeCoplanar(p: number[], tris: HullFace[], eps: number): ConvexHull {
 
 /** Boundary loop of a group of coplanar triangles, or null when it is not a simple planar polygon. */
 function boundaryLoop(p: number[], tris: HullFace[], members: number[], eps: number): number[] | null {
-  const inGroup = new Set<string>();
+  const np = p.length / 3;
+  const inGroup = new Set<number>();
   for (const ti of members) {
     const t = tris[ti];
-    for (let e = 0; e < 3; e++) inGroup.add(`${t.v[e]},${t.v[(e + 1) % 3]}`);
+    for (let e = 0; e < 3; e++) inGroup.add(edgeKey(t.v[e], t.v[(e + 1) % 3], np));
   }
   const next = new Map<number, number>();
   for (const ti of members) {
@@ -380,7 +385,7 @@ function boundaryLoop(p: number[], tris: HullFace[], members: number[], eps: num
     for (let e = 0; e < 3; e++) {
       const a = t.v[e];
       const b = t.v[(e + 1) % 3];
-      if (inGroup.has(`${b},${a}`)) continue;
+      if (inGroup.has(edgeKey(b, a, np))) continue;
       if (next.has(a)) return null;
       next.set(a, b);
     }

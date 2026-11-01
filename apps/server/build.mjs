@@ -1,4 +1,5 @@
-// Bundles the server into a single ESM file (dist/main.js).
+// Bundles the server into ESM files: dist/main.js (the server) and dist/render-worker.js (the
+// render worker thread entry, started by src/render/pool.ts from the directory of main.js).
 // @3d-editor/* workspace packages are bundled from their TypeScript sources; every other
 // package stays external and is resolved from node_modules at runtime.
 import { build } from 'esbuild';
@@ -25,8 +26,8 @@ await rm(path.join(here, 'dist'), { recursive: true, force: true });
 
 const result = await build({
   absWorkingDir: here,
-  entryPoints: ['src/main.ts'],
-  outfile: 'dist/main.js',
+  entryPoints: { main: 'src/main.ts', 'render-worker': 'src/render/worker.ts' },
+  outdir: 'dist',
   bundle: true,
   platform: 'node',
   format: 'esm',
@@ -53,5 +54,5 @@ const result = await build({
 
 const bytes = Object.values(result.metafile.outputs).reduce((n, o) => n + o.bytes, 0);
 console.log(
-  `built ${pkg.name}@${pkg.version} → dist/main.js (${(bytes / 1024).toFixed(0)} KiB incl. sourcemap)`,
+  `built ${pkg.name}@${pkg.version} → dist/main.js + dist/render-worker.js (${(bytes / 1024).toFixed(0)} KiB incl. sourcemaps)`,
 );

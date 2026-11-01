@@ -4,8 +4,11 @@ import {
   SceneEvaluator,
   TextureCache,
   autoFrameView,
+  denoiseFilm,
+  encodePNG,
   evaluatedBounds,
   evaluatedOrco,
+  filmToRGBA8,
   preparePathTrace,
   renderItems,
   renderSceneSoftware,
@@ -20,6 +23,8 @@ import {
 import type {
   AutoViewResult,
   DocRef,
+  FilmBuffers,
+  FinishOptions,
   FrameOptions,
   ImageResult,
   PreparedInfo,
@@ -57,7 +62,9 @@ export function softwareOptions(o: FrameOptions): SoftwareRenderOptions {
     frame: o.frame,
     engine: o.engine,
     cameraId: o.cameraId,
-    view: o.view ? { position: o.view.position, target: o.view.target, up: o.view.up, fovY: o.view.fovY } : undefined,
+    view: o.view
+      ? { position: o.view.position, target: o.view.target, up: o.view.up, fovY: o.view.fovY }
+      : undefined,
     shading: o.shading,
     wireframe: o.wireframe,
     samples: o.samples,
@@ -146,9 +153,7 @@ export class RenderEngine {
       timeLimit: s.timeLimit,
       exposure: prepared.exposure,
       viewTransform: prepared.viewTransform,
-      displayBackground: prepared.displayBackground
-        ? ([...prepared.displayBackground] as Vec4Tuple)
-        : null,
+      displayBackground: prepared.displayBackground ? ([...prepared.displayBackground] as Vec4Tuple) : null,
       warnings: [...prepared.scene.warnings],
       prepareMs: now() - t0,
     };
@@ -165,8 +170,11 @@ export class RenderEngine {
     this.tracers.delete(job);
   }
 
-  /** Renders a whole image on this thread (raster, or single-threaded path tracing). */
-  image(ref: DocRef, options: FrameOptions): ImageResult {
+  /**
+   * Renders a whole image on this thread (raster, or single-threaded path tracing); with `png`
+   * the PNG file is returned instead of the pixels.
+   */
+  image(ref: DocRef, options: FrameOptions, png = false): ImageResult {
     const { doc, evaluator } = this.document(ref);
     let last: PathTraceProgress | undefined;
     const img = renderSceneSoftware(doc, {
@@ -176,7 +184,9 @@ export class RenderEngine {
         last = p;
       },
     });
-    const out: ImageResult = { width: img.width, height: img.height, data: img.data };
+    const out: ImageResult = png
+      ? { width: img.width, height: img.height, png: encodePNG(img) }
+      : { width: img.width, height: img.height, data: img.data };
     if (last)
       out.pathtrace = {
         samples: last.samples,
@@ -184,6 +194,21 @@ export class RenderEngine {
         stopped: last.samples < last.total ? 'time' : 'done',
       };
     return out;
+  }
+
+  /** Denoises (optionally) and tone maps the mean film of a path traced render. */
+  finish(film: FilmBuffers, o: FinishOptions): ImageResult {
+    const linear = o.denoise ? denoiseFilm(film) : film.color;
+    const data = filmToRGBA8(
+      linear,
+      film.width,
+      film.height,
+      o.exposure,
+      o.viewTransform,
+      o.displayBackground,
+    );
+    const img = { width: film.width, height: film.height, data };
+    return o.png ? { width: img.width, height: img.height, png: encodePNG(img) } : img;
   }
 
   /**
@@ -203,7 +228,9 @@ export class RenderEngine {
     let any = false;
     for (const i of sampleFrameIndices(frames.length, AUTO_VIEW_SAMPLES)) {
       const scene = i === 0 ? first : evaluator.evaluate(frames[i], { forRender: true });
-      const b = evaluatedBounds(renderItems(scene, { forRender: true }).filter((o) => o.mesh.faces.length > 0));
+      const b = evaluatedBounds(
+        renderItems(scene, { forRender: true }).filter((o) => o.mesh.faces.length > 0),
+      );
       if (b && b.min.every(Number.isFinite) && b.max.every(Number.isFinite)) {
         for (let k = 0; k < 3; k++) {
           min[k] = Math.min(min[k], b.min[k]);

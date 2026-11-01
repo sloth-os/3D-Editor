@@ -33,9 +33,14 @@ port.on('message', (msg: WorkerRequest) => {
         reply(msg.id, tile, pathTileTransferables(tile));
         break;
       }
-      case 'image': {
-        const img = engine.image(msg.doc, msg.options);
-        reply(msg.id, img, [img.data.buffer as ArrayBuffer]);
+      case 'image':
+      case 'finish': {
+        const img =
+          msg.type === 'image'
+            ? engine.image(msg.doc, msg.options, msg.png)
+            : engine.finish(msg.film, msg.options);
+        const buffer = img.png?.buffer ?? img.data?.buffer;
+        reply(msg.id, img, buffer ? [buffer as ArrayBuffer] : []);
         break;
       }
       case 'auto-view':

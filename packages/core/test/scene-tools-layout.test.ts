@@ -16,6 +16,7 @@ import {
   boundsGap,
   boundsValue,
   computeDrop,
+  decomposeCompatible,
   distributeDeltas,
   emptyBounds,
   extendBounds,
@@ -315,7 +316,11 @@ describe('computeDrop', () => {
     expect(up.target).toBeNull();
     expectVec(up.normal, [0, 0, 1]);
     expect(computeDrop(box([0, 0, 5]), null, none, false)).toBeNull();
-    expect(computeDrop(box([0, 0, -5]), null, none, true)).toBeNull(); // entirely below the plane
+    // entirely below the plane: lifted onto it (the plane is ground everywhere, like a terrain)
+    const below = computeDrop(box([0, 0, -5]), null, none, true)!;
+    expect(below.dz).toBeCloseTo(5.5, 12);
+    expect(below.target).toBeNull();
+    expect(computeDrop(box([0, 0, -5]), null, none, false)).toBeNull();
   });
 
   it('rests on the first surface below the top of the geometry, ignoring surfaces above it', () => {
@@ -387,5 +392,185 @@ describe('meshDistance', () => {
     };
     expect(meshDistance(a, cone)!.distance).toBeCloseTo(0.25, 9);
     expect(meshDistance(a, { mesh: createMesh(), matrix: I })).toBeNull();
+  });
+});
+
+describe('review regressions: buried drops, exact distances, mirrored sampling, compatible eulers', () => {
+  const box = (at: Vec3, size = 1) => worldPoints(createCube({ size }), compose4(at, [0, 0, 0], [1, 1, 1]));
+  const geometry = (at: Vec3, size = 1) =>
+    new SceneRaycaster([target(createCube({ size }), compose4(at, [0, 0, 0], [1, 1, 1]), 'self')]);
+
+  it('lifts geometry buried under an up-facing surface onto it (nothing below but the ground plane)', () => {
+    // an open terrain-like sheet at z = 2 over a box at z = 0..1: the box is under the ground
+    const sheet = target(
+      createGrid({ x_subdivisions: 4, y_subdivisions: 4, size: 20 }),
+      compose4([0, 0, 2], [0, 0, 0], [1, 1, 1]),
+      'sheet',
+    );
+    const rc = new SceneRaycaster([sheet]);
+    const r = computeDrop(box([0, 0, 0.5]), geometry([0, 0, 0.5]), rc, true)!;
+    expect(r.target!.id).toBe('sheet');
+    expect(r.dz).toBeCloseTo(2, 9);
+    expectVec(r.normal, [0, 0, 1]);
+    // a box inside a closed solid leaves it through its top (not through its floor)
+    const solid = target(createCube({ size: 4 }), compose4([0, 0, 0], [0, 0, 0], [1, 1, 1]), 'solid');
+    const inside = computeDrop(box([0, 0, -1]), geometry([0, 0, -1]), new SceneRaycaster([solid]), true)!;
+    expect(inside.target!.id).toBe('solid');
+    expect(inside.dz).toBeCloseTo(2 - -1.5, 9);
+    // under a closed table top (its underside faces down) the box still drops to the ground plane
+    const top = target(createCube({ size: 2 }), compose4([0, 0, 3], [0, 0, 0], [1, 1, 0.1]), 'top');
+    const under = computeDrop(box([0, 0, 1]), geometry([0, 0, 1]), new SceneRaycaster([top]), true)!;
+    expect(under.target).toBeNull();
+    expect(under.dz).toBeCloseTo(-0.5, 9);
+  });
+
+  it('a lifted object also clears peaks of the surface between its own vertices', () => {
+    // a 2 m tall box buried under an open sheet at z = 3, with a spike (tip z = 4) rising through
+    // the sheet in the middle of its footprint, between the box's vertices
+    const sheet = target(
+      createGrid({ x_subdivisions: 1, y_subdivisions: 1, size: 20 }),
+      compose4([0, 0, 3], [0, 0, 0], [1, 1, 1]),
+      'sheet',
+    );
+    const spike = target(
+      createCone({ radius1: 0.5, radius2: 0, depth: 2, vertices: 8 }),
+      compose4([0, 0, 3], [0, 0, 0], [1, 1, 1]),
+      'spike',
+    );
+    const m = compose4([0, 0, 1], [0, 0, 0], [4, 4, 2]);
+    const geo = new SceneRaycaster([target(createCube({ size: 1 }), m, 'self')]);
+    const r = computeDrop(
+      worldPoints(createCube({ size: 1 }), m),
+      geo,
+      new SceneRaycaster([sheet, spike]),
+      true,
+    )!;
+    // lifting onto the sheet (+3) brings the tip (above the box's original top) into reach: the
+    // box bottom (z = 0) has to rise onto the tip (z = 4)
+    expect(r.dz).toBeCloseTo(4, 9);
+    expect(r.target!.id).toBe('spike');
+  });
+
+  it('meshDistance is exact for edge-edge and edge-face closest features', () => {
+    const beamX = { mesh: createCube({ size: 2 }), matrix: compose4([0, 0, 0], [0, 0, 0], [5, 0.1, 0.1]) };
+    const beamY = { mesh: createCube({ size: 2 }), matrix: compose4([0, 0, 0.5], [0, 0, 0], [0.1, 5, 0.1]) };
+    const d = meshDistance(beamX, beamY)!;
+    expect(d.distance).toBeCloseTo(0.3, 12);
+    expect(d.intersecting).toBe(false);
+    expect(d.pointA[2]).toBeCloseTo(0.1, 12);
+    expect(d.pointB[2]).toBeCloseTo(0.4, 12);
+    expect(Math.abs(d.pointA[0])).toBeLessThanOrEqual(0.1 + 1e-12);
+    expect(Math.abs(d.pointA[1])).toBeLessThanOrEqual(0.1 + 1e-12);
+    // skew edges of two cubes rotated 45° about different axes: only edge-edge pairs are closest
+    const c1 = { mesh: createCube({ size: 1 }), matrix: compose4([0, 0, 0], [Math.PI / 4, 0, 0], [1, 1, 1]) };
+    const c2 = { mesh: createCube({ size: 1 }), matrix: compose4([0, 0, 2], [0, Math.PI / 4, 0], [1, 1, 1]) };
+    expect(meshDistance(c1, c2)!.distance).toBeCloseTo(2 - Math.SQRT2, 12);
+    // touching (stacked) is 0 but not intersecting; overlapping is intersecting
+    const stacked = { mesh: createCube({ size: 1 }), matrix: compose4([0.2, 0.1, 1], [0, 0, 0], [1, 1, 1]) };
+    const base = { mesh: createCube({ size: 1 }), matrix: I };
+    expect(meshDistance(base, stacked)).toMatchObject({ distance: 0, intersecting: false });
+    const sunk = { mesh: createCube({ size: 1 }), matrix: compose4([0.2, 0.1, 0.9], [0, 0, 0], [1, 1, 1]) };
+    expect(meshDistance(base, sunk)).toMatchObject({ distance: 0, intersecting: true });
+    // several parts (e.g. the instances of a collection) count as one surface
+    const pair = meshDistance(
+      [base, { mesh: createCube({ size: 1 }), matrix: compose4([10, 0, 0], [0, 0, 0], [1, 1, 1]) }],
+      {
+        mesh: createCube({ size: 1 }),
+        matrix: compose4([12, 0, 0], [0, 0, 0], [1, 1, 1]),
+      },
+    )!;
+    expect(pair.distance).toBeCloseTo(1, 12);
+  });
+
+  it('meshDistance agrees with a dense point sampling of both surfaces (random poses)', () => {
+    const samplePoints = (mesh: MeshData, m: Mat4, n: number) =>
+      sampleSurface(mesh, m, n, 5).map((s) => s.point);
+    let seed = 1;
+    const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1;
+    for (let trial = 0; trial < 6; trial++) {
+      const a = {
+        mesh: createCube({ size: 1 }),
+        matrix: compose4([0, 0, 0], [rnd() * 3, rnd() * 3, rnd() * 3], [1, 0.6, 1.4]),
+      };
+      const b = {
+        mesh: createCone({ radius1: 0.5, radius2: 0.1, depth: 1, vertices: 12 }),
+        matrix: compose4(
+          [1.6 + rnd() * 0.3, rnd() * 0.3, rnd() * 0.3],
+          [rnd() * 3, rnd() * 3, rnd() * 3],
+          [1, 1, 1],
+        ),
+      };
+      const d = meshDistance(a, b)!;
+      const pa = samplePoints(a.mesh, a.matrix, 4000);
+      const pb = samplePoints(b.mesh, b.matrix, 4000);
+      let sampled = Infinity;
+      for (const p of pa)
+        for (const q of pb) sampled = Math.min(sampled, Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]));
+      // exact distance never exceeds what any sampled pair achieves, and the samples come close
+      expect(d.distance).toBeLessThanOrEqual(sampled + 1e-9);
+      expect(d.distance).toBeGreaterThan(sampled - 0.08);
+      // the reported closest points are on the surfaces and that far apart
+      expect(Math.hypot(...([0, 1, 2].map((k) => d.pointA[k] - d.pointB[k]) as Vec3))).toBeCloseTo(
+        d.distance,
+        9,
+      );
+    }
+  }, 30_000);
+
+  it('samples mirrored (negative scale) surfaces with outward normals', () => {
+    const grid = createGrid({ x_subdivisions: 2, y_subdivisions: 2, size: 10 });
+    for (const scale of [
+      [-1, 1, 1],
+      [1, -2, 1],
+      [-1, -1, -1],
+    ] as Vec3[]) {
+      const m = compose4([0, 0, 1], [0, 0, 0], scale);
+      const up = scale[2] < 0 ? -1 : 1; // a Z-mirror really turns the plane upside down
+      const pts = sampleSurface(grid, m, 20, 2, { maxSlope: 0.5 });
+      expect(pts).toHaveLength(up > 0 ? 20 : 0);
+      for (const s of sampleSurface(grid, m, 20, 2)) expectVec(s.normal, [0, 0, up]);
+    }
+  });
+
+  it('decomposeCompatible keeps eulers continuous and mirrored axes mirrored', () => {
+    const deg = Math.PI / 180;
+    // a rotation of -170° about Z close to a previous 170°: 190° (no jump of almost a full turn)
+    const m = compose4([1, 2, 3], [0, 0, -170 * deg], [2, 2, 2]);
+    const d = decomposeCompatible(m, [0, 0, 170 * deg], [1, 1, 1])!;
+    expectVec(d.rotation, [0, 0, 190 * deg], 12);
+    expectVec(d.location, [1, 2, 3], 12);
+    expectVec(d.scale, [2, 2, 2], 12);
+    // the result recomposes to the same matrix, also for mirrored ones keeping the mirrored axis
+    for (const [rot, scale, prev] of [
+      [
+        [0.3, -0.4, 2.9],
+        [-1, 2, 0.5],
+        [-1, 1, 1],
+      ],
+      [
+        [0.3, -0.4, 2.9],
+        [1, -2, 0.5],
+        [1, -1, 1],
+      ],
+      [
+        [1.2, 0.2, -3],
+        [-1, -2, 0.5],
+        [-1, -1, 1],
+      ],
+    ] as [Vec3, Vec3, Vec3][]) {
+      const mm = compose4([0, 0, 0], rot, scale);
+      const r = decomposeCompatible(mm, rot, prev)!;
+      expect(r.scale.map(Math.sign)).toEqual(prev.map(Math.sign));
+      const back = compose4(r.location, r.rotation, r.scale);
+      back.forEach((v, i) => expect(v).toBeCloseTo(mm[i], 10));
+    }
+    // mirroring appearing or disappearing flips the first negative axis, else X
+    const mirrored = compose4([0, 0, 0], [0, 0, 0], [-1, 1, 1]);
+    expect(decomposeCompatible(mirrored, [0, 0, 0], [1, 1, 1])!.scale).toEqual([-1, 1, 1]);
+    expect(decomposeCompatible(I, [0, 0, 0], [1, -1, 1])!.scale).toEqual([1, 1, 1]);
+    expect(
+      decomposeCompatible([0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], [0, 0, 0], [1, 1, 1]),
+    ).toBeNull();
+    expect(determinant4(m)).toBeGreaterThan(0);
   });
 });

@@ -89,7 +89,42 @@ export const Icons = {
     'M5 8V3.5a1 1 0 0 1 2 0V7M7 6.5V2.5a1 1 0 0 1 2 0V7M9 6.5V3.5a1 1 0 0 1 2 0V8M11 7a1 1 0 0 1 2 0v3a4.5 4.5 0 0 1-4.5 4.5H8A4 4 0 0 1 4.6 12.6L2.8 9.6a1 1 0 0 1 1.7-1L5 9.5',
   ),
   info: P('M8 1.5a6.5 6.5 0 1 1 0 13 6.5 6.5 0 0 1 0-13zM8 7v4.5M8 4.5v.5'),
+  /** Curve object (Bezier with handles). */
+  curve: P(
+    `M2.5 13C3.5 5 12.5 11 13.5 3M1.5 9.5l2 1M11.5 2.5l3 1${circle(2.5, 13, 0.8)}${circle(13.5, 3, 0.8)}`,
+  ),
+  /** Text (FONT) object. */
+  font: P('M3 4.5V3h10v1.5M8 3v10M6 13h4'),
+  /** Armature object (rig). */
+  armature: P(`${circle(8, 3.5, 1.5)}M8 5v4.5M4.5 7h7M8 9.5 5.5 14M8 9.5l2.5 4.5`),
+  /** Bone (octahedral). */
+  bone: P('M3 13 4.2 8.8 13 3 7.2 11.8zM4.2 8.8l3 3'),
+  /** Object constraint. */
+  constraint: P('M2.5 8.5h5v5h-5zM8.5 2.5h5v5h-5zM7.5 8.5l1-1'),
+  /** Particle system. */
+  particles: P(
+    circle(4, 4.5, 1.2) +
+      circle(11.5, 3.5, 1.2) +
+      circle(7.5, 8, 1.2) +
+      circle(3.5, 12, 1.2) +
+      circle(12, 11.5, 1.2),
+  ),
+  /** Physics (rigid body). */
+  physics: P(`${circle(10, 8.5, 3.5)}M1.5 6h4M1 8.5h4M1.5 11h4`),
+  /** Driver (function of other properties). */
+  driver: P('M10.5 2.5c-2 0-2.6 1.4-2.8 3L6.4 12.6c-.2 1.3-1 1.9-2.4 1.9M5 6.5h5.5'),
+  /** Empty instancing a collection. */
+  collectionInstance: P('M2 4h5l1 1.5h6V13H2zM6 11l4-4M7.5 7H10v2.5'),
+  /** F-curve modifier. */
+  fmodifier: P('M1.5 9c1.5-5 3-5 4.5 0s3 5 4.5 0 2.5-4 4-3'),
+  /** Warning (evaluation problem). */
+  warning: P('M8 2 14.5 13.5h-13zM8 6.5V10M8 12v.3'),
 };
+
+/** SVG path data of a circle (two arcs), for composing icons. */
+function circle(cx: number, cy: number, r: number): string {
+  return `M${cx - r} ${cy}a${r} ${r} 0 1 0 ${2 * r} 0a${r} ${r} 0 1 0 ${-2 * r} 0`;
+}
 
 export type IconName = keyof typeof Icons;
 

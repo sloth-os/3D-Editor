@@ -39,7 +39,11 @@ export interface PathTracerSettings {
   mistColor: [number, number, number];
   /** Denoise in `resolve()` by default (default true). */
   denoise: boolean;
-  /** Wall-clock budget of `render()` in seconds (0 = none; at least one sample is always rendered). */
+  /**
+   * Wall-clock budget of `render()` in seconds (0 = none). The first sample of every pixel is
+   * always rendered; after that passes shrink to what still fits, and a pass that overruns its
+   * estimate stops between bands of rows.
+   */
   timeLimit: number;
 }
 
@@ -75,7 +79,10 @@ export function pathTracerSettings(
     height: Math.max(1, Math.floor(fin(s.height, 1))),
     samples: Math.max(1, Math.min(1 << 20, Math.floor(fin(s.samples, 64)))),
     maxBounces,
-    maxTransmissionBounces: Math.max(0, Math.min(1024, Math.floor(fin(s.maxTransmissionBounces, maxBounces)))),
+    maxTransmissionBounces: Math.max(
+      0,
+      Math.min(1024, Math.floor(fin(s.maxTransmissionBounces, maxBounces))),
+    ),
     clampIndirect: Math.max(0, fin(s.clampIndirect, 10)),
     filterGlossy: Math.max(0, fin(s.filterGlossy, 1)),
     seed: Math.floor(fin(s.seed, 0)) >>> 0,
@@ -221,9 +228,15 @@ export class PathTracer {
 
   /**
    * Progressive render into the film until `samples` per pixel (default `settings.samples`), the
-   * time limit or a cancellation (`onProgress` returning false). Passes double in size (1, 2, 4,
-   * 8, then 16 samples per pass), every pass covers the whole image (in bands of rows), and the
-   * time limit is checked between passes using the last pass's speed.
+   * time limit or a cancellation (`onProgress` returning false, asked after every pass). Passes
+   * double in size (1, 2, 4, 8, then 16 samples per pass) and every pass covers the whole image in
+   * bands of rows, each band continuing from its own sample count (so a film with unevenly
+   * sampled rows is evened out first).
+   *
+   * Time limit: the first pass (one sample per pixel) always completes. Every later pass renders
+   * at most as many samples as the measured speed says still fit, and stops between bands once
+   * the limit is reached (the bands done keep their extra samples). `samples` of the result is the
+   * smallest number of samples of any pixel.
    */
   render(
     samples = this.settings.samples,
@@ -236,22 +249,37 @@ export class PathTracer {
     let done = this.film.samples;
     let pass = 1;
     let stopped: PathTraceStats['stopped'] = 'done';
-    let lastPassMs = 0;
-    let lastPassSamples = 0;
+    /** Measured wall time of one sample per pixel over the whole image (0 = unknown). */
+    let msPerSample = 0;
     while (done < total) {
-      const count = Math.min(pass, total - done);
-      if (limit > 0 && done > 0 && lastPassSamples > 0) {
-        const estimate = (lastPassMs / lastPassSamples) * count;
-        if (now() - t0 + estimate > limit) {
+      let count = Math.min(pass, total - done);
+      const timed = limit > 0 && done > 0;
+      if (timed && msPerSample > 0) {
+        const fit = Math.floor((limit - (now() - t0)) / msPerSample);
+        if (fit < 1) {
           stopped = 'time';
           break;
         }
+        if (fit < count) count = fit;
       }
+      const target = done + count;
       const tp = now();
-      for (let y = 0; y < H; y += BAND_ROWS) this.film.add(this.renderRows(y, y + BAND_ROWS, done, count));
-      lastPassMs = now() - tp;
-      lastPassSamples = count;
-      done += count;
+      let rendered = 0;
+      let complete = true;
+      for (let y = 0; y < H; y += BAND_ROWS) {
+        if (timed && y > 0 && now() - t0 >= limit) {
+          complete = false;
+          break;
+        }
+        rendered += this.renderBand(y, Math.min(H, y + BAND_ROWS), target);
+      }
+      if (!complete) {
+        stopped = 'time';
+        break;
+      }
+      // speed of this pass in samples per pixel over the whole image
+      if (rendered > 0) msPerSample = ((now() - tp) * H) / rendered;
+      done = target;
       pass = Math.min(pass * 2, 16);
       if (onProgress && onProgress({ samples: done, total, elapsed: now() - t0 }) === false) {
         stopped = done < total ? 'cancelled' : 'done';
@@ -262,7 +290,28 @@ export class PathTracer {
         break;
       }
     }
-    return { samples: done, elapsed: now() - t0, stopped };
+    return { samples: this.film.samples, elapsed: now() - t0, stopped };
+  }
+
+  /**
+   * Brings rows [y0, y1) of the film up to `target` samples (runs of rows with equal counts share
+   * a tile) and returns the number of row-samples rendered.
+   */
+  private renderBand(y0: number, y1: number, target: number): number {
+    const counts = this.film.rowSamples;
+    let rendered = 0;
+    let y = y0;
+    while (y < y1) {
+      const start = counts[y];
+      let end = y + 1;
+      while (end < y1 && counts[end] === start) end++;
+      if (start < target) {
+        this.film.add(this.renderRows(y, end, start, target - start));
+        rendered += (end - y) * (target - start);
+      }
+      y = end;
+    }
+    return rendered;
   }
 
   /** Mean image: linear premultiplied rgba, denoised when `denoise` (default: settings.denoise). */

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   SceneDoc,
   createCube,
@@ -117,6 +117,49 @@ describe('path tracer: refraction and reflection', () => {
     expect(inLeft[0]).toBeLessThan(0.1);
     expect(inRight[0]).toBeGreaterThan(0.75);
     expect(inRight[2]).toBeLessThan(0.1);
+  });
+
+  it('counts refractions against max_bounces like Blender’s total (0 = direct light only)', () => {
+    // regression: refractions had their own limit of max(8, max_bounces), so glass stayed
+    // transparent at max_bounces 0
+    const doc = blackWorld();
+    plane(doc, 'Backdrop', 20, emissive(doc, [1, 1, 1]), {
+      location: [0, 5, 0],
+      rotation: [Math.PI / 2, 0, 0],
+    });
+    const ball = createUVSphere({ segments: 48, ring_count: 24 });
+    ball.faceSmooth = ball.faceSmooth.map(() => true);
+    const glass = doc.addMaterial({ base_color: [1, 1, 1, 1], transmission: 1, roughness: 0, ior: 1.45 });
+    doc.addObject({ type: 'MESH', name: 'Ball', data: doc.addMesh('Ball', ball), material_slots: [glass] });
+    const view = {
+      position: [0, -5, 0] as [number, number, number],
+      target: [0, 0, 0] as [number, number, number],
+    };
+    const through = (maxBounces: number) =>
+      mean(
+        traceLinear(doc, { width: 16, height: 16, samples: 16, maxBounces, view: { ...view, fovY: 0.3 } })
+          .img,
+        16,
+        6,
+        6,
+        10,
+        10,
+      )[0];
+    // 0: the refracted ray may only find light at the next surface (the ball's back: none)
+    expect(through(0)).toBeLessThan(0.02);
+    // 1: in through the front and out through the back reaches the backdrop (minus Fresnel)
+    const one = through(1);
+    expect(one).toBeGreaterThan(0.85);
+    expect(through(4)).toBeCloseTo(one, 6);
+    // an explicit, lower transmission limit applies within the total
+    const tracer = tracerFor(doc, {
+      width: 16,
+      height: 16,
+      samples: 16,
+      maxBounces: 4,
+      view: { ...view, fovY: 0.3 },
+    });
+    expect(tracer.settings.maxTransmissionBounces).toBe(4);
   });
 
   it('a polished metal mirror reflects emitters tinted by its base colour', () => {
@@ -548,7 +591,12 @@ describe('path tracer: transparency, culling and film', () => {
       const white = lambert(doc);
       const cube = createCube({ size: 2 });
       if (smooth) cube.faceSmooth = cube.faceSmooth.map(() => true);
-      doc.addObject({ type: 'MESH', name: 'Table', data: doc.addMesh('Table', cube), material_slots: [white] });
+      doc.addObject({
+        type: 'MESH',
+        name: 'Table',
+        data: doc.addMesh('Table', cube),
+        material_slots: [white],
+      });
       doc.addObject({
         type: 'MESH',
         name: 'Box',
@@ -573,12 +621,15 @@ describe('path tracer: transparency, culling and film', () => {
     expect(flat.shadow).toBeLessThan(0.02 * flat.lit);
     expect(smooth.lit).toBeGreaterThan(0.3);
     expect(smooth.shadow).toBeLessThan(0.02 * smooth.lit);
-    // the offset fades in only for light within ~6° of the facet plane (Cycles' cutoff 0.1)
+    // the offset fades in only for light grazing the facet (Cycles' shadow_ray_offset, cutoff 0.1)
     expect(terminatorAmount(Math.SQRT1_2, Math.SQRT1_2)).toBe(0);
-    expect(terminatorAmount(0.1, 0)).toBe(0);
+    expect(terminatorAmount(Math.SQRT1_2, 0.02)).toBe(0);
     expect(terminatorAmount(0.02, 0.05)).toBe(1);
+    expect(terminatorAmount(0.1, 0)).toBe(1);
+    expect(terminatorAmount(0.15, 0.02)).toBeCloseTo(0.3, 12);
     expect(terminatorAmount(0.05, 0.1)).toBeCloseTo(0.5, 12);
-    expect(terminatorAmount(0.05, 0.3)).toBe(0);
+    expect(terminatorAmount(0.05, 0.3)).toBeCloseTo(0.5, 12);
+    expect(terminatorAmount(0.12, 0.3)).toBe(0);
     expect(terminatorAmount(NaN, 0)).toBe(0);
   });
 
@@ -908,5 +959,102 @@ describe('path tracer: robustness', () => {
     expect(calls).toBe(3);
     expect(cs.stopped).toBe('cancelled');
     expect(c.film.samples).toBe(1 + 2 + 4);
+  });
+
+  /**
+   * Runs `fn` on a virtual clock: `performance.now()` only advances while rows are rendered, by
+   * `cost.ms` per row and sample. Returns the renderRows calls (y0, y1, sampleStart, count).
+   */
+  function onVirtualClock(cost: { ms: number }, fn: (clock: () => number) => void): number[][] {
+    let clock = 0;
+    const calls: number[][] = [];
+    const renderRows = PathTracer.prototype.renderRows;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    const rowsSpy = vi.spyOn(PathTracer.prototype, 'renderRows').mockImplementation(function (
+      this: PathTracer,
+      y0: number,
+      y1: number,
+      s0: number,
+      n: number,
+    ) {
+      calls.push([y0, y1, s0, n]);
+      clock += (Math.min(y1, this.settings.height) - y0) * n * cost.ms;
+      return renderRows.call(this, y0, y1, s0, n);
+    });
+    try {
+      fn(() => clock);
+    } finally {
+      nowSpy.mockRestore();
+      rowsSpy.mockRestore();
+    }
+    return calls;
+  }
+
+  it('shrinks the last pass to the time left and stops between bands when a pass overruns', () => {
+    // regression: the limit was checked only between whole passes (doubling up to 16 samples)
+    const doc = SceneDoc.create();
+    // 32 rows (two bands) at 1 ms per row and sample: one sample per pixel takes 32 ms
+    const cost = { ms: 1 };
+    onVirtualClock(cost, (clock) => {
+      const t = tracerFor(doc, { width: 4, height: 32, samples: 64, options: { time_limit: 0.13 } });
+      const stats = t.render();
+      // passes 1 + 2 = 96 ms; the next pass (4 samples, 128 ms) is cut to the 1 that still fits
+      expect(stats).toMatchObject({ samples: 4, stopped: 'time' });
+      expect(clock()).toBe(128);
+    });
+    // the speed drops 5× after the first pass: the pass stops after its first band
+    cost.ms = 1;
+    const calls = onVirtualClock(cost, (clock) => {
+      const t = tracerFor(doc, { width: 4, height: 32, samples: 64, options: { time_limit: 0.13 } });
+      const stats = t.render(undefined, () => {
+        cost.ms = 5;
+      });
+      expect(stats).toMatchObject({ samples: 1, stopped: 'time' });
+      expect(clock()).toBe(32 + 16 * 2 * 5);
+      expect([...t.film.rowSamples]).toEqual([...Array(16).fill(3), ...Array(16).fill(1)]);
+      // a further render continues every band from its own count (no sample index twice)
+      cost.ms = 1;
+      expect(t.render(4)).toMatchObject({ samples: 4, stopped: 'done' });
+      expect([...t.film.rowSamples]).toEqual(Array(32).fill(4));
+    });
+    expect(calls).toEqual([
+      [0, 16, 0, 1],
+      [16, 32, 0, 1],
+      [0, 16, 1, 2],
+      // render(4): pass to 2 samples (rows 0–15 already have 3), then to 4
+      [16, 32, 1, 1],
+      [0, 16, 3, 1],
+      [16, 32, 2, 2],
+    ]);
+  });
+
+  it('reserves time for denoising within the time limit of renderPathTracedImage', () => {
+    // regression: denoising and the display conversion ran after the budget was used up
+    const doc = SceneDoc.create();
+    const ev = new SceneEvaluator(doc).evaluate(1, { forRender: true });
+    const cam = ev.activeCamera!;
+    const render = (denoise: boolean, time_limit: number) => {
+      let samples = 0;
+      onVirtualClock({ ms: 0.25 }, () => {
+        samples = renderPathTracedImage({
+          scene: ev,
+          items: renderItems(ev, { forRender: true }),
+          view: viewFromCamera(cam.camera!, cam.worldMatrix, 200 / 16),
+          camera: cam.camera!,
+          width: 200,
+          height: 16,
+          images: { get: () => null },
+          options: { samples: 8, denoise, time_limit },
+        }).stats.samples;
+      });
+      return samples;
+    };
+    // a sample per pixel takes 4 ms (virtual); denoising 3200 pixels takes a few milliseconds
+    expect(render(false, 0)).toBe(8);
+    const plain = render(false, 0.012);
+    const denoised = render(true, 0.012);
+    expect(plain).toBeGreaterThan(1);
+    expect(denoised).toBeGreaterThanOrEqual(1);
+    expect(denoised).toBeLessThan(plain);
   });
 });

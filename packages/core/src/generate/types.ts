@@ -23,22 +23,27 @@ export interface GeneratorResult {
   warnings?: string[];
 }
 
-/** Most faces (and vertices) one generated mesh may have. */
+/** Most faces one generated mesh may have. */
 export const MAX_GENERATED_FACES = 1_000_000;
+
+/** Most vertices one generated mesh may have (window and frame details need many per face). */
+export const MAX_GENERATED_VERTICES = 2 * MAX_GENERATED_FACES;
 
 /**
  * Thrown by generators when the requested mesh would exceed `MAX_GENERATED_FACES` faces or
- * vertices (detected before or while building it, so huge requests fail fast).
+ * `MAX_GENERATED_VERTICES` vertices (detected before or while building it, so huge requests fail
+ * fast instead of exhausting time and memory).
  */
 export class GeneratorLimitError extends Error {
   constructor(
-    /** Estimated faces of the requested mesh, or null when the limit was hit while building it. */
+    /** Estimated count of the requested mesh, or null when the limit was hit while building it. */
     readonly estimate: number | null,
     readonly limit = MAX_GENERATED_FACES,
+    readonly what: 'faces' | 'vertices' = 'faces',
   ) {
     const n = (v: number) => Math.round(v).toLocaleString('en-US');
     super(
-      `the mesh would have ${estimate === null ? `more than ${n(limit)}` : `about ${n(estimate)}`} faces ` +
+      `the mesh would have ${estimate === null ? `more than ${n(limit)}` : `about ${n(estimate)}`} ${what} ` +
         `(limit ${n(limit)})`,
     );
     this.name = 'GeneratorLimitError';

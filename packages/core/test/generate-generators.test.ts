@@ -664,8 +664,24 @@ describe('generators survive degenerate input', () => {
         ] as G.PipeParams['points'],
       }).mesh.faces.length,
     ).toBeGreaterThan(0);
-    // a fence with a single point falls back to a straight run
-    expectValid(G.generateFence({ points: [[0, 0]] }));
+    // a fence path without 2 distinct [x, y] positions builds nothing and says why (it never
+    // silently falls back to the default straight run somewhere else)
+    for (const points of [
+      [[0, 0]],
+      [
+        [2, 2, 0],
+        [2, 2, 1],
+      ],
+      [
+        [NaN, 0],
+        [1, 1],
+      ],
+    ]) {
+      const single = G.generateFence({ points });
+      expect(single.mesh.faces).toHaveLength(0);
+      expect(single.warnings?.join(' ')).toMatch(/at least 2 points at distinct \[x, y\] positions/);
+    }
+    expectValid(G.generateFence({ points: [] })); // no points: the straight run of `length`
     expectValid(
       G.generateFence({
         points: [
@@ -928,5 +944,175 @@ describe('generator building blocks', () => {
     const m = b.build();
     expect(G.signedVolume(m)).toBeCloseTo(1, 12);
     expect(G.surfaceArea(m)).toBeCloseTo(6, 12);
+  });
+});
+
+describe('size limits, big meshes and degenerate input (review regressions)', () => {
+  it('huge path and branch counts no longer overflow the call stack (no Math.max(...array))', () => {
+    // 128k wire rings: Math.max(...rings) in addRingSurface used to throw RangeError
+    const spring = G.generateSpring({ turns: 500, resolution: 256, wire_segments: 3 });
+    expect(spring.mesh.faces.length).toBe(128000 * 3 + 2);
+    expect(bounds(spring.mesh).max[2]).toBeCloseTo(G.SPRING_DEFAULTS.height, 9);
+    // ~36k limbs, ~150k skeleton elements: fitHeight spread them into Math.max
+    const tree = G.generateTree({ branch_levels: 4, branches: 12, leaf_density: 0, resolution: 3 });
+    expect(tree.mesh.faces.length).toBeGreaterThan(300_000);
+    expect(bounds(tree.mesh).max[2]).toBeCloseTo(G.TREE_DEFAULTS.height, 6);
+    // a lathe/ring surface with more rings than the stack allows arguments
+    const b = new G.MeshBuilder();
+    const rings = Array.from({ length: 150_000 }, (_, i): [number, number, number][] => [
+      [1, 0, i * 1e-3],
+      [-0.5, 0.8, i * 1e-3],
+      [-0.5, -0.8, i * 1e-3],
+    ]);
+    G.addRingSurface(b, rings, { capStart: true, capEnd: true });
+    expect(b.faceCount).toBe(149_999 * 3 + 2);
+  }, 60_000);
+
+  it('meshes over the face limit fail fast with GeneratorLimitError (estimated before building)', () => {
+    const zigzag = Array.from({ length: 2000 }, (_, i): [number, number, number] => [
+      Math.floor((i + 1) / 2),
+      Math.floor(i / 2),
+      0,
+    ]);
+    const cases: [string, () => G.GeneratorResult][] = [
+      ['spring', () => G.generateSpring({ turns: 500, resolution: 256 })],
+      ['pipe', () => G.generatePipe({ points: zigzag, bend_segments: 64 })],
+      ['tree', () => G.generateTree({ branch_levels: 4, branches: 8, leaf_density: 1 })],
+      ['building', () => G.generateBuilding({ floors: 200, width: 1000, depth: 1000 })],
+      [
+        'fence',
+        () =>
+          G.generateFence({
+            points: [
+              [0, 0],
+              [1e9, 0],
+            ],
+            post_spacing: 0.1,
+          }),
+      ],
+    ];
+    for (const [name, fn] of cases) {
+      const t0 = performance.now();
+      let err: unknown = null;
+      try {
+        fn();
+      } catch (e) {
+        err = e;
+      }
+      expect(err, name).toBeInstanceOf(G.GeneratorLimitError);
+      expect((err as G.GeneratorLimitError).estimate, name).toBeGreaterThan(G.MAX_GENERATED_FACES);
+      expect((err as Error).message).toMatch(/^the mesh would have about [\d,]+ faces \(limit 1,000,000\)$/);
+      // the old code ran for seconds (or forever) before failing or producing millions of faces
+      expect(performance.now() - t0, name).toBeLessThan(5000);
+    }
+    // the builder itself enforces the limits for anything an estimate misses
+    const small = new G.MeshBuilder(2, 4);
+    const v = [0, 1, 2, 3].map((i) => small.vert([i, i * i, 0]));
+    small.face([v[0], v[1], v[2]]);
+    small.face([v[1], v[2], v[3]]);
+    expect(() => small.face([v[0], v[2], v[3]])).toThrow(/more than 2 faces/);
+    expect(() => small.vert([9, 9, 9])).toThrow(/more than 4 vertices/);
+  });
+
+  it('big buildings look up their openings per cell and stay closed with every window', () => {
+    const r = G.generateBuilding({ floors: 12, width: 60, depth: 40, window_rows: 2, roof: 'FLAT' });
+    expectValid(r);
+    // front/back 24 columns, sides 16; 2 rows per storey; the door replaces the blocked windows
+    const glass = r.mesh.faceMaterials.filter((m) => m === 1).length;
+    const windows = (24 * 2 + 16 * 2) * 2 * 12;
+    expect(glass).toBeLessThan(windows);
+    expect(glass).toBeGreaterThan(windows - 6);
+    // 200 storeys × 40 columns per facade (8000 openings each) used to test every grid cell
+    // against every opening (~17 s); now it is a lookup
+    const t0 = performance.now();
+    const tall = G.generateBuilding({ floors: 200, width: 100, depth: 100 });
+    expect(tall.mesh.faces).toHaveLength(898_869); // the same mesh as before
+    expect(performance.now() - t0).toBeLessThan(15_000);
+  }, 30_000);
+
+  it('the block-culled sphere sampler polygonizes exactly like evaluating every sample', () => {
+    const rng = new G.Rng(7);
+    const spheres: G.BlobSphere[] = Array.from({ length: 24 }, () => ({
+      center: [rng.spread(1.5), rng.spread(1.5), rng.spread(1.5)] as [number, number, number],
+      radius: rng.range(0.15, 0.6),
+    }));
+    for (const [k, cut] of [
+      [0.35, null],
+      [0, null],
+      [0.2, 0.05],
+    ] as [number, number | null][]) {
+      const lo: [number, number, number] = [-2.3, -2.3, -2.3];
+      const hi: [number, number, number] = [2.3, 2.3, 2.3];
+      const cell = 4.6 / 40;
+      const fast = G.sampleSpheres(spheres, k, lo, hi, cell, cut);
+      const full = G.sampleGrid(
+        (x, y, z) => {
+          const d = G.blobDistance(spheres, k, x, y, z);
+          return cut === null ? d : -G.smoothMin(-d, z, cut);
+        },
+        lo,
+        hi,
+        cell,
+      );
+      expect([fast.nx, fast.ny, fast.nz]).toEqual([full.nx, full.ny, full.nz]);
+      // identical where a value can matter (within 1.5 cells of the surface), same side elsewhere
+      for (let i = 0; i < full.values.length; i++) {
+        const v = full.values[i];
+        if (Math.abs(v) <= 1.5 * cell) expect(fast.values[i]).toBeCloseTo(v, 12);
+        else expect(Math.sign(fast.values[i])).toBe(Math.sign(v));
+      }
+      expect(G.polygonize(fast)).toEqual(G.polygonize(full));
+    }
+    // the blend no longer depends on the order the spheres are listed in
+    const p: [number, number, number] = [0.1, -0.2, 0.3];
+    const d = G.blobDistance(spheres, 0.4, ...p);
+    expect(G.blobDistance(spheres.slice().reverse(), 0.4, ...p)).toBeCloseTo(d, 14);
+  });
+
+  it('dense blobs mesh in seconds, not tens of seconds', () => {
+    const t0 = performance.now();
+    const r = G.generateBlob({ count: 64, resolution: 120 });
+    expect(performance.now() - t0).toBeLessThan(8000);
+    expectValid(r);
+  }, 30_000);
+
+  it('inputs that cannot produce geometry return an empty mesh with the reason', () => {
+    const pipe = G.generatePipe({
+      points: [
+        [1, 1, 1],
+        [1, 1, 1],
+      ],
+    });
+    expect(pipe.mesh.faces).toHaveLength(0);
+    expect(pipe.warnings).toEqual([expect.stringMatching(/at least 2 distinct points .*got 1/)]);
+    // spheres far smaller than a grid cell (two 5 cm spheres 100 m apart at resolution 48)
+    const tiny = G.generateBlob({
+      spheres: [
+        { center: [0, 0, 0], radius: 0.05 },
+        { center: [100, 0, 0], radius: 0.05 },
+      ],
+    });
+    expect(tiny.mesh.faces).toHaveLength(0);
+    expect(tiny.warnings!.join()).toMatch(/too small for the marching-cubes grid: its cells are 2\.09\d* m/);
+    // one big sphere and one lost small one: meshed, with a warning about the small one
+    const partly = G.generateBlob({
+      spheres: [
+        { center: [0, 0, 0], radius: 2 },
+        { center: [40, 0, 0], radius: 0.2 },
+      ],
+      resolution: 24,
+    });
+    expect(partly.mesh.faces.length).toBeGreaterThan(0);
+    expect(partly.warnings).toEqual([expect.stringMatching(/^1 of 2 sphere\(s\) have a radius below/)]);
+    // ignored inputs are reported even when something is built
+    const fence = G.generateFence({
+      points: [
+        [0, 0],
+        [NaN, 1],
+        [3, 0],
+      ],
+    });
+    expect(fence.mesh.faces.length).toBeGreaterThan(0);
+    expect(fence.warnings).toEqual([expect.stringMatching(/ignored 1 point/)]);
   });
 });

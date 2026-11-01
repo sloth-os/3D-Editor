@@ -11,7 +11,8 @@ import {
   type WorldParams,
 } from './settings';
 import type { AnimTargetType, CollisionShape, DriverData, FCurve } from '../doc/types';
-import { Simulation, type BodyInput, type RigidBodyIssue } from './simulation';
+import { meshKey } from './mesh-key';
+import { Simulation, type BodyInput, type RigidBodyIssue, type SimulationOptions } from './simulation';
 
 export type { RigidBodyIssue } from './simulation';
 
@@ -52,11 +53,13 @@ export interface RigidBodyCacheInfo {
  * also tracks the local clock and deletions) tells whether the document may have changed. Only
  * then the inputs are re-read: rigid body and world settings, gravity, fps, the meshes (content
  * hash) and the transforms at frame_start form a signature, and a different signature starts a
- * new simulation. Animated (kinematic) bodies are compared frame by frame against the
- * transforms the cache was built with, up to the frame being evaluated; a difference re-runs
- * the simulation. That check is only repeated after edits that can change those transforms
- * (see `animationInputsKey`), so editing unrelated objects, materials or meshes at a late frame
- * does not re-evaluate every cached frame.
+ * new simulation. The new simulation reuses the collision shapes of the previous one whose
+ * inputs (mesh content, shape type, dynamics, exact scale) are unchanged (`shapeKey`), so an
+ * edit does not rebuild a dense MESH collider. Animated (kinematic) bodies are compared frame
+ * by frame against the transforms the cache was built with, up to the frame being evaluated; a
+ * difference re-runs the simulation. That check is only repeated after edits that can change
+ * those transforms (see `animationInputsKey`), so editing unrelated objects, materials or
+ * meshes at a late frame does not re-evaluate every cached frame.
  */
 
 interface CacheEntry {
@@ -68,7 +71,14 @@ interface CacheEntry {
   kinematicVerified: number;
   /** `animationInputsKey` of the animated bodies the verified frames were checked with. */
   kinematicKey: string;
+  /**
+   * Collision shapes the next simulation can reuse (by content key): the current simulation's,
+   * or the last ones built while the scene has no rigid bodies.
+   */
+  shapeSource: ShapeSource | null;
 }
+
+type ShapeSource = NonNullable<SimulationOptions['reuse']>;
 
 const caches = new WeakMap<object, CacheEntry>();
 const trackers = new WeakMap<object, { version: number }>();
@@ -94,43 +104,6 @@ function changeToken(doc: SceneDoc): string | null {
   let deletions = 0;
   for (const items of tr.deleteSet.clients.values()) deletions += items.length;
   return `${t.version}:${getState(y.store, y.clientID)}:${deletions}`;
-}
-
-const meshKeys = new WeakMap<MeshData, string>();
-
-/** Content hash of a mesh's vertex positions and faces (memoised per mesh instance). */
-function meshKey(mesh: MeshData): string {
-  let key = meshKeys.get(mesh);
-  if (key !== undefined) return key;
-  let h1 = 0x811c9dc5;
-  let h2 = 0x9747b28c;
-  const mix = (x: number) => {
-    h1 = Math.imul(h1 ^ x, 0x01000193);
-    h2 = Math.imul(h2 ^ x, 0x5bd1e995);
-    h2 ^= h2 >>> 13;
-  };
-  const f64 = new Float64Array(1);
-  const u32 = new Uint32Array(f64.buffer);
-  const pos = Array.isArray(mesh.positions) ? mesh.positions : [];
-  mix(pos.length);
-  for (const v of pos) {
-    f64[0] = v;
-    mix(u32[0]);
-    mix(u32[1]);
-  }
-  const faces = Array.isArray(mesh.faces) ? mesh.faces : [];
-  mix(faces.length);
-  for (const f of faces) {
-    if (!Array.isArray(f)) {
-      mix(-1);
-      continue;
-    }
-    mix(f.length);
-    for (const i of f) mix(typeof i === 'number' ? i | 0 : -1);
-  }
-  key = `${pos.length}:${faces.length}:${(h1 >>> 0).toString(36)}${(h2 >>> 0).toString(36)}`;
-  meshKeys.set(mesh, key);
-  return key;
 }
 
 /**
@@ -269,13 +242,17 @@ function validEntry(
     const collected = collectInputs(doc, host, params);
     inputs = collected.inputs;
     if (!entry || entry.signature !== collected.signature) {
-      const sim = inputs.length ? new Simulation(inputs, params) : null;
+      // unchanged collision shapes are reused, so only the simulation itself starts over
+      const reuse = entry?.shapeSource ?? null;
+      const sim = inputs.length ? new Simulation(inputs, params, { reuse }) : null;
       entry = {
         sim,
         signature: collected.signature,
         token,
         kinematicVerified: params.frameStart,
         kinematicKey: kinematicKeyOf(doc, sim),
+        // without bodies only the shapes are kept (not the old simulation's frame cache)
+        shapeSource: sim ?? (reuse && { shapes: reuse.shapes, spareShapes: reuse.spareShapes }),
       };
       caches.set(key, entry);
     } else {
@@ -340,7 +317,8 @@ export class RigidBodySimulator {
       for (let f = entry.kinematicVerified + 1; f <= upTo; f++) {
         if (!sim.kinematicMatches(f, host.transformsAt(f))) {
           inputs ??= collectInputs(doc, host, params).inputs;
-          sim = entry.sim = new Simulation(inputs, params);
+          sim = entry.sim = new Simulation(inputs, params, { reuse: sim });
+          entry.shapeSource = sim;
           this.lastIssues = sim.issues;
           break;
         }

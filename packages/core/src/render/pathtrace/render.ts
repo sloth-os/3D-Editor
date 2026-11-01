@@ -6,7 +6,9 @@ import type { RenderItem } from '../../eval/renderables';
 import type { SampledTexture } from '../raster';
 import type { RenderView } from '../view';
 import { compileScene, type CompiledScene, type SceneLight } from './compile';
+import { denoiseFilm } from './denoise';
 import { filmToRGBA8, viewTransformOf, type DisplayBackground } from './display';
+import type { FilmImage } from './film';
 import {
   PathTracer,
   pathTracerSettings,
@@ -26,7 +28,11 @@ export interface PathTraceRenderOptions {
   max_bounces?: number;
   /** Denoise the result (default: render settings `use_denoising`). */
   denoise?: boolean;
-  /** Wall-clock budget in seconds (0 / unset = none; at least one sample is rendered). */
+  /**
+   * Wall-clock budget in seconds (0 / unset = none) for compiling the scene, sampling and the
+   * (estimated) denoising and display conversion. One sample per pixel is always rendered, so very
+   * large images can take longer.
+   */
   time_limit?: number;
   /** Noise pattern seed (default 0). */
   seed?: number;
@@ -172,12 +178,44 @@ export function preparePathTrace(input: PathTraceRenderInput): PreparedPathTrace
   };
 }
 
-/** Path traces an evaluated scene and returns display-ready RGBA8 pixels. */
-export function renderPathTracedImage(input: PathTraceRenderInput): PathTracedImage {
-  const { scene, settings, exposure, viewTransform, displayBackground } = preparePathTrace(input);
+/**
+ * Time reserved for the work after sampling when a time limit is set, in milliseconds per pixel:
+ * denoising (about 1 µs per pixel on a typical desktop core) and the display conversion.
+ */
+const DENOISE_MS_PER_PIXEL = 1.5e-3;
+const DISPLAY_MS_PER_PIXEL = 0.2e-3;
+
+const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+/** Renders the samples and returns the mean film, letting the tracer and its sums go. */
+function traceFilm(
+  scene: CompiledScene,
+  settings: PathTracerSettings,
+  onProgress: PathTraceRenderOptions['onProgress'],
+): { stats: PathTraceStats; image: FilmImage } {
   const tracer = new PathTracer(scene, settings);
-  const stats = tracer.render(settings.samples, input.options?.onProgress);
-  const linear = tracer.resolve();
+  const stats = tracer.render(settings.samples, onProgress);
+  return { stats, image: tracer.film.resolve() };
+}
+
+/**
+ * Path traces an evaluated scene and returns display-ready RGBA8 pixels. With a time limit the
+ * sampling budget is what remains after compiling the scene and reserving the estimated time of
+ * denoising and the display conversion.
+ */
+export function renderPathTracedImage(input: PathTraceRenderInput): PathTracedImage {
+  const t0 = now();
+  const { scene, settings, exposure, viewTransform, displayBackground } = preparePathTrace(input);
+  let traceSettings = settings;
+  if (settings.timeLimit > 0) {
+    const pixels = settings.width * settings.height;
+    const reserve = pixels * ((settings.denoise ? DENOISE_MS_PER_PIXEL : 0) + DISPLAY_MS_PER_PIXEL);
+    const left = settings.timeLimit * 1000 - (now() - t0) - reserve;
+    // no time left: just the first sample of every pixel
+    traceSettings = { ...settings, timeLimit: Math.max(1e-3, left / 1000) };
+  }
+  const { stats, image } = traceFilm(scene, traceSettings, input.options?.onProgress);
+  const linear = settings.denoise ? denoiseFilm(image) : image.color;
   return {
     width: settings.width,
     height: settings.height,

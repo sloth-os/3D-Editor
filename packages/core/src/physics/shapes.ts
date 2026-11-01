@@ -36,6 +36,8 @@ export const MIN_HALF_EXTENT = 5e-3;
 export const HILL_CLIMB_VERTICES = 32;
 /** Vertex count of the polygon approximating cylinder / cone caps in contact manifolds. */
 const CAP_SEGMENTS = 12;
+/** `supportingFace` scans all faces of polyhedra with up to this many faces (exact). */
+const LINEAR_FACE_SCAN = 512;
 
 /** Convex polyhedron with face planes and edge adjacency (for SAT). */
 export interface Polyhedron {
@@ -57,7 +59,7 @@ export interface Polyhedron {
 
 /**
  * Neighbourhoods of a polyhedron's vertices (CSR lists). The neighbours of vertex i,
- * `adj[adjStart[i] … adjStart[i + 1])`, follow the edges of the fan-triangulated faces, so the
+ * `adj[adjStart[i] … adjStart[i + 1])`, follow the edges of a triangulation of the faces, so the
  * edges at every vertex span its tangent cone: a vertex no neighbour of which is further along a
  * direction is the furthest of all (hill climbing finds support points exactly).
  */
@@ -67,6 +69,9 @@ export interface VertexGraph {
   /** Faces around vertex i: `faces[faceStart[i] … faceStart[i + 1])`. */
   faceStart: Int32Array;
   faces: Int32Array;
+  /** Faces sharing an edge with face f: `faceAdj[faceAdjStart[f] … faceAdjStart[f + 1])`. */
+  faceAdjStart: Int32Array;
+  faceAdj: Int32Array;
   /** Start candidates for hill climbing: the extreme vertices along 26 fixed directions. */
   seeds: Int32Array;
 }
@@ -140,30 +145,50 @@ export function makePolyhedron(verts: ArrayLike<number>, faces: number[][], flat
   const centroid: Vec3 = [0, 0, 0];
   for (let i = 0; i < n; i++) for (let a = 0; a < 3; a++) centroid[a] += v[i * 3 + a] / n;
   const poly: Polyhedron = { verts: v, faces, planes, edges: Int32Array.from(edges), flat, centroid };
-  if (n > HILL_CLIMB_VERTICES) poly.graph = vertexGraph(v, faces);
+  if (n > HILL_CLIMB_VERTICES) poly.graph = vertexGraph(v, faces, poly.edges);
   return poly;
 }
 
-/** Vertex graph of a polyhedron: fan-triangulated face edges, incident faces and seeds. */
-function vertexGraph(v: Float64Array, faces: number[][]): VertexGraph {
+/** Vertex graph of a polyhedron: triangulated face edges, incident and adjacent faces, seeds. */
+function vertexGraph(v: Float64Array, faces: number[][], edges: Int32Array): VertexGraph {
   const n = v.length / 3;
   const nbrs: number[][] = Array.from({ length: n }, () => []);
   const around: number[][] = Array.from({ length: n }, () => []);
+  const across: number[][] = Array.from({ length: faces.length }, () => []);
+  for (let e = 0; e < edges.length; e += 4)
+    if (edges[e + 3] >= 0) {
+      across[edges[e + 2]].push(edges[e + 3]);
+      across[edges[e + 3]].push(edges[e + 2]);
+    }
   const link = (a: number, b: number) => {
     nbrs[a].push(b);
     nbrs[b].push(a);
+  };
+  // diagonals of a triangulation of the convex polygon f[lo … hi] (chord lo–hi present) by
+  // recursive halving: vertex degrees stay O(log n), so climbs over large faces stay short
+  const diagonals = (f: number[], lo: number, hi: number) => {
+    const stack = [lo, hi];
+    while (stack.length) {
+      const b = stack.pop()!;
+      const a = stack.pop()!;
+      if (b - a < 2) continue;
+      const mid = (a + b) >> 1;
+      if (mid - a > 1) link(f[a], f[mid]);
+      if (b - mid > 1) link(f[mid], f[b]);
+      stack.push(a, mid, mid, b);
+    }
   };
   faces.forEach((f, fi) => {
     for (let k = 0; k < f.length; k++) {
       link(f[k], f[(k + 1) % f.length]);
       around[f[k]].push(fi);
     }
-    for (let k = 2; k < f.length - 1; k++) link(f[0], f[k]);
+    diagonals(f, 0, f.length - 1);
   });
   const flatten = (lists: number[][]) => {
-    const start = new Int32Array(n + 1);
+    const start = new Int32Array(lists.length + 1);
     const out: number[] = [];
-    for (let i = 0; i < n; i++) {
+    for (let i = 0; i < lists.length; i++) {
       const sorted = lists[i].sort((a, b) => a - b);
       sorted.forEach((x, k) => {
         if (k === 0 || x !== sorted[k - 1]) out.push(x);
@@ -174,6 +199,7 @@ function vertexGraph(v: Float64Array, faces: number[][]): VertexGraph {
   };
   const adj = flatten(nbrs);
   const inc = flatten(around);
+  const faceAdj = flatten(across);
   const seeds: number[] = [];
   for (let x = -1; x <= 1; x++)
     for (let y = -1; y <= 1; y++)
@@ -195,6 +221,8 @@ function vertexGraph(v: Float64Array, faces: number[][]): VertexGraph {
     adj: adj.list,
     faceStart: inc.start,
     faces: inc.list,
+    faceAdjStart: faceAdj.start,
+    faceAdj: faceAdj.list,
     seeds: Int32Array.from(seeds),
   };
 }
@@ -470,10 +498,15 @@ export function supportingFace(s: Shape, dx: number, dy: number, dz: number): nu
         }
       };
       const g = p.graph;
-      if (g) {
-        // large polyhedra: the faces around the support vertex (d lies in its normal cone)
+      if (g && p.faces.length > LINEAR_FACE_SCAN) {
+        // many faces: start from the faces around the support vertex (d lies in its normal
+        // cone), then move across edges while a neighbouring face is better aligned
         const vi = polySupport(p, ux, uy, uz);
         for (let k = g.faceStart[vi]; k < g.faceStart[vi + 1]; k++) consider(g.faces[k]);
+        for (let cur = -1; cur !== best;) {
+          cur = best;
+          for (let k = g.faceAdjStart[cur]; k < g.faceAdjStart[cur + 1]; k++) consider(g.faceAdj[k]);
+        }
       } else for (let f = 0; f < p.faces.length; f++) consider(f);
       const out: number[] = [];
       for (const k of p.faces[best]) out.push(p.verts[k * 3], p.verts[k * 3 + 1], p.verts[k * 3 + 2]);

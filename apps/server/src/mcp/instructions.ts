@@ -2,20 +2,32 @@
 export const MCP_INSTRUCTIONS = `You control a Blender-inspired, real-time collaborative 3D editor.
 
 Conventions
-- Coordinate system: right-handed, Z is up (the XY plane is the ground), +Y is "forward/back" like in Blender.
-- Units: lengths in meters, angles in radians (tools with a \`rotation_degrees\` argument convert for you), colors are linear RGB(A) in 0..1.
-- Operators use Blender-style ids and parameter names (e.g. mesh.primitive_cube_add, transform.translate, mesh.extrude_region_move, object.shade_smooth). Datablock fields follow Blender's Python API (location, rotation_euler, scale, base_color, energy, lens, ...).
-- Names are unique per kind (Blender style: "Cube", "Cube.001"). Objects, materials and projects can be referenced by id or by exact name.
+- Right-handed, Z up (the XY plane is the ground), like Blender. Lengths in metres, angles in radians (tools with \`rotation_degrees\` convert), colours linear RGB(A) 0..1.
+- Operators use Blender ids and parameter names (mesh.primitive_cube_add, object.modifier_add, transform.rotate …); datablock fields follow Blender's Python API (location, rotation_euler, base_color, energy, lens, bevel_depth …). Data paths use Blender syntax: pose.bones["Arm"].rotation_euler, constraints["Track To"].influence, shape_keys["Smile"].value.
+- Names are unique per kind ("Cube", "Cube.001"); objects, materials and projects can be referenced by id or exact name.
 
 Collaboration
-- Every change is applied to the shared CRDT document and syncs live to every open editor (browsers on other devices see your edits immediately). Humans may be editing at the same time: re-read the scene (get_scene / get_object) before relying on earlier results.
-- You appear to other users as "AI agent (<your client name>)" with your own selection.
-- undo / redo only revert your own changes. \`batch\` runs several operators as a single undo step.
+- Every change syncs live to every open editor; humans may edit at the same time, so re-read (get_scene / get_object) before relying on earlier results. You appear as "AI agent (<client>)" with your own selection.
+- Each tool call is one undo step in your own history (undo / redo never revert others' work); \`batch\` runs many operators as one step.
 
-Typical workflow
+Tools
+- Inspect: get_scene (counts, objects with curves/armatures/constraints/particles/rigid bodies/drivers, \`problems\` = evaluation errors to fix), get_object (everything about one object), list_operators (catalogue with JSON schemas; filter by category or feature group: Curves, Text, Constraints, Rigging, Shape Keys, Vertex Groups, Instancing, Generators, Drivers, Physics, Shading, Modifiers, Layout, Scene, Rendering).
+- Edit: add_object, create_mesh, transform_object, set_parent, set_material, add_modifier / update_modifier (mesh, curve and text objects; object parameters by name), edit_mesh, insert_keyframe, set_scene_settings (render engine/samples, world, sky, mist, gravity and rigid body world), run_operator / batch for any operator.
+- Look: render_image (RASTER fast preview, PATHTRACER physically based final render on all server cores: samples, max_bounces, denoise, time_limit), render_animation (CONTACT_SHEET grid of frames, GIF, APNG, PNG_SEQUENCE).
+
+Recommended workflows
+- Environment: object.generate_terrain / generate_rock / generate_tree / generate_building … (category Add) → object.dimensions_set → scatter with object.scatter_add {surface, objects, count, min_distance} (instances, not real objects: get_scene shows instance counts) or object.scatter_on_surface / object.array_place → object.drop_to_ground → scene.measure / scene.raycast to verify.
+- Curves and text: curve.primitive_bezier_curve_add / curve.add_from_points {points}, then curve.properties_set {bevel_depth, extrude, fill_mode}; object.text_add {body, size, extrude}; animate growth with insert_keyframe property data.bevel_factor_end; object.convert {target: MESH} bakes them to meshes.
+- Constraints and camera tracking: object.constraint_add {type: TRACK_TO | DAMPED_TRACK | FOLLOW_PATH | CHILD_OF | COPY_LOCATION | LIMIT_* …, target}; object.track_set aims cameras/lights at a target; constraint.type_list describes every type, constraint.describe checks results; errors appear in get_object.
+- Rigging: object.armature_add → armature.chain_add / armature.bone_add → set_parent via run_operator object.parent_to {objects, parent, type: ARMATURE_AUTO} (automatic weights + Armature modifier) → pose.bone_transform_set {bone, rotation_euler, keyframe: true, frame} or pose.ik_add {bone, target, subtarget, chain_count}; armature.describe shows bones and posed positions.
+- Shape keys: object.shape_key_add {name} (the mesh itself is the basis) → object.shape_key_set_positions {key, indices, offsets | positions} → object.shape_key_set {key, value, keyframe: true, frame}.
+- Animation: insert_keyframe (object, pose bones, constraint influence, shape keys, curve data, material and procedural parameters, world); anim.keyframes_insert_many for many keys; anim.driver_add {path, expression: "sin(frame/10)"} for procedural motion; anim.fmodifier_add (NOISE, CYCLES via anim.extrapolation_set CYCLIC); anim.turntable for product spins.
+- Physics: rigidbody.object_add {type: ACTIVE | PASSIVE, collision_shape, mass} on falling objects and the ground → set_scene_settings {rigidbody_frame_end, gravity} → check with render_animation or rigidbody.describe → rigidbody.bake_to_keyframes to freeze the motion.
+- Look development: material.preset_list → material.preset_apply {preset} or material.procedural_set {channel, procedural: {type: NOISE | VORONOI | BRICK | WOOD …}}; world.sky_set {preset: CLEAR_DAY | SUNSET …} (or set_scene_settings sky fields) and world.mist_set for atmosphere.
+- Rendering: preview with render_image engine RASTER (or a browser editor); final images with render_image {engine: PATHTRACER, samples: 64–256, time_limit} — the image reports the samples reached; check animations with render_animation format CONTACT_SHEET and frame_step so the sheet has 12–24 frames, then GIF/APNG for the result.
+
+Typical session
 1. list_projects or create_project (projects open in the editor at /?project=<id>).
-2. get_scene to inspect objects, materials, bounds and settings.
-3. add_object / create_mesh / transform_object / set_material / add_modifier / edit_mesh / insert_keyframe / set_scene_settings, or run_operator for anything else.
-4. render_image to look at the result (uses a connected browser editor when available, else the built-in software renderer).
-
-Use list_operators to discover the full operator catalogue with JSON-schema parameters, then run_operator to execute any operator (selection and mode can be set per call).`;
+2. get_scene to inspect; list_operators {category} to find operators and their parameters.
+3. Build with the tools above (batch related operators); check \`problems\` in get_scene.
+4. render_image / render_animation to look at the result, fix, repeat.`;

@@ -133,22 +133,28 @@ const TETRA_FACES: readonly (readonly [number, number, number, number])[] = [
 ];
 
 /**
- * Relative height below which a tetrahedron counts as flat: its volume is then rounding noise,
- * far above that level for coordinates up to ~10⁵ times the simplex size.
+ * Tolerance of the flatness test below: about the height, relative to the coordinates, under
+ * which a tetrahedron counts as flat. Rounding noise of the volume is ~10⁵ times smaller.
  */
 const FLAT_TETRA = 1e-10;
 
-/** Whether a tetrahedron is flat: the height of its 4th vertex over the largest face is negligible. */
+/**
+ * Whether a tetrahedron is flat: 6·volume ≤ FLAT_TETRA · coordinate scale · longest edge² (the
+ * square bounds twice any face area, so this is a height of ~FLAT_TETRA · scale or less).
+ */
 function flatTetra(s: SimplexVertex[]): boolean {
   let scale = 0;
-  for (const p of s) scale = Math.max(scale, Math.abs(p.w[0]), Math.abs(p.w[1]), Math.abs(p.w[2]));
-  let maxArea2 = 0;
-  for (const [i, j, k] of TETRA_FACES) {
-    const n = cross(sub(s[j].w, s[i].w), sub(s[k].w, s[i].w));
-    maxArea2 = Math.max(maxArea2, len3(n[0], n[1], n[2]));
+  let maxEdge2 = 0;
+  for (let i = 0; i < 4; i++) {
+    const p = s[i].w;
+    scale = Math.max(scale, Math.abs(p[0]), Math.abs(p[1]), Math.abs(p[2]));
+    for (let j = i + 1; j < 4; j++) {
+      const q = s[j].w;
+      maxEdge2 = Math.max(maxEdge2, (q[0] - p[0]) ** 2 + (q[1] - p[1]) ** 2 + (q[2] - p[2]) ** 2);
+    }
   }
   const vol6 = dot(sub(s[1].w, s[0].w), cross(sub(s[2].w, s[0].w), sub(s[3].w, s[0].w)));
-  return !(Math.abs(vol6) > FLAT_TETRA * scale * maxArea2);
+  return !(Math.abs(vol6) > FLAT_TETRA * scale * maxEdge2);
 }
 
 /** Closest point of a tetrahedron to the origin; null when the origin is inside. */

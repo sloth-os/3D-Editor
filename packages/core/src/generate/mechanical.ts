@@ -266,9 +266,7 @@ export function generatePipe(params: Partial<PipeParams> = {}): GeneratorResult 
   const b = new MeshBuilder();
   const distinct = path.filter((q, i) => i === 0 || len(sub(q, path[i - 1])) >= 1e-9).length;
   if (distinct < 2) {
-    warnings.push(
-      `the path needs at least 2 distinct points (got ${distinct}); nothing to sweep the pipe along`,
-    );
+    warnings.push(`the path needs at least 2 distinct points to sweep the pipe along (got ${distinct})`);
     return { mesh: b.build(), materials: [MATERIALS.metal], warnings };
   }
   const thickness = clampNum(p.thickness, 0, radius * 0.95, 0);

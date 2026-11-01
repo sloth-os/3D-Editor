@@ -9,15 +9,12 @@ import type {
   ToolAnnotations,
 } from '@modelcontextprotocol/sdk/types.js';
 import {
-  ANIMATABLE,
   base64Decode,
   base64Encode,
   detectFormat,
-  encodePNG,
   enterEditMode,
   exportScene,
   importFile,
-  renderSceneSoftware,
   selectAllElements,
   selectionFromEdges,
   selectionFromFaces,
@@ -25,7 +22,9 @@ import {
   edgeKey,
   emptySelection,
   meshStats,
-  type AnimTargetType,
+  isAnimatable,
+  propertyLength,
+  readChannel,
   type ExportFormat,
   type ImportFormat,
   type MeshSelection,
@@ -43,7 +42,7 @@ import type { RoomManager } from '../sync/room-manager';
 import { RpcError } from '../sync/room';
 import { isNotImplemented, safeFileName } from '../api/projects';
 import { ToolError, type AgentProject, type AgentSession } from './agent';
-import { describeObject, round, roundVec, summarizeScene } from './scene-summary';
+import { DEFAULT_MAX_OBJECTS, describeObject, round, roundVec, summarizeScene } from './scene-summary';
 import {
   addModifier,
   applyModifier,
@@ -53,6 +52,25 @@ import {
   updateModifier,
 } from './modifiers';
 import { MAX_IMPORT_BYTES, fetchLimited } from './fetch-limited';
+import { keyTargetData, keyframeTarget, notAnimatable } from './keyframes';
+import { findOperatorGroup, operatorGroupNames } from './operator-groups';
+import type { AnimationOutput, FrameOptions, Renderer } from '../render';
+import type { RenderStore, StoredFile } from '../render/store';
+import {
+  DEFAULT_ANIMATION_TIME_LIMIT,
+  DEFAULT_IMAGE_TIME_LIMIT,
+  MAX_ANIMATION_SIZE,
+  MAX_RENDER_FRAMES,
+  MAX_TIME_LIMIT,
+  animationFrameSize,
+  denoiseArg,
+  engineArg,
+  maxBouncesArg,
+  progressReporter,
+  renderToolError,
+  samplesArg,
+  seedArg,
+} from './rendering';
 
 export interface ToolContext {
   agent: AgentSession;
@@ -61,6 +79,10 @@ export interface ToolContext {
   config: ServerConfig;
   metrics: ServerMetrics;
   log: Log;
+  /** Server-side renderer (render threads). */
+  renderer: Renderer;
+  /** Stored render results (render_animation `store`). */
+  renderStore: RenderStore;
 }
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
@@ -326,7 +348,7 @@ function decodeRenderResult(
 // ------------------------------------------------------------------ registration
 
 export function registerTools(server: McpServer, ctx: ToolContext): void {
-  const { agent, rooms, registry, metrics, log } = ctx;
+  const { agent, rooms, registry, metrics, log, renderer, renderStore } = ctx;
 
   function tool<S extends z.ZodRawShape>(
     name: string,
@@ -483,16 +505,27 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get scene',
       description:
-        'Describe the whole scene: every object (id, name, type, parent, collection, location / rotation_euler (radians, also in degrees) / scale, world-space bounds after modifiers, data summary such as mesh vertex/face counts, light energy or camera lens, material slots, modifiers, animated channels), materials, collections, scene/render/world settings and the active camera. Units: meters, Z up.',
+        'Describe the whole scene at a frame: counts (objects by type, vertices, faces, instances), every object (id, name, type, parent, collection, location / rotation_euler (radians, also in degrees) / scale, world-space bounds after modifiers and armature deformation, data summary: mesh vertex/face counts with shape keys and vertex groups, curve splines/points/bevel/extrude, text body, armature bones with parents and pose_position, light energy, camera lens; material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, generated instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, poses, curves, instancing, physics) so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object. Units: meters, Z up.',
       annotations: READ_ONLY,
     },
     {
       project: projectArg,
       frame: z.number().optional().describe('Frame to evaluate (default: the agent current frame)'),
+      max_objects: z
+        .number()
+        .int()
+        .min(1)
+        .max(5000)
+        .optional()
+        .describe(`Objects listed at most (default ${DEFAULT_MAX_OBJECTS}; counts always cover all)`),
     },
-    async ({ project, frame }) => {
+    async ({ project, frame, max_objects }) => {
       const p = await agent.project(project);
-      return summarizeScene(p.scene, { frame: frame ?? p.state.frame, projectId: p.id });
+      return summarizeScene(p.scene, {
+        frame: frame ?? p.state.frame,
+        projectId: p.id,
+        maxObjects: max_objects,
+      });
     },
   );
 
@@ -501,7 +534,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get object',
       description:
-        'Detailed description of one object: transform, world location and bounds, parent and children, mesh statistics, full material properties per slot, modifier stack with parameters, custom properties, visibility and animation keyframes.',
+        'Detailed description of one object at a frame: transform, world location and bounds, parent (and parent bone) and children, data (mesh statistics, shape keys with values, vertex groups with assigned vertex counts; curve settings and spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts, rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems.',
       annotations: READ_ONLY,
     },
     { project: projectArg, object: objectArg, frame: z.number().optional() },
@@ -515,12 +548,16 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'list_operators',
     {
       title: 'List operators',
-      description:
-        'The operator catalogue (Blender-style ids such as mesh.primitive_cube_add, transform.rotate, mesh.extrude_region_move, mesh.subdivide) with descriptions and JSON-schema parameters. Filter by category (e.g. Add, Object, Transform, Mesh, Material, Animation, Data, Snap, Select) and/or a search string. Without filters a compact list is returned; use include_parameters=true or a filter to get parameter schemas.',
+      description: `The operator catalogue (Blender-style ids such as mesh.primitive_cube_add, transform.rotate, mesh.extrude_region_move, curve.primitive_bezier_curve_add, object.constraint_add, armature.chain_add, rigidbody.object_add, anim.driver_add) with descriptions and JSON-schema parameters. Filter by \`category\`: a registry category (e.g. Add, Object, Transform, Mesh, Curve, Text, Armature, Pose, Physics, Layout, Scene, World, Material, Animation, Render, Data, Snap, Select) or a feature group: ${operatorGroupNames().join(', ')}; and/or a search string. Without filters a compact list is returned; filters (up to 60 results) or include_parameters=true give parameter schemas.`,
       annotations: READ_ONLY,
     },
     {
-      category: z.string().optional(),
+      category: z
+        .string()
+        .optional()
+        .describe(
+          'Registry category or feature group (case-insensitive), e.g. "Constraints", "Rigging", "Physics"',
+        ),
       search: z
         .string()
         .optional()
@@ -528,9 +565,21 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       include_parameters: z.boolean().optional(),
     },
     async ({ category, search, include_parameters }) => {
-      let list = operatorCatalogue(registry);
+      let list = operatorCatalogue(registry).filter((o) => !registry.get(o.id)?.uiOnly);
       const categories = [...new Set(list.map((o) => o.category))].sort();
-      if (category) list = list.filter((o) => o.category.toLowerCase() === category.toLowerCase());
+      if (category) {
+        const c = category.trim().toLowerCase();
+        const exact = list.filter((o) => o.category.toLowerCase() === c);
+        if (exact.length) list = exact;
+        else {
+          const group = findOperatorGroup(c);
+          if (!group)
+            throw new ToolError(
+              `Unknown category '${category}'. Categories: ${categories.join(', ')}. Feature groups: ${operatorGroupNames().join(', ')}.`,
+            );
+          list = list.filter((o) => group.match(o.id));
+        }
+      }
       if (search) {
         const s = search.toLowerCase();
         list = list.filter((o) => `${o.id} ${o.label} ${o.description}`.toLowerCase().includes(s));
@@ -539,6 +588,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       return {
         count: list.length,
         categories,
+        groups: operatorGroupNames(),
         modifier_types: modifierTypes().map((m) => m.type),
         operators: list.map((o) =>
           detailed
@@ -1028,7 +1078,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'add_modifier',
     {
       title: 'Add modifier',
-      description: `Add a modifier to the end of a mesh object's stack (non-destructive, like Blender). type is a Blender modifier identifier, e.g. SUBSURF {levels, render_levels}, MIRROR, ARRAY {count}, SOLIDIFY {thickness}, BOOLEAN {operation, object}. Parameter names follow Blender; invalid parameters are reported with the type's JSON schema. Available types: ${modifierTypeList()}.`,
+      description: `Add a modifier to the end of the stack of a mesh, curve or text object (non-destructive, like Blender; on curves and text it acts on the generated geometry). type is a Blender modifier identifier, e.g. SUBSURF {levels, render_levels}, MIRROR, ARRAY {count}, SOLIDIFY {thickness}, BOOLEAN {operation, object}, ARMATURE {object: "Rig"} (skinning; usually added by object.parent_to type ARMATURE_AUTO), CURVE {object: "Path", deform_axis} (bend along a curve). Object parameters accept object names. Parameter names follow Blender; invalid parameters are reported with the type's JSON schema. Available types: ${modifierTypeList()}.`,
       annotations: EDIT,
     },
     {
@@ -1112,7 +1162,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Apply modifier',
       description:
-        "Apply (bake) a modifier into the object's mesh data and remove it from the stack (like Blender's Apply; destructive to the base mesh).",
+        "Apply (bake) a modifier into the object's mesh data and remove it from the stack (like Blender's Apply; destructive to the base mesh). Mesh objects only: convert curves and text with run_operator object.convert {target: MESH} (bakes all their modifiers).",
       annotations: EDIT,
     },
     { project: projectArg, object: objectArg, modifier: z.string().min(1) },
@@ -1199,83 +1249,98 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Insert keyframe',
       description:
-        "Insert a keyframe at `frame` on an animatable property. Object properties: location, rotation_euler (radians), scale, color. Use 'data.<prop>' for the object's light/camera data (e.g. data.energy, data.lens), 'material.<prop>' for the material in slot 0 (e.g. material.base_color) and object='world' for world color/strength. `value` (number or vector) sets the keyed value; without it the current value is keyed. Use index for a single channel.",
+        'Insert a keyframe at `frame` on an animatable property (Blender data paths). Object: location, rotation_euler (radians), scale, color; nested object paths: pose.bones["Bone"].location / rotation_euler / scale (armature bones, bone axes), pose.bones["Bone"].constraints["IK"].influence, constraints["Name"].influence (or another numeric constraint parameter), modifiers["Name"].<parameter>, particle_systems["Name"].<setting>. \'data.<path>\' keys the object\'s data: light (data.energy, data.color), camera (data.lens, data.dof_focus_distance), curve or text (data.bevel_factor_end to grow a curve, data.extrude, data.eval_time, data.size, data.splines[0].points[1].co) or mesh shape keys (data.shape_keys["Smile"].value, or just shape_keys["Smile"].value). \'material.<path>\' keys the material in `material_slot` (default: the first): material.base_color, material.roughness, material.emission_strength, procedural texture parameters such as material.textures.base_color.procedural.scale. object=\'world\' keys world settings (color, strength, sun_elevation, sun_rotation, mist_density …). `value` (number or vector) sets the keyed value, otherwise the current value is keyed; `index` keys one channel. For many keys at once use run_operator anim.keyframes_insert_many; drivers: anim.driver_add; F-curve modifiers (noise, cycles): anim.fmodifier_add / anim.extrapolation_set.',
       annotations: EDIT,
     },
     {
       project: projectArg,
       object: z.string().min(1).describe("Object id/name, or 'world'"),
-      property: z.string().min(1),
+      property: z
+        .string()
+        .min(1)
+        .describe(
+          'Data path, e.g. location, pose.bones["Arm"].rotation_euler, data.bevel_factor_end, material.roughness',
+        ),
       frame: z.number(),
       value: z.union([z.number(), z.array(z.number())]).optional(),
       index: z.number().int().min(0).optional(),
       interpolation: z.enum(['CONSTANT', 'LINEAR', 'BEZIER']).default('BEZIER'),
+      material_slot: z
+        .number()
+        .int()
+        .min(0)
+        .max(63)
+        .optional()
+        .describe("For 'material.' paths: the material slot (default: the first filled slot)"),
     },
     async (a) => {
       const p = await agent.project(a.project);
-      let targetType: AnimTargetType = 'object';
-      let target: string;
-      let path = a.property;
-      if (a.object === 'world') {
-        targetType = 'world';
-        target = 'world';
-      } else {
-        const o = requireObject(p, a.object);
-        target = o.id;
-        if (path.startsWith('data.')) {
-          if (!o.data || (o.type !== 'LIGHT' && o.type !== 'CAMERA'))
-            throw new ToolError(`'${o.name}' has no light/camera data.`);
-          targetType = o.type === 'LIGHT' ? 'light' : 'camera';
-          target = o.data;
-          path = path.slice(5);
-        } else if (path.startsWith('material.')) {
-          const mat = o.material_slots.find(Boolean);
-          if (!mat) throw new ToolError(`'${o.name}' has no material.`);
-          targetType = 'material';
-          target = mat;
-          path = path.slice(9);
-        }
-      }
-      const len = ANIMATABLE[targetType]?.[path];
-      if (!len) {
-        throw new ToolError(
-          `'${path}' is not animatable on ${targetType}. Animatable: ${Object.keys(ANIMATABLE[targetType] ?? {}).join(', ')}.`,
-        );
-      }
+      const t = keyframeTarget(p, a.object, a.property.trim(), a.material_slot);
       const values = Array.isArray(a.value) ? a.value : undefined;
-      if (values && a.index === undefined && values.length !== len) {
-        throw new ToolError(`'${path}' has ${len} channels; value must have ${len} numbers.`);
-      }
+      const scalar = typeof a.value === 'number' ? a.value : undefined;
+      const sample = keyTargetData(p, t.type, t.id);
+      if (!isAnimatable(t.type, t.path) || !sample) throw new ToolError(notAnimatable(t));
+      const pose = /^pose\.bones\[(["'])(.+)\1\]\.(location|rotation_euler|scale)$/.exec(t.path);
+      const len = pose ? 3 : propertyLength(t.type, t.path, sample);
+      if (!len) throw new ToolError(`'${t.path}' does not exist on ${t.label}.`);
+      if (values && a.index === undefined && values.length !== len)
+        throw new ToolError(`'${t.path}' has ${len} channels; value must have ${len} numbers.`);
+      if (a.index !== undefined && a.index >= len)
+        throw new ToolError(`'${t.path}' has ${len} channel(s); index must be 0..${len - 1}.`);
       let inserted = 0;
       p.step(() => {
-        if (values && a.index === undefined) {
-          values.forEach((v, i) => {
-            const r = p.runOrThrow<{ inserted: number }>('anim.keyframe_insert_property', {
-              target_type: targetType,
-              target,
-              path,
-              index: i,
+        if (pose && !p.scene.getObject(t.id)?.pose?.bones?.[pose[2]]) {
+          // a bone that was never posed has no pose channel yet: create it with the rest values
+          // (the operator checks that the bone exists) so it can be keyed like any property
+          const channel = pose[3];
+          p.runOrThrow('pose.bone_transform_set', {
+            object: t.id,
+            bone: pose[2],
+            [channel]: channel === 'scale' ? [1, 1, 1] : [0, 0, 0],
+          });
+        }
+        const channels = a.index !== undefined ? [a.index] : Array.from({ length: len }, (_, i) => i);
+        for (const index of channels) {
+          const value = a.index !== undefined ? (scalar ?? values?.[0]) : (values?.[index] ?? scalar);
+          if (t.type === 'curve') {
+            const r = p.runOrThrow<{ inserted: number }>('curve.keyframe_insert', {
+              object: t.objectId,
+              path: t.path,
+              index: len > 1 || a.index !== undefined ? index : -1,
               frame: a.frame,
-              value: v,
+              value,
               interpolation: a.interpolation,
             });
             inserted += r.result?.inserted ?? 0;
-          });
-        } else {
-          const scalar = typeof a.value === 'number' ? a.value : values?.[0];
-          const r = p.runOrThrow<{ inserted: number }>('anim.keyframe_insert_property', {
-            target_type: targetType,
-            target,
-            path,
-            index: a.index ?? -1,
-            frame: a.frame,
-            value: scalar,
-            interpolation: a.interpolation,
-          });
-          inserted += r.result?.inserted ?? 0;
+          } else if (t.type === 'mesh') {
+            const current = readChannel(sample, t.path, index);
+            if (value === undefined && current === undefined)
+              throw new ToolError(`'${t.path}' does not exist on ${t.label}.`);
+            const r = p.runOrThrow<{ inserted: number }>('anim.keyframes_insert_many', {
+              target_type: 'mesh',
+              target: t.id,
+              path: t.path,
+              index,
+              frames: [a.frame],
+              values: [value ?? current],
+              interpolation: a.interpolation,
+            });
+            inserted += r.result?.inserted ?? 1;
+          } else {
+            const r = p.runOrThrow<{ inserted: number }>('anim.keyframe_insert_property', {
+              target_type: t.type,
+              target: t.id,
+              path: t.path,
+              index: len === 1 && a.index === undefined ? -1 : index,
+              frame: a.frame,
+              value,
+              interpolation: a.interpolation,
+            });
+            inserted += r.result?.inserted ?? 0;
+          }
         }
       });
-      return { inserted, target_type: targetType, path, frame: a.frame };
+      return { inserted, target_type: t.type, target: t.name, path: t.path, frame: a.frame };
     },
   );
 
@@ -1284,7 +1349,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Scene settings',
       description:
-        'Change scene, render and world settings: frame_start, frame_end, fps, frame_current (agent playhead), resolution_x/y, resolution_percentage, engine (RASTER|PATHTRACER), samples, film_transparent, view_transform, exposure, world_color (linear RGB), world_strength, environment (NONE|STUDIO|SKY|IMAGE), environment_strength, unit_system. One undo step.',
+        'Change scene, render, world and physics settings in one undo step. Scene: frame_start, frame_end, fps, frame_current (agent playhead), unit_system. Render: resolution_x/y, resolution_percentage, engine (RASTER|PATHTRACER), samples (path tracer samples per pixel), max_bounces, use_denoising, film_transparent, view_transform (AGX default), exposure. World: world_color (linear RGB), world_strength, environment (NONE|STUDIO|SKY|IMAGE), environment_strength; procedural sky (same as run_operator world.sky_set: sky_preset, sun_elevation / sun_rotation in radians, sun_intensity W/m², sun_size; any of them switches the environment to SKY); mist (same as world.mist_set: mist_density 1/m or mist_distance in m where it reaches 95 %, mist_color). Physics (same as rigidbody.world_set): use_gravity, gravity (m/s², default [0,0,-9.81]), rigidbody_enabled, rigidbody_frame_start/_end (simulated range), substeps_per_frame, solver_iterations, time_scale.',
       annotations: EDIT,
     },
     {
@@ -1297,7 +1362,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       resolution_y: z.number().int().min(1).max(16384).optional(),
       resolution_percentage: z.number().int().min(1).max(1000).optional(),
       engine: z.enum(['RASTER', 'PATHTRACER']).optional(),
-      samples: z.number().int().min(1).max(100000).optional(),
+      samples: z.number().int().min(1).max(100000).optional().describe('Path tracer samples per pixel'),
+      max_bounces: z.number().int().min(0).max(1024).optional().describe('Path tracer light bounces'),
+      use_denoising: z.boolean().optional().describe('Denoise path traced renders'),
       film_transparent: z.boolean().optional(),
       view_transform: z.enum(['STANDARD', 'AGX', 'FILMIC', 'ACES', 'NEUTRAL']).optional(),
       exposure: z.number().min(-32).max(32).optional(),
@@ -1305,7 +1372,48 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       world_strength: z.number().min(0).optional(),
       environment: z.enum(['NONE', 'STUDIO', 'SKY', 'IMAGE']).optional(),
       environment_strength: z.number().min(0).optional(),
+      sky_preset: z
+        .enum(['NOON', 'CLEAR_DAY', 'MORNING', 'SUNSET', 'DUSK', 'NIGHT', 'OVERCAST'])
+        .optional()
+        .describe('Procedural sky preset (applied before the explicit sun values)'),
+      sun_elevation: z
+        .number()
+        .min(-Math.PI / 2)
+        .max(Math.PI / 2)
+        .optional()
+        .describe('Radians above the horizon'),
+      sun_rotation: z
+        .number()
+        .min(-1000)
+        .max(1000)
+        .optional()
+        .describe(
+          'Sun azimuth in radians counter-clockwise from +Y (≈3.9 front-lights the default camera view)',
+        ),
+      sun_intensity: z.number().min(0).max(1e5).optional().describe('Sun irradiance W/m²'),
+      sun_size: z
+        .number()
+        .min(0)
+        .max(Math.PI / 2)
+        .optional()
+        .describe('Sun disc angular diameter in radians'),
+      mist_density: z.number().min(0).max(1000).optional().describe('Mist density 1/m (0 = off)'),
+      mist_distance: z
+        .number()
+        .positive()
+        .max(1e7)
+        .optional()
+        .describe('Depth in metres where the mist reaches 95 %'),
+      mist_color: vec3.optional(),
       unit_system: z.enum(['METRIC', 'IMPERIAL', 'NONE']).optional(),
+      use_gravity: z.boolean().optional(),
+      gravity: vec3.optional().describe('Gravity acceleration m/s²'),
+      rigidbody_enabled: z.boolean().optional().describe('Simulate rigid bodies'),
+      rigidbody_frame_start: z.number().int().optional(),
+      rigidbody_frame_end: z.number().int().optional(),
+      substeps_per_frame: z.number().int().min(1).max(1000).optional(),
+      solver_iterations: z.number().int().min(1).max(1000).optional(),
+      time_scale: z.number().min(0).max(100).optional(),
     },
     async (a) => {
       const p = await agent.project(a.project);
@@ -1324,26 +1432,76 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         'resolution_percentage',
         'engine',
         'samples',
+        'max_bounces',
+        'use_denoising',
         'film_transparent',
         'view_transform',
         'exposure',
       ]);
-      const world = pick(['world_color', 'world_strength', 'environment', 'environment_strength'], {
+      const sky = pick(['sky_preset', 'sun_elevation', 'sun_rotation', 'sun_intensity', 'sun_size'], {
+        sky_preset: 'preset',
+      });
+      const useSky = a.environment === 'SKY' || Object.keys(sky).length > 0;
+      if (useSky && a.environment && a.environment !== 'SKY')
+        throw new ToolError(`Sky settings need environment SKY (got ${a.environment}).`);
+      const world = pick(['world_color', 'world_strength', 'environment_strength'], {
         world_color: 'color',
         world_strength: 'strength',
       });
+      if (a.environment && !useSky) world.environment = a.environment;
+      if (a.mist_density !== undefined && a.mist_distance !== undefined)
+        throw new ToolError('Pass either mist_density or mist_distance, not both.');
+      const mist = pick(['mist_density', 'mist_distance', 'mist_color'], {
+        mist_density: 'density',
+        mist_distance: 'distance',
+        mist_color: 'color',
+      });
+      const physics = pick(
+        [
+          'use_gravity',
+          'gravity',
+          'rigidbody_enabled',
+          'rigidbody_frame_start',
+          'rigidbody_frame_end',
+          'substeps_per_frame',
+          'solver_iterations',
+          'time_scale',
+        ],
+        {
+          rigidbody_enabled: 'enabled',
+          rigidbody_frame_start: 'frame_start',
+          rigidbody_frame_end: 'frame_end',
+        },
+      );
       const start = (scene.frame_start as number | undefined) ?? p.scene.getScene().frame_start;
       const endFrame = (scene.frame_end as number | undefined) ?? p.scene.getScene().frame_end;
       if (endFrame < start) throw new ToolError('frame_end must be >= frame_start');
+      const reports: Record<string, unknown> = {};
       p.step(() => {
         if (Object.keys(scene).length) p.runOrThrow('data.set_property', { kind: 'scene', values: scene });
         if (Object.keys(render).length) p.runOrThrow('data.set_property', { kind: 'render', values: render });
         if (Object.keys(world).length) p.runOrThrow('data.set_property', { kind: 'world', values: world });
+        if (useSky) reports.sky = p.runOrThrow('world.sky_set', { ...sky, enable: true }).result;
+        if (Object.keys(mist).length) reports.mist = p.runOrThrow('world.mist_set', mist).result;
+        if (Object.keys(physics).length)
+          reports.rigidbody_world = p.runOrThrow('rigidbody.world_set', physics).result;
       });
       if (a.frame_current !== undefined) p.runOrThrow('scene.frame_set', { frame: a.frame_current });
       p.publishPresence();
-      const s = summarizeScene(p.scene, { frame: p.state.frame, projectId: p.id });
-      return { scene: s.scene, render: s.render, world: s.world, frame_current: p.state.frame };
+      const s = summarizeScene(p.scene, { frame: p.state.frame, projectId: p.id, maxObjects: 1 });
+      const sc = p.scene.getScene();
+      return {
+        scene: {
+          ...s.scene,
+          use_gravity: sc.use_gravity,
+          gravity: roundVec([...sc.gravity]),
+          rigidbody_world: sc.rigidbody_world,
+        },
+        render: s.render,
+        world: s.world,
+        frame_current: p.state.frame,
+        ...(Object.keys(reports).length ? { applied: reports } : {}),
+      };
     },
   );
 
@@ -1526,7 +1684,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Render image',
       description:
-        "Render a PNG of the scene to check your work. Uses a connected browser editor (WebGL, same look as the viewport) when available, otherwise the server's software renderer. Defaults to the scene camera; pass `camera` (camera object) or `view` {position, target, up?, fov_degrees?} for another viewpoint. Max 2048x2048.",
+        "Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, same look as the viewport) when available, otherwise the server's software rasterizer; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel). Defaults to the scene camera; pass `camera` (camera object) or `view` {position, target, up?, fov_degrees?} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications.",
       annotations: READ_ONLY,
     },
     {
@@ -1549,11 +1707,33 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         })
         .optional()
         .describe('Explicit viewpoint (world space, Z up)'),
-      renderer: z.enum(['auto', 'browser', 'software']).default('auto'),
-      shading: z.enum(['SOLID', 'MATERIAL']).optional(),
+      engine: engineArg,
+      samples: samplesArg,
+      max_bounces: maxBouncesArg,
+      denoise: denoiseArg,
+      time_limit: z
+        .number()
+        .min(0.1)
+        .max(MAX_TIME_LIMIT)
+        .optional()
+        .describe(
+          `PATHTRACER: wall-clock budget in seconds (default ${DEFAULT_IMAGE_TIME_LIMIT}): sampling stops when it is used up (at least one sample per pixel)`,
+        ),
+      seed: seedArg,
+      frame: z.number().optional().describe("Frame to render (default: the agent's current frame)"),
+      renderer: z
+        .enum(['auto', 'browser', 'software'])
+        .default('auto')
+        .describe(
+          'auto: a connected browser editor for RASTER (else the server), the server for PATHTRACER; browser: only a browser editor (WebGL, RASTER look); software: always the server',
+        ),
+      shading: z
+        .enum(['SOLID', 'MATERIAL'])
+        .optional()
+        .describe('MATERIAL (default): materials and lights; SOLID: grey clay shading (always rasterized)'),
       client: z.string().optional().describe('Specific editor connection/client name for browser rendering'),
     },
-    async (a) => {
+    async (a, extra) => {
       const p = await agent.project(a.project);
       const rs = p.scene.getRender();
       const width = a.width;
@@ -1569,16 +1749,14 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if (cam.type !== 'CAMERA') throw new ToolError(`'${cam.name}' is not a camera.`);
         cameraId = cam.id;
       }
-      const view = a.view
-        ? {
-            position: a.view.position as Vec3,
-            target: a.view.target as Vec3,
-            up: (a.view.up ?? [0, 0, 1]) as Vec3,
-            fovY: (a.view.fov_degrees ?? 50) * DEG2RAD,
-          }
-        : undefined;
+      const frame = a.frame ?? p.state.frame;
+      const engine = a.engine ?? rs.engine;
+      if (a.renderer === 'browser' && a.engine === 'PATHTRACER')
+        throw new ToolError(
+          'Browser editors render with WebGL (RASTER look) only; use renderer auto or software for PATHTRACER.',
+        );
       let fallbackReason: string | undefined;
-      if (a.renderer !== 'software') {
+      if (a.renderer === 'browser' || (a.renderer === 'auto' && engine === 'RASTER')) {
         const conn = p.room.pickRpcTarget('render', a.client);
         if (conn) {
           try {
@@ -1591,7 +1769,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                 camera: cameraId ?? null,
                 view: a.view ?? null,
                 shading: a.shading ?? null,
-                frame: p.state.frame,
+                frame,
               },
               15_000,
             );
@@ -1604,10 +1782,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                   type: 'text',
                   text: JSON.stringify({
                     renderer: 'browser',
+                    engine: 'RASTER',
                     client: conn.clientInfo.name ?? conn.clientInfo.app ?? conn.id,
                     connection: conn.id,
                     width: img.width ?? width,
                     height: img.height ?? height,
+                    frame,
                   }),
                 },
               ],
@@ -1619,32 +1799,290 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if (a.renderer === 'browser')
           throw new ToolError(`${fallbackReason}. Open the project in a browser or use renderer=software.`);
       }
-      let png: Uint8Array;
+      const options: FrameOptions = {
+        width,
+        height,
+        frame,
+        engine,
+        cameraId,
+        view: a.view
+          ? {
+              position: a.view.position,
+              target: a.view.target,
+              up: a.view.up ?? [0, 0, 1],
+              fovY: (a.view.fov_degrees ?? 50) * DEG2RAD,
+            }
+          : undefined,
+        shading: a.shading,
+        samples: a.samples,
+        max_bounces: a.max_bounces,
+        denoise: a.denoise,
+        time_limit: engine === 'PATHTRACER' ? (a.time_limit ?? DEFAULT_IMAGE_TIME_LIMIT) : undefined,
+        seed: a.seed,
+      };
+      let res;
       try {
-        png = encodePNG(
-          renderSceneSoftware(p.scene, { width, height, cameraId, view, frame: p.state.frame, samples: 2 }),
-        );
+        res = await renderer.renderImage({
+          scene: p.scene,
+          projectId: p.id,
+          options,
+          signal: extra.signal,
+          onProgress: progressReporter(extra),
+        });
       } catch (err) {
-        if (isNotImplemented(err))
-          throw new ToolError(
-            `Software rendering is not available in this build (${errorMessage(err)}); ${fallbackReason ?? ''}`.trim(),
-          );
-        throw new ToolError(`Rendering failed: ${errorMessage(err)}`);
+        throw renderToolError(err);
       }
+      const pt = res.pathtrace;
       return {
         content: [
-          { type: 'image', data: base64Encode(png), mimeType: 'image/png' },
+          { type: 'image', data: base64Encode(res.png), mimeType: 'image/png' },
           {
             type: 'text',
             text: JSON.stringify({
               renderer: 'software',
-              width,
-              height,
+              engine: res.engine,
+              width: res.width,
+              height: res.height,
+              frame,
+              threads: res.threads,
+              elapsed_ms: res.elapsedMs,
+              ...(pt
+                ? {
+                    samples: pt.samples,
+                    requested_samples: pt.requested,
+                    ...(pt.stopped === 'time'
+                      ? {
+                          time_limit_reached: true,
+                          hint: 'Sampling stopped at time_limit: raise time_limit or lower samples/size for a cleaner image.',
+                        }
+                      : {}),
+                  }
+                : {}),
+              ...(engine === 'PATHTRACER' && res.engine === 'RASTER'
+                ? { note_engine: 'SOLID shading always rasterizes' }
+                : {}),
+              ...(res.warnings.length ? { warnings: res.warnings.slice(0, 20) } : {}),
               ...(fallbackReason ? { note: fallbackReason } : {}),
             }),
           },
         ],
       };
+    },
+  );
+
+  tool(
+    'render_animation',
+    {
+      title: 'Render animation',
+      description:
+        'Render a range of frames on the server to check motion (keyframes, drivers, F-curve modifiers, constraints, armatures, physics, turntables) or to make an animated result. format CONTACT_SHEET (default: one PNG showing every rendered frame in a labelled grid — the easiest way to review a whole animation; sample long ranges to 12–24 tiles with frame_step), GIF (animated, 256 colours), APNG (animated PNG, returned as image/png) or PNG_SEQUENCE (one PNG per frame, returned as embedded image/png resources named frame_0001.png …). Frames frame_start..frame_end every frame_step (default: the scene frame range). Camera: `camera`, else the scene camera, else one fixed automatic view framing all frames (returned as view). engine RASTER (fast) or PATHTRACER (frames path traced in parallel on all CPU cores; keep size, samples and frame count small). time_limit bounds the whole render (default 60 s): path traced frames get an equal share and stop sampling early, frames that cannot start in time are dropped (truncated: true). store=true keeps the files on the server for an hour and returns download links (results too large to embed are stored automatically).',
+      annotations: READ_ONLY,
+    },
+    {
+      project: projectArg,
+      format: z
+        .enum(['CONTACT_SHEET', 'GIF', 'APNG', 'PNG_SEQUENCE'])
+        .default('CONTACT_SHEET')
+        .describe('Labelled frame grid PNG, animated GIF, animated PNG or one PNG per frame'),
+      frame_start: z.number().int().optional().describe('First frame (default: scene frame_start)'),
+      frame_end: z.number().int().optional().describe('Last frame (default: scene frame_end)'),
+      frame_step: z.number().int().min(1).max(10000).default(1).describe('Render every n-th frame'),
+      width: z
+        .number()
+        .int()
+        .min(16)
+        .max(MAX_ANIMATION_SIZE)
+        .optional()
+        .describe(
+          'Frame width in pixels (default: the render resolution scaled to fit 480 px; contact sheet tiles up to 240 px)',
+        ),
+      height: z
+        .number()
+        .int()
+        .min(16)
+        .max(MAX_ANIMATION_SIZE)
+        .optional()
+        .describe('Frame height in pixels (default: from width and the render aspect)'),
+      camera: z.string().optional().describe('Camera object id or name (default: the scene camera)'),
+      engine: engineArg,
+      shading: z
+        .enum(['SOLID', 'MATERIAL'])
+        .optional()
+        .describe('MATERIAL (default): materials and lights; SOLID: grey clay shading (always rasterized)'),
+      samples: samplesArg,
+      max_bounces: maxBouncesArg,
+      denoise: denoiseArg,
+      seed: seedArg,
+      animated_seed: z
+        .boolean()
+        .default(false)
+        .describe('PATHTRACER: vary the noise pattern per frame (default false: steadier, smaller files)'),
+      time_limit: z
+        .number()
+        .min(1)
+        .max(MAX_TIME_LIMIT)
+        .default(DEFAULT_ANIMATION_TIME_LIMIT)
+        .describe('Wall-clock budget of the whole render in seconds'),
+      frame_time_limit: z
+        .number()
+        .min(0.1)
+        .max(MAX_TIME_LIMIT)
+        .optional()
+        .describe(
+          'PATHTRACER: at most this many seconds of sampling per frame (default: a share of time_limit)',
+        ),
+      fps: z
+        .number()
+        .positive()
+        .max(1000)
+        .optional()
+        .describe('GIF / APNG playback rate (default: scene fps / frame_step = real time)'),
+      loop: z.number().int().min(0).max(65535).default(0).describe('GIF / APNG play count; 0 = forever'),
+      dither: z
+        .enum(['FLOYD_STEINBERG', 'BAYER', 'NONE'])
+        .default('FLOYD_STEINBERG')
+        .describe('GIF dithering (BAYER: ordered, stable between frames)'),
+      colors: z.number().int().min(2).max(256).default(256).describe('GIF palette size'),
+      columns: z.number().int().min(1).max(64).optional().describe('CONTACT_SHEET tiles per row'),
+      store: z
+        .boolean()
+        .default(false)
+        .describe('Keep the result on the server for an hour and return download links (like export_scene)'),
+    },
+    async (a, extra) => {
+      const p = await agent.project(a.project);
+      const sc = p.scene.getScene();
+      const start = a.frame_start ?? sc.frame_start;
+      const end = a.frame_end ?? sc.frame_end;
+      if (end < start) throw new ToolError(`frame_end (${end}) is before frame_start (${start}).`);
+      const total = Math.floor((end - start) / a.frame_step) + 1;
+      if (total > MAX_RENDER_FRAMES)
+        throw new ToolError(
+          `Too many frames (${total}, at most ${MAX_RENDER_FRAMES}): shorten the range or raise frame_step.`,
+        );
+      let cameraId: string | undefined;
+      if (a.camera) {
+        const cam = requireObject(p, a.camera);
+        if (cam.type !== 'CAMERA')
+          throw new ToolError(`'${cam.name}' is a ${cam.type} object, not a camera.`);
+        cameraId = cam.id;
+      }
+      // contact sheets: up to 240 px tiles, smaller for many frames (sheets stay around 2048 px)
+      const fit =
+        a.format === 'CONTACT_SHEET'
+          ? Math.max(48, Math.min(240, Math.floor(2048 / Math.ceil(Math.sqrt(total)))))
+          : 480;
+      const size = animationFrameSize(p.scene, a.width, a.height, fit);
+      const engine = a.engine ?? p.scene.getRender().engine;
+      let res: AnimationOutput;
+      try {
+        res = await renderer.renderAnimation({
+          scene: p.scene,
+          projectId: p.id,
+          format: a.format,
+          frame_start: start,
+          frame_end: end,
+          frame_step: a.frame_step,
+          width: size.width,
+          height: size.height,
+          fps: a.fps,
+          base: {
+            engine,
+            cameraId,
+            shading: a.shading,
+            samples: a.samples,
+            max_bounces: a.max_bounces,
+            denoise: a.denoise,
+            seed: a.seed,
+          },
+          frame_time_limit: a.frame_time_limit,
+          time_limit: a.time_limit,
+          animated_seed: a.animated_seed,
+          loop: a.loop,
+          dither: a.dither,
+          colors: a.colors,
+          columns: a.columns,
+          max_frames: MAX_RENDER_FRAMES,
+          signal: extra.signal,
+          onProgress: progressReporter(extra),
+        });
+      } catch (err) {
+        throw renderToolError(err, 'Rendering the animation');
+      }
+      const files: StoredFile[] = res.files
+        ? res.files.map((f) => ({ name: f.name, mime: 'image/png', data: f.data }))
+        : [
+            {
+              name: `animation.${a.format === 'GIF' ? 'gif' : 'png'}`,
+              mime: a.format === 'GIF' ? 'image/gif' : 'image/png',
+              data: res.data!,
+            },
+          ];
+      if (a.format === 'CONTACT_SHEET') files[0].name = 'contact_sheet.png';
+      const bytes = files.reduce((n, f) => n + f.data.byteLength, 0);
+      const tooLarge = bytes > MAX_EMBEDDED_EXPORT_BYTES;
+      let renderId: string | null = null;
+      if (a.store || tooLarge) renderId = renderStore.put(p.id, files);
+      const base = `${baseUrl(extra)}/api/projects/${encodeURIComponent(p.id)}/renders/${renderId}`;
+      const info: Record<string, unknown> = {
+        format: res.format,
+        engine,
+        mime: a.format === 'APNG' ? 'image/png (animated PNG)' : res.mime,
+        width: res.width,
+        height: res.height,
+        fps: round(res.fps, 3),
+        frames: res.frames,
+        frame_count: res.frames.length,
+        requested_frames: total,
+        truncated: res.cancelled,
+        bytes,
+        threads: res.threads,
+        parallelism: res.parallelism,
+        elapsed_ms: res.elapsedMs,
+      };
+      if (res.time_limit_reached) {
+        info.time_limit_reached = true;
+        info.hint =
+          'The time limit cut the render short: raise time_limit, or render fewer/smaller frames or fewer samples.';
+      }
+      if (res.undersampled_frames.length) info.undersampled_frames = res.undersampled_frames;
+      if (res.sheet) info.sheet = res.sheet;
+      if (res.view)
+        info.view = {
+          position: roundVec([...res.view.position]),
+          target: roundVec([...res.view.target]),
+          fov_degrees: round(res.view.fovY / DEG2RAD, 2),
+        };
+      if (renderId) {
+        info.download_urls = files.map((f) => `${base}/${f.name}`);
+        if (!a.store)
+          info.note = `The result (${bytes} bytes) is too large to embed; download it from download_urls.`;
+      } else if (tooLarge)
+        throw new ToolError(`The result (${bytes} bytes) is too large to return or store.`);
+      const content: CallToolResult['content'] = [{ type: 'text', text: JSON.stringify(info, null, 2) }];
+      if (!tooLarge) {
+        if (res.files)
+          for (const f of files)
+            content.push({
+              type: 'resource',
+              resource: {
+                uri: `project://${p.id}/renders/${renderId ?? 'latest'}/${f.name}`,
+                mimeType: 'image/png',
+                blob: base64Encode(f.data),
+              },
+            });
+        else content.unshift({ type: 'image', data: base64Encode(files[0].data), mimeType: files[0].mime });
+      }
+      if (renderId)
+        for (const f of files.slice(0, 50))
+          content.push({
+            type: 'resource_link',
+            uri: `${base}/${f.name}`,
+            name: f.name,
+            mimeType: f.mime,
+            description: 'Download (kept on the server for an hour)',
+          });
+      return { content };
     },
   );
 

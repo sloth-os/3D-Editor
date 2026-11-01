@@ -43,6 +43,11 @@ export interface NumberFieldProps {
   state?: 'keyed' | 'animated' | null;
   testId?: string;
   title?: string;
+  /**
+   * Text shown instead of the value while it is not a finite number, e.g. 'Auto' for an optional
+   * parameter left unset (dragging then starts from 0, typing replaces it).
+   */
+  placeholder?: string;
 }
 
 /**
@@ -65,10 +70,11 @@ export function NumberField(p: NumberFieldProps) {
     return x;
   };
   const display = toD(p.value);
+  const unset = p.placeholder !== undefined && !Number.isFinite(display);
   const onDown = (e: PointerEvent) => {
     if (editing || e.button !== 0) return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    drag.current = { x: e.clientX, start: display, moved: false, id: e.pointerId };
+    drag.current = { x: e.clientX, start: unset ? 0 : display, moved: false, id: e.pointerId };
   };
   const onMove = (e: PointerEvent) => {
     const d = drag.current;
@@ -92,7 +98,7 @@ export function NumberField(p: NumberFieldProps) {
       if (e.ctrlKey) v = Math.round(v / (step * 10)) * (step * 10);
       p.onChange(clamp(fromD(v)), true);
     } else {
-      setText(fmt(display, Math.max(precision, 4)));
+      setText(unset ? '' : fmt(display, Math.max(precision, 4)));
       setEditing(true);
     }
   };
@@ -102,7 +108,7 @@ export function NumberField(p: NumberFieldProps) {
     if (v !== null) p.onChange(clamp(fromD(v)), true);
   };
   const fill =
-    p.slider && p.min !== undefined && p.max !== undefined
+    p.slider && p.min !== undefined && p.max !== undefined && !unset
       ? Math.max(0, Math.min(1, (display - toD(p.min)) / (toD(p.max) - toD(p.min) || 1)))
       : null;
   return (
@@ -131,7 +137,7 @@ export function NumberField(p: NumberFieldProps) {
       ) : (
         <>
           {p.label && <span class="nf-label">{p.label}</span>}
-          <span class="nf-value">{fmt(display, precision, p.unit)}</span>
+          <span class="nf-value">{unset ? p.placeholder : fmt(display, precision, p.unit)}</span>
         </>
       )}
     </div>
@@ -271,13 +277,17 @@ export function EnumButtons<T extends string>(p: {
   /** Test id of the row; each button gets `${testId}-${value}`. */
   testId?: string;
   title?: string;
+  /** Buttons share the row width without wrapping (narrow paddings), e.g. six axis buttons. */
+  compact?: boolean;
 }) {
   return (
-    <div class="enum-row" data-testid={p.testId} title={p.title}>
+    <div class="enum-row" data-testid={p.testId} title={p.title} style={p.compact ? COMPACT_ROW : undefined}>
       {p.options.map((o) => (
         <button
           key={o.value}
           class={`btn ${p.value === o.value ? 'active' : ''}`}
+          style={p.compact ? COMPACT_BUTTON : undefined}
+          aria-pressed={p.value === o.value}
           data-testid={p.testId ? `${p.testId}-${o.value}` : undefined}
           onClick={() => p.onChange(o.value)}
         >
@@ -287,6 +297,9 @@ export function EnumButtons<T extends string>(p: {
     </div>
   );
 }
+
+const COMPACT_ROW = { flexWrap: 'nowrap' } as const;
+const COMPACT_BUTTON = { padding: '0 2px', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } as const;
 
 /**
  * Row of independent toggle buttons (Blender's X / Y / Z axis toggles): each option is a boolean
@@ -299,11 +312,12 @@ export function ToggleGroup(p: {
   testId?: string;
 }) {
   return (
-    <div class="enum-row" data-testid={p.testId}>
+    <div class="enum-row" data-testid={p.testId} style={COMPACT_ROW}>
       {p.options.map((o, i) => (
         <button
           key={i}
           class={`btn ${o.value ? 'active' : ''}`}
+          style={COMPACT_BUTTON}
           title={o.title}
           aria-pressed={o.value}
           data-testid={p.testId ? `${p.testId}-${i}` : undefined}
@@ -323,6 +337,11 @@ export function TextField(p: {
   testId?: string;
   type?: string;
   commitOnBlur?: boolean;
+  /** Id of a `<datalist>` with suggestions. */
+  list?: string;
+  title?: string;
+  /** Accessible name when there is no visible label. */
+  ariaLabel?: string;
 }) {
   const [v, setV] = useState(p.value);
   useEffect(() => setV(p.value), [p.value]);
@@ -335,6 +354,9 @@ export function TextField(p: {
       type={p.type ?? 'text'}
       value={v}
       placeholder={p.placeholder}
+      list={p.list}
+      title={p.title}
+      aria-label={p.ariaLabel}
       data-testid={p.testId}
       onInput={(e) => {
         setV((e.target as HTMLInputElement).value);

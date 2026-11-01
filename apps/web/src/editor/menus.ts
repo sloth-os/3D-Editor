@@ -1,3 +1,4 @@
+import { CONSTRAINT_TYPES, ROOT_COLLECTION_ID, type ConstraintCategory } from '@3d-editor/core';
 import { session } from '../app/store';
 import { registry } from './editor';
 
@@ -18,6 +19,35 @@ export interface MenuItem {
 
 const sep: MenuItem = { sep: true };
 
+/** A greyed-out placeholder line (e.g. "No collections"). */
+const note = (label: string): MenuItem => ({ label, enabled: () => false });
+
+/**
+ * Operators that menus run with default parameters and whose result is usually tuned afterwards.
+ * The web UI makes them redoable so they open the "Adjust Last Operation" panel, like their
+ * Blender counterparts (registry overrides only change UI behaviour, not the operators).
+ */
+export const REDO_PANEL_OPERATORS: readonly string[] = [
+  'object.convert',
+  'object.parent_set',
+  'object.track_set',
+  'object.duplicates_make_real',
+  'rigidbody.bake_to_keyframes',
+  'anim.turntable',
+  'anim.bake_transforms',
+];
+
+/** Marks {@link REDO_PANEL_OPERATORS} redoable in the editor's registry (idempotent). */
+export function enableRedoPanelOperators(reg = registry): void {
+  for (const id of REDO_PANEL_OPERATORS) {
+    const def = reg.get(id);
+    if (def && !def.redoable) reg.override({ ...def, redoable: true });
+  }
+}
+enableRedoPanelOperators();
+
+// ------------------------------------------------------------------ Add menu
+
 export const ADD_MESH: MenuItem[] = [
   { label: 'Plane', op: 'mesh.primitive_plane_add' },
   { label: 'Cube', op: 'mesh.primitive_cube_add' },
@@ -31,9 +61,83 @@ export const ADD_MESH: MenuItem[] = [
   { label: 'Grid', op: 'mesh.primitive_grid_add' },
 ];
 
+/** Add > Curve (Blender's curve primitives). */
+export const ADD_CURVE: MenuItem[] = [
+  { label: 'Bezier', op: 'curve.primitive_bezier_curve_add' },
+  { label: 'Circle', op: 'curve.primitive_bezier_circle_add' },
+  sep,
+  { label: 'Nurbs Curve', op: 'curve.primitive_nurbs_curve_add' },
+  { label: 'Nurbs Circle', op: 'curve.primitive_nurbs_circle_add' },
+  { label: 'Path', op: 'curve.primitive_nurbs_path_add' },
+];
+
+/** Add > Collection Instance: one entry per collection of the open project. */
+export function COLLECTION_INSTANCE_MENU(): MenuItem[] {
+  const doc = session.value?.doc;
+  const collections = doc ? doc.listCollections().filter((c) => c.id !== ROOT_COLLECTION_ID) : [];
+  if (!collections.length) return [note('No collections to instance')];
+  return collections.map((c) => ({
+    label: c.name,
+    op: 'object.collection_instance_add',
+    params: { collection: c.id },
+  }));
+}
+
+export const ADD_EMPTY: MenuItem[] = [
+  { label: 'Plain Axes', op: 'object.empty_add', params: { type: 'PLAIN_AXES' } },
+  { label: 'Arrows', op: 'object.empty_add', params: { type: 'ARROWS' } },
+  { label: 'Single Arrow', op: 'object.empty_add', params: { type: 'SINGLE_ARROW' } },
+  { label: 'Circle', op: 'object.empty_add', params: { type: 'CIRCLE' } },
+  { label: 'Cube', op: 'object.empty_add', params: { type: 'CUBE' } },
+  { label: 'Sphere', op: 'object.empty_add', params: { type: 'SPHERE' } },
+  { label: 'Cone', op: 'object.empty_add', params: { type: 'CONE' } },
+  sep,
+  { label: 'Collection Instance', submenu: COLLECTION_INSTANCE_MENU },
+];
+
+/** Grouping of the procedural generators (operators missing here are listed under "Other"). */
+const GENERATOR_GROUPS: [string, string[]][] = [
+  ['Nature', ['terrain', 'rock', 'tree', 'bush', 'grass_tuft', 'flower', 'cloud', 'blob']],
+  ['Architecture', ['building', 'stairs', 'fence', 'column', 'arch']],
+  ['Furniture & Props', ['table', 'chair', 'shelf', 'barrel']],
+  ['Mechanical', ['gear', 'spring', 'wheel', 'pipe']],
+];
+
+/** Add > Generators: every registered `object.generate_*` operator, grouped by theme. */
+export function GENERATORS_MENU(): MenuItem[] {
+  const ops = registry.list().filter((d) => d.id.startsWith('object.generate_'));
+  const used = new Set<string>();
+  const out: MenuItem[] = [];
+  const group = (title: string, ids: string[]) => {
+    const defs = ids.map((id) => ops.find((d) => d.id === id)).filter((d) => !!d);
+    if (!defs.length) return;
+    out.push({ title });
+    for (const d of defs) {
+      used.add(d.id);
+      out.push({ label: d.label, op: d.id });
+    }
+  };
+  for (const [title, names] of GENERATOR_GROUPS)
+    group(
+      title,
+      names.map((n) => `object.generate_${n}`),
+    );
+  group(
+    'Other',
+    ops.filter((d) => !used.has(d.id)).map((d) => d.id),
+  );
+  return out;
+}
+
 export const ADD_MENU: MenuItem[] = [
   { title: 'Add' },
   { label: 'Mesh', submenu: ADD_MESH },
+  { label: 'Curve', submenu: ADD_CURVE },
+  { label: 'Text', op: 'object.text_add' },
+  sep,
+  { label: 'Armature', op: 'object.armature_add' },
+  { label: 'Empty', submenu: ADD_EMPTY },
+  sep,
   {
     label: 'Light',
     submenu: [
@@ -44,18 +148,9 @@ export const ADD_MENU: MenuItem[] = [
     ],
   },
   { label: 'Camera', op: 'object.camera_add' },
-  {
-    label: 'Empty',
-    submenu: [
-      { label: 'Plain Axes', op: 'object.empty_add', params: { type: 'PLAIN_AXES' } },
-      { label: 'Arrows', op: 'object.empty_add', params: { type: 'ARROWS' } },
-      { label: 'Single Arrow', op: 'object.empty_add', params: { type: 'SINGLE_ARROW' } },
-      { label: 'Circle', op: 'object.empty_add', params: { type: 'CIRCLE' } },
-      { label: 'Cube', op: 'object.empty_add', params: { type: 'CUBE' } },
-      { label: 'Sphere', op: 'object.empty_add', params: { type: 'SPHERE' } },
-      { label: 'Cone', op: 'object.empty_add', params: { type: 'CONE' } },
-    ],
-  },
+  sep,
+  { label: 'Collection Instance', submenu: COLLECTION_INSTANCE_MENU },
+  { label: 'Generators', submenu: GENERATORS_MENU },
   sep,
   { label: 'Import…', op: 'wm.import' },
 ];
@@ -181,42 +276,233 @@ export const SELECT_MENU_EDIT = (): MenuItem[] => [
   { label: 'Faces Facing Up', op: 'mesh.select_by_normal', params: { direction: [0, 0, 1] } },
 ];
 
-export const OBJECT_MENU = (): MenuItem[] => [
+// ------------------------------------------------------------------ Object menu
+
+export const TRANSFORM_MENU = (): MenuItem[] => [
+  { label: 'Move', op: 'view3d.transform_modal', params: { mode: 'translate' }, shortcut: 'G' },
+  { label: 'Rotate', op: 'view3d.transform_modal', params: { mode: 'rotate' }, shortcut: 'R' },
+  { label: 'Scale', op: 'view3d.transform_modal', params: { mode: 'resize' }, shortcut: 'S' },
+  sep,
+  { label: 'Randomize Transform', op: 'object.randomize_transform' },
+  { label: 'Align Objects', op: 'object.align' },
+  { label: 'Set Dimensions', op: 'object.dimensions_set' },
+];
+
+/** Object > Apply (also the Ctrl+A popup). */
+export const APPLY_MENU = (): MenuItem[] => [
   {
-    label: 'Transform',
-    submenu: [
-      { label: 'Move', op: 'view3d.transform_modal', params: { mode: 'translate' }, shortcut: 'G' },
-      { label: 'Rotate', op: 'view3d.transform_modal', params: { mode: 'rotate' }, shortcut: 'R' },
-      { label: 'Scale', op: 'view3d.transform_modal', params: { mode: 'resize' }, shortcut: 'S' },
-    ],
+    label: 'Location',
+    op: 'object.transform_apply',
+    params: { location: true, rotation: false, scale: false },
   },
   {
-    label: 'Apply',
-    submenu: [
-      {
-        label: 'Location',
-        op: 'object.transform_apply',
-        params: { location: true, rotation: false, scale: false },
-      },
-      {
-        label: 'Rotation',
-        op: 'object.transform_apply',
-        params: { location: false, rotation: true, scale: false },
-      },
-      {
-        label: 'Scale',
-        op: 'object.transform_apply',
-        params: { location: false, rotation: false, scale: true },
-      },
-      {
-        label: 'All Transforms',
-        op: 'object.transform_apply',
-        params: { location: true, rotation: true, scale: true },
-      },
+    label: 'Rotation',
+    op: 'object.transform_apply',
+    params: { location: false, rotation: true, scale: false },
+  },
+  {
+    label: 'Scale',
+    op: 'object.transform_apply',
+    params: { location: false, rotation: false, scale: true },
+  },
+  {
+    label: 'All Transforms',
+    op: 'object.transform_apply',
+    params: { location: true, rotation: true, scale: true },
+  },
+  sep,
+  { label: 'Visual Transform', op: 'object.visual_transform_apply' },
+  { label: 'Visual Geometry to Mesh', op: 'object.convert', params: { target: 'MESH' } },
+  sep,
+  { label: 'Make Instances Real', op: 'object.duplicates_make_real', shortcut: 'Shift Ctrl A' },
+];
+
+export const SET_ORIGIN_MENU = (): MenuItem[] => [
+  { label: 'Origin to Geometry', op: 'object.origin_set', params: { type: 'ORIGIN_GEOMETRY' } },
+  { label: 'Origin to 3D Cursor', op: 'object.origin_set', params: { type: 'ORIGIN_CURSOR' } },
+  { label: 'Geometry to Origin', op: 'object.origin_set', params: { type: 'GEOMETRY_ORIGIN' } },
+];
+
+/** The active object and the other selected objects of the open project. */
+function selection(): { activeId: string | null; others: string[] } {
+  const st = session.value?.state;
+  const activeId = st?.activeId ?? null;
+  return { activeId, others: (st?.selectedIds ?? []).filter((id) => id !== activeId) };
+}
+
+/** Object > Parent "Set Parent To" entries; armature-specific ones when the active object is an armature. */
+export const PARENT_SET_MENU = (): MenuItem[] => {
+  const s = session.value;
+  const active = s?.state.activeId ? s.doc.getObject(s.state.activeId) : null;
+  const set = (label: string, params: Record<string, unknown>, shortcut?: string): MenuItem => ({
+    label,
+    op: 'object.parent_set',
+    params,
+    shortcut,
+  });
+  const items: MenuItem[] = [
+    set('Object', { type: 'OBJECT', keep_transform: true }),
+    set('Object (Without Inverse)', { type: 'OBJECT', keep_transform: false }),
+  ];
+  if (active?.type === 'ARMATURE') {
+    const bones = (active.data ? s!.doc.getArmature(active.data)?.bones : null) ?? [];
+    items.push(
       sep,
-      { label: 'Visual Geometry to Mesh', op: 'object.convert' },
-    ],
+      set('Armature Deform', { type: 'ARMATURE' }),
+      set('With Empty Groups', { type: 'ARMATURE_NAME' }),
+      set('With Envelope Weights', { type: 'ARMATURE_ENVELOPE' }),
+      set('With Automatic Weights', { type: 'ARMATURE_AUTO' }),
+      {
+        label: 'Bone',
+        submenu: bones.length
+          ? bones.map((b) => set(b.name, { type: 'BONE', bone: b.name }))
+          : [note('The armature has no bones')],
+      },
+    );
+  }
+  return items;
+};
+
+export const PARENT_CLEAR_MENU = (): MenuItem[] => [
+  { label: 'Clear Parent', op: 'object.parent_clear', params: { type: 'CLEAR' } },
+  {
+    label: 'Clear and Keep Transformation',
+    op: 'object.parent_clear',
+    params: { type: 'CLEAR_KEEP_TRANSFORM' },
   },
+];
+
+const CONSTRAINT_CATEGORIES: [ConstraintCategory, string][] = [
+  ['TRANSFORM', 'Transform'],
+  ['TRACKING', 'Tracking'],
+  ['RELATIONSHIP', 'Relationship'],
+];
+
+/**
+ * "Add Object Constraint" menu: every object constraint type under Blender's column titles
+ * (Transform, Tracking, Relationship). `objectId` is the owner (default: the active object).
+ * With `targetId` (Add Constraint with Targets) the constraint gets that target when its type
+ * reads one and the target has a suitable type (Follow Path and Clamp To need a curve).
+ */
+export function constraintAddItems(objectId?: string, targetId?: string | null): MenuItem[] {
+  const target = targetId ? session.value?.doc.getObject(targetId) : null;
+  const out: MenuItem[] = [];
+  for (const [category, title] of CONSTRAINT_CATEGORIES) {
+    const types = CONSTRAINT_TYPES.filter((t) => t.category === category && !t.boneOnly);
+    if (!types.length) continue;
+    out.push({ title });
+    for (const t of types) {
+      const params: Record<string, unknown> = { type: t.type };
+      if (objectId) params.object = objectId;
+      if (target && t.target !== 'NONE' && (!t.targetObjectType || t.targetObjectType === target.type))
+        params.target = target.id;
+      out.push({ label: t.label, op: 'object.constraint_add', params });
+    }
+  }
+  return out;
+}
+
+/** Shift+Ctrl+C: constraints for the active object targeting the other selected object. */
+export const CONSTRAINT_WITH_TARGETS_MENU = (): MenuItem[] => {
+  const { activeId, others } = selection();
+  if (!activeId) return [note('No active object')];
+  return constraintAddItems(activeId, others[0] ?? null);
+};
+
+export const CONSTRAINT_MENU = (): MenuItem[] => [
+  {
+    label: 'Add Constraint (with Targets)',
+    submenu: CONSTRAINT_WITH_TARGETS_MENU,
+    shortcut: 'Shift Ctrl C',
+  },
+  { label: 'Clear Object Constraints', op: 'object.constraints_clear', shortcut: 'Ctrl Alt C' },
+];
+
+/** Object > Track: the selected objects track the active one. */
+export const TRACK_MENU = (): MenuItem[] => [
+  { label: 'Damped Track Constraint', op: 'object.track_set', params: { type: 'DAMPTRACK' } },
+  { label: 'Track To Constraint', op: 'object.track_set', params: { type: 'TRACKTO' } },
+  { label: 'Lock Track Constraint', op: 'object.track_set', params: { type: 'LOCKTRACK' } },
+];
+
+export const RIGID_BODY_MENU = (): MenuItem[] => [
+  { label: 'Add Active', op: 'rigidbody.object_add', params: { type: 'ACTIVE' } },
+  { label: 'Add Passive', op: 'rigidbody.object_add', params: { type: 'PASSIVE' } },
+  { label: 'Remove', op: 'rigidbody.object_remove' },
+  sep,
+  { label: 'Bake to Keyframes', op: 'rigidbody.bake_to_keyframes' },
+  { label: 'Free Cache', op: 'rigidbody.cache_free' },
+];
+
+export const CONVERT_MENU = (): MenuItem[] => [
+  { label: 'Mesh', op: 'object.convert', params: { target: 'MESH' } },
+  { label: 'Curve', op: 'object.convert', params: { target: 'CURVE' } },
+];
+
+/** Object > Layout: alignment, placement and scattering tools for the selection. */
+export const LAYOUT_MENU = (): MenuItem[] => {
+  const { activeId, others } = selection();
+  const cursor = session.value?.state.cursorLocation ?? [0, 0, 0];
+  return [
+    { label: 'Align Objects', op: 'object.align' },
+    { label: 'Distribute', op: 'object.distribute' },
+    { label: 'Drop to Ground', op: 'object.drop_to_ground' },
+    {
+      // the surface under (or just above) the 3D cursor, cast straight down
+      label: 'Snap to Surface at 3D Cursor',
+      op: 'object.snap_to_surface',
+      params: { ray_origin: [cursor[0], cursor[1], cursor[2] + 1], ray_direction: [0, 0, -1] },
+    },
+    sep,
+    {
+      label: 'Look At Active',
+      op: 'object.look_at',
+      params: activeId ? { objects: others, target: activeId } : {},
+      enabled: () => !!activeId && others.length > 0,
+    },
+    { label: 'Look At 3D Cursor', op: 'object.look_at', params: { point: [...cursor] } },
+    sep,
+    { label: 'Randomize Transform', op: 'object.randomize_transform' },
+    { label: 'Set Dimensions', op: 'object.dimensions_set' },
+    sep,
+    { label: 'Array Place', op: 'object.array_place' },
+    {
+      label: 'Scatter on Surface',
+      op: 'object.scatter_on_surface',
+      enabled: () => !!activeId && others.length > 0,
+    },
+  ];
+};
+
+export const ANIMATION_MENU = (): MenuItem[] => {
+  const s = session.value;
+  const active = s?.state.activeId ? s.doc.getObject(s.state.activeId) : null;
+  const orbit = active && active.type !== 'CAMERA' ? { target: active.id } : {};
+  return [
+    { label: 'Insert Keyframe', op: 'anim.keyframe_insert', shortcut: 'I' },
+    { label: 'Delete Keyframes', op: 'anim.keyframe_delete', shortcut: 'Alt I' },
+    { label: 'Clear Keyframes', op: 'anim.keyframe_clear' },
+    sep,
+    { label: 'Interpolation: Bezier', op: 'anim.interpolation_type', params: { type: 'BEZIER' } },
+    { label: 'Interpolation: Linear', op: 'anim.interpolation_type', params: { type: 'LINEAR' } },
+    { label: 'Interpolation: Constant', op: 'anim.interpolation_type', params: { type: 'CONSTANT' } },
+    {
+      label: 'Extrapolation',
+      submenu: [
+        { label: 'Constant Extrapolation', op: 'anim.extrapolation_set', params: { type: 'CONSTANT' } },
+        { label: 'Linear Extrapolation', op: 'anim.extrapolation_set', params: { type: 'LINEAR' } },
+        { label: 'Make Cyclic', op: 'anim.extrapolation_set', params: { type: 'CYCLIC' } },
+      ],
+    },
+    sep,
+    { label: 'Camera Turntable', op: 'anim.turntable', params: orbit },
+    { label: 'Bake Action', op: 'anim.bake_transforms' },
+  ];
+};
+
+export const OBJECT_MENU = (): MenuItem[] => [
+  { label: 'Transform', submenu: TRANSFORM_MENU },
+  { label: 'Apply', submenu: APPLY_MENU, shortcut: 'Ctrl A' },
   {
     label: 'Clear',
     submenu: [
@@ -225,15 +511,9 @@ export const OBJECT_MENU = (): MenuItem[] => [
       { label: 'Scale', op: 'object.scale_clear', shortcut: 'Alt S' },
     ],
   },
-  {
-    label: 'Set Origin',
-    submenu: [
-      { label: 'Origin to Geometry', op: 'object.origin_set', params: { type: 'ORIGIN_GEOMETRY' } },
-      { label: 'Origin to 3D Cursor', op: 'object.origin_set', params: { type: 'ORIGIN_CURSOR' } },
-      { label: 'Geometry to Origin', op: 'object.origin_set', params: { type: 'GEOMETRY_ORIGIN' } },
-    ],
-  },
+  { label: 'Set Origin', submenu: SET_ORIGIN_MENU },
   { label: 'Snap', submenu: () => SNAP_MENU() },
+  { label: 'Layout', submenu: LAYOUT_MENU },
   sep,
   { label: 'Duplicate Objects', op: 'object.duplicate_move', shortcut: 'Shift D' },
   { label: 'Duplicate Linked', op: 'object.duplicate_move', params: { linked: true }, shortcut: 'Alt D' },
@@ -241,17 +521,11 @@ export const OBJECT_MENU = (): MenuItem[] => [
   sep,
   {
     label: 'Parent',
-    submenu: [
-      { label: 'Object (Keep Transform)', op: 'object.parent_set', shortcut: 'Ctrl P' },
-      { label: 'Clear Parent', op: 'object.parent_clear', params: { type: 'CLEAR' } },
-      {
-        label: 'Clear and Keep Transform',
-        op: 'object.parent_clear',
-        params: { type: 'CLEAR_KEEP_TRANSFORM' },
-        shortcut: 'Alt P',
-      },
-    ],
+    submenu: () => [...PARENT_SET_MENU(), sep, ...PARENT_CLEAR_MENU()],
+    shortcut: 'Ctrl P',
   },
+  { label: 'Constraint', submenu: CONSTRAINT_MENU },
+  { label: 'Track', submenu: TRACK_MENU, shortcut: 'Shift Ctrl T' },
   {
     label: 'Move to Collection',
     op: 'object.move_to_collection',
@@ -259,22 +533,14 @@ export const OBJECT_MENU = (): MenuItem[] => [
     shortcut: 'M',
   },
   sep,
+  { label: 'Rigid Body', submenu: RIGID_BODY_MENU },
+  { label: 'Convert', submenu: CONVERT_MENU },
+  sep,
   { label: 'Shade Smooth', op: 'object.shade_smooth' },
   { label: 'Shade Auto Smooth', op: 'object.shade_auto_smooth' },
   { label: 'Shade Flat', op: 'object.shade_flat' },
   sep,
-  {
-    label: 'Animation',
-    submenu: [
-      { label: 'Insert Keyframe', op: 'anim.keyframe_insert', shortcut: 'I' },
-      { label: 'Delete Keyframes', op: 'anim.keyframe_delete', shortcut: 'Alt I' },
-      { label: 'Clear Keyframes', op: 'anim.keyframe_clear' },
-      sep,
-      { label: 'Interpolation: Bezier', op: 'anim.interpolation_type', params: { type: 'BEZIER' } },
-      { label: 'Interpolation: Linear', op: 'anim.interpolation_type', params: { type: 'LINEAR' } },
-      { label: 'Interpolation: Constant', op: 'anim.interpolation_type', params: { type: 'CONSTANT' } },
-    ],
-  },
+  { label: 'Animation', submenu: ANIMATION_MENU },
   {
     label: 'Show/Hide',
     submenu: [
@@ -456,13 +722,17 @@ export const OBJECT_CONTEXT = (): MenuItem[] => [
   { label: 'Shade Smooth', op: 'object.shade_smooth' },
   { label: 'Shade Auto Smooth', op: 'object.shade_auto_smooth' },
   { label: 'Shade Flat', op: 'object.shade_flat' },
+  { label: 'Convert To', submenu: CONVERT_MENU },
   sep,
-  { label: 'Set Origin', submenu: OBJECT_MENU()[3].submenu },
+  { label: 'Set Origin', submenu: SET_ORIGIN_MENU },
   { label: 'Snap', submenu: () => SNAP_MENU() },
   sep,
   { label: 'Duplicate Objects', op: 'object.duplicate_move' },
   { label: 'Duplicate Linked', op: 'object.duplicate_move', params: { linked: true } },
   { label: 'Copy Share Link', op: 'wm.share' },
+  sep,
+  { label: 'Parent', submenu: () => [...PARENT_SET_MENU(), sep, ...PARENT_CLEAR_MENU()] },
+  { label: 'Rigid Body', submenu: RIGID_BODY_MENU },
   sep,
   { label: 'Insert Keyframe', op: 'anim.keyframe_insert' },
   { label: 'Delete', op: 'object.delete' },
@@ -499,6 +769,7 @@ export const MESH_CONTEXT = (): MenuItem[] => {
   return base;
 };
 
+/** Popup menus opened by name (`wm.call_menu`: Shift+A, Ctrl+P, Shift+Ctrl+C, RMB …). */
 export function menuByName(name: string): MenuItem[] {
   const s = session.value;
   switch (name) {
@@ -521,9 +792,17 @@ export function menuByName(name: string): MenuItem[] {
     case 'context':
       return s?.state.mode === 'EDIT' ? MESH_CONTEXT() : OBJECT_CONTEXT();
     case 'apply':
-      return OBJECT_MENU()[1].submenu as MenuItem[];
+      return [{ title: 'Apply' }, ...APPLY_MENU()];
     case 'parent':
-      return OBJECT_MENU()[11].submenu as MenuItem[];
+      return [{ title: 'Set Parent To' }, ...PARENT_SET_MENU()];
+    case 'parent_clear':
+      return [{ title: 'Clear Parent' }, ...PARENT_CLEAR_MENU()];
+    case 'constraint_add_targets':
+      return [{ title: 'Add Constraint (with Targets)' }, ...CONSTRAINT_WITH_TARGETS_MENU()];
+    case 'track':
+      return [{ title: 'Track' }, ...TRACK_MENU()];
+    case 'generators':
+      return [{ title: 'Generators' }, ...GENERATORS_MENU()];
     default:
       return [];
   }

@@ -4,6 +4,7 @@ import {
   evaluateModifierStack,
   getModifierDef,
   listModifierDefs,
+  modifierObjectParams,
   newId,
   registerBuiltinModifiers,
   safeJsonSchema,
@@ -11,6 +12,7 @@ import {
   defaultModifierParams,
   type ModifierData,
   type ObjectData,
+  type ObjectType,
   type OperatorRegistry,
 } from '@3d-editor/core';
 import { ToolError, type AgentProject } from './agent';
@@ -20,7 +22,51 @@ import { ToolError, type AgentProject } from './agent';
  * are used when registered (they are the single entry point for user actions); their parameter
  * names are matched against the operator's schema, and the outcome is verified against the
  * document. Missing operators fall back to equivalent direct document edits.
+ *
+ * Curve and text objects (CURVE, FONT) have modifier stacks too (applied to the geometry the curve
+ * generates, like in Blender); the core modifier operators only accept meshes, so their stacks
+ * are edited with direct document edits (one undo step, validated with the modifier schemas).
+ * Object references in parameters (ARMATURE / CURVE `object`, BOOLEAN `object`, ARRAY
+ * `offset_object`, …) may be given by name and are stored as object ids.
  */
+
+/** Object types with a modifier stack. */
+export const MODIFIER_OBJECT_TYPES: readonly ObjectType[] = ['MESH', 'CURVE', 'FONT'];
+
+/** Whether the core modifier operators handle this object (they only accept meshes). */
+function operatorsApply(o: ObjectData): boolean {
+  return o.type === 'MESH';
+}
+
+/**
+ * Resolves object references (by id or name) in a parameter patch of `type` to object ids
+ * ('' or null clears them). Throws a ToolError for unknown objects or self references.
+ */
+export function resolveObjectParams(
+  p: AgentProject,
+  owner: ObjectData,
+  type: string,
+  params: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!params) return params;
+  const out = { ...params };
+  for (const k of modifierObjectParams(type)) {
+    const v = out[k];
+    if (v === '' || v === null) {
+      out[k] = null;
+      continue;
+    }
+    if (typeof v !== 'string') continue;
+    const ref = p.scene.resolveObject(v);
+    if (!ref) throw new ToolError(`Object '${v}' (modifier parameter '${k}') not found.`);
+    if (ref.id === owner.id)
+      throw new ToolError(
+        `Modifier parameter '${k}' cannot reference the modifier's own object '${owner.name}'.`,
+      );
+    out[k] = ref.id;
+  }
+  return out;
+}
 
 export type ModifierPatch = {
   name?: string;
@@ -194,13 +240,17 @@ export function addModifier(
       .join(', ');
     throw new ToolError(`Unknown modifier type '${type}'. Available types: ${types || '(none registered)'}.`);
   }
-  if (object.type !== 'MESH')
-    throw new ToolError(`Modifiers can only be added to mesh objects ('${object.name}' is ${object.type}).`);
+  if (!MODIFIER_OBJECT_TYPES.includes(object.type))
+    throw new ToolError(
+      `Modifiers can only be added to mesh, curve and text objects ('${object.name}' is ${object.type}).`,
+    );
   type = def.type;
-  if (opts.params) mergeParams({ type, params: defaultModifierParams(type) }, opts.params); // validate early
+  const params = resolveObjectParams(p, object, type, opts.params);
+  if (params) mergeParams({ type, params: defaultModifierParams(type) }, params); // validate early
+  opts = { ...opts, params };
   return p.step(() => {
     const before = new Set(object.modifiers.map((m) => m.id));
-    const names = operatorParamNames(registry, 'object.modifier_add');
+    const names = operatorsApply(object) ? operatorParamNames(registry, 'object.modifier_add') : null;
     let via: ModifierChange['via'] = 'document';
     let added: ModifierData | null = null;
     if (names) {
@@ -250,9 +300,10 @@ export function updateModifier(
   mod: ModifierData,
   patch: ModifierPatch,
 ): ModifierChange {
+  patch = { ...patch, params: resolveObjectParams(p, object, mod.type, patch.params) };
   if (patch.params) mergeParams(mod, patch.params); // validate early
   return p.step(() => {
-    const names = operatorParamNames(registry, 'object.modifier_set');
+    const names = operatorsApply(object) ? operatorParamNames(registry, 'object.modifier_set') : null;
     let via: ModifierChange['via'] = 'document';
     if (names) {
       selectOnly(p, object.id);
@@ -282,7 +333,7 @@ export function removeModifier(
   mod: ModifierData,
 ): ModifierChange {
   return p.step(() => {
-    const names = operatorParamNames(registry, 'object.modifier_remove');
+    const names = operatorsApply(object) ? operatorParamNames(registry, 'object.modifier_remove') : null;
     let via: ModifierChange['via'] = 'document';
     const stillThere = () => !!p.scene.getObject(object.id)?.modifiers.some((m) => m.id === mod.id);
     if (names) {
@@ -347,6 +398,11 @@ export function applyModifier(
   object: ObjectData,
   mod: ModifierData,
 ): ModifierChange {
+  if (!operatorsApply(object))
+    throw new ToolError(
+      `Modifiers of ${object.type === 'FONT' ? 'text' : 'curve'} objects cannot be applied one by one; convert the object to a mesh instead ` +
+        `(run_operator object.convert {"target": "MESH"} bakes the curve geometry with every modifier).`,
+    );
   return p.step(() => {
     const names = operatorParamNames(registry, 'object.modifier_apply');
     if (names) {

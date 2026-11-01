@@ -11,7 +11,9 @@ import { errorMessage } from '../observability/tracing';
 import type { RoomManager } from '../sync/room-manager';
 import { AgentSession } from './agent';
 import { MCP_INSTRUCTIONS } from './instructions';
-import { registerResources, registerTools } from './tools';
+import { registerResources, registerTools, type ToolContext } from './tools';
+import { sharedRenderer, type Renderer } from '../render';
+import { sharedRenderStore, type RenderStore } from '../render/store';
 
 export const MCP_PATH = '/mcp';
 /** Large enough for base64 encoded 50 MB model imports. */
@@ -37,6 +39,10 @@ export interface McpHubOptions {
   /** Sessions without activity are closed after this time (default 30 min). */
   idleTimeoutMs?: number;
   maxSessions?: number;
+  /** Server-side renderer (default: the process-wide one, see `RENDER_WORKERS`). */
+  renderer?: Renderer;
+  /** Where render_animation keeps stored results (default: the process-wide store). */
+  renderStore?: RenderStore;
 }
 
 function rpcError(code: number, message: string) {
@@ -73,8 +79,18 @@ export class McpHub {
       { name: '3d-editor', title: '3D Editor', version: config.version },
       { instructions: MCP_INSTRUCTIONS },
     );
-    registerTools(server, { agent, rooms, registry, config, metrics, log });
-    registerResources(server, { agent, rooms, registry, config, metrics, log });
+    const ctx: ToolContext = {
+      agent,
+      rooms,
+      registry,
+      config,
+      metrics,
+      log,
+      renderer: this.opts.renderer ?? sharedRenderer({ log }),
+      renderStore: this.opts.renderStore ?? sharedRenderStore(),
+    };
+    registerTools(server, ctx);
+    registerResources(server, ctx);
     server.server.oninitialized = () => {
       const info = server.server.getClientVersion();
       agent.setClientName(info?.title ?? info?.name);

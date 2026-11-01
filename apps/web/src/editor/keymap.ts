@@ -129,8 +129,12 @@ const OBJECT_MODE: Record<string, Handler> = {
   H: () => run('object.hide_view_set', {}, 'hotkey'),
   'Shift+H': () => run('object.hide_view_set', { unselected: true }, 'hotkey'),
   'Alt+H': () => run('object.hide_view_clear', {}, 'hotkey'),
-  'Ctrl+P': () => run('object.parent_set', {}, 'hotkey'),
-  'Alt+P': () => run('object.parent_clear', { type: 'CLEAR_KEEP_TRANSFORM' }, 'hotkey'),
+  'Ctrl+P': () => run('wm.call_menu', { name: 'parent' }, 'hotkey'),
+  'Alt+P': () => run('wm.call_menu', { name: 'parent_clear' }, 'hotkey'),
+  'Ctrl+Shift+C': () => run('wm.call_menu', { name: 'constraint_add_targets' }, 'hotkey'),
+  'Ctrl+Alt+C': () => run('object.constraints_clear', {}, 'hotkey'),
+  'Ctrl+Shift+T': () => run('wm.call_menu', { name: 'track' }, 'hotkey'),
+  'Ctrl+Shift+A': () => run('object.duplicates_make_real', {}, 'hotkey'),
   'Alt+G': () => run('object.location_clear', {}, 'hotkey'),
   'Alt+R': () => run('object.rotation_clear', {}, 'hotkey'),
   'Alt+S': () => run('object.scale_clear', {}, 'hotkey'),
@@ -260,7 +264,11 @@ export const SHORTCUT_HELP: [string, string][] = [
   ],
   [
     'Object',
-    'Shift+A add · X delete · Shift+D duplicate · Alt+D linked · Ctrl+J join · Ctrl+P parent · H hide · Ctrl+A apply',
+    'Shift+A add · X delete · Shift+D duplicate · Alt+D linked · Ctrl+J join · Ctrl+P parent menu · Alt+P clear parent · H hide · Ctrl+A apply · Shift+Ctrl+A make instances real',
+  ],
+  [
+    'Constraints',
+    'Shift+Ctrl+C add constraint (targeting the other selected object) · Ctrl+Alt+C clear constraints · Shift+Ctrl+T track menu',
   ],
   [
     'Edit Mode',

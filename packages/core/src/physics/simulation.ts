@@ -2,7 +2,8 @@ import type { Mat4, Vec3 } from '../math/types';
 import type { MeshData } from '../mesh/types';
 import type { RigidBodyData } from '../doc/types';
 import { Body } from './body';
-import { buildCollisionShape } from './shapes';
+import { meshKey } from './mesh-key';
+import { buildCollisionShape, type ShapeBuild } from './shapes';
 import { motionMode, simulatedFrameEnd, type WorldParams } from './settings';
 import { PhysicsWorld } from './world';
 import { composeRigid, decomposeRigid, isFiniteVec, mat3ToQuat, quatToMat3, slerpQ } from './vmath';
@@ -33,9 +34,28 @@ export interface BodyInput {
   mesh: MeshData | null;
 }
 
+/** Collision shapes (or the reason none could be built) by their inputs, see `shapeKey`. */
+export type ShapeCache = Map<string, ShapeBuild | { error: string }>;
+
 export interface SimulationOptions {
   /** Let resting bodies sleep (default true). */
   sleeping?: boolean;
+  /**
+   * An earlier simulation of the same scene whose collision shapes are reused where their inputs
+   * are unchanged, so editing one body does not rebuild every shape: building a dense MESH
+   * collider (triangulation, welding, BVH) can take seconds.
+   */
+  reuse?: Pick<Simulation, 'shapes' | 'spareShapes'> | null;
+}
+
+/**
+ * Everything a collision shape is built from: the mesh content, the shape type, whether the body
+ * is dynamic (MESH falls back to CONVEX_HULL) and the exact world scale at frame_start. Equal
+ * keys give identical shapes, so reusing them keeps a simulation a pure function of its inputs.
+ */
+export function shapeKey(mesh: MeshData, rb: RigidBodyData, scale: Readonly<Vec3>): string {
+  const dynamic = rb.type === 'ACTIVE' && !rb.kinematic;
+  return `${meshKey(mesh)}|${rb.collision_shape}|${dynamic ? 1 : 0}|${scale[0]},${scale[1]},${scale[2]}`;
 }
 
 export class Simulation {
@@ -52,6 +72,13 @@ export class Simulation {
   /** Animated ("kinematic") bodies following their animation, in id order. */
   readonly kinematic: readonly Body[];
   readonly issues: RigidBodyIssue[] = [];
+  /** Collision shapes of this simulation's bodies, by `shapeKey`. */
+  readonly shapes: ShapeCache = new Map();
+  /**
+   * Shapes of the simulation this one was built from that it does not use, kept for one more
+   * generation (an undone removal or a setting switched back finds them again).
+   */
+  readonly spareShapes: ShapeCache = new Map();
   /** Last simulated frame (the world's state is the state at this frame). */
   current: number;
   /** Per frame (index = frame − frameStart): centre of mass xyz + quaternion xyzw of each output. */
@@ -67,10 +94,12 @@ export class Simulation {
     this.current = this.frameStart;
     const bodies: Body[] = [];
     const sorted = [...inputs].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const reuse = opts.reuse ?? null;
     for (const input of sorted) {
-      const body = this.createBody(input, bodies.length);
+      const body = this.createBody(input, bodies.length, reuse);
       if (body) bodies.push(body);
     }
+    if (reuse) for (const [k, v] of reuse.shapes) if (!this.shapes.has(k)) this.spareShapes.set(k, v);
     this.bodies = bodies;
     this.outputs = bodies.filter((b) => b.mode === 'DYNAMIC' || b.mode === 'FROZEN');
     this.kinematic = bodies.filter((b) => b.mode === 'KINEMATIC');
@@ -86,7 +115,7 @@ export class Simulation {
     this.issues.push({ objectId, level, message });
   }
 
-  private createBody(input: BodyInput, index: number): Body | null {
+  private createBody(input: BodyInput, index: number, reuse: SimulationOptions['reuse'] | null): Body | null {
     const { id, rb, matrix, mesh } = input;
     if (!mesh) {
       this.issue(id, 'ERROR', 'rigid bodies need a mesh object; left out of the simulation');
@@ -101,9 +130,12 @@ export class Simulation {
       return null;
     }
     const { position: origin, rotation: R, scale } = decomposeRigid(matrix);
-    const built = buildCollisionShape(rb.collision_shape, mesh, scale, {
+    const key = shapeKey(mesh, rb, scale);
+    let built = this.shapes.get(key) ?? reuse?.shapes.get(key) ?? reuse?.spareShapes.get(key);
+    built ??= buildCollisionShape(rb.collision_shape, mesh, scale, {
       dynamic: rb.type === 'ACTIVE' && !rb.kinematic,
     });
+    this.shapes.set(key, built);
     if ('error' in built) {
       this.issue(id, 'ERROR', `${built.error}; left out of the simulation`);
       return null;

@@ -15,6 +15,7 @@ import {
   cuboidFrame,
   type Polyhedron,
   boundingRadius,
+  polySupport,
   supportCore,
   supportingFace,
   type Shape,
@@ -23,7 +24,13 @@ import { epa, gjk, type SupportFn } from '../src/physics/gjk';
 import { collidePolyhedra, transformPolyhedron } from '../src/physics/sat';
 import { collide, type CollisionPose } from '../src/physics/narrowphase';
 import { TriangleBVH } from '../src/physics/bvh';
-import { clipFeatures, reduceManifold, type ContactCandidate } from '../src/physics/manifold';
+import {
+  MAX_CLIP_VERTICES,
+  clipFeatures,
+  reduceManifold,
+  simplifyPolygon,
+  type ContactCandidate,
+} from '../src/physics/manifold';
 import {
   decomposeRigid,
   mat3ToQuat,
@@ -115,7 +122,7 @@ describe('convex hull (quickhull)', () => {
     expect(convexHull(pts)).toEqual(h);
   });
 
-  it('simplifies large hulls to the vertex budget, staying inside the exact hull', () => {
+  it('simplifies large hulls to an optional vertex budget, staying inside the exact hull', () => {
     const sphere = createUVSphere({ segments: 64, ring_count: 32, radius: 1 });
     const h = convexHull(sphere.positions, 64)!;
     expect(h.points.length / 3).toBeLessThanOrEqual(64);
@@ -607,6 +614,61 @@ describe('closed-form box and sphere tests', () => {
     expect(q[1]).toBeCloseTo(1, 12);
   });
 
+  it('keeps every vertex of a convex hull and finds its support points exactly', () => {
+    // Blender (Bullet) collides with the full hull of the mesh vertices; a hull simplified to
+    // fewer vertices lies inside the mesh (round objects sank into the ground)
+    const uv = createUVSphere({ radius: 1, segments: 32, ring_count: 16 });
+    const scale: Vec3 = [1.3, 0.7, 1];
+    const b = buildCollisionShape('CONVEX_HULL', uv, scale, { dynamic: true });
+    if ('error' in b || b.shape.kind !== 'poly') throw new Error('hull expected');
+    const P = b.shape.poly;
+    expect(P.verts.length / 3).toBe(482);
+    expect(P.graph).toBeDefined(); // large hull: hill-climbing support queries
+    let seed = 3;
+    const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647) * 2 - 1;
+    const out = new Float64Array(3);
+    for (let k = 0; k < 500; k++) {
+      const d: Vec3 = [rnd(), rnd(), rnd()];
+      // the furthest mesh vertex (object space, scaled, relative to the centre of mass)
+      let best = -Infinity;
+      for (let i = 0; i < uv.positions.length; i += 3) {
+        let dot = 0;
+        for (let a = 0; a < 3; a++) dot += (uv.positions[i + a] * scale[a] - b.com[a]) * d[a];
+        best = Math.max(best, dot);
+      }
+      supportCore(b.shape, d[0], d[1], d[2], out);
+      expect(out[0] * d[0] + out[1] * d[1] + out[2] * d[2]).toBeCloseTo(best, 12);
+      const i = polySupport(P, d[0], d[1], d[2]);
+      expect([...P.verts.subarray(i * 3, i * 3 + 3)]).toEqual([...out]);
+    }
+    // hulls with many faces pick the supporting face by climbing: still the best aligned one
+    const ico = buildCollisionShape('CONVEX_HULL', createIcoSphere({ subdivisions: 5 }), [1, 1, 1], {
+      dynamic: true,
+    });
+    if ('error' in ico || ico.shape.kind !== 'poly') throw new Error('hull expected');
+    const Q = ico.shape.poly;
+    expect(Q.faces.length).toBe(5120);
+    for (let k = 0; k < 200; k++) {
+      const d: Vec3 = [rnd(), rnd(), rnd()];
+      const l = Math.hypot(...d);
+      let best = -Infinity;
+      for (let f = 0; f < Q.faces.length; f++)
+        best = Math.max(
+          best,
+          (Q.planes[f * 4] * d[0] + Q.planes[f * 4 + 1] * d[1] + Q.planes[f * 4 + 2] * d[2]) / l,
+        );
+      const face = supportingFace(ico.shape, d[0], d[1], d[2]);
+      const f = Q.faces.findIndex(
+        (fv) =>
+          fv.length * 3 === face.length &&
+          fv.every((v, j) => [0, 1, 2].every((a) => Q.verts[v * 3 + a] === face[j * 3 + a])),
+      );
+      expect(f).toBeGreaterThanOrEqual(0);
+      const got = (Q.planes[f * 4] * d[0] + Q.planes[f * 4 + 1] * d[1] + Q.planes[f * 4 + 2] * d[2]) / l;
+      expect(got).toBeCloseTo(best, 12);
+    }
+  });
+
   it('detects cuboid hulls, also rotated in object space', () => {
     const cube = buildCollisionShape('CONVEX_HULL', createCube({ size: 2 }), [1, 2, 3], { dynamic: true });
     if ('error' in cube || cube.shape.kind !== 'poly') throw new Error();
@@ -695,6 +757,42 @@ describe('manifold helpers and math', () => {
     expect(out.length).toBe(4);
     for (const c of out) {
       expect(Math.max(Math.abs(c.pa[0]), Math.abs(c.pa[1]))).toBeLessThanOrEqual(1 + 1e-12);
+      expect(c.s).toBeCloseTo(-0.01, 12);
+    }
+  });
+
+  it('simplifies large faces before clipping (caps of high-poly hulls)', () => {
+    const disc = (n: number, r: number, z: number, ccw: boolean): number[] => {
+      const out: number[] = [];
+      for (let k = 0; k < n; k++) {
+        const a = (2 * Math.PI * (ccw ? k : n - 1 - k)) / n;
+        out.push(r * Math.cos(a), r * Math.sin(a), z);
+      }
+      return out;
+    };
+    const big = disc(256, 1, 0, true);
+    const deep: Vec3 = [Math.cos(0.3), Math.sin(0.3), 0];
+    const small = simplifyPolygon(big, 256, 0, 0, 1, deep);
+    expect(small.length / 3).toBeGreaterThanOrEqual(MAX_CLIP_VERTICES);
+    expect(small.length / 3).toBeLessThanOrEqual(MAX_CLIP_VERTICES + 1);
+    // a subsequence of the polygon's vertices (same winding) that keeps the deepest one
+    let last = -1;
+    for (let i = 0; i < small.length; i += 3) {
+      const k = big.findIndex((_, j) => j % 3 === 0 && big[j] === small[i] && big[j + 1] === small[i + 1]);
+      expect(k).toBeGreaterThan(last);
+      last = k;
+    }
+    const kDeep = Math.round((0.3 / (2 * Math.PI)) * 256) * 3;
+    expect(
+      small.some((_, i) => i % 3 === 0 && small[i] === big[kDeep] && small[i + 1] === big[kDeep + 1]),
+    ).toBe(true);
+    // a 256-gon cap resting on another: a full-size manifold, reduced to four points
+    const out: ContactCandidate[] = [];
+    expect(clipFeatures(big, disc(256, 1, -0.01, false), [0, 0, 1], 0.05, out)).toBeGreaterThan(4);
+    const four = reduceManifold(out);
+    expect(four.length).toBe(4);
+    for (const c of four) {
+      expect(Math.hypot(c.pa[0], c.pa[1])).toBeGreaterThan(0.97);
       expect(c.s).toBeCloseTo(-0.01, 12);
     }
   });

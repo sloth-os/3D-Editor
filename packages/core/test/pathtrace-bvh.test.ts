@@ -287,7 +287,7 @@ describe('two-level ray queries', () => {
       if (isect.inst !== bestInst) expect(Math.abs(isect.t - best)).toBeLessThan(1e-8);
     }
     expect(hits).toBeGreaterThan(200);
-  });
+  }, 30_000);
 
   it('is watertight: rays through shared vertices and edges never slip through', () => {
     const grid = createGrid({ x_subdivisions: 12, y_subdivisions: 12, size: 2 } as never);

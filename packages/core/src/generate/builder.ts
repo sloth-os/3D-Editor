@@ -6,7 +6,7 @@ import { createMesh, edgeKey } from '../mesh/types';
 import { createIcoSphere } from '../mesh/primitives';
 import { buildTopology } from '../mesh/topology';
 import { faceNormal } from '../mesh/normals';
-import { GeneratorLimitError, MAX_GENERATED_FACES } from './types';
+import { GeneratorLimitError, MAX_GENERATED_FACES, MAX_GENERATED_VERTICES } from './types';
 
 /*
  * Mesh construction kit for the procedural generators. `MeshBuilder` accumulates polygons with
@@ -46,10 +46,13 @@ export class MeshBuilder {
   private keyed: Map<string, number> | null = null;
 
   /**
-   * @param limit most faces and most vertices the mesh may get; adding more throws a
-   *   GeneratorLimitError, so oversized requests stop early instead of exhausting memory.
+   * Adding more than `maxFaces` faces or `maxVertices` vertices throws a GeneratorLimitError, so
+   * oversized requests stop early instead of exhausting memory.
    */
-  constructor(readonly limit = MAX_GENERATED_FACES) {}
+  constructor(
+    readonly maxFaces = MAX_GENERATED_FACES,
+    readonly maxVertices = MAX_GENERATED_VERTICES,
+  ) {}
 
   get vertexCount(): number {
     return this.positions.length / 3;
@@ -62,7 +65,7 @@ export class MeshBuilder {
   /** Appends a vertex; non-finite coordinates are replaced by 0. Returns its index. */
   vert(p: Readonly<Vec3>): number {
     const i = this.positions.length / 3;
-    if (i >= this.limit) throw new GeneratorLimitError(null, this.limit);
+    if (i >= this.maxVertices) throw new GeneratorLimitError(null, this.maxVertices, 'vertices');
     this.positions.push(fin(p[0]), fin(p[1]), fin(p[2]));
     return i;
   }
@@ -104,7 +107,7 @@ export class MeshBuilder {
       if (uvs) uvs.splice(-2, 2);
     }
     if (vs.length < 3 || new Set(vs).size !== vs.length) return -1;
-    if (this.faces.length >= this.limit) throw new GeneratorLimitError(null, this.limit);
+    if (this.faces.length >= this.maxFaces) throw new GeneratorLimitError(null, this.maxFaces);
     this.faces.push(vs);
     this.faceUVs.push(uvs);
     this.faceMats.push(Math.max(0, Math.floor(mat)));

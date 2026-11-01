@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { Vec3 } from '../math/types';
 import { compose4 } from '../math/mat4';
 import { meshBounds, meshStats } from '../mesh/types';
-import type { OperatorContext } from './context';
+import { OperatorError, type OperatorContext } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { pollObjectMode, setSelection, vec3 } from './helpers';
 import {
@@ -27,6 +27,8 @@ import {
   TERRAIN_DEFAULTS,
   TREE_DEFAULTS,
   WHEEL_DEFAULTS,
+  GeneratorLimitError,
+  MAX_GENERATED_FACES,
   generateArch,
   generateBarrel,
   generateBlob,
@@ -100,10 +102,17 @@ type CommonParams = {
   materials: boolean;
 };
 
+/** Results above this many faces get a WARNING report (heavy for the viewport and for syncing). */
+export const LARGE_GENERATED_FACES = 250_000;
+
 const TAIL =
   'Object Mode only. The new object becomes the selection and the active object. ' +
+  `A mesh may have at most ${MAX_GENERATED_FACES.toLocaleString('en-US')} faces: larger requests fail ` +
+  'without changes, naming the parameters to lower. Inputs that cannot produce any geometry (e.g. too few ' +
+  'distinct points) fail too; inputs that were partly ignored are reported as warnings. ' +
   'Returns {object (id), name, mesh (id), vertices, faces, triangles, dimensions (bounding box size along the ' +
-  "object's axes × scale, metres), bounds (world-space {min, max}), material_slots: [{index, name, material}]}.";
+  "object's axes × scale, metres), bounds (world-space {min, max}), material_slots: [{index, name, material}], " +
+  'warnings (only when there are any)}.';
 
 /** Result of every object.generate_* operator. */
 export interface GeneratedObjectInfo {
@@ -116,6 +125,8 @@ export interface GeneratedObjectInfo {
   dimensions: Vec3;
   bounds: { min: Vec3; max: Vec3 };
   material_slots: { index: number; name: string; material: string | null }[];
+  /** Input problems the generator worked around (also reported as WARNING). */
+  warnings?: string[];
 }
 
 /** Id of the material used for a generator default: an existing material of that name, else a new one. */
@@ -182,7 +193,42 @@ export function addGeneratedObject(
     dimensions: [0, 1, 2].map((k) => r6((local.max[k] - local.min[k]) * Math.abs(scale[k]))) as Vec3,
     bounds: { min: bounds.min.map(r6) as Vec3, max: bounds.max.map(r6) as Vec3 },
     material_slots: res.materials.map((mat, index) => ({ index, name: mat.name, material: slots[index] })),
+    ...(res.warnings?.length ? { warnings: res.warnings.slice() } : {}),
   };
+}
+
+/**
+ * Runs a generator for an operator: oversized requests and inputs without any geometry become
+ * INVALID_PARAMS errors (before anything is added to the document), warnings become reports.
+ * `lower` names the parameters that drive the size of the result (for the messages).
+ */
+export function runGenerator(
+  ctx: OperatorContext,
+  label: string,
+  lower: string,
+  build: () => GeneratorResult,
+): GeneratorResult {
+  let res: GeneratorResult;
+  try {
+    res = build();
+  } catch (err) {
+    if (err instanceof GeneratorLimitError)
+      throw new OperatorError(`${label}: ${err.message}; lower ${lower}`, 'INVALID_PARAMS');
+    throw err;
+  }
+  if (res.mesh.faces.length === 0)
+    throw new OperatorError(
+      `${label}: nothing to generate${res.warnings?.length ? `: ${res.warnings.join('; ')}` : ''}`,
+      'INVALID_PARAMS',
+    );
+  for (const w of res.warnings ?? []) ctx.report('WARNING', `${label}: ${w}`);
+  const faces = res.mesh.faces.length;
+  if (faces > LARGE_GENERATED_FACES)
+    ctx.report(
+      'WARNING',
+      `${label}: large mesh (${faces.toLocaleString('en-US')} faces); lower ${lower} for a lighter scene`,
+    );
+  return res;
 }
 
 /** Registers one generator operator `object.generate_<kind>`. */
@@ -192,6 +238,8 @@ function generator<S extends z.ZodRawShape>(
     kind: string;
     label: string;
     description: string;
+    /** Parameters to lower when the result is too big (used in error and warning messages). */
+    lower: string;
     shape: S;
     build: (p: z.output<z.ZodObject<S>>) => GeneratorResult;
   },
@@ -208,7 +256,8 @@ function generator<S extends z.ZodRawShape>(
       poll: pollObjectMode,
       execute(ctx, p) {
         const params = p as unknown as z.output<z.ZodObject<S>> & CommonParams;
-        return addGeneratedObject(ctx, def.label, def.build(params), params);
+        const res = runGenerator(ctx, def.label, def.lower, () => def.build(params));
+        return addGeneratedObject(ctx, def.label, res, params);
       },
     }),
   );
@@ -227,6 +276,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'terrain',
     label: 'Terrain',
+    lower: 'subdivisions',
     description:
       'Generate a noise heightfield terrain: a square grid of `size` × `size` metres centred on the object origin ' +
       'with heights spanning exactly z = 0 … `height` (fractal gradient noise; optional island falloff and ' +
@@ -323,6 +373,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'rock',
     label: 'Rock',
+    lower: 'detail',
     description:
       'Generate a rock or boulder: a noise-displaced icosphere with flat fractured facets, resting on z = 0 and ' +
       'centred on the Z axis (origin at the bottom centre). Material slot 0 Rock.',
@@ -363,6 +414,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'tree',
     label: 'Tree',
+    lower: 'branch_levels, branches, leaf_density or resolution',
     description:
       'Generate a tree standing on z = 0 with its trunk on the object Z axis (origin at the foot of the trunk); ' +
       'the total height including foliage is exactly `height`. Styles: DECIDUOUS (tapered trunk with ' +
@@ -431,6 +483,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'bush',
     label: 'Bush',
+    lower: 'density',
     description:
       'Generate a bush: a dome of leafy clumps on a few short stems, standing on z = 0 and centred on the Z ' +
       'axis; its height is exactly `height`. Material slots: 0 Bark (stems), 1 Leaves.',
@@ -457,6 +510,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'grass_tuft',
     label: 'Grass',
+    lower: 'blades',
     description:
       'Generate a tuft of curved, pointed grass blades (thin closed blades) rooted around the object origin ' +
       'on z = 0. Material slot 0 Grass. Tip: scatter it with object.scatter_on_surface or object.scatter_add.',
@@ -494,6 +548,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'flower',
     label: 'Flower',
+    lower: 'petals',
     description:
       'Generate a flower: a curved stem with leaves, a ring of petals and a centre disc, standing on z = 0 ' +
       '(origin at the foot of the stem). Material slots: 0 Stem (stem and leaves), 1 Petals, 2 Flower Center.',
@@ -539,6 +594,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'building',
     label: 'Building',
+    lower: 'floors, window_rows, window_cols / window_cols_side, or width and depth',
     description:
       'Generate a multi-storey building: a closed wall shell with recessed windows (reveal, frame and glass) ' +
       'on every facade, a front door, and a FLAT (with parapet), GABLE or HIP roof. The footprint ' +
@@ -633,6 +689,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'stairs',
     label: 'Stairs',
+    lower: 'steps',
     description:
       'Generate stairs. STRAIGHT: the flight climbs along +Y starting at y = 0 (front edge of the first step), ' +
       'centred on X, solid down to the ground or a sloped slab. SPIRAL: wedge-shaped treads wind around a ' +
@@ -682,6 +739,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'fence',
     label: 'Fence',
+    lower: 'the number of points or the path length, or raise post_spacing and picket_width / picket_gap',
     description:
       'Generate a fence along a path of points (object space, relative to the object origin): posts at every ' +
       'path point plus intermediate posts at most post_spacing apart, with horizontal rails (RAIL) or two rails ' +
@@ -694,7 +752,8 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
         .nullable()
         .default(null)
         .describe(
-          'Path points [x, y] or [x, y, z] in metres relative to the object origin (null = straight fence)',
+          'Path points [x, y] or [x, y, z] in metres relative to the object origin; at least 2 at distinct ' +
+            '[x, y] positions (fewer fail). null or [] = a straight fence of `length` along +X',
         ),
       length: z
         .number()
@@ -746,6 +805,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'column',
     label: 'Column',
+    lower: 'segments or flutes',
     description:
       'Generate a classical (Doric-like) column standing on z = 0 with its axis on Z: a slightly tapered, ' +
       'optionally fluted shaft, a square plinth with torus moulding (base) and an echinus + square abacus ' +
@@ -789,6 +849,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'arch',
     label: 'Arch',
+    lower: 'segments',
     description:
       'Generate a free-standing masonry arch: two piers and a ROUND (semicircular, or segmental when too low) ' +
       'or POINTED (gothic) opening, standing on z = 0 with the opening centred on the origin, spanning X and ' +
@@ -838,6 +899,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'table',
     label: 'Table',
+    lower: 'the table parameters',
     description:
       'Generate a table standing on z = 0, centred on the origin: RECTANGLE (top, four legs, aprons) or ROUND ' +
       '(round top on a pedestal). Material slots: 0 Wood (top), 1 Wood Dark (legs and frame).',
@@ -880,6 +942,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'chair',
     label: 'Chair',
+    lower: 'the chair parameters',
     description:
       'Generate a chair standing on z = 0, centred on the origin and facing −Y (the backrest is on the +Y side): ' +
       'seat, four legs with side stretchers and a slatted or panel backrest. Material slots: 0 Wood (seat and ' +
@@ -922,6 +985,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'shelf',
     label: 'Shelf',
+    lower: 'shelves',
     description:
       'Generate an open bookshelf standing on z = 0, centred on the origin and facing −Y: two side boards, ' +
       'evenly spaced shelves (including bottom and top), a plinth and an optional back panel. Material slots: ' +
@@ -951,6 +1015,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'wheel',
     label: 'Wheel',
+    lower: 'spokes or segments',
     description:
       'Generate a wheel (cylinder based): a rounded tyre around a rim band, hub and spokes (or a solid disc), ' +
       'centred on the origin with its axle along X (rolls along Y; set location z = radius to stand it on ' +
@@ -1001,6 +1066,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'barrel',
     label: 'Barrel',
+    lower: 'staves or hoops',
     description:
       'Generate a wooden barrel (cylinder based) standing on z = 0 with its axis on Z: bulging stave body with ' +
       'recessed heads and metal hoops. Material slots: 0 Barrel Wood (staves and heads), 1 Iron (hoops).',
@@ -1034,6 +1100,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'gear',
     label: 'Gear',
+    lower: 'teeth',
     description:
       'Generate a spur gear lying in the XY plane, centred on the origin (z = ±thickness/2) with its axis on Z: ' +
       'trapezoidal teeth and an optional central bore hole. Material slot 0 Steel.',
@@ -1070,6 +1137,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'spring',
     label: 'Spring',
+    lower: 'turns, resolution (path samples per turn) or wire_segments',
     description:
       'Generate a helical coil spring: a round wire swept along a helix around the Z axis, standing on z = 0 ' +
       '(origin at the bottom centre), total height exactly `height`, with optionally closed (flat) end coils. ' +
@@ -1119,6 +1187,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'pipe',
     label: 'Pipe',
+    lower: 'the number of points, segments or bend_segments',
     description:
       'Generate a pipe: a circle of `radius` swept along a list of points (object space, relative to the object ' +
       'origin) with rounded bends (or sharp mitred corners), optional wall thickness (hollow) and closed ends. ' +
@@ -1130,7 +1199,8 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
         .max(10000)
         .default(PI.points)
         .describe(
-          'Path points [x, y, z] (or [x, y]) in metres relative to the object origin; 2+ distinct points',
+          'Path points [x, y, z] (or [x, y]) in metres relative to the object origin; at least 2 distinct ' +
+            'points (coincident points fail)',
         ),
       radius: z.number().min(0.0001).max(1000).default(PI.radius).describe('Outer radius in metres'),
       segments: z.number().int().min(3).max(128).default(PI.segments).describe('Vertices around the pipe'),
@@ -1169,6 +1239,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'cloud',
     label: 'Cloud',
+    lower: 'resolution',
     description:
       'Generate a puffy cumulus cloud: a smooth union of spheres (base layer plus smaller puffs heaped on top) ' +
       'meshed with marching cubes and stretched to exactly `size`, centred on the Z axis with its (optionally ' +
@@ -1207,6 +1278,7 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
   generator(reg, {
     kind: 'blob',
     label: 'Blob',
+    lower: 'resolution',
     description:
       'Generate an organic blob: the smooth union of spheres (metaball-like signed distance blend) meshed with ' +
       'marching cubes. Give explicit `spheres` (object space, kept as given) or let `count` random spheres fill ' +
@@ -1222,7 +1294,11 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
         .max(256)
         .nullable()
         .default(BLOB_DEFAULTS.spheres)
-        .describe('Explicit spheres; null or empty = random spheres from count/size/seed'),
+        .describe(
+          'Explicit spheres; null or empty = random spheres from count/size/seed. The grid spans all ' +
+            'spheres, so spheres much smaller than (their spread) / resolution are lost: such requests ' +
+            'fail (no surface) or warn',
+        ),
       count: z
         .number()
         .int()

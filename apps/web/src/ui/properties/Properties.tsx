@@ -1,62 +1,114 @@
-import { useState } from 'preact/hooks';
+import { signal } from '@preact/signals';
+import type { ObjectData } from '@3d-editor/core';
 import { session as sessionSig } from '../../app/store';
 import type { ProjectSession } from '../../project/session';
 import { Icon, type IconName } from '../icons';
 import { RenderTab, OutputTab, SceneTab, WorldTab } from './SceneTabs';
 import { ObjectTab } from './ObjectTab';
 import { ModifiersTab } from './ModifiersTab';
+import { ParticlesTab, canHaveParticles } from './ParticlesTab';
+import { PhysicsTab } from './PhysicsTab';
+import { ConstraintsTab } from './ConstraintsTab';
 import { DataTab } from './DataTab';
 import { MaterialTab } from './MaterialTab';
 
-type Tab = 'render' | 'output' | 'scene' | 'world' | 'object' | 'modifiers' | 'data' | 'material';
+/** Tabs of the Properties editor, in Blender's order. */
+export type PropertiesTabId =
+  | 'render'
+  | 'output'
+  | 'scene'
+  | 'world'
+  | 'object'
+  | 'modifiers'
+  | 'particles'
+  | 'physics'
+  | 'constraints'
+  | 'data'
+  | 'material';
 
-const TABS: { id: Tab; icon: IconName; title: string; needs?: 'object' | 'mesh' }[] = [
+interface TabDef {
+  id: PropertiesTabId;
+  icon: IconName;
+  title: string;
+  /** Whether the tab applies to the active object (scene tabs are always shown). */
+  available?: (o: ObjectData | null) => boolean;
+}
+
+const hasObject = (o: ObjectData | null) => !!o;
+const isMesh = (o: ObjectData | null) => o?.type === 'MESH';
+
+const TABS: TabDef[] = [
   { id: 'render', icon: 'render', title: 'Render' },
   { id: 'output', icon: 'output', title: 'Output' },
   { id: 'scene', icon: 'scene', title: 'Scene' },
   { id: 'world', icon: 'world', title: 'World' },
-  { id: 'object', icon: 'object', title: 'Object', needs: 'object' },
-  { id: 'modifiers', icon: 'wrench', title: 'Modifiers', needs: 'mesh' },
-  { id: 'data', icon: 'data', title: 'Object Data', needs: 'object' },
-  { id: 'material', icon: 'material', title: 'Material', needs: 'mesh' },
+  { id: 'object', icon: 'object', title: 'Object', available: hasObject },
+  { id: 'modifiers', icon: 'wrench', title: 'Modifiers', available: isMesh },
+  { id: 'particles', icon: 'particles', title: 'Particles', available: (o) => !!o && canHaveParticles(o) },
+  { id: 'physics', icon: 'physics', title: 'Physics', available: hasObject },
+  { id: 'constraints', icon: 'constraint', title: 'Object Constraints', available: hasObject },
+  { id: 'data', icon: 'data', title: 'Object Data', available: hasObject },
+  { id: 'material', icon: 'material', title: 'Material', available: isMesh },
 ];
 
-export const propertiesTab = { current: 'object' as Tab };
+/**
+ * The selected Properties tab. A signal so other editors can switch it (e.g. clicking a modifier
+ * or constraint in the Outliner opens its tab, like Blender).
+ */
+export const activePropertiesTab = signal<PropertiesTabId>('object');
+
+/** @deprecated use {@link activePropertiesTab}; kept for existing callers. */
+export const propertiesTab = {
+  get current(): PropertiesTabId {
+    return activePropertiesTab.value;
+  },
+  set current(v: PropertiesTabId) {
+    activePropertiesTab.value = v;
+  },
+};
+
+/** Tabs shown for the given active object. */
+export function availableTabs(active: ObjectData | null): PropertiesTabId[] {
+  return TABS.filter((t) => !t.available || t.available(active)).map((t) => t.id);
+}
 
 export function Properties({ session }: { session: ProjectSession }) {
   void session.revision.value;
   const activeId = session.state.$activeId.value;
   const active = activeId ? session.doc.getObject(activeId) : null;
-  const [tab, setTab] = useState<Tab>(propertiesTab.current);
-  const available = TABS.filter(
-    (t) => !t.needs || (t.needs === 'object' ? !!active : active?.type === 'MESH'),
-  );
-  const current = available.find((t) => t.id === tab) ? tab : available.find((t) => t.id === 'scene')!.id;
+  const tab = activePropertiesTab.value;
+  const available = TABS.filter((t) => !t.available || t.available(active));
+  // an unavailable tab falls back to Scene without forgetting the choice (it returns when the
+  // active object supports it again, as in Blender)
+  const current = available.some((t) => t.id === tab) ? tab : 'scene';
   return (
     <div class="properties" onPointerDown={(e) => e.stopPropagation()}>
-      <div class="prop-tabs">
+      <div class="prop-tabs" role="tablist" aria-orientation="vertical">
         {available.map((t) => (
           <button
             key={t.id}
             class={current === t.id ? 'active' : ''}
             title={t.title}
+            role="tab"
+            aria-selected={current === t.id}
+            aria-label={t.title}
             data-testid={`prop-tab-${t.id}`}
-            onClick={() => {
-              propertiesTab.current = t.id;
-              setTab(t.id);
-            }}
+            onClick={() => (activePropertiesTab.value = t.id)}
           >
             <Icon name={t.icon} />
           </button>
         ))}
       </div>
-      <div class="prop-content" data-testid={`prop-content-${current}`}>
+      <div class="prop-content" role="tabpanel" data-testid={`prop-content-${current}`}>
         {current === 'render' && <RenderTab s={session} />}
         {current === 'output' && <OutputTab s={session} />}
         {current === 'scene' && <SceneTab s={session} />}
         {current === 'world' && <WorldTab s={session} />}
         {current === 'object' && active && <ObjectTab s={session} o={active} />}
         {current === 'modifiers' && active && <ModifiersTab s={session} o={active} />}
+        {current === 'particles' && active && <ParticlesTab s={session} o={active} />}
+        {current === 'physics' && active && <PhysicsTab s={session} o={active} />}
+        {current === 'constraints' && active && <ConstraintsTab s={session} o={active} />}
         {current === 'data' && active && <DataTab s={session} o={active} />}
         {current === 'material' && active && <MaterialTab s={session} o={active} />}
       </div>

@@ -169,8 +169,7 @@ export function simplifyPolygon(
   }
   if (deep) extreme(deep[0], deep[1], deep[2]);
   const out: number[] = [];
-  for (let i = 0; i < count; i++)
-    if (keep[i]) out.push(poly[i * 3], poly[i * 3 + 1], poly[i * 3 + 2]);
+  for (let i = 0; i < count; i++) if (keep[i]) out.push(poly[i * 3], poly[i * 3 + 1], poly[i * 3 + 2]);
   // a degenerate (non-finite or collapsed) face stays as it was
   return out.length >= 9 ? out : Array.from({ length: count * 3 }, (_, i) => poly[i]);
 }

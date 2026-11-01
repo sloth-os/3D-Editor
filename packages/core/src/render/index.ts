@@ -73,6 +73,7 @@ export {
   createPathTile,
   pathTileTransferables,
   denoiseFilm,
+  viewCameraData,
   type CompiledScene,
   type PathTracerSettings,
   type PathTraceProgress,
@@ -114,11 +115,17 @@ export interface SoftwareRenderOptions {
    * exposure and `view_transform` (AgX by default, like Blender); the rasterizer uses Standard.
    */
   engine?: RenderEngine;
-  /** PATHTRACER: maximum diffuse/glossy bounces (default: render settings `max_bounces`). */
+  /**
+   * PATHTRACER: maximum bounces of any kind (diffuse, glossy, transmission), Blender's Total
+   * (default: render settings `max_bounces`; 0 = direct light only).
+   */
   max_bounces?: number;
   /** PATHTRACER: denoise the image (default: render settings `use_denoising`). */
   denoise?: boolean;
-  /** PATHTRACER: wall-clock budget in seconds (0 / unset = none; at least one sample is rendered). */
+  /**
+   * PATHTRACER: wall-clock budget in seconds for compiling, sampling and the estimated denoising
+   * (0 / unset = none). One sample per pixel is always rendered, so huge images can take longer.
+   */
   time_limit?: number;
   /** PATHTRACER: noise pattern seed (default 0; same seed and settings give the same image). */
   seed?: number;
@@ -337,7 +344,11 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
   const meshes = renderItems(scene, { forRender: true }).filter((o) => o.mesh.faces.length > 0);
   const bounds = evaluatedBounds(meshes);
   const view = resolveView(doc, scene, opts, aspect, bounds);
-  if ((opts.engine ?? doc.getRender().engine) === 'PATHTRACER' && opts.shading !== 'SOLID' && !opts.wireframe) {
+  if (
+    (opts.engine ?? doc.getRender().engine) === 'PATHTRACER' &&
+    opts.shading !== 'SOLID' &&
+    !opts.wireframe
+  ) {
     const pt = renderPathTracedImage({
       scene,
       items: meshes,

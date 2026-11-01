@@ -1,6 +1,6 @@
 import type { Mat4, Vec2, Vec3 } from '../math/types';
 import { MeshBuilder, addBox, addPrism, clampNum } from './builder';
-import { MATERIALS, type GeneratorResult } from './types';
+import { MATERIALS, checkFaceBudget, type GeneratorResult } from './types';
 
 /*
  * Multi-storey building: a closed wall shell whose facades are cut into a T-junction free grid
@@ -129,17 +129,28 @@ export function generateBuilding(params: Partial<BuildingParams> = {}): Generato
   const wh = clampNum(p.window_height, 0.1, 100, BUILDING_DEFAULTS.window_height);
   const band = fh - sill - 0.3;
   const winH = Math.min(wh, (band - 0.2 * (rows - 1)) / rows);
-  facades.forEach((f, fi) => {
+  const columns = facades.map((f, fi) => {
     const wanted = fi % 2 === 0 ? p.window_cols : p.window_cols_side;
     const cols = Math.round(
       wanted === null || wanted === undefined || !Number.isFinite(wanted)
         ? Math.max(1, Math.floor(f.length / 2.5))
         : clampNum(wanted, 0, 200, 0),
     );
-    if (cols < 1 || winH < 0.2) return;
+    const ww = cols >= 1 ? Math.min(clampNum(p.window_width, 0.1, 100, 1.2), f.length / cols - 0.4) : 0;
+    return cols < 1 || winH < 0.2 || ww < 0.25 ? { cols: 0, ww } : { cols, ww };
+  });
+  // fail before laying out the facades: every window column splits the facade grid twice and
+  // every window adds about 25 faces (reveals, frame, glass, glazing bars)
+  const windowsPerStorey = columns.reduce((s, c) => s + c.cols, 0) * rows;
+  const gridLines = (cols: number) => 2 * cols + 2;
+  checkFaceBudget(
+    windowsPerStorey * floors * 25 +
+      (2 * floors * rows + 2) * columns.reduce((s, c) => s + gridLines(c.cols), 0),
+  );
+  facades.forEach((f, fi) => {
+    const { cols, ww } = columns[fi];
+    if (cols < 1) return;
     const pitch = f.length / cols;
-    const ww = Math.min(clampNum(p.window_width, 0.1, 100, 1.2), pitch - 0.4);
-    if (ww < 0.25) return;
     for (let fl = 0; fl < floors; fl++)
       for (let r = 0; r < rows; r++) {
         const t0 = fl * fh + sill + r * (winH + 0.2);
@@ -157,15 +168,37 @@ export function generateBuilding(params: Partial<BuildingParams> = {}): Generato
 
   const b = new MeshBuilder();
   const V = (f: Facade, s: number, t: number) => b.sharedVert(P(f, s, t));
-  const inside = (o: Opening, s: number, t: number) => s > o.s0 && s < o.s1 && t > o.t0 && t < o.t1;
+  /** Index of the grid line at `v` (the first line not below v − EPS; every opening edge is a line). */
+  const lineAt = (lines: readonly number[], v: number): number => {
+    let lo = 0;
+    let hi = lines.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (lines[mid] < v - EPS) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
 
   // ---------------------------------------------------------------- facade grid
   for (const f of facades) {
+    // grid cells covered by an opening (looked up per opening, not tested per cell and opening)
+    const nt = zs.length - 1;
+    const covered = new Uint8Array(Math.max(0, f.ss.length - 1) * Math.max(0, nt));
+    const span = new Map<Opening, { i0: number; i1: number; j0: number; j1: number }>();
+    for (const o of f.openings) {
+      const r = {
+        i0: lineAt(f.ss, o.s0),
+        i1: lineAt(f.ss, o.s1),
+        j0: lineAt(zs, o.t0),
+        j1: lineAt(zs, o.t1),
+      };
+      span.set(o, r);
+      for (let i = r.i0; i < r.i1; i++) for (let j = r.j0; j < r.j1; j++) covered[i * nt + j] = 1;
+    }
     for (let i = 0; i + 1 < f.ss.length; i++)
       for (let j = 0; j + 1 < zs.length; j++) {
-        const sm = (f.ss[i] + f.ss[i + 1]) / 2;
-        const tm = (zs[j] + zs[j + 1]) / 2;
-        if (f.openings.some((o) => inside(o, sm, tm))) continue;
+        if (covered[i * nt + j]) continue;
         b.face(
           [
             V(f, f.ss[i], zs[j]),
@@ -177,8 +210,9 @@ export function generateBuilding(params: Partial<BuildingParams> = {}): Generato
         );
       }
     for (const o of f.openings) {
-      const sIn = f.ss.filter((s) => s >= o.s0 - EPS && s <= o.s1 + EPS);
-      const tIn = zs.filter((t) => t >= o.t0 - EPS && t <= o.t1 + EPS);
+      const cells = span.get(o)!;
+      const sIn = f.ss.slice(cells.i0, cells.i1 + 1);
+      const tIn = zs.slice(cells.j0, cells.j1 + 1);
       const Q = (s: number, t: number, d = inset) => b.vert(P(f, s, t, d));
       const q = [Q(o.s0, o.t0), Q(o.s1, o.t0), Q(o.s1, o.t1), Q(o.s0, o.t1)];
       o.q = q;

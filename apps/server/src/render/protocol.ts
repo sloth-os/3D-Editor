@@ -71,14 +71,40 @@ export interface PreparedInfo {
   prepareMs: number;
 }
 
-/** A rendered RGBA8 image (top row first). */
+/** A rendered image: RGBA8 pixels (top row first) and/or the PNG file (when requested). */
 export interface ImageResult {
   width: number;
   height: number;
-  data: Uint8ClampedArray;
+  data?: Uint8ClampedArray;
+  png?: Uint8Array;
   /** Path tracing statistics (absent for raster renders). */
   pathtrace?: { samples: number; requested: number; stopped: 'done' | 'time' | 'cancelled' };
   warnings?: string[];
+}
+
+/**
+ * The mean film of a path traced render (`PathFilm.resolve()`): what `finish` denoises and tone
+ * maps on a render thread.
+ */
+export interface FilmBuffers {
+  width: number;
+  height: number;
+  color: Float32Array;
+  emission: Float32Array;
+  variance: Float32Array;
+  albedo: Float32Array;
+  normal: Float32Array;
+  depth: Float32Array;
+}
+
+/** Display conversion of a film. */
+export interface FinishOptions {
+  denoise: boolean;
+  exposure: number;
+  viewTransform: ViewTransform;
+  displayBackground: Vec4Tuple | null;
+  /** Return the PNG file instead of the pixels. */
+  png: boolean;
 }
 
 /** The fixed automatic view of an animation without a camera (null when the scene has a camera). */
@@ -97,7 +123,10 @@ export type WorkerRequest =
     }
   /** Frees a prepared job (no response). */
   | { type: 'release'; job: number }
-  | { type: 'image'; id: number; doc: DocRef; options: FrameOptions }
+  /** Renders a whole image on the thread; `png` returns the PNG file instead of the pixels. */
+  | { type: 'image'; id: number; doc: DocRef; options: FrameOptions; png?: boolean }
+  /** Denoises and tone maps a film (buffers transferred). */
+  | { type: 'finish'; id: number; film: FilmBuffers; options: FinishOptions }
   | {
       type: 'auto-view';
       id: number;
@@ -113,8 +142,7 @@ export type WorkerRequest =
 export type WorkerResult = PreparedInfo | PathTile | ImageResult | AutoViewResult | { ok: true };
 
 export type WorkerResponse =
-  | { type: 'result'; id: number; result: WorkerResult }
-  | { type: 'error'; id: number; message: string };
+  { type: 'result'; id: number; result: WorkerResult } | { type: 'error'; id: number; message: string };
 
 /** Error raised when a render is cancelled (client abort, shutdown). */
 export class RenderCancelledError extends Error {

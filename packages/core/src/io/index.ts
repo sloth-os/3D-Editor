@@ -30,6 +30,7 @@ export type {
   ImportResult,
 } from './types';
 export { readImageInfo, sniffImageMime, type ImageInfo } from './image-info';
+export { evaluatedBounds } from './common';
 
 const MIME: Record<ExportFormat, string> = {
   gltf: 'model/gltf+json',

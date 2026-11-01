@@ -909,3 +909,257 @@ describe('scene.measure / scene.raycast / scene.stats (read-only)', () => {
     expect(sel.objects.selected).toBe(1);
   });
 });
+
+describe('review regressions', () => {
+  it('drop_to_ground lifts objects generated at z = 0 under a terrain onto it', () => {
+    const t = setup();
+    t.ok('object.generate_terrain', { name: 'Land', subdivisions: 32 });
+    expect(t.ok('scene.raycast', { origin: [-8, -5, 50], objects: ['Land'] }).point[2]).toBeGreaterThan(1.5);
+    const rock = t.ok('object.generate_rock', { name: 'Stone', location: [-8, -5, 0] }).object;
+    const um = t.undo();
+    const r = t.ok('object.drop_to_ground', { objects: ['Stone'] });
+    expect(r.objects[0]).toMatchObject({ dropped: true, surface: 'Land' });
+    expect(r.objects[0].moved).toBeGreaterThan(1.5);
+    // no rock vertex is below the terrain any more, and the rock rests on it
+    const w = t.world(rock);
+    let deepest = -Infinity;
+    for (let i = 0; i < w.points.length; i += 9) {
+      const p = transformPoint3(w.m, [w.points[i], w.points[i + 1], w.points[i + 2]]);
+      const g = t.ok('scene.raycast', { origin: [p[0], p[1], 100], objects: ['Land'] });
+      deepest = Math.max(deepest, g.point[2] - p[2]);
+    }
+    expect(deepest).toBeLessThan(1e-6);
+    const m = t.ok('scene.measure', { objects: ['Stone', 'Land'] });
+    expect(m.distances[0].surface_distance).toBeLessThan(1e-4);
+    um.undo();
+    expect(t.world(rock).origin).toEqual([-8, -5, 0]);
+  });
+
+  it('drop_to_ground and snap_to_surface land on instanced geometry, like scene.raycast sees it', () => {
+    const t = setup();
+    t.ok('collection.create', { name: 'Env' });
+    const floor = t.ok('mesh.primitive_plane_add', { name: 'Floor', size: 20, location: [0, 0, 2] }).object;
+    t.ok('object.select', { objects: [floor] });
+    t.ok('object.move_to_collection', { collection: 'Env' });
+    t.doc.updateObject(floor, { hide_viewport: true });
+    const inst = t.ok('object.collection_instance_add', { collection: 'Env' }).object;
+    const box = t.cube('Box', 1, [1, 1, 10]);
+    expect(t.ok('scene.raycast', { origin: [1, 1, 20], exclude: ['Box'] })).toMatchObject({
+      hit: true,
+      name: 'Floor',
+      instancer: inst,
+    });
+    const d = t.ok('object.drop_to_ground', { objects: ['Box'] });
+    expect(d.objects[0]).toMatchObject({ surface: 'Floor', moved: -7.5, location: [1, 1, 2.5] });
+    t.doc.updateObject(box, { location: [3, 3, 9] });
+    const s = t.ok('object.snap_to_surface', {
+      objects: ['Box'],
+      ray_origin: [3, 3, 20],
+      snap_point: 'BOTTOM',
+    });
+    expect(s.hit).toMatchObject({ name: 'Floor', instancer: inst });
+    expectVec(t.world(box).origin, [3, 3, 2.5]);
+    // an instance of the moved object itself is never its own ground
+    t.ok('collection.create', { name: 'Props' });
+    t.ok('object.select', { objects: [box] });
+    t.ok('object.move_to_collection', { collection: 'Props' });
+    t.ok('object.collection_instance_add', { collection: 'Props', location: [0, 0, -4] });
+    t.doc.updateObject(box, { location: [3, 3, 9] });
+    expect(t.ok('object.drop_to_ground', { objects: ['Box'] }).objects[0].surface).toBe('Floor');
+  });
+
+  it('array_place points constraint targets and modifier objects inside each copied group at the copies', () => {
+    const t = setup();
+    const target = t.ok('object.empty_add', { name: 'Target', location: [0, 5, 0] }).object;
+    const outside = t.ok('object.empty_add', { name: 'Outside', location: [9, 9, 9] }).object;
+    const lamp = t.cube('Lamp', 1, [0, 0, 3]);
+    t.ok('object.constraint_add', { type: 'TRACK_TO', object: 'Lamp', target: 'Target' });
+    t.ok('object.constraint_add', { type: 'COPY_SCALE', object: 'Lamp', target: 'Outside' });
+    t.ok('object.modifier_add', { type: 'MIRROR', object: lamp, params: { mirror_object: target } });
+    const um = t.undo();
+    const r = t.ok('object.array_place', {
+      objects: ['Target', 'Lamp'],
+      pattern: 'LINE',
+      count: 3,
+      offset: [10, 0, 0],
+    });
+    expect(r.items).toHaveLength(2);
+    for (const item of r.items as string[][]) {
+      const copies = item.map((id) => t.doc.getObject(id)!);
+      const tCopy = copies.find((o) => o.name.startsWith('Target'))!;
+      const lCopy = copies.find((o) => o.name.startsWith('Lamp'))!;
+      expect(lCopy.constraints[0].target).toBe(tCopy.id);
+      expect(lCopy.constraints[1].target).toBe(outside); // outside the copied group: unchanged
+      expect(lCopy.modifiers[0].params.mirror_object).toBe(tCopy.id);
+    }
+    // the original keeps its own references
+    expect(t.doc.getObject(lamp)!.constraints[0].target).toBe(target);
+    um.undo();
+    expect(t.doc.listObjects()).toHaveLength(3);
+  });
+
+  it('look_at and align_to_normal write compatible eulers, so keyed rotations never flip', () => {
+    const t = setup();
+    const cam = t.ok('object.camera_add', { name: 'Cam', location: [0, 0, 0] }).object;
+    t.ctx.state.autoKeying = true;
+    const deg = Math.PI / 180;
+    const at = (a: number) => [10 * Math.cos(a * deg), 10 * Math.sin(a * deg), 0];
+    t.ctx.state.frame = 1;
+    t.ok('object.look_at', { objects: ['Cam'], point: at(260) });
+    t.ctx.state.frame = 11;
+    const r = t.ok('object.look_at', { objects: ['Cam'], point: at(280) });
+    expect(r.objects[0].rotation_euler[2]).toBeCloseTo(190 * deg, 6); // not -170°
+    t.ctx.state.frame = 6;
+    const w = t.world(cam).m;
+    const heading = (Math.atan2(-w[9], -w[8]) / deg + 360) % 360;
+    expect(heading).toBeCloseTo(270, 0);
+    // align_to_normal on flat ground keeps a rotation beyond π as it is (decompose4 wrapped it)
+    t.ctx.state.autoKeying = false;
+    const b = t.cube('Spun', 1, [5, 5, 3], [0, 0, 4]);
+    t.ok('object.drop_to_ground', { objects: ['Spun'], align_to_normal: true });
+    expectVec(t.doc.getObject(b)!.rotation_euler, [0, 0, 4]);
+    expect(t.world(b).min[2]).toBeCloseTo(0, 9);
+  });
+
+  it('independent (linked=false) copies are created in linear time with their own data', () => {
+    const t = setup();
+    const c = t.cube('C', 0.5, [0, 0, 0]);
+    const meshName = t.doc.getMeshBlock(t.doc.getObject(c)!.data!)!.name;
+    const t0 = performance.now();
+    const r = t.ok('object.array_place', {
+      objects: ['C'],
+      pattern: 'GRID',
+      columns: 100,
+      rows: 100,
+      spacing: [1, 1],
+      linked: false,
+    });
+    // ~100 s with a full rescan of the mesh names per copy before
+    expect(performance.now() - t0).toBeLessThan(20_000);
+    expect(r.count).toBe(9999);
+    const blocks = t.doc.listMeshBlocks();
+    expect(blocks).toHaveLength(10_000);
+    expect(new Set(blocks.map((b) => b.name)).size).toBe(10_000);
+    expect(blocks.map((b) => b.name)).toContain(`${meshName}.9999`);
+    const first = t.doc.getObject(r.objects[0])!;
+    expect(first.data).not.toBe(t.doc.getObject(c)!.data);
+    expect(t.doc.getMesh(first.data!)).toEqual(t.doc.getMesh(t.doc.getObject(c)!.data!));
+  }, 60_000);
+
+  it('unlinked copies share one data copy per item for objects that share data, and round trip', () => {
+    const t = setup();
+    const a = t.cube('A', 1, [0, 0, 0]);
+    t.ok('object.select', { objects: [a] });
+    t.ok('object.duplicate', { linked: true, offset: [2, 0, 0] });
+    const b = t.ctx.state.selectedIds[0];
+    expect(t.doc.getObject(b)!.data).toBe(t.doc.getObject(a)!.data);
+    const r = t.ok('object.array_place', { objects: [a, b], count: 3, offset: [0, 5, 0], linked: false });
+    const datas = (r.items as string[][]).map((item) => new Set(item.map((id) => t.doc.getObject(id)!.data)));
+    for (const d of datas) expect(d.size).toBe(1);
+    expect(new Set(datas.map((d) => [...d][0])).size).toBe(2);
+    // editing one item's data leaves the others alone
+    const firstData = [...datas[0]][0]!;
+    const moved = t.doc.getMeshCopy(firstData)!;
+    moved.positions[0] += 1;
+    t.doc.setMesh(firstData, moved);
+    expect(t.doc.getMesh([...datas[1]][0]!)!.positions[0]).toBe(
+      t.doc.getMesh(t.doc.getObject(a)!.data!)!.positions[0],
+    );
+    const copy = SceneDoc.fromSnapshot(JSON.parse(JSON.stringify(t.doc.toSnapshot())));
+    for (const id of r.objects as string[]) {
+      expect(copy.getObject(id)).toEqual(t.doc.getObject(id));
+      expect(copy.getMesh(copy.getObject(id)!.data!)).toEqual(t.doc.getMesh(t.doc.getObject(id)!.data!));
+    }
+  });
+
+  it('refuses to copy more than MAX_COPY_BYTES of data in one run, before creating anything', () => {
+    const t = setup();
+    t.ok('object.generate_terrain', { name: 'Big', subdivisions: 300 });
+    const before = [t.doc.listObjects().length, t.doc.listMeshBlocks().length];
+    const r = t.run('object.array_place', { objects: ['Big'], count: 40, linked: false });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/MB of object data \(limit 64 MB\): use linked=true/);
+    expect([t.doc.listObjects().length, t.doc.listMeshBlocks().length]).toEqual(before);
+    expect(t.ok('object.array_place', { objects: ['Big'], count: 40 }).count).toBe(39); // linked is fine
+  });
+
+  it('dimensions_set targets world sizes (parent scale included); LOCAL keeps Blender dimensions', () => {
+    const t = setup();
+    const root = t.ok('object.empty_add', { name: 'Root', scale: [2, 2, 2] }).object;
+    const c = t.cube('C', 1, [0, 0, 0]);
+    t.doc.setParent(c, root, true);
+    expectVec(t.doc.getObject(c)!.scale, [0.5, 0.5, 0.5]);
+    const r = t.ok('object.dimensions_set', { objects: ['C'], x: 4 });
+    expect(r).toMatchObject({ space: 'WORLD' });
+    expectVec(r.objects[0].dimensions, [4, 1, 1]);
+    expectVec(r.objects[0].scale, [2, 0.5, 0.5]);
+    const m = t.ok('scene.measure', { objects: ['C'] }).objects[0];
+    expectVec(m.bounds.size, [4, 1, 1]);
+    expectVec(m.world_dimensions, [4, 1, 1]);
+    expectVec(m.dimensions, [2, 0.5, 0.5]);
+    const l = t.ok('object.dimensions_set', { objects: ['C'], y: 3, space: 'LOCAL' });
+    expectVec(l.objects[0].dimensions, [2, 3, 0.5]);
+    expectVec(t.ok('scene.measure', { objects: ['C'] }).objects[0].bounds.size, [4, 6, 1]);
+  });
+
+  it('array_place CIRCLE counts angles within 0.01 of 2π as a full turn', () => {
+    for (const [angle, expected] of [
+      [6.283185, [0, 90, 180, -90]],
+      [6.28, [0, 90, 180, -90]],
+      [-6.2832, [0, -90, 180, 90]],
+      [(330 * Math.PI) / 180, [0, 110, -140, -30]], // a real partial arc still ends at its angle
+    ] as [number, number[]][]) {
+      const t = setup();
+      const c = t.cube('C', 1, [5, 0, 0]);
+      const r = t.ok('object.array_place', {
+        objects: ['C'],
+        pattern: 'CIRCLE',
+        count: 4,
+        center: [0, 0, 0],
+        angle,
+      });
+      const got = [c, ...r.objects].map((id: string) => {
+        const o = t.world(id).origin;
+        const a = Math.round((Math.atan2(o[1], o[0]) * 180) / Math.PI);
+        return a === -180 ? 180 : a;
+      });
+      expect(got, `angle ${angle}`).toEqual(expected);
+    }
+  });
+
+  it('scatter_on_surface places copies upright on mirrored (negative scale) surfaces', () => {
+    const t = setup();
+    t.ok('mesh.primitive_plane_add', { name: 'Ground', size: 10, scale: [-1, 1, 1] });
+    t.cube('Box', 1, [0, 0, 5]);
+    expect(
+      t.ok('object.scatter_on_surface', { surface: 'Ground', objects: ['Box'], count: 10, max_slope: 0.5 })
+        .count,
+    ).toBe(10);
+    const r = t.ok('object.scatter_on_surface', {
+      surface: 'Ground',
+      objects: ['Box'],
+      count: 3,
+      align_to_normal: true,
+      rotation_random: 0,
+    });
+    for (const id of r.objects) expectVec(axis(t.world(id).m, 2), [0, 0, 1]);
+  });
+
+  it('scene.measure reports the exact surface distance of crossing beams and of instance geometry', () => {
+    const t = setup();
+    t.ok('mesh.primitive_cube_add', { name: 'A', size: 2, location: [0, 0, 0], scale: [5, 0.1, 0.1] });
+    t.ok('mesh.primitive_cube_add', { name: 'B', size: 2, location: [0, 0, 0.5], scale: [0.1, 5, 0.1] });
+    const d = t.ok('scene.measure', { objects: ['A', 'B'] }).distances[0];
+    expect(d).toMatchObject({ bounds_gap: 0.3, surface_distance: 0.3, intersecting: false });
+    expect(d.closest_points[0][2]).toBeCloseTo(0.1, 9);
+    expect(d.closest_points[1][2]).toBeCloseTo(0.4, 9);
+    t.ok('collection.create', { name: 'Props' });
+    const prop = t.cube('Prop', 1, [0, 0, 0]);
+    t.ok('object.select', { objects: [prop] });
+    t.ok('object.move_to_collection', { collection: 'Props' });
+    t.doc.updateObject(prop, { hide_viewport: true });
+    t.ok('object.collection_instance_add', { collection: 'Props', name: 'Inst', location: [0, 0, 3] });
+    const di = t.ok('scene.measure', { objects: ['Inst', 'B'] }).distances[0];
+    expect(di.surface_distance).toBeCloseTo(3 - 0.5 - 0.6, 9);
+  });
+});

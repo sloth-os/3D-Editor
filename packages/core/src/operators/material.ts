@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { MaterialData } from '../doc/types';
+import type { MaterialData, ObjectType } from '../doc/types';
 import { cloneMesh } from '../mesh/types';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { OperatorError, type OperatorContext } from './context';
@@ -42,6 +42,11 @@ function resolveMaterial(ctx: OperatorContext, ref: string): string {
   return m.id;
 }
 
+/** Object types whose geometry has material slots (meshes, and curves/text through their splines). */
+function hasMaterialSlots(type: ObjectType): boolean {
+  return type === 'MESH' || type === 'CURVE' || type === 'FONT';
+}
+
 export function registerMaterialOperators(reg: OperatorRegistry): void {
   reg.register(
     defineOperator({
@@ -59,7 +64,7 @@ export function registerMaterialOperators(reg: OperatorRegistry): void {
         const id = ctx.doc.addMaterial({ name: p.name, ...pickDefined(p, Object.keys(materialProps)) });
         if (p.assign) {
           for (const o of selectedObjects(ctx)) {
-            if (o.type !== 'MESH') continue;
+            if (!hasMaterialSlots(o.type)) continue;
             const slots = o.material_slots.length ? [...o.material_slots] : [null];
             const idx = Math.max(
               0,
@@ -129,10 +134,13 @@ export function registerMaterialOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.material_slot_add',
       label: 'Add Material Slot',
-      description: 'Add an empty material slot to the active object.',
+      description: 'Add an empty material slot to the active mesh, curve or text object.',
       category: 'Material',
       schema: z.object({}),
-      poll: (ctx) => (activeObject(ctx)?.type === 'MESH' ? true : 'Active object must be a mesh'),
+      poll: (ctx) => {
+        const o = activeObject(ctx);
+        return o && hasMaterialSlots(o.type) ? true : 'Active object must be a mesh, curve or text object';
+      },
       execute(ctx) {
         const o = activeObject(ctx)!;
         ctx.doc.updateObject(o.id, { material_slots: [...o.material_slots, null] });
@@ -144,7 +152,9 @@ export function registerMaterialOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.material_slot_remove',
       label: 'Remove Material Slot',
-      description: 'Remove a material slot from the active object; faces using it fall back to slot 0.',
+      description:
+        'Remove a material slot from the active object; faces (meshes) or splines (curves and text) using it fall ' +
+        'back to slot 0.',
       category: 'Material',
       schema: z.object({ index: z.number().int().min(0).optional() }),
       poll: (ctx) => ((activeObject(ctx)?.material_slots.length ?? 0) > 0 ? true : 'No material slots'),
@@ -154,10 +164,17 @@ export function registerMaterialOperators(reg: OperatorRegistry): void {
         if (index >= o.material_slots.length)
           throw new OperatorError('Slot index out of range', 'INVALID_PARAMS');
         ctx.doc.updateObject(o.id, { material_slots: o.material_slots.filter((_, i) => i !== index) });
+        const remap = (mi: number) => (mi === index ? 0 : mi > index ? mi - 1 : mi);
         if (o.data && o.type === 'MESH') {
           const m = cloneMesh(ctx.doc.getMesh(o.data)!);
-          m.faceMaterials = m.faceMaterials.map((mi) => (mi === index ? 0 : mi > index ? mi - 1 : mi));
+          m.faceMaterials = m.faceMaterials.map(remap);
           ctx.doc.setMesh(o.data, m);
+        } else if (o.data && (o.type === 'CURVE' || o.type === 'FONT')) {
+          const c = ctx.doc.getCurve(o.data);
+          if (c && c.splines.some((sp) => remap(sp.material_index) !== sp.material_index))
+            ctx.doc.updateCurve(o.data, {
+              splines: c.splines.map((sp) => ({ ...sp, material_index: remap(sp.material_index) })),
+            });
         }
       },
     }),

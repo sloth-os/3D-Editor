@@ -109,7 +109,13 @@ describe('renderSceneSoftware dispatch', () => {
     expect(
       same(
         a,
-        renderSceneSoftware(doc, { ...base, engine: 'PATHTRACER', samples: 8, denoise: false, max_bounces: 2 }),
+        renderSceneSoftware(doc, {
+          ...base,
+          engine: 'PATHTRACER',
+          samples: 8,
+          denoise: false,
+          max_bounces: 2,
+        }),
       ),
     ).toBe(true);
     // zero bounces still gives direct light (Cycles semantics); bounces add indirect light
@@ -262,6 +268,36 @@ describe('display transforms', () => {
     // exposure is applied before the transform
     doc.updateRender({ exposure: -2 });
     near(centre(renderSceneSoftware(doc, opts)).slice(0, 3), expected('AGX', 0.75, 0.1875, 0.075));
+  });
+
+  it('filmToRGBA8 (by lookup tables) matches the exact transforms within one 8-bit step', () => {
+    // regression: whole images went through a dozen Math.pow calls per pixel (AgX ≈ 2 µs/pixel)
+    let s = 7;
+    const rnd = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296;
+    const n = 20000;
+    const lin = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      const a = i % 5 === 0 ? rnd() : 1;
+      for (let k = 0; k < 3; k++) lin[i * 4 + k] = rnd() < 0.05 ? 0 : a * 2 ** (-14 + 23 * rnd());
+      lin[i * 4 + 3] = a;
+    }
+    for (const vt of VIEW_TRANSFORMS)
+      for (const bg of [null, [0.2, 0.5, 0.9, 0.7] as const]) {
+        const img = filmToRGBA8(lin, n, 1, 1.3, vt, bg);
+        let worst = 0;
+        for (let i = 0; i < n; i++) {
+          const a = lin[i * 4 + 3];
+          const rest = (1 - a) * (bg ? bg[3] : 0);
+          if (vt === 'STANDARD' && rest === 0) continue; // the rasterizer's byte table, as before
+          show(vt, (lin[i * 4] * 1.3) / a, (lin[i * 4 + 1] * 1.3) / a, (lin[i * 4 + 2] * 1.3) / a).forEach(
+            (v, k) => {
+              const exact = Math.round(((v * a + (bg ? bg[k] : 0) * rest) / (a + rest)) * 255);
+              worst = Math.max(worst, Math.abs(exact - img[i * 4 + k]));
+            },
+          );
+        }
+        expect(worst, `${vt} ${bg ? 'over a background' : ''}`).toBeLessThanOrEqual(1);
+      }
   });
 
   it('filmToRGBA8 composites a display-space background behind partial coverage', () => {

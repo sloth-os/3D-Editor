@@ -92,10 +92,8 @@ const ACES = logSigmoid(2.9, 1.6, 1.8, 0, 0);
 
 const lum = (r: number, g: number, b: number) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
-/** Log encoding + sigmoid of one (non-negative) channel → display-encoded value in [0, 1]. */
-function curve(s: LogSigmoid, c: number): number {
-  if (!(c > 0)) return 0;
-  const x = (Math.log2(c) - LOG_MIN) / LOG_RANGE;
+/** Sigmoid over the log-encoded value x ∈ [0, 1] → display-encoded value in [0, 1]. */
+function curveAt(s: LogSigmoid, x: number): number {
   if (x <= 0) return 0;
   if (x >= 1) return 1;
   return x < PIVOT_X
@@ -103,7 +101,81 @@ function curve(s: LogSigmoid, c: number): number {
     : PIVOT_Y + (1 - PIVOT_Y) * evalSide(s.shoulder, (x - PIVOT_X) / (1 - PIVOT_X));
 }
 
-function applyLogSigmoid(s: LogSigmoid, r: number, g: number, b: number, out: Float64Array | number[]): void {
+/** Log encoding + sigmoid of one (non-negative) channel → display-encoded value in [0, 1]. */
+function curve(s: LogSigmoid, c: number): number {
+  return c > 0 ? curveAt(s, (Math.log2(c) - LOG_MIN) / LOG_RANGE) : 0;
+}
+
+/*
+ * Lookup tables for converting whole images (`filmToRGBA8`): the curves and the sRGB encoding are
+ * smooth, so linear interpolation between 4096 samples is exact to far below an 8-bit step and
+ * avoids a dozen `Math.pow` calls per pixel. `applyViewTransform` keeps the exact functions.
+ */
+const TABLE_SAMPLES = 4096;
+const TABLE_SCALE = TABLE_SAMPLES / LOG_RANGE;
+
+/** A log-sigmoid curve sampled over x ∈ [0, 1]: display-encoded (`enc`) and linearized (`lin`). */
+interface CurveTable {
+  enc: Float64Array;
+  lin: Float64Array;
+}
+
+const curveTables = new Map<LogSigmoid, CurveTable>();
+
+function curveTable(s: LogSigmoid): CurveTable {
+  let t = curveTables.get(s);
+  if (!t) {
+    t = { enc: new Float64Array(TABLE_SAMPLES + 1), lin: new Float64Array(TABLE_SAMPLES + 1) };
+    for (let i = 0; i <= TABLE_SAMPLES; i++) {
+      t.enc[i] = curveAt(s, i / TABLE_SAMPLES);
+      t.lin[i] = srgbToLinear(t.enc[i]);
+    }
+    curveTables.set(s, t);
+  }
+  return t;
+}
+
+/** A curve table at linear channel value c (non-negative). */
+function tableAt(T: Float64Array, c: number): number {
+  if (!(c > 0)) return T[0];
+  const x = (Math.log2(c) - LOG_MIN) * TABLE_SCALE;
+  if (!(x > 0)) return T[0];
+  if (x >= TABLE_SAMPLES) return T[TABLE_SAMPLES];
+  const i = x | 0;
+  return T[i] + (T[i + 1] - T[i]) * (x - i);
+}
+
+/** sRGB encoding sampled over [0, 1] and, 64 times finer, over [0, 1/64] (where it bends most). */
+let srgbTable: Float64Array | null = null;
+let srgbTableLow: Float64Array | null = null;
+
+/** `linearToSrgb` by table (the linear toe below 0.0031308 is computed exactly). */
+function srgbFast(v: number): number {
+  if (!(v > 0.0031308)) return v > 0 ? v * 12.92 : 0;
+  if (v >= 1) return 1;
+  if (!srgbTable || !srgbTableLow) {
+    srgbTable = new Float64Array(TABLE_SAMPLES + 1);
+    srgbTableLow = new Float64Array(TABLE_SAMPLES + 1);
+    for (let i = 0; i <= TABLE_SAMPLES; i++) {
+      srgbTable[i] = linearToSrgb(i / TABLE_SAMPLES);
+      srgbTableLow[i] = linearToSrgb(i / (64 * TABLE_SAMPLES));
+    }
+  }
+  const low = v < 1 / 64;
+  const T = low ? srgbTableLow : srgbTable;
+  const x = v * (low ? 64 * TABLE_SAMPLES : TABLE_SAMPLES);
+  const i = x | 0;
+  return T[i] + (T[i + 1] - T[i]) * (x - i);
+}
+
+function applyLogSigmoid(
+  s: LogSigmoid,
+  r: number,
+  g: number,
+  b: number,
+  out: Float64Array | number[],
+  fast: boolean,
+): void {
   r = r > 0 ? r : 0;
   g = g > 0 ? g : 0;
   b = b > 0 ? b : 0;
@@ -114,27 +186,27 @@ function applyLogSigmoid(s: LogSigmoid, r: number, g: number, b: number, out: Fl
     g = g * k + l;
     b = b * k + l;
   }
-  let dr = curve(s, r);
-  let dg = curve(s, g);
-  let db = curve(s, b);
-  if (s.outset > 0) {
-    // back to linear, re-saturate (inverse mix away from the luminance), encode again
-    const lr = srgbToLinear(dr);
-    const lg = srgbToLinear(dg);
-    const lb = srgbToLinear(db);
-    const l = lum(lr, lg, lb) * s.outset;
-    const k = 1 / (1 - s.outset);
-    dr = linearToSrgb((lr - l) * k);
-    dg = linearToSrgb((lg - l) * k);
-    db = linearToSrgb((lb - l) * k);
+  if (!(s.outset > 0)) {
+    const T = fast ? curveTable(s).enc : null;
+    out[0] = T ? tableAt(T, r) : curve(s, r);
+    out[1] = T ? tableAt(T, g) : curve(s, g);
+    out[2] = T ? tableAt(T, b) : curve(s, b);
+    return;
   }
-  out[0] = dr;
-  out[1] = dg;
-  out[2] = db;
+  // back to linear, re-saturate (inverse mix away from the luminance), encode again
+  const T = fast ? curveTable(s).lin : null;
+  const lr = T ? tableAt(T, r) : srgbToLinear(curve(s, r));
+  const lg = T ? tableAt(T, g) : srgbToLinear(curve(s, g));
+  const lb = T ? tableAt(T, b) : srgbToLinear(curve(s, b));
+  const l = lum(lr, lg, lb) * s.outset;
+  const k = 1 / (1 - s.outset);
+  out[0] = fast ? srgbFast((lr - l) * k) : linearToSrgb((lr - l) * k);
+  out[1] = fast ? srgbFast((lg - l) * k) : linearToSrgb((lg - l) * k);
+  out[2] = fast ? srgbFast((lb - l) * k) : linearToSrgb((lb - l) * k);
 }
 
 /** Khronos PBR Neutral tone mapping (linear in, linear out), then sRGB encoding. */
-function applyNeutral(r: number, g: number, b: number, out: Float64Array | number[]): void {
+function applyNeutral(r: number, g: number, b: number, out: Float64Array | number[], fast: boolean): void {
   const START = 0.8 - 0.04;
   const DESATURATION = 0.15;
   r = r > 0 ? r : 0;
@@ -158,9 +230,9 @@ function applyNeutral(r: number, g: number, b: number, out: Float64Array | numbe
     g += (newPeak - g) * w;
     b += (newPeak - b) * w;
   }
-  out[0] = linearToSrgb(r);
-  out[1] = linearToSrgb(g);
-  out[2] = linearToSrgb(b);
+  out[0] = fast ? srgbFast(r) : linearToSrgb(r);
+  out[1] = fast ? srgbFast(g) : linearToSrgb(g);
+  out[2] = fast ? srgbFast(b) : linearToSrgb(b);
 }
 
 /** The view transforms understood by `applyViewTransform`. */
@@ -184,26 +256,38 @@ export function applyViewTransform(
   b: number,
   out: Float64Array | number[],
 ): void {
+  viewTransform(view, r, g, b, out, false);
+}
+
+/** `applyViewTransform`, by lookup tables when `fast` (within a small fraction of an 8-bit step). */
+function viewTransform(
+  view: ViewTransform,
+  r: number,
+  g: number,
+  b: number,
+  out: Float64Array | number[],
+  fast: boolean,
+): void {
   r = Number.isFinite(r) ? r : 0;
   g = Number.isFinite(g) ? g : 0;
   b = Number.isFinite(b) ? b : 0;
   switch (view) {
     case 'AGX':
-      applyLogSigmoid(AGX, r, g, b, out);
+      applyLogSigmoid(AGX, r, g, b, out, fast);
       return;
     case 'FILMIC':
-      applyLogSigmoid(FILMIC, r, g, b, out);
+      applyLogSigmoid(FILMIC, r, g, b, out, fast);
       return;
     case 'ACES':
-      applyLogSigmoid(ACES, r, g, b, out);
+      applyLogSigmoid(ACES, r, g, b, out, fast);
       return;
     case 'NEUTRAL':
-      applyNeutral(r, g, b, out);
+      applyNeutral(r, g, b, out, fast);
       return;
     default:
-      out[0] = linearToSrgb(r);
-      out[1] = linearToSrgb(g);
-      out[2] = linearToSrgb(b);
+      out[0] = fast ? srgbFast(r) : linearToSrgb(r);
+      out[1] = fast ? srgbFast(g) : linearToSrgb(g);
+      out[2] = fast ? srgbFast(b) : linearToSrgb(b);
   }
 }
 
@@ -248,7 +332,7 @@ export function filmToRGBA8(
       out[o + 2] = linearToSrgbByte(linear[o + 2] * k);
       continue;
     }
-    if (a > 0) applyViewTransform(vt, linear[o] * k, linear[o + 1] * k, linear[o + 2] * k, d);
+    if (a > 0) viewTransform(vt, linear[o] * k, linear[o + 1] * k, linear[o + 2] * k, d, true);
     else d.fill(0);
     // over the display-space background (straight alpha out)
     const ia = 1 / total;

@@ -283,3 +283,116 @@ describe('object.generate_* operators', () => {
     expect(glass).toBeGreaterThan(0);
   });
 });
+
+describe('generator operators: limits and degenerate input (review regressions)', () => {
+  const counts = (doc: SceneDoc) => [
+    doc.listObjects().length,
+    doc.listMeshBlocks().length,
+    doc.listMaterials().length,
+  ];
+  const zigzag = (n: number) =>
+    Array.from({ length: n }, (_, i) => [Math.floor((i + 1) / 2), Math.floor(i / 2), 0]);
+
+  it('oversized requests fail fast, name the parameters to lower and leave the document unchanged', () => {
+    const { doc, run } = setup();
+    const cases: [string, Record<string, unknown>, RegExp][] = [
+      ['spring', { turns: 500, resolution: 256 }, /lower turns, resolution .* or wire_segments$/],
+      [
+        'pipe',
+        { points: zigzag(2000), bend_segments: 64 },
+        /lower the number of points, segments or bend_segments$/,
+      ],
+      [
+        'tree',
+        { branch_levels: 4, branches: 12 },
+        /lower branch_levels, branches, leaf_density or resolution$/,
+      ],
+      ['building', { floors: 200, width: 1000, depth: 1000 }, /lower floors, window_rows/],
+      [
+        'fence',
+        {
+          points: [
+            [0, 0],
+            [1e9, 0],
+          ],
+          post_spacing: 0.1,
+        },
+        /raise post_spacing/,
+      ],
+    ];
+    for (const [kind, params, hint] of cases) {
+      const t0 = performance.now();
+      const r = run(`object.generate_${kind}`, params);
+      expect(r.ok, kind).toBe(false);
+      expect(r.error, kind).toMatch(
+        /^[A-Z][a-z]+: the mesh would have about [\d,]+ faces \(limit 1,000,000\); /,
+      );
+      expect(r.error, kind).toMatch(hint);
+      expect(performance.now() - t0, kind).toBeLessThan(5000);
+    }
+    expect(counts(doc)).toEqual([0, 0, 0]);
+  });
+
+  it('inputs without any geometry fail with the reason and leave nothing behind', () => {
+    const { doc, run, ok, reports } = setup();
+    const pipe = run('object.generate_pipe', {
+      points: [
+        [1, 1, 1],
+        [1, 1, 1],
+      ],
+    });
+    expect(pipe.ok).toBe(false);
+    expect(pipe.error).toBe(
+      'Pipe: nothing to generate: the path needs at least 2 distinct points to sweep the pipe along (got 1)',
+    );
+    const blob = run('object.generate_blob', {
+      spheres: [
+        { center: [0, 0, 0], radius: 0.05 },
+        { center: [100, 0, 0], radius: 0.05 },
+      ],
+    });
+    expect(blob.ok).toBe(false);
+    expect(blob.error).toMatch(/^Blob: nothing to generate: the spheres are too small .* raise resolution/);
+    for (const points of [
+      [
+        [2, 2, 0],
+        [2, 2, 1],
+      ],
+      [[2, 2]],
+    ]) {
+      const fence = run('object.generate_fence', { points });
+      expect(fence.ok).toBe(false);
+      expect(fence.error).toMatch(
+        /^Fence: nothing to generate: the path needs at least 2 points at distinct \[x, y\]/,
+      );
+    }
+    expect(counts(doc)).toEqual([0, 0, 0]);
+    // no points at all is the documented straight fence of `length`
+    expect(ok('object.generate_fence', { points: [], length: 3 }).dimensions[0]).toBeCloseTo(3.1, 6);
+    expect(ok('object.generate_fence', { points: null, length: 3 }).dimensions[0]).toBeCloseTo(3.1, 6);
+    // partly ignored input: built, with warnings in the reports and in the result
+    reports.length = 0;
+    const partly = ok('object.generate_blob', {
+      spheres: [
+        { center: [0, 0, 0], radius: 2 },
+        { center: [40, 0, 0], radius: 0.2 },
+      ],
+      resolution: 24,
+    });
+    expect(partly.warnings).toEqual([expect.stringMatching(/^1 of 2 sphere\(s\) have a radius below/)]);
+    expect(reports).toContainEqual(expect.stringMatching(/^Blob: 1 of 2 sphere\(s\)/));
+    expect(ok('object.generate_rock', {}).warnings).toBeUndefined();
+  });
+
+  it('warns about large (but allowed) meshes and names the parameters that drive their size', () => {
+    const { run } = setup();
+    const r = run('object.generate_terrain', { subdivisions: 501 });
+    expect(r.ok).toBe(true);
+    expect(r.result!.faces).toBe(501 * 501);
+    expect(r.reports).toContainEqual({
+      level: 'WARNING',
+      message: 'Terrain: large mesh (251,001 faces); lower subdivisions for a lighter scene',
+    });
+    expect(run('object.generate_terrain', { subdivisions: 400 }).reports).toEqual([]);
+  }, 30_000);
+});

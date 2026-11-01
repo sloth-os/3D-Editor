@@ -1,15 +1,164 @@
 import { useState } from 'preact/hooks';
+import type { JSX } from 'preact';
 import { ROOT_COLLECTION_ID, type CollectionData, type ObjectData } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
 import { run } from '../editor/editor';
 import { Icon, type IconName } from './icons';
+import { activePropertiesTab, type PropertiesTabId } from './properties/Properties';
 
 const TYPE_ICON: Record<string, IconName> = {
   MESH: 'mesh',
   EMPTY: 'empty',
   CAMERA: 'camera',
   LIGHT: 'light',
+  CURVE: 'curve',
+  FONT: 'font',
+  ARMATURE: 'armature',
 };
+
+/** Outliner icon of an object (empties instancing a collection get the collection instance icon). */
+export function objectIcon(o: ObjectData): IconName {
+  if (o.type === 'EMPTY' && o.instance_type === 'COLLECTION' && o.instance_collection)
+    return 'collectionInstance';
+  return TYPE_ICON[o.type] ?? 'object';
+}
+
+/** A sub-item row below an object (modifier, constraint, particle system, rigid body, instancing). */
+interface SubItem {
+  key: string;
+  icon: IconName;
+  label: string;
+  /** Properties tab that shows the item. */
+  tab: PropertiesTabId;
+  dim?: boolean;
+  /** Visibility-style toggle (modifier show_viewport, constraint mute, particles show_viewport). */
+  toggle?: { on: boolean; title: string; run: () => void };
+  testId: string;
+}
+
+interface SubGroup {
+  key: string;
+  icon: IconName;
+  label: string;
+  tab: PropertiesTabId;
+  items: SubItem[];
+}
+
+/** Blender-style outliner children of an object: modifiers, constraints, particles, physics, instancing. */
+export function objectSubGroups(session: ProjectSession, o: ObjectData): SubGroup[] {
+  const groups: SubGroup[] = [];
+  const tid = (kind: string, name: string) => `outl-${kind}-${o.name}-${name}`;
+  if (o.modifiers.length)
+    groups.push({
+      key: 'modifiers',
+      icon: 'wrench',
+      label: 'Modifiers',
+      tab: 'modifiers',
+      items: o.modifiers.map((m) => ({
+        key: m.id,
+        icon: 'wrench',
+        label: m.name,
+        tab: 'modifiers',
+        dim: !m.show_viewport,
+        testId: tid('modifier', m.name),
+        toggle: {
+          on: m.show_viewport,
+          title: m.show_viewport ? 'Disable in viewport' : 'Enable in viewport',
+          run: () =>
+            run(
+              'object.modifier_set',
+              { object: o.id, modifier: m.id, show_viewport: !m.show_viewport },
+              'ui',
+            ),
+        },
+      })),
+    });
+  const constraints = Array.isArray(o.constraints) ? o.constraints : [];
+  if (constraints.length)
+    groups.push({
+      key: 'constraints',
+      icon: 'constraint',
+      label: 'Constraints',
+      tab: 'constraints',
+      items: constraints.map((c) => ({
+        key: c.id,
+        icon: 'constraint',
+        label: c.name,
+        tab: 'constraints',
+        dim: c.mute,
+        testId: tid('constraint', c.name),
+        toggle: {
+          on: !c.mute,
+          title: c.mute ? 'Enable constraint' : 'Disable constraint',
+          run: () => run('constraint.update', { object: o.id, constraint: c.id, mute: !c.mute }, 'ui'),
+        },
+      })),
+    });
+  const systems = Array.isArray(o.particle_systems) ? o.particle_systems : [];
+  if (systems.length)
+    groups.push({
+      key: 'particles',
+      icon: 'particles',
+      label: 'Particle Systems',
+      tab: 'particles',
+      items: systems.map((ps) => ({
+        key: ps.id,
+        icon: 'particles',
+        label: ps.name,
+        tab: 'particles',
+        dim: !ps.show_viewport,
+        testId: tid('particles', ps.name),
+        toggle: {
+          on: ps.show_viewport,
+          title: ps.show_viewport ? 'Hide in viewport' : 'Show in viewport',
+          run: () =>
+            run(
+              'object.particle_system_update',
+              { object: o.id, particle_system: ps.id, show_viewport: !ps.show_viewport },
+              'ui',
+            ),
+        },
+      })),
+    });
+  const extra: SubItem[] = [];
+  if (o.rigid_body)
+    extra.push({
+      key: 'rigid_body',
+      icon: 'physics',
+      label: `Rigid Body (${o.rigid_body.type === 'PASSIVE' ? 'Passive' : 'Active'})`,
+      tab: 'physics',
+      dim: o.rigid_body.enabled === false && o.rigid_body.type === 'ACTIVE',
+      testId: tid('physics', 'rigid_body'),
+    });
+  if (o.type === 'EMPTY' && o.instance_type === 'COLLECTION' && o.instance_collection) {
+    const c = session.doc.getCollection(o.instance_collection);
+    extra.push({
+      key: 'instance',
+      icon: 'collection',
+      label: c ? c.name : `${o.instance_collection} (missing)`,
+      tab: 'object',
+      testId: tid('instance', c?.name ?? 'missing'),
+    });
+  }
+  if (extra.length) groups.push({ key: 'extra', icon: 'object', label: '', tab: 'object', items: extra });
+  return groups;
+}
+
+/** Inline icons of a collapsed object row: one per group (and one per extra item). */
+function badges(groups: SubGroup[]): { key: string; icon: IconName; tab: PropertiesTabId; title: string }[] {
+  return groups.flatMap((g) =>
+    g.key === 'extra'
+      ? g.items.map((i) => ({ key: i.key, icon: i.icon, tab: i.tab, title: i.label }))
+      : [
+          {
+            key: g.key,
+            icon: g.icon,
+            tab: g.tab,
+            title: `${g.label}: ${g.items.map((i) => i.label).join(', ')}`,
+          },
+        ],
+  );
+}
 
 /** Scene hierarchy: collections → objects → children, with visibility toggles, rename and drag-to-parent. */
 export function Outliner({ session }: { session: ProjectSession }) {
@@ -34,12 +183,17 @@ export function Outliner({ session }: { session: ProjectSession }) {
   }
   const peerColorFor = (id: string) => peers.find((p) => p.state.selection?.includes(id))?.state.user.color;
 
+  /**
+   * `collapsed` holds the ids whose expansion differs from the default: collections and objects
+   * with child objects start expanded, objects that only have sub-items start collapsed.
+   */
   const toggleCollapse = (id: string) => {
     const next = new Set(collapsed);
     if (next.has(id)) next.delete(id);
     else next.add(id);
     setCollapsed(next);
   };
+  const isOpen = (id: string, byDefault: boolean) => byDefault !== collapsed.has(id);
 
   const select = (o: ObjectData, e: MouseEvent) => {
     if (st.mode !== 'OBJECT' && o.id !== st.activeId) run('object.mode_set', { mode: 'OBJECT' }, 'ui');
@@ -55,15 +209,55 @@ export function Outliner({ session }: { session: ProjectSession }) {
     }
   };
 
-  const rows: preact.JSX.Element[] = [];
+  /** Clicking a sub-item selects its object and shows the item's Properties tab (like Blender). */
+  const openItem = (o: ObjectData, tab: PropertiesTabId, e: MouseEvent) => {
+    if ((e.ctrlKey || e.shiftKey) && selected.has(o.id)) {
+      // keep the multi-selection, only make the object active
+      if (st.mode !== 'OBJECT' && o.id !== st.activeId) run('object.mode_set', { mode: 'OBJECT' }, 'ui');
+      st.activeId = o.id;
+    } else select(o, e);
+    activePropertiesTab.value = tab;
+  };
+
+  const rows: JSX.Element[] = [];
   const q = filter.trim().toLowerCase();
+
+  const subRow = (o: ObjectData, item: SubItem, depth: number) => (
+    <div
+      key={`${o.id}:${item.key}`}
+      class="outliner-row"
+      style={{ paddingLeft: `${4 + depth * 14}px`, opacity: item.dim ? 0.55 : 1 }}
+      data-testid={item.testId}
+      title={`${item.label} — open in the Properties editor`}
+      onClick={(e) => openItem(o, item.tab, e)}
+    >
+      <span class="twisty" />
+      <Icon name={item.icon} size={13} />
+      <span class="name">{item.label}</span>
+      {item.toggle && (
+        <span
+          class="vis"
+          title={item.toggle.title}
+          onClick={(e) => {
+            e.stopPropagation();
+            item.toggle!.run();
+          }}
+        >
+          <Icon name={item.toggle.on ? 'eye' : 'eyeOff'} size={13} />
+        </span>
+      )}
+    </div>
+  );
+
   const renderObject = (o: ObjectData, depth: number) => {
     if (q && !o.name.toLowerCase().includes(q)) {
       for (const c of byParent.get(o.id) ?? []) renderObject(c, depth);
       return;
     }
     const children = byParent.get(o.id) ?? [];
-    const isCollapsed = collapsed.has(o.id);
+    const groups = objectSubGroups(session, o);
+    const expandable = children.length > 0 || groups.length > 0;
+    const open = isOpen(o.id, children.length > 0);
     const peerColor = peerColorFor(o.id);
     rows.push(
       <div
@@ -87,10 +281,15 @@ export function Outliner({ session }: { session: ProjectSession }) {
         onClick={(e) => select(o, e)}
         onDblClick={() => setRenaming(o.id)}
       >
-        <span class="twisty" onClick={(e) => (e.stopPropagation(), toggleCollapse(o.id))}>
-          {children.length ? (isCollapsed ? '▸' : '▾') : ''}
+        <span
+          class="twisty"
+          data-testid={expandable ? `outl-twisty-${o.name}` : undefined}
+          aria-expanded={expandable ? open : undefined}
+          onClick={(e) => (e.stopPropagation(), expandable && toggleCollapse(o.id))}
+        >
+          {expandable ? (open ? '▾' : '▸') : ''}
         </span>
-        <Icon name={TYPE_ICON[o.type] ?? 'object'} size={14} />
+        <Icon name={objectIcon(o)} size={14} />
         {renaming === o.id ? (
           <input
             class="textfield"
@@ -115,7 +314,21 @@ export function Outliner({ session }: { session: ProjectSession }) {
         ) : (
           <span class={`name ${o.hide_viewport ? 'hidden' : ''}`}>{o.name}</span>
         )}
-        {o.modifiers.length > 0 && <Icon name="wrench" size={12} style={{ opacity: 0.6 }} />}
+        {!open &&
+          badges(groups).map((b) => (
+            <span
+              key={b.key}
+              title={b.title}
+              style={{ display: 'flex', opacity: 0.6, marginLeft: '2px' }}
+              data-testid={`outl-badge-${o.name}-${b.key}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                openItem(o, b.tab, e);
+              }}
+            >
+              <Icon name={b.icon} size={12} />
+            </span>
+          ))}
         {peerColor && (
           <span class="peer-dot" style={{ background: peerColor }} title="Selected by another user" />
         )}
@@ -136,7 +349,39 @@ export function Outliner({ session }: { session: ProjectSession }) {
         </span>
       </div>,
     );
-    if (!isCollapsed) for (const c of children) renderObject(c, depth + 1);
+    if (!open) return;
+    for (const g of groups) {
+      if (g.key === 'extra') {
+        for (const item of g.items) rows.push(subRow(o, item, depth + 1));
+        continue;
+      }
+      const gid = `${o.id}:${g.key}`;
+      const groupOpen = isOpen(gid, true);
+      rows.push(
+        <div
+          key={gid}
+          class="outliner-row"
+          style={{ paddingLeft: `${4 + (depth + 1) * 14}px` }}
+          data-testid={`outl-group-${o.name}-${g.key}`}
+          onClick={(e) => openItem(o, g.tab, e)}
+        >
+          <span
+            class="twisty"
+            aria-expanded={groupOpen}
+            onClick={(e) => (e.stopPropagation(), toggleCollapse(gid))}
+          >
+            {groupOpen ? '▾' : '▸'}
+          </span>
+          <Icon name={g.icon} size={13} />
+          <span class="name" style={{ color: 'var(--text-dim)' }}>
+            {g.label}
+            {!groupOpen && ` (${g.items.length})`}
+          </span>
+        </div>,
+      );
+      if (groupOpen) for (const item of g.items) rows.push(subRow(o, item, depth + 2));
+    }
+    for (const c of children) renderObject(c, depth + 1);
   };
 
   const renderCollection = (c: CollectionData, depth: number) => {
@@ -200,6 +445,7 @@ export function Outliner({ session }: { session: ProjectSession }) {
         <input
           class="textfield"
           placeholder="Filter…"
+          aria-label="Filter objects by name"
           value={filter}
           onInput={(e) => setFilter((e.target as HTMLInputElement).value)}
         />

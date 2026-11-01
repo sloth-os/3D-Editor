@@ -46,12 +46,14 @@ const ANGLE_KEYS = /angle|rotation|spot_size/;
 
 /**
  * Whether a numeric parameter is an angle (stored in radians, shown in degrees): parameters whose
- * description says radians, otherwise angle-like names, except plain 0..1 factors.
+ * description gives radians as their unit, otherwise angle-like names, except plain 0..1 factors.
+ * Descriptions listing several units ("in the units of the property (metres, radians, …)") are
+ * not angles.
  */
 function isAngleParam(key: string, s: JsonSchema, extra?: readonly string[]): boolean {
   if (extra?.includes(key)) return true;
   const d = s.description ?? '';
-  if (/radian/i.test(d)) return true;
+  if (/radian/i.test(d) && !/metre|meter/i.test(d)) return true;
   if (/degree/i.test(d)) return false;
   if (s.minimum !== undefined && s.maximum !== undefined && s.minimum >= 0 && s.maximum <= 1) return false;
   return ANGLE_KEYS.test(key);
@@ -179,6 +181,7 @@ export function SchemaForm(p: {
                   value={String(value ?? s.enum[0])}
                   testId={tid}
                   title={s.description}
+                  compact
                   options={options}
                   onChange={(v) => p.onChange(key, v, true)}
                 />

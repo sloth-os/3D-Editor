@@ -1,8 +1,9 @@
 import type { Mat4, Vec3 } from '../math/types';
-import { axisAngle4, identity4 } from '../math/mat4';
+import { axisAngle4, determinant4, identity4 } from '../math/mat4';
 import { anyPerpendicular3, cross3, dot3 } from '../math/vec3';
 import type { MeshData } from '../mesh/types';
 import { surfaceTriangles } from '../instancing/sampling';
+import { matrixToCompatibleEuler } from '../constraints/math';
 import { Rng } from './random';
 
 /*
@@ -193,12 +194,42 @@ export function trackRotation(
   return [...cols[0], 0, ...cols[1], 0, ...cols[2], 0, 0, 0, 0, 1];
 }
 
+/**
+ * Splits a (parent-relative) matrix into location, Euler XYZ rotation and scale the way Blender
+ * applies a matrix to an object with compatible eulers: of the possible angle sets the one closest
+ * to `prevRotation` is chosen (no 2π jumps between consecutive edits or keyframes), and the scale
+ * keeps the signs of `prevScale` where the matrix allows it (a mirrored object stays mirrored on the
+ * same axis; when the mirroring changes, the first negative axis, else X, flips). Shear is dropped.
+ * Null for matrices with a zero-length axis or non-finite values.
+ */
+export function decomposeCompatible(
+  m: Readonly<Mat4>,
+  prevRotation: Readonly<Vec3>,
+  prevScale: Readonly<Vec3>,
+): { location: Vec3; rotation: Vec3; scale: Vec3 } | null {
+  if (!m.every(Number.isFinite)) return null;
+  const len = [0, 1, 2].map((c) => Math.hypot(m[c * 4], m[c * 4 + 1], m[c * 4 + 2]));
+  if (!len.every((l) => l > 1e-12)) return null;
+  const sign = [0, 1, 2].map((k) => (prevScale[k] < 0 ? -1 : 1));
+  const det = determinant4(m);
+  if (sign[0] * sign[1] * sign[2] < 0 !== det < 0) {
+    const k = sign.indexOf(-1);
+    sign[k < 0 ? 0 : k] *= -1;
+  }
+  const rot = identity4();
+  for (let c = 0; c < 3; c++) for (let r = 0; r < 3; r++) rot[c * 4 + r] = m[c * 4 + r] / (sign[c] * len[c]);
+  const rotation = matrixToCompatibleEuler(rot, prevRotation);
+  const scale: Vec3 = [sign[0] * len[0], sign[1] * len[1], sign[2] * len[2]];
+  if (![...rotation, ...scale].every(Number.isFinite)) return null;
+  return { location: [m[12], m[13], m[14]], rotation, scale };
+}
+
 // ------------------------------------------------------------------ surface sampling
 
 export interface SurfaceSample {
   /** World-space point on the surface. */
   point: Vec3;
-  /** Unit geometric normal (world space, following the face winding). */
+  /** Unit geometric normal (world space, facing the side the face winding faces in object space). */
   normal: Vec3;
   /** Face index in the mesh. */
   face: number;
@@ -236,6 +267,9 @@ export function sampleSurface(
   const cdf = new Float64Array(n);
   const maxSlope = opts.maxSlope ?? Math.PI;
   const cosMax = Math.cos(Math.max(0, Math.min(Math.PI, Number.isFinite(maxSlope) ? maxSlope : Math.PI)));
+  // a mirroring transform reverses the winding: flip the world-space cross products back so the
+  // normals keep facing the mesh's outside (like the inverse transpose the ray caster uses)
+  const flip = determinant4(m) < 0 ? -1 : 1;
   let total = 0;
   for (let t = 0; t < n; t++) {
     for (let k = 0; k < 3; k++) {
@@ -254,9 +288,9 @@ export function sampleSurface(
     const vx = W[o + 6] - W[o];
     const vy = W[o + 7] - W[o + 1];
     const vz = W[o + 8] - W[o + 2];
-    const nx = uy * vz - uz * vy;
-    const ny = uz * vx - ux * vz;
-    const nz = ux * vy - uy * vx;
+    const nx = (uy * vz - uz * vy) * flip;
+    const ny = (uz * vx - ux * vz) * flip;
+    const nz = (ux * vy - uy * vx) * flip;
     const l = Math.hypot(nx, ny, nz);
     let area = l / 2;
     if (!(area > 0) || !Number.isFinite(area) || nz / l < cosMax - 1e-12) area = 0;

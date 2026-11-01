@@ -86,14 +86,15 @@ const TERMINATOR_CUTOFF = 0.1;
 
 /**
  * Fraction of the shadow-terminator offset applied to a shadow ray from a smooth triangle, given
- * the cosines of the light direction to the geometric (`ngl` > 0) and shading (`nl`) normals.
- * Like Cycles, only light at grazing angles to the facet (ngl below the cutoff) is lifted, fading
- * in smoothly; light from higher up cannot be blocked by the neighbouring facets, and lifting its
- * rays (by up to a large part of a coarse triangle) would make nearby contact shadows vanish.
+ * the cosines of the light direction to the geometric (`ngl`) and shading (`nl`) normals on the lit
+ * side. As in Cycles' `shadow_ray_offset`, only light grazing the facet is lifted, fading in
+ * smoothly: by 1 − ngl / cutoff, or by 2 − (ngl + nl) / cutoff while the shading normal grazes
+ * the light too (nl below the cutoff). Light from higher up cannot be blocked by the neighbouring
+ * facets, and lifting its rays (by up to a large part of a coarse triangle) would make nearby
+ * contact shadows vanish.
  */
 export function terminatorAmount(ngl: number, nl: number): number {
-  if (!(ngl < TERMINATOR_CUTOFF)) return 0;
-  const k = 2 - (ngl + nl) / TERMINATOR_CUTOFF;
+  const k = nl < TERMINATOR_CUTOFF ? 2 - (ngl + nl) / TERMINATOR_CUTOFF : 1 - ngl / TERMINATOR_CUTOFF;
   return k > 0 ? (k < 1 ? k : 1) : 0;
 }
 
@@ -1298,7 +1299,8 @@ export class PathIntegrator {
                   let sox = this.px + gnx * side * eps;
                   let soy = this.py + gny * side * eps;
                   let soz = this.pz + gnz * side * eps;
-                  const lift = this.smoothTri && side > 0 && frontFacing ? terminatorAmount(geomSide, ilz) : 0;
+                  const lift =
+                    this.smoothTri && side > 0 && frontFacing ? terminatorAmount(geomSide, ilz) : 0;
                   if (lift > 0) {
                     const lx = this.lx;
                     const ly = this.ly;
