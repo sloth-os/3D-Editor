@@ -72,6 +72,7 @@ const GLOBAL: Record<string, Handler> = {
   'Ctrl+,': () => run('wm.preferences', {}, 'hotkey'),
   F3: () => run('wm.search_menu', {}, 'hotkey'),
   F12: () => run('render.render', {}, 'hotkey'),
+  'Ctrl+F12': () => run('render.render', { animation: true }, 'hotkey'),
   F1: () => openDialog('shortcuts'),
   'Shift+R': () => {
     const last = lastOperator.value;
@@ -280,6 +281,6 @@ export const SHORTCUT_HELP: [string, string][] = [
   ],
   [
     'General',
-    'Ctrl+Z undo · Ctrl+Shift+Z redo · F3 search · F12 render · Ctrl+S save · Shift+R repeat last · N sidebar · T toolbar',
+    'Ctrl+Z undo · Ctrl+Shift+Z redo · F3 search · F12 render · Ctrl+F12 render animation · Ctrl+S save · Shift+R repeat last · N sidebar · T toolbar',
   ],
 ];

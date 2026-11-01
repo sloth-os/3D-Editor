@@ -12,9 +12,18 @@ import {
   transformPoint3,
   type EvaluatedScene,
   type MeshData,
+  type RenderEngine,
   type Vec3,
 } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
+import {
+  pathTraceDocument,
+  pixelsToDataUrl,
+  renderViewFromMatrices,
+  type PathTraceJob,
+  type PathTraceOptions,
+  type PixelImage,
+} from '../render';
 import { SceneObjects } from './scene-objects';
 import { ViewportSky } from './sky';
 import { EditOverlay } from './edit-overlay';
@@ -35,6 +44,35 @@ import { telemetry } from '../telemetry/telemetry';
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 
 const VIEWPORT_BG = new THREE.Color(0x393939);
+
+/** Default sampling budget (seconds) of path traced `renderImage` calls (RPC renders time out at 15 s). */
+export const RPC_PATH_TRACE_SECONDS = 10;
+
+/** Options of {@link ViewportEngine.renderImage} and the other render entry points. */
+export interface RenderImageOptions {
+  width?: number;
+  height?: number;
+  cameraId?: string;
+  useViewport?: boolean;
+  /** Explicit viewpoint (world space, Z up); fov in degrees. */
+  view?: { position: number[]; target: number[]; up?: number[]; fov_degrees?: number } | null;
+  /** Viewport shading for the image (default RENDERED). */
+  shading?: 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED' | null;
+  /** Evaluate the scene at this frame. */
+  frame?: number | null;
+  /** Render engine (default: the render settings; viewport captures rasterize). */
+  engine?: RenderEngine | null;
+  /** PATHTRACER: samples per pixel (default: render settings). */
+  samples?: number;
+  /** PATHTRACER: maximum bounces (default: render settings). */
+  max_bounces?: number;
+  /** PATHTRACER: denoise (default: render settings). */
+  denoise?: boolean;
+  /** PATHTRACER: sampling budget in seconds (0 = none). */
+  time_limit?: number;
+  /** PATHTRACER: noise seed (default 0). */
+  seed?: number;
+}
 
 function cursorTexture(): THREE.Texture {
   const c = document.createElement('canvas');
@@ -621,148 +659,212 @@ export class ViewportEngine {
     return rc.ray.intersectPlane(plane, new THREE.Vector3());
   }
 
-  /** Renders the scene from the active camera into a PNG data URL at a given size (F12 / RPC). */
+  /**
+   * Renders the scene from the active camera into a PNG data URL at a given size (F12 / RPC).
+   * When the engine (option, else the render settings) is PATHTRACER the image is path traced on
+   * the render workers, except SOLID / WIREFRAME shading and viewport captures (`useViewport`
+   * without an explicit engine), which rasterize; path traced renders stop sampling after
+   * `time_limit` seconds (default {@link RPC_PATH_TRACE_SECONDS}, within the server's RPC timeout).
+   */
   async renderImage(
-    opts: {
-      width?: number;
-      height?: number;
-      cameraId?: string;
-      useViewport?: boolean;
-      /** Explicit viewpoint (world space, Z up); fov in degrees. */
-      view?: { position: number[]; target: number[]; up?: number[]; fov_degrees?: number } | null;
-      /** Viewport shading for the image (default RENDERED). */
-      shading?: 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED' | null;
-      /** Evaluate the scene at this frame. */
-      frame?: number | null;
-    } = {},
+    opts: RenderImageOptions = {},
   ): Promise<{ dataUrl: string; width: number; height: number }> {
     const span = telemetry.startSpan('render.image');
     try {
-      if (!this.ev) this.sync();
-      const ev = this.ev!;
-      const render = ev.render;
-      const scale = render.resolution_percentage / 100;
-      const width = Math.max(16, Math.min(4096, Math.round(opts.width ?? render.resolution_x * scale)));
-      const height = Math.max(16, Math.min(4096, Math.round(opts.height ?? render.resolution_y * scale)));
-      const aspect = width / height;
-      let cam: THREE.Camera;
-      const camObj = opts.cameraId ? ev.byId.get(opts.cameraId) : ev.activeCamera;
-      if (opts.view) {
-        const v = opts.view;
-        const pc = new THREE.PerspectiveCamera(v.fov_degrees ?? 50, aspect, 0.01, 10000);
-        pc.up.set(...((v.up ?? [0, 0, 1]) as [number, number, number]));
-        pc.position.set(...(v.position as [number, number, number]));
-        pc.lookAt(new THREE.Vector3(...(v.target as [number, number, number])));
-        cam = pc;
-      } else if (!opts.useViewport && camObj?.camera) {
-        const cd = camObj.camera;
-        const m = new THREE.Matrix4().fromArray(camObj.worldMatrix);
-        if (cd.type === 'ORTHO') {
-          const e = orthoHalfExtents(cd, aspect);
-          const oc = new THREE.OrthographicCamera(
-            -e.halfW,
-            e.halfW,
-            e.halfH,
-            -e.halfH,
-            cd.clip_start,
-            cd.clip_end,
-          );
-          m.decompose(oc.position, oc.quaternion, new THREE.Vector3());
-          cam = oc;
-        } else {
-          const pc = new THREE.PerspectiveCamera(
-            THREE.MathUtils.radToDeg(cameraFovY(cd, aspect)),
-            aspect,
-            cd.clip_start,
-            cd.clip_end,
-          );
-          m.decompose(pc.position, pc.quaternion, new THREE.Vector3());
-          cam = pc;
-        }
-      } else {
-        const pc = new THREE.PerspectiveCamera(40, aspect, 0.01, 10000);
-        applyPoseToCamera(this.pose, pc, aspect);
-        cam = pc;
-      }
-      cam.updateMatrixWorld(true);
-      (cam as THREE.PerspectiveCamera).updateProjectionMatrix?.();
-      // final render: rendered shading, no overlays
-      const prevShading = this.session.view.shading.value;
-      const prevOverlays = this.session.view.overlays.value;
-      const prevFrame = this.session.state.frame;
-      if (typeof opts.frame === 'number' && Number.isFinite(opts.frame))
-        this.session.state.frame = opts.frame;
-      this.session.view.shading.value = opts.shading ?? 'RENDERED';
-      this.session.view.overlays.value = false;
-      this.sync();
-      const target = new THREE.WebGLRenderTarget(width, height, { samples: 8, type: THREE.HalfFloatType });
-      // The composer output is already tone mapped and sRGB encoded, so copy it raw (linear target).
-      const out = new THREE.WebGLRenderTarget(width, height, { type: THREE.UnsignedByteType });
-      const comp = new EffectComposer(this.renderer, target);
-      comp.renderToScreen = false;
-      comp.setPixelRatio(1);
-      comp.setSize(width, height);
-      const transparent = render.film_transparent;
-      const prevBg = this.scene.background;
-      if (transparent) this.scene.background = null;
-      comp.addPass(new RenderPass(this.scene, cam));
-      comp.addPass(new OutputPass());
-      comp.render();
-      // copy result (composer read buffer) into a byte target via a fullscreen quad
-      const readTarget = comp.readBuffer;
-      const quad = new THREE.Mesh(
-        new THREE.PlaneGeometry(2, 2),
-        new THREE.MeshBasicMaterial({
-          map: readTarget.texture,
-          transparent: true,
-          toneMapped: false,
-          depthTest: false,
-        }),
-      );
-      const qs = new THREE.Scene();
-      qs.add(quad);
-      const qc = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-      const prevTm = this.renderer.toneMapping;
-      const prevClear = this.renderer.getClearColor(new THREE.Color());
-      const prevAlpha = this.renderer.getClearAlpha();
-      this.renderer.toneMapping = THREE.NoToneMapping;
-      this.renderer.setRenderTarget(out);
-      this.renderer.setClearColor(0x000000, 0);
-      this.renderer.clear();
-      this.renderer.render(qs, qc);
-      const pixels = new Uint8Array(width * height * 4);
-      this.renderer.readRenderTargetPixels(out, 0, 0, width, height, pixels);
-      this.renderer.setRenderTarget(null);
-      this.renderer.toneMapping = prevTm;
-      this.renderer.setClearColor(prevClear, prevAlpha);
-      this.scene.background = prevBg;
-      target.dispose();
-      out.dispose();
-      comp.dispose();
-      quad.geometry.dispose();
-      (quad.material as THREE.Material).dispose();
-      this.session.view.shading.value = prevShading;
-      this.session.view.overlays.value = prevOverlays;
-      this.session.state.frame = prevFrame;
-      this.invalidate();
-      // flip rows (WebGL origin is bottom-left)
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d')!;
-      const img = ctx.createImageData(width, height);
-      for (let y = 0; y < height; y++)
-        img.data.set(pixels.subarray((height - 1 - y) * width * 4, (height - y) * width * 4), y * width * 4);
-      if (!transparent) for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
-      ctx.putImageData(img, 0, 0);
-      span.setAttribute('render.width', width).setAttribute('render.height', height).setOk();
-      return { dataUrl: canvas.toDataURL('image/png'), width, height };
+      let img: PixelImage;
+      if (this.pathTraces(opts)) {
+        span.setAttribute('render.engine', 'PATHTRACER');
+        const r = await this.startPathTrace({
+          ...opts,
+          time_limit: opts.time_limit ?? RPC_PATH_TRACE_SECONDS,
+        }).result;
+        span.setAttribute('render.samples', r.samples);
+        img = r;
+      } else img = this.renderPixels(opts);
+      span.setAttribute('render.width', img.width).setAttribute('render.height', img.height).setOk();
+      return { dataUrl: pixelsToDataUrl(img), width: img.width, height: img.height };
     } catch (err) {
       span.setError(err instanceof Error ? err.message : String(err));
       throw err;
     } finally {
       telemetry.histogram('editor.render_ms', span.end());
     }
+  }
+
+  /** Whether {@link renderImage} path traces with these options. */
+  pathTraces(opts: RenderImageOptions = {}): boolean {
+    const engine = opts.engine ?? (opts.useViewport ? 'RASTER' : this.session.doc.getRender().engine);
+    return engine === 'PATHTRACER' && opts.shading !== 'SOLID' && opts.shading !== 'WIREFRAME';
+  }
+
+  /** Output size of a render: the options, else the render resolution (16..4096 px). */
+  private renderSize(opts: RenderImageOptions): { width: number; height: number } {
+    const render = this.session.doc.getRender();
+    const scale = render.resolution_percentage / 100;
+    return {
+      width: Math.max(16, Math.min(4096, Math.round(opts.width ?? render.resolution_x * scale))),
+      height: Math.max(16, Math.min(4096, Math.round(opts.height ?? render.resolution_y * scale))),
+    };
+  }
+
+  /**
+   * Starts a progressive path traced render on the render workers with {@link renderImage}'s view
+   * choice: the explicit view, else the camera (option or scene camera), else the viewport's view.
+   * The document is captured now; the render settings give samples, bounces and denoising unless
+   * the options override them.
+   */
+  startPathTrace(opts: RenderImageOptions = {}): PathTraceJob {
+    if (!this.ev) this.sync();
+    const ev = this.ev!;
+    const { width, height } = this.renderSize(opts);
+    const frame =
+      typeof opts.frame === 'number' && Number.isFinite(opts.frame) ? opts.frame : this.session.state.frame;
+    const o: PathTraceOptions = { width, height, frame };
+    if (opts.samples !== undefined) o.samples = opts.samples;
+    if (opts.max_bounces !== undefined) o.max_bounces = opts.max_bounces;
+    if (opts.denoise !== undefined) o.denoise = opts.denoise;
+    if (opts.seed !== undefined) o.seed = opts.seed;
+    if (opts.time_limit !== undefined) o.timeLimit = opts.time_limit;
+    const camObj = opts.cameraId ? ev.byId.get(opts.cameraId) : ev.activeCamera;
+    if (opts.view) {
+      const v = opts.view;
+      o.viewSpec = {
+        position: [v.position[0], v.position[1], v.position[2]],
+        target: [v.target[0], v.target[1], v.target[2]],
+        up: v.up ? [v.up[0], v.up[1], v.up[2]] : [0, 0, 1],
+        fovY: THREE.MathUtils.degToRad(v.fov_degrees ?? 50),
+      };
+    } else if (!opts.useViewport && camObj?.camera) o.cameraId = camObj.id;
+    else {
+      // the viewport's view, as a perspective camera like the rasterized render
+      const pc = new THREE.PerspectiveCamera(40, width / height, 0.01, 10000);
+      applyPoseToCamera(this.pose, pc, width / height);
+      o.view = renderViewFromMatrices(
+        pc.matrixWorldInverse.elements,
+        pc.projectionMatrix.elements,
+        false,
+        pc.near,
+        pc.far,
+      );
+    }
+    return pathTraceDocument(this.session.doc, o);
+  }
+
+  /**
+   * Rasterizes the scene (WebGL, Rendered shading unless `shading` says otherwise) with
+   * {@link renderImage}'s camera choice and returns RGBA8 pixels (top row first).
+   */
+  renderPixels(opts: RenderImageOptions = {}): PixelImage {
+    if (!this.ev) this.sync();
+    const ev = this.ev!;
+    const render = ev.render;
+    const { width, height } = this.renderSize(opts);
+    const aspect = width / height;
+    let cam: THREE.Camera;
+    const camObj = opts.cameraId ? ev.byId.get(opts.cameraId) : ev.activeCamera;
+    if (opts.view) {
+      const v = opts.view;
+      const pc = new THREE.PerspectiveCamera(v.fov_degrees ?? 50, aspect, 0.01, 10000);
+      pc.up.set(...((v.up ?? [0, 0, 1]) as [number, number, number]));
+      pc.position.set(...(v.position as [number, number, number]));
+      pc.lookAt(new THREE.Vector3(...(v.target as [number, number, number])));
+      cam = pc;
+    } else if (!opts.useViewport && camObj?.camera) {
+      const cd = camObj.camera;
+      const m = new THREE.Matrix4().fromArray(camObj.worldMatrix);
+      if (cd.type === 'ORTHO') {
+        const e = orthoHalfExtents(cd, aspect);
+        const oc = new THREE.OrthographicCamera(
+          -e.halfW,
+          e.halfW,
+          e.halfH,
+          -e.halfH,
+          cd.clip_start,
+          cd.clip_end,
+        );
+        m.decompose(oc.position, oc.quaternion, new THREE.Vector3());
+        cam = oc;
+      } else {
+        const pc = new THREE.PerspectiveCamera(
+          THREE.MathUtils.radToDeg(cameraFovY(cd, aspect)),
+          aspect,
+          cd.clip_start,
+          cd.clip_end,
+        );
+        m.decompose(pc.position, pc.quaternion, new THREE.Vector3());
+        cam = pc;
+      }
+    } else {
+      const pc = new THREE.PerspectiveCamera(40, aspect, 0.01, 10000);
+      applyPoseToCamera(this.pose, pc, aspect);
+      cam = pc;
+    }
+    cam.updateMatrixWorld(true);
+    (cam as THREE.PerspectiveCamera).updateProjectionMatrix?.();
+    // final render: rendered shading, no overlays
+    const prevShading = this.session.view.shading.value;
+    const prevOverlays = this.session.view.overlays.value;
+    const prevFrame = this.session.state.frame;
+    if (typeof opts.frame === 'number' && Number.isFinite(opts.frame)) this.session.state.frame = opts.frame;
+    this.session.view.shading.value = opts.shading ?? 'RENDERED';
+    this.session.view.overlays.value = false;
+    this.sync();
+    const target = new THREE.WebGLRenderTarget(width, height, { samples: 8, type: THREE.HalfFloatType });
+    // The composer output is already tone mapped and sRGB encoded, so copy it raw (linear target).
+    const out = new THREE.WebGLRenderTarget(width, height, { type: THREE.UnsignedByteType });
+    const comp = new EffectComposer(this.renderer, target);
+    comp.renderToScreen = false;
+    comp.setPixelRatio(1);
+    comp.setSize(width, height);
+    const transparent = render.film_transparent;
+    const prevBg = this.scene.background;
+    if (transparent) this.scene.background = null;
+    comp.addPass(new RenderPass(this.scene, cam));
+    comp.addPass(new OutputPass());
+    comp.render();
+    // copy result (composer read buffer) into a byte target via a fullscreen quad
+    const readTarget = comp.readBuffer;
+    const quad = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      new THREE.MeshBasicMaterial({
+        map: readTarget.texture,
+        transparent: true,
+        toneMapped: false,
+        depthTest: false,
+      }),
+    );
+    const qs = new THREE.Scene();
+    qs.add(quad);
+    const qc = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const prevTm = this.renderer.toneMapping;
+    const prevClear = this.renderer.getClearColor(new THREE.Color());
+    const prevAlpha = this.renderer.getClearAlpha();
+    this.renderer.toneMapping = THREE.NoToneMapping;
+    this.renderer.setRenderTarget(out);
+    this.renderer.setClearColor(0x000000, 0);
+    this.renderer.clear();
+    this.renderer.render(qs, qc);
+    const pixels = new Uint8Array(width * height * 4);
+    this.renderer.readRenderTargetPixels(out, 0, 0, width, height, pixels);
+    this.renderer.setRenderTarget(null);
+    this.renderer.toneMapping = prevTm;
+    this.renderer.setClearColor(prevClear, prevAlpha);
+    this.scene.background = prevBg;
+    target.dispose();
+    out.dispose();
+    comp.dispose();
+    quad.geometry.dispose();
+    (quad.material as THREE.Material).dispose();
+    this.session.view.shading.value = prevShading;
+    this.session.view.overlays.value = prevOverlays;
+    this.session.state.frame = prevFrame;
+    this.invalidate();
+    // flip rows (WebGL origin is bottom-left)
+    const data = new Uint8ClampedArray(width * height * 4);
+    for (let y = 0; y < height; y++)
+      data.set(pixels.subarray((height - 1 - y) * width * 4, (height - y) * width * 4), y * width * 4);
+    if (!transparent) for (let i = 3; i < data.length; i += 4) data[i] = 255;
+    return { width, height, data };
   }
 
   /** Small JPEG of the current viewport for project thumbnails. */

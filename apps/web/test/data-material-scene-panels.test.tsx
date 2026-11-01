@@ -1,0 +1,655 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
+import * as Y from 'yjs';
+import { signal } from '@preact/signals';
+import {
+  SceneDoc,
+  SceneEvaluator,
+  decodeFloat32,
+  defaultBone,
+  emptySelection,
+  fcurveKey,
+  rigidBodyCacheInfo,
+  type MaterialData,
+} from '@3d-editor/core';
+import { closeDialog, openDialog, session as sessionSignal } from '../src/app/store';
+import { runResult, viewport } from '../src/editor/editor';
+import { EditorStateSignals, ViewState } from '../src/editor/state';
+import type { ProjectSession } from '../src/project/session';
+import type { ViewportEngine } from '../src/viewport/engine';
+import { Properties, activePropertiesTab } from '../src/ui/properties/Properties';
+import {
+  DataTab,
+  boneTree,
+  curveFieldOperator,
+  shapeKeyPath,
+  splinePointInput,
+} from '../src/ui/properties/DataTab';
+import {
+  filterPresets,
+  materialSwatchPixels,
+  patchProcedural,
+  proceduralPatch,
+  textureSource,
+} from '../src/ui/properties/MaterialTab';
+import { mistDensityForDistance } from '../src/ui/properties/SceneTabs';
+import { DialogHost, formatRenderTime } from '../src/ui/dialogs/Dialogs';
+import { InProcessWorker, RenderPool, startPathTrace } from '../src/render';
+
+/** A project session backed by a real document, evaluator, undo manager and operator registry. */
+function fakeSession(): ProjectSession {
+  const doc = SceneDoc.create({ empty: true });
+  const undo = new Y.UndoManager(doc.sharedTypes(), {
+    trackedOrigins: new Set([doc.origin]),
+    captureTimeout: 0,
+  });
+  const revision = signal(0);
+  doc.onChange(() => revision.value++);
+  return {
+    id: 'test-project',
+    doc,
+    undo,
+    state: new EditorStateSignals(),
+    view: new ViewState(),
+    evaluator: new SceneEvaluator(doc),
+    revision,
+    undoRevision: signal(0),
+    peers: signal([]),
+    currentOperator: null,
+  } as unknown as ProjectSession;
+}
+
+function ok(id: string, params: Record<string, unknown> = {}): Record<string, unknown> {
+  const r = runResult(id, params, 'test');
+  if (!r?.ok) throw new Error(`${id} failed: ${r?.error}`);
+  return (r.result ?? {}) as Record<string, unknown>;
+}
+
+function select(s: ProjectSession, ...names: string[]): void {
+  const ids = names.map((n) => s.doc.findObjectByName(n)!.id);
+  s.state.selectedIds = ids;
+  s.state.activeId = ids[ids.length - 1];
+}
+
+const byTestId = (root: ParentNode, id: string) => root.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+
+/** Types into a Blender-style number field (click, type, Enter). */
+function typeNumber(el: HTMLElement, value: string): void {
+  fireEvent.pointerDown(el, { button: 0, clientX: 5, pointerId: 1 });
+  fireEvent.pointerUp(el, { button: 0, clientX: 5, pointerId: 1 });
+  const input = el.querySelector('input')!;
+  fireEvent.input(input, { target: { value } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+}
+
+function typeText(el: HTMLElement, value: string): void {
+  const input = (el.tagName === 'INPUT' ? el : el.querySelector('input')) as HTMLInputElement;
+  fireEvent.input(input, { target: { value } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+}
+
+let s: ProjectSession;
+beforeEach(() => {
+  localStorage.clear();
+  s = fakeSession();
+  sessionSignal.value = s;
+});
+afterEach(() => {
+  cleanup();
+  closeDialog();
+  viewport.engine = null;
+  sessionSignal.value = null;
+});
+
+describe('Object Data tab: curves', () => {
+  it('edits shape, geometry, mapping, path animation and the active spline through operators', () => {
+    const r = ok('curve.primitive_bezier_curve_add', { name: 'Wire' });
+    select(s, 'Wire');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const curve = () => s.doc.getCurve(s.doc.findObjectByName('Wire')!.data!)!;
+    expect(byTestId(container, 'prop-content-data')).not.toBeNull();
+
+    typeNumber(byTestId(container, 'curve-bevel-depth')!, '0.1');
+    expect(curve().bevel_depth).toBeCloseTo(0.1);
+    typeNumber(byTestId(container, 'curve-bevel-resolution')!, '6');
+    expect(curve().bevel_resolution).toBe(6);
+    typeNumber(byTestId(container, 'curve-extrude')!, '0.2');
+    expect(curve().extrude).toBeCloseTo(0.2);
+    typeNumber(byTestId(container, 'curve-factor-end')!, '0.5');
+    expect(curve().bevel_factor_end).toBeCloseTo(0.5);
+    fireEvent.click(byTestId(container, 'curve-fill-caps')!);
+    expect(curve().use_fill_caps).toBe(true);
+    fireEvent.change(byTestId(container, 'curve-twist')!, { target: { value: 'Z_UP' } });
+    expect(curve().twist_mode).toBe('Z_UP');
+    expect(byTestId(container, 'curve-taper-note')?.textContent).toMatch(/radius/);
+
+    // 2D curves offer the 2D fill modes and no twist method
+    fireEvent.click(byTestId(container, 'curve-dimensions-2D')!);
+    expect(curve().dimensions).toBe('2D');
+    expect(byTestId(container, 'curve-twist')).toBeNull();
+    const fills = [...(byTestId(container, 'curve-fill-mode') as HTMLSelectElement).options].map(
+      (o) => o.value,
+    );
+    expect(fills.slice(0, 4)).toEqual(['BOTH', 'FRONT', 'BACK', 'NONE']);
+
+    // bevel object: other curve objects only
+    ok('curve.primitive_bezier_circle_add', { name: 'Profile' });
+    select(s, 'Wire');
+    act(() => void (activePropertiesTab.value = 'data'));
+    fireEvent.click(byTestId(container, 'curve-bevel-mode-OBJECT')!);
+    expect(curve().bevel_mode).toBe('OBJECT');
+    const objects = [...(byTestId(container, 'curve-bevel-object') as HTMLSelectElement).options];
+    expect(objects.map((o) => o.textContent)).toEqual(['— none —', 'Profile']);
+    fireEvent.change(byTestId(container, 'curve-bevel-object')!, {
+      target: { value: s.doc.findObjectByName('Profile')!.id },
+    });
+    expect(curve().bevel_object).toBe(s.doc.findObjectByName('Profile')!.id);
+
+    // path animation (panel closed by default: open it)
+    fireEvent.click(
+      [...container.querySelectorAll('.panel-header')].find((h) =>
+        h.textContent?.includes('Path Animation'),
+      )!,
+    );
+    typeNumber(byTestId(container, 'curve-path-frames')!, '48');
+    expect(curve().path_duration).toBe(48);
+    typeNumber(byTestId(container, 'curve-eval-time')!, '12');
+    expect(curve().eval_time).toBe(12);
+
+    // active spline: cyclic, type and resolution keep the points
+    const points = curve().splines[0].points.map((p) => p.co);
+    fireEvent.click(byTestId(container, 'spline-cyclic')!);
+    expect(curve().splines[0].use_cyclic_u).toBe(true);
+    fireEvent.click(byTestId(container, 'spline-type-NURBS')!);
+    expect(curve().splines[0].type).toBe('NURBS');
+    expect(curve().splines[0].points.map((p) => p.co)).toEqual(points);
+    typeNumber(byTestId(container, 'spline-order')!, '3');
+    expect(curve().splines[0].order_u).toBe(3);
+    typeNumber(byTestId(container, 'spline-resolution')!, '20');
+    expect(curve().splines[0].resolution_u).toBe(20);
+    fireEvent.click(byTestId(container, 'spline-smooth')!);
+    expect(curve().splines[0].use_smooth).toBe(false);
+    expect(r.object).toBeTruthy();
+  });
+
+  it('shows curve evaluation errors and animated values', () => {
+    ok('curve.primitive_bezier_curve_add', { name: 'Wire', bevel_depth: 0.1 });
+    const wire = s.doc.findObjectByName('Wire')!;
+    ok('curve.keyframe_insert', { object: wire.id, path: 'bevel_depth', frame: 1, value: 0.1 });
+    ok('curve.keyframe_insert', { object: wire.id, path: 'bevel_depth', frame: 11, value: 0.3 });
+    s.state.frame = 6;
+    select(s, 'Wire');
+    const { container } = render(<DataTab s={s} o={s.doc.getObject(wire.id)!} />);
+    const depth = byTestId(container, 'curve-bevel-depth')!;
+    expect(depth.className).toContain('animated');
+    expect(parseFloat(depth.textContent!)).toBeGreaterThan(0.15);
+    expect(parseFloat(depth.textContent!)).toBeLessThan(0.25);
+  });
+});
+
+describe('Object Data tab: text', () => {
+  it('edits the body, font, spacing, alignment and offsets', () => {
+    ok('object.text_add', { body: 'Hello', name: 'Title' });
+    select(s, 'Title');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const curve = () => s.doc.getCurve(s.doc.findObjectByName('Title')!.data!)!;
+    const body = byTestId(container, 'font-body') as HTMLTextAreaElement;
+    expect(body.value).toBe('Hello');
+    fireEvent.input(body, { target: { value: 'Hello\nWorld' } });
+    fireEvent.blur(body);
+    expect(curve().body).toBe('Hello\nWorld');
+    typeNumber(byTestId(container, 'font-size')!, '0.5');
+    expect(curve().size).toBeCloseTo(0.5);
+    typeNumber(byTestId(container, 'font-shear')!, '0.2');
+    expect(curve().shear).toBeCloseTo(0.2);
+    typeNumber(byTestId(container, 'font-space-line')!, '1.5');
+    expect(curve().space_line).toBeCloseTo(1.5);
+    fireEvent.change(byTestId(container, 'font-align-x')!, { target: { value: 'CENTER' } });
+    expect(curve().align_x).toBe('CENTER');
+    fireEvent.change(byTestId(container, 'font-align-y')!, { target: { value: 'CENTER' } });
+    expect(curve().align_y).toBe('CENTER');
+    typeNumber(byTestId(container, 'font-offset-x')!, '0.25');
+    expect(curve().offset_x).toBeCloseTo(0.25);
+    // text shares the geometry panel (extrude gives thickness)
+    typeNumber(byTestId(container, 'curve-extrude')!, '0.05');
+    expect(curve().extrude).toBeCloseTo(0.05);
+    expect(byTestId(container, 'curve-dimensions')).toBeNull();
+    expect(byTestId(container, 'spline-type')).toBeNull();
+  });
+});
+
+describe('Object Data tab: armatures', () => {
+  it('edits the skeleton, bones, pose and adds IK', () => {
+    ok('object.armature_add', { name: 'Rig' });
+    select(s, 'Rig');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const rig = () => s.doc.findObjectByName('Rig')!;
+    const arm = () => s.doc.getArmature(rig().data!)!;
+
+    fireEvent.click(byTestId(container, 'armature-pose-position-REST')!);
+    expect(arm().pose_position).toBe('REST');
+    fireEvent.change(byTestId(container, 'armature-display-type')!, { target: { value: 'STICK' } });
+    expect(arm().display_type).toBe('STICK');
+    fireEvent.click(byTestId(container, 'armature-show-names')!);
+    expect(arm().show_names).toBe(true);
+
+    // add a child of the active bone, then another one
+    fireEvent.click(byTestId(container, 'bone-add')!);
+    fireEvent.click(byTestId(container, 'bone-add')!);
+    expect(arm().bones.map((b) => [b.name, b.parent])).toEqual([
+      ['Bone', null],
+      ['Bone.001', 'Bone'],
+      ['Bone.002', 'Bone.001'],
+    ]);
+    // the list shows the hierarchy; the new bone is active
+    expect(byTestId(container, 'bone-Bone.002')?.getAttribute('aria-selected')).toBe('true');
+    typeText(byTestId(container, 'bone-name')!, 'Hand');
+    expect(arm().bones[2].name).toBe('Hand');
+    expect(byTestId(container, 'bone-Hand')?.getAttribute('aria-selected')).toBe('true');
+    typeNumber(byTestId(container, 'bone-tail-2')!, '4');
+    expect(arm().bones[2].tail[2]).toBeCloseTo(4);
+    fireEvent.click(byTestId(container, 'bone-deform')!);
+    expect(arm().bones[2].use_deform).toBe(false);
+
+    // pose: rotation in degrees, keyframes and clear
+    typeNumber(byTestId(container, 'pose-rotation-0')!, '45');
+    expect(rig().pose.bones.Hand.rotation_euler[0]).toBeCloseTo(Math.PI / 4);
+    fireEvent.click(byTestId(container, 'pose-keyframe')!);
+    expect(
+      s.doc.getFCurve(
+        fcurveKey({
+          target_type: 'object',
+          target_id: rig().id,
+          path: 'pose.bones["Hand"].rotation_euler',
+          index: 0,
+        }),
+      ),
+    ).not.toBeNull();
+    fireEvent.click(byTestId(container, 'pose-clear')!);
+    expect(rig().pose.bones.Hand.rotation_euler).toEqual([0, 0, 0]);
+
+    // IK on Bone.001 targeting the Hand bone of this armature is refused (Hand is in its chain children)…
+    fireEvent.click(byTestId(container, 'bone-Bone.001')!);
+    expect(byTestId(container, 'pose-ik-add')?.hasAttribute('disabled')).toBe(true);
+    // …so add a free control bone and target it
+    act(
+      () =>
+        void ok('armature.bone_add', {
+          object: rig().id,
+          name: 'Target',
+          head: [1, 0, 1],
+          tail: [1, 0, 1.5],
+        }),
+    );
+    fireEvent.change(byTestId(container, 'pose-ik-bone')!, { target: { value: 'Target' } });
+    typeNumber(byTestId(container, 'pose-ik-chain')!, '2');
+    fireEvent.click(byTestId(container, 'pose-ik-add')!);
+    const ik = rig().pose.bones['Bone.001'].constraints!;
+    expect(ik.map((c) => [c.type, c.subtarget, c.params.chain_count])).toEqual([['IK', 'Target', 2]]);
+    typeNumber(byTestId(container, 'bone-constraint-IK-influence')!, '0.5');
+    expect(rig().pose.bones['Bone.001'].constraints![0].influence).toBeCloseTo(0.5);
+    fireEvent.click(byTestId(container, 'bone-constraint-IK-remove')!);
+    expect(rig().pose.bones['Bone.001'].constraints ?? []).toHaveLength(0);
+
+    fireEvent.click(byTestId(container, 'bone-Hand')!);
+    fireEvent.click(byTestId(container, 'bone-remove')!);
+    expect(arm().bones.map((b) => b.name)).toEqual(['Bone', 'Bone.001', 'Target']);
+  });
+
+  it('orders bones as a tree', () => {
+    const bones = [
+      { ...defaultBone('C'), parent: 'B' },
+      defaultBone('A'),
+      { ...defaultBone('B'), parent: 'A' },
+      { ...defaultBone('X'), parent: 'Y' },
+      { ...defaultBone('Y'), parent: 'X' },
+    ];
+    expect(boneTree(bones).map((t) => `${t.bone.name}${t.depth}`)).toEqual(['A0', 'B1', 'C2', 'X0', 'Y0']);
+  });
+});
+
+describe('Object Data tab: vertex groups and shape keys', () => {
+  it('adds, renames, assigns in Edit Mode, normalizes and removes vertex groups', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const meshId = s.doc.findObjectByName('Cube')!.data!;
+    fireEvent.click(byTestId(container, 'vgroup-add')!);
+    fireEvent.click(byTestId(container, 'vgroup-add')!);
+    expect(s.doc.getVertexGroups(meshId).map((g) => g.name)).toEqual(['Group', 'Group.001']);
+    typeText(byTestId(container, 'vgroup-name')!, 'Arm');
+    expect(s.doc.getVertexGroups(meshId).map((g) => g.name)).toEqual(['Group', 'Arm']);
+    expect(byTestId(container, 'vgroup-Arm')?.getAttribute('aria-selected')).toBe('true');
+
+    // Edit Mode: assign the selected vertices with the weight field
+    act(() => {
+      ok('object.mode_set', { mode: 'EDIT' });
+      const sel = emptySelection();
+      sel.verts.add(0);
+      sel.verts.add(1);
+      s.state.meshSelection = sel;
+    });
+    typeNumber(byTestId(container, 'vgroup-weight')!, '0.5');
+    fireEvent.click(byTestId(container, 'vgroup-assign')!);
+    const weights = () => [...decodeFloat32(s.doc.getVertexGroups(meshId)[1].weights)];
+    expect(weights().slice(0, 3)).toEqual([0.5, 0.5, 0]);
+    expect(byTestId(container, 'vgroup-Arm')?.textContent).toContain('2');
+    fireEvent.click(byTestId(container, 'vgroup-remove-from')!);
+    expect(weights().slice(0, 2)).toEqual([0, 0]);
+    act(() => void ok('object.mode_set', { mode: 'OBJECT' }));
+    expect(byTestId(container, 'vgroup-assign')).toBeNull();
+    fireEvent.click(byTestId(container, 'vgroup-normalize-all')!);
+    fireEvent.click(byTestId(container, 'vgroup-remove')!);
+    expect(s.doc.getVertexGroups(meshId).map((g) => g.name)).toEqual(['Group']);
+  });
+
+  it('lists the basis and edits key values, ranges, mute and relative keys', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const meshId = s.doc.findObjectByName('Cube')!.data!;
+    const keys = () => s.doc.getShapeKeys(meshId);
+    expect(byTestId(container, 'shape-key-Basis')).toBeNull();
+    fireEvent.click(byTestId(container, 'shape-key-add')!);
+    fireEvent.click(byTestId(container, 'shape-key-add')!);
+    expect(keys().map((k) => k.name)).toEqual(['Key 1', 'Key 2']);
+    expect(byTestId(container, 'shape-key-Basis')).not.toBeNull();
+    typeNumber(byTestId(container, 'shape-key-value')!, '0.75');
+    expect(keys()[1].value).toBeCloseTo(0.75);
+    typeNumber(byTestId(container, 'shape-key-max')!, '2');
+    expect(keys()[1].slider_max).toBe(2);
+    fireEvent.change(byTestId(container, 'shape-key-relative')!, { target: { value: 'Key 1' } });
+    expect(keys()[1].relative_key).toBe('Key 1');
+    fireEvent.click(byTestId(container, 'shape-key-Key 1-mute')!);
+    expect(keys()[0].mute).toBe(true);
+    fireEvent.click(byTestId(container, 'shape-key-keyframe')!);
+    expect(
+      s.doc.getFCurve(
+        fcurveKey({ target_type: 'mesh', target_id: meshId, path: shapeKeyPath('Key 2'), index: 0 }),
+      ),
+    ).not.toBeNull();
+    typeText(byTestId(container, 'shape-key-name')!, 'Smile');
+    expect(keys().map((k) => k.name)).toEqual(['Key 1', 'Smile']);
+    fireEvent.click(byTestId(container, 'shape-key-clear')!);
+    expect(keys().map((k) => k.value)).toEqual([0, 0]);
+    fireEvent.click(byTestId(container, 'shape-key-remove')!);
+    expect(keys().map((k) => k.name)).toEqual(['Key 1']);
+    fireEvent.click(byTestId(container, 'shape-key-add-mix')!);
+    expect(keys()).toHaveLength(2);
+    fireEvent.click(byTestId(container, 'shape-key-apply-all')!);
+    expect(keys()).toHaveLength(0);
+  });
+});
+
+describe('Material tab', () => {
+  it('applies presets as new materials or onto the current material', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'material';
+    const { container } = render(<Properties session={s} />);
+    const cube = () => s.doc.findObjectByName('Cube')!;
+    typeText(byTestId(container, 'material-preset-search')!, 'gold');
+    expect(
+      [...byTestId(container, 'material-presets')!.querySelectorAll('[role=option]')].map((e) =>
+        e.getAttribute('data-testid'),
+      ),
+    ).toEqual(['material-preset-gold']);
+    fireEvent.click(byTestId(container, 'material-preset-gold')!);
+    expect(byTestId(container, 'material-preset-description')?.textContent).toContain('Gold');
+    fireEvent.click(byTestId(container, 'material-preset-new')!);
+    const gold = s.doc.getMaterial(cube().material_slots[0]!)!;
+    expect(gold.name).toBe('Gold');
+    expect(gold.metallic).toBe(1);
+    // overwrite the material in place with another preset
+    typeText(byTestId(container, 'material-preset-search')!, 'brick');
+    fireEvent.click(byTestId(container, 'material-preset-brick')!);
+    fireEvent.click(byTestId(container, 'material-preset-apply')!);
+    const after = s.doc.getMaterial(gold.id)!;
+    expect(after.name).toBe('Gold');
+    expect(after.textures.base_color?.procedural?.type).toBe('BRICK');
+    expect(filterPresets('', 'METAL').every((p) => p.category === 'METAL')).toBe(true);
+    expect(filterPresets('glass clear', 'ALL').map((p) => p.id)).toEqual(['clear_glass']);
+  });
+
+  it('switches channels between none, image and procedural and edits procedural parameters', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    ok('material.new', { name: 'Paint' });
+    activePropertiesTab.value = 'material';
+    const { container } = render(<Properties session={s} />);
+    const mat = () => s.doc.getMaterial(s.doc.findObjectByName('Cube')!.material_slots[0]!)!;
+    fireEvent.click(byTestId(container, 'tex-base_color-source-PROCEDURAL')!);
+    expect(mat().textures.base_color?.procedural?.type).toBe('NOISE');
+    fireEvent.change(byTestId(container, 'tex-base_color-type')!, { target: { value: 'VORONOI' } });
+    expect(mat().textures.base_color?.procedural?.type).toBe('VORONOI');
+    // type parameters come from the core spec; detail is not used by Voronoi
+    expect(byTestId(container, 'tex-base_color-feature')).not.toBeNull();
+    expect(byTestId(container, 'tex-base_color-detail')).toBeNull();
+    fireEvent.change(byTestId(container, 'tex-base_color-feature')!, {
+      target: { value: 'DISTANCE_TO_EDGE' },
+    });
+    expect(mat().textures.base_color?.procedural?.params.feature).toBe('DISTANCE_TO_EDGE');
+    typeNumber(byTestId(container, 'tex-base_color-scale')!, '12');
+    expect(mat().textures.base_color?.procedural?.scale).toBe(12);
+    fireEvent.change(byTestId(container, 'tex-base_color-mapping')!, { target: { value: 'OBJECT' } });
+    expect(mat().textures.base_color?.procedural?.mapping).toBe('OBJECT');
+    typeNumber(byTestId(container, 'tex-base_color-offset-2')!, '0.5');
+    expect(mat().textures.base_color?.procedural?.params.offset_z).toBe(0.5);
+
+    // scalar channels edit grey ramp values; normal adds the bump distance
+    fireEvent.click(byTestId(container, 'tex-roughness-source-PROCEDURAL')!);
+    typeNumber(byTestId(container, 'tex-roughness-value-b')!, '0.8');
+    expect(mat().textures.roughness?.procedural?.color_b).toEqual([0.8, 0.8, 0.8, 1]);
+    fireEvent.click(byTestId(container, 'tex-normal-source-PROCEDURAL')!);
+    typeNumber(byTestId(container, 'tex-normal-bump-distance')!, '0.02');
+    expect(mat().textures.normal?.procedural?.params.bump_distance).toBeCloseTo(0.02);
+
+    // None clears the channel (one undo step)
+    fireEvent.click(byTestId(container, 'tex-roughness-source-NONE')!);
+    expect(mat().textures.roughness ?? null).toBeNull();
+    expect(textureSource(mat(), 'base_color')).toBe('PROCEDURAL');
+    expect(textureSource(mat(), 'roughness')).toBe('NONE');
+    expect(
+      textureSource({ textures: { alpha: { image: 'x', scale: [1, 1], offset: [0, 0] } } }, 'alpha'),
+    ).toBe('IMAGE');
+  });
+
+  it('builds procedural patches and preview swatches', () => {
+    const tex = {
+      type: 'NOISE' as const,
+      mapping: 'GENERATED' as const,
+      scale: 5,
+      detail: 2,
+      roughness: 0.5,
+      distortion: 0,
+      color_a: [0, 0, 0, 1] as [number, number, number, number],
+      color_b: [1, 1, 1, 1] as [number, number, number, number],
+      ramp_low: 0,
+      ramp_high: 1,
+      seed: 0,
+      params: { noise_type: 'FBM' },
+    };
+    expect(patchProcedural(tex, 'params.lacunarity', 3).params).toEqual({ noise_type: 'FBM', lacunarity: 3 });
+    expect(patchProcedural(tex, 'scale', 2).scale).toBe(2);
+    expect(proceduralPatch('params.lacunarity', 3)).toEqual({ params: { lacunarity: 3 } });
+    expect(proceduralPatch('scale', 2)).toEqual({ scale: 2 });
+    const m: MaterialData = s.doc.getMaterial(s.doc.addMaterial({ name: 'M', base_color: [1, 0, 0, 1] }))!;
+    const px = materialSwatchPixels(m, 16);
+    const at = (x: number, y: number) => [...px.subarray((y * 16 + x) * 4, (y * 16 + x) * 4 + 4)];
+    expect(at(0, 0)[3]).toBe(0);
+    const centre = at(8, 8);
+    expect(centre[3]).toBe(255);
+    expect(centre[0]).toBeGreaterThan(centre[1] + 40);
+  });
+});
+
+describe('Scene, World and Render tabs', () => {
+  it('switches the render engine and edits path tracer settings', () => {
+    activePropertiesTab.value = 'render';
+    const { container } = render(<Properties session={s} />);
+    expect(byTestId(container, 'render-samples')).toBeNull();
+    fireEvent.change(byTestId(container, 'render-engine')!, { target: { value: 'PATHTRACER' } });
+    expect(s.doc.getRender().engine).toBe('PATHTRACER');
+    typeNumber(byTestId(container, 'render-samples')!, '128');
+    expect(s.doc.getRender().samples).toBe(128);
+    typeNumber(byTestId(container, 'render-max-bounces')!, '8');
+    expect(s.doc.getRender().max_bounces).toBe(8);
+    fireEvent.click(byTestId(container, 'render-denoise')!);
+    expect(s.doc.getRender().use_denoising).toBe(false);
+    expect(byTestId(container, 'render-engine-hint')?.textContent).toMatch(/thread/);
+  });
+
+  it('edits the sky and the mist of the world', () => {
+    activePropertiesTab.value = 'world';
+    const { container } = render(<Properties session={s} />);
+    expect(byTestId(container, 'world-sun-elevation')).toBeNull();
+    fireEvent.change(byTestId(container, 'world-environment')!, { target: { value: 'SKY' } });
+    const w = () => s.doc.getWorld();
+    expect(w().environment).toBe('SKY');
+    expect(w().show_environment_background).toBe(true);
+    typeNumber(byTestId(container, 'world-sun-elevation')!, '10');
+    expect(w().sun_elevation).toBeCloseTo((10 * Math.PI) / 180);
+    typeNumber(byTestId(container, 'world-sun-intensity')!, '5');
+    expect(w().sun_intensity).toBe(5);
+    fireEvent.change(byTestId(container, 'world-sky-preset')!, { target: { value: 'SUNSET' } });
+    expect(w().sun_elevation).toBeCloseTo((2 * Math.PI) / 180);
+    // the Mist panel starts closed while there is no mist
+    expect(byTestId(container, 'world-mist-distance')).toBeNull();
+    fireEvent.click([...container.querySelectorAll('.panel-header')].find((h) => h.textContent === '▸Mist')!);
+    expect(byTestId(container, 'world-mist-distance')?.textContent).toBe('Off');
+    typeNumber(byTestId(container, 'world-mist-distance')!, '50');
+    expect(w().mist_density).toBeCloseTo(mistDensityForDistance(50));
+    expect(byTestId(container, 'world-mist-distance')?.textContent).toContain('50');
+    fireEvent.change(byTestId(container, 'world-environment')!, { target: { value: 'NONE' } });
+    expect(w().environment).toBe('NONE');
+  });
+
+  it('edits the rigid body world and bakes or frees its cache', () => {
+    ok('mesh.primitive_plane_add', { name: 'Ground', size: 10 });
+    ok('mesh.primitive_cube_add', { name: 'Box', location: [0, 0, 3] });
+    ok('rigidbody.object_add', { objects: ['Ground'], type: 'PASSIVE' });
+    ok('rigidbody.object_add', { objects: ['Box'], type: 'ACTIVE' });
+    activePropertiesTab.value = 'scene';
+    const { container } = render(<Properties session={s} />);
+    typeNumber(byTestId(container, 'scene-rigidbody-world-frame_end')!, '20');
+    expect(s.doc.getScene().rigidbody_world.frame_end).toBe(20);
+    typeNumber(byTestId(container, 'scene-rigidbody-world-substeps_per_frame')!, '5');
+    expect(s.doc.getScene().rigidbody_world.substeps_per_frame).toBe(5);
+    fireEvent.click(byTestId(container, 'scene-rigidbody-bake')!);
+    expect(rigidBodyCacheInfo(s.doc)?.simulated_to).toBe(20);
+    expect(byTestId(container, 'scene-rigidbody-cache')?.textContent).toContain('Cached frames 1–20');
+    fireEvent.click(byTestId(container, 'scene-rigidbody-free')!);
+    expect(rigidBodyCacheInfo(s.doc)).toBeNull();
+    fireEvent.click(byTestId(container, 'scene-rigidbody-bake-keyframes')!);
+    expect(s.doc.findObjectByName('Box')!.rigid_body).toBeNull();
+  });
+});
+
+describe('render window', () => {
+  const pools: RenderPool[] = [];
+  afterEach(() => {
+    for (const p of pools.splice(0)) p.dispose();
+  });
+  function fakeEngine(samples: number): ViewportEngine {
+    const pool = new RenderPool({ size: 2, factory: () => new InProcessWorker(), idleMs: 0 });
+    pools.push(pool);
+    return {
+      pathTraces: () => true,
+      startPathTrace: () => startPathTrace(pool, s.doc, { width: 16, height: 12, frame: 1, samples }),
+    } as unknown as ViewportEngine;
+  }
+
+  it('path traces progressively and shows the result with its render info', async () => {
+    s.doc.populateDefaultScene();
+    viewport.engine = fakeEngine(3);
+    openDialog('render');
+    const { container } = render(<DialogHost />);
+    await waitFor(() => expect(byTestId(container, 'render-image')).not.toBeNull(), { timeout: 10_000 });
+    expect(byTestId(container, 'render-image')?.getAttribute('src')).toMatch(/^data:image\/png;base64,/);
+    const status = byTestId(container, 'render-status')!.textContent!;
+    expect(status).toContain('Finished');
+    expect(status).toContain('Sample 3/3');
+    expect(byTestId(container, 'render-save')).not.toBeNull();
+    expect(byTestId(container, 'render-cancel')).toBeNull();
+  });
+
+  it('cancels with Escape and keeps the image', async () => {
+    s.doc.populateDefaultScene();
+    viewport.engine = fakeEngine(100_000);
+    openDialog('render');
+    const { container } = render(<DialogHost />);
+    await waitFor(() => expect(byTestId(container, 'render-status')?.textContent).toContain('Path Tracing'), {
+      timeout: 10_000,
+    });
+    expect(byTestId(container, 'render-cancel')).not.toBeNull();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(byTestId(container, 'render-status')?.textContent).toContain('Cancelled'), {
+      timeout: 10_000,
+    });
+    await waitFor(() => expect(byTestId(container, 'render-image')).not.toBeNull());
+  });
+
+  it('renders an animation into a file with progress', async () => {
+    s.doc.populateDefaultScene();
+    s.doc.updateScene({ frame_start: 1, frame_end: 3 });
+    s.doc.updateRender({ resolution_x: 40, resolution_y: 20, resolution_percentage: 50 });
+    const frames: number[] = [];
+    viewport.engine = {
+      renderPixels: (o: { frame: number; width: number; height: number }) => {
+        frames.push(o.frame);
+        return {
+          width: o.width,
+          height: o.height,
+          data: new Uint8ClampedArray(o.width * o.height * 4).fill(200),
+        };
+      },
+    } as unknown as ViewportEngine;
+    openDialog('render', { animation: true });
+    const { container } = render(<DialogHost />);
+    expect(byTestId(container, 'render-animation-settings')?.textContent).toContain('3 frames · 20×16 px');
+    fireEvent.change(byTestId(container, 'render-animation-format')!, { target: { value: 'GIF' } });
+    fireEvent.click(byTestId(container, 'render-animation-start')!);
+    await waitFor(() => expect(byTestId(container, 'render-animation-result')).not.toBeNull(), {
+      timeout: 10_000,
+    });
+    expect(frames).toEqual([1, 2, 3]);
+    expect(byTestId(container, 'render-animation-info')?.textContent).toMatch(/3 frames \(1–3\) · 20×16/);
+    expect(byTestId(container, 'render-animation-save')).not.toBeNull();
+    expect(formatRenderTime(83_456)).toBe('01:23.46');
+  });
+});
+
+describe('helpers', () => {
+  it('maps curve fields to their operators and keeps spline points', () => {
+    expect(curveFieldOperator('o', 'bevel_depth', 1)).toEqual({
+      id: 'curve.properties_set',
+      params: { object: 'o', bevel_depth: 1 },
+    });
+    expect(curveFieldOperator('o', 'align_x', 'CENTER').id).toBe('font.text_set');
+    const p = splinePointInput({
+      co: [1, 2, 3],
+      handle_left: null,
+      handle_right: [0, 0, 1],
+      handle_left_type: 'AUTO',
+      handle_right_type: 'FREE',
+      radius: 0.5,
+      tilt: 0.1,
+      weight: 2,
+    });
+    expect(p).toEqual({
+      co: [1, 2, 3],
+      handle_left: null,
+      handle_right: [0, 0, 1],
+      handle_left_type: 'AUTO',
+      handle_right_type: 'FREE',
+      radius: 0.5,
+      tilt: 0.1,
+      weight: 2,
+    });
+  });
+});

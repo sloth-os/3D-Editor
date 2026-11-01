@@ -175,7 +175,12 @@ export class RenderWorkerEngine {
       height,
       cameraId: o.cameraId,
       view: o.viewSpec
-        ? { position: o.viewSpec.position, target: o.viewSpec.target, up: o.viewSpec.up, fovY: o.viewSpec.fovY }
+        ? {
+            position: o.viewSpec.position,
+            target: o.viewSpec.target,
+            up: o.viewSpec.up,
+            fovY: o.viewSpec.fovY,
+          }
         : undefined,
     };
     const view: RenderView = o.view

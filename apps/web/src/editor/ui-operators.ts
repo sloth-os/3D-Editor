@@ -500,12 +500,20 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'render.render',
       label: 'Render Image',
-      description: 'Render the active camera view at the output resolution (F12).',
+      description:
+        'Render the active camera view at the output resolution (F12); with the PATHTRACER engine the image ' +
+        'refines progressively on the render workers. animation=true renders the frame range into an ' +
+        'animated PNG or GIF instead (Render Animation, Ctrl+F12).',
       category: 'Render',
       ...ui,
-      schema: z.object({}),
-      execute() {
-        openDialog('render');
+      schema: z.object({
+        animation: z
+          .boolean()
+          .default(false)
+          .describe('Render the frame range into an animation (Ctrl+F12) instead of a still image'),
+      }),
+      execute(_ctx, p) {
+        openDialog('render', p.animation ? { animation: true } : {});
       },
     }),
   );
