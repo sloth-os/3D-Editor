@@ -1,9 +1,11 @@
 import {
+  ANIMATABLE,
   FrameState,
   ROOT_COLLECTION_ID,
   SceneEvaluator,
   constraintTargets,
   decodeFloat32,
+  decompose4,
   expandInstances,
   meshStats,
   modifierObjectParams,
@@ -23,6 +25,7 @@ import {
   type SceneDoc,
   type ShapeKeyData,
   type Vec3,
+  type WorldSettings,
 } from '@3d-editor/core';
 
 /*
@@ -32,8 +35,11 @@ import {
  * are truncated, with the full count next to them, so a summary stays small enough to read.
  *
  * Values are the ones at the described frame, like Blender's properties: animated and driven
- * transforms, pose channels, shape key values, constraint influences and settings. Instance
- * counts are those of renders (the viewport may show fewer: particle display_percentage).
+ * transforms, pose channels, shape key values, constraint influences, light / camera / curve /
+ * world settings. Where such a value differs from the one stored in the document (the value that
+ * tools such as transform_object edit, overridden by keyframes and drivers), the stored value is
+ * listed too (`stored`, `stored_value`, `stored_influence`). Instance counts are those of renders
+ * (the viewport may show fewer: particle display_percentage).
  */
 
 const RAD2DEG = 180 / Math.PI;
@@ -72,6 +78,46 @@ function listField<T>(key: string, items: readonly T[], max: number): Record<str
   const b = bounded(items, max);
   return b.total === undefined ? { [key]: b.items } : { [key]: b.items, [`${key}_total`]: b.total };
 }
+
+/** A number or a vector of numbers rounded like the rest of a summary; other values as they are. */
+function rounded(v: unknown): unknown {
+  if (typeof v === 'number') return round(v);
+  const list = Array.isArray(v)
+    ? (v as unknown[])
+    : ArrayBuffer.isView(v) && !(v instanceof DataView)
+      ? Array.from(v as unknown as ArrayLike<unknown>)
+      : null;
+  if (list && list.length && list.every((x) => typeof x === 'number')) return roundVec(list as number[]);
+  return v;
+}
+
+/**
+ * The stored (document) values of `keys` that differ from their values at the frame `now`: what
+ * keyframes, drivers or F-curve modifiers override. Null when nothing differs.
+ */
+function storedDiff(
+  now: object | null | undefined,
+  stored: object | null | undefined,
+  keys: readonly string[],
+): Record<string, unknown> | null {
+  if (!now || !stored) return null;
+  const a = now as Record<string, unknown>;
+  const b = stored as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const k of keys) {
+    if (b[k] === undefined) continue;
+    const s = rounded(b[k]);
+    if (JSON.stringify(rounded(a[k])) !== JSON.stringify(s)) out[k] = s;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** `{ [key]: diff }` when `diff` is not null (for spreading into a summary). */
+const storedField = (diff: Record<string, unknown> | null, key = 'stored') => (diff ? { [key]: diff } : {});
+
+const TRANSFORM_KEYS = ['location', 'rotation_euler', 'scale'] as const;
+/** The channels of a pose bone that was never posed. */
+const REST_POSE = { location: [0, 0, 0], rotation_euler: [0, 0, 0], scale: [1, 1, 1] };
 
 export interface Bounds {
   min: Vec3;
@@ -340,38 +386,66 @@ function armatureSummary(scene: SceneDoc, o: ObjectData, ev: EvaluatedObject | u
     };
   });
   if (arm.bones.length > 128) out.bones_total = arm.bones.length;
+  // pose channels at the frame (keyed / driven), with the stored channels where they differ
+  const storedBones = scene.getObject(o.id)?.pose?.bones ?? {};
   out.pose = Object.fromEntries(
-    posed.slice(0, OBJECT_LIST).map(([name, pb]) => [
-      name,
-      {
-        location: roundVec([...pb.location]),
-        rotation_euler: roundVec([...pb.rotation_euler]),
-        scale: roundVec([...pb.scale]),
-        ...(pb.constraints?.length
-          ? { constraints: pb.constraints.map((c) => constraintSummary(scene, c, [], true)) }
-          : {}),
-      },
-    ]),
+    posed.slice(0, OBJECT_LIST).map(([name, pb]) => {
+      const stored = storedBones[name];
+      return [
+        name,
+        {
+          location: roundVec([...pb.location]),
+          rotation_euler: roundVec([...pb.rotation_euler]),
+          scale: roundVec([...pb.scale]),
+          // a bone without a stored channel rests at its rest pose (animation may still move it)
+          ...storedField(storedDiff(pb, stored ?? REST_POSE, TRANSFORM_KEYS)),
+          ...(pb.constraints?.length
+            ? {
+                constraints: pb.constraints.map((c) =>
+                  constraintSummary(
+                    scene,
+                    c,
+                    [],
+                    true,
+                    stored?.constraints?.find((x) => x.id === c.id),
+                  ),
+                ),
+              }
+            : {}),
+        },
+      ];
+    }),
   );
+  if (posed.length > OBJECT_LIST) out.pose_total = posed.length;
   return out;
 }
 
+/**
+ * A constraint (`c` at the frame: animated influence and parameters); `stored` is the document's
+ * constraint, whose influence is listed as `stored_influence` when keys or drivers change it.
+ */
 function constraintSummary(
   scene: SceneDoc,
   c: ConstraintData,
   errors: { constraintId: string; message: string }[],
   detailed: boolean,
+  stored?: ConstraintData,
 ): Record<string, unknown> {
   const targets = constraintTargets(c).map((id) => nameOf(scene, id));
   const errs = errors.filter((e) => e.constraintId === c.id).map((e) => e.message);
+  const storedParams = detailed && stored ? storedDiff(c.params, stored.params, Object.keys(c.params)) : null;
   return {
     name: c.name,
     type: c.type,
     ...(targets.length ? { targets } : {}),
     ...(c.subtarget ? { subtarget: c.subtarget } : {}),
     influence: round(c.influence),
+    ...(stored && round(stored.influence) !== round(c.influence)
+      ? { stored_influence: round(stored.influence) }
+      : {}),
     ...(c.mute ? { mute: true } : {}),
     ...(detailed ? { id: c.id, params: c.params } : {}),
+    ...storedField(storedParams, 'stored_params'),
     ...(errs.length ? { errors: errs } : {}),
   };
 }
@@ -487,8 +561,14 @@ function dataSummary(
     };
     if (base) Object.assign(out, meshStats(base));
     if (ev?.mesh && base && ev.mesh !== base) out.evaluated = meshStats(ev.mesh);
-    // values at the frame (keyed / driven), like Blender's shape key sliders
+    // values at the frame (keyed / driven), like Blender's shape key sliders; the stored value
+    // (what object.shape_key_set changes) when animation overrides it
     const keys = ctx ? ctx.shapeKeys(o.data) : scene.getShapeKeys(o.data);
+    const storedKeys = new Map(scene.getShapeKeys(o.data).map((k) => [k.name, k]));
+    const storedValue = (k: ShapeKeyData) => {
+      const s = storedKeys.get(k.name);
+      return s && round(s.value) !== round(k.value) ? { stored_value: round(s.value) } : {};
+    };
     if (keys.length)
       Object.assign(
         out,
@@ -499,12 +579,13 @@ function dataSummary(
               ? {
                   name: k.name,
                   value: round(k.value),
+                  ...storedValue(k),
                   slider_min: k.slider_min,
                   slider_max: k.slider_max,
                   ...(k.mute ? { mute: true } : {}),
                   ...(k.relative_key ? { relative_key: k.relative_key } : {}),
                 }
-              : { name: k.name, value: round(k.value), ...(k.mute ? { mute: true } : {}) },
+              : { name: k.name, value: round(k.value), ...storedValue(k), ...(k.mute ? { mute: true } : {}) },
           ),
           detailed ? OBJECT_LIST : SCENE_LIST,
         ),
@@ -528,45 +609,71 @@ function dataSummary(
     return out;
   }
   if ((o.type === 'CURVE' || o.type === 'FONT') && o.data) {
-    const c = ev?.curve ?? scene.getCurve(o.data);
+    const stored = scene.getCurve(o.data);
+    const c = ev?.curve ?? stored;
     if (!c) return null;
     const out = curveSummary(c, o.type, detailed);
     if (typeof out.bevel_object === 'string') out.bevel_object = nameOf(scene, out.bevel_object);
     out.users = scene.dataUsers(o.data);
     if (ev?.mesh) out.evaluated = meshStats(ev.mesh);
     else out.evaluated = 'wire (no surface: add bevel_depth, extrude or a 2D fill)';
+    Object.assign(out, storedField(storedDiff(c, stored, Object.keys(ANIMATABLE.curve))));
     return out;
   }
   if (o.type === 'ARMATURE') return armatureSummary(scene, ev?.data ?? o, ev, detailed);
   if (o.type === 'LIGHT' && o.data) {
-    const l = ev?.light ?? scene.getLight(o.data);
+    // the light datablock at the frame (animated energy, colour, size …); edit it with
+    // light.properties_set (or data.set_property kind 'lights'), key it with data.<field>
+    const stored = scene.getLight(o.data);
+    const l = ev?.light ?? stored;
     if (!l) return null;
     const out: Record<string, unknown> = {
       kind: 'light',
+      light: l.name,
+      ...(detailed ? { id: o.data } : {}),
       type: l.type,
       energy: round(l.energy),
       color: roundVec([...l.color]),
+      use_shadow: l.use_shadow,
+      shadow_soft_size: round(l.shadow_soft_size),
     };
     if (l.type === 'SPOT')
       Object.assign(out, { spot_size: round(l.spot_size), spot_blend: round(l.spot_blend) });
     if (l.type === 'AREA')
       Object.assign(out, { shape: l.shape, size: round(l.size), size_y: round(l.size_y) });
+    if (l.type === 'SUN') {
+      delete out.shadow_soft_size;
+      if (typeof l.angle === 'number') out.angle = round(l.angle);
+    }
+    Object.assign(out, storedField(storedDiff(l, stored, Object.keys(ANIMATABLE.light))));
     return out;
   }
   if (o.type === 'CAMERA' && o.data) {
-    const c = ev?.camera ?? scene.getCamera(o.data);
+    const stored = scene.getCamera(o.data);
+    const c = ev?.camera ?? stored;
     if (!c) return null;
     return {
       kind: 'camera',
+      camera: c.name,
+      ...(detailed ? { id: o.data } : {}),
       type: c.type,
       lens: round(c.lens),
       sensor_width: c.sensor_width,
-      ortho_scale: round(c.ortho_scale),
+      ...(detailed || c.sensor_fit !== 'AUTO' ? { sensor_fit: c.sensor_fit } : {}),
+      ...(c.type === 'ORTHO' || detailed ? { ortho_scale: round(c.ortho_scale) } : {}),
       clip_start: c.clip_start,
       clip_end: c.clip_end,
-      ...(c.dof_use
-        ? { dof_focus_distance: round(c.dof_focus_distance), dof_aperture_fstop: c.dof_aperture_fstop }
+      ...(c.shift_x || c.shift_y || detailed ? { shift_x: round(c.shift_x), shift_y: round(c.shift_y) } : {}),
+      // depth of field (path tracer): off unless dof_use is true (camera.properties_set)
+      dof_use: c.dof_use,
+      ...(c.dof_use || detailed
+        ? {
+            dof_focus_distance: round(c.dof_focus_distance),
+            dof_aperture_fstop: c.dof_aperture_fstop,
+            ...(c.dof_focus_object ? { dof_focus_object: nameOf(scene, c.dof_focus_object) } : {}),
+          }
         : {}),
+      ...storedField(storedDiff(c, stored, Object.keys(ANIMATABLE.camera))),
     };
   }
   if (o.type === 'EMPTY')
@@ -591,6 +698,8 @@ interface SummaryContext {
   instances: InstanceCounts;
   /** Instances in the viewport, when they differ from the render counts. */
   viewport: InstanceCounts | null;
+  /** The instances renders show. */
+  renderInstances: readonly EvaluatedInstance[];
   /** Shape keys of a mesh with their values at the frame. */
   shapeKeys(meshId: string): ShapeKeyData[];
 }
@@ -599,6 +708,7 @@ function summaryContext(scene: SceneDoc, ev: EvaluatedScene): SummaryContext {
   const shown = instanceCounts(ev.instances);
   let instances = shown;
   let viewport: InstanceCounts | null = null;
+  let renderInstances: readonly EvaluatedInstance[] = ev.instances;
   if (renderInstancesDiffer(ev)) {
     // the viewport evaluation thins particles out: count what renders show (same placements)
     try {
@@ -610,6 +720,7 @@ function summaryContext(scene: SceneDoc, ev: EvaluatedScene): SummaryContext {
         byId: ev.byId,
       });
       instances = instanceCounts(res.instances);
+      renderInstances = res.instances;
       if (
         instances.total !== shown.total ||
         [...instances.bySystem].some(([k, n]) => shown.bySystem.get(k) !== n)
@@ -625,6 +736,7 @@ function summaryContext(scene: SceneDoc, ev: EvaluatedScene): SummaryContext {
     problems: problemsByObject(scene, ev),
     instances,
     viewport,
+    renderInstances,
     shapeKeys: (meshId) => {
       fs ??= new FrameState(scene, ev.frame);
       return fs.get<{ shape_keys: ShapeKeyData[] }>('mesh', meshId)?.shape_keys ?? scene.getShapeKeys(meshId);
@@ -661,10 +773,13 @@ export function summarizeObject(
     parent: nameOf(scene, o.parent),
     ...(o.parent && o.parent_type === 'BONE' ? { parent_bone: o.parent_bone } : {}),
     collection: collectionName(scene, o.collection),
+    // local transform at the frame (keyframes, drivers, F-curve modifiers); `stored` = the
+    // document values where those override them (what transform_object sets)
     location: roundVec([...a.location]),
     rotation_euler: roundVec([...a.rotation_euler]),
     rotation_degrees: roundVec(a.rotation_euler.map((r) => r * RAD2DEG) as Vec3, 2),
     scale: roundVec([...a.scale]),
+    ...storedField(storedDiff(a, o, TRANSFORM_KEYS)),
     world_bounds: ev ? worldBounds(ev) : null,
     data: dataSummary(scene, o, ev, detailed, ctx),
     materials: o.material_slots.map((id) => (id ? (scene.getMaterial(id)?.name ?? id) : null)),
@@ -685,7 +800,15 @@ export function summarizeObject(
     ...(a.constraints?.length
       ? listField(
           'constraints',
-          a.constraints.map((c) => constraintSummary(scene, c, constraintErrors, detailed)),
+          a.constraints.map((c) =>
+            constraintSummary(
+              scene,
+              c,
+              constraintErrors,
+              detailed,
+              o.constraints?.find((x) => x.id === c.id),
+            ),
+          ),
           max,
         )
       : {}),
@@ -766,6 +889,53 @@ function boundedUsers(names: string[]): { users: string[]; users_total?: number 
     : { users: names };
 }
 
+/**
+ * World settings that keyframes or drivers change at the frame: their values at the frame and,
+ * in `stored`, the document values (what set_scene_settings / world.sky_set change).
+ */
+function animatedWorld(world: WorldSettings, stored: WorldSettings): Record<string, unknown> {
+  const diff = storedDiff(world, stored, Object.keys(ANIMATABLE.world));
+  if (!diff) return {};
+  const now = Object.fromEntries(
+    Object.keys(diff).map((k) => [k, rounded((world as unknown as Record<string, unknown>)[k])]),
+  );
+  return { animated: now, stored: diff };
+}
+
+/**
+ * Evaluated geometry of the scene: every object's mesh after shape keys and modifiers, including
+ * the surfaces of curves and text (hidden objects included, instances counted separately), and
+ * the triangles of the instances (like scene.stats).
+ */
+function evaluatedGeometry(
+  ev: EvaluatedScene,
+  instances: readonly EvaluatedInstance[],
+): {
+  geometry: { vertices: number; faces: number; triangles: number };
+  instanceTriangles: number;
+} {
+  const geometry = { vertices: 0, faces: 0, triangles: 0 };
+  const stats = new Map<MeshData, ReturnType<typeof meshStats>>();
+  const statsOf = (m: MeshData) => {
+    let s = stats.get(m);
+    if (!s) stats.set(m, (s = meshStats(m)));
+    return s;
+  };
+  for (const o of ev.objects) {
+    if (!o.mesh) continue;
+    const s = statsOf(o.mesh);
+    geometry.vertices += s.vertices;
+    geometry.faces += s.faces;
+    geometry.triangles += s.triangles;
+  }
+  let instanceTriangles = 0;
+  for (const inst of instances) {
+    const src = ev.byId.get(inst.sourceId)?.mesh;
+    if (src) instanceTriangles += statsOf(src).triangles;
+  }
+  return { geometry, instanceTriangles };
+}
+
 export function evaluate(scene: SceneDoc, frame?: number): EvaluatedScene {
   const f = frame ?? scene.getScene().frame_start;
   return new SceneEvaluator(scene).evaluate(f);
@@ -793,7 +963,10 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
     }
   const settings = scene.getScene();
   const render = scene.getRender();
-  const world = scene.getWorld();
+  // world settings at the frame (animated sun, mist …), stored values where they differ
+  const storedWorld = scene.getWorld();
+  const world = ev.world ?? storedWorld;
+  // base geometry: the stored mesh data of mesh objects (before shape keys and modifiers)
   let vertices = 0;
   let faces = 0;
   const byType: Record<string, number> = {};
@@ -806,6 +979,7 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
       faces += c.faces;
     }
   }
+  const evaluated = evaluatedGeometry(ev, ctx.renderInstances);
   const maxObjects = Math.max(1, opts.maxObjects ?? DEFAULT_MAX_OBJECTS);
   const listed = objects.slice(0, maxObjects);
   const rbw = settings.rigidbody_world;
@@ -818,10 +992,14 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
     counts: {
       objects: objects.length,
       by_type: byType,
+      // base meshes (as stored, before modifiers; curves and text not included)
       vertices,
       faces,
+      // what is rendered: after shape keys, modifiers, curve bevels/extrusions and text
+      evaluated: evaluated.geometry,
       materials: scene.listMaterials().length,
       instances: ctx.instances.total,
+      ...(evaluated.instanceTriangles ? { instance_triangles: evaluated.instanceTriangles } : {}),
       ...(ctx.viewport ? { viewport_instances: ctx.viewport.total } : {}),
       ...(drivers ? { drivers } : {}),
       ...(rigidBodies ? { rigid_bodies: rigidBodies } : {}),
@@ -880,6 +1058,7 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
       ...(world.mist_density > 0
         ? { mist_density: round(world.mist_density, 5), mist_color: roundVec([...world.mist_color]) }
         : {}),
+      ...animatedWorld(world, storedWorld),
     },
     objects: listed.map((o) => summarizeObject(scene, o, ev.byId.get(o.id), ctx)),
     ...(listed.length < objects.length
@@ -915,18 +1094,46 @@ export function describeObject(scene: SceneDoc, o: ObjectData, frame?: number) {
   // materials at the frame (animated / driven), like the rest of the description
   const materials = o.material_slots.map((id, slot) => {
     if (!id) return { slot, material: null };
-    const m = e?.materials[slot]?.id === id ? e.materials[slot] : scene.getMaterial(id);
-    return { slot, material: m ? { ...m, base_color: roundVec([...m.base_color]) } : { id, missing: true } };
+    const stored = scene.getMaterial(id);
+    const m = e?.materials[slot]?.id === id ? e.materials[slot] : stored;
+    return {
+      slot,
+      material: m
+        ? {
+            ...m,
+            base_color: roundVec([...m.base_color]),
+            ...storedField(storedDiff(m, stored, Object.keys(ANIMATABLE.material))),
+          }
+        : { id, missing: true },
+    };
   });
   const fcurves = scene.listFCurves(o.id);
   if (o.data) fcurves.push(...scene.listFCurves(o.data));
+  // the final world transform (parents, constraints, rigid body simulation), decomposed
+  const wt = decompose4(world);
   return {
     ...summarizeObject(scene, o, e, summaryContext(scene, ev), true),
     frame: ev.frame,
     world_location: roundVec([world[12], world[13], world[14]]),
+    world_transform: {
+      location: roundVec([...wt.location]),
+      rotation_euler: roundVec([...wt.rotation]),
+      rotation_degrees: roundVec(wt.rotation.map((r) => r * RAD2DEG) as Vec3, 2),
+      scale: roundVec([...wt.scale]),
+    },
     children: scene.childrenOf(o.id).map((c) => c.name),
     materials,
-    modifiers: (e?.data ?? o).modifiers.map((m) => ({ ...m })),
+    // modifiers at the frame (animated parameters), stored parameters where they differ
+    modifiers: (e?.data ?? o).modifiers.map((m) => {
+      const stored = o.modifiers.find((x) => x.id === m.id);
+      return {
+        ...m,
+        ...storedField(
+          stored ? storedDiff(m.params, stored.params, Object.keys(m.params)) : null,
+          'stored_params',
+        ),
+      };
+    }),
     custom_props: o.custom_props,
     display: {
       display_type: o.display_type,

@@ -1,10 +1,9 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { safeJsonSchema, transformPoint3 } from '@3d-editor/core';
+import { transformPoint3 } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
 import { ViewportEngine } from '../viewport/engine';
 import { ViewportInteraction } from '../viewport/interaction';
-import { canRun, hoveredArea, popupMenu, registry, run, viewport } from '../editor/editor';
-import { lastOperator, redoLast } from '../editor/runner';
+import { canRun, hoveredArea, popupMenu, run, viewport } from '../editor/editor';
 import { MenuButton } from './Menu';
 import {
   ADD_MENU,
@@ -16,7 +15,7 @@ import {
   VIEW_MENU,
 } from '../editor/menus';
 import { Icon, type IconName } from './icons';
-import { SchemaForm } from './SchemaForm';
+import { RedoPanel } from './RedoPanel';
 import { Panel, Row, SelectField, NumberField, ColorField, Checkbox } from './fields/fields';
 import { TransformFields } from './properties/ObjectTab';
 import { NavGizmo } from './NavGizmo';
@@ -184,47 +183,19 @@ function ViewportHeader({ s }: { s: ProjectSession }) {
   );
 }
 
-function RedoPanel({ s }: { s: ProjectSession }) {
-  const last = lastOperator.value;
-  void s.undoRevision.value;
-  const [open, setOpen] = useState(true);
-  if (!last || s.undo.undoStack.length !== last.undoDepth) return null;
-  const def = registry.get(last.id);
-  if (!def) return null;
-  const params = (last.params ?? {}) as Record<string, unknown>;
-  const schema = safeJsonSchema(def.schema);
-  return (
-    <div class="redo-panel" onPointerDown={(e) => e.stopPropagation()} data-testid="redo-panel">
-      <div class="panel-header" onClick={() => setOpen(!open)}>
-        <span class="chev">{open ? '▾' : '▸'}</span>
-        {def.label}
-      </div>
-      {open && (
-        <div class="panel-body">
-          <SchemaForm
-            schema={schema}
-            values={params}
-            doc={s.doc}
-            exclude={['enter_editmode', 'name', 'objects', 'object']}
-            testIdPrefix="redo"
-            onChange={(k, v, final) => {
-              if (!final) return;
-              redoLast(s, registry, { ...params, [k]: v });
-            }}
-          />
-        </div>
-      )}
-    </div>
-  );
-}
-
 function Sidebar({ s }: { s: ProjectSession }) {
   void s.revision.value;
   const id = s.state.$activeId.value;
   const o = id ? s.doc.getObject(id) : null;
   const st = s.state;
   return (
-    <div class="sidebar-n" onPointerDown={(e) => e.stopPropagation()} data-testid="sidebar">
+    <div
+      class="sidebar-n"
+      onPointerDown={(e) => e.stopPropagation()}
+      // scroll the sidebar, not the view
+      onWheel={(e) => e.stopPropagation()}
+      data-testid="sidebar"
+    >
       <Panel title="Transform" id="n-transform">
         {o && st.mode === 'OBJECT' ? (
           <TransformFields s={s} o={o} />

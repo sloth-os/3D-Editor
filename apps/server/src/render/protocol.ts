@@ -27,6 +27,18 @@ export interface DocRef {
   update: Uint8Array | SharedArrayBuffer;
 }
 
+/**
+ * Rigid body world matrices of one frame, simulated once for every render thread (see
+ * `Renderer.physics`): threads use them instead of running the simulation themselves.
+ */
+export interface PhysicsFrame {
+  frame: number;
+  /** Simulated objects (empty: nothing is simulated at this frame, e.g. before the world's start). */
+  ids: string[];
+  /** ids.length × 16 numbers: the world matrices (column-major), in the order of `ids`. */
+  matrices: Float64Array;
+}
+
 /** Options of one rendered image (a still or an animation frame). */
 export interface FrameOptions {
   width: number;
@@ -52,6 +64,8 @@ export interface FrameOptions {
   seed?: number;
   /** RGBA background (display values 0..1) instead of the world. */
   background?: Vec4Tuple;
+  /** The rigid body simulation at `frame`, computed once (threads simulate themselves without it). */
+  physics?: PhysicsFrame;
 }
 
 /** What a worker reports after preparing a path traced render (scene compiled, tracer built). */
@@ -151,6 +165,8 @@ export type WorkerRequest =
   | { type: 'apng-add'; id: number; job: number; frame: RawFrame; init?: APNGInit }
   /** Returns the APNG file of `job` and frees its encoder. */
   | { type: 'apng-finish'; id: number; job: number }
+  /** Simulates the rigid body world up to the given frames and returns their matrices. */
+  | { type: 'simulate'; id: number; doc: DocRef; frames: number[] }
   /** Drops the cached documents (an idle thread frees its memory; no response). */
   | { type: 'clear' }
   | { type: 'ping'; id: number };
@@ -188,8 +204,15 @@ export interface EncodedResult {
   sheet?: { width: number; height: number };
 }
 
+/** Answer to `simulate`: the matrices of every requested frame. */
+export interface SimulatedFrames {
+  frames: PhysicsFrame[];
+  /** Milliseconds spent simulating. */
+  ms: number;
+}
+
 export type WorkerResult =
-  PreparedInfo | PathTile | ImageResult | AutoViewResult | EncodedResult | { ok: true };
+  PreparedInfo | PathTile | ImageResult | AutoViewResult | EncodedResult | SimulatedFrames | { ok: true };
 
 export type WorkerResponse =
   { type: 'result'; id: number; result: WorkerResult } | { type: 'error'; id: number; message: string };

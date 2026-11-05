@@ -31,11 +31,16 @@ export interface ExportCollection {
 
 /**
  * Evaluates the scene and picks the objects to export: explicit ids (or names), or every object
- * visible in renders. Meshes are post-modifier unless `applyModifiers` is false.
+ * visible in renders. Meshes are post-modifier unless `applyModifiers` is false. `evaluator`: the
+ * scene evaluator to use (e.g. one that later samples the animation; default: a new one).
  */
-export function collectExport(doc: SceneDoc, opts: ExportOptions): ExportCollection {
+export function collectExport(
+  doc: SceneDoc,
+  opts: ExportOptions,
+  evaluator: SceneEvaluator = new SceneEvaluator(doc),
+): ExportCollection {
   const frame = opts.frame ?? doc.getScene().frame_start;
-  const scene = new SceneEvaluator(doc).evaluate(frame, { forRender: true });
+  const scene = evaluator.evaluate(frame, { forRender: true });
   const apply = opts.applyModifiers !== false;
   let picked: EvaluatedObject[];
   if (opts.objectIds) {

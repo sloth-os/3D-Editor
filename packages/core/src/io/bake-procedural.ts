@@ -51,6 +51,12 @@ export interface BakeGeometry {
    * GENERATED coordinates are computed (default: the mesh positions).
    */
   orco?: ArrayLike<number> | null;
+  /**
+   * The UVs of `mesh` were generated for the bake (the object has none): UV-mapped channels keep
+   * the value the renderers show on a mesh without UVs (the texture at uv (0, 0)), only
+   * GENERATED/OBJECT-mapped channels vary over the generated layout.
+   */
+  generatedUvs?: boolean;
 }
 
 interface TexelMap {
@@ -317,6 +323,12 @@ class BakeSession {
 
   /** Texture coordinate of a texel (UV mapping: its centre) into `out`. */
   coord(mapping: number, i: number, out: Float64Array): void {
+    if (mapping === 2 && this.geometry?.generatedUvs) {
+      out[0] = 0;
+      out[1] = 0;
+      out[2] = 0;
+      return;
+    }
     if (mapping === 2) {
       out[0] = ((i % this.width) + 0.5) / this.width;
       out[1] = 1 - (Math.floor(i / this.width) + 0.5) / this.height;
@@ -375,6 +387,8 @@ class BakeSession {
     const map = this.geometry ? this.map : null;
     const uvMapped = tex.mapping === 2;
     if (!uvMapped && !map) return null;
+    // a UV-mapped height is constant on a mesh without its own UVs: no relief
+    if (uvMapped && this.geometry?.generatedUvs) return null;
     const pat = this.pattern(tex)!;
     const [mu, mv] = meanMetric(map);
     const space = this.space;
@@ -589,7 +603,7 @@ export function bakeGeometryKey(geometry: BakeGeometry): string {
   const o = geometry.orco;
   const orco = o ? cachedHash(o, () => hashNumbers(o)) : '-';
   const space = geometry.texMin && geometry.texMax ? [...geometry.texMin, ...geometry.texMax].join(',') : '-';
-  return `${mesh}|${orco}|${space}`;
+  return `${mesh}|${orco}|${space}${geometry.generatedUvs ? '|gen' : ''}`;
 }
 
 /**
@@ -671,7 +685,7 @@ export function bakeMaterialTextures(
   if (s.normal && s.bump !== 0) {
     const img = session.normalMap(s.normal, s.bump);
     if (img) out.normal = img;
-    else skip('normal');
+    else if (!(s.normal.mapping === 2 && geometry?.generatedUvs)) skip('normal');
   }
   return out;
 }

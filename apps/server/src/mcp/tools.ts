@@ -41,17 +41,21 @@ import { errorMessage, withSpan } from '../observability/tracing';
 import type { RoomManager } from '../sync/room-manager';
 import { RpcError } from '../sync/room';
 import { isNotImplemented, safeFileName } from '../api/projects';
+import { persistenceNote } from '../persistence';
 import { ToolError, type AgentProject, type AgentSession } from './agent';
 import { DEFAULT_MAX_OBJECTS, describeObject, round, roundVec, summarizeScene } from './scene-summary';
 import {
   addModifier,
   applyModifier,
+  findModifierType,
+  modifierParamsSchema,
   modifierTypes,
   removeModifier,
   requireModifier,
   updateModifier,
 } from './modifiers';
 import { MAX_IMPORT_BYTES, fetchLimited } from './fetch-limited';
+import { DEFAULT_MESH_PAGE, MAX_HEIGHTMAP, MAX_MESH_PAGE, MESH_DATA_FIELDS, meshData } from './mesh-data';
 import {
   keyTargetData,
   keyframeTarget,
@@ -460,16 +464,19 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get project',
       description:
-        'Project details: name, timestamps, statistics, connected editors and agents, persistence mode and editor URL.',
+        "Project details: name, timestamps, statistics, connected editors and agents, editor URL, and the server's persistence: `persistence` disk | webdav (saved, survives restarts) or memory (lost when the server stops) with an explanation.",
       annotations: READ_ONLY,
     },
     { project: projectArg },
     async ({ project }, extra) => {
       const p = await agent.project(project);
       const listing = p.room.listing();
+      const persistence = rooms.persistence;
       return {
         ...listing,
-        persistence: rooms.persistence.mode,
+        persistence: persistence.mode,
+        persistence_note: persistenceNote(persistence.mode),
+        ...(persistence.mode === 'memory' ? {} : { stored_at: persistence.location }),
         editor_url: editorUrl(extra, p.id),
         clients: p.room.presence().map((e) => ({ name: e.state.user?.name ?? 'unknown', kind: e.kind })),
       };
@@ -518,7 +525,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get scene',
       description:
-        'Describe the whole scene at a frame: counts (objects by type, vertices, faces, instances), every object (id, name, type, parent, collection, location / rotation_euler (radians, also in degrees) / scale, world-space bounds after modifiers and armature deformation, data summary: mesh vertex/face counts with shape keys and vertex groups, curve splines/points/bevel/extrude, text body, armature bones with parents and pose_position, light energy, camera lens; material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, generated instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, poses, curves, instancing, physics) so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object. Units: meters, Z up.',
+        "Describe the whole scene at a frame. Values are the EVALUATED ones at that frame, like Blender's properties: keyframed, driven and F-curve-modified location / rotation_euler (radians, also in degrees) / scale, shape key values, constraint influences, pose channels, light / camera / curve / world settings; where animation overrides the value stored in the document (what transform_object or the *.properties_set operators change), the stored value is listed too (`stored`, `stored_value`, `stored_influence`). Contents: counts (objects by type; vertices / faces = BASE mesh data of mesh objects before modifiers, curves and text not included; evaluated {vertices, faces, triangles} = what renders: after shape keys, modifiers, curve bevels and text, instances not included; instances and instance_triangles = particle / collection instances of renders), every object (id, name, type, parent, collection, transform, world-space bounds after modifiers, armature deformation, constraints and physics, data summary: mesh vertex/face counts (base and evaluated) with shape keys and vertex groups, curve splines/points/bevel/extrude, text body, armature bones with parents and pose_position, light (datablock name, type, energy, colour, size/shape, spot), camera (lens, clipping, dof_use); material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, modifiers, poses, curves, instancing, physics) with object names so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object and get_mesh_data for vertex positions. Units: meters, Z up.",
       annotations: READ_ONLY,
     },
     {
@@ -547,13 +554,78 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get object',
       description:
-        'Detailed description of one object at a frame: transform, world location and bounds, parent (and parent bone) and children, data (mesh statistics, shape keys with values, vertex groups with assigned vertex counts; curve settings and spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts, rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems.',
+        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds, parent (and parent bone) and children, data (mesh statistics base and evaluated, shape keys with values, vertex groups with assigned vertex counts; curve settings and spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts, rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. Vertex positions and faces: get_mesh_data.',
       annotations: READ_ONLY,
     },
     { project: projectArg, object: objectArg, frame: z.number().optional() },
     async ({ project, object, frame }) => {
       const p = await agent.project(project);
       return describeObject(p.scene, requireObject(p, object), frame ?? p.state.frame);
+    },
+  );
+
+  tool(
+    'get_mesh_data',
+    {
+      title: 'Get mesh data',
+      description: `Read the geometry of a mesh, curve or text object, in pages: vertex positions (meters), vertex normals, faces (vertex index loops, counter-clockwise seen from the front), per-face material indices (with the material_slots they refer to), smooth flags, face normals and centers, UVs, loose edges, vertex group weights (source BASE), and a world-space heightmap of the surface (highest Z on an XY grid — for placing things on terrain). source BASE (default for meshes) is the stored mesh, whose indices edit_mesh selections, vertex groups and shape keys use; EVALUATED is the geometry after shape keys and modifiers at the frame (curves and text: their generated surface), RENDER the same with render settings (subdivision render_levels …). space LOCAL (object space, default) or WORLD. include picks the fields (default vertices, faces, face_materials). At most \`limit\` vertices and faces per call (default ${DEFAULT_MESH_PAGE}, max ${MAX_MESH_PAGE}); when more remain the result has truncated: true and next {vertex_offset, face_offset} to pass for the next page. totals gives the full counts. Compact JSON.`,
+      annotations: READ_ONLY,
+    },
+    {
+      project: projectArg,
+      object: objectArg,
+      include: z
+        .array(z.enum(MESH_DATA_FIELDS))
+        .optional()
+        .describe('Fields to return (default ["vertices", "faces", "face_materials"])'),
+      source: z
+        .enum(['BASE', 'EVALUATED', 'RENDER'])
+        .optional()
+        .describe(
+          'BASE: stored mesh (default for meshes); EVALUATED: after shape keys and modifiers (default for curves and text); RENDER: evaluated with render settings',
+        ),
+      space: z
+        .enum(['LOCAL', 'WORLD'])
+        .default('LOCAL')
+        .describe('Coordinates of positions, normals and centers'),
+      vertex_offset: z.number().int().min(0).default(0).describe('First vertex of the page'),
+      face_offset: z.number().int().min(0).default(0).describe('First face of the page'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_MESH_PAGE)
+        .default(DEFAULT_MESH_PAGE)
+        .describe('Vertices and faces per page'),
+      frame: z
+        .number()
+        .optional()
+        .describe("Frame for evaluated / world data (default: the agent's current frame)"),
+      decimals: z.number().int().min(0).max(6).default(4).describe('Rounding of coordinates'),
+      heightmap_resolution: z
+        .number()
+        .int()
+        .min(8)
+        .max(MAX_HEIGHTMAP)
+        .default(64)
+        .describe('Heightmap samples along the longer side of the object (include "heightmap")'),
+    },
+    async (a) => {
+      const p = await agent.project(a.project);
+      const o = requireObject(p, a.object);
+      const out = meshData(p.scene, o, {
+        source: a.source,
+        space: a.space,
+        include: a.include,
+        vertex_offset: a.vertex_offset,
+        face_offset: a.face_offset,
+        limit: a.limit,
+        frame: a.frame ?? p.state.frame,
+        decimals: a.decimals,
+        heightmap_resolution: a.heightmap_resolution,
+      });
+      // compact JSON: geometry lists are long
+      return { content: [{ type: 'text', text: JSON.stringify(out) }] };
     },
   );
 
@@ -615,6 +687,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         categories,
         groups: operatorGroupNames(),
         modifier_types: modifierTypes().map((m) => m.type),
+        modifier_parameters: 'list_modifier_types {type} gives the parameter schema of a modifier type',
         operators: list.map((o) =>
           detailed
             ? {
@@ -722,7 +795,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Run several operators',
       description:
-        'Run a list of operators in order as a single undo step (one `undo` reverts all of them). With stop_on_error (default true) execution stops at the first failure; changes made before it are kept.',
+        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns per operation {operator, ok, result | error, reports} — `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR.",
       annotations: EDIT,
     },
     {
@@ -755,6 +828,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             operator: op.operator,
             ok: res.ok,
             ...(res.ok ? { result: res.result ?? null } : { error: res.error }),
+            // warnings and info the operator reported (like run_operator's `reports`)
+            ...(res.reports.length ? { reports: res.reports } : {}),
           });
           if (!res.ok) {
             failed++;
@@ -762,10 +837,16 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           }
         }
       });
+      const warnings = results.filter((r) =>
+        (r.reports as { level: string }[] | undefined)?.some(
+          (x) => x.level === 'WARNING' || x.level === 'ERROR',
+        ),
+      ).length;
       const out = {
         ok: failed === 0,
         executed: results.length,
         failed,
+        ...(warnings ? { operations_with_warnings: warnings } : {}),
         results,
         selection: selectionSummary(p),
       };
@@ -780,7 +861,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Add object',
       description:
-        "Add a primitive or object: cube, plane, grid, circle, uv_sphere, ico_sphere, cylinder, cone, torus (meshes), bezier_curve, bezier_circle, nurbs_path (curves), text, armature, empty, camera or light. Placed at `location` (default: world origin) with optional rotation (radians) or rotation_degrees and scale. Type specific `params` follow Blender's operators, e.g. cube {size}, uv_sphere {segments, ring_count, radius}, cylinder {vertices, radius, depth}, torus {major_radius, minor_radius}, curves {radius, bevel_depth, extrude}, text {body, size, extrude, align_x}, armature {bone_name}, camera {lens}, light {energy (W), color}, empty {type: PLAIN_AXES|ARROWS|CUBE|SPHERE|...}. Other generators (object.generate_tree, curve.add_from_points …) run through run_operator. The new object becomes selected and active.",
+        "Add a primitive or object: cube, plane, grid, circle, uv_sphere, ico_sphere, cylinder, cone, torus (meshes), bezier_curve, bezier_circle, nurbs_path (curves), text, armature, empty, camera or light. Placed at `location` (default: world origin) with optional rotation (radians) or rotation_degrees and scale. Type specific `params` follow Blender's operators (see list_operators for the exact schema: unknown parameters are rejected), e.g. cube {size}, uv_sphere {segments, ring_count, radius}, cylinder {vertices, radius, depth}, torus {major_radius, minor_radius}, curves {radius, bevel_depth, extrude}, text {body, size, extrude, align_x}, armature {bone_name}, camera {lens, clip_end, dof_use, dof_focus_distance, dof_aperture_fstop …}, light {energy (W; W/m² for SUN), color, radius, shape: SQUARE | RECTANGLE | DISK | ELLIPSE, size, size_y, spot_size, spot_blend, shadow_soft_size …} with light_type POINT | SUN | SPOT | AREA. Light and camera data are changed afterwards with run_operator light.properties_set / camera.properties_set {object: name, …the same fields}. Empty {type: PLAIN_AXES|ARROWS|CUBE|SPHERE|...}. Other generators (object.generate_tree, curve.add_from_points …) run through run_operator. The new object becomes selected and active.",
       annotations: EDIT,
     },
     {
@@ -1106,10 +1187,52 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       .join(', ') || 'see list_operators';
 
   tool(
+    'list_modifier_types',
+    {
+      title: 'List modifier types',
+      description:
+        'The modifier types add_modifier / update_modifier accept, with label, category (GENERATE, DEFORM, NORMALS), description and the JSON schema of their parameters (Blender names, types, enums, ranges, units in the descriptions, defaults). Pass `type` (identifier or label, e.g. "SCREW" or "Subdivision Surface") for one type; parameters are included for at most 6 types unless include_parameters is true.',
+      annotations: READ_ONLY,
+    },
+    {
+      type: z.string().optional().describe('One modifier type (identifier or label)'),
+      category: z
+        .enum([...new Set(modifierTypes().map((m) => m.category))] as [string, ...string[]])
+        .optional()
+        .describe('Only types of this category'),
+      include_parameters: z
+        .boolean()
+        .optional()
+        .describe('Include parameter schemas (default: true when at most 6 types match)'),
+    },
+    async ({ type, category, include_parameters }) => {
+      let list = modifierTypes();
+      if (type) {
+        const found = findModifierType(type);
+        if (!found)
+          throw new ToolError(
+            `Unknown modifier type '${type}'. Types: ${list.map((m) => m.type).join(', ')}.`,
+          );
+        list = list.filter((m) => m.type === found);
+      }
+      if (category) list = list.filter((m) => m.category === category);
+      const detailed = include_parameters ?? list.length <= 6;
+      return {
+        count: list.length,
+        types: list.map((m) => ({
+          ...m,
+          ...(detailed ? { parameters: modifierParamsSchema(m.type) } : {}),
+        })),
+        ...(detailed ? {} : { hint: 'Pass type (or include_parameters: true) for the parameter schemas.' }),
+      };
+    },
+  );
+
+  tool(
     'add_modifier',
     {
       title: 'Add modifier',
-      description: `Add a modifier to the end of the stack of a mesh, curve or text object (non-destructive, like Blender; on curves and text it acts on the generated geometry). type is a Blender modifier identifier, e.g. SUBSURF {levels, render_levels}, MIRROR, ARRAY {count}, SOLIDIFY {thickness}, BOOLEAN {operation, object}, ARMATURE {object: "Rig"} (skinning; usually added by object.parent_to type ARMATURE_AUTO), CURVE {object: "Path", deform_axis} (bend along a curve). Object parameters accept object names. Parameter names follow Blender; invalid parameters are reported with the type's JSON schema. Available types: ${modifierTypeList()}.`,
+      description: `Add a modifier to the end of the stack of a mesh, curve or text object (non-destructive, like Blender; on curves and text it acts on the generated geometry). type is a Blender modifier identifier, e.g. SUBSURF {levels, render_levels}, MIRROR, ARRAY {count}, SOLIDIFY {thickness}, BOOLEAN {operation, object}, ARMATURE {object: "Rig"} (skinning; usually added by object.parent_to type ARMATURE_AUTO), CURVE {object: "Path", deform_axis} (bend along a curve). Object parameters accept object names. Parameter names follow Blender: list_modifier_types {type} gives every type's parameters (JSON schema with enums, ranges and defaults); unknown parameter names and invalid values are rejected with that schema. Available types: ${modifierTypeList()}.`,
       annotations: EDIT,
     },
     {
@@ -1139,7 +1262,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Update modifier',
       description:
-        'Change parameters, name or visibility (show_viewport, show_render, show_in_editmode) of a modifier (by name or id).',
+        'Change parameters, name or visibility (show_viewport, show_render, show_in_editmode) of a modifier (by name or id). Unknown parameter names and invalid values are rejected with the JSON schema of the type (see list_modifier_types).',
       annotations: EDIT,
     },
     {
@@ -1397,7 +1520,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Scene settings',
       description:
-        'Change scene, render, world and physics settings in one undo step. Scene: frame_start, frame_end, fps, frame_current (agent playhead), unit_system. Render: resolution_x/y, resolution_percentage, engine (RASTER|PATHTRACER), samples (path tracer samples per pixel), max_bounces, use_denoising, film_transparent, view_transform (AGX default), exposure. World: world_color (linear RGB), world_strength, environment (NONE|STUDIO|SKY|IMAGE), environment_strength; procedural sky (same as run_operator world.sky_set: sky_preset, sun_elevation / sun_rotation in radians, sun_intensity W/m², sun_size; any of them switches the environment to SKY); mist (same as world.mist_set: mist_density 1/m or mist_distance in m where it reaches 95 %, mist_color). Physics (same as rigidbody.world_set): use_gravity, gravity (m/s², default [0,0,-9.81]), rigidbody_enabled, rigidbody_frame_start/_end (simulated range), substeps_per_frame, solver_iterations, time_scale.',
+        'Change scene, render, world and physics settings in one undo step (lights and cameras are objects: edit their data with run_operator light.properties_set / camera.properties_set, e.g. camera depth of field dof_use / dof_focus_distance / dof_aperture_fstop or an area light shape and size; set_active_camera picks the render camera). Scene: frame_start, frame_end, fps, frame_current (agent playhead), unit_system. Render: resolution_x/y, resolution_percentage, engine (RASTER|PATHTRACER), samples (path tracer samples per pixel), max_bounces, use_denoising, film_transparent, view_transform (AGX default), exposure. World: world_color (linear RGB), world_strength, environment (NONE|STUDIO|SKY|IMAGE), environment_strength; procedural sky (same as run_operator world.sky_set: sky_preset, sun_elevation / sun_rotation in radians, sun_intensity W/m², sun_size; any of them switches the environment to SKY); mist (same as world.mist_set: mist_density 1/m or mist_distance in m where it reaches 95 %, mist_color). Physics (same as rigidbody.world_set): use_gravity, gravity (m/s², default [0,0,-9.81]), rigidbody_enabled, rigidbody_frame_start/_end (simulated range), substeps_per_frame, solver_iterations, time_scale.',
       annotations: EDIT,
     },
     {
@@ -1572,15 +1695,20 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
 
   // ---------------------------------------------------------------- undo / redo
 
+  const historyScope = () =>
+    agent.agentId
+      ? `the history of agent id '${agent.agentId}' (shared by every MCP session that sends this id)`
+      : 'the history of this MCP session (it starts empty with every new connection; send the same agent id with every connection — header x-mcp-agent-id or ?agent=<id> on the endpoint URL, as scripts/mcp.mjs does — to undo across connections)';
   for (const kind of ['undo', 'redo'] as const) {
     tool(
       kind,
       {
         title: kind === 'undo' ? 'Undo' : 'Redo',
         description:
-          kind === 'undo'
-            ? "Undo the agent's own most recent change(s) in a project (changes made by other users are never undone)."
-            : "Redo the agent's most recently undone change(s).",
+          (kind === 'undo'
+            ? "Undo the agent's own most recent change(s) in a project (changes made by other users are never undone). Each tool call is one step (a batch is one step)."
+            : "Redo the agent's most recently undone change(s).") +
+          ' The history belongs to the MCP session, or — when the client sends an agent id (header x-mcp-agent-id or ?agent=<id> on the endpoint URL; scripts/mcp.mjs sends one) — to that agent id across sessions, so one-shot CLI calls can undo each other. It ends when the server restarts or the project is unloaded.',
         annotations: EDIT,
       },
       { project: projectArg, steps: z.number().int().min(1).max(100).default(1) },
@@ -1597,6 +1725,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           [kind === 'undo' ? 'undone' : 'redone']: done,
           can_undo: p.undo.canUndo(),
           can_redo: p.undo.canRedo(),
+          ...(done < steps
+            ? {
+                note: `${done ? `Only ${done} of ${steps} step(s)` : 'Nothing'} to ${kind} in ${historyScope()}.`,
+              }
+            : {}),
         };
       },
     );
@@ -1670,7 +1803,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Export scene',
       description:
-        'Export the scene (or some objects) as glb, gltf, obj, stl or ply. Returns the file as an embedded base64 resource plus a download link (HTTP endpoint of this server).',
+        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at the agent's current frame. Returns {format, filename, mime, bytes, download_url, warnings} plus the file as an embedded base64 resource and a download link (HTTP endpoint of this server). `warnings` lists what the format could not represent — check it: e.g. procedural textures are baked into glTF images only on meshes with UVs (unwrap with edit_mesh uv.smart_project / uv.cube_project first), area lights become point lights.",
       annotations: READ_ONLY,
     },
     {
@@ -1702,6 +1835,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         mime: res.mime,
         bytes: res.data.byteLength,
         download_url: downloadUrl,
+        // what the format could not represent (procedural textures that need UVs, area lights …)
+        warnings: res.warnings ?? [],
       };
       const content: CallToolResult['content'] = [{ type: 'text', text: JSON.stringify(info, null, 2) }];
       if (res.data.byteLength <= MAX_EMBEDDED_EXPORT_BYTES) {
@@ -1732,7 +1867,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Render image',
       description:
-        "Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, same look as the viewport) when available, otherwise the server's software rasterizer; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel). Defaults to the scene camera; pass `camera` (camera object) or `view` {position, target, up?, fov_degrees?} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications.",
+        "Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, same look as the viewport) when available, otherwise the server's software rasterizer; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel). Defaults to the scene camera; pass `camera` (camera object) or `view` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications.",
       annotations: READ_ONLY,
     },
     {
@@ -1748,13 +1883,30 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       camera: z.string().optional().describe('Camera object id or name'),
       view: z
         .object({
-          position: vec3,
-          target: vec3,
-          up: vec3.optional(),
-          fov_degrees: z.number().min(1).max(170).optional(),
+          position: vec3.describe('Eye position (world space, metres)'),
+          target: vec3.describe('Point looked at (world space)'),
+          up: vec3.optional().describe('Up direction (default [0, 0, 1])'),
+          fov_degrees: z
+            .number()
+            .min(1)
+            .max(170)
+            .optional()
+            .describe(
+              'VERTICAL field of view in degrees (default 50). The horizontal angle is wider for landscape images: hfov = 2·atan(tan(fov/2)·width/height). To match a Blender camera use `lens` instead',
+            ),
+          lens: z
+            .number()
+            .min(1)
+            .max(5000)
+            .optional()
+            .describe(
+              "Focal length in mm instead of fov_degrees, like a Blender camera with a 36 mm sensor and sensor_fit AUTO (the sensor spans the image's longer side): 50 mm ≈ 39.6° across the longer side",
+            ),
         })
         .optional()
-        .describe('Explicit viewpoint (world space, Z up)'),
+        .describe(
+          'Explicit viewpoint instead of a camera (world space, Z up): position, target, up, and fov_degrees (vertical) or lens (mm)',
+        ),
       engine: engineArg,
       samples: samplesArg,
       max_bounces: maxBouncesArg,
@@ -1799,6 +1951,18 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       }
       const frame = a.frame ?? p.state.frame;
       const engine = a.engine ?? rs.engine;
+      if (a.view?.lens !== undefined && a.view.fov_degrees !== undefined)
+        throw new ToolError(
+          'Pass either view.fov_degrees (vertical field of view) or view.lens (mm), not both.',
+        );
+      // the vertical field of view (a lens covers 36 mm across the image's longer side, like Blender)
+      const fovDegrees =
+        a.view?.lens !== undefined
+          ? (2 * Math.atan((18 / a.view.lens) * (height > width ? 1 : height / width))) / DEG2RAD
+          : (a.view?.fov_degrees ?? 50);
+      const view = a.view
+        ? { position: a.view.position, target: a.view.target, up: a.view.up, fov_degrees: fovDegrees }
+        : null;
       if (a.renderer === 'browser' && a.engine === 'PATHTRACER')
         throw new ToolError(
           'Browser editors render with WebGL (RASTER look) only; use renderer auto or software for PATHTRACER.',
@@ -1815,7 +1979,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                 width,
                 height,
                 camera: cameraId ?? null,
-                view: a.view ?? null,
+                view,
                 shading: a.shading ?? null,
                 frame,
               },
@@ -1853,12 +2017,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         frame,
         engine,
         cameraId,
-        view: a.view
+        view: view
           ? {
-              position: a.view.position,
-              target: a.view.target,
-              up: a.view.up ?? [0, 0, 1],
-              fovY: (a.view.fov_degrees ?? 50) * DEG2RAD,
+              position: view.position,
+              target: view.target,
+              up: view.up ?? [0, 0, 1],
+              fovY: view.fov_degrees * DEG2RAD,
             }
           : undefined,
         shading: a.shading,
@@ -2161,6 +2325,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           active: nameOf(e.state.active),
           frame: e.state.frame,
           you: e.clientId === p.presenceId,
+          ...(e.clientId === p.presenceId && agent.agentId ? { agent_id: agent.agentId } : {}),
         })),
       };
     },

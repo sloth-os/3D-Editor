@@ -71,6 +71,28 @@ export function rpcRenderEngineOptions(p: Record<string, unknown>): RenderImageO
   return o;
 }
 
+const VIEW_TYPES = ['FRONT', 'BACK', 'RIGHT', 'LEFT', 'TOP', 'BOTTOM', 'CAMERA'] as const;
+const SHADING_TYPES = ['WIREFRAME', 'SOLID', 'MATERIAL', 'RENDERED'] as const;
+
+/**
+ * An enum parameter of a UI command, read from the first of `keys` that is given (MCP documents
+ * `view.set_view {view}`; `type` is accepted too), case-insensitive; `fallback` when none is given.
+ * Unknown values are an error that lists the valid ones.
+ */
+export function uiEnumParam<T extends string>(
+  params: Record<string, unknown>,
+  keys: readonly string[],
+  values: readonly T[],
+  fallback: T,
+): T {
+  const key = keys.find((k) => params[k] !== undefined && params[k] !== null);
+  if (!key) return fallback;
+  const v = String(params[key]).toUpperCase();
+  if (!(values as readonly string[]).includes(v))
+    throw new Error(`Unknown ${key} '${String(params[key])}': use one of ${values.join(', ')}`);
+  return v as T;
+}
+
 async function uiCommand(command: string, params: Record<string, unknown>): Promise<unknown> {
   const s = session.value!;
   const e = viewport.engine;
@@ -82,14 +104,15 @@ async function uiCommand(command: string, params: Record<string, unknown>): Prom
       run('view3d.view_selected', {}, 'mcp');
       return { ok: true };
     case 'view.set_view': {
-      const type = String(params.type ?? 'FRONT').toUpperCase();
-      if (type === 'CAMERA') run('view3d.view_camera', {}, 'mcp');
-      else run('view3d.view_axis', { type }, 'mcp');
-      return { ok: true };
+      const type = uiEnumParam(params, ['view', 'type'], VIEW_TYPES, 'FRONT');
+      const ok =
+        type === 'CAMERA' ? run('view3d.view_camera', {}, 'mcp') : run('view3d.view_axis', { type }, 'mcp');
+      return { ok, view: type };
     }
-    case 'view.shading':
-      run('view3d.toggle_shading', { type: String(params.type ?? 'SOLID').toUpperCase() }, 'mcp');
-      return { ok: true };
+    case 'view.shading': {
+      const type = uiEnumParam(params, ['shading', 'type'], SHADING_TYPES, 'SOLID');
+      return { ok: run('view3d.toggle_shading', { type }, 'mcp'), shading: type };
+    }
     case 'select': {
       const ids = (Array.isArray(params.objects) ? params.objects : [])
         .map((r) => s.doc.resolveObject(String(r))?.id)
@@ -136,7 +159,7 @@ async function uiCommand(command: string, params: Record<string, unknown>): Prom
     }
     default:
       throw new Error(
-        `unknown UI command '${command}'. Available: view.frame_all, view.frame_selected, view.set_view, view.shading, select, set_mode, set_frame, play, notify, run_operator, screenshot, get_view`,
+        `unknown UI command '${command}'. Available: view.frame_all, view.frame_selected, view.set_view {view: ${VIEW_TYPES.join('|')}}, view.shading {shading: ${SHADING_TYPES.join('|')}}, select, set_mode, set_frame, play, notify, run_operator, screenshot, get_view`,
       );
   }
 }

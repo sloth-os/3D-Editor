@@ -68,6 +68,15 @@ port.on('message', (msg: WorkerRequest) => {
       case 'auto-view':
         reply(msg.id, engine.autoView(msg.doc, msg.frames, msg.aspect, msg.camera, msg.budgetMs));
         break;
+      case 'simulate': {
+        const sim = engine.simulate(msg.doc, msg.frames);
+        reply(
+          msg.id,
+          sim,
+          sim.frames.map((f) => f.matrices.buffer as ArrayBuffer),
+        );
+        break;
+      }
       case 'ping':
         reply(msg.id, { ok: true });
         break;

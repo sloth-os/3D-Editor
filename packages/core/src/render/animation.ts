@@ -1153,6 +1153,12 @@ export interface AnimationRenderResult {
   time_limit_reached: boolean;
   /** Path traced frames that stopped sampling before the requested samples (a time limit ran out). */
   undersampled_frames: number[];
+  /**
+   * PATHTRACER: samples per pixel each frame got, aligned with `frames` (fewer than requested
+   * where a time limit ran out; every frame is denoised when denoising is on, also at 1 sample).
+   * Absent for rasterized renders.
+   */
+  frame_samples?: number[];
 }
 
 /** Most frames one animation render accepts. */
@@ -1319,6 +1325,8 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
   const files: { frame: number; name: string; data: Uint8Array }[] = [];
   const frames: number[] = [];
   const undersampled: number[] = [];
+  const frameSamples: number[] = [];
+  let pathTraced = false;
   let cancelled = false;
   let budgetHit = false;
   for (let i = 0; i < total; i++) {
@@ -1345,6 +1353,9 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
       },
     });
     frames.push(frame);
+    // progress is only reported by the path tracer (after every pass, the first one included)
+    if (progress.last) pathTraced = true;
+    frameSamples.push(progress.last?.samples ?? 0);
     if (progress.last && progress.last.samples < progress.last.total) {
       undersampled.push(frame);
       if (budgetBound) budgetHit = true;
@@ -1371,6 +1382,7 @@ export function renderAnimation(doc: SceneDoc, opts: AnimationRenderOptions = {}
     time_limit_reached: budgetHit,
     undersampled_frames: undersampled,
   };
+  if (pathTraced) result.frame_samples = frameSamples;
   if (view) result.view = { position: view.position, target: view.target, fovY: view.fovY };
   if (apng) result.data = apng.finish();
   else if (format === 'GIF')

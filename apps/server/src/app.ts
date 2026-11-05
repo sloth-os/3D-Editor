@@ -28,6 +28,8 @@ export interface AppOptions {
   logger?: FastifyServerOptions['logger'];
   /** Idle timeout of MCP sessions (default 30 min). */
   mcpIdleTimeoutMs?: number;
+  /** Presence of quiet MCP sessions is hidden after this time (default 5 min). */
+  mcpPresenceIdleMs?: number;
   /** How often idle rooms are checked for eviction. */
   sweepIntervalMs?: number;
   /** How often rooms with editors merge storage changes made by others (default 60 s, 0 = off). */
@@ -64,7 +66,7 @@ const CORS_ALLOW_METHODS = [
 ].join(', ');
 const CORS_ALLOW_HEADERS =
   'authorization, content-type, depth, destination, overwrite, if, if-match, if-none-match, lock-token, timeout, ' +
-  'mcp-session-id, mcp-protocol-version, last-event-id, traceparent, tracestate';
+  'mcp-session-id, mcp-protocol-version, x-mcp-agent-id, last-event-id, traceparent, tracestate';
 const CORS_EXPOSE_HEADERS =
   'etag, dav, location, lock-token, content-disposition, mcp-session-id, mcp-protocol-version';
 
@@ -185,6 +187,7 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
       metrics,
       log,
       idleTimeoutMs: opts.mcpIdleTimeoutMs,
+      presenceIdleMs: opts.mcpPresenceIdleMs,
     });
     mcp.register(app);
   }

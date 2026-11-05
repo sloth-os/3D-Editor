@@ -602,6 +602,20 @@ export class SceneDoc {
     this.updateBlock('lights', id, patch);
   }
 
+  /** All light datablocks, sorted by name. */
+  listLights(): LightData[] {
+    return [...this.map('lights').keys()]
+      .map((id) => this.getLight(id)!)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** All camera datablocks, sorted by name. */
+  listCameras(): CameraData[] {
+    return [...this.map('cameras').keys()]
+      .map((id) => this.getCamera(id)!)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
   addCamera(init: Partial<CameraData> = {}, id = newId()): string {
     const { id: _i, ...fields } = { ...defaultCamera(id, 'Camera'), ...init };
     return this.createBlock('cameras', fields, id);

@@ -1,5 +1,6 @@
 import { loadConfig } from './config';
 import { createApp } from './app';
+import { persistenceNote } from './persistence';
 
 async function main(): Promise<void> {
   let config;
@@ -23,6 +24,9 @@ async function main(): Promise<void> {
     },
     '3d-editor server starting',
   );
+  const note = `persistence: ${handle.persistence.mode} (${handle.persistence.location}): ${persistenceNote(handle.persistence.mode)}`;
+  if (handle.persistence.mode === 'memory') app.log.warn(note);
+  else app.log.info(note);
   await app.listen({ port: config.port, host: config.host });
   const address = app.server.address();
   const port = typeof address === 'object' && address ? address.port : config.port;

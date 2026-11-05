@@ -204,6 +204,7 @@ export function defaultLight(id: string, name: string, type: LightType = 'POINT'
     shape: 'SQUARE',
     size: type === 'AREA' ? 1 : 0.25,
     size_y: 1,
+    angle: (0.526 * Math.PI) / 180,
   };
 }
 
@@ -223,6 +224,7 @@ export function defaultCamera(id: string, name: string): CameraData {
     dof_use: false,
     dof_focus_distance: 10,
     dof_aperture_fstop: 2.8,
+    dof_focus_object: null,
   };
 }
 

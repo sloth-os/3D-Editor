@@ -9,8 +9,22 @@ import {
 import { renderAnimationParallel, type AnimationOutput, type AnimationProgress } from './animation';
 import { pathTraces } from './engine';
 import { abortable, pathTraceParallel } from './path-trace';
-import { RenderPool, defaultRenderThreads, type RenderPoolLog, type RenderPoolOptions } from './pool';
-import { RenderCancelledError, type DocRef, type FrameOptions, type ImageResult } from './protocol';
+import {
+  RenderPool,
+  defaultRenderThreads,
+  type RenderPoolLog,
+  type RenderPoolOptions,
+  type RenderThread,
+} from './pool';
+import {
+  RenderCancelledError,
+  isCancelled,
+  type DocRef,
+  type FrameOptions,
+  type ImageResult,
+  type PhysicsFrame,
+  type SimulatedFrames,
+} from './protocol';
 
 export { RenderPool, defaultRenderThreads, MAX_SHARED_RENDERS } from './pool';
 export type { LeaseOptions, RenderPoolOptions, RenderLease, RenderThread } from './pool';
@@ -38,6 +52,11 @@ export const MAX_ANIMATION_KEPT_PIXELS = 1 << 25;
 export const MAX_CONTACT_SHEET_PIXELS = 1 << 24;
 /** Concurrent path traced renders (each holds a film; others wait). */
 const MAX_CONCURRENT_PATHTRACE = 2;
+/**
+ * Most numbers of rigid body matrices (frames × bodies × 16) shared per document: 16 MB. Larger
+ * simulations are not shared (every render thread simulates for itself).
+ */
+const MAX_PHYSICS_NUMBERS = 2_000_000;
 
 /** Error for invalid render requests (shown to the caller as is). */
 export class RenderRequestError extends Error {
@@ -119,6 +138,15 @@ interface DocState {
   /** Version of the current document state, null after a change. */
   version: number | null;
   buffer: WeakRef<SharedArrayBuffer> | null;
+  /** Rigid body matrices simulated for a version of the document, by frame. */
+  physics: { version: number; frames: Map<number, PhysicsFrame>; numbers: number } | null;
+}
+
+/** Whether evaluating the scene runs the rigid body simulation (as `SceneEvaluator` decides). */
+function simulatesRigidBodies(scene: SceneDoc): boolean {
+  return (
+    !!scene.getScene().rigidbody_world?.enabled && scene.listObjects().some((o) => o.rigid_body?.enabled)
+  );
 }
 
 let nextVersion = 1;
@@ -172,7 +200,12 @@ export class Renderer {
     const ydoc = scene.ydoc;
     let s = this.states.get(ydoc);
     if (!s) {
-      const state: DocState = { key: `${projectId}:${ydoc.guid}`, version: null, buffer: null };
+      const state: DocState = {
+        key: `${projectId}:${ydoc.guid}`,
+        version: null,
+        buffer: null,
+        physics: null,
+      };
       ydoc.on('update', () => {
         state.version = null;
         state.buffer = null;
@@ -190,6 +223,67 @@ export class Renderer {
       s.version ??= nextVersion++;
     }
     return { key: s.key, version: s.version, update: buffer };
+  }
+
+  /**
+   * The rigid body simulation at `frames`, for every render thread of a render: simulated once on
+   * `thread` (incrementally, with that thread's simulation cache) and kept for this version of the
+   * document, so later renders of the same frames — on any thread, also after threads dropped
+   * their caches or were restarted — do not simulate again. Null when the scene has no rigid body
+   * simulation, or when it is too large to share (each thread then simulates for itself).
+   */
+  async physics(
+    scene: SceneDoc,
+    doc: DocRef,
+    frames: readonly number[],
+    thread: RenderThread,
+    signal?: AbortSignal,
+  ): Promise<Map<number, PhysicsFrame> | null> {
+    if (!simulatesRigidBodies(scene)) return null;
+    const state = this.states.get(scene.ydoc);
+    if (!state) return null;
+    let cache = state.physics;
+    if (!cache || cache.version !== doc.version)
+      cache = state.physics = { version: doc.version, frames: new Map(), numbers: 0 };
+    const out = new Map<number, PhysicsFrame>();
+    const missing: number[] = [];
+    for (const f of new Set(frames)) {
+      const cached = cache.frames.get(f);
+      if (cached) out.set(f, cached);
+      else missing.push(f);
+    }
+    if (missing.length) {
+      const bodies = scene.listObjects().filter((o) => o.rigid_body?.enabled).length;
+      const size = missing.length * bodies * 16;
+      if (size > MAX_PHYSICS_NUMBERS) return null;
+      if (cache.numbers + size > MAX_PHYSICS_NUMBERS) {
+        cache.frames.clear();
+        cache.numbers = 0;
+        for (const f of out.keys()) missing.push(f);
+        out.clear();
+      }
+      let res: SimulatedFrames;
+      try {
+        res = await abortable(
+          thread.call<SimulatedFrames>({ type: 'simulate', doc, frames: missing }),
+          signal,
+        );
+      } catch (err) {
+        if (isCancelled(err)) throw err;
+        // render threads evaluate (and report) the simulation themselves
+        return null;
+      }
+      // the document may have changed meanwhile: only keep results for the version they belong to
+      const keep = state.physics === cache;
+      for (const f of res.frames) {
+        out.set(f.frame, f);
+        if (keep) {
+          cache.frames.set(f.frame, f);
+          cache.numbers += f.matrices.length;
+        }
+      }
+    }
+    return out;
   }
 
   /** Renders one image (PNG). */
@@ -211,7 +305,10 @@ export class Renderer {
       try {
         const lease = await this.pool.lease(Infinity, req.signal);
         try {
-          const r = await pathTraceParallel(lease.threads, doc, o, {
+          // the rigid body simulation runs once (not on every thread)
+          const physics = await this.physics(req.scene, doc, [o.frame], lease.threads[0], req.signal);
+          const options = physics?.has(o.frame) ? { ...o, physics: physics.get(o.frame) } : o;
+          const r = await pathTraceParallel(lease.threads, doc, options, {
             signal: req.signal,
             png: true,
             onProgress: (p) =>
@@ -248,8 +345,10 @@ export class Renderer {
     }
     const lease = await this.pool.lease(1, req.signal, { interactive: true });
     try {
+      const physics = await this.physics(req.scene, doc, [o.frame], lease.threads[0], req.signal);
+      const options = physics?.has(o.frame) ? { ...o, physics: physics.get(o.frame) } : o;
       const img = await abortable(
-        lease.threads[0].call<ImageResult>({ type: 'image', doc, options: o, png: true }),
+        lease.threads[0].call<ImageResult>({ type: 'image', doc, options, png: true }),
         req.signal,
       );
       return {
@@ -336,6 +435,8 @@ export class Renderer {
                 total: p.total,
                 message: `rendered frame ${p.frame} (${p.done}/${p.total})`,
               }),
+            // the rigid body simulation of all frames runs once, on one thread
+            physics: (thread, list) => this.physics(req.scene, doc, list, thread, req.signal),
           },
         );
       } finally {

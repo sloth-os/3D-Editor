@@ -81,8 +81,8 @@ npm run dev            # terminal 2, http://localhost:5173
 | --- | --- | --- |
 | `PORT` / `HOST` | `8080` / `0.0.0.0` | Listen address |
 | `PUBLIC_DIR` | built web app | Directory with the PWA build |
-| `DATA_DIR` | `./data` (`/data` in Docker) | Disk persistence location |
-| `SYNC_PERSISTENCE` | `memory` (`webdav` if `WEBDAV_URL` is set) | Where live projects are persisted: `memory`, `disk`, `webdav` |
+| `DATA_DIR` | `./data` (`/data` in Docker) | Disk persistence location; setting it selects disk persistence |
+| `SYNC_PERSISTENCE` | `webdav` if `WEBDAV_URL` is set, else `disk` if `DATA_DIR` is set (always in Docker), else `memory` | Where live projects are persisted: `memory` (lost on restart), `disk`, `webdav`; logged at startup and shown by the MCP `get_project` tool |
 | `ROOM_IDLE_TTL_SECONDS` | `3600` | Unload idle projects after this time |
 | `WEBDAV_URL`, `WEBDAV_USERNAME`, `WEBDAV_PASSWORD` | – | Server-side WebDAV storage |
 | `WEBDAV_BASE_PATH` | `/3d-editor` | Folder for projects on WebDAV |

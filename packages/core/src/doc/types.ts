@@ -286,6 +286,11 @@ export interface LightData {
   shape: AreaShape;
   size: number;
   size_y: number;
+  /**
+   * SUN: angular diameter of the sun disc in radians (Blender SunLight.angle, default 0.526°);
+   * larger values give softer sun shadows in the path tracer.
+   */
+  angle?: number;
 }
 
 export type CameraType = 'PERSP' | 'ORTHO';
@@ -307,6 +312,12 @@ export interface CameraData {
   dof_use: boolean;
   dof_focus_distance: number;
   dof_aperture_fstop: number;
+  /**
+   * Depth of field: id of the object kept in focus (Blender dof.focus_object). When it exists the
+   * evaluated focus distance is its origin's depth along the camera's view axis, and
+   * dof_focus_distance is ignored.
+   */
+  dof_focus_object?: string | null;
 }
 
 export type ProceduralType =

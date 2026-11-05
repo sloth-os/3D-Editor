@@ -82,6 +82,20 @@ describe('loadConfig', () => {
     });
   });
 
+  it('persists to disk when DATA_DIR is given without SYNC_PERSISTENCE (phase-3 #22)', () => {
+    const c = loadConfig({ DATA_DIR: '/tmp/projects' }, noFiles);
+    expect(c.persistence).toBe('disk');
+    expect(c.dataDir).toBe(path.resolve('/tmp/projects'));
+    // an explicit mode wins, WebDAV wins over the data directory, and nothing means memory
+    expect(loadConfig({ DATA_DIR: '/tmp/p', SYNC_PERSISTENCE: 'memory' }, noFiles).persistence).toBe(
+      'memory',
+    );
+    expect(loadConfig({ DATA_DIR: '/tmp/p', WEBDAV_URL: 'http://dav.local' }, noFiles).persistence).toBe(
+      'webdav',
+    );
+    expect(loadConfig({ DATA_DIR: '  ' }, noFiles).persistence).toBe('memory');
+  });
+
   it('allows overriding persistence and disabling the proxy', () => {
     const c = loadConfig(
       {

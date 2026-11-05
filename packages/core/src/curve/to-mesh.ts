@@ -39,6 +39,13 @@ export interface CurveMeshResult {
   mesh: MeshData | null;
   /** Wire display of the splines as flat xyz segment pairs (object space). */
   lines: Float32Array | null;
+  /**
+   * Curves without a surface: the wire as a mesh of vertices and loose edges (one vertex per sampled
+   * point, cyclic splines closed), which Blender feeds to the modifier stack of such curves (a SCREW
+   * modifier revolves a profile curve). Null when there is a surface (its wires are loose edges of
+   * `mesh` then) or nothing to draw.
+   */
+  wire?: MeshData | null;
   /** Problems met while building (invalid data is skipped or simplified, never thrown). */
   errors?: string[];
 }
@@ -749,7 +756,10 @@ function buildCurveMesh(curve: CurveData, opts: CurveMeshOptions): CurveMeshResu
   });
   const lines = segs.length ? new Float32Array(segs) : null;
   const extra = errors.length ? { errors } : {};
-  if (b.faces.length === 0) return { mesh: null, lines, ...extra };
+  if (b.faces.length === 0) {
+    const wire = wireMesh(wirePoints, wireCyclic);
+    return { mesh: null, lines, ...(wire ? { wire } : {}), ...extra };
+  }
   // mixed surface + wire: the wires also become loose edges (kept by Convert to Mesh)
   wirePoints.forEach((pts, w) => {
     const ids = pts.map((p) => b.vertex(p));
@@ -757,6 +767,29 @@ function buildCurveMesh(curve: CurveData, opts: CurveMeshOptions): CurveMeshResu
     if (wireCyclic[w] && ids.length > 2) b.looseEdges.push(ids[ids.length - 1], ids[0]);
   });
   return { mesh: b.build(), lines, ...extra };
+}
+
+/** Vertices and loose edges of wire polylines (null when there are no edges). */
+function wireMesh(polylines: Vec3[][], cyclic: boolean[]): MeshData | null {
+  const positions: number[] = [];
+  const looseEdges: number[] = [];
+  polylines.forEach((pts, w) => {
+    const first = positions.length / 3;
+    for (const p of pts) positions.push(p[0], p[1], p[2]);
+    for (let i = 0; i + 1 < pts.length; i++) looseEdges.push(first + i, first + i + 1);
+    if (cyclic[w] && pts.length > 2) looseEdges.push(first + pts.length - 1, first);
+  });
+  if (!looseEdges.length) return null;
+  return {
+    positions,
+    faces: [],
+    faceMaterials: [],
+    faceSmooth: [],
+    uvs: null,
+    colors: null,
+    edgeAttrs: {},
+    looseEdges,
+  };
 }
 
 /**

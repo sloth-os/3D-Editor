@@ -115,13 +115,17 @@ class LayoutScene {
   private readonly ancestorCache = new Map<string, string[]>();
   private readonly pointCache = new Map<string, ArrayLike<number> | null>();
 
-  constructor(private readonly ctx: OperatorContext) {
-    this.ev = new SceneEvaluator(ctx.doc).evaluate(ctx.state.frame);
+  /** `frame`: the frame to evaluate (default: the current frame; the read-only queries take one). */
+  constructor(
+    private readonly ctx: OperatorContext,
+    private readonly frame: number = ctx.state.frame,
+  ) {
+    this.ev = new SceneEvaluator(ctx.doc).evaluate(frame);
   }
 
   /** Transform state of the frame, only built for bone parents (the evaluated scene has the rest). */
   private get fs(): FrameState {
-    return (this.fsCache ??= new FrameState(this.ctx.doc, this.ctx.state.frame));
+    return (this.fsCache ??= new FrameState(this.ctx.doc, this.frame));
   }
 
   get(id: string): EvaluatedObject {
@@ -716,9 +720,12 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'is lifted onto that surface, e.g. objects generated at z = 0 under a terrain. Where no surface is below ' +
         'or above, the plane z = 0 is the ground (ground_plane; it lifts objects below it too). ' +
         'align_to_normal first tilts the object so its local +Z follows the surface normal under its centre. ' +
-        'Objects are dropped independently (never onto each other). Returns per object whether it was dropped, ' +
-        'the vertical move (metres), the contact point on the surface, its normal, the surface name (or ' +
-        '"ground plane") and the new world origin.',
+        'Objects are dropped independently (never onto each other). A parent drops together with its children ' +
+        '(e.g. an empty grouping the parts of a lamp post rests on the lowest point of the whole assembly, so ' +
+        'no part ends up buried); objects given together with one of their ancestors move along with it ' +
+        '(moved_with). Returns per object whether it was dropped, the vertical move (metres), the contact point ' +
+        'on the surface, its normal, the surface name (or "ground plane"), the new world origin and the ' +
+        'children whose geometry counted.',
       category: 'Layout',
       redoable: true,
       schema: z.object({
@@ -768,21 +775,30 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         const targets = new SceneRaycaster(
           scene.targets({ exclude: moving, only, instances: p.include_instances }),
         );
-        const out = [];
-        for (const id of scene.byDepth(ids)) {
+        // A parent carries its children: each object drops as an assembly with its (visible)
+        // descendants, and objects given together with an ancestor move along with it.
+        const given = new Set(ids);
+        const roots = ids.filter((id) => !scene.ancestors(id).some((a) => given.has(a)));
+        const out: Record<string, unknown>[] = [];
+        const moves = new Map<string, number>();
+        for (const id of scene.byDepth(roots)) {
           let world = scene.world(id);
           const origin = translationOf(world);
+          const inverse = invert4(world);
+          // the object itself and its visible descendants with geometry, relative to the object
+          const members = [...scene.withDescendants([id])]
+            .filter((m) => (m === id || scene.get(m).visible) && scene.hasGeometry(m))
+            .map((m) => ({ id: m, rel: m === id ? identity4() : multiply4(inverse, scene.world(m)) }));
           const pointsOf = (w: Mat4): ArrayLike<number> => {
-            const pts = p.use_origin ? null : scene.localPoints(id);
-            if (!pts) return translationOf(w);
-            const world3 = new Float64Array(pts.length - (pts.length % 3));
-            for (let i = 0; i < world3.length; i += 3) {
-              const q = transformPoint3(w, [pts[i], pts[i + 1], pts[i + 2]]);
-              world3[i] = q[0];
-              world3[i + 1] = q[1];
-              world3[i + 2] = q[2];
+            if (p.use_origin || !members.length) return translationOf(w);
+            const all: number[] = [];
+            for (const m of members) {
+              const pts = scene.localPoints(m.id)!;
+              const mw = m.id === id ? w : multiply4(w, m.rel);
+              for (let i = 0; i + 2 < pts.length; i += 3)
+                all.push(...transformPoint3(mw, [pts[i], pts[i + 1], pts[i + 2]]));
             }
-            return world3;
+            return all.length ? all : translationOf(w);
           };
           let rotated = false;
           if (p.align_to_normal) {
@@ -806,9 +822,14 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           }
           const pts = pointsOf(world);
           const geometry =
-            p.use_origin || !scene.hasGeometry(id)
+            p.use_origin || !members.length
               ? null
-              : new SceneRaycaster(scene.geometryTargets(id, world));
+              : new SceneRaycaster(
+                  members.flatMap((m) =>
+                    scene.geometryTargets(m.id, m.id === id ? world : multiply4(world, m.rel)),
+                  ),
+                );
+          const children = members.filter((m) => m.id !== id).map((m) => nameOf(ctx, m.id));
           const drop = computeDrop(pts, geometry, targets, p.ground_plane);
           if (!drop) {
             ctx.report('WARNING', `Nothing below '${nameOf(ctx, id)}' to drop onto`);
@@ -820,6 +841,7 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           const final = multiply4(translation4([0, 0, dz]), world);
           if (rotated) scene.setWorld(id, final);
           else scene.translate(id, [0, 0, dz]);
+          moves.set(id, dz);
           out.push({
             object: id,
             name: nameOf(ctx, id),
@@ -828,6 +850,19 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
             contact: r3(drop.point),
             normal: r3(drop.normal),
             surface: drop.target ? nameOf(ctx, drop.target.objectId) : 'ground plane',
+            location: r3(translationOf(scene.world(id))),
+            ...(children.length && !p.use_origin ? { children } : {}),
+          });
+        }
+        // objects given together with an ancestor moved along with it
+        for (const id of ids) {
+          if (roots.includes(id)) continue;
+          const root = scene.ancestors(id).find((a) => roots.includes(a))!;
+          out.push({
+            object: id,
+            name: nameOf(ctx, id),
+            dropped: moves.has(root),
+            moved_with: nameOf(ctx, root),
             location: r3(translationOf(scene.world(id))),
           });
         }
@@ -1555,7 +1590,8 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'between origins and between bounding box centres, the gap between the bounding boxes (0 when they ' +
         'overlap) and, up to 8 objects, the exact closest distance between the actual surfaces (meshes, curves, ' +
         'text and the geometry of collection instances) with the closest points (0 when they touch; ' +
-        'intersecting=true when they cross). Units: metres.',
+        'intersecting=true when they cross). Units: metres. `frame` measures the scene at another frame ' +
+        '(animated, driven or simulated objects) without changing the current frame.',
       category: 'Scene',
       undo: false,
       schema: z.object({
@@ -1569,9 +1605,15 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           .boolean()
           .default(true)
           .describe('Compute the closest surface-to-surface distance of each pair (at most 8 objects)'),
+        frame: z
+          .number()
+          .optional()
+          .describe(
+            'Frame to evaluate (animation, drivers, constraints, physics), default: the current frame; the current frame is not changed',
+          ),
       }),
       execute(ctx, p) {
-        const scene = new LayoutScene(ctx);
+        const scene = new LayoutScene(ctx, p.frame ?? ctx.state.frame);
         let ids = p.objects?.length
           ? resolveObjectIds(ctx, p.objects)
           : ctx.state.selectedIds.filter((id) => scene.ev.byId.has(id));
@@ -1647,6 +1689,7 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
             }
         }
         return {
+          ...(p.frame !== undefined ? { frame: scene.ev.frame } : {}),
           objects,
           bounds: isEmptyBounds(all)
             ? null
@@ -1666,7 +1709,8 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'default, their instances (collection instances, particles). Does not change anything. Returns ' +
         '{hit: true, object (id; the instanced source for instances), name, instancer (id or null), point, ' +
         'normal (unit face normal, world space), distance (metres), face (index), front (hit the front side)} or ' +
-        '{hit: false}; with all=true a `hits` list of every surface along the ray, nearest first.',
+        '{hit: false}; with all=true a `hits` list of every surface along the ray, nearest first. `frame` casts ' +
+        'against the scene at another frame without changing the current frame.',
       category: 'Scene',
       undo: false,
       schema: z.object({
@@ -1690,21 +1734,29 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           .default(true)
           .describe('Also hit collection-instance and particle instances'),
         all: z.boolean().default(false).describe('Return every hit along the ray (up to 64), nearest first'),
+        frame: z
+          .number()
+          .optional()
+          .describe(
+            'Frame to evaluate (animation, drivers, constraints, physics), default: the current frame; the current frame is not changed',
+          ),
       }),
       execute(ctx, p) {
-        const scene = new LayoutScene(ctx);
+        const scene = new LayoutScene(ctx, p.frame ?? ctx.state.frame);
         const only = p.objects?.length ? new Set(p.objects.map((r) => resolveOne(ctx, r).id)) : null;
         const exclude = new Set((p.exclude ?? []).map((r) => resolveOne(ctx, r).id));
         const rc = new SceneRaycaster(scene.targets({ exclude, only, instances: p.include_instances }));
         const dir = p.direction as Vec3;
         if (!(Math.hypot(dir[0], dir[1], dir[2]) > 0))
           throw new OperatorError('direction must not be zero', 'INVALID_PARAMS');
+        // the frame is echoed when one was asked for
+        const frame = p.frame !== undefined ? { frame: scene.ev.frame } : {};
         if (p.all) {
           const hits = rc.castAll(p.origin as Vec3, dir, p.max_distance, 64).map((h) => hitInfo(ctx, h));
-          return { hit: hits.length > 0, count: hits.length, hits };
+          return { hit: hits.length > 0, count: hits.length, hits, ...frame };
         }
         const hit = rc.cast(p.origin as Vec3, dir, p.max_distance);
-        return hit ? { hit: true, ...hitInfo(ctx, hit) } : { hit: false };
+        return hit ? { hit: true, ...hitInfo(ctx, hit), ...frame } : { hit: false, ...frame };
       },
     }),
   );
@@ -1718,14 +1770,20 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'visible, selected, per type), evaluated geometry of the visible objects after modifiers (vertices, ' +
         'edges, faces, triangles), instances (count and triangles), data-block counts, animation (F-curves, ' +
         'drivers, frame range) and the world bounding box of the visible geometry. selected_only restricts the ' +
-        'geometry totals to the selected objects.',
+        'geometry totals to the selected objects; `frame` evaluates another frame without changing the current one.',
       category: 'Scene',
       undo: false,
       schema: z.object({
         selected_only: z.boolean().default(false).describe('Count the geometry of the selected objects only'),
+        frame: z
+          .number()
+          .optional()
+          .describe(
+            'Frame to evaluate (animation, drivers, constraints, physics), default: the current frame; the current frame is not changed',
+          ),
       }),
       execute(ctx, p) {
-        const ev = new SceneEvaluator(ctx.doc).evaluate(ctx.state.frame);
+        const ev = new SceneEvaluator(ctx.doc).evaluate(p.frame ?? ctx.state.frame);
         const selected = new Set(ctx.state.selectedIds);
         const byType: Record<string, number> = {};
         const geo = { vertices: 0, edges: 0, faces: 0, triangles: 0 };

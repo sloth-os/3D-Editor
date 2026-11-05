@@ -19,8 +19,10 @@ import {
   resolveView,
   sampleFrameIndices,
   viewCameraData,
+  type Mat4,
   type PathTile,
   type PathTraceProgress,
+  type RigidBodyHost,
   type SoftwareRenderOptions,
   type Vec3,
 } from '@3d-editor/core';
@@ -34,8 +36,10 @@ import type {
   FinishOptions,
   FrameOptions,
   ImageResult,
+  PhysicsFrame,
   PreparedInfo,
   RawFrame,
+  SimulatedFrames,
   Vec3Tuple,
   Vec4Tuple,
 } from './protocol';
@@ -63,6 +67,30 @@ interface CachedDocument {
   /** `DocRef.version` of the last applied state. */
   version: number;
   used: number;
+  /**
+   * Rigid body matrices of the frame being rendered, simulated once for every thread (see
+   * `FrameOptions.physics`): the evaluator uses them instead of simulating.
+   */
+  physics: { frame: number; matrices: Map<string, Mat4> | null } | null;
+}
+
+/** The world matrices of a physics frame by object id (null: nothing simulated at the frame). */
+function physicsMatrices(p: PhysicsFrame): Map<string, Mat4> | null {
+  if (!p.ids.length) return null;
+  const out = new Map<string, Mat4>();
+  p.ids.forEach((id, i) => out.set(id, Array.from(p.matrices.subarray(i * 16, i * 16 + 16)) as Mat4));
+  return out;
+}
+
+/** The scene access the rigid body simulator needs (as `SceneEvaluator.evaluate` provides it). */
+function rigidBodyHost(doc: SceneDoc, evaluator: SceneEvaluator): RigidBodyHost {
+  return {
+    transformsAt: (f) => evaluator.transformsAt(f),
+    meshOf: (id) => {
+      const o = doc.getObject(id);
+      return o?.type === 'MESH' && o.data ? doc.getMesh(o.data) : null;
+    },
+  };
 }
 
 /** Converts frame options to the core software renderer options (engine always explicit). */
@@ -106,14 +134,63 @@ export class RenderEngine {
       if (entry) entry.doc.applyUpdate(update, 'render');
       else {
         const doc = SceneDoc.fromUpdate(update);
-        entry = { doc, evaluator: new SceneEvaluator(doc), version: ref.version, used: 0 };
+        const created: CachedDocument = {
+          doc,
+          evaluator: new SceneEvaluator(doc),
+          version: ref.version,
+          used: 0,
+          physics: null,
+        };
+        // matrices simulated once for every thread (FrameOptions.physics) replace the simulation
+        const sim = created.evaluator.rigidBodies;
+        const simulate = sim.evaluate.bind(sim);
+        sim.evaluate = (d, frame, host) =>
+          created.physics && created.physics.frame === frame
+            ? created.physics.matrices
+            : simulate(d, frame, host);
+        entry = created;
         this.docs.set(ref.key, entry);
         this.evictDocuments();
       }
       entry.version = ref.version;
     }
     entry.used = ++this.clock;
+    // shared physics only apply to the render they came with (see documentFor)
+    entry.physics = null;
     return entry;
+  }
+
+  /** The cached document of `ref`, set up to use the physics of `options` (if any) for its frame. */
+  private documentFor(ref: DocRef, options: FrameOptions): CachedDocument {
+    const entry = this.document(ref);
+    const p = options.physics;
+    entry.physics = p && p.frame === options.frame ? { frame: p.frame, matrices: physicsMatrices(p) } : null;
+    return entry;
+  }
+
+  /**
+   * Simulates the rigid body world up to `frames` (incrementally, cached per document like every
+   * evaluation) and returns the world matrices of the simulated objects at each of them.
+   */
+  simulate(ref: DocRef, frames: number[]): SimulatedFrames {
+    const t0 = now();
+    const { doc, evaluator } = this.document(ref);
+    const host = rigidBodyHost(doc, evaluator);
+    const out: PhysicsFrame[] = [];
+    for (const frame of [...frames].sort((a, b) => a - b)) {
+      let m: Map<string, Mat4> | null;
+      try {
+        m = evaluator.rigidBodies.evaluate(doc, frame, host);
+      } catch {
+        // frames left out are simulated (and the error reported) by the threads rendering them
+        break;
+      }
+      const ids = m ? [...m.keys()] : [];
+      const matrices = new Float64Array(ids.length * 16);
+      ids.forEach((id, i) => matrices.set(m!.get(id)!, i * 16));
+      out.push({ frame, ids, matrices });
+    }
+    return { frames: out, ms: now() - t0 };
   }
 
   private evictDocuments(): void {
@@ -137,7 +214,7 @@ export class RenderEngine {
    */
   prepare(job: number, ref: DocRef, options: FrameOptions): PreparedInfo {
     const t0 = now();
-    const { doc, evaluator } = this.document(ref);
+    const { doc, evaluator } = this.documentFor(ref, options);
     const width = Math.round(options.width);
     const height = Math.round(options.height);
     const opts = softwareOptions(options);
@@ -215,7 +292,7 @@ export class RenderEngine {
    * the PNG file is returned instead of the pixels.
    */
   image(ref: DocRef, options: FrameOptions, png = false): ImageResult {
-    const { doc, evaluator } = this.document(ref);
+    const { doc, evaluator } = this.documentFor(ref, options);
     let last: PathTraceProgress | undefined;
     const img = renderSceneSoftware(doc, {
       ...softwareOptions(options),
@@ -331,7 +408,8 @@ export class RenderEngine {
       const info = this.prepare(-1, ref, options);
       const film = new PathFilm(info.width, info.height);
       for (let s = 0; s < info.samples; s += 2)
-        for (let y = 0; y < info.height; y += 4) film.add(this.rows(-1, y, Math.min(info.height, y + 4), s, 2));
+        for (let y = 0; y < info.height; y += 4)
+          film.add(this.rows(-1, y, Math.min(info.height, y + 4), s, 2));
       this.finish(film.resolve(), { ...info, png: true });
       this.image(ref, { ...options, engine: 'RASTER', samples: 2 }, true);
     } finally {

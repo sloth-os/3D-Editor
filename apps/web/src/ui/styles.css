@@ -742,15 +742,34 @@ select.select {
   overflow-y: auto;
   z-index: 3;
 }
+/* Adjust Last Operation: grows upwards from the bottom-left corner but always fits the viewport
+   (the view name in the top-left corner stays visible); long parameter lists scroll */
 .redo-panel {
   position: absolute;
   left: 50px;
   bottom: 10px;
   width: 260px;
+  max-width: calc(100% - 60px);
+  max-height: calc(100% - 56px);
+  display: flex;
+  flex-direction: column;
   background: rgba(40, 40, 40, 0.97);
   border: 1px solid var(--border);
   border-radius: 5px;
+  overflow: hidden;
   z-index: 4;
+}
+.redo-panel .panel-header {
+  flex: none;
+}
+.redo-panel .panel-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.redo-panel .panel-body > * {
+  /* rows keep their height and the body scrolls (rows set their own min-height) */
+  flex-shrink: 0;
 }
 .selection-rect {
   position: absolute;

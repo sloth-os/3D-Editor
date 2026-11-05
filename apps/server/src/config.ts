@@ -30,7 +30,12 @@ export interface ServerConfig {
   host: string;
   /** Directory holding the built PWA, or null when there is nothing to serve. */
   publicDir: string | null;
+  /** Directory of disk persistence (`DATA_DIR`, default ./data). */
   dataDir: string;
+  /**
+   * Where live projects are kept: `SYNC_PERSISTENCE`, else `webdav` when WEBDAV_URL is set, else
+   * `disk` when DATA_DIR is set, else `memory` (lost when the server stops).
+   */
   persistence: PersistenceMode;
   roomIdleTtlSeconds: number;
   persistDebounceMs: number;
@@ -182,7 +187,10 @@ export function loadConfig(
         basePath: normalizeBasePath(e.WEBDAV_BASE_PATH),
       }
     : null;
-  const persistence: PersistenceMode = e.SYNC_PERSISTENCE ?? (webdav ? 'webdav' : 'memory');
+  // without SYNC_PERSISTENCE: WebDAV when WEBDAV_URL is set, else disk when DATA_DIR is set
+  // (giving a data directory means "keep my projects there"), else memory
+  const persistence: PersistenceMode =
+    e.SYNC_PERSISTENCE ?? (webdav ? 'webdav' : cleaned.DATA_DIR ? 'disk' : 'memory');
   if (persistence === 'webdav' && !webdav)
     throw new Error('Invalid configuration: SYNC_PERSISTENCE=webdav requires WEBDAV_URL');
 

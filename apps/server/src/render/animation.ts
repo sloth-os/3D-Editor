@@ -9,6 +9,7 @@ import {
   type EncodedResult,
   type FrameOptions,
   type ImageResult,
+  type PhysicsFrame,
 } from './protocol';
 
 /*
@@ -77,11 +78,21 @@ export interface AnimationOutput {
 
 const now = () => performance.now();
 
+export interface AnimationRenderOptions {
+  signal?: AbortSignal;
+  onProgress?: (p: AnimationProgress) => void;
+  /**
+   * The rigid body simulation of the frames, computed once on `thread` (see `Renderer.physics`);
+   * without it (or when it returns null) every thread simulates the frames it renders.
+   */
+  physics?: (thread: RenderThread, frames: number[]) => Promise<Map<number, PhysicsFrame> | null>;
+}
+
 export async function renderAnimationParallel(
   threads: readonly RenderThread[],
   doc: DocRef,
   job: AnimationJob,
-  opts: { signal?: AbortSignal; onProgress?: (p: AnimationProgress) => void } = {},
+  opts: AnimationRenderOptions = {},
 ): Promise<AnimationOutput> {
   const { signal } = opts;
   if (!threads.length) throw new Error('no render threads');
@@ -105,6 +116,9 @@ export async function renderAnimationParallel(
       }),
       signal,
     );
+
+  // the rigid body simulation of every frame, once (inside the time budget, like the auto view)
+  const physics = opts.physics ? await opts.physics(threads[0], job.frames) : null;
 
   const seed = job.base.seed ?? 0;
   const bands = pathTraces(job.base) && total < threads.length && threads.length > 1;
@@ -133,6 +147,7 @@ export async function renderAnimationParallel(
         view: view ?? job.base.view,
         time_limit: timeLimit,
         seed: job.animatedSeed ? seed + Math.round(frame) : seed,
+        ...(physics?.has(frame) ? { physics: physics.get(frame) } : {}),
       },
     };
   };

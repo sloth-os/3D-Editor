@@ -14,6 +14,7 @@ import {
 } from '@3d-editor/core';
 import { closeDialog, openDialog, session as sessionSignal } from '../src/app/store';
 import { runResult, viewport } from '../src/editor/editor';
+import { infoLog } from '../src/editor/runner';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
 import type { ViewportEngine } from '../src/viewport/engine';
@@ -34,7 +35,7 @@ import {
   restoreProcedural,
   textureSource,
 } from '../src/ui/properties/MaterialTab';
-import { rpcRenderEngineOptions } from '../src/editor/rpc';
+import { rpcRenderEngineOptions, uiEnumParam } from '../src/editor/rpc';
 import { bakeRigidBodyWorld, mistDensityForDistance } from '../src/ui/properties/SceneTabs';
 import { DialogHost, formatRenderTime } from '../src/ui/dialogs/Dialogs';
 import { InProcessWorker, RenderPool, startPathTrace } from '../src/render';
@@ -300,6 +301,31 @@ describe('Object Data tab: armatures', () => {
     fireEvent.click(byTestId(container, 'bone-Hand')!);
     fireEvent.click(byTestId(container, 'bone-remove')!);
     expect(arm().bones.map((b) => b.name)).toEqual(['Bone', 'Bone.001', 'Target']);
+  });
+
+  it('renames a bone with Enter without renaming it again when the old name field loses focus', () => {
+    // regression: the fields of the renamed bone are rebuilt; the old name field (removed while
+    // focused) committed the rename again on blur and failed: "Bone 'Bone.001' not found"
+    ok('object.armature_add', { name: 'Rig' });
+    select(s, 'Rig');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    fireEvent.click(byTestId(container, 'bone-add')!);
+    const errors = () => infoLog.value.filter((l) => l.level === 'ERROR').map((l) => l.message);
+    const before = errors().length;
+    const field = byTestId(container, 'bone-name') as HTMLInputElement;
+    fireEvent.input(field, { target: { value: 'Hand' } });
+    fireEvent.keyDown(field, { key: 'Enter' });
+    fireEvent.blur(field);
+    const rig = s.doc.findObjectByName('Rig')!;
+    expect(s.doc.getArmature(rig.data!)!.bones.map((b) => b.name)).toEqual(['Bone', 'Hand']);
+    expect(errors().slice(before)).toEqual([]);
+    expect(byTestId(container, 'bone-Hand')?.getAttribute('aria-selected')).toBe('true');
+    // typing the same text again after a failed or undone rename still commits
+    const again = byTestId(container, 'bone-name') as HTMLInputElement;
+    fireEvent.input(again, { target: { value: 'Wrist' } });
+    fireEvent.keyDown(again, { key: 'Enter' });
+    expect(s.doc.getArmature(rig.data!)!.bones.map((b) => b.name)).toEqual(['Bone', 'Wrist']);
   });
 
   it('orders bones as a tree', () => {
@@ -672,6 +698,50 @@ describe('render window', () => {
     expect(byTestId(container, 'render-animation-save')).not.toBeNull();
     expect(formatRenderTime(83_456)).toBe('01:23.46');
   });
+
+  it('updates the samples and time of the frame being path traced while it renders', async () => {
+    // regression: the status line kept "Sample 0/…" and the frame's start time for the whole frame
+    s.doc.populateDefaultScene();
+    s.doc.updateScene({ frame_start: 1, frame_end: 2 });
+    s.doc.updateRender({
+      engine: 'PATHTRACER',
+      resolution_x: 32,
+      resolution_y: 16,
+      resolution_percentage: 50,
+    });
+    const pool = new RenderPool({ size: 1, factory: () => new InProcessWorker(), idleMs: 0 });
+    pools.push(pool);
+    viewport.engine = {
+      startPathTrace: (o: { frame: number; width: number; height: number }) =>
+        startPathTrace(pool, s.doc, { width: o.width, height: o.height, frame: o.frame, samples: 100_000 }),
+    } as unknown as ViewportEngine;
+    openDialog('render', { animation: true });
+    const { container } = render(<DialogHost />);
+    fireEvent.click(byTestId(container, 'render-animation-start')!);
+    const status = () => byTestId(container, 'render-animation-status')?.textContent ?? '';
+    await waitFor(() => expect(status()).toMatch(/Frame 1 \(1\/2\).*Sample [1-9]\d*\/100000/), {
+      timeout: 10_000,
+    });
+    const first = status();
+    // later samples of the same frame show up (and the clock keeps running) without a new frame
+    await waitFor(() => expect(status()).not.toBe(first), { timeout: 10_000 });
+    expect(status()).toMatch(/Frame 1 \(1\/2\)/);
+    const time = (t: string) => {
+      const [m, sec] = /Time (\d\d):(\d\d\.\d\d)/.exec(t)!.slice(1).map(Number);
+      return m * 60 + sec;
+    };
+    await waitFor(() => expect(time(status())).toBeGreaterThan(time(first)), { timeout: 10_000 });
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(byTestId(container, 'render-animation-start')).not.toBeNull(), {
+      timeout: 10_000,
+    });
+    // regression: cancelled before the first frame, the window kept saying "Rendering frame 1…"
+    expect(byTestId(container, 'render-animation-status')).toBeNull();
+    expect(byTestId(container, 'render-animation-progress')).toBeNull();
+    expect(container.textContent).not.toContain('Rendering frame');
+    expect(byTestId(container, 'render-animation-cancelled')?.textContent).toContain('Cancelled');
+    expect(byTestId(container, 'render-animation-settings')).not.toBeNull();
+  }, 30_000);
 });
 
 /** Drags a number field by `dx` pixels; `during` runs while the button is still down. */
@@ -793,6 +863,18 @@ describe('helpers', () => {
         seed: 'x',
       }),
     ).toEqual({ engine: 'PATHTRACER', samples: 32, max_bounces: 0, denoise: false, time_limit: 5 });
+  });
+
+  it('reads UI command parameters under the names MCP documents (view.set_view {view})', () => {
+    // regression: `view.set_view {view: 'TOP'}` (as the editor_command tool documents it) went to FRONT
+    const views = ['FRONT', 'TOP', 'CAMERA'] as const;
+    expect(uiEnumParam({ view: 'TOP' }, ['view', 'type'], views, 'FRONT')).toBe('TOP');
+    expect(uiEnumParam({ type: 'camera' }, ['view', 'type'], views, 'FRONT')).toBe('CAMERA');
+    expect(uiEnumParam({}, ['view', 'type'], views, 'FRONT')).toBe('FRONT');
+    expect(uiEnumParam({ view: null, type: 'top' }, ['view', 'type'], views, 'FRONT')).toBe('TOP');
+    expect(() => uiEnumParam({ view: 'SIDE' }, ['view', 'type'], views, 'FRONT')).toThrow(
+      "Unknown view 'SIDE': use one of FRONT, TOP, CAMERA",
+    );
   });
 
   it('labels procedural parameters and values like Blender', () => {

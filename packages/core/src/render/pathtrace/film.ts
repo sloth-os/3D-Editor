@@ -59,7 +59,11 @@ export interface FilmImage {
   /** Mean premultiplied linear radiance and coverage (rgba). */
   color: Float32Array;
   emission: Float32Array;
-  /** Variance of the mean luminance per pixel. */
+  /**
+   * Variance of the mean luminance per pixel. Pixels with fewer than `SPATIAL_VARIANCE_SAMPLES`
+   * samples get (or blend in) an estimate from their neighbourhood, so the denoiser also works at
+   * one sample per pixel (where the pixel's own estimate is exactly 0).
+   */
   variance: Float32Array;
   albedo: Float32Array;
   /** Unit normals (zero where no surface was hit). */
@@ -137,9 +141,11 @@ export class PathFilm {
     const albedo = new Float32Array(n * 3);
     const normal = new Float32Array(n * 3);
     const depth = new Float32Array(n);
+    let fewSamples = false;
     for (let y = 0; y < h; y++) {
       const N = this.rowSamples[y];
       if (!N) continue;
+      if (N < SPATIAL_VARIANCE_SAMPLES) fewSamples = true;
       const inv = 1 / N;
       for (let x = 0; x < w; x++) {
         const i = y * w + x;
@@ -166,9 +172,105 @@ export class PathFilm {
         variance[i] = N > 1 ? v / (N - 1) : v;
       }
     }
+    if (fewSamples) this.spatialVariance(color, normal, depth, variance);
     return { width: w, height: h, color, emission, variance, albedo, normal, depth };
   }
+
+  /**
+   * Variance of the mean luminance of pixels in rows with fewer than `SPATIAL_VARIANCE_SAMPLES`
+   * samples, estimated from their neighbourhood like SVGF does for short histories: the variance
+   * of the samples of the surrounding 5×5 pixels on the same surface (similar normal and depth),
+   * divided by the pixel's sample count. With one sample a pixel's own estimate is exactly 0 (the
+   * denoiser would leave the image as raw noise); with two or three it is very noisy, so it is
+   * blended towards the spatial one. Signal changes within the window (texture or shading edges)
+   * count as noise too, which only makes the low-sample result smoother. The estimate is scaled by
+   * `SPATIAL_VARIANCE_SCALE`: the denoiser shrinks its luminance tolerance from pass to pass, which
+   * suits per-pixel estimates but leaves one-sample speckles (a pixel whose single shadow ray was
+   * blocked) visible unless the tolerance starts wider.
+   */
+  private spatialVariance(
+    color: Float32Array,
+    normal: Float32Array,
+    depth: Float32Array,
+    variance: Float32Array,
+  ): void {
+    const w = this.width;
+    const h = this.height;
+    const n = w * h;
+    // per-sample luminance moments of every pixel: mean and mean square
+    const m1 = new Float32Array(n);
+    const m2 = new Float32Array(n);
+    for (let y = 0; y < h; y++) {
+      const N = this.rowSamples[y];
+      if (!N) continue;
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        m1[i] = 0.2126 * color[i * 4] + 0.7152 * color[i * 4 + 1] + 0.0722 * color[i * 4 + 2];
+        m2[i] = this.lum2[i] / N;
+      }
+    }
+    const R = 2;
+    for (let y = 0; y < h; y++) {
+      const N = this.rowSamples[y];
+      if (!N || N >= SPATIAL_VARIANCE_SAMPLES) continue;
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x;
+        const nx = normal[i * 3];
+        const ny = normal[i * 3 + 1];
+        const nz = normal[i * 3 + 2];
+        // the denoiser leaves pixels without a surface (background, emitters seen directly) alone
+        if (nx * nx + ny * ny + nz * nz < 0.25) continue;
+        const z = depth[i];
+        // depth tolerance: the local depth slope (central differences) per pixel of distance
+        const zx = x > 0 && x < w - 1 ? Math.abs(depth[i + 1] - depth[i - 1]) * 0.5 : 0;
+        const zy = y > 0 && y < h - 1 ? Math.abs(depth[i + w] - depth[i - w]) * 0.5 : 0;
+        const slope = Math.max(zx, zy, 1e-3 * z) * 2;
+        let sw = 0;
+        let s1 = 0;
+        let s2 = 0;
+        for (let dy = -R; dy <= R; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= h || !this.rowSamples[yy]) continue;
+          for (let dx = -R; dx <= R; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= w) continue;
+            const j = yy * w + xx;
+            let nd = nx * normal[j * 3] + ny * normal[j * 3 + 1] + nz * normal[j * 3 + 2];
+            if (nd <= 0.5) continue;
+            nd *= nd;
+            nd *= nd;
+            nd *= nd; // (n·n')^8
+            const dz = Math.abs(depth[j] - z) / (slope * Math.max(Math.abs(dx), Math.abs(dy), 1));
+            if (dz > 8) continue;
+            const wgt = nd * Math.exp(-dz);
+            sw += wgt;
+            s1 += wgt * m1[j];
+            s2 += wgt * m2[j];
+          }
+        }
+        if (!(sw > 0)) continue;
+        const mean = s1 / sw;
+        const spatial = (SPATIAL_VARIANCE_SCALE * Math.max(0, s2 / sw - mean * mean)) / N;
+        // one sample: spatial only; two and three: blended towards the pixel's own estimate
+        const t = (N - 1) / (SPATIAL_VARIANCE_SAMPLES - 1);
+        variance[i] = spatial + (variance[i] - spatial) * t;
+      }
+    }
+  }
 }
+
+/**
+ * Below this many samples per pixel the variance the denoiser is guided by is (partly) estimated
+ * from the neighbourhood (see `PathFilm.spatialVariance`).
+ */
+export const SPATIAL_VARIANCE_SAMPLES = 4;
+
+/**
+ * Factor on the spatial variance estimate: a wider luminance tolerance of the denoiser at one to
+ * three samples per pixel (on a test scene at one sample per pixel, 4 instead of 1 lowers the mean
+ * error against a converged render by a quarter and the pixel-to-pixel noise by 40 %).
+ */
+const SPATIAL_VARIANCE_SCALE = 4;
 
 function addRange(dst: Float32Array, src: Float32Array, d: number, s: number, n: number): void {
   for (let i = 0; i < n; i++) dst[d + i] += src[s + i];

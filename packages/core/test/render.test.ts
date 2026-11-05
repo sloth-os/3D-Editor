@@ -264,6 +264,8 @@ describe('software renderer', () => {
 
   it('lights with physical units: a 1000 W point light 5 m away lights a surface without clipping', () => {
     const doc = SceneDoc.create({ empty: true });
+    // only the lamp (and the dim world colour): no studio environment light
+    doc.updateWorld({ environment: 'NONE' });
     doc.addObject({ type: 'MESH', name: 'Floor', data: doc.addMesh('Floor', createPlane({ size: 4 })) });
     const light = doc.addLight({ type: 'POINT', energy: 1000 });
     doc.addObject({ type: 'LIGHT', name: 'Light', data: light, location: [0, 0, 5] });
@@ -303,7 +305,8 @@ describe('software renderer', () => {
       data: doc.addMesh('Plane', createPlane({ size: 2 })),
       material_slots: [mat],
     });
-    doc.updateWorld({ color: [1, 1, 1], strength: 1 }); // pure ambient: shows the texture color
+    // pure ambient (a uniform world colour, environment NONE): shows the texture color
+    doc.updateWorld({ environment: 'NONE', color: [1, 1, 1], strength: 1 });
     const cam = doc.addObject({
       type: 'CAMERA',
       name: 'Top',

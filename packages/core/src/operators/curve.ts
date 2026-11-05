@@ -45,7 +45,11 @@ const pointObject = z.object({
   tilt: z
     .number()
     .optional()
-    .describe('Twist of the bevel/extrusion around the curve direction, radians (default 0)'),
+    .describe(
+      'Twist of the bevel/extrusion around the curve direction, radians (default 0). Positive tilt turns the ' +
+        'profile clockwise when looking along the direction of travel: with fill_mode HALF and Z_UP twist, ' +
+        '-π/2 on every point opens the half tube upward (gutter, half-pipe), +π/2 downward (arch)',
+    ),
   weight: z.number().positive().optional().describe('NURBS only: control point weight (default 1)'),
 });
 
@@ -160,7 +164,15 @@ const curveFields = {
     .enum(['FULL', 'HALF', 'FRONT', 'BACK', 'BOTH', 'NONE'])
     .optional()
     .describe(
-      '3D curves: FULL tube, HALF/FRONT/BACK parts of the bevel. 2D curves and text: BOTH/FRONT/BACK cap faces, NONE = outline only',
+      '3D curves: which part of the bevel cross-section is built. The cross-section lies in the bevel frame: its ' +
+        "+x is the frame's side axis (with Z_UP or MINIMUM twist and no tilt: the LEFT of the direction of travel " +
+        'seen from above), its +y the up axis (+Z for a flat Z_UP path). FULL (= NONE) builds the closed tube; HALF ' +
+        '(= BOTH) the +x half, from the bottom over the left side to the top, so a flat path gives a C-shaped ' +
+        'channel opening sideways to the RIGHT; FRONT the upper quarter of that half (side to top), BACK the lower ' +
+        'quarter (bottom to side). For an upward-opening gutter or half-pipe use HALF with twist_mode Z_UP and ' +
+        'tilt -π/2 (-1.5708) on every point (+π/2 makes an arch opening downward). Normals face away from the ' +
+        'curve, so the inside of such a channel shows the back of the faces; add a SOLIDIFY modifier for walls ' +
+        'with thickness. 2D curves and text: BOTH/FRONT/BACK cap faces, NONE = outline only',
     ),
   use_fill_caps: z.boolean().optional().describe('Close the open ends of beveled open curves with cap faces'),
   twist_mode: z

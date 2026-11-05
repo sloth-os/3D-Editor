@@ -6,6 +6,12 @@ import { buildRenderBuffers, type RenderBuffers } from '../mesh/render-buffers';
 import { PATTERN_STRIDE, rampPattern, samplePattern, type CompiledProcedural } from '../material/procedural';
 import { bumpNormal, compiledCoord, type ProceduralSurface } from '../material/surface';
 import { evalSkyIrradiance, sampleSkyModel, type SkyModel } from './sky';
+import {
+  envBRDF,
+  environmentIrradiance,
+  sampleEnvironmentLighting,
+  type EnvironmentLighting,
+} from './env-light';
 import type { RenderView } from './view';
 
 /*
@@ -33,7 +39,10 @@ export interface SurfaceMaterial {
   er: number;
   eg: number;
   eb: number;
-  /** 0 opaque, 1 alpha clip, 2 dithered blend. */
+  /**
+   * 0 opaque, 1 alpha clip, 2 alpha blend (drawn after the opaque surfaces, sorted back to front,
+   * each sample blended with what is behind it by `alpha`).
+   */
   blend: number;
   threshold: number;
   cull: boolean;
@@ -49,6 +58,21 @@ export interface SurfaceMaterial {
   procedural?: ProceduralSurface | null;
   /** Emission strength (multiplies a procedural emission colour). */
   emissionStrength?: number;
+  /**
+   * Principled transmission 0..1 (glass): replaces the diffuse part; the surface is drawn in the
+   * blended pass and lets what is behind it through, tinted by the base colour and reduced by the
+   * Fresnel reflection (no refraction).
+   */
+  transmission?: number;
+  /** Index of refraction (dielectric Fresnel reflectance F0 = ((ior − 1) / (ior + 1))², default 1.5). */
+  ior?: number;
+}
+
+/** Per-object state the shading of a deferred (transparent) triangle needs. */
+interface ObjectState {
+  invWorld: Mat4;
+  texMin: Vec3;
+  texSize: Vec3;
 }
 
 /** Procedural sky lighting: diffuse irradiance SH (E/π) and the sky for reflections, × scale. */
@@ -79,8 +103,6 @@ export const LIGHT_SUN = 3;
 /** Packed light record: kind, position xyz, direction xyz (where it points), rgb (color × intensity), spotCos, spotSmooth, radius². */
 export const LIGHT_STRIDE = 13;
 
-const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => (v + 0.5) / 16);
-
 /**
  * Vertex record in screen space: sx, sy, depthKey, 1/w, normal xyz, world position xyz, rgba, uv,
  * undeformed object-space position xyz (GENERATED procedural coordinates).
@@ -93,6 +115,8 @@ const GUARD = 64;
  */
 const PROC_VALUES = 13;
 const INV_PI = 1 / Math.PI;
+/** Angular radius of a sun lamp's disc for its highlight (Blender's default sun angle 0.526°). */
+const SUN_ANGULAR_RADIUS = 0.00459;
 
 export class Rasterizer {
   readonly color: Float32Array;
@@ -108,6 +132,17 @@ export class Rasterizer {
   wireColor: [number, number, number, number] = [0, 0, 0, 0.6];
   /** Procedural sky lighting (environment SKY); replaces the uniform `ambient` when set. */
   sky: SkyLighting | null = null;
+  /**
+   * Image-based lighting of a STUDIO or IMAGE world (diffuse irradiance and prefiltered
+   * reflections, see env-light.ts); replaces the uniform `ambient` when set.
+   */
+  env: EnvironmentLighting | null = null;
+  /**
+   * Reflection probe (the lit scene seen from the camera, see `probeLighting`): replaces the world
+   * as the source of reflections when set, so metals and glossy surfaces reflect the lit room,
+   * floor and objects around them (one bounce, like the path tracer's first reflection).
+   */
+  probe: EnvironmentLighting | null = null;
   /** World mist (MATERIAL shading): 1 − exp(−(density·depth)²) towards `mistColor`; 0 disables. */
   mistDensity = 0;
   mistColor: [number, number, number] = [0, 0, 0];
@@ -116,6 +151,29 @@ export class Rasterizer {
    * evaluated once per output pixel and triangle and shared by its samples (like MSAA shading).
    */
   shadingBlock = 1;
+  /**
+   * Render buffers per mesh, shared by the rasterizers of one render (the reflection probe faces,
+   * linked duplicates and instances draw the same mesh several times).
+   */
+  bufferCache: Map<MeshData, RenderBuffers> | null = null;
+  /**
+   * Skip back faces of every material (reflection probes: from a point inside or on a closed
+   * object, its far side does not block the view of the surroundings).
+   */
+  cullBackFaces = false;
+  /**
+   * Transparent triangles (alpha blend, transmission) waiting for `flushTransparent`: VS numbers
+   * per vertex, three vertices per triangle, with their material, facing, wire flags and object.
+   */
+  private tVerts = new Float64Array(VS * 3 * 64);
+  private tCount = 0;
+  private tInfo: { mat: SurfaceMaterial; back: boolean; wire: number; state: ObjectState | null }[] = [];
+  /** Object state of the mesh being drawn (procedural texture coordinates). */
+  private curState: ObjectState | null = null;
+  /** Set while `flushTransparent` draws: blend instead of overwriting, no depth writes. */
+  private blendPass = false;
+  /** n·v of the last `shadeMaterial` call (glass Fresnel). */
+  private outNdv = 1;
   /** Per output-pixel column: triangle serial, block row and cached procedural values. */
   private procTri = new Int32Array(0);
   private procRow = new Int32Array(0);
@@ -155,6 +213,7 @@ export class Rasterizer {
   private readonly pn: Vec3 = [0, 0, 0];
   private readonly skyTmp = new Float64Array(3);
   private readonly skyTmp2 = new Float64Array(3);
+  private readonly brdfTmp = new Float64Array(2);
   private readonly scr = new Float64Array(VS * 16);
   private clipA = new Float64Array(VS * 16);
   private clipB = new Float64Array(VS * 16);
@@ -222,12 +281,21 @@ export class Rasterizer {
       }
       this.invWorld = invert4(world);
       const ts = texSpace ?? meshBounds(mesh) ?? { min: [0, 0, 0], max: [1, 1, 1] };
+      this.texMin = [0, 0, 0];
+      this.texSize = [1, 1, 1];
       for (let k = 0; k < 3; k++) {
         this.texMin[k] = ts.min[k];
         this.texSize[k] = ts.max[k] - ts.min[k];
       }
     }
-    const rb = buildRenderBuffers(mesh);
+    this.curState = procedural
+      ? { invWorld: this.invWorld, texMin: this.texMin, texSize: this.texSize }
+      : null;
+    let rb = this.bufferCache?.get(mesh);
+    if (!rb) {
+      rb = buildRenderBuffers(mesh);
+      this.bufferCache?.set(mesh, rb);
+    }
     const nv = rb.positions.length / 3;
     const tris = rb.indices.length / 3;
     if (!tris) return;
@@ -352,13 +420,17 @@ export class Rasterizer {
         ? fx * (eye[0] - wp[i0 * 3]) + fy * (eye[1] - wp[i0 * 3 + 1]) + fz * (eye[2] - wp[i0 * 3 + 2])
         : -(fx * fwd[0] + fy * fwd[1] + fz * fwd[2]);
       const back = facing < 0 !== mirrored;
-      if (back && mat.cull) continue;
+      if (back && (mat.cull || this.cullBackFaces)) continue;
       const wire = edges ? edges[t] : 0;
+      // alpha-blended and transmissive surfaces wait for the sorted transparent pass
+      const deferred =
+        this.mode === SHADE_MATERIAL && (mat.blend === 2 || (mat.transmission ?? 0) > 0);
       if (!(gc[i0] | gc[i1] | gc[i2])) {
         this.loadScreen(0, i0, cl, wn, wp, colors, uvs, og);
         this.loadScreen(1, i1, cl, wn, wp, colors, uvs, og);
         this.loadScreen(2, i2, cl, wn, wp, colors, uvs, og);
-        this.fill(0, 1, 2, mat, back, wire);
+        if (deferred) this.defer(0, 1, 2, mat, back, wire);
+        else this.fill(0, 1, 2, mat, back, wire);
       } else {
         const A = this.clipA;
         loadClip(A, 0, i0, cl, wn, wp, colors, uvs, og);
@@ -366,8 +438,71 @@ export class Rasterizer {
         loadClip(A, 2, i2, cl, wn, wp, colors, uvs, og);
         const n2 = this.clipPolygon(3);
         for (let j = 0; j < n2; j++) this.projectClip(j);
-        for (let j = 1; j + 1 < n2; j++) this.fill(0, j, j + 1, mat, back, 0);
+        for (let j = 1; j + 1 < n2; j++)
+          if (deferred) this.defer(0, j, j + 1, mat, back, 0);
+          else this.fill(0, j, j + 1, mat, back, 0);
       }
+    }
+  }
+
+  /** Stores the screen-space triangle in scratch slots a, b, c for the transparent pass. */
+  private defer(a: number, b: number, c: number, mat: SurfaceMaterial, back: boolean, wire: number): void {
+    const need = (this.tCount + 1) * VS * 3;
+    if (need > this.tVerts.length) {
+      const grown = new Float64Array(Math.max(need, this.tVerts.length * 2));
+      grown.set(this.tVerts);
+      this.tVerts = grown;
+    }
+    const o = this.tCount * VS * 3;
+    const S = this.scr;
+    this.tVerts.set(S.subarray(a * VS, a * VS + VS), o);
+    this.tVerts.set(S.subarray(b * VS, b * VS + VS), o + VS);
+    this.tVerts.set(S.subarray(c * VS, c * VS + VS), o + 2 * VS);
+    this.tInfo.push({ mat, back, wire, state: this.curState });
+    this.tCount++;
+  }
+
+  /**
+   * Draws the transparent triangles collected by `drawMesh` (call after every mesh is drawn):
+   * sorted far to near by their mean depth and blended over what is already in the buffers —
+   * smooth alpha blending (BLEND) and see-through glass (transmission) instead of screen-door
+   * dithering. They test against but do not write the depth buffer.
+   */
+  flushTransparent(): void {
+    const n = this.tCount;
+    if (!n) return;
+    const V = this.tVerts;
+    const keys = new Float64Array(n);
+    for (let t = 0; t < n; t++) {
+      const o = t * VS * 3;
+      // depth keys: larger is closer (1/w, or 1 − z_ndc for orthographic views)
+      keys[t] = V[o + 2] + V[o + VS + 2] + V[o + 2 * VS + 2];
+    }
+    const order = new Uint32Array(n);
+    for (let t = 0; t < n; t++) order[t] = t;
+    order.sort((a, b) => keys[a] - keys[b] || a - b);
+    const S = this.scr;
+    const saved = { invWorld: this.invWorld, texMin: this.texMin, texSize: this.texSize };
+    this.blendPass = true;
+    try {
+      for (let k = 0; k < n; k++) {
+        const t = order[k];
+        const info = this.tInfo[t];
+        S.set(V.subarray(t * VS * 3, (t + 1) * VS * 3), 0);
+        if (info.state) {
+          this.invWorld = info.state.invWorld;
+          this.texMin = info.state.texMin;
+          this.texSize = info.state.texSize;
+        }
+        this.fill(0, 1, 2, info.mat, info.back, info.wire);
+      }
+    } finally {
+      this.blendPass = false;
+      this.invWorld = saved.invWorld;
+      this.texMin = saved.texMin;
+      this.texSize = saved.texSize;
+      this.tCount = 0;
+      this.tInfo = [];
     }
   }
 
@@ -551,7 +686,11 @@ export class Rasterizer {
     const depth = this.depth;
     const color = this.color;
     const cov = this.cov;
-    const EPS = -1e-7;
+    // top-left fill rule: a sample exactly on an edge shared by two triangles belongs to one of
+    // them only (blended surfaces must not be drawn twice along their triangulation diagonals)
+    const e0 = a0 > 0 || (a0 === 0 && b0 > 0) ? -1e-7 : 1e-7;
+    const e1 = a1 > 0 || (a1 === 0 && b1 > 0) ? -1e-7 : 1e-7;
+    const e2 = a2 > 0 || (a2 === 0 && b2 > 0) ? -1e-7 : 1e-7;
     for (let py = minY; py <= maxY; py++) {
       const cy = py + 0.5;
       const cx0 = minX + 0.5;
@@ -560,7 +699,7 @@ export class Rasterizer {
       let w2 = ((x1 - x0) * (cy - y0) - (y1 - y0) * (cx0 - x0)) * inv;
       let row = py * W + minX;
       for (let px = minX; px <= maxX; px++, row++, w0 += a0, w1 += a1, w2 += a2) {
-        if (w0 < EPS || w1 < EPS || w2 < EPS) continue;
+        if (w0 < e0 || w1 < e1 || w2 < e2) continue;
         const z = w0 * z0 + w1 * z1 + w2 * z2;
         if (z <= depth[row] || z < zMin) continue;
         // perspective-correct weights
@@ -622,15 +761,20 @@ export class Rasterizer {
           pm.eb = pv[po + 8];
           sm = pm;
         }
-        if (blend) {
-          const alpha = mat.alpha * ca;
-          if (blend === 1 ? alpha < mat.threshold : alpha <= BAYER4[((py & 3) << 2) | (px & 3)]) continue;
+        // coverage: alpha clip (binary) or, in the transparent pass, alpha blending
+        let a = 1;
+        if (blend === 1) {
+          if (mat.alpha * ca < mat.threshold) continue;
+        } else if (blend === 2 && this.blendPass) {
+          a = mat.alpha * ca;
+          if (!(a > 1e-4)) continue;
+          if (a > 1) a = 1;
         }
-        depth[row] = z;
+        if (!this.blendPass) depth[row] = z;
         let nx = (l0 * S[oa + 4] + l1 * S[ob + 4] + l2 * S[oc + 4]) * flip;
         let ny = (l0 * S[oa + 5] + l1 * S[ob + 5] + l2 * S[oc + 5]) * flip;
         let nz = (l0 * S[oa + 6] + l1 * S[ob + 6] + l2 * S[oc + 6]) * flip;
-        const nl = 1 / (Math.hypot(nx, ny, nz) || 1);
+        const nl = 1 / (Math.sqrt(nx * nx + ny * ny + nz * nz) || 1);
         nx *= nl;
         ny *= nl;
         nz *= nl;
@@ -692,6 +836,32 @@ export class Rasterizer {
             g += (wc[1] - g) * k;
             b += (wc[2] - b) * k;
           }
+        }
+        if (this.blendPass) {
+          // premultiplied "over": the covered fraction a shows this surface plus, through glass,
+          // what is behind it (transmittance: base colour × (1 − Fresnel) × transmission)
+          let tr = 0;
+          let tg = 0;
+          let tb = 0;
+          const trans = mat.transmission ?? 0;
+          if (trans > 0 && this.mode === SHADE_MATERIAL) {
+            const ior = mat.ior ?? 1.5;
+            const f = (ior - 1) / (ior + 1);
+            const f0 = f * f;
+            const cv = 1 - (this.outNdv > 0 ? this.outNdv : 0);
+            const cv2 = cv * cv;
+            const k = trans * (1 - sm.metallic) * (1 - (f0 + (1 - f0) * cv2 * cv2 * cv));
+            tr = k * Math.min(1, br * cr);
+            tg = k * Math.min(1, bg * cg);
+            tb = k * Math.min(1, bb * cb);
+          }
+          const o3 = row * 3;
+          color[o3] = a * r + color[o3] * (1 - a + a * tr);
+          color[o3 + 1] = a * g + color[o3 + 1] * (1 - a + a * tg);
+          color[o3 + 2] = a * b + color[o3 + 2] * (1 - a + a * tb);
+          const opacity = a * (1 - (0.2126 * tr + 0.7152 * tg + 0.0722 * tb));
+          cov[row] = opacity + cov[row] * (1 - opacity);
+          continue;
         }
         color[row * 3] = r;
         color[row * 3 + 1] = g;
@@ -918,48 +1088,83 @@ export class Rasterizer {
       vx = this.view.eye[0] - px;
       vy = this.view.eye[1] - py;
       vz = this.view.eye[2] - pz;
-      const l = 1 / (Math.hypot(vx, vy, vz) || 1);
+      const l = 1 / (Math.sqrt(vx * vx + vy * vy + vz * vz) || 1);
       vx *= l;
       vy *= l;
       vz *= l;
     }
     const met = m.metallic;
-    const dr = br * (1 - met);
-    const dg = bg * (1 - met);
-    const db = bb * (1 - met);
-    const f0r = 0.04 * (1 - met) + br * met;
-    const f0g = 0.04 * (1 - met) + bg * met;
-    const f0b = 0.04 * (1 - met) + bb * met;
+    // transmission (glass) replaces the diffuse part; the light it lets through is blended in by
+    // the transparent pass
+    const kd = (1 - met) * (1 - (m.transmission ?? 0));
+    const dr = br * kd;
+    const dg = bg * kd;
+    const db = bb * kd;
+    // dielectric reflectance from the IOR (0.04 at the default 1.5)
+    const fi = m.ior !== undefined && m.ior > 0 ? (m.ior - 1) / (m.ior + 1) : 0.2;
+    const fd = fi * fi;
+    const f0r = fd * (1 - met) + br * met;
+    const f0g = fd * (1 - met) + bg * met;
+    const f0b = fd * (1 - met) + bb * met;
     const rough = m.roughness < 0.02 ? 0.02 : m.roughness > 1 ? 1 : m.roughness;
-    const alpha2 = rough * rough * rough * rough;
-    let shin = 2 / alpha2 - 2;
-    if (shin < 1) shin = 1;
-    else if (shin > 4096) shin = 4096;
-    const specK = ((shin + 8) / (8 * Math.PI)) * (1 - rough);
     const amb = this.ambient;
     let r: number;
     let g: number;
     let b: number;
     const sky = this.sky;
+    const ndv = nx * vx + ny * vy + nz * vz;
+    this.outNdv = ndv;
+    // mirror direction
+    const rx = 2 * ndv * nx - vx;
+    const ry = 2 * ndv * ny - vy;
+    const rz = 2 * ndv * nz - vz;
+    const d = this.skyTmp;
     if (sky) {
-      // diffuse: SH irradiance; specular: the sky in the mirror direction, blurred towards the
-      // irradiance with roughness (the sun disc is a separate light)
-      const d = this.skyTmp;
-      const sp = this.skyTmp2;
+      // diffuse: SH irradiance (the sun disc is a separate light)
       evalSkyIrradiance(sky.sh, nx, ny, nz, d);
-      const ndv = nx * vx + ny * vy + nz * vz;
-      sampleSkyModel(sky.model, 2 * ndv * nx - vx, 2 * ndv * ny - vy, 2 * ndv * nz - vz, false, sp);
+      r = sky.scale * d[0] * dr + m.er;
+      g = sky.scale * d[1] * dg + m.eg;
+      b = sky.scale * d[2] * db + m.eb;
+    } else if (this.env) {
+      // studio / image environment: SH irradiance
+      environmentIrradiance(this.env, nx, ny, nz, d);
+      r = d[0] * dr + m.er;
+      g = d[1] * dg + m.eg;
+      b = d[2] * db + m.eb;
+    } else {
+      r = amb[0] * dr + m.er;
+      g = amb[1] * dg + m.eg;
+      b = amb[2] * db + m.eb;
+    }
+    const sp = this.skyTmp2;
+    const probe = this.probe ?? this.env;
+    if (probe) {
+      // the radiance prefiltered for the roughness in the mirror direction (reflection probe: the
+      // lit scene around the camera; else the studio / image) with the split-sum BRDF
+      sampleEnvironmentLighting(probe, rx, ry, rz, rough, sp);
+      const ab = this.brdfTmp;
+      envBRDF(rough, ndv, ab);
+      r += sp[0] * (f0r * ab[0] + ab[1]);
+      g += sp[1] * (f0g * ab[0] + ab[1]);
+      b += sp[2] * (f0b * ab[0] + ab[1]);
+    } else if (sky) {
+      // the sky in the mirror direction, blurred towards the irradiance with roughness
+      sampleSkyModel(sky.model, rx, ry, rz, false, sp);
       const k = sky.scale;
       const t = rough;
-      r = k * (d[0] * dr + (sp[0] + t * (d[0] - sp[0])) * f0r) + m.er;
-      g = k * (d[1] * dg + (sp[1] + t * (d[1] - sp[1])) * f0g) + m.eg;
-      b = k * (d[2] * db + (sp[2] + t * (d[2] - sp[2])) * f0b) + m.eb;
+      r += k * (sp[0] + t * (d[0] - sp[0])) * f0r;
+      g += k * (sp[1] + t * (d[1] - sp[1])) * f0g;
+      b += k * (sp[2] + t * (d[2] - sp[2])) * f0b;
     } else {
-      r = amb[0] * (dr + f0r) + m.er;
-      g = amb[1] * (dg + f0g) + m.eg;
-      b = amb[2] * (db + f0b) + m.eb;
+      r += amb[0] * f0r;
+      g += amb[1] * f0g;
+      b += amb[2] * f0b;
     }
     const L = this.lights;
+    // GGX microfacet specular (the path tracer's principled BSDF): α = roughness², Smith
+    // height-correlated visibility, Schlick Fresnel
+    const alpha = rough * rough;
+    const nv = ndv > 1e-4 ? ndv : 1e-4;
     for (let i = 0; i < this.lightCount; i++) {
       const o = i * LIGHT_STRIDE;
       const kind = L[o];
@@ -967,17 +1172,47 @@ export class Rasterizer {
       let ly: number;
       let lz: number;
       let e: number;
+      // lamp size: the direction of its point closest to the mirror ray (Karis 2013 "representative
+      // point") and the lobe widened by its angular radius, renormalized — large lamps give large,
+      // dimmer highlights in glossy surfaces and metals (as their reflections in the path tracer)
+      let sx: number;
+      let sy: number;
+      let sz: number;
+      let a2 = alpha;
+      // mirror ray outside the lamp's disc: its far GGX tail is that of a point lamp at the centre
+      let outside = false;
       if (kind === LIGHT_SUN) {
         lx = -L[o + 4];
         ly = -L[o + 5];
         lz = -L[o + 6];
         e = 1;
+        sx = lx;
+        sy = ly;
+        sz = lz;
+        a2 = Math.min(1, alpha + SUN_ANGULAR_RADIUS);
       } else {
         lx = L[o + 1] - px;
         ly = L[o + 2] - py;
         lz = L[o + 3] - pz;
         const d2 = lx * lx + ly * ly + lz * lz;
-        const il = 1 / Math.sqrt(d2 || 1e-12);
+        const dist = Math.sqrt(d2 || 1e-12);
+        const rad = 2 * Math.sqrt(L[o + 12]);
+        const t = lx * rx + ly * ry + lz * rz;
+        let qx = t * rx - lx;
+        let qy = t * ry - ly;
+        let qz = t * rz - lz;
+        const ql = Math.sqrt(qx * qx + qy * qy + qz * qz);
+        outside = ql > rad && t > 0;
+        const f = ql > rad ? rad / ql : 1;
+        qx = lx + qx * f;
+        qy = ly + qy * f;
+        qz = lz + qz * f;
+        const sl = 1 / (Math.sqrt(qx * qx + qy * qy + qz * qz) || 1);
+        sx = qx * sl;
+        sy = qy * sl;
+        sz = qz * sl;
+        a2 = Math.min(1, alpha + rad / (2 * dist));
+        const il = 1 / dist;
         lx *= il;
         ly *= il;
         lz *= il;
@@ -1000,19 +1235,59 @@ export class Rasterizer {
       }
       const ndl = nx * lx + ny * ly + nz * lz;
       if (ndl <= 0) continue;
-      let hx = lx + vx;
-      let hy = ly + vy;
-      let hz = lz + vz;
-      const hl = 1 / (Math.hypot(hx, hy, hz) || 1);
-      hx *= hl;
-      hy *= hl;
-      hz *= hl;
-      const ndh = nx * hx + ny * hy + nz * hz;
-      const spec = ndh > 0 ? specK * Math.pow(ndh, shin) : 0;
+      let sr = 0;
+      let sg = 0;
+      let sb = 0;
+      const nds = nx * sx + ny * sy + nz * sz;
+      if (nds > 0) {
+        let hx = sx + vx;
+        let hy = sy + vy;
+        let hz = sz + vz;
+        const hl = 1 / (Math.sqrt(hx * hx + hy * hy + hz * hz) || 1);
+        hx *= hl;
+        hy *= hl;
+        hz *= hl;
+        const ndh = nx * hx + ny * hy + nz * hz;
+        if (ndh > 0) {
+          const aa = alpha * alpha;
+          const den = ndh * ndh * (aa - 1) + 1;
+          // D at the representative point with the lamp-size normalization (α / α')²: the flat,
+          // energy-conserving highlight where the mirror ray hits the lamp; away from it the lobe's
+          // tail towards the lamp centre (as for a point lamp) when that is brighter
+          let D = (aa / (Math.PI * den * den)) * ((alpha / a2) * (alpha / a2));
+          if (outside) {
+            let cx = lx + vx;
+            let cy = ly + vy;
+            let cz = lz + vz;
+            const cl = 1 / (Math.sqrt(cx * cx + cy * cy + cz * cz) || 1);
+            cx *= cl;
+            cy *= cl;
+            cz *= cl;
+            const ndc = nx * cx + ny * cy + nz * cz;
+            if (ndc > 0) {
+              const dc = ndc * ndc * (aa - 1) + 1;
+              const tail = aa / (Math.PI * dc * dc);
+              if (tail > D) D = tail;
+            }
+          }
+          const gv = nds * Math.sqrt(nv * nv * (1 - aa) + aa);
+          const gl = nv * Math.sqrt(nds * nds * (1 - aa) + aa);
+          const V = 0.5 / (gv + gl);
+          const vdh = Math.max(0, vx * hx + vy * hy + vz * hz);
+          const fv = 1 - vdh;
+          const fv2 = fv * fv;
+          const fw = fv2 * fv2 * fv;
+          // per unit irradiance on the surface (× nds / ndl: the lamp's cosine is applied below)
+          const k = (D * V * nds) / ndl;
+          sr = (f0r + (1 - f0r) * fw) * k;
+          sg = (f0g + (1 - f0g) * fw) * k;
+          sb = (f0b + (1 - f0b) * fw) * k;
+        }
+      }
       const k = e * ndl;
-      r += L[o + 7] * k * (dr * INV_PI + f0r * spec);
-      g += L[o + 8] * k * (dg * INV_PI + f0g * spec);
-      b += L[o + 9] * k * (db * INV_PI + f0b * spec);
+      r += L[o + 7] * k * (dr * INV_PI + sr);
+      g += L[o + 8] * k * (dg * INV_PI + sg);
+      b += L[o + 9] * k * (db * INV_PI + sb);
     }
     this.outR = r;
     this.outG = g;

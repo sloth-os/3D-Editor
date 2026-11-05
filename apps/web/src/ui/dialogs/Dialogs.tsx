@@ -467,6 +467,16 @@ function useLiveUpdates(source: { subscribe(fn: () => void): () => void } | null
   }, [source]);
 }
 
+/** Re-renders the calling component every `ms` milliseconds while `active` (a running clock). */
+function useTicker(active: boolean, ms = 250): void {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const h = setInterval(() => setTick((t) => t + 1), ms);
+    return () => clearInterval(h);
+  }, [active, ms]);
+}
+
 /** Calls `onEscape` for the Escape key while mounted (before the dialog and editor keymaps). */
 function useEscape(onEscape: () => boolean): void {
   useEffect(() => {
@@ -562,13 +572,21 @@ const PHASE_TEXT: Record<PathTraceStatus['phase'], string> = {
 /** Blender-style render info line of a path traced render. */
 function pathTraceInfo(job: PathTraceJob, frame: number): string {
   const st = job.status;
-  const parts = [`Frame ${frame}`, `Time ${formatRenderTime(st.elapsedMs)}`];
+  const parts = [`Frame ${frame}`, `Time ${formatRenderTime(job.elapsedMs)}`];
   if (st.phase === 'rendering' || st.phase === 'cancelled' || st.phase === 'done')
     parts.push(st.total ? `Sample ${st.samples}/${st.total}` : `Sample ${st.samples}`);
   if (st.phase === 'finishing') parts.push(job.status.total ? 'Denoising' : 'Finishing');
   if (st.threads) parts.push(`${st.threads} thread${st.threads === 1 ? '' : 's'}`);
   parts.push(`${job.width}×${job.height}`);
   return parts.join(' | ');
+}
+
+/** Progress of the path traced frame of an animation render: its phase or its samples. */
+function frameRenderInfo(job: PathTraceJob): string {
+  const st = job.status;
+  if (st.phase === 'preparing') return 'Preparing scene';
+  if (st.phase === 'finishing') return 'Denoising';
+  return `Sample ${st.samples}/${st.total || '…'}`;
 }
 
 type StillRender =
@@ -623,6 +641,8 @@ function RenderImageDialog() {
   }, [pass]);
   const job = render?.kind === 'path' ? render.job : null;
   useLiveUpdates(job);
+  // the clock keeps running between status changes (e.g. while the workers prepare the scene)
+  useTicker(!!job?.running);
   const onEscape = useCallback(() => {
     if (!job?.running) return false;
     job.cancel();
@@ -734,6 +754,10 @@ function RenderAnimationDialog() {
   useEffect(() => () => void (resultUrl && URL.revokeObjectURL(resultUrl)), [resultUrl]);
   useEffect(() => () => job?.cancel(), [job]);
   useLiveUpdates(job);
+  /** The path traced render of the frame being rendered (its samples and phase change within the frame). */
+  const current = job?.current?.job ?? null;
+  useLiveUpdates(current);
+  useTicker(!!job?.running);
   const onEscape = useCallback(() => {
     if (!job?.running) return false;
     job.cancel();
@@ -782,7 +806,6 @@ function RenderAnimationDialog() {
     j.result.then(setResult, (err: unknown) => setError(err instanceof Error ? err.message : String(err)));
   };
   const st = job?.status;
-  const current = job?.current?.job ?? null;
   return (
     <Modal
       title="Render Animation"
@@ -886,7 +909,12 @@ function RenderAnimationDialog() {
         </div>
       )}
       {error && <div class="error-text">{error}</div>}
-      {(running || (job && !result)) && st && (
+      {!running && !result && st?.phase === 'cancelled' && (
+        <div class="hint" style={{ textAlign: 'center' }} data-testid="render-animation-cancelled">
+          Cancelled before the first frame was finished: nothing to save.
+        </div>
+      )}
+      {running && st && (
         <div class="render-view">
           {current ? (
             <PathTraceCanvas key={current.id} job={current} testId="render-animation-canvas" />
@@ -904,8 +932,8 @@ function RenderAnimationDialog() {
           />
           <div class="hint" style={{ textAlign: 'center' }} data-testid="render-animation-status">
             <b>{st.phase === 'encoding' ? 'Encoding' : 'Rendering'}</b> | Frame {st.frame} (
-            {Math.min(st.index + 1, st.total)}/{st.total}) | Time {formatRenderTime(st.elapsedMs)}
-            {current ? ` | Sample ${current.status.samples}/${current.status.total || '…'}` : ''}
+            {Math.min(st.index + 1, st.total)}/{st.total}) | Time {formatRenderTime(job!.elapsedMs)}
+            {current && st.phase === 'rendering' ? ` | ${frameRenderInfo(current)}` : ''}
           </div>
         </div>
       )}

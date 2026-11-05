@@ -37,10 +37,12 @@ protocol is Yjs sync + awareness (presence) plus JSON RPC and control frames
 * Share a project with *File → Copy Share Link*; opening the link on another device joins the same
   live session (and, with WebDAV, the project also shows up in that device's project list).
 
-`SYNC_PERSISTENCE` controls what the server does with live rooms: `memory` (default without
-WebDAV: rooms live while devices are connected plus `ROOM_IDLE_TTL_SECONDS`; browsers keep their
-own copies), `disk` (`DATA_DIR`, recommended for Docker so MCP-created projects survive restarts),
-or `webdav`.
+`SYNC_PERSISTENCE` controls what the server does with live rooms: `memory` (rooms live while
+devices are connected plus `ROOM_IDLE_TTL_SECONDS`; browsers keep their own copies; lost when the
+server stops), `disk` (`DATA_DIR`, recommended for Docker so MCP-created projects survive restarts),
+or `webdav`. Without it the server uses `webdav` when `WEBDAV_URL` is set, `disk` when `DATA_DIR`
+is set (the Docker image sets it), and `memory` otherwise; the active mode is logged at startup
+and reported by the MCP `get_project` tool.
 
 ## Offline / PWA
 

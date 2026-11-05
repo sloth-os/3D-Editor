@@ -129,6 +129,8 @@ export class SceneEvaluator {
   private curveCounter = 0;
   private overrideTokens = new WeakMap<MeshData, number>();
   private overrideCounter = 0;
+  /** Wire display of modified wire curves, keyed by the evaluated mesh key. */
+  private wireLineCache = new Map<string, { key: string; token: number; lines: Float32Array | null }>();
   readonly rigidBodies = new RigidBodySimulator();
 
   constructor(private readonly doc: SceneDoc) {
@@ -138,7 +140,21 @@ export class SceneEvaluator {
   clearCache(): void {
     this.meshCache.clear();
     this.curveCache.clear();
+    this.wireLineCache.clear();
     this.rigidBodies.reset();
+  }
+
+  /** Segment pairs of the loose edges of an evaluated wire (cached per object and mesh key). */
+  private wireLines(id: string, key: string, mesh: MeshData): { lines: Float32Array; token: number } | null {
+    let e = this.wireLineCache.get(id);
+    if (!e || e.key !== key) {
+      const p = mesh.positions;
+      const segs = new Float32Array(mesh.looseEdges.length * 3);
+      mesh.looseEdges.forEach((v, i) => segs.set([p[v * 3], p[v * 3 + 1], p[v * 3 + 2]], i * 3));
+      e = { key, token: ++this.curveCounter, lines: segs.length ? segs : null };
+      this.wireLineCache.set(id, e);
+    }
+    return e.lines ? { lines: e.lines, token: e.token } : null;
   }
 
   /** Unsimulated world matrices of every object at a frame (no geometry evaluation). */
@@ -293,6 +309,16 @@ export class SceneEvaluator {
           const c = evalCurve(o);
           base = c?.result.mesh ?? null;
           baseToken = `c${c?.token ?? 0}`;
+          // Blender converts a curve without a surface to its wire (vertices + loose edges) for the
+          // modifier stack: SCREW revolves a profile curve, ARRAY repeats it, …
+          if (
+            !base &&
+            c?.result.wire &&
+            o.modifiers.some((m) => isModifierEnabled(m, { forRender, editMode }))
+          ) {
+            base = c.result.wire;
+            baseToken += 'w';
+          }
         }
         if (!base) {
           evaluated.set(id, null);
@@ -388,16 +414,25 @@ export class SceneEvaluator {
       };
       if (o.type === 'MESH' || o.type === 'CURVE' || o.type === 'FONT') {
         const r = evalMesh(o.id);
-        if (r) {
+        const c = o.type !== 'MESH' && o.data ? evalCurve(o) : null;
+        if (r && c && r.base === c.result.wire && r.mesh.faces.length === 0) {
+          // a modified wire curve that is still a wire (ARRAY, MIRROR, deform modifiers …) keeps the
+          // wire display, now of the modified edges
+          const w = this.wireLines(o.id, r.key, r.mesh);
+          if (w) {
+            ev.lines = w.lines;
+            ev.linesKey = `w${w.token}`;
+          }
+          ev.modifierErrors = r.errors;
+        } else if (r) {
           ev.mesh = r.mesh;
           ev.baseMesh = r.base;
           ev.meshKey = r.key;
           ev.modifierErrors = r.errors;
         }
         if (o.type !== 'MESH' && o.data) {
-          const c = evalCurve(o);
           ev.curve = fs.curve(o.data) ?? undefined;
-          if (c?.result.lines) {
+          if (c?.result.lines && !ev.mesh && !ev.lines) {
             ev.lines = c.result.lines;
             ev.linesKey = `c${c.token}`;
           }
@@ -405,7 +440,8 @@ export class SceneEvaluator {
       } else if (o.type === 'LIGHT' && o.data) {
         ev.light = fs.get<LightData>('light', o.data) ?? undefined;
       } else if (o.type === 'CAMERA' && o.data) {
-        ev.camera = fs.get<CameraData>('camera', o.data) ?? undefined;
+        const cam = fs.get<CameraData>('camera', o.data);
+        ev.camera = cam ? withFocusObject(cam, ev.worldMatrix, fs, o.id) : undefined;
       } else if (o.type === 'ARMATURE' && o.data) {
         ev.armature = doc.getArmature(o.data) ?? undefined;
         ev.pose = fs.pose(o.id) ?? undefined;
@@ -415,6 +451,7 @@ export class SceneEvaluator {
     // prune cache entries of deleted objects
     for (const id of this.meshCache.keys()) if (!fs.byId.has(id)) this.meshCache.delete(id);
     for (const id of this.curveCache.keys()) if (!fs.byId.has(id)) this.curveCache.delete(id);
+    for (const id of this.wireLineCache.keys()) if (!fs.byId.has(id)) this.wireLineCache.delete(id);
 
     const byId = new Map(out.map((o) => [o.id, o]));
     let instances: EvaluatedInstance[] = [];
@@ -442,6 +479,36 @@ export class SceneEvaluator {
       errors: fs.errors,
     };
   }
+}
+
+/**
+ * Depth of field with a focus object (Blender BKE_camera_object_dof_distance): the focus distance
+ * becomes the depth of the object's origin along the camera's view axis at this frame.
+ */
+function withFocusObject(
+  cam: CameraData,
+  camWorld: Mat4,
+  fs: FrameState,
+  cameraObjectId: string,
+): CameraData {
+  const focusId = cam.dof_focus_object;
+  if (!focusId) return cam;
+  const target = fs.byId.has(focusId) ? fs.world(focusId) : null;
+  if (!target) {
+    if (cam.dof_use)
+      fs.errors.push({
+        source: `camera:${cameraObjectId}`,
+        message: `depth of field focus object '${focusId}' not found: using dof_focus_distance`,
+      });
+    return cam;
+  }
+  const [zx, zy, zz] = [camWorld[8], camWorld[9], camWorld[10]];
+  const len = Math.hypot(zx, zy, zz) || 1;
+  const depth =
+    Math.abs(
+      zx * (camWorld[12] - target[12]) + zy * (camWorld[13] - target[13]) + zz * (camWorld[14] - target[14]),
+    ) / len;
+  return { ...cam, dof_focus_distance: depth };
 }
 
 /** One-shot evaluation helper (no caching across calls). */

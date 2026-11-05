@@ -141,7 +141,7 @@ describe('bone constraint targets in the scene', () => {
     expect(ev.byId.get(a)!.pose!.errors).toEqual([]);
     expect(distance(boneWorld(ev, a, 'Lower').tail, boneWorld(ev, b, 'Goal').head)).toBeLessThan(1e-4);
     // B moved and posed: the chain follows B's posed bone in world space
-    ok('object.transform_set', { object: 'B', location: [0.5, -0.5, 0] });
+    ok('object.transform_set', { objects: ['B'], location: [0.5, -0.5, 0] });
     ok('pose.bone_transform_set', { object: 'B', bone: 'Goal', location: [0, 0, 0.3] });
     ev = new SceneEvaluator(doc).evaluate(1);
     const goal = boneWorld(ev, b, 'Goal').head;

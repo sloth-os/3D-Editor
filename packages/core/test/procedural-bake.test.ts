@@ -301,16 +301,20 @@ describe('glTF export of procedural materials', () => {
     expect(mr.data[2]).toBe(Math.round(0.3 * 255));
   });
 
-  it('exports without textures (and with warnings) when a mesh has no UVs', () => {
+  it('generates UVs to bake GENERATED textures of a mesh without UVs (and says so)', () => {
+    // phase-3 issue #21: the texture used to be dropped (only a warning in the export result)
     const doc = SceneDoc.create({ empty: true });
     const mat = doc.addMaterial({ name: 'Gen', textures: { base_color: slot(defaultProcedural('NOISE')) } });
     const mesh = doc.addMesh('NoUV', { ...createCube({ size: 2 }), uvs: null });
     doc.addObject({ type: 'MESH', name: 'NoUV', data: mesh, material_slots: [mat] });
     const res = exportScene(doc, 'gltf', {});
-    expect((res.warnings ?? []).join('\n')).toMatch(/needs a UV-mapped mesh/);
+    const text = (res.warnings ?? []).join('\n');
+    expect(text).not.toMatch(/needs a UV-mapped mesh/);
+    expect(text).toMatch(/generated UVs/);
     const json = JSON.parse(new TextDecoder().decode(res.data));
-    expect(json.images).toBeUndefined();
-    expect(json.materials[0].pbrMetallicRoughness.baseColorTexture).toBeUndefined();
+    expect(json.images).toHaveLength(1);
+    expect(json.materials[0].pbrMetallicRoughness.baseColorTexture).toEqual({ index: 0 });
+    expect(Object.keys(json.meshes[0].primitives[0].attributes)).toContain('TEXCOORD_0');
   });
 });
 

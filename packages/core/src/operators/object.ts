@@ -2,8 +2,10 @@ import { z } from 'zod';
 import type { Mat4, Vec3 } from '../math/types';
 import { compose4, invert4, multiply4 } from '../math/mat4';
 import { transformPoint3 } from '../math/vec3';
-import type { EmptyDisplayType, LightType, ObjectData, ObjectType } from '../doc/types';
+import type { EmptyDisplayType, LightData, LightType, ObjectData, ObjectType } from '../doc/types';
 import { ROOT_COLLECTION_ID } from '../doc/types';
+import { defaultCamera, defaultLight } from '../doc/defaults';
+import { cameraFields, cameraPatch, LIGHT_TYPES, lightFields, lightPatch } from './light-camera';
 import type { MeshData } from '../mesh/types';
 import { appendMesh, cloneMesh, createMesh, edgeKey, meshBounds, vertexCount } from '../mesh/types';
 import { createPrimitive, type PrimitiveType } from '../mesh/primitives';
@@ -283,25 +285,28 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.camera_add',
       label: 'Camera',
-      description: 'Add a camera object. Becomes the scene camera if none is set.',
+      description:
+        'Add a camera object (looking down its local -Z axis; becomes the scene camera if none is set). Optional ' +
+        'camera settings as in camera.properties_set: lens or angle, sensor, clipping, ortho_scale, shift and depth ' +
+        'of field (dof_use, dof_focus_distance or dof_focus_object, dof_aperture_fstop). Returns {object, name, camera}.',
       category: 'Add',
       redoable: true,
       schema: z.object({
-        lens: z.number().positive().default(50),
-        type: z.enum(['PERSP', 'ORTHO']).default('PERSP'),
+        type: z.enum(['PERSP', 'ORTHO']).default('PERSP').describe('Projection: PERSP or ORTHO'),
+        ...cameraFields,
         ...placement,
       }),
       poll: pollObjectMode,
       execute(ctx, p) {
-        const data = ctx.doc.addCamera({ name: p.name ?? 'Camera', lens: p.lens, type: p.type });
-        const id = addObjectAndSelect(ctx, {
-          type: 'CAMERA',
-          name: p.name ?? 'Camera',
-          data,
-          ...placeObject(ctx, p),
-        });
+        const name = p.name ?? 'Camera';
+        const { location: _l, rotation: _r, scale: _s, name: _n, enter_editmode: _e, ...fields } = p;
+        // unset fields keep Blender's defaults (lens 50 mm, …)
+        const { patch, warnings } = cameraPatch(ctx.doc, [], defaultCamera('', name), fields);
+        const data = ctx.doc.addCamera({ ...patch, name });
+        const id = addObjectAndSelect(ctx, { type: 'CAMERA', name, data, ...placeObject(ctx, p) });
+        for (const w of warnings) ctx.report('WARNING', w);
         if (!ctx.doc.getScene().camera) ctx.doc.updateScene({ camera: id });
-        return { object: id };
+        return { object: id, name: ctx.doc.getObject(id)?.name, camera: data };
       },
     }),
   );
@@ -310,32 +315,47 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.light_add',
       label: 'Light',
-      description: 'Add a light object (POINT, SUN, SPOT or AREA). energy is in watts (W/m² for sun).',
+      description:
+        'Add a light object (POINT, SUN, SPOT or AREA; spot and area lights shine down their local -Z axis). energy is ' +
+        'in watts (W/m² for SUN). radius sizes the light like Blender’s Add > Light: AREA size = size_y = radius, ' +
+        'POINT/SPOT shadow_soft_size = 0.25 × radius. Every light setting of light.properties_set can be given ' +
+        'directly (shadow_soft_size, spot_size, spot_blend, shape, size, size_y, angle, use_shadow) and wins over ' +
+        'radius. Returns {object, name, light}.',
       category: 'Add',
       redoable: true,
       schema: z.object({
-        type: z.enum(['POINT', 'SUN', 'SPOT', 'AREA']).default('POINT'),
-        energy: z.number().min(0).optional(),
-        color: vec3.optional(),
-        radius: z.number().min(0).default(1),
+        type: z.enum(LIGHT_TYPES).default('POINT').describe('Light type'),
+        radius: z
+          .number()
+          .min(0)
+          .default(1)
+          .describe(
+            'Blender’s add-light size (default 1): AREA lights get size = size_y = radius (meters), POINT and SPOT ' +
+              'lights shadow_soft_size = 0.25 × radius; SUN lights ignore it. Explicit size/size_y/shadow_soft_size win',
+          ),
+        ...lightFields,
+        use_shadow: z.boolean().default(true).describe('Whether the light casts shadows'),
         ...placement,
       }),
       poll: pollObjectMode,
       execute(ctx, p) {
-        const label = p.type.charAt(0) + p.type.slice(1).toLowerCase();
-        const data = ctx.doc.addLight({
-          name: p.name ?? label,
-          type: p.type as LightType,
-          ...(p.energy !== undefined ? { energy: p.energy } : {}),
-          ...(p.color ? { color: p.color as Vec3 } : {}),
-        });
-        const id = addObjectAndSelect(ctx, {
-          type: 'LIGHT',
-          name: p.name ?? label,
-          data,
-          ...placeObject(ctx, p),
-        });
-        return { object: id };
+        const type = p.type as LightType;
+        const label = type.charAt(0) + type.slice(1).toLowerCase();
+        const name = p.name ?? label;
+        const { location: _l, rotation: _r, scale: _s, name: _n, enter_editmode: _e, radius, ...fields } = p;
+        // Blender (object_light_add_exec + BKE_object_obdata_size_init): the radius scales the light radius
+        // and, ×4, the 0.25 m default area size
+        const sized: Partial<LightData> =
+          type === 'AREA'
+            ? { size: radius, size_y: radius }
+            : type === 'SUN'
+              ? {}
+              : { shadow_soft_size: 0.25 * radius };
+        const { patch, warnings } = lightPatch(defaultLight('', name, type), fields);
+        const data = ctx.doc.addLight({ ...sized, ...patch, type, name });
+        const id = addObjectAndSelect(ctx, { type: 'LIGHT', name, data, ...placeObject(ctx, p) });
+        for (const w of warnings) ctx.report('WARNING', w);
+        return { object: id, name: ctx.doc.getObject(id)?.name, light: data };
       },
     }),
   );
@@ -1051,13 +1071,28 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.rename',
       label: 'Rename',
-      description: 'Rename an object (names are kept unique, Blender style).',
+      description:
+        'Rename an object (names are kept unique, Blender style: a taken name gets a .001 suffix). Returns the ' +
+        'name it got.',
       category: 'Object',
-      schema: z.object({ object: z.string().optional(), name: z.string().min(1) }),
+      schema: z.object({
+        object: z.string().optional().describe('Object id or name (default: the active object)'),
+        name: z.string().min(1).describe('New name'),
+      }),
       execute(ctx, p) {
-        const id = p.object ? ctx.doc.resolveObject(p.object)?.id : ctx.state.activeId;
-        if (!id) throw new OperatorError('No object to rename', 'NOT_FOUND');
-        return { name: ctx.doc.rename('objects', id, p.name) };
+        if (p.object) {
+          const o = ctx.doc.resolveObject(p.object);
+          if (!o) throw new OperatorError(`Object '${p.object}' not found`, 'NOT_FOUND');
+          return { object: o.id, old_name: o.name, name: ctx.doc.rename('objects', o.id, p.name) };
+        }
+        const active = ctx.state.activeId ? ctx.doc.getObject(ctx.state.activeId) : null;
+        if (!active)
+          throw new OperatorError('No active object to rename: pass `object` (id or name)', 'POLL_FAILED');
+        return {
+          object: active.id,
+          old_name: active.name,
+          name: ctx.doc.rename('objects', active.id, p.name),
+        };
       },
     }),
   );

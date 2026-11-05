@@ -7,7 +7,22 @@ import type { MeshData } from '../mesh/types';
 import { meshBounds } from '../mesh/types';
 import { proceduralSurface } from '../material/surface';
 import { evaluatedOrco } from '../material/orco';
-import { prepareSky, sampleSkyPixel, skyIrradianceSH, skySun, type SkyModel } from './sky';
+import {
+  prepareSky,
+  sampleSkyModel,
+  sampleSkyPixel,
+  skyIrradianceSH,
+  skySun,
+  type SkyModel,
+} from './sky';
+import {
+  environmentLighting,
+  probeLighting,
+  sampleEnvironmentLighting,
+  type EnvironmentLighting,
+  type ProbeFace,
+} from './env-light';
+import type { RenderBuffers } from '../mesh/render-buffers';
 import { SceneEvaluator, type EvaluatedScene } from '../eval/evaluate';
 import { evaluatedBounds } from '../io/common';
 import { renderItems, type RenderItem } from '../eval/renderables';
@@ -44,15 +59,21 @@ import { renderPathTracedImage, viewCameraData, type PathTraceProgress } from '.
  *
  * Lighting follows Blender's units: point/spot lights emit W/(4π) W/sr with inverse-square
  * falloff (a 1000 W light 5 m away gives ≈3.2 W/m², i.e. a normally lit surface), sun strength is
- * irradiance in W/m², area lights are approximated by one-sided point emitters. The world color ×
- * strength is a uniform ambient term. Without lights a camera-relative studio rig is used.
- * A procedural sky (world environment SKY) replaces it: spherical-harmonic sky irradiance plus sky
- * reflections, its sun as a directional light, and the sky as background (when
- * `show_environment_background`); world mist fogs surfaces (1 − exp(−(density·depth)²)).
+ * irradiance in W/m², area lights are approximated by one-sided point emitters. The world
+ * environment lights the scene like in the path tracer: STUDIO (the procedural photo studio) and
+ * IMAGE (an equirectangular PNG) as image-based lighting — irradiance plus reflections prefiltered
+ * by roughness (env-light.ts), so metals reflect the studio —, × strength × environment_strength;
+ * NONE as a uniform ambient of the world color × strength (plus a camera-relative studio rig when
+ * there are no lamps either). A procedural sky (environment SKY) gives spherical-harmonic sky
+ * irradiance plus sky reflections and its sun as a directional light. With
+ * `show_environment_background` the studio, image or sky is the background; world mist fogs
+ * surfaces (1 − exp(−(density·depth)²)).
  * Procedural texture slots are evaluated per sample (bump via neighbour-pixel differences).
  * PNG base color textures are sampled (other image formats fall back to the color factor).
- * Output is linear → sRGB (plus the scene exposure); transparency is approximated with ordered
- * dithering (smoothed by supersampling). No shadows.
+ * Output is linear → sRGB (plus the scene exposure). Transparent surfaces (blend_method BLEND,
+ * transmission) are drawn after the opaque ones, sorted back to front and blended per sample
+ * (glass lets the scene behind it through, tinted, with its reflections on top; no refraction).
+ * No shadows.
  */
 
 export { decodePNG } from './png';
@@ -205,14 +226,12 @@ function surfaceFromMaterial(
   const tex = textures && slot && !slot.procedural ? textures.get(slot.image) : null;
   const transmission = Math.min(1, Math.max(0, m.transmission ?? 0));
   const matAlpha = procedural?.alpha ? 1 : (m.alpha ?? 1);
-  const alpha = Math.min(1, Math.max(0, (m.base_color[3] ?? 1) * matAlpha)) * (1 - 0.8 * transmission);
+  const alpha = Math.min(1, Math.max(0, (m.base_color[3] ?? 1) * matAlpha));
   const varying = !!(procedural?.alpha || procedural?.base_color);
+  // OPAQUE ignores alpha (like the path tracer and Eevee); BLEND blends smoothly in the sorted
+  // transparent pass, where glass (transmission) also lets the background through
   const blend =
-    m.blend_method === 'CLIP'
-      ? 1
-      : (m.blend_method === 'BLEND' || transmission > 0) && (alpha < 1 || varying)
-        ? 2
-        : 0;
+    m.blend_method === 'CLIP' ? 1 : m.blend_method === 'BLEND' && (alpha < 1 || varying) ? 2 : 0;
   const es = Math.max(0, m.emission_strength ?? 0);
   return {
     r: Math.max(0, m.base_color[0]),
@@ -233,6 +252,8 @@ function surfaceFromMaterial(
     texOffset: tex && slot?.offset ? [slot.offset[0], slot.offset[1]] : [0, 0],
     procedural,
     emissionStrength: es,
+    transmission,
+    ior: Number.isFinite(m.ior) ? Math.max(1, m.ior) : 1.5,
   };
 }
 
@@ -263,11 +284,15 @@ export function resolveView(
   return viewFromSpec(autoFrameView(bounds, aspect), aspect, bounds);
 }
 
-/** Packs scene lights (or a camera-relative studio rig when there are none) for the shader. */
+/**
+ * Packs scene lights for the shader; without lamps and without environment lighting (`envLit`:
+ * a sky, studio or image world) a camera-relative studio rig.
+ */
 function buildLights(
   scene: EvaluatedScene,
   view: RenderView,
   skyLight: number[] | null = null,
+  envLit = false,
 ): { data: Float64Array; count: number; studio: boolean } {
   const out: number[] = [];
   // a procedural sky lights the scene itself (its sun, when up): no studio rig
@@ -306,7 +331,7 @@ function buildLights(
       radius * radius * 0.25,
     );
   }
-  if (out.length || skyLight)
+  if (out.length || skyLight || envLit)
     return { data: new Float64Array(out), count: out.length / LIGHT_STRIDE, studio: false };
   // studio rig: key, fill and rim suns fixed relative to the camera (view-space directions → world)
   const rig: [number, number, number, number][] = [
@@ -373,13 +398,30 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
   const ws = Math.max(0, world.strength ?? 1);
   // procedural sky (environment SKY): radiance × strength × environment_strength, like the path tracer
   const sky = !solid && world.environment === 'SKY' ? skySetup(world, ws) : null;
-  if (!solid) {
-    const lights = buildLights(scene, view, sky?.sunLight ?? null);
-    r.lights = lights.data;
-    r.lightCount = lights.count;
+  const textures = new TextureCache(doc);
+  // studio / image world (like the path tracer): image-based lighting instead of the flat ambient
+  const env =
+    !solid && (world.environment === 'STUDIO' || world.environment === 'IMAGE')
+      ? environmentLighting(
+          world,
+          world.environment === 'IMAGE' ? textures.get(world.environment_image ?? undefined) : null,
+        )
+      : null;
+  const lights = solid ? null : buildLights(scene, view, sky?.sunLight ?? null, !!env);
+  /** World lighting of a rasterizer (the main view and the reflection probe faces). */
+  const light = (ras: Rasterizer) => {
+    if (!lights) return;
+    ras.lights = lights.data;
+    ras.lightCount = lights.count;
     const boost = lights.studio ? 0.03 : 0;
-    r.ambient = [world.color[0] * ws + boost, world.color[1] * ws + boost, world.color[2] * ws + boost];
-    if (sky) r.sky = { sh: sky.sh, model: sky.model, scale: sky.scale };
+    ras.ambient = env
+      ? [0, 0, 0]
+      : [world.color[0] * ws + boost, world.color[1] * ws + boost, world.color[2] * ws + boost];
+    if (sky) ras.sky = { sh: sky.sh, model: sky.model, scale: sky.scale };
+    else if (env) ras.env = env;
+  };
+  light(r);
+  if (!solid) {
     const mist = world.mist_density;
     if (typeof mist === 'number' && mist > 0 && Number.isFinite(mist)) {
       r.mistDensity = mist;
@@ -400,9 +442,9 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       : Math.hypot(m[12] - e[0], m[13] - e[1], m[14] - e[2]);
   };
   meshes.sort((a, b) => dist(a) - dist(b));
-  const textures = new TextureCache(doc);
+  // materials and GENERATED texture spaces once per item (shared by the probe faces and the view)
   const texSpaces = new Map<MeshData, Bounds | null>();
-  for (const o of meshes) {
+  const draws = meshes.map((o) => {
     const mesh = o.mesh!;
     const hasColors = !!mesh.colors && mesh.colors.length === (mesh.positions.length / 3) * 4;
     let mats: SurfaceMaterial[];
@@ -420,6 +462,7 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       mats = o.materials.map((m) => surfaceFromMaterial(m, hasColors, textures));
       fallback = surfaceFromMaterial(null, hasColors);
     }
+    let texSpace: { min: Vec3; max: Vec3; orco: ArrayLike<number> | null } | null = null;
     if (mats.some((m) => m.procedural)) {
       // GENERATED texture space: bounds of the base (pre-modifier) mesh; coordinates from the
       // undeformed positions (orco) so textures stick to deformed surfaces
@@ -427,11 +470,40 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       const orco = mats.some((m) => m.procedural?.usesGenerated)
         ? evaluatedOrco(doc, scene, o.object, true)
         : null;
-      r.drawMesh(mesh, o.worldMatrix, mats, fallback, ts && { min: ts.min, max: ts.max, orco });
-      continue;
+      if (ts) texSpace = { min: ts.min, max: ts.max, orco };
     }
-    r.drawMesh(mesh, o.worldMatrix, mats, fallback);
+    return { o, mesh, mats, fallback, texSpace };
+  });
+  const buffers = new Map<MeshData, RenderBuffers>();
+  const drawAll = (ras: Rasterizer) => {
+    ras.bufferCache = buffers;
+    for (const d of draws) {
+      if (d.texSpace) ras.drawMesh(d.mesh, d.o.worldMatrix, d.mats, d.fallback, d.texSpace);
+      else ras.drawMesh(d.mesh, d.o.worldMatrix, d.mats, d.fallback);
+    }
+    // alpha-blended and glass surfaces last, back to front
+    ras.flushTransparent();
+  };
+  // reflections of the lit scene in metals and glossy surfaces: a probe rendered in front of
+  // what the camera looks at
+  const probeAt =
+    !solid && draws.some((d) => d.mats.some(reflective)) ? probePosition(view, bounds, drawAll) : null;
+  if (probeAt) {
+    r.probe = reflectionProbe(probeAt, bounds, light, drawAll, (x, y, z, out) => {
+      if (sky) {
+        sampleSkyModel(sky.model, x, y, z, false, out);
+        out[0] *= sky.scale;
+        out[1] *= sky.scale;
+        out[2] *= sky.scale;
+      } else if (env) sampleEnvironmentLighting(env, x, y, z, 0, out);
+      else {
+        out[0] = world.color[0] * ws;
+        out[1] = world.color[1] * ws;
+        out[2] = world.color[2] * ws;
+      }
+    });
   }
+  drawAll(r);
 
   // ---------------------------------------------------------------- resolve (box filter, sRGB)
   const exposure = Math.pow(2, scene.render.exposure ?? 0);
@@ -446,10 +518,13 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
     ];
   } else
     bg = [world.color[0] * ws * exposure, world.color[1] * ws * exposure, world.color[2] * ws * exposure, 1];
-  // the procedural sky as background, per pixel along the camera ray
+  // the procedural sky / studio / image as background, per pixel along the camera ray
   const skyBg =
-    sky && !opts.background && world.show_environment_background ? pixelRays(view, width, height) : null;
+    (sky || env) && !opts.background && world.show_environment_background
+      ? pixelRays(view, width, height)
+      : null;
   const skyPx = [0, 0, 0];
+  const envPx = new Float64Array(3);
   const out = new Uint8ClampedArray(width * height * 4);
   const inv = 1 / (k * k);
   const color = r.color;
@@ -477,6 +552,12 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
         bg[0] = skyPx[0] * f;
         bg[1] = skyPx[1] * f;
         bg[2] = skyPx[2] * f;
+      } else if (skyBg && env && cv < 1) {
+        const d = skyBg.dir(x, y);
+        sampleEnvironmentLighting(env, d[0], d[1], d[2], 0, envPx);
+        bg[0] = envPx[0] * exposure;
+        bg[1] = envPx[1] * exposure;
+        bg[2] = envPx[2] * exposure;
       }
       const rest = (1 - cv) * bg[3];
       const a = cv + rest;
@@ -495,6 +576,119 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
 
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** Whether a surface shows noticeable reflections of its surroundings (metallic or glossy). */
+function reflective(m: SurfaceMaterial): boolean {
+  return m.metallic > 0.05 || m.roughness < 0.3 || !!m.procedural?.metallic || !!m.procedural?.roughness;
+}
+
+/** Size (pixels) of a reflection probe cube face. */
+const PROBE_FACE = 32;
+/** Cube faces of the reflection probe: viewing direction and image up. */
+const PROBE_DIRS: [Vec3, Vec3][] = [
+  [
+    [1, 0, 0],
+    [0, 0, 1],
+  ],
+  [
+    [-1, 0, 0],
+    [0, 0, 1],
+  ],
+  [
+    [0, 1, 0],
+    [0, 0, 1],
+  ],
+  [
+    [0, -1, 0],
+    [0, 0, 1],
+  ],
+  [
+    [0, 0, 1],
+    [0, 1, 0],
+  ],
+  [
+    [0, 0, -1],
+    [0, 1, 0],
+  ],
+];
+
+/** Size (pixels, width) of the depth pre-pass that places the reflection probe. */
+const PROBE_PREPASS = 48;
+
+/**
+ * Where the reflection probe goes: on the line of sight through the image centre, a tenth of the
+ * way from the first surface it meets back towards the camera (the median depth of the central
+ * pixels of a small pre-render), so the probe sees the surroundings much like the objects the
+ * camera looks at; the centre of the scene bounds when the centre of the image shows no geometry.
+ * Null without geometry.
+ */
+function probePosition(view: RenderView, bounds: Bounds | null, draw: (r: Rasterizer) => void): Vec3 | null {
+  if (!bounds) return null;
+  const aspect = Math.abs(view.proj[5] / (view.proj[0] || 1)) || 1;
+  const w = PROBE_PREPASS;
+  const h = Math.max(4, Math.min(256, Math.round(w / aspect)));
+  const pre = new Rasterizer(w, h, view);
+  pre.mode = SHADE_SOLID;
+  draw(pre);
+  const depths: number[] = [];
+  const cx = w >> 1;
+  const cy = h >> 1;
+  for (let y = cy - 2; y <= cy + 2; y++)
+    for (let x = cx - 2; x <= cx + 2; x++) if (pre.cov[y * w + x] > 0) depths.push(pre.depth[y * w + x]);
+  if (!depths.length)
+    return [
+      (bounds.min[0] + bounds.max[0]) / 2,
+      (bounds.min[1] + bounds.max[1]) / 2,
+      (bounds.min[2] + bounds.max[2]) / 2,
+    ];
+  depths.sort((a, b) => a - b);
+  const key = depths[depths.length >> 1];
+  // depth keys: 1/w (perspective), 1 − z_ndc (orthographic)
+  const n = view.near;
+  const f = view.far;
+  const dist = view.ortho ? ((1 - key) * (f - n) + f + n) / 2 : 1 / key;
+  const t = dist * 0.9;
+  return [view.eye[0] + view.forward[0] * t, view.eye[1] + view.forward[1] * t, view.eye[2] + view.forward[2] * t];
+}
+
+/**
+ * A reflection probe at `at`: the scene rendered with its direct lighting into the six faces of a
+ * small cube map (`light` sets up a rasterizer's lighting, `draw` draws every item; back faces are
+ * culled, so a probe on or in an object sees past it), resampled and prefiltered by roughness
+ * (env-light.ts). Directions without geometry see the world (`background`). Reflections then show
+ * the lit floor, walls and objects around — what a metal or glossy surface mostly reflects in the
+ * path tracer — instead of only the world.
+ */
+function reflectionProbe(
+  at: Vec3,
+  bounds: Bounds | null,
+  light: (r: Rasterizer) => void,
+  draw: (r: Rasterizer) => void,
+  background: (x: number, y: number, z: number, out: Float64Array) => void,
+): EnvironmentLighting {
+  const eye = at;
+  const faces: ProbeFace[] = PROBE_DIRS.map(([dir, up]) => {
+    const fv = viewFromSpec(
+      { position: eye, target: [eye[0] + dir[0], eye[1] + dir[1], eye[2] + dir[2]], up, fovY: Math.PI / 2 },
+      1,
+      bounds,
+    );
+    const ras = new Rasterizer(PROBE_FACE, PROBE_FACE, fv);
+    ras.mode = SHADE_MATERIAL;
+    ras.cullBackFaces = true;
+    light(ras);
+    draw(ras);
+    return {
+      size: PROBE_FACE,
+      color: ras.color,
+      cov: ras.cov,
+      right: fv.right,
+      up: fv.up,
+      forward: fv.forward,
+    };
+  });
+  return probeLighting(faces, background);
 }
 
 /** Procedural sky of a SKY world: model, diffuse SH, scale and its sun as a packed SUN light. */

@@ -30,12 +30,102 @@ export interface AgentDeps {
   log: Log;
 }
 
+/** Characters allowed in agent ids (`x-mcp-agent-id` header / `agent` query parameter). */
+const AGENT_ID_RE = /^[\w.:@/+-]{1,128}$/;
+
+/** A valid agent id, or null (undefined/empty), or throws a ToolError for malformed ids. */
+export function parseAgentId(raw: unknown): string | null {
+  const v = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof v !== 'string' || !v.trim()) return null;
+  const id = v.trim();
+  if (!AGENT_ID_RE.test(id))
+    throw new ToolError(
+      'agent id must be 1-128 characters: letters, digits and . _ : @ / + - (x-mcp-agent-id header or ?agent= query parameter)',
+    );
+  return id;
+}
+
+/** What an agent keeps per project: its editor state and its undo history. */
+interface ProjectMemory {
+  room: Room;
+  state: EditorState;
+  undo: Y.UndoManager;
+}
+
 /**
- * The agent's view of one project: its own editor state (selection, mode, frame), a Y.UndoManager
- * tracking only the agent's changes, and its presence in the room's awareness.
+ * Who makes an agent's changes: the transaction origin, and per project the undo history and the
+ * editor state (selection, mode, frame). An MCP session without an agent id has an identity of
+ * its own, gone with the session. Sessions that send the same agent id (`x-mcp-agent-id` header
+ * or `?agent=` on the endpoint URL; scripts/mcp.mjs does) share one identity that outlives them:
+ * one-shot CLI calls (one session each) can then undo / redo each other's changes and keep the
+ * selection, like one long session.
+ */
+export class AgentIdentity {
+  /** Transaction origin of every change made under this identity. */
+  readonly origin: { type: 'mcp'; session: string; agent?: string };
+  private readonly memories = new Map<string, ProjectMemory>();
+  /** Live MCP sessions using this identity. */
+  sessions = 0;
+  lastUsed = Date.now();
+
+  /** `agentId` null: an anonymous identity of one session (`key` is the session id). */
+  constructor(
+    readonly key: string,
+    readonly agentId: string | null,
+  ) {
+    this.origin = agentId ? { type: 'mcp', session: key, agent: agentId } : { type: 'mcp', session: key };
+  }
+
+  /** The editor state and undo history in a project (new ones when the project was reloaded). */
+  memory(room: Room): ProjectMemory {
+    this.lastUsed = Date.now();
+    let m = this.memories.get(room.id);
+    if (m && (m.room !== room || room.destroyed)) {
+      // the project was unloaded (or deleted) since: its old document is gone, so is the history
+      m.undo.destroy();
+      m = undefined;
+    }
+    if (!m) {
+      m = {
+        room,
+        state: createEditorState(),
+        undo: new Y.UndoManager(room.scene.sharedTypes(), {
+          trackedOrigins: new Set([this.origin]),
+          captureTimeout: 0,
+        }),
+      };
+      this.memories.set(room.id, m);
+    }
+    return m;
+  }
+
+  forget(projectId: string): void {
+    this.memories.get(projectId)?.undo.destroy();
+    this.memories.delete(projectId);
+  }
+
+  /** Drops memories of projects that were unloaded (their documents are gone). */
+  prune(): void {
+    for (const [id, m] of this.memories)
+      if (m.room.destroyed) {
+        m.undo.destroy();
+        this.memories.delete(id);
+      }
+  }
+
+  dispose(): void {
+    for (const m of this.memories.values()) m.undo.destroy();
+    this.memories.clear();
+  }
+}
+
+/**
+ * The agent's view of one project in one MCP session: the identity's editor state (selection,
+ * mode, frame) and Y.UndoManager (tracking only the agent's changes), and the session's presence
+ * in the room's awareness.
  */
 export class AgentProject {
-  readonly state: EditorState = createEditorState();
+  readonly state: EditorState;
   readonly undo: Y.UndoManager;
   readonly presenceId = randomClientId();
   private lastPresence = '';
@@ -46,10 +136,9 @@ export class AgentProject {
     private readonly session: AgentSession,
     private readonly deps: AgentDeps,
   ) {
-    this.undo = new Y.UndoManager(room.scene.sharedTypes(), {
-      trackedOrigins: new Set([session.origin]),
-      captureTimeout: 0,
-    });
+    const memory = session.identity.memory(room);
+    this.state = memory.state;
+    this.undo = memory.undo;
     room.holders.add(session.id);
     this.publishPresence();
   }
@@ -129,9 +218,9 @@ export class AgentProject {
     };
   }
 
-  /** Publishes the agent's presence (only when it changed). */
+  /** Publishes the agent's presence (only when it changed; not while the session is away). */
   publishPresence(force = false): void {
-    if (!this.alive) return;
+    if (!this.alive || this.session.away) return;
     const state = this.presenceState();
     const key = JSON.stringify(state);
     if (!force && key === this.lastPresence) return;
@@ -139,10 +228,17 @@ export class AgentProject {
     this.room.setAgentPresence(this.presenceId, state);
   }
 
+  /** Removes the presence (the session went quiet); the next publish shows it again. */
+  hidePresence(): void {
+    if (!this.alive || !this.lastPresence) return;
+    this.lastPresence = '';
+    this.room.setAgentPresence(this.presenceId, null);
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.undo.destroy();
+    // the undo history and editor state belong to the identity (they may outlive the session)
     this.room.holders.delete(this.session.id);
     if (!this.room.destroyed) {
       this.room.setAgentPresence(this.presenceId, null);
@@ -151,23 +247,49 @@ export class AgentProject {
   }
 }
 
-/** Per-MCP-session state: one {@link AgentProject} per project the agent touched. */
+/**
+ * Per-MCP-session state: one {@link AgentProject} per project the agent touched, on top of the
+ * agent's {@link AgentIdentity} (its own, or one shared by sessions with the same agent id).
+ */
 export class AgentSession {
-  /** Transaction origin of every change made by this agent. */
-  readonly origin: { type: 'mcp'; session: string };
   clientName = 'MCP client';
+  readonly identity: AgentIdentity;
+  /** The session sent no request for a while: its presence is hidden until the next one. */
+  away = false;
   private readonly projects = new Map<string, AgentProject>();
   private disposed = false;
 
   constructor(
     readonly id: string,
     private readonly deps: AgentDeps,
+    identity?: AgentIdentity,
   ) {
-    this.origin = { type: 'mcp', session: id };
+    this.identity = identity ?? new AgentIdentity(id, null);
+    this.identity.sessions++;
+  }
+
+  /** Transaction origin of every change made by this agent (the identity's). */
+  get origin(): AgentIdentity['origin'] {
+    return this.identity.origin;
+  }
+
+  /** The agent id sessions share (null: this session has its own history). */
+  get agentId(): string | null {
+    return this.identity.agentId;
   }
 
   get displayName(): string {
     return `AI agent (${this.clientName})`;
+  }
+
+  /** Hides the presence of a quiet session (`away`) or shows it again. */
+  setAway(away: boolean): void {
+    if (this.away === away || this.disposed) return;
+    this.away = away;
+    for (const p of this.held()) {
+      if (away) p.hidePresence();
+      else p.publishPresence(true);
+    }
   }
 
   setClientName(name: string | undefined): void {
@@ -225,9 +347,11 @@ export class AgentSession {
     return [...this.projects.values()].filter((p) => p.alive);
   }
 
+  /** Lets go of a project (deleted): its presence, undo history and editor state. */
   forget(projectId: string): void {
     this.projects.get(projectId)?.dispose();
     this.projects.delete(projectId);
+    this.identity.forget(projectId);
   }
 
   dispose(): void {
@@ -235,5 +359,9 @@ export class AgentSession {
     this.disposed = true;
     for (const p of this.projects.values()) p.dispose();
     this.projects.clear();
+    this.identity.sessions--;
+    this.identity.lastUsed = Date.now();
+    // an anonymous identity ends with its session; shared ones are kept by the hub
+    if (!this.identity.agentId) this.identity.dispose();
   }
 }

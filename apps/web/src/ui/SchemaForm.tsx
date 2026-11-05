@@ -9,7 +9,7 @@ import {
   VectorField,
   RAD,
 } from './fields/fields';
-import type { SceneDoc } from '@3d-editor/core';
+import type { ObjectData, SceneDoc } from '@3d-editor/core';
 import { session } from '../app/store';
 
 /** Minimal JSON-schema shape produced by zod's toJSONSchema for operator/modifier params. */
@@ -155,6 +155,11 @@ export function SchemaForm(p: {
   expandEnums?: string[];
   /** Display label of an enum value (default: the humanized identifier). */
   enumLabel?: (key: string, value: string) => string | undefined;
+  /**
+   * Whether an object picker lists `object` for the parameter `key` (default: every object of a
+   * fitting type), e.g. to leave out objects the operator would reject for it.
+   */
+  objectFilter?: (key: string, object: ObjectData) => boolean;
 }) {
   const schema = p.schema as JsonSchema;
   const objectKeys = new Set([...OBJECT_REF_KEYS, ...(p.objectKeys ?? [])]);
@@ -215,7 +220,9 @@ export function SchemaForm(p: {
         }
         if (objectKeys.has(key) && p.doc && type === 'string') {
           const types = OBJECT_REF_TYPES[key];
-          const objs = p.doc.listObjects().filter((o) => !types || types.includes(o.type));
+          const objs = p.doc
+            .listObjects()
+            .filter((o) => (!types || types.includes(o.type)) && (p.objectFilter?.(key, o) ?? true));
           const stored = typeof value === 'string' ? value : '';
           // operators accept object ids or names: a name shows as its object
           const match = objs.find((o) => o.id === stored) ?? objs.find((o) => o.name === stored);

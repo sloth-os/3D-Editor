@@ -141,6 +141,11 @@ export class AnimationJob {
     return this.status.phase === 'rendering' || this.status.phase === 'encoding';
   }
 
+  /** Milliseconds since the render started: live while it runs, the final time afterwards. */
+  get elapsedMs(): number {
+    return this.running ? now() - this.t0 : this.status.elapsedMs;
+  }
+
   /** Stops after the frames finished so far (the frame being rendered is dropped). */
   cancel(): void {
     if (!this.running || this.cancelled) return;

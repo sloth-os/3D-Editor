@@ -68,12 +68,12 @@ describe('modifier operators', () => {
     expect(mods()).toHaveLength(0);
   });
 
-  it('only accepts mesh objects', () => {
+  it('only accepts mesh, curve and text objects', () => {
     const { run, ctx, mods } = setup();
     run('object.camera_add', {});
     const r = run('object.modifier_add', { type: 'SUBSURF' });
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/only mesh objects/);
+    expect(r.error).toMatch(/only mesh, curve and text objects/);
     // explicit object (by name) works regardless of the active object
     expect(run('object.modifier_add', { type: 'SUBSURF', object: 'Cube' }).ok).toBe(true);
     expect(mods()).toHaveLength(1);

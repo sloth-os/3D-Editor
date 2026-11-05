@@ -26,15 +26,20 @@ const modifierRef = z.string().describe('Modifier id or name');
 /** Types whose modifiers start disabled in edit mode (like Blender). */
 const EDITMODE_OFF = new Set(['BOOLEAN', 'BUILD', 'DECIMATE']);
 
+/**
+ * The object whose modifier stack an operator edits: mesh objects, and (like Blender) curve and text
+ * objects, whose modifiers act on the generated geometry (the surface, or the wire of a curve
+ * without one).
+ */
 function targetObject(ctx: OperatorContext, ref: string | undefined): ObjectData {
   const o = ref ? ctx.doc.resolveObject(ref) : activeObject(ctx);
   if (!o) {
     if (ref) throw new OperatorError(`Object '${ref}' not found`, 'NOT_FOUND');
     throw new OperatorError('No active object (pass `object`)', 'POLL_FAILED');
   }
-  if (o.type !== 'MESH' || !o.data) {
+  if (!['MESH', 'CURVE', 'FONT'].includes(o.type) || !o.data) {
     throw new OperatorError(
-      `Object '${o.name}' is a ${o.type} object; only mesh objects can have modifiers`,
+      `Object '${o.name}' is a ${o.type} object; only mesh, curve and text objects can have modifiers`,
       'POLL_FAILED',
     );
   }
@@ -142,7 +147,9 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
       id: 'object.modifier_add',
       label: 'Add Modifier',
       description:
-        "Add a modifier to the end of a mesh object's modifier stack (default: active object). `type` is a Blender " +
+        'Add a modifier to the end of the modifier stack of a mesh, curve or text object (default: active object; ' +
+        'on curves and text it acts on the generated surface, or on the wire of a curve without one, so SCREW ' +
+        'revolves a profile curve). `type` is a Blender ' +
         `modifier type (${typeList}); optional initial \`params\` are validated against the type's parameters. ` +
         'Returns the new modifier id and its unique name (e.g. "Subdivision", "Subdivision.001").',
       category: 'Object',
@@ -186,7 +193,7 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.modifier_remove',
       label: 'Remove Modifier',
-      description: "Remove a modifier (id or name) from a mesh object's stack (default: active object).",
+      description: "Remove a modifier (id or name) from an object's stack (default: active object).",
       category: 'Object',
       schema: z.object({ modifier: modifierRef, object: objectRef }),
       execute(ctx, p) {
@@ -215,6 +222,12 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
       schema: z.object({ modifier: modifierRef, object: objectRef }),
       execute(ctx, p) {
         const o = targetObject(ctx, p.object);
+        if (o.type !== 'MESH')
+          throw new OperatorError(
+            `Modifiers of the ${o.type === 'FONT' ? 'text' : 'curve'} object '${o.name}' cannot be applied one by ` +
+              'one: convert it with object.convert {target: "MESH"}, which bakes the whole modifier stack into a mesh',
+            'POLL_FAILED',
+          );
         if (ctx.state.mode === 'EDIT' && ctx.state.activeId === o.id) {
           throw new OperatorError('Modifiers cannot be applied in Edit Mode', 'POLL_FAILED');
         }

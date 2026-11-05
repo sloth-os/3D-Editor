@@ -80,8 +80,6 @@ export interface ModifierChange {
   modifier: ModifierData | null;
   /** How the change was made. */
   via: 'operator' | 'document' | 'operator+document';
-  /** Parameter keys not known to the modifier type (ignored). */
-  ignored?: string[];
 }
 
 const SETTINGS_KEYS = ['params', 'settings', 'values', 'properties'];
@@ -95,11 +93,57 @@ export function modifierTypes(): { type: string; label: string; category: string
     .sort((a, b) => a.type.localeCompare(b.type));
 }
 
-/** JSON schema of a modifier type's parameters (for error messages). */
-export function modifierParamsSchema(type: string): unknown {
+/**
+ * JSON schema of a modifier type's parameters (types, enums, ranges, defaults and descriptions;
+ * without the `$schema` URL), or null for unknown types.
+ */
+export function modifierParamsSchema(type: string): Record<string, unknown> | null {
   registerBuiltinModifiers();
   const def = getModifierDef(type);
-  return def ? safeJsonSchema(def.schema) : null;
+  if (!def) return null;
+  const { $schema: _url, ...schema } = safeJsonSchema(def.schema) as Record<string, unknown>;
+  return schema;
+}
+
+/** The modifier type of an identifier or label ('SUBSURF', 'subsurf', 'Subdivision Surface'), or null. */
+export function findModifierType(type: string): string | null {
+  registerBuiltinModifiers();
+  const t = type.trim();
+  const lower = t.toLowerCase();
+  const def =
+    getModifierDef(t) ??
+    getModifierDef(t.toUpperCase()) ??
+    listModifierDefs().find((d) => d.label.toLowerCase() === lower);
+  return def?.type ?? null;
+}
+
+function editDistance(a: string, b: string): number {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
+/** The known parameter closest to a misspelled one, or null. */
+function closest(name: string, known: readonly string[]): string | null {
+  const n = name.toLowerCase();
+  let best: string | null = null;
+  let score = Infinity;
+  for (const k of known) {
+    const d = k.includes(n) || n.includes(k) ? 1 : editDistance(n, k);
+    if (d < score) {
+      score = d;
+      best = k;
+    }
+  }
+  return best && score <= Math.max(2, Math.floor(n.length / 3)) ? best : null;
 }
 
 export function findModifier(o: ObjectData, ref: string): ModifierData | null {
@@ -163,22 +207,36 @@ function buildParams(
   return out;
 }
 
-/** Validates a parameter patch against the modifier type; returns merged params and ignored keys. */
+/**
+ * Validates a parameter patch against the modifier type and returns the merged params. Unknown
+ * parameter names and invalid values are rejected with the type's JSON schema (names, types,
+ * enums, ranges, defaults), so the caller can correct the call.
+ */
 function mergeParams(mod: Pick<ModifierData, 'type' | 'params'>, params: Record<string, unknown> = {}) {
   registerBuiltinModifiers();
   const def = getModifierDef(mod.type);
   const merged = { ...mod.params, ...params };
-  if (!def) return { params: merged, ignored: [] as string[] };
-  const known = new Set(Object.keys((def.schema as { shape?: Record<string, unknown> }).shape ?? {}));
-  const ignored = Object.keys(params).filter((k) => known.size > 0 && !known.has(k));
+  if (!def) return { params: merged };
+  const known = Object.keys((def.schema as { shape?: Record<string, unknown> }).shape ?? {});
+  const unknown = known.length ? Object.keys(params).filter((k) => !known.includes(k)) : [];
+  const schema = () =>
+    `${mod.type} parameters (JSON schema): ${JSON.stringify(modifierParamsSchema(mod.type))}`;
+  if (unknown.length) {
+    const hints = unknown
+      .map((k) => [k, closest(k, known)] as const)
+      .filter(([, c]) => c)
+      .map(([k, c]) => `'${k}' → '${c}'?`);
+    throw new ToolError(
+      `Unknown parameter${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => `'${k}'`).join(', ')} for the ${mod.type} modifier` +
+        `${hints.length ? ` (did you mean ${hints.join(', ')})` : ''}. Valid parameters: ${known.join(', ')}. ${schema()}`,
+    );
+  }
   const res = def.schema.safeParse(merged);
   if (!res.success) {
     const msg = res.error.issues.map((i) => `${i.path.join('.') || 'params'}: ${i.message}`).join('; ');
-    throw new ToolError(
-      `Invalid parameters for ${mod.type} modifier: ${msg}. Schema: ${JSON.stringify(safeJsonSchema(def.schema))}`,
-    );
+    throw new ToolError(`Invalid parameters for the ${mod.type} modifier: ${msg}. ${schema()}`);
   }
-  return { params: res.data as Record<string, unknown>, ignored };
+  return { params: res.data as Record<string, unknown> };
 }
 
 function sameValue(a: unknown, b: unknown): boolean {
@@ -186,19 +244,14 @@ function sameValue(a: unknown, b: unknown): boolean {
 }
 
 /** Applies a patch with direct document edits (fallback / completing operator results). */
-function patchDirect(p: AgentProject, objectId: string, modId: string, patch: ModifierPatch): string[] {
-  let ignored: string[] = [];
+function patchDirect(p: AgentProject, objectId: string, modId: string, patch: ModifierPatch): void {
   p.transact(() => {
     const o = p.scene.getObject(objectId);
     if (!o) throw new ToolError('object disappeared');
     const mods = o.modifiers.map((m) => {
       if (m.id !== modId) return m;
       const next: ModifierData = { ...m };
-      if (patch.params) {
-        const merged = mergeParams(m, patch.params);
-        next.params = merged.params;
-        ignored = merged.ignored;
-      }
+      if (patch.params) next.params = mergeParams(m, patch.params).params;
       for (const k of FLAG_KEYS) if (patch[k] !== undefined) next[k] = patch[k]!;
       if (patch.name !== undefined && patch.name !== m.name) {
         next.name = uniqueName(
@@ -210,7 +263,6 @@ function patchDirect(p: AgentProject, objectId: string, modId: string, patch: Mo
     });
     p.scene.updateObject(objectId, { modifiers: mods });
   });
-  return ignored;
 }
 
 /** Whether the modifier already reflects the patch. */
@@ -229,16 +281,15 @@ export function addModifier(
   opts: { name?: string; params?: Record<string, unknown> } = {},
 ): ModifierChange {
   registerBuiltinModifiers();
-  const lower = type.toLowerCase();
-  const def =
-    getModifierDef(type) ??
-    getModifierDef(type.toUpperCase()) ??
-    listModifierDefs().find((d) => d.label.toLowerCase() === lower);
+  const found = findModifierType(type);
+  const def = found ? getModifierDef(found) : undefined;
   if (!def) {
     const types = modifierTypes()
       .map((t) => t.type)
       .join(', ');
-    throw new ToolError(`Unknown modifier type '${type}'. Available types: ${types || '(none registered)'}.`);
+    throw new ToolError(
+      `Unknown modifier type '${type}'. Available types: ${types || '(none registered)'} (list_modifier_types describes them with their parameters).`,
+    );
   }
   if (!MODIFIER_OBJECT_TYPES.includes(object.type))
     throw new ToolError(
@@ -283,13 +334,12 @@ export function addModifier(
       added = mod;
     }
     const patch: ModifierPatch = { name: opts.name, params: opts.params };
-    let ignored: string[] = [];
     if (!satisfies(added, patch)) {
-      ignored = patchDirect(p, object.id, added.id, patch);
+      patchDirect(p, object.id, added.id, patch);
       if (via === 'operator') via = 'operator+document';
-    } else if (opts.params) ignored = mergeParams(added, opts.params).ignored;
+    }
     const final = p.scene.getObject(object.id)?.modifiers.find((m) => m.id === added!.id) ?? added;
-    return { modifier: final, via, ...(ignored.length ? { ignored } : {}) };
+    return { modifier: final, via };
   });
 }
 
@@ -316,13 +366,12 @@ export function updateModifier(
     }
     let current = p.scene.getObject(object.id)?.modifiers.find((m) => m.id === mod.id) ?? null;
     if (!current) throw new ToolError(`Modifier '${mod.name}' disappeared while updating it.`);
-    let ignored: string[] = [];
     if (!satisfies(current, patch)) {
-      ignored = patchDirect(p, object.id, mod.id, patch);
+      patchDirect(p, object.id, mod.id, patch);
       via = via === 'operator' ? 'operator+document' : 'document';
       current = p.scene.getObject(object.id)?.modifiers.find((m) => m.id === mod.id) ?? current;
-    } else if (patch.params) ignored = mergeParams(current, patch.params).ignored;
-    return { modifier: current, via, ...(ignored.length ? { ignored } : {}) };
+    }
+    return { modifier: current, via };
   });
 }
 

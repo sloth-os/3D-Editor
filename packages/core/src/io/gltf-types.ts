@@ -103,6 +103,16 @@ export interface GltfLight {
   spot?: { innerConeAngle?: number; outerConeAngle?: number };
 }
 
+export interface GltfSkin {
+  name?: string;
+  /** Accessor of MAT4 inverse bind matrices, one per joint. */
+  inverseBindMatrices?: number;
+  /** Common root of the joint hierarchy. */
+  skeleton?: number;
+  joints: number[];
+  extras?: unknown;
+}
+
 export interface GltfAnimation {
   name?: string;
   channels: { sampler: number; target: { node?: number; path: string; extensions?: GltfExtensions } }[];
@@ -124,7 +134,7 @@ export interface GltfRoot {
   bufferViews?: GltfBufferView[];
   buffers?: { uri?: string; byteLength: number; name?: string }[];
   animations?: GltfAnimation[];
-  skins?: unknown[];
+  skins?: GltfSkin[];
   extensionsUsed?: string[];
   extensionsRequired?: string[];
   extensions?: GltfExtensions;

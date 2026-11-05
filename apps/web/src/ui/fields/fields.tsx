@@ -59,6 +59,9 @@ export function NumberField(p: NumberFieldProps) {
   const fromD = p.fromDisplay ?? ((v: number) => v);
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState('');
+  // whether the text entry is still open: Enter and Escape close it, so the blur that browsers fire
+  // when they remove the focused input does not commit (or cancel into a commit) a second time
+  const entryOpen = useRef(false);
   const drag = useRef<{ x: number; start: number; moved: boolean; id: number } | null>(null);
   const precision = p.precision ?? (p.integer ? 0 : 3);
   const step = p.step ?? (p.integer ? 1 : 0.01);
@@ -100,9 +103,12 @@ export function NumberField(p: NumberFieldProps) {
     } else {
       setText(unset ? '' : fmt(display, Math.max(precision, 4)));
       setEditing(true);
+      entryOpen.current = true;
     }
   };
   const commit = () => {
+    if (!entryOpen.current) return;
+    entryOpen.current = false;
     const v = evalExpression(text);
     setEditing(false);
     if (v !== null) p.onChange(clamp(fromD(v)), true);
@@ -128,7 +134,10 @@ export function NumberField(p: NumberFieldProps) {
           onInput={(e) => setText((e.target as HTMLInputElement).value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter') commit();
-            if (e.key === 'Escape') setEditing(false);
+            if (e.key === 'Escape') {
+              entryOpen.current = false;
+              setEditing(false);
+            }
             e.stopPropagation();
           }}
           onBlur={commit}
@@ -354,9 +363,16 @@ export function TextField(p: {
   ariaLabel?: string;
 }) {
   const [v, setV] = useState(p.value);
+  /**
+   * The text committed last: a blur right after Enter (e.g. when the commit renamed what the field
+   * shows and the field is removed while focused) must not commit it again with stale props.
+   */
+  const committed = useRef<string | null>(null);
   useEffect(() => setV(p.value), [p.value]);
   const commit = () => {
-    if (v !== p.value) p.onChange(v);
+    if (v === p.value || v === committed.current) return;
+    committed.current = v;
+    p.onChange(v);
   };
   return (
     <input
@@ -369,6 +385,7 @@ export function TextField(p: {
       aria-label={p.ariaLabel}
       data-testid={p.testId}
       onInput={(e) => {
+        committed.current = null;
         setV((e.target as HTMLInputElement).value);
         if (p.commitOnBlur === false) p.onChange((e.target as HTMLInputElement).value);
       }}

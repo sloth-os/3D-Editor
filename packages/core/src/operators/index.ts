@@ -18,6 +18,7 @@ import { registerGenerateOperators } from './generate';
 import { registerSceneToolsOperators } from './scene-tools';
 import { registerPhysicsOperators } from './physics';
 import { registerDriverOperators } from './driver';
+import { registerLightCameraOperators } from './light-camera';
 
 export * from './context';
 export * from './registry';
@@ -35,6 +36,7 @@ export function createOperatorRegistry(): OperatorRegistry {
   registerMaterialOperators(reg);
   registerViewOperators(reg);
   registerDataOperators(reg);
+  registerLightCameraOperators(reg);
   registerMeshEditOperators(reg);
   registerModifierOperators(reg);
   registerIOOperators(reg);

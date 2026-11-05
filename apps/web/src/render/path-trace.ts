@@ -147,6 +147,14 @@ export class PathTraceJob {
   }
 
   /**
+   * Milliseconds since the render started: live while it runs (`status.elapsedMs` only changes
+   * with the status, e.g. not while the scene is being prepared), the final time afterwards.
+   */
+  get elapsedMs(): number {
+    return this.running ? now() - this.t0 : this.status.elapsedMs;
+  }
+
+  /**
    * Stops sampling: the result keeps the samples rendered so far (not denoised), like cancelling
    * a render in Blender.
    */

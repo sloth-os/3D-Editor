@@ -14,7 +14,8 @@ import { DocumentSnapshot, resetThreadDocument } from '../src/render/pool';
 import { RenderWorkerEngine, handleWorkerMessage, referencedImages } from '../src/render/worker-engine';
 import { bandRows, nextPassSize, passSamples, planPass, MAX_BAND_ROWS } from '../src/render/schedule';
 import { filmRowsToRGBA8 } from '../src/render/preview';
-import { renderViewFromMatrices } from '../src/render/view';
+import { renderViewFromCamera, renderViewFromMatrices, viewportCamera } from '../src/render/view';
+import * as THREE from 'three';
 import type { PreparedInfo, WorkerRequest, WorkerResponse } from '../src/render/protocol';
 
 const pools: RenderPool[] = [];
@@ -222,6 +223,27 @@ describe('parallel path tracing', () => {
     expect(r.samples).toBeLessThan(1 << 16);
   });
 
+  it('denoises renders that stop at one sample per pixel (e.g. time-limited animation frames)', async () => {
+    // the film's variance estimate reaches the worker that denoises: at 1 spp it comes from the
+    // neighbourhood (a pixel's own estimate is 0, which left time-limited frames as raw speckle)
+    const doc = SceneDoc.create();
+    const W = 64;
+    const H = 40;
+    const speckle = (d: Uint8ClampedArray) => {
+      let s = 0;
+      for (let y = 0; y < H; y++)
+        for (let x = 0; x + 1 < W; x++)
+          for (let k = 0; k < 3; k++) s += Math.abs(d[(y * W + x) * 4 + k] - d[(y * W + x + 1) * 4 + k]);
+      return s / (W * H * 3);
+    };
+    const render = (denoise: boolean) =>
+      startPathTrace(pool(2), doc, { width: W, height: H, frame: 1, samples: 1, denoise }).result;
+    const raw = await render(false);
+    const denoised = await render(true);
+    expect([raw.samples, denoised.samples, denoised.denoised]).toEqual([1, 1, true]);
+    expect(speckle(denoised.data)).toBeLessThan(speckle(raw.data) * 0.5);
+  });
+
   it('carries on when a worker fails, and fails when every worker does', async () => {
     const doc = scene();
     const reference = renderSceneSoftware(doc, { width: 24, height: 16, engine: 'PATHTRACER', samples: 3 });
@@ -283,6 +305,43 @@ describe('parallel path tracing', () => {
     expect(clean(v.up)).toEqual([0, 0, 1]);
     expect(clean(v.right)).toEqual([1, 0, 0]);
     expect(v.viewProj).toHaveLength(16);
+  });
+
+  it('renders the viewport view orthographic when the viewport is (without cutting the scene off)', async () => {
+    // regression: viewport renders and captures were always perspective, and an orthographic
+    // viewport camera (negative near plane) started the path tracer's rays behind the scene
+    const doc = scene();
+    const top = { target: new THREE.Vector3(0, 0, 0), distance: 17, yaw: 0, pitch: Math.PI / 2, fovY: 0.69 };
+    const persp = viewportCamera({ ...top, ortho: false }, 1.5);
+    expect(persp).toBeInstanceOf(THREE.PerspectiveCamera);
+    const ortho = viewportCamera({ ...top, ortho: true }, 1.5);
+    expect(ortho).toBeInstanceOf(THREE.OrthographicCamera);
+    // the raster camera keeps the viewport's clipping range around the view point
+    expect(ortho.near).toBeLessThan(0);
+    const traced = viewportCamera({ ...top, ortho: true }, 1.5, true) as THREE.OrthographicCamera;
+    expect(traced.near).toBe(0);
+    // same picture: the view point (17 m above the target) and the target project to the centre
+    for (const p of [new THREE.Vector3(0, 0, 17), new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -50)]) {
+      const a = p.clone().project(ortho);
+      const b = p.clone().project(traced);
+      expect(b.x).toBeCloseTo(a.x, 9);
+      expect(b.y).toBeCloseTo(a.y, 9);
+      expect(b.z).toBeGreaterThanOrEqual(-1);
+      expect(b.z).toBeLessThanOrEqual(1);
+    }
+    const view = renderViewFromCamera(traced);
+    expect(view.ortho).toBe(true);
+    // the default cube (2 m) fills the centre of a top view (pixels of 0.76 m); corners show the world
+    const r = await startPathTrace(pool(1), doc, { width: 24, height: 16, frame: 1, samples: 1, view })
+      .result;
+    const px = (x: number, y: number) => [...r.data.subarray((y * 24 + x) * 4, (y * 24 + x) * 4 + 3)];
+    const background = px(0, 0);
+    expect(px(23, 15)).toEqual(background);
+    for (const [x, y] of [
+      [11, 7],
+      [12, 8],
+    ])
+      expect(px(x, y)).not.toEqual(background);
   });
 
   it('converts film rows for the progressive preview', () => {

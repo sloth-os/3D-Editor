@@ -21,7 +21,9 @@ export async function makeTempDir(prefix = '3d-editor-test-'): Promise<string> {
 
 /**
  * Starts the app on an ephemeral port with a temporary DATA_DIR. Defaults: silent logs, no PWA
- * (API only), 50 ms persistence debounce. `env` overrides any variable.
+ * (API only), 50 ms persistence debounce, projects in memory unless SYNC_PERSISTENCE or
+ * WEBDAV_URL is given (pass SYNC_PERSISTENCE: '' for the server default, which persists to the
+ * DATA_DIR). `env` overrides any variable.
  */
 export async function startServer(
   env: Record<string, string> = {},
@@ -32,6 +34,8 @@ export async function startServer(
     LOG_LEVEL: 'silent',
     PERSIST_DEBOUNCE_MS: '50',
     PUBLIC_DIR: path.join(dataDir, '__no_public__'),
+    // the temporary DATA_DIR alone would select disk persistence
+    ...(env.SYNC_PERSISTENCE === undefined && !env.WEBDAV_URL ? { SYNC_PERSISTENCE: 'memory' } : {}),
     ...env,
     DATA_DIR: dataDir,
   });

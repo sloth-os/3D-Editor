@@ -117,16 +117,29 @@ export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
   },
   {
     name: 'Modifiers',
-    description: 'Modifier stacks (mesh, curve and text objects)',
+    description:
+      'Modifier stacks (mesh, curve and text objects): use the add_modifier / update_modifier / remove_modifier / apply_modifier tools; list_modifier_types gives the parameters of every modifier type',
+    tools: ['list_modifier_types', 'add_modifier', 'update_modifier', 'remove_modifier', 'apply_modifier'],
     match: prefix('object.modifier_'),
+  },
+  {
+    name: 'Lights and Cameras',
+    aliases: ['Lights', 'Cameras', 'Lighting'],
+    description:
+      'Light and camera objects and their data: light.properties_set (energy, colour, area light shape / size / size_y, spot cone, shadow softness), camera.properties_set (lens, clipping, orthographic scale, depth of field), aiming with object.track_set',
+    tools: ['add_object', 'set_active_camera'],
+    match: any(prefix('light.', 'camera.'), ids('object.light_add', 'object.camera_add', 'object.track_set')),
   },
   {
     name: 'Rendering',
     aliases: ['Render'],
     description:
-      'Render with the render_image (stills: RASTER previews, PATHTRACER finals) and render_animation (contact sheets, GIF, APNG, PNG sequences) tools; render settings with set_scene_settings. These operators set up what renders show: cameras, tracking, sky and mist',
+      'Render with the render_image (stills: RASTER previews, PATHTRACER finals) and render_animation (contact sheets, GIF, APNG, PNG sequences) tools; render settings with set_scene_settings. These operators set up what renders show: cameras (lens, depth of field: camera.properties_set), lights (energy, area light shape and size: light.properties_set), tracking, sky and mist',
     tools: ['render_image', 'render_animation', 'set_scene_settings', 'set_active_camera'],
-    match: any(prefix('world.'), ids('object.camera_add', 'object.track_set')),
+    match: any(
+      prefix('world.', 'light.', 'camera.'),
+      ids('object.camera_add', 'object.light_add', 'object.track_set'),
+    ),
   },
 ];
 

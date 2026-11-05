@@ -37,14 +37,21 @@ claude mcp add --transport http 3d-editor http://localhost:8080/mcp --header "Au
   `object.modifier_add`, `mesh.extrude_region_move`, `transform.rotate`…). `list_operators`
   returns every operator with its JSON schema; `run_operator` runs any of them.
 * Each tool call is one undo step in the agent's own undo history (`undo` / `redo` never revert
-  human edits).
+  human edits). The history (with the agent's selection, mode and frame) belongs to the MCP
+  session; clients that open a new session per call share one history by sending the same agent
+  id with every connection: header `x-mcp-agent-id: <id>` or `?agent=<id>` on the endpoint URL.
+  `scripts/mcp.mjs` does this (`MCP_AGENT_ID`, by default one id per user and working directory)
+  and ends its sessions with an HTTP `DELETE`, so no "AI agent" presence is left behind.
+* `get_scene` / `get_object` report the values at the requested frame (keyframes, drivers,
+  constraints applied) and list the stored document values next to them where animation
+  overrides them (`stored`, `stored_value`, `stored_influence`).
 
 ## Tools (overview)
 
 | Area | Tools |
 | --- | --- |
 | Projects | `list_projects`, `create_project`, `get_project`, `rename_project`, `delete_project` |
-| Inspect | `get_scene`, `get_object`, `list_operators`, `get_connected_clients` |
+| Inspect | `get_scene`, `get_object`, `get_mesh_data` (vertex positions, faces, face materials, normals, UVs, vertex groups, heightmap; paged), `list_operators`, `list_modifier_types`, `get_connected_clients` |
 | Objects | `add_object`, `transform_object`, `delete_objects`, `duplicate_object`, `set_parent`, `create_mesh` |
 | Modeling | `edit_mesh` (any `mesh.*` operator with an explicit vertex/edge/face selection), `run_operator`, `batch` |
 | Look | `set_material`, `add_modifier`, `update_modifier`, `remove_modifier`, `apply_modifier`, `set_scene_settings`, `set_active_camera` |

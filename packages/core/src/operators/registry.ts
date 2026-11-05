@@ -2,6 +2,16 @@ import { z } from 'zod';
 import type { OperatorContext, OperatorSource, ReportLevel } from './context';
 import { OperatorError } from './context';
 import { Emitter } from '../util/emitter';
+import {
+  closeJsonSchemaObjects,
+  describeUnknownParams,
+  findUnknownParams,
+  schemaParamNames,
+  unknownParamHints,
+} from './params-check';
+
+export { schemaParamNames, suggestNames, findUnknownParams } from './params-check';
+export type { UnknownParam } from './params-check';
 
 /**
  * Operators are the single entry point for every user-facing action (like Blender's
@@ -53,6 +63,11 @@ export interface RunResult<T = unknown> {
   ok: boolean;
   result?: T;
   error?: string;
+  /**
+   * Failure kind when the operator failed with an OperatorError: INVALID_PARAMS (e.g. unknown or
+   * misspelled parameter names), POLL_FAILED (wrong mode/selection), NOT_FOUND or FAILED.
+   */
+  code?: OperatorError['code'];
   reports: { level: ReportLevel; message: string }[];
   durationMs: number;
   params: unknown;
@@ -102,16 +117,31 @@ export class OperatorRegistry {
     return [...this.ops.values()].sort((a, b) => a.id.localeCompare(b.id));
   }
 
-  /** Parses params, applying defaults. Throws OperatorError('INVALID_PARAMS'). */
+  /**
+   * Parses params, applying defaults. Throws OperatorError('INVALID_PARAMS') for invalid values and
+   * for parameter names the schema does not declare (also inside nested parameter objects), with
+   * did-you-mean suggestions and the valid names: a misspelled key must never fall back to the
+   * default silently. Keys whose value is `undefined` count as not given.
+   */
   parseParams(id: string, params: unknown): unknown {
     const def = this.ops.get(id);
     if (!def) throw new OperatorError(`Unknown operator '${id}'`, 'NOT_FOUND');
-    const res = def.schema.safeParse(params ?? {});
-    if (!res.success) {
-      const msg = res.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ');
-      throw new OperatorError(`Invalid parameters for ${id}: ${msg}`, 'INVALID_PARAMS');
-    }
+    const input = params ?? {};
+    const problems: string[] = [];
+    const unknown = findUnknownParams(def.schema, input);
+    if (unknown.length) problems.push(describeUnknownParams(unknown), ...unknownParamHints(unknown));
+    const res = def.schema.safeParse(input);
+    if (!res.success)
+      problems.push(res.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; '));
+    if (problems.length)
+      throw new OperatorError(`Invalid parameters for ${id}: ${problems.join('. ')}`, 'INVALID_PARAMS');
     return res.data;
+  }
+
+  /** Top-level parameter names of an operator (null when unknown or when it accepts any key). */
+  paramNames(id: string): string[] | null {
+    const def = this.ops.get(id);
+    return def ? schemaParamNames(def.schema) : null;
   }
 
   /** Checks availability: true or a reason string. */
@@ -143,6 +173,7 @@ export class OperatorRegistry {
       },
     };
     let parsed: unknown = params;
+    let code: OperatorError['code'] | undefined;
     const finish = (ok: boolean, result?: unknown, error?: string): RunResult<T> => {
       const durationMs = now() - t0;
       this.onRun.emit({
@@ -158,7 +189,15 @@ export class OperatorRegistry {
         startedAt,
         mode: ctx.state.mode,
       });
-      return { ok, result: result as T, error, reports, durationMs, params: parsed };
+      return {
+        ok,
+        result: result as T,
+        error,
+        ...(code ? { code } : {}),
+        reports,
+        durationMs,
+        params: parsed,
+      };
     };
     try {
       parsed = this.parseParams(id, params);
@@ -177,6 +216,7 @@ export class OperatorRegistry {
       return finish(true, result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof OperatorError) code = err.code;
       wrapped.report('ERROR', message);
       return finish(false, undefined, message);
     }
@@ -198,9 +238,13 @@ export class OperatorRegistry {
   }
 }
 
+/**
+ * JSON schema of an operator's (or modifier's) parameters, as accepted on input. Object schemas are
+ * closed (`additionalProperties: false`): the registry rejects undeclared keys.
+ */
 export function safeJsonSchema(schema: z.ZodType): unknown {
   try {
-    return z.toJSONSchema(schema, { unrepresentable: 'any', io: 'input' });
+    return closeJsonSchemaObjects(z.toJSONSchema(schema, { unrepresentable: 'any', io: 'input' }));
   } catch {
     return { type: 'object' };
   }

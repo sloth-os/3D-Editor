@@ -267,6 +267,8 @@ class MainThread implements RenderThread {
         return this.engine.apngFinish(req.job);
       case 'auto-view':
         return this.engine.autoView(req.doc, req.frames, req.aspect, req.camera, req.budgetMs);
+      case 'simulate':
+        return this.engine.simulate(req.doc, req.frames);
       case 'ping':
         return { ok: true };
     }
@@ -390,7 +392,7 @@ export class RenderPool {
   private dispatch(): void {
     for (let round = 0; round < 2 && !this.closed; round++) {
       let longBlocked = false;
-      for (let i = 0; i < this.waiters.length; ) {
+      for (let i = 0; i < this.waiters.length;) {
         const w = this.waiters[i];
         let threads: RenderThread[] | null = null;
         if (w.interactive) threads = this.pickInteractive();

@@ -12,11 +12,40 @@ import { Panel } from '../fields/fields';
 import { SchemaForm } from '../SchemaForm';
 import { Icon } from '../icons';
 import { run } from '../../editor/editor';
-import { PREVIEW_ORIGIN } from './prop-edit';
+import { captureField, dragEdit, isRecord, withField } from './ObjectTab';
 import type { MenuItem } from '../../editor/menus';
 
-let dragOriginal: { key: string; modifiers: ModifierData[] } | null = null;
+/** The stored modifier of an object (null when it is gone). */
+function storedModifier(s: ProjectSession, objectId: string, modifierId: string): ModifierData | null {
+  const list = s.doc.getObject(objectId)?.modifiers;
+  return (Array.isArray(list) ? list : []).find((m) => isRecord(m) && m.id === modifierId) ?? null;
+}
 
+/**
+ * Sets one parameter of a modifier in the current document state (live drag previews and their
+ * restore; undefined removes it): the other modifiers and the other values of this one, including
+ * changes other devices or MCP agents make meanwhile, are kept as stored.
+ */
+function writeParam(
+  s: ProjectSession,
+  objectId: string,
+  modifierId: string,
+  key: string,
+  value: unknown,
+): void {
+  const list = s.doc.getObject(objectId)?.modifiers;
+  if (!Array.isArray(list) || !storedModifier(s, objectId, modifierId)) return;
+  s.doc.updateObject(objectId, {
+    modifiers: list.map((m) =>
+      isRecord(m) && m.id === modifierId ? { ...m, params: withField(m.params, key, value) } : m,
+    ),
+  });
+}
+
+/**
+ * Changes a modifier parameter from the panel: drags preview live and commit once through
+ * object.modifier_set (one undo step); the release restores only the dragged parameter.
+ */
 function setParam(
   s: ProjectSession,
   o: ObjectData,
@@ -25,20 +54,17 @@ function setParam(
   value: unknown,
   final: boolean,
 ): void {
-  const k = `${o.id}:${mod.id}:${key}`;
-  if (!final) {
-    if (!dragOriginal || dragOriginal.key !== k) dragOriginal = { key: k, modifiers: o.modifiers };
-    const modifiers = o.modifiers.map((m) =>
-      m.id === mod.id ? { ...m, params: { ...m.params, [key]: value } } : m,
-    );
-    s.doc.transact(() => s.doc.updateObject(o.id, { modifiers }), PREVIEW_ORIGIN);
-    return;
-  }
-  if (dragOriginal?.key === k) {
-    s.doc.transact(() => s.doc.updateObject(o.id, { modifiers: dragOriginal!.modifiers }), PREVIEW_ORIGIN);
-    dragOriginal = null;
-  }
-  run('object.modifier_set', { object: o.id, modifier: mod.id, params: { [key]: value } }, 'ui');
+  dragEdit(
+    s,
+    `modifier:${o.id}:${mod.id}:${key}`,
+    final,
+    () => writeParam(s, o.id, mod.id, key, value),
+    captureField(
+      () => storedModifier(s, o.id, mod.id)?.params?.[key],
+      (before) => writeParam(s, o.id, mod.id, key, before),
+    ),
+    () => run('object.modifier_set', { object: o.id, modifier: mod.id, params: { [key]: value } }, 'ui'),
+  );
 }
 
 function addMenu(o: ObjectData): MenuItem[] {

@@ -19,7 +19,8 @@ import type { ProjectSession } from '../project/session';
 import {
   pathTraceDocument,
   pixelsToDataUrl,
-  renderViewFromMatrices,
+  renderViewFromCamera,
+  viewportCamera,
   type PathTraceJob,
   type PathTraceOptions,
   type PixelImage,
@@ -53,6 +54,10 @@ export interface RenderImageOptions {
   width?: number;
   height?: number;
   cameraId?: string;
+  /**
+   * Show what the viewport shows (a capture): its own view, orthographic or perspective like the
+   * viewport, or the scene camera while the viewport looks through it.
+   */
   useViewport?: boolean;
   /** Explicit viewpoint (world space, Z up); fov in degrees. */
   view?: { position: number[]; target: number[]; up?: number[]; fov_degrees?: number } | null;
@@ -734,20 +739,18 @@ export class ViewportEngine {
         up: v.up ? [v.up[0], v.up[1], v.up[2]] : [0, 0, 1],
         fovY: THREE.MathUtils.degToRad(v.fov_degrees ?? 50),
       };
-    } else if (!opts.useViewport && camObj?.camera) o.cameraId = camObj.id;
-    else {
-      // the viewport's view, as a perspective camera like the rasterized render
-      const pc = new THREE.PerspectiveCamera(40, width / height, 0.01, 10000);
-      applyPoseToCamera(this.pose, pc, width / height);
-      o.view = renderViewFromMatrices(
-        pc.matrixWorldInverse.elements,
-        pc.projectionMatrix.elements,
-        false,
-        pc.near,
-        pc.far,
-      );
-    }
+    } else if (this.rendersCamera(opts) && camObj?.camera) o.cameraId = camObj.id;
+    // the viewport's view (orthographic when the viewport is), like the rasterized render
+    else o.view = renderViewFromCamera(viewportCamera(this.pose, width / height, true));
     return pathTraceDocument(this.session.doc, o);
+  }
+
+  /**
+   * Whether a render without an explicit view shows the camera (option or scene camera): always,
+   * except viewport captures (`useViewport`) while the viewport is not looking through the camera.
+   */
+  private rendersCamera(opts: RenderImageOptions): boolean {
+    return !opts.useViewport || this.session.view.cameraView.value;
   }
 
   /**
@@ -769,7 +772,7 @@ export class ViewportEngine {
       pc.position.set(...(v.position as [number, number, number]));
       pc.lookAt(new THREE.Vector3(...(v.target as [number, number, number])));
       cam = pc;
-    } else if (!opts.useViewport && camObj?.camera) {
+    } else if (this.rendersCamera(opts) && camObj?.camera) {
       const cd = camObj.camera;
       const m = new THREE.Matrix4().fromArray(camObj.worldMatrix);
       if (cd.type === 'ORTHO') {
@@ -794,11 +797,7 @@ export class ViewportEngine {
         m.decompose(pc.position, pc.quaternion, new THREE.Vector3());
         cam = pc;
       }
-    } else {
-      const pc = new THREE.PerspectiveCamera(40, aspect, 0.01, 10000);
-      applyPoseToCamera(this.pose, pc, aspect);
-      cam = pc;
-    }
+    } else cam = viewportCamera(this.pose, aspect);
     cam.updateMatrixWorld(true);
     (cam as THREE.PerspectiveCamera).updateProjectionMatrix?.();
     // final render: rendered shading, no overlays

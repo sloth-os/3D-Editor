@@ -36,8 +36,18 @@ const px = (img: RenderedImage, x: number, y: number) => [
 
 /** A 2 × 2 m plane at z = 0 seen from straight above; the centre pixel (33 × 33) looks at `target`. */
 function planeScene(material: Partial<MaterialData>, opts: { modifiers?: boolean } = {}) {
+  const res = litPlaneScene(material, opts);
+  // a lamp that emits nothing: without any lamp the renderer lights the scene with a studio rig,
+  // whose (rough, 4 %) reflections in the black emissive plane would shift its colour
+  if (material.emission_strength)
+    res.doc.addObject({ type: 'LIGHT', name: 'Off', data: res.doc.addLight({ type: 'SUN', energy: 0 }) });
+  return res;
+}
+
+function litPlaneScene(material: Partial<MaterialData>, opts: { modifiers?: boolean } = {}) {
   const doc = SceneDoc.create({ empty: true });
-  doc.updateWorld({ color: [0, 0, 0] });
+  // a black world (no studio environment, which would light and reflect in the plane)
+  doc.updateWorld({ environment: 'NONE', color: [0, 0, 0] });
   const mesh = doc.addMesh('Plane', createPlane({ size: 2 }));
   const mat = doc.addMaterial({ name: 'M', ...material });
   doc.addObject({
@@ -71,7 +81,10 @@ const render = (doc: SceneDoc, target: Vec3, size = 33) =>
     view: { position: [target[0], target[1], 4], target, up: [0, 1, 0], fovY: 0.6 },
   });
 
-/** Emission-only material: the pixel colour is exactly the procedural colour. */
+/**
+ * Emission-only material: the pixel colour is exactly the procedural colour (`planeScene` turns
+ * the lighting off for it).
+ */
 const emissive = (p: ProceduralTexture): Partial<MaterialData> => ({
   base_color: [0, 0, 0, 1],
   roughness: 1,

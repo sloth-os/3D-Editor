@@ -7,6 +7,7 @@ import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { selectedObjects } from './helpers';
+import { resolveDatablock } from './datablocks';
 
 /** Reads the current stored datablock for an animation target. */
 export function readTarget(
@@ -176,11 +177,19 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
       id: 'anim.keyframe_insert_property',
       label: 'Insert Keyframe (Property)',
       description:
-        'Insert a keyframe on any animatable property: target_type object|material|light|camera|world, path e.g. "location", "energy", "base_color". index -1 keys all channels. value overrides the current value.',
+        'Insert a keyframe on any animatable property: target_type object|material|light|camera|world, path e.g. ' +
+        '"location", "energy", "base_color". target: an object name or id (for light/camera the light/camera ' +
+        'object, for material an object with one material), or a datablock id or name; "world" for the world. ' +
+        'index -1 keys all channels. value overrides the current value. Returns {inserted, target_id}.',
       category: 'Animation',
       schema: z.object({
         target_type: z.enum(['object', 'material', 'light', 'camera', 'world']),
-        target: z.string().describe('Datablock id (or object name); "world" for the world'),
+        target: z
+          .string()
+          .describe(
+            'Object name or id (light/camera: the light or camera object; material: an object with one material), ' +
+              'or a datablock id or name; "world" for the world',
+          ),
         path: z.string(),
         index: z.number().int().default(-1),
         frame: z.number().optional(),
@@ -188,19 +197,22 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
         interpolation: z.enum(['CONSTANT', 'LINEAR', 'BEZIER']).default('BEZIER'),
       }),
       execute(ctx, p) {
-        let id = p.target;
-        if (p.target_type === 'object') {
-          const o = ctx.doc.resolveObject(p.target);
-          if (!o) throw new OperatorError(`Object '${p.target}' not found`, 'NOT_FOUND');
-          id = o.id;
-        }
-        if (p.target_type === 'world') id = 'world';
+        const kind = (
+          {
+            object: 'objects',
+            material: 'materials',
+            light: 'lights',
+            camera: 'cameras',
+            world: null,
+          } as const
+        )[p.target_type];
+        const id = kind ? resolveDatablock(ctx.doc, kind, p.target).id : 'world';
         const n = keyProperty(ctx, p.target_type, id, p.path, p.frame ?? ctx.state.frame, {
           index: p.index,
           value: p.value,
           interpolation: p.interpolation,
         });
-        return { inserted: n };
+        return { inserted: n, target_id: id };
       },
     }),
   );

@@ -11,7 +11,17 @@
  *   const mcp = await connect();                   // MCP_URL / MCP_TOKEN from the environment
  *   const scene = await mcp.call('get_scene', { project: 'Demo' });
  *
- * Environment: MCP_URL (default http://127.0.0.1:8080/mcp), MCP_TOKEN (bearer token, optional).
+ * Environment: MCP_URL (default http://127.0.0.1:8080/mcp), MCP_TOKEN (bearer token, optional),
+ * MCP_AGENT_ID (agent id, optional; see below).
+ *
+ * Undo history: the server keeps an agent's undo history (and its selection, mode and frame) per
+ * MCP session. Every CLI call is a new session, so the CLI identifies itself with an agent id
+ * (header x-mcp-agent-id): MCP_AGENT_ID, by default one id per user and working directory. Calls
+ * with the same agent id share one history, so `call undo` reverts the previous call's change.
+ * Set MCP_AGENT_ID to keep separate histories (e.g. two agents working in the same directory).
+ * Module users get a per-connection history unless they pass `{ agentId }` (or set MCP_AGENT_ID).
+ * Sessions are closed with an HTTP DELETE when done, so no "AI agent" presence lingers.
+ *
  * Tool results are returned as parsed JSON (text content). Results with files are returned as
  * `{ text, images: [{ mimeType, data (base64) }], resources: [{ uri, mimeType, blob }],
  * links: [{ uri, name, mimeType }] }`. On the CLI, `--out file` saves the first image (or embedded
@@ -19,7 +29,9 @@
  * export_scene files). Long renders report progress on stderr; `elapsed_ms` of the call is
  * printed with the result.
  */
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -65,15 +77,40 @@ function parseResult(res) {
   };
 }
 
+/** Header carrying the agent id (sessions with the same id share their undo history). */
+export const AGENT_ID_HEADER = 'x-mcp-agent-id';
+
+/** The CLI's default agent id: one per user, host and working directory. */
+export function defaultAgentId(cwd = process.cwd()) {
+  let user = 'user';
+  try {
+    user = os.userInfo().username || user;
+  } catch {
+    /* no user info */
+  }
+  const hash = createHash('sha256').update(`${user}@${os.hostname()}:${cwd}`).digest('hex').slice(0, 12);
+  return `cli-${hash}`;
+}
+
+/**
+ * Connects to the server. `agentId` (default: MCP_AGENT_ID) makes the session share its undo
+ * history and editor state with other sessions using the same id.
+ */
 export async function connect(
   url = process.env.MCP_URL ?? 'http://127.0.0.1:8080/mcp',
   token = process.env.MCP_TOKEN,
+  { agentId = process.env.MCP_AGENT_ID } = {},
 ) {
   const client = new Client({ name: '3d-editor-cli', version: '1.0.0' });
-  const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
-  await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers } }));
+  const headers = {
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(agentId ? { [AGENT_ID_HEADER]: agentId } : {}),
+  };
+  const transport = new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers } });
+  await client.connect(transport);
   return {
     client,
+    agentId: agentId ?? null,
     /**
      * Calls a tool and returns its parsed result; throws McpToolError on tool errors. `onProgress`
      * receives progress notifications (long renders); they also keep the request alive.
@@ -89,7 +126,15 @@ export async function connect(
     async tools() {
       return (await client.listTools()).tools;
     },
-    close: () => client.close(),
+    /** Ends the session on the server (HTTP DELETE: its presence disappears at once), then disconnects. */
+    async close() {
+      try {
+        await transport.terminateSession();
+      } catch {
+        /* the server may already have closed it */
+      }
+      await client.close();
+    },
   };
 }
 
@@ -156,7 +201,8 @@ async function main(argv) {
     process.exitCode = 2;
     return;
   }
-  const mcp = await connect();
+  // every CLI call is a new MCP session: one agent id keeps one undo history across calls
+  const mcp = await connect(undefined, undefined, { agentId: process.env.MCP_AGENT_ID || defaultAgentId() });
   const onProgress = (p) =>
     process.stderr.write(
       `  progress ${p.progress}${p.total ? `/${p.total}` : ''}${p.message ? ` ${p.message}` : ''}\n`,

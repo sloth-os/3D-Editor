@@ -14,7 +14,7 @@ import type { ServerMetrics } from '../observability/metrics';
 import type { Log } from '../observability/log';
 import { errorMessage } from '../observability/tracing';
 import type { RoomManager } from '../sync/room-manager';
-import { AgentSession } from './agent';
+import { AgentIdentity, AgentSession, ToolError, parseAgentId } from './agent';
 import { MCP_INSTRUCTIONS } from './instructions';
 import { registerResources, registerTools, type ToolContext } from './tools';
 import { sharedRenderer, type Renderer } from '../render';
@@ -43,6 +43,19 @@ export interface McpHubOptions {
   log: Log;
   /** Sessions without activity are closed after this time (default 30 min). */
   idleTimeoutMs?: number;
+  /**
+   * The presence (avatar) of a session without requests is hidden after this time and shown
+   * again with its next request (default 5 min): clients that never close their session (killed
+   * agents, one-shot calls without DELETE) do not leave "AI agent" ghosts in projects.
+   */
+  presenceIdleMs?: number;
+  /**
+   * Undo histories and editor states of agent ids (x-mcp-agent-id) are kept this long after their
+   * last session closed (default 6 hours).
+   */
+  identityTtlMs?: number;
+  /** Most agent identities kept (least recently used ones are dropped first; default 200). */
+  maxIdentities?: number;
   maxSessions?: number;
   /** Server-side renderer (default: the process-wide one, see `RENDER_WORKERS`). */
   renderer?: Renderer;
@@ -52,6 +65,18 @@ export interface McpHubOptions {
 
 function rpcError(code: number, message: string) {
   return { jsonrpc: '2.0', error: { code, message }, id: null };
+}
+
+/** Header and query parameter naming an agent id (see {@link AgentIdentity}). */
+export const AGENT_ID_HEADER = 'x-mcp-agent-id';
+export const AGENT_ID_QUERY = 'agent';
+
+/** The agent id of an initialize request (header, else `?agent=` query parameter), or null. */
+function agentIdOf(request: FastifyRequest): string | null {
+  const header = parseAgentId(request.headers[AGENT_ID_HEADER]);
+  if (header) return header;
+  const query = request.query as Record<string, unknown> | undefined;
+  return parseAgentId(query?.[AGENT_ID_QUERY]);
 }
 
 /** Ids of the JSON-RPC requests in a POST body (a message or a batch), except `initialize`. */
@@ -66,21 +91,53 @@ function requestIds(body: unknown): RequestId[] {
  */
 export class McpHub {
   private readonly sessions = new Map<string, McpSession>();
+  /** Identities of agent ids, kept between their sessions (undo histories, editor states). */
+  private readonly identities = new Map<string, AgentIdentity>();
   private readonly sweeper: ReturnType<typeof setInterval>;
   private readonly idleTimeoutMs: number;
+  private readonly presenceIdleMs: number;
+  private readonly identityTtlMs: number;
   private closing = false;
 
   constructor(private readonly opts: McpHubOptions) {
     this.idleTimeoutMs = opts.idleTimeoutMs ?? 30 * 60 * 1000;
+    this.presenceIdleMs = Math.min(opts.presenceIdleMs ?? 5 * 60 * 1000, this.idleTimeoutMs);
+    this.identityTtlMs = opts.identityTtlMs ?? 6 * 60 * 60 * 1000;
     this.sweeper = setInterval(
       () => this.sweep(),
-      Math.max(1000, Math.min(60_000, Math.floor(this.idleTimeoutMs / 2))),
+      Math.max(1000, Math.min(60_000, Math.floor(this.presenceIdleMs / 2))),
     );
     this.sweeper.unref?.();
   }
 
   get size(): number {
     return this.sessions.size;
+  }
+
+  /** Agent identities kept (live or between sessions). */
+  get identityCount(): number {
+    return this.identities.size;
+  }
+
+  /** The shared identity of an agent id (created on first use; least recently used ones evicted). */
+  private identity(agentId: string): AgentIdentity {
+    let id = this.identities.get(agentId);
+    if (!id) {
+      id = new AgentIdentity(`agent:${agentId}`, agentId);
+      this.identities.set(agentId, id);
+      const max = Math.max(1, this.opts.maxIdentities ?? 200);
+      if (this.identities.size > max) {
+        const idle = [...this.identities.values()]
+          .filter((x) => x.sessions <= 0 && x !== id)
+          .sort((a, b) => a.lastUsed - b.lastUsed);
+        for (const x of idle.slice(0, this.identities.size - max)) {
+          this.identities.delete(x.agentId!);
+          x.dispose();
+        }
+      }
+    }
+    id.lastUsed = Date.now();
+    return id;
   }
 
   /** Builds the MCP server of one session. */
@@ -106,7 +163,12 @@ export class McpHub {
       const info = server.server.getClientVersion();
       agent.setClientName(info?.title ?? info?.name);
       log.info(
-        { session: agent.id, client: info?.name, clientVersion: info?.version },
+        {
+          session: agent.id,
+          client: info?.name,
+          clientVersion: info?.version,
+          ...(agent.agentId ? { agent: agent.agentId } : {}),
+        },
         'MCP session initialized',
       );
     };
@@ -116,6 +178,9 @@ export class McpHub {
   private track(session: McpSession, reply: FastifyReply): void {
     session.open++;
     session.lastActive = Date.now();
+    session.agent.identity.lastUsed = session.lastActive;
+    // a request shows the presence of a session that went quiet again (not the one ending it)
+    if (reply.request.method !== 'DELETE') session.agent.setAway(false);
     reply.raw.once('close', () => {
       session.open--;
       session.lastActive = Date.now();
@@ -135,11 +200,20 @@ export class McpHub {
   private sweep(): void {
     const now = Date.now();
     for (const s of this.sessions.values()) {
-      if (s.open <= 0 && now - s.lastActive > this.idleTimeoutMs) {
+      if (s.open > 0) continue;
+      const idle = now - s.lastActive;
+      if (idle > this.idleTimeoutMs) {
         this.opts.log.info({ session: s.id }, 'closing idle MCP session');
         void s.transport.close().catch(() => undefined);
         void this.dispose(s);
-      }
+      } else if (idle > this.presenceIdleMs) s.agent.setAway(true);
+    }
+    for (const [key, id] of this.identities) {
+      if (id.sessions > 0) continue;
+      if (now - id.lastUsed > this.identityTtlMs) {
+        this.identities.delete(key);
+        id.dispose();
+      } else id.prune();
     }
   }
 
@@ -156,7 +230,10 @@ export class McpHub {
     try {
       session.transport.onmessage?.(notification);
     } catch (err) {
-      this.opts.log.debug({ err: errorMessage(err), session: session.id }, 'cancelling an MCP request failed');
+      this.opts.log.debug(
+        { err: errorMessage(err), session: session.id },
+        'cancelling an MCP request failed',
+      );
     }
   }
 
@@ -210,12 +287,18 @@ export class McpHub {
       if (this.sessions.size >= (this.opts.maxSessions ?? 1000)) {
         return reply.code(503).send(rpcError(-32000, 'Too many open MCP sessions'));
       }
+      let agentId: string | null;
+      try {
+        agentId = agentIdOf(request);
+      } catch (err) {
+        return reply.code(400).send(rpcError(-32602, err instanceof ToolError ? err.message : String(err)));
+      }
       const sessionId = randomUUID();
-      const agent = new AgentSession(sessionId, {
-        rooms: this.opts.rooms,
-        registry: this.opts.registry,
-        log: this.opts.log,
-      });
+      const agent = new AgentSession(
+        sessionId,
+        { rooms: this.opts.rooms, registry: this.opts.registry, log: this.opts.log },
+        agentId ? this.identity(agentId) : undefined,
+      );
       const server = this.createServer(agent);
       const entry: McpSession = {
         id: sessionId,
@@ -263,5 +346,7 @@ export class McpHub {
     const sessions = [...this.sessions.values()];
     await Promise.allSettled(sessions.map((s) => s.transport.close()));
     await Promise.allSettled(sessions.map((s) => this.dispose(s)));
+    for (const id of this.identities.values()) id.dispose();
+    this.identities.clear();
   }
 }

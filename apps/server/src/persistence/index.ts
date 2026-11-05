@@ -14,6 +14,21 @@ export interface Persistence {
   check(): Promise<{ ok: boolean; message?: string }>;
 }
 
+/** What a persistence mode means for projects (startup log, get_project). */
+export function persistenceNote(mode: PersistenceMode): string {
+  switch (mode) {
+    case 'disk':
+      return 'projects are saved to disk (DATA_DIR) and survive server restarts';
+    case 'webdav':
+      return 'projects are saved to the WebDAV server and survive server restarts';
+    default:
+      return (
+        'projects are kept in server memory only and are lost when the server stops ' +
+        '(browsers keep their own copies); set DATA_DIR or SYNC_PERSISTENCE=disk to save them to disk'
+      );
+  }
+}
+
 export function createPersistence(
   config: Pick<ServerConfig, 'persistence' | 'dataDir' | 'webdav'>,
   fetchImpl?: typeof fetch,
