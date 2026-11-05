@@ -7,14 +7,7 @@ import type { MeshData } from '../mesh/types';
 import { meshBounds } from '../mesh/types';
 import { proceduralSurface } from '../material/surface';
 import { evaluatedOrco } from '../material/orco';
-import {
-  prepareSky,
-  sampleSkyModel,
-  sampleSkyPixel,
-  skyIrradianceSH,
-  skySun,
-  type SkyModel,
-} from './sky';
+import { prepareSky, sampleSkyModel, sampleSkyPixel, skyIrradianceSH, skySun, type SkyModel } from './sky';
 import {
   environmentLighting,
   probeLighting,
@@ -230,8 +223,7 @@ function surfaceFromMaterial(
   const varying = !!(procedural?.alpha || procedural?.base_color);
   // OPAQUE ignores alpha (like the path tracer and Eevee); BLEND blends smoothly in the sorted
   // transparent pass, where glass (transmission) also lets the background through
-  const blend =
-    m.blend_method === 'CLIP' ? 1 : m.blend_method === 'BLEND' && (alpha < 1 || varying) ? 2 : 0;
+  const blend = m.blend_method === 'CLIP' ? 1 : m.blend_method === 'BLEND' && (alpha < 1 || varying) ? 2 : 0;
   const es = Math.max(0, m.emission_strength ?? 0);
   return {
     r: Math.max(0, m.base_color[0]),
@@ -649,7 +641,11 @@ function probePosition(view: RenderView, bounds: Bounds | null, draw: (r: Raster
   const f = view.far;
   const dist = view.ortho ? ((1 - key) * (f - n) + f + n) / 2 : 1 / key;
   const t = dist * 0.9;
-  return [view.eye[0] + view.forward[0] * t, view.eye[1] + view.forward[1] * t, view.eye[2] + view.forward[2] * t];
+  return [
+    view.eye[0] + view.forward[0] * t,
+    view.eye[1] + view.forward[1] * t,
+    view.eye[2] + view.forward[2] * t,
+  ];
 }
 
 /**

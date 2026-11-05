@@ -252,7 +252,8 @@ function downsample(src: EnvLevel): EnvLevel {
         let s = 0;
         for (let b = 0; b < 2; b++) {
           const y = Math.min(src.height - 1, j * 2 + b);
-          for (let a = 0; a < 2; a++) s += src.data[(y * src.width + Math.min(src.width - 1, i * 2 + a)) * 3 + c];
+          for (let a = 0; a < 2; a++)
+            s += src.data[(y * src.width + Math.min(src.width - 1, i * 2 + a)) * 3 + c];
         }
         data[(j * w + i) * 3 + c] = s / 4;
       }

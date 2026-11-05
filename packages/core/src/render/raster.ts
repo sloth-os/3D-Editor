@@ -423,8 +423,7 @@ export class Rasterizer {
       if (back && (mat.cull || this.cullBackFaces)) continue;
       const wire = edges ? edges[t] : 0;
       // alpha-blended and transmissive surfaces wait for the sorted transparent pass
-      const deferred =
-        this.mode === SHADE_MATERIAL && (mat.blend === 2 || (mat.transmission ?? 0) > 0);
+      const deferred = this.mode === SHADE_MATERIAL && (mat.blend === 2 || (mat.transmission ?? 0) > 0);
       if (!(gc[i0] | gc[i1] | gc[i2])) {
         this.loadScreen(0, i0, cl, wn, wp, colors, uvs, og);
         this.loadScreen(1, i1, cl, wn, wp, colors, uvs, og);
@@ -1178,7 +1177,7 @@ export class Rasterizer {
       let sx: number;
       let sy: number;
       let sz: number;
-      let a2 = alpha;
+      let a2: number;
       // mirror ray outside the lamp's disc: its far GGX tail is that of a point lamp at the centre
       let outside = false;
       if (kind === LIGHT_SUN) {

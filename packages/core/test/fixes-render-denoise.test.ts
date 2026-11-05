@@ -31,7 +31,12 @@ function shadowScene(): SceneDoc {
     location: [0, 0, 0.6],
     material_slots: [red],
   });
-  const brass = doc.addMaterial({ name: 'Brass', base_color: [0.9, 0.7, 0.3, 1], metallic: 1, roughness: 0.3 });
+  const brass = doc.addMaterial({
+    name: 'Brass',
+    base_color: [0.9, 0.7, 0.3, 1],
+    metallic: 1,
+    roughness: 0.3,
+  });
   doc.addObject({
     type: 'MESH',
     name: 'Box',

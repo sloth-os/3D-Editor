@@ -261,7 +261,12 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
         ['Spinner', spinner],
         ['Rig', rig],
       ] as const)
-        expectClose(pose.world[nodeIndex(json, name)], yUpWorld(sc.byId.get(id)!.worldMatrix), 2e-4, `${name} @${frame}`);
+        expectClose(
+          pose.world[nodeIndex(json, name)],
+          yUpWorld(sc.byId.get(id)!.worldMatrix),
+          2e-4,
+          `${name} @${frame}`,
+        );
       // bone nodes: posed bone matrices (native frames: Y along the bone)
       const rigEv = sc.byId.get(rig)!;
       for (const b of ['Base', 'Arm']) {
@@ -270,7 +275,8 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
           const a = rigEv.worldMatrix;
           const o = new Array<number>(16).fill(0);
           for (let c = 0; c < 4; c++)
-            for (let r = 0; r < 4; r++) for (let k = 0; k < 4; k++) o[c * 4 + r] += a[k * 4 + r] * posed[c * 4 + k];
+            for (let r = 0; r < 4; r++)
+              for (let k = 0; k < 4; k++) o[c * 4 + r] += a[k * 4 + r] * posed[c * 4 + k];
           return o;
         })();
         expectClose(pose.world[nodeIndex(json, b)], yUpWorld(world, false), 2e-4, `bone ${b} @${frame}`);
@@ -288,7 +294,9 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
     expect(json.scenes[0].nodes).toContain(hoseNode);
     expect(node.translation ?? node.rotation ?? node.scale ?? node.matrix).toBeUndefined();
     const skin = json.skins[node.skin];
-    expect(skin.joints.map((j: number) => json.nodes[j].name)).toEqual(expect.arrayContaining(['Base', 'Arm']));
+    expect(skin.joints.map((j: number) => json.nodes[j].name)).toEqual(
+      expect.arrayContaining(['Base', 'Arm']),
+    );
     expect(skin.skeleton).toBe(nodeIndex(json, 'Rig'));
     const prim = json.meshes[node.mesh].primitives[0];
     expect(Object.keys(prim.attributes)).toEqual(expect.arrayContaining(['JOINTS_0', 'WEIGHTS_0']));
@@ -314,7 +322,9 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
     expect(json.nodes[hoseNode].skin).toBeUndefined();
     const prim = json.meshes[json.nodes[hoseNode].mesh].primitives[0];
     expect(prim.targets.length).toBe(11);
-    expect((res.warnings ?? []).join('\n')).toMatch(/Hose.*deforms during the animation.*baked as 11 morph targets/);
+    expect((res.warnings ?? []).join('\n')).toMatch(
+      /Hose.*deforms during the animation.*baked as 11 morph targets/,
+    );
     const ev = new SceneEvaluator(doc);
     for (const frame of [1, 5, 11]) {
       const sc = ev.evaluate(frame, { forRender: true });
@@ -336,7 +346,15 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
     const grip = base.map((v, i) => (i % 3 === 0 && base[i] > 0 ? v - 0.3 : v));
     const lift = grip.map((v, i) => (i % 3 === 2 && base[i] > 0 ? v + 0.5 : v));
     doc.setShapeKeys(meshId, [
-      { name: 'Grip', value: 0, slider_min: 0, slider_max: 1, mute: false, relative_key: '', data: encodeFloat32(grip) },
+      {
+        name: 'Grip',
+        value: 0,
+        slider_min: 0,
+        slider_max: 1,
+        mute: false,
+        relative_key: '',
+        data: encodeFloat32(grip),
+      },
       {
         name: 'Lift',
         value: 0.5,
@@ -347,7 +365,12 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
         data: encodeFloat32(lift),
       },
     ]);
-    let fc = createFCurve({ target_type: 'mesh', target_id: meshId, path: 'shape_keys["Grip"].value', index: 0 });
+    let fc = createFCurve({
+      target_type: 'mesh',
+      target_id: meshId,
+      path: 'shape_keys["Grip"].value',
+      index: 0,
+    });
     fc = insertKeyframe(fc, 1, 0, 'LINEAR');
     fc = insertKeyframe(fc, 9, 1, 'LINEAR');
     doc.setFCurve(fc);
@@ -391,9 +414,9 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
     });
     const { json, bin } = exportGlb(doc);
     const n = nodeIndex(json, 'Box');
-    expect(json.animations[0].channels.some((c: Json) => c.target.node === n && c.target.path === 'translation')).toBe(
-      true,
-    );
+    expect(
+      json.animations[0].channels.some((c: Json) => c.target.node === n && c.target.path === 'translation'),
+    ).toBe(true);
     const ev = new SceneEvaluator(doc);
     for (const frame of [1, 6, 12]) {
       const w = ev.evaluate(frame, { forRender: true }).byId.get(box)!.worldMatrix;
@@ -401,6 +424,26 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
     }
     // it fell
     expect(gltfPose(json, bin, 11 / FPS).world[n][13]).toBeLessThan(1.5);
+  });
+
+  it('writes a matrix for a sheared transform (non-uniform parent scale, parent not exported)', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const parent = doc.addObject({ type: 'EMPTY', name: 'P', scale: [2, 1, 1] });
+    const child = doc.addObject({
+      type: 'MESH',
+      name: 'C',
+      data: doc.addMesh('C', createCube()),
+      parent,
+      location: [1, 0, 0],
+      rotation_euler: [0, 0, Math.PI / 4],
+    });
+    const res = exportScene(doc, 'glb', { objectIds: [child] });
+    const { json, bin } = parseGltf(res.data);
+    expect(gltfProblems(json, bin)).toEqual([]);
+    const n = json.nodes[nodeIndex(json, 'C')];
+    expect(n.matrix).toHaveLength(16);
+    const w = new SceneEvaluator(doc).evaluate(1).byId.get(child)!.worldMatrix;
+    expectClose(gltfPose(json, bin).world[nodeIndex(json, 'C')], yUpWorld(w), 1e-6, 'sheared world');
   });
 
   it('writes no animation for a static scene and keeps plain object transforms exact', () => {
@@ -498,7 +541,12 @@ describe('glTF export: procedural textures on meshes without UVs (#21)', () => {
       name: 'Hazard',
       textures: {
         base_color: slot(
-          defaultProcedural('WAVE', { mapping: 'OBJECT', scale: 4, color_a: [1, 0.8, 0, 1], color_b: [0, 0, 0, 1] }),
+          defaultProcedural('WAVE', {
+            mapping: 'OBJECT',
+            scale: 4,
+            color_a: [1, 0.8, 0, 1],
+            color_b: [0, 0, 0, 1],
+          }),
         ),
       },
     });

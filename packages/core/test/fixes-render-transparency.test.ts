@@ -26,7 +26,10 @@ function stats(img: RenderedImage, x0: number, y0: number, x1: number, y1: numbe
  * A dark world (no lamps, no environment light: emission only) seen from above through planes at
  * the given heights; the camera looks straight down at a black floor.
  */
-function layered(layers: { z: number; material: Partial<MaterialData>; size?: number }[], floor?: Partial<MaterialData>) {
+function layered(
+  layers: { z: number; material: Partial<MaterialData>; size?: number }[],
+  floor?: Partial<MaterialData>,
+) {
   const doc = SceneDoc.create({ empty: true });
   doc.updateWorld({ environment: 'NONE', color: [0, 0, 0] });
   doc.addObject({ type: 'LIGHT', name: 'Off', data: doc.addLight({ type: 'SUN', energy: 0 }) });
@@ -89,11 +92,12 @@ describe('RASTER smooth transparency (#5, #40)', () => {
   });
 
   it('gives a smooth partial alpha over a transparent background', () => {
-    const doc = layered([{ z: 1, material: emissive([1, 1, 1], 0.25) }]);
+    // (0.3: not a multiple of 1/16, which a 4×4 dither would happen to spread evenly)
+    const doc = layered([{ z: 1, material: emissive([1, 1, 1], 0.3) }]);
     const img = renderSceneSoftware(doc, { width: 24, height: 24, samples: 2, background: [0, 0, 0, 0] });
     const a = stats(img, 2, 2, 22, 22, 3);
     expect(a.sd).toBeLessThan(0.75);
-    expect(a.mean).toBeCloseTo(0.25 * 255, -0.5);
+    expect(Math.abs(a.mean - 0.3 * 255)).toBeLessThan(1);
   });
 
   it('sorts transparent surfaces back to front, whatever their drawing order', () => {
@@ -156,7 +160,13 @@ describe('RASTER smooth transparency (#5, #40)', () => {
       location: [1, 0, 0],
       material_slots: [glow([0.1, 0.1, 0.8])],
     });
-    const glass = doc.addMaterial({ name: 'Glass', base_color: [1, 1, 1, 1], transmission: 1, roughness: 0, ior: 1.5 });
+    const glass = doc.addMaterial({
+      name: 'Glass',
+      base_color: [1, 1, 1, 1],
+      transmission: 1,
+      roughness: 0,
+      ior: 1.5,
+    });
     // the sheet covers y ∈ [0, 4]: the upper half of the floor (image rows 10–20) and nothing
     // above it (rows 0–10); the lower half of the floor (rows 20–30) is bare
     doc.addObject({

@@ -64,7 +64,12 @@ function studioScene(envStrength: number): SceneDoc {
     name: 'Brass',
     ...presetMaterialValues(getMaterialPreset('brass')!),
   });
-  const chrome = doc.addMaterial({ name: 'Chrome', base_color: [0.9, 0.9, 0.9, 1], metallic: 1, roughness: 0.05 });
+  const chrome = doc.addMaterial({
+    name: 'Chrome',
+    base_color: [0.9, 0.9, 0.9, 1],
+    metallic: 1,
+    roughness: 0.05,
+  });
   const ball = createUVSphere({ segments: 32, ring_count: 16, radius: 0.5 });
   ball.faceSmooth = ball.faceSmooth.map(() => true);
   doc.addObject({
@@ -105,7 +110,13 @@ describe('RASTER studio / image environment lighting (#11)', () => {
     // the rasterizer's display transform, for a like-for-like comparison
     doc.updateRender({ view_transform: 'STANDARD' });
     const raster = renderSceneSoftware(doc, { width: W, height: H, engine: 'RASTER', samples: 2 });
-    const pt = renderSceneSoftware(doc, { width: W, height: H, engine: 'PATHTRACER', samples: 24, denoise: true });
+    const pt = renderSceneSoftware(doc, {
+      width: W,
+      height: H,
+      engine: 'PATHTRACER',
+      samples: 24,
+      denoise: true,
+    });
     for (const box of [BRASS, CHROME]) {
       const r = lum(boxMean(raster, ...box));
       const p = lum(boxMean(pt, ...box));
@@ -263,7 +274,13 @@ describe('RASTER studio / image environment lighting (#11)', () => {
     const h = 90;
     const gear: Box = [75, 40, 85, 50];
     const raster = renderSceneSoftware(doc, { width: w, height: h, engine: 'RASTER', samples: 2 });
-    const pt = renderSceneSoftware(doc, { width: w, height: h, engine: 'PATHTRACER', samples: 32, denoise: true });
+    const pt = renderSceneSoftware(doc, {
+      width: w,
+      height: h,
+      engine: 'PATHTRACER',
+      samples: 32,
+      denoise: true,
+    });
     const r = lum(boxMean(raster, ...gear));
     const p = lum(boxMean(pt, ...gear));
     // before the fix the gear was a black silhouette (≈ 12 sRGB levels) while the path tracer
@@ -288,7 +305,12 @@ describe('RASTER studio / image environment lighting (#11)', () => {
       data: doc.addMesh('Floor', createPlane({ size: 20 })),
       material_slots: [glow],
     });
-    const chrome = doc.addMaterial({ name: 'Chrome', base_color: [0.9, 0.9, 0.9, 1], metallic: 1, roughness: 0.1 });
+    const chrome = doc.addMaterial({
+      name: 'Chrome',
+      base_color: [0.9, 0.9, 0.9, 1],
+      metallic: 1,
+      roughness: 0.1,
+    });
     const ball = createUVSphere({ segments: 32, ring_count: 16, radius: 0.5 });
     ball.faceSmooth = ball.faceSmooth.map(() => true);
     doc.addObject({

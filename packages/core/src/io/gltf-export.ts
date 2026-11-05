@@ -327,7 +327,7 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
   };
   const w = new GltfWriter();
   const evaluator = new SceneEvaluator(doc);
-  const { scene, items, ids } = collectExport(doc, opts, evaluator);
+  const { scene, items } = collectExport(doc, opts, evaluator);
   const json = w.json;
   const render = scene.render;
   const applyModifiers = opts.applyModifiers !== false;
@@ -377,7 +377,8 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     if (!pose || it.instance) continue;
     const arm = objectNode.get(it.ev.id)!;
     const map = new Map<string, XNode>();
-    for (const name of pose.order) map.set(name, newNode({ name, armature: it, bone: name, converted: false }));
+    for (const name of pose.order)
+      map.set(name, newNode({ name, armature: it, bone: name, converted: false }));
     for (const name of pose.order) {
       const n = map.get(name)!;
       const p = pose.bones.get(name)?.parent;
@@ -526,7 +527,9 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       const sc = f === scene.frame ? scene : evaluator.evaluate(f, { forRender: true });
       for (const [n, tr] of tracks) {
         const m = gltfLocal(n, sc) ?? gltfLocal(n, scene);
-        const trs = m ? trsOfMatrix(m) : { t: [0, 0, 0] as Vec3, q: [0, 0, 0, 1] as Quat, s: [1, 1, 1] as Vec3, exact: true };
+        const trs = m
+          ? trsOfMatrix(m)
+          : { t: [0, 0, 0] as Vec3, q: [0, 0, 0, 1] as Quat, s: [1, 1, 1] as Vec3, exact: true };
         if (!trs.exact) sheared.add(n);
         let q = normalizeQuat(trs.q);
         const prev = prevQ.get(n);
@@ -581,8 +584,14 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       }
     });
   }
+  /** Nodes whose transform changes over the animation (get channels; others are static). */
+  const moving = new Set<XNode>();
+  for (const [n, tr] of tracks) if (varies(tr.t, 3) || varies(tr.r, 4) || varies(tr.s, 3)) moving.add(n);
   for (const n of sheared)
-    warn(`'${n.name}' has a sheared transform (non-uniform parent scale); glTF animation cannot represent it exactly`);
+    if (moving.has(n))
+      warn(
+        `'${n.name}' has a sheared transform (non-uniform parent scale); glTF animation cannot represent it exactly`,
+      );
 
   // ---------------------------------------------------------------- images / textures / materials
   const textures: NonNullable<GltfRoot['textures']> = [];
@@ -975,7 +984,10 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
   const meshes: GltfMesh[] = [];
   const meshOf = new Map<Geometry, Map<string, number>>();
   const skins: GltfSkin[] = [];
-  const weightsByNode = new Map<XNode, { item: ExportItem; count: number; values: Float32Array; baked: boolean }>();
+  const weightsByNode = new Map<
+    XNode,
+    { item: ExportItem; count: number; values: Float32Array; baked: boolean }
+  >();
   const bakedPlan = planBakes(deformations, frames, plans, warn);
   /** Generated UVs per source mesh (procedural textures on meshes without UVs). */
   const generatedUv = new Map<MeshData, MeshData>();
@@ -994,7 +1006,8 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     // position-dependent (GENERATED/OBJECT) procedural textures need UVs to be baked into: generate
     // them (Smart UV Project); UV-mapped ones show a constant on a mesh without UVs, like in the
     // renderers, and need none
-    const needing = mesh.uvs || !mesh.faces.length ? [] : it.materials.filter((m) => !!proceduralSurface(m)?.usesObject);
+    const needing =
+      mesh.uvs || !mesh.faces.length ? [] : it.materials.filter((m) => !!proceduralSurface(m)?.usesObject);
     const generatedUvs = needing.length > 0;
     if (generatedUvs) {
       mesh = withGeneratedUvs(mesh);
@@ -1250,7 +1263,8 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     if (cached !== undefined) return cached;
     const color = [Math.max(0, l.color[0]), Math.max(0, l.color[1]), Math.max(0, l.color[2])];
     let out: GltfLight;
-    if (l.type === 'SUN') out = { name: l.name, type: 'directional', color, intensity: Math.max(0, l.energy) };
+    if (l.type === 'SUN')
+      out = { name: l.name, type: 'directional', color, intensity: Math.max(0, l.energy) };
     else {
       const candela = Math.max(0, l.energy) / (4 * Math.PI);
       if (l.type === 'SPOT') {
@@ -1279,7 +1293,7 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
   for (const n of order) {
     const node: GltfNode = { name: n.name };
     const trs = staticTRS(n);
-    if (trs?.matrix && !tracks.has(n)) node.matrix = [...trs.matrix];
+    if (trs?.matrix && !moving.has(n)) node.matrix = [...trs.matrix];
     else if (trs) {
       if (!isDefault(trs.t, [0, 0, 0])) node.translation = [...trs.t];
       const q = normalizeQuat(trs.q);
@@ -1311,13 +1325,16 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
         }
       }
     } else if (ev.type === 'CAMERA' && ev.camera) node.camera = cameraIndex(ev.camera);
-    else if (ev.type === 'LIGHT' && ev.light) node.extensions = { KHR_lights_punctual: { light: lightIndex(ev.light) } };
+    else if (ev.type === 'LIGHT' && ev.light)
+      node.extensions = { KHR_lights_punctual: { light: lightIndex(ev.light) } };
     if (ev.data.custom_props && Object.keys(ev.data.custom_props).length && !it.instance)
       node.extras = { ...ev.data.custom_props };
   }
   for (const [it, plan] of plans)
     if (plan.why && plan.why !== 'topology' && deformations.has(it) && !bakedPlan.has(it))
-      warn(`Mesh '${it.ev.name}' deforms during the animation (${plan.why}) but was exported as at frame ${scene.frame}`);
+      warn(
+        `Mesh '${it.ev.name}' deforms during the animation (${plan.why}) but was exported as at frame ${scene.frame}`,
+      );
 
   // ---------------------------------------------------------------- animation
   if (frames.length) {
@@ -1326,13 +1343,19 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     for (let i = 0; i < frames.length; i++) times[i] = (frames[i] - start) / fps;
     let input = -1;
     const timeInput = () => (input >= 0 ? input : (input = w.accessor(times, 'SCALAR', undefined, true)));
-    const channel = (node: number, path: string, data: Float32Array, type: 'VEC3' | 'VEC4' | 'SCALAR', inp: number) => {
+    const channel = (
+      node: number,
+      path: string,
+      data: Float32Array,
+      type: 'VEC3' | 'VEC4' | 'SCALAR',
+      inp: number,
+    ) => {
       anim.samplers.push({ input: inp, output: w.accessor(data, type), interpolation: 'LINEAR' });
       anim.channels.push({ sampler: anim.samplers.length - 1, target: { node, path } });
     };
     for (const n of order) {
       const tr = tracks.get(n);
-      if (!tr) continue;
+      if (!tr || !moving.has(n)) continue;
       if (varies(tr.t, 3)) channel(n.index, 'translation', tr.t, 'VEC3', timeInput());
       if (varies(tr.r, 4)) channel(n.index, 'rotation', tr.r, 'VEC4', timeInput());
       if (varies(tr.s, 3)) channel(n.index, 'scale', tr.s, 'VEC3', timeInput());
@@ -1468,7 +1491,9 @@ function shapeKeyWeights(fs: FrameState, plan: MeshPlan): Float32Array {
     : [];
   plan.keys.forEach((k, i) => {
     const c = current.find((x) => x.name === k.name) ?? k;
-    out[i] = c.mute ? 0 : Math.min(c.slider_max, Math.max(c.slider_min, Number.isFinite(c.value) ? c.value : 0));
+    out[i] = c.mute
+      ? 0
+      : Math.min(c.slider_max, Math.max(c.slider_min, Number.isFinite(c.value) ? c.value : 0));
   });
   return out;
 }

@@ -12,10 +12,16 @@ const GLB_MAGIC = 0x46546c67;
 const CHUNK_JSON = 0x4e4f534a;
 const CHUNK_BIN = 0x004e4942;
 
-export const COMPONENT_SIZE: Record<number, number> = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 };
+export const COMPONENT_SIZE: Record<number, number> = {
+  5120: 1,
+  5121: 1,
+  5122: 2,
+  5123: 2,
+  5125: 4,
+  5126: 4,
+};
 export const COMPONENTS: Record<string, number> = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16 };
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
 export type Json = any;
 
 /** Parses a .glb (or a .gltf with an embedded data URI buffer). */
@@ -35,7 +41,9 @@ export function parseGltf(data: Uint8Array): { json: Json; bin: Uint8Array } {
   }
   const json = JSON.parse(new TextDecoder().decode(data));
   const uri: string | undefined = json.buffers?.[0]?.uri;
-  const bin = uri ? Uint8Array.from(atob(uri.slice(uri.indexOf(',') + 1)), (c) => c.charCodeAt(0)) : new Uint8Array(0);
+  const bin = uri
+    ? Uint8Array.from(atob(uri.slice(uri.indexOf(',') + 1)), (c) => c.charCodeAt(0))
+    : new Uint8Array(0);
   return { json, bin };
 }
 
@@ -120,7 +128,8 @@ export function gltfProblems(json: Json, bin: Uint8Array): string[] {
       seen.add(p);
     }
   });
-  for (const r of json.scenes?.[json.scene ?? 0]?.nodes ?? []) if (parentOf.has(r)) bad(`scene root ${r} has a parent`);
+  for (const r of json.scenes?.[json.scene ?? 0]?.nodes ?? [])
+    if (parentOf.has(r)) bad(`scene root ${r} has a parent`);
   // meshes
   (json.meshes ?? []).forEach((mesh: Json, mi: number) => {
     const targetCounts = new Set<number>(mesh.primitives.map((p: Json) => (p.targets ?? []).length));
@@ -147,7 +156,8 @@ export function gltfProblems(json: Json, bin: Uint8Array): string[] {
         if (t.POSITION !== undefined && (!accessors[t.POSITION].min || !accessors[t.POSITION].max))
           bad(`mesh ${mi}: target POSITION without min/max`);
       }
-      if (prim.material !== undefined && !json.materials?.[prim.material]) bad(`mesh ${mi}: material missing`);
+      if (prim.material !== undefined && !json.materials?.[prim.material])
+        bad(`mesh ${mi}: material missing`);
     }
   });
   // skins
@@ -208,7 +218,9 @@ export function gltfProblems(json: Json, bin: Uint8Array): string[] {
       const input = accessors[s.input];
       const output = accessors[s.output];
       const path = ch.target.path;
-      const type = { translation: 'VEC3', rotation: 'VEC4', scale: 'VEC3', weights: 'SCALAR' }[path as string];
+      const type = { translation: 'VEC3', rotation: 'VEC4', scale: 'VEC3', weights: 'SCALAR' }[
+        path as string
+      ];
       if (!type) bad(`animation ${ai}: path ${path}`);
       if (output.type !== type) bad(`animation ${ai}: ${path} output type ${output.type}`);
       if (path === 'weights') {
@@ -275,9 +287,17 @@ function sample(json: Json, bin: Uint8Array, anim: Json, ch: Json, t: number, n:
 }
 
 /** The scene of a glTF at an animation time: world matrices and morph weights per node. */
-export function gltfPose(json: Json, bin: Uint8Array, t = 0): { world: Mat4[]; weights: (number[] | null)[] } {
+export function gltfPose(
+  json: Json,
+  bin: Uint8Array,
+  t = 0,
+): { world: Mat4[]; weights: (number[] | null)[] } {
   const nodes: Json[] = json.nodes ?? [];
-  const local: Mat4[] = nodes.map((n) => (n.matrix ? [...n.matrix] : trs(n.translation ?? [0, 0, 0], n.rotation ?? [0, 0, 0, 1], n.scale ?? [1, 1, 1])));
+  const local: Mat4[] = nodes.map((n) =>
+    n.matrix
+      ? [...n.matrix]
+      : trs(n.translation ?? [0, 0, 0], n.rotation ?? [0, 0, 0, 1], n.scale ?? [1, 1, 1]),
+  );
   const weights: (number[] | null)[] = nodes.map((n) =>
     n.mesh !== undefined ? (n.weights ?? json.meshes[n.mesh].weights ?? null) : null,
   );
@@ -319,7 +339,12 @@ export function gltfPose(json: Json, bin: Uint8Array, t = 0): { world: Mat4[]; w
 }
 
 /** World-space (Y-up) vertex positions of a mesh node's first primitive at a pose. */
-export function gltfNodePositions(json: Json, bin: Uint8Array, node: number, pose = gltfPose(json, bin)): number[] {
+export function gltfNodePositions(
+  json: Json,
+  bin: Uint8Array,
+  node: number,
+  pose = gltfPose(json, bin),
+): number[] {
   const n = json.nodes[node];
   const prim = json.meshes[n.mesh].primitives[0];
   const P = readAccessor(json, bin, prim.attributes.POSITION);
