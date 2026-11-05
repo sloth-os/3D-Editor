@@ -10,11 +10,13 @@ import type {
   MaterialData,
   MaterialTextureChannel,
   ObjectType,
+  ShapeKeyData,
 } from '../doc/types';
 import { createFCurve } from '../anim/fcurve';
 import { lensFromFovY } from '../eval/camera';
 import type { MeshData } from '../mesh/types';
 import { createMesh, edgeKey } from '../mesh/types';
+import { encodeFloat32 } from '../mesh/shape-keys';
 import { base64Decode } from '../util/json';
 import { M_Y_TO_Z, M_Z_TO_Y, toZUp, trsToZUp, type TRS } from './axes';
 import { lookupFile, utf8Decode } from './bytes';
@@ -69,6 +71,8 @@ interface ParsedMesh {
   mesh: MeshData;
   /** glTF material index per slot (null = no material). */
   slots: (number | null)[];
+  /** Morph targets as shape keys: full positions (Z-up) of every target and its default weight. */
+  shapeKeys: { name: string; value: number; positions: number[] }[];
 }
 
 interface TextureRef {
@@ -96,8 +100,9 @@ interface ParsedNode {
 
 interface ParsedChannel {
   node: number;
-  path: 'translation' | 'rotation' | 'scale';
+  path: 'translation' | 'rotation' | 'scale' | 'weights';
   times: Float64Array;
+  /** Values per key: 3 (translation, scale), 4 (rotation) or one per morph target (weights). */
   values: Float64Array;
   interpolation: Interpolation;
 }
@@ -322,11 +327,14 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
       uv: Float64Array | null;
       colors: Float64Array | null;
       colorSize: number;
+      /** Morph target POSITION deltas (Z-up), one array per target (null: no delta). */
+      targets: (Float64Array | null)[];
     }
     const blocks: Block[] = [];
     const blockOf = new Map<string, Block>();
     let anyUV = false;
     let degenerate = 0;
+    let targetCount = 0;
     for (const prim of gm.primitives ?? []) {
       if (prim.extensions && Object.keys(prim.extensions).some((e) => GEOMETRY_COMPRESSION.has(e))) {
         warn('Compressed (Draco/meshopt) primitives are not supported and were skipped');
@@ -337,7 +345,7 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
         warn('Primitive without POSITION skipped');
         continue;
       }
-      if (prim.targets && prim.targets.length) warn('Morph targets are not supported and were ignored');
+      if (prim.targets && prim.targets.length) targetCount = Math.max(targetCount, prim.targets.length);
       if (attrs.JOINTS_0 !== undefined || attrs.WEIGHTS_0 !== undefined)
         warn('Skinning (joints/weights) is not supported and was ignored');
       if (Object.keys(attrs).some((a) => /^TEXCOORD_[1-9]/.test(a)))
@@ -374,6 +382,18 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
               ? colAcc.values
               : null,
           colorSize: colAcc?.size ?? 4,
+          targets: (prim.targets ?? []).map((t) => {
+            if (t.POSITION === undefined) return null;
+            const d = readAccessor(t.POSITION);
+            if (d.size !== 3 || d.count !== pos.count) return null;
+            const out = new Float64Array(d.count * 3);
+            for (let i = 0; i < d.count; i++) {
+              out[i * 3] = d.values[i * 3];
+              out[i * 3 + 1] = -d.values[i * 3 + 2] + 0;
+              out[i * 3 + 2] = d.values[i * 3 + 1];
+            }
+            return out;
+          }),
         };
         blocks.push(block);
         blockOf.set(key, block);
@@ -503,8 +523,24 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
       looseEdges.push(lines[i], lines[i + 1]);
     }
     const onlyNone = slots.length === 0 || (slots.length === 1 && slots[0] === null);
+    // morph targets → shape keys (relative to the basis = the mesh); NORMAL deltas are not needed
+    // (normals are recomputed from the shapes)
+    const names: unknown = (gm.extras as { targetNames?: unknown } | undefined)?.targetNames;
+    const shapeKeys: ParsedMesh['shapeKeys'] = [];
+    for (let k = 0; k < targetCount; k++) {
+      const shape = positions.slice();
+      for (const bl of blocks) {
+        const d = bl.targets[k];
+        if (d) for (let i = 0; i < bl.count * 3; i++) shape[bl.offset * 3 + i] += d[i];
+      }
+      const name =
+        Array.isArray(names) && typeof names[k] === 'string' ? (names[k] as string) : `Key ${k + 1}`;
+      const v = gm.weights?.[k];
+      shapeKeys.push({ name, value: typeof v === 'number' && Number.isFinite(v) ? v : 0, positions: shape });
+    }
     return {
       name: gm.name ?? '',
+      shapeKeys,
       slots: onlyNone ? [] : slots,
       mesh: createMesh({
         positions,
@@ -773,11 +809,7 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
     for (const ch of anim.channels ?? []) {
       const path = ch.target?.path;
       if (ch.target?.node === undefined) continue;
-      if (path === 'weights') {
-        warn('Morph target (weights) animation was ignored');
-        continue;
-      }
-      if (path !== 'translation' && path !== 'rotation' && path !== 'scale') {
+      if (path !== 'translation' && path !== 'rotation' && path !== 'scale' && path !== 'weights') {
         warn(`Animation path '${path}' is not supported`);
         continue;
       }
@@ -792,9 +824,16 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
         warn(`Animation channel skipped: ${err instanceof Error ? err.message : String(err)}`);
         continue;
       }
-      const size = path === 'rotation' ? 4 : 3;
       const keys = input.count;
       const cubic = sampler.interpolation === 'CUBICSPLINE';
+      // weights: one value per morph target and key (CUBICSPLINE: in-tangent, value, out-tangent)
+      const size =
+        path === 'rotation'
+          ? 4
+          : path === 'weights'
+            ? Math.round(output.values.length / (Math.max(1, keys) * (cubic ? 3 : 1)))
+            : 3;
+      if (!(size > 0)) continue;
       const values = new Float64Array(keys * size);
       for (let k = 0; k < keys; k++)
         for (let c = 0; c < size; c++) {
@@ -862,6 +901,31 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
     };
     const nodeObject = new Map<number, { id: string; parentConverted: boolean; selfConverted: boolean }>();
     let firstCamera: string | null = null;
+    /** Shape keys of a parsed mesh; slider ranges cover the default and animated weights. */
+    const shapeKeysOf = (pm: ParsedMesh, gltfMesh: number): ShapeKeyData[] => {
+      const lo = pm.shapeKeys.map((k) => Math.min(0, k.value));
+      const hi = pm.shapeKeys.map((k) => Math.max(1, k.value));
+      for (const ch of channels) {
+        if (ch.path !== 'weights' || json.nodes?.[ch.node]?.mesh !== gltfMesh) continue;
+        const n = pm.shapeKeys.length;
+        for (let i = 0; i < ch.values.length; i++) {
+          const k = i % n;
+          if (k < lo.length) {
+            lo[k] = Math.min(lo[k], ch.values[i]);
+            hi[k] = Math.max(hi[k], ch.values[i]);
+          }
+        }
+      }
+      return pm.shapeKeys.map((k, i) => ({
+        name: k.name,
+        value: k.value,
+        slider_min: Math.max(-10, lo[i]),
+        slider_max: Math.min(10, hi[i]),
+        mute: false,
+        relative_key: '',
+        data: encodeFloat32(k.positions),
+      }));
+    };
 
     const localTransform = (n: ParsedNode, parentConverted: boolean, selfConverted: boolean) => {
       if (n.trs) {
@@ -901,8 +965,10 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
       let dataName: string | undefined;
       if (type === 'MESH') {
         let mid = meshIds.get(n.mesh!);
-        if (!mid)
+        if (!mid) {
           meshIds.set(n.mesh!, (mid = doc.addMesh(pm!.name || n.name || opts.name || 'Mesh', pm!.mesh)));
+          if (pm!.shapeKeys.length) doc.setShapeKeys(mid, shapeKeysOf(pm!, n.mesh!));
+        }
         data = mid;
         slots = pm!.slots.map((s) => (s === null ? null : materialId(s)));
         dataName = pm!.name || undefined;
@@ -955,6 +1021,41 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
     for (const ch of channels) {
       const target = nodeObject.get(ch.node);
       if (!target) continue;
+      if (ch.path === 'weights') {
+        // morph target weights → shape key values of the node's mesh
+        const gm = json.nodes?.[ch.node]?.mesh;
+        const meshId = gm !== undefined ? meshIds.get(gm) : undefined;
+        const keysOf = meshId ? doc.getShapeKeys(meshId) : [];
+        const n = keysOf.length;
+        if (!meshId || !n || ch.values.length !== ch.times.length * n) {
+          if (meshId && !n)
+            warn('Morph target (weights) animation of a mesh without morph targets was ignored');
+          continue;
+        }
+        const k0 = `${meshId}:weights`;
+        if (animated.has(k0)) {
+          warn('Several animations target the same morph weights; only the first was imported');
+          continue;
+        }
+        animated.add(k0);
+        keysOf.forEach((key, k) => {
+          const fc = createFCurve({
+            target_type: 'mesh',
+            target_id: meshId,
+            path: `shape_keys[${JSON.stringify(key.name)}].value`,
+            index: 0,
+          });
+          const keyframes: Keyframe[] = [];
+          for (let i = 0; i < ch.times.length; i++)
+            keyframes.push({
+              frame: ch.times[i] * fps + scene.frame_start,
+              value: ch.values[i * n + k],
+              interpolation: ch.interpolation,
+            });
+          doc.setFCurve({ ...fc, keyframes });
+        });
+        continue;
+      }
       const path =
         ch.path === 'translation' ? 'location' : ch.path === 'rotation' ? 'rotation_euler' : 'scale';
       const k = `${target.id}:${path}`;

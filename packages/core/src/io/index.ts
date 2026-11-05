@@ -47,8 +47,12 @@ export function exportMimeType(format: ExportFormat): string {
 
 /**
  * Exports the scene (default: every object visible in renders, evaluated at frame_start with
- * modifiers applied). OBJ/STL/PLY contain world-space meshes; glTF keeps the object hierarchy,
- * materials, cameras, lights and transform animation.
+ * modifiers applied). OBJ/STL/PLY contain world-space meshes; glTF keeps the object hierarchy
+ * (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures
+ * baked, into generated UVs on meshes without UVs), cameras, lights and the animation sampled per
+ * frame from the evaluated scene (transforms from keyframes, drivers, constraints, IK and physics;
+ * shape keys as morph targets; Armature-deformed meshes as glTF skins; other deformation baked to
+ * morph targets). `warnings` lists what the format could not represent.
  */
 export function exportScene(doc: SceneDoc, format: ExportFormat, opts: ExportOptions = {}): ExportResult {
   switch (format) {

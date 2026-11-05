@@ -82,6 +82,21 @@ function editorPositions(mesh: MeshData, world: Mat4): number[] {
   return out;
 }
 
+/** Largest distance from a point of one set to the nearest point of the other (both ways). */
+function pointSetDistance(a: number[], b: number[]): number {
+  const one = (p: number[], q: number[]) => {
+    let worst = 0;
+    for (let i = 0; i < p.length; i += 3) {
+      let best = Infinity;
+      for (let j = 0; j < q.length; j += 3)
+        best = Math.min(best, Math.hypot(p[i] - q[j], p[i + 1] - q[j + 1], p[i + 2] - q[j + 2]));
+      worst = Math.max(worst, best);
+    }
+    return worst;
+  };
+  return Math.max(one(a, b), one(b, a));
+}
+
 function keyed(target: string, path: string, index: number, keys: [number, number][]) {
   let fc = createFCurve({ target_type: 'object', target_id: target, path, index });
   for (const [f, v] of keys) fc = insertKeyframe(fc, f, v, 'LINEAR');
@@ -389,6 +404,70 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
       const got = gltfNodePositions(json, bin, n, gltfPose(json, bin, (frame - 1) / FPS));
       expectClose(got, editorPositions(o.mesh!, o.worldMatrix), 1e-4, `shape keys @${frame}`);
     }
+  });
+
+  it('round-trips morph targets as shape keys with their animation (import)', () => {
+    const doc = SceneDoc.create({ empty: true });
+    doc.updateScene({ frame_start: 1, frame_end: 9, fps: FPS });
+    const meshId = doc.addMesh('Gripper', createCube({ size: 1 }));
+    const obj = doc.addObject({ type: 'MESH', name: 'Gripper', data: meshId });
+    const base = doc.getMesh(meshId)!.positions;
+    const grip = base.map((v, i) => (i % 3 === 0 && base[i] > 0 ? v - 0.3 : v));
+    doc.setShapeKeys(meshId, [
+      {
+        name: 'Grip',
+        value: 0.25,
+        slider_min: 0,
+        slider_max: 1,
+        mute: false,
+        relative_key: '',
+        data: encodeFloat32(grip),
+      },
+    ]);
+    let fc = createFCurve({
+      target_type: 'mesh',
+      target_id: meshId,
+      path: 'shape_keys["Grip"].value',
+      index: 0,
+    });
+    fc = insertKeyframe(fc, 1, 0, 'LINEAR');
+    fc = insertKeyframe(fc, 9, 1, 'LINEAR');
+    doc.setFCurve(fc);
+    const doc2 = SceneDoc.create({ empty: true });
+    doc2.updateScene({ frame_start: 1, frame_end: 9, fps: FPS });
+    const res = importFile(doc2, 'glb', exportScene(doc, 'glb').data);
+    expect(res.warnings.join('\n')).not.toMatch(/Morph/);
+    const o2 = doc2.findObjectByName('Gripper')!;
+    const keys = doc2.getShapeKeys(o2.data!);
+    expect(keys.map((k) => k.name)).toEqual(['Grip']);
+    const ev1 = new SceneEvaluator(doc);
+    const ev2 = new SceneEvaluator(doc2);
+    for (const frame of [1, 5, 9]) {
+      const a = ev1.evaluate(frame).byId.get(obj)!;
+      const b = ev2.evaluate(frame).byId.get(o2.id)!;
+      // the importer splits vertices like the exporter's render buffers: compare world positions
+      expectClose(
+        editorPositions(b.mesh!, b.worldMatrix),
+        editorPositions(a.mesh!, a.worldMatrix),
+        1e-4,
+        `@${frame}`,
+      );
+    }
+  });
+
+  it('re-imports a skinned mesh at its rest pose in world space', () => {
+    const { doc, hose } = rigScene();
+    const doc2 = SceneDoc.create({ empty: true });
+    importFile(doc2, 'glb', exportScene(doc, 'glb').data);
+    const h2 = doc2.findObjectByName('Hose')!;
+    const rest = new SceneEvaluator(doc).evaluate(1, { forRender: true }).byId.get(hose)!;
+    const imported = new SceneEvaluator(doc2).evaluate(1, { forRender: true }).byId.get(h2.id)!;
+    expect(
+      pointSetDistance(
+        editorPositions(imported.mesh!, imported.worldMatrix),
+        editorPositions(rest.mesh!, rest.worldMatrix),
+      ),
+    ).toBeLessThan(1e-4);
   });
 
   it('samples rigid body simulation results', () => {
