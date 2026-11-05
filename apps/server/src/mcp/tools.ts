@@ -52,8 +52,14 @@ import {
   updateModifier,
 } from './modifiers';
 import { MAX_IMPORT_BYTES, fetchLimited } from './fetch-limited';
-import { keyTargetData, keyframeTarget, notAnimatable } from './keyframes';
-import { findOperatorGroup, operatorGroupNames } from './operator-groups';
+import {
+  keyTargetData,
+  keyframeTarget,
+  missingPathReason,
+  notAnimatable,
+  unsetProceduralParam,
+} from './keyframes';
+import { findOperatorGroup, operatorGroupNames, toolOnlyOperator } from './operator-groups';
 import type { AnimationOutput, FrameOptions, Renderer } from '../render';
 import type { RenderStore, StoredFile } from '../render/store';
 import {
@@ -499,6 +505,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       agent.forget(id);
       const deleted = await rooms.deleteProject(id);
       if (!deleted) throw new ToolError(`Project '${project}' not found.`);
+      // like DELETE /api/projects/:id: its stored renders are no longer downloadable
+      renderStore.forgetProject(id);
       return { deleted: id };
     },
   );
@@ -570,20 +578,23 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       include_parameters: z.boolean().optional(),
     },
     async ({ category, search, include_parameters }) => {
-      let list = operatorCatalogue(registry).filter((o) => !registry.get(o.id)?.uiOnly);
+      // operators replaced by tools (renders) are not listed: run_operator refuses them
+      let list = operatorCatalogue(registry).filter(
+        (o) => !registry.get(o.id)?.uiOnly && !toolOnlyOperator(o.id),
+      );
       const categories = [...new Set(list.map((o) => o.category))].sort();
+      let group: ReturnType<typeof findOperatorGroup> = null;
       if (category) {
         const c = category.trim().toLowerCase();
-        const exact = list.filter((o) => o.category.toLowerCase() === c);
-        if (exact.length) list = exact;
-        else {
-          const group = findOperatorGroup(c);
-          if (!group)
-            throw new ToolError(
-              `Unknown category '${category}'. Categories: ${categories.join(', ')}. Feature groups: ${operatorGroupNames().join(', ')}.`,
-            );
-          list = list.filter((o) => group.match(o.id));
-        }
+        group = findOperatorGroup(c);
+        const g = group;
+        // a registry category and a feature group of the same name (Text, Curve(s) …): both
+        const matching = list.filter((o) => o.category.toLowerCase() === c || !!g?.match(o.id));
+        if (!matching.length && !group)
+          throw new ToolError(
+            `Unknown category '${category}'. Categories: ${categories.join(', ')}. Feature groups: ${operatorGroupNames().join(', ')}.`,
+          );
+        list = matching;
       }
       if (search) {
         const s = search.toLowerCase();
@@ -592,6 +603,15 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const detailed = include_parameters ?? (!!(category || search) && list.length <= 60);
       return {
         count: list.length,
+        ...(group
+          ? {
+              group: {
+                name: group.name,
+                description: group.description,
+                ...(group.tools ? { tools: group.tools } : {}),
+              },
+            }
+          : {}),
         categories,
         groups: operatorGroupNames(),
         modifier_types: modifierTypes().map((m) => m.type),
@@ -679,6 +699,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const def = registry.get(operator)!;
       if (def.uiOnly)
         throw new ToolError(`'${operator}' is only available in the browser editor UI (try editor_command).`);
+      const refused = toolOnlyOperator(operator);
+      if (refused) throw new ToolError(refused);
       applySelection(p, selection);
       const res = p.run(operator, params ?? {});
       p.publishPresence();
@@ -719,13 +741,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       let failed = 0;
       p.step(() => {
         for (const op of operations) {
-          if (!registry.has(op.operator)) {
+          const refused = registry.has(op.operator)
+            ? toolOnlyOperator(op.operator)
+            : `unknown operator${suggestOperators(registry, op.operator)}`;
+          if (refused) {
             failed++;
-            results.push({
-              operator: op.operator,
-              ok: false,
-              error: `unknown operator${suggestOperators(registry, op.operator)}`,
-            });
+            results.push({ operator: op.operator, ok: false, error: refused });
             if (stop_on_error) break;
             continue;
           }
@@ -1172,7 +1193,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Apply modifier',
       description:
-        "Apply (bake) a modifier into the object's mesh data and remove it from the stack (like Blender's Apply; destructive to the base mesh). Mesh objects only: convert curves and text with run_operator object.convert {target: MESH} (bakes all their modifiers).",
+        'Apply (bake) a modifier into the object\'s mesh data and remove it from the stack (like Blender\'s Apply; destructive to the base mesh). Mesh objects only: convert a curve or text object to a mesh, which bakes all of its modifiers, with run_operator {operator: "object.convert", params: {target: "MESH"}, selection: {objects: ["<name>"]}} (object.convert acts on the selection).',
       annotations: EDIT,
     },
     { project: projectArg, object: objectArg, modifier: z.string().min(1) },
@@ -1217,6 +1238,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       if (o.type !== 'MESH' || !o.data) throw new ToolError(`'${o.name}' is not a mesh object.`);
       if (!registry.has(a.operator))
         throw new ToolError(`Unknown operator '${a.operator}'.${suggestOperators(registry, a.operator)}`);
+      const refused = toolOnlyOperator(a.operator);
+      if (refused) throw new ToolError(refused);
       const mode = inferSelectMode(a.selection, a.select_mode);
       const res = p.step(() => {
         p.state.mode = 'OBJECT';
@@ -1291,7 +1314,16 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const sample = keyTargetData(p, t.type, t.id);
       if (!isAnimatable(t.type, t.path) || !sample) throw new ToolError(notAnimatable(t));
       const pose = /^pose\.bones\[(["'])(.+)\1\]\.(location|rotation_euler|scale)$/.exec(t.path);
-      const len = pose ? 3 : propertyLength(t.type, t.path, sample);
+      // a bone that was never posed has no pose channel yet, and a procedural texture parameter
+      // that was never set is not stored: both are created below before they are keyed
+      const unposed = !!pose && !p.scene.getObject(t.id)?.pose?.bones?.[pose[2]];
+      const unsetParam = t.type === 'material' ? unsetProceduralParam(sample, t.path) : null;
+      if (!unposed && !unsetParam) {
+        // keying a path that does not resolve would create an F-curve that animates nothing
+        const missing = missingPathReason(sample, t.path);
+        if (missing) throw new ToolError(`'${t.path}' does not exist on ${t.label}: ${missing}.`);
+      }
+      const len = pose ? 3 : unsetParam ? 1 : propertyLength(t.type, t.path, sample);
       if (!len) throw new ToolError(`'${t.path}' does not exist on ${t.label}.`);
       if (values && a.index === undefined && values.length !== len)
         throw new ToolError(`'${t.path}' has ${len} channels; value must have ${len} numbers.`);
@@ -1299,7 +1331,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         throw new ToolError(`'${t.path}' has ${len} channel(s); index must be 0..${len - 1}.`);
       let inserted = 0;
       p.step(() => {
-        if (pose && !p.scene.getObject(t.id)?.pose?.bones?.[pose[2]]) {
+        if (unsetParam)
+          p.runOrThrow('material.procedural_set', {
+            material: t.id,
+            channel: unsetParam.channel,
+            procedural: { params: { [unsetParam.key]: unsetParam.value } },
+          });
+        if (pose && unposed) {
           // a bone that was never posed has no pose channel yet: create it with the rest values
           // (the operator checks that the bone exists) so it can be keyed like any property
           const channel = pose[3];

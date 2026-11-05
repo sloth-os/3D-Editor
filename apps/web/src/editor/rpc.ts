@@ -2,10 +2,13 @@ import { effect } from '@preact/signals';
 import { session, toast } from '../app/store';
 import { run, runResult, viewport } from './editor';
 import { telemetry } from '../telemetry/telemetry';
+import type { RenderImageOptions } from '../viewport/engine';
 
 /**
  * Handles RPC requests routed by the server from MCP tools to this live editor:
- *  - `render` { width?, height?, camera?, use_viewport? } → { mime, data_base64, width, height }
+ *  - `render` { width?, height?, camera?, use_viewport?, view?, shading?, frame?, engine?, samples?,
+ *    max_bounces?, denoise?, time_limit?, seed? } → { mime, data_base64, width, height }; rasterized
+ *    unless `engine` is PATHTRACER (see {@link rpcRenderEngineOptions})
  *  - `ui` { command, params } → result of a UI command (view changes, selection, modes,
  *    operators that need the browser, screenshots)
  */
@@ -38,6 +41,7 @@ export function installRpcHandler(): () => void {
               ? (p.shading.toUpperCase() as 'SOLID' | 'MATERIAL' | 'RENDERED' | 'WIREFRAME')
               : null,
           frame: typeof p.frame === 'number' ? p.frame : null,
+          ...rpcRenderEngineOptions(p),
         });
         return { mime: 'image/png', data_base64: r.dataUrl.split(',')[1], width: r.width, height: r.height };
       }
@@ -47,6 +51,24 @@ export function installRpcHandler(): () => void {
     });
     return () => provider.setRpcHandler(null);
   });
+}
+
+/**
+ * Engine options of an RPC `render` request. The server delegates rasterized renders to editors
+ * (it path traces on its own worker pool), so the engine is RASTER unless the request names
+ * `engine: 'PATHTRACER'`; then `samples`, `max_bounces`, `denoise`, `time_limit` (seconds) and
+ * `seed` are honoured and the image is path traced on this editor's render workers.
+ */
+export function rpcRenderEngineOptions(p: Record<string, unknown>): RenderImageOptions {
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+  if (p.engine !== 'PATHTRACER') return { engine: 'RASTER' };
+  const o: RenderImageOptions = { engine: 'PATHTRACER' };
+  if (num(p.samples) !== undefined) o.samples = Math.max(1, Math.round(num(p.samples)!));
+  if (num(p.max_bounces) !== undefined) o.max_bounces = Math.max(0, Math.round(num(p.max_bounces)!));
+  if (typeof p.denoise === 'boolean') o.denoise = p.denoise;
+  if (num(p.time_limit) !== undefined) o.time_limit = Math.max(0, num(p.time_limit)!);
+  if (num(p.seed) !== undefined) o.seed = Math.round(num(p.seed)!);
+  return o;
 }
 
 async function uiCommand(command: string, params: Record<string, unknown>): Promise<unknown> {

@@ -1,16 +1,20 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import {
+  SceneEvaluator,
   rigidBodyCacheInfo,
   safeJsonSchema,
   sanitizeRigidBodyWorld,
   type EnvironmentType,
+  type SceneDoc,
   type WorldSettings,
 } from '@3d-editor/core';
 import type { ProjectSession } from '../../project/session';
 import { Checkbox, ColorField, NumberField, Panel, Row, SelectField, RAD } from '../fields/fields';
 import { SchemaForm } from '../SchemaForm';
 import { animState, setProp } from './prop-edit';
-import { registry, run, runResult } from '../../editor/editor';
+import { registry, run } from '../../editor/editor';
+import { toast } from '../../app/store';
+import { telemetry } from '../../telemetry/telemetry';
 import { defaultThreadCount } from '../../render';
 import { dragEdit } from './ObjectTab';
 
@@ -21,6 +25,13 @@ import { dragEdit } from './ObjectTab';
  */
 
 const BUTTON_ROW = { display: 'flex', gap: '4px', flexWrap: 'wrap' } as const;
+/** Two equal buttons across the panel (Render Image / Render Animation). */
+const RENDER_BUTTONS = {
+  display: 'grid',
+  gridTemplateColumns: '1fr 1fr',
+  gap: '4px',
+  marginTop: '6px',
+} as const;
 
 export function RenderTab({ s }: { s: ProjectSession }) {
   const r = s.doc.getRender();
@@ -51,24 +62,24 @@ export function RenderTab({ s }: { s: ProjectSession }) {
             <Checkbox value={r.use_shadows} label="Shadows" onChange={(v) => set('use_shadows', v)} />
           </Row>
         )}
-        <Row label="">
-          <div style={BUTTON_ROW}>
-            <button
-              class="btn primary"
-              onClick={() => run('render.render', {}, 'ui')}
-              data-testid="render-button"
-            >
-              Render Image (F12)
-            </button>
-            <button
-              class="btn"
-              onClick={() => run('render.render', { animation: true }, 'ui')}
-              data-testid="render-animation-button"
-            >
-              Render Animation (Ctrl F12)
-            </button>
-          </div>
-        </Row>
+        <div style={RENDER_BUTTONS}>
+          <button
+            class="btn primary"
+            title="Render the active camera at the output resolution (F12)"
+            onClick={() => run('render.render', {}, 'ui')}
+            data-testid="render-button"
+          >
+            Render Image
+          </button>
+          <button
+            class="btn"
+            title="Render the frame range into an animated PNG or GIF (Ctrl F12)"
+            onClick={() => run('render.render', { animation: true }, 'ui')}
+            data-testid="render-animation-button"
+          >
+            Render Animation
+          </button>
+        </div>
       </Panel>
       {pathTracer && (
         <>
@@ -291,12 +302,77 @@ const WORLD_LABELS: Record<string, string> = {
   enabled: 'Enabled',
   frame_start: 'Simulation Start',
   frame_end: 'Simulation End',
-  substeps_per_frame: 'Substeps Per Frame',
+  substeps_per_frame: 'Substeps',
   solver_iterations: 'Solver Iterations',
   time_scale: 'Speed',
-  use_gravity: 'Gravity',
+  use_gravity: 'Enabled',
   gravity: 'Gravity',
 };
+
+/** Progress of a rigid body bake: the last simulated frame and the last frame to simulate. */
+export interface BakeProgress {
+  frame: number;
+  end: number;
+}
+
+/**
+ * Bakes the rigid body world of `doc`: simulates frame after frame up to the world's (simulated)
+ * end into the simulation cache that every evaluator of the document shares, in slices of about
+ * `budgetMs` per event loop turn so the editor stays responsive. `onProgress` follows every slice;
+ * `onDone` gets true when the whole range is cached, false when the bake stopped early (cancelled,
+ * nothing to simulate, or failed with `error`). Returns the cancel function.
+ */
+export function bakeRigidBodyWorld(
+  doc: SceneDoc,
+  onProgress: (p: BakeProgress) => void,
+  onDone: (completed: boolean, error?: unknown) => void,
+  budgetMs = 30,
+): () => void {
+  // its own evaluator: the viewport's evaluation caches stay at the current frame
+  const evaluator = new SceneEvaluator(doc);
+  const start = sanitizeRigidBodyWorld(doc.getScene().rigidbody_world).frame_start;
+  let cancelled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  /** Frames simulated per evaluation (grows while evaluations are cheap). */
+  let stride = 1;
+  const finish = (completed: boolean, error?: unknown) => {
+    if (cancelled) return;
+    cancelled = true;
+    onDone(completed, error);
+  };
+  const slice = () => {
+    timer = null;
+    if (cancelled) return;
+    const t0 = performance.now();
+    try {
+      for (;;) {
+        const before = rigidBodyCacheInfo(doc)?.simulated_to ?? start;
+        const t = performance.now();
+        evaluator.evaluate(before + stride);
+        const info = rigidBodyCacheInfo(doc);
+        // stops when the range is cached, or when nothing simulates (no cache, or no progress: the
+        // world was disabled or has no active bodies)
+        if (!info || info.simulated_to >= info.frame_end || info.simulated_to <= before)
+          return finish(!!info && info.simulated_to >= info.frame_end);
+        const ms = performance.now() - t;
+        stride =
+          ms < budgetMs / 8 ? Math.min(stride * 2, 64) : ms > budgetMs ? Math.max(1, stride >> 1) : stride;
+        if (performance.now() - t0 >= budgetMs) {
+          onProgress({ frame: info.simulated_to, end: info.frame_end });
+          break;
+        }
+      }
+    } catch (err) {
+      return finish(false, err);
+    }
+    timer = setTimeout(slice, 0);
+  };
+  timer = setTimeout(slice, 0);
+  return () => {
+    if (timer) clearTimeout(timer);
+    finish(false);
+  };
+}
 
 /**
  * Blender's Scene > Gravity and Scene > Rigid Body World (settings and cache). The per-object rigid
@@ -304,30 +380,35 @@ const WORLD_LABELS: Record<string, string> = {
  */
 function RigidBodyWorldPanels({ s }: { s: ProjectSession }) {
   const [, setTick] = useState(0);
+  const [baking, setBaking] = useState<BakeProgress | null>(null);
+  const cancelBake = useRef<(() => void) | null>(null);
+  // a bake in progress stops with the panel (the frames simulated so far stay cached)
+  useEffect(() => () => cancelBake.current?.(), []);
   const sc = s.doc.getScene();
   const world = sanitizeRigidBodyWorld(sc.rigidbody_world);
   void s.state.$frame.value; // the cache grows while the animation plays
   const values: Record<string, unknown> = { ...world, use_gravity: sc.use_gravity, gravity: sc.gravity };
+  /** Sets one setting on the current scene (the other world settings stay as they are now). */
+  const write = (k: string, v: unknown) => {
+    if (k === 'use_gravity' || k === 'gravity') s.doc.updateScene({ [k]: v });
+    else
+      s.doc.updateScene({
+        rigidbody_world: { ...sanitizeRigidBodyWorld(s.doc.getScene().rigidbody_world), [k]: v },
+      });
+  };
   const set = (k: string, v: unknown, final: boolean) =>
     dragEdit(
       s,
       `scene-rigidbody-world:${k}`,
       final,
+      () => write(k, v),
       () => {
-        if (k === 'use_gravity' || k === 'gravity') s.doc.updateScene({ [k]: v });
-        else
-          s.doc.updateScene({
-            rigidbody_world: { ...sanitizeRigidBodyWorld(s.doc.getScene().rigidbody_world), [k]: v },
-          });
-      },
-      () => {
-        const original = s.doc.getScene();
-        const restore = {
-          rigidbody_world: original.rigidbody_world,
-          use_gravity: original.use_gravity,
-          gravity: original.gravity,
-        };
-        return () => s.doc.updateScene(restore);
+        const sc0 = s.doc.getScene();
+        const before =
+          k === 'use_gravity' || k === 'gravity'
+            ? sc0[k]
+            : (sanitizeRigidBodyWorld(sc0.rigidbody_world) as unknown as Record<string, unknown>)[k];
+        return () => write(k, before);
       },
       () => run('rigidbody.world_set', { [k]: v }, 'ui'),
     );
@@ -351,8 +432,15 @@ function RigidBodyWorldPanels({ s }: { s: ProjectSession }) {
       : 'Nothing cached yet (frames are simulated as the timeline plays)';
   const bake = () => {
     // simulates the whole range now, so playback and scrubbing only read the cache
-    const r = runResult('rigidbody.describe', { frame: world.frame_end }, 'ui');
-    if (r?.ok) setTick((t) => t + 1);
+    cancelBake.current?.();
+    setBaking({ frame: cache?.simulated_to ?? world.frame_start, end: world.frame_end });
+    cancelBake.current = bakeRigidBodyWorld(s.doc, setBaking, (completed, error) => {
+      cancelBake.current = null;
+      setBaking(null);
+      setTick((t) => t + 1);
+      if (error) toast(`Rigid body bake failed: ${error instanceof Error ? error.message : error}`, 'error');
+      else if (completed) telemetry.count('editor.rigidbody.bake');
+    });
   };
   return (
     <>
@@ -374,22 +462,47 @@ function RigidBodyWorldPanels({ s }: { s: ProjectSession }) {
             ? `${bodies.length} rigid bod${bodies.length === 1 ? 'y' : 'ies'} (${active.length} active) · ${cached}`
             : 'No rigid bodies: add them in the Physics tab of an object.'}
         </div>
-        <div style={{ ...BUTTON_ROW, marginTop: '4px' }}>
-          <button
-            class="btn"
-            data-testid="scene-rigidbody-bake"
-            disabled={!bodies.length || !world.enabled}
-            title="Simulate the whole frame range now (playback then reads the cache)"
-            onClick={bake}
+        {baking && (
+          <div
+            role="progressbar"
+            aria-label="Rigid body bake"
+            aria-valuemin={world.frame_start}
+            aria-valuemax={baking.end}
+            aria-valuenow={baking.frame}
+            class="hint"
+            data-testid="scene-rigidbody-baking"
           >
-            Bake
-          </button>
+            Baking frame {baking.frame} of {baking.end}…
+          </div>
+        )}
+        <div style={{ ...BUTTON_ROW, marginTop: '4px' }}>
+          {baking ? (
+            <button
+              class="btn"
+              data-testid="scene-rigidbody-bake-cancel"
+              title="Stop baking (the frames simulated so far stay cached)"
+              onClick={() => cancelBake.current?.()}
+            >
+              Cancel Bake
+            </button>
+          ) : (
+            <button
+              class="btn"
+              data-testid="scene-rigidbody-bake"
+              disabled={!bodies.length || !world.enabled}
+              title="Simulate the whole frame range now (playback then reads the cache)"
+              onClick={bake}
+            >
+              Bake
+            </button>
+          )}
           <button
             class="btn"
             data-testid="scene-rigidbody-free"
             disabled={!cache}
             title="Delete the cached simulation (it is simulated again from the start)"
             onClick={() => {
+              cancelBake.current?.();
               run('rigidbody.cache_free', {}, 'ui');
               setTick((t) => t + 1);
             }}

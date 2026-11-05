@@ -1,4 +1,6 @@
 import {
+  APNGEncoder,
+  PathFilm,
   PathTracer,
   SceneDoc,
   SceneEvaluator,
@@ -23,6 +25,7 @@ import {
   type Vec3,
 } from '@3d-editor/core';
 import type {
+  APNGInit,
   AutoViewResult,
   DocRef,
   EncodeOptions,
@@ -44,8 +47,11 @@ import type {
  * project), path traced renders are prepared once per job and then rendered in bands of rows.
  */
 
-/** Documents kept per render thread (least recently used ones are dropped). */
-const MAX_DOCUMENTS = 2;
+/**
+ * Documents kept per render thread (least recently used ones are dropped): the documents of the
+ * two long renders that may share a thread and of one quick render.
+ */
+const MAX_DOCUMENTS = 3;
 /** Most frames evaluated to frame the automatic view of an animation (as core renderAnimation). */
 const AUTO_VIEW_SAMPLES = 64;
 
@@ -89,6 +95,7 @@ export function pathTraces(o: Pick<FrameOptions, 'engine' | 'shading' | 'wirefra
 export class RenderEngine {
   private readonly docs = new Map<string, CachedDocument>();
   private readonly tracers = new Map<number, PathTracer>();
+  private readonly encoders = new Map<number, APNGEncoder>();
   private clock = 0;
 
   /** The cached document of `ref`, brought up to date with its state update. */
@@ -135,6 +142,7 @@ export class RenderEngine {
     const height = Math.round(options.height);
     const opts = softwareOptions(options);
     const scene = evaluator.evaluate(options.frame, { forRender: true });
+    const setupMs = now() - t0;
     const items = renderItems(scene, { forRender: true }).filter((o) => o.mesh.faces.length > 0);
     const view = resolveView(doc, scene, opts, width / height, evaluatedBounds(items));
     const prepared = preparePathTrace({
@@ -161,6 +169,7 @@ export class RenderEngine {
       displayBackground: prepared.displayBackground ? ([...prepared.displayBackground] as Vec4Tuple) : null,
       warnings: [...prepared.scene.warnings],
       prepareMs: now() - t0,
+      setupMs,
     };
   }
 
@@ -171,8 +180,34 @@ export class RenderEngine {
     return tracer.renderRows(y0, y1, sampleStart, sampleCount);
   }
 
+  /** Frees what a job keeps on this thread (path tracer, APNG encoder). */
   release(job: number): void {
     this.tracers.delete(job);
+    this.encoders.delete(job);
+  }
+
+  /**
+   * Adds the next frame to APNG job `job` (created by its first frame, from `init`): frames are
+   * compressed here instead of on the main thread (core APNGEncoder, so the file is the one core
+   * `renderAnimation` writes).
+   */
+  apngAdd(job: number, frame: RawFrame, init?: APNGInit): { ok: true } {
+    let enc = this.encoders.get(job);
+    if (!enc) {
+      if (!init) throw new Error(`APNG job ${job} is not started on this thread`);
+      enc = new APNGEncoder(init.width, init.height, init.fps, { loop: init.loop });
+      this.encoders.set(job, enc);
+    }
+    enc.addFrame(frame);
+    return { ok: true };
+  }
+
+  /** The APNG file of `job` (its encoder is freed). */
+  apngFinish(job: number): EncodedResult {
+    const enc = this.encoders.get(job);
+    if (!enc) throw new Error(`APNG job ${job} is not started on this thread`);
+    this.encoders.delete(job);
+    return { data: enc.finish() };
   }
 
   /**
@@ -262,10 +297,48 @@ export class RenderEngine {
     return { data: encodePNG(sheet), sheet: { width: sheet.width, height: sheet.height } };
   }
 
-  /** Frees every cached document and tracer. */
-  clear(): void {
+  /** Frees the cached documents (and their evaluator caches); prepared jobs are kept. */
+  clearDocuments(): void {
     for (const e of this.docs.values()) e.doc.destroy();
     this.docs.clear();
+  }
+
+  /** Frees every cached document, tracer and encoder. */
+  clear(): void {
+    this.clearDocuments();
     this.tracers.clear();
+    this.encoders.clear();
+  }
+
+  /**
+   * Renders a tiny scene once, path traced (bands, denoised) and rasterized, so that a new
+   * thread's first real render is not slowed down by JIT compilation: without it, the first
+   * frames of a time-limited render on fresh threads come out at a fraction of their samples.
+   */
+  warmUp(): void {
+    const doc = SceneDoc.create({ name: 'warm-up' });
+    try {
+      const ref: DocRef = { key: '\u0000warm-up', version: 0, update: doc.encodeState() };
+      const options: FrameOptions = {
+        width: 24,
+        height: 16,
+        frame: 1,
+        engine: 'PATHTRACER',
+        samples: 8,
+        max_bounces: 3,
+        denoise: true,
+      };
+      const info = this.prepare(-1, ref, options);
+      const film = new PathFilm(info.width, info.height);
+      for (let s = 0; s < info.samples; s += 2)
+        for (let y = 0; y < info.height; y += 4) film.add(this.rows(-1, y, Math.min(info.height, y + 4), s, 2));
+      this.finish(film.resolve(), { ...info, png: true });
+      this.image(ref, { ...options, engine: 'RASTER', samples: 2 }, true);
+    } finally {
+      this.release(-1);
+      this.docs.get('\u0000warm-up')?.doc.destroy();
+      this.docs.delete('\u0000warm-up');
+      doc.destroy();
+    }
   }
 }

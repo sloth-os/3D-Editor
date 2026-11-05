@@ -2,12 +2,19 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { act, cleanup, fireEvent, render } from '@testing-library/preact';
 import * as Y from 'yjs';
 import { signal } from '@preact/signals';
-import { SceneDoc, SceneEvaluator, defaultBone, fcurveKey } from '@3d-editor/core';
+import {
+  SceneDoc,
+  SceneEvaluator,
+  createEditorState,
+  defaultBone,
+  fcurveKey,
+  type OperatorContext,
+} from '@3d-editor/core';
 import { session as sessionSignal } from '../src/app/store';
 import { registry, run, runResult } from '../src/editor/editor';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
-import { Properties, activePropertiesTab } from '../src/ui/properties/Properties';
+import { Properties, activePropertiesTab, availableTabs } from '../src/ui/properties/Properties';
 import { Outliner } from '../src/ui/Outliner';
 import { layoutConstraintParams, constraintEnumLabel } from '../src/ui/properties/ConstraintsTab';
 import { channelLabel } from '../src/ui/properties/ObjectTab';
@@ -65,6 +72,42 @@ function typeText(el: HTMLElement, value: string): void {
   const input = (el.tagName === 'INPUT' ? el : el.querySelector('input')) as HTMLInputElement;
   fireEvent.input(input, { target: { value } });
   fireEvent.keyDown(input, { key: 'Enter' });
+}
+
+/** Drags a number field horizontally by `dx` pixels; `during` runs while the button is still down. */
+function dragNumber(el: HTMLElement, dx: number, during?: () => void): void {
+  fireEvent.pointerDown(el, { button: 0, clientX: 100, pointerId: 1 });
+  fireEvent.pointerMove(el, { clientX: 100 + dx / 2, pointerId: 1 });
+  if (during) act(during);
+  fireEvent.pointerMove(el, { clientX: 100 + dx, pointerId: 1 });
+  fireEvent.pointerUp(el, { clientX: 100 + dx, pointerId: 1 });
+}
+
+/**
+ * A second replica of the project (another device or an MCP agent) synced both ways like the sync
+ * hub; `run` executes an operator there, outside this session's undo history.
+ */
+function peerReplica(s: ProjectSession): { run: (id: string, params: Record<string, unknown>) => void } {
+  const peer = SceneDoc.fromUpdate(s.doc.encodeState(), { type: 'agent' });
+  s.doc.ydoc.on('update', (u: Uint8Array, origin: unknown) => {
+    if (origin !== 'from-peer') Y.applyUpdate(peer.ydoc, u, 'from-main');
+  });
+  peer.ydoc.on('update', (u: Uint8Array, origin: unknown) => {
+    if (origin !== 'from-main') Y.applyUpdate(s.doc.ydoc, u, 'from-peer');
+  });
+  const ctx: OperatorContext = {
+    doc: peer,
+    state: createEditorState(),
+    origin: peer.origin,
+    source: 'mcp',
+    report: () => undefined,
+  };
+  return {
+    run: (id, params) => {
+      const r = registry.run(ctx, id, params);
+      if (!r.ok) throw new Error(`${id} failed on the peer: ${r.error}`);
+    },
+  };
 }
 
 let s: ProjectSession;
@@ -493,5 +536,184 @@ describe('registry wiring', () => {
     const armature = ok('object.armature_add', { name: 'Arm' }).object as string;
     expect(s.doc.getArmature(s.doc.getObject(armature)!.data!)?.bones.map((b) => b.name)).toEqual(['Bone']);
     expect(defaultBone('X', [0, 0, 0], [0, 0, 1]).name).toBe('X');
+  });
+});
+
+describe('slider drags next to concurrent edits (other devices, MCP agents)', () => {
+  it('releasing a constraint drag keeps constraints an agent added meanwhile', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.empty_add', { name: 'Target', location: [0, 5, 0] });
+    ok('object.constraint_add', { object: 'Cube', type: 'TRACK_TO', target: 'Target' });
+    select(s, 'Cube');
+    const agent = peerReplica(s);
+    activePropertiesTab.value = 'constraints';
+    const { container } = render(<Properties session={s} />);
+    const cube = () => s.doc.findObjectByName('Cube')!;
+    const depth = s.undo.undoStack.length;
+    dragNumber(byTestId(container, 'constraint-Track To-influence')!, -40, () =>
+      agent.run('object.constraint_add', { object: 'Cube', type: 'LIMIT_LOCATION', name: 'AgentLimit' }),
+    );
+    expect(cube().constraints.map((c) => c.name)).toEqual(['Track To', 'AgentLimit']);
+    expect(cube().constraints[0].influence).toBeCloseTo(0.6);
+    // the drag is one undo step, and undoing it only reverts the influence
+    expect(s.undo.undoStack.length).toBe(depth + 1);
+    act(() => {
+      s.undo.undo();
+    });
+    expect(cube().constraints.map((c) => c.name)).toEqual(['Track To', 'AgentLimit']);
+    expect(cube().constraints[0].influence).toBe(1);
+  });
+
+  it('particle, rigid body, world and F-modifier drags keep what others changed meanwhile', () => {
+    ok('mesh.primitive_plane_add', { name: 'Ground', size: 4 });
+    ok('object.particle_system_add', { object: 'Ground' });
+    select(s, 'Ground');
+    ok('rigidbody.object_add', { objects: ['Ground'], type: 'ACTIVE' });
+    ok('anim.keyframe_insert_property', {
+      target_type: 'object',
+      target: 'Ground',
+      path: 'location',
+      index: 0,
+    });
+    ok('anim.fmodifier_add', { target: 'Ground', path: 'location', index: 0, type: 'NOISE' });
+    const agent = peerReplica(s);
+    const ground = () => s.doc.findObjectByName('Ground')!;
+    activePropertiesTab.value = 'particles';
+    localStorage.setItem('3d-editor:panel:object-fcurves', '1');
+    const { container } = render(<Properties session={s} />);
+
+    const count = Number(ground().particle_systems[0].settings.count);
+    dragNumber(byTestId(container, 'psys-ParticleSystem-count')!, 50, () =>
+      agent.run('object.particle_system_add', { object: 'Ground', name: 'AgentSystem' }),
+    );
+    expect(ground().particle_systems.map((p) => p.name)).toEqual(['ParticleSystem', 'AgentSystem']);
+    expect(ground().particle_systems[0].settings.count).toBe(count + 50);
+
+    act(() => {
+      activePropertiesTab.value = 'physics';
+    });
+    dragNumber(byTestId(container, 'rigidbody-mass')!, 100, () =>
+      agent.run('rigidbody.object_settings_set', { objects: ['Ground'], friction: 0.9 }),
+    );
+    expect(ground().rigid_body?.friction).toBeCloseTo(0.9);
+    expect(ground().rigid_body?.mass).toBeCloseTo(2);
+
+    fireEvent.click(
+      [...container.querySelectorAll('.panel-header')].find((h) =>
+        h.textContent?.includes('Rigid Body World'),
+      )!,
+    );
+    const substeps = s.doc.getScene().rigidbody_world.substeps_per_frame;
+    dragNumber(byTestId(container, 'rigidbody-world-substeps_per_frame')!, 10, () =>
+      agent.run('rigidbody.world_set', { solver_iterations: 33 }),
+    );
+    expect(s.doc.getScene().rigidbody_world.solver_iterations).toBe(33);
+    expect(s.doc.getScene().rigidbody_world.substeps_per_frame).toBe(substeps + 10);
+
+    act(() => {
+      activePropertiesTab.value = 'object';
+    });
+    dragNumber(byTestId(container, 'fcurve-location-0-mod-0-strength')!, 100, () =>
+      agent.run('anim.keyframe_insert_property', {
+        target_type: 'object',
+        target: 'Ground',
+        path: 'location',
+        index: 0,
+        frame: 20,
+        value: 3,
+      }),
+    );
+    const fc = s.doc.getFCurve(
+      fcurveKey({ target_type: 'object', target_id: ground().id, path: 'location', index: 0 }),
+    )!;
+    expect(fc.keyframes.map((k) => k.frame)).toEqual([1, 20]);
+    expect(fc.modifiers?.[0].params.strength).toBeCloseTo(2);
+  });
+});
+
+describe('review regressions', () => {
+  it('offers the Material tab for curve and text objects (they have material slots)', () => {
+    ok('object.text_add', { name: 'Logo' });
+    ok('curve.primitive_bezier_curve_add', { name: 'Wire' });
+    ok('object.empty_add', { name: 'Empty' });
+    expect(availableTabs(s.doc.findObjectByName('Wire'))).toContain('material');
+    expect(availableTabs(s.doc.findObjectByName('Empty'))).not.toContain('material');
+    select(s, 'Logo');
+    activePropertiesTab.value = 'material';
+    const { container } = render(<Properties session={s} />);
+    expect(byTestId(container, 'prop-tab-material')).not.toBeNull();
+    expect(byTestId(container, 'prop-content-material')).not.toBeNull();
+    fireEvent.click(container.querySelector('button[title="Add slot"]')!);
+    expect(s.doc.findObjectByName('Logo')!.material_slots).toHaveLength(1);
+  });
+
+  it('Add Driver drives the chosen property even when the channel list changed meanwhile', () => {
+    ok('mesh.primitive_plane_add', { name: 'Ground' });
+    ok('object.particle_system_add', { object: 'Ground' });
+    select(s, 'Ground');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-drivers', '1');
+    const { container } = render(<Properties session={s} />);
+    const channel = byTestId(container, 'driver-add-channel') as HTMLSelectElement;
+    const count = [...channel.options].find((o) => o.textContent === 'Count (ParticleSystem)')!;
+    fireEvent.change(channel, { target: { value: count.value } });
+    // a constraint added before the click inserts channels in front of the particle settings
+    act(() => {
+      ok('object.constraint_add', { object: 'Ground', type: 'LIMIT_LOCATION' });
+    });
+    fireEvent.click(byTestId(container, 'driver-add')!);
+    const ground = s.doc.findObjectByName('Ground')!;
+    expect(s.doc.listDrivers(ground.id).map((d) => d.path)).toEqual([
+      'particle_systems["ParticleSystem"].count',
+    ]);
+  });
+
+  it('lists the curves of the object data (Animate Path) with extrapolation and F-modifiers', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('curve.primitive_bezier_circle_add', { name: 'Path' });
+    ok('object.constraint_add', { object: 'Cube', type: 'FOLLOW_PATH', target: 'Path' });
+    const cube = s.doc.findObjectByName('Cube')!;
+    ok('constraint.followpath_path_animate', { object: cube.id, constraint: cube.constraints[0].id });
+    select(s, 'Path');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-fcurves', '1');
+    const { container } = render(<Properties session={s} />);
+    const path = s.doc.findObjectByName('Path')!;
+    const key = fcurveKey({ target_type: 'curve', target_id: path.data!, path: 'eval_time', index: 0 });
+    const box = byTestId(container, 'fcurve-curve-eval_time-0')!;
+    expect(box.textContent).toContain('Evaluation Time');
+    fireEvent.change(byTestId(container, 'fcurve-curve-eval_time-0-extrapolation')!, {
+      target: { value: 'CYCLIC' },
+    });
+    expect(s.doc.getFCurve(key)?.extrapolation).toBe('CYCLIC');
+    fireEvent.pointerDown(byTestId(container, 'fcurve-curve-eval_time-0-add-modifier')!);
+    fireEvent.click(menuItem('Noise')!);
+    expect(s.doc.getFCurve(key)?.modifiers?.map((m) => m.type)).toEqual(['NOISE']);
+    typeNumber(byTestId(container, 'fcurve-curve-eval_time-0-mod-0-strength')!, '4');
+    expect(s.doc.getFCurve(key)?.modifiers?.[0].params.strength).toBe(4);
+    fireEvent.click(byTestId(container, 'fcurve-curve-eval_time-0-mod-0-remove')!);
+    expect(s.doc.getFCurve(key)?.modifiers ?? []).toEqual([]);
+  });
+
+  it('range limits show Min and Max as their own full-width rows', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.constraint_add', { object: 'Cube', type: 'LIMIT_ROTATION' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'constraints';
+    const { container } = render(<Properties session={s} />);
+    for (const [id, label] of [
+      ['constraint-Limit Rotation-min_z', 'Min'],
+      ['constraint-Limit Rotation-max_z', 'Max'],
+    ]) {
+      const field = byTestId(container, id)!;
+      // no inner label overlapping the value
+      expect(field.querySelector('.nf-label')).toBeNull();
+      expect(field.closest('.prop-row')?.querySelector(':scope > label')?.textContent).toBe(label);
+    }
+    expect(
+      byTestId(container, 'constraint-Limit Rotation-use_limit_z')!
+        .closest('.prop-row')
+        ?.querySelector('label')?.textContent,
+    ).toBe('Limit Z');
   });
 });

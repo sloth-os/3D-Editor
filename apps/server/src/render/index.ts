@@ -12,18 +12,20 @@ import { abortable, pathTraceParallel } from './path-trace';
 import { RenderPool, defaultRenderThreads, type RenderPoolLog, type RenderPoolOptions } from './pool';
 import { RenderCancelledError, type DocRef, type FrameOptions, type ImageResult } from './protocol';
 
-export { RenderPool, defaultRenderThreads } from './pool';
-export type { RenderPoolOptions, RenderLease, RenderThread } from './pool';
+export { RenderPool, defaultRenderThreads, MAX_SHARED_RENDERS } from './pool';
+export type { LeaseOptions, RenderPoolOptions, RenderLease, RenderThread } from './pool';
 export { RenderCancelledError, isCancelled } from './protocol';
 export type { FrameOptions, ViewSpecInput } from './protocol';
 export type { AnimationOutput, AnimationProgress } from './animation';
 
 /*
- * Server-side rendering for MCP tools and the REST API, off the event loop: raster renders run on
- * one render thread, path traced renders on all of them (bands of rows, see path-trace.ts) and
- * animations frame by frame in parallel (see animation.ts). Render threads are worker threads
- * (`RENDER_WORKERS`, default: CPU cores up to 8) or, with RENDER_WORKERS=0 or when workers cannot
- * start, the main thread (one band or frame per event loop turn).
+ * Server-side rendering for MCP tools and the REST API, off the event loop: raster stills run on
+ * one free render thread (interactive leases: they never wait for long renders), path traced
+ * images on all render threads (bands of rows, see path-trace.ts) and animations frame by frame in
+ * parallel (see animation.ts); two long renders share the threads (see pool.ts). Render threads
+ * are worker threads (`RENDER_WORKERS`, default: CPU cores up to 8, plus one for interactive
+ * renders) or, with RENDER_WORKERS=0 or when workers cannot start, the main thread (one band or
+ * frame per event loop turn).
  */
 
 /** Largest path traced image (pixels): film, denoiser and display buffers take ~150 bytes per pixel. */
@@ -244,7 +246,7 @@ export class Renderer {
         releaseSlot();
       }
     }
-    const lease = await this.pool.lease(1, req.signal);
+    const lease = await this.pool.lease(1, req.signal, { interactive: true });
     try {
       const img = await abortable(
         lease.threads[0].call<ImageResult>({ type: 'image', doc, options: o, png: true }),

@@ -447,13 +447,13 @@ const RENDER_CANVAS_STYLE = {
   background: 'repeating-conic-gradient(#3a3a3a 0% 25%, #2e2e2e 0% 50%) 50% / 20px 20px',
 } as const;
 
-/** Re-renders the calling component (at most once per animation frame) while `subscribe` reports changes. */
-function useLiveUpdates(subscribe: ((fn: () => void) => () => void) | null): void {
+/** Re-renders the calling component (at most once per animation frame) while `source` reports changes. */
+function useLiveUpdates(source: { subscribe(fn: () => void): () => void } | null): void {
   const [, setTick] = useState(0);
   useEffect(() => {
-    if (!subscribe) return;
+    if (!source) return;
     let raf = 0;
-    const off = subscribe(() => {
+    const off = source.subscribe(() => {
       if (!raf)
         raf = requestAnimationFrame(() => {
           raf = 0;
@@ -464,7 +464,7 @@ function useLiveUpdates(subscribe: ((fn: () => void) => () => void) | null): voi
       off();
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [subscribe]);
+  }, [source]);
 }
 
 /** Calls `onEscape` for the Escape key while mounted (before the dialog and editor keymaps). */
@@ -580,7 +580,12 @@ function RenderImageDialog() {
   const [render, setRender] = useState<StillRender | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [finalUrl, setFinalUrl] = useState<string | null>(null);
+  /** Bumped by Render Again (the effect below starts a new render). */
+  const [pass, setPass] = useState(0);
   useEffect(() => {
+    setRender(null);
+    setError(null);
+    setFinalUrl(null);
     const e = viewport.engine;
     if (!e) {
       setError('No viewport available');
@@ -615,9 +620,9 @@ function RenderImageDialog() {
       clearTimeout(h);
       job?.cancel();
     };
-  }, []);
+  }, [pass]);
   const job = render?.kind === 'path' ? render.job : null;
-  useLiveUpdates(job ? job.subscribe.bind(job) : null);
+  useLiveUpdates(job);
   const onEscape = useCallback(() => {
     if (!job?.running) return false;
     job.cancel();
@@ -642,6 +647,16 @@ function RenderImageDialog() {
               onClick={() => job.cancel()}
             >
               Cancel
+            </button>
+          )}
+          {(render || error) && !job?.running && (
+            <button
+              class="btn"
+              data-testid="render-again"
+              title="Render the scene again as it is now"
+              onClick={() => setPass((n) => n + 1)}
+            >
+              Render Again
             </button>
           )}
           {url && (
@@ -718,7 +733,7 @@ function RenderAnimationDialog() {
   );
   useEffect(() => () => void (resultUrl && URL.revokeObjectURL(resultUrl)), [resultUrl]);
   useEffect(() => () => job?.cancel(), [job]);
-  useLiveUpdates(job ? job.subscribe.bind(job) : null);
+  useLiveUpdates(job);
   const onEscape = useCallback(() => {
     if (!job?.running) return false;
     job.cancel();
@@ -812,7 +827,7 @@ function RenderAnimationDialog() {
       }
     >
       {!running && !result && (
-        <div data-testid="render-animation-settings">
+        <div data-testid="render-animation-settings" style={{ maxWidth: '480px', margin: '0 auto' }}>
           <Row label="Format">
             <SelectField
               value={format}
@@ -878,7 +893,9 @@ function RenderAnimationDialog() {
           ) : job?.lastFrame ? (
             <PixelsCanvas img={job.lastFrame} testId="render-animation-canvas" />
           ) : (
-            <div class="hint">Rendering…</div>
+            <div class="hint" style={{ textAlign: 'center' }}>
+              Rendering frame {st.frame}…
+            </div>
           )}
           <ProgressBar
             fraction={(st.index + (current ? current.status.fraction : 0)) / Math.max(1, st.total)}

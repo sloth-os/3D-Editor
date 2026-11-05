@@ -15,6 +15,7 @@ import {
   type ProceduralParamSpec,
   type ProceduralTexture,
   type ProceduralType,
+  type TextureSlot,
   type Vec3,
   type Vec4,
 } from '@3d-editor/core';
@@ -677,6 +678,35 @@ function TextureChannel(p: {
   const tid = `tex-${channel}`;
   const fileInput = useRef<HTMLInputElement>(null);
   const pickImage = () => fileInput.current?.click();
+  /** The material's texture slots now, with this channel's slot replaced (other channels as they are now). */
+  const texturesWith = (fn: (cur: TextureSlot) => TextureSlot | null) => {
+    const cur = s.doc.getMaterial(m.id);
+    const curSlot = cur?.textures?.[channel];
+    return curSlot ? { ...(cur?.textures ?? {}), [channel]: fn(curSlot) } : null;
+  };
+  /** Image scale / offset: previewed while dragging, one data.set_property on release. */
+  const setImageField = (field: 'scale' | 'offset', v: number[], final: boolean) =>
+    dragEdit(
+      s,
+      `texture:${m.id}:${channel}:${field}`,
+      final,
+      () => {
+        const textures = texturesWith((x) => ({ ...x, [field]: [v[0], v[1]] }));
+        if (textures) s.doc.updateMaterial(m.id, { textures });
+      },
+      () => {
+        const before = s.doc.getMaterial(m.id)?.textures?.[channel]?.[field];
+        return () => {
+          const textures = texturesWith((x) => ({ ...x, [field]: before }));
+          if (textures) s.doc.updateMaterial(m.id, { textures });
+        };
+      },
+      () => {
+        const textures = texturesWith((x) => ({ ...x, [field]: [v[0], v[1]] }));
+        if (textures)
+          run('data.set_property', { kind: 'materials', target: m.id, values: { textures } }, 'ui');
+      },
+    );
   const setSource = (v: TextureSource) => {
     if (v === source) return;
     if (v === 'PROCEDURAL')
@@ -685,7 +715,10 @@ function TextureChannel(p: {
       // a stored image comes back when the procedural texture is removed; otherwise pick a file
       if (slot?.image) run('material.procedural_set', { material: m.id, channel, procedural: null }, 'ui');
       else pickImage();
-    } else setProp(s, 'materials', m.id, 'textures', { ...(m.textures ?? {}), [channel]: null });
+    } else {
+      const textures = texturesWith(() => null);
+      if (textures) setProp(s, 'materials', m.id, 'textures', textures);
+    }
   };
   return (
     <div style={{ ...boxStyle, marginBottom: '4px' }} data-testid={tid}>
@@ -733,16 +766,7 @@ function TextureChannel(p: {
               value={[slot.scale?.[0] ?? 1, slot.scale?.[1] ?? 1]}
               labels={['U', 'V']}
               testId={`${tid}-scale`}
-              onChange={(v, f) =>
-                setProp(
-                  s,
-                  'materials',
-                  m.id,
-                  'textures',
-                  { ...m.textures, [channel]: { ...slot, scale: v } },
-                  f,
-                )
-              }
+              onChange={(v, f) => setImageField('scale', v, f)}
             />
           </Row>
           <Row label="Offset">
@@ -750,16 +774,7 @@ function TextureChannel(p: {
               value={[slot.offset?.[0] ?? 0, slot.offset?.[1] ?? 0]}
               labels={['U', 'V']}
               testId={`${tid}-offset`}
-              onChange={(v, f) =>
-                setProp(
-                  s,
-                  'materials',
-                  m.id,
-                  'textures',
-                  { ...m.textures, [channel]: { ...slot, offset: v } },
-                  f,
-                )
-              }
+              onChange={(v, f) => setImageField('offset', v, f)}
             />
           </Row>
         </>
@@ -789,13 +804,33 @@ const USES_DISTORTION = new Set<ProceduralType>(['NOISE', 'VORONOI', 'WAVE', 'MA
 /** Channels whose texture is used as a single value (the red component of the ramp colours). */
 const SCALAR_CHANNELS = new Set<MaterialTextureChannel>(['roughness', 'metallic', 'normal', 'alpha']);
 
-const paramLabel = (key: string) =>
-  key
-    .replace(/_/g, ' ')
-    .replace(/^\w/, (c) => c.toUpperCase())
-    .replace(/\br\b/, 'R')
-    .replace(/\bg\b/, 'G')
-    .replace(/\bb\b/, 'B');
+/** Labels that differ from the title-cased key (Blender's names, or short enough for the label column). */
+const PARAM_LABELS: Record<string, string> = {
+  color_randomness: 'Random Color',
+  offset_frequency: 'Offset Freq.',
+  squash_frequency: 'Squash Freq.',
+  // enum values
+  FBM: 'fBM',
+  SIN: 'Sine',
+  TRI: 'Triangle',
+  SAW: 'Saw',
+  DISTANCE_TO_EDGE: 'Distance to Edge',
+  XY: 'XY',
+};
+const SMALL_WORDS = new Set(['to', 'of', 'and', 'or']);
+
+/** Title Case label of a parameter key or enum value (`mortar_size` → "Mortar Size"). */
+export function paramLabel(key: string): string {
+  return (
+    PARAM_LABELS[key] ??
+    key
+      .toLowerCase()
+      .split('_')
+      .filter(Boolean)
+      .map((w, i) => (i > 0 && SMALL_WORDS.has(w) ? w : w.charAt(0).toUpperCase() + w.slice(1)))
+      .join(' ')
+  );
+}
 
 /** The texture with one field (or `params.<key>`) changed, for live previews. */
 export function patchProcedural(tex: ProceduralTexture, field: string, value: unknown): ProceduralTexture {
@@ -803,6 +838,32 @@ export function patchProcedural(tex: ProceduralTexture, field: string, value: un
     return { ...tex, params: { ...(tex.params ?? {}), [field.slice(7)]: value as number | string } };
   if (field === 'params') return { ...tex, params: { ...(tex.params ?? {}), ...(value as object) } };
   return { ...tex, [field]: value } as ProceduralTexture;
+}
+
+/**
+ * `tex` with the field a drag previewed (`field` as in {@link patchProcedural}, `value` the
+ * previewed value) put back as it was in `before`; everything else keeps its current value.
+ */
+export function restoreProcedural(
+  tex: ProceduralTexture,
+  before: ProceduralTexture,
+  field: string,
+  value: unknown,
+): ProceduralTexture {
+  const keys = field.startsWith('params.')
+    ? [field.slice(7)]
+    : field === 'params'
+      ? Object.keys(value as object)
+      : null;
+  if (!keys)
+    return { ...tex, [field]: (before as unknown as Record<string, unknown>)[field] } as ProceduralTexture;
+  const params = { ...(tex.params ?? {}) };
+  for (const k of keys) {
+    const old = before.params?.[k];
+    if (old === undefined) delete params[k];
+    else params[k] = old;
+  }
+  return { ...tex, params };
 }
 
 /** The `procedural` argument of material.procedural_set for one field (params are merged by the operator). */
@@ -823,26 +884,25 @@ function ProceduralEditor(p: {
   const params = tex.params ?? {};
   const animPath = (field: string) => `textures.${channel}.procedural.${field}`;
   const st = (field: string) => animState(s, 'material', m.id, animPath(field), 0);
+  /** Replaces this channel's texture in the current material (other channels stay as they are now). */
+  const writeTexture = (fn: (t: ProceduralTexture) => ProceduralTexture) => {
+    const cur = s.doc.getMaterial(m.id);
+    const curTex = channelProcedural(cur, channel);
+    const slot = cur?.textures?.[channel];
+    if (!cur || !curTex || !slot) return;
+    s.doc.updateMaterial(m.id, {
+      textures: { ...cur.textures, [channel]: { ...slot, procedural: fn(curTex) } },
+    });
+  };
   const set = (field: string, value: unknown, final = true) =>
     dragEdit(
       s,
       `procedural:${m.id}:${channel}:${field}`,
       final,
+      () => writeTexture((t) => patchProcedural(t, field, value)),
       () => {
-        const cur = s.doc.getMaterial(m.id);
-        const curTex = channelProcedural(cur, channel);
-        const slot = cur?.textures?.[channel];
-        if (!cur || !curTex || !slot) return;
-        s.doc.updateMaterial(m.id, {
-          textures: {
-            ...cur.textures,
-            [channel]: { ...slot, procedural: patchProcedural(curTex, field, value) },
-          },
-        });
-      },
-      () => {
-        const before = s.doc.getMaterial(m.id)?.textures;
-        return () => before && s.doc.updateMaterial(m.id, { textures: before });
+        const before = channelProcedural(s.doc.getMaterial(m.id), channel);
+        return () => before && writeTexture((t) => restoreProcedural(t, before, field, value));
       },
       () =>
         run(
@@ -861,7 +921,7 @@ function ProceduralEditor(p: {
             value={String(value)}
             testId={`${tid}-${spec.key}`}
             title={spec.description}
-            options={(spec.values ?? []).map((v) => ({ value: v, label: paramLabel(v.toLowerCase()) }))}
+            options={(spec.values ?? []).map((v) => ({ value: v, label: paramLabel(v) }))}
             onChange={(v) => set(`params.${spec.key}`, v)}
           />
         </Row>

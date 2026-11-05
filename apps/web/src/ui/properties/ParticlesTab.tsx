@@ -14,7 +14,7 @@ import { NumberField, Panel, Row, TextField } from '../fields/fields';
 import { SchemaForm, type SchemaChoice } from '../SchemaForm';
 import { Icon } from '../icons';
 import { run, runResult } from '../../editor/editor';
-import { ErrorList, dragEdit, panelEvaluation } from './ObjectTab';
+import { ErrorList, captureField, dragEdit, isRecord, panelEvaluation, withField } from './ObjectTab';
 import { validItems } from './ConstraintsTab';
 
 /*
@@ -79,6 +79,33 @@ const ENUM_LABELS: Record<string, string> = {
 
 /** The particle system selected in the list, per emitter object (local UI state). */
 const activeSystems = signal<Record<string, string>>({});
+
+/** The stored particle system of an object (null when it is gone). */
+function storedSystem(s: ProjectSession, objectId: string, systemId: string): ParticleSystemData | null {
+  const list = s.doc.getObject(objectId)?.particle_systems;
+  return (Array.isArray(list) ? list : []).find((x) => isRecord(x) && x.id === systemId) ?? null;
+}
+
+/**
+ * Sets one setting of a particle system in the current document state (live drag previews and
+ * their restore; undefined removes it): the other systems, including ones added meanwhile by
+ * peers, are kept as stored.
+ */
+function writeSetting(
+  s: ProjectSession,
+  objectId: string,
+  systemId: string,
+  key: string,
+  value: unknown,
+): void {
+  const list = s.doc.getObject(objectId)?.particle_systems;
+  if (!Array.isArray(list) || !storedSystem(s, objectId, systemId)) return;
+  s.doc.updateObject(objectId, {
+    particle_systems: list.map((x) =>
+      isRecord(x) && x.id === systemId ? { ...x, settings: withField(x.settings, key, value) } : x,
+    ),
+  });
+}
 
 /** Objects a particle system can instance: geometry objects and collection instances. */
 function instanceObjectChoices(s: ProjectSession, emitter: ObjectData): SchemaChoice[] {
@@ -236,21 +263,11 @@ function SystemSettings(p: {
       s,
       `psys:${ps.id}:${k}`,
       final,
-      () => {
-        const cur = s.doc.getObject(o.id);
-        if (!cur) return;
-        s.doc.updateObject(o.id, {
-          particle_systems: cur.particle_systems.map((x) =>
-            x.id === ps.id ? { ...x, settings: { ...x.settings, [k]: v } } : x,
-          ),
-        });
-      },
-      () => {
-        const original = s.doc.getObject(o.id)?.particle_systems;
-        return () => {
-          if (original && s.doc.getObject(o.id)) s.doc.updateObject(o.id, { particle_systems: original });
-        };
-      },
+      () => writeSetting(s, o.id, ps.id, k, v),
+      captureField(
+        () => storedSystem(s, o.id, ps.id)?.settings?.[k as keyof ParticleSystemData['settings']],
+        (before) => writeSetting(s, o.id, ps.id, k, before),
+      ),
       () => update({ settings: { [k]: v } }),
     );
   const vertexGroups = o.type === 'MESH' && o.data ? s.doc.getVertexGroups(o.data).map((g) => g.name) : [];

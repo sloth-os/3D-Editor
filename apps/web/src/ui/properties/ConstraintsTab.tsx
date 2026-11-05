@@ -1,3 +1,4 @@
+import { Fragment } from 'preact';
 import { useState } from 'preact/hooks';
 import {
   getConstraintTypeInfo,
@@ -15,7 +16,16 @@ import { Icon } from '../icons';
 import { run } from '../../editor/editor';
 import { constraintAddItems, type MenuItem } from '../../editor/menus';
 import { animState } from './prop-edit';
-import { ErrorList, boneOptions, dragEdit, panelEvaluation, sourceErrors } from './ObjectTab';
+import {
+  ErrorList,
+  boneOptions,
+  captureField,
+  dragEdit,
+  isRecord,
+  panelEvaluation,
+  sourceErrors,
+  withField,
+} from './ObjectTab';
 
 /*
  * Object Constraints tab (Blender's Properties > Object Constraints): the constraint stack of the
@@ -196,18 +206,27 @@ const IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 const isIdentity = (m: unknown) =>
   Array.isArray(m) && m.length === 16 && m.every((v, i) => Math.abs(Number(v) - IDENTITY[i]) < 1e-9);
 
-/** Replaces one constraint of an object in the document (used for live drag previews). */
+/**
+ * Changes one constraint of an object in the current document state (live drag previews and their
+ * restore); the other constraints, including ones added meanwhile by peers, are kept as stored.
+ */
 function writeConstraint(
   s: ProjectSession,
   objectId: string,
   constraintId: string,
   change: (c: ConstraintData) => ConstraintData,
 ): void {
-  const o = s.doc.getObject(objectId);
-  if (!o) return;
+  const list = s.doc.getObject(objectId)?.constraints;
+  if (!Array.isArray(list) || !list.some((c) => isRecord(c) && c.id === constraintId)) return;
   s.doc.updateObject(objectId, {
-    constraints: o.constraints.map((c) => (c.id === constraintId ? change(c) : c)),
+    constraints: list.map((c) => (isRecord(c) && c.id === constraintId ? change(c) : c)),
   });
+}
+
+/** The stored constraint of an object (null when it is gone). */
+function readConstraint(s: ProjectSession, objectId: string, constraintId: string): ConstraintData | null {
+  const list = s.doc.getObject(objectId)?.constraints;
+  return (Array.isArray(list) ? list : []).find((c) => isRecord(c) && c.id === constraintId) ?? null;
 }
 
 export function ConstraintsTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
@@ -400,22 +419,29 @@ function ConstraintBody(p: {
   const hasBone = !!c.subtarget && bones.length > 0;
   const units: Record<string, string> = {};
   for (const [k, v] of Object.entries(props)) if (/metre|meter/i.test(v.description ?? '')) units[k] = ' m';
+  const writeParam = (k: string, v: unknown) =>
+    writeConstraint(s, o.id, c.id, (x) => ({ ...x, params: withField(x.params, k, v) }));
   const setParam = (k: string, v: unknown, final: boolean) =>
     dragEdit(
       s,
       `constraint:${c.id}:${k}`,
       final,
-      () => writeConstraint(s, o.id, c.id, (x) => ({ ...x, params: { ...x.params, [k]: v } })),
-      captureConstraints(s, o.id),
+      () => writeParam(k, v),
+      captureField(
+        () => readConstraint(s, o.id, c.id)?.params?.[k],
+        (before) => writeParam(k, before),
+      ),
       () => update({ params: { [k]: v } }),
     );
+  const writeInfluence = (v: unknown) =>
+    typeof v === 'number' && writeConstraint(s, o.id, c.id, (x) => ({ ...x, influence: v }));
   const setInfluence = (v: number, final: boolean) =>
     dragEdit(
       s,
       `constraint:${c.id}:influence`,
       final,
-      () => writeConstraint(s, o.id, c.id, (x) => ({ ...x, influence: v })),
-      captureConstraints(s, o.id),
+      () => writeInfluence(v),
+      captureField(() => readConstraint(s, o.id, c.id)?.influence, writeInfluence),
       () => update({ influence: v }),
     );
   const influencePath = constraintPath(c, 'influence');
@@ -475,33 +501,50 @@ function ConstraintBody(p: {
           );
         if (item.kind === 'limit') {
           const on = !!params[item.flag];
-          return (
-            <Row key={k} label={item.label} title={props[item.flag]?.description}>
-              <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
-                <Checkbox
-                  value={on}
-                  testId={`${tid}-${item.flag}`}
-                  onChange={(v) => setParam(item.flag, v, true)}
+          const valueField = (key: string) => {
+            const angle = /radian/i.test(props[key]?.description ?? '');
+            return (
+              <div style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55 }}>
+                <NumberField
+                  value={Number(params[key] ?? 0)}
+                  step={angle ? 1 : 0.01}
+                  unit={angle ? '°' : units[key]}
+                  {...(angle ? RAD : {})}
+                  title={props[key]?.description}
+                  testId={`${tid}-${key}`}
+                  onChange={(v, final) => setParam(key, v, final)}
                 />
-                {item.keys.map((key) => {
-                  const angle = /radian/i.test(props[key]?.description ?? '');
-                  return (
-                    <div key={key} style={{ flex: 1, minWidth: 0, opacity: on ? 1 : 0.55 }}>
-                      <NumberField
-                        value={Number(params[key] ?? 0)}
-                        label={item.keys.length > 1 ? (key.startsWith('min') ? 'Min' : 'Max') : undefined}
-                        step={angle ? 1 : 0.01}
-                        unit={angle ? '°' : units[key]}
-                        {...(angle ? RAD : {})}
-                        title={props[key]?.description}
-                        testId={`${tid}-${key}`}
-                        onChange={(v, final) => setParam(key, v, final)}
-                      />
-                    </div>
-                  );
-                })}
               </div>
-            </Row>
+            );
+          };
+          const checkbox = (
+            <Checkbox
+              value={on}
+              testId={`${tid}-${item.flag}`}
+              onChange={(v) => setParam(item.flag, v, true)}
+            />
+          );
+          if (item.keys.length === 1)
+            return (
+              <Row key={k} label={item.label} title={props[item.flag]?.description}>
+                <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                  {checkbox}
+                  {valueField(item.keys[0])}
+                </div>
+              </Row>
+            );
+          // Blender's layout of a range limit: the toggle, then full-width Min and Max rows
+          return (
+            <Fragment key={k}>
+              <Row label={item.label} title={props[item.flag]?.description}>
+                {checkbox}
+              </Row>
+              {item.keys.map((key) => (
+                <Row key={key} label={key.startsWith('min') ? 'Min' : 'Max'} title={props[key]?.description}>
+                  {valueField(key)}
+                </Row>
+              ))}
+            </Fragment>
           );
         }
         return (
@@ -603,14 +646,4 @@ function ConstraintBody(p: {
       </Row>
     </>
   );
-}
-
-/** Captures an object's constraint list; returns the function restoring it. */
-function captureConstraints(s: ProjectSession, objectId: string): () => () => void {
-  return () => {
-    const original = s.doc.getObject(objectId)?.constraints;
-    return () => {
-      if (original && s.doc.getObject(objectId)) s.doc.updateObject(objectId, { constraints: original });
-    };
-  };
 }

@@ -1,10 +1,13 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { h } from 'preact';
 import { signal } from '@preact/signals';
-import { SceneDoc, SceneEvaluator } from '@3d-editor/core';
+import { cleanup, fireEvent, render } from '@testing-library/preact';
+import { SceneDoc, SceneEvaluator, fcurveKey, safeJsonSchema } from '@3d-editor/core';
 import { session as sessionSignal } from '../src/app/store';
 import { hoveredArea, popupMenu, registry, run, runResult } from '../src/editor/editor';
-import { lastOperator } from '../src/editor/runner';
+import { lastOperator, redoLast } from '../src/editor/runner';
+import { SchemaForm } from '../src/ui/SchemaForm';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import { registerUiOperators } from '../src/editor/ui-operators';
 import { installKeymap } from '../src/editor/keymap';
@@ -270,5 +273,115 @@ describe('keymap', () => {
     } finally {
       uninstall();
     }
+  });
+});
+
+/**
+ * The Adjust Last Operation form of the last operator, wired like the viewport's redo panel:
+ * every change re-runs the operator with the new parameters.
+ */
+function redoPanel(): HTMLElement {
+  cleanup();
+  const last = lastOperator.value!;
+  const def = registry.get(last.id)!;
+  const params = (last.params ?? {}) as Record<string, unknown>;
+  return render(
+    h(SchemaForm, {
+      schema: safeJsonSchema(def.schema),
+      values: params,
+      doc: s.doc,
+      exclude: ['enter_editmode', 'name', 'objects', 'object'],
+      testIdPrefix: 'redo',
+      onChange: (k: string, v: unknown, final: boolean) => {
+        if (final) expect(redoLast(s, registry, { ...params, [k]: v })?.ok, `redo ${k}`).toBe(true);
+      },
+    }),
+  ).container as HTMLElement;
+}
+
+const field = (root: HTMLElement, id: string) => root.querySelector<HTMLElement>(`[data-testid="${id}"]`)!;
+
+/** Types into a Blender-style number field (click, type, Enter). */
+function typeNumber(el: HTMLElement, value: string): void {
+  fireEvent.pointerDown(el, { button: 0, clientX: 5, pointerId: 1 });
+  fireEvent.pointerUp(el, { button: 0, clientX: 5, pointerId: 1 });
+  const input = el.querySelector('input')!;
+  fireEvent.input(input, { target: { value } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+}
+
+describe('Adjust Last Operation after the menu operators', () => {
+  afterEach(cleanup);
+
+  it('Camera Turntable: the camera picker lists cameras and "none" creates a new camera again', () => {
+    ok('object.camera_add', { name: 'Camera' });
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    expect(click(entry(OBJECT_MENU(), ['Animation', 'Camera Turntable']))).toBe(true);
+    let panel = redoPanel();
+    const camera = field(panel, 'redo-camera') as HTMLSelectElement;
+    expect([...camera.options].map((o) => o.textContent)).toEqual(['— none —', 'Camera', 'Turntable Camera']);
+    fireEvent.change(camera, { target: { value: s.doc.findObjectByName('Camera')!.id } });
+    expect(s.doc.findObjectByName('Turntable Camera')).toBeNull();
+    panel = redoPanel();
+    fireEvent.change(field(panel, 'redo-camera'), { target: { value: '' } });
+    expect(lastOperator.value?.id).toBe('anim.turntable');
+    expect(s.doc.findObjectByName('Turntable Camera')?.type).toBe('CAMERA');
+  });
+
+  it('Align Objects keeps at least one axis', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('mesh.primitive_uv_sphere_add', { name: 'Sphere', location: [4, 0, 0] });
+    select(s, 'Sphere', 'Cube');
+    expect(click(entry(OBJECT_MENU(), ['Transform', 'Align Objects']))).toBe(true);
+    const sphere = () => s.doc.findObjectByName('Sphere')!;
+    expect(sphere().location[0]).toBeCloseTo(0);
+    let panel = redoPanel();
+    fireEvent.click(field(panel, 'redo-axis-0'));
+    // nothing was re-run: the alignment stays
+    expect(sphere().location[0]).toBeCloseTo(0);
+    expect(lastOperator.value?.params).toMatchObject({ axis: ['X'] });
+    fireEvent.click(field(panel, 'redo-axis-1'));
+    expect(lastOperator.value?.params).toMatchObject({ axis: ['X', 'Y'] });
+    panel = redoPanel();
+    fireEvent.click(field(panel, 'redo-axis-0'));
+    expect(lastOperator.value?.params).toMatchObject({ axis: ['Y'] });
+    expect(sphere().location[0]).toBeCloseTo(4);
+  });
+
+  it('Convert shows its Mesh/Curve target as a choice, not an object picker', () => {
+    ok('object.text_add', { name: 'Label' });
+    select(s, 'Label');
+    expect(click(entry(OBJECT_MENU(), ['Convert', 'Mesh']))).toBe(true);
+    const target = field(redoPanel(), 'redo-target') as HTMLSelectElement;
+    expect([...target.options].map((o) => o.value)).toEqual(['MESH', 'CURVE']);
+    expect(target.value).toBe('MESH');
+  });
+
+  it('Add Bezier: unset location, rotation and scale show their effective values', () => {
+    s.state.cursorLocation = [1, 2, 3];
+    expect(click(entry(ADD_MENU, ['Curve', 'Bezier']))).toBe(true);
+    const panel = redoPanel();
+    const shown = (key: string) =>
+      [0, 1, 2].map((i) => field(panel, `redo-${key}-${i}`).querySelector('.nf-value')?.textContent);
+    expect(shown('location')).toEqual(['1', '2', '3']);
+    expect(shown('scale')).toEqual(['1', '1', '1']);
+    typeNumber(field(panel, 'redo-scale-0'), '2');
+    const curve = s.doc.listObjects().find((o) => o.type === 'CURVE')!;
+    expect(curve.scale).toEqual([2, 1, 1]);
+    expect(curve.location).toEqual([1, 2, 3]);
+  });
+
+  it('Make Cyclic also loops the curves of the object data (a path animated by Follow Path)', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('curve.primitive_bezier_circle_add', { name: 'Path' });
+    ok('object.constraint_add', { object: 'Cube', type: 'FOLLOW_PATH', target: 'Path' });
+    const cube = s.doc.findObjectByName('Cube')!;
+    ok('constraint.followpath_path_animate', { object: cube.id, constraint: cube.constraints[0].id });
+    select(s, 'Path');
+    expect(click(entry(OBJECT_MENU(), ['Animation', 'Extrapolation', 'Make Cyclic']))).toBe(true);
+    const path = s.doc.findObjectByName('Path')!;
+    const key = fcurveKey({ target_type: 'curve', target_id: path.data!, path: 'eval_time', index: 0 });
+    expect(s.doc.getFCurve(key)?.extrapolation).toBe('CYCLIC');
   });
 });

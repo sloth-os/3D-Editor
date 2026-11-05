@@ -1,4 +1,12 @@
-import { ANIMATABLE, type AnimTargetType } from '@3d-editor/core';
+import {
+  ANIMATABLE,
+  getPathValue,
+  parseDataPath,
+  proceduralParamSpec,
+  type AnimTargetType,
+  type PathSegment,
+  type ProceduralType,
+} from '@3d-editor/core';
 import { ToolError, type AgentProject } from './agent';
 
 /*
@@ -149,4 +157,102 @@ export function keyTargetData(
     case 'curve':
       return rec(d.getCurve(id));
   }
+}
+
+/** `segs` written as a data path (`constraints["Track To"].influence`, `splines[0]` …). */
+function formatPath(segs: readonly PathSegment[]): string {
+  let out = '';
+  for (const seg of segs) {
+    if (seg.kind === 'prop') out += out ? `.${seg.name}` : seg.name;
+    else if (seg.kind === 'key') out += `[${JSON.stringify(seg.key)}]`;
+    else out += `[${seg.index}]`;
+  }
+  return out;
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  v !== null && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Uint8Array);
+
+/** A value insert_keyframe can key: a number, a boolean or a vector of numbers. */
+function keyable(v: unknown): boolean {
+  return (
+    typeof v === 'number' ||
+    typeof v === 'boolean' ||
+    (Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'number'))
+  );
+}
+
+/** Keyable properties of a record and of its `params` / `settings` bag (for messages). */
+function keyableNames(rec: Record<string, unknown>): string[] {
+  const names = Object.keys(rec).filter((k) => keyable(rec[k]));
+  for (const bag of ['params', 'settings']) {
+    const b = rec[bag];
+    if (isRecord(b)) names.push(...Object.keys(b).filter((k) => keyable(b[k])));
+  }
+  return [...new Set(names)];
+}
+
+function listNames(names: string[], max = 24): string {
+  const shown = names.slice(0, max).join(', ');
+  return names.length > max ? `${shown}, … (${names.length} in all)` : shown;
+}
+
+/**
+ * Why `path` does not lead to a keyable value of `root` (a datablock as stored), or null when it
+ * does. The message names the first part of the path that does not exist and what exists there,
+ * e.g. `constraints has no "Nope" (it has: "Track To")`.
+ */
+export function missingPathReason(root: Record<string, unknown>, path: string): string | null {
+  let segs: PathSegment[];
+  try {
+    segs = parseDataPath(path);
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+  let container: unknown = root;
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    const value = getPathValue(root, formatPath(segs.slice(0, i + 1)));
+    if (value === undefined) {
+      const where = i ? formatPath(segs.slice(0, i)) : 'it';
+      if (seg.kind === 'index') {
+        const n = Array.isArray(container) ? container.length : 0;
+        return Array.isArray(container)
+          ? `${where} has ${n} item${n === 1 ? '' : 's'}, there is no index ${seg.index}`
+          : `${where} is not a list`;
+      }
+      if (seg.kind === 'key') {
+        const names = Array.isArray(container)
+          ? container.map((e) => (isRecord(e) && typeof e.name === 'string' ? JSON.stringify(e.name) : null))
+          : isRecord(container)
+            ? Object.keys(container).map((k) => JSON.stringify(k))
+            : [];
+        const known = names.filter((n): n is string => !!n);
+        return `${where} has no ${JSON.stringify(seg.key)} (${known.length ? `it has: ${listNames(known)}` : 'it is empty'})`;
+      }
+      if (!isRecord(container)) return `${where} has no property '${seg.name}'`;
+      const names = keyableNames(container);
+      return `${where} has no property '${seg.name}'${names.length ? ` (keyable there: ${listNames(names)})` : ''}`;
+    }
+    container = value;
+  }
+  return keyable(container) ? null : `'${path}' is not a number, boolean or vector`;
+}
+
+/**
+ * A material path to a procedural texture parameter that is valid for the texture's type but not
+ * stored yet (type-specific params are only stored once set): `{ channel, key, default }`, so the
+ * caller can store the default before keying it. Null otherwise.
+ */
+export function unsetProceduralParam(
+  material: Record<string, unknown>,
+  path: string,
+): { channel: string; key: string; value: number } | null {
+  const m = /^textures\.(\w+)\.procedural\.(\w+)$/.exec(path);
+  if (!m) return null;
+  const tex = getPathValue(material, `textures.${m[1]}.procedural`);
+  if (!isRecord(tex) || typeof tex.type !== 'string' || getPathValue(tex, m[2]) !== undefined) return null;
+  const spec = proceduralParamSpec(tex.type as ProceduralType, m[2]);
+  if (!spec || spec.kind === 'enum' || typeof spec.default !== 'number') return null;
+  return { channel: m[1], key: m[2], value: spec.default };
 }

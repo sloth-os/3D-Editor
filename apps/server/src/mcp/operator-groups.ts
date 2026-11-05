@@ -2,12 +2,20 @@
  * Feature groups for `list_operators`: operators of one feature are spread over several registry
  * categories (constraint operators live in Object and Pose, curve operators in Add, Curve, Text
  * and Object, …), so agents can also filter by these task-oriented groups.
+ *
+ * Also the operators agents reach through dedicated tools instead of run_operator / batch /
+ * edit_mesh (`toolOnlyOperator`): the core render operators would render on the server's main
+ * thread and stall every editor and agent until they are done.
  */
 
 /** A task-oriented group of operators (matched by operator id). */
 export interface OperatorGroup {
   name: string;
   description: string;
+  /** Other names the group is found by (e.g. the registry category it extends). */
+  aliases?: string[];
+  /** MCP tools to use for this feature (listed with the operators). */
+  tools?: string[];
   match: (id: string) => boolean;
 }
 
@@ -114,10 +122,41 @@ export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
   },
   {
     name: 'Rendering',
-    description: 'Software renders and animation renders',
-    match: prefix('render.'),
+    aliases: ['Render'],
+    description:
+      'Render with the render_image (stills: RASTER previews, PATHTRACER finals) and render_animation (contact sheets, GIF, APNG, PNG sequences) tools; render settings with set_scene_settings. These operators set up what renders show: cameras, tracking, sky and mist',
+    tools: ['render_image', 'render_animation', 'set_scene_settings', 'set_active_camera'],
+    match: any(prefix('world.'), ids('object.camera_add', 'object.track_set')),
   },
 ];
+
+/** Operators replaced by MCP tools, with the tool and how to use it instead. */
+const TOOL_ONLY: Record<string, { tool: string; usage: string }> = {
+  'render.render_software': {
+    tool: 'render_image',
+    usage:
+      'same options (width, height, engine RASTER | PATHTRACER, samples, max_bounces, denoise, time_limit, seed, camera, view, frame); it returns the image',
+  },
+  'render.render_animation': {
+    tool: 'render_animation',
+    usage:
+      'format CONTACT_SHEET | GIF | APNG | PNG_SEQUENCE, frame_start, frame_end, frame_step, width, height, engine, samples, time_limit, store; frames render in parallel and the result comes back as an image or files',
+  },
+};
+
+/**
+ * Why `id` cannot be run through run_operator / batch / edit_mesh and which tool to use instead,
+ * or null when it can: render operators (`render.*`) render on the event loop of the server.
+ */
+export function toolOnlyOperator(id: string): string | null {
+  if (!id.startsWith('render.')) return null;
+  const t = TOOL_ONLY[id] ?? TOOL_ONLY['render.render_software'];
+  return (
+    `'${id}' would render on the server's main thread and stall every editor and agent until it is done, ` +
+    `so it is not available through run_operator, batch or edit_mesh. Use the ${t.tool} tool instead ` +
+    `(${t.usage}): it renders on the server's render threads.`
+  );
+}
 
 const normalize = (s: string) =>
   s
@@ -125,10 +164,13 @@ const normalize = (s: string) =>
     .replace(/[\s_-]+/g, '')
     .replace(/s$/, '');
 
-/** The group named `name` (case-insensitive; spaces, underscores and a plural "s" are ignored). */
+/**
+ * The group named `name` or one of its aliases (case-insensitive; spaces, underscores and a
+ * plural "s" are ignored).
+ */
 export function findOperatorGroup(name: string): OperatorGroup | null {
   const n = normalize(name);
-  return OPERATOR_GROUPS.find((g) => normalize(g.name) === n) ?? null;
+  return OPERATOR_GROUPS.find((g) => [g.name, ...(g.aliases ?? [])].some((x) => normalize(x) === n)) ?? null;
 }
 
 /** Names of the feature groups, in listing order. */

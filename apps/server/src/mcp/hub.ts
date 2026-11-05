@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import {
+  isInitializeRequest,
+  isJSONRPCRequest,
+  type JSONRPCNotification,
+  type RequestId,
+} from '@modelcontextprotocol/sdk/types.js';
 import type { OperatorRegistry } from '@3d-editor/core';
 import type { ServerConfig } from '../config';
 import type { ServerMetrics } from '../observability/metrics';
@@ -47,6 +52,12 @@ export interface McpHubOptions {
 
 function rpcError(code: number, message: string) {
   return { jsonrpc: '2.0', error: { code, message }, id: null };
+}
+
+/** Ids of the JSON-RPC requests in a POST body (a message or a batch), except `initialize`. */
+function requestIds(body: unknown): RequestId[] {
+  const messages = Array.isArray(body) ? body : [body];
+  return messages.filter((m) => isJSONRPCRequest(m) && m.method !== 'initialize').map((m) => m.id);
 }
 
 /**
@@ -132,6 +143,23 @@ export class McpHub {
     }
   }
 
+  /**
+   * Cancels a request of a session as if the client had sent `notifications/cancelled`: its
+   * handler's abort signal fires (renders stop) and no response is sent.
+   */
+  private cancel(session: McpSession, requestId: RequestId, reason: string): void {
+    const notification: JSONRPCNotification = {
+      jsonrpc: '2.0',
+      method: 'notifications/cancelled',
+      params: { requestId, reason },
+    };
+    try {
+      session.transport.onmessage?.(notification);
+    } catch (err) {
+      this.opts.log.debug({ err: errorMessage(err), session: session.id }, 'cancelling an MCP request failed');
+    }
+  }
+
   private async handle(
     request: FastifyRequest,
     reply: FastifyReply,
@@ -139,6 +167,16 @@ export class McpHub {
     body?: unknown,
   ): Promise<void> {
     this.track(session, reply);
+    // A POST's responses go out on its own response stream; without an event store (no stream
+    // resumption) they can never be delivered once the client is gone (agent killed, connection
+    // dropped). Cancel those requests then, so a render does not hold render threads until its
+    // time limit for nobody.
+    const ids = requestIds(body);
+    if (ids.length)
+      reply.raw.once('close', () => {
+        if (reply.raw.writableFinished || session.closed) return;
+        for (const id of ids) this.cancel(session, id, 'the client disconnected');
+      });
     reply.hijack();
     try {
       await session.transport.handleRequest(request.raw, reply.raw, body);

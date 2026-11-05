@@ -28,11 +28,14 @@ import {
 import {
   filterPresets,
   materialSwatchPixels,
+  paramLabel,
   patchProcedural,
   proceduralPatch,
+  restoreProcedural,
   textureSource,
 } from '../src/ui/properties/MaterialTab';
-import { mistDensityForDistance } from '../src/ui/properties/SceneTabs';
+import { rpcRenderEngineOptions } from '../src/editor/rpc';
+import { bakeRigidBodyWorld, mistDensityForDistance } from '../src/ui/properties/SceneTabs';
 import { DialogHost, formatRenderTime } from '../src/ui/dialogs/Dialogs';
 import { InProcessWorker, RenderPool, startPathTrace } from '../src/render';
 
@@ -122,7 +125,7 @@ describe('Object Data tab: curves', () => {
     expect(curve().use_fill_caps).toBe(true);
     fireEvent.change(byTestId(container, 'curve-twist')!, { target: { value: 'Z_UP' } });
     expect(curve().twist_mode).toBe('Z_UP');
-    expect(byTestId(container, 'curve-taper-note')?.textContent).toMatch(/radius/);
+    expect(byTestId(container, 'curve-taper-note')?.textContent).toMatch(/radius/i);
 
     // 2D curves offer the 2D fill modes and no twist method
     fireEvent.click(byTestId(container, 'curve-dimensions-2D')!);
@@ -529,7 +532,7 @@ describe('Scene, World and Render tabs', () => {
     expect(w().environment).toBe('NONE');
   });
 
-  it('edits the rigid body world and bakes or frees its cache', () => {
+  it('edits the rigid body world and bakes or frees its cache', async () => {
     ok('mesh.primitive_plane_add', { name: 'Ground', size: 10 });
     ok('mesh.primitive_cube_add', { name: 'Box', location: [0, 0, 3] });
     ok('rigidbody.object_add', { objects: ['Ground'], type: 'PASSIVE' });
@@ -540,7 +543,12 @@ describe('Scene, World and Render tabs', () => {
     expect(s.doc.getScene().rigidbody_world.frame_end).toBe(20);
     typeNumber(byTestId(container, 'scene-rigidbody-world-substeps_per_frame')!, '5');
     expect(s.doc.getScene().rigidbody_world.substeps_per_frame).toBe(5);
+    // the bake runs in slices between event loop turns, with progress and a Cancel button
     fireEvent.click(byTestId(container, 'scene-rigidbody-bake')!);
+    expect(byTestId(container, 'scene-rigidbody-bake-cancel')).not.toBeNull();
+    await waitFor(() => expect(byTestId(container, 'scene-rigidbody-bake')).not.toBeNull(), {
+      timeout: 10_000,
+    });
     expect(rigidBodyCacheInfo(s.doc)?.simulated_to).toBe(20);
     expect(byTestId(container, 'scene-rigidbody-cache')?.textContent).toContain('Cached frames 1–20');
     fireEvent.click(byTestId(container, 'scene-rigidbody-free')!);
@@ -548,6 +556,41 @@ describe('Scene, World and Render tabs', () => {
     fireEvent.click(byTestId(container, 'scene-rigidbody-bake-keyframes')!);
     expect(s.doc.findObjectByName('Box')!.rigid_body).toBeNull();
   });
+});
+
+describe('rigid body bake', () => {
+  it('simulates in slices with progress, and stops when cancelled', async () => {
+    ok('mesh.primitive_plane_add', { name: 'Ground', size: 10 });
+    ok('mesh.primitive_cube_add', { name: 'Box', location: [0, 0, 3] });
+    ok('rigidbody.object_add', { objects: ['Ground'], type: 'PASSIVE' });
+    ok('rigidbody.object_add', { objects: ['Box'], type: 'ACTIVE' });
+    ok('rigidbody.world_set', { frame_end: 60 });
+    const progress: number[] = [];
+    const done = await new Promise<boolean>((resolve) =>
+      bakeRigidBodyWorld(s.doc, (p) => progress.push(p.frame), resolve, 2),
+    );
+    expect(done).toBe(true);
+    expect(rigidBodyCacheInfo(s.doc)?.simulated_to).toBe(60);
+    expect(progress.length).toBeGreaterThan(1);
+    expect([...progress].sort((a, b) => a - b)).toEqual(progress);
+    // cancelled: the frames simulated so far stay cached
+    ok('rigidbody.cache_free');
+    let result: boolean | null = null;
+    const cancel = bakeRigidBodyWorld(
+      s.doc,
+      () => cancel(),
+      (completed) => (result = completed),
+      1,
+    );
+    await waitFor(() => expect(result).toBe(false));
+    const partial = rigidBodyCacheInfo(s.doc)?.simulated_to ?? 0;
+    expect(partial).toBeGreaterThan(1);
+    expect(partial).toBeLessThan(60);
+    // nothing simulates any more (world disabled, a partial cache left): stops at once
+    ok('rigidbody.world_set', { enabled: false });
+    expect(await new Promise((resolve) => bakeRigidBodyWorld(s.doc, () => undefined, resolve))).toBe(false);
+    expect(rigidBodyCacheInfo(s.doc)?.simulated_to).toBe(partial);
+  }, 30_000);
 });
 
 describe('render window', () => {
@@ -576,6 +619,13 @@ describe('render window', () => {
     expect(status).toContain('Sample 3/3');
     expect(byTestId(container, 'render-save')).not.toBeNull();
     expect(byTestId(container, 'render-cancel')).toBeNull();
+    // Render Again starts a new render of the scene as it is now
+    const first = byTestId(container, 'render-image')!.getAttribute('src');
+    s.doc.updateObject(s.doc.findObjectByName('Cube')!.id, { location: [0.6, 0, 0] });
+    fireEvent.click(byTestId(container, 'render-again')!);
+    await waitFor(() => expect(byTestId(container, 'render-image')).toBeNull());
+    await waitFor(() => expect(byTestId(container, 'render-image')).not.toBeNull(), { timeout: 10_000 });
+    expect(byTestId(container, 'render-image')!.getAttribute('src')).not.toBe(first);
   });
 
   it('cancels with Escape and keeps the image', async () => {
@@ -624,7 +674,164 @@ describe('render window', () => {
   });
 });
 
+/** Drags a number field by `dx` pixels; `during` runs while the button is still down. */
+function dragNumber(el: HTMLElement, dx: number, during?: () => void): void {
+  fireEvent.pointerDown(el, { button: 0, clientX: 10, pointerId: 1 });
+  fireEvent.pointerMove(el, { clientX: 10 + dx / 2, pointerId: 1 });
+  fireEvent.pointerMove(el, { clientX: 10 + dx, pointerId: 1 });
+  if (during) act(during);
+  fireEvent.pointerUp(el, { button: 0, clientX: 10 + dx, pointerId: 1 });
+}
+
+/** A change made by another device or an MCP agent (not this editor's undo history). */
+const remote = (fn: () => void) => s.doc.transact(fn, 'remote-peer');
+
+describe('slider drags', () => {
+  it('preview live and commit once; edits made elsewhere during a drag survive the release', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.shape_key_add', { object: 'Cube', name: 'A' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const meshId = s.doc.findObjectByName('Cube')!.data!;
+    fireEvent.click(byTestId(container, 'shape-key-A')!);
+    const steps = s.undo.undoStack.length;
+    let previewed = -1;
+    dragNumber(byTestId(container, 'shape-key-value')!, 40, () => {
+      previewed = s.doc.getShapeKeys(meshId)[0].value;
+      // an agent adds a key while the slider is held
+      remote(() =>
+        s.doc.setShapeKeys(meshId, [
+          ...s.doc.getShapeKeys(meshId),
+          { ...s.doc.getShapeKeys(meshId)[0], name: 'B', value: 0 },
+        ]),
+      );
+    });
+    // previewed live (40 px at 0.01 per pixel), committed once on release
+    expect(previewed).toBeCloseTo(0.4);
+    const keys = s.doc.getShapeKeys(meshId);
+    expect(keys.map((k) => k.name)).toEqual(['A', 'B']);
+    expect(keys[0].value).toBeCloseTo(0.4);
+    expect(s.undo.undoStack.length).toBe(steps + 1);
+    act(() => void s.undo.undo());
+    expect(s.doc.getShapeKeys(meshId).map((k) => [k.name, k.value])).toEqual([
+      ['A', 0],
+      ['B', 0],
+    ]);
+  });
+
+  it('restores only the dragged procedural parameter and rigid body world setting', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    ok('material.new', { name: 'Paint' });
+    const matId = s.doc.findObjectByName('Cube')!.material_slots[0]!;
+    ok('material.procedural_set', { material: matId, channel: 'base_color', procedural: { type: 'NOISE' } });
+    activePropertiesTab.value = 'material';
+    const view = render(<Properties session={s} />);
+    const scale0 = s.doc.getMaterial(matId)!.textures.base_color!.procedural!.scale;
+    dragNumber(byTestId(view.container, 'tex-base_color-scale')!, 30, () =>
+      remote(() => {
+        const m = s.doc.getMaterial(matId)!;
+        const roughness = {
+          image: '',
+          scale: [1, 1] as [number, number],
+          offset: [0, 0] as [number, number],
+        };
+        s.doc.updateMaterial(matId, { roughness: 0.25, textures: { ...m.textures, roughness } });
+      }),
+    );
+    const m = s.doc.getMaterial(matId)!;
+    expect(m.textures.base_color!.procedural!.scale).toBeCloseTo(scale0 + 3);
+    expect(m.textures.roughness).toBeTruthy();
+    expect(m.roughness).toBe(0.25);
+    view.unmount();
+
+    activePropertiesTab.value = 'scene';
+    const { container } = render(<Properties session={s} />);
+    dragNumber(byTestId(container, 'scene-rigidbody-world-substeps_per_frame')!, 20, () =>
+      remote(() => s.doc.updateScene({ gravity: [0, 0, -3] })),
+    );
+    expect(s.doc.getScene().gravity).toEqual([0, 0, -3]);
+    expect(s.doc.getScene().rigidbody_world.substeps_per_frame).toBeGreaterThan(10);
+  });
+});
+
+describe('Object Data tab: cameras', () => {
+  it('edits the depth of field the path tracer renders', () => {
+    s.doc.populateDefaultScene();
+    select(s, 'Camera');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const cam = () => s.doc.getCamera(s.doc.findObjectByName('Camera')!.data!)!;
+    // the panel starts closed while depth of field is off
+    expect(byTestId(container, 'camera-dof')).toBeNull();
+    fireEvent.click(
+      [...container.querySelectorAll('.panel-header')].find((h) => h.textContent === '▸Depth of Field')!,
+    );
+    fireEvent.click(
+      byTestId(container, 'camera-dof')!.querySelector('input') ?? byTestId(container, 'camera-dof')!,
+    );
+    expect(cam().dof_use).toBe(true);
+    typeNumber(byTestId(container, 'camera-dof-distance')!, '4.5');
+    expect(cam().dof_focus_distance).toBeCloseTo(4.5);
+    typeNumber(byTestId(container, 'camera-dof-fstop')!, '1.4');
+    expect(cam().dof_aperture_fstop).toBeCloseTo(1.4);
+  });
+});
+
 describe('helpers', () => {
+  it('maps the engine options of RPC renders (rasterized unless PATHTRACER is asked for)', () => {
+    expect(rpcRenderEngineOptions({})).toEqual({ engine: 'RASTER' });
+    expect(rpcRenderEngineOptions({ engine: 'RASTER', samples: 64 })).toEqual({ engine: 'RASTER' });
+    expect(
+      rpcRenderEngineOptions({
+        engine: 'PATHTRACER',
+        samples: 31.6,
+        max_bounces: -2,
+        denoise: false,
+        time_limit: 5,
+        seed: 'x',
+      }),
+    ).toEqual({ engine: 'PATHTRACER', samples: 32, max_bounces: 0, denoise: false, time_limit: 5 });
+  });
+
+  it('labels procedural parameters and values like Blender', () => {
+    expect(paramLabel('mortar_size')).toBe('Mortar Size');
+    expect(paramLabel('mortar_r')).toBe('Mortar R');
+    expect(paramLabel('DISTANCE_TO_EDGE')).toBe('Distance to Edge');
+    expect(paramLabel('QUADRATIC_SPHERE')).toBe('Quadratic Sphere');
+    expect(paramLabel('SIN')).toBe('Sine');
+    expect(paramLabel('color_randomness')).toBe('Random Color');
+  });
+
+  it('restores the dragged field of a procedural texture', () => {
+    const tex = {
+      type: 'NOISE' as const,
+      mapping: 'GENERATED' as const,
+      scale: 5,
+      detail: 2,
+      roughness: 0.5,
+      distortion: 0,
+      color_a: [0, 0, 0, 1] as [number, number, number, number],
+      color_b: [1, 1, 1, 1] as [number, number, number, number],
+      ramp_low: 0,
+      ramp_high: 1,
+      seed: 0,
+      params: { noise_type: 'FBM', offset_x: 1 },
+    };
+    const now = { ...tex, scale: 9, seed: 4, params: { noise_type: 'RIDGED', offset_x: 3, offset_y: 2 } };
+    expect(restoreProcedural(now, tex, 'scale', 9)).toEqual({ ...now, scale: 5 });
+    expect(restoreProcedural(now, tex, 'params.noise_type', 'RIDGED').params).toEqual({
+      noise_type: 'FBM',
+      offset_x: 3,
+      offset_y: 2,
+    });
+    expect(restoreProcedural(now, tex, 'params', { offset_x: 3, offset_y: 2 }).params).toEqual({
+      noise_type: 'RIDGED',
+      offset_x: 1,
+    });
+  });
+
   it('maps curve fields to their operators and keeps spline points', () => {
     expect(curveFieldOperator('o', 'bevel_depth', 1)).toEqual({
       id: 'curve.properties_set',

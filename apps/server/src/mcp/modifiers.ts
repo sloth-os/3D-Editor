@@ -400,8 +400,9 @@ export function applyModifier(
 ): ModifierChange {
   if (!operatorsApply(object))
     throw new ToolError(
-      `Modifiers of ${object.type === 'FONT' ? 'text' : 'curve'} objects cannot be applied one by one; convert the object to a mesh instead ` +
-        `(run_operator object.convert {"target": "MESH"} bakes the curve geometry with every modifier).`,
+      `Modifiers of ${object.type === 'FONT' ? 'text' : 'curve'} objects cannot be applied one by one; convert the object to a mesh instead, ` +
+        `which bakes its geometry with every modifier: run_operator {"operator": "object.convert", "params": {"target": "MESH"}, ` +
+        `"selection": {"objects": [${JSON.stringify(object.name)}]}} (object.convert converts the selected objects).`,
     );
   return p.step(() => {
     const names = operatorParamNames(registry, 'object.modifier_apply');

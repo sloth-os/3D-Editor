@@ -71,6 +71,11 @@ export function registerProjectRoutes(
 ): void {
   const renderer = () => opts.renderer ?? sharedRenderer({ log: app.log });
   const renderStore = opts.renderStore ?? sharedRenderStore();
+  /** Renders in progress (path traced ones may take minutes): cancelled when the server stops. */
+  const rendering = new Set<AbortController>();
+  app.addHook('preClose', async () => {
+    for (const abort of rendering) abort.abort();
+  });
 
   /** Loads a project or replies 404/503. */
   async function roomOr404(id: string, reply: FastifyReply): Promise<Room | null> {
@@ -179,12 +184,13 @@ export function registerProjectRoutes(
       cameraId = cam.id;
     }
     const engine = q.data.engine ?? render.engine;
-    // a client that goes away cancels its render
+    // a client that goes away cancels its render, and so does a server shutdown
     const abort = new AbortController();
     const onClose = () => {
       if (!reply.raw.writableFinished) abort.abort();
     };
     reply.raw.once('close', onClose);
+    rendering.add(abort);
     try {
       const result = await withSpan(
         'project.render',
@@ -220,11 +226,15 @@ export function registerProjectRoutes(
       if (result.pathtrace) reply.header('x-render-samples', String(result.pathtrace.samples));
       return reply.send(Buffer.from(png.buffer, png.byteOffset, png.byteLength));
     } catch (err) {
-      if (isCancelled(err)) return reply.code(499).send({ error: 'render cancelled' });
+      if (isCancelled(err))
+        return reply
+          .code(abort.signal.aborted && reply.raw.writable ? 503 : 499)
+          .send({ error: 'render cancelled' });
       if (err instanceof RenderRequestError) return reply.code(400).send({ error: err.message });
       if (isNotImplemented(err)) return reply.code(501).send({ error: errorMessage(err) });
       return reply.code(500).send({ error: `render failed: ${errorMessage(err)}` });
     } finally {
+      rendering.delete(abort);
       reply.raw.off('close', onClose);
     }
   });

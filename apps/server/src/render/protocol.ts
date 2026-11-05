@@ -67,8 +67,13 @@ export interface PreparedInfo {
   viewTransform: ViewTransform;
   displayBackground: Vec4Tuple | null;
   warnings: string[];
-  /** Milliseconds spent evaluating and compiling the scene. */
+  /** Milliseconds spent loading the document, evaluating and compiling the scene. */
   prepareMs: number;
+  /**
+   * Part of `prepareMs` spent loading the document and evaluating the scene (animation, physics,
+   * modifiers): like core `renderSceneSoftware`, time limits cover compiling and sampling only.
+   */
+  setupMs: number;
 }
 
 /** A rendered image: RGBA8 pixels (top row first) and/or the PNG file (when requested). */
@@ -139,7 +144,24 @@ export type WorkerRequest =
     }
   /** Encodes kept animation frames as a GIF or a contact sheet PNG (frame buffers transferred). */
   | { type: 'encode'; id: number; frames: RawFrame[]; options: EncodeOptions }
+  /**
+   * Adds the next frame of APNG job `job` (frames in order; the encoder of the job lives on this
+   * thread, created by the first frame with `init`). Freed by `apng-finish` or `release`.
+   */
+  | { type: 'apng-add'; id: number; job: number; frame: RawFrame; init?: APNGInit }
+  /** Returns the APNG file of `job` and frees its encoder. */
+  | { type: 'apng-finish'; id: number; job: number }
+  /** Drops the cached documents (an idle thread frees its memory; no response). */
+  | { type: 'clear' }
   | { type: 'ping'; id: number };
+
+/** Settings of an APNG encoder job (see `apng-add`). */
+export interface APNGInit {
+  width: number;
+  height: number;
+  fps: number;
+  loop?: number;
+}
 
 /** RGBA8 pixels of one frame (top row first). */
 export interface RawFrame {

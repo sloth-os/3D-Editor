@@ -36,6 +36,9 @@ interface TabDef {
 
 const hasObject = (o: ObjectData | null) => !!o;
 const isMesh = (o: ObjectData | null) => o?.type === 'MESH';
+/** Object types with material slots (core: meshes, and curves/text through their splines). */
+const MATERIAL_TYPES = new Set(['MESH', 'CURVE', 'FONT']);
+const hasMaterialSlots = (o: ObjectData | null) => !!o && MATERIAL_TYPES.has(o.type);
 
 const TABS: TabDef[] = [
   { id: 'render', icon: 'render', title: 'Render' },
@@ -48,7 +51,7 @@ const TABS: TabDef[] = [
   { id: 'physics', icon: 'physics', title: 'Physics', available: (o) => isMesh(o) || !!o?.rigid_body },
   { id: 'constraints', icon: 'constraint', title: 'Object Constraints', available: hasObject },
   { id: 'data', icon: 'data', title: 'Object Data', available: hasObject },
-  { id: 'material', icon: 'material', title: 'Material', available: isMesh },
+  { id: 'material', icon: 'material', title: 'Material', available: hasMaterialSlots },
 ];
 
 /**

@@ -14,6 +14,7 @@ import type { Room } from '../sync/room';
 import type { RoomManager } from '../sync/room-manager';
 import type { Log } from '../observability/log';
 import { randomClientId } from '../sync/awareness';
+import { toolOnlyOperator } from './operator-groups';
 
 /** Errors with a message meant for the agent (returned as `isError` tool results). */
 export class ToolError extends Error {
@@ -77,8 +78,13 @@ export class AgentProject {
     };
   }
 
-  /** Runs an operator with the agent's state (one undo step unless inside {@link step}). */
+  /**
+   * Runs an operator with the agent's state (one undo step unless inside {@link step}). Operators
+   * replaced by MCP tools (renders, see `toolOnlyOperator`) fail without running.
+   */
   run<T = unknown>(operator: string, params?: unknown): RunResult<T> {
+    const refused = toolOnlyOperator(operator);
+    if (refused) return { ok: false, error: refused, reports: [], durationMs: 0, params };
     this.room.touch();
     const res = this.deps.registry.run<T>(this.context(), operator, params);
     this.publishPresence();

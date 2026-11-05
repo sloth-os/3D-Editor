@@ -487,11 +487,25 @@ export const ANIMATION_MENU = (): MenuItem[] => {
     { label: 'Interpolation: Linear', op: 'anim.interpolation_type', params: { type: 'LINEAR' } },
     { label: 'Interpolation: Constant', op: 'anim.interpolation_type', params: { type: 'CONSTANT' } },
     {
+      // every curve of the selected objects, including their data's (light, camera, a path's
+      // Evaluation Time keyed by Animate Path, shape keys) and their materials'
       label: 'Extrapolation',
       submenu: [
-        { label: 'Constant Extrapolation', op: 'anim.extrapolation_set', params: { type: 'CONSTANT' } },
-        { label: 'Linear Extrapolation', op: 'anim.extrapolation_set', params: { type: 'LINEAR' } },
-        { label: 'Make Cyclic', op: 'anim.extrapolation_set', params: { type: 'CYCLIC' } },
+        {
+          label: 'Constant Extrapolation',
+          op: 'anim.extrapolation_set',
+          params: { type: 'CONSTANT', include_data: true },
+        },
+        {
+          label: 'Linear Extrapolation',
+          op: 'anim.extrapolation_set',
+          params: { type: 'LINEAR', include_data: true },
+        },
+        {
+          label: 'Make Cyclic',
+          op: 'anim.extrapolation_set',
+          params: { type: 'CYCLIC', include_data: true },
+        },
       ],
     },
     sep,

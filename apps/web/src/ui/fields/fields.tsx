@@ -157,6 +157,8 @@ export function VectorField(p: {
   max?: number;
   states?: ('keyed' | 'animated' | null)[];
   testId?: string;
+  /** Text shown for components that are not finite numbers (see {@link NumberFieldProps}). */
+  placeholder?: string;
 }) {
   const labels = p.labels ?? ['X', 'Y', 'Z', 'W'];
   return (
@@ -175,6 +177,7 @@ export function VectorField(p: {
           fromDisplay={p.fromDisplay}
           state={p.states?.[i] ?? null}
           testId={p.testId ? `${p.testId}-${i}` : undefined}
+          placeholder={p.placeholder}
           onChange={(x, final) => {
             const next = p.value.slice();
             next[i] = x;

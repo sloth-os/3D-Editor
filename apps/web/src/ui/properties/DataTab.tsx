@@ -83,6 +83,8 @@ const LIST_STYLE = {
   borderRadius: 'var(--radius)',
 } as const;
 const BUTTON_ROW = { display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '4px' } as const;
+/** A value at the end of a list row (readable on the highlighted active row too). */
+const LIST_VALUE = { marginLeft: 'auto', paddingRight: '6px', opacity: 0.7, fontSize: '11px' } as const;
 
 /** A Blender-style list (UIList) with a column of buttons on its right. */
 function UIList(p: {
@@ -265,9 +267,7 @@ function VertexGroupsPanel(p: { s: ProjectSession; o: ObjectData; meshId: string
               <>
                 <Icon name="mesh" size={13} />
                 <span class="name">{g.name}</span>
-                <span class="hint" style={{ marginLeft: 'auto', paddingRight: '6px' }}>
-                  {count}
-                </span>
+                <span style={LIST_VALUE}>{count}</span>
               </>
             ),
           };
@@ -387,18 +387,22 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
     final: boolean,
   ) => {
     if (!final && (field !== 'value' || bytes > SHAPE_KEY_PREVIEW_BYTES)) return;
+    /** Sets the field of this key in the current list (other keys and fields stay as they are now). */
+    const write = (value: number) =>
+      s.doc.setShapeKeys(
+        meshId,
+        s.doc.getShapeKeys(meshId).map((x) => (x.name === k.name ? { ...x, [field]: value } : x)),
+      );
     dragEdit(
       s,
       `shapekey:${meshId}:${k.name}:${field}`,
       final,
-      () =>
-        s.doc.setShapeKeys(
-          meshId,
-          s.doc.getShapeKeys(meshId).map((x) => (x.name === k.name ? { ...x, [field]: v } : x)),
-        ),
+      () => write(v),
       () => {
-        const original = s.doc.getShapeKeys(meshId);
-        return () => s.doc.setShapeKeys(meshId, original);
+        const before = s.doc.getShapeKeys(meshId).find((x) => x.name === k.name)?.[field];
+        return () => {
+          if (typeof before === 'number') write(before);
+        };
       },
       () => run('object.shape_key_set', { object: o.id, key: k.name, [field]: v }, 'ui'),
     );
@@ -429,9 +433,7 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
           <span class="name" style={{ opacity: k.mute ? 0.5 : 1 }}>
             {k.name}
           </span>
-          <span class="hint" style={{ marginLeft: 'auto' }}>
-            {value(k).toFixed(3)}
-          </span>
+          <span style={{ ...LIST_VALUE, paddingRight: 0 }}>{value(k).toFixed(3)}</span>
           <span
             class="vis"
             title={k.mute ? 'Enable the shape key' : 'Mute the shape key'}
@@ -689,26 +691,6 @@ function CurvePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
             />
           </Row>
         )}
-        <Row label="Resolution Preview U" title="Samples per segment between control points">
-          <NumberField
-            value={curve.resolution_u}
-            integer
-            min={1}
-            max={1024}
-            testId="curve-resolution"
-            onChange={(v, f) => set('resolution_u', v, f)}
-          />
-        </Row>
-        <Row label="Render U" title="Resolution of final renders (0 = the preview resolution)">
-          <NumberField
-            value={curve.render_resolution_u}
-            integer
-            min={0}
-            max={1024}
-            testId="curve-render-resolution"
-            onChange={(v, f) => set('render_resolution_u', v, f)}
-          />
-        </Row>
         {!is2D && (
           <Row label="Twist Method" title="Orientation of the bevel along the curve">
             <SelectField
@@ -732,6 +714,32 @@ function CurvePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
               curve.fill_mode,
             )}
             onChange={(v) => set('fill_mode', v)}
+          />
+        </Row>
+        <div class="hint" style={SUBHEAD}>
+          Resolution
+        </div>
+        <Row label="Preview U" title="Resolution Preview U: samples per segment between control points">
+          <NumberField
+            value={curve.resolution_u}
+            integer
+            min={1}
+            max={1024}
+            testId="curve-resolution"
+            onChange={(v, f) => set('resolution_u', v, f)}
+          />
+        </Row>
+        <Row
+          label="Render U"
+          title="Resolution Render U: samples per segment in final renders (0 = Preview U)"
+        >
+          <NumberField
+            value={curve.render_resolution_u}
+            integer
+            min={0}
+            max={1024}
+            testId="curve-render-resolution"
+            onChange={(v, f) => set('render_resolution_u', v, f)}
           />
         </Row>
       </Panel>
@@ -824,8 +832,8 @@ function CurvePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
         </Row>
         {!isText && (
           <div class="hint" data-testid="curve-taper-note">
-            Taper: the bevel and extrusion follow the radius of the spline points (0 = pointed); set it per
-            point with curve.spline_set_points.
+            Taper: the bevel and the extrusion are scaled by the Radius of each control point (0 = pointed
+            end); radii are set per point with the curve.spline_set_points operator (F3).
           </div>
         )}
         <div class="hint" style={SUBHEAD}>
@@ -1086,21 +1094,25 @@ function ActiveSplinePanel({ s, o, curve }: { s: ProjectSession; o: ObjectData; 
       { object: o.id, spline_index: index, points: sp.points.map(splinePointInput), ...patch },
       'ui',
     );
+  /** Sets the resolution of the active spline in the current spline list. */
+  const writeResolution = (v: number) => {
+    const cur = s.doc.getCurve(curve.id);
+    if (!cur || !Array.isArray(cur.splines) || !cur.splines[index]) return;
+    s.doc.updateCurve(curve.id, {
+      splines: cur.splines.map((x, i) => (i === index ? { ...x, resolution_u: v } : x)),
+    });
+  };
   const setResolution = (v: number, final: boolean) =>
     dragEdit(
       s,
       `spline:${curve.id}:${index}:resolution`,
       final,
+      () => writeResolution(v),
       () => {
-        const cur = s.doc.getCurve(curve.id);
-        if (!cur) return;
-        s.doc.updateCurve(curve.id, {
-          splines: cur.splines.map((x, i) => (i === index ? { ...x, resolution_u: v } : x)),
-        });
-      },
-      () => {
-        const before = s.doc.getCurve(curve.id)?.splines;
-        return () => before && s.doc.updateCurve(curve.id, { splines: before });
+        const before = s.doc.getCurve(curve.id)?.splines?.[index]?.resolution_u;
+        return () => {
+          if (typeof before === 'number') writeResolution(before);
+        };
       },
       () => update({ resolution_u: v }),
     );
@@ -1421,21 +1433,25 @@ function BoneFields(p: {
   const { s, o, armId, bone, bones } = p;
   const update = (patch: Record<string, unknown>) =>
     runResult('armature.bone_update', { object: o.id, bone: bone.name, ...patch }, 'ui');
+  /** Sets a rest field of this bone in the current bone list (other bones stay as they are now). */
+  const writeRest = (field: 'head' | 'tail' | 'roll', v: Vec3 | number) => {
+    const cur = s.doc.getArmature(armId);
+    if (!cur || !Array.isArray(cur.bones)) return;
+    s.doc.updateArmature(armId, {
+      bones: cur.bones.map((b) => (b.name === bone.name ? { ...b, [field]: v } : b)),
+    });
+  };
   const setRest = (field: 'head' | 'tail' | 'roll', v: Vec3 | number, final: boolean) =>
     dragEdit(
       s,
       `bone:${armId}:${bone.name}:${field}`,
       final,
+      () => writeRest(field, v),
       () => {
-        const cur = s.doc.getArmature(armId);
-        if (!cur) return;
-        s.doc.updateArmature(armId, {
-          bones: cur.bones.map((b) => (b.name === bone.name ? { ...b, [field]: v } : b)),
-        });
-      },
-      () => {
-        const before = s.doc.getArmature(armId)?.bones;
-        return () => before && s.doc.updateArmature(armId, { bones: before });
+        const before = s.doc.getArmature(armId)?.bones?.find((b) => b.name === bone.name)?.[field];
+        return () => {
+          if (before !== undefined) writeRest(field, before);
+        };
       },
       () => void update({ [field]: v }),
     );
@@ -1534,21 +1550,24 @@ function PosePanel({
   const values = (c: PoseChannel) =>
     [0, 1, 2].map((i) => animatedValue(s, 'object', o.id, path(c), i, (pb[c] ?? defaultPoseBone()[c])[i]));
   const states = (c: PoseChannel) => [0, 1, 2].map((i) => animState(s, 'object', o.id, path(c), i));
+  /** Sets one channel of this bone in the current pose (other bones and channels stay as they are now). */
+  const writeChannel = (c: PoseChannel, v: Vec3) => {
+    const cur = s.doc.getObject(o.id);
+    if (!cur) return;
+    const map = { ...(cur.pose?.bones ?? {}) };
+    map[bone.name] = { ...(map[bone.name] ?? defaultPoseBone()), [c]: v };
+    s.doc.updateObject(o.id, { pose: { ...cur.pose, bones: map } });
+  };
   const setChannel = (c: PoseChannel, v: number[], final: boolean) =>
     dragEdit(
       s,
       `pose:${o.id}:${bone.name}:${c}`,
       final,
+      () => writeChannel(c, v as Vec3),
       () => {
-        const cur = s.doc.getObject(o.id);
-        if (!cur) return;
-        const map = { ...(cur.pose?.bones ?? {}) };
-        map[bone.name] = { ...(map[bone.name] ?? defaultPoseBone()), [c]: v as Vec3 };
-        s.doc.updateObject(o.id, { pose: { ...cur.pose, bones: map } });
-      },
-      () => {
-        const before = s.doc.getObject(o.id)?.pose ?? { bones: {} };
-        return () => s.doc.updateObject(o.id, { pose: before });
+        // a bone without a pose entry is at rest: its channel goes back to the rest value
+        const before = s.doc.getObject(o.id)?.pose?.bones?.[bone.name]?.[c] ?? defaultPoseBone()[c];
+        return () => writeChannel(c, before);
       },
       () => run('pose.bone_transform_set', { object: o.id, bone: bone.name, [c]: v }, 'ui'),
     );
@@ -1643,23 +1662,29 @@ function BoneConstraintBox({
   const update = (patch: Record<string, unknown>) =>
     run('pose.constraint_set', { object: o.id, bone, constraint: c.id, ...patch }, 'ui');
   const influencePath = poseBonePath(bone, `constraints[${JSON.stringify(c.name)}].influence`);
+  /** Sets this constraint's influence in the current pose (everything else stays as it is now). */
+  const writeInfluence = (v: number) => {
+    const cur = s.doc.getObject(o.id);
+    const pb = cur?.pose?.bones?.[bone];
+    if (!cur || !pb) return;
+    const list = (pb.constraints ?? []).map((x) => (x.id === c.id ? { ...x, influence: v } : x));
+    s.doc.updateObject(o.id, {
+      pose: { ...cur.pose, bones: { ...cur.pose.bones, [bone]: { ...pb, constraints: list } } },
+    });
+  };
   const setInfluence = (v: number, final: boolean) =>
     dragEdit(
       s,
       `bonecon:${o.id}:${bone}:${c.id}`,
       final,
+      () => writeInfluence(v),
       () => {
-        const cur = s.doc.getObject(o.id);
-        const pb = cur?.pose?.bones?.[bone];
-        if (!cur || !pb) return;
-        const list = (pb.constraints ?? []).map((x) => (x.id === c.id ? { ...x, influence: v } : x));
-        s.doc.updateObject(o.id, {
-          pose: { ...cur.pose, bones: { ...cur.pose.bones, [bone]: { ...pb, constraints: list } } },
-        });
-      },
-      () => {
-        const before = s.doc.getObject(o.id)?.pose ?? { bones: {} };
-        return () => s.doc.updateObject(o.id, { pose: before });
+        const before = s.doc
+          .getObject(o.id)
+          ?.pose?.bones?.[bone]?.constraints?.find((x) => x.id === c.id)?.influence;
+        return () => {
+          if (typeof before === 'number') writeInfluence(before);
+        };
       },
       () => update({ influence: v }),
     );
@@ -1668,7 +1693,7 @@ function BoneConstraintBox({
       <div style={boxHeaderStyle}>
         <Icon name="constraint" size={13} />
         <b style={{ opacity: c.mute ? 0.5 : 1 }}>{c.name}</b>
-        <span class="hint">{label}</span>
+        {label !== c.name && <span class="hint">{label}</span>}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: '2px' }}>
           <IconButton
             icon={c.mute ? 'eyeOff' : 'eye'}
@@ -2024,6 +2049,39 @@ function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
             onChange={(v, f) => set('sensor_width', v, f)}
           />
         </Row>
+      </Panel>
+      <Panel title="Depth of Field" id="camera-dof" defaultOpen={c.dof_use}>
+        <Row label="">
+          <Checkbox
+            value={c.dof_use}
+            label="Depth of Field"
+            testId="camera-dof"
+            onChange={(v) => set('dof_use', v)}
+          />
+        </Row>
+        <Row label="Focus Distance" title="Distance from the camera that is in sharp focus">
+          <NumberField
+            value={animatedValue(s, 'camera', id, 'dof_focus_distance', 0, c.dof_focus_distance)}
+            min={0}
+            step={0.1}
+            unit=" m"
+            state={animState(s, 'camera', id, 'dof_focus_distance', 0)}
+            testId="camera-dof-distance"
+            onChange={(v, f) => set('dof_focus_distance', v, f)}
+          />
+        </Row>
+        <Row label="F-Stop" title="Aperture f-number: lower values give a shallower focus and more blur">
+          <NumberField
+            value={c.dof_aperture_fstop}
+            min={0.1}
+            max={128}
+            step={0.1}
+            precision={1}
+            testId="camera-dof-fstop"
+            onChange={(v, f) => set('dof_aperture_fstop', v, f)}
+          />
+        </Row>
+        <div class="hint">Rendered by the Path Tracer engine (the rasterized viewport stays sharp).</div>
       </Panel>
     </>
   );

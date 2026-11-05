@@ -1,8 +1,10 @@
 import {
+  FrameState,
   ROOT_COLLECTION_ID,
   SceneEvaluator,
   constraintTargets,
   decodeFloat32,
+  expandInstances,
   meshStats,
   modifierObjectParams,
   normalizeParticleSettings,
@@ -11,6 +13,7 @@ import {
   type CurveData,
   type DriverData,
   type EvalError,
+  type EvaluatedInstance,
   type EvaluatedObject,
   type EvaluatedScene,
   type FCurve,
@@ -18,6 +21,7 @@ import {
   type MeshData,
   type ObjectData,
   type SceneDoc,
+  type ShapeKeyData,
   type Vec3,
 } from '@3d-editor/core';
 
@@ -26,6 +30,10 @@ import {
  * given by name (names are unique per datablock kind) and ids are included where useful. Lists
  * that can grow without bound (bones, spline points, shape keys, constraints, drivers, problems…)
  * are truncated, with the full count next to them, so a summary stays small enough to read.
+ *
+ * Values are the ones at the described frame, like Blender's properties: animated and driven
+ * transforms, pose channels, shape key values, constraint influences and settings. Instance
+ * counts are those of renders (the viewport may show fewer: particle display_percentage).
  */
 
 const RAD2DEG = 180 / Math.PI;
@@ -35,6 +43,8 @@ const SCENE_LIST = 12;
 const OBJECT_LIST = 64;
 /** Most evaluation problems listed. */
 const MAX_PROBLEMS = 40;
+/** Most users listed per material in `get_scene`. */
+const MATERIAL_USERS = 24;
 /** Most characters of a text object's body in `get_scene`. */
 const TEXT_PREVIEW = 120;
 /** Objects listed by `get_scene` unless asked for more. */
@@ -148,6 +158,11 @@ function problemsByObject(scene: SceneDoc, ev: EvaluatedScene): Map<string, Eval
   return out;
 }
 
+/** `message` with object ids replaced by the objects' names (evaluation messages name ids). */
+function withNames(scene: SceneDoc, message: string): string {
+  return message.replace(/[A-Za-z0-9_-]{8,40}/g, (word) => scene.getObject(word)?.name ?? word);
+}
+
 /** A problem with its source made readable (object names instead of ids). */
 function describeProblem(
   scene: SceneDoc,
@@ -155,7 +170,47 @@ function describeProblem(
 ): { source: string; object?: string; message: string } {
   const t = problemTarget(e.source);
   const object = t ? scene.getObject(t)?.name : undefined;
-  return { source: e.source.split(':')[0], ...(object ? { object } : {}), message: e.message };
+  return {
+    source: e.source.split(':')[0],
+    ...(object ? { object } : {}),
+    message: withNames(scene, e.message),
+  };
+}
+
+/** Name of the modifier an evaluated modifier error belongs to ('shape keys' for shape key errors). */
+function modifierName(o: ObjectData, modifierId: string): string {
+  if (modifierId === 'shape_keys') return 'shape keys';
+  return o.modifiers.find((m) => m.id === modifierId)?.name ?? modifierId;
+}
+
+/** Modifier errors of an evaluated object, by modifier name, with object names in the messages. */
+function modifierErrors(scene: SceneDoc, ev: EvaluatedObject): { modifier: string; message: string }[] {
+  return ev.modifierErrors.map((e) => ({
+    modifier: modifierName(ev.data, e.modifierId),
+    message: withNames(scene, e.message),
+  }));
+}
+
+/**
+ * Every evaluation problem of the scene, for the top-level `problems` list: scene errors (drivers,
+ * poses, curves, instancing, physics), constraint errors and modifier errors of every object.
+ */
+function allProblems(scene: SceneDoc, ev: EvaluatedScene): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = ev.errors.map((e) => describeProblem(scene, e));
+  for (const o of ev.objects) {
+    for (const e of o.constraintErrors) {
+      const c = o.data.constraints?.find((x) => x.id === e.constraintId);
+      out.push({
+        source: 'constraint',
+        object: o.name,
+        ...(c ? { constraint: c.name } : {}),
+        message: withNames(scene, e.message),
+      });
+    }
+    for (const e of modifierErrors(scene, o))
+      out.push({ source: 'modifier', object: o.name, modifier: e.modifier, message: e.message });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- feature summaries
@@ -233,6 +288,7 @@ function curveSummary(c: CurveData, type: 'CURVE' | 'FONT', detailed: boolean): 
   return out;
 }
 
+/** Armature data; `o` is the object at the frame (animated pose channels). */
 function armatureSummary(scene: SceneDoc, o: ObjectData, ev: EvaluatedObject | undefined, detailed: boolean) {
   const arm = o.data ? scene.getArmature(o.data) : null;
   if (!arm) return null;
@@ -324,9 +380,12 @@ function particleSummary(
   scene: SceneDoc,
   o: ObjectData,
   instancesBySystem: Map<string, number>,
+  viewportBySystem: Map<string, number> | null,
   detailed: boolean,
 ) {
   return o.particle_systems.map((ps) => {
+    const instances = instancesBySystem.get(ps.id) ?? 0;
+    const viewport = viewportBySystem?.get(ps.id) ?? instances;
     const { settings } = normalizeParticleSettings(ps.settings);
     const source =
       settings.instance_type === 'OBJECT'
@@ -343,7 +402,9 @@ function particleSummary(
       count: settings.count,
       instance_type: settings.instance_type,
       ...source,
-      instances: instancesBySystem.get(ps.id) ?? 0,
+      instances,
+      ...(viewport !== instances ? { viewport_instances: viewport } : {}),
+      ...(settings.display_percentage < 100 ? { display_percentage: settings.display_percentage } : {}),
       ...(ps.show_viewport ? {} : { show_viewport: false }),
       ...(ps.show_render ? {} : { show_render: false }),
       ...(detailed ? { id: ps.id, settings: ps.settings } : {}),
@@ -379,17 +440,34 @@ function fcurveLabel(fc: FCurve, objectId: string): string {
   return `${prefix}${fc.path}[${fc.index}]`;
 }
 
-/** Instance counts of an evaluated scene: per owner object and per particle system id. */
-function instanceCounts(ev: EvaluatedScene): { byOwner: Map<string, number>; bySystem: Map<string, number> } {
+interface InstanceCounts {
+  total: number;
+  byOwner: Map<string, number>;
+  bySystem: Map<string, number>;
+}
+
+/** Instance counts: in all, per owner object and per particle system id. */
+function instanceCounts(instances: readonly EvaluatedInstance[]): InstanceCounts {
   const byOwner = new Map<string, number>();
   const bySystem = new Map<string, number>();
-  for (const inst of ev.instances) {
+  for (const inst of instances) {
     byOwner.set(inst.ownerId, (byOwner.get(inst.ownerId) ?? 0) + 1);
     // ids: `${owner}:${system}:${particle}…` for particles, `${owner}:${source}` for collections
     const parts = inst.id.split(':');
     if (parts.length >= 3) bySystem.set(parts[1], (bySystem.get(parts[1]) ?? 0) + 1);
   }
-  return { byOwner, bySystem };
+  return { total: instances.length, byOwner, bySystem };
+}
+
+/** Whether renders show other particle instances than the viewport (display_percentage, visibility). */
+function renderInstancesDiffer(ev: EvaluatedScene): boolean {
+  return ev.objects.some((o) =>
+    (o.data.particle_systems ?? []).some(
+      (ps) =>
+        ps.show_viewport !== ps.show_render ||
+        normalizeParticleSettings(ps.settings).settings.display_percentage < 100,
+    ),
+  );
 }
 
 function dataSummary(
@@ -397,6 +475,7 @@ function dataSummary(
   o: ObjectData,
   ev: EvaluatedObject | undefined,
   detailed = false,
+  ctx?: SummaryContext,
 ): Record<string, unknown> | null {
   if (o.type === 'MESH' && o.data) {
     const base = scene.getMesh(o.data);
@@ -408,7 +487,8 @@ function dataSummary(
     };
     if (base) Object.assign(out, meshStats(base));
     if (ev?.mesh && base && ev.mesh !== base) out.evaluated = meshStats(ev.mesh);
-    const keys = scene.getShapeKeys(o.data);
+    // values at the frame (keyed / driven), like Blender's shape key sliders
+    const keys = ctx ? ctx.shapeKeys(o.data) : scene.getShapeKeys(o.data);
     if (keys.length)
       Object.assign(
         out,
@@ -457,7 +537,7 @@ function dataSummary(
     else out.evaluated = 'wire (no surface: add bevel_depth, extrude or a 2D fill)';
     return out;
   }
-  if (o.type === 'ARMATURE') return armatureSummary(scene, o, ev, detailed);
+  if (o.type === 'ARMATURE') return armatureSummary(scene, ev?.data ?? o, ev, detailed);
   if (o.type === 'LIGHT' && o.data) {
     const l = ev?.light ?? scene.getLight(o.data);
     if (!l) return null;
@@ -507,11 +587,49 @@ function dataSummary(
 interface SummaryContext {
   ev: EvaluatedScene;
   problems: Map<string, EvalError[]>;
-  instances: ReturnType<typeof instanceCounts>;
+  /** Instances in renders (every particle of the systems shown in renders). */
+  instances: InstanceCounts;
+  /** Instances in the viewport, when they differ from the render counts. */
+  viewport: InstanceCounts | null;
+  /** Shape keys of a mesh with their values at the frame. */
+  shapeKeys(meshId: string): ShapeKeyData[];
 }
 
 function summaryContext(scene: SceneDoc, ev: EvaluatedScene): SummaryContext {
-  return { ev, problems: problemsByObject(scene, ev), instances: instanceCounts(ev) };
+  const shown = instanceCounts(ev.instances);
+  let instances = shown;
+  let viewport: InstanceCounts | null = null;
+  if (renderInstancesDiffer(ev)) {
+    // the viewport evaluation thins particles out: count what renders show (same placements)
+    try {
+      const res = expandInstances({
+        doc: scene,
+        frame: ev.frame,
+        forRender: true,
+        objects: ev.objects,
+        byId: ev.byId,
+      });
+      instances = instanceCounts(res.instances);
+      if (
+        instances.total !== shown.total ||
+        [...instances.bySystem].some(([k, n]) => shown.bySystem.get(k) !== n)
+      )
+        viewport = shown;
+    } catch {
+      /* keep the viewport counts */
+    }
+  }
+  let fs: FrameState | null = null;
+  return {
+    ev,
+    problems: problemsByObject(scene, ev),
+    instances,
+    viewport,
+    shapeKeys: (meshId) => {
+      fs ??= new FrameState(scene, ev.frame);
+      return fs.get<{ shape_keys: ShapeKeyData[] }>('mesh', meshId)?.shape_keys ?? scene.getShapeKeys(meshId);
+    },
+  };
 }
 
 /** Summary of one object (used in scene listings; `detailed` for get_object). */
@@ -531,7 +649,11 @@ export function summarizeObject(
   const constraintErrors = ev?.constraintErrors ?? [];
   const problems = ctx?.problems.get(o.id) ?? [];
   const instances = ctx?.instances.byOwner.get(o.id) ?? 0;
-  const rb = o.rigid_body;
+  const viewportInstances = ctx?.viewport ? (ctx.viewport.byOwner.get(o.id) ?? 0) : instances;
+  // the object at the frame: animated / driven transforms, constraints, modifiers, particle settings
+  const a = ev?.data ?? o;
+  const rb = a.rigid_body;
+  const modErrors = ev ? modifierErrors(scene, ev) : [];
   return {
     id: o.id,
     name: o.name,
@@ -539,14 +661,14 @@ export function summarizeObject(
     parent: nameOf(scene, o.parent),
     ...(o.parent && o.parent_type === 'BONE' ? { parent_bone: o.parent_bone } : {}),
     collection: collectionName(scene, o.collection),
-    location: roundVec([...o.location]),
-    rotation_euler: roundVec([...o.rotation_euler]),
-    rotation_degrees: roundVec(o.rotation_euler.map((r) => r * RAD2DEG) as Vec3, 2),
-    scale: roundVec([...o.scale]),
+    location: roundVec([...a.location]),
+    rotation_euler: roundVec([...a.rotation_euler]),
+    rotation_degrees: roundVec(a.rotation_euler.map((r) => r * RAD2DEG) as Vec3, 2),
+    scale: roundVec([...a.scale]),
     world_bounds: ev ? worldBounds(ev) : null,
-    data: dataSummary(scene, o, ev, detailed),
+    data: dataSummary(scene, o, ev, detailed, ctx),
     materials: o.material_slots.map((id) => (id ? (scene.getMaterial(id)?.name ?? id) : null)),
-    modifiers: o.modifiers.map((m) => {
+    modifiers: a.modifiers.map((m) => {
       const refs: Record<string, unknown> = {};
       for (const k of modifierObjectParams(m.type)) {
         const v = m.params[k];
@@ -560,17 +682,26 @@ export function summarizeObject(
         ...refs,
       };
     }),
-    ...(o.constraints?.length
+    ...(a.constraints?.length
       ? listField(
           'constraints',
-          o.constraints.map((c) => constraintSummary(scene, c, constraintErrors, detailed)),
+          a.constraints.map((c) => constraintSummary(scene, c, constraintErrors, detailed)),
           max,
         )
       : {}),
-    ...(o.particle_systems?.length
-      ? { particle_systems: particleSummary(scene, o, ctx?.instances.bySystem ?? new Map(), detailed) }
+    ...(a.particle_systems?.length
+      ? {
+          particle_systems: particleSummary(
+            scene,
+            a,
+            ctx?.instances.bySystem ?? new Map(),
+            ctx?.viewport?.bySystem ?? null,
+            detailed,
+          ),
+        }
       : {}),
     ...(instances ? { instances } : {}),
+    ...(viewportInstances !== instances ? { viewport_instances: viewportInstances } : {}),
     ...(rb
       ? {
           rigid_body: detailed
@@ -585,8 +716,8 @@ export function summarizeObject(
         }
       : {}),
     ...(ev?.simulated ? { simulated: true } : {}),
-    ...(o.hide_viewport ? { hide_viewport: true } : {}),
-    ...(o.hide_render ? { hide_render: true } : {}),
+    ...(a.hide_viewport ? { hide_viewport: true } : {}),
+    ...(a.hide_render ? { hide_render: true } : {}),
     ...(animated.length ? listField('animated', animated, detailed ? OBJECT_LIST : 24) : {}),
     ...(drivers.length
       ? listField(
@@ -595,7 +726,7 @@ export function summarizeObject(
           max,
         )
       : {}),
-    ...(ev?.modifierErrors.length ? { modifier_errors: ev.modifierErrors } : {}),
+    ...(modErrors.length ? listField('modifier_errors', modErrors, max) : {}),
     ...(problems.length
       ? listField(
           'problems',
@@ -606,7 +737,7 @@ export function summarizeObject(
   };
 }
 
-function materialSummary(scene: SceneDoc, users: Map<string, string[]>) {
+function materialSummary(scene: SceneDoc, users: Map<string, Set<string>>) {
   return scene.listMaterials().map((m) => {
     const procedural = Object.entries(m.textures ?? {})
       .filter(([, slot]) => slot?.procedural)
@@ -623,9 +754,16 @@ function materialSummary(scene: SceneDoc, users: Map<string, string[]>) {
       ...(m.alpha < 1 ? { alpha: round(m.alpha), blend_method: m.blend_method } : {}),
       ...(m.transmission > 0 ? { transmission: round(m.transmission), ior: round(m.ior) } : {}),
       ...(procedural.length ? { procedural } : {}),
-      users: users.get(m.id) ?? [],
+      ...boundedUsers([...(users.get(m.id) ?? [])]),
     };
   });
+}
+
+/** `users` (object names, at most MATERIAL_USERS) and `users_total` when there are more. */
+function boundedUsers(names: string[]): { users: string[]; users_total?: number } {
+  return names.length > MATERIAL_USERS
+    ? { users: names.slice(0, MATERIAL_USERS), users_total: names.length }
+    : { users: names };
 }
 
 export function evaluate(scene: SceneDoc, frame?: number): EvaluatedScene {
@@ -645,13 +783,13 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
   const ev = evaluate(scene, opts.frame);
   const ctx = summaryContext(scene, ev);
   const objects = scene.listObjects();
-  const materialUsers = new Map<string, string[]>();
+  const materialUsers = new Map<string, Set<string>>();
   for (const o of objects)
     for (const s of o.material_slots) {
       if (!s) continue;
-      const list = materialUsers.get(s) ?? [];
-      if (!list.includes(o.name)) list.push(o.name);
-      materialUsers.set(s, list);
+      let set = materialUsers.get(s);
+      if (!set) materialUsers.set(s, (set = new Set()));
+      set.add(o.name);
     }
   const settings = scene.getScene();
   const render = scene.getRender();
@@ -683,7 +821,8 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
       vertices,
       faces,
       materials: scene.listMaterials().length,
-      instances: ev.instances.length,
+      instances: ctx.instances.total,
+      ...(ctx.viewport ? { viewport_instances: ctx.viewport.total } : {}),
       ...(drivers ? { drivers } : {}),
       ...(rigidBodies ? { rigid_bodies: rigidBodies } : {}),
     },
@@ -764,13 +903,7 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
         ...listField('objects', members, 50),
       };
     }),
-    ...(ev.errors.length
-      ? listField(
-          'problems',
-          ev.errors.map((e) => describeProblem(scene, e)),
-          MAX_PROBLEMS,
-        )
-      : {}),
+    ...listField('problems', allProblems(scene, ev), MAX_PROBLEMS),
   };
 }
 
@@ -779,9 +912,10 @@ export function describeObject(scene: SceneDoc, o: ObjectData, frame?: number) {
   const ev = evaluate(scene, frame);
   const e = ev.byId.get(o.id);
   const world = e?.worldMatrix ?? scene.worldMatrix(o.id);
+  // materials at the frame (animated / driven), like the rest of the description
   const materials = o.material_slots.map((id, slot) => {
     if (!id) return { slot, material: null };
-    const m = scene.getMaterial(id);
+    const m = e?.materials[slot]?.id === id ? e.materials[slot] : scene.getMaterial(id);
     return { slot, material: m ? { ...m, base_color: roundVec([...m.base_color]) } : { id, missing: true } };
   });
   const fcurves = scene.listFCurves(o.id);
@@ -792,7 +926,7 @@ export function describeObject(scene: SceneDoc, o: ObjectData, frame?: number) {
     world_location: roundVec([world[12], world[13], world[14]]),
     children: scene.childrenOf(o.id).map((c) => c.name),
     materials,
-    modifiers: o.modifiers.map((m) => ({ ...m })),
+    modifiers: (e?.data ?? o).modifiers.map((m) => ({ ...m })),
     custom_props: o.custom_props,
     display: {
       display_type: o.display_type,

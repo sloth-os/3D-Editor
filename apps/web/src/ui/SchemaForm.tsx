@@ -10,11 +10,14 @@ import {
   RAD,
 } from './fields/fields';
 import type { SceneDoc } from '@3d-editor/core';
+import { session } from '../app/store';
 
 /** Minimal JSON-schema shape produced by zod's toJSONSchema for operator/modifier params. */
 interface JsonSchema {
   type?: string | string[];
   properties?: Record<string, JsonSchema>;
+  /** Parameters without a default that must be given. */
+  required?: string[];
   enum?: unknown[];
   const?: unknown;
   default?: unknown;
@@ -42,6 +45,12 @@ const OBJECT_REF_KEYS = new Set([
   'instance_object',
   'surface',
 ]);
+/** Object types an object-reference parameter accepts, by name (others accept any object). */
+const OBJECT_REF_TYPES: Record<string, readonly string[]> = {
+  camera: ['CAMERA'],
+  surface: ['MESH', 'CURVE', 'FONT'],
+  bevel_object: ['CURVE'],
+};
 const ANGLE_KEYS = /angle|rotation|spot_size/;
 
 /**
@@ -89,6 +98,29 @@ function unwrap(s: JsonSchema): JsonSchema {
   return s;
 }
 
+/**
+ * The value an operator uses for an optional vector parameter that was left unset, when it is
+ * known: a literal default in the description ("default [1, 1, 1]"), the 3D cursor ("default:
+ * the 3D cursor"), otherwise the identity `scale` and `rotation` of the add operators (Blender's
+ * location / rotation / scale convention). Null when the operator computes it or keeps a current
+ * value (e.g. an orbit centre fitted to the scene, `rotation_euler` of a "set" operator).
+ */
+function implicitVector(key: string, s: JsonSchema, length: number): number[] | null {
+  const d = s.description ?? '';
+  const literal = /default:?\s*\[([^\]]*)\]/i.exec(d);
+  if (literal) {
+    const nums = literal[1].split(',').map((x) => Number(x.trim()));
+    if (nums.length === length && nums.every(Number.isFinite)) return nums;
+  }
+  if (/3D cursor/i.test(d)) {
+    const cursor = session.value?.state.cursorLocation;
+    if (cursor?.length === length) return [...cursor];
+  }
+  if (key === 'scale') return Array.from({ length }, () => 1);
+  if (key === 'rotation') return Array.from({ length }, () => 0);
+  return null;
+}
+
 /** A fixed choice of a {@link SchemaForm} dropdown ('' stands for none / null). */
 export interface SchemaChoice {
   value: string;
@@ -126,6 +158,7 @@ export function SchemaForm(p: {
 }) {
   const schema = p.schema as JsonSchema;
   const objectKeys = new Set([...OBJECT_REF_KEYS, ...(p.objectKeys ?? [])]);
+  const required = new Set(schema?.required ?? []);
   const props = schema?.properties ?? {};
   const keys = p.only ? p.only.filter((k) => k in props) : Object.keys(props);
   const rows = keys.filter((k) => !p.exclude?.includes(k)).map((k) => [k, props[k]] as const);
@@ -155,23 +188,6 @@ export function SchemaForm(p: {
             </Row>
           );
         }
-        if (objectKeys.has(key) && p.doc && type === 'string') {
-          const objs = p.doc.listObjects();
-          return (
-            <Row key={key} label={label} title={s.description}>
-              <SelectField
-                value={(value as string) ?? ''}
-                testId={tid}
-                title={s.description}
-                options={[
-                  { value: '', label: '— none —' },
-                  ...objs.map((o) => ({ value: o.id, label: o.name })),
-                ]}
-                onChange={(v) => p.onChange(key, v || null, true)}
-              />
-            </Row>
-          );
-        }
         if (s.enum) {
           const options = s.enum.map((e) => ({ value: String(e), label: enumText(key, e) }));
           return (
@@ -194,6 +210,40 @@ export function SchemaForm(p: {
                   onChange={(v) => p.onChange(key, v, true)}
                 />
               )}
+            </Row>
+          );
+        }
+        if (objectKeys.has(key) && p.doc && type === 'string') {
+          const types = OBJECT_REF_TYPES[key];
+          const objs = p.doc.listObjects().filter((o) => !types || types.includes(o.type));
+          const stored = typeof value === 'string' ? value : '';
+          // operators accept object ids or names: a name shows as its object
+          const match = objs.find((o) => o.id === stored) ?? objs.find((o) => o.name === stored);
+          const other = stored && !match ? p.doc.resolveObject(stored) : null;
+          const nullable = isNullable(raw);
+          const optional = nullable || !required.has(key);
+          const selected = match?.id ?? stored;
+          return (
+            <Row key={key} label={label} title={s.description}>
+              <SelectField
+                value={selected}
+                testId={tid}
+                title={s.description}
+                options={[
+                  ...(optional || !selected
+                    ? [{ value: '', label: optional ? '— none —' : '— choose —' }]
+                    : []),
+                  ...objs.map((o) => ({ value: o.id, label: o.name })),
+                  ...(stored && !match
+                    ? [{ value: stored, label: other ? `${other.name} (invalid)` : `${stored} (missing)` }]
+                    : []),
+                ]}
+                onChange={(v) => {
+                  if (v) p.onChange(key, v, true);
+                  // cleared: null where the schema allows it, otherwise left out (the operator's default)
+                  else if (optional) p.onChange(key, nullable ? null : undefined, true);
+                }}
+              />
             </Row>
           );
         }
@@ -238,15 +288,27 @@ export function SchemaForm(p: {
           if (single?.enum) {
             // a set of enum values (e.g. axes ['X', 'Z']): one toggle per value
             const all = single.enum.map(String);
+            const min = s.minItems ?? 0;
+            const atMin = arr.length <= min;
             return (
               <Row key={key} label={label} title={s.description}>
                 <ToggleGroup
                   testId={tid}
-                  options={all.map((e) => ({ label: enumText(key, e), value: arr.includes(e) }))}
+                  options={all.map((e) => {
+                    const on = arr.map(String).includes(e);
+                    return {
+                      label: enumText(key, e),
+                      value: on,
+                      title:
+                        on && atMin ? `At least ${min} value${min === 1 ? '' : 's'} required` : undefined,
+                    };
+                  })}
                   onChange={(i, on) => {
                     const set = new Set(arr.map(String));
                     if (on) set.add(all[i]);
                     else set.delete(all[i]);
+                    // the operator rejects fewer values than the schema's minimum
+                    if (set.size < min) return;
                     p.onChange(
                       key,
                       all.filter((e) => set.has(e)),
@@ -284,15 +346,27 @@ export function SchemaForm(p: {
           }
           if (items && items.every((i) => ['number', 'integer'].includes(String(unwrap(i).type)))) {
             const isAngle = isAngleParam(key, s, p.angleKeys);
+            // an optional vector left unset shows what the operator uses instead ('Auto' when the
+            // operator computes it); editing one component keeps the shown values of the others
+            const shown = Array.isArray(value)
+              ? items.map((_, i) => Number(arr[i] ?? 0))
+              : (implicitVector(key, s, items.length) ?? items.map(() => NaN));
             return (
               <Row key={key} label={label} title={s.description}>
                 <VectorField
-                  value={items.map((_, i) => Number(arr[i] ?? 0))}
+                  value={shown}
+                  placeholder="Auto"
                   step={isAngle ? 1 : 0.01}
                   unit={p.units?.[key] ?? (isAngle ? '°' : undefined)}
                   {...(isAngle ? RAD : {})}
                   testId={tid}
-                  onChange={(v, final) => p.onChange(key, v, final)}
+                  onChange={(v, final) =>
+                    p.onChange(
+                      key,
+                      v.map((x) => (Number.isFinite(x) ? x : 0)),
+                      final,
+                    )
+                  }
                 />
               </Row>
             );

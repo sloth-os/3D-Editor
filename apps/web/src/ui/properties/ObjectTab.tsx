@@ -98,6 +98,10 @@ let dragState: { key: string; restore: () => void } | null = null;
  * value outside undo (synced to peers, like {@link setProp}); the final value restores the state
  * captured before the drag (`capture` returns the restore function) and runs `commit`, normally an
  * operator, so the whole drag is a single undo step.
+ *
+ * The restore must put back only the dragged field, written into the document state as it is at
+ * release time (see {@link captureField}): a drag lasts seconds, and other devices or MCP agents
+ * may change other entries of the same list (constraints, particle systems, keyframes) meanwhile.
  */
 export function dragEdit(
   s: ProjectSession,
@@ -119,6 +123,31 @@ export function dragEdit(
   }
   commit();
 }
+
+/**
+ * A `capture` for {@link dragEdit} that restores one field: `read` returns the field's current
+ * stored value (undefined when absent), `write` stores a value into the current document state,
+ * re-reading it and changing nothing else (undefined removes the field). Edits that others make to
+ * the rest of the datablock during the drag therefore survive the release.
+ */
+export function captureField(read: () => unknown, write: (value: unknown) => void): () => () => void {
+  return () => {
+    const before = read();
+    return () => write(before);
+  };
+}
+
+/** A copy of `record` with `key` set to `value`, or without `key` when `value` is undefined. */
+export function withField<T extends object>(record: T | null | undefined, key: string, value: unknown): T {
+  const next: Record<string, unknown> = { ...(record ?? {}) };
+  if (value === undefined) delete next[key];
+  else next[key] = value;
+  return next as T;
+}
+
+/** Whether a stored list entry is an object (stored lists may hold malformed entries). */
+export const isRecord = (x: unknown): x is Record<string, unknown> =>
+  x !== null && typeof x === 'object' && !Array.isArray(x);
 
 /** Small framed box used for list entries inside panels (drivers, variables, channels). */
 export const boxStyle = {
@@ -499,6 +528,7 @@ const PROPERTY_NAMES: Record<string, string> = {
   scale: 'Scale',
   energy: 'Power',
   lens: 'Focal Length',
+  eval_time: 'Evaluation Time',
   custom_props: 'Custom Property',
 };
 const AXIS_FIRST = new Set(['location', 'rotation_euler', 'scale']);
@@ -799,18 +829,20 @@ function DriversPanel({ s, o }: { s: ProjectSession; o: ObjectData }) {
 }
 
 function AddDriver({ s, o, drivers }: { s: ProjectSession; o: ObjectData; drivers: DriverData[] }) {
+  // the selection is the channel's key, not its position: the list changes whenever a constraint,
+  // modifier or particle system is added, removed or renamed (here, on a peer or by an agent)
   const [sel, setSel] = useState('');
   const channels = drivableChannels(s, o);
   const driven = new Set(drivers.map((d) => fcurveKey(d)));
   const keyOf = (c: Channel) =>
     fcurveKey({ target_type: c.target.type, target_id: c.target.id, path: c.path, index: c.index });
-  const groups: [string, { c: Channel; i: number }[]][] = [];
-  channels.forEach((c, i) => {
+  const groups: [string, Channel[]][] = [];
+  for (const c of channels) {
     const g = groups.find(([name]) => name === c.group);
-    if (g) g[1].push({ c, i });
-    else groups.push([c.group, [{ c, i }]]);
-  });
-  const chosen = sel === '' ? null : channels[Number(sel)];
+    if (g) g[1].push(c);
+    else groups.push([c.group, [c]]);
+  }
+  const chosen = sel && !driven.has(sel) ? (channels.find((c) => keyOf(c) === sel) ?? null) : null;
   const add = () => {
     if (!chosen) return;
     const block = storedBlock(s, chosen.target.type, chosen.target.id);
@@ -835,7 +867,7 @@ function AddDriver({ s, o, drivers }: { s: ProjectSession; o: ObjectData; driver
       <select
         class="select"
         style={{ flex: 1, minWidth: 0 }}
-        value={sel}
+        value={chosen ? sel : ''}
         data-testid="driver-add-channel"
         aria-label="Property to drive"
         onChange={(e) => setSel((e.target as HTMLSelectElement).value)}
@@ -843,12 +875,15 @@ function AddDriver({ s, o, drivers }: { s: ProjectSession; o: ObjectData; driver
         <option value="">Property to drive…</option>
         {groups.map(([name, items]) => (
           <optgroup key={name} label={name}>
-            {items.map(({ c, i }) => (
-              <option key={i} value={String(i)} disabled={driven.has(keyOf(c))}>
-                {c.label}
-                {driven.has(keyOf(c)) ? ' (driven)' : ''}
-              </option>
-            ))}
+            {items.map((c) => {
+              const k = keyOf(c);
+              return (
+                <option key={k} value={k} disabled={driven.has(k)}>
+                  {c.label}
+                  {driven.has(k) ? ' (driven)' : ''}
+                </option>
+              );
+            })}
           </optgroup>
         ))}
       </select>
@@ -1101,11 +1136,15 @@ const EXTRAPOLATIONS = [
 ] as const;
 
 function FCurvesPanel({ s, o }: { s: ProjectSession; o: ObjectData }) {
-  const curves = s.doc
-    .listFCurves(o.id)
-    .filter((fc) => fc.target_type === 'object')
-    .sort((a, b) => a.path.localeCompare(b.path) || a.index - b.index);
-  const block = o as unknown as Record<string, unknown>;
+  // the curves of the object and of its data (light, camera, curve, shape keys, materials), like
+  // the Drivers panel: e.g. the eval_time curve that Animate Path keys on a path
+  const curves = driverTargets(s, o).flatMap((t) =>
+    s.doc
+      .listFCurves(t.id)
+      .filter((fc) => fc.target_type === t.type)
+      .sort((a, b) => a.path.localeCompare(b.path) || a.index - b.index)
+      .map((fc) => ({ fc, t })),
+  );
   return (
     <Panel
       title={`Animation${curves.length ? ` (${curves.length})` : ''}`}
@@ -1115,55 +1154,94 @@ function FCurvesPanel({ s, o }: { s: ProjectSession; o: ObjectData }) {
       {curves.length === 0 && (
         <div class="hint">No animated properties. Insert keyframes (I) to animate this object.</div>
       )}
-      {curves.map((fc) => (
-        <ChannelBox key={fcurveKey(fc)} s={s} o={o} fc={fc} length={channelCount('object', block, fc.path)} />
+      {curves.map(({ fc, t }) => (
+        <ChannelBox
+          key={fcurveKey(fc)}
+          s={s}
+          o={o}
+          fc={fc}
+          target={t}
+          length={channelCount(fc.target_type, storedBlock(s, fc.target_type, fc.target_id), fc.path)}
+          // anim.extrapolation_set selects data curves by object, property and channel only
+          shared={curves
+            .filter((x) => x.fc !== fc && x.fc.path === fc.path && x.fc.index === fc.index)
+            .map((x) => x.t.name)}
+        />
       ))}
     </Panel>
   );
 }
 
-function ChannelBox({ s, o, fc, length }: { s: ProjectSession; o: ObjectData; fc: FCurve; length: number }) {
-  const ref = { target_type: 'object', target: o.id, path: fc.path, index: fc.index };
+function ChannelBox(p: {
+  s: ProjectSession;
+  o: ObjectData;
+  fc: FCurve;
+  target: DriverTarget;
+  length: number;
+  /** Datablocks of the object with a curve of the same property and channel. */
+  shared: string[];
+}) {
+  const { s, o, fc } = p;
+  const isObject = fc.target_type === 'object';
+  const ref = { target_type: fc.target_type, target: fc.target_id, path: fc.path, index: fc.index };
   const driver = s.doc.getDriver(fcurveKey(fc));
-  const tid = `fcurve-${fc.path}-${fc.index}`;
+  const tid = isObject ? `fcurve-${fc.path}-${fc.index}` : `fcurve-${fc.target_type}-${fc.path}-${fc.index}`;
+  const sharedNote =
+    !isObject && p.shared.length ? ` (also applies to the same channel of ${p.shared.join(', ')})` : '';
   return (
     <div style={boxStyle} data-testid={tid}>
-      <div style={boxHeaderStyle}>
+      {/* the controls move below the name when both do not fit on one line */}
+      <div style={{ ...boxHeaderStyle, flexWrap: 'wrap' }}>
         <Icon name="key" size={11} style={{ flex: 'none', color: 'var(--key)' }} />
         <span
-          style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          style={{
+            flex: '1 0 auto',
+            maxWidth: 'calc(100% - 16px)',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
           title={`${fc.path}[${fc.index}] · ${fc.keyframes.length} keyframe${fc.keyframes.length === 1 ? '' : 's'}`}
         >
-          {channelLabel(fc.path, fc.index, length)}
+          {channelLabel(fc.path, fc.index, p.length)}
+          {!isObject && <span class="hint"> · {p.target.name}</span>}
         </span>
-        <SelectField
-          value={fc.extrapolation}
-          testId={`${tid}-extrapolation`}
-          title="Extrapolation: how the curve continues before the first and after the last keyframe"
-          options={EXTRAPOLATIONS.map((e) => ({ ...e }))}
-          onChange={(type) =>
-            run('anim.extrapolation_set', { objects: [o.id], type, path: fc.path, index: fc.index }, 'ui')
-          }
-        />
-        <MenuButton
-          label="+ Modifier"
-          testId={`${tid}-add-modifier`}
-          items={() => [
-            { title: 'Add F-Curve Modifier' },
-            ...FMODIFIER_TYPE_INFO.map((i) => ({
-              label: i.label,
-              op: 'anim.fmodifier_add',
-              params: { ...ref, type: i.type },
-            })),
-          ]}
-        />
+        <span style={{ display: 'flex', gap: '4px', marginLeft: 'auto' }}>
+          <SelectField
+            value={fc.extrapolation}
+            testId={`${tid}-extrapolation`}
+            title={`Extrapolation: how the curve continues before the first and after the last keyframe${sharedNote}`}
+            options={EXTRAPOLATIONS.map((e) => ({ ...e }))}
+            onChange={(type) =>
+              run(
+                'anim.extrapolation_set',
+                { objects: [o.id], type, path: fc.path, index: fc.index, include_data: !isObject },
+                'ui',
+              )
+            }
+          />
+          <MenuButton
+            label="+ Modifier"
+            testId={`${tid}-add-modifier`}
+            items={() => [
+              { title: 'Add F-Curve Modifier' },
+              ...FMODIFIER_TYPE_INFO.map((i) => ({
+                label: i.label,
+                op: 'anim.fmodifier_add',
+                params: { ...ref, type: i.type },
+              })),
+            ]}
+          />
+        </span>
       </div>
       {driver && !driver.mute && (
         <div class="hint">Driven: the driver overrides this curve and its modifiers.</div>
       )}
-      {(fc.modifiers ?? []).map((m, i) => (
-        <FModifierBox key={i} s={s} o={o} fc={fc} m={m} index={i} testId={`${tid}-mod-${i}`} />
-      ))}
+      {(Array.isArray(fc.modifiers) ? fc.modifiers : []).map((m, i) =>
+        isRecord(m) ? (
+          <FModifierBox key={i} s={s} fc={fc} m={m} index={i} testId={`${tid}-mod-${i}`} />
+        ) : null,
+      )}
     </div>
   );
 }
@@ -1221,39 +1299,40 @@ function fmodSchema(type: string): unknown {
   return schema;
 }
 
-function FModifierBox(p: {
-  s: ProjectSession;
-  o: ObjectData;
-  fc: FCurve;
-  m: FModifierData;
-  index: number;
-  testId: string;
-}) {
-  const { s, o, fc, m, index } = p;
+function FModifierBox(p: { s: ProjectSession; fc: FCurve; m: FModifierData; index: number; testId: string }) {
+  const { s, fc, m, index } = p;
   const [open, setOpen] = useState(true);
   const info = FMODIFIER_TYPE_INFO.find((t) => t.type === m.type);
-  const ref = { target_type: 'object', target: o.id, path: fc.path, index: fc.index, modifier_index: index };
+  const ref = {
+    target_type: fc.target_type,
+    target: fc.target_id,
+    path: fc.path,
+    index: fc.index,
+    modifier_index: index,
+  };
   const params = (m.params ?? {}) as Record<string, unknown>;
   const update = (patch: Record<string, unknown>) => run('anim.fmodifier_update', { ...ref, ...patch }, 'ui');
+  const key = fcurveKey(fc);
+  /** Writes one parameter of this modifier into the current curve (nothing when it is gone). */
+  const writeParam = (k: string, v: unknown) => {
+    const cur = s.doc.getFCurve(key);
+    const mod = cur?.modifiers?.[index];
+    if (!cur?.modifiers || !isRecord(mod) || mod.type !== m.type) return;
+    const modifiers = cur.modifiers.map((x, j) =>
+      j === index ? { ...x, params: withField(x.params, k, v) } : x,
+    );
+    s.doc.setFCurve({ ...cur, modifiers });
+  };
   const setParam = (k: string, v: unknown, final: boolean) =>
     dragEdit(
       s,
-      `${fcurveKey(fc)}:${index}:${k}`,
+      `${key}:${index}:${k}`,
       final,
-      () => {
-        const cur = s.doc.getFCurve(fcurveKey(fc));
-        if (!cur?.modifiers?.[index]) return;
-        const modifiers = cur.modifiers.map((x, j) =>
-          j === index ? { ...x, params: { ...x.params, [k]: v } as FModifierData['params'] } : x,
-        );
-        s.doc.setFCurve({ ...cur, modifiers });
-      },
-      () => {
-        const original = s.doc.getFCurve(fcurveKey(fc));
-        return () => {
-          if (original) s.doc.setFCurve(original);
-        };
-      },
+      () => writeParam(k, v),
+      captureField(
+        () => s.doc.getFCurve(key)?.modifiers?.[index]?.params?.[k],
+        (before) => writeParam(k, before),
+      ),
       () => update({ params: { [k]: v } }),
     );
   const coefficients = Array.isArray(params.coefficients) ? (params.coefficients as number[]) : [];

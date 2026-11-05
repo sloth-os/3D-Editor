@@ -10,7 +10,15 @@ import { EnumButtons, Panel, Row } from '../fields/fields';
 import { SchemaForm } from '../SchemaForm';
 import { Icon } from '../icons';
 import { registry, run } from '../../editor/editor';
-import { ErrorList, dragEdit, panelEvaluation, sourceErrors } from './ObjectTab';
+import {
+  ErrorList,
+  captureField,
+  dragEdit,
+  isRecord,
+  panelEvaluation,
+  sourceErrors,
+  withField,
+} from './ObjectTab';
 
 /*
  * Physics tab (Blender's Properties > Physics, rigid bodies only): add/remove the active object's
@@ -126,21 +134,21 @@ function RigidBodyPanels(p: {
   const active = rb.type === 'ACTIVE';
   const world = sanitizeRigidBodyWorld(s.doc.getScene().rigidbody_world);
   const values = rb as unknown as Record<string, unknown>;
+  /** Sets one setting of the current rigid body (nothing when it was removed meanwhile). */
+  const writeSetting = (k: string, v: unknown) => {
+    const cur = s.doc.getObject(o.id)?.rigid_body;
+    if (isRecord(cur)) s.doc.updateObject(o.id, { rigid_body: withField(cur, k, v) });
+  };
   const setSetting = (k: string, v: unknown, final: boolean) =>
     dragEdit(
       s,
       `rigidbody:${o.id}:${k}`,
       final,
-      () => {
-        const cur = sanitizeRigidBody(s.doc.getObject(o.id)?.rigid_body);
-        if (cur) s.doc.updateObject(o.id, { rigid_body: { ...cur, [k]: v } });
-      },
-      () => {
-        const original = s.doc.getObject(o.id)?.rigid_body ?? null;
-        return () => {
-          if (s.doc.getObject(o.id)) s.doc.updateObject(o.id, { rigid_body: original });
-        };
-      },
+      () => writeSetting(k, v),
+      captureField(
+        () => (s.doc.getObject(o.id)?.rigid_body as Record<string, unknown> | null | undefined)?.[k],
+        (before) => writeSetting(k, before),
+      ),
       () => run('rigidbody.object_settings_set', { objects: [o.id], [k]: v }, 'ui'),
     );
   const form = (keys: string[]) => (
@@ -238,27 +246,30 @@ function WorldPanel({ s }: { s: ProjectSession }) {
     use_gravity: scene.use_gravity,
     gravity: scene.gravity,
   };
+  // gravity lives on the scene, the other settings in its rigidbody_world record
+  const onScene = (k: string) => k === 'use_gravity' || k === 'gravity';
+  const read = (k: string): unknown => {
+    const scene = s.doc.getScene();
+    return onScene(k)
+      ? (scene as unknown as Record<string, unknown>)[k]
+      : (scene.rigidbody_world as unknown as Record<string, unknown> | undefined)?.[k];
+  };
+  /** Sets one setting in the current scene state, leaving the others as stored. */
+  const write = (k: string, v: unknown) => {
+    if (onScene(k)) {
+      if (v !== undefined) s.doc.updateScene({ [k]: v });
+    } else s.doc.updateScene({ rigidbody_world: withField(s.doc.getScene().rigidbody_world, k, v) });
+  };
   const set = (k: string, v: unknown, final: boolean) =>
     dragEdit(
       s,
       `rigidbody_world:${k}`,
       final,
-      () => {
-        if (k === 'use_gravity' || k === 'gravity') s.doc.updateScene({ [k]: v });
-        else
-          s.doc.updateScene({
-            rigidbody_world: { ...sanitizeRigidBodyWorld(s.doc.getScene().rigidbody_world), [k]: v },
-          });
-      },
-      () => {
-        const original = s.doc.getScene();
-        const restore = {
-          rigidbody_world: original.rigidbody_world,
-          use_gravity: original.use_gravity,
-          gravity: original.gravity,
-        };
-        return () => s.doc.updateScene(restore);
-      },
+      () => write(k, v),
+      captureField(
+        () => read(k),
+        (before) => write(k, before),
+      ),
       () => run('rigidbody.world_set', { [k]: v }, 'ui'),
     );
   return (

@@ -55,6 +55,10 @@ const DENOISE_MS_PER_PIXEL = 1.5e-3;
 const DISPLAY_MS_PER_PIXEL = 0.2e-3;
 
 let nextJob = 1;
+/** A job id unique in this process (jobs keep state on render threads, freed by `release(job)`). */
+export function newJobId(): number {
+  return nextJob++;
+}
 const now = () => performance.now();
 
 /** Races `p` against `signal` (rejects with a RenderCancelledError when it aborts first). */
@@ -98,7 +102,7 @@ export async function pathTraceParallel(
   if (!threads.length) throw new Error('no render threads');
   const { signal } = opts;
   if (signal?.aborted) throw new RenderCancelledError();
-  const job = nextJob++;
+  const job = newJobId();
   const t0 = now();
   const prepared = threads.map((t) => t.call<PreparedInfo>({ type: 'prepare', job, doc, options }));
   for (const p of prepared) p.catch(() => undefined);
@@ -135,12 +139,14 @@ export async function pathTraceParallel(
     );
 
     const tRender = now();
-    // like core renderPathTracedImage, a time limit covers compiling, sampling and the estimated
-    // denoising and display conversion: sampling gets what is left (the first pass always runs)
+    // like core renderSceneSoftware, a time limit covers compiling, sampling and the estimated
+    // denoising and display conversion (not loading and evaluating the scene): sampling gets what
+    // is left (the first pass always runs)
     let limit = 0;
     if (info.timeLimit > 0) {
       const reserve = W * H * ((info.denoise ? DENOISE_MS_PER_PIXEL : 0) + DISPLAY_MS_PER_PIXEL);
-      limit = Math.max(1, info.timeLimit * 1000 - (tRender - t0) - reserve);
+      const used = Math.max(0, tRender - t0 - info.setupMs);
+      limit = Math.max(1, info.timeLimit * 1000 - used - reserve);
     }
     /**
      * Brings every row of the film to `target` samples (bands of rows with equal counts continue

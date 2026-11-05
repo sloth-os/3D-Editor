@@ -13,6 +13,14 @@ if (!port) throw new Error('the render worker must run in a worker thread');
 
 const engine = new RenderEngine();
 
+// JIT warm-up before the first request is answered (the pool's start-up ping waits for it, so
+// the time it takes is not taken from a render's time limit)
+try {
+  engine.warmUp();
+} catch (err) {
+  console.warn(`render worker warm-up failed: ${err instanceof Error ? err.message : String(err)}`);
+}
+
 function reply(id: number, result: WorkerResult, transfer: ArrayBuffer[] = []): void {
   const msg: WorkerResponse = { type: 'result', id, result };
   port!.postMessage(msg, transfer);
@@ -21,6 +29,10 @@ function reply(id: number, result: WorkerResult, transfer: ArrayBuffer[] = []): 
 port.on('message', (msg: WorkerRequest) => {
   if (msg.type === 'release') {
     engine.release(msg.job);
+    return;
+  }
+  if (msg.type === 'clear') {
+    engine.clearDocuments();
     return;
   }
   try {
@@ -43,11 +55,16 @@ port.on('message', (msg: WorkerRequest) => {
         reply(msg.id, img, buffer ? [buffer as ArrayBuffer] : []);
         break;
       }
-      case 'encode': {
-        const encoded = engine.encode(msg.frames, msg.options);
+      case 'encode':
+      case 'apng-finish': {
+        const encoded =
+          msg.type === 'encode' ? engine.encode(msg.frames, msg.options) : engine.apngFinish(msg.job);
         reply(msg.id, encoded, [encoded.data.buffer as ArrayBuffer]);
         break;
       }
+      case 'apng-add':
+        reply(msg.id, engine.apngAdd(msg.job, msg.frame, msg.init));
+        break;
       case 'auto-view':
         reply(msg.id, engine.autoView(msg.doc, msg.frames, msg.aspect, msg.camera, msg.budgetMs));
         break;
