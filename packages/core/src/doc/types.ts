@@ -123,6 +123,29 @@ export interface PoseBone {
   scale: Vec3;
   /** Bone constraints (e.g. IK), evaluated in armature space during pose evaluation. */
   constraints?: ConstraintData[];
+  /**
+   * IK settings (Blender pose bone properties, set with pose.ik_settings_set). lock_ik_*: IK
+   * chains may not rotate the bone about its local X / Y / Z axis (Y runs along the bone).
+   */
+  lock_ik_x?: boolean;
+  lock_ik_y?: boolean;
+  lock_ik_z?: boolean;
+  /** IK limits: keep the rotation about local X / Y / Z (relative to the rest pose) in [ik_min_*, ik_max_*]. */
+  use_ik_limit_x?: boolean;
+  use_ik_limit_y?: boolean;
+  use_ik_limit_z?: boolean;
+  /** Radians, -π … 0. */
+  ik_min_x?: number;
+  ik_min_y?: number;
+  ik_min_z?: number;
+  /** Radians, 0 … π. */
+  ik_max_x?: number;
+  ik_max_y?: number;
+  ik_max_z?: number;
+  /** IK resistance to rotating about local X / Y / Z, 0 … 0.99. */
+  ik_stiffness_x?: number;
+  ik_stiffness_y?: number;
+  ik_stiffness_z?: number;
 }
 
 export type CollisionShape = 'BOX' | 'SPHERE' | 'CAPSULE' | 'CYLINDER' | 'CONE' | 'CONVEX_HULL' | 'MESH';

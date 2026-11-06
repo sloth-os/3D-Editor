@@ -21,6 +21,7 @@ import { getModifierDef, modifierObjectParams, registerBuiltinModifiers } from '
 import { getConstraintTypeInfo } from '../constraints/catalogue';
 import { FrameState } from '../eval/frame-state';
 import { computePose } from '../armature/pose';
+import { ikSettingsOf } from '../armature/ik';
 import { rollFromZAxis } from '../armature/bone-math';
 import {
   BONE_CONSTRAINT_LABELS,
@@ -296,6 +297,34 @@ function ikChain(arm: ArmatureData, bone: string, chainCount: number, useTail: b
     cur = byName.get(cur)!.parent;
   }
   return chain.reverse();
+}
+
+/** Every IK setting of a pose bone with its effective value (Blender defaults filled in). */
+function ikSettingsSummary(pb: PoseBone | undefined) {
+  const s = ikSettingsOf(pb);
+  const out: Record<string, boolean | number> = {};
+  (['x', 'y', 'z'] as const).forEach((a, i) => {
+    out[`lock_ik_${a}`] = s?.lock[i] ?? false;
+    out[`use_ik_limit_${a}`] = !!s?.limit[i];
+    out[`ik_min_${a}`] = round(s?.limit[i]?.[0] ?? Math.max(-Math.PI, Math.min(0, pb?.[`ik_min_${a}`] ?? -Math.PI)));
+    out[`ik_max_${a}`] = round(s?.limit[i]?.[1] ?? Math.min(Math.PI, Math.max(0, pb?.[`ik_max_${a}`] ?? Math.PI)));
+    out[`ik_stiffness_${a}`] = round(s?.stiffness[i] ?? 0);
+  });
+  return out;
+}
+
+/** IK constraints of an armature object whose chain contains `bone` (owner bone, name, chain). */
+function chainsContaining(object: ObjectData, arm: ArmatureData, bone: string) {
+  const out: { bone: string; constraint: string; chain: string[] }[] = [];
+  for (const [owner, pb] of Object.entries(object.pose?.bones ?? {})) {
+    for (const c of pb.constraints ?? []) {
+      if (c.type !== 'IK') continue;
+      const params = (c.params ?? {}) as { chain_count?: number; use_tail?: boolean };
+      const chain = ikChain(arm, owner, params.chain_count ?? 0, params.use_tail ?? true);
+      if (chain.includes(bone)) out.push({ bone: owner, constraint: c.name, chain });
+    }
+  }
+  return out;
 }
 
 // ------------------------------------------------------------------ vertex group helpers
@@ -1020,8 +1049,10 @@ function registerAddAndBoneOperators(reg: OperatorRegistry): void {
       id: 'armature.describe',
       label: 'Describe Armature',
       description:
-        'Read-only: list the bones of an armature with their hierarchy, rest head/tail/roll (armature space), pose ' +
-        'channels (location/rotation_euler/scale), bone constraints and the evaluated posed head/tail in world space ' +
+        'Read-only: list the bones of an armature with their hierarchy, rest head/tail/roll and rest x_axis / z_axis ' +
+        '(armature space; Y runs from head to tail), pose ' +
+        'channels (location/rotation_euler/scale), bone constraints, IK settings (ik_settings: locks, limits, ' +
+        'stiffness; null when none) and the evaluated posed head/tail in world space ' +
         'at the current (or given) frame, plus pose evaluation problems. Use it to verify a rig.',
       category: 'Armature',
       undo: false,
@@ -1046,6 +1077,13 @@ function registerAddAndBoneOperators(reg: OperatorRegistry): void {
             const ev = pose?.bones.get(b.name);
             return {
               ...boneSummary(b),
+              // rest axes in armature space: rotating about X tilts the tail towards +Z, about Z towards −X
+              ...(ev
+                ? {
+                    x_axis: roundVec([ev.rest[0], ev.rest[1], ev.rest[2]]),
+                    z_axis: roundVec([ev.rest[8], ev.rest[9], ev.rest[10]]),
+                  }
+                : {}),
               children: arm.bones.filter((c) => c.parent === b.name).map((c) => c.name),
               location: roundVec(pb.location),
               rotation_euler: roundVec(pb.rotation_euler),
@@ -1066,6 +1104,8 @@ function registerAddAndBoneOperators(reg: OperatorRegistry): void {
                 mute: c.mute,
                 params: c.params,
               })),
+              // IK locks / limits / stiffness (pose.ik_settings_set), null when the bone has none
+              ik_settings: ikSettingsOf(pb) ? ikSettingsSummary(pb) : null,
             };
           }),
           errors: pose?.errors ?? [],
@@ -1273,6 +1313,116 @@ function registerPoseOperators(reg: OperatorRegistry): void {
           params,
         });
         return { object: object.id, bone: p.bone, constraint: c.id, name: c.name, chain };
+      },
+    }),
+  );
+
+  const ikAxis = (a: 'X' | 'Y' | 'Z', what: string) =>
+    `${what} the bone's local ${a} axis (${a === 'Y' ? 'Y runs along the bone, head → tail: twist' : `${a} bends the bone`})`;
+  const ikSettingsShape = Object.fromEntries(
+    (['x', 'y', 'z'] as const).flatMap((a) => {
+      const A = a.toUpperCase() as 'X' | 'Y' | 'Z';
+      return [
+        [`lock_ik_${a}`, z.boolean().optional().describe(ikAxis(A, 'IK may not rotate the bone about'))],
+        [
+          `use_ik_limit_${a}`,
+          z.boolean().optional().describe(`Limit the IK rotation about local ${A} to [ik_min_${a}, ik_max_${a}]`),
+        ],
+        [
+          `ik_min_${a}`,
+          z
+            .number()
+            .min(-Math.PI)
+            .max(0)
+            .optional()
+            .describe(`Radians (−π … 0, default −π): smallest rotation about local ${A}, from the rest pose`),
+        ],
+        [
+          `ik_max_${a}`,
+          z
+            .number()
+            .min(0)
+            .max(Math.PI)
+            .optional()
+            .describe(`Radians (0 … π, default π): largest rotation about local ${A}, from the rest pose`),
+        ],
+        [
+          `ik_stiffness_${a}`,
+          z
+            .number()
+            .min(0)
+            .max(0.99)
+            .optional()
+            .describe(`0 … 0.99 (default 0): resistance to rotating about local ${A}; other bones move more instead`),
+        ],
+      ];
+    }),
+  ) as Record<string, z.ZodOptional<z.ZodBoolean> | z.ZodOptional<z.ZodNumber>>;
+
+  reg.register(
+    defineOperator({
+      id: 'pose.ik_settings_set',
+      label: 'Set Bone IK Settings',
+      description:
+        "Set a pose bone's inverse kinematics settings (Blender Bone properties > Inverse Kinematics), used by " +
+        'every IK chain that contains the bone. Axes are the bone\'s own: Y runs along the bone (head → tail, ' +
+        'twist), X and Z bend it. lock_ik_x/y/z: the solver may not rotate the bone about that axis (e.g. a ' +
+        "robot's vertical base bone that may only yaw: lock_ik_x and lock_ik_z; a hinge: lock two axes). " +
+        'use_ik_limit_x/y/z with ik_min_* (−π … 0) and ik_max_* (0 … π): keep the rotation about that axis, ' +
+        'measured from the rest pose (swing about X/Z, twist about Y), within range; a positive angle about X tilts ' +
+        'the tail towards the bone\'s +Z axis, about Z towards its −X axis (armature.describe lists every bone\'s ' +
+        'rest x_axis and z_axis). ik_stiffness_x/y/z (0 … ' +
+        '0.99): the bone resists rotating about that axis, so other bones take more of the motion. Only the ' +
+        'settings passed change. Chains with such bones are solved with a damped least-squares solver (FABRIK ' +
+        'otherwise); a pole target is ignored when the chain root itself is locked, limited or stiff. Returns ' +
+        'every IK setting of the bone and the IK constraints whose chains contain it (a warning when none does: ' +
+        'the settings only matter inside an IK chain).',
+      category: 'Pose',
+      redoable: true,
+      schema: z.object({
+        object: objectRef(),
+        bone: boneRef.describe('Bone whose IK settings change'),
+        ...ikSettingsShape,
+      }),
+      execute(ctx, p) {
+        const { object, arm } = armatureTarget(ctx, p.object);
+        findBone(arm, p.bone);
+        const pb = poseChannel(object, p.bone) as PoseBone & Record<string, unknown>;
+        const changed: string[] = [];
+        for (const key of Object.keys(ikSettingsShape)) {
+          const v = (p as Record<string, unknown>)[key];
+          if (v === undefined) continue;
+          pb[key] = v;
+          changed.push(key);
+        }
+        if (!changed.length)
+          throw new OperatorError(
+            `Nothing to set: pass at least one of ${Object.keys(ikSettingsShape).join(', ')}`,
+            'INVALID_PARAMS',
+          );
+        for (const a of ['x', 'y', 'z'] as const) {
+          const min = pb[`ik_min_${a}`];
+          const max = pb[`ik_max_${a}`];
+          if (pb[`use_ik_limit_${a}`] && min === undefined && max === undefined)
+            ctx.report(
+              'WARNING',
+              `'${p.bone}': use_ik_limit_${a} without ik_min_${a} / ik_max_${a} allows −π … π (no limit yet)`,
+            );
+          if (!pb[`use_ik_limit_${a}`] && (changed.includes(`ik_min_${a}`) || changed.includes(`ik_max_${a}`)))
+            ctx.report(
+              'WARNING',
+              `'${p.bone}': ik_min_${a} / ik_max_${a} only apply with use_ik_limit_${a}: true`,
+            );
+        }
+        writePoseChannel(ctx, object, p.bone, pb);
+        const chains = chainsContaining(ctx.doc.getObject(object.id)!, arm, p.bone);
+        if (!chains.length)
+          ctx.report(
+            'WARNING',
+            `'${p.bone}' is not part of any IK chain yet: the settings take effect once an IK constraint ` +
+              '(pose.ik_add) includes it',
+          );
+        return { object: object.id, bone: p.bone, changed, ik_settings: ikSettingsSummary(pb), chains };
       },
     }),
   );

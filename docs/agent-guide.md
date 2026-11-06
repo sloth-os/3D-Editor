@@ -35,10 +35,13 @@ Contents:
   the URL) so `undo` and your selection survive between connections.
 - **Check persistence** with `get_project`: with `persistence: "memory"` the project is lost when
   the server stops. Export what you need (`export_scene`) or ask for a server with `DATA_DIR`.
-- **Read schemas instead of guessing.** Operator parameter names are strict (a typo is an error
-  with suggestions), but a misspelled top-level _tool_ argument is silently ignored
-  (`set_scene_settings {"sampels": 5}` changes nothing), so take tool argument names from the
-  tool's input schema. The catalogues explain themselves:
+- **Read schemas instead of guessing.** Names are strict: a misspelled tool argument
+  (`set_scene_settings {"sampels": 5}`), a misspelled key inside `view`, `selection` or a batch
+  operation, and a misspelled operator or modifier parameter all fail the call with did-you-mean
+  suggestions and the valid names, and change nothing. Tool input schemas are in `tools/list`;
+  operator parameters go inside `params`. The catalogues explain themselves:
+  <!-- re-check: uncommitted server change on 2026-11-06 (strict tool arguments,
+  apps/server/src/mcp/strict-args.ts) -->
   - `list_operators {category: "<group>"}` returns the operators of a feature with their JSON
     schemas, e.g. `Curves`, `Constraints`, `Rigging`, `Physics`, `Generators`, `Drivers`,
     `Shading`, `Lights and Cameras`, `Layout`, `Scene`;
@@ -305,9 +308,11 @@ Each agent has its own selection, active object and mode, separate from every hu
     `world.sky_set` also sets zenith, horizon and ground colours;
   - `environment: "NONE"` with `world_color` and `world_strength` for a plain background;
   - mist: `mist_distance` (metres at which it reaches 95 %) and `mist_color`;
-  - `data.set_property` with `kind: "world"` and `values: {show_environment_background: false}`
-    keeps the studio light but hides it from the background; `environment_rotation` turns it (the
-    orrery uses both).
+  - the studio environment lights the scene but is hidden from the background by default (the
+    background shows the world colour); `data.set_property` with `kind: "world"` and
+    `values: {show_environment_background: true}` shows it, and `environment_rotation` (radians)
+    turns it (the orrery turns its studio by 200°). A sky set with `world.sky_set` or
+    `set_scene_settings` shows itself as the background.
 
 ## Animation
 
@@ -478,18 +483,18 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
 | ------------------------------ | ------------------------------------------------------------------------------------------------------ |
 | Layout check                   | `render_image {engine: "RASTER", width: 640}`                                                          |
 | Motion check                   | `render_animation {format: "CONTACT_SHEET", engine: "RASTER", frame_step}` with 12–24 tiles            |
-| Lighting and material preview  | `PATHTRACER`, 640×360, 16–32 samples, `denoise: true`, `time_limit` 45–60                              |
-| Final still                    | `PATHTRACER`, 1280×720, 128–256 samples, `denoise: true`, `max_bounces` 4–10, `time_limit` 300–470     |
-| Animation (contact sheet, GIF) | `PATHTRACER`, 320×180 tiles or 480×270 GIF frames, 8–16 samples, `denoise: true`, `time_limit` 200–600 |
+| Lighting and material preview  | `PATHTRACER`, 640×360, 16–64 samples, `denoise: true`, `time_limit` 45–60                              |
+| Final still                    | `PATHTRACER`, 1280×720, 128–256 samples, `denoise: true`, `max_bounces` 6–10, `time_limit` 420–480     |
+| Animation (contact sheet, GIF) | `PATHTRACER`, 320×180 tiles or 480×270 GIF frames, 8–32 samples, `denoise: true`, `time_limit` 200–600 |
 
 - Path tracing time grows with pixels × samples × bounces and with scene complexity. `time_limit`
   is wall-clock time: sampling stops when it is used up, after at least one sample per pixel. The
   result says what was reached (`samples` against `requested_samples`, `time_limit_reached`), so
   check it and raise the limit or lower the size or samples if needed.
 - For animations `time_limit` covers the whole render. Every path-traced frame gets an equal share
-  of what is left; frames that cannot start in time are dropped (`truncated: true`), and
-  `undersampled_frames` lists frames that stopped early. `frame_time_limit` caps one frame. Low
-  sample counts work with `denoise: true`.
+  of what is left; frames that cannot start in time are dropped (`truncated: true`),
+  `undersampled_frames` lists frames that stopped early and `frame_samples` the samples each frame
+  reached. `frame_time_limit` caps one frame. Low sample counts work with `denoise: true`.
 - Renders run on the server's shared render threads. At most two long renders (path-traced stills
   and animations) run at once across all agents and REST clients; others wait, while raster
   stills always get a thread of their own. The 600 s limit applies per call.
@@ -499,24 +504,29 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
 - `view_transform` (`AGX` default, `STANDARD`, `FILMIC`, `ACES`, `NEUTRAL`) and `exposure` change
   the look. The orrery uses `STANDARD` to keep a saturated sun; the product shot uses `NEUTRAL` for
   faithful product colours.
-- In a browser, the web editor path traces on Web Workers (F12, Ctrl+F12); the MCP tools always
-  path trace on the server.
+- In a browser, the web editor path traces on Web Workers (F12, Ctrl+F12). `render_image` path
+  traces on the server unless you pass `renderer: "browser"`, which uses those workers of a
+  connected editor; the result then does not report the samples reached. `render_animation`
+  always renders on the server.
 
 ## Exporting
 
-- `export_scene {format: "glb"}` (or `gltf`, `obj`, `stl`, `ply`; `objects` for a subset)
-  exports at your current frame and returns the file embedded (up to 20 MiB) with a download link.
-  Always read `warnings`.
-- The download link exports again on request: the whole scene at `frame_start`, ignoring
-  `objects`, `apply_modifiers` and your frame; it needs the server's `AUTH_TOKEN` when one is set.
+- `export_scene {format: "glb"}` (or `gltf`, `obj`, `stl`, `ply`; `objects` for a subset,
+  `apply_modifiers`, `frame`) exports at your current frame unless you pass `frame`, and returns
+  the file embedded (up to 20 MiB) with a download link. Always read `warnings`.
+- The download link exports again when it is fetched, with the same format, objects,
+  `apply_modifiers` and frame (after later edits it gives the project as it is then); it needs the
+  server's `AUTH_TOKEN` when one is set.
+  <!-- re-check: uncommitted server change on 2026-11-06 (export_scene `frame` and download_url
+  options, apps/server/src/mcp/tools.ts) -->
 - OBJ, STL and PLY hold static, world-space meshes.
-- <!-- re-check: gltf-export --> glTF (_exporter status on 2026-11-05; it is still being finished,
-  re-check against `packages/core/src/io/gltf-export.ts`): hierarchy, materials with procedural
-  textures baked to 512×512 PNGs (UVs are generated for meshes without them), cameras, lights
-  (area lights become point lights), instances, and animation sampled every frame over the scene
-  range (keyframes, drivers, constraints, IK and physics as node transforms; shape keys as morph
-  targets; armature-deformed meshes as skins; other deformation baked to morph targets). Sky, mist
-  and the drivers and constraints themselves are not exported.
+- <!-- re-check: gltf-export (matched packages/core/src/io/gltf-export.ts on 2026-11-06) --> glTF:
+  hierarchy, materials with procedural textures baked to 512×512 PNGs (UVs are generated for
+  meshes without them), cameras, lights (area lights become point lights), instances, and
+  animation sampled every frame over the scene range (keyframes, drivers, constraints, IK and
+  physics as node transforms; shape keys as morph targets; armature-deformed meshes as skins;
+  other deformation baked to morph targets). Sky, mist and the drivers and constraints themselves
+  are not exported.
 - The orrery script bakes its driven and constrained motion into keyframes inside one batch
   (`anim.bake_transforms`), exports, then calls `undo` to get the live drivers back. The glTF
   exporter described above samples evaluated motion itself, but the pattern is useful whenever you
@@ -525,10 +535,14 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
 ## Common errors and how to read them
 
 Tool errors explain themselves; read the whole message, including the JSON after the first line.
+Failed operators carry a `code` in that JSON: `INVALID_PARAMS` (fix `params`), `POLL_FAILED` (mode,
+selection or object type), `NOT_FOUND` (operator, object or datablock) or `FAILED`.
 
 | You see                                                                                               | Meaning and fix                                                                                       |
 | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                            | Misspelled or unsupported parameter; use a listed name                                                |
+| `unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                            | Misspelled or unsupported operator parameter; use a listed name                                       |
+| `unknown argument 'sampels' (did you mean 'samples'?). Valid arguments: …`                            | Misspelled tool argument; operator parameters go inside `params`                                      |
+| `unknown key 'fov' (did you mean 'lens' or 'fov_degrees'?) (valid keys: …) at view`                   | Misspelled key inside `view`, `selection` or a batch operation                                        |
 | `Input validation error: Invalid arguments for tool get_object: … at frame`                           | A tool argument of the wrong type or out of range (e.g. `time_limit` above 600)                       |
 | `unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …` | A selection-based operator; pass `selection: {objects: [...]}`                                        |
 | `surface: Invalid input: expected array, received string`                                             | Wrong value type; check the schema (`list_operators {search}`)                                        |
@@ -562,7 +576,9 @@ Pitfalls the example projects ran into:
 - The selection persists: a selection-based operator without `selection` acts on what the last
   call selected (often the object you just added).
 - Names are made unique (`Cube.001`): use the `name` a result returns.
-- A misspelled tool argument (not an operator parameter) is ignored without an error.
+- Misspelled tool arguments (`base_colour`, `rotaton`, `parms`) fail the call, and so do operator
+  parameters given as tool arguments; the message names the argument you meant or says that
+  operator parameters go inside `params`.
 - `transform_object` on an animated channel changes only the stored value; the keys win.
 - `get_scene`, `get_object` and `render_image` use your current frame, which starts at 1.
 - A scaled object stretches its OBJECT-mapped procedural textures: apply the scale first.
@@ -575,7 +591,8 @@ Pitfalls the example projects ran into:
 ## Example projects
 
 Five projects were built from nothing through MCP alone. Each folder has a re-runnable
-`build.mjs` (it deletes and rebuilds its project, then renders and exports into the folder; run it
+`build.mjs` (it deletes and rebuilds its project, checks it and writes its renders into the folder;
+`--export-only` writes `scene.glb` instead, and each script's header lists its other modes; run it
 with `MCP_URL=http://host:port/mcp node examples/<name>/build.mjs`) and the outputs it produced.
 The scripts were still being finished when this guide was written, so the operator ids below are
 the best search terms; function names and numbers may differ.

@@ -1004,13 +1004,24 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
         'same values in each cycle and jumps back at the cycle boundary unless faded out there (NOISE ' +
         "use_restricted_range with blend_in / blend_out). Affects the objects' curves (optionally only `path` / " +
         '`index`), and with include_data also their object data (light, camera, curve, mesh shape keys) and ' +
-        'materials. Returns the number of curves.',
+        'materials. To change the curves of one datablock only, pass target_type and target instead of objects ' +
+        "(as for the F-modifier operators), e.g. {target_type: 'light', target: 'Lamp', path: 'color'} changes the " +
+        "light data's color curves but not the lamp object's viewport color, which has the same path. Returns the " +
+        'number of curves (fcurves) and how many changed.',
       category: 'Animation',
       schema: z.object({
         objects: z
           .array(z.string())
           .optional()
-          .describe('Object ids or names (default: the selected objects)'),
+          .describe('Object ids or names (default: the selected objects); not with target_type'),
+        target_type: z
+          .enum(TARGET_TYPES)
+          .optional()
+          .describe(
+            'Only the curves of one datablock: object, material, light, camera, world, scene, mesh (shape keys) or ' +
+              'curve (with `target`; instead of objects / include_data)',
+          ),
+        target: targetRef('the active object (or its data)'),
         type: z.enum(['CONSTANT', 'LINEAR', 'CYCLIC']).describe('Extrapolation mode'),
         path: z
           .string()
@@ -1026,9 +1037,23 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
           ),
       }),
       execute(ctx, p) {
-        const ids = resolveObjectIds(ctx, p.objects);
-        if (!ids.length) throw new OperatorError('No objects selected (pass `objects`)', 'POLL_FAILED');
         const targets = new Map<string, Target>();
+        if (p.target_type !== undefined) {
+          if (p.objects !== undefined || p.include_data)
+            throw new OperatorError(
+              'Pass either target_type / target (the curves of one datablock) or objects / include_data, not both',
+              'INVALID_PARAMS',
+            );
+          const t = resolveTarget(ctx, p.target_type, p.target);
+          targets.set(`${t.type}:${t.id}`, t);
+        } else if (p.target !== undefined)
+          throw new OperatorError(
+            '`target` needs target_type (object, material, light, camera, world, scene, mesh or curve)',
+            'INVALID_PARAMS',
+          );
+        const ids = p.target_type !== undefined ? [] : resolveObjectIds(ctx, p.objects);
+        if (p.target_type === undefined && !ids.length)
+          throw new OperatorError('No objects selected (pass `objects`)', 'POLL_FAILED');
         for (const id of ids) {
           const o = ctx.doc.getObject(id)!;
           targets.set(`object:${id}`, { type: 'object', id, name: o.name });
@@ -1048,11 +1073,14 @@ export function registerDriverOperators(reg: OperatorRegistry): void {
             ctx.doc.setFCurve({ ...fc, extrapolation: p.type });
             changed++;
           }
-        if (!matched)
+        if (!matched) {
+          const only = p.target_type !== undefined ? [...targets.values()][0] : null;
           throw new OperatorError(
-            `No animation curves${p.path ? ` for '${p.path}'` : ''} on the given objects`,
+            `No animation curves${p.path ? ` for '${p.path}'` : ''}` +
+              (only ? ` on ${only.type} '${only.name}'` : ' on the given objects'),
             'NOT_FOUND',
           );
+        }
         return { type: p.type, fcurves: matched, changed };
       },
     }),

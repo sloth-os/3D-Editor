@@ -26,6 +26,8 @@ export interface RigidBodyIssue {
 /** A rigid body object as read from the scene at frame_start. */
 export interface BodyInput {
   id: string;
+  /** Object name (orders bodies that start at the same pose, see `compareBodyOrder`). */
+  name?: string;
   /** Validated rigid body settings. */
   rb: RigidBodyData;
   /** Unsimulated world matrix at frame_start (null when unavailable). */
@@ -58,6 +60,33 @@ export function shapeKey(mesh: MeshData, rb: RigidBodyData, scale: Readonly<Vec3
   return `${meshKey(mesh)}|${rb.collision_shape}|${dynamic ? 1 : 0}|${scale[0]},${scale[1]},${scale[2]}`;
 }
 
+/** Matrix elements compared for the solver order: the translation first, then the rotation / scale. */
+const ORDER_KEYS = [12, 13, 14, 0, 1, 2, 4, 5, 6, 8, 9, 10, 3, 7, 11, 15];
+
+/**
+ * Solver order of rigid bodies: by their world matrix at frame_start (location x, y, z first),
+ * then by name and id for bodies that start at exactly the same pose. The order changes the result
+ * of the sequential-impulse solver slightly; object ids are random, so ordering by id made two
+ * builds of the same scene simulate differently. Ordered by their start poses, identical scenes
+ * simulate identically whatever their object ids and names, and renaming changes nothing.
+ */
+export function compareBodyOrder(a: BodyInput, b: BodyInput): number {
+  const ma = a.matrix;
+  const mb = b.matrix;
+  if (ma && mb) {
+    for (const k of ORDER_KEYS) {
+      const x = ma[k];
+      const y = mb[k];
+      if (x < y) return -1;
+      if (x > y) return 1;
+    }
+  } else if (ma || mb) return ma ? -1 : 1;
+  const na = a.name ?? a.id;
+  const nb = b.name ?? b.id;
+  if (na !== nb) return na < nb ? -1 : 1;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
 export class Simulation {
   readonly world: PhysicsWorld;
   readonly frameStart: number;
@@ -67,9 +96,9 @@ export class Simulation {
   /** Length of one step in seconds. */
   readonly dt: number;
   readonly bodies: readonly Body[];
-  /** Bodies whose transform the simulation drives (ACTIVE and not animated), in id order. */
+  /** Bodies whose transform the simulation drives (ACTIVE and not animated), in solver order. */
   readonly outputs: readonly Body[];
-  /** Animated ("kinematic") bodies following their animation, in id order. */
+  /** Animated ("kinematic") bodies following their animation, in solver order. */
   readonly kinematic: readonly Body[];
   readonly issues: RigidBodyIssue[] = [];
   /** Collision shapes of this simulation's bodies, by `shapeKey`. */
@@ -93,7 +122,7 @@ export class Simulation {
     this.dt = params.timeScale / params.fps / params.substeps;
     this.current = this.frameStart;
     const bodies: Body[] = [];
-    const sorted = [...inputs].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const sorted = [...inputs].sort(compareBodyOrder);
     const reuse = opts.reuse ?? null;
     for (const input of sorted) {
       const body = this.createBody(input, bodies.length, reuse);

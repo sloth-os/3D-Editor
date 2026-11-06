@@ -5,16 +5,21 @@
  *
  *   MCP_URL=http://127.0.0.1:8080/mcp node examples/clockwork-orrery/build.mjs [mode] [--out-dir DIR]
  *
- * Modes (the scene is always rebuilt from scratch first: the project is deleted and recreated):
+ * Modes (the scene is always rebuilt from scratch first: the project is deleted and recreated, then
+ * verified: driven angles, gear ratios, the moon's period, clearance between all moving parts at
+ * every frame of the loop, and the framing):
  *   --final        (default) build + verify, then render.png (path traced 1280×720), contact_sheet.png
  *                  (12 path traced frames) and preview.gif (48 path traced frames, 480×270)
- *   --build-only   build + verify only (a few seconds, no renders)
+ *   --build-only   build + verify only, no renders (about a minute; the per-frame clearance sweep is
+ *                  most of it)
  *   --preview      build + verify + quick previews in $PREVIEW_DIR (RASTER still, 640×360 path traced
  *                  still, RASTER contact sheet); nothing is written next to this script
  *   --export-only  build + verify + scene.glb (glTF binary), no renders
- *   --stages a,b   explicit stage list: build (always), preview, still, anim, export
+ *   --stages a,b   explicit stage list instead of a mode: build (always), preview, still, anim, export
  *   --out-dir DIR  where render.png / contact_sheet.png / preview.gif / scene.glb are written
  *                  (default: this folder)
+ * Any other argument (e.g. "build-only" without the dashes) or an unknown stage name stops the
+ * script with exit code 2 before it connects to the server.
  *
  * Mechanism: ONE master channel — the empty "Master Drive", rotation Z keyed linearly 0 → 2π over
  * frames 1 → 49 (anim.keyframes_insert_many) and repeated forever (anim.extrapolation_set CYCLIC).
@@ -24,9 +29,11 @@
  *   gear train    θ_B = φ_B − (T_A/T_B)·(θ_A − φ_A)  for every meshing pair A→B (opposite senses,
  *                 ratio teeth_A/teeth_B; φ chosen so a tooth of A sits in a gap of B)
  * The moon rides a Bezier circle parented to the third planet's arm (FOLLOW_PATH constraint, timed
- * with constraint.followpath_path_animate: one orbit every 12 frames).
+ * on its own by constraint.followpath_path_animate: the curve's eval_time is keyed 0 → 100 over 12
+ * frames with LINEAR extrapolation, i.e. one orbit every 12 frames, four per master turn).
  * verifyMotion() reads the evaluated transforms back with get_object at several frames and fails
- * the build if any part does not move exactly as designed.
+ * the build if any part does not move exactly as designed; verifyClearance() measures the exact
+ * surface distances between the moving parts at every frame (scene.measure) and fails on contact.
  */
 import { mkdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -40,23 +47,49 @@ const PREVIEW_DIR = process.env.PREVIEW_DIR ?? path.join(os.tmpdir(), 'clockwork
 
 // ---------------------------------------------------------------------------------- command line
 
-const argv = process.argv.slice(2);
-function argValue(name) {
-  const i = argv.indexOf(name);
-  return i >= 0 ? argv[i + 1] : undefined;
-}
 const MODES = {
   '--final': 'build,still,anim',
   '--build-only': 'build',
   '--preview': 'build,preview',
   '--export-only': 'build,export',
 };
-const modeFlag = argv.find((a) => a in MODES);
-const STAGES = new Set((argValue('--stages') ?? process.env.STAGES ?? MODES[modeFlag ?? '--final']).split(',').map((s) => s.trim()));
-STAGES.add('build');
-const OUT_DIR = path.resolve(argValue('--out-dir') ?? HERE);
-for (const a of argv)
-  if (a.startsWith('--') && !(a in MODES) && a !== '--stages' && a !== '--out-dir') throw new Error(`unknown option ${a}`);
+const STAGE_NAMES = ['build', 'preview', 'still', 'anim', 'export'];
+const USAGE = `usage: MCP_URL=http://HOST:PORT/mcp node examples/clockwork-orrery/build.mjs [${Object.keys(MODES).join(' | ')} | --stages ${STAGE_NAMES.join(',')}] [--out-dir DIR]`;
+
+function usageError(msg) {
+  console.error(`build.mjs: ${msg}\n${USAGE}`);
+  process.exit(2);
+}
+
+/** Strict command line: every argument must be a known flag or the value right after one. */
+function parseArgs(argv) {
+  let mode = null;
+  let stageList = null;
+  let outDir = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--help' || a === '-h') {
+      console.log(USAGE);
+      process.exit(0);
+    } else if (a in MODES || a === '--stages') {
+      if (mode || stageList) usageError(`give one mode or --stages, not both (${mode ?? '--stages'} and ${a})`);
+      if (a === '--stages') {
+        stageList = argv[++i];
+        if (!stageList || stageList.startsWith('-')) usageError('--stages needs a comma-separated list');
+      } else mode = a;
+    } else if (a === '--out-dir') {
+      if (outDir) usageError('--out-dir given twice');
+      outDir = argv[++i];
+      if (!outDir || outDir.startsWith('-')) usageError('--out-dir needs a directory');
+    } else usageError(`unknown argument "${a}"`);
+  }
+  const stages = (stageList ?? MODES[mode ?? '--final']).split(',').map((s) => s.trim());
+  const unknown = stages.filter((s) => !STAGE_NAMES.includes(s));
+  if (unknown.length) usageError(`unknown stage(s) ${unknown.map((s) => `"${s}"`).join(', ')} (known: ${STAGE_NAMES.join(', ')})`);
+  return { stages: new Set(['build', ...stages]), outDir: path.resolve(outDir ?? HERE) };
+}
+
+const { stages: STAGES, outDir: OUT_DIR } = parseArgs(process.argv.slice(2));
 
 const TAU = 2 * Math.PI;
 const DEG = Math.PI / 180;
@@ -144,13 +177,22 @@ const SUN = { r: 0.075, z: 0.735 };
 
 // Planets: orbit radius R, sphere radius s, arm height h, planet centre height p, orbits per master
 // turn n (=> periods 12, 16, 24, 48 frames), spin turns per master turn, start angle, material.
+// Titan's gilt ring: major / minor radius in planet radii, tilt (Euler XYZ in the arm frame) and
+// flattening. The radii are chosen so that the annuli the four assemblies sweep around the spindle
+// stay at least MIN_GAP apart (layoutPlanets): two arms can then never touch, at any angle.
 const PLANETS = [
-  { key: 'Ember', R: 0.135, s: 0.021, h: 0.585, p: 0.655, n: 4, spin: 8, phase: 68 * DEG, material: 'Copper' },
-  { key: 'Azure', R: 0.205, s: 0.028, h: 0.525, p: 0.63, n: 3, spin: 6, phase: 138 * DEG, material: 'Azure Glaze' },
-  { key: 'Verdant', R: 0.285, s: 0.034, h: 0.46, p: 0.605, n: 2, spin: 4, phase: 8 * DEG, material: 'Verdant' },
-  { key: 'Titan', R: 0.37, s: 0.052, h: 0.39, p: 0.575, n: 1, spin: 3, phase: 228 * DEG, material: 'Banded Giant' },
+  { key: 'Ember', R: 0.125, s: 0.02, h: 0.585, p: 0.655, n: 4, spin: 8, phase: 68 * DEG, material: 'Copper' },
+  { key: 'Azure', R: 0.185, s: 0.026, h: 0.525, p: 0.63, n: 3, spin: 6, phase: 138 * DEG, material: 'Azure Glaze' },
+  { key: 'Verdant', R: 0.285, s: 0.031, h: 0.46, p: 0.605, n: 2, spin: 4, phase: 8 * DEG, material: 'Verdant' },
+  {
+    key: 'Titan', R: 0.445, s: 0.048, h: 0.39, p: 0.575, n: 1, spin: 3, phase: 228 * DEG, material: 'Banded Giant',
+    ring: { major: 1.55, minor: 0.26, tilt: [22 * DEG, 8 * DEG, 0], flatten: 0.14 },
+  },
 ];
-const MOON = { orbit: 0.068, r: 0.0115, framesPerOrbit: 12, tilt: 14 * DEG };
+const MOON = { planet: 'Verdant', orbit: 0.05, r: 0.0105, framesPerOrbit: 12, tilt: 14 * DEG };
+const ARM = { barW: 0.014, barT: 0.006, collarR: 0.019, collarH: 0.016, postR: 0.0034 };
+const MIN_GAP = 0.01; // radial gap between the swept annuli of neighbouring planet assemblies (m)
+const CLEARANCE = { planets: 0.005, gears: 0.0002 }; // smallest surface distance allowed in verifyClearance
 const LOOP = 48; // frames per master turn (frame 49 = frame 1)
 
 // Gear train on the deck: module (pitch diameter per tooth) and tooth depth shared by all gears so
@@ -238,6 +280,51 @@ function layoutGears() {
       throw new Error(`gear ${x.name} would jump at the loop point (${turns} turns, symmetry ${x.symmetry})`);
   }
   return g;
+}
+
+// ---------------------------------------------------------------------------------- planet layout
+
+/**
+ * Planet layout check (pure geometry, before any editor call). Each arm carries a "head" — the
+ * planet, Titan's ring, Verdant's moon on its orbit — whose horizontal reach from the arm's post is
+ * ρ, so the assembly sweeps the annulus [R − ρ, R + ρ] around the spindle. When neighbouring
+ * annuli are disjoint, two assemblies cannot touch at any angle: an outer head never reaches an
+ * inner post or bar (they lie inside the inner annulus), and every outer bar and collar runs below
+ * the inner ones, whose heads sit above their own bars. verifyClearance() then confirms this on the
+ * built scene with exact surface distances at every frame.
+ */
+function layoutPlanets() {
+  const heads = PLANETS.map((P) => {
+    let rho = P.s;
+    let dip = P.s; // how far the head reaches below the planet centre
+    if (P.ring) {
+      const reach = P.s * (P.ring.major + P.ring.minor);
+      const tilt = Math.acos(Math.cos(P.ring.tilt[0]) * Math.cos(P.ring.tilt[1])); // ring plane vs. horizontal
+      rho = Math.max(rho, reach);
+      dip = Math.max(dip, reach * Math.sin(tilt) + P.s * P.ring.minor * P.ring.flatten);
+    }
+    if (P.key === MOON.planet) {
+      rho = Math.max(rho, MOON.orbit + MOON.r);
+      dip = Math.max(dip, MOON.orbit * Math.sin(MOON.tilt) + MOON.r);
+    }
+    return { key: P.key, R: P.R, h: P.h, rIn: P.R - rho, rOut: P.R + rho, bottom: P.p - dip };
+  });
+  const fail = (msg) => {
+    throw new Error(`planet layout: ${msg}`);
+  };
+  if (heads[0].rIn - SUN.r < MIN_GAP) fail(`${heads[0].key} reaches the sun`);
+  for (const [i, x] of heads.entries()) {
+    if (x.bottom < x.h + ARM.barT / 2 + MIN_GAP) fail(`${x.key} hangs down to its own arm (bottom ${x.bottom.toFixed(3)} m)`);
+    if (i === 0) continue;
+    const inner = heads[i - 1];
+    const gap = x.rIn - inner.rOut;
+    if (gap < MIN_GAP)
+      fail(`${inner.key} (r ${inner.rIn.toFixed(3)}–${inner.rOut.toFixed(3)} m) and ${x.key} (r ${x.rIn.toFixed(3)}–${x.rOut.toFixed(3)} m) overlap or nearly do (gap ${gap.toFixed(4)} m)`);
+    if (inner.h - x.h < ARM.collarH + MIN_GAP) fail(`the arms of ${inner.key} and ${x.key} are too close in height`);
+  }
+  for (const x of heads)
+    console.log(`    ${x.key.padEnd(8)} sweeps r ${x.rIn.toFixed(4)}–${x.rOut.toFixed(4)} m (z ≥ ${x.bottom.toFixed(3)} m above its arm at ${x.h} m)`);
+  return heads;
 }
 
 // ---------------------------------------------------------------------------------- build
@@ -373,9 +460,10 @@ async function assign(material, objects) {
 }
 
 async function plinth() {
-  // table top: rotated so the procedural wood rings run along world X (plank-like grain); deep
-  // enough that its far edge stays above the frame and the wood fades into the dark
-  await op('mesh.primitive_cube_add', { size: 1, name: 'Table', location: [0, 7, -0.025], scale: [0.05, 16, 8], rotation: [0, Math.PI / 2, 0] });
+  // table top: rotated so the procedural wood rings run along world X (plank-like grain); 24 m wide
+  // (X ±12) and 16 m deep (Y −1…15), so none of its edges enters the frame and the wood fades into
+  // the dark (verifyFraming checks that the four image corners see the table top)
+  await op('mesh.primitive_cube_add', { size: 1, name: 'Table', location: [0, 7, -0.025], scale: [0.05, 16, 24], rotation: [0, Math.PI / 2, 0] });
   await op('object.transform_apply', { location: false, rotation: false, scale: true }, { objects: ['Table'] });
   await assign('Table Wood', ['Table']);
 
@@ -524,11 +612,11 @@ async function planetArms() {
     await call('add_object', { type: 'empty', name: pivot, location: [0, 0, P.h], params: { radius: 0.05 } });
     // arm = collar on the spindle + flat bar + upright post + cup, joined into one mesh
     const barLen = P.R + 0.004;
-    await op('mesh.primitive_cube_add', { size: 1, name: arm, location: [barLen / 2, 0, P.h], scale: [barLen, 0.014, 0.006] });
+    await op('mesh.primitive_cube_add', { size: 1, name: arm, location: [barLen / 2, 0, P.h], scale: [barLen, ARM.barW, ARM.barT] });
     await op('object.transform_apply', { location: false, rotation: false, scale: true }, { objects: [arm] });
     const parts = [
-      ['mesh.primitive_cylinder_add', { vertices: 40, radius: 0.019, depth: 0.016, name: `${arm} Collar`, location: [0, 0, P.h] }],
-      ['mesh.primitive_cylinder_add', { vertices: 24, radius: 0.0034, depth: P.p - P.h - P.s * 0.6, name: `${arm} Post`, location: [P.R, 0, P.h + (P.p - P.h - P.s * 0.6) / 2] }],
+      ['mesh.primitive_cylinder_add', { vertices: 40, radius: ARM.collarR, depth: ARM.collarH, name: `${arm} Collar`, location: [0, 0, P.h] }],
+      ['mesh.primitive_cylinder_add', { vertices: 24, radius: ARM.postR, depth: P.p - P.h - P.s * 0.6, name: `${arm} Post`, location: [P.R, 0, P.h + (P.p - P.h - P.s * 0.6) / 2] }],
       ['mesh.primitive_cylinder_add', { vertices: 32, radius: 0.0065, depth: 0.004, name: `${arm} Boss`, location: [P.R, 0, P.h + 0.0042] }],
       ['mesh.primitive_cone_add', { vertices: 32, radius1: 0.0034, radius2: P.s * 0.5, depth: P.s * 0.42, name: `${arm} Cup`, location: [P.R, 0, P.p - P.s * 0.72] }],
     ];
@@ -540,14 +628,18 @@ async function planetArms() {
     await op('object.shade_smooth', {}, { objects: [P.key] });
     await assign(P.material, [P.key]);
     const children = [arm, P.key];
-    if (P.key === 'Titan') {
+    if (P.ring) {
       // a flat gilt ring around the giant (on the arm, so it orbits but does not spin)
-      await op('mesh.primitive_torus_add', { major_radius: P.s * 1.72, minor_radius: P.s * 0.36, major_segments: 72, minor_segments: 16, name: 'Titan Ring', location: [P.R, 0, P.p], rotation: [22 * DEG, 8 * DEG, 0], scale: [1, 1, 0.14] });
-      await op('object.shade_smooth', {}, { objects: ['Titan Ring'] });
-      await assign('Gilt', ['Titan Ring']);
-      children.push('Titan Ring');
+      const ring = `${P.key} Ring`;
+      await op('mesh.primitive_torus_add', {
+        major_radius: P.s * P.ring.major, minor_radius: P.s * P.ring.minor, major_segments: 72, minor_segments: 16,
+        name: ring, location: [P.R, 0, P.p], rotation: P.ring.tilt, scale: [1, 1, P.ring.flatten],
+      });
+      await op('object.shade_smooth', {}, { objects: [ring] });
+      await assign('Gilt', [ring]);
+      children.push(ring);
     }
-    if (P.key === 'Verdant') {
+    if (P.key === MOON.planet) {
       // the moon's orbit: a thin brass Bezier circle around the planet; the moon follows it
       await op('curve.primitive_bezier_circle_add', {
         radius: MOON.orbit, name: 'Moon Orbit', location: [P.R, 0, P.p], rotation: [MOON.tilt, 0, 0],
@@ -691,25 +783,125 @@ async function verifyMotion(gears) {
       const r = Math.hypot(o.world_location[0], o.world_location[1]);
       check(Math.abs(r - P.R) < 1e-3, `${P.key} f${f}: orbit radius ${r.toFixed(4)} ≠ ${P.R}`);
     }
-  // the moon: on its orbit around Verdant, one orbit every 12 frames, back at its start at frame 49
-  const moonAt = {};
-  for (const f of [1, 4, 7, 13, 25, LOOP + 1]) {
+  // the moon: on its orbit around its planet, one prograde orbit every 12 frames. The orbit rides on
+  // the planet's arm, so the moon's position is taken relative to the planet, turned back into the
+  // arm's frame (minus the pivot angle) and then into the tilted orbit plane, where its angle must
+  // advance by 360°·Δf/12: a quarter orbit at frames 4, 7, 10, a full one at 13, 25 and 49.
+  const moonFrames = [1, 4, 7, 10, 13, 25, LOOP + 1];
+  const moonAngle = {};
+  for (const f of moonFrames) {
     const m = await call('get_object', { object: 'Moon', frame: f }, { quiet: true });
-    const p = await call('get_object', { object: 'Verdant', frame: f }, { quiet: true });
-    const d = Math.hypot(...m.world_location.map((x, i) => x - p.world_location[i]));
-    check(Math.abs(d - MOON.orbit) < 1.5e-3, `Moon f${f}: ${d.toFixed(4)} m from Verdant ≠ ${MOON.orbit}`);
-    moonAt[f] = m.world_location;
+    const p = await call('get_object', { object: MOON.planet, frame: f }, { quiet: true });
+    const rel = m.world_location.map((x, i) => x - p.world_location[i]);
+    const pivot = `${MOON.planet} Pivot`;
+    const a = -(angle[pivot][f] ?? (await call('get_object', { object: pivot, frame: f }, { quiet: true })).rotation_euler[2]);
+    const ax = rel[0] * Math.cos(a) - rel[1] * Math.sin(a);
+    const ay = rel[0] * Math.sin(a) + rel[1] * Math.cos(a);
+    const oy = ay * Math.cos(MOON.tilt) + rel[2] * Math.sin(MOON.tilt); // undo the orbit's tilt about the arm
+    const oz = -ay * Math.sin(MOON.tilt) + rel[2] * Math.cos(MOON.tilt);
+    const d = Math.hypot(...rel);
+    check(Math.abs(d - MOON.orbit) < 1.5e-3, `Moon f${f}: ${d.toFixed(4)} m from ${MOON.planet} ≠ ${MOON.orbit}`);
+    check(Math.abs(oz) < 1e-3, `Moon f${f}: ${oz.toFixed(4)} m off its orbit plane`);
+    moonAngle[f] = Math.atan2(oy, ax);
   }
-  const same = (a, b) => Math.hypot(...a.map((x, i) => x - b[i])) < 1e-3;
-  check(!same(moonAt[1], moonAt[4]) && !same(moonAt[1], moonAt[7]), 'Moon does not move');
-  check(same(moonAt[1], moonAt[25]) && same(moonAt[1], moonAt[LOOP + 1]), 'Moon is not back at its start after 2 and 4 orbits');
+  const moonSteps = [];
+  for (const f of moonFrames.slice(1)) {
+    const want = mod(((f - 1) / MOON.framesPerOrbit) * TAU, TAU);
+    const got = mod(moonAngle[f] - moonAngle[1], TAU);
+    const err = Math.min(Math.abs(got - want), TAU - Math.abs(got - want));
+    const shown = got > TAU - 1e-3 ? got - TAU : got; // 359.99° → −0.01°
+    check(err < 1.5 * DEG, `Moon f${f}: ${(shown / DEG).toFixed(1)}° along its orbit since frame 1 ≠ ${(want / DEG).toFixed(1)}°`);
+    const orbits = (f - 1) / MOON.framesPerOrbit;
+    moonSteps.push(`f${f} ${(shown / DEG).toFixed(1)}°${Number.isInteger(orbits) ? ` (${orbits} orbit${orbits > 1 ? 's' : ''})` : ''}`);
+  }
   for (const line of pairs) console.log(`    ${line}`);
   const fmt = (o) => [1, 13, 25, LOOP + 1].map((f) => r4(angle[o][f])).join(' / ');
   for (const o of ['Ember Pivot', 'Azure Pivot', 'Verdant Pivot', 'Titan Pivot', 'Great Wheel', 'Idler Wheel', 'Third Wheel', 'Pinion'])
     console.log(`    ${o.padEnd(14)} θ at frames 1/13/25/49: ${fmt(o)}`);
-  console.log(`    moon ${MOON.orbit} m from Verdant at frames 1,4,7,13,25,49; back at its start every ${MOON.framesPerOrbit} frames`);
+  console.log(`    moon ${MOON.orbit} m from ${MOON.planet}; angle along its orbit (arm frame) since frame 1: ${moonSteps.join(', ')} → one orbit every ${MOON.framesPerOrbit} frames`);
   if (errors.length) throw new Error(`motion check failed:\n  ${errors.join('\n  ')}`);
-  console.log(`  ✓ motion verified: ${parts.length} driven parts × ${frames.length} frames, ${pairs.length} meshing pairs, moon path, seamless ${LOOP}-frame loop`);
+  console.log(`  ✓ motion verified: ${parts.length} driven parts × ${frames.length} frames, ${pairs.length} meshing pairs, moon period, seamless ${LOOP}-frame loop`);
+}
+
+/**
+ * Exact clearance between the moving parts at every frame of the loop: scene.measure with
+ * surface_distance (at most 8 objects per call) on groups that together cover every pair of
+ * different assemblies — the four planet arms (planet, arm, ring, moon orbit and moon), the sun and
+ * the four wheels. Contacts inside one assembly (a planet in its cup, the moon threaded on its wire)
+ * are by design and skipped; any other pair closer than CLEARANCE fails the build.
+ */
+async function verifyClearance() {
+  const assembly = {}; // object name → assembly
+  for (const P of PLANETS) {
+    const objs = [P.key, `${P.key} Arm`, ...(P.ring ? [`${P.key} Ring`] : []), ...(P.key === MOON.planet ? ['Moon Orbit', 'Moon'] : [])];
+    for (const o of objs) assembly[o] = P.key;
+  }
+  assembly.Sun = 'Sun';
+  for (const x of GEARS) assembly[x.name] = x.name;
+  const members = (key) => Object.keys(assembly).filter((o) => assembly[o] === key);
+  const [E, A, V, T] = PLANETS.map((P) => members(P.key));
+  const groups = [[...E, ...A, ...V], [...V, ...T, 'Sun'], [...E, ...A, ...T, 'Sun'], GEARS.map((x) => x.name)];
+  // every pair of different assemblies must be measured in at least one group of ≤ 8 objects
+  const covered = new Set(groups.flatMap((g) => g.flatMap((a) => g.map((b) => `${a}|${b}`))));
+  const names = Object.keys(assembly);
+  for (const a of names)
+    for (const b of names) {
+      const sameKind = GEARS.some((x) => x.name === a) === GEARS.some((x) => x.name === b); // gears sit far below the arms
+      if (assembly[a] !== assembly[b] && sameKind && !covered.has(`${a}|${b}`)) throw new Error(`clearance groups miss ${a} / ${b}`);
+    }
+  if (groups.some((g) => g.length > 8)) throw new Error('scene.measure takes at most 8 objects for surface distances');
+
+  const worst = new Map(); // "a / b" → closest {d, f}
+  const failures = [];
+  const t0 = Date.now();
+  for (let f = 1; f <= LOOP; f++)
+    for (const objects of groups) {
+      const res = await call('run_operator', { operator: 'scene.measure', params: { objects, frame: f, surface_distance: true } }, { quiet: true });
+      for (const p of res.result?.distances ?? []) {
+        if (assembly[p.a_name] === assembly[p.b_name]) continue;
+        const key = [p.a_name, p.b_name].sort().join(' / ');
+        const d = p.surface_distance;
+        if (typeof d !== 'number') throw new Error(`scene.measure gave no surface distance for ${key}: ${short(p)}`);
+        const w = worst.get(key);
+        if (!w || d < w.d) worst.set(key, { d, f });
+        const limit = GEARS.some((x) => x.name === p.a_name) ? CLEARANCE.gears : CLEARANCE.planets;
+        if (p.intersecting || d < limit) failures.push(`f${f} ${key}: ${p.intersecting ? 'INTERSECTING' : `${(d * 1000).toFixed(2)} mm`}`);
+      }
+    }
+  const closest = [...worst.entries()].sort((a, b) => a[1].d - b[1].d);
+  for (const [key, w] of closest.slice(0, 8)) console.log(`    closest: ${key.padEnd(28)} ${(w.d * 1000).toFixed(1)} mm at frame ${w.f}`);
+  if (failures.length) throw new Error(`clearance check failed (${failures.length}):\n  ${failures.slice(0, 40).join('\n  ')}`);
+  console.log(`  ✓ clearance verified: ${worst.size} pairs of moving parts × ${LOOP} frames in ${((Date.now() - t0) / 1000).toFixed(1)} s (planets ≥ ${CLEARANCE.planets * 1000} mm, gear teeth never cross)`);
+}
+
+/**
+ * Framing: the table must fill the whole frame, so no edge of it can show. The camera's axes come
+ * from its evaluated world rotation (Track To on the Focus empty); rays through the four image
+ * corners (36 mm sensor across the 16:9 image) must hit the top face of the table.
+ */
+async function verifyFraming() {
+  const cam = await call('get_object', { object: 'Camera', frame: 1 }, { quiet: true });
+  const [ex, ey, ez] = cam.world_transform.rotation_euler; // XYZ Euler: R = Rz·Ry·Rx
+  const rot = ([x, y, z]) => {
+    [y, z] = [y * Math.cos(ex) - z * Math.sin(ex), y * Math.sin(ex) + z * Math.cos(ex)];
+    [x, z] = [x * Math.cos(ey) + z * Math.sin(ey), -x * Math.sin(ey) + z * Math.cos(ey)];
+    [x, y] = [x * Math.cos(ez) - y * Math.sin(ez), x * Math.sin(ez) + y * Math.cos(ez)];
+    return [x, y, z];
+  };
+  const right = rot([1, 0, 0]);
+  const up = rot([0, 1, 0]);
+  const fwd = rot([0, 0, -1]);
+  const tx = 18 / CAMERA.lens;
+  const ty = (tx * 720) / 1280;
+  const seen = [];
+  for (const [sx, sy, label] of [[-1, 1, 'top left'], [1, 1, 'top right'], [-1, -1, 'bottom left'], [1, -1, 'bottom right']]) {
+    const direction = fwd.map((v, i) => v + sx * tx * right[i] + sy * ty * up[i]);
+    const r = await call('run_operator', { operator: 'scene.raycast', params: { origin: cam.world_location, direction, objects: ['Table'], frame: 1 } }, { quiet: true });
+    const hit = r.result;
+    if (!hit?.hit || hit.normal[2] < 0.99) throw new Error(`framing: the ${label} image corner does not see the table top (${short(hit)})`);
+    seen.push(`${label} (${hit.point.map((v) => v.toFixed(2)).join(', ')})`);
+  }
+  console.log(`  ✓ framing: all four image corners see the table top: ${seen.join('; ')}`);
 }
 
 // ---------------------------------------------------------------------------------- renders
@@ -745,8 +937,11 @@ async function animation() {
   timings['contact_sheet.png'] = { ms: Date.now() - t0, info: sheet.text };
   await saveImage(sheet, path.join(OUT_DIR, 'contact_sheet.png'));
   console.log(`    → contact_sheet.png ${short(sheet.text, 400)}`);
+  // GIF: 6 spp with the whole 600 s budget (37.5 s per frame on each of 3 threads at the start), so
+  // every frame reaches the same sample count even on a busy machine: with the fixed seed the static
+  // parts are then identical in every frame (frames cut short at a lower count would shimmer)
   t0 = Date.now();
-  const gif = await call('render_animation', { ...common, format: 'GIF', width: 480, height: 270, samples: 8, fps: 16, dither: 'BAYER', time_limit: 540 });
+  const gif = await call('render_animation', { ...common, format: 'GIF', width: 480, height: 270, samples: 6, fps: 16, dither: 'BAYER', time_limit: 600 });
   timings['preview.gif'] = { ms: Date.now() - t0, info: gif.text };
   await saveImage(gif, path.join(OUT_DIR, 'preview.gif'));
   console.log(`    → preview.gif ${short(gif.text, 400)}`);
@@ -792,6 +987,8 @@ const T0 = Date.now();
 try {
   console.log(`stages: ${[...STAGES].join(', ')}  outputs: ${OUT_DIR}`);
   await mkdir(OUT_DIR, { recursive: true });
+  console.log('● planet layout (swept annuli)');
+  layoutPlanets();
   console.log('● project');
   await resetProject();
   console.log('● scene settings & materials');
@@ -813,6 +1010,8 @@ try {
   console.log('● verify');
   await verifyScene();
   await verifyMotion(gears);
+  await verifyClearance();
+  await verifyFraming();
   timings.build = { ms: Date.now() - T0 };
   if (STAGES.has('preview')) {
     console.log('● previews');

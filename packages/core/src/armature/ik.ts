@@ -1,6 +1,16 @@
-import type { Mat4, Vec3 } from '../math/types';
-import { invert4, multiply4 } from '../math/mat4';
-import { blendMatrices, decomposeTRS, rotateAbout, rotationBetween, rotationPart, tailOf } from './bone-math';
+import type { Mat4, Quat, Vec3 } from '../math/types';
+import { fromQuat4, invert4, multiply4 } from '../math/mat4';
+import { multiplyQuat, quatFromAxisAngle } from '../math/quat';
+import {
+  blendMatrices,
+  composeTRS,
+  decomposeTRS,
+  quatFromRotationMatrix,
+  rotateAbout,
+  rotationBetween,
+  rotationPart,
+  tailOf,
+} from './bone-math';
 
 /*
  * Inverse kinematics for bone chains.
@@ -14,7 +24,78 @@ import { blendMatrices, decomposeTRS, rotateAbout, rotationBetween, rotationPart
  * Pole targets follow Blender: before and after solving, the whole chain is rotated about its
  * root so that the root bone's X axis — rotated by `poleAngle` towards its Z axis — faces the pole
  * (in the plane perpendicular to the root → goal direction).
+ *
+ * Bones with IK settings (Blender's pose bone lock_ik_*, use_ik_limit_* / ik_min_* / ik_max_* and
+ * ik_stiffness_*) make their job use a damped least-squares solver over the bones' local rotation
+ * axes instead (like Blender's iTaSC / Standard solver): a locked axis is not a degree of freedom
+ * at all, stiffness weights an axis down, and after every step each limited bone's rotation
+ * relative to its rest pose is clamped (swing about X / Z and twist about Y, the bone axis).
  */
+
+/** Per-bone IK settings (Blender pose bone lock_ik_*, use_ik_limit_*, ik_min_* / ik_max_*, ik_stiffness_*). */
+export interface IkBoneSettings {
+  /** Local X / Y / Z axes the solver may not rotate the bone about. */
+  lock: [boolean, boolean, boolean];
+  /** Allowed rotation per local axis relative to the rest pose ([min, max] radians), or null. */
+  limit: [[number, number] | null, [number, number] | null, [number, number] | null];
+  /** Resistance to rotation per local axis, 0 (none) … 0.99. */
+  stiffness: [number, number, number];
+}
+
+/** The IK fields of a pose bone (Blender names); see `PoseBone`. */
+export interface PoseBoneIkFields {
+  lock_ik_x?: unknown;
+  lock_ik_y?: unknown;
+  lock_ik_z?: unknown;
+  use_ik_limit_x?: unknown;
+  use_ik_limit_y?: unknown;
+  use_ik_limit_z?: unknown;
+  ik_min_x?: unknown;
+  ik_min_y?: unknown;
+  ik_min_z?: unknown;
+  ik_max_x?: unknown;
+  ik_max_y?: unknown;
+  ik_max_z?: unknown;
+  ik_stiffness_x?: unknown;
+  ik_stiffness_y?: unknown;
+  ik_stiffness_z?: unknown;
+}
+
+/**
+ * IK settings of a pose bone (null when it has none), with Blender's ranges and defaults: limits
+ * ik_min_* in [-π, 0] (default -π) and ik_max_* in [0, π] (default π), stiffness in [0, 0.99].
+ * Invalid values are reported through `problem` and replaced by the default.
+ */
+export function ikSettingsOf(
+  pb: PoseBoneIkFields | null | undefined,
+  problem: (message: string) => void = () => {},
+): IkBoneSettings | null {
+  if (!pb || typeof pb !== 'object') return null;
+  const num = (key: keyof PoseBoneIkFields, def: number, lo: number, hi: number): number => {
+    const v = pb[key];
+    if (v === undefined || v === null) return def;
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      problem(`${key} is not a number; using ${+def.toFixed(4)}`);
+      return def;
+    }
+    return Math.min(hi, Math.max(lo, v));
+  };
+  const axes = ['x', 'y', 'z'] as const;
+  const lock = axes.map((a) => pb[`lock_ik_${a}`] === true) as IkBoneSettings['lock'];
+  const limit = axes.map((a) =>
+    pb[`use_ik_limit_${a}`] === true
+      ? [num(`ik_min_${a}`, -Math.PI, -Math.PI, 0), num(`ik_max_${a}`, Math.PI, 0, Math.PI)]
+      : null,
+  ) as IkBoneSettings['limit'];
+  const stiffness = axes.map((a) => num(`ik_stiffness_${a}`, 0, 0, 0.99)) as IkBoneSettings['stiffness'];
+  const s: IkBoneSettings = { lock, limit, stiffness };
+  return hasIkSettings(s) ? s : null;
+}
+
+/** True when the settings change anything (else the bone is solved like any other). */
+export function hasIkSettings(s: IkBoneSettings | null | undefined): s is IkBoneSettings {
+  return !!s && (s.lock.some(Boolean) || s.limit.some(Boolean) || s.stiffness.some((v) => v > 0));
+}
 
 /** A bone taking part in an IK job. `matrix` is updated in place by the solver. */
 export interface IkBone {
@@ -23,6 +104,14 @@ export interface IkBone {
   length: number;
   /** Index of the parent within the job, -1 for bones whose parent is not part of the job. */
   parent: number;
+  /**
+   * The bone's rest frame, which IK limits are measured from: relative to its parent's matrix
+   * (parent⁻¹ · frame) when the parent is part of the job, else in armature space. Defaults to the
+   * bone's own starting matrix.
+   */
+  restFrame?: Mat4;
+  /** Locks, limits and stiffness of the bone (null / omitted: free). */
+  ik?: IkBoneSettings | null;
 }
 
 export interface IkChain {
@@ -65,8 +154,11 @@ class Job {
   readonly children: number[][];
   /** parent⁻¹ · child at the start (fixed while solving). */
   readonly local: (Mat4 | null)[];
+  /** Matrices at the start of the solve. */
+  readonly initial: Mat4[];
 
   constructor(readonly bones: IkBone[]) {
+    this.initial = bones.map((b) => b.matrix.slice());
     this.children = bones.map(() => []);
     this.local = bones.map((_, i) => this.relation(i));
     bones.forEach((b, i) => {
@@ -439,10 +531,232 @@ function blendInfluence(bones: IkBone[], initial: Mat4[], chains: IkChain[]): vo
   bones.forEach((b, i) => (b.matrix = out[i]));
 }
 
+// ------------------------------------------------------------------ constrained solver
+
+/** Twist (about the bone's Y axis) and swing rotation vector (x, z) of a local rotation q = swing · twist. */
+function swingTwist(q: Readonly<Quat>): { sx: number; sz: number; twist: number } {
+  const tl = Math.hypot(q[1], q[3]);
+  // a half-turn swing has no defined twist: take none
+  const tw: Quat = tl > 1e-9 ? [0, q[1] / tl, 0, q[3] / tl] : [0, 0, 0, 1];
+  let twist = 2 * Math.atan2(tw[1], tw[3]);
+  if (twist > Math.PI) twist -= 2 * Math.PI;
+  else if (twist < -Math.PI) twist += 2 * Math.PI;
+  let sw = multiplyQuat(q, [0, -tw[1], 0, tw[3]]);
+  if (sw[3] < 0) sw = [-sw[0], -sw[1], -sw[2], -sw[3]];
+  const sl = Math.hypot(sw[0], sw[1], sw[2]);
+  const angle = 2 * Math.atan2(sl, sw[3]);
+  const k = sl > 1e-12 ? angle / sl : 2;
+  return { sx: sw[0] * k, sz: sw[2] * k, twist };
+}
+
+/** Rotation from a swing rotation vector (x, 0, z) followed by a twist about Y: swing · twist. */
+function fromSwingTwist(sx: number, sz: number, twist: number): Quat {
+  const a = Math.hypot(sx, sz);
+  const swing: Quat = a > 1e-12 ? quatFromAxisAngle([sx / a, 0, sz / a], a) : [0, 0, 0, 1];
+  return multiplyQuat(swing, quatFromAxisAngle([0, 1, 0], twist));
+}
+
+/**
+ * Clamps a bone's rotation relative to its rest frame to its IK limits (swing about X / Z and
+ * twist about Y). Returns the clamped local rotation, or null when it is within the limits.
+ */
+export function clampIkRotation(q: Readonly<Quat>, s: IkBoneSettings): Quat | null {
+  if (!s.limit.some(Boolean)) return null;
+  const st = swingTwist(q);
+  const clamp = (v: number, l: [number, number] | null) => (l ? Math.min(l[1], Math.max(l[0], v)) : v);
+  const sx = clamp(st.sx, s.limit[0]);
+  const twist = clamp(st.twist, s.limit[1]);
+  const sz = clamp(st.sz, s.limit[2]);
+  if (sx === st.sx && sz === st.sz && twist === st.twist) return null;
+  return fromSwingTwist(sx, sz, twist);
+}
+
+/** Solves A x = b (small dense system, partial pivoting); null when singular. */
+function solveLinear(A: number[][], b: number[]): number[] | null {
+  const n = b.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    if (!(Math.abs(M[p][c]) > 1e-300)) return null;
+    [M[c], M[p]] = [M[p], M[c]];
+    for (let r = c + 1; r < n; r++) {
+      const f = M[r][c] / M[c][c];
+      if (f === 0) continue;
+      for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  const x = new Array<number>(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let v = M[r][n];
+    for (let k = r + 1; k < n; k++) v -= M[r][k] * x[k];
+    x[r] = v / M[r][r];
+  }
+  return x;
+}
+
+/**
+ * The rest frame of a job bone in armature space, under its parent's current matrix (without a
+ * `restFrame`, the bone's starting pose counts as its rest pose).
+ */
+function restFrameOf(job: Job, i: number): Mat4 {
+  const b = job.bones[i];
+  if (b.parent < 0) return b.restFrame ?? job.initial[i];
+  const rel = b.restFrame ?? multiply4(invert4(job.initial[b.parent]), job.initial[i]);
+  return multiply4(job.bones[b.parent].matrix, rel);
+}
+
+/** Replaces the rotation of bone i (location and scale kept), descendants follow. */
+function setRotation(job: Job, i: number, r: Readonly<Quat>): void {
+  const trs = decomposeTRS(job.bones[i].matrix);
+  job.bones[i].matrix = composeTRS({ location: trs.location, rotation: [...r] as Quat, scale: trs.scale });
+  job.local[i] = job.relation(i);
+  job.propagate(i);
+}
+
+/** Clamps bone i to its IK limits; true when it changed. */
+function enforceLimits(job: Job, i: number): boolean {
+  const s = job.bones[i].ik;
+  if (!s || !s.limit.some(Boolean)) return false;
+  const frame = quatFromRotationMatrix(rotationPart(restFrameOf(job, i)));
+  const cur = quatFromRotationMatrix(rotationPart(job.bones[i].matrix));
+  const local = multiplyQuat([-frame[0], -frame[1], -frame[2], frame[3]], cur);
+  const clamped = clampIkRotation(local, s);
+  if (!clamped) return false;
+  setRotation(job, i, multiplyQuat(frame, clamped));
+  return true;
+}
+
+interface Dof {
+  bone: number;
+  axis: 0 | 1 | 2;
+  weight: number;
+}
+
+/**
+ * Damped least-squares IK over the local rotation axes of the chain bones (Blender's Jacobian
+ * solver): locked axes are left out, stiffness lowers an axis' weight, limits are enforced after
+ * every step (axes held at a limit stop moving that way). All chains of the job are solved
+ * together. Returns the remaining effector error.
+ */
+function solveConstrained(job: Job, chains: IkChain[]): number {
+  const order = [...new Set(chains.flatMap((c) => c.bones))].sort((a, b) => a - b);
+  const dofs: Dof[] = [];
+  for (const b of order) {
+    const s = job.bones[b].ik;
+    for (const axis of [0, 1, 2] as const) {
+      if (s?.lock[axis]) continue;
+      dofs.push({ bone: b, axis, weight: Math.max(0.01, 1 - Math.min(0.99, s?.stiffness[axis] ?? 0)) });
+    }
+  }
+  const inChain = chains.map((c) => new Set(c.bones));
+  let scale = 0;
+  for (const b of order) scale += job.bones[b].length;
+  const tol = Math.max(1e-9, scale * 1e-7);
+  const lambda = 0.02 * scale;
+  const maxIt = Math.min(10000, Math.max(...chains.map((c) => c.iterations)));
+  const m = chains.length * 3;
+  const errorVec = (): number[] => {
+    const e: number[] = [];
+    for (const c of chains) {
+      const eff = effectorOf(job, c);
+      e.push(c.target[0] - eff[0], c.target[1] - eff[1], c.target[2] - eff[2]);
+    }
+    return e;
+  };
+  for (const b of order) enforceLimits(job, b);
+  let e = errorVec();
+  let err = Math.hypot(...e);
+  let best = err;
+  let stall = 0;
+  for (let it = 0; it < maxIt && err > tol && dofs.length; it++) {
+    // Jacobian columns: d(effector)/d(angle) = axis × (effector − joint)
+    const effectors = chains.map((c) => effectorOf(job, c));
+    const cols = dofs.map((d) => {
+      const M = job.bones[d.bone].matrix;
+      const a = unit([M[d.axis * 4], M[d.axis * 4 + 1], M[d.axis * 4 + 2]]) ?? ([0, 0, 0] as V);
+      const h = head(M);
+      const col: number[] = [];
+      chains.forEach((c, ci) => {
+        if (!inChain[ci].has(d.bone)) col.push(0, 0, 0);
+        else col.push(...cross(a, sub(effectors[ci], h)));
+      });
+      return col;
+    });
+    let weights = dofs.map((d) => d.weight);
+    let step: number[] | null = null;
+    for (let pass = 0; pass < 2; pass++) {
+      const A: number[][] = [];
+      for (let r = 0; r < m; r++) {
+        const row = new Array<number>(m).fill(0);
+        for (let c = 0; c < m; c++) {
+          let v = 0;
+          for (let j = 0; j < dofs.length; j++) v += cols[j][r] * weights[j] * cols[j][c];
+          row[c] = v + (r === c ? lambda * lambda : 0);
+        }
+        A.push(row);
+      }
+      const y = solveLinear(A, e);
+      if (!y) break;
+      step = dofs.map((_, j) => {
+        let v = 0;
+        for (let r = 0; r < m; r++) v += cols[j][r] * y[r];
+        return weights[j] * v;
+      });
+      // axes held at a limit that the step pushes further out drop out (active set), once
+      if (pass > 0) break;
+      let blocked = false;
+      weights = weights.map((w, j) => {
+        const d = dofs[j];
+        const lim = job.bones[d.bone].ik?.limit[d.axis];
+        if (!lim || step![j] === 0) return w;
+        const frame = quatFromRotationMatrix(rotationPart(restFrameOf(job, d.bone)));
+        const cur = quatFromRotationMatrix(rotationPart(job.bones[d.bone].matrix));
+        const st = swingTwist(multiplyQuat([-frame[0], -frame[1], -frame[2], frame[3]], cur));
+        const v = d.axis === 0 ? st.sx : d.axis === 1 ? st.twist : st.sz;
+        const atMax = v >= lim[1] - 1e-9 && step![j] > 0;
+        const atMin = v <= lim[0] + 1e-9 && step![j] < 0;
+        if (!atMax && !atMin) return w;
+        blocked = true;
+        return 0;
+      });
+      if (!blocked) break;
+    }
+    if (!step) break;
+    // keep steps small (the linearisation only holds near the current pose)
+    const big = Math.max(...step.map(Math.abs));
+    const f = big > 0.2 ? 0.2 / big : 1;
+    const perBone = new Map<number, V>();
+    dofs.forEach((d, j) => {
+      const v = perBone.get(d.bone) ?? ([0, 0, 0] as V);
+      v[d.axis] += step![j] * f;
+      perBone.set(d.bone, v);
+    });
+    for (const b of order) {
+      const v = perBone.get(b);
+      if (!v) continue;
+      const angle = len(v);
+      if (!(angle > 0)) continue;
+      // rotation about the bone's own (current) local axes: R ← R · Rot(v)
+      const cur = quatFromRotationMatrix(rotationPart(job.bones[b].matrix));
+      setRotation(job, b, multiplyQuat(cur, quatFromAxisAngle([v[0] / angle, v[1] / angle, v[2] / angle], angle)));
+    }
+    for (const b of order) enforceLimits(job, b);
+    e = errorVec();
+    err = Math.hypot(...e);
+    if (err < best * (1 - 1e-6)) {
+      best = err;
+      stall = 0;
+    } else if (++stall >= 20) break;
+  }
+  return err;
+}
+
 /**
  * Solves the IK chains of one job. A single chain uses FABRIK with its pole; chains that share
  * bones are first solved one after the other and then refined jointly (poles are ignored there,
- * like Blender does with several targets). Bone matrices are updated in place.
+ * like Blender does with several targets). Jobs with locked, limited or stiff bones use the
+ * damped least-squares solver (`solveConstrained`). Bone matrices are updated in place.
  */
 export function solveIk(bones: IkBone[], chains: IkChain[]): IkResult {
   const warnings: string[] = [];
@@ -452,6 +766,23 @@ export function solveIk(bones: IkBone[], chains: IkChain[]): IkResult {
     (c) => c.bones.length > 0 && c.target.every(Number.isFinite) && c.influence > 0,
   );
   if (valid.length === 0) return { warnings };
+  if (valid.some((c) => c.bones.some((b) => hasIkSettings(bones[b].ik)))) {
+    const single = valid.length === 1 ? valid[0] : null;
+    const rootSet = single ? hasIkSettings(bones[single.bones[0]].ik) : false;
+    if (single?.pole && rootSet)
+      warnings.push(
+        'the pole target is ignored: the root bone of the chain has IK locks, limits or stiffness',
+      );
+    if (!single && valid.some((c) => c.pole))
+      warnings.push('pole targets are ignored for IK chains that share bones');
+    const pole = single && !rootSet ? single : null;
+    if (pole) alignPole(job, pole);
+    solveConstrained(job, valid.map((c) => ({ ...c, pole: null })));
+    if (pole) alignPole(job, pole);
+    for (const chain of valid) if (chain.useStretch) stretch(job, chain);
+    blendInfluence(bones, initial, valid);
+    return { warnings };
+  }
   if (valid.length === 1) {
     const chain = valid[0];
     alignPole(job, chain);

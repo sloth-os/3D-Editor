@@ -15,8 +15,13 @@ import { perpendicular } from './vmath';
  * is solved.
  */
 
-/** Allowed penetration before position correction acts (m). */
+/**
+ * Allowed penetration before position correction acts (m), for bodies at least 8 mm thick;
+ * thinner bodies allow SLOP_RATIO of their half thickness (see `Manifold.slop`).
+ */
 export const LINEAR_SLOP = 0.002;
+/** Allowed penetration relative to the half thickness of the thinner body of a contact. */
+export const SLOP_RATIO = 0.25;
 /** Fraction of the remaining penetration removed per position iteration. */
 const BAUMGARTE = 0.2;
 /** Largest position correction per contact and iteration (m). */
@@ -117,6 +122,11 @@ export class Manifold {
   readonly restitution: number;
   /** Normal stored in B's frame (B static/kinematic) instead of A's. */
   readonly refB: boolean;
+  /**
+   * Penetration the position correction tolerates (m): LINEAR_SLOP, or less for thin bodies, so
+   * a 1 mm coin cannot sink 2 mm (through a triangle mesh or into another coin).
+   */
+  readonly slop: number;
 
   constructor(
     readonly a: Body,
@@ -127,6 +137,7 @@ export class Manifold {
     this.friction = Math.min(10, a.friction * b.friction);
     this.restitution = a.restitution * b.restitution;
     this.refB = !b.dynamic && a.dynamic;
+    this.slop = Math.min(LINEAR_SLOP, SLOP_RATIO * Math.min(a.thinHalf, b.thinHalf));
   }
 
   /** Replaces the contact points, carrying accumulated impulses over from matching old points. */
@@ -544,11 +555,13 @@ export function rotateBody(body: Body, tx: number, ty: number, tz: number): void
 
 /**
  * One non-linear Gauss-Seidel position iteration: recomputes each contact's separation from the
- * current poses and pushes penetrating bodies apart. Returns the smallest separation seen.
+ * current poses and pushes penetrating bodies apart. Returns the smallest separation seen, in
+ * units of the manifold's `slop` (-1 = penetrating by the tolerated amount).
  */
 export function solvePosition(m: Manifold): number {
   const a = m.a;
   const b = m.b;
+  const slop = m.slop;
   let minSep = 0;
   const ref = m.refB ? b : a;
   for (const p of m.points) {
@@ -567,7 +580,7 @@ export function solvePosition(m: Manifold): number {
     const pbz = b.pz + Rb[6] * p.lbx + Rb[7] * p.lby + Rb[8] * p.lbz;
     const sep = (pbx - pax) * nx + (pby - pay) * ny + (pbz - paz) * nz;
     if (sep < minSep) minSep = sep;
-    const C = Math.min(0, Math.max(-MAX_CORRECTION, BAUMGARTE * (sep + LINEAR_SLOP)));
+    const C = Math.min(0, Math.max(-MAX_CORRECTION, BAUMGARTE * (sep + slop)));
     if (C === 0) continue;
     const cx = (pax + pbx) / 2;
     const cy = (pay + pby) / 2;
@@ -615,5 +628,5 @@ export function solvePosition(m: Manifold): number {
       );
     }
   }
-  return minSep;
+  return slop > 0 ? minSep / slop : minSep < 0 ? -Infinity : 0;
 }

@@ -4,7 +4,6 @@ import { SweepAndPrune } from './broadphase';
 import type { ContactCandidate } from './manifold';
 import { collide } from './narrowphase';
 import {
-  LINEAR_SLOP,
   Manifold,
   applyRestitution,
   prepareManifold,
@@ -27,12 +26,15 @@ import { angularVelocityBetween, slerpQ } from './vmath';
  *   6. semi-implicit Euler integration (exact rotation by ω·dt),
  *   7. non-linear Gauss-Seidel penetration correction (does not add velocity),
  *   8. sleep bookkeeping: islands at rest for TIME_TO_SLEEP stop being simulated.
- * Bodies are ordered by object id and pairs / manifolds by body index, so a run is a pure
- * function of its inputs.
+ * Bodies are ordered by their start pose (see `compareBodyOrder`) and pairs / manifolds by body
+ * index, so a run is a pure function of its inputs: identical scenes simulate identically whatever
+ * their object ids and names.
  */
 
-/** Bodies slower than this (m/s) … */
+/** Bodies slower than this (m/s; for small bodies SLEEP_SIZE_RATIO of their bounding radius per second) … */
 export const SLEEP_LINEAR_SPEED = 0.03;
+/** Linear sleep threshold of small bodies, in bounding radii per second. */
+export const SLEEP_SIZE_RATIO = 0.25;
 /** … and turning slower than this (rad/s) … */
 export const SLEEP_ANGULAR_SPEED = 0.04;
 /** … for this long (s, whole island) fall asleep. */
@@ -171,9 +173,10 @@ export class PhysicsWorld {
     // ---- positions
     this.integratePositions(dt);
     for (let it = 0; it < this.positionIterations; it++) {
+      // smallest separation in units of each contact's tolerated penetration (slop)
       let minSep = 0;
       for (const m of active) minSep = Math.min(minSep, solvePosition(m));
-      if (minSep >= -3 * LINEAR_SLOP) break;
+      if (minSep >= -3) break;
     }
     for (const b of bodies) if (awakeDynamic(b)) b.updateWorldInertia();
     this.recoverBlowUps();
@@ -343,10 +346,12 @@ export class PhysicsWorld {
   }
 
   private updateSleep(list: readonly Manifold[], dt: number): void {
-    const lin2 = SLEEP_LINEAR_SPEED * SLEEP_LINEAR_SPEED;
     const ang2 = SLEEP_ANGULAR_SPEED * SLEEP_ANGULAR_SPEED;
     for (const b of this.bodies) {
       if (!awakeDynamic(b)) continue;
+      // small bodies must be slower relative to their size (a creeping coin is not at rest)
+      const lin = Math.min(SLEEP_LINEAR_SPEED, SLEEP_SIZE_RATIO * b.boundingRadius);
+      const lin2 = lin * lin;
       const v2 = b.vx * b.vx + b.vy * b.vy + b.vz * b.vz;
       const w2 = b.wx * b.wx + b.wy * b.wy + b.wz * b.wz;
       b.sleepTime = v2 > lin2 || w2 > ang2 ? 0 : b.sleepTime + dt;

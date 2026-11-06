@@ -16,8 +16,11 @@
  * Options:
  *   --out-dir <dir>      where outputs go (default: this directory, or the preview directory)
  *   --samples <n>        samples per pixel of the final still (default 256)
+ *   --min-samples <n>    fail instead of writing render.png if the time limit stops the still below
+ *                        this many samples (default: half of --samples)
  *   --time-limit <s>     wall-clock budget of the final still in seconds (default 450)
  *   --anim-samples <n>   samples per pixel of the GIF frames (default 16; the contact sheet uses 2x)
+ * Every output is checked before it is written, so a failed render never replaces a good file.
  * Environment: MCP_URL (default http://127.0.0.1:8080/mcp), MCP_TOKEN; MODE=<mode> is accepted as
  * an alias of the mode flag.
  *
@@ -39,22 +42,32 @@ const MODES = ['build-only', 'preview', 'final', 'still', 'anim', 'export-only']
 const ALIASES = { build: 'build-only', export: 'export-only', full: 'final' };
 
 function parseArgs(argv) {
-  const opts = { mode: null, outDir: null, samples: 256, timeLimit: 450, animSamples: 16 };
-  const num = (flag, v) => {
-    const n = Number(v);
-    if (!Number.isFinite(n) || n <= 0) throw new Error(`${flag} needs a positive number, got ${v}`);
-    return n;
-  };
+  const opts = { mode: null, outDir: null, samples: 256, minSamples: null, timeLimit: 450, animSamples: 16 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    // A value flag must be followed by its value: `--out-dir` with the path forgotten must not
+    // silently fall back to this directory (and overwrite the committed outputs).
+    const value = () => {
+      const v = argv[i + 1];
+      if (v === undefined || v.startsWith('--')) throw new Error(`${a} needs a value`);
+      i++;
+      return v;
+    };
+    const num = () => {
+      const v = value();
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) throw new Error(`${a} needs a positive number, got ${v}`);
+      return n;
+    };
     const mode = a.replace(/^--/, '');
     if (MODES.includes(mode)) {
       if (opts.mode && opts.mode !== mode) throw new Error(`choose one mode, got --${opts.mode} and ${a}`);
       opts.mode = mode;
-    } else if (a === '--out-dir') opts.outDir = argv[++i];
-    else if (a === '--samples') opts.samples = num(a, argv[++i]);
-    else if (a === '--time-limit') opts.timeLimit = num(a, argv[++i]);
-    else if (a === '--anim-samples') opts.animSamples = num(a, argv[++i]);
+    } else if (a === '--out-dir') opts.outDir = path.resolve(value());
+    else if (a === '--samples') opts.samples = num();
+    else if (a === '--min-samples') opts.minSamples = num();
+    else if (a === '--time-limit') opts.timeLimit = num();
+    else if (a === '--anim-samples') opts.animSamples = num();
     else throw new Error(`unknown argument ${a} (modes: ${MODES.map((m) => `--${m}`).join(' ')})`);
   }
   if (!opts.mode && process.env.MODE) {
@@ -64,6 +77,9 @@ function parseArgs(argv) {
   }
   opts.mode ??= 'final';
   opts.outDir ??= opts.mode === 'preview' ? '/tmp/product-shot-previews' : HERE;
+  // The still is refused (render.png is left untouched) when the time limit stops it below this.
+  opts.minSamples ??= Math.ceil(opts.samples / 2);
+  if (opts.minSamples > opts.samples) throw new Error('--min-samples is larger than --samples');
   return opts;
 }
 
@@ -91,10 +107,31 @@ const BOTTLE = {
 };
 const LIQUID = { gap: 0.0004, level: 0.062 };
 const PEDESTAL = { radius: 0.085, height: 0.05, fillet: 0.004 };
-const Z_BOTTLE = PEDESTAL.height; // the bottle stands on the pedestal
+/**
+ * The bottle stands on the plinth with a 0.2 mm air gap (about half a pixel in render.png). If the
+ * glass bottom and the marble top shared a plane, rays refracted through the thick glass base could
+ * leave the glass in that plane and miss the plinth top, leaving a grainy grey band in the base.
+ */
+const BOTTLE_LIFT = 0.0002;
+const Z_BOTTLE = PEDESTAL.height + BOTTLE_LIFT;
 const APOTHEM = BOTTLE.R * Math.cos(PI / BOTTLE.steps); // distance of the front facet from the axis
 const FACE_Y = -APOTHEM; // front facet plane (the bottle is not rotated, only stretched along X)
-const LABEL = { w: 0.03, h: 0.027, cz: 0.04, corner: 0.0022, thick: 0.0002 };
+const LABEL = {
+  w: 0.03, // plate width and height
+  h: 0.027,
+  cz: 0.04, // centre height above the bottle base
+  corner: 0.0022,
+  thick: 0.0002,
+  frameInset: 0.0015, // the gold frame line runs 1.5 mm inside the plate edge ...
+  frameBevel: 0.00011, // ... as a 0.22 mm round tube
+  nameSize: 0.0046,
+  minNameMargin: 0.0025, // clear space between the name and the frame on each side
+  // vertical layout (offsets from the label centre): emblem, name baseline, rule, subline baseline
+  emblemZ: 0.0064,
+  nameZ: -0.0028,
+  ruleZ: -0.0056,
+  sublineZ: -0.009,
+};
 const LABEL_CENTER = [0, FACE_Y - 2 * LABEL.thick, Z_BOTTLE + LABEL.cz];
 
 /** Still camera; the turntable orbits this camera around TARGET, so frame 1 is the still. */
@@ -126,6 +163,7 @@ const STUDIO_RIG = [
   'Fill Strip',
   'Rim Strip',
   'Backdrop Glow',
+  'Reflector Card',
   'Column',
   'Gold Sphere',
   'Pearl',
@@ -148,7 +186,9 @@ async function call(tool, args = {}) {
   try {
     return await mcp.call(tool, { project: PROJECT, ...args });
   } catch (e) {
-    throw new Error(`${tool} failed: ${e.message}\n  args: ${JSON.stringify(args).slice(0, 600)}`);
+    throw new Error(`${tool} failed: ${e.message}\n  args: ${JSON.stringify(args).slice(0, 600)}`, {
+      cause: e,
+    });
   }
 }
 
@@ -307,10 +347,18 @@ function roundedDisc(radius, height, f, { bottomFillet = true, n = 6 } = {}) {
 }
 
 /**
+ * Expected evaluated vertex count of every lathe, for verifyScene(): a full SCREW turn makes `steps`
+ * rings of the profile, and the profile points on the axis merge into one vertex each.
+ */
+const LATHES = new Map();
+
+/**
  * Lathe: a POLY profile curve (wire, no bevel) with a SCREW modifier around its local Z axis, and
  * optionally SMOOTH_BY_ANGLE to keep facet edges sharp. `steps` is used for viewport AND renders.
  */
 async function revolve(name, profile, { steps, location, scale, th = 0, smoothAngle = null }) {
+  const onAxis = profile.filter(([r]) => r === 0).length;
+  LATHES.set(name, steps * (profile.length - onAxis) + onAxis);
   await op('curve.add_from_points', {
     name,
     points: toPlane(profile, th),
@@ -473,11 +521,11 @@ async function buildLabel() {
       operator: 'curve.add_from_points',
       params: {
         name: 'Label Frame',
-        points: roundedRect(w - 0.003, h - 0.003, corner * 0.6),
+        points: roundedRect(w - 2 * LABEL.frameInset, h - 2 * LABEL.frameInset, corner * 0.6),
         type: 'POLY',
         cyclic: true,
         dimensions: '3D',
-        bevel_depth: 0.00011,
+        bevel_depth: LABEL.frameBevel,
         bevel_resolution: 1,
         location: [0, yFront - 0.00012, zc],
         rotation: rot,
@@ -491,19 +539,20 @@ async function buildLabel() {
         name: 'Emblem',
         points: crescent(0.0026, 0.0016, -0.35),
         extrude: ink,
-        location: [0, yInk, zc + 0.0072],
+        location: [0, yInk, zc + LABEL.emblemZ],
       },
     },
+    // the name, as wide as the subline, with about 3 mm of air to the frame on each side
     {
       operator: 'object.text_add',
       params: {
         body: 'VELLUNE',
         name: 'Label Name',
-        size: 0.0056,
+        size: LABEL.nameSize,
         extrude: ink,
         align_x: 'CENTER',
         space_character: 1.15,
-        location: [0, yInk, zc - 0.0022],
+        location: [0, yInk, zc + LABEL.nameZ],
         rotation: rot,
       },
     },
@@ -514,7 +563,7 @@ async function buildLabel() {
         name: 'Label Rule',
         points: roundedRect(0.011, 0.00028, 0.00013, 2),
         extrude: ink,
-        location: [0, yInk, zc - 0.0048],
+        location: [0, yInk, zc + LABEL.ruleZ],
       },
     },
     {
@@ -526,7 +575,7 @@ async function buildLabel() {
         extrude: ink * 0.7,
         align_x: 'CENTER',
         space_character: 1.6,
-        location: [0, yInk, zc - 0.0082],
+        location: [0, yInk, zc + LABEL.sublineZ],
         rotation: rot,
       },
     },
@@ -558,9 +607,9 @@ async function light(name, type, { location, aimAt, ...settings }) {
 }
 
 /**
- * Three-point studio lighting with area lights (power in W), a background light and the dim
- * STUDIO environment. Area lights are invisible to the camera but show up in reflections, so the
- * strips are placed where the octagonal facets mirror them.
+ * Three-point studio lighting with area lights (power in W), a background light, a reflector card
+ * and the dim STUDIO environment. Area lights are invisible to the camera but show up in
+ * reflections, so the strips and the card are placed where the octagonal facets mirror them.
  */
 async function buildLights() {
   // Key: a large warm softbox high front-left: soft light on the label, cap and pedestal.
@@ -603,6 +652,18 @@ async function buildLights() {
     spot_size: 0.7,
     spot_blend: 0.9,
     shadow_soft_size: 0.05,
+  });
+  // Reflector card: a weak, wide strip behind the camera, low and to its right, where the cap's
+  // polished front facet looks. It adds almost no light to the scene, but that facet mirrors it as a
+  // soft gold gradient instead of the dark space around the camera (it would read as a black hole).
+  await light('Reflector Card', 'AREA', {
+    location: [0.17, -1.25, 0.2],
+    aimAt: [0, 0, 0.16],
+    energy: 0.5,
+    color: [1.0, 0.97, 0.92],
+    shape: 'RECTANGLE',
+    size: 0.9,
+    size_y: 0.3,
   });
 }
 
@@ -710,35 +771,49 @@ async function buildTurntable() {
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 
 /**
- * Checks the built scene: no evaluation problems, the lathes produced the expected geometry, the
- * label sits on the front facet, the camera orbits seamlessly (get_object at several frames) and
- * the depth of field stays focused at label depth.
+ * Checks the built scene: no evaluation problems, every lathe produced the expected geometry, the
+ * bottle stands just above the plinth, the label sits on the front facet with room around the name,
+ * the camera orbits seamlessly (get_object at several frames) and the depth of field stays focused
+ * at label depth.
  */
 async function verifyScene() {
   const s = await call('get_scene', {});
   log(`   scene: ${JSON.stringify(s.counts)}`);
   check(!s.problems?.length, `scene problems ${JSON.stringify(s.problems)}`);
 
-  // Lathe results (SCREW on wire curves): rings x profile points, sized like the design.
-  const bottle = await call('get_object', { object: 'Bottle' });
-  const n = bottleProfile().length;
-  check(
-    bottle.data.evaluated?.vertices >= BOTTLE.steps * (n - 2),
-    `bottle lathe geometry ${JSON.stringify(bottle.data.evaluated)}`,
-  );
+  // Lathe results (SCREW on wire curves): exactly `steps` rings of each profile.
+  const objs = {};
+  for (const [name, vertices] of LATHES) {
+    objs[name] = await call('get_object', { object: name });
+    const ev = objs[name].data.evaluated;
+    check(
+      ev?.vertices === vertices && ev.faces > 0,
+      `${name} lathe: ${JSON.stringify(ev)}, expected ${vertices} vertices`,
+    );
+  }
+  log(`   lathes: ${[...LATHES.keys()].map((k) => `${k} ${objs[k].data.evaluated.vertices} v`).join(', ')}`);
+  const { Bottle: bottle, Pedestal: ped } = objs;
   const bs = bottle.world_bounds.size;
-  log(
-    `   bottle: ${JSON.stringify(bottle.data.evaluated)}, size ${bs.map((v) => (v * 100).toFixed(1)).join(' x ')} cm`,
-  );
+  log(`   bottle size ${bs.map((v) => (v * 100).toFixed(1)).join(' x ')} cm`);
   check(Math.abs(bs[2] - BOTTLE.Hn) < 1e-3 && bs[0] > bs[1], `bottle bounds ${JSON.stringify(bs)}`);
-  const ped = await call('get_object', { object: 'Pedestal' });
+  const pedTop = ped.world_bounds.max[2];
+  check(Math.abs(pedTop - PEDESTAL.height) < 1e-6, `pedestal top ${pedTop} != ${PEDESTAL.height}`);
+  const lift = bottle.world_bounds.min[2] - pedTop;
   check(
-    Math.abs(ped.world_bounds.max[2] - Z_BOTTLE) < 1e-4,
-    `pedestal top ${ped.world_bounds.max[2]} != ${Z_BOTTLE}`,
+    Math.abs(lift - BOTTLE_LIFT) < 1e-6,
+    `bottle base ${lift * 1000} mm above the plinth, expected 0.2 mm`,
   );
   const label = await call('get_object', { object: 'Label' });
   const gap = FACE_Y - label.world_bounds.max[1];
   check(gap > 0 && gap < 2e-4, `label not on the front facet (gap ${gap})`);
+  // The name keeps clear space to the frame on both sides (inner edge of the frame tube).
+  const name = await call('get_object', { object: 'Label Name' });
+  const inner = LABEL.w / 2 - LABEL.frameInset - LABEL.frameBevel;
+  const margin = inner - Math.max(-name.world_bounds.min[0], name.world_bounds.max[0]);
+  log(
+    `   label name ${(name.world_bounds.size[0] * 1000).toFixed(1)} mm wide, ${(margin * 1000).toFixed(2)} mm from the frame`,
+  );
+  check(margin >= LABEL.minNameMargin, `the label name is ${margin * 1000} mm from the frame`);
 
   // Turntable: camera radius/height constant, quarter turn every 9 frames, frame 37 == frame 1.
   const loopLen = LOOP.frame_end - LOOP.frame_start + 1;
@@ -746,6 +821,7 @@ async function verifyScene() {
   for (const f of [1, 10, 19, 28, 37]) {
     const cam = await call('get_object', { object: 'Camera', frame: f });
     const fp = await call('get_object', { object: 'Focus Point', frame: f });
+    const card = await call('get_object', { object: 'Reflector Card', frame: f });
     const p = cam.world_location;
     const az = Math.atan2(p[1] - CAMERA.target[1], p[0] - CAMERA.target[0]);
     const expected = CAMERA.azimuth + (2 * PI * (f - LOOP.frame_start)) / loopLen;
@@ -758,6 +834,7 @@ async function verifyScene() {
       dAz: +dAz.toFixed(5),
       focus: cam.data.dof_focus_distance,
       toFocus: +dist(p, fp.world_location).toFixed(4),
+      toCard: +dist(p, card.world_location).toFixed(4),
     });
     check(Math.abs(dAz) < 1e-3, `camera azimuth at frame ${f}: ${az} vs ${expected}`);
     check(
@@ -769,6 +846,12 @@ async function verifyScene() {
   log(`   turntable check: ${JSON.stringify(rows)}`);
   const focus = rows.map((r) => r.focus);
   check(Math.max(...focus) - Math.min(...focus) < 1e-3, `focus distance changes during the loop: ${focus}`);
+  // The reflector card travels with the camera (same distance at every frame).
+  const toCard = rows.map((r) => r.toCard);
+  check(
+    Math.max(...toCard) - Math.min(...toCard) < 1e-3,
+    `the reflector card does not follow the camera: ${toCard}`,
+  );
   check(dist(rows[0].cam, rows[4].cam) < 1e-6, 'the loop is not seamless (frame 37 != frame 1)');
   // The bottle itself never moves.
   const b19 = await call('get_object', { object: 'Bottle', frame: 19 });
@@ -815,7 +898,11 @@ async function previews() {
   results.pathtraced = await saveFile(pt, path.join(OPTS.outDir, 'pathtraced.png'));
 }
 
-/** Final still: 1280x720 path traced and denoised, bounded by a wall-clock budget. */
+/**
+ * Final still: 1280x720 path traced and denoised, bounded by a wall-clock budget. If the budget
+ * stops it below --min-samples (a slower or busier machine), the build fails and the existing
+ * render.png is kept instead of being replaced by a noisier one.
+ */
 async function finalStill() {
   const r = await call('render_image', {
     engine: 'PATHTRACER',
@@ -826,14 +913,22 @@ async function finalStill() {
     time_limit: OPTS.timeLimit,
     frame: 1,
   });
+  const { samples, time_limit_reached: cut } = r.text;
+  if (cut)
+    log(`   the ${OPTS.timeLimit} s time limit stopped the still at ${samples} of ${OPTS.samples} samples`);
+  check(
+    samples >= OPTS.minSamples,
+    `render.png reached only ${samples} of ${OPTS.samples} samples in ${OPTS.timeLimit} s (minimum ${OPTS.minSamples}); ` +
+      'not written: raise --time-limit or lower --samples / --min-samples',
+  );
   results.still = await saveFile(r, path.join(OPTS.outDir, 'render.png'));
 }
 
-/** A render_animation result must contain every requested frame. */
+/** A render_animation result must contain every requested frame; checked before the file is written. */
 function checkFrames(what, info, expected) {
   check(
     !info.truncated && info.frame_count === expected,
-    `${what}: ${info.frame_count}/${expected} frames, truncated ${info.truncated}`,
+    `${what}: ${info.frame_count}/${expected} frames, truncated ${info.truncated}; not written`,
   );
 }
 
@@ -853,8 +948,8 @@ async function turntableOutputs() {
     denoise: true,
     time_limit: 300,
   });
-  results.contact_sheet = await saveFile(sheet, path.join(OPTS.outDir, 'contact_sheet.png'));
   checkFrames('contact sheet', sheet.text, Math.ceil(loopLen / 3));
+  results.contact_sheet = await saveFile(sheet, path.join(OPTS.outDir, 'contact_sheet.png'));
   const gif = await call('render_animation', {
     format: 'GIF',
     engine: 'PATHTRACER',
@@ -868,8 +963,8 @@ async function turntableOutputs() {
     fps: 12,
     dither: 'BAYER',
   });
-  results.gif = await saveFile(gif, path.join(OPTS.outDir, 'preview.gif'));
   checkFrames('GIF', gif.text, loopLen);
+  results.gif = await saveFile(gif, path.join(OPTS.outDir, 'preview.gif'));
 }
 
 async function exportGlb() {

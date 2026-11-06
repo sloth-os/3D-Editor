@@ -1,12 +1,12 @@
 import { z } from 'zod';
-import type { DatablockKind } from '../doc/types';
+import type { CameraData, DatablockKind } from '../doc/types';
 import { ANIMATABLE } from '../anim/properties';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { OperatorError, type OperatorContext } from './context';
 import { rekeyAnimated } from './anim';
 import type { AnimTargetType } from '../doc/types';
 import { resolveDatablock } from './datablocks';
-import { cameraFields, LIGHT_TYPES, lightFields } from './light-camera';
+import { cameraFields, checkCameraFields, LIGHT_TYPES, lightFields } from './light-camera';
 
 const KINDS = [
   'objects',
@@ -87,9 +87,10 @@ export function registerDataOperators(reg: OperatorRegistry): void {
         'scene/render/world): the datablock id or name, or for object data the object that uses it: the name or ' +
         'id of a light object (kind lights), camera object (cameras) or mesh object (meshes), or of an object with ' +
         'one material (materials). Field names follow Blender (e.g. location, rotation_euler, hide_viewport, energy, ' +
-        'spot_size, shadow_soft_size, size, lens, clip_end, dof_use, base_color, resolution_x, frame_end). For ' +
-        'lights and cameras light.properties_set / camera.properties_set are the friendlier tools (several ' +
-        'objects, warnings, keyframes).',
+        'spot_size, shadow_soft_size, size, lens, clip_end, dof_use, base_color, resolution_x, frame_end). Light ' +
+        'and camera values are validated like light.properties_set / camera.properties_set (ranges, clip_end > ' +
+        'clip_start, a camera cannot focus on itself), which are the friendlier tools for them (several objects, ' +
+        'warnings, keyframes).',
       category: 'Data',
       schema: z.object({
         kind: z.enum(KINDS),
@@ -110,7 +111,9 @@ export function registerDataOperators(reg: OperatorRegistry): void {
         else if (p.kind === 'world') ctx.doc.updateWorld(p.values);
         else {
           if (!p.target) throw new OperatorError('target is required', 'INVALID_PARAMS');
-          const id = resolveDatablock(ctx.doc, p.kind, p.target).id;
+          const resolved = resolveDatablock(ctx.doc, p.kind, p.target);
+          if (resolved.warning) ctx.report('WARNING', resolved.warning);
+          const id = resolved.id;
           const current = ctx.doc.getBlock(p.kind, id)!;
           const values = { ...p.values };
           for (const [k, v] of Object.entries(values)) {
@@ -131,6 +134,14 @@ export function registerDataOperators(reg: OperatorRegistry): void {
               );
           }
           validateFields(ctx, p.kind, values);
+          if (p.kind === 'cameras') {
+            // the cross-field checks of camera.properties_set (clip range, a camera focusing on itself)
+            const users = ctx.doc
+              .listObjects()
+              .filter((o) => o.type === 'CAMERA' && o.data === id)
+              .map((o) => o.id);
+            checkCameraFields(ctx.doc, users, current as unknown as CameraData, values as Partial<CameraData>);
+          }
           ctx.doc.updateBlockByKind(p.kind, id, values);
           const animType = ANIM_TYPE[p.kind];
           if (animType) {

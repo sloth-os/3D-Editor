@@ -71,7 +71,7 @@ editor can be improved from real usage.
 - **Files** – import and export glTF 2.0 (`.glb`/`.gltf`), OBJ, STL and PLY. The glTF exporter
   writes the hierarchy, materials (procedural textures baked to images), cameras, lights,
   instances and the animation sampled per frame, with skins and morph targets.
-  <!-- gltf-export: re-check against packages/core/src/io/gltf-export.ts (in progress) -->
+  <!-- re-check: gltf-export (matched packages/core/src/io/gltf-export.ts on 2026-11-06) -->
 - **Offline PWA** – installable, works without a network after the first visit.
 - **Storage** – browser (IndexedDB) by default; WebDAV when configured (on the server or in the
   browser), with CRDT merge-saving so concurrent devices never overwrite each other.
@@ -94,8 +94,9 @@ editor can be improved from real usage.
 Each project in [`examples/`](examples) was built from scratch by an AI agent working only
 through the MCP server, with the same tools any external agent gets. The build is reproducible:
 run against a server, an example's `build.mjs` deletes and recreates its project, builds the
-whole scene and writes the renders (and the glTF export, where the example has one) next to
-itself. Building a scene is quick; the path-traced renders take most of the time.
+whole scene and writes its renders next to itself (`--export-only` writes the glTF export
+`scene.glb` instead; each script's header lists its modes). Building a scene is quick; the
+path-traced renders take most of the time.
 
 ```bash
 npm start &                                   # or any running server
@@ -156,7 +157,7 @@ npm run dev            # terminal 2, http://localhost:5173
 | `PUBLIC_DIR`                                       | the built web app                                                                                   | Directory with the PWA build                                                                                                                                                                                                        |
 | `DATA_DIR`                                         | `./data` (`/data` in Docker)                                                                        | Disk persistence location; setting it selects disk persistence                                                                                                                                                                      |
 | `SYNC_PERSISTENCE`                                 | `webdav` if `WEBDAV_URL` is set, else `disk` if `DATA_DIR` is set (always in Docker), else `memory` | Where live projects are persisted: `memory` (lost on restart), `disk`, `webdav`; logged at startup and shown by the MCP `get_project` tool                                                                                          |
-| `PERSIST_DEBOUNCE_MS`                              | `1500`                                                                                              | Delay before a changed project is saved (while edits keep coming, saves still happen at least every 10× this delay, and at least every 5 s)                                                                                         |
+| `PERSIST_DEBOUNCE_MS`                              | `1500`                                                                                              | Delay before a changed project is saved. While edits keep coming, a save still happens at the latest 10× this delay (at least 5 s) after the first unsaved change: 15 s by default                                                  |
 | `ROOM_IDLE_TTL_SECONDS`                            | `3600`                                                                                              | Unload idle projects after this time                                                                                                                                                                                                |
 | `WEBDAV_URL`, `WEBDAV_USERNAME`, `WEBDAV_PASSWORD` | –                                                                                                   | Server-side WebDAV storage                                                                                                                                                                                                          |
 | `WEBDAV_BASE_PATH`                                 | `/3d-editor`                                                                                        | Folder for projects on WebDAV                                                                                                                                                                                                       |
@@ -188,9 +189,9 @@ npm run lint && npm run format:check && npm run typecheck
 ```
 
 CI runs lint, the format check, the type check and the unit tests with coverage, the integration
-tests, and the e2e tests against a production build on every push and pull request; the Docker
-workflow builds and smoke-tests the image and publishes multi-arch images to GHCR on `main` and
-version tags.
+tests, and the e2e tests against a production build on pushes to `main`, on every pull request and
+on manual runs; the Docker workflow builds and smoke-tests the image and publishes multi-arch
+images to GHCR on `main` and version tags.
 
 ## Documentation
 

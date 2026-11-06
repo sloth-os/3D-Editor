@@ -111,28 +111,51 @@ After building, `build.mjs` reads the scene back and stops with an error if some
 
 ## Rebuild
 
-Start a server (any data directory), then run the script from the repository root:
+Start a server (any port and data directory; run `npm run build` first if `apps/server/dist` is
+missing), then run the script from the repository root. It deletes and recreates the project
+`product-shot` on that server and stops with an error on the first failing tool call or check.
 
 ```bash
-PORT=4505 DATA_DIR=/tmp/ps-data RENDER_WORKERS=3 node .phase3/app-v2/dist/main.js &
-MCP_URL=http://127.0.0.1:4505/mcp node examples/product-shot/build.mjs            # = --final
+PORT=4505 DATA_DIR=/tmp/ps-data RENDER_WORKERS=3 node apps/server/dist/main.js &   # or: npm start
+MCP_URL=http://127.0.0.1:4505/mcp node examples/product-shot/build.mjs                # = --final
+MCP_URL=http://127.0.0.1:4505/mcp node examples/product-shot/build.mjs --build-only   # scene only
+MCP_URL=http://127.0.0.1:4505/mcp node examples/product-shot/build.mjs --export-only  # scene.glb only
 ```
 
-| Mode flag | Runs |
-| --- | --- |
-| `--final` (default) | Build and verify, then `render.png`, `contact_sheet.png` and `preview.gif` |
-| `--build-only` | Build and verify the project only, no renders (about 1 s) |
-| `--preview` | Build plus a RASTER and a 640×360 path-traced preview (≤ 60 s) in `--out-dir` (default `/tmp/product-shot-previews`) |
-| `--still` | Build plus `render.png` only |
-| `--anim` | Build plus `contact_sheet.png` and `preview.gif` only |
-| `--export-only` | Build plus `scene.glb` only, no renders |
+| Mode flag | Runs | Time (3 render threads) |
+| --- | --- | --- |
+| `--final` (default) | Build and verify, then `render.png`, `contact_sheet.png` and `preview.gif` | about 11 min |
+| `--build-only` | Build and verify the project only, no renders | about 1 s |
+| `--preview` | Build plus a RASTER and a 640×360 path-traced preview (64 samples, at most 60 s) in `--out-dir` (default `/tmp/product-shot-previews`) | about 1 min |
+| `--still` | Build plus `render.png` only | about 7.5 min |
+| `--anim` | Build plus `contact_sheet.png` and `preview.gif` only | about 3 min |
+| `--export-only` | Build plus `scene.glb` only, no renders | about 2 s |
 
 Options: `--out-dir <dir>` redirects the outputs; `--samples <n>` (default 256) and
 `--time-limit <s>` (default 450) set the still's samples and wall-clock budget;
-`--anim-samples <n>` (default 12) sets the GIF samples (the contact sheet uses twice as many).
+`--anim-samples <n>` (default 16) sets the GIF samples (the contact sheet uses twice as many).
 `MODE=build|preview|still|anim|export|full` is accepted as an alias of the flags.
 
-FINAL_RUN_PLACEHOLDER
+## Final production run
+
+`render.png`, `contact_sheet.png` and `preview.gif` come from a single run of `build.mjs --final`
+against a freshly started server with a new, empty data directory, which is also the proof that
+the project rebuilds from scratch:
+
+```bash
+PORT=4555 DATA_DIR=/tmp/ps-final RENDER_WORKERS=3 node apps/server/dist/main.js &
+MCP_URL=http://127.0.0.1:4555/mcp node examples/product-shot/build.mjs --final
+```
+
+Measured on 2026-11-06 on 4 CPU cores shared with other jobs, with 3 render threads:
+
+| Stage | Time | Result |
+| --- | --- | --- |
+| Build and verify (`fresh project` … `verify scene`) | 1.2 s | 23 objects, 19,060 evaluated triangles, 8 materials; every check passed |
+| `render.png` | 452 s | 1280×720 path traced: 183 of the 256 requested samples per pixel (the 450 s time limit stopped it), denoised; 749 KiB |
+| `contact_sheet.png` | 40 s | 12 frames (1, 4, … 34) as 320×180 tiles, 32 samples, denoised; 862 KiB |
+| `preview.gif` | 152 s | all 36 frames, 480×270, 16 samples, denoised, 12 fps; 1.6 MB |
+| Whole script | 646 s (10 min 46 s) | exit code 0 |
 
 ## Known limitations and workarounds
 
@@ -154,9 +177,15 @@ FINAL_RUN_PLACEHOLDER
 * **Inspection counts.** `get_scene` / `get_object` evaluated counts use the modifiers' viewport
   settings. The script sets SCREW `render_steps` equal to `steps`, so what the tools report is what
   renders.
-* **Animation quality.** The GIF frames are path traced at 16 samples per pixel and denoised, so
-  fine glass detail is slightly smoothed; the 256-colour palette with Bayer dithering leaves a fine
-  dot pattern in the backdrop gradient.
-* **glTF export.** `scene.glb` comes from `--export-only` and is regenerated in a later pass with
-  the finished exporter. glTF has no area lights (the three area lights are exported as point
-  lights), and the procedural marble is baked to textures on generated UVs.
+* **Animation quality.** The contact sheet (32 samples per pixel) and the GIF frames (16 samples)
+  are denoised at low sample counts, so the glass shows slight blotches and fine detail is
+  smoothed; the GIF's 256-colour palette with Bayer dithering leaves a fine dot pattern in the
+  backdrop gradient.
+* **Focus distance in the build log.** The `camera` line of the log prints the result of
+  `camera.properties_set`, which shows `dof_focus_distance: 10`: the stored default, which
+  `dof_focus_object` overrides. The distance the renders use (1.016 m, the depth of the label) is
+  the evaluated value that `get_object` reports and the turntable check prints.
+* **glTF export.** `scene.glb` is written by `--export-only`; the file in this folder predates the
+  current scene and is regenerated in a later pass with the finished exporter. glTF has no area
+  lights (the exporter warns and writes the three area lights as point lights), and the
+  procedural marble is baked to textures on generated (Smart UV Project) UVs.

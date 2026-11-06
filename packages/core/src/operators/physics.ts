@@ -11,6 +11,8 @@ import {
   inspectRigidBodies,
   type RigidBodyHost,
 } from '../physics/rigid-body';
+import { buildCollisionShape } from '../physics/shapes';
+import { decomposeRigid } from '../physics/vmath';
 import {
   COLLISION_SHAPES,
   MAX_SIMULATED_FRAMES,
@@ -78,7 +80,10 @@ const settingsShape = {
     .min(0)
     .max(1)
     .optional()
-    .describe('Distance in m within which contacts are detected ahead of touching (default 0.04)'),
+    .describe(
+      'Distance in m within which contacts are detected ahead of touching (default 0.04); shapes are not ' +
+        'inflated by it. Closely spaced small bodies need a margin below their gaps (dominoes: 0.001)',
+    ),
   linear_damping: z
     .number()
     .min(0)
@@ -147,8 +152,26 @@ function resolveTargets(ctx: OperatorContext, refs: string[] | undefined): Objec
   return ids.map((id) => ctx.doc.getObject(id)!);
 }
 
+/**
+ * The thickening of a body's convex collision shape when its mesh (at the world's frame_start
+ * scale) is thinner than the minimum collision thickness, else null. Triangle-mesh colliders
+ * (MESH on PASSIVE / Animated bodies) have no thickness and are not checked.
+ */
+function thicknessNote(doc: SceneDoc, o: ObjectData, rb: RigidBodyData): string | null {
+  const dynamic = rb.type === 'ACTIVE' && !rb.kinematic;
+  if (rb.collision_shape === 'MESH' && !dynamic) return null;
+  const mesh = o.data ? doc.getMesh(o.data) : null;
+  if (!mesh || mesh.positions.length === 0) return null;
+  const m = new FrameState(doc, worldOf(doc).frame_start).world(o.id);
+  if (!m) return null;
+  const built = buildCollisionShape(rb.collision_shape, mesh, decomposeRigid(m).scale, { dynamic });
+  if ('error' in built || !built.thickened) return null;
+  // the notes say how it is simulated (a flat static floor needs no note: only its back changes)
+  return built.notes.find((n) => n.includes('thick')) ?? null;
+}
+
 /** Warnings about settings that will not behave as the user might expect. */
-function settingWarnings(ctx: OperatorContext, o: ObjectData, rb: RigidBodyData): void {
+function settingWarnings(ctx: OperatorContext, o: ObjectData, rb: RigidBodyData): string | null {
   if (rb.type === 'ACTIVE' && !rb.kinematic && rb.collision_shape === 'MESH')
     ctx.report(
       'WARNING',
@@ -157,10 +180,13 @@ function settingWarnings(ctx: OperatorContext, o: ObjectData, rb: RigidBodyData)
   const mesh = o.data ? ctx.doc.getMesh(o.data) : null;
   if (mesh && mesh.positions.length === 0)
     ctx.report('WARNING', `'${o.name}' has no vertices and is left out of the simulation`);
+  const thin = thicknessNote(ctx.doc, o, rb);
+  if (thin) ctx.report('WARNING', `'${o.name}': ${thin}`);
+  return thin;
 }
 
-function describeSettings(o: ObjectData, rb: RigidBodyData) {
-  return { object: o.id, name: o.name, ...rb };
+function describeSettings(o: ObjectData, rb: RigidBodyData, collisionNote: string | null) {
+  return { object: o.id, name: o.name, ...rb, collision_note: collisionNote };
 }
 
 /**
@@ -205,7 +231,11 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
         "Blender's defaults (mass 1 kg, friction 0.5, restitution 0, margin 0.04 m, CONVEX_HULL for ACTIVE, " +
         'MESH for PASSIVE) unless settings are passed. Objects that already have a rigid body keep their ' +
         'settings, take the new type and the settings passed (switching to ACTIVE turns "Dynamic" on). ' +
-        'Non-mesh objects are skipped with a warning. Returns the resulting settings per object.',
+        'Non-mesh objects are skipped with a warning. Collision shapes keep the true size of thin objects (a ' +
+        '7.5 mm domino, a coin, a 0.3 mm card) down to 0.2% of their largest dimension; a thinner mesh is ' +
+        'simulated thicker and a flat one (a plane) as a thin slab behind its faces, reported in ' +
+        'collision_note and as a warning. Returns the resulting settings per object (with collision_note, ' +
+        'null when the shape has the mesh\'s size).',
       category: 'Physics',
       poll: pollObjectMode,
       schema: z.object({
@@ -233,8 +263,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
           const rb: RigidBodyData = { ...base, ...patch };
           doc.updateObject(o.id, { rigid_body: rb });
           if (!existing) created++;
-          settingWarnings(ctx, o, rb);
-          objects.push(describeSettings(o, rb));
+          objects.push(describeSettings(o, rb, settingWarnings(ctx, o, rb)));
         }
         if (!objects.length)
           throw new OperatorError(
@@ -307,8 +336,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
             rb.type = p.type;
           }
           ctx.doc.updateObject(o.id, { rigid_body: rb });
-          settingWarnings(ctx, o, rb);
-          return describeSettings(o, rb);
+          return describeSettings(o, rb, settingWarnings(ctx, o, rb));
         });
         return { objects };
       },

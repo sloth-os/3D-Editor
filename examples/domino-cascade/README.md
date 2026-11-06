@@ -22,8 +22,9 @@ All sizes are real-world metres, Z up. 80 objects, 18 k render triangles, 70 mat
 
 * **Table** – `object.generate_table` (2.6 × 1.5 m, top at 0.75 m). Its `Wood` material is
   rewritten as satin oak boards: a `BRICK` procedural on the base colour (one random tone per
-  1.3 m × 0.19 m board, hair-line seams), `WOOD` growth rings with fibre streaks as a fine bump
-  and, with the same rings, on the roughness (0.28–0.6), plus a light clear coat.
+  1.3 m × 0.19 m board, hair-line seams), a fine grain along the boards as a 0.15 mm bump (a
+  `WAVE` procedural: saw-tooth bands about 14 mm apart, wobbled by noise) and, with the same
+  pattern, on the roughness (0.3–0.55), plus a light clear coat.
 * **Dominoes** – 60 jumbo toy dominoes (80 × 40 × 14 mm, 47 g). One bevelled prototype
   (cube → `object.transform_apply` → `BEVEL` modifier applied → auto smooth → rigid body) is copied
   with `object.array_place` (linked duplicates, rigid body copied along); one `batch` renames the
@@ -152,8 +153,8 @@ FINAL_RUN_PLACEHOLDER
   `object.empty_add`, `object.track_set` (Track To), `anim.keyframes_insert_many` (camera, target
   and focus-target paths).
 * **Shading:** `material.preset_apply` (`glossy_plastic` ×60 with colour overrides, `wood`,
-  `clear_glass`), `material.update`, `material.procedural_set` (`BRICK` boards and parquet, `WOOD`
-  ring bump).
+  `clear_glass`), `material.update` (clear coat), `material.procedural_set` (`BRICK` boards and
+  parquet on the base colour, `WAVE` grain on the normal (bump) and roughness channels).
 
 ## Known limitations
 
@@ -169,6 +170,13 @@ FINAL_RUN_PLACEHOLDER
   those of the final production run.
 * **Depth of field** is rendered by the path tracer only: the RASTER inspection sheets are sharp
   throughout. At GIF size (480 × 270) the blur is subtle.
+* **RASTER previews** (the inspection sheets) ignore the ACES view transform and look brighter and
+  flatter than the path-traced outputs; the lighting was judged on path-traced previews only.
+* **Wood grain:** procedural textures cannot be rotated and the `WOOD` texture's rings and fibre
+  streaks are built around texture Z, so on a horizontal table top they show as end-grain rings
+  or a rippled speckle. The grain is therefore a `WAVE` pattern varying along Y (lines along the
+  boards), and the board colour and the grain cannot share one texture (one procedural per
+  channel).
 * **GIF:** 256 colours with ordered (Bayer) dithering and 10 samples per pixel (denoised) per
   frame; the contact sheet tiles use 16 samples. Both are softer than the still.
 * **scene.glb:** from an earlier export pass; `--export-only` regenerates it. glTF has no area

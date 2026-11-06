@@ -36,7 +36,7 @@ Start a server on any port, then run the build against it:
 cd /path/to/3D-Editor
 PORT=4501 DATA_DIR=/tmp/lc-data node apps/server/dist/main.js &   # or any running editor server
 MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs                 # full run
-MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --build-only    # scene + checks only (~10–15 s)
+MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --build-only    # scene + checks only (6–15 s)
 MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --preview       # + RASTER and 16-spp previews in $TMPDIR/lighthouse-cove-preview
 MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --export-only   # scene + checks + scene.glb, no renders
 ```
@@ -72,7 +72,7 @@ sculpt strokes, the path waypoints, the camera, the sun and the beam phase.
 | Fence along part of it | `object.generate_fence {points: [x, y, z]}` 1 m to the seaward side of the upper path, with every post on a ray-cast ground height | Visual |
 | Conifers, rocks, grass tufts, kept off the beach and the path | `object.generate_tree {CONIFER}` ×3, `generate_rock` ×3, `generate_grass_tuft` ×2 and `generate_bush` as sources. Per-vertex density maps are written as vertex groups (`object.vertex_group_set_weights`): no trees on the sand, the path, the pads or the open slopes; rocks on the shoreline and steep ground; dune grass along the sand edge. They are scattered with `object.scatter_add {vertex_group, min_distance}` | `scatter_add` results: 40 pines, 110 rocks, 2600 tufts, 30 bushes |
 | Wooden sign "NORTH POINT" on a post | A board on two posts, parented to an empty that is turned to face the camera. The letters are `object.text_add {body: "NORTH POINT", extrude}`. The wood grain is a distorted WAVE texture, applied after `object.transform_apply` of the board's scale | Visual |
-| Sunset sky with a low sun, light mist | `world.sky_set {preset: SUNSET, sun_elevation: 0.04, sun_rotation: 4.22}` with custom zenith and horizon colours, and `world.mist_set {distance: 800}`. Five thin cloud streaks come from `object.generate_cloud`, each generated small and stretched by its object scale | Visual |
+| Sunset sky with a low sun, light mist | `world.sky_set {preset: SUNSET, sun_elevation: 0.04, sun_rotation: 4.22}` with custom zenith and horizon colours, and `world.mist_set {distance: 800}` (95 % at 800 m: the island stays clear, the far sea and the clouds fade into a lavender haze). Five thin cloud streaks come from `object.generate_cloud`, each generated small and stretched by its object scale. They glow in exactly the mist colour (see the known limitations for why) | Visual, plus a path-traced frame where a beam crosses the clouds |
 | Rotating beam: a spot light driven from the frame | Two opposite SPOT lights (`object.light_add` with `spot_size`, `spot_blend`, `shadow_soft_size`). Each has an `anim.driver_add` on `rotation_euler[2]` with the expression `phase + (frame - 1) * pi / 24`: half a turn in 24 frames, so the pair loops seamlessly. The visible shafts are explained below | `get_object {frame}` at frames 1, 7, 13, 19 and 25. The evaluated heading of beam A is 81.9°, 126.9°, 171.9°, 216.9° and 261.9° (7.5° per frame), and frame 25 equals frame 1 with the beams swapped |
 | Camera aimed with TRACK_TO at an empty near the lighthouse | `add_object empty` ("Camera Target") + `object.constraint_add {type: TRACK_TO, target}` + `set_active_camera` | The camera's evaluated `world_transform` from `get_object` aims 0.001° off the target |
 
@@ -108,6 +108,8 @@ the 6-spp animation.
   `object.array_place` for the jetty posts.
 - **Animation**: `anim.driver_add`, with evaluated values checked through `get_object {frame}`.
 - **Constraints**: TRACK_TO.
+- **World**: `world.sky_set` (the SUNSET preset with a low sun and custom zenith, horizon and
+  ground colours) and `world.mist_set`.
 - **Scene queries**: batched `scene.raycast`, plus `get_scene` counts and `problems`.
 - **Rendering**: `render_image` with the path tracer (ACES, denoise, time limit) and
   `render_animation` CONTACT_SHEET and GIF, path traced and denoised.
@@ -142,6 +144,14 @@ FINAL_RUN_TIMINGS
     happens in the still.
   - The lantern glass is alpha-blended rather than refractive. Refractive glass would keep the
     lamp light inside the lantern.
+- **The path tracer loses the mist behind glass.** It applies the world mist once per camera
+  ray, using the depth of the first surface hit. When that surface is glass (the shafts, but
+  also any window), whatever is seen through it gets the mist of the glass's depth, which is
+  almost none. Lit clouds behind a passing beam therefore lost their mist and showed up dark
+  brown. RASTER gets this right. The workaround: the clouds sit 700–1000 m away, where the mist
+  covers 90–99 % of their own shading anyway, so they have a black base colour and emit exactly
+  the mist colour. They look the same with or without mist, so they look the same through a
+  beam.
 - **RASTER previews show the beams as solid bright tubes.** The software rasterizer ignores the
   procedural emission of transmissive materials. `--preview` therefore also renders a small
   path-traced image, which is cheap because the shafts need few samples.
@@ -153,8 +163,8 @@ FINAL_RUN_TIMINGS
   the texture and bump of the grass, rock and sand materials still change at face edges of the
   0.5 m grid. At this camera distance the change is not visible.
 - **There is no operator to set vertex colours from data.** Each vertex is painted with its own
-  small `paint.vertex_color_stroke` dab, with the colours quantised to 145 values. This takes 7–9
-  s of the build.
+  small `paint.vertex_color_stroke` dab, with the colours quantised to 145 values. This takes
+  3–9 s of the build, depending on the load of the machine.
 - **The path still floats slightly in places.** It is banked with the ground, but on the steep
   final stretch below the lighthouse it floats up to 0.31 m above the terrain, against 0.11 m for
   a perfect fit.

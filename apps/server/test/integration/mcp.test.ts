@@ -460,7 +460,9 @@ describe('MCP endpoint', () => {
     expect(updated.modifier.show_render).toBe(false);
     expect(updated.via).toBe(hasModifierOperators ? 'operator' : 'document');
     cube = await ok('get_object', { project: id, object: 'Cube' });
-    expect(cube.data.evaluated.faces).toBe(96);
+    // evaluated = what renders show (show_render is off: the plain cube); the viewport shows level 2
+    expect(cube.data.evaluated.faces).toBe(6);
+    expect(cube.data.evaluated_viewport.faces).toBe(96);
     const applied = await ok('apply_modifier', { project: id, object: 'Cube', modifier: name });
     expect(applied.mesh.faces).toBe(96);
     cube = await ok('get_object', { project: id, object: 'Cube' });

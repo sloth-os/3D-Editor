@@ -70,6 +70,15 @@ export interface AnimationOutput {
   cancelled: boolean;
   time_limit_reached: boolean;
   undersampled_frames: number[];
+  /**
+   * PATHTRACER: samples per pixel each frame reached, aligned with `frames` (fewer than
+   * `requested_samples` where a time limit stopped it). Absent for rasterized renders.
+   */
+  frame_samples?: number[];
+  /** PATHTRACER: samples per pixel requested per frame. */
+  requested_samples?: number;
+  /** Render warnings of the frames (each once), e.g. objects with degenerate triangles. */
+  warnings: string[];
   threads: number;
   /** FRAMES: one frame per thread; BANDS: frames in turn, each path traced by all threads. */
   parallelism: 'FRAMES' | 'BANDS';
@@ -157,6 +166,11 @@ export async function renderAnimationParallel(
   const kept: { width: number; height: number; data: Uint8ClampedArray }[] = [];
   const files: { frame: number; name: string; data: Uint8Array }[] = [];
   const undersampled: number[] = [];
+  /** Samples reached per rendered frame (path tracing), in frame order. */
+  const frameSamples: number[] = [];
+  let requestedSamples = 0;
+  let pathTraced = false;
+  const warnings = new Set<string>();
   let budgetHit = false;
   let encoded = 0;
   const results = new Map<number, { img: ImageResult; budgetBound: boolean }>();
@@ -167,6 +181,12 @@ export async function renderAnimationParallel(
       results.delete(encoded);
       const frame = job.frames[encoded];
       const pt = r.img.pathtrace;
+      if (pt) {
+        pathTraced = true;
+        requestedSamples = Math.max(requestedSamples, pt.requested);
+      }
+      frameSamples.push(pt?.samples ?? 0);
+      for (const w of r.img.warnings ?? []) warnings.add(w);
       if (pt && pt.samples < pt.requested) {
         undersampled.push(frame);
         if (r.budgetBound) budgetHit = true;
@@ -275,6 +295,8 @@ export async function renderAnimationParallel(
       cancelled,
       time_limit_reached: budgetHit || (cancelled && budgetMs > 0),
       undersampled_frames: undersampled,
+      ...(pathTraced ? { frame_samples: frameSamples, requested_samples: requestedSamples } : {}),
+      warnings: [...warnings],
       threads: threads.length,
       parallelism: bands ? 'BANDS' : 'FRAMES',
       elapsedMs: 0,

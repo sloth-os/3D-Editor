@@ -12,7 +12,13 @@ import {
 } from './settings';
 import type { AnimTargetType, CollisionShape, DriverData, FCurve } from '../doc/types';
 import { meshKey } from './mesh-key';
-import { Simulation, type BodyInput, type RigidBodyIssue, type SimulationOptions } from './simulation';
+import {
+  Simulation,
+  compareBodyOrder,
+  type BodyInput,
+  type RigidBodyIssue,
+  type SimulationOptions,
+} from './simulation';
 
 export type { RigidBodyIssue } from './simulation';
 
@@ -195,27 +201,35 @@ export function animationInputsKey(doc: SceneDoc, ids: readonly string[]): strin
   return parts.sort().join('|');
 }
 
-/** Rigid body objects of the scene (validated settings, id order) and the signature of all inputs. */
+/**
+ * Rigid body objects of the scene (validated settings, in solver order: by start pose, see
+ * `compareBodyOrder`) and the signature of all inputs.
+ */
 function collectInputs(
   doc: SceneDoc,
   host: RigidBodyHost,
   params: WorldParams,
 ): { inputs: BodyInput[]; signature: string } {
-  const found: { id: string; rb: NonNullable<ReturnType<typeof sanitizeRigidBody>> }[] = [];
+  const found: { id: string; name: string; rb: NonNullable<ReturnType<typeof sanitizeRigidBody>> }[] = [];
   for (const o of doc.listObjects()) {
     const rb = sanitizeRigidBody(o.rigid_body);
-    if (rb) found.push({ id: o.id, rb });
+    if (rb) found.push({ id: o.id, name: o.name, rb });
   }
   if (!found.length) return { inputs: [], signature: 'empty' };
-  found.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const transforms = host.transformsAt(params.frameStart);
+  const inputs = found
+    .map(({ id, name, rb }): BodyInput => ({
+      id,
+      name,
+      rb,
+      matrix: transforms.get(id) ?? null,
+      mesh: host.meshOf(id),
+    }))
+    .sort(compareBodyOrder);
+  // the order of the parts records the solver order (bodies starting at the same pose: by name)
   const parts = [stableStringify(params)];
-  const inputs = found.map(({ id, rb }): BodyInput => {
-    const matrix = transforms.get(id) ?? null;
-    const mesh = host.meshOf(id);
+  for (const { id, rb, mesh, matrix } of inputs)
     parts.push(id, stableStringify(rb), mesh ? meshKey(mesh) : '-', matrix ? matrix.join(',') : '-');
-    return { id, rb, matrix, mesh };
-  });
   return { inputs, signature: parts.join('|') };
 }
 

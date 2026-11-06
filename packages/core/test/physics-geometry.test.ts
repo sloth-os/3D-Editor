@@ -9,7 +9,7 @@ import {
   sphereMass,
 } from '../src/physics/mass';
 import {
-  MIN_HALF_EXTENT,
+  minHalfExtent,
   boxPolyhedron,
   buildCollisionShape,
   cuboidFrame,
@@ -272,13 +272,19 @@ describe('collision shapes from meshes (Blender sizing rules)', () => {
     const b = buildCollisionShape('BOX', createPlane({ size: 2 }), [1, 1, 1], { dynamic: true });
     if ('error' in b || b.shape.kind !== 'poly') throw new Error();
     expect(b.inertia.every(Number.isFinite)).toBe(true);
-    expect(b.shape.box!.half).toEqual([1, 1, MIN_HALF_EXTENT]);
+    const t = minHalfExtent(1);
+    expect(b.shape.box!.half).toEqual([1, 1, t]);
+    // the slab lies behind the plane (which faces +Z): its top is the plane itself
+    expect(b.com).toEqual([0, 0, -t]);
+    expect(b.notes.join(" ")).toMatch(/slab behind its faces/);
+    expect(b.thickened).toEqual({ mesh: 0, collision: 2 * t });
     // a flat hull becomes a thin solid slab (a cuboid for a square plane)
     const h = buildCollisionShape('CONVEX_HULL', createPlane({ size: 2 }), [1, 1, 1], { dynamic: true });
     if ('error' in h || h.shape.kind !== 'poly') throw new Error();
     expect(h.shape.poly.flat).toBe(false);
-    expect(Math.min(...h.shape.box!.half)).toBeCloseTo(MIN_HALF_EXTENT, 12);
+    expect(Math.min(...h.shape.box!.half)).toBeCloseTo(t, 12);
     expect(Math.max(...h.shape.box!.half)).toBeCloseTo(1, 12);
+    expect(h.com[2]).toBeCloseTo(-t, 12);
     expect(h.inertia.every(Number.isFinite)).toBe(true);
     const tri = buildCollisionShape(
       'CONVEX_HULL',
@@ -290,7 +296,7 @@ describe('collision shapes from meshes (Blender sizing rules)', () => {
     );
     if ('error' in tri || tri.shape.kind !== 'poly') throw new Error();
     expect(tri.shape.poly.verts.length / 3).toBe(6);
-    expect(tri.volume).toBeCloseTo(0.5 * 2 * MIN_HALF_EXTENT, 12);
+    expect(tri.volume).toBeCloseTo(0.5 * 2 * minHalfExtent(0.5), 12);
   });
 });
 

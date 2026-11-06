@@ -488,7 +488,7 @@ async function lookDev() {
   );
 
   // table top: satin oak boards (BRICK pattern = planks with a random tone each and hairline
-  // seams) with a fine growth-ring and fibre bump
+  // seams) with a fine grain running along the boards (bump + gloss)
   await op('material.update', { material: 'Wood', base_color: [0.4, 0.21, 0.09, 1], roughness: 0.42, coat_weight: 0.15, coat_roughness: 0.15 });
   await op('material.procedural_set', {
     material: 'Wood',
@@ -503,36 +503,32 @@ async function lookDev() {
       params: { plane: 'XY', brick_width: 1.3, row_height: 0.1875, mortar_size: 0.0012, mortar_smooth: 0.3, offset: 0.37, mortar_r: 0.05, mortar_g: 0.025, mortar_b: 0.01 },
     },
   });
+  // grain: SAW-profile WAVE bands varying along Y (= lines along X, the boards' length, ~14 mm
+  // apart) wobbled by noise; a 0.15 mm bump and, with the same pattern, the gloss (roughness
+  // 0.3..0.55). (WOOD rings around Z with fibre streaks read as a rippled, hammered surface on a
+  // horizontal top at full resolution.)
+  const grain = (colorA, colorB, extra = {}) => ({
+    type: 'WAVE',
+    mapping: 'OBJECT',
+    scale: 22,
+    detail: 3,
+    distortion: 4,
+    roughness: 0.55,
+    color_a: colorA,
+    color_b: colorB,
+    params: { wave_type: 'BANDS', direction: 'Y', wave_profile: 'SAW', detail_scale: 0.6, ...extra },
+  });
   await op('material.procedural_set', {
     material: 'Wood',
     channel: 'normal',
     replace: true,
-    procedural: {
-      type: 'WOOD',
-      mapping: 'OBJECT',
-      scale: 60,
-      detail: 1,
-      distortion: 0.6,
-      color_a: [0, 0, 0, 1],
-      color_b: [1, 1, 1, 1],
-      params: { wood_type: 'RINGS', wave_profile: 'SAW', grain: 0.5, offset_y: 6, bump_distance: 0.0004 },
-    },
+    procedural: grain([0, 0, 0, 1], [1, 1, 1, 1], { bump_distance: 0.00015 }),
   });
-  // ... and the same growth rings with fibre streaks modulate the gloss (roughness 0.28..0.6)
   await op('material.procedural_set', {
     material: 'Wood',
     channel: 'roughness',
     replace: true,
-    procedural: {
-      type: 'WOOD',
-      mapping: 'OBJECT',
-      scale: 60,
-      detail: 2,
-      distortion: 0.8,
-      color_a: [0.28, 0.28, 0.28, 1],
-      color_b: [0.6, 0.6, 0.6, 1],
-      params: { wood_type: 'RINGS', wave_profile: 'SAW', grain: 0.6, offset_y: 6 },
-    },
+    procedural: grain([0.3, 0.3, 0.3, 1], [0.55, 0.55, 0.55, 1]),
   });
   await op('material.update', { material: 'Wood Dark', base_color: [0.09, 0.045, 0.02, 1], roughness: 0.5 });
 

@@ -1,5 +1,4 @@
 import {
-  SceneEvaluator,
   computeVertexNormals,
   countTriangles,
   decodeFloat32,
@@ -13,6 +12,7 @@ import {
   type SceneDoc,
   type Vec3,
 } from '@3d-editor/core';
+import { evaluateCached } from './eval-cache';
 import { ToolError } from './agent';
 
 /*
@@ -199,7 +199,7 @@ export function meshData(scene: SceneDoc, o: ObjectData, opts: MeshDataOptions):
   // evaluation: needed for evaluated geometry and for world-space data (the matrix at the frame)
   const needsEval = source !== 'BASE' || space === 'WORLD' || include.has('heightmap');
   const ev = needsEval
-    ? new SceneEvaluator(scene).evaluate(opts.frame, { forRender: source === 'RENDER' })
+    ? evaluateCached(scene, opts.frame, source === 'RENDER' ? 'RENDER' : 'VIEWPORT')
     : null;
   const e = ev?.byId.get(o.id);
   const world: Mat4 | null = e?.worldMatrix ?? (needsEval ? scene.worldMatrix(o.id) : null);

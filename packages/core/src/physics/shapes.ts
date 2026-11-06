@@ -27,11 +27,34 @@ import type { Mat3 } from './vmath';
  */
 
 /**
- * Smallest half thickness of convex collision geometry: flat or degenerate meshes become 1 cm
- * slabs / rods. Like Bullet's collision margin this keeps them from crossing (two-sided)
- * triangle meshes, where a body without thickness could not tell which side it came from.
+ * Largest minimal half thickness of convex collision geometry (see `minHalfExtent`): flat meshes
+ * of a metre and more become 1 cm slabs.
  */
 export const MIN_HALF_EXTENT = 5e-3;
+/** Minimal half thickness relative to the largest half extent of a body (see `minHalfExtent`). */
+export const THIN_RATIO = 2e-3;
+/** Smallest minimal half thickness (m), for tiny bodies (see `minHalfExtent`). */
+export const MIN_HALF_EXTENT_FLOOR = 1e-5;
+
+/**
+ * Smallest half thickness of convex collision geometry for a body whose largest half extent is
+ * `maxHalf`: THIN_RATIO of it, between MIN_HALF_EXTENT_FLOOR and MIN_HALF_EXTENT. Flat or
+ * degenerate meshes (a plane, a line) become slabs / rods this thick; like Bullet's collision
+ * margin this keeps them from crossing (two-sided) triangle meshes, where a body without
+ * thickness could not tell which side it came from. Real bodies keep their thickness down to
+ * this limit (a 7.5 mm domino, a coin, a 0.3 mm playing card); thinner ones are thickened to it,
+ * with a note.
+ */
+export function minHalfExtent(maxHalf: number): number {
+  const m = Number.isFinite(maxHalf) ? THIN_RATIO * maxHalf : MIN_HALF_EXTENT;
+  return Math.min(MIN_HALF_EXTENT, Math.max(MIN_HALF_EXTENT_FLOOR, m));
+}
+
+/** Millimetres for notes: two significant digits below 1 mm. */
+function mm(m: number): string {
+  const v = m * 1000;
+  return `${v >= 1 ? +v.toFixed(1) : +v.toPrecision(2)} mm`;
+}
 /** Polyhedra with more vertices answer support queries by hill climbing (see `polySupport`). */
 export const HILL_CLIMB_VERTICES = 32;
 /** Vertex count of the polygon approximating cylinder / cone caps in contact manifolds. */
@@ -111,8 +134,13 @@ export interface ShapeBuild {
   /** Inertia about the centre of mass for 1 kg, body axes. */
   inertia: Mat3;
   volume: number;
-  /** Non-fatal notes (fallbacks), for diagnostics. */
+  /** Non-fatal notes (fallbacks, thickened thin meshes), for diagnostics. */
   notes: string[];
+  /**
+   * Set when the mesh is thinner than the minimum collision thickness (`minHalfExtent`) and the
+   * convex shape was thickened: the mesh's thickness and the simulated one (m).
+   */
+  thickened?: { mesh: number; collision: number };
 }
 
 // ---------------------------------------------------------------- polyhedra
@@ -571,6 +599,40 @@ export function shapeBounds(s: Shape): { min: Vec3; max: Vec3 } {
   return { min, max };
 }
 
+/**
+ * Half the thickness of a convex shape in its thinnest direction (for polyhedra, along the face
+ * normal with the smallest width); Infinity for triangle meshes, which have no inside. The solver
+ * scales its penetration tolerances with it, so thin bodies cannot sink through each other.
+ */
+export function thinHalfExtent(s: Shape): number {
+  switch (s.kind) {
+    case 'sphere':
+    case 'capsule':
+      return s.radius;
+    case 'cylinder':
+      return Math.min(s.radius, s.halfHeight);
+    case 'cone':
+      return Math.min(s.radius, s.height / 2);
+    case 'poly': {
+      const { verts, planes } = s.poly;
+      let best = Infinity;
+      for (let f = 0; f < planes.length; f += 4) {
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = 0; i < verts.length; i += 3) {
+          const d = planes[f] * verts[i] + planes[f + 1] * verts[i + 1] + planes[f + 2] * verts[i + 2];
+          if (d < lo) lo = d;
+          if (d > hi) hi = d;
+        }
+        best = Math.min(best, (hi - lo) / 2);
+      }
+      return best;
+    }
+    case 'mesh':
+      return Infinity;
+  }
+}
+
 /** Radius of the smallest origin-centred sphere containing the shape. */
 export function boundingRadius(s: Shape): number {
   const { min, max } = shapeBounds(s);
@@ -628,9 +690,46 @@ function result(
 }
 
 /**
+ * Direction the faces of a mesh look to (unit, scaled object space), from their area-weighted
+ * normal (half the sum of their Newell vectors): the front of an open mesh such as a plane, null
+ * when the faces do not agree on one side (closed meshes, double-sided planes, no faces).
+ */
+function frontDirection(mesh: MeshData, pts: number[], valid: Int32Array, size: number): Vec3 | null {
+  const n = areaNormal(mesh, pts, valid);
+  const l = Math.hypot(n[0], n[1], n[2]);
+  return l > 1e-6 * size * size ? [n[0] / l, n[1] / l, n[2] / l] : null;
+}
+
+function areaNormal(mesh: MeshData, pts: number[], valid: Int32Array): Vec3 {
+  const out: Vec3 = [0, 0, 0];
+  const faces = Array.isArray(mesh.faces) ? mesh.faces : [];
+  for (const f of faces) {
+    if (!Array.isArray(f) || f.length < 3) continue;
+    const idx: number[] = [];
+    for (const v of f) {
+      const k = Number.isInteger(v) && v >= 0 && v < valid.length ? valid[v] : -1;
+      if (k < 0) break;
+      idx.push(k * 3);
+    }
+    if (idx.length !== f.length) continue;
+    for (let i = 0; i < idx.length; i++) {
+      const a = idx[i];
+      const b = idx[(i + 1) % idx.length];
+      out[0] += ((pts[a + 1] - pts[b + 1]) * (pts[a + 2] + pts[b + 2])) / 2;
+      out[1] += ((pts[a + 2] - pts[b + 2]) * (pts[a] + pts[b])) / 2;
+      out[2] += ((pts[a] - pts[b]) * (pts[a + 1] + pts[b + 1])) / 2;
+    }
+  }
+  return out;
+}
+
+/**
  * Builds the collision shape of an object from its mesh (object space) and world scale.
  * `dynamic` bodies cannot use triangle meshes (Blender's MESH shape is unstable for active
- * bodies): they fall back to the convex hull. Returns an error string for unusable meshes.
+ * bodies): they fall back to the convex hull. Convex shapes are at least `minHalfExtent` thick:
+ * an open flat mesh (a plane) becomes a slab behind its faces, so its visible surface is where
+ * things collide; a thinner closed mesh is thickened around its centre (both with a note).
+ * Returns an error string for unusable meshes.
  */
 export function buildCollisionShape(
   type: CollisionShape,
@@ -642,7 +741,61 @@ export function buildCollisionShape(
   const { pts, valid } = scaledPositions(mesh, scale);
   if (pts.length === 0) return { error: 'mesh has no (finite) vertices' };
   const { center, half } = bounds(pts);
-  const h: Vec3 = half.map((v) => Math.max(v, MIN_HALF_EXTENT)) as Vec3;
+  const size = Math.max(half[0], half[1], half[2]);
+  const minHalf = minHalfExtent(size);
+  const h: Vec3 = half.map((v) => Math.max(v, minHalf)) as Vec3;
+  let thickened: ShapeBuild['thickened'];
+  if (type === 'BOX' || type === 'CYLINDER' || type === 'CONE') {
+    // bounds-fitted shapes: thin axes are thickened; a flat open mesh extends behind its faces
+    const thin = [0, 1, 2].filter((a) => half[a] < minHalf && (type === 'BOX' || a === 2));
+    if (thin.length) {
+      const front = frontDirection(mesh, pts, valid, size);
+      for (const a of thin) {
+        const flat = half[a] <= 1e-9 * size;
+        if (flat && front && Math.abs(front[a]) > 0.9) {
+          center[a] -= Math.sign(front[a]) * (h[a] - half[a]);
+          // only the back side changes; for a static floor or wall that is not worth a note
+          if (opts.dynamic) notes.push(slabNote(minHalf, true));
+        } else notes.push(flat ? slabNote(minHalf, false) : thinNote(half[a], minHalf, 'XYZ'[a]));
+        thickened = { mesh: 2 * half[a], collision: 2 * h[a] };
+      }
+    }
+  }
+  const out = buildShape(type, mesh, pts, valid, scale, opts, center, h, minHalf, notes, size);
+  if (thickened && !('error' in out)) out.thickened ??= thickened;
+  return out;
+}
+
+/** Note for a flat mesh simulated as a slab (behind its faces, or centred on it). */
+function slabNote(minHalf: number, behind: boolean): string {
+  return (
+    `flat mesh: simulated as a ${mm(2 * minHalf)} thick slab ${behind ? 'behind its faces' : 'centred on it'} ` +
+    `(minimum collision thickness: ${THIN_RATIO * 100}% of the largest half size)`
+  );
+}
+
+/** Note for a closed mesh thinner than the minimum collision thickness. */
+function thinNote(half: number, minHalf: number, axis?: string): string {
+  return (
+    `the mesh is only ${mm(2 * half)} thick${axis ? ` (${axis})` : ''}, below the minimum collision ` +
+    `thickness of ${mm(2 * minHalf)} (${THIN_RATIO * 100}% of its largest half size): it collides as if ` +
+    `${mm(2 * minHalf)} thick`
+  );
+}
+
+function buildShape(
+  type: CollisionShape,
+  mesh: MeshData,
+  pts: number[],
+  valid: Int32Array,
+  scale: Readonly<Vec3>,
+  opts: { dynamic: boolean },
+  center: Vec3,
+  h: Vec3,
+  minHalf: number,
+  notes: string[],
+  size: number,
+): ShapeBuild | { error: string } {
   switch (type) {
     case 'BOX':
       return result(
@@ -712,27 +865,81 @@ export function buildCollisionShape(
         }
         notes.push('mesh has no faces, using its convex hull');
       } else notes.push('active rigid bodies cannot use the MESH shape, using CONVEX_HULL');
-      return hullShape(pts, notes);
+      return hullShape(pts, notes, minHalf, () => frontDirection(mesh, pts, valid, size), opts.dynamic);
     }
     case 'CONVEX_HULL':
     default:
-      return hullShape(pts, notes);
+      return hullShape(pts, notes, minHalf, () => frontDirection(mesh, pts, valid, size), opts.dynamic);
   }
 }
 
-function hullShape(pts: number[], notes: string[]): ShapeBuild {
-  let hull = convexHull(pts);
-  if (hull && hull.dimension === 2) {
-    // flat mesh: a thin slab around its polygon
-    const [nx, ny, nz] = hull.normals[0];
-    const h = MIN_HALF_EXTENT;
-    const slab: number[] = [];
-    for (let i = 0; i < hull.points.length; i += 3) {
-      const [x, y, z] = [hull.points[i], hull.points[i + 1], hull.points[i + 2]];
-      slab.push(x + nx * h, y + ny * h, z + nz * h, x - nx * h, y - ny * h, z - nz * h);
+/** Half the width of a convex polytope along its thinnest face normal, and that normal. */
+function thinnestWidth(points: readonly number[], normals: readonly Vec3[]): { half: number; normal: Vec3 } {
+  let half = Infinity;
+  let normal: Vec3 = [0, 0, 1];
+  for (const n of normals) {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = 0; i < points.length; i += 3) {
+      const d = n[0] * points[i] + n[1] * points[i + 1] + n[2] * points[i + 2];
+      lo = Math.min(lo, d);
+      hi = Math.max(hi, d);
     }
-    const thick = convexHull(slab);
-    if (thick?.dimension === 3) hull = thick;
+    if ((hi - lo) / 2 < half) {
+      half = (hi - lo) / 2;
+      normal = n;
+    }
+  }
+  return { half, normal };
+}
+
+/** Convex hull of the points moved `up` along n and `down` against it (a slab / thickened hull). */
+function extrudedHull(points: readonly number[], n: Readonly<Vec3>, up: number, down: number) {
+  const out: number[] = [];
+  for (let i = 0; i < points.length; i += 3) {
+    const [x, y, z] = [points[i], points[i + 1], points[i + 2]];
+    out.push(x + n[0] * up, y + n[1] * up, z + n[2] * up, x - n[0] * down, y - n[1] * down, z - n[2] * down);
+  }
+  const hull = convexHull(out);
+  return hull?.dimension === 3 ? hull : null;
+}
+
+function hullShape(
+  pts: number[],
+  notes: string[],
+  minHalf: number,
+  frontDir: () => Vec3 | null,
+  dynamic: boolean,
+): ShapeBuild {
+  let hull = convexHull(pts);
+  let thickened: ShapeBuild['thickened'];
+  if (hull && hull.dimension === 2) {
+    // flat mesh: a slab behind its faces (centred on it when the faces do not say which side is front)
+    let n = hull.normals[0];
+    const f = frontDir();
+    const fn = f ? f[0] * n[0] + f[1] * n[1] + f[2] * n[2] : 0;
+    const front = Math.abs(fn) > 0.9;
+    if (fn < 0) n = [-n[0], -n[1], -n[2]];
+    const thick = front
+      ? extrudedHull(hull.points, n, 0, 2 * minHalf)
+      : extrudedHull(hull.points, n, minHalf, minHalf);
+    if (thick) {
+      hull = thick;
+      thickened = { mesh: 0, collision: 2 * minHalf };
+      if (dynamic || !front) notes.push(slabNote(minHalf, front));
+    }
+  } else if (hull && hull.dimension === 3) {
+    // closed but thinner than the minimum: thickened along its thinnest direction
+    const w = thinnestWidth(hull.points, hull.normals);
+    if (w.half < minHalf * (1 - 1e-9)) {
+      const grow = minHalf - w.half;
+      const thick = extrudedHull(hull.points, w.normal, grow, grow);
+      if (thick) {
+        hull = thick;
+        thickened = { mesh: 2 * w.half, collision: 2 * minHalf };
+        notes.push(thinNote(w.half, minHalf));
+      }
+    }
   }
   if (hull && hull.dimension === 3) {
     const mp = polyhedronMass(hull.points, hull.faces);
@@ -747,11 +954,12 @@ function hullShape(pts: number[], notes: string[]): ShapeBuild {
         inertia: mp.inertia,
         volume: mp.volume,
         notes,
+        ...(thickened ? { thickened } : {}),
       };
     }
   }
   if (hull && hull.dimension === 2) {
-    const mp = boundsMass(hull.points, 2 * MIN_HALF_EXTENT);
+    const mp = boundsMass(hull.points, 2 * minHalf);
     const verts = hull.points.map((v, i) => v - mp.com[i % 3]);
     return {
       shape: { kind: 'poly', poly: makePolyhedron(verts, hull.faces, true) },
@@ -764,8 +972,8 @@ function hullShape(pts: number[], notes: string[]): ShapeBuild {
   }
   // a point or a segment: thin box around it
   const { center, half } = bounds(hull?.points ?? pts);
-  const h: Vec3 = half.map((v) => Math.max(v, MIN_HALF_EXTENT)) as Vec3;
-  notes.push('mesh vertices are collinear, using a thin box');
+  const h: Vec3 = half.map((v) => Math.max(v, minHalf)) as Vec3;
+  notes.push(`mesh vertices are collinear, using a ${mm(2 * minHalf)} thin box`);
   return {
     ...result(
       { kind: 'poly', poly: boxPolyhedron(h), box: alignedBox(h) },

@@ -2,11 +2,9 @@ import {
   ANIMATABLE,
   FrameState,
   ROOT_COLLECTION_ID,
-  SceneEvaluator,
   constraintTargets,
   decodeFloat32,
   decompose4,
-  expandInstances,
   meshStats,
   modifierObjectParams,
   normalizeParticleSettings,
@@ -27,6 +25,7 @@ import {
   type Vec3,
   type WorldSettings,
 } from '@3d-editor/core';
+import { evaluateCached, type EvalMode } from './eval-cache';
 
 /*
  * Compact JSON descriptions of a scene for MCP agents. Numbers are rounded, references are
@@ -38,8 +37,12 @@ import {
  * transforms, pose channels, shape key values, constraint influences, light / camera / curve /
  * world settings. Where such a value differs from the one stored in the document (the value that
  * tools such as transform_object edit, overridden by keyframes and drivers), the stored value is
- * listed too (`stored`, `stored_value`, `stored_influence`). Instance counts are those of renders
- * (the viewport may show fewer: particle display_percentage).
+ * listed too (`stored`, `stored_value`, `stored_influence`).
+ *
+ * Geometry is described as renders show it: the scene is evaluated with the render settings of
+ * modifiers, curves and particles (SUBSURF render_levels, SCREW render_steps, show_render, curve
+ * render_resolution_u, every particle). Where the viewport shows other geometry, its counts are
+ * listed too (`evaluated_viewport`, `viewport_instances`).
  */
 
 const RAD2DEG = 180 / Math.PI;
@@ -151,6 +154,11 @@ function* worldVertices(mesh: MeshData, m: Mat4): Generator<Vec3> {
   for (let i = 0; i + 2 < p.length; i += 3) yield transformPoint3(m, [p[i], p[i + 1], p[i + 2]]);
 }
 
+function* worldLinePoints(lines: Float32Array, m: Mat4): Generator<Vec3> {
+  for (let i = 0; i + 2 < lines.length; i += 3)
+    yield transformPoint3(m, [lines[i], lines[i + 1], lines[i + 2]]);
+}
+
 function* posedBonePoints(ev: EvaluatedObject): Generator<Vec3> {
   for (const b of ev.pose?.bones.values() ?? []) {
     yield transformPoint3(ev.worldMatrix, b.head);
@@ -160,10 +168,12 @@ function* posedBonePoints(ev: EvaluatedObject): Generator<Vec3> {
 
 /**
  * World-space axis aligned bounds of an evaluated object: its geometry after modifiers (meshes,
- * curves and text with a surface), its posed bones (armatures), otherwise its origin.
+ * curves and text with a surface), its wire (curves without a surface, also after edge-only
+ * modifiers such as ARRAY), its posed bones (armatures), otherwise its origin.
  */
 export function worldBounds(ev: EvaluatedObject): Bounds | null {
   if (ev.mesh && ev.mesh.positions.length >= 3) return boundsOf(worldVertices(ev.mesh, ev.worldMatrix));
+  if (ev.lines && ev.lines.length >= 3) return boundsOf(worldLinePoints(ev.lines, ev.worldMatrix));
   if (ev.pose?.bones.size) return boundsOf(posedBonePoints(ev));
   const m = ev.worldMatrix;
   return boundsOf([[m[12], m[13], m[14]]]);
@@ -282,28 +292,52 @@ function curveSummary(c: CurveData, type: 'CURVE' | 'FONT', detailed: boolean): 
       cyclic: c.splines.filter((s) => s.use_cyclic_u).length,
     });
   }
-  if (c.bevel_depth > 0 || c.bevel_mode === 'OBJECT')
+  // the shape settings (curve.properties_set): get_object lists every one, get_scene the ones
+  // that shape the surface or differ from the defaults
+  if (detailed) {
     Object.assign(out, {
+      fill_mode: c.fill_mode,
       bevel_mode: c.bevel_mode,
       bevel_depth: round(c.bevel_depth),
       bevel_resolution: c.bevel_resolution,
-    });
-  if (c.bevel_mode === 'OBJECT' && c.bevel_object) out.bevel_object = c.bevel_object;
-  if (c.extrude > 0) out.extrude = round(c.extrude);
-  if (c.offset !== 0) out.offset = round(c.offset);
-  if (c.bevel_factor_start !== 0 || c.bevel_factor_end !== 1)
-    out.bevel_factor = [round(c.bevel_factor_start), round(c.bevel_factor_end)];
-  if (c.dimensions === '2D' || type === 'FONT') out.fill_mode = c.fill_mode;
-  // path animation fields (every curve has use_path on, like in Blender): when used or asked for
-  if (c.use_path && type === 'CURVE' && (detailed || c.eval_time !== 0))
-    Object.assign(out, { path_duration: c.path_duration, eval_time: round(c.eval_time) });
-  if (detailed) {
-    Object.assign(out, {
+      bevel_object: c.bevel_object,
+      // [bevel_factor_start, bevel_factor_end]
+      bevel_factor: [round(c.bevel_factor_start), round(c.bevel_factor_end)],
+      extrude: round(c.extrude),
+      offset: round(c.offset),
+      use_fill_caps: c.use_fill_caps,
+      twist_mode: c.twist_mode,
       resolution_u: c.resolution_u,
       render_resolution_u: c.render_resolution_u,
-      twist_mode: c.twist_mode,
-      use_fill_caps: c.use_fill_caps,
     });
+    if (type === 'CURVE')
+      Object.assign(out, {
+        use_path: c.use_path,
+        path_duration: c.path_duration,
+        eval_time: round(c.eval_time),
+      });
+  } else {
+    out.fill_mode = c.fill_mode;
+    if (c.bevel_depth > 0 || c.bevel_mode === 'OBJECT')
+      Object.assign(out, {
+        bevel_mode: c.bevel_mode,
+        bevel_depth: round(c.bevel_depth),
+        bevel_resolution: c.bevel_resolution,
+      });
+    if (c.bevel_mode === 'OBJECT' && c.bevel_object) out.bevel_object = c.bevel_object;
+    if (c.extrude > 0) out.extrude = round(c.extrude);
+    if (c.offset !== 0) out.offset = round(c.offset);
+    if (c.bevel_factor_start !== 0 || c.bevel_factor_end !== 1)
+      out.bevel_factor = [round(c.bevel_factor_start), round(c.bevel_factor_end)];
+    if (c.use_fill_caps) out.use_fill_caps = true;
+    if (c.twist_mode !== 'MINIMUM' && type === 'CURVE') out.twist_mode = c.twist_mode;
+    if (c.resolution_u !== 12) out.resolution_u = c.resolution_u;
+    if (c.render_resolution_u > 0) out.render_resolution_u = c.render_resolution_u;
+    // path animation fields (every curve has use_path on, like in Blender): when used
+    if (c.use_path && type === 'CURVE' && c.eval_time !== 0)
+      Object.assign(out, { path_duration: c.path_duration, eval_time: round(c.eval_time) });
+  }
+  if (detailed) {
     if (type === 'CURVE') {
       out.splines = c.splines.slice(0, 16).map((s, i) => ({
         index: i,
@@ -533,15 +567,23 @@ function instanceCounts(instances: readonly EvaluatedInstance[]): InstanceCounts
   return { total: instances.length, byOwner, bySystem };
 }
 
-/** Whether renders show other particle instances than the viewport (display_percentage, visibility). */
-function renderInstancesDiffer(ev: EvaluatedScene): boolean {
-  return ev.objects.some((o) =>
-    (o.data.particle_systems ?? []).some(
-      (ps) =>
-        ps.show_viewport !== ps.show_render ||
-        normalizeParticleSettings(ps.settings).settings.display_percentage < 100,
-    ),
-  );
+/**
+ * `{evaluated_viewport}`: the viewport's evaluated mesh statistics when they differ from the
+ * render geometry (`render`), e.g. SCREW steps vs render_steps, SUBSURF levels vs render_levels,
+ * a modifier shown in only one of them, or curve resolution_u vs render_resolution_u.
+ */
+function viewportStats(
+  render: MeshData | null | undefined,
+  viewport: EvaluatedObject | undefined,
+): { evaluated_viewport?: ReturnType<typeof meshStats> | 'none' } {
+  if (!viewport || viewport.mesh === render) return {};
+  if (!viewport.mesh) return render ? { evaluated_viewport: 'none' } : {};
+  const v = meshStats(viewport.mesh);
+  if (!render) return { evaluated_viewport: v };
+  const r = meshStats(render);
+  return v.vertices !== r.vertices || v.faces !== r.faces || v.triangles !== r.triangles
+    ? { evaluated_viewport: v }
+    : {};
 }
 
 function dataSummary(
@@ -559,8 +601,15 @@ function dataSummary(
       mesh: block?.name ?? o.data,
       users: scene.dataUsers(o.data),
     };
-    if (base) Object.assign(out, meshStats(base));
-    if (ev?.mesh && base && ev.mesh !== base) out.evaluated = meshStats(ev.mesh);
+    if (base) {
+      Object.assign(out, meshStats(base));
+      // the geometry renders show (listed whenever modifiers or shape keys could change it); the
+      // viewport's too where its modifier settings give other geometry
+      const viewport = viewportStats(ev?.mesh ?? base, ctx?.viewportOf(o.id));
+      if (ev?.mesh && (ev.mesh !== base || o.modifiers.length || viewport.evaluated_viewport))
+        out.evaluated = meshStats(ev.mesh);
+      Object.assign(out, viewport);
+    }
     // values at the frame (keyed / driven), like Blender's shape key sliders; the stored value
     // (what object.shape_key_set changes) when animation overrides it
     const keys = ctx ? ctx.shapeKeys(o.data) : scene.getShapeKeys(o.data);
@@ -616,7 +665,11 @@ function dataSummary(
     if (typeof out.bevel_object === 'string') out.bevel_object = nameOf(scene, out.bevel_object);
     out.users = scene.dataUsers(o.data);
     if (ev?.mesh) out.evaluated = meshStats(ev.mesh);
-    else out.evaluated = 'wire (no surface: add bevel_depth, extrude or a 2D fill)';
+    else {
+      out.evaluated = 'wire (no surface: add bevel_depth, extrude or a 2D fill)';
+      if (ev?.lines?.length) out.wire_edges = ev.lines.length / 6;
+    }
+    Object.assign(out, viewportStats(ev?.mesh, ctx?.viewportOf(o.id)));
     Object.assign(out, storedField(storedDiff(c, stored, Object.keys(ANIMATABLE.curve))));
     return out;
   }
@@ -692,6 +745,7 @@ function dataSummary(
 
 /** Context shared by the object summaries of one evaluation. */
 interface SummaryContext {
+  /** The scene evaluated for rendering (what the summaries describe). */
   ev: EvaluatedScene;
   problems: Map<string, EvalError[]>;
   /** Instances in renders (every particle of the systems shown in renders). */
@@ -700,35 +754,47 @@ interface SummaryContext {
   viewport: InstanceCounts | null;
   /** The instances renders show. */
   renderInstances: readonly EvaluatedInstance[];
+  /** The object evaluated with the viewport settings (only when the viewport may differ). */
+  viewportOf(id: string): EvaluatedObject | undefined;
   /** Shape keys of a mesh with their values at the frame. */
   shapeKeys(meshId: string): ShapeKeyData[];
 }
 
-function summaryContext(scene: SceneDoc, ev: EvaluatedScene): SummaryContext {
-  const shown = instanceCounts(ev.instances);
-  let instances = shown;
-  let viewport: InstanceCounts | null = null;
-  let renderInstances: readonly EvaluatedInstance[] = ev.instances;
-  if (renderInstancesDiffer(ev)) {
-    // the viewport evaluation thins particles out: count what renders show (same placements)
-    try {
-      const res = expandInstances({
-        doc: scene,
-        frame: ev.frame,
-        forRender: true,
-        objects: ev.objects,
-        byId: ev.byId,
-      });
-      instances = instanceCounts(res.instances);
-      renderInstances = res.instances;
-      if (
-        instances.total !== shown.total ||
-        [...instances.bySystem].some(([k, n]) => shown.bySystem.get(k) !== n)
-      )
-        viewport = shown;
-    } catch {
-      /* keep the viewport counts */
+/**
+ * Whether the viewport can show other geometry or instances than renders: modifiers (render_levels,
+ * render_steps, show_viewport vs show_render …), particle systems (display_percentage, visibility)
+ * or curves with their own render resolution. Without any, one evaluation describes both.
+ */
+function viewportMayDiffer(scene: SceneDoc): boolean {
+  for (const o of scene.listObjects()) {
+    if (o.modifiers.length || o.particle_systems?.length) return true;
+    if ((o.type === 'CURVE' || o.type === 'FONT') && o.data) {
+      const c = scene.getCurve(o.data);
+      if (c && c.render_resolution_u > 0 && c.render_resolution_u !== c.resolution_u) return true;
     }
+  }
+  return false;
+}
+
+/**
+ * Context of the summaries of `ev` (a RENDER evaluation); `viewport` is the VIEWPORT evaluation of
+ * the same frame, for the counts that differ in the viewport (null: they cannot differ).
+ */
+function summaryContext(
+  scene: SceneDoc,
+  ev: EvaluatedScene,
+  viewportEv: EvaluatedScene | null,
+): SummaryContext {
+  const instances = instanceCounts(ev.instances);
+  let viewport: InstanceCounts | null = null;
+  if (viewportEv && viewportEv !== ev) {
+    const shown = instanceCounts(viewportEv.instances);
+    if (
+      instances.total !== shown.total ||
+      [...instances.bySystem].some(([k, n]) => shown.bySystem.get(k) !== n) ||
+      [...instances.byOwner].some(([k, n]) => shown.byOwner.get(k) !== n)
+    )
+      viewport = shown;
   }
   let fs: FrameState | null = null;
   return {
@@ -736,7 +802,8 @@ function summaryContext(scene: SceneDoc, ev: EvaluatedScene): SummaryContext {
     problems: problemsByObject(scene, ev),
     instances,
     viewport,
-    renderInstances,
+    renderInstances: ev.instances,
+    viewportOf: (id) => (viewportEv && viewportEv !== ev ? viewportEv.byId.get(id) : undefined),
     shapeKeys: (meshId) => {
       fs ??= new FrameState(scene, ev.frame);
       return fs.get<{ shape_keys: ShapeKeyData[] }>('mesh', meshId)?.shape_keys ?? scene.getShapeKeys(meshId);
@@ -936,75 +1003,34 @@ function evaluatedGeometry(
   return { geometry, instanceTriangles };
 }
 
-export function evaluate(scene: SceneDoc, frame?: number): EvaluatedScene {
-  const f = frame ?? scene.getScene().frame_start;
-  return new SceneEvaluator(scene).evaluate(f);
+/**
+ * The scene evaluated at `frame` (default: the scene's frame_start), cached per document state:
+ * RENDER (default) with the render settings of modifiers, curves and particles, VIEWPORT with the
+ * viewport's.
+ */
+export function evaluate(scene: SceneDoc, frame?: number, mode: EvalMode = 'RENDER'): EvaluatedScene {
+  return evaluateCached(scene, frame ?? scene.getScene().frame_start, mode);
 }
 
-export interface SceneSummaryOptions {
-  frame?: number;
-  projectId?: string;
-  /** Objects listed at most (default DEFAULT_MAX_OBJECTS); the counts cover every object. */
-  maxObjects?: number;
+/** The RENDER evaluation and, when the viewport may show other geometry, the VIEWPORT one. */
+function evaluateBoth(
+  scene: SceneDoc,
+  frame?: number,
+): { ev: EvaluatedScene; viewport: EvaluatedScene | null } {
+  const ev = evaluate(scene, frame, 'RENDER');
+  return { ev, viewport: viewportMayDiffer(scene) ? evaluate(scene, ev.frame, 'VIEWPORT') : null };
 }
 
-/** Full scene description returned by `get_scene` and the `project://{id}/scene` resource. */
-export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) {
-  const ev = evaluate(scene, opts.frame);
-  const ctx = summaryContext(scene, ev);
-  const objects = scene.listObjects();
-  const materialUsers = new Map<string, Set<string>>();
-  for (const o of objects)
-    for (const s of o.material_slots) {
-      if (!s) continue;
-      let set = materialUsers.get(s);
-      if (!set) materialUsers.set(s, (set = new Set()));
-      set.add(o.name);
-    }
+/**
+ * Scene, render and world settings (`world`: the world at the frame, with the stored values where
+ * keyframes or drivers change them).
+ */
+function settingsSummary(scene: SceneDoc, world: WorldSettings, rigidBodies: number) {
   const settings = scene.getScene();
   const render = scene.getRender();
-  // world settings at the frame (animated sun, mist …), stored values where they differ
   const storedWorld = scene.getWorld();
-  const world = ev.world ?? storedWorld;
-  // base geometry: the stored mesh data of mesh objects (before shape keys and modifiers)
-  let vertices = 0;
-  let faces = 0;
-  const byType: Record<string, number> = {};
-  for (const o of objects) {
-    byType[o.type] = (byType[o.type] ?? 0) + 1;
-    if (o.type !== 'MESH' || !o.data) continue;
-    const c = scene.meshCounts(o.data);
-    if (c) {
-      vertices += c.vertices;
-      faces += c.faces;
-    }
-  }
-  const evaluated = evaluatedGeometry(ev, ctx.renderInstances);
-  const maxObjects = Math.max(1, opts.maxObjects ?? DEFAULT_MAX_OBJECTS);
-  const listed = objects.slice(0, maxObjects);
   const rbw = settings.rigidbody_world;
-  const rigidBodies = objects.filter((o) => o.rigid_body).length;
-  const drivers = scene.listDrivers().length;
   return {
-    project: { id: opts.projectId, name: scene.name },
-    units: { up_axis: 'Z', length: 'meters', angles: 'radians' },
-    frame: ev.frame,
-    counts: {
-      objects: objects.length,
-      by_type: byType,
-      // base meshes (as stored, before modifiers; curves and text not included)
-      vertices,
-      faces,
-      // what is rendered: after shape keys, modifiers, curve bevels/extrusions and text
-      evaluated: evaluated.geometry,
-      materials: scene.listMaterials().length,
-      instances: ctx.instances.total,
-      ...(evaluated.instanceTriangles ? { instance_triangles: evaluated.instanceTriangles } : {}),
-      ...(ctx.viewport ? { viewport_instances: ctx.viewport.total } : {}),
-      ...(drivers ? { drivers } : {}),
-      ...(rigidBodies ? { rigid_bodies: rigidBodies } : {}),
-    },
-    active_camera: settings.camera ? { id: settings.camera, name: nameOf(scene, settings.camera) } : null,
     scene: {
       frame_start: settings.frame_start,
       frame_end: settings.frame_end,
@@ -1060,6 +1086,90 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
         : {}),
       ...animatedWorld(world, storedWorld),
     },
+  };
+}
+
+/**
+ * The scene, render and world settings at `frame` without evaluating the geometry (what
+ * set_scene_settings returns).
+ */
+export function sceneSettingsAt(scene: SceneDoc, frame: number) {
+  const world = new FrameState(scene, frame).get<WorldSettings>('world', 'world') ?? scene.getWorld();
+  const rigidBodies = scene.listObjects().filter((o) => o.rigid_body).length;
+  return settingsSummary(scene, world, rigidBodies);
+}
+
+export interface SceneSummaryOptions {
+  frame?: number;
+  projectId?: string;
+  /** Objects listed at most (default DEFAULT_MAX_OBJECTS); the counts cover every object. */
+  maxObjects?: number;
+}
+
+/** Full scene description returned by `get_scene` and the `project://{id}/scene` resource. */
+export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) {
+  const both = evaluateBoth(scene, opts.frame);
+  const ev = both.ev;
+  const ctx = summaryContext(scene, ev, both.viewport);
+  const objects = scene.listObjects();
+  const materialUsers = new Map<string, Set<string>>();
+  for (const o of objects)
+    for (const s of o.material_slots) {
+      if (!s) continue;
+      let set = materialUsers.get(s);
+      if (!set) materialUsers.set(s, (set = new Set()));
+      set.add(o.name);
+    }
+  const settings = scene.getScene();
+  // world settings at the frame (animated sun, mist …)
+  const world = ev.world ?? scene.getWorld();
+  // base geometry: the stored mesh data of mesh objects (before shape keys and modifiers)
+  let vertices = 0;
+  let faces = 0;
+  const byType: Record<string, number> = {};
+  for (const o of objects) {
+    byType[o.type] = (byType[o.type] ?? 0) + 1;
+    if (o.type !== 'MESH' || !o.data) continue;
+    const c = scene.meshCounts(o.data);
+    if (c) {
+      vertices += c.vertices;
+      faces += c.faces;
+    }
+  }
+  const evaluated = evaluatedGeometry(ev, ctx.renderInstances);
+  const viewportGeometry = both.viewport ? evaluatedGeometry(both.viewport, []).geometry : null;
+  const viewportDiffers =
+    !!viewportGeometry &&
+    (viewportGeometry.vertices !== evaluated.geometry.vertices ||
+      viewportGeometry.faces !== evaluated.geometry.faces ||
+      viewportGeometry.triangles !== evaluated.geometry.triangles);
+  const maxObjects = Math.max(1, opts.maxObjects ?? DEFAULT_MAX_OBJECTS);
+  const listed = objects.slice(0, maxObjects);
+  const rigidBodies = objects.filter((o) => o.rigid_body).length;
+  const drivers = scene.listDrivers().length;
+  return {
+    project: { id: opts.projectId, name: scene.name },
+    units: { up_axis: 'Z', length: 'meters', angles: 'radians' },
+    frame: ev.frame,
+    counts: {
+      objects: objects.length,
+      by_type: byType,
+      // base meshes (as stored, before modifiers; curves and text not included)
+      vertices,
+      faces,
+      // what is rendered: after shape keys, modifiers (render settings), curve bevels/extrusions
+      // and text; the viewport's counts when its modifier/curve settings give other geometry
+      evaluated: evaluated.geometry,
+      ...(viewportDiffers ? { evaluated_viewport: viewportGeometry } : {}),
+      materials: scene.listMaterials().length,
+      instances: ctx.instances.total,
+      ...(evaluated.instanceTriangles ? { instance_triangles: evaluated.instanceTriangles } : {}),
+      ...(ctx.viewport ? { viewport_instances: ctx.viewport.total } : {}),
+      ...(drivers ? { drivers } : {}),
+      ...(rigidBodies ? { rigid_bodies: rigidBodies } : {}),
+    },
+    active_camera: settings.camera ? { id: settings.camera, name: nameOf(scene, settings.camera) } : null,
+    ...settingsSummary(scene, world, rigidBodies),
     objects: listed.map((o) => summarizeObject(scene, o, ev.byId.get(o.id), ctx)),
     ...(listed.length < objects.length
       ? {
@@ -1088,7 +1198,8 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
 
 /** Detailed description of one object (`get_object`). */
 export function describeObject(scene: SceneDoc, o: ObjectData, frame?: number) {
-  const ev = evaluate(scene, frame);
+  const both = evaluateBoth(scene, frame);
+  const ev = both.ev;
   const e = ev.byId.get(o.id);
   const world = e?.worldMatrix ?? scene.worldMatrix(o.id);
   // materials at the frame (animated / driven), like the rest of the description
@@ -1112,7 +1223,7 @@ export function describeObject(scene: SceneDoc, o: ObjectData, frame?: number) {
   // the final world transform (parents, constraints, rigid body simulation), decomposed
   const wt = decompose4(world);
   return {
-    ...summarizeObject(scene, o, e, summaryContext(scene, ev), true),
+    ...summarizeObject(scene, o, e, summaryContext(scene, ev, both.viewport), true),
     frame: ev.frame,
     world_location: roundVec([world[12], world[13], world[14]]),
     world_transform: {

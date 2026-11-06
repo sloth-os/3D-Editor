@@ -196,6 +196,120 @@ export function registerSculptOperators(reg: OperatorRegistry): void {
       },
     }),
   );
+  const rgba = z.union([
+    z.tuple([z.number(), z.number(), z.number()]),
+    z.tuple([z.number(), z.number(), z.number(), z.number()]),
+  ]);
+  reg.register(
+    defineOperator({
+      id: 'paint.vertex_color_set_data',
+      label: 'Set Vertex Colors from Data',
+      description:
+        'Write exact per-vertex colors into the vertex color layer of a mesh object in one call (one undo step), ' +
+        'e.g. terrain colors computed from height and slope. Colors are linear RGBA (or RGB, alpha 1) floats ' +
+        '0..1 (divide 0..255 values by 255). Give ONE of: `colors` with one color per vertex in vertex order (as ' +
+        'get_mesh_data lists them; the count must match, or pass `start` to write a contiguous run from that ' +
+        'vertex index on); `colors` + `indices` (one color per listed vertex index, or a single color for all of ' +
+        'them); or `ranges` ([{start, count, color}], a color per run of vertex indices). Other vertices keep ' +
+        'their colors; a mesh without a color layer first gets an all-white one. The renderers and the viewport ' +
+        'MULTIPLY the material base color by the vertex color (use a white base color to see the colors as ' +
+        'they are); faces blend between their vertices. Objects sharing the mesh change together. Returns ' +
+        '{object, vertices (mesh vertex count), set (vertices written)}.',
+      category: 'Paint',
+      schema: z.object({
+        object: z.string().optional().describe('Mesh object (id or name); default: the active object'),
+        colors: z
+          .array(rgba)
+          .optional()
+          .describe('Linear [r, g, b, a] (or [r, g, b]) 0..1 per vertex; see the description for the forms'),
+        indices: z
+          .array(z.number().int().min(0))
+          .optional()
+          .describe('Vertex indices the `colors` go to (same length as colors, or one color for all)'),
+        start: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe('With `colors` and no `indices`: index of the vertex that gets colors[0] (a contiguous run)'),
+        ranges: z
+          .array(
+            z.object({
+              start: z.number().int().min(0).describe('First vertex index of the run'),
+              count: z.number().int().min(1).describe('Number of vertices in the run'),
+              color: rgba.describe('Linear [r, g, b, a] (or [r, g, b]) 0..1'),
+            }),
+          )
+          .optional()
+          .describe('Runs of vertex indices with one color each (instead of colors / indices)'),
+      }),
+      execute(ctx, p) {
+        const t = target(ctx, p.object);
+        const n = t.mesh.positions.length / 3;
+        const check = (c: readonly number[], where: string): number[] => {
+          for (const v of c)
+            if (!Number.isFinite(v) || v < 0 || v > 1)
+              throw new OperatorError(
+                `${where} = [${c.join(', ')}]: colors are linear 0..1 floats` +
+                  (v > 1 && v <= 255 ? ' (divide 0..255 values by 255)' : ''),
+                'INVALID_PARAMS',
+              );
+          return c.length === 3 ? [c[0], c[1], c[2], 1] : [c[0], c[1], c[2], c[3]];
+        };
+        const writes: [number, number[]][] = [];
+        const index = (i: number, where: string) => {
+          if (i >= n)
+            throw new OperatorError(
+              `${where} = ${i} is out of range: '${t.o.name}' has ${n} vertices (0 … ${n - 1})`,
+              'INVALID_PARAMS',
+            );
+          return i;
+        };
+        if (p.ranges) {
+          if (p.colors || p.indices || p.start !== undefined)
+            throw new OperatorError('Pass `ranges` or `colors` (with indices / start), not both', 'INVALID_PARAMS');
+          p.ranges.forEach((r, k) => {
+            const c = check(r.color, `ranges[${k}].color`);
+            index(r.start + r.count - 1, `ranges[${k}].start + count - 1`);
+            for (let i = r.start; i < r.start + r.count; i++) writes.push([i, c]);
+          });
+        } else if (p.colors) {
+          const colors = p.colors.map((c, k) => check(c, `colors[${k}]`));
+          if (p.indices) {
+            if (p.start !== undefined)
+              throw new OperatorError('Pass `indices` or `start`, not both', 'INVALID_PARAMS');
+            if (colors.length !== 1 && colors.length !== p.indices.length)
+              throw new OperatorError(
+                `colors has ${colors.length} entries for ${p.indices.length} indices: pass one color per index ` +
+                  'or a single color for all of them',
+                'INVALID_PARAMS',
+              );
+            p.indices.forEach((i, k) => writes.push([index(i, `indices[${k}]`), colors[colors.length === 1 ? 0 : k]]));
+          } else {
+            const start = p.start ?? 0;
+            if (p.start === undefined && colors.length !== n)
+              throw new OperatorError(
+                `colors has ${colors.length} entries but '${t.o.name}' has ${n} vertices: pass one color per ` +
+                  'vertex, `start` for a contiguous run, or `indices` / `ranges` for some vertices',
+                'INVALID_PARAMS',
+              );
+            index(start + colors.length - 1, 'start + colors.length - 1');
+            colors.forEach((c, k) => writes.push([start + k, c]));
+          }
+        } else
+          throw new OperatorError(
+            'Nothing to set: pass `colors` (per vertex, or with indices / start) or `ranges`',
+            'INVALID_PARAMS',
+          );
+        const m = cloneMesh(t.mesh);
+        const cols = m.colors && m.colors.length === n * 4 ? m.colors : new Array<number>(n * 4).fill(1);
+        for (const [i, c] of writes) for (let k = 0; k < 4; k++) cols[i * 4 + k] = c[k];
+        m.colors = cols;
+        ctx.doc.setMesh(t.o.data!, m);
+        return { object: t.o.name, vertices: n, set: new Set(writes.map((w) => w[0])).size };
+      },
+    }),
+  );
   reg.register(
     defineOperator({
       id: 'paint.vertex_color_set',

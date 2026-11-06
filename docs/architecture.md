@@ -138,7 +138,9 @@ its constraints and modifiers; plus the instances, the world, render and scene s
 active camera and a list of non-fatal problems (drivers, poses, curves, instancing, physics). The
 viewport, both renderers, the exporters, the MCP scene summaries and the scene-tool operators all
 read the scene through it. One evaluator lives in every project session, render worker and server
-render thread, and keeps its caches between calls.
+render thread, and keeps its caches between calls. The MCP inspection tools keep two per document
+(render and viewport settings) and reuse the 16 most recent evaluations (by frame and settings)
+until the document changes (`apps/server/src/mcp/eval-cache.ts`).
 
 In short, per frame: F-curves → drivers → parenting → armature poses → constraints (in dependency
 order) → rigid body overrides, then shape keys → curves and text → modifier stacks → instancing.
@@ -231,9 +233,13 @@ by pass (`schedule.ts`). The main thread adds the tiles to one film and refreshe
 row; at the end a worker denoises and tone maps the mean film. Animation frames are rendered one
 after the other (path traced on the workers, or rasterized with WebGL) and streamed to an APNG or
 GIF encoder on a worker, so the main thread keeps no frames. Canceling keeps the samples or frames
-finished so far. The editor's RPC handler can also path trace on these workers when a request asks
-for `engine: PATHTRACER`, but the server's MCP tools currently send only raster requests to
-browsers.
+finished so far. The editor's RPC handler path traces on these workers when a request asks for
+`engine: PATHTRACER`: the server's MCP `render_image` sends such requests with
+`renderer: browser` (with `renderer: auto` it path traces on the server and sends only raster
+renders to browsers).
+
+<!-- re-check: uncommitted server change on 2026-11-06 (renderer browser path tracing,
+apps/server/src/mcp/tools.ts) -->
 
 ### Server render threads
 
@@ -258,13 +264,16 @@ Server-side rendering (`apps/server/src/render`) serves the MCP tools `render_im
 - **Path-traced stills** are split into bands of rows over sample ranges (tasks of about 25,000
   samples, at least three bands per thread and pass); the main thread accumulates the tiles in one
   film, then a render thread denoises it and encodes the PNG. **Animations** render frames in
-  parallel, one per thread. Limits: 2048 × 1280 pixels for path tracing, 4096 × 4096 for raster
-  images; requests report progress notifications and can be canceled.
+  parallel, one per thread; a path-traced animation with fewer frames than threads renders its
+  frames one after the other, each in bands on all threads. Limits: 2048 × 1280 pixels for path
+  tracing, 4096 × 4096 for raster images; requests report progress notifications and can be
+  canceled.
 - **Routing.** `render_image` with `renderer: auto` sends RASTER renders to a browser editor that
   has the project open (over the sync connection's RPC channel, so they use WebGL), and path traces
-  on the server; without a browser, RASTER uses the CPU rasterizer. `render_animation` and
-  `render.png` always render on the server. Files from `render_animation {store: true}` are kept
-  for an hour (at most 256 MiB) and served from `/api/projects/:id/renders/…`.
+  on the server; without a browser, RASTER uses the CPU rasterizer. With `renderer: browser` both
+  engines run in the editor, PATHTRACER on its render workers. `render_animation` and `render.png`
+  always render on the server. Files from `render_animation {store: true}` are kept for an hour
+  (at most 256 MiB) and served from `/api/projects/:id/renders/…`.
 
 ## Server
 

@@ -15,6 +15,7 @@ import {
   filmToRGBA8,
   preparePathTrace,
   renderItems,
+  renderPathTracedImage,
   renderSceneSoftware,
   resolveView,
   sampleFrameIndices,
@@ -22,6 +23,7 @@ import {
   type Mat4,
   type PathTile,
   type PathTraceProgress,
+  type PathTraceRenderInput,
   type RigidBodyHost,
   type SoftwareRenderOptions,
   type Vec3,
@@ -43,6 +45,7 @@ import type {
   Vec3Tuple,
   Vec4Tuple,
 } from './protocol';
+import { nameDegenerateTriangles } from './degenerate';
 
 /*
  * The rendering work done by one render thread (a worker, or the main thread in single-thread
@@ -118,6 +121,46 @@ export function softwareOptions(o: FrameOptions): SoftwareRenderOptions {
 /** True when a render with these options path traces (SOLID shading and wireframes rasterize). */
 export function pathTraces(o: Pick<FrameOptions, 'engine' | 'shading' | 'wireframe'>): boolean {
   return o.engine === 'PATHTRACER' && o.shading !== 'SOLID' && !o.wireframe;
+}
+
+/**
+ * Film > Transparent for rasterized renders. Core `renderSceneSoftware` reads
+ * `render.film_transparent` only in its path tracer: its rasterizer composites the world colour
+ * (or sky) unless the caller passes a `background`, so a transparent film is passed as a fully
+ * transparent background (alpha 0 where nothing is drawn, partial alpha at edges and glass).
+ */
+export function filmBackground(doc: SceneDoc, o: FrameOptions): Vec4Tuple | undefined {
+  if (o.background) return o.background;
+  if (pathTraces(o) || !doc.getRender().film_transparent) return undefined;
+  return [0, 0, 0, 0];
+}
+
+/**
+ * The input of a path traced render, set up exactly like core `renderSceneSoftware` does (render
+ * evaluation, visible geometry, camera precedence, depth of field, textures, orco).
+ */
+function pathTraceInput(
+  doc: SceneDoc,
+  evaluator: SceneEvaluator,
+  options: FrameOptions,
+): PathTraceRenderInput {
+  const width = Math.round(options.width);
+  const height = Math.round(options.height);
+  const opts = softwareOptions(options);
+  const scene = evaluator.evaluate(options.frame, { forRender: true });
+  const items = renderItems(scene, { forRender: true }).filter((o) => o.mesh.faces.length > 0);
+  const view = resolveView(doc, scene, opts, width / height, evaluatedBounds(items));
+  return {
+    scene,
+    items,
+    view,
+    camera: viewCameraData(doc, scene, opts),
+    width,
+    height,
+    images: new TextureCache(doc),
+    orco: (o) => evaluatedOrco(doc, scene, o.object, true),
+    options: opts,
+  };
 }
 
 export class RenderEngine {
@@ -215,24 +258,9 @@ export class RenderEngine {
   prepare(job: number, ref: DocRef, options: FrameOptions): PreparedInfo {
     const t0 = now();
     const { doc, evaluator } = this.documentFor(ref, options);
-    const width = Math.round(options.width);
-    const height = Math.round(options.height);
-    const opts = softwareOptions(options);
-    const scene = evaluator.evaluate(options.frame, { forRender: true });
+    const input = pathTraceInput(doc, evaluator, options);
     const setupMs = now() - t0;
-    const items = renderItems(scene, { forRender: true }).filter((o) => o.mesh.faces.length > 0);
-    const view = resolveView(doc, scene, opts, width / height, evaluatedBounds(items));
-    const prepared = preparePathTrace({
-      scene,
-      items,
-      view,
-      camera: viewCameraData(doc, scene, opts),
-      width,
-      height,
-      images: new TextureCache(doc),
-      orco: (o) => evaluatedOrco(doc, scene, o.object, true),
-      options: opts,
-    });
+    const prepared = preparePathTrace(input);
     this.tracers.set(job, new PathTracer(prepared.scene, prepared.settings));
     const s = prepared.settings;
     return {
@@ -244,7 +272,7 @@ export class RenderEngine {
       exposure: prepared.exposure,
       viewTransform: prepared.viewTransform,
       displayBackground: prepared.displayBackground ? ([...prepared.displayBackground] as Vec4Tuple) : null,
-      warnings: [...prepared.scene.warnings],
+      warnings: nameDegenerateTriangles(prepared.scene.warnings, input.items),
       prepareMs: now() - t0,
       setupMs,
     };
@@ -294,13 +322,24 @@ export class RenderEngine {
   image(ref: DocRef, options: FrameOptions, png = false): ImageResult {
     const { doc, evaluator } = this.documentFor(ref, options);
     let last: PathTraceProgress | undefined;
-    const img = renderSceneSoftware(doc, {
-      ...softwareOptions(options),
-      evaluator,
-      onProgress: (p) => {
-        last = p;
-      },
-    });
+    const onProgress = (p: PathTraceProgress) => {
+      last = p;
+    };
+    let img: { width: number; height: number; data: Uint8ClampedArray };
+    let warnings: string[] = [];
+    if (pathTraces(options)) {
+      // renderSceneSoftware's path tracing, with the warnings it does not return
+      const input = pathTraceInput(doc, evaluator, options);
+      const pt = renderPathTracedImage({ ...input, options: { ...input.options, onProgress } });
+      img = pt;
+      warnings = nameDegenerateTriangles(pt.stats.warnings ?? [], input.items);
+    } else
+      img = renderSceneSoftware(doc, {
+        ...softwareOptions(options),
+        background: filmBackground(doc, options),
+        evaluator,
+        onProgress,
+      });
     const out: ImageResult = png
       ? { width: img.width, height: img.height, png: encodePNG(img) }
       : { width: img.width, height: img.height, data: img.data };
@@ -310,6 +349,7 @@ export class RenderEngine {
         requested: last.total,
         stopped: last.samples < last.total ? 'time' : 'done',
       };
+    if (warnings.length) out.warnings = warnings;
     return out;
   }
 

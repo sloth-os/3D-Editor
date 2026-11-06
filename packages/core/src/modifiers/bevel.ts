@@ -12,7 +12,9 @@ import { mergeLoops } from './polymerge';
  * Edge mode: every selected edge becomes a strip of `segments` quads following a superellipse profile,
  * faces shrink away from beveled edges, and every affected vertex gets a patch polygon (fan-filled for
  * segments > 1). Where beveled and non-beveled edges meet, the new vertices slide along the non-beveled
- * edges and the neighbouring faces receive the extra vertices, so closed inputs stay closed.
+ * edges and the neighbouring faces receive the extra vertices, so closed inputs stay closed. A vertex
+ * where just two beveled edges meet with a single bevel vertex on each side (a cylinder rim, the middle
+ * of a beveled edge loop) needs no patch: like Blender's weld, both strips share one profile chain.
  * Vertex mode: corners are cut off at `width` along each incident edge.
  *
  * Limitations: only manifold vertices with a closed face fan are beveled (boundary and non-manifold
@@ -371,6 +373,43 @@ function bevelEdges(
     return arc;
   };
 
+  // --- welds (Blender's two-edge weld): where exactly two beveled edges meet and each side between them
+  // holds a single bevel vertex (a miter point inside a face, or one slide point on the only unbeveled edge
+  // there, e.g. every rim vertex of a cylinder or a vertex in the middle of a beveled edge loop), both
+  // strips end on the same two vertices. They share one profile chain bulging toward the original vertex
+  // and need no vertex patch; a patch there would fill the sliver between two slightly different arcs.
+  const welded = new Uint8Array(nv);
+  for (let v = 0; v < nv; v++) {
+    const ring = rings[v];
+    if (!ring) continue;
+    const bev = ring.eIn.filter((e) => isB[e]);
+    if (bev.length !== 2) continue;
+    const ends = bev.map((e) => {
+      const [fa, fb] = stripFace(e);
+      return [cornerVert.get(cornerOf(fa, v))!, cornerVert.get(cornerOf(fb, v))!];
+    });
+    const [[a1, b1], [a2, b2]] = ends;
+    if (a1 === b1 || !((a1 === a2 && b1 === b2) || (a1 === b2 && b1 === a2))) continue;
+    welded[v] = 1;
+    const arc = [a1];
+    if (S > 1) {
+      const pa = pos(a1);
+      const pb = pos(b1);
+      const C = [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]];
+      const ua = vertUV.get(a1) ?? [0, 0];
+      const ub = vertUV.get(b1) ?? [0, 0];
+      for (let j = 1; j < S; j++) {
+        const q = profilePoint(pa, pb, C, j / S, p.profile);
+        const idx = b.addVertex(q[0], q[1], q[2], colors, v);
+        vertUV.set(idx, [ua[0] + ((ub[0] - ua[0]) * j) / S, ua[1] + ((ub[1] - ua[1]) * j) / S]);
+        arc.push(idx);
+      }
+    }
+    arc.push(b1);
+    arcs.set(`${bev[0]}:${v}`, arc);
+    arcs.set(`${bev[1]}:${v}`, a2 === a1 ? arc : arc.slice().reverse());
+  }
+
   // --- original faces (shrunk), with slide points inserted along non-beveled edges
   const faceIndex: number[] = [];
   for (let f = 0; f < m.faces.length; f++) {
@@ -437,7 +476,7 @@ function bevelEdges(
   // --- vertex patches
   for (let v = 0; v < nv; v++) {
     const ring = rings[v];
-    if (!ring || !ring.eIn.some((e) => isB[e])) continue;
+    if (!ring || welded[v] || !ring.eIn.some((e) => isB[e])) continue;
     const n = ring.faces.length;
     const seq: number[] = [];
     const push = (x: number) => {
@@ -666,7 +705,9 @@ export const bevelModifier: ModifierDef<typeof schema> = {
   description:
     'Rounds or chamfers edges (or vertices): edges sharper than `angle_limit` (or all with limit_method NONE) are ' +
     'replaced by a strip of `segments` faces following `profile` (0.5 = round), offset by `width` into the adjacent ' +
-    'faces; corners get patch faces. affect=VERTICES cuts off corners instead. Closed manifold input stays closed. ' +
+    'faces; corners where three or more beveled edges meet get patch faces, while two beveled edges meeting (e.g. ' +
+    'the rim of a cylinder) continue into each other with one shared profile (all quads, like Blender). ' +
+    'affect=VERTICES cuts off corners instead. Closed manifold input stays closed. ' +
     'Limitation: boundary / non-manifold vertices are not beveled.',
   schema,
   apply(mesh, p) {

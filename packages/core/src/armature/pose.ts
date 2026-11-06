@@ -9,7 +9,7 @@ import {
   type BoneConstraintTarget,
   type IkParams,
 } from './bone-constraints';
-import { solveIk, type IkBone, type IkChain } from './ik';
+import { ikSettingsOf, solveIk, type IkBone, type IkBoneSettings, type IkChain } from './ik';
 
 /*
  * Pose evaluation. Every bone gets a rest matrix (from head/tail/roll) and a posed matrix
@@ -47,6 +47,8 @@ interface Node {
   basis: Mat4;
   /** Active constraints (not muted, positive influence). */
   constraints: ConstraintData[];
+  /** IK locks, limits and stiffness (null: none). */
+  ik: IkBoneSettings | null;
 }
 
 interface ChainSpec {
@@ -252,6 +254,7 @@ class PoseEvaluator implements PoseEvaluation {
       offset,
       basis: compose4(loc as Vec3, rot, scl),
       constraints,
+      ik: ikSettingsOf(pb, (m) => this.error(`pose bone "${name}": ${m}`)),
     };
   }
 
@@ -434,7 +437,8 @@ class PoseEvaluator implements PoseEvaluation {
       const frame = parentM ? multiply4(parentM, n.offset) : n.rest;
       const m = this.constrain(n, multiply4(frame, n.basis), frame);
       fk.push(m);
-      bones.push({ matrix: m, length: n.length, parent: pj ?? -1 });
+      // IK limits are measured from the rest frame (relative to the parent when it is solved too)
+      bones.push({ matrix: m, length: n.length, parent: pj ?? -1, restFrame: pj !== undefined ? n.offset : frame, ik: n.ik });
     }
     // goals
     const chains: IkChain[] = [];

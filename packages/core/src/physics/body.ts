@@ -2,7 +2,7 @@ import type { Quat, Vec3 } from '../math/types';
 import type { CollisionShape } from '../doc/types';
 import type { MotionMode } from './settings';
 import type { Shape } from './shapes';
-import { boundingRadius, coreRadius, shapeBounds } from './shapes';
+import { boundingRadius, coreRadius, shapeBounds, thinHalfExtent } from './shapes';
 import { invert3, quatToMat3, rotateTensor, type Mat3 } from './vmath';
 
 /*
@@ -44,6 +44,8 @@ export class Body {
   /** Core radius (spheres / capsules) and radius of an origin-centred bounding sphere. */
   readonly radius: number;
   readonly boundingRadius: number;
+  /** Half thickness in the thinnest direction (Infinity for triangle meshes), see `thinHalfExtent`. */
+  readonly thinHalf: number;
   /** Body-space bounds of the shape (for the narrow phase against triangle meshes). */
   readonly localMin: Vec3;
   readonly localMax: Vec3;
@@ -103,6 +105,7 @@ export class Body {
     this.unitInertia = init.unitInertia;
     this.radius = coreRadius(init.shape);
     this.boundingRadius = boundingRadius(init.shape);
+    this.thinHalf = thinHalfExtent(init.shape);
     const b = shapeBounds(init.shape);
     this.localMin = b.min;
     this.localMax = b.max;

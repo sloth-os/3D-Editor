@@ -16,7 +16,20 @@ const createBody = z.object({
 });
 const renameBody = z.object({ name: z.string().trim().min(1).max(200) });
 const idParams = z.object({ id: z.string() });
-const exportQuery = z.object({ format: z.enum(EXPORT_FORMATS).default('glb') });
+/**
+ * Options of GET /api/projects/:id/export (the same as the MCP export_scene tool, whose download
+ * link carries them): `objects` (comma-separated ids or names; default every object shown in
+ * renders), `apply_modifiers` (default true) and `frame` (default the scene's frame_start).
+ */
+const exportQuery = z.object({
+  format: z.enum(EXPORT_FORMATS).default('glb'),
+  objects: z.string().optional(),
+  apply_modifiers: z
+    .enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])
+    .transform((v) => ['true', '1', 'yes', 'on'].includes(v))
+    .optional(),
+  frame: z.coerce.number().optional(),
+});
 const queryBool = z
   .enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])
   .transform((v) => ['true', '1', 'yes', 'on'].includes(v));
@@ -139,14 +152,35 @@ export function registerProjectRoutes(
   app.get('/api/projects/:id/export', async (request, reply) => {
     const { id } = idParams.parse(request.params);
     const q = exportQuery.safeParse(request.query);
-    if (!q.success) return badRequest(reply, `format must be one of ${EXPORT_FORMATS.join(', ')}`);
+    if (!q.success)
+      return badRequest(
+        reply,
+        q.error.issues.some((i) => i.path[0] === 'format')
+          ? `format must be one of ${EXPORT_FORMATS.join(', ')}`
+          : q.error,
+      );
     const room = await roomOr404(id, reply);
     if (!room) return reply;
+    let objectIds: string[] | undefined;
+    if (q.data.objects !== undefined) {
+      const refs = q.data.objects
+        .split(',')
+        .map((r) => r.trim())
+        .filter(Boolean);
+      const missing = refs.filter((r) => !room.scene.resolveObject(r));
+      if (missing.length) return reply.code(400).send({ error: `objects not found: ${missing.join(', ')}` });
+      objectIds = refs.map((r) => room.scene.resolveObject(r)!.id);
+    }
     try {
       const result = await withSpan(
         'project.export',
         { 'project.id': id, 'export.format': q.data.format },
-        () => exportScene(room.scene, q.data.format as ExportFormat),
+        () =>
+          exportScene(room.scene, q.data.format as ExportFormat, {
+            objectIds,
+            applyModifiers: q.data.apply_modifiers,
+            frame: q.data.frame,
+          }),
       );
       return reply
         .header('content-type', result.mime)

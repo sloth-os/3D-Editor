@@ -71,6 +71,9 @@ const CAMERA = { at: [15.5, -36, 3.3], target: [8, 6, 8.6], lens: 26 };
 // A low sun behind the camera's right shoulder warms the lighthouse; the sky ahead is the pink and
 // violet twilight side, where the beams show best.
 const SUN = { elevation: 0.04, rotation: 4.22 };
+// Light mist: 95 % at 800 m, so the island (30–60 m away) stays clear while the far sea and the
+// clouds (700–1000 m) fade into the lavender twilight haze.
+const MIST = { distance: 800, color: [0.6, 0.45, 0.5] };
 // Two opposite beams turn half a revolution in FRAMES frames → a seamless loop of the pair.
 const FRAMES = 24;
 // Beam A heading at frame 1 (radians about Z, counter-clockwise from +Y, like the sun azimuth).
@@ -78,6 +81,13 @@ const FRAMES = 24;
 const BEAM_PHASE = 1.43;
 const BEAM_TILT = 0.035; // beams dip slightly below the horizontal
 const SHAFT = { start: 1.3, length: 30 }; // visible shaft: from just outside the lantern glass
+// Scattered vegetation and rocks (object.scatter_add on the island, density from vertex groups).
+const SCATTERS = [
+  { name: 'Pines', objects: ['Pine A', 'Pine B', 'Pine C'], vertex_group: 'Trees', count: 40, seed: 11, min_distance: 2.6, size_random: 0.35, align_to_normal: false },
+  { name: 'Rocks', objects: ['Rock A', 'Rock B', 'Rock C'], vertex_group: 'Rocks', count: 100, seed: 5, min_distance: 1.3, size_random: 0.65, rotation_random: 0.25, align_to_normal: true },
+  { name: 'Grass Tufts', objects: ['Tuft A', 'Tuft B'], vertex_group: 'Grass', count: 2600, seed: 3, min_distance: 0.32, size_random: 0.5, align_to_normal: true },
+  { name: 'Bushes', objects: ['Bush A'], vertex_group: 'Bushes', count: 30, seed: 7, min_distance: 2.2, size_random: 0.45, align_to_normal: false },
+];
 
 // ---------------------------------------------------------------------------------------------
 // MCP helpers
@@ -243,6 +253,14 @@ async function createProject() {
 const N = TERRAIN.sub + 1;
 const CELL = TERRAIN.size / TERRAIN.sub;
 let ground; // { vertices, faces } of the final island mesh (object space = world space)
+let dryBeach; // per face: 1 = beach sand above the waterline (no rocks or grass are scattered there)
+let nearBeach; // per vertex: 1 = corner of a dry beach face
+/** Index of the island grid face under (x, y). */
+const faceAt = (x, y) => {
+  const i = Math.floor(clamp((x + TERRAIN.size / 2) / CELL, 0, TERRAIN.sub - 1e-6));
+  const j = Math.floor(clamp((y + TERRAIN.size / 2) / CELL, 0, TERRAIN.sub - 1e-6));
+  return j * TERRAIN.sub + i;
+};
 function heightAt(x, y) {
   const fi = clamp((x + TERRAIN.size / 2) / CELL, 0, TERRAIN.sub - 1e-6);
   const fj = clamp((y + TERRAIN.size / 2) / CELL, 0, TERRAIN.sub - 1e-6);
@@ -310,7 +328,7 @@ async function buildIsland() {
     wet: [0.32, 0.25, 0.17],
   };
   const housePad = (p) => Math.max(Math.abs(p[0] - HOUSE.x) - HOUSE.w / 2, Math.abs(p[1] - HOUSE.y) - HOUSE.d / 2, 0);
-  const W = []; // per vertex {sand, rock}
+  const W = []; // per vertex {sand, rock, h}
   const colors = [];
   for (let j = 0; j < N; j++)
     for (let i = 0; i < N; i++) {
@@ -329,7 +347,7 @@ async function buildIsland() {
       c = mix(c, COL.earth, worn * 0.8);
       c = mix(c, mix(COL.rock, [0.3, 0.28, 0.25], 0.5 + 0.5 * n1), rock);
       c = mix(c, mix(COL.sand, COL.wet, smooth(0.15, 0.0, h)), sand);
-      W.push({ sand, rock });
+      W.push({ sand, rock, h });
       colors.push(c);
     }
   // Paint them: one small dab per vertex (radius below the 0.5 m grid spacing, strength 1), with
@@ -363,6 +381,17 @@ async function buildIsland() {
     slots[sand > 0.5 ? 2 : rock > 0.5 ? 1 : 0].push(k);
   });
   log(`ground slots: ${slots[0].length} ground, ${slots[1].length} rock, ${slots[2].length} sand faces`);
+  // The dry beach: sand faces with a corner above the waterline. Their corners get no scatter
+  // density, so no rock or grass tuft can land on them (rocks still stand in the shallows).
+  dryBeach = new Uint8Array(ground.faces.length);
+  nearBeach = new Uint8Array(ground.vertices.length);
+  for (const k of slots[2]) {
+    if (ground.faces[k].some((v) => W[v].h > 0)) {
+      dryBeach[k] = 1;
+      for (const v of ground.faces[k]) nearBeach[v] = 1;
+    }
+  }
+  log(`dry beach: ${dryBeach.reduce((s, x) => s + x, 0)} faces`);
   for (const [index, faces] of slots.entries()) {
     if (index === 0) continue; // faces start in slot 0
     await tool('edit_mesh', { object: 'Island', operator: 'object.material_slot_assign', params: { index }, selection: { faces, all: false }, select_mode: 'FACE' });
@@ -734,12 +763,13 @@ async function buildVegetation() {
       const dLH = Math.hypot(p[0] - LH[0], p[1] - LH[1]);
       const dSign = Math.hypot(p[0] - SIGN.at[0], p[1] - SIGN.at[1]);
       const land = smooth(SEA + 0.5, SEA + 1.0, z);
-      const clear = smooth(1.1, 1.8, dPath) * smooth(0.6, 1.5, dHouse) * smooth(2.8, 3.6, dLH) * smooth(0.8, 1.5, dSign);
+      const offBeach = 1 - nearBeach[j * N + i]; // nothing on the dry beach
+      const clear = smooth(1.1, 1.8, dPath) * smooth(0.6, 1.5, dHouse) * smooth(2.8, 3.6, dLH) * smooth(0.8, 1.5, dSign) * offBeach;
       // trees: the western hill and the northern slopes; keep the cove, the cottage front and the headland open
       const west = smooth(4, -6, p[0]) + smooth(12, 20, p[1]) * smooth(10, 4, p[0]);
       const treeClear = smooth(2.5, 4.5, dPath) * smooth(3, 6, dHouse) * smooth(6, 9, dLH);
-      groups.Trees.push(clamp(land * smooth(SEA + 1.2, SEA + 2.4, z) * treeClear * clamp(west) * smooth(0.75, 0.85, nz)));
-      // rocks: the shoreline band and steep ground
+      groups.Trees.push(clamp(land * smooth(SEA + 1.2, SEA + 2.4, z) * treeClear * clamp(west) * smooth(0.75, 0.85, nz) * offBeach));
+      // rocks: the shoreline band (standing in the shallows, not on the dry beach) and steep ground
       const shore = smooth(SEA - 0.4, SEA, z) * smooth(SEA + 1.2, SEA + 0.5, z);
       groups.Rocks.push(clamp((0.55 * shore + smooth(0.86, 0.72, nz) + 0.04) * clear));
       const dune = smooth(SEA + 0.25, SEA + 0.6, z) * smooth(SEA + 1.4, SEA + 0.8, z); // just above the sand
@@ -754,10 +784,7 @@ async function buildVegetation() {
     if (r.errors?.length) throw new Error(`scatter ${name}: ${r.errors.join('; ')}`);
     log(`scatter ${name}: ${r.particles} particles, ${r.instances} instances`);
   };
-  await scatter('Pines', ['Pine A', 'Pine B', 'Pine C'], { count: 40, seed: 11, min_distance: 2.6, size: 1, size_random: 0.35, align_to_normal: false, vertex_group: 'Trees' });
-  await scatter('Rocks', ['Rock A', 'Rock B', 'Rock C'], { count: 110, seed: 5, min_distance: 1.3, size: 1, size_random: 0.65, rotation_random: 0.25, align_to_normal: true, vertex_group: 'Rocks' });
-  await scatter('Grass Tufts', ['Tuft A', 'Tuft B'], { count: 2600, seed: 3, min_distance: 0.32, size: 1, size_random: 0.5, align_to_normal: true, vertex_group: 'Grass' });
-  await scatter('Bushes', ['Bush A'], { count: 30, seed: 7, min_distance: 2.2, size: 1, size_random: 0.45, align_to_normal: false, vertex_group: 'Bushes' });
+  for (const { name, objects, ...settings } of SCATTERS) await scatter(name, objects, { size: 1, ...settings });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -775,7 +802,7 @@ async function buildWorldAndCamera() {
     ground_color: [0.08, 0.06, 0.06],
   });
   log(`sky: sun dir ${sky.sun_direction.map((v) => v.toFixed(2))}, irradiance ${sky.sun_irradiance.map((v) => v.toFixed(2))}`);
-  await op('world.mist_set', { distance: 800, color: [0.6, 0.45, 0.5] });
+  await op('world.mist_set', { distance: MIST.distance, color: MIST.color });
   // Thin cloud streaks low over the horizon and one high wisp, catching the last pink light. Each is
   // generated small (marching cubes need a sensible aspect ratio) and stretched by its object scale.
   const view = [CAMERA.target[0] - CAMERA.at[0], CAMERA.target[1] - CAMERA.at[1]];
@@ -793,7 +820,14 @@ async function buildWorldAndCamera() {
     const at = [CAMERA.at[0] + fwd[0] * c.d + right[0] * c.side, CAMERA.at[1] + fwd[1] * c.d + right[1] * c.side, c.z];
     await op('object.generate_cloud', { name: `Cloud ${k + 1}`, size: c.size, puffs: 20, smoothness: 0.3, resolution: 64, seed: c.seed, location: at, scale: c.scale, rotation: [0, 0, Math.atan2(fwd[1], fwd[0]) + Math.PI / 2 + c.yaw] });
   }
-  for (let k = 1; k <= clouds.length; k++) await material(`Cloud ${k}`, { name: 'Cloud Pink', base_color: [0.95, 0.76, 0.78, 1], roughness: 1 });
+  // At 700–1000 m the mist covers 90–99 % of a cloud's own shading, so the clouds simply glow in
+  // the mist colour (black base, emission = mist colour). That also keeps them unchanged behind
+  // the beam shafts: the path tracer evaluates the mist at the first surface a camera ray hits,
+  // which there is the shaft glass a few metres away, so lit clouds would lose their mist and
+  // show up dark brown through a passing beam.
+  for (let k = 1; k <= clouds.length; k++) {
+    await material(`Cloud ${k}`, k === 1 ? { name: 'Cloud Haze', base_color: [0, 0, 0, 1], roughness: 1, emission_color: MIST.color, emission_strength: 1 } : { material: 'Cloud Haze' });
+  }
   await add('empty', 'Camera Target', { location: CAMERA.target, params: { type: 'SPHERE' } });
   await add('camera', 'Camera', { location: CAMERA.at, params: { lens: CAMERA.lens, clip_end: 2000 } });
   const c = await op('object.constraint_add', { object: 'Camera', type: 'TRACK_TO', target: 'Camera Target', params: { track_axis: 'TRACK_NEGATIVE_Z', up_axis: 'UP_Y' } });
@@ -849,6 +883,37 @@ async function check() {
   const angle = (Math.acos(clamp((f[0] * to[0] + f[1] * to[1] + f[2] * to[2]) / tl, -1, 1)) * 180) / Math.PI;
   log(`  camera: ${(cam.constraints ?? []).map((c) => `${c.type} → ${(c.targets ?? []).join(', ')}`).join(', ')}; aims ${angle.toFixed(3)}° off the target`);
   if (angle > 0.1) throw new Error(`camera does not aim at its target (${angle}°)`);
+
+  // Scatter placement. Instances have no positions of their own in the MCP results, so each
+  // particle system is made real for a moment: one batch shows only that system and runs
+  // object.duplicates_make_real, get_scene lists the new objects, and undo reverts the batch.
+  // The 2,600 grass tufts are left out: making them real roughly doubles the server's memory
+  // (see the README). They follow the same density rules (zero weight on the dry beach).
+  const pathLine = resample(PATH_WAYPOINTS, 0.25);
+  for (const sc of SCATTERS.filter((x) => x.count <= 500)) {
+    const res = await ops([
+      ...SCATTERS.map((o) => ({ operator: 'object.particle_system_update', params: { object: 'Island', particle_system: o.name, show_viewport: o === sc, show_render: o === sc } })),
+      { operator: 'object.duplicates_make_real', params: { objects: ['Island'] } },
+    ]);
+    const made = new Set(res.at(-1).objects);
+    const listed = await tool('get_scene', { max_objects: 5000 });
+    const u = await tool('undo', {});
+    if (u.undone !== 1) throw new Error(`undo after the ${sc.name} placement check: ${JSON.stringify(u)}`);
+    const pts = listed.objects.filter((o) => made.has(o.id)).map((o) => o.location);
+    if (pts.length !== made.size) throw new Error(`${sc.name}: ${made.size} objects made real, ${pts.length} listed`);
+    let closest = Infinity;
+    for (let a = 0; a < pts.length; a++)
+      for (let b = a + 1; b < pts.length; b++) closest = Math.min(closest, Math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1], pts[a][2] - pts[b][2]));
+    const onPath = pts.filter((q) => distToPolyline(q, pathLine) < 0.75).length; // the path is 1.5 m wide
+    const onBeach = pts.filter((q) => dryBeach[faceAt(q[0], q[1])]).length;
+    const inSea = pts.filter((q) => q[2] < SEA).length;
+    log(`  ${sc.name}: ${pts.length} placed, closest pair ${closest.toFixed(2)} m (min_distance ${sc.min_distance}), on the path ${onPath}, on the dry beach ${onBeach}, in the shallows ${inSea}`);
+    if (closest < sc.min_distance - 1e-3 || onPath || onBeach) throw new Error(`${sc.name} placement check failed`);
+  }
+  const after = await tool('get_scene', { max_objects: 1 });
+  if (after.counts.objects !== s.counts.objects || after.counts.instances !== s.counts.instances) {
+    throw new Error(`the placement checks changed the scene: ${JSON.stringify(after.counts)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------

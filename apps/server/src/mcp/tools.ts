@@ -31,6 +31,7 @@ import {
   type ObjectData,
   type OperatorInfo,
   type OperatorRegistry,
+  type RunResult,
   type SelectMode,
   type Vec3,
 } from '@3d-editor/core';
@@ -43,7 +44,14 @@ import { RpcError } from '../sync/room';
 import { isNotImplemented, safeFileName } from '../api/projects';
 import { persistenceNote } from '../persistence';
 import { ToolError, type AgentProject, type AgentSession } from './agent';
-import { DEFAULT_MAX_OBJECTS, describeObject, round, roundVec, summarizeScene } from './scene-summary';
+import {
+  DEFAULT_MAX_OBJECTS,
+  describeObject,
+  round,
+  roundVec,
+  sceneSettingsAt,
+  summarizeScene,
+} from './scene-summary';
 import {
   addModifier,
   applyModifier,
@@ -64,6 +72,7 @@ import {
   unsetProceduralParam,
 } from './keyframes';
 import { findOperatorGroup, operatorGroupNames, toolOnlyOperator } from './operator-groups';
+import { strictArgObject, strictToolSchema } from './strict-args';
 import type { AnimationOutput, FrameOptions, Renderer } from '../render';
 import type { RenderStore, StoredFile } from '../render/store';
 import {
@@ -111,20 +120,20 @@ const projectArg = z.string().min(1).describe('Project id or exact project name 
 const objectArg = z.string().min(1).describe('Object id or exact object name');
 const objectList = z.array(z.string().min(1)).min(1).describe('Object ids or exact names');
 const selectModeEnum = z.enum(['VERT', 'EDGE', 'FACE']);
-const meshSelectionSchema = z
-  .object({
-    verts: z.array(z.number().int().min(0)).optional().describe('Vertex indices'),
-    edges: z
-      .array(z.tuple([z.number().int().min(0), z.number().int().min(0)]))
-      .optional()
-      .describe('Edges as [vertexA, vertexB] pairs'),
-    faces: z.array(z.number().int().min(0)).optional().describe('Face indices'),
-    all: z
-      .boolean()
-      .optional()
-      .describe('Select everything (true) or nothing (false) before applying the lists'),
-  })
-  .describe('Edit-mode element selection');
+const meshSelectionShape = {
+  verts: z.array(z.number().int().min(0)).optional().describe('Vertex indices'),
+  edges: z
+    .array(z.tuple([z.number().int().min(0), z.number().int().min(0)]))
+    .optional()
+    .describe('Edges as [vertexA, vertexB] pairs'),
+  faces: z.array(z.number().int().min(0)).optional().describe('Face indices'),
+  all: z
+    .boolean()
+    .optional()
+    .describe('Select everything (true) or nothing (false) before applying the lists'),
+};
+// nested argument objects are closed like the tools' arguments (see strict-args.ts)
+const meshSelectionSchema = strictArgObject(meshSelectionShape).describe('Edit-mode element selection');
 
 const READ_ONLY: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
 const EDIT: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
@@ -281,6 +290,13 @@ function inferSelectMode(
   return 'VERT';
 }
 
+/** Kind of an operator failure (see core OperatorError); failures that are not OperatorErrors are FAILED. */
+type OperatorErrorCode = NonNullable<RunResult['code']>;
+
+function errorCode(res: RunResult): OperatorErrorCode {
+  return res.code ?? 'FAILED';
+}
+
 function editDistance(a: string, b: string): number {
   const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
   for (let i = 1; i <= a.length; i++) {
@@ -365,9 +381,15 @@ function decodeRenderResult(
 export function registerTools(server: McpServer, ctx: ToolContext): void {
   const { agent, rooms, registry, metrics, log, renderer, renderStore } = ctx;
 
+  /**
+   * Registers a tool. Its arguments are strict: unknown or misspelled argument names (also inside
+   * nested argument objects) fail the call with suggestions and the valid names, and the input
+   * schema in tools/list is closed. `argsHint` is added to that error when an unknown argument is
+   * not a typo of a valid one (e.g. that operator parameters belong in `params`).
+   */
   function tool<S extends z.ZodRawShape>(
     name: string,
-    meta: { title: string; description: string; annotations?: ToolAnnotations },
+    meta: { title: string; description: string; annotations?: ToolAnnotations; argsHint?: string },
     shape: S,
     handler: (args: z.output<z.ZodObject<S>>, extra: ToolExtra) => Promise<ToolOutput> | ToolOutput,
   ): void {
@@ -400,10 +422,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         end();
       }
     };
-    server.registerTool(
+    const inputSchema = strictToolSchema(shape, { tool: name, hint: meta.argsHint });
+    server.registerTool<z.ZodRawShape, typeof inputSchema>(
       name,
-      { title: meta.title, description: meta.description, inputSchema: shape, annotations: meta.annotations },
-      cb as unknown as ToolCallback<S>,
+      { title: meta.title, description: meta.description, inputSchema, annotations: meta.annotations },
+      cb as unknown as ToolCallback<typeof inputSchema>,
     );
   }
 
@@ -525,7 +548,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get scene',
       description:
-        "Describe the whole scene at a frame. Values are the EVALUATED ones at that frame, like Blender's properties: keyframed, driven and F-curve-modified location / rotation_euler (radians, also in degrees) / scale, shape key values, constraint influences, pose channels, light / camera / curve / world settings; where animation overrides the value stored in the document (what transform_object or the *.properties_set operators change), the stored value is listed too (`stored`, `stored_value`, `stored_influence`). Contents: counts (objects by type; vertices / faces = BASE mesh data of mesh objects before modifiers, curves and text not included; evaluated {vertices, faces, triangles} = what renders: after shape keys, modifiers, curve bevels and text, instances not included; instances and instance_triangles = particle / collection instances of renders), every object (id, name, type, parent, collection, transform, world-space bounds after modifiers, armature deformation, constraints and physics, data summary: mesh vertex/face counts (base and evaluated) with shape keys and vertex groups, curve splines/points/bevel/extrude, text body, armature bones with parents and pose_position, light (datablock name, type, energy, colour, size/shape, spot), camera (lens, clipping, dof_use); material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, modifiers, poses, curves, instancing, physics) with object names so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object and get_mesh_data for vertex positions. Units: meters, Z up.",
+        "Describe the whole scene at a frame. Values are the EVALUATED ones at that frame, like Blender's properties: keyframed, driven and F-curve-modified location / rotation_euler (radians, also in degrees) / scale, shape key values, constraint influences, pose channels, light / camera / curve / world settings; where animation overrides the value stored in the document (what transform_object or the *.properties_set operators change), the stored value is listed too (`stored`, `stored_value`, `stored_influence`). Contents: counts (objects by type; vertices / faces = BASE mesh data of mesh objects before modifiers, curves and text not included; evaluated {vertices, faces, triangles} = the geometry renders show: after shape keys, modifiers with their RENDER settings (SUBSURF render_levels, SCREW render_steps, show_render), curve bevels (render_resolution_u) and text, instances not included; evaluated_viewport = the same with the viewport settings, only listed when the viewport shows other geometry; instances and instance_triangles = particle / collection instances of renders, viewport_instances when the viewport shows fewer), every object (id, name, type, parent, collection, transform, world-space bounds of the render geometry after modifiers, armature deformation, constraints and physics (wire curves: of their wire), data summary: mesh vertex/face counts (base, evaluated = render, evaluated_viewport when it differs) with shape keys and vertex groups, curve splines/points/fill_mode/bevel/extrude, text body, armature bones with parents and pose_position, light (datablock name, type, energy, colour, size/shape, spot), camera (lens, clipping, dof_use); material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, modifiers, poses, curves, instancing, physics) with object names so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object and get_mesh_data for vertex positions. Evaluations are cached per document state and frame, so repeated get_scene / get_object calls (e.g. checking motion at many frames) are cheap until the scene changes. Units: meters, Z up.",
       annotations: READ_ONLY,
     },
     {
@@ -554,10 +577,14 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get object',
       description:
-        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds, parent (and parent bone) and children, data (mesh statistics base and evaluated, shape keys with values, vertex groups with assigned vertex counts; curve settings and spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts, rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. Vertex positions and faces: get_mesh_data.',
+        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds of the render geometry (wire curves: their wire), parent (and parent bone) and children, data (mesh statistics base and evaluated = what renders show (render settings of the modifiers: SUBSURF render_levels, SCREW render_steps, show_render), plus evaluated_viewport when the viewport shows other geometry; shape keys with values, vertex groups with assigned vertex counts; every curve shape setting (fill_mode, bevel_mode/depth/resolution/object, bevel_factor, extrude, offset, use_fill_caps, twist_mode, resolution_u, render_resolution_u, path settings) and the spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts, rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. Vertex positions and faces: get_mesh_data. Evaluations are cached per document state and frame: checking many objects or frames is cheap.',
       annotations: READ_ONLY,
     },
-    { project: projectArg, object: objectArg, frame: z.number().optional() },
+    {
+      project: projectArg,
+      object: objectArg,
+      frame: z.number().optional().describe("Frame to evaluate (default: the agent's current frame)"),
+    },
     async ({ project, object, frame }) => {
       const p = await agent.project(project);
       return describeObject(p.scene, requireObject(p, object), frame ?? p.state.frame);
@@ -708,17 +735,17 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
 
   // ---------------------------------------------------------------- generic operator execution
 
-  const selectionSchema = z
-    .object({
-      objects: z
-        .array(z.string())
-        .optional()
-        .describe('Objects to select (ids or names); replaces the selection'),
-      active: z.string().optional().describe('Active object (id or name); defaults to the last selected'),
-      mode: z.enum(['OBJECT', 'EDIT']).optional().describe('Interaction mode; EDIT edits the active mesh'),
-      mesh: meshSelectionSchema.extend({ select_mode: selectModeEnum.optional() }).optional(),
-    })
-    .describe("Selection/mode to set before running (persists for the agent's next calls)");
+  const selectionSchema = strictArgObject({
+    objects: z
+      .array(z.string())
+      .optional()
+      .describe('Objects to select (ids or names); replaces the selection'),
+    active: z.string().optional().describe('Active object (id or name); defaults to the last selected'),
+    mode: z.enum(['OBJECT', 'EDIT']).optional().describe('Interaction mode; EDIT edits the active mesh'),
+    mesh: strictArgObject({ ...meshSelectionShape, select_mode: selectModeEnum.optional() })
+      .optional()
+      .describe('Edit-mode element selection of the active mesh (with mode EDIT)'),
+  }).describe("Selection/mode to set before running (persists for the agent's next calls)");
 
   function applySelection(p: AgentProject, sel: z.infer<typeof selectionSchema> | undefined): void {
     if (!sel) return;
@@ -751,8 +778,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Run operator',
       description:
-        "Execute any operator by id with JSON parameters (see list_operators), as one undo step. Operators act on the agent's own selection like in Blender: use `selection` to choose objects, the active object and the mode (EDIT + mesh element selection for mesh.* operators) before running. Returns the operator result, reports and the resulting selection.",
+        "Execute any operator by id with JSON parameters (see list_operators), as one undo step. Operators act on the agent's own selection like in Blender: use `selection` to choose objects, the active object and the mode (EDIT + mesh element selection for mesh.* operators) before running. Returns {ok, operator, result, reports, duration_ms, selection}. A failure is an error result whose first line is the message, followed by that JSON with `error` and `code`: INVALID_PARAMS (unknown, misspelled or invalid parameters: fix params), POLL_FAILED (wrong mode, selection or object type, or not available here: change the selection/mode), NOT_FOUND (an unknown operator, object or datablock) or FAILED (the operator itself failed).",
       annotations: EDIT,
+      argsHint:
+        "Operator parameters go inside `params` (run_operator {project, operator, params: {…}, selection}); list_operators {search} gives each operator's parameters.",
     },
     {
       project: projectArg,
@@ -765,15 +794,22 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     async ({ project, operator, params, selection }) => {
       const p = await agent.project(project);
+      // refusals carry an operator error code like operator failures, so agents can branch on it
+      const refuse = (error: string, code: OperatorErrorCode) =>
+        failure(error, { ok: false, operator, error, code });
       if (!registry.has(operator))
-        throw new ToolError(
+        return refuse(
           `Unknown operator '${operator}'.${suggestOperators(registry, operator)} Use list_operators.`,
+          'NOT_FOUND',
         );
       const def = registry.get(operator)!;
       if (def.uiOnly)
-        throw new ToolError(`'${operator}' is only available in the browser editor UI (try editor_command).`);
+        return refuse(
+          `'${operator}' is only available in the browser editor UI (try editor_command).`,
+          'POLL_FAILED',
+        );
       const refused = toolOnlyOperator(operator);
-      if (refused) throw new ToolError(refused);
+      if (refused) return refuse(refused, 'FAILED');
       applySelection(p, selection);
       const res = p.run(operator, params ?? {});
       p.publishPresence();
@@ -781,6 +817,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         ok: res.ok,
         operator,
         result: res.result ?? null,
+        ...(res.ok ? {} : { error: res.error ?? 'unknown error', code: errorCode(res) }),
         reports: res.reports,
         duration_ms: round(res.durationMs, 2),
         selection: selectionSummary(p),
@@ -795,17 +832,26 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Run several operators',
       description:
-        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns per operation {operator, ok, result | error, reports} — `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR.",
+        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns per operation {operator, ok, result | error + code, reports} — `code` is INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED as in run_operator; `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR.",
       annotations: EDIT,
+      argsHint:
+        'Each operation is {operator, params} inside `operations` (batch {project, operations: [{operator, params: {…}}, …], stop_on_error}).',
     },
     {
       project: projectArg,
       operations: z
         .array(
-          z.object({ operator: z.string().min(1), params: z.record(z.string(), z.unknown()).optional() }),
+          strictArgObject({
+            operator: z.string().min(1).describe("Operator id, e.g. 'object.modifier_add'"),
+            params: z
+              .record(z.string(), z.unknown())
+              .optional()
+              .describe('Operator parameters (defaults are applied)'),
+          }),
         )
         .min(1)
-        .max(200),
+        .max(200)
+        .describe('Operations in order: [{operator, params}, …]'),
       stop_on_error: z.boolean().default(true),
     },
     async ({ project, operations, stop_on_error }) => {
@@ -814,12 +860,18 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       let failed = 0;
       p.step(() => {
         for (const op of operations) {
-          const refused = registry.has(op.operator)
+          const known = registry.has(op.operator);
+          const refused = known
             ? toolOnlyOperator(op.operator)
             : `unknown operator${suggestOperators(registry, op.operator)}`;
           if (refused) {
             failed++;
-            results.push({ operator: op.operator, ok: false, error: refused });
+            results.push({
+              operator: op.operator,
+              ok: false,
+              error: refused,
+              code: known ? 'FAILED' : 'NOT_FOUND',
+            });
             if (stop_on_error) break;
             continue;
           }
@@ -827,7 +879,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           results.push({
             operator: op.operator,
             ok: res.ok,
-            ...(res.ok ? { result: res.result ?? null } : { error: res.error }),
+            ...(res.ok ? { result: res.result ?? null } : { error: res.error, code: errorCode(res) }),
             // warnings and info the operator reported (like run_operator's `reports`)
             ...(res.reports.length ? { reports: res.reports } : {}),
           });
@@ -863,6 +915,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description:
         "Add a primitive or object: cube, plane, grid, circle, uv_sphere, ico_sphere, cylinder, cone, torus (meshes), bezier_curve, bezier_circle, nurbs_path (curves), text, armature, empty, camera or light. Placed at `location` (default: world origin) with optional rotation (radians) or rotation_degrees and scale. Type specific `params` follow Blender's operators (see list_operators for the exact schema: unknown parameters are rejected), e.g. cube {size}, uv_sphere {segments, ring_count, radius}, cylinder {vertices, radius, depth}, torus {major_radius, minor_radius}, curves {radius, bevel_depth, extrude}, text {body, size, extrude, align_x}, armature {bone_name}, camera {lens, clip_end, dof_use, dof_focus_distance, dof_aperture_fstop …}, light {energy (W; W/m² for SUN), color, radius, shape: SQUARE | RECTANGLE | DISK | ELLIPSE, size, size_y, spot_size, spot_blend, shadow_soft_size …} with light_type POINT | SUN | SPOT | AREA. Light and camera data are changed afterwards with run_operator light.properties_set / camera.properties_set {object: name, …the same fields}. Empty {type: PLAIN_AXES|ARROWS|CUBE|SPHERE|...}. Other generators (object.generate_tree, curve.add_from_points …) run through run_operator. The new object becomes selected and active.",
       annotations: EDIT,
+      argsHint:
+        'Type-specific operator parameters (size, radius, segments, depth, energy, lens, body …) go inside `params`; list_operators gives their names.',
     },
     {
       project: projectArg,
@@ -1087,6 +1141,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description:
         "Give a mesh, curve or text object a principled (PBR) material in a slot (default 0; curve and text splines choose their slot with material_index): reuse an existing material (`material`), create/update one by `name`, or (without either) edit the slot's material when only this object uses it, otherwise create a new one. Properties: base_color (linear RGB/RGBA 0..1), metallic, roughness, emission_color + emission_strength, alpha, transmission, ior, blend_method. One undo step.",
       annotations: EDIT,
+      argsHint:
+        'Other material settings (coat_weight, coat_roughness, sheen_weight, use_backface_culling) are set with run_operator material.update {material, …}; procedural textures with material.procedural_set, presets with material.preset_apply.',
     },
     {
       project: projectArg,
@@ -1234,6 +1290,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       title: 'Add modifier',
       description: `Add a modifier to the end of the stack of a mesh, curve or text object (non-destructive, like Blender; on curves and text it acts on the generated geometry). type is a Blender modifier identifier, e.g. SUBSURF {levels, render_levels}, MIRROR, ARRAY {count}, SOLIDIFY {thickness}, BOOLEAN {operation, object}, ARMATURE {object: "Rig"} (skinning; usually added by object.parent_to type ARMATURE_AUTO), CURVE {object: "Path", deform_axis} (bend along a curve). Object parameters accept object names. Parameter names follow Blender: list_modifier_types {type} gives every type's parameters (JSON schema with enums, ranges and defaults); unknown parameter names and invalid values are rejected with that schema. Available types: ${modifierTypeList()}.`,
       annotations: EDIT,
+      argsHint:
+        'Modifier parameters (levels, count, thickness, object …) go inside `params`; list_modifier_types {type} gives their names.',
     },
     {
       project: projectArg,
@@ -1264,6 +1322,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description:
         'Change parameters, name or visibility (show_viewport, show_render, show_in_editmode) of a modifier (by name or id). Unknown parameter names and invalid values are rejected with the JSON schema of the type (see list_modifier_types).',
       annotations: EDIT,
+      argsHint: 'Modifier parameters go inside `params`; list_modifier_types {type} gives their names.',
     },
     {
       project: projectArg,
@@ -1342,8 +1401,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Edit mesh',
       description:
-        "Run an edit-mode operator on a mesh object: enters Edit Mode on the object (headless), selects the given vertices/edges/faces (default: everything), runs the operator (mesh.* such as mesh.extrude_region_move {value}, mesh.inset, mesh.subdivide, mesh.loopcut, mesh.delete, mesh.merge, or transform.translate/rotate/resize to move the selected elements), then returns to Object Mode. Use list_operators (search 'mesh.') for the catalogue and parameters. One undo step.",
+        "Run an edit-mode operator on a mesh object: enters Edit Mode on the object (headless), selects the given vertices/edges/faces (default: everything), runs the operator (mesh.* such as mesh.extrude_region_move {value}, mesh.inset, mesh.subdivide, mesh.loopcut, mesh.delete, mesh.merge, or transform.translate/rotate/resize to move the selected elements), then returns to Object Mode. Use list_operators (search 'mesh.') for the catalogue and parameters. One undo step. Returns {ok, operator, result, reports, mesh, selection_after}; a failure also carries `error` and `code` (INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED, as run_operator).",
       annotations: EDIT,
+      argsHint:
+        'Operator parameters go inside `params`; the elements to select go inside `selection` {verts, edges, faces, all}.',
     },
     {
       project: projectArg,
@@ -1359,10 +1420,15 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const p = await agent.project(a.project);
       const o = requireObject(p, a.object);
       if (o.type !== 'MESH' || !o.data) throw new ToolError(`'${o.name}' is not a mesh object.`);
+      const refuse = (error: string, code: OperatorErrorCode) =>
+        failure(error, { ok: false, operator: a.operator, error, code });
       if (!registry.has(a.operator))
-        throw new ToolError(`Unknown operator '${a.operator}'.${suggestOperators(registry, a.operator)}`);
+        return refuse(
+          `Unknown operator '${a.operator}'.${suggestOperators(registry, a.operator)}`,
+          'NOT_FOUND',
+        );
       const refused = toolOnlyOperator(a.operator);
-      if (refused) throw new ToolError(refused);
+      if (refused) return refuse(refused, 'FAILED');
       const mode = inferSelectMode(a.selection, a.select_mode);
       const res = p.step(() => {
         p.state.mode = 'OBJECT';
@@ -1384,6 +1450,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         ok: res.ok,
         operator: a.operator,
         result: res.result ?? null,
+        ...(res.ok ? {} : { error: res.error ?? 'unknown error', code: errorCode(res) }),
         reports: res.reports,
         mesh: mesh ? meshStats(mesh) : null,
         selection_after: {
@@ -1407,6 +1474,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description:
         'Insert a keyframe at `frame` on an animatable property (Blender data paths). Object: location, rotation_euler (radians), scale, color; nested object paths: pose.bones["Bone"].location / rotation_euler / scale (armature bones, bone axes), pose.bones["Bone"].constraints["IK"].influence, constraints["Name"].influence (or another numeric constraint parameter), modifiers["Name"].<parameter>, particle_systems["Name"].<setting>. \'data.<path>\' keys the object\'s data: light (data.energy, data.color), camera (data.lens, data.dof_focus_distance), curve or text (data.bevel_factor_end to grow a curve, data.extrude, data.eval_time, data.size, data.splines[0].points[1].co) or mesh shape keys (data.shape_keys["Smile"].value, or just shape_keys["Smile"].value). \'material.<path>\' keys the material in `material_slot` (default: the first): material.base_color, material.roughness, material.emission_strength, procedural texture parameters such as material.textures.base_color.procedural.scale. object=\'world\' keys world settings (color, strength, sun_elevation, sun_rotation, mist_density …). `value` (number or vector) sets the keyed value, otherwise the current value is keyed; `index` keys one channel. For many keys at once use run_operator anim.keyframes_insert_many; drivers: anim.driver_add; F-curve modifiers (noise, cycles): anim.fmodifier_add / anim.extrapolation_set.',
       annotations: EDIT,
+      argsHint:
+        'Key one property per call (property: a data path such as location or data.energy, value, frame, index); many keys at once: run_operator anim.keyframes_insert_many.',
     },
     {
       project: projectArg,
@@ -1522,6 +1591,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description:
         'Change scene, render, world and physics settings in one undo step (lights and cameras are objects: edit their data with run_operator light.properties_set / camera.properties_set, e.g. camera depth of field dof_use / dof_focus_distance / dof_aperture_fstop or an area light shape and size; set_active_camera picks the render camera). Scene: frame_start, frame_end, fps, frame_current (agent playhead), unit_system. Render: resolution_x/y, resolution_percentage, engine (RASTER|PATHTRACER), samples (path tracer samples per pixel), max_bounces, use_denoising, film_transparent, view_transform (AGX default), exposure. World: world_color (linear RGB), world_strength, environment (NONE|STUDIO|SKY|IMAGE), environment_strength; procedural sky (same as run_operator world.sky_set: sky_preset, sun_elevation / sun_rotation in radians, sun_intensity W/m², sun_size; any of them switches the environment to SKY); mist (same as world.mist_set: mist_density 1/m or mist_distance in m where it reaches 95 %, mist_color). Physics (same as rigidbody.world_set): use_gravity, gravity (m/s², default [0,0,-9.81]), rigidbody_enabled, rigidbody_frame_start/_end (simulated range), substeps_per_frame, solver_iterations, time_scale.',
       annotations: EDIT,
+      argsHint:
+        'Lights and cameras are objects: change their data with run_operator light.properties_set / camera.properties_set {object, …}; the active camera with set_active_camera.',
     },
     {
       project: projectArg,
@@ -1659,7 +1730,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       });
       if (a.frame_current !== undefined) p.runOrThrow('scene.frame_set', { frame: a.frame_current });
       p.publishPresence();
-      const s = summarizeScene(p.scene, { frame: p.state.frame, projectId: p.id, maxObjects: 1 });
+      // the settings only (no geometry evaluation)
+      const s = sceneSettingsAt(p.scene, p.state.frame);
       const sc = p.scene.getScene();
       return {
         scene: {
@@ -1803,24 +1875,32 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Export scene',
       description:
-        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at the agent's current frame. OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, download_url, warnings} plus the file as an embedded base64 resource and a download link (HTTP endpoint of this server). `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped.",
+        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at a frame (default: the agent's current frame). OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, warnings} plus the file as an embedded base64 resource (up to 20 MiB) and a download link. download_url (an HTTP endpoint of this server) exports again when it is fetched, with the same options (format, objects, apply_modifiers, frame): the same file as the embedded one while the scene is unchanged, the project's current state after later edits. `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped.",
       annotations: READ_ONLY,
     },
     {
       project: projectArg,
       format: z.enum(['glb', 'gltf', 'obj', 'stl', 'ply']).default('glb'),
-      objects: z.array(z.string()).optional().describe('Only these objects (ids or names)'),
-      apply_modifiers: z.boolean().default(true),
+      objects: z
+        .array(z.string())
+        .optional()
+        .describe('Only these objects (ids or names; default: every object shown in renders)'),
+      apply_modifiers: z.boolean().default(true).describe('Apply the modifier stacks (default true)'),
+      frame: z
+        .number()
+        .optional()
+        .describe("Frame the scene is evaluated at (default: the agent's current frame)"),
     },
     async (a, extra) => {
       const p = await agent.project(a.project);
       const objectIds = a.objects?.map((r) => requireObject(p, r).id);
+      const frame = a.frame ?? p.state.frame;
       let res;
       try {
         res = exportScene(p.scene, a.format as ExportFormat, {
           objectIds,
           applyModifiers: a.apply_modifiers,
-          frame: p.state.frame,
+          frame,
         });
       } catch (err) {
         if (isNotImplemented(err))
@@ -1828,12 +1908,19 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         throw new ToolError(`Export failed: ${errorMessage(err)}`);
       }
       const filename = safeFileName(p.scene.name, res.extension);
-      const downloadUrl = `${baseUrl(extra)}/api/projects/${encodeURIComponent(p.id)}/export?format=${a.format}`;
+      // the link exports with the same options when it is fetched (GET …/export, see api/projects.ts)
+      const query = new URLSearchParams({ format: a.format, frame: String(frame) });
+      if (objectIds) query.set('objects', objectIds.join(','));
+      if (!a.apply_modifiers) query.set('apply_modifiers', 'false');
+      const downloadUrl = `${baseUrl(extra)}/api/projects/${encodeURIComponent(p.id)}/export?${query}`;
       const info = {
         format: a.format,
         filename,
         mime: res.mime,
         bytes: res.data.byteLength,
+        frame,
+        objects: objectIds ? objectIds.map((id) => p.scene.getObject(id)?.name ?? id) : 'all',
+        apply_modifiers: a.apply_modifiers,
         download_url: downloadUrl,
         // what the format could not represent (procedural textures that need UVs, area lights …)
         warnings: res.warnings ?? [],
@@ -1854,7 +1941,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         uri: downloadUrl,
         name: filename,
         mimeType: res.mime,
-        description: 'Download (same export, generated on request)',
+        description:
+          'Download: exported again on request with the same options (format, objects, apply_modifiers, frame)',
       });
       return { content };
     },
@@ -1867,7 +1955,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Render image',
       description:
-        "Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, same look as the viewport) when available, otherwise the server's software rasterizer; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel). Defaults to the scene camera; pass `camera` (camera object) or `view` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications.",
+        "Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, same look as the viewport) when available, otherwise the server's software rasterizer; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel), or with renderer browser on a browser editor's render workers. Film > Transparent (set_scene_settings film_transparent) gives a transparent background with both engines. Defaults to the scene camera; pass `camera` (camera object) or `view` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications. The JSON text after the image gives renderer, engine, size, frame, timing, for path tracing samples (reached) and requested_samples, and `warnings` (e.g. textures that could not be used, or degenerate triangles skipped, with the objects they belong to).",
       annotations: READ_ONLY,
     },
     {
@@ -1881,28 +1969,27 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .optional()
         .describe('Default: from the render resolution aspect ratio'),
       camera: z.string().optional().describe('Camera object id or name'),
-      view: z
-        .object({
-          position: vec3.describe('Eye position (world space, metres)'),
-          target: vec3.describe('Point looked at (world space)'),
-          up: vec3.optional().describe('Up direction (default [0, 0, 1])'),
-          fov_degrees: z
-            .number()
-            .min(1)
-            .max(170)
-            .optional()
-            .describe(
-              'VERTICAL field of view in degrees (default 50). The horizontal angle is wider for landscape images: hfov = 2·atan(tan(fov/2)·width/height). To match a Blender camera use `lens` instead',
-            ),
-          lens: z
-            .number()
-            .min(1)
-            .max(5000)
-            .optional()
-            .describe(
-              "Focal length in mm instead of fov_degrees, like a Blender camera with a 36 mm sensor and sensor_fit AUTO (the sensor spans the image's longer side): 50 mm ≈ 39.6° across the longer side",
-            ),
-        })
+      view: strictArgObject({
+        position: vec3.describe('Eye position (world space, metres)'),
+        target: vec3.describe('Point looked at (world space)'),
+        up: vec3.optional().describe('Up direction (default [0, 0, 1])'),
+        fov_degrees: z
+          .number()
+          .min(1)
+          .max(170)
+          .optional()
+          .describe(
+            'VERTICAL field of view in degrees (default 50). The horizontal angle is wider for landscape images: hfov = 2·atan(tan(fov/2)·width/height). To match a Blender camera use `lens` instead',
+          ),
+        lens: z
+          .number()
+          .min(1)
+          .max(5000)
+          .optional()
+          .describe(
+            "Focal length in mm instead of fov_degrees, like a Blender camera with a 36 mm sensor and sensor_fit AUTO (the sensor spans the image's longer side): 50 mm ≈ 39.6° across the longer side",
+          ),
+      })
         .optional()
         .describe(
           'Explicit viewpoint instead of a camera (world space, Z up): position, target, up, and fov_degrees (vertical) or lens (mm)',
@@ -1925,7 +2012,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .enum(['auto', 'browser', 'software'])
         .default('auto')
         .describe(
-          'auto: a connected browser editor for RASTER (else the server), the server for PATHTRACER; browser: only a browser editor (WebGL, RASTER look); software: always the server',
+          "auto: RASTER on a connected browser editor (WebGL, the viewport's look; else the server's rasterizer), PATHTRACER on the server (all its cores); browser: only a browser editor: RASTER with WebGL, PATHTRACER on the editor's render workers (samples, max_bounces, denoise, time_limit, seed; the result does not include the samples reached); software: always the server",
         ),
       shading: z
         .enum(['SOLID', 'MATERIAL'])
@@ -1963,14 +2050,27 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const view = a.view
         ? { position: a.view.position, target: a.view.target, up: a.view.up, fov_degrees: fovDegrees }
         : null;
-      if (a.renderer === 'browser' && a.engine === 'PATHTRACER')
-        throw new ToolError(
-          'Browser editors render with WebGL (RASTER look) only; use renderer auto or software for PATHTRACER.',
-        );
       let fallbackReason: string | undefined;
       if (a.renderer === 'browser' || (a.renderer === 'auto' && engine === 'RASTER')) {
         const conn = p.room.pickRpcTarget('render', a.client);
         if (conn) {
+          // the editor path traces on its render workers when asked (SOLID shading rasterizes)
+          const browserPT = engine === 'PATHTRACER' && a.shading !== 'SOLID';
+          const timeLimit = a.time_limit ?? DEFAULT_IMAGE_TIME_LIMIT;
+          const requested = a.samples ?? rs.samples;
+          // long browser renders send no progress of their own: keep the request alive
+          const progress = browserPT ? progressReporter(extra) : undefined;
+          const t0 = Date.now();
+          const keepAlive = progress
+            ? setInterval(() => {
+                const seconds = Math.floor((Date.now() - t0) / 1000);
+                progress({
+                  progress: Math.min(seconds, Math.ceil(timeLimit)),
+                  total: Math.ceil(timeLimit),
+                  message: `path tracing in the browser editor: ${seconds} s (time_limit ${timeLimit} s)`,
+                });
+              }, 5000)
+            : null;
           try {
             const result = await p.room.rpcTo(
               conn,
@@ -1982,11 +2082,28 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                 view,
                 shading: a.shading ?? null,
                 frame,
+                ...(browserPT
+                  ? {
+                      engine: 'PATHTRACER',
+                      samples: requested,
+                      max_bounces: a.max_bounces ?? rs.max_bounces,
+                      denoise: a.denoise ?? rs.use_denoising,
+                      time_limit: timeLimit,
+                      seed: a.seed ?? 0,
+                    }
+                  : { engine: 'RASTER' }),
               },
-              15_000,
+              // path tracing takes up to time_limit plus loading, compiling, denoising and the PNG
+              browserPT ? timeLimit * 1000 + 30_000 : 15_000,
             );
             const img = decodeRenderResult(result);
             if (!img) throw new Error('the editor returned no image');
+            const reached =
+              typeof result === 'object' &&
+              result &&
+              typeof (result as { samples?: unknown }).samples === 'number'
+                ? (result as { samples: number }).samples
+                : undefined;
             return {
               content: [
                 { type: 'image', data: img.data, mimeType: img.mimeType },
@@ -1994,18 +2111,37 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                   type: 'text',
                   text: JSON.stringify({
                     renderer: 'browser',
-                    engine: 'RASTER',
+                    engine: browserPT ? 'PATHTRACER' : 'RASTER',
                     client: conn.clientInfo.name ?? conn.clientInfo.app ?? conn.id,
                     connection: conn.id,
                     width: img.width ?? width,
                     height: img.height ?? height,
                     frame,
+                    elapsed_ms: Date.now() - t0,
+                    ...(browserPT
+                      ? {
+                          ...(reached !== undefined ? { samples: reached } : {}),
+                          requested_samples: requested,
+                          time_limit: timeLimit,
+                          ...(reached === undefined
+                            ? {
+                                note_samples:
+                                  'The browser editor does not report the samples it reached: sampling stops at time_limit. Use renderer software for the samples reached.',
+                              }
+                            : {}),
+                        }
+                      : {}),
+                    ...(engine === 'PATHTRACER' && !browserPT
+                      ? { note_engine: 'SOLID shading always rasterizes' }
+                      : {}),
                   }),
                 },
               ],
             };
           } catch (err) {
             fallbackReason = `browser render failed: ${err instanceof RpcError ? err.message : errorMessage(err)}`;
+          } finally {
+            if (keepAlive) clearInterval(keepAlive);
           }
         } else fallbackReason = 'no connected browser editor can render';
         if (a.renderer === 'browser')
@@ -2087,7 +2223,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Render animation',
       description:
-        'Render a range of frames on the server to check motion (keyframes, drivers, F-curve modifiers, constraints, armatures, physics, turntables) or to make an animated result. format CONTACT_SHEET (default: one PNG showing every rendered frame in a labelled grid — the easiest way to review a whole animation; sample long ranges to 12–24 tiles with frame_step), GIF (animated, 256 colours), APNG (animated PNG, returned as image/png) or PNG_SEQUENCE (one PNG per frame, returned as embedded image/png resources named frame_0001.png …). Frames frame_start..frame_end every frame_step (default: the scene frame range). Camera: `camera`, else the scene camera, else one fixed automatic view framing all frames (returned as view). engine RASTER (fast) or PATHTRACER (frames path traced in parallel on all CPU cores; keep size, samples and frame count small). time_limit bounds the whole render (default 60 s): path traced frames get an equal share and stop sampling early, frames that cannot start in time are dropped (truncated: true). store=true keeps the files on the server for an hour and returns download links (results too large to embed are stored automatically).',
+        'Render a range of frames on the server to check motion (keyframes, drivers, F-curve modifiers, constraints, armatures, physics, turntables) or to make an animated result. format CONTACT_SHEET (default: one PNG showing every rendered frame in a labelled grid — the easiest way to review a whole animation; sample long ranges to 12–24 tiles with frame_step), GIF (animated, 256 colours), APNG (animated PNG, returned as image/png) or PNG_SEQUENCE (one PNG per frame, returned as embedded image/png resources named frame_0001.png …). Frames frame_start..frame_end every frame_step (default: the scene frame range). Camera: `camera`, else the scene camera, else one fixed automatic view framing all frames (returned as view). engine RASTER (fast) or PATHTRACER (frames path traced in parallel on all CPU cores; keep size, samples and frame count small). time_limit bounds the whole render (default 60 s): path traced frames get an equal share and stop sampling early, frames that cannot start in time are dropped (truncated: true). Path traced results report requested_samples, samples_reached {min, mean, max} and frame_samples (the samples per pixel each frame reached, aligned with frames) plus undersampled_frames (frames that stopped early). store=true keeps the files on the server for an hour and returns download links (results too large to embed are stored automatically).',
       annotations: READ_ONLY,
     },
     {
@@ -2257,7 +2393,19 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         info.hint =
           'The time limit cut the render short: raise time_limit, or render fewer/smaller frames or fewer samples.';
       }
+      if (res.frame_samples?.length) {
+        // what the time budget left of the requested samples, per frame (aligned with frames)
+        const fs = res.frame_samples;
+        info.requested_samples = res.requested_samples;
+        info.samples_reached = {
+          min: Math.min(...fs),
+          mean: round(fs.reduce((a, b) => a + b, 0) / fs.length, 1),
+          max: Math.max(...fs),
+        };
+        info.frame_samples = fs;
+      }
       if (res.undersampled_frames.length) info.undersampled_frames = res.undersampled_frames;
+      if (res.warnings.length) info.warnings = res.warnings.slice(0, 20);
       if (res.sheet) info.sheet = res.sheet;
       if (res.view)
         info.view = {
@@ -2338,6 +2486,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       description:
         'Send a UI command to a live browser editor that has the project open (most recently active one, or `client`): e.g. view.frame_all, view.frame_selected, view.set_view {view: FRONT|TOP|RIGHT|CAMERA...}, select {objects}, set_mode {mode}, screenshot. Fails when no browser editor accepting UI commands is connected.',
       annotations: { ...EDIT, openWorldHint: true },
+      argsHint: 'Command parameters go inside `params` (editor_command {project, command, params: {…}}).',
     },
     {
       project: projectArg,

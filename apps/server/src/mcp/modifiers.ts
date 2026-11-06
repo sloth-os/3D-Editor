@@ -1,5 +1,4 @@
 import {
-  SceneEvaluator,
   cloneMesh,
   evaluateModifierStack,
   getModifierDef,
@@ -16,6 +15,7 @@ import {
   type OperatorRegistry,
 } from '@3d-editor/core';
 import { ToolError, type AgentProject } from './agent';
+import { evaluateCached } from './eval-cache';
 
 /*
  * Modifier stack editing for MCP tools. The operators `object.modifier_add|set|remove|apply`
@@ -410,7 +410,8 @@ function applyDirect(p: AgentProject, object: ObjectData, mod: ModifierData): vo
   if (!object.data) throw new ToolError(`'${object.name}' has no mesh data`);
   const base = p.scene.getMesh(object.data);
   if (!base) throw new ToolError(`'${object.name}' has no mesh data`);
-  const ev = new SceneEvaluator(p.scene).evaluate(p.state.frame);
+  // Apply uses the viewport settings of the stack, like Blender
+  const ev = evaluateCached(p.scene, p.state.frame, 'VIEWPORT');
   const res = evaluateModifierStack(base, [{ ...mod, show_viewport: true }], {
     frame: p.state.frame,
     objectMatrix: ev.byId.get(object.id)?.worldMatrix ?? p.scene.worldMatrix(object.id),

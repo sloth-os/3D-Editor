@@ -206,7 +206,9 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
             world: null,
           } as const
         )[p.target_type];
-        const id = kind ? resolveDatablock(ctx.doc, kind, p.target).id : 'world';
+        const resolved = kind ? resolveDatablock(ctx.doc, kind, p.target) : null;
+        if (resolved?.warning) ctx.report('WARNING', resolved.warning);
+        const id = resolved ? resolved.id : 'world';
         const n = keyProperty(ctx, p.target_type, id, p.path, p.frame ?? ctx.state.frame, {
           index: p.index,
           value: p.value,

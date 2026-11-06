@@ -485,7 +485,7 @@ export class SceneEvaluator {
  * Depth of field with a focus object (Blender BKE_camera_object_dof_distance): the focus distance
  * becomes the depth of the object's origin along the camera's view axis at this frame.
  */
-function withFocusObject(
+export function withFocusObject(
   cam: CameraData,
   camWorld: Mat4,
   fs: FrameState,

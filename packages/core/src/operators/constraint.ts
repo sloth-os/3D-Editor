@@ -405,10 +405,13 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
       label: 'Describe Constraints',
       description:
         "Read-only: an object's constraint stack in evaluation order (id, name, type, target and sub-target with " +
-        'the target name, influence, mute, params) with the current evaluation error of each constraint (missing ' +
+        'the target name, mute, params) with the current evaluation error of each constraint (missing ' +
         'target, invalid parameters, dependency cycle …; identical to what scene evaluation reports), and the ' +
-        "object's evaluated world location / rotation_euler (radians) / scale at the current (or given) frame. Use " +
-        'it to verify that constraints do what was intended.',
+        "object's evaluated world location / rotation_euler (radians) / scale at the current (or given) frame. " +
+        '`influence` (and `params`) are the values evaluated at that frame, i.e. with keyframes and drivers ' +
+        'applied, the ones the world transform was computed with; `stored_influence` (and `stored_params` when ' +
+        'they differ) are the values stored in the document, which keyframes and drivers override. Use it to ' +
+        'verify that constraints do what was intended.',
       category: 'Object',
       undo: false,
       schema: z.object({
@@ -417,30 +420,40 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
       }),
       execute(ctx, p) {
         const owner = ownerObject(ctx, p.object);
-        const fs = new FrameState(ctx.doc, p.frame ?? ctx.state.frame);
+        const frame = p.frame ?? ctx.state.frame;
+        const fs = new FrameState(ctx.doc, frame);
         const world = fs.world(owner.id) ?? ctx.doc.worldMatrix(owner.id);
         const errors = fs.constraintErrors.get(owner.id) ?? [];
         const d = decompose4(world);
         const round = (v: number[]) => v.map((x) => Math.round(x * 1e6) / 1e6);
+        // the stack as evaluated at the frame (animated / driven influence and parameters)
+        const animated = fs.byId.get(owner.id)?.constraints ?? owner.constraints;
         return {
           object: owner.id,
           name: owner.name,
+          frame,
           world_location: round(d.location),
           world_rotation_euler: round(d.rotation),
           world_scale: round(d.scale),
-          constraints: owner.constraints.map((c, i) => ({
-            index: i,
-            id: c.id,
-            name: c.name,
-            type: c.type,
-            target: c.target,
-            target_name: c.target ? (ctx.doc.getObject(c.target)?.name ?? null) : null,
-            subtarget: c.subtarget,
-            influence: c.influence,
-            mute: c.mute,
-            params: c.params,
-            error: errors.find((e) => e.constraintId === c.id || e.constraintId === `#${i}`)?.message ?? null,
-          })),
+          constraints: owner.constraints.map((stored, i) => {
+            const c = animated.find((a) => a.id === stored.id) ?? stored;
+            const paramsChanged = JSON.stringify(c.params) !== JSON.stringify(stored.params);
+            return {
+              index: i,
+              id: c.id,
+              name: c.name,
+              type: c.type,
+              target: c.target,
+              target_name: c.target ? (ctx.doc.getObject(c.target)?.name ?? null) : null,
+              subtarget: c.subtarget,
+              influence: c.influence,
+              stored_influence: stored.influence,
+              mute: c.mute,
+              params: c.params,
+              ...(paramsChanged ? { stored_params: stored.params } : {}),
+              error: errors.find((e) => e.constraintId === c.id || e.constraintId === `#${i}`)?.message ?? null,
+            };
+          }),
         };
       },
     }),

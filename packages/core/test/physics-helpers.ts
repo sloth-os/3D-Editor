@@ -107,6 +107,12 @@ export function directSimulation(doc: SceneDoc, opts: { sleeping?: boolean } = {
   const inputs: BodyInput[] = doc
     .listObjects()
     .filter((o) => o.rigid_body)
-    .map((o) => ({ id: o.id, rb: o.rigid_body!, matrix: tf.get(o.id) ?? null, mesh: host.meshOf(o.id) }));
+    .map((o) => ({
+      id: o.id,
+      name: o.name,
+      rb: o.rigid_body!,
+      matrix: tf.get(o.id) ?? null,
+      mesh: host.meshOf(o.id),
+    }));
   return new Simulation(inputs, params, opts);
 }

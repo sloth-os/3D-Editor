@@ -109,7 +109,7 @@ PORT=4503 npm start &                               # or any running server / th
 # 2. the build (modes are exclusive; the scene is always rebuilt and verified first)
 MCP_URL=http://127.0.0.1:4503/mcp node examples/robot-workcell/build.mjs
 #   (no flag)          final renders: render.png, contact_sheet.png, preview.gif
-#   --no-render        build + verify only (3-6 s)
+#   --no-render        build + verify only (about 3 s)
 #   --export-only      build + verify, then scene.glb (no renders)
 #   --preview=DIR      build + verify, then RASTER stills, a RASTER contact sheet and a small
 #                      path-traced frame into DIR (outputs untouched)
@@ -117,13 +117,35 @@ MCP_URL=http://127.0.0.1:4503/mcp node examples/robot-workcell/build.mjs
 #   --still-time=S     time limit of the still (default 480 s)
 ```
 
-Building and verifying the scene takes 3–6 s and 177 MCP tool calls (most operators run inside
-`batch` calls); the renders take the rest of the time. They are time-limited, so the samples
-reached depend on the CPU.
+Building and verifying the scene takes about 3 s and 176 MCP tool calls (177 when an older
+project is deleted first; most operators run inside `batch` calls); the renders take the rest of
+the time. They are time-limited, so the samples reached depend on the CPU. The script prints the
+project's editor URL (`http://<host>/?project=<id>`): open it to scrub the timeline and inspect
+the rig, the constraints, the shape key and the driver in the web editor.
 
 ## Final production run
 
-FINAL_RUN_PLACEHOLDER
+The outputs in this folder come from one run of `build.mjs` (default mode) against a fresh
+server with an empty data directory, which also shows that the project rebuilds from scratch. The
+machine has 4 cores and was shared with other agents during the run (1-minute load average 5.5–11,
+mean 8), so the path tracer reached fewer samples than it would on an idle machine.
+
+```bash
+PORT=4553 DATA_DIR=/tmp/phase3/robot-workcell/final-data RENDER_WORKERS=3 node .phase3/app-v2/dist/main.js &
+MCP_URL=http://127.0.0.1:4553/mcp node examples/robot-workcell/build.mjs
+```
+
+| Stage | Settings | Wall time | Result |
+| --- | --- | --- | --- |
+| Build + verification | 176 MCP tool calls | 2.7 s | IK error 0.0 mm, crate error 0.06 mm, pad clearance 2.0 mm |
+| `render.png` | PATHTRACER 1280×720, frame 49, 256 spp requested, 6 bounces, denoised, time limit 480 s | 484.6 s | **79 spp** reached (3 render threads); 1.27 MB |
+| `contact_sheet.png` | PATHTRACER, frames 1–96 every 4th (24 tiles of 320×180), 12 spp, 4 bounces, denoised, 10 s per frame | 85.9 s | 21 of 24 frames stopped at the per-frame limit (≈ 7 spp); 2.81 MB |
+| `preview.gif` | PATHTRACER, frames 1–95 every 2nd (48 frames, 12 fps), 480×270, 16 spp, 4 bounces, denoised, 15 s per frame, Bayer dither | 245.1 s | all 48 frames stopped at the per-frame limit (≈ 4–9 spp); 4.21 MB |
+| **Total** | | **818 s (13.6 min)** | exit code 0 |
+
+`render_animation` reports which frames stopped early but not how many samples they reached; the
+≈ values come from `render_image` calls with the same size, samples and time limit on the same
+(equally loaded) machine.
 
 ## Known limitations
 
@@ -140,10 +162,11 @@ FINAL_RUN_PLACEHOLDER
   resolution the 4 mm wires are sub-pixel and shimmer slightly.
 - **Rollers do not turn** (they are smooth cylinders of one ARRAY object, so a spin would be
   invisible), and the crates' conveyor ride is keyframed, not simulated.
-- **Low sample counts.** The CPU was shared with other agents; the path tracer stopped at its
-  time limits (see the table above). The denoiser cleans even 1–2 sample frames, but fine
-  details (the fence wires, the hose) are softer than in a converged render, and
-  `render_animation` does not report the samples each frame reached.
+- **Low sample counts.** The CPU was shared with other agents, so the path tracer stopped at its
+  time limits: 79 spp for the still, roughly 4–9 spp per GIF frame (see the table above). The
+  denoiser cleans even 1–2 sample frames, but fine details (the fence wires, the hose) are softer
+  than in a converged render, and `render_animation` does not report the samples each frame
+  reached.
 - **scene.glb** is written by `--export-only` from the live, rigged scene; area lights become
   point lights in glTF and procedural textures are baked through automatically generated UVs
   (both reported as `export_scene` warnings). It is regenerated with the finished glTF exporter.

@@ -2,11 +2,11 @@
 
 ## Where projects are saved
 
-| Configuration | Saved to |
-| --- | --- |
-| No WebDAV configured (default) | The browser (IndexedDB). |
-| Server started with `WEBDAV_URL` | WebDAV, through the server's `/dav` proxy (credentials stay on the server, no CORS needed). The server also persists the live sync rooms there. |
-| WebDAV URL entered in *Preferences → Storage* | WebDAV, accessed directly from the browser (the WebDAV server must send CORS headers). |
+| Configuration                                 | Saved to                                                                                                                                        |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| No WebDAV configured (default)                | The browser (IndexedDB).                                                                                                                        |
+| Server started with `WEBDAV_URL`              | WebDAV, through the server's `/dav` proxy (credentials stay on the server, no CORS needed). The server also persists the live sync rooms there. |
+| WebDAV URL entered in _Preferences → Storage_ | WebDAV, accessed directly from the browser (the WebDAV server must send CORS headers).                                                          |
 
 Projects are **always** cached in IndexedDB as well, which is what makes the app work offline.
 When WebDAV is configured the local copy is merged with the WebDAV copy on open, a moment
@@ -31,10 +31,10 @@ protocol is Yjs sync + awareness (presence) plus JSON RPC and control frames
 (`packages/core/src/sync/protocol.ts`). Tabs of the same browser additionally talk over
 `BroadcastChannel`, which also works offline.
 
-* Changes appear on every device that has the project open, typically within one network round
+- Changes appear on every device that has the project open, typically within one network round
   trip. Peers are shown as avatars; click one to follow that user's viewport.
-* A device that was offline merges automatically when it reconnects.
-* Share a project with *File → Copy Share Link*; opening the link on another device joins the same
+- A device that was offline merges automatically when it reconnects.
+- Share a project with _File → Copy Share Link_; opening the link on another device joins the same
   live session (and, with WebDAV, the project also shows up in that device's project list).
 
 `SYNC_PERSISTENCE` controls what the server does with live rooms: `memory` (rooms live while

@@ -7,6 +7,8 @@ import { OperatorError, type OperatorContext } from './context';
 import { selectedObjects } from './helpers';
 import { keyProperty, rekeyAnimated } from './anim';
 import { nameList, objectsUsing, resolveDatablock } from './datablocks';
+import { FrameState } from '../eval/frame-state';
+import { withFocusObject } from '../eval/evaluate';
 
 /*
  * Light and camera data editing (Blender: Properties editor > Object Data of a light or camera,
@@ -223,6 +225,33 @@ const CAMERA_KEYS = [
 ] as const;
 
 /** Validated camera data patch for the given fields, plus warnings (e.g. DOF settings while DOF is off). */
+/**
+ * Cross-field checks of camera data (shared by camera.properties_set and data.set_property):
+ * clip_end must stay greater than clip_start, and a camera cannot focus on itself (one of the
+ * `cameraObjectIds` using the data). `patch.dof_focus_object` must already be an object id.
+ * Throws INVALID_PARAMS.
+ */
+export function checkCameraFields(
+  doc: SceneDoc,
+  cameraObjectIds: readonly string[],
+  current: CameraData,
+  patch: Partial<CameraData>,
+): void {
+  const focus = patch.dof_focus_object;
+  if (focus && cameraObjectIds.includes(focus))
+    throw new OperatorError(
+      `A camera cannot focus on itself ('${doc.getObject(focus)?.name ?? focus}')`,
+      'INVALID_PARAMS',
+    );
+  const clipStart = patch.clip_start ?? current.clip_start;
+  const clipEnd = patch.clip_end ?? current.clip_end;
+  if (clipEnd <= clipStart)
+    throw new OperatorError(
+      `clip_end (${clipEnd}) must be greater than clip_start (${clipStart})`,
+      'INVALID_PARAMS',
+    );
+}
+
 export function cameraPatch(
   doc: SceneDoc,
   cameraObjectIds: string[],
@@ -265,18 +294,10 @@ export function cameraPatch(
     else {
       const o = doc.resolveObject(ref);
       if (!o) throw new OperatorError(`Focus object '${ref}' not found`, 'NOT_FOUND');
-      if (cameraObjectIds.includes(o.id))
-        throw new OperatorError(`A camera cannot focus on itself ('${o.name}')`, 'INVALID_PARAMS');
       patch.dof_focus_object = o.id;
     }
   }
-  const clipStart = patch.clip_start ?? current.clip_start;
-  const clipEnd = patch.clip_end ?? current.clip_end;
-  if (clipEnd <= clipStart)
-    throw new OperatorError(
-      `clip_end (${clipEnd}) must be greater than clip_start (${clipStart})`,
-      'INVALID_PARAMS',
-    );
+  checkCameraFields(doc, cameraObjectIds, current, patch);
   const type = patch.type ?? current.type;
   if (type === 'ORTHO' && (p.lens !== undefined || p.angle !== undefined))
     warnings.push('lens/angle have no effect on an ORTHO camera (use ortho_scale)');
@@ -317,6 +338,7 @@ function dataTargets(
   };
   for (const ref of refs) {
     const r = resolveDatablock(ctx.doc, kind, ref);
+    if (r.warning) ctx.report('WARNING', r.warning);
     // a datablock id/name: report it through the first object using it
     add(r.object ?? objectsUsing(ctx.doc, kind).find((x) => x.data === r.id) ?? null, r.id);
   }
@@ -388,6 +410,42 @@ export function summarizeCamera(doc: SceneDoc, c: CameraData): Record<string, un
   return { ...rest, dof_focus_object: focus ? focus.name : null };
 }
 
+/**
+ * The distance a camera object focuses at on `frame` (like get_object's data.dof_focus_distance):
+ * the depth of its dof_focus_object along the view axis when it has one, else its (animated)
+ * dof_focus_distance. Null when it cannot be evaluated (no object, missing focus object).
+ */
+export function evaluatedFocusDistance(doc: SceneDoc, cameraObjectId: string, frame: number): number | null {
+  const o = doc.getObject(cameraObjectId);
+  if (!o || o.type !== 'CAMERA' || !o.data) return null;
+  const fs = new FrameState(doc, frame);
+  const cam = fs.get<CameraData>('camera', o.data);
+  const world = fs.world(o.id);
+  if (!cam || !world) return null;
+  const d = withFocusObject(cam, world, fs, o.id).dof_focus_distance;
+  return Number.isFinite(d) ? round(d) : null;
+}
+
+/**
+ * summarizeCamera for a camera object, with dof_focus_distance as evaluated on `frame`: where a
+ * focus object (or animation) overrides the stored value, that one is listed as
+ * stored_dof_focus_distance.
+ */
+function summarizeCameraObject(
+  doc: SceneDoc,
+  object: ObjectData | null,
+  c: CameraData,
+  frame: number,
+): Record<string, unknown> {
+  const out = summarizeCamera(doc, c);
+  const focus = object ? evaluatedFocusDistance(doc, object.id, frame) : null;
+  if (focus !== null && Math.abs(focus - round(c.dof_focus_distance)) > 1e-6) {
+    out.dof_focus_distance = focus;
+    out.stored_dof_focus_distance = c.dof_focus_distance;
+  }
+  return out;
+}
+
 export function registerLightCameraOperators(reg: OperatorRegistry): void {
   reg.register(
     defineOperator({
@@ -452,7 +510,9 @@ export function registerLightCameraOperators(reg: OperatorRegistry): void {
         'tracer. Targets: object/objects (camera object names or ids); default: the selected cameras, else the ' +
         'scene camera. Only the given fields change, in one undo step. Animated fields are re-keyed at the current ' +
         'frame (keyframe=true inserts keys, e.g. for a focus pull). Returns {cameras: [{object, camera (datablock ' +
-        'id), ...all camera settings}], keyframes}.',
+        'id), ...all camera settings}], keyframes}; dof_focus_distance there is the distance the camera focuses at ' +
+        'on the current frame: with a dof_focus_object, that object\'s depth along the view axis, the stored value ' +
+        '(which the focus object overrides) then following as stored_dof_focus_distance.',
       category: 'Data',
       schema: z.object({
         ...targetParams,
@@ -494,7 +554,7 @@ export function registerLightCameraOperators(reg: OperatorRegistry): void {
           cameras.push({
             object: t.object?.name ?? null,
             camera: t.data,
-            ...summarizeCamera(ctx.doc, ctx.doc.getCamera(t.data)!),
+            ...summarizeCameraObject(ctx.doc, t.object, ctx.doc.getCamera(t.data)!, ctx.state.frame),
           });
         }
         return { cameras, ...(p.keyframe ? { keyframes } : {}) };
