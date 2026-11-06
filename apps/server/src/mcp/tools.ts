@@ -40,6 +40,7 @@ import type { Log } from '../observability/log';
 import { errorMessage, withSpan } from '../observability/tracing';
 import type { RoomManager } from '../sync/room-manager';
 import { RpcError } from '../sync/room';
+import { ProjectNameTakenError, requireFreeProjectName, withProjectNames } from '../sync/project-names';
 import { isNotImplemented, safeFileName } from '../api/projects';
 import { persistenceNote } from '../persistence';
 import { ToolError, type AgentProject, type AgentSession } from './agent';
@@ -386,35 +387,24 @@ function decodeRenderResult(
 }
 
 /**
- * Serializes the name checks of create_project / rename_project with the change they guard, per
- * server (every MCP session has its own tools), so two agents cannot take the same name at once.
+ * Refuses a project name that another project already has, ignoring letter case (see
+ * sync/project-names.ts): projects are found by id or name, and a second project with the same
+ * name would make every by-name reference ambiguous. Call it inside withProjectNames.
  */
-const projectNameLocks = new WeakMap<RoomManager, Promise<void>>();
-function withProjectNames<T>(rooms: RoomManager, fn: () => Promise<T>): Promise<T> {
-  const run = (projectNameLocks.get(rooms) ?? Promise.resolve()).then(fn);
-  // the chain must not hold the result (a created room would stay reachable after its deletion)
-  projectNameLocks.set(
-    rooms,
-    run.then(
-      () => undefined,
-      () => undefined,
-    ),
-  );
-  return run;
-}
-
-/**
- * Refuses a project name that another project already has: projects are found by id or exact name,
- * and a second project with the same name would make every by-name reference ambiguous.
- */
-async function requireFreeProjectName(rooms: RoomManager, name: string, self?: string): Promise<void> {
-  const taken = (await rooms.listProjects()).filter((p) => p.name === name && p.id !== self);
-  if (!taken.length) return;
-  const ids = taken.map((p) => p.id);
-  throw new ToolError(
-    `A project named '${name}' already exists (id ${ids.join(', ')}). Project names are unique because tools find projects by name: ` +
-      `work in that project (pass its id), delete it first with delete_project {project: '${ids[0]}', confirm: true}, or choose another name.`,
-  );
+async function requireFreeName(rooms: RoomManager, name: string, self?: string): Promise<void> {
+  try {
+    await requireFreeProjectName(rooms, name, self);
+  } catch (err) {
+    if (!(err instanceof ProjectNameTakenError)) throw err;
+    const ids = err.ids;
+    const caseNote = err.differsInCase
+      ? ` Names that differ only in letter case count as the same name, so '${name}' is taken too.`
+      : '';
+    throw new ToolError(
+      `A project named '${err.holders[0].name}' already exists (id ${ids.join(', ')}).${caseNote} Project names are unique because tools find projects by name: ` +
+        `work in that project (pass its id), delete it first with delete_project {project: '${ids[0]}', confirm: true}, or choose another name.`,
+    );
+  }
 }
 
 // ------------------------------------------------------------------ registration
@@ -504,7 +494,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Create project',
       description:
-        "Create a new project. By default it contains Blender's startup scene (a 2 m cube named 'Cube' with 'Material', a 'Camera' and a point 'Light'); pass empty=true for an empty scene. Project names are unique (tools find projects by id or name): a name that another project already has is refused with that project's id, so work in it, delete it first (delete_project) or pick another name. Returns the project id and the URL that opens it in the editor.",
+        "Create a new project. By default it contains Blender's startup scene (a 2 m cube named 'Cube' with 'Material', a 'Camera' and a point 'Light'); pass empty=true for an empty scene. Project names are unique, ignoring letter case (tools find projects by id or name): a name that another project already has ('Lighthouse' when 'lighthouse' exists, too) is refused with that project's id, so work in it, delete it first (delete_project) or pick another name. Returns the project id and the URL that opens it in the editor.",
       annotations: EDIT,
     },
     {
@@ -513,7 +503,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     async ({ name, empty }, extra) => {
       const room = await withProjectNames(rooms, async () => {
-        await requireFreeProjectName(rooms, name);
+        await requireFreeName(rooms, name);
         return rooms.createProject({ name, empty });
       });
       const p = await agent.project(room.id);
@@ -555,7 +545,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Rename project',
       description:
-        'Rename a project (stored in the document, synced to all editors). The name must not be used by another project.',
+        'Rename a project (stored in the document, synced to all editors). The name must not be used by another project, ignoring letter case (changing the case of its own name is fine).',
       annotations: EDIT,
     },
     {
@@ -565,7 +555,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     async ({ project, name }) => {
       const p = await agent.project(project);
       await withProjectNames(rooms, async () => {
-        await requireFreeProjectName(rooms, name, p.id);
+        await requireFreeName(rooms, name, p.id);
         p.transact(() => p.scene.setName(name));
       });
       return { id: p.id, name: p.scene.name };
