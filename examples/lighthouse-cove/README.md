@@ -40,7 +40,7 @@ PORT=4501 DATA_DIR=/tmp/lc-data node apps/server/dist/main.js &   # or any runni
 MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs                 # full run (11–15 min with RENDER_WORKERS=3, depending on the load)
 MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --build-only    # scene + checks only (5–10 s)
 MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --preview       # + RASTER and 16-spp previews in $TMPDIR/lighthouse-cove-preview (about 45 s)
-MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --export-only   # scene + checks + scene.glb, no renders (about 20 s)
+MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --export-only   # scene + checks + scene.glb, no renders (13–20 s)
 ```
 
 The script deletes any project called `lighthouse-cove`, creates it again empty, builds the whole
@@ -54,7 +54,7 @@ The flags:
 - `--export` also exports `scene.glb` after the renders.
 - `--out <dir>` writes the outputs to another folder (for example `--export-only --out /tmp/x`).
 - `--keep` makes the script fail instead of deleting an existing project.
-- `--check-all` adds the 2,600 grass tufts to the scatter placement check (4 s more).
+- `--check-all` adds the 2,600 grass tufts to the scatter placement check (3–4 s more).
 
 Any tool error stops the build, and so does any operator WARNING, because a warning means that
 some input was ignored. So does any failed check (next section). The layout and the main design
@@ -236,7 +236,7 @@ tower around frame 22).
   everything else 11–60 m away (and the clouds far beyond), the circle of confusion stays at about
   one pixel or less even at f/1.4. `camera.properties_set {dof_use, dof_focus_distance,
   dof_aperture_fstop}` would therefore have no visible effect on this wide shot.
-- **`scene.glb` is regenerated later.** The present exporter writes about 6.3 MB in 12 s, bakes
+- **`scene.glb` is regenerated later.** The present exporter writes about 6.3 MB in 9–12 s, bakes
   procedural textures to PNG and exports the window area lights as point lights. glTF has no lens
   shift, so the exported camera is centred on the lighthouse. It says both in its warnings.
   Drivers, the sky and the mist are not part of glTF.

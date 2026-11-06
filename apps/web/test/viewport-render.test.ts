@@ -660,7 +660,7 @@ function webglLuminance(e: ViewportEngine, gl: RecordingRenderer, width: number,
       const e3 = [0, 0, 0];
       for (const l of lights) {
         const c = l.color;
-        let irradiance = 0;
+        let irradiance: number;
         if ((l as THREE.AmbientLight).isAmbientLight) irradiance = l.intensity;
         else if ((l as THREE.DirectionalLight).isDirectionalLight) {
           const d = l as THREE.DirectionalLight;
