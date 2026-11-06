@@ -8,6 +8,7 @@ import {
   type WorldSettings,
 } from '@3d-editor/core';
 import { setProceduralScene } from './materials';
+import { fitSunShadow, SUN_SHADOW_MAP_SIZE } from './sun-shadow';
 
 /*
  * World sky and mist in the viewport.
@@ -15,9 +16,10 @@ import { setProceduralScene } from './materials';
  * - environment SKY (Rendered shading): the analytic sky of @3d-editor/core is rendered into an
  *   equirectangular HalfFloat texture; without the sun disc it becomes the PMREM environment
  *   (image-based lighting), with the sun disc the background. The sun itself is a shadow-casting
- *   DirectionalLight with the irradiance of `skySun` (W/m², like SUN lamps). Sky radiance is
- *   scaled by world strength × environment_strength like in every other renderer; the sky ignores
- *   environment_rotation (sun_rotation orients it).
+ *   DirectionalLight with the irradiance of `skySun` (W/m², like SUN lamps), whose shadow map is
+ *   fitted to each render's camera like a SUN lamp's (sun-shadow.ts, {@link ViewportSky.fitShadow}).
+ *   Sky radiance is scaled by world strength × environment_strength like in every other renderer;
+ *   the sky ignores environment_rotation (sun_rotation orients it).
  * - mist (Material Preview and Rendered): three.js FogExp2 with the world mist density and colour,
  *   i.e. 1 − exp(−(density·depth)²) over the view depth, exactly what the CPU renderer applies.
  */
@@ -74,7 +76,7 @@ function equirectTexture(
 }
 
 /** World-space bounding sphere of the visible meshes (null when there are none). */
-export function sceneBounds(ev: EvaluatedScene): THREE.Sphere | null {
+function sceneBounds(ev: EvaluatedScene): THREE.Sphere | null {
   const box = new THREE.Box3();
   const v = new THREE.Vector3();
   const m = new THREE.Matrix4();
@@ -105,9 +107,7 @@ export class ViewportSky {
 
   constructor(private readonly pmrem: THREE.PMREMGenerator) {
     this.sun.name = 'Sky Sun';
-    this.sun.shadow.mapSize.set(2048, 2048);
-    this.sun.shadow.bias = -0.0003;
-    this.sun.shadow.normalBias = 0.02;
+    this.sun.shadow.mapSize.set(SUN_SHADOW_MAP_SIZE, SUN_SHADOW_MAP_SIZE);
     this.sun.shadow.radius = 2;
   }
 
@@ -188,7 +188,7 @@ export class ViewportSky {
     light.color.setRGB(e[0] / peak, e[1] / peak, e[2] / peak);
     // the sun's irradiance (W/m²), like SUN lamps and the core renderers' sky sun
     light.intensity = peak * scale;
-    // place the light (and its shadow frustum) around the visible geometry
+    // place the light around the visible geometry (its shadow map is fitted per render: fitShadow)
     const sphere = sceneBounds(ev) ?? new THREE.Sphere(new THREE.Vector3(), 10);
     const r = Math.max(sphere.radius, 0.5);
     const d = sun.direction;
@@ -201,12 +201,15 @@ export class ViewportSky {
     light.target.updateMatrixWorld();
     light.updateMatrixWorld();
     light.castShadow = castShadows;
-    const cam = light.shadow.camera;
-    cam.left = cam.bottom = -r;
-    cam.right = cam.top = r;
-    cam.near = 0.01;
-    cam.far = 2 * r + 2;
-    cam.updateProjectionMatrix();
+  }
+
+  /**
+   * Fits the sun's shadow map to what `camera` sees of the shadow-casting geometry `boxes` (world
+   * bounding boxes, see `SceneObjects.shadowBoxes`), like the shadow maps of SUN lamps; call it
+   * before every render with that render's camera. Does nothing while the sky's sun is off.
+   */
+  fitShadow(camera: THREE.Camera, boxes: readonly THREE.Box3[]): void {
+    if (this.sun.parent && this.sun.castShadow) fitSunShadow(this.sun, camera, boxes);
   }
 
   private detachSun(scene: THREE.Scene): void {

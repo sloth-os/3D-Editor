@@ -11,7 +11,7 @@ import {
 } from '@3d-editor/core';
 import { buildMaterial, materialKey, TextureCache, type ShadingKind } from './materials';
 import { boneLines, cameraLines, emptyLines, lightLines, linesObject } from './helpers';
-import { sceneBounds } from './sky';
+import { fitSunShadow, SUN_SHADOW_MAP_SIZE } from './sun-shadow';
 
 /** three.js representation of one document object. */
 export interface ObjectView {
@@ -59,45 +59,6 @@ export function lightIntensity(l: Pick<LightData, 'type' | 'energy'>, area = 1):
   if (l.type === 'SUN') return p;
   if (l.type === 'AREA') return p / (Math.PI * Math.max(1e-6, area));
   return p / (4 * Math.PI);
-}
-
-/** Shadow map size of sun lamps (their map spans the whole scene). */
-const SUN_SHADOW_MAP = 2048;
-
-/**
- * Fits the shadow map of a sun lamp to the visible geometry, like the sky's sun (sky.ts): the
- * shadow camera looks along the sun from the lamp (as three.js places it), and its orthographic
- * frustum is the scene's bounding sphere in that view, so everything casts and receives shadows
- * and the texels are as small as the scene allows; the normal offset follows the texel size
- * (about 1.5 texels), against acne on surfaces lit at grazing angles. Without geometry the
- * frustum stays as it is.
- */
-export function fitSunShadow(
-  light: THREE.DirectionalLight,
-  lampWorld: number[],
-  sphere: THREE.Sphere | null,
-): void {
-  if (!sphere) return;
-  const cam = light.shadow.camera;
-  const from = new THREE.Vector3(lampWorld[12], lampWorld[13], lampWorld[14]);
-  // the light shines along its local −Z (its target is at local (0, 0, −1))
-  const to = from.clone().sub(new THREE.Vector3(lampWorld[8], lampWorld[9], lampWorld[10]));
-  const view = new THREE.OrthographicCamera();
-  view.up.copy(cam.up);
-  view.position.copy(from);
-  view.lookAt(to);
-  view.updateMatrixWorld(true);
-  const c = sphere.center.clone().applyMatrix4(view.matrixWorldInverse);
-  const r = Math.max(sphere.radius * 1.02, 0.05);
-  cam.left = c.x - r;
-  cam.right = c.x + r;
-  cam.bottom = c.y - r;
-  cam.top = c.y + r;
-  // the camera looks down its −Z: the sphere's depth is −c.z
-  cam.near = -c.z - r - 0.01;
-  cam.far = -c.z + r + 0.01;
-  cam.updateProjectionMatrix();
-  light.shadow.normalBias = Math.max(0.005, (1.5 * 2 * r) / light.shadow.mapSize.x);
 }
 
 /**
@@ -174,9 +135,7 @@ export class SceneObjects {
 
   sync(doc: SceneDoc, ev: EvaluatedScene, opts: SyncOptions): void {
     const seen = new Set<string>();
-    // bounds of the visible geometry, for the shadow maps of sun lamps (computed when needed)
-    let sphere: THREE.Sphere | null | undefined;
-    const bounds = () => (sphere === undefined ? (sphere = sceneBounds(ev)) : sphere);
+    this.boxes = null;
     for (const o of ev.objects) {
       seen.add(o.id);
       let v = this.views.get(o.id);
@@ -200,7 +159,7 @@ export class SceneObjects {
       if (o.mesh) this.syncMesh(doc, v, o, opts);
       else this.clearMesh(v);
       if (o.type !== 'MESH') this.syncHelper(v, o, opts);
-      if (o.type === 'LIGHT' && o.light) this.syncLight(v, o.light, o.worldMatrix, opts, bounds);
+      if (o.type === 'LIGHT' && o.light) this.syncLight(v, o.light, o.worldMatrix, opts);
       else if (v.light) {
         v.root.remove(v.light);
         v.light.dispose();
@@ -255,6 +214,7 @@ export class SceneObjects {
       g.matrices.forEach((m, i) => im.setMatrixAt(i, tmp.fromArray(m)));
       im.instanceMatrix.needsUpdate = true;
       im.computeBoundingSphere();
+      im.computeBoundingBox();
       im.visible = owner.visible && src.visible;
       im.castShadow = opts.castShadows;
       im.receiveShadow = opts.castShadows;
@@ -444,7 +404,6 @@ export class SceneObjects {
     l: LightData,
     world: number[],
     opts: SyncOptions,
-    bounds: () => THREE.Sphere | null,
   ): void {
     const key = `${l.type}|${l.shape}`;
     if (v.lightKey !== key || !v.light) {
@@ -458,10 +417,6 @@ export class SceneObjects {
         d.position.set(0, 0, 0);
         d.target.position.set(0, 0, -1);
         d.add(d.target);
-        d.shadow.camera.left = d.shadow.camera.bottom = -15;
-        d.shadow.camera.right = d.shadow.camera.top = 15;
-        d.shadow.camera.near = -50;
-        d.shadow.camera.far = 50;
         light = d;
       } else if (l.type === 'SPOT') {
         const s = new THREE.SpotLight();
@@ -515,14 +470,54 @@ export class SceneObjects {
     if ('shadow' in light && light.castShadow) {
       const sh = (light as THREE.PointLight).shadow;
       // (three.js resizes the map when the size changes)
-      const size = light instanceof THREE.DirectionalLight ? SUN_SHADOW_MAP : 1024;
+      const size = light instanceof THREE.DirectionalLight ? SUN_SHADOW_MAP_SIZE : 1024;
       sh.mapSize.set(size, size);
-      sh.bias = -0.0005;
-      sh.normalBias = 0.02;
       sh.radius = 3;
-      if (light instanceof THREE.DirectionalLight) fitSunShadow(light, world, bounds());
+      // a sun's frustum and biases are fitted to each render's camera (fitSunShadows)
+      if (!(light instanceof THREE.DirectionalLight)) {
+        sh.bias = -0.0005;
+        sh.normalBias = 0.02;
+      }
     }
     light.visible = opts.shading === 'RENDERED';
+  }
+
+  /** {@link shadowBoxes} of the last sync (null: not computed yet). */
+  private boxes: THREE.Box3[] | null = null;
+
+  /**
+   * World-space bounding boxes of the visible geometry that casts and receives shadows: one per
+   * mesh (meshes, curve and text surfaces) and one per group of instances, as last synced.
+   */
+  shadowBoxes(): THREE.Box3[] {
+    if (this.boxes) return this.boxes;
+    const out: THREE.Box3[] = [];
+    for (const v of this.views.values()) {
+      const m = v.mesh;
+      if (!m || !v.root.visible || !m.visible || !m.castShadow) continue;
+      if (!m.geometry.boundingBox) m.geometry.computeBoundingBox();
+      const b = m.geometry.boundingBox;
+      // the mesh sits at the origin of its root, whose matrix is the object's world matrix
+      if (b && !b.isEmpty()) out.push(b.clone().applyMatrix4(v.root.matrix));
+    }
+    for (const im of this.instanced.values()) {
+      if (!im.visible || !im.castShadow || im.count === 0) continue;
+      if (!im.boundingBox) im.computeBoundingBox();
+      if (im.boundingBox && !im.boundingBox.isEmpty()) out.push(im.boundingBox.clone());
+    }
+    return (this.boxes = out);
+  }
+
+  /**
+   * Fits the shadow maps of the shadow-casting sun lamps to what `camera` sees ({@link fitSunShadow});
+   * call it before every render, with that render's camera.
+   */
+  fitSunShadows(camera: THREE.Camera): void {
+    for (const v of this.views.values()) {
+      const l = v.light;
+      if (l instanceof THREE.DirectionalLight && l.castShadow && l.visible && v.root.visible)
+        fitSunShadow(l, camera, this.shadowBoxes());
+    }
   }
 
   /** Meshes that can be picked, plus helper pick proxies. */
