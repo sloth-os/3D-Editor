@@ -111,15 +111,15 @@ navigation, dialogs, modal tools) with `uiOnly: true`. An operator:
 - **is traced** by telemetry (`operator <id>` span with source, mode, status and duration).
 
 The same registry serves menus, hotkeys, the F3 search, the redo panel ("Adjust Last Operation"),
-the JavaScript console and MCP. MCP exposes it directly: `list_operators` returns every operator
-that is not UI-only with its JSON schema (filterable by registry category or by feature groups
-such as Curves, Rigging, Physics or Rendering, see `apps/server/src/mcp/operator-groups.ts`),
-`run_operator` runs one, `batch` runs several in one undo step, and `edit_mesh` runs `mesh.*`
-operators on an explicit vertex/edge/face selection. The dedicated MCP tools (`add_object`,
-`set_material`, `add_modifier`, `insert_keyframe`, …) are thin wrappers around the same
-operators. The `render.*` operators are refused through `run_operator` and `batch`, because they
-would render on the server's main thread; agents render with `render_image` and
-`render_animation`, which use the render threads.
+the JavaScript console and MCP. MCP exposes it directly: `list_operators` lists every operator
+except the UI-only and `render.*` ones, with JSON schemas (filterable by registry category or by
+feature groups such as Curves, Rigging, Physics or Rendering, see
+`apps/server/src/mcp/operator-groups.ts`), `run_operator` runs one, `batch` runs several in one
+undo step, and `edit_mesh` runs `mesh.*` operators on an explicit vertex/edge/face selection. The
+dedicated MCP tools (`add_object`, `set_material`, `add_modifier`, `insert_keyframe`, …) are thin
+wrappers around the same operators. The `render.*` operators are refused through `run_operator`,
+`batch` and `edit_mesh`, because they would render on the server's main thread; agents render
+with `render_image` and `render_animation`, which use the render threads.
 
 ## Undo
 
@@ -237,9 +237,6 @@ finished so far. The editor's RPC handler path traces on these workers when a re
 `engine: PATHTRACER`: the server's MCP `render_image` sends such requests with
 `renderer: browser` (with `renderer: auto` it path traces on the server and sends only raster
 renders to browsers).
-
-<!-- re-check: uncommitted server change on 2026-11-06 (renderer browser path tracing,
-apps/server/src/mcp/tools.ts) -->
 
 ### Server render threads
 

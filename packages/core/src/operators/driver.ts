@@ -126,9 +126,19 @@ function targetName(doc: SceneDoc, type: AnimTargetType, id: string): string {
   return kind && doc.has(kind, id) ? blockName(doc, kind, id) : id;
 }
 
+/** The datablock of `type` an object uses (its data; for material its first material slot), or null. */
+function objectDataId(doc: SceneDoc, type: AnimTargetType, o: ObjectData): string | null {
+  const kind = KIND[type];
+  if (!kind || type === 'object') return null;
+  if (type === 'material')
+    return (o.material_slots ?? []).find((m): m is string => !!m && doc.has('materials', m)) ?? null;
+  return DATA_OBJECT_TYPES[type]?.includes(o.type) && o.data && doc.has(kind, o.data) ? o.data : null;
+}
+
 /**
  * Resolves a datablock reference (see `targetRef`). Without a reference the active object (or
- * its data) is used.
+ * its data) is used. A datablock name wins over an object name; when the name also belongs to an
+ * object whose data is another datablock, a WARNING names both.
  */
 function resolveTarget(
   ctx: OperatorContext,
@@ -143,7 +153,18 @@ function resolveTarget(
   if (type !== 'object' && ref !== undefined) {
     if (doc.has(kind, ref)) return { type, id: ref, name: blockName(doc, kind, ref) };
     for (const id of doc.map(kind).keys())
-      if (doc.getBlock(kind, id)?.name === ref) return { type, id, name: ref };
+      if (doc.getBlock(kind, id)?.name === ref) {
+        const o = doc.resolveObject(ref);
+        const own = o ? objectDataId(doc, type, o) : null;
+        if (o && own && own !== id)
+          ctx.report(
+            'WARNING',
+            `'${ref}' names both the ${type} datablock '${ref}' and the object '${o.name}' (whose ${type} data ` +
+              `is '${blockName(doc, kind, own)}'): used the ${type} datablock '${ref}'. To use the object's ` +
+              `${type} data instead, pass its datablock id '${own}'`,
+          );
+        return { type, id, name: ref };
+      }
   }
   const o = ref !== undefined ? doc.resolveObject(ref) : activeObject(ctx);
   if (!o) {
@@ -154,12 +175,7 @@ function resolveTarget(
     );
   }
   if (type === 'object') return { type, id: o.id, name: o.name };
-  const dataId =
-    type === 'material'
-      ? ((o.material_slots ?? []).find((m): m is string => !!m && doc.has('materials', m)) ?? null)
-      : DATA_OBJECT_TYPES[type]?.includes(o.type) && o.data && doc.has(kind, o.data)
-        ? o.data
-        : null;
+  const dataId = objectDataId(doc, type, o);
   if (!dataId) throw new OperatorError(`Object '${o.name}' (${o.type}) has no ${type} data`, 'NOT_FOUND');
   return { type, id: dataId, name: blockName(doc, kind, dataId) };
 }

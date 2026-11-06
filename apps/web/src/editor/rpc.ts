@@ -1,6 +1,7 @@
 import { effect } from '@preact/signals';
-import { session, toast } from '../app/store';
-import { run, runResult, viewport } from './editor';
+import type { EditorMode } from '@3d-editor/core';
+import { session, toast, toasts } from '../app/store';
+import { runResult, viewport } from './editor';
 import { telemetry } from '../telemetry/telemetry';
 import type { RenderImageOptions } from '../viewport/engine';
 
@@ -8,7 +9,8 @@ import type { RenderImageOptions } from '../viewport/engine';
  * Handles RPC requests routed by the server from MCP tools to this live editor:
  *  - `render` { width?, height?, camera?, use_viewport?, view?, shading?, frame?, engine?, samples?,
  *    max_bounces?, denoise?, time_limit?, seed? } → { mime, data_base64, width, height }; rasterized
- *    unless `engine` is PATHTRACER (see {@link rpcRenderEngineOptions})
+ *    unless `engine` is PATHTRACER (see {@link rpcRenderEngineOptions}), a final render of the scene
+ *    (see {@link rpcRenderShading})
  *  - `ui` { command, params } → result of a UI command (view changes, selection, modes,
  *    operators that need the browser, screenshots)
  */
@@ -37,10 +39,7 @@ export function installRpcHandler(): () => void {
               up?: number[];
               fov_degrees?: number;
             } | null) ?? null,
-          shading:
-            typeof p.shading === 'string'
-              ? (p.shading.toUpperCase() as 'SOLID' | 'MATERIAL' | 'RENDERED' | 'WIREFRAME')
-              : null,
+          shading: rpcRenderShading(p.shading),
           frame: typeof p.frame === 'number' ? p.frame : null,
           ...rpcRenderEngineOptions(p),
         });
@@ -72,8 +71,27 @@ export function rpcRenderEngineOptions(p: Record<string, unknown>): RenderImageO
   return o;
 }
 
+/**
+ * The viewport shading of an RPC `render` (MCP `render_image {shading}`). MCP names the look of the
+ * image, not a viewport shading: MATERIAL (its default) is materials, lights and the world, the look
+ * of a final render (the viewport's Material Preview would light the scene with a studio HDRI and
+ * show it instead of the world); SOLID is grey clay shading in front of the world colour. Null when
+ * not given (a final render); unknown values are an error.
+ */
+export function rpcRenderShading(shading: unknown): 'RENDERED' | 'SOLID' | null {
+  if (shading === undefined || shading === null) return null;
+  const v = String(shading).toUpperCase();
+  if (v === 'MATERIAL' || v === 'RENDERED') return 'RENDERED';
+  if (v === 'SOLID') return 'SOLID';
+  throw new Error(
+    `Unknown shading '${String(shading)}': use MATERIAL (materials, lights and the world) or SOLID (grey clay)`,
+  );
+}
+
 const VIEW_TYPES = ['FRONT', 'BACK', 'RIGHT', 'LEFT', 'TOP', 'BOTTOM', 'CAMERA'] as const;
 const SHADING_TYPES = ['WIREFRAME', 'SOLID', 'MATERIAL', 'RENDERED'] as const;
+/** Modes of `set_mode` (object.mode_set). */
+const MODES = ['OBJECT', 'EDIT', 'SCULPT', 'VERTEX_PAINT'] as const satisfies readonly EditorMode[];
 
 /**
  * An enum parameter of a UI command, read from the first of `keys` that is given (MCP documents

@@ -542,7 +542,7 @@ async function buildLabel() {
         location: [0, yInk, zc + LABEL.emblemZ],
       },
     },
-    // the name, as wide as the subline, with about 3 mm of air to the frame on each side
+    // the name, about as wide as the subline, with 2.8 mm of air to the frame on each side
     {
       operator: 'object.text_add',
       params: {
@@ -595,8 +595,9 @@ async function buildLabel() {
     { operator: 'material.update', params: { material: 'Gold Leaf', roughness: 0.28 } },
     { operator: 'object.parent_to', params: { objects: ['Label', ...gold], parent: 'Bottle' } },
   ]);
+  // object.text_add returns the layout width (glyph cells); verifyScene() measures the geometry.
   log(
-    `   label name width ${(res[3].width * 1000).toFixed(1)} mm, subline ${(res[5].width * 1000).toFixed(1)} mm (label ${w * 1000} mm)`,
+    `   text layout widths: name ${(res[3].width * 1000).toFixed(1)} mm, subline ${(res[5].width * 1000).toFixed(1)} mm (label ${w * 1000} mm)`,
   );
 }
 

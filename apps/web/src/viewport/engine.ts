@@ -7,6 +7,7 @@ import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { effect } from '@preact/signals';
 import {
+  SceneEvaluator,
   cameraFovY,
   meshBounds,
   orthoHalfExtents,
@@ -19,8 +20,10 @@ import {
 import type { ProjectSession } from '../project/session';
 import {
   applyLensShift,
+  finalRenderScene,
   pathTraceDocument,
   pixelsToDataUrl,
+  renderOutputSize,
   renderViewFromCamera,
   sceneCameraView,
   viewportCamera,
@@ -51,6 +54,9 @@ const VIEWPORT_BG = new THREE.Color(0x393939);
 
 /** Default sampling budget (seconds) of path traced `renderImage` calls (RPC renders time out at 15 s). */
 export const RPC_PATH_TRACE_SECONDS = 10;
+
+/** The evaluator of final renders is dropped after this long without renders (its caches can be big). */
+const FINAL_EVALUATOR_IDLE_MS = 60_000;
 
 /**
  * Divides colour by alpha (straight alpha) for transparent-film renders: a render over a clear
@@ -446,14 +452,14 @@ export class ViewportEngine {
   }
 
   private envKey = '';
-  private applyShading(): void {
-    const v = this.session.view;
-    const shading = v.shading.value;
-    const ev = this.ev!;
+  /** Lighting, background and colour management of `shading` (default: the viewport's) for `ev`. */
+  private applyShading(ev: EvaluatedScene = this.ev!, shading = this.session.view.shading.value): void {
     const world = ev.world;
     const r = this.renderer;
     const tm: Record<string, THREE.ToneMapping> = {
-      STANDARD: THREE.NoToneMapping,
+      // Standard is no curve, but Exposure still scales the colours (three.js ignores
+      // toneMappingExposure with NoToneMapping)
+      STANDARD: THREE.LinearToneMapping,
       AGX: THREE.AgXToneMapping,
       FILMIC: THREE.ACESFilmicToneMapping,
       ACES: THREE.ACESFilmicToneMapping,
@@ -733,14 +739,19 @@ export class ViewportEngine {
     return engine === 'PATHTRACER' && opts.shading !== 'SOLID' && opts.shading !== 'WIREFRAME';
   }
 
-  /** Output size of a render: the options, else the render resolution (16..4096 px). */
+  /**
+   * Output size of a render: the options (a missing side follows the output's aspect ratio), else
+   * the output settings (resolution × %). Larger than 4096 px on a side, both sides are scaled by
+   * the same factor, so the image keeps the camera's framing (see {@link renderOutputSize}).
+   */
   private renderSize(opts: RenderImageOptions): { width: number; height: number } {
     const render = this.session.doc.getRender();
-    const scale = render.resolution_percentage / 100;
-    return {
-      width: Math.max(16, Math.min(4096, Math.round(opts.width ?? render.resolution_x * scale))),
-      height: Math.max(16, Math.min(4096, Math.round(opts.height ?? render.resolution_y * scale))),
-    };
+    const aspect = render.resolution_x / Math.max(1, render.resolution_y);
+    const size =
+      opts.width === undefined && opts.height === undefined
+        ? renderOutputSize(render.resolution_x, render.resolution_y, render.resolution_percentage)
+        : renderOutputSize(opts.width ?? opts.height! * aspect, opts.height ?? opts.width! / aspect, 100);
+    return { width: size.width, height: size.height };
   }
 
   /**
@@ -813,26 +824,38 @@ export class ViewportEngine {
   /**
    * Rasterizes the scene (WebGL, Rendered shading unless `shading` says otherwise) with
    * {@link renderImage}'s camera choice and returns RGBA8 pixels (top row first).
+   *
+   * A final render (F12, Render Animation, MCP renders) shows the document as it is now, evaluated
+   * for rendering like the path tracer and the server's renderers: objects visible in renders
+   * (`hide_render`, not `hide_viewport`), modifiers with their render settings (Subdivision render
+   * levels, `show_render`), curve render resolution and render particle amounts, shape keys also
+   * while the viewport is in Edit Mode, and none of the viewport's display settings (X-ray, Display
+   * As Wire / Bounds, live transform previews). A capture (`useViewport`) shows the viewport as it
+   * is, with `shading` and without overlays.
    */
   renderPixels(opts: RenderImageOptions = {}): PixelImage {
     const { width, height } = this.renderSize(opts);
     const aspect = width / height;
     const view = this.session.view;
     const state = this.session.state;
-    // final render: rendered shading, no overlays, the document as it is now at the requested frame
+    const shading = opts.shading ?? 'RENDERED';
+    const frame = typeof opts.frame === 'number' && Number.isFinite(opts.frame) ? opts.frame : state.frame;
     const prevShading = view.shading.value;
     const prevOverlays = view.overlays.value;
     const prevFrame = state.frame;
     const prevBg = this.scene.background;
     const disposables: { dispose(): void }[] = [];
     try {
-      if (typeof opts.frame === 'number' && Number.isFinite(opts.frame)) state.frame = opts.frame;
-      view.shading.value = opts.shading ?? 'RENDERED';
-      view.overlays.value = false;
       // The camera comes from this evaluation too: the viewport's own one is from its last animation
       // frame (stale in hidden tabs, which get none) and at the viewport's frame.
-      this.sync();
-      const ev = this.ev!;
+      let ev: EvaluatedScene;
+      if (opts.useViewport) {
+        state.frame = frame;
+        view.shading.value = shading;
+        view.overlays.value = false;
+        this.sync();
+        ev = this.ev!;
+      } else ev = this.syncFinalRender(frame, shading);
       const cam = this.renderCamera(ev, opts, aspect);
       const target = new THREE.WebGLRenderTarget(width, height, { samples: 8, type: THREE.HalfFloatType });
       // The composer output is already tone mapped and sRGB encoded, so copy it raw (linear target).
@@ -913,6 +936,56 @@ export class ViewportEngine {
     }
   }
 
+  /** Evaluator of final renders (see {@link finalEvaluator}) and the timer that drops it. */
+  private finalEval: SceneEvaluator | null = null;
+  private finalEvalTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * The evaluator of final renders. It is not the viewport's: its caches keep the geometry evaluated
+   * with the render settings, the viewport's with the viewport settings, so neither recomputes the
+   * other's. Dropped after {@link FINAL_EVALUATOR_IDLE_MS} without renders.
+   */
+  private finalEvaluator(): SceneEvaluator {
+    this.finalEval ??= new SceneEvaluator(this.session.doc);
+    if (this.finalEvalTimer) clearTimeout(this.finalEvalTimer);
+    this.finalEvalTimer = setTimeout(() => {
+      this.finalEval = null;
+      this.finalEvalTimer = null;
+    }, FINAL_EVALUATOR_IDLE_MS);
+    return this.finalEval;
+  }
+
+  /**
+   * Mirrors the scene as a final render shows it (see {@link renderPixels}) into the three.js scene
+   * with `shading`, and returns that evaluation. The viewport shows its own state again from its
+   * next frame. Clay shading (SOLID) has the world colour behind it, like the server's renderer,
+   * instead of the viewport's grey.
+   */
+  private syncFinalRender(frame: number, shading: NonNullable<RenderImageOptions['shading']>): EvaluatedScene {
+    const s = this.session;
+    const ev = finalRenderScene(this.finalEvaluator().evaluate(frame, { forRender: true }));
+    const render = ev.render;
+    this.objects.sync(s.doc, ev, {
+      shading,
+      showWireOverlay: false,
+      xray: false,
+      selected: new Set(s.state.selectedIds),
+      activeId: s.state.activeId,
+      editObjectId: null,
+      renderAspect: render.resolution_x / Math.max(1, render.resolution_y),
+      castShadows: shading === 'RENDERED' && render.use_shadows,
+      imagesRevision: this.imagesRevision,
+    });
+    this.applyShading(ev, shading);
+    if (shading === 'SOLID' || shading === 'WIREFRAME') {
+      const w = ev.world;
+      const k = Number.isFinite(w.strength) ? Math.max(0, w.strength) : 1;
+      this.scene.background = new THREE.Color(w.color[0] * k, w.color[1] * k, w.color[2] * k);
+    }
+    this.needsSync = true;
+    return ev;
+  }
+
   /**
    * The camera of a rasterized render with {@link renderImage}'s camera choice, taken from `ev` (the
    * scene evaluated for this render): the explicit view, else the camera (option or scene camera)
@@ -960,6 +1033,8 @@ export class ViewportEngine {
 
   dispose(): void {
     cancelAnimationFrame(this.raf);
+    if (this.finalEvalTimer) clearTimeout(this.finalEvalTimer);
+    this.finalEval = null;
     this.resizeObserver.disconnect();
     for (const d of this.disposers) d();
     this.objects.dispose();

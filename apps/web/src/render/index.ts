@@ -48,6 +48,13 @@ export {
   sceneCameraView,
   viewportCamera,
 } from './view';
+export {
+  MAX_RENDER_SIDE,
+  finalRenderScene,
+  renderOutputSize,
+  scaledOutputNote,
+  type RenderOutputSize,
+} from './final';
 export { filmRowsToRGBA8 } from './preview';
 export { RenderCancelledError, type PixelImage, type RenderViewData, type EncodeFormat } from './protocol';
 

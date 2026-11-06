@@ -37,11 +37,10 @@ Contents:
   the server stops. Export what you need (`export_scene`) or ask for a server with `DATA_DIR`.
 - **Read schemas instead of guessing.** Names are strict: a misspelled tool argument
   (`set_scene_settings {"sampels": 5}`), a misspelled key inside `view`, `selection` or a batch
-  operation, and a misspelled operator or modifier parameter all fail the call with did-you-mean
-  suggestions and the valid names, and change nothing. Tool input schemas are in `tools/list`;
-  operator parameters go inside `params`. The catalogues explain themselves:
-  <!-- re-check: uncommitted server change on 2026-11-06 (strict tool arguments,
-  apps/server/src/mcp/strict-args.ts) -->
+  operation, and a misspelled operator or modifier parameter all fail with did-you-mean
+  suggestions and the valid names before anything changes (in a `batch`, the operations before
+  the failing one stay applied). Tool input schemas are in `tools/list`; operator parameters go
+  inside `params`. The catalogues explain themselves:
   - `list_operators {category: "<group>"}` returns the operators of a feature with their JSON
     schemas, e.g. `Curves`, `Constraints`, `Rigging`, `Physics`, `Generators`, `Drivers`,
     `Shading`, `Lights and Cameras`, `Layout`, `Scene`;
@@ -244,7 +243,8 @@ Each agent has its own selection, active object and mode, separate from every hu
   changes every generated rock. Pass `materials: false` to get empty slots, or assign new
   materials.
 - **Vertex colours**: `paint.vertex_color_set` / `paint.vertex_color_stroke` multiply the base
-  colour.
+  colour; `paint.vertex_color_set_data {object, colors | indices | ranges}` writes exact linear
+  colours per vertex (in `get_mesh_data` vertex order), e.g. computed from height and slope.
 - Image textures cannot be loaded through MCP; they arrive with imported glTF files or through
   the web editor's Material tab.
 
@@ -311,8 +311,9 @@ Each agent has its own selection, active object and mode, separate from every hu
   - the studio environment lights the scene but is hidden from the background by default (the
     background shows the world colour); `data.set_property` with `kind: "world"` and
     `values: {show_environment_background: true}` shows it, and `environment_rotation` (radians)
-    turns it (the orrery turns its studio by 200°). A sky set with `world.sky_set` or
-    `set_scene_settings` shows itself as the background.
+    turns it (the orrery turns its studio by 200°). Switching to a sky with `world.sky_set` or
+    `set_scene_settings` also shows the sky as the background (`world.sky_set` with
+    `show_background: false` hides it).
 
 ## Animation
 
@@ -393,10 +394,13 @@ Each agent has its own selection, active object and mode, separate from every hu
    (bone axes: Y runs along the bone; rotating about X or Z bends it) or `insert_keyframe` with
    `property: 'pose.bones["Upper"].rotation_euler'`. `pose.transforms_clear` resets.
 5. **IK**: `pose.ik_add {object, bone, target, chain_count, pole_target, pole_angle}` puts the end
-   of a `chain_count`-bone chain on a target object (usually an empty you animate) or bone. Other
-   bone constraints (`pose.constraint_add`): `COPY_ROTATION`, `COPY_LOCATION`, `DAMPED_TRACK`,
-   `LIMIT_ROTATION`. The robot keeps its wrist vertical with a `DAMPED_TRACK` to an empty below the
-   IK target.
+   of a `chain_count`-bone chain on a target object (usually an empty you animate) or bone.
+   `pose.ik_settings_set {object, bone, …}` locks (`lock_ik_x`), limits (`use_ik_limit_z` with
+   `ik_min_z` / `ik_max_z`, radians from the rest pose) or stiffens (`ik_stiffness_y`) a bone's
+   rotation in every IK chain that contains it; a base bone that may only yaw locks X and Z.
+   Other bone constraints (`pose.constraint_add`): `COPY_ROTATION`, `COPY_LOCATION`,
+   `DAMPED_TRACK`, `LIMIT_ROTATION`. The robot keeps its wrist vertical with a `DAMPED_TRACK` to an
+   empty below the IK target.
 6. **Verify** with `armature.describe {object, frame}`: `posed_head_world` and `posed_tail_world`
    per bone and pose `errors`. The robot script measures its IK error in millimetres this way.
 
@@ -485,7 +489,7 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
 | Motion check                   | `render_animation {format: "CONTACT_SHEET", engine: "RASTER", frame_step}` with 12–24 tiles            |
 | Lighting and material preview  | `PATHTRACER`, 640×360, 16–64 samples, `denoise: true`, `time_limit` 45–60                              |
 | Final still                    | `PATHTRACER`, 1280×720, 128–256 samples, `denoise: true`, `max_bounces` 6–10, `time_limit` 420–480     |
-| Animation (contact sheet, GIF) | `PATHTRACER`, 320×180 tiles or 480×270 GIF frames, 8–32 samples, `denoise: true`, `time_limit` 200–600 |
+| Animation (contact sheet, GIF) | `PATHTRACER`, 320×180 tiles or 480×270 GIF frames, 6–32 samples, `denoise: true`, `time_limit` 200–600 |
 
 - Path tracing time grows with pixels × samples × bounces and with scene complexity. `time_limit`
   is wall-clock time: sampling stops when it is used up, after at least one sample per pixel. The
@@ -517,8 +521,6 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
 - The download link exports again when it is fetched, with the same format, objects,
   `apply_modifiers` and frame (after later edits it gives the project as it is then); it needs the
   server's `AUTH_TOKEN` when one is set.
-  <!-- re-check: uncommitted server change on 2026-11-06 (export_scene `frame` and download_url
-  options, apps/server/src/mcp/tools.ts) -->
 - OBJ, STL and PLY hold static, world-space meshes.
 - <!-- re-check: gltf-export (matched packages/core/src/io/gltf-export.ts on 2026-11-06) --> glTF:
   hierarchy, materials with procedural textures baked to 512×512 PNGs (UVs are generated for
@@ -576,9 +578,9 @@ Pitfalls the example projects ran into:
 - The selection persists: a selection-based operator without `selection` acts on what the last
   call selected (often the object you just added).
 - Names are made unique (`Cube.001`): use the `name` a result returns.
-- Misspelled tool arguments (`base_colour`, `rotaton`, `parms`) fail the call, and so do operator
-  parameters given as tool arguments; the message names the argument you meant or says that
-  operator parameters go inside `params`.
+- Operator parameters given as tool arguments fail the call, like misspelled tool arguments
+  (`base_colour`, `rotaton`, `parms`): `run_operator {operator: "object.empty_add", name: "E"}`
+  is rejected with a message that operator parameters go inside `params`.
 - `transform_object` on an animated channel changes only the stored value; the keys win.
 - `get_scene`, `get_object` and `render_image` use your current frame, which starts at 1.
 - A scaled object stretches its OBJECT-mapped procedural textures: apply the scale first.

@@ -884,11 +884,12 @@ async function check() {
   log(`  camera: ${(cam.constraints ?? []).map((c) => `${c.type} → ${(c.targets ?? []).join(', ')}`).join(', ')}; aims ${angle.toFixed(3)}° off the target`);
   if (angle > 0.1) throw new Error(`camera does not aim at its target (${angle}°)`);
 
-  // Scatter placement. Instances have no positions of their own in the MCP results, so each
-  // particle system is made real for a moment: one batch shows only that system and runs
+  // Scatter placement. No MCP tool reports where the instances of a particle system are, so each
+  // system is made real for a moment: one batch shows only that system and runs
   // object.duplicates_make_real, get_scene lists the new objects, and undo reverts the batch.
-  // The 2,600 grass tufts are left out: making them real roughly doubles the server's memory
-  // (see the README). They follow the same density rules (zero weight on the dry beach).
+  // The 2,600 grass tufts are left out to keep the check light (listing them alone is 1.3 MB of
+  // JSON, and the server's memory is already tight); they follow the same density rules (zero
+  // weight on the dry beach and the path).
   const pathLine = resample(PATH_WAYPOINTS, 0.25);
   for (const sc of SCATTERS.filter((x) => x.count <= 500)) {
     const res = await ops([
@@ -934,7 +935,7 @@ async function renders() {
   }
   if (!FLAGS.has('--skip-final')) {
     const t = Date.now();
-    const r = await tool('render_image', { width: 1280, height: 720, engine: 'PATHTRACER', samples: 128, max_bounces: 8, denoise: true, time_limit: 420, frame: 1 });
+    const r = await tool('render_image', { width: 1280, height: 720, engine: 'PATHTRACER', samples: 128, max_bounces: 8, denoise: true, time_limit: 480, frame: 1 });
     stats.final = { seconds: (Date.now() - t) / 1000, samples: r.text?.samples, requested: r.text?.requested_samples, threads: r.text?.threads };
     log(`final still: ${JSON.stringify(stats.final)}`);
     await saveResult(r, 'render.png');

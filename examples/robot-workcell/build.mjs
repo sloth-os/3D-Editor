@@ -4,16 +4,18 @@
  *
  *   MCP_URL=http://127.0.0.1:8080/mcp node examples/robot-workcell/build.mjs [mode] [options]
  *
- * Modes (the scene is always deleted, rebuilt and verified first)
+ * Modes (exclusive; the scene is always deleted, rebuilt and verified first)
  *   (none)             final renders: render.png, contact_sheet.png, preview.gif
  *   --no-render        build + verify only (a few seconds)
  *   --export-only      build + verify, then export scene.glb (no renders)
  *   --preview=DIR      build + verify, then quick previews into DIR (RASTER stills, a RASTER
  *                      contact sheet and one small path-traced frame); the outputs are untouched
- * Options for the final renders
+ * Options for the final renders (only without a mode flag)
  *   --still-only       only render.png
  *   --anim-only        only contact_sheet.png and preview.gif
  *   --still-time=S     time limit of the path-traced still in seconds (default 480)
+ * Unknown, repeated or incomplete arguments (e.g. --preview without =DIR) and contradictory
+ * combinations are rejected before anything is built or rendered.
  *
  * Outputs (next to this script): render.png (path-traced 1280x720 still), contact_sheet.png
  * (24 path-traced frames of the cycle), preview.gif (48-frame pick-and-place cycle) and, with
@@ -30,21 +32,37 @@ import { connect } from '../../scripts/mcp.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT = 'robot-workcell';
-const argv = process.argv.slice(2);
-const flag = (name) => argv.includes(`--${name}`);
-const option = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
-const KNOWN = ['no-render', 'export-only', 'preview', 'still-only', 'anim-only', 'still-time'];
-for (const a of argv) {
-  const name = a.replace(/^--/, '').split('=')[0];
-  if (!a.startsWith('--') || !KNOWN.includes(name)) throw new Error(`unknown argument ${a} (known: ${KNOWN.map((k) => `--${k}`).join(' ')})`);
+
+// Command line, validated strictly before anything runs: the default mode overwrites the final
+// outputs, so a mistyped or incomplete flag must never fall through to it.
+const FLAGS = ['no-render', 'export-only', 'still-only', 'anim-only']; // --name
+const VALUES = ['preview', 'still-time']; // --name=value
+const args = {};
+for (const a of process.argv.slice(2)) {
+  const m = /^--([a-z-]+)(?:=(.*))?$/s.exec(a);
+  const known = [...FLAGS.map((k) => `--${k}`), ...VALUES.map((k) => `--${k}=…`)].join(' ');
+  if (!m || (!FLAGS.includes(m[1]) && !VALUES.includes(m[1]))) throw new Error(`unknown argument ${a} (known: ${known})`);
+  const [, name, value] = m;
+  if (FLAGS.includes(name) && value !== undefined) throw new Error(`--${name} takes no value`);
+  if (VALUES.includes(name) && !value) throw new Error(`--${name} needs a value: --${name}=${name === 'preview' ? 'DIR' : 'SECONDS'}`);
+  if (name in args) throw new Error(`--${name} is given twice`);
+  args[name] = value ?? true;
 }
-const NO_RENDER = flag('no-render');
-const EXPORT_ONLY = flag('export-only');
-const PREVIEW_DIR = option('preview');
-const STILL_ONLY = flag('still-only');
-const ANIM_ONLY = flag('anim-only');
-const STILL_TIME = Number(option('still-time') ?? 480);
-const FINAL_RENDERS = !NO_RENDER && !EXPORT_ONLY && !PREVIEW_DIR;
+const modes = ['no-render', 'export-only', 'preview'].filter((k) => k in args);
+if (modes.length > 1) throw new Error(`the modes ${modes.map((k) => `--${k}`).join(', ')} are exclusive`);
+if (args['still-only'] && args['anim-only']) throw new Error('--still-only and --anim-only are exclusive (give neither to render both)');
+const finalOptions = ['still-only', 'anim-only', 'still-time'].filter((k) => k in args);
+if (modes.length && finalOptions.length)
+  throw new Error(`${finalOptions.map((k) => `--${k}`).join(', ')} only ${finalOptions.length > 1 ? 'apply' : 'applies'} to the final renders (no mode flag), not to --${modes[0]}`);
+if (args['anim-only'] && args['still-time']) throw new Error('--still-time has no effect with --anim-only');
+const NO_RENDER = !!args['no-render'];
+const EXPORT_ONLY = !!args['export-only'];
+const PREVIEW_DIR = args.preview;
+const STILL_ONLY = !!args['still-only'];
+const ANIM_ONLY = !!args['anim-only'];
+const STILL_TIME = Number(args['still-time'] ?? 480);
+if (!(STILL_TIME > 0 && STILL_TIME <= 3600)) throw new Error(`--still-time must be a number of seconds in (0, 3600], got ${args['still-time']}`);
+const FINAL_RENDERS = !modes.length;
 
 const T0 = Date.now();
 const log = (...a) => console.log(`[${((Date.now() - T0) / 1000).toFixed(1).padStart(6)}s]`, ...a);
@@ -1143,6 +1161,13 @@ async function render(toolName, args, label) {
   const r = await tool(toolName, args, { onProgress: progress(label) });
   return { r, ms: Date.now() - t, meta: info(r) };
 }
+/** Samples per pixel the frames of a path-traced render_animation reached, when the editor
+ *  reports them (frame_samples; editor builds before commit 6451e56 only list undersampled_frames). */
+function sampleStats(meta) {
+  const s = meta.frame_samples;
+  if (!Array.isArray(s) || !s.length) return { frame_samples: 'not reported' };
+  return { spp_min: Math.min(...s), spp_mean: +(s.reduce((a, b) => a + b, 0) / s.length).toFixed(1), spp_max: Math.max(...s), requested: meta.requested_samples };
+}
 const timings = { build_s: +((Date.now() - T0) / 1000).toFixed(1), build_mcp_calls: mcpCalls, verify };
 
 if (PREVIEW_DIR) {
@@ -1187,8 +1212,9 @@ if (FINAL_RENDERS) {
       { format: 'CONTACT_SHEET', engine: 'PATHTRACER', frame_start: 1, frame_end: FRAME_END, frame_step: 4, width: 320, height: 180, columns: 6, samples: 12, max_bounces: 4, denoise: true, frame_time_limit: 10, time_limit: 300 },
       'contact_sheet.png',
     );
+    if (meta.truncated) throw new Error(`contact_sheet.png truncated: ${JSON.stringify(meta).slice(0, 600)}`);
     let bytes = await save(r, path.join(HERE, 'contact_sheet.png'));
-    timings.contact_sheet = { s: +(ms / 1000).toFixed(1), frames: meta.frames?.length, undersampled: meta.undersampled_frames?.length ?? 0, truncated: !!meta.truncated, bytes };
+    timings.contact_sheet = { s: +(ms / 1000).toFixed(1), frames: meta.frames?.length, undersampled: meta.undersampled_frames?.length ?? 0, ...sampleStats(meta), bytes };
     log(`contact_sheet.png: ${JSON.stringify(timings.contact_sheet)}`);
     // preview.gif: the whole 96-frame cycle as 48 path-traced frames (every 2nd frame, 12 fps)
     ({ r, ms, meta } = await render(
@@ -1199,7 +1225,7 @@ if (FINAL_RENDERS) {
     if (meta.truncated) throw new Error(`preview.gif truncated: ${JSON.stringify(meta).slice(0, 600)}`);
     bytes = await save(r, path.join(HERE, 'preview.gif'), 'image/gif');
     if (bytes > 6e6) log(`WARNING: preview.gif is ${(bytes / 1e6).toFixed(2)} MB (limit 6 MB)`);
-    timings.gif = { s: +(ms / 1000).toFixed(1), frames: meta.frames?.length, undersampled: meta.undersampled_frames?.length ?? 0, bytes };
+    timings.gif = { s: +(ms / 1000).toFixed(1), frames: meta.frames?.length, undersampled: meta.undersampled_frames?.length ?? 0, ...sampleStats(meta), bytes };
     log(`preview.gif: ${JSON.stringify(timings.gif)} ${JSON.stringify(meta).slice(0, 400)}`);
   }
 }

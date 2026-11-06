@@ -12,18 +12,18 @@
  *                  (12 path traced frames) and preview.gif (48 path traced frames, 480×270)
  *   --build-only   build + verify only, no renders (about a minute; the per-frame clearance sweep is
  *                  most of it)
- *   --preview      build + verify + quick previews in $PREVIEW_DIR (RASTER still, 640×360 path traced
- *                  still, RASTER contact sheet); nothing is written next to this script
+ *   --preview      build + verify + quick previews in $PREVIEW_DIR (960×540 RASTER still, 640×360 path
+ *                  traced still, RASTER contact sheet); nothing is written next to this script
  *   --export-only  build + verify + scene.glb (glTF binary), no renders
  *   --stages a,b   explicit stage list instead of a mode: build (always), preview, still, anim, export
  *   --out-dir DIR  where render.png / contact_sheet.png / preview.gif / scene.glb are written
  *                  (default: this folder)
- * Any other argument (e.g. "build-only" without the dashes) or an unknown stage name stops the
- * script with exit code 2 before it connects to the server.
+ * Any other argument (e.g. "build-only" without the dashes), an unknown stage name, two modes at once
+ * or a flag without its value stops the script with exit code 2 before it connects to the server.
  *
  * Mechanism: ONE master channel — the empty "Master Drive", rotation Z keyed linearly 0 → 2π over
  * frames 1 → 49 (anim.keyframes_insert_many) and repeated forever (anim.extrapolation_set CYCLIC).
- * Every moving part reads it through a scripted driver (anim.driver_add):
+ * Every rotating part reads it through a scripted driver (anim.driver_add):
  *   planet arms   θ = phase + n·m      n = 4, 3, 2, 1 orbits per master turn (12/16/24/48 frames)
  *   planet spin   θ = s·m              (integer turns, so the 48-frame loop is seamless)
  *   gear train    θ_B = φ_B − (T_A/T_B)·(θ_A − φ_A)  for every meshing pair A→B (opposite senses,
@@ -937,17 +937,21 @@ async function animation() {
   timings['contact_sheet.png'] = { ms: Date.now() - t0, info: sheet.text };
   await saveImage(sheet, path.join(OUT_DIR, 'contact_sheet.png'));
   console.log(`    → contact_sheet.png ${short(sheet.text, 400)}`);
-  // GIF: 6 spp with the whole 600 s budget (37.5 s per frame on each of 3 threads at the start), so
-  // every frame reaches the same sample count even on a busy machine: with the fixed seed the static
-  // parts are then identical in every frame (frames cut short at a lower count would shimmer)
+  // GIF: 8 spp with the largest budget render_animation allows (600 s, i.e. a 37.5 s share per frame
+  // on each of 3 threads; a frame needs ~9 s on an idle core, ~25 s on a busy machine), so every
+  // frame reaches the same sample count: with the fixed seed the static parts are then identical in
+  // every frame (frames cut short at a lower count would shimmer). Dropped frames fail the build;
+  // frames that stopped sampling early (undersampled_frames) are reported as a warning.
   t0 = Date.now();
-  const gif = await call('render_animation', { ...common, format: 'GIF', width: 480, height: 270, samples: 6, fps: 16, dither: 'BAYER', time_limit: 600 });
+  const gif = await call('render_animation', { ...common, format: 'GIF', width: 480, height: 270, samples: 8, fps: 16, dither: 'BAYER', time_limit: 600 });
   timings['preview.gif'] = { ms: Date.now() - t0, info: gif.text };
   await saveImage(gif, path.join(OUT_DIR, 'preview.gif'));
   console.log(`    → preview.gif ${short(gif.text, 400)}`);
-  for (const r of [sheet, gif]) {
+  for (const [file, r] of [['contact_sheet.png', sheet], ['preview.gif', gif]]) {
     const info = r.text ?? {};
-    if (info.truncated) throw new Error(`animation truncated: ${short(info)}`);
+    if (info.truncated) throw new Error(`${file}: animation truncated: ${short(info)}`);
+    if (info.undersampled_frames?.length) warnings.push(`${file}: frames ${info.undersampled_frames.join(', ')} stopped sampling early (time budget)`);
+    else console.log(`    ${file}: every frame reached its full samples`);
   }
 }
 

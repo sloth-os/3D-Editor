@@ -121,7 +121,7 @@ export function resolveDatablock(doc: SceneDoc, kind: DatablockKind, ref: string
           `'${ref}' names both the ${label} object '${o.name}' (whose ${label} data is '${own?.name ?? o.data}') ` +
           `and another ${label} datablock called '${other.name}'` +
           (users.length ? ` (used by ${nameList(users.map((u) => u.name))})` : '') +
-          `: changed the object's data '${own?.name ?? o.data}'. To change '${other.name}' instead, pass its ` +
+          `: used the object's data '${own?.name ?? o.data}'. To use '${other.name}' instead, pass its ` +
           `datablock id '${other.id}'` +
           (users.length ? ` or the name of an object using it ('${users[0].name}')` : ''),
       };
@@ -138,7 +138,7 @@ export function resolveDatablock(doc: SceneDoc, kind: DatablockKind, ref: string
         object: null,
         warning:
           `'${ref}' names both the material '${byName.name}' and the object '${o.name}' (whose only material ` +
-          `is '${mats[0].name}'): changed the material '${byName.name}'. To change '${mats[0].name}' instead, ` +
+          `is '${mats[0].name}'): used the material '${byName.name}'. To use '${mats[0].name}' instead, ` +
           `pass its name or id '${mats[0].id}'`,
       };
     }

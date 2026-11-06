@@ -2,6 +2,7 @@ import type { Vec3 } from '../math/types';
 import { Rng } from './random';
 import { MeshBuilder, boxProjectUV, clampNum, placeMesh } from './builder';
 import { polygonize, type ScalarGrid } from './isosurface';
+import { faceIslands } from '../mesh/topology';
 import { MATERIALS, type GeneratorResult } from './types';
 
 /*
@@ -365,7 +366,19 @@ export const CLOUD_DEFAULTS: CloudParams = {
   seed: 0,
 };
 
-/** Puffy cloud centred on the Z axis with its base at z = 0. Slot 0: Cloud. */
+/**
+ * Puffy cloud centred on the Z axis with its base at z = 0. Slot 0: Cloud.
+ *
+ * Built in a normalized space (cloud height about 1) and stretched to the exact size at the end:
+ * a base layer of puffs spread evenly over the footprint ellipse, smaller puffs heaped on top of
+ * them. The base puffs are about half the cloud height (the cumulus look) but at least large
+ * enough that their number of them, spread over the footprint, overlap into one connected layer:
+ * a flat cloud (footprint much larger than its height, e.g. a 520 × 110 × 12 m stratus streak)
+ * gets puffs wider than the cloud is high, which the final stretch flattens into a continuous
+ * layer. The marching-cubes grid is refined where the longest side alone would leave a base puff
+ * less than 2.5 cells wide in radius (long or flat clouds), within the sample budget of a cube of
+ * `resolution` cells.
+ */
 export function generateCloud(params: Partial<CloudParams> = {}): GeneratorResult {
   const p = { ...CLOUD_DEFAULTS, ...params };
   const size = (p.size ?? CLOUD_DEFAULTS.size).map((v, i) =>
@@ -374,41 +387,47 @@ export function generateCloud(params: Partial<CloudParams> = {}): GeneratorResul
   const puffs = Math.round(clampNum(p.puffs, 1, 64, CLOUD_DEFAULTS.puffs));
   const res = Math.round(clampNum(p.resolution, 8, 160, CLOUD_DEFAULTS.resolution));
   const rng = new Rng(p.seed, 0xc10d);
-  // build in a normalized space (height 1) and stretch to the exact size at the end:
-  // a base layer of large puffs spread over the footprint, smaller puffs heaped on top of them
   const ax = size[0] / size[2];
   const ay = size[1] / size[2];
-  const rBase = Math.max(0.2, Math.min(0.55, ax / 4, ay / 4));
   const baseCount = Math.max(1, Math.round(puffs * 0.55));
-  const spheres: BlobSphere[] = [];
-  for (let i = 0; i < baseCount; i++) {
-    const r = rBase * rng.range(0.7, 1);
-    const a = (2 * Math.PI * i) / baseCount + rng.spread(0.5);
-    const u = baseCount === 1 ? 0 : rng.range(0.35, 1);
-    const cx = Math.cos(a) * u * Math.max(0, ax / 2 - r);
-    const cy = Math.sin(a) * u * Math.max(0, ay / 2 - r);
-    spheres.push({ center: [cx, cy, r * 0.35], radius: r });
-  }
+  // base puff radius: the classic cumulus size, or what it takes to cover the footprint with
+  // baseCount overlapping puffs (over its area, and along its length for a long streak)
+  const rBase = Math.max(
+    0.2,
+    Math.min(0.55, ax / 4, ay / 4),
+    0.6 * Math.sqrt((ax * ay) / baseCount),
+    (0.6 * Math.max(ax, ay)) / (baseCount + 1),
+  );
+  const spheres = baseLayer(rng, ax / 2, ay / 2, baseCount, rBase);
   for (let i = baseCount; i < puffs; i++) {
-    // heap on a base puff, preferring the ones near the centre
+    // heap on a base puff, preferring the ones near the centre (the first ones of the layer);
+    // pulled a little toward the centre for a domed top, but never off its base puff
     const j = Math.min(baseCount - 1, Math.floor(rng.next() * rng.next() * baseCount));
     const base = spheres[j];
     const r = base.radius * rng.range(0.55, 0.85);
+    const off = Math.hypot(base.center[0], base.center[1]);
+    const pull = off > 1e-9 ? Math.min(0.3, (0.35 * base.radius) / off) : 0;
     spheres.push({
       center: [
-        base.center[0] * 0.7 + rng.spread(base.radius * 0.4),
-        base.center[1] * 0.7 + rng.spread(base.radius * 0.4),
+        base.center[0] * (1 - pull) + rng.spread(base.radius * 0.3),
+        base.center[1] * (1 - pull) + rng.spread(base.radius * 0.3),
         base.center[2] + base.radius * rng.range(0.45, 0.85),
       ],
       radius: r,
     });
   }
-  const k = clampNum(p.smoothness, 0, 2, CLOUD_DEFAULTS.smoothness);
   const flat = p.flat_bottom !== false;
+  // smoothness is a fraction of the cloud height: scale it (and the flat cut) to the height of
+  // the puffs in the normalized space, which grows with the puffs of a flat cloud
+  const bare = sphereBounds(spheres, 0);
+  const height = bare.max[2] - (flat ? Math.max(bare.min[2], 0) : bare.min[2]);
+  const k = clampNum(p.smoothness, 0, 2, CLOUD_DEFAULTS.smoothness) * height;
+  const cut = 0.05 * height;
   const { min, max } = sphereBounds(spheres, k * 0.5);
-  if (flat) min[2] = Math.max(min[2], -0.05);
-  const box = gridBox(min, max, res);
-  const b = box ? meshGrid(sampleSpheres(spheres, k, box.lo, box.hi, box.cell, flat ? 0.05 : null)) : null;
+  if (flat) min[2] = Math.max(min[2], -cut);
+  const smallest = Math.min(...spheres.slice(0, baseCount).map((sp) => sp.radius));
+  const box = cloudGrid(min, max, res, smallest / 2.5);
+  const b = box ? meshGrid(sampleSpheres(spheres, k, box.lo, box.hi, box.cell, flat ? cut : null)) : null;
   if (!b) return { mesh: new MeshBuilder().build(), materials: [MATERIALS.cloud] };
   const mesh = b.build();
   placeMesh(mesh, { ground: true, centerXY: true });
@@ -426,5 +445,99 @@ export function generateCloud(params: Partial<CloudParams> = {}): GeneratorResul
   for (let i = 0; i < P.length; i += 3)
     for (let c = 0; c < 3; c++) if (ext[c] > 1e-9) P[i + c] *= size[c] / ext[c];
   mesh.uvs = mesh.faces.map((f) => boxProjectUV(P, f));
-  return { mesh, materials: [MATERIALS.cloud] };
+  const warnings: string[] = [];
+  const islands = faceIslands(mesh);
+  if (islands.count > 1)
+    warnings.push(
+      `the cloud came out in ${islands.count} separate pieces: raise puffs, smoothness or resolution`,
+    );
+  return { mesh, materials: [MATERIALS.cloud], ...(warnings.length ? { warnings } : {}) };
+}
+
+/**
+ * The cloud's base layer: `count` puffs of radius rBase × 0.7…1 whose centres are spread evenly
+ * (best-candidate sampling) over the ellipse with half-axes hx, hy minus their radius, sorted from
+ * the centre outward (heaped puffs prefer the first ones). Then the radii are scaled up where
+ * needed until neighbouring puffs overlap along a minimum spanning tree of the centres, so the
+ * layer is always one connected piece, whatever the footprint (a long streak has its centres on a
+ * line, a wide flat cloud on a disc).
+ */
+function baseLayer(rng: Rng, hx: number, hy: number, count: number, rBase: number): BlobSphere[] {
+  const radii = Array.from({ length: count }, () => rBase * rng.range(0.7, 1));
+  const pts: [number, number][] = [];
+  const candidates = 16;
+  for (let i = 0; i < count; i++) {
+    const ex = Math.max(0, hx - radii[i]);
+    const ey = Math.max(0, hy - radii[i]);
+    let best: [number, number] = [0, 0];
+    let bestD = -1;
+    for (let c = 0; c < (i === 0 ? 1 : candidates); c++) {
+      // uniform over the ellipse (the first puff near the centre)
+      const rho = i === 0 ? 0.3 * rng.next() : Math.sqrt(rng.next());
+      const a = rng.next() * 2 * Math.PI;
+      const q: [number, number] = [Math.cos(a) * rho * ex, Math.sin(a) * rho * ey];
+      let d = Infinity;
+      for (const o of pts) d = Math.min(d, Math.hypot(q[0] - o[0], q[1] - o[1]));
+      if (d > bestD) {
+        bestD = d;
+        best = q;
+      }
+    }
+    pts.push(best);
+  }
+  const order = pts
+    .map((q, i) => ({ q, r: radii[i], t: Math.hypot(q[0] / Math.max(hx, 1e-9), q[1] / Math.max(hy, 1e-9)) }))
+    .sort((a, b) => a.t - b.t);
+  // overlap along a minimum spanning tree (Prim): neighbouring puffs must reach into each other
+  // by a quarter of their radii so that the union stays connected at the grid resolution
+  let scale = 1;
+  const inTree = new Array<boolean>(count).fill(false);
+  const link = new Array<number>(count).fill(Infinity);
+  const from = new Array<number>(count).fill(-1);
+  link[0] = 0;
+  for (let n = 0; n < count; n++) {
+    let u = -1;
+    for (let i = 0; i < count; i++) if (!inTree[i] && (u < 0 || link[i] < link[u])) u = i;
+    inTree[u] = true;
+    if (from[u] >= 0) {
+      const a = order[u];
+      const b = order[from[u]];
+      const d = Math.hypot(a.q[0] - b.q[0], a.q[1] - b.q[1]);
+      scale = Math.max(scale, d / (0.75 * (a.r + b.r)));
+    }
+    for (let i = 0; i < count; i++) {
+      if (inTree[i]) continue;
+      const d = Math.hypot(order[i].q[0] - order[u].q[0], order[i].q[1] - order[u].q[1]);
+      if (d < link[i]) {
+        link[i] = d;
+        from[i] = u;
+      }
+    }
+  }
+  return order.map(({ q, r }) => ({ center: [q[0], q[1], r * scale * 0.35], radius: r * scale }));
+}
+
+/**
+ * The cloud's marching-cubes grid: `resolution` cells along the longest side (like gridBox), but
+ * cells no larger than `fine` where that fits in the samples of a cube of `resolution` cells (a
+ * long or flat cloud has few cells across its short sides, so its puffs can be resolved).
+ */
+function cloudGrid(
+  min: Vec3,
+  max: Vec3,
+  resolution: number,
+  fine: number,
+): { lo: Vec3; hi: Vec3; cell: number } | null {
+  const box = gridBox(min, max, resolution);
+  if (!box || !(fine > 0) || fine >= box.cell) return box;
+  const ext = [0, 1, 2].map((a) => max[a] - min[a]);
+  // the cell size at which the box (with its margin) holds resolution³ cells
+  const budget = Math.cbrt((ext[0] + 2 * fine) * (ext[1] + 2 * fine) * (ext[2] + 2 * fine)) / resolution;
+  const cell = Math.max(fine, budget);
+  if (cell >= box.cell) return box;
+  return {
+    lo: [min[0] - cell, min[1] - cell, min[2] - cell],
+    hi: [max[0] + cell, max[1] + cell, max[2] + cell],
+    cell,
+  };
 }

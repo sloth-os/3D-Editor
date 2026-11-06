@@ -114,8 +114,9 @@ after `ROOM_IDLE_TTL_SECONDS` (default 3600 s).
 
 **Progress.** When a request carries a progress token (`_meta.progressToken`), long renders send
 `notifications/progress` at most every 250 ms: samples per pixel for path-traced stills, frames
-for animations. Clients should reset their request timeout on progress (`scripts/mcp.mjs` does,
-with a 15-minute timeout).
+for animations, and the elapsed seconds every 5 s while a browser editor path traces (until
+`time_limit` has passed). Clients should reset their request timeout on progress
+(`scripts/mcp.mjs` does, with a 15-minute timeout).
 
 ## Conventions
 
@@ -131,20 +132,21 @@ with a 15-minute timeout).
   `object.modifier_add`, `bevel_depth`, `energy`); data paths use Blender syntax
   (`pose.bones["Arm"].rotation_euler`, `constraints["Track To"].influence`).
 - **Strict names.** Unknown or misspelled names are rejected with did-you-mean suggestions and the
-  list of valid names; nothing is changed.
+  list of valid names.
   - **Tool arguments** are checked before a tool runs, for names as well as types and ranges, at
-    the top level and inside `view`, `selection` (and its `mesh`) and the `operations` of `batch`:
-    `set_scene_settings {"sampels": 5}` fails with "Input validation error: Invalid arguments for
-    tool set_scene_settings: unknown argument 'sampels' (did you mean 'samples'?). Valid arguments:
-    …". The message points a key that belongs inside a nested argument there
-    (`'position' goes inside 'view'`), and tools that take `params` say that operator or modifier
-    parameters go there. The input schemas in `tools/list` are closed
+    the top level and inside `view`, `selection` (and its `mesh`) and the `operations` of `batch`,
+    so a rejected call changes nothing: `set_scene_settings {"sampels": 5}` fails with "Input
+    validation error: Invalid arguments for tool set_scene_settings: unknown argument 'sampels'
+    (did you mean 'samples'?). Valid arguments: …". A key that belongs inside a nested argument is
+    pointed there (`'position' goes inside 'view'`). For a key that is no typo of a valid
+    argument, the tools that take `params` add a hint that operator, modifier or command
+    parameters belong there, and `set_material`, `insert_keyframe` and `set_scene_settings` name
+    the operators for settings they do not take. The input schemas in `tools/list` are closed
     (`additionalProperties: false`).
   - **Operator and modifier parameters** (the `params` of `run_operator`, `batch`, `edit_mesh`,
     `add_object` and the modifier tools) are checked by the operator registry, at every nesting
-    level. Operator JSON schemas carry `additionalProperties: false`.
-  <!-- re-check: uncommitted server change on 2026-11-06 (strict tool arguments,
-  apps/server/src/mcp/strict-args.ts) -->
+    level, before the operator runs; in a `batch`, the operations before a rejected one stay
+    applied. Operator JSON schemas carry `additionalProperties: false`.
 - **Evaluated and stored values.** `get_scene` and `get_object` report values at a frame after
   keyframes, drivers, F-curve modifiers, constraints and physics, like Blender's properties
   editor. Where animation overrides the value stored in the document, the stored value is listed
@@ -251,10 +253,6 @@ count; use `get_object` for everything about one object.
 Evaluations are cached per document state and frame, so repeated `get_scene`, `get_object` and
 `get_mesh_data` calls (checking motion at many frames, say) are cheap until the scene changes.
 
-<!-- re-check: uncommitted server change on 2026-11-06 (render-settings counts, evaluated_viewport,
-wire bounds, curve settings and cached evaluations in apps/server/src/mcp/scene-summary.ts and
-eval-cache.ts) -->
-
 #### `get_object`
 
 Arguments: `project`, `object`, `frame`.
@@ -300,7 +298,7 @@ indentation).
 
 Arguments: `category`, `search`, `include_parameters`.
 
-The operator catalogue: 261 operators are registered, of which the 2 `render.*` operators are not
+The operator catalogue: 263 operators are registered, of which the 2 `render.*` operators are not
 listed (renders go through the [rendering tools](#rendering)). `category` accepts, case-insensitively:
 
 - a **registry category**: Add, Animation, Armature, Collection, Curve, Data, Export, Import,
@@ -371,9 +369,6 @@ Refused operators (failures too, with the `code` named here):
   `edit_mesh` refuse them and name the tool to use instead (`render_image`, `render_animation`);
 - UI-only operators, which the web app registers for itself (none are part of the server's
   registry), `POLL_FAILED`.
-
-<!-- re-check: uncommitted server change on 2026-11-06 (`error` and `code` in failed run_operator,
-batch and edit_mesh results, apps/server/src/mcp/tools.ts) -->
 
 #### `batch`
 
@@ -574,12 +569,10 @@ Exports the scene evaluated at `frame`. The content is the JSON
 what the format could not represent.
 
 `download_url` is `GET /api/projects/<id>/export` with the same options as query parameters
-(`format`, `frame`, and `objects` and `apply_modifiers=false` when they were given; see
-[REST endpoints](#rest-endpoints)). It exports again when it is fetched: the same file as the
-embedded one while the scene is unchanged, the project's current state after later edits.
-
-<!-- re-check: uncommitted server change on 2026-11-06 (export_scene `frame`, result fields and
-download_url options, apps/server/src/mcp/tools.ts and api/projects.ts) -->
+(`format` and `frame`, plus `objects` when a subset was exported and `apply_modifiers=false` when
+modifiers were not applied; see [REST endpoints](#rest-endpoints)). It exports again when it is
+fetched: the same file as the embedded one while the scene is unchanged, the project's current
+state after later edits.
 
 What the formats contain:
 
@@ -616,9 +609,13 @@ agents) or, for `render_image`, in a connected browser editor. `run_operator` re
   camera directly (only in reflections); use emissive materials for visible light sources. It has
   no volumes, subsurface scattering or motion blur.
 - `shading: "SOLID"` (grey clay) always rasterizes. Without `shading`, renders show materials and
-  scene lights. Leave it out for browser renders: an explicit `MATERIAL` there gives the
-  viewport's Material Preview (studio light, scene lamps off), while on the server it is the
-  default look.
+  scene lights. Leave it out for raster renders in a browser editor: an explicit `MATERIAL` there
+  gives the viewport's Material Preview (studio light, scene lamps off), while on the server and
+  for path tracing it is the default look.
+
+<!-- re-check: browser raster shading (apps/web/src/editor/rpc.ts, viewport/engine.ts renderPixels)
+matched the code on 2026-11-06 while a change to the web editor's final renders (render
+visibility, RPC shading) was in progress -->
 
 `engine` defaults to the scene's render engine (`set_scene_settings {engine}`), whichever renderer
 is used. `render_image` chooses where to render with `renderer`:
@@ -631,12 +628,9 @@ is used. `render_image` chooses where to render with `renderer`:
 
 If a browser render fails or times out (raster: 15 s; path tracing: `time_limit` + 30 s), `auto`
 falls back to the server and says so in `note`, and `browser` fails. While an editor path traces,
-the tool sends a progress notification every 5 s (to requests with a progress token). The web
-editor's own Render Image (F12) and Render Animation (Ctrl+F12) windows path trace on the same Web
-Workers. `render_animation` always renders on the server.
-
-<!-- re-check: uncommitted server change on 2026-11-06 (renderer browser path tracing,
-apps/server/src/mcp/tools.ts) -->
+the tool sends a progress notification every 5 s until `time_limit` has passed (to requests with
+a progress token). The web editor's own Render Image (F12) and Render Animation (Ctrl+F12) windows
+path trace on the same Web Workers. `render_animation` always renders on the server.
 
 The server's render threads: `RENDER_WORKERS` (default: CPU cores, at most 8; `0` renders on the
 main thread) plus one thread for raster stills, which never wait for long renders. Long renders
@@ -718,9 +712,6 @@ in the order of `frames`); and when they apply `time_limit_reached`, `hint`,
 `undersampled_frames`, `warnings` (each once, at most 20), `sheet {width, height, columns, rows}`,
 `view {position, target, fov_degrees}` (usable as a `render_image` view), `download_urls` and
 `note`.
-
-<!-- re-check: uncommitted server change on 2026-11-06 (per-frame samples and warnings of
-render_animation, apps/server/src/render/animation.ts) -->
 
 ### Live editors
 
@@ -830,7 +821,7 @@ driver) and the `problems` list of `get_scene`.
 | `get_scene`                                | `max_objects` up to 5000 (default 300); `problems` up to 40                                                                                                                        |
 | `get_mesh_data`                            | 20000 vertices and faces per page (default 2000); heightmap up to 256 samples per side                                                                                             |
 | `list_operators`                           | Parameter schemas when a filter matches at most 60 operators (or `include_parameters: true`)                                                                                       |
-| `render_image`                             | 16–2048 per side; path tracing at most 2,621,440 pixels; `time_limit` up to 600 s (default 30)                                                                                     |
+| `render_image`                             | 16–2048 per side; path tracing on the server at most 2,621,440 pixels; `time_limit` up to 600 s (default 30)                                                                       |
 | Browser renders                            | Raster: 15 s per render request; path tracing: `time_limit` + 30 s                                                                                                                 |
 | `render_animation`                         | 1000 frames, 2048 px per side, `time_limit` up to 600 s (default 60); GIFs and contact sheets at most 33,554,432 pixels over all frames; a contact sheet at most 16,777,216 pixels |
 | Concurrent long renders                    | 2 path-traced stills or animations at once (more wait their turn; raster stills have a thread of their own)                                                                        |

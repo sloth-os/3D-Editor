@@ -224,7 +224,6 @@ const CAMERA_KEYS = [
   'dof_focus_object',
 ] as const;
 
-/** Validated camera data patch for the given fields, plus warnings (e.g. DOF settings while DOF is off). */
 /**
  * Cross-field checks of camera data (shared by camera.properties_set and data.set_property):
  * clip_end must stay greater than clip_start, and a camera cannot focus on itself (one of the
@@ -252,6 +251,7 @@ export function checkCameraFields(
     );
 }
 
+/** Validated camera data patch for the given fields, plus warnings (e.g. DOF settings while DOF is off). */
 export function cameraPatch(
   doc: SceneDoc,
   cameraObjectIds: string[],
