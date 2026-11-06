@@ -291,7 +291,9 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       kind: 'enum',
       default: 'SOFT',
       values: ['SOFT', 'SHARP', 'SHARPER'],
-      description: 'vein sharpness (factor 0 = vein → color_a)',
+      description:
+        'vein sharpness (factor 0 = vein → color_a). The vein WIDTH is set by the ramp: ramp_high ≈ 0.25 with ' +
+        'ramp_interpolation EASE gives thin veins',
     },
     {
       key: 'wave_profile',
@@ -337,12 +339,21 @@ export const PROCEDURAL_TYPE_DOCS: Readonly<Record<ProceduralType, string>> = {
     'cellular noise (stones, cells, scales); factor per `feature`; distortion warps the domain; detail/roughness unused',
   CHECKER: 'alternating 3D checker cells, factor 0/1 (one cell per scaled unit)',
   GRADIENT: 'gradient of the scaled coordinate per `gradient_type` (use OBJECT mapping for centred spheres)',
-  WAVE: 'sine/saw/triangle bands or rings (20 rad per scaled unit like Blender); distortion = noise amount',
+  WAVE:
+    'sine/saw/triangle bands or rings (20 rad per scaled unit like Blender); distortion = noise amount; for thin ' +
+    'lines (color_a) instead of soft bands narrow the ramp, e.g. ramp_high 0.2',
   BRICK:
     'brick wall: random ramp factor per brick, mortar in mortar_r/g/b; rows along Y, bricks along X (plane=WALL: rows along Z)',
   MARBLE:
-    'turbulent vein bands along the XYZ diagonal (scale = bands per unit); distortion = turbulence (≈2), detail/roughness = turbulence noise',
-  WOOD: 'wood growth rings (scale = rings per unit), distortion = ring wobble, `grain` fibre streaks',
+    'turbulent vein bands along the XYZ diagonal (scale = bands per unit); distortion = turbulence (≈2), ' +
+    'detail/roughness = turbulence noise; factor 0 = vein (color_a). The ramp sets the vein width: with the ' +
+    'default 0..1 ramp the factor spreads over the whole range and the stone looks like a soft, cloudy mix of ' +
+    'both colours; for thin veins use ramp_low 0, ramp_high ≈ 0.25 (0.2–0.3) and params.ramp_interpolation ' +
+    'EASE (thin color_a veins on color_b stone, e.g. pale veins on black marble); marble_type SHARP/SHARPER ' +
+    'thins them further',
+  WOOD:
+    'wood growth rings (scale = rings per unit), distortion = ring wobble, `grain` fibre streaks; for thin ' +
+    'dark ring lines (color_a) narrow the ramp, e.g. ramp_high 0.3',
   MAGIC:
     'psychedelic interference pattern; detail = depth 0..10, distortion = folding; each RGB channel is ramped separately',
 };

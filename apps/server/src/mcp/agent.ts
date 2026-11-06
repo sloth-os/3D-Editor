@@ -15,6 +15,7 @@ import type { RoomManager } from '../sync/room-manager';
 import type { Log } from '../observability/log';
 import { randomClientId } from '../sync/awareness';
 import { toolOnlyOperator } from './operator-groups';
+import { AgentHistory, type HistoryLimits } from './history';
 
 /** Errors with a message meant for the agent (returned as `isError` tool results). */
 export class ToolError extends Error {
@@ -28,6 +29,8 @@ export interface AgentDeps {
   rooms: RoomManager;
   registry: OperatorRegistry;
   log: Log;
+  /** Limits of the undo history of each agent and project (see {@link AgentHistory}). */
+  history?: Partial<HistoryLimits>;
 }
 
 /** Characters allowed in agent ids (`x-mcp-agent-id` header / `agent` query parameter). */
@@ -49,7 +52,7 @@ export function parseAgentId(raw: unknown): string | null {
 interface ProjectMemory {
   room: Room;
   state: EditorState;
-  undo: Y.UndoManager;
+  history: AgentHistory;
 }
 
 /**
@@ -72,6 +75,7 @@ export class AgentIdentity {
   constructor(
     readonly key: string,
     readonly agentId: string | null,
+    private readonly historyLimits: Partial<HistoryLimits> = {},
   ) {
     this.origin = agentId ? { type: 'mcp', session: key, agent: agentId } : { type: 'mcp', session: key };
   }
@@ -82,39 +86,54 @@ export class AgentIdentity {
     let m = this.memories.get(room.id);
     if (m && (m.room !== room || room.destroyed)) {
       // the project was unloaded (or deleted) since: its old document is gone, so is the history
-      m.undo.destroy();
+      m.history.destroy();
       m = undefined;
     }
     if (!m) {
       m = {
         room,
         state: createEditorState(),
-        undo: new Y.UndoManager(room.scene.sharedTypes(), {
-          trackedOrigins: new Set([this.origin]),
-          captureTimeout: 0,
-        }),
+        history: new AgentHistory(room.scene.ydoc, room.scene.sharedTypes(), this.origin, this.historyLimits),
       };
       this.memories.set(room.id, m);
     }
     return m;
   }
 
+  /** The undo history in a project, if this identity has one (tests and diagnostics). */
+  historyOf(projectId: string): AgentHistory | undefined {
+    return this.memories.get(projectId)?.history;
+  }
+
+  /**
+   * Ends the history and editor state in a project (deleted). What the history kept for undo is
+   * garbage collected (see {@link AgentHistory.destroy}).
+   */
   forget(projectId: string): void {
-    this.memories.get(projectId)?.undo.destroy();
+    this.memories.get(projectId)?.history.destroy();
     this.memories.delete(projectId);
+  }
+
+  /** Lets go of a closed room (project deleted or unloaded): its history and editor state. */
+  release(room: Room): void {
+    const m = this.memories.get(room.id);
+    if (m?.room !== room) return;
+    m.history.destroy();
+    this.memories.delete(room.id);
   }
 
   /** Drops memories of projects that were unloaded (their documents are gone). */
   prune(): void {
     for (const [id, m] of this.memories)
       if (m.room.destroyed) {
-        m.undo.destroy();
+        m.history.destroy();
         this.memories.delete(id);
       }
   }
 
+  /** Ends every history (the session or agent id expired): their kept data is collected. */
   dispose(): void {
-    for (const m of this.memories.values()) m.undo.destroy();
+    for (const m of this.memories.values()) m.history.destroy();
     this.memories.clear();
   }
 }
@@ -126,6 +145,8 @@ export class AgentIdentity {
  */
 export class AgentProject {
   readonly state: EditorState;
+  /** The agent's bounded undo history in this project. */
+  readonly history: AgentHistory;
   readonly undo: Y.UndoManager;
   readonly presenceId = randomClientId();
   private lastPresence = '';
@@ -138,7 +159,8 @@ export class AgentProject {
   ) {
     const memory = session.identity.memory(room);
     this.state = memory.state;
-    this.undo = memory.undo;
+    this.history = memory.history;
+    this.undo = memory.history.undo;
     room.holders.add(session.id);
     this.publishPresence();
   }
@@ -176,6 +198,8 @@ export class AgentProject {
     if (refused) return { ok: false, error: refused, reports: [], durationMs: 0, params };
     this.room.touch();
     const res = this.deps.registry.run<T>(this.context(), operator, params);
+    // inside a step (batch, edit_mesh …): free what the step created and deleted again so far
+    this.history.compactStep();
     this.publishPresence();
     return res;
   }
@@ -264,7 +288,7 @@ export class AgentSession {
     private readonly deps: AgentDeps,
     identity?: AgentIdentity,
   ) {
-    this.identity = identity ?? new AgentIdentity(id, null);
+    this.identity = identity ?? new AgentIdentity(id, null, deps.history);
     this.identity.sessions++;
   }
 
@@ -345,6 +369,19 @@ export class AgentSession {
   /** Projects this agent currently holds. */
   held(): AgentProject[] {
     return [...this.projects.values()].filter((p) => p.alive);
+  }
+
+  /**
+   * Lets go of a room that was closed (its project deleted by anyone, or unloaded): the handle,
+   * and the identity's history and editor state there, so the old document can be freed.
+   */
+  release(room: Room): void {
+    const p = this.projects.get(room.id);
+    if (p?.room === room) {
+      p.dispose();
+      this.projects.delete(room.id);
+    }
+    this.identity.release(room);
   }
 
   /** Lets go of a project (deleted): its presence, undo history and editor state. */

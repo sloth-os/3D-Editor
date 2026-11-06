@@ -198,10 +198,10 @@ the printed `editor:` URL), runs every check above, and then does what the mode 
 
 | Mode | What it does | Time |
 | --- | --- | --- |
-| `--final` (default) | build + checks, `render.png`, `contact_sheet.png`, `preview.gif` | FINAL_TOTAL_SHORT with 3 render threads (see below) |
-| `--build-only` | build + checks, no renders | ~55 s (the clearance sweep takes ~35 s of it) |
-| `--preview` | build + checks + 960×540 RASTER still, 640×360 path-traced still (16 spp) and RASTER contact sheet in `$PREVIEW_DIR` (default `$TMPDIR/clockwork-orrery-previews`); nothing is written next to the script | PREVIEW_TIME |
-| `--export-only` | build + checks + `scene.glb` (no renders) | EXPORT_TIME |
+| `--final` (default) | build + checks, `render.png`, `contact_sheet.png`, `preview.gif` | ~11 min with 3 render threads on a busy 4-core machine (see below) |
+| `--build-only` | build + checks, no renders | 49–54 s (the clearance sweep takes ~35 s of it) |
+| `--preview` | build + checks + 960×540 RASTER still, 640×360 path-traced still (16 spp) and RASTER contact sheet in `$PREVIEW_DIR` (default `$TMPDIR/clockwork-orrery-previews`); nothing is written next to the script | 108 s (busy machine) |
+| `--export-only` | build + checks + `scene.glb` (no renders) | 82 s (busy machine) |
 | `--stages build,still,…` | any combination of `build`, `preview`, `still`, `anim`, `export` | |
 
 `--out-dir DIR` writes `render.png`, `contact_sheet.png`, `preview.gif` and `scene.glb` to another
@@ -216,7 +216,31 @@ project keeps its live drivers and constraint.
 
 ## Final production run
 
-FINAL_RUN_SECTION
+The images in this folder come from one run of the default mode on a fresh editor server with an
+empty data directory and three render threads. The run also proves that the project rebuilds from
+scratch:
+
+```bash
+PORT=4552 DATA_DIR=$(mktemp -d) RENDER_WORKERS=3 node apps/server/dist/main.js &
+MCP_URL=http://127.0.0.1:4552/mcp node examples/clockwork-orrery/build.mjs --final
+```
+
+Measured on 2026-11-06 on a 4-core machine that was busy with other work at the same time (load
+average about 6–7 while the still rendered):
+
+| Stage | Settings | Wall time | Result |
+| --- | --- | --- | --- |
+| build + checks | 62 objects (36 meshes, 12 texts, 1 curve, 6 lights, 6 empties, 1 camera), 16 materials, 14 drivers, 47,902 render triangles | 48.9 s (35.1 s of it the clearance sweep) | every check passed, no scene problems |
+| `render.png` | 1280×720, path tracer, 160 spp, `time_limit` 470 s, 6 bounces, denoised, f/4 depth of field | 407.9 s | all 160 spp reached; 0.92 MB |
+| `contact_sheet.png` | 12 frames (1, 5 … 45), 320×180 each, 12 spp, 4 bounces, denoised | 27.1 s | every frame at 12 spp; 0.75 MB |
+| `preview.gif` | 48 frames, 480×270, 8 spp, 4 bounces, denoised, 16 fps, Bayer dither, `time_limit` 600 s | 187.7 s | every frame at 8 spp; 0.91 MB |
+| **total** | | **671.6 s (11.2 min)** | exit code 0 |
+
+Every GIF frame reached the same sample count, and the path tracer uses the same noise seed for
+every frame, so the parts of the picture that do not move are identical from frame to frame. On a
+patch of the table (x 380–480, y 150–230) the mean difference between consecutive frames is
+0.13–0.25 grey levels out of 255 for every pair, including the loop seam 48 → 1. A high-pass noise
+measure of the same patch is 2.81–2.84 in all 48 frames, so the table does not shimmer.
 
 ## Known limitations
 

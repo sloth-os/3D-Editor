@@ -1243,7 +1243,10 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
     description:
       'Generate a puffy cumulus cloud: a smooth union of spheres (base layer plus smaller puffs heaped on top) ' +
       'meshed with marching cubes and stretched to exactly `size`, centred on the Z axis with its (optionally ' +
-      'flat) base at z = 0. Material slot 0 Cloud.',
+      'flat) base at z = 0. Any proportions work, including flat layers and long streaks (e.g. size [520, 110, ' +
+      '12] for a stratus band): the base puffs always overlap into one connected piece, flat clouds get wide ' +
+      'puffs that the stretch flattens, so there is no need to generate small and scale the object. Material ' +
+      'slot 0 Cloud.',
     shape: {
       size: vec3.default(CLOUD_DEFAULTS.size).describe('Exact dimensions [x, y, z] in metres'),
       puffs: z
@@ -1269,7 +1272,10 @@ export function registerGenerateOperators(reg: OperatorRegistry): void {
         .min(8)
         .max(160)
         .default(CLOUD_DEFAULTS.resolution)
-        .describe('Marching-cubes cells along the longest side (higher = smoother, more faces)'),
+        .describe(
+          'Marching-cubes cells along the longest side (higher = smoother, more faces); long or flat clouds ' +
+            'get finer cells so that their puffs stay resolved',
+        ),
       seed,
     },
     build: (p) => generateCloud({ ...p, size: p.size as Vec3 }),

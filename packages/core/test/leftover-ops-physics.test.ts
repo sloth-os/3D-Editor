@@ -52,7 +52,12 @@ describe('rigid body solver order', () => {
           type: 'MESH',
           name: `${prefix}.${String(i).padStart(3, '0')}`,
           data: box,
-          rigid_body: rb('ACTIVE', { collision_shape: 'BOX', mass: 0.1, collision_margin: 0.002, friction: 0.6 }),
+          rigid_body: rb('ACTIVE', {
+            collision_shape: 'BOX',
+            mass: 0.1,
+            collision_margin: 0.002,
+            friction: 0.6,
+          }),
           location: [i * 0.35, 0, 0.5],
           scale: [0.1, 0.5, 1],
           rotation_euler: i === 0 ? [0, 0.25, 0] : [0, 0, 0],
@@ -97,7 +102,12 @@ describe('thin rigid bodies', () => {
   it('rests a 7.5 mm tile on the ground at its true thickness (no 10 mm minimum)', () => {
     const { ok, reports, z } = setup();
     ok('mesh.primitive_cube_add', { name: 'Ground', size: 1, scale: [4, 4, 0.1], location: [0, 0, -0.05] });
-    ok('mesh.primitive_cube_add', { name: 'Tile', size: 1, scale: [0.048, 0.024, 0.0075], location: [0, 0, 0.1] });
+    ok('mesh.primitive_cube_add', {
+      name: 'Tile',
+      size: 1,
+      scale: [0.048, 0.024, 0.0075],
+      location: [0, 0, 0.1],
+    });
     ok('object.select_all', { action: 'SELECT' });
     ok('object.transform_apply', { location: false, rotation: false, scale: true });
     ok('rigidbody.object_add', { objects: ['Ground'], type: 'PASSIVE', collision_shape: 'BOX' });
@@ -143,10 +153,16 @@ describe('thin rigid bodies', () => {
       rotation: [0.3, 0.2, 0],
     });
     ok('object.transform_apply', { location: false, rotation: false, scale: true });
-    ok('rigidbody.object_add', { objects: ['Card'], collision_shape: 'BOX', mass: 0.002, collision_margin: 0.0005 });
+    ok('rigidbody.object_add', {
+      objects: ['Card'],
+      collision_shape: 'BOX',
+      mass: 0.002,
+      collision_margin: 0.0005,
+    });
     ok('rigidbody.world_set', { substeps_per_frame: 10, solver_iterations: 10 });
     // each coin lies 1.75 mm above the one below (within the solver's thickness-relative slop)
-    for (let i = 0; i < 4; i++) expect(Math.abs(z(`Coin${i}`, 60) - (0.000875 + 0.00175 * i))).toBeLessThan(2e-4);
+    for (let i = 0; i < 4; i++)
+      expect(Math.abs(z(`Coin${i}`, 60) - (0.000875 + 0.00175 * i))).toBeLessThan(2e-4);
     expect(z('Card', 60)).toBeGreaterThan(0.0001);
     expect(z('Card', 60)).toBeLessThan(0.0002);
   });
@@ -157,12 +173,27 @@ describe('thin rigid bodies', () => {
     ok('mesh.primitive_plane_add', { name: 'Floor', size: 4 });
     const floor = ok('rigidbody.object_add', { objects: ['Floor'], type: 'PASSIVE', collision_shape: 'BOX' });
     expect(floor.objects[0].collision_note).toBeNull();
-    ok('mesh.primitive_cube_add', { name: 'Tile', size: 1, scale: [0.048, 0.024, 0.0075], location: [0, 0, 0.1] });
+    ok('mesh.primitive_cube_add', {
+      name: 'Tile',
+      size: 1,
+      scale: [0.048, 0.024, 0.0075],
+      location: [0, 0, 0.1],
+    });
     ok('object.transform_apply', { location: false, rotation: false, scale: true });
-    ok('rigidbody.object_add', { objects: ['Tile'], collision_shape: 'BOX', mass: 0.02, collision_margin: 0.001 });
+    ok('rigidbody.object_add', {
+      objects: ['Tile'],
+      collision_shape: 'BOX',
+      mass: 0.02,
+      collision_margin: 0.001,
+    });
     expect(z('Tile', 48)).toBeCloseTo(0.00375, 5);
     // a 0.05 mm sheet of 30 cm is below 0.2 % of its size: simulated thicker, and said so
-    ok('mesh.primitive_cube_add', { name: 'Sheet', size: 1, scale: [0.21, 0.297, 0.00005], location: [1, 0, 0.1] });
+    ok('mesh.primitive_cube_add', {
+      name: 'Sheet',
+      size: 1,
+      scale: [0.21, 0.297, 0.00005],
+      location: [1, 0, 0.1],
+    });
     ok('object.transform_apply', { location: false, rotation: false, scale: true });
     reports.length = 0;
     const r = ok('rigidbody.object_add', { objects: ['Sheet'], collision_shape: 'BOX', mass: 0.005 });
@@ -190,8 +221,18 @@ describe('thin rigid bodies', () => {
     );
     ok('object.select_all', { action: 'SELECT' });
     ok('object.transform_apply', { location: false, rotation: false, scale: true });
-    ok('rigidbody.object_add', { objects: ['Ground'], type: 'PASSIVE', collision_shape: 'BOX', friction: 0.6 });
-    ok('rigidbody.object_add', { objects: names, collision_shape: 'BOX', mass: 0.008, collision_margin: 0.0005 });
+    ok('rigidbody.object_add', {
+      objects: ['Ground'],
+      type: 'PASSIVE',
+      collision_shape: 'BOX',
+      friction: 0.6,
+    });
+    ok('rigidbody.object_add', {
+      objects: names,
+      collision_shape: 'BOX',
+      mass: 0.008,
+      collision_margin: 0.0005,
+    });
     ok('rigidbody.world_set', { substeps_per_frame: 20, solver_iterations: 20 });
     const ev = new SceneEvaluator(doc);
     const fell = new Array<number>(names.length).fill(-1);

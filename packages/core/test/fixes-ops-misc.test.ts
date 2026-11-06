@@ -154,6 +154,7 @@ describe('sculpt and paint parameter documentation (#3)', () => {
     const ops = reg.describe().filter((o) => o.id.startsWith('sculpt.') || o.id.startsWith('paint.'));
     expect(ops.map((o) => o.id).sort()).toEqual([
       'paint.vertex_color_set',
+      'paint.vertex_color_set_data',
       'paint.vertex_color_stroke',
       'sculpt.brush_stroke',
     ]);
@@ -165,6 +166,7 @@ describe('sculpt and paint parameter documentation (#3)', () => {
     expect(stroke.description).toContain('SPHERE');
     expect(stroke.description).toContain('cannot level a pad on a slope');
     expect(ops.find((o) => o.id === 'paint.vertex_color_stroke')!.description).toContain('MULTIPLY');
+    expect(ops.find((o) => o.id === 'paint.vertex_color_set_data')!.description).toContain('MULTIPLY');
   });
 
   it('GRAB moves the vertex at the first point by exactly grab_delta', () => {

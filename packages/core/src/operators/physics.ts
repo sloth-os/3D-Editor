@@ -235,7 +235,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
         '7.5 mm domino, a coin, a 0.3 mm card) down to 0.2% of their largest dimension; a thinner mesh is ' +
         'simulated thicker and a flat one (a plane) as a thin slab behind its faces, reported in ' +
         'collision_note and as a warning. Returns the resulting settings per object (with collision_note, ' +
-        'null when the shape has the mesh\'s size).',
+        "null when the shape has the mesh's size).",
       category: 'Physics',
       poll: pollObjectMode,
       schema: z.object({

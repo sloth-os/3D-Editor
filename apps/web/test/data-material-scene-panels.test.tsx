@@ -7,13 +7,15 @@ import {
   SceneEvaluator,
   decodeFloat32,
   defaultBone,
+  defaultRigidBody,
   emptySelection,
   fcurveKey,
   rigidBodyCacheInfo,
   type MaterialData,
 } from '@3d-editor/core';
-import { closeDialog, openDialog, session as sessionSignal } from '../src/app/store';
-import { runResult, viewport } from '../src/editor/editor';
+import { closeDialog, openDialog, session as sessionSignal, toasts } from '../src/app/store';
+import { registry, runResult, viewport } from '../src/editor/editor';
+import { registerUiOperators } from '../src/editor/ui-operators';
 import { infoLog } from '../src/editor/runner';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
@@ -23,7 +25,9 @@ import {
   DataTab,
   activeEntryIndex,
   boneTree,
+  cameraFieldOfView,
   curveFieldOperator,
+  lensForFieldOfView,
   shapeKeyPath,
   splinePointInput,
 } from '../src/ui/properties/DataTab';
@@ -36,8 +40,19 @@ import {
   restoreProcedural,
   textureSource,
 } from '../src/ui/properties/MaterialTab';
-import { rpcRenderEngineOptions, uiCommand, uiEnumParam } from '../src/editor/rpc';
-import { bakeRigidBodyWorld, mistDensityForDistance } from '../src/ui/properties/SceneTabs';
+import {
+  rpcRenderEngineOptions,
+  rpcRenderShading,
+  uiBooleanParam,
+  uiCommand,
+  uiEnumParam,
+} from '../src/editor/rpc';
+import {
+  bakeRigidBodyWorld,
+  frameRateOption,
+  frameRateOptions,
+  mistDensityForDistance,
+} from '../src/ui/properties/SceneTabs';
 import { DialogHost, formatRenderTime } from '../src/ui/dialogs/Dialogs';
 import { InProcessWorker, RenderPool, startPathTrace } from '../src/render';
 
@@ -664,6 +679,63 @@ describe('Scene, World and Render tabs', () => {
     fireEvent.click(byTestId(container, 'scene-rigidbody-bake-keyframes')!);
     expect(s.doc.findObjectByName('Box')!.rigid_body).toBeNull();
   });
+
+  it('redraws the rigid body world on document changes: its own edits, agents and undo', () => {
+    // regression: the panels read the frame signal, so @preact/signals skipped them whenever the
+    // Properties editor redrew with the same props: a typed value snapped back to the old one, and
+    // bodies added by an agent left "No rigid bodies" and a disabled Bake button
+    ok('mesh.primitive_cube_add', { name: 'Box', location: [0, 0, 3] });
+    activePropertiesTab.value = 'scene';
+    const { container } = render(<Properties session={s} />);
+    const shown = (key: string) =>
+      parseFloat(byTestId(container, `scene-rigidbody-world-${key}`)!.textContent!);
+    const cache = () => byTestId(container, 'scene-rigidbody-cache')!.textContent!;
+    const bake = () => byTestId(container, 'scene-rigidbody-bake') as HTMLButtonElement;
+    typeNumber(byTestId(container, 'scene-rigidbody-world-substeps_per_frame')!, '25');
+    expect(s.doc.getScene().rigidbody_world.substeps_per_frame).toBe(25);
+    expect(shown('substeps_per_frame')).toBe(25);
+    typeNumber(byTestId(container, 'scene-rigidbody-world-frame_end')!, '100');
+    expect(s.doc.getScene().rigidbody_world.frame_end).toBe(100);
+    expect(shown('frame_end')).toBe(100);
+    expect(cache()).toContain('No rigid bodies');
+    expect(bake().disabled).toBe(true);
+    // an MCP agent (another replica) adds a body
+    act(() =>
+      remote(() => {
+        const box = s.doc.findObjectByName('Box')!;
+        s.doc.updateObject(box.id, { rigid_body: defaultRigidBody('ACTIVE') });
+      }),
+    );
+    expect(cache()).toContain('1 rigid body (1 active)');
+    expect(bake().disabled).toBe(false);
+    // undo of the panel's own edit shows the value before it
+    act(() => void s.undo.undo());
+    expect(s.doc.getScene().rigidbody_world.frame_end).toBe(250);
+    expect(shown('frame_end')).toBe(250);
+  });
+
+  it('shows any frame rate in the Output tab (custom rates set by agents)', () => {
+    // regression: a rate outside the eight presets (15, 29.97 …) left an empty Frame Rate box
+    activePropertiesTab.value = 'output';
+    const { container } = render(<Properties session={s} />);
+    const select = () => byTestId(container, 'output-fps') as HTMLSelectElement;
+    const label = () => select().options[select().selectedIndex]?.textContent;
+    act(() => s.doc.updateScene({ fps: 15 }));
+    expect(select().selectedIndex).toBeGreaterThanOrEqual(0);
+    expect(label()).toBe('Custom (15 fps)');
+    act(() => s.doc.updateScene({ fps: 29.97 }));
+    expect(label()).toBe('29.97 fps');
+    act(() => s.doc.updateScene({ fps: 30000 / 1001 }));
+    expect(label()).toBe('29.97 fps');
+    // picking a preset sets it
+    fireEvent.change(select(), { target: { value: frameRateOption(24) } });
+    expect(s.doc.getScene().fps).toBe(24);
+    expect(label()).toBe('24 fps');
+    expect(frameRateOptions(24).some((o) => o.label.startsWith('Custom'))).toBe(false);
+    expect(frameRateOptions(23.976).find((o) => o.value === frameRateOption(23.976))?.label).toBe(
+      '23.98 fps',
+    );
+  });
 });
 
 describe('rigid body bake', () => {
@@ -769,14 +841,15 @@ describe('render window', () => {
     } as unknown as ViewportEngine;
     openDialog('render', { animation: true });
     const { container } = render(<DialogHost />);
-    expect(byTestId(container, 'render-animation-settings')?.textContent).toContain('3 frames · 20×16 px');
+    // 40×20 at 50 %: the aspect ratio is kept (it used to be stretched to at least 16 px per side)
+    expect(byTestId(container, 'render-animation-settings')?.textContent).toContain('3 frames · 20×10 px');
     fireEvent.change(byTestId(container, 'render-animation-format')!, { target: { value: 'GIF' } });
     fireEvent.click(byTestId(container, 'render-animation-start')!);
     await waitFor(() => expect(byTestId(container, 'render-animation-result')).not.toBeNull(), {
       timeout: 10_000,
     });
     expect(frames).toEqual([1, 2, 3]);
-    expect(byTestId(container, 'render-animation-info')?.textContent).toMatch(/3 frames \(1–3\) · 20×16/);
+    expect(byTestId(container, 'render-animation-info')?.textContent).toMatch(/3 frames \(1–3\) · 20×10/);
     expect(byTestId(container, 'render-animation-save')).not.toBeNull();
     expect(formatRenderTime(83_456)).toBe('01:23.46');
   });
@@ -803,7 +876,7 @@ describe('render window', () => {
     openDialog('render', { animation: true });
     const { container } = render(<DialogHost />);
     const settings = () => byTestId(container, 'render-animation-settings')!.textContent!;
-    expect(settings()).toContain('2 frames · 20×16 px');
+    expect(settings()).toContain('2 frames · 20×10 px');
     expect(settings()).toContain('Rasterized (WebGL)');
     expect(byTestId(container, 'render-animation-samples')).toBeNull();
     // an agent switches to the path tracer at full size with 3 samples and a longer range
@@ -870,6 +943,74 @@ describe('render window', () => {
     expect(byTestId(container, 'render-animation-cancelled')?.textContent).toContain('Cancelled');
     expect(byTestId(container, 'render-animation-settings')).not.toBeNull();
   }, 30_000);
+
+  it('refuses frame ranges longer than it renders instead of cutting them short', () => {
+    // regression: frames 1–12000 offered "Render 10000 frames" and silently rendered 1–10000
+    s.doc.populateDefaultScene();
+    s.doc.updateScene({ frame_start: 1, frame_end: 12_000 });
+    s.doc.updateRender({ resolution_x: 1920, resolution_y: 1080, resolution_percentage: 1 });
+    viewport.engine = { renderPixels: () => null } as unknown as ViewportEngine;
+    openDialog('render', { animation: true });
+    const { container } = render(<DialogHost />);
+    const settings = byTestId(container, 'render-animation-settings')!.textContent!;
+    expect(settings).toContain('12000 frames · 19×11 px');
+    expect(settings).toContain('The range has 12000 frames: at most 10000 can be rendered at once');
+    expect((byTestId(container, 'render-animation-start') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('keeps the framing of outputs larger than the browser renders and says so', async () => {
+    // regression: each side was clamped to 4096 px on its own (8000×2000 rendered 4096×2000)
+    s.doc.populateDefaultScene();
+    s.doc.updateScene({ frame_start: 1, frame_end: 2 });
+    s.doc.updateRender({ resolution_x: 8000, resolution_y: 2000, resolution_percentage: 100 });
+    viewport.engine = {
+      pathTraces: () => false,
+      renderImage: async () => ({ dataUrl: 'data:image/png;base64,AAAA', width: 4096, height: 1024 }),
+    } as unknown as ViewportEngine;
+    openDialog('render', { animation: true });
+    const anim = render(<DialogHost />);
+    expect(byTestId(anim.container, 'render-animation-settings')?.textContent).toContain(
+      '2 frames · 4096×1024 px',
+    );
+    expect(byTestId(anim.container, 'render-animation-size-note')?.textContent).toBe(
+      'Scaled down from 8000×2000 px (the browser renders at most 4096 px per side; the framing is the same)',
+    );
+    anim.unmount();
+    closeDialog();
+    openDialog('render');
+    const still = render(<DialogHost />);
+    await waitFor(() => expect(byTestId(still.container, 'render-image')).not.toBeNull());
+    expect(byTestId(still.container, 'render-size-note')?.textContent).toContain(
+      'Scaled down from 8000×2000 px',
+    );
+    expect(still.container.textContent).toContain('4096×1024');
+  });
+
+  it('does not call a finished animation cancelled when Cancel is pressed while it is encoded', async () => {
+    // regression: Cancel stayed enabled while encoding and the complete file was labelled "Cancelled"
+    s.doc.populateDefaultScene();
+    s.doc.updateScene({ frame_start: 1, frame_end: 3 });
+    s.doc.updateRender({ resolution_x: 40, resolution_y: 20, resolution_percentage: 50 });
+    viewport.engine = {
+      renderPixels: (o: { width: number; height: number }) => ({
+        width: o.width,
+        height: o.height,
+        data: new Uint8ClampedArray(o.width * o.height * 4).fill(90),
+      }),
+    } as unknown as ViewportEngine;
+    openDialog('render', { animation: true });
+    const { container } = render(<DialogHost />);
+    fireEvent.click(byTestId(container, 'render-animation-start')!);
+    const status = () => byTestId(container, 'render-animation-status')?.textContent ?? '';
+    await waitFor(() => expect(status()).toContain('Encoding'), { timeout: 10_000 });
+    const cancel = byTestId(container, 'render-animation-cancel') as HTMLButtonElement;
+    expect(cancel.disabled).toBe(true);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(byTestId(container, 'render-animation-result')).not.toBeNull(), {
+      timeout: 10_000,
+    });
+    expect(byTestId(container, 'render-animation-info')?.textContent).toMatch(/^3 frames \(1–3\)/);
+  });
 });
 
 /** Drags a number field by `dx` pixels; `during` runs while the button is still down. */
@@ -1052,6 +1193,39 @@ describe('Object Data tab: cameras', () => {
     typeNumber(byTestId(container, 'camera-dof-fstop')!, '1.4');
     expect(cam().dof_aperture_fstop).toBeCloseTo(1.4);
   });
+
+  it("shows Blender's Field of View (across the sensor) and keeps a typed angle with any Sensor Fit", () => {
+    // regression: the field showed the vertical angle of the output (22.9° for 50 mm at 16:9,
+    // Blender shows 39.6°) and converted a typed angle as if Sensor Fit were Auto
+    s.doc.populateDefaultScene();
+    s.doc.updateRender({ resolution_x: 1920, resolution_y: 1080 });
+    select(s, 'Camera');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const camObj = s.doc.findObjectByName('Camera')!;
+    const cam = () => s.doc.getCamera(camObj.data!)!;
+    const fov = () => parseFloat(byTestId(container, 'camera-fov')!.textContent!);
+    expect(cam().lens).toBe(50);
+    expect(fov()).toBeCloseTo(39.598, 2);
+    // the same angle camera.properties_set {angle} takes: setting it there keeps the lens
+    ok('camera.properties_set', { object: 'Camera', angle: cameraFieldOfView(cam()) });
+    expect(cam().lens).toBeCloseTo(50, 3);
+    for (const [fit, w, h] of [
+      ['AUTO', 1920, 1080],
+      ['VERTICAL', 1920, 1080],
+      ['HORIZONTAL', 1080, 1920],
+    ] as const) {
+      act(() => {
+        s.doc.updateRender({ resolution_x: w, resolution_y: h });
+        s.doc.updateBlockByKind('cameras', camObj.data!, { sensor_fit: fit, lens: 50 });
+      });
+      expect(fov()).toBeCloseTo(39.598, 2);
+      typeNumber(byTestId(container, 'camera-fov')!, '40');
+      expect(fov()).toBeCloseTo(40, 3);
+      expect(cam().lens).toBeCloseTo(lensForFieldOfView((40 * Math.PI) / 180, 36), 6);
+      expect(cam().lens).toBeCloseTo(49.452, 2);
+    }
+  });
 });
 
 describe('helpers', () => {
@@ -1108,6 +1282,83 @@ describe('helpers', () => {
     await expect(uiCommand('select', { objects: [] })).resolves.toEqual({ selected: [], names: [] });
     expect(s.state.activeId).toBeNull();
     await expect(uiCommand('set_frames', {})).rejects.toThrow(/set_frame \{frame: number\}/);
+  });
+
+  it('returns why a UI command failed to the agent instead of toasting it in the editor', async () => {
+    // regression: set_mode / view.set_view / view.shading answered a bare {ok: false} and the reason
+    // showed up as an error toast for the person at the browser; an invalid mode was not rejected
+    // with the valid ones, and play {playing: 'false'} started playback
+    if (!registry.has('view3d.view_camera')) registerUiOperators(registry);
+    s.doc.populateDefaultScene();
+    const errorToasts = () => toasts.value.filter((t) => t.level === 'error').map((t) => t.message);
+    const before = errorToasts().length;
+    await expect(uiCommand('set_mode', { mode: 'EDIT' })).resolves.toEqual({
+      ok: false,
+      mode: 'OBJECT',
+      error: 'EDIT mode requires an active mesh object',
+    });
+    await expect(uiCommand('set_mode', { mode: 'BOGUS' })).rejects.toThrow(
+      "Unknown mode 'BOGUS': use one of OBJECT, EDIT, SCULPT, VERTEX_PAINT",
+    );
+    select(s, 'Cube');
+    await expect(uiCommand('set_mode', { mode: 'edit' })).resolves.toEqual({ ok: true, mode: 'EDIT' });
+    await expect(uiCommand('set_mode', {})).resolves.toEqual({ ok: true, mode: 'OBJECT' });
+    // the camera view, also when asked twice (view3d.view_camera toggles)
+    viewport.engine = { requestRender: () => undefined } as unknown as ViewportEngine;
+    await expect(uiCommand('view.set_view', { view: 'CAMERA' })).resolves.toEqual({
+      ok: true,
+      view: 'CAMERA',
+    });
+    await expect(uiCommand('view.set_view', { view: 'CAMERA' })).resolves.toEqual({
+      ok: true,
+      view: 'CAMERA',
+    });
+    expect(s.view.cameraView.value).toBe(true);
+    s.view.cameraView.value = false;
+    ok('object.delete', { objects: ['Camera'] });
+    await expect(uiCommand('view.set_view', { view: 'CAMERA' })).resolves.toEqual({
+      ok: false,
+      view: 'CAMERA',
+      error: 'No active camera in scene',
+    });
+    // a shading asked for twice stays (view3d.toggle_shading switches WIREFRAME back to SOLID)
+    await expect(uiCommand('view.shading', { shading: 'WIREFRAME' })).resolves.toEqual({
+      ok: true,
+      shading: 'WIREFRAME',
+    });
+    await expect(uiCommand('view.shading', { shading: 'wireframe' })).resolves.toEqual({
+      ok: true,
+      shading: 'WIREFRAME',
+    });
+    // an operator run by the agent: its error goes back, not into a toast
+    s.state.selectedIds = [];
+    s.state.activeId = null;
+    await expect(
+      uiCommand('run_operator', { operator: 'object.mode_set', params: { mode: 'SCULPT' } }),
+    ).resolves.toMatchObject({
+      ok: false,
+      error: 'SCULPT mode requires an active mesh object',
+    });
+    expect(errorToasts().length).toBe(before);
+    // play reads booleans, also as strings
+    await expect(uiCommand('play', { playing: 'false' })).resolves.toEqual({ playing: false });
+    await expect(uiCommand('play', {})).resolves.toEqual({ playing: true });
+    await expect(uiCommand('play', { playing: false })).resolves.toEqual({ playing: false });
+    await expect(uiCommand('play', { playing: 'maybe' })).rejects.toThrow(
+      `'playing' must be true or false, got "maybe"`,
+    );
+    expect(s.view.playing.value).toBe(false);
+    expect(uiBooleanParam({ x: 'TRUE' }, 'x', false)).toBe(true);
+    expect(uiBooleanParam({ x: 0 }, 'x', true)).toBe(false);
+  });
+
+  it('renders MCP shading MATERIAL as a final render (materials, lights and the world)', () => {
+    // regression: MATERIAL became the viewport's Material Preview (studio HDRI instead of the world)
+    expect(rpcRenderShading(undefined)).toBeNull();
+    expect(rpcRenderShading('MATERIAL')).toBe('RENDERED');
+    expect(rpcRenderShading('material')).toBe('RENDERED');
+    expect(rpcRenderShading('SOLID')).toBe('SOLID');
+    expect(() => rpcRenderShading('TOON')).toThrow("Unknown shading 'TOON': use MATERIAL");
   });
 
   it('labels procedural parameters and values like Blender', () => {

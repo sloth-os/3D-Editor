@@ -124,6 +124,38 @@ function bakeTransform(mesh: MeshData, M: Mat4): MeshData {
   return { ...mesh, positions: out };
 }
 
+/** The name of a render item's object (the instanced object for instances), for warnings. */
+function itemName(item: RenderItem): string {
+  return item.object?.name ?? item.data?.name ?? item.id;
+}
+
+/** Objects named in the degenerate triangle warning at most. */
+const MAX_NAMED = 8;
+
+/**
+ * The warning about degenerate (zero-area or non-finite) triangles, which the BVH skips, naming
+ * the objects they belong to with their counts, most first, e.g. "4 degenerate triangle(s) skipped
+ * (zero-area or non-finite faces of the render geometry; they do not render): 'Motto Plate' 4".
+ * Objects sharing a mesh (linked duplicates, instances) are listed together with the mesh's count.
+ * Null when there are none.
+ */
+function degenerateWarning(byGeometry: Map<MeshGeometry, Set<string>>): string | null {
+  const found: { name: string; n: number }[] = [];
+  let total = 0;
+  for (const [g, names] of byGeometry) {
+    total += g.skipped;
+    found.push({ name: [...names].join("', '"), n: g.skipped });
+  }
+  if (!total) return null;
+  found.sort((a, b) => b.n - a.n || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const listed = found.slice(0, MAX_NAMED).map((f) => `'${f.name}' ${f.n}`);
+  const more = found.length > MAX_NAMED ? `, and ${found.length - MAX_NAMED} more object(s)` : '';
+  return (
+    `${total} degenerate triangle(s) skipped (zero-area or non-finite faces of the render geometry; ` +
+    `they do not render): ${listed.join(', ')}${more}`
+  );
+}
+
 /** Builds the acceleration structures, materials, lights and environment of a scene. */
 export function compileScene(input: CompileInput): CompiledScene {
   const warnings: string[] = [];
@@ -208,27 +240,37 @@ export function compileScene(input: CompileInput): CompiledScene {
     orco: number;
   };
   const list: Inst[] = [];
+  const degenerate = new Map<MeshGeometry, Set<string>>();
   for (const item of input.items) {
     let mesh = item.mesh;
     if (!mesh || !mesh.faces.length) continue;
     let M = item.worldMatrix;
+    const name = itemName(item);
     if (!M || M.length < 16 || !M.every(Number.isFinite)) {
-      warnings.push(`'${item.id}': invalid transform; not rendered`);
+      warnings.push(`'${name}': invalid (non-finite) transform; not rendered`);
       continue;
     }
     let inv = invert4(M);
+    let flat = false;
     if (!isInvertible(M, inv)) {
       // zero scale on an axis (e.g. a plane scaled flat): bake the transform into the geometry
       mesh = bakeTransform(mesh, M);
       M = IDENTITY;
       inv = IDENTITY;
+      flat = true;
     }
     let g: MeshGeometry;
     try {
       g = meshGeometry(mesh);
     } catch (e) {
-      warnings.push(`'${item.id}': mesh could not be prepared for rendering (${(e as Error).message})`);
+      warnings.push(`'${name}': mesh could not be prepared for rendering (${(e as Error).message})`);
       continue;
+    }
+    if (g.skipped > 0) {
+      // degenerate triangles, named by object (a mesh shared by several objects counts once)
+      let names = degenerate.get(g);
+      if (!names) degenerate.set(g, (names = new Set()));
+      names.add(flat ? `${name} (scaled flat)` : name);
     }
     if (g.triCount === 0) continue;
     let gi = geomIndex.get(g);
@@ -286,8 +328,12 @@ export function compileScene(input: CompileInput): CompiledScene {
     slotList.push(...slots);
     instances.gen.set(gen, i * 6);
     const g = geometries[geom];
+    // shadow rays ask about hits on (possibly) transparent and transmissive surfaces
     instances.filtered[i] = slots.some(
-      (s) => materials[s].transparent || (!!g.colors && materials[s].blend !== BLEND_OPAQUE),
+      (s) =>
+        materials[s].transparent ||
+        materials[s].transmissive ||
+        (!!g.colors && materials[s].blend !== BLEND_OPAQUE),
     )
       ? 1
       : 0;
@@ -330,8 +376,8 @@ export function compileScene(input: CompileInput): CompiledScene {
   const sceneRadius = bounds
     ? Math.max(1, 0.5 * Math.hypot(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2]))
     : 1;
-  const skipped = geometries.reduce((a, g) => a + g.skipped, 0);
-  if (skipped > 0) warnings.push(`${skipped} degenerate triangle(s) skipped`);
+  const named = degenerateWarning(degenerate);
+  if (named) warnings.push(named);
 
   // ---- emissive meshes
   const emitters: EmitterGroup[] = [];

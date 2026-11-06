@@ -1,6 +1,6 @@
 import type { Vec3 } from '../../math/types';
 import { bumpNormal } from '../../material/surface';
-import { PrincipledBSDF } from './bsdf';
+import { PrincipledBSDF, thinTransmittance } from './bsdf';
 import { CameraRays } from './camera';
 import type { CompiledScene } from './compile';
 import { discretePdf } from './distribution';
@@ -18,13 +18,35 @@ import {
   spotMask,
   type LampData,
 } from './lights';
-import { ShadingContext, SurfaceShader, type PTMaterial } from './material';
+import { BLEND_BLEND, ShadingContext, SurfaceShader, type PTMaterial } from './material';
 import { Sampler } from './sampler';
 
 /*
  * Unidirectional path tracer with next-event estimation and multiple importance sampling
  * (power heuristic) between light sampling and BSDF sampling, Russian roulette, indirect
  * clamping and stochastic alpha transparency. One call of `trace` computes one camera sample.
+ *
+ * Light through glass. Shadow rays pass alpha-transparent surfaces (by their uncovered part) and
+ * transmissive ones (thin-walled: straight through, attenuated by transmission × base colour and
+ * the Fresnel reflection, see `thinTransmittance`), so lamps inside glass lanterns and bulbs light
+ * the scene and index-matched (IOR 1) surfaces cast almost no shadow. A closed glass object is
+ * crossed twice and attenuates like a thin shell; its lens effect (caustics, a bright focus in the
+ * shadow of a glass ball) is not part of the lighting. To count no light twice, glass reached by a
+ * ray from a vertex that samples lights (diffuse or glossy, not a mirror and not the camera) is
+ * thin-walled for that path too: it reflects like a sheet, transmits straight through, and the
+ * transmission keeps that vertex's MIS state (like a transparent layer: lights found through the
+ * glass are weighed against the vertex's own light samples), while the light behind the glass is
+ * left to that vertex. The camera, mirrors and smooth glass still see refraction (lenses, glass
+ * balls and bottles look right); reflections in glossy surfaces and indirect light see glass as
+ * thin-walled.
+ *
+ * Alpha-blended (BLEND) surfaces seen by the camera are shaded with deterministic coverage: their
+ * emission, direct light and mist count with the coverage as weight, and only the choice between
+ * scattering there and passing through stays random, so faint glows (light shafts) are smooth.
+ *
+ * Mist follows the camera chain: every surface the camera sees, directly or through transmissions
+ * and transparent layers, fades towards the mist colour by its own view depth (the background is
+ * not misted), so distant objects seen through glass keep their mist like in the rasterizer.
  */
 
 /** What camera rays that leave the scene show. */
@@ -79,6 +101,8 @@ const DIM_VERTEX = 2;
 // far above any vertex dimension (paths are at most a few thousand vertices long)
 const DIM_RR = 1 << 16;
 const DIM_ALPHA = 1 << 17;
+/** Vertices of alpha-blended surfaces the camera ray scatters at and passes (by layer). */
+const DIM_SPLIT = 1 << 18;
 /** A sphere lamp counts as a point light from points closer than this squared radius factor. */
 const INSIDE_SPHERE = 1.0001;
 /** Blender's object shadow terminator "Geometry Offset" (default 0.1): see `terminatorAmount`. */
@@ -173,6 +197,14 @@ export class PathIntegrator {
   /** `hitLamp`: distance limit of the current ray and distance of the lamp hit. */
   private lampLimit = Infinity;
   private lampT = 0;
+  /** Per-channel transmittance of the current shadow ray (product over the surfaces it passed). */
+  private shR = 1;
+  private shG = 1;
+  private shB = 1;
+  /** `shadowCosine`: whether the shadow ray enters the surface from its front (outer) side. */
+  private shadowEntering = true;
+  /** Scratch rgb of `thinTransmittance`. */
+  private readonly thin = new Float64Array(3);
 
   constructor(
     readonly scene: CompiledScene,
@@ -261,13 +293,93 @@ export class PathIntegrator {
     c.genSize[2] = gen[go + 5] - gen[go + 2];
   }
 
-  /** Light passing through a possibly transparent surface hit by a shadow ray. */
+  /**
+   * Light passing a surface hit by a shadow ray (the intersector's `shadowFilter`): the uncovered
+   * part of alpha-transparent surfaces plus, through transmissive ones, their thin-walled
+   * transmittance. Multiplies the shadow ray's per-channel transmittance (shR, shG, shB) and
+   * returns this surface's largest factor, or 0 (opaque) once next to nothing is left.
+   */
   private shadowTransmittance(inst: number, tri: number, b1: number, b2: number): number {
     const m = this.materialOf(inst, tri);
-    if (!m.transparent && !(this.scene.geometries[this.scene.instances.geom[inst]].colors && m.blend !== 0))
-      return 0;
-    this.fillContext(this.shadowCtx, inst, tri, b1, b2);
-    return 1 - this.shadowShader.coverage(m, this.shadowCtx);
+    const vcol = m.blend !== 0 && !!this.scene.geometries[this.scene.instances.geom[inst]].colors;
+    if (!m.transparent && !vcol && !m.transmissive) return 0;
+    const c = this.shadowCtx;
+    this.fillContext(c, inst, tri, b1, b2);
+    const sh = this.shadowShader;
+    const cov = m.transparent || vcol ? sh.coverage(m, c) : 1;
+    let pr = 1 - cov;
+    let pg = pr;
+    let pb = pr;
+    if (cov > 0 && m.transmissive) {
+      sh.evaluate(m, c);
+      if (sh.transmission > 0 && sh.metallic < 1) {
+        const mu = this.shadowCosine(inst, tri, b1, b2);
+        const t = this.thin;
+        thinTransmittance(sh, mu, this.shadowEntering, t);
+        pr += cov * t[0];
+        pg += cov * t[1];
+        pb += cov * t[2];
+      }
+    }
+    this.shR *= pr;
+    this.shG *= pg;
+    this.shB *= pb;
+    if (!(Math.max(this.shR, this.shG, this.shB) >= 1e-4)) return 0;
+    const mx = Math.max(pr, pg, pb);
+    return mx > 0 ? mx : 0;
+  }
+
+  /**
+   * |cos| between the current shadow ray (`isect.ray`) and the normal of a surface it hits (the
+   * interpolated shading normal of smooth triangles, else the face normal); sets `shadowEntering`
+   * (the ray hits the front side).
+   */
+  private shadowCosine(inst: number, tri: number, b1: number, b2: number): number {
+    const s = this.scene;
+    const g = s.geometries[s.instances.geom[inst]];
+    const V = g.verts;
+    const o = tri * 9;
+    const ex = V[o + 3] - V[o];
+    const ey = V[o + 4] - V[o + 1];
+    const ez = V[o + 5] - V[o + 2];
+    const fx = V[o + 6] - V[o];
+    const fy = V[o + 7] - V[o + 1];
+    const fz = V[o + 8] - V[o + 2];
+    const nx = ey * fz - ez * fy;
+    const ny = ez * fx - ex * fz;
+    const nz = ex * fy - ey * fx;
+    const I = s.instances.inv;
+    const io = inst * 12;
+    const R = this.isect.ray;
+    const dx = R[3];
+    const dy = R[4];
+    const dz = R[5];
+    const dl = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+    const wx = I[io] * nx + I[io + 1] * ny + I[io + 2] * nz;
+    const wy = I[io + 3] * nx + I[io + 4] * ny + I[io + 5] * nz;
+    const wz = I[io + 6] * nx + I[io + 7] * ny + I[io + 8] * nz;
+    const gl = Math.sqrt(wx * wx + wy * wy + wz * wz);
+    if (!(gl > 0) || !Number.isFinite(gl)) {
+      this.shadowEntering = true;
+      return 1;
+    }
+    this.shadowEntering = wx * dx + wy * dy + wz * dz < 0;
+    if (g.smooth[tri] === 1) {
+      const N = g.normals;
+      const b0 = 1 - b1 - b2;
+      const i0 = g.vidx[tri * 3] * 3;
+      const i1 = g.vidx[tri * 3 + 1] * 3;
+      const i2 = g.vidx[tri * 3 + 2] * 3;
+      const ax = b0 * N[i0] + b1 * N[i1] + b2 * N[i2];
+      const ay = b0 * N[i0 + 1] + b1 * N[i1 + 1] + b2 * N[i2 + 1];
+      const az = b0 * N[i0 + 2] + b1 * N[i1 + 2] + b2 * N[i2 + 2];
+      const sx = I[io] * ax + I[io + 1] * ay + I[io + 2] * az;
+      const sy = I[io + 3] * ax + I[io + 4] * ay + I[io + 5] * az;
+      const sz = I[io + 6] * ax + I[io + 7] * ay + I[io + 8] * az;
+      const sl = Math.sqrt(sx * sx + sy * sy + sz * sz);
+      if (sl > 0 && Number.isFinite(sl)) return Math.abs(sx * dx + sy * dy + sz * dz) / (sl * dl);
+    }
+    return Math.abs(wx * dx + wy * dy + wz * dz) / (gl * dl);
   }
 
   /** Computes position and normals of the current intersection (`isect.ray` origin + t · direction). */
@@ -884,9 +996,20 @@ export class PathIntegrator {
     const fx = smp.u0;
     const fy = smp.u1;
     smp.next2D(DIM_LENS);
+    // radiance and the part seen directly (emission, background) gathered since the camera chain
+    // reached its current surface, and the finished (misted) sums of the surfaces before it
     let Lr = 0;
     let Lg = 0;
     let Lb = 0;
+    let Er = 0;
+    let Eg = 0;
+    let Eb = 0;
+    let Fr = 0;
+    let Fg = 0;
+    let Fb = 0;
+    let FEr = 0;
+    let FEg = 0;
+    let FEb = 0;
     let alpha = 0;
     this.er = this.eg = this.eb = 0;
     this.albR = this.albG = this.albB = 0;
@@ -906,11 +1029,11 @@ export class PathIntegrator {
     let tpR = 1;
     let tpG = 1;
     let tpB = 1;
-    let etaScale = 1;
     let cameraRay = true;
     let travelled = 0;
     // distance from the last scattering vertex (or the camera) to the ray origin, which moves
-    // forward through alpha-transparent surfaces; MIS densities of lights need the full distance
+    // forward through alpha-transparent surfaces and through transmissions that continue the
+    // previous vertex's MIS state; MIS densities of lights need the full distance
     let segT = 0;
     let scatters = 0;
     let bounces = 0;
@@ -934,8 +1057,13 @@ export class PathIntegrator {
     let aovTG = 1;
     let aovTB = 1;
     let firstHit = true;
+    // the camera chain: the surfaces the camera sees, directly or through transmissions and
+    // transparent layers; each fades towards the mist colour by its own view depth
+    let chain = true;
     let mist = 0;
+    const misty = st.mistDensity > 0;
     const clampK = st.clampIndirect > 0 ? st.clampIndirect : Infinity;
+    const thin = this.thin;
 
     for (;;) {
       // the ray goes through the intersector's scratch array (no boxed arguments)
@@ -981,6 +1109,18 @@ export class PathIntegrator {
       }
       if (!hit) {
         // ---- escaped
+        if (chain && misty && mist > 0) {
+          // the background is not misted (like the rasterizer): close the last surface's share
+          const k = 1 - mist;
+          Fr += Lr * k;
+          Fg += Lg * k;
+          Fb += Lb * k;
+          FEr += Er * k;
+          FEg += Eg * k;
+          FEb += Eb * k;
+          Lr = Lg = Lb = Er = Eg = Eb = 0;
+          mist = 0;
+        }
         if (cameraRay) {
           if (st.background === BACKGROUND_TRANSPARENT) break;
           let br: number;
@@ -1001,9 +1141,9 @@ export class PathIntegrator {
           Lr += br;
           Lg += bg;
           Lb += bb;
-          this.er += br;
-          this.eg += bg;
-          this.eb += bb;
+          Er += br;
+          Eg += bg;
+          Eb += bb;
           alpha = ba;
           if (aovPending) {
             this.albR = aovTR;
@@ -1082,11 +1222,20 @@ export class PathIntegrator {
       const frontFacing = this.gx * dx + this.gy * dy + this.gz * dz < 0;
       // alpha transparency and camera-ray backface culling: continue through the surface
       let passThrough = cameraRay && m.cull && !frontFacing;
+      // deterministic coverage of alpha-blended surfaces seen by the camera: their emission, direct
+      // light and mist are weighted by the coverage (no speckle from faint glows), and only the
+      // choice between scattering at the surface and passing through it stays random
+      let covScale = 1;
+      let splitPass = false;
       if (!passThrough && (m.blend !== 0 || m.transparent)) {
         const cov = shader.coverage(m, ctx);
         if (cov < 1) {
           smp.next2D(DIM_ALPHA + Math.min(scatters, 60) * 64 + Math.min(layers, 63));
-          passThrough = smp.u0 >= cov;
+          const pass = smp.u0 >= cov;
+          if (cameraRay && m.blend === BLEND_BLEND && cov > 0 && layers < st.maxTransparentLayers) {
+            covScale = cov;
+            splitPass = pass;
+          } else passThrough = pass;
         }
       }
       if (passThrough && layers < st.maxTransparentLayers) {
@@ -1101,7 +1250,7 @@ export class PathIntegrator {
         if (tMax !== Infinity) tMax = Math.max(0, tMax - hitT);
         continue;
       }
-      if (cameraRay) alpha = 1;
+      if (cameraRay && !splitPass) alpha = 1;
       shader.evaluate(m, ctx);
       // orient the frame towards the viewer
       const flip = frontFacing ? 1 : -1;
@@ -1147,23 +1296,49 @@ export class PathIntegrator {
           snz = gnz;
         }
       }
-      if (firstHit) {
+      const transmissive = shader.transmission > 0 && shader.metallic < 1;
+      if (firstHit && !splitPass) {
         firstHit = false;
         this.nrmX = snx;
         this.nrmY = sny;
         this.nrmZ = snz;
         this.depth = travelled + hitT;
-        if (st.mistDensity > 0) {
-          const cam = this.camera;
-          const e = this.scene.camera.eye;
-          const zd = (this.px - e[0]) * cam.fx + (this.py - e[1]) * cam.fy + (this.pz - e[2]) * cam.fz;
-          const k = st.mistDensity * zd;
-          mist = 1 - Math.exp(-k * k);
+      }
+      if (chain && misty) {
+        // ---- mist (like the rasterizer): what the camera chain gathered at the previous surface
+        // fades by that surface's mist, everything from here on by this one's; the mist colour
+        // fills in for the part of the view that ends here (not passed on through transmission)
+        const k = 1 - mist;
+        Fr += Lr * k;
+        Fg += Lg * k;
+        Fb += Lb * k;
+        FEr += Er * k;
+        FEg += Eg * k;
+        FEb += Eb * k;
+        Lr = Lg = Lb = Er = Eg = Eb = 0;
+        const cam = this.camera;
+        const e = this.scene.camera.eye;
+        const zd = (this.px - e[0]) * cam.fx + (this.py - e[1]) * cam.fy + (this.pz - e[2]) * cam.fz;
+        const kz = st.mistDensity * zd;
+        mist = 1 - Math.exp(-kz * kz);
+        if (mist > 0) {
+          if (transmissive) thinTransmittance(shader, snx * wox + sny * woy + snz * woz, frontFacing, thin);
+          else thin[0] = thin[1] = thin[2] = 0;
+          const w = covScale * mist;
+          const ir = st.mistR * w * tpR * (1 - thin[0]);
+          const ig = st.mistG * w * tpG * (1 - thin[1]);
+          const ib = st.mistB * w * tpB * (1 - thin[2]);
+          Fr += ir;
+          Fg += ig;
+          Fb += ib;
+          FEr += ir;
+          FEg += ig;
+          FEb += ib;
         }
       }
       // ---- emission
       if (shader.emitR > 0 || shader.emitG > 0 || shader.emitB > 0) {
-        let w = 1;
+        let w = covScale;
         if (!cameraRay && !prevSingular) {
           const k = this.scene.instances.emitGroup[inst];
           let pl = 0;
@@ -1196,13 +1371,15 @@ export class PathIntegrator {
         Lg += cg;
         Lb += cb;
         if (cameraRay) {
-          this.er += cr;
-          this.eg += cg;
-          this.eb += cb;
+          Er += cr;
+          Eg += cg;
+          Eb += cb;
         }
       }
       // ---- scattering
-      const transmissive = shader.transmission > 0 && shader.metallic < 1;
+      // a surface reached from a vertex that sampled lights (through transmissions or transparent
+      // layers) leaves the light behind it to that vertex: its shadow rays pass this surface
+      const owned = !prevSingular;
       // local frame (Duff et al. 2017)
       const sgn = snz >= 0 ? 1 : -1;
       const fa = -1 / (sgn + snz);
@@ -1218,6 +1395,8 @@ export class PathIntegrator {
         const blurPdf = minPdf / st.filterGlossy;
         if (blurPdf < 1) blurAlpha = Math.sqrt(1 - blurPdf) * 0.5;
       }
+      // glass seen from such a vertex is thin-walled, like in its shadow rays: it reflects like a
+      // sheet and transmits straight through (no refraction, no total internal reflection)
       bsdf.setup(
         shader,
         wox * t1x + woy * t1y + woz * t1z,
@@ -1225,8 +1404,9 @@ export class PathIntegrator {
         wox * snx + woy * sny + woz * snz,
         frontFacing,
         blurAlpha,
+        owned && transmissive,
       );
-      if (aovPending) {
+      if (aovPending && !splitPass) {
         if (bsdf.singular && aovSpecular < 2) {
           aovSpecular++;
           aovTR *= Math.max(0.05, bsdf.albedoR);
@@ -1241,8 +1421,10 @@ export class PathIntegrator {
       }
       // the bounce limit was reached: this segment only collected (MIS-weighted) emission
       if (finalSegment) break;
-      if (!bsdf.active) break;
-      const dimBase = DIM_VERTEX + 3 * scatters;
+      if (!bsdf.active && !splitPass) break;
+      // alpha-blended surfaces scattered at with deterministic coverage get their own dimensions
+      // (the surface behind them is shaded in the same sample)
+      const dimBase = covScale < 1 ? DIM_SPLIT + 3 * layers : DIM_VERTEX + 3 * scatters;
       const eps = EPS_SCALE * (1 + Math.max(Math.abs(this.px), Math.abs(this.py), Math.abs(this.pz)));
       // light selection and BSDF lobe choice share one 2D point
       smp.next2D(dimBase + 2);
@@ -1250,8 +1432,14 @@ export class PathIntegrator {
       const uLobe = smp.u1;
       // ---- next-event estimation
       let selTotal = 0;
-      if (!bsdf.singular && lights.count > 0) {
-        selTotal = lights.prepare(this.px, this.py, this.pz, gnx, gny, gnz, transmissive);
+      let savedSel = false;
+      if (bsdf.active && !bsdf.singular && lights.count > 0) {
+        // the previous vertex's selection weights, for transmissions that continue its MIS state
+        if (owned && transmissive && prevTotal > 0) {
+          lights.save();
+          savedSel = true;
+        }
+        selTotal = lights.prepare(this.px, this.py, this.pz, gnx, gny, gnz, transmissive && !owned);
         const group = lights.pick(uSel);
         if (group >= 0) {
           const pSel = lights.prob;
@@ -1287,13 +1475,16 @@ export class PathIntegrator {
             const ilx = wx * t1x + wy * t1y + wz * t1z;
             const ily = wx * t2x + wy * t2y + wz * t2z;
             const ilz = wx * snx + wy * sny + wz * snz;
-            // reflection must stay above, transmission below the geometric surface
-            if (geomSide > 0 === ilz > 0 && geomSide !== 0) {
+            // reflection must stay above, transmission below the geometric surface; light behind
+            // a surface owned by the previous vertex is that vertex's
+            if (geomSide > 0 === ilz > 0 && geomSide !== 0 && !(owned && geomSide < 0)) {
               bsdf.eval(ilx, ily, ilz);
               if (bsdf.fR + bsdf.fG + bsdf.fB > 0) {
                 const lightPdf = this.lPdf * pSel;
                 const w = this.lDelta ? 1 : powerHeuristic(lightPdf, bsdf.pdf);
-                let visible = 1;
+                let vr = 1;
+                let vg = 1;
+                let vb = 1;
                 if (this.lShadow) {
                   const side = geomSide > 0 ? 1 : -1;
                   let sox = this.px + gnx * side * eps;
@@ -1324,14 +1515,19 @@ export class PathIntegrator {
                   ray[4] = wy;
                   ray[5] = wz;
                   ray[6] = tShadow;
-                  if (isect.occludedRay()) visible = 0;
-                  else visible = isect.transmittance;
+                  this.shR = this.shG = this.shB = 1;
+                  if (isect.occludedRay()) vr = vg = vb = 0;
+                  else {
+                    vr = this.shR;
+                    vg = this.shG;
+                    vb = this.shB;
+                  }
                 }
-                if (visible > 0) {
-                  const k = (w * visible) / lightPdf;
-                  let cr = tpR * bsdf.fR * this.lr * k;
-                  let cg = tpG * bsdf.fG * this.lg * k;
-                  let cb = tpB * bsdf.fB * this.lb * k;
+                if (vr + vg + vb > 0) {
+                  const k = (w * covScale) / lightPdf;
+                  let cr = tpR * bsdf.fR * this.lr * k * vr;
+                  let cg = tpG * bsdf.fG * this.lg * k * vg;
+                  let cb = tpB * bsdf.fB * this.lb * k * vb;
                   if (scatters >= 1) {
                     const mx = Math.max(cr, cg, cb);
                     if (mx > clampK) {
@@ -1349,6 +1545,18 @@ export class PathIntegrator {
             }
           }
         }
+      }
+      if (splitPass) {
+        // the camera ray passes the uncovered part of the alpha-blended surface
+        layers++;
+        travelled += hitT;
+        segT += hitT;
+        const side = frontFacing ? -1 : 1;
+        ox = this.px + this.gx * side * eps;
+        oy = this.py + this.gy * side * eps;
+        oz = this.pz + this.gz * side * eps;
+        if (tMax !== Infinity) tMax = Math.max(0, tMax - hitT);
+        continue;
       }
       // ---- BSDF sampling
       smp.next2D(dimBase);
@@ -1372,25 +1580,33 @@ export class PathIntegrator {
       tpR *= bsdf.fR * ip;
       tpG *= bsdf.fG * ip;
       tpB *= bsdf.fB * ip;
-      if (transmission) {
-        transmissions++;
-        const ior = shader.ior > 1e-3 ? shader.ior : 1.5;
-        const eta = frontFacing ? ior : 1 / ior;
-        etaScale *= eta * eta;
-      } else bounces++;
-      prevPdf = bsdf.pdf;
+      if (transmission) transmissions++;
+      else {
+        bounces++;
+        chain = false;
+      }
+      if (transmission && owned) {
+        // the previous vertex's shadow rays pass this surface (thin-walled): what the ray finds
+        // through it is weighed against that vertex's light sampling, so the transmission keeps
+        // its MIS state like a transparent layer (no light is counted twice)
+        if (savedSel) lights.restore();
+        segT += hitT;
+      } else {
+        prevPdf = bsdf.pdf;
+        prevSingular = bsdf.singular || delta;
+        prevX = this.px;
+        prevY = this.py;
+        prevZ = this.pz;
+        prevTotal = selTotal;
+        segT = 0;
+      }
       if (!delta && bsdf.pdf < minPdf) minPdf = bsdf.pdf;
-      prevSingular = bsdf.singular || delta;
-      prevX = this.px;
-      prevY = this.py;
-      prevZ = this.pz;
-      prevTotal = selTotal;
       scatters++;
       cameraRay = false;
       if (!(tpR + tpG + tpB > 0) || !Number.isFinite(tpR + tpG + tpB)) break;
       // Russian roulette after three scattering events
       if (scatters >= 3 && !finalSegment) {
-        const q = Math.min(1, Math.max(tpR, tpG, tpB) * etaScale);
+        const q = Math.min(1, Math.max(tpR, tpG, tpB));
         smp.next2D(DIM_RR + scatters);
         if (smp.u0 >= q) break;
         tpR /= q;
@@ -1405,25 +1621,24 @@ export class PathIntegrator {
       dy = nwy;
       dz = nwz;
       tMax = Infinity;
-      segT = 0;
     }
-    if (!(Number.isFinite(Lr) && Number.isFinite(Lg) && Number.isFinite(Lb))) {
-      Lr = Lg = Lb = 0;
-      this.er = this.eg = this.eb = 0;
+    const k = 1 - mist;
+    Fr += Lr * k;
+    Fg += Lg * k;
+    Fb += Lb * k;
+    FEr += Er * k;
+    FEg += Eg * k;
+    FEb += Eb * k;
+    if (!(Number.isFinite(Fr) && Number.isFinite(Fg) && Number.isFinite(Fb))) {
+      Fr = Fg = Fb = 0;
+      FEr = FEg = FEb = 0;
     }
-    if (mist > 0) {
-      // like the rasterizer: the first surface fades towards the mist colour (noise-free part)
-      const k = 1 - mist;
-      Lr = Lr * k + st.mistR * mist;
-      Lg = Lg * k + st.mistG * mist;
-      Lb = Lb * k + st.mistB * mist;
-      this.er = this.er * k + st.mistR * mist;
-      this.eg = this.eg * k + st.mistG * mist;
-      this.eb = this.eb * k + st.mistB * mist;
-    }
-    this.r = Lr;
-    this.g = Lg;
-    this.b = Lb;
+    this.r = Fr;
+    this.g = Fg;
+    this.b = Fb;
+    this.er = FEr;
+    this.eg = FEg;
+    this.eb = FEb;
     this.a = alpha;
   }
 }

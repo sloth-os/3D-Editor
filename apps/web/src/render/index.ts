@@ -32,6 +32,7 @@ export {
   AnimationJob,
   MAX_ANIMATION_FRAMES,
   MAX_GIF_PIXELS,
+  animationFrameCount,
   animationFrames,
   animationProblem,
   startAnimationRender,

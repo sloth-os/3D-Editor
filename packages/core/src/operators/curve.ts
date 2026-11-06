@@ -47,8 +47,12 @@ const pointObject = z.object({
     .optional()
     .describe(
       'Twist of the bevel/extrusion around the curve direction, radians (default 0). Positive tilt turns the ' +
-        'profile clockwise when looking along the direction of travel: with fill_mode HALF and Z_UP twist, ' +
-        '-π/2 on every point opens the half tube upward (gutter, half-pipe), +π/2 downward (arch)',
+        'cross-section clockwise as seen looking along the direction of travel: on a level path with twist_mode ' +
+        'Z_UP (or MINIMUM) it RAISES the LEFT side of the profile (its +x side; left of travel seen from above) ' +
+        'and lowers the right side, like a road banked for a right turn (a flat profile of width w gets its left ' +
+        'edge w/2 × sin(tilt) higher), and leans the top of an extruded ribbon to the right; negative tilt does ' +
+        'the opposite. With fill_mode HALF, -π/2 on every point opens the half tube upward (gutter, half-pipe), ' +
+        '+π/2 downward (arch)',
     ),
   weight: z.number().positive().optional().describe('NURBS only: control point weight (default 1)'),
 });

@@ -3,6 +3,8 @@ import { SceneDoc, renderSceneSoftware, type PathTile } from '@3d-editor/core';
 import {
   InProcessWorker,
   RenderPool,
+  MAX_ANIMATION_FRAMES,
+  animationFrameCount,
   animationFrames,
   animationProblem,
   pathTraceDocument,
@@ -411,6 +413,44 @@ describe('animation rendering', () => {
     expect(animationProblem('GIF', 4000, 4000, 10)).toMatch(/too many/);
     expect(animationProblem('APNG', 10, 10, 0)).toMatch(/empty/);
     expect(animationProblem('APNG', 4000, 4000, 10)).toBeNull();
+  });
+
+  it('counts the whole frame range, so a range longer than the limit is refused, not cut', () => {
+    // regression: the frame list stopped at 10000 frames, so the 10000-frame check never fired and
+    // frames 1–12000 rendered 1–10000 without a word
+    expect(animationFrameCount(1, 12_000)).toBe(12_000);
+    expect(animationFrameCount(1, 7, 2)).toBe(4);
+    expect(animationFrameCount(5, 4)).toBe(0);
+    expect(animationFrameCount(1, Number.NaN)).toBe(0);
+    expect(animationProblem('APNG', 19, 11, animationFrameCount(1, 12_000))).toBe(
+      'The range has 12000 frames: at most 10000 can be rendered at once (render it in parts, or raise Step)',
+    );
+    expect(animationProblem('APNG', 19, 11, animationFrameCount(1, 12_000, 2))).toBeNull();
+    expect(animationFrames(1, 12_000).length).toBe(MAX_ANIMATION_FRAMES);
+  });
+
+  it('finishes the file with every frame when cancelled while encoding', async () => {
+    // regression: Cancel during "Encoding" marked a complete animation as cancelled
+    const job = startAnimationRender(pool(1), {
+      format: 'GIF',
+      frames: [1, 2, 3],
+      width: 4,
+      height: 4,
+      fps: 24,
+      renderFrame: () => ({ done: Promise.resolve(solid(4, 4, 80)), cancel: () => undefined }),
+    });
+    // (listener errors are caught by the job: assert after it ran)
+    let cancellableWhileEncoding: boolean | null = null;
+    job.subscribe(() => {
+      if (job.status.phase !== 'encoding' || cancellableWhileEncoding !== null) return;
+      cancellableWhileEncoding = job.cancellable;
+      job.cancel();
+    });
+    const r = await job.result;
+    expect(r!.frames).toEqual([1, 2, 3]);
+    expect(r!.cancelled).toBe(false);
+    expect(job.status.phase).toBe('done');
+    expect(cancellableWhileEncoding).toBe(false);
   });
 
   it('path traces animation frames on the shared document', async () => {

@@ -47,6 +47,13 @@ export interface ServerConfig {
   mcpEnabled: boolean;
   /** Additional secret accepted on /mcp only. */
   mcpToken: string | null;
+  /** Undo steps kept per MCP agent and project (`MCP_UNDO_STEPS`, default 100). */
+  mcpUndoSteps: number;
+  /**
+   * Replaced or deleted data kept for the undo history of each MCP agent and project, in bytes
+   * (`MCP_UNDO_MEMORY_MB`, default 64 MB); older steps are dropped beyond it.
+   */
+  mcpUndoMemoryBytes: number;
   /** Accept browser telemetry on /otlp. */
   telemetryEnabled: boolean;
   /** OpenTelemetry export (null = disabled, zero overhead). */
@@ -99,6 +106,8 @@ const envSchema = z.object({
   AUTH_TOKEN: z.string().optional(),
   MCP_ENABLED: boolish.default(true),
   MCP_TOKEN: z.string().optional(),
+  MCP_UNDO_STEPS: z.coerce.number().int().min(1).max(10000).default(100),
+  MCP_UNDO_MEMORY_MB: z.coerce.number().min(0).max(65536).default(64),
   TELEMETRY_ENABLED: boolish.default(true),
   OTEL_EXPORTER_OTLP_ENDPOINT: httpUrl.optional(),
   OTEL_EXPORTER_OTLP_HEADERS: z.string().optional(),
@@ -217,6 +226,8 @@ export function loadConfig(
     authToken: e.AUTH_TOKEN ?? null,
     mcpEnabled: e.MCP_ENABLED,
     mcpToken: e.MCP_TOKEN ?? null,
+    mcpUndoSteps: e.MCP_UNDO_STEPS,
+    mcpUndoMemoryBytes: Math.round(e.MCP_UNDO_MEMORY_MB * 1024 * 1024),
     telemetryEnabled: e.TELEMETRY_ENABLED,
     otel: e.OTEL_EXPORTER_OTLP_ENDPOINT
       ? {

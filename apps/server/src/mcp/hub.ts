@@ -19,6 +19,7 @@ import { MCP_INSTRUCTIONS } from './instructions';
 import { registerResources, registerTools, type ToolContext } from './tools';
 import { sharedRenderer, type Renderer } from '../render';
 import { sharedRenderStore, type RenderStore } from '../render/store';
+import { resolveHistoryLimits, type HistoryLimits } from './history';
 
 export const MCP_PATH = '/mcp';
 /** Large enough for base64 encoded 50 MB model imports. */
@@ -56,6 +57,8 @@ export interface McpHubOptions {
   identityTtlMs?: number;
   /** Most agent identities kept (least recently used ones are dropped first; default 200). */
   maxIdentities?: number;
+  /** Limits of each agent's undo history per project (default: 100 steps, 64 MB). */
+  history?: Partial<HistoryLimits>;
   maxSessions?: number;
   /** Server-side renderer (default: the process-wide one, see `RENDER_WORKERS`). */
   renderer?: Renderer;
@@ -94,6 +97,7 @@ export class McpHub {
   /** Identities of agent ids, kept between their sessions (undo histories, editor states). */
   private readonly identities = new Map<string, AgentIdentity>();
   private readonly sweeper: ReturnType<typeof setInterval>;
+  private readonly unsubscribeRooms: () => void;
   private readonly idleTimeoutMs: number;
   private readonly presenceIdleMs: number;
   private readonly identityTtlMs: number;
@@ -108,6 +112,11 @@ export class McpHub {
       Math.max(1000, Math.min(60_000, Math.floor(this.presenceIdleMs / 2))),
     );
     this.sweeper.unref?.();
+    // a deleted or unloaded project: every session and agent id lets go of its document at once
+    this.unsubscribeRooms = opts.rooms.onRoomClosed((room) => {
+      for (const s of this.sessions.values()) s.agent.release(room);
+      for (const id of this.identities.values()) id.release(room);
+    });
   }
 
   get size(): number {
@@ -123,7 +132,7 @@ export class McpHub {
   private identity(agentId: string): AgentIdentity {
     let id = this.identities.get(agentId);
     if (!id) {
-      id = new AgentIdentity(`agent:${agentId}`, agentId);
+      id = new AgentIdentity(`agent:${agentId}`, agentId, this.opts.history);
       this.identities.set(agentId, id);
       const max = Math.max(1, this.opts.maxIdentities ?? 200);
       if (this.identities.size > max) {
@@ -156,6 +165,7 @@ export class McpHub {
       log,
       renderer: this.opts.renderer ?? sharedRenderer({ log }),
       renderStore: this.opts.renderStore ?? sharedRenderStore(),
+      historyLimits: resolveHistoryLimits(this.opts.history),
     };
     registerTools(server, ctx);
     registerResources(server, ctx);
@@ -296,7 +306,7 @@ export class McpHub {
       const sessionId = randomUUID();
       const agent = new AgentSession(
         sessionId,
-        { rooms: this.opts.rooms, registry: this.opts.registry, log: this.opts.log },
+        { rooms: this.opts.rooms, registry: this.opts.registry, log: this.opts.log, history: this.opts.history },
         agentId ? this.identity(agentId) : undefined,
       );
       const server = this.createServer(agent);
@@ -343,6 +353,7 @@ export class McpHub {
   async close(): Promise<void> {
     this.closing = true;
     clearInterval(this.sweeper);
+    this.unsubscribeRooms();
     const sessions = [...this.sessions.values()];
     await Promise.allSettled(sessions.map((s) => s.transport.close()));
     await Promise.allSettled(sessions.map((s) => this.dispose(s)));

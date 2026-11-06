@@ -1,4 +1,5 @@
 import type { Vec3 } from '../math/types';
+import type { MeshData } from '../mesh/types';
 import { Rng } from './random';
 import { MeshBuilder, boxProjectUV, clampNum, placeMesh } from './builder';
 import { polygonize, type ScalarGrid } from './isosurface';
@@ -371,13 +372,13 @@ export const CLOUD_DEFAULTS: CloudParams = {
  *
  * Built in a normalized space (cloud height about 1) and stretched to the exact size at the end:
  * a base layer of puffs spread evenly over the footprint ellipse, smaller puffs heaped on top of
- * them. The base puffs are about half the cloud height (the cumulus look) but at least large
- * enough that their number of them, spread over the footprint, overlap into one connected layer:
- * a flat cloud (footprint much larger than its height, e.g. a 520 × 110 × 12 m stratus streak)
- * gets puffs wider than the cloud is high, which the final stretch flattens into a continuous
- * layer. The marching-cubes grid is refined where the longest side alone would leave a base puff
- * less than 2.5 cells wide in radius (long or flat clouds), within the sample budget of a cube of
- * `resolution` cells.
+ * them. The base puffs are about half the cloud height (the cumulus look), but large enough to
+ * overlap into one connected layer over the whole footprint: a flat cloud (footprint much larger
+ * than its height, e.g. a 520 × 110 × 12 m stratus streak) gets puffs wider than the cloud is
+ * high, which the final stretch flattens into a continuous layer. The marching-cubes grid is
+ * refined where the longest side alone would leave a base puff less than 2.5 cells in radius
+ * (long or flat clouds), within the sample budget of a cube of `resolution` cells. Voids enclosed
+ * between puffs are removed; a cloud that still comes out in several pieces is reported.
  */
 export function generateCloud(params: Partial<CloudParams> = {}): GeneratorResult {
   const p = { ...CLOUD_DEFAULTS, ...params };
@@ -429,7 +430,7 @@ export function generateCloud(params: Partial<CloudParams> = {}): GeneratorResul
   const box = cloudGrid(min, max, res, smallest / 2.5);
   const b = box ? meshGrid(sampleSpheres(spheres, k, box.lo, box.hi, box.cell, flat ? cut : null)) : null;
   if (!b) return { mesh: new MeshBuilder().build(), materials: [MATERIALS.cloud] };
-  const mesh = b.build();
+  const { mesh, pieces } = withoutCavities(b.build());
   placeMesh(mesh, { ground: true, centerXY: true });
   // stretch to the exact requested dimensions
   const P = mesh.positions;
@@ -445,13 +446,51 @@ export function generateCloud(params: Partial<CloudParams> = {}): GeneratorResul
   for (let i = 0; i < P.length; i += 3)
     for (let c = 0; c < 3; c++) if (ext[c] > 1e-9) P[i + c] *= size[c] / ext[c];
   mesh.uvs = mesh.faces.map((f) => boxProjectUV(P, f));
-  const warnings: string[] = [];
-  const islands = faceIslands(mesh);
-  if (islands.count > 1)
-    warnings.push(
-      `the cloud came out in ${islands.count} separate pieces: raise puffs, smoothness or resolution`,
-    );
+  const warnings =
+    pieces > 1
+      ? [`the cloud came out in ${pieces} separate pieces: raise smoothness, puffs or resolution`]
+      : [];
   return { mesh, materials: [MATERIALS.cloud], ...(warnings.length ? { warnings } : {}) };
+}
+
+/**
+ * Drops the closed pieces of a marching-cubes surface that face inward (negative volume): the
+ * walls of voids enclosed between the puffs of a hard union, invisible from outside. Returns the
+ * mesh and the number of outward-facing pieces it consists of.
+ */
+function withoutCavities(mesh: MeshData): { mesh: MeshData; pieces: number } {
+  const isl = faceIslands(mesh);
+  if (isl.count < 2) return { mesh, pieces: isl.count };
+  const P = mesh.positions;
+  const volume = new Float64Array(isl.count);
+  mesh.faces.forEach((f, i) => {
+    const a = f[0] * 3;
+    for (let t = 1; t + 1 < f.length; t++) {
+      const b = f[t] * 3;
+      const c = f[t + 1] * 3;
+      volume[isl.islandOf[i]] +=
+        P[a] * (P[b + 1] * P[c + 2] - P[b + 2] * P[c + 1]) -
+        P[a + 1] * (P[b] * P[c + 2] - P[b + 2] * P[c]) +
+        P[a + 2] * (P[b] * P[c + 1] - P[b + 1] * P[c]);
+    }
+  });
+  const pieces = volume.filter((v) => v > 0).length;
+  if (pieces === isl.count) return { mesh, pieces };
+  const out = new MeshBuilder();
+  const map = new Map<number, number>();
+  mesh.faces.forEach((f, i) => {
+    if (!(volume[isl.islandOf[i]] > 0)) return;
+    const vs = f.map((v) => {
+      let m = map.get(v);
+      if (m === undefined) {
+        m = out.vert([P[v * 3], P[v * 3 + 1], P[v * 3 + 2]]);
+        map.set(v, m);
+      }
+      return m;
+    });
+    out.face(vs, 0, true);
+  });
+  return { mesh: out.build(), pieces };
 }
 
 /**

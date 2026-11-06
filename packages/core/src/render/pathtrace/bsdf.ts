@@ -11,8 +11,11 @@
  *        + (1 − metallic) · (1 − transmission) · (dielectric GGX specular over Lambert diffuse).
  * GGX uses α = roughness², the height-correlated Smith masking term, visible-normal sampling and an
  * energy compensation of the single-scattering loss (like Blender's multiscatter GGX) for the
- * reflection lobes and the glass lobe. Glass with IOR 1 does not bend light: its transmission is a
- * delta lobe straight through the surface, whatever the roughness.
+ * reflection lobes and the glass lobe. Refraction carries radiance across the interface without
+ * the η² factor of a change of medium (like Cycles: entering and leaving a closed body cancel it
+ * anyway, and single sheets or lamps inside glass keep their brightness). Glass with IOR 1 does not
+ * bend light: its transmission is a delta lobe straight through the surface, whatever the
+ * roughness.
  *
  * Sampling picks one lobe in proportion to its approximate albedo and returns the full BSDF value
  * and the combined pdf of all lobes (one-sample MIS over lobes).
@@ -343,6 +346,57 @@ function clamp01(v: number): number {
   return v > 0 ? (v < 1 ? v : 1) : 0;
 }
 
+// ------------------------------------------------------------------ thin-walled transmission
+
+/**
+ * Light that passes straight through a surface along a shadow ray, per channel into `out` (the
+ * largest component is returned): the surface is treated as thin-walled — no refraction and no
+ * change of radiance — and passes the weight of the principled transmission lobe,
+ * (1 − metallic) · transmission · base colour, less its dielectric Fresnel reflection at the
+ * incidence cosine `mu` (no total internal reflection: a thin sheet reflects the same on both
+ * sides; index-matched surfaces reflect nothing) and, crossed from the outside (`entering`), less
+ * what the sheen and coat layers reflect. This is what shadow rays (next-event estimation) see of
+ * glass, so lamps inside glass lanterns or bulbs light the scene around them; a closed glass
+ * object is crossed twice and so attenuates like a thin shell (its lens effect and caustics are
+ * not part of direct lighting).
+ */
+export function thinTransmittance(p: BSDFInputs, mu: number, entering: boolean, out: Float64Array): number {
+  const glassW = (1 - clamp01(p.metallic)) * clamp01(p.transmission);
+  if (!(glassW > 0)) {
+    out[0] = out[1] = out[2] = 0;
+    return 0;
+  }
+  const c = Math.min(1, Math.max(1e-6, Math.abs(mu)));
+  const ior = p.ior > 1e-3 && Number.isFinite(p.ior) ? p.ior : 1.5;
+  const eta = ior >= 1 ? ior : 1 / ior;
+  const F = eta - 1 < ETA_MATCHED ? 0 : fresnelDielectric(c, eta);
+  let attR = 1;
+  let attG = 1;
+  let attB = 1;
+  if (entering) {
+    // sheen and coat sit on the outside of transmissive objects (see `setup`)
+    const sheen = clamp01(p.sheen);
+    const es = sheen > 0 ? sheenAlbedo(c) * sheen : 0;
+    let coatAlbedo = 0;
+    const coat = clamp01(p.coat);
+    if (coat > 0) {
+      const cr = clamp01(p.coatRoughness);
+      const f0c = ((COAT_IOR - 1) / (COAT_IOR + 1)) ** 2;
+      const e1c = Math.max(1e-3, albedoE1(c, cr));
+      coatAlbedo = albedoDielectric(c, cr, f0c) * (1 + f0c * (1 / e1c - 1)) * coat;
+    }
+    const ca = clamp01(1 - coatAlbedo);
+    attR = clamp01(1 - es * Math.max(0, p.sheenR)) * ca;
+    attG = clamp01(1 - es * Math.max(0, p.sheenG)) * ca;
+    attB = clamp01(1 - es * Math.max(0, p.sheenB)) * ca;
+  }
+  const k = glassW * (1 - F);
+  out[0] = k * clamp01(p.baseR) * attR;
+  out[1] = k * clamp01(p.baseG) * attG;
+  out[2] = k * clamp01(p.baseB) * attB;
+  return Math.max(out[0], out[1], out[2]);
+}
+
 // ------------------------------------------------------------------ BSDF
 
 /** Input parameters of `PrincipledBSDF.setup` (linear colours, Blender ranges). */
@@ -437,8 +491,17 @@ export class PrincipledBSDF {
   private compD = 1;
   private compC = 1;
   private compG = 1;
-  /** Index-matched glass (|η − 1| < `ETA_MATCHED`): its transmission is a delta lobe. */
+  /**
+   * Index-matched (|η − 1| < `ETA_MATCHED`) or thin-walled glass: its transmission is a delta lobe
+   * straight through the surface.
+   */
   private passThrough = false;
+  /**
+   * Thin-walled glass (`setup`'s `thin`): the glass lobe reflects with the Fresnel of a sheet
+   * (an interface entered from outside: no total internal reflection) and passes the rest straight
+   * through, like `thinTransmittance`.
+   */
+  private thin = false;
   // diffuse weight (rgb, already including albedo scaling and attenuation)
   private diffR = 0;
   private diffG = 0;
@@ -450,9 +513,19 @@ export class PrincipledBSDF {
    * Prepares the closure. `wo` is the local outgoing direction (wz > 0); `entering` is true when
    * wo is outside the object (front face), which decides the IOR ratio for transmission.
    * `minAlpha` raises the GGX α of every microfacet lobe to at least that value (path
-   * regularization, Cycles' "Filter Glossy").
+   * regularization, Cycles' "Filter Glossy"). `thin` makes glass thin-walled: it reflects like a
+   * sheet and transmits straight through (the path tracer uses this where shadow rays already
+   * treat the glass as thin, see integrator.ts).
    */
-  setup(p: BSDFInputs, wox: number, woy: number, woz: number, entering: boolean, minAlpha = 0): void {
+  setup(
+    p: BSDFInputs,
+    wox: number,
+    woy: number,
+    woz: number,
+    entering: boolean,
+    minAlpha = 0,
+    thin = false,
+  ): void {
     this.wox = wox;
     this.woy = woy;
     this.woz = Math.max(1e-6, woz);
@@ -516,10 +589,19 @@ export class PrincipledBSDF {
     const specAlbedoD = Math.min(1, albedoDielectric(mu, rough, f0d) * this.compD);
     const kd = this.dielW * (1 - specAlbedoD);
     // glass: index-matched interfaces pass light straight through; rough ones get the energy
-    // lost to single scattering back (white glass stays lossless at any roughness)
-    this.passThrough = this.glassW > 0 && Math.abs(this.eta - 1) < ETA_MATCHED;
+    // lost to single scattering back (white glass stays lossless at any roughness); a thin wall
+    // reflects the same from both sides and passes the rest straight through
+    this.thin = thin && this.glassW > 0;
+    if (this.thin) this.eta = ior >= 1 ? ior : 1 / ior;
+    this.passThrough = this.glassW > 0 && (this.thin || Math.abs(this.eta - 1) < ETA_MATCHED);
+    // (a thin wall's rough reflection gets its single-scattering loss back like the opaque lobes;
+    // what it does not reflect passes losslessly)
     this.compG =
-      this.glassW > 0 && !this.passThrough ? 1 / Math.max(0.2, glassAlbedo(mu, rough, this.eta)) : 1;
+      this.glassW > 0 && !this.passThrough
+        ? 1 / Math.max(0.2, glassAlbedo(mu, rough, this.eta))
+        : this.thin
+          ? 1 / e1
+          : 1;
     this.diffR = kd * bR * this.attR;
     this.diffG = kd * bG * this.attG;
     this.diffB = kd * bB * this.attB;
@@ -553,7 +635,9 @@ export class PrincipledBSDF {
       prob[LOBE_DIFFUSE] === 0 &&
       prob[LOBE_SHEEN] === 0 &&
       (prob[LOBE_SPEC] === 0 || this.alpha < SPECULAR_ALPHA) &&
-      (prob[LOBE_GLASS] === 0 || this.passThrough || this.alpha < SPECULAR_ALPHA) &&
+      (prob[LOBE_GLASS] === 0 ||
+        (this.passThrough && Math.abs(this.eta - 1) < ETA_MATCHED) ||
+        this.alpha < SPECULAR_ALPHA) &&
       (prob[LOBE_COAT] === 0 || this.alphaC < SPECULAR_ALPHA);
     this.singular = sum > 0 && specOnly;
     // albedo AOV
@@ -669,8 +753,10 @@ export class PrincipledBSDF {
           const sq = ci + co / eta;
           const denom = sq * sq;
           if (denom > 0) {
-            // f·|cos θi| = D G2 (1 − F) |i·h| |o·h| / (|o_z| denom η²)
-            const k = ((D * G2 * (1 - F) * -ci * co) / (oz * denom * eta * eta)) * this.glassW * this.compG;
+            // f·|cos θi| = D G2 (1 − F) |i·h| |o·h| / (|o_z| denom): like Cycles, without the
+            // η² radiance compression of a medium (a single glass sheet, a lamp or camera inside
+            // a glass body keep their brightness; a closed body is entered and left anyway)
+            const k = ((D * G2 * (1 - F) * -ci * co) / (oz * denom)) * this.glassW * this.compG;
             fr += k * this.baseR * this.attR;
             fg += k * this.baseG * this.attG;
             fb += k * this.baseB * this.attB;
@@ -715,7 +801,28 @@ export class PrincipledBSDF {
     this.sampledTransmission = false;
     this.sampledDelta = false;
     if (lobe === LOBE_GLASS && this.passThrough) {
-      // index-matched glass: straight through with weight (1 − F ≈ 1) × tint, chosen with prob
+      if (this.thin && Math.abs(this.eta - 1) >= ETA_MATCHED) {
+        // thin wall: a microfacet reflects with its Fresnel, else the light passes straight through
+        const h = this.h;
+        sampleVNDF(ox, oy, oz, this.alpha, u0, u1, h);
+        const c = ox * h[0] + oy * h[1] + oz * h[2];
+        if (c <= 0) return false;
+        if (uSub < fresnelDielectric(c, this.eta)) {
+          ix = 2 * c * h[0] - ox;
+          iy = 2 * c * h[1] - oy;
+          iz = 2 * c * h[2] - oz;
+          if (iz <= 0) return false;
+          this.sampledSpecular = this.alpha < SPECULAR_ALPHA;
+          this.wx = ix;
+          this.wy = iy;
+          this.wz = iz;
+          this.eval(ix, iy, iz);
+          return this.pdf > 0 && this.fR + this.fG + this.fB > 0;
+        }
+      }
+      // index-matched glass or the transmitted part of a thin wall: straight through with weight
+      // (1 − F) × tint (F ≈ 0 when index-matched; for a thin wall the reflected share is the
+      // microfacet reflection sampled above), chosen with prob
       this.wx = -ox;
       this.wy = -oy;
       this.wz = -oz;

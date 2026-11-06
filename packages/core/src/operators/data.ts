@@ -140,7 +140,12 @@ export function registerDataOperators(reg: OperatorRegistry): void {
               .listObjects()
               .filter((o) => o.type === 'CAMERA' && o.data === id)
               .map((o) => o.id);
-            checkCameraFields(ctx.doc, users, current as unknown as CameraData, values as Partial<CameraData>);
+            checkCameraFields(
+              ctx.doc,
+              users,
+              current as unknown as CameraData,
+              values as Partial<CameraData>,
+            );
           }
           ctx.doc.updateBlockByKind(p.kind, id, values);
           const animType = ANIM_TYPE[p.kind];

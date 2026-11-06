@@ -44,6 +44,7 @@ import { RpcError } from '../sync/room';
 import { isNotImplemented, safeFileName } from '../api/projects';
 import { persistenceNote } from '../persistence';
 import { ToolError, type AgentProject, type AgentSession } from './agent';
+import type { HistoryLimits } from './history';
 import {
   DEFAULT_MAX_OBJECTS,
   describeObject,
@@ -102,7 +103,11 @@ export interface ToolContext {
   renderer: Renderer;
   /** Stored render results (render_animation `store`). */
   renderStore: RenderStore;
+  /** Limits of the agents' undo histories (for descriptions and notes). */
+  historyLimits: HistoryLimits;
 }
+
+const formatMb = (bytes: number) => `${+(bytes / 1048576).toFixed(1)} MB`;
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 type ToolOutput = CallToolResult | Record<string, unknown> | unknown[];
@@ -1780,7 +1785,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           (kind === 'undo'
             ? "Undo the agent's own most recent change(s) in a project (changes made by other users are never undone). Each tool call is one step (a batch is one step)."
             : "Redo the agent's most recently undone change(s).") +
-          ' The history belongs to the MCP session, or — when the client sends an agent id (header x-mcp-agent-id or ?agent=<id> on the endpoint URL; scripts/mcp.mjs sends one) — to that agent id across sessions, so one-shot CLI calls can undo each other. It ends when the server restarts or the project is unloaded.',
+          ' The history belongs to the MCP session, or — when the client sends an agent id (header x-mcp-agent-id or ?agent=<id> on the endpoint URL; scripts/mcp.mjs sends one) — to that agent id across sessions, so one-shot CLI calls can undo each other. It ends when the server restarts or the project is unloaded.' +
+          ` It keeps the last ${ctx.historyLimits.maxSteps} steps per project and at most ${formatMb(ctx.historyLimits.maxBytes)} of replaced or deleted data (older steps are dropped; the newest step is always kept).`,
         annotations: EDIT,
       },
       { project: projectArg, steps: z.number().int().min(1).max(100).default(1) },
@@ -1793,13 +1799,18 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           done++;
         }
         p.room.touch();
+        const dropped = p.history.stats().dropped_steps;
         return {
           [kind === 'undo' ? 'undone' : 'redone']: done,
           can_undo: p.undo.canUndo(),
           can_redo: p.undo.canRedo(),
           ...(done < steps
             ? {
-                note: `${done ? `Only ${done} of ${steps} step(s)` : 'Nothing'} to ${kind} in ${historyScope()}.`,
+                note:
+                  `${done ? `Only ${done} of ${steps} step(s)` : 'Nothing'} to ${kind} in ${historyScope()}.` +
+                  (kind === 'undo' && dropped
+                    ? ` The history keeps the last ${p.history.maxSteps} steps and at most ${formatMb(p.history.maxBytes)} of replaced or deleted data per project: ${dropped} older step(s) were dropped.`
+                    : ''),
               }
             : {}),
         };

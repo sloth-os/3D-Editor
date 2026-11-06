@@ -129,28 +129,63 @@ export function uiNumberParam(params: Record<string, unknown>, key: string): num
 }
 
 /**
+ * A boolean UI command parameter: true or false (also the strings "true" / "false" in any case, and
+ * 1 / 0); `fallback` when it is not given. Anything else is an error that names the parameter.
+ */
+export function uiBooleanParam(params: Record<string, unknown>, key: string, fallback: boolean): boolean {
+  const raw = params[key];
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw === 'boolean') return raw;
+  if (raw === 1 || raw === 0) return raw === 1;
+  const v = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (v === 'true' || v === 'false') return v === 'true';
+  throw new Error(`'${key}' must be true or false, got ${JSON.stringify(raw)}`);
+}
+
+/**
+ * Runs an operator for an MCP agent's UI command: `{ok: true, result?}`, or `{ok: false, error}` with
+ * the operator's reason. The agent gets the reason; the person at this editor, who did not cause the
+ * failure, gets no error toast for it (it stays in the Info log).
+ */
+function runForAgent(id: string, params?: unknown): { ok: boolean; error?: string; result?: unknown } {
+  const shown = toasts.value;
+  const r = runResult(id, params, 'mcp');
+  if (r?.ok) return r.result === undefined ? { ok: true } : { ok: true, result: r.result };
+  if (toasts.value !== shown)
+    toasts.value = toasts.value.filter((t) => shown.includes(t) || t.level !== 'error');
+  return { ok: false, error: r?.error ?? 'No project is open in this editor' };
+}
+
+/**
  * Runs a UI command of an RPC `ui` request (MCP `editor_command`) in this editor; invalid parameters
- * are errors that say what is wrong, and leave the editor as it was.
+ * are errors that say what is wrong, and leave the editor as it was. A command that cannot be done
+ * (no active mesh for Edit Mode, no scene camera, …) returns `ok: false` and the reason in `error`.
  */
 export async function uiCommand(command: string, params: Record<string, unknown>): Promise<unknown> {
   const s = session.value!;
   const e = viewport.engine;
   switch (command) {
     case 'view.frame_all':
-      run('view3d.view_all', {}, 'mcp');
-      return { ok: true };
+      return runForAgent('view3d.view_all', {});
     case 'view.frame_selected':
-      run('view3d.view_selected', {}, 'mcp');
-      return { ok: true };
+      return runForAgent('view3d.view_selected', {});
     case 'view.set_view': {
       const type = uiEnumParam(params, ['view', 'type'], VIEW_TYPES, 'FRONT');
-      const ok =
-        type === 'CAMERA' ? run('view3d.view_camera', {}, 'mcp') : run('view3d.view_axis', { type }, 'mcp');
-      return { ok, view: type };
+      // view3d.view_camera toggles the camera view: asked for the camera, the agent gets it whatever
+      // the view is now
+      if (type === 'CAMERA' && s.view.cameraView.value && s.doc.getScene().camera)
+        return { ok: true, view: type };
+      const r =
+        type === 'CAMERA' ? runForAgent('view3d.view_camera', {}) : runForAgent('view3d.view_axis', { type });
+      return r.ok ? { ok: true, view: type } : { ok: false, view: type, error: r.error };
     }
     case 'view.shading': {
       const type = uiEnumParam(params, ['shading', 'type'], SHADING_TYPES, 'SOLID');
-      return { ok: run('view3d.toggle_shading', { type }, 'mcp'), shading: type };
+      // view3d.toggle_shading switches WIREFRAME back to SOLID: the agent gets the shading it asks for
+      const r = s.view.shading.value === type ? { ok: true } : runForAgent('view3d.toggle_shading', { type });
+      return r.ok
+        ? { ok: true, shading: s.view.shading.value }
+        : { ok: false, shading: s.view.shading.value, error: r.error };
     }
     case 'select': {
       // objects (names or ids; the last one becomes active); none or [] deselects everything
@@ -173,20 +208,23 @@ export async function uiCommand(command: string, params: Record<string, unknown>
       s.state.activeId = ids[ids.length - 1] ?? null;
       return { selected: ids, names: ids.map((id) => s.doc.getObject(id)?.name ?? id) };
     }
-    case 'set_mode':
-      return { ok: run('object.mode_set', { mode: String(params.mode ?? 'OBJECT').toUpperCase() }, 'mcp') };
+    case 'set_mode': {
+      // `mode` is the editor's mode afterwards (unchanged when the switch failed)
+      const r = runForAgent('object.mode_set', { mode: uiEnumParam(params, ['mode'], MODES, 'OBJECT') });
+      return r.ok ? { ok: true, mode: s.state.mode } : { ok: false, mode: s.state.mode, error: r.error };
+    }
     case 'set_frame':
       s.state.frame = uiNumberParam(params, 'frame');
       return { frame: s.state.frame };
     case 'play':
-      s.view.playing.value = params.playing !== false;
+      s.view.playing.value = uiBooleanParam(params, 'playing', true);
       return { playing: s.view.playing.value };
     case 'notify':
       toast(String(params.message ?? ''), 'info', 6000);
       return { ok: true };
     case 'run_operator': {
-      const r = runResult(String(params.operator), params.params, 'mcp');
-      return r ? { ok: r.ok, error: r.error, result: r.result } : { ok: false };
+      const r = runForAgent(String(params.operator), params.params);
+      return { ok: r.ok, error: r.error, result: r.result };
     }
     case 'screenshot': {
       if (!e) throw new Error('no viewport');
@@ -211,7 +249,7 @@ export async function uiCommand(command: string, params: Record<string, unknown>
     }
     default:
       throw new Error(
-        `unknown UI command '${command}'. Available: view.frame_all, view.frame_selected, view.set_view {view: ${VIEW_TYPES.join('|')}}, view.shading {shading: ${SHADING_TYPES.join('|')}}, select {objects: [names]}, set_mode {mode}, set_frame {frame: number}, play {playing}, notify {message}, run_operator {operator, params}, screenshot {width?, height?}, get_view`,
+        `unknown UI command '${command}'. Available: view.frame_all, view.frame_selected, view.set_view {view: ${VIEW_TYPES.join('|')}}, view.shading {shading: ${SHADING_TYPES.join('|')}}, select {objects: [names]}, set_mode {mode: ${MODES.join('|')}}, set_frame {frame: number}, play {playing: true|false}, notify {message}, run_operator {operator, params}, screenshot {width?, height?}, get_view`,
       );
   }
 }

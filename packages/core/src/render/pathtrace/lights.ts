@@ -388,6 +388,9 @@ export class LightSelector {
   readonly adaptive: boolean;
   private readonly weights: Float64Array;
   private readonly staticDist: Distribution1D;
+  /** Weights and total remembered by `save`. */
+  private saved: Float64Array | null = null;
+  private savedTotal = 0;
   /** Sum of the weights of the last `prepare` call. */
   total = 0;
   /** Probability of the group chosen by the last `pick`, and the remapped random number. */
@@ -539,6 +542,24 @@ export class LightSelector {
     this.prob = w[last] / this.total;
     this.uRest = 0.5;
     return last;
+  }
+
+  /**
+   * Remembers the weights of the last `prepare` call, so that `restore` can bring them back after
+   * another point was prepared (a path that continues from an earlier vertex's MIS state).
+   */
+  save(): void {
+    if (this.adaptive) {
+      if (!this.saved) this.saved = new Float64Array(this.count);
+      this.saved.set(this.weights);
+    }
+    this.savedTotal = this.total;
+  }
+
+  /** Brings back the weights remembered by `save`. */
+  restore(): void {
+    if (this.adaptive && this.saved) this.weights.set(this.saved);
+    this.total = this.savedTotal;
   }
 
   /**

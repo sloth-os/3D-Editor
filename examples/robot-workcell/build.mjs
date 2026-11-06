@@ -128,6 +128,17 @@ function addTaperBox(g, z0, z1, [w0, d0], [w1, d1], [ox, oy] = [0, 0]) {
     g.f.push(q.map((i) => vb + i));
   return { v: vb, f: fb };
 }
+const addTaper = (g, t) => addTaperBox(g, t.z0, t.z1, [t.w0, t.d0], [t.w1, t.d1]);
+/** Box centred at c with edges along the unit vectors a, b and a x b (sizes [sa, sb, sc]). */
+function addOrientedBox(g, c, a, b, [sa, sb, sc]) {
+  const n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const vb = g.v.length;
+  for (const k of [-0.5, 0.5])
+    for (const j of [-0.5, 0.5])
+      for (const i of [-0.5, 0.5]) g.v.push(c.map((x, m) => r6(x + a[m] * i * sa + b[m] * j * sb + n[m] * k * sc)));
+  for (const q of [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]])
+    g.f.push(q.map((i) => vb + i));
+}
 /** Closed cylinder around `axis` ('X' | 'Y' | 'Z') centred at c. */
 function addCylinder(g, c, radius, length, axis = 'Z', segments = 32) {
   const vb = g.v.length;
@@ -162,6 +173,7 @@ const mul = (a, s) => a.map((x) => x * s);
 const len = (a) => Math.hypot(...a);
 const norm = (a) => mul(a, 1 / len(a));
 const dist = (a, b) => len(sub(a, b));
+const dot = (a, b) => a.reduce((acc, x, i) => acc + x * b[i], 0);
 const fmt = (a) => `[${a.map((x) => x.toFixed(3)).join(', ')}]`;
 
 // ---------------------------------------------------------------------------------------------
@@ -177,6 +189,23 @@ const WRIST = [1.32, 0, 1.62];
 const WRIST_TAIL = [1.32, 0, 1.38];
 const HOSE_START = [-0.3, 0, 0.63]; // dress-pack hose: cable fitting at the back of the turret ...
 const HOSE_END = [WRIST[0] - 0.04, 0, WRIST[2] + 0.12]; // ... to the top of the wrist
+const LU = dist(ELBOW, SHOULDER); // upper-arm and forearm bone lengths
+const LF = dist(WRIST, ELBOW);
+// The two arm links are boxes tapering along their bone: from z0 to z1 (metres from the bone head)
+// with width w (in the arm plane) and depth d (along the joint axes, world Y) at both ends.
+const UPPER_ARM_TAPER = { z0: 0.1, z1: LU - 0.1, w0: 0.24, d0: 0.24, w1: 0.17, d1: 0.2 };
+const FOREARM_START = 0.12; // the forearm starts this far from the elbow axis ...
+const FOREARM_TAPER = { z0: FOREARM_START, z1: LF - 0.06, w0: 0.19, d0: 0.18, w1: 0.13, d1: 0.14 };
+const ELBOW_HOUSING_R = 0.16; // ... inside the elbow housing, which covers both link ends
+const ELBOW_MOTOR_Y = -0.19; // the rear elbow motor sits beside the arm's centre plane
+/** Half the in-plane width of a tapered link `s` metres from its bone head. */
+const taperHalf = (t, s) => (t.w0 + ((t.w1 - t.w0) * (s - t.z0)) / (t.z1 - t.z0)) / 2;
+// Dress-pack hose route: centre line 0.17 m behind the upper arm's axis, a 0.235 m arc around
+// the elbow axis, 0.135 m above the forearm's axis
+const HOSE_BACK_OFFSET = 0.17;
+const HOSE_ARC_R = 0.235;
+const HOSE_ARC_DEG = [150, 118, 85];
+const HOSE_TOP_OFFSET = 0.135;
 const GRIP_DROP = 0.52; // wrist head (IK target) -> centre of a gripped crate
 const CRATE = [0.42, 0.42, 0.32];
 const CONVEYOR_X = -1.55;
@@ -229,12 +258,22 @@ const F_GRIPPED = 33; // fingers closed: the crate starts to follow the gripper
 const F_RELEASE = 72; // crate set down on the pallet
 const F_OPEN = 77;
 // Conveyor: the crate waits at the pick station at frame 1. While the robot swings it to the
-// pallet, the conveyor indexes the queue one pitch forward, so that at frame 96 the next crate
-// sits where this one started (the conveyor part of the cycle loops seamlessly).
+// pallet, the conveyor indexes the queue one pitch forward: at frame 96 every queued crate sits
+// where the one ahead of it started, and Crate_Queued5, hidden in the infeed hood at frame 1, has
+// taken the last place, so the conveyor looks the same at frames 1 and 96 (verified in step 11).
 const QUEUE_PITCH = 1.05; // spacing of the waiting crates along the belt (m)
-const QUEUED = ['Crate_Queued1', 'Crate_Queued2', 'Crate_Queued3', 'Crate_Queued4'];
+const QUEUED = ['Crate_Queued1', 'Crate_Queued2', 'Crate_Queued3', 'Crate_Queued4', 'Crate_Queued5'];
 const F_INDEX_START = 44;
 const F_INDEX_END = 62;
+// Infeed hood at the far end of the belt (mouth at INFEED_Y0, back wall at INFEED_Y1) and its
+// roll-up door, keyed [frame, lift in m]: closed, open before the crate arrives, closed behind it
+const INFEED_Y0 = 4.52;
+const INFEED_Y1 = 5.85;
+const MOUTH_HALF = 0.25; // half width of the mouth (crate: 0.21)
+const MOUTH_TOP = ROLLER_TOP + CRATE[2] + 0.06; // 6 cm above a crate
+const DOOR_Y = INFEED_Y0 + 0.065; // door plane, just behind the 5 cm front wall
+const DOOR_LIFT = 0.42; // fully open: the door is hidden behind the header
+const DOOR_KEYS = [[1, 0], [45, 0], [51, DOOR_LIFT], [58, DOOR_LIFT], [64, 0]];
 
 const smoother = (u) => u * u * u * (u * (u * 6 - 15) + 10);
 function cylAt(f) {
@@ -463,26 +502,29 @@ const robotParts = []; // [object name, material key, bone]
   ops.push(meshOp('Robot_ShoulderHousing', g));
   robotParts.push(['Robot_ShoulderHousing', 'graphite', 'J2_Shoulder']);
   const dU = norm(sub(ELBOW, SHOULDER));
-  const LU = dist(ELBOW, SHOULDER);
   g = newGeo();
-  addTaperBox(g, 0.1, LU - 0.1, [0.24, 0.24], [0.17, 0.2]);
+  addTaper(g, UPPER_ARM_TAPER);
   ops.push(meshOp('Robot_UpperArm', g, { location: SHOULDER, rotation: [0, Math.atan2(dU[0], dU[2]), 0] }));
   robotParts.push(['Robot_UpperArm', 'paint', 'J2_Shoulder']);
 
-  // J3: elbow housing, rear motor, forearm
+  // J3: elbow housing, rear motor, forearm. The elbow bends between 78 and 127 degrees in the
+  // cycle, so the links are laid out to clear each other over that whole range: the forearm
+  // starts 0.12 m from the joint axis (inside the 0.16 m housing), so its lower corner never
+  // reaches the end of the upper arm when the elbow closes, and the rear motor is mounted beside
+  // the arm's centre plane (y -0.115 to -0.265): it swings past the upper arm (|y| <= 0.1) when
+  // the elbow opens, and the dress-pack hose (y = 0) runs around the back of the elbow next to it.
   g = newGeo();
-  addCylinder(g, ELBOW, 0.14, 0.28, 'Y', 40);
+  addCylinder(g, ELBOW, ELBOW_HOUSING_R, 0.3, 'Y', 44);
   ops.push(meshOp('Robot_ElbowHousing', g));
   robotParts.push(['Robot_ElbowHousing', 'graphite', 'J3_Elbow']);
   const dF = norm(sub(WRIST, ELBOW));
-  const LF = dist(WRIST, ELBOW);
   g = newGeo();
-  addTaperBox(g, -0.34, -0.12, [0.15, 0.15], [0.15, 0.15]);
-  addCylinder(g, [0, 0, -0.38], 0.085, 0.08, 'Z', 28);
+  addTaperBox(g, -0.34, -0.1, [0.15, 0.15], [0.15, 0.15], [0, ELBOW_MOTOR_Y]);
+  addCylinder(g, [0, ELBOW_MOTOR_Y, -0.38], 0.085, 0.08, 'Z', 28);
   ops.push(meshOp('Robot_ElbowMotor', g, { location: ELBOW, rotation: [0, Math.atan2(dF[0], dF[2]), 0] }));
   robotParts.push(['Robot_ElbowMotor', 'graphite', 'J3_Elbow']);
   g = newGeo();
-  addTaperBox(g, 0.08, LF - 0.06, [0.19, 0.18], [0.13, 0.14]);
+  addTaper(g, FOREARM_TAPER);
   ops.push(meshOp('Robot_Forearm', g, { location: ELBOW, rotation: [0, Math.atan2(dF[0], dF[2]), 0] }));
   robotParts.push(['Robot_Forearm', 'paint', 'J3_Elbow']);
   g = newGeo();
@@ -499,9 +541,10 @@ const robotParts = []; // [object name, material key, bone]
   await batch(ops, 'robot parts');
 }
 // Gears (generator): slewing ring on J1, gear wheels on the shoulder and elbow
-await op('object.generate_gear', { name: 'Robot_SlewRing', teeth: 60, radius: 0.335, tooth_depth: 0.02, thickness: 0.05, bore: 0.25, location: [0, 0, 0.345] });
-await op('object.generate_gear', { name: 'Robot_ShoulderGear', teeth: 28, radius: 0.16, tooth_depth: 0.022, thickness: 0.035, bore: 0.05, location: [SHOULDER[0], 0.235, SHOULDER[2]], rotation: [Math.PI / 2, 0, 0] });
-await op('object.generate_gear', { name: 'Robot_ElbowGear', teeth: 22, radius: 0.125, tooth_depth: 0.018, thickness: 0.03, bore: 0.04, location: [ELBOW[0], 0.155, ELBOW[2]], rotation: [Math.PI / 2, 0, 0] });
+// (materials: false: the parts get their materials below, so no unused default "Steel" is made)
+await op('object.generate_gear', { name: 'Robot_SlewRing', teeth: 60, radius: 0.335, tooth_depth: 0.02, thickness: 0.05, bore: 0.25, location: [0, 0, 0.345], materials: false });
+await op('object.generate_gear', { name: 'Robot_ShoulderGear', teeth: 28, radius: 0.16, tooth_depth: 0.022, thickness: 0.035, bore: 0.05, location: [SHOULDER[0], 0.235, SHOULDER[2]], rotation: [Math.PI / 2, 0, 0], materials: false });
+await op('object.generate_gear', { name: 'Robot_ElbowGear', teeth: 26, radius: 0.145, tooth_depth: 0.02, thickness: 0.03, bore: 0.04, location: [ELBOW[0], 0.165, ELBOW[2]], rotation: [Math.PI / 2, 0, 0], materials: false });
 robotParts.push(['Robot_SlewRing', 'steel', 'J1_Base'], ['Robot_ShoulderGear', 'steel', 'J2_Shoulder'], ['Robot_ElbowGear', 'steel', 'J3_Elbow']);
 
 // Gripper with two fingers; the 'Grip' shape key closes them onto the crate
@@ -561,28 +604,30 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
   log(`bone-parented ${robotParts.length} rigid parts (object.parent_set BONE)`);
 }
 
-// Dress-pack hose along the arm, skinned with automatic weights so it bends with the joints
+const CLAMPS = []; // [clamp name, hose point it holds (rest pose)], filled below, used by the verification
+// Dress-pack hose along the arm, skinned with automatic weights so it bends with the joints.
+// Route (arm plane y = 0): turret fitting -> up the back of the upper arm -> around the back of
+// the elbow (outside the housing, next to the side-mounted elbow motor) -> along the top of the
+// forearm -> wrist. Clamps on brackets hold it to the arm.
 {
-  const nB = [-dirOf(SHOULDER, ELBOW)[2], 0, dirOf(SHOULDER, ELBOW)[0]]; // behind the upper arm
-  function dirOf(a, b) {
-    return norm(sub(b, a));
-  }
-  const dU = dirOf(SHOULDER, ELBOW);
-  const dF = dirOf(ELBOW, WRIST);
-  const up = [-dF[2], 0, dF[0]];
+  const dU = norm(sub(ELBOW, SHOULDER));
+  const dF = norm(sub(WRIST, ELBOW));
+  const nB = [-dU[2], 0, dU[0]]; // behind the upper arm (its local -X)
+  const up = [-dF[2], 0, dF[0]]; // above the forearm (its local -X)
+  const HOSE_R = 0.032;
   const pts = [
     HOSE_START,
     [-0.31, 0, 0.74],
     [-0.22, 0, 0.9],
-    add(add(SHOULDER, mul(dU, 0.35)), mul(nB, 0.17)),
-    add(add(SHOULDER, mul(dU, 0.7)), mul(nB, 0.165)),
+    add(add(SHOULDER, mul(dU, 0.35)), mul(nB, HOSE_BACK_OFFSET)),
+    add(add(SHOULDER, mul(dU, 0.7)), mul(nB, HOSE_BACK_OFFSET)),
   ];
-  for (const a of [150, 118, 85]) {
+  for (const a of HOSE_ARC_DEG) {
     const t = (a * Math.PI) / 180;
-    pts.push([ELBOW[0] + 0.235 * Math.cos(t), 0, ELBOW[2] + 0.235 * Math.sin(t)]);
+    pts.push([ELBOW[0] + HOSE_ARC_R * Math.cos(t), 0, ELBOW[2] + HOSE_ARC_R * Math.sin(t)]);
   }
-  for (const t of [0.35, 0.68, 0.9]) pts.push(add(add(ELBOW, mul(dF, t)), mul(up, 0.135)));
-  pts.push(HOSE_END);
+  const forePts = [0.35, 0.68, 0.9].map((t) => add(add(ELBOW, mul(dF, t)), mul(up, HOSE_TOP_OFFSET)));
+  pts.push(...forePts, HOSE_END);
   // densify (~4 cm) so the skinned tube bends smoothly
   const dense = [];
   for (let i = 0; i < pts.length - 1; i++) {
@@ -593,11 +638,12 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
   const hose = await op('object.generate_pipe', {
     name: 'Robot_Hose',
     points: dense,
-    radius: 0.032,
+    radius: HOSE_R,
     segments: 14,
     bend_radius: 0,
     closed_ends: true,
     location: [0, 0, 0],
+    materials: false,
   });
   const weights = await op(
     'object.parent_set',
@@ -606,40 +652,96 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
   );
   await batch([assign('rubber', ['Robot_Hose']), sel(['Robot_Hose']), { operator: 'object.shade_smooth' }], 'hose');
   log(`hose: ${hose.vertices} vertices, auto weights -> ${JSON.stringify(weights.vertex_groups)}`);
-  // Weight fix-up: the automatic weights give the hose root on the turret ~45 % shoulder and
-  // elbow influence, so the root would slide over its fitting whenever the shoulder pitches.
-  // Pin the first 10 cm to J1_Base and blend into the automatic weights over the next 15 cm
-  // (read with get_mesh_data, written with object.vertex_group_set_weights).
+  // Weight fix-up (what a rigger does with weight painting after automatic weights): the
+  // automatic weights blend over long stretches of the hose (at the root about half J2_Shoulder,
+  // at the upper-arm clamps 5-16 % J1_Base and up to 15 % J3_Elbow), so the root would slide over
+  // its fitting and the clamped stretches through their clamps. The stretches that are fixed to
+  // a link are pinned to its bone (root -> J1_Base, upper-arm clamps -> J2_Shoulder, forearm ->
+  // J3_Elbow) and blend back into the automatic weights over 12-15 cm, so the hose still bends
+  // with the automatic weights at the shoulder and around the elbow. Weights are read with
+  // get_mesh_data and written with object.vertex_group_set_weights.
+  const arc = [0];
+  for (let i = 1; i < dense.length; i++) arc.push(arc[i - 1] + dist(dense[i - 1], dense[i]));
+  /** Arc length along the hose path of the path point closest to p. */
+  const arcAt = (p) => {
+    let best = Infinity;
+    let at = 0;
+    for (let i = 0; i < dense.length - 1; i++) {
+      const d = sub(dense[i + 1], dense[i]);
+      const L = len(d);
+      const t = Math.min(1, Math.max(0, dot(sub(p, dense[i]), d) / (L * L)));
+      const e = dist(p, add(dense[i], mul(d, t)));
+      if (e < best) [best, at] = [e, arc[i] + t * L];
+    }
+    return at;
+  };
+  const zones = [
+    { bone: 'J1_Base', from: 0, to: 0.1, blend: 0.15 },
+    { bone: 'J2_Shoulder', from: arcAt(pts[3]) - 0.05, to: arcAt(pts[4]) + 0.05, blend: 0.12 },
+    { bone: 'J3_Elbow', from: arcAt(forePts[0]) - 0.05, to: Infinity, blend: 0.12 },
+  ];
   const wd = await tool('get_mesh_data', { object: 'Robot_Hose', include: ['vertices', 'vertex_groups'], source: 'BASE', space: 'WORLD', limit: 5000 });
   const groups = Object.keys(wd.vertex_groups);
   const fixed = Object.fromEntries(groups.map((g) => [g, []]));
+  const pinned = Object.fromEntries(zones.map((z) => [z.bone, 0]));
   wd.vertices.forEach((v, i) => {
-    const k = Math.min(1, Math.max(0, (dist(v, HOSE_START) - 0.1) / 0.15));
-    for (const g of groups) fixed[g][i] = r6((g === 'J1_Base' ? 1 - k : 0) + k * wd.vertex_groups[g][i]);
+    const s = arcAt(v);
+    let pin = 0;
+    let bone = null;
+    for (const z of zones) {
+      const k = 1 - Math.max(0, z.from - s, s - z.to) / z.blend;
+      if (k > pin) [pin, bone] = [k, z.bone];
+    }
+    if (pin >= 1) pinned[bone]++;
+    for (const g of groups) fixed[g][i] = r6((1 - pin) * wd.vertex_groups[g][i] + (g === bone ? pin : 0));
   });
   await batch(
     groups.map((group) => ({ operator: 'object.vertex_group_set_weights', params: { object: 'Robot_Hose', group, weights: fixed[group] } })),
-    'hose root weights',
+    'hose weights',
   );
-  log(`hose root pinned to J1_Base (${wd.vertices.filter((v) => dist(v, HOSE_START) < 0.25).length} vertices re-weighted)`);
-  // clamps holding the hose (bone-parented rings)
+  log(`hose weights pinned (vertices fully pinned per bone ${JSON.stringify(pinned)}); automatic weights kept at the shoulder and the elbow`);
+
+  // Clamps (bone-parented rings around the hose), each on a small bracket that reaches down to
+  // the arm surface; the bracket length follows the taper of the arm segment it is bolted to.
+  const RING = 0.042; // torus major radius
   const clampOps = [];
-  const clampAt = (name, p, dir, bone) => {
+  const upperBrackets = newGeo();
+  const foreBrackets = newGeo();
+  const clampAt = (name, p, dir, bone, toArm, offset, halfWidth, g) => {
     clampOps.push({
       operator: 'mesh.primitive_torus_add',
-      params: { name, major_radius: 0.042, minor_radius: 0.011, major_segments: 24, minor_segments: 8, location: p, rotation: [0, Math.atan2(dir[0], dir[2]), 0] },
+      params: { name, major_radius: RING, minor_radius: 0.011, major_segments: 24, minor_segments: 8, location: p, rotation: [0, Math.atan2(dir[0], dir[2]), 0] },
     });
     clampOps.push(assign('steel', [name]));
     clampOps.push(sel([name, 'Robot_Rig'], 'Robot_Rig'), { operator: 'object.parent_set', params: { type: 'BONE', bone } });
+    const t0 = RING - 0.004; // inside the ring's tube ...
+    const t1 = offset - halfWidth + 0.006; // ... to 6 mm inside the arm
+    addOrientedBox(g, add(p, mul(toArm, (t0 + t1) / 2)), toArm, [0, 1, 0], [t1 - t0, 0.03, 0.022]);
   };
-  clampAt('Robot_HoseClamp1', pts[3], dU, 'J2_Shoulder');
-  clampAt('Robot_HoseClamp2', pts[4], dU, 'J2_Shoulder');
-  clampAt('Robot_HoseClamp3', pts[9], dF, 'J3_Elbow');
+  const upperHalf = (s) => taperHalf(UPPER_ARM_TAPER, s);
+  const foreHalf = (s) => taperHalf(FOREARM_TAPER, s);
+  CLAMPS.push(['Robot_HoseClamp1', pts[3]], ['Robot_HoseClamp2', pts[4]], ['Robot_HoseClamp3', forePts[1]]);
+  clampAt('Robot_HoseClamp1', pts[3], dU, 'J2_Shoulder', mul(nB, -1), HOSE_BACK_OFFSET, upperHalf(0.35), upperBrackets);
+  clampAt('Robot_HoseClamp2', pts[4], dU, 'J2_Shoulder', mul(nB, -1), HOSE_BACK_OFFSET, upperHalf(0.7), upperBrackets);
+  clampAt('Robot_HoseClamp3', forePts[1], dF, 'J3_Elbow', mul(up, -1), HOSE_TOP_OFFSET, foreHalf(0.68), foreBrackets);
+  clampOps.push(
+    meshOp('Robot_ClampBrackets_Upper', upperBrackets),
+    meshOp('Robot_ClampBracket_Fore', foreBrackets),
+    assign('steel', ['Robot_ClampBrackets_Upper', 'Robot_ClampBracket_Fore']),
+    sel(['Robot_ClampBrackets_Upper', 'Robot_Rig'], 'Robot_Rig'),
+    { operator: 'object.parent_set', params: { type: 'BONE', bone: 'J2_Shoulder' } },
+    sel(['Robot_ClampBracket_Fore', 'Robot_Rig'], 'Robot_Rig'),
+    { operator: 'object.parent_set', params: { type: 'BONE', bone: 'J3_Elbow' } },
+  );
   await batch(clampOps, 'hose clamps');
 }
 
 // ---------------------------------------------------------------------------------------------
 // 5. IK rig: target empty (keyframed), wrist aim, IK + Damped Track
+//    WORKAROUND (missing editor feature): the IK chain covers only J2/J3 because pose.ik_add has
+//    no per-bone IK locks or limits (Blender lock_ik_x/y/z, use_ik_limit_*); a chain over J1 would
+//    tilt the vertical base. J1's yaw and J4's roll are therefore keyed per frame from the target
+//    azimuth in section 8, and a Damped Track keeps the wrist vertical.
 // ---------------------------------------------------------------------------------------------
 await batch(
   [
@@ -661,17 +763,22 @@ await op('pose.constraint_add', {
 log(`IK on J3_Elbow, chain ${ik.chain.join(' -> ')}; Damped Track keeps the wrist vertical`);
 
 // ---------------------------------------------------------------------------------------------
-// 6. Conveyor (rollers via ARRAY), pallet (ARRAY boards), crates
+// 6. Conveyor (rollers via ARRAY) with an infeed hood, pallets (ARRAY boards), crates
 // ---------------------------------------------------------------------------------------------
+// The conveyor runs from the pick station out through the gap in the fence to an infeed hood.
+// The next crate waits inside the hood behind a closed roll-up door, out of the camera's sight;
+// while the queue indexes, the door opens, the crate rolls out and the door closes behind it, so
+// the conveyor looks the same at frames 1 and 96.
 {
-  const len = 5.2;
   const y0 = -0.5;
-  const yc = y0 + len / 2;
+  const y1 = INFEED_Y1 - 0.05;
+  const len = y1 - y0;
+  const yc = (y0 + y1) / 2;
   const ops = [];
   let g = newGeo();
   for (const sx of [-1, 1]) addBox(g, [CONVEYOR_X + sx * 0.335, yc, 0.735], [0.05, len, 0.13]);
   addBox(g, [CONVEYOR_X, y0 + 0.08, 0.77], [0.62, 0.04, 0.035]); // low end stop
-  addBox(g, [CONVEYOR_X, len + y0 - 0.25, 0.48], [0.5, 0.35, 0.3]); // drive box
+  addBox(g, [CONVEYOR_X, 4.0, 0.48], [0.5, 0.35, 0.3]); // drive box
   ops.push(meshOp('Conveyor_Frame', g), assign('frame', ['Conveyor_Frame']));
   // one leg + half a cross brace; MIRROR across the centre line, ARRAY along the belt
   g = newGeo();
@@ -689,11 +796,31 @@ log(`IK on J3_Elbow, chain ${ik.chain.join(' -> ')}; Damped Track keeps the wris
   addBox(g, [CONVEYOR_X - 0.42, 0.25, 0.55], [0.04, 0.04, 0.5]);
   addBox(g, [CONVEYOR_X - 0.42, 0.25, 0.83], [0.06, 0.08, 0.07]);
   ops.push(meshOp('Conveyor_Sensor', g), assign('graphite', ['Conveyor_Sensor']));
+  // infeed hood: side walls, roof, back wall and a front wall around a mouth a little wider and
+  // taller than a crate; the roll-up door sits just behind the front wall
+  g = newGeo();
+  const [hx, hz0, hz1, wall] = [0.42, 0.6, 1.66, 0.03];
+  const hy = (INFEED_Y0 + INFEED_Y1) / 2;
+  const depth = INFEED_Y1 - INFEED_Y0;
+  for (const sx of [-1, 1]) addBox(g, [CONVEYOR_X + sx * (hx - wall / 2), hy, (hz0 + hz1) / 2], [wall, depth, hz1 - hz0]);
+  addBox(g, [CONVEYOR_X, hy, hz1 - 0.02], [2 * hx, depth, 0.04]); // roof
+  addBox(g, [CONVEYOR_X, INFEED_Y1 - wall / 2, (hz0 + hz1) / 2], [2 * hx, wall, hz1 - hz0]); // back
+  for (const sx of [-1, 1]) addBox(g, [CONVEYOR_X + sx * (MOUTH_HALF + hx) / 2, INFEED_Y0 + 0.025, (hz0 + hz1) / 2], [hx - MOUTH_HALF, 0.05, hz1 - hz0]);
+  addBox(g, [CONVEYOR_X, INFEED_Y0 + 0.025, (MOUTH_TOP + hz1) / 2], [2 * hx, 0.05, hz1 - MOUTH_TOP]); // header
+  ops.push(meshOp('Infeed_Hood', g), assign('frame', ['Infeed_Hood']));
+  g = newGeo();
+  addBox(g, [CONVEYOR_X, INFEED_Y0 - 0.003, MOUTH_TOP + 0.12], [2 * hx - 0.06, 0.006, 0.14]); // hazard band over the mouth
+  ops.push(meshOp('Infeed_Band', g), assign('stripes', ['Infeed_Band']));
+  g = newGeo();
+  const [dz0, dz1] = [ROLLER_TOP + 0.005, MOUTH_TOP + 0.025];
+  addBox(g, [CONVEYOR_X, DOOR_Y, (dz0 + dz1) / 2], [2 * MOUTH_HALF + 0.02, 0.02, dz1 - dz0]);
+  ops.push(meshOp('Infeed_Door', g), assign('fence', ['Infeed_Door']));
   await batch(ops, 'conveyor');
+  const rollers = Math.floor((y1 - 0.15 - (y0 + 0.14)) / 0.12) + 1;
   await tool('add_modifier', { object: 'Conveyor_Legs', type: 'MIRROR', params: { use_axis: [true, false, false] } });
-  await tool('add_modifier', { object: 'Conveyor_Legs', type: 'ARRAY', params: { count: 4, use_relative_offset: false, use_constant_offset: true, constant_offset_displace: [0, 1.55, 0] } });
-  await tool('add_modifier', { object: 'Conveyor_Rollers', type: 'ARRAY', params: { count: 42, use_relative_offset: false, use_constant_offset: true, constant_offset_displace: [0, 0.12, 0] } });
-  log('conveyor: 42 rollers (ARRAY), mirrored + arrayed legs');
+  await tool('add_modifier', { object: 'Conveyor_Legs', type: 'ARRAY', params: { count: 4, use_relative_offset: false, use_constant_offset: true, constant_offset_displace: [0, (len - 0.4) / 3, 0] } });
+  await tool('add_modifier', { object: 'Conveyor_Rollers', type: 'ARRAY', params: { count: rollers, use_relative_offset: false, use_constant_offset: true, constant_offset_displace: [0, 0.12, 0] } });
+  log(`conveyor: ${rollers} rollers (ARRAY), mirrored + arrayed legs, infeed hood with roll-up door`);
 }
 // Pallets: one deck board, one block and one base board, multiplied with ARRAY modifiers
 // (a second, stacked set adds a Z ARRAY on top: a stack of empty pallets in the back corner)
@@ -777,16 +904,23 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   const fence = { height: 2.0, post_spacing: 1.3, post_width: 0.07, style: 'RAIL', rails: 3, location: [0, 0, 0], materials: false };
   await op('object.generate_fence', { ...fence, name: 'Fence_West', points: [[-2.2, 2.75], [-3.35, 2.75], [-3.35, -2.6]] });
   await op('object.generate_fence', { ...fence, name: 'Fence_East', points: [[-0.9, 2.75], [2.75, 2.75], [2.75, -2.6]] });
-  // welded-mesh infill panels between the posts (thin dark boxes)
+  // Welded-mesh infill panels between the posts (thin dark boxes whose alpha is the wire grid
+  // below). The BRICK mortar lines (the wires) are 8 mm wide and centred on multiples of 5 cm in
+  // object space, so the panel edges are placed where they cannot leave loose wire ends: the top
+  // edge (1.804) lies inside the generated top rail (rail centres 0.6 / 1.2 / 1.8 m, 63 mm tall,
+  // 28 mm thick), the bottom edge (0.196) closes on a full horizontal wire, and the side edges end
+  // 25 mm from the post centres, inside the 70 mm posts.
   const g = newGeo();
+  const PANEL_Z = [0.196, 1.804];
   const panel = (a, b) => {
     const L = dist(a, b);
     const n = Math.max(1, Math.ceil(L / 1.3 - 1e-6));
     for (let i = 0; i < n; i++) {
       const p = add(a, mul(sub(b, a), (i + 0.5) / n));
-      const s = L / n - 0.1;
+      const s = L / n - 0.05;
       const alongX = Math.abs(b[0] - a[0]) > Math.abs(b[1] - a[1]);
-      addBox(g, [p[0], p[1], 1.05], alongX ? [s, 0.012, 1.75] : [0.012, s, 1.75]);
+      const [z0, z1] = PANEL_Z;
+      addBox(g, [p[0], p[1], (z0 + z1) / 2], alongX ? [s, 0.012, z1 - z0] : [0.012, s, z1 - z0]);
     }
   };
   panel([-2.2, 2.75], [-3.35, 2.75]);
@@ -951,6 +1085,7 @@ await batch(
     keyMany('IK_Target', 'location', 0, frames, tgt.map((p) => p[0])),
     keyMany('IK_Target', 'location', 1, frames, tgt.map((p) => p[1])),
     keyMany('IK_Target', 'location', 2, frames, tgt.map((p) => p[2])),
+    // J1 yaw keyed from the target azimuth (IK cannot drive it without IK locks, see section 5)
     keyMany('Robot_Rig', 'pose.bones["J1_Base"].rotation_euler', 1, frames, yaw),
     // J4 rolls against the base yaw so the gripper (and the crate) keep their heading
     keyMany('Robot_Rig', 'pose.bones["J4_Wrist"].rotation_euler', 1, frames, yaw.map((a) => a - Math.PI)),
@@ -962,18 +1097,20 @@ for (const [f, v] of [[1, 0], [F_GRIP_START, 0], [F_GRIPPED, 1], [F_RELEASE, 1],
   await tool('insert_keyframe', { object: 'Robot_Gripper', property: 'shape_keys["Grip"].value', frame: f, value: v, interpolation: 'BEZIER' });
 // The active crate waits at the pick station (its own location is keyed at frame 1 so the
 // place keys added in step 9 do not leak backwards). While the robot carries it away the
-// conveyor indexes: every queued crate moves one pitch towards the pick station.
+// conveyor indexes: every queued crate moves one pitch towards the pick station, and the infeed
+// door lifts to let the hidden crate out (smooth BEZIER keys on the door's Z location).
 {
   const fr = frames.filter((f) => f >= F_INDEX_START && f <= F_INDEX_END);
   await batch(
     [
       ...[0, 1, 2].map((i) => keyMany('Crate', 'location', i, [1], [PICK[i]], 'CONSTANT')),
       ...QUEUED.map((name, i) => keyMany(name, 'location', 1, fr, fr.map((f) => PICK[1] + (i + 1) * QUEUE_PITCH - beltAt(f)))),
+      keyMany('Infeed_Door', 'location', 2, DOOR_KEYS.map(([f]) => f), DOOR_KEYS.map(([, z]) => z), 'BEZIER'),
     ],
     'crate + conveyor keys',
   );
 }
-log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape key, ${QUEUED.length} queued crates`);
+log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape key, ${QUEUED.length} queued crates, infeed door`);
 
 // ---------------------------------------------------------------------------------------------
 // 9. The crate follows the gripper while carried: Child Of (J4_Wrist bone) with keyed influence
@@ -1096,41 +1233,106 @@ const verify = {};
   check(Math.max(...focus) - Math.min(...focus) > 0.3, `camera focus distance does not follow the gripper: ${focus.join(', ')}`);
   log(`worst IK error ${mm(worstIk)}, worst crate error ${mm(worstCarry)}, focus ${Math.min(...focus).toFixed(2)}..${Math.max(...focus).toFixed(2)} m`);
 
-  // (e) the skinned hose bends with the arm: the vertices at its wrist end stay at a constant
-  // distance from the wrist joint and those at its turret end on the J1 axis, at every frame
+  // (e) the skinned hose follows the arm: its root stays on the turret fitting (the rest root
+  // turned by the J1 yaw: catches sliding up, down or around as well as away from the axis), the
+  // stretches in the three clamps stay centred in their rings, and the wrist end keeps its
+  // distance to the wrist joint
   const base = await tool('get_mesh_data', { object: 'Robot_Hose', include: ['vertices'], source: 'BASE', space: 'WORLD', limit: 5000 });
-  const endIdx = base.vertices.map((v, i) => [v, i]).filter(([v]) => dist(v, HOSE_END) < 0.05).map(([, i]) => i);
-  const startIdx = base.vertices.map((v, i) => [v, i]).filter(([v]) => dist(v, HOSE_START) < 0.05).map(([, i]) => i);
+  const near = (p, r) => base.vertices.map((v, i) => [v, i]).filter(([v]) => dist(v, p) < r).map(([, i]) => i);
   const centroid = (verts, idx) => mul(idx.reduce((acc, i) => add(acc, verts[i]), [0, 0, 0]), 1 / idx.length);
+  const endIdx = near(HOSE_END, 0.05);
+  const startIdx = near(HOSE_START, 0.05);
+  const clampIdx = CLAMPS.map(([, p]) => near(p, 0.035));
+  check(endIdx.length > 3 && startIdx.length > 3 && clampIdx.every((x) => x.length > 3), 'hose end / clamp rings not found');
+  const root0 = centroid(base.vertices, startIdx);
   const endGap = [];
-  const startRadius = [];
-  for (const f of [1, 28, 47, 56, 72, 96]) {
+  let rootErr = 0;
+  let clampErr = 0;
+  for (const f of [1, 16, 28, 45, 56, 72, 77, 96]) {
     const ev = await tool('get_mesh_data', { object: 'Robot_Hose', include: ['vertices'], source: 'EVALUATED', space: 'WORLD', frame: f, limit: 5000 });
     const d = await op('armature.describe', { object: 'Robot_Rig', frame: f });
-    const wrist = d.bones.find((b) => b.name === 'J4_Wrist').posed_head_world;
-    endGap.push(dist(centroid(ev.vertices, endIdx), wrist));
-    const s0 = centroid(ev.vertices, startIdx);
-    startRadius.push(Math.hypot(s0[0], s0[1]));
+    const bone = (n) => d.bones.find((b) => b.name === n);
+    const shoulder = bone('J2_Shoulder').posed_head_world;
+    const yawF = Math.atan2(shoulder[1], shoulder[0]);
+    const fitting = [root0[0] * Math.cos(yawF) - root0[1] * Math.sin(yawF), root0[0] * Math.sin(yawF) + root0[1] * Math.cos(yawF), root0[2]];
+    rootErr = Math.max(rootErr, dist(centroid(ev.vertices, startIdx), fitting));
+    for (const [k, [name]] of CLAMPS.entries()) {
+      const ring = (await tool('get_object', { object: name, frame: f })).world_location;
+      clampErr = Math.max(clampErr, dist(centroid(ev.vertices, clampIdx[k]), ring));
+    }
+    endGap.push(dist(centroid(ev.vertices, endIdx), bone('J4_Wrist').posed_head_world));
   }
   const spread = (a) => Math.max(...a) - Math.min(...a);
-  log(`hose (${base.vertices.length} vertices): wrist end - wrist joint ${endGap.map((x) => x.toFixed(3)).join(' / ')} m; turret end radius ${startRadius.map((x) => x.toFixed(3)).join(' / ')} m`);
-  check(endIdx.length > 3 && startIdx.length > 3, `hose end rings not found (${endIdx.length}, ${startIdx.length})`);
-  check(spread(endGap) < 0.03, `hose end drifts from the wrist by ${mm(spread(endGap))}`);
-  check(spread(startRadius) < 0.01, `hose start drifts off the turret by ${mm(spread(startRadius))}`);
+  log(`hose (${base.vertices.length} vertices): root off its fitting <= ${mm(rootErr)}, hose off clamp centres <= ${mm(clampErr)}, wrist end - wrist joint ${endGap.map((x) => x.toFixed(4)).join(' / ')} m`);
+  check(rootErr < 0.002, `hose root slides off its turret fitting by ${mm(rootErr)}`);
+  check(clampErr < 0.002, `hose slides in its clamps by ${mm(clampErr)}`);
+  check(spread(endGap) < 0.003, `hose end drifts from the wrist by ${mm(spread(endGap))}`);
 
-  // (f) clearance between the finger pads and the carried crate, (g) the conveyor queue indexes
-  // one pitch, so frame 96 matches frame 1 on the belt
+  // (f) no part of the arm passes through another one: the hose against the links, housings,
+  // motors and gears, and the elbow motor and forearm against the upper arm (scene.measure finds
+  // the closest distance between the actual surfaces, intersecting = true where they cross), at
+  // frames that cover the whole range of the elbow (78-127 degrees) and the shoulder
+  const ARM = ['Robot_Hose', 'Robot_UpperArm', 'Robot_Forearm', 'Robot_ElbowMotor', 'Robot_ElbowHousing', 'Robot_ElbowGear', 'Robot_ShoulderHousing', 'Robot_Turret'];
+  const mustClear = (a, b) => a === 'Robot_Hose' || b === 'Robot_Hose' || [a, b].sort().join() === 'Robot_ElbowMotor,Robot_UpperArm' || [a, b].sort().join() === 'Robot_Forearm,Robot_UpperArm';
+  const gaps = {};
+  for (const f of [1, 13, 17, 29, 41, 45, 49, 57, 65, 73, 77, 89]) {
+    const m = await op('scene.measure', { objects: ARM, frame: f });
+    for (const p of m.distances)
+      if (mustClear(p.a_name, p.b_name)) {
+        const key = `${p.a_name.replace('Robot_', '')}/${p.b_name.replace('Robot_', '')}`;
+        gaps[key] = Math.min(gaps[key] ?? Infinity, p.intersecting ? -1 : p.surface_distance);
+        check(!p.intersecting && p.surface_distance > 0.003, `${key} at frame ${f}: ${p.intersecting ? 'intersecting' : mm(p.surface_distance)}`);
+      }
+  }
+  const tight = Object.entries(gaps).sort((a, b) => a[1] - b[1]).slice(0, 5);
+  log(`arm clearances (12 frames): ${tight.map(([k, g]) => `${k} ${mm(g)}`).join(', ')}, ... all >= 3 mm`);
+
+  // (g) clearance between the finger pads and the carried crate
   const m = await op('scene.measure', { objects: ['Robot_Gripper', 'Crate'], frame: 50 });
   const pair = m.distances?.[0] ?? {};
   log(`scene.measure @50 gripper <-> crate: surface distance ${pair.surface_distance} m, intersecting ${pair.intersecting}`);
   check(pair.intersecting === false && pair.surface_distance < 0.01, `gripper/crate clearance ${JSON.stringify(pair)}`);
+
+  // (h) the conveyor loops: every queued crate moves exactly one pitch (the first one onto the
+  // pick station), the crate that replaces the last one waits invisible inside the infeed hood at
+  // frame 1 (scene.raycast from the camera to its corners hits something else first), the door
+  // is closed at frames 1 and 96, open while the crate passes and never touches it
   for (const [i, name] of QUEUED.entries()) {
     const y1 = (await tool('get_object', { object: name, frame: 1 })).world_location[1];
     const y96 = (await tool('get_object', { object: name, frame: FRAME_END })).world_location[1];
     check(Math.abs(y1 - y96 - QUEUE_PITCH) < 1e-3, `${name} moved ${y1 - y96} m instead of one pitch`);
     if (i === 0) check(Math.abs(y96 - PICK[1]) < 1e-3, `${name} does not reach the pick station (${y96})`);
   }
-  Object.assign(verify, { worst_ik_mm: +(worstIk * 1000).toFixed(2), worst_crate_mm: +(worstCarry * 1000).toFixed(2), pad_gap_m: pair.surface_distance });
+  const hidden = QUEUED[QUEUED.length - 1];
+  const eye = (await tool('get_object', { object: 'Camera', frame: 1 })).world_location;
+  const c5 = (await tool('get_object', { object: hidden, frame: 1 })).world_location;
+  const probes = [c5];
+  for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) probes.push(add(c5, [sx * (CRATE[0] / 2 - 0.01), sy * (CRATE[1] / 2 - 0.01), sz * (CRATE[2] / 2 - 0.01)]));
+  const seen = [];
+  for (const q of probes) {
+    const hit = await op('scene.raycast', { origin: eye, direction: sub(q, eye), frame: 1 });
+    if (!hit.hit || hit.name === hidden) seen.push(fmt(q));
+  }
+  check(!seen.length, `${hidden} is visible from the camera at frame 1 at ${seen.join(' ')}`);
+  const doorZ = async (f) => (await tool('get_object', { object: 'Infeed_Door', frame: f })).world_location[2];
+  const [door1, door96] = [await doorZ(1), await doorZ(FRAME_END)];
+  check(Math.abs(door1) < 1e-4 && Math.abs(door96) < 1e-4, `infeed door not closed at frames 1/96 (${door1}, ${door96})`);
+  let doorGap = Infinity;
+  for (let f = F_INDEX_START; f <= DOOR_KEYS[DOOR_KEYS.length - 1][0]; f += 2) {
+    const dm = await op('scene.measure', { objects: ['Infeed_Door', hidden], frame: f });
+    const dp = dm.distances[0];
+    doorGap = Math.min(doorGap, dp.intersecting ? -1 : dp.surface_distance);
+    check(!dp.intersecting, `infeed door intersects ${hidden} at frame ${f}`);
+  }
+  log(`conveyor loop: ${QUEUED.length} queued crates moved one pitch; ${hidden} hidden at frame 1 (${probes.length} camera rays blocked); door closed at 1/96, door <-> crate >= ${mm(doorGap)}`);
+  Object.assign(verify, {
+    worst_ik_mm: +(worstIk * 1000).toFixed(2),
+    worst_crate_mm: +(worstCarry * 1000).toFixed(2),
+    pad_gap_m: pair.surface_distance,
+    hose_root_mm: +(rootErr * 1000).toFixed(2),
+    hose_clamp_mm: +(clampErr * 1000).toFixed(2),
+    min_arm_clearance_mm: +(Math.min(...Object.values(gaps)) * 1000).toFixed(1),
+  });
   if (failures.length) throw new Error(`verification failed:\n  ${failures.join('\n  ')}`);
   log('verification passed');
 }

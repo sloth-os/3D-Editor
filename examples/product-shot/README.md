@@ -145,11 +145,11 @@ MCP_URL=http://127.0.0.1:4505/mcp node examples/product-shot/build.mjs --export-
 
 | Mode flag | Runs | Time (3 render threads) |
 | --- | --- | --- |
-| `--final` (default) | Build and verify, then `render.png`, `contact_sheet.png` and `preview.gif` | about 11 min |
+| `--final` (default) | Build and verify, then `render.png`, `contact_sheet.png` and `preview.gif` | about 12 min |
 | `--build-only` | Build and verify the project only, no renders | about 1 s |
 | `--preview` | Build plus a RASTER and a 640×360 path-traced preview (64 samples, at most 60 s) in `--out-dir` (default `/tmp/product-shot-previews`) | about 1 min |
 | `--still` | Build plus `render.png` only | about 7.5 min |
-| `--anim` | Build plus `contact_sheet.png` and `preview.gif` only | about 3 min |
+| `--anim` | Build plus `contact_sheet.png` and `preview.gif` only | about 4 min |
 | `--export-only` | Build plus `scene.glb` only, no renders | about 2 s |
 
 Options:
@@ -179,11 +179,11 @@ Measured on 2026-11-06 on 4 CPU cores shared with other jobs, with 3 render thre
 
 | Stage | Time | Result |
 | --- | --- | --- |
-| Build and verify (`fresh project` … `verify scene`) | 1.2 s | 23 objects, 19,060 evaluated triangles, 8 materials; every check passed |
-| `render.png` | 452 s | 1280×720 path traced: 183 of the 256 requested samples per pixel (the 450 s time limit stopped it), denoised; 749 KiB |
-| `contact_sheet.png` | 40 s | 12 frames (1, 4, … 34) as 320×180 tiles, 32 samples, denoised; 862 KiB |
-| `preview.gif` | 152 s | all 36 frames, 480×270, 16 samples, denoised, 12 fps; 1.6 MB |
-| Whole script | 646 s (10 min 46 s) | exit code 0 |
+| Build and verify (`fresh project` … `verify scene`) | 1.0 s | 24 objects, 19,060 evaluated triangles, 8 materials; every check passed |
+| `render.png` | 453 s | 1280×720 path traced: 207 of the 256 requested samples per pixel (the 450 s time limit stopped it, above the minimum of 128), denoised; 733 KiB |
+| `contact_sheet.png` | 71 s | 12 frames (1, 4, … 34) as 320×180 tiles, 32 samples, denoised; 862 KiB |
+| `preview.gif` | 176 s | all 36 frames, 480×270, 16 samples, denoised, 12 fps, loops forever; 1.6 MB |
+| Whole script | 701 s (11 min 41 s) | exit code 0 |
 
 ## Known limitations and workarounds
 
@@ -206,9 +206,11 @@ Measured on 2026-11-06 on 4 CPU cores shared with other jobs, with 3 render thre
 * **RASTER previews** have no shadows and no refraction: the glass is drawn as smooth tinted
   transparency. Judge the glass, the liquid and the depth of field only in path-traced renders
   (`--preview` makes one).
-* **Inspection counts.** `get_scene` / `get_object` evaluated counts use the modifiers' viewport
-  settings. The script sets SCREW `render_steps` equal to `steps`, so what the tools report is what
-  renders.
+* **Inspection counts and precision.** `get_scene` / `get_object` evaluated counts use the
+  modifiers' viewport settings. The script sets SCREW `render_steps` equal to `steps`, so what the
+  tools report is what renders. `get_object` also rounds lengths to 0.1 mm (the frame's 0.11 mm
+  bevel reads 0.1 mm), which is coarse at label scale: the 0.2 mm lift is a multiple of it, the
+  name margin is checked against 2.5 mm, and `scene.measure` gives exact bounds when needed.
 * **Animation quality.** The contact sheet (32 samples per pixel) and the GIF frames (16 samples)
   are denoised at low sample counts, so the glass shows slight blotches and fine detail is
   smoothed; the GIF's 256-colour palette with Bayer dithering leaves a fine dot pattern in the

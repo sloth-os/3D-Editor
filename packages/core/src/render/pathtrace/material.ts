@@ -71,6 +71,11 @@ export interface PTMaterial {
   procedural: ProceduralSurface | null;
   /** May be (partly) transparent: CLIP/BLEND with alpha < 1 or alpha-carrying textures. */
   transparent: boolean;
+  /**
+   * Lets light through its transmission lobe (transmission > 0, not fully metallic): shadow rays
+   * pass it, attenuated (see `thinTransmittance` in bsdf.ts).
+   */
+  transmissive: boolean;
   /** Emits light. */
   emissive: boolean;
 }
@@ -148,10 +153,12 @@ export function compileMaterial(m: MaterialData | null, imageIndex: (id: string)
     texAlpha: slot(t.alpha, p?.alpha ?? null),
     procedural,
     transparent: false,
+    transmissive: false,
     emissive: false,
   };
   out.transparent =
     blend !== BLEND_OPAQUE && (alpha < 1 || !!out.texBase || !!out.texAlpha || !!p?.base_color || !!p?.alpha);
+  out.transmissive = out.transmission > 0 && (out.metallic < 1 || !!out.texMetallic || !!p?.metallic);
   out.emissive = p?.emission ? es > 0 : out.emitR + out.emitG + out.emitB > 0;
   return out;
 }

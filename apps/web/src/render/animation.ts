@@ -60,7 +60,7 @@ export interface AnimationResult {
   fps: number;
   /** The frames in the file. */
   frames: number[];
-  /** True when the render was cancelled before its last frame. */
+  /** True when the render was cancelled before its last frame (the file has fewer frames). */
   cancelled: boolean;
   elapsedMs: number;
 }
@@ -70,17 +70,31 @@ export const MAX_GIF_PIXELS = 1 << 26;
 /** Most frames of one animation render. */
 export const MAX_ANIMATION_FRAMES = 10_000;
 
-/** Frame numbers `start`, `start + step`, … up to `end` (inclusive). */
-export function animationFrames(start: number, end: number, step = 1): number[] {
-  const s = Math.max(1, Math.floor(step));
+/** How many frames `start`, `start + step`, … up to `end` (inclusive) are (0 for an empty range). */
+export function animationFrameCount(start: number, end: number, step = 1): number {
+  const s = Number.isFinite(step) ? Math.max(1, Math.floor(step)) : 1;
   const a = Math.round(start);
   const b = Math.round(end);
-  const out: number[] = [];
-  for (let f = a; f <= b && out.length < MAX_ANIMATION_FRAMES; f += s) out.push(f);
-  return out;
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return 0;
+  return Math.floor((b - a) / s) + 1;
 }
 
-/** Why an animation cannot be rendered with these settings, or null. */
+/**
+ * Frame numbers `start`, `start + step`, … up to `end` (inclusive), at most
+ * {@link MAX_ANIMATION_FRAMES} of them: check {@link animationFrameCount} with
+ * {@link animationProblem} first, a longer range is not renderable.
+ */
+export function animationFrames(start: number, end: number, step = 1): number[] {
+  const s = Number.isFinite(step) ? Math.max(1, Math.floor(step)) : 1;
+  const a = Math.round(start);
+  const n = Math.min(MAX_ANIMATION_FRAMES, animationFrameCount(start, end, step));
+  return Array.from({ length: n }, (_, i) => a + i * s);
+}
+
+/**
+ * Why an animation cannot be rendered with these settings, or null. `frames` is the number of
+ * frames of the range (see {@link animationFrameCount}).
+ */
 export function animationProblem(
   format: EncodeFormat,
   width: number,
@@ -88,7 +102,11 @@ export function animationProblem(
   frames: number,
 ): string | null {
   if (frames < 1) return 'The frame range is empty (End must not be before Start)';
-  if (frames > MAX_ANIMATION_FRAMES) return `At most ${MAX_ANIMATION_FRAMES} frames can be rendered at once`;
+  if (frames > MAX_ANIMATION_FRAMES)
+    return (
+      `The range has ${frames} frames: at most ${MAX_ANIMATION_FRAMES} can be rendered at once ` +
+      '(render it in parts, or raise Step)'
+    );
   if (format === 'GIF' && width * height * frames > MAX_GIF_PIXELS)
     return (
       `A GIF keeps every frame until it is encoded: ${frames} frames of ${width}×${height} are too many ` +
@@ -141,14 +159,25 @@ export class AnimationJob {
     return this.status.phase === 'rendering' || this.status.phase === 'encoding';
   }
 
+  /**
+   * Whether {@link cancel} can still drop frames: while frames render. Once every frame is rendered
+   * the job only finishes the file, which then holds the whole animation.
+   */
+  get cancellable(): boolean {
+    return this.status.phase === 'rendering' && !this.cancelled;
+  }
+
   /** Milliseconds since the render started: live while it runs, the final time afterwards. */
   get elapsedMs(): number {
     return this.running ? now() - this.t0 : this.status.elapsedMs;
   }
 
-  /** Stops after the frames finished so far (the frame being rendered is dropped). */
+  /**
+   * Stops after the frames finished so far (the frame being rendered is dropped). Does nothing once
+   * every frame is rendered (encoding): the file is finished with all of them.
+   */
   cancel(): void {
-    if (!this.running || this.cancelled) return;
+    if (!this.cancellable) return;
     this.cancelled = true;
     this.current?.cancel();
   }
@@ -235,6 +264,8 @@ export class AnimationJob {
       this.emit({ phase: 'encoding' });
       const file = await encoder.call<EncodedFile>({ type: 'encode-end', session });
       closed = true;
+      // cancelled only when frames were dropped (a cancel after the last frame dropped none)
+      const cancelled = rendered.length < o.frames.length;
       const result: AnimationResult = {
         data: file.data,
         mime: o.format === 'GIF' ? 'image/gif' : 'image/apng',
@@ -243,10 +274,10 @@ export class AnimationJob {
         height: o.height,
         fps: o.fps,
         frames: rendered,
-        cancelled: this.cancelled,
+        cancelled,
         elapsedMs: now() - this.t0,
       };
-      this.emit({ phase: this.cancelled ? 'cancelled' : 'done' });
+      this.emit({ phase: cancelled ? 'cancelled' : 'done' });
       return result;
     } finally {
       if (!closed) encoder.notify({ type: 'encode-abort', session });

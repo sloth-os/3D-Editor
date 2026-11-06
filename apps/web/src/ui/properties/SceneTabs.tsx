@@ -163,6 +163,34 @@ export function RenderTab({ s }: { s: ProjectSession }) {
   );
 }
 
+/** Blender's frame rate presets (23.98, 29.97 and 59.94 are the NTSC rates 24, 30 and 60 / 1.001). */
+const FRAME_RATES = [12, 24000 / 1001, 24, 25, 30000 / 1001, 30, 48, 50, 60000 / 1001, 60, 120, 240];
+
+/** The preset matching a frame rate (to within 0.005 fps), else null. */
+function frameRatePreset(fps: number): number | null {
+  return FRAME_RATES.find((x) => Math.abs(x - fps) < 0.005) ?? null;
+}
+
+/** `fps` for display: at most two decimals (23.98, 29.97, 15). */
+const fpsLabel = (fps: number) => `${Math.round(fps * 100) / 100} fps`;
+
+/** The Frame Rate option of `fps`: its preset, else the rate itself (shown as Custom). */
+export function frameRateOption(fps: number): string {
+  return String(frameRatePreset(fps) ?? fps);
+}
+
+/**
+ * The Frame Rate options: Blender's presets, plus "Custom (15 fps)" for a rate set elsewhere (an
+ * agent, the console) that is none of them, so the box always shows the rate that playback and
+ * Render Animation use.
+ */
+export function frameRateOptions(fps: number): { value: string; label: string }[] {
+  const options = FRAME_RATES.map((x) => ({ value: String(x), label: fpsLabel(x) }));
+  if (frameRatePreset(fps) === null && Number.isFinite(fps))
+    options.push({ value: String(fps), label: `Custom (${fpsLabel(fps)})` });
+  return options;
+}
+
 export function OutputTab({ s }: { s: ProjectSession }) {
   const r = s.doc.getRender();
   const sc = s.doc.getScene();
@@ -203,10 +231,11 @@ export function OutputTab({ s }: { s: ProjectSession }) {
             onChange={(v, f) => setProp(s, 'render', null, 'resolution_percentage', v, f)}
           />
         </Row>
-        <Row label="Frame Rate">
+        <Row label="Frame Rate" title="Frames per second of playback and of rendered animations">
           <SelectField
-            value={String(sc.fps)}
-            options={[12, 24, 25, 30, 48, 50, 60, 120].map((x) => ({ value: String(x), label: `${x} fps` }))}
+            value={frameRateOption(sc.fps)}
+            testId="output-fps"
+            options={frameRateOptions(sc.fps)}
             onChange={(v) => setProp(s, 'scene', null, 'fps', Number(v))}
           />
         </Row>
@@ -385,9 +414,13 @@ function RigidBodyWorldPanels({ s }: { s: ProjectSession }) {
   const cancelBake = useRef<(() => void) | null>(null);
   // a bake in progress stops with the panel (the frames simulated so far stay cached)
   useEffect(() => () => cancelBake.current?.(), []);
+  // Reading a signal makes @preact/signals skip this panel when its parent redraws with the same
+  // props, so it subscribes to every change it shows: document changes (its own edits, agents,
+  // collaborators, undo) and the frame (the cache grows while the animation plays).
+  void s.revision.value;
+  void s.state.$frame.value;
   const sc = s.doc.getScene();
   const world = sanitizeRigidBodyWorld(sc.rigidbody_world);
-  void s.state.$frame.value; // the cache grows while the animation plays
   const values: Record<string, unknown> = { ...world, use_gravity: sc.use_gravity, gravity: sc.gravity };
   /** Sets one setting on the current scene (the other world settings stay as they are now). */
   const write = (k: string, v: unknown) => {

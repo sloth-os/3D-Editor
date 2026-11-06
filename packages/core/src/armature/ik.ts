@@ -1,5 +1,5 @@
 import type { Mat4, Quat, Vec3 } from '../math/types';
-import { fromQuat4, invert4, multiply4 } from '../math/mat4';
+import { invert4, multiply4 } from '../math/mat4';
 import { multiplyQuat, quatFromAxisAngle } from '../math/quat';
 import {
   blendMatrices,
@@ -739,7 +739,11 @@ function solveConstrained(job: Job, chains: IkChain[]): number {
       if (!(angle > 0)) continue;
       // rotation about the bone's own (current) local axes: R ← R · Rot(v)
       const cur = quatFromRotationMatrix(rotationPart(job.bones[b].matrix));
-      setRotation(job, b, multiplyQuat(cur, quatFromAxisAngle([v[0] / angle, v[1] / angle, v[2] / angle], angle)));
+      setRotation(
+        job,
+        b,
+        multiplyQuat(cur, quatFromAxisAngle([v[0] / angle, v[1] / angle, v[2] / angle], angle)),
+      );
     }
     for (const b of order) enforceLimits(job, b);
     e = errorVec();
@@ -777,7 +781,10 @@ export function solveIk(bones: IkBone[], chains: IkChain[]): IkResult {
       warnings.push('pole targets are ignored for IK chains that share bones');
     const pole = single && !rootSet ? single : null;
     if (pole) alignPole(job, pole);
-    solveConstrained(job, valid.map((c) => ({ ...c, pole: null })));
+    solveConstrained(
+      job,
+      valid.map((c) => ({ ...c, pole: null })),
+    );
     if (pole) alignPole(job, pole);
     for (const chain of valid) if (chain.useStretch) stretch(job, chain);
     blendInfluence(bones, initial, valid);

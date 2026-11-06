@@ -276,7 +276,7 @@ describe('collision shapes from meshes (Blender sizing rules)', () => {
     expect(b.shape.box!.half).toEqual([1, 1, t]);
     // the slab lies behind the plane (which faces +Z): its top is the plane itself
     expect(b.com).toEqual([0, 0, -t]);
-    expect(b.notes.join(" ")).toMatch(/slab behind its faces/);
+    expect(b.notes.join(' ')).toMatch(/slab behind its faces/);
     expect(b.thickened).toEqual({ mesh: 0, collision: 2 * t });
     // a flat hull becomes a thin solid slab (a cuboid for a square plane)
     const h = buildCollisionShape('CONVEX_HULL', createPlane({ size: 2 }), [1, 1, 1], { dynamic: true });

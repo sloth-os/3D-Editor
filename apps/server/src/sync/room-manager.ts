@@ -46,6 +46,7 @@ export class RoomManager {
   private sweeping = false;
   private refreshing = false;
   private closed = false;
+  private readonly closedListeners = new Set<(room: Room) => void>();
 
   constructor(private readonly opts: RoomManagerOptions) {
     const interval = opts.sweepIntervalMs ?? Math.max(250, Math.min(60_000, Math.floor(opts.ttlMs / 2)));
@@ -71,6 +72,26 @@ export class RoomManager {
 
   get persistence(): Persistence {
     return this.opts.persistence;
+  }
+
+  /**
+   * Calls `listener` after a loaded room was closed because its project was deleted or because it
+   * was evicted while idle, so that whoever kept state for it (MCP undo histories) lets go of its
+   * document. Returns the unsubscribe function.
+   */
+  onRoomClosed(listener: (room: Room) => void): () => void {
+    this.closedListeners.add(listener);
+    return () => this.closedListeners.delete(listener);
+  }
+
+  private emitClosed(room: Room): void {
+    for (const listener of [...this.closedListeners]) {
+      try {
+        listener(room);
+      } catch (err) {
+        this.opts.log.warn({ err: errorMessage(err), project: room.id }, 'room close listener failed');
+      }
+    }
   }
 
   private get store() {
@@ -247,6 +268,7 @@ export class RoomManager {
       this.rooms.delete(id);
       this.updateGauge();
       await room.close({ flush: false, code: 4404, reason: 'project deleted' });
+      this.emitClosed(room);
     }
     const store = this.store;
     if (store && existed) {
@@ -281,6 +303,7 @@ export class RoomManager {
         this.rooms.delete(room.id);
         this.updateGauge();
         await room.close({ flush: false });
+        this.emitClosed(room);
         this.opts.log.debug({ project: room.id }, 'evicted idle room');
       }
       for (const [id, t] of this.tombstones) if (now - t > TOMBSTONE_TTL_MS) this.tombstones.delete(id);

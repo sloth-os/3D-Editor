@@ -961,7 +961,10 @@ export class ViewportEngine {
    * next frame. Clay shading (SOLID) has the world colour behind it, like the server's renderer,
    * instead of the viewport's grey.
    */
-  private syncFinalRender(frame: number, shading: NonNullable<RenderImageOptions['shading']>): EvaluatedScene {
+  private syncFinalRender(
+    frame: number,
+    shading: NonNullable<RenderImageOptions['shading']>,
+  ): EvaluatedScene {
     const s = this.session;
     const ev = finalRenderScene(this.finalEvaluator().evaluate(frame, { forRender: true }));
     const render = ev.render;

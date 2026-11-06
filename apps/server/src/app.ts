@@ -188,6 +188,7 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
       log,
       idleTimeoutMs: opts.mcpIdleTimeoutMs,
       presenceIdleMs: opts.mcpPresenceIdleMs,
+      history: { maxSteps: config.mcpUndoSteps, maxBytes: config.mcpUndoMemoryBytes },
     });
     mcp.register(app);
   }

@@ -451,7 +451,8 @@ export function registerConstraintOperators(reg: OperatorRegistry): void {
               mute: c.mute,
               params: c.params,
               ...(paramsChanged ? { stored_params: stored.params } : {}),
-              error: errors.find((e) => e.constraintId === c.id || e.constraintId === `#${i}`)?.message ?? null,
+              error:
+                errors.find((e) => e.constraintId === c.id || e.constraintId === `#${i}`)?.message ?? null,
             };
           }),
         };

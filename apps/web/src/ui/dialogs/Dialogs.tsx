@@ -2,11 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import type { ComponentChildren } from 'preact';
 import { WebDAVClient, type ExportFormat } from '@3d-editor/core';
 import {
+  animationFrameCount,
   animationFrames,
   animationProblem,
   pixelsToCanvas,
   pixelsToDataUrl,
+  renderOutputSize,
   renderPool,
+  scaledOutputNote,
   startAnimationRender,
   type AnimationJob,
   type AnimationResult,
@@ -589,9 +592,21 @@ function frameRenderInfo(job: PathTraceJob): string {
   return `Sample ${st.samples}/${st.total || '…'}`;
 }
 
-type StillRender =
+type StillRender = (
   | { kind: 'raster'; img: { dataUrl: string; width: number; height: number; ms: number } }
-  | { kind: 'path'; job: PathTraceJob; frame: number };
+  | { kind: 'path'; job: PathTraceJob; frame: number }
+) & {
+  /** Says that the output was scaled down to the browser's size limit (null when it was not). */
+  sizeNote: string | null;
+};
+
+/** The note of the render windows when the output settings ask for more than the browser renders. */
+function outputSizeNote(): string | null {
+  const r = session.value?.doc.getRender();
+  return r
+    ? scaledOutputNote(renderOutputSize(r.resolution_x, r.resolution_y, r.resolution_percentage))
+    : null;
+}
 
 /** F12: renders the scene camera at the output resolution (WebGL, or path traced on the workers). */
 function RenderImageDialog() {
@@ -613,11 +628,12 @@ function RenderImageDialog() {
     let job: PathTraceJob | null = null;
     // let the dialog paint first
     const h = setTimeout(() => {
+      const sizeNote = outputSizeNote();
       try {
         if (e.pathTraces()) {
           job = e.startPathTrace();
           const frame = session.value?.state.frame ?? 1;
-          setRender({ kind: 'path', job, frame });
+          setRender({ kind: 'path', job, frame, sizeNote });
           telemetry.count('editor.render.pathtrace');
           job.result.then(
             (r) => {
@@ -628,7 +644,7 @@ function RenderImageDialog() {
           );
         } else
           e.renderImage()
-            .then((r) => setRender({ kind: 'raster', img: { ...r, ms: performance.now() - t0 } }))
+            .then((r) => setRender({ kind: 'raster', img: { ...r, ms: performance.now() - t0 }, sizeNote }))
             .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -726,6 +742,15 @@ function RenderImageDialog() {
             ))}
           </div>
         )}
+        {render?.sizeNote && (
+          <div
+            class="hint"
+            style={{ color: 'var(--warn)', textAlign: 'center' }}
+            data-testid="render-size-note"
+          >
+            {render.sizeNote}
+          </div>
+        )}
       </div>
     </Modal>
   );
@@ -773,13 +798,17 @@ function RenderAnimationDialog() {
   }, [job]);
   useEscape(onEscape);
   if (!s || !sc || !rs) return null;
-  const width = Math.max(16, Math.min(4096, Math.round((rs.resolution_x * percent) / 100)));
-  const height = Math.max(16, Math.min(4096, Math.round((rs.resolution_y * percent) / 100)));
-  const frames = animationFrames(start, end, step);
+  // the output size, scaled down uniformly (same framing) when larger than the browser renders
+  const size = renderOutputSize(rs.resolution_x, rs.resolution_y, percent);
+  const { width, height } = size;
+  const sizeNote = scaledOutputNote(size);
+  const frameCount = animationFrameCount(start, end, step);
   const fps = sc.fps / Math.max(1, step);
-  const problem = animationProblem(format, width, height, frames.length);
+  const problem = animationProblem(format, width, height, frameCount);
   const running = !!job?.running;
   const begin = () => {
+    if (problem) return setError(problem);
+    const frames = animationFrames(start, end, step);
     const e = viewport.engine;
     if (!e) return setError('No viewport available');
     setError(null);
@@ -826,7 +855,12 @@ function RenderAnimationDialog() {
             <button
               class="btn"
               data-testid="render-animation-cancel"
-              title="Stop and keep the frames rendered so far (Esc)"
+              disabled={!job?.cancellable}
+              title={
+                job?.cancellable
+                  ? 'Stop and keep the frames rendered so far (Esc)'
+                  : 'Every frame is rendered: the file is being finished'
+              }
               onClick={() => job?.cancel()}
             >
               Cancel
@@ -836,7 +870,7 @@ function RenderAnimationDialog() {
               class={`btn ${result ? '' : 'primary'}`}
               data-testid="render-animation-start"
               disabled={!!problem}
-              title={problem ?? `Render ${frames.length} frames`}
+              title={problem ?? `Render ${frameCount} frames`}
               onClick={begin}
             >
               {result ? 'Render Again' : 'Render'}
@@ -926,10 +960,15 @@ function RenderAnimationDialog() {
             </>
           )}
           <div class="hint" style={{ marginTop: '6px' }}>
-            {frames.length} frame{frames.length === 1 ? '' : 's'} · {width}×{height} px ·{' '}
+            {frameCount} frame{frameCount === 1 ? '' : 's'} · {width}×{height} px ·{' '}
             {Math.round(fps * 100) / 100} fps ·{' '}
             {pathTrace ? 'Path Tracer (render workers)' : 'Rasterized (WebGL)'}
           </div>
+          {sizeNote && (
+            <div class="hint" style={{ color: 'var(--warn)' }} data-testid="render-animation-size-note">
+              {sizeNote}
+            </div>
+          )}
           {problem && <div class="error-text">{problem}</div>}
         </div>
       )}

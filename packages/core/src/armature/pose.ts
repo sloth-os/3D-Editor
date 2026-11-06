@@ -438,7 +438,13 @@ class PoseEvaluator implements PoseEvaluation {
       const m = this.constrain(n, multiply4(frame, n.basis), frame);
       fk.push(m);
       // IK limits are measured from the rest frame (relative to the parent when it is solved too)
-      bones.push({ matrix: m, length: n.length, parent: pj ?? -1, restFrame: pj !== undefined ? n.offset : frame, ik: n.ik });
+      bones.push({
+        matrix: m,
+        length: n.length,
+        parent: pj ?? -1,
+        restFrame: pj !== undefined ? n.offset : frame,
+        ik: n.ik,
+      });
     }
     // goals
     const chains: IkChain[] = [];

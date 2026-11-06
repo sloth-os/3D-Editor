@@ -511,7 +511,7 @@ export function registerLightCameraOperators(reg: OperatorRegistry): void {
         'scene camera. Only the given fields change, in one undo step. Animated fields are re-keyed at the current ' +
         'frame (keyframe=true inserts keys, e.g. for a focus pull). Returns {cameras: [{object, camera (datablock ' +
         'id), ...all camera settings}], keyframes}; dof_focus_distance there is the distance the camera focuses at ' +
-        'on the current frame: with a dof_focus_object, that object\'s depth along the view axis, the stored value ' +
+        "on the current frame: with a dof_focus_object, that object's depth along the view axis, the stored value " +
         '(which the focus object overrides) then following as stored_dof_focus_distance.',
       category: 'Data',
       schema: z.object({

@@ -14,7 +14,7 @@ light falls on the ground in front of them, and a porch lamp burns by the door. 
 winds up from a sandy cove, past the cottage door, to the lighthouse door, with a rail fence on
 its seaward side. A plank jetty and a rowing boat lie in the cove. A wooden sign at the head of
 the beach reads **NORTH POINT**. Pines, bushes, rocks and dune grass are scattered over the
-island, and thin cloud streaks catch the last light low over the horizon.
+island, but not on the beach or the path. Thin cloud streaks lie low over the horizon.
 
 | Beam sweep (24 frames, path traced) | Animated loop |
 | --- | --- |
@@ -22,11 +22,12 @@ island, and thin cloud streaks catch the last light low over the horizon.
 
 The outputs in this folder:
 
-- `render.png`: the final still, 1280×720, path traced.
-- `contact_sheet.png`: the 24 frames of the beam sweep.
-- `preview.gif`: the same 24 frames as a seamless loop, 480×270.
+- `render.png`: the final still, 1280×720, path traced and denoised.
+- `contact_sheet.png`: the 24 frames of the beam sweep, path traced.
+- `preview.gif`: the same 24 frames as a seamless loop, 480×270 at 10 fps.
 - `build.mjs`: the reproducible build.
-- `scene.glb`: written by the export stage (see below).
+- `scene.glb` comes from the export stage (`--export-only`). The glTF exporter is still being
+  finished, so the file is generated in a later pass and is not part of this folder yet.
 
 ## Rebuild
 
@@ -35,10 +36,10 @@ Start a server on any port, then run the build against it:
 ```bash
 cd /path/to/3D-Editor
 PORT=4501 DATA_DIR=/tmp/lc-data node apps/server/dist/main.js &   # or any running editor server
-MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs                 # full run
-MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --build-only    # scene + checks only (6–15 s)
-MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --preview       # + RASTER and 16-spp previews in $TMPDIR/lighthouse-cove-preview
-MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --export-only   # scene + checks + scene.glb, no renders
+MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs                 # full run (about 12 min on 3 cores)
+MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --build-only    # scene + checks only (5–10 s)
+MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --preview       # + RASTER and 16-spp previews in $TMPDIR/lighthouse-cove-preview (about 45 s)
+MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --export-only   # scene + checks + scene.glb, no renders (about 20 s)
 ```
 
 The script deletes any project called `lighthouse-cove`, creates it again empty, builds the whole
@@ -50,12 +51,13 @@ The flags:
 - `--skip-final` skips the still.
 - `--skip-anim` skips the animation.
 - `--export` also exports `scene.glb` after the renders.
-- `--out <dir>` writes the outputs to another folder.
+- `--out <dir>` writes the outputs to another folder (for example `--export-only --out /tmp/x`).
 - `--keep` makes the script fail instead of deleting an existing project.
 
-Any tool error stops the build, and so does any operator WARNING, because a warning means some
-input was ignored. Every design number is a constant at the top of `build.mjs`: the layout, the
-sculpt strokes, the path waypoints, the camera, the sun and the beam phase.
+Any tool error stops the build, and so does any operator WARNING, because a warning means that
+some input was ignored. So does any failed check (next section). Every design number is a
+constant at the top of `build.mjs`: the layout, the sculpt strokes, the path waypoints, the
+scatter settings, the camera, the sun and the beam phase.
 
 ## The brief, element by element
 
@@ -70,10 +72,10 @@ sculpt strokes, the path waypoints, the camera, the sun and the beam phase.
 | Lit windows | One **RECTANGLE area light** per window, sized to the pane. The panes are found with `get_mesh_data {face_materials, face_centers, face_normals}` on the generated building, and the lights are added with `object.light_add {type: AREA, shape: RECTANGLE, size, size_y}` in one `batch`. A small porch lamp has its own POINT light | Path-traced crop |
 | Winding stone path, with bevel, dropped onto the terrain | `curve.add_from_points` BEZIER with a 1.5 m flat profile (`bevel_mode: OBJECT`). The waypoints are resampled every 0.8 m and **dropped onto the ground** with batched downward `scene.raycast`s. Two more ray casts 0.7 m to the left and right of each point set a per-point **tilt**, so the path banks with the cross-slope. The flagstones are two VORONOI textures, CELL colour and DISTANCE_TO_EDGE bump | `get_mesh_data` of the evaluated path against the island heightmap: the highest point is 0.31 m above the ground (0.56 m without banking) |
 | Fence along part of it | `object.generate_fence {points: [x, y, z]}` 1 m to the seaward side of the upper path, with every post on a ray-cast ground height | Visual |
-| Conifers, rocks, grass tufts, kept off the beach and the path | `object.generate_tree {CONIFER}` ×3, `generate_rock` ×3, `generate_grass_tuft` ×2 and `generate_bush` as sources. Per-vertex density maps are written as vertex groups (`object.vertex_group_set_weights`): no trees on the sand, the path, the pads or the open slopes; rocks on the shoreline and steep ground; dune grass along the sand edge. They are scattered with `object.scatter_add {vertex_group, min_distance}` | `scatter_add` results: 40 pines, 110 rocks, 2600 tufts, 30 bushes |
+| Conifers, rocks, grass tufts, kept off the beach and the path | `object.generate_tree {CONIFER}` ×3, `generate_rock` ×3, `generate_grass_tuft` ×2 and `generate_bush` as sources. Per-vertex density maps are written as vertex groups (`object.vertex_group_set_weights`). Every vertex of the dry beach (sand faces above the waterline), the path, the building pads and the sign gets weight 0. Trees grow on the western hill and the northern slopes. Rocks lie along the shoreline, standing in the shallows, and on steep ground. Grass tufts grow all over the land and are densest just above the sand. They are scattered with `object.scatter_add {vertex_group, min_distance}`: 40 pines, 100 rocks, 2,600 tufts and 30 bushes | **Placement check** in `build.mjs`. For the pines, rocks and bushes, each system is made real for a moment (`object.duplicates_make_real` in a `batch` that hides the other systems), listed with `get_scene`, and the batch is undone. Closest pairs: 2.61 m (min_distance 2.6), 1.31 m (1.3) and 2.29 m (2.2). None stands on the path or the dry beach, and 46 of the rocks stand in the shallows. A one-off run of the same check on the 2,600 tufts: closest pair 0.320 m (0.32), none on the path, the beach or in the water |
 | Wooden sign "NORTH POINT" on a post | A board on two posts, parented to an empty that is turned to face the camera. The letters are `object.text_add {body: "NORTH POINT", extrude}`. The wood grain is a distorted WAVE texture, applied after `object.transform_apply` of the board's scale | Visual |
-| Sunset sky with a low sun, light mist | `world.sky_set {preset: SUNSET, sun_elevation: 0.04, sun_rotation: 4.22}` with custom zenith and horizon colours, and `world.mist_set {distance: 800}` (95 % at 800 m: the island stays clear, the far sea and the clouds fade into a lavender haze). Five thin cloud streaks come from `object.generate_cloud`, each generated small and stretched by its object scale. They glow in exactly the mist colour (see the known limitations for why) | Visual, plus a path-traced frame where a beam crosses the clouds |
-| Rotating beam: a spot light driven from the frame | Two opposite SPOT lights (`object.light_add` with `spot_size`, `spot_blend`, `shadow_soft_size`). Each has an `anim.driver_add` on `rotation_euler[2]` with the expression `phase + (frame - 1) * pi / 24`: half a turn in 24 frames, so the pair loops seamlessly. The visible shafts are explained below | `get_object {frame}` at frames 1, 7, 13, 19 and 25. The evaluated heading of beam A is 81.9°, 126.9°, 171.9°, 216.9° and 261.9° (7.5° per frame), and frame 25 equals frame 1 with the beams swapped |
+| Sunset sky with a low sun, light mist | `world.sky_set {preset: SUNSET, sun_elevation: 0.04, sun_rotation: 4.22}` with custom zenith and horizon colours, and `world.mist_set {distance: 800}` (95 % at 800 m: the island stays clear, the far sea and the clouds fade into a lavender haze). The sun is behind the camera, low on the right, and lights the tower warm; the sky ahead is the pink and violet twilight side. Five thin cloud streaks come from `object.generate_cloud`, each generated small and stretched by its object scale. They glow in exactly the mist colour (see the known limitations for why) | Visual, plus a path-traced frame where a beam crosses the clouds |
+| Rotating beam: a spot light driven from the frame | Two opposite SPOT lights (`add_object {type: light, light_type: SPOT}` with `spot_size`, `spot_blend`, `shadow_soft_size`). Each has an `anim.driver_add` on `rotation_euler[2]` with the expression `phase + (frame - 1) * pi / 24`: half a turn in 24 frames, so the pair loops seamlessly. The visible shafts are explained below | `get_object {frame}` at frames 1, 7, 13, 19 and 25. The evaluated heading of beam A is 81.9°, 126.9°, 171.9°, 216.9° and 261.9° (7.5° per frame), and frame 25 equals frame 1 with the beams swapped |
 | Camera aimed with TRACK_TO at an empty near the lighthouse | `add_object empty` ("Camera Target") + `object.constraint_add {type: TRACK_TO, target}` + `set_active_camera` | The camera's evaluated `world_transform` from `get_object` aims 0.001° off the target |
 
 **The beam shafts.** The path tracer has no volumes, so the light of the beams in the mist is
@@ -97,15 +99,19 @@ the 6-spp animation.
 - **Geometry read-back**: `get_mesh_data` for vertices, faces, face materials, face centres and
   normals in world space, the evaluated surface of a curve, and heightmaps. It replaces the OBJ
   export and parsing of the first version.
+- **Mesh editing**: `edit_mesh` with face selections (`object.material_slot_assign`) and vertex
+  selections (`mesh.delete` turns a UV sphere into the boat hull), Solidify, Wireframe and Smooth
+  by Angle modifiers, `object.transform_apply`, `object.shade_smooth`.
 - **Materials**: presets, procedural textures (WAVE, VORONOI, GRADIENT, BRICK and NOISE presets)
   on the base_color, normal and emission channels, emission, transmission and alpha blending.
-- **Lights and cameras by name**: every light setting is passed straight to `object.light_add`,
-  including spot cone, blend, radius and area shape and size. The camera gets `lens` and
+- **Lights and cameras by name**: every light setting is passed straight to `add_object` or
+  `object.light_add`, including spot cone, blend, radius and area shape and size. The camera gets `lens` and
   `clip_end`. These replace the single-keyframe workaround of the first version.
 - **Curves and text**: a bevel profile object, per-point tilt, `data.set_property` to hide the
   profile helper, and extruded text.
-- **Instancing**: `object.scatter_add` with vertex-group density and `min_distance`;
-  `object.array_place` for the jetty posts.
+- **Instancing**: `object.scatter_add` with vertex-group density and `min_distance`,
+  `object.particle_system_update` (visibility), `object.duplicates_make_real` plus `undo` for the
+  placement check, and `object.array_place` for the jetty posts.
 - **Animation**: `anim.driver_add`, with evaluated values checked through `get_object {frame}`.
 - **Constraints**: TRACK_TO.
 - **World**: `world.sky_set` (the SUNSET preset with a low sun and custom zenith, horizon and
@@ -113,9 +119,15 @@ the 6-spp animation.
 - **Scene queries**: batched `scene.raycast`, plus `get_scene` counts and `problems`.
 - **Rendering**: `render_image` with the path tracer (ACES, denoise, time limit) and
   `render_animation` CONTACT_SHEET and GIF, path traced and denoised.
+- **Export**: `export_scene {format: glb}` in the export stage.
+
+The MCP tools it calls: `list_projects`, `delete_project`, `create_project`,
+`set_scene_settings`, `run_operator`, `batch`, `add_object`, `transform_object`, `set_parent`,
+`set_material`, `add_modifier`, `edit_mesh`, `get_mesh_data`, `get_object`, `get_scene`,
+`set_active_camera`, `undo`, `render_image`, `render_animation` and `export_scene`.
 
 Scene size: 70 objects (54 meshes, 2 curves, 1 text, 10 lights, 2 empties, 1 camera), 44k
-vertices and 64k faces evaluated (86k triangles), plus 2,780 scattered instances (2.5 M instance
+vertices and 64k faces evaluated (86k triangles), plus 2,770 scattered instances (2.5 M instance
 triangles). There are 43 materials and 2 drivers.
 
 ## Final production run
@@ -125,7 +137,7 @@ and ran the whole `build.mjs` in its default mode. It also proves that the proje
 scratch:
 
 ```bash
-PORT=4551 DATA_DIR=<fresh dir> RENDER_WORKERS=3 node .phase3/app-v2/dist/main.js &
+PORT=4551 DATA_DIR=<new empty dir> RENDER_WORKERS=3 node .phase3/app-v2/dist/main.js &   # a snapshot of the editor server
 MCP_URL=http://127.0.0.1:4551/mcp node examples/lighthouse-cove/build.mjs
 ```
 
@@ -151,7 +163,7 @@ FINAL_RUN_TIMINGS
   brown. RASTER gets this right. The workaround: the clouds sit 700–1000 m away, where the mist
   covers 90–99 % of their own shading anyway, so they have a black base colour and emit exactly
   the mist colour. They look the same with or without mist, so they look the same through a
-  beam.
+  beam. The price is that they are flat: they have no lit and shaded sides.
 - **RASTER previews show the beams as solid bright tubes.** The software rasterizer ignores the
   procedural emission of transmissive materials. `--preview` therefore also renders a small
   path-traced image, which is cheap because the shafts need few samples.
@@ -164,14 +176,25 @@ FINAL_RUN_TIMINGS
   0.5 m grid. At this camera distance the change is not visible.
 - **There is no operator to set vertex colours from data.** Each vertex is painted with its own
   small `paint.vertex_color_stroke` dab, with the colours quantised to 145 values. This takes
-  3–9 s of the build, depending on the load of the machine.
+  2–6 s of the build, and its 145 operators are the main reason why the project's document is so
+  large (next point).
+- **The project's document is very large.** Every edit of the 16,641-vertex island replaces
+  whole attribute layers (1.4 MB per paint dab), and the synced document keeps every replaced
+  copy. The saved project is therefore about 210 MB. The web editor downloads that much when it
+  opens the project (15–20 s on localhost), and the server holds 630–750 MB of heap for it.
+  Deleting the project frees the memory, but a long-running server with the default heap limit
+  (about 2 GB) once ran out of memory after half an hour of rebuilds and previews. Restart the
+  server between long sessions, or start it with `node --max-old-space-size=4096`.
+- **Scatter positions can only be checked indirectly.** No MCP tool lists where the instances of
+  a particle system are, so the placement check makes each system real and undoes it. The 2,600
+  grass tufts are left out of the check that runs in every build, to keep it light; their
+  numbers above come from a one-off run of the same check.
 - **The path still floats slightly in places.** It is banked with the ground, but on the steep
   final stretch below the lighthouse it floats up to 0.31 m above the terrain, against 0.11 m for
   a perfect fit.
 - **Depth of field is not used.** With a 26 mm lens and everything 15–60 m away, the circle of
-  confusion stays below one pixel even at f/1.4, so `camera.properties_set {dof_use}` would have
-  no visible effect.
-- **`scene.glb` comes from the export stage.** Run `--export-only` or add `--export`. The glTF
-  exporter is still being finished, so the file is regenerated in a later pass. The present
-  exporter writes about 6.2 MB, bakes procedural textures to PNG and exports area lights as
-  point lights. Drivers, the sky and the mist are not part of glTF.
+  confusion stays below one pixel even at f/1.4. `camera.properties_set {dof_use,
+  dof_focus_distance, dof_aperture_fstop}` would therefore have no visible effect on this wide shot.
+- **`scene.glb` is regenerated later.** The present exporter writes about 6.2 MB in 14 s, bakes
+  procedural textures to PNG and exports the window area lights as point lights (it says so in
+  its warnings). Drivers, the sky and the mist are not part of glTF.

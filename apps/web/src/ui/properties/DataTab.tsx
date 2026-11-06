@@ -3,10 +3,8 @@ import { useEffect, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import {
   BONE_CONSTRAINT_LABELS,
-  cameraFovY,
   decodeFloat32,
   defaultPoseBone,
-  lensFromFovY,
   meshStats,
   poseBonePath,
   sanitizeSpline,
@@ -2008,13 +2006,26 @@ function LightPanel({ s, id }: { s: ProjectSession; id: string }) {
 
 // ------------------------------------------------------------------ camera
 
+/**
+ * Blender's camera Field of View (`angle`, radians): the angle across the sensor, i.e. across the
+ * image side the Sensor Fit puts it on (the wider side with Auto, the width with Horizontal, the
+ * height with Vertical). It does not depend on the output size: 39.6° for 50 mm on a 36 mm sensor.
+ * camera.properties_set {angle} uses the same meaning.
+ */
+export function cameraFieldOfView(cam: Pick<CameraData, 'lens' | 'sensor_width'>): number {
+  return 2 * Math.atan((cam.sensor_width || 36) / (2 * cam.lens));
+}
+
+/** The focal length (mm) of a Field of View (see {@link cameraFieldOfView}). */
+export function lensForFieldOfView(angle: number, sensorWidth: number): number {
+  return (sensorWidth || 36) / (2 * Math.tan(angle / 2));
+}
+
 function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
   const c = s.doc.getCamera(id);
   if (!c) return null;
   /** The values at the current frame (keyframes and drivers applied), which the renderers use. */
   const a = animatedBlock<CameraData>(s, 'camera', id) ?? c;
-  const r = s.doc.getRender();
-  const aspect = r.resolution_x / Math.max(1, r.resolution_y);
   const set = (f: string, v: unknown, final = true) => setProp(s, 'cameras', id, f, v, final);
   const st = (path: string) => animState(s, 'camera', id, path, 0);
   return (
@@ -2047,17 +2058,21 @@ function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
                 onChange={(v, f) => set('lens', v, f)}
               />
             </Row>
-            <Row label="Field of View">
+            <Row
+              label="Field of View"
+              title="Angle across the sensor: the image's wider side with Sensor Fit Auto (its width with Horizontal, its height with Vertical)"
+            >
               <NumberField
-                value={cameraFovY(a, aspect)}
+                value={cameraFieldOfView(a)}
                 unit="°"
                 step={0.5}
                 {...RAD}
-                min={0.01}
-                max={3.1}
+                // the angles of the Focal Length range (1–5000 mm)
+                min={cameraFieldOfView({ lens: 5000, sensor_width: a.sensor_width })}
+                max={cameraFieldOfView({ lens: 1, sensor_width: a.sensor_width })}
                 state={st('lens')}
                 testId="camera-fov"
-                onChange={(v, f) => set('lens', lensFromFovY(v, aspect, c.sensor_width), f)}
+                onChange={(v, f) => set('lens', lensForFieldOfView(v, a.sensor_width), f)}
               />
             </Row>
           </>

@@ -306,8 +306,12 @@ function ikSettingsSummary(pb: PoseBone | undefined) {
   (['x', 'y', 'z'] as const).forEach((a, i) => {
     out[`lock_ik_${a}`] = s?.lock[i] ?? false;
     out[`use_ik_limit_${a}`] = !!s?.limit[i];
-    out[`ik_min_${a}`] = round(s?.limit[i]?.[0] ?? Math.max(-Math.PI, Math.min(0, pb?.[`ik_min_${a}`] ?? -Math.PI)));
-    out[`ik_max_${a}`] = round(s?.limit[i]?.[1] ?? Math.min(Math.PI, Math.max(0, pb?.[`ik_max_${a}`] ?? Math.PI)));
+    out[`ik_min_${a}`] = round(
+      s?.limit[i]?.[0] ?? Math.max(-Math.PI, Math.min(0, pb?.[`ik_min_${a}`] ?? -Math.PI)),
+    );
+    out[`ik_max_${a}`] = round(
+      s?.limit[i]?.[1] ?? Math.min(Math.PI, Math.max(0, pb?.[`ik_max_${a}`] ?? Math.PI)),
+    );
     out[`ik_stiffness_${a}`] = round(s?.stiffness[i] ?? 0);
   });
   return out;
@@ -1326,7 +1330,10 @@ function registerPoseOperators(reg: OperatorRegistry): void {
         [`lock_ik_${a}`, z.boolean().optional().describe(ikAxis(A, 'IK may not rotate the bone about'))],
         [
           `use_ik_limit_${a}`,
-          z.boolean().optional().describe(`Limit the IK rotation about local ${A} to [ik_min_${a}, ik_max_${a}]`),
+          z
+            .boolean()
+            .optional()
+            .describe(`Limit the IK rotation about local ${A} to [ik_min_${a}, ik_max_${a}]`),
         ],
         [
           `ik_min_${a}`,
@@ -1353,7 +1360,9 @@ function registerPoseOperators(reg: OperatorRegistry): void {
             .min(0)
             .max(0.99)
             .optional()
-            .describe(`0 … 0.99 (default 0): resistance to rotating about local ${A}; other bones move more instead`),
+            .describe(
+              `0 … 0.99 (default 0): resistance to rotating about local ${A}; other bones move more instead`,
+            ),
         ],
       ];
     }),
@@ -1365,12 +1374,12 @@ function registerPoseOperators(reg: OperatorRegistry): void {
       label: 'Set Bone IK Settings',
       description:
         "Set a pose bone's inverse kinematics settings (Blender Bone properties > Inverse Kinematics), used by " +
-        'every IK chain that contains the bone. Axes are the bone\'s own: Y runs along the bone (head → tail, ' +
+        "every IK chain that contains the bone. Axes are the bone's own: Y runs along the bone (head → tail, " +
         'twist), X and Z bend it. lock_ik_x/y/z: the solver may not rotate the bone about that axis (e.g. a ' +
         "robot's vertical base bone that may only yaw: lock_ik_x and lock_ik_z; a hinge: lock two axes). " +
         'use_ik_limit_x/y/z with ik_min_* (−π … 0) and ik_max_* (0 … π): keep the rotation about that axis, ' +
         'measured from the rest pose (swing about X/Z, twist about Y), within range; a positive angle about X tilts ' +
-        'the tail towards the bone\'s +Z axis, about Z towards its −X axis (armature.describe lists every bone\'s ' +
+        "the tail towards the bone's +Z axis, about Z towards its −X axis (armature.describe lists every bone's " +
         'rest x_axis and z_axis). ik_stiffness_x/y/z (0 … ' +
         '0.99): the bone resists rotating about that axis, so other bones take more of the motion. Only the ' +
         'settings passed change. Chains with such bones are solved with a damped least-squares solver (FABRIK ' +
@@ -1408,7 +1417,10 @@ function registerPoseOperators(reg: OperatorRegistry): void {
               'WARNING',
               `'${p.bone}': use_ik_limit_${a} without ik_min_${a} / ik_max_${a} allows −π … π (no limit yet)`,
             );
-          if (!pb[`use_ik_limit_${a}`] && (changed.includes(`ik_min_${a}`) || changed.includes(`ik_max_${a}`)))
+          if (
+            !pb[`use_ik_limit_${a}`] &&
+            (changed.includes(`ik_min_${a}`) || changed.includes(`ik_max_${a}`))
+          )
             ctx.report(
               'WARNING',
               `'${p.bone}': ik_min_${a} / ik_max_${a} only apply with use_ik_limit_${a}: true`,

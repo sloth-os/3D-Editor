@@ -28,7 +28,8 @@ function setup() {
 }
 
 type Bone = { name: string; posed_head_world: number[]; posed_tail_world: number[] };
-const dist = (a: readonly number[], b: readonly number[]) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+const dist = (a: readonly number[], b: readonly number[]) =>
+  Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 
 /** The issue's rig: a vertical base, an upper arm and a forearm, one IK chain over all three. */
 function robot() {
@@ -106,7 +107,9 @@ describe('pose.ik_settings_set: IK locks, limits and stiffness', () => {
       );
       const dir = (x: Bone) => x.posed_tail_world.map((v, i) => v - x.posed_head_world[i]);
       const angle = (a: number[], c: number[]) =>
-        Math.acos(Math.min(1, (a[0] * c[0] + a[1] * c[1] + a[2] * c[2]) / Math.hypot(...a) / Math.hypot(...c)));
+        Math.acos(
+          Math.min(1, (a[0] * c[0] + a[1] * c[1] + a[2] * c[2]) / Math.hypot(...a) / Math.hypot(...c)),
+        );
       return {
         // bend of the elbow relative to the rest pose (the bones start 0.05 rad apart)
         bend: angle(dir(b.Upper), dir(b.Fore)) - Math.atan2(0.05, 1),
@@ -133,7 +136,13 @@ describe('pose.ik_settings_set: IK locks, limits and stiffness', () => {
     const reach = Math.sqrt(1 + fore * fore + 2 * fore * Math.cos(1 + Math.atan2(0.05, 1)));
     expect(limited.error).toBeCloseTo(reach - Math.hypot(0.3, 0.5), 3);
     // stiffness: a stiff upper arm takes less of the motion
-    t.ok('pose.ik_settings_set', { object: 'Arm', bone: 'Fore', lock_ik_y: false, lock_ik_z: false, use_ik_limit_x: false });
+    t.ok('pose.ik_settings_set', {
+      object: 'Arm',
+      bone: 'Fore',
+      lock_ik_y: false,
+      lock_ik_z: false,
+      use_ik_limit_x: false,
+    });
     t.ok('pose.ik_settings_set', { object: 'Arm', bone: 'Fore', use_ik_limit_y: true }); // no-op limit (−π … π)
     t.doc.updateObject(t.doc.findObjectByName('Goal')!.id, { location: [1.5, 0.3, 0.2] });
     const free = pose();
@@ -164,7 +173,13 @@ describe('pose.ik_settings_set: IK locks, limits and stiffness', () => {
       code: 'NOT_FOUND',
     });
     // a bone outside every IK chain: the settings are stored, with a warning
-    ok('armature.bone_add', { object: 'Rig', name: 'Tool', head: [1, 0, 1.5], tail: [1.2, 0, 1.5], parent: 'Fore' });
+    ok('armature.bone_add', {
+      object: 'Rig',
+      name: 'Tool',
+      head: [1, 0, 1.5],
+      tail: [1.2, 0, 1.5],
+      parent: 'Fore',
+    });
     reports.length = 0;
     const r = ok('pose.ik_settings_set', { object: 'Rig', bone: 'Tool', ik_min_z: -0.5 });
     expect(r.chains).toEqual([]);
@@ -175,7 +190,13 @@ describe('pose.ik_settings_set: IK locks, limits and stiffness', () => {
 
 describe('IK solver with bone settings', () => {
   it('clamps the swing and twist of a bone to its limits', () => {
-    const s = ikSettingsOf({ use_ik_limit_x: true, ik_min_x: -0.2, ik_max_x: 0.3, use_ik_limit_y: true, ik_max_y: 0.1 })!;
+    const s = ikSettingsOf({
+      use_ik_limit_x: true,
+      ik_min_x: -0.2,
+      ik_max_x: 0.3,
+      use_ik_limit_y: true,
+      ik_max_y: 0.1,
+    })!;
     expect(s.limit).toEqual([[-0.2, 0.3], [-Math.PI, 0.1], null]);
     expect(clampIkRotation(quatFromAxisAngle([1, 0, 0], 0.25), s)).toBeNull();
     const q = clampIkRotation(quatFromAxisAngle([1, 0, 0], 0.8), s)!;
@@ -185,10 +206,9 @@ describe('IK solver with bone settings', () => {
     expect(2 * Math.atan2(tw[1], tw[3])).toBeCloseTo(0.1, 9);
     // invalid values fall back to Blender's defaults and are reported
     const problems: string[] = [];
-    expect(ikSettingsOf({ use_ik_limit_z: true, ik_max_z: Number.NaN }, (m) => problems.push(m))!.limit[2]).toEqual([
-      -Math.PI,
-      Math.PI,
-    ]);
+    expect(
+      ikSettingsOf({ use_ik_limit_z: true, ik_max_z: Number.NaN }, (m) => problems.push(m))!.limit[2],
+    ).toEqual([-Math.PI, Math.PI]);
     expect(problems).toEqual(['ik_max_z is not a number; using 3.1416']);
     expect(ikSettingsOf({ lock_ik_x: false, ik_stiffness_y: 0 })).toBeNull();
   });
@@ -198,16 +218,35 @@ describe('IK solver with bone settings', () => {
     const child = identity4();
     child[13] = 1;
     const bones: IkBone[] = [
-      { matrix: identity4(), length: 1, parent: -1, ik: ikSettingsOf({ lock_ik_x: true, lock_ik_y: true, lock_ik_z: true }) },
+      {
+        matrix: identity4(),
+        length: 1,
+        parent: -1,
+        ik: ikSettingsOf({ lock_ik_x: true, lock_ik_y: true, lock_ik_z: true }),
+      },
       { matrix: child, length: 1, parent: 0 },
     ];
     solveIk(bones, [
-      { bones: [0, 1], target: [0.7, 1.5, 0], pole: null, poleAngle: 0, iterations: 500, useStretch: false, influence: 1 },
+      {
+        bones: [0, 1],
+        target: [0.7, 1.5, 0],
+        pole: null,
+        poleAngle: 0,
+        iterations: 500,
+        useStretch: false,
+        influence: 1,
+      },
     ]);
     expect(bones[0].matrix.map((v) => +v.toFixed(9))).toEqual(identity4());
     // the child can reach the goal only if it is within its length of the root's tail
-    const tip = [bones[1].matrix[12] + bones[1].matrix[4], bones[1].matrix[13] + bones[1].matrix[5], bones[1].matrix[14] + bones[1].matrix[6]];
+    const tip = [
+      bones[1].matrix[12] + bones[1].matrix[4],
+      bones[1].matrix[13] + bones[1].matrix[5],
+      bones[1].matrix[14] + bones[1].matrix[6],
+    ];
     expect(dist(tip, [0.7, 1.5, 0])).toBeLessThan(0.15);
-    expect(dist([bones[1].matrix[12], bones[1].matrix[13], bones[1].matrix[14]], [0, 1, 0])).toBeLessThan(1e-12);
+    expect(dist([bones[1].matrix[12], bones[1].matrix[13], bones[1].matrix[14]], [0, 1, 0])).toBeLessThan(
+      1e-12,
+    );
   });
 });

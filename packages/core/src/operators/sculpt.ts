@@ -231,7 +231,9 @@ export function registerSculptOperators(reg: OperatorRegistry): void {
           .int()
           .min(0)
           .optional()
-          .describe('With `colors` and no `indices`: index of the vertex that gets colors[0] (a contiguous run)'),
+          .describe(
+            'With `colors` and no `indices`: index of the vertex that gets colors[0] (a contiguous run)',
+          ),
         ranges: z
           .array(
             z.object({
@@ -267,7 +269,10 @@ export function registerSculptOperators(reg: OperatorRegistry): void {
         };
         if (p.ranges) {
           if (p.colors || p.indices || p.start !== undefined)
-            throw new OperatorError('Pass `ranges` or `colors` (with indices / start), not both', 'INVALID_PARAMS');
+            throw new OperatorError(
+              'Pass `ranges` or `colors` (with indices / start), not both',
+              'INVALID_PARAMS',
+            );
           p.ranges.forEach((r, k) => {
             const c = check(r.color, `ranges[${k}].color`);
             index(r.start + r.count - 1, `ranges[${k}].start + count - 1`);
@@ -284,7 +289,9 @@ export function registerSculptOperators(reg: OperatorRegistry): void {
                   'or a single color for all of them',
                 'INVALID_PARAMS',
               );
-            p.indices.forEach((i, k) => writes.push([index(i, `indices[${k}]`), colors[colors.length === 1 ? 0 : k]]));
+            p.indices.forEach((i, k) =>
+              writes.push([index(i, `indices[${k}]`), colors[colors.length === 1 ? 0 : k]]),
+            );
           } else {
             const start = p.start ?? 0;
             if (p.start === undefined && colors.length !== n)
