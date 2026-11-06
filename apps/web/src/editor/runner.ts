@@ -9,7 +9,7 @@ import type {
 } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
 import { telemetry } from '../telemetry/telemetry';
-import { toast } from '../app/store';
+import { session as openSession, toast } from '../app/store';
 
 export interface InfoLine {
   id: number;
@@ -113,6 +113,27 @@ const AGENT_SOURCES: ReadonlySet<OperatorSource> = new Set(['mcp', 'api']);
 
 /** Set right before an operator runs that continues an action (see {@link continueRepeat}). */
 let continuation: RepeatAction | null = null;
+
+/**
+ * Forgets the operator history: what Adjust Last Operation adjusts ({@link lastOperator}) and what
+ * Repeat Last repeats ({@link lastRepeat}). The history belongs to the project it was recorded in,
+ * so it is cleared whenever another project is opened, created or closed in this tab (File > New,
+ * Open, Close switch projects without reloading the page), like Blender, which clears its operator
+ * history when it loads a file or starts a new one.
+ */
+export function clearOperatorHistory(): void {
+  lastOperator.value = null;
+  lastRepeat.value = null;
+  continuation = null;
+}
+
+// the project open in this tab; its operator history is cleared when another one takes its place
+let historyProject: ProjectSession | null = openSession.peek();
+openSession.subscribe((s) => {
+  if (s === historyProject) return;
+  historyProject = s;
+  clearOperatorHistory();
+});
 
 /**
  * Makes the next operator run part of `action`: an interactive transform that completes the

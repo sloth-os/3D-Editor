@@ -576,12 +576,15 @@ await op('object.armature_add', {
   radius: 0.4,
 });
 await op('armature.bone_update', { object: 'Robot_Rig', bone: 'J1_Base', head: J1_HEAD, tail: J1_TAIL });
+// align_roll: every arm bone's local Z axis faces the front (-Y), so the pitch joints J2 and J3
+// bend about their own Z axis (the joint axis), which the IK locks in section 5 rely on
 const chain = await op('armature.chain_add', {
   object: 'Robot_Rig',
   points: [SHOULDER, ELBOW, WRIST, WRIST_TAIL],
   names: ['J2_Shoulder', 'J3_Elbow', 'J4_Wrist'],
   parent: 'J1_Base',
   use_connect: false,
+  align_roll: [0, -1, 0],
 });
 await op('armature.properties_set', { object: 'Robot_Rig', display_type: 'STICK', show_names: true });
 log(`armature bones: J1_Base + ${chain.bones.join(', ')} (lengths ${chain.lengths.join(', ')})`);
@@ -949,11 +952,8 @@ const CLAMPS = []; // [clamp name, hose point it holds (rest pose)], filled belo
 }
 
 // ---------------------------------------------------------------------------------------------
-// 5. IK rig: target empty (keyframed), wrist aim, IK + Damped Track
-//    WORKAROUND (missing editor feature): the IK chain covers only J2/J3 because pose.ik_add has
-//    no per-bone IK locks or limits (Blender lock_ik_x/y/z, use_ik_limit_*); a chain over J1 would
-//    tilt the vertical base. J1's yaw and J4's roll are therefore keyed per frame from the target
-//    azimuth in section 8, and a Damped Track keeps the wrist vertical.
+// 5. IK rig: target empty (keyframed), wrist aim, a three-bone IK chain with per-bone IK locks
+//    (J1 may only yaw, J2 and J3 only pitch) + a Damped Track that keeps the wrist vertical
 // ---------------------------------------------------------------------------------------------
 await batch(
   [
@@ -973,9 +973,24 @@ const ik = await op('pose.ik_add', {
   object: 'Robot_Rig',
   bone: 'J3_Elbow',
   target: 'IK_Target',
-  chain_count: 2,
+  chain_count: 3,
   iterations: 500,
 });
+// IK locks (Blender's lock_ik_*): the vertical base bone J1 turns only about its own Y axis (the
+// vertical: yaw), the shoulder and the elbow only about their Z axes (the joint axes, see
+// align_roll in section 4), so the arm stays in a vertical plane through the base axis
+const ikSettings = await batch(
+  [
+    ['J1_Base', { lock_ik_x: true, lock_ik_z: true }],
+    ['J2_Shoulder', { lock_ik_x: true, lock_ik_y: true }],
+    ['J3_Elbow', { lock_ik_x: true, lock_ik_y: true }],
+  ].map(([bone, s]) => ({
+    operator: 'pose.ik_settings_set',
+    params: { object: 'Robot_Rig', bone, ...s },
+  })),
+  'ik locks',
+);
+log(`IK settings: ${JSON.stringify(ikSettings.map((r) => r.result).slice(0, 3)).slice(0, 900)}`);
 await op('pose.constraint_add', {
   object: 'Robot_Rig',
   bone: 'J4_Wrist',
@@ -1453,9 +1468,8 @@ await batch(
       frames,
       tgt.map((p) => p[2]),
     ),
-    // J1 yaw keyed from the target azimuth (IK cannot drive it without IK locks, see section 5)
-    keyMany('Robot_Rig', 'pose.bones["J1_Base"].rotation_euler', 1, frames, yaw),
-    // J4 rolls against the base yaw so the gripper (and the crate) keep their heading
+    // J4 rolls against the base yaw (the target azimuth, which the IK turns J1 to) so the gripper
+    // and the crate keep their heading
     keyMany(
       'Robot_Rig',
       'pose.bones["J4_Wrist"].rotation_euler',
@@ -1695,14 +1709,25 @@ const verify = {};
   // with the gripper while gripped and stays on its pallet slot after the release; (c) fingers
   // (shape key) and Child Of influence evaluated per frame; (d) the camera focus follows the gripper
   let worstIk = 0;
+  let worstYaw = 0;
+  let worstTilt = 0;
   let worstCarry = 0;
   const focus = [];
+  /** Angle difference wrapped to [-pi, pi). */
+  const wrap = (a) => a - 2 * Math.PI * Math.floor((a + Math.PI) / (2 * Math.PI));
   for (const f of [1, 12, 16, 22, 28, 33, 40, 47, 50, 56, 63, 68, 72, 77, 80, 88, 96]) {
     const d = await op('armature.describe', { object: 'Robot_Rig', frame: f });
     check(!d.errors?.length, `pose errors at ${f}: ${JSON.stringify(d.errors)}`);
-    const wrist = d.bones.find((b) => b.name === 'J4_Wrist').posed_head_world;
+    const bone = (n) => d.bones.find((b) => b.name === n);
+    const wrist = bone('J4_Wrist').posed_head_world;
     const ikErr = dist(wrist, targetAt(f));
     worstIk = Math.max(worstIk, ikErr);
+    // the IK locks keep the base vertical (J1 only yaws) and the arm in the vertical plane through
+    // the base axis and the target: J1's yaw (the direction of the shoulder) is the target azimuth
+    const [j1h, j1t] = [bone('J1_Base').posed_head_world, bone('J1_Base').posed_tail_world];
+    worstTilt = Math.max(worstTilt, Math.hypot(j1t[0] - j1h[0], j1t[1] - j1h[1]) / dist(j1t, j1h));
+    const sh = bone('J2_Shoulder').posed_head_world;
+    worstYaw = Math.max(worstYaw, Math.abs(wrap(Math.atan2(sh[1], sh[0]) - cylAt(f).az)));
     const crate = await tool('get_object', { object: 'Crate', frame: f });
     const grip = await tool('get_object', { object: 'Robot_Gripper', frame: f });
     const camera = await tool('get_object', { object: 'Camera', frame: f });
@@ -1723,13 +1748,15 @@ const verify = {};
     );
   }
   check(worstIk < 0.005, `IK error ${mm(worstIk)}`);
+  check(worstTilt < 1e-5, `J1 tilts out of the vertical (sin ${worstTilt})`);
+  check(worstYaw < 1e-4, `J1 yaw is ${worstYaw} rad off the target azimuth`);
   check(worstCarry < 0.005, `crate offset error ${mm(worstCarry)}`);
   check(
     Math.max(...focus) - Math.min(...focus) > 0.3,
     `camera focus distance does not follow the gripper: ${focus.join(', ')}`,
   );
   log(
-    `worst IK error ${mm(worstIk)}, worst crate error ${mm(worstCarry)}, focus ${Math.min(...focus).toFixed(2)}..${Math.max(...focus).toFixed(2)} m`,
+    `worst IK error ${mm(worstIk)}, J1 yaw - target azimuth <= ${((worstYaw * 180) / Math.PI).toExponential(1)} deg, J1 tilt ${worstTilt.toExponential(1)}, worst crate error ${mm(worstCarry)}, focus ${Math.min(...focus).toFixed(2)}..${Math.max(...focus).toFixed(2)} m`,
   );
 
   // (e) the skinned hose follows the arm: its root stays on the turret fitting (the rest root

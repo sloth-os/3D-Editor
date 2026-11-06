@@ -205,16 +205,37 @@ export interface FrameRateParts {
   base: number;
 }
 
+/** Largest whole Base {@link frameRateParts} tries (enough for any rate given with two decimals). */
+const MAX_WHOLE_BASE = 100;
+
 /**
  * The FPS / Base pair shown for `rate`. The document stores only the rate, so the pair is derived
- * from it like Blender's NTSC presets (FPS the nearest whole number, Base the divisor that gives
- * the rate: 29.97 → 30 / 1.001, 15 → 15 / 1), unless `typed` (the pair last entered in this
- * editor) still gives the rate, which then stays as entered (15 / 2, not 8 / 1.0667).
+ * from it the way it would be entered: a whole rate as FPS / 1 (15 → 15 / 1); an NTSC rate as a
+ * whole FPS / 1.001 like Blender's presets (29.97 → 30 / 1.001, 14.985 → 15 / 1.001); any other
+ * fraction with the smallest whole Base that gives it exactly (12.5 → 25 / 2, 7.5 → 15 / 2,
+ * 0.5 → 1 / 2); else the nearest whole FPS and the Base that gives the rate. A pair entered in
+ * this editor (`typed`) that still gives the rate stays as entered (30 / 4, not 15 / 2).
  */
 export function frameRateParts(rate: number, typed?: FrameRateParts | null): FrameRateParts {
   if (typed && typed.base > 0 && Math.abs(typed.fps / typed.base - rate) <= 1e-9 * Math.max(1, rate))
     return typed;
   if (!(rate > 0) || !Number.isFinite(rate)) return { fps: 24, base: 1 };
+  // the whole number `rate × base` is within a relative `tolerance` of, if any
+  const wholeFps = (base: number, tolerance: number): number | null => {
+    const x = rate * base;
+    const fps = Math.round(x);
+    return fps >= 1 && Math.abs(x - fps) <= tolerance * x ? fps : null;
+  };
+  const exact = 1e-9;
+  const whole = wholeFps(1, exact);
+  if (whole !== null) return { fps: whole, base: 1 };
+  // NTSC: also a rate written with fewer decimals (29.97 for 30 / 1.001 = 29.97003)
+  const ntsc = wholeFps(1.001, 1e-5);
+  if (ntsc !== null) return { fps: ntsc, base: 1.001 };
+  for (let base = 2; base <= MAX_WHOLE_BASE; base++) {
+    const fps = wholeFps(base, exact);
+    if (fps !== null) return { fps, base };
+  }
   const fps = Math.max(1, Math.round(rate));
   return { fps, base: fps / rate };
 }

@@ -12,9 +12,11 @@
  * marble hits the first one), keys a focus target that follows the marble and then the wave front
  * (camera depth of field), animates a showcase camera, renders inspection contact sheets, bakes
  * the simulation to keyframes (and checks that the keys reproduce it), then renders a path-traced
- * still, a contact sheet and a GIF.
+ * still, a contact sheet and a GIF. The rigid body solver is deterministic: every fresh build
+ * simulates (and bakes) the same cascade.
  *
- *   MCP_URL=http://127.0.0.1:4504/mcp node examples/domino-cascade/build.mjs [mode] [options]
+ *   npm start   # the editor server (after npm ci && npm run build), MCP at :8080/mcp
+ *   MCP_URL=http://127.0.0.1:8080/mcp node examples/domino-cascade/build.mjs [mode] [options]
  *
  * Modes (default --final):
  *   --final        scene, verify, animate, inspect, bake, still, sheet, gif   (the production run)
@@ -90,10 +92,10 @@ const timings = {};
 // ---------------------------------------------------------------------------------------------
 const TABLE = { width: 2.6, depth: 1.5, height: 0.75, top: 0.05, leg: 0.09 };
 const TOP = TABLE.height; // z of the table top
-// Jumbo toy dominoes, 14 mm thick (real ones are about 7.5 mm). The editor build that rendered
-// the outputs (README, "Final production run") gives every collision box at least 5 mm half
-// thickness, so 7.5 mm dominoes would collide like 10 mm slabs and hover above the table; at
-// 14 mm that clamp never applies. (The engine from commit 6451e56 on keeps thin boxes thin.)
+// Jumbo toy dominoes: 80 x 40 x 14 mm, a standard 48 x 24 x 7.5 mm domino scaled up 1.67x (a
+// touch thicker), so that 60 of them read clearly in the wide shot of a 2.6 m table. The physics
+// engine simulates boxes at their true size (the scene stage checks that rigidbody.object_add
+// reports no thickened collision shape for the dominoes and the marble).
 const DOMINO = { h: 0.08, w: 0.04, t: 0.014, mass: 0.047, count: 60 };
 const S_CURVE = { x0: -0.9, y0: 0.0, amplitude: 0.35, wavelength: 2.0 };
 const MARBLE = { r: 0.014, mass: 0.029 }; // 28 mm glass marble
@@ -181,6 +183,20 @@ async function batch(operations) {
     results.push(...r.results);
   }
   return results;
+}
+
+/**
+ * Checks a rigidbody.object_add result: each body's collision shape must have the mesh's true size
+ * (collision_note null; the engine thickens shapes thinner than 0.2 % of their largest dimension
+ * and says so in collision_note).
+ */
+function trueSizeShapes(result) {
+  for (const o of result.objects ?? [])
+    if (o.collision_note)
+      throw new Error(`'${o.name}' is not simulated at its true size: ${o.collision_note}`);
+  log(
+    `  ${(result.objects ?? []).map((o) => `${o.name}: ${o.collision_shape}`).join(', ')}, true-size shape`,
+  );
 }
 
 function save(name, data) {
@@ -312,11 +328,12 @@ async function buildScene() {
   log(
     `S-curve length ${layout.length.toFixed(3)} m, spacing ${(layout.spacing * 1000).toFixed(1)} mm, chute ${chute.length.toFixed(3)} m`,
   );
+  // project names are unique (create_project refuses a taken name): replace the old project
   const projects = await mcp.call('list_projects', {});
   const list = Array.isArray(projects) ? projects : (projects.projects ?? []);
-  if (list.some((p) => p.name === PROJECT)) {
-    await mcp.call('delete_project', { project: PROJECT, confirm: true });
-    log(`deleted the existing '${PROJECT}' project`);
+  for (const p of list.filter((q) => q.name === PROJECT)) {
+    await mcp.call('delete_project', { project: p.id, confirm: true });
+    log(`deleted the existing '${PROJECT}' project (${p.id})`);
   }
   const created = await mcp.call('create_project', { name: PROJECT, empty: true });
   log(`created project ${created.id} — open ${created.editor_url}`);
@@ -366,7 +383,7 @@ async function buildScene() {
   });
   await call('apply_modifier', { object: dominoNames[0], modifier: 'Bevel' });
   await op('object.shade_auto_smooth', { angle: deg(35) }, [dominoNames[0]]);
-  await op('rigidbody.object_add', {
+  const dominoBody = await op('rigidbody.object_add', {
     objects: [dominoNames[0]],
     type: 'ACTIVE',
     collision_shape: 'BOX',
@@ -375,6 +392,7 @@ async function buildScene() {
     restitution: 0.1,
     collision_margin: 0.002,
   });
+  trueSizeShapes(dominoBody);
   const placed = await op('object.array_place', {
     objects: [dominoNames[0]],
     pattern: 'LINE',
@@ -459,7 +477,7 @@ async function buildScene() {
     location: [c0[0], c0[1], c0[2] - CHUTE.radius + MARBLE.r + 0.0005],
   });
   await op('object.shade_smooth', {}, ['Marble']);
-  await op('rigidbody.object_add', {
+  const marbleBody = await op('rigidbody.object_add', {
     objects: ['Marble'],
     type: 'ACTIVE',
     collision_shape: 'SPHERE',
@@ -471,6 +489,7 @@ async function buildScene() {
     linear_damping: 0.35,
     angular_damping: 0.35,
   });
+  trueSizeShapes(marbleBody);
 
   // --- physics world ------------------------------------------------------------------------
   const world = await op('rigidbody.world_set', {
@@ -1117,9 +1136,19 @@ async function preview() {
   log(`  path trace: ${JSON.stringify(p.text).slice(0, 300)}`);
 }
 
+/**
+ * Keeps a render's result (timing, samples reached ...) for timings.json and logs it without the
+ * per-frame lists; frames that stopped sampling early (time_limit) are reported, not fatal.
+ */
 function record(name, started, text) {
   timings[name] = { seconds: +((Date.now() - started) / 1000).toFixed(1), ...text };
-  log(`  ${name}: ${JSON.stringify(text).slice(0, 500)}`);
+  const perFrame = new Set(['frames', 'frame_samples', 'sheet']);
+  const brief = Object.fromEntries(Object.entries(text ?? {}).filter(([k]) => !perFrame.has(k)));
+  log(`  ${name}: ${JSON.stringify(brief).slice(0, 600)}`);
+  if (text?.undersampled_frames?.length)
+    log(
+      `  ${name} WARNING: frames ${text.undersampled_frames.join(', ')} stopped sampling early (time_limit)`,
+    );
 }
 
 async function still() {
@@ -1178,15 +1207,16 @@ async function gif() {
   record('gif', started, r.text);
 }
 
+/** scene.glb: the baked scene with its animation (frames 1-100), static pose at frame 1. */
 async function exportGlb() {
   const started = Date.now();
-  const r = await call('export_scene', { format: 'glb' });
+  const r = await call('export_scene', { format: 'glb', frame: 1 });
   const res = (r.resources ?? []).find((x) => x.blob);
   if (!res) throw new Error(`export_scene returned no file: ${JSON.stringify(r).slice(0, 300)}`);
   const file = save(path.join(OUT, 'scene.glb'), res.blob);
-  for (const w of r.text?.warnings ?? [])
-    log(`  export warning: ${typeof w === 'string' ? w : JSON.stringify(w)}`);
-  record('export', started, { bytes: statSync(file).size });
+  const warnings = (r.text?.warnings ?? []).map((w) => (typeof w === 'string' ? w : JSON.stringify(w)));
+  for (const w of warnings) log(`  export warning: ${w}`);
+  record('export', started, { bytes: statSync(file).size, elapsed_ms: r.text?.elapsed_ms, warnings });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1214,5 +1244,7 @@ try {
 }
 timings.total_seconds = +((Date.now() - t0) / 1000).toFixed(1);
 mkdirSync(WORK, { recursive: true });
-writeFileSync(path.join(WORK, 'timings.json'), JSON.stringify(timings, null, 2));
-log(`done; timings: ${JSON.stringify(timings)}`);
+const timingsFile = path.join(WORK, 'timings.json');
+writeFileSync(timingsFile, JSON.stringify(timings, null, 2));
+const seconds = Object.entries(timings).filter(([k]) => k.startsWith('stage_') || k === 'total_seconds');
+log(`done; seconds: ${JSON.stringify(Object.fromEntries(seconds))} (render results in ${timingsFile})`);

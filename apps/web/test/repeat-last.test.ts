@@ -17,7 +17,8 @@ import { registerUiOperators } from '../src/editor/ui-operators';
 import { installKeymap } from '../src/editor/keymap';
 import { EDIT_MENU } from '../src/editor/menus';
 import { ViewportInteraction } from '../src/viewport/interaction';
-import type { ProjectSession } from '../src/project/session';
+import { ProjectSession } from '../src/project/session';
+import { closeProject, createProject, openProject } from '../src/project/manager';
 
 /** A project session backed by a real document, evaluator, undo manager and operator registry. */
 function fakeSession(): ProjectSession {
@@ -234,6 +235,51 @@ describe('Repeat Last (Shift+R)', () => {
       ok: true,
     });
     expect(s.doc.listObjects()).toHaveLength(2);
+  });
+
+  it('another project opened in the tab (File > New, Open) starts without the previous one’s history', async () => {
+    // regression: the history outlived its project, so after File > New (no page reload) Edit >
+    // Repeat Last was enabled and Shift+R re-ran the previous project's last operation in the new one
+    sessionSignal.value = null;
+    const a = await createProject('Repeat A', { empty: true });
+    const b = { id: '' };
+    try {
+      ok('mesh.primitive_cone_add', { name: 'ConeA', location: [3, 0, 0] });
+      expect(lastRepeat.value?.steps.map((st) => st.id)).toEqual(['mesh.primitive_cone_add']);
+      expect(lastOperator.value?.id).toBe('mesh.primitive_cone_add');
+      const repeatItem = () => EDIT_MENU().find((i) => i.op === 'screen.repeat_last')!;
+      expect(repeatItem().enabled?.()).toBe(true);
+
+      const sb = await createProject('Repeat B');
+      b.id = sb.id;
+      expect(sessionSignal.value).toBe(sb);
+      expect(lastRepeat.value).toBeNull();
+      // Adjust Last Operation has nothing to adjust either (its undo depth check alone would let the
+      // old operation through once the new project's undo stack reached the same depth)
+      expect(lastOperator.value).toBeNull();
+      expect(repeatItem().enabled?.()).toBe(false);
+      shiftR();
+      expect(runResult('screen.repeat_last', {}, 'menu')?.error).toBe('Nothing to repeat');
+      expect(names(sb).sort()).toEqual(['Camera', 'Cube', 'Light']);
+      // what is done in the new project is what repeats there
+      ok('mesh.primitive_plane_add', { name: 'Plane' });
+      shiftR();
+      expect(names(sb).filter((n) => n.startsWith('Plane'))).toHaveLength(2);
+      expect(names(sb).some((n) => n.startsWith('Cone'))).toBe(false);
+
+      // opening the first project again does not bring the second one's history along
+      const reopened = await openProject(a.id);
+      expect(lastRepeat.value).toBeNull();
+      expect(lastOperator.value).toBeNull();
+      const before = names(reopened);
+      shiftR();
+      expect(names(reopened)).toEqual(before);
+    } finally {
+      closeProject();
+      await ProjectSession.deleteLocal(a.id);
+      if (b.id) await ProjectSession.deleteLocal(b.id);
+    }
+    expect(lastRepeat.value).toBeNull();
   });
 
   it('agents’ editor commands do not become the user’s Repeat Last', () => {

@@ -776,21 +776,56 @@ describe('Scene, World and Render tabs', () => {
     typeNumber(fps()!, '30');
     typeNumber(base()!, '1.001');
     expect(s.doc.getScene().fps).toBeCloseTo(30000 / 1001, 9);
-    // rates set by an agent show as FPS / Base too (no empty box, no hidden custom rate)
+    // rates set by an agent show as FPS / Base too (no empty box, no hidden custom rate), as the
+    // simplest pair that gives them (12.5 fps read FPS 13, Base 1.04)
     act(() => s.doc.updateScene({ fps: 12.5 }));
     expect(label()).toBe('Custom (12.5 fps)');
-    expect(num(fps())).toBe(13);
-    expect(num(fps()) / num(base())).toBeCloseTo(12.5, 3);
-    expect(frameRateParts(12.5)).toEqual({ fps: 13, base: 1.04 });
-    expect(frameRateParts(30000 / 1001).fps).toBe(30);
-    expect(frameRateParts(30000 / 1001).base).toBeCloseTo(1.001, 12);
-    expect(frameRateParts(7.5, { fps: 15, base: 2 })).toEqual({ fps: 15, base: 2 });
-    expect(frameRateParts(8, { fps: 15, base: 2 })).toEqual({ fps: 8, base: 1 });
+    expect([num(fps()), num(base())]).toEqual([25, 2]);
+    act(() => s.doc.updateScene({ fps: 15 / 1.001 }));
+    expect(label()).toBe('Custom (14.99 fps)');
+    expect([num(fps()), num(base())]).toEqual([15, 1.001]);
     // picking a preset leaves Custom
     fireEvent.change(select(), { target: { value: frameRateOption(25) } });
     expect(s.doc.getScene().fps).toBe(25);
     expect(label()).toBe('25 fps');
     expect(fps()).toBeNull();
+  });
+
+  it('shows a rate set elsewhere as the simplest FPS / Base pair that gives it', () => {
+    // regression: the pair was the nearest whole FPS and whatever Base gave the rate (12.5 → 13 / 1.04)
+    const pair = (rate: number) => frameRateParts(rate);
+    expect(pair(15)).toEqual({ fps: 15, base: 1 });
+    expect(pair(1000)).toEqual({ fps: 1000, base: 1 });
+    // fractions: the smallest whole Base
+    expect(pair(12.5)).toEqual({ fps: 25, base: 2 });
+    expect(pair(7.5)).toEqual({ fps: 15, base: 2 });
+    expect(pair(6.25)).toEqual({ fps: 25, base: 4 });
+    expect(pair(0.5)).toEqual({ fps: 1, base: 2 });
+    expect(pair(1 / 3)).toEqual({ fps: 1, base: 3 });
+    expect(pair(0.1)).toEqual({ fps: 1, base: 10 });
+    expect(pair(12.34)).toEqual({ fps: 617, base: 50 });
+    // NTSC rates: whole FPS / 1.001 like Blender's presets, also when written with fewer decimals
+    expect(pair(30000 / 1001)).toEqual({ fps: 30, base: 1.001 });
+    expect(pair(15 / 1.001)).toEqual({ fps: 15, base: 1.001 });
+    expect(pair(29.97)).toEqual({ fps: 30, base: 1.001 });
+    expect(pair(23.976)).toEqual({ fps: 24, base: 1.001 });
+    expect(pair(59.94)).toEqual({ fps: 60, base: 1.001 });
+    // anything else: the nearest whole FPS and the Base that gives the rate
+    const other = pair(4 * Math.PI);
+    expect(other.fps).toBe(13);
+    expect(other.fps / other.base).toBeCloseTo(4 * Math.PI, 12);
+    // every pair gives its rate (NTSC ones to the decimals they were written with)
+    for (const rate of [0.1, 1, 2.5, 6.25, 12.34, 14.985, 29.97, 47.952, 119.88, 999.9, 1000, 4 * Math.PI]) {
+      const p = pair(rate);
+      expect(Math.abs(p.fps / p.base - rate) / rate).toBeLessThan(2e-6);
+      expect(Number.isInteger(p.fps)).toBe(true);
+    }
+    // a pair typed in the editor stays as typed while it gives the rate
+    expect(frameRateParts(7.5, { fps: 30, base: 4 })).toEqual({ fps: 30, base: 4 });
+    expect(frameRateParts(8, { fps: 15, base: 2 })).toEqual({ fps: 8, base: 1 });
+    // nonsense rates show the default pair
+    expect(pair(0)).toEqual({ fps: 24, base: 1 });
+    expect(pair(Number.NaN)).toEqual({ fps: 24, base: 1 });
   });
 });
 

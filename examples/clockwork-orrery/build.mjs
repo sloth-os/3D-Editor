@@ -72,7 +72,8 @@ function parseArgs(argv) {
       console.log(USAGE);
       process.exit(0);
     } else if (a in MODES || a === '--stages') {
-      if (mode || stageList) usageError(`give one mode or --stages, not both (${mode ?? '--stages'} and ${a})`);
+      if (mode || stageList)
+        usageError(`give one mode or --stages, not both (${mode ?? '--stages'} and ${a})`);
       if (a === '--stages') {
         stageList = argv[++i];
         if (!stageList || stageList.startsWith('-')) usageError('--stages needs a comma-separated list');
@@ -85,7 +86,10 @@ function parseArgs(argv) {
   }
   const stages = (stageList ?? MODES[mode ?? '--final']).split(',').map((s) => s.trim());
   const unknown = stages.filter((s) => !STAGE_NAMES.includes(s));
-  if (unknown.length) usageError(`unknown stage(s) ${unknown.map((s) => `"${s}"`).join(', ')} (known: ${STAGE_NAMES.join(', ')})`);
+  if (unknown.length)
+    usageError(
+      `unknown stage(s) ${unknown.map((s) => `"${s}"`).join(', ')} (known: ${STAGE_NAMES.join(', ')})`,
+    );
   return { stages: new Set(['build', ...stages]), outDir: path.resolve(outDir ?? HERE) };
 }
 
@@ -144,10 +148,16 @@ async function op(operator, params = {}, selection) {
 
 /** batch → one undo step; the server fails the call if any operation fails. */
 async function batch(label, operations) {
-  const r = await call('batch', { operations: operations.map(([operator, params]) => ({ operator, params })) }, { quiet: true });
+  const r = await call(
+    'batch',
+    { operations: operations.map(([operator, params]) => ({ operator, params })) },
+    { quiet: true },
+  );
   const results = r.results ?? [];
   const failed = results.filter((x) => x && x.ok === false);
-  console.log(`  ✓ batch "${label}": ${operations.length} operators${failed.length ? `, ${failed.length} FAILED` : ''}`);
+  console.log(
+    `  ✓ batch "${label}": ${operations.length} operators${failed.length ? `, ${failed.length} FAILED` : ''}`,
+  );
   if (failed.length || r.ok === false) throw new Error(`batch ${label} failed: ${short(r, 2000)}`);
   results.forEach((x, i) => collectReports(operations[i][0], x?.reports));
   return results.map((x) => x?.result);
@@ -182,10 +192,38 @@ const SUN = { r: 0.075, z: 0.735 };
 // stay at least MIN_GAP apart (layoutPlanets): two arms can then never touch, at any angle.
 const PLANETS = [
   { key: 'Ember', R: 0.125, s: 0.02, h: 0.585, p: 0.655, n: 4, spin: 8, phase: 68 * DEG, material: 'Copper' },
-  { key: 'Azure', R: 0.185, s: 0.026, h: 0.525, p: 0.63, n: 3, spin: 6, phase: 138 * DEG, material: 'Azure Glaze' },
-  { key: 'Verdant', R: 0.285, s: 0.031, h: 0.46, p: 0.605, n: 2, spin: 4, phase: 8 * DEG, material: 'Verdant' },
   {
-    key: 'Titan', R: 0.445, s: 0.048, h: 0.39, p: 0.575, n: 1, spin: 3, phase: 228 * DEG, material: 'Banded Giant',
+    key: 'Azure',
+    R: 0.185,
+    s: 0.026,
+    h: 0.525,
+    p: 0.63,
+    n: 3,
+    spin: 6,
+    phase: 138 * DEG,
+    material: 'Azure Glaze',
+  },
+  {
+    key: 'Verdant',
+    R: 0.285,
+    s: 0.031,
+    h: 0.46,
+    p: 0.605,
+    n: 2,
+    spin: 4,
+    phase: 8 * DEG,
+    material: 'Verdant',
+  },
+  {
+    key: 'Titan',
+    R: 0.445,
+    s: 0.048,
+    h: 0.39,
+    p: 0.575,
+    n: 1,
+    spin: 3,
+    phase: 228 * DEG,
+    material: 'Banded Giant',
     ring: { major: 1.55, minor: 0.26, tilt: [22 * DEG, 8 * DEG, 0], flatten: 0.14 },
   },
 ];
@@ -194,6 +232,7 @@ const ARM = { barW: 0.014, barT: 0.006, collarR: 0.019, collarH: 0.016, postR: 0
 const MIN_GAP = 0.01; // radial gap between the swept annuli of neighbouring planet assemblies (m)
 const CLEARANCE = { planets: 0.005, gears: 0.0002 }; // smallest surface distance allowed in verifyClearance
 const LOOP = 48; // frames per master turn (frame 49 = frame 1)
+const FPS = 24;
 
 // Gear train on the deck: module (pitch diameter per tooth) and tooth depth shared by all gears so
 // they mesh. Pitch radius = MODULE·T/2, tip radius = pitch + DEPTH/2. `windows` = lightening holes;
@@ -218,10 +257,40 @@ const FOCUS = [0, -0.03, 0.335];
 const CAMERA = { location: [1.3, -2.47, 1.24], lens: 50, fstop: 4 };
 const LIGHTS = [
   // name, location, watts, colour, shape, size, size_y — rectangular soft boxes and a rim strip
-  { name: 'Key Light', location: [-1.25, -1.35, 1.65], energy: 280, color: [1, 0.8, 0.6], shape: 'RECTANGLE', size: 1.1, size_y: 0.7 },
-  { name: 'Fill Light', location: [1.7, -0.75, 0.8], energy: 65, color: [0.78, 0.86, 1], shape: 'DISK', size: 1.4 },
-  { name: 'Rim Light', location: [0.55, 1.65, 1.35], energy: 260, color: [1, 0.72, 0.45], shape: 'RECTANGLE', size: 1.5, size_y: 0.32 },
-  { name: 'Top Light', location: [0.0, 0.2, 2.2], energy: 55, color: [1, 0.92, 0.82], shape: 'DISK', size: 1.2 },
+  {
+    name: 'Key Light',
+    location: [-1.25, -1.35, 1.65],
+    energy: 280,
+    color: [1, 0.8, 0.6],
+    shape: 'RECTANGLE',
+    size: 1.1,
+    size_y: 0.7,
+  },
+  {
+    name: 'Fill Light',
+    location: [1.7, -0.75, 0.8],
+    energy: 65,
+    color: [0.78, 0.86, 1],
+    shape: 'DISK',
+    size: 1.4,
+  },
+  {
+    name: 'Rim Light',
+    location: [0.55, 1.65, 1.35],
+    energy: 260,
+    color: [1, 0.72, 0.45],
+    shape: 'RECTANGLE',
+    size: 1.5,
+    size_y: 0.32,
+  },
+  {
+    name: 'Top Light',
+    location: [0.0, 0.2, 2.2],
+    energy: 55,
+    color: [1, 0.92, 0.82],
+    shape: 'DISK',
+    size: 1.2,
+  },
 ];
 
 // ---------------------------------------------------------------------------------- gear maths
@@ -273,7 +342,8 @@ function layoutGears() {
         throw new Error(`gears ${g[i].name} and ${g[j].name} collide (${d.toFixed(4)} m)`);
     }
   for (const x of g) {
-    if (Math.hypot(x.x, x.y) + x.tip > DIAL.innerRing - 0.006) throw new Error(`gear ${x.name} runs into the dial ring`);
+    if (Math.hypot(x.x, x.y) + x.tip > DIAL.innerRing - 0.006)
+      throw new Error(`gear ${x.name} runs into the dial ring`);
     x.symmetry = gcd(x.T, x.windows ?? x.T); // rotational symmetry order of teeth + windows
     const turns = Math.abs(x.k); // turns per loop
     if (Math.abs(turns * x.symmetry - Math.round(turns * x.symmetry)) > 1e-9)
@@ -314,16 +384,22 @@ function layoutPlanets() {
   };
   if (heads[0].rIn - SUN.r < MIN_GAP) fail(`${heads[0].key} reaches the sun`);
   for (const [i, x] of heads.entries()) {
-    if (x.bottom < x.h + ARM.barT / 2 + MIN_GAP) fail(`${x.key} hangs down to its own arm (bottom ${x.bottom.toFixed(3)} m)`);
+    if (x.bottom < x.h + ARM.barT / 2 + MIN_GAP)
+      fail(`${x.key} hangs down to its own arm (bottom ${x.bottom.toFixed(3)} m)`);
     if (i === 0) continue;
     const inner = heads[i - 1];
     const gap = x.rIn - inner.rOut;
     if (gap < MIN_GAP)
-      fail(`${inner.key} (r ${inner.rIn.toFixed(3)}–${inner.rOut.toFixed(3)} m) and ${x.key} (r ${x.rIn.toFixed(3)}–${x.rOut.toFixed(3)} m) overlap or nearly do (gap ${gap.toFixed(4)} m)`);
-    if (inner.h - x.h < ARM.collarH + MIN_GAP) fail(`the arms of ${inner.key} and ${x.key} are too close in height`);
+      fail(
+        `${inner.key} (r ${inner.rIn.toFixed(3)}–${inner.rOut.toFixed(3)} m) and ${x.key} (r ${x.rIn.toFixed(3)}–${x.rOut.toFixed(3)} m) overlap or nearly do (gap ${gap.toFixed(4)} m)`,
+      );
+    if (inner.h - x.h < ARM.collarH + MIN_GAP)
+      fail(`the arms of ${inner.key} and ${x.key} are too close in height`);
   }
   for (const x of heads)
-    console.log(`    ${x.key.padEnd(8)} sweeps r ${x.rIn.toFixed(4)}–${x.rOut.toFixed(4)} m (z ≥ ${x.bottom.toFixed(3)} m above its arm at ${x.h} m)`);
+    console.log(
+      `    ${x.key.padEnd(8)} sweeps r ${x.rIn.toFixed(4)}–${x.rOut.toFixed(4)} m (z ≥ ${x.bottom.toFixed(3)} m above its arm at ${x.h} m)`,
+    );
   return heads;
 }
 
@@ -345,7 +421,7 @@ async function sceneSettings() {
   await call('set_scene_settings', {
     frame_start: 1,
     frame_end: LOOP,
-    fps: 24,
+    fps: FPS,
     frame_current: 1,
     resolution_x: 1280,
     resolution_y: 720,
@@ -394,59 +470,156 @@ async function materials() {
     ['material.update', { material: 'Azure Glaze', base_color: [0.025, 0.11, 0.42, 1] }],
     // dark marble: near-black stone with sparse warm-white veins. MARBLE factor 0 = vein; the ramp
     // ends at 0.26 with EASE, so everything outside the thin vein bands is the black colour_b.
-    ['material.procedural_set', {
-      material: 'Dark Marble',
-      channel: 'base_color',
-      replace: true,
-      procedural: {
-        type: 'MARBLE', mapping: 'OBJECT', scale: 3.8, distortion: 4.2, detail: 6, roughness: 0.55,
-        color_a: [0.44, 0.4, 0.33], color_b: [0.006, 0.0062, 0.0068], ramp_low: 0, ramp_high: 0.26,
-        params: { marble_type: 'SHARP', ramp_interpolation: 'EASE' },
+    [
+      'material.procedural_set',
+      {
+        material: 'Dark Marble',
+        channel: 'base_color',
+        replace: true,
+        procedural: {
+          type: 'MARBLE',
+          mapping: 'OBJECT',
+          scale: 3.8,
+          distortion: 4.2,
+          detail: 6,
+          roughness: 0.55,
+          color_a: [0.44, 0.4, 0.33],
+          color_b: [0.006, 0.0062, 0.0068],
+          ramp_low: 0,
+          ramp_high: 0.26,
+          params: { marble_type: 'SHARP', ramp_interpolation: 'EASE' },
+        },
       },
-    }],
+    ],
     ['material.update', { material: 'Dark Marble', roughness: 0.18, coat_weight: 0 }],
     // dark walnut for the plinth foot, oiled wood with growth rings and fibre streaks for the table
-    ['material.procedural_set', {
-      material: 'Dark Wood',
-      channel: 'base_color',
-      procedural: { color_a: [0.022, 0.009, 0.004], color_b: [0.075, 0.032, 0.014] },
-    }],
-    ['material.update', { material: 'Dark Wood', roughness: 0.38 }],
-    ['material.procedural_set', {
-      material: 'Table Wood',
-      channel: 'base_color',
-      replace: true,
-      procedural: {
-        type: 'WOOD', mapping: 'OBJECT', scale: 7, distortion: 1.4, detail: 4, roughness: 0.55,
-        color_a: [0.032, 0.014, 0.006], color_b: [0.095, 0.045, 0.019],
-        params: { wood_type: 'RINGS', grain: 0.7, offset_x: 0.35 },
+    [
+      'material.procedural_set',
+      {
+        material: 'Dark Wood',
+        channel: 'base_color',
+        procedural: { color_a: [0.022, 0.009, 0.004], color_b: [0.075, 0.032, 0.014] },
       },
-    }],
+    ],
+    ['material.update', { material: 'Dark Wood', roughness: 0.38 }],
+    [
+      'material.procedural_set',
+      {
+        material: 'Table Wood',
+        channel: 'base_color',
+        replace: true,
+        procedural: {
+          type: 'WOOD',
+          mapping: 'OBJECT',
+          scale: 7,
+          distortion: 1.4,
+          detail: 4,
+          roughness: 0.55,
+          color_a: [0.032, 0.014, 0.006],
+          color_b: [0.095, 0.045, 0.019],
+          params: { wood_type: 'RINGS', grain: 0.7, offset_x: 0.35 },
+        },
+      },
+    ],
     ['material.update', { material: 'Table Wood', roughness: 0.42 }],
-    ['material.new', { name: 'Blued Steel', assign: false, base_color: [0.07, 0.09, 0.16, 1], metallic: 1, roughness: 0.22 }],
-    ['material.new', { name: 'Black Enamel', assign: false, base_color: [0.006, 0.006, 0.007, 1], metallic: 0, roughness: 0.3 }],
-    ['material.new', { name: 'Midnight Enamel', assign: false, base_color: [0.003, 0.007, 0.03, 1], metallic: 0, roughness: 0.25, coat_weight: 0.5, coat_roughness: 0.08 }],
+    [
+      'material.new',
+      { name: 'Blued Steel', assign: false, base_color: [0.07, 0.09, 0.16, 1], metallic: 1, roughness: 0.22 },
+    ],
+    [
+      'material.new',
+      {
+        name: 'Black Enamel',
+        assign: false,
+        base_color: [0.006, 0.006, 0.007, 1],
+        metallic: 0,
+        roughness: 0.3,
+      },
+    ],
+    [
+      'material.new',
+      {
+        name: 'Midnight Enamel',
+        assign: false,
+        base_color: [0.003, 0.007, 0.03, 1],
+        metallic: 0,
+        roughness: 0.25,
+        coat_weight: 0.5,
+        coat_roughness: 0.08,
+      },
+    ],
     // the sun: a near-black diffuse base (so the studio lights do not wash it out) under a warm,
     // granulated procedural emission
-    ['material.new', { name: 'Sun', assign: false, base_color: [0.02, 0.008, 0.002, 1], emission_color: [1, 0.55, 0.15], emission_strength: 3.0, roughness: 0.6 }],
-    ['material.procedural_set', {
-      material: 'Sun',
-      channel: 'emission',
-      procedural: { type: 'NOISE', mapping: 'OBJECT', scale: 38, detail: 5, roughness: 0.55, color_a: [0.95, 0.16, 0.01], color_b: [1, 0.62, 0.16], ramp_low: 0.35, ramp_high: 0.68 },
-    }],
+    [
+      'material.new',
+      {
+        name: 'Sun',
+        assign: false,
+        base_color: [0.02, 0.008, 0.002, 1],
+        emission_color: [1, 0.55, 0.15],
+        emission_strength: 3.0,
+        roughness: 0.6,
+      },
+    ],
+    [
+      'material.procedural_set',
+      {
+        material: 'Sun',
+        channel: 'emission',
+        procedural: {
+          type: 'NOISE',
+          mapping: 'OBJECT',
+          scale: 38,
+          detail: 5,
+          roughness: 0.55,
+          color_a: [0.95, 0.16, 0.01],
+          color_b: [1, 0.62, 0.16],
+          ramp_low: 0.35,
+          ramp_high: 0.68,
+        },
+      },
+    ],
     // planets
     ['material.new', { name: 'Verdant', assign: false, base_color: [0.05, 0.2, 0.5, 1], roughness: 0.45 }],
-    ['material.procedural_set', {
-      material: 'Verdant',
-      channel: 'base_color',
-      procedural: { type: 'NOISE', mapping: 'OBJECT', scale: 34, detail: 6, roughness: 0.55, color_a: [0.012, 0.05, 0.2], color_b: [0.13, 0.24, 0.07], ramp_low: 0.49, ramp_high: 0.53 },
-    }],
-    ['material.new', { name: 'Banded Giant', assign: false, base_color: [0.8, 0.55, 0.3, 1], roughness: 0.55 }],
-    ['material.procedural_set', {
-      material: 'Banded Giant',
-      channel: 'base_color',
-      procedural: { type: 'WAVE', mapping: 'OBJECT', scale: 7, distortion: 3.5, detail: 3, color_a: [0.7, 0.45, 0.2], color_b: [0.2, 0.07, 0.025], params: { wave_type: 'BANDS', direction: 'Z' } },
-    }],
+    [
+      'material.procedural_set',
+      {
+        material: 'Verdant',
+        channel: 'base_color',
+        procedural: {
+          type: 'NOISE',
+          mapping: 'OBJECT',
+          scale: 34,
+          detail: 6,
+          roughness: 0.55,
+          color_a: [0.012, 0.05, 0.2],
+          color_b: [0.13, 0.24, 0.07],
+          ramp_low: 0.49,
+          ramp_high: 0.53,
+        },
+      },
+    ],
+    [
+      'material.new',
+      { name: 'Banded Giant', assign: false, base_color: [0.8, 0.55, 0.3, 1], roughness: 0.55 },
+    ],
+    [
+      'material.procedural_set',
+      {
+        material: 'Banded Giant',
+        channel: 'base_color',
+        procedural: {
+          type: 'WAVE',
+          mapping: 'OBJECT',
+          scale: 7,
+          distortion: 3.5,
+          detail: 3,
+          color_a: [0.7, 0.45, 0.2],
+          color_b: [0.2, 0.07, 0.025],
+          params: { wave_type: 'BANDS', direction: 'Z' },
+        },
+      },
+    ],
   ]);
 }
 
@@ -463,19 +636,72 @@ async function plinth() {
   // table top: rotated so the procedural wood rings run along world X (plank-like grain); 24 m wide
   // (X ±12) and 16 m deep (Y −1…15), so none of its edges enters the frame and the wood fades into
   // the dark (verifyFraming checks that the four image corners see the table top)
-  await op('mesh.primitive_cube_add', { size: 1, name: 'Table', location: [0, 7, -0.025], scale: [0.05, 16, 24], rotation: [0, Math.PI / 2, 0] });
-  await op('object.transform_apply', { location: false, rotation: false, scale: true }, { objects: ['Table'] });
+  await op('mesh.primitive_cube_add', {
+    size: 1,
+    name: 'Table',
+    location: [0, 7, -0.025],
+    scale: [0.05, 16, 24],
+    rotation: [0, Math.PI / 2, 0],
+  });
+  await op(
+    'object.transform_apply',
+    { location: false, rotation: false, scale: true },
+    { objects: ['Table'] },
+  );
   await assign('Table Wood', ['Table']);
 
-  await op('mesh.primitive_cylinder_add', { vertices: 8, radius: BASE.r, depth: BASE.h, name: 'Plinth Base', location: [0, 0, BASE.h / 2], rotation: [0, 0, Math.PI / 8] });
-  await op('mesh.primitive_cylinder_add', { vertices: 8, radius: PLINTH.r, depth: PLINTH.h, name: 'Plinth', location: [0, 0, PLINTH.z0 + PLINTH.h / 2], rotation: [0, 0, Math.PI / 8] });
-  await op('mesh.primitive_cylinder_add', { vertices: 96, radius: DECK.r, depth: DECK.t, name: 'Deck', location: [0, 0, PLINTH_TOP + DECK.t / 2] });
+  await op('mesh.primitive_cylinder_add', {
+    vertices: 8,
+    radius: BASE.r,
+    depth: BASE.h,
+    name: 'Plinth Base',
+    location: [0, 0, BASE.h / 2],
+    rotation: [0, 0, Math.PI / 8],
+  });
+  await op('mesh.primitive_cylinder_add', {
+    vertices: 8,
+    radius: PLINTH.r,
+    depth: PLINTH.h,
+    name: 'Plinth',
+    location: [0, 0, PLINTH.z0 + PLINTH.h / 2],
+    rotation: [0, 0, Math.PI / 8],
+  });
+  await op('mesh.primitive_cylinder_add', {
+    vertices: 96,
+    radius: DECK.r,
+    depth: DECK.t,
+    name: 'Deck',
+    location: [0, 0, PLINTH_TOP + DECK.t / 2],
+  });
   // a thin gilt moulding where the marble meets the wood
-  await op('mesh.primitive_cylinder_add', { vertices: 8, radius: PLINTH.r + 0.008, depth: 0.012, name: 'Moulding', location: [0, 0, PLINTH.z0 + 0.006], rotation: [0, 0, Math.PI / 8] });
-  await call('add_modifier', { object: 'Plinth Base', type: 'BEVEL', params: { width: 0.012, segments: 3, limit_method: 'ANGLE' } });
-  await call('add_modifier', { object: 'Plinth', type: 'BEVEL', params: { width: 0.007, segments: 3, limit_method: 'ANGLE' } });
-  await call('add_modifier', { object: 'Deck', type: 'BEVEL', params: { width: 0.0025, segments: 2, limit_method: 'ANGLE' } });
-  await call('add_modifier', { object: 'Moulding', type: 'BEVEL', params: { width: 0.004, segments: 2, limit_method: 'ANGLE' } });
+  await op('mesh.primitive_cylinder_add', {
+    vertices: 8,
+    radius: PLINTH.r + 0.008,
+    depth: 0.012,
+    name: 'Moulding',
+    location: [0, 0, PLINTH.z0 + 0.006],
+    rotation: [0, 0, Math.PI / 8],
+  });
+  await call('add_modifier', {
+    object: 'Plinth Base',
+    type: 'BEVEL',
+    params: { width: 0.012, segments: 3, limit_method: 'ANGLE' },
+  });
+  await call('add_modifier', {
+    object: 'Plinth',
+    type: 'BEVEL',
+    params: { width: 0.007, segments: 3, limit_method: 'ANGLE' },
+  });
+  await call('add_modifier', {
+    object: 'Deck',
+    type: 'BEVEL',
+    params: { width: 0.0025, segments: 2, limit_method: 'ANGLE' },
+  });
+  await call('add_modifier', {
+    object: 'Moulding',
+    type: 'BEVEL',
+    params: { width: 0.004, segments: 2, limit_method: 'ANGLE' },
+  });
   await assign('Dark Wood', ['Plinth Base']);
   await assign('Dark Marble', ['Plinth']);
   await assign('Midnight Enamel', ['Deck']);
@@ -486,8 +712,24 @@ async function plinth() {
 async function dial() {
   // gilt chapter rings and twelve Roman numerals around the enamelled deck, like a clock dial
   const z = DECK_TOP + 0.0006;
-  await op('mesh.primitive_torus_add', { major_radius: DIAL.innerRing, minor_radius: 0.0016, major_segments: 160, minor_segments: 8, name: 'Chapter Ring', location: [0, 0, z], scale: [1, 1, 0.5] });
-  await op('mesh.primitive_torus_add', { major_radius: DIAL.outerRing, minor_radius: 0.0026, major_segments: 160, minor_segments: 10, name: 'Dial Rim', location: [0, 0, DECK_TOP], scale: [1, 1, 0.8] });
+  await op('mesh.primitive_torus_add', {
+    major_radius: DIAL.innerRing,
+    minor_radius: 0.0016,
+    major_segments: 160,
+    minor_segments: 8,
+    name: 'Chapter Ring',
+    location: [0, 0, z],
+    scale: [1, 1, 0.5],
+  });
+  await op('mesh.primitive_torus_add', {
+    major_radius: DIAL.outerRing,
+    minor_radius: 0.0026,
+    major_segments: 160,
+    minor_segments: 10,
+    name: 'Dial Rim',
+    location: [0, 0, DECK_TOP],
+    scale: [1, 1, 0.8],
+  });
   await op('object.shade_smooth', {}, { objects: ['Chapter Ring', 'Dial Rim'] });
   const numerals = ['XII', 'I', 'II', 'III', 'IIII', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI'];
   const names = [];
@@ -496,29 +738,59 @@ async function dial() {
     const name = `Numeral ${body}`;
     // text lies in XY facing +Z; rotate so the letters' up points away from the centre
     await op('object.text_add', {
-      body, size: DIAL.size, align_x: 'CENTER', align_y: 'CENTER', extrude: 0.0006, name,
+      body,
+      size: DIAL.size,
+      align_x: 'CENTER',
+      align_y: 'CENTER',
+      extrude: 0.0006,
+      name,
       location: [r4(DIAL.numeralR * Math.cos(theta)), r4(DIAL.numeralR * Math.sin(theta)), z + 0.0006],
       rotation: [0, 0, r4(theta - Math.PI / 2)],
     });
     names.push(name);
   }
-  await op('object.material_assign', { material: 'Gilt', objects: ['Chapter Ring', 'Dial Rim', ...names], slot: 0 });
+  await op('object.material_assign', {
+    material: 'Gilt',
+    objects: ['Chapter Ring', 'Dial Rim', ...names],
+    slot: 0,
+  });
 }
 
 async function textPlate() {
   const faceY = -APOTHEM; // front face of the marble octagon
   const plate = { w: 0.3, h: 0.096, t: 0.006, z: PLINTH.z0 + PLINTH.h / 2 };
   const plateFront = faceY - plate.t;
-  await op('mesh.primitive_cube_add', { size: 1, name: 'Motto Plate', location: [0, faceY - plate.t / 2, plate.z], scale: [plate.w, plate.t, plate.h] });
-  await op('object.transform_apply', { location: false, rotation: false, scale: true }, { objects: ['Motto Plate'] });
-  await call('add_modifier', { object: 'Motto Plate', type: 'BEVEL', params: { width: 0.0018, segments: 2, limit_method: 'ANGLE' } });
+  await op('mesh.primitive_cube_add', {
+    size: 1,
+    name: 'Motto Plate',
+    location: [0, faceY - plate.t / 2, plate.z],
+    scale: [plate.w, plate.t, plate.h],
+  });
+  await op(
+    'object.transform_apply',
+    { location: false, rotation: false, scale: true },
+    { objects: ['Motto Plate'] },
+  );
+  await call('add_modifier', {
+    object: 'Motto Plate',
+    type: 'BEVEL',
+    params: { width: 0.0018, segments: 2, limit_method: 'ANGLE' },
+  });
   await assign('Plate Brass', ['Motto Plate']);
 
   // the motto as real text, sized from the measured layout so it fits the plate with a margin
   const extrude = 0.002;
   let t = await op('object.text_add', {
-    body: MOTTO, size: 0.032, align_x: 'CENTER', align_y: 'CENTER', extrude, space_character: 1.2, space_line: 1.3,
-    name: 'Motto', location: [0, plateFront, plate.z], rotation: [Math.PI / 2, 0, 0],
+    body: MOTTO,
+    size: 0.032,
+    align_x: 'CENTER',
+    align_y: 'CENTER',
+    extrude,
+    space_character: 1.2,
+    space_line: 1.3,
+    name: 'Motto',
+    location: [0, plateFront, plate.z],
+    rotation: [Math.PI / 2, 0, 0],
   });
   const maxWidth = plate.w - 0.06;
   if (t.width > maxWidth || t.height > plate.h - 0.03) {
@@ -528,17 +800,37 @@ async function textPlate() {
   }
   // engrave: bake the text to a mesh and subtract it (2 mm deep) from the plate
   await op('object.convert', { target: 'MESH', keep_original: false }, { objects: ['Motto'] });
-  await call('add_modifier', { object: 'Motto Plate', name: 'Engraving', type: 'BOOLEAN', params: { operation: 'DIFFERENCE', object: 'Motto' } });
+  await call('add_modifier', {
+    object: 'Motto Plate',
+    name: 'Engraving',
+    type: 'BOOLEAN',
+    params: { operation: 'DIFFERENCE', object: 'Motto' },
+  });
   // black wax filling the engraving, 0.6 mm below the plate surface
   await call('duplicate_object', { object: 'Motto', name: 'Motto Fill', offset: [0, extrude + 0.0006, 0] });
-  await op('data.set_property', { kind: 'objects', target: 'Motto', values: { hide_render: true, hide_viewport: true } });
-  await op('data.set_property', { kind: 'objects', target: 'Motto Fill', values: { hide_render: false, hide_viewport: false } });
+  await op('data.set_property', {
+    kind: 'objects',
+    target: 'Motto',
+    values: { hide_render: true, hide_viewport: true },
+  });
+  await op('data.set_property', {
+    kind: 'objects',
+    target: 'Motto Fill',
+    values: { hide_render: false, hide_viewport: false },
+  });
   await assign('Black Enamel', ['Motto Fill']);
   // two domed screws
   const screws = [];
   for (const [i, sx] of [-1, 1].entries()) {
     const name = `Plate Screw ${i + 1}`;
-    await op('mesh.primitive_uv_sphere_add', { segments: 16, ring_count: 8, radius: 0.0055, name, location: [sx * (plate.w / 2 - 0.012), plateFront, plate.z], scale: [1, 0.45, 1] });
+    await op('mesh.primitive_uv_sphere_add', {
+      segments: 16,
+      ring_count: 8,
+      radius: 0.0055,
+      name,
+      location: [sx * (plate.w / 2 - 0.012), plateFront, plate.z],
+      scale: [1, 0.45, 1],
+    });
     screws.push(name);
   }
   await op('object.shade_smooth', {}, { objects: screws });
@@ -551,10 +843,19 @@ async function gearTrain() {
   const g = layoutGears();
   for (const x of g) {
     const res = await op('object.generate_gear', {
-      teeth: x.T, radius: r4(x.tip), tooth_depth: DEPTH, thickness: GEAR_T, bore: x.bore,
-      name: x.name, location: [r4(x.x), r4(x.y), GEAR_Z], rotation: [0, 0, x.phase], materials: false,
+      teeth: x.T,
+      radius: r4(x.tip),
+      tooth_depth: DEPTH,
+      thickness: GEAR_T,
+      bore: x.bore,
+      name: x.name,
+      location: [r4(x.x), r4(x.y), GEAR_Z],
+      rotation: [0, 0, x.phase],
+      materials: false,
     });
-    console.log(`    ${x.name}: T=${x.T} tip r=${x.tip.toFixed(4)} at (${x.x.toFixed(4)}, ${x.y.toFixed(4)}) phase ${(x.phase / DEG).toFixed(2)}° ratio ${x.k.toFixed(4)} → ${res.vertices} verts`);
+    console.log(
+      `    ${x.name}: T=${x.T} tip r=${x.tip.toFixed(4)} at (${x.x.toFixed(4)}, ${x.y.toFixed(4)}) phase ${(x.phase / DEG).toFixed(2)}° ratio ${x.k.toFixed(4)} → ${res.vertices} verts`,
+    );
     // lightening windows cut with a boolean and applied; spaced evenly so the gear keeps a
     // rotational symmetry of gcd(teeth, windows)
     if (x.windows) {
@@ -566,11 +867,22 @@ async function gearTrain() {
       for (let s = 0; s < x.windows; s++) {
         const a = x.phase + Math.PI / x.windows + (s * TAU) / x.windows;
         const name = `${x.name} Cutter ${s + 1}`;
-        await op('mesh.primitive_cylinder_add', { vertices: 32, radius: hole, depth: GEAR_T * 3, name, location: [x.x + rc * Math.cos(a), x.y + rc * Math.sin(a), GEAR_Z] });
+        await op('mesh.primitive_cylinder_add', {
+          vertices: 32,
+          radius: hole,
+          depth: GEAR_T * 3,
+          name,
+          location: [x.x + rc * Math.cos(a), x.y + rc * Math.sin(a), GEAR_Z],
+        });
         cutters.push(name);
       }
       await op('object.join', {}, { objects: cutters, active: cutters[0] });
-      await call('add_modifier', { object: x.name, name: 'Windows', type: 'BOOLEAN', params: { operation: 'DIFFERENCE', object: cutters[0] } });
+      await call('add_modifier', {
+        object: x.name,
+        name: 'Windows',
+        type: 'BOOLEAN',
+        params: { operation: 'DIFFERENCE', object: cutters[0] },
+      });
       await call('apply_modifier', { object: x.name, modifier: 'Windows' });
       await call('delete_objects', { objects: [cutters[0]] });
     }
@@ -578,8 +890,21 @@ async function gearTrain() {
     await autoSmooth([x.name], 30 * DEG);
     // arbor: blued steel pin with a domed cap (the great wheel sits on the spindle instead)
     if (x !== g[0]) {
-      await op('mesh.primitive_cylinder_add', { vertices: 24, radius: 0.0075, depth: GEAR_T + 0.016, name: `${x.name} Arbor`, location: [x.x, x.y, DECK_TOP + (GEAR_T + 0.016) / 2] });
-      await op('mesh.primitive_uv_sphere_add', { segments: 24, ring_count: 12, radius: 0.0095, name: `${x.name} Cap`, location: [x.x, x.y, DECK_TOP + GEAR_T + 0.016], scale: [1, 1, 0.55] });
+      await op('mesh.primitive_cylinder_add', {
+        vertices: 24,
+        radius: 0.0075,
+        depth: GEAR_T + 0.016,
+        name: `${x.name} Arbor`,
+        location: [x.x, x.y, DECK_TOP + (GEAR_T + 0.016) / 2],
+      });
+      await op('mesh.primitive_uv_sphere_add', {
+        segments: 24,
+        ring_count: 12,
+        radius: 0.0095,
+        name: `${x.name} Cap`,
+        location: [x.x, x.y, DECK_TOP + GEAR_T + 0.016],
+        scale: [1, 1, 0.55],
+      });
       await assign('Blued Steel', [`${x.name} Arbor`, `${x.name} Cap`]);
       await autoSmooth([`${x.name} Arbor`]);
       await op('object.shade_smooth', {}, { objects: [`${x.name} Cap`] });
@@ -590,11 +915,36 @@ async function gearTrain() {
 
 async function sunAndSpindle() {
   const len = SPINDLE.top - DECK_TOP;
-  await op('mesh.primitive_cylinder_add', { vertices: 32, radius: SPINDLE.r, depth: len, name: 'Spindle', location: [0, 0, DECK_TOP + len / 2] });
+  await op('mesh.primitive_cylinder_add', {
+    vertices: 32,
+    radius: SPINDLE.r,
+    depth: len,
+    name: 'Spindle',
+    location: [0, 0, DECK_TOP + len / 2],
+  });
   // hub where the spindle meets the great wheel, and a gilt cup holding the sun
-  await op('mesh.primitive_cylinder_add', { vertices: 48, radius: 0.026, depth: 0.022, name: 'Hub', location: [0, 0, GEAR_Z + GEAR_T / 2 + 0.011] });
-  await op('mesh.primitive_cone_add', { vertices: 48, radius1: 0.014, radius2: 0.04, depth: 0.05, name: 'Sun Cup', location: [0, 0, SUN.z - SUN.r * 0.62 - 0.012] });
-  await op('mesh.primitive_uv_sphere_add', { segments: 64, ring_count: 32, radius: SUN.r, name: 'Sun', location: [0, 0, SUN.z] });
+  await op('mesh.primitive_cylinder_add', {
+    vertices: 48,
+    radius: 0.026,
+    depth: 0.022,
+    name: 'Hub',
+    location: [0, 0, GEAR_Z + GEAR_T / 2 + 0.011],
+  });
+  await op('mesh.primitive_cone_add', {
+    vertices: 48,
+    radius1: 0.014,
+    radius2: 0.04,
+    depth: 0.05,
+    name: 'Sun Cup',
+    location: [0, 0, SUN.z - SUN.r * 0.62 - 0.012],
+  });
+  await op('mesh.primitive_uv_sphere_add', {
+    segments: 64,
+    ring_count: 32,
+    radius: SUN.r,
+    name: 'Sun',
+    location: [0, 0, SUN.z],
+  });
   await assign('Brass', ['Spindle', 'Hub']);
   await assign('Gilt', ['Sun Cup']);
   await assign('Sun', ['Sun']);
@@ -602,7 +952,14 @@ async function sunAndSpindle() {
   await op('object.shade_smooth', {}, { objects: ['Sun'] });
   // a warm lamp inside the sun (radius just larger than the sphere, so it shines out of it) lights
   // the planets' sun-facing sides like the lamp of a real orrery; lights are invisible to the camera
-  await op('object.light_add', { type: 'POINT', name: 'Sun Lamp', location: [0, 0, SUN.z], energy: 40, color: [1, 0.62, 0.3], shadow_soft_size: SUN.r + 0.01 });
+  await op('object.light_add', {
+    type: 'POINT',
+    name: 'Sun Lamp',
+    location: [0, 0, SUN.z],
+    energy: 40,
+    color: [1, 0.62, 0.3],
+    shadow_soft_size: SUN.r + 0.01,
+  });
 }
 
 async function planetArms() {
@@ -612,19 +969,61 @@ async function planetArms() {
     await call('add_object', { type: 'empty', name: pivot, location: [0, 0, P.h], params: { radius: 0.05 } });
     // arm = collar on the spindle + flat bar + upright post + cup, joined into one mesh
     const barLen = P.R + 0.004;
-    await op('mesh.primitive_cube_add', { size: 1, name: arm, location: [barLen / 2, 0, P.h], scale: [barLen, ARM.barW, ARM.barT] });
+    await op('mesh.primitive_cube_add', {
+      size: 1,
+      name: arm,
+      location: [barLen / 2, 0, P.h],
+      scale: [barLen, ARM.barW, ARM.barT],
+    });
     await op('object.transform_apply', { location: false, rotation: false, scale: true }, { objects: [arm] });
     const parts = [
-      ['mesh.primitive_cylinder_add', { vertices: 40, radius: ARM.collarR, depth: ARM.collarH, name: `${arm} Collar`, location: [0, 0, P.h] }],
-      ['mesh.primitive_cylinder_add', { vertices: 24, radius: ARM.postR, depth: P.p - P.h - P.s * 0.6, name: `${arm} Post`, location: [P.R, 0, P.h + (P.p - P.h - P.s * 0.6) / 2] }],
-      ['mesh.primitive_cylinder_add', { vertices: 32, radius: 0.0065, depth: 0.004, name: `${arm} Boss`, location: [P.R, 0, P.h + 0.0042] }],
-      ['mesh.primitive_cone_add', { vertices: 32, radius1: 0.0034, radius2: P.s * 0.5, depth: P.s * 0.42, name: `${arm} Cup`, location: [P.R, 0, P.p - P.s * 0.72] }],
+      [
+        'mesh.primitive_cylinder_add',
+        {
+          vertices: 40,
+          radius: ARM.collarR,
+          depth: ARM.collarH,
+          name: `${arm} Collar`,
+          location: [0, 0, P.h],
+        },
+      ],
+      [
+        'mesh.primitive_cylinder_add',
+        {
+          vertices: 24,
+          radius: ARM.postR,
+          depth: P.p - P.h - P.s * 0.6,
+          name: `${arm} Post`,
+          location: [P.R, 0, P.h + (P.p - P.h - P.s * 0.6) / 2],
+        },
+      ],
+      [
+        'mesh.primitive_cylinder_add',
+        { vertices: 32, radius: 0.0065, depth: 0.004, name: `${arm} Boss`, location: [P.R, 0, P.h + 0.0042] },
+      ],
+      [
+        'mesh.primitive_cone_add',
+        {
+          vertices: 32,
+          radius1: 0.0034,
+          radius2: P.s * 0.5,
+          depth: P.s * 0.42,
+          name: `${arm} Cup`,
+          location: [P.R, 0, P.p - P.s * 0.72],
+        },
+      ],
     ];
     await batch(`${P.key} arm parts`, parts);
     await op('object.join', {}, { objects: [arm, ...parts.map((p) => p[1].name)], active: arm });
     await assign('Polished Brass', [arm]);
     await autoSmooth([arm]);
-    await op('mesh.primitive_uv_sphere_add', { segments: 48, ring_count: 24, radius: P.s, name: P.key, location: [P.R, 0, P.p] });
+    await op('mesh.primitive_uv_sphere_add', {
+      segments: 48,
+      ring_count: 24,
+      radius: P.s,
+      name: P.key,
+      location: [P.R, 0, P.p],
+    });
     await op('object.shade_smooth', {}, { objects: [P.key] });
     await assign(P.material, [P.key]);
     const children = [arm, P.key];
@@ -632,8 +1031,14 @@ async function planetArms() {
       // a flat gilt ring around the giant (on the arm, so it orbits but does not spin)
       const ring = `${P.key} Ring`;
       await op('mesh.primitive_torus_add', {
-        major_radius: P.s * P.ring.major, minor_radius: P.s * P.ring.minor, major_segments: 72, minor_segments: 16,
-        name: ring, location: [P.R, 0, P.p], rotation: P.ring.tilt, scale: [1, 1, P.ring.flatten],
+        major_radius: P.s * P.ring.major,
+        minor_radius: P.s * P.ring.minor,
+        major_segments: 72,
+        minor_segments: 16,
+        name: ring,
+        location: [P.R, 0, P.p],
+        rotation: P.ring.tilt,
+        scale: [1, 1, P.ring.flatten],
       });
       await op('object.shade_smooth', {}, { objects: [ring] });
       await assign('Gilt', [ring]);
@@ -642,8 +1047,13 @@ async function planetArms() {
     if (P.key === MOON.planet) {
       // the moon's orbit: a thin brass Bezier circle around the planet; the moon follows it
       await op('curve.primitive_bezier_circle_add', {
-        radius: MOON.orbit, name: 'Moon Orbit', location: [P.R, 0, P.p], rotation: [MOON.tilt, 0, 0],
-        bevel_depth: 0.0011, bevel_resolution: 3, resolution_u: 24,
+        radius: MOON.orbit,
+        name: 'Moon Orbit',
+        location: [P.R, 0, P.p],
+        rotation: [MOON.tilt, 0, 0],
+        bevel_depth: 0.0011,
+        bevel_resolution: 3,
+        resolution_u: 24,
       });
       await op('curve.switch_direction', { object: 'Moon Orbit' }, { objects: ['Moon Orbit'] }); // prograde (counter-clockwise)
       await op('object.material_assign', { material: 'Polished Brass', objects: ['Moon Orbit'], slot: 0 });
@@ -652,12 +1062,23 @@ async function planetArms() {
     await call('set_parent', { objects: children, parent: pivot });
   }
   // the moon itself (unparented; Follow Path carries it along the orbit, which rides on the arm)
-  await op('mesh.primitive_uv_sphere_add', { segments: 32, ring_count: 16, radius: MOON.r, name: 'Moon', location: [0, 0, 0] });
+  await op('mesh.primitive_uv_sphere_add', {
+    segments: 32,
+    ring_count: 16,
+    radius: MOON.r,
+    name: 'Moon',
+    location: [0, 0, 0],
+  });
   await op('object.shade_smooth', {}, { objects: ['Moon'] });
   await assign('Moon Silver', ['Moon']);
   const c = await op('object.constraint_add', { object: 'Moon', type: 'FOLLOW_PATH', target: 'Moon Orbit' });
   if (c.errors?.length) throw new Error(`Follow Path errors: ${short(c.errors)}`);
-  const anim = await op('constraint.followpath_path_animate', { object: 'Moon', constraint: c.name, frame_start: 1, length: MOON.framesPerOrbit });
+  const anim = await op('constraint.followpath_path_animate', {
+    object: 'Moon',
+    constraint: c.name,
+    frame_start: 1,
+    length: MOON.framesPerOrbit,
+  });
   console.log(`    moon path animation: ${short(anim)}`);
 }
 
@@ -670,7 +1091,13 @@ function drivenParts(gears) {
   }
   // a simple gear train: gear i turns T_great/T_i as fast as the great wheel, the sign alternating
   for (const x of gears)
-    parts.push({ object: x.name, phase: r4(x.phase), k: x.k, kExpr: x === gears[0] ? '1' : `${gears[0].T}/${x.T}`, symmetry: x.symmetry });
+    parts.push({
+      object: x.name,
+      phase: r4(x.phase),
+      k: x.k,
+      kExpr: x === gears[0] ? '1' : `${gears[0].T}/${x.T}`,
+      symmetry: x.symmetry,
+    });
   parts.push({ object: 'Hub', phase: 0, k: 1, kExpr: '1', symmetry: 1 });
   parts.push({ object: 'Sun', phase: 0, k: -1, kExpr: '1', symmetry: 1 });
   return parts;
@@ -685,17 +1112,35 @@ function driverExpression({ phase, k, kExpr }) {
 
 async function mechanism(gears) {
   // ONE master channel
-  await call('add_object', { type: 'empty', name: 'Master Drive', location: [0, 0, 0.1], params: { radius: 0.1 } });
-  const keys = await op('anim.keyframes_insert_many', {
-    target: 'Master Drive', path: 'rotation_euler', index: 2, frames: [1, LOOP + 1], values: [0, TAU], interpolation: 'LINEAR',
+  await call('add_object', {
+    type: 'empty',
+    name: 'Master Drive',
+    location: [0, 0, 0.1],
+    params: { radius: 0.1 },
   });
-  const ex = await op('anim.extrapolation_set', { objects: ['Master Drive'], type: 'CYCLIC', path: 'rotation_euler', index: 2 });
+  const keys = await op('anim.keyframes_insert_many', {
+    target: 'Master Drive',
+    path: 'rotation_euler',
+    index: 2,
+    frames: [1, LOOP + 1],
+    values: [0, TAU],
+    interpolation: 'LINEAR',
+  });
+  const ex = await op('anim.extrapolation_set', {
+    objects: ['Master Drive'],
+    type: 'CYCLIC',
+    path: 'rotation_euler',
+    index: 2,
+  });
   console.log(`    master: ${short(keys)}; extrapolation ${short(ex)}`);
   const v = [{ name: 'm', target: 'Master Drive', path: 'rotation_euler', index: 2 }];
   const drivers = drivenParts(gears).map((part) => {
     const expression = driverExpression(part);
     console.log(`    ${part.object.padEnd(14)} θ = ${expression}`);
-    return ['anim.driver_add', { target: part.object, path: 'rotation_euler', index: 2, expression, variables: v }];
+    return [
+      'anim.driver_add',
+      { target: part.object, path: 'rotation_euler', index: 2, expression, variables: v },
+    ];
   });
   const res = await batch('drivers', drivers);
   const bad = res.flatMap((r) => r?.drivers ?? []).filter((d) => d.error);
@@ -711,12 +1156,25 @@ async function lightsAndCamera() {
   }
   await op('object.track_set', { type: 'TRACKTO', target: 'Focus', objects: LIGHTS.map((l) => l.name) });
   // a low kicker that grazes the plinth front so the engraved plate reads
-  await op('object.light_add', { type: 'AREA', name: 'Plate Kicker', location: [-0.35, -1.45, 0.3], energy: 22, color: [1, 0.85, 0.7], shape: 'RECTANGLE', size: 0.5, size_y: 0.2 });
+  await op('object.light_add', {
+    type: 'AREA',
+    name: 'Plate Kicker',
+    location: [-0.35, -1.45, 0.3],
+    energy: 22,
+    color: [1, 0.85, 0.7],
+    shape: 'RECTANGLE',
+    size: 0.5,
+    size_y: 0.2,
+  });
   await op('object.track_set', { type: 'TRACKTO', target: 'Motto Plate', objects: ['Plate Kicker'] });
   // camera with depth of field focused on the Focus empty (middle of the planet ring) at every frame
   await op('object.camera_add', {
-    name: 'Camera', location: CAMERA.location, lens: CAMERA.lens,
-    dof_use: true, dof_focus_object: 'Focus', dof_aperture_fstop: CAMERA.fstop,
+    name: 'Camera',
+    location: CAMERA.location,
+    lens: CAMERA.lens,
+    dof_use: true,
+    dof_focus_object: 'Focus',
+    dof_aperture_fstop: CAMERA.fstop,
   });
   await op('object.track_set', { type: 'TRACKTO', target: 'Focus', objects: ['Camera'] });
   await call('set_active_camera', { camera: 'Camera' });
@@ -747,7 +1205,9 @@ async function verifyMotion(gears) {
   const parts = drivenParts(gears);
   const angle = {}; // object → frame → evaluated rotation Z
   const errors = [];
-  const check = (cond, msg) => { if (!cond) errors.push(msg); };
+  const check = (cond, msg) => {
+    if (!cond) errors.push(msg);
+  };
   for (const part of parts) {
     angle[part.object] = {};
     for (const f of frames) {
@@ -757,11 +1217,18 @@ async function verifyMotion(gears) {
       const want = part.phase + part.k * master(f);
       check(Math.abs(z - want) < 2e-3, `${part.object} f${f}: rotation ${z.toFixed(4)} ≠ ${want.toFixed(4)}`);
       // the driver overrides the document value, which get_object lists as `stored`
-      if (f === 13) check(Array.isArray(o.stored?.rotation_euler), `${part.object}: no stored rotation reported next to the driven one`);
+      if (f === 13)
+        check(
+          Array.isArray(o.stored?.rotation_euler),
+          `${part.object}: no stored rotation reported next to the driven one`,
+        );
     }
     // seamless loop: the turn over 48 frames is a multiple of the part's visual symmetry
     const turns = (angle[part.object][LOOP + 1] - angle[part.object][1]) / TAU;
-    check(Math.abs(turns * part.symmetry - Math.round(turns * part.symmetry)) < 1e-3, `${part.object} turns ${turns} per loop: seam`);
+    check(
+      Math.abs(turns * part.symmetry - Math.round(turns * part.symmetry)) < 1e-3,
+      `${part.object} turns ${turns} per loop: seam`,
+    );
   }
   // meshing pairs: opposite senses, speed ratio teeth_A / teeth_B
   const pairs = [];
@@ -773,7 +1240,10 @@ async function verifyMotion(gears) {
       const ratio = dB / dA;
       check(Math.sign(dA) === -Math.sign(dB), `${A.name}/${B.name} turn the same way`);
       check(Math.abs(ratio + A.T / B.T) < 1e-3, `${A.name}/${B.name} ratio ${ratio} ≠ −${A.T}/${B.T}`);
-      if (f === 13) pairs.push(`${A.name} ${A.T}T → ${B.name} ${B.T}T: Δθ ${dA.toFixed(3)} → ${dB.toFixed(3)} rad (ratio ${ratio.toFixed(4)} = −${A.T}/${B.T})`);
+      if (f === 13)
+        pairs.push(
+          `${A.name} ${A.T}T → ${B.name} ${B.T}T: Δθ ${dA.toFixed(3)} → ${dB.toFixed(3)} rad (ratio ${ratio.toFixed(4)} = −${A.T}/${B.T})`,
+        );
     }
   }
   // planets stay on their orbits (world position at radius R from the spindle)
@@ -794,13 +1264,19 @@ async function verifyMotion(gears) {
     const p = await call('get_object', { object: MOON.planet, frame: f }, { quiet: true });
     const rel = m.world_location.map((x, i) => x - p.world_location[i]);
     const pivot = `${MOON.planet} Pivot`;
-    const a = -(angle[pivot][f] ?? (await call('get_object', { object: pivot, frame: f }, { quiet: true })).rotation_euler[2]);
+    const a = -(
+      angle[pivot][f] ??
+      (await call('get_object', { object: pivot, frame: f }, { quiet: true })).rotation_euler[2]
+    );
     const ax = rel[0] * Math.cos(a) - rel[1] * Math.sin(a);
     const ay = rel[0] * Math.sin(a) + rel[1] * Math.cos(a);
     const oy = ay * Math.cos(MOON.tilt) + rel[2] * Math.sin(MOON.tilt); // undo the orbit's tilt about the arm
     const oz = -ay * Math.sin(MOON.tilt) + rel[2] * Math.cos(MOON.tilt);
     const d = Math.hypot(...rel);
-    check(Math.abs(d - MOON.orbit) < 1.5e-3, `Moon f${f}: ${d.toFixed(4)} m from ${MOON.planet} ≠ ${MOON.orbit}`);
+    check(
+      Math.abs(d - MOON.orbit) < 1.5e-3,
+      `Moon f${f}: ${d.toFixed(4)} m from ${MOON.planet} ≠ ${MOON.orbit}`,
+    );
     check(Math.abs(oz) < 1e-3, `Moon f${f}: ${oz.toFixed(4)} m off its orbit plane`);
     moonAngle[f] = Math.atan2(oy, ax);
   }
@@ -810,17 +1286,35 @@ async function verifyMotion(gears) {
     const got = mod(moonAngle[f] - moonAngle[1], TAU);
     const err = Math.min(Math.abs(got - want), TAU - Math.abs(got - want));
     const shown = got > TAU - 1e-3 ? got - TAU : got; // 359.99° → −0.01°
-    check(err < 1.5 * DEG, `Moon f${f}: ${(shown / DEG).toFixed(1)}° along its orbit since frame 1 ≠ ${(want / DEG).toFixed(1)}°`);
+    check(
+      err < 1.5 * DEG,
+      `Moon f${f}: ${(shown / DEG).toFixed(1)}° along its orbit since frame 1 ≠ ${(want / DEG).toFixed(1)}°`,
+    );
     const orbits = (f - 1) / MOON.framesPerOrbit;
-    moonSteps.push(`f${f} ${(shown / DEG).toFixed(1)}°${Number.isInteger(orbits) ? ` (${orbits} orbit${orbits > 1 ? 's' : ''})` : ''}`);
+    moonSteps.push(
+      `f${f} ${(shown / DEG).toFixed(1)}°${Number.isInteger(orbits) ? ` (${orbits} orbit${orbits > 1 ? 's' : ''})` : ''}`,
+    );
   }
   for (const line of pairs) console.log(`    ${line}`);
   const fmt = (o) => [1, 13, 25, LOOP + 1].map((f) => r4(angle[o][f])).join(' / ');
-  for (const o of ['Ember Pivot', 'Azure Pivot', 'Verdant Pivot', 'Titan Pivot', 'Great Wheel', 'Idler Wheel', 'Third Wheel', 'Pinion'])
+  for (const o of [
+    'Ember Pivot',
+    'Azure Pivot',
+    'Verdant Pivot',
+    'Titan Pivot',
+    'Great Wheel',
+    'Idler Wheel',
+    'Third Wheel',
+    'Pinion',
+  ])
     console.log(`    ${o.padEnd(14)} θ at frames 1/13/25/49: ${fmt(o)}`);
-  console.log(`    moon ${MOON.orbit} m from ${MOON.planet}; angle along its orbit (arm frame) since frame 1: ${moonSteps.join(', ')} → one orbit every ${MOON.framesPerOrbit} frames`);
+  console.log(
+    `    moon ${MOON.orbit} m from ${MOON.planet}; angle along its orbit (arm frame) since frame 1: ${moonSteps.join(', ')} → one orbit every ${MOON.framesPerOrbit} frames`,
+  );
   if (errors.length) throw new Error(`motion check failed:\n  ${errors.join('\n  ')}`);
-  console.log(`  ✓ motion verified: ${parts.length} driven parts × ${frames.length} frames, ${pairs.length} meshing pairs, moon period, seamless ${LOOP}-frame loop`);
+  console.log(
+    `  ✓ motion verified: ${parts.length} driven parts × ${frames.length} frames, ${pairs.length} meshing pairs, moon period, seamless ${LOOP}-frame loop`,
+  );
 }
 
 /**
@@ -833,45 +1327,67 @@ async function verifyMotion(gears) {
 async function verifyClearance() {
   const assembly = {}; // object name → assembly
   for (const P of PLANETS) {
-    const objs = [P.key, `${P.key} Arm`, ...(P.ring ? [`${P.key} Ring`] : []), ...(P.key === MOON.planet ? ['Moon Orbit', 'Moon'] : [])];
+    const objs = [
+      P.key,
+      `${P.key} Arm`,
+      ...(P.ring ? [`${P.key} Ring`] : []),
+      ...(P.key === MOON.planet ? ['Moon Orbit', 'Moon'] : []),
+    ];
     for (const o of objs) assembly[o] = P.key;
   }
   assembly.Sun = 'Sun';
   for (const x of GEARS) assembly[x.name] = x.name;
   const members = (key) => Object.keys(assembly).filter((o) => assembly[o] === key);
   const [E, A, V, T] = PLANETS.map((P) => members(P.key));
-  const groups = [[...E, ...A, ...V], [...V, ...T, 'Sun'], [...E, ...A, ...T, 'Sun'], GEARS.map((x) => x.name)];
+  const groups = [
+    [...E, ...A, ...V],
+    [...V, ...T, 'Sun'],
+    [...E, ...A, ...T, 'Sun'],
+    GEARS.map((x) => x.name),
+  ];
   // every pair of different assemblies must be measured in at least one group of ≤ 8 objects
   const covered = new Set(groups.flatMap((g) => g.flatMap((a) => g.map((b) => `${a}|${b}`))));
   const names = Object.keys(assembly);
   for (const a of names)
     for (const b of names) {
       const sameKind = GEARS.some((x) => x.name === a) === GEARS.some((x) => x.name === b); // gears sit far below the arms
-      if (assembly[a] !== assembly[b] && sameKind && !covered.has(`${a}|${b}`)) throw new Error(`clearance groups miss ${a} / ${b}`);
+      if (assembly[a] !== assembly[b] && sameKind && !covered.has(`${a}|${b}`))
+        throw new Error(`clearance groups miss ${a} / ${b}`);
     }
-  if (groups.some((g) => g.length > 8)) throw new Error('scene.measure takes at most 8 objects for surface distances');
+  if (groups.some((g) => g.length > 8))
+    throw new Error('scene.measure takes at most 8 objects for surface distances');
 
   const worst = new Map(); // "a / b" → closest {d, f}
   const failures = [];
   const t0 = Date.now();
   for (let f = 1; f <= LOOP; f++)
     for (const objects of groups) {
-      const res = await call('run_operator', { operator: 'scene.measure', params: { objects, frame: f, surface_distance: true } }, { quiet: true });
+      const res = await call(
+        'run_operator',
+        { operator: 'scene.measure', params: { objects, frame: f, surface_distance: true } },
+        { quiet: true },
+      );
       for (const p of res.result?.distances ?? []) {
         if (assembly[p.a_name] === assembly[p.b_name]) continue;
         const key = [p.a_name, p.b_name].sort().join(' / ');
         const d = p.surface_distance;
-        if (typeof d !== 'number') throw new Error(`scene.measure gave no surface distance for ${key}: ${short(p)}`);
+        if (typeof d !== 'number')
+          throw new Error(`scene.measure gave no surface distance for ${key}: ${short(p)}`);
         const w = worst.get(key);
         if (!w || d < w.d) worst.set(key, { d, f });
         const limit = GEARS.some((x) => x.name === p.a_name) ? CLEARANCE.gears : CLEARANCE.planets;
-        if (p.intersecting || d < limit) failures.push(`f${f} ${key}: ${p.intersecting ? 'INTERSECTING' : `${(d * 1000).toFixed(2)} mm`}`);
+        if (p.intersecting || d < limit)
+          failures.push(`f${f} ${key}: ${p.intersecting ? 'INTERSECTING' : `${(d * 1000).toFixed(2)} mm`}`);
       }
     }
   const closest = [...worst.entries()].sort((a, b) => a[1].d - b[1].d);
-  for (const [key, w] of closest.slice(0, 8)) console.log(`    closest: ${key.padEnd(28)} ${(w.d * 1000).toFixed(1)} mm at frame ${w.f}`);
-  if (failures.length) throw new Error(`clearance check failed (${failures.length}):\n  ${failures.slice(0, 40).join('\n  ')}`);
-  console.log(`  ✓ clearance verified: ${worst.size} pairs of moving parts × ${LOOP} frames in ${((Date.now() - t0) / 1000).toFixed(1)} s (planets ≥ ${CLEARANCE.planets * 1000} mm, gear teeth never cross)`);
+  for (const [key, w] of closest.slice(0, 8))
+    console.log(`    closest: ${key.padEnd(28)} ${(w.d * 1000).toFixed(1)} mm at frame ${w.f}`);
+  if (failures.length)
+    throw new Error(`clearance check failed (${failures.length}):\n  ${failures.slice(0, 40).join('\n  ')}`);
+  console.log(
+    `  ✓ clearance verified: ${worst.size} pairs of moving parts × ${LOOP} frames in ${((Date.now() - t0) / 1000).toFixed(1)} s (planets ≥ ${CLEARANCE.planets * 1000} mm, gear teeth never cross)`,
+  );
 }
 
 /**
@@ -894,11 +1410,24 @@ async function verifyFraming() {
   const tx = 18 / CAMERA.lens;
   const ty = (tx * 720) / 1280;
   const seen = [];
-  for (const [sx, sy, label] of [[-1, 1, 'top left'], [1, 1, 'top right'], [-1, -1, 'bottom left'], [1, -1, 'bottom right']]) {
+  for (const [sx, sy, label] of [
+    [-1, 1, 'top left'],
+    [1, 1, 'top right'],
+    [-1, -1, 'bottom left'],
+    [1, -1, 'bottom right'],
+  ]) {
     const direction = fwd.map((v, i) => v + sx * tx * right[i] + sy * ty * up[i]);
-    const r = await call('run_operator', { operator: 'scene.raycast', params: { origin: cam.world_location, direction, objects: ['Table'], frame: 1 } }, { quiet: true });
+    const r = await call(
+      'run_operator',
+      {
+        operator: 'scene.raycast',
+        params: { origin: cam.world_location, direction, objects: ['Table'], frame: 1 },
+      },
+      { quiet: true },
+    );
     const hit = r.result;
-    if (!hit?.hit || hit.normal[2] < 0.99) throw new Error(`framing: the ${label} image corner does not see the table top (${short(hit)})`);
+    if (!hit?.hit || hit.normal[2] < 0.99)
+      throw new Error(`framing: the ${label} image corner does not see the table top (${short(hit)})`);
     seen.push(`${label} (${hit.point.map((v) => v.toFixed(2)).join(', ')})`);
   }
   console.log(`  ✓ framing: all four image corners see the table top: ${seen.join('; ')}`);
@@ -910,6 +1439,7 @@ async function renderStill(file, opts) {
   const t0 = Date.now();
   const res = await call('render_image', { width: 1280, height: 720, frame: 1, ...opts });
   timings[path.basename(file)] = { ms: Date.now() - t0, info: res.text };
+  for (const w of res.text?.warnings ?? []) warnings.push(`${path.basename(file)}: ${w}`);
   await saveImage(res, file);
   console.log(`    → ${file} ${short(res.text, 400)}`);
   return res.text;
@@ -918,22 +1448,52 @@ async function renderStill(file, opts) {
 async function previews() {
   await mkdir(PREVIEW_DIR, { recursive: true });
   await renderStill(path.join(PREVIEW_DIR, 'raster.png'), { width: 960, height: 540, engine: 'RASTER' });
-  await renderStill(path.join(PREVIEW_DIR, 'pt-preview.png'), { width: 640, height: 360, engine: 'PATHTRACER', samples: 16, time_limit: 60 });
-  const sheet = await call('render_animation', { format: 'CONTACT_SHEET', frame_start: 1, frame_end: LOOP, frame_step: 4, width: 320, height: 180, columns: 4, engine: 'RASTER', time_limit: 120 });
+  await renderStill(path.join(PREVIEW_DIR, 'pt-preview.png'), {
+    width: 640,
+    height: 360,
+    engine: 'PATHTRACER',
+    samples: 16,
+    time_limit: 60,
+  });
+  const sheet = await call('render_animation', {
+    format: 'CONTACT_SHEET',
+    frame_start: 1,
+    frame_end: LOOP,
+    frame_step: 4,
+    width: 320,
+    height: 180,
+    columns: 4,
+    engine: 'RASTER',
+    time_limit: 120,
+  });
   await saveImage(sheet, path.join(PREVIEW_DIR, 'raster-sheet.png'));
   console.log(`    → ${PREVIEW_DIR}/raster-sheet.png ${short(sheet.text, 300)}`);
 }
 
 async function finalStill() {
   // path traced 1280×720 still; sampling stops at 160 spp or after 470 s, whichever comes first
-  return renderStill(path.join(OUT_DIR, 'render.png'), { engine: 'PATHTRACER', samples: 160, denoise: true, time_limit: 470 });
+  return renderStill(path.join(OUT_DIR, 'render.png'), {
+    engine: 'PATHTRACER',
+    samples: 160,
+    denoise: true,
+    time_limit: 470,
+  });
 }
 
 async function animation() {
   // path traced frames with few samples; the denoiser cleans every frame (also frames that stop early)
   const common = { frame_start: 1, frame_end: LOOP, engine: 'PATHTRACER', denoise: true, max_bounces: 4 };
   let t0 = Date.now();
-  const sheet = await call('render_animation', { ...common, format: 'CONTACT_SHEET', frame_step: 4, width: 320, height: 180, columns: 4, samples: 12, time_limit: 240 });
+  const sheet = await call('render_animation', {
+    ...common,
+    format: 'CONTACT_SHEET',
+    frame_step: 4,
+    width: 320,
+    height: 180,
+    columns: 4,
+    samples: 12,
+    time_limit: 240,
+  });
   timings['contact_sheet.png'] = { ms: Date.now() - t0, info: sheet.text };
   await saveImage(sheet, path.join(OUT_DIR, 'contact_sheet.png'));
   console.log(`    → contact_sheet.png ${short(sheet.text, 400)}`);
@@ -943,43 +1503,77 @@ async function animation() {
   // every frame (frames cut short at a lower count would shimmer). Dropped frames fail the build;
   // frames that stopped sampling early (undersampled_frames) are reported as a warning.
   t0 = Date.now();
-  const gif = await call('render_animation', { ...common, format: 'GIF', width: 480, height: 270, samples: 8, fps: 16, dither: 'BAYER', time_limit: 600 });
+  const gif = await call('render_animation', {
+    ...common,
+    format: 'GIF',
+    width: 480,
+    height: 270,
+    samples: 8,
+    fps: 16,
+    dither: 'BAYER',
+    time_limit: 600,
+  });
   timings['preview.gif'] = { ms: Date.now() - t0, info: gif.text };
   await saveImage(gif, path.join(OUT_DIR, 'preview.gif'));
   console.log(`    → preview.gif ${short(gif.text, 400)}`);
-  for (const [file, r] of [['contact_sheet.png', sheet], ['preview.gif', gif]]) {
+  for (const [file, r] of [
+    ['contact_sheet.png', sheet],
+    ['preview.gif', gif],
+  ]) {
     const info = r.text ?? {};
+    for (const w of info.warnings ?? []) warnings.push(`${file}: ${w}`);
     if (info.truncated) throw new Error(`${file}: animation truncated: ${short(info)}`);
-    if (info.undersampled_frames?.length) warnings.push(`${file}: frames ${info.undersampled_frames.join(', ')} stopped sampling early (time budget)`);
+    const s = info.samples_reached ?? {};
+    console.log(
+      `    ${file}: ${info.frame_count} frames, samples per pixel reached min ${s.min} / mean ${s.mean} / max ${s.max} of ${info.requested_samples}`,
+    );
+    if (info.undersampled_frames?.length)
+      warnings.push(
+        `${file}: frames ${info.undersampled_frames.join(', ')} stopped sampling early (time budget)`,
+      );
     else console.log(`    ${file}: every frame reached its full samples`);
   }
 }
 
-async function exportGlb() {
-  // glTF cannot carry drivers or constraints: bake the driven rotations and the moon's path into
-  // keyframes (one batch = one undo step), export, then undo the bake so the project keeps its
-  // live drivers and Follow Path constraint.
+/** The JSON chunk of a binary glTF (12-byte header, then the JSON chunk's length, type and data). */
+function glbJson(buf) {
+  if (buf.readUInt32LE(0) !== 0x46546c67 || buf.readUInt32LE(16) !== 0x4e4f534a)
+    throw new Error('scene.glb is not a binary glTF');
+  return JSON.parse(buf.subarray(20, 20 + buf.readUInt32LE(12)).toString('utf8'));
+}
+
+async function exportGlb(gears) {
+  // The glTF exporter samples the evaluated scene once per frame of the scene's frame range, so the
+  // live drivers and the moon's Follow Path constraint export as they are (as keyframed node
+  // rotations and the moon's translation). The range is extended to frame 49 (= frame 1) for the
+  // export, so the clip ends where it starts and loops seamlessly, and set back to 1–48 afterwards.
   const t0 = Date.now();
-  const list = await op('anim.driver_list', {});
-  const driven = [...new Set((list.drivers ?? []).map((d) => d.target_name))];
-  const baked = await batch('bake for export', [
-    ['anim.bake_transforms', { objects: driven, frame_start: 1, frame_end: LOOP + 1, step: 1, channels: ['rotation_euler'] }],
-    ['anim.bake_transforms', { objects: ['Moon'], frame_start: 1, frame_end: LOOP + 1, step: 1, channels: ['location'], clear_constraints: true }],
-  ]);
-  console.log(`    baked ${baked.flatMap((r) => r?.objects ?? []).length} objects`);
-  let buf;
+  let res;
+  await call('set_scene_settings', { frame_end: LOOP + 1 });
   try {
-    const res = await call('export_scene', { format: 'glb' });
-    const blob = res.resources?.find((r) => r.blob)?.blob;
-    if (!blob) throw new Error(`export returned no file: ${short(res)}`);
-    for (const w of res.text?.warnings ?? []) warnings.push(`export: ${short(w)}`);
-    buf = Buffer.from(blob, 'base64');
+    res = await call('export_scene', { format: 'glb' });
   } finally {
-    const u = await call('undo', {});
-    const back = await op('anim.driver_list', {});
-    console.log(`    undo bake: ${short(u)} → ${back.drivers?.length} drivers live again`);
-    if ((back.drivers?.length ?? 0) < driven.length) throw new Error('undo after export did not restore every driver');
+    await call('set_scene_settings', { frame_end: LOOP });
   }
+  const info = res.text ?? {};
+  const blob = res.resources?.find((r) => r.blob)?.blob;
+  if (!blob) throw new Error(`export returned no file: ${short(res)}`);
+  for (const w of info.warnings ?? []) warnings.push(`export: ${short(w)}`);
+  const buf = Buffer.from(blob, 'base64');
+  // check the file: one clip with a key per frame 1–49 that animates every driven part and the moon
+  const gltf = glbJson(buf);
+  const anim = gltf.animations?.[0];
+  const input = anim ? gltf.accessors[anim.samplers[0].input] : null;
+  const animated = new Set((anim?.channels ?? []).map((c) => gltf.nodes[c.target.node].name));
+  const missing = [...drivenParts(gears).map((p) => p.object), 'Moon'].filter((o) => !animated.has(o));
+  if (!input || input.count !== LOOP + 1 || Math.abs(input.max[0] - LOOP / FPS) > 1e-3 || missing.length)
+    throw new Error(
+      `scene.glb animation: ${input?.count} keys up to ${input?.max?.[0]} s (want ${LOOP + 1} up to ${LOOP / FPS} s); not animated: ${missing.join(', ') || 'none'}`,
+    );
+  console.log(
+    `    scene.glb: ${gltf.nodes.length} nodes, ${gltf.meshes.length} meshes, ${gltf.materials.length} materials, ${gltf.images?.length ?? 0} baked texture images, ` +
+      `1 animation: ${anim.channels.length} channels on ${animated.size} nodes × ${input.count} keys (frames 1–${LOOP + 1}, ${input.max[0].toFixed(3)} s); export ${info.elapsed_ms} ms`,
+  );
   await writeFile(path.join(OUT_DIR, 'scene.glb'), buf);
   timings['scene.glb'] = { ms: Date.now() - t0, bytes: buf.length };
   console.log(`    → scene.glb ${(buf.length / 1e6).toFixed(2)} MB`);
@@ -1031,10 +1625,22 @@ try {
   }
   if (STAGES.has('export')) {
     console.log('● export');
-    await exportGlb();
+    await exportGlb(gears);
   }
   console.log(`\nDone in ${((Date.now() - T0) / 1000).toFixed(1)} s. Project ${project}`);
-  console.log('timings:', JSON.stringify(Object.fromEntries(Object.entries(timings).map(([k, v]) => [k, { s: r4(v.ms / 1000), ...(v.bytes ? { bytes: v.bytes } : {}), ...(v.info ? { info: v.info } : {}) }])), null, 1));
+  console.log(
+    'timings:',
+    JSON.stringify(
+      Object.fromEntries(
+        Object.entries(timings).map(([k, v]) => [
+          k,
+          { s: r4(v.ms / 1000), ...(v.bytes ? { bytes: v.bytes } : {}), ...(v.info ? { info: v.info } : {}) },
+        ]),
+      ),
+      null,
+      1,
+    ),
+  );
   if (warnings.length) console.log(`warnings (${warnings.length}):\n  ${warnings.join('\n  ')}`);
 } catch (e) {
   console.error(`\nBUILD FAILED after ${((Date.now() - T0) / 1000).toFixed(1)} s: ${e.message}`);

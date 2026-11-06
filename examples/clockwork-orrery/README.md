@@ -2,14 +2,26 @@
 
 An original brass clockwork orrery on a dark marble plinth, built entirely through the editor's MCP
 server by [`build.mjs`](build.mjs), with the same tools an external AI agent uses. Every step
-(modelling, materials, the driven mechanism, lights, camera, renders) is a tool call. The script
-rebuilds the project from scratch, checks the result numerically and renders the outputs.
+(modelling, materials, the driven mechanism, lights, camera, renders, the glTF export) is a tool
+call. The script rebuilds the project from scratch, checks the result numerically and renders the
+outputs.
 
 ![Final path-traced still](render.png)
 
 | Contact sheet (every 4th frame of the 48-frame loop) | Animated preview (48 frames, loops seamlessly) |
 | --- | --- |
 | ![Contact sheet](contact_sheet.png) | ![Preview](preview.gif) |
+
+Files in this folder:
+
+| File | What it is | Made by |
+| --- | --- | --- |
+| [`build.mjs`](build.mjs) | the build script | |
+| `render.png` | path-traced still, 1280×720 | `build.mjs` (default mode) |
+| `contact_sheet.png` | 12 path-traced frames of the loop | `build.mjs` (default mode) |
+| `preview.gif` | the whole 48-frame loop, path traced | `build.mjs` (default mode) |
+| [`scene.glb`](scene.glb) | the animated scene as binary glTF 2.0 ([below](#sceneglb)) | `build.mjs --export-only` |
+| `editor.png` | the project open in the web editor ([below](#in-the-editor)) | Playwright screenshot |
 
 ## The scene
 
@@ -131,6 +143,10 @@ The build fails (exit code 1) unless all of these checks pass on the built scene
   parts must stay at least 5 mm apart, and gear teeth at least 0.2 mm (they keep 0.8 mm).
 * **`verifyFraming()`**: casts rays (`scene.raycast`) from the camera through the four image corners.
   All four must hit the top face of the table, so no table edge can enter the picture.
+* **Renders** (default mode): a dropped animation frame (`truncated`) fails the build; frames that
+  stopped sampling early (`undersampled_frames`) and render warnings are listed at the end.
+* **`exportGlb()`** (`--export-only`): the file's animation must have 49 keys (frames 1–49) and
+  animate all 14 driven parts and the moon.
 
 Excerpt from the final production run:
 
@@ -145,12 +161,71 @@ closest: Idler Wheel / Third Wheel    0.8 mm at frame 3
 closest: Pinion / Third Wheel         0.8 mm at frame 4
 closest: Azure / Ember                19.4 mm at frame 10
 closest: Azure / Moon                 26.6 mm at frame 33
+closest: Azure / Ember Arm            26.6 mm at frame 10
 closest: Moon Orbit / Titan Ring      28.5 mm at frame 31
-✓ clearance verified: 61 pairs of moving parts × 48 frames in 35.1 s (planets ≥ 5 mm, gear teeth never cross)
+closest: Azure / Moon Orbit           28.8 mm at frame 32
+✓ clearance verified: 61 pairs of moving parts × 48 frames in 53.7 s (planets ≥ 5 mm, gear teeth never cross)
 ✓ framing: all four image corners see the table top: top left (-7.00, 5.11, 0.00); top right (-0.36, 8.64, 0.00); bottom left (-0.51, -0.96, 0.00); bottom right (1.06, -0.12, 0.00)
 ```
 
 The contact sheet and the GIF are the visual check of the same motion.
+
+## In the editor
+
+![The orrery in the web editor](editor.png)
+
+The built project open in the web editor (the `editor:` URL that the script prints), in the camera
+view with **Rendered** viewport shading. The Third Wheel is selected in the outliner. The
+Properties editor shows its Z rotation in purple, because a driver sets it (68.554° at frame 1),
+and the Drivers panel with the expression `1.1965 + 36/27 * m`, whose variable `m` reads the
+Master Drive's Z rotation (`rotation_euler[2]`). The viewport is the editor's real-time WebGL
+preview (its area lights cast no shadows, and there is no depth of field and no global
+illumination), so it looks brighter and flatter than the path-traced still. The screenshot was
+taken with Playwright Chromium at 1600×900 (software WebGL) after the scene had loaded; the browser
+console stayed free of errors and warnings.
+
+## scene.glb
+
+[`scene.glb`](scene.glb) (2.52 MB, binary glTF 2.0) is written by `--export-only` with
+`export_scene`. The exporter samples the evaluated scene once per frame, so the live drivers and the
+moon's Follow Path constraint need no baking. For the export the scene's frame range is set to 1–49
+(frame 49 looks exactly like frame 1), so the clip ends where it starts and loops seamlessly; the
+script then sets it back to 1–48. The file contains:
+
+* 61 nodes: 48 meshes with their modifiers applied (bevels, the engraved plate; 44,602 triangles),
+  the 50 mm camera, 6 lights (`KHR_lights_punctual`) and the 6 empties. The planet assemblies are
+  children of their pivot empties, as in the editor.
+* 16 PBR materials (`KHR_materials_clearcoat` on the enamel deck and Azure's glaze,
+  `KHR_materials_emissive_strength` on the sun). The 6 procedural textures are baked into 8 PNG
+  images of 512 × 512 pixels: base colours, the sun's emission and normal maps for the two woods.
+* One animation, `Scene`: 2.0 s at 24 fps, 49 linear keys per channel, 17 channels on 16 nodes.
+  They are the rotations of the 14 driven parts (pivots, planets, wheels, hub, sun), the Master
+  Drive's rotation, and the moon's translation and rotation.
+* No skins and no morph targets: the scene has no armature and no shape keys.
+
+Export warnings (all five expected; glTF has no area lights):
+
+```
+Area light 'Fill Light' exported as a point light
+Area light 'Key Light' exported as a point light
+Area light 'Plate Kicker' exported as a point light
+Area light 'Rim Light' exported as a point light
+Area light 'Top Light' exported as a point light
+```
+
+Checks of the committed file:
+
+* Structure: the repository's glTF test validator (`parseGltf` / `gltfProblems` in
+  `packages/core/test/fixes-export-gltf-check.ts`) finds no problems: buffer views, accessor bounds,
+  node hierarchy and animation samplers are valid. Sampled with the validator's evaluator
+  (`gltfPose`), every planet stays on its orbit radius and the moon 50 mm from Verdant at frames 1,
+  7, 13, 25 and 49.
+  The last key equals the first, except the Third Wheel, which ends turned by 120°: a symmetry of
+  its 27 teeth and 6 windows, so the loop has no visible seam.
+* three.js r187: `GLTFLoader` in headless Chromium loads the file (1 clip of 2 s with 17 tracks,
+  48 meshes, 6 lights, 1 camera, no console errors). Played with an `AnimationMixer` and sampled at
+  240 Hz over the whole loop, the four planets stay on their orbit radii (within 0.0001 mm), and
+  the mixer repeats the clip: Ember is at the same place at t = 0.25 s, 2.25 s and 4.25 s.
 
 ## Editor features shown
 
@@ -158,8 +233,8 @@ The contact sheet and the GIF are the visual check of the same motion.
   `run_operator`, `batch` (with per-operation `reports`), `add_object`, `add_modifier`,
   `apply_modifier`, `duplicate_object`, `delete_objects`, `set_parent`, `set_active_camera`,
   `get_object` (evaluated values at a frame, `stored` values, `world_location`, `world_transform`),
-  `get_scene` (`counts`, `problems`), `render_image`, `render_animation` (`CONTACT_SHEET`, `GIF`),
-  `export_scene`, `undo`.
+  `get_scene` (`counts`, `problems`), `render_image`, `render_animation` (`CONTACT_SHEET`, `GIF`,
+  `samples_reached`), `export_scene` (glTF with the drivers and the constraint sampled per frame).
 * **Operators**:
   * modelling: `object.generate_gear`; `mesh.primitive_cube_add / cylinder_add / cone_add /
     uv_sphere_add / torus_add`; `curve.primitive_bezier_circle_add` (with `bevel_depth`),
@@ -169,7 +244,7 @@ The contact sheet and the GIF are the visual check of the same motion.
     `material.update`, `material.procedural_set`;
   * animation: `object.constraint_add {FOLLOW_PATH}`, `constraint.followpath_path_animate`;
     `anim.keyframes_insert_many`, `anim.extrapolation_set {CYCLIC}`, `anim.driver_add` (scripted
-    expressions with an object variable), `anim.driver_list`, `anim.bake_transforms` (export only);
+    expressions with an object variable);
   * lights and camera: `object.light_add` (AREA shapes `RECTANGLE` / `DISK` with sizes, `POINT`
     radius), `object.camera_add` (depth of field with a focus object), `object.track_set`;
   * measuring: `scene.measure` (exact surface distances at a given frame), `scene.raycast`
@@ -180,17 +255,20 @@ The contact sheet and the GIF are the visual check of the same motion.
 * **Rendering**: the CPU path tracer with denoising, depth of field, area-light shapes, procedural
   textures, an emissive mesh plus a point light, and the `STANDARD` view transform with exposure.
   The denoiser also cleans the few-sample animation frames.
+* **Web editor**: camera view, Rendered shading, outliner, the Object tab's driven fields and
+  Drivers panel ([`editor.png`](editor.png)).
 
 ## Rebuild
 
-Start an editor server (any port; `npm run build` first if `apps/server/dist` is missing) and run
-the script with `MCP_URL` pointing at its `/mcp` endpoint:
+From a clone of the repository: install, build and start the editor server (it listens on port
+8080; `PORT`, `DATA_DIR` and `RENDER_WORKERS` are optional), then run the script in a second
+terminal with `MCP_URL` pointing at the server's `/mcp` endpoint:
 
 ```bash
-cd /path/to/3D-Editor
-PORT=8080 DATA_DIR=/tmp/orrery-data node apps/server/dist/main.js &     # or: npm start
+npm ci && npm run build && npm start
 MCP_URL=http://127.0.0.1:8080/mcp node examples/clockwork-orrery/build.mjs                 # = --final
 MCP_URL=http://127.0.0.1:8080/mcp node examples/clockwork-orrery/build.mjs --build-only    # scene + checks only
+MCP_URL=http://127.0.0.1:8080/mcp node examples/clockwork-orrery/build.mjs --export-only   # + scene.glb
 ```
 
 The script always deletes and recreates the project `clockwork-orrery` (open it in the editor at
@@ -198,64 +276,82 @@ the printed `editor:` URL), runs every check above, and then does what the mode 
 
 | Mode | What it does | Time |
 | --- | --- | --- |
-| `--final` (default) | build + checks, `render.png`, `contact_sheet.png`, `preview.gif` | ~11 min with 3 render threads on a busy 4-core machine (see below) |
-| `--build-only` | build + checks, no renders | 49–54 s (the clearance sweep takes ~35 s of it) |
-| `--preview` | build + checks + 960×540 RASTER still, 640×360 path-traced still (16 spp) and RASTER contact sheet in `$PREVIEW_DIR` (default `$TMPDIR/clockwork-orrery-previews`); nothing is written next to the script | 108 s (busy machine) |
-| `--export-only` | build + checks + `scene.glb` (no renders) | 82 s (busy machine) |
+| `--final` (default) | build + checks, `render.png`, `contact_sheet.png`, `preview.gif` | 13 min with 3 render threads on a busy 4-core machine (see below) |
+| `--build-only` | build + checks, no renders | 41 s (38 s of it the clearance sweep) |
+| `--preview` | build + checks + 960×540 RASTER still, 640×360 path-traced still (16 spp) and RASTER contact sheet in `$PREVIEW_DIR` (default `$TMPDIR/clockwork-orrery-previews`); nothing is written next to the script | 111 s with 1 render thread on a busy machine |
+| `--export-only` | build + checks + `scene.glb` (no renders) | 47 s (the export itself 4 s) |
 | `--stages build,still,…` | any combination of `build`, `preview`, `still`, `anim`, `export` | |
 
+The times of the last three modes were measured on the same busy machine with one render thread.
 `--out-dir DIR` writes `render.png`, `contact_sheet.png`, `preview.gif` and `scene.glb` to another
 folder. The command line is strict: an unknown argument (e.g. `build-only` without the dashes), an
 unknown stage name, two modes at once or a flag without its value stops the script with exit
 code 2, before it connects to the server. Any tool error, failed batch operation, scene problem,
-motion mismatch, collision or framing failure stops it with exit code 1.
+motion mismatch, collision, framing failure, dropped animation frame or wrong glTF animation stops
+it with exit code 1.
 
-`scene.glb` is not part of the final run. `--export-only` bakes the driven rotations and the moon's
-path into keyframes (`anim.bake_transforms`, one undo step), exports, and undoes the bake so the
-project keeps its live drivers and constraint.
+`scene.glb` is not part of the default mode; `--export-only` makes it (see [scene.glb](#sceneglb)).
 
 ## Final production run
 
-The images in this folder come from one run of the default mode on a fresh editor server with an
-empty data directory and three render threads. The run also proves that the project rebuilds from
-scratch:
+`render.png`, `contact_sheet.png` and `preview.gif` come from one run of the default mode on a
+fresh editor server with an empty data directory and three render threads, so the run also proves
+that the project rebuilds from scratch. The server was this repository's production build
+(`npm run build` at commit `999b4dc`), started like `npm start`:
 
 ```bash
-PORT=4552 DATA_DIR=$(mktemp -d) RENDER_WORKERS=3 node apps/server/dist/main.js &
-MCP_URL=http://127.0.0.1:4552/mcp node examples/clockwork-orrery/build.mjs --final
+PORT=4562 DATA_DIR=$(mktemp -d) RENDER_WORKERS=3 npm start &
+MCP_URL=http://127.0.0.1:4562/mcp node examples/clockwork-orrery/build.mjs --final
 ```
 
 Measured on 2026-11-06 on a 4-core machine that was busy with other work at the same time (load
-average about 6–7 while the still rendered):
+average 11–16 while the still rendered, 6–9 during the animation):
 
 | Stage | Settings | Wall time | Result |
 | --- | --- | --- | --- |
-| build + checks | 62 objects (36 meshes, 12 texts, 1 curve, 6 lights, 6 empties, 1 camera), 16 materials, 14 drivers, 47,902 render triangles | 48.9 s (35.1 s of it the clearance sweep) | every check passed, no scene problems |
-| `render.png` | 1280×720, path tracer, 160 spp, `time_limit` 470 s, 6 bounces, denoised, f/4 depth of field | 407.9 s | all 160 spp reached; 0.92 MB |
-| `contact_sheet.png` | 12 frames (1, 5 … 45), 320×180 each, 12 spp, 4 bounces, denoised | 27.1 s | every frame at 12 spp; 0.75 MB |
-| `preview.gif` | 48 frames, 480×270, 8 spp, 4 bounces, denoised, 16 fps, Bayer dither, `time_limit` 600 s | 187.7 s | every frame at 8 spp; 0.91 MB |
-| **total** | | **671.6 s (11.2 min)** | exit code 0 |
+| build + checks | 62 objects (36 meshes, 12 texts, 1 curve, 6 lights, 6 empties, 1 camera), 16 materials, 14 drivers; 44,602 rendered triangles | 58.4 s (53.7 s of it the clearance sweep) | every check passed, no scene problems |
+| `render.png` | 1280×720, path tracer, 160 spp requested, `time_limit` 470 s, 6 bounces, denoised, f/4 depth of field | 474.0 s | the time limit stopped sampling at 71 spp; the denoised image shows no noise at full size; 0.97 MB |
+| `contact_sheet.png` | 12 frames (1, 5 … 45), 320×180 each, 12 spp, 4 bounces, denoised | 37.3 s | every frame at 12 spp; 0.75 MB |
+| `preview.gif` | 48 frames, 480×270, 8 spp, 4 bounces, denoised, 16 fps, Bayer dither, `time_limit` 600 s | 207.3 s | every frame at 8 spp (`samples_reached` min = max = 8); 0.91 MB |
+| **total** | | **777.0 s (13.0 min)** | exit code 0; 3 warnings, all the plate's degenerate triangles (see below) |
+
+`get_scene` counts 47,646 evaluated triangles: the 44,602 that render plus the 3,044 of the
+hidden text mesh that cuts the engraving.
 
 Every GIF frame reached the same sample count, and the path tracer uses the same noise seed for
 every frame, so the parts of the picture that do not move are nearly identical from frame to frame.
 On a patch of the table (x 380–480, y 150–230) the mean difference between consecutive frames is
-0.13–0.25 grey levels out of 255 for every pair, including the loop seam 48 → 1. A high-pass noise
-measure of the same patch is 2.81–2.84 in all 48 frames, so the table does not shimmer.
+0.11–0.25 grey levels out of 255 for every pair, including the loop seam 48 → 1 (0.19). The
+high-pass noise of the same patch (standard deviation of the patch minus its 3 × 3 box blur) is
+3.63–3.68 grey levels in all 48 frames, so the table does not shimmer.
+
+`scene.glb` and `editor.png` were made with a second server running the same build (one render
+thread): `--export-only` wrote `scene.glb` (47 s, the export itself 4 s; a second export gave a
+byte-identical file), and the screenshot shows the project of that run open in the editor.
 
 ## Known limitations
 
-* The path tracer reports "4 degenerate triangle(s) skipped" without naming the object. They
-  belong to the engraved motto plate (bevel + boolean with the converted text) and are invisible.
-* RASTER previews (`--preview`) have no shadows and no depth of field. Their single reflection
-  probe sits above the deck, so the far part of the glossy table reflects the deck's highlight and
-  looks far brighter than in the path tracer. Use them for layout and motion, not for judging the
-  light.
-* Most of the build time is verification: about 125 `get_object` calls (one object at one frame
-  each) and 192 `scene.measure` calls (48 frames × 4 groups, because exact surface distances take
-  at most 8 objects per call).
+* Every path-traced render warns `4 degenerate triangle(s) skipped (…): 'Motto Plate' 4`. The
+  boolean engraving leaves large n-gons (up to 477 corners) with collinear vertices along the
+  letters, and their triangulation has four zero-area triangles. They cover no pixels.
+* RASTER previews (`--preview`; the server's software rasterizer renders them when no editor is
+  open in a browser) have no shadows and no depth of field, and they reflect a single reflection
+  probe placed where the image centre looks (at the spindle). The far part of the glossy table
+  therefore shows a bright sheen that the path tracer does not have. Use them for layout and
+  motion, not for judging the light.
+* On a busy machine the still's 470 s budget is not enough for 160 spp at 1280×720 with three
+  render threads: the final run stopped at 71 spp under a load average of 11–16. The denoiser
+  cleans the result, but a quieter machine gives a more converged image.
+* Most of the build time is the clearance sweep: 192 `scene.measure` calls (48 frames × 4 groups),
+  because exact surface distances take at most 8 objects and one frame per call. The motion check's
+  125 `get_object` calls take only a few seconds.
 * The clearance sweep samples whole frames only. Between frames the planets are kept apart by the
   disjoint annuli (the design guarantees it); the gear teeth were measured at the 48 frames only.
-* glTF cannot carry drivers, constraints or area lights. The export bakes the motion into keyframes
-  and exports the area lights as point lights (the exporter warns).
+* `scene.glb` is an approximation of the scene: the five area lights become point lights (glTF has
+  no area lights), the procedural textures are baked into 512 × 512 images (the grain of the 24 m
+  table is blurred and the marble's thin veins are lost), and glTF players interpolate the
+  per-frame keys linearly. Rotations stay exact, but the moon's world position cuts chords between
+  the keys: in three.js it comes up to 6 mm closer to Verdant than its 50 mm orbit (it never touches
+  it).
 * The near numerals of the dial (V, VI, VII) read upside down from the camera, as on a real dial
   with radial numerals.

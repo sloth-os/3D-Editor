@@ -1,0 +1,87 @@
+import { test, expect } from '@playwright/test';
+import { PLAIN, callJson, mcpConnect, menuPath, newProject, setNumberField, statNumber } from './helpers';
+
+test.describe('curves and text', () => {
+  test('a Bezier curve gets a surface from the bevel depth in the Object Data tab', async ({ page }) => {
+    const id = await newProject(page);
+    const triangles = await statNumber(page, 'stats-triangles');
+    const vertices = await statNumber(page, 'stats-vertices');
+    await menuPath(page, ['Add', 'Curve', 'Bezier']);
+    await expect(page.getByTestId('outliner-BezierCurve')).toHaveClass(/active/);
+    // a plain wire curve has no surface: nothing to count yet
+    await expect(page.getByTestId('viewport-stats')).toContainText('Objects 1/4');
+    expect(await statNumber(page, 'stats-triangles')).toBe(triangles);
+
+    await page.getByTestId('prop-tab-data').click();
+    await expect(page.getByTestId('curve-bevel-mode-ROUND')).toHaveAttribute('aria-pressed', 'true');
+    await setNumberField(page, 'curve-bevel-depth', 0.1);
+    await expect(page.getByTestId('curve-bevel-depth')).toContainText('0.1 m');
+    // the round bevel sweeps a tube along the curve
+    await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(triangles + 100);
+    const tube = (await statNumber(page, 'stats-triangles')) - triangles;
+    const tubeVertices = (await statNumber(page, 'stats-vertices')) - vertices;
+
+    // the server's evaluation of the synced document agrees with the viewport
+    const client = await mcpConnect(PLAIN);
+    await expect
+      .poll(async () => (await callJson(client, 'get_object', { project: id, object: 'BezierCurve' })).data)
+      .toMatchObject({
+        kind: 'curve',
+        bevel_depth: 0.1,
+        evaluated: { triangles: tube, vertices: tubeVertices },
+      });
+
+    // a finer bevel profile gives more geometry
+    await setNumberField(page, 'curve-bevel-resolution', 8);
+    await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(triangles + tube);
+    // and depth 0 is a wire again
+    await setNumberField(page, 'curve-bevel-depth', 0);
+    await expect.poll(() => statNumber(page, 'stats-triangles')).toBe(triangles);
+    await client.close();
+  });
+
+  test('a text object: add it, edit its body, convert it to a mesh', async ({ page }) => {
+    const id = await newProject(page);
+    const triangles = await statNumber(page, 'stats-triangles');
+    await menuPath(page, ['Add', 'Text']);
+    await expect(page.getByTestId('outliner-Text')).toHaveClass(/active/);
+    await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(triangles);
+    const word = (await statNumber(page, 'stats-triangles')) - triangles;
+
+    await page.getByTestId('prop-tab-data').click();
+    const body = page.getByTestId('font-body');
+    await expect(body).toHaveValue('Text');
+    await body.fill('Hello\nWorld');
+    await body.press('Control+Enter');
+    await expect(page.getByTestId('prop-content-data')).toContainText('2 lines · 10 characters');
+    // ten glyphs instead of four
+    await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(triangles + 2 * word);
+    const text = (await statNumber(page, 'stats-triangles')) - triangles;
+
+    const client = await mcpConnect(PLAIN);
+    await expect
+      .poll(async () => (await callJson(client, 'get_object', { project: id, object: 'Text' })).data)
+      .toMatchObject({ kind: 'text', body: 'Hello\nWorld', evaluated: { triangles: text } });
+
+    // Object > Convert > Mesh: the same surface as an editable mesh
+    await expect(page.getByTestId('prop-tab-modifiers')).toHaveCount(0);
+    await menuPath(page, ['Object', 'Convert', 'Mesh']);
+    await expect(page.getByTestId('prop-tab-modifiers')).toBeVisible();
+    await expect(page.getByTestId('font-body')).toHaveCount(0);
+    await expect(page.getByTestId('outliner-Text')).toHaveClass(/active/);
+    expect(await statNumber(page, 'stats-triangles')).toBe(triangles + text);
+    await expect
+      .poll(async () => {
+        const o = await callJson(client, 'get_object', { project: id, object: 'Text' });
+        return { type: o.type, kind: o.data.kind, triangles: o.data.triangles };
+      })
+      .toEqual({ type: 'MESH', kind: 'mesh', triangles: text });
+    // it is a real mesh now: Edit Mode works on it
+    await page.getByTestId('viewport').hover();
+    await page.keyboard.press('Tab');
+    await expect(page.getByTestId('mode-select')).toHaveValue('EDIT');
+    await page.keyboard.press('Tab');
+    await expect(page.getByTestId('mode-select')).toHaveValue('OBJECT');
+    await client.close();
+  });
+});

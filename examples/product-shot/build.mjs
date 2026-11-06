@@ -334,7 +334,11 @@ function capProfile() {
   ];
 }
 
-/** A disc/column with rounded rims (fillet radius f) and a flat top: replaces BEVEL (see README). */
+/**
+ * A disc or column with rounded rims (fillet radius f) and a flat top, as a lathe profile. A BEVEL
+ * modifier on a cylinder gives the same shape, but it stretches the cylinder's UVs across the seam
+ * between cap and side, which spoils the marble baked into scene.glb (see README).
+ */
 function roundedDisc(radius, height, f, { bottomFillet = true, n = 6 } = {}) {
   const bottom = bottomFillet ? [[radius - f, 0], ...arc(radius - f, f, f, f, -PI / 2, 0, n)] : [[radius, 0]];
   return [
@@ -742,7 +746,15 @@ async function buildCamera() {
     clip_start: 0.05,
     clip_end: 20,
   });
-  log(`   camera at ${JSON.stringify(pos)}: ${JSON.stringify(r.cameras[0]).slice(0, 300)}`);
+  // The result reports the evaluated focus distance: the depth of the Focus Point (label centre).
+  const cam = r.cameras[0];
+  log(
+    `   camera at ${JSON.stringify(pos)}: ${cam.lens} mm, f/${cam.dof_aperture_fstop}, focus ${cam.dof_focus_distance} m on ${cam.dof_focus_object}`,
+  );
+  check(
+    Math.abs(cam.dof_focus_distance - dist(pos, LABEL_CENTER)) < 2e-3,
+    `focus distance ${cam.dof_focus_distance} m, expected the label depth ${dist(pos, LABEL_CENTER)} m`,
+  );
 }
 
 /**
@@ -925,11 +937,23 @@ async function finalStill() {
   results.still = await saveFile(r, path.join(OPTS.outDir, 'render.png'));
 }
 
-/** A render_animation result must contain every requested frame; checked before the file is written. */
-function checkFrames(what, info, expected) {
+/**
+ * A render_animation result must contain every requested frame, each sampled to at least half of the
+ * requested samples (the time limit stops slow frames early); checked before the file is written.
+ */
+function checkFrames(what, info, expected, samples) {
   check(
     !info.truncated && info.frame_count === expected,
     `${what}: ${info.frame_count}/${expected} frames, truncated ${info.truncated}; not written`,
+  );
+  const reached = info.samples_reached;
+  log(
+    `   ${what}: ${info.frame_count} frames, samples per pixel min ${reached?.min} / mean ${reached?.mean} of ${samples}` +
+      (info.undersampled_frames?.length ? `, undersampled frames ${info.undersampled_frames.join(' ')}` : ''),
+  );
+  check(
+    reached && reached.min >= Math.ceil(samples / 2),
+    `${what}: a frame reached only ${reached?.min} of ${samples} samples; not written`,
   );
 }
 
@@ -949,7 +973,7 @@ async function turntableOutputs() {
     denoise: true,
     time_limit: 300,
   });
-  checkFrames('contact sheet', sheet.text, Math.ceil(loopLen / 3));
+  checkFrames('contact sheet', sheet.text, Math.ceil(loopLen / 3), OPTS.animSamples * 2);
   results.contact_sheet = await saveFile(sheet, path.join(OPTS.outDir, 'contact_sheet.png'));
   const gif = await call('render_animation', {
     format: 'GIF',
@@ -964,7 +988,7 @@ async function turntableOutputs() {
     fps: 12,
     dither: 'BAYER',
   });
-  checkFrames('GIF', gif.text, loopLen);
+  checkFrames('GIF', gif.text, loopLen, OPTS.animSamples);
   results.gif = await saveFile(gif, path.join(OPTS.outDir, 'preview.gif'));
 }
 
