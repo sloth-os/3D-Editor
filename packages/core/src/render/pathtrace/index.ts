@@ -10,7 +10,7 @@ export { buildBVH, bvhStats, type BVH } from './bvh';
 export { meshGeometry, type MeshGeometry } from './geometry';
 export { SceneIntersector, type SceneInstances } from './intersect';
 export { Sampler, sobol2, owenScramble, hash32, filterOffset, FILTER_WIDTH } from './sampler';
-export { PrincipledBSDF, fresnelDielectric, SPECULAR_ALPHA, type BSDFInputs } from './bsdf';
+export { PrincipledBSDF, fresnelDielectric, thinTransmittance, SPECULAR_ALPHA, type BSDFInputs } from './bsdf';
 export {
   studioRadiance,
   ENV_UNIFORM,

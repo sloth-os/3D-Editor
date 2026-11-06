@@ -32,6 +32,8 @@ function layered(
 ) {
   const doc = SceneDoc.create({ empty: true });
   doc.updateWorld({ environment: 'NONE', color: [0, 0, 0] });
+  // levels compared with linearToSrgb: the Standard view transform
+  doc.updateRender({ view_transform: 'STANDARD' });
   doc.addObject({ type: 'LIGHT', name: 'Off', data: doc.addLight({ type: 'SUN', energy: 0 }) });
   if (floor)
     doc.addObject({
@@ -143,6 +145,7 @@ describe('RASTER smooth transparency (#5, #40)', () => {
     // floor: an emissive red/blue split; a glass sheet (transmission 1) over half of it
     const doc = SceneDoc.create({ empty: true });
     doc.updateWorld({ environment: 'NONE', color: [0, 0, 0] });
+    doc.updateRender({ view_transform: 'STANDARD' });
     doc.addObject({ type: 'LIGHT', name: 'Off', data: doc.addLight({ type: 'SUN', energy: 0 }) });
     const glow = (rgb: [number, number, number]) =>
       doc.addMaterial({ base_color: [0, 0, 0, 1], roughness: 1, emission_color: rgb, emission_strength: 1 });

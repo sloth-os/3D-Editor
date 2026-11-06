@@ -76,7 +76,10 @@ async function build(client: Client, project: string): Promise<void> {
   });
   const batch = await ok(client, 'batch', {
     project,
-    operations: Array.from({ length: 20 }, (_, i) => ({ operator: 'paint.vertex_color_stroke', params: dab(i) })),
+    operations: Array.from({ length: 20 }, (_, i) => ({
+      operator: 'paint.vertex_color_stroke',
+      params: dab(i),
+    })),
   });
   expect(batch.failed ?? 0).toBe(0);
   for (let i = 20; i < 30; i++)
@@ -139,7 +142,10 @@ describe('server memory under repeated rebuilds', () => {
     for (const s of sizes) expect(s).toBeLessThan(budget + 4 * MB);
     expect(sizes[5] - sizes[1]).toBeLessThan(2 * MB);
     // memory: bounded too (it grew by ~50 MB per round: old mesh versions and their decoded copies)
-    expect(heaps[5] - heaps[1], `heap after each round (MB): ${heaps.map((h) => h.toFixed(0)).join(', ')}`).toBeLessThan(40);
+    expect(
+      heaps[5] - heaps[1],
+      `heap after each round (MB): ${heaps.map((h) => h.toFixed(0)).join(', ')}`,
+    ).toBeLessThan(40);
     // undo still works within the history (16 steps of ~0.5 MB fit the 8 MB budget)
     const undone = await ok(client, 'undo', { project: id, steps: 100 });
     expect(undone.undone).toBeGreaterThan(10);
@@ -160,7 +166,9 @@ describe('server memory under repeated rebuilds', () => {
     await memoryMb(); // collects garbage
     expect(doc.deref(), 'the deleted project document is still reachable').toBeUndefined();
     // the sessions carry on
-    expect((await ok(viewer, 'list_projects', {})).projects.some((p: { id: string }) => p.id === id)).toBe(false);
+    expect((await ok(viewer, 'list_projects', {})).projects.some((p: { id: string }) => p.id === id)).toBe(
+      false,
+    );
     const next = await ok(builder, 'create_project', { name: 'Next', empty: true });
     await ok(builder, 'add_object', { project: next.id, type: 'cube' });
     expect((await ok(builder, 'undo', { project: next.id })).undone).toBe(1);
@@ -187,7 +195,10 @@ describe('server memory under repeated rebuilds', () => {
     }
     // the session's history is gone: the document holds the live scene only (~1 MB, was ~15 MB)
     for (const s of sizes) expect(s).toBeLessThan(2 * MB);
-    expect(heaps[3] - heaps[1], `heap after each round (MB): ${heaps.map((h) => h.toFixed(0)).join(', ')}`).toBeLessThan(25);
+    expect(
+      heaps[3] - heaps[1],
+      `heap after each round (MB): ${heaps.map((h) => h.toFixed(0)).join(', ')}`,
+    ).toBeLessThan(25);
     expect(server.handle.rooms.get(last)).toBeTruthy();
   });
 });

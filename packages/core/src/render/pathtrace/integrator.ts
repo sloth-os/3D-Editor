@@ -1419,8 +1419,10 @@ export class PathIntegrator {
           this.albB = aovTB * bsdf.albedoB;
         }
       }
-      // the bounce limit was reached: this segment only collected (MIS-weighted) emission
-      if (finalSegment) break;
+      // the bounce limit was reached: this segment only collects (MIS-weighted) emission, but it
+      // still passes thin-walled glass (like transparent layers) to reach the light behind it
+      const passOnly = finalSegment;
+      if (passOnly && !(owned && transmissive)) break;
       if (!bsdf.active && !splitPass) break;
       // alpha-blended surfaces scattered at with deterministic coverage get their own dimensions
       // (the surface behind them is shaded in the same sample)
@@ -1433,7 +1435,7 @@ export class PathIntegrator {
       // ---- next-event estimation
       let selTotal = 0;
       let savedSel = false;
-      if (bsdf.active && !bsdf.singular && lights.count > 0) {
+      if (!passOnly && bsdf.active && !bsdf.singular && lights.count > 0) {
         // the previous vertex's selection weights, for transmissions that continue its MIS state
         if (owned && transmissive && prevTotal > 0) {
           lights.save();
@@ -1562,6 +1564,7 @@ export class PathIntegrator {
       smp.next2D(dimBase);
       if (!bsdf.sample(smp.u0, smp.u1, uLobe)) break;
       const transmission = bsdf.sampledTransmission;
+      if (passOnly && !(transmission && bsdf.sampledDelta)) break;
       // beyond the bounce limit the ray is still traced, but only to find the light it hits
       // (completes the MIS of this vertex's direct lighting), not to scatter again
       if (

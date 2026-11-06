@@ -269,6 +269,8 @@ class MainThread implements RenderThread {
         return this.engine.autoView(req.doc, req.frames, req.aspect, req.camera, req.budgetMs);
       case 'simulate':
         return this.engine.simulate(req.doc, req.frames);
+      case 'export':
+        return this.engine.exportFile(req.doc, req.format, req.options);
       case 'ping':
         return { ok: true };
     }

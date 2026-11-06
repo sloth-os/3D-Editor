@@ -306,7 +306,12 @@ export class McpHub {
       const sessionId = randomUUID();
       const agent = new AgentSession(
         sessionId,
-        { rooms: this.opts.rooms, registry: this.opts.registry, log: this.opts.log, history: this.opts.history },
+        {
+          rooms: this.opts.rooms,
+          registry: this.opts.registry,
+          log: this.opts.log,
+          history: this.opts.history,
+        },
         agentId ? this.identity(agentId) : undefined,
       );
       const server = this.createServer(agent);

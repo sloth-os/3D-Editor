@@ -2,7 +2,8 @@
 /**
  * Minimal MCP client for the 3D editor server (Streamable HTTP), usable as a CLI or a module.
  *
- *   node scripts/mcp.mjs tools [filter]            list tools
+ *   node scripts/mcp.mjs tools [filter] [--json]   list tools; with a filter, each matching tool's
+ *                                                  description and arguments (--json: input schemas)
  *   node scripts/mcp.mjs ops [filter]              list operators (via list_operators)
  *   node scripts/mcp.mjs call <tool> ['<json>'] [--out file] [--out-dir dir]
  *   node scripts/mcp.mjs batch <calls.json> [--out-dir dir]   [{ "tool": "...", "args": {...} }, ...]
@@ -190,13 +191,82 @@ function takeFlag(args, flag) {
   return i >= 0 ? args.splice(i, 2)[1] : null;
 }
 
+/** A short type of a JSON schema property: `number`, `string[]`, `[number, number, number]`, `A | B` … */
+function schemaType(p) {
+  if (!p || typeof p !== 'object') return 'any';
+  if (p.enum) return p.enum.map((v) => JSON.stringify(v)).join(' | ');
+  if (p.const !== undefined) return JSON.stringify(p.const);
+  const alts = p.anyOf ?? p.oneOf;
+  if (alts) return [...new Set(alts.map(schemaType))].join(' | ');
+  if (p.type === 'array') {
+    // tuples: draft 2020-12 prefixItems, or draft-07 items as an array
+    const tuple = Array.isArray(p.prefixItems) ? p.prefixItems : Array.isArray(p.items) ? p.items : null;
+    if (tuple) return `[${tuple.map(schemaType).join(', ')}]`;
+    const item = schemaType(p.items);
+    const n = p.minItems !== undefined && p.minItems === p.maxItems ? ` × ${p.minItems}` : '';
+    return `${item.includes(' ') ? `(${item})` : item}[]${n}`;
+  }
+  if (p.type === 'object' && !p.properties && p.additionalProperties) return 'object (any keys)';
+  return Array.isArray(p.type) ? p.type.join(' | ') : (p.type ?? 'any');
+}
+
+/** Lines describing the properties of an object schema (nested objects and object arrays indented). */
+function describeProperties(schema, indent = '  ', depth = 0) {
+  const lines = [];
+  const required = new Set(schema?.required ?? []);
+  for (const [key, p] of Object.entries(schema?.properties ?? {})) {
+    const facts = [schemaType(p), required.has(key) ? 'required' : 'optional'];
+    if (p.default !== undefined) facts.push(`default ${JSON.stringify(p.default)}`);
+    // zod gives every integer the safe-integer range: not worth showing
+    const bound = (v) => (v === undefined || Math.abs(v) >= Number.MAX_SAFE_INTEGER ? undefined : v);
+    const lo =
+      bound(p.minimum) ?? (bound(p.exclusiveMinimum) !== undefined ? `>${p.exclusiveMinimum}` : undefined);
+    const hi =
+      bound(p.maximum) ?? (bound(p.exclusiveMaximum) !== undefined ? `<${p.exclusiveMaximum}` : undefined);
+    if (lo !== undefined || hi !== undefined) facts.push(`range ${lo ?? '…'}..${hi ?? '…'}`);
+    lines.push(`${indent}${key} (${facts.join(', ')})${p.description ? `: ${p.description}` : ''}`);
+    const nested =
+      p.type === 'object' ? p : p.type === 'array' && p.items?.type === 'object' ? p.items : null;
+    if (nested?.properties && depth < 3) lines.push(...describeProperties(nested, `${indent}  `, depth + 1));
+  }
+  return lines;
+}
+
+/** `tools [filter]`: one line per tool, or with a filter each matching tool in full. */
+export function formatTools(tools, filter = '', { json = false } = {}) {
+  const f = filter.toLowerCase();
+  const exact = tools.filter((t) => t.name === f);
+  const matches = exact.length ? exact : tools.filter((t) => !f || t.name.includes(f));
+  if (json)
+    return JSON.stringify(
+      matches.map((t) => ({ name: t.name, inputSchema: t.inputSchema })),
+      null,
+      2,
+    );
+  if (!f) return tools.map((t) => `${t.name}: ${(t.description ?? '').split('. ')[0]}`).join('\n');
+  if (!matches.length) return `no tool matches '${filter}' (tools: ${tools.map((t) => t.name).join(', ')})`;
+  return matches
+    .map((t) => {
+      const args = describeProperties(t.inputSchema);
+      return [
+        `${t.name}`,
+        `  ${t.description ?? ''}`,
+        args.length ? '  Arguments:' : '  No arguments.',
+        ...args.map((l) => `  ${l}`),
+      ].join('\n');
+    })
+    .join('\n\n');
+}
+
 async function main(argv) {
   const [cmd, ...rest] = argv;
+  const json = rest.includes('--json');
+  if (json) rest.splice(rest.indexOf('--json'), 1);
   const out = takeFlag(rest, '--out');
   const outDir = takeFlag(rest, '--out-dir');
   if (!['tools', 'ops', 'call', 'batch'].includes(cmd)) {
     console.error(
-      'usage: mcp.mjs tools [filter] | ops [filter] | call <tool> [json] [--out f] [--out-dir d] | batch <file> [--out-dir d]',
+      'usage: mcp.mjs tools [filter] [--json] | ops [filter] | call <tool> [json] [--out f] [--out-dir d] | batch <file> [--out-dir d]',
     );
     process.exitCode = 2;
     return;
@@ -209,9 +279,7 @@ async function main(argv) {
     );
   try {
     if (cmd === 'tools') {
-      const f = (rest[0] ?? '').toLowerCase();
-      for (const t of await mcp.tools())
-        if (!f || t.name.includes(f)) console.log(`${t.name}: ${(t.description ?? '').split('. ')[0]}`);
+      console.log(formatTools(await mcp.tools(), rest[0] ?? '', { json }));
     } else if (cmd === 'ops') {
       const r = await mcp.call('list_operators', rest[0] ? { search: rest[0] } : {});
       console.log(JSON.stringify(r, null, 2));

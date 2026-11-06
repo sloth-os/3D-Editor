@@ -13,7 +13,6 @@ import {
   base64Encode,
   detectFormat,
   enterEditMode,
-  exportScene,
   importFile,
   selectAllElements,
   selectionFromEdges,
@@ -74,7 +73,7 @@ import {
 } from './keyframes';
 import { findOperatorGroup, operatorGroupNames, toolOnlyOperator } from './operator-groups';
 import { strictArgObject, strictToolSchema } from './strict-args';
-import type { AnimationOutput, FrameOptions, Renderer } from '../render';
+import { isCancelled, type AnimationOutput, type FrameOptions, type Renderer } from '../render';
 import type { RenderStore, StoredFile } from '../render/store';
 import {
   DEFAULT_ANIMATION_TIME_LIMIT,
@@ -1799,6 +1798,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           done++;
         }
         p.room.touch();
+        // objects the steps removed are no longer selected (also in the presence others see)
+        p.syncSelection();
         const dropped = p.history.stats().dropped_steps;
         return {
           [kind === 'undo' ? 'undone' : 'redone']: done,
@@ -1886,7 +1887,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Export scene',
       description:
-        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at a frame (default: the agent's current frame). OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, warnings} plus the file as an embedded base64 resource (up to 20 MiB) and a download link. download_url (an HTTP endpoint of this server) exports again when it is fetched, with the same options (format, objects, apply_modifiers, frame): the same file as the embedded one while the scene is unchanged, the project's current state after later edits. `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped.",
+        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at a frame (default: the agent's current frame). OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, elapsed_ms, warnings} plus the file as an embedded base64 resource (up to 20 MiB) and a download link. The export runs on a render thread, so it does not hold up the server; a glTF export samples every frame of the scene range, which takes seconds for long ranges and large scenes. download_url (an HTTP endpoint of this server) exports again when it is fetched, with the same options (format, objects, apply_modifiers, frame): the same file as the embedded one while the scene is unchanged, the project's current state after later edits. `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped.",
       annotations: READ_ONLY,
     },
     {
@@ -1908,12 +1909,17 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const frame = a.frame ?? p.state.frame;
       let res;
       try {
-        res = exportScene(p.scene, a.format as ExportFormat, {
-          objectIds,
-          applyModifiers: a.apply_modifiers,
-          frame,
+        // on a render thread: a large glTF export (animation sampled per frame, texture bakes)
+        // takes seconds and must not hold up the event loop that serves editors and agents
+        res = await renderer.exportScene({
+          scene: p.scene,
+          projectId: p.id,
+          format: a.format as ExportFormat,
+          options: { objectIds, applyModifiers: a.apply_modifiers, frame },
+          signal: extra.signal,
         });
       } catch (err) {
+        if (isCancelled(err)) throw new ToolError('The export was cancelled.');
         if (isNotImplemented(err))
           throw new ToolError(`Exporting ${a.format} is not available in this build: ${errorMessage(err)}`);
         throw new ToolError(`Export failed: ${errorMessage(err)}`);
@@ -1933,8 +1939,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         objects: objectIds ? objectIds.map((id) => p.scene.getObject(id)?.name ?? id) : 'all',
         apply_modifiers: a.apply_modifiers,
         download_url: downloadUrl,
+        elapsed_ms: res.elapsedMs,
         // what the format could not represent (procedural textures that need UVs, area lights …)
-        warnings: res.warnings ?? [],
+        warnings: res.warnings,
       };
       const content: CallToolResult['content'] = [{ type: 'text', text: JSON.stringify(info, null, 2) }];
       if (res.data.byteLength <= MAX_EMBEDDED_EXPORT_BYTES) {

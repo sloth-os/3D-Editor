@@ -1,6 +1,6 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { exportScene, type ExportFormat } from '@3d-editor/core';
+import type { ExportFormat } from '@3d-editor/core';
 import type { RoomManager } from '../sync/room-manager';
 import { StorageUnavailableError } from '../sync/room-manager';
 import type { Room } from '../sync/room';
@@ -171,15 +171,25 @@ export function registerProjectRoutes(
       if (missing.length) return reply.code(400).send({ error: `objects not found: ${missing.join(', ')}` });
       objectIds = refs.map((r) => room.scene.resolveObject(r)!.id);
     }
+    // a client that goes away cancels the export, and so does a server shutdown
+    const abort = new AbortController();
+    const onClose = () => {
+      if (!reply.raw.writableFinished) abort.abort();
+    };
+    reply.raw.once('close', onClose);
+    rendering.add(abort);
     try {
+      // on a render thread (exports of large animated scenes take seconds: not on the event loop)
       const result = await withSpan(
         'project.export',
         { 'project.id': id, 'export.format': q.data.format },
         () =>
-          exportScene(room.scene, q.data.format as ExportFormat, {
-            objectIds,
-            applyModifiers: q.data.apply_modifiers,
-            frame: q.data.frame,
+          renderer().exportScene({
+            scene: room.scene,
+            projectId: id,
+            format: q.data.format as ExportFormat,
+            options: { objectIds, applyModifiers: q.data.apply_modifiers, frame: q.data.frame },
+            signal: abort.signal,
           }),
       );
       return reply
@@ -189,10 +199,18 @@ export function registerProjectRoutes(
           `attachment; filename="${safeFileName(room.scene.name, result.extension)}"`,
         )
         .header('cache-control', 'no-store')
+        .header('x-export-time-ms', String(result.elapsedMs))
         .send(Buffer.from(result.data.buffer, result.data.byteOffset, result.data.byteLength));
     } catch (err) {
+      if (isCancelled(err))
+        return reply
+          .code(abort.signal.aborted && reply.raw.writable ? 503 : 499)
+          .send({ error: 'export cancelled' });
       if (isNotImplemented(err)) return reply.code(501).send({ error: errorMessage(err) });
       return reply.code(500).send({ error: `export failed: ${errorMessage(err)}` });
+    } finally {
+      rendering.delete(abort);
+      reply.raw.off('close', onClose);
     }
   });
 

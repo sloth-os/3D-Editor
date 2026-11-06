@@ -36,7 +36,7 @@ Start a server on any port, then run the build against it:
 ```bash
 cd /path/to/3D-Editor
 PORT=4501 DATA_DIR=/tmp/lc-data node apps/server/dist/main.js &   # or any running editor server
-MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs                 # full run (about 12 min on 3 cores)
+MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs                 # full run (about 11 min with RENDER_WORKERS=3)
 MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --build-only    # scene + checks only (5–10 s)
 MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --preview       # + RASTER and 16-spp previews in $TMPDIR/lighthouse-cove-preview (about 45 s)
 MCP_URL=http://127.0.0.1:4501/mcp node examples/lighthouse-cove/build.mjs --export-only   # scene + checks + scene.glb, no renders (about 20 s)
@@ -105,8 +105,8 @@ the 6-spp animation.
 - **Materials**: presets, procedural textures (WAVE, VORONOI, GRADIENT, BRICK and NOISE presets)
   on the base_color, normal and emission channels, emission, transmission and alpha blending.
 - **Lights and cameras by name**: every light setting is passed straight to `add_object` or
-  `object.light_add`, including spot cone, blend, radius and area shape and size. The camera gets `lens` and
-  `clip_end`. These replace the single-keyframe workaround of the first version.
+  `object.light_add`, including spot cone, blend, radius and area shape and size. The camera
+  gets `lens` and `clip_end`. These replace the single-keyframe workaround of the first version.
 - **Curves and text**: a bevel profile object, per-point tilt, `data.set_property` to hide the
   profile helper, and extruded text.
 - **Instancing**: `object.scatter_add` with vertex-group density and `min_distance`,
@@ -141,7 +141,20 @@ PORT=4551 DATA_DIR=<new empty dir> RENDER_WORKERS=3 node .phase3/app-v2/dist/mai
 MCP_URL=http://127.0.0.1:4551/mcp node examples/lighthouse-cove/build.mjs
 ```
 
-FINAL_RUN_TIMINGS
+Measured on 2026-11-06. The run held the render lock from 06:36:35 to 06:47:55, and the
+machine's 4 cores were shared with other agents (load average 6–9). Exit code 0:
+
+| Stage | Settings | Time | Result |
+| --- | --- | --- | --- |
+| Build and checks | the whole scene, then the beam, path, camera and placement checks | 10.5 s | all checks passed (island 5.9 s, of which 4.9 s are the vertex colours; checks 1.9 s) |
+| Final still `render.png` | 1280×720, path tracer, 128 spp, 8 bounces, denoise, ACES, time limit 480 s | 459.8 s | **128 of 128 spp**, 3 threads, 0.64 MB |
+| `contact_sheet.png` | 24 frames, 320×180 each, 6 columns, path tracer, 12 spp, denoise | 51.4 s | 24 frames, none dropped, 1.06 MB |
+| `preview.gif` | 24 frames, 480×270, 10 fps, path tracer, 16 spp, denoise, Floyd–Steinberg dither | 156.3 s | 24 frames, none dropped, 0.96 MB |
+| **Total** | | **678.1 s (11.3 min)** | |
+
+The saved project (`document.ybin` in the server's data directory) is 213 MB; see the known
+limitations. An earlier final run on a busier machine (load average about 12, time limit 420 s)
+reached only 91 of 128 spp in the still.
 
 ## Known limitations
 
@@ -180,7 +193,7 @@ FINAL_RUN_TIMINGS
   large (next point).
 - **The project's document is very large.** Every edit of the 16,641-vertex island replaces
   whole attribute layers (1.4 MB per paint dab), and the synced document keeps every replaced
-  copy. The saved project is therefore about 210 MB. The web editor downloads that much when it
+  copy. The saved project is therefore about 213 MB. The web editor downloads that much when it
   opens the project (15–20 s on localhost), and the server holds 630–750 MB of heap for it.
   Deleting the project frees the memory, but a long-running server with the default heap limit
   (about 2 GB) once ran out of memory after half an hour of rebuilds and previews. Restart the
@@ -192,9 +205,10 @@ FINAL_RUN_TIMINGS
 - **The path still floats slightly in places.** It is banked with the ground, but on the steep
   final stretch below the lighthouse it floats up to 0.31 m above the terrain, against 0.11 m for
   a perfect fit.
-- **Depth of field is not used.** With a 26 mm lens and everything 15–60 m away, the circle of
-  confusion stays below one pixel even at f/1.4. `camera.properties_set {dof_use,
-  dof_focus_distance, dof_aperture_fstop}` would therefore have no visible effect on this wide shot.
+- **Depth of field is not used.** With a 26 mm lens, focus on the lighthouse 43 m away and
+  everything else 11–60 m away, the circle of confusion stays at about one pixel or less even at
+  f/1.4. `camera.properties_set {dof_use, dof_focus_distance, dof_aperture_fstop}` would
+  therefore have no visible effect on this wide shot.
 - **`scene.glb` is regenerated later.** The present exporter writes about 6.2 MB in 14 s, bakes
   procedural textures to PNG and exports the window area lights as point lights (it says so in
   its warnings). Drivers, the sky and the mist are not part of glTF.

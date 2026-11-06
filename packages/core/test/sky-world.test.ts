@@ -161,6 +161,8 @@ describe('CPU renderer: sky and mist', () => {
     const { doc, run } = setup();
     // sun ahead of the camera (+Y), above the field of view
     run('world.sky_set', { sun_elevation: deg(40), sun_rotation: 0 });
+    // compared with linearToSrgb: the Standard view transform
+    doc.updateRender({ view_transform: 'STANDARD' });
     const fovY = 0.8;
     const img = renderSceneSoftware(doc, {
       width: 64,

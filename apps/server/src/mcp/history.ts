@@ -100,7 +100,8 @@ function valueBytes(v: unknown, depth = 0): number {
         return 32 + (s * n) / sample;
       }
       let s = 32;
-      for (const [k, x] of Object.entries(v as Record<string, unknown>)) s += 16 + k.length * 2 + valueBytes(x, depth + 1);
+      for (const [k, x] of Object.entries(v as Record<string, unknown>))
+        s += 16 + k.length * 2 + valueBytes(x, depth + 1);
       return s;
     }
     default:
@@ -123,7 +124,8 @@ function keptBelow(type: Y.AbstractType<any>): boolean {
   const kept = (item: Y.Item): boolean =>
     item.keep || (item.content instanceof Y.ContentType && keptBelow(item.content.type));
   for (let item = type._start; item; item = item.right) if (kept(item)) return true;
-  for (const last of type._map.values()) for (let item: Y.Item | null = last; item; item = item.left) if (kept(item)) return true;
+  for (const last of type._map.values())
+    for (let item: Y.Item | null = last; item; item = item.left) if (kept(item)) return true;
   return false;
 }
 
@@ -341,17 +343,20 @@ export class AgentHistory {
     this.doc.transact((tr) => {
       for (const s of steps)
         Y.iterateDeletedStructs(tr, s.deletions, (struct) => {
-          if (!(struct instanceof Y.Item) || !struct.keep) return;
-          if (struct.content instanceof Y.ContentType) {
-            if (leavesOnly) return;
-            containers.push(struct);
-          }
+          if (!(struct instanceof Y.Item)) return;
+          const container = struct.content instanceof Y.ContentType;
+          // also the containers Yjs un-kept itself (dropped redo steps): checked below
+          if (container) containers.push(struct);
+          if (!struct.keep || (container && leavesOnly)) return;
           bytes += itemContentBytes(struct);
           items++;
           struct.keep = false;
         });
     }, GC_ORIGIN);
-    for (const c of containers) if (keptBelow((c.content as Y.ContentType).type)) c.keep = true;
+    // collecting a container wipes everything below it: keep those below which a step still keeps
+    // data, and every container of popped steps (their children carry the links undo follows)
+    for (const c of containers)
+      if (!c.keep && (leavesOnly || keptBelow((c.content as Y.ContentType).type))) c.keep = true;
     this.collect(Y.mergeDeleteSets(steps.map((s) => s.deletions)));
     this.totals.released_items += items;
     this.totals.released_bytes += bytes;

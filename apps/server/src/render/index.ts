@@ -3,6 +3,7 @@ import {
   MAX_ANIMATION_FRAMES,
   contactSheetLayout,
   type AnimationFormat,
+  type ExportFormat,
   type GIFDither,
   type SceneDoc,
 } from '@3d-editor/core';
@@ -20,6 +21,8 @@ import {
   RenderCancelledError,
   isCancelled,
   type DocRef,
+  type ExportJobOptions,
+  type ExportedFile,
   type FrameOptions,
   type ImageResult,
   type PhysicsFrame,
@@ -29,7 +32,7 @@ import {
 export { RenderPool, defaultRenderThreads, MAX_SHARED_RENDERS } from './pool';
 export type { LeaseOptions, RenderPoolOptions, RenderLease, RenderThread } from './pool';
 export { RenderCancelledError, isCancelled } from './protocol';
-export type { FrameOptions, ViewSpecInput } from './protocol';
+export type { ExportJobOptions, ExportedFile, FrameOptions, ViewSpecInput } from './protocol';
 export type { AnimationOutput, AnimationProgress } from './animation';
 
 /*
@@ -102,6 +105,21 @@ export interface RenderImageResult {
     resolve_ms?: number;
   };
   warnings: string[];
+}
+
+/** A file to export (see {@link Renderer.exportScene}). */
+export interface ExportRequest {
+  scene: SceneDoc;
+  projectId: string;
+  format: ExportFormat;
+  options: ExportJobOptions;
+  signal?: AbortSignal;
+}
+
+/** An exported file, with where and how long it took. */
+export interface ExportResult extends ExportedFile {
+  mode: 'workers' | 'main-thread';
+  elapsedMs: number;
 }
 
 /** An animation to render (see {@link Renderer.renderAnimation}). */
@@ -361,6 +379,33 @@ export class Renderer {
         elapsedMs: Math.round(performance.now() - t0),
         warnings: img.warnings ?? [],
       };
+    } finally {
+      lease.release();
+    }
+  }
+
+  /**
+   * Exports the scene (glTF, OBJ, STL, PLY) on a render thread, like a raster still (one free
+   * thread; it never waits for long renders): a glTF export samples the animation frame by frame
+   * and bakes procedural textures, which takes seconds on large scenes and used to hold up the
+   * event loop that serves every editor and agent. The thread exports the document state of the
+   * moment of the call. In single-thread mode (RENDER_WORKERS=0) it runs on the main thread.
+   */
+  async exportScene(req: ExportRequest): Promise<ExportResult> {
+    const t0 = performance.now();
+    const doc = this.docRef(req.projectId, req.scene);
+    const lease = await this.pool.lease(1, req.signal, { interactive: true });
+    try {
+      const file = await abortable(
+        lease.threads[0].call<ExportedFile>({
+          type: 'export',
+          doc,
+          format: req.format,
+          options: req.options,
+        }),
+        req.signal,
+      );
+      return { ...file, mode: this.pool.mode, elapsedMs: Math.round(performance.now() - t0) };
     } finally {
       lease.release();
     }

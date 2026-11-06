@@ -293,6 +293,8 @@ describe('RASTER studio / image environment lighting (#11)', () => {
   it('reflects the lit scene around (reflection probe): a chrome ball mirrors a bright floor', () => {
     const doc = SceneDoc.create({ empty: true });
     doc.updateWorld({ environment: 'NONE', color: [0, 0, 0] });
+    // hue ratios of a bright reflection: the Standard view transform (AgX desaturates highlights)
+    doc.updateRender({ view_transform: 'STANDARD' });
     const glow = doc.addMaterial({
       name: 'Glow',
       base_color: [0, 0, 0, 1],

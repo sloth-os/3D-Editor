@@ -4,14 +4,15 @@
  * MCP server (no file is touched except the outputs written next to this script).
  *
  * A blue glass marble rolls down a curved aluminium chute (a thick C-shaped profile curve swept
- * along a 3D Bezier path as a bevel object, converted to a mesh) that winds down from a tower of
- * toy blocks, leaves the lip and knocks over the first of 60 rainbow-coloured plastic dominoes
- * standing along an S-curve on a generated oak table. The table, chute, dowels, blocks and floor
- * are PASSIVE colliders, the dominoes ACTIVE boxes and the marble an ACTIVE sphere. The script
- * checks the simulation (every domino must topple, in path order), keys a focus target that
- * follows the marble and then the wave front (camera depth of field), animates a showcase camera,
- * renders inspection contact sheets, bakes the simulation to keyframes (and checks that the keys
- * reproduce it), then renders a path-traced still, a contact sheet and a GIF.
+ * along a 3D Bezier path as a bevel object, converted to a mesh) that starts in the top block of
+ * a tower of toy blocks, leaves the lip and knocks over the first of 60 rainbow-coloured plastic
+ * dominoes standing along an S-curve on a generated oak table. The table, chute, dowels, blocks
+ * and floor are PASSIVE colliders, the dominoes ACTIVE boxes and the marble an ACTIVE sphere. The
+ * script checks the simulation (every domino must topple, in path order; when and where the
+ * marble hits the first one), keys a focus target that follows the marble and then the wave front
+ * (camera depth of field), animates a showcase camera, renders inspection contact sheets, bakes
+ * the simulation to keyframes (and checks that the keys reproduce it), then renders a path-traced
+ * still, a contact sheet and a GIF.
  *
  *   MCP_URL=http://127.0.0.1:4504/mcp node examples/domino-cascade/build.mjs [mode] [options]
  *
@@ -21,7 +22,9 @@
  *   --preview      scene, verify, animate, bake, preview       (640x360 RASTER + 24 spp path trace)
  *   --export-only  scene, verify, animate, bake, export        (scene.glb only, no renders)
  *   --stages=a,b   any of: scene verify animate inspect bake preview still sheet gif export
- *                  (stages without `scene` work on the existing project, e.g. --stages=still)
+ *                  Stages without `scene` work on the existing project, baked or not: verify
+ *                  checks the live simulation or, once baked, the keyframes; bake skips a project
+ *                  that is already baked (e.g. --stages=verify, --stages=animate,still).
  * Options:
  *   --still-samples=N  --still-time=S   path-traced still budget (default 256 spp / 450 s)
  *   --frame=F                           still / preview frame (default 55, mid-cascade)
@@ -46,20 +49,30 @@ const MODES = {
   preview: ['scene', 'verify', 'animate', 'bake', 'preview'],
   'export-only': ['scene', 'verify', 'animate', 'bake', 'export'],
 };
-const KNOWN_STAGES = ['scene', 'verify', 'animate', 'inspect', 'bake', 'preview', 'still', 'sheet', 'gif', 'export'];
+const KNOWN_STAGES = [...new Set(Object.values(MODES).flat())]; // the stages in pipeline order
 const opts = { mode: 'final', stages: null, stillSamples: 256, stillTime: 450, frame: 55, draft: false };
 for (const arg of process.argv.slice(2)) {
   const [key, value] = arg.replace(/^--/, '').split('=');
   if (MODES[key] && value === undefined) opts.mode = key;
-  else if (key === 'stages' && value) opts.stages = value.split(',').map((s) => s.trim()).filter(Boolean);
+  else if (key === 'stages' && value)
+    opts.stages = value
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
   else if (key === 'still-samples') opts.stillSamples = Number(value);
   else if (key === 'still-time') opts.stillTime = Number(value);
   else if (key === 'frame') opts.frame = Number(value);
   else if (key === 'draft' && value === undefined) opts.draft = true;
-  else throw new Error(`unknown argument '${arg}' (modes: ${Object.keys(MODES).map((m) => '--' + m).join(' ')}; --stages=, --still-samples=, --still-time=, --frame=, --draft)`);
+  else
+    throw new Error(
+      `unknown argument '${arg}' (modes: ${Object.keys(MODES)
+        .map((m) => '--' + m)
+        .join(' ')}; --stages=, --still-samples=, --still-time=, --frame=, --draft)`,
+    );
 }
 const STAGES = new Set(opts.stages ?? MODES[opts.mode]);
-for (const s of STAGES) if (!KNOWN_STAGES.includes(s)) throw new Error(`unknown stage '${s}' (known: ${KNOWN_STAGES.join(', ')})`);
+for (const s of STAGES)
+  if (!KNOWN_STAGES.includes(s)) throw new Error(`unknown stage '${s}' (known: ${KNOWN_STAGES.join(', ')})`);
 
 const PROJECT = process.env.PROJECT_NAME ?? 'domino-cascade';
 const WORK = process.env.WORK_DIR ?? path.join(os.tmpdir(), 'domino-cascade-work');
@@ -77,7 +90,11 @@ const timings = {};
 // ---------------------------------------------------------------------------------------------
 const TABLE = { width: 2.6, depth: 1.5, height: 0.75, top: 0.05, leg: 0.09 };
 const TOP = TABLE.height; // z of the table top
-const DOMINO = { h: 0.08, w: 0.04, t: 0.014, mass: 0.047, count: 60 }; // jumbo toy dominoes
+// Jumbo toy dominoes, 14 mm thick (real ones are about 7.5 mm). The editor build that rendered
+// the outputs (README, "Final production run") gives every collision box at least 5 mm half
+// thickness, so 7.5 mm dominoes would collide like 10 mm slabs and hover above the table; at
+// 14 mm that clamp never applies. (The engine from commit 6451e56 on keeps thin boxes thin.)
+const DOMINO = { h: 0.08, w: 0.04, t: 0.014, mass: 0.047, count: 60 };
 const S_CURVE = { x0: -0.9, y0: 0.0, amplitude: 0.35, wavelength: 2.0 };
 const MARBLE = { r: 0.014, mass: 0.029 }; // 28 mm glass marble
 const CHUTE = {
@@ -115,19 +132,29 @@ const log = (...a) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1)}s]`,
 async function call(tool, args = {}) {
   const started = Date.now();
   try {
-    const r = await mcp.call(tool, { project: PROJECT, ...args }, {
-      onProgress: (p) => process.stderr.write(`    progress ${p.progress}${p.total ? '/' + p.total : ''} ${p.message ?? ''}\n`),
-    });
+    const r = await mcp.call(
+      tool,
+      { project: PROJECT, ...args },
+      {
+        onProgress: (p) =>
+          process.stderr.write(
+            `    progress ${p.progress}${p.total ? '/' + p.total : ''} ${p.message ?? ''}\n`,
+          ),
+      },
+    );
     const ms = Date.now() - started;
     if (ms > 2000) log(`  ${tool} took ${(ms / 1000).toFixed(1)} s`);
     return r;
   } catch (e) {
-    throw new Error(`${tool} ${JSON.stringify(args).slice(0, 300)} failed: ${e.message.slice(0, 2000)}`);
+    throw new Error(`${tool} ${JSON.stringify(args).slice(0, 300)} failed: ${e.message.slice(0, 2000)}`, {
+      cause: e,
+    });
   }
 }
 
 const printReports = (operator, reports) => {
-  for (const rep of reports ?? []) if (rep.level !== 'INFO') log(`  ${operator} ${rep.level}: ${rep.message}`);
+  for (const rep of reports ?? [])
+    if (rep.level !== 'INFO') log(`  ${operator} ${rep.level}: ${rep.message}`);
 };
 
 /**
@@ -136,7 +163,11 @@ const printReports = (operator, reports) => {
  * `selection` (`select`); unknown parameters are rejected by the server.
  */
 async function op(operator, params = {}, select = null) {
-  const r = await call('run_operator', { operator, params, ...(select ? { selection: { objects: select } } : {}) });
+  const r = await call('run_operator', {
+    operator,
+    params,
+    ...(select ? { selection: { objects: select } } : {}),
+  });
   printReports(operator, r.reports);
   return r.result;
 }
@@ -268,13 +299,19 @@ function dominoColor(i, n) {
 const layout = dominoLayout();
 const chute = chutePath(layout.dominoes[0]);
 const dominoNames = layout.dominoes.map((_, i) => `Domino.${String(i + 1).padStart(2, '0')}`);
-const MARBLE_START_INDEX = 7; // chute.dense index (35 mm down the lead-in)
+// The upper end of the chute runs into a fourth toy block on top of the tower: seen from the
+// cameras, the steep last few centimetres of the channel mirror the key light (and the end face
+// the rim light) as a blown-out white crescent, which the block hides.
+const START_BLOCK = { size: 0.06, cover: 0.03 }; // cube edge; length of channel inside the block
+const MARBLE_START_INDEX = 10; // chute.dense index: 50 mm down the lead-in, clear of the block
 
 // ---------------------------------------------------------------------------------------------
 // Stage: scene
 // ---------------------------------------------------------------------------------------------
 async function buildScene() {
-  log(`S-curve length ${layout.length.toFixed(3)} m, spacing ${(layout.spacing * 1000).toFixed(1)} mm, chute ${chute.length.toFixed(3)} m`);
+  log(
+    `S-curve length ${layout.length.toFixed(3)} m, spacing ${(layout.spacing * 1000).toFixed(1)} mm, chute ${chute.length.toFixed(3)} m`,
+  );
   const projects = await mcp.call('list_projects', {});
   const list = Array.isArray(projects) ? projects : (projects.projects ?? []);
   if (list.some((p) => p.name === PROJECT)) {
@@ -284,7 +321,13 @@ async function buildScene() {
   const created = await mcp.call('create_project', { name: PROJECT, empty: true });
   log(`created project ${created.id} — open ${created.editor_url}`);
 
-  await call('set_scene_settings', { frame_start: 1, frame_end: FRAME_END, fps: FPS, resolution_x: 1280, resolution_y: 720 });
+  await call('set_scene_settings', {
+    frame_start: 1,
+    frame_end: FRAME_END,
+    fps: FPS,
+    resolution_x: 1280,
+    resolution_y: 720,
+  });
 
   // --- table (generator) + its collider -----------------------------------------------------
   const table = await op('object.generate_table', {
@@ -316,7 +359,11 @@ async function buildScene() {
     scale: [DOMINO.t, DOMINO.w, DOMINO.h],
   });
   await op('object.transform_apply', { location: false, rotation: false, scale: true }, [dominoNames[0]]);
-  await call('add_modifier', { object: dominoNames[0], type: 'BEVEL', params: { width: 0.0025, segments: 3 } });
+  await call('add_modifier', {
+    object: dominoNames[0],
+    type: 'BEVEL',
+    params: { width: 0.0025, segments: 3 },
+  });
   await call('apply_modifier', { object: dominoNames[0], modifier: 'Bevel' });
   await op('object.shade_auto_smooth', { angle: deg(35) }, [dominoNames[0]]);
   await op('rigidbody.object_add', {
@@ -341,7 +388,11 @@ async function buildScene() {
     if (i > 0) ops.push({ operator: 'object.rename', params: { object: ids[i], name: dominoNames[i] } });
     ops.push({
       operator: 'object.transform_set',
-      params: { objects: [i === 0 ? dominoNames[0] : ids[i]], location: [d.x, d.y, d.z], rotation_euler: [0, 0, d.heading] },
+      params: {
+        objects: [i === 0 ? dominoNames[0] : ids[i]],
+        location: [d.x, d.y, d.z],
+        rotation_euler: [0, 0, d.heading],
+      },
     });
   });
   await batch(ops);
@@ -361,7 +412,14 @@ async function buildScene() {
     const a = -Math.PI / 2 - half + (2 * half * k) / nArc; // inner arc back
     prof.push([CHUTE.radius * Math.cos(a), CHUTE.radius * Math.sin(a), 0]);
   }
-  await op('curve.add_from_points', { name: 'Chute Profile', points: prof, type: 'POLY', cyclic: true, dimensions: '2D', location: [0, 0, -1] });
+  await op('curve.add_from_points', {
+    name: 'Chute Profile',
+    points: prof,
+    type: 'POLY',
+    cyclic: true,
+    dimensions: '2D',
+    location: [0, 0, -1],
+  });
   const pts = [];
   const stride = 6;
   for (let i = 0; i < chute.dense.length; i += stride) pts.push(chute.dense[i]);
@@ -383,7 +441,13 @@ async function buildScene() {
   await call('delete_objects', { objects: ['Chute Profile'] });
   await op('object.shade_auto_smooth', { angle: deg(40) }, ['Chute']);
   // the channel is concave: a triangle-mesh collider
-  await op('rigidbody.object_add', { objects: ['Chute'], type: 'PASSIVE', collision_shape: 'MESH', friction: 0.4, collision_margin: 0.002 });
+  await op('rigidbody.object_add', {
+    objects: ['Chute'],
+    type: 'PASSIVE',
+    collision_shape: 'MESH',
+    friction: 0.4,
+    collision_margin: 0.002,
+  });
 
   // --- marble -------------------------------------------------------------------------------
   const c0 = chute.dense[MARBLE_START_INDEX];
@@ -409,7 +473,12 @@ async function buildScene() {
   });
 
   // --- physics world ------------------------------------------------------------------------
-  const world = await op('rigidbody.world_set', { frame_start: 1, frame_end: FRAME_END, substeps_per_frame: 20, solver_iterations: 20 });
+  const world = await op('rigidbody.world_set', {
+    frame_start: 1,
+    frame_end: FRAME_END,
+    substeps_per_frame: 20,
+    solver_iterations: 20,
+  });
   log(`rigid body world: ${JSON.stringify(world.rigidbody_world)}, step ${world.step_seconds.toFixed(5)} s`);
 
   await buildProps();
@@ -421,9 +490,9 @@ async function buildScene() {
   if ((sc.problems ?? []).length) throw new Error('the scene has evaluation problems');
 }
 
-/** Toy-block tower under the top of the chute, dowels under the bend, the floor and two walls. */
+/** Toy-block tower (with the start block) under the chute, dowels under the bend, floor and walls. */
 async function buildProps() {
-  // three stacked toy blocks carry the top of the chute
+  // three stacked toy blocks carry the top of the chute, a fourth (the start block) sits over its end
   const top = chute.dense[0];
   const blockZ = TOP + CHUTE.startHeight - CHUTE.radius - CHUTE.wall - 0.001; // just under the chute
   const nBlocks = 3;
@@ -437,13 +506,33 @@ async function buildProps() {
         size,
         // the chute starts heading -X: the tower stands just behind its first point so the
         // blocks never poke through the channel floor
-        location: [top[0] + size / 2 - 0.008 + 0.006 * Math.sin(k * 2.1), top[1] + 0.006 * Math.cos(k * 1.7), TOP + size * (k + 0.5)],
+        location: [
+          top[0] + size / 2 - 0.008 + 0.006 * Math.sin(k * 2.1),
+          top[1] + 0.006 * Math.cos(k * 1.7),
+          TOP + size * (k + 0.5),
+        ],
         rotation: [0, 0, deg([8, -11, 4][k])],
       },
     });
   }
+  // the start block on top: the first START_BLOCK.cover metres of the channel run inside it
+  blockOps.push({
+    operator: 'mesh.primitive_cube_add',
+    params: {
+      name: 'Start Block',
+      size: START_BLOCK.size,
+      location: [
+        top[0] - START_BLOCK.cover + START_BLOCK.size / 2,
+        top[1] + 0.003,
+        blockZ + START_BLOCK.size / 2,
+      ],
+      rotation: [0, 0, deg(-5)],
+    },
+  });
   await batch(blockOps);
-  for (let k = 0; k < nBlocks; k++) await call('add_modifier', { object: `Block.${k + 1}`, type: 'BEVEL', params: { width: 0.004, segments: 2 } });
+  const blocks = [...Array.from({ length: nBlocks }, (_, k) => `Block.${k + 1}`), 'Start Block'];
+  for (const name of blocks)
+    await call('add_modifier', { object: name, type: 'BEVEL', params: { width: 0.004, segments: 2 } });
 
   // wooden dowels under the chute (they stop where the chute floor is)
   const ds = 0.005;
@@ -454,27 +543,67 @@ async function buildProps() {
       const h = p[2] - CHUTE.radius - CHUTE.wall - TOP;
       return {
         operator: 'mesh.primitive_cylinder_add',
-        params: { name: `Dowel.${k + 1}`, radius: 0.006, depth: h, vertices: 16, location: [p[0], p[1], TOP + h / 2] },
+        params: {
+          name: `Dowel.${k + 1}`,
+          radius: 0.006,
+          depth: h,
+          vertices: 16,
+          location: [p[0], p[1], TOP + h / 2],
+        },
       };
     }),
   );
   // colliders for the props, so a stray marble cannot roll through them
-  await op('rigidbody.object_add', { objects: dowelAt.map((_, k) => `Dowel.${k + 1}`), type: 'PASSIVE', collision_shape: 'CYLINDER', collision_margin: 0.001 });
   await op('rigidbody.object_add', {
-    objects: Array.from({ length: nBlocks }, (_, k) => `Block.${k + 1}`),
+    objects: dowelAt.map((_, k) => `Dowel.${k + 1}`),
+    type: 'PASSIVE',
+    collision_shape: 'CYLINDER',
+    collision_margin: 0.001,
+  });
+  await op('rigidbody.object_add', {
+    objects: blocks,
     type: 'PASSIVE',
     collision_shape: 'BOX',
     collision_margin: 0.001,
   });
+  // the marble must start clear of the start block (an initial overlap would kick it)
+  const gap = await op('scene.measure', { objects: ['Marble', 'Start Block'] });
+  const clearance = gap.distances?.[0]?.surface_distance;
+  log(`marble to start block: ${(clearance * 1000).toFixed(1)} mm`);
+  if (!(clearance > 0.003))
+    throw new Error(`the marble starts too close to the start block: ${JSON.stringify(gap).slice(0, 300)}`);
 
   // room: a floor and two plaster walls closing the corner behind the table (x = -3.2, y = 3.2);
   // the floor is rotated a quarter turn so its (object space) boards run along world Y
-  await op('mesh.primitive_plane_add', { name: 'Floor', size: 1, location: [0.65, -0.4, 0], rotation: [0, 0, deg(90)], scale: [7.2, 7.7, 1] });
+  await op('mesh.primitive_plane_add', {
+    name: 'Floor',
+    size: 1,
+    location: [0.65, -0.4, 0],
+    rotation: [0, 0, deg(90)],
+    scale: [7.2, 7.7, 1],
+  });
   await op('object.transform_apply', { location: false, rotation: false, scale: true }, ['Floor']);
-  await op('mesh.primitive_plane_add', { name: 'Wall', size: 1, location: [0.65, 3.2, 1.6], rotation: [deg(90), 0, 0], scale: [7.7, 3.2, 1] });
-  await op('mesh.primitive_plane_add', { name: 'Side Wall', size: 1, location: [-3.2, -0.4, 1.6], rotation: [deg(90), 0, deg(90)], scale: [7.2, 3.2, 1] });
+  await op('mesh.primitive_plane_add', {
+    name: 'Wall',
+    size: 1,
+    location: [0.65, 3.2, 1.6],
+    rotation: [deg(90), 0, 0],
+    scale: [7.7, 3.2, 1],
+  });
+  await op('mesh.primitive_plane_add', {
+    name: 'Side Wall',
+    size: 1,
+    location: [-3.2, -0.4, 1.6],
+    rotation: [deg(90), 0, deg(90)],
+    scale: [7.2, 3.2, 1],
+  });
   await op('object.transform_apply', { location: false, rotation: true, scale: true }, ['Wall', 'Side Wall']);
-  await op('rigidbody.object_add', { objects: ['Floor'], type: 'PASSIVE', collision_shape: 'BOX', friction: 0.6 });
+  await op('rigidbody.object_add', {
+    objects: ['Floor'],
+    type: 'PASSIVE',
+    collision_shape: 'BOX',
+    friction: 0.6,
+  });
 }
 
 /** Materials: rainbow glossy plastic dominoes, oak table, aluminium chute, glass marble, room. */
@@ -483,13 +612,24 @@ async function lookDev() {
   await batch(
     dominoNames.map((name, i) => ({
       operator: 'material.preset_apply',
-      params: { preset: 'glossy_plastic', objects: [name], name: `Plastic ${String(i + 1).padStart(2, '0')}`, base_color: [...dominoColor(i, DOMINO.count), 1] },
+      params: {
+        preset: 'glossy_plastic',
+        objects: [name],
+        name: `Plastic ${String(i + 1).padStart(2, '0')}`,
+        base_color: [...dominoColor(i, DOMINO.count), 1],
+      },
     })),
   );
 
   // table top: satin oak boards (BRICK pattern = planks with a random tone each and hairline
   // seams) with a fine grain running along the boards (bump + gloss)
-  await op('material.update', { material: 'Wood', base_color: [0.4, 0.21, 0.09, 1], roughness: 0.42, coat_weight: 0.15, coat_roughness: 0.15 });
+  await op('material.update', {
+    material: 'Wood',
+    base_color: [0.4, 0.21, 0.09, 1],
+    roughness: 0.42,
+    coat_weight: 0.15,
+    coat_roughness: 0.15,
+  });
   await op('material.procedural_set', {
     material: 'Wood',
     channel: 'base_color',
@@ -500,7 +640,17 @@ async function lookDev() {
       scale: 1,
       color_a: [0.21, 0.085, 0.03, 1],
       color_b: [0.42, 0.19, 0.07, 1],
-      params: { plane: 'XY', brick_width: 1.3, row_height: 0.1875, mortar_size: 0.0012, mortar_smooth: 0.3, offset: 0.37, mortar_r: 0.05, mortar_g: 0.025, mortar_b: 0.01 },
+      params: {
+        plane: 'XY',
+        brick_width: 1.3,
+        row_height: 0.1875,
+        mortar_size: 0.0012,
+        mortar_smooth: 0.3,
+        offset: 0.37,
+        mortar_r: 0.05,
+        mortar_g: 0.025,
+        mortar_b: 0.01,
+      },
     },
   });
   // grain: SAW-profile WAVE bands varying along Y (= lines along X, the boards' length, ~14 mm
@@ -533,23 +683,65 @@ async function lookDev() {
   await op('material.update', { material: 'Wood Dark', base_color: [0.09, 0.045, 0.02, 1], roughness: 0.5 });
 
   // chute: satin aluminium; dowels: beech; blocks: painted toy blocks
-  await call('set_material', { object: 'Chute', name: 'Satin Aluminium', base_color: [0.86, 0.87, 0.88, 1], metallic: 1, roughness: 0.28 });
-  await op('material.preset_apply', { preset: 'wood', objects: ['Dowel.1', 'Dowel.2', 'Dowel.3', 'Dowel.4'], name: 'Beech', base_color: [0.62, 0.42, 0.24, 1] });
-  await op('material.procedural_set', { material: 'Beech', channel: 'base_color', procedural: { color_a: [0.45, 0.28, 0.14, 1], color_b: [0.7, 0.5, 0.3, 1] } });
+  await call('set_material', {
+    object: 'Chute',
+    name: 'Satin Aluminium',
+    base_color: [0.86, 0.87, 0.88, 1],
+    metallic: 1,
+    roughness: 0.28,
+  });
+  await op('material.preset_apply', {
+    preset: 'wood',
+    objects: ['Dowel.1', 'Dowel.2', 'Dowel.3', 'Dowel.4'],
+    name: 'Beech',
+    base_color: [0.62, 0.42, 0.24, 1],
+  });
+  await op('material.procedural_set', {
+    material: 'Beech',
+    channel: 'base_color',
+    procedural: { color_a: [0.45, 0.28, 0.14, 1], color_b: [0.7, 0.5, 0.3, 1] },
+  });
   const blockColors = [
     [0.55, 0.035, 0.02],
     [0.8, 0.42, 0.02],
     [0.02, 0.13, 0.5],
   ];
-  for (let k = 0; k < 3; k++) await call('set_material', { object: `Block.${k + 1}`, name: `Toy Block ${k + 1}`, base_color: [...blockColors[k], 1], roughness: 0.5 });
+  for (let k = 0; k < 3; k++)
+    await call('set_material', {
+      object: `Block.${k + 1}`,
+      name: `Toy Block ${k + 1}`,
+      base_color: [...blockColors[k], 1],
+      roughness: 0.5,
+    });
+  await call('set_material', {
+    object: 'Start Block',
+    name: 'Toy Block 4',
+    base_color: [0.04, 0.3, 0.07, 1],
+    roughness: 0.5,
+  });
 
   // marble: clear glass with a blue tint
-  await op('material.preset_apply', { preset: 'clear_glass', objects: ['Marble'], name: 'Marble Glass', base_color: [0.05, 0.25, 0.85, 1] });
+  await op('material.preset_apply', {
+    preset: 'clear_glass',
+    objects: ['Marble'],
+    name: 'Marble Glass',
+    base_color: [0.05, 0.25, 0.85, 1],
+  });
 
   // room: muted teal plaster (complements the warm oak) and a dark walnut plank floor
-  await call('set_material', { object: 'Wall', name: 'Plaster', base_color: [0.05, 0.09, 0.1, 1], roughness: 0.92 });
+  await call('set_material', {
+    object: 'Wall',
+    name: 'Plaster',
+    base_color: [0.05, 0.09, 0.1, 1],
+    roughness: 0.92,
+  });
   await call('set_material', { object: 'Side Wall', material: 'Plaster' });
-  await call('set_material', { object: 'Floor', name: 'Parquet', base_color: [0.3, 0.17, 0.08, 1], roughness: 0.55 });
+  await call('set_material', {
+    object: 'Floor',
+    name: 'Parquet',
+    base_color: [0.3, 0.17, 0.08, 1],
+    roughness: 0.55,
+  });
   await op('material.procedural_set', {
     material: 'Parquet',
     channel: 'base_color',
@@ -559,7 +751,16 @@ async function lookDev() {
       scale: 1,
       color_a: [0.07, 0.035, 0.018, 1],
       color_b: [0.19, 0.1, 0.05, 1],
-      params: { plane: 'XY', brick_width: 1.2, row_height: 0.14, mortar_size: 0.0015, offset: 0.31, mortar_r: 0.02, mortar_g: 0.012, mortar_b: 0.006 },
+      params: {
+        plane: 'XY',
+        brick_width: 1.2,
+        row_height: 0.14,
+        mortar_size: 0.0015,
+        offset: 0.31,
+        mortar_r: 0.02,
+        mortar_g: 0.012,
+        mortar_b: 0.006,
+      },
     },
   });
 }
@@ -606,7 +807,12 @@ async function lightsAndCameras() {
 
   // depth of field target: keyed in the `animate` stage to follow the marble, then the wave front
   const d0 = layout.dominoes[0];
-  await op('object.empty_add', { name: 'Focus Target', type: 'SPHERE', radius: 0.02, location: [d0.x, d0.y, d0.z] });
+  await op('object.empty_add', {
+    name: 'Focus Target',
+    type: 'SPHERE',
+    radius: 0.02,
+    location: [d0.x, d0.y, d0.z],
+  });
 
   // main camera (still): f/2 with the focus on the Focus Target
   await op('object.camera_add', {
@@ -621,7 +827,12 @@ async function lightsAndCameras() {
   await call('set_active_camera', { camera: 'Camera' });
 
   // showcase camera (GIF, contact sheet): Track To an empty; both are keyed in `animate`
-  await op('object.empty_add', { name: 'Showcase Target', type: 'PLAIN_AXES', radius: 0.05, location: SHOWCASE.start.target });
+  await op('object.empty_add', {
+    name: 'Showcase Target',
+    type: 'PLAIN_AXES',
+    radius: 0.05,
+    location: SHOWCASE.start.target,
+  });
   await op('object.camera_add', {
     name: 'Showcase Cam',
     lens: SHOWCASE.lens,
@@ -630,8 +841,13 @@ async function lightsAndCameras() {
     dof_focus_object: 'Focus Target',
     dof_aperture_fstop: SHOWCASE.fstop,
   });
-  const track = await op('object.track_set', { type: 'TRACKTO', objects: ['Showcase Cam'], target: 'Showcase Target' });
-  if ((track.constraints ?? []).some((c) => (c.errors ?? []).length)) throw new Error(`track_set: ${JSON.stringify(track)}`);
+  const track = await op('object.track_set', {
+    type: 'TRACKTO',
+    objects: ['Showcase Cam'],
+    target: 'Showcase Target',
+  });
+  if ((track.constraints ?? []).some((c) => (c.errors ?? []).length))
+    throw new Error(`track_set: ${JSON.stringify(track)}`);
 
   // close-up of the chute for the marble-run inspection sheet
   await op('object.camera_add', { name: 'Ramp Cam', lens: 35, location: [-0.3, -0.42, 1.12] });
@@ -639,36 +855,100 @@ async function lightsAndCameras() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Stage: verify — every domino topples, in path order (sampled with rigidbody.describe)
+// Stage: verify — every domino topples, in path order, and when / where the marble hits the
+// first one. rigidbody.describe with an explicit object list reports the live simulation of a
+// fresh scene and the evaluated keyframes of a baked one, so the stage works on both.
 // ---------------------------------------------------------------------------------------------
+/** Tilt of the local Z axis from vertical (rotation XYZ euler), radians. */
+const tiltOf = (rot) => Math.acos(Math.max(-1, Math.min(1, Math.cos(rot[0]) * Math.cos(rot[1]))));
+const describe = async (frame, objects) => (await op('rigidbody.describe', { frame, objects })).objects;
+
+/** What moves the dominoes and the marble: 'simulation' (fresh scene) or 'keyframes' (baked). */
+async function motionSource() {
+  const bodies = await describe(1, [...dominoNames, 'Marble']);
+  const active = bodies.filter((b) => b.rigid_body?.type === 'ACTIVE').length;
+  if (active === bodies.length) return 'simulation';
+  if (active === 0 && (await call('get_object', { object: dominoNames[0], frame: 1 })).animation?.length)
+    return 'keyframes';
+  throw new Error(
+    `${active} of ${bodies.length} dominoes / marble have ACTIVE rigid bodies and ${dominoNames[0]} has no keyframes: ` +
+      'the project is neither a fresh scene nor a baked one; rebuild it (a mode, or --stages=scene,...)',
+  );
+}
+
 async function verify() {
+  const source = await motionSource();
+  log(`verifying the ${source === 'simulation' ? 'live rigid body simulation' : 'baked keyframes'}`);
   const fallFrame = new Array(DOMINO.count).fill(null);
   const tilt = new Array(DOMINO.count).fill(0);
   const marbleTrack = [];
   for (let f = 1; f <= FRAME_END; f += 2) {
-    const r = await op('rigidbody.describe', { frame: f });
-    for (const b of r.objects) {
+    for (const b of await describe(f, [...dominoNames, 'Marble'])) {
       if (b.name === 'Marble') marbleTrack.push({ frame: f, location: b.world_location });
       const i = dominoNames.indexOf(b.name);
       if (i < 0) continue;
-      // tilt of the local Z axis from vertical (rotation XYZ euler)
-      const [rx, ry] = b.world_rotation_euler;
-      const a = Math.acos(Math.max(-1, Math.min(1, Math.cos(rx) * Math.cos(ry))));
-      tilt[i] = a;
-      if (fallFrame[i] === null && a > deg(45)) fallFrame[i] = f;
+      tilt[i] = tiltOf(b.world_rotation_euler);
+      if (fallFrame[i] === null && tilt[i] > deg(45)) fallFrame[i] = f;
     }
   }
   const fallen = fallFrame.filter((f) => f !== null).length;
   let inOrder = true;
   for (let i = 1; i < DOMINO.count; i++)
-    if (fallFrame[i] !== null && fallFrame[i - 1] !== null && fallFrame[i] < fallFrame[i - 1]) inOrder = false;
+    if (fallFrame[i] !== null && fallFrame[i - 1] !== null && fallFrame[i] < fallFrame[i - 1])
+      inOrder = false;
   const fmt = (p) => p.map((v) => +v.toFixed(3));
-  log(`marble track (frame: x, y, z): ${marbleTrack.filter((_, k) => k % 3 === 0).map((m) => `${m.frame}: ${fmt(m.location).join(', ')}`).join(' | ')}`);
+  log(
+    `marble track (frame: x, y, z): ${marbleTrack
+      .filter((_, k) => k % 3 === 0)
+      .map((m) => `${m.frame}: ${fmt(m.location).join(', ')}`)
+      .join(' | ')}`,
+  );
   log(`fall frames (first sampled frame past 45 deg): ${JSON.stringify(fallFrame)}`);
   log(`final tilt (deg): ${JSON.stringify(tilt.map((a) => Math.round((a * 180) / Math.PI)))}`);
   log(`${fallen}/${DOMINO.count} dominoes toppled; in order: ${inOrder}`);
   if (fallen !== DOMINO.count || !inOrder) throw new Error('the cascade is incomplete or out of order');
+  await impact();
   return { fallFrame, marbleTrack };
+}
+
+/**
+ * The marble's arrival at the lip and its impact on the first domino, sampled every frame: the
+ * marble's centre along the run-out direction relative to the lip and to the domino's centre,
+ * and the domino's tilt. First contact with the upright domino is at a centre distance of
+ * marble radius + half the domino's thickness; the contact height is interpolated there.
+ */
+async function impact() {
+  const d0 = layout.dominoes[0];
+  const dir = [Math.cos(d0.heading), Math.sin(d0.heading)];
+  const along = (p, o) => (p[0] - o[0]) * dir[0] + (p[1] - o[1]) * dir[1];
+  const touch = MARBLE.r + DOMINO.t / 2;
+  const rows = [];
+  let lipFrame = null;
+  let hit = null;
+  for (let f = 1; f <= FRAME_END && !(hit && f > hit.to + 1); f++) {
+    const bodies = await describe(f, ['Marble', dominoNames[0]]);
+    const m = bodies.find((b) => b.name === 'Marble').world_location;
+    const tilt = tiltOf(bodies.find((b) => b.name === dominoNames[0]).world_rotation_euler);
+    const row = { f, z: m[2], lip: along(m, chute.lip), dom: along(m, [d0.x, d0.y]), tilt };
+    rows.push(row);
+    if (lipFrame === null && row.lip > -0.002) lipFrame = f;
+    const prev = rows[rows.length - 2];
+    if (!hit && prev && tilt > deg(0.5)) {
+      const s = Math.min(1, Math.max(0, (-touch - prev.dom) / (row.dom - prev.dom || 1)));
+      hit = { from: prev.f, to: f, height: prev.z + (row.z - prev.z) * s - TOP };
+    }
+  }
+  if (!hit || lipFrame === null) throw new Error(`the marble never reaches ${dominoNames[0]}`);
+  const rel = (v) => `${Math.abs(v * 1000).toFixed(0)} mm ${v >= 0 ? 'past' : 'before'}`;
+  for (const r of rows.filter((r) => r.f >= lipFrame - 2))
+    log(
+      `  f${r.f}: marble centre ${rel(r.lip)} the lip, ${rel(r.dom)} ${dominoNames[0]}'s centre, ` +
+        `${((r.z - TOP) * 1000).toFixed(0)} mm above the table; ${dominoNames[0]} tilted ${((r.tilt * 180) / Math.PI).toFixed(1)}°`,
+    );
+  log(
+    `marble: reaches the lip at frame ${lipFrame}; hits ${dominoNames[0]} between frames ${hit.from} and ${hit.to}, ` +
+      `centre ≈ ${(hit.height * 1000).toFixed(0)} mm above the table (${Math.round((hit.height / DOMINO.h) * 100)} % of the domino height)`,
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -687,25 +967,44 @@ async function animateCameras(sim) {
   });
   const b = sxy / sxx;
   const a = mf - b * mi;
-  log(`wave front: frame ≈ ${a.toFixed(1)} + ${b.toFixed(3)}·i  (${(layout.spacing / (b / FPS)).toFixed(2)} m/s)`);
+  log(
+    `wave front: frame ≈ ${a.toFixed(1)} + ${b.toFixed(3)}·i  (${(layout.spacing / (b / FPS)).toFixed(2)} m/s)`,
+  );
   const keys = [];
   // the marble on its way down (until just before the impact)
-  for (const m of sim.marbleTrack) if (m.frame < a - 2 && (m.frame - 1) % 4 === 0) keys.push([m.frame, m.location]);
-  for (let i = 0; i < n; i += 6) keys.push([a + b * i, [layout.dominoes[i].x, layout.dominoes[i].y, TOP + 0.04]]);
+  for (const m of sim.marbleTrack)
+    if (m.frame < a - 2 && (m.frame - 1) % 4 === 0) keys.push([m.frame, m.location]);
+  for (let i = 0; i < n; i += 6)
+    keys.push([a + b * i, [layout.dominoes[i].x, layout.dominoes[i].y, TOP + 0.04]]);
   keys.push([a + b * (n - 1), [layout.dominoes[n - 1].x, layout.dominoes[n - 1].y, TOP + 0.04]]);
   const anim = (target, frames, values, interpolation) =>
     [0, 1, 2].map((index) => ({
       operator: 'anim.keyframes_insert_many',
-      params: { target, path: 'location', index, frames, values: values.map((v) => v[index]), interpolation, replace: true },
+      params: {
+        target,
+        path: 'location',
+        index,
+        frames,
+        values: values.map((v) => v[index]),
+        interpolation,
+        replace: true,
+      },
     }));
   const end = { location: CAMERA.location, target: CAMERA.target };
   await batch([
-    ...anim('Focus Target', keys.map((k) => +k[0].toFixed(2)), keys.map((k) => k[1]), 'LINEAR'),
+    ...anim(
+      'Focus Target',
+      keys.map((k) => +k[0].toFixed(2)),
+      keys.map((k) => k[1]),
+      'LINEAR',
+    ),
     // the showcase camera eases from the chute close-up to the main camera's framing
     ...anim('Showcase Cam', SHOWCASE.frames, [SHOWCASE.start.location, end.location], 'BEZIER'),
     ...anim('Showcase Target', SHOWCASE.frames, [SHOWCASE.start.target, end.target], 'BEZIER'),
   ]);
-  log(`focus target: ${keys.length} keys (frames ${keys[0][0]}..${keys[keys.length - 1][0].toFixed(1)}); showcase camera keys at ${SHOWCASE.frames}`);
+  log(
+    `focus target: ${keys.length} keys (frames ${keys[0][0]}..${keys[keys.length - 1][0].toFixed(1)}); showcase camera keys at ${SHOWCASE.frames}`,
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -720,16 +1019,23 @@ async function inspect() {
   ];
   for (const st of sheets) {
     const { name, ...range } = st;
-    const r = await call('render_animation', { format: 'CONTACT_SHEET', engine: 'RASTER', width: 320, columns: 4, time_limit: 120, ...range });
+    const r = await call('render_animation', {
+      format: 'CONTACT_SHEET',
+      engine: 'RASTER',
+      width: 320,
+      columns: 4,
+      time_limit: 120,
+      ...range,
+    });
     save(path.join(WORK, `${name}.png`), r.images[0].data);
   }
   // evaluated values at several frames
   const at = async (object, frame) => (await call('get_object', { object, frame })).world_transform;
   const v = (p) => `[${p.map((x) => x.toFixed(3)).join(', ')}]`;
   const marble = [];
-  for (const f of [1, 10, 20, 26, 30, 60, 100]) marble.push(`f${f} ${v((await at('Marble', f)).location)}`);
+  for (const f of [1, 10, 20, 25, 26, 30, 60, 100])
+    marble.push(`f${f} ${v((await at('Marble', f)).location)}`);
   log(`  Marble: ${marble.join('  ')}`);
-  const tiltOf = (rot) => (Math.acos(Math.max(-1, Math.min(1, Math.cos(rot[0]) * Math.cos(rot[1])))) * 180) / Math.PI;
   for (const [name, frames] of [
     [dominoNames[0], [20, 30, 40]],
     [dominoNames[29], [45, 55, 65]],
@@ -738,14 +1044,20 @@ async function inspect() {
     const parts = [];
     for (const f of frames) {
       const tr = await at(name, f);
-      parts.push(`f${f} tilt ${tiltOf(tr.rotation_euler).toFixed(0)}° at ${v(tr.location)}`);
+      parts.push(
+        `f${f} tilt ${((tiltOf(tr.rotation_euler) * 180) / Math.PI).toFixed(0)}° at ${v(tr.location)}`,
+      );
     }
     log(`  ${name}: ${parts.join('  ')}`);
   }
   const focus = await at('Focus Target', STILL_FRAME);
-  const near = layout.dominoes.map((d, i) => [i, Math.hypot(d.x - focus.location[0], d.y - focus.location[1])]).sort((p, q) => p[1] - q[1])[0];
+  const near = layout.dominoes
+    .map((d, i) => [i, Math.hypot(d.x - focus.location[0], d.y - focus.location[1])])
+    .sort((p, q) => p[1] - q[1])[0];
   const cam = await call('get_object', { object: 'Camera', frame: STILL_FRAME });
-  log(`  frame ${STILL_FRAME}: Focus Target at ${v(focus.location)} (next to ${dominoNames[near[0]]}); Camera focuses on '${cam.data.dof_focus_object}' at ${cam.data.dof_focus_distance.toFixed(3)} m (f/${cam.data.dof_aperture_fstop})`);
+  log(
+    `  frame ${STILL_FRAME}: Focus Target at ${v(focus.location)} (next to ${dominoNames[near[0]]}); Camera focuses on '${cam.data.dof_focus_object}' at ${cam.data.dof_focus_distance.toFixed(3)} m (f/${cam.data.dof_aperture_fstop})`,
+  );
   const sc = await call('get_object', { object: 'Showcase Cam', frame: 1 });
   log(`  Showcase Cam f1 ${v(sc.world_transform.location)} rot ${v(sc.world_transform.rotation_degrees)}`);
 }
@@ -754,6 +1066,10 @@ async function inspect() {
 // Stage: bake — rigid body simulation -> keyframes, then check the keys reproduce the simulation
 // ---------------------------------------------------------------------------------------------
 async function bake() {
+  if ((await motionSource()) === 'keyframes') {
+    log('the project is already baked (keyframes, no ACTIVE rigid bodies): nothing to bake');
+    return;
+  }
   const probe = [10, 30, STILL_FRAME, 80];
   const names = ['Marble', dominoNames[0], dominoNames[20], dominoNames[40], dominoNames[59]];
   const before = {};
@@ -761,7 +1077,12 @@ async function bake() {
     const r = await op('rigidbody.describe', { frame: f, objects: names });
     for (const b of r.objects) before[`${b.name}@${f}`] = b.world_location;
   }
-  const r = await op('rigidbody.bake_to_keyframes', { objects: [...dominoNames, 'Marble'], frame_start: 1, frame_end: FRAME_END, step: 1 });
+  const r = await op('rigidbody.bake_to_keyframes', {
+    objects: [...dominoNames, 'Marble'],
+    frame_start: 1,
+    frame_end: FRAME_END,
+    step: 1,
+  });
   const baked = Array.isArray(r) ? r : (r.objects ?? []);
   const nKeys = baked.reduce((s, o) => s + (o.keyframes ?? 0), 0);
   log(`baked ${baked.length} bodies, ${nKeys} keyframes (simplified per body)`);
@@ -784,7 +1105,14 @@ async function bake() {
 async function preview() {
   const r = await call('render_image', { width: 640, height: 360, engine: 'RASTER', frame: STILL_FRAME });
   save('preview-raster.png', r.images[0].data);
-  const p = await call('render_image', { width: 640, height: 360, engine: 'PATHTRACER', samples: 24, time_limit: 60, frame: STILL_FRAME });
+  const p = await call('render_image', {
+    width: 640,
+    height: 360,
+    engine: 'PATHTRACER',
+    samples: 24,
+    time_limit: 60,
+    frame: STILL_FRAME,
+  });
   save('preview-pt.png', p.images[0].data);
   log(`  path trace: ${JSON.stringify(p.text).slice(0, 300)}`);
 }
@@ -856,7 +1184,8 @@ async function exportGlb() {
   const res = (r.resources ?? []).find((x) => x.blob);
   if (!res) throw new Error(`export_scene returned no file: ${JSON.stringify(r).slice(0, 300)}`);
   const file = save(path.join(OUT, 'scene.glb'), res.blob);
-  for (const w of r.text?.warnings ?? []) log(`  export warning: ${typeof w === 'string' ? w : JSON.stringify(w)}`);
+  for (const w of r.text?.warnings ?? [])
+    log(`  export warning: ${typeof w === 'string' ? w : JSON.stringify(w)}`);
   record('export', started, { bytes: statSync(file).size });
 }
 

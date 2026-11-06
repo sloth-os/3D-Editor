@@ -12,6 +12,7 @@ import {
   encodePNG,
   evaluatedBounds,
   evaluatedOrco,
+  exportScene,
   filmToRGBA8,
   preparePathTrace,
   renderItems,
@@ -20,6 +21,7 @@ import {
   resolveView,
   sampleFrameIndices,
   viewCameraData,
+  type ExportFormat,
   type Mat4,
   type PathTile,
   type PathTraceProgress,
@@ -34,6 +36,8 @@ import type {
   DocRef,
   EncodeOptions,
   EncodedResult,
+  ExportJobOptions,
+  ExportedFile,
   FilmBuffers,
   FinishOptions,
   FrameOptions,
@@ -45,7 +49,6 @@ import type {
   Vec3Tuple,
   Vec4Tuple,
 } from './protocol';
-import { nameDegenerateTriangles } from './degenerate';
 
 /*
  * The rendering work done by one render thread (a worker, or the main thread in single-thread
@@ -272,7 +275,8 @@ export class RenderEngine {
       exposure: prepared.exposure,
       viewTransform: prepared.viewTransform,
       displayBackground: prepared.displayBackground ? ([...prepared.displayBackground] as Vec4Tuple) : null,
-      warnings: nameDegenerateTriangles(prepared.scene.warnings, input.items),
+      // the scene compiler's warnings name the objects (e.g. those with degenerate triangles)
+      warnings: prepared.scene.warnings,
       prepareMs: now() - t0,
       setupMs,
     };
@@ -332,7 +336,7 @@ export class RenderEngine {
       const input = pathTraceInput(doc, evaluator, options);
       const pt = renderPathTracedImage({ ...input, options: { ...input.options, onProgress } });
       img = pt;
-      warnings = nameDegenerateTriangles(pt.stats.warnings ?? [], input.items);
+      warnings = pt.stats.warnings ?? [];
     } else
       img = renderSceneSoftware(doc, {
         ...softwareOptions(options),
@@ -403,6 +407,23 @@ export class RenderEngine {
       target: [...v.target] as Vec3Tuple,
       up: [...v.up] as Vec3Tuple,
       fovY: v.fovY,
+    };
+  }
+
+  /**
+   * Exports the document (core `exportScene`): on a render thread, a long export (glTF animation
+   * sampled frame by frame, texture bakes) does not hold up the server's event loop.
+   */
+  exportFile(ref: DocRef, format: ExportFormat, options: ExportJobOptions): ExportedFile {
+    const t0 = now();
+    const { doc } = this.document(ref);
+    const res = exportScene(doc, format, options);
+    return {
+      data: res.data,
+      mime: res.mime,
+      extension: res.extension,
+      warnings: res.warnings ?? [],
+      ms: Math.round(now() - t0),
     };
   }
 

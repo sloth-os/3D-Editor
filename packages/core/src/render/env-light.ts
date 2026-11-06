@@ -43,6 +43,11 @@ export interface EnvironmentLighting {
   sinR: number;
   /** Radiance multiplier: world strength × environment_strength. */
   scale: number;
+  /**
+   * What the camera sees of the world (`sampleEnvironmentBackground`): the equirectangular image
+   * of an IMAGE world at full resolution, or the procedural studio; neither for a reflection probe.
+   */
+  source?: { image: SampledTexture } | { studio: true };
 }
 
 /** Roughness of each prefiltered level. */
@@ -71,12 +76,76 @@ export function environmentLighting(
   const scale = finiteNonNeg(world.strength, 1) * finiteNonNeg(world.environment_strength, 1);
   if (!(scale > 0)) return null;
   let maps: EnvMaps | null = null;
-  if (world.environment === 'STUDIO') maps = studioMaps();
-  else if (world.environment === 'IMAGE' && image && image.width > 0 && image.height > 0)
+  let source: EnvironmentLighting['source'];
+  if (world.environment === 'STUDIO') {
+    maps = studioMaps();
+    source = { studio: true };
+  } else if (world.environment === 'IMAGE' && image && image.width > 0 && image.height > 0) {
     maps = imageMaps(world.environment_image ?? '', image);
+    source = { image };
+  }
   if (!maps) return null;
   const rot = Number.isFinite(world.environment_rotation) ? world.environment_rotation : 0;
-  return { maps, cosR: Math.cos(rot), sinR: Math.sin(rot), scale };
+  return { maps, cosR: Math.cos(rot), sinR: Math.sin(rot), scale, source };
+}
+
+/**
+ * The world as the camera sees it in direction (x, y, z) (× scale), into out: the equirectangular
+ * image of an IMAGE world at its full resolution (bilinear, like the path tracer's background) or
+ * the procedural studio, rather than the 256 × 128 map the lighting is prefiltered from.
+ */
+export function sampleEnvironmentBackground(
+  env: EnvironmentLighting,
+  x: number,
+  y: number,
+  z: number,
+  out: Float64Array,
+): void {
+  const src = env.source;
+  if (!src) {
+    sampleEnvironmentLighting(env, x, y, z, 0, out);
+    return;
+  }
+  const lx = env.cosR * x + env.sinR * y;
+  const ly = -env.sinR * x + env.cosR * y;
+  if ('studio' in src) {
+    const L = studioRadiance(lx, ly, z) * env.scale;
+    out[0] = out[1] = out[2] = L;
+    return;
+  }
+  const img = src.image;
+  const W = img.width;
+  const H = img.height;
+  const u = 0.5 - Math.atan2(ly, lx) / (2 * Math.PI);
+  const v = 0.5 + Math.asin(z > 1 ? 1 : z < -1 ? -1 : z) / Math.PI;
+  if (!(u === u && v === v)) {
+    out[0] = out[1] = out[2] = 0;
+    return;
+  }
+  // row 0 of the image is the zenith
+  const fx = u * W - 0.5;
+  const fy = Math.min(H - 1, Math.max(0, (1 - v) * H - 0.5));
+  const x0 = Math.floor(fx);
+  const y0 = Math.floor(fy);
+  const ax = fx - x0;
+  const ay = fy - y0;
+  const xa = ((x0 % W) + W) % W;
+  const xb = xa + 1 === W ? 0 : xa + 1;
+  const yb = Math.min(H - 1, y0 + 1);
+  const d = img.data;
+  const i00 = (y0 * W + xa) * 4;
+  const i10 = (y0 * W + xb) * 4;
+  const i01 = (yb * W + xa) * 4;
+  const i11 = (yb * W + xb) * 4;
+  const k = env.scale;
+  const w00 = (1 - ax) * (1 - ay) * k;
+  const w10 = ax * (1 - ay) * k;
+  const w01 = (1 - ax) * ay * k;
+  const w11 = ax * ay * k;
+  const L = SRGB_LUT;
+  out[0] = L[d[i00]] * w00 + L[d[i10]] * w10 + L[d[i01]] * w01 + L[d[i11]] * w11;
+  out[1] = L[d[i00 + 1]] * w00 + L[d[i10 + 1]] * w10 + L[d[i01 + 1]] * w01 + L[d[i11 + 1]] * w11;
+  out[2] = L[d[i00 + 2]] * w00 + L[d[i10 + 2]] * w10 + L[d[i01 + 2]] * w01 + L[d[i11 + 2]] * w11;
 }
 
 let studioCache: EnvMaps | null = null;

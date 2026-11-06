@@ -219,8 +219,8 @@ describe('AgentHistory', () => {
   it('gives the same document states as an unbounded Y.UndoManager (random edits, undo, redo)', () => {
     for (const seed of [1, 2, 3, 4, 5, 6]) {
       let x = seed * 7919;
-      const rnd = () => ((x = (x * 1103515245 + 12345) % 2147483648) / 2147483648);
-      const pick = <T,>(a: T[]): T => a[Math.floor(rnd() * a.length)];
+      const rnd = () => (x = (x * 1103515245 + 12345) % 2147483648) / 2147483648;
+      const pick = <T>(a: T[]): T => a[Math.floor(rnd() * a.length)];
       const maxSteps = seed % 2 ? 4 : 1000;
       const make = (bounded: boolean) => {
         const doc = new Y.Doc();
@@ -228,7 +228,9 @@ describe('AgentHistory', () => {
         const root = doc.getMap<any>('meshes');
         const origin = { type: 'mcp', session: `s${seed}` };
         const history = bounded ? new AgentHistory(doc, [root], origin, { maxSteps }) : null;
-        const um = history?.undo ?? new Y.UndoManager([root], { trackedOrigins: new Set([origin]), captureTimeout: 0 });
+        const um =
+          history?.undo ??
+          new Y.UndoManager([root], { trackedOrigins: new Set([origin]), captureTimeout: 0 });
         return { doc, root, origin, history, um };
       };
       const a = make(true);
@@ -280,6 +282,87 @@ describe('AgentHistory', () => {
       expect(retained(a.doc).bytes).toBeLessThanOrEqual(retained(b.doc).bytes);
       a.history!.destroy();
       expect(retained(a.doc).items).toBe(0);
+    }
+  });
+
+  it('gives the same document states as unbounded Y.UndoManagers with two agents editing the same objects', () => {
+    for (const seed of [11, 12, 13, 14, 15, 16, 17, 18]) {
+      let x = seed * 104729;
+      const rnd = () => (x = (x * 1103515245 + 12345) % 2147483648) / 2147483648;
+      const pick = <T>(a: T[]): T => a[Math.floor(rnd() * a.length)];
+      const maxSteps = seed % 2 ? 3 : 1000;
+      const make = (bounded: boolean) => {
+        const doc = new Y.Doc();
+        doc.clientID = 7;
+        const root = doc.getMap<any>('meshes');
+        const agents = ['A', 'B'].map((n) => {
+          const origin = { type: 'mcp', session: n };
+          const history = bounded ? new AgentHistory(doc, [root], origin, { maxSteps }) : null;
+          const um =
+            history?.undo ??
+            new Y.UndoManager([root], { trackedOrigins: new Set([origin]), captureTimeout: 0 });
+          return { origin, history, um };
+        });
+        return { doc, root, agents };
+      };
+      const a = make(true);
+      const b = make(false);
+      for (let i = 0; i < 300; i++) {
+        const who = rnd() < 0.5 ? 0 : 1;
+        const r = rnd();
+        const choice = r < 0.15 ? 'undo' : r < 0.22 ? 'redo' : 'edit';
+        const ops: ((root: Y.Map<any>) => void)[] = [];
+        if (choice === 'edit')
+          for (let k = 1 + Math.floor(rnd() * 3); k > 0; k--) {
+            const key = pick(['o1', 'o2']);
+            const field = pick(['data', 'name']);
+            const kind = rnd();
+            const tag = Math.floor(rnd() * 250);
+            ops.push((root) => {
+              const o = root.get(key);
+              if (kind < 0.15) root.set(key, new Y.Map());
+              else if (kind < 0.25) root.delete(key);
+              else if (o instanceof Y.Map) {
+                if (kind < 0.35) o.set('child', new Y.Map());
+                else if (o.get('child') instanceof Y.Map && kind < 0.55)
+                  o.get('child').set(field, blob(tag, 48));
+                else o.set(field, field === 'data' ? blob(tag, 64) : [tag]);
+              } else root.set(key, blob(tag, 32));
+            });
+          }
+        for (const d of [a, b]) {
+          const ag = d.agents[who];
+          if (choice === 'undo') ag.um.undo();
+          else if (choice === 'redo') ag.um.redo();
+          else {
+            ag.um.stopCapturing();
+            ag.um.captureTimeout = Number.POSITIVE_INFINITY;
+            for (const op of ops) {
+              d.doc.transact(() => op(d.root), ag.origin);
+              ag.history?.compactStep();
+            }
+            ag.um.captureTimeout = 0;
+            ag.um.stopCapturing();
+          }
+        }
+        for (const ag of a.agents) ag.history!.maintain();
+        for (const ag of b.agents) while (ag.um.undoStack.length > maxSteps) ag.um.undoStack.shift();
+        expect(JSON.stringify(a.root.toJSON()), `seed ${seed} op ${i} (${'AB'[who]} ${choice})`).toBe(
+          JSON.stringify(b.root.toJSON()),
+        );
+      }
+      expect(retained(a.doc).bytes).toBeLessThanOrEqual(retained(b.doc).bytes);
+      // one agent's history ends: the other one's undo keeps working the same way
+      a.agents[0].history!.destroy();
+      b.agents[0].um.destroy();
+      for (let i = 0; i < 4; i++) {
+        a.agents[1].um.undo();
+        b.agents[1].um.undo();
+        a.agents[1].history!.maintain();
+        expect(JSON.stringify(a.root.toJSON()), `seed ${seed} after A ended, undo ${i}`).toBe(
+          JSON.stringify(b.root.toJSON()),
+        );
+      }
     }
   });
 

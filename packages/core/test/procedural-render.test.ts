@@ -48,6 +48,8 @@ function litPlaneScene(material: Partial<MaterialData>, opts: { modifiers?: bool
   const doc = SceneDoc.create({ empty: true });
   // a black world (no studio environment, which would light and reflect in the plane)
   doc.updateWorld({ environment: 'NONE', color: [0, 0, 0] });
+  // colours compared with linearToSrgb: the Standard view transform
+  doc.updateRender({ view_transform: 'STANDARD' });
   const mesh = doc.addMesh('Plane', createPlane({ size: 2 }));
   const mat = doc.addMaterial({ name: 'M', ...material });
   doc.addObject({
@@ -256,6 +258,7 @@ describe('GENERATED coordinates of deformed meshes (orco)', () => {
     // regression: GENERATED used the deformed position, so textures swam through twisted surfaces
     const doc = SceneDoc.create({ empty: true });
     doc.updateWorld({ color: [0, 0, 0] });
+    doc.updateRender({ view_transform: 'STANDARD' });
     const tex = defaultProcedural('GRADIENT', { color_a: [0, 0, 0, 1], color_b: [1, 1, 1, 1] });
     const mat = doc.addMaterial({ name: 'M', ...emissive(tex) });
     doc.addObject({

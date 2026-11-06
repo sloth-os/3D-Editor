@@ -68,6 +68,11 @@ port.on('message', (msg: WorkerRequest) => {
       case 'auto-view':
         reply(msg.id, engine.autoView(msg.doc, msg.frames, msg.aspect, msg.camera, msg.budgetMs));
         break;
+      case 'export': {
+        const file = engine.exportFile(msg.doc, msg.format, msg.options);
+        reply(msg.id, file, [file.data.buffer as ArrayBuffer]);
+        break;
+      }
       case 'simulate': {
         const sim = engine.simulate(msg.doc, msg.frames);
         reply(

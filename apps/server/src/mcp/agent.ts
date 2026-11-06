@@ -232,14 +232,32 @@ export class AgentProject {
 
   presenceState(): PresenceState {
     const name = this.session.displayName;
+    // objects that no longer exist (undone, deleted by someone else) are not shown as selected
+    const exists = (id: string) => !!this.room.scene.getObject(id);
     return {
       user: { name, color: colorForName(name), kind: 'agent' },
       device: 'mcp',
       mode: this.state.mode,
-      selection: [...this.state.selectedIds],
-      active: this.state.activeId,
+      selection: this.state.selectedIds.filter(exists),
+      active: this.state.activeId && exists(this.state.activeId) ? this.state.activeId : null,
       frame: this.state.frame,
     };
+  }
+
+  /**
+   * Drops objects that no longer exist from the selection and the active object (after undo or
+   * redo removed them), leaving Edit Mode when the edited object is gone, and publishes the
+   * presence again.
+   */
+  syncSelection(): void {
+    const s = this.state;
+    const exists = (id: string) => !!this.room.scene.getObject(id);
+    s.selectedIds = s.selectedIds.filter(exists);
+    if (s.activeId && !exists(s.activeId)) {
+      s.activeId = null;
+      if (s.mode === 'EDIT') s.mode = 'OBJECT';
+    }
+    this.publishPresence();
   }
 
   /** Publishes the agent's presence (only when it changed; not while the session is away). */

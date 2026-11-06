@@ -1,4 +1,4 @@
-import type { Vec3, Vec4 } from '../math/types';
+import type { Mat4, Vec3, Vec4 } from '../math/types';
 import { normalize3 } from '../math/vec3';
 import { invert4 } from '../math/mat4';
 import type { SceneDoc } from '../doc/scene-doc';
@@ -11,6 +11,7 @@ import { prepareSky, sampleSkyModel, sampleSkyPixel, skyIrradianceSH, skySun, ty
 import {
   environmentLighting,
   probeLighting,
+  sampleEnvironmentBackground,
   sampleEnvironmentLighting,
   type EnvironmentLighting,
   type ProbeFace,
@@ -43,7 +44,13 @@ import {
   type RenderView,
 } from './view';
 import type { RenderEngine } from '../doc/types';
-import { renderPathTracedImage, viewCameraData, type PathTraceProgress } from './pathtrace';
+import {
+  filmToRGBA8,
+  renderPathTracedImage,
+  viewCameraData,
+  viewTransformOf,
+  type PathTraceProgress,
+} from './pathtrace';
 
 /*
  * CPU software renderer used when no browser (WebGL) is available — e.g. MCP agents asking the
@@ -63,7 +70,9 @@ import { renderPathTracedImage, viewCameraData, type PathTraceProgress } from '.
  * surfaces (1 − exp(−(density·depth)²)).
  * Procedural texture slots are evaluated per sample (bump via neighbour-pixel differences).
  * PNG base color textures are sampled (other image formats fall back to the color factor).
- * Output is linear → sRGB (plus the scene exposure). Transparent surfaces (blend_method BLEND,
+ * Output: the scene exposure and view transform (AgX, Filmic, ACES, Neutral or Standard, exactly
+ * like the path tracer's display conversion; SOLID shading is always Standard), Film > Transparent
+ * leaves the background transparent. Transparent surfaces (blend_method BLEND,
  * transmission) are drawn after the opaque ones, sorted back to front and blended per sample
  * (glass lets the scene behind it through, tinted, with its reflections on top; no refraction).
  * No shadows.
@@ -109,7 +118,11 @@ export interface SoftwareRenderOptions {
   cameraId?: string;
   /** Explicit view (overrides camera). fovY in radians. */
   view?: { position: Vec3; target: Vec3; up?: Vec3; fovY?: number };
-  /** RGBA background in 0..1, display (sRGB) values (default: world color). Alpha < 1 gives a transparent PNG background. */
+  /**
+   * RGBA background in 0..1, display (sRGB) values, shown as given (no exposure or view transform;
+   * default: the world, or nothing with Film > Transparent). Alpha < 1 gives a transparent PNG
+   * background.
+   */
   background?: Vec4;
   shading?: 'SOLID' | 'MATERIAL';
   /** Overlay wireframe edges. */
@@ -125,8 +138,8 @@ export interface SoftwareRenderOptions {
   /**
    * Render engine (default: the scene's render `engine`). PATHTRACER is a physically based CPU path
    * tracer (soft shadows, reflections, refraction, global illumination); it is used for MATERIAL
-   * shading only (SOLID and the wireframe overlay always rasterize). Its output applies the scene's
-   * exposure and `view_transform` (AgX by default, like Blender); the rasterizer uses Standard.
+   * shading only (SOLID and the wireframe overlay always rasterize). Both engines apply the scene's
+   * exposure and `view_transform` (AgX by default, like Blender; SOLID shading uses Standard).
    */
   engine?: RenderEngine;
   /**
@@ -158,6 +171,12 @@ export interface RenderedImage {
   /** RGBA8 pixels, row-major, top row first. */
   data: Uint8ClampedArray;
 }
+
+/**
+ * Render buffers of the meshes drawn by the rasterizer, kept while a mesh is alive (meshes are
+ * immutable: an evaluator reuses unchanged ones from render to render).
+ */
+const RENDER_BUFFERS = new WeakMap<MeshData, RenderBuffers>();
 
 /** Largest output image (pixels) and supersampled buffer (samples) the renderer accepts. */
 const MAX_PIXELS = 4096 * 4096;
@@ -277,14 +296,16 @@ export function resolveView(
 }
 
 /**
- * Packs scene lights for the shader; without lamps and without environment lighting (`envLit`:
- * a sky, studio or image world) a camera-relative studio rig.
+ * Packs scene lights for the shader; without lamps, without environment lighting (`envLit`: a
+ * sky, studio or image world) and without other light (`otherLight`: emissive surfaces or a bright
+ * world colour) a camera-relative studio rig — exactly when the path tracer adds one.
  */
 function buildLights(
   scene: EvaluatedScene,
   view: RenderView,
   skyLight: number[] | null = null,
   envLit = false,
+  otherLight = false,
 ): { data: Float64Array; count: number; studio: boolean } {
   const out: number[] = [];
   // a procedural sky lights the scene itself (its sun, when up): no studio rig
@@ -323,7 +344,7 @@ function buildLights(
       radius * radius * 0.25,
     );
   }
-  if (out.length || skyLight || envLit)
+  if (out.length || skyLight || envLit || otherLight)
     return { data: new Float64Array(out), count: out.length / LIGHT_STRIDE, studio: false };
   // studio rig: key, fill and rim suns fixed relative to the camera (view-space directions → world)
   const rig: [number, number, number, number][] = [
@@ -399,7 +420,20 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
           world.environment === 'IMAGE' ? textures.get(world.environment_image ?? undefined) : null,
         )
       : null;
-  const lights = solid ? null : buildLights(scene, view, sky?.sunLight ?? null, !!env);
+  // emissive surfaces or a bright world light the scene themselves (no studio rig, like the path
+  // tracer, which samples emitters as lights)
+  const lumW = 0.2126 * world.color[0] + 0.7152 * world.color[1] + 0.0722 * world.color[2];
+  const otherLight =
+    lumW * ws >= 0.1 ||
+    meshes.some((o) =>
+      o.materials.some(
+        (m) =>
+          !!m &&
+          (m.emission_strength ?? 0) > 0 &&
+          (m.emission_color.some((c) => c > 0) || !!m.textures?.emission?.procedural),
+      ),
+    );
+  const lights = solid ? null : buildLights(scene, view, sky?.sunLight ?? null, !!env, otherLight);
   /** World lighting of a rasterizer (the main view and the reflection probe faces). */
   const light = (ras: Rasterizer) => {
     if (!lights) return;
@@ -466,9 +500,11 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
     }
     return { o, mesh, mats, fallback, texSpace };
   });
-  const buffers = new Map<MeshData, RenderBuffers>();
+  // world-space vertices per item, shared by the main view and the reflection probe's faces
+  const worldCache = new Map<Mat4, { mesh: MeshData; wp: Float64Array; wn: Float64Array }>();
   const drawAll = (ras: Rasterizer) => {
-    ras.bufferCache = buffers;
+    ras.bufferCache = RENDER_BUFFERS;
+    ras.worldCache = worldCache;
     for (const d of draws) {
       if (d.texSpace) ras.drawMesh(d.mesh, d.o.worldMatrix, d.mats, d.fallback, d.texSpace);
       else ras.drawMesh(d.mesh, d.o.worldMatrix, d.mats, d.fallback);
@@ -497,27 +533,40 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
   }
   drawAll(r);
 
-  // ---------------------------------------------------------------- resolve (box filter, sRGB)
+  // ---------------------------------------------------------------- resolve (box filter, display)
   const exposure = Math.pow(2, scene.render.exposure ?? 0);
-  let bg: [number, number, number, number];
-  if (opts.background) {
-    const b = opts.background;
-    bg = [
-      srgbToLinear(clamp01(b[0])),
-      srgbToLinear(clamp01(b[1])),
-      srgbToLinear(clamp01(b[2])),
-      clamp01(b[3] ?? 1),
-    ];
-  } else
-    bg = [world.color[0] * ws * exposure, world.color[1] * ws * exposure, world.color[2] * ws * exposure, 1];
+  // the scene's view transform, like the path tracer and the browser's Rendered view (SOLID
+  // shading keeps Standard, like the viewport's Solid mode)
+  const vt = solid ? 'STANDARD' : viewTransformOf(scene.render.view_transform);
+  // Film > Transparent (like the path tracer): nothing behind the surfaces, alpha = their coverage
+  const transparent = !opts.background && !!scene.render.film_transparent;
+  // an explicit background: display values, composited behind the surfaces as they are (no
+  // exposure, no view transform)
+  const explicit: [number, number, number, number] | null = opts.background
+    ? [
+        clamp01(opts.background[0]),
+        clamp01(opts.background[1]),
+        clamp01(opts.background[2]),
+        clamp01(opts.background[3] ?? 1),
+      ]
+    : null;
+  // the world behind uncovered samples (scene-linear, before exposure)
+  const bg: [number, number, number] = [world.color[0] * ws, world.color[1] * ws, world.color[2] * ws];
   // the procedural sky / studio / image as background, per pixel along the camera ray
   const skyBg =
-    (sky || env) && !opts.background && world.show_environment_background
+    (sky || env) && !opts.background && !transparent && world.show_environment_background
       ? pixelRays(view, width, height)
       : null;
   const skyPx = [0, 0, 0];
   const envPx = new Float64Array(3);
   const out = new Uint8ClampedArray(width * height * 4);
+  // Standard keeps the exact sRGB conversion and linear compositing of an explicit background; the
+  // other view transforms go through a linear film and the path tracer's display conversion
+  const standard = vt === 'STANDARD';
+  const film = standard ? null : new Float32Array(width * height * 4);
+  const explicitLin = explicit
+    ? [srgbToLinear(explicit[0]), srgbToLinear(explicit[1]), srgbToLinear(explicit[2]), explicit[3]]
+    : null;
   const inv = 1 / (k * k);
   const color = r.color;
   const cov = r.cov;
@@ -537,32 +586,59 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
         }
       }
       cv *= inv;
+      cr *= inv;
+      cg *= inv;
+      cb *= inv;
       if (skyBg && sky && cv < 1) {
         const d = skyBg.dir(x, y);
         sampleSkyPixel(sky.model, d[0], d[1], d[2], skyBg.pixelRadius, skyPx);
-        const f = sky.scale * exposure;
-        bg[0] = skyPx[0] * f;
-        bg[1] = skyPx[1] * f;
-        bg[2] = skyPx[2] * f;
+        bg[0] = skyPx[0] * sky.scale;
+        bg[1] = skyPx[1] * sky.scale;
+        bg[2] = skyPx[2] * sky.scale;
       } else if (skyBg && env && cv < 1) {
+        // the full-resolution world (not the prefiltered lighting maps)
         const d = skyBg.dir(x, y);
-        sampleEnvironmentLighting(env, d[0], d[1], d[2], 0, envPx);
-        bg[0] = envPx[0] * exposure;
-        bg[1] = envPx[1] * exposure;
-        bg[2] = envPx[2] * exposure;
+        sampleEnvironmentBackground(env, d[0], d[1], d[2], envPx);
+        bg[0] = envPx[0];
+        bg[1] = envPx[1];
+        bg[2] = envPx[2];
       }
-      const rest = (1 - cv) * bg[3];
-      const a = cv + rest;
       const o = (y * width + x) * 4;
+      // what lies behind the uncovered part: the world (alpha 1), or nothing
+      const behind = !explicit && !transparent;
+      if (film) {
+        film[o] = cr + (behind ? bg[0] * (1 - cv) : 0);
+        film[o + 1] = cg + (behind ? bg[1] * (1 - cv) : 0);
+        film[o + 2] = cb + (behind ? bg[2] * (1 - cv) : 0);
+        film[o + 3] = behind ? 1 : cv;
+        continue;
+      }
+      let rest = 0;
+      let br = 0;
+      let bgG = 0;
+      let bb = 0;
+      if (explicitLin) {
+        rest = (1 - cv) * explicitLin[3];
+        br = explicitLin[0];
+        bgG = explicitLin[1];
+        bb = explicitLin[2];
+      } else if (behind) {
+        rest = 1 - cv;
+        br = bg[0] * exposure;
+        bgG = bg[1] * exposure;
+        bb = bg[2] * exposure;
+      }
+      const a = cv + rest;
       if (a > 0) {
         const ia = 1 / a;
-        out[o] = linearToSrgbByte((cr * inv * exposure + bg[0] * rest) * ia);
-        out[o + 1] = linearToSrgbByte((cg * inv * exposure + bg[1] * rest) * ia);
-        out[o + 2] = linearToSrgbByte((cb * inv * exposure + bg[2] * rest) * ia);
+        out[o] = linearToSrgbByte((cr * exposure + br * rest) * ia);
+        out[o + 1] = linearToSrgbByte((cg * exposure + bgG * rest) * ia);
+        out[o + 2] = linearToSrgbByte((cb * exposure + bb * rest) * ia);
       }
       out[o + 3] = Math.round(a * 255);
     }
   }
+  if (film) return { width, height, data: filmToRGBA8(film, width, height, exposure, vt, explicit) };
   return { width, height, data: out };
 }
 
@@ -622,6 +698,7 @@ function probePosition(view: RenderView, bounds: Bounds | null, draw: (r: Raster
   const h = Math.max(4, Math.min(256, Math.round(w / aspect)));
   const pre = new Rasterizer(w, h, view);
   pre.mode = SHADE_SOLID;
+  pre.sortTriangles = false;
   draw(pre);
   const depths: number[] = [];
   const cx = w >> 1;
@@ -673,6 +750,7 @@ function reflectionProbe(
     const ras = new Rasterizer(PROBE_FACE, PROBE_FACE, fv);
     ras.mode = SHADE_MATERIAL;
     ras.cullBackFaces = true;
+    ras.sortTriangles = false;
     light(ras);
     draw(ras);
     return {

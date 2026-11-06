@@ -1,3 +1,7 @@
+import { execFile } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -564,5 +568,57 @@ describe('MCP fixes for agents (round 2)', () => {
     });
     const img = decodePNG(Buffer.from(opaque.raw.content.find((c) => c.type === 'image')!.data!, 'base64'));
     expect(img.data[3]).toBe(255);
+  });
+
+  it('the presence drops objects that undo removed (product-shot v2 #3)', async () => {
+    const { id } = await ok('create_project', { name: 'Presence after undo', empty: true });
+    await ok('add_object', { project: id, type: 'cube', name: 'A' });
+    const me = async () =>
+      (await ok('get_connected_clients', { project: id })).presence.find((e: any) => e.you);
+    expect((await me()).selection).toEqual(['A']);
+    expect((await ok('undo', { project: id })).undone).toBe(1);
+    expect((await ok('get_scene', { project: id })).counts.objects).toBe(0);
+    // the presence others see no longer selects the removed cube (it showed its raw id before)
+    const after = await me();
+    expect(after.selection).toEqual([]);
+    expect(after.active).toBeNull();
+    const r = await ok('run_operator', { project: id, operator: 'scene.stats', params: {} });
+    expect(r.selection).toMatchObject({ selected: [], active: null });
+    expect((await me()).selection).toEqual([]);
+    // redo brings the cube back, unselected
+    expect((await ok('redo', { project: id })).redone).toBe(1);
+    expect((await ok('get_scene', { project: id })).counts.objects).toBe(1);
+    expect((await me()).selection).toEqual([]);
+  });
+
+  it('scripts/mcp.mjs tools <filter> lists the arguments of the tools (robot-workcell v2 #3)', async () => {
+    const run = promisify(execFile);
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
+    const cli = (...args: string[]) =>
+      run(process.execPath, [path.join(root, 'scripts', 'mcp.mjs'), 'tools', ...args], {
+        cwd: root,
+        env: { ...process.env, MCP_URL: `${server.url}/mcp` },
+        timeout: 60_000,
+      }).then((r) => r.stdout);
+    const text = await cli('render_animation');
+    expect(text).toMatch(/^render_animation\n {2}Render a range of frames/);
+    // every argument with its type, default and range: what an agent needs to call the tool
+    expect(text).toContain(
+      'dither ("FLOYD_STEINBERG" | "BAYER" | "NONE", optional, default "FLOYD_STEINBERG")',
+    );
+    expect(text).toMatch(/frame_time_limit \(number, optional, range 0\.1\.\.600\): PATHTRACER/);
+    expect(text).toContain('animated_seed (boolean, optional, default false)');
+    // nested arguments
+    expect(await cli('render_image')).toMatch(/\n {6}position \(\[number, number, number\], required\)/);
+    // the input schemas as JSON
+    const schemas = JSON.parse(await cli('undo', '--json'));
+    expect(schemas).toEqual([
+      expect.objectContaining({ name: 'undo', inputSchema: expect.objectContaining({ type: 'object' }) }),
+    ]);
+    expect(Object.keys(schemas[0].inputSchema.properties)).toEqual(['project', 'steps']);
+    // without a filter: one line per tool
+    const list = (await cli()).trim().split('\n');
+    expect(list.length).toBeGreaterThan(30);
+    expect(list.every((l) => /^[a-z_]+: /.test(l))).toBe(true);
   });
 });

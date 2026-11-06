@@ -237,8 +237,8 @@ average about 6–7 while the still rendered):
 | **total** | | **671.6 s (11.2 min)** | exit code 0 |
 
 Every GIF frame reached the same sample count, and the path tracer uses the same noise seed for
-every frame, so the parts of the picture that do not move are identical from frame to frame. On a
-patch of the table (x 380–480, y 150–230) the mean difference between consecutive frames is
+every frame, so the parts of the picture that do not move are nearly identical from frame to frame.
+On a patch of the table (x 380–480, y 150–230) the mean difference between consecutive frames is
 0.13–0.25 grey levels out of 255 for every pair, including the loop seam 48 → 1. A high-pass noise
 measure of the same patch is 2.81–2.84 in all 48 frames, so the table does not shimmer.
 
@@ -246,8 +246,10 @@ measure of the same patch is 2.81–2.84 in all 48 frames, so the table does not
 
 * The path tracer reports "4 degenerate triangle(s) skipped" without naming the object. They
   belong to the engraved motto plate (bevel + boolean with the converted text) and are invisible.
-* RASTER previews (`--preview`) have no shadows and no depth of field, and the table looks brighter
-  than in the path tracer. Use them for layout and motion, not for judging the light.
+* RASTER previews (`--preview`) have no shadows and no depth of field. Their single reflection
+  probe sits above the deck, so the far part of the glossy table reflects the deck's highlight and
+  looks far brighter than in the path tracer. Use them for layout and motion, not for judging the
+  light.
 * Most of the build time is verification: about 125 `get_object` calls (one object at one frame
   each) and 192 `scene.measure` calls (48 frames × 4 groups, because exact surface distances take
   at most 8 objects per call).

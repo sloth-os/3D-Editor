@@ -157,6 +157,8 @@ describe('PNG codec', () => {
 describe('software renderer', () => {
   it('renders the default scene: background corners, lit cube near the center', () => {
     const doc = SceneDoc.create();
+    // exact sRGB levels: the Standard view transform (the default AgX rolls values off)
+    doc.updateRender({ view_transform: 'STANDARD' });
     const img = renderSceneSoftware(doc, { width: 160, height: 90 });
     expect(img.data.length).toBe(160 * 90 * 4);
     // world color 0.051 (linear) → sRGB ≈ 64
@@ -240,6 +242,7 @@ describe('software renderer', () => {
 
   it('renders the world color (or the given background) for an empty scene', () => {
     const doc = SceneDoc.create({ empty: true });
+    doc.updateRender({ view_transform: 'STANDARD' });
     doc.updateWorld({ color: [0.2, 0.4, 0.6] });
     const img = renderSceneSoftware(doc, { width: 16, height: 8 });
     expect(new Set(Array.from({ length: 16 * 8 }, (_, i) => pixel(img, i % 16, i >> 4).join(','))).size).toBe(
@@ -307,6 +310,7 @@ describe('software renderer', () => {
     });
     // pure ambient (a uniform world colour, environment NONE): shows the texture color
     doc.updateWorld({ environment: 'NONE', color: [1, 1, 1], strength: 1 });
+    doc.updateRender({ view_transform: 'STANDARD' });
     const cam = doc.addObject({
       type: 'CAMERA',
       name: 'Top',

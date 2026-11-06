@@ -193,29 +193,27 @@ describe('path tracer: refraction and reflection', () => {
     expect(expected).toBeLessThan(1.8);
   });
 
-  it('filter glossy (default) finds caustics of small lamps through glass at low sample counts', () => {
+  it('filter glossy (default) finds caustics of small lamps in mirrors at low sample counts', () => {
+    // (glass no longer makes caustics of lamps: its shadows pass their light thin-walled)
     const doc = blackWorld();
     plane(doc, 'Floor', 20, lambert(doc));
-    const ball = createUVSphere({ segments: 32, ring_count: 16, radius: 0.5 });
-    ball.faceSmooth = ball.faceSmooth.map(() => true);
-    doc.addObject({
-      type: 'MESH',
-      name: 'Glass',
-      data: doc.addMesh('Glass', ball),
-      location: [0, 0, 1],
-      material_slots: [
-        doc.addMaterial({ base_color: [1, 1, 1, 1], transmission: 1, roughness: 0, ior: 1.5 }),
-      ],
-    });
-    // a small lamp up and to the right: the caustic lands on the floor left of the ball
+    // a small lamp, hidden from the floor below it by a black card just under it …
     doc.addObject({
       type: 'LIGHT',
       name: 'Lamp',
       data: doc.addLight({ type: 'POINT', energy: 300, shadow_soft_size: 0.05 }),
-      location: [2, 0, 4],
+      location: [0, 0, 3],
     });
-    topCamera(doc, 3, 6);
-    // mean of the caustic region around x ≈ −0.7 m (the ball covers x ∈ ±0.5 m)
+    plane(doc, 'Card', 0.6, lambert(doc, [0, 0, 0]), { location: [0, 0, 2.9] });
+    // … and a vertical mirror beside it that reflects it onto the shadowed floor
+    plane(
+      doc,
+      'Mirror',
+      6,
+      doc.addMaterial({ base_color: [0.9, 0.9, 0.9, 1], metallic: 1, roughness: 0 }),
+      { location: [2, 0, 2], rotation: [0, Math.PI / 2, 0] },
+    );
+    topCamera(doc, 0.5, 2.5);
     const caustic = (filter: number, seed: number) => {
       const { img } = traceLinear(doc, {
         width: 24,
@@ -224,12 +222,13 @@ describe('path tracer: refraction and reflection', () => {
         seed,
         options: { filter_glossy: filter },
       });
-      return mean(img, 24, 2, 9, 10, 15)[0];
+      return mean(img, 24, 0, 0, 24, 24)[0];
     };
-    // without the filter the caustic is (almost) never found: only the indirect light remains
+    // without the filter the reflected lamp is (almost) never found
     const none = caustic(0, 1);
     const a = caustic(1, 1);
     const b = caustic(1, 2);
+    expect(a).toBeGreaterThan(0.02);
     expect(a).toBeGreaterThan(2 * none);
     expect(Math.abs(a - b) / a).toBeLessThan(0.2);
   }, 30_000);

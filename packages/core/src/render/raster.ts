@@ -153,9 +153,22 @@ export class Rasterizer {
   shadingBlock = 1;
   /**
    * Render buffers per mesh, shared by the rasterizers of one render (the reflection probe faces,
-   * linked duplicates and instances draw the same mesh several times).
+   * linked duplicates and instances draw the same mesh several times) and, through a WeakMap,
+   * between renders of unchanged meshes.
    */
-  bufferCache: Map<MeshData, RenderBuffers> | null = null;
+  bufferCache: Pick<Map<MeshData, RenderBuffers>, 'get' | 'set'> | null = null;
+  /**
+   * World-space vertex positions and normals per world matrix (each drawn item has its own
+   * matrix object), shared by the rasterizers of one render: the reflection probe's faces and its
+   * depth pre-pass draw the same items as the main view.
+   */
+  worldCache: Map<Mat4, { mesh: MeshData; wp: Float64Array; wn: Float64Array }> | null = null;
+  /**
+   * Draw each mesh's triangles front to back (cheap early depth rejection). Small helper renders
+   * (the reflection probe's 32 × 32 faces) skip the sort, which costs more than the overdraw
+   * it saves on dense meshes.
+   */
+  sortTriangles = true;
   /**
    * Skip back faces of every material (reflection probes: from a point inside or on a closed
    * object, its far side does not block the view of the surroundings).
@@ -315,7 +328,6 @@ export class Rasterizer {
       }
     }
     const M = world;
-    const NM = normalMatrix4(M);
     // mirroring transforms reverse the winding of world-space triangles
     const mirrored =
       M[0] * (M[5] * M[10] - M[6] * M[9]) -
@@ -323,36 +335,21 @@ export class Rasterizer {
         M[8] * (M[1] * M[6] - M[2] * M[5]) <
       0;
     const VP = this.view.viewProj;
-    const wp = new Float64Array(nv * 3);
-    const wn = new Float64Array(nv * 3);
-    const cl = new Float64Array(nv * 4);
-    const oc = new Uint8Array(nv);
-    const gc = new Uint8Array(nv);
-    const P = rb.positions;
-    const Nr = rb.normals;
+    // world-space positions and normals: computed once per item and render (probe faces too)
+    let ws = this.worldCache?.get(world);
+    if (!ws || ws.mesh !== mesh || ws.wp.length !== nv * 3) {
+      ws = { mesh, ...worldVertices(rb, M) };
+      this.worldCache?.set(world, ws);
+    }
+    const wp = ws.wp;
+    const wn = ws.wn;
+    const cl = scratchF64('cl', nv * 4);
+    const oc = scratchU8('oc', nv);
+    const gc = scratchU8('gc', nv);
     for (let i = 0; i < nv; i++) {
-      const x = P[i * 3];
-      const y = P[i * 3 + 1];
-      const z = P[i * 3 + 2];
-      const wx = M[0] * x + M[4] * y + M[8] * z + M[12];
-      const wy = M[1] * x + M[5] * y + M[9] * z + M[13];
-      const wz = M[2] * x + M[6] * y + M[10] * z + M[14];
-      wp[i * 3] = wx;
-      wp[i * 3 + 1] = wy;
-      wp[i * 3 + 2] = wz;
-      const a = Nr[i * 3];
-      const b = Nr[i * 3 + 1];
-      const c = Nr[i * 3 + 2];
-      let nx = NM[0] * a + NM[4] * b + NM[8] * c;
-      let ny = NM[1] * a + NM[5] * b + NM[9] * c;
-      let nz = NM[2] * a + NM[6] * b + NM[10] * c;
-      const nl = Math.hypot(nx, ny, nz) || 1;
-      nx /= nl;
-      ny /= nl;
-      nz /= nl;
-      wn[i * 3] = nx;
-      wn[i * 3 + 1] = ny;
-      wn[i * 3 + 2] = nz;
+      const wx = wp[i * 3];
+      const wy = wp[i * 3 + 1];
+      const wz = wp[i * 3 + 2];
       const cx = VP[0] * wx + VP[4] * wy + VP[8] * wz + VP[12];
       const cy = VP[1] * wx + VP[5] * wy + VP[9] * wz + VP[13];
       const cz = VP[2] * wx + VP[6] * wy + VP[10] * wz + VP[14];
@@ -372,29 +369,30 @@ export class Rasterizer {
         (cz < -cw ? 16 : 0) |
         (cx < -GUARD * cw || cx > GUARD * cw || cy < -GUARD * cw || cy > GUARD * cw ? 1 : 0);
     }
-    const triMat: SurfaceMaterial[] = new Array(tris);
-    for (const g of rb.groups) {
-      const m = materials[g.materialIndex] ?? fallback;
-      for (let t = g.start / 3; t < (g.start + g.count) / 3; t++) triMat[t] = m;
-    }
+    // material of every triangle (by its group)
+    const groupMats: SurfaceMaterial[] = rb.groups.map((g) => materials[g.materialIndex] ?? fallback);
+    const triGroup = scratchU32('triGroup', tris);
+    rb.groups.forEach((g, gi) => triGroup.fill(gi, g.start / 3, (g.start + g.count) / 3));
     const edges = this.wireHalfWidth > 0 ? wireEdgeFlags(mesh, rb) : null;
-    // front-to-back order by nearest vertex
     const idx = rb.indices;
-    const keys = new Float64Array(tris);
     const persp = !this.view.ortho;
-    for (let t = 0; t < tris; t++) {
-      let k = -Infinity;
-      for (let j = 0; j < 3; j++) {
-        const v = idx[t * 3 + j];
-        const w = cl[v * 4 + 3];
-        const key = persp ? (w > 0 ? 1 / w : Infinity) : -cl[v * 4 + 2];
-        if (key > k) k = key;
-      }
-      keys[t] = k;
-    }
-    const order = new Uint32Array(tris);
+    const order = scratchU32('order', tris);
     for (let t = 0; t < tris; t++) order[t] = t;
-    order.sort((a, b) => keys[b] - keys[a]);
+    if (this.sortTriangles) {
+      // front-to-back order by nearest vertex
+      const keys = scratchF64('keys', tris);
+      for (let t = 0; t < tris; t++) {
+        let k = -Infinity;
+        for (let j = 0; j < 3; j++) {
+          const v = idx[t * 3 + j];
+          const w = cl[v * 4 + 3];
+          const key = persp ? (w > 0 ? 1 / w : Infinity) : -cl[v * 4 + 2];
+          if (key > k) k = key;
+        }
+        keys[t] = k;
+      }
+      order.sort((a, b) => keys[b] - keys[a]);
+    }
     const colors = rb.colors;
     const uvs = rb.uvs;
     const eye = this.view.eye;
@@ -405,7 +403,7 @@ export class Rasterizer {
       const i1 = idx[t * 3 + 1];
       const i2 = idx[t * 3 + 2];
       if (oc[i0] & oc[i1] & oc[i2]) continue;
-      const mat = triMat[t];
+      const mat = groupMats[triGroup[t]];
       // facing from world-space geometry (robust for clipped triangles and mirrored objects)
       const ax = wp[i1 * 3] - wp[i0 * 3];
       const ay = wp[i1 * 3 + 1] - wp[i0 * 3 + 1];
@@ -758,6 +756,10 @@ export class Rasterizer {
           pm.er = pv[po + 6];
           pm.eg = pv[po + 7];
           pm.eb = pv[po + 8];
+          // (glass stays glass: without these a transmissive material with a procedural texture
+          // was shaded as an opaque diffuse surface)
+          pm.transmission = mat.transmission;
+          pm.ior = mat.ior;
           sm = pm;
         }
         // coverage: alpha clip (binary) or, in the transparent pass, alpha blending
@@ -813,16 +815,35 @@ export class Rasterizer {
         let r = this.outR;
         let g = this.outG;
         let b = this.outB;
+        // glass (transparent pass): the share of what is behind it that it lets through, per
+        // channel: base colour × (1 − Fresnel) × transmission
+        let tr = 0;
+        let tg = 0;
+        let tb = 0;
+        const trans = mat.transmission ?? 0;
+        if (this.blendPass && trans > 0 && this.mode === SHADE_MATERIAL) {
+          const ior = mat.ior ?? 1.5;
+          const f = (ior - 1) / (ior + 1);
+          const f0 = f * f;
+          const cv = 1 - (this.outNdv > 0 ? this.outNdv : 0);
+          const cv2 = cv * cv;
+          const k = trans * (1 - sm.metallic) * (1 - (f0 + (1 - f0) * cv2 * cv2 * cv));
+          tr = k * Math.min(1, br * cr);
+          tg = k * Math.min(1, bg * cg);
+          tb = k * Math.min(1, bb * cb);
+        }
         if (this.mistDensity > 0 && this.mode === SHADE_MATERIAL) {
-          // FogExp2 over the planar view depth (as three.js scene fog)
+          // FogExp2 over the planar view depth (as three.js scene fog); the mist colour fills in
+          // only for the part of the view that ends here, not for what glass lets through (that
+          // is misted by its own depth, so the mist behind glass matches the mist around it)
           const e = this.view.eye;
           const f = this.view.forward;
           const k = this.mistDensity * ((wx - e[0]) * f[0] + (wy - e[1]) * f[1] + (wz - e[2]) * f[2]);
           const m = 1 - Math.exp(-k * k);
           const mc = this.mistColor;
-          r += (mc[0] - r) * m;
-          g += (mc[1] - g) * m;
-          b += (mc[2] - b) * m;
+          r += (mc[0] * (1 - tr) - r) * m;
+          g += (mc[1] * (1 - tg) - g) * m;
+          b += (mc[2] * (1 - tb) - b) * m;
         }
         if (wire) {
           let d = Infinity;
@@ -838,22 +859,7 @@ export class Rasterizer {
         }
         if (this.blendPass) {
           // premultiplied "over": the covered fraction a shows this surface plus, through glass,
-          // what is behind it (transmittance: base colour × (1 − Fresnel) × transmission)
-          let tr = 0;
-          let tg = 0;
-          let tb = 0;
-          const trans = mat.transmission ?? 0;
-          if (trans > 0 && this.mode === SHADE_MATERIAL) {
-            const ior = mat.ior ?? 1.5;
-            const f = (ior - 1) / (ior + 1);
-            const f0 = f * f;
-            const cv = 1 - (this.outNdv > 0 ? this.outNdv : 0);
-            const cv2 = cv * cv;
-            const k = trans * (1 - sm.metallic) * (1 - (f0 + (1 - f0) * cv2 * cv2 * cv));
-            tr = k * Math.min(1, br * cr);
-            tg = k * Math.min(1, bg * cg);
-            tb = k * Math.min(1, bb * cb);
-          }
+          // what is behind it (transmittance tr, tg, tb)
           const o3 = row * 3;
           color[o3] = a * r + color[o3] * (1 - a + a * tr);
           color[o3 + 1] = a * g + color[o3 + 1] * (1 - a + a * tg);
@@ -1322,6 +1328,63 @@ export class Rasterizer {
 
 function clamp01(v: number): number {
   return v > 0 ? (v < 1 ? v : 1) : 0;
+}
+
+/** World-space positions and unit normals of a mesh's render vertices under matrix M. */
+function worldVertices(rb: RenderBuffers, M: Mat4): { wp: Float64Array; wn: Float64Array } {
+  const nv = rb.positions.length / 3;
+  const NM = normalMatrix4(M);
+  const wp = new Float64Array(nv * 3);
+  const wn = new Float64Array(nv * 3);
+  const P = rb.positions;
+  const Nr = rb.normals;
+  for (let i = 0; i < nv; i++) {
+    const x = P[i * 3];
+    const y = P[i * 3 + 1];
+    const z = P[i * 3 + 2];
+    wp[i * 3] = M[0] * x + M[4] * y + M[8] * z + M[12];
+    wp[i * 3 + 1] = M[1] * x + M[5] * y + M[9] * z + M[13];
+    wp[i * 3 + 2] = M[2] * x + M[6] * y + M[10] * z + M[14];
+    const a = Nr[i * 3];
+    const b = Nr[i * 3 + 1];
+    const c = Nr[i * 3 + 2];
+    let nx = NM[0] * a + NM[4] * b + NM[8] * c;
+    let ny = NM[1] * a + NM[5] * b + NM[9] * c;
+    let nz = NM[2] * a + NM[6] * b + NM[10] * c;
+    const nl = Math.hypot(nx, ny, nz) || 1;
+    nx /= nl;
+    ny /= nl;
+    nz /= nl;
+    wn[i * 3] = nx;
+    wn[i * 3 + 1] = ny;
+    wn[i * 3 + 2] = nz;
+  }
+  return { wp, wn };
+}
+
+/*
+ * Scratch arrays of `drawMesh`, reused between calls (grown as needed): a dense mesh drawn by the
+ * main view and the reflection probe's faces would otherwise allocate tens of megabytes per draw.
+ * drawMesh is not reentrant, so one set suffices.
+ */
+const scratch = new Map<string, Float64Array | Uint8Array | Uint32Array>();
+
+function scratchF64(name: string, n: number): Float64Array {
+  let a = scratch.get(name) as Float64Array | undefined;
+  if (!a || a.length < n) scratch.set(name, (a = new Float64Array(Math.max(n, 1024))));
+  return a;
+}
+
+function scratchU8(name: string, n: number): Uint8Array {
+  let a = scratch.get(name) as Uint8Array | undefined;
+  if (!a || a.length < n) scratch.set(name, (a = new Uint8Array(Math.max(n, 1024))));
+  return a;
+}
+
+function scratchU32(name: string, n: number): Uint32Array {
+  let a = scratch.get(name) as Uint32Array | undefined;
+  if (!a || a.length < n) scratch.set(name, (a = new Uint32Array(Math.max(n, 1024))));
+  return a.length === n ? a : a.subarray(0, n);
 }
 
 function loadClip(

@@ -1,4 +1,4 @@
-import type { PathTile, RenderEngine, ViewTransform } from '@3d-editor/core';
+import type { ExportFormat, PathTile, RenderEngine, ViewTransform } from '@3d-editor/core';
 
 /*
  * Messages between the render pool (main thread) and its worker threads. Everything is plain,
@@ -126,6 +126,26 @@ export interface FinishOptions {
   png: boolean;
 }
 
+/** Options of an export (core `exportScene`). */
+export interface ExportJobOptions {
+  /** Only these objects (ids; default every object shown in renders). */
+  objectIds?: string[];
+  /** Apply the modifier stacks (default true). */
+  applyModifiers?: boolean;
+  /** Frame the scene is evaluated at (default the scene's frame_start). */
+  frame?: number;
+}
+
+/** An exported file (data transferred). */
+export interface ExportedFile {
+  data: Uint8Array;
+  mime: string;
+  extension: string;
+  warnings: string[];
+  /** Milliseconds the export took on the render thread. */
+  ms: number;
+}
+
 /** The fixed automatic view of an animation without a camera (null when the scene has a camera). */
 export type AutoViewResult = { position: Vec3Tuple; target: Vec3Tuple; up: Vec3Tuple; fovY: number } | null;
 
@@ -167,6 +187,8 @@ export type WorkerRequest =
   | { type: 'apng-finish'; id: number; job: number }
   /** Simulates the rigid body world up to the given frames and returns their matrices. */
   | { type: 'simulate'; id: number; doc: DocRef; frames: number[] }
+  /** Exports the document (glTF, OBJ, STL, PLY) off the event loop; the file is transferred. */
+  | { type: 'export'; id: number; doc: DocRef; format: ExportFormat; options: ExportJobOptions }
   /** Drops the cached documents (an idle thread frees its memory; no response). */
   | { type: 'clear' }
   | { type: 'ping'; id: number };
@@ -212,7 +234,14 @@ export interface SimulatedFrames {
 }
 
 export type WorkerResult =
-  PreparedInfo | PathTile | ImageResult | AutoViewResult | EncodedResult | SimulatedFrames | { ok: true };
+  | PreparedInfo
+  | PathTile
+  | ImageResult
+  | AutoViewResult
+  | EncodedResult
+  | SimulatedFrames
+  | ExportedFile
+  | { ok: true };
 
 export type WorkerResponse =
   { type: 'result'; id: number; result: WorkerResult } | { type: 'error'; id: number; message: string };
