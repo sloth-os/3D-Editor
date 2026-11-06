@@ -172,17 +172,20 @@ export function fitSunShadow(
     visible.push({ box, points, start, end });
   }
 
-  // the receivers: what the camera sees, up to the shadow distance
-  let receivers: THREE.Vector3[] = [];
+  // the receivers: what the camera sees, up to the shadow distance (perspective views: far away, a
+  // texel covers fewer pixels; an orthographic view is as wide at every depth and has none)
+  const receivers: THREE.Vector3[] = [];
   let shadowDistance = Infinity;
   if (visible.length) {
-    // where the visible objects start; boxes the camera is in (a room, a sky dome) start at the near
-    // plane and say nothing about where the scene is
-    const nearPlane = Math.max(0, Math.min(...corners.filter((_, i) => i % 2 === 0).map(depth)));
-    const starts = visible.map((v) => v.start).sort((a, b) => a - b);
-    const outside = starts.filter((d) => d > 1.5 * nearPlane + 1e-6);
-    const ref = outside.length ? outside : starts;
-    shadowDistance = SHADOW_DISTANCE_SCALE * Math.max(ref[ref.length >> 1], nearPlane, 1e-4);
+    if ((camera as THREE.PerspectiveCamera).isPerspectiveCamera) {
+      // where the visible objects start; boxes the camera is in (a room, a sky dome) start at the
+      // near plane and say nothing about where the scene is
+      const nearPlane = Math.max(0, Math.min(...corners.filter((_, i) => i % 2 === 0).map(depth)));
+      const starts = visible.map((v) => v.start).sort((a, b) => a - b);
+      const outside = starts.filter((d) => d > 1.5 * nearPlane + 1e-6);
+      const ref = outside.length ? outside : starts;
+      shadowDistance = SHADOW_DISTANCE_SCALE * Math.max(ref[ref.length >> 1], nearPlane, 1e-4);
+    }
     if (visible.every((v) => v.end <= shadowDistance)) for (const v of visible) receivers.push(...v.points);
     else {
       const forward = camera.getWorldDirection(new THREE.Vector3());

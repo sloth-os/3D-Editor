@@ -976,21 +976,43 @@ const ik = await op('pose.ik_add', {
   chain_count: 3,
   iterations: 500,
 });
-// IK locks (Blender's lock_ik_*): the vertical base bone J1 turns only about its own Y axis (the
-// vertical: yaw), the shoulder and the elbow only about their Z axes (the joint axes, see
-// align_roll in section 4), so the arm stays in a vertical plane through the base axis
-const ikSettings = await batch(
-  [
-    ['J1_Base', { lock_ik_x: true, lock_ik_z: true }],
-    ['J2_Shoulder', { lock_ik_x: true, lock_ik_y: true }],
-    ['J3_Elbow', { lock_ik_x: true, lock_ik_y: true }],
-  ].map(([bone, s]) => ({
+// Per-bone IK locks and limits (Blender's lock_ik_* / use_ik_limit_*): the vertical base bone J1
+// turns only about its own Y axis (the vertical: yaw), the shoulder and the elbow only about their
+// Z axes (the joint axes, see align_roll in section 4), so the arm stays in the vertical plane
+// through the base axis and the target. Joint limits, measured from the rest pose (positive = the
+// link tilts back / up), keep the shoulder from swinging over the top and the elbow from flipping
+// over; the cycle uses -28..8 degrees at J2 and -11..38 degrees at J3.
+const IK_SETTINGS = {
+  J1_Base: { lock_ik_x: true, lock_ik_z: true },
+  J2_Shoulder: { lock_ik_x: true, lock_ik_y: true, use_ik_limit_z: true, ik_min_z: -50, ik_max_z: 30 },
+  J3_Elbow: { lock_ik_x: true, lock_ik_y: true, use_ik_limit_z: true, ik_min_z: -35, ik_max_z: 60 },
+};
+const ikSet = await batch(
+  Object.entries(IK_SETTINGS).map(([bone, s]) => ({
     operator: 'pose.ik_settings_set',
-    params: { object: 'Robot_Rig', bone, ...s },
+    params: {
+      object: 'Robot_Rig',
+      bone,
+      ...s,
+      ...(s.use_ik_limit_z
+        ? { ik_min_z: (s.ik_min_z * Math.PI) / 180, ik_max_z: (s.ik_max_z * Math.PI) / 180 }
+        : {}),
+    },
   })),
-  'ik locks',
+  'ik settings',
 );
-log(`IK settings: ${JSON.stringify(ikSettings.map((r) => r.result).slice(0, 3)).slice(0, 900)}`);
+for (const r of ikSet)
+  if (!r.result?.chains?.some((c) => c.constraint === 'IK'))
+    throw new Error(`IK settings of ${r.result?.bone}: not in the IK chain (${JSON.stringify(r.result)})`);
+// The solver starts from the pose channels (like Blender's IK), so J1 is posed (not keyed) at the
+// home azimuth, facing the front of the cell: every target of the cycle then lies within 90 degrees
+// of the start and the solver turns the base the short way round. (From the rest pose, the pick
+// station lies straight behind the arm, where the yaw has no direction to start in.)
+await op('pose.bone_transform_set', {
+  object: 'Robot_Rig',
+  bone: 'J1_Base',
+  rotation_euler: [0, WAY.home.az, 0],
+});
 await op('pose.constraint_add', {
   object: 'Robot_Rig',
   bone: 'J4_Wrist',
@@ -999,7 +1021,15 @@ await op('pose.constraint_add', {
   target: 'Wrist_Aim',
   params: { track_axis: 'TRACK_Y' },
 });
-log(`IK on J3_Elbow, chain ${ik.chain.join(' -> ')}; Damped Track keeps the wrist vertical`);
+const lockText = (s) =>
+  `locks ${['x', 'y', 'z'].filter((a) => s[`lock_ik_${a}`]).join('')}` +
+  (s.use_ik_limit_z ? ` + z limit ${s.ik_min_z}..${s.ik_max_z} deg` : '');
+const ikText = Object.entries(IK_SETTINGS).map(([b, s]) => `${b} ${lockText(s)}`);
+const homeDeg = ((WAY.home.az * 180) / Math.PI).toFixed(0);
+log(
+  `IK on J3_Elbow, chain ${ik.chain.join(' -> ')}: ${ikText.join(', ')}; solver start J1 yaw ${homeDeg} deg`,
+);
+log('Damped Track keeps the wrist vertical');
 
 // ---------------------------------------------------------------------------------------------
 // 6. Conveyor (rollers via ARRAY) with an infeed hood, pallets (ARRAY boards), crates
@@ -1526,7 +1556,7 @@ for (const [f, v] of [
   );
 }
 log(
-  `keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape key, ${QUEUED.length} queued crates, infeed door`,
+  `keyed ${FRAME_END} frames of IK target / J4 roll, gripper shape key, ${QUEUED.length} queued crates, infeed door`,
 );
 
 // ---------------------------------------------------------------------------------------------
@@ -1917,6 +1947,7 @@ const verify = {};
   );
   Object.assign(verify, {
     worst_ik_mm: +(worstIk * 1000).toFixed(2),
+    j1_yaw_err_deg: +((worstYaw * 180) / Math.PI).toExponential(1),
     worst_crate_mm: +(worstCarry * 1000).toFixed(2),
     pad_gap_m: pair.surface_distance,
     hose_root_mm: +(rootErr * 1000).toFixed(2),
