@@ -35,7 +35,18 @@ it('fuzz many seeds, 1-3 agents + remote edits', () => {
         const um = history?.undo ?? new Y.UndoManager([root], { trackedOrigins: new Set([origin]), captureTimeout: 0 });
         return { origin, history, um };
       });
-      return { doc, root, agents, name: bounded ? 'bounded' : 'reference' };
+      const log: string[] = [];
+      if (bounded)
+        doc.on('afterTransaction', (tr: Y.Transaction) => {
+          const o: any = tr.origin;
+          const who = o && o.session ? o.session : o instanceof Y.UndoManager ? `UM(${agents.findIndex((g) => g.um === o)})${o.undoing ? 'undo' : o.redoing ? 'redo' : ''}` : o && o.type ? o.type : String(o);
+          const ins: string[] = [];
+          tr.afterState.forEach((end, client) => { const st = tr.beforeState.get(client) || 0; if (end > st) ins.push(`${st}..${end - 1}`); });
+          const del: string[] = [];
+          tr.deleteSet.clients.forEach((items) => items.forEach((it) => del.push(`${it.clock}+${it.len}`)));
+          if (ins.length || del.length) log.push(`${who} ins[${ins.join(',')}] del[${del.join(',')}]`);
+        });
+      return { doc, root, agents, name: bounded ? 'bounded' : 'reference', log };
     };
     const a = make(true);
     const b = make(false);
@@ -110,11 +121,14 @@ it('fuzz many seeds, 1-3 agents + remote edits', () => {
       for (const ag of a.agents) ag.history!.destroy();
       if (!failed && retained(a.doc) !== 0) {
         failed = `seed ${seed}: retains ${retained(a.doc)} after all ended`;
-        if ([4, 14, 52].includes(seed)) {
+        if ([4].includes(seed)) {
           for (const structs of a.doc.store.clients.values())
             for (const st of structs)
               if (st instanceof Y.Item && st.deleted && st.content instanceof Y.ContentBinary) {
                 const par = (st.parent as any)._item as Y.Item | null;
+                const c = st.id.clock;
+                const rel = (a.log as string[]).filter((l) => { const m = l.match(/ins\[(\d+)\.\.(\d+)\]/); const ins = m && +m[1] <= c && c <= +m[2]; const dels = [...l.matchAll(/(\d+)\+(\d+)/g)].some((d) => +d[1] <= c && c < +d[1] + +d[2]); return ins || dels; });
+                console.log(`  history of ${c}:\n    ` + rel.join('\n    '));
                 console.log(`seed ${seed} retained ${st.id.client}:${st.id.clock} keep=${st.keep} redone=${st.redone ? st.redone.clock : null} parentSub=${st.parentSub} parent=${par ? `${par.id.clock} deleted=${par.deleted} keep=${par.keep}` : 'root'}`);
               }
         }
