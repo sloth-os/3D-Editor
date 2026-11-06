@@ -18,21 +18,23 @@ import * as Y from 'yjs';
  *   needed to undo or redo that step (Yjs skips it), so it is collected right away;
  * - at most `maxSteps` undo steps are kept, and at most `maxBytes` of replaced or deleted data
  *   (the newest step is always kept); older steps are dropped and their data collected;
- * - redo steps that Yjs drops (a new change after an undo) are collected;
+ * - steps that Yjs drops itself are collected: redo steps (a new change after an undo) and undo or
+ *   redo steps that had nothing left to change when they were applied (Yjs discards those silently);
+ * - restored copies (undo and redo restore deleted data as copies, which Yjs keeps from the start)
+ *   that a change no agent tracks deletes (an editor, the REST API) are collected: no step can
+ *   bring them back;
  * - when the history ends (the session or agent id expires, the project is deleted) everything it
  *   kept is collected, so the memory is freed while the project stays open for others.
  *
  * Collecting means clearing `keep` on the deleted items of the dropped steps (only on them, not on
  * their parents, which other steps may still need) and running Yjs's garbage collection over those
  * items: their content is replaced by a deleted placeholder, the item structs (and their `redone`
- * links, which undo follows) stay. Two Yjs details shape the rules:
- * - collecting a deleted container (a nested Y.Map such as an object) wipes everything below it,
- *   kept or not, so a container is only collected when nothing below it is still kept by another
- *   step (of this agent or another one);
- * - undo and redo restore deleted items as copies and link the originals to them (`redone`); older
- *   steps follow these links. Steps that undo or redo applied ("popped") therefore only release the
- *   content of their leaf items (mesh blobs, values), never containers, whose children would lose
- *   their links. Their content is shared with the copies, so this frees memory once the copies go.
+ * links, which undo follows) stay. Deleted containers (nested Y.Maps such as objects) are never
+ * collected, only the values below them: Yjs collects a container by replacing everything below it,
+ * kept or not, with bare placeholders that drop the item structs, and undo and redo of any agent
+ * follow `redone` links from the originals of restored items to their copies, which can sit below a
+ * container another agent deleted (an undo then failed inside Yjs). A deleted container without
+ * its values costs a few hundred bytes; the values (mesh blobs, attribute arrays) are the memory.
  */
 
 type StackItem = Y.UndoManager['undoStack'][number];
@@ -119,13 +121,15 @@ export function itemContentBytes(item: Y.Item): number {
   return 96; // types (their children are items of their own), formats, embeds, sub-documents
 }
 
-/** Whether a deleted container still has an item below it that some undo step keeps. */
-function keptBelow(type: Y.AbstractType<any>): boolean {
-  const kept = (item: Y.Item): boolean =>
-    item.keep || (item.content instanceof Y.ContentType && keptBelow(item.content.type));
-  for (let item = type._start; item; item = item.right) if (kept(item)) return true;
-  for (const last of type._map.values())
-    for (let item: Y.Item | null = last; item; item = item.left) if (kept(item)) return true;
+/** Deleted containers are never collected (see above): they stay kept, their values do not. */
+const isContainer = (item: Y.Item) => item.content instanceof Y.ContentType;
+
+/** The live histories of each document (to tell changes some agent tracks from the others). */
+const histories = new WeakMap<Y.Doc, Set<AgentHistory>>();
+
+/** Whether an agent history records a transaction with this origin (its changes, its undo / redo). */
+function trackedByAgent(doc: Y.Doc, origin: unknown): boolean {
+  for (const h of histories.get(doc) ?? []) if (h.tracks(origin)) return true;
   return false;
 }
 
@@ -148,8 +152,8 @@ export class AgentHistory {
   private readonly popped = new WeakSet<StackItem>();
   /** Popped stack items whose leaf content is not released yet. */
   private poppedPending: StackItem[] = [];
-  /** The redo stack at the last maintenance (to find steps Yjs dropped since). */
-  private redoSeen: StackItem[] = [];
+  /** The undo and redo stacks at the last maintenance (to find steps Yjs dropped since). */
+  private seen: StackItem[] = [];
   /** Delete sets of the agent's changes since the last {@link compactStep}. */
   private pending: StackItem['deletions'][] = [];
   private scheduled = false;
@@ -180,11 +184,35 @@ export class AgentHistory {
     this.undo.on('stack-cleared', () => this.schedule());
     // registered after the UndoManager's own handler: the step already holds the transaction
     doc.on('afterTransaction', this.onTransaction);
+    let set = histories.get(doc);
+    if (!set) histories.set(doc, (set = new Set()));
+    set.add(this);
+  }
+
+  /** Whether this history records transactions with `origin` (the agent's changes, undo, redo). */
+  tracks(origin: unknown): boolean {
+    return origin === this.origin || origin === this.undo;
   }
 
   private readonly onTransaction = (tr: Y.Transaction): void => {
-    if (tr.origin !== this.origin || this.undo.undoing || this.undo.redoing) return;
-    if (tr.deleteSet.clients.size) this.pending.push(tr.deleteSet);
+    if (!tr.deleteSet.clients.size) return;
+    if (tr.origin === this.origin) {
+      if (!this.undo.undoing && !this.undo.redoing) this.pending.push(tr.deleteSet);
+      return;
+    }
+    // A change no agent history records (an editor, the REST API, storage) that deleted restored
+    // copies: Yjs keeps those from the moment undo or redo creates them, but no step can bring them
+    // back now. Un-keeping them here lets Yjs collect them right after this handler (the first
+    // history of the document does it). Containers stay, like everywhere here.
+    const set = histories.get(this.doc);
+    if (set?.values().next().value !== this || trackedByAgent(this.doc, tr.origin)) return;
+    Y.iterateDeletedStructs(tr, tr.deleteSet, (struct) => {
+      if (struct instanceof Y.Item && struct.keep && !isContainer(struct)) {
+        struct.keep = false;
+        this.totals.released_items++;
+        this.totals.released_bytes += itemContentBytes(struct);
+      }
+    });
   };
 
   /**
@@ -200,19 +228,16 @@ export class AgentHistory {
     if (!s) return;
     let churn = 0;
     let churnBytes = 0;
-    const containers: Y.Item[] = [];
     this.doc.transact((tr) => {
       for (const ds of pending)
         Y.iterateDeletedStructs(tr, ds, (struct) => {
-          if (!(struct instanceof Y.Item) || !struct.keep) return;
+          if (!(struct instanceof Y.Item) || !struct.keep || isContainer(struct)) return;
           if (!Y.isDeleted(s.deletions, struct.id) || !coveredBy(s.insertions, struct)) return;
           struct.keep = false;
-          if (struct.content instanceof Y.ContentType) containers.push(struct);
           churn++;
           churnBytes += itemContentBytes(struct);
         });
     }, GC_ORIGIN);
-    for (const c of containers) if (keptBelow((c.content as Y.ContentType).type)) c.keep = true;
     if (!churn) return;
     this.collect(Y.mergeDeleteSets(pending));
     this.sizes.delete(s);
@@ -265,10 +290,12 @@ export class AgentHistory {
     const um = this.undo;
     this.pending = [];
     const release: StackItem[] = [];
-    // redo steps that Yjs dropped (a new change after an undo) and that were not redone
-    if (this.redoSeen.length) {
-      const live = new Set(um.redoStack);
-      for (const s of this.redoSeen) if (!live.has(s) && !this.popped.has(s)) release.push(s);
+    // steps that Yjs dropped since the last maintenance and that undo / redo did not apply: redo
+    // steps cleared by a new change, and steps with nothing left to change, which undo and redo
+    // discard without an event
+    if (this.seen.length) {
+      const live = new Set([...um.undoStack, ...um.redoStack]);
+      for (const s of this.seen) if (!live.has(s) && !this.popped.has(s)) release.push(s);
     }
     let total = 0;
     for (const s of um.undoStack) total += this.sizeOf(s);
@@ -290,12 +317,12 @@ export class AgentHistory {
       release.push(s);
       this.totals.dropped_steps++;
     }
-    this.redoSeen = [...um.redoStack];
+    this.seen = [...um.undoStack, ...um.redoStack];
     this.release(release);
     if (this.poppedPending.length) {
       const popped = this.poppedPending;
       this.poppedPending = [];
-      this.release(popped, true);
+      this.release(popped);
     }
   }
 
@@ -309,20 +336,17 @@ export class AgentHistory {
     let kept = 0;
     let churn = 0;
     let churnBytes = 0;
-    const containers: Y.Item[] = [];
     this.doc.transact((tr) => {
       Y.iterateDeletedStructs(tr, s.deletions, (struct) => {
         if (!(struct instanceof Y.Item)) return;
         const bytes = itemContentBytes(struct);
-        if (struct.keep && coveredBy(s.insertions, struct)) {
+        if (struct.keep && !isContainer(struct) && coveredBy(s.insertions, struct)) {
           struct.keep = false;
-          if (struct.content instanceof Y.ContentType) containers.push(struct);
           churn++;
           churnBytes += bytes;
         } else kept += bytes;
       });
     }, GC_ORIGIN);
-    for (const c of containers) if (keptBelow((c.content as Y.ContentType).type)) c.keep = true;
     if (churn) {
       this.collect(s.deletions);
       this.totals.released_items += churn;
@@ -332,31 +356,28 @@ export class AgentHistory {
   }
 
   /**
-   * Clears `keep` on the deleted items of dropped steps and collects them; containers only when
-   * nothing below them is still kept, and with `leavesOnly` (popped steps) not at all.
+   * Clears `keep` on the deleted values of dropped (or applied) steps and collects them. Deleted
+   * containers stay kept, also those Yjs un-kept itself when it dropped redo steps: collecting one
+   * would replace everything below it, including restored copies other steps link to.
    */
-  private release(steps: StackItem[], leavesOnly = false): void {
+  private release(steps: StackItem[]): void {
     if (!steps.length || this.doc.isDestroyed) return;
     let items = 0;
     let bytes = 0;
-    const containers: Y.Item[] = [];
     this.doc.transact((tr) => {
       for (const s of steps)
         Y.iterateDeletedStructs(tr, s.deletions, (struct) => {
           if (!(struct instanceof Y.Item)) return;
-          const container = struct.content instanceof Y.ContentType;
-          // also the containers Yjs un-kept itself (dropped redo steps): checked below
-          if (container) containers.push(struct);
-          if (!struct.keep || (container && leavesOnly)) return;
+          if (isContainer(struct)) {
+            struct.keep = true;
+            return;
+          }
+          if (!struct.keep) return;
           bytes += itemContentBytes(struct);
           items++;
           struct.keep = false;
         });
     }, GC_ORIGIN);
-    // collecting a container wipes everything below it: keep those below which a step still keeps
-    // data, and every container of popped steps (their children carry the links undo follows)
-    for (const c of containers)
-      if (!c.keep && (leavesOnly || keptBelow((c.content as Y.ContentType).type))) c.keep = true;
     this.collect(Y.mergeDeleteSets(steps.map((s) => s.deletions)));
     this.totals.released_items += items;
     this.totals.released_bytes += bytes;
@@ -394,17 +415,19 @@ export class AgentHistory {
     }
     this.destroyed = true;
     const live = new Set([...this.undo.undoStack, ...this.undo.redoStack]);
-    // redo steps Yjs dropped since the last maintenance
-    for (const s of this.redoSeen) if (!this.popped.has(s)) live.add(s);
+    // steps Yjs dropped since the last maintenance
+    for (const s of this.seen) if (!this.popped.has(s)) live.add(s);
     const popped = this.poppedPending;
     this.undo.undoStack = [];
     this.undo.redoStack = [];
-    this.redoSeen = [];
+    this.seen = [];
     this.poppedPending = [];
-    this.release([...live]);
-    this.release(popped, true);
+    this.release([...live, ...popped]);
     this.pending = [];
     this.doc.off('afterTransaction', this.onTransaction);
+    const set = histories.get(this.doc);
+    set?.delete(this);
+    if (set && !set.size) histories.delete(this.doc);
     this.undo.destroy();
   }
 }

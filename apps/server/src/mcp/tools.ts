@@ -64,6 +64,7 @@ import {
 } from './modifiers';
 import { MAX_IMPORT_BYTES, fetchLimited } from './fetch-limited';
 import { DEFAULT_MESH_PAGE, MAX_HEIGHTMAP, MAX_MESH_PAGE, MESH_DATA_FIELDS, meshData } from './mesh-data';
+import { DEFAULT_INSTANCE_PAGE, MAX_INSTANCE_PAGE, listInstances } from './instances';
 import {
   keyTargetData,
   keyframeTarget,
@@ -380,6 +381,34 @@ function decodeRenderResult(
   };
 }
 
+/**
+ * Serializes the name checks of create_project / rename_project with the change they guard, per
+ * server (every MCP session has its own tools), so two agents cannot take the same name at once.
+ */
+const projectNameLocks = new WeakMap<RoomManager, Promise<unknown>>();
+function withProjectNames<T>(rooms: RoomManager, fn: () => Promise<T>): Promise<T> {
+  const run = (projectNameLocks.get(rooms) ?? Promise.resolve()).then(fn);
+  projectNameLocks.set(
+    rooms,
+    run.catch(() => undefined),
+  );
+  return run;
+}
+
+/**
+ * Refuses a project name that another project already has: projects are found by id or exact name,
+ * and a second project with the same name would make every by-name reference ambiguous.
+ */
+async function requireFreeProjectName(rooms: RoomManager, name: string, self?: string): Promise<void> {
+  const taken = (await rooms.listProjects()).filter((p) => p.name === name && p.id !== self);
+  if (!taken.length) return;
+  const ids = taken.map((p) => p.id);
+  throw new ToolError(
+    `A project named '${name}' already exists (id ${ids.join(', ')}). Project names are unique because tools find projects by name: ` +
+      `work in that project (pass its id), delete it first with delete_project {project: '${ids[0]}', confirm: true}, or choose another name.`,
+  );
+}
+
 // ------------------------------------------------------------------ registration
 
 export function registerTools(server: McpServer, ctx: ToolContext): void {
@@ -467,15 +496,18 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Create project',
       description:
-        "Create a new project. By default it contains Blender's startup scene (a 2 m cube named 'Cube' with 'Material', a 'Camera' and a point 'Light'); pass empty=true for an empty scene. Returns the project id and the URL that opens it in the editor.",
+        "Create a new project. By default it contains Blender's startup scene (a 2 m cube named 'Cube' with 'Material', a 'Camera' and a point 'Light'); pass empty=true for an empty scene. Project names are unique (tools find projects by id or name): a name that another project already has is refused with that project's id, so work in it, delete it first (delete_project) or pick another name. Returns the project id and the URL that opens it in the editor.",
       annotations: EDIT,
     },
     {
-      name: z.string().trim().min(1).max(200).describe('Project name'),
+      name: z.string().trim().min(1).max(200).describe('Project name (not used by another project)'),
       empty: z.boolean().default(false).describe('Start with an empty scene'),
     },
     async ({ name, empty }, extra) => {
-      const room = await rooms.createProject({ name, empty });
+      const room = await withProjectNames(rooms, async () => {
+        await requireFreeProjectName(rooms, name);
+        return rooms.createProject({ name, empty });
+      });
       const p = await agent.project(room.id);
       return {
         id: room.id,
@@ -514,13 +546,20 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'rename_project',
     {
       title: 'Rename project',
-      description: 'Rename a project (stored in the document, synced to all editors).',
+      description:
+        'Rename a project (stored in the document, synced to all editors). The name must not be used by another project.',
       annotations: EDIT,
     },
-    { project: projectArg, name: z.string().trim().min(1).max(200) },
+    {
+      project: projectArg,
+      name: z.string().trim().min(1).max(200).describe('New project name (not used by another project)'),
+    },
     async ({ project, name }) => {
       const p = await agent.project(project);
-      p.transact(() => p.scene.setName(name));
+      await withProjectNames(rooms, async () => {
+        await requireFreeProjectName(rooms, name, p.id);
+        p.transact(() => p.scene.setName(name));
+      });
       return { id: p.id, name: p.scene.name };
     },
   );
@@ -552,7 +591,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get scene',
       description:
-        "Describe the whole scene at a frame. Values are the EVALUATED ones at that frame, like Blender's properties: keyframed, driven and F-curve-modified location / rotation_euler (radians, also in degrees) / scale, shape key values, constraint influences, pose channels, light / camera / curve / world settings; where animation overrides the value stored in the document (what transform_object or the *.properties_set operators change), the stored value is listed too (`stored`, `stored_value`, `stored_influence`). Contents: counts (objects by type; vertices / faces = BASE mesh data of mesh objects before modifiers, curves and text not included; evaluated {vertices, faces, triangles} = the geometry renders show: after shape keys, modifiers with their RENDER settings (SUBSURF render_levels, SCREW render_steps, show_render), curve bevels (render_resolution_u) and text, instances not included; evaluated_viewport = the same with the viewport settings, only listed when the viewport shows other geometry; instances and instance_triangles = particle / collection instances of renders, viewport_instances when the viewport shows fewer), every object (id, name, type, parent, collection, transform, world-space bounds of the render geometry after modifiers, armature deformation, constraints and physics (wire curves: of their wire), data summary: mesh vertex/face counts (base, evaluated = render, evaluated_viewport when it differs) with shape keys and vertex groups, curve splines/points/fill_mode/bevel/extrude, text body, armature bones with parents and pose_position, light (datablock name, type, energy, colour, size/shape, spot), camera (lens, clipping, dof_use); material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, modifiers, poses, curves, instancing, physics) with object names so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object and get_mesh_data for vertex positions. Evaluations are cached per document state and frame, so repeated get_scene / get_object calls (e.g. checking motion at many frames) are cheap until the scene changes. Units: meters, Z up.",
+        "Describe the whole scene at a frame. Values are the EVALUATED ones at that frame, like Blender's properties: keyframed, driven and F-curve-modified location / rotation_euler (radians, also in degrees) / scale, shape key values, constraint influences, pose channels, light / camera / curve / world settings; where animation overrides the value stored in the document (what transform_object or the *.properties_set operators change), the stored value is listed too (`stored`, `stored_value`, `stored_influence`). Contents: counts (objects by type; vertices / faces = BASE mesh data of mesh objects before modifiers, curves and text not included; evaluated {vertices, faces, triangles} = the geometry renders show: after shape keys, modifiers with their RENDER settings (SUBSURF render_levels, SCREW render_steps, show_render), curve bevels (render_resolution_u) and text, instances not included; evaluated_viewport = the same with the viewport settings, only listed when the viewport shows other geometry; instances and instance_triangles = particle / collection instances of renders, viewport_instances when the viewport shows fewer), every object (id, name, type, parent, collection, transform, world-space bounds of the render geometry after modifiers, armature deformation, constraints and physics (wire curves: of their wire), data summary: mesh vertex/face counts (base, evaluated = render, evaluated_viewport when it differs) with shape keys and vertex groups, curve splines/points/fill_mode/bevel/extrude, text body, armature bones with parents and pose_position, light (datablock name, type, energy, colour, size/shape, spot), camera (lens, clipping, dof_use); material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, instances; where they are: get_instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, modifiers, poses, curves, instancing, physics) with object names so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object and get_mesh_data for vertex positions. Evaluations are cached per document state and frame, so repeated get_scene / get_object calls (e.g. checking motion at many frames) are cheap until the scene changes. Units: meters, Z up.",
       annotations: READ_ONLY,
     },
     {
@@ -581,7 +620,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get object',
       description:
-        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds of the render geometry (wire curves: their wire), parent (and parent bone) and children, data (mesh statistics base and evaluated = what renders show (render settings of the modifiers: SUBSURF render_levels, SCREW render_steps, show_render), plus evaluated_viewport when the viewport shows other geometry; shape keys with values, vertex groups with assigned vertex counts; every curve shape setting (fill_mode, bevel_mode/depth/resolution/object, bevel_factor, extrude, offset, use_fill_caps, twist_mode, resolution_u, render_resolution_u, path settings) and the spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts, rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. Vertex positions and faces: get_mesh_data. Evaluations are cached per document state and frame: checking many objects or frames is cheap.',
+        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds of the render geometry (wire curves: their wire), parent (and parent bone) and children, data (mesh statistics base and evaluated = what renders show (render settings of the modifiers: SUBSURF render_levels, SCREW render_steps, show_render), plus evaluated_viewport when the viewport shows other geometry; shape keys with values, vertex groups with assigned vertex counts; every curve shape setting (fill_mode, bevel_mode/depth/resolution/object, bevel_factor, extrude, offset, use_fill_caps, twist_mode, resolution_u, render_resolution_u, path settings) and the spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts (instance transforms: get_instances), rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. Vertex positions and faces: get_mesh_data. Evaluations are cached per document state and frame: checking many objects or frames is cheap.',
       annotations: READ_ONLY,
     },
     {
@@ -599,7 +638,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'get_mesh_data',
     {
       title: 'Get mesh data',
-      description: `Read the geometry of a mesh, curve or text object, in pages: vertex positions (meters), vertex normals, faces (vertex index loops, counter-clockwise seen from the front), per-face material indices (with the material_slots they refer to), smooth flags, face normals and centers, UVs, loose edges, vertex group weights (source BASE), and a world-space heightmap of the surface (highest Z on an XY grid — for placing things on terrain). source BASE (default for meshes) is the stored mesh, whose indices edit_mesh selections, vertex groups and shape keys use; EVALUATED is the geometry after shape keys and modifiers at the frame (curves and text: their generated surface), RENDER the same with render settings (subdivision render_levels …). space LOCAL (object space, default) or WORLD. include picks the fields (default vertices, faces, face_materials). At most \`limit\` vertices and faces per call (default ${DEFAULT_MESH_PAGE}, max ${MAX_MESH_PAGE}); when more remain the result has truncated: true and next {vertex_offset, face_offset} to pass for the next page. totals gives the full counts. Compact JSON.`,
+      description: `Read the geometry of a mesh, curve or text object, in pages: vertex positions (meters), vertex normals, vertex colors (include "colors": linear [r, g, b, a] 0..1 per vertex from the color layer that paint.vertex_color_set / _stroke / _set_data write, null when there is none), faces (vertex index loops, counter-clockwise seen from the front), per-face material indices (with the material_slots they refer to), smooth flags, face normals and centers, UVs, loose edges, vertex group weights (source BASE), and a world-space heightmap of the surface (highest Z on an XY grid — for placing things on terrain). source BASE (default for meshes) is the stored mesh, whose indices edit_mesh selections, vertex groups and shape keys use; EVALUATED is the geometry after shape keys and modifiers at the frame (curves and text: their generated surface), RENDER the same with render settings (subdivision render_levels …). space LOCAL (object space, default) or WORLD. include picks the fields (default vertices, faces, face_materials). At most \`limit\` vertices and faces per call (default ${DEFAULT_MESH_PAGE}, max ${MAX_MESH_PAGE}); when more remain the result has truncated: true and next {vertex_offset, face_offset} to pass for the next page. totals gives the full counts. Compact JSON.`,
       annotations: READ_ONLY,
     },
     {
@@ -656,6 +695,51 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         heightmap_resolution: a.heightmap_resolution,
       });
       // compact JSON: geometry lists are long
+      return { content: [{ type: 'text', text: JSON.stringify(out) }] };
+    },
+  );
+
+  tool(
+    'get_instances',
+    {
+      title: 'Get instances',
+      description: `List the instances an object generates, with the world transform of each, in pages: every particle of its particle systems (object.scatter_add, object.particle_system_add; one entry per instanced object, so whole-collection particles give one per collection object) and the objects of the collection it instances (object.collection_instance_add). Read-only: check a scatter (spacing / min_distance, nothing on a path, a beach or in the water, sizes, orientations) without making the instances real. Each entry: {system, particle} (particle index) or {collection}, the source object it instances, location (m), rotation_euler (radians, XYZ) and scale in WORLD space. Also per particle system: instance_object / instance_collection, count, particles and instances placed, location_bounds (min/max of the instance locations) and whether it is shown; problems lists instancing errors. source RENDER (default) lists what renders show (every particle of the systems with show_render), VIEWPORT what the editor shows (display_percentage, show_viewport). \`particle_system\` (name or id) restricts the list to one system; \`total\` counts the listed kind. At most \`limit\` per call (default ${DEFAULT_INSTANCE_PAGE}, max ${MAX_INSTANCE_PAGE}); when more remain the result has truncated: true and next {offset}. Compact JSON.`,
+      annotations: READ_ONLY,
+    },
+    {
+      project: projectArg,
+      object: objectArg.describe('Particle emitter or collection-instancing empty (id or exact name)'),
+      particle_system: z
+        .string()
+        .min(1)
+        .optional()
+        .describe('Only this particle system of the object (name or id); default: all of them'),
+      source: z
+        .enum(['RENDER', 'VIEWPORT'])
+        .default('RENDER')
+        .describe('RENDER: the instances renders show (default); VIEWPORT: the editor viewport'),
+      frame: z.number().optional().describe("Frame to evaluate (default: the agent's current frame)"),
+      offset: z.number().int().min(0).default(0).describe('First instance of the page'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_INSTANCE_PAGE)
+        .default(DEFAULT_INSTANCE_PAGE)
+        .describe('Instances per page'),
+      decimals: z.number().int().min(0).max(6).default(4).describe('Rounding of the transforms'),
+    },
+    async (a) => {
+      const p = await agent.project(a.project);
+      const out = listInstances(p.scene, requireObject(p, a.object), {
+        frame: a.frame ?? p.state.frame,
+        source: a.source,
+        particle_system: a.particle_system,
+        offset: a.offset,
+        limit: a.limit,
+        decimals: a.decimals,
+      });
+      // compact JSON: instance lists are long
       return { content: [{ type: 'text', text: JSON.stringify(out) }] };
     },
   );

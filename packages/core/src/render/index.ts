@@ -34,6 +34,7 @@ import {
   SHADE_SOLID,
   type SampledTexture,
   type SurfaceMaterial,
+  type WorldVertices,
 } from './raster';
 import {
   autoFrameView,
@@ -501,7 +502,7 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
     return { o, mesh, mats, fallback, texSpace };
   });
   // world-space vertices per item, shared by the main view and the reflection probe's faces
-  const worldCache = new Map<Mat4, { mesh: MeshData; wp: Float64Array; wn: Float64Array }>();
+  const worldCache = new Map<Mat4, WorldVertices>();
   const drawAll = (ras: Rasterizer) => {
     ras.bufferCache = RENDER_BUFFERS;
     ras.worldCache = worldCache;
@@ -653,6 +654,13 @@ function reflective(m: SurfaceMaterial): boolean {
 
 /** Size (pixels) of a reflection probe cube face. */
 const PROBE_FACE = 32;
+/**
+ * Grid cells per axis of the coarse proxies that the reflection probe's faces and its depth
+ * pre-pass draw instead of dense meshes (`Rasterizer.lodCells`): about one cell per face pixel
+ * for an object that fills a face, so the tiny, blurred probe looks the same while a mesh of
+ * hundreds of thousands of triangles no longer costs every probe pass as much as the main view.
+ */
+const PROBE_LOD_CELLS = 32;
 /** Cube faces of the reflection probe: viewing direction and image up. */
 const PROBE_DIRS: [Vec3, Vec3][] = [
   [
@@ -699,6 +707,7 @@ function probePosition(view: RenderView, bounds: Bounds | null, draw: (r: Raster
   const pre = new Rasterizer(w, h, view);
   pre.mode = SHADE_SOLID;
   pre.sortTriangles = false;
+  pre.lodCells = PROBE_LOD_CELLS;
   draw(pre);
   const depths: number[] = [];
   const cx = w >> 1;
@@ -751,6 +760,7 @@ function reflectionProbe(
     ras.mode = SHADE_MATERIAL;
     ras.cullBackFaces = true;
     ras.sortTriangles = false;
+    ras.lodCells = PROBE_LOD_CELLS;
     light(ras);
     draw(ras);
     return {

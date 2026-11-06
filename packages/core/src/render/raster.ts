@@ -117,6 +117,14 @@ const PROC_VALUES = 13;
 const INV_PI = 1 / Math.PI;
 /** Angular radius of a sun lamp's disc for its highlight (Blender's default sun angle 0.526°). */
 const SUN_ANGULAR_RADIUS = 0.00459;
+/** Meshes with more triangles are drawn from a coarse proxy by helper renders (`lodCells`). */
+export const LOD_MIN_TRIANGLES = 20000;
+
+/**
+ * Triangles iterated by `Rasterizer.drawMesh` (every rasterizer) since the counter was last set
+ * to 0: a cheap, deterministic measure of rasterization work for tests and profiling.
+ */
+export const rasterStats = { triangles: 0 };
 
 export class Rasterizer {
   readonly color: Float32Array;
@@ -156,19 +164,31 @@ export class Rasterizer {
    * linked duplicates and instances draw the same mesh several times) and, through a WeakMap,
    * between renders of unchanged meshes.
    */
-  bufferCache: Pick<Map<MeshData, RenderBuffers>, 'get' | 'set'> | null = null;
+  bufferCache: {
+    get(mesh: MeshData): RenderBuffers | undefined;
+    set(mesh: MeshData, rb: RenderBuffers): unknown;
+  } | null = null;
   /**
    * World-space vertex positions and normals per world matrix (each drawn item has its own
    * matrix object), shared by the rasterizers of one render: the reflection probe's faces and its
-   * depth pre-pass draw the same items as the main view.
+   * depth pre-pass draw the same items as the main view. `og` caches the undeformed positions of
+   * the render vertices (GENERATED texture coordinates) made from `ogSource` (the orco, or null).
    */
-  worldCache: Map<Mat4, { mesh: MeshData; wp: Float64Array; wn: Float64Array }> | null = null;
+  worldCache: Map<Mat4, WorldVertices> | null = null;
   /**
    * Draw each mesh's triangles front to back (cheap early depth rejection). Small helper renders
    * (the reflection probe's 32 × 32 faces) skip the sort, which costs more than the overdraw
    * it saves on dense meshes.
    */
   sortTriangles = true;
+  /**
+   * Level of detail of small helper renders (the reflection probe's faces and its depth
+   * pre-pass): meshes with more than `LOD_MIN_TRIANGLES` triangles are drawn from a proxy whose
+   * vertices are clustered on a grid of `lodCells` cells along each axis of the mesh's bounds
+   * (see `clusteredRenderBuffers`); 0 draws every mesh at full detail. A dense mesh would
+   * otherwise cost each of these tiny, blurred images about as much as the main view.
+   */
+  lodCells = 0;
   /**
    * Skip back faces of every material (reflection probes: from a point inside or on a closed
    * object, its far side does not block the view of the surroundings).
@@ -309,24 +329,12 @@ export class Rasterizer {
       rb = buildRenderBuffers(mesh);
       this.bufferCache?.set(mesh, rb);
     }
+    if (this.lodCells > 0 && !(this.wireHalfWidth > 0) && rb.indices.length > 3 * LOD_MIN_TRIANGLES)
+      rb = lodRenderBuffers(rb, this.lodCells);
     const nv = rb.positions.length / 3;
     const tris = rb.indices.length / 3;
     if (!tris) return;
-    // undeformed object-space position per render vertex (GENERATED procedural coordinates)
-    let og: Float64Array | null = null;
-    if (procedural) {
-      og = Float64Array.from(rb.positions);
-      const orco = texSpace?.orco;
-      if (orco && orco.length === mesh.positions.length) {
-        const src = rb.vertexSource;
-        for (let i = 0; i < nv; i++) {
-          const s = src[i] * 3;
-          og[i * 3] = orco[s];
-          og[i * 3 + 1] = orco[s + 1];
-          og[i * 3 + 2] = orco[s + 2];
-        }
-      }
-    }
+    rasterStats.triangles += tris;
     const M = world;
     // mirroring transforms reverse the winding of world-space triangles
     const mirrored =
@@ -337,15 +345,41 @@ export class Rasterizer {
     const VP = this.view.viewProj;
     // world-space positions and normals: computed once per item and render (probe faces too)
     let ws = this.worldCache?.get(world);
-    if (!ws || ws.mesh !== mesh || ws.wp.length !== nv * 3) {
-      ws = { mesh, ...worldVertices(rb, M) };
+    if (!ws || ws.mesh !== mesh || ws.rb !== rb) {
+      ws = { mesh, rb, ...worldVertices(rb, M) };
       this.worldCache?.set(world, ws);
     }
     const wp = ws.wp;
     const wn = ws.wn;
+    // undeformed object-space position per render vertex (GENERATED procedural coordinates; only
+    // material shading reads them), shared by the rasterizers of one render like `ws`
+    let og: Float64Array | null = null;
+    if (procedural && this.mode === SHADE_MATERIAL) {
+      const orco = texSpace?.orco && texSpace.orco.length === mesh.positions.length ? texSpace.orco : null;
+      if (ws.og && ws.ogSource === orco) og = ws.og;
+      else {
+        og = Float64Array.from(rb.positions);
+        if (orco) {
+          const src = rb.vertexSource;
+          for (let i = 0; i < nv; i++) {
+            const s = src[i] * 3;
+            og[i * 3] = orco[s];
+            og[i * 3 + 1] = orco[s + 1];
+            og[i * 3 + 2] = orco[s + 2];
+          }
+        }
+        ws.og = og;
+        ws.ogSource = orco;
+      }
+    }
     const cl = scratchF64('cl', nv * 4);
     const oc = scratchU8('oc', nv);
     const gc = scratchU8('gc', nv);
+    // screen position of every vertex in front of the near plane (as `loadScreen` computes it)
+    const sx = scratchF64('sx', nv);
+    const sy = scratchF64('sy', nv);
+    const W = this.width;
+    const H = this.height;
     for (let i = 0; i < nv; i++) {
       const wx = wp[i * 3];
       const wy = wp[i * 3 + 1];
@@ -368,6 +402,10 @@ export class Rasterizer {
       gc[i] =
         (cz < -cw ? 16 : 0) |
         (cx < -GUARD * cw || cx > GUARD * cw || cy < -GUARD * cw || cy > GUARD * cw ? 1 : 0);
+      // (only read for vertices that need no clipping, which are in front of the eye: w > 0)
+      const iw = 1 / cw;
+      sx[i] = (cx * iw * 0.5 + 0.5) * W;
+      sy[i] = (0.5 - cy * iw * 0.5) * H;
     }
     // material of every triangle (by its group)
     const groupMats: SurfaceMaterial[] = rb.groups.map((g) => materials[g.materialIndex] ?? fallback);
@@ -403,6 +441,28 @@ export class Rasterizer {
       const i1 = idx[t * 3 + 1];
       const i2 = idx[t * 3 + 2];
       if (oc[i0] & oc[i1] & oc[i2]) continue;
+      const clipped = gc[i0] | gc[i1] | gc[i2];
+      if (!clipped) {
+        // no pixel centre inside the triangle's bounding box: `fill` would draw nothing (the same
+        // test, before the per-vertex setup: most triangles of dense meshes in small images, such
+        // as the reflection probe's faces, cover no sample at all)
+        const x0 = sx[i0];
+        const x1 = sx[i1];
+        const x2 = sx[i2];
+        if (
+          Math.max(0, Math.ceil(Math.min(x0, x1, x2) - 0.5)) >
+          Math.min(W - 1, Math.floor(Math.max(x0, x1, x2) - 0.5))
+        )
+          continue;
+        const y0 = sy[i0];
+        const y1 = sy[i1];
+        const y2 = sy[i2];
+        if (
+          Math.max(0, Math.ceil(Math.min(y0, y1, y2) - 0.5)) >
+          Math.min(H - 1, Math.floor(Math.max(y0, y1, y2) - 0.5))
+        )
+          continue;
+      }
       const mat = groupMats[triGroup[t]];
       // facing from world-space geometry (robust for clipped triangles and mirrored objects)
       const ax = wp[i1 * 3] - wp[i0 * 3];
@@ -422,7 +482,7 @@ export class Rasterizer {
       const wire = edges ? edges[t] : 0;
       // alpha-blended and transmissive surfaces wait for the sorted transparent pass
       const deferred = this.mode === SHADE_MATERIAL && (mat.blend === 2 || (mat.transmission ?? 0) > 0);
-      if (!(gc[i0] | gc[i1] | gc[i2])) {
+      if (!clipped) {
         this.loadScreen(0, i0, cl, wn, wp, colors, uvs, og);
         this.loadScreen(1, i1, cl, wn, wp, colors, uvs, og);
         this.loadScreen(2, i2, cl, wn, wp, colors, uvs, og);
@@ -1331,6 +1391,157 @@ function clamp01(v: number): number {
 }
 
 /** World-space positions and unit normals of a mesh's render vertices under matrix M. */
+/** Level-of-detail proxies per render buffers and grid size (kept while the buffers live). */
+const LOD_CACHE = new WeakMap<RenderBuffers, Map<number, RenderBuffers>>();
+
+/** The level-of-detail proxy of `rb` for `cells` grid cells per axis (cached). */
+function lodRenderBuffers(rb: RenderBuffers, cells: number): RenderBuffers {
+  let byCells = LOD_CACHE.get(rb);
+  if (!byCells) LOD_CACHE.set(rb, (byCells = new Map()));
+  let out = byCells.get(cells);
+  if (!out) byCells.set(cells, (out = clusteredRenderBuffers(rb, cells)));
+  return out;
+}
+
+/**
+ * A coarse version of `rb` for small images (vertex clustering): the vertices are grouped by
+ * their cell in a grid of `cells` cells along each axis of their bounds (every axis divided
+ * evenly, so thin parts keep their thickness), each group becomes one vertex at the mean position
+ * with the mean normal (and the uv, colour and source vertex of its first member), and the
+ * triangles are remapped to these vertices; those with two corners in one cell vanish. Material
+ * groups keep their order. At most `cells`³ vertices remain, about 2 · 6 · `cells`² triangles
+ * for a closed surface.
+ */
+export function clusteredRenderBuffers(rb: RenderBuffers, cells: number): RenderBuffers {
+  const P = rb.positions;
+  const N = rb.normals;
+  const nv = P.length / 3;
+  const n = Math.max(1, Math.min(256, Math.floor(cells) || 1));
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+  for (let i = 0; i < nv; i++) {
+    const x = P[i * 3];
+    const y = P[i * 3 + 1];
+    const z = P[i * 3 + 2];
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+  const kx = maxX > minX ? n / (maxX - minX) : 0;
+  const ky = maxY > minY ? n / (maxY - minY) : 0;
+  const kz = maxZ > minZ ? n / (maxZ - minZ) : 0;
+  const slot = new Int32Array(n * n * n).fill(-1);
+  const cluster = new Int32Array(nv);
+  const first: number[] = [];
+  for (let i = 0; i < nv; i++) {
+    const ix = Math.min(n - 1, Math.floor((P[i * 3] - minX) * kx));
+    const iy = Math.min(n - 1, Math.floor((P[i * 3 + 1] - minY) * ky));
+    const iz = Math.min(n - 1, Math.floor((P[i * 3 + 2] - minZ) * kz));
+    const key = (ix * n + iy) * n + iz;
+    let c = slot[key];
+    if (c < 0) {
+      c = slot[key] = first.length;
+      first.push(i);
+    }
+    cluster[i] = c;
+  }
+  const m = first.length;
+  const sum = new Float64Array(m * 6);
+  const count = new Uint32Array(m);
+  for (let i = 0; i < nv; i++) {
+    const o = cluster[i] * 6;
+    sum[o] += P[i * 3];
+    sum[o + 1] += P[i * 3 + 1];
+    sum[o + 2] += P[i * 3 + 2];
+    sum[o + 3] += N[i * 3];
+    sum[o + 4] += N[i * 3 + 1];
+    sum[o + 5] += N[i * 3 + 2];
+    count[cluster[i]]++;
+  }
+  const positions = new Float32Array(m * 3);
+  const normals = new Float32Array(m * 3);
+  const vertexSource = new Uint32Array(m);
+  const srcUv = rb.uvs;
+  const srcColor = rb.colors;
+  const uvs = srcUv ? new Float32Array(m * 2) : null;
+  const colors = srcColor ? new Float32Array(m * 4) : null;
+  for (let c = 0; c < m; c++) {
+    const f = first[c];
+    const o = c * 6;
+    positions[c * 3] = sum[o] / count[c];
+    positions[c * 3 + 1] = sum[o + 1] / count[c];
+    positions[c * 3 + 2] = sum[o + 2] / count[c];
+    let nx = sum[o + 3];
+    let ny = sum[o + 4];
+    let nz = sum[o + 5];
+    let l = Math.hypot(nx, ny, nz);
+    if (!(l > 1e-9)) {
+      // opposite normals cancelled (both sides of a thin wall): keep the first member's
+      nx = N[f * 3];
+      ny = N[f * 3 + 1];
+      nz = N[f * 3 + 2];
+      l = Math.hypot(nx, ny, nz) || 1;
+    }
+    normals[c * 3] = nx / l;
+    normals[c * 3 + 1] = ny / l;
+    normals[c * 3 + 2] = nz / l;
+    vertexSource[c] = rb.vertexSource[f];
+    if (uvs && srcUv) {
+      uvs[c * 2] = srcUv[f * 2];
+      uvs[c * 2 + 1] = srcUv[f * 2 + 1];
+    }
+    if (colors && srcColor) for (let k = 0; k < 4; k++) colors[c * 4 + k] = srcColor[f * 4 + k];
+  }
+  const I = rb.indices;
+  const indices = new Uint32Array(I.length);
+  const triFace = new Uint32Array(I.length / 3);
+  const groups: RenderBuffers['groups'] = [];
+  let w = 0;
+  for (const g of rb.groups) {
+    const start = w;
+    for (let o = g.start; o < g.start + g.count; o += 3) {
+      const a = cluster[I[o]];
+      const b = cluster[I[o + 1]];
+      const c = cluster[I[o + 2]];
+      if (a === b || b === c || a === c) continue;
+      indices[w] = a;
+      indices[w + 1] = b;
+      indices[w + 2] = c;
+      triFace[w / 3] = rb.triFace[o / 3];
+      w += 3;
+    }
+    if (w > start) groups.push({ start, count: w - start, materialIndex: g.materialIndex });
+  }
+  return {
+    positions,
+    normals,
+    uvs,
+    colors,
+    indices: indices.slice(0, w),
+    groups,
+    triFace: triFace.slice(0, w / 3),
+    vertexSource,
+  };
+}
+
+/** World-space vertices of one drawn item (see `Rasterizer.worldCache`). */
+export interface WorldVertices {
+  mesh: MeshData;
+  /** The render buffers drawn (the mesh's, or their level-of-detail proxy). */
+  rb: RenderBuffers;
+  wp: Float64Array;
+  wn: Float64Array;
+  og?: Float64Array;
+  ogSource?: ArrayLike<number> | null;
+}
+
 function worldVertices(rb: RenderBuffers, M: Mat4): { wp: Float64Array; wn: Float64Array } {
   const nv = rb.positions.length / 3;
   const NM = normalMatrix4(M);

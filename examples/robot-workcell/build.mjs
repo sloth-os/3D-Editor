@@ -41,27 +41,33 @@ const args = {};
 for (const a of process.argv.slice(2)) {
   const m = /^--([a-z-]+)(?:=(.*))?$/s.exec(a);
   const known = [...FLAGS.map((k) => `--${k}`), ...VALUES.map((k) => `--${k}=…`)].join(' ');
-  if (!m || (!FLAGS.includes(m[1]) && !VALUES.includes(m[1]))) throw new Error(`unknown argument ${a} (known: ${known})`);
+  if (!m || (!FLAGS.includes(m[1]) && !VALUES.includes(m[1])))
+    throw new Error(`unknown argument ${a} (known: ${known})`);
   const [, name, value] = m;
   if (FLAGS.includes(name) && value !== undefined) throw new Error(`--${name} takes no value`);
-  if (VALUES.includes(name) && !value) throw new Error(`--${name} needs a value: --${name}=${name === 'preview' ? 'DIR' : 'SECONDS'}`);
+  if (VALUES.includes(name) && !value)
+    throw new Error(`--${name} needs a value: --${name}=${name === 'preview' ? 'DIR' : 'SECONDS'}`);
   if (name in args) throw new Error(`--${name} is given twice`);
   args[name] = value ?? true;
 }
 const modes = ['no-render', 'export-only', 'preview'].filter((k) => k in args);
 if (modes.length > 1) throw new Error(`the modes ${modes.map((k) => `--${k}`).join(', ')} are exclusive`);
-if (args['still-only'] && args['anim-only']) throw new Error('--still-only and --anim-only are exclusive (give neither to render both)');
+if (args['still-only'] && args['anim-only'])
+  throw new Error('--still-only and --anim-only are exclusive (give neither to render both)');
 const finalOptions = ['still-only', 'anim-only', 'still-time'].filter((k) => k in args);
 if (modes.length && finalOptions.length)
-  throw new Error(`${finalOptions.map((k) => `--${k}`).join(', ')} only ${finalOptions.length > 1 ? 'apply' : 'applies'} to the final renders (no mode flag), not to --${modes[0]}`);
+  throw new Error(
+    `${finalOptions.map((k) => `--${k}`).join(', ')} only ${finalOptions.length > 1 ? 'apply' : 'applies'} to the final renders (no mode flag), not to --${modes[0]}`,
+  );
 if (args['anim-only'] && args['still-time']) throw new Error('--still-time has no effect with --anim-only');
-const NO_RENDER = !!args['no-render'];
+// (--no-render needs no variable: with it, none of the render and export stages at the end runs)
 const EXPORT_ONLY = !!args['export-only'];
 const PREVIEW_DIR = args.preview;
 const STILL_ONLY = !!args['still-only'];
 const ANIM_ONLY = !!args['anim-only'];
 const STILL_TIME = Number(args['still-time'] ?? 480);
-if (!(STILL_TIME > 0 && STILL_TIME <= 3600)) throw new Error(`--still-time must be a number of seconds in (0, 3600], got ${args['still-time']}`);
+if (!(STILL_TIME > 0 && STILL_TIME <= 3600))
+  throw new Error(`--still-time must be a number of seconds in (0, 3600], got ${args['still-time']}`);
 const FINAL_RENDERS = !modes.length;
 
 const T0 = Date.now();
@@ -78,14 +84,17 @@ async function call(tool, args = {}, opts) {
   try {
     return await mcp.call(tool, args, opts);
   } catch (e) {
-    const shown = JSON.stringify(args, (k, v) => (Array.isArray(v) && v.length > 12 ? `[${v.length} items]` : v));
-    throw new Error(`${tool} failed: ${e.message}\n  args: ${shown.slice(0, 1500)}`);
+    const shown = JSON.stringify(args, (k, v) =>
+      Array.isArray(v) && v.length > 12 ? `[${v.length} items]` : v,
+    );
+    throw new Error(`${tool} failed: ${e.message}\n  args: ${shown.slice(0, 1500)}`, { cause: e });
   }
 }
 const tool = (name, args = {}, opts) => call(name, { project: PROJECT, ...args }, opts);
 async function op(operator, params = {}, selection) {
   const r = await tool('run_operator', { operator, params, ...(selection ? { selection } : {}) });
-  for (const rep of r.reports ?? []) if (rep.level !== 'INFO') log(`  ${operator}: ${rep.level} ${rep.message}`);
+  for (const rep of r.reports ?? [])
+    if (rep.level !== 'INFO') log(`  ${operator}: ${rep.level} ${rep.message}`);
   return r.result;
 }
 async function batch(operations, label = 'batch') {
@@ -95,12 +104,16 @@ async function batch(operations, label = 'batch') {
     if (!r.ok) throw new Error(`${label}: ${JSON.stringify(r).slice(0, 2000)}`);
     // batch reports every operation's warnings: surface them instead of dropping them
     for (const res of r.results ?? [])
-      for (const rep of res.reports ?? []) if (rep.level !== 'INFO') log(`  ${label} / ${res.operator}: ${rep.level} ${rep.message}`);
+      for (const rep of res.reports ?? [])
+        if (rep.level !== 'INFO') log(`  ${label} / ${res.operator}: ${rep.level} ${rep.message}`);
     results.push(...(r.results ?? []));
   }
   return results;
 }
-const sel = (objects, active) => ({ operator: 'object.select', params: { objects, ...(active ? { active } : {}) } });
+const sel = (objects, active) => ({
+  operator: 'object.select',
+  params: { objects, ...(active ? { active } : {}) },
+});
 
 // ---------------------------------------------------------------------------------------------
 // Geometry helpers (meshes are built at real size: object scale stays 1, so procedural
@@ -113,8 +126,16 @@ function addBox(g, [cx, cy, cz], [sx, sy, sz]) {
   const vb = g.v.length;
   const fb = g.f.length;
   for (const z of [cz - sz / 2, cz + sz / 2])
-    for (const y of [cy - sy / 2, cy + sy / 2]) for (const x of [cx - sx / 2, cx + sx / 2]) g.v.push([r6(x), r6(y), r6(z)]);
-  for (const q of [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]])
+    for (const y of [cy - sy / 2, cy + sy / 2])
+      for (const x of [cx - sx / 2, cx + sx / 2]) g.v.push([r6(x), r6(y), r6(z)]);
+  for (const q of [
+    [0, 2, 3, 1],
+    [4, 5, 7, 6],
+    [0, 1, 5, 4],
+    [2, 6, 7, 3],
+    [0, 4, 6, 2],
+    [1, 3, 7, 5],
+  ])
     g.f.push(q.map((i) => vb + i));
   return { v: vb, f: fb, nv: 8, nf: 6 };
 }
@@ -122,9 +143,20 @@ function addBox(g, [cx, cy, cz], [sx, sy, sz]) {
 function addTaperBox(g, z0, z1, [w0, d0], [w1, d1], [ox, oy] = [0, 0]) {
   const vb = g.v.length;
   const fb = g.f.length;
-  for (const [z, w, d] of [[z0, w0, d0], [z1, w1, d1]])
-    for (const y of [-d / 2, d / 2]) for (const x of [-w / 2, w / 2]) g.v.push([r6(ox + x), r6(oy + y), r6(z)]);
-  for (const q of [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]])
+  for (const [z, w, d] of [
+    [z0, w0, d0],
+    [z1, w1, d1],
+  ])
+    for (const y of [-d / 2, d / 2])
+      for (const x of [-w / 2, w / 2]) g.v.push([r6(ox + x), r6(oy + y), r6(z)]);
+  for (const q of [
+    [0, 2, 3, 1],
+    [4, 5, 7, 6],
+    [0, 1, 5, 4],
+    [2, 6, 7, 3],
+    [0, 4, 6, 2],
+    [1, 3, 7, 5],
+  ])
     g.f.push(q.map((i) => vb + i));
   return { v: vb, f: fb };
 }
@@ -135,8 +167,16 @@ function addOrientedBox(g, c, a, b, [sa, sb, sc]) {
   const vb = g.v.length;
   for (const k of [-0.5, 0.5])
     for (const j of [-0.5, 0.5])
-      for (const i of [-0.5, 0.5]) g.v.push(c.map((x, m) => r6(x + a[m] * i * sa + b[m] * j * sb + n[m] * k * sc)));
-  for (const q of [[0, 2, 3, 1], [4, 5, 7, 6], [0, 1, 5, 4], [2, 6, 7, 3], [0, 4, 6, 2], [1, 3, 7, 5]])
+      for (const i of [-0.5, 0.5])
+        g.v.push(c.map((x, m) => r6(x + a[m] * i * sa + b[m] * j * sb + n[m] * k * sc)));
+  for (const q of [
+    [0, 2, 3, 1],
+    [4, 5, 7, 6],
+    [0, 1, 5, 4],
+    [2, 6, 7, 3],
+    [0, 4, 6, 2],
+    [1, 3, 7, 5],
+  ])
     g.f.push(q.map((i) => vb + i));
 }
 /** Closed cylinder around `axis` ('X' | 'Y' | 'Z') centred at c. */
@@ -144,7 +184,11 @@ function addCylinder(g, c, radius, length, axis = 'Z', segments = 32) {
   const vb = g.v.length;
   const fb = g.f.length;
   const map = (a, b, h) =>
-    axis === 'Z' ? [c[0] + a, c[1] + b, c[2] + h] : axis === 'Y' ? [c[0] + a, c[1] + h, c[2] + b] : [c[0] + h, c[1] + a, c[2] + b];
+    axis === 'Z'
+      ? [c[0] + a, c[1] + b, c[2] + h]
+      : axis === 'Y'
+        ? [c[0] + a, c[1] + h, c[2] + b]
+        : [c[0] + h, c[1] + a, c[2] + b];
   for (const h of [-length / 2, length / 2])
     for (let i = 0; i < segments; i++) {
       const t = (2 * Math.PI * i) / segments;
@@ -273,7 +317,13 @@ const MOUTH_HALF = 0.25; // half width of the mouth (crate: 0.21)
 const MOUTH_TOP = ROLLER_TOP + CRATE[2] + 0.06; // 6 cm above a crate
 const DOOR_Y = INFEED_Y0 + 0.065; // door plane, just behind the 5 cm front wall
 const DOOR_LIFT = 0.42; // fully open: the door is hidden behind the header
-const DOOR_KEYS = [[1, 0], [45, 0], [51, DOOR_LIFT], [58, DOOR_LIFT], [64, 0]];
+const DOOR_KEYS = [
+  [1, 0],
+  [45, 0],
+  [51, DOOR_LIFT],
+  [58, DOOR_LIFT],
+  [64, 0],
+];
 
 const smoother = (u) => u * u * u * (u * (u * 6 - 15) + 10);
 function cylAt(f) {
@@ -294,7 +344,8 @@ const targetAt = (f) => {
   return [c.r * Math.cos(c.az), c.r * Math.sin(c.az), c.z];
 };
 /** Belt travel of the queued crates (0 -> one pitch) while the conveyor indexes. */
-const beltAt = (f) => QUEUE_PITCH * smoother(Math.min(1, Math.max(0, (f - F_INDEX_START) / (F_INDEX_END - F_INDEX_START))));
+const beltAt = (f) =>
+  QUEUE_PITCH * smoother(Math.min(1, Math.max(0, (f - F_INDEX_START) / (F_INDEX_END - F_INDEX_START))));
 
 // ---------------------------------------------------------------------------------------------
 // 1. Project
@@ -326,8 +377,19 @@ await tool('set_scene_settings', {
 // 2. Materials
 // ---------------------------------------------------------------------------------------------
 const MAT = {
-  paint: { name: 'Robot Teal Paint', base_color: [0.012, 0.23, 0.26, 1], roughness: 0.3, coat_weight: 0.6, coat_roughness: 0.08 },
-  graphite: { name: 'Graphite Housing', base_color: [0.025, 0.027, 0.03, 1], metallic: 0.55, roughness: 0.38 },
+  paint: {
+    name: 'Robot Teal Paint',
+    base_color: [0.012, 0.23, 0.26, 1],
+    roughness: 0.3,
+    coat_weight: 0.6,
+    coat_roughness: 0.08,
+  },
+  graphite: {
+    name: 'Graphite Housing',
+    base_color: [0.025, 0.027, 0.03, 1],
+    metallic: 0.55,
+    roughness: 0.38,
+  },
   steel: { name: 'Machined Steel', base_color: [0.62, 0.63, 0.64, 1], metallic: 1, roughness: 0.28 },
   alu: { name: 'Gripper Aluminium', base_color: [0.8, 0.8, 0.82, 1], metallic: 1, roughness: 0.34 },
   rubber: { name: 'Black Rubber', base_color: [0.012, 0.012, 0.013, 1], roughness: 0.62 },
@@ -341,18 +403,59 @@ const MAT = {
   floor: { name: 'Epoxy Floor', base_color: [0.1, 0.105, 0.11, 1], roughness: 0.3 },
   stripes: { name: 'Hazard Stripes', base_color: [0.9, 0.62, 0.02, 1], roughness: 0.5 },
   cabinet: { name: 'Cabinet Grey', base_color: [0.42, 0.44, 0.46, 1], metallic: 0.2, roughness: 0.4 },
-  screen: { name: 'HMI Screen', base_color: [0.02, 0.02, 0.02, 1], roughness: 0.2, emission_color: [0.2, 0.55, 1.0], emission_strength: 3 },
-  green: { name: 'Lamp Green', base_color: [0.05, 0.5, 0.1, 1], roughness: 0.3, emission_color: [0.1, 1.0, 0.25], emission_strength: 12 },
-  amber: { name: 'Lamp Amber', base_color: [0.6, 0.35, 0.02, 1], roughness: 0.3, emission_color: [1.0, 0.55, 0.05], emission_strength: 0 },
-  red: { name: 'Lamp Red', base_color: [0.5, 0.03, 0.02, 1], roughness: 0.3, emission_color: [1.0, 0.05, 0.03], emission_strength: 0 },
+  screen: {
+    name: 'HMI Screen',
+    base_color: [0.02, 0.02, 0.02, 1],
+    roughness: 0.2,
+    emission_color: [0.2, 0.55, 1.0],
+    emission_strength: 3,
+  },
+  green: {
+    name: 'Lamp Green',
+    base_color: [0.05, 0.5, 0.1, 1],
+    roughness: 0.3,
+    emission_color: [0.1, 1.0, 0.25],
+    emission_strength: 12,
+  },
+  amber: {
+    name: 'Lamp Amber',
+    base_color: [0.6, 0.35, 0.02, 1],
+    roughness: 0.3,
+    emission_color: [1.0, 0.55, 0.05],
+    emission_strength: 0,
+  },
+  red: {
+    name: 'Lamp Red',
+    base_color: [0.5, 0.03, 0.02, 1],
+    roughness: 0.3,
+    emission_color: [1.0, 0.05, 0.03],
+    emission_strength: 0,
+  },
   button: { name: 'EStop Red', base_color: [0.55, 0.02, 0.015, 1], roughness: 0.25, coat_weight: 0.5 },
   sign: { name: 'Sign Yellow', base_color: [0.9, 0.7, 0.05, 1], roughness: 0.5 },
   text: { name: 'Sign Black', base_color: [0.01, 0.01, 0.01, 1], roughness: 0.5 },
   wall: { name: 'Corrugated Wall', base_color: [0.05, 0.058, 0.066, 1], metallic: 0.35, roughness: 0.5 },
-  wallSide: { name: 'Corrugated Wall Side', base_color: [0.05, 0.058, 0.066, 1], metallic: 0.35, roughness: 0.5 },
-  window: { name: 'Hall Window', base_color: [0.05, 0.06, 0.08, 1], roughness: 0.1, emission_color: [0.35, 0.5, 0.85], emission_strength: 2.0 },
+  wallSide: {
+    name: 'Corrugated Wall Side',
+    base_color: [0.05, 0.058, 0.066, 1],
+    metallic: 0.35,
+    roughness: 0.5,
+  },
+  window: {
+    name: 'Hall Window',
+    base_color: [0.05, 0.06, 0.08, 1],
+    roughness: 0.1,
+    emission_color: [0.35, 0.5, 0.85],
+    emission_strength: 2.0,
+  },
   column: { name: 'Column Paint', base_color: [0.16, 0.17, 0.18, 1], metallic: 0.3, roughness: 0.5 },
-  curtain: { name: 'Light Curtain Red', base_color: [0.3, 0.01, 0.01, 1], roughness: 0.3, emission_color: [1.0, 0.04, 0.02], emission_strength: 6 },
+  curtain: {
+    name: 'Light Curtain Red',
+    base_color: [0.3, 0.01, 0.01, 1],
+    roughness: 0.3,
+    emission_color: [1.0, 0.04, 0.02],
+    emission_strength: 6,
+  },
 };
 await batch(
   Object.values(MAT).map((m) => ({ operator: 'material.new', params: { ...m, assign: false } })),
@@ -425,7 +528,14 @@ const assign = (material, objects, slot = 0) => ({
         params: {
           material: MAT.floor.name,
           channel: 'roughness',
-          procedural: { type: 'NOISE', mapping: 'OBJECT', scale: 2.5, detail: 4, color_a: [0.12, 0.12, 0.12], color_b: [0.36, 0.36, 0.36] },
+          procedural: {
+            type: 'NOISE',
+            mapping: 'OBJECT',
+            scale: 2.5,
+            detail: 4,
+            color_a: [0.12, 0.12, 0.12],
+            color_b: [0.36, 0.36, 0.36],
+          },
         },
       },
       {
@@ -441,7 +551,12 @@ const assign = (material, objects, slot = 0) => ({
             color_b: [0.012, 0.012, 0.012],
             ramp_low: 0.5,
             ramp_high: 0.5,
-            params: { wave_type: 'BANDS', direction: 'DIAGONAL', wave_profile: 'SAW', ramp_interpolation: 'CONSTANT' },
+            params: {
+              wave_type: 'BANDS',
+              direction: 'DIAGONAL',
+              wave_profile: 'SAW',
+              ramp_interpolation: 'CONSTANT',
+            },
           },
         },
       },
@@ -454,7 +569,12 @@ const assign = (material, objects, slot = 0) => ({
 // ---------------------------------------------------------------------------------------------
 // 4. Robot: armature (4 joints) and its rigid parts
 // ---------------------------------------------------------------------------------------------
-await op('object.armature_add', { name: 'Robot_Rig', bone_name: 'J1_Base', location: [0, 0, 0], radius: 0.4 });
+await op('object.armature_add', {
+  name: 'Robot_Rig',
+  bone_name: 'J1_Base',
+  location: [0, 0, 0],
+  radius: 0.4,
+});
 await op('armature.bone_update', { object: 'Robot_Rig', bone: 'J1_Base', head: J1_HEAD, tail: J1_TAIL });
 const chain = await op('armature.chain_add', {
   object: 'Robot_Rig',
@@ -472,7 +592,8 @@ const robotParts = []; // [object name, material key, bone]
   // Static base (not rigged)
   let g = newGeo();
   addBox(g, [0, 0, 0.03], [0.9, 0.9, 0.06]);
-  for (const sx of [-1, 1]) for (const sy of [-1, 1]) addCylinder(g, [sx * 0.36, sy * 0.36, 0.075], 0.03, 0.03, 'Z', 12);
+  for (const sx of [-1, 1])
+    for (const sy of [-1, 1]) addCylinder(g, [sx * 0.36, sy * 0.36, 0.075], 0.03, 0.03, 'Z', 12);
   ops.push(meshOp('Robot_BasePlate', g), assign('graphite', ['Robot_BasePlate']));
   g = newGeo();
   addCylinder(g, [0, 0, 0.19], 0.3, 0.26, 'Z', 48);
@@ -542,10 +663,43 @@ const robotParts = []; // [object name, material key, bone]
 }
 // Gears (generator): slewing ring on J1, gear wheels on the shoulder and elbow
 // (materials: false: the parts get their materials below, so no unused default "Steel" is made)
-await op('object.generate_gear', { name: 'Robot_SlewRing', teeth: 60, radius: 0.335, tooth_depth: 0.02, thickness: 0.05, bore: 0.25, location: [0, 0, 0.345], materials: false });
-await op('object.generate_gear', { name: 'Robot_ShoulderGear', teeth: 28, radius: 0.16, tooth_depth: 0.022, thickness: 0.035, bore: 0.05, location: [SHOULDER[0], 0.235, SHOULDER[2]], rotation: [Math.PI / 2, 0, 0], materials: false });
-await op('object.generate_gear', { name: 'Robot_ElbowGear', teeth: 26, radius: 0.145, tooth_depth: 0.02, thickness: 0.03, bore: 0.04, location: [ELBOW[0], 0.165, ELBOW[2]], rotation: [Math.PI / 2, 0, 0], materials: false });
-robotParts.push(['Robot_SlewRing', 'steel', 'J1_Base'], ['Robot_ShoulderGear', 'steel', 'J2_Shoulder'], ['Robot_ElbowGear', 'steel', 'J3_Elbow']);
+await op('object.generate_gear', {
+  name: 'Robot_SlewRing',
+  teeth: 60,
+  radius: 0.335,
+  tooth_depth: 0.02,
+  thickness: 0.05,
+  bore: 0.25,
+  location: [0, 0, 0.345],
+  materials: false,
+});
+await op('object.generate_gear', {
+  name: 'Robot_ShoulderGear',
+  teeth: 28,
+  radius: 0.16,
+  tooth_depth: 0.022,
+  thickness: 0.035,
+  bore: 0.05,
+  location: [SHOULDER[0], 0.235, SHOULDER[2]],
+  rotation: [Math.PI / 2, 0, 0],
+  materials: false,
+});
+await op('object.generate_gear', {
+  name: 'Robot_ElbowGear',
+  teeth: 26,
+  radius: 0.145,
+  tooth_depth: 0.02,
+  thickness: 0.03,
+  bore: 0.04,
+  location: [ELBOW[0], 0.165, ELBOW[2]],
+  rotation: [Math.PI / 2, 0, 0],
+  materials: false,
+});
+robotParts.push(
+  ['Robot_SlewRing', 'steel', 'J1_Base'],
+  ['Robot_ShoulderGear', 'steel', 'J2_Shoulder'],
+  ['Robot_ElbowGear', 'steel', 'J3_Elbow'],
+);
 
 // Gripper with two fingers; the 'Grip' shape key closes them onto the crate
 const gripper = newGeo();
@@ -597,9 +751,15 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
   ops.push(sel(smooth), { operator: 'object.shade_auto_smooth', params: { angle: 0.6 } });
   for (const bone of ['J1_Base', 'J2_Shoulder', 'J3_Elbow', 'J4_Wrist']) {
     const kids = robotParts.filter(([, , b]) => b === bone).map(([n]) => n);
-    ops.push(sel([...kids, 'Robot_Rig'], 'Robot_Rig'), { operator: 'object.parent_set', params: { type: 'BONE', bone } });
+    ops.push(sel([...kids, 'Robot_Rig'], 'Robot_Rig'), {
+      operator: 'object.parent_set',
+      params: { type: 'BONE', bone },
+    });
   }
-  ops.push(sel(['Robot_BasePlate', 'Robot_Pedestal', 'Robot_Rig'], 'Robot_Rig'), { operator: 'object.parent_set', params: { type: 'OBJECT' } });
+  ops.push(sel(['Robot_BasePlate', 'Robot_Pedestal', 'Robot_Rig'], 'Robot_Rig'), {
+    operator: 'object.parent_set',
+    params: { type: 'OBJECT' },
+  });
   await batch(ops, 'robot materials + bone parenting');
   log(`bone-parented ${robotParts.length} rigid parts (object.parent_set BONE)`);
 }
@@ -650,7 +810,10 @@ const CLAMPS = []; // [clamp name, hose point it holds (rest pose)], filled belo
     { type: 'ARMATURE_AUTO' },
     { objects: ['Robot_Hose', 'Robot_Rig'], active: 'Robot_Rig' },
   );
-  await batch([assign('rubber', ['Robot_Hose']), sel(['Robot_Hose']), { operator: 'object.shade_smooth' }], 'hose');
+  await batch(
+    [assign('rubber', ['Robot_Hose']), sel(['Robot_Hose']), { operator: 'object.shade_smooth' }],
+    'hose',
+  );
   log(`hose: ${hose.vertices} vertices, auto weights -> ${JSON.stringify(weights.vertex_groups)}`);
   // Weight fix-up (what a rigger does with weight painting after automatic weights): the
   // automatic weights blend over long stretches of the hose (at the root about half J2_Shoulder,
@@ -680,7 +843,13 @@ const CLAMPS = []; // [clamp name, hose point it holds (rest pose)], filled belo
     { bone: 'J2_Shoulder', from: arcAt(pts[3]) - 0.05, to: arcAt(pts[4]) + 0.05, blend: 0.12 },
     { bone: 'J3_Elbow', from: arcAt(forePts[0]) - 0.05, to: Infinity, blend: 0.12 },
   ];
-  const wd = await tool('get_mesh_data', { object: 'Robot_Hose', include: ['vertices', 'vertex_groups'], source: 'BASE', space: 'WORLD', limit: 5000 });
+  const wd = await tool('get_mesh_data', {
+    object: 'Robot_Hose',
+    include: ['vertices', 'vertex_groups'],
+    source: 'BASE',
+    space: 'WORLD',
+    limit: 5000,
+  });
   const groups = Object.keys(wd.vertex_groups);
   const fixed = Object.fromEntries(groups.map((g) => [g, []]));
   const pinned = Object.fromEntries(zones.map((z) => [z.bone, 0]));
@@ -696,10 +865,15 @@ const CLAMPS = []; // [clamp name, hose point it holds (rest pose)], filled belo
     for (const g of groups) fixed[g][i] = r6((1 - pin) * wd.vertex_groups[g][i] + (g === bone ? pin : 0));
   });
   await batch(
-    groups.map((group) => ({ operator: 'object.vertex_group_set_weights', params: { object: 'Robot_Hose', group, weights: fixed[group] } })),
+    groups.map((group) => ({
+      operator: 'object.vertex_group_set_weights',
+      params: { object: 'Robot_Hose', group, weights: fixed[group] },
+    })),
     'hose weights',
   );
-  log(`hose weights pinned (vertices fully pinned per bone ${JSON.stringify(pinned)}); automatic weights kept at the shoulder and the elbow`);
+  log(
+    `hose weights pinned (vertices fully pinned per bone ${JSON.stringify(pinned)}); automatic weights kept at the shoulder and the elbow`,
+  );
 
   // Clamps (bone-parented rings around the hose), each on a small bracket that reaches down to
   // the arm surface; the bracket length follows the taper of the arm segment it is bolted to.
@@ -710,10 +884,21 @@ const CLAMPS = []; // [clamp name, hose point it holds (rest pose)], filled belo
   const clampAt = (name, p, dir, bone, toArm, offset, halfWidth, g) => {
     clampOps.push({
       operator: 'mesh.primitive_torus_add',
-      params: { name, major_radius: RING, minor_radius: 0.011, major_segments: 24, minor_segments: 8, location: p, rotation: [0, Math.atan2(dir[0], dir[2]), 0] },
+      params: {
+        name,
+        major_radius: RING,
+        minor_radius: 0.011,
+        major_segments: 24,
+        minor_segments: 8,
+        location: p,
+        rotation: [0, Math.atan2(dir[0], dir[2]), 0],
+      },
     });
     clampOps.push(assign('steel', [name]));
-    clampOps.push(sel([name, 'Robot_Rig'], 'Robot_Rig'), { operator: 'object.parent_set', params: { type: 'BONE', bone } });
+    clampOps.push(sel([name, 'Robot_Rig'], 'Robot_Rig'), {
+      operator: 'object.parent_set',
+      params: { type: 'BONE', bone },
+    });
     const t0 = RING - 0.004; // inside the ring's tube ...
     const t1 = offset - halfWidth + 0.006; // ... to 6 mm inside the arm
     addOrientedBox(g, add(p, mul(toArm, (t0 + t1) / 2)), toArm, [0, 1, 0], [t1 - t0, 0.03, 0.022]);
@@ -721,9 +906,36 @@ const CLAMPS = []; // [clamp name, hose point it holds (rest pose)], filled belo
   const upperHalf = (s) => taperHalf(UPPER_ARM_TAPER, s);
   const foreHalf = (s) => taperHalf(FOREARM_TAPER, s);
   CLAMPS.push(['Robot_HoseClamp1', pts[3]], ['Robot_HoseClamp2', pts[4]], ['Robot_HoseClamp3', forePts[1]]);
-  clampAt('Robot_HoseClamp1', pts[3], dU, 'J2_Shoulder', mul(nB, -1), HOSE_BACK_OFFSET, upperHalf(0.35), upperBrackets);
-  clampAt('Robot_HoseClamp2', pts[4], dU, 'J2_Shoulder', mul(nB, -1), HOSE_BACK_OFFSET, upperHalf(0.7), upperBrackets);
-  clampAt('Robot_HoseClamp3', forePts[1], dF, 'J3_Elbow', mul(up, -1), HOSE_TOP_OFFSET, foreHalf(0.68), foreBrackets);
+  clampAt(
+    'Robot_HoseClamp1',
+    pts[3],
+    dU,
+    'J2_Shoulder',
+    mul(nB, -1),
+    HOSE_BACK_OFFSET,
+    upperHalf(0.35),
+    upperBrackets,
+  );
+  clampAt(
+    'Robot_HoseClamp2',
+    pts[4],
+    dU,
+    'J2_Shoulder',
+    mul(nB, -1),
+    HOSE_BACK_OFFSET,
+    upperHalf(0.7),
+    upperBrackets,
+  );
+  clampAt(
+    'Robot_HoseClamp3',
+    forePts[1],
+    dF,
+    'J3_Elbow',
+    mul(up, -1),
+    HOSE_TOP_OFFSET,
+    foreHalf(0.68),
+    foreBrackets,
+  );
   clampOps.push(
     meshOp('Robot_ClampBrackets_Upper', upperBrackets),
     meshOp('Robot_ClampBracket_Fore', foreBrackets),
@@ -745,13 +957,25 @@ const CLAMPS = []; // [clamp name, hose point it holds (rest pose)], filled belo
 // ---------------------------------------------------------------------------------------------
 await batch(
   [
-    { operator: 'object.empty_add', params: { name: 'IK_Target', type: 'SPHERE', radius: 0.08, location: WRIST } },
-    { operator: 'object.empty_add', params: { name: 'Wrist_Aim', type: 'PLAIN_AXES', radius: 0.05, location: sub(WRIST, [0, 0, 1]) } },
+    {
+      operator: 'object.empty_add',
+      params: { name: 'IK_Target', type: 'SPHERE', radius: 0.08, location: WRIST },
+    },
+    {
+      operator: 'object.empty_add',
+      params: { name: 'Wrist_Aim', type: 'PLAIN_AXES', radius: 0.05, location: sub(WRIST, [0, 0, 1]) },
+    },
     { operator: 'object.parent_to', params: { objects: ['Wrist_Aim'], parent: 'IK_Target' } },
   ],
   'ik helpers',
 );
-const ik = await op('pose.ik_add', { object: 'Robot_Rig', bone: 'J3_Elbow', target: 'IK_Target', chain_count: 2, iterations: 500 });
+const ik = await op('pose.ik_add', {
+  object: 'Robot_Rig',
+  bone: 'J3_Elbow',
+  target: 'IK_Target',
+  chain_count: 2,
+  iterations: 500,
+});
 await op('pose.constraint_add', {
   object: 'Robot_Rig',
   bone: 'J4_Wrist',
@@ -784,13 +1008,25 @@ log(`IK on J3_Elbow, chain ${ik.chain.join(' -> ')}; Damped Track keeps the wris
   g = newGeo();
   addBox(g, [0.335, 0, 0.335], [0.06, 0.06, 0.67]);
   addBox(g, [0.17, 0, 0.22], [0.33, 0.04, 0.04]);
-  ops.push(meshOp('Conveyor_Legs', g, { location: [CONVEYOR_X, y0 + 0.2, 0] }), assign('frame', ['Conveyor_Legs']));
+  ops.push(
+    meshOp('Conveyor_Legs', g, { location: [CONVEYOR_X, y0 + 0.2, 0] }),
+    assign('frame', ['Conveyor_Legs']),
+  );
   // one roller, axis along X; ARRAY along the object's local Y (= world Y)
   ops.push({
     operator: 'mesh.primitive_cylinder_add',
-    params: { name: 'Conveyor_Rollers', radius: 0.035, depth: 0.62, vertices: 20, location: [CONVEYOR_X, y0 + 0.14, ROLLER_TOP - 0.035], rotation: [0, Math.PI / 2, 0] },
+    params: {
+      name: 'Conveyor_Rollers',
+      radius: 0.035,
+      depth: 0.62,
+      vertices: 20,
+      location: [CONVEYOR_X, y0 + 0.14, ROLLER_TOP - 0.035],
+      rotation: [0, Math.PI / 2, 0],
+    },
   });
-  ops.push(assign('roller', ['Conveyor_Rollers']), sel(['Conveyor_Rollers']), { operator: 'object.shade_smooth' });
+  ops.push(assign('roller', ['Conveyor_Rollers']), sel(['Conveyor_Rollers']), {
+    operator: 'object.shade_smooth',
+  });
   // photo-eye sensor post at the pick station
   g = newGeo();
   addBox(g, [CONVEYOR_X - 0.42, 0.25, 0.55], [0.04, 0.04, 0.5]);
@@ -802,10 +1038,16 @@ log(`IK on J3_Elbow, chain ${ik.chain.join(' -> ')}; Damped Track keeps the wris
   const [hx, hz0, hz1, wall] = [0.42, 0.6, 1.66, 0.03];
   const hy = (INFEED_Y0 + INFEED_Y1) / 2;
   const depth = INFEED_Y1 - INFEED_Y0;
-  for (const sx of [-1, 1]) addBox(g, [CONVEYOR_X + sx * (hx - wall / 2), hy, (hz0 + hz1) / 2], [wall, depth, hz1 - hz0]);
+  for (const sx of [-1, 1])
+    addBox(g, [CONVEYOR_X + sx * (hx - wall / 2), hy, (hz0 + hz1) / 2], [wall, depth, hz1 - hz0]);
   addBox(g, [CONVEYOR_X, hy, hz1 - 0.02], [2 * hx, depth, 0.04]); // roof
   addBox(g, [CONVEYOR_X, INFEED_Y1 - wall / 2, (hz0 + hz1) / 2], [2 * hx, wall, hz1 - hz0]); // back
-  for (const sx of [-1, 1]) addBox(g, [CONVEYOR_X + sx * (MOUTH_HALF + hx) / 2, INFEED_Y0 + 0.025, (hz0 + hz1) / 2], [hx - MOUTH_HALF, 0.05, hz1 - hz0]);
+  for (const sx of [-1, 1])
+    addBox(
+      g,
+      [CONVEYOR_X + (sx * (MOUTH_HALF + hx)) / 2, INFEED_Y0 + 0.025, (hz0 + hz1) / 2],
+      [hx - MOUTH_HALF, 0.05, hz1 - hz0],
+    );
   addBox(g, [CONVEYOR_X, INFEED_Y0 + 0.025, (MOUTH_TOP + hz1) / 2], [2 * hx, 0.05, hz1 - MOUTH_TOP]); // header
   ops.push(meshOp('Infeed_Hood', g), assign('frame', ['Infeed_Hood']));
   g = newGeo();
@@ -817,9 +1059,31 @@ log(`IK on J3_Elbow, chain ${ik.chain.join(' -> ')}; Damped Track keeps the wris
   ops.push(meshOp('Infeed_Door', g), assign('fence', ['Infeed_Door']));
   await batch(ops, 'conveyor');
   const rollers = Math.floor((y1 - 0.15 - (y0 + 0.14)) / 0.12) + 1;
-  await tool('add_modifier', { object: 'Conveyor_Legs', type: 'MIRROR', params: { use_axis: [true, false, false] } });
-  await tool('add_modifier', { object: 'Conveyor_Legs', type: 'ARRAY', params: { count: 4, use_relative_offset: false, use_constant_offset: true, constant_offset_displace: [0, (len - 0.4) / 3, 0] } });
-  await tool('add_modifier', { object: 'Conveyor_Rollers', type: 'ARRAY', params: { count: rollers, use_relative_offset: false, use_constant_offset: true, constant_offset_displace: [0, 0.12, 0] } });
+  await tool('add_modifier', {
+    object: 'Conveyor_Legs',
+    type: 'MIRROR',
+    params: { use_axis: [true, false, false] },
+  });
+  await tool('add_modifier', {
+    object: 'Conveyor_Legs',
+    type: 'ARRAY',
+    params: {
+      count: 4,
+      use_relative_offset: false,
+      use_constant_offset: true,
+      constant_offset_displace: [0, (len - 0.4) / 3, 0],
+    },
+  });
+  await tool('add_modifier', {
+    object: 'Conveyor_Rollers',
+    type: 'ARRAY',
+    params: {
+      count: rollers,
+      use_relative_offset: false,
+      use_constant_offset: true,
+      constant_offset_displace: [0, 0.12, 0],
+    },
+  });
   log(`conveyor: ${rollers} rollers (ARRAY), mirrored + arrayed legs, infeed hood with roll-up door`);
 }
 // Pallets: one deck board, one block and one base board, multiplied with ARRAY modifiers
@@ -838,7 +1102,12 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   ops.push(meshOp(names[2], g, { location: [cx, cy, 0], rotation: [0, 0, rotZ] }));
   const arr = (object, name, count, d) => ({
     operator: 'object.modifier_add',
-    params: { object, type: 'ARRAY', name, params: { count, use_relative_offset: false, use_constant_offset: true, constant_offset_displace: d } },
+    params: {
+      object,
+      type: 'ARRAY',
+      name,
+      params: { count, use_relative_offset: false, use_constant_offset: true, constant_offset_displace: d },
+    },
   });
   ops.push(arr(names[0], 'Boards', 5, [0, 0.22, 0]));
   ops.push(arr(names[1], 'Blocks X', 3, [0.54, 0, 0]));
@@ -867,14 +1136,12 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   addBox(g, [0, 0, h / 2 - 0.0175], [w, d, 0.035]);
   addBox(g, [0, 0, -h / 2 + 0.0175], [w, d, 0.035]);
   addBox(g, [0, 0, 0], [w - 0.008, d - 0.008, 0.03]);
-  for (const sx of [-1, 1]) for (const sy of [-1, 1]) addBox(g, [sx * (w / 2 - 0.0225), sy * (d / 2 - 0.0225), 0], [0.035, 0.035, h - 0.02]);
+  for (const sx of [-1, 1])
+    for (const sy of [-1, 1])
+      addBox(g, [sx * (w / 2 - 0.0225), sy * (d / 2 - 0.0225), 0], [0.035, 0.035, h - 0.02]);
   const label = addBox(g, [0, -d / 2 + 0.0035, 0.07], [0.16, 0.01, 0.06]);
   await batch(
-    [
-      meshOp('Crate', g, { location: PICK }),
-      assign('crate', ['Crate'], 0),
-      assign('label', ['Crate'], 1),
-    ],
+    [meshOp('Crate', g, { location: PICK }), assign('crate', ['Crate'], 0), assign('label', ['Crate'], 1)],
     'crate',
   );
   await tool('edit_mesh', {
@@ -894,16 +1161,42 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
     await tool('duplicate_object', { object: 'Crate', linked: true, name });
     await tool('transform_object', { object: name, location: loc });
   }
-  log(`crates: active + ${copies.length} linked duplicates (${QUEUED.length} queued on the conveyor, 3 on the pallet)`);
+  log(
+    `crates: active + ${copies.length} linked duplicates (${QUEUED.length} queued on the conveyor, 3 on the pallet)`,
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
 // 7. Safety fence (generator), sign, controller cabinet with signal tower, light curtain
 // ---------------------------------------------------------------------------------------------
 {
-  const fence = { height: 2.0, post_spacing: 1.3, post_width: 0.07, style: 'RAIL', rails: 3, location: [0, 0, 0], materials: false };
-  await op('object.generate_fence', { ...fence, name: 'Fence_West', points: [[-2.2, 2.75], [-3.35, 2.75], [-3.35, -2.6]] });
-  await op('object.generate_fence', { ...fence, name: 'Fence_East', points: [[-0.9, 2.75], [2.75, 2.75], [2.75, -2.6]] });
+  const fence = {
+    height: 2.0,
+    post_spacing: 1.3,
+    post_width: 0.07,
+    style: 'RAIL',
+    rails: 3,
+    location: [0, 0, 0],
+    materials: false,
+  };
+  await op('object.generate_fence', {
+    ...fence,
+    name: 'Fence_West',
+    points: [
+      [-2.2, 2.75],
+      [-3.35, 2.75],
+      [-3.35, -2.6],
+    ],
+  });
+  await op('object.generate_fence', {
+    ...fence,
+    name: 'Fence_East',
+    points: [
+      [-0.9, 2.75],
+      [2.75, 2.75],
+      [2.75, -2.6],
+    ],
+  });
   // Welded-mesh infill panels between the posts (thin dark boxes whose alpha is the wire grid
   // below). The BRICK mortar lines (the wires) are 8 mm wide and centred on multiples of 5 cm in
   // object space, so the panel edges are placed where they cannot leave loose wire ends: the top
@@ -946,7 +1239,17 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
       scale: 1,
       color_a: [0, 0, 0],
       color_b: [0, 0, 0],
-      params: { plane: 'WALL', brick_width: 0.05, row_height: 0.05, mortar_size: 0.004, mortar_smooth: 0, offset: 0, mortar_r: 1, mortar_g: 1, mortar_b: 1 },
+      params: {
+        plane: 'WALL',
+        brick_width: 0.05,
+        row_height: 0.05,
+        mortar_size: 0.004,
+        mortar_smooth: 0,
+        offset: 0,
+        mortar_r: 1,
+        mortar_g: 1,
+        mortar_b: 1,
+      },
     },
   });
   log('safety fence: generate_fence (2 runs) + welded-mesh panels');
@@ -956,8 +1259,30 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   let g = newGeo();
   addBox(g, [1.0, 2.715, 1.35], [1.25, 0.02, 0.42]);
   ops.push(meshOp('Sign_Plate', g), assign('sign', ['Sign_Plate']));
-  ops.push({ operator: 'object.text_add', params: { name: 'Sign_Title', body: 'CELL 04 - PALLETIZING', size: 0.12, align_x: 'CENTER', extrude: 0.002, location: [1.0, 2.70, 1.40], rotation: [Math.PI / 2, 0, 0] } });
-  ops.push({ operator: 'object.text_add', params: { name: 'Sign_Warning', body: 'AUTOMATIC MACHINE - KEEP OUT', size: 0.065, align_x: 'CENTER', extrude: 0.002, location: [1.0, 2.70, 1.235], rotation: [Math.PI / 2, 0, 0] } });
+  ops.push({
+    operator: 'object.text_add',
+    params: {
+      name: 'Sign_Title',
+      body: 'CELL 04 - PALLETIZING',
+      size: 0.12,
+      align_x: 'CENTER',
+      extrude: 0.002,
+      location: [1.0, 2.7, 1.4],
+      rotation: [Math.PI / 2, 0, 0],
+    },
+  });
+  ops.push({
+    operator: 'object.text_add',
+    params: {
+      name: 'Sign_Warning',
+      body: 'AUTOMATIC MACHINE - KEEP OUT',
+      size: 0.065,
+      align_x: 'CENTER',
+      extrude: 0.002,
+      location: [1.0, 2.7, 1.235],
+      rotation: [Math.PI / 2, 0, 0],
+    },
+  });
   ops.push(assign('text', ['Sign_Title', 'Sign_Warning']));
   // controller cabinet outside the fence with HMI screen and a signal tower
   const CAB = [2.05, 3.4];
@@ -1009,12 +1334,20 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   g = newGeo();
   {
     const [ya, yb, xc] = [0.47, 2.72, 0.22];
-    const prof = [[0.13, 0], [-0.13, 0], [-0.05, 0.045], [0.05, 0.045]];
+    const prof = [
+      [0.13, 0],
+      [-0.13, 0],
+      [-0.05, 0.045],
+      [0.05, 0.045],
+    ];
     for (const y of [ya, yb]) for (const [dx, z] of prof) g.v.push([r6(xc + dx), y, z]);
     g.f.push([0, 1, 2, 3].reverse(), [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]);
   }
   ops.push(meshOp('Cable_Protector', g), assign('stripes', ['Cable_Protector']));
-  ops.push(sel(['Signal_Pole', 'Signal_Green', 'Signal_Amber', 'Signal_Red', 'EStop_Button']), { operator: 'object.shade_auto_smooth', params: { angle: 0.6 } });
+  ops.push(sel(['Signal_Pole', 'Signal_Green', 'Signal_Amber', 'Signal_Red', 'EStop_Button']), {
+    operator: 'object.shade_auto_smooth',
+    params: { angle: 0.6 },
+  });
   await batch(ops, 'props');
   log('sign, controller cabinet, signal tower, light curtain, e-stop, cable protector');
 }
@@ -1034,10 +1367,12 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   g = newGeo();
   // mullioned window strips: 3 x 2 panes per bay
   for (let x = -7.2; x <= 8; x += 2.05)
-    for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) addBox(g, [x - 0.57 + i * 0.57, 7.08, 2.48 + j * 0.56], [0.52, 0.04, 0.5]);
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 2; j++) addBox(g, [x - 0.57 + i * 0.57, 7.08, 2.48 + j * 0.56], [0.52, 0.04, 0.5]);
   for (const wx of [-8.08, 8.98])
     for (let y = -4.5; y <= 6.5; y += 2.05)
-      for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) addBox(g, [wx, y - 0.57 + i * 0.57, 2.48 + j * 0.56], [0.04, 0.52, 0.5]);
+      for (let i = 0; i < 3; i++)
+        for (let j = 0; j < 2; j++) addBox(g, [wx, y - 0.57 + i * 0.57, 2.48 + j * 0.56], [0.04, 0.52, 0.5]);
   ops.push(meshOp('Hall_Windows', g), assign('window', ['Hall_Windows']));
   g = newGeo();
   for (const x of [-6, -2, 2, 6]) addBox(g, [x, 6.9, 3.5], [0.35, 0.35, 7]);
@@ -1050,7 +1385,12 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
     params: {
       material,
       channel: 'normal',
-      procedural: { type: 'WAVE', mapping: 'OBJECT', scale: 2.2, params: { wave_type: 'BANDS', direction, wave_profile: 'SIN', bump_distance: 0.02 } },
+      procedural: {
+        type: 'WAVE',
+        mapping: 'OBJECT',
+        scale: 2.2,
+        params: { wave_type: 'BANDS', direction, wave_profile: 'SIN', bump_distance: 0.02 },
+      },
     },
   });
   await batch([corrugation(MAT.wall.name, 'X'), corrugation(MAT.wallSide.name, 'Y')], 'wall corrugation');
@@ -1066,7 +1406,9 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
     expression: '14 * (fract(frame / 12) < 0.5)',
   });
   const drv = d.drivers?.[0] ?? d;
-  log(`driver on '${MAT.amber.name}'.emission_strength = ${drv.expression ?? JSON.stringify(d).slice(0, 160)}`);
+  log(
+    `driver on '${MAT.amber.name}'.emission_strength = ${drv.expression ?? JSON.stringify(d).slice(0, 160)}`,
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1078,23 +1420,67 @@ const tgt = frames.map(targetAt);
 const yaw = frames.map((f) => cylAt(f).az);
 const keyMany = (target, pathName, index, fr, values, interpolation = 'LINEAR', extra = {}) => ({
   operator: 'anim.keyframes_insert_many',
-  params: { target, path: pathName, index, frames: fr, values: values.map((v) => r6(v)), interpolation, ...extra },
+  params: {
+    target,
+    path: pathName,
+    index,
+    frames: fr,
+    values: values.map((v) => r6(v)),
+    interpolation,
+    ...extra,
+  },
 });
 await batch(
   [
-    keyMany('IK_Target', 'location', 0, frames, tgt.map((p) => p[0])),
-    keyMany('IK_Target', 'location', 1, frames, tgt.map((p) => p[1])),
-    keyMany('IK_Target', 'location', 2, frames, tgt.map((p) => p[2])),
+    keyMany(
+      'IK_Target',
+      'location',
+      0,
+      frames,
+      tgt.map((p) => p[0]),
+    ),
+    keyMany(
+      'IK_Target',
+      'location',
+      1,
+      frames,
+      tgt.map((p) => p[1]),
+    ),
+    keyMany(
+      'IK_Target',
+      'location',
+      2,
+      frames,
+      tgt.map((p) => p[2]),
+    ),
     // J1 yaw keyed from the target azimuth (IK cannot drive it without IK locks, see section 5)
     keyMany('Robot_Rig', 'pose.bones["J1_Base"].rotation_euler', 1, frames, yaw),
     // J4 rolls against the base yaw so the gripper (and the crate) keep their heading
-    keyMany('Robot_Rig', 'pose.bones["J4_Wrist"].rotation_euler', 1, frames, yaw.map((a) => a - Math.PI)),
+    keyMany(
+      'Robot_Rig',
+      'pose.bones["J4_Wrist"].rotation_euler',
+      1,
+      frames,
+      yaw.map((a) => a - Math.PI),
+    ),
   ],
   'arm keys',
 );
 // gripper fingers: shape key keyed over time
-for (const [f, v] of [[1, 0], [F_GRIP_START, 0], [F_GRIPPED, 1], [F_RELEASE, 1], [F_OPEN, 0]])
-  await tool('insert_keyframe', { object: 'Robot_Gripper', property: 'shape_keys["Grip"].value', frame: f, value: v, interpolation: 'BEZIER' });
+for (const [f, v] of [
+  [1, 0],
+  [F_GRIP_START, 0],
+  [F_GRIPPED, 1],
+  [F_RELEASE, 1],
+  [F_OPEN, 0],
+])
+  await tool('insert_keyframe', {
+    object: 'Robot_Gripper',
+    property: 'shape_keys["Grip"].value',
+    frame: f,
+    value: v,
+    interpolation: 'BEZIER',
+  });
 // The active crate waits at the pick station (its own location is keyed at frame 1 so the
 // place keys added in step 9 do not leak backwards). While the robot carries it away the
 // conveyor indexes: every queued crate moves one pitch towards the pick station, and the infeed
@@ -1104,30 +1490,69 @@ for (const [f, v] of [[1, 0], [F_GRIP_START, 0], [F_GRIPPED, 1], [F_RELEASE, 1],
   await batch(
     [
       ...[0, 1, 2].map((i) => keyMany('Crate', 'location', i, [1], [PICK[i]], 'CONSTANT')),
-      ...QUEUED.map((name, i) => keyMany(name, 'location', 1, fr, fr.map((f) => PICK[1] + (i + 1) * QUEUE_PITCH - beltAt(f)))),
-      keyMany('Infeed_Door', 'location', 2, DOOR_KEYS.map(([f]) => f), DOOR_KEYS.map(([, z]) => z), 'BEZIER'),
+      ...QUEUED.map((name, i) =>
+        keyMany(
+          name,
+          'location',
+          1,
+          fr,
+          fr.map((f) => PICK[1] + (i + 1) * QUEUE_PITCH - beltAt(f)),
+        ),
+      ),
+      keyMany(
+        'Infeed_Door',
+        'location',
+        2,
+        DOOR_KEYS.map(([f]) => f),
+        DOOR_KEYS.map(([, z]) => z),
+        'BEZIER',
+      ),
     ],
     'crate + conveyor keys',
   );
 }
-log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape key, ${QUEUED.length} queued crates, infeed door`);
+log(
+  `keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape key, ${QUEUED.length} queued crates, infeed door`,
+);
 
 // ---------------------------------------------------------------------------------------------
 // 9. The crate follows the gripper while carried: Child Of (J4_Wrist bone) with keyed influence
 // ---------------------------------------------------------------------------------------------
 {
   await op('scene.frame_set', { frame: F_GRIPPED });
-  const c = await op('object.constraint_add', { object: 'Crate', type: 'CHILD_OF', name: 'Carried', target: 'Robot_Rig', subtarget: 'J4_Wrist' });
+  const c = await op('object.constraint_add', {
+    object: 'Crate',
+    type: 'CHILD_OF',
+    name: 'Carried',
+    target: 'Robot_Rig',
+    subtarget: 'J4_Wrist',
+  });
   if (c.errors?.length) throw new Error(`Child Of errors: ${JSON.stringify(c.errors)}`);
   const atGrip = await op('constraint.describe', { object: 'Crate', frame: F_GRIPPED });
-  log(`Child Of inverse set at frame ${F_GRIPPED}: crate at ${fmt(atGrip.world_location)} (pick ${fmt(PICK)})`);
-  await tool('insert_keyframe', { object: 'Crate', property: 'constraints["Carried"].influence', frame: 1, value: 0, interpolation: 'CONSTANT' });
-  await tool('insert_keyframe', { object: 'Crate', property: 'constraints["Carried"].influence', frame: F_GRIPPED, value: 1, interpolation: 'CONSTANT' });
+  log(
+    `Child Of inverse set at frame ${F_GRIPPED}: crate at ${fmt(atGrip.world_location)} (pick ${fmt(PICK)})`,
+  );
+  await tool('insert_keyframe', {
+    object: 'Crate',
+    property: 'constraints["Carried"].influence',
+    frame: 1,
+    value: 0,
+    interpolation: 'CONSTANT',
+  });
+  await tool('insert_keyframe', {
+    object: 'Crate',
+    property: 'constraints["Carried"].influence',
+    frame: F_GRIPPED,
+    value: 1,
+    interpolation: 'CONSTANT',
+  });
   // where the gripper sets the crate down -> becomes the crate's own (keyed) transform
   const atPlace = await op('constraint.describe', { object: 'Crate', frame: F_RELEASE });
   const L = atPlace.world_location;
   const R = atPlace.world_rotation_euler;
-  log(`crate at release frame ${F_RELEASE}: ${fmt(L)} rot ${fmt(R)} (slot ${fmt(PLACE)}, error ${(dist(L, PLACE) * 1000).toFixed(1)} mm)`);
+  log(
+    `crate at release frame ${F_RELEASE}: ${fmt(L)} rot ${fmt(R)} (slot ${fmt(PLACE)}, error ${(dist(L, PLACE) * 1000).toFixed(1)} mm)`,
+  );
   await batch(
     [
       keyMany('Crate', 'location', 0, [F_RELEASE], [L[0]], 'CONSTANT'),
@@ -1137,7 +1562,13 @@ log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape ke
     ],
     'crate place keys',
   );
-  await tool('insert_keyframe', { object: 'Crate', property: 'constraints["Carried"].influence', frame: F_RELEASE, value: 0, interpolation: 'CONSTANT' });
+  await tool('insert_keyframe', {
+    object: 'Crate',
+    property: 'constraints["Carried"].influence',
+    frame: F_RELEASE,
+    value: 0,
+    interpolation: 'CONSTANT',
+  });
   await op('scene.frame_set', { frame: 1 });
 }
 
@@ -1145,7 +1576,13 @@ log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape ke
 // 10. Camera (Damped Track on the gripper + depth of field), lights, world
 // ---------------------------------------------------------------------------------------------
 {
-  await op('object.camera_add', { name: 'Camera', lens: CAMERA_LENS, clip_start: 0.05, clip_end: 60, location: CAMERA_LOC });
+  await op('object.camera_add', {
+    name: 'Camera',
+    lens: CAMERA_LENS,
+    clip_start: 0.05,
+    clip_end: 60,
+    location: CAMERA_LOC,
+  });
   await op('object.look_at', { objects: ['Camera'], point: CAMERA_AIM });
   await tool('set_active_camera', { camera: 'Camera' });
   // The camera pans half-way towards the gripper (influence 0.5 keeps the cell framed)
@@ -1159,18 +1596,63 @@ log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape ke
   });
   if (ct.errors?.length) throw new Error(`camera constraint: ${JSON.stringify(ct.errors)}`);
   // Depth of field (path tracer): the gripper stays in focus at every frame, the hall softens
-  const cam = await op('camera.properties_set', { object: 'Camera', dof_use: true, dof_focus_object: 'Robot_Gripper', dof_aperture_fstop: 2.8 });
-  log(`camera: lens ${cam.cameras[0].lens} mm, DOF f/${cam.cameras[0].dof_aperture_fstop} on ${cam.cameras[0].dof_focus_object}`);
+  const cam = await op('camera.properties_set', {
+    object: 'Camera',
+    dof_use: true,
+    dof_focus_object: 'Robot_Gripper',
+    dof_aperture_fstop: 2.8,
+  });
+  log(
+    `camera: lens ${cam.cameras[0].lens} mm, DOF f/${cam.cameras[0].dof_aperture_fstop} on ${cam.cameras[0].dof_focus_object}`,
+  );
 
   // Lights: two long LED ceiling strips over the cell (RECTANGLE area lights), a warm spot
   // from high front-left that models the robot and throws its shadow across the floor, and a
   // cool rectangular rim behind the robot that separates the arm from the dark hall. The world
   // is a dim blue-grey ambient with mist; the hall windows glow.
   const LIGHTS = [
-    { name: 'Ceiling_Strip_Front', type: 'AREA', shape: 'RECTANGLE', size: 4.2, size_y: 0.45, energy: 1000, color: [0.93, 0.96, 1.0], location: [-0.3, -1.1, 4.5] },
-    { name: 'Ceiling_Strip_Back', type: 'AREA', shape: 'RECTANGLE', size: 4.2, size_y: 0.45, energy: 800, color: [0.93, 0.96, 1.0], location: [-0.3, 1.3, 4.5] },
-    { name: 'Key_Spot', type: 'SPOT', energy: 5000, spot_size: 0.9, spot_blend: 0.6, shadow_soft_size: 0.35, color: [1.0, 0.8, 0.58], location: [-3.6, -3.6, 5.2], aim: [0.1, -0.2, 0.9] },
-    { name: 'Rim_Cool', type: 'AREA', shape: 'RECTANGLE', size: 3.0, size_y: 1.0, energy: 2000, color: [0.55, 0.72, 1.0], location: [1.2, 4.2, 3.3], aim: [0.0, 0.0, 1.2] },
+    {
+      name: 'Ceiling_Strip_Front',
+      type: 'AREA',
+      shape: 'RECTANGLE',
+      size: 4.2,
+      size_y: 0.45,
+      energy: 1000,
+      color: [0.93, 0.96, 1.0],
+      location: [-0.3, -1.1, 4.5],
+    },
+    {
+      name: 'Ceiling_Strip_Back',
+      type: 'AREA',
+      shape: 'RECTANGLE',
+      size: 4.2,
+      size_y: 0.45,
+      energy: 800,
+      color: [0.93, 0.96, 1.0],
+      location: [-0.3, 1.3, 4.5],
+    },
+    {
+      name: 'Key_Spot',
+      type: 'SPOT',
+      energy: 5000,
+      spot_size: 0.9,
+      spot_blend: 0.6,
+      shadow_soft_size: 0.35,
+      color: [1.0, 0.8, 0.58],
+      location: [-3.6, -3.6, 5.2],
+      aim: [0.1, -0.2, 0.9],
+    },
+    {
+      name: 'Rim_Cool',
+      type: 'AREA',
+      shape: 'RECTANGLE',
+      size: 3.0,
+      size_y: 1.0,
+      energy: 2000,
+      color: [0.55, 0.72, 1.0],
+      location: [1.2, 4.2, 3.3],
+      aim: [0.0, 0.0, 1.2],
+    },
   ];
   await batch(
     LIGHTS.flatMap(({ aim, ...l }) => [
@@ -1179,8 +1661,16 @@ log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape ke
     ]),
     'lights',
   );
-  await tool('set_scene_settings', { environment: 'NONE', world_color: [0.006, 0.007, 0.01], world_strength: 1, mist_distance: 30, mist_color: [0.02, 0.024, 0.032] });
-  log(`lights: ${LIGHTS.map((l) => `${l.name} ${l.shape ?? l.type}${l.size ? ` ${l.size}x${l.size_y} m` : ''} ${l.energy} W`).join(', ')}`);
+  await tool('set_scene_settings', {
+    environment: 'NONE',
+    world_color: [0.006, 0.007, 0.01],
+    world_strength: 1,
+    mist_distance: 30,
+    mist_color: [0.02, 0.024, 0.032],
+  });
+  log(
+    `lights: ${LIGHTS.map((l) => `${l.name} ${l.shape ?? l.type}${l.size ? ` ${l.size}x${l.size_y} m` : ''} ${l.energy} W`).join(', ')}`,
+  );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1196,7 +1686,10 @@ const verify = {};
   const mm = (d) => `${(d * 1000).toFixed(1)} mm`;
   const scene = await tool('get_scene', { max_objects: 5 });
   log(`scene: ${JSON.stringify(scene.counts ?? {}).slice(0, 300)}`);
-  check(!scene.problems?.length, `get_scene problems: ${JSON.stringify(scene.problems ?? []).slice(0, 1500)}`);
+  check(
+    !scene.problems?.length,
+    `get_scene problems: ${JSON.stringify(scene.problems ?? []).slice(0, 1500)}`,
+  );
 
   // (a) IK: the wrist reaches the keyed target; (b) the crate rests at the pick station, rides
   // with the gripper while gripped and stays on its pallet slot after the release; (c) fingers
@@ -1221,7 +1714,8 @@ const verify = {};
     const fingers = grip.data.shape_keys.find((k) => k.name === 'Grip').value;
     focus.push(camera.data.dof_focus_distance);
     check(influence === (carried ? 1 : 0), `Child Of influence ${influence} at frame ${f}`);
-    if (f > F_GRIPPED && f < F_RELEASE) check(fingers > 0.999, `fingers open (${fingers}) while carrying at ${f}`);
+    if (f > F_GRIPPED && f < F_RELEASE)
+      check(fingers > 0.999, `fingers open (${fingers}) while carrying at ${f}`);
     if (f <= F_GRIP_START || f >= F_OPEN) check(fingers < 0.001, `fingers closed (${fingers}) at ${f}`);
     log(
       `  f${String(f).padStart(2)} wrist IK err ${mm(ikErr)} | crate ${fmt(crate.world_location)} (${carried ? 'carried' : f < F_GRIPPED ? 'at pick' : 'on pallet'}, err ${mm(carryErr)})` +
@@ -1230,31 +1724,64 @@ const verify = {};
   }
   check(worstIk < 0.005, `IK error ${mm(worstIk)}`);
   check(worstCarry < 0.005, `crate offset error ${mm(worstCarry)}`);
-  check(Math.max(...focus) - Math.min(...focus) > 0.3, `camera focus distance does not follow the gripper: ${focus.join(', ')}`);
-  log(`worst IK error ${mm(worstIk)}, worst crate error ${mm(worstCarry)}, focus ${Math.min(...focus).toFixed(2)}..${Math.max(...focus).toFixed(2)} m`);
+  check(
+    Math.max(...focus) - Math.min(...focus) > 0.3,
+    `camera focus distance does not follow the gripper: ${focus.join(', ')}`,
+  );
+  log(
+    `worst IK error ${mm(worstIk)}, worst crate error ${mm(worstCarry)}, focus ${Math.min(...focus).toFixed(2)}..${Math.max(...focus).toFixed(2)} m`,
+  );
 
   // (e) the skinned hose follows the arm: its root stays on the turret fitting (the rest root
   // turned by the J1 yaw: catches sliding up, down or around as well as away from the axis), the
   // stretches in the three clamps stay centred in their rings, and the wrist end keeps its
   // distance to the wrist joint
-  const base = await tool('get_mesh_data', { object: 'Robot_Hose', include: ['vertices'], source: 'BASE', space: 'WORLD', limit: 5000 });
-  const near = (p, r) => base.vertices.map((v, i) => [v, i]).filter(([v]) => dist(v, p) < r).map(([, i]) => i);
-  const centroid = (verts, idx) => mul(idx.reduce((acc, i) => add(acc, verts[i]), [0, 0, 0]), 1 / idx.length);
+  const base = await tool('get_mesh_data', {
+    object: 'Robot_Hose',
+    include: ['vertices'],
+    source: 'BASE',
+    space: 'WORLD',
+    limit: 5000,
+  });
+  const near = (p, r) =>
+    base.vertices
+      .map((v, i) => [v, i])
+      .filter(([v]) => dist(v, p) < r)
+      .map(([, i]) => i);
+  const centroid = (verts, idx) =>
+    mul(
+      idx.reduce((acc, i) => add(acc, verts[i]), [0, 0, 0]),
+      1 / idx.length,
+    );
   const endIdx = near(HOSE_END, 0.05);
   const startIdx = near(HOSE_START, 0.05);
   const clampIdx = CLAMPS.map(([, p]) => near(p, 0.035));
-  check(endIdx.length > 3 && startIdx.length > 3 && clampIdx.every((x) => x.length > 3), 'hose end / clamp rings not found');
+  check(
+    endIdx.length > 3 && startIdx.length > 3 && clampIdx.every((x) => x.length > 3),
+    'hose end / clamp rings not found',
+  );
   const root0 = centroid(base.vertices, startIdx);
   const endGap = [];
   let rootErr = 0;
   let clampErr = 0;
   for (const f of [1, 16, 28, 45, 56, 72, 77, 96]) {
-    const ev = await tool('get_mesh_data', { object: 'Robot_Hose', include: ['vertices'], source: 'EVALUATED', space: 'WORLD', frame: f, limit: 5000 });
+    const ev = await tool('get_mesh_data', {
+      object: 'Robot_Hose',
+      include: ['vertices'],
+      source: 'EVALUATED',
+      space: 'WORLD',
+      frame: f,
+      limit: 5000,
+    });
     const d = await op('armature.describe', { object: 'Robot_Rig', frame: f });
     const bone = (n) => d.bones.find((b) => b.name === n);
     const shoulder = bone('J2_Shoulder').posed_head_world;
     const yawF = Math.atan2(shoulder[1], shoulder[0]);
-    const fitting = [root0[0] * Math.cos(yawF) - root0[1] * Math.sin(yawF), root0[0] * Math.sin(yawF) + root0[1] * Math.cos(yawF), root0[2]];
+    const fitting = [
+      root0[0] * Math.cos(yawF) - root0[1] * Math.sin(yawF),
+      root0[0] * Math.sin(yawF) + root0[1] * Math.cos(yawF),
+      root0[2],
+    ];
     rootErr = Math.max(rootErr, dist(centroid(ev.vertices, startIdx), fitting));
     for (const [k, [name]] of CLAMPS.entries()) {
       const ring = (await tool('get_object', { object: name, frame: f })).world_location;
@@ -1263,7 +1790,9 @@ const verify = {};
     endGap.push(dist(centroid(ev.vertices, endIdx), bone('J4_Wrist').posed_head_world));
   }
   const spread = (a) => Math.max(...a) - Math.min(...a);
-  log(`hose (${base.vertices.length} vertices): root off its fitting <= ${mm(rootErr)}, hose off clamp centres <= ${mm(clampErr)}, wrist end - wrist joint ${endGap.map((x) => x.toFixed(4)).join(' / ')} m`);
+  log(
+    `hose (${base.vertices.length} vertices): root off its fitting <= ${mm(rootErr)}, hose off clamp centres <= ${mm(clampErr)}, wrist end - wrist joint ${endGap.map((x) => x.toFixed(4)).join(' / ')} m`,
+  );
   check(rootErr < 0.002, `hose root slides off its turret fitting by ${mm(rootErr)}`);
   check(clampErr < 0.002, `hose slides in its clamps by ${mm(clampErr)}`);
   check(spread(endGap) < 0.003, `hose end drifts from the wrist by ${mm(spread(endGap))}`);
@@ -1272,8 +1801,21 @@ const verify = {};
   // motors and gears, and the elbow motor and forearm against the upper arm (scene.measure finds
   // the closest distance between the actual surfaces, intersecting = true where they cross), at
   // frames that cover the whole range of the elbow (78-127 degrees) and the shoulder
-  const ARM = ['Robot_Hose', 'Robot_UpperArm', 'Robot_Forearm', 'Robot_ElbowMotor', 'Robot_ElbowHousing', 'Robot_ElbowGear', 'Robot_ShoulderHousing', 'Robot_Turret'];
-  const mustClear = (a, b) => a === 'Robot_Hose' || b === 'Robot_Hose' || [a, b].sort().join() === 'Robot_ElbowMotor,Robot_UpperArm' || [a, b].sort().join() === 'Robot_Forearm,Robot_UpperArm';
+  const ARM = [
+    'Robot_Hose',
+    'Robot_UpperArm',
+    'Robot_Forearm',
+    'Robot_ElbowMotor',
+    'Robot_ElbowHousing',
+    'Robot_ElbowGear',
+    'Robot_ShoulderHousing',
+    'Robot_Turret',
+  ];
+  const mustClear = (a, b) =>
+    a === 'Robot_Hose' ||
+    b === 'Robot_Hose' ||
+    [a, b].sort().join() === 'Robot_ElbowMotor,Robot_UpperArm' ||
+    [a, b].sort().join() === 'Robot_Forearm,Robot_UpperArm';
   const gaps = {};
   for (const f of [1, 13, 17, 29, 41, 45, 49, 57, 65, 73, 77, 89]) {
     const m = await op('scene.measure', { objects: ARM, frame: f });
@@ -1281,17 +1823,27 @@ const verify = {};
       if (mustClear(p.a_name, p.b_name)) {
         const key = `${p.a_name.replace('Robot_', '')}/${p.b_name.replace('Robot_', '')}`;
         gaps[key] = Math.min(gaps[key] ?? Infinity, p.intersecting ? -1 : p.surface_distance);
-        check(!p.intersecting && p.surface_distance > 0.003, `${key} at frame ${f}: ${p.intersecting ? 'intersecting' : mm(p.surface_distance)}`);
+        check(
+          !p.intersecting && p.surface_distance > 0.003,
+          `${key} at frame ${f}: ${p.intersecting ? 'intersecting' : mm(p.surface_distance)}`,
+        );
       }
   }
-  const tight = Object.entries(gaps).sort((a, b) => a[1] - b[1]).slice(0, 5);
+  const tight = Object.entries(gaps)
+    .sort((a, b) => a[1] - b[1])
+    .slice(0, 5);
   log(`arm clearances (12 frames): ${tight.map(([k, g]) => `${k} ${mm(g)}`).join(', ')}, ... all >= 3 mm`);
 
   // (g) clearance between the finger pads and the carried crate
   const m = await op('scene.measure', { objects: ['Robot_Gripper', 'Crate'], frame: 50 });
   const pair = m.distances?.[0] ?? {};
-  log(`scene.measure @50 gripper <-> crate: surface distance ${pair.surface_distance} m, intersecting ${pair.intersecting}`);
-  check(pair.intersecting === false && pair.surface_distance < 0.01, `gripper/crate clearance ${JSON.stringify(pair)}`);
+  log(
+    `scene.measure @50 gripper <-> crate: surface distance ${pair.surface_distance} m, intersecting ${pair.intersecting}`,
+  );
+  check(
+    pair.intersecting === false && pair.surface_distance < 0.01,
+    `gripper/crate clearance ${JSON.stringify(pair)}`,
+  );
 
   // (h) the conveyor loops: every queued crate moves exactly one pitch (the first one onto the
   // pick station), the crate that replaces the last one waits invisible inside the infeed hood at
@@ -1307,16 +1859,25 @@ const verify = {};
   const eye = (await tool('get_object', { object: 'Camera', frame: 1 })).world_location;
   const c5 = (await tool('get_object', { object: hidden, frame: 1 })).world_location;
   const probes = [c5];
-  for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) probes.push(add(c5, [sx * (CRATE[0] / 2 - 0.01), sy * (CRATE[1] / 2 - 0.01), sz * (CRATE[2] / 2 - 0.01)]));
+  for (const sx of [-1, 1])
+    for (const sy of [-1, 1])
+      for (const sz of [-1, 1])
+        probes.push(
+          add(c5, [sx * (CRATE[0] / 2 - 0.01), sy * (CRATE[1] / 2 - 0.01), sz * (CRATE[2] / 2 - 0.01)]),
+        );
   const seen = [];
   for (const q of probes) {
     const hit = await op('scene.raycast', { origin: eye, direction: sub(q, eye), frame: 1 });
     if (!hit.hit || hit.name === hidden) seen.push(fmt(q));
   }
   check(!seen.length, `${hidden} is visible from the camera at frame 1 at ${seen.join(' ')}`);
-  const doorZ = async (f) => (await tool('get_object', { object: 'Infeed_Door', frame: f })).world_location[2];
+  const doorZ = async (f) =>
+    (await tool('get_object', { object: 'Infeed_Door', frame: f })).world_location[2];
   const [door1, door96] = [await doorZ(1), await doorZ(FRAME_END)];
-  check(Math.abs(door1) < 1e-4 && Math.abs(door96) < 1e-4, `infeed door not closed at frames 1/96 (${door1}, ${door96})`);
+  check(
+    Math.abs(door1) < 1e-4 && Math.abs(door96) < 1e-4,
+    `infeed door not closed at frames 1/96 (${door1}, ${door96})`,
+  );
   let doorGap = Infinity;
   for (let f = F_INDEX_START; f <= DOOR_KEYS[DOOR_KEYS.length - 1][0]; f += 2) {
     const dm = await op('scene.measure', { objects: ['Infeed_Door', hidden], frame: f });
@@ -1324,7 +1885,9 @@ const verify = {};
     doorGap = Math.min(doorGap, dp.intersecting ? -1 : dp.surface_distance);
     check(!dp.intersecting, `infeed door intersects ${hidden} at frame ${f}`);
   }
-  log(`conveyor loop: ${QUEUED.length} queued crates moved one pitch; ${hidden} hidden at frame 1 (${probes.length} camera rays blocked); door closed at 1/96, door <-> crate >= ${mm(doorGap)}`);
+  log(
+    `conveyor loop: ${QUEUED.length} queued crates moved one pitch; ${hidden} hidden at frame 1 (${probes.length} camera rays blocked); door closed at 1/96, door <-> crate >= ${mm(doorGap)}`,
+  );
   Object.assign(verify, {
     worst_ik_mm: +(worstIk * 1000).toFixed(2),
     worst_crate_mm: +(worstCarry * 1000).toFixed(2),
@@ -1342,7 +1905,8 @@ const verify = {};
 // ---------------------------------------------------------------------------------------------
 const info = (r) => (typeof r.text === 'string' ? JSON.parse(r.text) : r.text);
 async function save(r, file, mime = 'image/png') {
-  const item = r.resources?.find((x) => x.mimeType === mime && x.blob) ?? r.images?.find((x) => x.mimeType === mime);
+  const item =
+    r.resources?.find((x) => x.mimeType === mime && x.blob) ?? r.images?.find((x) => x.mimeType === mime);
   const data = item?.blob ?? item?.data;
   if (!data) throw new Error(`no ${mime} in result: ${JSON.stringify(r).slice(0, 600)}`);
   const buf = Buffer.from(data, 'base64');
@@ -1368,27 +1932,55 @@ async function render(toolName, args, label) {
 function sampleStats(meta) {
   const s = meta.frame_samples;
   if (!Array.isArray(s) || !s.length) return { frame_samples: 'not reported' };
-  return { spp_min: Math.min(...s), spp_mean: +(s.reduce((a, b) => a + b, 0) / s.length).toFixed(1), spp_max: Math.max(...s), requested: meta.requested_samples };
+  return {
+    spp_min: Math.min(...s),
+    spp_mean: +(s.reduce((a, b) => a + b, 0) / s.length).toFixed(1),
+    spp_max: Math.max(...s),
+    requested: meta.requested_samples,
+  };
 }
 const timings = { build_s: +((Date.now() - T0) / 1000).toFixed(1), build_mcp_calls: mcpCalls, verify };
 
 if (PREVIEW_DIR) {
   await mkdir(PREVIEW_DIR, { recursive: true });
   for (const f of [1, 22, 33, 47, STILL_FRAME, 66, 77, 90]) {
-    const { r, ms } = await render('render_image', { engine: 'RASTER', width: 640, height: 360, frame: f }, `raster ${f}`);
+    const { r, ms } = await render(
+      'render_image',
+      { engine: 'RASTER', width: 640, height: 360, frame: f },
+      `raster ${f}`,
+    );
     await save(r, path.join(PREVIEW_DIR, `raster_f${f}.png`));
     log(`preview: RASTER frame ${f} in ${ms} ms`);
   }
   const sheet = await render(
     'render_animation',
-    { format: 'CONTACT_SHEET', engine: 'RASTER', frame_start: 1, frame_end: FRAME_END, frame_step: 4, width: 320, height: 180, columns: 6, time_limit: 300 },
+    {
+      format: 'CONTACT_SHEET',
+      engine: 'RASTER',
+      frame_start: 1,
+      frame_end: FRAME_END,
+      frame_step: 4,
+      width: 320,
+      height: 180,
+      columns: 6,
+      time_limit: 300,
+    },
     'raster contact sheet',
   );
   await save(sheet.r, path.join(PREVIEW_DIR, 'contact_raster.png'));
   log(`preview: RASTER contact sheet in ${sheet.ms} ms`);
   const pt = await render(
     'render_image',
-    { engine: 'PATHTRACER', width: 640, height: 360, frame: STILL_FRAME, samples: 32, max_bounces: 4, denoise: true, time_limit: 45 },
+    {
+      engine: 'PATHTRACER',
+      width: 640,
+      height: 360,
+      frame: STILL_FRAME,
+      samples: 32,
+      max_bounces: 4,
+      denoise: true,
+      time_limit: 45,
+    },
     'path traced preview',
   );
   await save(pt.r, path.join(PREVIEW_DIR, `pt_f${STILL_FRAME}.png`));
@@ -1400,34 +1992,89 @@ if (FINAL_RENDERS) {
     // Final still: path traced, denoised; sampling stops at the time limit
     const { r, ms, meta } = await render(
       'render_image',
-      { engine: 'PATHTRACER', width: 1280, height: 720, frame: STILL_FRAME, samples: 256, max_bounces: 6, denoise: true, time_limit: STILL_TIME },
+      {
+        engine: 'PATHTRACER',
+        width: 1280,
+        height: 720,
+        frame: STILL_FRAME,
+        samples: 256,
+        max_bounces: 6,
+        denoise: true,
+        time_limit: STILL_TIME,
+      },
       'render.png',
     );
     const bytes = await save(r, path.join(HERE, 'render.png'));
-    timings.still = { s: +(ms / 1000).toFixed(1), samples: meta.samples, requested: meta.requested_samples, threads: meta.threads, bytes };
+    timings.still = {
+      s: +(ms / 1000).toFixed(1),
+      samples: meta.samples,
+      requested: meta.requested_samples,
+      threads: meta.threads,
+      bytes,
+    };
     log(`render.png: ${JSON.stringify(timings.still)}`);
   }
   if (!STILL_ONLY) {
     // Contact sheet: 24 path-traced frames of the cycle (every 4th frame), denoised
     let { r, ms, meta } = await render(
       'render_animation',
-      { format: 'CONTACT_SHEET', engine: 'PATHTRACER', frame_start: 1, frame_end: FRAME_END, frame_step: 4, width: 320, height: 180, columns: 6, samples: 12, max_bounces: 4, denoise: true, frame_time_limit: 10, time_limit: 300 },
+      {
+        format: 'CONTACT_SHEET',
+        engine: 'PATHTRACER',
+        frame_start: 1,
+        frame_end: FRAME_END,
+        frame_step: 4,
+        width: 320,
+        height: 180,
+        columns: 6,
+        samples: 12,
+        max_bounces: 4,
+        denoise: true,
+        frame_time_limit: 10,
+        time_limit: 300,
+      },
       'contact_sheet.png',
     );
     if (meta.truncated) throw new Error(`contact_sheet.png truncated: ${JSON.stringify(meta).slice(0, 600)}`);
     let bytes = await save(r, path.join(HERE, 'contact_sheet.png'));
-    timings.contact_sheet = { s: +(ms / 1000).toFixed(1), frames: meta.frames?.length, undersampled: meta.undersampled_frames?.length ?? 0, ...sampleStats(meta), bytes };
+    timings.contact_sheet = {
+      s: +(ms / 1000).toFixed(1),
+      frames: meta.frames?.length,
+      undersampled: meta.undersampled_frames?.length ?? 0,
+      ...sampleStats(meta),
+      bytes,
+    };
     log(`contact_sheet.png: ${JSON.stringify(timings.contact_sheet)}`);
     // preview.gif: the whole 96-frame cycle as 48 path-traced frames (every 2nd frame, 12 fps)
     ({ r, ms, meta } = await render(
       'render_animation',
-      { format: 'GIF', engine: 'PATHTRACER', frame_start: 1, frame_end: FRAME_END - 1, frame_step: 2, width: 480, height: 270, samples: 16, max_bounces: 4, denoise: true, frame_time_limit: 15, time_limit: 600, dither: 'BAYER' },
+      {
+        format: 'GIF',
+        engine: 'PATHTRACER',
+        frame_start: 1,
+        frame_end: FRAME_END - 1,
+        frame_step: 2,
+        width: 480,
+        height: 270,
+        samples: 16,
+        max_bounces: 4,
+        denoise: true,
+        frame_time_limit: 15,
+        time_limit: 600,
+        dither: 'BAYER',
+      },
       'preview.gif',
     ));
     if (meta.truncated) throw new Error(`preview.gif truncated: ${JSON.stringify(meta).slice(0, 600)}`);
     bytes = await save(r, path.join(HERE, 'preview.gif'), 'image/gif');
     if (bytes > 6e6) log(`WARNING: preview.gif is ${(bytes / 1e6).toFixed(2)} MB (limit 6 MB)`);
-    timings.gif = { s: +(ms / 1000).toFixed(1), frames: meta.frames?.length, undersampled: meta.undersampled_frames?.length ?? 0, ...sampleStats(meta), bytes };
+    timings.gif = {
+      s: +(ms / 1000).toFixed(1),
+      frames: meta.frames?.length,
+      undersampled: meta.undersampled_frames?.length ?? 0,
+      ...sampleStats(meta),
+      bytes,
+    };
     log(`preview.gif: ${JSON.stringify(timings.gif)} ${JSON.stringify(meta).slice(0, 400)}`);
   }
 }
@@ -1440,7 +2087,9 @@ if (EXPORT_ONLY) {
   const meta = info(r);
   const bytes = await save(r, path.join(HERE, 'scene.glb'), 'model/gltf-binary');
   timings.glb = { s: +((Date.now() - t) / 1000).toFixed(1), bytes, warnings: meta.warnings ?? [] };
-  log(`scene.glb: ${(bytes / 1e6).toFixed(2)} MB in ${timings.glb.s} s; warnings: ${JSON.stringify(meta.warnings ?? []).slice(0, 1500)}`);
+  log(
+    `scene.glb: ${(bytes / 1e6).toFixed(2)} MB in ${timings.glb.s} s; warnings: ${JSON.stringify(meta.warnings ?? []).slice(0, 1500)}`,
+  );
 }
 
 log(`done in ${((Date.now() - T0) / 1000).toFixed(1)} s`);

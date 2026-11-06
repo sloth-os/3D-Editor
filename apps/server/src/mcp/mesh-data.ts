@@ -16,15 +16,17 @@ import { evaluateCached } from './eval-cache';
 import { ToolError } from './agent';
 
 /*
- * Read access to mesh geometry for agents (the get_mesh_data tool): vertex positions and normals,
- * faces with their material indices, UVs, loose edges and vertex group weights, in pages, plus an
- * optional world-space heightmap of the surface (terrain-aware placement without parsing exports).
+ * Read access to mesh geometry for agents (the get_mesh_data tool): vertex positions, normals and
+ * colors, faces with their material indices, UVs, loose edges and vertex group weights, in pages,
+ * plus an optional world-space heightmap of the surface (terrain-aware placement without parsing
+ * exports).
  */
 
 /** What get_mesh_data can return. */
 export const MESH_DATA_FIELDS = [
   'vertices',
   'normals',
+  'colors',
   'faces',
   'face_materials',
   'face_smooth',
@@ -222,7 +224,9 @@ export function meshData(scene: SceneDoc, o: ObjectData, opts: MeshDataOptions):
   const toSpace = space === 'WORLD' && world ? (p: Vec3) => transformPoint3(world, p) : (p: Vec3) => p;
   const normalToSpace = space === 'WORLD' && world ? normalTransform(world) : (n: Vec3) => n;
   const vec = (v: Vec3) => [round(v[0]), round(v[1]), round(v[2])];
-  const vertexRange = include.has('vertices') || include.has('normals') || include.has('vertex_groups');
+  const vertexRange = ['vertices', 'normals', 'colors', 'vertex_groups'].some((k) =>
+    include.has(k as MeshDataField),
+  );
   const faceRange = ['faces', 'face_materials', 'face_smooth', 'face_normals', 'face_centers', 'uvs'].some(
     (k) => include.has(k as MeshDataField),
   );
@@ -265,6 +269,27 @@ export function meshData(scene: SceneDoc, o: ObjectData, opts: MeshDataOptions):
     for (let i = v0; i < v1; i++)
       list.push(vec(normalToSpace([normals[i * 3], normals[i * 3 + 1], normals[i * 3 + 2]])));
     out.normals = list;
+  }
+  if (include.has('colors')) {
+    // the vertex color layer (what paint.vertex_color_set / _stroke / _set_data write): RGBA per vertex
+    const cols = mesh.colors;
+    if (cols && cols.length >= nv * 4) {
+      const list: number[][] = [];
+      for (let i = v0; i < v1; i++)
+        list.push([
+          round(cols[i * 4]),
+          round(cols[i * 4 + 1]),
+          round(cols[i * 4 + 2]),
+          round(cols[i * 4 + 3]),
+        ]);
+      out.colors = list;
+    } else {
+      out.colors = null;
+      out.colors_note =
+        source === 'BASE'
+          ? 'the mesh has no vertex color layer (paint.vertex_color_set, paint.vertex_color_stroke and paint.vertex_color_set_data add one; renders then multiply the base color by it)'
+          : 'the evaluated geometry carries no vertex colors (the mesh has no color layer, or a modifier does not keep it)';
+    }
   }
   if (include.has('vertex_groups')) {
     if (source !== 'BASE' || !o.data) out.vertex_groups = null;

@@ -19,7 +19,7 @@ cabinet with a signal tower. It stands in a dim factory hall.
 | Part | How it is made |
 | --- | --- |
 | Robot rig | `object.armature_add` + `armature.bone_update` (J1_Base) + `armature.chain_add` (J2_Shoulder, J3_Elbow, J4_Wrist): **J1** yaws about Z, **J2 / J3** pitch (2-bone IK), **J4** rolls the gripper about the vertical. |
-| Rigid parts | 18 parts: turret with shoulder yoke, motors, joint housings, tapered arm segments, wrist flange, gripper, three gears, three hose clamps and two clamp-bracket meshes. They are made with `object.add_mesh_from_data`, `object.generate_gear` and `mesh.primitive_torus_add` and bone-parented like Blender's Ctrl+P > Bone: `object.select` (parts + armature active), then `object.parent_set {type: BONE, bone}`. The elbow bends between 78° and 127° in the cycle, and its layout is chosen so that nothing collides over that range: the forearm starts inside the 0.16 m elbow housing, and the rear elbow motor sits beside the arm's centre plane. As a result no link, motor or hose passes through another part at any frame (the build checks this, see Verification). The base plate and pedestal are plain children of the rig. |
+| Rigid parts | 18 parts: turret with shoulder yoke, motors, joint housings, tapered arm segments, wrist flange, gripper, three gears, three hose clamps and two clamp-bracket meshes. They are made with `object.add_mesh_from_data`, `object.generate_gear` and `mesh.primitive_torus_add` and bone-parented like Blender's Ctrl+P > Bone: `object.select` (parts + armature active), then `object.parent_set {type: BONE, bone}`. The elbow bends between 78° and 127° in the cycle, and its layout is chosen so that nothing collides over that range: the forearm starts inside the 0.16 m elbow housing, and the rear elbow motor sits beside the arm's centre plane. As a result, apart from the joints themselves (each link ends inside the round housing of its joint), no link, motor or hose passes through another part at any frame (the build checks this, see Verification). The base plate and pedestal are plain children of the rig. |
 | Gears | `object.generate_gear`: a 60-tooth slewing ring on J1 and gear wheels on the shoulder and elbow, bone-parented so they turn with their joints. `materials: false`, because the parts get their own materials (otherwise the generator would leave an unused default "Steel" material behind). |
 | Dress-pack hose | `object.generate_pipe` along a path that runs up the back of the upper arm, around the back of the elbow next to the elbow motor and along the top of the forearm. It is bound with `object.parent_set {type: ARMATURE_AUTO}` (automatic bone-heat weights + Armature modifier), so it bends with J1, J2 and J3. On a hose that runs 17 cm from its bones, the automatic weights blend over long stretches. With the raw weights, the hose root (55 % J1_Base, 42 % J2_Shoulder) slid up to 112 mm over its fitting, and the hose moved up to 36 mm out of the centre of its clamps. The build therefore reads the weights with `get_mesh_data` and pins each clamped stretch to the bone of its link: root → J1_Base, upper-arm clamps → J2_Shoulder, forearm → J3_Elbow. Each pinned stretch blends back into the automatic weights over 12–15 cm, so the automatic weights still bend the hose at the shoulder and around the elbow. The fixed weights are written back with `object.vertex_group_set_weights`. Three clamps on brackets hold the hose to the arm. |
 | IK | `pose.ik_add` on J3_Elbow (chain 2) targeting the keyframed empty `IK_Target`. `pose.constraint_add DAMPED_TRACK` on J4 aims at `Wrist_Aim` (a child of the target, 1 m below it), which keeps the wrist vertical like a palletizer's parallel link. |
@@ -31,10 +31,11 @@ cabinet with a signal tower. It stands in a dim factory hall.
 | Safety fence | `object.generate_fence` makes two RAIL runs that leave a gap for the conveyor. The welded-mesh infill panels are thin boxes whose alpha is a procedural BRICK texture without row offset (mortar = wire, bricks = holes, blend CLIP). The panel edges sit where the 5 cm wire grid cannot leave loose wire ends: the top edge inside the generated top rail, the side edges inside the posts and the bottom edge on a full wire. |
 | Props | `object.text_add` signs ("CELL 04 - PALLETIZING", "AUTOMATIC MACHINE - KEEP OUT"), a controller cabinet with an emissive HMI and a signal tower, a light curtain, an E-stop station and a striped cable protector. The tower's amber lamp blinks through `anim.driver_add` on the material's `emission_strength` (`14 * (fract(frame / 12) < 0.5)`). |
 | Hall | North, west and east corrugated walls (a WAVE bump on the normal channel; the side walls use a second material with the waves along Y), glowing window strips and steel columns. |
-| Camera | `object.camera_add` (30 mm) + `object.look_at`. A **DAMPED_TRACK** constraint (`TRACK_NEGATIVE_Z`, influence 0.5) on `Robot_Gripper` makes the camera pan after the gripper between conveyor and pallet. **Depth of field** with `camera.properties_set {dof_use, dof_focus_object: Robot_Gripper, dof_aperture_fstop: 2.8}` keeps the gripper in focus at every frame (focus distance 3.9–5.7 m). |
+| Camera | `object.camera_add` (30 mm) + `object.look_at`. A **DAMPED_TRACK** constraint (`TRACK_NEGATIVE_Z`, influence 0.5) on `Robot_Gripper` makes the camera pan after the gripper between conveyor and pallet. **Depth of field** with `camera.properties_set {dof_use, dof_focus_object: Robot_Gripper, dof_aperture_fstop: 2.8}` keeps the gripper in focus at every frame (focus distance 3.90–5.65 m). |
 | Lighting | `object.light_add` with area-light shapes and sizes: two 4.2 × 0.45 m **RECTANGLE** LED strips over the cell, a cool 3 × 1 m RECTANGLE rim light behind the robot and a warm **SPOT** key (`spot_size`, `spot_blend`, `shadow_soft_size`) from the front left. Also a dark world colour, mist (`set_scene_settings mist_distance`), the AgX view transform and emissive windows. |
 
-The scene has 76 objects (66 meshes), 28 materials and about 31 900 evaluated triangles.
+The scene has 77 objects (67 meshes), 28 materials (each one used) and about 31 900 evaluated
+triangles.
 
 ## Animation (96 frames, 24 fps)
 
@@ -70,7 +71,7 @@ fails:
   - The crate sits at the pick station before the grip, rides with the gripper while gripped and
     stays on its slot after the release (worst error **0.06 mm**).
   - The Child Of influence is 0 / 1 / 0 and the `Grip` shape key is 0 / 1 / 0 as planned.
-  - The camera's evaluated DOF focus distance follows the gripper (3.9–5.7 m).
+  - The camera's evaluated DOF focus distance follows the gripper (3.90–5.65 m).
 - **Hose.** `get_mesh_data {source: EVALUATED, space: WORLD}` at 8 frames:
   - The hose root stays on its turret fitting, within **0.02 mm**. The check compares it with the
     rest-pose root turned by the J1 yaw, so it also catches the root sliding up, down or around
@@ -84,7 +85,10 @@ fails:
     shoulder housing nor turret.
   - Neither the elbow motor nor the forearm touches the upper arm.
   - The tightest clearances are 11.2 mm (hose to elbow housing), 12.6 mm (forearm to upper arm)
-    and 13.5 mm (elbow motor to upper arm).
+    and 13.5 mm (elbow motor to upper arm). The same `scene.measure` run over all 96 frames finds
+    no intersection either (minimum 13.4 mm for the elbow motor at frame 43).
+  - Parts that are mounted on each other are not checked: each link ends inside the round
+    housing of its joint, and the motors and gears sit on their housings.
 - **Grip clearance.** `scene.measure {frame: 50}`: 2 mm between the finger pads and the carried
   crate, no intersection.
 - **Conveyor loop.**
@@ -132,7 +136,7 @@ PORT=4503 npm start &                               # or any running server / th
 # 2. The build. The modes are exclusive; the scene is always rebuilt and verified first.
 MCP_URL=http://127.0.0.1:4503/mcp node examples/robot-workcell/build.mjs
 #   (no flag)          final renders: render.png, contact_sheet.png, preview.gif
-#   --no-render        build + verify only (about 9 s)
+#   --no-render        build + verify only (about 10 s)
 #   --export-only      build + verify, then scene.glb (no renders)
 #   --preview=DIR      build + verify, then RASTER stills, a RASTER contact sheet and a small
 #                      path-traced frame into DIR (outputs untouched)
@@ -145,14 +149,39 @@ contradictory combinations (two modes, `--still-only --anim-only`, final-render 
 mode) are rejected before anything is built, so a typo can never start the final renders and
 overwrite the outputs.
 
-FINAL_RUN_BUILD_SENTENCE The renders take the rest of the time. They are time-limited, so the
+Building and verifying the scene takes about 10 s (10.7 s and 244 MCP calls in the final
+production run below). The renders take the rest of the time. They are time-limited, so the
 samples reached depend on the CPU. The script prints the project's editor URL
 (`http://<host>/?project=<id>`): open it to scrub the timeline and inspect the rig, the
 constraints, the shape key and the driver in the web editor.
 
 ## Final production run
 
-FINAL_RUN_SECTION
+`render.png`, `contact_sheet.png` and `preview.gif` come from a single default-mode run on a
+fresh server with an empty data directory. The same run shows that the project rebuilds from
+scratch. The server was the editor built from commit `550701b` (2026-11-05), started like this:
+
+```bash
+npm run build                                   # editor at commit 550701b
+PORT=4553 DATA_DIR=<new empty dir> RENDER_WORKERS=3 npm start &
+MCP_URL=http://127.0.0.1:4553/mcp node examples/robot-workcell/build.mjs
+```
+
+The run finished with exit code 0 in 810.8 s (13.5 min). It ran on a 4-core machine that other
+jobs were also using, so the renders did not have the CPU to themselves.
+
+| Stage | Time | Settings and result |
+| --- | --- | --- |
+| Build + verify | 10.7 s | 244 MCP calls; all checks passed (IK 0.0 mm, crate 0.06 mm, finger pads 2.04 mm from the crate, hose root 0.02 mm, clamps 0.09 mm, arm clearances ≥ 11.2 mm) |
+| `render.png` | 479.8 s | Path tracer, 1280 × 720, frame 49, 6 bounces, denoised, 480 s limit on 3 threads: **79 of 256 spp** reached (1.28 MB) |
+| `contact_sheet.png` | 78.1 s | Path tracer, frames 1–93 every 4th (24 tiles of 320 × 180), 12 spp, 4 bounces, denoised, 10 s per frame: 12 tiles reached 12 spp, 12 stopped at the time limit (2.73 MB) |
+| `preview.gif` | 242.2 s | Path tracer, frames 1–95 every 2nd (48 frames at 12 fps), 480 × 270, 16 spp, 4 bounces, denoised, 15 s per frame, Bayer dither: all 48 frames stopped at the time limit, none dropped (3.99 MB) |
+
+`render_animation` in this editor build lists the frames that stopped at their time limit, but
+not how many samples they reached. Later builds (from commit `6451e56`) report them, and then
+`build.mjs` writes the minimum, mean and maximum to its `TIMINGS` line by itself. Shortly
+before the run, single `render_image` probes with the same size, sample count and time limit on
+one thread reached 7–9 spp with the GIF settings and 9 spp with the contact-sheet settings.
 
 ## Known limitations
 
@@ -171,7 +200,10 @@ FINAL_RUN_SECTION
   resolution the 8 mm wires are sub-pixel and shimmer slightly.
 - **Rollers do not turn.** They are smooth cylinders of one ARRAY object, so a spin would be
   invisible. The crates' conveyor ride is keyframed, not simulated.
-- FINAL_RUN_SAMPLES_LIMITATION
+- **Low sample counts in the animation.** On the shared CPU, every GIF frame stopped below its
+  16 spp, so the denoised frames look slightly soft and grainy. The still reached 79 of its
+  256 spp. The renders are time-limited, so a less busy machine gives cleaner frames with the
+  same script (`--still-time=S` also gives the still more time).
 - **scene.glb** is written by `--export-only` from the live, rigged scene. Area lights become
   point lights in glTF, and procedural textures are baked through automatically generated UVs
   (both are reported as `export_scene` warnings). It will be regenerated with the finished glTF
