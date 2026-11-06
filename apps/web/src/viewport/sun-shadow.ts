@@ -14,17 +14,21 @@ import * as THREE from 'three';
  * times the median distance from the camera at which the visible objects start, so a far background
  * (mountains or clouds a kilometre away) does not cost the foreground its resolution; beyond it
  * there are no sun shadows. Orthographic views (as wide at every depth) have no shadow distance.
- * The depth and normal biases are a couple of texels in world units (a few millimetres to centimetres
- * for a view of metre-sized objects), whatever the depth range of the map: enough against acne on
- * faces lit at an angle, too little to detach the shadows from the objects casting them.
+ * The normal and depth biases are a few texels in world units (millimetres to a few centimetres for a
+ * view of metre-sized objects), whatever the depth range of the map: enough against acne on faces
+ * the sun grazes, too little to detach the shadows from the objects casting them.
  */
 
 /** Width and height of a sun's shadow map in texels. */
 export const SUN_SHADOW_MAP_SIZE = 2048;
 /** The shadow distance: this many times the median distance at which the visible objects start. */
 export const SHADOW_DISTANCE_SCALE = 4;
-/** Normal offset of shadow lookups (three.js normalBias) in texels of the fitted map. */
-export const NORMAL_BIAS_TEXELS = 2;
+/**
+ * Normal offset of shadow lookups (three.js normalBias) in texels of the fitted map: about the reach
+ * of the shadow filter (`shadow.radius` texels), so a face the sun grazes does not shadow itself
+ * where the filter samples the map beside the lookup (2 texels left a fine dither on such faces).
+ */
+export const NORMAL_BIAS_TEXELS = 3;
 /** Depth bias of shadow lookups in texels (world units) of the fitted map. */
 export const DEPTH_BIAS_TEXELS = 2;
 

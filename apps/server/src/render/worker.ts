@@ -1,6 +1,7 @@
 import { parentPort } from 'node:worker_threads';
 import { pathTileTransferables } from '@3d-editor/core';
 import { RenderEngine } from './engine';
+import { lowerThreadPriority } from './priority';
 import type { WorkerRequest, WorkerResponse, WorkerResult } from './protocol';
 
 /*
@@ -10,6 +11,10 @@ import type { WorkerRequest, WorkerResponse, WorkerResult } from './protocol';
 
 const port = parentPort;
 if (!port) throw new Error('the render worker must run in a worker thread');
+
+// below the main thread, which keeps serving editors, agents and health checks while every render
+// thread is busy (see priority.ts)
+lowerThreadPriority();
 
 const engine = new RenderEngine();
 

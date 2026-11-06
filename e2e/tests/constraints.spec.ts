@@ -1,5 +1,16 @@
 import { test, expect } from '@playwright/test';
-import { PLAIN, callJson, mcpConnect, menuPath, newProject, setNumberField } from './helpers';
+import {
+  PLAIN,
+  callJson,
+  changedFraction,
+  mcpConnect,
+  menuPath,
+  newProject,
+  region,
+  setNumberField,
+  viewportShot,
+  type RgbaImage,
+} from './helpers';
 
 type Vec3 = [number, number, number];
 
@@ -16,6 +27,13 @@ function closeTo(a: number[], b: number[], eps = 1e-3): boolean {
   return a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) < eps);
 }
 
+/**
+ * Share of the viewport around the empty at (4, 0, 0) (in the default view of the editor's
+ * viewport, right of the cube) that differs from `before`: its arrow turns as its aim changes.
+ */
+const arrowChange = (before: RgbaImage, now: RgbaImage) =>
+  changedFraction(before, now, region(now, 0.62, 0.42, 0.16, 0.25));
+
 test.describe('object constraints', () => {
   test('a Track To constraint added in the Constraints tab aims its owner at the picked target', async ({
     page,
@@ -28,8 +46,9 @@ test.describe('object constraints', () => {
         rotation_euler: Vec3;
       };
 
-    // the owner: an empty 4 m to the side of the default cube
-    await menuPath(page, ['Add', 'Empty', 'Plain Axes']);
+    // the owner: an empty 4 m to the side of the default cube, drawn as an arrow along its local Z
+    // axis, which shows where it points (plain axes would look the same aimed along the world axes)
+    await menuPath(page, ['Add', 'Empty', 'Single Arrow']);
     await expect(page.getByTestId('outliner-Empty')).toHaveClass(/active/);
     await page.getByTestId('prop-tab-object').click();
     await setNumberField(page, 'loc-0', 4);
@@ -54,6 +73,7 @@ test.describe('object constraints', () => {
     // the target picker lists the other objects
     const target = page.getByTestId('constraint-Track To-target');
     await expect(target.locator('option')).toHaveText(['— none —', 'Camera', 'Cube', 'Light']);
+    const upright = await viewportShot(page);
     await target.selectOption({ label: 'Cube' });
     await expect(page.getByTestId('constraint-Track To-error')).toHaveCount(0);
 
@@ -67,6 +87,8 @@ test.describe('object constraints', () => {
     expect(owner.constraints).toEqual([
       expect.objectContaining({ type: 'TRACK_TO', targets: ['Cube'], influence: 1 }),
     ]);
+    // the viewport draws the aimed empty: its arrow no longer points up
+    await expect.poll(async () => arrowChange(upright, await viewportShot(page))).toBeGreaterThan(0.003);
 
     // picking the target is one undo step (the picker keeps the keyboard focus: leave it first)
     await target.blur();
@@ -75,6 +97,7 @@ test.describe('object constraints', () => {
     await expect(target).toHaveValue('');
     await expect(page.getByTestId('constraint-Track To-error')).toBeVisible();
     await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual([0, 0, 0]);
+    await expect.poll(async () => arrowChange(upright, await viewportShot(page))).toBeLessThan(0.001);
     await page.keyboard.press('Control+Shift+z');
     await expect(target.locator('option:checked')).toHaveText('Cube');
     await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual(wt.rotation_euler);
@@ -94,11 +117,14 @@ test.describe('object constraints', () => {
     // influence 0 turns the constraint off
     await setNumberField(page, 'constraint-Track To-influence', 0);
     await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual([0, 0, 0]);
+    const off = await viewportShot(page);
     // and muting it from the panel header does the same at full influence
     await setNumberField(page, 'constraint-Track To-influence', 1);
     await expect.poll(async () => (await worldTransform()).rotation_euler).not.toEqual([0, 0, 0]);
+    await expect.poll(async () => arrowChange(off, await viewportShot(page))).toBeGreaterThan(0.003);
     await page.getByTestId('constraint-Track To-mute').click();
     await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual([0, 0, 0]);
+    await expect.poll(async () => arrowChange(off, await viewportShot(page))).toBeLessThan(0.001);
     wt = await worldTransform();
     expect(wt.location).toEqual([4, 0, 0]);
     await client.close();

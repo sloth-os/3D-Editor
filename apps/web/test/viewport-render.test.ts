@@ -910,7 +910,7 @@ describe('sun shadows', () => {
       const m = shadowMetrics(light);
       texels.push(m.texel);
       expect(m.texel, `${size} m floor: texel`).toBeLessThan(0.02);
-      expect(m.normalBias).toBeLessThan(0.03);
+      expect(m.normalBias).toBeLessThan(0.04);
       expect(m.depthBias).toBeLessThan(0.03);
       // the casters the camera sees, and their shadows on the floor it sees, are in the map
       const cam = sceneCamera(e, gl);

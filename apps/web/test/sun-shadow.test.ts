@@ -160,7 +160,8 @@ describe('fitSunShadow', () => {
       expect(light.shadow.normalBias).toBeCloseTo(NORMAL_BIAS_TEXELS * fit.texel, 9);
       // three.js adds the bias to the 0..1 depth over near..far
       expect(-light.shadow.bias * (fit.far - fit.near)).toBeCloseTo(DEPTH_BIAS_TEXELS * fit.texel, 9);
-      expect(light.shadow.normalBias).toBeLessThan(0.03);
+      // centimetres (the whole-scene fit had 0.63 m and 0.43 m)
+      expect(light.shadow.normalBias).toBeLessThan(0.04);
       expect(-light.shadow.bias * (fit.far - fit.near)).toBeLessThan(0.03);
     }
   });

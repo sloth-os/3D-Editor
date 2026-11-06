@@ -90,12 +90,75 @@ function vertexRing(m: MeshData, topo: Topology, dirFace: Map<string, number>, v
   return ring;
 }
 
-/** Superellipse profile point between A (t=0) and B (t=1) bulging toward control point C. */
+/**
+ * Superellipse exponent of a `profile` value, Blender's mapping (as the edit-mode bevel tool):
+ * 0.5 → 2 (circle), 0.25 → 1 (straight), 1 → ∞ (square corner), 0 → 0 (inverted square).
+ */
+function profileExponent(profile: number): number {
+  const p = Math.min(0.9999, Math.max(1e-4, profile));
+  return (-2 * Math.LN2) / Math.log(p);
+}
+
+/**
+ * Arc-length tables of the quarter superellipse X^k + Y^k = 1 from (0, 1) to (1, 0), per exponent:
+ * like Blender, profile vertices are spaced evenly along the curve, so boxy and concave profiles
+ * keep their segments apart instead of bunching them in the corner (zero-area faces).
+ */
+const superellipseTables = new Map<number, { X: Float64Array; Y: Float64Array; s: Float64Array }>();
+
+function superellipseTable(k: number): { X: Float64Array; Y: Float64Array; s: Float64Array } {
+  let tab = superellipseTables.get(k);
+  if (tab) return tab;
+  const H = 256; // samples per half (from an end to the diagonal point)
+  const d = Math.pow(2, -1 / k);
+  const X = new Float64Array(2 * H + 1);
+  const Y = new Float64Array(2 * H + 1);
+  for (let i = 0; i <= H; i++) {
+    // first half from (0, 1): X^k grows linearly in w for concave exponents, X itself otherwise
+    const w = i / H;
+    const x = k < 1 ? d * Math.pow(w, 1 / k) : d * w;
+    const y = i === H ? d : Math.pow(Math.max(0, 1 - Math.pow(x, k)), 1 / k);
+    X[i] = x;
+    Y[i] = y;
+    X[2 * H - i] = y; // the second half mirrors the first
+    Y[2 * H - i] = x;
+  }
+  const s = new Float64Array(2 * H + 1);
+  for (let i = 1; i <= 2 * H; i++) s[i] = s[i - 1] + Math.hypot(X[i] - X[i - 1], Y[i] - Y[i - 1]);
+  for (let i = 1; i <= 2 * H; i++) s[i] /= s[2 * H];
+  tab = { X, Y, s };
+  if (superellipseTables.size > 64) superellipseTables.clear();
+  superellipseTables.set(k, tab);
+  return tab;
+}
+
+/**
+ * Superellipse profile point between A (t=0) and B (t=1) bulging toward control point C, at the
+ * fraction t of the curve's length (a round profile is an exact circular arc).
+ */
 function profilePoint(A: number[], B: number[], C: number[], t: number, profile: number): number[] {
   const k = profileExponent(profile);
-  const th = (t * Math.PI) / 2;
-  const x = 1 - Math.pow(Math.sin(th), 2 / k);
-  const y = 1 - Math.pow(Math.cos(th), 2 / k);
+  let X: number;
+  let Y: number;
+  if (k === 2) {
+    X = Math.sin((t * Math.PI) / 2);
+    Y = Math.cos((t * Math.PI) / 2);
+  } else {
+    const tab = superellipseTable(k);
+    const tt = Math.min(1, Math.max(0, t));
+    let lo = 0;
+    let hi = tab.s.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (tab.s[mid] <= tt) lo = mid;
+      else hi = mid;
+    }
+    const f = tab.s[hi] > tab.s[lo] ? (tt - tab.s[lo]) / (tab.s[hi] - tab.s[lo]) : 0;
+    X = tab.X[lo] + (tab.X[hi] - tab.X[lo]) * f;
+    Y = tab.Y[lo] + (tab.Y[hi] - tab.Y[lo]) * f;
+  }
+  const x = 1 - X;
+  const y = 1 - Y;
   return [0, 1, 2].map((i) => C[i] + (A[i] - C[i]) * x + (B[i] - C[i]) * y);
 }
 
@@ -134,27 +197,180 @@ function cornerUV(m: MeshData, f: number, i: number, pt: number[]): number[] {
   ];
 }
 
+/** Where a new vertex lies relative to the faces around its original vertex (see `BevelUVs`). */
+const enum HomeKind {
+  /** Inside one original face's region (a miter corner, a profile point on that face's side). */
+  FACE,
+  /** On an original edge (a slide point, the middle of a profile, a patch sector boundary). */
+  EDGE,
+  /** At the original vertex (a patch center, the vertex itself). */
+  VERT,
+}
+
+/**
+ * Per-face-corner UVs of the new bevel geometry, interpolated like Blender: every new face takes its
+ * UVs from one original face around the vertex its corners belong to, so bevel faces stay inside the
+ * UV island of the face they were cut from instead of stretching across UV seams (a cylinder's rim
+ * between the cap circles and the side strip, the wrap-around seam of its side).
+ *
+ * Every new vertex records its original vertex and its "home". In face F, a vertex at home in F takes
+ * F's UV at its position (projected into F's plane); a vertex on an edge of F is first snapped onto
+ * that edge; a vertex at home in a neighbouring face is snapped onto the edge F shares with it (or onto
+ * the original vertex). So both halves of a bevel strip map onto their own face's island up to the
+ * seam, and faces on both sides of an edge agree where the UVs are continuous. A face whose corners
+ * lie in several faces' regions (the middle quad of an odd-segment strip, a corner patch) uses each
+ * corner's own face where the UVs around it are continuous and one representative face otherwise.
+ */
+class BevelUVs {
+  private readonly vert: number[] = [];
+  private readonly kind: HomeKind[] = [];
+  private readonly ref: number[] = [];
+  private readonly seams = new Map<number, boolean>();
+
+  constructor(
+    private readonly m: MeshData,
+    private readonly topo: Topology,
+    private readonly b: MeshBuilder,
+  ) {}
+
+  /** Records new vertex `id` of original vertex `v` with its home (`ref`: the face or edge). */
+  set(id: number, v: number, kind: HomeKind, ref = -1): void {
+    this.vert[id] = v;
+    this.kind[id] = kind;
+    this.ref[id] = ref;
+  }
+
+  /** Gives `id` the home of vertex `from` (a profile point on the same side as its end `from`). */
+  copy(id: number, from: number): void {
+    this.set(id, this.vert[from], this.kind[from], this.ref[from]);
+  }
+
+  homeFace(id: number): number {
+    return this.kind[id] === HomeKind.FACE ? this.ref[id] : -1;
+  }
+
+  homeEdge(id: number): number {
+    return this.kind[id] === HomeKind.EDGE ? this.ref[id] : -1;
+  }
+
+  /** Whether original edge e is a UV seam (its two faces disagree on the UV of an end). */
+  seam(e: number): boolean {
+    let r = this.seams.get(e);
+    if (r !== undefined) return r;
+    r = false;
+    const fs = this.topo.edgeFaces[e];
+    const uvs = this.m.uvs;
+    if (fs.length === 2 && uvs) {
+      const [f, g] = fs;
+      for (const v of this.topo.edges[e]) {
+        const i = this.m.faces[f].indexOf(v);
+        const j = this.m.faces[g].indexOf(v);
+        const du = uvs[f][i * 2] - uvs[g][j * 2];
+        const dv = uvs[f][i * 2 + 1] - uvs[g][j * 2 + 1];
+        if (Math.abs(du) > 1e-6 || Math.abs(dv) > 1e-6) r = true;
+      }
+    }
+    this.seams.set(e, r);
+    return r;
+  }
+
+  /** Whether any edge at original vertex v is a UV seam. */
+  seamAt(v: number): boolean {
+    return this.topo.vertEdges[v].some((e) => this.seam(e));
+  }
+
+  /** The edge of face f at its corner i that face g shares (−1 when none). */
+  private sharedEdge(f: number, i: number, g: number): number {
+    const L = this.m.faces[f].length;
+    for (const e of [this.topo.faceEdges[f][(i + L - 1) % L], this.topo.faceEdges[f][i]])
+      if (this.topo.edgeFaces[e].includes(g)) return e;
+    return -1;
+  }
+
+  private isEdgeAt(f: number, i: number, e: number): boolean {
+    const L = this.m.faces[f].length;
+    return this.topo.faceEdges[f][i] === e || this.topo.faceEdges[f][(i + L - 1) % L] === e;
+  }
+
+  /** Whether face f can interpolate vertex id without snapping it into f. */
+  compatible(f: number, id: number): boolean {
+    const i = this.m.faces[f].indexOf(this.vert[id]);
+    if (i < 0) return false;
+    const k = this.kind[id];
+    if (k === HomeKind.FACE) return this.ref[id] === f;
+    if (k === HomeKind.EDGE) return this.isEdgeAt(f, i, this.ref[id]);
+    return true;
+  }
+
+  /** Position `pt` snapped onto original edge e (the closest point of the segment). */
+  private snap(e: number, pt: number[]): number[] {
+    const P = this.m.positions;
+    const [a, c] = this.topo.edges[e];
+    const d = sub(P, c, a);
+    const dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let t = dd > 0 ? ((pt[0] - P[a * 3]) * d[0] + (pt[1] - P[a * 3 + 1]) * d[1] + (pt[2] - P[a * 3 + 2]) * d[2]) / dd : 0;
+    t = Math.min(1, Math.max(0, t));
+    return [P[a * 3] + d[0] * t, P[a * 3 + 1] + d[1] * t, P[a * 3 + 2] + d[2] * t];
+  }
+
+  /** UV of vertex id interpolated in original face f (`project`: f's UV at its position, no snapping). */
+  uvIn(f: number, id: number, project = false): number[] {
+    const v = this.vert[id];
+    const face = this.m.faces[f];
+    const i = face.indexOf(v);
+    const P = this.m.positions;
+    let pt = [this.b.positions[id * 3], this.b.positions[id * 3 + 1], this.b.positions[id * 3 + 2]];
+    if (i < 0) return cornerUV(this.m, f, 0, pt);
+    if (!project) {
+      const k = this.kind[id];
+      const at = [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]];
+      if (k === HomeKind.FACE && this.ref[id] !== f) {
+        const e = this.sharedEdge(f, i, this.ref[id]);
+        pt = e >= 0 ? this.snap(e, pt) : at;
+      } else if (k === HomeKind.EDGE) pt = this.isEdgeAt(f, i, this.ref[id]) ? this.snap(this.ref[id], pt) : at;
+      else if (k === HomeKind.VERT) pt = at;
+    }
+    return cornerUV(this.m, f, i, pt);
+  }
+
+  /**
+   * Per-corner UVs of a new face with corners `loop` cut from the original faces `candidates` (in order
+   * of preference); `continuous`: the UVs are continuous between those faces (no seam among them).
+   */
+  faceUVs(loop: number[], candidates: number[], continuous: boolean): number[] {
+    for (const f of candidates)
+      if (loop.every((x) => this.compatible(f, x))) return loop.flatMap((x) => this.uvIn(f, x));
+    if (continuous)
+      return loop.flatMap((x) => this.uvIn(candidates.find((f) => this.compatible(f, x)) ?? candidates[0], x));
+    let best = candidates[0];
+    let bestN = -1;
+    for (const f of candidates) {
+      const n = loop.filter((x) => this.compatible(f, x)).length;
+      if (n > bestN) [best, bestN] = [f, n];
+    }
+    return loop.flatMap((x) => this.uvIn(best, x));
+  }
+}
+
 interface PatchCtx {
   b: MeshBuilder;
-  vertUV: Map<number, number[]>;
+  uv: BevelUVs | null;
+  /** The original faces around the patch's vertex (UV sources), and whether their UVs are seamless. */
+  faces: number[];
+  continuous: boolean;
   material: number;
   smooth: boolean;
 }
 
-/** Adds a vertex patch as one polygon. */
+/** Adds a face of a vertex patch. */
 function addPatch(ctx: PatchCtx, loop: number[]): void {
-  const uvOf = (v: number) => ctx.vertUV.get(v) ?? [0, 0];
-  ctx.b.addFace(loop, ctx.material, ctx.smooth, loop.flatMap(uvOf));
-}
-
-/** Superellipse exponent of a `profile` value (as used by `profilePoint`). */
-function profileExponent(profile: number): number {
-  return Math.max(0.1, Math.min(40, 4 * profile));
+  ctx.b.addFace(loop, ctx.material, ctx.smooth, ctx.uv?.faceUVs(loop, ctx.faces, ctx.continuous) ?? null);
 }
 
 /**
  * The quad-grid patch of `sides` (S ≥ 2 segments each, consecutive sides sharing their end points) at
  * original vertex v, or false when the sides do not close up that way (the caller adds a polygon).
+ * `onVertex` gets every new vertex with its place in the grid (see `GridPatchContext`).
  */
 function gridPatch(
   ctx: PatchCtx,
@@ -164,15 +380,18 @@ function gridPatch(
   corner: number[],
   colors: ArrayLike<number> | null,
   v: number,
+  onVertex: (id: number, i: number, j: number, k: number) => void,
 ): boolean {
   const n = sides.length;
   if (n < 3 || S < 2) return false;
   for (let i = 0; i < n; i++) if (sides[i].ids[S] !== sides[(i + 1) % n].ids[0]) return false;
   const gctx: GridPatchContext = {
-    ...ctx,
+    b: ctx.b,
     colors,
     colorIndex: v,
     profileAt: (a, b, c, t) => profilePoint(a, b, c, t, profile),
+    onVertex,
+    addFace: (loop) => addPatch(ctx, loop),
   };
   fillGridPatch(gctx, sides, S, corner, patchFullness(profileExponent(profile)));
   return true;
@@ -180,7 +399,7 @@ function gridPatch(
 
 /** A profile side walked the other way. */
 function reversedSide(s: PatchSide): PatchSide {
-  return { ids: s.ids.slice().reverse(), a: s.b, b: s.a, c: s.c };
+  return { ids: s.ids.slice().reverse(), a: s.b, b: s.a, c: s.c, tag: s.tag };
 }
 
 export function bevelMesh(m: MeshData, p: BevelParams): MeshData {
@@ -293,8 +512,11 @@ function bevelEdges(
   const width = p.use_clamp_overlap ? Math.min(p.width, scaleLimit) : p.width;
 
   const b = new MeshBuilder({ colors: !!colors, uvs: !!m.uvs });
-  for (let v = 0; v < nv; v++) b.addVertex(P[v * 3], P[v * 3 + 1], P[v * 3 + 2], colors, v);
-  const vertUV = new Map<number, number[]>();
+  const uv = m.uvs ? new BevelUVs(m, topo, b) : null;
+  for (let v = 0; v < nv; v++) {
+    b.addVertex(P[v * 3], P[v * 3 + 1], P[v * 3 + 2], colors, v);
+    uv?.set(v, v, HomeKind.VERT);
+  }
   const pos = (i: number) => [b.positions[i * 3], b.positions[i * 3 + 1], b.positions[i * 3 + 2]];
 
   // slide points: one per (vertex, edge), averaged over the requesting faces
@@ -324,6 +546,7 @@ function bevelEdges(
       colors,
       r.v,
     );
+    uv?.set(idx, r.v, HomeKind.EDGE, r.e);
     slideVert.set(sk, idx);
     slideT.set(sk, t / l);
   }
@@ -344,11 +567,10 @@ function bevelEdges(
           colors,
           v,
         );
+        uv?.set(idx, v, HomeKind.FACE, f);
       } else if (c?.kind === 'SLIDE') idx = slideVert.get(`${v}:${c.e}`)!;
       cornerVert.set(ck(f, i), idx);
-      const uv = cornerUV(m, f, i, pos(idx));
-      cornerUVs.set(ck(f, i), uv);
-      if (!vertUV.has(idx)) vertUV.set(idx, uv);
+      cornerUVs.set(ck(f, i), cornerUV(m, f, i, pos(idx)));
     }
   }
   const cornerOf = (f: number, v: number) => ck(f, m.faces[f].indexOf(v));
@@ -380,12 +602,12 @@ function bevelEdges(
         ((mid[0] - P[v * 3]) * dir[0] + (mid[1] - P[v * 3 + 1]) * dir[1] + (mid[2] - P[v * 3 + 2]) * dir[2]) /
         (dl * dl);
       const C = [P[v * 3] + dir[0] * s, P[v * 3 + 1] + dir[1] * s, P[v * 3 + 2] + dir[2] * s];
-      const ua = vertUV.get(A) ?? [0, 0];
-      const ub = vertUV.get(B) ?? [0, 0];
       for (let j = 1; j < S; j++) {
         const q = profilePoint(pa, pb, C, j / S, p.profile);
         const idx = b.addVertex(q[0], q[1], q[2], colors, v);
-        vertUV.set(idx, [ua[0] + ((ub[0] - ua[0]) * j) / S, ua[1] + ((ub[1] - ua[1]) * j) / S]);
+        // each half of the profile belongs to the face (or slide edge) of its end; the middle is on e
+        if (2 * j === S) uv?.set(idx, v, HomeKind.EDGE, e);
+        else uv?.copy(idx, 2 * j < S ? A : B);
         arc.push(idx);
       }
       arcSpecs.set(key, { a: pa, b: pb, c: C });
@@ -418,12 +640,12 @@ function bevelEdges(
       const pa = pos(a1);
       const pb = pos(b1);
       const C = [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]];
-      const ua = vertUV.get(a1) ?? [0, 0];
-      const ub = vertUV.get(b1) ?? [0, 0];
       for (let j = 1; j < S; j++) {
         const q = profilePoint(pa, pb, C, j / S, p.profile);
         const idx = b.addVertex(q[0], q[1], q[2], colors, v);
-        vertUV.set(idx, [ua[0] + ((ub[0] - ua[0]) * j) / S, ua[1] + ((ub[1] - ua[1]) * j) / S]);
+        // the shared profile lies on both strips' middle lines at once: its middle is at v
+        if (2 * j === S) uv?.set(idx, v, HomeKind.VERT);
+        else uv?.copy(idx, 2 * j < S ? a1 : b1);
         arc.push(idx);
       }
     }
@@ -479,19 +701,15 @@ function bevelEdges(
   for (let e = 0; e < ne; e++) {
     if (!isB[e]) continue;
     const [u, w] = topo.edges[e];
-    const [fa] = stripFace(e);
+    const [fa, fb] = stripFace(e);
     const au = arcAt(e, u);
     const aw = arcAt(e, w);
     const mat = p.material >= 0 ? p.material : (m.faceMaterials[fa] ?? 0);
     const smooth = m.faceSmooth[fa] ?? false;
+    // quads on one side of the middle take that face's UVs; the middle quad of an odd count spans both
     for (let j = 0; j < S; j++) {
       const quad = [aw[j], au[j], au[j + 1], aw[j + 1]];
-      b.addFace(
-        quad,
-        mat,
-        smooth,
-        quad.flatMap((x) => vertUV.get(x) ?? [0, 0]),
-      );
+      b.addFace(quad, mat, smooth, uv?.faceUVs(quad, [fa, fb], !uv.seam(e)) ?? null);
     }
   }
 
@@ -514,7 +732,7 @@ function bevelEdges(
         for (const x of fa === fPrev ? arc : arc.slice().reverse()) push(x);
         const spec = arcSpecs.get(`${e}:${v}`);
         if (spec) {
-          const side = { ids: arc, ...spec };
+          const side = { ids: arc, ...spec, tag: e };
           sides.push(fa === fPrev ? side : reversedSide(side));
         }
       } else {
@@ -529,7 +747,9 @@ function bevelEdges(
     const f0 = ring.faces[0];
     const ctx: PatchCtx = {
       b,
-      vertUV,
+      uv,
+      faces: ring.faces,
+      continuous: !uv?.seamAt(v),
       material: p.material >= 0 ? p.material : (m.faceMaterials[f0] ?? 0),
       smooth: m.faceSmooth[f0] ?? false,
     };
@@ -551,7 +771,7 @@ function bevelEdges(
         const merged = planar
           ? mergeLoops(
               { verts: fl, uvs: b.uvs ? b.uvs[fi] : null },
-              { verts: loop, uvs: b.uvs ? loop.flatMap((x) => vertUV.get(x) ?? [0, 0]) : null },
+              { verts: loop, uvs: uv ? loop.flatMap((x) => uv.uvIn(keepers[0], x, true)) : null },
             )
           : null;
         if (merged) {
@@ -565,7 +785,26 @@ function bevelEdges(
     }
     // three or more beveled edges, each pair of neighbours ending on one shared bevel vertex: quad grid
     const corner = [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]];
-    if (gridPatch(ctx, sides.reverse().map(reversedSide), S, p.profile, corner, colors, v)) continue;
+    const gsides = sides.reverse().map(reversedSide);
+    // UV homes of the grid vertices: sector i lies in the face at its corner (side i's first vertex);
+    // with even S the sector boundaries run over the beveled edges and the center sits at v
+    const half = S / 2;
+    const sectorFace = (i: number): number => {
+      const c = gsides[i].ids[0];
+      const f = uv?.homeFace(c) ?? -1;
+      if (f >= 0) return f;
+      const es = uv?.homeEdge(c) ?? -1;
+      const fs = es >= 0 ? topo.edgeFaces[es] : ring.faces;
+      return fs.find((g) => topo.edgeFaces[gsides[i].tag!].includes(g)) ?? fs[0];
+    };
+    const onVertex = (id: number, i: number, j: number, k: number) => {
+      if (!uv) return;
+      if (i < 0) uv.set(id, v, HomeKind.VERT);
+      else if (k === half) uv.set(id, v, HomeKind.EDGE, gsides[i].tag);
+      else if (j === half) uv.set(id, v, HomeKind.EDGE, gsides[(i + gsides.length - 1) % gsides.length].tag);
+      else uv.set(id, v, HomeKind.FACE, sectorFace(i));
+    };
+    if (gridPatch(ctx, gsides, S, p.profile, corner, colors, v, onVertex)) continue;
     addPatch(ctx, loop);
   }
   // edge attributes of non-beveled edges are kept on the edge (and its slid parts)
@@ -616,7 +855,11 @@ function bevelVertices(
     }
   }
   const b = new MeshBuilder({ colors: !!colors, uvs: !!m.uvs });
-  for (let v = 0; v < nv; v++) b.addVertex(P[v * 3], P[v * 3 + 1], P[v * 3 + 2], colors, v);
+  const uv = m.uvs ? new BevelUVs(m, topo, b) : null;
+  for (let v = 0; v < nv; v++) {
+    b.addVertex(P[v * 3], P[v * 3 + 1], P[v * 3 + 2], colors, v);
+    uv?.set(v, v, HomeKind.VERT);
+  }
   const cut = new Map<string, number>(); // `${v}:${e}` → vertex on edge e at distance `width` from v
   const cutAt = (v: number, e: number) => {
     const key = `${v}:${e}`;
@@ -632,11 +875,11 @@ function bevelVertices(
         colors,
         v,
       );
+      uv?.set(idx, v, HomeKind.EDGE, e);
       cut.set(key, idx);
     }
     return idx;
   };
-  const vertUV = new Map<number, number[]>();
   // per face corner: the arc from the cut on the incoming edge to the cut on the outgoing edge
   const cornerArc = new Map<string, number[]>();
   const cornerSpec = new Map<string, { a: number[]; b: number[]; c: number[] }>(); // its profile
@@ -649,9 +892,7 @@ function bevelVertices(
       const v = face[i];
       if (!sel[v]) {
         loop.push(v);
-        const uv = cornerUV(m, f, i, [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]]);
-        luv.push(...uv);
-        if (!vertUV.has(v)) vertUV.set(v, uv);
+        luv.push(...cornerUV(m, f, i, [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]]));
         continue;
       }
       const eIn = topo.faceEdges[f][(i + L - 1) % L];
@@ -664,16 +905,16 @@ function bevelVertices(
       const pv = [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]];
       for (let j = 1; j < S; j++) {
         const q = profilePoint(pa, pc, pv, j / S, p.profile);
-        arc.push(b.addVertex(q[0], q[1], q[2], colors, v));
+        const idx = b.addVertex(q[0], q[1], q[2], colors, v);
+        uv?.set(idx, v, HomeKind.FACE, f);
+        arc.push(idx);
       }
       arc.push(c);
       cornerArc.set(`${f}:${i}`, arc);
       cornerSpec.set(`${f}:${i}`, { a: pa, b: pc, c: pv });
       for (const x of arc) {
-        const uv = cornerUV(m, f, i, [b.positions[x * 3], b.positions[x * 3 + 1], b.positions[x * 3 + 2]]);
         loop.push(x);
-        luv.push(...uv);
-        if (!vertUV.has(x)) vertUV.set(x, uv);
+        luv.push(...cornerUV(m, f, i, [b.positions[x * 3], b.positions[x * 3 + 1], b.positions[x * 3 + 2]]));
       }
     }
     b.addFace(loop, m.faceMaterials[f] ?? 0, m.faceSmooth[f] ?? false, luv);
@@ -688,18 +929,30 @@ function bevelVertices(
       const key = `${ring.faces[k]}:${ring.corners[k]}`;
       const arc = cornerArc.get(key)!;
       for (let j = arc.length - 1; j >= 0; j--) if (seq[seq.length - 1] !== arc[j]) seq.push(arc[j]);
-      sides.push(reversedSide({ ids: arc, ...cornerSpec.get(key)! }));
+      sides.push(reversedSide({ ids: arc, ...cornerSpec.get(key)!, tag: ring.faces[k] }));
     }
     while (seq.length > 1 && seq[0] === seq[seq.length - 1]) seq.pop();
     if (seq.length < 3) continue;
     const f0 = ring.faces[0];
     const ctx: PatchCtx = {
       b,
-      vertUV,
+      uv,
+      faces: ring.faces,
+      continuous: !uv?.seamAt(v),
       material: p.material >= 0 ? p.material : (m.faceMaterials[f0] ?? 0),
       smooth: m.faceSmooth[f0] ?? false,
     };
-    if (!gridPatch(ctx, sides, S, p.profile, [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]], colors, v))
+    // UV homes of the grid vertices: side i lies in one face and sector i spans the corner between
+    // side i − 1 and side i, which meet on an edge: the half nearer each side belongs to its face,
+    // the diagonal from that corner to the center lies over the edge, the center at v
+    const n = sides.length;
+    const onVertex = (id: number, i: number, j: number, k: number) => {
+      if (!uv) return;
+      if (i < 0) uv.set(id, v, HomeKind.VERT);
+      else if (j === k) uv.set(id, v, HomeKind.EDGE, uv.homeEdge(sides[i].ids[0]));
+      else uv.set(id, v, HomeKind.FACE, sides[j < k ? i : (i + n - 1) % n].tag);
+    };
+    if (!gridPatch(ctx, sides, S, p.profile, [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]], colors, v, onVertex))
       addPatch(ctx, seq);
   }
   for (const key in m.edgeAttrs) {

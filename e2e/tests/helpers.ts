@@ -415,6 +415,11 @@ export function crop(img: RgbaImage, r: Rect): RgbaImage {
 
 // ---------------------------------------------------------------- rendering in the editor
 
+/** A screenshot of the whole 3D viewport, overlays included. */
+export async function viewportShot(page: Page): Promise<RgbaImage> {
+  return decodePng(await page.getByTestId('viewport').screenshot());
+}
+
 /**
  * A screenshot of the middle of the 3D viewport, `size` pixels square: what the viewport draws
  * around the world origin in the default view, away from its overlays (header text, statistics,

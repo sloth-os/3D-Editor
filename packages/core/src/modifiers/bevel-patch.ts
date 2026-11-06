@@ -28,23 +28,29 @@ export interface PatchSide {
   a: number[];
   b: number[];
   c: number[];
+  /** The caller's tag for the side (the beveled edge or the face it lies in). */
+  tag?: number;
 }
 
 export interface GridPatchContext {
   b: MeshBuilder;
-  /** Per-vertex UVs of the builder vertices (read for the sides, written for new vertices). */
-  vertUV: Map<number, number[]>;
-  material: number;
-  smooth: boolean;
   /** Vertex colour source (the original vertex's colour is copied to new vertices). */
   colors: ArrayLike<number> | null;
   colorIndex: number;
   /** Point of a side's profile at t ∈ [0, 1]. */
   profileAt: (a: number[], b: number[], c: number[], t: number) => number[];
+  /**
+   * Called for every new vertex with its place in the grid: sector `i` (the sector around side i's
+   * first corner), row `j` (0 = side i) and column `k` (0 = side i − 1); the center vertex of an
+   * even patch has i = −1 and j = k = S / 2. The caller derives the vertex's UV source from it.
+   */
+  onVertex?: (id: number, i: number, j: number, k: number) => void;
+  /** Adds one face of the patch (the caller sets its material, smoothing and UVs). */
+  addFace: (loop: number[]) => void;
 }
 
-/** Point components: position, UV and the weight of the control center (for placing it afterwards). */
-const D = 6;
+/** Point components: position and the weight of the control center (for placing it afterwards). */
+const D = 4;
 type Pt = Float64Array;
 
 interface Level {
@@ -257,13 +263,10 @@ export function fillGridPatch(
   fullness: number,
 ): void {
   const n = sides.length;
-  const uvOf = (v: number) => ctx.vertUV.get(v) ?? [0, 0];
-  const ends = sides.map((s) => [uvOf(s.ids[0]), uvOf(s.ids[S])]);
   const sample = (i: number, t: number): Pt => {
     const s = sides[i];
     const q = t <= 0 ? s.a : t >= 1 ? s.b : ctx.profileAt(s.a, s.b, s.c, t);
-    const [ua, ub] = ends[i];
-    return Float64Array.of(q[0], q[1], q[2], ua[0] + (ub[0] - ua[0]) * t, ua[1] + (ub[1] - ua[1]) * t, 0);
+    return Float64Array.of(q[0], q[1], q[2], 0);
   };
   // control mesh: every sector one quad (corner, middle of its side, center, middle of the previous side)
   const pts: Pt[] = [];
@@ -271,7 +274,7 @@ export function fillGridPatch(
   for (let i = 0; i < n; i++) ring.push(pts.push(sample(i, 0)) - 1, pts.push(sample(i, 0.5)) - 1);
   const center = average(ring.filter((_, r) => r % 2 === 0).map((r) => pts[r]));
   const A = [center[0], center[1], center[2]];
-  center[5] = 1;
+  center[3] = 1;
   const c0 = pts.push(center) - 1;
   const grid = sides.map((_, i) => [
     [ring[2 * i], ring[2 * i + 1]],
@@ -280,18 +283,18 @@ export function fillGridPatch(
   let lv: Level = { N: 2, pts, ring, grid };
   while (lv.N < S) lv = refine(lv, n, sample);
   // place the control center so that the patch center lands on its target: every point depends
-  // linearly on the control center, with the weight carried in component 5
+  // linearly on the control center, with the weight carried in component 3
   const h = lv.N / 2;
   const pc = lv.pts[lv.grid[0][h][h]];
-  const lambda = pc[5];
+  const lambda = pc[3];
   if (lambda > 1e-9) {
     const delta = [0, 1, 2].map((q) => (A[q] + (corner[q] - A[q]) * fullness - pc[q]) / lambda);
     // (boundary points have weight 0; a point object may be listed twice)
     const seen = new Set<Pt>();
     for (const p of lv.pts) {
-      if (p[5] === 0 || seen.has(p)) continue;
+      if (p[3] === 0 || seen.has(p)) continue;
       seen.add(p);
-      for (let q = 0; q < 3; q++) p[q] += p[5] * delta[q];
+      for (let q = 0; q < 3; q++) p[q] += p[3] * delta[q];
     }
   }
   // round profiles on one sphere (a cube-like corner): the patch is part of that sphere
@@ -300,14 +303,14 @@ export function fillGridPatch(
   // columns k ≤ m (plus the center for even S); the other grid positions are shared with neighbours
   const m = Math.floor(S / 2);
   const odd = S % 2;
-  const newVertex = (p: Pt): number => {
+  const newVertex = (p: Pt, i: number, j: number, k: number): number => {
     if (sphere) {
       const d = [p[0] - sphere.c[0], p[1] - sphere.c[1], p[2] - sphere.c[2]];
       const l = Math.hypot(d[0], d[1], d[2]);
       if (l > 1e-12 * sphere.r) for (let q = 0; q < 3; q++) p[q] = sphere.c[q] + (d[q] * sphere.r) / l;
     }
     const id = ctx.b.addVertex(p[0], p[1], p[2], ctx.colors, ctx.colorIndex);
-    ctx.vertUV.set(id, [p[3], p[4]]);
+    ctx.onVertex?.(id, i, j, k);
     return id;
   };
   const canon: number[][][] = sides.map((_, i) => {
@@ -317,13 +320,13 @@ export function fillGridPatch(
       for (let k = 0; k <= m; k++) {
         if (j === 0) row.push(sides[i].ids[k]);
         else if (k === 0) row.push(sides[(i + n - 1) % n].ids[S - j]);
-        else row.push(newVertex(sampleGrid(lv, lv.grid[i], (j * lv.N) / S, (k * lv.N) / S)));
+        else row.push(newVertex(sampleGrid(lv, lv.grid[i], (j * lv.N) / S, (k * lv.N) / S), i, j, k));
       }
       rows.push(row);
     }
     return rows;
   });
-  const centerId = odd ? -1 : newVertex(pc);
+  const centerId = odd ? -1 : newVertex(pc, -1, m, m);
   const at = (i0: number, j0: number, k0: number): number => {
     let [i, j, k] = [i0, j0, k0];
     for (let guard = 0; guard < 4; guard++) {
@@ -334,7 +337,7 @@ export function fillGridPatch(
     }
     throw new Error(`bevel patch: no grid point (${i0}, ${j0}, ${k0})`);
   };
-  const face = (loop: number[]) => ctx.b.addFace(loop, ctx.material, ctx.smooth, loop.flatMap(uvOf));
+  const face = ctx.addFace;
   for (let i = 0; i < n; i++)
     for (let j = 0; j < m; j++)
       for (let k = 0; k < m + odd; k++)

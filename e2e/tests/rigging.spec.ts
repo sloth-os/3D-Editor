@@ -1,5 +1,17 @@
 import { test, expect } from '@playwright/test';
-import { PLAIN, callJson, fieldNumber, mcpConnect, menuPath, newProject, setNumberField } from './helpers';
+import {
+  PLAIN,
+  callJson,
+  changedFraction,
+  fieldNumber,
+  mcpConnect,
+  menuPath,
+  newProject,
+  region,
+  setNumberField,
+  viewportShot,
+  type RgbaImage,
+} from './helpers';
 
 type Vec3 = [number, number, number];
 interface BoneInfo {
@@ -12,6 +24,13 @@ interface BoneInfo {
 }
 
 const dist = (a: number[], b: number[]) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+/**
+ * Share of the viewport above the default cube (where the bones above its top, 1 m high, are drawn
+ * in the default view) that differs from `before`.
+ */
+const bonesChange = (before: RgbaImage, now: RgbaImage) =>
+  changedFraction(before, now, region(now, 0.45, 0.25, 0.12, 0.235));
 
 test.describe('rigging', () => {
   test('armature: bones list, an IK chain and posing, with an agent editing the same rig live', async ({
@@ -56,6 +75,7 @@ test.describe('rigging', () => {
     await expect(page.getByTestId('outliner-Armature')).toHaveClass(/active/);
     await page.getByTestId('bone-Hand').click();
     await expect(page.locator('.panel-header', { hasText: 'Pose: Hand' })).toBeVisible();
+    const straight = await viewportShot(page);
     await expect(page.getByTestId('pose-ik-target').locator('option')).toContainText(['IKTarget']);
     await page.getByTestId('pose-ik-target').selectOption({ label: 'IKTarget' });
     await expect(page.getByTestId('pose-ik-chain')).toContainText('2');
@@ -70,15 +90,19 @@ test.describe('rigging', () => {
       .toBeLessThan(0.01);
     expect((await bone('Bone')).posed_tail_world).toEqual([0, 0, 1]);
     expect((await bone('Bone.001')).posed_head_world).toEqual([0, 0, 1]);
+    // the viewport draws the bent chain
+    await expect.poll(async () => bonesChange(straight, await viewportShot(page))).toBeGreaterThan(0.01);
 
     // pose the root bone in the Pose panel: 30° about its X axis tilts the whole chain
     await page.getByTestId('bone-Bone').click();
     await expect(page.locator('.panel-header', { hasText: 'Pose: Bone' })).toBeVisible();
+    const rest = await viewportShot(page);
     await setNumberField(page, 'pose-rotation-0', 30);
     await expect(page.getByTestId('pose-rotation-0')).toContainText('30°');
     await expect
       .poll(async () => dist((await bone('Bone')).posed_tail_world, [0, -0.5, 0.866]))
       .toBeLessThan(0.002);
+    await expect.poll(async () => bonesChange(rest, await viewportShot(page))).toBeGreaterThan(0.01);
     // the IK chain follows its new root and still reaches the target
     expect(dist((await bone('Bone.001')).posed_head_world, [0, -0.5, 0.866])).toBeLessThan(0.002);
     expect(dist((await bone('Hand')).posed_tail_world, [1, 0, 1.6])).toBeLessThan(0.01);
@@ -96,6 +120,7 @@ test.describe('rigging', () => {
     await page.getByTestId('pose-clear').click();
     await expect.poll(() => fieldNumber(page, 'pose-rotation-2')).toBe(0);
     await expect.poll(async () => (await bone('Bone')).posed_tail_world).toEqual([0, 0, 1]);
+    await expect.poll(async () => bonesChange(rest, await viewportShot(page))).toBeLessThan(0.001);
     await client.close();
   });
 });
