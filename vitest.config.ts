@@ -10,6 +10,10 @@ export default defineConfig({
           root: './packages/core',
           include: ['test/**/*.test.ts'],
           environment: 'node',
+          // geometry, physics and path-tracing tests are CPU heavy; on shared CI runners and
+          // under coverage instrumentation they can take several times longer than locally
+          testTimeout: 30_000,
+          hookTimeout: 30_000,
         },
       },
       {
