@@ -9,6 +9,8 @@ import { cloneMesh } from '../mesh/types';
 import { ANIMATABLE, isAnimatable, propertyLength } from '../anim/properties';
 import { bezierHandles, sanitizeSpline } from '../curve/spline';
 import { layoutText, textOutline } from '../curve/text';
+import { curveToMeshData } from '../curve/to-mesh';
+import { meshBounds } from '../mesh/types';
 import type { EvaluatedScene } from '../eval/evaluate';
 import { fcurveKey } from '../doc/scene-doc';
 import type { OperatorContext } from './context';
@@ -1458,7 +1460,9 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
         'Add a text object (Blender FONT) using the built-in geometric sans-serif font. The text lies in the local XY ' +
         'plane facing +Z with its first baseline at the origin (TOP_BASELINE). size = em height in metres (capitals ' +
         'are 0.7 × size); extrude gives thickness (total 2 × extrude), bevel_depth rounds the edges. Supports printable ' +
-        'ASCII and Latin-1 letters; "\\n" starts a new line. Returns {object, name, curve, lines, width, height, bounds}.',
+        'ASCII and Latin-1 letters; "\\n" starts a new line. Returns {object, name, curve, lines, ' +
+        TEXT_EXTENT_HELP +
+        '}.',
       category: 'Add',
       redoable: true,
       schema: z.object({
@@ -1515,15 +1519,7 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
         ] as const)
           (data as Record<string, unknown>)[k] = rest[k];
         const r = addCurveObject(ctx, 'FONT', name ?? 'Text', data, { location, rotation, scale });
-        const layout = layoutText(ctx.doc.getCurve(r.curve)!);
-        const b = layout.bounds;
-        return {
-          ...r,
-          lines: layout.lineCount,
-          width: b.max[0] - b.min[0],
-          height: b.max[1] - b.min[1],
-          bounds: { min: b.min, max: b.max },
-        };
+        return { ...r, ...textExtent(ctx.doc.getCurve(r.curve)!) };
       },
     }),
   );
@@ -1534,7 +1530,9 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
       label: 'Set Text',
       description:
         'Change the text (body) and/or text layout properties (size, spacing, shear, alignment, offsets) of a text ' +
-        'object. Geometry (extrude, bevel, fill) is set with curve.properties_set. Returns {body, lines, width, height, bounds}.',
+        'object. Geometry (extrude, bevel, fill) is set with curve.properties_set. Returns {body, lines, ' +
+        TEXT_EXTENT_HELP +
+        '}.',
       category: 'Text',
       schema: z.object({
         object: objectRef,
@@ -1554,16 +1552,37 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
         ctx.doc.updateCurve(curve.id, patch);
         rekeyCurve(ctx, curve.id, patch);
         const now = ctx.doc.getCurve(curve.id)!;
-        const layout = layoutText(now);
-        const b = layout.bounds;
-        return {
-          body: now.body,
-          lines: layout.lineCount,
-          width: b.max[0] - b.min[0],
-          height: b.max[1] - b.min[1],
-          bounds: { min: b.min, max: b.max },
-        };
+        return { body: now.body, ...textExtent(now) };
       },
     }),
   );
+}
+
+const TEXT_EXTENT_HELP =
+  'width, height, bounds: the layout box from the font metrics (advance widths, ascent and descent: what ' +
+  'align_x / align_y place, in object units without object scale), ink_width, ink_height, ink_bounds: the ' +
+  'extent of the letters themselves (narrower than the layout box by the side bearings; offset and bevel ' +
+  'included; what scene.measure reports for an unscaled, unrotated text; null without visible characters)';
+
+/** Line count, layout box and ink extent of a text datablock (see TEXT_EXTENT_HELP). */
+function textExtent(curve: CurveData) {
+  const layout = layoutText(curve);
+  const b = layout.bounds;
+  let ink: { min: [number, number]; max: [number, number] } | null = null;
+  try {
+    const mesh = curveToMeshData(curve, { forRender: false, isText: true });
+    const mb = mesh && mesh.positions.length ? meshBounds(mesh) : null;
+    if (mb) ink = { min: [mb.min[0], mb.min[1]], max: [mb.max[0], mb.max[1]] };
+  } catch {
+    ink = null;
+  }
+  return {
+    lines: layout.lineCount,
+    width: b.max[0] - b.min[0],
+    height: b.max[1] - b.min[1],
+    bounds: { min: b.min, max: b.max },
+    ink_width: ink ? ink.max[0] - ink.min[0] : null,
+    ink_height: ink ? ink.max[1] - ink.min[1] : null,
+    ink_bounds: ink,
+  };
 }

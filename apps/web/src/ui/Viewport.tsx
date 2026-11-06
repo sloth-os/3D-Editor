@@ -245,9 +245,10 @@ function Sidebar({ s }: { s: ProjectSession }) {
   );
 }
 
-/** Statistics/info overlay in the top-left corner (Blender style). */
-function InfoOverlay({ s }: { s: ProjectSession }) {
+/** Statistics/info overlay in the top-left corner (Blender style); hidden with the overlays. */
+export function InfoOverlay({ s }: { s: ProjectSession }) {
   void s.revision.value;
+  if (!s.view.overlays.value) return null;
   const frame = s.state.$frame.value;
   const active = s.state.$activeId.value ? s.doc.getObject(s.state.$activeId.value) : null;
   const label = s.view.viewLabel.value;
@@ -283,17 +284,19 @@ function InfoOverlay({ s }: { s: ProjectSession }) {
   );
 }
 
-function CameraFrame({ engine }: { engine: ViewportEngine }) {
+/** The camera frame and passepartout of the camera view (an overlay, hidden with the overlays). */
+export function CameraFrame({ engine }: { engine: ViewportEngine }) {
   const [, setTick] = useState(0);
   useEffect(() => {
     const cb = () => setTick((t) => t + 1);
     engine.onAfterRender.add(cb);
     return () => engine.onAfterRender.delete(cb);
   }, [engine]);
+  if (!engine.session.view.overlays.value) return null;
   const r = engine.cameraFrameRect();
   if (!r) return null;
   return (
-    <div class="viewport-overlay" style={{ inset: 0 }}>
+    <div class="viewport-overlay" style={{ inset: 0 }} data-testid="camera-frame">
       <div
         style={{
           position: 'absolute',
@@ -309,7 +312,8 @@ function CameraFrame({ engine }: { engine: ViewportEngine }) {
   );
 }
 
-function PeerCursors({ s, engine }: { s: ProjectSession; engine: ViewportEngine }) {
+/** Other people's 3D cursors (an overlay, hidden with the overlays). */
+export function PeerCursors({ s, engine }: { s: ProjectSession; engine: ViewportEngine }) {
   const peers = s.peers.value;
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -317,6 +321,7 @@ function PeerCursors({ s, engine }: { s: ProjectSession; engine: ViewportEngine 
     engine.onAfterRender.add(cb);
     return () => engine.onAfterRender.delete(cb);
   }, [engine]);
+  if (!s.view.overlays.value) return null;
   return (
     <>
       {peers

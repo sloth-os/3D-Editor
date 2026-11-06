@@ -409,11 +409,16 @@ export function Row(p: {
   label?: string;
   children: ComponentChildren;
   full?: boolean;
+  /**
+   * The label column is as wide as the label instead of 40% of the row, for short labels in nested
+   * list entries (a driver variable's Target and Path) whose values need the width.
+   */
+  compact?: boolean;
   /** Tooltip of the label (e.g. the property description). */
   title?: string;
 }) {
   return (
-    <div class={`prop-row ${p.full ? 'full' : ''}`}>
+    <div class={`prop-row ${p.full ? 'full' : ''} ${p.compact ? 'compact' : ''}`}>
       {!p.full && <label title={p.title}>{p.label}</label>}
       <div>{p.children}</div>
     </div>

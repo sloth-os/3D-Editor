@@ -12,6 +12,7 @@ import {
 } from './settings';
 import type { AnimTargetType, CollisionShape, DriverData, FCurve } from '../doc/types';
 import { meshKey } from './mesh-key';
+import { clearCollisionShapeCache } from './shapes';
 import {
   Simulation,
   compareBodyOrder,
@@ -369,6 +370,8 @@ export function inspectRigidBodies(doc: SceneDoc, host: RigidBodyHost): RigidBod
 export function freeRigidBodyCache(doc: SceneDoc): RigidBodyCacheInfo | null {
   const info = rigidBodyCacheInfo(doc);
   caches.delete(cacheKey(doc));
+  // and the collision shapes shared between simulations: the next one starts from scratch
+  clearCollisionShapeCache();
   return info;
 }
 

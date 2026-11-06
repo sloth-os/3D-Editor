@@ -1086,8 +1086,9 @@ function VariableEditor(p: {
           <Icon name="close" size={12} />
         </button>
       </div>
+      {/* compact rows: the path needs the width (e.g. rotation_euler, pose.bones["Arm"].location) */}
       {pickable && (
-        <Row label="Target">
+        <Row label="Target" compact>
           <SelectField
             value={v.target_id}
             testId={`${p.testId}-target`}
@@ -1100,18 +1101,19 @@ function VariableEditor(p: {
           />
         </Row>
       )}
-      <Row label="Path">
+      <Row label="Path" compact>
         <div style={{ display: 'flex', gap: '2px' }}>
-          <div style={{ flex: 1 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
             <TextField
               value={v.path}
               list="driver-path-suggestions"
               testId={`${p.testId}-path`}
+              title={`${v.path}[${v.index}]`}
               ariaLabel="Data path the variable reads"
               onChange={(path) => path.trim() && p.onChange({ ...v, path: path.trim() })}
             />
           </div>
-          <div style={{ width: '44px' }} title="Channel index (0 = X / R, 1 = Y / G, 2 = Z / B)">
+          <div style={{ width: '40px', flex: 'none' }} title="Channel index (0 = X / R, 1 = Y / G, 2 = Z / B)">
             <NumberField
               value={v.index}
               integer

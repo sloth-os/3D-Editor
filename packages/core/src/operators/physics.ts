@@ -11,7 +11,8 @@ import {
   inspectRigidBodies,
   type RigidBodyHost,
 } from '../physics/rigid-body';
-import { buildCollisionShape } from '../physics/shapes';
+import { buildCollisionShape, cachedCollisionShape } from '../physics/shapes';
+import { shapeKey } from '../physics/simulation';
 import { decomposeRigid } from '../physics/vmath';
 import {
   COLLISION_SHAPES,
@@ -112,6 +113,16 @@ const settingsShape = {
     ),
 };
 
+/** Custom property rigidbody.bake_to_keyframes sets on the objects it bakes ('frames A-B step S'). */
+const BAKED_PROP = 'rigid_body_baked';
+
+/** The bake note of an object baked with rigidbody.bake_to_keyframes (null for others). */
+function bakedOf(o: ObjectData): string | null {
+  if (o.rigid_body) return null;
+  const v = o.custom_props?.[BAKED_PROP];
+  return v === undefined ? null : String(v);
+}
+
 const typeEnum = z.enum(['ACTIVE', 'PASSIVE']);
 const TYPE_HELP =
   'ACTIVE bodies are simulated (fall, collide, bounce); PASSIVE bodies are static colliders (floors, walls, ' +
@@ -177,7 +188,10 @@ function thicknessChecker(doc: SceneDoc): ThicknessCheck {
     const key = `${o.data}|${rb.collision_shape}|${dynamic}|${scale.join(',')}`;
     let note = memo.get(key);
     if (note === undefined) {
-      const built = buildCollisionShape(rb.collision_shape, mesh, scale, { dynamic });
+      // shared with the simulation's shapes (a hull of a high-poly mesh is built once, not per call)
+      const built = cachedCollisionShape(shapeKey(mesh, rb, scale), mesh, () =>
+        buildCollisionShape(rb.collision_shape, mesh, scale, { dynamic }),
+      );
       // the notes say how it is simulated (a flat static floor needs no note: only its back changes)
       note =
         'error' in built || !built.thickened ? null : (built.notes.find((n) => n.includes('thick')) ?? null);
@@ -284,7 +298,12 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
           if (existing && existing.type !== 'ACTIVE' && p.type === 'ACTIVE' && patch.enabled === undefined)
             base.enabled = true;
           const rb: RigidBodyData = { ...base, ...patch };
-          doc.updateObject(o.id, { rigid_body: rb });
+          if (o.custom_props && BAKED_PROP in o.custom_props) {
+            // simulated again: no longer a baked body
+            const props = { ...o.custom_props };
+            delete props[BAKED_PROP];
+            doc.updateObject(o.id, { rigid_body: rb, custom_props: props });
+          } else doc.updateObject(o.id, { rigid_body: rb });
           if (!existing) created++;
           objects.push(describeSettings(o, rb, settingWarnings(ctx, o, rb, thickness)));
         }
@@ -484,8 +503,9 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
         'physics, e.g. to edit the motion or export it. Keys are relative to the parent; keys whose value ' +
         'equals both neighbours (within 1e-4) are dropped; existing keys of those channels inside the range ' +
         'are replaced, and drivers and F-curve modifiers on them are removed so the keys reproduce the ' +
-        'simulation. Other rigid bodies stay simulated (without the baked objects). Returns the keyframes ' +
-        'written per object.',
+        'simulation. Other rigid bodies stay simulated (without the baked objects). The baked objects get the ' +
+        "custom property rigid_body_baked ('frames A-B step S'), so rigidbody.describe keeps listing them " +
+        '(motion KEYFRAMED). Returns the keyframes written per object.',
       category: 'Physics',
       poll: pollObjectMode,
       schema: z.object({
@@ -591,7 +611,11 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
             }
           if (o.constraints?.some((c) => !c.mute))
             ctx.report('WARNING', `'${o.name}' has constraints: they now apply on top of the baked keys`);
-          doc.updateObject(o.id, { rigid_body: null });
+          // marks the object as a baked body (rigidbody.describe lists it as KEYFRAMED)
+          doc.updateObject(o.id, {
+            rigid_body: null,
+            custom_props: { ...o.custom_props, [BAKED_PROP]: `frames ${start}-${end} step ${p.step}` },
+          });
           results.push({ object: o.id, name: o.name, keyframes });
         }
         if (removedDrivers) ctx.report('WARNING', `Removed ${removedDrivers} driver(s) on baked channels`);
@@ -648,7 +672,10 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
         'KINEMATIC (animated), FROZEN (ACTIVE with Dynamic off) or STATIC, whether it has come to rest ' +
         '(sleeping; null when unknown for that frame)) with its ' +
         'world location / rotation at `frame` (simulated when the simulation drives it), plus problems such as ' +
-        'non-mesh objects. Simulates up to `frame` if needed.',
+        'non-mesh objects. Bodies baked with rigidbody.bake_to_keyframes are listed too (rigid_body null, ' +
+        "motion KEYFRAMED, baked: 'frames A-B step S'; `baked_objects` counts them), and any requested object " +
+        'without a rigid body reports motion KEYFRAMED when keyframes or drivers move it (else null). ' +
+        'Simulates up to `frame` if needed.',
       category: 'Physics',
       undo: false,
       schema: z.object({
@@ -681,8 +708,17 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
               if (!o) throw new OperatorError(`Object '${r}' not found`, 'NOT_FOUND');
               return o;
             })
-          : doc.listObjects().filter((o) => o.rigid_body);
+          : doc.listObjects().filter((o) => o.rigid_body || bakedOf(o) !== null);
         const issues = info?.issues ?? [];
+        // objects whose transform keyframes or drivers move (baked bodies, animated colliders …)
+        const transformPaths = new Set(['location', 'rotation_euler', 'rotation_quaternion', 'scale']);
+        const keyed = new Set<string>();
+        for (const fc of doc.listFCurves())
+          if (fc.target_type === 'object' && !fc.mute && fc.keyframes.length && transformPaths.has(fc.path))
+            keyed.add(fc.target_id);
+        for (const d of doc.listDrivers())
+          if (d.target_type === 'object' && !d.mute && transformPaths.has(d.path)) keyed.add(d.target_id);
+        const baked = doc.listObjects().filter((o) => bakedOf(o) !== null).length;
         const simulatedEnd = simulatedFrameEnd(worldParams(scene));
         const atFrame = Math.ceil(Math.min(frame, simulatedEnd));
         return {
@@ -697,6 +733,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
             ? { frame_start: info.frame_start, frame_end: info.frame_end, simulated_to: info.simulated_to }
             : null,
           error: simError,
+          ...(baked ? { baked_objects: baked } : {}),
           objects: objects.map((o) => {
             const rb = sanitizeRigidBody(o.rigid_body);
             const m = fs.world(o.id);
@@ -708,8 +745,9 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
               object: o.id,
               name: o.name,
               rigid_body: rb,
+              ...(bakedOf(o) !== null ? { baked: bakedOf(o) } : {}),
               simulated_shape: body?.collision_shape ?? null,
-              motion: body?.motion ?? null,
+              motion: body?.motion ?? (!rb && keyed.has(o.id) ? 'KEYFRAMED' : null),
               // sleep state is known for the last simulated frame only
               sleeping: body && info && info.simulated_to === atFrame ? body.sleeping : null,
               simulated: !!simulated?.has(o.id),

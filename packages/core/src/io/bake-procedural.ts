@@ -557,6 +557,55 @@ export interface BakedMaterialTextures {
   warnings: string[];
 }
 
+/**
+ * Fraction of a mesh's UV layout used by more than one face: texels of an N × N grid over the UV
+ * square covered by the UV triangles of two or more faces, relative to the covered texels (0 without
+ * UVs). Position-dependent bakes (GENERATED/OBJECT mapping) into overlapping UVs are wrong for all
+ * but one of the surfaces sharing the texels.
+ */
+export function uvOverlapFraction(mesh: MeshData, N = 256): number {
+  if (!hasUvs(mesh)) return 0;
+  const cover = new Uint8Array(N * N);
+  const stamp = new Int32Array(N * N).fill(-1);
+  let covered = 0;
+  let twice = 0;
+  for (let fi = 0; fi < mesh.faces.length; fi++) {
+    const uv = mesh.uvs![fi];
+    const L = mesh.faces[fi].length;
+    if (!uv || uv.length < L * 2) continue;
+    for (let t = 1; t + 1 < L; t++) {
+      const x0 = uv[0] * N;
+      const y0 = uv[1] * N;
+      const x1 = uv[t * 2] * N;
+      const y1 = uv[t * 2 + 1] * N;
+      const x2 = uv[t * 2 + 2] * N;
+      const y2 = uv[t * 2 + 3] * N;
+      const d = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+      if (!(Math.abs(d) > 1e-12)) continue;
+      // texel centres strictly inside the triangle (shared edges of neighbouring faces do not count)
+      const minX = Math.max(0, Math.floor(Math.min(x0, x1, x2)));
+      const maxX = Math.min(N - 1, Math.ceil(Math.max(x0, x1, x2)));
+      const minY = Math.max(0, Math.floor(Math.min(y0, y1, y2)));
+      const maxY = Math.min(N - 1, Math.ceil(Math.max(y0, y1, y2)));
+      for (let y = minY; y <= maxY; y++)
+        for (let x = minX; x <= maxX; x++) {
+          const cx = x + 0.5;
+          const cy = y + 0.5;
+          const l0 = ((y1 - y2) * (cx - x2) + (x2 - x1) * (cy - y2)) / d;
+          const l1 = ((y2 - y0) * (cx - x2) + (x0 - x2) * (cy - y2)) / d;
+          if (l0 <= 1e-9 || l1 <= 1e-9 || 1 - l0 - l1 <= 1e-9) continue;
+          const i = y * N + x;
+          if (stamp[i] === fi) continue;
+          stamp[i] = fi;
+          if (cover[i] === 0) covered++;
+          else if (cover[i] === 1) twice++;
+          if (cover[i] < 2) cover[i]++;
+        }
+    }
+  }
+  return covered ? twice / covered : 0;
+}
+
 /** True when baking the material's procedurals depends on the mesh (not only on UVs). */
 export function proceduralBakeNeedsGeometry(m: MaterialData | null): boolean {
   const s = proceduralSurface(m);

@@ -362,6 +362,11 @@ export class ViewportEngine {
     }
     const render = this.ev.render;
     const shading = v.shading.value;
+    // Overlays off hides everything Blender's overlay engine draws: helpers (cameras, lights,
+    // empties, bones, wire curves), wireframe overlays, the edit-mode cage display, outlines,
+    // origins, the grid, the 3D cursor, peers' boxes (and, in Viewport.tsx, the text info,
+    // statistics and camera frame). Wireframe shading itself stays.
+    const overlays = v.overlays.value;
     this.objects.sync(s.doc, this.ev, {
       shading,
       showWireOverlay: v.showWireframe.value,
@@ -372,9 +377,10 @@ export class ViewportEngine {
       renderAspect: render.resolution_x / Math.max(1, render.resolution_y),
       castShadows: shading === 'RENDERED' && render.use_shadows,
       imagesRevision: this.imagesRevision,
+      overlays,
     });
     this.applyShading();
-    // edit overlay
+    // edit overlay (picking keeps using its cage while it is hidden)
     if (editId) {
       const o = this.ev.byId.get(editId);
       const base = this.meshOverrides.get(editId) ?? o?.baseMesh;
@@ -383,13 +389,14 @@ export class ViewportEngine {
           ? `live${this.overrideToken}`
           : `doc${s.doc.meshVersion(o.data.data ?? '')}`;
         this.edit.update(base, st.meshSelection, st.selectMode, o.worldMatrix, v.xray.value, token);
+        this.edit.group.visible = overlays;
       } else this.edit.hide();
     } else this.edit.hide();
     // outlines
     const sel = new Set(st.selectedIds);
     const selMeshes: THREE.Object3D[] = [];
     const activeMeshes: THREE.Object3D[] = [];
-    if (st.mode === 'OBJECT' && v.overlays.value)
+    if (st.mode === 'OBJECT' && overlays)
       for (const id of sel) {
         const view = this.objects.views.get(id);
         if (!view?.mesh?.visible || !view.root.visible) continue;
@@ -401,7 +408,7 @@ export class ViewportEngine {
     this.outlineActive.enabled = activeMeshes.length > 0;
     // origin dots
     const dots: number[] = [];
-    if (st.mode === 'OBJECT' && v.overlays.value)
+    if (st.mode === 'OBJECT' && overlays)
       for (const id of sel) {
         const o = this.ev.byId.get(id);
         if (o?.visible) dots.push(o.worldMatrix[12], o.worldMatrix[13], o.worldMatrix[14]);
@@ -410,8 +417,8 @@ export class ViewportEngine {
     this.originDots.geometry = new THREE.BufferGeometry();
     this.originDots.geometry.setAttribute('position', new THREE.Float32BufferAttribute(dots, 3));
     this.syncPeers();
-    this.grid.visible = v.overlays.value && v.showGrid.value;
-    this.cursor.visible = v.overlays.value;
+    this.grid.visible = overlays && v.showGrid.value;
+    this.cursor.visible = overlays;
     span.setAttribute('scene.objects', this.ev.objects.length).end();
   }
 
@@ -1019,6 +1026,7 @@ export class ViewportEngine {
       renderAspect: render.resolution_x / Math.max(1, render.resolution_y),
       castShadows: shading === 'RENDERED' && render.use_shadows,
       imagesRevision: this.imagesRevision,
+      overlays: false,
     });
     this.finalShading = true;
     try {

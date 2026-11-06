@@ -63,7 +63,7 @@ function runImport(
 function runExport(
   ctx: OperatorContext,
   format: ExportFormat,
-  p: { use_selection: boolean; apply_modifiers: boolean; filename?: string },
+  p: { use_selection: boolean; apply_modifiers: boolean; filename?: string; bake_resolution?: number },
 ) {
   let objectIds: string[] | undefined;
   if (p.use_selection) {
@@ -75,6 +75,7 @@ function runExport(
     objectIds,
     applyModifiers: p.apply_modifiers,
     frame: ctx.state.frame,
+    bakeResolution: p.bake_resolution,
   });
   for (const w of res.warnings ?? []) ctx.report('WARNING', w);
   const base = p.filename?.trim() ? p.filename.trim() : safeFileName(ctx.doc.name, 'scene');
@@ -142,10 +143,22 @@ export function registerIOOperators(reg: OperatorRegistry): void {
       id: 'export_scene.gltf',
       label: 'Export glTF 2.0',
       description:
-        'Export the scene as glTF 2.0 (GLB binary or .gltf with an embedded buffer): hierarchy, meshes, materials, textures, cameras, KHR_lights_punctual lights and sampled transform animation. Returns { filename, mime, data_base64 }.',
+        'Export the scene as glTF 2.0 (GLB binary or .gltf with an embedded buffer): hierarchy, meshes, materials, textures (procedural textures baked into images), cameras, KHR_lights_punctual lights and transform animation sampled per frame (objects on strongly curved paths 2–4 times per frame). Returns { filename, mime, data_base64, warnings }.',
       category: 'Export',
       undo: false,
-      schema: z.object({ export_format: z.enum(['GLB', 'GLTF_EMBEDDED']).default('GLB'), ...exportShape }),
+      schema: z.object({
+        export_format: z.enum(['GLB', 'GLTF_EMBEDDED']).default('GLB'),
+        ...exportShape,
+        bake_resolution: z
+          .number()
+          .int()
+          .min(64)
+          .max(4096)
+          .optional()
+          .describe(
+            'Size in pixels of the square images procedural textures are baked into. Default: per mesh, about 64 texels per metre of its surface (512–2048 px) within a budget for the whole export',
+          ),
+      }),
       execute: (ctx, p) => runExport(ctx, p.export_format === 'GLB' ? 'glb' : 'gltf', p),
     }),
   );
@@ -186,7 +199,7 @@ export function registerIOOperators(reg: OperatorRegistry): void {
       id: 'render.render_software',
       label: 'Render Image (Software)',
       description:
-        'Render the scene on the CPU and return a PNG ({ mime, data_base64, width, height }). Camera: the given camera, else the scene camera, else an automatic view of all objects. Size defaults to the render resolution scaled to fit 800 px.',
+        'Render the scene on the CPU and return a PNG ({ mime, data_base64, width, height }). Camera: the given camera, else the scene camera, else an automatic view of all objects. Size defaults to the render resolution scaled to fit 800 px. This is the RASTER preview: no shadows, and glossy reflections come from one reflection probe in front of what the image centre shows, looked up by direction only, so water, floors and large tables far from it can show reflections the path tracer does not (judge reflections with a PATHTRACER render).',
       category: 'Render',
       undo: false,
       schema: z.object({

@@ -143,6 +143,11 @@ export interface SoftwareRenderOptions {
    * tracer (soft shadows, reflections, refraction, global illumination); it is used for MATERIAL
    * shading only (SOLID and the wireframe overlay always rasterize). Both engines apply the scene's
    * exposure and `view_transform` (AgX by default, like Blender; SOLID shading uses Standard).
+   * RASTER is a preview: no shadows, and glossy reflections come from one small reflection probe
+   * placed in front of what the image centre shows, looked up by direction only (no parallax), so
+   * reflective surfaces far from that point reflect what the probe sees in that direction (a wide
+   * smear of a nearby object across rippled water, a bright far end of a large glossy table): judge
+   * reflections and lighting with PATHTRACER.
    */
   engine?: RenderEngine;
   /**

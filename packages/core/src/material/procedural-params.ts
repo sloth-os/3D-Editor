@@ -310,7 +310,17 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 'RINGS',
       values: ['RINGS', 'BANDS'],
       description:
-        'RINGS = growth rings around the texture Z axis, BANDS = straight bands along the XYZ diagonal',
+        'RINGS = growth rings around the `axis` (concentric end grain on faces across it, long stripes on faces ' +
+        'along it), BANDS = straight bands along the XYZ diagonal',
+    },
+    {
+      key: 'axis',
+      kind: 'enum',
+      default: 'Z',
+      values: ['Z', 'X', 'Y'],
+      description:
+        "texture axis the growth rings go around and the fibre streaks run along, i.e. the board's length: X " +
+        'or Y for a table top or floor boards running along X or Y (default Z: a post or log standing up)',
     },
     {
       key: 'wave_profile',
@@ -325,7 +335,7 @@ export const PROCEDURAL_TYPE_PARAMS: Readonly<Record<ProceduralType, readonly Pr
       default: 0.3,
       min: 0,
       max: 1,
-      description: 'strength of fine fibre streaks along Z (0 = none, 1 = strong)',
+      description: 'strength of fine fibre streaks along the `axis` (0 = none, 1 = strong)',
     },
   ],
   MAGIC: [],
@@ -352,8 +362,9 @@ export const PROCEDURAL_TYPE_DOCS: Readonly<Record<ProceduralType, string>> = {
     'EASE (thin color_a veins on color_b stone, e.g. pale veins on black marble); marble_type SHARP/SHARPER ' +
     'thins them further',
   WOOD:
-    'wood growth rings (scale = rings per unit), distortion = ring wobble, `grain` fibre streaks; for thin ' +
-    'dark ring lines (color_a) narrow the ramp, e.g. ramp_high 0.3',
+    'wood growth rings around params.axis (Z default; X or Y for boards lying along X or Y) (scale = rings ' +
+    'per unit), distortion = ring wobble, `grain` fibre streaks along the axis; for thin dark ring lines ' +
+    '(color_a) narrow the ramp, e.g. ramp_high 0.3',
   MAGIC:
     'psychedelic interference pattern; detail = depth 0..10, distortion = folding; each RGB channel is ramped separately',
 };

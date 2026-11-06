@@ -10,6 +10,12 @@ export interface ExportOptions {
   applyModifiers?: boolean;
   /** Frame used for evaluation (default scene frame_start). */
   frame?: number;
+  /**
+   * glTF: size in pixels (64–4096) of the square images procedural textures are baked into. Default:
+   * per mesh, about 64 texels per metre of its surface (512–2048 px; a UV-mapped bake shared by
+   * several meshes is sized for the largest), within a budget for the whole export.
+   */
+  bakeResolution?: number;
 }
 
 export interface ExportResult {

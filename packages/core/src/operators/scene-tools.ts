@@ -70,6 +70,9 @@ export const MAX_LAYOUT_OBJECTS = 10_000;
 
 /** array_place CIRCLE angles this close to ±2π (radians) count as a full turn. */
 export const FULL_TURN_TOLERANCE = 0.01;
+/** scene.measure: most objects whose pairwise distances are listed, and the surface distance budget. */
+const MEASURE_MAX_PAIR_OBJECTS = 25;
+const MEASURE_SURFACE_BUDGET_MS = 3000;
 
 const AXES = ['X', 'Y', 'Z'] as const;
 const AXIS_INDEX = { X: 0, Y: 1, Z: 2 } as const;
@@ -1588,9 +1591,12 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'included; what object.dimensions_set space=WORLD sets); the bounding box around all of them; and for ' +
         'every pair (up to 25 objects) the distance ' +
         'between origins and between bounding box centres, the gap between the bounding boxes (0 when they ' +
-        'overlap) and, up to 8 objects, the exact closest distance between the actual surfaces (meshes, curves, ' +
-        'text and the geometry of collection instances) with the closest points (0 when they touch; ' +
-        'intersecting=true when they cross). Units: metres. `frame` measures the scene at another frame ' +
+        'overlap) and the exact closest distance between the actual surfaces (meshes, curves, text and the ' +
+        'geometry of collection instances) with the closest points (0 when they touch; intersecting=true when ' +
+        'they cross). Surface distances are computed nearest pairs first within a time budget of about 3 s: ' +
+        'pairs left without one carry surface_distance_skipped, `surface_distances` gives {computed, skipped}, ' +
+        'and a WARNING says so (measure fewer objects at a time to get them all). More than 25 objects give no ' +
+        'pairs (`distances_skipped` says why). Units: metres. `frame` measures the scene at another frame ' +
         '(animated, driven or simulated objects) without changing the current frame.',
       category: 'Scene',
       undo: false,
@@ -1604,7 +1610,9 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         surface_distance: z
           .boolean()
           .default(true)
-          .describe('Compute the closest surface-to-surface distance of each pair (at most 8 objects)'),
+          .describe(
+            'Compute the closest surface-to-surface distance of each pair (nearest pairs first, about 3 s in all)',
+          ),
         frame: z
           .number()
           .optional()
@@ -1654,8 +1662,8 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           }
           return t;
         };
-        const distances = [];
-        if (ids.length >= 2 && ids.length <= 25) {
+        const distances: Record<string, unknown>[] = [];
+        if (ids.length >= 2 && ids.length <= MEASURE_MAX_PAIR_OBJECTS) {
           for (let i = 0; i < ids.length; i++)
             for (let j = i + 1; j < ids.length; j++) {
               const a = ids[i];
@@ -1675,26 +1683,58 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
                 center_distance: round(Math.hypot(ca[0] - cb[0], ca[1] - cb[1], ca[2] - cb[2])),
                 bounds_gap: round(boundsGap(ba, bb)),
               };
-              const ta = p.surface_distance && ids.length <= 8 ? trianglesOf(a) : null;
-              const tb = ta ? trianglesOf(b) : null;
-              if (ta && tb) {
-                const d = triangleSetDistance(ta, tb);
-                if (d) {
-                  entry.surface_distance = round(d.distance);
-                  entry.closest_points = [r3(d.pointA), r3(d.pointB)];
-                  entry.intersecting = d.intersecting;
-                }
-              }
               distances.push(entry);
             }
         }
+        // exact surface distances, nearest pairs (by bounding box gap) first, within a time budget
+        let computed = 0;
+        let skipped = 0;
+        if (p.surface_distance && distances.length) {
+          const deadline = Date.now() + MEASURE_SURFACE_BUDGET_MS;
+          const order = distances
+            .map((e, k) => ({ e, k }))
+            .sort((x, y) => (x.e.bounds_gap as number) - (y.e.bounds_gap as number) || x.k - y.k);
+          for (const { e } of order) {
+            if (Date.now() > deadline) {
+              e.surface_distance_skipped = 'time budget';
+              skipped++;
+              continue;
+            }
+            const ta = trianglesOf(e.a as string);
+            const tb = ta ? trianglesOf(e.b as string) : null;
+            const d = ta && tb ? triangleSetDistance(ta, tb) : null;
+            if (!d) continue; // an object without surface geometry (empty, camera, light)
+            e.surface_distance = round(d.distance);
+            e.closest_points = [r3(d.pointA), r3(d.pointB)];
+            e.intersecting = d.intersecting;
+            computed++;
+          }
+          if (skipped)
+            ctx.report(
+              'WARNING',
+              `scene.measure: surface distances computed for ${computed} of ${computed + skipped} pairs ` +
+                `(time budget); the others have surface_distance_skipped (measure fewer objects at a time)`,
+            );
+        }
+        const tooMany = ids.length > MEASURE_MAX_PAIR_OBJECTS;
+        if (tooMany)
+          ctx.report(
+            'WARNING',
+            `scene.measure: ${ids.length} objects: pairwise distances need at most ${MEASURE_MAX_PAIR_OBJECTS} objects`,
+          );
         return {
           ...(p.frame !== undefined ? { frame: scene.ev.frame } : {}),
           objects,
           bounds: isEmptyBounds(all)
             ? null
             : { ...boundsOut(all), center: r3(boundsCenter(all)), size: r3(boundsSize(all)) },
-          ...(ids.length >= 2 ? { distances } : {}),
+          ...(ids.length >= 2 && !tooMany ? { distances } : {}),
+          ...(p.surface_distance && distances.length ? { surface_distances: { computed, skipped } } : {}),
+          ...(tooMany
+            ? {
+                distances_skipped: `${ids.length} objects: pairwise distances need at most ${MEASURE_MAX_PAIR_OBJECTS} objects`,
+              }
+            : {}),
         };
       },
     }),
@@ -1709,7 +1749,8 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'default, their instances (collection instances, particles). Does not change anything. Returns ' +
         '{hit: true, object (id; the instanced source for instances), name, instancer (id or null), point, ' +
         'normal (unit face normal, world space), distance (metres), face (index), front (hit the front side)} or ' +
-        '{hit: false}; with all=true a `hits` list of every surface along the ray, nearest first. `frame` casts ' +
+        '{hit: false}; with all=true a `hits` list of every surface along the ray, nearest first (surfaces of ' +
+        'different objects at the same distance, e.g. a glass standing on a slab, are all listed). `frame` casts ' +
         'against the scene at another frame without changing the current frame.',
       category: 'Scene',
       undo: false,

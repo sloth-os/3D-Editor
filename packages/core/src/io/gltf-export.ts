@@ -50,6 +50,7 @@ import {
   bakeGeometryKey,
   bakeMaterialTextures,
   proceduralBakeNeedsGeometry,
+  uvOverlapFraction,
   type BakeGeometry,
 } from './bake-procedural';
 import { hasProceduralTextures, proceduralSurface } from '../material/surface';
@@ -91,13 +92,20 @@ import { encodePNG, type PNGImage } from '../render/png';
  *   scene fps (LINEAR): node translation/rotation/scale wherever an object's or a bone's transform
  *   relative to its exported parent changes (keyframes, drivers, constraints, IK, physics …;
  *   rotations as normalized, sign-continuous quaternions) and morph target weights (shape key values,
- *   baked deformation). Animated camera, light and material properties and the world are not
+ *   baked deformation). Nodes on strongly curved paths, whose linearly interpolated keys would cut
+ *   chords (an object a constraint keeps on a fast orbit, keyed in world space), are sampled 2–4
+ *   times per frame (`chordError`); a warning names those still off by more than the tolerance. Animated camera, light and material properties and the world are not
  *   exported (they would need KHR_animation_pointer; glTF has no world): a warning names the
  *   properties whose values change over the frame range, and the file keeps the export frame's.
- * - Procedural texture slots are baked to PNG images in UV space (bake-procedural.ts); materials
- *   whose bake depends on the geometry (GENERATED/OBJECT mapping, bump) get one glTF material per
- *   distinct mesh content (identical meshes share one bake). A mesh without UVs whose material has
- *   procedural textures gets generated UVs (Smart UV Project) to bake them into.
+ * - Procedural texture slots are baked to PNG images in UV space (bake-procedural.ts), sized per
+ *   mesh by its surface area (`bakeResolution` overrides); materials whose bake depends on the
+ *   geometry (GENERATED/OBJECT mapping, bump) get one glTF material per distinct mesh content
+ *   (identical meshes share one bake), named Name, Name.001 … with a warning. A mesh without UVs, or
+ *   with overlapping UVs (`uvOverlapFraction`), whose material has GENERATED/OBJECT-mapped procedural
+ *   textures gets generated UVs (Smart UV Project) to bake them into, unless image textures or
+ *   UV-mapped procedurals need its UVs (then a warning says the bake is wrong where faces overlap).
+ * - Materials: Principled values as pbrMetallicRoughness plus KHR_materials_emissive_strength,
+ *   _transmission, _ior, _clearcoat and _sheen (colour = tint × weight, roughness 0.5).
  */
 
 class BinBuilder {
@@ -329,6 +337,20 @@ const MAX_INFLUENCES = 4;
 const MAX_BAKED_FLOATS = 12_000_000;
 /** Most frames sampled for the animation. */
 const MAX_FRAMES = 10000;
+/** Most samples per frame of nodes on curved paths (see `chordError`). */
+const MAX_SUBFRAMES = 4;
+/**
+ * Automatic size of procedural bakes: about BAKE_TEXELS_PER_METRE texels per metre of the baked
+ * surface (by its world-space area and the share of the UV square its layout covers), rounded up to
+ * a power of two within [BAKE_MIN_SIZE, BAKE_MAX_SIZE]; all automatic bakes together stay within
+ * BAKE_BUDGET texels (larger ones are halved down to BAKE_MIN_SIZE when the budget runs out).
+ */
+const BAKE_TEXELS_PER_METRE = 64;
+const BAKE_MIN_SIZE = 512;
+const BAKE_MAX_SIZE = 2048;
+const BAKE_BUDGET = 3 * 2048 * 2048;
+/** Share of a UV layout used twice above which position-dependent bakes do not use it. */
+const UV_OVERLAP_LIMIT = 0.005;
 
 /** How a mesh object's deformation is exported. */
 type MeshMode = 'static' | 'morph' | 'skin';
@@ -700,6 +722,78 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       warn(
         `'${n.name}' has a sheared transform (non-uniform parent scale); glTF animation cannot represent it exactly`,
       );
+  // glTF players interpolate translations linearly: a node on a strongly curved path (an object a
+  // constraint keeps on a rotating orbit, exported with world-space keys) cuts chords between the
+  // per-frame keys. Such nodes get keys at sub-frames too (2–4 per frame), enough to bring the
+  // chord error under CHORD_TOLERANCE where possible.
+  /** Sub-frame tracks (times in frames) of nodes on curved paths. */
+  const fineTracks = new Map<XNode, Track & { frames: Float64Array }>();
+  if (frames.length > 2) {
+    const curved = new Map<XNode, number>();
+    for (const n of moving) {
+      const tr = tracks.get(n)!;
+      if (!varies(tr.t, 3)) continue;
+      const err = chordError(tr.t);
+      if (err > chordTolerance(tr.t)) curved.set(n, err);
+    }
+    if (curved.size) {
+      let k = 1;
+      for (const [n, err] of curved) {
+        const tol = chordTolerance(tracks.get(n)!.t);
+        k = Math.max(k, Math.min(MAX_SUBFRAMES, Math.ceil(Math.sqrt(err / tol))));
+      }
+      const count = (frames.length - 1) * k + 1;
+      const at = new Float64Array(count);
+      for (let i = 0; i < count; i++) at[i] = frames[0] + i / k;
+      for (const n of curved.keys())
+        fineTracks.set(n, {
+          frames: at,
+          t: new Float32Array(count * 3),
+          r: new Float32Array(count * 4),
+          s: new Float32Array(count * 3),
+        });
+      const prevQ = new Map<XNode, Quat>();
+      for (let i = 0; i < count; i++) {
+        const fi = i / k;
+        const exactFrame = Number.isInteger(fi);
+        const sc = exactFrame ? null : evaluator.evaluate(at[i], { forRender: true });
+        for (const [n, ft] of fineTracks) {
+          let tq: { t: Vec3; q: Quat; s: Vec3 };
+          if (sc) {
+            const m = gltfLocal(n, sc) ?? gltfLocal(n, scene);
+            const trs = m ? trsOfMatrix(m) : null;
+            tq = trs
+              ? { t: trs.t, q: normalizeQuat(trs.q), s: trs.s }
+              : { t: [0, 0, 0], q: [0, 0, 0, 1], s: [1, 1, 1] };
+          } else {
+            const tr = tracks.get(n)!;
+            const o = fi;
+            tq = {
+              t: [tr.t[o * 3], tr.t[o * 3 + 1], tr.t[o * 3 + 2]],
+              q: [tr.r[o * 4], tr.r[o * 4 + 1], tr.r[o * 4 + 2], tr.r[o * 4 + 3]],
+              s: [tr.s[o * 3], tr.s[o * 3 + 1], tr.s[o * 3 + 2]],
+            };
+          }
+          let q = tq.q;
+          const prev = prevQ.get(n);
+          if (prev && prev[0] * q[0] + prev[1] * q[1] + prev[2] * q[2] + prev[3] * q[3] < 0)
+            q = [-q[0], -q[1], -q[2], -q[3]];
+          prevQ.set(n, q);
+          ft.t.set(tq.t, i * 3);
+          ft.r.set(q, i * 4);
+          ft.s.set(tq.s, i * 3);
+        }
+      }
+      for (const [n, ft] of fineTracks) {
+        const left = chordError(ft.t);
+        const tol = chordTolerance(ft.t);
+        if (left > tol)
+          warn(
+            `'${n.name}' moves on a strongly curved path: sampled ${k} times per frame, its linearly interpolated glTF keys still cut chords of up to ${(left * 1000).toFixed(1)} mm (parent it to the rotating object, or use a higher frame rate, for a closer path)`,
+          );
+      }
+    }
+  }
 
   // ---------------------------------------------------------------- images / textures / materials
   const textures: NonNullable<GltfRoot['textures']> = [];
@@ -775,7 +869,85 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     it: ExportItem;
     generatedUvs: boolean;
   }
-  const bake = (m: MaterialData, surf: Surface, hasUv: boolean): { result: BakeResult; key: string } => {
+  let bakeTexels = 0;
+  const explicitBakeSize =
+    opts.bakeResolution !== undefined && Number.isFinite(opts.bakeResolution)
+      ? Math.max(64, Math.min(4096, Math.round(opts.bakeResolution)))
+      : null;
+  /** Automatic image size for a bake onto `mesh` of item `it` (before the budget). */
+  const wantedSize = (mesh: MeshData, it: ExportItem): number => {
+    let area = 0;
+    let uvArea = 0;
+    const P = mesh.positions;
+    mesh.faces.forEach((f, fi) => {
+      const uv = mesh.uvs?.[fi];
+      for (let i = 1; i + 1 < f.length; i++) {
+        const a = f[0] * 3;
+        const b = f[i] * 3;
+        const c = f[i + 1] * 3;
+        const ux = P[b] - P[a];
+        const uy = P[b + 1] - P[a + 1];
+        const uz = P[b + 2] - P[a + 2];
+        const vx = P[c] - P[a];
+        const vy = P[c + 1] - P[a + 1];
+        const vz = P[c + 2] - P[a + 2];
+        area += Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+        if (uv)
+          uvArea +=
+            Math.abs(
+              (uv[i * 2] - uv[0]) * (uv[i * 2 + 3] - uv[1]) -
+                (uv[i * 2 + 2] - uv[0]) * (uv[i * 2 + 1] - uv[1]),
+            ) / 2;
+      }
+    });
+    // world scale of the surface: area grows with |det|^(2/3) of the object's matrix
+    const det = Math.abs(determinant4(it.ev.worldMatrix));
+    const worldArea = area * (Number.isFinite(det) && det > 0 ? Math.pow(det, 2 / 3) : 1);
+    const coverage = Math.min(1, Math.max(0.05, uvArea));
+    let size = BAKE_MIN_SIZE;
+    const want = Math.sqrt(worldArea / coverage) * BAKE_TEXELS_PER_METRE;
+    while (size < BAKE_MAX_SIZE && size < want) size *= 2;
+    return size;
+  };
+  /** UV-mapped bakes are shared by every mesh of a material: sized for the largest of them. */
+  const sharedSizes = new Map<string, number>();
+  /**
+   * Image size of a bake of `m` onto `surf`: explicit, else from the surface's size (geometry
+   * dependent bakes) or the largest surface using the material (UV-mapped bakes), within the budget.
+   */
+  const bakeSize = (m: MaterialData, surf: Surface, perMesh: boolean): number => {
+    if (explicitBakeSize !== null) return explicitBakeSize;
+    const budgeted = (size: number) => {
+      while (size > BAKE_MIN_SIZE && bakeTexels + size * size > BAKE_BUDGET) size /= 2;
+      return size;
+    };
+    if (perMesh) return budgeted(wantedSize(surf.mesh, surf.it));
+    let shared = sharedSizes.get(m.id);
+    if (shared === undefined) {
+      shared = BAKE_MIN_SIZE;
+      for (const it of items)
+        if (plans.has(it) && it.materials.some((x) => x?.id === m.id))
+          shared = Math.max(shared, wantedSize(plans.get(it)!.mesh, it));
+      // one size for every mesh of the material, so they keep sharing one bake
+      sharedSizes.set(m.id, (shared = budgeted(shared)));
+    }
+    return shared;
+  };
+  /** Name of a material in glTF: its name, with .001, .002 … for further exported copies of it. */
+  const bakedNames = new Map<string, string[]>();
+  const nameFor = (m: MaterialData): string => {
+    let names = bakedNames.get(m.id);
+    if (!names) bakedNames.set(m.id, (names = []));
+    const name = names.length ? `${m.name}.${String(names.length).padStart(3, '0')}` : m.name;
+    names.push(name);
+    return name;
+  };
+  const bake = (
+    m: MaterialData,
+    surf: Surface,
+    hasUv: boolean,
+    name: () => string,
+  ): { result: BakeResult; key: string } => {
     // the bake depends on the geometry for GENERATED/OBJECT mappings and bumps: key it by content so
     // identical meshes (e.g. many copies of a cube) share one bake and one material
     const it = surf.it;
@@ -796,7 +968,8 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       };
       geoKey = bakeGeometryKey(geometry);
     }
-    const key = `${hasUv ? 'uv' : 'nouv'}|${geoKey}`;
+    const size = hasUv ? bakeSize(m, surf, geoKey !== '') : 0;
+    const key = `${hasUv ? 'uv' : 'nouv'}|${geoKey}|${size}`;
     const bakeKey = `${stableStringify([
       m.textures,
       m.base_color,
@@ -808,17 +981,22 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     ])}|${key}`;
     let result = bakes.get(bakeKey);
     if (!result) {
-      const baked = bakeMaterialTextures(m, geometry);
+      const baked = bakeMaterialTextures(m, geometry, size ? { width: size } : {});
       for (const msg of baked.warnings) warn(msg);
+      const images = [baked.baseColor, baked.metallicRoughness, baked.normal, baked.emissive].filter(
+        (x) => !!x,
+      );
+      if (explicitBakeSize === null) bakeTexels += images.length ? size * size : 0;
+      const n = name();
       result = {
-        baseColor: baked.baseColor && pngTexture(baked.baseColor, `${m.name} base color`),
+        baseColor: baked.baseColor && pngTexture(baked.baseColor, `${n} base color`),
         baseColorFactor: baked.baseColorFactor,
         metallicRoughness:
-          baked.metallicRoughness && pngTexture(baked.metallicRoughness, `${m.name} metallic roughness`),
+          baked.metallicRoughness && pngTexture(baked.metallicRoughness, `${n} metallic roughness`),
         metallicFactor: baked.metallicFactor,
         roughnessFactor: baked.roughnessFactor,
-        normal: baked.normal && pngTexture(baked.normal, `${m.name} normal`),
-        emissive: baked.emissive && pngTexture(baked.emissive, `${m.name} emission`),
+        normal: baked.normal && pngTexture(baked.normal, `${n} normal`),
+        emissive: baked.emissive && pngTexture(baked.emissive, `${n} emission`),
         emissiveColor: baked.emissiveColor,
       };
       bakes.set(bakeKey, result);
@@ -828,7 +1006,11 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
   const materialIndex = (m: MaterialData, surf: Surface): number => {
     // glTF texture bindings need TEXCOORD_0: primitives without UVs get texture-less materials
     const hasUv = !!surf.mesh.uvs && surf.mesh.faces.length > 0;
-    const baked = hasProceduralTextures(m) ? bake(m, surf, hasUv) : null;
+    // a material exported more than once (a bake per mesh, with and without image textures) gets
+    // distinct names: Beech, Beech.001 … (images named after them)
+    let glName: string | null = null;
+    const name = () => (glName ??= nameFor(m));
+    const baked = hasProceduralTextures(m) ? bake(m, surf, hasUv, name) : null;
     const t = m.textures ?? {};
     // whether UVs change the exported material: only image textures (procedurals: `baked.key`),
     // which are dropped on meshes without UVs and on generated UVs (made for procedural bakes only)
@@ -838,7 +1020,7 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     const cached = materialOf.get(key);
     if (cached !== undefined) return cached;
     const b = baked?.result ?? null;
-    const out: GltfMaterial = { name: m.name };
+    const out: GltfMaterial = { name: name() };
     const pbr: NonNullable<GltfMaterial['pbrMetallicRoughness']> = {};
     const bc = [
       clamp01(m.base_color[0]),
@@ -954,6 +1136,19 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
         },
       };
       w.extensionsUsed.add('KHR_materials_clearcoat');
+    }
+    if (m.sheen_weight > 0) {
+      // sheen colour = tint × weight; the renderers' sheen lobe has a fixed roughness of 0.5
+      const tint = m.sheen_tint ?? [1, 1, 1];
+      const sw = clamp01(m.sheen_weight);
+      out.extensions = {
+        ...out.extensions,
+        KHR_materials_sheen: {
+          sheenColorFactor: [clamp01(tint[0] * sw), clamp01(tint[1] * sw), clamp01(tint[2] * sw)],
+          sheenRoughnessFactor: 0.5,
+        },
+      };
+      w.extensionsUsed.add('KHR_materials_sheen');
     }
     materials.push(out);
     materialOf.set(key, materials.length - 1);
@@ -1115,17 +1310,39 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     }
     return g;
   };
+  const overlaps = new Map<MeshData, number>();
+  const overlapOf = (mesh: MeshData): number => {
+    let o = overlaps.get(mesh);
+    if (o === undefined) overlaps.set(mesh, (o = uvOverlapFraction(mesh)));
+    return o;
+  };
   /**
    * The mesh written for an item, and the materials it generated UVs for: position-dependent
    * (GENERATED/OBJECT) procedural textures need UVs to be baked into, so a mesh without UVs gets
    * them (Smart UV Project); UV-mapped ones show a constant on a mesh without UVs, like in the
-   * renderers, and need none.
+   * renderers, and need none. UVs that overlap (mirrored or stacked islands) would bake several
+   * surfaces into the same texels: they are replaced by generated ones too, unless a material of
+   * the mesh needs them (image textures, UV-mapped procedurals), which leaves `overlap` set.
    */
-  const writtenMesh = (it: ExportItem): { mesh: MeshData; needing: (MaterialData | null)[] } => {
+  const writtenMesh = (
+    it: ExportItem,
+  ): { mesh: MeshData; needing: (MaterialData | null)[]; overlap: number; kept: boolean } => {
     const mesh = plans.get(it)!.mesh;
-    const needing =
-      mesh.uvs || !mesh.faces.length ? [] : it.materials.filter((m) => !!proceduralSurface(m)?.usesObject);
-    return { mesh: needing.length ? withGeneratedUvs(mesh) : mesh, needing };
+    const positional = mesh.faces.length
+      ? it.materials.filter((m) => !!proceduralSurface(m)?.usesObject)
+      : [];
+    if (!positional.length) return { mesh, needing: [], overlap: 0, kept: false };
+    if (!mesh.uvs) return { mesh: withGeneratedUvs(mesh), needing: positional, overlap: 0, kept: false };
+    const overlap = overlapOf(mesh);
+    if (overlap <= UV_OVERLAP_LIMIT) return { mesh, needing: [], overlap: 0, kept: false };
+    const needsUvs = it.materials.some(
+      (m) =>
+        !!m &&
+        (!!proceduralSurface(m)?.usesUv ||
+          Object.values(m.textures ?? {}).some((slot) => !!slot && !!slot.image && !slot.procedural)),
+    );
+    if (needsUvs) return { mesh, needing: positional, overlap, kept: true };
+    return { mesh: withGeneratedUvs(mesh), needing: positional, overlap, kept: false };
   };
   const bakedPlan = planBakes(deformations, frames, plans, warn, (it) => {
     const { mesh } = writtenMesh(it);
@@ -1134,15 +1351,22 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
   const exportMesh = (n: XNode): number | undefined => {
     const it = n.item!;
     const plan = plans.get(it)!;
-    const { mesh, needing } = writtenMesh(it);
-    const generatedUvs = needing.length > 0;
-    if (generatedUvs) {
+    const { mesh, needing, overlap, kept } = writtenMesh(it);
+    const generatedUvs = needing.length > 0 && !kept;
+    const mats = needing.map((m) => `'${m!.name}'`).join(', ');
+    const share = `${Math.max(1, Math.round(overlap * 100))}% of the UV layout is used by more than one face`;
+    if (kept)
       warn(
-        `Mesh '${it.ev.name}' has no UVs: generated UVs (Smart UV Project) to bake the procedural textures of ${needing
-          .map((m) => `'${m!.name}'`)
-          .join(', ')}`,
+        `Mesh '${it.ev.name}': its UVs overlap (${share}), so the baked procedural textures of ${mats} (GENERATED/OBJECT mapping) are wrong where faces share texels; its UVs are kept for its image textures / UV-mapped procedurals (unwrap it without overlaps, e.g. uv.smart_project)`,
       );
-    }
+    else if (generatedUvs && overlap > 0)
+      warn(
+        `Mesh '${it.ev.name}': its UVs overlap (${share}): generated UVs (Smart UV Project) replace them to bake the procedural textures of ${mats}`,
+      );
+    else if (generatedUvs)
+      warn(
+        `Mesh '${it.ev.name}' has no UVs: generated UVs (Smart UV Project) to bake the procedural textures of ${mats}`,
+      );
     const baked = bakedPlan.get(it);
     let g: Geometry;
     if (plan.mode === 'skin') {
@@ -1479,12 +1703,24 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       anim.samplers.push({ input: inp, output: w.accessor(data, type), interpolation: 'LINEAR' });
       anim.channels.push({ sampler: anim.samplers.length - 1, target: { node, path } });
     };
+    let fineInput = -1;
     for (const n of order) {
-      const tr = tracks.get(n);
-      if (!tr || !moving.has(n)) continue;
-      if (varies(tr.t, 3)) channel(n.index, 'translation', tr.t, 'VEC3', timeInput());
-      if (varies(tr.r, 4)) channel(n.index, 'rotation', tr.r, 'VEC4', timeInput());
-      if (varies(tr.s, 3)) channel(n.index, 'scale', tr.s, 'VEC3', timeInput());
+      const coarse = tracks.get(n);
+      if (!coarse || !moving.has(n)) continue;
+      const fine = fineTracks.get(n);
+      const tr = fine ?? coarse;
+      const inp = () => {
+        if (!fine) return timeInput();
+        if (fineInput < 0) {
+          const t = new Float32Array(fine.frames.length);
+          for (let i = 0; i < t.length; i++) t[i] = (fine.frames[i] - start) / fps;
+          fineInput = w.accessor(t, 'SCALAR', undefined, true);
+        }
+        return fineInput;
+      };
+      if (varies(tr.t, 3)) channel(n.index, 'translation', tr.t, 'VEC3', inp());
+      if (varies(tr.r, 4)) channel(n.index, 'rotation', tr.r, 'VEC4', inp());
+      if (varies(tr.s, 3)) channel(n.index, 'scale', tr.s, 'VEC3', inp());
     }
     for (const [n, wt] of weightsByNode) {
       if (wt.baked) {
@@ -1498,6 +1734,19 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
   }
 
   // ---------------------------------------------------------------- assemble
+  for (const [id, names] of bakedNames) {
+    if (names.length < 2) continue;
+    const m = doc.getMaterial(id);
+    const list =
+      names.length > 3 ? `${names[0]}, ${names[1]} … ${names[names.length - 1]}` : names.join(', ');
+    const why =
+      m && proceduralBakeNeedsGeometry(m)
+        ? 'its procedural textures depend on the surface (GENERATED/OBJECT mapping or a bump), so they are baked for each mesh'
+        : m && hasProceduralTextures(m)
+          ? 'meshes without UVs get its UV-mapped procedural textures as constant values (as the renderers show them), the others baked images'
+          : 'meshes without UVs cannot use its image textures';
+    warn(`Material '${m?.name ?? names[0]}' is exported as ${names.length} glTF materials (${list}): ${why}`);
+  }
   if (!nodes.length) warn('No objects to export');
   const rootNodes = order.filter((n) => !n.parent).map((n) => n.index);
   json.scene = 0;
@@ -1528,6 +1777,47 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
 }
 
 // ------------------------------------------------------------------ helpers
+
+/**
+ * Largest distance between the straight segments of a per-frame translation track (xyz per key)
+ * and the circular arcs through consecutive keys: the chord error of linear interpolation.
+ */
+function chordError(t: Float32Array): number {
+  const n = t.length / 3;
+  let worst = 0;
+  const p = (i: number, k: number) => t[i * 3 + k];
+  for (let i = 0; i + 2 < n; i++) {
+    const a = Math.hypot(p(i + 1, 0) - p(i, 0), p(i + 1, 1) - p(i, 1), p(i + 1, 2) - p(i, 2));
+    const b = Math.hypot(p(i + 2, 0) - p(i + 1, 0), p(i + 2, 1) - p(i + 1, 1), p(i + 2, 2) - p(i + 1, 2));
+    const c = Math.hypot(p(i + 2, 0) - p(i, 0), p(i + 2, 1) - p(i, 1), p(i + 2, 2) - p(i, 2));
+    // circumradius R = abc / (4 · area); the sagitta of a chord of length L is R − √(R² − L²/4)
+    const ux = p(i + 1, 0) - p(i, 0);
+    const uy = p(i + 1, 1) - p(i, 1);
+    const uz = p(i + 1, 2) - p(i, 2);
+    const vx = p(i + 2, 0) - p(i, 0);
+    const vy = p(i + 2, 1) - p(i, 1);
+    const vz = p(i + 2, 2) - p(i, 2);
+    const area = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
+    if (!(area > 1e-12 * (a * b + 1e-30))) continue;
+    const R = (a * b * c) / (4 * area);
+    for (const L of [a, b]) {
+      const h = R * R - (L * L) / 4;
+      worst = Math.max(worst, h > 0 ? R - Math.sqrt(h) : R);
+    }
+  }
+  return worst;
+}
+
+/** Acceptable chord error of a translation track: 0.5 mm, or 0.1% of the path's extent. */
+function chordTolerance(t: Float32Array): number {
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < t.length; i++) {
+    lo[i % 3] = Math.min(lo[i % 3], t[i]);
+    hi[i % 3] = Math.max(hi[i % 3], t[i]);
+  }
+  return Math.max(0.0005, 0.001 * Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]));
+}
 
 /** Whether any value of a per-frame track (stride values per frame) differs from the first frame. */
 function varies(data: Float32Array, stride: number): boolean {

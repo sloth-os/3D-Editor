@@ -239,6 +239,45 @@ function mergeParams(mod: Pick<ModifierData, 'type' | 'params'>, params: Record<
   return { params: res.data as Record<string, unknown> };
 }
 
+/**
+ * Refuses settings of the modifier itself given inside `params` (show_viewport, show_render,
+ * show_in_editmode, name) when the type has no parameter of that name: they are arguments of the
+ * tool, next to `params`, and the error says so instead of listing the type's parameters.
+ */
+function rejectToolArgsInParams(
+  tool: 'add_modifier' | 'update_modifier',
+  mod: Pick<ModifierData, 'type' | 'name'>,
+  params: Record<string, unknown> | undefined,
+): void {
+  if (!params) return;
+  registerBuiltinModifiers();
+  const known = Object.keys(
+    (getModifierDef(mod.type)?.schema as { shape?: Record<string, unknown> } | undefined)?.shape ?? {},
+  );
+  const misplaced = Object.keys(params).filter(
+    (k) => !known.includes(k) && ((FLAG_KEYS as readonly string[]).includes(k) || k === 'name'),
+  );
+  if (!misplaced.length) return;
+  const list = misplaced.map((k) => `'${k}'`).join(', ');
+  const example = misplaced.map((k) => `${k}: ${JSON.stringify(params[k])}`).join(', ');
+  const plural = misplaced.length > 1;
+  if (tool === 'update_modifier')
+    throw new ToolError(
+      `${list} ${plural ? 'are arguments' : 'is an argument'} of update_modifier itself, not ${plural ? 'parameters' : 'a parameter'} of the ${mod.type} modifier: ` +
+        `pass ${plural ? 'them' : 'it'} next to \`params\`, outside it: update_modifier {project, object, modifier: ${JSON.stringify(mod.name)}, ${example}}.`,
+    );
+  const flags = misplaced.filter((k) => k !== 'name');
+  throw new ToolError(
+    `${list} ${plural ? 'are' : 'is'} not ${plural ? 'parameters' : 'a parameter'} of the ${mod.type} modifier.` +
+      (misplaced.includes('name')
+        ? ` The modifier's name is an argument of add_modifier itself, next to \`params\`: add_modifier {project, object, type: ${JSON.stringify(mod.type)}, name: ${JSON.stringify(params.name)}}.`
+        : '') +
+      (flags.length
+        ? ` Its visibility (${flags.join(', ')}) is set after adding it, with update_modifier {project, object, modifier: <its name>, ${flags.map((k) => `${k}: ${JSON.stringify(params[k])}`).join(', ')}}.`
+        : ''),
+  );
+}
+
 function sameValue(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
@@ -296,6 +335,7 @@ export function addModifier(
       `Modifiers can only be added to mesh, curve and text objects ('${object.name}' is ${object.type}).`,
     );
   type = def.type;
+  rejectToolArgsInParams('add_modifier', { type, name: opts.name ?? def.label }, opts.params);
   const params = resolveObjectParams(p, object, type, opts.params);
   if (params) mergeParams({ type, params: defaultModifierParams(type) }, params); // validate early
   opts = { ...opts, params };
@@ -350,6 +390,7 @@ export function updateModifier(
   mod: ModifierData,
   patch: ModifierPatch,
 ): ModifierChange {
+  rejectToolArgsInParams('update_modifier', mod, patch.params);
   patch = { ...patch, params: resolveObjectParams(p, object, mod.type, patch.params) };
   if (patch.params) mergeParams(mod, patch.params); // validate early
   return p.step(() => {

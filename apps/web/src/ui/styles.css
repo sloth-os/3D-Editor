@@ -304,6 +304,11 @@ select.select {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 0 4px;
+  /* a native select is as wide as its longest option: never wider than its container (long
+     object names are cut off instead of pushing the select out of its panel) */
+  max-width: 100%;
+  min-width: 0;
+  text-overflow: ellipsis;
 }
 
 /* ---------- menus */
@@ -398,10 +403,19 @@ select.select {
 }
 .prop-row {
   display: grid;
-  grid-template-columns: 40% 1fr;
+  /* minmax(0, …): the value column never grows past the row for wide content (a 1fr track
+     cannot shrink below its content's min-content width) */
+  grid-template-columns: 40% minmax(0, 1fr);
   align-items: center;
   gap: 6px;
   min-height: var(--row);
+}
+.prop-row > div {
+  min-width: 0;
+}
+/* drop-downs fill the value column like Blender's */
+.prop-row > div > select.select {
+  width: 100%;
 }
 .prop-row > label {
   text-align: right;
@@ -411,7 +425,14 @@ select.select {
   white-space: nowrap;
 }
 .prop-row.full {
-  grid-template-columns: 1fr;
+  grid-template-columns: minmax(0, 1fr);
+}
+/* short labels (Target, Path) in nested list entries: the value gets the rest of the row */
+.prop-row.compact {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+.prop-row.compact > label {
+  min-width: 34px;
 }
 .vector {
   display: flex;

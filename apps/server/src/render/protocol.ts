@@ -134,6 +134,11 @@ export interface ExportJobOptions {
   applyModifiers?: boolean;
   /** Frame the scene is evaluated at (default the scene's frame_start). */
   frame?: number;
+  /**
+   * glTF: size in pixels (64–4096) of the square images procedural textures are baked into
+   * (default: chosen per mesh from its size, see core ExportOptions.bakeResolution).
+   */
+  bakeResolution?: number;
 }
 
 /** An exported file (data transferred). */

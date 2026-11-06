@@ -724,6 +724,55 @@ function areaNormal(mesh: MeshData, pts: number[], valid: Int32Array): Vec3 {
 }
 
 /**
+ * Shapes built from equal inputs (`shapeKey`: mesh content, shape type, dynamic, scale), shared by
+ * every simulation and every rigidbody operator call, most recently used last. A convex hull of a
+ * high-poly mesh takes a while, so scenes with many unique meshes no longer rebuild every hull on
+ * every call. Bounded by entries and by the input vertex coordinates the shapes were built from.
+ */
+const shapeCache = new Map<string, { built: ShapeBuild | { error: string }; weight: number }>();
+let shapeCacheWeight = 0;
+const SHAPE_CACHE_ENTRIES = 1024;
+const SHAPE_CACHE_WEIGHT = 8_000_000;
+
+/** The collision shape for `key` from the shared cache, built (and cached) when missing. */
+export function cachedCollisionShape(
+  key: string,
+  mesh: MeshData,
+  build: () => ShapeBuild | { error: string },
+): ShapeBuild | { error: string } {
+  const hit = shapeCache.get(key);
+  if (hit) {
+    shapeCache.delete(key);
+    shapeCache.set(key, hit);
+    return hit.built;
+  }
+  const built = build();
+  const weight =
+    Array.isArray(mesh.positions) || ArrayBuffer.isView(mesh.positions) ? mesh.positions.length : 0;
+  if (weight <= SHAPE_CACHE_WEIGHT / 4) {
+    shapeCache.set(key, { built, weight });
+    shapeCacheWeight += weight;
+    for (const [k, v] of shapeCache) {
+      if (shapeCache.size <= SHAPE_CACHE_ENTRIES && shapeCacheWeight <= SHAPE_CACHE_WEIGHT) break;
+      shapeCache.delete(k);
+      shapeCacheWeight -= v.weight;
+    }
+  }
+  return built;
+}
+
+/** Number of collision shapes in the shared cache (tests). */
+export function collisionShapeCacheSize(): number {
+  return shapeCache.size;
+}
+
+/** Drops every shared collision shape (rigidbody.cache_free starts from scratch). */
+export function clearCollisionShapeCache(): void {
+  shapeCache.clear();
+  shapeCacheWeight = 0;
+}
+
+/**
  * Builds the collision shape of an object from its mesh (object space) and world scale.
  * `dynamic` bodies cannot use triangle meshes (Blender's MESH shape is unstable for active
  * bodies): they fall back to the convex hull. Convex shapes are at least `minHalfExtent` thick:

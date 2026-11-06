@@ -24,6 +24,7 @@ import {
   isAnimatable,
   propertyLength,
   readChannel,
+  type EditorState,
   type ExportFormat,
   type ImportFormat,
   type MeshSelection,
@@ -78,6 +79,7 @@ import {
 } from './keyframes';
 import { findOperatorGroup, operatorGroupNames, toolOnlyOperator } from './operator-groups';
 import { strictArgObject, strictToolSchema } from './strict-args';
+import { checkEditorCommand, editorCommandList } from './editor-commands';
 import { isCancelled, type AnimationOutput, type FrameOptions, type Renderer } from '../render';
 import type { RenderStore, StoredFile } from '../render/store';
 import {
@@ -589,7 +591,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get scene',
       description:
-        "Describe the whole scene at a frame. Values are the EVALUATED ones at that frame, like Blender's properties: keyframed, driven and F-curve-modified location / rotation_euler (radians, also in degrees) / scale, shape key values, constraint influences, pose channels, light / camera / curve / world settings; where animation overrides the value stored in the document (what transform_object or the *.properties_set operators change), the stored value is listed too (`stored`, `stored_value`, `stored_influence`). Contents: counts (objects by type; vertices / faces = BASE mesh data of mesh objects before modifiers, curves and text not included; evaluated {vertices, faces, triangles} = the geometry renders show, the same objects the renderers and export_scene use: objects shown in renders only (objects hidden with hide_render, e.g. Boolean cutters and helpers, are left out and counted apart in not_rendered {objects: their names, vertices, faces, triangles}), after shape keys, modifiers with their RENDER settings (SUBSURF render_levels, SCREW render_steps, show_render), curve bevels (render_resolution_u) and text, instances not included; evaluated_viewport = the objects shown in the viewport with the viewport settings (what the editor's statistics overlay shows), only listed when it differs; instances and instance_triangles = particle / collection instances in renders (their emitter or instancing empty shown in renders), viewport_instances when the viewport shows others), every object (id, name, type, parent, collection, transform, world-space bounds of the render geometry after modifiers, armature deformation, constraints and physics (wire curves: of their wire), data summary: mesh vertex/face counts (base, evaluated = render, evaluated_viewport when it differs) with shape keys and vertex groups, curve splines/points/fill_mode/bevel/extrude, text body, armature bones with parents and pose_position, light (datablock name, type, energy, colour, size/shape, spot), camera (lens, clipping, dof_use); material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, instances; where they are: get_instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, modifiers, poses, curves, instancing, physics) with object names so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object and get_mesh_data for vertex positions. Evaluations are cached per document state and frame, so repeated get_scene / get_object calls (e.g. checking motion at many frames) are cheap until the scene changes. Units: meters, Z up. Numbers are rounded to `decimals` (default 4 = 0.1 mm; up to 6 = 1 µm); get_object rounds to 6 by default.",
+        "Describe the whole scene at a frame. Values are the EVALUATED ones at that frame, like Blender's properties: keyframed, driven and F-curve-modified location / rotation_euler (radians, also in degrees) / scale, shape key values, constraint influences, pose channels, light / camera / curve / world settings; where animation overrides the value stored in the document (what transform_object or the *.properties_set operators change), the stored value is listed too (`stored`, `stored_value`, `stored_influence`). Contents: counts (objects by type; vertices / faces = BASE mesh data of mesh objects before modifiers, curves and text not included; evaluated {vertices, faces, triangles} = the geometry renders show, the same objects the renderers and export_scene use: objects shown in renders only (objects hidden with hide_render, e.g. Boolean cutters and helpers, are left out and counted apart in not_rendered {objects: their names, vertices, faces, triangles, and instances / instance_triangles of hidden emitters}; hidden source objects of scatters and collection instances are listed there too, while their instances render and are counted in instances / instance_triangles), after shape keys, modifiers with their RENDER settings (SUBSURF render_levels, SCREW render_steps, show_render), curve bevels (render_resolution_u) and text, instances not included; evaluated_viewport = the objects shown in the viewport with the viewport settings (what the editor's statistics overlay shows), only listed when it differs; instances and instance_triangles = particle / collection instances in renders (their emitter or instancing empty shown in renders), viewport_instances when the viewport shows others), every object (id, name, type, parent, collection, transform, world-space bounds of the render geometry after modifiers, armature deformation, constraints and physics (wire curves: of their wire), data summary: mesh vertex/face counts (base, evaluated = render, evaluated_viewport when it differs) with shape keys and vertex groups, curve splines/points/fill_mode/bevel/extrude, text body, armature bones with parents and pose_position, light (datablock name, type, energy, colour, size/shape, spot), camera (lens, clipping, dof_use); material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, instances; where they are: get_instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, modifiers, poses, curves, instancing, physics) with object names so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object and get_mesh_data for vertex positions. Evaluations are cached per document state and frame, so repeated get_scene / get_object calls (e.g. checking motion at many frames) are cheap until the scene changes. Units: meters, Z up. Numbers are rounded to `decimals` (default 4 = 0.1 mm; up to 6 = 1 µm); get_object rounds to 6 by default.",
       annotations: READ_ONLY,
     },
     {
@@ -628,7 +630,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get object',
       description:
-        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds of the render geometry (wire curves: their wire), parent (and parent bone) and children, data (mesh statistics base and evaluated = what renders show (render settings of the modifiers: SUBSURF render_levels, SCREW render_steps, show_render), plus evaluated_viewport when the viewport shows other geometry; shape keys with values, vertex groups with assigned vertex counts; every curve shape setting (fill_mode, bevel_mode/depth/resolution/object, bevel_factor, extrude, offset, use_fill_caps, twist_mode, resolution_u, render_resolution_u, path settings) and the spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts (instance transforms: get_instances), rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. data.evaluated is the geometry of the object itself, also when it is hidden from renders (hide_render; get_scene then counts it in counts.not_rendered, not in counts.evaluated). Numbers are rounded to `decimals` (default 6 = 1 µm, so sub-millimetre parts such as labels, engravings and fine bevels read back as they were made). Vertex positions and faces: get_mesh_data. Evaluations are cached per document state and frame: checking many objects or frames is cheap.',
+        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds of the render geometry (wire curves: their wire), parent (and parent bone) and children, data (mesh statistics base and evaluated = what renders show (render settings of the modifiers: SUBSURF render_levels, SCREW render_steps, show_render), plus evaluated_viewport when the viewport shows other geometry; shape keys with values, vertex groups with assigned vertex counts; every curve shape setting (fill_mode, bevel_mode/depth/resolution/object, bevel_factor, extrude, offset, use_fill_caps, twist_mode, resolution_u, render_resolution_u, path settings) and the spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts (instance transforms: get_instances), rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. The mesh statistics in data (data.evaluated, or the base counts when nothing changes the mesh) are those of the object itself, also when it is hidden from renders (hide_render: get_scene then counts it in counts.not_rendered, not in counts.evaluated). Numbers are rounded to `decimals` (default 6 = 1 µm, so sub-millimetre parts such as labels, engravings and fine bevels read back as they were made). Vertex positions and faces: get_mesh_data. Evaluations are cached per document state and frame: checking many objects or frames is cheap.',
       annotations: READ_ONLY,
     },
     {
@@ -848,11 +850,34 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     mesh: strictArgObject({ ...meshSelectionShape, select_mode: selectModeEnum.optional() })
       .optional()
       .describe('Edit-mode element selection of the active mesh (with mode EDIT)'),
-  }).describe("Selection/mode to set before running (persists for the agent's next calls)");
+  }).describe(
+    "Selection/mode to set before running (kept for the agent's next calls). All or nothing: a selection that cannot be applied is not applied at all, and a call that fails leaves the selection as it was",
+  );
 
+  /**
+   * Sets the agent's selection, active object and mode (and the Edit Mode element selection) from a
+   * `selection` argument, all or nothing: when any part fails (an unknown object, Edit Mode without
+   * an active mesh, an element index out of range) the agent's editor state is left as it was, and
+   * the error says why.
+   */
   function applySelection(p: AgentProject, sel: z.infer<typeof selectionSchema> | undefined): void {
     if (!sel) return;
+    const before = { ...p.state };
+    try {
+      setSelection(p, sel);
+    } catch (err) {
+      Object.assign(p.state, before);
+      throw err;
+    }
+  }
+
+  function setSelection(p: AgentProject, sel: z.infer<typeof selectionSchema>): void {
     const state = p.state;
+    // element selections only exist in Edit Mode: one given for Object Mode would do nothing
+    if (sel.mesh && (sel.mode === 'OBJECT' || (sel.mode === undefined && state.mode !== 'EDIT')))
+      throw new ToolError(
+        `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' (selection: {objects: ['<mesh object>'], mode: 'EDIT', mesh: {faces: […]}}).`,
+      );
     if (sel.objects) {
       const ids = sel.objects.map((r) => requireObject(p, r).id);
       state.selectedIds = [...new Set(ids)];
@@ -866,7 +891,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     if (sel.mode === 'EDIT' || (sel.mesh && state.mode === 'EDIT')) {
       const active = state.activeId ? p.scene.getObject(state.activeId) : null;
       if (!active || active.type !== 'MESH')
-        throw new ToolError('Edit mode needs an active mesh object (selection.active).');
+        throw new ToolError(
+          `Edit mode needs an active mesh object (selection.active)${active ? `: '${active.name}' is a ${active.type} object` : ''}.`,
+        );
       if (state.mode !== 'EDIT' || sel.mode === 'EDIT') enterEditMode(p.context(), active.id);
       if (sel.mesh) {
         const mode = inferSelectMode(sel.mesh, sel.mesh.select_mode);
@@ -876,12 +903,22 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     }
   }
 
+  /**
+   * Puts the agent's editor state back to what it was before a call (or a batch operation) that
+   * failed: a failed call changes nothing, its selection included.
+   */
+  function restoreState(p: AgentProject, before: EditorState): void {
+    Object.assign(p.state, before);
+    // objects the failed operator deleted are not selected
+    p.syncSelection();
+  }
+
   tool(
     'run_operator',
     {
       title: 'Run operator',
       description:
-        "Execute any operator by id with JSON parameters (see list_operators), as one undo step. Operators act on the agent's own selection like in Blender: use `selection` to choose objects, the active object and the mode (EDIT + mesh element selection for mesh.* operators) before running. Returns {ok, operator, result, reports, duration_ms, selection}. A failure is an error result whose first line is the message, followed by that JSON with `error` and `code`: INVALID_PARAMS (unknown, misspelled or invalid parameters: fix params), POLL_FAILED (wrong mode, selection or object type, or not available here: change the selection/mode), NOT_FOUND (an unknown operator, object or datablock) or FAILED (the operator itself failed).",
+        "Execute any operator by id with JSON parameters (see list_operators), as one undo step. Operators act on the agent's own selection like in Blender: use `selection` to choose objects, the active object and the mode (EDIT + mesh element selection for mesh.* operators) before running. Returns {ok, operator, result, reports, duration_ms, selection}. A failure is an error result whose first line is the message, followed by that JSON with `error` and `code`: INVALID_PARAMS (unknown, misspelled or invalid parameters: fix params), POLL_FAILED (wrong mode, selection or object type, or not available here: change the selection/mode), NOT_FOUND (an unknown operator, object or datablock) or FAILED (the operator itself failed). A call that fails changes nothing in the agent's editor state: a selection that cannot be applied (unknown object, mode EDIT without an active mesh, mesh elements without mode EDIT, an element index out of range) is not applied at all, and when the operator fails the selection, active object and mode are put back as they were before the call (the failure's `selection` shows them).",
       annotations: EDIT,
       argsHint:
         "Operator parameters go inside `params` (run_operator {project, operator, params: {…}, selection}); list_operators {search} gives each operator's parameters.",
@@ -913,8 +950,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         );
       const refused = toolOnlyOperator(operator);
       if (refused) return refuse(refused, 'FAILED');
+      const before = { ...p.state };
       applySelection(p, selection);
       const res = p.run(operator, params ?? {});
+      // a call that fails changes nothing: the selection and mode it asked for are not kept
+      if (!res.ok) restoreState(p, before);
       p.publishPresence();
       const out = {
         ok: res.ok,
@@ -935,7 +975,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Run several operators',
       description:
-        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). Each operation is {operator, params, selection?}: `selection` (as in run_operator: objects, active object, mode, edit-mode mesh elements) is set before that operation runs and stays set for the following ones, for operators that act on the selection (object.convert, object.transform_apply, export_mesh.* use_selection …). With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns per operation {operator, ok, result | error + code, reports} — `code` is INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED as in run_operator (a selection naming an unknown object fails its operation with NOT_FOUND); `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR.",
+        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). Each operation is {operator, params, selection?}: `selection` (as in run_operator: objects, active object, mode, edit-mode mesh elements) is set before that operation runs and stays set for the following ones, for operators that act on the selection (object.convert, object.transform_apply, export_mesh.* use_selection …). An operation that fails changes nothing in the agent's editor state: its selection is not kept (all or nothing, as in run_operator), so the following operations see the selection of before it. With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns per operation {operator, ok, result | error + code, reports} — `code` is INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED as in run_operator (a selection naming an unknown object fails its operation with NOT_FOUND); `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR.",
       annotations: EDIT,
       argsHint:
         'Each operation is {operator, params, selection} inside `operations` (batch {project, operations: [{operator, params: {…}, selection: {objects: […]}}, …], stop_on_error}).',
@@ -983,6 +1023,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             if (stop_on_error) break;
             continue;
           }
+          // an operation that fails changes nothing: neither its selection nor the operator's
+          const before = { ...p.state };
           if (op.selection)
             try {
               applySelection(p, op.selection);
@@ -1007,6 +1049,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             ...(res.reports.length ? { reports: res.reports } : {}),
           });
           if (!res.ok) {
+            restoreState(p, before);
             failed++;
             if (stop_on_error) break;
           }
@@ -1524,7 +1567,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Edit mesh',
       description:
-        "Run an edit-mode operator on a mesh object: enters Edit Mode on the object (headless), selects the given vertices/edges/faces (default: everything), runs the operator (mesh.* such as mesh.extrude_region_move {value}, mesh.inset, mesh.subdivide, mesh.loopcut, mesh.delete, mesh.merge, or transform.translate/rotate/resize to move the selected elements), then returns to Object Mode. Use list_operators (search 'mesh.') for the catalogue and parameters. One undo step. Returns {ok, operator, result, reports, mesh, selection_after}; a failure also carries `error` and `code` (INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED, as run_operator).",
+        "Run an edit-mode operator on a mesh object: enters Edit Mode on the object (headless), selects the given vertices/edges/faces (default: everything), runs the operator (mesh.* such as mesh.extrude_region_move {value}, mesh.inset, mesh.subdivide, mesh.loopcut, mesh.delete, mesh.merge, or transform.translate/rotate/resize to move the selected elements), then returns to Object Mode; the object is then the agent's selected and active object. A call that fails (an element index out of range, the operator's failure) leaves the agent's selection and mode as they were. Use list_operators (search 'mesh.') for the catalogue and parameters. One undo step. Returns {ok, operator, result, reports, mesh, selection_after}; a failure also carries `error` and `code` (INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED, as run_operator).",
       annotations: EDIT,
       argsHint:
         'Operator parameters go inside `params`; the elements to select go inside `selection` {verts, edges, faces, all}.',
@@ -1553,19 +1596,27 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const refused = toolOnlyOperator(a.operator);
       if (refused) return refuse(refused, 'FAILED');
       const mode = inferSelectMode(a.selection, a.select_mode);
-      const res = p.step(() => {
-        p.state.mode = 'OBJECT';
-        p.state.selectedIds = [o.id];
-        p.state.activeId = o.id;
-        enterEditMode(p.context(), o.id);
-        p.state.selectMode = mode;
-        p.state.meshSelection = meshSelection(p, o.id, a.selection, mode);
-        try {
-          return p.run(a.operator, a.params ?? {});
-        } finally {
+      const before = { ...p.state };
+      let res: RunResult;
+      try {
+        res = p.step(() => {
           p.state.mode = 'OBJECT';
-        }
-      });
+          p.state.selectedIds = [o.id];
+          p.state.activeId = o.id;
+          enterEditMode(p.context(), o.id);
+          p.state.selectMode = mode;
+          p.state.meshSelection = meshSelection(p, o.id, a.selection, mode);
+          try {
+            return p.run(a.operator, a.params ?? {});
+          } finally {
+            p.state.mode = 'OBJECT';
+          }
+        });
+      } catch (err) {
+        // an element index out of range: nothing changed, the agent's selection included
+        restoreState(p, before);
+        throw err;
+      }
       const after = p.scene.getObject(o.id);
       const mesh = after?.data ? p.scene.getMesh(after.data) : null;
       const sel = p.state.meshSelection;
@@ -1582,6 +1633,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           faces: [...sel.faces].slice(0, 500),
         },
       };
+      // a call that fails changes nothing: the agent's selection and mode stay as they were
+      if (!res.ok) restoreState(p, before);
       p.publishPresence();
       if (!res.ok) return failure(`${a.operator} failed: ${res.error}`, out);
       return out;
@@ -2006,7 +2059,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Export scene',
       description:
-        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at a frame (default: the agent's current frame). OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, elapsed_ms, warnings} plus the file as an embedded base64 resource (up to 20 MiB) and a download link. The export runs on a render thread, so it does not hold up the server; a glTF export samples every frame of the scene range, which takes seconds for long ranges and large scenes. download_url (an HTTP endpoint of this server) exports again when it is fetched, with the same options (format, objects, apply_modifiers, frame): the same file as the embedded one while the scene is unchanged, the project's current state after later edits. `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped.",
+        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at a frame (default: the agent's current frame). OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images, by default about 128 texels per metre of surface (512–2048 px per mesh), or bake_resolution px; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, elapsed_ms, warnings} plus the file as an embedded base64 resource (up to 20 MiB) and a download link. The export runs on a render thread, so it does not hold up the server; a glTF export samples every frame of the scene range, which takes seconds for long ranges and large scenes. download_url (an HTTP endpoint of this server) exports again when it is fetched, with the same options (format, objects, apply_modifiers, frame, bake_resolution): the same file as the embedded one while the scene is unchanged, the project's current state after later edits. `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped.",
       annotations: READ_ONLY,
     },
     {
@@ -2021,6 +2074,15 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .number()
         .optional()
         .describe("Frame the scene is evaluated at (default: the agent's current frame)"),
+      bake_resolution: z
+        .number()
+        .int()
+        .min(64)
+        .max(4096)
+        .optional()
+        .describe(
+          'glTF/GLB: size in pixels of the square images procedural textures are baked into, for every bake (64–4096). Default: per mesh, about 128 texels per metre of its surface (512–2048 px), within a budget for the whole export; raise it for large objects whose baked texture looks blurry',
+        ),
     },
     async (a, extra) => {
       const p = await agent.project(a.project);
@@ -2034,7 +2096,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           scene: p.scene,
           projectId: p.id,
           format: a.format as ExportFormat,
-          options: { objectIds, applyModifiers: a.apply_modifiers, frame },
+          options: { objectIds, applyModifiers: a.apply_modifiers, frame, bakeResolution: a.bake_resolution },
           signal: extra.signal,
         });
       } catch (err) {
@@ -2048,6 +2110,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const query = new URLSearchParams({ format: a.format, frame: String(frame) });
       if (objectIds) query.set('objects', objectIds.join(','));
       if (!a.apply_modifiers) query.set('apply_modifiers', 'false');
+      if (a.bake_resolution !== undefined) query.set('bake_resolution', String(a.bake_resolution));
       const downloadUrl = `${baseUrl(extra)}/api/projects/${encodeURIComponent(p.id)}/export?${query}`;
       const info = {
         format: a.format,
@@ -2057,6 +2120,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         frame,
         objects: objectIds ? objectIds.map((id) => p.scene.getObject(id)?.name ?? id) : 'all',
         apply_modifiers: a.apply_modifiers,
+        ...(a.bake_resolution !== undefined ? { bake_resolution: a.bake_resolution } : {}),
         download_url: downloadUrl,
         elapsed_ms: res.elapsedMs,
         // what the format could not represent (procedural textures that need UVs, area lights …)
@@ -2079,7 +2143,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         name: filename,
         mimeType: res.mime,
         description:
-          'Download: exported again on request with the same options (format, objects, apply_modifiers, frame)',
+          'Download: exported again on request with the same options (format, objects, apply_modifiers, frame, bake_resolution)',
       });
       return { content };
     },
@@ -2620,19 +2684,23 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'editor_command',
     {
       title: 'Editor command',
-      description:
-        'Send a UI command to a live browser editor that has the project open (most recently active one, or `client`): e.g. view.frame_all, view.frame_selected, view.set_view {view: FRONT|TOP|RIGHT|CAMERA...}, select {objects}, set_mode {mode}, screenshot. Fails when no browser editor accepting UI commands is connected.',
+      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`). Commands and their \`params\`: ${editorCommandList()}. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected.`,
       annotations: { ...EDIT, openWorldHint: true },
       argsHint: 'Command parameters go inside `params` (editor_command {project, command, params: {…}}).',
     },
     {
       project: projectArg,
-      command: z.string().min(1),
-      params: z.record(z.string(), z.unknown()).optional(),
+      command: z.string().min(1).describe('UI command, e.g. view.set_view (see the description)'),
+      params: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe("The command's parameters, e.g. {view: 'TOP'}"),
       client: z.string().optional().describe('Connection id or client name'),
       timeout_ms: z.number().int().min(100).max(60_000).default(10_000),
     },
     async (a, extra) => {
+      // a misspelled command or parameter would be ignored by the editor: refuse it first
+      checkEditorCommand(a.command, a.params ?? {});
       const p = await agent.project(a.project);
       try {
         const result = await p.room.rpc(

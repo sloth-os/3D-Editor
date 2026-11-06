@@ -261,6 +261,7 @@ export function fillGridPatch(
   S: number,
   corner: number[],
   fullness: number,
+  boxiness = 0,
 ): void {
   const n = sides.length;
   const sample = (i: number, t: number): Pt => {
@@ -320,7 +321,31 @@ export function fillGridPatch(
       for (let k = 0; k <= m; k++) {
         if (j === 0) row.push(sides[i].ids[k]);
         else if (k === 0) row.push(sides[(i + n - 1) % n].ids[S - j]);
-        else row.push(newVertex(sampleGrid(lv, lv.grid[i], (j * lv.N) / S, (k * lv.N) / S), i, j, k));
+        else {
+          const p = sampleGrid(lv, lv.grid[i], (j * lv.N) / S, (k * lv.N) / S);
+          if (boxiness > 0) {
+            // boxy profiles: toward the Coons patch of the sector (its corner, the halves of the two
+            // profiles there, straight lines from their middles to the center), which for square
+            // profiles is the flat corner of the face itself
+            const u = k / (S / 2);
+            const w = j / (S / 2);
+            const prev = (i + n - 1) % n;
+            const c0 = sample(i, 0);
+            const mi = sample(i, 0.5);
+            const mp = sample(prev, 0.5);
+            const g0 = sample(i, u / 2);
+            const d0 = sample(prev, 1 - w / 2);
+            for (let q = 0; q < 3; q++) {
+              const g1 = mp[q] + (pc[q] - mp[q]) * u;
+              const d1 = mi[q] + (pc[q] - mi[q]) * w;
+              const bil =
+                (1 - u) * (1 - w) * c0[q] + u * (1 - w) * mi[q] + (1 - u) * w * mp[q] + u * w * pc[q];
+              const coons = (1 - w) * g0[q] + w * g1 + (1 - u) * d0[q] + u * d1 - bil;
+              p[q] += boxiness * (coons - p[q]);
+            }
+          }
+          row.push(newVertex(p, i, j, k));
+        }
       }
       rows.push(row);
     }

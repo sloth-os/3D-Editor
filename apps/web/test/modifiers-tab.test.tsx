@@ -7,7 +7,7 @@ import { session as sessionSignal } from '../src/app/store';
 import { registry, runResult } from '../src/editor/editor';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
-import { Properties, activePropertiesTab } from '../src/ui/properties/Properties';
+import { Properties, activePropertiesTab, availableTabs } from '../src/ui/properties/Properties';
 
 /** A project session backed by a real document, evaluator, undo manager and operator registry. */
 function fakeSession(): ProjectSession {
@@ -155,3 +155,51 @@ describe('Modifiers tab slider drags next to concurrent edits (other devices, MC
     expect(modifiers()).toEqual([]);
   });
 });
+
+describe('Modifiers tab of curve and text objects', () => {
+  it('is shown for curves and text and edits their modifier stack', () => {
+    // regression: the tab was only offered for meshes, so the modifiers of a lathe curve (SCREW,
+    // SMOOTH_BY_ANGLE) could not be seen or changed in the Properties editor
+    ok('curve.add_from_points', {
+      name: 'Profile',
+      points: [
+        [0.1, 0, 0],
+        [0.12, 0, 0.1],
+        [0.05, 0, 0.2],
+      ],
+      type: 'POLY',
+    });
+    ok('object.text_add', { body: 'Hi', name: 'Label' });
+    ok('object.modifier_add', { object: 'Profile', type: 'SCREW' });
+    ok('object.modifier_add', { object: 'Label', type: 'SOLIDIFY' });
+    for (const name of ['Profile', 'Label']) expect(availableTabsOf(name)).toContain('modifiers');
+    ok('object.empty_add', { name: 'Marker' });
+    expect(availableTabsOf('Marker')).not.toContain('modifiers');
+
+    const profile = s.doc.findObjectByName('Profile')!;
+    s.state.selectedIds = [profile.id];
+    s.state.activeId = profile.id;
+    activePropertiesTab.value = 'modifiers';
+    const { container } = render(<Properties session={s} />);
+    expect(byTestId(container, 'prop-tab-modifiers')).not.toBeNull();
+    expect(byTestId(container, 'prop-content-modifiers')).not.toBeNull();
+    expect(container.textContent).toContain('Screw');
+    // a parameter edit goes through object.modifier_set
+    const steps = byTestId(container, 'mod-screw-steps')!;
+    fireEvent.pointerDown(steps, { button: 0, clientX: 100, pointerId: 1 });
+    fireEvent.pointerUp(steps, { clientX: 100, pointerId: 1 });
+    const input = byTestId(container, 'mod-screw-steps')!.querySelector('input')!;
+    fireEvent.input(input, { target: { value: '24' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(s.doc.findObjectByName('Profile')!.modifiers[0].params.steps).toBe(24);
+    // modifiers of curves bake only as a whole (convert to mesh): Apply says so instead of failing
+    const apply = byTestId(container, 'modifier-apply-Screw') as HTMLButtonElement;
+    expect(apply.disabled).toBe(true);
+    expect(apply.title).toContain('Object > Convert > Mesh');
+    expect(byTestId(container, 'modifier-curve-hint')?.textContent).toContain('wire');
+  });
+});
+
+function availableTabsOf(name: string) {
+  return availableTabs(s.doc.findObjectByName(name));
+}

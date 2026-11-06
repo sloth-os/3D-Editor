@@ -3,6 +3,12 @@ import { z } from 'zod';
 import type { ExportFormat } from '@3d-editor/core';
 import type { RoomManager } from '../sync/room-manager';
 import { StorageUnavailableError } from '../sync/room-manager';
+import {
+  ProjectNameTakenError,
+  freeProjectName,
+  requireFreeProjectName,
+  withProjectNames,
+} from '../sync/project-names';
 import type { Room } from '../sync/room';
 import { errorMessage, withSpan, withSpanSync } from '../observability/tracing';
 import { RenderRequestError, isCancelled, sharedRenderer, type Renderer } from '../render';
@@ -10,8 +16,11 @@ import { sharedRenderStore, type RenderStore } from '../render/store';
 
 export const EXPORT_FORMATS = ['glb', 'gltf', 'obj', 'stl', 'ply'] as const;
 
+/** Name of projects created without one (then 'Untitled.001', … while it is taken). */
+const UNTITLED = 'Untitled';
 const createBody = z.object({
-  name: z.string().trim().min(1).max(200).default('Untitled'),
+  /** Must not be taken (ignoring case); without it the first free 'Untitled', 'Untitled.001' … */
+  name: z.string().trim().min(1).max(200).optional(),
   empty: z.boolean().default(false),
 });
 const renameBody = z.object({ name: z.string().trim().min(1).max(200) });
@@ -19,7 +28,8 @@ const idParams = z.object({ id: z.string() });
 /**
  * Options of GET /api/projects/:id/export (the same as the MCP export_scene tool, whose download
  * link carries them): `objects` (comma-separated ids or names; default every object shown in
- * renders), `apply_modifiers` (default true) and `frame` (default the scene's frame_start).
+ * renders), `apply_modifiers` (default true), `frame` (default the scene's frame_start) and
+ * `bake_resolution` (glTF: pixels of procedural texture bakes, 64–4096; default per mesh).
  */
 const exportQuery = z.object({
   format: z.enum(EXPORT_FORMATS).default('glb'),
@@ -29,6 +39,7 @@ const exportQuery = z.object({
     .transform((v) => ['true', '1', 'yes', 'on'].includes(v))
     .optional(),
   frame: z.coerce.number().optional(),
+  bake_resolution: z.coerce.number().int().min(64).max(4096).optional(),
 });
 const queryBool = z
   .enum(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off'])
@@ -69,6 +80,21 @@ function badRequest(reply: FastifyReply, error: z.ZodError | string) {
       ? error
       : error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`).join('; ');
   return reply.code(400).send({ error: message });
+}
+
+/**
+ * 409 for a name another project has: its id and what to do. Project names are unique (ignoring
+ * letter case) because projects are found by name (MCP tools, `?project=` links).
+ */
+function nameTaken(reply: FastifyReply, err: ProjectNameTakenError) {
+  const ids = err.ids;
+  return reply.code(409).send({
+    error:
+      `A project named '${err.holders[0].name}' already exists (id ${ids.join(', ')}). Project names are unique, ignoring letter case, ` +
+      `because projects are found by name: open that project, delete it first (DELETE /api/projects/${ids[0]}) or choose another name.`,
+    id: ids[0],
+    ids,
+  });
 }
 
 /** Builds a safe download file name from a project name. */
@@ -113,8 +139,18 @@ export function registerProjectRoutes(
   app.post('/api/projects', async (request, reply) => {
     const body = createBody.safeParse(request.body ?? {});
     if (!body.success) return badRequest(reply, body.error);
-    const room = await rooms.createProject(body.data);
-    return reply.code(201).send({ id: room.id, name: room.scene.name });
+    const { name, empty } = body.data;
+    try {
+      // the name check and the creation run one at a time with MCP create_project / rename_project
+      const room = await withProjectNames(rooms, async () => {
+        if (name !== undefined) await requireFreeProjectName(rooms, name);
+        return rooms.createProject({ name: name ?? (await freeProjectName(rooms, UNTITLED)), empty });
+      });
+      return reply.code(201).send({ id: room.id, name: room.scene.name });
+    } catch (err) {
+      if (err instanceof ProjectNameTakenError) return nameTaken(reply, err);
+      throw err;
+    }
   });
 
   app.get('/api/projects/:id', async (request, reply) => {
@@ -130,7 +166,15 @@ export function registerProjectRoutes(
     if (!body.success) return badRequest(reply, body.error);
     const room = await roomOr404(id, reply);
     if (!room) return reply;
-    room.scene.setName(body.data.name);
+    try {
+      await withProjectNames(rooms, async () => {
+        await requireFreeProjectName(rooms, body.data.name, id);
+        room.scene.setName(body.data.name);
+      });
+    } catch (err) {
+      if (err instanceof ProjectNameTakenError) return nameTaken(reply, err);
+      throw err;
+    }
     return room.listing();
   });
 
@@ -188,7 +232,12 @@ export function registerProjectRoutes(
             scene: room.scene,
             projectId: id,
             format: q.data.format as ExportFormat,
-            options: { objectIds, applyModifiers: q.data.apply_modifiers, frame: q.data.frame },
+            options: {
+              objectIds,
+              applyModifiers: q.data.apply_modifiers,
+              frame: q.data.frame,
+              bakeResolution: q.data.bake_resolution,
+            },
             signal: abort.signal,
           }),
       );

@@ -271,12 +271,15 @@ describe('glTF export of procedural materials', () => {
 
   it('embeds baked PNG textures with absolute values and per-mesh materials when needed', () => {
     const res = exportScene(scene(), 'glb', {});
-    expect(res.warnings).toEqual([]);
+    // GENERATED bakes depend on the mesh: two 'Gen' materials (named apart, with a note); UV bakes
+    // are shared: one 'Uv'
+    expect(res.warnings).toEqual([
+      "Material 'Gen' is exported as 2 glTF materials (Gen, Gen.001): its procedural textures depend on the surface (GENERATED/OBJECT mapping or a bump), so they are baked for each mesh",
+    ]);
     const { json, bin } = readGLB(res.data);
     const materials = json.materials as { name: string; pbrMetallicRoughness: Record<string, unknown> }[];
-    // GENERATED bakes depend on the mesh: two 'Gen' materials; UV bakes are shared: one 'Uv'
-    expect(materials.filter((m) => m.name === 'Gen')).toHaveLength(2);
-    expect(materials.filter((m) => m.name === 'Uv')).toHaveLength(1);
+    expect(materials.filter((m) => m.name === 'Gen' || m.name === 'Gen.001')).toHaveLength(2);
+    expect(materials.filter((m) => m.name.startsWith('Uv'))).toHaveLength(1);
     const gen = materials.find((m) => m.name === 'Gen')!.pbrMetallicRoughness;
     expect(gen.baseColorFactor).toBeUndefined();
     expect(gen.metallicFactor).toBeUndefined();

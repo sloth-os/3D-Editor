@@ -116,6 +116,12 @@ export interface SyncOptions {
   renderAspect: number;
   castShadows: boolean;
   imagesRevision: number;
+  /**
+   * Whether the viewport's overlays are on. Off, the object helpers (cameras, lights, empties,
+   * bones, curves without a surface) and the wireframe overlays (Wireframe toggle, `show_wire`,
+   * Display As Wire) are hidden and cannot be clicked, like in Blender; Wireframe shading stays.
+   */
+  overlays: boolean;
 }
 
 /** Keeps three.js objects in sync with an evaluated scene (incremental, cached by keys). */
@@ -300,13 +306,12 @@ export class SceneObjects {
       opts.shading !== 'WIREFRAME' && o.data.display_type !== 'WIRE' && o.data.display_type !== 'BOUNDS';
     v.mesh.castShadow = opts.castShadows;
     v.mesh.receiveShadow = opts.castShadows;
-    // wireframe overlay
+    // wireframe overlay (the wires of Wireframe shading are the shading, not an overlay)
     const showWire =
       !isEdit &&
       (opts.shading === 'WIREFRAME' ||
-        opts.showWireOverlay ||
-        o.data.show_wire ||
-        o.data.display_type === 'WIRE');
+        (opts.overlays &&
+          (opts.showWireOverlay || o.data.show_wire || o.data.display_type === 'WIRE')));
     if (showWire) {
       const wk = `${v.meshKey}`;
       if (!v.wire || v.wireKey !== wk) {
@@ -398,6 +403,7 @@ export class SceneObjects {
       const sel = opts.selected.has(o.id);
       mat.color.copy(o.id === opts.activeId ? COLORS.active : sel ? COLORS.selected : COLORS.helper);
       mat.depthTest = !opts.xray;
+      v.helper.visible = opts.overlays;
     }
   }
 
@@ -514,14 +520,18 @@ export class SceneObjects {
     }
   }
 
-  /** Meshes that can be picked, plus helper pick proxies. */
+  /**
+   * Meshes that can be picked, plus the pick proxies of the helpers on screen (none while the
+   * overlays are off, and none for an object that no longer draws a helper, e.g. a curve that got
+   * a surface).
+   */
   pickables(): THREE.Object3D[] {
     const out: THREE.Object3D[] = [];
     for (const v of this.views.values()) {
       if (!v.root.visible) continue;
       if (v.mesh?.visible) out.push(v.mesh);
       else if (v.wire?.visible) out.push(v.wire);
-      if (v.pickProxy) out.push(v.pickProxy);
+      if (v.pickProxy && v.helper?.visible) out.push(v.pickProxy);
     }
     for (const im of this.instanced.values()) if (im.visible) out.push(im);
     return out;

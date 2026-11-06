@@ -20,6 +20,8 @@ import { fillGridPatch, patchFullness, type GridPatchContext, type PatchSide } f
  * like Blender's (see bevel-patch.ts); with one segment it is a single polygon.
  * Vertex mode: corners are cut off at `width` along each incident edge; with several segments the cut
  * is rounded by profiles across the faces and the same quad-grid patch.
+ * Profiles are Blender's superellipses (profile 0.5 a circular arc, 1 a square corner) with their
+ * segments spaced evenly along the curve. UVs are interpolated per face corner (see `BevelUVs`).
  *
  * Limitations: only manifold vertices with a closed face fan are beveled (boundary and non-manifold
  * vertices/edges are left as they are) and the width is clamped globally (`use_clamp_overlap`).
@@ -44,7 +46,11 @@ const schema = z.object({
     .min(0)
     .max(1)
     .default(0.5)
-    .describe('Profile shape: 0.5 round, 0.25 straight, 1 boxy, <0.25 concave'),
+    .describe(
+      'Profile shape (Blender superellipse): 0.5 round (circular arc), 0.25 straight chamfer, above 0.5 boxier up ' +
+        'to 1 = square (the segments follow the original sharp edge), below 0.25 concave (values under 0.01 act as ' +
+        '0.01). Segments are spaced evenly along the profile.',
+    ),
   material: z
     .number()
     .int()
@@ -95,7 +101,7 @@ function vertexRing(m: MeshData, topo: Topology, dirFace: Map<string, number>, v
  * 0.5 → 2 (circle), 0.25 → 1 (straight), 1 → ∞ (square corner), 0 → 0 (inverted square).
  */
 function profileExponent(profile: number): number {
-  const p = Math.min(0.9999, Math.max(1e-4, profile));
+  const p = Math.min(0.9999, Math.max(0.01, profile));
   return (-2 * Math.LN2) / Math.log(p);
 }
 
@@ -308,7 +314,10 @@ class BevelUVs {
     const [a, c] = this.topo.edges[e];
     const d = sub(P, c, a);
     const dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-    let t = dd > 0 ? ((pt[0] - P[a * 3]) * d[0] + (pt[1] - P[a * 3 + 1]) * d[1] + (pt[2] - P[a * 3 + 2]) * d[2]) / dd : 0;
+    let t =
+      dd > 0
+        ? ((pt[0] - P[a * 3]) * d[0] + (pt[1] - P[a * 3 + 1]) * d[1] + (pt[2] - P[a * 3 + 2]) * d[2]) / dd
+        : 0;
     t = Math.min(1, Math.max(0, t));
     return [P[a * 3] + d[0] * t, P[a * 3 + 1] + d[1] * t, P[a * 3 + 2] + d[2] * t];
   }
@@ -327,7 +336,8 @@ class BevelUVs {
       if (k === HomeKind.FACE && this.ref[id] !== f) {
         const e = this.sharedEdge(f, i, this.ref[id]);
         pt = e >= 0 ? this.snap(e, pt) : at;
-      } else if (k === HomeKind.EDGE) pt = this.isEdgeAt(f, i, this.ref[id]) ? this.snap(this.ref[id], pt) : at;
+      } else if (k === HomeKind.EDGE)
+        pt = this.isEdgeAt(f, i, this.ref[id]) ? this.snap(this.ref[id], pt) : at;
       else if (k === HomeKind.VERT) pt = at;
     }
     return cornerUV(this.m, f, i, pt);
@@ -341,7 +351,9 @@ class BevelUVs {
     for (const f of candidates)
       if (loop.every((x) => this.compatible(f, x))) return loop.flatMap((x) => this.uvIn(f, x));
     if (continuous)
-      return loop.flatMap((x) => this.uvIn(candidates.find((f) => this.compatible(f, x)) ?? candidates[0], x));
+      return loop.flatMap((x) =>
+        this.uvIn(candidates.find((f) => this.compatible(f, x)) ?? candidates[0], x),
+      );
     let best = candidates[0];
     let bestN = -1;
     for (const f of candidates) {
@@ -393,7 +405,8 @@ function gridPatch(
     onVertex,
     addFace: (loop) => addPatch(ctx, loop),
   };
-  fillGridPatch(gctx, sides, S, corner, patchFullness(profileExponent(profile)));
+  const k = profileExponent(profile);
+  fillGridPatch(gctx, sides, S, corner, patchFullness(k), k > 2 ? 1 - 2 / k : 0);
   return true;
 }
 
@@ -986,7 +999,10 @@ export const bevelModifier: ModifierDef<typeof schema> = {
     'one triangle per cube corner), round corners of round profiles lying on a sphere; with 1 segment one polygon. ' +
     'affect=VERTICES cuts off corners instead (rounded the same way with segments > 1). The width is clamped so ' +
     'neighbouring bevels stop just short of each other (use_clamp_overlap). Closed manifold input stays closed. ' +
-    'Limitation: boundary / non-manifold vertices are not beveled.',
+    'UVs of the new faces are interpolated per face corner inside the UV island of the face each one was cut ' +
+    'from (like Blender), so bevels do not stretch across UV seams. Limitations: boundary / non-manifold vertices ' +
+    'are not beveled; corner patches where edges of very different angles meet (every rim vertex of a cylinder ' +
+    'with limit_method NONE) can be slightly uneven (dents under 1% of the width).',
   schema,
   apply(mesh, p) {
     return bevelMesh(mesh, p);

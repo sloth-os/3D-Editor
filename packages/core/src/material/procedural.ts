@@ -137,7 +137,7 @@ export const PROCEDURAL_PACKING: Readonly<
     mortar_b: ['k2', 2],
   },
   MARBLE: { marble_type: ['mode', 0], wave_profile: ['mode', 1] },
-  WOOD: { wood_type: ['mode', 0], wave_profile: ['mode', 1], grain: ['k0', 0] },
+  WOOD: { wood_type: ['mode', 0], wave_profile: ['mode', 1], axis: ['mode', 2], grain: ['k0', 0] },
   MAGIC: {},
 };
 
@@ -478,12 +478,16 @@ export function samplePattern(
       break;
     }
     case T_WOOD: {
-      let n = mode[0] === 0 ? Math.sqrt(x * x + y * y) : (x + y + z) * INV_SQRT3;
-      if (dist !== 0) n += dist * (fractalNoise(x, y, z * 0.25, detail, rough, 2, s, NOISE_FBM) * 2 - 1);
+      // the ring axis becomes w: X → (u, v, w) = (y, z, x), Y → (z, x, y), Z → (x, y, z)
+      const u = mode[2] === 1 ? y : mode[2] === 2 ? z : x;
+      const v0 = mode[2] === 1 ? z : mode[2] === 2 ? x : y;
+      const w = mode[2] === 1 ? x : mode[2] === 2 ? y : z;
+      let n = mode[0] === 0 ? Math.sqrt(u * u + v0 * v0) : (u + v0 + w) * INV_SQRT3;
+      if (dist !== 0) n += dist * (fractalNoise(u, v0, w * 0.25, detail, rough, 2, s, NOISE_FBM) * 2 - 1);
       let v = waveProfile(n * TWO_PI, mode[1]);
       const grain = k0[0];
       if (grain > 0)
-        v *= 1 - grain * fractalNoise(x * 16, y * 16, z * 0.5, 1, 0.5, 2, streamSeed(s, 7), NOISE_FBM);
+        v *= 1 - grain * fractalNoise(u * 16, v0 * 16, w * 0.5, 1, 0.5, 2, streamSeed(s, 7), NOISE_FBM);
       f = v;
       break;
     }

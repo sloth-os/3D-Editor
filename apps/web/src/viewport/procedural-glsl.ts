@@ -347,11 +347,13 @@ vec4 pfxSample(PfxTex t, vec3 coord) {
     if (t.mode.x >= 2) v = sqrt(v);
     fac = v;
   } else if (t.type == 7) {
-    float n = t.mode.x == 0 ? sqrt(p.x * p.x + p.y * p.y) : (p.x + p.y + p.z) * PFX_INV_SQRT3;
-    if (dist != 0.0) n += dist * (pfxFractal(vec3(p.x, p.y, p.z * 0.25), detail, rough, 2.0, s, 0) * 2.0 - 1.0);
+    // params.axis (mode.z): the ring axis becomes w, X → (y, z, x), Y → (z, x, y) (as procedural.ts)
+    vec3 q = t.mode.z == 1 ? p.yzx : (t.mode.z == 2 ? p.zxy : p);
+    float n = t.mode.x == 0 ? sqrt(q.x * q.x + q.y * q.y) : (q.x + q.y + q.z) * PFX_INV_SQRT3;
+    if (dist != 0.0) n += dist * (pfxFractal(vec3(q.x, q.y, q.z * 0.25), detail, rough, 2.0, s, 0) * 2.0 - 1.0);
     float v = pfxWaveProfile(n * PFX_TWO_PI, t.mode.y);
     if (t.k0.x > 0.0)
-      v *= 1.0 - t.k0.x * pfxFractal(vec3(p.x * 16.0, p.y * 16.0, p.z * 0.5), 1.0, 0.5, 2.0, pfxStreamSeed(s, 7u), 0);
+      v *= 1.0 - t.k0.x * pfxFractal(vec3(q.x * 16.0, q.y * 16.0, q.z * 0.5), 1.0, 0.5, 2.0, pfxStreamSeed(s, 7u), 0);
     fac = v;
   } else if (t.type == 8) {
     float gain = dist * 1.5;

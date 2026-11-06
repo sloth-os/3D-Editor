@@ -629,10 +629,11 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
     }
     const sheen = ext.KHR_materials_sheen;
     if (sheen) {
+      // sheen colour = tint × weight (as the exporter writes it): the brightest component is the weight
       const c = sheen.sheenColorFactor ?? [0, 0, 0];
       const m = Math.max(c[0], c[1], c[2]);
       if (m > 0) {
-        props.sheen_weight = 1;
+        props.sheen_weight = clamp01(m);
         props.sheen_tint = [c[0] / m, c[1] / m, c[2] / m];
       }
     }

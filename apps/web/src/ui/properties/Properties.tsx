@@ -39,6 +39,12 @@ const isMesh = (o: ObjectData | null) => o?.type === 'MESH';
 /** Object types with material slots (core: meshes, and curves/text through their splines). */
 const MATERIAL_TYPES = new Set(['MESH', 'CURVE', 'FONT']);
 const hasMaterialSlots = (o: ObjectData | null) => !!o && MATERIAL_TYPES.has(o.type);
+/**
+ * Objects with a modifier stack (core object.modifier_add: meshes, curves and text with their
+ * data; on curves and text the stack acts on the surface, or on the wire of a curve without one).
+ */
+const MODIFIER_TYPES = new Set(['MESH', 'CURVE', 'FONT']);
+export const hasModifierStack = (o: ObjectData | null) => !!o?.data && MODIFIER_TYPES.has(o.type);
 
 const TABS: TabDef[] = [
   { id: 'render', icon: 'render', title: 'Render' },
@@ -46,7 +52,7 @@ const TABS: TabDef[] = [
   { id: 'scene', icon: 'scene', title: 'Scene' },
   { id: 'world', icon: 'world', title: 'World' },
   { id: 'object', icon: 'object', title: 'Object', available: hasObject },
-  { id: 'modifiers', icon: 'wrench', title: 'Modifiers', available: isMesh },
+  { id: 'modifiers', icon: 'wrench', title: 'Modifiers', available: hasModifierStack },
   { id: 'particles', icon: 'particles', title: 'Particles', available: (o) => !!o && canHaveParticles(o) },
   { id: 'physics', icon: 'physics', title: 'Physics', available: (o) => isMesh(o) || !!o?.rigid_body },
   { id: 'constraints', icon: 'constraint', title: 'Object Constraints', available: hasObject },

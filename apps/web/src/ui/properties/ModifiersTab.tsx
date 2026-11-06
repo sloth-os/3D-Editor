@@ -87,8 +87,22 @@ function addMenu(o: ObjectData): MenuItem[] {
     .filter((c) => c.submenu.length > 0);
 }
 
+/**
+ * Why a modifier of `o` cannot be applied on its own (null when it can): the stack of a curve or
+ * text object only bakes as a whole, by converting the object to a mesh (core object.modifier_apply).
+ */
+export function modifierApplyBlocked(o: ObjectData): string | null {
+  if (o.type === 'MESH') return null;
+  const kind = o.type === 'FONT' ? 'text' : 'curve';
+  return (
+    `Modifiers of a ${kind} object cannot be applied one by one: Object > Convert > Mesh bakes the ` +
+    'whole modifier stack into a mesh'
+  );
+}
+
 export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const ev = s.evaluator.evaluate(s.state.frame).byId.get(o.id);
+  const applyBlocked = modifierApplyBlocked(o);
   return (
     <>
       <div class="prop-context">
@@ -97,6 +111,13 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
       <div style={{ padding: '4px 8px' }} data-testid="add-modifier">
         <MenuButton label="Add Modifier ▾" items={() => addMenu(o)} testId="add-modifier-button" />
       </div>
+      {o.type !== 'MESH' && (
+        <div class="hint" style={{ padding: '0 8px 4px' }} data-testid="modifier-curve-hint">
+          {o.type === 'FONT'
+            ? 'The modifiers act on the surface of the text.'
+            : 'The modifiers act on the surface of the curve, or on its wire when it has none (Screw revolves a profile).'}
+        </div>
+      )}
       {o.modifiers.length === 0 && (
         <div class="empty-note">No modifiers. Add one to change geometry non-destructively.</div>
       )}
@@ -168,7 +189,8 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
                 </button>
                 <button
                   class="btn flat"
-                  title="Apply (bake into mesh)"
+                  title={applyBlocked ?? 'Apply (bake into mesh)'}
+                  disabled={!!applyBlocked}
                   data-testid={`modifier-apply-${m.name}`}
                   onClick={() => run('object.modifier_apply', { object: o.id, modifier: m.id }, 'ui')}
                 >

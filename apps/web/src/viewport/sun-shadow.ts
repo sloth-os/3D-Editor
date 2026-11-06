@@ -17,6 +17,16 @@ import * as THREE from 'three';
  * The normal and depth biases are a few texels in world units (millimetres to a few centimetres for a
  * view of metre-sized objects), whatever the depth range of the map: enough against acne on faces
  * the sun grazes, too little to detach the shadows from the objects casting them.
+ *
+ * The fitted map's texels are rarely square: under a low sun the visible ground is long across the
+ * light and short along it, so a texel can be 20 times longer in x than in y. A face needs a normal
+ * offset of a few texels measured along its slope across the map (the direction its depth changes
+ * in): the ground under a low sun slopes along y, where texels are short. One offset for all faces,
+ * sized for the long side, lifted the ground's lookups by centimetres to decimetres and so cut the
+ * long shadows of a low sun short (a 10 cm box under a 3° sun cast 1.39 m instead of 1.91 m) or
+ * removed those of small objects. The lit materials therefore scale the light's normal offset per
+ * face to the texel length along that face's slope ({@link sunNormalOffsetScale}, the same formula
+ * in GLSL: {@link installSunShadowOffset}).
  */
 
 /** Width and height of a sun's shadow map in texels. */
@@ -24,13 +34,23 @@ export const SUN_SHADOW_MAP_SIZE = 2048;
 /** The shadow distance: this many times the median distance at which the visible objects start. */
 export const SHADOW_DISTANCE_SCALE = 4;
 /**
- * Normal offset of shadow lookups (three.js normalBias) in texels of the fitted map: about the reach
- * of the shadow filter (`shadow.radius` texels), so a face the sun grazes does not shadow itself
- * where the filter samples the map beside the lookup (2 texels left a fine dither on such faces).
+ * Normal offset of shadow lookups in texels of the fitted map, beyond the reach of the shadow
+ * filter: three.js's PCF samples the map up to `shadow.radius` texels beside the lookup, each sample
+ * a bilinear 2 × 2 texel comparison, so a face the sun grazes needs `radius + 1` texels of offset
+ * along its slope not to shadow itself there (less left a fine dither on such faces).
  */
-export const NORMAL_BIAS_TEXELS = 3;
-/** Depth bias of shadow lookups in texels (world units) of the fitted map. */
+export const NORMAL_BIAS_EXTRA_TEXELS = 1;
+/**
+ * Depth bias of shadow lookups in texels (world units) of the fitted map's finer axis: only depth
+ * precision is left to cover once the normal offset handles slopes, and more detaches shadows from
+ * what casts them (a lit gap at the foot of a wall).
+ */
 export const DEPTH_BIAS_TEXELS = 2;
+
+/** The normal offset of a sun's shadow lookups in texels of its map: the filter's reach plus one. */
+export function normalBiasTexels(light: THREE.DirectionalLight): number {
+  return Math.max(0, light.shadow.radius) + NORMAL_BIAS_EXTRA_TEXELS;
+}
 
 /** What {@link fitSunShadow} fitted, in the shadow camera's view space (metres). */
 export interface SunShadowFit {
@@ -355,8 +375,101 @@ export function fitSunShadow(
   cam.far = far;
   cam.updateProjectionMatrix();
   const texel = Math.max(tx, ty);
-  light.shadow.normalBias = NORMAL_BIAS_TEXELS * texel;
+  // sized for the longer texel side; the materials scale it per face to the texel along the face's
+  // slope (sunNormalOffsetScale)
+  light.shadow.normalBias = normalBiasTexels(light) * texel;
   // three.js adds the bias to the receiver's depth in the map's 0..1 range (near..far)
-  light.shadow.bias = -(DEPTH_BIAS_TEXELS * texel) / (far - near);
+  light.shadow.bias = -(DEPTH_BIAS_TEXELS * Math.min(tx, ty)) / (far - near);
   return { left, right, bottom, top, near, far, texel, shadowDistance };
+}
+
+/**
+ * The factor the lit materials apply to a sun's normal offset (`shadow.normalBias`, sized for the
+ * longer side of the map's texels) for a face with world normal `normal`, given the sun's shadow
+ * matrix (world → map coordinates 0..1, three.js `shadow.matrix`): the texel length along the face's
+ * slope across the map (the direction its depth changes in, the normal's projection onto the map),
+ * divided by the longer texel side. 1 where the slope runs along the longer side; for the ground
+ * under a low sun, whose slope runs along the short side, the ratio of the two sides. Faces turned to
+ * the sun (no slope) get the shorter side's ratio. Mirrors the GLSL of {@link installSunShadowOffset}.
+ */
+export function sunNormalOffsetScale(normal: THREE.Vector3, shadowMatrix: THREE.Matrix4): number {
+  const e = shadowMatrix.elements;
+  // gradients of the map coordinates u and v in world space (rows 0 and 1): their squared lengths
+  // are 1 / width² and 1 / height² of the map in world units
+  const gu = new THREE.Vector3(e[0], e[4], e[8]);
+  const gv = new THREE.Vector3(e[1], e[5], e[9]);
+  const iu = gu.lengthSq();
+  const iv = gv.lengthSq();
+  const mn = Math.min(iu, iv);
+  const mx = Math.max(iu, iv);
+  if (!(mn > 0)) return 1;
+  const n = normal.clone().normalize();
+  // squared components of the normal along the map's axes
+  const a = n.dot(gu) ** 2 / iu;
+  const b = n.dot(gv) ** 2 / iv;
+  // texel length along the normal's projection, over the longer texel side
+  const along = Math.sqrt((a * (mn / iu) + b * (mn / iv)) / Math.max(a + b, 1e-6));
+  return Math.min(1, Math.max(along, Math.sqrt(mn / mx)));
+}
+
+/** The GLSL of {@link sunNormalOffsetScale} (vertex shader, after `shadowmap_pars_vertex`). */
+const SCALE_GLSL = /* glsl */ `
+#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+	// texel length along the face's slope across the sun's map over its longer texel side (sun-shadow.ts)
+	float pfxSunNormalOffsetScale( const in vec3 normal, const in mat4 shadowMatrix ) {
+		vec3 gu = vec3( shadowMatrix[ 0 ][ 0 ], shadowMatrix[ 1 ][ 0 ], shadowMatrix[ 2 ][ 0 ] );
+		vec3 gv = vec3( shadowMatrix[ 0 ][ 1 ], shadowMatrix[ 1 ][ 1 ], shadowMatrix[ 2 ][ 1 ] );
+		float iu = dot( gu, gu );
+		float iv = dot( gv, gv );
+		float mn = min( iu, iv );
+		float mx = max( iu, iv );
+		if ( mn <= 0.0 ) return 1.0;
+		float du = dot( normal, gu );
+		float dv = dot( normal, gv );
+		float a = du * du / iu;
+		float b = dv * dv / iv;
+		float along = sqrt( ( a * ( mn / iu ) + b * ( mn / iv ) ) / max( a + b, 1e-6 ) );
+		return min( 1.0, max( along, sqrt( mn / mx ) ) );
+	}
+#endif
+`;
+
+/** The normal offset of directional shadow lookups in three.js's `shadowmap_vertex` chunk. */
+const DIRECTIONAL_OFFSET =
+  'shadowWorldPosition = worldPosition + vec4( shadowWorldNormal * directionalLightShadows[ i ].shadowNormalBias, 0 );';
+const SCALED_OFFSET =
+  'shadowWorldPosition = worldPosition + vec4( shadowWorldNormal * ( directionalLightShadows[ i ].shadowNormalBias * ' +
+  'pfxSunNormalOffsetScale( shadowWorldNormal, directionalShadowMatrix[ i ] ) ), 0 );';
+
+/**
+ * Rewrites a lit material's vertex shader so the normal offset of sun (directional) shadow lookups
+ * is scaled per face by {@link sunNormalOffsetScale}. Returns whether three.js's shader had the
+ * expected code (a three.js update that changes it leaves the shader as it was).
+ */
+export function patchSunShadowOffset(shader: { vertexShader: string }): boolean {
+  const chunk = THREE.ShaderChunk.shadowmap_vertex;
+  if (
+    !chunk.includes(DIRECTIONAL_OFFSET) ||
+    !shader.vertexShader.includes('#include <shadowmap_vertex>') ||
+    !shader.vertexShader.includes('#include <shadowmap_pars_vertex>')
+  )
+    return false;
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <shadowmap_pars_vertex>', `#include <shadowmap_pars_vertex>\n${SCALE_GLSL}`)
+    .replace('#include <shadowmap_vertex>', chunk.replace(DIRECTIONAL_OFFSET, SCALED_OFFSET));
+  return true;
+}
+
+/**
+ * Makes a lit material scale sun shadow normal offsets per face (see the module comment), after its
+ * own `onBeforeCompile` (procedural textures); its program cache key changes with it.
+ */
+export function installSunShadowOffset(material: THREE.Material): void {
+  const before = material.onBeforeCompile;
+  const key = material.customProgramCacheKey;
+  material.onBeforeCompile = (shader, renderer) => {
+    before.call(material, shader, renderer);
+    patchSunShadowOffset(shader);
+  };
+  material.customProgramCacheKey = () => `${key.call(material)}|sun-offset`;
 }

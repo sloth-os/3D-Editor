@@ -8,11 +8,32 @@ import os from 'node:os';
  * collection then takes several times as long, and /healthz answered in hundreds of milliseconds
  * under combined render load. Render threads therefore run at a lower priority (nice 10): they
  * still use every core the main thread leaves idle, so renders are not slower on an otherwise
- * idle server, but the event loop gets a core as soon as it has work.
+ * idle server, but the event loop gets a core as soon as it has work. RENDER_WORKER_NICE changes
+ * the value (0: the main thread's priority).
  */
 
 /** Nice value of the render threads (the main thread keeps the process's, normally 0). */
 export const RENDER_THREAD_NICE = 10;
+
+/**
+ * The nice value render threads use: `RENDER_WORKER_NICE` (0–19; 0 keeps the priority of the main
+ * thread, e.g. on a machine that only renders), default {@link RENDER_THREAD_NICE}. Render threads
+ * also yield to other processes of the machine at a higher nice value; an invalid value is
+ * reported in `problem` and the default is used.
+ */
+export function renderThreadNice(env: Record<string, string | undefined> = process.env): {
+  nice: number;
+  problem?: string;
+} {
+  const raw = env.RENDER_WORKER_NICE?.trim();
+  if (!raw) return { nice: RENDER_THREAD_NICE };
+  const n = Number(raw);
+  if (Number.isInteger(n) && n >= 0 && n <= 19) return { nice: n };
+  return {
+    nice: RENDER_THREAD_NICE,
+    problem: `RENDER_WORKER_NICE must be a whole number from 0 to 19 (got '${raw}'): using ${RENDER_THREAD_NICE}`,
+  };
+}
 
 /**
  * Lowers the CPU priority of the calling thread to `nice` (never raises it). Only on Linux, where

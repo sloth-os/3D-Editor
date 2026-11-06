@@ -852,11 +852,13 @@ describe('glTF export: procedural textures on meshes without UVs (#21)', () => {
       const mesh = json.meshes[json.nodes[nodeIndex(json, name)].mesh];
       return mesh.primitives.map((p: Json) => json.materials[p.material]);
     };
+    // two glTF materials from one editor material get distinct names (A is exported first)
     const onB = matOf('B')[0];
-    expect(onB.name).toBe('Textured');
+    expect(onB.name).toBe('Textured.001');
     expect(onB.pbrMetallicRoughness.baseColorTexture).toBeDefined();
     const onA = matOf('A').find((m: Json) => m.name === 'Textured');
     expect(onA.pbrMetallicRoughness.baseColorTexture).toBeUndefined();
+    expect((res.warnings ?? []).join('\n')).toMatch(/'Textured' is exported as 2 glTF materials/);
   }, 60_000);
 });
 

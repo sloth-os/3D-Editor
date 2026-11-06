@@ -23,9 +23,24 @@ const materialProps = {
   emission_strength: z.number().min(0).optional(),
   alpha: z.number().min(0).max(1).optional(),
   blend_method: z.enum(['OPAQUE', 'CLIP', 'BLEND']).optional(),
+  alpha_threshold: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .describe('blend_method CLIP: alpha below this value is cut out (default 0.5)'),
   coat_weight: z.number().min(0).max(1).optional(),
   coat_roughness: z.number().min(0).max(1).optional(),
   sheen_weight: z.number().min(0).max(1).optional(),
+  sheen_tint: vec3.optional().describe('Linear RGB colour of the sheen (default white)'),
+  normal_strength: z
+    .number()
+    .min(0)
+    .max(10)
+    .optional()
+    .describe(
+      'Strength of the normal channel: scales image normal maps and procedural bumps (bump height = params.bump_distance × normal_strength; default 1)',
+    ),
   use_backface_culling: z.boolean().optional(),
 };
 

@@ -3,7 +3,7 @@ import type { MeshData } from '../mesh/types';
 import type { RigidBodyData } from '../doc/types';
 import { Body } from './body';
 import { meshKey } from './mesh-key';
-import { buildCollisionShape, type ShapeBuild } from './shapes';
+import { buildCollisionShape, cachedCollisionShape, type ShapeBuild } from './shapes';
 import { motionMode, simulatedFrameEnd, type WorldParams } from './settings';
 import { PhysicsWorld } from './world';
 import { composeRigid, decomposeRigid, isFiniteVec, mat3ToQuat, quatToMat3, slerpQ } from './vmath';
@@ -161,9 +161,11 @@ export class Simulation {
     const { position: origin, rotation: R, scale } = decomposeRigid(matrix);
     const key = shapeKey(mesh, rb, scale);
     let built = this.shapes.get(key) ?? reuse?.shapes.get(key) ?? reuse?.spareShapes.get(key);
-    built ??= buildCollisionShape(rb.collision_shape, mesh, scale, {
-      dynamic: rb.type === 'ACTIVE' && !rb.kinematic,
-    });
+    built ??= cachedCollisionShape(key, mesh, () =>
+      buildCollisionShape(rb.collision_shape, mesh, scale, {
+        dynamic: rb.type === 'ACTIVE' && !rb.kinematic,
+      }),
+    );
     this.shapes.set(key, built);
     if ('error' in built) {
       this.issue(id, 'ERROR', `${built.error}; left out of the simulation`);

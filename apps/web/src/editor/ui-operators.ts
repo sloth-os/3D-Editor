@@ -282,7 +282,14 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     'xray',
     'See through objects; selection also selects hidden elements (Alt+Z).',
   );
-  toggle('view3d.toggle_overlays', 'Toggle Overlays', 'overlays', 'Show or hide viewport overlays.');
+  toggle(
+    'view3d.toggle_overlays',
+    'Toggle Overlays',
+    'overlays',
+    'Show or hide all viewport overlays, like Blender: grid, 3D cursor, camera, light and empty ' +
+      'helpers, bones, curves without a surface, wireframe overlays, selection outlines and origins, ' +
+      'the edit-mode cage, the camera frame, the text info and the statistics (Wireframe shading stays).',
+  );
   toggle('view3d.toggle_sidebar', 'Sidebar', 'sidebar', 'Toggle the viewport sidebar (N).');
   toggle('view3d.toggle_toolbar', 'Toolbar', 'toolbar', 'Toggle the tool bar (T).');
   toggle(

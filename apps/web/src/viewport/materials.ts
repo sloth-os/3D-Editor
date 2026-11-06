@@ -12,6 +12,7 @@ import {
   type ProceduralSurface,
   type SceneDoc,
 } from '@3d-editor/core';
+import { installSunShadowOffset } from './sun-shadow';
 import {
   injectProceduralShader,
   proceduralProgramKey,
@@ -131,6 +132,8 @@ export function buildMaterial(
     return mat;
   }
   const mat = new THREE.MeshPhysicalMaterial();
+  // sun shadow normal offsets follow the map's texels along each face's slope (sun-shadow.ts)
+  installSunShadowOffset(mat);
   const d = m;
   if (!d) {
     mat.color.copy(DEFAULT_GREY);
@@ -344,11 +347,14 @@ function installProcedural(
     mat.depthWrite = !mat.transparent;
   }
   const key = proceduralProgramKey(channels);
-  mat.onBeforeCompile = (shader) => {
+  // before the sun shadow offset patch installed by buildMaterial
+  const after = mat.onBeforeCompile;
+  mat.onBeforeCompile = (shader, renderer) => {
     Object.assign(shader.uniforms, uniforms);
     injectProceduralShader(shader, channels);
+    after.call(mat, shader, renderer);
   };
-  mat.customProgramCacheKey = () => key;
+  mat.customProgramCacheKey = () => `${key}|sun-offset`;
   mat.onBeforeRender = (_renderer, scene, _camera, geometry, object) => {
     const b = texSpaceOf(doc, object, geometry);
     if (b) {

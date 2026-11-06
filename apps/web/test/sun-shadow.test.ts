@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import * as THREE from 'three';
+import { SceneDoc, defaultMaterial, defaultProcedural, type MaterialData } from '@3d-editor/core';
+import * as shadowModule from '../src/viewport/sun-shadow';
+import { buildMaterial, TextureCache } from '../src/viewport/materials';
 import {
   DEPTH_BIAS_TEXELS,
   fitSunShadow,
-  NORMAL_BIAS_TEXELS,
+  normalBiasTexels,
   SHADOW_DISTANCE_SCALE,
   SUN_SHADOW_MAP_SIZE,
   type SunShadowFit,
@@ -151,17 +154,21 @@ describe('fitSunShadow', () => {
     expect(fits[1].texel / fits[0].texel).toBeLessThan(3);
   });
 
-  it('keeps the biases a couple of texels in world units, whatever the depth range', () => {
+  it('keeps the biases a few texels in world units, whatever the depth range', () => {
     // regression: a fixed depth bias of 0.0005 of the map's depth range was 0.43 m over the 866 m
     // range of a 600 m floor
     for (const size of [12, 600]) {
       const light = reportSun();
       const fit = fitSunShadow(light, defaultCamera(), reportScene(size).boxes)!;
-      expect(light.shadow.normalBias).toBeCloseTo(NORMAL_BIAS_TEXELS * fit.texel, 9);
-      // three.js adds the bias to the 0..1 depth over near..far
-      expect(-light.shadow.bias * (fit.far - fit.near)).toBeCloseTo(DEPTH_BIAS_TEXELS * fit.texel, 9);
+      // the filter's reach (shadow.radius texels) plus one, in texels of the longer side
+      expect(normalBiasTexels(light)).toBe(light.shadow.radius + 1);
+      expect(light.shadow.normalBias).toBeCloseTo(normalBiasTexels(light) * fit.texel, 9);
+      // three.js adds the bias to the 0..1 depth over near..far; texels of the finer side
+      const c = light.shadow.camera;
+      const fine = Math.min(c.right - c.left, c.top - c.bottom) / SUN_SHADOW_MAP_SIZE;
+      expect(-light.shadow.bias * (fit.far - fit.near)).toBeCloseTo(DEPTH_BIAS_TEXELS * fine, 9);
       // centimetres (the whole-scene fit had 0.63 m and 0.43 m)
-      expect(light.shadow.normalBias).toBeLessThan(0.04);
+      expect(light.shadow.normalBias).toBeLessThan(0.05);
       expect(-light.shadow.bias * (fit.far - fit.near)).toBeLessThan(0.03);
     }
   });
@@ -314,5 +321,110 @@ describe('fitSunShadow', () => {
       expect(fit.near).toBeCloseTo(d0 - margin, 9);
       expect(fit.far).toBeCloseTo(d1 + margin, 9);
     }
+  });
+});
+
+describe('sun shadow normal offset per face', () => {
+  /** A sun at `elevation` (degrees) whose light travels along −X (the sun stands in the +X sky). */
+  function lowSun(elevation: number) {
+    const e = THREE.MathUtils.degToRad(elevation);
+    return sun([-Math.cos(e), 0, -Math.sin(e)], [0, -2, 10]);
+  }
+  /** The factor the materials apply per face (1 for a uniform offset, as before per-face scaling). */
+  const scaleOf = (n: THREE.Vector3, light: THREE.DirectionalLight) =>
+    (shadowModule.sunNormalOffsetScale ?? (() => 1))(n, light.shadow.matrix);
+
+  it('keeps the long shadows of a low sun: the ground is offset by texels along its slope', () => {
+    // regression: one offset for every face, three texels of the map's long side, lifted the ground's
+    // lookups by 2.7 cm, so a 10 cm box under a 3° sun cast a 1.39 m shadow instead of 1.91 m (and
+    // with a coarser map, smaller objects none at all)
+    const floor = box([-300, -300, 0], [300, 300, 0]);
+    const small = box([-1.55, -2.05, 0], [-1.45, -1.95, 0.1]);
+    const big = box([-1, -1, 0], [1, 1, 2]);
+    const cam = camera([-2.5, -6, 1], [-2.5, -2, 0.05], 22.9);
+    for (const elevation of [3, 10, 25]) {
+      const light = lowSun(elevation);
+      const fit = fitSunShadow(light, cam, [floor, small, big])!;
+      light.shadow.updateMatrices(light);
+      const c = light.shadow.camera;
+      const tx = (c.right - c.left) / SUN_SHADOW_MAP_SIZE;
+      const ty = (c.top - c.bottom) / SUN_SHADOW_MAP_SIZE;
+      // the map is anisotropic under a low sun: its texels are much shorter along the light
+      if (elevation === 3) expect(tx / ty).toBeGreaterThan(5);
+      const lift = light.shadow.normalBias * scaleOf(new THREE.Vector3(0, 0, 1), light);
+      const e = THREE.MathUtils.degToRad(elevation);
+      // the shadow of the box ends where a lookup lifted by `lift` clears its top
+      const length = (0.1 - lift) / Math.tan(e);
+      // the filter's reach plus one texel along the ground's slope (y), enough against acne, and
+      // not the long side's (x) texels
+      expect(lift).toBeCloseTo((light.shadow.radius + 1) * ty, 9);
+      expect(fit.texel).toBeCloseTo(Math.max(tx, ty), 12);
+      // under the 3° sun the shadow keeps 98 % of its length (79 % before)
+      if (elevation === 3) expect(length / (0.1 / Math.tan(e))).toBeGreaterThan(0.95);
+    }
+  });
+
+  it('is the texel length along each face’s slope across the map, over the longer texel side', () => {
+    let seed = 7;
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    const floor = box([-300, -300, 0], [300, 300, 0]);
+    const things = [box([-1, -1, 0], [1, 1, 2]), box([2, 2, 0], [2.2, 2.2, 3])];
+    const cam = camera([0, -15, 2], [0, 0, 0.5], 30);
+    for (let t = 0; t < 12; t++) {
+      const e = 0.03 + rnd() * 1.4;
+      const a = rnd() * Math.PI * 2;
+      const light = sun([Math.cos(a) * Math.cos(e), Math.sin(a) * Math.cos(e), -Math.sin(e)]);
+      fitSunShadow(light, cam, [floor, ...things]);
+      light.shadow.updateMatrices(light);
+      const c = light.shadow.camera;
+      const tx = (c.right - c.left) / SUN_SHADOW_MAP_SIZE;
+      const ty = (c.top - c.bottom) / SUN_SHADOW_MAP_SIZE;
+      const inverse = new THREE.Matrix3().setFromMatrix4(c.matrixWorldInverse);
+      for (let k = 0; k < 20; k++) {
+        const n = new THREE.Vector3(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).normalize();
+        // the normal in the shadow camera's view: x and y run across the map
+        const v = n.clone().applyMatrix3(inverse);
+        const across = Math.hypot(v.x, v.y);
+        if (across < 1e-3) continue;
+        const along = Math.hypot((v.x / across) * tx, (v.y / across) * ty);
+        const expected = Math.min(1, Math.max(along, Math.min(tx, ty)) / Math.max(tx, ty));
+        expect(scaleOf(n, light)).toBeCloseTo(expected, 6);
+      }
+    }
+  });
+
+  it('is applied by the lit materials in their vertex shader', () => {
+    // three.js's chunk still has the line the patch rewrites
+    const shader = { vertexShader: THREE.ShaderLib.physical.vertexShader };
+    expect(shadowModule.patchSunShadowOffset?.(shader)).toBe(true);
+    expect(shader.vertexShader).toContain(
+      'pfxSunNormalOffsetScale( shadowWorldNormal, directionalShadowMatrix[ i ] )',
+    );
+    expect(shader.vertexShader).toContain('float pfxSunNormalOffsetScale(');
+    expect(shader.vertexShader).not.toContain('#include <shadowmap_vertex>');
+    // every lit material of the viewport, with and without procedural textures
+    const doc = SceneDoc.create({ empty: true });
+    const plain = defaultMaterial('m1', 'Plain');
+    const textured: MaterialData = {
+      ...defaultMaterial('m2', 'Marble'),
+      textures: {
+        base_color: { image: '', scale: [1, 1], offset: [0, 0], procedural: defaultProcedural('NOISE') },
+      },
+    };
+    const keys = new Set<string>();
+    for (const m of [null, plain, textured]) {
+      const mat = buildMaterial(m, 'PBR', doc, new TextureCache(() => undefined));
+      const s = {
+        uniforms: {} as Record<string, unknown>,
+        vertexShader: THREE.ShaderLib.physical.vertexShader,
+        fragmentShader: THREE.ShaderLib.physical.fragmentShader,
+      };
+      mat.onBeforeCompile(s as unknown as THREE.WebGLProgramParametersWithUniforms, {} as THREE.WebGLRenderer);
+      expect(s.vertexShader).toContain('pfxSunNormalOffsetScale( shadowWorldNormal');
+      keys.add(mat.customProgramCacheKey());
+    }
+    // the plain materials share a program; the textured one has its own
+    expect(keys.size).toBe(2);
+    expect([...keys].every((k) => k.includes('sun-offset'))).toBe(true);
   });
 });

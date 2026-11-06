@@ -1030,6 +1030,8 @@ interface GeometryCounts {
 function evaluatedGeometry(
   ev: EvaluatedScene,
   shown: Shown,
+  /** Statistics of meshes counted before (shared by the render and viewport counts). */
+  stats = new Map<MeshData, ReturnType<typeof meshStats>>(),
 ): {
   geometry: GeometryCounts;
   instanceTriangles: number;
@@ -1045,7 +1047,6 @@ function evaluatedGeometry(
     instanceTriangles: 0,
   };
   const hiddenNames = new Set<string>();
-  const stats = new Map<MeshData, ReturnType<typeof meshStats>>();
   const statsOf = (m: MeshData) => {
     let s = stats.get(m);
     if (!s) stats.set(m, (s = meshStats(m)));
@@ -1220,8 +1221,9 @@ function sceneSummary(scene: SceneDoc, opts: SceneSummaryOptions) {
   }
   // what renders show (objects shown in renders), and what the viewport shows: with its modifier /
   // curve settings, or (when those cannot differ) the same geometry with the viewport visibility
-  const evaluated = evaluatedGeometry(ev, 'RENDER');
-  const viewportGeometry = evaluatedGeometry(both.viewport ?? ev, 'VIEWPORT').geometry;
+  const meshStatsCache = new Map<MeshData, ReturnType<typeof meshStats>>();
+  const evaluated = evaluatedGeometry(ev, 'RENDER', meshStatsCache);
+  const viewportGeometry = evaluatedGeometry(both.viewport ?? ev, 'VIEWPORT', meshStatsCache).geometry;
   const viewportDiffers =
     viewportGeometry.vertices !== evaluated.geometry.vertices ||
     viewportGeometry.faces !== evaluated.geometry.faces ||

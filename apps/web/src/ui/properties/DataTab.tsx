@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import {
   BONE_CONSTRAINT_LABELS,
@@ -15,6 +15,7 @@ import {
   type CurveData,
   type LightData,
   type ObjectData,
+  type PoseBone,
   type ShapeKeyData,
   type Spline,
   type SplinePoint,
@@ -943,29 +944,50 @@ function CurvePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
   );
 }
 
-function TextBody({ value, onCommit }: { value: string; onCommit: (v: string) => void }) {
+/**
+ * The body of a text object. Ctrl+Enter applies it and leaves the field (like confirming a field in
+ * Blender), so Ctrl+Z is the editor's undo again rather than the text box's own, and the box shows
+ * the document's text: after an undo, a change by an agent, or an edit that failed. Escape cancels
+ * and leaves the field; leaving it any other way applies it.
+ */
+export function TextBody({ value, onCommit }: { value: string; onCommit: (v: string) => boolean }) {
   const [text, setText] = useState(value);
+  /**
+   * Text this field applied or cancelled since it got the focus: the blur that follows Ctrl+Enter or
+   * Escape must not apply it (again).
+   */
+  const settled = useRef<string | null>(null);
   useEffect(() => setText(value), [value]);
-  const commit = () => {
-    if (text !== value) onCommit(text);
+  const commit = (t: string) => {
+    if (t === value || t === settled.current) return;
+    settled.current = t;
+    // a failed edit (reported in the Info log) shows the document's text again
+    if (!onCommit(t)) setText(value);
   };
   return (
     <textarea
       class="textfield"
       aria-label="Text"
       data-testid="font-body"
-      title="Text (Ctrl+Enter or leaving the field applies it)"
+      title="Text (Ctrl+Enter or leaving the field applies it, Escape cancels)"
       rows={Math.min(8, Math.max(3, text.split('\n').length + 1))}
       value={text}
       style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit', padding: '4px 6px', height: 'auto' }}
       onInput={(e) => setText((e.target as HTMLTextAreaElement).value)}
-      onBlur={commit}
+      onFocus={() => (settled.current = null)}
+      onBlur={(e) => commit((e.currentTarget as HTMLTextAreaElement).value)}
       onKeyDown={(e) => {
+        const el = e.currentTarget as HTMLTextAreaElement;
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
           e.preventDefault();
-          commit();
+          commit(el.value);
+          el.blur();
         }
-        if (e.key === 'Escape') setText(value);
+        if (e.key === 'Escape') {
+          settled.current = el.value;
+          setText(value);
+          el.blur();
+        }
         e.stopPropagation();
       }}
     />
@@ -1474,7 +1496,189 @@ function ArmaturePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
         )}
       </Panel>
       {active && <PosePanel key={active.name} s={s} o={o} bone={active} bones={bones} />}
+      {active && <BoneIkPanel key={`ik-${active.name}`} s={s} o={o} bone={active} bones={bones} />}
     </>
+  );
+}
+
+const IK_AXES = ['x', 'y', 'z'] as const;
+type IkAxis = (typeof IK_AXES)[number];
+/** A per-bone IK setting of a pose bone (pose.ik_settings_set). */
+type IkField =
+  | `lock_ik_${IkAxis}`
+  | `use_ik_limit_${IkAxis}`
+  | `ik_min_${IkAxis}`
+  | `ik_max_${IkAxis}`
+  | `ik_stiffness_${IkAxis}`;
+
+/**
+ * The IK constraints of an armature object whose chains contain `bone` (core pose.ik_settings_set
+ * reports the same): the bone's IK settings apply to every chain it is part of.
+ */
+export function ikChainsWith(
+  o: ObjectData,
+  bones: readonly BoneData[],
+  bone: string,
+): { owner: string; constraint: string }[] {
+  const byName = new Map(bones.map((b) => [b.name, b]));
+  const out: { owner: string; constraint: string }[] = [];
+  for (const [owner, pb] of Object.entries(o.pose?.bones ?? {})) {
+    for (const c of Array.isArray(pb?.constraints) ? pb.constraints : []) {
+      if (!c || c.type !== 'IK') continue;
+      const params = (c.params ?? {}) as { chain_count?: unknown; use_tail?: unknown };
+      const count = typeof params.chain_count === 'number' ? params.chain_count : 0;
+      // like the solver: with use_tail off the chain starts at the owner's parent
+      let cur: string | null = params.use_tail === false ? (byName.get(owner)?.parent ?? null) : owner;
+      const seen = new Set<string>();
+      while (cur && byName.has(cur) && !seen.has(cur)) {
+        seen.add(cur);
+        if (count > 0 && seen.size > count) break;
+        if (cur === bone) {
+          out.push({ owner, constraint: c.name });
+          break;
+        }
+        cur = byName.get(cur)!.parent;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Blender's Bone > Inverse Kinematics: per-axis IK locks, stiffness and limits of the active bone,
+ * used by every IK chain that contains it. Edits run pose.ik_settings_set (slider drags preview live
+ * and commit one undo step); the fields show the document, so changes by MCP agents appear at once.
+ * Axes are the bone's own: Y runs along the bone (twist), X and Z bend it.
+ */
+function BoneIkPanel({
+  s,
+  o,
+  bone,
+  bones,
+}: {
+  s: ProjectSession;
+  o: ObjectData;
+  bone: BoneData;
+  bones: BoneData[];
+}) {
+  const pb: PoseBone | undefined = o.pose?.bones?.[bone.name];
+  const flag = (k: IkField) => pb?.[k] === true;
+  // stored values with Blender's ranges and defaults (core ikSettingsOf)
+  const num = (k: IkField, def: number, lo: number, hi: number) => {
+    const v = pb?.[k];
+    return typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def;
+  };
+  const set = (patch: Partial<Record<IkField, boolean | number>>) =>
+    run('pose.ik_settings_set', { object: o.id, bone: bone.name, ...patch }, 'ui');
+  /** Writes one IK field of this bone into the current pose (drag previews and their restore). */
+  const writeField = (k: IkField, v: unknown) => {
+    const cur = s.doc.getObject(o.id);
+    if (!cur) return;
+    const map = { ...(cur.pose?.bones ?? {}) };
+    const next: Record<string, unknown> = { ...(map[bone.name] ?? defaultPoseBone()) };
+    if (v === undefined) delete next[k];
+    else next[k] = v;
+    map[bone.name] = next as unknown as (typeof map)[string];
+    s.doc.updateObject(o.id, { pose: { ...cur.pose, bones: map } });
+  };
+  const setNumber = (k: IkField, v: number, final: boolean) =>
+    dragEdit(
+      s,
+      `ik:${o.id}:${bone.name}:${k}`,
+      final,
+      () => writeField(k, v),
+      () => {
+        const before = s.doc.getObject(o.id)?.pose?.bones?.[bone.name]?.[k];
+        return () => writeField(k, before);
+      },
+      () => void set({ [k]: v }),
+    );
+  const chains = ikChainsWith(o, bones, bone.name);
+  const dim = (on: boolean) => (on ? undefined : { opacity: 0.5 });
+  return (
+    <Panel title={`Inverse Kinematics: ${bone.name}`} id="armature-bone-ik">
+      <div class="hint" data-testid="pose-ik-chains" style={{ marginBottom: '2px' }}>
+        {chains.length
+          ? `Used by ${chains.map((c) => `${c.constraint} (${c.owner})`).join(', ')}.`
+          : 'No IK chain contains this bone yet: these settings apply once an IK constraint’s chain includes it.'}
+      </div>
+      <Row label="Lock IK" title="The IK solver may not rotate the bone about these axes (Y runs along the bone)">
+        <div style={{ display: 'flex', gap: '10px' }}>
+          {IK_AXES.map((a) => (
+            <Checkbox
+              key={a}
+              value={flag(`lock_ik_${a}`)}
+              label={a.toUpperCase()}
+              testId={`pose-ik-lock-${a}`}
+              onChange={(v) => set({ [`lock_ik_${a}`]: v })}
+            />
+          ))}
+        </div>
+      </Row>
+      <Row label="Stiffness" title="Resistance to rotating about each axis (0 … 0.99): other bones move more">
+        <div class="vector">
+          {IK_AXES.map((a) => (
+            <div key={a} style={dim(!flag(`lock_ik_${a}`))}>
+              <NumberField
+                label={a.toUpperCase()}
+                value={num(`ik_stiffness_${a}`, 0, 0, 0.99)}
+                min={0}
+                max={0.99}
+                slider
+                testId={`pose-ik-stiffness-${a}`}
+                onChange={(v, f) => setNumber(`ik_stiffness_${a}`, v, f)}
+              />
+            </div>
+          ))}
+        </div>
+      </Row>
+      {IK_AXES.map((a) => {
+        const limited = flag(`use_ik_limit_${a}`);
+        const locked = flag(`lock_ik_${a}`);
+        const A = a.toUpperCase();
+        return (
+          <Row
+            key={a}
+            label={`Limit ${A}`}
+            title={`Keep the IK rotation about ${A}, measured from the rest pose, between Min and Max`}
+          >
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center', ...dim(!locked) }}>
+              <Checkbox
+                value={limited}
+                testId={`pose-ik-limit-${a}`}
+                onChange={(v) => set({ [`use_ik_limit_${a}`]: v })}
+              />
+              <div style={{ flex: 1, minWidth: 0, ...dim(limited) }}>
+                <NumberField
+                  label="Min"
+                  value={num(`ik_min_${a}`, -Math.PI, -Math.PI, 0)}
+                  min={-Math.PI}
+                  max={0}
+                  unit="°"
+                  step={1}
+                  {...RAD}
+                  testId={`pose-ik-min-${a}`}
+                  onChange={(v, f) => setNumber(`ik_min_${a}`, v, f)}
+                />
+              </div>
+              <div style={{ flex: 1, minWidth: 0, ...dim(limited) }}>
+                <NumberField
+                  label="Max"
+                  value={num(`ik_max_${a}`, Math.PI, 0, Math.PI)}
+                  min={0}
+                  max={Math.PI}
+                  unit="°"
+                  step={1}
+                  {...RAD}
+                  testId={`pose-ik-max-${a}`}
+                  onChange={(v, f) => setNumber(`ik_max_${a}`, v, f)}
+                />
+              </div>
+            </div>
+          </Row>
+        );
+      })}
+    </Panel>
   );
 }
 

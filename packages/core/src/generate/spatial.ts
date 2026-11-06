@@ -495,9 +495,23 @@ export class SceneRaycaster {
       const hit = this.cast(origin, direction, maxDistance, { minDistance: from, skip: opts.skip });
       if (!hit) break;
       out.push(hit);
-      // step past this surface (relative epsilon keeps far hits from repeating)
-      from = hit.distance + 1e-7 * Math.max(1, hit.distance);
+      // relative epsilon: steps past this surface without repeating far hits
+      const eps = 1e-7 * Math.max(1, hit.distance);
+      // surfaces of other targets at the same distance (coincident faces, e.g. glass standing on a
+      // slab): cast again within the epsilon band, leaving out the targets already hit there
+      const band = new Set<RaycastTarget>([hit.target]);
+      while (out.length < maxHits) {
+        const same = this.cast(origin, direction, Math.min(maxDistance, hit.distance + eps), {
+          minDistance: Math.max(from, hit.distance - eps),
+          skip: (t) => band.has(t) || !!opts.skip?.(t),
+        });
+        if (!same) break;
+        out.push(same);
+        band.add(same.target);
+      }
+      from = hit.distance + eps;
     }
+    out.sort((a, b) => a.distance - b.distance);
     return out;
   }
 }
