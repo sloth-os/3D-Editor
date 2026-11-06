@@ -80,12 +80,23 @@ describe('principled BSDF', () => {
       }
   });
 
-  it('transmits (1 − F)/η² of the radiance into glass and η² more when leaving it', () => {
-    const into = sampledAlbedo(setup({ transmission: 1, roughness: 0.2 }, 1, true), 64);
+  it('transmits (1 − F) of the radiance into and out of glass, without η² scaling (like Cycles)', () => {
+    // regression: refraction scaled radiance by 1/η² into glass and η² out of it, so a single glass
+    // sheet darkened (or, seen from its back, brightened ×2.25) what was behind it, and lamps inside
+    // glass bodies did not match their thin-walled shadows
     const F = fresnelDielectric(1, 1.5);
-    expect(into).toBeCloseTo(F + (1 - F) / 2.25, 1);
-    const out = sampledAlbedo(setup({ transmission: 1, roughness: 0.2 }, 1, false), 64);
-    expect(out).toBeCloseTo(F + (1 - F) * 2.25, 1);
+    for (const entering of [true, false]) {
+      const b = setup({ transmission: 1, roughness: 0.2 }, 1, entering);
+      expect(sampledAlbedo(b, 64)).toBeCloseTo(1, 1);
+      let t = 0;
+      const n = 64;
+      for (let i = 0; i < n; i++)
+        for (let j = 0; j < n; j++)
+          for (let k = 0; k < 4; k++)
+            if (b.sample((i + 0.5) / n, (j + 0.5) / n, (k + 0.5) / 4) && b.sampledTransmission)
+              t += b.fR / b.pdf;
+      expect(t / (n * n * 4)).toBeCloseTo(1 - F, 1);
+    }
   });
 
   it('passes light straight through index-matched glass (IOR 1) at any roughness', () => {
@@ -120,21 +131,20 @@ describe('principled BSDF', () => {
   });
 
   it('compensates the single-scattering energy loss of rough glass (energy albedo ≈ 1)', () => {
-    // energy = reflected + transmitted (the η² radiance scaling removed)
-    const energy = (b: PrincipledBSDF, eta: number, n = 48) => {
+    // energy = reflected + transmitted
+    const energy = (b: PrincipledBSDF, n = 48) => {
       let s = 0;
       for (let i = 0; i < n; i++)
         for (let j = 0; j < n; j++)
           for (let k = 0; k < 4; k++)
-            if (b.sample((i + 0.5) / n, (j + 0.5) / n, (k + 0.5) / 4))
-              s += (b.fR / b.pdf) * (b.sampledTransmission ? eta * eta : 1);
+            if (b.sample((i + 0.5) / n, (j + 0.5) / n, (k + 0.5) / 4)) s += b.fR / b.pdf;
       return s / (n * n * 4);
     };
     for (const roughness of [0.5, 0.7, 1])
       for (const mu of [1, 0.6, 0.3])
         for (const entering of [true, false]) {
           const b = setup({ transmission: 1, ior: 1.5, roughness }, mu, entering);
-          const e = energy(b, entering ? 1.5 : 1 / 1.5);
+          const e = energy(b);
           const what = `roughness ${roughness}, μ ${mu}, ${entering ? 'entering' : 'leaving'}`;
           expect(e, what).toBeGreaterThan(0.95);
           expect(e, what).toBeLessThan(1.04);
