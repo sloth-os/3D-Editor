@@ -41,10 +41,17 @@ export function setSelection(
 /** Resolves ids or names to object ids; throws for unknown references. */
 export function resolveObjectIds(ctx: OperatorContext, refs: string[] | undefined): string[] {
   if (!refs || refs.length === 0) return selectedObjects(ctx).map((o) => o.id);
+  // many references: one name index instead of a scan of the scene per name (the first object of a
+  // name wins, as in SceneDoc.findObjectByName)
+  let byName: Map<string, string> | null = null;
+  if (refs.length > 16) {
+    byName = new Map();
+    for (const o of ctx.doc.listObjects()) if (!byName.has(o.name)) byName.set(o.name, o.id);
+  }
   return refs.map((r) => {
-    const o = ctx.doc.resolveObject(r);
-    if (!o) throw new OperatorError(`Object '${r}' not found`, 'NOT_FOUND');
-    return o.id;
+    const id = byName ? (ctx.doc.getObject(r)?.id ?? byName.get(r)) : ctx.doc.resolveObject(r)?.id;
+    if (!id) throw new OperatorError(`Object '${r}' not found`, 'NOT_FOUND');
+    return id;
   });
 }
 

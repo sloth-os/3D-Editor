@@ -766,11 +766,22 @@ export function buildCollisionShape(
   return out;
 }
 
+/**
+ * How the minimum collision thickness 2 · minHalf came about (see `minHalfExtent`): THIN_RATIO of the
+ * body's largest dimension, or the cap / floor of that rule.
+ */
+function minThicknessRule(minHalf: number): string {
+  const pct = `${+(THIN_RATIO * 100).toFixed(3)}% of its largest dimension`;
+  if (minHalf >= MIN_HALF_EXTENT) return `${pct}, at most ${mm(2 * MIN_HALF_EXTENT)}`;
+  if (minHalf <= MIN_HALF_EXTENT_FLOOR) return `${pct}, at least ${mm(2 * MIN_HALF_EXTENT_FLOOR)}`;
+  return pct;
+}
+
 /** Note for a flat mesh simulated as a slab (behind its faces, or centred on it). */
 function slabNote(minHalf: number, behind: boolean): string {
   return (
     `flat mesh: simulated as a ${mm(2 * minHalf)} thick slab ${behind ? 'behind its faces' : 'centred on it'} ` +
-    `(minimum collision thickness: ${THIN_RATIO * 100}% of the largest half size)`
+    `(minimum collision thickness: ${minThicknessRule(minHalf)})`
   );
 }
 
@@ -778,7 +789,7 @@ function slabNote(minHalf: number, behind: boolean): string {
 function thinNote(half: number, minHalf: number, axis?: string): string {
   return (
     `the mesh is only ${mm(2 * half)} thick${axis ? ` (${axis})` : ''}, below the minimum collision ` +
-    `thickness of ${mm(2 * minHalf)} (${THIN_RATIO * 100}% of its largest half size): it collides as if ` +
+    `thickness of ${mm(2 * minHalf)} (${minThicknessRule(minHalf)}): it collides as if ` +
     `${mm(2 * minHalf)} thick`
   );
 }

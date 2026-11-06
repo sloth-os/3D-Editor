@@ -15,15 +15,13 @@ import { setProceduralScene } from './materials';
  * - environment SKY (Rendered shading): the analytic sky of @3d-editor/core is rendered into an
  *   equirectangular HalfFloat texture; without the sun disc it becomes the PMREM environment
  *   (image-based lighting), with the sun disc the background. The sun itself is a shadow-casting
- *   DirectionalLight (irradiance from `skySun`, scaled like viewport SUN lamps). Sky radiance is
+ *   DirectionalLight with the irradiance of `skySun` (W/m², like SUN lamps). Sky radiance is
  *   scaled by world strength × environment_strength like in every other renderer; the sky ignores
  *   environment_rotation (sun_rotation orients it).
  * - mist (Material Preview and Rendered): three.js FogExp2 with the world mist density and colour,
  *   i.e. 1 − exp(−(density·depth)²) over the view depth, exactly what the CPU renderer applies.
  */
 
-/** Viewport SUN lamps use energy × 2.5 (scene-objects.ts); the sky's sun matches them. */
-const SUN_SCALE = 2.5;
 /** Largest finite half float. */
 const HALF_MAX = 65504;
 
@@ -188,7 +186,8 @@ export class ViewportSky {
       scene.add(light.target);
     }
     light.color.setRGB(e[0] / peak, e[1] / peak, e[2] / peak);
-    light.intensity = peak * scale * SUN_SCALE;
+    // the sun's irradiance (W/m²), like SUN lamps and the core renderers' sky sun
+    light.intensity = peak * scale;
     // place the light (and its shadow frustum) around the visible geometry
     const sphere = sceneBounds(ev) ?? new THREE.Sphere(new THREE.Vector3(), 10);
     const r = Math.max(sphere.radius, 0.5);

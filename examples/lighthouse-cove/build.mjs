@@ -16,6 +16,7 @@
  *   --export       also export scene.glb after the renders
  *   --out <dir>    write the outputs to <dir> instead of this folder
  *   --keep         fail instead of deleting an existing "lighthouse-cove" project
+ *   --check-all    also run the scatter placement check on the 2,600 grass tufts (slower)
  *
  * Re-runnable: an existing project named "lighthouse-cove" is deleted and rebuilt from nothing.
  * Every number the scene depends on is in this file. Any tool error (including an operator
@@ -34,7 +35,7 @@ const FLAGS = new Set(ARGS.filter((a) => a.startsWith('--')));
 const OUT_DIR = ARGS.includes('--out') ? path.resolve(ARGS[ARGS.indexOf('--out') + 1]) : HERE;
 const MODE = FLAGS.has('--build-only') ? 'build' : FLAGS.has('--preview') ? 'preview' : FLAGS.has('--export-only') ? 'export' : 'final';
 for (const f of FLAGS) {
-  if (!['--build-only', '--preview', '--export-only', '--skip-final', '--skip-anim', '--export', '--out', '--keep'].includes(f)) {
+  if (!['--build-only', '--preview', '--export-only', '--skip-final', '--skip-anim', '--export', '--out', '--keep', '--check-all'].includes(f)) {
     throw new Error(`unknown flag ${f}`);
   }
 }
@@ -60,14 +61,18 @@ const SCULPT = [
   { brush: 'FLATTEN', at: [HOUSE.x, HOUSE.y], r: 5, dabs: 8 }, // cottage pad
   { brush: 'FLATTEN', at: LH, r: 3.5, dabs: 8 }, // lighthouse pad
 ];
-// The stone path: waypoints from the cove beach past the cottage door to the foot of the lighthouse.
-// The last two lie on one ray from the lighthouse axis (the direction its door faces), 5.6 m and
-// 3.9 m out, so the path ends square in front of the steps that climb to the door on the plinth.
+// The stone path: waypoints from the cove beach past the cottage door up to the foot of the
+// lighthouse. The door faces the last waypoint, and the last two lie on one ray from the lighthouse
+// axis, so the path ends square to the door. The headland is steep there (about 1 m per metre at
+// the plinth), so the path stops at the plinth and steps cut into the plinth climb to the door.
 const PATH_WAYPOINTS = [
   [3.2, -8.6], [4.3, -7.0], [5.4, -6.0], [7.6, -6.1], [9.6, -4.6], [10.9, -1.6],
-  [11.3, 1.6], [12.0, 4.6], [13.45, 6.45], [13.61, 8.14],
+  [11.3, 1.6], [12.0, 4.6], [13.52, 7.19], [13.7, 9.0],
 ];
-const STEPS = { rise: 0.2, width: 1.3 }; // steps from the path end to the door: ≈ 0.2 m rises
+// The path's centre line as built: a Catmull-Rom curve through the waypoints (resample() below).
+// Distances to the path (worn ground, scatter density, checks) are measured to this line.
+const PATH_LINE = resample(PATH_WAYPOINTS, 0.25);
+const STEPS = { rise: 0.19, width: 1.3, back: 1.95 }; // ≈ 0.19 m rises; the notch reaches in to r = 1.95 m
 const FENCE_RANGE = [3, 9]; // waypoint indices the seaward fence runs along
 const FENCE_POST_SPACING = 2.0; // generate_fence adds posts between points farther apart than this
 const PATH_TILT_SIGN = 1; // curve tilt that raises the profile's left side (+x of the bevel frame)
@@ -83,7 +88,7 @@ const CAMERA = { at: [15.5, -36, 3.3], target: [LH[0], LH[1], 8.6], look: [8, 6,
 // violet twilight side, where the beams show best.
 const SUN = { elevation: 0.04, rotation: 4.22 };
 // Light mist: 95 % at 800 m, so the island (30–60 m away) stays clear while the far sea and the
-// clouds (700–1000 m) fade into the lavender twilight haze.
+// clouds (830–1000 m) fade into the lavender twilight haze.
 const MIST = { distance: 800, color: [0.6, 0.45, 0.5] };
 // Two opposite beams turn half a revolution in FRAMES frames → a seamless loop of the pair.
 const FRAMES = 24;
@@ -365,7 +370,7 @@ async function buildIsland() {
       const rock = smooth(0.82, 0.7, nz + 0.05 * n2);
       const sand = (1 - smooth(beachTop - 0.12, beachTop + 0.12, h)) * (1 - rock);
       const dryness = clamp(0.45 + 0.7 * n2 + 0.5 * smooth(beachTop + 0.7, beachTop + 0.15, h) + 0.25 * smooth(4, 7, h));
-      const worn = clamp(0.7 * smooth(1.7, 0.85, distToPolyline(p, PATH_WAYPOINTS)) + 0.75 * smooth(1.3, 0.35, housePad(p)) + 0.6 * smooth(3.6, 2.8, Math.hypot(p[0] - LH[0], p[1] - LH[1])));
+      const worn = clamp(0.7 * smooth(1.7, 0.85, distToPolyline(p, PATH_LINE)) + 0.75 * smooth(1.3, 0.35, housePad(p)) + 0.6 * smooth(3.6, 2.8, Math.hypot(p[0] - LH[0], p[1] - LH[1])));
       const [rockA, rockB] = pair(rock, clamp(0.5 + 0.5 * n1));
       const [sandA, sandB] = pair(sand, smooth(0.15, 0.0, h));
       const f = { dry: dryness, earth: worn * 0.8, rockA, rockB, sandA, sandB };
@@ -471,7 +476,7 @@ async function buildSea() {
 // ---------------------------------------------------------------------------------------------
 /** Height of the plinth top (= the door sill): 0.4 m above the highest ground under the plinth. */
 const plinthTop = () => maxHeightIn(LH[0], LH[1], PLINTH.r) + PLINTH.above;
-/** Unit vector (x, y) from the lighthouse axis towards the end of the path: the way the door faces. */
+/** Unit vector (x, y) from the lighthouse axis towards the last path waypoint: the way the door faces. */
 const doorDir = () => {
   const [ex, ey] = PATH_WAYPOINTS.at(-1);
   const l = Math.hypot(ex - LH[0], ey - LH[1]);
@@ -506,7 +511,6 @@ async function buildLighthouse() {
   await op('object.generate_fence', { name: 'LH Railing', points: ring, closed: true, style: 'RAIL', rails: 3, height: 1.0, post_width: 0.05, post_spacing: 0.7, location: [x, y, zg + 0.25], materials: false });
   await tool('add_modifier', { object: 'LH Lantern Frame', type: 'WIREFRAME', params: { thickness: 0.07 } });
   await tool('add_modifier', { object: 'LH Tower', type: 'SMOOTH_BY_ANGLE' });
-  await tool('add_modifier', { object: 'LH Plinth', type: 'SMOOTH_BY_ANGLE' });
 
   // Materials
   await op('material.preset_apply', { preset: 'concrete', objects: ['LH Plinth'], name: 'Lighthouse Stone' });
@@ -693,9 +697,10 @@ async function buildPath() {
   await op('data.set_property', { kind: 'objects', target: 'Path Profile', values: { hide_viewport: true, hide_render: true } });
 
   // Fence on the seaward (right-hand) side of the upper path, 1.05 m from its centre line. Every
-  // post stands on a ray-cast ground height: the fence points are spaced at most 1.9 m apart, so
-  // generate_fence (which adds interpolated posts only between points farther apart than
-  // post_spacing) puts a post on each point and nowhere else.
+  // post stands on a ray-cast ground height, sunk 0.1 m (enough for the 0.1 m post on a 1:1
+  // slope): the fence points are spaced at most 1.9 m apart, so generate_fence (which adds
+  // interpolated posts only between points farther apart than post_spacing) puts a post on each
+  // point and nowhere else.
   const seg = PATH_WAYPOINTS.slice(FENCE_RANGE[0], FENCE_RANGE[1] + 1);
   const dense = resample(seg, 1.6);
   const offset = dense.map((p, k) => {
@@ -712,35 +717,44 @@ async function buildPath() {
     for (let s = 1; s <= n; s++) side.push(mix(a, b, s / n));
   }
   const fz = await raycastHeights(side);
-  const fence = await op('object.generate_fence', { name: 'Path Fence', points: side.map(([x, y], k) => [x, y, fz[k] - 0.05]), style: 'RAIL', rails: 2, height: 1.0, post_width: 0.1, post_spacing: FENCE_POST_SPACING, location: [0, 0, 0], materials: false });
+  const fence = await op('object.generate_fence', { name: 'Path Fence', points: side.map(([x, y], k) => [x, y, fz[k] - 0.1]), style: 'RAIL', rails: 2, height: 1.0, post_width: 0.1, post_spacing: FENCE_POST_SPACING, location: [0, 0, 0], materials: false });
   log(`fence: ${side.length} posts, ${fence.faces} faces`);
   await material('Path Fence', { name: 'Weathered Wood', base_color: [0.32, 0.27, 0.21, 1], roughness: 0.8 });
 
-  // Steps from the end of the path up to the lighthouse door on the plinth: equal rises of about
-  // STEPS.rise, spread over the run between the plinth wall and the path end. Each step is a block
-  // that reaches back into the plinth and down into the ground; the blocks get slightly wider
-  // towards the bottom so that their side faces never coincide.
+  // Steps up to the lighthouse door, cut into the plinth: a hidden box cuts a notch out of the
+  // plinth (BOOLEAN DIFFERENCE modifier) from the path end in to the foot of the tower, and step
+  // blocks fill the notch with equal rises of about STEPS.rise from the path's top to the door sill.
+  // (The ground in front of the door falls about 1 m per metre, so steps outside the plinth would
+  // never catch up with it.) The blocks are a little wider than the notch, so that they reach into
+  // its walls, and each reaches back to the tower.
   const u = doorDir();
-  const zTop = plinthTop();
+  const heading = Math.atan2(u[1], u[0]);
+  const at = (r, z) => [LH[0] + u[0] * r, LH[1] + u[1] * r, z];
+  const zTop = plinthTop(); // the door sill
   const zPath = pathPts.at(-1).co[2] + 0.08; // top of the path at its end
   const rises = Math.max(2, Math.round((zTop - zPath) / STEPS.rise));
   const rise = (zTop - zPath) / rises;
-  const front = Math.hypot(PATH_WAYPOINTS.at(-1)[0] - LH[0], PATH_WAYPOINTS.at(-1)[1] - LH[1]) + 0.1; // the path ends under the lowest step
-  const run = (front - PLINTH.r) / (rises - 1);
+  const front = Math.hypot(PATH_WAYPOINTS.at(-1)[0] - LH[0], PATH_WAYPOINTS.at(-1)[1] - LH[1]) - 0.02; // the lowest step meets the path end
+  const tread = (front - STEPS.back) / (rises - 1);
+  const outer = PLINTH.r + 0.4;
+  await add('cube', 'LH Step Cut', { params: { size: 1 }, location: at((STEPS.back + outer) / 2, (zPath - 0.1 + zTop + 0.5) / 2), rotation: [0, 0, heading], scale: [outer - STEPS.back, STEPS.width, zTop + 0.5 - (zPath - 0.1)] });
+  await op('data.set_property', { kind: 'objects', target: 'LH Step Cut', values: { hide_viewport: true, hide_render: true } });
+  await tool('add_modifier', { object: 'LH Plinth', type: 'BOOLEAN', params: { operation: 'DIFFERENCE', object: 'LH Step Cut' } });
+  await tool('add_modifier', { object: 'LH Plinth', type: 'SMOOTH_BY_ANGLE' });
   const steps = [];
   for (let k = 1; k < rises; k++) {
-    const [inner, outer, top, bottom] = [PLINTH.r - 0.5, PLINTH.r + k * run, zTop - k * rise, zPath - 0.8];
-    const c = (inner + outer) / 2;
+    const [r0, r1, top, bottom] = [STEPS.back - 0.15, STEPS.back + k * tread, zTop - k * rise, zPath - 0.4];
     const name = `LH Step ${k}`;
     steps.push(name);
-    await add('cube', name, { params: { size: 1 }, location: [LH[0] + u[0] * c, LH[1] + u[1] * c, (top + bottom) / 2], rotation: [0, 0, Math.atan2(u[1], u[0])], scale: [outer - inner, STEPS.width + 0.04 * k, top - bottom] });
+    await add('cube', name, { params: { size: 1 }, location: at((r0 + r1) / 2, (top + bottom) / 2), rotation: [0, 0, heading], scale: [r1 - r0, STEPS.width + 0.06, top - bottom] });
   }
-  // One object: apply the scales (OBJECT-mapped stone texture keeps its size), join, rename.
+  // One object: apply the scales (the OBJECT-mapped stone texture keeps its size), join, rename.
   await op('object.transform_apply', { location: false, rotation: false, scale: true }, { selection: { objects: steps, mode: 'OBJECT' } });
-  await op('object.join', {}, { selection: { objects: steps, active: steps[0], mode: 'OBJECT' } });
-  await op('object.rename', { object: steps[0], name: 'LH Steps' });
+  if (steps.length > 1) await op('object.join', {}, { selection: { objects: steps, active: steps[0], mode: 'OBJECT' } });
+  const renamed = await op('object.rename', { object: steps[0], name: 'LH Steps' });
+  if ((renamed.name ?? renamed) !== 'LH Steps') throw new Error(`steps renamed to ${JSON.stringify(renamed)}`);
   await material('LH Steps', { material: 'Lighthouse Stone' });
-  log(`steps: ${rises} rises of ${rise.toFixed(3)} m, treads ${run.toFixed(2)} m, from the path end (z ${zPath.toFixed(2)}) to the door sill (z ${zTop.toFixed(2)})`);
+  log(`steps: ${rises} rises of ${rise.toFixed(3)} m and treads of ${tread.toFixed(2)} m, from the path end (top z ${zPath.toFixed(2)}) to the door sill (z ${zTop.toFixed(2)})`);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -855,7 +869,7 @@ async function buildVegetation() {
       const p = V[j * N + i];
       const z = p[2];
       const nz = normalZ(i, j);
-      const dPath = distToPolyline(p, PATH_WAYPOINTS);
+      const dPath = distToPolyline(p, PATH_LINE);
       const dHouse = housePad(p);
       const dLH = Math.hypot(p[0] - LH[0], p[1] - LH[1]);
       const dSign = Math.hypot(p[0] - SIGN.at[0], p[1] - SIGN.at[1]);
@@ -900,8 +914,9 @@ async function buildWorldAndCamera() {
   });
   log(`sky: sun dir ${sky.sun_direction.map((v) => v.toFixed(2))}, irradiance ${sky.sun_irradiance.map((v) => v.toFixed(2))}`);
   await op('world.mist_set', { distance: MIST.distance, color: MIST.color });
-  // Thin cloud streaks low over the horizon and one high wisp, catching the last pink light. Each is
-  // generated small (marching cubes need a sensible aspect ratio) and stretched by its object scale.
+  // Four thin cloud streaks low over the horizon. Each is generated small (marching cubes need a
+  // sensible aspect ratio) and stretched by its object scale. (A fifth, high cloud was dropped: under
+  // the mist it rendered as flat lavender blobs that read as paper cut-outs.)
   const view = [CAMERA.look[0] - CAMERA.at[0], CAMERA.look[1] - CAMERA.at[1]]; // centre of the frame
   const vl = Math.hypot(...view);
   const fwd = [view[0] / vl, view[1] / vl];
@@ -911,13 +926,12 @@ async function buildWorldAndCamera() {
     { d: 1000, side: -60, z: 42, size: [60, 24, 8], scale: [10, 4, 0.8], seed: 5, yaw: 0 },
     { d: 900, side: 430, z: 50, size: [60, 24, 8], scale: [8, 4, 1.1], seed: 8, yaw: -0.1 },
     { d: 800, side: 230, z: 100, size: [50, 20, 8], scale: [7, 3.5, 1.1], seed: 12, yaw: 0.2 },
-    { d: 700, side: -330, z: 250, size: [60, 24, 8], scale: [7, 3, 0.9], seed: 3, yaw: 0.15 },
   ];
   for (const [k, c] of clouds.entries()) {
     const at = [CAMERA.at[0] + fwd[0] * c.d + right[0] * c.side, CAMERA.at[1] + fwd[1] * c.d + right[1] * c.side, c.z];
     await op('object.generate_cloud', { name: `Cloud ${k + 1}`, size: c.size, puffs: 20, smoothness: 0.3, resolution: 64, seed: c.seed, location: at, scale: c.scale, rotation: [0, 0, Math.atan2(fwd[1], fwd[0]) + Math.PI / 2 + c.yaw], materials: false });
   }
-  // At 700–1000 m the mist covers 90–99 % of a cloud's own shading, so the clouds simply glow in
+  // At 830–1000 m the mist covers 96–99 % of a cloud's own shading, so the clouds simply glow in
   // the mist colour (black base, emission = mist colour). That also keeps them unchanged behind
   // the beam shafts: the path tracer evaluates the mist at the first surface a camera ray hits,
   // which there is the shaft glass a few metres away, so lit clouds would lose their mist and
@@ -951,7 +965,8 @@ function lensShift(p) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 10. Checks: scene problems, the driven beams at several frames, the camera aim
+// 10. Checks: scene problems and unused materials, the driven beams at several frames, the path
+//     on the ground, the painted colours, the camera aim and framing, the scatter placement
 // ---------------------------------------------------------------------------------------------
 /** Local X, Y, Z axes (the columns of Rz·Ry·Rx) of an XYZ Euler rotation. */
 function axesOf([rx, ry, rz]) {
@@ -998,9 +1013,16 @@ async function check() {
   log(`  path: ${pm.vertices.length} vertices, highest ${highest.toFixed(2)} m above the ground (top surface: +0.11 m)`);
   if (highest > 0.4) throw new Error(`the path floats ${highest.toFixed(2)} m above the ground`);
   // The painted island colours equal the computed ones. get_mesh_data does not return vertex
-  // colours, but export_mesh.ply does (8-bit sRGB): export the island alone and compare every vertex.
-  const ply = await op('export_mesh.ply', { use_selection: true, apply_modifiers: false }, { selection: { objects: ['Island'], mode: 'OBJECT' } });
-  const buf = Buffer.from(ply.data_base64, 'base64');
+  // colours, but export_mesh.ply does (8-bit sRGB). The export would include the scattered
+  // instances, so one batch hides the particle systems and exports the island; undo reverts it.
+  const plyBatch = await ops([
+    ...SCATTERS.map((o) => ({ operator: 'object.particle_system_update', params: { object: 'Island', particle_system: o.name, show_viewport: false, show_render: false } })),
+    { operator: 'object.select', params: { objects: ['Island'] } },
+    { operator: 'export_mesh.ply', params: { use_selection: true, apply_modifiers: false } },
+  ]);
+  const undone = await tool('undo', {});
+  if (undone.undone !== 1) throw new Error(`undo after the colour export: ${JSON.stringify(undone)}`);
+  const buf = Buffer.from(plyBatch.at(-1).data_base64, 'base64');
   const start = buf.indexOf('end_header\n') + 'end_header\n'.length;
   const header = buf.subarray(0, start).toString('latin1');
   const props = header.split('element face')[0].match(/property \w+ \w+/g).map((l) => l.split(' ').slice(1)); // [type, name]
@@ -1042,11 +1064,10 @@ async function check() {
   // Scatter placement. No MCP tool reports where the instances of a particle system are, so each
   // system is made real for a moment: one batch shows only that system and runs
   // object.duplicates_make_real, get_scene lists the new objects, and undo reverts the batch.
-  // The 2,600 grass tufts are left out to keep the check light (listing them alone is 1.3 MB of
-  // JSON, and the server's memory is already tight); they follow the same density rules (zero
-  // weight on the dry beach and the path).
-  const pathLine = resample(PATH_WAYPOINTS, 0.25);
-  for (const sc of SCATTERS.filter((x) => x.count <= 500)) {
+  // The 2,600 grass tufts are left out unless --check-all is given, to keep the check light
+  // (listing them is 1.3 MB of JSON); they follow the same density rules (zero weight on the dry
+  // beach and the path).
+  for (const sc of SCATTERS.filter((x) => FLAGS.has('--check-all') || x.count <= 500)) {
     const res = await ops([
       ...SCATTERS.map((o) => ({ operator: 'object.particle_system_update', params: { object: 'Island', particle_system: o.name, show_viewport: o === sc, show_render: o === sc } })),
       { operator: 'object.duplicates_make_real', params: { objects: ['Island'] } },
@@ -1060,7 +1081,7 @@ async function check() {
     let closest = Infinity;
     for (let a = 0; a < pts.length; a++)
       for (let b = a + 1; b < pts.length; b++) closest = Math.min(closest, Math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1], pts[a][2] - pts[b][2]));
-    const onPath = pts.filter((q) => distToPolyline(q, pathLine) < 0.75).length; // the path is 1.5 m wide
+    const onPath = pts.filter((q) => distToPolyline(q, PATH_LINE) < 0.75).length; // the path is 1.5 m wide
     const onBeach = pts.filter((q) => dryBeach[faceAt(q[0], q[1])]).length;
     const inSea = pts.filter((q) => q[2] < SEA).length;
     log(`  ${sc.name}: ${pts.length} placed, closest pair ${closest.toFixed(2)} m (min_distance ${sc.min_distance}), on the path ${onPath}, on the dry beach ${onBeach}, in the shallows ${inSea}`);

@@ -198,6 +198,8 @@ describe('thin rigid bodies', () => {
     reports.length = 0;
     const r = ok('rigidbody.object_add', { objects: ['Sheet'], collision_shape: 'BOX', mass: 0.005 });
     expect(r.objects[0].collision_note).toMatch(/only 0\.05 mm thick.*collides as if 0\.59 mm thick/);
+    // the rule as stated: 0.59 mm is 0.2% of the sheet's largest dimension (29.7 cm), not of its half size
+    expect(r.objects[0].collision_note).toContain('0.59 mm (0.2% of its largest dimension)');
     expect(reports.join('\n')).toMatch(/WARNING: 'Sheet': the mesh is only 0\.05 mm thick/);
     const d = ok('rigidbody.describe', { frame: 30 });
     expect(d.objects.find((o: { name: string }) => o.name === 'Sheet').issues.join(' ')).toMatch(
@@ -245,5 +247,52 @@ describe('thin rigid bodies', () => {
     }
     expect(fell.every((f) => f > 0)).toBe(true);
     for (let i = 1; i < fell.length; i++) expect(fell[i]).toBeGreaterThanOrEqual(fell[i - 1]);
+  });
+});
+
+describe('rigid body notes and large scenes', () => {
+  it('states the minimum thickness rule as it is applied (largest dimension, 10 mm cap)', () => {
+    const { ok, reports } = setup();
+    // the verifier's sheet: a 2 m cube scaled to 42 x 59.4 cm x 0.1 mm → 0.2% of 59.4 cm = 1.2 mm
+    ok('mesh.primitive_cube_add', { name: 'Sheet', scale: [0.21, 0.297, 0.00005], location: [1, 0, 0.1] });
+    ok('object.transform_apply', { location: false, rotation: false, scale: true });
+    const r = ok('rigidbody.object_add', { objects: ['Sheet'], collision_shape: 'BOX', mass: 0.005 });
+    expect(r.objects[0].collision_note).toBe(
+      'the mesh is only 0.1 mm thick (Z), below the minimum collision thickness of 1.2 mm (0.2% of its ' +
+        'largest dimension): it collides as if 1.2 mm thick',
+    );
+    // a 6 m plane as a dynamic body: 0.2% would be 12 mm, the cap is 10 mm
+    ok('mesh.primitive_plane_add', { name: 'Board', size: 6, location: [0, 0, 1] });
+    reports.length = 0;
+    const b = ok('rigidbody.object_add', { objects: ['Board'], collision_shape: 'BOX' });
+    expect(b.objects[0].collision_note).toBe(
+      'flat mesh: simulated as a 10 mm thick slab behind its faces (minimum collision thickness: 0.2% of ' +
+        'its largest dimension, at most 10 mm)',
+    );
+    expect(reports).toContain(`WARNING: 'Board': ${b.objects[0].collision_note}`);
+  });
+
+  it('adds and changes rigid bodies of many objects in linear time', () => {
+    // the thickness check built a frame state (a pass over the whole scene) per object: 1000 objects
+    // took 15 s instead of 0.1 s
+    const { ok, doc } = setup();
+    ok('mesh.primitive_cube_add', { name: 'D0', size: 0.1, location: [0, 0, 0.05] });
+    ok('object.array_place', { objects: ['D0'], pattern: 'LINE', count: 800, offset: [0.2, 0, 0], linked: true });
+    const names = doc
+      .listObjects()
+      .filter((o) => o.type === 'MESH')
+      .map((o) => o.name);
+    expect(names).toHaveLength(800);
+    let t = performance.now();
+    const r = ok('rigidbody.object_add', { objects: names, type: 'ACTIVE', collision_shape: 'BOX' });
+    const add = performance.now() - t;
+    t = performance.now();
+    ok('rigidbody.object_settings_set', { objects: names, mass: 0.5 });
+    const set = performance.now() - t;
+    expect(r.objects).toHaveLength(800);
+    expect(r.objects.every((o: { collision_note: string | null }) => o.collision_note === null)).toBe(true);
+    // about 50 ms each now; the quadratic version needed over 5 s for 800 objects
+    expect(add).toBeLessThan(2500);
+    expect(set).toBeLessThan(2500);
   });
 });

@@ -81,6 +81,8 @@ import {
 
 export { decodePNG } from './png';
 export { autoFrameView } from './view';
+// the STUDIO / IMAGE world as the renderers see it (the web viewport lights WebGL renders with it)
+export { environmentLighting, sampleEnvironmentBackground, type EnvironmentLighting } from './env-light';
 export * from './sky';
 export * from './animation';
 export {

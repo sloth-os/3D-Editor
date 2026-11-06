@@ -5,21 +5,24 @@ import { buildTopology, type Topology } from '../mesh/topology';
 import type { ModifierDef } from './registry';
 import { DEG, MeshBuilder, faceNormalsOf, hasColors } from './util';
 import { mergeLoops } from './polymerge';
+import { fillGridPatch, patchFullness, type GridPatchContext, type PatchSide } from './bevel-patch';
 
 /*
  * Self-contained bevel modifier (independent of the edit-mode bevel tool).
  *
  * Edge mode: every selected edge becomes a strip of `segments` quads following a superellipse profile,
- * faces shrink away from beveled edges, and every affected vertex gets a patch polygon (fan-filled for
- * segments > 1). Where beveled and non-beveled edges meet, the new vertices slide along the non-beveled
- * edges and the neighbouring faces receive the extra vertices, so closed inputs stay closed. A vertex
- * where just two beveled edges meet with a single bevel vertex on each side (a cylinder rim, the middle
- * of a beveled edge loop) needs no patch: like Blender's weld, both strips share one profile chain.
- * Vertex mode: corners are cut off at `width` along each incident edge.
+ * faces shrink away from beveled edges, and every affected vertex gets a patch. Where beveled and
+ * non-beveled edges meet, the new vertices slide along the non-beveled edges and the neighbouring faces
+ * receive the extra vertices, so closed inputs stay closed. A vertex where just two beveled edges meet
+ * with a single bevel vertex on each side (a cylinder rim, the middle of a beveled edge loop) needs no
+ * patch: like Blender's weld, both strips share one profile chain. Where three or more beveled edges meet
+ * (a cube corner, a cylinder rim with limit_method NONE), the patch between their profiles is a quad grid
+ * like Blender's (see bevel-patch.ts); with one segment it is a single polygon.
+ * Vertex mode: corners are cut off at `width` along each incident edge; with several segments the cut
+ * is rounded by profiles across the faces and the same quad-grid patch.
  *
  * Limitations: only manifold vertices with a closed face fan are beveled (boundary and non-manifold
- * vertices/edges are left as they are), the width is clamped globally (`use_clamp_overlap`) and vertex
- * patches with several segments are filled with a triangle fan instead of a quad grid.
+ * vertices/edges are left as they are) and the width is clamped globally (`use_clamp_overlap`).
  */
 
 const schema = z.object({
@@ -89,7 +92,7 @@ function vertexRing(m: MeshData, topo: Topology, dirFace: Map<string, number>, v
 
 /** Superellipse profile point between A (t=0) and B (t=1) bulging toward control point C. */
 function profilePoint(A: number[], B: number[], C: number[], t: number, profile: number): number[] {
-  const k = Math.max(0.1, Math.min(40, 4 * profile));
+  const k = profileExponent(profile);
   const th = (t * Math.PI) / 2;
   const x = 1 - Math.pow(Math.sin(th), 2 / k);
   const y = 1 - Math.pow(Math.cos(th), 2 / k);
@@ -138,31 +141,46 @@ interface PatchCtx {
   smooth: boolean;
 }
 
-/** Adds a vertex patch: an n-gon, or a triangle fan around a center point when `fanCenter` is given. */
-function addPatch(
-  ctx: PatchCtx,
-  loop: number[],
-  fanCenter: number[] | null,
-  colorSrc: number[] | null,
-  colorIndex: number,
-): void {
+/** Adds a vertex patch as one polygon. */
+function addPatch(ctx: PatchCtx, loop: number[]): void {
   const uvOf = (v: number) => ctx.vertUV.get(v) ?? [0, 0];
-  if (!fanCenter || loop.length <= 4) {
-    ctx.b.addFace(loop, ctx.material, ctx.smooth, loop.flatMap(uvOf));
-    return;
-  }
-  const c = ctx.b.addVertex(fanCenter[0], fanCenter[1], fanCenter[2], colorSrc, colorIndex);
-  const cu = [0, 0];
-  for (const v of loop) {
-    const u = uvOf(v);
-    cu[0] += u[0] / loop.length;
-    cu[1] += u[1] / loop.length;
-  }
-  for (let i = 0; i < loop.length; i++) {
-    const a = loop[i];
-    const d = loop[(i + 1) % loop.length];
-    ctx.b.addFace([c, a, d], ctx.material, ctx.smooth, [...cu, ...uvOf(a), ...uvOf(d)]);
-  }
+  ctx.b.addFace(loop, ctx.material, ctx.smooth, loop.flatMap(uvOf));
+}
+
+/** Superellipse exponent of a `profile` value (as used by `profilePoint`). */
+function profileExponent(profile: number): number {
+  return Math.max(0.1, Math.min(40, 4 * profile));
+}
+
+/**
+ * The quad-grid patch of `sides` (S ≥ 2 segments each, consecutive sides sharing their end points) at
+ * original vertex v, or false when the sides do not close up that way (the caller adds a polygon).
+ */
+function gridPatch(
+  ctx: PatchCtx,
+  sides: PatchSide[],
+  S: number,
+  profile: number,
+  corner: number[],
+  colors: ArrayLike<number> | null,
+  v: number,
+): boolean {
+  const n = sides.length;
+  if (n < 3 || S < 2) return false;
+  for (let i = 0; i < n; i++) if (sides[i].ids[S] !== sides[(i + 1) % n].ids[0]) return false;
+  const gctx: GridPatchContext = {
+    ...ctx,
+    colors,
+    colorIndex: v,
+    profileAt: (a, b, c, t) => profilePoint(a, b, c, t, profile),
+  };
+  fillGridPatch(gctx, sides, S, corner, patchFullness(profileExponent(profile)));
+  return true;
+}
+
+/** A profile side walked the other way. */
+function reversedSide(s: PatchSide): PatchSide {
+  return { ids: s.ids.slice().reverse(), a: s.b, b: s.a, c: s.c };
 }
 
 export function bevelMesh(m: MeshData, p: BevelParams): MeshData {
@@ -260,8 +278,10 @@ function bevelEdges(
         corners.set(ck(f, i), { kind: 'M', w });
         const projPrev = Math.abs(w[0] * uPrev[0] + w[1] * uPrev[1] + w[2] * uPrev[2]);
         const projNext = Math.abs(w[0] * uNext[0] + w[1] * uNext[1] + w[2] * uNext[2]);
-        if (projPrev > 1e-12) scaleLimit = Math.min(scaleLimit, (0.5 * lPrev) / projPrev);
-        if (projNext > 1e-12) scaleLimit = Math.min(scaleLimit, (0.5 * lNext) / projNext);
+        // stop just short of the middle of the edge (like slides below): bevels from both ends that
+        // met exactly would leave zero-area faces (e.g. the sides of a low-poly cylinder with NONE)
+        if (projPrev > 1e-12) scaleLimit = Math.min(scaleLimit, (0.49 * lPrev) / projPrev);
+        if (projNext > 1e-12) scaleLimit = Math.min(scaleLimit, (0.49 * lNext) / projNext);
       } else if (bIn || bOut) {
         const t = 1 / Math.max(sinA, 1e-3);
         const e = bOut ? ring.eIn[k] : ring.eOut[k];
@@ -335,6 +355,7 @@ function bevelEdges(
 
   // --- strips (with profile arcs at both ends)
   const arcs = new Map<string, number[]>(); // `${e}:${v}` → vertices from the first face side to the second
+  const arcSpecs = new Map<string, { a: number[]; b: number[]; c: number[] }>(); // their profiles (segments > 1)
   const stripFace = (e: number): [number, number] => {
     const [a, c] = topo.edges[e];
     return [dirFace.get(`${a},${c}`) ?? -1, dirFace.get(`${c},${a}`) ?? -1];
@@ -367,6 +388,7 @@ function bevelEdges(
         vertUV.set(idx, [ua[0] + ((ub[0] - ua[0]) * j) / S, ua[1] + ((ub[1] - ua[1]) * j) / S]);
         arc.push(idx);
       }
+      arcSpecs.set(key, { a: pa, b: pb, c: C });
     }
     arc.push(B);
     arcs.set(key, arc);
@@ -482,6 +504,7 @@ function bevelEdges(
     const push = (x: number) => {
       if (seq[seq.length - 1] !== x) seq.push(x);
     };
+    const sides: PatchSide[] = []; // the profiles in fan order (the patch winds the other way)
     for (let k = 0; k < n; k++) {
       const e = ring.eIn[k];
       const fPrev = ring.faces[(k + n - 1) % n];
@@ -489,6 +512,11 @@ function bevelEdges(
         const arc = arcAt(e, v);
         const [fa] = stripFace(e);
         for (const x of fa === fPrev ? arc : arc.slice().reverse()) push(x);
+        const spec = arcSpecs.get(`${e}:${v}`);
+        if (spec) {
+          const side = { ids: arc, ...spec };
+          sides.push(fa === fPrev ? side : reversedSide(side));
+        }
       } else {
         const sv = slideVert.get(`${v}:${e}`);
         if (sv !== undefined) push(sv);
@@ -532,16 +560,13 @@ function bevelEdges(
           continue;
         }
       }
-      addPatch(ctx, loop, null, colors, v);
+      addPatch(ctx, loop);
       continue;
     }
-    let center: number[] | null = null;
-    if (S > 1) {
-      const c = [0, 0, 0];
-      for (const x of loop) for (let q = 0; q < 3; q++) c[q] += b.positions[x * 3 + q] / loop.length;
-      center = [0, 1, 2].map((q) => c[q] + (P[v * 3 + q] - c[q]) * 0.5);
-    }
-    addPatch(ctx, loop, center, colors, v);
+    // three or more beveled edges, each pair of neighbours ending on one shared bevel vertex: quad grid
+    const corner = [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]];
+    if (gridPatch(ctx, sides.reverse().map(reversedSide), S, p.profile, corner, colors, v)) continue;
+    addPatch(ctx, loop);
   }
   // edge attributes of non-beveled edges are kept on the edge (and its slid parts)
   for (const key in m.edgeAttrs) {
@@ -614,6 +639,7 @@ function bevelVertices(
   const vertUV = new Map<number, number[]>();
   // per face corner: the arc from the cut on the incoming edge to the cut on the outgoing edge
   const cornerArc = new Map<string, number[]>();
+  const cornerSpec = new Map<string, { a: number[]; b: number[]; c: number[] }>(); // its profile
   for (let f = 0; f < m.faces.length; f++) {
     const face = m.faces[f];
     const L = face.length;
@@ -635,12 +661,14 @@ function bevelVertices(
       const arc = [a];
       const pa = [b.positions[a * 3], b.positions[a * 3 + 1], b.positions[a * 3 + 2]];
       const pc = [b.positions[c * 3], b.positions[c * 3 + 1], b.positions[c * 3 + 2]];
+      const pv = [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]];
       for (let j = 1; j < S; j++) {
-        const q = profilePoint(pa, pc, [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]], j / S, p.profile);
+        const q = profilePoint(pa, pc, pv, j / S, p.profile);
         arc.push(b.addVertex(q[0], q[1], q[2], colors, v));
       }
       arc.push(c);
       cornerArc.set(`${f}:${i}`, arc);
+      cornerSpec.set(`${f}:${i}`, { a: pa, b: pc, c: pv });
       for (const x of arc) {
         const uv = cornerUV(m, f, i, [b.positions[x * 3], b.positions[x * 3 + 1], b.positions[x * 3 + 2]]);
         loop.push(x);
@@ -654,32 +682,25 @@ function bevelVertices(
     if (!sel[v]) continue;
     const ring = rings[v]!;
     const seq: number[] = [];
+    const sides: PatchSide[] = [];
     // walk the fan backwards so the patch is wound opposite to the face corners it borders
     for (let k = ring.faces.length - 1; k >= 0; k--) {
-      const arc = cornerArc.get(`${ring.faces[k]}:${ring.corners[k]}`)!;
+      const key = `${ring.faces[k]}:${ring.corners[k]}`;
+      const arc = cornerArc.get(key)!;
       for (let j = arc.length - 1; j >= 0; j--) if (seq[seq.length - 1] !== arc[j]) seq.push(arc[j]);
+      sides.push(reversedSide({ ids: arc, ...cornerSpec.get(key)! }));
     }
     while (seq.length > 1 && seq[0] === seq[seq.length - 1]) seq.pop();
     if (seq.length < 3) continue;
     const f0 = ring.faces[0];
-    let center: number[] | null = null;
-    if (S > 1) {
-      const c = [0, 0, 0];
-      for (const x of seq) for (let q = 0; q < 3; q++) c[q] += b.positions[x * 3 + q] / seq.length;
-      center = [0, 1, 2].map((q) => c[q] + (P[v * 3 + q] - c[q]) * 0.5);
-    }
-    addPatch(
-      {
-        b,
-        vertUV,
-        material: p.material >= 0 ? p.material : (m.faceMaterials[f0] ?? 0),
-        smooth: m.faceSmooth[f0] ?? false,
-      },
-      seq,
-      center,
-      colors,
-      v,
-    );
+    const ctx: PatchCtx = {
+      b,
+      vertUV,
+      material: p.material >= 0 ? p.material : (m.faceMaterials[f0] ?? 0),
+      smooth: m.faceSmooth[f0] ?? false,
+    };
+    if (!gridPatch(ctx, sides, S, p.profile, [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]], colors, v))
+      addPatch(ctx, seq);
   }
   for (const key in m.edgeAttrs) {
     const e = topo.edgeIndex.get(key);
@@ -705,9 +726,13 @@ export const bevelModifier: ModifierDef<typeof schema> = {
   description:
     'Rounds or chamfers edges (or vertices): edges sharper than `angle_limit` (or all with limit_method NONE) are ' +
     'replaced by a strip of `segments` faces following `profile` (0.5 = round), offset by `width` into the adjacent ' +
-    'faces; corners where three or more beveled edges meet get patch faces, while two beveled edges meeting (e.g. ' +
-    'the rim of a cylinder) continue into each other with one shared profile (all quads, like Blender). ' +
-    'affect=VERTICES cuts off corners instead. Closed manifold input stays closed. ' +
+    'faces. Where two beveled edges meet (the rim of a cylinder with limit_method ANGLE) the strips continue into ' +
+    'each other with one shared profile; where three or more meet (a cube corner, every rim vertex of a cylinder ' +
+    'with limit_method NONE, whose vertical edges are beveled too) the corner is filled like Blender: with ' +
+    'segments > 1 a grid of quads around a center vertex (even segments) or a center polygon (odd segments, e.g. ' +
+    'one triangle per cube corner), round corners of round profiles lying on a sphere; with 1 segment one polygon. ' +
+    'affect=VERTICES cuts off corners instead (rounded the same way with segments > 1). The width is clamped so ' +
+    'neighbouring bevels stop just short of each other (use_clamp_overlap). Closed manifold input stays closed. ' +
     'Limitation: boundary / non-manifold vertices are not beveled.',
   schema,
   apply(mesh, p) {

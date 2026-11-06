@@ -280,6 +280,52 @@ describe('MCP extras for agents', () => {
     );
   });
 
+  it('batch sets a selection per operation, like run_operator (lighthouse-cove colour check)', async () => {
+    const { id } = await ok('create_project', { name: 'Batch selection', empty: true });
+    await ok('add_object', { project: id, type: 'cube', name: 'A' });
+    await ok('add_object', { project: id, type: 'cube', name: 'B', location: [3, 0, 0] });
+    await ok('add_object', { project: id, type: 'cube', name: 'C', location: [6, 0, 0] });
+    const r = await ok('batch', {
+      project: id,
+      operations: [
+        { operator: 'object.delete', selection: { objects: ['A'] } },
+        { operator: 'export_mesh.stl', params: { use_selection: true }, selection: { objects: ['B'] } },
+        // no selection: the previous one stays set
+        { operator: 'export_mesh.stl', params: { use_selection: true } },
+      ],
+    });
+    expect(r.results.map((x: { ok: boolean }) => x.ok)).toEqual([true, true, true]);
+    expect(r.results[0].result).toEqual({ deleted: 1 });
+    // one cube: 12 triangles (binary STL: 84-byte header + 50 bytes per triangle)
+    expect(r.results[1].result.size).toBe(84 + 12 * 50);
+    expect(r.results[2].result.size).toBe(84 + 12 * 50);
+    expect(r.selection).toMatchObject({ selected: ['B'], active: 'B' });
+    const names = (await ok('get_scene', { project: id })).objects.map((o: { name: string }) => o.name);
+    expect(names.sort()).toEqual(['B', 'C']);
+    // one undo step for the whole batch
+    await ok('undo', { project: id });
+    expect((await ok('get_scene', { project: id })).counts.objects).toBe(3);
+
+    // a selection naming an unknown object fails its operation (NOT_FOUND), nothing runs after it
+    const bad = await call('batch', {
+      project: id,
+      operations: [
+        { operator: 'object.delete', selection: { objects: ['Nope'] } },
+        { operator: 'object.delete', selection: { objects: ['C'] } },
+      ],
+    });
+    expect(bad.raw.isError).toBe(true);
+    const details = JSON.parse(bad.text.slice(bad.text.indexOf('\n') + 1));
+    expect(details.results).toHaveLength(1);
+    expect(details.results[0]).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    expect(details.results[0].error).toMatch(/^selection: Object 'Nope' not found/);
+    expect((await ok('get_scene', { project: id })).counts.objects).toBe(3);
+    // and the schema still rejects keys that are neither operator, params nor selection
+    expect(
+      await fails('batch', { project: id, operations: [{ operator: 'object.delete', selected: ['C'] }] }),
+    ).toMatch(/unknown key 'selected' \(did you mean 'selection'\?\)/);
+  });
+
   it('get_instances lists collection instances of an empty', async () => {
     const { id } = await ok('create_project', { name: 'Collection check', empty: true });
     await op(id, 'mesh.primitive_cube_add', { size: 1, location: [1, 0, 0] });

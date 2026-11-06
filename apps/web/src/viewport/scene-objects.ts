@@ -41,10 +41,38 @@ export const COLORS = {
 let rectInit = false;
 
 /**
- * Converts Blender-style watts (W / 4π ≈ candela) into three.js intensities. The factor is
- * calibrated so the default 1000 W lamp lights the default scene like Blender's EEVEE.
+ * The three.js intensity of a lamp in Blender's units, exactly as the CPU rasterizer and the path
+ * tracer light the scene (core render/index.ts `buildLights`, render/pathtrace/lights.ts), so the
+ * WebGL renders (Rendered viewport, F12, Render Animation, MCP renders in a browser) are as bright
+ * as theirs:
+ * - POINT / SPOT: power P (W) → radiant intensity P / 4π (W/sr); the three.js intensity (candela)
+ *   with inverse-square decay gives the same irradiance;
+ * - SUN: `energy` is the irradiance (W/m²) of a surface facing it, the three.js directional
+ *   intensity;
+ * - AREA: a one-sided Lambertian emitter of power P and area A has radiance P / (π·A), the
+ *   RectAreaLight intensity; `area` is the world area of the drawn rectangle (scale included), so
+ *   the emitted power stays P also for disc and ellipse shapes.
  */
-const LIGHT_SCALE = 12;
+export function lightIntensity(l: Pick<LightData, 'type' | 'energy'>, area = 1): number {
+  const p = Number.isFinite(l.energy) ? Math.max(0, l.energy) : 0;
+  if (l.type === 'SUN') return p;
+  if (l.type === 'AREA') return p / (Math.PI * Math.max(1e-6, area));
+  return p / (4 * Math.PI);
+}
+
+/**
+ * three.js SpotLight `angle` and `penumbra` of a Blender spot cone (full angle `spotSize`, edge
+ * softness `blend`): the core renderers fade the light in with a smoothstep from the cone edge
+ * (cos ½·size) to cos ½·size + (1 − cos ½·size)·blend, three.js from cos(angle) to
+ * cos(angle·(1 − penumbra)).
+ */
+export function spotCone(spotSize: number, blend: number): { angle: number; penumbra: number } {
+  const half = Math.min(Math.PI / 2, Math.max(1e-4, (Number.isFinite(spotSize) ? spotSize : 0) / 2));
+  const b = Math.min(1, Math.max(0, Number.isFinite(blend) ? blend : 0));
+  const cosHalf = Math.cos(half);
+  const inner = Math.acos(Math.min(1, cosHalf + (1 - cosHalf) * b));
+  return { angle: half, penumbra: Math.min(1, Math.max(0, 1 - inner / half)) };
+}
 
 export function geometryFromMesh(mesh: MeshData): { geometry: THREE.BufferGeometry; triFace: Uint32Array } {
   const rb = buildRenderBuffers(mesh);
@@ -129,7 +157,7 @@ export class SceneObjects {
       if (o.mesh) this.syncMesh(doc, v, o, opts);
       else this.clearMesh(v);
       if (o.type !== 'MESH') this.syncHelper(v, o, opts);
-      if (o.type === 'LIGHT' && o.light) this.syncLight(v, o.light, opts);
+      if (o.type === 'LIGHT' && o.light) this.syncLight(v, o.light, o.worldMatrix, opts);
       else if (v.light) {
         v.root.remove(v.light);
         v.light.dispose();
@@ -368,7 +396,7 @@ export class SceneObjects {
     }
   }
 
-  private syncLight(v: ObjectView, l: LightData, opts: SyncOptions): void {
+  private syncLight(v: ObjectView, l: LightData, world: number[], opts: SyncOptions): void {
     const key = `${l.type}|${l.shape}`;
     if (v.lightKey !== key || !v.light) {
       if (v.light) {
@@ -409,22 +437,26 @@ export class SceneObjects {
     light.color.setRGB(l.color[0], l.color[1], l.color[2]);
     const shadows = opts.castShadows && l.use_shadow;
     if (light instanceof THREE.DirectionalLight) {
-      light.intensity = l.energy * 2.5;
+      light.intensity = lightIntensity(l);
       light.castShadow = shadows;
     } else if (light instanceof THREE.SpotLight) {
-      light.intensity = (l.energy / (4 * Math.PI)) * LIGHT_SCALE;
-      light.angle = Math.min(Math.PI / 2, l.spot_size / 2);
-      light.penumbra = Math.min(1, l.spot_blend);
+      light.intensity = lightIntensity(l);
+      const cone = spotCone(l.spot_size, l.spot_blend);
+      light.angle = cone.angle;
+      light.penumbra = cone.penumbra;
       light.decay = 2;
       light.castShadow = shadows;
     } else if (light instanceof THREE.RectAreaLight) {
-      const w = l.size;
-      const h = l.shape === 'RECTANGLE' || l.shape === 'ELLIPSE' ? l.size_y : l.size;
+      const w = Math.max(1e-4, l.size);
+      const h = Math.max(1e-4, l.shape === 'RECTANGLE' || l.shape === 'ELLIPSE' ? l.size_y : l.size);
       light.width = w;
       light.height = h;
-      light.intensity = (l.energy / (4 * Math.PI * Math.max(0.01, w * h))) * LIGHT_SCALE;
+      // the rectangle is scaled by the object's X and Y axes
+      const sx = Math.hypot(world[0], world[1], world[2]);
+      const sy = Math.hypot(world[4], world[5], world[6]);
+      light.intensity = lightIntensity(l, w * h * sx * sy);
     } else if (light instanceof THREE.PointLight) {
-      light.intensity = (l.energy / (4 * Math.PI)) * LIGHT_SCALE;
+      light.intensity = lightIntensity(l);
       light.decay = 2;
       light.castShadow = shadows;
     }

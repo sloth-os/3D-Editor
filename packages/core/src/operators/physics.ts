@@ -152,26 +152,47 @@ function resolveTargets(ctx: OperatorContext, refs: string[] | undefined): Objec
   return ids.map((id) => ctx.doc.getObject(id)!);
 }
 
+/** Thickness note of a body (see `thicknessChecker`). */
+type ThicknessCheck = (o: ObjectData, rb: RigidBodyData) => string | null;
+
 /**
  * The thickening of a body's convex collision shape when its mesh (at the world's frame_start
  * scale) is thinner than the minimum collision thickness, else null. Triangle-mesh colliders
- * (MESH on PASSIVE / Animated bodies) have no thickness and are not checked.
+ * (MESH on PASSIVE / Animated bodies) have no thickness and are not checked. One checker serves one
+ * operator call: the world matrices at frame_start come from a single frame state, and linked
+ * duplicates with the same scale share one shape build (a frame state or hull per object made
+ * adding rigid bodies to many objects quadratic in the scene size).
  */
-function thicknessNote(doc: SceneDoc, o: ObjectData, rb: RigidBodyData): string | null {
-  const dynamic = rb.type === 'ACTIVE' && !rb.kinematic;
-  if (rb.collision_shape === 'MESH' && !dynamic) return null;
-  const mesh = o.data ? doc.getMesh(o.data) : null;
-  if (!mesh || mesh.positions.length === 0) return null;
-  const m = new FrameState(doc, worldOf(doc).frame_start).world(o.id);
-  if (!m) return null;
-  const built = buildCollisionShape(rb.collision_shape, mesh, decomposeRigid(m).scale, { dynamic });
-  if ('error' in built || !built.thickened) return null;
-  // the notes say how it is simulated (a flat static floor needs no note: only its back changes)
-  return built.notes.find((n) => n.includes('thick')) ?? null;
+function thicknessChecker(doc: SceneDoc): ThicknessCheck {
+  let fs: FrameState | null = null;
+  const memo = new Map<string, string | null>();
+  return (o, rb) => {
+    const dynamic = rb.type === 'ACTIVE' && !rb.kinematic;
+    if (rb.collision_shape === 'MESH' && !dynamic) return null;
+    const mesh = o.data ? doc.getMesh(o.data) : null;
+    if (!mesh || mesh.positions.length === 0) return null;
+    const m = (fs ??= new FrameState(doc, worldOf(doc).frame_start)).world(o.id);
+    if (!m) return null;
+    const scale = decomposeRigid(m).scale;
+    const key = `${o.data}|${rb.collision_shape}|${dynamic}|${scale.join(',')}`;
+    let note = memo.get(key);
+    if (note === undefined) {
+      const built = buildCollisionShape(rb.collision_shape, mesh, scale, { dynamic });
+      // the notes say how it is simulated (a flat static floor needs no note: only its back changes)
+      note = 'error' in built || !built.thickened ? null : (built.notes.find((n) => n.includes('thick')) ?? null);
+      memo.set(key, note);
+    }
+    return note;
+  };
 }
 
 /** Warnings about settings that will not behave as the user might expect. */
-function settingWarnings(ctx: OperatorContext, o: ObjectData, rb: RigidBodyData): string | null {
+function settingWarnings(
+  ctx: OperatorContext,
+  o: ObjectData,
+  rb: RigidBodyData,
+  thickness: ThicknessCheck,
+): string | null {
   if (rb.type === 'ACTIVE' && !rb.kinematic && rb.collision_shape === 'MESH')
     ctx.report(
       'WARNING',
@@ -180,7 +201,7 @@ function settingWarnings(ctx: OperatorContext, o: ObjectData, rb: RigidBodyData)
   const mesh = o.data ? ctx.doc.getMesh(o.data) : null;
   if (mesh && mesh.positions.length === 0)
     ctx.report('WARNING', `'${o.name}' has no vertices and is left out of the simulation`);
-  const thin = thicknessNote(ctx.doc, o, rb);
+  const thin = thickness(o, rb);
   if (thin) ctx.report('WARNING', `'${o.name}': ${thin}`);
   return thin;
 }
@@ -248,6 +269,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
         const patch = pickSettings(p);
         const objects: ReturnType<typeof describeSettings>[] = [];
         const skipped: { object: string; name: string; reason: string }[] = [];
+        const thickness = thicknessChecker(doc);
         let created = 0;
         for (const o of resolveTargets(ctx, p.objects)) {
           if (o.type !== 'MESH' || !o.data) {
@@ -263,7 +285,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
           const rb: RigidBodyData = { ...base, ...patch };
           doc.updateObject(o.id, { rigid_body: rb });
           if (!existing) created++;
-          objects.push(describeSettings(o, rb, settingWarnings(ctx, o, rb)));
+          objects.push(describeSettings(o, rb, settingWarnings(ctx, o, rb, thickness)));
         }
         if (!objects.length)
           throw new OperatorError(
@@ -329,6 +351,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
               '(add one with rigidbody.object_add)',
             'POLL_FAILED',
           );
+        const thickness = thicknessChecker(ctx.doc);
         const objects = targets.map((o) => {
           const rb: RigidBodyData = { ...sanitizeRigidBody(o.rigid_body)!, ...patch };
           if (p.type) {
@@ -336,7 +359,7 @@ export function registerPhysicsOperators(reg: OperatorRegistry): void {
             rb.type = p.type;
           }
           ctx.doc.updateObject(o.id, { rigid_body: rb });
-          return describeSettings(o, rb, settingWarnings(ctx, o, rb));
+          return describeSettings(o, rb, settingWarnings(ctx, o, rb, thickness));
         });
         return { objects };
       },

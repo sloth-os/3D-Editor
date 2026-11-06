@@ -2,7 +2,6 @@ import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass.js';
-import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { effect } from '@preact/signals';
@@ -33,6 +32,14 @@ import {
 } from '../render';
 import { SceneObjects } from './scene-objects';
 import { ViewportSky } from './sky';
+import { ViewTransformPass } from './view-transform';
+import {
+  STUDIO_RIG,
+  STUDIO_RIG_AMBIENT,
+  WorldEnvironment,
+  aimStudioRig,
+  needsStudioRig,
+} from './world-env';
 import { EditOverlay } from './edit-overlay';
 import { createGrid, updateGrid } from './grid';
 import {
@@ -164,6 +171,10 @@ export class ViewportEngine {
   private outlineActive: OutlinePass;
   private overlayPass: RenderPass;
   private renderPass: RenderPass;
+  /** Exposure, view transform and sRGB encoding of the viewport (see view-transform.ts). */
+  private outputPass = new ViewTransformPass();
+  /** The view transform and exposure (stops) the last `applyShading` chose. */
+  private colorManagement: { view: string; exposure: number } = { view: 'STANDARD', exposure: 0 };
   private grid = createGrid();
   private cursor: THREE.Sprite;
   private originDots: THREE.Points;
@@ -171,6 +182,8 @@ export class ViewportEngine {
   private ambient = new THREE.AmbientLight(0xffffff, 0);
   private envTexture: THREE.Texture | null = null;
   private pmrem: THREE.PMREMGenerator;
+  /** The STUDIO / IMAGE world environment of Rendered shading and final renders. */
+  private worldEnv: WorldEnvironment;
   /** World sky (environment SKY) and mist. */
   private sky: ViewportSky;
   private dirty = true;
@@ -197,6 +210,7 @@ export class ViewportEngine {
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.pmrem = new THREE.PMREMGenerator(this.renderer);
     this.sky = new ViewportSky(this.pmrem);
+    this.worldEnv = new WorldEnvironment(this.pmrem);
     this.objects = new SceneObjects(this.scene, this.overlay, () => this.requestRender());
     this.scene.add(this.ambient);
     this.overlay.add(this.grid, this.edit.group, this.peerBoxes);
@@ -240,7 +254,7 @@ export class ViewportEngine {
     this.composer.addPass(this.overlayPass);
     this.composer.addPass(this.outlineSel);
     this.composer.addPass(this.outlineActive);
-    this.composer.addPass(new OutputPass());
+    this.composer.addPass(this.outputPass);
 
     this.restorePose();
     this.resizeObserver = new ResizeObserver(() => this.resize());
@@ -451,56 +465,48 @@ export class ViewportEngine {
     }
   }
 
-  private envKey = '';
   /** Lighting, background and colour management of `shading` (default: the viewport's) for `ev`. */
   private applyShading(ev: EvaluatedScene = this.ev!, shading = this.session.view.shading.value): void {
     const world = ev.world;
     const r = this.renderer;
-    const tm: Record<string, THREE.ToneMapping> = {
-      // Standard is no curve, but Exposure still scales the colours (three.js ignores
-      // toneMappingExposure with NoToneMapping)
-      STANDARD: THREE.LinearToneMapping,
-      AGX: THREE.AgXToneMapping,
-      FILMIC: THREE.ACESFilmicToneMapping,
-      ACES: THREE.ACESFilmicToneMapping,
-      NEUTRAL: THREE.NeutralToneMapping,
-    };
-    if (shading === 'RENDERED' || shading === 'MATERIAL') {
-      r.toneMapping = tm[ev.render.view_transform] ?? THREE.AgXToneMapping;
-      r.toneMappingExposure = Math.pow(2, ev.render.exposure);
-    } else {
-      r.toneMapping = THREE.NoToneMapping;
-      r.toneMappingExposure = 1;
-    }
+    // Colour management (exposure, view transform, sRGB) is the output pass's, with the core
+    // renderers' curves; three.js's own tone mapping stays off. Solid / wireframe: Standard.
+    r.toneMapping = THREE.NoToneMapping;
+    r.toneMappingExposure = 1;
+    this.colorManagement =
+      shading === 'RENDERED' || shading === 'MATERIAL'
+        ? { view: ev.render.view_transform ?? 'AGX', exposure: ev.render.exposure ?? 0 }
+        : { view: 'STANDARD', exposure: 0 };
+    this.outputPass.setTransform(this.colorManagement.view, this.colorManagement.exposure);
     r.shadowMap.enabled = shading === 'RENDERED' && ev.render.use_shadows;
-    const wantEnv = shading === 'MATERIAL' || (shading === 'RENDERED' && world.environment !== 'NONE');
-    const key = wantEnv ? `room` : '';
-    if (key !== this.envKey) {
-      this.envKey = key;
-      if (wantEnv && !this.envTexture) {
-        const room = new RoomEnvironment();
-        this.envTexture = this.pmrem.fromScene(room, 0.04).texture;
-      }
-    }
-    this.scene.environment = wantEnv ? this.envTexture : null;
-    // In Rendered mode the studio environment acts as soft fill light; lamps provide the key light.
-    this.scene.environmentIntensity =
-      shading === 'RENDERED' ? world.environment_strength * world.strength * 0.35 : 1;
-    const envRot = shading === 'RENDERED' ? world.environment_rotation : 0;
-    this.scene.environmentRotation.set(Math.PI / 2, 0, envRot);
-    this.scene.backgroundRotation.set(Math.PI / 2, 0, envRot);
+    // Material Preview: three.js's studio room as a look-dev HDRI, whatever the world (like
+    // Blender's). Rendered: the world as the core renderers light it: a STUDIO / IMAGE environment
+    // (world-env.ts), the procedural sky (sky.ts, below) or the flat world colour.
+    if (shading === 'MATERIAL' && !this.envTexture)
+      this.envTexture = this.pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    const env = shading === 'RENDERED' ? this.worldEnv.maps(this.session.doc, world) : null;
+    const ws = Number.isFinite(world.strength) ? Math.max(0, world.strength) : 1;
+    this.scene.environment = shading === 'MATERIAL' ? this.envTexture : (env?.lighting ?? null);
+    this.scene.environmentIntensity = env ? env.scale : 1;
+    // equirect layouts are Y up; the scene is Z up
+    this.scene.environmentRotation.set(Math.PI / 2, 0, 0);
+    this.scene.backgroundRotation.set(Math.PI / 2, 0, 0);
+    this.scene.backgroundIntensity = 1;
+    this.scene.backgroundBlurriness = 0;
+    // the core renderers' studio rig lights a scene without any light (aimed per render)
+    this.rigNeeded =
+      shading === 'RENDERED' && needsStudioRig(ev, !!env || world.environment === 'SKY', this.finalShading);
+    for (const l of this.studioRig) l.visible = this.rigNeeded;
     if (shading === 'RENDERED') {
-      if (world.show_environment_background && wantEnv) {
-        this.scene.background = this.envTexture;
-        this.scene.backgroundBlurriness = 0.3;
-      } else
-        this.scene.background = new THREE.Color(
-          world.color[0] * world.strength,
-          world.color[1] * world.strength,
-          world.color[2] * world.strength,
-        );
-      this.ambient.color.setRGB(world.color[0], world.color[1], world.color[2]);
-      this.ambient.intensity = world.environment === 'NONE' ? world.strength * Math.PI : 0;
+      if (env && world.show_environment_background) {
+        this.scene.background = env.background();
+        this.scene.backgroundIntensity = env.scale;
+      } else this.scene.background = new THREE.Color(world.color[0] * ws, world.color[1] * ws, world.color[2] * ws);
+      // the flat world colour lights the scene (radiance colour × strength: irradiance π × that),
+      // unless an environment or the sky does
+      const boost = this.rigNeeded ? STUDIO_RIG_AMBIENT : 0;
+      this.ambient.color.setRGB(world.color[0] * ws + boost, world.color[1] * ws + boost, world.color[2] * ws + boost);
+      this.ambient.intensity = env || world.environment === 'SKY' ? 0 : Math.PI;
     } else if (shading === 'MATERIAL') {
       this.scene.background = this.envTexture;
       this.scene.backgroundBlurriness = 0.6;
@@ -509,9 +515,25 @@ export class ViewportEngine {
       this.scene.background = VIEWPORT_BG;
       this.ambient.intensity = 0;
     }
-    this.scene.backgroundIntensity = 1;
     // procedural sky (Rendered) and mist (Material Preview / Rendered) override the above
     this.sky.apply(this.scene, ev, shading, r.shadowMap.enabled);
+  }
+
+  /** Whether the studio rig lights the scene (see `needsStudioRig`), set by `applyShading`. */
+  private rigNeeded = false;
+  /** Whether `applyShading` runs for a final render (render visibility) rather than the viewport. */
+  private finalShading = false;
+  /** The key, fill and rim suns of the studio rig (world-env.ts). */
+  private studioRig = STUDIO_RIG.map(() => {
+    const l = new THREE.DirectionalLight(0xffffff, 0);
+    l.visible = false;
+    this.scene.add(l, l.target);
+    return l;
+  });
+
+  /** Points the studio rig at a camera when it is on. */
+  private aimRig(camera: THREE.Camera): void {
+    if (this.rigNeeded) aimStudioRig(this.studioRig, camera);
   }
 
   // ------------------------------------------------------------------ cameras & render
@@ -590,6 +612,7 @@ export class ViewportEngine {
     this.overlayPass.camera = cam;
     this.outlineSel.renderCamera = cam;
     this.outlineActive.renderCamera = cam;
+    this.aimRig(cam);
     this.composer.render();
     v.viewLabel.value = v.cameraView.value ? 'Camera Perspective' : viewLabel(this.pose);
     for (const cb of this.onAfterRender) cb();
@@ -857,6 +880,7 @@ export class ViewportEngine {
         ev = this.ev!;
       } else ev = this.syncFinalRender(frame, shading);
       const cam = this.renderCamera(ev, opts, aspect);
+      this.aimRig(cam);
       const target = new THREE.WebGLRenderTarget(width, height, { samples: 8, type: THREE.HalfFloatType });
       // The composer output is already tone mapped and sRGB encoded, so copy it raw (linear target).
       const out = new THREE.WebGLRenderTarget(width, height, { type: THREE.UnsignedByteType });
@@ -884,7 +908,9 @@ export class ViewportEngine {
         disposables.push(unpremultiply);
         comp.addPass(unpremultiply);
       }
-      const output = new OutputPass();
+      // exposure, view transform and sRGB encoding like the path tracer's film (view-transform.ts)
+      const output = new ViewTransformPass();
+      output.setTransform(this.colorManagement.view, this.colorManagement.exposure);
       disposables.push(output);
       comp.addPass(output);
       comp.render();
@@ -979,7 +1005,12 @@ export class ViewportEngine {
       castShadows: shading === 'RENDERED' && render.use_shadows,
       imagesRevision: this.imagesRevision,
     });
-    this.applyShading(ev, shading);
+    this.finalShading = true;
+    try {
+      this.applyShading(ev, shading);
+    } finally {
+      this.finalShading = false;
+    }
     if (shading === 'SOLID' || shading === 'WIREFRAME') {
       const w = ev.world;
       const k = Number.isFinite(w.strength) ? Math.max(0, w.strength) : 1;
@@ -1036,6 +1067,7 @@ export class ViewportEngine {
 
   dispose(): void {
     cancelAnimationFrame(this.raf);
+    this.worldEnv.dispose();
     if (this.finalEvalTimer) clearTimeout(this.finalEvalTimer);
     this.finalEval = null;
     this.resizeObserver.disconnect();

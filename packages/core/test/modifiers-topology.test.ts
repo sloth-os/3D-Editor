@@ -243,7 +243,8 @@ describe('BEVEL', () => {
     const flat = signedVolume(applyModifier('BEVEL', createCube(), { width: 0.2 }));
     const r = applyModifier('BEVEL', createCube(), { width: 0.2, segments: 3 });
     expectClosedConsistent(r);
-    expect(r.faces.length).toBe(6 + 12 * 3 + 8 * 9);
+    // Blender's corner patches: per corner 3 sectors of 1 × 2 quads around a center triangle
+    expect(r.faces.length).toBe(6 + 12 * 3 + 8 * 7);
     const v = signedVolume(r);
     expect(v).toBeGreaterThan(flat);
     expect(v).toBeLessThan(8);

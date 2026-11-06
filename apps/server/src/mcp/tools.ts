@@ -924,10 +924,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Run several operators',
       description:
-        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns per operation {operator, ok, result | error + code, reports} — `code` is INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED as in run_operator; `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR.",
+        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). Each operation is {operator, params, selection?}: `selection` (as in run_operator: objects, active object, mode, edit-mode mesh elements) is set before that operation runs and stays set for the following ones, for operators that act on the selection (object.convert, object.transform_apply, export_mesh.* use_selection …). With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns per operation {operator, ok, result | error + code, reports} — `code` is INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED as in run_operator (a selection naming an unknown object fails its operation with NOT_FOUND); `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR.",
       annotations: EDIT,
       argsHint:
-        'Each operation is {operator, params} inside `operations` (batch {project, operations: [{operator, params: {…}}, …], stop_on_error}).',
+        'Each operation is {operator, params, selection} inside `operations` (batch {project, operations: [{operator, params: {…}, selection: {objects: […]}}, …], stop_on_error}).',
     },
     {
       project: projectArg,
@@ -939,11 +939,16 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
               .record(z.string(), z.unknown())
               .optional()
               .describe('Operator parameters (defaults are applied)'),
+            selection: selectionSchema
+              .optional()
+              .describe(
+                'Selection/mode to set before this operation (stays set for the following ones), as in run_operator',
+              ),
           }),
         )
         .min(1)
         .max(200)
-        .describe('Operations in order: [{operator, params}, …]'),
+        .describe('Operations in order: [{operator, params, selection?}, …]'),
       stop_on_error: z.boolean().default(true),
     },
     async ({ project, operations, stop_on_error }) => {
@@ -967,6 +972,21 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             if (stop_on_error) break;
             continue;
           }
+          if (op.selection)
+            try {
+              applySelection(p, op.selection);
+            } catch (err) {
+              if (!(err instanceof ToolError)) throw err;
+              failed++;
+              results.push({
+                operator: op.operator,
+                ok: false,
+                error: `selection: ${err.message}`,
+                code: /not found/i.test(err.message) ? 'NOT_FOUND' : 'POLL_FAILED',
+              });
+              if (stop_on_error) break;
+              continue;
+            }
           const res = p.run(op.operator, op.params ?? {});
           results.push({
             operator: op.operator,
