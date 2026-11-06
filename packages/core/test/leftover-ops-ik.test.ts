@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { SceneDoc, createEditorState, createOperatorRegistry, type OperatorContext } from '../src';
 import { clampIkRotation, ikSettingsOf, solveIk, type IkBone } from '../src/armature/ik';
-import { quatFromAxisAngle } from '../src/math/quat';
+import { quatFromRotationMatrix, rotationPart } from '../src/armature/bone-math';
+import { FrameState } from '../src/eval/frame-state';
+import { multiplyQuat, quatFromAxisAngle } from '../src/math/quat';
 import { identity4 } from '../src/math/mat4';
+import type { Mat4, Quat } from '../src/math/types';
 
 // Regression tests for the robot-workcell issue "No per-bone IK locks or limits (Blender lock_ik_x/y/z,
 // use_ik_limit_*): an IK chain that includes a robot's yaw base tilts the base".
@@ -248,5 +251,114 @@ describe('IK solver with bone settings', () => {
     expect(dist([bones[1].matrix[12], bones[1].matrix[13], bones[1].matrix[14]], [0, 1, 0])).toBeLessThan(
       1e-12,
     );
+  });
+});
+
+// Verifier follow-up: "IK locks on a single axis are not honoured (lock_ik_y twist up to 87°, lock_ik_x / z
+// bend up to 50° / 97°)": steps about the free local axes add up to a rotation about the locked one.
+describe('IK with one locked axis per bone', () => {
+  const conj = (q: Quat): Quat => [-q[0], -q[1], -q[2], q[3]];
+  const rot = (m: Mat4): Quat => quatFromRotationMatrix(rotationPart(m));
+  /** Rotation relative to the rest frame as Blender's segments see it: q = swing(sx, sz) · twist(y). */
+  const swingTwist = (q: Quat) => {
+    const tl = Math.hypot(q[1], q[3]);
+    const twist = 2 * Math.atan2(q[1] / tl, q[3] / tl);
+    let sw = multiplyQuat(q, [0, -q[1] / tl, 0, q[3] / tl]);
+    if (sw[3] < 0) sw = [-sw[0], -sw[1], -sw[2], -sw[3]];
+    const sl = Math.hypot(sw[0], sw[1], sw[2]);
+    const k = sl > 1e-12 ? (2 * Math.atan2(sl, sw[3])) / sl : 2;
+    return { x: sw[0] * k, y: Math.atan2(Math.sin(twist), Math.cos(twist)), z: sw[2] * k };
+  };
+
+  /** The verifier's two-bone arm (bones not in line, so a bend needs both locked and free axes). */
+  function arm(lock: 'lock_ik_x' | 'lock_ik_y' | 'lock_ik_z') {
+    const t = setup();
+    t.ok('object.armature_add', { name: 'Arm', bone_name: 'Upper', location: [0, 0, 0] });
+    t.ok('armature.bone_update', { object: 'Arm', bone: 'Upper', head: [0, 0, 0], tail: [0.6, 0.1, 0] });
+    t.ok('armature.chain_add', {
+      object: 'Arm',
+      points: [
+        [0.6, 0.1, 0],
+        [1.1, 0.4, 0.1],
+      ],
+      names: ['Fore'],
+      parent: 'Upper',
+      use_connect: true,
+    });
+    const armId = t.doc.findObjectByName('Arm')!.id;
+    const bone = (fs: FrameState, name: string) => fs.boneMatrix(armId, name)!.matrix;
+    const restFs = new FrameState(t.doc, 1);
+    const restU = rot(bone(restFs, 'Upper'));
+    const restF = rot(bone(restFs, 'Fore'));
+    t.ok('object.empty_add', { name: 'Goal', location: [-0.5, 0.6, -0.4] });
+    t.ok('pose.ik_add', { object: 'Arm', bone: 'Fore', target: 'Goal', chain_count: 2 });
+    for (const b of ['Upper', 'Fore']) t.ok('pose.ik_settings_set', { object: 'Arm', bone: b, [lock]: true });
+    const goalId = t.doc.findObjectByName('Goal')!.id;
+    /** Both bones' rotations relative to their rest frames, and the distance of the tip from the goal. */
+    const solve = (goal: [number, number, number]) => {
+      t.doc.updateObject(goalId, { location: goal });
+      const fs = new FrameState(t.doc, 1);
+      const U = bone(fs, 'Upper');
+      const F = bone(fs, 'Fore');
+      const qU = rot(U);
+      // Fore's rest frame moves with Upper: Upper's pose · Upper's rest⁻¹ · Fore's rest
+      const frameF = multiplyQuat(multiplyQuat(qU, conj(restU)), restF);
+      const len = Math.hypot(0.5, 0.3, 0.1);
+      const tip = [F[12] + F[4] * len, F[13] + F[5] * len, F[14] + F[6] * len];
+      return {
+        upper: swingTwist(multiplyQuat(conj(restU), qU)),
+        fore: swingTwist(multiplyQuat(conj(frameF), rot(F))),
+        error: dist(tip, goal),
+        U,
+        restU,
+      };
+    };
+    return solve;
+  }
+
+  const goals: [number, number, number][] = [
+    [-0.5, 0.6, -0.4],
+    [-0.2, -0.4, -0.8],
+    [0.3, 0.9, 0.6],
+    [0.9, -0.3, 0.5],
+    [-0.6, -0.6, 0.4],
+    [0.2, 0.2, -1],
+  ];
+
+  it('never twists a bone with lock_ik_y (swing only) and still reaches every goal', () => {
+    const solve = arm('lock_ik_y');
+    for (const g of goals) {
+      const r = solve(g);
+      // the old solver twisted Fore by up to 147° and Upper by 23°
+      expect(Math.abs(r.upper.y)).toBeLessThan(1e-9);
+      expect(Math.abs(r.fore.y)).toBeLessThan(1e-9);
+      expect(r.error).toBeLessThan(1e-4);
+    }
+  });
+
+  it('bends a bone with lock_ik_x only about its rest Z axis (an elbow with twist)', () => {
+    const solve = arm('lock_ik_x');
+    for (const g of goals) {
+      const r = solve(g);
+      expect(Math.abs(r.upper.x)).toBeLessThan(1e-9);
+      expect(Math.abs(r.fore.x)).toBeLessThan(1e-9);
+      // decomposition-free: Upper's direction stays in its rest X-Y plane (it left it by up to 40°)
+      const restZ = multiplyQuat(multiplyQuat(r.restU, [0, 0, 1, 0]), conj(r.restU));
+      const dir = [r.U[4], r.U[5], r.U[6]];
+      expect(Math.abs(dir[0] * restZ[0] + dir[1] * restZ[1] + dir[2] * restZ[2])).toBeLessThan(1e-9);
+    }
+    // a goal in reach is reached; one out of reach ends at the closest pose the locks allow
+    expect(solve([-0.5, 0.6, -0.4]).error).toBeLessThan(1e-4);
+    expect(solve([-0.2, -0.4, -0.8]).error).toBeLessThan(0.23);
+  });
+
+  it('bends a bone with lock_ik_z only about its rest X axis', () => {
+    const solve = arm('lock_ik_z');
+    for (const g of goals) {
+      const r = solve(g);
+      expect(Math.abs(r.upper.z)).toBeLessThan(1e-9);
+      expect(Math.abs(r.fore.z)).toBeLessThan(1e-9);
+    }
+    expect(solve([0.9, -0.3, 0.5]).error).toBeLessThan(1e-4);
   });
 });
