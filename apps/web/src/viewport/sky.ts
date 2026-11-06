@@ -74,7 +74,7 @@ function equirectTexture(
 }
 
 /** World-space bounding sphere of the visible meshes (null when there are none). */
-function sceneBounds(ev: EvaluatedScene): THREE.Sphere | null {
+export function sceneBounds(ev: EvaluatedScene): THREE.Sphere | null {
   const box = new THREE.Box3();
   const v = new THREE.Vector3();
   const m = new THREE.Matrix4();

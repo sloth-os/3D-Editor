@@ -8,6 +8,7 @@ import {
   createOperatorRegistry,
   insertKeyframe,
   renderItems,
+  renderSceneSoftware,
   resolveView,
   type CameraData,
   type OperatorContext,
@@ -17,6 +18,8 @@ import type { ProjectSession } from '../src/project/session';
 import { renderOutputSize, type PathTraceOptions } from '../src/render';
 import { applyLensShift, sceneCameraView } from '../src/render/view';
 import { ViewportEngine } from '../src/viewport/engine';
+import { lightIntensity, spotCone } from '../src/viewport/scene-objects';
+import { viewTransformParams, viewTransformPixel } from '../src/viewport/view-transform';
 
 /*
  * The viewport engine's render entry points (F12, Render Animation, MCP renders) with a recording
@@ -512,15 +515,30 @@ describe('final renders (F12, Render Animation, MCP renders)', () => {
     }
   });
 
-  it('apply the exposure with the Standard view transform', () => {
-    // regression: Standard mapped to NoToneMapping, which ignores toneMappingExposure
+  it('apply the exposure and the view transform in the output pass, also with Standard', () => {
+    // regression: Standard mapped to NoToneMapping, which ignores toneMappingExposure; the other
+    // transforms used three.js's tone mapping curves instead of the core renderers'
     const s = session();
-    s.doc.updateRender({ view_transform: 'STANDARD', exposure: 2 });
     const { e, gl } = engine(s);
+    /** The colour management of the output pass of the last render. */
+    const output = () => {
+      const u = gl.renders
+        .map((r) => ((r.scene as THREE.Mesh).material as THREE.ShaderMaterial | undefined)?.uniforms)
+        .filter((x) => x?.curve && x.inset)
+        .at(-1)!;
+      return { mode: u.mode.value, exposure: u.exposure.value, inset: u.inset.value, outset: u.outset.value };
+    };
+    s.doc.updateRender({ view_transform: 'STANDARD', exposure: 2 });
     e.renderPixels();
-    const r = gl.renders.find((x) => x.scene === e.scene)!;
-    expect(r.toneMapping).toBe(THREE.LinearToneMapping);
-    expect(r.toneMappingExposure).toBeCloseTo(4, 9);
+    expect(output()).toEqual({ mode: 0, exposure: 4, inset: 0, outset: 0 });
+    // three.js's own tone mapping stays off (the pass does it)
+    expect(gl.renders.find((x) => x.scene === e.scene)!.toneMapping).toBe(THREE.NoToneMapping);
+    s.doc.updateRender({ view_transform: 'AGX', exposure: -1 });
+    e.renderPixels();
+    expect(output()).toEqual({ ...viewTransformParams('AGX'), exposure: 0.5 });
+    // clay shading is always Standard without exposure, like the server's renderer
+    e.renderPixels({ shading: 'SOLID' });
+    expect(output()).toEqual({ mode: 0, exposure: 1, inset: 0, outset: 0 });
   });
 
   it('keep the aspect ratio of outputs larger than 4096 px or smaller than 16 px', () => {
@@ -541,6 +559,299 @@ describe('final renders (F12, Render Animation, MCP renders)', () => {
     expect([img.width, img.height]).toEqual([64, 16]);
     img = e.renderPixels({ width: 64 });
     expect([img.width, img.height]).toEqual([64, 32]);
+  });
+});
+
+/** Rec. 709 luminance of a display (sRGB-encoded, 0..1) colour, in linear light. */
+function displayLuminance(c: readonly number[]): number {
+  const lin = (v: number) => (v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+  return 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]);
+}
+
+/** Mean luminance of RGBA8 pixels. */
+function meanLuminance(data: Uint8ClampedArray | Uint8Array): number {
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 4)
+    sum += displayLuminance([data[i] / 255, data[i + 1] / 255, data[i + 2] / 255]);
+  return sum / (data.length / 4);
+}
+
+/**
+ * A 40 m plane (Lambertian grey, no specular: IOR 1) seen straight from above by a camera 10 m
+ * up, lit by one lamp and a dark world colour: nothing shadows or reflects onto anything, so every
+ * renderer computes the same image.
+ */
+function litPlane(lamp: 'SUN' | 'POINT' | 'SPOT', view: string, exposure = 0): ProjectSession {
+  const s = session();
+  const doc = s.doc;
+  for (const o of doc.listObjects()) doc.removeObject(o.id);
+  doc.updateWorld({ environment: 'NONE', color: [0.04, 0.04, 0.04], strength: 1 });
+  doc.updateRender({ resolution_x: 48, resolution_y: 32, view_transform: view, exposure } as never);
+  ok(s, 'mesh.primitive_plane_add', { name: 'Floor', size: 40 });
+  ok(s, 'material.new', { name: 'Grey', assign: false });
+  const mat = doc.listMaterials().find((m) => m.name === 'Grey')!.id;
+  ok(s, 'object.material_assign', { material: mat, objects: ['Floor'] });
+  doc.updateBlockByKind('materials', mat, { base_color: [0.7, 0.6, 0.5, 1], roughness: 1, ior: 1 });
+  ok(s, 'object.camera_add', { name: 'Cam', location: [0, 0, 10], rotation: [0, 0, 0] });
+  doc.updateScene({ camera: doc.findObjectByName('Cam')!.id });
+  if (lamp === 'SUN')
+    ok(s, 'object.light_add', { type: 'SUN', name: 'Lamp', energy: 2.5, rotation: [0.35, 0.2, 0] });
+  else if (lamp === 'POINT')
+    ok(s, 'object.light_add', { type: 'POINT', name: 'Lamp', energy: 1500, location: [1.5, -1, 4] });
+  else
+    ok(s, 'object.light_add', {
+      type: 'SPOT',
+      name: 'Lamp',
+      energy: 4000,
+      location: [0.5, 0.5, 6],
+      rotation: [0.05, 0, 0],
+      spot_size: 0.8,
+      spot_blend: 0.35,
+    });
+  return s;
+}
+
+/**
+ * The image the WebGL renderer draws of {@link litPlane} with the three.js scene the engine built
+ * (lights, ambient, the floor material, the camera that drew it): per pixel the radiance three.js
+ * computes for a Lambertian surface (`BRDF_Lambert` = albedo / π times the irradiance of every
+ * light: candela / d² for point and spot lights with the spot cone's smoothstep, lux for
+ * directional lights, colour × intensity for the ambient light), then the output pass
+ * (`viewTransformPixel`, the shader's twin) with its exposure. Returns the mean luminance.
+ */
+function webglLuminance(e: ViewportEngine, gl: RecordingRenderer, width: number, height: number): number {
+  const scene = e.scene;
+  scene.updateMatrixWorld(true);
+  const camera = sceneCamera(e, gl);
+  camera.updateMatrixWorld(true);
+  let albedo: THREE.Color | null = null;
+  const lights: THREE.Light[] = [];
+  scene.traverseVisible((o) => {
+    if ((o as THREE.Light).isLight) lights.push(o as THREE.Light);
+    const m = o as THREE.Mesh;
+    if (m.isMesh && m.userData.objectId && !albedo)
+      albedo = ((Array.isArray(m.material) ? m.material[0] : m.material) as THREE.MeshPhysicalMaterial).color;
+  });
+  if (!albedo) throw new Error('the floor was not drawn');
+  const a = albedo as THREE.Color;
+  // the output pass of the render (the fullscreen quad with the view transform shader)
+  const pass = gl.renders
+    .map((r) => (r.scene as THREE.Mesh).material as THREE.ShaderMaterial | undefined)
+    .find((m) => m?.uniforms?.curve && m.uniforms.inset)!;
+  expect(pass).toBeTruthy();
+  const view = (['STANDARD', 'AGX', 'FILMIC', 'ACES', 'NEUTRAL'] as const).find((v) => {
+    const p = viewTransformParams(v);
+    return (
+      p.mode === pass.uniforms.mode.value &&
+      p.inset === pass.uniforms.inset.value &&
+      p.outset === pass.uniforms.outset.value
+    );
+  })!;
+  const exposure = pass.uniforms.exposure.value as number;
+  const n = new THREE.Vector3(0, 0, 1);
+  const ray = new THREE.Raycaster();
+  const plane = new THREE.Plane(n, 0);
+  const p = new THREE.Vector3();
+  let sum = 0;
+  for (let y = 0; y < height; y++)
+    for (let x = 0; x < width; x++) {
+      ray.setFromCamera(new THREE.Vector2(((x + 0.5) / width) * 2 - 1, 1 - ((y + 0.5) / height) * 2), camera);
+      if (!ray.ray.intersectPlane(plane, p)) throw new Error('the floor does not fill the image');
+      const e3 = [0, 0, 0];
+      for (const l of lights) {
+        const c = l.color;
+        let irradiance = 0;
+        if ((l as THREE.AmbientLight).isAmbientLight) irradiance = l.intensity;
+        else if ((l as THREE.DirectionalLight).isDirectionalLight) {
+          const d = l as THREE.DirectionalLight;
+          const toLight = new THREE.Vector3()
+            .setFromMatrixPosition(d.matrixWorld)
+            .sub(new THREE.Vector3().setFromMatrixPosition(d.target.matrixWorld))
+            .normalize();
+          irradiance = d.intensity * Math.max(0, n.dot(toLight));
+        } else {
+          const pos = new THREE.Vector3().setFromMatrixPosition(l.matrixWorld);
+          const toLight = pos.clone().sub(p);
+          const d2 = toLight.lengthSq();
+          toLight.normalize();
+          irradiance = (l.intensity * Math.max(0, n.dot(toLight))) / Math.max(d2, 0.01);
+          if ((l as THREE.SpotLight).isSpotLight) {
+            const sp = l as THREE.SpotLight;
+            const axis = pos.clone().sub(new THREE.Vector3().setFromMatrixPosition(sp.target.matrixWorld));
+            const cos = toLight.dot(axis.normalize());
+            const e0 = Math.cos(sp.angle);
+            const e1 = Math.cos(sp.angle * (1 - sp.penumbra));
+            const t = Math.min(1, Math.max(0, (cos - e0) / (e1 - e0)));
+            irradiance *= t * t * (3 - 2 * t);
+          }
+        }
+        e3[0] += c.r * irradiance;
+        e3[1] += c.g * irradiance;
+        e3[2] += c.b * irradiance;
+      }
+      const radiance = [a.r, a.g, a.b].map((k, i) => (k / Math.PI) * e3[i] * exposure);
+      sum += displayLuminance(viewTransformPixel(view, radiance[0], radiance[1], radiance[2]));
+    }
+  return sum / (width * height);
+}
+
+describe('final render brightness', () => {
+  it('lights a simple scene as brightly as the path tracer and the CPU rasterizer', () => {
+    // regression: WebGL renders (F12, Render Animation, browser MCP renders) were 15–20 % brighter
+    // (8-bit mean) than the path tracer and the server's renderer: lamps were 12× (point, spot,
+    // area) or 2.5× (sun) the core's Blender units and three.js's AgX / ACES / Neutral tone mapping
+    // are other curves than the core's view transforms
+    const cases = [
+      ['SUN', 'STANDARD', 0],
+      ['SUN', 'AGX', 0],
+      ['POINT', 'AGX', 0.5],
+      ['POINT', 'FILMIC', 0],
+      ['SPOT', 'NEUTRAL', 0],
+      ['SPOT', 'ACES', -0.5],
+    ] as const;
+    for (const [lamp, view, exposure] of cases) {
+      const s = litPlane(lamp, view, exposure);
+      const { e, gl } = engine(s);
+      const img = e.renderPixels();
+      expect([img.width, img.height]).toEqual([48, 32]);
+      const webgl = webglLuminance(e, gl, img.width, img.height);
+      const cpu = meanLuminance(
+        renderSceneSoftware(s.doc, { width: img.width, height: img.height, engine: 'RASTER' }).data,
+      );
+      const pt = meanLuminance(
+        renderSceneSoftware(s.doc, {
+          width: img.width,
+          height: img.height,
+          engine: 'PATHTRACER',
+          samples: 32,
+          max_bounces: 1,
+        }).data,
+      );
+      const label = `${lamp} ${view} ${exposure}`;
+      expect(cpu / pt, `${label}: CPU rasterizer / path tracer`).toBeGreaterThan(0.97);
+      expect(cpu / pt, `${label}: CPU rasterizer / path tracer`).toBeLessThan(1.03);
+      expect(webgl / cpu, `${label}: WebGL / CPU rasterizer`).toBeGreaterThan(0.98);
+      expect(webgl / cpu, `${label}: WebGL / CPU rasterizer`).toBeLessThan(1.02);
+      expect(webgl / pt, `${label}: WebGL / path tracer`).toBeGreaterThan(0.97);
+      expect(webgl / pt, `${label}: WebGL / path tracer`).toBeLessThan(1.03);
+    }
+    // path tracing six small images is CPU heavy on a loaded machine
+  }, 60_000);
+
+  it('gives lamps the intensities of the core renderers (Blender units)', () => {
+    // point and spot: radiant intensity P / 4π (candela); sun: irradiance; area: radiance P / (π·A)
+    expect(lightIntensity({ type: 'POINT', energy: 1000 })).toBeCloseTo(1000 / (4 * Math.PI), 9);
+    expect(lightIntensity({ type: 'SPOT', energy: 1000 })).toBeCloseTo(1000 / (4 * Math.PI), 9);
+    expect(lightIntensity({ type: 'SUN', energy: 3 })).toBe(3);
+    expect(lightIntensity({ type: 'AREA', energy: 800 }, 2 * 3)).toBeCloseTo(800 / (Math.PI * 6), 9);
+    expect(lightIntensity({ type: 'POINT', energy: -5 })).toBe(0);
+    // the spot cone fades in over the blend like the core's smoothstep
+    for (const [size, blend] of [
+      [Math.PI / 4, 0.15],
+      [1.2, 0],
+      [2.5, 1],
+      [Math.PI, 0.5],
+    ]) {
+      const { angle, penumbra } = spotCone(size, blend);
+      const cosHalf = Math.cos(Math.min(Math.PI / 2, size / 2));
+      expect(angle).toBeCloseTo(Math.min(Math.PI / 2, size / 2), 9);
+      expect(Math.cos(angle * (1 - penumbra))).toBeCloseTo(cosHalf + (1 - cosHalf) * blend, 9);
+    }
+    // the engine's lights: an area light's radiance uses its world area (object scale included)
+    const s = session();
+    ok(s, 'object.light_add', {
+      type: 'AREA',
+      name: 'Panel',
+      energy: 600,
+      size: 2,
+      size_y: 0.5,
+      shape: 'RECTANGLE',
+    });
+    s.doc.updateObject(s.doc.findObjectByName('Panel')!.id, { scale: [2, 3, 1] });
+    s.doc.updateRender({ engine: 'RASTER' });
+    const { e } = engine(s);
+    e.renderPixels();
+    const found: Record<string, number> = {};
+    e.scene.traverse((o) => {
+      if ((o as THREE.Light).isLight && o.visible) found[o.type] = (o as THREE.Light).intensity;
+    });
+    expect(found.PointLight).toBeCloseTo(1000 / (4 * Math.PI), 6);
+    expect(found.RectAreaLight).toBeCloseTo(600 / (Math.PI * 2 * 0.5 * 2 * 3), 6);
+    // a spot lamp shines from its object's origin (three.js puts new spot lights 1 m up)
+    ok(s, 'object.light_add', { type: 'SPOT', name: 'Spot', location: [1, 2, 3], rotation: [0.4, 0.3, 0] });
+    e.renderPixels();
+    let spot: THREE.SpotLight | null = null;
+    e.scene.traverse((o) => {
+      if ((o as THREE.SpotLight).isSpotLight) spot = o as THREE.SpotLight;
+    });
+    const sp = spot as unknown as THREE.SpotLight;
+    sp.updateWorldMatrix(true, true);
+    expect(
+      new THREE.Vector3()
+        .setFromMatrixPosition(sp.matrixWorld)
+        .toArray()
+        .map((v) => +v.toFixed(6)),
+    ).toEqual([1, 2, 3]);
+  });
+});
+
+describe('sun shadows', () => {
+  it('cover the whole scene with a shadow map fitted to it', () => {
+    // regression: a sun lamp's shadow map covered a fixed ±15 m square around the lamp at 1024 px:
+    // larger scenes lost their shadows and small ones got coarse texels and acne on faces lit at
+    // grazing angles (stripes in F12 renders)
+    const s = session();
+    ok(s, 'mesh.primitive_plane_add', { name: 'Ground', size: 60, location: [5, -3, -1] });
+    ok(s, 'mesh.primitive_cube_add', { name: 'Far', size: 2, location: [28, 25, 3] });
+    ok(s, 'object.light_add', {
+      type: 'SUN',
+      name: 'Sun',
+      location: [40, -30, 12],
+      rotation: [0.7, 0.2, 0.9],
+    });
+    s.doc.updateRender({ use_shadows: true });
+    const { e } = engine(s);
+    e.renderPixels();
+    let sun: THREE.DirectionalLight | null = null;
+    e.scene.traverse((o) => {
+      if ((o as THREE.DirectionalLight).isDirectionalLight && (o as THREE.DirectionalLight).castShadow)
+        sun = o as THREE.DirectionalLight;
+    });
+    const light = sun as unknown as THREE.DirectionalLight;
+    expect(light).toBeTruthy();
+    e.scene.updateMatrixWorld(true);
+    // where three.js puts the shadow camera before drawing the shadow map
+    light.shadow.updateMatrices(light);
+    const cam = light.shadow.camera;
+    const corners: THREE.Vector3[] = [];
+    e.scene.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (!m.isMesh || !m.userData.objectId || !m.visible) return;
+      m.geometry.computeBoundingBox();
+      const b = m.geometry.boundingBox!;
+      for (let i = 0; i < 8; i++)
+        corners.push(
+          new THREE.Vector3(
+            i & 1 ? b.max.x : b.min.x,
+            i & 2 ? b.max.y : b.min.y,
+            i & 4 ? b.max.z : b.min.z,
+          ).applyMatrix4(m.matrixWorld),
+        );
+    });
+    expect(corners.length).toBeGreaterThan(8);
+    for (const c of corners) {
+      const v = c.clone().applyMatrix4(cam.matrixWorldInverse);
+      expect(v.x).toBeGreaterThanOrEqual(cam.left);
+      expect(v.x).toBeLessThanOrEqual(cam.right);
+      expect(v.y).toBeGreaterThanOrEqual(cam.bottom);
+      expect(v.y).toBeLessThanOrEqual(cam.top);
+      expect(-v.z).toBeGreaterThanOrEqual(cam.near);
+      expect(-v.z).toBeLessThanOrEqual(cam.far);
+    }
+    expect(light.shadow.mapSize.x).toBe(2048);
+    // the frustum is the scene's size, not a fixed 30 m
+    expect(cam.right - cam.left).toBeGreaterThan(60);
+    expect(cam.right - cam.left).toBeLessThan(120);
   });
 });
 

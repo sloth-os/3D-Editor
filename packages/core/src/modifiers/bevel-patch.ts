@@ -286,9 +286,10 @@ export function fillGridPatch(
   const lambda = pc[5];
   if (lambda > 1e-9) {
     const delta = [0, 1, 2].map((q) => (A[q] + (corner[q] - A[q]) * fullness - pc[q]) / lambda);
+    // (boundary points have weight 0; a point object may be listed twice)
     const seen = new Set<Pt>();
     for (const p of lv.pts) {
-      if (seen.has(p) || !(p[5] !== 0)) continue;
+      if (p[5] === 0 || seen.has(p)) continue;
       seen.add(p);
       for (let q = 0; q < 3; q++) p[q] += p[5] * delta[q];
     }
@@ -333,8 +334,7 @@ export function fillGridPatch(
     }
     throw new Error(`bevel patch: no grid point (${i0}, ${j0}, ${k0})`);
   };
-  const face = (loop: number[]) =>
-    ctx.b.addFace(loop, ctx.material, ctx.smooth, loop.flatMap(uvOf));
+  const face = (loop: number[]) => ctx.b.addFace(loop, ctx.material, ctx.smooth, loop.flatMap(uvOf));
   for (let i = 0; i < n; i++)
     for (let j = 0; j < m; j++)
       for (let k = 0; k < m + odd; k++)

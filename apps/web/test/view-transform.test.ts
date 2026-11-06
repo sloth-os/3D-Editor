@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type * as THREE from 'three';
 import { VIEW_TRANSFORMS, applyViewTransform } from '@3d-editor/core';
 import {
   CURVE_SAMPLES,
@@ -64,7 +65,7 @@ describe('view transform pass', () => {
     pass.setTransform('AGX', 2);
     expect(u.exposure.value).toBe(4);
     expect([u.mode.value, u.inset.value, u.outset.value]).toEqual([1, 0.2, 0.15]);
-    expect(u.curve.value?.image.data).toBe(curveTable('AGX'));
+    expect((u.curve.value as THREE.DataTexture | null)?.image.data).toBe(curveTable('AGX'));
     pass.setTransform('STANDARD', -1);
     expect([u.mode.value, u.exposure.value, u.curve.value]).toEqual([0, 0.5, null]);
     pass.setTransform(undefined, NaN);

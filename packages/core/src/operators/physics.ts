@@ -179,7 +179,8 @@ function thicknessChecker(doc: SceneDoc): ThicknessCheck {
     if (note === undefined) {
       const built = buildCollisionShape(rb.collision_shape, mesh, scale, { dynamic });
       // the notes say how it is simulated (a flat static floor needs no note: only its back changes)
-      note = 'error' in built || !built.thickened ? null : (built.notes.find((n) => n.includes('thick')) ?? null);
+      note =
+        'error' in built || !built.thickened ? null : (built.notes.find((n) => n.includes('thick')) ?? null);
       memo.set(key, note);
     }
     return note;

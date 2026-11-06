@@ -277,7 +277,13 @@ describe('rigid body notes and large scenes', () => {
     // took 15 s instead of 0.1 s
     const { ok, doc } = setup();
     ok('mesh.primitive_cube_add', { name: 'D0', size: 0.1, location: [0, 0, 0.05] });
-    ok('object.array_place', { objects: ['D0'], pattern: 'LINE', count: 800, offset: [0.2, 0, 0], linked: true });
+    ok('object.array_place', {
+      objects: ['D0'],
+      pattern: 'LINE',
+      count: 800,
+      offset: [0.2, 0, 0],
+      linked: true,
+    });
     const names = doc
       .listObjects()
       .filter((o) => o.type === 'MESH')

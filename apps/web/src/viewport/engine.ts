@@ -33,13 +33,7 @@ import {
 import { SceneObjects } from './scene-objects';
 import { ViewportSky } from './sky';
 import { ViewTransformPass } from './view-transform';
-import {
-  STUDIO_RIG,
-  STUDIO_RIG_AMBIENT,
-  WorldEnvironment,
-  aimStudioRig,
-  needsStudioRig,
-} from './world-env';
+import { STUDIO_RIG, STUDIO_RIG_AMBIENT, WorldEnvironment, aimStudioRig, needsStudioRig } from './world-env';
 import { EditOverlay } from './edit-overlay';
 import { createGrid, updateGrid } from './grid';
 import {
@@ -501,11 +495,20 @@ export class ViewportEngine {
       if (env && world.show_environment_background) {
         this.scene.background = env.background();
         this.scene.backgroundIntensity = env.scale;
-      } else this.scene.background = new THREE.Color(world.color[0] * ws, world.color[1] * ws, world.color[2] * ws);
+      } else
+        this.scene.background = new THREE.Color(
+          world.color[0] * ws,
+          world.color[1] * ws,
+          world.color[2] * ws,
+        );
       // the flat world colour lights the scene (radiance colour × strength: irradiance π × that),
       // unless an environment or the sky does
       const boost = this.rigNeeded ? STUDIO_RIG_AMBIENT : 0;
-      this.ambient.color.setRGB(world.color[0] * ws + boost, world.color[1] * ws + boost, world.color[2] * ws + boost);
+      this.ambient.color.setRGB(
+        world.color[0] * ws + boost,
+        world.color[1] * ws + boost,
+        world.color[2] * ws + boost,
+      );
       this.ambient.intensity = env || world.environment === 'SKY' ? 0 : Math.PI;
     } else if (shading === 'MATERIAL') {
       this.scene.background = this.envTexture;

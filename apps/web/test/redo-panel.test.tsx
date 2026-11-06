@@ -462,7 +462,13 @@ describe('Adjust Last Operation shows what "set" operators keep', () => {
     // regression: the Target picker read "— none —" for an IK targeting a bone of its own armature
     ok('object.armature_add', { name: 'Rig', bone_name: 'Upper' });
     const rig = id('Rig');
-    ok('armature.bone_add', { object: rig, name: 'Lower', head: [0, 0, 1], tail: [0, 0, 2], parent: 'Upper' });
+    ok('armature.bone_add', {
+      object: rig,
+      name: 'Lower',
+      head: [0, 0, 1],
+      tail: [0, 0, 2],
+      parent: 'Upper',
+    });
     ok('armature.bone_add', { object: rig, name: 'Hand.IK', head: [1, 0, 2], tail: [1, 0, 2.5] });
     ok('armature.bone_add', { object: rig, name: 'Pole', head: [0, -2, 1], tail: [0, -2, 1.5] });
     ok('pose.ik_add', { object: rig, bone: 'Lower', subtarget: 'Hand.IK', chain_count: 2 });

@@ -1375,8 +1375,13 @@ function registerPoseOperators(reg: OperatorRegistry): void {
       description:
         "Set a pose bone's inverse kinematics settings (Blender Bone properties > Inverse Kinematics), used by " +
         "every IK chain that contains the bone. Axes are the bone's own: Y runs along the bone (head → tail, " +
-        'twist), X and Z bend it. lock_ik_x/y/z: the solver may not rotate the bone about that axis (e.g. a ' +
-        "robot's vertical base bone that may only yaw: lock_ik_x and lock_ik_z; a hinge: lock two axes). " +
+        'twist), X and Z bend it. lock_ik_x/y/z: the solver may not rotate the bone about that axis; the ' +
+        "rotation from the rest pose (a swing about an axis in the bone's X-Z plane, then a twist about Y) keeps " +
+        'that component at zero, like Blender: lock_ik_y alone = swing without twist; lock_ik_x alone = bend ' +
+        'about the rest Z axis plus twist (an elbow), lock_ik_z alone = bend about the rest X axis plus twist; ' +
+        "two locks = a hinge about the third axis (a robot's vertical base bone that may only yaw: lock_ik_x and " +
+        'lock_ik_z); all three = the bone keeps its pose. A pose rotation about a locked axis is dropped while ' +
+        'the chain is solved. ' +
         'use_ik_limit_x/y/z with ik_min_* (−π … 0) and ik_max_* (0 … π): keep the rotation about that axis, ' +
         'measured from the rest pose (swing about X/Z, twist about Y), within range; a positive angle about X tilts ' +
         "the tail towards the bone's +Z axis, about Z towards its −X axis (armature.describe lists every bone's " +

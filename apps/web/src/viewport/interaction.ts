@@ -208,8 +208,13 @@ export class ViewportInteraction {
     const res = m.finish(confirm);
     telemetry.count('editor.modal.finished', 1, { kind: m.kind, confirmed: confirm });
     if (res) {
+      // the confirmed transform is the last step of the operation it completes (Repeat Last)
       continueRepeat(continues);
-      this.host.run(res.operator, res.params, 'hotkey');
+      try {
+        this.host.run(res.operator, res.params, 'hotkey');
+      } finally {
+        continueRepeat(null);
+      }
     }
   }
 
