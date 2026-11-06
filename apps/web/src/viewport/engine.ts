@@ -539,6 +539,16 @@ export class ViewportEngine {
     if (this.rigNeeded) aimStudioRig(this.studioRig, camera);
   }
 
+  /**
+   * Fits the shadow maps of the suns (SUN lamps and the sky's sun) to what `camera` sees, before a
+   * render with it (sun-shadow.ts).
+   */
+  private fitShadows(camera: THREE.Camera): void {
+    if (!this.renderer.shadowMap.enabled) return;
+    this.objects.fitSunShadows(camera);
+    this.sky.fitShadow(camera, this.objects.shadowBoxes());
+  }
+
   // ------------------------------------------------------------------ cameras & render
 
   get camera(): THREE.PerspectiveCamera | THREE.OrthographicCamera {
@@ -616,6 +626,7 @@ export class ViewportEngine {
     this.outlineSel.renderCamera = cam;
     this.outlineActive.renderCamera = cam;
     this.aimRig(cam);
+    this.fitShadows(cam);
     this.composer.render();
     v.viewLabel.value = v.cameraView.value ? 'Camera Perspective' : viewLabel(this.pose);
     for (const cb of this.onAfterRender) cb();
@@ -884,6 +895,7 @@ export class ViewportEngine {
       } else ev = this.syncFinalRender(frame, shading);
       const cam = this.renderCamera(ev, opts, aspect);
       this.aimRig(cam);
+      this.fitShadows(cam);
       const target = new THREE.WebGLRenderTarget(width, height, { samples: 8, type: THREE.HalfFloatType });
       // The composer output is already tone mapped and sRGB encoded, so copy it raw (linear target).
       const out = new THREE.WebGLRenderTarget(width, height, { type: THREE.UnsignedByteType });
