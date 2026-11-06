@@ -45,6 +45,10 @@ for (const f of FLAGS) {
 const SEA = 0.6; // sea level (the island terrain meets z = 0 at its border, 0.6 m under water)
 const TERRAIN = { size: 64, sub: 128, height: 3.2, noise_scale: 14, seed: 3 };
 const LH = [14, 12]; // lighthouse axis (x, y) on the north-eastern headland
+// The lighthouse stands on a round stone plinth whose top (the door sill) is 0.4 m above the highest
+// ground under it; the tower above it is 11 m tall up to the gallery floor.
+const PLINTH = { r: 2.7, above: 0.4 };
+const TOWER_H = 11;
 const HOUSE = { x: 5, y: -2.6, w: 6.4, d: 4.4 }; // keeper's cottage footprint (front door faces -Y)
 // Island shaping: GRAB strokes (vertical moves with a smooth falloff) and FLATTEN dabs that
 // even out the building pads (the buildings also sit on foundations that reach into the ground).
@@ -56,18 +60,25 @@ const SCULPT = [
   { brush: 'FLATTEN', at: [HOUSE.x, HOUSE.y], r: 5, dabs: 8 }, // cottage pad
   { brush: 'FLATTEN', at: LH, r: 3.5, dabs: 8 }, // lighthouse pad
 ];
-// The stone path: waypoints from the cove beach past the cottage door up to the lighthouse door.
+// The stone path: waypoints from the cove beach past the cottage door to the foot of the lighthouse.
+// The last two lie on one ray from the lighthouse axis (the direction its door faces), 5.6 m and
+// 3.9 m out, so the path ends square in front of the steps that climb to the door on the plinth.
 const PATH_WAYPOINTS = [
   [3.2, -8.6], [4.3, -7.0], [5.4, -6.0], [7.6, -6.1], [9.6, -4.6], [10.9, -1.6],
-  [11.3, 1.6], [12.0, 4.6], [13.0, 7.2], [13.7, 9.0],
+  [11.3, 1.6], [12.0, 4.6], [13.45, 6.45], [13.61, 8.14],
 ];
+const STEPS = { rise: 0.2, width: 1.3 }; // steps from the path end to the door: ≈ 0.2 m rises
 const FENCE_RANGE = [3, 9]; // waypoint indices the seaward fence runs along
+const FENCE_POST_SPACING = 2.0; // generate_fence adds posts between points farther apart than this
 const PATH_TILT_SIGN = 1; // curve tilt that raises the profile's left side (+x of the bevel frame)
 const SIGN = { at: [1.5, -8.2], turn: -0.25 }; // sign position; it faces the camera, turned by `turn`
 const COVE = { at: [2, -12], r: 9 }; // the cove keeps a wider beach
 const JETTY = { x: 0, y: -8.7, len: 7.4, w: 1.5 }; // jetty from the cove beach out over the water
-// The camera floats over the cove mouth; its Track To target is an empty beside the lighthouse.
-const CAMERA = { at: [15.5, -36, 3.3], target: [8, 6, 8.6], lens: 26 };
+// The camera floats over the cove mouth. Its Track To target is an empty on the lighthouse's axis,
+// 2.4 m above the door sill. A lens shift (computed in buildWorldAndCamera) then centres the frame on
+// `look`, a point between the cottage and the lighthouse, so that the tower stands right of centre
+// and the cottage and the trees fit in; the camera itself stays aimed at the lighthouse.
+const CAMERA = { at: [15.5, -36, 3.3], target: [LH[0], LH[1], 8.6], look: [8, 6, 8.6], lens: 26, sensor: 36 };
 // A low sun behind the camera's right shoulder warms the lighthouse; the sky ahead is the pink and
 // violet twilight side, where the beams show best.
 const SUN = { elevation: 0.04, rotation: 4.22 };
@@ -162,6 +173,10 @@ async function saveResult(result, file) {
 // small maths
 const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
 const mix = (a, b, t) => a.map((v, i) => v + (b[i] - v) * t);
+const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross3 = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm3 = (a) => a.map((v) => v / Math.hypot(...a));
 const smooth = (e0, e1, x) => {
   const t = clamp((x - e0) / (e1 - e0));
   return t * t * (3 - 2 * t);
@@ -253,6 +268,7 @@ async function createProject() {
 const N = TERRAIN.sub + 1;
 const CELL = TERRAIN.size / TERRAIN.sub;
 let ground; // { vertices, faces } of the final island mesh (object space = world space)
+let islandColors; // per vertex: the linear RGB colour painted on the island (for the check)
 let dryBeach; // per face: 1 = beach sand above the waterline (no rocks or grass are scattered there)
 let nearBeach; // per vertex: 1 = corner of a dry beach face
 /** Index of the island grid face under (x, y). */
@@ -329,7 +345,14 @@ async function buildIsland() {
   };
   const housePad = (p) => Math.max(Math.abs(p[0] - HOUSE.x) - HOUSE.w / 2, Math.abs(p[1] - HOUSE.y) - HOUSE.d / 2, 0);
   const W = []; // per vertex {sand, rock, h}
-  const colors = [];
+  // The colour of a vertex is a chain of blends: lush grass → dry grass (dryness) → worn earth →
+  // rock (itself a mix of two greys) → sand (a mix of dry and wet sand). Each blend toward a mix of
+  // two colours A, B (fraction s of B) with weight w is split into two plain blends, toward A by
+  // w(1 − s)/(1 − ws) and then toward B by ws, so every step blends toward ONE colour.
+  const pair = (w, s) => [w * s < 1 ? (w * (1 - s)) / (1 - w * s) : 0, w * s];
+  const STEP_COLORS = { dry: COL.dry, earth: COL.earth, rockA: COL.rock, rockB: [0.3, 0.28, 0.25], sandA: COL.sand, sandB: COL.wet };
+  const blends = Object.fromEntries(Object.keys(STEP_COLORS).map((k) => [k, []])); // per step: factor per vertex
+  const expected = []; // the resulting colour per vertex (for the check below)
   for (let j = 0; j < N; j++)
     for (let i = 0; i < N; i++) {
       const p = ground.vertices[j * N + i];
@@ -343,28 +366,55 @@ async function buildIsland() {
       const sand = (1 - smooth(beachTop - 0.12, beachTop + 0.12, h)) * (1 - rock);
       const dryness = clamp(0.45 + 0.7 * n2 + 0.5 * smooth(beachTop + 0.7, beachTop + 0.15, h) + 0.25 * smooth(4, 7, h));
       const worn = clamp(0.7 * smooth(1.7, 0.85, distToPolyline(p, PATH_WAYPOINTS)) + 0.75 * smooth(1.3, 0.35, housePad(p)) + 0.6 * smooth(3.6, 2.8, Math.hypot(p[0] - LH[0], p[1] - LH[1])));
-      let c = mix(COL.lush, COL.dry, dryness);
-      c = mix(c, COL.earth, worn * 0.8);
-      c = mix(c, mix(COL.rock, [0.3, 0.28, 0.25], 0.5 + 0.5 * n1), rock);
-      c = mix(c, mix(COL.sand, COL.wet, smooth(0.15, 0.0, h)), sand);
+      const [rockA, rockB] = pair(rock, clamp(0.5 + 0.5 * n1));
+      const [sandA, sandB] = pair(sand, smooth(0.15, 0.0, h));
+      const f = { dry: dryness, earth: worn * 0.8, rockA, rockB, sandA, sandB };
+      let c = COL.lush;
+      for (const k of Object.keys(STEP_COLORS)) {
+        blends[k].push(f[k]);
+        c = mix(c, STEP_COLORS[k], f[k]);
+      }
       W.push({ sand, rock, h });
-      colors.push(c);
+      expected.push(c);
     }
-  // Paint them: one small dab per vertex (radius below the 0.5 m grid spacing, strength 1), with
-  // the colours quantised so that every colour is one paint.vertex_color_stroke call.
-  const groups = new Map();
-  colors.forEach((c, k) => {
-    const q = c.map((x) => Math.round(Math.pow(x, 1 / 2.2) * 40) / 40);
-    const key = q.join(',');
-    if (!groups.has(key)) groups.set(key, { color: [...q.map((x) => Math.pow(x, 2.2)), 1], points: [] });
-    groups.get(key).points.push(ground.vertices[k]);
-  });
+  // Paint: paint.vertex_color_set fills the lush base colour, then every blend step is ONE
+  // paint.vertex_color_stroke with one dab per vertex it touches. A dab blends the vertices within
+  // `radius` toward the colour by strength × smoothstep(1 − d / radius), d = distance to the dab.
+  // So a dab placed at d = radius·(1 − smoothstep⁻¹(f)) from its vertex (diagonally, between the
+  // grid lines) blends that vertex by exactly f; the radius (0.2 m) is smaller than the distance
+  // from any dab to the next vertex (≥ 0.38 m on the 0.5 m grid; checked below), so each dab
+  // touches only its own vertex. 7 operators in all: the synced document stores a copy of the
+  // colour layer per operator, so few operators keep the project small.
+  const R = 0.2;
+  const unsmooth = (y) => 0.5 - Math.sin(Math.asin(1 - 2 * y) / 3); // inverse of t²(3 − 2t) on 0..1
+  const V = ground.vertices;
+  const strokes = [];
+  let dabs = 0;
+  for (const [k, color] of Object.entries(STEP_COLORS)) {
+    const points = [];
+    blends[k].forEach((fk, v) => {
+      if (fk < 1e-4) return;
+      const d = R * (1 - unsmooth(Math.min(1, fk)));
+      const q = [V[v][0] + d * Math.SQRT1_2, V[v][1] + d * Math.SQRT1_2, V[v][2]];
+      // every other vertex must be outside the dab (its grid neighbours are the closest ones)
+      const [i, j] = [v % N, Math.floor(v / N)];
+      for (let dj = -1; dj <= 1; dj++)
+        for (let di = -1; di <= 1; di++) {
+          const [ni, nj] = [i + di, j + dj];
+          if ((di || dj) && ni >= 0 && nj >= 0 && ni < N && nj < N) {
+            const o = V[nj * N + ni];
+            if (Math.hypot(o[0] - q[0], o[1] - q[1], o[2] - q[2]) < R + 0.01) throw new Error(`paint dab of vertex ${v} reaches vertex ${nj * N + ni}`);
+          }
+        }
+      points.push(q);
+    });
+    dabs += points.length;
+    if (points.length) strokes.push({ operator: 'paint.vertex_color_stroke', params: { object: 'Island', points, radius: R, strength: 1, color: [...color, 1] } });
+  }
   const t = Date.now();
-  await ops([
-    { operator: 'paint.vertex_color_set', params: { object: 'Island', color: [1, 1, 1, 1] } },
-    ...[...groups.values()].map((g) => ({ operator: 'paint.vertex_color_stroke', params: { object: 'Island', points: g.points, radius: 0.3 * CELL, strength: 1, color: g.color } })),
-  ]);
-  log(`vertex colours: ${colors.length} vertices in ${groups.size} colours (${((Date.now() - t) / 1000).toFixed(1)} s)`);
+  await ops([{ operator: 'paint.vertex_color_set', params: { object: 'Island', color: [...COL.lush, 1] } }, ...strokes]);
+  log(`vertex colours: ${expected.length} vertices, ${strokes.length} strokes with ${dabs} dabs (${((Date.now() - t) / 1000).toFixed(1)} s)`);
+  islandColors = expected;
 
   // ---- materials: the presets give texture, bump and roughness; their colours are made neutral
   // (light greys) so the vertex colours above set the hue. Slot per face from its corners.
@@ -419,18 +469,23 @@ async function buildSea() {
 // ---------------------------------------------------------------------------------------------
 // 4. Lighthouse
 // ---------------------------------------------------------------------------------------------
-let LZ = 0; // ground height at the lighthouse
-let ZG = 0; // gallery floor
+/** Height of the plinth top (= the door sill): 0.4 m above the highest ground under the plinth. */
+const plinthTop = () => maxHeightIn(LH[0], LH[1], PLINTH.r) + PLINTH.above;
+/** Unit vector (x, y) from the lighthouse axis towards the end of the path: the way the door faces. */
+const doorDir = () => {
+  const [ex, ey] = PATH_WAYPOINTS.at(-1);
+  const l = Math.hypot(ex - LH[0], ey - LH[1]);
+  return [(ex - LH[0]) / l, (ey - LH[1]) / l];
+};
+
 async function buildLighthouse() {
   const [x, y] = LH;
-  LZ = maxHeightIn(x, y, 2.7);
-  const z0 = LZ;
-  const towerH = 11;
-  const zt = z0 + 0.4; // top of the plinth
+  const towerH = TOWER_H;
+  const zt = plinthTop(); // top of the plinth
+  const z0 = zt - PLINTH.above; // highest ground under the plinth
   const zg = zt + towerH; // gallery floor
-  ZG = zg;
   log(`lighthouse base z = ${z0.toFixed(2)}, lamp at z = ${(zg + 1.1).toFixed(2)}`);
-  await add('cylinder', 'LH Plinth', { params: { vertices: 40, radius: 2.7, depth: 2.2 }, location: [x, y, z0 - 0.7] });
+  await add('cylinder', 'LH Plinth', { params: { vertices: 40, radius: PLINTH.r, depth: 2.2 }, location: [x, y, zt - 1.1] });
   await add('cone', 'LH Tower', { params: { vertices: 48, radius1: 1.9, radius2: 1.32, depth: towerH }, location: [x, y, zt + towerH / 2] });
   await add('cylinder', 'LH Gallery', { params: { vertices: 48, radius: 2.2, depth: 0.25 }, location: [x, y, zg + 0.125] });
   await add('cylinder', 'LH Lantern Glass', { params: { vertices: 12, radius: 1.2, depth: 1.8 }, location: [x, y, zg + 0.25 + 0.9] });
@@ -439,8 +494,8 @@ async function buildLighthouse() {
   await add('cone', 'LH Roof', { params: { vertices: 48, radius1: 1.55, radius2: 0.12, depth: 1.15 }, location: [x, y, zg + 2.05 + 0.575] });
   await add('uv_sphere', 'LH Vent', { params: { segments: 16, ring_count: 8, radius: 0.2 }, location: [x, y, zg + 3.35] });
   await add('cylinder', 'LH Rod', { params: { vertices: 8, radius: 0.025, depth: 0.9 }, location: [x, y, zg + 3.8] });
-  // Door and two small windows facing the path (south-west).
-  const face = Math.atan2(PATH_WAYPOINTS.at(-1)[1] - y, PATH_WAYPOINTS.at(-1)[0] - x);
+  // Door and two small windows facing the end of the path (south).
+  const face = Math.atan2(doorDir()[1], doorDir()[0]);
   const rad = (h) => 1.9 - (0.58 * h) / towerH; // tower radius at height h above the plinth
   const onWall = (h, inset) => [x + Math.cos(face) * (rad(h) - inset), y + Math.sin(face) * (rad(h) - inset), zt + h];
   await add('cube', 'LH Door', { params: { size: 1 }, location: onWall(1.0, 0.05), rotation: [0, 0, face + Math.PI / 2], scale: [0.95, 0.3, 2.0] });
@@ -448,7 +503,7 @@ async function buildLighthouse() {
   await add('cube', 'LH Window 2', { params: { size: 1 }, location: onWall(8.0, 0.05), rotation: [0, 0, face + Math.PI / 2], scale: [0.4, 0.3, 0.65] });
   // Railing: a closed circular RAIL fence around the gallery.
   const ring = Array.from({ length: 28 }, (_, k) => [Math.cos((k / 28) * 2 * Math.PI) * 2.08, Math.sin((k / 28) * 2 * Math.PI) * 2.08, 0]);
-  await op('object.generate_fence', { name: 'LH Railing', points: ring, closed: true, style: 'RAIL', rails: 3, height: 1.0, post_width: 0.05, post_spacing: 0.7, location: [x, y, zg + 0.25] });
+  await op('object.generate_fence', { name: 'LH Railing', points: ring, closed: true, style: 'RAIL', rails: 3, height: 1.0, post_width: 0.05, post_spacing: 0.7, location: [x, y, zg + 0.25], materials: false });
   await tool('add_modifier', { object: 'LH Lantern Frame', type: 'WIREFRAME', params: { thickness: 0.07 } });
   await tool('add_modifier', { object: 'LH Tower', type: 'SMOOTH_BY_ANGLE' });
   await tool('add_modifier', { object: 'LH Plinth', type: 'SMOOTH_BY_ANGLE' });
@@ -544,6 +599,7 @@ async function buildCottage() {
     roof_height: 1.9,
     roof_overhang: 0.35,
     location: [x, y, z],
+    materials: false, // its five slots get our own materials below
   });
   log(`cottage at z=${z.toFixed(2)}: ${r.faces} faces, slots ${r.material_slots.map((s) => s.name).join('/')}`);
   await add('cube', 'Cottage Foundation', { params: { size: 1 }, location: [x, y, z - 0.55], scale: [w + 0.3, d + 0.3, 1.3] });
@@ -599,7 +655,6 @@ async function raycastHeights(points) {
   const res = await ops(points.map(([x, y]) => ({ operator: 'scene.raycast', params: { origin: [x, y, 60], direction: [0, 0, -1], objects: ['Island'] } })));
   return res.map((r, k) => (r.hit ? r.point[2] : heightAt(points[k][0], points[k][1])));
 }
-let pathPts = [];
 async function buildPath() {
   // Profile: a closed 2D rectangle 1.5 m wide and 0.53 m deep with its top 8 cm above the curve
   // (the deep sides stay buried where the ground falls away).
@@ -615,7 +670,7 @@ async function buildPath() {
     return [-(b[1] - a[1]) / l, (b[0] - a[0]) / l]; // left of the direction of travel
   });
   const zs = await raycastHeights(xy.flatMap((p, k) => [p, [p[0] + leftOf[k][0] * 0.7, p[1] + leftOf[k][1] * 0.7], [p[0] - leftOf[k][0] * 0.7, p[1] - leftOf[k][1] * 0.7]]));
-  pathPts = xy.map(([x, y], k) => {
+  const pathPts = xy.map(([x, y], k) => {
     const [zc, zl, zr] = zs.slice(3 * k, 3 * k + 3);
     return { co: [x, y, Math.max(zc, (zl + zr) / 2) + 0.03], tilt: PATH_TILT_SIGN * Math.atan2(zl - zr, 1.4) };
   });
@@ -637,19 +692,55 @@ async function buildPath() {
   // Hide the bevel profile helper (it is only a shape).
   await op('data.set_property', { kind: 'objects', target: 'Path Profile', values: { hide_viewport: true, hide_render: true } });
 
-  // Fence on the seaward (right-hand) side of the upper path, each post on the ground.
+  // Fence on the seaward (right-hand) side of the upper path, 1.05 m from its centre line. Every
+  // post stands on a ray-cast ground height: the fence points are spaced at most 1.9 m apart, so
+  // generate_fence (which adds interpolated posts only between points farther apart than
+  // post_spacing) puts a post on each point and nowhere else.
   const seg = PATH_WAYPOINTS.slice(FENCE_RANGE[0], FENCE_RANGE[1] + 1);
-  const dense = resample(seg, 2.0);
-  const side = dense.map((p, k) => {
+  const dense = resample(seg, 1.6);
+  const offset = dense.map((p, k) => {
     const a = dense[Math.max(0, k - 1)];
     const b = dense[Math.min(dense.length - 1, k + 1)];
     const t = [b[0] - a[0], b[1] - a[1]];
     const l = Math.hypot(...t) || 1;
     return [p[0] + (t[1] / l) * 1.05, p[1] - (t[0] / l) * 1.05];
   });
+  const side = [offset[0]]; // the offset line is longer on the outside of bends: split long gaps
+  for (let k = 1; k < offset.length; k++) {
+    const [a, b] = [offset[k - 1], offset[k]];
+    const n = Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / (FENCE_POST_SPACING - 0.1));
+    for (let s = 1; s <= n; s++) side.push(mix(a, b, s / n));
+  }
   const fz = await raycastHeights(side);
-  await op('object.generate_fence', { name: 'Path Fence', points: side.map(([x, y], k) => [x, y, fz[k] - 0.05]), style: 'RAIL', rails: 2, height: 1.0, post_width: 0.1, post_spacing: 2.0, location: [0, 0, 0] });
+  const fence = await op('object.generate_fence', { name: 'Path Fence', points: side.map(([x, y], k) => [x, y, fz[k] - 0.05]), style: 'RAIL', rails: 2, height: 1.0, post_width: 0.1, post_spacing: FENCE_POST_SPACING, location: [0, 0, 0], materials: false });
+  log(`fence: ${side.length} posts, ${fence.faces} faces`);
   await material('Path Fence', { name: 'Weathered Wood', base_color: [0.32, 0.27, 0.21, 1], roughness: 0.8 });
+
+  // Steps from the end of the path up to the lighthouse door on the plinth: equal rises of about
+  // STEPS.rise, spread over the run between the plinth wall and the path end. Each step is a block
+  // that reaches back into the plinth and down into the ground; the blocks get slightly wider
+  // towards the bottom so that their side faces never coincide.
+  const u = doorDir();
+  const zTop = plinthTop();
+  const zPath = pathPts.at(-1).co[2] + 0.08; // top of the path at its end
+  const rises = Math.max(2, Math.round((zTop - zPath) / STEPS.rise));
+  const rise = (zTop - zPath) / rises;
+  const front = Math.hypot(PATH_WAYPOINTS.at(-1)[0] - LH[0], PATH_WAYPOINTS.at(-1)[1] - LH[1]) + 0.1; // the path ends under the lowest step
+  const run = (front - PLINTH.r) / (rises - 1);
+  const steps = [];
+  for (let k = 1; k < rises; k++) {
+    const [inner, outer, top, bottom] = [PLINTH.r - 0.5, PLINTH.r + k * run, zTop - k * rise, zPath - 0.8];
+    const c = (inner + outer) / 2;
+    const name = `LH Step ${k}`;
+    steps.push(name);
+    await add('cube', name, { params: { size: 1 }, location: [LH[0] + u[0] * c, LH[1] + u[1] * c, (top + bottom) / 2], rotation: [0, 0, Math.atan2(u[1], u[0])], scale: [outer - inner, STEPS.width + 0.04 * k, top - bottom] });
+  }
+  // One object: apply the scales (OBJECT-mapped stone texture keeps its size), join, rename.
+  await op('object.transform_apply', { location: false, rotation: false, scale: true }, { selection: { objects: steps, mode: 'OBJECT' } });
+  await op('object.join', {}, { selection: { objects: steps, active: steps[0], mode: 'OBJECT' } });
+  await op('object.rename', { object: steps[0], name: 'LH Steps' });
+  await material('LH Steps', { material: 'Lighthouse Stone' });
+  log(`steps: ${rises} rises of ${rise.toFixed(3)} m, treads ${run.toFixed(2)} m, from the path end (z ${zPath.toFixed(2)}) to the door sill (z ${zTop.toFixed(2)})`);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -733,20 +824,26 @@ async function buildJetty() {
 // ---------------------------------------------------------------------------------------------
 async function buildVegetation() {
   const far = (k) => [140 + k * 8, 0, 0];
-  await op('object.generate_tree', { name: 'Pine A', style: 'CONIFER', height: 6.5, trunk_radius: 0.17, branch_levels: 3, leaf_density: 0.9, leaf_size: 0.6, seed: 4, location: far(0) });
-  await op('object.generate_tree', { name: 'Pine B', style: 'CONIFER', height: 4.8, trunk_radius: 0.13, branch_levels: 2, leaf_density: 0.95, leaf_size: 0.5, seed: 9, location: far(1) });
-  await op('object.generate_tree', { name: 'Pine C', style: 'CONIFER', height: 8, trunk_radius: 0.21, branch_levels: 4, leaf_density: 0.85, leaf_size: 0.7, seed: 13, location: far(2) });
+  await op('object.generate_tree', { name: 'Pine A', style: 'CONIFER', height: 6.5, trunk_radius: 0.17, branch_levels: 3, leaf_density: 0.9, leaf_size: 0.6, seed: 4, location: far(0), materials: false });
+  await op('object.generate_tree', { name: 'Pine B', style: 'CONIFER', height: 4.8, trunk_radius: 0.13, branch_levels: 2, leaf_density: 0.95, leaf_size: 0.5, seed: 9, location: far(1), materials: false });
+  await op('object.generate_tree', { name: 'Pine C', style: 'CONIFER', height: 8, trunk_radius: 0.21, branch_levels: 4, leaf_density: 0.85, leaf_size: 0.7, seed: 13, location: far(2), materials: false });
   await op('object.generate_rock', { name: 'Rock A', size: [1.4, 1.1, 0.8], roughness: 0.6, seed: 2, location: far(3) });
   await op('object.generate_rock', { name: 'Rock B', size: [0.7, 0.6, 0.45], roughness: 0.5, seed: 5, location: far(4) });
   await op('object.generate_rock', { name: 'Rock C', size: [2.4, 1.7, 1.3], roughness: 0.65, facets: 7, seed: 8, location: far(5) });
-  await op('object.generate_grass_tuft', { name: 'Tuft A', blades: 18, height: 0.38, spread: 0.1, seed: 1, location: far(6) });
-  await op('object.generate_grass_tuft', { name: 'Tuft B', blades: 28, height: 0.55, spread: 0.14, bend: 0.6, seed: 3, location: far(7) });
-  await op('object.generate_bush', { name: 'Bush A', height: 0.9, seed: 2, location: far(8) });
+  await op('object.generate_grass_tuft', { name: 'Tuft A', blades: 18, height: 0.38, spread: 0.1, seed: 1, location: far(6), materials: false });
+  await op('object.generate_grass_tuft', { name: 'Tuft B', blades: 28, height: 0.55, spread: 0.14, bend: 0.6, seed: 3, location: far(7), materials: false });
+  await op('object.generate_bush', { name: 'Bush A', height: 0.9, seed: 2, location: far(8), materials: false });
+  // The generators ran with `materials: false` (empty slots): slot 0 is the trunk/twigs, slot 1 the
+  // foliage of the trees and the bush; the tufts have one slot.
+  await material('Pine A', { slot: 0, name: 'Bark', base_color: [0.12, 0.07, 0.035, 1], roughness: 0.9 });
   await material('Pine A', { slot: 1, name: 'Pine Needles', base_color: [0.025, 0.07, 0.03, 1], roughness: 0.8 });
-  await material('Pine B', { slot: 1, material: 'Pine Needles' });
-  await material('Pine C', { slot: 1, material: 'Pine Needles' });
+  for (const o of ['Pine B', 'Pine C']) {
+    await material(o, { slot: 0, material: 'Bark' });
+    await material(o, { slot: 1, material: 'Pine Needles' });
+  }
   await material('Tuft A', { name: 'Coastal Grass', base_color: [0.16, 0.2, 0.05, 1], roughness: 0.7 });
   await material('Tuft B', { material: 'Coastal Grass' });
+  await material('Bush A', { slot: 0, material: 'Bark' });
   await material('Bush A', { slot: 1, name: 'Bush Leaves', base_color: [0.035, 0.085, 0.03, 1], roughness: 0.8 });
 
   // Density maps (vertex groups on the island, one weight per vertex).
@@ -805,7 +902,7 @@ async function buildWorldAndCamera() {
   await op('world.mist_set', { distance: MIST.distance, color: MIST.color });
   // Thin cloud streaks low over the horizon and one high wisp, catching the last pink light. Each is
   // generated small (marching cubes need a sensible aspect ratio) and stretched by its object scale.
-  const view = [CAMERA.target[0] - CAMERA.at[0], CAMERA.target[1] - CAMERA.at[1]];
+  const view = [CAMERA.look[0] - CAMERA.at[0], CAMERA.look[1] - CAMERA.at[1]]; // centre of the frame
   const vl = Math.hypot(...view);
   const fwd = [view[0] / vl, view[1] / vl];
   const right = [fwd[1], -fwd[0]];
@@ -818,7 +915,7 @@ async function buildWorldAndCamera() {
   ];
   for (const [k, c] of clouds.entries()) {
     const at = [CAMERA.at[0] + fwd[0] * c.d + right[0] * c.side, CAMERA.at[1] + fwd[1] * c.d + right[1] * c.side, c.z];
-    await op('object.generate_cloud', { name: `Cloud ${k + 1}`, size: c.size, puffs: 20, smoothness: 0.3, resolution: 64, seed: c.seed, location: at, scale: c.scale, rotation: [0, 0, Math.atan2(fwd[1], fwd[0]) + Math.PI / 2 + c.yaw] });
+    await op('object.generate_cloud', { name: `Cloud ${k + 1}`, size: c.size, puffs: 20, smoothness: 0.3, resolution: 64, seed: c.seed, location: at, scale: c.scale, rotation: [0, 0, Math.atan2(fwd[1], fwd[0]) + Math.PI / 2 + c.yaw], materials: false });
   }
   // At 700–1000 m the mist covers 90–99 % of a cloud's own shading, so the clouds simply glow in
   // the mist colour (black base, emission = mist colour). That also keeps them unchanged behind
@@ -828,26 +925,50 @@ async function buildWorldAndCamera() {
   for (let k = 1; k <= clouds.length; k++) {
     await material(`Cloud ${k}`, k === 1 ? { name: 'Cloud Haze', base_color: [0, 0, 0, 1], roughness: 1, emission_color: MIST.color, emission_strength: 1 } : { material: 'Cloud Haze' });
   }
+  // The camera: Track To an empty on the lighthouse, and a lens shift that brings CAMERA.look to the
+  // centre of the frame. Track To (−Z forward, Y up) keeps the camera level, so its axes follow from
+  // the two positions; shift is in units of the image width (the wider side with sensor_fit AUTO).
+  const [sx, sy] = lensShift(CAMERA.look);
   await add('empty', 'Camera Target', { location: CAMERA.target, params: { type: 'SPHERE' } });
-  await add('camera', 'Camera', { location: CAMERA.at, params: { lens: CAMERA.lens, clip_end: 2000 } });
+  await add('camera', 'Camera', { location: CAMERA.at, params: { lens: CAMERA.lens, sensor_width: CAMERA.sensor, clip_end: 2000, shift_x: sx, shift_y: sy } });
   const c = await op('object.constraint_add', { object: 'Camera', type: 'TRACK_TO', target: 'Camera Target', params: { track_axis: 'TRACK_NEGATIVE_Z', up_axis: 'UP_Y' } });
   if (c.errors?.length) throw new Error(`camera constraint: ${c.errors.join('; ')}`);
   await tool('set_active_camera', { camera: 'Camera' });
+  log(`camera: lens shift x ${sx.toFixed(4)}, y ${sy.toFixed(4)}`);
+}
+/** Camera axes (right, up, forward) of a level camera at CAMERA.at aimed at CAMERA.target. */
+function cameraAxes() {
+  const f = norm3(sub3(CAMERA.target, CAMERA.at));
+  const r = norm3(cross3(f, [0, 0, 1]));
+  return { r, u: cross3(r, f), f };
+}
+/** Lens shift (x, y) that puts world point p at the centre of the frame. */
+function lensShift(p) {
+  const { r, u, f } = cameraAxes();
+  const v = sub3(p, CAMERA.at);
+  const k = CAMERA.lens / CAMERA.sensor / dot3(v, f);
+  return [k * dot3(v, r), k * dot3(v, u)];
 }
 
 // ---------------------------------------------------------------------------------------------
 // 10. Checks: scene problems, the driven beams at several frames, the camera aim
 // ---------------------------------------------------------------------------------------------
-/** Forward (−Z) axis of an XYZ Euler rotation. */
-function forwardOf([rx, ry, rz]) {
+/** Local X, Y, Z axes (the columns of Rz·Ry·Rx) of an XYZ Euler rotation. */
+function axesOf([rx, ry, rz]) {
   const [cx, sx, cy, sy, cz, sz] = [Math.cos(rx), Math.sin(rx), Math.cos(ry), Math.sin(ry), Math.cos(rz), Math.sin(rz)];
-  // third column of Rz·Ry·Rx, negated
-  return [-(cz * sy * cx + sz * sx), -(sz * sy * cx - cz * sx), -(cy * cx)];
+  return [
+    [cz * cy, sz * cy, -sy],
+    [cz * sy * sx - sz * cx, sz * sy * sx + cz * cx, cy * sx],
+    [cz * sy * cx + sz * sx, sz * sy * cx - cz * sx, cy * cx],
+  ];
 }
 async function check() {
   const s = await tool('get_scene', { max_objects: 5 });
   log(`scene: ${JSON.stringify(s.counts ?? {}).slice(0, 400)}`);
   if (s.problems?.length) throw new Error(`scene problems: ${JSON.stringify(s.problems).slice(0, 800)}`);
+  const orphans = (s.materials ?? []).filter((m) => !m.users?.length).map((m) => m.name);
+  log(`  materials: ${s.materials?.length}, without users: ${orphans.length ? orphans.join(', ') : 'none'}`);
+  if (orphans.length) throw new Error(`materials without users: ${orphans.join(', ')}`);
   // The beams are driven by the frame: read the evaluated heading back with get_object {frame}.
   const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
   for (const frame of [1, 7, 13, 19, 25]) {
@@ -873,16 +994,50 @@ async function check() {
     return (1 - v) * ((1 - u) * H[j][i] + u * H[j][i + 1]) + v * ((1 - u) * H[j + 1][i] + u * H[j + 1][i + 1]);
   };
   const above = pm.vertices.map(([x, y, z]) => z - groundAt(x, y));
-  log(`  path: ${pm.vertices.length} vertices, highest ${Math.max(...above).toFixed(2)} m above the ground (top surface: +0.11 m)`);
+  const highest = Math.max(...above);
+  log(`  path: ${pm.vertices.length} vertices, highest ${highest.toFixed(2)} m above the ground (top surface: +0.11 m)`);
+  if (highest > 0.4) throw new Error(`the path floats ${highest.toFixed(2)} m above the ground`);
+  // The painted island colours equal the computed ones. get_mesh_data does not return vertex
+  // colours, but export_mesh.ply does (8-bit sRGB): export the island alone and compare every vertex.
+  const ply = await op('export_mesh.ply', { use_selection: true, apply_modifiers: false }, { selection: { objects: ['Island'], mode: 'OBJECT' } });
+  const buf = Buffer.from(ply.data_base64, 'base64');
+  const start = buf.indexOf('end_header\n') + 'end_header\n'.length;
+  const header = buf.subarray(0, start).toString('latin1');
+  const props = header.split('element face')[0].match(/property \w+ \w+/g).map((l) => l.split(' ').slice(1)); // [type, name]
+  const bytes = { float: 4, uchar: 1 };
+  const at = {};
+  let stride = 0;
+  for (const [type, name] of props) [at[name], stride] = [stride, stride + bytes[type]];
+  const srgb8 = (c) => Math.round(255 * (c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055));
+  let worst = 0;
+  const nv = Number(header.match(/element vertex (\d+)/)[1]);
+  for (let k = 0; k < nv; k++) {
+    const b = start + k * stride;
+    const [x, y] = [buf.readFloatLE(b + at.x), buf.readFloatLE(b + at.y)];
+    const want = islandColors[Math.round((y + TERRAIN.size / 2) / CELL) * N + Math.round((x + TERRAIN.size / 2) / CELL)];
+    ['red', 'green', 'blue'].forEach((ch, c) => (worst = Math.max(worst, Math.abs(buf[b + at[ch]] - srgb8(want[c])))));
+  }
+  log(`  island colours: ${nv} exported vertices, largest difference ${worst}/255 from the computed colours`);
+  if (worst > 1) throw new Error(`the painted island colours differ from the computed ones by up to ${worst}/255`);
+  // The camera: Track To aims it at the empty on the lighthouse, and the lens shift puts
+  // CAMERA.look at the centre of the frame (projected with the evaluated camera transform).
   const cam = await tool('get_object', { object: 'Camera', frame: 1 });
   const errs = (cam.constraints ?? []).flatMap((c) => c.errors ?? (c.error ? [c.error] : []));
   if (errs.length) throw new Error(`camera constraint errors: ${errs.join('; ')}`);
-  const f = forwardOf(cam.world_transform.rotation_euler);
-  const to = CAMERA.target.map((v, i) => v - cam.world_transform.location[i]);
-  const tl = Math.hypot(...to);
-  const angle = (Math.acos(clamp((f[0] * to[0] + f[1] * to[1] + f[2] * to[2]) / tl, -1, 1)) * 180) / Math.PI;
-  log(`  camera: ${(cam.constraints ?? []).map((c) => `${c.type} → ${(c.targets ?? []).join(', ')}`).join(', ')}; aims ${angle.toFixed(3)}° off the target`);
+  const [X, Y, Z] = axesOf(cam.world_transform.rotation_euler);
+  const camAt = cam.world_transform.location;
+  const to = sub3(CAMERA.target, camAt);
+  const angle = (Math.acos(clamp(-dot3(Z, to) / Math.hypot(...to), -1, 1)) * 180) / Math.PI;
+  const camData = cam.data ?? {};
+  const pixel = (p) => {
+    const v = sub3(p, camAt);
+    const k = camData.lens / camData.sensor_width / -dot3(v, Z);
+    return [640 + 1280 * (k * dot3(v, X) - camData.shift_x), 360 - 1280 * (k * dot3(v, Y) - camData.shift_y)];
+  };
+  const [lookPx, targetPx] = [pixel(CAMERA.look), pixel(CAMERA.target)];
+  log(`  camera: ${(cam.constraints ?? []).map((c) => `${c.type} → ${(c.targets ?? []).join(', ')}`).join(', ')}; aims ${angle.toFixed(3)}° off the target; 1280×720 frame: look point at (${lookPx.map((v) => v.toFixed(1))}), lighthouse target at (${targetPx.map((v) => v.toFixed(0))})`);
   if (angle > 0.1) throw new Error(`camera does not aim at its target (${angle}°)`);
+  if (Math.hypot(lookPx[0] - 640, lookPx[1] - 360) > 0.5) throw new Error('the lens shift does not centre the frame on CAMERA.look');
 
   // Scatter placement. No MCP tool reports where the instances of a particle system are, so each
   // system is made real for a moment: one batch shows only that system and runs
@@ -962,7 +1117,6 @@ async function exportScene() {
   stats.export = { seconds: (Date.now() - t) / 1000, warnings: ex.text?.warnings ?? ex.warnings };
   if (stats.export.warnings?.length) log(`  export warnings: ${JSON.stringify(stats.export.warnings).slice(0, 600)}`);
   stats.export.bytes = await saveResult(ex, 'scene.glb');
-  if (stats.export.bytes > 6e6) log('  ⚠ scene.glb is larger than 6 MB');
 }
 
 // ---------------------------------------------------------------------------------------------

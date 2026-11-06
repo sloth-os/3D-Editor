@@ -422,7 +422,10 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
       ),
     });
   const bytes = keys.reduce((n, k) => n + (k.data?.length ?? 0), 0);
-  const value = (k: ShapeKeyData) => animatedValue(s, 'mesh', meshId, shapeKeyPath(k.name), 0, k.value);
+  // the values at the current frame (keyframes and drivers applied), which the viewport and the
+  // renderers use
+  const animated = animatedBlock<{ shape_keys: ShapeKeyData[] }>(s, 'mesh', meshId)?.shape_keys;
+  const value = (k: ShapeKeyData) => animated?.find((x) => x.name === k.name)?.value ?? k.value;
   const setKey = (
     k: ShapeKeyData,
     field: 'value' | 'slider_min' | 'slider_max',
@@ -1879,6 +1882,13 @@ function AddIkForm({
 
 // ------------------------------------------------------------------ light
 
+/**
+ * The smallest spot cone the operators accept (light.properties_set and data.set_property validate
+ * spot_size with Blender's range, 1°..180°): a smaller typed value is clamped to it instead of
+ * being rejected.
+ */
+export const SPOT_SIZE_MIN = Math.PI / 180;
+
 function LightPanel({ s, id }: { s: ProjectSession; id: string }) {
   const l = s.doc.getLight(id);
   if (!l) return null;
@@ -1941,12 +1951,13 @@ function LightPanel({ s, id }: { s: ProjectSession; id: string }) {
           <Row label="Size">
             <NumberField
               value={a.spot_size}
-              min={0.01}
+              min={SPOT_SIZE_MIN}
               max={Math.PI}
               unit="°"
               step={1}
               {...RAD}
               state={st('spot_size')}
+              testId="light-spot-size"
               onChange={(v, f) => set('spot_size', v, f)}
             />
           </Row>
@@ -2021,6 +2032,34 @@ export function lensForFieldOfView(angle: number, sensorWidth: number): number {
   return (sensorWidth || 36) / (2 * Math.tan(angle / 2));
 }
 
+/** The Focal Length range of the panel; the operators reject a lens under 1 mm. */
+export const LENS_MIN = 1;
+export const LENS_MAX = 5000;
+
+/**
+ * The focal length the Field of View field writes: {@link lensForFieldOfView} kept in the Focal
+ * Length range. At the widest angle the field offers, the round trip angle → lens can come out a
+ * hair under 1 mm (0.9999999999999998 for many sensor sizes), which the operators would reject.
+ */
+export function lensForFieldOfViewClamped(angle: number, sensorWidth: number): number {
+  return Math.min(LENS_MAX, Math.max(LENS_MIN, lensForFieldOfView(angle, sensorWidth)));
+}
+
+/**
+ * The bounds of the Clip Start / End fields: the operators require clip_end > clip_start, so each
+ * field stops just short of the other's stored value instead of sending a value that is rejected.
+ */
+export function clipRange(cam: Pick<CameraData, 'clip_start' | 'clip_end'>): {
+  startMax: number;
+  endMin: number;
+} {
+  const gap = (x: number) => Math.max(Math.abs(x) * 1e-9, 1e-12);
+  return {
+    startMax: cam.clip_end - gap(cam.clip_end),
+    endMin: Math.max(0.0001, cam.clip_start + gap(cam.clip_start)),
+  };
+}
+
 function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
   const c = s.doc.getCamera(id);
   if (!c) return null;
@@ -2028,6 +2067,8 @@ function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
   const a = animatedBlock<CameraData>(s, 'camera', id) ?? c;
   const set = (f: string, v: unknown, final = true) => setProp(s, 'cameras', id, f, v, final);
   const st = (path: string) => animState(s, 'camera', id, path, 0);
+  // the operators check the stored clip range (clip_end > clip_start)
+  const clip = clipRange(c);
   return (
     <>
       <div class="prop-context">
@@ -2049,8 +2090,8 @@ function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
             <Row label="Focal Length">
               <NumberField
                 value={a.lens}
-                min={1}
-                max={5000}
+                min={LENS_MIN}
+                max={LENS_MAX}
                 step={0.5}
                 unit=" mm"
                 state={st('lens')}
@@ -2068,11 +2109,11 @@ function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
                 step={0.5}
                 {...RAD}
                 // the angles of the Focal Length range (1–5000 mm)
-                min={cameraFieldOfView({ lens: 5000, sensor_width: a.sensor_width })}
-                max={cameraFieldOfView({ lens: 1, sensor_width: a.sensor_width })}
+                min={cameraFieldOfView({ lens: LENS_MAX, sensor_width: a.sensor_width })}
+                max={cameraFieldOfView({ lens: LENS_MIN, sensor_width: a.sensor_width })}
                 state={st('lens')}
                 testId="camera-fov"
-                onChange={(v, f) => set('lens', lensForFieldOfView(v, a.sensor_width), f)}
+                onChange={(v, f) => set('lens', lensForFieldOfViewClamped(v, a.sensor_width), f)}
               />
             </Row>
           </>
@@ -2105,23 +2146,26 @@ function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
             onChange={(v, f) => set('shift_y', v, f)}
           />
         </Row>
-        <Row label="Clip Start">
+        <Row label="Clip Start" title="Near clipping distance; it stays below Clip End">
           <NumberField
             value={a.clip_start}
             min={0.0001}
+            max={clip.startMax}
             step={0.01}
             unit=" m"
             state={st('clip_start')}
+            testId="camera-clip-start"
             onChange={(v, f) => set('clip_start', v, f)}
           />
         </Row>
-        <Row label="End">
+        <Row label="End" title="Far clipping distance; it stays above Clip Start">
           <NumberField
             value={a.clip_end}
-            min={0.01}
+            min={clip.endMin}
             step={1}
             unit=" m"
             state={st('clip_end')}
+            testId="camera-clip-end"
             onChange={(v, f) => set('clip_end', v, f)}
           />
         </Row>

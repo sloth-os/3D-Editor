@@ -207,6 +207,13 @@ const shown = (root: HTMLElement, key: string) =>
   [0, 1, 2].map((i) => field(root, `redo-${key}-${i}`)?.querySelector('.nf-value')?.textContent);
 const id = (name: string) => s.doc.findObjectByName(name)!.id;
 
+/** Types into a text field and confirms with Enter. */
+function typeText(el: HTMLElement, value: string): void {
+  const input = (el.tagName === 'INPUT' ? el : el.querySelector('input')) as HTMLInputElement;
+  fireEvent.input(input, { target: { value } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+}
+
 /** Types into a Blender-style number field (click, type, Enter). */
 function typeNumber(el: HTMLElement, value: string): void {
   fireEvent.pointerDown(el, { button: 0, clientX: 5, pointerId: 1 });
@@ -449,6 +456,41 @@ describe('Adjust Last Operation shows what "set" operators keep', () => {
     });
     root = panel();
     expect(optionLabels(field(root, 'redo-target'))).toEqual(['— none —', 'Ctrl']);
+  });
+
+  it('Add IK: a bone of the same armature shows as "This armature", not "— none —"', () => {
+    // regression: the Target picker read "— none —" for an IK targeting a bone of its own armature
+    ok('object.armature_add', { name: 'Rig', bone_name: 'Upper' });
+    const rig = id('Rig');
+    ok('armature.bone_add', { object: rig, name: 'Lower', head: [0, 0, 1], tail: [0, 0, 2], parent: 'Upper' });
+    ok('armature.bone_add', { object: rig, name: 'Hand.IK', head: [1, 0, 2], tail: [1, 0, 2.5] });
+    ok('armature.bone_add', { object: rig, name: 'Pole', head: [0, -2, 1], tail: [0, -2, 1.5] });
+    ok('pose.ik_add', { object: rig, bone: 'Lower', subtarget: 'Hand.IK', chain_count: 2 });
+    let root = panel();
+    expect(field(root, 'redo-panel')?.textContent).toContain('Add IK');
+    const target = field(root, 'redo-target') as HTMLSelectElement;
+    expect(target.value).toBe('');
+    expect(target.selectedOptions[0].textContent).toBe('This armature (Rig)');
+    expect(optionLabels(target)).not.toContain('— none —');
+    // without a pole bone the pole picker is a plain "none"
+    expect((field(root, 'redo-pole_target') as HTMLSelectElement).selectedOptions[0].textContent).toBe(
+      '— none —',
+    );
+    // a pole bone of the same armature reads the same way
+    typeText(field(root, 'redo-pole_subtarget')!, 'Pole');
+    const ik = () => s.doc.getObject(rig)!.pose!.bones.Lower.constraints![0];
+    expect(ik().params.pole_subtarget).toBe('Pole');
+    expect(ik().target).toBe(rig);
+    root = panel();
+    expect((field(root, 'redo-pole_target') as HTMLSelectElement).selectedOptions[0].textContent).toBe(
+      'This armature (Rig)',
+    );
+    // an object target shows the object
+    ok('mesh.primitive_cube_add', { name: 'Goal' });
+    ok('pose.ik_add', { object: rig, bone: 'Upper', target: 'Goal' });
+    root = panel();
+    expect((field(root, 'redo-target') as HTMLSelectElement).selectedOptions[0].textContent).toBe('Goal');
+    expect(optionLabels(field(root, 'redo-target'))).toContain('— none —');
   });
 
   it('Set Modifier Properties: hides the modifier id and shows its current visibility', () => {

@@ -23,11 +23,15 @@ import type { ViewportEngine } from '../src/viewport/engine';
 import { Properties, activePropertiesTab } from '../src/ui/properties/Properties';
 import {
   DataTab,
+  LENS_MAX,
+  LENS_MIN,
+  SPOT_SIZE_MIN,
   activeEntryIndex,
   boneTree,
   cameraFieldOfView,
   curveFieldOperator,
   lensForFieldOfView,
+  lensForFieldOfViewClamped,
   shapeKeyPath,
   splinePointInput,
 } from '../src/ui/properties/DataTab';
@@ -51,6 +55,7 @@ import {
   bakeRigidBodyWorld,
   frameRateOption,
   frameRateOptions,
+  frameRateParts,
   mistDensityForDistance,
 } from '../src/ui/properties/SceneTabs';
 import { DialogHost, formatRenderTime } from '../src/ui/dialogs/Dialogs';
@@ -731,10 +736,61 @@ describe('Scene, World and Render tabs', () => {
     fireEvent.change(select(), { target: { value: frameRateOption(24) } });
     expect(s.doc.getScene().fps).toBe(24);
     expect(label()).toBe('24 fps');
-    expect(frameRateOptions(24).some((o) => o.label.startsWith('Custom'))).toBe(false);
+    expect(frameRateOptions(24).filter((o) => o.label.startsWith('Custom'))).toEqual([
+      { value: 'CUSTOM', label: 'Custom' },
+    ]);
     expect(frameRateOptions(23.976).find((o) => o.value === frameRateOption(23.976))?.label).toBe(
       '23.98 fps',
     );
+  });
+
+  it('sets a custom frame rate as FPS / Base, like Blender, and shows the FPS / Base of rates set elsewhere', () => {
+    // regression: only the presets could be picked; a rate like 15 or 12.5 could not be entered
+    activePropertiesTab.value = 'output';
+    const { container } = render(<Properties session={s} />);
+    const select = () => byTestId(container, 'output-fps') as HTMLSelectElement;
+    const label = () => select().options[select().selectedIndex]?.textContent;
+    const fps = () => byTestId(container, 'output-fps-custom');
+    const base = () => byTestId(container, 'output-fps-base');
+    const num = (el: HTMLElement | null) => parseFloat(el!.textContent!);
+    expect(s.doc.getScene().fps).toBe(24);
+    expect(fps()).toBeNull();
+    // Custom shows the current rate's FPS and Base
+    fireEvent.change(select(), { target: { value: 'CUSTOM' } });
+    expect(select().value).toBe('CUSTOM');
+    expect([num(fps()), num(base())]).toEqual([24, 1]);
+    expect(s.doc.getScene().fps).toBe(24);
+    typeNumber(fps()!, '15');
+    expect(s.doc.getScene().fps).toBe(15);
+    expect(label()).toBe('Custom (15 fps)');
+    // a Base divides: 15 / 2 = 7.5 fps, and the fields keep the pair as typed
+    typeNumber(base()!, '2');
+    expect(s.doc.getScene().fps).toBe(7.5);
+    expect(label()).toBe('Custom (7.5 fps)');
+    expect([num(fps()), num(base())]).toEqual([15, 2]);
+    // one undo step per edit
+    act(() => void s.undo.undo());
+    expect(s.doc.getScene().fps).toBe(15);
+    expect([num(fps()), num(base())]).toEqual([15, 1]);
+    // NTSC: 30 / 1.001
+    typeNumber(fps()!, '30');
+    typeNumber(base()!, '1.001');
+    expect(s.doc.getScene().fps).toBeCloseTo(30000 / 1001, 9);
+    // rates set by an agent show as FPS / Base too (no empty box, no hidden custom rate)
+    act(() => s.doc.updateScene({ fps: 12.5 }));
+    expect(label()).toBe('Custom (12.5 fps)');
+    expect(num(fps())).toBe(13);
+    expect(num(fps()) / num(base())).toBeCloseTo(12.5, 3);
+    expect(frameRateParts(12.5)).toEqual({ fps: 13, base: 1.04 });
+    expect(frameRateParts(30000 / 1001).fps).toBe(30);
+    expect(frameRateParts(30000 / 1001).base).toBeCloseTo(1.001, 12);
+    expect(frameRateParts(7.5, { fps: 15, base: 2 })).toEqual({ fps: 15, base: 2 });
+    expect(frameRateParts(8, { fps: 15, base: 2 })).toEqual({ fps: 8, base: 1 });
+    // picking a preset leaves Custom
+    fireEvent.change(select(), { target: { value: frameRateOption(25) } });
+    expect(s.doc.getScene().fps).toBe(25);
+    expect(label()).toBe('25 fps');
+    expect(fps()).toBeNull();
   });
 });
 
@@ -1170,6 +1226,59 @@ describe('animated fields', () => {
     expect(shown(container, 'camera-shift-x')).toBeCloseTo(0.2, 3);
     expect(byTestId(container, 'camera-fov')!.className).toContain('animated');
   });
+
+  it('colour driven fields as driven (Blender: purple), also without keyframes, and show the driven value', () => {
+    // regression: a driver without keyframes left the field uncoloured; shape key values and pose
+    // bone channels showed the stored value instead of the driven one
+    s.doc.populateDefaultScene();
+    const driver = (target_type: string, target: string, path: string, expression: string, index = -1) =>
+      ok('anim.driver_add', { target_type, target, path, expression, index });
+    driver('light', 'Light', 'shadow_soft_size', 'frame / 10');
+    key('light', 'Light', 'energy', 100, 1100);
+    driver('camera', 'Camera', 'lens', '30 + frame');
+    driver('object', 'Cube', 'location', 'frame / 4', 2);
+    ok('object.shape_key_add', { object: 'Cube', name: 'Tall' });
+    driver('mesh', 'Cube', 'shape_keys["Tall"].value', 'frame / 20');
+    ok('object.armature_add', { name: 'Rig' });
+    driver('object', 'Rig', 'pose.bones["Bone"].rotation_euler', 'frame / 60', 0);
+    s.state.frame = 6;
+    const cls = (container: ParentNode, id: string) => byTestId(container, id)!.className;
+    // vector components carry an axis label (X / Y / Z) before the value
+    const component = (container: ParentNode, id: string) =>
+      parseFloat(byTestId(container, id)!.querySelector('.nf-value')!.textContent!);
+
+    select(s, 'Light');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    expect(cls(container, 'light-radius')).toContain('driven');
+    expect(shown(container, 'light-radius')).toBeCloseTo(0.6, 3);
+    // keyframes without a driver stay green / yellow
+    expect(cls(container, 'light-energy')).toContain('animated');
+    expect(cls(container, 'light-energy')).not.toContain('driven');
+
+    act(() => select(s, 'Camera'));
+    expect(cls(container, 'camera-lens')).toContain('driven');
+    expect(cls(container, 'camera-fov')).toContain('driven');
+    expect(shown(container, 'camera-lens')).toBeCloseTo(36, 3);
+
+    act(() => select(s, 'Cube'));
+    fireEvent.click(byTestId(container, 'shape-key-Tall')!);
+    expect(cls(container, 'shape-key-value')).toContain('driven');
+    expect(shown(container, 'shape-key-value')).toBeCloseTo(0.3, 3);
+
+    act(() => select(s, 'Rig'));
+    expect(cls(container, 'pose-rotation-0')).toContain('driven');
+    expect(cls(container, 'pose-rotation-1')).not.toContain('driven');
+    expect(component(container, 'pose-rotation-0')).toBeCloseTo(((6 / 60) * 180) / Math.PI, 2);
+
+    act(() => {
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+    });
+    expect(cls(container, 'loc-2')).toContain('driven');
+    expect(cls(container, 'loc-0')).not.toContain('driven');
+    expect(component(container, 'loc-2')).toBeCloseTo(1.5, 3);
+  });
 });
 
 describe('Object Data tab: cameras', () => {
@@ -1225,6 +1334,50 @@ describe('Object Data tab: cameras', () => {
       expect(cam().lens).toBeCloseTo(lensForFieldOfView((40 * Math.PI) / 180, 36), 6);
       expect(cam().lens).toBeCloseTo(49.452, 2);
     }
+  });
+
+  it('keeps typed values inside the ranges the operators accept (spot size, widest angle, clip range)', () => {
+    // regression: Spot Size went down to 0.01 rad (under 1°), the widest Field of View wrote a lens
+    // a hair under 1 mm, and Clip End could go below Clip Start: data.set_property rejected each
+    // with INVALID_PARAMS, an error toast appeared and the field snapped back
+    s.doc.populateDefaultScene();
+    ok('object.light_add', { type: 'SPOT', name: 'Spot' });
+    select(s, 'Spot');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const errors = () => toasts.value.filter((t) => t.level === 'error').map((t) => t.message);
+    const before = errors().length;
+    const spot = () => s.doc.getLight(s.doc.findObjectByName('Spot')!.data!)!;
+    typeNumber(byTestId(container, 'light-spot-size')!, '0.012');
+    expect(spot().spot_size).toBe(SPOT_SIZE_MIN);
+    expect(SPOT_SIZE_MIN).toBeCloseTo((1 * Math.PI) / 180, 12);
+    typeNumber(byTestId(container, 'light-spot-size')!, '200');
+    expect(spot().spot_size).toBe(Math.PI);
+
+    const camObj = s.doc.findObjectByName('Camera')!;
+    const cam = () => s.doc.getCamera(camObj.data!)!;
+    act(() => {
+      select(s, 'Camera');
+      // a 35 mm sensor: the widest angle converts back to 0.9999999999999986 mm
+      s.doc.updateBlockByKind('cameras', camObj.data!, { sensor_width: 35 });
+    });
+    expect(lensForFieldOfView(cameraFieldOfView({ lens: 1, sensor_width: 35 }), 35)).toBeLessThan(1);
+    typeNumber(byTestId(container, 'camera-fov')!, '179');
+    expect(cam().lens).toBe(LENS_MIN);
+    expect(lensForFieldOfViewClamped(Math.PI * 0.999, 35)).toBe(LENS_MIN);
+    expect(lensForFieldOfViewClamped(1e-9, 35)).toBe(LENS_MAX);
+    typeNumber(byTestId(container, 'camera-lens')!, '0.5');
+    expect(cam().lens).toBe(1);
+
+    // the clip range stays valid (clip_end > clip_start) from either side
+    typeNumber(byTestId(container, 'camera-clip-end')!, '0.05');
+    expect(cam().clip_end).toBeGreaterThan(cam().clip_start);
+    expect(cam().clip_end).toBeCloseTo(0.1, 6);
+    typeNumber(byTestId(container, 'camera-clip-end')!, '50');
+    typeNumber(byTestId(container, 'camera-clip-start')!, '80');
+    expect(cam().clip_start).toBeLessThan(cam().clip_end);
+    expect(cam().clip_start).toBeCloseTo(50, 6);
+    expect(errors().slice(before)).toEqual([]);
   });
 });
 

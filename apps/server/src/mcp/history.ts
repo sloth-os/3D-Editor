@@ -29,12 +29,15 @@ import * as Y from 'yjs';
  * Collecting means clearing `keep` on the deleted items of the dropped steps (only on them, not on
  * their parents, which other steps may still need) and running Yjs's garbage collection over those
  * items: their content is replaced by a deleted placeholder, the item structs (and their `redone`
- * links, which undo follows) stay. Deleted containers (nested Y.Maps such as objects) are never
- * collected, only the values below them: Yjs collects a container by replacing everything below it,
- * kept or not, with bare placeholders that drop the item structs, and undo and redo of any agent
- * follow `redone` links from the originals of restored items to their copies, which can sit below a
- * container another agent deleted (an undo then failed inside Yjs). A deleted container without
- * its values costs a few hundred bytes; the values (mesh blobs, attribute arrays) are the memory.
+ * links, which undo follows) stay. A deleted container (a nested Y.Map such as an object) is
+ * collected differently: Yjs replaces everything below it, kept or not, with bare placeholders
+ * without links. Undo and redo restore deleted items as copies and link each original to its copy
+ * (`redone`); undo and redo of every agent follow these links (to restore into a container's copy,
+ * to delete what a step created). So a deleted container is only collected when nothing below it
+ * is still kept by a step, is such a copy or has such a link; otherwise only the values below it
+ * are (an undo failed inside Yjs when a copy below a collected container was reached). The same
+ * protection applies to containers that changes no agent tracks delete (an editor), which Yjs
+ * would collect at once.
  */
 
 type StackItem = Y.UndoManager['undoStack'][number];
@@ -121,8 +124,65 @@ export function itemContentBytes(item: Y.Item): number {
   return 96; // types (their children are items of their own), formats, embeds, sub-documents
 }
 
-/** Deleted containers are never collected (see above): they stay kept, their values do not. */
 const isContainer = (item: Y.Item) => item.content instanceof Y.ContentType;
+
+type DeleteSet = StackItem['deletions'];
+
+/** Restored copies of each document: the insertions of the agents' undo and redo transactions. */
+const copiesByDoc = new WeakMap<Y.Doc, DeleteSet>();
+
+/** Records the items an undo or redo transaction created (copies the originals link to). */
+function recordCopies(tr: Y.Transaction): void {
+  const created = Y.createDeleteSet();
+  tr.afterState.forEach((end, client) => {
+    const start = tr.beforeState.get(client) ?? 0;
+    if (end > start)
+      (created.clients as Map<number, { clock: number; len: number }[]>).set(client, [
+        { clock: start, len: end - start },
+      ]);
+  });
+  if (!created.clients.size) return;
+  const prev = copiesByDoc.get(tr.doc);
+  copiesByDoc.set(tr.doc, prev ? Y.mergeDeleteSets([prev, created]) : created);
+}
+
+/** Whether any clock of `item` lies in `ds` (sorted, merged ranges). */
+function overlaps(ds: DeleteSet, item: Y.Item): boolean {
+  const ranges = ds.clients.get(item.id.client);
+  if (!ranges?.length) return false;
+  const end = item.id.clock + item.length;
+  let lo = 0;
+  let hi = ranges.length - 1;
+  let last = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ranges[mid].clock < end) {
+      last = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return last >= 0 && ranges[last].clock + ranges[last].len > item.id.clock;
+}
+
+/**
+ * Whether a deleted container can be collected (see above): it is no restored copy, and nothing
+ * below it is kept by a step, is a restored copy or links to one.
+ */
+function collectable(container: Y.Item, copies: DeleteSet | undefined): boolean {
+  if (copies && overlaps(copies, container)) return false;
+  const clean = (item: Y.Item): boolean =>
+    !item.keep &&
+    item.redone === null &&
+    !(copies && overlaps(copies, item)) &&
+    (!(item.content instanceof Y.ContentType) || below(item.content.type));
+  const below = (type: Y.AbstractType<any>): boolean => {
+    for (let item = type._start; item; item = item.right) if (!clean(item)) return false;
+    for (const last of type._map.values())
+      for (let item: Y.Item | null = last; item; item = item.left) if (!clean(item)) return false;
+    return true;
+  };
+  return below((container.content as Y.ContentType).type);
+}
 
 /** The live histories of each document (to tell changes some agent tracks from the others). */
 const histories = new WeakMap<Y.Doc, Set<AgentHistory>>();
@@ -195,24 +255,52 @@ export class AgentHistory {
   }
 
   private readonly onTransaction = (tr: Y.Transaction): void => {
+    if (tr.origin === this.undo && !tr.deleteSet.clients.size) recordCopies(tr);
     if (!tr.deleteSet.clients.size) return;
     if (tr.origin === this.origin) {
       if (!this.undo.undoing && !this.undo.redoing) this.pending.push(tr.deleteSet);
       return;
     }
-    // A change no agent history records (an editor, the REST API, storage) that deleted restored
-    // copies: Yjs keeps those from the moment undo or redo creates them, but no step can bring them
-    // back now. Un-keeping them here lets Yjs collect them right after this handler (the first
-    // history of the document does it). Containers stay, like everywhere here.
+    if (tr.origin === this.undo) {
+      recordCopies(tr);
+      // Undo / redo restored a copy into a container that is deleted by now: Yjs deletes the copy
+      // in the same transaction but keeps it, and records no step when nothing else changed, so
+      // nothing would ever release it. Copies created and deleted here are never restored.
+      Y.iterateDeletedStructs(tr, tr.deleteSet, (struct) => {
+        if (
+          struct instanceof Y.Item &&
+          struct.keep &&
+          !isContainer(struct) &&
+          struct.id.clock >= (tr.beforeState.get(struct.id.client) ?? 0)
+        ) {
+          struct.keep = false;
+          this.totals.released_items++;
+          this.totals.released_bytes += itemContentBytes(struct);
+        }
+      });
+      return;
+    }
+    // A change no agent history records (an editor, the REST API, storage), handled by the first
+    // history of the document, right before Yjs collects what the change deleted:
+    // - restored copies it deleted: Yjs keeps those from the moment undo or redo creates them, but
+    //   no step can bring them back now, so they are un-kept and collected;
+    // - containers it deleted that Yjs would collect at once although undo still needs what is
+    //   below them (see above) stay.
     const set = histories.get(this.doc);
     if (set?.values().next().value !== this || trackedByAgent(this.doc, tr.origin)) return;
+    const copies = copiesByDoc.get(this.doc);
+    const containers: Y.Item[] = [];
     Y.iterateDeletedStructs(tr, tr.deleteSet, (struct) => {
-      if (struct instanceof Y.Item && struct.keep && !isContainer(struct)) {
+      if (!(struct instanceof Y.Item)) return;
+      if (isContainer(struct)) {
+        if (!struct.keep) containers.push(struct);
+      } else if (struct.keep) {
         struct.keep = false;
         this.totals.released_items++;
         this.totals.released_bytes += itemContentBytes(struct);
       }
     });
+    for (const c of containers) if (!collectable(c, copies)) c.keep = true;
   };
 
   /**
@@ -228,16 +316,19 @@ export class AgentHistory {
     if (!s) return;
     let churn = 0;
     let churnBytes = 0;
+    const containers: Y.Item[] = [];
     this.doc.transact((tr) => {
       for (const ds of pending)
         Y.iterateDeletedStructs(tr, ds, (struct) => {
-          if (!(struct instanceof Y.Item) || !struct.keep || isContainer(struct)) return;
+          if (!(struct instanceof Y.Item) || !struct.keep) return;
           if (!Y.isDeleted(s.deletions, struct.id) || !coveredBy(s.insertions, struct)) return;
           struct.keep = false;
+          if (isContainer(struct)) containers.push(struct);
           churn++;
           churnBytes += itemContentBytes(struct);
         });
     }, GC_ORIGIN);
+    this.protect(containers);
     if (!churn) return;
     this.collect(Y.mergeDeleteSets(pending));
     this.sizes.delete(s);
@@ -336,17 +427,20 @@ export class AgentHistory {
     let kept = 0;
     let churn = 0;
     let churnBytes = 0;
+    const containers: Y.Item[] = [];
     this.doc.transact((tr) => {
       Y.iterateDeletedStructs(tr, s.deletions, (struct) => {
         if (!(struct instanceof Y.Item)) return;
         const bytes = itemContentBytes(struct);
-        if (struct.keep && !isContainer(struct) && coveredBy(s.insertions, struct)) {
+        if (struct.keep && coveredBy(s.insertions, struct)) {
           struct.keep = false;
+          if (isContainer(struct)) containers.push(struct);
           churn++;
           churnBytes += bytes;
         } else kept += bytes;
       });
     }, GC_ORIGIN);
+    this.protect(containers);
     if (churn) {
       this.collect(s.deletions);
       this.totals.released_items += churn;
@@ -355,29 +449,36 @@ export class AgentHistory {
     return kept;
   }
 
+  /** Containers just un-kept that cannot be collected yet (see above) stay kept. */
+  private protect(containers: Y.Item[]): void {
+    if (!containers.length) return;
+    const copies = copiesByDoc.get(this.doc);
+    for (const c of containers) if (!collectable(c, copies)) c.keep = true;
+  }
+
   /**
-   * Clears `keep` on the deleted values of dropped (or applied) steps and collects them. Deleted
-   * containers stay kept, also those Yjs un-kept itself when it dropped redo steps: collecting one
-   * would replace everything below it, including restored copies other steps link to.
+   * Clears `keep` on the deleted items of dropped (or applied) steps and collects them; containers
+   * only when collectable (also those Yjs un-kept itself when it dropped redo steps).
    */
   private release(steps: StackItem[]): void {
     if (!steps.length || this.doc.isDestroyed) return;
     let items = 0;
     let bytes = 0;
+    const containers: Y.Item[] = [];
     this.doc.transact((tr) => {
       for (const s of steps)
         Y.iterateDeletedStructs(tr, s.deletions, (struct) => {
           if (!(struct instanceof Y.Item)) return;
-          if (isContainer(struct)) {
-            struct.keep = true;
-            return;
-          }
+          if (isContainer(struct)) containers.push(struct);
           if (!struct.keep) return;
           bytes += itemContentBytes(struct);
           items++;
           struct.keep = false;
         });
     }, GC_ORIGIN);
+    // after every item of these steps is un-kept: what is below a container may be theirs
+    for (const c of containers) c.keep = false;
+    this.protect(containers);
     this.collect(Y.mergeDeleteSets(steps.map((s) => s.deletions)));
     this.totals.released_items += items;
     this.totals.released_bytes += bytes;

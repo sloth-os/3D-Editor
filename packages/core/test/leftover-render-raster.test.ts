@@ -74,13 +74,15 @@ describe('RASTER: view transform, film transparency, world background (phase 3 v
         vt,
         radiance.map((v) => v * 2 ** -0.5),
       );
-      for (let c = 0; c < 3; c++) expect(Math.abs(raster[c] - expected[c]), `${vt} channel ${c}`).toBeLessThanOrEqual(1);
+      for (let c = 0; c < 3; c++)
+        expect(Math.abs(raster[c] - expected[c]), `${vt} channel ${c}`).toBeLessThanOrEqual(1);
       const pt = px(
         renderSceneSoftware(doc, { width: 8, height: 8, engine: 'PATHTRACER', samples: 4, denoise: false }),
         4,
         4,
       );
-      for (let c = 0; c < 3; c++) expect(Math.abs(raster[c] - pt[c]), `${vt} vs path tracer`).toBeLessThanOrEqual(2);
+      for (let c = 0; c < 3; c++)
+        expect(Math.abs(raster[c] - pt[c]), `${vt} vs path tracer`).toBeLessThanOrEqual(2);
     }
     // ACES rolls the highlight off where Standard clips
     doc.updateRender({ view_transform: 'STANDARD', exposure: 0 });
@@ -133,7 +135,13 @@ describe('RASTER: view transform, film transparency, world background (phase 3 v
         const v = (x >> 1) % 2 ? 230 : 20;
         data.set([v, v, v, 255], (y * W + x) * 4);
       }
-    const image = doc.addImage({ name: 'Checker', mime: 'image/png', width: W, height: H, data: encodePNG({ width: W, height: H, data }) });
+    const image = doc.addImage({
+      name: 'Checker',
+      mime: 'image/png',
+      width: W,
+      height: H,
+      data: encodePNG({ width: W, height: H, data }),
+    });
     doc.updateWorld({
       environment: 'IMAGE',
       environment_image: image,
@@ -142,12 +150,23 @@ describe('RASTER: view transform, film transparency, world background (phase 3 v
     });
     doc.updateRender({ view_transform: 'STANDARD' });
     // 0.09° per render pixel, 0.7° per image pixel: every stripe spans about 15 pixels
-    const view = { position: [0, 0, 0] as [number, number, number], target: [0, 10, 0] as [number, number, number], fovY: 0.1 };
+    const view = {
+      position: [0, 0, 0] as [number, number, number],
+      target: [0, 10, 0] as [number, number, number],
+      fovY: 0.1,
+    };
     const raster = renderSceneSoftware(doc, { width: 64, height: 64, samples: 1, view });
     const row = Array.from({ length: 64 }, (_, x) => px(raster, x, 32)[0]);
     expect(Math.max(...row) - Math.min(...row)).toBeGreaterThan(150);
     // the same background as the path tracer's
-    const pt = renderSceneSoftware(doc, { width: 64, height: 64, engine: 'PATHTRACER', samples: 16, denoise: false, view });
+    const pt = renderSceneSoftware(doc, {
+      width: 64,
+      height: 64,
+      engine: 'PATHTRACER',
+      samples: 16,
+      denoise: false,
+      view,
+    });
     let diff = 0;
     for (let x = 0; x < 64; x++) diff += Math.abs(px(pt, x, 32)[0] - row[x]);
     expect(diff / 64).toBeLessThan(25);
@@ -189,7 +208,8 @@ describe('RASTER: glass (lighthouse-cove v2)', () => {
     // opaque white surface, a flat lit white)
     const unlit = renderSceneSoftware(doc(1, 0), { width: 32, height: 8, samples: 1 });
     for (const x of [2, 16, 29])
-      for (let c = 0; c < 3; c++) expect(Math.abs(px(glass, x, 4)[c] - px(unlit, x, 4)[c])).toBeLessThanOrEqual(3);
+      for (let c = 0; c < 3; c++)
+        expect(Math.abs(px(glass, x, 4)[c] - px(unlit, x, 4)[c])).toBeLessThanOrEqual(3);
     // while an opaque white emitter does
     const opaque = renderSceneSoftware(doc(0, 2), { width: 32, height: 8, samples: 1 });
     expect(px(opaque, 2, 4)[2] - px(glass, 2, 4)[2]).toBeGreaterThan(60);
@@ -197,7 +217,12 @@ describe('RASTER: glass (lighthouse-cove v2)', () => {
 
   it('keeps the mist of what is seen through distant glass (no second mist veil)', () => {
     const doc = SceneDoc.create({ empty: true });
-    doc.updateWorld({ environment: 'NONE', color: [0, 0, 0], mist_density: 0.01, mist_color: [0.8, 0.1, 0.1] });
+    doc.updateWorld({
+      environment: 'NONE',
+      color: [0, 0, 0],
+      mist_density: 0.01,
+      mist_color: [0.8, 0.1, 0.1],
+    });
     doc.updateRender({ view_transform: 'STANDARD' });
     doc.addObject({ type: 'LIGHT', name: 'Off', data: doc.addLight({ type: 'SUN', energy: 0 }) });
     const wall = (name: string, size: number, x: number, y: number, m: Partial<MaterialData>) =>
@@ -209,7 +234,13 @@ describe('RASTER: glass (lighthouse-cove v2)', () => {
         rotation_euler: [Math.PI / 2, 0, 0],
         material_slots: [doc.addMaterial({ name, ...m })],
       });
-    wall('Far', 400, 0, 150, { base_color: [0, 0, 0, 1], ior: 1, roughness: 1, emission_color: [1, 1, 1], emission_strength: 1 });
+    wall('Far', 400, 0, 150, {
+      base_color: [0, 0, 0, 1],
+      ior: 1,
+      roughness: 1,
+      emission_color: [1, 1, 1],
+      emission_strength: 1,
+    });
     // an index-matched pane 120 m away, itself 76 % in the mist
     wall('Pane', 40, -30, 120, { base_color: [1, 1, 1, 1], transmission: 1, roughness: 0, ior: 1 });
     const img = renderSceneSoftware(doc, {
@@ -220,6 +251,7 @@ describe('RASTER: glass (lighthouse-cove v2)', () => {
     });
     const around = px(img, 60, 16);
     const through = px(img, 20, 16);
-    for (let c = 0; c < 3; c++) expect(Math.abs(through[c] - around[c]), `channel ${c}`).toBeLessThanOrEqual(3);
+    for (let c = 0; c < 3; c++)
+      expect(Math.abs(through[c] - around[c]), `channel ${c}`).toBeLessThanOrEqual(3);
   });
 });

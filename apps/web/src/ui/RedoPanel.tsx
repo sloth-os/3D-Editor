@@ -167,6 +167,8 @@ export interface RedoForm {
   choices: Record<string, SchemaChoice[]>;
   /** Whether an object picker lists an object: never one the operator would reject. */
   objectFilter: (key: string, o: ObjectData) => boolean;
+  /** Labels of the empty choice of object pickers whose unset value means something else than none. */
+  emptyLabels: Record<string, string>;
 }
 
 /**
@@ -183,6 +185,7 @@ export function redoForm(doc: SceneDoc, last: LastOperator): RedoForm {
   const exclude = [...HIDDEN, ...(HIDDEN_BY_OPERATOR[last.id] ?? [])];
   const objectKeys: string[] = [];
   const choices: Record<string, SchemaChoice[]> = {};
+  const emptyLabels: Record<string, string> = {};
   const created = new Set(last.created);
   const rules: ((key: string, o: ObjectData) => boolean)[] = [(_k, o) => !created.has(o.id)];
   const resolveId = (ref: unknown) => {
@@ -229,6 +232,13 @@ export function redoForm(doc: SceneDoc, last: LastOperator): RedoForm {
       const b = k === 'target' || k === 'pole_target' ? bone[k] : null;
       return !b || boneNames(doc, o).includes(b);
     });
+    if (last.id !== 'pose.constraint_set') {
+      // Add IK / Add Bone Constraint: a bone without a target object is a bone of the constrained
+      // armature itself, not "none" (Set Bone Constraint's empty choice does remove the target)
+      const owner = objectOrActive(doc, last, params.object);
+      const self = `This armature${owner ? ` (${owner.name})` : ''}`;
+      for (const k of ['target', 'pole_target'] as const) if (bone[k]) emptyLabels[k] = self;
+    }
   }
 
   if (last.id === 'anim.turntable') {
@@ -247,7 +257,14 @@ export function redoForm(doc: SceneDoc, last: LastOperator): RedoForm {
     rules.push((k, o) => k !== 'target' || o.id !== only);
   }
 
-  return { values, exclude, objectKeys, choices, objectFilter: (k, o) => rules.every((r) => r(k, o)) };
+  return {
+    values,
+    exclude,
+    objectKeys,
+    choices,
+    objectFilter: (k, o) => rules.every((r) => r(k, o)),
+    emptyLabels,
+  };
 }
 
 /**
@@ -318,6 +335,7 @@ export function RedoPanel({ s }: { s: ProjectSession }) {
             objectKeys={form.objectKeys}
             choices={form.choices}
             objectFilter={form.objectFilter}
+            emptyLabels={form.emptyLabels}
             testIdPrefix="redo"
             onChange={(k, v, final) => {
               if (!final) return;

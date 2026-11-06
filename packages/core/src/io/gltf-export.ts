@@ -74,7 +74,9 @@ import { encodePNG, type PNGImage } from '../render/png';
  * - Deformation:
  *   - shape keys of a mesh without modifiers → morph targets (POSITION and NORMAL deltas) with the
  *     key values as default weights (extras.targetNames holds the key names);
- *   - a mesh whose only modifier is an Armature modifier on an exported armature → a glTF skin:
+ *   - a mesh whose only modifier is an Armature modifier on an exported armature (without Apply
+ *     Modifiers: whose first enabled Armature modifier uses an exported armature; the other
+ *     modifiers are left out like every modifier then) → a glTF skin:
  *     joints = the deform bones' nodes, inverse bind matrices from the rest pose, JOINTS_0 and
  *     WEIGHTS_0 from the vertex groups (or bone envelopes; at most 4 influences per vertex). The
  *     mesh node is a root node with an identity transform and its vertices are the rest-pose mesh
@@ -89,7 +91,9 @@ import { encodePNG, type PNGImage } from '../render/png';
  *   scene fps (LINEAR): node translation/rotation/scale wherever an object's or a bone's transform
  *   relative to its exported parent changes (keyframes, drivers, constraints, IK, physics …;
  *   rotations as normalized, sign-continuous quaternions) and morph target weights (shape key values,
- *   baked deformation).
+ *   baked deformation). Animated camera, light and material properties and the world are not
+ *   exported (they would need KHR_animation_pointer; glTF has no world): a warning names the
+ *   properties whose values change over the frame range, and the file keeps the export frame's.
  * - Procedural texture slots are baked to PNG images in UV space (bake-procedural.ts); materials
  *   whose bake depends on the geometry (GENERATED/OBJECT mapping, bump) get one glTF material per
  *   distinct mesh content (identical meshes share one bake). A mesh without UVs whose material has
@@ -317,7 +321,11 @@ class GltfWriter {
 
 /** Most influences (joints) per vertex of a skinned mesh (JOINTS_0 / WEIGHTS_0). */
 const MAX_INFLUENCES = 4;
-/** Budget of baked deformation morph targets (floats of POSITION + NORMAL deltas, all meshes). */
+/**
+ * Budget of baked deformation morph targets: floats of their POSITION + NORMAL deltas, all meshes
+ * (per written vertex: meshes are written with their vertices split at flat faces, sharp edges and
+ * UV seams, so a flat-shaded grid has about four per mesh vertex).
+ */
 const MAX_BAKED_FLOATS = 12_000_000;
 /** Most frames sampled for the animation. */
 const MAX_FRAMES = 10000;
@@ -551,6 +559,51 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
   /** Per-frame evaluated meshes of statically planned meshes that deform (baking candidates). */
   const deformations = new Map<ExportItem, (MeshData | null)[]>();
   const bindRelation = new Map<ExportItem, Mat4>();
+  /**
+   * Datablocks with F-curves or drivers whose animation glTF cannot carry (without
+   * KHR_animation_pointer): camera and light data, materials and the world, as 'type:id'.
+   */
+  const animatedData = new Set<string>();
+  const unexportable = (type: string) =>
+    type === 'camera' || type === 'light' || type === 'material' || type === 'world';
+  for (const fc of doc.listFCurves())
+    if (!fc.mute && fc.keyframes.length && unexportable(fc.target_type))
+      animatedData.add(`${fc.target_type}:${fc.target_id}`);
+  for (const d of doc.listDrivers())
+    if (!d.mute && unexportable(d.target_type)) animatedData.add(`${d.target_type}:${d.target_id}`);
+  /** Properties whose value at some frame differs from the export frame's, per datablock label. */
+  const unexported = new Map<string, Set<string>>();
+  const noteChanges = (label: string, at: object | null | undefined, now: object | null | undefined) => {
+    if (!at || !now || at === now) return;
+    const a = at as Record<string, unknown>;
+    const b = now as Record<string, unknown>;
+    for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      if (a[k] === b[k] || stableStringify(a[k]) === stableStringify(b[k])) continue;
+      let keys = unexported.get(label);
+      if (!keys) unexported.set(label, (keys = new Set()));
+      keys.add(k);
+    }
+  };
+  /** Compares the animated cameras, lights, materials and world of an evaluated frame. */
+  const noteUnexportedAnimation = (sc: EvaluatedScene) => {
+    const seen = new Set<string>();
+    for (const it of items) {
+      if (it.instance) continue;
+      const ev = sc.byId.get(it.ev.id);
+      if (!ev) continue;
+      const dataId = it.ev.data.data;
+      if (dataId && it.ev.camera && animatedData.has(`camera:${dataId}`))
+        noteChanges(`Camera '${it.ev.name}'`, it.ev.camera, ev.camera);
+      if (dataId && it.ev.light && animatedData.has(`light:${dataId}`))
+        noteChanges(`Light '${it.ev.name}'`, it.ev.light, ev.light);
+      it.ev.materials.forEach((m, slot) => {
+        if (!m || seen.has(m.id) || !animatedData.has(`material:${m.id}`)) return;
+        seen.add(m.id);
+        noteChanges(`Material '${m.name}'`, m, ev.materials[slot]);
+      });
+    }
+    if ([...animatedData].some((k) => k.startsWith('world:'))) noteChanges('World', scene.world, sc.world);
+  };
   if (frames.length) {
     for (const n of order) {
       if (n.identity || n.fixed) continue;
@@ -571,6 +624,7 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     const prevQ = new Map<XNode, Quat>();
     frames.forEach((f, fi) => {
       const sc = f === scene.frame ? scene : evaluator.evaluate(f, { forRender: true });
+      if (animatedData.size) noteUnexportedAnimation(sc);
       for (const [n, tr] of tracks) {
         const m = gltfLocal(n, sc) ?? gltfLocal(n, scene);
         const trs = m
@@ -629,6 +683,14 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
         list[fi] = mesh;
       }
     });
+  }
+  for (const [label, keys] of unexported) {
+    const props = [...keys].join(', ');
+    warn(
+      label === 'World'
+        ? `World: the animation of ${props} is not exported (glTF has no world or environment)`
+        : `${label}: the animation of ${props} is not exported (glTF animates node transforms, morph target weights and skins; camera, light and material properties would need KHR_animation_pointer, which is not written), so the file keeps their values at frame ${scene.frame}`,
+    );
   }
   /** Nodes whose transform changes over the animation (get channels; others are static). */
   const moving = new Set<XNode>();
@@ -917,12 +979,19 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     if (!g) m.set(variant, (g = build()));
     return g;
   };
+  /** Render buffers (the vertices written: split at flat faces, sharp edges and UV seams) per mesh. */
+  const renderBuffers = new Map<MeshData, RenderBuffers>();
+  const renderBuffersOf = (mesh: MeshData): RenderBuffers => {
+    let rb = renderBuffers.get(mesh);
+    if (!rb) renderBuffers.set(mesh, (rb = buildRenderBuffers(mesh)));
+    return rb;
+  };
   /**
    * Writes the vertex attributes and per-material indices of a mesh. `xf`: matrix applied to the
    * positions (and its normal matrix to the normals) before the Y-up conversion (skins: to world).
    */
   const writeGeometry = (mesh: MeshData, xf: Mat4 | null, withLines: boolean): Geometry => {
-    const rb = mesh.faces.length ? buildRenderBuffers(mesh) : null;
+    const rb = mesh.faces.length ? renderBuffersOf(mesh) : null;
     const g: Geometry = { rb, attributes: {}, groups: [], lines: null, targets: [], targetNames: [] };
     if (rb && rb.indices.length) {
       const nv = rb.positions.length / 3;
@@ -1036,7 +1105,6 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     XNode,
     { item: ExportItem; count: number; values: Float32Array; baked: boolean }
   >();
-  const bakedPlan = planBakes(deformations, frames, plans, warn);
   /** Generated UVs per source mesh (procedural textures on meshes without UVs). */
   const generatedUv = new Map<MeshData, MeshData>();
   const withGeneratedUvs = (mesh: MeshData): MeshData => {
@@ -1047,18 +1115,28 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     }
     return g;
   };
+  /**
+   * The mesh written for an item, and the materials it generated UVs for: position-dependent
+   * (GENERATED/OBJECT) procedural textures need UVs to be baked into, so a mesh without UVs gets
+   * them (Smart UV Project); UV-mapped ones show a constant on a mesh without UVs, like in the
+   * renderers, and need none.
+   */
+  const writtenMesh = (it: ExportItem): { mesh: MeshData; needing: (MaterialData | null)[] } => {
+    const mesh = plans.get(it)!.mesh;
+    const needing =
+      mesh.uvs || !mesh.faces.length ? [] : it.materials.filter((m) => !!proceduralSurface(m)?.usesObject);
+    return { mesh: needing.length ? withGeneratedUvs(mesh) : mesh, needing };
+  };
+  const bakedPlan = planBakes(deformations, frames, plans, warn, (it) => {
+    const { mesh } = writtenMesh(it);
+    return mesh.faces.length ? renderBuffersOf(mesh).positions.length / 3 : 0;
+  });
   const exportMesh = (n: XNode): number | undefined => {
     const it = n.item!;
     const plan = plans.get(it)!;
-    let mesh = plan.mesh;
-    // position-dependent (GENERATED/OBJECT) procedural textures need UVs to be baked into: generate
-    // them (Smart UV Project); UV-mapped ones show a constant on a mesh without UVs, like in the
-    // renderers, and need none
-    const needing =
-      mesh.uvs || !mesh.faces.length ? [] : it.materials.filter((m) => !!proceduralSurface(m)?.usesObject);
+    const { mesh, needing } = writtenMesh(it);
     const generatedUvs = needing.length > 0;
     if (generatedUvs) {
-      mesh = withGeneratedUvs(mesh);
       warn(
         `Mesh '${it.ev.name}' has no UVs: generated UVs (Smart UV Project) to bake the procedural textures of ${needing
           .map((m) => `'${m!.name}'`)
@@ -1491,6 +1569,16 @@ function planMesh(
   const keys = (fs.get<{ shape_keys: ShapeKeyData[] }>('mesh', meshId)?.shape_keys ?? []).filter(
     (k) => decodeFloat32(k.data).length === n,
   );
+  if (!applyModifiers) {
+    // the modifiers are not applied (the base mesh is written), but an Armature modifier is a
+    // skin, not geometry: like Blender's exporter, the mesh keeps it (the first enabled Armature
+    // modifier whose armature is exported)
+    for (const m of ev.data.modifiers) {
+      if (m.type !== 'ARMATURE' || !isModifierEnabled(m, MODIFIER_FLAGS)) continue;
+      const arm = armaturePlan(doc, m, itemById);
+      if (arm) return { mode: 'skin', mesh: basis, keys, meshId, skin: arm };
+    }
+  }
   const mods = applyModifiers ? ev.data.modifiers.filter((m) => isModifierEnabled(m, MODIFIER_FLAGS)) : [];
   if (!mods.length) {
     if (keys.length) return { mode: 'morph', mesh: basis, keys, meshId };
@@ -1568,18 +1656,23 @@ interface BakePlan {
 
 /**
  * Which frames of the deforming meshes become morph targets: every frame within the budget (one
- * target per frame), else every k-th frame. Weights: target i is 1 at its frame.
+ * target per frame), else every k-th frame. Weights: target i is 1 at its frame. `writtenVertices`:
+ * the number of vertices written for an item's mesh (the size of each of its targets).
  */
 function planBakes(
   deformations: Map<ExportItem, (MeshData | null)[]>,
   frames: number[],
   plans: Map<ExportItem, MeshPlan>,
   warn: (msg: string) => void,
+  writtenVertices: (it: ExportItem) => number,
 ): Map<ExportItem, BakePlan> {
   const out = new Map<ExportItem, BakePlan>();
-  let total = 0;
-  for (const [it] of deformations) total += plans.get(it)!.mesh.positions.length * 2 * frames.length;
-  const step = Math.max(1, Math.ceil(total / MAX_BAKED_FLOATS));
+  // POSITION + NORMAL deltas (3 floats each) per written vertex, of one frame of every mesh
+  let perFrame = 0;
+  for (const [it] of deformations) perFrame += writtenVertices(it) * 6;
+  // every step-th frame and the last one: at most `maxTargets` targets (at least the first and last)
+  const maxTargets = Math.max(2, Math.floor(MAX_BAKED_FLOATS / Math.max(1, perFrame)));
+  const step = frames.length <= maxTargets ? 1 : Math.ceil((frames.length - 1) / (maxTargets - 1));
   for (const [it] of deformations) {
     const plan = plans.get(it)!;
     if (plan.why === 'topology') continue;
@@ -1592,10 +1685,18 @@ function planBakes(
     out.set(it, { frames: picked, weights });
     warn(
       `Mesh '${it.ev.name}' deforms during the animation (${plan.why ?? 'modifiers'}): baked as ${k} morph targets` +
-        (step > 1 ? ` (every ${step}th frame, to keep the file small)` : ''),
+        (step > 1 ? ` (every ${ordinal(step)} frame, to keep the file small)` : ''),
     );
   }
   return out;
+}
+
+/** 2 → '2nd', 11 → '11th', 23 → '23rd'. */
+function ordinal(n: number): string {
+  const tens = n % 100;
+  const suffix =
+    tens >= 11 && tens <= 13 ? 'th' : n % 10 === 1 ? 'st' : n % 10 === 2 ? 'nd' : n % 10 === 3 ? 'rd' : 'th';
+  return `${n}${suffix}`;
 }
 
 function samePositions(a: MeshData, b: MeshData): boolean {

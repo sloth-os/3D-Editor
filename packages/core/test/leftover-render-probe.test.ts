@@ -46,7 +46,10 @@ function denseScene(metallic: number): SceneDoc {
   return doc;
 }
 
-const VIEW = { position: [4, -6, 3] as [number, number, number], target: [0, 0, 1] as [number, number, number] };
+const VIEW = {
+  position: [4, -6, 3] as [number, number, number],
+  target: [0, 0, 1] as [number, number, number],
+};
 
 /** Triangles the rasterizers iterate for one 320 × 180 render. */
 function trianglesOfRender(doc: SceneDoc): number {
@@ -102,14 +105,21 @@ describe('RASTER reflection probe on dense meshes', () => {
       const r = Math.hypot(lod.positions[i * 3], lod.positions[i * 3 + 1], lod.positions[i * 3 + 2]);
       expect(r).toBeGreaterThan(0.95);
       expect(r).toBeLessThan(1.0001);
-      expect(Math.hypot(lod.normals[i * 3], lod.normals[i * 3 + 1], lod.normals[i * 3 + 2])).toBeCloseTo(1, 5);
+      expect(Math.hypot(lod.normals[i * 3], lod.normals[i * 3 + 1], lod.normals[i * 3 + 2])).toBeCloseTo(
+        1,
+        5,
+      );
     }
     for (let i = 0; i < lod.indices.length; i++) expect(lod.indices[i]).toBeLessThan(nv);
   });
 
   it('draws the proxy in small images like the full mesh', () => {
     const mesh = createUVSphere({ segments: 256, ring_count: 256, radius: 1 });
-    const view = viewFromSpec({ position: [0, -4, 0], target: [0, 0, 0], up: [0, 0, 1], fovY: Math.PI / 2 }, 1, null);
+    const view = viewFromSpec(
+      { position: [0, -4, 0], target: [0, 0, 0], up: [0, 0, 1], fovY: Math.PI / 2 },
+      1,
+      null,
+    );
     const draw = (lodCells: number) => {
       const ras = new Rasterizer(32, 32, view);
       ras.mode = SHADE_MATERIAL;

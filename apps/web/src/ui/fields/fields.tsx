@@ -25,6 +25,12 @@ export function evalExpression(s: string): number | null {
   }
 }
 
+/**
+ * Animation state of a field, coloured like Blender: on a keyframe (yellow), animated between
+ * keyframes (green), set by a driver (purple).
+ */
+export type FieldState = 'keyed' | 'animated' | 'driven';
+
 export interface NumberFieldProps {
   value: number;
   onChange: (v: number, final: boolean) => void;
@@ -40,7 +46,7 @@ export interface NumberFieldProps {
   /** Display transform (e.g. radians → degrees). */
   toDisplay?: (v: number) => number;
   fromDisplay?: (v: number) => number;
-  state?: 'keyed' | 'animated' | null;
+  state?: FieldState | null;
   testId?: string;
   title?: string;
   /**
@@ -164,7 +170,7 @@ export function VectorField(p: {
   fromDisplay?: (v: number) => number;
   min?: number;
   max?: number;
-  states?: ('keyed' | 'animated' | null)[];
+  states?: (FieldState | null)[];
   testId?: string;
   /** Text shown for components that are not finite numbers (see {@link NumberFieldProps}). */
   placeholder?: string;

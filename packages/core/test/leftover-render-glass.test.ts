@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { SceneDoc, createCube, createPlane, createUVSphere, type MaterialData } from '../src';
-import { PrincipledBSDF, fresnelDielectric, thinTransmittance, type BSDFInputs } from '../src/render/pathtrace';
+import {
+  PrincipledBSDF,
+  fresnelDielectric,
+  thinTransmittance,
+  type BSDFInputs,
+} from '../src/render/pathtrace';
 import { mean, topCamera, traceLinear } from './pathtrace-helpers';
 
 /*
@@ -190,8 +195,7 @@ describe('path tracer: light through glass (lighthouse-cove v2)', () => {
       b.setup(inputs, Math.sqrt(1 - mu * mu), 0, mu, false, 0, true);
       let t = 0;
       const n = 4000;
-      for (let i = 0; i < n; i++)
-        if (b.sample(0.5, 0.5, (i + 0.5) / n) && b.sampledDelta) t += b.fR / b.pdf;
+      for (let i = 0; i < n; i++) if (b.sample(0.5, 0.5, (i + 0.5) / n) && b.sampledDelta) t += b.fR / b.pdf;
       expect(t / n).toBeCloseTo(k, 2);
     }
     thinTransmittance({ ...inputs, transmission: 0 }, 1, true, out);

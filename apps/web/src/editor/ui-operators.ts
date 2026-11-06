@@ -10,6 +10,7 @@ import { shareLink } from '../project/manager';
 import { nearestEdge, projectEditVerts } from '../viewport/picking';
 import { takePendingStroke } from '../viewport/interaction';
 import { telemetry } from '../telemetry/telemetry';
+import { lastRepeat, repeatLast, runOperator } from './runner';
 
 function engine() {
   const e = viewport.engine;
@@ -55,6 +56,25 @@ export function registerUiOperators(reg: OperatorRegistry): void {
         telemetry.count('editor.redo', 1, {
           'undo.operator': String(item?.meta.get('operator') ?? 'unknown'),
         });
+      },
+    }),
+  );
+  reg.register(
+    defineOperator({
+      id: 'screen.repeat_last',
+      label: 'Repeat Last',
+      description:
+        'Run the last operation again as a new step with the same settings, on the current selection ' +
+        '(Shift+R): after Duplicate and Move it duplicates and moves once more, after Add Cube it adds another.',
+      category: 'Edit',
+      ...ui,
+      schema: z.object({}),
+      poll: () => (lastRepeat.value ? true : 'Nothing to repeat'),
+      execute(ctx) {
+        const action = lastRepeat.value!;
+        const res = repeatLast(session.value!, reg, ctx.source);
+        // a failing step reported why itself
+        return { repeated: action.label, ok: !!res?.ok, ...(res?.ok ? {} : { error: res?.error }) };
       },
     }),
   );
@@ -320,24 +340,40 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       description: 'Start an interactive move/rotate/scale (G/R/S).',
       category: 'Transform',
       ...ui,
-      schema: z.object({ mode: z.enum(['translate', 'rotate', 'resize']) }),
+      schema: z.object({
+        mode: z.enum(['translate', 'rotate', 'resize']),
+        continue_last: z
+          .boolean()
+          .default(false)
+          .describe(
+            'The transform completes the operation that ran just before it (Extrude and Move, Duplicate ' +
+              'and Move): Repeat Last (Shift+R) repeats that operation and this transform together',
+          ),
+      }),
       execute(_ctx, p) {
-        viewport.interaction?.startModal(p.mode);
+        viewport.interaction?.startModal(p.mode, p.continue_last ? lastRepeat.value : null);
       },
     }),
   );
   reg.register(
     defineOperator({
       id: 'object.duplicate_move',
-      label: 'Duplicate',
-      description: 'Duplicate the selection and move it interactively (Shift+D / Alt+D linked).',
+      label: 'Duplicate Objects',
+      description:
+        'Duplicate the selection and move the copies interactively (Shift+D / Alt+D linked). Repeat Last ' +
+        '(Shift+R) duplicates the copies and moves them by the same offset.',
       category: 'Object',
-      uiOnly: true,
+      ...ui,
       schema: z.object({ linked: z.boolean().default(false) }),
+      poll: (ctx) => reg.poll(ctx, 'object.duplicate'),
       execute(ctx, p) {
-        const r = registry.run(ctx, 'object.duplicate', { linked: p.linked });
-        if (!r.ok) throw new Error(r.error);
-        setTimeout(() => viewport.interaction?.startModal('translate'), 0);
+        // a step of its own (undo, Adjust Last Operation, Repeat Last), which the move continues
+        const r = runOperator(session.value!, reg, 'object.duplicate', { linked: p.linked }, ctx.source);
+        // a failure was reported by the run
+        if (!r.ok) return { ok: false, error: r.error };
+        const action = lastRepeat.value;
+        setTimeout(() => viewport.interaction?.startModal('translate', action), 0);
+        return r.result;
       },
     }),
   );

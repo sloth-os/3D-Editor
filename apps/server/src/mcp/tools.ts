@@ -385,12 +385,16 @@ function decodeRenderResult(
  * Serializes the name checks of create_project / rename_project with the change they guard, per
  * server (every MCP session has its own tools), so two agents cannot take the same name at once.
  */
-const projectNameLocks = new WeakMap<RoomManager, Promise<unknown>>();
+const projectNameLocks = new WeakMap<RoomManager, Promise<void>>();
 function withProjectNames<T>(rooms: RoomManager, fn: () => Promise<T>): Promise<T> {
   const run = (projectNameLocks.get(rooms) ?? Promise.resolve()).then(fn);
+  // the chain must not hold the result (a created room would stay reachable after its deletion)
   projectNameLocks.set(
     rooms,
-    run.catch(() => undefined),
+    run.then(
+      () => undefined,
+      () => undefined,
+    ),
   );
   return run;
 }

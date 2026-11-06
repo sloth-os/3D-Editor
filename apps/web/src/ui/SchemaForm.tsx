@@ -160,6 +160,11 @@ export function SchemaForm(p: {
    * fitting type), e.g. to leave out objects the operator would reject for it.
    */
   objectFilter?: (key: string, object: ObjectData) => boolean;
+  /**
+   * Label of the empty choice of an optional object picker (default "— none —"): what the operator
+   * uses when the parameter is left unset, e.g. "This armature" for a bone target.
+   */
+  emptyLabels?: Record<string, string>;
 }) {
   const schema = p.schema as JsonSchema;
   const objectKeys = new Set([...OBJECT_REF_KEYS, ...(p.objectKeys ?? [])]);
@@ -238,7 +243,7 @@ export function SchemaForm(p: {
                 title={s.description}
                 options={[
                   ...(optional || !selected
-                    ? [{ value: '', label: optional ? '— none —' : '— choose —' }]
+                    ? [{ value: '', label: optional ? (p.emptyLabels?.[key] ?? '— none —') : '— choose —' }]
                     : []),
                   ...objs.map((o) => ({ value: o.id, label: o.name })),
                   ...(stored && !match

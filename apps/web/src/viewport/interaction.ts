@@ -18,6 +18,7 @@ import { clonePose, poseBasis } from './navigation';
 import { nearestEdge, nearestVertex, objectsInRect, pickFace, pickObject, projectEditVerts } from './picking';
 import { prefs } from '../app/prefs';
 import { telemetry } from '../telemetry/telemetry';
+import { continueRepeat, type RepeatAction } from '../editor/runner';
 import { BrushStroke } from './brush';
 
 export interface InteractionHost {
@@ -175,7 +176,15 @@ export class ViewportInteraction {
 
   // ------------------------------------------------------------------ modal transforms
 
-  startModal(kind: ModalKind): void {
+  /** The action the running modal transform completes (see {@link startModal}). */
+  private modalContinues: RepeatAction | null = null;
+
+  /**
+   * Starts an interactive G / R / S transform. `continues`: the operation it completes (the
+   * duplicate of Duplicate and Move, the extrusion of Extrude and Move), which Repeat Last (Shift+R)
+   * then repeats together with the confirmed transform, like Blender's macros.
+   */
+  startModal(kind: ModalKind, continues: RepeatAction | null = null): void {
     if (this.modal) return;
     const st = this.session.state;
     if (st.mode !== 'OBJECT' && st.mode !== 'EDIT') return;
@@ -185,6 +194,7 @@ export class ViewportInteraction {
       return;
     }
     this.modal = m;
+    this.modalContinues = continues;
     this.el.focus();
     telemetry.count('editor.modal.started', 1, { kind });
   }
@@ -192,10 +202,15 @@ export class ViewportInteraction {
   finishModal(confirm: boolean): void {
     const m = this.modal;
     if (!m) return;
+    const continues = this.modalContinues;
     this.modal = null;
+    this.modalContinues = null;
     const res = m.finish(confirm);
     telemetry.count('editor.modal.finished', 1, { kind: m.kind, confirmed: confirm });
-    if (res) this.host.run(res.operator, res.params, 'hotkey');
+    if (res) {
+      continueRepeat(continues);
+      this.host.run(res.operator, res.params, 'hotkey');
+    }
   }
 
   /** Keys while a modal transform runs. Returns true if handled. */

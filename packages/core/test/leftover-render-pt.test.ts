@@ -22,7 +22,13 @@ function blackWorld(): SceneDoc {
   return doc;
 }
 
-function plane(doc: SceneDoc, name: string, size: number, material: Partial<MaterialData>, z: number): string {
+function plane(
+  doc: SceneDoc,
+  name: string,
+  size: number,
+  material: Partial<MaterialData>,
+  z: number,
+): string {
   return doc.addObject({
     type: 'MESH',
     name,
@@ -102,13 +108,21 @@ describe('path tracer: mist through glass (lighthouse-cove v2)', () => {
         material_slots: [doc.addMaterial({ name, ...m })],
       });
     wall('Far', 400, 0, 150, glow([1, 1, 1]));
-    const pane = { base_color: [1, 1, 1, 1] as [number, number, number, number], transmission: 1, roughness: 0 };
+    const pane = {
+      base_color: [1, 1, 1, 1] as [number, number, number, number],
+      transmission: 1,
+      roughness: 0,
+    };
     wall('Matched', 1.6 * (paneDistance / 5), -1.2 * (paneDistance / 5), paneDistance, { ...pane, ior: 1 });
     wall('Glass', 1.6 * (paneDistance / 5), 1.2 * (paneDistance / 5), paneDistance, { ...pane, ior: 1.45 });
     return doc;
   }
 
-  const view = { position: [0, 0, 0] as [number, number, number], target: [0, 10, 0] as [number, number, number], fovY: 0.66 };
+  const view = {
+    position: [0, 0, 0] as [number, number, number],
+    target: [0, 10, 0] as [number, number, number],
+    fovY: 0.66,
+  };
 
   it('keeps the mist of what is seen through glass (like the rasterizer)', () => {
     for (const distance of [5, 120]) {
@@ -122,7 +136,9 @@ describe('path tracer: mist through glass (lighthouse-cove v2)', () => {
       expect(around[1]).toBeCloseTo(1 - m + 0.1 * m, 2);
       for (let c = 0; c < 3; c++) {
         // index-matched glass is invisible, mist included
-        expect(Math.abs(matched[c] / around[c] - 1), `IOR 1 at ${distance} m, channel ${c}`).toBeLessThan(0.01);
+        expect(Math.abs(matched[c] / around[c] - 1), `IOR 1 at ${distance} m, channel ${c}`).toBeLessThan(
+          0.01,
+        );
         // glass dims the view by its two Fresnel reflections at most
         expect(glass[c] / around[c], `IOR 1.45 at ${distance} m, channel ${c}`).toBeGreaterThan(0.9);
         expect(glass[c] / around[c], `IOR 1.45 at ${distance} m, channel ${c}`).toBeLessThan(1.02);
@@ -148,7 +164,12 @@ describe('path tracer: warnings name the objects (clockwork-orrery v2)', () => {
     // a linked duplicate shares the mesh: counted once, named with it
     doc.addObject({ type: 'MESH', name: 'Motto Plate.001', data: plate, location: [0, 3, 0] });
     doc.addObject({ type: 'MESH', name: 'Gear', data: doc.addMesh('Gear', sliver()), location: [3, 0, 0] });
-    doc.addObject({ type: 'MESH', name: 'Clean', data: doc.addMesh('Clean', createPlane()), location: [6, 0, 0] });
+    doc.addObject({
+      type: 'MESH',
+      name: 'Clean',
+      data: doc.addMesh('Clean', createPlane()),
+      location: [6, 0, 0],
+    });
     const scene = new SceneEvaluator(doc).evaluate(1, { forRender: true });
     const items = renderItems(scene, { forRender: true });
     const view = resolveView(doc, scene, { width: 32, height: 24 }, 32 / 24, evaluatedBounds(items));

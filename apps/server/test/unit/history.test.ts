@@ -404,4 +404,158 @@ describe('AgentHistory', () => {
     expect(retained(doc).items).toBe(0);
     expect(history.undo.undoStack.length).toBe(1);
   });
+
+  it('collects the steps undo discards without an event (nothing left to change)', () => {
+    const { doc, mesh, history, step, set } = setup();
+    step(() => set('data', blob(1)));
+    step(() => set('data', blob(2))); // keeps version 1 to undo this
+    doc.transact(() => mesh.set('data', blob(3)), { type: 'remote' });
+    // version 1 cannot come back over the other user's change: Yjs discards both steps silently
+    history.undo.undo();
+    history.maintain();
+    expect(tagOf(mesh.get('data'))).toBe(3);
+    expect(history.undo.undoStack.length).toBe(0);
+    expect(retained(doc).items).toBe(0);
+  });
+
+  it('collects copies that undo restored into a container that is deleted by then', () => {
+    const { doc, mesh, history, step } = setup();
+    const t = (fn: () => void) => step(() => doc.transact(fn, ORIGIN));
+    t(() => {
+      const obj = new Y.Map<any>();
+      mesh.set('object', obj);
+      obj.set('data', blob(1));
+    });
+    t(() => mesh.get('object').set('data', blob(2))); // keeps version 1
+    t(() => mesh.delete('object')); // keeps the object and version 2
+    history.undo.undo(); // the object and version 2 come back as copies
+    expect(tagOf(mesh.get('object').get('data'))).toBe(2);
+    doc.transact(() => mesh.delete('object'), { type: 'remote' }); // someone deletes the copy
+    // undo of version 2 restores version 1 into the deleted copy: Yjs deletes it at once, keeps it
+    // and records no step, so nothing would ever release it
+    history.undo.undo();
+    history.maintain();
+    expect(mesh.get('object')).toBeUndefined();
+    history.destroy();
+    expect(retained(doc)).toEqual({ items: 0, bytes: 0 });
+  });
+
+  it('collects restored copies that a change no agent tracks deletes', () => {
+    const { doc, mesh, history, step, set } = setup();
+    step(() => set('data', blob(1)));
+    step(() => set('data', blob(2)));
+    history.undo.undo(); // version 1 comes back as a copy, which Yjs keeps from the start
+    expect(tagOf(mesh.get('data'))).toBe(1);
+    doc.transact(() => mesh.set('data', blob(3)), { type: 'remote' }); // an editor replaces it
+    history.maintain();
+    // only version 2 (needed to redo) is kept; the copy of version 1 is collected
+    expect(retained(doc).items).toBe(1);
+    history.undo.redo(); // conflicts with the editor's change: nothing to redo
+    expect(tagOf(mesh.get('data'))).toBe(3);
+    history.destroy();
+    expect(retained(doc).items).toBe(0);
+  });
+
+  it('never fails inside Yjs and keeps nothing once every history ended (1-3 agents, editors, random)', () => {
+    for (let seed = 1; seed <= 60; seed++) {
+      let x = seed * 104729 + 17;
+      const rnd = () => (x = (x * 1103515245 + 12345) % 2147483648) / 2147483648;
+      const pick = <T>(a: T[]): T => a[Math.floor(rnd() * a.length)];
+      const agentCount = 1 + (seed % 3);
+      const maxSteps = [1, 2, 3, 5, 1000][seed % 5];
+      const editors = seed % 4 === 0;
+      const make = (bounded: boolean) => {
+        const doc = new Y.Doc();
+        doc.clientID = 7;
+        const root = doc.getMap<any>('meshes');
+        const agents = Array.from({ length: agentCount }, (_, n) => {
+          const origin = { type: 'mcp', session: `a${n}` };
+          const history = bounded ? new AgentHistory(doc, [root], origin, { maxSteps }) : null;
+          const um =
+            history?.undo ??
+            new Y.UndoManager([root], { trackedOrigins: new Set([origin]), captureTimeout: 0 });
+          return { origin, history, um };
+        });
+        return { doc, root, agents };
+      };
+      const a = make(true);
+      const b = make(false);
+      let referenceFailed = false;
+      for (let i = 0; i < 200 && !referenceFailed; i++) {
+        const who = Math.floor(rnd() * (agentCount + (editors ? 1 : 0)));
+        const r = rnd();
+        const choice = who === agentCount ? 'editor' : r < 0.15 ? 'undo' : r < 0.24 ? 'redo' : 'edit';
+        const ops: ((root: Y.Map<any>) => void)[] = [];
+        if (choice === 'edit' || choice === 'editor')
+          for (let k = 1 + Math.floor(rnd() * 3); k > 0; k--) {
+            const key = pick(['o1', 'o2', 'o3']);
+            const field = pick(['data', 'name']);
+            const kind = rnd();
+            const tag = Math.floor(rnd() * 250);
+            ops.push((root) => {
+              const o = root.get(key);
+              if (kind < 0.15) root.set(key, new Y.Map());
+              else if (kind < 0.25) root.delete(key);
+              else if (o instanceof Y.Map) {
+                if (kind < 0.35) o.set('child', new Y.Map());
+                else if (o.get('child') instanceof Y.Map && kind < 0.55)
+                  o.get('child').set(field, blob(tag, 48));
+                else if (kind < 0.6) o.delete(field);
+                else o.set(field, field === 'data' ? blob(tag, 64) : [tag]);
+              } else root.set(key, blob(tag, 32));
+            });
+          }
+        for (const d of [a, b]) {
+          const run = () => {
+            if (choice === 'editor') {
+              for (const op of ops) d.doc.transact(() => op(d.root), { type: 'editor' });
+              return;
+            }
+            const ag = d.agents[who];
+            if (choice === 'undo') ag.um.undo();
+            else if (choice === 'redo') ag.um.redo();
+            else {
+              ag.um.stopCapturing();
+              ag.um.captureTimeout = Number.POSITIVE_INFINITY;
+              for (const op of ops) {
+                d.doc.transact(() => op(d.root), ag.origin);
+                ag.history?.compactStep();
+              }
+              ag.um.captureTimeout = 0;
+              ag.um.stopCapturing();
+            }
+          };
+          if (d === a) run();
+          else
+            try {
+              run();
+            } catch {
+              // plain Yjs itself can fail here (a restored copy below a container an editor
+              // deleted); the comparison ends, the bounded run must not have failed before
+              referenceFailed = true;
+            }
+        }
+        for (const ag of a.agents) ag.history!.maintain();
+        for (const ag of b.agents) while (ag.um.undoStack.length > maxSteps) ag.um.undoStack.shift();
+        if (!referenceFailed)
+          expect(JSON.stringify(a.root.toJSON()), `seed ${seed} op ${i} (${who} ${choice})`).toBe(
+            JSON.stringify(b.root.toJSON()),
+          );
+      }
+      if (!referenceFailed)
+        expect(retained(a.doc).bytes, `seed ${seed}`).toBeLessThanOrEqual(retained(b.doc).bytes);
+      // histories end one after the other; the others keep undoing without errors (their results
+      // may differ from plain Yjs once the ended history's values are collected: Yjs then treats
+      // them like an editor's changes, whose overwritten values it collects too)
+      for (const [k, ag] of a.agents.entries()) {
+        ag.history!.destroy();
+        for (const other of a.agents.slice(k + 1)) {
+          other.um.undo();
+          other.um.redo();
+          other.history!.maintain();
+        }
+      }
+      expect(retained(a.doc), `seed ${seed}`).toEqual({ items: 0, bytes: 0 });
+    }
+  });
 });

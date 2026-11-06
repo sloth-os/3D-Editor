@@ -127,18 +127,6 @@ export function pathTraces(o: Pick<FrameOptions, 'engine' | 'shading' | 'wirefra
 }
 
 /**
- * Film > Transparent for rasterized renders. Core `renderSceneSoftware` reads
- * `render.film_transparent` only in its path tracer: its rasterizer composites the world colour
- * (or sky) unless the caller passes a `background`, so a transparent film is passed as a fully
- * transparent background (alpha 0 where nothing is drawn, partial alpha at edges and glass).
- */
-export function filmBackground(doc: SceneDoc, o: FrameOptions): Vec4Tuple | undefined {
-  if (o.background) return o.background;
-  if (pathTraces(o) || !doc.getRender().film_transparent) return undefined;
-  return [0, 0, 0, 0];
-}
-
-/**
  * The input of a path traced render, set up exactly like core `renderSceneSoftware` does (render
  * evaluation, visible geometry, camera precedence, depth of field, textures, orco).
  */
@@ -338,12 +326,8 @@ export class RenderEngine {
       img = pt;
       warnings = pt.stats.warnings ?? [];
     } else
-      img = renderSceneSoftware(doc, {
-        ...softwareOptions(options),
-        background: filmBackground(doc, options),
-        evaluator,
-        onProgress,
-      });
+      // Film > Transparent: core's rasterizer leaves the background transparent itself
+      img = renderSceneSoftware(doc, { ...softwareOptions(options), evaluator, onProgress });
     const out: ImageResult = png
       ? { width: img.width, height: img.height, png: encodePNG(img) }
       : { width: img.width, height: img.height, data: img.data };

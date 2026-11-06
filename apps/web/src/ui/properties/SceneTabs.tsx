@@ -174,21 +174,116 @@ function frameRatePreset(fps: number): number | null {
 /** `fps` for display: at most two decimals (23.98, 29.97, 15). */
 const fpsLabel = (fps: number) => `${Math.round(fps * 100) / 100} fps`;
 
-/** The Frame Rate option of `fps`: its preset, else the rate itself (shown as Custom). */
+/** The Frame Rate option that shows custom rates (Blender's "Custom" preset). */
+export const CUSTOM_FRAME_RATE = 'CUSTOM';
+
+/** The Frame Rate option of `fps`: its preset, else Custom. */
 export function frameRateOption(fps: number): string {
-  return String(frameRatePreset(fps) ?? fps);
+  const preset = frameRatePreset(fps);
+  return preset === null ? CUSTOM_FRAME_RATE : String(preset);
 }
 
 /**
- * The Frame Rate options: Blender's presets, plus "Custom (15 fps)" for a rate set elsewhere (an
- * agent, the console) that is none of them, so the box always shows the rate that playback and
- * Render Animation use.
+ * The Frame Rate options: Blender's presets and Custom, labelled with the rate when the rate is
+ * none of the presets ("Custom (15 fps)", set here or by an agent), so the box always shows the
+ * rate that playback and Render Animation use.
  */
 export function frameRateOptions(fps: number): { value: string; label: string }[] {
-  const options = FRAME_RATES.map((x) => ({ value: String(x), label: fpsLabel(x) }));
-  if (frameRatePreset(fps) === null && Number.isFinite(fps))
-    options.push({ value: String(fps), label: `Custom (${fpsLabel(fps)})` });
-  return options;
+  const custom = frameRatePreset(fps) === null && Number.isFinite(fps);
+  return [
+    ...FRAME_RATES.map((x) => ({ value: String(x), label: fpsLabel(x) })),
+    { value: CUSTOM_FRAME_RATE, label: custom ? `Custom (${fpsLabel(fps)})` : 'Custom' },
+  ];
+}
+
+/** The highest frame rate the editor accepts (set_scene_settings takes 0 < fps ≤ 1000). */
+const MAX_FRAME_RATE = 1000;
+
+/** FPS and Base of a custom frame rate (Blender's fps and fps_base; the rate is FPS / Base). */
+export interface FrameRateParts {
+  fps: number;
+  base: number;
+}
+
+/**
+ * The FPS / Base pair shown for `rate`. The document stores only the rate, so the pair is derived
+ * from it like Blender's NTSC presets (FPS the nearest whole number, Base the divisor that gives
+ * the rate: 29.97 → 30 / 1.001, 15 → 15 / 1), unless `typed` (the pair last entered in this
+ * editor) still gives the rate, which then stays as entered (15 / 2, not 8 / 1.0667).
+ */
+export function frameRateParts(rate: number, typed?: FrameRateParts | null): FrameRateParts {
+  if (typed && typed.base > 0 && Math.abs(typed.fps / typed.base - rate) <= 1e-9 * Math.max(1, rate))
+    return typed;
+  if (!(rate > 0) || !Number.isFinite(rate)) return { fps: 24, base: 1 };
+  const fps = Math.max(1, Math.round(rate));
+  return { fps, base: fps / rate };
+}
+
+/** The FPS / Base pairs entered per document (the document stores only their quotient). */
+const typedFrameRates = new WeakMap<object, FrameRateParts>();
+
+/**
+ * Output > Format > Frame Rate: Blender's presets, and Custom with editable FPS and Base (the rate
+ * is FPS / Base), which also shows any other rate an agent or a script set.
+ */
+function FrameRateRows({ s }: { s: ProjectSession }) {
+  // redraw on every document change (an agent or undo changing the rate)
+  void s.revision.value;
+  const rate = s.doc.getScene().fps;
+  // Custom picked while the rate is one of the presets: show its FPS / Base to edit
+  const [customPicked, setCustomPicked] = useState(false);
+  const option = frameRateOption(rate);
+  const custom = option === CUSTOM_FRAME_RATE || customPicked;
+  const parts = frameRateParts(rate, typedFrameRates.get(s.doc));
+  const setParts = (next: FrameRateParts, final: boolean) => {
+    typedFrameRates.set(s.doc, next);
+    setProp(s, 'scene', null, 'fps', next.fps / next.base, final);
+  };
+  return (
+    <>
+      <Row label="Frame Rate" title="Frames per second of playback and of rendered animations">
+        <SelectField
+          value={custom ? CUSTOM_FRAME_RATE : option}
+          testId="output-fps"
+          options={frameRateOptions(rate)}
+          onChange={(v) => {
+            if (v === CUSTOM_FRAME_RATE) return setCustomPicked(true);
+            setCustomPicked(false);
+            setProp(s, 'scene', null, 'fps', Number(v));
+          }}
+        />
+      </Row>
+      {custom && (
+        <>
+          <Row label="FPS" title="Frames per second (Blender's fps); the frame rate is FPS / Base">
+            <NumberField
+              value={parts.fps}
+              integer
+              min={1}
+              max={Math.max(1, Math.floor(MAX_FRAME_RATE * parts.base))}
+              step={1}
+              testId="output-fps-custom"
+              onChange={(v, f) => setParts({ fps: v, base: parts.base }, f)}
+            />
+          </Row>
+          <Row
+            label="Base"
+            title="Divisor of FPS (Blender's fps_base): 1.001 gives the NTSC rates, e.g. 30 / 1.001 = 29.97 fps"
+          >
+            <NumberField
+              value={parts.base}
+              min={parts.fps / MAX_FRAME_RATE}
+              max={1000}
+              step={0.001}
+              precision={4}
+              testId="output-fps-base"
+              onChange={(v, f) => setParts({ fps: parts.fps, base: v }, f)}
+            />
+          </Row>
+        </>
+      )}
+    </>
+  );
 }
 
 export function OutputTab({ s }: { s: ProjectSession }) {
@@ -231,14 +326,7 @@ export function OutputTab({ s }: { s: ProjectSession }) {
             onChange={(v, f) => setProp(s, 'render', null, 'resolution_percentage', v, f)}
           />
         </Row>
-        <Row label="Frame Rate" title="Frames per second of playback and of rendered animations">
-          <SelectField
-            value={frameRateOption(sc.fps)}
-            testId="output-fps"
-            options={frameRateOptions(sc.fps)}
-            onChange={(v) => setProp(s, 'scene', null, 'fps', Number(v))}
-          />
-        </Row>
+        <FrameRateRows s={s} />
       </Panel>
       <Panel title="Frame Range">
         <Row label="Frame Start">

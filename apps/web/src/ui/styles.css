@@ -477,6 +477,9 @@ select.select {
 .numfield.animated {
   background: #4e7a3a;
 }
+.numfield.driven {
+  background: #6e3fa0;
+}
 .textfield {
   height: var(--row);
   width: 100%;

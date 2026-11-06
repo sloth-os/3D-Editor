@@ -1,7 +1,5 @@
 import { session, openDialog, dialog } from '../app/store';
 import { hoveredArea, paletteOpen, popupMenu, run, viewport } from './editor';
-import { lastOperator, redoLast } from './runner';
-import { registry } from './editor';
 
 /**
  * Blender-style keymap. Keys are resolved per hovered area; viewport keys depend on the mode.
@@ -74,10 +72,7 @@ const GLOBAL: Record<string, Handler> = {
   F12: () => run('render.render', {}, 'hotkey'),
   'Ctrl+F12': () => run('render.render', { animation: true }, 'hotkey'),
   F1: () => openDialog('shortcuts'),
-  'Shift+R': () => {
-    const last = lastOperator.value;
-    if (last && session.value) redoLast(session.value, registry, last.params);
-  },
+  'Shift+R': () => run('screen.repeat_last', {}, 'hotkey'),
   Space: () => run('screen.animation_play', {}, 'hotkey'),
   'Shift+ArrowLeft': () => run('screen.frame_jump', { end: false }, 'hotkey'),
   'Shift+ArrowRight': () => run('screen.frame_jump', { end: true }, 'hotkey'),
@@ -163,7 +158,7 @@ const EDIT_MODE: Record<string, Handler> = {
   Delete: () => run('wm.call_menu', { name: 'delete' }, 'hotkey'),
   E: () => {
     if (run('mesh.extrude_region_move', { value: [0, 0, 0] }, 'hotkey'))
-      run('view3d.transform_modal', { mode: 'translate' }, 'hotkey');
+      run('view3d.transform_modal', { mode: 'translate', continue_last: true }, 'hotkey');
   },
   I: () => run('mesh.inset', {}, 'hotkey'),
   'Ctrl+B': () => run('mesh.bevel', {}, 'hotkey'),
@@ -175,7 +170,7 @@ const EDIT_MODE: Record<string, Handler> = {
   Y: () => run('mesh.split', {}, 'hotkey'),
   'Shift+D': () => {
     if (run('mesh.duplicate_move', {}, 'hotkey'))
-      run('view3d.transform_modal', { mode: 'translate' }, 'hotkey');
+      run('view3d.transform_modal', { mode: 'translate', continue_last: true }, 'hotkey');
   },
   'Ctrl+T': () => run('mesh.quads_convert_to_tris', {}, 'hotkey'),
   'Alt+J': () => run('mesh.tris_convert_to_quads', {}, 'hotkey'),

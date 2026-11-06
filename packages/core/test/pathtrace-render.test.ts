@@ -206,13 +206,10 @@ describe('path tracer: refraction and reflection', () => {
     });
     plane(doc, 'Card', 0.6, lambert(doc, [0, 0, 0]), { location: [0, 0, 2.9] });
     // … and a vertical mirror beside it that reflects it onto the shadowed floor
-    plane(
-      doc,
-      'Mirror',
-      6,
-      doc.addMaterial({ base_color: [0.9, 0.9, 0.9, 1], metallic: 1, roughness: 0 }),
-      { location: [2, 0, 2], rotation: [0, Math.PI / 2, 0] },
-    );
+    plane(doc, 'Mirror', 6, doc.addMaterial({ base_color: [0.9, 0.9, 0.9, 1], metallic: 1, roughness: 0 }), {
+      location: [2, 0, 2],
+      rotation: [0, Math.PI / 2, 0],
+    });
     topCamera(doc, 0.5, 2.5);
     const caustic = (filter: number, seed: number) => {
       const { img } = traceLinear(doc, {

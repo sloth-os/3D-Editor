@@ -1,6 +1,7 @@
 import { CONSTRAINT_TYPES, ROOT_COLLECTION_ID, type ConstraintCategory } from '@3d-editor/core';
 import { session } from '../app/store';
 import { registry } from './editor';
+import { lastRepeat } from './runner';
 
 export interface MenuItem {
   label?: string;
@@ -183,6 +184,8 @@ export const FILE_MENU = (): MenuItem[] => [
 export const EDIT_MENU = (): MenuItem[] => [
   { label: 'Undo', op: 'ed.undo', shortcut: 'Ctrl Z', enabled: () => !!session.value?.undo.canUndo() },
   { label: 'Redo', op: 'ed.redo', shortcut: 'Ctrl Shift Z', enabled: () => !!session.value?.undo.canRedo() },
+  sep,
+  { label: 'Repeat Last', op: 'screen.repeat_last', shortcut: 'Shift R', enabled: () => !!lastRepeat.value },
   sep,
   { label: 'Menu Search…', op: 'wm.search_menu', shortcut: 'F3' },
   sep,
