@@ -40,9 +40,12 @@ import type { ImportOptions, ImportResult } from './types';
  * mesh becomes one mesh datablock with all primitives merged (one material slot per primitive
  * material, vertices shared between primitives that share attribute accessors, nothing welded).
  * Smooth shading is derived from vertex normals. Materials, embedded images, cameras,
- * KHR_lights_punctual lights and TRS animations (as per-key fcurves) are imported; skins and morph
- * targets are ignored with a warning. Parsing happens before the document is touched so a broken
- * file never leaves a half-imported scene.
+ * KHR_lights_punctual lights and TRS animations (as per-key fcurves) are imported. Morph targets
+ * become shape keys of the mesh (POSITION deltas; names from mesh.extras.targetNames, default
+ * values from node or mesh weights) and `weights` animations become F-curves on their values.
+ * Skins are not imported (with a warning): a skinned mesh keeps the vertex positions stored in the
+ * file (its bind pose) at its node, and the joints become empties. Parsing happens before the
+ * document is touched so a broken file never leaves a half-imported scene.
  */
 
 const GEOMETRY_COMPRESSION = new Set([
@@ -92,6 +95,8 @@ interface ParsedNode {
   trs: TRS | null;
   matrix: number[] | null;
   mesh?: number;
+  /** Morph target weights of this node (override the mesh's default weights). */
+  weights?: number[];
   camera?: number;
   light?: number;
   extras?: unknown;
@@ -347,7 +352,9 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
       }
       if (prim.targets && prim.targets.length) targetCount = Math.max(targetCount, prim.targets.length);
       if (attrs.JOINTS_0 !== undefined || attrs.WEIGHTS_0 !== undefined)
-        warn('Skinning (joints/weights) is not supported and was ignored');
+        warn(
+          'Skin weights (JOINTS_0/WEIGHTS_0) are not imported: skinned meshes keep their bind pose, without vertex groups or an Armature modifier',
+        );
       if (Object.keys(attrs).some((a) => /^TEXCOORD_[1-9]/.test(a)))
         warn('Only the first UV map (TEXCOORD_0) is imported');
       const key = [attrs.POSITION, attrs.NORMAL, attrs.TEXCOORD_0, attrs.COLOR_0].join(':');
@@ -527,14 +534,18 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
     // (normals are recomputed from the shapes)
     const names: unknown = (gm.extras as { targetNames?: unknown } | undefined)?.targetNames;
     const shapeKeys: ParsedMesh['shapeKeys'] = [];
+    // shape keys are addressed by name (F-curve paths, relative keys): names must be unique
+    const used = new Set<string>();
     for (let k = 0; k < targetCount; k++) {
       const shape = positions.slice();
       for (const bl of blocks) {
         const d = bl.targets[k];
         if (d) for (let i = 0; i < bl.count * 3; i++) shape[bl.offset * 3 + i] += d[i];
       }
-      const name =
-        Array.isArray(names) && typeof names[k] === 'string' ? (names[k] as string) : `Key ${k + 1}`;
+      const given = Array.isArray(names) && typeof names[k] === 'string' ? (names[k] as string).trim() : '';
+      let name = given || `Key ${k + 1}`;
+      for (let n = 1; used.has(name); n++) name = `${given || `Key ${k + 1}`}.${String(n).padStart(3, '0')}`;
+      used.add(name);
       const v = gm.weights?.[k];
       shapeKeys.push({ name, value: typeof v === 'number' && Number.isFinite(v) ? v : 0, positions: shape });
     }
@@ -738,7 +749,10 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
       return null;
     }
     seenNodes.add(ni);
-    if (n.skin !== undefined) warn('Skins are not supported and were ignored');
+    if (n.skin !== undefined)
+      warn(
+        `Skin of node '${n.name ?? ni}' not imported: the mesh is placed as stored in the file (bind pose, not deformed by its joints, which become empties)`,
+      );
     let trs: TRS | null = null;
     let matrix: number[] | null = null;
     if (n.matrix && n.matrix.length === 16) matrix = n.matrix;
@@ -755,6 +769,7 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
       trs,
       matrix,
       mesh: n.mesh,
+      weights: Array.isArray(n.weights) ? n.weights : undefined,
       camera: n.camera !== undefined && json.cameras?.[n.camera] ? n.camera : undefined,
       light: typeof light === 'number' && gltfLights[light] ? light : undefined,
       extras: n.extras,
@@ -901,10 +916,17 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
     };
     const nodeObject = new Map<number, { id: string; parentConverted: boolean; selfConverted: boolean }>();
     let firstCamera: string | null = null;
-    /** Shape keys of a parsed mesh; slider ranges cover the default and animated weights. */
-    const shapeKeysOf = (pm: ParsedMesh, gltfMesh: number): ShapeKeyData[] => {
-      const lo = pm.shapeKeys.map((k) => Math.min(0, k.value));
-      const hi = pm.shapeKeys.map((k) => Math.max(1, k.value));
+    /**
+     * Shape keys of a parsed mesh (values: the weights of the first node using it, else the mesh's);
+     * slider ranges cover the default and animated weights.
+     */
+    const shapeKeysOf = (pm: ParsedMesh, gltfMesh: number, nodeWeights?: number[]): ShapeKeyData[] => {
+      const values = pm.shapeKeys.map((k, i) => {
+        const w = nodeWeights?.length === pm.shapeKeys.length ? nodeWeights[i] : undefined;
+        return typeof w === 'number' && Number.isFinite(w) ? w : k.value;
+      });
+      const lo = values.map((v) => Math.min(0, v));
+      const hi = values.map((v) => Math.max(1, v));
       for (const ch of channels) {
         if (ch.path !== 'weights' || json.nodes?.[ch.node]?.mesh !== gltfMesh) continue;
         const n = pm.shapeKeys.length;
@@ -918,7 +940,7 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
       }
       return pm.shapeKeys.map((k, i) => ({
         name: k.name,
-        value: k.value,
+        value: values[i],
         slider_min: Math.max(-10, lo[i]),
         slider_max: Math.min(10, hi[i]),
         mute: false,
@@ -967,7 +989,7 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
         let mid = meshIds.get(n.mesh!);
         if (!mid) {
           meshIds.set(n.mesh!, (mid = doc.addMesh(pm!.name || n.name || opts.name || 'Mesh', pm!.mesh)));
-          if (pm!.shapeKeys.length) doc.setShapeKeys(mid, shapeKeysOf(pm!, n.mesh!));
+          if (pm!.shapeKeys.length) doc.setShapeKeys(mid, shapeKeysOf(pm!, n.mesh!, n.weights));
         }
         data = mid;
         slots = pm!.slots.map((s) => (s === null ? null : materialId(s)));
@@ -1028,8 +1050,14 @@ export function importGLTF(doc: SceneDoc, data: Uint8Array, opts: ImportOptions 
         const keysOf = meshId ? doc.getShapeKeys(meshId) : [];
         const n = keysOf.length;
         if (!meshId || !n || ch.values.length !== ch.times.length * n) {
-          if (meshId && !n)
-            warn('Morph target (weights) animation of a mesh without morph targets was ignored');
+          const node = json.nodes?.[ch.node]?.name ?? String(ch.node);
+          warn(
+            !meshId
+              ? `Morph target weights animation of node '${node}' ignored: the node has no imported mesh`
+              : !n
+                ? `Morph target weights animation of node '${node}' ignored: its mesh has no morph targets`
+                : `Morph target weights animation of node '${node}' ignored: ${ch.values.length / Math.max(1, ch.times.length)} values per key for ${n} morph targets`,
+          );
           continue;
         }
         const k0 = `${meshId}:weights`;

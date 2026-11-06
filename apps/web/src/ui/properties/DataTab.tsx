@@ -12,8 +12,10 @@ import {
   sanitizeSpline,
   type BoneConstraintType,
   type BoneData,
+  type CameraData,
   type ConstraintData,
   type CurveData,
+  type LightData,
   type ObjectData,
   type ShapeKeyData,
   type Spline,
@@ -34,6 +36,7 @@ import {
   RAD,
 } from '../fields/fields';
 import { animState, animatedValue, setProp } from './prop-edit';
+import { animatedBlock } from './animated';
 import { run, runResult } from '../../editor/editor';
 import { Icon, type IconName } from '../icons';
 import {
@@ -64,10 +67,34 @@ export function DataTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
 
 // ------------------------------------------------------------------ shared helpers
 
+/** The active entry of a list (UI state, like Blender's active_index): its name and position. */
+export interface ActiveEntry {
+  name: string;
+  index: number;
+}
+
+/**
+ * Index of the active entry in a list of names: the entry with the remembered name, else (after a
+ * rename made elsewhere: undo, redo, an MCP agent or a collaborator) the entry at the remembered
+ * position, the last one when the list got shorter; -1 for none.
+ */
+export function activeEntryIndex(names: readonly string[], entry: ActiveEntry | undefined): number {
+  if (!entry || !names.length) return -1;
+  const i = names.indexOf(entry.name);
+  if (i >= 0) return i;
+  return entry.index < 0 ? -1 : Math.min(entry.index, names.length - 1);
+}
+
+/** The entry to remember for `name` in a list (its position now). */
+const entryOf = (names: readonly string[], name: string): ActiveEntry => ({
+  name,
+  index: names.indexOf(name),
+});
+
 /** Active list entries per datablock (UI state, like Blender's active_index). */
-const activeVertexGroups = signal<Record<string, string>>({});
-const activeShapeKeys = signal<Record<string, string>>({});
-const activeBones = signal<Record<string, string>>({});
+const activeVertexGroups = signal<Record<string, ActiveEntry>>({});
+const activeShapeKeys = signal<Record<string, ActiveEntry>>({});
+const activeBones = signal<Record<string, ActiveEntry>>({});
 const activeSplines = signal<Record<string, number>>({});
 /** Weight used by Assign in Edit Mode (Blender's tool setting vertex_group_weight). */
 const vertexGroupWeight = signal(1);
@@ -235,14 +262,22 @@ export function assignedVertexCount(weights: Uint8Array): number {
 function VertexGroupsPanel(p: { s: ProjectSession; o: ObjectData; meshId: string; vertexCount: number }) {
   const { s, o, meshId } = p;
   const groups = s.doc.getVertexGroups(meshId);
-  const chosen = activeVertexGroups.value[meshId];
   const index = Math.max(
     0,
-    groups.findIndex((g) => g.name === chosen),
+    activeEntryIndex(
+      groups.map((g) => g.name),
+      activeVertexGroups.value[meshId],
+    ),
   );
   const active = groups[index] ?? null;
   const select = (name: string) =>
-    (activeVertexGroups.value = { ...activeVertexGroups.value, [meshId]: name });
+    (activeVertexGroups.value = {
+      ...activeVertexGroups.value,
+      [meshId]: entryOf(
+        s.doc.getVertexGroups(meshId).map((g) => g.name),
+        name,
+      ),
+    });
   const editing = s.state.mode === 'EDIT' && s.state.activeId === o.id;
   const add = () => {
     const r = runResult('object.vertex_group_add', { object: o.id, name: 'Group' }, 'ui');
@@ -374,10 +409,20 @@ export const shapeKeyPath = (name: string) => `shape_keys[${JSON.stringify(name)
 
 function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; meshId: string }) {
   const keys = s.doc.getShapeKeys(meshId);
-  const chosen = activeShapeKeys.value[meshId] ?? '';
-  const activeIndex = keys.findIndex((k) => k.name === chosen);
+  // none: the Basis row
+  const activeIndex = activeEntryIndex(
+    keys.map((k) => k.name),
+    activeShapeKeys.value[meshId],
+  );
   const active: ShapeKeyData | null = activeIndex >= 0 ? keys[activeIndex] : null;
-  const select = (name: string) => (activeShapeKeys.value = { ...activeShapeKeys.value, [meshId]: name });
+  const select = (name: string) =>
+    (activeShapeKeys.value = {
+      ...activeShapeKeys.value,
+      [meshId]: entryOf(
+        s.doc.getShapeKeys(meshId).map((k) => k.name),
+        name,
+      ),
+    });
   const bytes = keys.reduce((n, k) => n + (k.data?.length ?? 0), 0);
   const value = (k: ShapeKeyData) => animatedValue(s, 'mesh', meshId, shapeKeyPath(k.name), 0, k.value);
   const setKey = (
@@ -1295,9 +1340,19 @@ function ArmaturePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const ev = panelEvaluation(s);
   const bones = Array.isArray(arm.bones) ? arm.bones : [];
   const tree = boneTree(bones);
-  const chosen = activeBones.value[o.id];
-  const active = bones.find((b) => b.name === chosen) ?? tree[0]?.bone ?? null;
-  const select = (name: string) => (activeBones.value = { ...activeBones.value, [o.id]: name });
+  const chosen = activeEntryIndex(
+    bones.map((b) => b.name),
+    activeBones.value[o.id],
+  );
+  const active = (chosen >= 0 ? bones[chosen] : null) ?? tree[0]?.bone ?? null;
+  const select = (name: string) =>
+    (activeBones.value = {
+      ...activeBones.value,
+      [o.id]: entryOf(
+        (s.doc.getArmature(o.data!)?.bones ?? []).map((b) => b.name),
+        name,
+      ),
+    });
   const setArmature = (patch: Record<string, unknown>) =>
     run('armature.properties_set', { object: o.id, ...patch }, 'ui');
   const add = () => {
@@ -1829,6 +1884,8 @@ function AddIkForm({
 function LightPanel({ s, id }: { s: ProjectSession; id: string }) {
   const l = s.doc.getLight(id);
   if (!l) return null;
+  /** The values at the current frame (keyframes and drivers applied), which the renderers use. */
+  const a = animatedBlock<LightData>(s, 'light', id) ?? l;
   const set = (f: string, v: unknown, final = true) => setProp(s, 'lights', id, f, v, final);
   const st = (path: string, i = 0) => animState(s, 'light', id, path, i);
   return (
@@ -1851,11 +1908,11 @@ function LightPanel({ s, id }: { s: ProjectSession; id: string }) {
           />
         </Row>
         <Row label="Color">
-          <ColorField value={l.color} onChange={(v, f) => set('color', v, f)} />
+          <ColorField value={a.color} testId="light-color" onChange={(v, f) => set('color', v, f)} />
         </Row>
         <Row label={l.type === 'SUN' ? 'Strength' : 'Power'}>
           <NumberField
-            value={l.energy}
+            value={a.energy}
             min={0}
             step={l.type === 'SUN' ? 0.01 : 1}
             unit={l.type === 'SUN' ? '' : ' W'}
@@ -1867,10 +1924,12 @@ function LightPanel({ s, id }: { s: ProjectSession; id: string }) {
         {l.type !== 'SUN' && l.type !== 'AREA' && (
           <Row label="Radius">
             <NumberField
-              value={l.shadow_soft_size}
+              value={a.shadow_soft_size}
               min={0}
               step={0.01}
               unit=" m"
+              state={st('shadow_soft_size')}
+              testId="light-radius"
               onChange={(v, f) => set('shadow_soft_size', v, f)}
             />
           </Row>
@@ -1883,21 +1942,23 @@ function LightPanel({ s, id }: { s: ProjectSession; id: string }) {
         <Panel title="Spot Shape">
           <Row label="Size">
             <NumberField
-              value={l.spot_size}
+              value={a.spot_size}
               min={0.01}
               max={Math.PI}
               unit="°"
               step={1}
               {...RAD}
+              state={st('spot_size')}
               onChange={(v, f) => set('spot_size', v, f)}
             />
           </Row>
           <Row label="Blend">
             <NumberField
-              value={l.spot_blend}
+              value={a.spot_blend}
               min={0}
               max={1}
               slider
+              state={st('spot_blend')}
               onChange={(v, f) => set('spot_blend', v, f)}
             />
           </Row>
@@ -1919,20 +1980,22 @@ function LightPanel({ s, id }: { s: ProjectSession; id: string }) {
           </Row>
           <Row label="Size">
             <NumberField
-              value={l.size}
+              value={a.size}
               min={0.001}
               step={0.01}
               unit=" m"
+              state={st('size')}
               onChange={(v, f) => set('size', v, f)}
             />
           </Row>
           {(l.shape === 'RECTANGLE' || l.shape === 'ELLIPSE') && (
             <Row label="Size Y">
               <NumberField
-                value={l.size_y}
+                value={a.size_y}
                 min={0.001}
                 step={0.01}
                 unit=" m"
+                state={st('size_y')}
                 onChange={(v, f) => set('size_y', v, f)}
               />
             </Row>
@@ -1948,9 +2011,12 @@ function LightPanel({ s, id }: { s: ProjectSession; id: string }) {
 function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
   const c = s.doc.getCamera(id);
   if (!c) return null;
+  /** The values at the current frame (keyframes and drivers applied), which the renderers use. */
+  const a = animatedBlock<CameraData>(s, 'camera', id) ?? c;
   const r = s.doc.getRender();
   const aspect = r.resolution_x / Math.max(1, r.resolution_y);
   const set = (f: string, v: unknown, final = true) => setProp(s, 'cameras', id, f, v, final);
+  const st = (path: string) => animState(s, 'camera', id, path, 0);
   return (
     <>
       <div class="prop-context">
@@ -1971,24 +2037,26 @@ function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
           <>
             <Row label="Focal Length">
               <NumberField
-                value={c.lens}
+                value={a.lens}
                 min={1}
                 max={5000}
                 step={0.5}
                 unit=" mm"
-                state={animState(s, 'camera', id, 'lens', 0)}
+                state={st('lens')}
                 testId="camera-lens"
                 onChange={(v, f) => set('lens', v, f)}
               />
             </Row>
             <Row label="Field of View">
               <NumberField
-                value={cameraFovY(c, aspect)}
+                value={cameraFovY(a, aspect)}
                 unit="°"
                 step={0.5}
                 {...RAD}
                 min={0.01}
                 max={3.1}
+                state={st('lens')}
+                testId="camera-fov"
                 onChange={(v, f) => set('lens', lensFromFovY(v, aspect, c.sensor_width), f)}
               />
             </Row>
@@ -1996,34 +2064,49 @@ function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
         ) : (
           <Row label="Ortho Scale">
             <NumberField
-              value={c.ortho_scale}
+              value={a.ortho_scale}
               min={0.001}
               step={0.05}
+              state={st('ortho_scale')}
               onChange={(v, f) => set('ortho_scale', v, f)}
             />
           </Row>
         )}
         <Row label="Shift X">
-          <NumberField value={c.shift_x} step={0.01} onChange={(v, f) => set('shift_x', v, f)} />
+          <NumberField
+            value={a.shift_x}
+            step={0.01}
+            state={st('shift_x')}
+            testId="camera-shift-x"
+            onChange={(v, f) => set('shift_x', v, f)}
+          />
         </Row>
         <Row label="Y">
-          <NumberField value={c.shift_y} step={0.01} onChange={(v, f) => set('shift_y', v, f)} />
+          <NumberField
+            value={a.shift_y}
+            step={0.01}
+            state={st('shift_y')}
+            testId="camera-shift-y"
+            onChange={(v, f) => set('shift_y', v, f)}
+          />
         </Row>
         <Row label="Clip Start">
           <NumberField
-            value={c.clip_start}
+            value={a.clip_start}
             min={0.0001}
             step={0.01}
             unit=" m"
+            state={st('clip_start')}
             onChange={(v, f) => set('clip_start', v, f)}
           />
         </Row>
         <Row label="End">
           <NumberField
-            value={c.clip_end}
+            value={a.clip_end}
             min={0.01}
             step={1}
             unit=" m"
+            state={st('clip_end')}
             onChange={(v, f) => set('clip_end', v, f)}
           />
         </Row>
@@ -2061,22 +2144,23 @@ function CameraPanel({ s, id }: { s: ProjectSession; id: string }) {
         </Row>
         <Row label="Focus Distance" title="Distance from the camera that is in sharp focus">
           <NumberField
-            value={animatedValue(s, 'camera', id, 'dof_focus_distance', 0, c.dof_focus_distance)}
+            value={a.dof_focus_distance}
             min={0}
             step={0.1}
             unit=" m"
-            state={animState(s, 'camera', id, 'dof_focus_distance', 0)}
+            state={st('dof_focus_distance')}
             testId="camera-dof-distance"
             onChange={(v, f) => set('dof_focus_distance', v, f)}
           />
         </Row>
         <Row label="F-Stop" title="Aperture f-number: lower values give a shallower focus and more blur">
           <NumberField
-            value={c.dof_aperture_fstop}
+            value={a.dof_aperture_fstop}
             min={0.1}
             max={128}
             step={0.1}
             precision={1}
+            state={st('dof_aperture_fstop')}
             testId="camera-dof-fstop"
             onChange={(v, f) => set('dof_aperture_fstop', v, f)}
           />

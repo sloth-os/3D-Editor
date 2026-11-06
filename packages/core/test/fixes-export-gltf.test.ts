@@ -10,6 +10,7 @@ import {
   defaultPoseBone,
   defaultProcedural,
   encodeFloat32,
+  encodePNG,
   exportScene,
   importFile,
   insertKeyframe,
@@ -20,6 +21,7 @@ import {
   type TextureSlot,
   type Vec3,
 } from '../src';
+import { writeGLB } from '../src/io/glb';
 import { armatureData, bone, tube } from './armature-helpers';
 import { rb } from './physics-helpers';
 import {
@@ -70,6 +72,22 @@ function editorPositions(mesh: MeshData, world: Mat4): number[] {
   const rbuf = buildRenderBuffers(mesh);
   const out: number[] = [];
   const p = rbuf.positions;
+  for (let i = 0; i < p.length; i += 3) {
+    const x = p[i];
+    const y = p[i + 1];
+    const z = p[i + 2];
+    const wx = world[0] * x + world[4] * y + world[8] * z + world[12];
+    const wy = world[1] * x + world[5] * y + world[9] * z + world[13];
+    const wz = world[2] * x + world[6] * y + world[10] * z + world[14];
+    out.push(wx, wz, -wy);
+  }
+  return out;
+}
+
+/** Editor world-space positions (Y-up, like `editorPositions`) of a mesh's vertices. */
+function worldPoints(mesh: MeshData, world: Mat4): number[] {
+  const out: number[] = [];
+  const p = mesh.positions;
   for (let i = 0; i < p.length; i += 3) {
     const x = p[i];
     const y = p[i + 1];
@@ -440,19 +458,140 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
     const o2 = doc2.findObjectByName('Gripper')!;
     const keys = doc2.getShapeKeys(o2.data!);
     expect(keys.map((k) => k.name)).toEqual(['Grip']);
+    // stored value: the default weight (the keyed value at the export frame 1, not the
+    // document's 0.25); the imported F-curve drives it
+    expect(keys[0].value).toBeCloseTo(0, 6);
+    expect(doc2.listFCurves().some((fc) => fc.path === 'shape_keys["Grip"].value')).toBe(true);
     const ev1 = new SceneEvaluator(doc);
     const ev2 = new SceneEvaluator(doc2);
     for (const frame of [1, 5, 9]) {
       const a = ev1.evaluate(frame).byId.get(obj)!;
       const b = ev2.evaluate(frame).byId.get(o2.id)!;
-      // the importer splits vertices like the exporter's render buffers: compare world positions
-      expectClose(
-        editorPositions(b.mesh!, b.worldMatrix),
-        editorPositions(a.mesh!, a.worldMatrix),
-        1e-4,
+      // the importer triangulates and splits vertices (one per glTF vertex): compare the world
+      // positions as point sets
+      expect(
+        pointSetDistance(worldPoints(b.mesh!, b.worldMatrix), worldPoints(a.mesh!, a.worldMatrix)),
         `@${frame}`,
-      );
+      ).toBeLessThan(1e-4);
     }
+    // the deformation is really animated: the +X face moved in by 0.3 at frame 9
+    const end = ev2.evaluate(9).byId.get(o2.id)!;
+    const maxX = Math.max(...worldPoints(end.mesh!, end.worldMatrix).filter((_, i) => i % 3 === 0));
+    expect(maxX).toBeCloseTo(0.5 - 0.3, 4);
+  });
+
+  it('imports morph targets with unique shape key names, node weights and clear warnings', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const meshId = doc.addMesh('Blob', createCube({ size: 1 }));
+    doc.addObject({ type: 'MESH', name: 'Blob', data: meshId });
+    const base = doc.getMesh(meshId)!.positions;
+    const up = base.map((v, i) => (i % 3 === 2 ? v + 0.25 : v));
+    const key = (name: string, value: number) => ({
+      name,
+      value,
+      slider_min: 0,
+      slider_max: 1,
+      mute: false,
+      relative_key: '',
+      data: encodeFloat32(up),
+    });
+    doc.setShapeKeys(meshId, [key('A', 0.1), key('B', 0.2)]);
+    const { json, bin } = parseGltf(exportScene(doc, 'glb').data);
+    // a hand-edited file: duplicate target names, node weights overriding the mesh's, and a
+    // weights animation with the wrong number of values
+    const n = nodeIndex(json, 'Blob');
+    json.meshes[json.nodes[n].mesh].extras.targetNames = ['Same', 'Same'];
+    json.nodes[n].weights = [0.75, 0];
+    const times = json.accessors.length;
+    json.accessors.push({ ...json.accessors[json.meshes[0].primitives[0].indices], count: 1 });
+    json.animations = [
+      {
+        channels: [{ sampler: 0, target: { node: n, path: 'weights' } }],
+        samplers: [{ input: times, output: times, interpolation: 'LINEAR' }],
+      },
+    ];
+    const glb = writeGLB(json, bin);
+    const doc2 = SceneDoc.create({ empty: true });
+    const res = importFile(doc2, 'glb', glb);
+    const o2 = doc2.findObjectByName('Blob')!;
+    const keys = doc2.getShapeKeys(o2.data!);
+    expect(keys.map((k) => k.name)).toEqual(['Same', 'Same.001']);
+    expect(keys.map((k) => k.value)).toEqual([0.75, 0]);
+    expect(res.warnings.join('\n')).toMatch(
+      /weights animation of node 'Blob' ignored: .* for 2 morph targets/,
+    );
+  });
+
+  it('imports sparse morph targets (as Blender writes shape keys) and their weights animation', () => {
+    // one triangle; target "Lift" moves vertex 2 up by 1 (Y-up), stored as a sparse accessor
+    // without a bufferView; weights animated 0 → 1 over one second (CUBICSPLINE: tangents ignored)
+    const f32 = (v: number[]) => new Uint8Array(new Float32Array(v).buffer);
+    const parts = [
+      f32([0, 0, 0, 1, 0, 0, 0, 0, -1]), // POSITION
+      new Uint8Array(new Uint16Array([2, 0]).buffer), // sparse indices (padded)
+      f32([0, 1, 0]), // sparse values
+      f32([0, 1]), // times
+      f32([0, 0, 0, 0, 1, 0]), // weights: (in, value, out) per key
+    ];
+    const offsets: number[] = [];
+    let len = 0;
+    for (const p of parts) {
+      offsets.push(len);
+      len += p.length;
+    }
+    const bin = new Uint8Array(len);
+    parts.forEach((p, i) => bin.set(p, offsets[i]));
+    const json = {
+      asset: { version: '2.0' },
+      scene: 0,
+      scenes: [{ nodes: [0] }],
+      nodes: [{ name: 'Tri', mesh: 0 }],
+      meshes: [
+        {
+          name: 'Tri',
+          extras: { targetNames: ['Lift'] },
+          weights: [0.25],
+          primitives: [{ attributes: { POSITION: 0 }, targets: [{ POSITION: 1 }] }],
+        },
+      ],
+      buffers: [{ byteLength: len }],
+      bufferViews: parts.map((p, i) => ({ buffer: 0, byteOffset: offsets[i], byteLength: p.length })),
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 0, -1], max: [1, 0, 0] },
+        {
+          componentType: 5126,
+          count: 3,
+          type: 'VEC3',
+          min: [0, 0, 0],
+          max: [0, 1, 0],
+          sparse: {
+            count: 1,
+            indices: { bufferView: 1, componentType: 5123 },
+            values: { bufferView: 2 },
+          },
+        },
+        { bufferView: 3, componentType: 5126, count: 2, type: 'SCALAR', min: [0], max: [1] },
+        { bufferView: 4, componentType: 5126, count: 6, type: 'SCALAR' },
+      ],
+      animations: [
+        {
+          channels: [{ sampler: 0, target: { node: 0, path: 'weights' } }],
+          samplers: [{ input: 2, output: 3, interpolation: 'CUBICSPLINE' }],
+        },
+      ],
+    };
+    const doc = SceneDoc.create({ empty: true });
+    doc.updateScene({ fps: 24, frame_start: 1, frame_end: 25 });
+    const res = importFile(doc, 'glb', writeGLB(json, bin));
+    expect(res.warnings.join('\n')).not.toMatch(/Morph|weights/);
+    const tri = doc.findObjectByName('Tri')!;
+    const keys = doc.getShapeKeys(tri.data!);
+    expect(keys.map((k) => [k.name, k.value])).toEqual([['Lift', 0.25]]);
+    const ev = new SceneEvaluator(doc);
+    // glTF vertex 2 (0, 0, -1) is editor (0, 1, 0); "Lift" raises it to z = 1 at full weight
+    const z2 = (frame: number) => ev.evaluate(frame).byId.get(tri.id)!.mesh!.positions[2 * 3 + 2];
+    expect(z2(1)).toBeCloseTo(0, 5);
+    expect(z2(25)).toBeCloseTo(1, 5);
   });
 
   it('re-imports a skinned mesh at its rest pose in world space', () => {
@@ -523,6 +662,40 @@ describe('glTF export: sampled animation, skins and morph targets (#20)', () => 
     expect(n.matrix).toHaveLength(16);
     const w = new SceneEvaluator(doc).evaluate(1).byId.get(child)!.worldMatrix;
     expectClose(gltfPose(json, bin).world[nodeIndex(json, 'C')], yUpWorld(w), 1e-6, 'sheared world');
+  });
+
+  it('animates a sheared transform with the closest rotation (not without rotation), with a warning', () => {
+    const doc = SceneDoc.create({ empty: true });
+    doc.updateScene({ frame_start: 1, frame_end: 11, fps: FPS });
+    const parent = doc.addObject({ type: 'EMPTY', name: 'P', scale: [1.5, 1, 1] });
+    const child = doc.addObject({
+      type: 'MESH',
+      name: 'C',
+      data: doc.addMesh('C', createCube()),
+      parent,
+      location: [1, 0, 0],
+    });
+    doc.setFCurve(
+      keyed(child, 'rotation_euler', 2, [
+        [1, 0],
+        [11, Math.PI / 2],
+      ]),
+    );
+    const res = exportScene(doc, 'glb', { objectIds: [child] });
+    const { json, bin } = parseGltf(res.data);
+    expect(gltfProblems(json, bin)).toEqual([]);
+    expect((res.warnings ?? []).join('\n')).toMatch(/'C' has a sheared transform/);
+    const n = nodeIndex(json, 'C');
+    const ev = new SceneEvaluator(doc);
+    // frame 6: 45° inside a 1.5× x-scale (sheared); TRS can only approximate it, but the closest
+    // rotation keeps every element within 0.2 (no rotation at all would be off by more than 1)
+    const w6 = ev.evaluate(6, { forRender: true }).byId.get(child)!.worldMatrix;
+    expectClose(gltfPose(json, bin, 5 / FPS).world[n], yUpWorld(w6), 0.2, 'sheared @6');
+    // frames 1 and 11 (0° and 90°) are not sheared: exact
+    for (const frame of [1, 11]) {
+      const w = ev.evaluate(frame, { forRender: true }).byId.get(child)!.worldMatrix;
+      expectClose(gltfPose(json, bin, (frame - 1) / FPS).world[n], yUpWorld(w), 1e-4, `@${frame}`);
+    }
   });
 
   it('writes no animation for a static scene and keeps plain object transforms exact', () => {
@@ -642,7 +815,49 @@ describe('glTF export: procedural textures on meshes without UVs (#21)', () => {
     expect(uv.every((v) => v >= 0 && v <= 1)).toBe(true);
     expect(json.materials[0].pbrMetallicRoughness.baseColorTexture).toEqual({ index: 0 });
     expect(json.images).toHaveLength(1);
-  });
+  }, 60_000);
+
+  it('keeps image textures of a material shared with a mesh whose UVs were generated', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const px = new Uint8ClampedArray([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]);
+    const png = encodePNG({ width: 2, height: 2, data: px });
+    const img = doc.addImage({ name: 'Checker', mime: 'image/png', width: 2, height: 2, data: png });
+    const textured = doc.addMaterial({
+      name: 'Textured',
+      textures: { base_color: { image: img, scale: [1, 1], offset: [0, 0] } },
+    });
+    const stripes = doc.addMaterial({
+      name: 'Stripes',
+      textures: { base_color: slot(defaultProcedural('WAVE', { mapping: 'OBJECT', scale: 4 })) },
+    });
+    // "A" (exported first) has no UVs: generated for its procedural slot, its image slot dropped
+    const noUv = { ...createCube(), uvs: null };
+    noUv.faceMaterials = noUv.faces.map((_, f) => f % 2);
+    doc.addObject({
+      type: 'MESH',
+      name: 'A',
+      data: doc.addMesh('A', noUv),
+      material_slots: [stripes, textured],
+    });
+    doc.addObject({
+      type: 'MESH',
+      name: 'B',
+      data: doc.addMesh('B', createCube()),
+      location: [3, 0, 0],
+      material_slots: [textured],
+    });
+    const { json, res } = exportGlb(doc);
+    expect((res.warnings ?? []).join('\n')).toMatch(/'Textured': image textures need UVs, but mesh 'A'/);
+    const matOf = (name: string) => {
+      const mesh = json.meshes[json.nodes[nodeIndex(json, name)].mesh];
+      return mesh.primitives.map((p: Json) => json.materials[p.material]);
+    };
+    const onB = matOf('B')[0];
+    expect(onB.name).toBe('Textured');
+    expect(onB.pbrMetallicRoughness.baseColorTexture).toBeDefined();
+    const onA = matOf('A').find((m: Json) => m.name === 'Textured');
+    expect(onA.pbrMetallicRoughness.baseColorTexture).toBeUndefined();
+  }, 60_000);
 });
 
 /** Re-exported for the vertex check of skinned meshes (rest pose): bone matrices are used. */

@@ -12,6 +12,7 @@ import type { ProjectSession } from '../../project/session';
 import { Checkbox, ColorField, NumberField, Panel, Row, SelectField, RAD } from '../fields/fields';
 import { SchemaForm } from '../SchemaForm';
 import { animState, setProp } from './prop-edit';
+import { animatedBlock } from './animated';
 import { registry, run } from '../../editor/editor';
 import { toast } from '../../app/store';
 import { telemetry } from '../../telemetry/telemetry';
@@ -539,6 +540,8 @@ export function mistDensityForDistance(distance: number): number {
 
 export function WorldTab({ s }: { s: ProjectSession }) {
   const w = s.doc.getWorld();
+  /** The values at the current frame (keyframes and drivers applied), which the renderers use. */
+  const a = animatedBlock<WorldSettings>(s, 'world', 'world') ?? w;
   const set = (f: keyof WorldSettings, v: unknown, final = true) => setProp(s, 'world', null, f, v, final);
   const st = (f: keyof WorldSettings, i = 0) => animState(s, 'world', 'world', f, i);
   const environments = ENVIRONMENTS.some((e) => e.value === w.environment)
@@ -550,11 +553,11 @@ export function WorldTab({ s }: { s: ProjectSession }) {
       <div class="prop-context">Scene › World</div>
       <Panel title="Surface">
         <Row label="Color">
-          <ColorField value={w.color} testId="world-color" onChange={(v, f) => set('color', v, f)} />
+          <ColorField value={a.color} testId="world-color" onChange={(v, f) => set('color', v, f)} />
         </Row>
         <Row label="Strength">
           <NumberField
-            value={w.strength}
+            value={a.strength}
             min={0}
             max={100}
             step={0.01}
@@ -579,7 +582,7 @@ export function WorldTab({ s }: { s: ProjectSession }) {
         </Row>
         <Row label="Strength">
           <NumberField
-            value={w.environment_strength}
+            value={a.environment_strength}
             min={0}
             max={20}
             step={0.01}
@@ -591,7 +594,7 @@ export function WorldTab({ s }: { s: ProjectSession }) {
         {!sky && (
           <Row label="Rotation">
             <NumberField
-              value={w.environment_rotation}
+              value={a.environment_rotation}
               unit="°"
               step={1}
               {...RAD}
@@ -609,11 +612,11 @@ export function WorldTab({ s }: { s: ProjectSession }) {
           />
         </Row>
       </Panel>
-      {sky && <SkyPanel s={s} w={w} set={set} st={st} />}
-      <Panel title="Mist" id="world-mist" defaultOpen={w.mist_density > 0}>
+      {sky && <SkyPanel s={s} w={a} set={set} st={st} />}
+      <Panel title="Mist" id="world-mist" defaultOpen={a.mist_density > 0 || !!st('mist_density')}>
         <Row label="Density" title="Distance fog density in 1/m (0 = off)">
           <NumberField
-            value={w.mist_density}
+            value={a.mist_density}
             min={0}
             max={1000}
             step={0.001}
@@ -626,18 +629,19 @@ export function WorldTab({ s }: { s: ProjectSession }) {
         </Row>
         <Row label="Distance" title="View depth in metres where the mist reaches 95 %">
           <NumberField
-            value={w.mist_density > 0 ? mistDensityForDistance(1) / w.mist_density : NaN}
+            value={a.mist_density > 0 ? mistDensityForDistance(1) / a.mist_density : NaN}
             placeholder="Off"
             min={0.01}
             step={1}
             unit=" m"
+            state={st('mist_density')}
             testId="world-mist-distance"
             onChange={(v, f) => set('mist_density', mistDensityForDistance(v), f)}
           />
         </Row>
         <Row label="Color">
           <ColorField
-            value={w.mist_color}
+            value={a.mist_color}
             testId="world-mist-color"
             onChange={(v, f) => set('mist_color', v, f)}
           />
@@ -649,6 +653,7 @@ export function WorldTab({ s }: { s: ProjectSession }) {
 
 function SkyPanel(p: {
   s: ProjectSession;
+  /** The world at the current frame (animated values). */
   w: WorldSettings;
   set: (f: keyof WorldSettings, v: unknown, final?: boolean) => void;
   st: (f: keyof WorldSettings, i?: number) => ReturnType<typeof animState>;

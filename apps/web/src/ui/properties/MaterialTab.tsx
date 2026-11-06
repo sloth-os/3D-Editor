@@ -32,6 +32,7 @@ import {
   VectorField,
 } from '../fields/fields';
 import { animState, setProp } from './prop-edit';
+import { animatedBlock } from './animated';
 import { run, runResult } from '../../editor/editor';
 import { Icon } from '../icons';
 import { toast } from '../../app/store';
@@ -470,19 +471,21 @@ function PresetPanel({
 function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
   const set = (f: string, v: unknown, final = true) => setProp(s, 'materials', m.id, f, v, final);
   const st = (path: string) => animState(s, 'material', m.id, path, 0);
+  /** The values at the current frame (keyframes and drivers applied), which the renderers use. */
+  const a = animatedBlock<MaterialData>(s, 'material', m.id) ?? m;
   return (
     <>
       <Panel title="Surface (Principled)">
         <Row label="Base Color">
           <ColorField
-            value={m.base_color}
+            value={a.base_color}
             testId="material-base-color"
             onChange={(v, f) => set('base_color', v, f)}
           />
         </Row>
         <Row label="Metallic">
           <NumberField
-            value={m.metallic}
+            value={a.metallic}
             min={0}
             max={1}
             slider
@@ -493,7 +496,7 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
         </Row>
         <Row label="Roughness">
           <NumberField
-            value={m.roughness}
+            value={a.roughness}
             min={0}
             max={1}
             slider
@@ -503,17 +506,34 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
           />
         </Row>
         <Row label="IOR">
-          <NumberField value={m.ior} min={1} max={4} step={0.01} onChange={(v, f) => set('ior', v, f)} />
+          <NumberField
+            value={a.ior}
+            min={1}
+            max={4}
+            step={0.01}
+            state={st('ior')}
+            testId="material-ior"
+            onChange={(v, f) => set('ior', v, f)}
+          />
         </Row>
         <Row label="Alpha">
-          <NumberField value={m.alpha} min={0} max={1} slider onChange={(v, f) => set('alpha', v, f)} />
-        </Row>
-        <Row label="Transmission">
           <NumberField
-            value={m.transmission}
+            value={a.alpha}
             min={0}
             max={1}
             slider
+            state={st('alpha')}
+            testId="material-alpha"
+            onChange={(v, f) => set('alpha', v, f)}
+          />
+        </Row>
+        <Row label="Transmission">
+          <NumberField
+            value={a.transmission}
+            min={0}
+            max={1}
+            slider
+            state={st('transmission')}
             testId="material-transmission"
             onChange={(v, f) => set('transmission', v, f)}
           />
@@ -521,11 +541,11 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
       </Panel>
       <Panel title="Emission">
         <Row label="Color">
-          <ColorField value={m.emission_color} onChange={(v, f) => set('emission_color', v, f)} />
+          <ColorField value={a.emission_color} onChange={(v, f) => set('emission_color', v, f)} />
         </Row>
         <Row label="Strength">
           <NumberField
-            value={m.emission_strength}
+            value={a.emission_strength}
             min={0}
             step={0.05}
             state={st('emission_strength')}
@@ -537,16 +557,17 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
       <Panel title="Coat & Sheen" defaultOpen={false}>
         <Row label="Coat">
           <NumberField
-            value={m.coat_weight}
+            value={a.coat_weight}
             min={0}
             max={1}
             slider
+            state={st('coat_weight')}
             onChange={(v, f) => set('coat_weight', v, f)}
           />
         </Row>
         <Row label="Coat Roughness">
           <NumberField
-            value={m.coat_roughness}
+            value={a.coat_roughness}
             min={0}
             max={1}
             slider
@@ -555,15 +576,16 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
         </Row>
         <Row label="Sheen">
           <NumberField
-            value={m.sheen_weight}
+            value={a.sheen_weight}
             min={0}
             max={1}
             slider
+            state={st('sheen_weight')}
             onChange={(v, f) => set('sheen_weight', v, f)}
           />
         </Row>
         <Row label="Sheen Tint">
-          <ColorField value={m.sheen_tint} onChange={(v, f) => set('sheen_tint', v, f)} />
+          <ColorField value={a.sheen_tint} onChange={(v, f) => set('sheen_tint', v, f)} />
         </Row>
       </Panel>
       <Panel title="Textures" id="material-textures">
@@ -590,7 +612,7 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
         {m.blend_method === 'CLIP' && (
           <Row label="Clip Threshold">
             <NumberField
-              value={m.alpha_threshold}
+              value={a.alpha_threshold}
               min={0}
               max={1}
               slider
@@ -600,7 +622,7 @@ function PrincipledPanel({ s, m }: { s: ProjectSession; m: MaterialData }) {
         )}
         <Row label="Normal Strength" title="Strength of normal maps and procedural bump">
           <NumberField
-            value={m.normal_strength}
+            value={a.normal_strength}
             min={0}
             max={10}
             step={0.01}
@@ -878,12 +900,15 @@ function ProceduralEditor(p: {
   channel: MaterialTextureChannel;
   tex: ProceduralTexture;
 }) {
-  const { s, m, channel, tex } = p;
+  const { s, m, channel } = p;
+  // the texture at the current frame (keyframed parameters as the renderers use them); edits change
+  // the stored texture (`p.tex`)
+  const tex = channelProcedural(animatedBlock<MaterialData>(s, 'material', m.id), channel) ?? p.tex;
   const tid = `tex-${channel}`;
   const scalar = SCALAR_CHANNELS.has(channel);
   const params = tex.params ?? {};
   const animPath = (field: string) => `textures.${channel}.procedural.${field}`;
-  const st = (field: string) => animState(s, 'material', m.id, animPath(field), 0);
+  const st = (field: string, index = 0) => animState(s, 'material', m.id, animPath(field), index);
   /** Replaces this channel's texture in the current material (other channels stay as they are now). */
   const writeTexture = (fn: (t: ProceduralTexture) => ProceduralTexture) => {
     const cur = s.doc.getMaterial(m.id);
@@ -1028,6 +1053,7 @@ function ProceduralEditor(p: {
             <NumberField
               value={tex.color_a[0]}
               step={0.01}
+              state={st('color_a')}
               testId={`${tid}-value-a`}
               onChange={(v, f) => set('color_a', grey(v), f)}
             />
@@ -1036,6 +1062,7 @@ function ProceduralEditor(p: {
             <NumberField
               value={tex.color_b[0]}
               step={0.01}
+              state={st('color_b')}
               testId={`${tid}-value-b`}
               onChange={(v, f) => set('color_b', grey(v), f)}
             />

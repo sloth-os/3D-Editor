@@ -2,19 +2,26 @@
 /**
  * Robot palletizing workcell — built from scratch through the 3D editor's MCP server.
  *
- *   MCP_URL=http://127.0.0.1:8080/mcp node examples/robot-workcell/build.mjs [options]
+ *   MCP_URL=http://127.0.0.1:8080/mcp node examples/robot-workcell/build.mjs [mode] [options]
  *
- * Options
- *   --no-render        build and verify the scene only (no render, no export)
- *   --preview=DIR      also write quick RASTER previews + a contact sheet into DIR (not the outputs)
- *   --still-only       final outputs: only render.png
- *   --skip-still       final outputs: skip render.png (GIF, contact sheet, GLB only)
+ * Modes (the scene is always deleted, rebuilt and verified first)
+ *   (none)             final renders: render.png, contact_sheet.png, preview.gif
+ *   --no-render        build + verify only (a few seconds)
+ *   --export-only      build + verify, then export scene.glb (no renders)
+ *   --preview=DIR      build + verify, then quick previews into DIR (RASTER stills, a RASTER
+ *                      contact sheet and one small path-traced frame); the outputs are untouched
+ * Options for the final renders
+ *   --still-only       only render.png
+ *   --anim-only        only contact_sheet.png and preview.gif
+ *   --still-time=S     time limit of the path-traced still in seconds (default 480)
  *
- * Outputs (next to this script): render.png (path traced still), preview.gif (48-frame
- * pick-and-place cycle), contact_sheet.png, scene.glb.
+ * Outputs (next to this script): render.png (path-traced 1280x720 still), contact_sheet.png
+ * (24 path-traced frames of the cycle), preview.gif (48-frame pick-and-place cycle) and, with
+ * --export-only, scene.glb.
  *
  * Everything is created through MCP tools (create_project, run_operator, batch, insert_keyframe,
- * set_scene_settings, render_image, render_animation, export_scene …). Sizes are metres, Z is up.
+ * add_modifier, set_scene_settings, get_object, get_mesh_data, render_image, render_animation,
+ * export_scene …). Sizes are metres, angles radians, Z is up. Any tool error aborts the build.
  */
 import { writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -26,13 +33,20 @@ const PROJECT = 'robot-workcell';
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(`--${name}`);
 const option = (name) => argv.find((a) => a.startsWith(`--${name}=`))?.split('=').slice(1).join('=');
+const KNOWN = ['no-render', 'export-only', 'preview', 'still-only', 'anim-only', 'still-time'];
+for (const a of argv) {
+  const name = a.replace(/^--/, '').split('=')[0];
+  if (!a.startsWith('--') || !KNOWN.includes(name)) throw new Error(`unknown argument ${a} (known: ${KNOWN.map((k) => `--${k}`).join(' ')})`);
+}
 const NO_RENDER = flag('no-render');
+const EXPORT_ONLY = flag('export-only');
 const PREVIEW_DIR = option('preview');
 const STILL_ONLY = flag('still-only');
-const SKIP_STILL = flag('skip-still');
+const ANIM_ONLY = flag('anim-only');
+const STILL_TIME = Number(option('still-time') ?? 480);
+const FINAL_RENDERS = !NO_RENDER && !EXPORT_ONLY && !PREVIEW_DIR;
 
 const T0 = Date.now();
-const timings = {};
 const log = (...a) => console.log(`[${((Date.now() - T0) / 1000).toFixed(1).padStart(6)}s]`, ...a);
 
 const mcp = await connect();
@@ -40,7 +54,9 @@ const mcp = await connect();
 // ---------------------------------------------------------------------------------------------
 // MCP helpers
 // ---------------------------------------------------------------------------------------------
+let mcpCalls = 0;
 async function call(tool, args = {}, opts) {
+  mcpCalls++;
   try {
     return await mcp.call(tool, args, opts);
   } catch (e) {
@@ -55,10 +71,16 @@ async function op(operator, params = {}, selection) {
   return r.result;
 }
 async function batch(operations, label = 'batch') {
+  const results = [];
   for (let i = 0; i < operations.length; i += 200) {
     const r = await tool('batch', { operations: operations.slice(i, i + 200) });
     if (!r.ok) throw new Error(`${label}: ${JSON.stringify(r).slice(0, 2000)}`);
+    // batch reports every operation's warnings: surface them instead of dropping them
+    for (const res of r.results ?? [])
+      for (const rep of res.reports ?? []) if (rep.level !== 'INFO') log(`  ${label} / ${res.operator}: ${rep.level} ${rep.message}`);
+    results.push(...(r.results ?? []));
   }
+  return results;
 }
 const sel = (objects, active) => ({ operator: 'object.select', params: { objects, ...(active ? { active } : {}) } });
 
@@ -135,6 +157,8 @@ const SHOULDER = [0.14, 0, 0.84];
 const ELBOW = [0.3, 0, 1.8];
 const WRIST = [1.32, 0, 1.62];
 const WRIST_TAIL = [1.32, 0, 1.38];
+const HOSE_START = [-0.3, 0, 0.63]; // dress-pack hose: cable fitting at the back of the turret ...
+const HOSE_END = [WRIST[0] - 0.04, 0, WRIST[2] + 0.12]; // ... to the top of the wrist
 const GRIP_DROP = 0.52; // wrist head (IK target) -> centre of a gripped crate
 const CRATE = [0.42, 0.42, 0.32];
 const CONVEYOR_X = -1.55;
@@ -176,15 +200,23 @@ const TIMELINE = [
   [86, 'qLift'],
   [96, 'home'],
 ];
-const CAMERA_LOC = [0.45, -6.1, 2.55];
-const CAMERA_AIM = [0.0, 0.0, 1.05];
-const STILL_FRAME = 47;
+// Camera: a low three-quarter view from the open front-left corner of the cell; it pans after
+// the gripper with a half-strength Damped Track and keeps the gripper in focus (depth of field).
+const CAMERA_LOC = [-2.3, -4.7, 1.55];
+const CAMERA_AIM = [0.3, 0.05, 1.0];
+const CAMERA_LENS = 30;
+const STILL_FRAME = 49; // the crate lifted high, on its way from the conveyor to the free pallet slot
 const F_GRIP_START = 28;
 const F_GRIPPED = 33; // fingers closed: the crate starts to follow the gripper
 const F_RELEASE = 72; // crate set down on the pallet
 const F_OPEN = 77;
-const F_CRATE_ARRIVES = 18;
-const CRATE_START_Y = 2.3;
+// Conveyor: the crate waits at the pick station at frame 1. While the robot swings it to the
+// pallet, the conveyor indexes the queue one pitch forward, so that at frame 96 the next crate
+// sits where this one started (the conveyor part of the cycle loops seamlessly).
+const QUEUE_PITCH = 1.05; // spacing of the waiting crates along the belt (m)
+const QUEUED = ['Crate_Queued1', 'Crate_Queued2', 'Crate_Queued3', 'Crate_Queued4'];
+const F_INDEX_START = 44;
+const F_INDEX_END = 62;
 
 const smoother = (u) => u * u * u * (u * (u * 6 - 15) + 10);
 function cylAt(f) {
@@ -204,10 +236,8 @@ const targetAt = (f) => {
   const c = cylAt(f);
   return [c.r * Math.cos(c.az), c.r * Math.sin(c.az), c.z];
 };
-const crateYAt = (f) => {
-  const u = Math.min(1, Math.max(0, (f - 1) / (F_CRATE_ARRIVES - 1)));
-  return CRATE_START_Y * (1 - (1 - (1 - u) ** 3));
-};
+/** Belt travel of the queued crates (0 -> one pitch) while the conveyor indexes. */
+const beltAt = (f) => QUEUE_PITCH * smoother(Math.min(1, Math.max(0, (f - F_INDEX_START) / (F_INDEX_END - F_INDEX_START))));
 
 // ---------------------------------------------------------------------------------------------
 // 1. Project
@@ -262,7 +292,8 @@ const MAT = {
   sign: { name: 'Sign Yellow', base_color: [0.9, 0.7, 0.05, 1], roughness: 0.5 },
   text: { name: 'Sign Black', base_color: [0.01, 0.01, 0.01, 1], roughness: 0.5 },
   wall: { name: 'Corrugated Wall', base_color: [0.05, 0.058, 0.066, 1], metallic: 0.35, roughness: 0.5 },
-  window: { name: 'Hall Window', base_color: [0.05, 0.06, 0.08, 1], roughness: 0.1, emission_color: [0.35, 0.5, 0.85], emission_strength: 0.75 },
+  wallSide: { name: 'Corrugated Wall Side', base_color: [0.05, 0.058, 0.066, 1], metallic: 0.35, roughness: 0.5 },
+  window: { name: 'Hall Window', base_color: [0.05, 0.06, 0.08, 1], roughness: 0.1, emission_color: [0.35, 0.5, 0.85], emission_strength: 2.0 },
   column: { name: 'Column Paint', base_color: [0.16, 0.17, 0.18, 1], metallic: 0.3, roughness: 0.5 },
   curtain: { name: 'Light Curtain Red', base_color: [0.3, 0.01, 0.01, 1], roughness: 0.3, emission_color: [1.0, 0.04, 0.02], emission_strength: 6 },
 };
@@ -327,8 +358,8 @@ const assign = (material, objects, slot = 0) => ({
             scale: 0.9,
             detail: 6,
             roughness: 0.55,
-            color_a: [0.07, 0.075, 0.08],
-            color_b: [0.14, 0.145, 0.15],
+            color_a: [0.035, 0.038, 0.042],
+            color_b: [0.08, 0.083, 0.088],
           },
         },
       },
@@ -495,7 +526,8 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
   log(`gripper: finger travel ${(GRIP_TRAVEL * 1000).toFixed(1)} mm per side`);
 }
 
-// Materials + smooth shading + bone parenting of every rigid part
+// Materials + smooth shading + bone parenting of every rigid part. Bone parenting works like
+// Blender's Ctrl+P > Bone: select the parts, make the armature active, object.parent_set BONE.
 {
   const ops = [];
   for (const [name, mat] of robotParts) if (mat) ops.push(assign(mat, [name]));
@@ -504,11 +536,11 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
   ops.push(sel(smooth), { operator: 'object.shade_auto_smooth', params: { angle: 0.6 } });
   for (const bone of ['J1_Base', 'J2_Shoulder', 'J3_Elbow', 'J4_Wrist']) {
     const kids = robotParts.filter(([, , b]) => b === bone).map(([n]) => n);
-    ops.push({ operator: 'object.parent_to', params: { objects: kids, parent: 'Robot_Rig', type: 'BONE', bone } });
+    ops.push(sel([...kids, 'Robot_Rig'], 'Robot_Rig'), { operator: 'object.parent_set', params: { type: 'BONE', bone } });
   }
-  ops.push({ operator: 'object.parent_to', params: { objects: ['Robot_BasePlate', 'Robot_Pedestal'], parent: 'Robot_Rig', type: 'OBJECT' } });
+  ops.push(sel(['Robot_BasePlate', 'Robot_Pedestal', 'Robot_Rig'], 'Robot_Rig'), { operator: 'object.parent_set', params: { type: 'OBJECT' } });
   await batch(ops, 'robot materials + bone parenting');
-  log(`bone-parented ${robotParts.length} rigid parts`);
+  log(`bone-parented ${robotParts.length} rigid parts (object.parent_set BONE)`);
 }
 
 // Dress-pack hose along the arm, skinned with automatic weights so it bends with the joints
@@ -521,7 +553,7 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
   const dF = dirOf(ELBOW, WRIST);
   const up = [-dF[2], 0, dF[0]];
   const pts = [
-    [-0.3, 0, 0.63],
+    HOSE_START,
     [-0.31, 0, 0.74],
     [-0.22, 0, 0.9],
     add(add(SHOULDER, mul(dU, 0.35)), mul(nB, 0.17)),
@@ -532,7 +564,7 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
     pts.push([ELBOW[0] + 0.235 * Math.cos(t), 0, ELBOW[2] + 0.235 * Math.sin(t)]);
   }
   for (const t of [0.35, 0.68, 0.9]) pts.push(add(add(ELBOW, mul(dF, t)), mul(up, 0.135)));
-  pts.push([WRIST[0] - 0.04, 0, WRIST[2] + 0.12]);
+  pts.push(HOSE_END);
   // densify (~4 cm) so the skinned tube bends smoothly
   const dense = [];
   for (let i = 0; i < pts.length - 1; i++) {
@@ -556,6 +588,22 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
   );
   await batch([assign('rubber', ['Robot_Hose']), sel(['Robot_Hose']), { operator: 'object.shade_smooth' }], 'hose');
   log(`hose: ${hose.vertices} vertices, auto weights -> ${JSON.stringify(weights.vertex_groups)}`);
+  // Weight fix-up: the automatic weights give the hose root on the turret ~45 % shoulder and
+  // elbow influence, so the root would slide over its fitting whenever the shoulder pitches.
+  // Pin the first 10 cm to J1_Base and blend into the automatic weights over the next 15 cm
+  // (read with get_mesh_data, written with object.vertex_group_set_weights).
+  const wd = await tool('get_mesh_data', { object: 'Robot_Hose', include: ['vertices', 'vertex_groups'], source: 'BASE', space: 'WORLD', limit: 5000 });
+  const groups = Object.keys(wd.vertex_groups);
+  const fixed = Object.fromEntries(groups.map((g) => [g, []]));
+  wd.vertices.forEach((v, i) => {
+    const k = Math.min(1, Math.max(0, (dist(v, HOSE_START) - 0.1) / 0.15));
+    for (const g of groups) fixed[g][i] = r6((g === 'J1_Base' ? 1 - k : 0) + k * wd.vertex_groups[g][i]);
+  });
+  await batch(
+    groups.map((group) => ({ operator: 'object.vertex_group_set_weights', params: { object: 'Robot_Hose', group, weights: fixed[group] } })),
+    'hose root weights',
+  );
+  log(`hose root pinned to J1_Base (${wd.vertices.filter((v) => dist(v, HOSE_START) < 0.25).length} vertices re-weighted)`);
   // clamps holding the hose (bone-parented rings)
   const clampOps = [];
   const clampAt = (name, p, dir, bone) => {
@@ -564,7 +612,7 @@ const GRIP_TRAVEL = PAD_OPEN - 0.0065 - (CRATE[1] / 2 + 0.002); // pads stop 2 m
       params: { name, major_radius: 0.042, minor_radius: 0.011, major_segments: 24, minor_segments: 8, location: p, rotation: [0, Math.atan2(dir[0], dir[2]), 0] },
     });
     clampOps.push(assign('steel', [name]));
-    clampOps.push({ operator: 'object.parent_to', params: { objects: [name], parent: 'Robot_Rig', type: 'BONE', bone } });
+    clampOps.push(sel([name, 'Robot_Rig'], 'Robot_Rig'), { operator: 'object.parent_set', params: { type: 'BONE', bone } });
   };
   clampAt('Robot_HoseClamp1', pts[3], dU, 'J2_Shoulder');
   clampAt('Robot_HoseClamp2', pts[4], dU, 'J2_Shoulder');
@@ -678,7 +726,7 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   const label = addBox(g, [0, -d / 2 + 0.0035, 0.07], [0.16, 0.01, 0.06]);
   await batch(
     [
-      meshOp('Crate', g, { location: [PICK[0], CRATE_START_Y, PICK[2]] }),
+      meshOp('Crate', g, { location: PICK }),
       assign('crate', ['Crate'], 0),
       assign('label', ['Crate'], 1),
     ],
@@ -692,7 +740,7 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   });
   await tool('add_modifier', { object: 'Crate', type: 'BEVEL', params: { width: 0.004, segments: 2 } });
   const copies = [
-    ['Crate_Queued', [PICK[0], 3.25, PICK[2]]],
+    ...QUEUED.map((name, i) => [name, [PICK[0], PICK[1] + (i + 1) * QUEUE_PITCH, PICK[2]]]),
     ['Crate_Pallet1', SLOT(-1, 1)],
     ['Crate_Pallet2', SLOT(1, 1)],
     ['Crate_Pallet3', SLOT(1, -1)],
@@ -701,7 +749,7 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
     await tool('duplicate_object', { object: 'Crate', linked: true, name });
     await tool('transform_object', { object: name, location: loc });
   }
-  log(`crates: active + ${copies.length} linked duplicates`);
+  log(`crates: active + ${copies.length} linked duplicates (${QUEUED.length} queued on the conveyor, 3 on the pallet)`);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -791,17 +839,19 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   addBox(g, [-3.112, -2.6, 0.95], [0.006, 0.03, 1.6]);
   addBox(g, [2.512, -2.6, 0.95], [0.006, 0.03, 1.6]);
   ops.push(meshOp('LightCurtain_Emitters', g), assign('curtain', ['LightCurtain_Emitters']));
-  // emergency-stop station inside the light curtain (yellow box, red mushroom button)
+  // emergency-stop station at the operator side, just outside the light curtain
+  // (yellow box, red mushroom button facing the walkway)
+  const [ex, ey] = [-3.7, -2.95];
   g = newGeo();
-  addBox(g, [-2.55, -2.05, 0.55], [0.06, 0.06, 1.1]);
-  addBox(g, [-2.55, -2.05, 0.02], [0.24, 0.24, 0.04]);
+  addBox(g, [ex, ey, 0.55], [0.06, 0.06, 1.1]);
+  addBox(g, [ex, ey, 0.02], [0.24, 0.24, 0.04]);
   ops.push(meshOp('EStop_Post', g), assign('graphite', ['EStop_Post']));
   g = newGeo();
-  addBox(g, [-2.55, -2.09, 1.16], [0.17, 0.12, 0.17]);
+  addBox(g, [ex, ey - 0.04, 1.16], [0.17, 0.12, 0.17]);
   ops.push(meshOp('EStop_Box', g), assign('sign', ['EStop_Box']));
   g = newGeo();
-  addCylinder(g, [-2.55, -2.165, 1.17], 0.022, 0.04, 'Y', 20);
-  addCylinder(g, [-2.55, -2.20, 1.17], 0.045, 0.03, 'Y', 28);
+  addCylinder(g, [ex, ey - 0.115, 1.17], 0.022, 0.04, 'Y', 20);
+  addCylinder(g, [ex, ey - 0.15, 1.17], 0.045, 0.03, 'Y', 28);
   ops.push(meshOp('EStop_Button', g), assign('button', ['EStop_Button']));
   // floor cable protector from the fence to the robot base (trapezoid profile, hazard striped)
   g = newGeo();
@@ -817,38 +867,43 @@ async function buildPallet(prefix, [cx, cy], rotZ, stack = 1) {
   log('sign, controller cabinet, signal tower, light curtain, e-stop, cable protector');
 }
 
-// Factory hall behind the cell: corrugated walls with a strip of windows, steel columns
+// Factory hall around the cell: corrugated walls (north, west, east) with strips of windows and
+// steel columns. The corrugation is a WAVE bump on the normal channel; its bands run along the
+// wall, so the side walls get their own material with the waves along Y.
 {
   const ops = [];
   let g = newGeo();
-  addBox(g, [-1, 7.2, 3.5], [20, 0.2, 7]);
+  addBox(g, [0.4, 7.2, 3.5], [17.6, 0.2, 7]);
+  ops.push(meshOp('Hall_Wall_North', g), assign('wall', ['Hall_Wall_North']));
+  g = newGeo();
   addBox(g, [-8.2, -1, 3.5], [0.2, 16.6, 7]);
-  ops.push(meshOp('Hall_Walls', g), assign('wall', ['Hall_Walls']));
+  addBox(g, [9.1, -1, 3.5], [0.2, 16.6, 7]);
+  ops.push(meshOp('Hall_Walls_Side', g), assign('wallSide', ['Hall_Walls_Side']));
   g = newGeo();
   // mullioned window strips: 3 x 2 panes per bay
-  for (let x = -7.2; x <= 7; x += 2.05)
+  for (let x = -7.2; x <= 8; x += 2.05)
     for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) addBox(g, [x - 0.57 + i * 0.57, 7.08, 2.48 + j * 0.56], [0.52, 0.04, 0.5]);
-  for (let y = -4.5; y <= 6.5; y += 2.05)
-    for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) addBox(g, [-8.08, y - 0.57 + i * 0.57, 2.48 + j * 0.56], [0.04, 0.52, 0.5]);
+  for (const wx of [-8.08, 8.98])
+    for (let y = -4.5; y <= 6.5; y += 2.05)
+      for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) addBox(g, [wx, y - 0.57 + i * 0.57, 2.48 + j * 0.56], [0.04, 0.52, 0.5]);
   ops.push(meshOp('Hall_Windows', g), assign('window', ['Hall_Windows']));
   g = newGeo();
   for (const x of [-6, -2, 2, 6]) addBox(g, [x, 6.9, 3.5], [0.35, 0.35, 7]);
   for (const y of [-4, 0, 4]) addBox(g, [-7.9, y, 3.5], [0.35, 0.35, 7]);
+  for (const y of [-4, 0, 4]) addBox(g, [8.8, y, 3.5], [0.35, 0.35, 7]);
   ops.push(meshOp('Hall_Columns', g), assign('column', ['Hall_Columns']));
   await batch(ops, 'hall');
-  await op('material.procedural_set', {
-    material: MAT.wall.name,
-    channel: 'normal',
-    procedural: { type: 'WAVE', mapping: 'OBJECT', scale: 2.2, params: { wave_type: 'BANDS', direction: 'X', wave_profile: 'SIN', bump_distance: 0.02 } },
+  const corrugation = (material, direction) => ({
+    operator: 'material.procedural_set',
+    params: {
+      material,
+      channel: 'normal',
+      procedural: { type: 'WAVE', mapping: 'OBJECT', scale: 2.2, params: { wave_type: 'BANDS', direction, wave_profile: 'SIN', bump_distance: 0.02 } },
+    },
   });
+  await batch([corrugation(MAT.wall.name, 'X'), corrugation(MAT.wallSide.name, 'Y')], 'wall corrugation');
   log('factory hall: walls (WAVE bump corrugation), window strips, columns');
 }
-
-// UV maps for the meshes with procedural materials: renders do not need them (OBJECT mapping),
-// but the glTF exporter can only bake procedural textures to PNG through UVs.
-for (const object of ['Floor', 'Hazard_Border', 'Hazard_RobotZone', 'Cable_Protector', 'Fence_Panels', 'Hall_Walls',
-  'Pallet_Deck', 'Pallet_Blocks', 'Pallet_Base', 'PalletStack_Deck', 'PalletStack_Blocks', 'PalletStack_Base'])
-  await tool('edit_mesh', { object, operator: 'uv.smart_project', params: { island_margin: 0.01 } });
 
 // Status lamp: the amber light of the signal tower blinks while the cell runs (driver)
 {
@@ -858,11 +913,12 @@ for (const object of ['Floor', 'Hazard_Border', 'Hazard_RobotZone', 'Cable_Prote
     path: 'emission_strength',
     expression: '14 * (fract(frame / 12) < 0.5)',
   });
-  log(`driver on '${MAT.amber.name}'.emission_strength: ${JSON.stringify(d).slice(0, 200)}`);
+  const drv = d.drivers?.[0] ?? d;
+  log(`driver on '${MAT.amber.name}'.emission_strength = ${drv.expression ?? JSON.stringify(d).slice(0, 160)}`);
 }
 
 // ---------------------------------------------------------------------------------------------
-// 8. Animation: IK target path, J1 yaw, J4 wrist roll, gripper shape key, conveyor crate
+// 8. Animation: IK target path, J1 yaw, J4 wrist roll, gripper shape key, conveyor queue
 // ---------------------------------------------------------------------------------------------
 const frames = [];
 for (let f = 1; f <= FRAME_END; f++) frames.push(f);
@@ -886,20 +942,20 @@ await batch(
 // gripper fingers: shape key keyed over time
 for (const [f, v] of [[1, 0], [F_GRIP_START, 0], [F_GRIPPED, 1], [F_RELEASE, 1], [F_OPEN, 0]])
   await tool('insert_keyframe', { object: 'Robot_Gripper', property: 'shape_keys["Grip"].value', frame: f, value: v, interpolation: 'BEZIER' });
-// crate rides the conveyor to the pick station, then holds
+// The active crate waits at the pick station (its own location is keyed at frame 1 so the
+// place keys added in step 9 do not leak backwards). While the robot carries it away the
+// conveyor indexes: every queued crate moves one pitch towards the pick station.
 {
-  const fr = frames.filter((f) => f < F_CRATE_ARRIVES);
+  const fr = frames.filter((f) => f >= F_INDEX_START && f <= F_INDEX_END);
   await batch(
     [
-      keyMany('Crate', 'location', 1, fr, fr.map(crateYAt)),
-      keyMany('Crate', 'location', 1, [F_CRATE_ARRIVES], [0], 'CONSTANT'),
-      keyMany('Crate', 'location', 0, [1], [PICK[0]], 'CONSTANT'),
-      keyMany('Crate', 'location', 2, [1], [PICK[2]], 'CONSTANT'),
+      ...[0, 1, 2].map((i) => keyMany('Crate', 'location', i, [1], [PICK[i]], 'CONSTANT')),
+      ...QUEUED.map((name, i) => keyMany(name, 'location', 1, fr, fr.map((f) => PICK[1] + (i + 1) * QUEUE_PITCH - beltAt(f)))),
     ],
-    'crate conveyor keys',
+    'crate + conveyor keys',
   );
 }
-log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape key and conveyor crate`);
+log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape key, ${QUEUED.length} queued crates`);
 
 // ---------------------------------------------------------------------------------------------
 // 9. The crate follows the gripper while carried: Child Of (J4_Wrist bone) with keyed influence
@@ -931,12 +987,13 @@ log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape ke
 }
 
 // ---------------------------------------------------------------------------------------------
-// 10. Camera (Damped Track on the gripper), lights, world
+// 10. Camera (Damped Track on the gripper + depth of field), lights, world
 // ---------------------------------------------------------------------------------------------
 {
-  await op('object.camera_add', { name: 'Camera', lens: 28, location: CAMERA_LOC });
+  await op('object.camera_add', { name: 'Camera', lens: CAMERA_LENS, clip_start: 0.05, clip_end: 60, location: CAMERA_LOC });
   await op('object.look_at', { objects: ['Camera'], point: CAMERA_AIM });
   await tool('set_active_camera', { camera: 'Camera' });
+  // The camera pans half-way towards the gripper (influence 0.5 keeps the cell framed)
   const ct = await op('object.constraint_add', {
     object: 'Camera',
     type: 'DAMPED_TRACK',
@@ -946,169 +1003,218 @@ log(`keyed ${FRAME_END} frames of IK target / J1 yaw / J4 roll, gripper shape ke
     params: { track_axis: 'TRACK_NEGATIVE_Z' },
   });
   if (ct.errors?.length) throw new Error(`camera constraint: ${JSON.stringify(ct.errors)}`);
-  // Dark factory hall: large soft area lights (warm key over the cell, cool rim behind the
-  // robot, dim fill from the front-left); the world is a dark blue-grey ambient.
+  // Depth of field (path tracer): the gripper stays in focus at every frame, the hall softens
+  const cam = await op('camera.properties_set', { object: 'Camera', dof_use: true, dof_focus_object: 'Robot_Gripper', dof_aperture_fstop: 2.8 });
+  log(`camera: lens ${cam.cameras[0].lens} mm, DOF f/${cam.cameras[0].dof_aperture_fstop} on ${cam.cameras[0].dof_focus_object}`);
+
+  // Lights: two long LED ceiling strips over the cell (RECTANGLE area lights), a warm spot
+  // from high front-left that models the robot and throws its shadow across the floor, and a
+  // cool rectangular rim behind the robot that separates the arm from the dark hall. The world
+  // is a dim blue-grey ambient with mist; the hall windows glow.
   const LIGHTS = [
-    { name: 'Key_Area', energy: 2400, color: [1.0, 0.92, 0.82], size: 2.6, location: [0.6, -1.7, 5.2], aim: [0.0, -0.2, 0.8] },
-    { name: 'Rim_Area', energy: 2100, color: [0.7, 0.84, 1.0], size: 3, location: [-1.2, 4.4, 3.9], aim: [-0.2, 0, 1.2] },
-    { name: 'Fill_Area', energy: 260, color: [0.85, 0.9, 1.0], size: 3, location: [-3.8, -4.6, 3.2], aim: [0.0, -0.2, 0.8] },
+    { name: 'Ceiling_Strip_Front', type: 'AREA', shape: 'RECTANGLE', size: 4.2, size_y: 0.45, energy: 1000, color: [0.93, 0.96, 1.0], location: [-0.3, -1.1, 4.5] },
+    { name: 'Ceiling_Strip_Back', type: 'AREA', shape: 'RECTANGLE', size: 4.2, size_y: 0.45, energy: 800, color: [0.93, 0.96, 1.0], location: [-0.3, 1.3, 4.5] },
+    { name: 'Key_Spot', type: 'SPOT', energy: 5000, spot_size: 0.9, spot_blend: 0.6, shadow_soft_size: 0.35, color: [1.0, 0.8, 0.58], location: [-3.6, -3.6, 5.2], aim: [0.1, -0.2, 0.9] },
+    { name: 'Rim_Cool', type: 'AREA', shape: 'RECTANGLE', size: 3.0, size_y: 1.0, energy: 2000, color: [0.55, 0.72, 1.0], location: [1.2, 4.2, 3.3], aim: [0.0, 0.0, 1.2] },
   ];
   await batch(
-    LIGHTS.map((l) => ({ operator: 'object.light_add', params: { name: l.name, type: 'AREA', energy: l.energy, color: l.color, location: l.location } })),
+    LIGHTS.flatMap(({ aim, ...l }) => [
+      { operator: 'object.light_add', params: l },
+      ...(aim ? [{ operator: 'object.look_at', params: { objects: [l.name], point: aim } }] : []),
+    ]),
     'lights',
   );
-  for (const l of LIGHTS) {
-    await op('object.look_at', { objects: [l.name], point: l.aim });
-    // object.light_add ignores `radius` for area lights and data.set_property cannot resolve the
-    // light datablock by name, so the size is set through a (constant) keyframe on data.size.
-    for (const prop of ['size', 'size_y']) await tool('insert_keyframe', { object: l.name, property: `data.${prop}`, frame: 1, value: l.size });
-  }
-  await tool('set_scene_settings', { environment: 'NONE', world_color: [0.022, 0.026, 0.034], world_strength: 1, mist_distance: 32, mist_color: [0.035, 0.042, 0.055] });
-  log('camera with Damped Track on the gripper, three area lights, dark world');
+  await tool('set_scene_settings', { environment: 'NONE', world_color: [0.006, 0.007, 0.01], world_strength: 1, mist_distance: 30, mist_color: [0.02, 0.024, 0.032] });
+  log(`lights: ${LIGHTS.map((l) => `${l.name} ${l.shape ?? l.type}${l.size ? ` ${l.size}x${l.size_y} m` : ''} ${l.energy} W`).join(', ')}`);
 }
 
 // ---------------------------------------------------------------------------------------------
-// 11. Verification through MCP queries
+// 11. Verification through MCP queries (evaluated values at several frames); any failed check
+//     aborts the build
 // ---------------------------------------------------------------------------------------------
+const verify = {};
 {
+  const failures = [];
+  const check = (ok, msg) => {
+    if (!ok) failures.push(msg);
+  };
+  const mm = (d) => `${(d * 1000).toFixed(1)} mm`;
   const scene = await tool('get_scene', { max_objects: 5 });
-  log(`scene: ${JSON.stringify(scene.counts ?? scene.stats ?? {}).slice(0, 300)}`);
-  if (scene.problems?.length) log(`PROBLEMS: ${JSON.stringify(scene.problems).slice(0, 1500)}`);
+  log(`scene: ${JSON.stringify(scene.counts ?? {}).slice(0, 300)}`);
+  check(!scene.problems?.length, `get_scene problems: ${JSON.stringify(scene.problems ?? []).slice(0, 1500)}`);
+
+  // (a) IK: the wrist reaches the keyed target; (b) the crate rests at the pick station, rides
+  // with the gripper while gripped and stays on its pallet slot after the release; (c) fingers
+  // (shape key) and Child Of influence evaluated per frame; (d) the camera focus follows the gripper
   let worstIk = 0;
   let worstCarry = 0;
-  for (const f of [1, 16, 28, 33, 40, 50, 63, 72, 80, 96]) {
+  const focus = [];
+  for (const f of [1, 12, 16, 22, 28, 33, 40, 47, 50, 56, 63, 68, 72, 77, 80, 88, 96]) {
     const d = await op('armature.describe', { object: 'Robot_Rig', frame: f });
-    const wrist = d.bones.find((b) => b.name === 'J4_Wrist');
-    const want = targetAt(f);
-    const err = dist(wrist.posed_head_world, want);
-    worstIk = Math.max(worstIk, err);
-    const crate = await op('constraint.describe', { object: 'Crate', frame: f });
-    const expectCrate = f >= F_GRIPPED && f < F_RELEASE ? sub(wrist.posed_head_world, [0, 0, GRIP_DROP]) : null;
-    const carry = expectCrate ? dist(crate.world_location, expectCrate) : 0;
-    worstCarry = Math.max(worstCarry, carry);
+    check(!d.errors?.length, `pose errors at ${f}: ${JSON.stringify(d.errors)}`);
+    const wrist = d.bones.find((b) => b.name === 'J4_Wrist').posed_head_world;
+    const ikErr = dist(wrist, targetAt(f));
+    worstIk = Math.max(worstIk, ikErr);
+    const crate = await tool('get_object', { object: 'Crate', frame: f });
+    const grip = await tool('get_object', { object: 'Robot_Gripper', frame: f });
+    const camera = await tool('get_object', { object: 'Camera', frame: f });
+    const carried = f >= F_GRIPPED && f < F_RELEASE;
+    const want = carried ? sub(wrist, [0, 0, GRIP_DROP]) : f < F_GRIPPED ? PICK : PLACE;
+    const carryErr = dist(crate.world_location, want);
+    worstCarry = Math.max(worstCarry, carryErr);
+    const influence = crate.constraints.find((c) => c.name === 'Carried').influence;
+    const fingers = grip.data.shape_keys.find((k) => k.name === 'Grip').value;
+    focus.push(camera.data.dof_focus_distance);
+    check(influence === (carried ? 1 : 0), `Child Of influence ${influence} at frame ${f}`);
+    if (f > F_GRIPPED && f < F_RELEASE) check(fingers > 0.999, `fingers open (${fingers}) while carrying at ${f}`);
+    if (f <= F_GRIP_START || f >= F_OPEN) check(fingers < 0.001, `fingers closed (${fingers}) at ${f}`);
     log(
-      `  f${String(f).padStart(2)} wrist ${fmt(wrist.posed_head_world)} target ${fmt(want)} IK err ${(err * 1000).toFixed(1)} mm` +
-        ` | crate ${fmt(crate.world_location)}${expectCrate ? ` carry err ${(carry * 1000).toFixed(1)} mm` : ''}`,
+      `  f${String(f).padStart(2)} wrist IK err ${mm(ikErr)} | crate ${fmt(crate.world_location)} (${carried ? 'carried' : f < F_GRIPPED ? 'at pick' : 'on pallet'}, err ${mm(carryErr)})` +
+        ` | fingers ${fingers.toFixed(2)} | Child Of ${influence} | focus ${camera.data.dof_focus_distance.toFixed(2)} m`,
     );
-    if (d.errors?.length) log(`  pose errors: ${JSON.stringify(d.errors)}`);
   }
-  log(`worst IK error ${(worstIk * 1000).toFixed(1)} mm, worst carry offset error ${(worstCarry * 1000).toFixed(1)} mm`);
-  // scene.measure works at the agent's current frame: set it first
-  await op('scene.frame_set', { frame: 50 });
-  const m = await op('scene.measure', { objects: ['Robot_Gripper', 'Crate'] });
+  check(worstIk < 0.005, `IK error ${mm(worstIk)}`);
+  check(worstCarry < 0.005, `crate offset error ${mm(worstCarry)}`);
+  check(Math.max(...focus) - Math.min(...focus) > 0.3, `camera focus distance does not follow the gripper: ${focus.join(', ')}`);
+  log(`worst IK error ${mm(worstIk)}, worst crate error ${mm(worstCarry)}, focus ${Math.min(...focus).toFixed(2)}..${Math.max(...focus).toFixed(2)} m`);
+
+  // (e) the skinned hose bends with the arm: the vertices at its wrist end stay at a constant
+  // distance from the wrist joint and those at its turret end on the J1 axis, at every frame
+  const base = await tool('get_mesh_data', { object: 'Robot_Hose', include: ['vertices'], source: 'BASE', space: 'WORLD', limit: 5000 });
+  const endIdx = base.vertices.map((v, i) => [v, i]).filter(([v]) => dist(v, HOSE_END) < 0.05).map(([, i]) => i);
+  const startIdx = base.vertices.map((v, i) => [v, i]).filter(([v]) => dist(v, HOSE_START) < 0.05).map(([, i]) => i);
+  const centroid = (verts, idx) => mul(idx.reduce((acc, i) => add(acc, verts[i]), [0, 0, 0]), 1 / idx.length);
+  const endGap = [];
+  const startRadius = [];
+  for (const f of [1, 28, 47, 56, 72, 96]) {
+    const ev = await tool('get_mesh_data', { object: 'Robot_Hose', include: ['vertices'], source: 'EVALUATED', space: 'WORLD', frame: f, limit: 5000 });
+    const d = await op('armature.describe', { object: 'Robot_Rig', frame: f });
+    const wrist = d.bones.find((b) => b.name === 'J4_Wrist').posed_head_world;
+    endGap.push(dist(centroid(ev.vertices, endIdx), wrist));
+    const s0 = centroid(ev.vertices, startIdx);
+    startRadius.push(Math.hypot(s0[0], s0[1]));
+  }
+  const spread = (a) => Math.max(...a) - Math.min(...a);
+  log(`hose (${base.vertices.length} vertices): wrist end - wrist joint ${endGap.map((x) => x.toFixed(3)).join(' / ')} m; turret end radius ${startRadius.map((x) => x.toFixed(3)).join(' / ')} m`);
+  check(endIdx.length > 3 && startIdx.length > 3, `hose end rings not found (${endIdx.length}, ${startIdx.length})`);
+  check(spread(endGap) < 0.03, `hose end drifts from the wrist by ${mm(spread(endGap))}`);
+  check(spread(startRadius) < 0.01, `hose start drifts off the turret by ${mm(spread(startRadius))}`);
+
+  // (f) clearance between the finger pads and the carried crate, (g) the conveyor queue indexes
+  // one pitch, so frame 96 matches frame 1 on the belt
+  const m = await op('scene.measure', { objects: ['Robot_Gripper', 'Crate'], frame: 50 });
   const pair = m.distances?.[0] ?? {};
-  log(`scene.measure @50 gripper<->crate: surface distance ${pair.surface_distance} m, intersecting ${pair.intersecting}`);
-  await op('scene.frame_set', { frame: 1 });
+  log(`scene.measure @50 gripper <-> crate: surface distance ${pair.surface_distance} m, intersecting ${pair.intersecting}`);
+  check(pair.intersecting === false && pair.surface_distance < 0.01, `gripper/crate clearance ${JSON.stringify(pair)}`);
+  for (const [i, name] of QUEUED.entries()) {
+    const y1 = (await tool('get_object', { object: name, frame: 1 })).world_location[1];
+    const y96 = (await tool('get_object', { object: name, frame: FRAME_END })).world_location[1];
+    check(Math.abs(y1 - y96 - QUEUE_PITCH) < 1e-3, `${name} moved ${y1 - y96} m instead of one pitch`);
+    if (i === 0) check(Math.abs(y96 - PICK[1]) < 1e-3, `${name} does not reach the pick station (${y96})`);
+  }
+  Object.assign(verify, { worst_ik_mm: +(worstIk * 1000).toFixed(2), worst_crate_mm: +(worstCarry * 1000).toFixed(2), pad_gap_m: pair.surface_distance });
+  if (failures.length) throw new Error(`verification failed:\n  ${failures.join('\n  ')}`);
+  log('verification passed');
 }
 
 // ---------------------------------------------------------------------------------------------
-// 12. Renders and export
+// 12. Outputs (see the modes at the top): quick previews, the final renders or the glTF export
 // ---------------------------------------------------------------------------------------------
-const saveImage = async (r, file) => {
-  const img = r.images?.[0] ?? r.resources?.[0];
-  const data = img?.data ?? img?.blob;
-  if (!data) throw new Error(`no image in result: ${JSON.stringify(r).slice(0, 500)}`);
-  await writeFile(file, Buffer.from(data, 'base64'));
-  return typeof r.text === 'string' ? r.text : JSON.stringify(r.text);
-};
-const progress = (label) => (p) => process.stdout.write(`\r  ${label} ${p.progress}${p.total ? `/${p.total}` : ''} ${p.message ?? ''}      `);
+const info = (r) => (typeof r.text === 'string' ? JSON.parse(r.text) : r.text);
+async function save(r, file, mime = 'image/png') {
+  const item = r.resources?.find((x) => x.mimeType === mime && x.blob) ?? r.images?.find((x) => x.mimeType === mime);
+  const data = item?.blob ?? item?.data;
+  if (!data) throw new Error(`no ${mime} in result: ${JSON.stringify(r).slice(0, 600)}`);
+  const buf = Buffer.from(data, 'base64');
+  await writeFile(file, buf);
+  return buf.length;
+}
+/** Progress notifications of long renders, at most one line every 15 s. */
+function progress(label) {
+  let last = 0;
+  return (p) => {
+    if (Date.now() - last < 15000) return;
+    last = Date.now();
+    log(`  ${label}: ${p.progress}${p.total ? `/${p.total}` : ''} ${p.message ?? ''}`);
+  };
+}
+async function render(toolName, args, label) {
+  const t = Date.now();
+  const r = await tool(toolName, args, { onProgress: progress(label) });
+  return { r, ms: Date.now() - t, meta: info(r) };
+}
+const timings = { build_s: +((Date.now() - T0) / 1000).toFixed(1), build_mcp_calls: mcpCalls, verify };
 
 if (PREVIEW_DIR) {
   await mkdir(PREVIEW_DIR, { recursive: true });
-  for (const f of [1, 33, STILL_FRAME, 61, 72]) {
-    const t = Date.now();
-    const r = await tool('render_image', { engine: 'RASTER', width: 640, height: 360, frame: f });
-    await saveImage(r, path.join(PREVIEW_DIR, `raster_f${f}.png`));
-    log(`preview raster frame ${f}: ${Date.now() - t} ms`);
+  for (const f of [1, 22, 33, 47, STILL_FRAME, 66, 77, 90]) {
+    const { r, ms } = await render('render_image', { engine: 'RASTER', width: 640, height: 360, frame: f }, `raster ${f}`);
+    await save(r, path.join(PREVIEW_DIR, `raster_f${f}.png`));
+    log(`preview: RASTER frame ${f} in ${ms} ms`);
   }
-  const t = Date.now();
-  const r = await tool('render_animation', { format: 'CONTACT_SHEET', engine: 'RASTER', frame_start: 1, frame_end: FRAME_END, frame_step: 5, width: 320, columns: 5, time_limit: 300 }, { onProgress: progress('contact sheet') });
-  await saveImage(r, path.join(PREVIEW_DIR, 'contact_raster.png'));
-  log(`\npreview contact sheet: ${Date.now() - t} ms`);
+  const sheet = await render(
+    'render_animation',
+    { format: 'CONTACT_SHEET', engine: 'RASTER', frame_start: 1, frame_end: FRAME_END, frame_step: 4, width: 320, height: 180, columns: 6, time_limit: 300 },
+    'raster contact sheet',
+  );
+  await save(sheet.r, path.join(PREVIEW_DIR, 'contact_raster.png'));
+  log(`preview: RASTER contact sheet in ${sheet.ms} ms`);
+  const pt = await render(
+    'render_image',
+    { engine: 'PATHTRACER', width: 640, height: 360, frame: STILL_FRAME, samples: 32, max_bounces: 4, denoise: true, time_limit: 45 },
+    'path traced preview',
+  );
+  await save(pt.r, path.join(PREVIEW_DIR, `pt_f${STILL_FRAME}.png`));
+  log(`preview: path traced frame ${STILL_FRAME} in ${pt.ms} ms, ${pt.meta.samples} spp`);
 }
 
-if (!NO_RENDER) {
-  if (!SKIP_STILL) {
-    const t = Date.now();
-    const r = await tool(
+if (FINAL_RENDERS) {
+  if (!ANIM_ONLY) {
+    // Final still: path traced, denoised; sampling stops at the time limit
+    const { r, ms, meta } = await render(
       'render_image',
-      { engine: 'PATHTRACER', width: 1280, height: 720, frame: STILL_FRAME, samples: 160, denoise: true, max_bounces: 6, time_limit: 300 },
-      { onProgress: progress('render.png') },
+      { engine: 'PATHTRACER', width: 1280, height: 720, frame: STILL_FRAME, samples: 256, max_bounces: 6, denoise: true, time_limit: STILL_TIME },
+      'render.png',
     );
-    const info = await saveImage(r, path.join(HERE, 'render.png'));
-    timings.still = { ms: Date.now() - t, info: JSON.parse(info) };
-    log(`\nrender.png: ${Date.now() - t} ms ${info}`);
+    const bytes = await save(r, path.join(HERE, 'render.png'));
+    timings.still = { s: +(ms / 1000).toFixed(1), samples: meta.samples, requested: meta.requested_samples, threads: meta.threads, bytes };
+    log(`render.png: ${JSON.stringify(timings.still)}`);
   }
   if (!STILL_ONLY) {
-    // Contact sheet: 20 path-traced tiles of the cycle. Each frame needs >= 2 samples, because the
-    // denoiser cannot filter a 1-sample frame (see README), hence the generous per-frame limit.
-    let t = Date.now();
-    let r = await tool(
+    // Contact sheet: 24 path-traced frames of the cycle (every 4th frame), denoised
+    let { r, ms, meta } = await render(
       'render_animation',
-      { format: 'CONTACT_SHEET', engine: 'PATHTRACER', frame_start: 1, frame_end: FRAME_END, frame_step: 5, width: 320, height: 180, columns: 5, samples: 3, max_bounces: 3, denoise: true, frame_time_limit: 12, time_limit: 300 },
-      { onProgress: progress('contact_sheet.png') },
+      { format: 'CONTACT_SHEET', engine: 'PATHTRACER', frame_start: 1, frame_end: FRAME_END, frame_step: 4, width: 320, height: 180, columns: 6, samples: 12, max_bounces: 4, denoise: true, frame_time_limit: 10, time_limit: 300 },
+      'contact_sheet.png',
     );
-    let info = await saveImage(r, path.join(HERE, 'contact_sheet.png'));
-    timings.contact = { ms: Date.now() - t, info: JSON.parse(info) };
-    log(`\ncontact_sheet.png: ${Date.now() - t} ms ${info.slice(0, 300)}`);
-    // 48-frame GIF of the whole cycle (frames 1, 3 … 95), low-sample path tracing
-    t = Date.now();
-    r = await tool(
+    let bytes = await save(r, path.join(HERE, 'contact_sheet.png'));
+    timings.contact_sheet = { s: +(ms / 1000).toFixed(1), frames: meta.frames?.length, undersampled: meta.undersampled_frames?.length ?? 0, truncated: !!meta.truncated, bytes };
+    log(`contact_sheet.png: ${JSON.stringify(timings.contact_sheet)}`);
+    // preview.gif: the whole 96-frame cycle as 48 path-traced frames (every 2nd frame, 12 fps)
+    ({ r, ms, meta } = await render(
       'render_animation',
-      {
-        format: 'GIF',
-        engine: 'PATHTRACER',
-        frame_start: 1,
-        frame_end: FRAME_END - 1,
-        frame_step: 2,
-        width: 480,
-        height: 270,
-        samples: 4,
-        max_bounces: 3,
-        denoise: true,
-        frame_time_limit: 20,
-        time_limit: 600,
-        dither: 'BAYER',
-      },
-      { onProgress: progress('preview.gif') },
-    );
-    const gif = r.resources?.find((x) => x.mimeType === 'image/gif') ?? r.images?.[0];
-    if (!gif) throw new Error(`no GIF in result: ${JSON.stringify(r).slice(0, 800)}`);
-    await writeFile(path.join(HERE, 'preview.gif'), Buffer.from(gif.blob ?? gif.data, 'base64'));
-    info = typeof r.text === 'string' ? r.text : JSON.stringify(r.text);
-    timings.gif = { ms: Date.now() - t, info: JSON.parse(info) };
-    log(`\npreview.gif: ${Date.now() - t} ms ${info.slice(0, 500)}`);
-
-    // GLB: the glTF exporter ignores bone parenting and does not export armatures, IK, constraint
-    // results or shape-key animation (see README). Workaround: bake the evaluated motion of the
-    // rigid robot parts, the crate and the camera into plain object keyframes (world space,
-    // unparented, constraints removed), export without the skinned hose and the rig helpers,
-    // then undo the bake so the project keeps its live rig.
-    t = Date.now();
-    const scene = await tool('get_scene', { max_objects: 1000 });
-    const rigid = scene.objects.filter((o) => o.parent === 'Robot_Rig' && o.parent_bone).map((o) => o.name);
-    const baked = await op('anim.bake_transforms', {
-      objects: [...rigid, 'Crate', 'Camera'],
-      frame_start: 1,
-      frame_end: FRAME_END,
-      step: 1,
-      clear_parents: true,
-      clear_constraints: true,
-      interpolation: 'LINEAR',
-    });
-    const exclude = new Set(['Robot_Hose', 'Robot_Rig', 'IK_Target', 'Wrist_Aim']);
-    r = await tool('export_scene', { format: 'glb', objects: scene.objects.map((o) => o.name).filter((n) => !exclude.has(n)) });
-    const undone = await tool('undo', { steps: 1 });
-    const check = await tool('get_object', { object: 'Robot_UpperArm' });
-    if (check.parent_bone !== 'J2_Shoulder') throw new Error(`undo of the bake failed: ${JSON.stringify(undone)}`);
-    const glb = r.resources?.find((x) => x.blob);
-    if (!glb) throw new Error(`no GLB in result: ${JSON.stringify(r).slice(0, 800)}`);
-    const buf = Buffer.from(glb.blob, 'base64');
-    await writeFile(path.join(HERE, 'scene.glb'), buf);
-    timings.glb = { ms: Date.now() - t, bytes: buf.length, baked_objects: baked.objects.length };
-    log(`scene.glb: ${(buf.length / 1e6).toFixed(2)} MB in ${Date.now() - t} ms (baked ${baked.objects.length} objects, bake undone)`);
+      { format: 'GIF', engine: 'PATHTRACER', frame_start: 1, frame_end: FRAME_END - 1, frame_step: 2, width: 480, height: 270, samples: 16, max_bounces: 4, denoise: true, frame_time_limit: 15, time_limit: 600, dither: 'BAYER' },
+      'preview.gif',
+    ));
+    if (meta.truncated) throw new Error(`preview.gif truncated: ${JSON.stringify(meta).slice(0, 600)}`);
+    bytes = await save(r, path.join(HERE, 'preview.gif'), 'image/gif');
+    if (bytes > 6e6) log(`WARNING: preview.gif is ${(bytes / 1e6).toFixed(2)} MB (limit 6 MB)`);
+    timings.gif = { s: +(ms / 1000).toFixed(1), frames: meta.frames?.length, undersampled: meta.undersampled_frames?.length ?? 0, bytes };
+    log(`preview.gif: ${JSON.stringify(timings.gif)} ${JSON.stringify(meta).slice(0, 400)}`);
   }
 }
 
-log(`done in ${((Date.now() - T0) / 1000).toFixed(1)} s ${JSON.stringify(timings)}`);
+if (EXPORT_ONLY) {
+  // glTF binary of the live, rigged scene at frame 1 (the exporter samples the animation)
+  await op('scene.frame_set', { frame: 1 });
+  const t = Date.now();
+  const r = await tool('export_scene', { format: 'glb' });
+  const meta = info(r);
+  const bytes = await save(r, path.join(HERE, 'scene.glb'), 'model/gltf-binary');
+  timings.glb = { s: +((Date.now() - t) / 1000).toFixed(1), bytes, warnings: meta.warnings ?? [] };
+  log(`scene.glb: ${(bytes / 1e6).toFixed(2)} MB in ${timings.glb.s} s; warnings: ${JSON.stringify(meta.warnings ?? []).slice(0, 1500)}`);
+}
+
+log(`done in ${((Date.now() - T0) / 1000).toFixed(1)} s`);
+console.log(`TIMINGS ${JSON.stringify(timings)}`);
 await mcp.close();

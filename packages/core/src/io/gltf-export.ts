@@ -144,7 +144,10 @@ function trsFromObject(o: Pick<ObjectData, 'location' | 'rotation_euler' | 'scal
   return { t: [...o.location] as Vec3, q: quatFromEuler(o.rotation_euler), s: [...o.scale] as Vec3 };
 }
 
-/** Node transform of a matrix: TRS, and whether TRS reproduces it (false with shear). */
+/**
+ * Node transform of a matrix: TRS, and whether TRS reproduces it (false with shear: then the
+ * rotation is the one closest to the sheared axes, the best a TRS animation channel can do).
+ */
 function trsOfMatrix(m: Readonly<Mat4>): TRS & { exact: boolean } {
   let sx = Math.hypot(m[0], m[1], m[2]);
   const sy = Math.hypot(m[4], m[5], m[6]);
@@ -158,14 +161,57 @@ function trsOfMatrix(m: Readonly<Mat4>): TRS & { exact: boolean } {
       r[8 + k] = m[8 + k] / sz;
     }
   }
-  const q = quatFromRotationMatrix(r);
+  let q = quatFromRotationMatrix(r);
   const t: Vec3 = [m[12], m[13], m[14]];
   const s: Vec3 = [sx, sy, sz];
   const back = composeQuat(t, q, s);
   const tol = 1e-5 * Math.max(1, Math.abs(sx), Math.abs(sy), Math.abs(sz));
   let exact = q.every(Number.isFinite);
   for (let i = 0; i < 12 && exact; i++) if (Math.abs(back[i] - m[i]) > tol) exact = false;
-  return { t, q: exact ? q : [0, 0, 0, 1], s, exact };
+  if (!exact) {
+    const c = closestRotation(r);
+    q = c ? normalizeQuat(quatFromRotationMatrix(c)) : [0, 0, 0, 1];
+    if (!q.every(Number.isFinite)) q = [0, 0, 0, 1];
+  }
+  return { t, q, s, exact };
+}
+
+/**
+ * The rotation closest to the (unit-column, positive-determinant) linear part of `r`: its polar
+ * decomposition, by Newton iteration R ← (R + R⁻ᵀ) / 2. Null when `r` is singular.
+ */
+function closestRotation(r: Readonly<Mat4>): Mat4 | null {
+  // column-major 3×3: a[col * 3 + row]
+  let a = [r[0], r[1], r[2], r[4], r[5], r[6], r[8], r[9], r[10]];
+  for (let it = 0; it < 30; it++) {
+    const [a0, a1, a2, a3, a4, a5, a6, a7, a8] = a;
+    // A⁻ᵀ = cofactor matrix / det, element (row i, col j) = C_ij at index j * 3 + i
+    const c00 = a4 * a8 - a7 * a5;
+    const c10 = a6 * a5 - a3 * a8;
+    const c20 = a3 * a7 - a6 * a4;
+    const det = a0 * c00 + a1 * c10 + a2 * c20;
+    if (!(Math.abs(det) > 1e-12)) return null;
+    const inv = 1 / det;
+    const invT = [
+      c00,
+      c10,
+      c20,
+      a7 * a2 - a1 * a8, // C_01
+      a0 * a8 - a6 * a2, // C_11
+      a6 * a1 - a0 * a7, // C_21
+      a1 * a5 - a4 * a2, // C_02
+      a3 * a2 - a0 * a5, // C_12
+      a0 * a4 - a3 * a1, // C_22
+    ];
+    let diff = 0;
+    a = a.map((v, i) => {
+      const n = (v + invT[i] * inv) / 2;
+      diff = Math.max(diff, Math.abs(n - v));
+      return n;
+    });
+    if (diff < 1e-12) break;
+  }
+  return [a[0], a[1], a[2], 0, a[3], a[4], a[5], 0, a[6], a[7], a[8], 0, 0, 0, 0, 1];
 }
 
 /** T · R(q) · S. */
@@ -722,9 +768,11 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     const hasUv = !!surf.mesh.uvs && surf.mesh.faces.length > 0;
     const baked = hasProceduralTextures(m) ? bake(m, surf, hasUv) : null;
     const t = m.textures ?? {};
-    // whether UVs change the exported material: only image textures (procedurals: `baked.key`)
+    // whether UVs change the exported material: only image textures (procedurals: `baked.key`),
+    // which are dropped on meshes without UVs and on generated UVs (made for procedural bakes only)
     const imageSlots = Object.values(t).some((slot) => !!slot && !!slot.image && !slot.procedural);
-    const key = `${m.id}|${baked ? baked.key : imageSlots ? (hasUv ? 'uv' : 'nouv') : '-'}`;
+    const imagesKept = hasUv && !surf.generatedUvs;
+    const key = `${m.id}|${baked ? baked.key : imageSlots ? (imagesKept ? 'uv' : 'nouv') : '-'}`;
     const cached = materialOf.get(key);
     if (cached !== undefined) return cached;
     const b = baked?.result ?? null;

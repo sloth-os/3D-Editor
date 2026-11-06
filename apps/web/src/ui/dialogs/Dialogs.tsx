@@ -734,16 +734,24 @@ function RenderImageDialog() {
 /** Ctrl+F12: renders the frame range into an animated PNG or GIF. */
 function RenderAnimationDialog() {
   const s = session.value;
+  // Redraw on document changes: an MCP agent or a collaborator can change the engine, the
+  // resolution or the frame range while the window is open, and Render uses them as they are then.
+  void s?.revision.value;
   const sc = s?.doc.getScene();
   const rs = s?.doc.getRender();
   const pathTrace = rs?.engine === 'PATHTRACER';
   const [format, setFormat] = useState<EncodeFormat>('APNG');
-  const [start, setStart] = useState(sc?.frame_start ?? 1);
-  const [end, setEnd] = useState(sc?.frame_end ?? 1);
+  // frame range, resolution % and samples follow the scene's settings until changed in this window
+  const [startEdit, setStart] = useState<number | null>(null);
+  const [endEdit, setEnd] = useState<number | null>(null);
   const [step, setStep] = useState(1);
-  const [percent, setPercent] = useState(rs?.resolution_percentage ?? 100);
-  const [samples, setSamples] = useState(rs?.samples ?? 64);
+  const [percentEdit, setPercent] = useState<number | null>(null);
+  const [samplesEdit, setSamples] = useState<number | null>(null);
   const [timeLimit, setTimeLimit] = useState(0);
+  const start = startEdit ?? sc?.frame_start ?? 1;
+  const end = endEdit ?? sc?.frame_end ?? 1;
+  const percent = percentEdit ?? rs?.resolution_percentage ?? 100;
+  const samples = samplesEdit ?? rs?.samples ?? 64;
   const [job, setJob] = useState<AnimationJob | null>(null);
   const [result, setResult] = useState<AnimationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -878,12 +886,29 @@ function RenderAnimationDialog() {
             <NumberField value={step} integer min={1} max={1000} step={1} onChange={setStep} />
           </Row>
           <Row label="Resolution %">
-            <NumberField value={percent} integer min={1} max={100} slider unit="%" onChange={setPercent} />
+            <NumberField
+              value={percent}
+              integer
+              min={1}
+              max={100}
+              slider
+              unit="%"
+              testId="render-animation-percent"
+              onChange={setPercent}
+            />
           </Row>
           {pathTrace && (
             <>
               <Row label="Samples" title="Samples per pixel of every frame">
-                <NumberField value={samples} integer min={1} max={4096} step={1} onChange={setSamples} />
+                <NumberField
+                  value={samples}
+                  integer
+                  min={1}
+                  max={4096}
+                  step={1}
+                  testId="render-animation-samples"
+                  onChange={setSamples}
+                />
               </Row>
               <Row
                 label="Time Limit"

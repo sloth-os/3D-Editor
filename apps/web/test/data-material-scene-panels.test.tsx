@@ -21,6 +21,7 @@ import type { ViewportEngine } from '../src/viewport/engine';
 import { Properties, activePropertiesTab } from '../src/ui/properties/Properties';
 import {
   DataTab,
+  activeEntryIndex,
   boneTree,
   curveFieldOperator,
   shapeKeyPath,
@@ -35,7 +36,7 @@ import {
   restoreProcedural,
   textureSource,
 } from '../src/ui/properties/MaterialTab';
-import { rpcRenderEngineOptions, uiEnumParam } from '../src/editor/rpc';
+import { rpcRenderEngineOptions, uiCommand, uiEnumParam } from '../src/editor/rpc';
 import { bakeRigidBodyWorld, mistDensityForDistance } from '../src/ui/properties/SceneTabs';
 import { DialogHost, formatRenderTime } from '../src/ui/dialogs/Dialogs';
 import { InProcessWorker, RenderPool, startPathTrace } from '../src/render';
@@ -415,6 +416,87 @@ describe('Object Data tab: vertex groups and shape keys', () => {
   });
 });
 
+describe('Object Data tab: active list entries', () => {
+  // regression: the active bone, vertex group and shape key were remembered by name only, so a
+  // rename made elsewhere (undo, redo, an MCP agent, a collaborator) jumped to the root bone, the
+  // first group or the Basis (Blender keeps the active index)
+  const selected = (container: ParentNode, id: string) =>
+    byTestId(container, id)?.getAttribute('aria-selected') === 'true';
+  const inputValue = (container: ParentNode, id: string) => {
+    const el = byTestId(container, id)!;
+    return ((el.tagName === 'INPUT' ? el : el.querySelector('input')) as HTMLInputElement).value;
+  };
+
+  it('keep the active bone across undo, redo and renames made elsewhere', () => {
+    ok('object.armature_add', { name: 'Rig' });
+    select(s, 'Rig');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const rig = s.doc.findObjectByName('Rig')!;
+    const names = () => s.doc.getArmature(rig.data!)!.bones.map((b) => b.name);
+    fireEvent.click(byTestId(container, 'bone-add')!);
+    fireEvent.click(byTestId(container, 'bone-add')!);
+    typeText(byTestId(container, 'bone-name')!, 'Hand');
+    expect(selected(container, 'bone-Hand')).toBe(true);
+    act(() => void s.undo.undo());
+    expect(names()).toEqual(['Bone', 'Bone.001', 'Bone.002']);
+    expect(selected(container, 'bone-Bone.002')).toBe(true);
+    expect(inputValue(container, 'bone-name')).toBe('Bone.002');
+    act(() => void s.undo.redo());
+    expect(selected(container, 'bone-Hand')).toBe(true);
+    // an agent renames it
+    act(() => void ok('armature.bone_update', { object: rig.id, bone: 'Hand', name: 'Wrist' }));
+    expect(selected(container, 'bone-Wrist')).toBe(true);
+    expect(byTestId(container, 'bone-Bone')?.getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('keep the active vertex group and shape key across undo and renames made elsewhere', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const cube = s.doc.findObjectByName('Cube')!;
+    fireEvent.click(byTestId(container, 'vgroup-add')!);
+    fireEvent.click(byTestId(container, 'vgroup-add')!);
+    typeText(byTestId(container, 'vgroup-name')!, 'Arm');
+    expect(selected(container, 'vgroup-Arm')).toBe(true);
+    act(() => void s.undo.undo());
+    expect(s.doc.getVertexGroups(cube.data!).map((g) => g.name)).toEqual(['Group', 'Group.001']);
+    expect(selected(container, 'vgroup-Group.001')).toBe(true);
+    expect(inputValue(container, 'vgroup-name')).toBe('Group.001');
+
+    fireEvent.click(byTestId(container, 'shape-key-add')!);
+    fireEvent.click(byTestId(container, 'shape-key-add')!);
+    fireEvent.click(byTestId(container, 'shape-key-Key 1')!);
+    typeText(byTestId(container, 'shape-key-name')!, 'Smile');
+    expect(selected(container, 'shape-key-Smile')).toBe(true);
+    act(() => void s.undo.undo());
+    expect(s.doc.getShapeKeys(cube.data!).map((k) => k.name)).toEqual(['Key 1', 'Key 2']);
+    expect(selected(container, 'shape-key-Key 1')).toBe(true);
+    expect(inputValue(container, 'shape-key-name')).toBe('Key 1');
+    // a collaborator renames it
+    act(() =>
+      s.doc.transact(
+        () =>
+          s.doc.setShapeKeys(
+            cube.data!,
+            s.doc.getShapeKeys(cube.data!).map((k) => (k.name === 'Key 1' ? { ...k, name: 'Frown' } : k)),
+          ),
+        'remote-peer',
+      ),
+    );
+    expect(selected(container, 'shape-key-Frown')).toBe(true);
+    // the Basis stays the active row when it was
+    fireEvent.click(byTestId(container, 'shape-key-Basis')!);
+    act(() => void ok('object.shape_key_set', { object: cube.id, key: 'Key 2', name: 'Wink' }));
+    expect(selected(container, 'shape-key-Basis')).toBe(true);
+    expect(byTestId(container, 'shape-key-name')).toBeNull();
+    expect(activeEntryIndex(['A', 'B'], { name: 'C', index: 5 })).toBe(1);
+    expect(activeEntryIndex(['A', 'B'], { name: 'B', index: 0 })).toBe(1);
+    expect(activeEntryIndex([], { name: 'B', index: 0 })).toBe(-1);
+  });
+});
+
 describe('Material tab', () => {
   it('applies presets as new materials or onto the current material', () => {
     ok('mesh.primitive_cube_add', { name: 'Cube' });
@@ -699,6 +781,52 @@ describe('render window', () => {
     expect(formatRenderTime(83_456)).toBe('01:23.46');
   });
 
+  it('follows render settings changed while the Render Animation window is open', async () => {
+    // regression: the window kept the engine, size and samples it opened with (an MCP agent or a
+    // collaborator changing them was ignored) and rendered with them
+    s.doc.populateDefaultScene();
+    s.doc.updateScene({ frame_start: 1, frame_end: 2 });
+    s.doc.updateRender({ resolution_x: 40, resolution_y: 20, resolution_percentage: 50 });
+    const pool = new RenderPool({ size: 1, factory: () => new InProcessWorker(), idleMs: 0 });
+    pools.push(pool);
+    const calls: string[] = [];
+    viewport.engine = {
+      renderPixels: (o: { frame: number; width: number; height: number }) => {
+        calls.push(`raster ${o.frame} ${o.width}×${o.height}`);
+        return { width: o.width, height: o.height, data: new Uint8ClampedArray(o.width * o.height * 4) };
+      },
+      startPathTrace: (o: { frame: number; width: number; height: number; samples: number }) => {
+        calls.push(`path ${o.frame} ${o.width}×${o.height} ${o.samples} spp`);
+        return startPathTrace(pool, s.doc, { width: o.width, height: o.height, frame: o.frame, samples: 1 });
+      },
+    } as unknown as ViewportEngine;
+    openDialog('render', { animation: true });
+    const { container } = render(<DialogHost />);
+    const settings = () => byTestId(container, 'render-animation-settings')!.textContent!;
+    expect(settings()).toContain('2 frames · 20×16 px');
+    expect(settings()).toContain('Rasterized (WebGL)');
+    expect(byTestId(container, 'render-animation-samples')).toBeNull();
+    // an agent switches to the path tracer at full size with 3 samples and a longer range
+    act(() =>
+      s.doc.transact(() => {
+        s.doc.updateRender({ engine: 'PATHTRACER', samples: 3, resolution_percentage: 100 });
+        s.doc.updateScene({ frame_end: 3 });
+      }, 'remote-peer'),
+    );
+    expect(settings()).toContain('3 frames · 40×20 px');
+    expect(settings()).toContain('Path Tracer');
+    expect(parseFloat(byTestId(container, 'render-animation-samples')!.textContent!)).toBe(3);
+    // a value changed in the window is kept when the scene's changes
+    typeNumber(byTestId(container, 'render-animation-end-frame')!, '2');
+    act(() => s.doc.updateScene({ frame_end: 5 }));
+    expect(settings()).toContain('2 frames · 40×20 px');
+    fireEvent.click(byTestId(container, 'render-animation-start')!);
+    await waitFor(() => expect(byTestId(container, 'render-animation-result')).not.toBeNull(), {
+      timeout: 10_000,
+    });
+    expect(calls).toEqual(['path 1 40×20 3 spp', 'path 2 40×20 3 spp']);
+  });
+
   it('updates the samples and time of the frame being path traced while it renders', async () => {
     // regression: the status line kept "Sample 0/…" and the frame's start time for the whole frame
     s.doc.populateDefaultScene();
@@ -826,6 +954,83 @@ describe('slider drags', () => {
   });
 });
 
+describe('animated fields', () => {
+  /** Keys `path` of a datablock linearly: `a` at frame 1, `b` at frame 11. */
+  const key = (target_type: string, target: string, path: string, a: number, b: number, index = -1) => {
+    for (const [frame, value] of [
+      [1, a],
+      [11, b],
+    ])
+      ok('anim.keyframe_insert_property', {
+        target_type,
+        target,
+        path,
+        frame,
+        value,
+        index,
+        interpolation: 'LINEAR',
+      });
+  };
+  const shown = (container: ParentNode, id: string) => parseFloat(byTestId(container, id)!.textContent!);
+
+  it('show the value at the current frame in the Material, World, Light and Camera panels', () => {
+    // regression: they showed the stored value, not what the viewport and the renderers use
+    s.doc.populateDefaultScene();
+    select(s, 'Cube');
+    ok('material.procedural_set', { channel: 'roughness', procedural: { type: 'NOISE', scale: 5 } });
+    key('material', 'Cube', 'metallic', 0, 1);
+    key('material', 'Cube', 'emission_strength', 0, 10);
+    key('material', 'Cube', 'textures.roughness.procedural.scale', 5, 25, 0);
+    ok('world.sky_set', { enable: true });
+    key('world', 'world', 'strength', 1, 3);
+    key('world', 'world', 'sun_elevation', 0.1, 1.1);
+    key('world', 'world', 'mist_density', 0.01, 0.11);
+    key('light', 'Light', 'energy', 100, 1100);
+    key('camera', 'Camera', 'lens', 50, 100);
+    key('camera', 'Camera', 'shift_x', 0, 0.4);
+    // a driven field (no keyframes) shows the driven value too
+    ok('anim.driver_add', {
+      target_type: 'light',
+      target: 'Light',
+      path: 'shadow_soft_size',
+      expression: 'frame / 10',
+    });
+    s.state.frame = 6;
+
+    activePropertiesTab.value = 'material';
+    const { container } = render(<Properties session={s} />);
+    expect(shown(container, 'material-metallic')).toBeCloseTo(0.5, 3);
+    expect(shown(container, 'material-emission-strength')).toBeCloseTo(5, 3);
+    expect(shown(container, 'tex-roughness-scale')).toBeCloseTo(15, 3);
+    expect(byTestId(container, 'tex-roughness-scale')!.className).toContain('animated');
+    // not the stored value (which edits change and the animation overrides)
+    const mat = s.doc.getMaterial(s.doc.findObjectByName('Cube')!.material_slots[0]!)!;
+    expect(mat.metallic).toBe(0);
+    // scrubbing updates the fields
+    act(() => void (s.state.frame = 11));
+    expect(shown(container, 'material-metallic')).toBeCloseTo(1, 3);
+    expect(byTestId(container, 'material-metallic')!.className).toContain('keyed');
+    act(() => void (s.state.frame = 6));
+
+    act(() => void (activePropertiesTab.value = 'world'));
+    expect(shown(container, 'world-strength')).toBeCloseTo(2, 3);
+    expect(shown(container, 'world-sun-elevation')).toBeCloseTo((0.6 * 180) / Math.PI, 1);
+    expect(shown(container, 'world-mist-density')).toBeCloseTo(0.06, 3);
+    expect(shown(container, 'world-mist-distance')).toBeCloseTo(mistDensityForDistance(1) / 0.06, 1);
+
+    act(() => {
+      select(s, 'Light');
+      activePropertiesTab.value = 'data';
+    });
+    expect(shown(container, 'light-energy')).toBeCloseTo(600, 3);
+    expect(shown(container, 'light-radius')).toBeCloseTo(0.6, 3);
+    act(() => select(s, 'Camera'));
+    expect(shown(container, 'camera-lens')).toBeCloseTo(75, 3);
+    expect(shown(container, 'camera-shift-x')).toBeCloseTo(0.2, 3);
+    expect(byTestId(container, 'camera-fov')!.className).toContain('animated');
+  });
+});
+
 describe('Object Data tab: cameras', () => {
   it('edits the depth of field the path tracer renders', () => {
     s.doc.populateDefaultScene();
@@ -875,6 +1080,34 @@ describe('helpers', () => {
     expect(() => uiEnumParam({ view: 'SIDE' }, ['view', 'type'], views, 'FRONT')).toThrow(
       "Unknown view 'SIDE': use one of FRONT, TOP, CAMERA",
     );
+  });
+
+  it('validates the frame of set_frame and the objects of select (MCP editor_command)', async () => {
+    // regression: set_frame {frame: 'ten'} put the editor at frame NaN (animated objects vanished)
+    // and reported {frame: null}; select silently skipped unknown names
+    s.doc.populateDefaultScene();
+    await expect(uiCommand('set_frame', { frame: 12 })).resolves.toEqual({ frame: 12 });
+    await expect(uiCommand('set_frame', { frame: '24' })).resolves.toEqual({ frame: 24 });
+    await expect(uiCommand('set_frame', { frame: 'ten' })).rejects.toThrow(
+      `'frame' must be a number, got "ten"`,
+    );
+    await expect(uiCommand('set_frame', { frame: { at: 3 } })).rejects.toThrow(`'frame' must be a number`);
+    await expect(uiCommand('set_frame', {})).rejects.toThrow(`'frame' is required: a number`);
+    expect(s.state.frame).toBe(24);
+    const cube = s.doc.findObjectByName('Cube')!;
+    await expect(uiCommand('select', { objects: ['Cube'] })).resolves.toEqual({
+      selected: [cube.id],
+      names: ['Cube'],
+    });
+    await expect(uiCommand('select', { objects: ['Nope', 'Cube'] })).rejects.toThrow(
+      /^Object not found: Nope \(selection unchanged\)\. Objects: .*Cube/,
+    );
+    await expect(uiCommand('select', { objects: [3] })).rejects.toThrow(`'objects' must be a list`);
+    expect(s.state.selectedIds).toEqual([cube.id]);
+    await expect(uiCommand('select', { objects: 'Light' })).resolves.toMatchObject({ names: ['Light'] });
+    await expect(uiCommand('select', { objects: [] })).resolves.toEqual({ selected: [], names: [] });
+    expect(s.state.activeId).toBeNull();
+    await expect(uiCommand('set_frames', {})).rejects.toThrow(/set_frame \{frame: number\}/);
   });
 
   it('labels procedural parameters and values like Blender', () => {

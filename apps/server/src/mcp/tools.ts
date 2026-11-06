@@ -1803,7 +1803,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Export scene',
       description:
-        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at the agent's current frame. Returns {format, filename, mime, bytes, download_url, warnings} plus the file as an embedded base64 resource and a download link (HTTP endpoint of this server). `warnings` lists what the format could not represent — check it: e.g. procedural textures are baked into glTF images only on meshes with UVs (unwrap with edit_mesh uv.smart_project / uv.cube_project first), area lights become point lights.",
+        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at the agent's current frame. OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, download_url, warnings} plus the file as an embedded base64 resource and a download link (HTTP endpoint of this server). `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped.",
       annotations: READ_ONLY,
     },
     {

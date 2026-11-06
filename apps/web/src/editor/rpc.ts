@@ -26,8 +26,9 @@ export function installRpcHandler(): () => void {
         const r = await e.renderImage({
           width: typeof p.width === 'number' ? p.width : undefined,
           height: typeof p.height === 'number' ? p.height : undefined,
+          // an unknown camera is reported by the render, not replaced by the scene camera
           cameraId:
-            typeof p.camera === 'string' ? (s.doc.resolveObject(p.camera)?.id ?? undefined) : undefined,
+            typeof p.camera === 'string' ? (s.doc.resolveObject(p.camera)?.id ?? p.camera) : undefined,
           useViewport: !!p.use_viewport,
           view:
             (p.view as {
@@ -93,7 +94,27 @@ export function uiEnumParam<T extends string>(
   return v as T;
 }
 
-async function uiCommand(command: string, params: Record<string, unknown>): Promise<unknown> {
+/**
+ * A numeric UI command parameter: a finite number (a numeric string is accepted too). A missing
+ * parameter or anything else is an error that names the parameter and what was given.
+ */
+export function uiNumberParam(params: Record<string, unknown>, key: string): number {
+  const raw = params[key];
+  const v = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  if (typeof v !== 'number' || !Number.isFinite(v))
+    throw new Error(
+      raw === undefined || raw === null
+        ? `'${key}' is required: a number`
+        : `'${key}' must be a number, got ${JSON.stringify(raw)}`,
+    );
+  return v;
+}
+
+/**
+ * Runs a UI command of an RPC `ui` request (MCP `editor_command`) in this editor; invalid parameters
+ * are errors that say what is wrong, and leave the editor as it was.
+ */
+export async function uiCommand(command: string, params: Record<string, unknown>): Promise<unknown> {
   const s = session.value!;
   const e = viewport.engine;
   switch (command) {
@@ -114,17 +135,30 @@ async function uiCommand(command: string, params: Record<string, unknown>): Prom
       return { ok: run('view3d.toggle_shading', { type }, 'mcp'), shading: type };
     }
     case 'select': {
-      const ids = (Array.isArray(params.objects) ? params.objects : [])
-        .map((r) => s.doc.resolveObject(String(r))?.id)
-        .filter(Boolean) as string[];
+      // objects (names or ids; the last one becomes active); none or [] deselects everything
+      const refs = params.objects ?? [];
+      const list = typeof refs === 'string' ? [refs] : refs;
+      if (!Array.isArray(list) || list.some((r) => typeof r !== 'string'))
+        throw new Error(`'objects' must be a list of object names or ids, got ${JSON.stringify(refs)}`);
+      const found = list.map((r) => s.doc.resolveObject(r));
+      const missing = list.filter((_, i) => !found[i]);
+      if (missing.length)
+        throw new Error(
+          `Object${missing.length === 1 ? '' : 's'} not found: ${missing.join(', ')} (selection unchanged). Objects: ${s.doc
+            .listObjects()
+            .map((o) => o.name)
+            .slice(0, 50)
+            .join(', ')}`,
+        );
+      const ids = [...new Set(found.map((o) => o!.id))];
       s.state.selectedIds = ids;
       s.state.activeId = ids[ids.length - 1] ?? null;
-      return { selected: ids };
+      return { selected: ids, names: ids.map((id) => s.doc.getObject(id)?.name ?? id) };
     }
     case 'set_mode':
       return { ok: run('object.mode_set', { mode: String(params.mode ?? 'OBJECT').toUpperCase() }, 'mcp') };
     case 'set_frame':
-      s.state.frame = Number(params.frame ?? 1);
+      s.state.frame = uiNumberParam(params, 'frame');
       return { frame: s.state.frame };
     case 'play':
       s.view.playing.value = params.playing !== false;
@@ -159,7 +193,7 @@ async function uiCommand(command: string, params: Record<string, unknown>): Prom
     }
     default:
       throw new Error(
-        `unknown UI command '${command}'. Available: view.frame_all, view.frame_selected, view.set_view {view: ${VIEW_TYPES.join('|')}}, view.shading {shading: ${SHADING_TYPES.join('|')}}, select, set_mode, set_frame, play, notify, run_operator, screenshot, get_view`,
+        `unknown UI command '${command}'. Available: view.frame_all, view.frame_selected, view.set_view {view: ${VIEW_TYPES.join('|')}}, view.shading {shading: ${SHADING_TYPES.join('|')}}, select {objects: [names]}, set_mode {mode}, set_frame {frame: number}, play {playing}, notify {message}, run_operator {operator, params}, screenshot {width?, height?}, get_view`,
       );
   }
 }

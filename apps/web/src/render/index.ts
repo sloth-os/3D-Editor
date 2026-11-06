@@ -41,7 +41,13 @@ export {
   type AnimationStatus,
   type FrameRender,
 } from './animation';
-export { renderViewFromCamera, renderViewFromMatrices, viewportCamera } from './view';
+export {
+  applyLensShift,
+  renderViewFromCamera,
+  renderViewFromMatrices,
+  sceneCameraView,
+  viewportCamera,
+} from './view';
 export { filmRowsToRGBA8 } from './preview';
 export { RenderCancelledError, type PixelImage, type RenderViewData, type EncodeFormat } from './protocol';
 

@@ -1,20 +1,29 @@
 #!/usr/bin/env node
 /**
- * "Vellune" — an original perfume product shot, built from scratch through the 3D editor's MCP
- * server (the same tools an external AI agent uses).
+ * "Vellune": an original perfume product shot, built from scratch through the 3D editor's MCP
+ * server with the same tools an external AI agent uses.
  *
- *   MCP_URL=http://127.0.0.1:4505/mcp node examples/product-shot/build.mjs
+ *   MCP_URL=http://127.0.0.1:4505/mcp node examples/product-shot/build.mjs [mode] [options]
  *
- * Environment:
- *   MCP_URL      MCP endpoint (default http://127.0.0.1:8080/mcp, see scripts/mcp.mjs)
- *   MODE         full (default): build + final still + turntable + glb export
- *                build: only build the project; preview: build + quick previews into PREVIEW_DIR
- *                still / anim / export: build + only that output
- *   PREVIEW_DIR  where MODE=preview writes its PNGs (default /tmp/product-shot-previews)
- *   OUT_DIR      where final outputs go (default: this directory)
+ * Modes (default --final):
+ *   --build-only    delete and rebuild the project, verify it, no renders
+ *   --preview       rebuild + quick previews (RASTER 640x360, path traced 640x360 <= 60 s) into --out-dir
+ *                   (default /tmp/product-shot-previews)
+ *   --final         rebuild + render.png + turntable (contact_sheet.png, preview.gif) into this directory
+ *   --still         rebuild + render.png only
+ *   --anim          rebuild + contact_sheet.png and preview.gif only
+ *   --export-only   rebuild + scene.glb only (no renders)
+ * Options:
+ *   --out-dir <dir>      where outputs go (default: this directory, or the preview directory)
+ *   --samples <n>        samples per pixel of the final still (default 256)
+ *   --time-limit <s>     wall-clock budget of the final still in seconds (default 450)
+ *   --anim-samples <n>   samples per pixel of the GIF frames (default 16; the contact sheet uses 2x)
+ * Environment: MCP_URL (default http://127.0.0.1:8080/mcp), MCP_TOKEN; MODE=<mode> is accepted as
+ * an alias of the mode flag.
  *
- * Everything (geometry, materials, lights, camera, animation) is created by MCP tool calls; the
- * script only computes numbers (profile points, label layout) and saves the returned files.
+ * Every object, material, light, the camera, the animation and the renders are made by MCP tool
+ * calls; the script only computes numbers (profile points, label layout, camera placement), checks
+ * the results and saves the files the server returns. Any tool error stops the build.
  */
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -22,56 +31,119 @@ import { fileURLToPath } from 'node:url';
 import { connect } from '../../scripts/mcp.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const OUT = process.env.OUT_DIR ?? HERE;
-const MODE = process.env.MODE ?? 'full';
-const PREVIEW_DIR = process.env.PREVIEW_DIR ?? '/tmp/product-shot-previews';
 const PROJECT = 'product-shot';
+
+// ------------------------------------------------------------------ command line
+
+const MODES = ['build-only', 'preview', 'final', 'still', 'anim', 'export-only'];
+const ALIASES = { build: 'build-only', export: 'export-only', full: 'final' };
+
+function parseArgs(argv) {
+  const opts = { mode: null, outDir: null, samples: 256, timeLimit: 450, animSamples: 16 };
+  const num = (flag, v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) throw new Error(`${flag} needs a positive number, got ${v}`);
+    return n;
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const mode = a.replace(/^--/, '');
+    if (MODES.includes(mode)) {
+      if (opts.mode && opts.mode !== mode) throw new Error(`choose one mode, got --${opts.mode} and ${a}`);
+      opts.mode = mode;
+    } else if (a === '--out-dir') opts.outDir = argv[++i];
+    else if (a === '--samples') opts.samples = num(a, argv[++i]);
+    else if (a === '--time-limit') opts.timeLimit = num(a, argv[++i]);
+    else if (a === '--anim-samples') opts.animSamples = num(a, argv[++i]);
+    else throw new Error(`unknown argument ${a} (modes: ${MODES.map((m) => `--${m}`).join(' ')})`);
+  }
+  if (!opts.mode && process.env.MODE) {
+    const m = ALIASES[process.env.MODE] ?? process.env.MODE;
+    if (!MODES.includes(m)) throw new Error(`unknown MODE=${process.env.MODE}`);
+    opts.mode = m;
+  }
+  opts.mode ??= 'final';
+  opts.outDir ??= opts.mode === 'preview' ? '/tmp/product-shot-previews' : HERE;
+  return opts;
+}
+
+const OPTS = parseArgs(process.argv.slice(2));
 
 const PI = Math.PI;
 const r6 = (v) => Math.round(v * 1e6) / 1e6;
 
-// ------------------------------------------------------------------ design constants (metres)
+// ------------------------------------------------------------------ design constants (metres, Z up)
 
-/** Octagonal bottle: the profile lies in the plane at 22.5° so a flat facet faces the camera (-Y). */
+/** Octagonal flacon: the profile lies in the vertical plane at 22.5° so a flat facet faces -Y. */
 const TH0 = PI / 8;
 const BOTTLE = {
-  R: 0.038, // circumradius of the octagon at the shoulder line
+  R: 0.038, // circumradius of the octagon (before the X stretch)
   f: 0.004, // outer bottom fillet
   Hs: 0.072, // top of the straight side wall
   rn: 0.0105, // neck radius
   Hsh: 0.016, // shoulder height
-  Hn: 0.096, // top of the neck
+  Hn: 0.096, // top of the neck (hidden under the cap)
   t: 0.0032, // glass wall thickness
   base: 0.014, // thick glass base
   fi: 0.005, // inner bottom fillet
-  scaleX: 1.2, // elongated octagon: wider front facet for the label
-  steps: 8,
+  scaleX: 1.2, // elongated octagon: a wider front facet for the label
+  steps: 8, // SCREW steps = number of facets
 };
 const LIQUID = { gap: 0.0004, level: 0.062 };
-const PEDESTAL = { radius: 0.085, height: 0.05 };
+const PEDESTAL = { radius: 0.085, height: 0.05, fillet: 0.004 };
 const Z_BOTTLE = PEDESTAL.height; // the bottle stands on the pedestal
 const APOTHEM = BOTTLE.R * Math.cos(PI / BOTTLE.steps); // distance of the front facet from the axis
-const FACE_Y = -APOTHEM; // front facet plane (object space = world space, the bottle is not rotated)
+const FACE_Y = -APOTHEM; // front facet plane (the bottle is not rotated, only stretched along X)
 const LABEL = { w: 0.03, h: 0.027, cz: 0.04, corner: 0.0022, thick: 0.0002 };
-/** Still camera; the turntable orbits the same camera around TARGET, so frame 1 matches the still. */
-const CAMERA = { azimuth: -PI / 2 - 0.14, distance: 1.05, elevation: 0.15, target: [0, 0, 0.095], lens: 85, fstop: 4 };
+const LABEL_CENTER = [0, FACE_Y - 2 * LABEL.thick, Z_BOTTLE + LABEL.cz];
+
+/** Still camera; the turntable orbits this camera around TARGET, so frame 1 is the still. */
+const CAMERA = {
+  azimuth: -PI / 2 - 0.14,
+  distance: 1.05,
+  elevation: 0.15,
+  target: [0, 0, 0.095],
+  lens: 85,
+  fstop: 4,
+};
 const camPos = () => {
   const { azimuth: a, distance: d, elevation: e, target: t } = CAMERA;
-  return [r6(t[0] + d * Math.cos(e) * Math.cos(a)), r6(t[1] + d * Math.cos(e) * Math.sin(a)), r6(t[2] + d * Math.sin(e))];
+  return [
+    r6(t[0] + d * Math.cos(e) * Math.cos(a)),
+    r6(t[1] + d * Math.cos(e) * Math.sin(a)),
+    r6(t[2] + d * Math.sin(e)),
+  ];
 };
-const BACKDROP_COLOR = [0.2, 0.085, 0.078];
-/** Objects that turn with the turntable camera (everything except the bottle and its pedestal). */
-const STUDIO_RIG = ['Cyclorama', 'Key Softbox', 'Fill Panel', 'Rim Strip', 'Column', 'Gold Sphere', 'Pearl', 'Pearl Small', 'Pearl Tiny'];
+const LOOP = { frame_start: 1, frame_end: 36, fps: 24 };
+const BACKDROP_COLOR = [0.08, 0.022, 0.028]; // deep wine red: gold and amber glow against it
+/**
+ * Objects that turn with the turntable camera: on screen the bottle and its pedestal spin in a
+ * fixed studio. The focus point stays in front of the bottle at label depth.
+ */
+const STUDIO_RIG = [
+  'Cyclorama',
+  'Key Softbox',
+  'Fill Strip',
+  'Rim Strip',
+  'Backdrop Glow',
+  'Column',
+  'Gold Sphere',
+  'Pearl',
+  'Pearl Small',
+  'Pearl Tiny',
+  'Focus Point',
+];
 
-// ------------------------------------------------------------------ helpers
+// ------------------------------------------------------------------ MCP helpers
 
 const t0 = Date.now();
 const timings = [];
+const warnings = [];
 const log = (...a) => console.log(`[${((Date.now() - t0) / 1000).toFixed(1).padStart(6)} s]`, ...a);
 
 const mcp = await connect();
 
-/** Calls an MCP tool on the project; errors carry the tool name and arguments. */
+/** Calls an MCP tool on the project; a tool error stops the build with the tool name and arguments. */
 async function call(tool, args = {}) {
   try {
     return await mcp.call(tool, { project: PROJECT, ...args });
@@ -80,10 +152,18 @@ async function call(tool, args = {}) {
   }
 }
 
+function noteReports(operator, reports = []) {
+  for (const rep of reports)
+    if (rep.level !== 'INFO') {
+      warnings.push(`${operator}: ${rep.level} ${rep.message}`);
+      log(`  ${operator}: ${rep.level} ${rep.message}`);
+    }
+}
+
 /** Runs one operator; logs its warnings and returns the operator result. */
 async function op(operator, params = {}, selection) {
   const r = await call('run_operator', { operator, params, ...(selection ? { selection } : {}) });
-  for (const rep of r.reports ?? []) if (rep.level !== 'INFO') log(`  ${operator}: ${rep.level} ${rep.message}`);
+  noteReports(operator, r.reports);
   if (!r.ok) throw new Error(`${operator} reported failure: ${JSON.stringify(r.reports)}`);
   return r.result;
 }
@@ -92,8 +172,7 @@ async function op(operator, params = {}, selection) {
 async function batch(operations) {
   const r = await call('batch', { operations });
   if (!r.ok || r.failed) throw new Error(`batch failed: ${JSON.stringify(r).slice(0, 1500)}`);
-  for (const x of r.results)
-    for (const rep of x.reports ?? []) if (rep.level !== 'INFO') log(`  ${x.operator}: ${rep.level} ${rep.message}`);
+  for (const x of r.results) noteReports(x.operator, x.reports);
   return r.results.map((x) => x.result);
 }
 
@@ -107,6 +186,12 @@ async function step(name, fn) {
   return res;
 }
 
+function check(cond, message) {
+  if (!cond) throw new Error(`verification failed: ${message}`);
+}
+
+// ------------------------------------------------------------------ geometry helpers
+
 /** Points of an elliptical arc (start point excluded) in the (r, z) profile plane. */
 function arc(cr, cz, rr, rz, a0, a1, n) {
   const pts = [];
@@ -117,8 +202,8 @@ function arc(cr, cz, rr, rz, a0, a1, n) {
   return pts;
 }
 
-/** (r, z) profile -> 3D points in the vertical plane at angle TH0 around Z. */
-const toPlane = (rz) => rz.map(([r, z]) => [r6(r * Math.cos(TH0)), r6(r * Math.sin(TH0)), r6(z)]);
+/** (r, z) profile -> 3D points in the vertical plane at angle `th` around Z. */
+const toPlane = (rz, th = 0) => rz.map(([r, z]) => [r6(r * Math.cos(th)), r6(r * Math.sin(th)), r6(z)]);
 
 /** Rounded rectangle outline (centred, in the local XY plane). */
 function roundedRect(w, h, rad, n = 5) {
@@ -158,8 +243,9 @@ function crescent(h, d, tilt, n = 16) {
   return pts.map(([x, y]) => [r6(x * c - y * s), r6(x * s + y * c), 0]);
 }
 
-// ------------------------------------------------------------------ profiles
+// ------------------------------------------------------------------ lathe profiles (r, z)
 
+/** Glass wall and base: outer wall, domed shoulder, neck lip, inner cavity, thick base. */
 function bottleProfile() {
   const { R, f, Hs, rn, Hsh, Hn, t, base, fi } = BOTTLE;
   const rni = rn - t;
@@ -179,6 +265,7 @@ function bottleProfile() {
   ];
 }
 
+/** The perfume follows the cavity with a thin air gap (the path tracer has no nested dielectrics). */
 function liquidProfile() {
   const { R, t, base, fi } = BOTTLE;
   const g = LIQUID.gap;
@@ -191,6 +278,7 @@ function liquidProfile() {
   ];
 }
 
+/** Stepped cap: a collar over the neck, the tall octagonal body and a softly rounded top. */
 function capProfile() {
   return [
     [0, 0],
@@ -206,42 +294,54 @@ function capProfile() {
   ];
 }
 
+/** A disc/column with rounded rims (fillet radius f) and a flat top: replaces BEVEL (see README). */
+function roundedDisc(radius, height, f, { bottomFillet = true, n = 6 } = {}) {
+  const bottom = bottomFillet ? [[radius - f, 0], ...arc(radius - f, f, f, f, -PI / 2, 0, n)] : [[radius, 0]];
+  return [
+    [0, 0],
+    ...bottom,
+    [radius, height - f],
+    ...arc(radius - f, height - f, f, f, 0, PI / 2, n),
+    [0, height],
+  ];
+}
+
 /**
- * Lathe workflow: profile curve -> mesh (object.convert) -> SCREW modifier (+ smooth by angle).
- * The SCREW modifier does nothing on a plain wire curve here, hence the conversion.
+ * Lathe: a POLY profile curve (wire, no bevel) with a SCREW modifier around its local Z axis, and
+ * optionally SMOOTH_BY_ANGLE to keep facet edges sharp. `steps` is used for viewport AND renders.
  */
-async function revolve(name, profile, { steps = BOTTLE.steps, location, scaleX = 1, smoothAngle = 0.6 } = {}) {
+async function revolve(name, profile, { steps, location, scale, th = 0, smoothAngle = null }) {
   await op('curve.add_from_points', {
     name,
-    points: toPlane(profile),
+    points: toPlane(profile, th),
     type: 'POLY',
     dimensions: '3D',
     location,
-    scale: [scaleX, 1, 1],
+    ...(scale ? { scale } : {}),
   });
-  await op('object.convert', { target: 'MESH' }, { objects: [name] });
   await call('add_modifier', {
     object: name,
     type: 'SCREW',
     name: 'Lathe',
-    params: { axis: 'Z', angle: 2 * PI, steps, render_steps: steps, use_merge_vertices: true, merge_threshold: 1e-5 },
+    params: {
+      axis: 'Z',
+      angle: 2 * PI,
+      steps,
+      render_steps: steps,
+      use_merge_vertices: true,
+      merge_threshold: 1e-5,
+    },
   });
-  await call('add_modifier', { object: name, type: 'SMOOTH_BY_ANGLE', name: 'Facets', params: { angle: smoothAngle } });
+  if (smoothAngle != null)
+    await call('add_modifier', {
+      object: name,
+      type: 'SMOOTH_BY_ANGLE',
+      name: 'Facets',
+      params: { angle: smoothAngle },
+    });
 }
 
-/** Light/camera datablock ids are not exposed by get_object; anim.driver_add reports them. */
-async function dataId(targetType, object, probePath) {
-  const r = await op('anim.driver_add', { target_type: targetType, target: object, path: probePath, expression: '0' });
-  const id = r.drivers[0].target_id;
-  await op('anim.driver_remove', { target_type: targetType, target: id, path: probePath });
-  return id;
-}
-
-async function aim(objects, point) {
-  await op('object.look_at', { objects, point });
-}
-
-// ------------------------------------------------------------------ build
+// ------------------------------------------------------------------ build stages
 
 async function freshProject() {
   const projects = await mcp.call('list_projects', {});
@@ -258,29 +358,30 @@ async function freshProject() {
 
 async function sceneSettings() {
   await call('set_scene_settings', {
-    frame_start: 1,
-    frame_end: 36,
-    fps: 24,
+    ...LOOP,
     resolution_x: 1280,
     resolution_y: 720,
     engine: 'PATHTRACER',
-    samples: 128,
-    max_bounces: 8, // glass walls + perfume = 6 refractions before the backdrop
+    samples: 256,
+    max_bounces: 10, // glass walls + perfume = 6 refractions before the backdrop is reached
     use_denoising: true,
     view_transform: 'NEUTRAL', // Khronos PBR Neutral: faithful product colours
     exposure: 0,
     environment: 'STUDIO',
-    environment_strength: 0.2,
+    environment_strength: 0.2, // a subtle studio environment for reflections in glass and gold
     world_color: [0.05, 0.045, 0.04],
     world_strength: 1,
   });
 }
 
 async function buildStudio() {
-  // Cyclorama: an open 2D curve (floor -> cove -> wall) extruded sideways into a seamless sweep.
+  // Cyclorama: an open 2D profile (floor -> 26 cm cove -> wall) extruded sideways into a seamless sweep.
   const R = 0.26;
   const back = 0.62;
-  const prof = [[-0.75, 0, 0], [back - R, 0, 0]];
+  const prof = [
+    [-0.75, 0, 0],
+    [back - R, 0, 0],
+  ];
   for (let i = 1; i < 14; i++) {
     const a = -PI / 2 + (i / 14) * (PI / 2);
     prof.push([r6(back - R + R * Math.cos(a)), r6(R + R * Math.sin(a)), 0]);
@@ -303,51 +404,43 @@ async function buildStudio() {
     roughness: 0.92,
   });
 
-  // Marble pedestal: bevelled cylinder with the procedural marble preset.
-  await call('add_object', {
-    type: 'cylinder',
-    name: 'Pedestal',
-    params: { vertices: 128, radius: PEDESTAL.radius, depth: PEDESTAL.height },
-    location: [0, 0, PEDESTAL.height / 2],
-  });
-  await call('add_modifier', {
-    object: 'Pedestal',
-    type: 'BEVEL',
-    name: 'Soft Edge',
-    params: { width: 0.004, segments: 4, limit_method: 'ANGLE', angle_limit: 0.6 },
-  });
-  await op('object.shade_auto_smooth', { angle: 0.6 }, { objects: ['Pedestal'] });
+  // Marble pedestal: a revolved profile with 4 mm round rims, procedural marble.
+  const { radius, height, fillet } = PEDESTAL;
+  await revolve('Pedestal', roundedDisc(radius, height, fillet), { steps: 128, location: [0, 0, 0] });
   await op('material.preset_apply', { preset: 'marble', objects: ['Pedestal'], name: 'Carrara Marble' });
   await op('material.procedural_set', {
     material: 'Carrara Marble',
     channel: 'base_color',
     procedural: { scale: 9, color_a: [0.4, 0.4, 0.41], color_b: [0.8, 0.79, 0.76], distortion: 2.6 },
   });
+  // Polished stone: a full clear coat mirrors the bottle softly in the plinth top.
+  await op('material.update', { material: 'Carrara Marble', coat_weight: 1, coat_roughness: 0.06 });
 }
 
 async function buildBottle() {
   const loc = [0, 0, Z_BOTTLE];
-  await revolve('Bottle', bottleProfile(), { location: loc, scaleX: BOTTLE.scaleX });
+  const lathe = { steps: BOTTLE.steps, th: TH0, scale: [BOTTLE.scaleX, 1, 1], smoothAngle: 0.6 };
+  await revolve('Bottle', bottleProfile(), { ...lathe, location: loc });
   await call('set_material', {
     object: 'Bottle',
     name: 'Bottle Glass',
-    base_color: [0.965, 0.985, 1.0],
+    base_color: [0.965, 0.985, 1.0], // a faint cool tint
     transmission: 1,
     roughness: 0.0,
     ior: 1.5,
     metallic: 0,
   });
-  await revolve('Perfume', liquidProfile(), { location: loc, scaleX: BOTTLE.scaleX });
+  await revolve('Perfume', liquidProfile(), { ...lathe, location: loc });
   await call('set_material', {
     object: 'Perfume',
     name: 'Perfume',
-    base_color: [1.0, 0.87, 0.64],
+    base_color: [1.0, 0.84, 0.55], // amber
     transmission: 1,
     roughness: 0.0,
     ior: 1.36,
   });
   const capZ = Z_BOTTLE + BOTTLE.Hs + BOTTLE.Hsh + 0.0003;
-  await revolve('Cap', capProfile(), { location: [0, 0, capZ], scaleX: BOTTLE.scaleX });
+  await revolve('Cap', capProfile(), { ...lathe, location: [0, 0, capZ] });
   await op('material.preset_apply', { preset: 'gold', objects: ['Cap'], name: 'Polished Gold' });
   await op('material.update', { material: 'Polished Gold', roughness: 0.14 });
 }
@@ -367,7 +460,13 @@ async function buildLabel() {
     // black enamel plate: a filled, extruded rounded rectangle
     {
       operator: 'curve.add_from_points',
-      params: { ...flat, name: 'Label', points: roundedRect(w, h, corner), extrude: thick, location: [0, yPlate, zc] },
+      params: {
+        ...flat,
+        name: 'Label',
+        points: roundedRect(w, h, corner),
+        extrude: thick,
+        location: [0, yPlate, zc],
+      },
     },
     // thin gold frame: a closed 3D outline with a round bevel
     {
@@ -387,7 +486,13 @@ async function buildLabel() {
     // crescent emblem ("lune")
     {
       operator: 'curve.add_from_points',
-      params: { ...flat, name: 'Emblem', points: crescent(0.0026, 0.0016, -0.35), extrude: ink, location: [0, yInk, zc + 0.0072] },
+      params: {
+        ...flat,
+        name: 'Emblem',
+        points: crescent(0.0026, 0.0016, -0.35),
+        extrude: ink,
+        location: [0, yInk, zc + 0.0072],
+      },
     },
     {
       operator: 'object.text_add',
@@ -404,7 +509,13 @@ async function buildLabel() {
     },
     {
       operator: 'curve.add_from_points',
-      params: { ...flat, name: 'Label Rule', points: roundedRect(0.011, 0.00028, 0.00013, 2), extrude: ink, location: [0, yInk, zc - 0.0048] },
+      params: {
+        ...flat,
+        name: 'Label Rule',
+        points: roundedRect(0.011, 0.00028, 0.00013, 2),
+        extrude: ink,
+        location: [0, yInk, zc - 0.0048],
+      },
     },
     {
       operator: 'object.text_add',
@@ -421,58 +532,87 @@ async function buildLabel() {
     },
     {
       operator: 'material.new',
-      params: { name: 'Black Enamel', assign: false, base_color: [0.012, 0.012, 0.014, 1], roughness: 0.32, coat_weight: 1, coat_roughness: 0.04 },
+      params: {
+        name: 'Black Enamel',
+        assign: false,
+        base_color: [0.012, 0.012, 0.014, 1],
+        roughness: 0.32,
+        coat_weight: 1,
+        coat_roughness: 0.04,
+      },
     },
     { operator: 'object.material_assign', params: { material: 'Black Enamel', objects: ['Label'] } },
     { operator: 'material.preset_apply', params: { preset: 'gold', objects: gold, name: 'Gold Leaf' } },
     { operator: 'material.update', params: { material: 'Gold Leaf', roughness: 0.28 } },
     { operator: 'object.parent_to', params: { objects: ['Label', ...gold], parent: 'Bottle' } },
   ]);
-  log(`   label name width ${(res[3].width * 1000).toFixed(1)} mm, subline ${(res[5].width * 1000).toFixed(1)} mm (label ${w * 1000} mm)`);
+  log(
+    `   label name width ${(res[3].width * 1000).toFixed(1)} mm, subline ${(res[5].width * 1000).toFixed(1)} mm (label ${w * 1000} mm)`,
+  );
 }
 
-/** Area light: added, aimed, then shaped through its datablock (see dataId). */
-async function areaLight(name, { location, aimAt, energy, color, shape, size, sizeY }) {
-  await call('add_object', { type: 'light', light_type: 'AREA', name, params: { energy, color }, location });
-  await aim([name], aimAt);
-  const id = await dataId('light', name, 'energy');
-  await op('data.set_property', { kind: 'lights', target: id, values: { shape, size, size_y: sizeY ?? size } });
+/** Light with its shape and size given directly to object.light_add (via add_object), then aimed. */
+async function light(name, type, { location, aimAt, ...settings }) {
+  await call('add_object', { type: 'light', light_type: type, name, params: settings, location });
+  await op('object.look_at', { objects: [name], point: aimAt });
 }
 
+/**
+ * Three-point studio lighting with area lights (power in W), a background light and the dim
+ * STUDIO environment. Area lights are invisible to the camera but show up in reflections, so the
+ * strips are placed where the octagonal facets mirror them.
+ */
 async function buildLights() {
-  // Three-point studio lighting with area lights (power in W) + the dim STUDIO environment.
-  await areaLight('Key Softbox', {
+  // Key: a large warm softbox high front-left: soft light on the label, cap and pedestal.
+  await light('Key Softbox', 'AREA', {
     location: [-0.5, -0.36, 0.46],
     aimAt: [0, 0, 0.1],
     energy: 12,
     color: [1.0, 0.95, 0.88],
     shape: 'RECTANGLE',
     size: 0.75,
-    sizeY: 0.85,
+    size_y: 0.85,
   });
-  await areaLight('Fill Panel', {
-    location: [0.52, -0.5, 0.2],
-    aimAt: [0, 0, 0.09],
-    energy: 2.2,
+  // Fill: a cool vertical strip on the right, mirrored by the front-right facet as a bright stripe.
+  await light('Fill Strip', 'AREA', {
+    location: [0.45, -0.02, 0.13],
+    aimAt: [0, -0.02, 0.12],
+    energy: 2.5,
     color: [0.88, 0.93, 1.0],
-    shape: 'SQUARE',
-    size: 0.6,
+    shape: 'RECTANGLE',
+    size: 0.12,
+    size_y: 0.6,
   });
-  // Side-back strip for the glass edges; placed so its emitting half-space does not end on the
-  // visible backdrop (an area light close to the wall drew a hard light/dark boundary there).
-  await areaLight('Rim Strip', {
-    location: [0.42, 0.14, 0.16],
+  // Rim: a narrow strip behind on the left that outlines the glass, cap and pedestal edges.
+  await light('Rim Strip', 'AREA', {
+    location: [-0.3, 0.3, 0.2],
     aimAt: [0, 0, 0.11],
-    energy: 6,
+    energy: 8,
     color: [1.0, 0.97, 0.93],
     shape: 'RECTANGLE',
-    size: 0.08,
-    sizeY: 0.5,
+    size: 0.1,
+    size_y: 0.5,
+  });
+  // Background light: a soft warm spot pooled on the cove right behind the bottle. The camera sees
+  // this glow through the perfume, which makes the liquid shine amber (a "rising moon" halo).
+  await light('Backdrop Glow', 'SPOT', {
+    location: [0, 0.12, 0.38],
+    aimAt: [0.07, 0.46, 0],
+    energy: 70,
+    color: [1.0, 0.85, 0.7],
+    spot_size: 0.7,
+    spot_blend: 0.9,
+    shadow_soft_size: 0.05,
   });
 }
 
 /** Props (one batch): a marble column with a gold sphere behind, three pearls in front. */
 async function buildProps() {
+  // The column is revolved like the pedestal (rounded top rim).
+  await revolve('Column', roundedDisc(0.045, 0.1, 0.0025, { bottomFillet: false }), {
+    steps: 96,
+    location: [0.24, 0.33, 0],
+  });
   const pearls = [
     ['Pearl', 0.012, [-0.135, -0.02]],
     ['Pearl Small', 0.008, [-0.108, -0.046]],
@@ -480,24 +620,16 @@ async function buildProps() {
   ];
   const names = pearls.map((p) => p[0]);
   await batch([
-    {
-      operator: 'mesh.primitive_cylinder_add',
-      params: { name: 'Column', vertices: 96, radius: 0.045, depth: 0.1, location: [0.24, 0.33, 0.05] },
-    },
-    {
-      operator: 'object.modifier_add',
-      params: {
-        object: 'Column',
-        type: 'BEVEL',
-        name: 'Soft Edge',
-        params: { width: 0.002, segments: 3, limit_method: 'ANGLE', angle_limit: 0.6 },
-      },
-    },
-    { operator: 'object.shade_auto_smooth', params: { angle: 0.6 } }, // acts on the selection (the column)
     { operator: 'object.material_assign', params: { material: 'Carrara Marble', objects: ['Column'] } },
     {
       operator: 'mesh.primitive_uv_sphere_add',
-      params: { name: 'Gold Sphere', segments: 64, ring_count: 32, radius: 0.018, location: [0.24, 0.33, 0.118] },
+      params: {
+        name: 'Gold Sphere',
+        segments: 64,
+        ring_count: 32,
+        radius: 0.018,
+        location: [0.24, 0.33, 0.118],
+      },
     },
     ...pearls.map(([name, radius, [x, y]]) => ({
       operator: 'mesh.primitive_uv_sphere_add',
@@ -506,34 +638,55 @@ async function buildProps() {
     { operator: 'object.select', params: { objects: ['Gold Sphere', ...names] } },
     { operator: 'object.shade_smooth', params: {} },
     { operator: 'object.material_assign', params: { material: 'Polished Gold', objects: ['Gold Sphere'] } },
-    { operator: 'material.preset_apply', params: { preset: 'porcelain', objects: names, name: 'Pearl White' } },
-    { operator: 'material.update', params: { material: 'Pearl White', coat_weight: 1, coat_roughness: 0.05, roughness: 0.3 } },
+    {
+      operator: 'material.preset_apply',
+      params: { preset: 'porcelain', objects: names, name: 'Pearl White' },
+    },
+    {
+      operator: 'material.update',
+      params: {
+        material: 'Pearl White',
+        base_color: [0.9, 0.86, 0.8, 1],
+        roughness: 0.22,
+        coat_weight: 1,
+        coat_roughness: 0.03,
+        sheen_weight: 0.4,
+      },
+    },
   ]);
 }
 
+/**
+ * Camera with depth of field: 85 mm at f/4, focused on the "Focus Point" empty at the centre of
+ * the label (camera.properties_set dof_focus_object). The empty turns with the turntable camera,
+ * so the focus stays on the front of the bottle during the spin.
+ */
 async function buildCamera() {
   const pos = camPos();
-  await call('add_object', { type: 'camera', name: 'Camera', params: { lens: CAMERA.lens }, location: pos });
-  await aim(['Camera'], CAMERA.target);
-  await call('set_active_camera', { camera: 'Camera' });
-  // Depth of field focused on the label: distance along the view axis.
-  const dir = CAMERA.target.map((v, i) => v - pos[i]);
-  const len = Math.hypot(...dir);
-  const label = [0, FACE_Y, Z_BOTTLE + LABEL.cz];
-  const focus = label.reduce((acc, v, i) => acc + (v - pos[i]) * dir[i], 0) / len;
-  const id = await dataId('camera', 'Camera', 'lens');
-  await op('data.set_property', {
-    kind: 'cameras',
-    target: id,
-    values: { dof_use: true, dof_focus_distance: r6(focus), dof_aperture_fstop: CAMERA.fstop },
+  await call('add_object', {
+    type: 'empty',
+    name: 'Focus Point',
+    params: { type: 'SPHERE', radius: 0.004 },
+    location: LABEL_CENTER,
   });
-  log(`   camera at ${JSON.stringify(pos)}, focus ${focus.toFixed(3)} m at f/${CAMERA.fstop}`);
+  await call('add_object', { type: 'camera', name: 'Camera', params: { lens: CAMERA.lens }, location: pos });
+  await op('object.look_at', { objects: ['Camera'], point: CAMERA.target });
+  await call('set_active_camera', { camera: 'Camera' });
+  const r = await op('camera.properties_set', {
+    object: 'Camera',
+    dof_use: true,
+    dof_focus_object: 'Focus Point',
+    dof_aperture_fstop: CAMERA.fstop,
+    clip_start: 0.05,
+    clip_end: 20,
+  });
+  log(`   camera at ${JSON.stringify(pos)}: ${JSON.stringify(r.cameras[0]).slice(0, 300)}`);
 }
 
 /**
  * Turntable: anim.turntable orbits the still camera around the bottle (same radius, height and start
- * angle, so frame 1 is the still). The backdrop, lights and props are parented to the pivot, so
- * they turn with the camera: on screen the bottle and its pedestal spin in a fixed studio.
+ * angle, so frame 1 is the still). The backdrop, lights, props and the focus point are parented to
+ * the pivot, so they turn with the camera: on screen the bottle and its pedestal spin in a fixed studio.
  */
 async function buildTurntable() {
   const { distance: d, elevation: e, azimuth: a, target } = CAMERA;
@@ -543,22 +696,83 @@ async function buildTurntable() {
     radius: r6(d * Math.cos(e)),
     height: r6(d * Math.sin(e)),
     start_angle: a,
-    frame_start: 1,
-    frame_end: 36,
+    frame_start: LOOP.frame_start,
+    frame_end: LOOP.frame_end,
     set_frame_range: true,
   });
-  log(`   turntable: pivot ${tt.pivot_name}, radius ${tt.radius}, height ${tt.height}`);
-  await op('object.parent_to', {
-    objects: STUDIO_RIG,
-    parent: tt.pivot_name,
-  });
+  log(
+    `   turntable: pivot ${tt.pivot_name}, radius ${tt.radius}, height ${tt.height}, ${tt.loop_frames} frames`,
+  );
+  await op('object.parent_to', { objects: STUDIO_RIG, parent: tt.pivot_name });
   return tt;
 }
 
-async function checkScene() {
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+/**
+ * Checks the built scene: no evaluation problems, the lathes produced the expected geometry, the
+ * label sits on the front facet, the camera orbits seamlessly (get_object at several frames) and
+ * the depth of field stays focused at label depth.
+ */
+async function verifyScene() {
   const s = await call('get_scene', {});
   log(`   scene: ${JSON.stringify(s.counts)}`);
-  if (s.problems?.length) log(`   PROBLEMS: ${JSON.stringify(s.problems)}`);
+  check(!s.problems?.length, `scene problems ${JSON.stringify(s.problems)}`);
+
+  // Lathe results (SCREW on wire curves): rings x profile points, sized like the design.
+  const bottle = await call('get_object', { object: 'Bottle' });
+  const n = bottleProfile().length;
+  check(
+    bottle.data.evaluated?.vertices >= BOTTLE.steps * (n - 2),
+    `bottle lathe geometry ${JSON.stringify(bottle.data.evaluated)}`,
+  );
+  const bs = bottle.world_bounds.size;
+  log(
+    `   bottle: ${JSON.stringify(bottle.data.evaluated)}, size ${bs.map((v) => (v * 100).toFixed(1)).join(' x ')} cm`,
+  );
+  check(Math.abs(bs[2] - BOTTLE.Hn) < 1e-3 && bs[0] > bs[1], `bottle bounds ${JSON.stringify(bs)}`);
+  const ped = await call('get_object', { object: 'Pedestal' });
+  check(
+    Math.abs(ped.world_bounds.max[2] - Z_BOTTLE) < 1e-4,
+    `pedestal top ${ped.world_bounds.max[2]} != ${Z_BOTTLE}`,
+  );
+  const label = await call('get_object', { object: 'Label' });
+  const gap = FACE_Y - label.world_bounds.max[1];
+  check(gap > 0 && gap < 2e-4, `label not on the front facet (gap ${gap})`);
+
+  // Turntable: camera radius/height constant, quarter turn every 9 frames, frame 37 == frame 1.
+  const loopLen = LOOP.frame_end - LOOP.frame_start + 1;
+  const rows = [];
+  for (const f of [1, 10, 19, 28, 37]) {
+    const cam = await call('get_object', { object: 'Camera', frame: f });
+    const fp = await call('get_object', { object: 'Focus Point', frame: f });
+    const p = cam.world_location;
+    const az = Math.atan2(p[1] - CAMERA.target[1], p[0] - CAMERA.target[0]);
+    const expected = CAMERA.azimuth + (2 * PI * (f - LOOP.frame_start)) / loopLen;
+    const dAz = Math.atan2(Math.sin(az - expected), Math.cos(az - expected));
+    const radius = Math.hypot(p[0] - CAMERA.target[0], p[1] - CAMERA.target[1]);
+    rows.push({
+      f,
+      cam: p,
+      az: +az.toFixed(4),
+      dAz: +dAz.toFixed(5),
+      focus: cam.data.dof_focus_distance,
+      toFocus: +dist(p, fp.world_location).toFixed(4),
+    });
+    check(Math.abs(dAz) < 1e-3, `camera azimuth at frame ${f}: ${az} vs ${expected}`);
+    check(
+      Math.abs(radius - CAMERA.distance * Math.cos(CAMERA.elevation)) < 1e-3,
+      `camera radius at frame ${f}: ${radius}`,
+    );
+    check(cam.data.dof_use === true, 'depth of field is off');
+  }
+  log(`   turntable check: ${JSON.stringify(rows)}`);
+  const focus = rows.map((r) => r.focus);
+  check(Math.max(...focus) - Math.min(...focus) < 1e-3, `focus distance changes during the loop: ${focus}`);
+  check(dist(rows[0].cam, rows[4].cam) < 1e-6, 'the loop is not seamless (frame 37 != frame 1)');
+  // The bottle itself never moves.
+  const b19 = await call('get_object', { object: 'Bottle', frame: 19 });
+  check(dist(b19.world_location, [0, 0, Z_BOTTLE]) < 1e-9, 'the bottle moves');
   return s;
 }
 
@@ -580,80 +794,93 @@ async function saveFile(result, file) {
   await mkdir(path.dirname(file), { recursive: true });
   await writeFile(file, buf);
   const info = typeof result.text === 'string' ? result.text : JSON.stringify(result.text ?? {});
-  log(`   wrote ${file} (${(buf.length / 1024).toFixed(0)} KiB) ${info.slice(0, 400)}`);
+  log(`   wrote ${file} (${(buf.length / 1024).toFixed(0)} KiB) ${info.slice(0, 500)}`);
   return result.text;
-}
-
-async function previews() {
-  await mkdir(PREVIEW_DIR, { recursive: true });
-  const raster = await call('render_image', { engine: 'RASTER', width: 640, height: 360 });
-  await saveFile(raster, path.join(PREVIEW_DIR, 'raster.png'));
-  const pt = await call('render_image', {
-    engine: 'PATHTRACER',
-    width: Number(process.env.PW ?? 480),
-    height: Number(process.env.PH ?? 270),
-    samples: Number(process.env.PS ?? 24),
-    time_limit: Number(process.env.PT ?? 60),
-    denoise: true,
-  });
-  await saveFile(pt, path.join(PREVIEW_DIR, 'pathtraced.png'));
 }
 
 const results = {};
 
-/** Final still: 1280x720 path traced, denoised, bounded to 300 s of wall-clock time. */
+async function previews() {
+  const raster = await call('render_image', { engine: 'RASTER', width: 640, height: 360, frame: 1 });
+  results.raster = await saveFile(raster, path.join(OPTS.outDir, 'raster.png'));
+  const pt = await call('render_image', {
+    engine: 'PATHTRACER',
+    width: 640,
+    height: 360,
+    samples: 64,
+    time_limit: 60,
+    denoise: true,
+    frame: 1,
+  });
+  results.pathtraced = await saveFile(pt, path.join(OPTS.outDir, 'pathtraced.png'));
+}
+
+/** Final still: 1280x720 path traced and denoised, bounded by a wall-clock budget. */
 async function finalStill() {
   const r = await call('render_image', {
     engine: 'PATHTRACER',
     width: 1280,
     height: 720,
-    samples: Number(process.env.FINAL_SAMPLES ?? 96),
+    samples: OPTS.samples,
     denoise: true,
-    time_limit: Number(process.env.FINAL_TIME ?? 300),
+    time_limit: OPTS.timeLimit,
     frame: 1,
   });
-  results.still = await saveFile(r, path.join(OUT, 'render.png'));
+  results.still = await saveFile(r, path.join(OPTS.outDir, 'render.png'));
 }
 
-/** Turntable: a 12-tile contact sheet of the loop and the full 36-frame loop as a GIF. */
+/** A render_animation result must contain every requested frame. */
+function checkFrames(what, info, expected) {
+  check(
+    !info.truncated && info.frame_count === expected,
+    `${what}: ${info.frame_count}/${expected} frames, truncated ${info.truncated}`,
+  );
+}
+
+/** Turntable: a 12-tile contact sheet of the loop, then the full 36-frame loop as a GIF. */
 async function turntableOutputs() {
+  const loopLen = LOOP.frame_end - LOOP.frame_start + 1;
   const sheet = await call('render_animation', {
     format: 'CONTACT_SHEET',
     engine: 'PATHTRACER',
-    frame_start: 1,
-    frame_end: 36,
+    frame_start: LOOP.frame_start,
+    frame_end: LOOP.frame_end,
     frame_step: 3,
     width: 320,
     height: 180,
     columns: 4,
-    samples: 16,
+    samples: OPTS.animSamples * 2,
     denoise: true,
-    time_limit: 240,
+    time_limit: 300,
   });
-  results.contact_sheet = await saveFile(sheet, path.join(OUT, 'contact_sheet.png'));
+  results.contact_sheet = await saveFile(sheet, path.join(OPTS.outDir, 'contact_sheet.png'));
+  checkFrames('contact sheet', sheet.text, Math.ceil(loopLen / 3));
   const gif = await call('render_animation', {
     format: 'GIF',
     engine: 'PATHTRACER',
-    frame_start: 1,
-    frame_end: 36,
-    width: 384,
-    height: 216,
-    samples: 8,
+    frame_start: LOOP.frame_start,
+    frame_end: LOOP.frame_end,
+    width: 480,
+    height: 270,
+    samples: OPTS.animSamples,
     denoise: true,
-    time_limit: 300,
+    time_limit: 600,
     fps: 12,
     dither: 'BAYER',
   });
-  results.gif = await saveFile(gif, path.join(OUT, 'preview.gif'));
+  results.gif = await saveFile(gif, path.join(OPTS.outDir, 'preview.gif'));
+  checkFrames('GIF', gif.text, loopLen);
 }
 
 async function exportGlb() {
   const r = await call('export_scene', { format: 'glb' });
-  results.glb = await saveFile(r, path.join(OUT, 'scene.glb'));
+  results.glb = await saveFile(r, path.join(OPTS.outDir, 'scene.glb'));
 }
 
 // ------------------------------------------------------------------ main
 
+const { mode } = OPTS;
+log(`mode --${mode}, outputs -> ${OPTS.outDir}`);
 try {
   await step('fresh project', freshProject);
   await step('scene settings', sceneSettings);
@@ -664,13 +891,14 @@ try {
   await step('props', buildProps);
   await step('camera', buildCamera);
   await step('turntable rig', buildTurntable);
-  await step('check scene', checkScene);
-  if (MODE === 'preview') await step('previews', previews);
-  if (MODE === 'full' || MODE === 'still') await step('final still (render.png)', finalStill);
-  if (MODE === 'full' || MODE === 'anim') await step('turntable renders', turntableOutputs);
-  if (MODE === 'full' || MODE === 'export') await step('glTF export (scene.glb)', exportGlb);
+  await step('verify scene', verifyScene);
+  if (mode === 'preview') await step('previews', previews);
+  if (mode === 'final' || mode === 'still') await step('final still (render.png)', finalStill);
+  if (mode === 'final' || mode === 'anim') await step('turntable renders', turntableOutputs);
+  if (mode === 'export-only') await step('glTF export (scene.glb)', exportGlb);
 } finally {
   log('timings', JSON.stringify(timings));
+  if (warnings.length) log(`warnings (${warnings.length})`, JSON.stringify(warnings));
   if (Object.keys(results).length) log('results', JSON.stringify(results));
   await mcp.close();
 }

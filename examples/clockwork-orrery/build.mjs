@@ -3,14 +3,18 @@
  * Clockwork Orrery — an original brass orrery on a dark marble plinth, built entirely through the
  * 3D editor's MCP server (the same tools an external AI agent uses).
  *
- *   MCP_URL=http://127.0.0.1:8080/mcp node examples/clockwork-orrery/build.mjs [--stages list]
+ *   MCP_URL=http://127.0.0.1:8080/mcp node examples/clockwork-orrery/build.mjs [mode] [--out-dir DIR]
  *
- * Stages (comma separated, default "build,still,anim,export"):
- *   build    delete + recreate the project and build the whole scene (always runs first)
- *   preview  quick raster + low-sample path traced previews into $PREVIEW_DIR (default /tmp)
- *   still    render.png   — final path traced still (1280×720)
- *   anim     preview.gif + contact_sheet.png — 48-frame loop of the mechanism
- *   export   scene.glb    — glTF binary export
+ * Modes (the scene is always rebuilt from scratch first: the project is deleted and recreated):
+ *   --final        (default) build + verify, then render.png (path traced 1280×720), contact_sheet.png
+ *                  (12 path traced frames) and preview.gif (48 path traced frames, 480×270)
+ *   --build-only   build + verify only (a few seconds, no renders)
+ *   --preview      build + verify + quick previews in $PREVIEW_DIR (RASTER still, 640×360 path traced
+ *                  still, RASTER contact sheet); nothing is written next to this script
+ *   --export-only  build + verify + scene.glb (glTF binary), no renders
+ *   --stages a,b   explicit stage list: build (always), preview, still, anim, export
+ *   --out-dir DIR  where render.png / contact_sheet.png / preview.gif / scene.glb are written
+ *                  (default: this folder)
  *
  * Mechanism: ONE master channel — the empty "Master Drive", rotation Z keyed linearly 0 → 2π over
  * frames 1 → 49 (anim.keyframes_insert_many) and repeated forever (anim.extrapolation_set CYCLIC).
@@ -19,8 +23,10 @@
  *   planet spin   θ = s·m              (integer turns, so the 48-frame loop is seamless)
  *   gear train    θ_B = φ_B − (T_A/T_B)·(θ_A − φ_A)  for every meshing pair A→B (opposite senses,
  *                 ratio teeth_A/teeth_B; φ chosen so a tooth of A sits in a gap of B)
- * The moon rides a Bezier circle parented to the third planet's arm (FOLLOW_PATH constraint,
- * timed with constraint.followpath_path_animate).
+ * The moon rides a Bezier circle parented to the third planet's arm (FOLLOW_PATH constraint, timed
+ * with constraint.followpath_path_animate: one orbit every 12 frames).
+ * verifyMotion() reads the evaluated transforms back with get_object at several frames and fails
+ * the build if any part does not move exactly as designed.
  */
 import { mkdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -31,17 +37,32 @@ import { connect } from '../../scripts/mcp.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_NAME = 'clockwork-orrery';
 const PREVIEW_DIR = process.env.PREVIEW_DIR ?? path.join(os.tmpdir(), 'clockwork-orrery-previews');
-const argStages = (() => {
-  const i = process.argv.indexOf('--stages');
-  return i >= 0 ? process.argv[i + 1] : process.env.STAGES;
-})();
-const STAGES = new Set((argStages ?? 'build,still,anim,export').split(',').map((s) => s.trim()));
+
+// ---------------------------------------------------------------------------------- command line
+
+const argv = process.argv.slice(2);
+function argValue(name) {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+}
+const MODES = {
+  '--final': 'build,still,anim',
+  '--build-only': 'build',
+  '--preview': 'build,preview',
+  '--export-only': 'build,export',
+};
+const modeFlag = argv.find((a) => a in MODES);
+const STAGES = new Set((argValue('--stages') ?? process.env.STAGES ?? MODES[modeFlag ?? '--final']).split(',').map((s) => s.trim()));
 STAGES.add('build');
+const OUT_DIR = path.resolve(argValue('--out-dir') ?? HERE);
+for (const a of argv)
+  if (a.startsWith('--') && !(a in MODES) && a !== '--stages' && a !== '--out-dir') throw new Error(`unknown option ${a}`);
 
 const TAU = 2 * Math.PI;
 const DEG = Math.PI / 180;
 const r4 = (v) => Math.round(v * 1e4) / 1e4;
 const mod = (a, n) => ((a % n) + n) % n;
+const gcd = (a, b) => (b ? gcd(b, a % b) : a);
 
 // ---------------------------------------------------------------------------------- MCP helpers
 
@@ -55,14 +76,13 @@ function short(v, n = 400) {
   return s && s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
-/** Calls an MCP tool on the project; logs and rethrows errors with context. */
+/** Calls an MCP tool on the project; logs and rethrows errors with context (fails the build). */
 async function call(tool, args = {}, { quiet = false, withProject = true } = {}) {
   const t0 = Date.now();
   const full = withProject && project ? { project, ...args } : args;
   try {
     const res = await mcp.call(tool, full, {
-      onProgress: (p) =>
-        process.stderr.write(`    … ${p.message ?? `${p.progress}/${p.total ?? '?'}`}\r`),
+      onProgress: (p) => process.stderr.write(`    … ${p.message ?? `${p.progress}/${p.total ?? '?'}`}\r`),
     });
     if (!quiet) console.log(`  ✓ ${tool}${args.operator ? ` ${args.operator}` : ''} (${Date.now() - t0} ms)`);
     return res;
@@ -73,26 +93,30 @@ async function call(tool, args = {}, { quiet = false, withProject = true } = {})
   }
 }
 
-/** run_operator → the operator's own result; reports (warnings) are echoed. */
+function collectReports(operator, reports) {
+  for (const rep of reports ?? []) {
+    const level = rep.level ?? rep.type ?? '';
+    const msg = `${operator}: ${level} ${rep.message ?? short(rep)}`;
+    console.log(`    report ${msg}`);
+    if (/WARN|ERROR/i.test(level)) warnings.push(msg);
+  }
+}
+
+/** run_operator → the operator's own result; WARNING/ERROR reports are echoed and collected. */
 async function op(operator, params = {}, selection) {
   const r = await call('run_operator', { operator, params, ...(selection ? { selection } : {}) });
-  for (const rep of r.reports ?? []) {
-    const msg = `${operator}: ${rep.type ?? ''} ${rep.message ?? short(rep)}`;
-    console.log(`    report ${msg}`);
-    if (/WARN|ERROR/i.test(rep.type ?? '')) warnings.push(msg);
-  }
+  collectReports(operator, r.reports);
   return r.result;
 }
 
-/** batch → one undo step; fails loudly if any operation failed. */
+/** batch → one undo step; the server fails the call if any operation fails. */
 async function batch(label, operations) {
-  const r = await call('batch', {
-    operations: operations.map(([operator, params]) => ({ operator, params })),
-  }, { quiet: true });
-  const results = r.results ?? r.operations ?? [];
+  const r = await call('batch', { operations: operations.map(([operator, params]) => ({ operator, params })) }, { quiet: true });
+  const results = r.results ?? [];
   const failed = results.filter((x) => x && x.ok === false);
   console.log(`  ✓ batch "${label}": ${operations.length} operators${failed.length ? `, ${failed.length} FAILED` : ''}`);
   if (failed.length || r.ok === false) throw new Error(`batch ${label} failed: ${short(r, 2000)}`);
+  results.forEach((x, i) => collectReports(operations[i][0], x?.reports));
   return results.map((x) => x?.result);
 }
 
@@ -106,7 +130,7 @@ async function saveImage(res, file) {
 // ---------------------------------------------------------------------------------- design
 
 // Plinth (Z up, metres). Octagons are rotated by π/8 so a flat face looks at the camera (−Y).
-const BASE = { r: 0.52, h: 0.05 }; // dark wood
+const BASE = { r: 0.52, h: 0.05 }; // dark wood foot
 const PLINTH = { r: 0.47, z0: 0.05, h: 0.13 }; // dark marble
 const PLINTH_TOP = PLINTH.z0 + PLINTH.h; // 0.18
 const DECK = { r: 0.418, t: 0.008 }; // enamelled dial plate on the marble
@@ -119,34 +143,44 @@ const SPINDLE = { r: 0.011, top: 0.68 };
 const SUN = { r: 0.075, z: 0.735 };
 
 // Planets: orbit radius R, sphere radius s, arm height h, planet centre height p, orbits per master
-// turn n (=> periods 12, 16, 24, 48 frames), spin turns per master turn, start angle.
+// turn n (=> periods 12, 16, 24, 48 frames), spin turns per master turn, start angle, material.
 const PLANETS = [
-  { key: 'Ember', R: 0.135, s: 0.021, h: 0.585, p: 0.655, n: 4, spin: 8, phase: 68 * DEG },
-  { key: 'Azure', R: 0.205, s: 0.028, h: 0.525, p: 0.63, n: 3, spin: 6, phase: 138 * DEG },
-  { key: 'Verdant', R: 0.285, s: 0.034, h: 0.46, p: 0.605, n: 2, spin: 4, phase: 8 * DEG },
-  { key: 'Titan', R: 0.37, s: 0.052, h: 0.39, p: 0.575, n: 1, spin: 3, phase: 228 * DEG },
+  { key: 'Ember', R: 0.135, s: 0.021, h: 0.585, p: 0.655, n: 4, spin: 8, phase: 68 * DEG, material: 'Copper' },
+  { key: 'Azure', R: 0.205, s: 0.028, h: 0.525, p: 0.63, n: 3, spin: 6, phase: 138 * DEG, material: 'Azure Glaze' },
+  { key: 'Verdant', R: 0.285, s: 0.034, h: 0.46, p: 0.605, n: 2, spin: 4, phase: 8 * DEG, material: 'Verdant' },
+  { key: 'Titan', R: 0.37, s: 0.052, h: 0.39, p: 0.575, n: 1, spin: 3, phase: 228 * DEG, material: 'Banded Giant' },
 ];
 const MOON = { orbit: 0.068, r: 0.0115, framesPerOrbit: 12, tilt: 14 * DEG };
+const LOOP = 48; // frames per master turn (frame 49 = frame 1)
 
 // Gear train on the deck: module (pitch diameter per tooth) and tooth depth shared by all gears so
-// they mesh. Pitch radius = MODULE·T/2, tip radius = pitch + DEPTH/2.
+// they mesh. Pitch radius = MODULE·T/2, tip radius = pitch + DEPTH/2. `windows` = lightening holes;
+// their count must keep the 48-frame loop seamless: a gear turns T_great/T per loop, which has to
+// be a multiple of its symmetry 1/gcd(T, windows) (checked in layoutGears and verifyMotion).
 const MODULE = 0.0066;
 const DEPTH = 0.0115;
 const CLEAR = 0.0008; // extra centre distance (backlash)
 const GEAR_T = 0.012;
 const GEAR_Z = DECK_TOP + 0.0012 + GEAR_T / 2;
 const GEARS = [
-  { name: 'Great Wheel', T: 36, material: 'Brass', spokes: 6 },
-  { name: 'Idler Wheel', T: 18, material: 'Gilt', angle: -38 * DEG },
-  { name: 'Third Wheel', T: 27, material: 'Brass', spokes: 5, dist: 0.262 },
-  { name: 'Pinion', T: 12, material: 'Copper', dist: 0.305 },
+  { name: 'Great Wheel', T: 36, material: 'Brass', windows: 6, bore: 0.0125 },
+  { name: 'Idler Wheel', T: 18, material: 'Gilt', angle: -38 * DEG, bore: 0.006 },
+  { name: 'Third Wheel', T: 27, material: 'Brass', windows: 6, dist: 0.262, bore: 0.006 },
+  { name: 'Pinion', T: 12, material: 'Copper', dist: 0.305, bore: 0.006 },
 ];
 
 const MOTTO = 'THE HEAVENS\nKEPT IN BRASS';
 
 // Camera & lights
 const FOCUS = [0, -0.03, 0.335];
-const CAMERA = { location: [1.3, -2.47, 1.24], lens: 50, fstop: 2.8 };
+const CAMERA = { location: [1.3, -2.47, 1.24], lens: 50, fstop: 4 };
+const LIGHTS = [
+  // name, location, watts, colour, shape, size, size_y — rectangular soft boxes and a rim strip
+  { name: 'Key Light', location: [-1.25, -1.35, 1.65], energy: 280, color: [1, 0.8, 0.6], shape: 'RECTANGLE', size: 1.1, size_y: 0.7 },
+  { name: 'Fill Light', location: [1.7, -0.75, 0.8], energy: 65, color: [0.78, 0.86, 1], shape: 'DISK', size: 1.4 },
+  { name: 'Rim Light', location: [0.55, 1.65, 1.35], energy: 260, color: [1, 0.72, 0.45], shape: 'RECTANGLE', size: 1.5, size_y: 0.32 },
+  { name: 'Top Light', location: [0.0, 0.2, 2.2], energy: 55, color: [1, 0.92, 0.82], shape: 'DISK', size: 1.2 },
+];
 
 // ---------------------------------------------------------------------------------- gear maths
 
@@ -184,9 +218,9 @@ function layoutGears() {
     const tauA = mod((alpha - A.phase) / pA, 1); // 0 = tooth centre of A on the line
     B.phase = mod(alpha + Math.PI - pB * (0.5 - tauA), TAU);
     B.k = (-A.k * A.T) / B.T;
-    B.meshesWith = A.name;
+    B.meshesWith = A;
   }
-  // sanity: neighbours mesh, nothing else collides, everything stays on the deck
+  // sanity: neighbours mesh, nothing else collides, everything stays on the deck, the loop is seamless
   for (let i = 0; i < g.length; i++)
     for (let j = i + 1; j < g.length; j++) {
       const d = Math.hypot(g[i].x - g[j].x, g[i].y - g[j].y);
@@ -196,8 +230,13 @@ function layoutGears() {
       if (!meshing && d < g[i].tip + g[j].tip + 0.008)
         throw new Error(`gears ${g[i].name} and ${g[j].name} collide (${d.toFixed(4)} m)`);
     }
-  for (const x of g)
+  for (const x of g) {
     if (Math.hypot(x.x, x.y) + x.tip > DIAL.innerRing - 0.006) throw new Error(`gear ${x.name} runs into the dial ring`);
+    x.symmetry = gcd(x.T, x.windows ?? x.T); // rotational symmetry order of teeth + windows
+    const turns = Math.abs(x.k); // turns per loop
+    if (Math.abs(turns * x.symmetry - Math.round(turns * x.symmetry)) > 1e-9)
+      throw new Error(`gear ${x.name} would jump at the loop point (${turns} turns, symmetry ${x.symmetry})`);
+  }
   return g;
 }
 
@@ -218,7 +257,7 @@ async function resetProject() {
 async function sceneSettings() {
   await call('set_scene_settings', {
     frame_start: 1,
-    frame_end: 48,
+    frame_end: LOOP,
     fps: 24,
     frame_current: 1,
     resolution_x: 1280,
@@ -230,7 +269,7 @@ async function sceneSettings() {
     use_denoising: true,
     // STANDARD keeps the sun saturated and the stone dark (AgX lifts blacks and whitens the sun)
     view_transform: 'STANDARD',
-    exposure: -1.15,
+    exposure: -1.1,
     // a warm, very dark backdrop; the procedural photo studio only lights and reflects
     world_color: [0.012, 0.009, 0.007],
     world_strength: 1,
@@ -244,7 +283,7 @@ async function sceneSettings() {
 }
 
 async function materials() {
-  // Presets give physically plausible starting points; each is created once and shared.
+  // Presets give physically plausible starting points; each material is created once and shared.
   const presets = [
     ['Brass', 'brass'],
     ['Polished Brass', 'brass'],
@@ -266,14 +305,20 @@ async function materials() {
     ['material.update', { material: 'Plate Brass', roughness: 0.42 }],
     ['material.update', { material: 'Brass', roughness: 0.26 }],
     ['material.update', { material: 'Azure Glaze', base_color: [0.025, 0.11, 0.42, 1] }],
-    // dark marble: near-black stone with pale gold-grey veins (MARBLE factor 0 = vein)
+    // dark marble: near-black stone with sparse warm-white veins. MARBLE factor 0 = vein; the ramp
+    // ends at 0.26 with EASE, so everything outside the thin vein bands is the black colour_b.
     ['material.procedural_set', {
       material: 'Dark Marble',
       channel: 'base_color',
-      procedural: { color_a: [0.26, 0.22, 0.17], color_b: [0.007, 0.0075, 0.009], scale: 3.2, distortion: 2.6, params: { marble_type: 'SHARPER' } },
+      replace: true,
+      procedural: {
+        type: 'MARBLE', mapping: 'OBJECT', scale: 3.8, distortion: 4.2, detail: 6, roughness: 0.55,
+        color_a: [0.44, 0.4, 0.33], color_b: [0.006, 0.0062, 0.0068], ramp_low: 0, ramp_high: 0.26,
+        params: { marble_type: 'SHARP', ramp_interpolation: 'EASE' },
+      },
     }],
-    ['material.update', { material: 'Dark Marble', roughness: 0.3, coat_weight: 0 }],
-    // dark walnut for the plinth foot, lighter oiled wood for the table
+    ['material.update', { material: 'Dark Marble', roughness: 0.18, coat_weight: 0 }],
+    // dark walnut for the plinth foot, oiled wood with growth rings and fibre streaks for the table
     ['material.procedural_set', {
       material: 'Dark Wood',
       channel: 'base_color',
@@ -283,14 +328,20 @@ async function materials() {
     ['material.procedural_set', {
       material: 'Table Wood',
       channel: 'base_color',
-      procedural: { color_a: [0.045, 0.02, 0.009], color_b: [0.09, 0.043, 0.019], scale: 11, distortion: 0.7, params: { grain: 0.45 } },
+      replace: true,
+      procedural: {
+        type: 'WOOD', mapping: 'OBJECT', scale: 7, distortion: 1.4, detail: 4, roughness: 0.55,
+        color_a: [0.032, 0.014, 0.006], color_b: [0.095, 0.045, 0.019],
+        params: { wood_type: 'RINGS', grain: 0.7, offset_x: 0.35 },
+      },
     }],
     ['material.update', { material: 'Table Wood', roughness: 0.42 }],
     ['material.new', { name: 'Blued Steel', assign: false, base_color: [0.07, 0.09, 0.16, 1], metallic: 1, roughness: 0.22 }],
     ['material.new', { name: 'Black Enamel', assign: false, base_color: [0.006, 0.006, 0.007, 1], metallic: 0, roughness: 0.3 }],
     ['material.new', { name: 'Midnight Enamel', assign: false, base_color: [0.003, 0.007, 0.03, 1], metallic: 0, roughness: 0.25, coat_weight: 0.5, coat_roughness: 0.08 }],
-    // the sun: warm emission with a granulated procedural emission colour
-    ['material.new', { name: 'Sun', assign: false, base_color: [1, 0.62, 0.22, 1], emission_color: [1, 0.55, 0.15], emission_strength: 2.4, roughness: 0.5 }],
+    // the sun: a near-black diffuse base (so the studio lights do not wash it out) under a warm,
+    // granulated procedural emission
+    ['material.new', { name: 'Sun', assign: false, base_color: [0.02, 0.008, 0.002, 1], emission_color: [1, 0.55, 0.15], emission_strength: 3.0, roughness: 0.6 }],
     ['material.procedural_set', {
       material: 'Sun',
       channel: 'emission',
@@ -395,7 +446,7 @@ async function textPlate() {
   await op('data.set_property', { kind: 'objects', target: 'Motto', values: { hide_render: true, hide_viewport: true } });
   await op('data.set_property', { kind: 'objects', target: 'Motto Fill', values: { hide_render: false, hide_viewport: false } });
   await assign('Black Enamel', ['Motto Fill']);
-  // four domed screws
+  // two domed screws
   const screws = [];
   for (const [i, sx] of [-1, 1].entries()) {
     const name = `Plate Screw ${i + 1}`;
@@ -412,19 +463,20 @@ async function gearTrain() {
   const g = layoutGears();
   for (const x of g) {
     const res = await op('object.generate_gear', {
-      teeth: x.T, radius: r4(x.tip), tooth_depth: DEPTH, thickness: GEAR_T, bore: x === g[0] ? 0.0125 : 0.006,
+      teeth: x.T, radius: r4(x.tip), tooth_depth: DEPTH, thickness: GEAR_T, bore: x.bore,
       name: x.name, location: [r4(x.x), r4(x.y), GEAR_Z], rotation: [0, 0, x.phase], materials: false,
     });
     console.log(`    ${x.name}: T=${x.T} tip r=${x.tip.toFixed(4)} at (${x.x.toFixed(4)}, ${x.y.toFixed(4)}) phase ${(x.phase / DEG).toFixed(2)}° ratio ${x.k.toFixed(4)} → ${res.vertices} verts`);
-    // lightening windows ("spokes") cut with a boolean and applied
-    if (x.spokes) {
+    // lightening windows cut with a boolean and applied; spaced evenly so the gear keeps a
+    // rotational symmetry of gcd(teeth, windows)
+    if (x.windows) {
       const cutters = [];
-      const rIn = 0.0125 + 0.012;
+      const rIn = x.bore + 0.012;
       const rOut = x.rp - DEPTH / 2 - 0.012;
       const rc = (rIn + rOut) / 2;
-      const hole = Math.min((rOut - rIn) / 2, rc * Math.sin(Math.PI / x.spokes) - 0.008);
-      for (let s = 0; s < x.spokes; s++) {
-        const a = x.phase + Math.PI / x.spokes + (s * TAU) / x.spokes;
+      const hole = Math.min((rOut - rIn) / 2, rc * Math.sin(Math.PI / x.windows) - 0.008);
+      for (let s = 0; s < x.windows; s++) {
+        const a = x.phase + Math.PI / x.windows + (s * TAU) / x.windows;
         const name = `${x.name} Cutter ${s + 1}`;
         await op('mesh.primitive_cylinder_add', { vertices: 32, radius: hole, depth: GEAR_T * 3, name, location: [x.x + rc * Math.cos(a), x.y + rc * Math.sin(a), GEAR_Z] });
         cutters.push(name);
@@ -460,11 +512,13 @@ async function sunAndSpindle() {
   await assign('Sun', ['Sun']);
   await autoSmooth(['Spindle', 'Hub', 'Sun Cup']);
   await op('object.shade_smooth', {}, { objects: ['Sun'] });
+  // a warm lamp inside the sun (radius just larger than the sphere, so it shines out of it) lights
+  // the planets' sun-facing sides like the lamp of a real orrery; lights are invisible to the camera
+  await op('object.light_add', { type: 'POINT', name: 'Sun Lamp', location: [0, 0, SUN.z], energy: 40, color: [1, 0.62, 0.3], shadow_soft_size: SUN.r + 0.01 });
 }
 
 async function planetArms() {
-  const planetMaterials = { Ember: 'Copper', Azure: 'Azure Glaze', Verdant: 'Verdant', Titan: 'Banded Giant' };
-  for (const [i, P] of PLANETS.entries()) {
+  for (const P of PLANETS) {
     const pivot = `${P.key} Pivot`;
     const arm = `${P.key} Arm`;
     await call('add_object', { type: 'empty', name: pivot, location: [0, 0, P.h], params: { radius: 0.05 } });
@@ -484,7 +538,7 @@ async function planetArms() {
     await autoSmooth([arm]);
     await op('mesh.primitive_uv_sphere_add', { segments: 48, ring_count: 24, radius: P.s, name: P.key, location: [P.R, 0, P.p] });
     await op('object.shade_smooth', {}, { objects: [P.key] });
-    await assign(planetMaterials[P.key], [P.key]);
+    await assign(P.material, [P.key]);
     const children = [arm, P.key];
     if (P.key === 'Titan') {
       // a flat gilt ring around the giant (on the arm, so it orbits but does not spin)
@@ -505,7 +559,7 @@ async function planetArms() {
     }
     await call('set_parent', { objects: children, parent: pivot });
   }
-  // the moon itself (unparented; Follow Path puts it on the orbit in world space)
+  // the moon itself (unparented; Follow Path carries it along the orbit, which rides on the arm)
   await op('mesh.primitive_uv_sphere_add', { segments: 32, ring_count: 16, radius: MOON.r, name: 'Moon', location: [0, 0, 0] });
   await op('object.shade_smooth', {}, { objects: ['Moon'] });
   await assign('Moon Silver', ['Moon']);
@@ -515,94 +569,147 @@ async function planetArms() {
   console.log(`    moon path animation: ${short(anim)}`);
 }
 
+/** Expected driven rotation (Z) of every moving part as a function of the master angle m. */
+function drivenParts(gears) {
+  const parts = [];
+  for (const P of PLANETS) {
+    parts.push({ object: `${P.key} Pivot`, phase: r4(P.phase), k: P.n, kExpr: `${P.n}`, symmetry: 1 });
+    parts.push({ object: P.key, phase: 0, k: P.spin, kExpr: `${P.spin}`, symmetry: 1 });
+  }
+  // a simple gear train: gear i turns T_great/T_i as fast as the great wheel, the sign alternating
+  for (const x of gears)
+    parts.push({ object: x.name, phase: r4(x.phase), k: x.k, kExpr: x === gears[0] ? '1' : `${gears[0].T}/${x.T}`, symmetry: x.symmetry });
+  parts.push({ object: 'Hub', phase: 0, k: 1, kExpr: '1', symmetry: 1 });
+  parts.push({ object: 'Sun', phase: 0, k: -1, kExpr: '1', symmetry: 1 });
+  return parts;
+}
+
+/** Driver expression θ = φ ± k·m, e.g. "2.3736 - 36/18 * m". */
+function driverExpression({ phase, k, kExpr }) {
+  const term = kExpr === '1' ? 'm' : `${kExpr} * m`;
+  if (!phase) return k < 0 ? `-${term}` : term;
+  return `${phase} ${k < 0 ? '-' : '+'} ${term}`;
+}
+
 async function mechanism(gears) {
   // ONE master channel
   await call('add_object', { type: 'empty', name: 'Master Drive', location: [0, 0, 0.1], params: { radius: 0.1 } });
   const keys = await op('anim.keyframes_insert_many', {
-    target: 'Master Drive', path: 'rotation_euler', index: 2, frames: [1, 49], values: [0, TAU], interpolation: 'LINEAR',
+    target: 'Master Drive', path: 'rotation_euler', index: 2, frames: [1, LOOP + 1], values: [0, TAU], interpolation: 'LINEAR',
   });
   const ex = await op('anim.extrapolation_set', { objects: ['Master Drive'], type: 'CYCLIC', path: 'rotation_euler', index: 2 });
   console.log(`    master: ${short(keys)}; extrapolation ${short(ex)}`);
   const v = [{ name: 'm', target: 'Master Drive', path: 'rotation_euler', index: 2 }];
-  const drivers = [];
-  for (const P of PLANETS) {
-    drivers.push(['anim.driver_add', { target: `${P.key} Pivot`, path: 'rotation_euler', index: 2, expression: `${r4(P.phase)} + ${P.n} * m`, variables: v }]);
-    drivers.push(['anim.driver_add', { target: P.key, path: 'rotation_euler', index: 2, expression: `${P.spin} * m`, variables: v }]);
-  }
-  for (const x of gears) {
-    // θ = φ + k·m with k = ±T_master/T (sign alternates along the train)
-    const k = x.k === 1 ? '' : `${x.k < 0 ? '-' : '+'} ${r4(Math.abs(x.k))} * `;
-    const expr = x.k === 1 ? `${r4(x.phase)} + m` : `${r4(x.phase)} ${k}m`;
-    drivers.push(['anim.driver_add', { target: x.name, path: 'rotation_euler', index: 2, expression: expr, variables: v }]);
-  }
-  drivers.push(['anim.driver_add', { target: 'Hub', path: 'rotation_euler', index: 2, expression: 'm', variables: v }]);
-  drivers.push(['anim.driver_add', { target: 'Sun', path: 'rotation_euler', index: 2, expression: '-m', variables: v }]);
+  const drivers = drivenParts(gears).map((part) => {
+    const expression = driverExpression(part);
+    console.log(`    ${part.object.padEnd(14)} θ = ${expression}`);
+    return ['anim.driver_add', { target: part.object, path: 'rotation_euler', index: 2, expression, variables: v }];
+  });
   const res = await batch('drivers', drivers);
   const bad = res.flatMap((r) => r?.drivers ?? []).filter((d) => d.error);
   if (bad.length) throw new Error(`driver errors: ${short(bad)}`);
 }
 
-/**
- * Light and camera datablocks cannot be addressed by name in data.set_property and no tool returns
- * their ids, so read the id from a temporary driver (anim.driver_add returns target_id).
- */
-async function dataBlockId(object, targetType, pathName, value) {
-  const r = await op('anim.driver_add', { target_type: targetType, target: object, path: pathName, expression: String(value) });
-  const id = r.drivers?.[0]?.target_id;
-  await op('anim.driver_remove', { target_type: targetType, target: object, path: pathName });
-  if (!id) throw new Error(`no ${targetType} datablock id for ${object}`);
-  return id;
-}
-
 async function lightsAndCamera() {
   await call('add_object', { type: 'empty', name: 'Focus', location: FOCUS, params: { radius: 0.05 } });
-  const lights = [
-    // name, location, energy W, colour, size (m)
-    ['Key Light', [-1.25, -1.35, 1.65], 260, [1, 0.8, 0.6], 0.9],
-    ['Fill Light', [1.7, -0.75, 0.8], 70, [0.78, 0.86, 1], 1.4],
-    ['Rim Light', [0.55, 1.65, 1.35], 240, [1, 0.72, 0.45], 0.7],
-    ['Top Light', [0.0, 0.2, 2.2], 60, [1, 0.92, 0.82], 1.2],
-  ];
-  for (const [name, location, energy, color, size] of lights) {
-    await call('add_object', { type: 'light', light_type: 'AREA', name, location, params: { energy, color } });
-    const id = await dataBlockId(name, 'light', 'energy', energy);
-    await op('data.set_property', { kind: 'lights', target: id, values: { size, shape: 'DISK' } });
+  // warm studio: rectangular soft boxes and a rim strip (shape/size set directly on the new lights)
+  for (const L of LIGHTS) {
+    const { name, location, ...settings } = L;
+    await op('object.light_add', { type: 'AREA', name, location, ...settings });
   }
-  await op('object.track_set', { type: 'TRACKTO', target: 'Focus', objects: lights.map((l) => l[0]) });
+  await op('object.track_set', { type: 'TRACKTO', target: 'Focus', objects: LIGHTS.map((l) => l.name) });
   // a low kicker that grazes the plinth front so the engraved plate reads
-  await call('add_object', { type: 'light', light_type: 'AREA', name: 'Plate Kicker', location: [-0.35, -1.45, 0.3], params: { energy: 22, color: [1, 0.85, 0.7] } });
-  await op('data.set_property', { kind: 'lights', target: await dataBlockId('Plate Kicker', 'light', 'energy', 22), values: { size: 0.45, shape: 'DISK' } });
+  await op('object.light_add', { type: 'AREA', name: 'Plate Kicker', location: [-0.35, -1.45, 0.3], energy: 22, color: [1, 0.85, 0.7], shape: 'RECTANGLE', size: 0.5, size_y: 0.2 });
   await op('object.track_set', { type: 'TRACKTO', target: 'Motto Plate', objects: ['Plate Kicker'] });
-  await call('add_object', { type: 'camera', name: 'Camera', location: CAMERA.location, params: { lens: CAMERA.lens } });
+  // camera with depth of field focused on the Focus empty (middle of the planet ring) at every frame
+  await op('object.camera_add', {
+    name: 'Camera', location: CAMERA.location, lens: CAMERA.lens,
+    dof_use: true, dof_focus_object: 'Focus', dof_aperture_fstop: CAMERA.fstop,
+  });
   await op('object.track_set', { type: 'TRACKTO', target: 'Focus', objects: ['Camera'] });
   await call('set_active_camera', { camera: 'Camera' });
-  const camId = await dataBlockId('Camera', 'camera', 'lens', CAMERA.lens);
-  // focus on the middle of the planet ring (the Focus empty the camera tracks)
-  const focusDist = Math.hypot(...CAMERA.location.map((c, i) => c - FOCUS[i]));
-  await op('data.set_property', {
-    kind: 'cameras', target: camId,
-    values: { dof_use: true, dof_focus_distance: r4(focusDist), dof_aperture_fstop: CAMERA.fstop },
-  });
-  console.log(`    camera focus distance ${focusDist.toFixed(3)} m at f/${CAMERA.fstop}`);
+  const cam = await call('get_object', { object: 'Camera' }, { quiet: true });
+  console.log(`    camera: ${short(cam.data, 400)}`);
+  if (!cam.data?.dof_use) throw new Error('camera depth of field is not enabled');
 }
 
-async function verify() {
+// ---------------------------------------------------------------------------------- verification
+
+/** get_scene problems: any evaluation error fails the build. */
+async function verifyScene() {
   const scene = await call('get_scene', { frame: 1 }, { quiet: true });
+  console.log(`  scene: ${short(scene.counts, 400)}`);
   const problems = scene.problems ?? [];
-  console.log(`  scene: ${short(scene.counts, 300)}`);
-  if (problems.length) {
-    console.log(`  ⚠ problems: ${short(problems, 2000)}`);
-    warnings.push(...problems.map((p) => `problem: ${short(p)}`));
-  }
-  // check the mechanism moves as designed: driven values at a few frames
-  for (const f of [1, 13, 25]) {
-    await op('scene.frame_set', { frame: f });
-    const list = await op('anim.driver_list', {});
-    const vals = Object.fromEntries((list.drivers ?? []).map((d) => [d.target_name, r4(d.value)]));
-    console.log(`    frame ${f}: ${short(vals, 600)}`);
-  }
-  await op('scene.frame_set', { frame: 1 });
+  if (problems.length) throw new Error(`scene problems: ${short(problems, 2000)}`);
   return scene;
+}
+
+/**
+ * Reads the EVALUATED transforms back with get_object at several frames and checks the mechanism:
+ * every driven angle, the gear ratios and opposite senses of meshing pairs, the planets' orbit
+ * radii, the moon's path around its planet, and that frame 49 looks exactly like frame 1.
+ */
+async function verifyMotion(gears) {
+  const frames = [1, 4, 7, 13, 25, 37, LOOP + 1];
+  const master = (f) => (TAU * (f - 1)) / LOOP; // linear key 0 → 2π over frames 1 → 49
+  const parts = drivenParts(gears);
+  const angle = {}; // object → frame → evaluated rotation Z
+  const errors = [];
+  const check = (cond, msg) => { if (!cond) errors.push(msg); };
+  for (const part of parts) {
+    angle[part.object] = {};
+    for (const f of frames) {
+      const o = await call('get_object', { object: part.object, frame: f }, { quiet: true });
+      const z = o.rotation_euler[2];
+      angle[part.object][f] = z;
+      const want = part.phase + part.k * master(f);
+      check(Math.abs(z - want) < 2e-3, `${part.object} f${f}: rotation ${z.toFixed(4)} ≠ ${want.toFixed(4)}`);
+      // the driver overrides the document value, which get_object lists as `stored`
+      if (f === 13) check(Array.isArray(o.stored?.rotation_euler), `${part.object}: no stored rotation reported next to the driven one`);
+    }
+    // seamless loop: the turn over 48 frames is a multiple of the part's visual symmetry
+    const turns = (angle[part.object][LOOP + 1] - angle[part.object][1]) / TAU;
+    check(Math.abs(turns * part.symmetry - Math.round(turns * part.symmetry)) < 1e-3, `${part.object} turns ${turns} per loop: seam`);
+  }
+  // meshing pairs: opposite senses, speed ratio teeth_A / teeth_B
+  const pairs = [];
+  for (const B of gears.filter((x) => x.meshesWith)) {
+    const A = B.meshesWith;
+    for (const f of [7, 13]) {
+      const dA = angle[A.name][f] - angle[A.name][1];
+      const dB = angle[B.name][f] - angle[B.name][1];
+      const ratio = dB / dA;
+      check(Math.sign(dA) === -Math.sign(dB), `${A.name}/${B.name} turn the same way`);
+      check(Math.abs(ratio + A.T / B.T) < 1e-3, `${A.name}/${B.name} ratio ${ratio} ≠ −${A.T}/${B.T}`);
+      if (f === 13) pairs.push(`${A.name} ${A.T}T → ${B.name} ${B.T}T: Δθ ${dA.toFixed(3)} → ${dB.toFixed(3)} rad (ratio ${ratio.toFixed(4)} = −${A.T}/${B.T})`);
+    }
+  }
+  // planets stay on their orbits (world position at radius R from the spindle)
+  for (const P of PLANETS)
+    for (const f of [1, 7, 13]) {
+      const o = await call('get_object', { object: P.key, frame: f }, { quiet: true });
+      const r = Math.hypot(o.world_location[0], o.world_location[1]);
+      check(Math.abs(r - P.R) < 1e-3, `${P.key} f${f}: orbit radius ${r.toFixed(4)} ≠ ${P.R}`);
+    }
+  // the moon: on its orbit around Verdant, one orbit every 12 frames, back at its start at frame 49
+  const moonAt = {};
+  for (const f of [1, 4, 7, 13, 25, LOOP + 1]) {
+    const m = await call('get_object', { object: 'Moon', frame: f }, { quiet: true });
+    const p = await call('get_object', { object: 'Verdant', frame: f }, { quiet: true });
+    const d = Math.hypot(...m.world_location.map((x, i) => x - p.world_location[i]));
+    check(Math.abs(d - MOON.orbit) < 1.5e-3, `Moon f${f}: ${d.toFixed(4)} m from Verdant ≠ ${MOON.orbit}`);
+    moonAt[f] = m.world_location;
+  }
+  const same = (a, b) => Math.hypot(...a.map((x, i) => x - b[i])) < 1e-3;
+  check(!same(moonAt[1], moonAt[4]) && !same(moonAt[1], moonAt[7]), 'Moon does not move');
+  check(same(moonAt[1], moonAt[25]) && same(moonAt[1], moonAt[LOOP + 1]), 'Moon is not back at its start after 2 and 4 orbits');
+  for (const line of pairs) console.log(`    ${line}`);
+  const fmt = (o) => [1, 13, 25, LOOP + 1].map((f) => r4(angle[o][f])).join(' / ');
+  for (const o of ['Ember Pivot', 'Azure Pivot', 'Verdant Pivot', 'Titan Pivot', 'Great Wheel', 'Idler Wheel', 'Third Wheel', 'Pinion'])
+    console.log(`    ${o.padEnd(14)} θ at frames 1/13/25/49: ${fmt(o)}`);
+  console.log(`    moon ${MOON.orbit} m from Verdant at frames 1,4,7,13,25,49; back at its start every ${MOON.framesPerOrbit} frames`);
+  if (errors.length) throw new Error(`motion check failed:\n  ${errors.join('\n  ')}`);
+  console.log(`  ✓ motion verified: ${parts.length} driven parts × ${frames.length} frames, ${pairs.length} meshing pairs, moon path, seamless ${LOOP}-frame loop`);
 }
 
 // ---------------------------------------------------------------------------------- renders
@@ -612,32 +719,41 @@ async function renderStill(file, opts) {
   const res = await call('render_image', { width: 1280, height: 720, frame: 1, ...opts });
   timings[path.basename(file)] = { ms: Date.now() - t0, info: res.text };
   await saveImage(res, file);
-  console.log(`    → ${file} ${short(res.text, 300)}`);
+  console.log(`    → ${file} ${short(res.text, 400)}`);
   return res.text;
 }
 
 async function previews() {
   await mkdir(PREVIEW_DIR, { recursive: true });
-  await renderStill(path.join(PREVIEW_DIR, 'pt-preview.png'), { width: 960, height: 540, engine: 'PATHTRACER', samples: 16, time_limit: 120 });
+  await renderStill(path.join(PREVIEW_DIR, 'raster.png'), { width: 960, height: 540, engine: 'RASTER' });
+  await renderStill(path.join(PREVIEW_DIR, 'pt-preview.png'), { width: 640, height: 360, engine: 'PATHTRACER', samples: 16, time_limit: 60 });
+  const sheet = await call('render_animation', { format: 'CONTACT_SHEET', frame_start: 1, frame_end: LOOP, frame_step: 4, width: 320, height: 180, columns: 4, engine: 'RASTER', time_limit: 120 });
+  await saveImage(sheet, path.join(PREVIEW_DIR, 'raster-sheet.png'));
+  console.log(`    → ${PREVIEW_DIR}/raster-sheet.png ${short(sheet.text, 300)}`);
 }
 
 async function finalStill() {
-  return renderStill(path.join(HERE, 'render.png'), { engine: 'PATHTRACER', samples: 128, denoise: true, time_limit: 295 });
+  // path traced 1280×720 still; sampling stops at 160 spp or after 470 s, whichever comes first
+  return renderStill(path.join(OUT_DIR, 'render.png'), { engine: 'PATHTRACER', samples: 160, denoise: true, time_limit: 470 });
 }
 
 async function animation() {
-  // few samples, so every frame finishes its share of the budget (frames stopped at 1 spp are not denoised)
-  const common = { frame_start: 1, frame_end: 48, width: 480, height: 270, engine: 'PATHTRACER', samples: 4, denoise: true, max_bounces: 4 };
+  // path traced frames with few samples; the denoiser cleans every frame (also frames that stop early)
+  const common = { frame_start: 1, frame_end: LOOP, engine: 'PATHTRACER', denoise: true, max_bounces: 4 };
   let t0 = Date.now();
-  const sheet = await call('render_animation', { ...common, format: 'CONTACT_SHEET', frame_step: 4, width: 320, height: 180, columns: 4, samples: 8, time_limit: 150 });
+  const sheet = await call('render_animation', { ...common, format: 'CONTACT_SHEET', frame_step: 4, width: 320, height: 180, columns: 4, samples: 12, time_limit: 240 });
   timings['contact_sheet.png'] = { ms: Date.now() - t0, info: sheet.text };
-  await saveImage(sheet, path.join(HERE, 'contact_sheet.png'));
-  console.log(`    → contact_sheet.png ${short(sheet.text, 300)}`);
+  await saveImage(sheet, path.join(OUT_DIR, 'contact_sheet.png'));
+  console.log(`    → contact_sheet.png ${short(sheet.text, 400)}`);
   t0 = Date.now();
-  const gif = await call('render_animation', { ...common, format: 'GIF', fps: 16, dither: 'BAYER', time_limit: 295 });
+  const gif = await call('render_animation', { ...common, format: 'GIF', width: 480, height: 270, samples: 8, fps: 16, dither: 'BAYER', time_limit: 540 });
   timings['preview.gif'] = { ms: Date.now() - t0, info: gif.text };
-  await saveImage(gif, path.join(HERE, 'preview.gif'));
-  console.log(`    → preview.gif ${short(gif.text, 300)}`);
+  await saveImage(gif, path.join(OUT_DIR, 'preview.gif'));
+  console.log(`    → preview.gif ${short(gif.text, 400)}`);
+  for (const r of [sheet, gif]) {
+    const info = r.text ?? {};
+    if (info.truncated) throw new Error(`animation truncated: ${short(info)}`);
+  }
 }
 
 async function exportGlb() {
@@ -648,8 +764,8 @@ async function exportGlb() {
   const list = await op('anim.driver_list', {});
   const driven = [...new Set((list.drivers ?? []).map((d) => d.target_name))];
   const baked = await batch('bake for export', [
-    ['anim.bake_transforms', { objects: driven, frame_start: 1, frame_end: 49, step: 1, channels: ['rotation_euler'] }],
-    ['anim.bake_transforms', { objects: ['Moon'], frame_start: 1, frame_end: 49, step: 1, channels: ['location'], clear_constraints: true }],
+    ['anim.bake_transforms', { objects: driven, frame_start: 1, frame_end: LOOP + 1, step: 1, channels: ['rotation_euler'] }],
+    ['anim.bake_transforms', { objects: ['Moon'], frame_start: 1, frame_end: LOOP + 1, step: 1, channels: ['location'], clear_constraints: true }],
   ]);
   console.log(`    baked ${baked.flatMap((r) => r?.objects ?? []).length} objects`);
   let buf;
@@ -657,15 +773,15 @@ async function exportGlb() {
     const res = await call('export_scene', { format: 'glb' });
     const blob = res.resources?.find((r) => r.blob)?.blob;
     if (!blob) throw new Error(`export returned no file: ${short(res)}`);
+    for (const w of res.text?.warnings ?? []) warnings.push(`export: ${short(w)}`);
     buf = Buffer.from(blob, 'base64');
   } finally {
     const u = await call('undo', {});
     const back = await op('anim.driver_list', {});
     console.log(`    undo bake: ${short(u)} → ${back.drivers?.length} drivers live again`);
-    if ((back.drivers?.length ?? 0) < driven.length)
-      warnings.push('undo after export did not restore every driver');
+    if ((back.drivers?.length ?? 0) < driven.length) throw new Error('undo after export did not restore every driver');
   }
-  await writeFile(path.join(HERE, 'scene.glb'), buf);
+  await writeFile(path.join(OUT_DIR, 'scene.glb'), buf);
   timings['scene.glb'] = { ms: Date.now() - t0, bytes: buf.length };
   console.log(`    → scene.glb ${(buf.length / 1e6).toFixed(2)} MB`);
 }
@@ -674,18 +790,20 @@ async function exportGlb() {
 
 const T0 = Date.now();
 try {
+  console.log(`stages: ${[...STAGES].join(', ')}  outputs: ${OUT_DIR}`);
+  await mkdir(OUT_DIR, { recursive: true });
   console.log('● project');
   await resetProject();
   console.log('● scene settings & materials');
   await sceneSettings();
   await materials();
-  console.log('● plinth');
+  console.log('● plinth, dial, motto plate');
   await plinth();
   await dial();
   await textPlate();
   console.log('● gear train');
   const gears = await gearTrain();
-  console.log('● sun, spindle, planets');
+  console.log('● sun, spindle, planets, moon');
   await sunAndSpindle();
   await planetArms();
   console.log('● mechanism (master channel + drivers)');
@@ -693,7 +811,8 @@ try {
   console.log('● lights & camera');
   await lightsAndCamera();
   console.log('● verify');
-  await verify();
+  await verifyScene();
+  await verifyMotion(gears);
   timings.build = { ms: Date.now() - T0 };
   if (STAGES.has('preview')) {
     console.log('● previews');
@@ -714,6 +833,9 @@ try {
   console.log(`\nDone in ${((Date.now() - T0) / 1000).toFixed(1)} s. Project ${project}`);
   console.log('timings:', JSON.stringify(Object.fromEntries(Object.entries(timings).map(([k, v]) => [k, { s: r4(v.ms / 1000), ...(v.bytes ? { bytes: v.bytes } : {}), ...(v.info ? { info: v.info } : {}) }])), null, 1));
   if (warnings.length) console.log(`warnings (${warnings.length}):\n  ${warnings.join('\n  ')}`);
+} catch (e) {
+  console.error(`\nBUILD FAILED after ${((Date.now() - T0) / 1000).toFixed(1)} s: ${e.message}`);
+  process.exitCode = 1;
 } finally {
   await mcp.close();
 }

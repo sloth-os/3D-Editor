@@ -3,115 +3,160 @@
 ![Final path-traced still](render.png)
 
 An original product visualisation of an invented eau de parfum called **Vellune**. The name and
-the crescent-moon emblem are made up for this scene ("lune" is French for moon). It does not
+the crescent-moon emblem were made up for this scene ("lune" is French for moon); they do not
 depict any real brand or product. Every object, material, light, the camera, the animation and the
-renders were made by [`build.mjs`](build.mjs) calling the editor's MCP server, the same way an
-external AI agent would. The script only does arithmetic (profile points, label layout) and saves
-the files the server returns.
+renders are made by [`build.mjs`](build.mjs) calling the editor's MCP server, the same way an
+external AI agent would. The script only does arithmetic (profile points, label layout, camera
+placement), checks the results it reads back and saves the files the server returns.
 
 | File | What it is |
 | --- | --- |
-| `build.mjs` | Reproducible build: deletes and recreates the `product-shot` project, builds the scene, renders the outputs and exports the glTF |
+| `build.mjs` | Reproducible build: deletes and recreates the `product-shot` project, builds and verifies the scene, renders the outputs |
 | `render.png` | Final still, 1280×720, path traced and denoised |
 | `contact_sheet.png` | Turntable check: 12 of the 36 loop frames, path traced |
-| `preview.gif` | The full 36-frame turntable loop, 384×216 at 12 fps, path traced at low samples |
-| `scene.glb` | glTF 2.0 export of the scene (modifiers applied, turntable animation included) |
+| `preview.gif` | The full 36-frame turntable loop, 480×270 at 12 fps, path traced at low samples and denoised |
+| `scene.glb` | glTF 2.0 export of the scene (written by `--export-only`, see below) |
 
 ## The scene
 
-Everything is built at real-world scale (metres, Z up). The bottle is about 9 cm wide and 13 cm
-tall with its cap.
+Everything is built at real-world scale (metres, Z up). The bottle is 8.4 cm wide, 7 cm deep and
+12.9 cm tall with its cap; the plinth is 17 cm across and 5 cm high.
 
-* **Bottle.** A thick-walled glass flacon with an elongated octagonal cross-section. Its
-  wall/base profile (outer wall, domed shoulder, neck, inner cavity, thick glass base) is a POLY
-  curve (`curve.add_from_points`) converted to a mesh (`object.convert`) and revolved by a
-  **SCREW** modifier with 8 steps. The 8 steps make the facets. The profile lies in the plane at
-  22.5° so a flat facet faces the camera, and the object is scaled 1.2× along X to widen that
-  front facet for the label. A **SMOOTH_BY_ANGLE** modifier keeps the facet edges sharp and the
-  shoulder curvature smooth. The glass is a slightly blue-tinted transmissive material with
-  IOR 1.5.
-* **Perfume.** A second revolved profile that follows the cavity with a 0.4 mm air gap. The
-  liquid is champagne-coloured (transmission, IOR 1.36).
-* **Cap.** A stepped octagonal cap revolved the same way, with facets aligned to the bottle. It
+* **Bottle.** A thick-walled glass flacon with an elongated octagonal cross-section. Its profile
+  (outer wall, domed shoulder, neck lip, inner cavity, thick glass base) is a POLY curve made with
+  `curve.add_from_points`. A **SCREW** modifier with 8 steps revolves this wire profile directly;
+  the 8 steps are the facets. The profile lies in the vertical plane at 22.5° so that a flat
+  facet faces the camera, and the object is scaled 1.2× along X to widen that front facet for the
+  label. A **SMOOTH_BY_ANGLE** modifier keeps the facet edges sharp and the shoulder smooth. The
+  glass has a faint cool tint (transmission 1, IOR 1.5, roughness 0).
+* **Perfume.** A second revolved profile follows the cavity with a 0.4 mm air gap. The liquid is
+  amber (transmission 1, IOR 1.36).
+* **Cap.** A stepped octagonal cap revolved the same way, its facets aligned with the bottle. It
   uses the `gold` preset, polished to roughness 0.14.
-* **Front label.** Six curve and text objects, created in a single `batch`:
+* **Front label.** Six curve and text objects, created in a single `batch` (one undo step):
   * a black enamel plate: a filled, extruded 2D rounded rectangle with a clear coat;
-  * a gold frame: a closed curve with a round `bevel_depth`;
+  * a thin gold frame: a closed 3D curve with a round `bevel_depth`;
   * a crescent emblem: a filled 2D curve;
-  * the name **VELLUNE** and **EAU DE PARFUM**: extruded FONT objects;
+  * the name **VELLUNE** and the line **EAU DE PARFUM**: extruded text (`object.text_add`);
   * a gold rule between the two lines.
 
-  The label pieces are parented to the bottle.
-* **Pedestal and props.** A bevelled marble plinth, using the procedural `marble` preset re-scaled
-  with `material.procedural_set`. A marble column with a gold sphere stands behind on the right,
-  and three porcelain "pearls" lie on the floor in front.
-* **Cyclorama.** A seamless studio sweep: an open 2D curve (floor → 26 cm cove → wall) whose
-  `extrude` turns it into a 1.6 m wide sheet. The paper is a matte dusty rose.
-* **Lighting.** Three area lights:
-  * a large warm **key** softbox front-left (0.75 × 0.85 m);
-  * a cool **fill** panel front-right;
-  * a narrow **rim** strip side-back for the glass edges.
+  The label pieces are parented to the bottle and sit 0.06 mm in front of the glass.
+* **Pedestal and props.** A marble plinth and a marble column, both revolved profiles with 4 mm and
+  2.5 mm round rims, use the procedural `marble` preset re-tuned with `material.procedural_set`.
+  A polished gold sphere sits on the column, and three cream "pearls" (porcelain preset with a
+  clear coat and sheen) lie on the floor in front.
+* **Cyclorama.** A seamless studio sweep: an open 2D curve (floor, 26 cm cove, wall) whose
+  `extrude` turns it into a 1.6 m wide sheet. The paper is a matte deep wine red.
+* **Lighting.** Three-point lighting with area lights, plus a background light:
+  * **key**: a large warm softbox (0.75 × 0.85 m) high front-left, for the label, cap and plinth;
+  * **fill**: a cool vertical strip (0.12 × 0.6 m) on the right. Area lights are invisible to the
+    camera but appear in reflections, so the front-right facet mirrors it as a bright stripe;
+  * **rim**: a narrow strip (0.1 × 0.5 m) behind on the left for the glass, cap and plinth edges;
+  * **backdrop glow**: a soft SPOT pooled on the cove right behind the bottle. The camera sees
+    this warm glow through the perfume, which makes the liquid shine amber, and it frames the
+    bottle like a rising moon.
 
   The STUDIO environment at strength 0.2 adds subtle reflections. The view transform is
   **Khronos PBR Neutral**, which keeps product colours faithful.
-* **Camera.** 85 mm lens at about 1.05 m. **Depth of field** at f/4 is focused on the label plane,
-  so the column, the pearls and the backdrop fall off softly.
+* **Camera.** An 85 mm lens at about 1.05 m. **Depth of field** at f/4
+  (`camera.properties_set` `dof_use`, `dof_aperture_fstop`) is focused through `dof_focus_object`
+  on a "Focus Point" empty at the centre of the label, so the column, the pearls and the backdrop
+  fall off softly.
 * **Turntable.** `anim.turntable` orbits the *same* camera around the bottle. Its radius, height
-  and start angle reproduce the still, so frame 1 is the still. The backdrop, lights and props
-  are parented to the "Turntable Pivot" and turn with the camera. On screen, the bottle and its
-  pedestal spin while the studio stays put, like a real product turntable. The loop is 36 frames
-  long and seamless (CYCLIC extrapolation).
+  and start angle reproduce the still, so frame 1 is the still. The backdrop, the lights, the
+  props and the focus point are parented to the "Turntable Pivot" and turn with the camera. On
+  screen the bottle and its plinth spin while the studio stays put, like on a real product
+  turntable, and the focus stays on the front of the bottle. The loop is 36 frames long and
+  seamless (CYCLIC extrapolation).
+
+## Checks done by the build
+
+After building, `build.mjs` reads the scene back and stops with an error if something is off:
+
+* `get_scene` reports no evaluation `problems`;
+* the SCREW lathes produced geometry (`get_object` evaluated counts) and the bottle has the designed
+  size; the plinth top is at 5 cm; the label plate sits on the front facet (gap below 0.2 mm);
+* `get_object` at frames 1, 10, 19, 28 and 37 gives the evaluated camera position: the azimuth
+  advances by exactly a quarter turn every 9 frames, the radius stays 1.038 m, frame 37 equals
+  frame 1 (seamless loop), and the evaluated `dof_focus_distance` stays constant (1.016 m);
+* the bottle never moves.
 
 ## Features, operators and tools used
 
 * **MCP tools:**
-  * project lifecycle: `list_projects`, `delete_project`, `create_project`;
-  * scene and objects: `set_scene_settings`, `add_object`, `add_modifier`, `set_material`,
-    `set_active_camera`;
-  * operators: `run_operator`, `batch`;
-  * checks and output: `get_scene` (problems check), `render_image` (PATHTRACER),
-    `render_animation` (CONTACT_SHEET and GIF), `export_scene` (glb).
-* **Curves and text:** `curve.add_from_points` covers POLY curves in 2D and 3D, `cyclic`,
-  `fill_mode`, `extrude` and `bevel_depth`. Text uses `object.text_add`, and `object.convert` turns
-  curves into meshes.
-* **Modifiers:** SCREW (lathe), SMOOTH_BY_ANGLE and BEVEL.
+  * projects: `list_projects`, `delete_project`, `create_project`;
+  * building: `set_scene_settings`, `add_object` (empty, camera, AREA and SPOT lights with their
+    shape, size and cone given directly), `add_modifier`, `set_material`, `set_active_camera`,
+    `run_operator`, `batch`;
+  * checking: `get_scene` (problems, base and evaluated counts), `get_object` (evaluated values at
+    a frame: camera position, focus distance, bounds);
+  * output: `render_image` (PATHTRACER and RASTER), `render_animation` (CONTACT_SHEET and GIF),
+    `export_scene` (glb).
+* **Curves and text:** `curve.add_from_points` (POLY curves in 2D and 3D, `cyclic`, `fill_mode`,
+  `extrude`, `bevel_depth`) and `object.text_add`.
+* **Modifiers:** SCREW on wire curves (lathe) and SMOOTH_BY_ANGLE.
 * **Shading:**
   * presets via `material.preset_apply` (gold, marble, porcelain);
-  * procedural textures via `material.procedural_set` (the MARBLE texture);
-  * new materials and edits via `material.new` and `material.update` (clear coat);
+  * procedural textures via `material.procedural_set` (MARBLE);
+  * new materials and edits via `material.new` and `material.update` (clear coat, sheen);
   * assignment via `object.material_assign`;
   * transmission and IOR via `set_material`.
-* **Layout and look:** `object.look_at` aims the lights and the camera; `object.shade_smooth` and
-  `object.shade_auto_smooth` set shading.
-* **Data:** `data.set_property` sets the area light shape and size and the camera DOF (see
-  limitations).
-* **Animation and rigging:** `anim.turntable` and `object.parent_to`.
-* **Rendering:** the path tracer with denoising, `max_bounces` 10, a time limit, DOF and the
-  NEUTRAL view transform.
+* **Lights and camera:** `object.light_add` settings through `add_object` (`shape`, `size`,
+  `size_y`, `spot_size`, `spot_blend`), `camera.properties_set` (depth of field with a focus
+  object, clipping), `object.look_at`.
+* **Layout:** `object.select` and `object.shade_smooth` (in a batch), `object.parent_to`.
+* **Animation:** `anim.turntable`.
+* **Rendering:** the path tracer with denoising, `max_bounces` 10, a time limit, depth of field and
+  the NEUTRAL view transform.
 
 ## Rebuild
 
-Start a server (any data dir), then run the script from the repository root:
+Start a server (any data directory), then run the script from the repository root:
 
 ```bash
-PORT=4505 DATA_DIR=/tmp/ps-data RENDER_WORKERS=2 node .phase3/app/dist/main.js &
-MCP_URL=http://127.0.0.1:4505/mcp node examples/product-shot/build.mjs
+PORT=4505 DATA_DIR=/tmp/ps-data RENDER_WORKERS=3 node .phase3/app-v2/dist/main.js &
+MCP_URL=http://127.0.0.1:4505/mcp node examples/product-shot/build.mjs            # = --final
 ```
 
-`MODE` selects what runs:
-
-| `MODE` | Runs |
+| Mode flag | Runs |
 | --- | --- |
-| `full` (default) | Build, then the still, the turntable renders and the export |
-| `build` | The project only |
-| `preview` | Build plus quick 480×270 previews in `PREVIEW_DIR` |
-| `still`, `anim`, `export` | Build plus that one output |
+| `--final` (default) | Build and verify, then `render.png`, `contact_sheet.png` and `preview.gif` |
+| `--build-only` | Build and verify the project only, no renders (about 1 s) |
+| `--preview` | Build plus a RASTER and a 640×360 path-traced preview (≤ 60 s) in `--out-dir` (default `/tmp/product-shot-previews`) |
+| `--still` | Build plus `render.png` only |
+| `--anim` | Build plus `contact_sheet.png` and `preview.gif` only |
+| `--export-only` | Build plus `scene.glb` only, no renders |
 
-`OUT_DIR` redirects the outputs. `FINAL_SAMPLES` and `FINAL_TIME` override the still's samples
-and time budget.
+Options: `--out-dir <dir>` redirects the outputs; `--samples <n>` (default 256) and
+`--time-limit <s>` (default 450) set the still's samples and wall-clock budget;
+`--anim-samples <n>` (default 12) sets the GIF samples (the contact sheet uses twice as many).
+`MODE=build|preview|still|anim|export|full` is accepted as an alias of the flags.
 
-RENDER_TIMES_PLACEHOLDER
+FINAL_RUN_PLACEHOLDER
 
 ## Known limitations and workarounds
 
-LIMITATIONS_PLACEHOLDER
+* **No BEVEL modifier on the plinth and column.** The Bevel modifier with more than one segment
+  cuts a small notch into the rounded edge at every vertex where two beveled edges meet an
+  unbeveled one, so a beveled cylinder shows a jagged zig-zag along its rims (it was visible in
+  the first version of this render). The plinth and the column are therefore revolved profiles
+  with round fillets, which also give perfectly smooth rims.
+* **Liquid and glass do not touch.** The path tracer treats every transmissive surface as a
+  boundary between air and the material, so a liquid surface cannot share a boundary with the
+  glass. The perfume is a separate body with a 0.4 mm air gap, which adds faint bright outlines
+  where it meets the glass.
+* **Lamps are invisible to the camera** in the path tracer and appear only in reflections. The
+  glow behind the bottle is light pooled on the backdrop, not a visible lamp, and the strip
+  highlights on the facets are reflections of the fill and key lights.
+* **RASTER previews** have no shadows and no refraction: the glass is drawn as smooth tinted
+  transparency. Judge the glass, the liquid and the depth of field only in path-traced renders
+  (`--preview` makes one).
+* **Inspection counts.** `get_scene` / `get_object` evaluated counts use the modifiers' viewport
+  settings. The script sets SCREW `render_steps` equal to `steps`, so what the tools report is what
+  renders.
+* **Animation quality.** The GIF frames are path traced at 16 samples per pixel and denoised, so
+  fine glass detail is slightly smoothed; the 256-colour palette with Bayer dithering leaves a fine
+  dot pattern in the backdrop gradient.
+* **glTF export.** `scene.glb` comes from `--export-only` and is regenerated in a later pass with
+  the finished exporter. glTF has no area lights (the three area lights are exported as point
+  lights), and the procedural marble is baked to textures on generated UVs.

@@ -1,7 +1,55 @@
 import * as THREE from 'three';
-import { multiply4, type Mat4 } from '@3d-editor/core';
+import { cameraFovY, multiply4, orthoHalfExtents, type CameraData, type Mat4 } from '@3d-editor/core';
 import { applyPoseToCamera, type ViewPose } from '../viewport/navigation';
 import type { RenderViewData, Vec3T } from './protocol';
+
+/**
+ * Blender's lens shift on a three.js camera's projection (call after `updateProjectionMatrix`, which
+ * resets it): the image moves by `shiftX` / `shiftY` times its larger dimension, exactly like core
+ * `viewFromCamera`, so rasterized renders frame a shifted camera like the path tracer and the
+ * server's renderers.
+ */
+export function applyLensShift(
+  cam: THREE.PerspectiveCamera | THREE.OrthographicCamera,
+  shiftX: number,
+  shiftY: number,
+  aspect: number,
+): void {
+  if (!shiftX && !shiftY) return;
+  const sx = 2 * (shiftX || 0) * Math.max(1, 1 / aspect);
+  const sy = 2 * (shiftY || 0) * Math.max(1, aspect);
+  const e = cam.projectionMatrix.elements;
+  for (let c = 0; c < 4; c++) {
+    e[c * 4] -= sx * e[c * 4 + 3];
+    e[c * 4 + 1] -= sy * e[c * 4 + 3];
+  }
+  cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+}
+
+/**
+ * A three.js camera showing a scene camera (its evaluated data and world matrix) in an image of
+ * `aspect`: perspective or orthographic with the camera's field of view (sensor fit), clipping range
+ * and lens shift; the view core `viewFromCamera` gives the path tracer and the server's renderers.
+ */
+export function sceneCameraView(
+  cam: CameraData,
+  world: ArrayLike<number>,
+  aspect: number,
+): THREE.PerspectiveCamera | THREE.OrthographicCamera {
+  const near = Math.max(1e-6, cam.clip_start);
+  const far = Math.max(near * 1.001, cam.clip_end);
+  let c: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+  if (cam.type === 'ORTHO') {
+    const e = orthoHalfExtents(cam, aspect);
+    c = new THREE.OrthographicCamera(-e.halfW, e.halfW, e.halfH, -e.halfH, near, far);
+  } else
+    c = new THREE.PerspectiveCamera(THREE.MathUtils.radToDeg(cameraFovY(cam, aspect)), aspect, near, far);
+  new THREE.Matrix4().fromArray(Array.from(world)).decompose(c.position, c.quaternion, new THREE.Vector3());
+  c.updateMatrixWorld(true);
+  c.updateProjectionMatrix();
+  applyLensShift(c, cam.shift_x, cam.shift_y, aspect);
+  return c;
+}
 
 /**
  * A camera showing the viewport's own view (its navigation pose) in an image of `aspect`:

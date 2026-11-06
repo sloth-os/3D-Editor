@@ -368,5 +368,6 @@ describe('software renderer', () => {
     const m = mask(img);
     expect(Math.abs(m.cx - 255.5)).toBeLessThan(8);
     expect(Math.abs(m.cy - 255.5)).toBeLessThan(8);
-  });
+    // the 6 s budget above is the performance check; vitest's 5 s default must not pre-empt it
+  }, 30_000);
 });
