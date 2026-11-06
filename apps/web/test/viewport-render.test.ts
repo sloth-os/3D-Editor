@@ -119,7 +119,22 @@ vi.mock('three', async (importOriginal) => {
     compile() {}
     dispose() {}
   }
-  return { ...three, WebGLRenderer: RecordingWebGLRenderer };
+  /** Prefiltered environment maps need WebGL: placeholder targets (the procedural sky's, studio's). */
+  class StubPMREMGenerator {
+    fromScene() {
+      return new three.WebGLRenderTarget(1, 1);
+    }
+    fromEquirectangular() {
+      return new three.WebGLRenderTarget(1, 1);
+    }
+    fromCubemap() {
+      return new three.WebGLRenderTarget(1, 1);
+    }
+    compileEquirectangularShader() {}
+    compileCubemapShader() {}
+    dispose() {}
+  }
+  return { ...three, WebGLRenderer: RecordingWebGLRenderer, PMREMGenerator: StubPMREMGenerator };
 });
 
 const pathTraced = vi.hoisted(() => [] as PathTraceOptions[]);
@@ -795,63 +810,175 @@ describe('final render brightness', () => {
   });
 });
 
+/**
+ * The scene of the report: Blender's default scene (camera, 2 m cube) on a `floor` m plane at
+ * z = −1, with a 15 cm pole and a 50 cm box, lit by a shadow-casting sun lamp.
+ */
+function sunScene(floor: number): ProjectSession {
+  const s = session();
+  ok(s, 'mesh.primitive_plane_add', { name: 'Floor', size: floor, location: [0, 0, -1] });
+  ok(s, 'mesh.primitive_cube_add', {
+    name: 'Pole',
+    size: 1,
+    location: [2.5, 1, 0.5],
+    scale: [0.15, 0.15, 3],
+  });
+  ok(s, 'mesh.primitive_cube_add', { name: 'Box', size: 0.5, location: [-2, -2, -0.75] });
+  ok(s, 'light.properties_set', { object: 'Light', type: 'SUN', energy: 3 });
+  s.doc.updateObject(s.doc.findObjectByName('Light')!.id, { location: [2, -2, 5], rotation: [0.6, 0.35, 0] });
+  s.doc.updateRender({ use_shadows: true, resolution_x: 64, resolution_y: 36 });
+  return s;
+}
+
+/** The shadow-casting suns (directional lights) of the engine's scene, by name. */
+function shadowSuns(e: ViewportEngine): Map<string, THREE.DirectionalLight> {
+  const out = new Map<string, THREE.DirectionalLight>();
+  e.scene.traverse((o) => {
+    const l = o as THREE.DirectionalLight;
+    if (l.isDirectionalLight && l.castShadow && l.visible && l.parent)
+      out.set(l.name || String(l.parent.userData.objectId ?? ''), l);
+  });
+  return out;
+}
+
+/** World size of a texel of a sun's shadow map and its biases in world units. */
+function shadowMetrics(light: THREE.DirectionalLight) {
+  const c = light.shadow.camera;
+  const texel = Math.max(c.right - c.left, c.top - c.bottom) / light.shadow.mapSize.x;
+  return { texel, normalBias: light.shadow.normalBias, depthBias: -light.shadow.bias * (c.far - c.near) };
+}
+
+/** Whether a world point lies in the volume a sun's shadow map covers. */
+function inShadowMap(light: THREE.DirectionalLight, p: THREE.Vector3): boolean {
+  const c = light.shadow.camera;
+  // where three.js puts the shadow camera before drawing the map
+  light.shadow.updateMatrices(light);
+  const v = p.clone().applyMatrix4(c.matrixWorldInverse);
+  const e = 1e-6;
+  return (
+    v.x >= c.left - e &&
+    v.x <= c.right + e &&
+    v.y >= c.bottom - e &&
+    v.y <= c.top + e &&
+    -v.z >= c.near - e &&
+    -v.z <= c.far + e
+  );
+}
+
+/** Points on the surface of an object's mesh as the render drew it (its world box, 4 × 4 × 4). */
+function objectPoints(e: ViewportEngine, s: ProjectSession, name: string): THREE.Vector3[] {
+  const id = s.doc.findObjectByName(name)!.id;
+  let mesh: THREE.Mesh | null = null;
+  e.scene.traverse((o) => {
+    if ((o as THREE.Mesh).isMesh && o.userData.objectId === id) mesh = o as THREE.Mesh;
+  });
+  const m = mesh as unknown as THREE.Mesh;
+  m.updateWorldMatrix(true, false);
+  m.geometry.computeBoundingBox();
+  const b = m.geometry.boundingBox!.clone().applyMatrix4(m.matrixWorld);
+  const out: THREE.Vector3[] = [];
+  for (let i = 0; i <= 3; i++)
+    for (let j = 0; j <= 3; j++)
+      for (let k = 0; k <= 3; k++)
+        out.push(
+          new THREE.Vector3(
+            THREE.MathUtils.lerp(b.min.x, b.max.x, i / 3),
+            THREE.MathUtils.lerp(b.min.y, b.max.y, j / 3),
+            THREE.MathUtils.lerp(b.min.z, b.max.z, k / 3),
+          ),
+        );
+  return out;
+}
+
 describe('sun shadows', () => {
-  it('cover the whole scene with a shadow map fitted to it', () => {
-    // regression: a sun lamp's shadow map covered a fixed ±15 m square around the lamp at 1024 px:
-    // larger scenes lost their shadows and small ones got coarse texels and acne on faces lit at
-    // grazing angles (stripes in F12 renders)
-    const s = session();
-    ok(s, 'mesh.primitive_plane_add', { name: 'Ground', size: 60, location: [5, -3, -1] });
-    ok(s, 'mesh.primitive_cube_add', { name: 'Far', size: 2, location: [28, 25, 3] });
-    ok(s, 'object.light_add', {
-      type: 'SUN',
-      name: 'Sun',
-      location: [40, -30, 12],
-      rotation: [0.7, 0.2, 0.9],
-    });
-    s.doc.updateRender({ use_shadows: true });
+  it('stay sharp however large the ground plane: the map is fitted to what the render camera sees', () => {
+    // regression: a sun's map was fitted to the whole scene's bounding sphere; with a 600 m floor a
+    // texel was 0.42 m (wider than the 15 cm pole), the normal offset 0.63 m and the depth bias
+    // 0.43 m: the shadows of the cube, the pole and the box faded out and vanished, and the cube's
+    // faces got moiré acne
+    const texels: number[] = [];
+    for (const size of [12, 600]) {
+      const s = sunScene(size);
+      const { e, gl } = engine(s);
+      e.renderPixels();
+      const sun = [...shadowSuns(e).values()];
+      expect(sun).toHaveLength(1);
+      const light = sun[0];
+      const m = shadowMetrics(light);
+      texels.push(m.texel);
+      expect(m.texel, `${size} m floor: texel`).toBeLessThan(0.02);
+      expect(m.normalBias).toBeLessThan(0.03);
+      expect(m.depthBias).toBeLessThan(0.02);
+      // the casters the camera sees, and their shadows on the floor it sees, are in the map
+      const cam = sceneCamera(e, gl);
+      const view = new THREE.Frustum().setFromProjectionMatrix(
+        new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse),
+      );
+      light.updateWorldMatrix(true, true);
+      const dir = new THREE.Vector3()
+        .setFromMatrixPosition(light.target.matrixWorld)
+        .sub(new THREE.Vector3().setFromMatrixPosition(light.matrixWorld))
+        .normalize();
+      let checked = 0;
+      for (const name of ['Cube', 'Pole', 'Box'])
+        for (const p of objectPoints(e, s, name)) {
+          const shadow = p.clone().addScaledVector(dir, (-1 - p.z) / dir.z);
+          for (const q of [p, shadow])
+            if (view.containsPoint(q) && Math.max(Math.abs(q.x), Math.abs(q.y)) <= size / 2) {
+              expect(inShadowMap(light, q), `${size} m floor: ${name} ${q.toArray()}`).toBe(true);
+              checked++;
+            }
+        }
+      expect(checked).toBeGreaterThan(100);
+    }
+    // the 600 m floor's map is about as fine as the 12 m floor's, not 50 times coarser
+    expect(texels[1] / texels[0]).toBeLessThan(3);
+  });
+
+  it('fit the sky’s sun the same way', () => {
+    const s = sunScene(600);
+    s.doc.removeObject(s.doc.findObjectByName('Light')!.id);
+    s.doc.updateWorld({
+      environment: 'SKY',
+      sun_elevation: 0.8,
+      sun_rotation: 3.9,
+      sun_intensity: 3,
+    } as never);
     const { e } = engine(s);
     e.renderPixels();
-    let sun: THREE.DirectionalLight | null = null;
-    e.scene.traverse((o) => {
-      if ((o as THREE.DirectionalLight).isDirectionalLight && (o as THREE.DirectionalLight).castShadow)
-        sun = o as THREE.DirectionalLight;
+    const sky = shadowSuns(e).get('Sky Sun');
+    expect(sky).toBeTruthy();
+    const m = shadowMetrics(sky!);
+    // the whole-scene fit gave 0.42 m texels here
+    expect(m.texel).toBeLessThan(0.03);
+    expect(m.normalBias).toBeLessThan(0.05);
+    expect(m.depthBias).toBeLessThan(0.03);
+    for (const p of objectPoints(e, s, 'Cube')) expect(inShadowMap(sky!, p)).toBe(true);
+  });
+
+  it('refit the map for every render: the viewport fits its own view, a final render the camera', () => {
+    const s = sunScene(600);
+    const { e } = engine(s);
+    s.view.shading.value = 'RENDERED';
+    // the viewport looks closely at the box, 2 m away
+    e.setPose({
+      target: new THREE.Vector3(-2, -2, -0.75),
+      distance: 2,
+      yaw: 0.6,
+      pitch: 0.5,
+      ortho: false,
+      fovY: THREE.MathUtils.degToRad(39.6),
     });
-    const light = sun as unknown as THREE.DirectionalLight;
-    expect(light).toBeTruthy();
-    e.scene.updateMatrixWorld(true);
-    // where three.js puts the shadow camera before drawing the shadow map
-    light.shadow.updateMatrices(light);
-    const cam = light.shadow.camera;
-    const corners: THREE.Vector3[] = [];
-    e.scene.traverse((o) => {
-      const m = o as THREE.Mesh;
-      if (!m.isMesh || !m.userData.objectId || !m.visible) return;
-      m.geometry.computeBoundingBox();
-      const b = m.geometry.boundingBox!;
-      for (let i = 0; i < 8; i++)
-        corners.push(
-          new THREE.Vector3(
-            i & 1 ? b.max.x : b.min.x,
-            i & 2 ? b.max.y : b.min.y,
-            i & 4 ? b.max.z : b.min.z,
-          ).applyMatrix4(m.matrixWorld),
-        );
-    });
-    expect(corners.length).toBeGreaterThan(8);
-    for (const c of corners) {
-      const v = c.clone().applyMatrix4(cam.matrixWorldInverse);
-      expect(v.x).toBeGreaterThanOrEqual(cam.left);
-      expect(v.x).toBeLessThanOrEqual(cam.right);
-      expect(v.y).toBeGreaterThanOrEqual(cam.bottom);
-      expect(v.y).toBeLessThanOrEqual(cam.top);
-      expect(-v.z).toBeGreaterThanOrEqual(cam.near);
-      expect(-v.z).toBeLessThanOrEqual(cam.far);
-    }
-    expect(light.shadow.mapSize.x).toBe(2048);
-    // the frustum is the scene's size, not a fixed 30 m
-    expect(cam.right - cam.left).toBeGreaterThan(60);
-    expect(cam.right - cam.left).toBeLessThan(120);
+    e.sync();
+    e.thumbnail();
+    const light = [...shadowSuns(e).values()][0];
+    const close = shadowMetrics(light).texel;
+    for (const p of objectPoints(e, s, 'Box')) expect(inShadowMap(light, p)).toBe(true);
+    // the final render's camera sees the whole group from 11 m: a larger, coarser map
+    e.renderPixels();
+    const final = shadowMetrics([...shadowSuns(e).values()][0]).texel;
+    expect(final).toBeGreaterThan(2 * close);
+    for (const p of objectPoints(e, s, 'Pole')) expect(inShadowMap(light, p)).toBe(true);
   });
 });
 

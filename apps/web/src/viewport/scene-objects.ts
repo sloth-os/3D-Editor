@@ -124,6 +124,8 @@ export class SceneObjects {
   /** Instanced meshes keyed by `${ownerId}|${sourceId}`. */
   private readonly instanced = new Map<string, THREE.InstancedMesh>();
   readonly textures: TextureCache;
+  /** {@link SceneObjects.shadowBoxes} of the last sync (null: not computed yet). */
+  private boxes: THREE.Box3[] | null = null;
 
   constructor(
     private readonly scene: THREE.Scene,
@@ -399,12 +401,7 @@ export class SceneObjects {
     }
   }
 
-  private syncLight(
-    v: ObjectView,
-    l: LightData,
-    world: number[],
-    opts: SyncOptions,
-  ): void {
+  private syncLight(v: ObjectView, l: LightData, world: number[], opts: SyncOptions): void {
     const key = `${l.type}|${l.shape}`;
     if (v.lightKey !== key || !v.light) {
       if (v.light) {
@@ -481,9 +478,6 @@ export class SceneObjects {
     }
     light.visible = opts.shading === 'RENDERED';
   }
-
-  /** {@link shadowBoxes} of the last sync (null: not computed yet). */
-  private boxes: THREE.Box3[] | null = null;
 
   /**
    * World-space bounding boxes of the visible geometry that casts and receives shadows: one per

@@ -42,11 +42,7 @@ export interface SunShadowFit {
 
 /** Corner `i` of a box: bit 0 picks x, bit 1 y and bit 2 z (min or max). */
 function corner(box: THREE.Box3, i: number, out = new THREE.Vector3()): THREE.Vector3 {
-  return out.set(
-    i & 1 ? box.max.x : box.min.x,
-    i & 2 ? box.max.y : box.min.y,
-    i & 4 ? box.max.z : box.min.z,
-  );
+  return out.set(i & 1 ? box.max.x : box.min.x, i & 2 ? box.max.y : box.min.y, i & 4 ? box.max.z : box.min.z);
 }
 
 /** The faces of a box as cycles of {@link corner} indices. */
@@ -267,7 +263,8 @@ export function fitSunShadow(
     }
     if (bx1 < left || bx0 > right || by1 < bottom || by0 > top || bd >= near) continue;
     if (bx0 >= left && bx1 <= right && by0 >= bottom && by1 <= top) near = bd;
-    else for (const p of clipBox(box, prism, [])) near = Math.min(near, -tmp.copy(p).applyMatrix4(lightView).z);
+    else
+      for (const p of clipBox(box, prism, [])) near = Math.min(near, -tmp.copy(p).applyMatrix4(lightView).z);
   }
   const margin = Math.max(0.05, 0.01 * (d1 - near));
   near -= margin;

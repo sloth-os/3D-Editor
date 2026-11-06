@@ -1985,17 +1985,11 @@ async function render(toolName, args, label) {
   const r = await tool(toolName, args, { onProgress: progress(label) });
   return { r, ms: Date.now() - t, meta: info(r) };
 }
-/** Samples per pixel the frames of a path-traced render_animation reached, when the editor
- *  reports them (frame_samples; editor builds before commit 6451e56 only list undersampled_frames). */
+/** Samples per pixel the frames of a path-traced render_animation reached (samples_reached). */
 function sampleStats(meta) {
-  const s = meta.frame_samples;
-  if (!Array.isArray(s) || !s.length) return { frame_samples: 'not reported' };
-  return {
-    spp_min: Math.min(...s),
-    spp_mean: +(s.reduce((a, b) => a + b, 0) / s.length).toFixed(1),
-    spp_max: Math.max(...s),
-    requested: meta.requested_samples,
-  };
+  const s = meta.samples_reached;
+  if (!s) return { samples_reached: 'not reported' };
+  return { spp_min: s.min, spp_mean: s.mean, spp_max: s.max, requested: meta.requested_samples };
 }
 const timings = { build_s: +((Date.now() - T0) / 1000).toFixed(1), build_mcp_calls: mcpCalls, verify };
 
@@ -2138,13 +2132,18 @@ if (FINAL_RENDERS) {
 }
 
 if (EXPORT_ONLY) {
-  // glTF binary of the live, rigged scene at frame 1 (the exporter samples the animation)
-  await op('scene.frame_set', { frame: 1 });
+  // glTF binary of the live, rigged scene at frame 1 (the exporter samples the animation over the
+  // frame range: IK, constraints, the shape key as a morph target, the skinned hose as a skin)
   const t = Date.now();
-  const r = await tool('export_scene', { format: 'glb' });
+  const r = await tool('export_scene', { format: 'glb', frame: 1 });
   const meta = info(r);
   const bytes = await save(r, path.join(HERE, 'scene.glb'), 'model/gltf-binary');
-  timings.glb = { s: +((Date.now() - t) / 1000).toFixed(1), bytes, warnings: meta.warnings ?? [] };
+  timings.glb = {
+    s: +((Date.now() - t) / 1000).toFixed(1),
+    export_ms: meta.elapsed_ms,
+    bytes,
+    warnings: meta.warnings ?? [],
+  };
   log(
     `scene.glb: ${(bytes / 1e6).toFixed(2)} MB in ${timings.glb.s} s; warnings: ${JSON.stringify(meta.warnings ?? []).slice(0, 1500)}`,
   );
