@@ -3,6 +3,8 @@ import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import {
   PLAIN,
   callJson,
+  changedFraction,
+  crop,
   decodePng,
   imageStats,
   mcpConnect,
@@ -214,9 +216,27 @@ test.describe('MCP features', () => {
     });
     const grid = decodePng(toolImage(sheet));
     expect([grid.width, grid.height]).toEqual([info.sheet.width, info.sheet.height]);
-    expect(grid.width).toBeGreaterThanOrEqual(2 * 64);
-    expect(grid.height).toBeGreaterThanOrEqual(2 * 36);
+    // 2×2 cells of 64×36 pixels with the same gap around and between them
+    const gap = (grid.width - 2 * 64) / 3;
+    expect(Number.isInteger(gap) && gap >= 0).toBe(true);
+    expect(grid.height).toBe(2 * 36 + 3 * gap);
     expect(imageStats(grid).std).toBeGreaterThan(5);
+    // each cell shows its own frame: below the frame number in its top-left corner, a cell is the
+    // picture render_image makes of that frame, and the cube has moved from the first to the last
+    const cell = (k: number) =>
+      crop(grid, { x: gap + (k % 2) * (64 + gap), y: gap + Math.floor(k / 2) * (36 + gap), w: 64, h: 36 });
+    const belowLabel = { x: 0, y: 8, w: 64, h: 28 };
+    for (const [k, frame] of (info.frames as number[]).entries()) {
+      const still = await client.callTool({
+        name: 'render_image',
+        arguments: { project, engine: 'RASTER', renderer: 'software', width: 64, height: 36, frame },
+      });
+      expect(
+        changedFraction(decodePng(toolImage(still)), cell(k), belowLabel),
+        `cell of frame ${frame}`,
+      ).toBeLessThan(0.01);
+    }
+    expect(changedFraction(cell(0), cell(3), belowLabel)).toBeGreaterThan(0.2);
     await client.close();
   });
 

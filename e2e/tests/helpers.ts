@@ -399,7 +399,37 @@ export function changedFraction(a: RgbaImage, b: RgbaImage, rect?: Rect, thresho
   return changed / n;
 }
 
+/** A copy of a rectangle of an image, e.g. one cell of a contact sheet. */
+export function crop(img: RgbaImage, r: Rect): RgbaImage {
+  const inside = r.x >= 0 && r.y >= 0 && r.x + r.w <= img.width && r.y + r.h <= img.height;
+  expect(inside, `${r.w}×${r.h} at (${r.x}, ${r.y}) lies inside the ${img.width}×${img.height} image`).toBe(
+    true,
+  );
+  const data = new Uint8Array(r.w * r.h * 4);
+  for (let y = 0; y < r.h; y++) {
+    const from = ((r.y + y) * img.width + r.x) * 4;
+    data.set(img.data.subarray(from, from + r.w * 4), y * r.w * 4);
+  }
+  return { width: r.w, height: r.h, data };
+}
+
 // ---------------------------------------------------------------- rendering in the editor
+
+/**
+ * A screenshot of the middle of the 3D viewport, `size` pixels square: what the viewport draws
+ * around the world origin in the default view, away from its overlays (header text, statistics,
+ * navigation gizmo, the Adjust Last Operation panel).
+ */
+export async function viewportCentre(page: Page, size = 160): Promise<RgbaImage> {
+  const box = (await page.getByTestId('viewport').boundingBox())!;
+  const clip = {
+    x: Math.round(box.x + box.width / 2 - size / 2),
+    y: Math.round(box.y + box.height / 2 - size / 2),
+    width: size,
+    height: size,
+  };
+  return decodePng(await page.screenshot({ clip }));
+}
 
 /** Sets the output resolution scale (Output tab, "%"), e.g. 5 % of 1920×1080 = 96×54 pixels. */
 export async function setOutputPercentage(page: Page, percent: number): Promise<void> {

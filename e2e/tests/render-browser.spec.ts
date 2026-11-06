@@ -1,11 +1,13 @@
 import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import {
+  changedFraction,
+  decodeApng,
   decodePng,
   decodePngDataUrl,
   imageStats,
   newProject,
-  pngChunks,
+  renderStill,
   setNumberField,
   setOutputPercentage,
 } from './helpers';
@@ -43,6 +45,15 @@ test.describe('rendering in the browser', () => {
     const opaque = img.data.filter((_, i) => i % 4 === 3).every((a) => a === 255);
     expect(opaque).toBe(true);
 
+    // it ran on the render workers, one per core (at most 8), still running after the render: a
+    // pool whose workers cannot start renders on the main thread instead, as "1 thread"
+    const cores = await page.evaluate(() => navigator.hardwareConcurrency);
+    const threads = Math.max(1, Math.min(8, Math.floor(cores) || 4));
+    const renderWorkers = () =>
+      page.workers().filter((w) => /\/render\.worker-[\w-]+\.js$/.test(w.url())).length;
+    await expect.poll(renderWorkers).toBe(threads);
+    await expect(status).toContainText(/\| [1-8] threads? \|/);
+
     // Save Image downloads that PNG
     const download = page.waitForEvent('download');
     await page.getByTestId('render-save').click();
@@ -64,6 +75,8 @@ test.describe('rendering in the browser', () => {
         timeout: 60_000,
       })
       .toBeGreaterThan(0);
+    // every worker renders bands of this image
+    await expect(status).toContainText(`| ${threads} thread${threads === 1 ? '' : 's'} |`);
     await page.keyboard.press('Escape');
     await expect(status).toContainText('Cancelled');
     await expect(image).toBeVisible();
@@ -110,17 +123,29 @@ test.describe('rendering in the browser', () => {
     await page.getByTestId('render-animation-save').click();
     const file = await download;
     expect(file.suggestedFilename()).toMatch(/\.png$/);
-    const bytes = readFileSync((await file.path())!);
-    const chunks = pngChunks(bytes);
     // APNG: an animation control chunk with four frames, played forever, and one fcTL per frame
-    const actl = chunks.find((c) => c.type === 'acTL');
-    expect(actl).toBeDefined();
-    expect(actl!.data.readUInt32BE(0)).toBe(4);
-    expect(actl!.data.readUInt32BE(4)).toBe(0);
-    expect(chunks.filter((c) => c.type === 'fcTL')).toHaveLength(4);
-    const first = decodePng(bytes);
-    expect([first.width, first.height]).toEqual([96, 54]);
-    expect(imageStats(first).std).toBeGreaterThan(10);
+    const apng = decodeApng(readFileSync((await file.path())!));
+    expect([apng.frameCount, apng.plays, apng.frames.length]).toEqual([4, 0, 4]);
+    const frames = apng.frames;
+    expect([frames[0].width, frames[0].height]).toEqual([96, 54]);
+    expect(frames[0].region).toEqual({ x: 0, y: 0, w: 96, h: 54 });
+    expect(imageStats(frames[0]).std).toBeGreaterThan(10);
+    // the cube moves in every frame: each later frame redraws more than the 1×1 rectangle of an
+    // unchanged frame, and the picture differs from the frame before
+    for (let k = 1; k < frames.length; k++) {
+      const { w, h } = frames[k].region;
+      expect(w * h, `area redrawn by frame ${k + 1}`).toBeGreaterThan(1);
+      expect(changedFraction(frames[k - 1], frames[k]), `frame ${k + 1} against frame ${k}`).toBeGreaterThan(
+        0.03,
+      );
+    }
     await page.locator('.modal .close').click();
+    await expect(page.getByTestId('render-animation-dialog')).toHaveCount(0);
+
+    // and every frame shows its own moment: the last and first frames are the pictures that F12
+    // renders at frames 4 (the current frame) and 1
+    expect(changedFraction(await renderStill(page), frames[3])).toBeLessThan(0.01);
+    await setNumberField(page, 'current-frame', 1);
+    expect(changedFraction(await renderStill(page), frames[0])).toBeLessThan(0.01);
   });
 });

@@ -71,6 +71,11 @@ function clipPolygon(poly: THREE.Vector3[], plane: THREE.Plane): THREE.Vector3[]
   return out;
 }
 
+/** Whether a box (centre `c`, half size `h`) lies inside `plane` (on the side its normal points to). */
+function boxInsidePlane({ normal: n, constant }: THREE.Plane, c: THREE.Vector3, h: THREE.Vector3): boolean {
+  return n.dot(c) + constant >= Math.abs(n.x) * h.x + Math.abs(n.y) * h.y + Math.abs(n.z) * h.z;
+}
+
 /**
  * Vertices of the part of `box` inside every plane (each keeps the side its normal points to). The
  * region the planes bound has the corners `regionCorners` (none when it is unbounded): those inside
@@ -81,12 +86,16 @@ function clipBox(
   planes: readonly THREE.Plane[],
   regionCorners: readonly THREE.Vector3[],
 ): THREE.Vector3[] {
+  const c = box.getCenter(new THREE.Vector3());
+  const h = box.getSize(new THREE.Vector3()).multiplyScalar(0.5);
+  // only the planes the box reaches across cut it
+  const cutting = planes.filter((pl) => !boxInsidePlane(pl, c, h));
   const corners = Array.from({ length: 8 }, (_, i) => corner(box, i));
-  if (corners.every((p) => planes.every((pl) => pl.distanceToPoint(p) >= 0))) return corners;
+  if (!cutting.length) return corners;
   const out: THREE.Vector3[] = [];
   for (const face of BOX_FACES) {
     let poly = face.map((i) => corners[i]);
-    for (const pl of planes) {
+    for (const pl of cutting) {
       poly = clipPolygon(poly, pl);
       if (!poly.length) break;
     }
@@ -129,12 +138,37 @@ function quantize(size: number): number {
   return 2 ** (Math.ceil(Math.log2(Math.max(size, 1e-4)) * 8) / 8);
 }
 
+/** Coordinate `k` (0 x, 1 y, 2 z) of the point `c` mapped by the affine matrix with `elements`. */
+function mapped(elements: ArrayLike<number>, k: number, c: THREE.Vector3): number {
+  const e = elements;
+  return e[k] * c.x + e[4 + k] * c.y + e[8 + k] * c.z + e[12 + k];
+}
+
+/**
+ * How far coordinate `k` of the corners of a box with half size `h`, mapped by the affine matrix
+ * with `elements`, reaches either side of its centre's: the box's range in that coordinate is
+ * exactly mapped(centre) ± this (the image of a box under an affine map).
+ */
+function reach(elements: ArrayLike<number>, k: number, h: THREE.Vector3): number {
+  const e = elements;
+  return Math.abs(e[k]) * h.x + Math.abs(e[4 + k]) * h.y + Math.abs(e[8 + k]) * h.z;
+}
+
+/** A box in view: its index, the vertices of its part in view (null: all of it) and the view depths that part spans. */
+interface VisibleBox {
+  i: number;
+  points: THREE.Vector3[] | null;
+  start: number;
+  end: number;
+}
+
 /**
  * Fits the shadow camera (frustum and biases) of a sun to what `camera` sees of the shadow-casting
  * geometry `boxes` (world-space bounding boxes of the visible meshes and instances): see the module
  * comment. Call it before every render with that render's camera; three.js then draws the map from
  * the light's position along its direction (its target). Returns what it fitted, or null (the
- * shadow camera unchanged) when there is no geometry.
+ * shadow camera unchanged) when there is no geometry. A box costs a few multiplications unless it
+ * crosses the edge of the view or of the map, where it is clipped.
  */
 export function fitSunShadow(
   light: THREE.DirectionalLight,
@@ -143,6 +177,35 @@ export function fitSunShadow(
 ): SunShadowFit | null {
   const solid = boxes.filter((b) => !b.isEmpty());
   if (!solid.length) return null;
+  const count = solid.length;
+  const c = new THREE.Vector3();
+  const h = new THREE.Vector3();
+  const centre = (b: THREE.Box3) => {
+    b.getCenter(c);
+    b.getSize(h).multiplyScalar(0.5);
+  };
+  const tmp = new THREE.Vector3();
+
+  // where three.js puts the shadow camera: at the light, looking at its target
+  light.updateWorldMatrix(true, true);
+  light.target.updateWorldMatrix(true, false);
+  light.shadow.updateMatrices(light);
+  const cam = light.shadow.camera;
+  const lightView = cam.matrixWorldInverse;
+  // every box's extent in the shadow camera's view: x, y and the depth along the light (−z)
+  const L = lightView.elements;
+  const lightBox = new Float64Array(6 * count);
+  for (let i = 0; i < count; i++) {
+    centre(solid[i]);
+    const o = 6 * i;
+    for (let k = 0; k < 2; k++) {
+      lightBox[o + 2 * k] = mapped(L, k, c) - reach(L, k, h);
+      lightBox[o + 2 * k + 1] = mapped(L, k, c) + reach(L, k, h);
+    }
+    lightBox[o + 4] = -mapped(L, 2, c) - reach(L, 2, h);
+    lightBox[o + 5] = -mapped(L, 2, c) + reach(L, 2, h);
+  }
+
   camera.updateMatrixWorld();
   const view = camera.matrixWorldInverse;
   const frustum = new THREE.Frustum().setFromProjectionMatrix(
@@ -151,13 +214,20 @@ export function fitSunShadow(
     camera.reversedDepth,
   );
   const corners = frustumCorners(camera);
-  const tmp = new THREE.Vector3();
   const depth = (p: THREE.Vector3) => -tmp.copy(p).applyMatrix4(view).z;
 
-  // the visible part of each box and the view depths it spans
-  const visible: { box: THREE.Box3; points: THREE.Vector3[]; start: number; end: number }[] = [];
-  for (const box of solid) {
+  // the part of each box in view and the view depths it spans
+  const visible: VisibleBox[] = [];
+  for (let i = 0; i < count; i++) {
+    const box = solid[i];
     if (!frustum.intersectsBox(box)) continue;
+    centre(box);
+    if (frustum.planes.every((pl) => boxInsidePlane(pl, c, h))) {
+      const mid = -mapped(view.elements, 2, c);
+      const r = reach(view.elements, 2, h);
+      visible.push({ i, points: null, start: mid - r, end: mid + r });
+      continue;
+    }
     const points = clipBox(box, frustum.planes, corners);
     if (!points.length) continue;
     let start = Infinity;
@@ -167,24 +237,52 @@ export function fitSunShadow(
       start = Math.min(start, d);
       end = Math.max(end, d);
     }
-    visible.push({ box, points, start, end });
+    visible.push({ i, points, start, end });
   }
 
-  // the receivers: what the camera sees, up to the shadow distance (perspective views: far away, a
-  // texel covers fewer pixels; an orthographic view is as wide at every depth and has none)
-  const receivers: THREE.Vector3[] = [];
+  // the receivers (what the camera sees, up to the shadow distance) in the shadow camera's view
+  let x0 = Infinity;
+  let x1 = -Infinity;
+  let y0 = Infinity;
+  let y1 = -Infinity;
+  let d0 = Infinity;
+  let d1 = -Infinity;
+  let received = 0;
+  const receivePoint = (p: THREE.Vector3) => {
+    tmp.copy(p).applyMatrix4(lightView);
+    x0 = Math.min(x0, tmp.x);
+    x1 = Math.max(x1, tmp.x);
+    y0 = Math.min(y0, tmp.y);
+    y1 = Math.max(y1, tmp.y);
+    d0 = Math.min(d0, -tmp.z);
+    d1 = Math.max(d1, -tmp.z);
+    received++;
+  };
+  const receiveBox = (i: number) => {
+    const o = 6 * i;
+    x0 = Math.min(x0, lightBox[o]);
+    x1 = Math.max(x1, lightBox[o + 1]);
+    y0 = Math.min(y0, lightBox[o + 2]);
+    y1 = Math.max(y1, lightBox[o + 3]);
+    d0 = Math.min(d0, lightBox[o + 4]);
+    d1 = Math.max(d1, lightBox[o + 5]);
+    received++;
+  };
+  const receive = (v: VisibleBox) => (v.points ? v.points.forEach(receivePoint) : receiveBox(v.i));
   let shadowDistance = Infinity;
   if (visible.length) {
+    // perspective views: far away, a texel covers fewer pixels (an orthographic view is as wide
+    // at every depth and has no shadow distance)
     if ((camera as THREE.PerspectiveCamera).isPerspectiveCamera) {
       // where the visible objects start; boxes the camera is in (a room, a sky dome) start at the
       // near plane and say nothing about where the scene is
       const nearPlane = Math.max(0, Math.min(...corners.filter((_, i) => i % 2 === 0).map(depth)));
-      const starts = visible.map((v) => v.start).sort((a, b) => a - b);
+      const starts = Float64Array.from(visible, (v) => v.start).sort();
       const outside = starts.filter((d) => d > 1.5 * nearPlane + 1e-6);
       const ref = outside.length ? outside : starts;
       shadowDistance = SHADOW_DISTANCE_SCALE * Math.max(ref[ref.length >> 1], nearPlane, 1e-4);
     }
-    if (visible.every((v) => v.end <= shadowDistance)) for (const v of visible) receivers.push(...v.points);
+    if (visible.every((v) => v.end <= shadowDistance)) visible.forEach(receive);
     else {
       const forward = camera.getWorldDirection(new THREE.Vector3());
       const eye = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
@@ -194,38 +292,17 @@ export function fitSunShadow(
       const capped = frustumCorners(camera, shadowDistance);
       for (const v of visible) {
         if (v.start > shadowDistance) continue;
-        if (v.end <= shadowDistance) receivers.push(...v.points);
-        else receivers.push(...clipBox(v.box, planes, capped));
+        if (v.end <= shadowDistance) receive(v);
+        else clipBox(solid[v.i], planes, capped).forEach(receivePoint);
       }
     }
-    if (!receivers.length) for (const v of visible) receivers.push(...v.points);
+    if (!received) visible.forEach(receive);
   } else {
     // nothing in view (no shadow can be seen): the whole scene
-    for (const b of solid) for (let i = 0; i < 8; i++) receivers.push(corner(b, i));
-  }
-
-  // where three.js puts the shadow camera: at the light, looking at its target
-  light.updateWorldMatrix(true, true);
-  light.target.updateWorldMatrix(true, false);
-  light.shadow.updateMatrices(light);
-  const cam = light.shadow.camera;
-  const lightView = cam.matrixWorldInverse;
-  let x0 = Infinity;
-  let x1 = -Infinity;
-  let y0 = Infinity;
-  let y1 = -Infinity;
-  let d0 = Infinity;
-  let d1 = -Infinity;
-  for (const p of receivers) {
-    tmp.copy(p).applyMatrix4(lightView);
-    x0 = Math.min(x0, tmp.x);
-    x1 = Math.max(x1, tmp.x);
-    y0 = Math.min(y0, tmp.y);
-    y1 = Math.max(y1, tmp.y);
-    d0 = Math.min(d0, -tmp.z);
-    d1 = Math.max(d1, -tmp.z);
+    for (let i = 0; i < count; i++) receiveBox(i);
   }
   if (!Number.isFinite(x0 + x1 + y0 + y1 + d0 + d1)) return null;
+
   // margin for the filter, a size that changes in steps and a centre on the texel grid: the shadow
   // edges stay put while the view moves a little
   const mapSize = Math.max(1, light.shadow.mapSize.x);
@@ -249,24 +326,18 @@ export function fitSunShadow(
     new THREE.Plane(new THREE.Vector3(0, -1, 0), top),
   ].map((pl) => pl.applyMatrix4(cam.matrixWorld));
   let near = d0;
-  for (const box of solid) {
-    let bx0 = Infinity;
-    let bx1 = -Infinity;
-    let by0 = Infinity;
-    let by1 = -Infinity;
-    let bd = Infinity;
-    for (let i = 0; i < 8; i++) {
-      corner(box, i, tmp).applyMatrix4(lightView);
-      bx0 = Math.min(bx0, tmp.x);
-      bx1 = Math.max(bx1, tmp.x);
-      by0 = Math.min(by0, tmp.y);
-      by1 = Math.max(by1, tmp.y);
-      bd = Math.min(bd, -tmp.z);
-    }
+  for (let i = 0; i < count; i++) {
+    const o = 6 * i;
+    const bx0 = lightBox[o];
+    const bx1 = lightBox[o + 1];
+    const by0 = lightBox[o + 2];
+    const by1 = lightBox[o + 3];
+    const bd = lightBox[o + 4];
     if (bx1 < left || bx0 > right || by1 < bottom || by0 > top || bd >= near) continue;
     if (bx0 >= left && bx1 <= right && by0 >= bottom && by1 <= top) near = bd;
     else
-      for (const p of clipBox(box, prism, [])) near = Math.min(near, -tmp.copy(p).applyMatrix4(lightView).z);
+      for (const p of clipBox(solid[i], prism, []))
+        near = Math.min(near, -tmp.copy(p).applyMatrix4(lightView).z);
   }
   const margin = Math.max(0.05, 0.01 * (d1 - near));
   near -= margin;

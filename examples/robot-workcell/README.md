@@ -31,7 +31,7 @@ Every file in this folder comes from this repository's editor and `build.mjs` (s
 | Rigid parts | 18 parts: turret with shoulder yoke, motors, joint housings, tapered arm segments, wrist flange, gripper, three gears, three hose clamps and two clamp-bracket meshes. They are made with `object.add_mesh_from_data`, `object.generate_gear` and `mesh.primitive_torus_add` and bone-parented like Blender's Ctrl+P > Bone: `object.select` (parts + armature active), then `object.parent_set {type: BONE, bone}`. The elbow bends between 78° and 127° in the cycle, and its layout is chosen so that nothing collides over that range: the forearm starts inside the 0.16 m elbow housing, and the rear elbow motor sits beside the arm's centre plane. As a result, apart from the joints themselves (each link ends inside the round housing of its joint), no link, motor or hose passes through another part at any frame (the build checks this, see Verification). The base plate and pedestal are plain children of the rig. |
 | Gears | `object.generate_gear`: a 60-tooth slewing ring on J1 and gear wheels on the shoulder and elbow, bone-parented so they turn with their joints. `materials: false`, because the parts get their own materials (otherwise the generator would leave an unused default "Steel" material behind). |
 | Dress-pack hose | `object.generate_pipe` along a path that runs up the back of the upper arm, around the back of the elbow next to the elbow motor and along the top of the forearm. It is bound with `object.parent_set {type: ARMATURE_AUTO}` (automatic bone-heat weights + Armature modifier), so it bends with J1, J2 and J3. On a hose that runs 17 cm from its bones, the automatic weights blend over long stretches. With the raw weights, the hose root (55 % J1_Base, 42 % J2_Shoulder) slid up to 112 mm over its fitting, and the hose moved up to 36 mm out of the centre of its clamps. The build therefore reads the weights with `get_mesh_data` and pins each clamped stretch to the bone of its link: root → J1_Base, upper-arm clamps → J2_Shoulder, forearm → J3_Elbow. Each pinned stretch blends back into the automatic weights over 12–15 cm, so the automatic weights still bend the hose at the shoulder and around the elbow. The fixed weights are written back with `object.vertex_group_set_weights`. Three clamps on brackets hold the hose to the arm. |
-| IK | `pose.ik_add` on J3_Elbow with a **three-bone chain** (J1_Base → J2_Shoulder → J3_Elbow) that reaches the keyframed empty `IK_Target`. **Per-bone IK locks** (`pose.ik_settings_set`, Blender's `lock_ik_*`) make it a palletizer: J1 may only turn about its own Y axis, the vertical (`lock_ik_x`, `lock_ik_z`), J2 and J3 only about their Z axes, the joint axes (`lock_ik_x`, `lock_ik_y`). So the IK turns the base towards the target and keeps the arm in the vertical plane through it. **IK limits** (`use_ik_limit_z`) hold the shoulder within −50…30° and the elbow within −35…60° of the rest pose (the cycle uses −28…8° and −11…38°), so the solver cannot swing the arm over the top or flip the elbow. Like Blender's, the solver starts from the pose, so J1 is posed (not keyed) at the home azimuth of 270° with `pose.bone_transform_set`: every target of the cycle lies within 90° of it. From the rest pose, the pick station lies straight behind the arm, where the yaw has no direction to start in, and the solver would reach over the top instead. `pose.constraint_add DAMPED_TRACK` on J4 aims at `Wrist_Aim` (a child of the target, 1 m below it), which keeps the wrist vertical like a palletizer's parallel link. |
+| IK | `pose.ik_add` on J3_Elbow with a **three-bone chain** (J1_Base → J2_Shoulder → J3_Elbow) that reaches the keyframed empty `IK_Target`. **Per-bone IK locks** (`pose.ik_settings_set`, Blender's `lock_ik_*`) make it a palletizer: J1 may only turn about its own Y axis, the vertical (`lock_ik_x`, `lock_ik_z`), J2 and J3 only about their Z axes, the joint axes (`lock_ik_x`, `lock_ik_y`). So the IK turns the base towards the target and keeps the arm in the vertical plane through it. **IK limits** (`use_ik_limit_z`) hold the shoulder within −50…30° and the elbow within −35…60° of the rest pose (the cycle uses −28…8° and −11…38°), so the solver cannot swing the arm over the top or flip the elbow. Like Blender's, the solver starts from the pose, so J1 is posed (not keyed) at the home azimuth of 270° with `pose.bone_transform_set`: every target of the cycle lies within 90° of it. From the rest pose, the pick station lies straight behind the arm, where the yaw has no direction to start in: without the start pose, the base does not turn round and the wrist misses the pick station by 2.4 m (without the limits, the arm reaches back over the top instead). `pose.constraint_add DAMPED_TRACK` on J4 aims at `Wrist_Aim` (a child of the target, 1 m below it), which keeps the wrist vertical like a palletizer's parallel link. |
 | Gripper fingers | One mesh with a `Grip` shape key (`object.shape_key_add` + `object.shape_key_set_positions`) that moves both fingers 58 mm inwards. `insert_keyframe shape_keys["Grip"].value` keys it open → closed → open. |
 | Carry | A `CHILD_OF` constraint (`object.constraint_add`) on the crate targets bone J4_Wrist, with keyed influence: 0 → 1 when the fingers have closed, 1 → 0 at the release. The crate's own location is keyed at frame 1 (pick station) and, at the release frame, at the place position read back with `constraint.describe`. |
 | Conveyor | One roller with an **ARRAY** modifier (51 rollers), one leg with **MIRROR + ARRAY**, side frames, an end stop, a drive box and a photo-eye sensor. At the far end, outside the fence, stands an infeed hood with a hazard band and a roll-up door. The door's Z location has smooth BEZIER keys: it opens at frames 45–51 and closes behind the emerging crate at 58–64. Nine crates are linked duplicates (`duplicate_object linked`) of one ribbed tote mesh with a BEVEL modifier: six on the belt (one of them waiting unseen inside the hood) and three on the pallet. |
@@ -196,10 +196,11 @@ forearm and every vertex of the skinned hose where the editor has them at frames
 
 `editor.png`: the project open in the web editor (`http://<server>/?project=<id>`), 1600 × 900,
 the camera view at frame 49 in Material Preview shading. `Robot_Rig` is selected, and its Object
-Data properties show the pose of `J3_Elbow` with the IK constraint (target `IK_Target`, chain
-length 3); the outliner lists the rig's bone-parented parts and the timeline the keys of the
-J4 roll. Taken with Playwright (headless Chromium, software WebGL) on the server of the
-`--export-only` run; the browser console stayed empty (no errors or warnings).
+Data properties show the bone `J3_Elbow` (head, tail, roll) and its pose with the IK constraint
+(target `IK_Target`, chain length 3); the outliner lists the rig's bone-parented parts and the
+timeline the keys of the J4 roll. Taken with Playwright on the project of the `--export-only`
+run, in headless Chromium with software WebGL, which draws this view at about 1 fps (the last
+line of the statistics overlay). The browser console stayed empty (no errors or warnings).
 
 ## Rebuild
 
@@ -224,10 +225,11 @@ tool error or failed check stops it. Unknown, repeated or incomplete arguments (
 --anim-only`, final-render options with a mode) are rejected before anything is built, so a typo
 can never start the final renders and overwrite the outputs.
 
-Building and verifying the scene takes about 5–10 s (247 MCP calls). The renders take the rest of
-the time. They are time-limited, so the samples reached depend on the CPU. The script prints the
-project's editor URL (`http://<host>/?project=<id>`): open it to scrub the timeline and inspect
-the rig, the constraints, the shape key and the driver in the web editor.
+Building and verifying the scene takes about 5–10 s (246 MCP calls, one more when an old
+project is deleted first). The renders take the rest of the time. They are time-limited, so the
+samples reached depend on the CPU. The script prints the project's editor URL
+(`http://<host>/?project=<id>`): open it to scrub the timeline and inspect the rig, the
+constraints, the shape key and the driver in the web editor.
 
 ## Final production run
 
@@ -245,7 +247,17 @@ MCP_URL=http://127.0.0.1:4563/mcp node examples/robot-workcell/build.mjs
 `scene.glb` and `editor.png` come from an `--export-only` run of the same build on a second
 server (1 render thread); the scene is the same.
 
-⟨FINAL⟩
+Measured on 2026-11-06 (17:16:07–17:29:42 UTC), exit code 0, in 813.9 s (13.6 min). The
+machine's 4 CPU cores were shared with other agents' editor servers and renders (load average 16
+at the start of the run, 7 at the end), so the render times are pessimistic, and the
+time-limited renders reached fewer samples than they would on an idle machine.
+
+| Stage | Time | Settings and result |
+| --- | --- | --- |
+| Build + verify | 9.7 s | 246 MCP calls; all checks passed (IK 0.0 mm, J1 yaw within 0.0002° of the target azimuth, crate 0.06 mm, finger pads 2.04 mm from the crate, hose root 0.02 mm, clamps 0.09 mm, arm clearances ≥ 11.2 mm) |
+| `render.png` | 485.9 s | Path tracer, 1280 × 720, frame 49, 6 bounces, denoised, 480 s limit on 3 threads: **100 of 256 spp** reached (1.25 MB) |
+| `contact_sheet.png` | 75.5 s | Path tracer, frames 1–93 every 4th (24 tiles of 320 × 180), 12 spp, 4 bounces, denoised, 10 s per frame: 12 tiles reached 12 spp, 12 stopped at the time limit (`samples_reached` min 7, mean 10.7; 2.68 MB) |
+| `preview.gif` | 242.7 s | Path tracer, frames 1–95 every 2nd (48 frames at 12 fps), 480 × 270, 16 spp, 4 bounces, denoised, 15 s per frame, Bayer dither: all 48 frames stopped at the time limit, none dropped (`samples_reached` min 3, mean 6.7, max 10; 4.04 MB) |
 
 ## Known limitations
 
@@ -256,14 +268,18 @@ server (1 render thread); the scene is the same.
   `armature.describe` lists them (`ik_settings`).
 - **Hose weights needed a fix-up.** On the hose, the automatic weights blend too far along the
   arm, so the build pins the stretches at the root and the clamps to their bones (see above). The
-  editor has no weight clean-up operators (limit total, levels, smooth) to do this without
-  computing the weights in the script.
+  editor's weight operators normalize, but cannot limit, level or smooth weights, so the script
+  computes the fixed weights itself.
 - **Fence infill is a separate object.** `object.generate_fence` makes posts and rails or
   pickets only, so the welded wire mesh is a panel object with a procedural BRICK alpha. At GIF
   resolution the 8 mm wires are sub-pixel and shimmer slightly.
 - **Rollers do not turn.** They are smooth cylinders of one ARRAY object, so a spin would be
   invisible. The crates' conveyor ride is keyframed, not simulated.
-- ⟨SAMPLES⟩
+- **Low sample counts in the animation.** On the shared CPU, every GIF frame stopped below its
+  16 spp (3–10 spp), so the denoised frames look slightly soft and blotchy, and half of the
+  contact-sheet tiles stopped below their 12 spp. The still reached 100 of its 256 spp. The
+  renders are time-limited, so a less busy machine gives cleaner frames with the same script
+  (`--still-time=S` also gives the still more time).
 - **scene.glb** has no blinking amber lamp, area-light shapes, depth of field, mist or view
   transform (see [scene.glb](#sceneglb)), and its procedural textures are baked into images
   through generated UVs.

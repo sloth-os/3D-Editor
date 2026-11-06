@@ -151,7 +151,7 @@ describe('fitSunShadow', () => {
     expect(fits[1].texel / fits[0].texel).toBeLessThan(3);
   });
 
-  it('keeps the biases a fraction of a texel in world units, whatever the depth range', () => {
+  it('keeps the biases a couple of texels in world units, whatever the depth range', () => {
     // regression: a fixed depth bias of 0.0005 of the map's depth range was 0.43 m over the 866 m
     // range of a 600 m floor
     for (const size of [12, 600]) {
@@ -263,5 +263,55 @@ describe('fitSunShadow', () => {
     expect(fitSunShadow(light, cam, [])).toBeNull();
     expect(fitSunShadow(light, cam, [new THREE.Box3()])).toBeNull();
     expect(light.shadow.camera.left).toBe(before);
+  });
+
+  it('fits exactly the corners of boxes wholly in view (their ranges come from centre and half size, without clipping)', () => {
+    let seed = 11;
+    const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    const corners = (b: THREE.Box3) =>
+      [0, 1, 2, 3, 4, 5, 6, 7].map(
+        (i) =>
+          new THREE.Vector3(i & 1 ? b.max.x : b.min.x, i & 2 ? b.max.y : b.min.y, i & 4 ? b.max.z : b.min.z),
+      );
+    const cam = camera([0, -40, 10], [0, 0, 2], 40);
+    for (let t = 0; t < 20; t++) {
+      // a dozen boxes the camera sees whole
+      const boxes: THREE.Box3[] = [];
+      while (boxes.length < 12) {
+        const c = new THREE.Vector3((rnd() - 0.5) * 16, (rnd() - 0.5) * 16, rnd() * 4);
+        const h = new THREE.Vector3(0.1 + rnd(), 0.1 + rnd(), 0.1 + 2 * rnd());
+        const b = new THREE.Box3(c.clone().sub(h), c.clone().add(h));
+        if (corners(b).every((p) => seen(cam, p))) boxes.push(b);
+      }
+      const light = sun([rnd() - 0.5, rnd() - 0.5, -0.3 - rnd()], [10 * rnd(), 10 * rnd(), 20]);
+      const fit = fitSunShadow(light, cam, boxes)!;
+      // the shadow distance: 4 × the median view depth at which the boxes start
+      const starts = boxes
+        .map((b) => Math.min(...corners(b).map((p) => -p.applyMatrix4(cam.matrixWorldInverse).z)))
+        .sort((a, b) => a - b);
+      expect(fit.shadowDistance).toBeCloseTo(SHADOW_DISTANCE_SCALE * starts[starts.length >> 1], 9);
+      // the corners in the shadow camera's view
+      const lv = boxes.flatMap(corners).map((p) => p.applyMatrix4(light.shadow.camera.matrixWorldInverse));
+      const [x0, x1] = [Math.min(...lv.map((p) => p.x)), Math.max(...lv.map((p) => p.x))];
+      const [y0, y1] = [Math.min(...lv.map((p) => p.y)), Math.max(...lv.map((p) => p.y))];
+      const [d0, d1] = [Math.min(...lv.map((p) => -p.z)), Math.max(...lv.map((p) => -p.z))];
+      // all of them are in the map, which is no larger than they need: their bounds plus the
+      // filter's margin (less the half texel the map's centre may move to the texel grid), rounded
+      // up to the next eighth of an octave
+      const pad = (Math.max(x1 - x0, y1 - y0) * (light.shadow.radius + 2)) / SUN_SHADOW_MAP_SIZE;
+      for (const [lo, hi, a, b] of [
+        [fit.left, fit.right, x0, x1],
+        [fit.bottom, fit.top, y0, y1],
+      ]) {
+        const halfTexel = (hi - lo) / SUN_SHADOW_MAP_SIZE / 2;
+        expect(lo).toBeLessThanOrEqual(a - pad + halfTexel + 1e-9);
+        expect(hi).toBeGreaterThanOrEqual(b + pad - halfTexel - 1e-9);
+        expect(hi - lo).toBeLessThanOrEqual((b - a + 2 * pad) * 2 ** (1 / 8) + 1e-9);
+      }
+      // nothing lies between them and the sun: the depth range is theirs plus the margin
+      const margin = Math.max(0.05, 0.01 * (d1 - d0));
+      expect(fit.near).toBeCloseTo(d0 - margin, 9);
+      expect(fit.far).toBeCloseTo(d1 + margin, 9);
+    }
   });
 });

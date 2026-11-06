@@ -46,6 +46,9 @@ import { ToolError, type AgentProject, type AgentSession } from './agent';
 import type { HistoryLimits } from './history';
 import {
   DEFAULT_MAX_OBJECTS,
+  MAX_DECIMALS,
+  OBJECT_DECIMALS,
+  SCENE_DECIMALS,
   describeObject,
   round,
   roundVec,
@@ -218,6 +221,7 @@ function requireObject(p: AgentProject, ref: string): ObjectData {
   return o;
 }
 
+/** An object's id, name, type, transform (as precise as get_object) and parent. */
 function brief(p: AgentProject, id: string) {
   const o = p.scene.getObject(id);
   if (!o) return { id, deleted: true };
@@ -225,9 +229,9 @@ function brief(p: AgentProject, id: string) {
     id: o.id,
     name: o.name,
     type: o.type,
-    location: roundVec([...o.location]),
-    rotation_euler: roundVec([...o.rotation_euler]),
-    scale: roundVec([...o.scale]),
+    location: roundVec([...o.location], OBJECT_DECIMALS),
+    rotation_euler: roundVec([...o.rotation_euler], OBJECT_DECIMALS),
+    scale: roundVec([...o.scale], OBJECT_DECIMALS),
     parent: o.parent ? (p.scene.getObject(o.parent)?.name ?? o.parent) : null,
   };
 }
@@ -595,7 +599,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get scene',
       description:
-        "Describe the whole scene at a frame. Values are the EVALUATED ones at that frame, like Blender's properties: keyframed, driven and F-curve-modified location / rotation_euler (radians, also in degrees) / scale, shape key values, constraint influences, pose channels, light / camera / curve / world settings; where animation overrides the value stored in the document (what transform_object or the *.properties_set operators change), the stored value is listed too (`stored`, `stored_value`, `stored_influence`). Contents: counts (objects by type; vertices / faces = BASE mesh data of mesh objects before modifiers, curves and text not included; evaluated {vertices, faces, triangles} = the geometry renders show: after shape keys, modifiers with their RENDER settings (SUBSURF render_levels, SCREW render_steps, show_render), curve bevels (render_resolution_u) and text, instances not included; evaluated_viewport = the same with the viewport settings, only listed when the viewport shows other geometry; instances and instance_triangles = particle / collection instances of renders, viewport_instances when the viewport shows fewer), every object (id, name, type, parent, collection, transform, world-space bounds of the render geometry after modifiers, armature deformation, constraints and physics (wire curves: of their wire), data summary: mesh vertex/face counts (base, evaluated = render, evaluated_viewport when it differs) with shape keys and vertex groups, curve splines/points/fill_mode/bevel/extrude, text body, armature bones with parents and pose_position, light (datablock name, type, energy, colour, size/shape, spot), camera (lens, clipping, dof_use); material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, instances; where they are: get_instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, modifiers, poses, curves, instancing, physics) with object names so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object and get_mesh_data for vertex positions. Evaluations are cached per document state and frame, so repeated get_scene / get_object calls (e.g. checking motion at many frames) are cheap until the scene changes. Units: meters, Z up.",
+        "Describe the whole scene at a frame. Values are the EVALUATED ones at that frame, like Blender's properties: keyframed, driven and F-curve-modified location / rotation_euler (radians, also in degrees) / scale, shape key values, constraint influences, pose channels, light / camera / curve / world settings; where animation overrides the value stored in the document (what transform_object or the *.properties_set operators change), the stored value is listed too (`stored`, `stored_value`, `stored_influence`). Contents: counts (objects by type; vertices / faces = BASE mesh data of mesh objects before modifiers, curves and text not included; evaluated {vertices, faces, triangles} = the geometry renders show, the same objects the renderers and export_scene use: objects shown in renders only (objects hidden with hide_render, e.g. Boolean cutters and helpers, are left out and counted apart in not_rendered {objects: their names, vertices, faces, triangles}), after shape keys, modifiers with their RENDER settings (SUBSURF render_levels, SCREW render_steps, show_render), curve bevels (render_resolution_u) and text, instances not included; evaluated_viewport = the objects shown in the viewport with the viewport settings (what the editor's statistics overlay shows), only listed when it differs; instances and instance_triangles = particle / collection instances in renders (their emitter or instancing empty shown in renders), viewport_instances when the viewport shows others), every object (id, name, type, parent, collection, transform, world-space bounds of the render geometry after modifiers, armature deformation, constraints and physics (wire curves: of their wire), data summary: mesh vertex/face counts (base, evaluated = render, evaluated_viewport when it differs) with shape keys and vertex groups, curve splines/points/fill_mode/bevel/extrude, text body, armature bones with parents and pose_position, light (datablock name, type, energy, colour, size/shape, spot), camera (lens, clipping, dof_use); material slots, modifiers with their object references, constraints (type, targets, influence, errors), particle systems (count, instanced object/collection, instances; where they are: get_instances), rigid body (type, shape, mass), animated channels, drivers (path + expression) and evaluation problems), materials (with procedural textures), collections, scene/render/world settings (rigid body world, sky, mist) and the active camera. `problems` lists evaluation errors (drivers, constraints, modifiers, poses, curves, instancing, physics) with object names so you can fix them. Long lists are truncated with *_total counts; use get_object for everything about one object and get_mesh_data for vertex positions. Evaluations are cached per document state and frame, so repeated get_scene / get_object calls (e.g. checking motion at many frames) are cheap until the scene changes. Units: meters, Z up. Numbers are rounded to `decimals` (default 4 = 0.1 mm; up to 6 = 1 µm); get_object rounds to 6 by default.",
       annotations: READ_ONLY,
     },
     {
@@ -608,13 +612,23 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .max(5000)
         .optional()
         .describe(`Objects listed at most (default ${DEFAULT_MAX_OBJECTS}; counts always cover all)`),
+      decimals: z
+        .number()
+        .int()
+        .min(0)
+        .max(MAX_DECIMALS)
+        .default(SCENE_DECIMALS)
+        .describe(
+          `Rounding of the numbers (default ${SCENE_DECIMALS}: 0.1 mm; ${MAX_DECIMALS} for sub-millimetre detail, or use get_object)`,
+        ),
     },
-    async ({ project, frame, max_objects }) => {
+    async ({ project, frame, max_objects, decimals }) => {
       const p = await agent.project(project);
       return summarizeScene(p.scene, {
         frame: frame ?? p.state.frame,
         projectId: p.id,
         maxObjects: max_objects,
+        decimals,
       });
     },
   );
@@ -624,17 +638,24 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get object',
       description:
-        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds of the render geometry (wire curves: their wire), parent (and parent bone) and children, data (mesh statistics base and evaluated = what renders show (render settings of the modifiers: SUBSURF render_levels, SCREW render_steps, show_render), plus evaluated_viewport when the viewport shows other geometry; shape keys with values, vertex groups with assigned vertex counts; every curve shape setting (fill_mode, bevel_mode/depth/resolution/object, bevel_factor, extrude, offset, use_fill_caps, twist_mode, resolution_u, render_resolution_u, path settings) and the spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts (instance transforms: get_instances), rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. Vertex positions and faces: get_mesh_data. Evaluations are cached per document state and frame: checking many objects or frames is cheap.',
+        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds of the render geometry (wire curves: their wire), parent (and parent bone) and children, data (mesh statistics base and evaluated = what renders show (render settings of the modifiers: SUBSURF render_levels, SCREW render_steps, show_render), plus evaluated_viewport when the viewport shows other geometry; shape keys with values, vertex groups with assigned vertex counts; every curve shape setting (fill_mode, bevel_mode/depth/resolution/object, bevel_factor, extrude, offset, use_fill_caps, twist_mode, resolution_u, render_resolution_u, path settings) and the spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts (instance transforms: get_instances), rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. data.evaluated is the geometry of the object itself, also when it is hidden from renders (hide_render; get_scene then counts it in counts.not_rendered, not in counts.evaluated). Numbers are rounded to `decimals` (default 6 = 1 µm, so sub-millimetre parts such as labels, engravings and fine bevels read back as they were made). Vertex positions and faces: get_mesh_data. Evaluations are cached per document state and frame: checking many objects or frames is cheap.',
       annotations: READ_ONLY,
     },
     {
       project: projectArg,
       object: objectArg,
       frame: z.number().optional().describe("Frame to evaluate (default: the agent's current frame)"),
+      decimals: z
+        .number()
+        .int()
+        .min(0)
+        .max(MAX_DECIMALS)
+        .default(OBJECT_DECIMALS)
+        .describe(`Rounding of the numbers (default ${OBJECT_DECIMALS}: 1 µm)`),
     },
-    async ({ project, object, frame }) => {
+    async ({ project, object, frame, decimals }) => {
       const p = await agent.project(project);
-      return describeObject(p.scene, requireObject(p, object), frame ?? p.state.frame);
+      return describeObject(p.scene, requireObject(p, object), frame ?? p.state.frame, decimals);
     },
   );
 

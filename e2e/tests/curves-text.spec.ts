@@ -1,27 +1,39 @@
 import { test, expect } from '@playwright/test';
-import { PLAIN, callJson, mcpConnect, menuPath, newProject, setNumberField, statNumber } from './helpers';
+import {
+  PLAIN,
+  callJson,
+  changedFraction,
+  mcpConnect,
+  menuPath,
+  newProject,
+  setNumberField,
+  statNumber,
+  viewportCentre,
+} from './helpers';
 
 test.describe('curves and text', () => {
   test('a Bezier curve gets a surface from the bevel depth in the Object Data tab', async ({ page }) => {
-    const id = await newProject(page);
-    const triangles = await statNumber(page, 'stats-triangles');
-    const vertices = await statNumber(page, 'stats-vertices');
+    // an empty scene: no default cube around the curve, which is added at the origin
+    const id = await newProject(page, PLAIN, { empty: true });
     await menuPath(page, ['Add', 'Curve', 'Bezier']);
     await expect(page.getByTestId('outliner-BezierCurve')).toHaveClass(/active/);
     // a plain wire curve has no surface: nothing to count yet
-    await expect(page.getByTestId('viewport-stats')).toContainText('Objects 1/4');
-    expect(await statNumber(page, 'stats-triangles')).toBe(triangles);
+    await expect(page.getByTestId('viewport-stats')).toContainText('Objects 1/1');
+    expect(await statNumber(page, 'stats-triangles')).toBe(0);
+    const wire = await viewportCentre(page);
 
     await page.getByTestId('prop-tab-data').click();
     await expect(page.getByTestId('curve-bevel-mode-ROUND')).toHaveAttribute('aria-pressed', 'true');
     await setNumberField(page, 'curve-bevel-depth', 0.1);
     await expect(page.getByTestId('curve-bevel-depth')).toContainText('0.1 m');
     // the round bevel sweeps a tube along the curve
-    await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(triangles + 100);
-    const tube = (await statNumber(page, 'stats-triangles')) - triangles;
-    const tubeVertices = (await statNumber(page, 'stats-vertices')) - vertices;
+    await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(100);
+    const tube = await statNumber(page, 'stats-triangles');
+    const tubeVertices = await statNumber(page, 'stats-vertices');
+    // which the viewport draws: a solid tube across the middle of the view instead of a thin line
+    await expect.poll(async () => changedFraction(wire, await viewportCentre(page))).toBeGreaterThan(0.03);
 
-    // the server's evaluation of the synced document agrees with the viewport
+    // the server's evaluation of the synced document gives the editor's counts
     const client = await mcpConnect(PLAIN);
     await expect
       .poll(async () => (await callJson(client, 'get_object', { project: id, object: 'BezierCurve' })).data)
@@ -33,10 +45,11 @@ test.describe('curves and text', () => {
 
     // a finer bevel profile gives more geometry
     await setNumberField(page, 'curve-bevel-resolution', 8);
-    await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(triangles + tube);
-    // and depth 0 is a wire again
+    await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(tube);
+    // and depth 0 is a wire again, in the viewport too
     await setNumberField(page, 'curve-bevel-depth', 0);
-    await expect.poll(() => statNumber(page, 'stats-triangles')).toBe(triangles);
+    await expect.poll(() => statNumber(page, 'stats-triangles')).toBe(0);
+    await expect.poll(async () => changedFraction(wire, await viewportCentre(page))).toBeLessThan(0.01);
     await client.close();
   });
 

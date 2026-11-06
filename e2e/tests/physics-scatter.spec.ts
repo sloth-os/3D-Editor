@@ -1,28 +1,14 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect } from '@playwright/test';
 import {
   PLAIN,
   callJson,
   changedFraction,
-  decodePng,
   fieldNumber,
   mcpConnect,
   newProject,
   setNumberField,
-  type RgbaImage,
+  viewportCentre,
 } from './helpers';
-
-/** A screenshot of the middle of the 3D viewport (where the default cube is), away from its overlays. */
-async function viewportCentre(page: Page): Promise<RgbaImage> {
-  const box = (await page.getByTestId('viewport').boundingBox())!;
-  const size = 160;
-  const clip = {
-    x: Math.round(box.x + box.width / 2 - size / 2),
-    y: Math.round(box.y + box.height / 2 - size / 2),
-    width: size,
-    height: size,
-  };
-  return decodePng(await page.screenshot({ clip }));
-}
 
 test.describe('physics and scattering', () => {
   test('rigid body from the Physics tab, baked in the Scene tab, falls as the frame changes', async ({

@@ -13,7 +13,6 @@ import {
   type CurveData,
   type DriverData,
   type EvalError,
-  type EvaluatedInstance,
   type EvaluatedObject,
   type EvaluatedScene,
   type FCurve,
@@ -28,8 +27,9 @@ import {
 import { evaluateCached, type EvalMode } from './eval-cache';
 
 /*
- * Compact JSON descriptions of a scene for MCP agents. Numbers are rounded, references are
- * given by name (names are unique per datablock kind) and ids are included where useful. Lists
+ * Compact JSON descriptions of a scene for MCP agents. Numbers are rounded (get_scene: 4 decimals
+ * = 0.1 mm by default, get_object: 6 decimals = 1 µm, both with a `decimals` option), references
+ * are given by name (names are unique per datablock kind) and ids are included where useful. Lists
  * that can grow without bound (bones, spline points, shape keys, constraints, drivers, problems…)
  * are truncated, with the full count next to them, so a summary stays small enough to read.
  *
@@ -41,11 +41,38 @@ import { evaluateCached, type EvalMode } from './eval-cache';
  *
  * Geometry is described as renders show it: the scene is evaluated with the render settings of
  * modifiers, curves and particles (SUBSURF render_levels, SCREW render_steps, show_render, curve
- * render_resolution_u, every particle). Where the viewport shows other geometry, its counts are
- * listed too (`evaluated_viewport`, `viewport_instances`).
+ * render_resolution_u, every particle), and the scene counts only take objects shown in renders
+ * (like the renderers and the exporters: objects hidden with hide_render, e.g. Boolean cutters, are
+ * counted apart in `not_rendered`). Where the viewport shows other geometry, its counts are listed
+ * too (`evaluated_viewport`, `viewport_instances`: the objects shown in the viewport, like the
+ * editor's statistics overlay).
  */
 
 const RAD2DEG = 180 / Math.PI;
+
+/** Decimals of the numbers in get_scene (0.1 mm), get_mesh_data and get_instances by default. */
+export const SCENE_DECIMALS = 4;
+/** Decimals of the numbers in get_object by default (1 µm: labels, jewellery, fine bevels). */
+export const OBJECT_DECIMALS = 6;
+/** Most decimals a summary can be asked for. */
+export const MAX_DECIMALS = 6;
+
+/**
+ * Decimals of the summary being built (see {@link withDecimals}). Summaries are built
+ * synchronously, so one module-wide setting cannot leak into another call.
+ */
+let decimalsNow = SCENE_DECIMALS;
+
+/** Runs `fn` (which builds a summary) with numbers rounded to `decimals` (0–6). */
+function withDecimals<T>(decimals: number | undefined, fn: () => T): T {
+  const prev = decimalsNow;
+  decimalsNow = Math.max(0, Math.min(MAX_DECIMALS, Math.round(decimals ?? prev)));
+  try {
+    return fn();
+  } finally {
+    decimalsNow = prev;
+  }
+}
 
 /** Longest lists in `get_scene` (per object) and `get_object`. */
 const SCENE_LIST = 12;
@@ -59,16 +86,22 @@ const TEXT_PREVIEW = 120;
 /** Objects listed by `get_scene` unless asked for more. */
 export const DEFAULT_MAX_OBJECTS = 300;
 
-export function round(v: number, decimals = 4): number {
+/**
+ * `v` rounded to `decimals` (default: those of the summary being built, else 4); -0 becomes 0.
+ */
+export function round(v: number, decimals = decimalsNow): number {
   if (!Number.isFinite(v)) return v;
   const f = 10 ** decimals;
   const r = Math.round(v * f) / f;
   return r === 0 ? 0 : r;
 }
 
-export function roundVec<T extends number[]>(v: T, decimals = 4): T {
+export function roundVec<T extends number[]>(v: T, decimals = decimalsNow): T {
   return v.map((x) => round(x, decimals)) as T;
 }
+
+/** Decimals of angles in degrees next to radians (two fewer: 0.01° for 4 decimals of radians). */
+const degreeDecimals = () => Math.max(0, decimalsNow - 2);
 
 /** The first `max` items and, when there are more, the total. */
 function bounded<T>(items: readonly T[], max: number): { items: T[]; total?: number } {
@@ -549,22 +582,36 @@ function fcurveLabel(fc: FCurve, objectId: string): string {
 }
 
 interface InstanceCounts {
+  /** Instances shown (their owner object is visible: in renders, or in the viewport). */
   total: number;
+  /** Instances per owner object and per particle system id (shown or not). */
   byOwner: Map<string, number>;
   bySystem: Map<string, number>;
 }
 
-/** Instance counts: in all, per owner object and per particle system id. */
-function instanceCounts(instances: readonly EvaluatedInstance[]): InstanceCounts {
+/** Which objects a count takes: those shown in renders, or those shown in the viewport. */
+type Shown = 'RENDER' | 'VIEWPORT';
+
+/** Whether an evaluated object is shown in renders (RENDER) or in the viewport (VIEWPORT). */
+const isShown = (o: EvaluatedObject, shown: Shown) => (shown === 'RENDER' ? o.renderVisible : o.visible);
+
+/**
+ * Instance counts of `ev`: the instances shown (instances follow their owner's visibility, like
+ * the renderers and the viewport), and per owner object and particle system id.
+ */
+function instanceCounts(ev: EvaluatedScene, shown: Shown): InstanceCounts {
   const byOwner = new Map<string, number>();
   const bySystem = new Map<string, number>();
-  for (const inst of instances) {
+  let total = 0;
+  for (const inst of ev.instances) {
     byOwner.set(inst.ownerId, (byOwner.get(inst.ownerId) ?? 0) + 1);
     // ids: `${owner}:${system}:${particle}…` for particles, `${owner}:${source}` for collections
     const parts = inst.id.split(':');
     if (parts.length >= 3) bySystem.set(parts[1], (bySystem.get(parts[1]) ?? 0) + 1);
+    const owner = ev.byId.get(inst.ownerId);
+    if (owner && isShown(owner, shown)) total++;
   }
-  return { total: instances.length, byOwner, bySystem };
+  return { total, byOwner, bySystem };
 }
 
 /**
@@ -752,8 +799,6 @@ interface SummaryContext {
   instances: InstanceCounts;
   /** Instances in the viewport, when they differ from the render counts. */
   viewport: InstanceCounts | null;
-  /** The instances renders show. */
-  renderInstances: readonly EvaluatedInstance[];
   /** The object evaluated with the viewport settings (only when the viewport may differ). */
   viewportOf(id: string): EvaluatedObject | undefined;
   /** Shape keys of a mesh with their values at the frame. */
@@ -785,24 +830,24 @@ function summaryContext(
   ev: EvaluatedScene,
   viewportEv: EvaluatedScene | null,
 ): SummaryContext {
-  const instances = instanceCounts(ev.instances);
-  let viewport: InstanceCounts | null = null;
-  if (viewportEv && viewportEv !== ev) {
-    const shown = instanceCounts(viewportEv.instances);
-    if (
-      instances.total !== shown.total ||
-      [...instances.bySystem].some(([k, n]) => shown.bySystem.get(k) !== n) ||
-      [...instances.byOwner].some(([k, n]) => shown.byOwner.get(k) !== n)
-    )
-      viewport = shown;
-  }
+  const instances = instanceCounts(ev, 'RENDER');
+  // the viewport's instances (display_percentage, show_viewport, owners hidden in only one of the
+  // two); without a VIEWPORT evaluation the instances are the same, shown as their owners are
+  const shown = instanceCounts(viewportEv ?? ev, 'VIEWPORT');
+  const differs = (a: Map<string, number>, b: Map<string, number>) =>
+    a.size !== b.size || [...a].some(([k, n]) => b.get(k) !== n);
+  const viewport =
+    instances.total !== shown.total ||
+    differs(instances.bySystem, shown.bySystem) ||
+    differs(instances.byOwner, shown.byOwner)
+      ? shown
+      : null;
   let fs: FrameState | null = null;
   return {
     ev,
     problems: problemsByObject(scene, ev),
     instances,
     viewport,
-    renderInstances: ev.instances,
     viewportOf: (id) => (viewportEv && viewportEv !== ev ? viewportEv.byId.get(id) : undefined),
     shapeKeys: (meshId) => {
       fs ??= new FrameState(scene, ev.frame);
@@ -844,7 +889,7 @@ export function summarizeObject(
     // document values where those override them (what transform_object sets)
     location: roundVec([...a.location]),
     rotation_euler: roundVec([...a.rotation_euler]),
-    rotation_degrees: roundVec(a.rotation_euler.map((r) => r * RAD2DEG) as Vec3, 2),
+    rotation_degrees: roundVec(a.rotation_euler.map((r) => r * RAD2DEG) as Vec3, degreeDecimals()),
     scale: roundVec([...a.scale]),
     ...storedField(storedDiff(a, o, TRANSFORM_KEYS)),
     world_bounds: ev ? worldBounds(ev) : null,
@@ -969,19 +1014,37 @@ function animatedWorld(world: WorldSettings, stored: WorldSettings): Record<stri
   return { animated: now, stored: diff };
 }
 
+interface GeometryCounts {
+  vertices: number;
+  faces: number;
+  triangles: number;
+}
+
 /**
- * Evaluated geometry of the scene: every object's mesh after shape keys and modifiers, including
- * the surfaces of curves and text (hidden objects included, instances counted separately), and
- * the triangles of the instances (like scene.stats).
+ * Evaluated geometry of the scene as renders (`shown` RENDER) or the viewport (VIEWPORT) show it:
+ * the meshes after shape keys and modifiers, including the surfaces of curves and text, of the
+ * objects shown there (instances counted separately), and the triangles of the instances whose
+ * owner is shown (like the renderers, the exporters and the editor's statistics). The geometry of
+ * the objects that are not shown is counted apart (`hidden`, with their names).
  */
 function evaluatedGeometry(
   ev: EvaluatedScene,
-  instances: readonly EvaluatedInstance[],
+  shown: Shown,
 ): {
-  geometry: { vertices: number; faces: number; triangles: number };
+  geometry: GeometryCounts;
   instanceTriangles: number;
+  hidden: GeometryCounts & { objects: string[]; instances: number; instanceTriangles: number };
 } {
   const geometry = { vertices: 0, faces: 0, triangles: 0 };
+  const hidden = {
+    objects: [] as string[],
+    vertices: 0,
+    faces: 0,
+    triangles: 0,
+    instances: 0,
+    instanceTriangles: 0,
+  };
+  const hiddenNames = new Set<string>();
   const stats = new Map<MeshData, ReturnType<typeof meshStats>>();
   const statsOf = (m: MeshData) => {
     let s = stats.get(m);
@@ -991,16 +1054,26 @@ function evaluatedGeometry(
   for (const o of ev.objects) {
     if (!o.mesh) continue;
     const s = statsOf(o.mesh);
-    geometry.vertices += s.vertices;
-    geometry.faces += s.faces;
-    geometry.triangles += s.triangles;
+    const into = isShown(o, shown) ? geometry : hidden;
+    into.vertices += s.vertices;
+    into.faces += s.faces;
+    into.triangles += s.triangles;
+    if (into === hidden) hiddenNames.add(o.name);
   }
   let instanceTriangles = 0;
-  for (const inst of instances) {
+  for (const inst of ev.instances) {
+    const owner = ev.byId.get(inst.ownerId);
     const src = ev.byId.get(inst.sourceId)?.mesh;
-    if (src) instanceTriangles += statsOf(src).triangles;
+    const triangles = src ? statsOf(src).triangles : 0;
+    if (owner && isShown(owner, shown)) instanceTriangles += triangles;
+    else {
+      hidden.instances++;
+      hidden.instanceTriangles += triangles;
+      if (owner) hiddenNames.add(owner.name);
+    }
   }
-  return { geometry, instanceTriangles };
+  hidden.objects = [...hiddenNames];
+  return { geometry, instanceTriangles, hidden };
 }
 
 /**
@@ -1082,7 +1155,10 @@ function settingsSummary(scene: SceneDoc, world: WorldSettings, rigidBodies: num
           }
         : {}),
       ...(world.mist_density > 0
-        ? { mist_density: round(world.mist_density, 5), mist_color: roundVec([...world.mist_color]) }
+        ? {
+            mist_density: round(world.mist_density, Math.max(5, decimalsNow)),
+            mist_color: roundVec([...world.mist_color]),
+          }
         : {}),
       ...animatedWorld(world, storedWorld),
     },
@@ -1104,10 +1180,16 @@ export interface SceneSummaryOptions {
   projectId?: string;
   /** Objects listed at most (default DEFAULT_MAX_OBJECTS); the counts cover every object. */
   maxObjects?: number;
+  /** Decimals of the numbers (0–6, default SCENE_DECIMALS = 0.1 mm). */
+  decimals?: number;
 }
 
 /** Full scene description returned by `get_scene` and the `project://{id}/scene` resource. */
 export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) {
+  return withDecimals(opts.decimals ?? SCENE_DECIMALS, () => sceneSummary(scene, opts));
+}
+
+function sceneSummary(scene: SceneDoc, opts: SceneSummaryOptions) {
   const both = evaluateBoth(scene, opts.frame);
   const ev = both.ev;
   const ctx = summaryContext(scene, ev, both.viewport);
@@ -1136,13 +1218,29 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
       faces += c.faces;
     }
   }
-  const evaluated = evaluatedGeometry(ev, ctx.renderInstances);
-  const viewportGeometry = both.viewport ? evaluatedGeometry(both.viewport, []).geometry : null;
+  // what renders show (objects shown in renders), and what the viewport shows: with its modifier /
+  // curve settings, or (when those cannot differ) the same geometry with the viewport visibility
+  const evaluated = evaluatedGeometry(ev, 'RENDER');
+  const viewportGeometry = evaluatedGeometry(both.viewport ?? ev, 'VIEWPORT').geometry;
   const viewportDiffers =
-    !!viewportGeometry &&
-    (viewportGeometry.vertices !== evaluated.geometry.vertices ||
-      viewportGeometry.faces !== evaluated.geometry.faces ||
-      viewportGeometry.triangles !== evaluated.geometry.triangles);
+    viewportGeometry.vertices !== evaluated.geometry.vertices ||
+    viewportGeometry.faces !== evaluated.geometry.faces ||
+    viewportGeometry.triangles !== evaluated.geometry.triangles;
+  const hidden = evaluated.hidden;
+  const notRendered =
+    hidden.objects.length > 0
+      ? {
+          not_rendered: {
+            ...listField('objects', hidden.objects, MATERIAL_USERS),
+            vertices: hidden.vertices,
+            faces: hidden.faces,
+            triangles: hidden.triangles,
+            ...(hidden.instances
+              ? { instances: hidden.instances, instance_triangles: hidden.instanceTriangles }
+              : {}),
+          },
+        }
+      : {};
   const maxObjects = Math.max(1, opts.maxObjects ?? DEFAULT_MAX_OBJECTS);
   const listed = objects.slice(0, maxObjects);
   const rigidBodies = objects.filter((o) => o.rigid_body).length;
@@ -1157,9 +1255,12 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
       // base meshes (as stored, before modifiers; curves and text not included)
       vertices,
       faces,
-      // what is rendered: after shape keys, modifiers (render settings), curve bevels/extrusions
-      // and text; the viewport's counts when its modifier/curve settings give other geometry
+      // what is rendered: the objects shown in renders, after shape keys, modifiers (render
+      // settings), curve bevels/extrusions and text; the geometry of objects hidden from renders
+      // (hide_render: Boolean cutters, helpers) apart; the viewport's counts (objects shown in the
+      // viewport, its modifier/curve settings) when they differ
       evaluated: evaluated.geometry,
+      ...notRendered,
       ...(viewportDiffers ? { evaluated_viewport: viewportGeometry } : {}),
       materials: scene.listMaterials().length,
       instances: ctx.instances.total,
@@ -1196,8 +1297,15 @@ export function summarizeScene(scene: SceneDoc, opts: SceneSummaryOptions = {}) 
   };
 }
 
-/** Detailed description of one object (`get_object`). */
-export function describeObject(scene: SceneDoc, o: ObjectData, frame?: number) {
+/**
+ * Detailed description of one object (`get_object`), its numbers rounded to `decimals` (0–6,
+ * default OBJECT_DECIMALS = 1 µm, so sub-millimetre parts read back as they were made).
+ */
+export function describeObject(scene: SceneDoc, o: ObjectData, frame?: number, decimals = OBJECT_DECIMALS) {
+  return withDecimals(decimals, () => objectDescription(scene, o, frame));
+}
+
+function objectDescription(scene: SceneDoc, o: ObjectData, frame?: number) {
   const both = evaluateBoth(scene, frame);
   const ev = both.ev;
   const e = ev.byId.get(o.id);
@@ -1229,7 +1337,7 @@ export function describeObject(scene: SceneDoc, o: ObjectData, frame?: number) {
     world_transform: {
       location: roundVec([...wt.location]),
       rotation_euler: roundVec([...wt.rotation]),
-      rotation_degrees: roundVec(wt.rotation.map((r) => r * RAD2DEG) as Vec3, 2),
+      rotation_degrees: roundVec(wt.rotation.map((r) => r * RAD2DEG) as Vec3, degreeDecimals()),
       scale: roundVec([...wt.scale]),
     },
     children: scene.childrenOf(o.id).map((c) => c.name),
