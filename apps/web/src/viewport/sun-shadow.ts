@@ -10,11 +10,13 @@ import * as THREE from 'three';
  * - the casters: everything between those receivers and the sun, also outside the view.
  * The texels therefore cover the visible part of the scene, whatever the size of the scene: a 600 m
  * ground plane or a distant terrain does not spread them over hundreds of metres, and metre-sized
- * objects keep sharp shadows. The shadow distance is SHADOW_DISTANCE_SCALE times the median distance
- * from the camera at which the visible objects start, so a far background (mountains or clouds a
- * kilometre away) does not cost the foreground its resolution; beyond it there are no sun shadows.
- * The depth and normal biases are fractions of a texel in world units, whatever the depth range of
- * the map.
+ * objects keep sharp shadows. In perspective views the shadow distance is SHADOW_DISTANCE_SCALE
+ * times the median distance from the camera at which the visible objects start, so a far background
+ * (mountains or clouds a kilometre away) does not cost the foreground its resolution; beyond it
+ * there are no sun shadows. Orthographic views (as wide at every depth) have no shadow distance.
+ * The depth and normal biases are a couple of texels in world units (a few millimetres to centimetres
+ * for a view of metre-sized objects), whatever the depth range of the map: enough against acne on
+ * faces lit at an angle, too little to detach the shadows from the objects casting them.
  */
 
 /** Width and height of a sun's shadow map in texels. */
@@ -22,9 +24,9 @@ export const SUN_SHADOW_MAP_SIZE = 2048;
 /** The shadow distance: this many times the median distance at which the visible objects start. */
 export const SHADOW_DISTANCE_SCALE = 4;
 /** Normal offset of shadow lookups (three.js normalBias) in texels of the fitted map. */
-export const NORMAL_BIAS_TEXELS = 1.5;
+export const NORMAL_BIAS_TEXELS = 2;
 /** Depth bias of shadow lookups in texels (world units) of the fitted map. */
-export const DEPTH_BIAS_TEXELS = 1;
+export const DEPTH_BIAS_TEXELS = 2;
 
 /** What {@link fitSunShadow} fitted, in the shadow camera's view space (metres). */
 export interface SunShadowFit {

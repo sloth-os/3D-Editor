@@ -161,7 +161,7 @@ describe('fitSunShadow', () => {
       // three.js adds the bias to the 0..1 depth over near..far
       expect(-light.shadow.bias * (fit.far - fit.near)).toBeCloseTo(DEPTH_BIAS_TEXELS * fit.texel, 9);
       expect(light.shadow.normalBias).toBeLessThan(0.03);
-      expect(-light.shadow.bias * (fit.far - fit.near)).toBeLessThan(0.02);
+      expect(-light.shadow.bias * (fit.far - fit.near)).toBeLessThan(0.03);
     }
   });
 

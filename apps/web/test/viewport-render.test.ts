@@ -825,7 +825,10 @@ function sunScene(floor: number): ProjectSession {
   });
   ok(s, 'mesh.primitive_cube_add', { name: 'Box', size: 0.5, location: [-2, -2, -0.75] });
   ok(s, 'light.properties_set', { object: 'Light', type: 'SUN', energy: 3 });
-  s.doc.updateObject(s.doc.findObjectByName('Light')!.id, { location: [2, -2, 5], rotation: [0.6, 0.35, 0] });
+  s.doc.updateObject(s.doc.findObjectByName('Light')!.id, {
+    location: [2, -2, 5],
+    rotation_euler: [0.6, 0.35, 0],
+  });
   s.doc.updateRender({ use_shadows: true, resolution_x: 64, resolution_y: 36 });
   return s;
 }
@@ -908,7 +911,7 @@ describe('sun shadows', () => {
       texels.push(m.texel);
       expect(m.texel, `${size} m floor: texel`).toBeLessThan(0.02);
       expect(m.normalBias).toBeLessThan(0.03);
-      expect(m.depthBias).toBeLessThan(0.02);
+      expect(m.depthBias).toBeLessThan(0.03);
       // the casters the camera sees, and their shadows on the floor it sees, are in the map
       const cam = sceneCamera(e, gl);
       const view = new THREE.Frustum().setFromProjectionMatrix(

@@ -178,9 +178,8 @@ export interface RgbaImage {
   data: Uint8Array;
 }
 
-/** Decodes a non-interlaced 8-bit grey, RGB or RGBA PNG (the default image of an APNG). */
-export function decodePng(buf: Buffer): RgbaImage {
-  const chunks = pngChunks(buf);
+/** Size and channels of a non-interlaced 8-bit grey, grey+alpha, RGB or RGBA PNG (the decodable ones). */
+function pngHeader(chunks: PngChunk[]): { width: number; height: number; channels: number } {
   const ihdr = chunks.find((c) => c.type === 'IHDR')!.data;
   const width = ihdr.readUInt32BE(0);
   const height = ihdr.readUInt32BE(4);
@@ -190,7 +189,19 @@ export function decodePng(buf: Buffer): RgbaImage {
     throw new Error(
       `unsupported PNG: bit depth ${bitDepth}, colour type ${colorType}, interlace ${interlace}`,
     );
+  return { width, height, channels };
+}
+
+/** Decodes a non-interlaced 8-bit grey, RGB or RGBA PNG (the default image of an APNG). */
+export function decodePng(buf: Buffer): RgbaImage {
+  const chunks = pngChunks(buf);
+  const { width, height, channels } = pngHeader(chunks);
   const raw = inflateSync(Buffer.concat(chunks.filter((c) => c.type === 'IDAT').map((c) => c.data)));
+  return { width, height, data: unfilterToRgba(raw, width, height, channels) };
+}
+
+/** Reverses the PNG row filters of `width`×`height` pixels of `channels` bytes and expands them to RGBA. */
+function unfilterToRgba(raw: Uint8Array, width: number, height: number, channels: number): Uint8Array {
   const stride = width * channels;
   const out = new Uint8Array(width * height * 4);
   let prev = new Uint8Array(stride);
@@ -226,7 +237,73 @@ export function decodePng(buf: Buffer): RgbaImage {
     }
     prev = cur;
   }
-  return { width, height, data: out };
+  return out;
+}
+
+/** One frame of an animated PNG, as a viewer shows it. */
+export interface ApngFrame extends RgbaImage {
+  /** The rectangle this frame redraws (its fcTL chunk); the rest is kept from the frames before. */
+  region: Rect;
+}
+
+/**
+ * Decodes every frame of an APNG: each frame's rectangle (fcTL, then IDAT or fdAT data) is drawn
+ * onto the canvas with its blend operation (SOURCE or OVER), the full picture is taken, and the
+ * rectangle is disposed of (NONE, BACKGROUND or PREVIOUS) before the next frame. Checks the shared
+ * sequence numbers of the fcTL and fdAT chunks. `frameCount` and `plays` come from the acTL chunk.
+ */
+export function decodeApng(buf: Buffer): { frameCount: number; plays: number; frames: ApngFrame[] } {
+  const chunks = pngChunks(buf);
+  const { width, height, channels } = pngHeader(chunks);
+  const actl = chunks.find((c) => c.type === 'acTL');
+  if (!actl) throw new Error('not an animated PNG: no acTL chunk');
+  // each frame's control chunk and data (IDAT belongs to the first frame when an fcTL precedes it)
+  const parts: { fctl: Buffer; data: Buffer[] }[] = [];
+  let seq = 0;
+  for (const c of chunks) {
+    if (c.type === 'fcTL' || c.type === 'fdAT')
+      expect(c.data.readUInt32BE(0), `sequence number of an ${c.type} chunk`).toBe(seq++);
+    if (c.type === 'fcTL') parts.push({ fctl: c.data, data: [] });
+    else if (c.type === 'IDAT' && parts.length) parts[parts.length - 1].data.push(c.data);
+    else if (c.type === 'fdAT') parts[parts.length - 1].data.push(c.data.subarray(4));
+  }
+  const canvas = new Uint8Array(width * height * 4);
+  const frames = parts.map(({ fctl, data }, k): ApngFrame => {
+    const region = {
+      w: fctl.readUInt32BE(4),
+      h: fctl.readUInt32BE(8),
+      x: fctl.readUInt32BE(12),
+      y: fctl.readUInt32BE(16),
+    };
+    const { x, y, w, h } = region;
+    expect(x + w <= width && y + h <= height, `frame ${k + 1} lies inside the image`).toBe(true);
+    // dispose_op PREVIOUS on the first frame means BACKGROUND
+    const dispose = k === 0 && fctl[24] === 2 ? 1 : fctl[24];
+    const blendOver = fctl[25] === 1;
+    const pixels = unfilterToRgba(inflateSync(Buffer.concat(data)), w, h, channels);
+    const before = dispose === 2 ? canvas.slice() : null;
+    for (let j = 0; j < h; j++)
+      for (let i = 0; i < w; i++) {
+        const s = (j * w + i) * 4;
+        const o = ((y + j) * width + x + i) * 4;
+        if (!blendOver) {
+          canvas.set(pixels.subarray(s, s + 4), o);
+          continue;
+        }
+        const a = pixels[s + 3] / 255;
+        const b = (canvas[o + 3] / 255) * (1 - a);
+        const alpha = a + b;
+        for (let ch = 0; ch < 3; ch++)
+          canvas[o + ch] = alpha ? Math.round((pixels[s + ch] * a + canvas[o + ch] * b) / alpha) : 0;
+        canvas[o + 3] = Math.round(alpha * 255);
+      }
+    const frame = { width, height, data: canvas.slice(), region };
+    if (dispose === 1)
+      for (let j = 0; j < h; j++) canvas.fill(0, ((y + j) * width + x) * 4, ((y + j) * width + x + w) * 4);
+    else if (before) canvas.set(before);
+    return frame;
+  });
+  return { frameCount: actl.data.readUInt32BE(0), plays: actl.data.readUInt32BE(4), frames };
 }
 
 /** Decodes a `data:image/png;base64,…` URL. */
