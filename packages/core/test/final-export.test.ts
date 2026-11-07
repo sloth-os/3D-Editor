@@ -75,7 +75,8 @@ describe('glTF export: procedural bakes', () => {
     const op = run('export_scene.gltf', { bake_resolution: 128 });
     const viaOp = parseGltf(Uint8Array.from(atob(op.data_base64), (c) => c.charCodeAt(0)));
     expect(sizeOf(viaOp, 'Big')).toEqual([128, 128]);
-  });
+    // a 2048 px procedural bake takes several seconds, several times longer under coverage
+  }, 120_000);
 
   it('names the per-mesh copies of one material apart and says so', () => {
     const { doc, run } = setup();
