@@ -1113,7 +1113,10 @@ function VariableEditor(p: {
               onChange={(path) => path.trim() && p.onChange({ ...v, path: path.trim() })}
             />
           </div>
-          <div style={{ width: '40px', flex: 'none' }} title="Channel index (0 = X / R, 1 = Y / G, 2 = Z / B)">
+          <div
+            style={{ width: '40px', flex: 'none' }}
+            title="Channel index (0 = X / R, 1 = Y / G, 2 = Z / B)"
+          >
             <NumberField
               value={v.index}
               integer

@@ -10,6 +10,11 @@ export const frameTimeMs = signal(0);
  * WebGL can take many seconds per frame: the viewport says so instead of looking frozen.
  */
 export const slowFrameMs = signal(0);
+/**
+ * Whether that slow frame compiled shaders (the first frame in Material Preview or Rendered shading
+ * of a scene, or after its lights or materials changed): later frames are faster.
+ */
+export const slowFrameCompiled = signal(false);
 /** A frame slower than this is reported ({@link slowFrameMs}). */
 export const SLOW_FRAME_MS = 2000;
 

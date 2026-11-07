@@ -3,11 +3,14 @@ import {
   buildTopology,
   createCube,
   createCylinder,
+  createGrid,
   createIcoSphere,
+  extrudeRegion,
   selectAllElements,
   subdivide,
   type MeshData,
 } from '../src';
+import { smartProject } from '../src/mesh/uv';
 import { applyModifier, expectClosedConsistent, signedVolume } from './modifiers-helpers';
 
 // BEVEL modifier: UVs of the new geometry stay inside the UV island of the face they were cut from
@@ -262,5 +265,83 @@ describe('BEVEL modifier profiles (Blender superellipses, evenly spaced segments
           expect(concaveEdges(r, width * 1e-4), `${name}, profile ${profile}, ${segments} segments`).toBe(0);
         }
       }
+  });
+});
+
+describe('BEVEL modifier: boxy profiles at the rim of a cylinder with limit_method NONE (verifier repro)', () => {
+  it('leaves no notches at the rim vertices, also with odd segment counts', () => {
+    // every rim vertex joins two rim edges and a shallow vertical edge; with odd segment counts the middle
+    // face of each strip cuts the edge's corner off and the corner patch rose back toward the corner
+    // between them: creases 3.0% of the width deep with 3 segments (1.1% with 5), visible notches
+    for (const vertices of [16, 32])
+      for (const profile of [0.75, 0.85, 0.9, 0.95, 1])
+        for (const segments of [3, 4, 5, 7]) {
+          const cyl = createCylinder({ vertices, radius: 1, depth: 1 });
+          const r = applyModifier('BEVEL', cyl, { width: 0.1, segments, profile, limit_method: 'NONE' });
+          expectClosedConsistent(r);
+          const label = `${vertices} sides, profile ${profile}, ${segments} segments`;
+          expect(concaveEdges(r, 0.1 * 2e-3), label).toBe(0);
+        }
+  });
+});
+
+describe('BEVEL modifier UVs next to edges that are not beveled (verifier repro)', () => {
+  /** Signed shoelace area of face fi's UV polygon (negative: the face is mirrored in UV space). */
+  const signedUvArea = (m: MeshData, fi: number) => {
+    const uv = m.uvs![fi];
+    const n = m.faces[fi].length;
+    let a = 0;
+    for (let i = 0; i < n; i++) {
+      const j = (i + 1) % n;
+      a += uv[i * 2] * uv[j * 2 + 1] - uv[j * 2] * uv[i * 2 + 1];
+    }
+    return a / 2;
+  };
+
+  it('keeps the planar UVs of a flat grid exact (no bow-tie faces at the slide points)', () => {
+    // createGrid UVs are (x + 1) / 2, (y + 1) / 2; its border vertices are not beveled, so the edges
+    // from the border inward slide: the profile points next to those slide points were snapped onto
+    // the slide edge (56 mirrored faces and 528 shared texels at 1024² with 5 segments)
+    const grid = createGrid({});
+    for (const segments of [1, 2, 3, 4, 5]) {
+      const r = applyModifier('BEVEL', grid, { width: 0.02, segments, limit_method: 'NONE' });
+      const label = `${segments} segments`;
+      expect(r.faces.length, label).toBeGreaterThan(grid.faces.length);
+      expect(r.faces.filter((_, fi) => signedUvArea(r, fi) < -1e-12).length, label).toBe(0);
+      expect(uvOverlap(r, 1024), label).toBe(0);
+      let worst = 0;
+      r.faces.forEach((f, fi) =>
+        f.forEach((v, i) => {
+          const du = r.uvs![fi][i * 2] - (r.positions[v * 3] + 1) / 2;
+          const dv = r.uvs![fi][i * 2 + 1] - (r.positions[v * 3 + 1] + 1) / 2;
+          worst = Math.max(worst, Math.hypot(du, dv));
+        }),
+      );
+      // every new vertex of a flat mesh gets the UV of its own position (the patch centers too)
+      expect(worst, label).toBeLessThan(1e-9);
+    }
+  });
+
+  it('does not overlap the islands of an extruded platform with its own UVs', () => {
+    // 6 × 6 grid, the middle 2 × 2 faces extruded 0.3 up, unwrapped with Smart UV Project
+    const g = createGrid({ x_subdivisions: 6, y_subdivisions: 6, size: 2 });
+    const faces = new Set([14, 15, 20, 21]);
+    const verts = new Set([...faces].flatMap((f) => g.faces[f]));
+    const platform = extrudeRegion(g, { verts, edges: new Set(), faces }, { offset: [0, 0, 0.3] }).mesh;
+    const all = new Set(platform.faces.map((_, i) => i));
+    const unwrapped = smartProject(platform, { verts: new Set(), edges: new Set(), faces: all }).mesh;
+    expect(uvOverlap(unwrapped, 512)).toBe(0);
+    for (const [limit_method, segments] of [
+      ['ANGLE', 2],
+      ['ANGLE', 3],
+      ['ANGLE', 4],
+      ['NONE', 2],
+      ['NONE', 3],
+      ['NONE', 5],
+    ] as const) {
+      const r = applyModifier('BEVEL', unwrapped, { width: 0.05, segments, limit_method });
+      // NONE with 3 segments shared 168 texels, with 5 segments 312
+      expect(uvOverlap(r, 512), `${limit_method}, ${segments} segments`).toBe(0);
+    }
   });
 });

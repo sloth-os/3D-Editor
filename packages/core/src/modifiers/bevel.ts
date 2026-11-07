@@ -176,18 +176,18 @@ function norm(v: number[]): number {
   return Math.hypot(v[0], v[1], v[2]);
 }
 
-/** UV at position `pt` inside face f's corner i, by decomposing pt − v in the corner's edge basis. */
-function cornerUV(m: MeshData, f: number, i: number, pt: number[]): number[] {
-  const uv = m.uvs?.[f];
-  if (!uv) return [0, 0];
+/**
+ * Coordinates of position `pt` in face f's corner i: pt − v = al · (previous corner − v) + be · (next
+ * corner − v), least squares (so pt is projected into the corner's plane); with `ab` the lengths of
+ * those two edges.
+ */
+function cornerCoords(m: MeshData, f: number, i: number, pt: number[]): { al: number; be: number; ab: number[] } {
   const face = m.faces[f];
   const L = face.length;
   const v = face[i];
-  const ip = (i + L - 1) % L;
-  const inx = (i + 1) % L;
   const P = m.positions;
-  const a = sub(P, face[ip], v);
-  const b = sub(P, face[inx], v);
+  const a = sub(P, face[(i + L - 1) % L], v);
+  const b = sub(P, face[(i + 1) % L], v);
   const w = [pt[0] - P[v * 3], pt[1] - P[v * 3 + 1], pt[2] - P[v * 3 + 2]];
   const aa = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
   const ab = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -195,8 +195,21 @@ function cornerUV(m: MeshData, f: number, i: number, pt: number[]): number[] {
   const wa = w[0] * a[0] + w[1] * a[1] + w[2] * a[2];
   const wb = w[0] * b[0] + w[1] * b[1] + w[2] * b[2];
   const det = aa * bb - ab * ab;
-  const al = Math.abs(det) > 1e-24 ? (wa * bb - wb * ab) / det : 0;
-  const be = Math.abs(det) > 1e-24 ? (wb * aa - wa * ab) / det : 0;
+  return {
+    al: Math.abs(det) > 1e-24 ? (wa * bb - wb * ab) / det : 0,
+    be: Math.abs(det) > 1e-24 ? (wb * aa - wa * ab) / det : 0,
+    ab: [Math.sqrt(aa), Math.sqrt(bb)],
+  };
+}
+
+/** UV at position `pt` inside face f's corner i, by decomposing pt − v in the corner's edge basis. */
+function cornerUV(m: MeshData, f: number, i: number, pt: number[]): number[] {
+  const uv = m.uvs?.[f];
+  if (!uv) return [0, 0];
+  const L = m.faces[f].length;
+  const ip = (i + L - 1) % L;
+  const inx = (i + 1) % L;
+  const { al, be } = cornerCoords(m, f, i, pt);
   return [
     uv[i * 2] + al * (uv[ip * 2] - uv[i * 2]) + be * (uv[inx * 2] - uv[i * 2]),
     uv[i * 2 + 1] + al * (uv[ip * 2 + 1] - uv[i * 2 + 1]) + be * (uv[inx * 2 + 1] - uv[i * 2 + 1]),
@@ -232,6 +245,8 @@ class BevelUVs {
   private readonly kind: HomeKind[] = [];
   private readonly ref: number[] = [];
   private readonly seams = new Map<number, boolean>();
+  /** Vertices inside a vertex patch (used by that patch's faces only). */
+  private readonly inner = new Set<number>();
 
   constructor(
     private readonly m: MeshData,
@@ -249,6 +264,12 @@ class BevelUVs {
   /** Gives `id` the home of vertex `from` (a profile point on the same side as its end `from`). */
   copy(id: number, from: number): void {
     this.set(id, this.vert[from], this.kind[from], this.ref[from]);
+  }
+
+  /** Records new vertex `id` of a vertex patch (see `set`) as inside the patch. */
+  setInner(id: number, v: number, kind: HomeKind, ref = -1): void {
+    this.set(id, v, kind, ref);
+    this.inner.add(id);
   }
 
   homeFace(id: number): number {
@@ -344,16 +365,57 @@ class BevelUVs {
   }
 
   /**
+   * The face among `faces` whose corner at vertex id's original vertex holds id's position best (the
+   * largest smaller corner coordinate, in length units), or −1: when no face has that corner, or when
+   * the UVs of that face's corner are degenerate (an extruded wall whose UVs collapse onto a line),
+   * whose UV map cannot place a point off the line.
+   */
+  private holdingFace(id: number, faces: number[]): number {
+    const v = this.vert[id];
+    const pt = [this.b.positions[id * 3], this.b.positions[id * 3 + 1], this.b.positions[id * 3 + 2]];
+    let best = -1;
+    let bestScore = -Infinity;
+    for (const f of faces) {
+      const i = this.m.faces[f].indexOf(v);
+      if (i < 0) continue;
+      const { al, be, ab } = cornerCoords(this.m, f, i, pt);
+      const score = Math.min(al * ab[0], be * ab[1]);
+      if (score > bestScore) [best, bestScore] = [f, score];
+    }
+    if (best < 0) return -1;
+    const uv = this.m.uvs![best];
+    const L = this.m.faces[best].length;
+    const i = this.m.faces[best].indexOf(v);
+    const ip = (i + L - 1) % L;
+    const inx = (i + 1) % L;
+    const ax = uv[ip * 2] - uv[i * 2];
+    const ay = uv[ip * 2 + 1] - uv[i * 2 + 1];
+    const bx = uv[inx * 2] - uv[i * 2];
+    const by = uv[inx * 2 + 1] - uv[i * 2 + 1];
+    return Math.abs(ax * by - ay * bx) > 1e-3 * Math.hypot(ax, ay) * Math.hypot(bx, by) ? best : -1;
+  }
+
+  /**
    * Per-corner UVs of a new face with corners `loop` cut from the original faces `candidates` (in order
    * of preference); `continuous`: the UVs are continuous between those faces (no seam among them).
    */
   faceUVs(loop: number[], candidates: number[], continuous: boolean): number[] {
-    for (const f of candidates)
-      if (loop.every((x) => this.compatible(f, x))) return loop.flatMap((x) => this.uvIn(f, x));
+    // with continuous UVs a patch's inner vertices that lie over an edge or the vertex (sector boundaries,
+    // the center) take the UV at their position in the face holding them, rather than snapping onto the
+    // edge or the vertex: the same in every face of the patch, whose candidates are all the faces around
+    // the vertex
+    const own = new Map<number, number[]>();
     if (continuous)
-      return loop.flatMap((x) =>
-        this.uvIn(candidates.find((f) => this.compatible(f, x)) ?? candidates[0], x),
-      );
+      for (const x of loop)
+        if (this.inner.has(x) && this.kind[x] !== HomeKind.FACE) {
+          const f = this.holdingFace(x, candidates);
+          if (f >= 0) own.set(x, this.uvIn(f, x, true));
+        }
+    const at = (f: number, x: number) => own.get(x) ?? this.uvIn(f, x);
+    for (const f of candidates)
+      if (loop.every((x) => this.compatible(f, x))) return loop.flatMap((x) => at(f, x));
+    if (continuous)
+      return loop.flatMap((x) => at(candidates.find((f) => this.compatible(f, x)) ?? candidates[0], x));
     let best = candidates[0];
     let bestN = -1;
     for (const f of candidates) {
@@ -412,7 +474,7 @@ function gridPatch(
 
 /** A profile side walked the other way. */
 function reversedSide(s: PatchSide): PatchSide {
-  return { ids: s.ids.slice().reverse(), a: s.b, b: s.a, c: s.c, tag: s.tag };
+  return { ...s, ids: s.ids.slice().reverse(), a: s.b, b: s.a };
 }
 
 export function bevelMesh(m: MeshData, p: BevelParams): MeshData {
@@ -595,6 +657,28 @@ function bevelEdges(
     const [a, c] = topo.edges[e];
     return [dirFace.get(`${a},${c}`) ?? -1, dirFace.get(`${c},${a}`) ?? -1];
   };
+  /** Whether beveled edge e is convex: a corner of its second face lies below the first face's plane. */
+  const convexEdge = (e: number): boolean => {
+    const [fa, fb] = stripFace(e);
+    const [a] = topo.edges[e];
+    let lowest = 0;
+    for (const x of m.faces[fb] ?? [])
+      lowest = Math.min(
+        lowest,
+        (P[x * 3] - P[a * 3]) * fn[fa * 3] +
+          (P[x * 3 + 1] - P[a * 3 + 1]) * fn[fa * 3 + 1] +
+          (P[x * 3 + 2] - P[a * 3 + 2]) * fn[fa * 3 + 2],
+      );
+    let highest = 0;
+    for (const x of m.faces[fb] ?? [])
+      highest = Math.max(
+        highest,
+        (P[x * 3] - P[a * 3]) * fn[fa * 3] +
+          (P[x * 3 + 1] - P[a * 3 + 1]) * fn[fa * 3 + 1] +
+          (P[x * 3 + 2] - P[a * 3 + 2]) * fn[fa * 3 + 2],
+      );
+    return lowest < 0 && highest <= 1e-9 * edgeLen(e);
+  };
   const arcAt = (e: number, v: number): number[] => {
     const key = `${e}:${v}`;
     let arc = arcs.get(key);
@@ -618,9 +702,11 @@ function bevelEdges(
       for (let j = 1; j < S; j++) {
         const q = profilePoint(pa, pb, C, j / S, p.profile);
         const idx = b.addVertex(q[0], q[1], q[2], colors, v);
-        // each half of the profile belongs to the face (or slide edge) of its end; the middle is on e
+        // each half of the profile lies in the strip's face on its side, also where its end is a slide
+        // point: the profile leaves the slide edge at once (unless it is a weld's, below); the middle is
+        // on e
         if (2 * j === S) uv?.set(idx, v, HomeKind.EDGE, e);
-        else uv?.copy(idx, 2 * j < S ? A : B);
+        else uv?.set(idx, v, HomeKind.FACE, 2 * j < S ? fa : fb);
         arc.push(idx);
       }
       arcSpecs.set(key, { a: pa, b: pb, c: C });
@@ -745,7 +831,7 @@ function bevelEdges(
         for (const x of fa === fPrev ? arc : arc.slice().reverse()) push(x);
         const spec = arcSpecs.get(`${e}:${v}`);
         if (spec) {
-          const side = { ids: arc, ...spec, tag: e };
+          const side = { ids: arc, ...spec, tag: e, dir: sub(P, other(e, v), v), convex: convexEdge(e) };
           sides.push(fa === fPrev ? side : reversedSide(side));
         }
       } else {
@@ -812,10 +898,11 @@ function bevelEdges(
     };
     const onVertex = (id: number, i: number, j: number, k: number) => {
       if (!uv) return;
-      if (i < 0) uv.set(id, v, HomeKind.VERT);
-      else if (k === half) uv.set(id, v, HomeKind.EDGE, gsides[i].tag);
-      else if (j === half) uv.set(id, v, HomeKind.EDGE, gsides[(i + gsides.length - 1) % gsides.length].tag);
-      else uv.set(id, v, HomeKind.FACE, sectorFace(i));
+      if (i < 0) uv.setInner(id, v, HomeKind.VERT);
+      else if (k === half) uv.setInner(id, v, HomeKind.EDGE, gsides[i].tag);
+      else if (j === half)
+        uv.setInner(id, v, HomeKind.EDGE, gsides[(i + gsides.length - 1) % gsides.length].tag);
+      else uv.setInner(id, v, HomeKind.FACE, sectorFace(i));
     };
     if (gridPatch(ctx, gsides, S, p.profile, corner, colors, v, onVertex)) continue;
     addPatch(ctx, loop);
@@ -961,9 +1048,9 @@ function bevelVertices(
     const n = sides.length;
     const onVertex = (id: number, i: number, j: number, k: number) => {
       if (!uv) return;
-      if (i < 0) uv.set(id, v, HomeKind.VERT);
-      else if (j === k) uv.set(id, v, HomeKind.EDGE, uv.homeEdge(sides[i].ids[0]));
-      else uv.set(id, v, HomeKind.FACE, sides[j < k ? i : (i + n - 1) % n].tag);
+      if (i < 0) uv.setInner(id, v, HomeKind.VERT);
+      else if (j === k) uv.setInner(id, v, HomeKind.EDGE, uv.homeEdge(sides[i].ids[0]));
+      else uv.setInner(id, v, HomeKind.FACE, sides[j < k ? i : (i + n - 1) % n].tag);
     };
     if (!gridPatch(ctx, sides, S, p.profile, [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]], colors, v, onVertex))
       addPatch(ctx, seq);
@@ -1001,8 +1088,9 @@ export const bevelModifier: ModifierDef<typeof schema> = {
     'neighbouring bevels stop just short of each other (use_clamp_overlap). Closed manifold input stays closed. ' +
     'UVs of the new faces are interpolated per face corner inside the UV island of the face each one was cut ' +
     'from (like Blender), so bevels do not stretch across UV seams. Limitations: boundary / non-manifold vertices ' +
-    'are not beveled; corner patches where edges of very different angles meet (every rim vertex of a cylinder ' +
-    'with limit_method NONE) can be slightly uneven (dents under 1% of the width).',
+    'are not beveled; with round profiles (about 0.4–0.7) and 4 or more segments, corner patches where edges of ' +
+    'very different angles meet (every rim vertex of a cylinder with limit_method NONE) have shallow dents (under ' +
+    '0.6% of the width).',
   schema,
   apply(mesh, p) {
     return bevelMesh(mesh, p);

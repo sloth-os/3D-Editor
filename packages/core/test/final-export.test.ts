@@ -215,6 +215,64 @@ describe('glTF export: animation of objects on curved paths', () => {
     expect(res.warnings?.some((w) => /curved path/.test(w)) ?? false).toBe(false);
   });
 
+  it('keeps one key per frame where the motion only turns at frames (LINEAR zigzag keys)', () => {
+    const { doc, run } = setup();
+    doc.updateScene({ frame_start: 1, frame_end: 41 });
+    run('mesh.primitive_cube_add', { name: 'Box', size: 0.1 });
+    const frames = Array.from({ length: 21 }, (_, i) => 1 + 2 * i);
+    run('anim.keyframes_insert_many', {
+      target: 'Box',
+      path: 'location',
+      index: 0,
+      frames,
+      values: frames.map((_, i) => i * 0.05),
+      interpolation: 'LINEAR',
+    });
+    run('anim.keyframes_insert_many', {
+      target: 'Box',
+      path: 'location',
+      index: 1,
+      frames,
+      values: frames.map((_, i) => (i % 2) * 0.05),
+      interpolation: 'LINEAR',
+    });
+    // a moon on a fast orbit in the same scene still gets keys between the frames
+    run('mesh.primitive_uv_sphere_add', { name: 'Moon', radius: 0.005 });
+    run('anim.driver_add', { target: 'Moon', path: 'location', index: 0, expression: 'cos(frame * pi / 4) * 0.05' });
+    run('anim.driver_add', { target: 'Moon', path: 'location', index: 1, expression: 'sin(frame * pi / 4) * 0.05' });
+    const res = exportScene(doc, 'glb');
+    const { json, bin } = parseGltf(res.data);
+    const keys = (name: string) => {
+      const node = json.nodes.findIndex((n: any) => n.name === name);
+      const ch = json.animations[0].channels.find(
+        (c: any) => c.target.node === node && c.target.path === 'translation',
+      );
+      return readAccessor(json, bin, json.animations[0].samplers[ch.sampler].input).length;
+    };
+    // the zigzag got 3 keys per frame and "'Box' moves on a strongly curved path … 2.4 mm"
+    expect(keys('Box')).toBe(41);
+    expect(keys('Moon')).toBeGreaterThan(41 * 2);
+    expect(res.warnings?.filter((w) => /curved path/.test(w)) ?? []).toEqual([]);
+  });
+
+  it('keeps one key per frame for a rigid body bouncing down a slope', () => {
+    const { doc, run } = setup();
+    doc.updateScene({ frame_start: 1, frame_end: 60 });
+    run('mesh.primitive_cube_add', { name: 'Floor', size: 4 });
+    run('object.transform_set', { objects: ['Floor'], scale: [1, 1, 0.05], rotation_euler: [0.35, 0, 0] });
+    run('rigidbody.object_add', { objects: ['Floor'], type: 'PASSIVE' });
+    run('mesh.primitive_uv_sphere_add', { name: 'Ball', radius: 0.1, location: [0, 0, 1.5] });
+    run('rigidbody.object_add', { objects: ['Ball'], type: 'ACTIVE' });
+    run('rigidbody.world_set', { enabled: true, frame_start: 1, frame_end: 60 });
+    const res = exportScene(doc, 'glb');
+    const { json, bin } = parseGltf(res.data);
+    // the simulation is linear between frames: the bounce looked like a tight curve ("chords of up to
+    // 19.5 mm") and got 2–4 keys per frame that lay within 3.4e-7 m of the per-frame path
+    for (const ch of json.animations[0].channels)
+      expect(readAccessor(json, bin, json.animations[0].samplers[ch.sampler].input).length).toBe(60);
+    expect(res.warnings?.filter((w) => /curved path/.test(w)) ?? []).toEqual([]);
+  });
+
   it('keeps one key per frame for straight motion', () => {
     const { doc, run } = setup();
     doc.updateScene({ frame_start: 1, frame_end: 24 });

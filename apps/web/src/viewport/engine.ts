@@ -47,7 +47,13 @@ import {
   viewLabel,
   type ViewPose,
 } from './navigation';
-import { SLOW_FRAME_MS, recordFrame, resetFrameClock, slowFrameMs } from '../telemetry/perf';
+import {
+  SLOW_FRAME_MS,
+  recordFrame,
+  resetFrameClock,
+  slowFrameCompiled,
+  slowFrameMs,
+} from '../telemetry/perf';
 import { telemetry } from '../telemetry/telemetry';
 
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
@@ -66,6 +72,20 @@ const FINAL_EVALUATOR_IDLE_MS = 60_000;
  * renders the whole scene once more.
  */
 export const TRANSMISSION_LAYER_TRIANGLES = 1_000_000;
+
+/** Multisampling of the viewport's scene target (smooth edges). */
+export const VIEWPORT_MSAA_SAMPLES = 4;
+/**
+ * A viewport frame that keeps the GPU busy longer than this turns the scene target's multisampling
+ * off ({@link ViewportEngine.multisampling}): software WebGL (SwiftShader, no GPU) rasterizes every
+ * sample, so 4× MSAA makes a heavy scene's frames about four times slower (lighthouse-cove's 2.6 M
+ * triangles in Rendered shading: 3.2 s → 0.8 s per frame). A GPU draws such frames in milliseconds.
+ */
+export const MSAA_OFF_FRAME_MS = 250;
+/** Multisampling comes back once a frame without it takes less than this (MSAA can cost several times more). */
+export const MSAA_ON_FRAME_MS = MSAA_OFF_FRAME_MS / 8;
+/** A frame the GPU has not finished after this long is given up on (it no longer holds frames back). */
+const FENCE_TIMEOUT_MS = 10 * 60_000;
 
 /**
  * Divides colour by alpha (straight alpha) for transparent-film renders: a render over a clear
@@ -204,6 +224,14 @@ export class ViewportEngine {
    */
   private gpuFence: WebGLSync | null = null;
   private gpuFenceStart = 0;
+  /** When that frame's renders started (after the scene sync) and the programs three.js had then. */
+  private gpuRenderStart = 0;
+  private gpuPrograms = 0;
+  /**
+   * Whether the viewport's scene target is multisampled: off while frames are slow (software
+   * WebGL, see {@link MSAA_OFF_FRAME_MS}), on again once they are fast.
+   */
+  multisampling = true;
   imagesRevision = 0;
 
   constructor(
@@ -246,7 +274,10 @@ export class ViewportEngine {
     this.originDots.renderOrder = 19;
     this.overlay.add(this.originDots);
 
-    const rt = new THREE.WebGLRenderTarget(1, 1, { samples: 4, type: THREE.HalfFloatType });
+    const rt = new THREE.WebGLRenderTarget(1, 1, {
+      samples: VIEWPORT_MSAA_SAMPLES,
+      type: THREE.HalfFloatType,
+    });
     this.composer = new EffectComposer(this.renderer, rt);
     this.renderPass = new RenderPass(this.scene, this.perspCam);
     this.overlayPass = new RenderPass(this.overlay, this.perspCam);
@@ -364,40 +395,80 @@ export class ViewportEngine {
     const start = performance.now();
     if (this.needsSync) this.sync();
     this.dirty = false;
+    const renderStart = performance.now();
+    const programs = this.programCount();
     this.render();
     recordFrame(now);
-    this.fenceFrame(start);
+    this.fenceFrame(start, renderStart, programs);
+  }
+
+  /** Shader programs three.js has compiled (a frame that adds some compiled shaders). */
+  private programCount(): number {
+    return this.renderer.info?.programs?.length ?? 0;
   }
 
   /**
-   * Whether the GPU finished the last frame (always true without WebGL2 fences); when it did, its
-   * cost (from the start of the frame) updates {@link slowFrameMs}. A fence pending for more than two
-   * minutes (lost context) is dropped.
+   * Whether the GPU finished the last frame (always true without WebGL2 fences). When it did, its
+   * cost updates {@link slowFrameMs} (from the start of the frame, scene sync included) and the
+   * multisampling ({@link adaptMultisampling}, from the start of its renders). A frame of a lost
+   * context, or not done after {@link FENCE_TIMEOUT_MS}, is given up on.
    */
   private frameDone(): boolean {
     const fence = this.gpuFence;
     if (!fence) return true;
     const gl = this.renderer.getContext?.();
-    const elapsed = performance.now() - this.gpuFenceStart;
-    if (gl && 'getSyncParameter' in gl && elapsed < 120_000) {
+    const now = performance.now();
+    const elapsed = now - this.gpuFenceStart;
+    if (gl && 'getSyncParameter' in gl && !gl.isContextLost?.() && elapsed < FENCE_TIMEOUT_MS) {
       const gl2 = gl as WebGL2RenderingContext;
       if (gl2.getSyncParameter(fence, gl2.SYNC_STATUS) !== gl2.SIGNALED) return false;
       gl2.deleteSync(fence);
     }
     this.gpuFence = null;
+    const compiled = this.programCount() > this.gpuPrograms;
+    this.adaptMultisampling(now - this.gpuRenderStart, compiled);
     const slow = elapsed > SLOW_FRAME_MS && document.visibilityState === 'visible' ? elapsed : 0;
     if (slowFrameMs.value !== slow) slowFrameMs.value = slow;
+    if (slowFrameCompiled.value !== (slow > 0 && compiled)) slowFrameCompiled.value = slow > 0 && compiled;
     return true;
   }
 
-  /** Puts a fence after the frame that started at `start` (WebGL2; see {@link frameDone}). */
-  private fenceFrame(start: number): void {
+  /**
+   * Puts a fence after the frame that started at `start` and rendered from `renderStart` with
+   * `programs` compiled shader programs before it (WebGL2; see {@link frameDone}).
+   */
+  private fenceFrame(start: number, renderStart: number, programs: number): void {
     const gl = this.renderer.getContext?.();
     if (!gl || !('fenceSync' in gl)) return;
     const gl2 = gl as WebGL2RenderingContext;
     this.gpuFence = gl2.fenceSync(gl2.SYNC_GPU_COMMANDS_COMPLETE, 0);
     this.gpuFenceStart = start;
+    this.gpuRenderStart = renderStart;
+    this.gpuPrograms = programs;
     gl2.flush();
+  }
+
+  /**
+   * Turns the scene target's multisampling off after a frame whose renders took longer than
+   * {@link MSAA_OFF_FRAME_MS} and draws the view again without it; turns it back on (and redraws)
+   * once a frame takes less than {@link MSAA_ON_FRAME_MS}. A frame that compiled shaders only counts
+   * as slow: the frame after it shows what the scene itself costs.
+   */
+  private adaptMultisampling(ms: number, compiled: boolean): void {
+    if (this.multisampling && ms > MSAA_OFF_FRAME_MS) this.setMultisampling(false);
+    else if (!this.multisampling && !compiled && ms < MSAA_ON_FRAME_MS) this.setMultisampling(true);
+  }
+
+  private setMultisampling(on: boolean): void {
+    this.multisampling = on;
+    const samples = on ? VIEWPORT_MSAA_SAMPLES : 0;
+    for (const t of [this.composer.renderTarget1, this.composer.renderTarget2]) {
+      if (t.samples === samples) continue;
+      t.samples = samples;
+      // three.js allocates the target again, with the new sample count, when it is next used
+      t.dispose();
+    }
+    this.requestRender();
   }
 
   // ------------------------------------------------------------------ scene sync

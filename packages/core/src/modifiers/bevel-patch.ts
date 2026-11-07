@@ -17,7 +17,10 @@ import type { MeshBuilder } from './util';
  * center is placed so that the patch center lands where a superellipsoid corner with the profile's
  * shape has it: on the sphere for round profiles at a cube corner. When all profiles lie on one
  * sphere (round profiles at a cube-like corner) the interior is projected onto it, so such corners
- * are exact sphere patches, like Blender's cube-corner special case.
+ * are exact sphere patches, like Blender's cube-corner special case. Boxy profiles pull the interior
+ * toward the flat corners of the faces (exactly there for square profiles), and at convex corners
+ * keep it behind the middle faces of the strips (extended along their edges), so the chamfer that
+ * the middle face of an odd segment count cuts continues into the patch instead of notching it.
  */
 
 /** One side of an n-sided patch, in the patch's winding order. */
@@ -30,6 +33,13 @@ export interface PatchSide {
   c: number[];
   /** The caller's tag for the side (the beveled edge or the face it lies in). */
   tag?: number;
+  /**
+   * Direction of the beveled edge whose strip ends in this side (edge bevels), and whether that edge
+   * is convex: the strip's faces run parallel to it, and boxy patches at convex corners stay behind
+   * them (see `fillGridPatch`).
+   */
+  dir?: number[];
+  convex?: boolean;
 }
 
 export interface GridPatchContext {
@@ -250,6 +260,24 @@ function sphereThrough(pts: Pt[]): { c: number[]; r: number } | null {
 }
 
 /**
+ * Moves p onto the plane of the strip face through the side's segment `a`–`b` (extended along the
+ * side's edge `dir`), when p lies beyond it on the side of the profile's corner `c`.
+ */
+function behindFace(p: Pt, side: PatchSide, a: Pt, b: Pt): void {
+  const d = side.dir;
+  if (!d) return;
+  const e = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+  const nrm = [e[1] * d[2] - e[2] * d[1], e[2] * d[0] - e[0] * d[2], e[0] * d[1] - e[1] * d[0]];
+  const l = Math.hypot(nrm[0], nrm[1], nrm[2]);
+  if (!(l > 1e-12 * (Math.hypot(e[0], e[1], e[2]) * Math.hypot(d[0], d[1], d[2])))) return;
+  let sgn = 1 / l;
+  if ((side.c[0] - a[0]) * nrm[0] + (side.c[1] - a[1]) * nrm[1] + (side.c[2] - a[2]) * nrm[2] < 0) sgn = -sgn;
+  const n = [nrm[0] * sgn, nrm[1] * sgn, nrm[2] * sgn];
+  const over = (p[0] - a[0]) * n[0] + (p[1] - a[1]) * n[1] + (p[2] - a[2]) * n[2];
+  if (over > 0) for (let q = 0; q < 3; q++) p[q] -= over * n[q];
+}
+
+/**
  * Fills an n-sided vertex patch (n ≥ 3 sides of S ≥ 2 segments that share their end points, in the
  * winding order the patch faces get) with a quad grid; see the file comment. `corner` is the original
  * vertex position and `fullness` the fraction of the way from the corners' centroid toward it where
@@ -304,6 +332,7 @@ export function fillGridPatch(
   // columns k ≤ m (plus the center for even S); the other grid positions are shared with neighbours
   const m = Math.floor(S / 2);
   const odd = S % 2;
+  const convex = boxiness > 0 && sides.every((s) => s.dir && s.convex);
   const newVertex = (p: Pt, i: number, j: number, k: number): number => {
     if (sphere) {
       const d = [p[0] - sphere.c[0], p[1] - sphere.c[1], p[2] - sphere.c[2]];
@@ -343,6 +372,17 @@ export function fillGridPatch(
               const coons = (1 - w) * g0[q] + w * g1 + (1 - u) * d0[q] + u * d1 - bil;
               p[q] += boxiness * (coons - p[q]);
             }
+            // at a convex corner the patch stays behind the middle faces of the two strips ending here
+            // (extended along their edges): with an odd segment count the middle face cuts the
+            // edge's corner off (a chamfer), and a patch rising back toward the corner between them
+            // left a notch at every such vertex (a cylinder rim with limit_method NONE)
+            if (convex)
+              for (const s of [i, prev])
+                if (odd) behindFace(p, sides[s], sample(s, m / S), sample(s, (m + 1) / S));
+                else {
+                  behindFace(p, sides[s], sample(s, (m - 1) / S), sample(s, m / S));
+                  behindFace(p, sides[s], sample(s, m / S), sample(s, (m + 1) / S));
+                }
           }
           row.push(newVertex(p, i, j, k));
         }

@@ -6,6 +6,7 @@ import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
 import { ViewportEngine } from '../src/viewport/engine';
 import { CameraFrame, InfoOverlay, PeerCursors } from '../src/ui/Viewport';
+import { slowFrameCompiled, slowFrameMs } from '../src/telemetry/perf';
 
 /*
  * The viewport's Overlays toggle hides every overlay, like Blender: the object helpers (cameras,
@@ -221,5 +222,54 @@ describe('viewport overlays toggle', () => {
     });
     expect(q('viewport-info')).not.toBeNull();
     expect(q('camera-frame')).not.toBeNull();
+  });
+});
+
+describe('slow viewport notice', () => {
+  afterEach(() => {
+    slowFrameMs.value = 0;
+    slowFrameCompiled.value = false;
+  });
+
+  it('says how long a slow frame took, under the text info and above the statistics', () => {
+    // regression: Rendered shading of a heavy scene in software WebGL drew for minutes with nothing
+    // on screen saying so
+    const s = session();
+    const { container } = render(<InfoOverlay s={s} />);
+    const q = (id: string) => container.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+    expect(q('viewport-slow-frame')).toBeNull();
+    act(() => {
+      slowFrameMs.value = 12_500;
+    });
+    const notice = q('viewport-slow-frame')!;
+    expect(notice.textContent).toBe('Slow viewport: 13 s per frame');
+    expect(notice.title).toContain('Solid shading is much faster');
+    // one column: the notice ends the text info, the statistics follow it (they overlapped)
+    expect(q('viewport-info')!.contains(notice)).toBe(true);
+    expect(q('viewport-info')!.parentElement).toBe(q('viewport-stats')!.parentElement);
+    expect(q('viewport-info')!.nextElementSibling).toBe(q('viewport-stats'));
+    act(() => {
+      slowFrameMs.value = 3_240;
+    });
+    expect(q('viewport-slow-frame')!.textContent).toBe('Slow viewport: 3.2 s per frame');
+    // the first frame in Rendered shading compiles the shaders: later ones are faster
+    act(() => {
+      slowFrameMs.value = 51_000;
+      slowFrameCompiled.value = true;
+    });
+    expect(q('viewport-slow-frame')!.textContent).toBe(
+      'Slow viewport: 51 s for the last frame (compiling shaders)',
+    );
+    // hidden with the overlays, gone once frames are fast again
+    act(() => {
+      s.view.overlays.value = false;
+    });
+    expect(q('viewport-slow-frame')).toBeNull();
+    act(() => {
+      s.view.overlays.value = true;
+      slowFrameMs.value = 0;
+    });
+    expect(q('viewport-info')).not.toBeNull();
+    expect(q('viewport-slow-frame')).toBeNull();
   });
 });

@@ -1602,7 +1602,10 @@ function BoneIkPanel({
           ? `Used by ${chains.map((c) => `${c.constraint} (${c.owner})`).join(', ')}.`
           : 'No IK chain contains this bone yet: these settings apply once an IK constraint’s chain includes it.'}
       </div>
-      <Row label="Lock IK" title="The IK solver may not rotate the bone about these axes (Y runs along the bone)">
+      <Row
+        label="Lock IK"
+        title="The IK solver may not rotate the bone about these axes (Y runs along the bone)"
+      >
         <div style={{ display: 'flex', gap: '10px' }}>
           {IK_AXES.map((a) => (
             <Checkbox

@@ -20,7 +20,7 @@ import { Panel, Row, SelectField, NumberField, ColorField, Checkbox } from './fi
 import { TransformFields } from './properties/ObjectTab';
 import { NavGizmo } from './NavGizmo';
 import { importFiles } from '../io/import-export';
-import { fps, slowFrameMs } from '../telemetry/perf';
+import { fps, slowFrameCompiled, slowFrameMs } from '../telemetry/perf';
 import type { ToolId } from '../editor/state';
 
 function BrushSettings({ s }: { s: ProjectSession }) {
@@ -257,9 +257,10 @@ export function InfoOverlay({ s }: { s: ProjectSession }) {
   const mode = s.state.$mode.value;
   const sel = s.state.$meshSelection.value;
   const slow = slowFrameMs.value;
+  // one column: the info grows (slow-frame notice) without running into the statistics
   return (
-    <>
-      <div class="viewport-overlay viewport-info" data-testid="viewport-info">
+    <div class="viewport-overlay viewport-corner">
+      <div class="viewport-info" data-testid="viewport-info">
         <div>{label}</div>
         <div>
           ({Math.round(frame)}) Scene Collection{active ? ` | ${active.name}` : ''}
@@ -269,17 +270,20 @@ export function InfoOverlay({ s }: { s: ProjectSession }) {
             class="viewport-slow"
             data-testid="viewport-slow-frame"
             title={
-              'The last frame took this long to draw. Rendered shading of a heavy scene (many triangles, ' +
-              'shadow-casting lamps, area lights) is slow in software WebGL; Solid or Material Preview ' +
-              'shading is much faster, and F12 / the path tracer renders the final image.'
+              'The last frame took this long to draw. Without GPU acceleration (software WebGL) heavy ' +
+              'scenes are slow: the first frame in Material Preview or Rendered shading compiles the ' +
+              'shaders of every material and light combination, and while frames stay slow the view is ' +
+              'drawn without anti-aliasing. Solid shading is much faster; F12 or the path tracer renders ' +
+              'the final image.'
             }
           >
-            Slow viewport: {(slow / 1000).toFixed(slow < 10_000 ? 1 : 0)} s per frame
+            Slow viewport: {(slow / 1000).toFixed(slow < 10_000 ? 1 : 0)} s
+            {slowFrameCompiled.value ? ' for the last frame (compiling shaders)' : ' per frame'}
           </div>
         )}
       </div>
       {stats && (
-        <div class="viewport-overlay viewport-stats" data-testid="viewport-stats">
+        <div class="viewport-stats" data-testid="viewport-stats">
           <div>
             Objects {s.state.$selectedIds.value.length}/{stats.objects}
           </div>
@@ -294,7 +298,7 @@ export function InfoOverlay({ s }: { s: ProjectSession }) {
           <div>{fps.value ? `${fps.value} fps` : ''}</div>
         </div>
       )}
-    </>
+    </div>
   );
 }
 

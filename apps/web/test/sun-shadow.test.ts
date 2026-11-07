@@ -419,7 +419,10 @@ describe('sun shadow normal offset per face', () => {
         vertexShader: THREE.ShaderLib.physical.vertexShader,
         fragmentShader: THREE.ShaderLib.physical.fragmentShader,
       };
-      mat.onBeforeCompile(s as unknown as THREE.WebGLProgramParametersWithUniforms, {} as THREE.WebGLRenderer);
+      mat.onBeforeCompile(
+        s as unknown as THREE.WebGLProgramParametersWithUniforms,
+        {} as THREE.WebGLRenderer,
+      );
       expect(s.vertexShader).toContain('pfxSunNormalOffsetScale( shadowWorldNormal');
       keys.add(mat.customProgramCacheKey());
     }

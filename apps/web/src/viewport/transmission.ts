@@ -49,7 +49,8 @@ export interface TransmissionUniforms {
 }
 
 /** three.js's transmission lookup (transmission_pars_fragment), validated against the picture's depth. */
-const SAMPLE_FUNCTION = 'vec4 getTransmissionSample( const in vec2 fragCoord, const in float roughness, const in float ior ) {';
+const SAMPLE_FUNCTION =
+  'vec4 getTransmissionSample( const in vec2 fragCoord, const in float roughness, const in float ior ) {';
 const SAMPLE_LINE = 'return textureBicubic( transmissionSamplerMap, fragCoord.xy, lod );';
 const DEPTH_FUNCTION = `uniform sampler2D pfxTransmissionDepth;
 	// distance along the view axis of a window depth of the picture (same projection as this draw)
@@ -251,7 +252,8 @@ function screenRect(box: THREE.Box3, camera: THREE.Camera): [number, number, num
 }
 
 /** The materials of a mesh. */
-const materialsOf = (m: THREE.Mesh): THREE.Material[] => (Array.isArray(m.material) ? m.material : [m.material]);
+const materialsOf = (m: THREE.Mesh): THREE.Material[] =>
+  Array.isArray(m.material) ? m.material : [m.material];
 
 /** Draws the pictures transmissive objects refract (see the module comment). */
 export class TransmissionLayers {

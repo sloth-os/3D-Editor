@@ -344,8 +344,7 @@ export class SceneObjects {
     const showWire =
       !isEdit &&
       (opts.shading === 'WIREFRAME' ||
-        (opts.overlays &&
-          (opts.showWireOverlay || o.data.show_wire || o.data.display_type === 'WIRE')));
+        (opts.overlays && (opts.showWireOverlay || o.data.show_wire || o.data.display_type === 'WIRE')));
     if (showWire) {
       const wk = `${v.meshKey}`;
       if (!v.wire || v.wireKey !== wk) {

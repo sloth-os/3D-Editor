@@ -6,6 +6,7 @@ import {
   SceneEvaluator,
   createFCurve,
   createOperatorRegistry,
+  createUVSphere,
   insertKeyframe,
   renderItems,
   renderSceneSoftware,
@@ -17,8 +18,15 @@ import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
 import { renderOutputSize, type PathTraceOptions } from '../src/render';
 import { applyLensShift, sceneCameraView } from '../src/render/view';
-import { ViewportEngine } from '../src/viewport/engine';
-import { lightIntensity, spotCone } from '../src/viewport/scene-objects';
+import {
+  MSAA_OFF_FRAME_MS,
+  MSAA_ON_FRAME_MS,
+  VIEWPORT_MSAA_SAMPLES,
+  ViewportEngine,
+} from '../src/viewport/engine';
+import type { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { LOCAL_SHADOW_LAYER, lightIntensity, spotCone } from '../src/viewport/scene-objects';
+import { SLOW_FRAME_MS, slowFrameCompiled, slowFrameMs } from '../src/telemetry/perf';
 import { viewTransformParams, viewTransformPixel } from '../src/viewport/view-transform';
 
 /*
@@ -44,6 +52,9 @@ interface RecordingRenderer {
   readPixels: (buffer: Uint8Array) => void;
   /** Called on every `render(scene, camera)`, to look at the scene as it is drawn. */
   onRender: ((scene: THREE.Object3D) => void) | null;
+  /** What `getContext()` returns (null: no WebGL2 fences). */
+  context: unknown;
+  info: { programs: unknown[] };
 }
 
 vi.mock('three', async (importOriginal) => {
@@ -62,6 +73,13 @@ vi.mock('three', async (importOriginal) => {
     renders: RecordingRenderer['renders'] = [];
     readPixels: RecordingRenderer['readPixels'] = (b) => b.fill(0);
     onRender: RecordingRenderer['onRender'] = null;
+    /** The WebGL context `getContext()` returns (a fence stand-in in frame pacing tests). */
+    context: unknown = null;
+    /** Compiled shader programs (tests add some to stand for a frame that compiles shaders). */
+    info = { programs: [] as unknown[] };
+    getContext() {
+      return this.context;
+    }
     private clearColor = new three.Color(0, 0, 0);
     private clearAlpha = 1;
     private target: unknown = null;
@@ -181,9 +199,17 @@ function engine(s: ProjectSession): { e: ViewportEngine; gl: RecordingRenderer }
   return { e, gl: e.renderer as unknown as RecordingRenderer };
 }
 
+/**
+ * The renders that drew the scene's objects, in order: not the shadow-only render of the point and
+ * spot light shadow maps (SceneObjects.renderLocalShadows), whose camera sees no object layer.
+ */
+function scenePasses(e: ViewportEngine, gl: RecordingRenderer): RecordingRenderer['renders'] {
+  return gl.renders.filter((x) => x.scene === e.scene && x.camera.layers.isEnabled(0));
+}
+
 /** The camera that drew the scene in the last render. */
 function sceneCamera(e: ViewportEngine, gl: RecordingRenderer): THREE.Camera {
-  const r = gl.renders.filter((x) => x.scene === e.scene).at(-1);
+  const r = scenePasses(e, gl).at(-1);
   if (!r) throw new Error('the scene was not rendered');
   return r.camera;
 }
@@ -321,12 +347,12 @@ describe('viewport render entry points', () => {
       b.set([200, 100, 50, 128], 4);
     };
     let img = e.renderPixels({ width: 16, height: 16 });
-    expect(gl.renders.find((r) => r.scene === e.scene)?.clearAlpha).toBe(1);
+    expect(scenePasses(e, gl)[0]?.clearAlpha).toBe(1);
     expect(img.data[3]).toBe(255);
     s.doc.updateRender({ film_transparent: true });
     gl.renders.length = 0;
     img = e.renderPixels({ width: 16, height: 16 });
-    expect(gl.renders.find((r) => r.scene === e.scene)?.clearAlpha).toBe(0);
+    expect(scenePasses(e, gl)[0]?.clearAlpha).toBe(0);
     // straight alpha is kept; fully transparent pixels are black
     const last = img.data.length - 16 * 4; // bottom row first in WebGL: the top row of the image
     expect([...img.data.subarray(last, last + 8)]).toEqual([0, 0, 0, 0, 200, 100, 50, 128]);
@@ -1003,5 +1029,235 @@ describe('render output size', () => {
     expect(renderOutputSize(1920, 1080, 15)).toMatchObject({ width: 288, height: 162, scaled: false });
     expect(renderOutputSize(1920, 1080, 1)).toMatchObject({ width: 19, height: 11, scaled: false });
     expect(renderOutputSize(4, 4, 1)).toMatchObject({ width: 1, height: 1, scaled: false });
+  });
+});
+
+describe('heavy scenes in Rendered shading', () => {
+  /** Runs one turn of the viewport's frame loop (what requestAnimationFrame would run). */
+  const frame = (e: ViewportEngine) => (e as unknown as { loop(now: number): void }).loop(performance.now());
+  /** The shadow-only renders that draw the point and spot light shadow maps. */
+  const shadowPasses = (e: ViewportEngine, gl: RecordingRenderer) =>
+    gl.renders.filter((r) => r.scene === e.scene && r.camera.layers.mask === 1 << LOCAL_SHADOW_LAYER);
+  const instancedMeshes = (e: ViewportEngine) => {
+    const out: THREE.InstancedMesh[] = [];
+    e.scene.traverse((o) => {
+      if ((o as THREE.InstancedMesh).isInstancedMesh) out.push(o as THREE.InstancedMesh);
+    });
+    return out;
+  };
+  /** A session whose ground scatters `count` rocks of about 4,000 triangles (the default point light casts shadows). */
+  function scatterScene(count: number): ProjectSession {
+    const s = session();
+    const rock = s.doc.addObject({
+      name: 'Rock',
+      type: 'MESH',
+      data: s.doc.addMesh('Rock', createUVSphere({ segments: 64, ring_count: 32, radius: 0.05 })),
+      location: [0, 0, -30],
+    });
+    ok(s, 'mesh.primitive_plane_add', { size: 20 });
+    const ground = s.doc.listObjects().find((o) => o.name === 'Plane')!;
+    ok(s, 'object.particle_system_add', {
+      object: ground.id,
+      settings: { count, instance_type: 'OBJECT', instance_object: rock },
+    });
+    s.view.shading.value = 'RENDERED';
+    return s;
+  }
+
+  afterEach(() => {
+    slowFrameMs.value = 0;
+    slowFrameCompiled.value = false;
+    vi.restoreAllMocks();
+  });
+
+  /** A stand-in WebGL2 context whose frame fences the test completes (`fences[i].done = true`). */
+  function fenceContext(gl: RecordingRenderer) {
+    const SIGNALED = 0x9119;
+    const fences: { done: boolean }[] = [];
+    gl.context = {
+      SYNC_STATUS: 0x9114,
+      SIGNALED,
+      SYNC_GPU_COMMANDS_COMPLETE: 0x9117,
+      fenceSync: () => {
+        const f = { done: false };
+        fences.push(f);
+        return f;
+      },
+      getSyncParameter: (f: { done: boolean }) => (f.done ? SIGNALED : 0x9118),
+      deleteSync: () => undefined,
+      flush: () => undefined,
+      isContextLost: () => false,
+    };
+    return fences;
+  }
+
+  it('draws point and spot light shadow maps after scene changes, not for every frame', () => {
+    // regression: every frame drew the point light's six cube faces again, also while only the view moved
+    const s = session();
+    s.view.shading.value = 'RENDERED';
+    const { e, gl } = engine(s);
+    frame(e);
+    expect(shadowPasses(e, gl)).toHaveLength(1);
+    // the view moves: the maps, which do not depend on it, are kept
+    for (let i = 0; i < 3; i++) {
+      e.requestRender();
+      frame(e);
+    }
+    expect(scenePasses(e, gl)).toHaveLength(4);
+    expect(shadowPasses(e, gl)).toHaveLength(1);
+    // the scene changes: they are drawn again before the next frame's renders
+    const cube = s.doc.listObjects().find((o) => o.type === 'MESH')!;
+    s.doc.updateObject(cube.id, { location: [0, 0, 1] });
+    frame(e);
+    expect(shadowPasses(e, gl)).toHaveLength(2);
+    const last = gl.renders.findIndex((r) => r === shadowPasses(e, gl)[1]);
+    expect(gl.renders.slice(last + 1).some((r) => r.scene === e.scene && r.camera.layers.isEnabled(0))).toBe(
+      true,
+    );
+  });
+
+  it('leaves big instance scatters out of point and spot light shadows; they keep the sun’s', () => {
+    // regression: lighthouse-cove's 2.5 M instance triangles were drawn 14 times more per frame for the
+    // shadow maps of two point lights (six cube faces each) and two spot lights
+    const castingInShadowPass = (count: number) => {
+      const s = scatterScene(count);
+      const { e, gl } = engine(s);
+      const casting: boolean[][] = [];
+      gl.onRender = () => {
+        if (gl.renders.at(-1)!.camera.layers.mask === 1 << LOCAL_SHADOW_LAYER)
+          casting.push(instancedMeshes(e).map((im) => im.castShadow));
+      };
+      frame(e);
+      expect(instancedMeshes(e).length).toBeGreaterThan(0);
+      // in the frame's renders (the sun's shadow map is drawn in them) the instances cast shadows
+      expect(instancedMeshes(e).every((im) => im.castShadow)).toBe(true);
+      return { casting, skip: e.objects.localShadowsSkipInstances };
+    };
+    // 400 rocks × ~4,000 triangles × six cube faces is over the budget
+    const heavy = castingInShadowPass(400);
+    expect(heavy.casting).toEqual([heavy.casting[0].map(() => false)]);
+    expect(heavy.skip).toBe(true);
+    // a small scatter keeps casting point light shadows
+    const light = castingInShadowPass(20);
+    expect(light.casting).toEqual([light.casting[0].map(() => true)]);
+    expect(light.skip).toBe(false);
+  });
+
+  it('draws one transmission picture in heavy scenes, levels for nested glass otherwise', () => {
+    const glassScene = (count: number) => {
+      const s = count ? scatterScene(count) : session();
+      s.view.shading.value = 'RENDERED';
+      ok(s, 'mesh.primitive_uv_sphere_add', { radius: 1, location: [0, 0, 3] });
+      ok(s, 'mesh.primitive_uv_sphere_add', { radius: 0.5, location: [0, 0, 3] });
+      for (const o of s.doc.listObjects().filter((x) => x.name.startsWith('Sphere'))) {
+        s.state.selectedIds = [o.id];
+        s.state.activeId = o.id;
+        ok(s, 'material.new', { name: `Glass ${o.name}`, transmission: 1, roughness: 0 });
+      }
+      s.state.selectedIds = [];
+      s.state.activeId = null;
+      return s;
+    };
+    const pictures = (s: ProjectSession) => {
+      const { e } = engine(s);
+      frame(e);
+      return (e as unknown as { transmission: { lastPictures: number } }).transmission.lastPictures;
+    };
+    // the inner sphere is seen through the outer one: two levels
+    expect(pictures(glassScene(0))).toBe(2);
+    // with 1.6 M instance triangles each level would render them once more
+    expect(pictures(glassScene(400))).toBe(1);
+  });
+
+  it('starts no frame while the GPU draws the last one, and says how long a slow frame took', () => {
+    // regression: in software WebGL a heavy frame drew for minutes with frames queueing behind it
+    // and nothing on screen saying so
+    const s = session();
+    const { e, gl } = engine(s);
+    const fences = fenceContext(gl);
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    frame(e);
+    expect(scenePasses(e, gl)).toHaveLength(1);
+    expect(fences).toHaveLength(1);
+    // the view keeps changing while the GPU is busy: no frame is started
+    now += 5000;
+    e.requestRender();
+    frame(e);
+    frame(e);
+    expect(scenePasses(e, gl)).toHaveLength(1);
+    expect(slowFrameMs.value).toBe(0);
+    // the frame is done after 12.5 s: the next one starts and the notice says how long it took
+    now += 7500;
+    fences[0].done = true;
+    frame(e);
+    expect(scenePasses(e, gl)).toHaveLength(2);
+    expect(slowFrameMs.value).toBe(12_500);
+    // a fast frame clears it
+    now += SLOW_FRAME_MS / 4;
+    fences[1].done = true;
+    e.requestRender();
+    frame(e);
+    expect(scenePasses(e, gl)).toHaveLength(3);
+    expect(slowFrameMs.value).toBe(0);
+  });
+
+  it('draws without multisampling while frames are slow, with it again once they are fast', () => {
+    // regression: software WebGL rasterizes every MSAA sample: lighthouse-cove's Rendered frames took
+    // 3.2 s with 4× MSAA and 0.8 s without
+    const s = session();
+    const { e, gl } = engine(s);
+    const fences = fenceContext(gl);
+    const composer = (e as unknown as { composer: EffectComposer }).composer;
+    const samples = () => [composer.renderTarget1.samples, composer.renderTarget2.samples];
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    /** Finishes the frame in flight after `ms` and runs the loop once (with a view change if asked). */
+    const finish = (ms: number, change = false) => {
+      now += ms;
+      fences.at(-1)!.done = true;
+      if (change) e.requestRender();
+      frame(e);
+    };
+    frame(e);
+    expect(samples()).toEqual([VIEWPORT_MSAA_SAMPLES, VIEWPORT_MSAA_SAMPLES]);
+    // a slow frame: multisampling goes off and the view is drawn again without it, unasked
+    finish(MSAA_OFF_FRAME_MS + 50);
+    expect(e.multisampling).toBe(false);
+    expect(samples()).toEqual([0, 0]);
+    expect(scenePasses(e, gl)).toHaveLength(2);
+    // frames without it that are not fast enough keep it off
+    finish(MSAA_ON_FRAME_MS * 3, true);
+    expect(e.multisampling).toBe(false);
+    expect(scenePasses(e, gl)).toHaveLength(3);
+    // a fast one brings it back, and the view is drawn again with it
+    finish(MSAA_ON_FRAME_MS / 2);
+    expect(e.multisampling).toBe(true);
+    expect(samples()).toEqual([VIEWPORT_MSAA_SAMPLES, VIEWPORT_MSAA_SAMPLES]);
+    expect(scenePasses(e, gl)).toHaveLength(4);
+    // a frame that compiled shaders (the first one in Rendered shading) only counts as slow
+    gl.onRender = () => gl.info.programs.push({});
+    finish(MSAA_ON_FRAME_MS / 2, true);
+    gl.onRender = null;
+    expect(scenePasses(e, gl)).toHaveLength(5);
+    finish(SLOW_FRAME_MS + 1000);
+    expect(e.multisampling).toBe(false);
+    expect(slowFrameMs.value).toBe(SLOW_FRAME_MS + 1000);
+    expect(slowFrameCompiled.value).toBe(true);
+    // the frame after it (drawn unasked, no new shaders) shows what the scene costs
+    expect(scenePasses(e, gl)).toHaveLength(6);
+    finish(MSAA_ON_FRAME_MS / 2);
+    expect(e.multisampling).toBe(true);
+    expect(slowFrameMs.value).toBe(0);
+    expect(slowFrameCompiled.value).toBe(false);
+    // fast frames that compile shaders do not bring multisampling back
+    gl.onRender = () => gl.info.programs.push({});
+    finish(MSAA_OFF_FRAME_MS * 2);
+    expect(e.multisampling).toBe(false);
+    finish(MSAA_ON_FRAME_MS / 2, true);
+    expect(e.multisampling).toBe(false);
+    finish(MSAA_ON_FRAME_MS / 2, true);
+    expect(e.multisampling).toBe(false);
+    gl.onRender = null;
   });
 });

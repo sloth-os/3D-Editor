@@ -701,15 +701,19 @@ select.select {
   color: #ddd;
   text-shadow: 0 1px 2px #000;
 }
-.viewport-info {
+/* the text info above the statistics, in one column */
+.viewport-corner {
   top: 8px;
   left: 50px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.viewport-info {
   font-size: 12px;
   line-height: 1.5;
 }
 .viewport-stats {
-  top: 50px;
-  left: 50px;
   font-size: 11px;
   font-family: var(--mono);
   color: #ccc;
