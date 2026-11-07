@@ -105,12 +105,15 @@ driver sets it. The outliner lists the beam's two shaft cones under it.
 
 ## scene.glb
 
-`--export-only` (or `--export`) writes `scene.glb` with `export_scene {format: glb, objects}`.
-The export runs on a server render thread and takes 10–20 s. It holds every object the renders
-show except the four cloud streaks: they are flat shapes 0.8–1 km away that glow in the mist
-colour and only read through the world mist, which glTF cannot carry (nor the sky). Leaving them
-out keeps the file under 6 MB (5.64 MB; with the clouds it would be 7.5 MB) and lets a viewer that
-frames the whole scene frame the island and the 600 m sea rather than a 2 km box of sky.
+`--export-only` (or `--export`) writes `scene.glb` with `export_scene {format: glb, objects,
+bake_resolution: 512}`. The export runs on a server render thread and takes 10–20 s. It holds every
+object the renders show except the four cloud streaks: they are flat shapes 0.8–1 km away that glow
+in the mist colour and only read through the world mist, which glTF cannot carry (nor the sky).
+Leaving them out keeps the file under 6 MB (5.85 MB; with the clouds it would be 7.7 MB) and lets a
+viewer that frames the whole scene frame the island and the 600 m sea rather than a 2 km box of sky.
+The procedural textures are baked at 512 × 512 pixels: at the exporter's automatic size (about
+64 texels per metre, which gives 2048 pixels for the island's ground and rock textures) the file
+would be 26 MB.
 
 What the file contains:
 
@@ -119,9 +122,11 @@ What the file contains:
   10 lights (`KHR_lights_punctual`) and the camera.
 - The 2,770 scattered pines, rocks, tufts and bushes as nodes that share 9 meshes. The whole
   file has 2.6 M triangles.
-- 34 materials. The procedural textures are baked into 24 PNG images. The lantern glass and the
-  beam shafts use `KHR_materials_transmission` and `KHR_materials_ior`, and the lamps and the lit
-  windows `KHR_materials_emissive_strength`.
+- 34 materials. The procedural textures are baked into 24 PNG images. `Jetty Planks` and
+  `Lighthouse Stone` are baked once per mesh that uses them, because their textures depend on the
+  surface, so they appear twice (the copies are named `Jetty Planks.001` and
+  `Lighthouse Stone.001`). The lantern glass and the beam shafts use `KHR_materials_transmission`
+  and `KHR_materials_ior`, and the lamps and the lit windows `KHR_materials_emissive_strength`.
 - One animation, `Scene`: the driven heading of both beams, sampled once per frame (24 keys at
   24 fps, 0–0.958 s). The clip ends on frame 24, so a player that loops it goes from frame 24
   straight back to frame 1 (which looks like frame 25, since the two beams are alike) without
@@ -133,11 +138,19 @@ The export warnings:
   lighthouse, not on the point between the cottage and the tower.
 - `Area light 'Cottage Window Light 1' exported as a point light`, and the same for window lights
   2 to 6.
+- `Mesh 'LH Plinth': its UVs overlap (17% of the UV layout is used by more than one face): generated
+  UVs (Smart UV Project) replace them to bake the procedural textures of 'Lighthouse Stone'`, and
+  the same for `LH Steps` (100 %) and for `Stone Path` (100 %, `Path Stones`). The exporter unwraps
+  these meshes itself, so every face gets its own part of the baked images.
+- `Material 'Jetty Planks' is exported as 2 glTF materials (Jetty Planks, Jetty Planks.001): its
+  procedural textures depend on the surface (GENERATED/OBJECT mapping or a bump), so they are baked
+  for each mesh`, and the same for `Lighthouse Stone`.
 
 Checked with the repository's glTF validator (`packages/core/test/fixes-export-gltf-check.ts`:
-no problems) and with three.js `GLTFLoader` in headless Chromium: the file loads (2,889 meshes,
-8 point and 2 spot lights, 1 camera) and the `Scene` clip turns the beams 7.5° per frame, as in
-the editor. It has no skins and no morph targets, because the scene has none.
+no problems) and with three.js r187 `GLTFLoader` in headless Chromium: the file loads without
+console messages (2,889 meshes, 8 point and 2 spot lights, 1 camera, 34 materials, 24 textures)
+and the `Scene` clip turns the beams 7.5° per frame, as in the editor. It has no skins and no
+morph targets, because the scene has none.
 
 ## Editor features this project exercises
 
@@ -180,9 +193,10 @@ The MCP tools it calls: `list_projects`, `delete_project`, `create_project`,
 `get_scene`, `set_active_camera`, `render_image`, `render_animation` and `export_scene`.
 
 Scene size: 71 objects (55 meshes, 2 curves, 1 text, 10 lights, 2 empties, 1 camera; the Boolean
-cutter, the path profile and the 9 scatter sources are hidden), 65k vertices and 107k faces
-evaluated (129k triangles), plus 2,770 scattered instances (2.5 M instance triangles). There are 33
-materials, all in use, and 2 drivers.
+cutter, the path profile and the 9 scatter sources are hidden from renders). The objects that
+render have 60k vertices and 98k faces evaluated (118k triangles), and the 11 hidden ones another
+5.5k vertices (`get_scene` lists them under `not_rendered`). The 2,770 scattered instances add
+2.5 M triangles. There are 33 materials, all in use, and 2 drivers.
 
 ## Final production run
 
@@ -206,9 +220,11 @@ machine's 4 cores were shared with other agents (load average 4–16). Exit code
 | `preview.gif` | 24 frames, 480×270, 10 fps, path tracer, 16 spp, denoise, Floyd–Steinberg dither | 288.7 s | 24 frames, every frame at 16 spp, 0.96 MB |
 | **Total** | | **719.7 s (12.0 min)** | |
 
-The saved project (`document.ybin` in the server's data directory) is 6.6 MB. `scene.glb` comes
-from an `--export-only` run on the same editor code, and `editor.png` from a project built with
-`--build-only` on it.
+The saved project (`document.ybin` in the server's data directory) is 6.6 MB. `editor.png` comes
+from a project built with `--build-only` on the same editor code. `scene.glb` comes from an
+`--export-only` run on the final code (2026-11-07, after the last fixes to the exporter; export
+11 s, whole run 15 s). A preview path-traced on that code (640×360, 24 spp) matches `render.png`,
+so the renders were kept.
 
 ## Known limitations
 

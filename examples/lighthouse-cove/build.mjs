@@ -1837,8 +1837,10 @@ async function exportScene() {
   const objects = s.objects
     .filter((o) => !o.hide_render && !hidden.has(o.collection) && !/^Cloud \d+$/.test(o.name))
     .map((o) => o.name);
+  // The procedural textures are baked at 512 × 512 (bake_resolution). The automatic size (about
+  // 64 texels per metre: 2048 px for the island's ground and rock textures) gives a 26 MB file.
   const t = Date.now();
-  const ex = await tool('export_scene', { format: 'glb', objects, frame: 1 });
+  const ex = await tool('export_scene', { format: 'glb', objects, frame: 1, bake_resolution: 512 });
   const text = ex.text ?? {};
   stats.export = {
     seconds: (Date.now() - t) / 1000,

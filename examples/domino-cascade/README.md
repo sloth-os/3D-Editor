@@ -123,7 +123,10 @@ How `build.mjs` checks the simulation before baking it:
   frame and the showcase camera's tracked rotation.
 * **bake** – `rigidbody.bake_to_keyframes` turns the motion of the 61 active bodies into keyframes
   and the script checks with `get_object` that the keys reproduce the simulated positions
-  (max. difference 0.084 mm). A project that is already baked is left as it is.
+  (max. difference 0.084 mm). The baked objects lose their rigid bodies; `rigidbody.describe`
+  still lists them, with `motion: KEYFRAMED` and the baked range. `build.mjs` tells a baked
+  project from a fresh one by the missing rigid bodies plus the keyframes (`get_object …
+  animation`), and leaves a project that is already baked as it is.
 
 The final production run (see below) logged:
 
@@ -152,7 +155,7 @@ bake:      61 bodies, 4077 keyframes; baked keys vs simulation: max position dif
 ## scene.glb
 
 `--export-only` rebuilds the scene and writes `scene.glb` with `export_scene {format: 'glb',
-frame: 1}`: 988 KiB (1,012,144 bytes), exported in 6.6 s.
+frame: 1}`: 1.03 MiB (1,083,424 bytes), exported in 5.8 s.
 
 * **Nodes** – 81, one per object, at their frame-1 pose: 74 meshes (20,042 triangles), the three
   cameras (perspective, 45 mm and 35 mm as `yfov`), the two lights (`KHR_lights_punctual`) and the
@@ -161,28 +164,34 @@ frame: 1}`: 988 KiB (1,012,144 bytes), exported in 6.6 s.
   `KHR_materials_clearcoat`) and dark wood, the glass marble (`KHR_materials_transmission`),
   aluminium, the four toy-block colours, parquet, plaster and beech. The procedural textures are
   baked into 12 PNG images (512 × 512): the oak's board colour, roughness and grain bump (as a
-  normal map), the parquet's colour and the beech's colour and bump. Beech is baked once per dowel
-  (4 materials), because its bake depends on each dowel's mesh.
+  normal map), the parquet's colour and the beech's colour and bump. The UVs of the generated
+  table overlap, so the exporter unwraps the table itself for the oak's bakes. Beech is baked once
+  per dowel (4 materials, `Beech` to `Beech.003`), because its bake depends on each dowel's mesh.
 * **Animation** – one clip, `Scene`, frames 1–100 sampled at 24 fps (100 LINEAR keys, 0–4.125 s):
   translation and rotation of the 60 dominoes and the marble (the baked simulation), of the
   `Showcase Cam` (its Track To constraint is baked into the rotation) and translation of the
-  `Focus Target` and `Showcase Target` empties: 126 channels on 64 nodes. The scene has no
-  armatures or shape keys, so the file has no skins or morph targets.
-* **Export warnings** (both expected):
+  `Focus Target` and `Showcase Target` empties: 126 channels on 64 nodes. The `Focus Target`'s
+  linear keys lie between frames (30.07, 35.15 …), so its path bends inside some frame intervals;
+  the exporter adds a key in the middle of the 5 intervals where that matters (105 keys). The scene
+  has no armatures or shape keys, so the file has no skins or morph targets.
+* **Export warnings** (all expected):
   * `Area light 'Key Light' exported as a point light`
   * `Area light 'Rim Light' exported as a point light`
+  * `Mesh 'Table': its UVs overlap (100% of the UV layout is used by more than one face): generated
+    UVs (Smart UV Project) replace them to bake the procedural textures of 'Wood'`
+  * `Material 'Beech' is exported as 4 glTF materials (Beech, Beech.001 … Beech.003): its
+    procedural textures depend on the surface (GENERATED/OBJECT mapping or a bump), so they are
+    baked for each mesh`
 * Not in the file (glTF cannot hold them): the camera's depth of field, the `STUDIO` world, the
   ACES view transform and the rigid bodies of the colliders.
 
 Checked after the export: the structural validator of the editor's glTF tests
-(`packages/core/test/fixes-export-gltf-check.ts`, run with `tsx`) finds no problems, and the
-animation evaluated at 24 sample frames matches the editor's evaluated scene to the 0.1 mm that
-`get_object` reports (largest difference 0.074 mm; orientations of the camera, a domino and the
-marble within 0.003°). three.js (0.187, `GLTFLoader` in headless Chromium) loads it without
-errors or warnings (75 meshes, 74 materials, 3 cameras, 2 lights, one 4.125 s clip with 126
-tracks), and an `AnimationMixer` playing the clip puts the marble, `Domino.01`, `.30` and `.60`,
-the focus target and the showcase camera where the editor has them at frames 1, 2, 25, 26, 30,
-55, 80 and 100 (48 positions, identical to 0.1 mm).
+(`packages/core/test/fixes-export-gltf-check.ts`, run with `tsx`) finds no problems. three.js
+(0.187, `GLTFLoader` in headless Chromium) loads it without errors or warnings (75 meshes, 74
+materials, 3 cameras, 2 lights, one 4.125 s clip with 126 tracks), and an `AnimationMixer`
+playing the clip puts the marble, `Domino.01`, `.30` and `.60`, the focus target and the showcase
+camera where the editor has them at frames 1, 2, 25, 26, 30, 55, 80 and 100 (48 positions, within
+0.001 mm of the values `get_object` reports).
 
 ## In the editor
 
@@ -192,10 +201,10 @@ the focus target and the showcase camera where the editor has them at frames 1, 
 the camera view at frame 65 in Material Preview shading, with `Domino.42` (at the wave front)
 selected: the outliner, its Object properties with the baked location and rotation keys (yellow:
 a key on this frame) and the timeline with its keyframes. Taken with Playwright (headless
-Chromium, software WebGL, hence the 1 fps in the statistics) on the server of the
-`--export-only` run; the browser console stayed empty (no errors or warnings). The other cameras
-are drawn as outlines (`Ramp Cam` around the tower; `Showcase Cam` coincides with `Camera` from
-frame 60).
+Chromium, software WebGL, hence the 1 fps in the statistics) on the server of an `--export-only`
+run of the same build as the renders; the browser console stayed empty (no errors or warnings).
+The other cameras are drawn as outlines (`Ramp Cam` around the tower; `Showcase Cam` coincides
+with `Camera` from frame 60).
 
 ## Rebuild
 
@@ -240,8 +249,10 @@ PORT=4564 DATA_DIR=<empty directory> RENDER_WORKERS=3 node apps/server/dist/main
 WORK_DIR=<work directory> MCP_URL=http://127.0.0.1:4564/mcp node examples/domino-cascade/build.mjs --final
 ```
 
-`scene.glb` comes from an `--export-only` run of the same build on a second server (1 render
-thread); the simulation is the same.
+`scene.glb` comes from an `--export-only` run on the final code (2026-11-07, after the last fixes
+to the exporter); it simulated the same cascade (identical fall frames and marble track). A
+preview path-traced on that code (640 × 360, frame 55, 24 spp) matches `render.png`, so the
+renders were kept.
 
 Measured on 2026-11-06 (16:27:34–16:41:39 UTC), exit code 0:
 
@@ -294,15 +305,12 @@ Measured on 2026-11-06 (16:27:34–16:41:39 UTC), exit code 0:
   rolling off the table.
 * **Depth of field** is rendered by the path tracer only: the RASTER inspection sheets and the
   editor's viewport are sharp throughout. At GIF size (480 × 270) the blur is subtle.
-* **Wood grain:** procedural textures cannot be rotated and the `WOOD` texture's rings and fibre
-  streaks are built around texture Z, so on a horizontal table top they show as end-grain rings
-  or a rippled speckle. The grain is therefore a `WAVE` pattern varying along Y (lines along the
-  boards), and the board colour and the grain cannot share one texture (one procedural per
-  channel).
-* **Baked bodies in `rigidbody.describe`:** after `rigidbody.bake_to_keyframes` the baked objects
-  have no rigid body, and `rigidbody.describe` lists them only when asked by name, with
-  `rigid_body` and `motion` null. `build.mjs` therefore tells a baked project from a fresh one by
-  their missing rigid bodies plus their keyframes (`get_object … animation`).
+* **Wood grain:** procedural textures cannot be rotated, and when the scene was built the `WOOD`
+  texture's rings and fibre streaks ran around texture Z only, so on a horizontal table top they
+  showed as end-grain rings or a rippled speckle. The grain is therefore a `WAVE` pattern varying
+  along Y (lines along the boards), and the board colour and the grain cannot share one texture
+  (one procedural per channel). `WOOD` now has an `axis` parameter (X or Y for boards lying along
+  X or Y), which this scene does not use.
 * **The still is time-limited:** on the shared machine the path tracer stopped at the 450 s
   budget with 140 of the requested 256 samples per pixel; denoised, it shows no visible noise.
 * **GIF and contact sheet:** 10 and 16 samples per pixel (denoised); the GIF has 256 colours with

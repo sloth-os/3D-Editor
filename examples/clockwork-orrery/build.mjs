@@ -1545,7 +1545,8 @@ function glbJson(buf) {
 async function exportGlb(gears) {
   // The glTF exporter samples the evaluated scene once per frame of the scene's frame range, so the
   // live drivers and the moon's Follow Path constraint export as they are (as keyframed node
-  // rotations and the moon's translation). The range is extended to frame 49 (= frame 1) for the
+  // rotations and the moon's translation); where a path curves between frames (the moon's fast
+  // orbit) it adds keys between the frames. The range is extended to frame 49 (= frame 1) for the
   // export, so the clip ends where it starts and loops seamlessly, and set back to 1–48 afterwards.
   const t0 = Date.now();
   let res;
@@ -1560,19 +1561,28 @@ async function exportGlb(gears) {
   if (!blob) throw new Error(`export returned no file: ${short(res)}`);
   for (const w of info.warnings ?? []) warnings.push(`export: ${short(w)}`);
   const buf = Buffer.from(blob, 'base64');
-  // check the file: one clip with a key per frame 1–49 that animates every driven part and the moon
+  // check the file: one clip that animates every driven part and the moon, every channel keyed at
+  // least once per frame 1–49 (channels of curved paths also between frames)
   const gltf = glbJson(buf);
   const anim = gltf.animations?.[0];
-  const input = anim ? gltf.accessors[anim.samplers[0].input] : null;
+  const inputs = (anim?.samplers ?? []).map((s) => gltf.accessors[s.input]);
+  const keys = inputs.map((a) => a.count);
+  const badInput = inputs.find(
+    (a) => a.count < LOOP + 1 || Math.abs(a.min[0]) > 1e-6 || Math.abs(a.max[0] - LOOP / FPS) > 1e-3,
+  );
   const animated = new Set((anim?.channels ?? []).map((c) => gltf.nodes[c.target.node].name));
   const missing = [...drivenParts(gears).map((p) => p.object), 'Moon'].filter((o) => !animated.has(o));
-  if (!input || input.count !== LOOP + 1 || Math.abs(input.max[0] - LOOP / FPS) > 1e-3 || missing.length)
+  if (!inputs.length || badInput || missing.length)
     throw new Error(
-      `scene.glb animation: ${input?.count} keys up to ${input?.max?.[0]} s (want ${LOOP + 1} up to ${LOOP / FPS} s); not animated: ${missing.join(', ') || 'none'}`,
+      `scene.glb animation: ${badInput ? `${badInput.count} keys from ${badInput.min?.[0]} to ${badInput.max?.[0]} s` : `${inputs.length} samplers`} (want at least ${LOOP + 1} keys from 0 to ${LOOP / FPS} s); not animated: ${missing.join(', ') || 'none'}`,
     );
+  const extra = (anim.channels ?? [])
+    .filter((c) => keys[c.sampler] > LOOP + 1)
+    .map((c) => `${gltf.nodes[c.target.node].name} ${c.target.path} ${keys[c.sampler]}`);
   console.log(
     `    scene.glb: ${gltf.nodes.length} nodes, ${gltf.meshes.length} meshes, ${gltf.materials.length} materials, ${gltf.images?.length ?? 0} baked texture images, ` +
-      `1 animation: ${anim.channels.length} channels on ${animated.size} nodes × ${input.count} keys (frames 1–${LOOP + 1}, ${input.max[0].toFixed(3)} s); export ${info.elapsed_ms} ms`,
+      `1 animation: ${anim.channels.length} channels on ${animated.size} nodes × ${LOOP + 1} keys (frames 1–${LOOP + 1}, ${(LOOP / FPS).toFixed(3)} s)` +
+      `${extra.length ? `, keys between frames: ${extra.join(', ')}` : ''}; export ${info.elapsed_ms} ms`,
   );
   await writeFile(path.join(OUT_DIR, 'scene.glb'), buf);
   timings['scene.glb'] = { ms: Date.now() - t0, bytes: buf.length };

@@ -31,7 +31,7 @@ Every file in this folder comes from this repository's editor and `build.mjs` (s
 | Rigid parts | 18 parts: turret with shoulder yoke, motors, joint housings, tapered arm segments, wrist flange, gripper, three gears, three hose clamps and two clamp-bracket meshes. They are made with `object.add_mesh_from_data`, `object.generate_gear` and `mesh.primitive_torus_add` and bone-parented like Blender's Ctrl+P > Bone: `object.select` (parts + armature active), then `object.parent_set {type: BONE, bone}`. The elbow bends between 78° and 127° in the cycle, and its layout is chosen so that nothing collides over that range: the forearm starts inside the 0.16 m elbow housing, and the rear elbow motor sits beside the arm's centre plane. As a result, apart from the joints themselves (each link ends inside the round housing of its joint), no link, motor or hose passes through another part at any frame (the build checks this, see Verification). The base plate and pedestal are plain children of the rig. |
 | Gears | `object.generate_gear`: a 60-tooth slewing ring on J1 and gear wheels on the shoulder and elbow, bone-parented so they turn with their joints. `materials: false`, because the parts get their own materials (otherwise the generator would leave an unused default "Steel" material behind). |
 | Dress-pack hose | `object.generate_pipe` along a path that runs up the back of the upper arm, around the back of the elbow next to the elbow motor and along the top of the forearm. It is bound with `object.parent_set {type: ARMATURE_AUTO}` (automatic bone-heat weights + Armature modifier), so it bends with J1, J2 and J3. On a hose that runs 17 cm from its bones, the automatic weights blend over long stretches. With the raw weights, the hose root (55 % J1_Base, 42 % J2_Shoulder) slid up to 112 mm over its fitting, and the hose moved up to 36 mm out of the centre of its clamps. The build therefore reads the weights with `get_mesh_data` and pins each clamped stretch to the bone of its link: root → J1_Base, upper-arm clamps → J2_Shoulder, forearm → J3_Elbow. Each pinned stretch blends back into the automatic weights over 12–15 cm, so the automatic weights still bend the hose at the shoulder and around the elbow. The fixed weights are written back with `object.vertex_group_set_weights`. Three clamps on brackets hold the hose to the arm. |
-| IK | `pose.ik_add` on J3_Elbow with a **three-bone chain** (J1_Base → J2_Shoulder → J3_Elbow) that reaches the keyframed empty `IK_Target`. **Per-bone IK locks** (`pose.ik_settings_set`, Blender's `lock_ik_*`) make it a palletizer: J1 may only turn about its own Y axis, the vertical (`lock_ik_x`, `lock_ik_z`), J2 and J3 only about their Z axes, the joint axes (`lock_ik_x`, `lock_ik_y`). So the IK turns the base towards the target and keeps the arm in the vertical plane through it. **IK limits** (`use_ik_limit_z`) hold the shoulder within −50…30° and the elbow within −35…60° of the rest pose (the cycle uses −28…8° and −11…38°), so the solver cannot swing the arm over the top or flip the elbow. Like Blender's, the solver starts from the pose, so J1 is posed (not keyed) at the home azimuth of 270° with `pose.bone_transform_set`: every target of the cycle lies within 90° of it. From the rest pose, the pick station lies straight behind the arm, where the yaw has no direction to start in: without the start pose, the base does not turn round and the wrist misses the pick station by 2.4 m (without the limits, the arm reaches back over the top instead). `pose.constraint_add DAMPED_TRACK` on J4 aims at `Wrist_Aim` (a child of the target, 1 m below it), which keeps the wrist vertical like a palletizer's parallel link. |
+| IK | `pose.ik_add` on J3_Elbow with a **three-bone chain** (J1_Base → J2_Shoulder → J3_Elbow) that reaches the keyframed empty `IK_Target`. **Per-bone IK locks** (`pose.ik_settings_set`, Blender's `lock_ik_*`) make it a palletizer: J1 may only turn about its own Y axis, the vertical (`lock_ik_x`, `lock_ik_z`), J2 and J3 only about their Z axes, the joint axes (`lock_ik_x`, `lock_ik_y`). So the IK turns the base towards the target and keeps the arm in the vertical plane through it. **IK limits** (`use_ik_limit_z`) hold the shoulder within −50…30° and the elbow within −35…60° of the rest pose (the cycle uses −28…8° and −11…38°), so the solver cannot swing the arm over the top or flip the elbow. Like Blender's, the solver starts from the pose, so J1 is posed (not keyed) at the home azimuth of 270° with `pose.bone_transform_set`: every target of the cycle lies within 90° of it. From the rest pose, the pick station lies straight behind the arm, where the yaw has no direction to start in: without the start pose, the base does not turn round and the wrist misses the pick station by 2.4 m (without the limits, the arm reaches back over the top instead). `pose.constraint_add DAMPED_TRACK` on J4 aims at `Wrist_Aim` (a child of the target, 1 m below it), which keeps the wrist vertical like a palletizer's parallel link. The web editor shows the locks and limits of the active bone in its Inverse Kinematics bone panel, and `armature.describe` lists them (`ik_settings`). |
 | Gripper fingers | One mesh with a `Grip` shape key (`object.shape_key_add` + `object.shape_key_set_positions`) that moves both fingers 58 mm inwards. `insert_keyframe shape_keys["Grip"].value` keys it open → closed → open. |
 | Carry | A `CHILD_OF` constraint (`object.constraint_add`) on the crate targets bone J4_Wrist, with keyed influence: 0 → 1 when the fingers have closed, 1 → 0 at the release. The crate's own location is keyed at frame 1 (pick station) and, at the release frame, at the place position read back with `constraint.describe`. |
 | Conveyor | One roller with an **ARRAY** modifier (51 rollers), one leg with **MIRROR + ARRAY**, side frames, an end stop, a drive box and a photo-eye sensor. At the far end, outside the fence, stands an infeed hood with a hazard band and a roll-up door. The door's Z location has smooth BEZIER keys: it opens at frames 45–51 and closes behind the emerging crate at 58–64. Nine crates are linked duplicates (`duplicate_object linked`) of one ribbed tote mesh with a BEVEL modifier: six on the belt (one of them waiting unseen inside the hood) and three on the pallet. |
@@ -142,8 +142,8 @@ fails:
 ## scene.glb
 
 `--export-only` rebuilds and verifies the scene and writes `scene.glb` with
-`export_scene {format: 'glb', frame: 1}`: 4.16 MB (4,159,212 bytes), exported in 6.1 s on a
-server with one render thread.
+`export_scene {format: 'glb', frame: 1, bake_resolution: 512}`: 4.16 MB (4,159,296 bytes),
+exported in 6.1 s on a server with two render threads.
 
 - **Nodes:** 81, one per object (at its frame-1 pose) plus the four bones J1_Base … J4_Wrist,
   with the bone-parented robot parts under their bones. 69 meshes in 79 primitives (one per
@@ -160,11 +160,14 @@ server with one render thread.
 - **Materials:** 36 PBR materials (`KHR_materials_clearcoat` for the teal paint, the crates and
   the E-stop button, `KHR_materials_emissive_strength` for the windows, the HMI screen, the green
   and amber lamps and the light curtain). The
-  procedural textures are baked into 21 PNG images (2.5 MB): the floor's colour and roughness,
-  the walls' corrugation (normal maps), the hazard stripes, the wire grid of the fence panels (an
-  alpha `MASK`) and the pine colour and grain of the pallets. Their bakes depend on each mesh's
-  generated UVs, so `Hazard Stripes` is written once per striped mesh (4 materials) and
-  `Pallet Pine` once per pallet mesh (6).
+  procedural textures are baked into 21 PNG images of 512 × 512 pixels (2.5 MB): the floor's
+  colour and roughness, the walls' corrugation (normal maps), the hazard stripes, the wire grid of
+  the fence panels (an alpha `MASK`) and the pine colour and grain of the pallets. Their bakes
+  depend on each mesh's generated UVs, so `Hazard Stripes` is written once per striped mesh (4
+  materials, `Hazard Stripes` to `Hazard Stripes.003`) and `Pallet Pine` once per pallet mesh (6,
+  up to `Pallet Pine.005`). The size is set with `bake_resolution`: the exporter's automatic size
+  (about 64 texels per metre, which gives 2048 pixels for the floor and the north wall) makes a
+  7.1 MB file.
 - **Export warnings** (all expected):
   - `Material 'Lamp Amber': the animation of emission_strength is not exported (glTF animates
     node transforms, morph target weights and skins; camera, light and material properties would
@@ -176,19 +179,21 @@ server with one render thread.
     '…'` for the 14 meshes with procedural textures: `Floor`, `Hazard_Border`,
     `Hazard_RobotZone`, `Cable_Protector`, `Infeed_Band`, `Fence_Panels`, `Hall_Wall_North`,
     `Hall_Walls_Side` and the six pallet meshes.
+  - `Material 'Hazard Stripes' is exported as 4 glTF materials (Hazard Stripes, Hazard
+    Stripes.001 … Hazard Stripes.003): its procedural textures depend on the surface
+    (GENERATED/OBJECT mapping or a bump), so they are baked for each mesh`, and the same for
+    `Pallet Pine` (6 materials).
 - Not in the file (glTF cannot hold them): the camera's depth of field, the mist, the world
   colour and the AgX view transform.
 
 Checked after the export: the structural validator of the editor's glTF tests
-(`packages/core/test/fixes-export-gltf-check.ts`, run with `tsx`) finds no problems, and the file
-evaluated at 16 frames matches the editor's evaluated scene: the gripper, the crates, the door,
-the IK target and two arm links within 0.073 mm, the vertices of the skinned hose and of the
-morphed gripper within 0.085 mm, the `Grip` weight to 2 × 10⁻⁷. three.js (0.187, `GLTFLoader` in headless
-Chromium) loads it without console errors or warnings (79 meshes, one skinned mesh with the four
-bones, the `Grip` morph target on both gripper primitives, one 3.96 s clip with 15 tracks), and
-an `AnimationMixer` playing the clip puts the crate, the gripper, a queued crate, the door, the
-forearm and every vertex of the skinned hose where the editor has them at frames 1, 33, 50, 63,
-72, 80 and 96 (within 0.085 mm), with the `Grip` influence at the editor's 0 / 1 / 0.
+(`packages/core/test/fixes-export-gltf-check.ts`, run with `tsx`) finds no problems. three.js
+(0.187, `GLTFLoader` in headless Chromium) loads it without console errors or warnings (79
+meshes, one skinned mesh with the four bones, the `Grip` morph target on both gripper primitives,
+one 3.96 s clip with 15 tracks), and an `AnimationMixer` playing the clip puts the crate, the
+gripper, a queued crate, the door, the forearm and every vertex of the skinned hose where the
+editor has them at frames 1, 33, 50, 63, 72, 80 and 96 (within 0.005 mm of the values
+`get_object` and `get_mesh_data` report), with the `Grip` influence at the editor's 0 / 1 / 0.
 
 ## In the editor
 
@@ -244,8 +249,10 @@ PORT=4563 DATA_DIR=<empty directory> RENDER_WORKERS=3 node apps/server/dist/main
 MCP_URL=http://127.0.0.1:4563/mcp node examples/robot-workcell/build.mjs
 ```
 
-`scene.glb` and `editor.png` come from an `--export-only` run of the same build on a second
-server (1 render thread); the scene is the same.
+`editor.png` comes from an `--export-only` run of the same build on a second server (1 render
+thread); the scene is the same. `scene.glb` comes from an `--export-only` run on the final code
+(2026-11-07, after the last fixes to the exporter). A preview path-traced on that code (640 × 360,
+frame 49, 24 spp) matches `render.png`, so the renders were kept.
 
 Measured on 2026-11-06 (17:16:07–17:29:42 UTC), exit code 0, in 813.9 s (13.6 min). The
 machine's 4 CPU cores were shared with other agents' editor servers and renders (load average 16
@@ -263,9 +270,6 @@ time-limited renders reached fewer samples than they would on an idle machine.
 
 - **The GIF is one cycle, not a perfect loop.** The conveyor and the infeed door loop seamlessly,
   but at the restart the crate on the pallet disappears and its slot is empty again.
-- **The IK locks are not shown in the web editor.** The bone panels show the IK constraint
-  (target, chain length), but not the per-bone locks and limits that `pose.ik_settings_set` sets;
-  `armature.describe` lists them (`ik_settings`).
 - **Hose weights needed a fix-up.** On the hose, the automatic weights blend too far along the
   arm, so the build pins the stretches at the root and the clamps to their bones (see above). The
   editor's weight operators normalize, but cannot limit, level or smooth weights, so the script

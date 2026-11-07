@@ -2133,9 +2133,11 @@ if (FINAL_RENDERS) {
 
 if (EXPORT_ONLY) {
   // glTF binary of the live, rigged scene at frame 1 (the exporter samples the animation over the
-  // frame range: IK, constraints, the shape key as a morph target, the skinned hose as a skin)
+  // frame range: IK, constraints, the shape key as a morph target, the skinned hose as a skin).
+  // The procedural textures are baked at 512 × 512 (bake_resolution): the automatic size (about
+  // 64 texels per metre: 2048 px for the floor and the north wall) gives a 7.1 MB file.
   const t = Date.now();
-  const r = await tool('export_scene', { format: 'glb', frame: 1 });
+  const r = await tool('export_scene', { format: 'glb', frame: 1, bake_resolution: 512 });
   const meta = info(r);
   const bytes = await save(r, path.join(HERE, 'scene.glb'), 'model/gltf-binary');
   timings.glb = {

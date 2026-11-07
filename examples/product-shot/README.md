@@ -156,7 +156,7 @@ the label appears in the lower part of the glass.
 
 ## scene.glb
 
-`--export-only` rebuilds the project and writes `scene.glb` (glTF 2.0 binary, 809,492 bytes) with
+`--export-only` rebuilds the project and writes `scene.glb` (glTF 2.0 binary, 809,608 bytes) with
 `export_scene` at frame 1:
 
 * 24 nodes in the editor's hierarchy: the Bottle with the six label pieces as its children, the
@@ -165,16 +165,17 @@ the label appears in the lower part of the glass.
 * 16 meshes with the modifiers applied (the lathes, curves and text become triangle meshes):
   13,085 vertices and 19,060 triangles;
 * 9 materials: the bottle glass and the perfume with `KHR_materials_transmission` (the perfume also
-  with `KHR_materials_ior` 1.36), the enamel, marble and pearls with `KHR_materials_clearcoat`,
-  the two golds and the backdrop paper. The procedural marble is baked into two 512 × 512 PNG
-  textures, one per object (so "Carrara Marble" appears twice), on UVs the exporter generates;
+  with `KHR_materials_ior` 1.36), the enamel, marble and pearls with `KHR_materials_clearcoat`
+  (the pearls also with `KHR_materials_sheen`), the two golds and the backdrop paper. The
+  procedural marble is baked into two 512 × 512 PNG textures, one per object (so the marble
+  appears twice, as `Carrara Marble` and `Carrara Marble.001`), on UVs the exporter generates;
 * the 85 mm camera (a perspective camera with a 13.6° vertical field of view);
 * five `KHR_lights_punctual` lights: the spot, and point lights in place of the four area lights;
 * one animation, "Scene": the rotation of the Turntable Pivot, 36 keys over 1.458 s (frames 1–36
   at 24 fps). The scene has no armatures, shape keys or deforming modifiers, so the file has no
   skins or morph targets.
 
-The export reports six warnings:
+The export reports seven warnings:
 
 * `Mesh 'Pedestal' has no UVs: generated UVs (Smart UV Project) to bake the procedural textures of 'Carrara Marble'`
 * `Mesh 'Column' has no UVs: generated UVs (Smart UV Project) to bake the procedural textures of 'Carrara Marble'`
@@ -182,18 +183,20 @@ The export reports six warnings:
 * `Area light 'Key Softbox' exported as a point light`
 * `Area light 'Reflector Card' exported as a point light`
 * `Area light 'Rim Strip' exported as a point light`
+* `Material 'Carrara Marble' is exported as 2 glTF materials (Carrara Marble, Carrara Marble.001):
+  its procedural textures depend on the surface (GENERATED/OBJECT mapping or a bump), so they are
+  baked for each mesh`
 
-Not in the file, without a warning: the pearls' sheen (`KHR_materials_sheen` is not written), the
-depth of field (glTF cameras have none), the STUDIO environment, the world colour and the view
-transform.
+Not in the file, without a warning: the depth of field (glTF cameras have none), the STUDIO
+environment, the world colour and the view transform.
 
 The file was checked in two ways. The structural validator of the core tests
 (`packages/core/test/fixes-export-gltf-check.ts`: buffer views, accessor bounds and alignment,
-attribute counts, node hierarchy, animation samplers) finds no problems, and the camera position
-evaluated from the file at frames 1, 10, 19 and 28 matches the editor's within 0.05 mm. three.js
-r187 (`GLTFLoader` in headless Chromium) loads it without errors or console messages, finds the
-24 nodes, 16 meshes, 5 lights, the camera and the 9 materials, and an `AnimationMixer` playing
-"Scene" moves the camera along the same path. Two things to know when viewing it:
+attribute counts, node hierarchy, animation samplers) finds no problems. three.js r187
+(`GLTFLoader` in headless Chromium) loads it without errors or console messages, finds the 24
+nodes, 16 meshes, 5 lights, the camera and the 9 materials (the pearls with sheen), and an
+`AnimationMixer` playing "Scene" puts the camera where the editor has it at frames 1, 10, 19 and
+28 (within 0.001 mm). Two things to know when viewing it:
 
 * three.js does not draw a transmissive object behind another transmissive surface, so the
   perfume is invisible inside the glass there (it appears when the bottle is hidden);
@@ -225,7 +228,7 @@ MCP_URL=http://127.0.0.1:8080/mcp node examples/product-shot/build.mjs --export-
 | `--preview` | Build plus a RASTER and a 640×360 path-traced preview (64 samples, at most 60 s) in `--out-dir` (default `/tmp/product-shot-previews`) | about 1 min |
 | `--still` | Build plus `render.png` only | about 6.5 min |
 | `--anim` | Build plus `contact_sheet.png` and `preview.gif` only | about 3 min |
-| `--export-only` | Build plus `scene.glb` only, no renders | about 2 s |
+| `--export-only` | Build plus `scene.glb` only, no renders | about 3 s |
 
 Options:
 
@@ -260,26 +263,29 @@ Measured on 2026-11-06 on 4 CPU cores shared with other jobs, with 3 render thre
 | `preview.gif` | 132 s | all 36 frames, 480×270, every frame at its 16 requested samples, denoised, 12 fps, loops forever; 1.6 MB |
 | Whole script | 563 s (9 min 23 s) | exit code 0 |
 
-`scene.glb` comes from `build.mjs --export-only` against the same editor version, and
-`editor.png` from that project opened in the web editor.
+`editor.png` comes from a `build.mjs --export-only` run against the same editor version, with
+that project opened in the web editor. `scene.glb` comes from an `--export-only` run on the final
+code (2026-11-07, after the last fixes to the exporter, which now writes the sheen). A preview
+path-traced on that code (640×360, 32 spp) matches `render.png`, so the renders were kept.
 
 ## Known limitations and workarounds
 
-* **Revolved plinth and column instead of a beveled cylinder.** The BEVEL modifier now rounds a
-  cylinder's rims cleanly (all quads), but it stretches the cylinder's UVs across the seam between
-  the caps and the side: the bevel faces' UVs cover large parts of the side strip, so the marble
-  that `export_scene` bakes into those UVs comes out wrong in `scene.glb` (plain grey sides with
-  flat triangles). The renders are not affected (they use generated texture coordinates). The
-  plinth and the column therefore stay revolved profiles with round fillets: they have no UVs,
-  so the exporter unwraps the final mesh itself and bakes the marble correctly.
+* **Revolved plinth and column instead of a beveled cylinder.** When the scene was built, the
+  BEVEL modifier rounded a cylinder's rims cleanly (all quads) but stretched the cylinder's UVs
+  across the seam between the caps and the side, so the marble that `export_scene` baked into
+  those UVs came out wrong in `scene.glb` (plain grey sides with flat triangles). The renders were
+  not affected (they use generated texture coordinates). The plinth and the column therefore stay
+  revolved profiles with round fillets: they have no UVs, so the exporter unwraps the final mesh
+  itself and bakes the marble correctly. (BEVEL now keeps the UVs of each new face inside the UV
+  island of the face it was cut from.)
 * **The glass touches nothing.** The path tracer treats every transmissive surface as a boundary
   between air and the material, so a liquid surface cannot share a boundary with the glass. The
   perfume is a separate body with a 0.4 mm air gap, which adds faint bright outlines where it
   meets the glass. The bottle also stands 0.2 mm above the plinth. When its bottom face and the
   marble top shared a plane, the path tracer used either surface at random for rays refracted
-  through the thick base, which left a grainy grey band in it. `scene.raycast` with `all: true`
-  also lists only one of two coincident surfaces, so the build checks the gap with `get_object`
-  bounds instead.
+  through the thick base, which left a grainy grey band in it. The build checks the gap with
+  `get_object` bounds (when it was written, `scene.raycast` with `all: true` listed only one of two
+  coincident surfaces; it now lists both).
 * **Lamps are invisible to the camera** in the path tracer and appear only in reflections. The
   glow behind the bottle is light pooled on the backdrop, not a visible lamp, and the strip
   highlights on the facets are reflections of the fill and key lights.
@@ -291,12 +297,9 @@ Measured on 2026-11-06 on 4 CPU cores shared with other jobs, with 3 render thre
   a shifted copy of what is in front of it (the label appears a second time, lower down; see
   `editor.png`). The Overlays button hides the grid and the 3D cursor but not the light helper
   lines.
-* **Inspection precision.** `get_object` rounds lengths to 0.1 mm (the frame's 0.11 mm bevel reads
-  0.1 mm), which is coarse at label scale: the 0.2 mm lift is a multiple of it, the name margin is
-  checked against 2.5 mm, and `scene.measure` gives exact bounds when needed.
 * **Animation quality.** The contact sheet (32 samples per pixel) and the GIF frames (16 samples)
   are denoised at low sample counts, so the glass shows slight blotches and fine detail is
   smoothed; the GIF's 256-colour palette with Bayer dithering leaves a fine dot pattern in the
   backdrop gradient.
 * **glTF export.** Area lights become point lights, the procedural marble becomes baked textures,
-  and sheen, depth of field and the world are not exported (see [scene.glb](#sceneglb)).
+  and depth of field and the world are not exported (see [scene.glb](#sceneglb)).

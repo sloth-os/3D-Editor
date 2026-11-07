@@ -145,8 +145,9 @@ The build fails (exit code 1) unless all of these checks pass on the built scene
   All four must hit the top face of the table, so no table edge can enter the picture.
 * **Renders** (default mode): a dropped animation frame (`truncated`) fails the build; frames that
   stopped sampling early (`undersampled_frames`) and render warnings are listed at the end.
-* **`exportGlb()`** (`--export-only`): the file's animation must have 49 keys (frames 1–49) and
-  animate all 14 driven parts and the moon.
+* **`exportGlb()`** (`--export-only`): every channel of the file's animation must have at least 49
+  keys over frames 1–49 (one per frame, more where a path curves between frames), and the animation
+  must move all 14 driven parts and the moon.
 
 Excerpt from the final production run:
 
@@ -186,21 +187,25 @@ console stayed free of errors and warnings.
 
 ## scene.glb
 
-[`scene.glb`](scene.glb) (2.52 MB, binary glTF 2.0) is written by `--export-only` with
+[`scene.glb`](scene.glb) (4.66 MB, binary glTF 2.0) is written by `--export-only` with
 `export_scene`. The exporter samples the evaluated scene once per frame, so the live drivers and the
-moon's Follow Path constraint need no baking. For the export the scene's frame range is set to 1–49
-(frame 49 looks exactly like frame 1), so the clip ends where it starts and loops seamlessly; the
-script then sets it back to 1–48. The file contains:
+moon's Follow Path constraint need no baking; where a path curves between two frames, as the moon's
+fast orbit does, it also samples between the frames. For the export the scene's frame range is set
+to 1–49 (frame 49 looks exactly like frame 1), so the clip ends where it starts and loops
+seamlessly; the script then sets it back to 1–48. The file contains:
 
 * 61 nodes: 48 meshes with their modifiers applied (bevels, the engraved plate; 44,602 triangles),
   the 50 mm camera, 6 lights (`KHR_lights_punctual`) and the 6 empties. The planet assemblies are
   children of their pivot empties, as in the editor.
 * 16 PBR materials (`KHR_materials_clearcoat` on the enamel deck and Azure's glaze,
   `KHR_materials_emissive_strength` on the sun). The 6 procedural textures are baked into 8 PNG
-  images of 512 × 512 pixels: base colours, the sun's emission and normal maps for the two woods.
-* One animation, `Scene`: 2.0 s at 24 fps, 49 linear keys per channel, 17 channels on 16 nodes.
-  They are the rotations of the 14 driven parts (pivots, planets, wheels, hub, sun), the Master
-  Drive's rotation, and the moon's translation and rotation.
+  images: base colours, the sun's emission and normal maps for the two woods. The exporter sizes
+  each bake by the surface it covers: 2048 × 2048 pixels for the 24 × 16 m table (its colour and
+  normal map), 512 × 512 for the rest.
+* One animation, `Scene`: 2.0 s at 24 fps, 17 channels on 16 nodes. The rotations of the 14 driven
+  parts (pivots, planets, wheels, hub, sun) and of the Master Drive have 49 linear keys, one per
+  frame. The moon's translation and rotation have 161 keys: 2 or 4 per frame (4 in 32 of the 48
+  frame intervals), so its path stays round between the frames.
 * No skins and no morph targets: the scene has no armature and no shape keys.
 
 Export warnings (all five expected; glTF has no area lights):
@@ -224,8 +229,9 @@ Checks of the committed file:
   its 27 teeth and 6 windows, so the loop has no visible seam.
 * three.js r187: `GLTFLoader` in headless Chromium loads the file (1 clip of 2 s with 17 tracks,
   48 meshes, 6 lights, 1 camera, no console errors). Played with an `AnimationMixer` and sampled at
-  240 Hz over the whole loop, the four planets stay on their orbit radii (within 0.0001 mm), and
-  the mixer repeats the clip: Ember is at the same place at t = 0.25 s, 2.25 s and 4.25 s.
+  240 Hz over two loops, the four planets stay on their orbit radii (within 0.0001 mm), the moon
+  stays 49.4–50.0 mm from Verdant, and the mixer repeats the clip: Ember is at the same place at
+  t = 0.25 s, 2.25 s and 4.25 s.
 
 ## Editor features shown
 
@@ -279,10 +285,11 @@ the printed `editor:` URL), runs every check above, and then does what the mode 
 | `--final` (default) | build + checks, `render.png`, `contact_sheet.png`, `preview.gif` | 13 min with 3 render threads on a busy 4-core machine (see below) |
 | `--build-only` | build + checks, no renders | 41 s (38 s of it the clearance sweep) |
 | `--preview` | build + checks + 960×540 RASTER still, 640×360 path-traced still (16 spp) and RASTER contact sheet in `$PREVIEW_DIR` (default `$TMPDIR/clockwork-orrery-previews`); nothing is written next to the script | 111 s with 1 render thread on a busy machine |
-| `--export-only` | build + checks + `scene.glb` (no renders) | 47 s (the export itself 4 s) |
+| `--export-only` | build + checks + `scene.glb` (no renders) | 71 s (the export itself 15 s, 2 render threads) |
 | `--stages build,still,…` | any combination of `build`, `preview`, `still`, `anim`, `export` | |
 
-The times of the last three modes were measured on the same busy machine with one render thread.
+The times of the last three modes were measured on the same busy machine with one render thread
+(`--export-only` with two, on the final code).
 `--out-dir DIR` writes `render.png`, `contact_sheet.png`, `preview.gif` and `scene.glb` to another
 folder. The command line is strict: an unknown argument (e.g. `build-only` without the dashes), an
 unknown stage name, two modes at once or a flag without its value stops the script with exit
@@ -315,8 +322,8 @@ average 11–16 while the still rendered, 6–9 during the animation):
 | `preview.gif` | 48 frames, 480×270, 8 spp, 4 bounces, denoised, 16 fps, Bayer dither, `time_limit` 600 s | 207.3 s | every frame at 8 spp (`samples_reached` min = max = 8); 0.91 MB |
 | **total** | | **777.0 s (13.0 min)** | exit code 0; 3 warnings, all the plate's degenerate triangles (see below) |
 
-`get_scene` counts 47,646 evaluated triangles: the 44,602 that render plus the 3,044 of the
-hidden text mesh that cuts the engraving.
+`get_scene` counts the 44,602 triangles that render as `evaluated`, and the 3,044 of the hidden
+text mesh that cuts the engraving under `not_rendered`.
 
 Every GIF frame reached the same sample count, and the path tracer uses the same noise seed for
 every frame, so the parts of the picture that do not move are nearly identical from frame to frame.
@@ -325,15 +332,20 @@ On a patch of the table (x 380–480, y 150–230) the mean difference between c
 high-pass noise of the same patch (standard deviation of the patch minus its 3 × 3 box blur) is
 3.63–3.68 grey levels in all 48 frames, so the table does not shimmer.
 
-`scene.glb` and `editor.png` were made with a second server running the same build (one render
-thread): `--export-only` wrote `scene.glb` (47 s, the export itself 4 s; a second export gave a
-byte-identical file), and the screenshot shows the project of that run open in the editor.
+`editor.png` was made with a second server running the same build (one render thread): the
+screenshot shows the project of an `--export-only` run open in the editor. `scene.glb` comes from
+an `--export-only` run on the final code (2026-11-07, after the last fixes to the exporter and the
+triangulation; 71 s, the export itself 15 s; a second run wrote a byte-identical file). A preview
+path-traced on that code (640×360, 24 spp) matches `render.png` and no longer warns about
+degenerate triangles, so the renders were kept.
 
 ## Known limitations
 
-* Every path-traced render warns `4 degenerate triangle(s) skipped (…): 'Motto Plate' 4`. The
-  boolean engraving leaves large n-gons (up to 477 corners) with collinear vertices along the
-  letters, and their triangulation has four zero-area triangles. They cover no pixels.
+* The renders of the final production run warned `4 degenerate triangle(s) skipped (…): 'Motto
+  Plate' 4`. The boolean engraving leaves large n-gons (up to 477 corners) with collinear vertices
+  along the letters, and their triangulation had four zero-area triangles, which cover no pixels.
+  The editor's triangulation now removes such triangles, so renders of the current build no longer
+  warn.
 * RASTER previews (`--preview`; the server's software rasterizer renders them when no editor is
   open in a browser) have no shadows and no depth of field, and they reflect a single reflection
   probe placed where the image centre looks (at the spindle). The far part of the glossy table
@@ -343,15 +355,16 @@ byte-identical file), and the screenshot shows the project of that run open in t
   render threads: the final run stopped at 71 spp under a load average of 11–16. The denoiser
   cleans the result, but a quieter machine gives a more converged image.
 * Most of the build time is the clearance sweep: 192 `scene.measure` calls (48 frames × 4 groups),
-  because exact surface distances take at most 8 objects and one frame per call. The motion check's
-  125 `get_object` calls take only a few seconds.
+  because a call measures one frame and the script measures groups of at most 8 objects (the limit
+  of exact surface distances when it was written; `scene.measure` now takes up to 25). The motion
+  check's 125 `get_object` calls take only a few seconds.
 * The clearance sweep samples whole frames only. Between frames the planets are kept apart by the
   disjoint annuli (the design guarantees it); the gear teeth were measured at the 48 frames only.
 * `scene.glb` is an approximation of the scene: the five area lights become point lights (glTF has
-  no area lights), the procedural textures are baked into 512 × 512 images (the grain of the 24 m
-  table is blurred and the marble's thin veins are lost), and glTF players interpolate the
-  per-frame keys linearly. Rotations stay exact, but the moon's world position cuts chords between
-  the keys: in three.js it comes up to 6 mm closer to Verdant than its 50 mm orbit (it never touches
-  it).
+  no area lights), the procedural textures are baked into images (2048 pixels across the 24 m
+  table, 512 for the smaller parts, so fine detail such as the marble's thin veins is softened), and
+  glTF players interpolate the keys linearly. Rotations stay exact, and the extra keys on the moon's
+  curved path keep it within 0.6 mm of its 50 mm orbit around Verdant in three.js (with one key per
+  frame it cut chords up to 6 mm deep).
 * The near numerals of the dial (V, VI, VII) read upside down from the camera, as on a real dial
   with radial numerals.
