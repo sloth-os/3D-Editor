@@ -13,7 +13,7 @@ import { SyncTestClient } from '../helpers/sync-client';
 
 /*
  * Regression tests for the second round of problems AI agents logged while building the example
- * projects through MCP (phase 3, /tmp/phase3/*-issues-v2.json) and the server leftovers: strict tool
+ * projects in examples/ through MCP and the server leftovers: strict tool
  * arguments, export download links, browser path tracing, operator error codes, wire curve bounds
  * and curve settings, render vs viewport geometry counts, cached evaluations, per-frame samples of
  * path traced animations, named degenerate triangles and transparent film in raster renders.
