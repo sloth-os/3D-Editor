@@ -23,6 +23,34 @@ class FlakyStore extends MemoryFileStore {
   }
 }
 
+/**
+ * A store that pairs content and ETag the way the WebDAV client does with servers that send no ETag
+ * with GET or PUT (packages/core webdav.ts read() and write(), e.g. the webdav-server of the
+ * integration tests): it reads or writes the content, then asks for the ETag with a second request
+ * (PROPFIND), which another server's write can come before. `betweenRead` / `betweenWrite` run once
+ * between the two requests of the next read / write of a project's document.
+ */
+class SplitEtagStore extends MemoryFileStore {
+  betweenRead: (() => Promise<unknown>) | null = null;
+  betweenWrite: (() => Promise<unknown>) | null = null;
+  override async read(path: string) {
+    const r = await super.read(path);
+    const between = this.betweenRead;
+    if (!r || !between || !path.endsWith('/document.ybin')) return r;
+    this.betweenRead = null;
+    await between();
+    return { data: r.data, etag: (await super.read(path))!.etag };
+  }
+  override async write(path: string, data: Uint8Array, opts?: WriteOptions) {
+    const r = await super.write(path, data, opts);
+    const between = this.betweenWrite;
+    if (!between || !path.endsWith('/document.ybin')) return r;
+    this.betweenWrite = null;
+    await between();
+    return { etag: (await super.read(path))!.etag };
+  }
+}
+
 const managers: RoomManager[] = [];
 
 function setup(opts: { ttlMs?: number; debounceMs?: number; fs?: FileStore } = {}) {
@@ -112,6 +140,47 @@ describe('RoomManager', () => {
     expect(room.scene.findObjectByName('From another server')).not.toBeNull();
     expect(room.isDirty).toBe(false); // merged storage changes are not re-saved
     expect(await metrics.render()).toContain('persistence_operations_total{op="refresh",status="ok"} 1');
+  });
+
+  /*
+   * Two servers sharing one storage (the WebDAV persistence integration test, which failed now and
+   * then on a busy machine: 7 of 30 runs with every CPU busy). A server must merge every write of
+   * the other one, also when the ETag it got with a read or a write names a newer write than the
+   * content it read or wrote: it used to skip reading the stored document when its ETag equalled
+   * the one of its last sync, and so never merged that newer write.
+   */
+  it("merges the other server's write that came between reading the document and its ETag", async () => {
+    const fs = new SplitEtagStore();
+    const one = setup({ fs, debounceMs: 60_000 });
+    const two = setup({ fs, debounceMs: 60_000 });
+    const a = await one.rooms.createProject({ name: 'Two servers' });
+    const b = (await two.rooms.open(a.id))!;
+    a.scene.addObject({ type: 'EMPTY', name: 'Made on one' });
+    // server two refreshes while server one saves: two reads the document before one's write, and
+    // its ETag after it
+    fs.betweenRead = () => a.flush();
+    await b.refresh();
+    expect(b.scene.findObjectByName('Made on one')).toBeNull();
+    // its next refresh reads one's write, with that ETag
+    await b.refresh();
+    expect(b.scene.findObjectByName('Made on one')).not.toBeNull();
+  });
+
+  it("merges the other server's write that came between its own write and that write's ETag", async () => {
+    const fs = new SplitEtagStore();
+    const one = setup({ fs, debounceMs: 60_000 });
+    const two = setup({ fs, debounceMs: 60_000 });
+    const a = await one.rooms.createProject({ name: 'Two servers' });
+    const b = (await two.rooms.open(a.id))!;
+    b.scene.addObject({ type: 'EMPTY', name: 'Made on two' });
+    a.scene.addObject({ type: 'EMPTY', name: 'Made on one' });
+    // server two saves; server one saves (merging two's write) before two asks for its ETag
+    fs.betweenWrite = () => a.flush();
+    await b.flush();
+    expect(a.scene.findObjectByName('Made on two')).not.toBeNull();
+    expect(b.scene.findObjectByName('Made on one')).toBeNull();
+    await b.refresh();
+    expect(b.scene.findObjectByName('Made on one')).not.toBeNull();
   });
 
   it('evicts idle rooms after saving, but keeps rooms in use or with unsaved changes', async () => {

@@ -41,8 +41,11 @@ function pngSize(json: any, bin: Uint8Array, image: number): [number, number] {
   return [dv.getUint32(16), dv.getUint32(20)];
 }
 
-const OBJECT_NOISE = {
-  type: 'NOISE',
+// An OBJECT-mapped texture is baked for each mesh, at a size from the mesh's surface whatever its
+// pattern (gltf-export.ts `bakeSize`): a checker is the cheapest to bake (with a noise, the export
+// with the 24 m floor below took about 3 times as long)
+const OBJECT_CHECKER = {
+  type: 'CHECKER',
   mapping: 'OBJECT',
   scale: 4,
   color_a: [0.1, 0.1, 0.1, 1],
@@ -54,10 +57,10 @@ describe('glTF export: procedural bakes', () => {
     const { doc, run } = setup();
     run('mesh.primitive_plane_add', { name: 'Floor', size: 24 });
     run('material.new', { name: 'Big' });
-    run('material.procedural_set', { material: 'Big', procedural: OBJECT_NOISE });
+    run('material.procedural_set', { material: 'Big', procedural: OBJECT_CHECKER });
     run('mesh.primitive_cube_add', { name: 'Small', size: 0.2, location: [0, 0, 1] });
     run('material.new', { name: 'Tiny' });
-    run('material.procedural_set', { material: 'Tiny', procedural: OBJECT_NOISE });
+    run('material.procedural_set', { material: 'Tiny', procedural: OBJECT_CHECKER });
     const auto = parseGltf(exportScene(doc, 'glb').data);
     const sizeOf = (g: { json: any; bin: Uint8Array }, name: string) =>
       pngSize(
@@ -75,13 +78,13 @@ describe('glTF export: procedural bakes', () => {
     const op = run('export_scene.gltf', { bake_resolution: 128 });
     const viaOp = parseGltf(Uint8Array.from(atob(op.data_base64), (c) => c.charCodeAt(0)));
     expect(sizeOf(viaOp, 'Big')).toEqual([128, 128]);
-    // a 2048 px procedural bake takes several seconds, several times longer under coverage
+    // one 2048 × 2048 bake and its PNG take about 2 s, 11 s under coverage, even with a checker
   }, 120_000);
 
   it('names the per-mesh copies of one material apart and says so', () => {
     const { doc, run } = setup();
     run('material.new', { name: 'Beech', assign: false });
-    run('material.procedural_set', { material: 'Beech', procedural: OBJECT_NOISE });
+    run('material.procedural_set', { material: 'Beech', procedural: OBJECT_CHECKER });
     // four different meshes (an OBJECT-mapped texture is baked once per distinct mesh)
     for (const [i, size] of [0.2, 0.3, 0.4, 0.5].entries()) {
       run('mesh.primitive_cube_add', { name: `Dowel.${i + 1}`, size, location: [i, 0, 0] });
@@ -105,7 +108,7 @@ describe('glTF export: procedural bakes', () => {
     const { doc, run } = setup();
     run('mesh.primitive_cube_add', { name: 'Stacked' });
     run('material.new', { name: 'Stone' });
-    run('material.procedural_set', { material: 'Stone', procedural: OBJECT_NOISE });
+    run('material.procedural_set', { material: 'Stone', procedural: OBJECT_CHECKER });
     // every face of the cube mapped onto the whole UV square (stacked islands)
     const obj = doc.listObjects().find((o) => o.name === 'Stacked')!;
     const mesh = doc.getMesh(obj.data!)!;

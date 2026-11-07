@@ -10,6 +10,7 @@ import {
   quantizePalette,
 } from '../src';
 import { decodeAPNG, decodeGIF, lzwDecode, solidFrame } from './render-animation-helpers';
+import { cpuMs } from './timing-helpers';
 
 type RGBA = [number, number, number, number];
 const BG: RGBA = [20, 40, 60, 255];
@@ -358,9 +359,10 @@ describe('encodeGIF', () => {
       height: 64,
       data: noiseBytes(96 * 64 * 4, k + 3).map((v, i) => (i % 4 === 3 ? 255 : v)),
     }));
-    const t0 = performance.now();
+    // CPU time: about 0.2 s, 0.5 s under coverage on a busy machine
+    const t0 = cpuMs();
     const gif = decodeGIF(encodeGIF(frames, 12));
-    expect(performance.now() - t0).toBeLessThan(5000);
+    expect(cpuMs() - t0).toBeLessThan(5000);
     expect(gif.frames).toHaveLength(12);
     expect(gif.palette.length).toBe(256 * 3);
     expect(gif.frames.every((f) => f.indices.every((v) => v < 256))).toBe(true);

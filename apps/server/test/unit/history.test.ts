@@ -456,6 +456,11 @@ describe('AgentHistory', () => {
     expect(retained(doc).items).toBe(0);
   });
 
+  /*
+   * 60 random sessions of 200 steps, each run on two documents (AgentHistory and plain Yjs) and
+   * compared after every step: 0.8–0.95 s, 1.1–1.3 s under coverage on an idle 4-CPU machine. CI
+   * runners can be 2–3 times slower, so the test gets 15 s instead of the default 5 s.
+   */
   it('never fails inside Yjs and keeps nothing once every history ended (1-3 agents, editors, random)', () => {
     for (let seed = 1; seed <= 60; seed++) {
       let x = seed * 104729 + 17;
@@ -557,5 +562,5 @@ describe('AgentHistory', () => {
       }
       expect(retained(a.doc), `seed ${seed}`).toEqual({ items: 0, bytes: 0 });
     }
-  });
+  }, 15_000);
 });

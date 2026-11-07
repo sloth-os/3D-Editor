@@ -87,20 +87,75 @@ describe('docs: browser editors', () => {
     );
   });
 
-  it("give the cost of screenshots by the viewport's shading, not MATERIAL and RENDERED as slow in themselves", () => {
+  it('give the cost of screenshots: tens of seconds only for the first one in a shading, which the editor keeps', () => {
     for (const doc of [mcp, guide].map(flat)) {
       expect(doc).not.toMatch(/tens of seconds per `editor_command` screenshot in those shadings/);
       expect(doc).not.toMatch(/tens of seconds per screenshot of a heavy scene in `MATERIAL` or `RENDERED`/);
       expect(doc).not.toMatch(/where one drawn with materials and lights took 20 s/);
+      // not every screenshot in another shading than the viewport's: only the first one in a shading
+      expect(doc).not.toMatch(
+        /in another shading (it )?builds and compiles the scene's materials for that image/,
+      );
+      expect(doc).not.toMatch(/took 20–25 s (each )?while the viewport showed `SOLID`/);
     }
     expect(flat(mcp)).toContain(
-      "A screenshot in the viewport's shading costs about one such frame; one in another shading builds " +
-        "and compiles the scene's materials for that image.",
+      "An editor builds and compiles the scene's materials for `MATERIAL` or `RENDERED` shading the first " +
+        'time it draws that shading after it opened the project, for a screenshot or a frame of its viewport, ' +
+        'and keeps them for later ones',
+    );
+    expect(flat(mcp)).toContain('the first `RENDERED` screenshot took 20–24 s and the next ones 1.0–1.5 s');
+    expect(flat(mcp)).toContain(
+      'a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 21 s later (the rest ' +
+        'of the first one, then one frame)',
     );
     expect(flat(guide)).toContain(
-      "in another shading it builds and compiles the scene's materials for that image, which takes tens of " +
-        'seconds for a scene with many materials in `MATERIAL` or `RENDERED`',
+      'the first screenshot or viewport frame in each of them after it opened the project builds and compiles ' +
+        "the scene's materials for that shading (20–24 s for a scene with 71 materials), and the editor keeps " +
+        'them, so later screenshots in that shading take about one frame (1–2 s)',
     );
+    expect(flat(guide)).toContain(
+      'a screenshot that timed out still builds its materials, so retrying it waits for the rest and then ' +
+        'takes about one frame',
+    );
+  });
+
+  it('say that a material edit can make the next screenshot in a shading compile shaders again', () => {
+    // an edit rebuilds the materials of the objects that use it (scene-objects.ts materialSets); a
+    // RENDERED screenshot after an edit of the table's material took 10–15 s (docs/mcp.md)
+    for (const doc of [mcp, guide].map(flat))
+      expect(doc).not.toMatch(/did not make the next screenshot pay again/);
+    expect(flat(mcp)).toContain(
+      'and keeps them for later ones until they change: after a material edit, the next screenshot or frame ' +
+        'in each of these shadings builds the materials of the objects that use it again, and compiles their ' +
+        "shaders again unless other objects' materials share them.",
+    );
+    expect(flat(mcp)).toContain(
+      'the next `RENDERED` screenshot took 10–15 s, more than the default `timeout_ms`, and later ones 0.9–1.5 s again',
+    );
+    expect(flat(mcp)).toContain('the editor keeps what it built for both until the materials change');
+    expect(flat(guide)).toContain(
+      'so later screenshots in that shading take about one frame (1–2 s), also after the viewport switched to ' +
+        'it, until you edit a material: the next screenshot or frame in each of these shadings then compiles ' +
+        'the shaders of the objects with that material again unless other objects share them',
+    );
+    expect(row(guide, "`editor_command '…' failed: the editor did not answer")).toContain(
+      'or after a material edit',
+    );
+  });
+
+  it('show the timeout messages of the server below and at the maximum of timeout_ms', () => {
+    const doc = flat(mcp);
+    expect(doc).toContain(editorTimeoutMessage('screenshot', 10_000));
+    expect(doc).toContain(editorTimeoutMessage('select', 10_000));
+    // at the maximum: what the doc says the advice starts with
+    const quoted = doc.match(/At the maximum the advice starts with "([^"]*) …"/)?.[1];
+    expect(quoted).toBeDefined();
+    for (const [command, params] of [
+      ['screenshot', {}],
+      ['screenshot', { shading: 'SOLID' }],
+      ['select', {}],
+    ] as const)
+      expect(editorTimeoutMessage(command, MAX_EDITOR_TIMEOUT_MS, null, params)).toContain(` ${quoted} `);
   });
 
   it('say what ed.undo undoes there: also operators run with editor_command, never the tools', () => {
@@ -149,6 +204,12 @@ describe('docs: selections', () => {
     expect(flat(guide)).toContain(
       'Lists that the select mode would not use are refused (`POLL_FAILED`), and so is `all: true` with lists',
     );
+    // leaving select_mode out is VERT only for some lists: faces alone are FACE, edges alone EDGE
+    const refusal = row(guide, "`select_mode 'FACE' selects only the listed faces");
+    expect(refusal).not.toMatch(/leave `select_mode` out for `VERT`/);
+    expect(refusal).toContain(
+      'left out, `select_mode` is `FACE` for faces alone, `EDGE` for edges alone, else `VERT`',
+    );
   });
 });
 
@@ -166,6 +227,13 @@ describe('docs: browser UI operators', () => {
         'it had open, which it leaves before it can answer: `editor_command` says it got no answer',
     );
     expect(row(mcp, '`wm.share`')).toContain("Puts the project's link on the person's clipboard");
+    // render.render renders a still at once; its animation window waits for the person's Render button
+    expect(row(mcp, '`render.render`')).toContain(
+      '`{animation: true}` opens the Render Animation window instead, which renders nothing until the person ' +
+        'presses its Render button',
+    );
+    for (const doc of [mcp, guide].map(flat))
+      expect(doc).not.toMatch(/animation: true\W+renders the frame range/);
     expect(flat(guide)).not.toMatch(/wm\.share[^.]*(dialog|menu)/);
   });
 

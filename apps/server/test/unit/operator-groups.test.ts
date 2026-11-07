@@ -118,7 +118,7 @@ describe('browserUiOperator', () => {
     const zoomBy = interaction.slice(interaction.indexOf('  zoomBy(factor: number)'));
     expect(zoomBy.slice(0, zoomBy.indexOf('\n  }\n'))).toContain('this.leaveCameraView()');
     expect(browserUiOperator('view3d.zoom')).toMatch(
-      /: it zooms the person's view in or out, out of the camera view\.$/,
+      /: it zooms the person's view in by 1\.25× per unit of `delta` \(default 1; negative values zoom out\), out of the camera view\.$/,
     );
   });
 
@@ -130,7 +130,7 @@ describe('browserUiOperator', () => {
         'waits for the person to move the copies with the mouse.',
     );
     expect(browserUiOperator('view3d.transform_modal')).toMatch(
-      /To move, rotate or scale use transform\.translate \{value\}, transform\.rotate \{value, orient_axis\} or transform\.resize \{value\} on your selection \(through edit_mesh for mesh elements\), or the transform_object tool\. In a live editor run it with .*: it starts a move, rotation or scale of the editor's selection that follows the person's mouse until they click\.$/,
+      /To move, rotate or scale use transform\.translate \{value\}, transform\.rotate \{value, orient_axis\} or transform\.resize \{value\} on your selection \(through edit_mesh for mesh elements\), or the transform_object tool\. In a live editor run it with .*: it starts a move, rotation or scale \(\{mode: translate, rotate or resize\}\) of the editor's selection that follows the person's mouse until they click\.$/,
     );
     expect(browserUiOperator('mesh.loopcut_pick')).toMatch(
       /To cut a loop use edit_mesh \{object, operator: 'mesh\.loopcut', params: \{edge: \[a, b\], number_cuts\}\}.*: in Edit Mode it cuts the edge ring of the editor's active mesh under the person's mouse pointer, and fails when the pointer is over no edge\.$/,
@@ -162,6 +162,184 @@ describe('browserUiOperator', () => {
     expect(browserUiOperator('custom.panel_toggle', true)).toBe(
       `${HEAD('custom.panel_toggle')} Run it there with ${RUN('custom.panel_toggle')}.`,
     );
+  });
+});
+
+describe('the parameters the caveats name', () => {
+  /*
+   * An agent runs a browser UI operator with the parameters its caveat names: the browser editor's
+   * operators are not in list_operators, and a required parameter left out fails in the editor
+   * ("Invalid parameters for view3d.view_orbit: type: …"). So every caveat names the required
+   * parameters of its operator's schema in apps/web/src/editor/ui-operators.ts (with the values of
+   * an enum), and only parameters the schema has.
+   */
+  const UI = readFileSync(
+    fileURLToPath(new URL('../../../web/src/editor/ui-operators.ts', import.meta.url)),
+    'utf8',
+  );
+  const MENUS = readFileSync(
+    fileURLToPath(new URL('../../../web/src/editor/menus.ts', import.meta.url)),
+    'utf8',
+  );
+
+  interface Param {
+    required: boolean;
+    /** The values of a z.enum, else null. */
+    values: string[] | null;
+    source: string;
+  }
+
+  /** The top-level entries of an object literal's body, split at commas outside brackets and strings. */
+  function entries(body: string): string[] {
+    const out: string[] = [];
+    let depth = 0;
+    let quote: string | null = null;
+    let cur = '';
+    for (const c of body) {
+      if (quote) {
+        if (c === quote) quote = null;
+      } else if (c === "'" || c === '"' || c === '`') quote = c;
+      else if ('([{'.includes(c)) depth++;
+      else if (')]}'.includes(c)) depth--;
+      else if (c === ',' && depth === 0) {
+        if (cur.trim()) out.push(cur.trim());
+        cur = '';
+        continue;
+      }
+      cur += c;
+    }
+    if (cur.trim()) out.push(cur.trim());
+    return out;
+  }
+
+  /** The parameters of a browser UI operator's schema (ui-operators.ts). */
+  function schemaOf(id: string): Map<string, Param> {
+    const params = new Map<string, Param>();
+    const start = UI.indexOf(`id: '${id}'`);
+    if (start < 0) {
+      // the view toggles, registered with toggle(id, …): no parameters
+      expect(UI, id).toMatch(new RegExp(`toggle\\(\\s*'${id.replace('.', '\\.')}'`));
+      return params;
+    }
+    const block = UI.slice(start, UI.indexOf('execute(', start));
+    const open = block.indexOf('schema: z.object({');
+    expect(open, id).toBeGreaterThan(0);
+    let depth = 0;
+    let end = open + 'schema: z.object('.length;
+    for (; end < block.length; end++) {
+      if (block[end] === '{') depth++;
+      if (block[end] === '}' && --depth === 0) break;
+    }
+    const body = block.slice(open + 'schema: z.object({'.length, end);
+    for (const entry of entries(body)) {
+      const key = entry.slice(0, entry.indexOf(':')).trim();
+      const expr = entry.slice(entry.indexOf(':') + 1);
+      const values = expr.match(/^\s*z\.enum\(\[([^\]]*)\]\)/)?.[1].match(/'(\w+)'/g);
+      params.set(key, {
+        required: !/\.default\(|\.optional\(\)/.test(expr),
+        values: values ? values.map((v) => v.slice(1, -1)) : null,
+        source: expr,
+      });
+    }
+    return params;
+  }
+
+  /** What the refusal says the operator does in a live editor (after how to run it). */
+  const caveat = (id: string) => {
+    const msg = browserUiOperator(id)!;
+    return msg.slice(msg.indexOf(RUN(id)) + RUN(id).length);
+  };
+
+  /**
+   * The parameters a caveat names: `{key: …}` (one key and its values), `{a, b}` (keys) and `` `key` ``,
+   * leaving out editor commands and their parameters (editor_command view.set_view {view: 'CAMERA'}).
+   */
+  function named(text: string): string[] {
+    const plain = text.replace(/editor_command [\w.]+( \{[^}]*\})?/g, '');
+    const out: string[] = [];
+    for (const [, group] of plain.matchAll(/\{([^}]*)\}/g)) {
+      const parts = group.split(',').map((x) => x.trim());
+      if (parts[0].includes(':')) out.push(parts[0].slice(0, parts[0].indexOf(':')));
+      else out.push(...parts);
+    }
+    for (const [, key] of plain.matchAll(/`(\w+)`/g)) out.push(key);
+    return out;
+  }
+
+  it('name the required parameters of every operator, with the values of an enum', () => {
+    let required = 0;
+    for (const id of BROWSER_UI_OPERATORS) {
+      const text = caveat(id);
+      for (const [key, p] of schemaOf(id)) {
+        if (!p.required) continue;
+        required++;
+        expect(named(text), `${id}: ${key}`).toContain(key);
+        for (const v of p.values ?? []) expect(text, `${id}: ${key} ${v}`).toMatch(new RegExp(`\\b${v}\\b`));
+      }
+    }
+    // view3d.view_axis, view3d.view_orbit, view3d.toggle_shading, wm.tool_set, view3d.transform_modal,
+    // wm.call_menu, screen.workspace_set
+    expect(required).toBe(7);
+  });
+
+  it('name only parameters the schema has, with its defaults and units', () => {
+    for (const id of BROWSER_UI_OPERATORS) {
+      const schema = schemaOf(id);
+      for (const key of named(caveat(id))) expect([...schema.keys()], `${id}: ${key}`).toContain(key);
+    }
+    // the orbit's angle is in radians (pose.yaw and pose.pitch), 15° by default
+    const orbit = schemaOf('view3d.view_orbit');
+    expect(orbit.get('angle')?.source).toContain('.default(Math.PI / 12)');
+    expect(UI).toContain('pose.yaw += p.angle');
+    expect(caveat('view3d.view_orbit')).toContain(
+      '({type: ORBITLEFT, ORBITRIGHT, ORBITUP or ORBITDOWN}) by `angle` (radians, default π/12: 15°)',
+    );
+    // zoom: the view's distance times 1.25^-delta
+    expect(schemaOf('view3d.zoom').get('delta')?.source).toContain('.default(1)');
+    expect(UI).toContain('zoomBy(Math.pow(1.25, -p.delta))');
+    expect(caveat('view3d.zoom')).toContain(
+      '1.25× per unit of `delta` (default 1; negative values zoom out)',
+    );
+    expect(schemaOf('screen.frame_offset').get('delta')?.source).toContain('.default(1)');
+    expect(caveat('screen.frame_offset')).toContain('by `delta` frames (default 1)');
+    expect(schemaOf('screen.keyframe_jump').get('next')?.source).toContain('.default(true)');
+    expect(caveat('screen.keyframe_jump')).toContain('(`next`, default true; false: the previous one)');
+    expect(schemaOf('wm.read_homefile').get('name')?.source).toContain(".default('Untitled')");
+  });
+
+  it('render.render: the still renders at once, the animation window waits for its Render button', () => {
+    expect(schemaOf('render.render').get('animation')?.source).toContain('.default(false)');
+    const dialogs = readFileSync(
+      fileURLToPath(new URL('../../../web/src/ui/dialogs/Dialogs.tsx', import.meta.url)),
+      'utf8',
+    );
+    const body = (name: string) => {
+      const start = dialogs.indexOf(`function ${name}()`);
+      expect(start, name).toBeGreaterThan(0);
+      return dialogs.slice(start, dialogs.indexOf('\n}\n', start));
+    };
+    // the still: a render started by the effect that runs when the window opens
+    expect(body('RenderImageDialog')).toMatch(/useEffect\(\(\) => \{[\s\S]*e\.renderImage\(\)/);
+    // the animation: started only by the Render button (begin)
+    const animation = body('RenderAnimationDialog');
+    expect(animation).toContain('onClick={begin}');
+    expect(animation.match(/begin\b/g)).toHaveLength(2);
+    expect(caveat('render.render')).toContain(
+      'with {animation: true} it opens the Render Animation window instead, which renders nothing until the ' +
+        'person presses its Render button',
+    );
+    expect(caveat('render.render')).not.toMatch(/animation: true renders/);
+  });
+
+  it('wm.call_menu: names every menu the editor has', () => {
+    const start = MENUS.indexOf('export function menuByName(');
+    const menus = [...MENUS.slice(start, MENUS.indexOf('\n}\n', start)).matchAll(/case '(\w+)':/g)].map(
+      (m) => m[1],
+    );
+    expect(menus.length).toBeGreaterThan(10);
+    const text = caveat('wm.call_menu');
+    for (const m of menus) expect(text, m).toMatch(new RegExp(`[{ ]${m}[,}]| ${m} or `));
+    expect(text).toContain('another name opens nothing');
   });
 });
 

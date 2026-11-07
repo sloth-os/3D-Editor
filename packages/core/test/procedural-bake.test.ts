@@ -23,6 +23,7 @@ import {
 } from '../src';
 import { linearToSrgb } from '../src/render/color';
 import { readGLB } from '../src/io/glb';
+import { cpuMs } from './timing-helpers';
 
 const slot = (p: ProceduralTexture): TextureSlot => ({
   image: '',
@@ -373,38 +374,60 @@ describe('glTF export: texture bindings, deduplication and deformation', () => {
 
   it('bakes identical meshes once and shares the material (content-keyed)', () => {
     // regression: one bake and one material per mesh object made exports of copies very slow
-    const doc = SceneDoc.create({ empty: true });
-    const reg = createOperatorRegistry();
-    const ctx: OperatorContext = {
-      doc,
-      state: createEditorState(),
-      origin: doc.origin,
-      source: 'test',
-      report: () => undefined,
+    /** `n` cubes of 1 m, each with its own (identical) mesh, all with the concrete preset. */
+    const cubes = (n: number) => {
+      const doc = SceneDoc.create({ empty: true });
+      const ctx: OperatorContext = {
+        doc,
+        state: createEditorState(),
+        origin: doc.origin,
+        source: 'test',
+        report: () => undefined,
+      };
+      const ids: string[] = [];
+      for (let i = 0; i < n; i++)
+        ids.push(
+          doc.addObject({
+            type: 'MESH',
+            name: `C${i}`,
+            data: doc.addMesh(`C${i}`, createCube({ size: 1 })),
+            location: [i * 2, 0, 0],
+          }),
+        );
+      const ok = createOperatorRegistry().run(ctx, 'material.preset_apply', {
+        preset: 'concrete',
+        objects: ids,
+      }).ok;
+      expect(ok).toBe(true);
+      return { doc, ids };
     };
-    const ids: string[] = [];
-    for (let i = 0; i < 12; i++)
-      ids.push(
-        doc.addObject({
-          type: 'MESH',
-          name: `C${i}`,
-          data: doc.addMesh(`C${i}`, createCube({ size: 1 })),
-          location: [i * 2, 0, 0],
-        }),
-      );
-    expect(reg.run(ctx, 'material.preset_apply', { preset: 'concrete', objects: ids }).ok).toBe(true);
-    const t0 = performance.now();
-    const res = exportScene(doc, 'glb');
-    const seconds = (performance.now() - t0) / 1000;
-    const { json } = readGLB(res.data);
-    expect((json.materials as unknown[]).length).toBe(1);
-    expect((json.images as unknown[]).length).toBe(2); // base colour + normal
-    expect(seconds).toBeLessThan(6);
+    // 128 px instead of the automatic 512 keeps the test fast; the bake and its PNG encoding are
+    // still most of the export time
+    const opts = { bakeResolution: 128 };
+    const counts = (doc: SceneDoc) => {
+      const { json } = readGLB(exportScene(doc, 'glb', opts).data);
+      return { materials: (json.materials as unknown[]).length, images: (json.images as unknown[]).length };
+    };
+    const { doc, ids } = cubes(12);
+    expect(counts(doc)).toEqual({ materials: 1, images: 2 }); // base colour + normal
+    // and in about the time of one bake: the 12 copies export in about the time of one cube (a bake
+    // per copy takes about 12 times as long). CPU time, the least of 3 exports each.
+    const single = cubes(1).doc;
+    let copiesMs = Infinity;
+    let singleMs = Infinity;
+    for (let k = 0; k < 3; k++) {
+      let t0 = cpuMs();
+      exportScene(single, 'glb', opts);
+      singleMs = Math.min(singleMs, cpuMs() - t0);
+      t0 = cpuMs();
+      exportScene(doc, 'glb', opts);
+      copiesMs = Math.min(copiesMs, cpuMs() - t0);
+    }
+    expect(copiesMs).toBeLessThan(4 * singleMs);
     // a different mesh still gets its own bake
     doc.updateObject(ids[3], { data: doc.addMesh('Big', createCube({ size: 3 })) });
-    const res2 = exportScene(doc, 'glb');
-    expect((readGLB(res2.data).json.materials as unknown[]).length).toBe(2);
-  }, 60_000);
+    expect(counts(doc)).toEqual({ materials: 2, images: 4 });
+  });
 
   it('bakes GENERATED textures of deformed meshes from the undeformed positions (orco)', () => {
     const doc = SceneDoc.create({ empty: true });

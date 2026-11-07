@@ -9,6 +9,7 @@ import {
   type MeshData,
 } from '../src';
 import * as G from '../src/generate';
+import { cpuMs } from './timing-helpers';
 
 /*
  * Every procedural generator: structural validity, closed and outward-facing parts, determinism,
@@ -1023,11 +1024,13 @@ describe('size limits, big meshes and degenerate input (review regressions)', ()
     expect(glass).toBeLessThan(windows);
     expect(glass).toBeGreaterThan(windows - 6);
     // 200 storeys × 40 columns per facade (8000 openings each) used to test every grid cell
-    // against every opening (~17 s); now it is a lookup
-    const t0 = performance.now();
+    // against every opening; now it is a lookup. CPU time: 1.4 to 2.1 s, 2.3 to 2.8 s under
+    // coverage (also on a busy machine); the old code took 7.3 to 8.3 s, 28 to 32 s under coverage
+    // (so this bound catches it only under coverage).
+    const t0 = cpuMs();
     const tall = G.generateBuilding({ floors: 200, width: 100, depth: 100 });
     expect(tall.mesh.faces).toHaveLength(898_869); // the same mesh as before
-    expect(performance.now() - t0).toBeLessThan(15_000);
+    expect(cpuMs() - t0).toBeLessThan(10_000);
   }, 30_000);
 
   it('the block-culled sphere sampler polygonizes exactly like evaluating every sample', () => {
@@ -1070,11 +1073,44 @@ describe('size limits, big meshes and degenerate input (review regressions)', ()
   });
 
   it('dense blobs mesh in seconds, not tens of seconds', () => {
-    const t0 = performance.now();
+    // CPU time: 0.3 to 0.6 s, 1.6 to 2 s under coverage (also on a busy machine). The old code
+    // evaluated every sphere at every grid sample: 4.8 to 5.5 s, 9.5 to 11.4 s under coverage (so
+    // this bound catches it only under coverage; the next test catches it in both).
+    const t0 = cpuMs();
     const r = G.generateBlob({ count: 64, resolution: 120 });
-    expect(performance.now() - t0).toBeLessThan(8000);
+    expect(cpuMs() - t0).toBeLessThan(8000);
     expectValid(r);
   }, 30_000);
+
+  it('blob spheres that cannot change the surface add almost no meshing time', () => {
+    // with 127 small spheres hidden inside it, a big sphere meshes to the same surface in 0.8 to 1.5
+    // times its own CPU time (the least of 3 each); the old code, which evaluated every sphere at
+    // every grid sample, took 16 to 37 times as long
+    const big: G.BlobSphere = { center: [0, 0, 0], radius: 1 };
+    const rng = new G.Rng(5);
+    const hidden: G.BlobSphere[] = [
+      big,
+      ...Array.from({ length: 127 }, () => ({
+        center: [rng.spread(0.2), rng.spread(0.2), rng.spread(0.2)] as [number, number, number],
+        radius: 0.1,
+      })),
+    ];
+    const time = (spheres: G.BlobSphere[]) => {
+      const t = cpuMs();
+      const { mesh } = G.generateBlob({ spheres, resolution: 64 });
+      return { ms: cpuMs() - t, mesh };
+    };
+    let oneMs = Infinity;
+    let allMs = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const one = time([big]);
+      const all = time(hidden);
+      if (i === 0) expect(all.mesh.positions).toEqual(one.mesh.positions);
+      oneMs = Math.min(oneMs, one.ms);
+      allMs = Math.min(allMs, all.ms);
+    }
+    expect(allMs).toBeLessThan(5 * oneMs);
+  });
 
   it('inputs that cannot produce geometry return an empty mesh with the reason', () => {
     const pipe = G.generatePipe({

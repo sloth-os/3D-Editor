@@ -13,6 +13,7 @@ import {
   renderSceneSoftware,
   type RenderedImage,
 } from '../src';
+import { cpuMs } from './timing-helpers';
 
 // ---------------------------------------------------------------- helpers
 
@@ -365,10 +366,11 @@ describe('software renderer', () => {
     const sphere = createUVSphere({ segments: 320, ring_count: 160 });
     sphere.faceSmooth = sphere.faceSmooth.map(() => true);
     doc.addObject({ type: 'MESH', name: 'Dense', data: doc.addMesh('Dense', sphere) });
-    const t0 = performance.now();
+    const t0 = cpuMs();
     const img = renderSceneSoftware(doc, { width: 512, height: 512 });
-    const ms = performance.now() - t0;
-    expect(ms).toBeLessThan(6000);
+    // CPU time: about 0.8 s, 1.4 s under coverage on a busy machine (where the wall-clock time
+    // reached 8.4 s)
+    expect(cpuMs() - t0).toBeLessThan(6000);
     const m = mask(img);
     expect(Math.abs(m.cx - 255.5)).toBeLessThan(8);
     expect(Math.abs(m.cy - 255.5)).toBeLessThan(8);

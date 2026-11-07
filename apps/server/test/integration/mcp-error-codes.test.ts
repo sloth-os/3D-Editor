@@ -464,7 +464,7 @@ describe('browser UI operators an agent means as an edit', () => {
       [
         'run_operator',
         { operator: 'view3d.transform_modal', params: { mode: 'translate' } },
-        /To move, rotate or scale use transform\.translate \{value\}, transform\.rotate \{value, orient_axis\} or transform\.resize \{value\} on your selection .*: it starts a move, rotation or scale of the editor's selection that follows the person's mouse until they click\.$/,
+        /To move, rotate or scale use transform\.translate \{value\}, transform\.rotate \{value, orient_axis\} or transform\.resize \{value\} on your selection .*: it starts a move, rotation or scale \(\{mode: translate, rotate or resize\}\) of the editor's selection that follows the person's mouse until they click\.$/,
       ],
       [
         'edit_mesh',
@@ -788,21 +788,45 @@ describe('selection lists that the select mode would not use', () => {
     expect(before).toMatchObject({ mode: 'EDIT', mesh: { select_mode: 'FACE', faces: 1 } });
     const face = (await ok('get_mesh_data', { project: id, object: 'Cube' })).faces[0] as number[];
     const edge = [face[0], face[1]];
-    const VERT =
-      "leave select_mode out (or pass 'VERT') to select the listed vertices with the vertices of the listed " +
-      'edges and faces';
+    const VERT = "leave select_mode out (or pass 'VERT') to select";
     const cases: [Record<string, unknown>, string][] = [
       [
         { verts: [0, 1], select_mode: 'FACE' },
-        `select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: list only faces, or ${VERT}`,
+        "select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: list faces " +
+          `instead, or ${VERT} the listed vertices`,
+      ],
+      [
+        { verts: [0], faces: [0], select_mode: 'FACE' },
+        "select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: list only " +
+          `faces, or ${VERT} the listed vertices with the vertices of the listed faces`,
       ],
       [
         { verts: [0], edges: [edge], faces: [0], select_mode: 'FACE' },
-        `select_mode 'FACE' selects only the listed faces, so the listed verts and edges would be ignored: list only faces, or ${VERT}`,
+        "select_mode 'FACE' selects only the listed faces, so the listed verts and edges would be ignored: list " +
+          `only faces, or ${VERT} the listed vertices with the vertices of the listed edges and faces`,
       ],
       [
         { edges: [edge], faces: [0], select_mode: 'EDGE' },
-        `select_mode 'EDGE' selects only the listed edges, so the listed faces would be ignored: list only edges, or ${VERT}`,
+        "select_mode 'EDGE' selects only the listed edges, so the listed faces would be ignored: list only " +
+          `edges, or ${VERT} the vertices of the listed edges and faces`,
+      ],
+      [
+        { verts: [0], faces: [0], select_mode: 'EDGE' },
+        "select_mode 'EDGE' selects only the listed edges, so the listed verts and faces would be ignored: list " +
+          `edges instead, or ${VERT} the listed vertices with the vertices of the listed faces`,
+      ],
+      // one list that the mode does not use: leaving select_mode out infers the mode that does
+      [
+        { faces: [0], select_mode: 'EDGE' },
+        "select_mode 'EDGE' selects only the listed edges, so the listed faces would be ignored: list edges " +
+          "instead, leave select_mode out (or pass 'FACE') to select the listed faces, or pass 'VERT' to select " +
+          'the vertices of the listed faces',
+      ],
+      [
+        { edges: [edge], select_mode: 'FACE' },
+        "select_mode 'FACE' selects only the listed faces, so the listed edges would be ignored: list faces " +
+          "instead, leave select_mode out (or pass 'EDGE') to select the listed edges, or pass 'VERT' to select " +
+          'the vertices of the listed edges',
       ],
       [
         { faces: [0], all: true },
@@ -861,6 +885,37 @@ describe('selection lists that the select mode would not use', () => {
     expect((await ok('get_object', { project: id, object: 'Cube' })).data).toMatchObject({
       vertices: 8,
       faces: 6,
+    });
+    // the remedies are what the calls do: without select_mode the mode the message names selects the
+    // lists, and so does 'VERT' where the message offers it
+    for (const [mesh, message] of cases) {
+      if (!message.startsWith('select_mode ')) continue;
+      const lists = { ...mesh };
+      delete lists.select_mode;
+      const left = message.match(/leave select_mode out \(or pass '(\w+)'\)/)?.[1];
+      expect(left, message).toBeDefined();
+      for (const [select_mode, expected] of [
+        [undefined, left],
+        ['VERT', 'VERT'],
+        [left, left],
+      ]) {
+        const r = await ok('run_operator', {
+          project: id,
+          operator: 'scene.stats',
+          selection: {
+            objects: ['Cube'],
+            mode: 'EDIT',
+            mesh: { ...lists, ...(select_mode ? { select_mode } : {}) },
+          },
+        });
+        expect(r.selection.mesh.select_mode, `${JSON.stringify(lists)} ${select_mode}`).toBe(expected);
+      }
+      if (left !== 'VERT') expect(message).toContain("pass 'VERT' to select the vertices of the listed");
+    }
+    await ok('run_operator', {
+      project: id,
+      operator: 'scene.stats',
+      selection: { objects: ['Cube'], mode: 'EDIT', mesh: { faces: [1] } },
     });
     // the lists each mode uses still select: faces in FACE mode, edges in EDGE mode, all lists in
     // VERT mode (by their vertices), and all: false with lists
@@ -1154,15 +1209,27 @@ describe('tool descriptions', () => {
     expect(editor.description).toContain("in the viewport's shading or `shading`, without overlays");
     expect(editor.description).not.toMatch(/whatever the (viewport's|editor's) shading/);
     expect(editor.description).toContain("take screenshots with shading 'SOLID' (grey clay, much faster)");
-    // the cost of a screenshot depends on the viewport's shading: MATERIAL and RENDERED are not slow in
-    // themselves (about 1 s while the viewport shows that shading, 20-25 s while it shows another one)
-    const overstated = /tens of seconds per screenshot (and|in (them|MATERIAL or RENDERED))/;
+    // the cost of a screenshot: tens of seconds only for the first screenshot or viewport frame in
+    // MATERIAL or RENDERED shading after the editor opened the project, which builds and compiles the
+    // scene's materials for it; the editor keeps them, also for a screenshot that timed out, so later
+    // ones (and a retry) take about one frame: 20-24 s, then 1-2 s for 71 materials (docs/mcp.md),
+    // until a material edit: then the next one compiled the table's shaders again (10-15 s)
+    const overstated =
+      /tens of seconds (per screenshot|for a screenshot in)|each screenshot then builds|while (its|the) viewport shows another/;
     expect(editor.description).not.toMatch(overstated);
     expect(editor.description).toContain(
-      "a screenshot in MATERIAL or RENDERED shading while the viewport shows another one builds and compiles the scene's materials for that image (tens of seconds with many materials)",
+      "the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds: the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, take about one frame",
+    );
+    expect(editor.description).toContain(
+      'take about one frame, except that after a material edit the next screenshot or frame in each of these shadings can compile the shaders of the objects with that material again (10–15 s for an object with procedural wood textures)',
+    );
+    expect(editor.description).toContain(
+      'a screenshot that timed out still builds its materials, so retrying it waits for the rest and then takes about one frame',
     );
     expect(client.getInstructions()).not.toMatch(overstated);
-    expect(client.getInstructions()).toContain('while its viewport shows another shading');
+    expect(client.getInstructions()).toContain(
+      "the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds (it builds and compiles the scene's materials for that shading and keeps them; after a material edit the next one in each can compile the shaders of the objects with that material again, 10–15 s for an object with procedural wood textures)",
+    );
     // what the editor's UI operators do there, said plainly, and wm.read_homefile's missing answer
     expect(editor.description).not.toContain('when asked for one it says what it does here');
     expect(editor.description).toContain(
@@ -1176,7 +1243,7 @@ describe('tool descriptions', () => {
     ).timeout_ms;
     expect(timeout.description).not.toMatch(overstated);
     expect(timeout.description).toContain(
-      'and tens of seconds per screenshot in one of them while the viewport shows another shading',
+      "the first screenshot or viewport frame of a heavy scene in MATERIAL or RENDERED shading takes tens of seconds (the editor builds and compiles that shading's materials and keeps them), the first one after a material edit 10–15 s for an object with procedural wood textures (it can compile that object's shaders again), later ones seconds",
     );
     expect(timeout.maximum).toBe(55_000);
     expect(editor.description).toContain('at most 55000');
@@ -1200,11 +1267,15 @@ describe('timeouts of the browser editor', () => {
     expect(r.text).toBe(
       "editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 200 ms (at most 55000); " +
         'it may still carry the command out, and its next commands and renders wait until it has. The screenshot ' +
-        "is drawn in the viewport's shading, like a frame of the viewport, which takes seconds for a heavy scene " +
-        'in MATERIAL or RENDERED shading without GPU acceleration (software WebGL, e.g. a headless browser), tens ' +
-        'of seconds the first time while it compiles the shaders: pass a larger timeout_ms (at most 55000), or ' +
-        "pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use render_image " +
-        "with shading 'SOLID', and render_image for final images.",
+        "is drawn in the viewport's shading, like a frame of the viewport. An editor without GPU acceleration " +
+        '(software WebGL, e.g. a headless browser) takes seconds for that with a heavy scene in MATERIAL or ' +
+        'RENDERED shading, and tens of seconds for its first screenshot or frame in one of them after it opened ' +
+        "the project, while it builds and compiles the scene's materials for that shading. After a material " +
+        'edit, its next screenshot or frame in each of these shadings can compile the shaders of the objects with that ' +
+        'material again (10–15 s for an object with procedural wood textures). It keeps what it compiled, so a ' +
+        'retry waits for the editor to finish and then takes about one frame. Retry with a larger timeout_ms (at ' +
+        "most 55000), or pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use " +
+        "render_image with shading 'SOLID', and render_image for final images.",
     );
     // other failures keep their message
     expect(await ok('editor_command', { project: id, command: 'view.frame_all' })).toEqual({
@@ -1242,10 +1313,14 @@ describe('timeouts of the browser editor', () => {
     });
     expect(material.raw.isError).toBe(true);
     expect(material.text).toContain(
-      'until it has. In MATERIAL shading an editor without GPU acceleration (software WebGL, e.g. a headless ' +
-        'browser) can take seconds per screenshot of a heavy scene, and tens of seconds while its viewport shows ' +
-        "another shading (each screenshot then builds and compiles the scene's materials for MATERIAL): pass a " +
-        "larger timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot (grey clay, much faster)",
+      'until it has. An editor without GPU acceleration (software WebGL, e.g. a headless browser) takes seconds ' +
+        'per MATERIAL screenshot of a heavy scene, and tens of seconds for its first MATERIAL screenshot or ' +
+        "viewport frame after it opened the project, while it builds and compiles the scene's materials for " +
+        'MATERIAL shading. After a material edit, its next MATERIAL screenshot or viewport frame can compile ' +
+        'the shaders of the objects with that material again (10–15 s for an object with procedural wood ' +
+        'textures). It keeps what it compiled, so a retry waits for the editor to finish and then takes about ' +
+        "one frame. Retry with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot " +
+        '(grey clay, much faster)',
     );
     // a SOLID one is not told to use SOLID
     const solid = await call('editor_command', {
@@ -1259,8 +1334,11 @@ describe('timeouts of the browser editor', () => {
     expect(solid.text).toMatch(/sent \d+ s ago\)\. An editor without GPU acceleration/);
     expect(solid.text).toContain(
       'An editor without GPU acceleration (software WebGL, e.g. a headless browser) can take seconds ' +
-        'per screenshot of a scene with millions of triangles even in SOLID shading: pass a larger timeout_ms (at ' +
-        "most 55000); render_image renders without the editor with renderer 'software'.",
+        'per screenshot of a scene with millions of triangles even in SOLID shading, and a screenshot waits for ' +
+        "the viewport's frames in MATERIAL or RENDERED shading that compile shaders: its first one (tens of " +
+        "seconds for a heavy scene, while the editor builds and compiles the scene's materials) and its first " +
+        'one after a material edit (seconds). Pass a larger timeout_ms (at most 55000), or render without the ' +
+        "editor: render_image with renderer 'software'.",
     );
     expect(solid.text).not.toContain("pass shading 'SOLID'");
     // an unknown shading never reaches the editor

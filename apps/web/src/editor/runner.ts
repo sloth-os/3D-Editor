@@ -211,6 +211,7 @@ export function runOperator(
   source: OperatorSource = 'ui',
 ): RunResult {
   const def = registry.get(id);
+  recordUnchanged(session.undo);
   const continues = continuation;
   continuation = null;
   const repeatBefore = lastRepeat.value;
@@ -322,17 +323,33 @@ function stepHistory(session: ProjectSession, operator: string, direction: 'undo
 type StackItem = Y.UndoManager['undoStack'][number];
 type DeleteSet = StackItem['deletions'];
 
-/** Whether the clocks `from` … `to` − 1 of `client` all lie in `ds`. */
-function coveredBy(ds: DeleteSet, client: number, from: number, to: number): boolean {
-  const ranges = (ds.clients.get(client) ?? [])
-    .filter((r) => r.clock < to && r.clock + r.len > from)
-    .sort((a, b) => a.clock - b.clock);
-  let at = from;
-  for (const r of ranges) {
-    if (r.clock > at) return false;
-    at = Math.max(at, r.clock + r.len);
+/**
+ * The end of the range of `ds` that holds the clock `clock` of `client`, or `clock` when none does.
+ * The ranges of a stack item's sets are sorted and merged (Yjs's own lookups rely on that).
+ */
+function rangeEnd(ds: DeleteSet, client: number, clock: number): number {
+  const ranges = ds.clients.get(client) ?? [];
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const r = ranges[mid];
+    if (clock < r.clock) hi = mid - 1;
+    else if (clock >= r.clock + r.len) lo = mid + 1;
+    else return r.clock + r.len;
   }
-  return at >= to;
+  return clock;
+}
+
+/** Whether the clocks `from` … `to` − 1 of `client` all lie in `ds` (or in one of several sets). */
+function coveredBy(ds: DeleteSet | DeleteSet[], client: number, from: number, to: number): boolean {
+  const sets = Array.isArray(ds) ? ds : [ds];
+  for (let at = from; at < to;) {
+    const next = Math.max(...sets.map((d) => rangeEnd(d, client, at)));
+    if (next === at) return false;
+    at = next;
+  }
+  return true;
 }
 
 /** The structs of the document's store that hold the clocks of `ds`, with each one's client. */
@@ -353,29 +370,244 @@ function* structsOf(
   }
 }
 
+/** Key of a step's {@link UnchangedWrites} in the meta of its undo stack item. */
+const UNCHANGED_WRITES = 'unchanged-writes';
+
 /**
- * Whether others (MCP agents, other users) have changed any part of what an undo step of this
- * session changed since it was made. The document stores every field of an object or data block
- * as one entry of the block's map, holding the field's whole value: an object's `location`,
- * `rotation_euler` or `scale` (all three components), its `modifiers`, `constraints` or
- * `particle_systems` (the whole list), an armature's `pose` (every bone), a mesh's geometry (`data`,
- * one blob) and its `shape_keys` (every key) … Another origin's change is therefore part of the
- * step's change when it
- *  - set again or removed an entry the step set (any edit of the same field of the same block, also
- *    of another list item, bone or vector component than the step's), or removed a block the step
- *    changed (deleting the object or data block), or
- *  - set again an entry the step removed.
- * Changes of other fields of the same block, and of other blocks, are not. Undoing the step leaves
- * those parts as the others left them (Yjs never overwrites remote changes) and reverts the rest.
- * Reads the step's stack item (the entries it inserted and deleted) and changes nothing.
+ * The map entries an undo step set to the value they already had, up to rounding: its no-op writes.
+ * The document stores every field of an object or data block as one entry of the block's map,
+ * holding the field's whole value, and operators set some fields whole although they leave them as
+ * they were: transform.translate writes the `location`, `rotation_euler` and `scale` of every object
+ * it moves, as decomposed from the object's new matrix. A Move thus changes the location and
+ * rewrites the rotation and scale, unchanged up to rounding (see {@link SAME_NUMBER_TOLERANCE}).
+ * Only a rotation with |Y| above 90° or within 0.0256° of it (gimbal lock: Z goes into X), or with
+ * |X| or |Z| above 180°, and a negative Y or Z scale can come out as other, equivalent values: the
+ * Move then changes them.
  */
-function changedByOthers(undo: Y.UndoManager, step: StackItem): boolean {
+interface UnchangedWrites {
+  /** The step's values of those entries (its items, by id). */
+  set: DeleteSet;
+  /** The equal values they replaced. */
+  replaced: DeleteSet;
+  /** Whether the step changed anything else: set an entry to another value, added or removed one. */
+  changed: boolean;
+}
+
+/**
+ * How far apart two numbers that are not both whole may be and still count as the same stored value:
+ * this fraction of the larger one, or this much for numbers below 1. An operator that recomputes a
+ * value it leaves as it was can change its last digits: decomposing the new matrices of moved
+ * objects (1000 of each kind measured) changed their rotation angles by up to 1.8e-14 (children of
+ * rotated, scaled parents included), or 5.2e-13 with |Y| between 89° and 89.974°, and their scales
+ * by up to 2 units in the last place (11 for children of rotated parents with scales of 0.1 to 10).
+ * The viewport draws in 32-bit floats, which are 1.2e-7 apart near 1. Whole numbers (frames, counts,
+ * seeds of any size) count as the same only when equal.
+ */
+const SAME_NUMBER_TOLERANCE = 1e-12;
+
+/**
+ * Whether two stored values are the same plain data (JSON values, binary data): numbers within
+ * {@link SAME_NUMBER_TOLERANCE} of each other count as the same.
+ */
+function samePlain(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a === 'number' && typeof b === 'number')
+    return (
+      (Number.isNaN(a) && Number.isNaN(b)) ||
+      (!(Number.isInteger(a) && Number.isInteger(b)) &&
+        Math.abs(a - b) <= SAME_NUMBER_TOLERANCE * Math.max(1, Math.abs(a), Math.abs(b)))
+    );
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (a instanceof Uint8Array || b instanceof Uint8Array) {
+    if (!(a instanceof Uint8Array && b instanceof Uint8Array) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((v, i) => samePlain(v, b[i]));
+  }
+  // other objects than plain ones (a Yjs type …) are never the same value
+  const plain = (o: object) => [Object.prototype, null].includes(Object.getPrototypeOf(o));
+  if (!plain(a) || !plain(b)) return false;
+  const ra = a as Record<string, unknown>;
+  const rb = b as Record<string, unknown>;
+  const keys = Object.keys(ra);
+  return (
+    keys.length === Object.keys(rb).length &&
+    keys.every((k) => Object.prototype.hasOwnProperty.call(rb, k) && samePlain(ra[k], rb[k]))
+  );
+}
+
+/** Whether two map entries hold the same plain value (a value that is a Yjs type never is). */
+function sameValue(a: Y.Item, b: Y.Item): boolean {
+  const ca = a.content;
+  const cb = b.content;
+  if (ca instanceof Y.ContentAny && cb instanceof Y.ContentAny)
+    return ca.arr.length === 1 && cb.arr.length === 1 && samePlain(ca.arr[0], cb.arr[0]);
+  return ca instanceof Y.ContentBinary && cb instanceof Y.ContentBinary && samePlain(ca.content, cb.content);
+}
+
+/**
+ * Records a step's {@link UnchangedWrites} in its stack item. Runs when the step is added to the undo
+ * stack, right after its transaction: the values it replaced are still there then (the undo manager
+ * keeps what its steps removed), and its own values are too. Yjs may later drop the content of an
+ * entry another origin removes, so this cannot be told afterwards.
+ */
+function recordUnchangedWrites(doc: Y.Doc, step: StackItem): void {
+  const set = Y.createDeleteSet();
+  const replaced = Y.createDeleteSet();
+  const add = (ds: DeleteSet, id: Y.ID) => {
+    const ranges = ds.clients.get(id.client) ?? [];
+    ds.clients.set(id.client, ranges);
+    ranges.push({ clock: id.clock, len: 1 });
+  };
+  let changed = false;
+  // the entries the step set, with the value each held before the step
+  for (const { s } of structsOf(doc, step.insertions)) {
+    // a value the step replaced itself (it set the entry twice)
+    if (s instanceof Y.Item && s.deleted) continue;
+    let before = s instanceof Y.Item && s.parentSub !== null && s.length === 1 ? s.left : null;
+    while (before && Y.isDeleted(step.insertions, before.id)) before = before.left;
+    // the value it replaced was there until the step (the step did not add the entry)
+    if (
+      s instanceof Y.Item &&
+      before?.length === 1 &&
+      Y.isDeleted(step.deletions, before.id) &&
+      sameValue(before, s)
+    ) {
+      add(set, s.id);
+      add(replaced, before.id);
+    } else changed = true;
+  }
+  const unchanged: UnchangedWrites = {
+    set: Y.mergeDeleteSets([set]),
+    replaced: Y.mergeDeleteSets([replaced]),
+    changed,
+  };
+  // the entries (and blocks) the step removed, other than the values its writes replaced
+  unchanged.changed ||= [...step.deletions.clients].some(([client, ranges]) =>
+    ranges.some((r) => !coveredBy([step.insertions, unchanged.replaced], client, r.clock, r.clock + r.len)),
+  );
+  step.meta.set(UNCHANGED_WRITES, unchanged);
+}
+
+const recordingUnchanged = new WeakSet<Y.UndoManager>();
+
+/**
+ * Makes `undo` record the {@link UnchangedWrites} of every step it adds to its undo stack: an
+ * operation's own step, and the new step (a new stack item with new copies of the entries) that
+ * the session's undo and redo of a step make.
+ */
+function recordUnchanged(undo: Y.UndoManager): void {
+  if (recordingUnchanged.has(undo)) return;
+  recordingUnchanged.add(undo);
+  const record = (e: { stackItem: StackItem; type: 'undo' | 'redo' }) => {
+    if (e.type !== 'undo') return;
+    try {
+      recordUnchangedWrites(undo.doc, e.stackItem);
+    } catch (err) {
+      // it runs inside the step's transaction, whose changes are made: never fail that. Without a
+      // record every entry the step set counts as changed (see changedByOthers)
+      e.stackItem.meta.delete(UNCHANGED_WRITES);
+      console.error('[runner] could not record the unchanged writes of an undo step', err);
+    }
+  };
+  undo.on('stack-item-added', record);
+  // a transaction merged into the last step (only with a capture timeout): record the whole step anew
+  undo.on('stack-item-updated', record);
+}
+
+/**
+ * What undoing an undo step of this session would do, read as Yjs's UndoManager does it (popStackItem
+ * and redoItem) without undoing anything.
+ */
+function undoOutlook(undo: Y.UndoManager, step: StackItem) {
   const doc = undo.doc;
   const inScope = (item: Y.Item) =>
     undo.scope.some((t) => t === doc || Y.isParentOf(t as Y.AbstractType<unknown>, item));
   // what the session's other undo and redo steps removed (Yjs passes over those, see redoItem)
   const deletedByHistory = (id: Y.ID) =>
     [...undo.undoStack, ...undo.redoStack].some((s) => s !== step && Y.isDeleted(s.deletions, id));
+  /**
+   * Whether a value of `item`'s entry that someone else set follows it, past the step's own values
+   * and the ones the session's undo and redo removed: undoing the step then leaves the entry as they
+   * set it (Yjs's redoItem gives up on that conflict). Null when this cannot be told (the content
+   * of a removed block is gone).
+   */
+  const setLater = (item: Y.Item): boolean | null => {
+    let left: Y.Item | Y.GC = item;
+    while (
+      left instanceof Y.Item &&
+      left.right &&
+      (left.right.redone || Y.isDeleted(step.insertions, left.right.id) || deletedByHistory(left.right.id))
+    ) {
+      left = left.right;
+      while (left instanceof Y.Item && left.redone) left = Y.getItem(doc.store, left.redone);
+    }
+    return left instanceof Y.Item ? left.right !== null : null;
+  };
+  /** The value `item`'s entry holds now, in the block that holds the entry now. */
+  const currentValue = (item: Y.Item): Y.Item | undefined => {
+    let block = (item.parent as Y.AbstractType<unknown>)._item;
+    // a block the session's undo brought back is a copy (Yjs's redoItem follows it the same way)
+    while (block?.deleted && block.redone) {
+      const copy: Y.Item | Y.GC = Y.getItem(doc.store, block.redone);
+      if (!(copy instanceof Y.Item)) return undefined;
+      block = copy;
+    }
+    const type = block ? (block.content as Y.ContentType).type : (item.parent as Y.AbstractType<unknown>);
+    return type._map.get(item.parentSub as string);
+  };
+  // the values undoing the step removes: the ones it set that are still there, or the copies of
+  // them the session's undo and redo brought back (as Yjs's popStackItem finds them)
+  let removedByUndo: Set<Y.Item | Y.GC> | undefined;
+  const undoRemoves = (value: Y.Item | undefined): boolean => {
+    if (!removedByUndo) {
+      removedByUndo = new Set();
+      for (const { s } of structsOf(doc, step.insertions)) {
+        let cur: Y.Item | Y.GC = s;
+        while (cur instanceof Y.Item && cur.redone) cur = Y.getItem(doc.store, cur.redone);
+        if (!cur.deleted) removedByUndo.add(cur);
+      }
+    }
+    return !!value && !value.deleted && removedByUndo.has(value);
+  };
+  return { inScope, setLater, currentValue, undoRemoves };
+}
+
+/**
+ * Whether others (MCP agents, other users) have changed any part of what an undo step of this
+ * session changed since it was made, so that undoing the step would not bring back what was there
+ * before it with their edits applied. Undoing reverts what the step changed and leaves what others
+ * set since as they left it (Yjs never overwrites a value another origin set). Every field of an
+ * object or data block is one entry of the block's map holding the field's whole value: an
+ * object's `location`, `rotation_euler` or `scale` (all three components), its `modifiers`,
+ * `constraints` or `particle_systems` (the whole list), an armature's `pose` (every bone), a mesh's
+ * geometry (`data`, one blob) and its `shape_keys` (every key) … Another origin's change counts when
+ * it
+ *  - set again or removed an entry the step changed (any edit of the same field of the same block,
+ *    also of another list item, bone or vector component than the step's, and also to the value the
+ *    step set: undoing can no longer bring back the value from before the step), or removed a block
+ *    the step changed (deleting the object or data block),
+ *  - set again an entry the step removed,
+ *  - removed an entry the step rewrote unchanged (see {@link UnchangedWrites}; undoing would bring it
+ *    back), or the block that holds one, or
+ *  - set an entry the step rewrote unchanged at the same time as the step (neither had the other's
+ *    change yet) to a value that lost to the step's: Yjs orders values set at the same time by client
+ *    id, and undoing would remove the step's value without bringing back the one before it.
+ * Others setting an entry the step rewrote unchanged otherwise do not count: undoing keeps their
+ * value, which is what the entry would hold had they edited it before the step (the step only
+ * rewrote it), e.g. setting the rotation or scale of an object a Move only moved (rotating it with R
+ * also stores its location again, which the Move changed). Nor do changes of other fields of the
+ * same block, and of other blocks. Reads the step's stack item (the entries it inserted and
+ * deleted, and the no-op writes recorded in its meta; without that record every entry it set counts
+ * as changed) and changes nothing.
+ */
+function changedByOthers(undo: Y.UndoManager, step: StackItem): boolean {
+  const doc = undo.doc;
+  const unchanged = step.meta.get(UNCHANGED_WRITES) as UnchangedWrites | undefined;
+  const { inScope, setLater, currentValue, undoRemoves } = undoOutlook(undo, step);
   // the entries the step set: removed or replaced since, other than by the step itself (a field it
   // set twice); an entry that an undo removed and brought back again counts as still there
   for (const { client, s, from, to } of structsOf(doc, step.insertions)) {
@@ -385,33 +617,60 @@ function changedByOthers(undo: Y.UndoManager, step: StackItem): boolean {
     if (cur === s && coveredBy(step.deletions, client, from, to)) continue;
     // a removed child of a removed block may be left without its content (Y.GC): removed by others
     if (cur instanceof Y.Item && !inScope(cur)) continue;
+    // an entry the step rewrote unchanged, set again by others in the block that still holds it
+    if (
+      unchanged &&
+      cur instanceof Y.Item &&
+      coveredBy([step.deletions, unchanged.set], client, from, to) &&
+      !(cur.parent as Y.AbstractType<unknown>)._item?.deleted &&
+      setLater(cur)
+    )
+      continue;
     return true;
   }
   // the entries the step removed (not ones it set itself): set again since, or their block removed
   // (Yjs's redo of a removed map entry gives up on the same conditions)
-  for (const { s } of structsOf(doc, step.deletions)) {
-    if (!(s instanceof Y.Item) || s.parentSub === null || Y.isDeleted(step.insertions, s.id)) continue;
+  for (const { client, s, from, to } of structsOf(doc, step.deletions)) {
+    if (!(s instanceof Y.Item) || s.parentSub === null || coveredBy(step.insertions, client, from, to))
+      continue;
     if (!inScope(s)) continue;
     const parent = (s.parent as Y.AbstractType<unknown>)._item;
     if (parent?.deleted && !parent.redone && !Y.isDeleted(step.deletions, parent.id)) return true;
-    // the later values of the entry's key: the step's own, or ones an undo or redo removed
-    let left: Y.Item | Y.GC = s;
-    while (
-      left instanceof Y.Item &&
-      left.right &&
-      (left.right.redone || Y.isDeleted(step.insertions, left.right.id) || deletedByHistory(left.right.id))
-    ) {
-      left = left.right;
-      while (left instanceof Y.Item && left.redone) left = Y.getItem(doc.store, left.redone);
+    if (unchanged && coveredBy([step.insertions, unchanged.replaced], client, from, to)) {
+      // the value an unchanged rewrite replaced. Undoing brings it back, or keeps the value others
+      // set since (told above). Only a value of theirs set at the same time as the step's that lost
+      // to it (Yjs orders such values by client id) lies between the two: undoing then removes the
+      // step's value and cannot bring this one back, which leaves the entry empty (an object's scale
+      // would read 1). Counted too when this cannot be told
+      const later = setLater(s);
+      if (later === null || (later && undoRemoves(currentValue(s)))) return true;
+      continue;
     }
-    if (!(left instanceof Y.Item) || left.right) return true;
+    if (setLater(s) !== false) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether undoing an undo step of this session would leave an entry it set empty: others set the
+ * entry at the same time as the step (neither had the other's change yet) to a value that lost to
+ * the step's (Yjs orders values set at the same time by client id). Their value lies between the
+ * step's and the one the step replaced, so undoing removes the step's value and cannot bring the
+ * replaced one back (see {@link changedByOthers}, which counts this for every other operation).
+ */
+function undoEmptiesEntry(undo: Y.UndoManager, step: StackItem): boolean {
+  const { inScope, setLater, currentValue, undoRemoves } = undoOutlook(undo, step);
+  for (const { client, s, from, to } of structsOf(undo.doc, step.deletions)) {
+    if (!(s instanceof Y.Item) || s.parentSub === null || coveredBy(step.insertions, client, from, to))
+      continue;
+    if (inScope(s) && setLater(s) !== false && undoRemoves(currentValue(s))) return true;
   }
   return false;
 }
 
 /**
  * Undoes the last step of the session's history, the own step of the operation being adjusted.
- * Others (an MCP agent, another user) may since have overwritten everything the step changed, e.g.
+ * Others (an MCP agent, another user) may since have overwritten everything the step wrote, e.g.
  * by setting the same object's pose: Yjs then drops the step, which has nothing left to undo, and
  * undoes the one before it instead. That one is redone at once, so adjusting an operation never
  * reverts an earlier one. Returns whether the step itself was undone.
@@ -435,16 +694,23 @@ function undoOwnStep(session: ProjectSession, operator: string): boolean {
  * brought back with the selection it left, and the operation stays adjustable with its previous
  * parameters: a rejected value changes nothing. Returns null when there is no operation to adjust
  * or it can no longer be adjusted: something else was done or undone since, or others changed what
- * it did and it is not a property edit (below).
+ * it did (below).
  *
- * Others (MCP agents, other users) may since have changed part or all of what the operation
- * changed (see {@link changedByOthers}: e.g. moved one of the objects it moved, edited a
- * constraint of the object it added a constraint to). Undoing it would then revert only the rest,
- * or nothing. A property edit (setting values of something that exists) runs again on top of their
- * edits, which keeps them and changes only what the adjusted parameters set. Any other operation
- * would be applied again to what they changed (a double move, a second constraint, their new keys
- * removed again), so it can no longer be adjusted: this is decided before anything is undone,
- * nothing is undone or run again, and the panel closes with a warning (a toast and the Info log).
+ * Others (MCP agents, other users) may since have edited what the operation wrote. Edits that
+ * leave what it changed as it left it keep it adjustable: edits of other objects and fields, and
+ * new values of fields it rewrote unchanged (setting the rotation or scale of an object a Move only
+ * moved; see {@link UnchangedWrites}): undoing it keeps their edits, and the re-run starts from
+ * them. Edits of part or all of what it changed (e.g. moving one of the objects it moved, editing a
+ * constraint of the object it added a constraint to) leave undoing it nothing or only the rest to
+ * revert. A property edit (setting values of something that exists) then runs again on top of their edits,
+ * which keeps them and changes only what the adjusted parameters set. Any other operation would be
+ * applied again to what they changed (a double move, a second constraint, their new keys removed
+ * again), so it can no longer be adjusted. Neither can any operation after others set a field it
+ * wrote at the same time as it (neither had the other's change yet) to a value that lost to its
+ * value: undoing would leave the field empty (see {@link changedByOthers}), and a property edit
+ * would rebuild the field from what it sets (a pose from the one bone channel it sets). This is
+ * decided before anything is undone: nothing is undone or run again, and the panel closes with a
+ * warning (a toast and the Info log).
  */
 export function redoLast(
   session: ProjectSession,
@@ -486,12 +752,18 @@ function redoLastOperation(
   const after = selectionSnapshot(session);
   // its own undo step (when it changed something), read before anything is undone
   const own = last.undoStep ? session.undo.undoStack[session.undo.undoStack.length - 1] : undefined;
-  if (own && !PROPERTY_EDITS.has(last.id) && changedByOthers(session.undo, own)) return cannotAdjust(last);
+  // a property edit runs again on top of others' edits, but not on an entry undoing it would empty:
+  // it would lose the rest of the entry (the other bones and channels of a pose it sets one bone of)
+  const propertyEdit = PROPERTY_EDITS.has(last.id);
+  if (own && (propertyEdit ? undoEmptiesEntry(session.undo, own) : changedByOthers(session.undo, own)))
+    return cannotAdjust(last);
   // an operation that changed nothing has no undo step of its own: undoing would revert the one before
   const undone = last.undoStep && undoOwnStep(session, last.id);
-  // its step had nothing left to undo: others overwrote all of it (and Yjs dropped the step)
+  // its step had nothing left to undo: others overwrote all of it (and Yjs dropped the step). When
+  // all it did was rewrite values unchanged, it runs again on top of their edits, like a property edit
   const overwritten = last.undoStep && !undone;
-  if (overwritten && !PROPERTY_EDITS.has(last.id)) {
+  const rewroteOnly = (own?.meta.get(UNCHANGED_WRITES) as UnchangedWrites | undefined)?.changed === false;
+  if (overwritten && !propertyEdit && !rewroteOnly) {
     restoreSelection(session, after);
     return cannotAdjust(last);
   }

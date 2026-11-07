@@ -25,6 +25,7 @@ import {
   type Vec3,
 } from '../src';
 import { linearToSrgb } from '../src/render/color';
+import { cpuMs } from './timing-helpers';
 
 function slot(p: ProceduralTexture): TextureSlot {
   return { image: '', scale: [1, 1], offset: [0, 0], procedural: p };
@@ -395,16 +396,18 @@ describe('CPU renderer: procedural shading cost', () => {
       return doc;
     };
     const view = { position: [0, -9, 4] as Vec3, target: [0, 0, 0.5] as Vec3 };
+    // CPU time, so that a busy machine slows neither render
     const time = (doc: SceneDoc, samples: number) => {
       renderSceneSoftware(doc, { width: 64, height: 36, samples, view }); // warm-up
-      const t = performance.now();
+      const t = cpuMs();
       const img = renderSceneSoftware(doc, { width: 320, height: 180, samples, view });
-      return { ms: performance.now() - t, img };
+      return { ms: cpuMs() - t, img };
     };
     const rock = ground('rock');
     const s1 = time(rock, 1);
     const s4 = time(rock, 4);
-    // 16 samples per pixel share one evaluation: far less than 16× the single-sample cost
+    // 16 samples per pixel share one evaluation: far less than 16× the single-sample cost (1.2 to
+    // 1.6 times; 13 to 17 times when every sample was shaded)
     expect(s4.ms).toBeLessThan(s1.ms * 6);
     // and the image is the same texture (anti-aliased geometry only)
     let diff = 0;

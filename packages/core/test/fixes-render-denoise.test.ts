@@ -117,7 +117,9 @@ describe('path tracer denoising at very low sample counts (#12, #18)', () => {
         max_bounces: 3,
         seed,
       });
-    const ref = render(256, false, 11);
+    // 64 samples are enough for the reference: with 256 the differences to it below change by 2 %
+    // at most
+    const ref = render(64, false, 11);
     const raw1 = render(1, false);
     const den1 = render(1, true);
     const den2 = render(2, true);

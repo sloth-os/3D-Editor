@@ -155,7 +155,6 @@ export class RoomManager {
   private async load(id: string, create: boolean): Promise<Room | null> {
     const store = this.store;
     let update: Uint8Array | null = null;
-    let etag: string | undefined;
     let info: ProjectInfo | null = null;
     let persisted = false;
     let failed = false;
@@ -166,10 +165,7 @@ export class RoomManager {
         await withSpan('persistence.load', { 'project.id': id }, async (span) => {
           const doc = await store.loadDocument(id);
           info = await store.loadInfo(id).catch(() => null);
-          if (doc) {
-            update = doc.update;
-            etag = doc.etag;
-          }
+          if (doc) update = doc.update;
           persisted = !!doc || !!info;
           span.setAttribute('persistence.found', persisted);
         });
@@ -187,7 +183,7 @@ export class RoomManager {
     if (!persisted && !create) return null;
     const ydoc = new Y.Doc();
     if (update) Y.applyUpdate(ydoc, update, STORAGE_ORIGIN);
-    const room = new Room(id, ydoc, this.roomDeps(), { info, etag, persisted });
+    const room = new Room(id, ydoc, this.roomDeps(), { info, persisted });
     this.rooms.set(id, room);
     this.updateGauge();
     // Storage was unreachable: the first save merges whatever is stored (CRDT) into this room.

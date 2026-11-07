@@ -98,63 +98,137 @@ describe('editor command catalogue', () => {
 });
 
 describe('editor command timeouts', () => {
-  it('name timeout_ms and its maximum, and say what to do', () => {
-    const msg = editorTimeoutMessage('screenshot', 10_000);
-    expect(msg).toBe(
-      "editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000); " +
-        'it may still carry the command out, and its next commands and renders wait until it has. The screenshot ' +
-        "is drawn in the viewport's shading, like a frame of the viewport, which takes seconds for a heavy scene " +
-        'in MATERIAL or RENDERED shading without GPU acceleration (software WebGL, e.g. a headless browser), tens ' +
-        'of seconds the first time while it compiles the shaders: pass a larger timeout_ms (at most 55000), or ' +
-        "pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use render_image " +
-        "with shading 'SOLID', and render_image for final images.",
-    );
-    // at the maximum there is no larger timeout to ask for
-    const max = editorTimeoutMessage('screenshot', MAX_EDITOR_TIMEOUT_MS);
-    expect(max).toContain('timeout_ms is at its maximum (55000)');
-    expect(max).not.toContain('pass a larger timeout_ms');
+  const HEAD = 'it may still carry the command out, and its next commands and renders wait until it has.';
+  const NO_GPU = 'An editor without GPU acceleration (software WebGL, e.g. a headless browser)';
+  const SOLID_ADVICE =
+    "pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use render_image " +
+    "with shading 'SOLID', and render_image for final images.";
+  /** A material edit compiles the shaders of the objects with that material again. */
+  const edited = (next: string) =>
+    `After a material edit, its next ${next} can compile the shaders of the objects with that material ` +
+    'again (10–15 s for an object with procedural wood textures).';
+  const KEPT =
+    'It keeps what it compiled, so a retry waits for the editor to finish and then takes about one frame.';
+  const VIEWPORT =
+    "The screenshot is drawn in the viewport's shading, like a frame of the viewport. An editor without GPU " +
+    'acceleration (software WebGL, e.g. a headless browser) takes seconds for that with a heavy scene in ' +
+    'MATERIAL or RENDERED shading, and tens of seconds for its first screenshot or frame in one of them after ' +
+    "it opened the project, while it builds and compiles the scene's materials for that shading. " +
+    `${edited('screenshot or frame in each of these shadings')} ${KEPT}`;
+  const shaded = (shading: string) =>
+    `${NO_GPU} takes seconds per ${shading} screenshot of a heavy scene, and tens of seconds for its first ` +
+    `${shading} screenshot or viewport frame after it opened the project, while it builds and compiles the ` +
+    `scene's materials for ${shading} shading. ${edited(`${shading} screenshot or viewport frame`)} ${KEPT}`;
+  const fast = (shading: string) =>
+    `${NO_GPU} can take seconds per screenshot of a scene with millions of triangles even in ${shading} ` +
+    "shading, and a screenshot waits for the viewport's frames in MATERIAL or RENDERED shading that compile " +
+    'shaders: its first one (tens of seconds for a heavy scene, while the editor builds and compiles the ' +
+    "scene's materials) and its first one after a material edit (seconds).";
+  const viewport = (command: string) =>
+    `'${command}' waits while the editor draws its viewport. ${NO_GPU} takes seconds per frame for a scene ` +
+    'with millions of triangles, and seconds for its first frame of a heavy scene in MATERIAL or RENDERED ' +
+    "shading, while it builds the scene's materials.";
+  const SWITCH =
+    "switch the viewport to SOLID shading (editor_command view.shading {shading: 'SOLID'}), which draws much faster.";
+  const BUSY =
+    "It was still busy with an earlier request that the server had stopped waiting for (editor_command 'screenshot' sent 12 s ago).";
+  /** The cases: command, params, why it can take long, the advice below and at the maximum. */
+  const cases: [string, Record<string, unknown>, string, string, string][] = [
+    [
+      'screenshot',
+      {},
+      VIEWPORT,
+      `Retry with a larger timeout_ms (at most 55000), or ${SOLID_ADVICE}`,
+      `With timeout_ms at its maximum (55000), retry or ${SOLID_ADVICE}`,
+    ],
+    ...(['MATERIAL', 'rendered'] as const).map(
+      (shading): [string, Record<string, unknown>, string, string, string] => [
+        'screenshot',
+        { shading, width: 640 },
+        shaded(shading.toUpperCase()),
+        `Retry with a larger timeout_ms (at most 55000), or ${SOLID_ADVICE}`,
+        `With timeout_ms at its maximum (55000), retry or ${SOLID_ADVICE}`,
+      ],
+    ),
+    ...(['SOLID', 'wireframe'] as const).map(
+      (shading): [string, Record<string, unknown>, string, string, string] => [
+        'screenshot',
+        { shading },
+        fast(shading.toUpperCase()),
+        "Pass a larger timeout_ms (at most 55000), or render without the editor: render_image with renderer 'software'.",
+        "With timeout_ms at its maximum (55000), render without the editor: render_image with renderer 'software'.",
+      ],
+    ),
+    ...['select', 'set_frame', 'view.set_view', 'run_operator'].map(
+      (command): [string, Record<string, unknown>, string, string, string] => [
+        command,
+        {},
+        viewport(command),
+        `Pass a larger timeout_ms (at most 55000), or ${SWITCH}`,
+        `With timeout_ms at its maximum (55000), ${SWITCH}`,
+      ],
+    ),
+  ];
+
+  it('name timeout_ms and its maximum, why the editor can take that long and what to do', () => {
+    for (const [command, params, why, below] of cases)
+      expect(
+        editorTimeoutMessage(command, 10_000, null, params),
+        `${command} ${JSON.stringify(params)}`,
+      ).toBe(
+        `editor_command '${command}' failed: the editor did not answer within timeout_ms = 10000 ms (at most ` +
+          `55000); ${HEAD} ${why} ${below}`,
+      );
   });
 
-  it('advise SOLID for screenshots in the shading they were asked for, and not again for SOLID ones', () => {
-    const rendered = editorTimeoutMessage('screenshot', 10_000, null, { shading: 'rendered', width: 640 });
-    expect(rendered).toContain(
-      'until it has. In RENDERED shading an editor without GPU acceleration (software WebGL, e.g. a headless ' +
-        'browser) can take seconds per screenshot of a heavy scene, and tens of seconds while its viewport shows ' +
-        "another shading (each screenshot then builds and compiles the scene's materials for RENDERED): pass a " +
-        'larger timeout_ms (at most 55000)',
-    );
-    expect(rendered).toContain("or pass shading 'SOLID' for the screenshot (grey clay, much faster)");
-    for (const shading of ['SOLID', 'wireframe']) {
-      const msg = editorTimeoutMessage('screenshot', 10_000, null, { shading });
-      expect(msg).toBe(
-        "editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000); " +
-          'it may still carry the command out, and its next commands and renders wait until it has. An editor ' +
-          'without GPU acceleration (software WebGL, e.g. a headless browser) can take seconds per screenshot of a ' +
-          `scene with millions of triangles even in ${shading.toUpperCase()} shading: pass a larger timeout_ms (at ` +
-          "most 55000); render_image renders without the editor with renderer 'software'.",
+  it('at the maximum, advise what else helps instead of a larger timeout_ms', () => {
+    for (const [command, params, why, , atMax] of cases) {
+      const msg = editorTimeoutMessage(command, MAX_EDITOR_TIMEOUT_MS, null, params);
+      expect(msg, `${command} ${JSON.stringify(params)}`).toBe(
+        `editor_command '${command}' failed: the editor did not answer within timeout_ms = 55000 ms (at most ` +
+          `55000); ${HEAD} ${why} ${atMax}`,
+      );
+      expect(msg).not.toMatch(/larger timeout_ms/);
+    }
+  });
+
+  it('read as sentences on both sides of the maximum, with and without the earlier request', () => {
+    for (const [command, params] of cases)
+      for (const timeout of [10_000, MAX_EDITOR_TIMEOUT_MS - 1, MAX_EDITOR_TIMEOUT_MS])
+        for (const busy of [null, "editor_command 'screenshot' sent 12 s ago"]) {
+          const msg = editorTimeoutMessage(command, timeout, busy, params);
+          const label = `${command} ${JSON.stringify(params)} ${timeout} ${busy}`;
+          // a statement is never joined to an instruction with "or" ("… is at its maximum (55000), or pass …")
+          expect(msg, label).not.toMatch(/maximum \(\d+\)[,;:]? or /);
+          expect(msg, label).not.toMatch(/is at its maximum/);
+          // every sentence starts with a capital letter or a quoted command (e.g. is no sentence end)
+          for (const m of msg.replace(/e\.g\. /g, 'eg ').matchAll(/[.;:] (\S)/g))
+            if (m[0].startsWith('.')) expect(m[1], `${label}: ${m[0]}`).toMatch(/[A-Z']/);
+          expect(msg, label).toMatch(/\.$/);
+          expect(msg.includes(BUSY), label).toBe(!!busy);
+          if (busy) expect(msg, label).toContain(`until it has. ${BUSY} `);
+          expect(msg.includes('With timeout_ms at its maximum (55000), '), label).toBe(
+            timeout === MAX_EDITOR_TIMEOUT_MS,
+          );
+          expect(msg.includes('a larger timeout_ms (at most 55000), or '), label).toBe(
+            timeout < MAX_EDITOR_TIMEOUT_MS,
+          );
+        }
+  });
+
+  it('advise SOLID for screenshots in other shadings, and not again for SOLID or WIREFRAME ones', () => {
+    for (const [command, params] of cases) {
+      const msg = editorTimeoutMessage(command, 10_000, null, params);
+      const shading = typeof params.shading === 'string' ? params.shading.toUpperCase() : null;
+      expect(msg.includes("pass shading 'SOLID'"), `${command} ${shading}`).toBe(
+        command === 'screenshot' && shading !== 'SOLID' && shading !== 'WIREFRAME',
       );
     }
   });
 
   it('explain commands that draw nothing by the viewport they wait for, not by screenshots', () => {
-    for (const command of ['select', 'set_frame', 'view.set_view', 'run_operator']) {
-      const msg = editorTimeoutMessage(command, 10_000);
-      expect(msg).toBe(
-        `editor_command '${command}' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000); ` +
-          'it may still carry the command out, and its next commands and renders wait until it has. ' +
-          `'${command}' waits while the editor draws its viewport, which takes seconds per frame for a heavy scene ` +
-          'in MATERIAL or RENDERED shading without GPU acceleration (software WebGL, e.g. a headless browser), tens ' +
-          'of seconds the first time while it compiles the shaders: pass a larger timeout_ms (at most 55000), or ' +
-          "switch the viewport to SOLID shading (editor_command view.shading {shading: 'SOLID'}), which draws much faster.",
-      );
-      expect(msg).not.toMatch(/screenshot|render_image/);
-    }
-  });
-
-  it('name the earlier request the editor was still busy with', () => {
-    expect(editorTimeoutMessage('select', 10_000, "editor_command 'screenshot' sent 12 s ago")).toContain(
-      "until it has. It was still busy with an earlier request that the server had stopped waiting for (editor_command 'screenshot' sent 12 s ago). 'select' waits",
-    );
+    for (const command of ['select', 'set_frame', 'view.set_view', 'run_operator'])
+      expect(editorTimeoutMessage(command, 10_000)).not.toMatch(/screenshot|render_image/);
   });
 
   it('stay under the default request timeout of MCP SDK clients', () => {
@@ -165,30 +239,81 @@ describe('editor command timeouts', () => {
 
 describe('the cost of screenshots', () => {
   /*
-   * In software WebGL a screenshot in the viewport's shading costs about one frame of the viewport
-   * (about 1 s in RENDERED for a 71-material scene that the viewport showed in RENDERED); one in
-   * another shading builds and compiles the scene's materials for that image (20–25 s in RENDERED
-   * while the viewport showed SOLID): apps/web rpc.ts. The texts must not make MATERIAL and
-   * RENDERED screenshots slow in themselves.
+   * Measured in headless Chromium with software WebGL (SwiftShader), a scene of 81 objects and 71
+   * materials at 1280×720 (docs/mcp.md): the first screenshot or viewport frame in MATERIAL or
+   * RENDERED shading after the editor opened the project took 20–24 s, as it builds and compiles the
+   * scene's materials for that shading; the editor keeps them (scene-objects.ts materialSets), so
+   * later screenshots in it took 1.0–2.3 s, also after the viewport switched to it, and a retry of a
+   * first screenshot that timed out waited for the rest of it and then took about one frame. Until a
+   * material changes: an edit rebuilds the materials of the objects that use it, and the next
+   * screenshot in each of those shadings after an edit of the table's material (procedural wood
+   * textures, shaders no other object shares) took 10–15 s, more than the default timeout_ms. The
+   * texts must tell the first screenshot in a shading from later ones, not make every screenshot in
+   * another shading than the viewport's pay again, and not promise one frame after a material edit.
    */
   const overstated =
-    /tens of seconds per screenshot (in (them|MATERIAL or RENDERED)|of a heavy scene, the first)/;
+    /tens of seconds (per screenshot|for a screenshot in)|each screenshot then builds|while (its|the) viewport shows another/;
+  /** A text that says the editor keeps what it built, or that later screenshots take one frame. */
+  const promisesReuse = /keeps (them|what it compiled)|about one frame/;
 
-  it('is told by the shading the viewport shows: tens of seconds only in another shading', () => {
+  it('is tens of seconds only for the first screenshot or frame in a shading, which the editor keeps', () => {
     for (const shading of ['MATERIAL', 'rendered']) {
       const msg = editorTimeoutMessage('screenshot', 10_000, null, { shading });
       expect(msg).not.toMatch(overstated);
-      expect(msg).toContain('and tens of seconds while its viewport shows another shading');
+      expect(msg).toContain(
+        `tens of seconds for its first ${shading.toUpperCase()} screenshot or viewport frame after it opened the project`,
+      );
+      expect(msg).toContain(
+        'It keeps what it compiled, so a retry waits for the editor to finish and then takes about one frame.',
+      );
     }
     // in the viewport's own shading a screenshot is a frame of the viewport
     const own = editorTimeoutMessage('screenshot', 10_000);
     expect(own).not.toMatch(overstated);
-    expect(own).toContain("The screenshot is drawn in the viewport's shading, like a frame of the viewport");
+    expect(own).toContain("The screenshot is drawn in the viewport's shading, like a frame of the viewport.");
+    expect(own).toContain(
+      'tens of seconds for its first screenshot or frame in one of them after it opened the project',
+    );
     expect(MCP_INSTRUCTIONS).not.toMatch(overstated);
     expect(MCP_INSTRUCTIONS).toContain(
-      'and tens of seconds for a screenshot in one of them while its viewport shows another shading (it ' +
-        'builds and compiles the materials for that image)',
+      'a screenshot of a heavy scene in MATERIAL or RENDERED shading takes seconds, and the first screenshot or ' +
+        'viewport frame in each of them after the editor opened the project tens of seconds (it builds and ' +
+        "compiles the scene's materials for that shading and keeps them",
     );
+    expect(MCP_INSTRUCTIONS).toContain(
+      'a screenshot that timed out still builds the materials, so retrying it waits for the rest and then takes about one frame',
+    );
+  });
+
+  it('can be seconds again after a material edit, which the texts that promise reuse say', () => {
+    for (const shading of ['MATERIAL', 'rendered'])
+      expect(editorTimeoutMessage('screenshot', 10_000, null, { shading })).toContain(
+        `After a material edit, its next ${shading.toUpperCase()} screenshot or viewport frame can compile the ` +
+          'shaders of the objects with that material again (10–15 s for an object with procedural wood textures).',
+      );
+    expect(editorTimeoutMessage('screenshot', 10_000)).toContain(
+      'After a material edit, its next screenshot or frame in each of these shadings can compile the shaders of the ' +
+        'objects with that material again (10–15 s for an object with procedural wood textures).',
+    );
+    // SOLID and WIREFRAME screenshots wait for the viewport's frame that compiles them
+    for (const shading of ['SOLID', 'WIREFRAME'])
+      expect(editorTimeoutMessage('screenshot', 10_000, null, { shading })).toContain(
+        'and its first one after a material edit (seconds)',
+      );
+    expect(MCP_INSTRUCTIONS).toContain(
+      'after a material edit the next one in each can compile the shaders of the objects with that material ' +
+        'again, 10–15 s for an object with procedural wood textures',
+    );
+    // no text promises reuse without the exception
+    const texts = [
+      MCP_INSTRUCTIONS,
+      ...[undefined, 'MATERIAL', 'RENDERED', 'SOLID', 'WIREFRAME'].flatMap((shading) =>
+        [10_000, MAX_EDITOR_TIMEOUT_MS].map((t) =>
+          editorTimeoutMessage('screenshot', t, null, shading ? { shading } : {}),
+        ),
+      ),
+    ];
+    for (const text of texts) if (promisesReuse.test(text)) expect(text).toMatch(/after a material edit/i);
   });
 });
 

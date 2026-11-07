@@ -1,11 +1,52 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from 'y-protocols/awareness';
-import { SceneDoc } from '@3d-editor/core';
+import * as syncProtocol from 'y-protocols/sync';
+import { MSG_SYNC, SceneDoc, encodeFrame } from '@3d-editor/core';
 import { ProjectSession } from '../src/project/session';
 import { localIndex } from '../src/project/local-index';
 import { serverConfig } from '../src/app/store';
 import { prefs, defaultPreferences } from '../src/app/prefs';
+
+/** A WebSocket that never connects; the test plays the sync server through `receive`. */
+class FakeSocket {
+  static readonly OPEN = 1;
+  static created: FakeSocket[] = [];
+  readyState = 0;
+  binaryType = 'blob';
+  onopen: (() => void) | null = null;
+  onmessage: ((e: { data: ArrayBuffer }) => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  constructor(readonly url: string) {
+    FakeSocket.created.push(this);
+  }
+  send(): void {}
+  close(): void {
+    this.readyState = 3;
+  }
+  receive(frame: Uint8Array): void {
+    this.onmessage?.({ data: frame.slice().buffer });
+  }
+}
+
+/** Browser storage only, and a server with sync whose WebSocket is a {@link FakeSocket}. */
+function withSyncServer(): void {
+  FakeSocket.created = [];
+  vi.stubGlobal('WebSocket', FakeSocket);
+  serverConfig.value = {
+    version: 'test',
+    features: { sync: true, mcp: false, telemetry: false, webdavProxy: false },
+    webdav: null,
+    persistence: 'memory',
+  };
+  prefs.value = { ...defaultPreferences(), storage: { ...defaultPreferences().storage, mode: 'browser' } };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  ProjectSession.remoteWaitMs = 4000;
+});
 
 describe('ProjectSession (browser storage)', () => {
   it('persists projects in IndexedDB across sessions and indexes them', async () => {
@@ -34,6 +75,81 @@ describe('ProjectSession (browser storage)', () => {
     const s3 = await ProjectSession.open('proj-1');
     expect(s3.doc.listObjects()).toHaveLength(0);
     s3.close(false);
+  });
+
+  it('opens a project it has nothing of at once when no server or WebDAV is attached', async () => {
+    // regression: it waited 4 s (remoteWaitMs) for a remote that could not answer
+    serverConfig.value = null;
+    prefs.value = { ...defaultPreferences(), storage: { ...defaultPreferences().storage, mode: 'browser' } };
+    const t0 = performance.now();
+    const s = await ProjectSession.open('proj-nothing');
+    // about 10 ms here; the wait it must not do is 4000 ms
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect(s.provider?.enabled).toBe(false);
+    expect(s.webdav).toBeNull();
+    expect(s.doc.listObjects()).toHaveLength(0);
+    s.close(false);
+  });
+
+  it('waits for an attached sync server to deliver a project it has nothing of', async () => {
+    withSyncServer();
+    const events: string[] = [];
+    const opening = ProjectSession.open('proj-remote').then((s) => {
+      events.push(`opened with ${s.doc.listObjects().length} objects`);
+      return s;
+    });
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(1));
+    // the server answers a moment later with the project (its sync step 2)
+    await new Promise((r) => setTimeout(r, 200));
+    const remote = SceneDoc.create({ name: 'On the server' });
+    events.push('server answered');
+    FakeSocket.created[0].receive(
+      encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep2(enc, remote.ydoc)),
+    );
+    const s = await opening;
+    expect(events).toEqual(['server answered', 'opened with 3 objects']);
+    expect(s.doc.name).toBe('On the server');
+    expect(s.provider?.synced.value).toBe(true);
+    s.close(false);
+    remote.destroy();
+  });
+
+  it('waits for attached WebDAV storage to deliver a project it has nothing of', async () => {
+    serverConfig.value = null;
+    const d = defaultPreferences();
+    prefs.value = {
+      ...d,
+      storage: { mode: 'webdav', webdav: { ...d.storage.webdav, url: 'https://dav.example/' } },
+    };
+    const remote = SceneDoc.create({ name: 'On WebDAV' });
+    const events: string[] = [];
+    // the WebDAV server answers the GET of the project's document a moment later
+    vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+      await new Promise((r) => setTimeout(r, 200));
+      events.push(`${init.method} ${new URL(url).pathname}`);
+      return new Response(remote.encodeState().slice(), { status: 200, headers: { ETag: '"1"' } });
+    });
+    const s = await ProjectSession.open('proj-dav').then((s) => {
+      events.push(`opened with ${s.doc.listObjects().length} objects`);
+      return s;
+    });
+    expect(events).toEqual(['GET /3d-editor/projects/proj-dav/document.ybin', 'opened with 3 objects']);
+    expect(s.webdav).not.toBeNull();
+    expect(s.doc.name).toBe('On WebDAV');
+    s.close(false);
+    remote.destroy();
+  });
+
+  it('opens an empty project after the deadline when the attached server does not answer', async () => {
+    withSyncServer();
+    ProjectSession.remoteWaitMs = 300;
+    const t0 = performance.now();
+    const s = await ProjectSession.open('proj-silent');
+    expect(FakeSocket.created).toHaveLength(1);
+    expect(performance.now() - t0).toBeGreaterThanOrEqual(250);
+    expect(s.doc.listObjects()).toHaveLength(0);
+    expect(s.provider?.synced.value).toBe(false);
+    s.close(false);
   });
 
   it('undo restores edit-mode selection metadata and removed objects clear the selection', async () => {

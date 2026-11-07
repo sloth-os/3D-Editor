@@ -116,7 +116,12 @@ afterAll(async () => {
   await server?.cleanup();
 });
 
-describe('exports on a render thread', () => {
+/*
+ * A GLB export of the scene samples its 3,000 frames on a render thread: 3-7 s per test on an idle
+ * 4-CPU machine, 22-42 s while every CPU was busy with other work. The work is the export itself,
+ * so the tests get 120 s instead of the 60 s of the integration tests.
+ */
+describe('exports on a render thread', { timeout: 120_000 }, () => {
   it('export_scene keeps the server responsive and gives the same file as an export on the main thread', async () => {
     const { result, ms, maxHealthMs, maxLoopDelayMs, probes } = await whileProbing(() =>
       call('export_scene', { project: projectId, format: 'glb', frame: 1 }),

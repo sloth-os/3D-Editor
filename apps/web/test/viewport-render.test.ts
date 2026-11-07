@@ -243,6 +243,13 @@ beforeEach(() => {
   vi.stubGlobal('cancelAnimationFrame', () => undefined);
   pathTraced.length = 0;
 });
+// Cheap: at most 8.6 ms under coverage in 300 runs, timed inside the hook. A reporter that times
+// hooks from vitest's task events (onHookStart / onHookEnd) can show it taking seconds: the worker
+// sends those events at most every 100 ms and leaves the rest to a timer, which cannot fire while
+// synchronous tests run, so the end of a hook can reach the reporter only after the tests that
+// follow it. Which hook that hits varies from run to run; under coverage it was the afterEach of one
+// of the tests before 'lights a simple scene as brightly as the path tracer …', shown taking about
+// that test's time.
 afterEach(() => {
   for (const e of engines.splice(0)) e.dispose();
   vi.unstubAllGlobals();

@@ -206,7 +206,6 @@ export class Room {
   persisted: boolean;
   /** Last known `project.json` content. */
   info: ProjectInfo | null;
-  private lastEtag: string | undefined;
   private dirty = false;
   private firstDirtyAt = 0;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -224,7 +223,7 @@ export class Room {
     readonly id: string,
     doc: Y.Doc,
     private readonly deps: RoomDeps,
-    init: { info?: ProjectInfo | null; etag?: string; persisted?: boolean } = {},
+    init: { info?: ProjectInfo | null; persisted?: boolean } = {},
   ) {
     this.doc = doc;
     this.scene = new SceneDoc(doc, { type: 'server', room: id });
@@ -232,7 +231,6 @@ export class Room {
     // The server itself is not a participant.
     this.awareness.setLocalState(null);
     this.info = init.info ?? null;
-    this.lastEtag = init.etag;
     this.persisted = !!init.persisted;
     doc.on('update', this.onDocUpdate);
     this.awareness.on('update', this.onAwarenessUpdate);
@@ -332,6 +330,14 @@ export class Room {
   /**
    * Merges changes made to the stored document by others (other servers sharing the storage,
    * devices saving to WebDAV directly) into the room, and saves pending local changes.
+   *
+   * Every save and refresh merges the stored content it read: syncDocument is not given the ETag
+   * of the last sync (`lastEtag`), with which it would skip that content when the stored ETag is
+   * unchanged and the room has nothing new. An ETag only says that when it was taken together with
+   * the content, and the WebDAV client takes it with a second request (PROPFIND) from servers that
+   * send none with GET or PUT, such as the webdav-server of the integration tests: another server's
+   * write between the two requests gave the room the ETag of a write it had not merged, and it
+   * never merged it (two servers sharing one storage stayed apart, test/unit/rooms.test.ts).
    */
   refresh(): Promise<void> {
     if (!this.deps.store || this.destroyed) return Promise.resolve();
@@ -353,11 +359,9 @@ export class Room {
       await withSpan(`persistence.${op}`, { 'project.id': this.id }, async (span) => {
         const prevInfo = await store.loadInfo(this.id).catch(() => null);
         const res = await store.syncDocument(this.id, this.doc, {
-          lastEtag: this.lastEtag,
           origin: STORAGE_ORIGIN,
           info: () => (this.info = projectInfoFromScene(this.id, this.scene, prevInfo ?? this.info)),
         });
-        if (res.etag) this.lastEtag = res.etag;
         span.setAttributes({ 'persistence.pulled': res.pulled, 'persistence.pushed': res.pushed });
       });
       this.persisted = true;

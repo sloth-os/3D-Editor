@@ -211,7 +211,8 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
     use: 'run_operator again',
     editor:
       "it runs the person's last operation again (operations run with editor_command are not repeated) on " +
-      "the editor's selection, as a new step of the person's undo history",
+      "the editor's selection, as a new step of the person's undo history, and fails when there is nothing " +
+      'to repeat',
   },
   'object.duplicate_move': {
     instead:
@@ -225,8 +226,8 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
       'To move, rotate or scale use transform.translate {value}, transform.rotate {value, orient_axis} or transform.resize {value} on your selection (through edit_mesh for mesh elements), or the transform_object tool.',
     use: 'transform.translate / transform.rotate / transform.resize',
     editor:
-      "it starts a move, rotation or scale of the editor's selection that follows the person's mouse until " +
-      'they click',
+      "it starts a move, rotation or scale ({mode: translate, rotate or resize}) of the editor's selection " +
+      "that follows the person's mouse until they click",
   },
   'mesh.loopcut_pick': {
     instead:
@@ -247,10 +248,11 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
     instead: 'For an image use render_image (render_animation for an animation): they need no editor.',
     use: 'render_image',
     editor:
-      "it opens the Render window on the person's screen and renders the scene there at the output " +
+      "it opens the Render window on the person's screen and renders the scene there at once, at the output " +
       "resolution, from the scene camera (else the editor's view; path traced on that computer's render " +
-      'workers when the render engine is PATHTRACER; animation: true renders the frame range), without ' +
-      'returning the image',
+      'workers when the render engine is PATHTRACER), without returning the image; with {animation: true} it ' +
+      'opens the Render Animation window instead, which renders nothing until the person presses its Render ' +
+      'button',
   },
   'view3d.object_as_camera': {
     instead: 'To set the scene camera use set_active_camera.',
@@ -265,20 +267,21 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
     use: 'transform_object on the camera',
     editor:
       "it moves the scene camera to the editor's viewpoint (a step of the person's undo history) and switches " +
-      'that editor to the camera view',
+      'that editor to the camera view, and fails without a scene camera',
   },
   'screen.frame_offset': {
     instead: 'To set your own current frame use scene.frame_set {frame} (most tools also take a `frame`).',
     use: 'scene.frame_set',
-    editor: "it moves the editor's current frame, not yours",
+    editor: "it moves the editor's current frame, not yours, by `delta` frames (default 1)",
   },
   'screen.keyframe_jump': {
     instead:
       'To go to a keyframe use scene.frame_set {frame} with its frame from get_object (its animation lists the keyframes).',
     use: 'scene.frame_set',
     editor:
-      "it moves the editor's current frame, not yours, to the next or previous keyframe of the editor's " +
-      'selected objects (of all objects when none is selected)',
+      "it moves the editor's current frame, not yours, to the next keyframe (`next`, default true; false: the " +
+      "previous one) of the editor's selected objects (of all objects when none is selected), and fails when " +
+      'there is none',
   },
   'screen.animation_play': {
     instead: 'To look at the animation use render_animation (a contact sheet, GIF or APNG).',
@@ -356,15 +359,19 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
   },
   'view3d.view_orbit': {
     editor:
-      "it orbits the person's view by `angle` (radians, default π/12: 15°); in the camera view it changes only " +
-      'the view they get back when they leave it',
+      "it orbits the person's view ({type: ORBITLEFT, ORBITRIGHT, ORBITUP or ORBITDOWN}) by `angle` (radians, " +
+      'default π/12: 15°); in the camera view it changes only the view they get back when they leave it',
   },
   'view3d.view_persportho': {
     editor:
       "it switches the person's view between perspective and orthographic; in the camera view it changes only " +
       'the view they get back when they leave it',
   },
-  'view3d.zoom': { editor: "it zooms the person's view in or out, out of the camera view" },
+  'view3d.zoom': {
+    editor:
+      "it zooms the person's view in by 1.25× per unit of `delta` (default 1; negative values zoom out), out " +
+      'of the camera view',
+  },
   'view3d.toggle_xray': {
     editor: 'it turns X-ray on or off in that editor (what the person sees, and what their clicks select)',
   },
@@ -379,20 +386,26 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
   },
   'view3d.toggle_shading': {
     editor:
-      "it switches the shading of the person's viewport ({type}; WIREFRAME again goes back to SOLID; " +
-      'editor_command view.shading sets it)',
+      "it switches the shading of the person's viewport ({type: WIREFRAME, SOLID, MATERIAL or RENDERED}; " +
+      'WIREFRAME again goes back to SOLID; editor_command view.shading sets it)',
   },
   'wm.tool_set': {
     editor:
-      "it changes the person's active tool in that editor, and with it what their mouse does in the viewport",
+      "it changes the person's active tool in that editor ({tool: select, cursor, move, rotate, scale, " +
+      'sculpt_draw, sculpt_smooth, sculpt_grab, sculpt_inflate, sculpt_flatten or paint}), and with it what ' +
+      'their mouse does in the viewport',
   },
   'wm.call_menu': {
-    editor: "it opens a popup menu on the person's screen (at their mouse pointer unless x and y are given)",
+    editor:
+      'it opens a popup menu ({name: add, snap, delete, merge, separate, uv, shading, view, context, apply, ' +
+      'parent, parent_clear, constraint_add_targets, track or generators}; another name opens nothing) on ' +
+      "the person's screen, at their mouse pointer unless x and y are given",
   },
   'wm.preferences': { editor: "it opens the Preferences window on the person's screen" },
   'screen.workspace_set': {
     editor:
-      "it switches the person's workspace layout (Shading also switches their viewport to Material Preview)",
+      "it switches the person's workspace layout ({name: Layout, Modeling, Shading, Animation or Scripting}; " +
+      'Shading also switches their viewport to Material Preview)',
   },
 };
 

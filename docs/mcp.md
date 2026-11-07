@@ -494,7 +494,7 @@ runs it in a live editor (– : no counterpart among the tools):
 | `screen.repeat_last`                                                                                                                                                                   | `run_operator` again (or a `batch`)                                                                                                               | Runs the person's last operation again on the editor's selection (operations run with `editor_command` are not repeated)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `screen.frame_offset`, `screen.keyframe_jump`                                                                                                                                          | `scene.frame_set {frame}` (the agent's own frame; `get_object` lists the keyframes)                                                               | Moves the editor's current frame (to a keyframe of the editor's selected objects)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `screen.animation_play`                                                                                                                                                                | `render_animation`                                                                                                                                | Starts or stops playback in that editor (`editor_command` `play` sets it)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `render.render`                                                                                                                                                                        | `render_image`, `render_animation`                                                                                                                | Opens the Render window on the person's screen and renders the scene there (path traced on that computer's render workers with `PATHTRACER`), without returning the image                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `render.render`                                                                                                                                                                        | `render_image`, `render_animation`                                                                                                                | Opens the Render window on the person's screen and renders the scene there at once (path traced on that computer's render workers with `PATHTRACER`), without returning the image; `{animation: true}` opens the Render Animation window instead, which renders nothing until the person presses its Render button                                                                                                                                                                                                                                                                                                 |
 | `view3d.object_as_camera`                                                                                                                                                              | `set_active_camera`                                                                                                                               | Makes the editor's active object, a camera, the scene camera and switches that editor to the camera view                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `view3d.camera_to_view`                                                                                                                                                                | `transform_object` on the camera (`object.track_set` aims it); `render_image` takes a `view`                                                      | Moves the scene camera to the editor's viewpoint and switches that editor to the camera view                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `wm.read_homefile`                                                                                                                                                                     | `create_project`                                                                                                                                  | Creates a new project (`{name, empty}`) and switches the person's editor to it, away from the project it had open, which it leaves before it can answer: `editor_command` says it got no answer (`list_projects` lists the new project)                                                                                                                                                                                                                                                                                                                                                                            |
@@ -1040,9 +1040,10 @@ It is rasterized (WebGL) like the viewport, never path traced: `MATERIAL` is Mat
 studio environment lights the scene, unlike the `MATERIAL` of `render_image`, which shows the
 scene's lights and world), and `RENDERED` is the Rendered viewport (the scene's lights and world,
 with shadows when the render settings use them), also when the scene's render engine is
-`PATHTRACER`: path traced images come from `render_image`. Drawing a `shading` other than the
-viewport's costs as much as switching the viewport to it (see below); the viewport keeps its own
-shading.
+`PATHTRACER`: path traced images come from `render_image`. The first screenshot in a shading the
+editor has not drawn since it opened the project costs as much as the viewport's first frame in it,
+and the editor keeps what it built for both until the materials change (see below); the viewport
+keeps its own shading.
 
 `run_operator` is how agents run the operators of the browser editor's own user interface
 (`view3d.*`, `wm.*`, `screen.*`, `ed.*`, `render.render` …), which the `run_operator` tool refuses
@@ -1067,45 +1068,78 @@ is unknown.
 
 `timeout_ms` is how long the server waits for the editor's answer, at most 55000 (less than the 60 s
 request timeout of MCP clients built on the TypeScript SDK, so the server's error arrives first). An
-editor without GPU acceleration (software WebGL, as in a headless browser) draws its viewport at
-seconds per frame for a heavy scene in `MATERIAL` or `RENDERED` shading, tens of seconds for the
-first frame in a shading, which compiles its shaders. A screenshot in the viewport's shading costs
-about one such frame; one in another shading builds and compiles the scene's materials for that
-image. In such an editor, `RENDERED` screenshots of a scene with 71 materials took 20–25 s each
-while the viewport showed `SOLID` (23–44 s in another measurement) and about 1 s while it showed
-`RENDERED`, `SOLID` ones under 1 s, and `render_image` with `shading: "SOLID"` (grey clay) 0.5–2 s.
-A scene of millions of triangles takes seconds per frame even in `SOLID` shading. The other commands
-draw nothing themselves, but wait while the editor draws its viewport. When the editor does not
-answer in time the error says so and what to do (one line each):
+editor builds and compiles the scene's materials for `MATERIAL` or `RENDERED` shading the first time
+it draws that shading after it opened the project, for a screenshot or a frame of its viewport, and
+keeps them for later ones until they change: after a material edit, the next screenshot or frame in
+each of these shadings builds the materials of the objects that use it again, and compiles their
+shaders again unless other objects' materials share them. Without GPU acceleration (software WebGL,
+as in a headless browser) the first time takes tens of seconds for a heavy scene, and compiling the
+shaders of one object again seconds. In such an editor (headless Chromium, a scene of 81 objects and
+71 materials, 1280×720 screenshots, the viewport in `SOLID`), the first `RENDERED` screenshot took
+20–24 s and the next ones 1.0–1.5 s, the first `MATERIAL` one 21–23 s (also after the `RENDERED`
+ones) and the next ones 1.3–1.5 s; `SOLID` and `WIREFRAME` screenshots took 0.7–1.4 s, and
+`render_image` with `shading: "SOLID"` (grey clay; rendered on the server, as the scene's render
+engine was `PATHTRACER`) 1.8–3 s. Switching the viewport to `RENDERED` after a `RENDERED` screenshot
+reused its materials (screenshots in its shading then took 1.3–2.0 s), while switching it to
+`MATERIAL` or `RENDERED` first took 20–23 s until its first frame was drawn, which screenshots
+waited for. After an edit of the material of the table or of the dowels (procedural wood textures,
+whose shaders no other object shares) the next `RENDERED` screenshot took 10–15 s, more than the
+default `timeout_ms`, and later ones 0.9–1.5 s again; after another such edit the next `MATERIAL`
+screenshot took 11.6 s and the next `RENDERED` one after it 12.1 s (each shading compiles its own);
+after edits of materials whose shaders other objects share (the plastics, the toy blocks, the
+aluminium, the plaster) it took 1.2–1.9 s, after those of the floor (a `BRICK` texture) and of the
+glass marble 2.6 s and 1.8 s. With the viewport in `RENDERED`, commands sent after such an edit
+answered in 11–78 ms, the next screenshot took 12.8–13.5 s (4.6–6.0 s when sent 20–45 s after the
+edit), and a `SOLID` screenshot sent right after the edit 6.5 s, as it waited for the viewport's
+frame. (These edit timings were measured while other test suites ran on the machine.) A scene of
+millions of triangles takes seconds per frame in any shading: with 4 million triangles a `SOLID`
+screenshot took 8.5–10.6 s and a `WIREFRAME` one 18 s. The other commands draw nothing themselves,
+but wait while the editor draws its viewport: 4.1–5.2 s after the viewport switched to `MATERIAL` or
+`RENDERED` for the first time (while it built the materials; compiling them then held up only
+screenshots), 3.1–3.2 s with 4 million triangles, milliseconds otherwise.
+
+The editor finishes a command the server stopped waiting for, and keeps the materials a screenshot
+built: a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 21 s later
+(the rest of the first one, then one frame), and the next one in 1.2 s; a `get_view` sent right
+after the timeout also waited 22 s. With the default `timeout_ms` the first try and the first retry
+timed out, and the second retry answered in 4 s. After an edit of the table's material, a `RENDERED`
+screenshot that timed out after 3 s, retried at once, answered 9.5–11 s later and the next one in
+0.9–1.5 s; with the default `timeout_ms` the first try timed out and the retry answered in 3.4 s.
+When the editor does not answer in time the error says so and what to do (one line each):
 
 ```text
 editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most
 55000); it may still carry the command out, and its next commands and renders wait until it has. The
-screenshot is drawn in the viewport's shading, like a frame of the viewport, which takes seconds for
-a heavy scene in MATERIAL or RENDERED shading without GPU acceleration (software WebGL, e.g. a
-headless browser), tens of seconds the first time while it compiles the shaders: pass a larger
-timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot (grey clay, much faster); for
-a quick look use render_image with shading 'SOLID', and render_image for final images.
+screenshot is drawn in the viewport's shading, like a frame of the viewport. An editor without GPU
+acceleration (software WebGL, e.g. a headless browser) takes seconds for that with a heavy scene in
+MATERIAL or RENDERED shading, and tens of seconds for its first screenshot or frame in one of them
+after it opened the project, while it builds and compiles the scene's materials for that shading.
+After a material edit, its next screenshot or frame in each of these shadings can compile the
+shaders of the objects with that material again (10–15 s for an object with procedural wood
+textures). It keeps what it compiled, so a retry waits for the editor to finish and then takes about
+one frame. Retry with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for the
+screenshot (grey clay, much faster); for a quick look use render_image with shading 'SOLID', and
+render_image for final images.
 
 editor_command 'select' failed: the editor did not answer within timeout_ms = 10000 ms (at most
 55000); it may still carry the command out, and its next commands and renders wait until it has.
-'select' waits while the editor draws its viewport, which takes seconds per frame for a heavy scene
-in MATERIAL or RENDERED shading without GPU acceleration (software WebGL, e.g. a headless browser),
-tens of seconds the first time while it compiles the shaders: pass a larger timeout_ms (at most
-55000), or switch the viewport to SOLID shading (editor_command view.shading {shading: 'SOLID'}),
-which draws much faster.
+'select' waits while the editor draws its viewport. An editor without GPU acceleration (software
+WebGL, e.g. a headless browser) takes seconds per frame for a scene with millions of triangles, and
+seconds for its first frame of a heavy scene in MATERIAL or RENDERED shading, while it builds the
+scene's materials. Pass a larger timeout_ms (at most 55000), or switch the viewport to SOLID shading
+(editor_command view.shading {shading: 'SOLID'}), which draws much faster.
 ```
 
-A screenshot with `shading` `MATERIAL` or `RENDERED` says instead that in that shading it can take
-seconds for a heavy scene, and tens of seconds while the viewport shows another shading (each
-screenshot then builds and compiles the scene's materials); one with `shading` `SOLID` or
-`WIREFRAME` says that a scene with millions of triangles takes seconds even then, and that
-`render_image` with `renderer: "software"` renders without the editor. At the maximum it says that
-`timeout_ms` cannot be raised further. When the editor was still busy with an earlier request that
-the server had stopped waiting for (a screenshot or render that timed out), the error names it after
-the first sentence ("It was still busy with an earlier request that the server had stopped waiting
-for (editor_command 'screenshot' sent 12 s ago)."). While the tool waits, it sends a progress
-notification every 5 s to requests with a progress token.
+A screenshot with `shading` `MATERIAL` or `RENDERED` says the same about that shading; one with
+`shading` `SOLID` or `WIREFRAME` says that a scene with millions of triangles takes seconds even
+then and that a screenshot waits for the viewport's frames in `MATERIAL` or `RENDERED` shading that
+compile shaders (its first one, and its first one after a material edit), and advises `render_image`
+with `renderer: "software"`, which renders without the editor. At the maximum the advice starts with
+"With timeout_ms at its maximum (55000), …" instead of a larger `timeout_ms`. When the editor was
+still busy with an earlier request that the server had stopped waiting for (a screenshot or render
+that timed out), the error names it after the first sentence ("It was still busy with an earlier
+request that the server had stopped waiting for (editor_command 'screenshot' sent 12 s ago).").
+While the tool waits, it sends a progress notification every 5 s to requests with a progress token.
 
 ### Resources
 
@@ -1149,7 +1183,7 @@ quotes are written as `\n`, `\r` or `\u2028`, as in JSON.
 | `'show_render' is not a parameter of the BEVEL modifier. Its visibility (show_render) is set after adding it, with update_modifier …`                                                 | A modifier setting given inside `params` instead of as a tool argument                                                                                                                                                                                                              |
 | `Unknown parameter 'veiw' (did you mean 'view'?) for the editor command view.set_view. Its parameters: …`                                                                             | A misspelled `editor_command` command or parameter (refused before anything is sent)                                                                                                                                                                                                |
 | `screenshot: 'shading' must be WIREFRAME, SOLID, MATERIAL or RENDERED, letter case ignored (got "SOILD"; did you mean 'SOLID'?).`                                                     | An invalid `screenshot` value (`width` and `height` too; refused before anything is sent)                                                                                                                                                                                           |
-| `editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000); …`                                                                       | The editor needed longer: raise `timeout_ms` or take the screenshot with `shading: "SOLID"`; a quick look: `render_image {shading: "SOLID"}`; final images: `render_image`                                                                                                          |
+| `editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000); …`                                                                       | The editor needed longer: retry with a larger `timeout_ms` (the editor keeps the materials it compiled) or take the screenshot with `shading: "SOLID"`; a quick look: `render_image {shading: "SOLID"}`; final images: `render_image`                                               |
 | `editor_command 'run_operator' got no answer for wm.read_homefile, as expected: …` / `editor_command '…' failed: the editor's connection to this project closed before it answered …` | The editor left the project before it answered: `wm.read_homefile` switched it to a new project; otherwise its page was closed or reloaded, it opened another project or lost its connection, or the server closed the project (whether it carried the command out is then unknown) |
 | `browser render failed: the editor did not finish the RASTER image within 55 s. …`                                                                                                    | `render_image` with `renderer: "browser"` on a heavy scene: render on the server, smaller or `SOLID`                                                                                                                                                                                |
 | `'dimensions' is not animatable on object. Animatable: …`                                                                                                                             | `insert_keyframe` on a property that cannot be keyed                                                                                                                                                                                                                                |

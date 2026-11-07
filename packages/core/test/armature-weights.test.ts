@@ -6,6 +6,7 @@ import { createGrid } from '../src/mesh/primitives';
 import { triangulateMesh } from '../src/mesh/triangulate';
 import { appendMesh, createMesh, type MeshData } from '../src/mesh/types';
 import { tube } from './armature-helpers';
+import { cpuMs } from './timing-helpers';
 
 const RINGS = 21;
 const SEG = 12;
@@ -157,12 +158,15 @@ describe('automatic (bone heat) weights', () => {
       tail: [0, 0, z0 + len * (i + 1)],
     }));
     computeHeatWeights(body, bones); // warm up
-    let t = performance.now();
+    // CPU time, so that a busy machine slows neither measurement: the ratio was 1.4 to 2.2; ray
+    // testing every bone for each vertex of the shell (the old code) made it 7.5 to 8.4, and 18 to
+    // 21 under coverage
+    let t = cpuMs();
     computeHeatWeights(body, bones);
-    const bodyMs = performance.now() - t;
-    t = performance.now();
+    const bodyMs = cpuMs() - t;
+    t = cpuMs();
     const res = computeHeatWeights(both, bones);
-    const bothMs = performance.now() - t;
+    const bothMs = cpuMs() - t;
     expect(bothMs).toBeLessThan(4 * bodyMs + 50);
     const nBody = body.positions.length / 3;
     const n = both.positions.length / 3;

@@ -95,6 +95,12 @@ export class ProjectSession {
     this.awareness.on('change', () => this.refreshPeers());
   }
 
+  /**
+   * How long opening a project that has nothing locally waits for the attached sync server or
+   * WebDAV to deliver it (or for the server's first sync), at most.
+   */
+  static remoteWaitMs = 4000;
+
   static async open(id: string, opts: { initial?: SceneDoc; name?: string } = {}): Promise<ProjectSession> {
     const span = telemetry.startSpan('project.open', { 'project.new': !!opts.initial });
     const s = new ProjectSession(id);
@@ -106,9 +112,12 @@ export class ProjectSession {
       s.provider = new SyncProvider(id, s.doc.ydoc, s.awareness, null);
       s.attachRemotes();
       // If nothing exists locally yet (opening a remote project on a fresh device), wait briefly for
-      // the server/WebDAV so the UI does not flash an empty scene.
-      if (!opts.initial && s.doc.listObjects().length === 0 && s.doc.getMeta().created_at === '') {
-        await s.waitForRemote(4000);
+      // the server/WebDAV so the UI does not flash an empty scene. Only when one is attached: without
+      // one nothing can arrive (other tabs of this browser share the IndexedDB copy), and a server
+      // or WebDAV attached later (attachRemotes) fills the open scene when it syncs.
+      const remote = s.provider.enabled || !!s.webdav;
+      if (remote && !opts.initial && s.doc.listObjects().length === 0 && s.doc.getMeta().created_at === '') {
+        await s.waitForRemote(ProjectSession.remoteWaitMs);
       }
       if (opts.name && !s.doc.getMeta().created_at) s.doc.setName(opts.name);
       await localIndex.put({ ...s.projectInfo(), last_opened: new Date().toISOString() });

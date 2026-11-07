@@ -123,16 +123,17 @@ describe('render.render_animation', () => {
 
   it('keeps the render aspect when the derived side would exceed 2048 pixels', () => {
     const { doc, ok } = setup(true); // nothing to draw: large frames stay cheap
-    doc.updateRender({ resolution_x: 1920, resolution_y: 1080, resolution_percentage: 100 });
+    // a 10:1 render, so that the frames are small: the derived side would be 20480 px
+    doc.updateRender({ resolution_x: 3840, resolution_y: 384, resolution_percentage: 100 });
     const wide = ok({ format: 'APNG', frame_end: 1, height: 2048, samples: 1 });
-    expect([wide.width, wide.height]).toEqual([2048, 1152]);
-    doc.updateRender({ resolution_x: 1080, resolution_y: 1920 });
+    expect([wide.width, wide.height]).toEqual([2048, 205]);
+    doc.updateRender({ resolution_x: 384, resolution_y: 3840 });
     const tall = ok({ format: 'APNG', frame_end: 1, width: 2048, samples: 1 });
-    expect([tall.width, tall.height]).toEqual([1152, 2048]);
+    expect([tall.width, tall.height]).toEqual([205, 2048]);
     // within the limit the given side is kept exactly
     expect(ok({ format: 'APNG', frame_end: 1, width: 90, samples: 1 })).toMatchObject({
       width: 90,
-      height: 160,
+      height: 900,
     });
   }, 60_000);
 
