@@ -114,9 +114,12 @@ after `ROOM_IDLE_TTL_SECONDS` (default 3600 s).
 
 **Progress.** When a request carries a progress token (`_meta.progressToken`), long renders send
 `notifications/progress` at most every 250 ms: samples per pixel for path-traced stills, frames
-for animations, and the elapsed seconds every 5 s while a browser editor path traces (until
-`time_limit` has passed). Clients should reset their request timeout on progress
-(`scripts/mcp.mjs` does, with a 15-minute timeout).
+for animations, and the elapsed seconds every 5 s while a request waits for a browser editor (a
+`render_image` with `renderer: "browser"` until the image arrives, an `editor_command` until the
+editor answers). Clients should reset their request timeout on progress (`scripts/mcp.mjs` does,
+with a 15-minute timeout): the 60 s default of clients built on the MCP TypeScript SDK is too short
+for long renders. The server's own waits for a browser editor outside path tracing stay under it
+(at most 55 s), so their errors arrive first.
 
 ## Conventions
 
@@ -419,22 +422,87 @@ systems …), `reports` its INFO / WARNING / ERROR messages (for example "apply 
 `selection` the agent's resulting `mode`, `selected`, `active` and `frame` (with element counts in
 edit mode). Read the reports: an operator can succeed and still warn that a setting has no effect.
 
-A failure of the operator is an error result: the first line is the message, followed by JSON with
-`ok: false`, `error` (the message) and `code`, one of `INVALID_PARAMS`, `POLL_FAILED`, `NOT_FOUND`
-and `FAILED` (see [Errors](#errors)), plus the fields above when the operator ran. A `selection`
-that cannot be applied is a plain error message instead, without JSON or `code` (`Object 'Nope'
-not found in project …`, `face index 99 out of range (mesh has 6 faces)`); in a `batch` it fails
-its operation with a `code`.
+Every failure is an error result: the first line is the message, followed by JSON
+`{ok: false, operator, error, code, selection}`, also when the `selection` cannot be applied, the
+project is unknown or the operator id is refused (below). `error` is the message (for an operator
+failure without the `<operator> failed:` prefix of the first line), `code` one of
+`INVALID_PARAMS`, `POLL_FAILED`, `NOT_FOUND` and `FAILED` (see [Errors](#errors)) and `selection`
+the agent's editor state, which the failed call left as it was. When the operator ran, `result`
+(`null`), `reports` and `duration_ms` are added; when the project cannot be found, `selection` is
+left out. The message is always one line: a line break in a name it quotes (object and project
+names can contain them) is written as in JSON (`\n`, `\r`, `\u2028` …), so the JSON always starts
+on the second line. A `selection` that cannot be applied fails with these messages and codes:
 
-Refused operators (failures too, with the `code` named here):
+| Failure                                                                                  | `code`        | Message (abridged)                                                        |
+| ---------------------------------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------- |
+| An unknown object in `selection.objects` or `selection.active`                           | `NOT_FOUND`   | `Object 'Nope' not found in project 'P'. Objects: …`                      |
+| `mode: "EDIT"` without an active mesh object                                             | `POLL_FAILED` | `Edit mode needs an active mesh object (selection.active): 'Camera' is …` |
+| `mesh` without `mode: "EDIT"` (in Object Mode)                                           | `POLL_FAILED` | `selection.mesh selects vertices, edges or faces in Edit Mode: add …`     |
+| An element index the base mesh does not have (`verts`, `faces`, the vertices of `edges`) | `POLL_FAILED` | `face index 99 out of range (mesh has 6 faces)`                           |
+| An unknown project                                                                       | `NOT_FOUND`   | `Project 'X' not found. Known projects: …`                                |
 
-- unknown ids, with up to 8 closest ids ("Did you mean: …"), `NOT_FOUND`. The browser UI's own
-  operators are unknown ids here too: the web app registers them for itself (view navigation such
-  as `view3d.view_all` or `view3d.view_axis`, `screen.animation_play`, `wm.save_mainfile`,
-  `ed.undo` …), and they run in a live editor through `editor_command` `run_operator`;
+The code is decided by the kind of error (an unknown project or object is a "not found" error),
+never by the wording of its message.
+
+Refused operator ids (failures too, with the `code` named here):
+
+- unknown ids, `NOT_FOUND`, with up to 8 closest ids, letter case ignored ("Unknown operator
+  'mesh.primitive_cube_ad'. Did you mean: mesh.primitive_cube_add, …? Use list_operators."). The
+  closest ids include the browser editor's UI operators (next item), which a note after the list
+  names as such, with what to use instead and how a live editor runs them: `VIEW3D.VIEW_ALL` or
+  `view3d.view_al` get "Did you mean: view3d.view_all, view3d.view_axis, …? They are operators of
+  the browser editor's user interface: a live editor runs them with editor_command {project,
+  command: 'run_operator', params: {operator, params}}. Use list_operators.";
+- the operators of the browser editor's own user interface, `NOT_FOUND`: the web app registers
+  them for itself (view navigation such as `view3d.view_all`, `view3d.view_axis`,
+  `view3d.view_camera`, the `view3d.toggle_*` switches, `screen.animation_play`,
+  `screen.frame_offset`, `wm.save_mainfile`, `wm.tool_set`, `ed.undo`, `render.render`, Shift+D's
+  `object.duplicate_move` …; the list is `BROWSER_UI_OPERATORS` in `packages/core`), so the server
+  does not have them. The message says so and how to run one in a live editor that has the project
+  open (see [`editor_command`](#editor_command)). Where the tools do the same, it names that first,
+  and then what the operator does in a live editor, on the person's selection and undo history
+  (table below);
 - `render.render_software` and `render.render_animation`, `FAILED`: they would render on the
   server's main thread and stall every editor and agent, so `run_operator`, `batch` and
   `edit_mesh` refuse them and name the tool to use instead (`render_image`, `render_animation`).
+
+What the message of a browser UI operator names instead, and what the operator does when an agent
+runs it in a live editor:
+
+| Browser UI operator                                                                            | Instead (the agent's own selection and history)                                                                                                   | In a live editor                                                                         |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `object.duplicate_move` (Shift+D)                                                              | `object.duplicate {linked, offset: [x, y, z]}` (copies and moves them in one step), or the `duplicate_object` tool                                | Duplicates the person's selection, then waits for them to move the copies with the mouse |
+| `view3d.transform_modal` (G, R, S)                                                             | `transform.translate {value}`, `transform.rotate {value, orient_axis}`, `transform.resize {value}` (`edit_mesh` for elements), `transform_object` | Starts a move, rotation or scale that follows the person's mouse                         |
+| `mesh.loopcut_pick` (Ctrl+R)                                                                   | `edit_mesh` with `mesh.loopcut {edge: [a, b], number_cuts}` (an edge of the ring, as base mesh vertex indices)                                    | Cuts the edge ring under the person's mouse pointer                                      |
+| `sculpt.commit_stroke`                                                                         | `sculpt.brush_stroke`, `paint.vertex_color_stroke` with the points of the stroke                                                                  | Commits the stroke the person is drawing                                                 |
+| `ed.undo`, `ed.redo`                                                                           | The `undo` and `redo` tools (the agent's own changes)                                                                                             | Undoes or redoes the editor user's change                                                |
+| `screen.repeat_last`                                                                           | `run_operator` again (or a `batch`)                                                                                                               | Repeats the editor user's last operation                                                 |
+| `screen.frame_offset`, `screen.keyframe_jump`                                                  | `scene.frame_set {frame}` (the agent's own frame; `get_object` lists the keyframes)                                                               | Changes the editor's frame                                                               |
+| `screen.animation_play`                                                                        | `render_animation`                                                                                                                                | Starts or stops playback                                                                 |
+| `render.render`                                                                                | `render_image`, `render_animation`                                                                                                                | Opens the Render window                                                                  |
+| `view3d.object_as_camera`                                                                      | `set_active_camera`                                                                                                                               | Makes the active camera the scene camera                                                 |
+| `view3d.camera_to_view`                                                                        | `transform_object` on the camera (`object.track_set` aims it); `render_image` takes a `view`                                                      | Moves the scene camera to the editor's viewpoint                                         |
+| `wm.export`, `wm.import`, `wm.read_homefile`, `wm.open_mainfile`, `wm.search_menu`, `wm.share` | `export_scene`, `import_model`, `create_project`, `list_projects`, `list_operators {search}`, `get_project` (`editor_url`)                        | Opens the editor's dialogs and menus                                                     |
+| `wm.save_mainfile`                                                                             | Nothing: the server stores projects itself                                                                                                        | Makes that editor save its own copy at once                                              |
+
+The other browser UI operators (view navigation, the `view3d.toggle_*` switches, `wm.tool_set`,
+`screen.workspace_set`, menus) have no counterpart among the tools. Two of the messages (one line
+each):
+
+```text
+'view3d.view_all' is an operator of the browser editor's user interface (viewport, playback, tools,
+windows): only a live editor can run it, not run_operator, batch or edit_mesh. Run it there with
+editor_command {project, command: 'run_operator', params: {operator: 'view3d.view_all', params: {…}}}
+(get_connected_clients lists the editors that have the project open).
+
+'object.duplicate_move' is an operator of the browser editor's user interface (viewport, playback,
+tools, windows): only a live editor can run it, not run_operator, batch or edit_mesh. To duplicate
+objects use object.duplicate {linked, offset: [x, y, z]} on your selection (or the duplicate_object
+tool): it copies them and moves the copies by offset in one step. In a live editor run it with
+editor_command {project, command: 'run_operator', params: {operator: 'object.duplicate_move', params:
+{…}}} (get_connected_clients lists the editors that have the project open): it duplicates the
+editor's selection, then waits for the person to move the copies with the mouse.
+```
 
 #### `batch`
 
@@ -451,13 +519,18 @@ kept, so the following operations see the selection of before it. With `stop_on_
 stops at the first failure and keeps the changes made before it.
 
 The result is `{ok, executed, failed, results, selection}`. Each entry of `results` is
-`{operator, ok, result}` or `{operator, ok: false, error, code}` (`code` as for `run_operator`; an
-operation whose `selection` cannot be applied fails with an `error` starting with `selection:`,
-with `NOT_FOUND` for an unknown object and `POLL_FAILED` otherwise, such as an element index out
-of range or Edit Mode without an active mesh), with `reports` when the operator reported anything.
+`{operator, ok, result}` or `{operator, ok: false, error, code}` (`code` as for `run_operator`: an
+operation whose `selection` cannot be applied fails with an `error` starting with `selection:` and
+the message of the table above, with `NOT_FOUND` for an unknown object and `POLL_FAILED`
+otherwise; unknown operator ids and the browser editor's UI operators are refused with the
+messages of `run_operator` and `NOT_FOUND`, `render.render_software` and `render.render_animation`
+with `FAILED`), with `reports` when the operator reported anything. `error` is one line, as in
+`run_operator`.
 `operations_with_warnings` is added when some operations reported a WARNING or ERROR (failed ones
 included) and counts them. When an operation failed, the tool result is an error whose text starts
-with "_n_ of _m_ operation(s) failed" followed by the same JSON.
+with "_n_ of _m_ operation(s) failed" followed by the same JSON. When the call fails as a whole (an
+unknown project), the first line is the message and the JSON adds `error` and `code`
+(`{ok: false, executed: 0, failed: 0, results: [], error, code: "NOT_FOUND"}`).
 
 ### Objects
 
@@ -550,11 +623,20 @@ face selection and the `uv.*` unwrap operators. Indices are those of the base me
 (`get_mesh_data` with `source: BASE`). The result is
 `{ok, operator, result, reports, mesh, selection_after}`: `mesh` statistics and the selected
 element indices afterwards (at most 500 of each kind). Afterwards the object is the agent's
-selected and active object, in Object Mode. A failure leaves the agent's selection and mode as
-they were. When the operator fails, or is unknown or refused, the error result carries JSON with
-`error` and `code` as for `run_operator` (with the fields above when the operator ran); an element
-index out of range (`face index 99 out of range (mesh has 6 faces)`), an unknown object or an
-object that is not a mesh is a plain error message, without JSON or `code`.
+selected and active object, in Object Mode.
+
+Every failure is an error result like those of `run_operator`: the first line is the message,
+followed by JSON `{ok: false, operator, error, code, selection}` (with `result`, `reports`, `mesh`
+and `selection_after` when the operator ran; without `selection` when the project cannot be
+found), and it changes nothing in the agent's editor state, whose unchanged selection, active
+object, mode and element selection `selection` shows. Besides the operator's own failures:
+
+| Failure                                                                                                                      | `code`            | Message (abridged)                                                                                                         |
+| ---------------------------------------------------------------------------------------------------------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| An unknown object                                                                                                            | `NOT_FOUND`       | `Object 'Nope' not found in project 'P'. Objects: …`                                                                       |
+| An object that is not a mesh                                                                                                 | `POLL_FAILED`     | `'Camera' is not a mesh object.`                                                                                           |
+| An element index the base mesh does not have                                                                                 | `POLL_FAILED`     | `face index 42 out of range (mesh has 6 faces)`                                                                            |
+| An unknown operator id, an operator of the browser editor's UI (`mesh.loopcut_pick` names `mesh.loopcut`), `render.render_*` | as `run_operator` | as `run_operator` (`Unknown operator …`, `'view3d.view_selected' is an operator of the browser editor's user interface …`) |
 
 ### Animation and scene settings
 
@@ -706,8 +788,10 @@ What the formats contain:
 ### Rendering
 
 Two tools render, on the server's render threads (off the event loop that serves editors and
-agents) or, for `render_image`, in a connected browser editor. `run_operator` refuses the
-`render.*` operators.
+agents) or, for `render_image`, in a connected browser editor. `run_operator`, `batch` and
+`edit_mesh` refuse the core render operators `render.render_software` and `render.render_animation`
+(`FAILED`, naming these tools) and the browser editor's `render.render`, which opens its Render
+window (`NOT_FOUND`, as all its UI operators).
 
 #### Engines and routing
 
@@ -742,11 +826,57 @@ is used. `render_image` chooses where to render with `renderer`:
 | `browser`        | A browser editor only (`client` picks one); an error when none is connected        | That editor's render workers (Web Workers); the samples reached are not reported |
 | `software`       | The server's rasterizer                                                            | The server's path tracer                                                         |
 
-If a browser render fails or times out (raster: 15 s; path tracing: `time_limit` + 30 s), `auto`
-falls back to the server and says so in `note`, and `browser` fails. While an editor path traces,
-the tool sends a progress notification every 5 s until `time_limit` has passed (to requests with
-a progress token). The web editor's own Render Image (F12) and Render Animation (Ctrl+F12) windows
-path trace on the same Web Workers. `render_animation` always renders on the server.
+How long the server waits for an editor's image: with `auto`, 15 s for a raster image; with
+`browser`, 55 s for a raster image (an editor without GPU acceleration, software WebGL as in a
+headless browser, can take tens of seconds for a heavy scene) and `time_limit` + 30 s for a path
+trace (loading, compiling, denoising and the PNG). 55 s is less than the 60 s that MCP clients built
+on the TypeScript SDK wait for a request by default, so the server's error, which says what to do,
+arrives before such a client gives up with "Request timed out"; a path trace that takes longer sends
+progress notifications (below), and the client needs a longer request timeout or one that it resets
+on progress.
+
+If a browser render fails or times out, `auto` renders on the server instead and says why in
+`note`, and `browser` fails with what to do (a path trace: lower `time_limit` or the size, or path
+trace on the server). The editor does not stop drawing an image the server stopped waiting for, and
+until it has finished, its next renders and commands wait behind it. Meanwhile `render_image`
+sends renders to another connected editor that is not busy (without `client`), else `auto` renders
+on the server without asking the busy editor (its `note` says so), and the errors of `browser`
+renders and `editor_command` name the earlier request the editor was still busy with ("it was
+still busy with an earlier request that the server had stopped waiting for: a RASTER render sent
+16 s ago"). A path trace runs on the editor's render workers and does not hold up its other
+requests. An editor that answered its last raster image (of the same shading: `SOLID` is judged
+apart) after the server had stopped waiting, or took longer than the 15 s `auto` waits, is not
+asked by `auto` for 2 minutes after that image either: in software WebGL every raster image of a
+heavy scene can take about 20 s (a 71-material scene in a headless editor), and `auto` would
+otherwise wait 15 s in vain for every other render. A faster answer (`renderer: "browser"`, which
+waits longer) makes `auto` use the editor again at once. The notes and the error of a raster image
+that timed out (one line each):
+
+```text
+note:  browser render failed: the editor did not finish the RASTER image within 15 s (renderer 'auto'
+       waits 15 s before it renders on the server; renderer 'browser' waits 55 s); it may still be
+       drawing it, and until it has, renderer 'auto' renders on the server without asking it
+note:  the browser editor is still busy with an earlier request that the server stopped waiting for
+       (a RASTER render sent 3 s ago): renderer 'auto' renders on the server until it has finished
+note:  the browser editor answered its last RASTER image after 21 s, when the server had stopped
+       waiting for it: renderer 'auto' renders on the server and asks that editor again 120 s after
+       that image; renderer 'browser' waits up to 55 s
+error: browser render failed: the editor did not finish the RASTER image within 55 s. It may still
+       be drawing it, and its next renders and commands wait until it has. A heavy scene takes tens
+       of seconds in an editor without GPU acceleration (software WebGL, e.g. a headless browser):
+       render on the server with renderer 'software' (or 'auto'), render a smaller image, or pass
+       shading 'SOLID' (grey clay, faster).
+```
+
+A `SOLID` render that times out is not told to use `SOLID`: its error ends with "render on the
+server with renderer 'software' (or 'auto') or render a smaller image."
+
+While a `browser` render waits, the tool sends a progress notification every 5 s to requests with
+a progress token, until the image arrives or the wait ends (for a path trace, `progress` counts the
+seconds up to `time_limit` and then stays there while the editor finishes), so clients that reset
+their request timeout on progress keep waiting. The web editor's own Render Image (F12) and Render
+Animation (Ctrl+F12) windows path trace on the same Web Workers. `render_animation` always renders
+on the server.
 
 The server's render threads: `RENDER_WORKERS` (default: CPU cores, at most 8; `0` renders on the
 main thread) plus one thread for raster stills and exports, which never wait for long renders.
@@ -843,7 +973,7 @@ id, `agent_id`).
 #### `editor_command`
 
 Arguments: `project`, `command`, `params`, `client` (connection id or client name; default: the
-most recently active editor that accepts UI commands), `timeout_ms` (100–60000, default 10000).
+most recently active editor that accepts UI commands), `timeout_ms` (100–55000, default 10000).
 
 Sends a UI command to a live browser editor that has the project open. The server first checks the
 command and the names of its parameters (with did-you-mean suggestions and the valid names, also
@@ -862,7 +992,7 @@ UI commands is connected … Open _editor_url_ in a browser"). Commands:
 | `play`                | `playing` (default true)                                                        | Start or stop playback                                                                           |
 | `notify`              | `message`                                                                       | Show a message to the user                                                                       |
 | `run_operator`        | `operator`, `params`                                                            | Run an operator in that editor, with its selection and its undo history (also UI-only operators) |
-| `screenshot`          | `width`, `height` (whole pixels, 16–4096; default: the viewport size)           | A PNG of the viewport as the user sees it (returned as an image)                                 |
+| `screenshot`          | `width`, `height` (whole pixels, 16–4096; default: the viewport size)           | A PNG of the viewport's view (returned as an image), see below                                   |
 | `get_view`            | –                                                                               | The viewport's target, distance, yaw, pitch, orthographic flag and camera view state             |
 
 Enum values are case-insensitive. Unknown commands and misspelled parameter names are refused by
@@ -874,6 +1004,55 @@ afterwards, and a command the editor cannot carry out (Edit Mode without an acti
 camera view without a scene camera) answers `ok: false` with the reason in `error`. `select`
 answers `{selected, names}`; `[]` deselects everything.
 
+`screenshot` shows the viewport's view (the scene camera when the viewport looks through it) without
+overlays, drawn with materials, lights and the world (Rendered shading) whatever shading the
+viewport shows, so it is not always what the person sees.
+
+`run_operator` is how agents run the operators of the browser editor's own user interface
+(`view3d.*`, `wm.*`, `screen.*`, `ed.*`, `render.render` …), which the `run_operator` tool refuses
+with a message that names this command (`editor_command {project, command: 'run_operator', params:
+{operator: 'view3d.view_all', params: {}}}`). They act on that editor: its view, its selection and
+its user's undo history (`ed.undo` undoes the user's change, not the agent's: use the `undo` tool
+for those), and the interactive ones wait for the person's mouse (`object.duplicate_move`
+duplicates the person's selection and leaves a move running, `view3d.transform_modal` starts one):
+for edits, use the server operators the refusal names (`object.duplicate {offset}`,
+`transform.translate` …).
+
+`timeout_ms` is how long the server waits for the editor's answer, at most 55000 (less than the
+60 s request timeout of MCP clients built on the TypeScript SDK, so the server's error arrives
+first). An editor without GPU acceleration (software WebGL, as in a headless browser) can take tens
+of seconds per frame for a heavy scene drawn with materials and lights, the first frame also
+compiling the shaders. Screenshots are drawn that way whatever shading the editor shows: in such an
+editor, screenshots of a scene with 71 materials took about 20 s (23–44 s in another measurement),
+also with the editor in `SOLID` shading, while `render_image` with `shading: "SOLID"` (grey clay)
+took 0.5–2 s. The other commands draw nothing themselves, but wait while the editor draws its
+viewport, which takes seconds per frame for such a scene in `MATERIAL` or `RENDERED` shading. When
+the editor does not answer in time the error says so and what to do (one line each):
+
+```text
+editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most
+55000); it may still carry the command out, and its next commands and renders wait until it has. An
+editor without GPU acceleration (software WebGL, e.g. a headless browser) can take tens of seconds
+per frame for a heavy scene drawn with materials and lights, as screenshots are whatever the
+viewport's shading, the first time also compiling the shaders: pass a larger timeout_ms (at most
+55000); for a quick look use render_image with shading 'SOLID' (grey clay, much faster), and
+render_image for final images.
+
+editor_command 'select' failed: the editor did not answer within timeout_ms = 10000 ms (at most
+55000); it may still carry the command out, and its next commands and renders wait until it has.
+'select' waits while the editor draws its viewport, which takes seconds per frame for a heavy scene
+in MATERIAL or RENDERED shading without GPU acceleration (software WebGL, e.g. a headless browser),
+tens of seconds the first time while it compiles the shaders: pass a larger timeout_ms (at most
+55000), or switch the viewport to SOLID shading (editor_command view.shading {shading: 'SOLID'}),
+which draws much faster.
+```
+
+At the maximum it says that `timeout_ms` cannot be raised further. When the editor was still busy
+with an earlier request that the server had stopped waiting for (a screenshot or render that timed
+out), the error names it after the first sentence ("It was still busy with an earlier request that
+the server had stopped waiting for (editor_command 'screenshot' sent 12 s ago)."). While the tool
+waits, it sends a progress notification every 5 s to requests with a progress token.
+
 ### Resources
 
 `project://{id}/scene` (JSON): the same description as `get_scene`, at the agent's frame, for each
@@ -882,46 +1061,55 @@ project. `resources/list` lists one per project.
 ## Errors
 
 **Tool errors** are normal tool results with `isError: true` and a text message. Most messages say
-what to do. When an operator fails in `run_operator`, `batch` or `edit_mesh`, the first line is the
-message and the rest is the full result as JSON (for `batch`, including the operations that
-succeeded). A `selection` or element index that `run_operator` or `edit_mesh` cannot apply, and a
-wrong object reference, are plain messages without JSON.
+what to do. Every failure of `run_operator` and `edit_mesh`, and every `batch` call with a failure,
+is uniform: the first line is the message and the rest is JSON with `ok: false`, `error` and `code`
+— for `run_operator` and `edit_mesh` `{ok: false, operator, error, code, selection, …}`, also when
+the `selection`, the object, an element index, the project or the operator id is the problem; for
+`batch` the full result, including the operations that succeeded (see the tools above). Errors of
+the tool arguments (`Input validation error: …`, checked before any tool runs) and the errors of
+the other tools are plain messages. A message never spans lines: line breaks in the names it
+quotes are written as `\n`, `\r` or `\u2028`, as in JSON.
 
-| Message (abridged)                                                                                                                                | Cause                                                                                                 |
-| ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `MCP error -32602: Input validation error: Invalid arguments for tool get_object: Invalid input: expected number, received string at frame`       | A tool argument of the wrong type or out of range (e.g. `time_limit` above 600)                       |
-| `… Invalid arguments for tool set_scene_settings: unknown argument 'sampels' (did you mean 'samples'?). Valid arguments: …`                       | A misspelled or unknown tool argument                                                                 |
-| `… Invalid arguments for tool render_image: unknown key 'fov' (did you mean 'lens' or 'fov_degrees'?) (valid keys: …) at view`                    | A misspelled key inside a nested tool argument (`view`, `selection`, batch `operations`)              |
-| `… unknown argument 'name'. Valid arguments: project, operator, params, selection. Operator parameters go inside …`                               | Operator parameters given as tool arguments                                                           |
-| `Invalid parameters for mesh.primitive_cylinder_add: unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                    | A misspelled or unsupported operator parameter (also nested, e.g. in curve points)                    |
-| `Invalid parameters for object.shade_smooth: unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …` | A selection-based operator: pass `selection`                                                          |
-| `Invalid parameters for object.drop_to_ground: surface: Invalid input: expected array, received string`                                           | A value of the wrong type or out of range                                                             |
-| `mesh.subdivide failed: Operator requires Edit Mode`                                                                                              | The operator's preconditions (mode, selection, object type) are not met; use `edit_mesh` for `mesh.*` |
-| `Unknown operator 'mesh.primitive_cylindr_add'. Did you mean: …`                                                                                  | A misspelled operator id                                                                              |
-| `'render.render_software' would render on the server's main thread … Use the render_image tool instead`                                           | `render.*` through `run_operator` / `batch` / `edit_mesh`                                             |
-| `Object 'Nope' not found in project 'P'. Objects: …`                                                                                              | A wrong object reference (the message lists up to 40 names)                                           |
-| `Project 'X' not found. Known projects: …` / `Several projects are named 'X': … Pass the project id instead.`                                     | A wrong or ambiguous project reference                                                                |
-| `A project named 'Lighthouse' already exists (id …). … Project names are unique because tools find projects by name …`                            | `create_project` / `rename_project` with a name another project has (letter case ignored)             |
-| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                                                                 | An element selection without `mode: "EDIT"`                                                           |
-| `face index 99 out of range (mesh has 6 faces)`                                                                                                   | An element index of a `selection` (`run_operator`, `edit_mesh`) that the base mesh does not have      |
-| `'show_render' is not a parameter of the BEVEL modifier. Its visibility (show_render) is set after adding it, with update_modifier …`             | A modifier setting given inside `params` instead of as a tool argument                                |
-| `Unknown parameter 'veiw' (did you mean 'view'?) for the editor command view.set_view. Its parameters: …`                                         | A misspelled `editor_command` command or parameter (refused before anything is sent)                  |
-| `'dimensions' is not animatable on object. Animatable: …`                                                                                         | `insert_keyframe` on a property that cannot be keyed                                                  |
-| `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" (it is empty).`                                       | `insert_keyframe` on a path that does not resolve                                                     |
-| `A path traced image of 2048×2048 is too large (at most 2621440 pixels, e.g. 2048×1280): render smaller`                                          | Render limits                                                                                         |
-| `Too many frames (5000, at most 1000): shorten the range or raise frame_step.`                                                                    | `render_animation` limits                                                                             |
-| `Rendering was cancelled.`                                                                                                                        | The request was cancelled or the client disconnected                                                  |
-| `<tool> failed: <message>`                                                                                                                        | An unexpected server error (also logged)                                                              |
+| Message (abridged)                                                                                                                                 | Cause                                                                                                                                              |
+| -------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MCP error -32602: Input validation error: Invalid arguments for tool get_object: Invalid input: expected number, received string at frame`        | A tool argument of the wrong type or out of range (e.g. `time_limit` above 600)                                                                    |
+| `… Invalid arguments for tool set_scene_settings: unknown argument 'sampels' (did you mean 'samples'?). Valid arguments: …`                        | A misspelled or unknown tool argument                                                                                                              |
+| `… Invalid arguments for tool render_image: unknown key 'fov' (did you mean 'lens' or 'fov_degrees'?) (valid keys: …) at view`                     | A misspelled key inside a nested tool argument (`view`, `selection`, batch `operations`)                                                           |
+| `… unknown argument 'name'. Valid arguments: project, operator, params, selection. Operator parameters go inside …`                                | Operator parameters given as tool arguments                                                                                                        |
+| `Invalid parameters for mesh.primitive_cylinder_add: unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                     | A misspelled or unsupported operator parameter (also nested, e.g. in curve points)                                                                 |
+| `Invalid parameters for object.shade_smooth: unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …`  | A selection-based operator: pass `selection`                                                                                                       |
+| `Invalid parameters for object.drop_to_ground: surface: Invalid input: expected array, received string`                                            | A value of the wrong type or out of range                                                                                                          |
+| `mesh.subdivide failed: Operator requires Edit Mode`                                                                                               | The operator's preconditions (mode, selection, object type) are not met; use `edit_mesh` for `mesh.*`                                              |
+| `Unknown operator 'mesh.primitive_cylindr_add'. Did you mean: …`                                                                                   | A misspelled operator id, letter case ignored; browser UI operators among the suggestions are named as such (`NOT_FOUND`)                          |
+| `'view3d.view_all' is an operator of the browser editor's user interface … Run it there with editor_command {project, command: 'run_operator', …}` | An operator of the browser editor's UI through `run_operator` / `batch` / `edit_mesh` (`NOT_FOUND`); some name the tool or operator to use instead |
+| `'render.render_software' would render on the server's main thread … Use the render_image tool instead`                                            | `render.render_software` or `render.render_animation` through `run_operator` / `batch` / `edit_mesh` (`FAILED`)                                    |
+| `Object 'Nope' not found in project 'P'. Objects: …`                                                                                               | A wrong object reference (the message lists up to 40 names; `NOT_FOUND`)                                                                           |
+| `Project 'X' not found. Known projects: …` / `Several projects are named 'X': … Pass the project id instead.`                                      | A wrong or ambiguous project reference                                                                                                             |
+| `A project named 'Lighthouse' already exists (id …). … Project names are unique because tools find projects by name …`                             | `create_project` / `rename_project` with a name another project has (letter case ignored)                                                          |
+| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                                                                  | An element selection without `mode: "EDIT"` (`POLL_FAILED`)                                                                                        |
+| `Edit mode needs an active mesh object (selection.active): 'Camera' is a CAMERA object.`                                                           | `mode: "EDIT"` in a `selection` without an active mesh object (`POLL_FAILED`)                                                                      |
+| `face index 99 out of range (mesh has 6 faces)`                                                                                                    | An element index of a `selection` (`run_operator`, `edit_mesh`) that the base mesh does not have                                                   |
+| `'Camera' is not a mesh object.`                                                                                                                   | `edit_mesh` on an object that is not a mesh (`POLL_FAILED`)                                                                                        |
+| `'show_render' is not a parameter of the BEVEL modifier. Its visibility (show_render) is set after adding it, with update_modifier …`              | A modifier setting given inside `params` instead of as a tool argument                                                                             |
+| `Unknown parameter 'veiw' (did you mean 'view'?) for the editor command view.set_view. Its parameters: …`                                          | A misspelled `editor_command` command or parameter (refused before anything is sent)                                                               |
+| `editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000); …`                                    | The editor needed longer: raise `timeout_ms`; a quick look: `render_image {shading: "SOLID"}`; final images: `render_image`                        |
+| `browser render failed: the editor did not finish the RASTER image within 55 s. …`                                                                 | `render_image` with `renderer: "browser"` on a heavy scene: render on the server, smaller or `SOLID`                                               |
+| `'dimensions' is not animatable on object. Animatable: …`                                                                                          | `insert_keyframe` on a property that cannot be keyed                                                                                               |
+| `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" (it is empty).`                                        | `insert_keyframe` on a path that does not resolve                                                                                                  |
+| `A path traced image of 2048×2048 is too large (at most 2621440 pixels, e.g. 2048×1280): render smaller`                                           | Render limits                                                                                                                                      |
+| `Too many frames (5000, at most 1000): shorten the range or raise frame_step.`                                                                     | `render_animation` limits                                                                                                                          |
+| `Rendering was cancelled.`                                                                                                                         | The request was cancelled or the client disconnected                                                                                               |
+| `<tool> failed: <message>`                                                                                                                         | An unexpected server error (also logged)                                                                                                           |
 
-Failed `run_operator`, `edit_mesh` and `batch` operations also carry a `code` in their JSON (the
-kinds of the core operator registry; plain selection errors have none):
+The `code` of `run_operator`, `edit_mesh` and `batch` failures is one of the kinds of the core
+operator registry, decided by the kind of error, never by the wording of its message:
 
-| `code`           | Meaning                                                                                                                      |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `INVALID_PARAMS` | Unknown, misspelled or invalid parameters: fix `params`                                                                      |
-| `POLL_FAILED`    | Wrong mode, selection or object type; in a `batch`, also a `selection` that cannot be applied (other than an unknown object) |
-| `NOT_FOUND`      | An unknown operator (operators only the browser UI offers included: use `editor_command`), object or datablock               |
-| `FAILED`         | The operator itself failed, or it is refused here (`render.*`: use the rendering tools instead)                              |
+| `code`           | Meaning                                                                                                                                                                                                                                                |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `INVALID_PARAMS` | Unknown, misspelled or invalid parameters: fix `params`                                                                                                                                                                                                |
+| `POLL_FAILED`    | Wrong mode, selection or object type (`edit_mesh` on an object that is not a mesh), or a `selection` that cannot be applied: Edit Mode without an active mesh, `mesh` without Edit Mode, an element index out of range                                 |
+| `NOT_FOUND`      | An unknown project, object, datablock or operator id (with the closest ids); an operator of the browser editor's UI, `render.render` included (the message says how to run it with `editor_command`, and what to use instead where the tools offer it) |
+| `FAILED`         | The operator itself failed, it is refused here (`render.render_software`, `render.render_animation`: use the rendering tools instead), or another failure (the message says why)                                                                       |
 
 An operator can also **succeed with problems**: check `reports` (WARNING / ERROR), `errors` lists in
 results (`object.constraint_add`, `object.track_set`, particle systems, `anim.driver_add` per
@@ -955,13 +1143,13 @@ driver) and the `problems` list of `get_scene`.
 | Undo history                               | 100 steps and 64 MB of replaced or deleted data per agent and project (`MCP_UNDO_STEPS`, `MCP_UNDO_MEMORY_MB`); older steps are dropped                                            |
 | `list_operators`                           | Parameter schemas when a filter matches at most 60 operators (or `include_parameters: true`)                                                                                       |
 | `render_image`                             | 16–2048 per side; path tracing on the server at most 2,621,440 pixels; `time_limit` up to 600 s (default 30)                                                                       |
-| Browser renders                            | Raster: 15 s per render request; path tracing: `time_limit` + 30 s                                                                                                                 |
+| Browser renders                            | Raster: 55 s with `renderer: "browser"`, 15 s with `auto` (then the server renders); path tracing: `time_limit` + 30 s                                                             |
 | `render_animation`                         | 1000 frames, 2048 px per side, `time_limit` up to 600 s (default 60); GIFs and contact sheets at most 33,554,432 pixels over all frames; a contact sheet at most 16,777,216 pixels |
 | Concurrent long renders                    | 2 path-traced stills or animations at once (more wait their turn; raster stills have a thread of their own)                                                                        |
 | Embedded files                             | 20 MiB (`export_scene`, `render_animation`); larger animations are stored and linked                                                                                               |
 | Stored renders                             | 1 hour, 256 MiB in all (oldest dropped first); kept in memory                                                                                                                      |
 | `import_model`                             | 50 MB; URL downloads time out after 60 s                                                                                                                                           |
-| `editor_command`                           | `timeout_ms` up to 60000; screenshots 16–4096 px per side                                                                                                                          |
+| `editor_command`                           | `timeout_ms` 100–55000 (default 10000); screenshots 16–4096 px per side                                                                                                            |
 
 ## REST endpoints
 

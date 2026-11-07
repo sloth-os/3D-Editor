@@ -5,7 +5,9 @@ import type { SceneDoc } from '@3d-editor/core';
 import { isNotImplemented } from '../api/projects';
 import { RenderRequestError, isCancelled, type RenderProgress } from '../render';
 import { errorMessage } from '../observability/tracing';
+import { RpcError, type Room, type RpcAnswer, type SyncConnection } from '../sync/room';
 import { ToolError } from './agent';
+import { MAX_EDITOR_WAIT_MS } from './editor-commands';
 
 /*
  * Shared pieces of the rendering tools (render_image, render_animation): option schemas,
@@ -24,6 +26,132 @@ export const MAX_TIME_LIMIT = 600;
 export const MAX_ANIMATION_SIZE = 2048;
 /** Most frames of one render_animation call. */
 export const MAX_RENDER_FRAMES = 1000;
+
+/**
+ * How long render_image waits for a RASTER image of a browser editor with renderer 'browser' (ms):
+ * an editor without GPU acceleration (software WebGL, e.g. a headless browser) takes tens of
+ * seconds for a heavy scene (a verifier's 71-material scene: one browser render took 12.9 s, two
+ * did not finish within the 15 s the server used to wait, one took 30 s; its screenshots took
+ * 23–44 s). Under the 60 s default request timeout of MCP clients (see {@link MAX_EDITOR_WAIT_MS}).
+ */
+export const BROWSER_RASTER_TIMEOUT_MS = MAX_EDITOR_WAIT_MS;
+/**
+ * How long render_image waits for a browser editor's RASTER image with renderer 'auto' before it
+ * renders on the server instead (ms): the fallback must stay fast.
+ */
+export const AUTO_BROWSER_RASTER_TIMEOUT_MS = 15_000;
+/** Time a browser editor's path trace gets beyond its time_limit: loading, compiling, denoising, the PNG (ms). */
+export const BROWSER_PATHTRACE_EXTRA_MS = 30_000;
+/**
+ * How long renderer 'auto' renders on the server without asking an editor that was too slow for
+ * its last RASTER image (ms; see {@link slowBrowserRaster}).
+ */
+export const SLOW_EDITOR_RETRY_MS = 120_000;
+
+/**
+ * Whether renderer 'auto' should render on the server instead of asking `conn` for a RASTER image
+ * with this `shading`: the editor's last such image came after the server had stopped waiting, or
+ * took longer than 'auto' waits ({@link AUTO_BROWSER_RASTER_TIMEOUT_MS}), less than
+ * {@link SLOW_EDITOR_RETRY_MS} ago. In software WebGL every RASTER image of a heavy scene can take
+ * about 20 s (a 71-material scene in a headless editor), so 'auto' would otherwise wait 15 s in
+ * vain for every other render. A faster answer (renderer 'browser' waits longer) clears it.
+ * Returns why, as a clause after "the browser editor", or null.
+ */
+export function slowBrowserRaster(
+  room: Room,
+  conn: SyncConnection,
+  shading: 'SOLID' | 'MATERIAL' | undefined,
+  now = Date.now(),
+): string | null {
+  // without a shading (or with MATERIAL) the editor draws materials and lights; SOLID is separate
+  const shadings = shading === 'SOLID' ? ['SOLID'] : [undefined, 'MATERIAL'];
+  const last = shadings
+    .map((s) => room.lastAnswer(conn, { method: 'render', engine: 'RASTER', shading: s }))
+    .filter((x): x is RpcAnswer => !!x)
+    .sort((a, b) => b.sentAt - a.sentAt)[0];
+  if (!last || !(last.late || last.tookMs > AUTO_BROWSER_RASTER_TIMEOUT_MS)) return null;
+  if (now - (last.sentAt + last.tookMs) >= SLOW_EDITOR_RETRY_MS) return null;
+  const seconds = Math.round(last.tookMs / 1000);
+  return last.late
+    ? `answered its last RASTER image after ${seconds} s, when the server had stopped waiting for it`
+    : `needed ${seconds} s for its last RASTER image, longer than renderer 'auto' waits (${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s)`;
+}
+
+/** How long render_image waits for a browser editor's image (ms). */
+export function browserRenderTimeout(
+  renderer: 'auto' | 'browser',
+  pathTrace: boolean,
+  timeLimitSeconds: number,
+): number {
+  if (pathTrace) return timeLimitSeconds * 1000 + BROWSER_PATHTRACE_EXTRA_MS;
+  return renderer === 'browser' ? BROWSER_RASTER_TIMEOUT_MS : AUTO_BROWSER_RASTER_TIMEOUT_MS;
+}
+
+/** A browser editor's render that failed (render_image), for {@link browserRenderFailure}. */
+export interface BrowserRender {
+  renderer: 'auto' | 'browser';
+  pathTrace: boolean;
+  /** How long the server waited (ms). */
+  timeoutMs: number;
+  /** Path tracing: the time_limit (seconds). */
+  timeLimit: number;
+  /** The `shading` argument (SOLID is the fast grey clay look already). */
+  shading?: 'SOLID' | 'MATERIAL';
+  /**
+   * The earlier request the editor was still busy with when this render was sent (one the server
+   * had stopped waiting for, see describeLateRpcs).
+   */
+  busy?: string | null;
+}
+
+/**
+ * Why a browser editor's render failed and what to do instead: `reason` for the error (renderer
+ * 'browser') and for the `note` of the server render that replaces it (renderer 'auto'), `advice`
+ * for the error. A timeout says how long the server waited, that the editor may still be drawing
+ * the image (it holds up the editor's next requests: 'auto' renders on the server meanwhile) and
+ * the earlier request the editor was still busy with.
+ */
+export function browserRenderFailure(err: unknown, r: BrowserRender): { reason: string; advice: string } {
+  if (!(err instanceof RpcError && err.code === 'TIMEOUT'))
+    return {
+      reason: `browser render failed: ${errorMessage(err)}`,
+      advice: "Use renderer 'software' to render on the server.",
+    };
+  const seconds = Math.round(r.timeoutMs / 1000);
+  const busy = r.busy
+    ? ` (it was still busy with an earlier request that the server had stopped waiting for: ${r.busy})`
+    : '';
+  if (r.pathTrace)
+    return {
+      reason:
+        `browser render failed: the editor did not finish path tracing within ${seconds} s ` +
+        `(time_limit ${r.timeLimit} s + ${BROWSER_PATHTRACE_EXTRA_MS / 1000} s for loading, compiling and denoising)${busy}`,
+      advice:
+        'Its render workers may still be busy with it. ' +
+        "Path trace on the server with renderer 'software' or 'auto' (all its CPU cores), or lower time_limit or the image size.",
+    };
+  if (r.renderer === 'auto')
+    return {
+      reason:
+        `browser render failed: the editor did not finish the RASTER image within ${seconds} s ` +
+        `(renderer 'auto' waits ${seconds} s before it renders on the server; renderer 'browser' waits ` +
+        `${BROWSER_RASTER_TIMEOUT_MS / 1000} s)${busy}; it may still be drawing it, and until it has, ` +
+        "renderer 'auto' renders on the server without asking it",
+      advice: '',
+    };
+  return {
+    reason: `browser render failed: the editor did not finish the RASTER image within ${seconds} s${busy}`,
+    advice:
+      'It may still be drawing it, and its next renders and commands wait until it has. ' +
+      'A heavy scene takes tens of seconds in an editor without GPU acceleration (software WebGL, e.g. a headless browser): ' +
+      (r.shading === 'SOLID'
+        ? "render on the server with renderer 'software' (or 'auto') or render a smaller image."
+        : "render on the server with renderer 'software' (or 'auto'), render a smaller image, or pass shading 'SOLID' (grey clay, faster)."),
+  };
+}
+
+/** How often a request that waits for a browser editor sends a progress notification (ms). */
+export const KEEP_ALIVE_MS = 5000;
 
 /** `engine` argument of the rendering tools. */
 export const engineArg = z
@@ -95,6 +223,20 @@ export function progressReporter(extra: ToolExtra): ((p: RenderProgress) => void
       })
       .catch(() => undefined);
   };
+}
+
+/**
+ * While a request waits for a browser editor (which sends no progress of its own), sends a progress
+ * notification every {@link KEEP_ALIVE_MS} (only when the client asked for progress), so clients
+ * that reset their request timeout on progress keep waiting. `at` gives the notification after a
+ * number of seconds. Returns the function that stops it.
+ */
+export function keepAlive(extra: ToolExtra, at: (seconds: number) => RenderProgress): () => void {
+  const progress = progressReporter(extra);
+  if (!progress) return () => undefined;
+  const t0 = Date.now();
+  const timer = setInterval(() => progress(at(Math.floor((Date.now() - t0) / 1000))), KEEP_ALIVE_MS);
+  return () => clearInterval(timer);
 }
 
 /**

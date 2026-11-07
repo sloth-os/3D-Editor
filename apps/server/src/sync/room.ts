@@ -137,6 +137,54 @@ interface PendingRpc {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  request: RpcRequestInfo;
+}
+
+/** What an RPC request to an editor asked for, and when it was sent. */
+export interface RpcRequestInfo {
+  method: string;
+  /** The `command` of a `ui` request (editor_command). */
+  command?: string;
+  /** The `engine` of a `render` request (RASTER or PATHTRACER). */
+  engine?: string;
+  /** The `shading` of a `render` request (SOLID or MATERIAL; none: materials and lights). */
+  shading?: string;
+  /** When it was sent (ms since the epoch). */
+  sentAt: number;
+}
+
+/**
+ * A request an editor did not answer within its timeout and has not answered since (see
+ * {@link Room.lateRpcs}): the editor may still be working on it.
+ */
+export type LateRpc = RpcRequestInfo;
+
+/** An editor's answer to a request (see {@link Room.lastAnswer}). */
+export interface RpcAnswer extends RpcRequestInfo {
+  /** How long the editor took to answer (ms). */
+  tookMs: number;
+  /** Whether it answered after the request had timed out. */
+  late: boolean;
+}
+
+/** How long a request that timed out counts as unanswered at most (ms): then it is forgotten. */
+export const LATE_RPC_MS = 10 * 60_000;
+
+/** The method of an RPC request with the parameters that tell what it asked for. */
+function requestInfo(method: string, params: unknown, sentAt: number): RpcRequestInfo {
+  const p = typeof params === 'object' && params !== null ? (params as Record<string, unknown>) : {};
+  return {
+    method,
+    ...(typeof p.command === 'string' ? { command: p.command } : {}),
+    ...(typeof p.engine === 'string' ? { engine: p.engine } : {}),
+    ...(typeof p.shading === 'string' ? { shading: p.shading } : {}),
+    sentAt,
+  };
+}
+
+/** The key of the kind of a request for {@link Room.lastAnswer}: its method and what it asked for. */
+function answerKey(r: Pick<RpcRequestInfo, 'method' | 'command' | 'engine' | 'shading'>): string {
+  return [r.method, r.command ?? '', r.engine ?? '', r.shading ?? ''].join('|');
 }
 
 /**
@@ -165,6 +213,10 @@ export class Room {
   private saveChain: Promise<void> = Promise.resolve();
   private saveFailures = 0;
   private readonly pendingRpc = new Map<string, PendingRpc>();
+  /** Requests that timed out, by id, until the editor answers them late (see {@link lateRpcs}). */
+  private readonly lateRpc = new Map<string, LateRpc & { conn: SyncConnection }>();
+  /** Each connection's last answer per kind of request (see {@link lastAnswer}). */
+  private readonly answers = new Map<SyncConnection, Map<string, RpcAnswer>>();
   private readonly agents = new Map<number, { state: PresenceState; clock: number }>();
   private agentTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -404,6 +456,8 @@ export class Room {
       this.deps.metrics.syncRpc.inc({ method: p.method, status: 'closed' });
       p.reject(new RpcError(`client disconnected before answering '${p.method}'`, 'CLOSED'));
     }
+    for (const [id, l] of this.lateRpc) if (l.conn === conn) this.lateRpc.delete(id);
+    this.answers.delete(conn);
     if (!this.destroyed) {
       if (conn.awarenessIds.size > 0)
         awarenessProtocol.removeAwarenessStates(this.awareness, [...conn.awarenessIds], null);
@@ -540,9 +594,19 @@ export class Room {
     if (msg.kind === 'res') {
       const res = msg as RpcResponse;
       const p = this.pendingRpc.get(res.id);
-      if (!p || p.conn !== conn) return;
+      if (!p || p.conn !== conn) {
+        // the late answer to a request that timed out: the editor is done with it
+        const late = this.lateRpc.get(res.id);
+        if (late?.conn === conn) {
+          this.lateRpc.delete(res.id);
+          const { conn: _conn, ...request } = late;
+          this.recordAnswer(conn, request, true);
+        }
+        return;
+      }
       clearTimeout(p.timer);
       this.pendingRpc.delete(res.id);
+      this.recordAnswer(conn, p.request, false);
       if (res.error) {
         this.deps.metrics.syncRpc.inc({ method: p.method, status: 'error' });
         p.reject(new RpcError(res.error.message || 'remote error', 'REMOTE'));
@@ -611,6 +675,11 @@ export class Room {
     return this.rpcTo(conn, method, params, opts.timeoutMs);
   }
 
+  /**
+   * Sends an RPC request to `conn` and resolves with its result. A request it does not answer
+   * within `timeoutMs` is rejected (TIMEOUT) and counts as unanswered until the editor answers it
+   * late (see {@link lateRpcs}).
+   */
   rpcTo(conn: SyncConnection, method: string, params: unknown, timeoutMs = 15_000): Promise<unknown> {
     return withSpan(
       'sync.rpc',
@@ -618,12 +687,18 @@ export class Room {
       () => {
         return new Promise<unknown>((resolve, reject) => {
           const id = newId(16);
+          const request = requestInfo(method, params, Date.now());
           const timer = setTimeout(() => {
             this.pendingRpc.delete(id);
             this.deps.metrics.syncRpc.inc({ method, status: 'timeout' });
+            // the editor may still be working on it (and hold up the next requests until it is done)
+            if (!this.destroyed && this.conns.has(conn)) {
+              this.pruneLateRpcs();
+              this.lateRpc.set(id, { ...request, conn });
+            }
             reject(new RpcError(`editor did not answer '${method}' within ${timeoutMs} ms`, 'TIMEOUT'));
           }, timeoutMs);
-          this.pendingRpc.set(id, { conn, method, resolve, reject, timer });
+          this.pendingRpc.set(id, { conn, method, resolve, reject, timer, request });
           const req: RpcRequest = { kind: 'req', id, method, params, traceparent: currentTraceparent() };
           if (!this.send(conn, encodeJsonFrame(MSG_RPC, req), 'rpc')) {
             clearTimeout(timer);
@@ -634,6 +709,44 @@ export class Room {
         });
       },
     );
+  }
+
+  /**
+   * The requests sent to `conn` that it did not answer within their timeout and has not answered
+   * since, oldest first: the editor may still be working on them, and while it draws an image for
+   * one (a rasterized render, a screenshot) its next requests wait. Forgotten when it answers,
+   * disconnects or after {@link LATE_RPC_MS}.
+   */
+  lateRpcs(conn: SyncConnection): LateRpc[] {
+    this.pruneLateRpcs();
+    const out: LateRpc[] = [];
+    for (const { conn: c, ...late } of this.lateRpc.values()) if (c === conn) out.push(late);
+    return out.sort((a, b) => a.sentAt - b.sentAt);
+  }
+
+  /**
+   * The last answer `conn` gave to a request of this kind (method, and the command, engine and
+   * shading it asked for), on time or late: how long the editor took. Null when it has answered
+   * none since it connected.
+   */
+  lastAnswer(
+    conn: SyncConnection,
+    kind: Pick<RpcRequestInfo, 'method' | 'command' | 'engine' | 'shading'>,
+  ): RpcAnswer | null {
+    return this.answers.get(conn)?.get(answerKey(kind)) ?? null;
+  }
+
+  private recordAnswer(conn: SyncConnection, request: RpcRequestInfo, late: boolean): void {
+    if (!this.conns.has(conn)) return;
+    let byKind = this.answers.get(conn);
+    if (!byKind) this.answers.set(conn, (byKind = new Map()));
+    byKind.set(answerKey(request), { ...request, tookMs: Date.now() - request.sentAt, late });
+  }
+
+  /** Forgets unanswered requests older than {@link LATE_RPC_MS}. */
+  private pruneLateRpcs(): void {
+    const now = Date.now();
+    for (const [id, l] of this.lateRpc) if (now - l.sentAt > LATE_RPC_MS) this.lateRpc.delete(id);
   }
 
   // ---------------------------------------------------------------- presence
@@ -724,6 +837,8 @@ export class Room {
       p.reject(new RpcError('room closed', 'CLOSED'));
     }
     this.pendingRpc.clear();
+    this.lateRpc.clear();
+    this.answers.clear();
     this.doc.off('update', this.onDocUpdate);
     this.awareness.off('update', this.onAwarenessUpdate);
     this.scene.destroy();

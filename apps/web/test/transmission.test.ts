@@ -24,6 +24,7 @@ import {
   transmissionThickness,
   type LayerItem,
 } from '../src/viewport/transmission';
+import { glslFunction, glslProgram } from './glsl';
 
 /*
  * Glass and liquids in the WebGL renders (transmission.ts). Regressions: a transmissive object
@@ -500,5 +501,162 @@ describe('transmissive materials', () => {
     const g = new THREE.BoxGeometry(0.084, 0.07, 0.096);
     expect(transmissionThickness(g)).toBeCloseTo(0.07, 9);
     expect(transmissionThickness(new THREE.BufferGeometry())).toBe(0);
+  });
+});
+
+describe('the depth check of refracted lookups', () => {
+  /*
+   * The patched shader's lookup (getTransmissionSample) run on the CPU (glsl.ts): something in front
+   * of the glass, like a label on a bottle, is in the picture too, and a lookup that lands on it
+   * would show it a second time, shifted, through the glass. Regression guard: forcing the check
+   * to pass (`if ( true )`) left this file green, as it only checked the shader text.
+   */
+  const W = 200;
+  const H = 150;
+  /** The fragment of the glass surface: pixel (100, 75) of the picture, 5 m from the camera. */
+  const FRAGMENT: [number, number] = [100.5, 75.5];
+  const GLASS = 5;
+  const STRAIGHT = [FRAGMENT[0] / W, FRAGMENT[1] / H];
+  /** Where the refracted ray leaves the glass (picture coordinates): 20 pixels to the right. */
+  const REFRACTED = [0.6, 0.5];
+  const perspective = new THREE.PerspectiveCamera(50, W / H, 0.1, 100);
+  const orthographic = new THREE.OrthographicCamera(-4, 4, 3, -3, 0.1, 100);
+  const columns = (m: THREE.Matrix4) => [0, 1, 2, 3].map((c) => m.elements.slice(c * 4, c * 4 + 4));
+  /** Window depth of a point `distance` in front of `camera` (what the depth picture holds). */
+  const windowDepth = (camera: THREE.Camera, distance: number) =>
+    new THREE.Vector3(0, 0, -distance).applyMatrix4(camera.projectionMatrix).z * 0.5 + 0.5;
+
+  let patched: string | null = null;
+  /** The functions of the patched physical fragment shader the lookup runs. */
+  const source = (): string => {
+    if (patched === null) {
+      const shader = {
+        vertexShader: THREE.ShaderLib.physical.vertexShader,
+        fragmentShader: THREE.ShaderLib.physical.fragmentShader,
+      };
+      expect(patchTransmission(shader)).toBe(true);
+      patched = ['applyIorToRoughness', 'pfxViewDistance', 'getTransmissionSample']
+        .map((name) => glslFunction(shader.fragmentShader, name))
+        .join('\n');
+    }
+    return patched;
+  };
+
+  /**
+   * Where in the picture the glass fragment reads what it refracts, for a picture showing
+   * something `distanceAt(u, v)` metres away at picture coordinates (u, v) (everywhere else: the
+   * background, 20 m away).
+   */
+  function lookup(
+    distanceAt: (u: number, v: number) => number | null,
+    { camera = perspective as THREE.Camera, thickness = 0.5, scale = 1, defines = [] as string[] } = {},
+  ): number[] {
+    const sample = glslProgram(source(), {
+      defines,
+      globals: {
+        gl_FragCoord: [...FRAGMENT, windowDepth(camera, GLASS), 1],
+        isOrthographic: (camera as THREE.OrthographicCamera).isOrthographicCamera === true,
+        projectionMatrix: columns(camera.projectionMatrix),
+        modelMatrix: columns(new THREE.Matrix4().makeScale(scale, scale, scale)),
+        thickness,
+        transmissionSamplerSize: [W, H],
+        transmissionSamplerMap: 'colour',
+        pfxTransmissionDepth: 'depth',
+      },
+      natives: {
+        texture2D: (picture: string, uv: number[]) => {
+          expect(picture).toBe('depth');
+          return [windowDepth(camera, distanceAt(uv[0], uv[1]) ?? 20), 0, 0, 1];
+        },
+        // the colour picture: where it was read
+        textureBicubic: (picture: string, uv: number[], lod: number) => {
+          expect(picture).toBe('colour');
+          expect(lod).toBe(0);
+          return [uv[0], uv[1], 0, 1];
+        },
+      },
+    })('getTransmissionSample', REFRACTED, 0, 1.5) as number[];
+    return sample.slice(0, 2);
+  }
+  /** Whether `p` lies on the way from straight behind the fragment to the refracted lookup. */
+  const onTheWay = (p: number[]) => {
+    const [dx, dy] = [REFRACTED[0] - STRAIGHT[0], REFRACTED[1] - STRAIGHT[1]];
+    const t = ((p[0] - STRAIGHT[0]) * dx + (p[1] - STRAIGHT[1]) * dy) / (dx * dx + dy * dy);
+    const cross = (p[0] - STRAIGHT[0]) * dy - (p[1] - STRAIGHT[1]) * dx;
+    return t >= 0 && t <= 1 && Math.abs(cross) < 1e-9;
+  };
+  /** A label in front of the glass covering picture columns u0 … u1 (and rows v0 … v1). */
+  const label =
+    (u0: number, u1: number, distance = 4.9, [v0, v1] = [0, 1]) =>
+    (u: number, v: number) =>
+      u >= u0 && u <= u1 && v >= v0 && v <= v1 ? distance : null;
+
+  it('keeps a refracted lookup that lands on what lies behind the glass', () => {
+    expect(lookup(() => null)).toEqual(REFRACTED);
+    // a label elsewhere does not matter
+    expect(lookup(label(0.8, 0.9))).toEqual(REFRACTED);
+    // nor does something inside the glass, clearly behind its surface (the perfume in a bottle)
+    expect(lookup(label(0.55, 0.75, 5.2))).toEqual(REFRACTED);
+  });
+
+  it('moves a lookup that lands on something in front of the glass back towards straight behind it', () => {
+    // the label covers u 0.55 … 0.75, in front of the glass: the lookup at u 0.6 would show it again
+    const p = lookup(label(0.55, 0.75));
+    expect(p).not.toEqual(REFRACTED);
+    expect(onTheWay(p)).toBe(true);
+    // off the label, with the texels the filter reads around it (two to each side)
+    expect(p[0] + 2 / W).toBeLessThan(0.55);
+    // but no further than needed: not all the way back
+    expect(p[0]).toBeGreaterThan(STRAIGHT[0]);
+  });
+
+  it('also moves a lookup whose filter would read something in front of the glass', () => {
+    // the label starts one texel to the right of the lookup
+    const p = lookup(label(0.605, 0.75));
+    expect(p[0]).toBeLessThan(REFRACTED[0]);
+    expect(p[0] + 2 / W).toBeLessThan(0.605);
+    expect(onTheWay(p)).toBe(true);
+  });
+
+  it('also moves a lookup whose filter would read something in front of the glass above or below it', () => {
+    // regression guard: the labels above spanned whole columns, so the taps above and below the
+    // lookup (two pixels away, like those to its sides) could be left out unnoticed
+    const row = REFRACTED[1];
+    // a label starting one pixel above the lookup's row, and one ending one pixel below it
+    const rowRanges: [number, number][] = [
+      [row + 1 / H, 0.75],
+      [0.25, row - 1 / H],
+    ];
+    for (const rows of rowRanges) {
+      const p = lookup(label(0.55, 0.75, 4.9, rows));
+      expect(p).not.toEqual(REFRACTED);
+      expect(onTheWay(p)).toBe(true);
+      expect(p[0] + 2 / W).toBeLessThan(0.55);
+    }
+    // three pixels away the filter does not reach it
+    expect(lookup(label(0.55, 0.75, 4.9, [row + 3 / H, 0.75]))).toEqual(REFRACTED);
+    expect(lookup(label(0.55, 0.75, 4.9, [0.25, row - 3 / H]))).toEqual(REFRACTED);
+  });
+
+  it('counts what lies less than a tenth of the glass’s thickness behind its surface as in front', () => {
+    // 3 cm behind the surface of 50 cm thick glass: not clearly behind it
+    expect(lookup(label(0.55, 0.75, 5.03))).not.toEqual(REFRACTED);
+    // 8 cm behind it is, unless the object is scaled up (its thickness with it)
+    expect(lookup(label(0.55, 0.75, 5.08))).toEqual(REFRACTED);
+    expect(lookup(label(0.55, 0.75, 5.08), { scale: 2 })).not.toEqual(REFRACTED);
+    // a thin pane: 3 cm behind 5 cm of glass is behind it
+    expect(lookup(label(0.55, 0.75, 5.03), { thickness: 0.05 })).toEqual(REFRACTED);
+  });
+
+  it('works with orthographic cameras', () => {
+    expect(lookup(() => null, { camera: orthographic })).toEqual(REFRACTED);
+    expect(lookup(label(0.8, 0.9), { camera: orthographic })).toEqual(REFRACTED);
+    const p = lookup(label(0.55, 0.75), { camera: orthographic });
+    expect(p[0] + 2 / W).toBeLessThan(0.55);
+    expect(onTheWay(p)).toBe(true);
+  });
+
+  it('refracts without the check with a reversed depth buffer (another depth mapping)', () => {
+    expect(lookup(label(0.55, 0.75), { defines: ['USE_REVERSED_DEPTH_BUFFER'] })).toEqual(REFRACTED);
   });
 });

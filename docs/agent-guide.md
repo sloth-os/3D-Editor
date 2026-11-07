@@ -576,6 +576,23 @@ their final size instead of scaling small ones.
   traces on the server unless you pass `renderer: "browser"`, which uses those workers of a
   connected editor; the result then does not report the samples reached. `render_animation`
   always renders on the server.
+- An editor without GPU acceleration (software WebGL, e.g. a headless browser) is slow with heavy
+  scenes drawn with materials and lights: tens of seconds per frame, its `editor_command`
+  screenshots too (they are drawn that way whatever the editor's shading), and seconds per frame
+  of its own viewport in Material or Rendered shading, which its other commands wait for.
+  `render_image` with the default `renderer: "auto"` waits 15 s for such an editor's raster image
+  and then renders on the server (`note` says so); `renderer: "browser"` waits up to 55 s and then
+  fails, saying what to do. For `editor_command` raise `timeout_ms` (default 10000, at most 55000:
+  both stay under the 60 s an MCP client built on the TypeScript SDK waits by default); for a quick
+  look use `render_image {shading: "SOLID"}` (grey clay: under 2 s where a screenshot took 20 s),
+  and make final images with `render_image`.
+- An editor keeps drawing an image the server stopped waiting for, and its next renders and
+  commands wait behind it. Until it has finished, `render_image` uses another connected editor that
+  is not busy, else `renderer: "auto"` renders on the server without asking it (`note` says so),
+  and a timeout of `editor_command` or of a `renderer: "browser"` render names the earlier request
+  it was still busy with: do not fire more requests at a busy editor. After an editor needed longer
+  than `auto` waits for a raster image, `auto` renders on the server for 2 minutes without asking
+  it (so it stays fast); `renderer: "browser"` still uses it.
 
 ## Exporting
 
@@ -613,35 +630,65 @@ their final size instead of scaling small ones.
 ## Common errors and how to read them
 
 Tool errors explain themselves; read the whole message, including the JSON after the first line.
-Failed operators carry a `code` in that JSON: `INVALID_PARAMS` (fix `params`), `POLL_FAILED` (mode,
-selection or object type), `NOT_FOUND` (operator, object or datablock) or `FAILED`. A `selection`
-that cannot be applied (an unknown object, an element index out of range) is a plain message
-without JSON or `code`, except in a `batch`, where its operation fails with `NOT_FOUND` (an unknown
-object) or `POLL_FAILED`.
+Every failure of `run_operator` and `edit_mesh` has the same shape: the message on the first line,
+then `{ok: false, operator, error, code, selection, …}`, where `selection` is your selection, active
+object and mode, which the failed call left as they were. In a `batch` each failed operation is
+`{operator, ok: false, error, code}` (a `selection` that cannot be applied: `error` starts with
+`selection:`). Branch on `code`:
 
-| You see                                                                                               | Meaning and fix                                                                                       |
-| ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                            | Misspelled or unsupported operator parameter; use a listed name                                       |
-| `unknown argument 'sampels' (did you mean 'samples'?). Valid arguments: …`                            | Misspelled tool argument; operator parameters go inside `params`                                      |
-| `unknown key 'fov' (did you mean 'lens' or 'fov_degrees'?) (valid keys: …) at view`                   | Misspelled key inside `view`, `selection` or a batch operation                                        |
-| `Input validation error: Invalid arguments for tool get_object: … at frame`                           | A tool argument of the wrong type or out of range (e.g. `time_limit` above 600)                       |
-| `unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …` | A selection-based operator; pass `selection: {objects: [...]}`                                        |
-| `surface: Invalid input: expected array, received string`                                             | Wrong value type; check the schema (`list_operators {search}`)                                        |
-| `Operator requires Edit Mode`                                                                         | A `mesh.*` operator through `run_operator`; use `edit_mesh`                                           |
-| `Unknown operator '…'. Did you mean: …`                                                               | Misspelled operator id, or one the browser UI alone has (`view3d.view_all` …): use `editor_command`   |
-| `'render.render_software' would render on the server's main thread …`                                 | Use `render_image` / `render_animation`                                                               |
-| `Object 'X' not found in project 'P'. Objects: …`                                                     | The name changed (`.001` suffix) or the object was deleted; use names from results                    |
-| `Several projects are named 'X' …`                                                                    | Pass the project id                                                                                   |
-| `A project named 'X' already exists (id …) …`                                                         | Names are unique, ignoring case: work in that project, delete it first or pick another name           |
-| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                     | Pass `mode: "EDIT"` with an element selection, or use `edit_mesh`                                     |
-| `'…' is not animatable on object. Animatable: …`                                                      | Key a listed path; use `data.` for light, camera, curve and mesh data and `material.` for materials   |
-| `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" …`        | The path names something that does not exist; check names with `get_object`                           |
-| `n of m operation(s) failed`                                                                          | Find the first `ok: false` in `results`; earlier operations were applied (one undo step reverts them) |
-| `A path traced image of … is too large (at most 2621440 pixels …)`                                    | Render smaller                                                                                        |
-| `Too many frames (…, at most 1000)`                                                                   | Raise `frame_step` or shorten the range                                                               |
-| `No browser editor accepting UI commands is connected …`                                              | `editor_command` needs the project open in a browser                                                  |
-| `Nothing to undo in the history of this MCP session …`                                                | The session is new: send an agent id to undo across connections                                       |
-| HTTP 404 `Session not found`                                                                          | The session expired (30 minutes idle) or the server restarted: connect again                          |
+- `INVALID_PARAMS`: unknown, misspelled or invalid parameters: fix `params`;
+- `POLL_FAILED`: wrong mode, selection or object type, or a `selection` that cannot be applied:
+  `mode: "EDIT"` without an active mesh, `mesh` elements without `mode: "EDIT"`, an element index
+  out of range; `edit_mesh` on an object that is not a mesh;
+- `NOT_FOUND`: an unknown project, object, datablock or operator id. A misspelled operator id comes
+  with the closest ids, letter case ignored (`VIEW3D.VIEW_ALL` → `view3d.view_all`); an operator of
+  the browser editor's own UI (`view3d.view_all`, `screen.animation_play`, `wm.save_mainfile`,
+  `ed.undo`, `render.render`, Shift+D's `object.duplicate_move` …) with how to run it in a live
+  editor: `editor_command` with `command: "run_operator"` and `params: {operator, params}`
+  (`get_connected_clients` lists the editors). Where the tools do the same, the message names that
+  first: use it, because in a live editor these operators act on the person's selection and undo
+  history and the interactive ones wait for their mouse (`object.duplicate_move` duplicates the
+  person's selection and leaves a move running). For an edit use `object.duplicate {offset}`
+  instead of `object.duplicate_move`, `transform.translate` / `rotate` / `resize` instead of
+  `view3d.transform_modal`, `edit_mesh` with `mesh.loopcut {edge}` instead of `mesh.loopcut_pick`,
+  `undo` instead of `ed.undo`, `scene.frame_set` instead of `screen.frame_offset`;
+- `FAILED`: the operator itself failed, or `render.render_software` / `render.render_animation`
+  (use `render_image` / `render_animation`; `render.render` is a browser UI operator: `NOT_FOUND`).
+
+The message is always one line (line breaks in names show as `\n`), so the JSON starts on the
+second line.
+
+The codes come from the kind of error, never from the wording of the message.
+
+| You see                                                                                               | Meaning and fix                                                                                                |
+| ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                            | Misspelled or unsupported operator parameter; use a listed name                                                |
+| `unknown argument 'sampels' (did you mean 'samples'?). Valid arguments: …`                            | Misspelled tool argument; operator parameters go inside `params`                                               |
+| `unknown key 'fov' (did you mean 'lens' or 'fov_degrees'?) (valid keys: …) at view`                   | Misspelled key inside `view`, `selection` or a batch operation                                                 |
+| `Input validation error: Invalid arguments for tool get_object: … at frame`                           | A tool argument of the wrong type or out of range (e.g. `time_limit` above 600)                                |
+| `unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …` | A selection-based operator; pass `selection: {objects: [...]}`                                                 |
+| `surface: Invalid input: expected array, received string`                                             | Wrong value type; check the schema (`list_operators {search}`)                                                 |
+| `Operator requires Edit Mode`                                                                         | A `mesh.*` operator through `run_operator`; use `edit_mesh`                                                    |
+| `Unknown operator '…'. Did you mean: …`                                                               | Misspelled operator id (`NOT_FOUND`); use one of the suggested ids                                             |
+| `'view3d.view_all' is an operator of the browser editor's user interface … Run it there with …`       | An operator of the editor's UI (`NOT_FOUND`): use what it names instead, or `editor_command` in a live editor  |
+| `Edit mode needs an active mesh object (selection.active): 'Camera' is a CAMERA object.`              | `mode: "EDIT"` needs a mesh as the active object (`POLL_FAILED`)                                               |
+| `'Camera' is not a mesh object.`                                                                      | `edit_mesh` works on mesh objects only (`POLL_FAILED`)                                                         |
+| `face index 99 out of range (mesh has 6 faces)`                                                       | An element index the base mesh does not have (`POLL_FAILED`); read indices with `get_mesh_data`                |
+| `'render.render_software' would render on the server's main thread …`                                 | Use `render_image` / `render_animation` (`FAILED`)                                                             |
+| `Object 'X' not found in project 'P'. Objects: …`                                                     | The name changed (`.001` suffix) or the object was deleted; use names from results                             |
+| `Several projects are named 'X' …`                                                                    | Pass the project id                                                                                            |
+| `A project named 'X' already exists (id …) …`                                                         | Names are unique, ignoring case: work in that project, delete it first or pick another name                    |
+| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                     | Pass `mode: "EDIT"` with an element selection, or use `edit_mesh`                                              |
+| `'…' is not animatable on object. Animatable: …`                                                      | Key a listed path; use `data.` for light, camera, curve and mesh data and `material.` for materials            |
+| `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" …`        | The path names something that does not exist; check names with `get_object`                                    |
+| `n of m operation(s) failed`                                                                          | Find the first `ok: false` in `results`; earlier operations were applied (one undo step reverts them)          |
+| `A path traced image of … is too large (at most 2621440 pixels …)`                                    | Render smaller                                                                                                 |
+| `Too many frames (…, at most 1000)`                                                                   | Raise `frame_step` or shorten the range                                                                        |
+| `No browser editor accepting UI commands is connected …`                                              | `editor_command` needs the project open in a browser                                                           |
+| `editor_command '…' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000) …` | A slow editor (software WebGL, heavy scene): raise `timeout_ms`; quick look: `render_image {shading: "SOLID"}` |
+| `browser render failed: the editor did not finish the RASTER image within 55 s …`                     | `renderer: "browser"` on a heavy scene: use `software` / `auto`, a smaller size or `shading: "SOLID"`          |
+| `Nothing to undo in the history of this MCP session …`                                                | The session is new: send an agent id to undo across connections                                                |
+| HTTP 404 `Session not found`                                                                          | The session expired (30 minutes idle) or the server restarted: connect again                                   |
 
 Problems that do not fail a call:
 

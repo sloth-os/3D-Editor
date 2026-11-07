@@ -3,11 +3,19 @@ import * as Y from 'yjs';
 import { z } from 'zod';
 import { h } from 'preact';
 import { signal } from '@preact/signals';
-import { cleanup, fireEvent, render } from '@testing-library/preact';
-import { OperatorError, OperatorRegistry, SceneDoc, SceneEvaluator, defineOperator } from '@3d-editor/core';
+import { act, cleanup, fireEvent, render } from '@testing-library/preact';
+import {
+  OperatorError,
+  OperatorRegistry,
+  SceneDoc,
+  SceneEvaluator,
+  createEditorState,
+  defineOperator,
+  type OperatorContext,
+} from '@3d-editor/core';
 import { session as sessionSignal } from '../src/app/store';
 import { registry, runResult } from '../src/editor/editor';
-import { lastOperator, redoLast, runOperator } from '../src/editor/runner';
+import { infoLog, lastOperator, redoLast, runOperator } from '../src/editor/runner';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import { registerUiOperators } from '../src/editor/ui-operators';
 import { enableRedoPanelOperators } from '../src/editor/menus';
@@ -49,6 +57,31 @@ function select(s: ProjectSession, ...names: string[]): void {
   const ids = names.map((n) => s.doc.findObjectByName(n)!.id);
   s.state.selectedIds = ids;
   s.state.activeId = ids[ids.length - 1];
+}
+
+/**
+ * An MCP agent's replica of the project, synced both ways like the sync hub: its edits reach the
+ * session as remote updates, which are not on the session's undo stack.
+ */
+function agentReplica(s: ProjectSession): (id: string, params: Record<string, unknown>) => void {
+  const peer = SceneDoc.fromUpdate(s.doc.encodeState(), { type: 'agent' });
+  s.doc.ydoc.on('update', (u: Uint8Array, origin: unknown) => {
+    if (origin !== 'from-peer') Y.applyUpdate(peer.ydoc, u, 'from-main');
+  });
+  peer.ydoc.on('update', (u: Uint8Array, origin: unknown) => {
+    if (origin !== 'from-main') Y.applyUpdate(s.doc.ydoc, u, 'from-peer');
+  });
+  const ctx: OperatorContext = {
+    doc: peer,
+    state: createEditorState(),
+    origin: peer.origin,
+    source: 'mcp',
+    report: () => undefined,
+  };
+  return (id, params) => {
+    const r = registry.run(ctx, id, params);
+    if (!r.ok) throw new Error(`${id} failed on the agent: ${r.error}`);
+  };
 }
 
 /** Whether the Adjust Last Operation panel is still offered for the last operator. */
@@ -415,6 +448,69 @@ describe('Adjust Last Operation shows what "set" operators keep', () => {
     expect(pb.rotation_euler[0]).toBeCloseTo(0.5);
   });
 
+  it('Set Bone IK Settings: unset settings show the bone’s IK state; a re-run changes only the edited one', () => {
+    // regression: after a click in the bone's Inverse Kinematics panel (one setting passed) every
+    // other setting read unchecked or "Auto", contradicting the Properties editor
+    ok('object.armature_add', { name: 'Rig', bone_name: 'Elbow' });
+    const rig = id('Rig');
+    // settings made earlier (e.g. by an MCP agent)
+    ok('pose.ik_settings_set', {
+      object: rig,
+      bone: 'Elbow',
+      lock_ik_x: true,
+      use_ik_limit_z: true,
+      ik_min_z: -Math.PI / 6,
+      ik_max_z: Math.PI / 3,
+      ik_stiffness_y: 0.4,
+    });
+    // what the bone IK panel runs for a click on Lock IK Z
+    ok('pose.ik_settings_set', { object: rig, bone: 'Elbow', lock_ik_z: true });
+    let root = panel();
+    expect(field(root, 'redo-panel')?.textContent).toContain('Set Bone IK Settings');
+    const on = (k: string) => field(root, `redo-${k}`)!.classList.contains('on');
+    const value = (k: string) => field(root, `redo-${k}`)!.querySelector('.nf-value')?.textContent;
+    expect(['x', 'y', 'z'].map((a) => on(`lock_ik_${a}`))).toEqual([true, false, true]);
+    expect(['x', 'y', 'z'].map((a) => on(`use_ik_limit_${a}`))).toEqual([false, false, true]);
+    expect(['x', 'y', 'z'].map((a) => value(`ik_min_${a}`))).toEqual(['-180°', '-180°', '-30°']);
+    expect(['x', 'y', 'z'].map((a) => value(`ik_max_${a}`))).toEqual(['180°', '180°', '60°']);
+    expect(['x', 'y', 'z'].map((a) => value(`ik_stiffness_${a}`))).toEqual(['0', '0.4', '0']);
+    expect(root.textContent).not.toContain('Auto');
+
+    // unchecking Lock IK Z in the panel re-runs with only that setting changed
+    fireEvent.click(field(root, 'redo-lock_ik_z')!);
+    const pb = () => s.doc.getObject(rig)!.pose!.bones.Elbow;
+    expect(lastOperator.value?.params).toEqual({ object: rig, bone: 'Elbow', lock_ik_z: false });
+    expect(pb()).toMatchObject({
+      lock_ik_x: true,
+      lock_ik_z: false,
+      use_ik_limit_z: true,
+      ik_stiffness_y: 0.4,
+    });
+    expect(pb().ik_min_z).toBeCloseTo(-Math.PI / 6, 9);
+    expect(pb().ik_max_z).toBeCloseTo(Math.PI / 3, 9);
+    // a kept setting edited in the panel joins the call; the others still show the bone
+    root = panel();
+    expect(on('lock_ik_x')).toBe(true);
+    typeNumber(field(root, 'redo-ik_max_z')!, '45');
+    expect(lastOperator.value?.params).toEqual({
+      object: rig,
+      bone: 'Elbow',
+      lock_ik_z: false,
+      ik_max_z: Math.PI / 4,
+    });
+    expect(pb().ik_max_z).toBeCloseTo(Math.PI / 4, 9);
+    expect(pb().ik_min_z).toBeCloseTo(-Math.PI / 6, 9);
+    expect(pb()).toMatchObject({ lock_ik_x: true, lock_ik_z: false, ik_stiffness_y: 0.4 });
+    root = panel();
+    expect(value('ik_min_z')).toBe('-30°');
+    expect(value('ik_max_z')).toBe('45°');
+    expect(on('lock_ik_x')).toBe(true);
+    // the whole adjusted edit is one undo step: undoing it brings back the bone as it was before
+    s.undo.undo();
+    expect(pb().lock_ik_z ?? false).toBe(false);
+    expect(pb().ik_max_z).toBeCloseTo(Math.PI / 3, 9);
+  });
+
   it('Edit Bone: unset head and tail show the bone; editing one component keeps the others', () => {
     ok('object.armature_add', { name: 'Rig', bone_name: 'Arm' });
     const rig = id('Rig');
@@ -513,5 +609,130 @@ describe('Adjust Last Operation shows what "set" operators keep', () => {
     const mod = () => s.doc.findObjectByName('Cube')!.modifiers[0];
     expect(mod().show_viewport).toBe(false);
     expect(mod().params.levels).toBe(2);
+  });
+});
+
+describe('Adjust Last Operation while others edit the same objects (MCP agents, other users)', () => {
+  const pb = () => s.doc.findObjectByName('Rig')!.pose!.bones.Elbow;
+
+  it('kept values follow what others change while the panel is open', () => {
+    // regression: the panel only re-rendered on this session's own operations, so it kept showing
+    // the values from before an agent's edit, contradicting the Properties editor
+    ok('object.armature_add', { name: 'Rig', bone_name: 'Elbow' });
+    const rig = id('Rig');
+    ok('pose.ik_settings_set', { object: rig, bone: 'Elbow', ik_stiffness_x: 0.3 });
+    // what the bone IK panel runs for a click on Lock IK Z
+    ok('pose.ik_settings_set', { object: rig, bone: 'Elbow', lock_ik_z: true });
+    // rendered once: only the agent's edit can update it
+    const root = panel();
+    const on = (k: string) => field(root, `redo-${k}`)!.classList.contains('on');
+    const value = (k: string) => field(root, `redo-${k}`)!.querySelector('.nf-value')?.textContent;
+    expect([value('ik_stiffness_x'), on('use_ik_limit_y'), value('ik_min_y')]).toEqual([
+      '0.3',
+      false,
+      '-180°',
+    ]);
+    const agent = agentReplica(s);
+    act(() =>
+      agent('pose.ik_settings_set', {
+        object: 'Rig',
+        bone: 'Elbow',
+        ik_stiffness_x: 0.5,
+        use_ik_limit_y: true,
+        ik_min_y: -Math.PI / 4,
+      }),
+    );
+    // the agent's edit is not on this session's undo stack: the operation can still be adjusted
+    expect(panelOffered(s)).toBe(true);
+    expect(field(root, 'redo-panel')?.textContent).toContain('Set Bone IK Settings');
+    expect([value('ik_stiffness_x'), on('use_ik_limit_y'), value('ik_min_y')]).toEqual(['0.5', true, '-45°']);
+    expect(on('lock_ik_z')).toBe(true);
+
+    // the same for the pose channels Set Bone Transform keeps
+    ok('pose.bone_transform_set', { object: rig, bone: 'Elbow', location: [0, 0.5, 0] });
+    const transform = panel();
+    expect(shown(transform, 'scale')).toEqual(['1', '1', '1']);
+    act(() => agent('pose.bone_transform_set', { object: 'Rig', bone: 'Elbow', scale: [2, 3, 4] }));
+    expect(shown(transform, 'scale')).toEqual(['2', '3', '4']);
+    expect(shown(transform, 'location')).toEqual(['0', '0.5', '0']);
+  });
+
+  it('a re-run after an agent overwrote the edit keeps its edit and undoes no earlier operation', () => {
+    ok('object.armature_add', { name: 'Rig', bone_name: 'Elbow' });
+    const rig = id('Rig');
+    // an earlier operation that has nothing to do with the bone
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('pose.ik_settings_set', { object: rig, bone: 'Elbow', lock_ik_z: true });
+    const depth = s.undo.undoStack.length;
+    const root = panel();
+    // the agent sets another IK setting of the bone, which stores the armature's whole pose again:
+    // the click's change has nothing left to undo
+    const agent = agentReplica(s);
+    act(() => agent('pose.ik_settings_set', { object: 'Rig', bone: 'Elbow', ik_stiffness_x: 0.5 }));
+    fireEvent.click(field(root, 'redo-lock_ik_z')!);
+    expect(pb()).toMatchObject({ lock_ik_z: false, ik_stiffness_x: 0.5 });
+    // regression: Yjs skipped the overwritten step and undid the cube's addition instead, which
+    // the re-run then dropped from the history for good
+    expect(s.doc.findObjectByName('Cube')).not.toBeNull();
+    expect(s.undo.undoStack.length).toBe(depth);
+    expect(lastOperator.value?.params).toEqual({ object: rig, bone: 'Elbow', lock_ik_z: false });
+    expect(field(root, 'redo-lock_ik_z')?.classList.contains('on')).toBe(false);
+    // one undo step reverts the adjusted edit, keeping the agent's; the cube's addition is still undoable
+    s.undo.undo();
+    expect(pb().ik_stiffness_x).toBe(0.5);
+    expect(s.doc.findObjectByName('Cube')).not.toBeNull();
+    s.undo.undo();
+    expect(s.doc.findObjectByName('Cube')).toBeNull();
+  });
+
+  it('a rejected value after an agent overwrote the edit changes nothing and keeps the panel', () => {
+    ok('object.armature_add', { name: 'Rig', bone_name: 'Elbow' });
+    const rig = id('Rig');
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('pose.ik_settings_set', { object: rig, bone: 'Elbow', lock_ik_z: true });
+    const agent = agentReplica(s);
+    agent('pose.ik_settings_set', { object: 'Rig', bone: 'Elbow', ik_stiffness_x: 0.5 });
+    const params = lastOperator.value!.params as Record<string, unknown>;
+    // stiffness goes up to 0.99
+    expect(redoLast(s, registry, { ...params, ik_stiffness_y: 2 })?.ok).toBe(false);
+    expect(pb()).toMatchObject({ lock_ik_z: true, ik_stiffness_x: 0.5 });
+    expect(pb().ik_stiffness_y).toBeUndefined();
+    expect(s.doc.findObjectByName('Cube')).not.toBeNull();
+    expect(panelOffered(s)).toBe(true);
+    // a valid value then runs again on top of the agent's edit
+    expect(redoLast(s, registry, { ...params, ik_stiffness_y: 0.25 })?.ok).toBe(true);
+    expect(pb()).toMatchObject({ lock_ik_z: true, ik_stiffness_x: 0.5, ik_stiffness_y: 0.25 });
+    expect(s.doc.findObjectByName('Cube')).not.toBeNull();
+    expect(panelOffered(s)).toBe(true);
+  });
+
+  it('an added constraint an agent overwrote can no longer be adjusted (adding it again would make two)', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('curve.primitive_bezier_circle_add', { name: 'Path' });
+    // an earlier operation that has nothing to do with the constraint
+    ok('object.light_add', { name: 'Light' });
+    select(s, 'Cube');
+    ok('object.constraint_add', { type: 'FOLLOW_PATH', target: 'Path' });
+    const cube = () => s.doc.findObjectByName('Cube')!;
+    const constraint = cube().constraints[0].id;
+    const root = panel();
+    // the agent changes the constraint, which stores the cube's whole constraint stack again
+    const agent = agentReplica(s);
+    act(() => agent('constraint.update', { object: 'Cube', constraint, influence: 0.5 }));
+    typeNumber(field(root, 'redo-influence')!, '0.8');
+    // nothing changes and the panel closes, saying why
+    expect(cube().constraints.map((c) => [c.id, c.influence])).toEqual([[constraint, 0.5]]);
+    expect(s.doc.findObjectByName('Light')).not.toBeNull();
+    expect(lastOperator.value).toBeNull();
+    expect(field(root, 'redo-panel')).toBeNull();
+    expect(infoLog.value.at(-1)).toMatchObject({
+      level: 'WARNING',
+      message:
+        'Add Constraint can no longer be adjusted: an agent or another user has changed what it did since',
+    });
+    // the light's addition is still the step Ctrl+Z undoes
+    s.undo.undo();
+    expect(s.doc.findObjectByName('Light')).toBeNull();
+    expect(cube().constraints).toHaveLength(1);
   });
 });

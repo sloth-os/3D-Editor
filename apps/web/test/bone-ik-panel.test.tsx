@@ -206,4 +206,66 @@ describe('bone IK settings panel', () => {
     fireEvent.click(byTestId(container, 'bone-Base')!);
     expect(byTestId(container, 'pose-ik-chains')?.textContent).toContain('No IK chain contains this bone');
   });
+
+  it('leaves the owner out of its chain when the IK does not use its tail', () => {
+    const { container } = arm('Lower');
+    const rig = s.doc.findObjectByName('Rig')!;
+    expect(byTestId(container, 'pose-ik-chains')?.textContent).toBe('Used by IK (Lower).');
+    // use_tail off: the chain ends at Lower's head, so Lower itself is not rotated by it
+    act(() => {
+      ok('pose.constraint_set', {
+        object: 'Rig',
+        bone: 'Lower',
+        constraint: rig.pose.bones.Lower.constraints![0].id,
+        params: { use_tail: false },
+      });
+    });
+    expect(byTestId(container, 'pose-ik-chains')?.textContent).toContain('No IK chain contains this bone');
+    for (const bone of ['Upper', 'Base']) {
+      fireEvent.click(byTestId(container, `bone-${bone}`)!);
+      expect(byTestId(container, 'pose-ik-chains')?.textContent).toBe('Used by IK (Lower).');
+    }
+  });
+
+  it('finds the same chains as core for every chain length, with and without the tail', () => {
+    // Root → Base → Upper → Lower, and the chain core's pose.ik_add reports for an IK on Lower
+    ok('object.armature_add', { name: 'Arm', bone_name: 'Root' });
+    ok('armature.chain_add', {
+      object: 'Arm',
+      points: [
+        [0, 0, 1],
+        [0, 0, 2],
+        [0, 0, 3],
+        [0, 0, 4],
+      ],
+      names: ['Base', 'Upper', 'Lower'],
+      parent: 'Root',
+      use_connect: true,
+    });
+    ok('object.empty_add', { name: 'Goal', location: [1, 0, 3] });
+    const object = () => s.doc.findObjectByName('Arm')!;
+    const bones = s.doc.getArmature(object().data!)!.bones;
+    const names = bones.map((b) => b.name);
+    expect(names).toEqual(['Root', 'Base', 'Upper', 'Lower']);
+    const seen: string[][] = [];
+    for (const use_tail of [true, false])
+      for (const chain_count of [0, 1, 2, 3, 4]) {
+        const { chain } = ok('pose.ik_add', {
+          object: 'Arm',
+          bone: 'Lower',
+          target: 'Goal',
+          chain_count,
+          use_tail,
+        }) as { chain: string[] };
+        const users = names.filter((b) => ikChainsWith(object(), bones, b).some((c) => c.owner === 'Lower'));
+        expect(users.sort(), `use_tail ${use_tail}, chain_count ${chain_count}`).toEqual([...chain].sort());
+        seen.push(chain);
+        s.undo.undo();
+        expect(object().pose.bones.Lower?.constraints ?? []).toEqual([]);
+      }
+    // (the cases differ: the owner is in every chain with its tail and in none without)
+    expect(seen.slice(0, 5).every((c) => c.includes('Lower'))).toBe(true);
+    expect(seen.slice(5).some((c) => c.includes('Lower'))).toBe(false);
+    expect(seen[6]).toEqual(['Upper']);
+  });
 });

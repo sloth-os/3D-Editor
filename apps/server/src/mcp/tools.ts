@@ -24,6 +24,8 @@ import {
   isAnimatable,
   propertyLength,
   readChannel,
+  OperatorError,
+  BROWSER_UI_OPERATORS,
   type EditorState,
   type ExportFormat,
   type ImportFormat,
@@ -40,11 +42,11 @@ import type { ServerMetrics } from '../observability/metrics';
 import type { Log } from '../observability/log';
 import { errorMessage, withSpan } from '../observability/tracing';
 import type { RoomManager } from '../sync/room-manager';
-import { RpcError } from '../sync/room';
+import { RpcError, type Room, type SyncConnection } from '../sync/room';
 import { ProjectNameTakenError, requireFreeProjectName, withProjectNames } from '../sync/project-names';
 import { isNotImplemented, safeFileName } from '../api/projects';
 import { persistenceNote } from '../persistence';
-import { ToolError, type AgentProject, type AgentSession } from './agent';
+import { NotFoundError, ToolError, type AgentProject, type AgentSession, type ErrorCode } from './agent';
 import type { HistoryLimits } from './history';
 import {
   DEFAULT_MAX_OBJECTS,
@@ -77,18 +79,40 @@ import {
   notAnimatable,
   unsetProceduralParam,
 } from './keyframes';
-import { findOperatorGroup, operatorGroupNames, toolOnlyOperator } from './operator-groups';
+import {
+  browserUiOperator,
+  browserUiOperatorsNote,
+  findOperatorGroup,
+  operatorGroupNames,
+  toolOnlyOperator,
+} from './operator-groups';
 import { strictArgObject, strictToolSchema } from './strict-args';
-import { checkEditorCommand, editorCommandList } from './editor-commands';
+import {
+  DEFAULT_EDITOR_TIMEOUT_MS,
+  MAX_EDITOR_TIMEOUT_MS,
+  blockingLateRpcs,
+  checkEditorCommand,
+  describeLateRpcs,
+  editorCommandList,
+  editorTimeoutMessage,
+} from './editor-commands';
 import { isCancelled, type AnimationOutput, type FrameOptions, type Renderer } from '../render';
 import type { RenderStore, StoredFile } from '../render/store';
 import {
+  AUTO_BROWSER_RASTER_TIMEOUT_MS,
+  BROWSER_PATHTRACE_EXTRA_MS,
+  BROWSER_RASTER_TIMEOUT_MS,
   DEFAULT_ANIMATION_TIME_LIMIT,
   DEFAULT_IMAGE_TIME_LIMIT,
   MAX_ANIMATION_SIZE,
   MAX_RENDER_FRAMES,
   MAX_TIME_LIMIT,
   animationFrameSize,
+  SLOW_EDITOR_RETRY_MS,
+  browserRenderFailure,
+  browserRenderTimeout,
+  keepAlive,
+  slowBrowserRaster,
   denoiseArg,
   engineArg,
   maxBouncesArg,
@@ -178,8 +202,37 @@ function text(value: unknown): CallToolResult {
   };
 }
 
+/**
+ * Characters that end a line in common clients (JavaScript's `\n` and `\r`, the others Python's
+ * `splitlines()` also splits at), see {@link oneLine}.
+ */
+const LINE_BREAKS = new Set([0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029]);
+
+/**
+ * `s` on one line: line breaks, which names (of objects, projects, …) can contain, become escapes
+ * as in JSON (`\n`, `\r`, `\u2028` …). The message of an error is its first line, and the JSON of
+ * run_operator, batch and edit_mesh failures follows on the next one, so a name with a line break
+ * in a message must not end that line early.
+ */
+export function oneLine(s: string): string {
+  let out = '';
+  for (const c of s) {
+    const code = c.charCodeAt(0);
+    if (!LINE_BREAKS.has(code)) out += c;
+    else if (code === 0x0a) out += '\\n';
+    else if (code === 0x0d) out += '\\r';
+    else out += `\\u${code.toString(16).padStart(4, '0')}`;
+  }
+  return out;
+}
+
+/**
+ * An error result: the message on one line (see {@link oneLine}), followed on the next line by
+ * `details` as JSON when given.
+ */
 function failure(message: string, details?: unknown): CallToolResult {
-  const body = details === undefined ? message : `${message}\n${JSON.stringify(details, null, 2)}`;
+  const first = oneLine(message);
+  const body = details === undefined ? first : `${first}\n${JSON.stringify(details, null, 2)}`;
   return { content: [{ type: 'text', text: body }], isError: true };
 }
 
@@ -213,11 +266,12 @@ function objectNames(p: AgentProject, max = 40): string {
     : names.join(', ');
 }
 
+/** The object an agent refers to by id or exact name; a {@link NotFoundError} when there is none. */
 function requireObject(p: AgentProject, ref: string): ObjectData {
   const o = p.scene.resolveObject(ref);
   if (!o) {
     const names = objectNames(p);
-    throw new ToolError(
+    throw new NotFoundError(
       `Object '${ref}' not found in project '${p.scene.name}'.${names ? ` Objects: ${names}.` : ' The scene is empty.'}`,
     );
   }
@@ -259,6 +313,10 @@ function selectionSummary(p: AgentProject) {
   return out;
 }
 
+/**
+ * The Edit Mode element selection `sel` asks for on an object's base mesh. An index the mesh does
+ * not have is a ToolError with code POLL_FAILED (a selection that cannot be applied).
+ */
 function meshSelection(
   p: AgentProject,
   objectId: string,
@@ -267,16 +325,26 @@ function meshSelection(
 ): MeshSelection {
   const o = p.scene.getObject(objectId);
   const mesh = o?.data ? p.scene.getMesh(o.data) : null;
-  if (!mesh) throw new ToolError('object has no mesh data');
+  if (!mesh) throw new ToolError('object has no mesh data', 'POLL_FAILED');
   if (!sel) return selectAllElements(mesh);
   const hasLists = !!(sel.verts?.length || sel.edges?.length || sel.faces?.length);
   if (!hasLists) return sel.all === false ? emptySelection() : selectAllElements(mesh);
   const nv = mesh.positions.length / 3;
   for (const v of sel.verts ?? [])
-    if (v >= nv) throw new ToolError(`vertex index ${v} out of range (mesh has ${nv} vertices)`);
+    if (v >= nv)
+      throw new ToolError(`vertex index ${v} out of range (mesh has ${nv} vertices)`, 'POLL_FAILED');
+  for (const [a, b] of sel.edges ?? [])
+    if (a >= nv || b >= nv)
+      throw new ToolError(
+        `edge [${a}, ${b}]: vertex index ${Math.max(a, b)} out of range (mesh has ${nv} vertices)`,
+        'POLL_FAILED',
+      );
   for (const f of sel.faces ?? [])
     if (f >= mesh.faces.length)
-      throw new ToolError(`face index ${f} out of range (mesh has ${mesh.faces.length} faces)`);
+      throw new ToolError(
+        `face index ${f} out of range (mesh has ${mesh.faces.length} faces)`,
+        'POLL_FAILED',
+      );
   if (mode === 'FACE') return selectionFromFaces(mesh, sel.faces ?? []);
   if (mode === 'EDGE')
     return selectionFromEdges(
@@ -303,10 +371,18 @@ function inferSelectMode(
 }
 
 /** Kind of an operator failure (see core OperatorError); failures that are not OperatorErrors are FAILED. */
-type OperatorErrorCode = NonNullable<RunResult['code']>;
-
-function errorCode(res: RunResult): OperatorErrorCode {
+function errorCode(res: RunResult): ErrorCode {
   return res.code ?? 'FAILED';
+}
+
+/**
+ * The kind of a failure thrown around an operator (an unknown project or object, a selection that
+ * cannot be applied): the code the error carries (ToolError, NotFoundError, core OperatorError),
+ * else `fallback`. Decided by the error's class and code, never by its message.
+ */
+function codeOf(err: unknown, fallback: ErrorCode): ErrorCode {
+  if (err instanceof ToolError || err instanceof OperatorError) return err.code ?? fallback;
+  return fallback;
 }
 
 function editDistance(a: string, b: string): number {
@@ -323,24 +399,36 @@ function editDistance(a: string, b: string): number {
   return prev[b.length];
 }
 
-/** Closest operator ids to a (mistyped) id. */
+/**
+ * Closest operator ids to a (mistyped) id, ignoring letter case: the registry's and the browser
+ * editor's UI operators (BROWSER_UI_OPERATORS), which the note after the list names as such, with
+ * what to use instead and how a live editor runs them ('VIEW3D.VIEW_ALL' or 'view3d.view_al' →
+ * view3d.view_all).
+ */
 function suggestOperators(registry: OperatorRegistry, id: string): string {
   const needle = id.toLowerCase();
   const tail = needle.split('.').pop() ?? needle;
-  const scored = registry
-    .list()
-    .filter((d) => !d.uiOnly)
-    .map((d) => {
-      const cand = d.id.toLowerCase();
+  const candidates = [
+    ...registry
+      .list()
+      .filter((d) => !d.uiOnly)
+      .map((d) => d.id),
+    ...BROWSER_UI_OPERATORS.filter((b) => !registry.has(b)),
+  ];
+  const scored = candidates
+    .map((c) => {
+      const cand = c.toLowerCase();
       let score = editDistance(needle, cand);
       if (tail.length > 2 && cand.includes(tail)) score -= 3;
-      return { id: d.id, score };
+      return { id: c, score };
     })
     .sort((a, b) => a.score - b.score || a.id.localeCompare(b.id))
     .filter((x) => x.score <= Math.max(4, Math.ceil(needle.length / 2)))
     .slice(0, 8)
     .map((x) => x.id);
-  return scored.length ? ` Did you mean: ${scored.join(', ')}?` : '';
+  if (!scored.length) return '';
+  const browser = scored.filter((s) => BROWSER_UI_OPERATORS.includes(s) && !registry.has(s));
+  return ` Did you mean: ${scored.join(', ')}?${browser.length ? ` ${browserUiOperatorsNote(browser, scored)}` : ''}`;
 }
 
 const describeCache = new WeakMap<OperatorRegistry, OperatorInfo[]>();
@@ -351,6 +439,27 @@ function operatorCatalogue(registry: OperatorRegistry): OperatorInfo[] {
     describeCache.set(registry, list);
   }
   return list;
+}
+
+/**
+ * The browser editor render_image sends a render to: the one `client` names, else the most
+ * recently active editor that is neither still busy with a request the server stopped waiting for
+ * (Room.lateRpcs: it is still drawing an image, and a new render would wait behind it) nor, for
+ * renderer 'auto', too slow for its last RASTER image of this shading (slowBrowserRaster), else
+ * the most recently active one. `busy` and `slow` say why the chosen editor is not to be asked.
+ */
+function renderEditor(
+  room: Room,
+  a: { client?: string; renderer: 'auto' | 'browser'; shading?: 'SOLID' | 'MATERIAL' },
+): { conn: SyncConnection | null; busy: string | null; slow: string | null } {
+  const busyWith = (c: SyncConnection) => describeLateRpcs(blockingLateRpcs(room.lateRpcs(c)));
+  const slowWith = (c: SyncConnection) =>
+    a.renderer === 'auto' ? slowBrowserRaster(room, c, a.shading) : null;
+  const conn = a.client
+    ? room.pickRpcTarget('render', a.client)
+    : (room.rpcCandidates('render').find((c) => !busyWith(c) && !slowWith(c)) ??
+      room.pickRpcTarget('render'));
+  return { conn, busy: conn ? busyWith(conn) : null, slow: conn ? slowWith(conn) : null };
 }
 
 /**
@@ -856,9 +965,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
 
   /**
    * Sets the agent's selection, active object and mode (and the Edit Mode element selection) from a
-   * `selection` argument, all or nothing: when any part fails (an unknown object, Edit Mode without
-   * an active mesh, an element index out of range) the agent's editor state is left as it was, and
-   * the error says why.
+   * `selection` argument, all or nothing: when any part fails (an unknown object: NotFoundError;
+   * Edit Mode without an active mesh, mesh elements without Edit Mode, an element index out of
+   * range: ToolError with code POLL_FAILED) the agent's editor state is left as it was, and the
+   * error says why.
    */
   function applySelection(p: AgentProject, sel: z.infer<typeof selectionSchema> | undefined): void {
     if (!sel) return;
@@ -877,6 +987,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     if (sel.mesh && (sel.mode === 'OBJECT' || (sel.mode === undefined && state.mode !== 'EDIT')))
       throw new ToolError(
         `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' (selection: {objects: ['<mesh object>'], mode: 'EDIT', mesh: {faces: […]}}).`,
+        'POLL_FAILED',
       );
     if (sel.objects) {
       const ids = sel.objects.map((r) => requireObject(p, r).id);
@@ -893,6 +1004,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       if (!active || active.type !== 'MESH')
         throw new ToolError(
           `Edit mode needs an active mesh object (selection.active)${active ? `: '${active.name}' is a ${active.type} object` : ''}.`,
+          'POLL_FAILED',
         );
       if (state.mode !== 'EDIT' || sel.mode === 'EDIT') enterEditMode(p.context(), active.id);
       if (sel.mesh) {
@@ -913,12 +1025,56 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     p.syncSelection();
   }
 
+  /**
+   * Why an operator id cannot run through run_operator, batch or edit_mesh, with the failure code,
+   * or null when it can: an operator of the browser editor's UI (NOT_FOUND: the server does not
+   * have it; the message says how to run it in a live editor with editor_command), an unknown id
+   * (NOT_FOUND, with the closest ids) or a render operator that a tool replaces (FAILED).
+   */
+  function operatorRefusal(id: string): { error: string; code: ErrorCode } | null {
+    const browser = browserUiOperator(id, !!registry.get(id)?.uiOnly);
+    if (browser) return { error: browser, code: 'NOT_FOUND' };
+    if (!registry.has(id))
+      return {
+        error: `Unknown operator '${id}'.${suggestOperators(registry, id)} Use list_operators.`,
+        code: 'NOT_FOUND',
+      };
+    const tool = toolOnlyOperator(id);
+    return tool ? { error: tool, code: 'FAILED' } : null;
+  }
+
+  /** The message of an error thrown inside a tool: an agent-facing error's own, else logged. */
+  function thrownMessage(tool: string, err: unknown): string {
+    if (err instanceof ToolError || err instanceof OperatorError) return err.message;
+    log.warn({ err: errorMessage(err), tool, session: agent.id }, 'MCP tool failed');
+    return `${tool} failed: ${errorMessage(err)}`;
+  }
+
+  /**
+   * The error result of a run_operator or edit_mesh call that failed before or around its operator
+   * (an unknown project or object, a refused operator id, a selection that cannot be applied),
+   * shaped like an operator failure: the message on the first line, then the JSON {ok: false,
+   * operator, error, code, selection} with the code the error carries (FAILED when it has none)
+   * and the agent's editor state, which the call left as it was (no `selection` when the project
+   * could not be opened).
+   */
+  function callFailure(tool: string, operator: string, err: unknown, p?: AgentProject): CallToolResult {
+    const error = oneLine(thrownMessage(tool, err));
+    return failure(error, {
+      ok: false,
+      operator,
+      error,
+      code: codeOf(err, 'FAILED'),
+      ...(p ? { selection: selectionSummary(p) } : {}),
+    });
+  }
+
   tool(
     'run_operator',
     {
       title: 'Run operator',
       description:
-        "Execute any operator by id with JSON parameters (see list_operators), as one undo step. Operators act on the agent's own selection like in Blender: use `selection` to choose objects, the active object and the mode (EDIT + mesh element selection for mesh.* operators) before running. Returns {ok, operator, result, reports, duration_ms, selection}. A failure is an error result whose first line is the message, followed by that JSON with `error` and `code`: INVALID_PARAMS (unknown, misspelled or invalid parameters: fix params), POLL_FAILED (wrong mode, selection or object type, or not available here: change the selection/mode), NOT_FOUND (an unknown operator, object or datablock) or FAILED (the operator itself failed). A call that fails changes nothing in the agent's editor state: a selection that cannot be applied (unknown object, mode EDIT without an active mesh, mesh elements without mode EDIT, an element index out of range) is not applied at all, and when the operator fails the selection, active object and mode are put back as they were before the call (the failure's `selection` shows them).",
+        "Execute any operator by id with JSON parameters (see list_operators), as one undo step. Operators act on the agent's own selection like in Blender: use `selection` to choose objects, the active object and the mode (EDIT + mesh element selection for mesh.* operators) before running. Returns {ok, operator, result, reports, duration_ms, selection}. Every failure is an error result whose first line is the message, followed by JSON {ok: false, operator, error, code, selection} (plus result, reports and duration_ms when the operator ran; without selection when the project is unknown). `code`: INVALID_PARAMS (unknown, misspelled or invalid parameters: fix params), POLL_FAILED (wrong mode, selection or object type, or a `selection` that cannot be applied: mode EDIT without an active mesh, mesh elements without mode EDIT, an element index out of range; change the selection/mode), NOT_FOUND (an unknown project, object, datablock or operator id; unknown ids come with the closest ids, letter case ignored, and ids of the browser editor's own UI operators (view3d.*, wm.*, screen.*, ed.*, render.render …) with what to use here instead where the tools offer it (object.duplicate {offset} for Shift+D's object.duplicate_move, transform.translate / rotate / resize for view3d.transform_modal, mesh.loopcut through edit_mesh for mesh.loopcut_pick, the undo tool for ed.undo …) and how to run them in a live editor: editor_command {command: 'run_operator', params: {operator, params}}) or FAILED (the operator itself failed; render.render_software and render.render_animation are refused: use render_image / render_animation). The message is always one line (line breaks in names show as \\n). A call that fails changes nothing in the agent's editor state: a selection that cannot be applied is not applied at all, and when the operator fails the selection, active object and mode are put back as they were before the call (the failure's `selection` shows them).",
       annotations: EDIT,
       argsHint:
         "Operator parameters go inside `params` (run_operator {project, operator, params: {…}, selection}); list_operators {search} gives each operator's parameters.",
@@ -933,40 +1089,36 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       selection: selectionSchema.optional(),
     },
     async ({ project, operator, params, selection }) => {
-      const p = await agent.project(project);
-      // refusals carry an operator error code like operator failures, so agents can branch on it
-      const refuse = (error: string, code: OperatorErrorCode) =>
-        failure(error, { ok: false, operator, error, code });
-      if (!registry.has(operator))
-        return refuse(
-          `Unknown operator '${operator}'.${suggestOperators(registry, operator)} Use list_operators.`,
-          'NOT_FOUND',
-        );
-      const def = registry.get(operator)!;
-      if (def.uiOnly)
-        return refuse(
-          `'${operator}' is only available in the browser editor UI (try editor_command).`,
-          'POLL_FAILED',
-        );
-      const refused = toolOnlyOperator(operator);
-      if (refused) return refuse(refused, 'FAILED');
-      const before = { ...p.state };
-      applySelection(p, selection);
-      const res = p.run(operator, params ?? {});
-      // a call that fails changes nothing: the selection and mode it asked for are not kept
-      if (!res.ok) restoreState(p, before);
-      p.publishPresence();
-      const out = {
-        ok: res.ok,
-        operator,
-        result: res.result ?? null,
-        ...(res.ok ? {} : { error: res.error ?? 'unknown error', code: errorCode(res) }),
-        reports: res.reports,
-        duration_ms: round(res.durationMs, 2),
-        selection: selectionSummary(p),
-      };
-      if (!res.ok) return failure(`${operator} failed: ${res.error}`, out);
-      return out;
+      // every failure is the message plus JSON with a code (see callFailure), like operator failures
+      let p: AgentProject | undefined;
+      let before: EditorState | undefined;
+      let res: RunResult | undefined;
+      try {
+        p = await agent.project(project);
+        const refused = operatorRefusal(operator);
+        if (refused) throw new ToolError(refused.error, refused.code);
+        before = { ...p.state };
+        // all or nothing: a selection that cannot be applied fails the call and changes nothing
+        applySelection(p, selection);
+        res = p.run(operator, params ?? {});
+        // a call that fails changes nothing: the selection and mode it asked for are not kept
+        if (!res.ok) restoreState(p, before);
+        p.publishPresence();
+        const out = {
+          ok: res.ok,
+          operator,
+          result: res.result ?? null,
+          ...(res.ok ? {} : { error: oneLine(res.error ?? 'unknown error'), code: errorCode(res) }),
+          reports: res.reports,
+          duration_ms: round(res.durationMs, 2),
+          selection: selectionSummary(p),
+        };
+        if (!res.ok) return failure(`${operator} failed: ${res.error}`, out);
+        return out;
+      } catch (err) {
+        if (p && before && !res?.ok) restoreState(p, before);
+        return callFailure('run_operator', operator, err, p);
+      }
     },
   );
 
@@ -975,7 +1127,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Run several operators',
       description:
-        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). Each operation is {operator, params, selection?}: `selection` (as in run_operator: objects, active object, mode, edit-mode mesh elements) is set before that operation runs and stays set for the following ones, for operators that act on the selection (object.convert, object.transform_apply, export_mesh.* use_selection …). An operation that fails changes nothing in the agent's editor state: its selection is not kept (all or nothing, as in run_operator), so the following operations see the selection of before it. With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns per operation {operator, ok, result | error + code, reports} — `code` is INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED as in run_operator (a selection naming an unknown object fails its operation with NOT_FOUND); `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR.",
+        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). Each operation is {operator, params, selection?}: `selection` (as in run_operator: objects, active object, mode, edit-mode mesh elements) is set before that operation runs and stays set for the following ones, for operators that act on the selection (object.convert, object.transform_apply, export_mesh.* use_selection …). An operation that fails changes nothing in the agent's editor state: its selection is not kept (all or nothing, as in run_operator), so the following operations see the selection of before it. With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns {ok, executed, failed, results, selection} with per operation {operator, ok, result | error + code, reports} — `code` is INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED as in run_operator: a selection that cannot be applied fails its operation with an error starting 'selection: ', NOT_FOUND for an unknown object, else POLL_FAILED; unknown operator ids fail with NOT_FOUND and the closest ids, ids of the browser editor's UI operators (view3d.*, wm.*, render.render …) with NOT_FOUND, what to use instead and how to run them in a live editor (editor_command), render.render_software and render.render_animation with FAILED; `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR. When an operation failed, the result is an error whose first line is 'n of m operation(s) failed', followed by that JSON; when the call fails as a whole (an unknown project), the first line is the message and the JSON also has `error` and `code`.",
       annotations: EDIT,
       argsHint:
         'Each operation is {operator, params, selection} inside `operations` (batch {project, operations: [{operator, params: {…}, selection: {objects: […]}}, …], stop_on_error}).',
@@ -1003,58 +1155,75 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       stop_on_error: z.boolean().default(true),
     },
     async ({ project, operations, stop_on_error }) => {
-      const p = await agent.project(project);
       const results: Record<string, unknown>[] = [];
       let failed = 0;
-      p.step(() => {
-        for (const op of operations) {
-          const known = registry.has(op.operator);
-          const refused = known
-            ? toolOnlyOperator(op.operator)
-            : `unknown operator${suggestOperators(registry, op.operator)}`;
-          if (refused) {
-            failed++;
-            results.push({
-              operator: op.operator,
-              ok: false,
-              error: refused,
-              code: known ? 'FAILED' : 'NOT_FOUND',
-            });
-            if (stop_on_error) break;
-            continue;
-          }
-          // an operation that fails changes nothing: neither its selection nor the operator's
-          const before = { ...p.state };
-          if (op.selection)
-            try {
-              applySelection(p, op.selection);
-            } catch (err) {
-              if (!(err instanceof ToolError)) throw err;
+      let p: AgentProject | undefined;
+      try {
+        p = await agent.project(project);
+        const ap = p;
+        ap.step(() => {
+          for (const op of operations) {
+            // refused like in run_operator: browser UI operators, unknown ids, render operators
+            const refused = operatorRefusal(op.operator);
+            if (refused) {
               failed++;
               results.push({
                 operator: op.operator,
                 ok: false,
-                error: `selection: ${err.message}`,
-                code: /not found/i.test(err.message) ? 'NOT_FOUND' : 'POLL_FAILED',
+                error: oneLine(refused.error),
+                code: refused.code,
               });
               if (stop_on_error) break;
               continue;
             }
-          const res = p.run(op.operator, op.params ?? {});
-          results.push({
-            operator: op.operator,
-            ok: res.ok,
-            ...(res.ok ? { result: res.result ?? null } : { error: res.error, code: errorCode(res) }),
-            // warnings and info the operator reported (like run_operator's `reports`)
-            ...(res.reports.length ? { reports: res.reports } : {}),
-          });
-          if (!res.ok) {
-            restoreState(p, before);
-            failed++;
-            if (stop_on_error) break;
+            // an operation that fails changes nothing: neither its selection nor the operator's
+            const before = { ...ap.state };
+            if (op.selection)
+              try {
+                applySelection(ap, op.selection);
+              } catch (err) {
+                if (!(err instanceof ToolError || err instanceof OperatorError)) throw err;
+                failed++;
+                results.push({
+                  operator: op.operator,
+                  ok: false,
+                  error: oneLine(`selection: ${err.message}`),
+                  // the error's own code: NOT_FOUND for an unknown object, else POLL_FAILED
+                  code: codeOf(err, 'POLL_FAILED'),
+                });
+                if (stop_on_error) break;
+                continue;
+              }
+            const res = ap.run(op.operator, op.params ?? {});
+            results.push({
+              operator: op.operator,
+              ok: res.ok,
+              ...(res.ok
+                ? { result: res.result ?? null }
+                : { error: oneLine(res.error ?? 'unknown error'), code: errorCode(res) }),
+              // warnings and info the operator reported (like run_operator's `reports`)
+              ...(res.reports.length ? { reports: res.reports } : {}),
+            });
+            if (!res.ok) {
+              restoreState(ap, before);
+              failed++;
+              if (stop_on_error) break;
+            }
           }
-        }
-      });
+        });
+      } catch (err) {
+        // the call itself failed (an unknown project): the message, then the batch JSON with a code
+        const error = oneLine(thrownMessage('batch', err));
+        return failure(error, {
+          ok: false,
+          executed: results.length,
+          failed,
+          results,
+          error,
+          code: codeOf(err, 'FAILED'),
+          ...(p ? { selection: selectionSummary(p) } : {}),
+        });
+      }
       const warnings = results.filter((r) =>
         (r.reports as { level: string }[] | undefined)?.some(
           (x) => x.level === 'WARNING' || x.level === 'ERROR',
@@ -1567,7 +1736,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Edit mesh',
       description:
-        "Run an edit-mode operator on a mesh object: enters Edit Mode on the object (headless), selects the given vertices/edges/faces (default: everything), runs the operator (mesh.* such as mesh.extrude_region_move {value}, mesh.inset, mesh.subdivide, mesh.loopcut, mesh.delete, mesh.merge, or transform.translate/rotate/resize to move the selected elements), then returns to Object Mode; the object is then the agent's selected and active object. A call that fails (an element index out of range, the operator's failure) leaves the agent's selection and mode as they were. Use list_operators (search 'mesh.') for the catalogue and parameters. One undo step. Returns {ok, operator, result, reports, mesh, selection_after}; a failure also carries `error` and `code` (INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED, as run_operator).",
+        "Run an edit-mode operator on a mesh object: enters Edit Mode on the object (headless), selects the given vertices/edges/faces (default: everything), runs the operator (mesh.* such as mesh.extrude_region_move {value}, mesh.inset, mesh.subdivide, mesh.loopcut, mesh.delete, mesh.merge, or transform.translate/rotate/resize to move the selected elements), then returns to Object Mode; the object is then the agent's selected and active object. Use list_operators (search 'mesh.') for the catalogue and parameters. One undo step. Returns {ok, operator, result, reports, mesh, selection_after}. Every failure is an error result whose first line is the message, followed by JSON {ok: false, operator, error, code, selection} (plus result, reports, mesh and selection_after when the operator ran; without selection when the project is unknown), with `code` as in run_operator: NOT_FOUND (an unknown project, object or operator id; ids of the browser editor's UI operators say what to use instead, e.g. mesh.loopcut {edge} for mesh.loopcut_pick and transform.* for view3d.transform_modal, and how to run them in a live editor: editor_command), POLL_FAILED (not a mesh object, an element index out of range, the operator's preconditions), INVALID_PARAMS (fix params) or FAILED (the operator itself failed). A call that fails changes nothing in the agent's editor state: its selection, active object and mode stay as they were (the failure's `selection` shows them).",
       annotations: EDIT,
       argsHint:
         'Operator parameters go inside `params`; the elements to select go inside `selection` {verts, edges, faces, all}.',
@@ -1583,61 +1752,60 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .describe('Default: inferred from the selection (faces → FACE, edges → EDGE, else VERT)'),
     },
     async (a) => {
-      const p = await agent.project(a.project);
-      const o = requireObject(p, a.object);
-      if (o.type !== 'MESH' || !o.data) throw new ToolError(`'${o.name}' is not a mesh object.`);
-      const refuse = (error: string, code: OperatorErrorCode) =>
-        failure(error, { ok: false, operator: a.operator, error, code });
-      if (!registry.has(a.operator))
-        return refuse(
-          `Unknown operator '${a.operator}'.${suggestOperators(registry, a.operator)}`,
-          'NOT_FOUND',
-        );
-      const refused = toolOnlyOperator(a.operator);
-      if (refused) return refuse(refused, 'FAILED');
-      const mode = inferSelectMode(a.selection, a.select_mode);
-      const before = { ...p.state };
-      let res: RunResult;
+      // every failure is the message plus JSON with a code (see callFailure), like operator failures
+      let p: AgentProject | undefined;
+      let before: EditorState | undefined;
+      let res: RunResult | undefined;
       try {
-        res = p.step(() => {
-          p.state.mode = 'OBJECT';
-          p.state.selectedIds = [o.id];
-          p.state.activeId = o.id;
-          enterEditMode(p.context(), o.id);
-          p.state.selectMode = mode;
-          p.state.meshSelection = meshSelection(p, o.id, a.selection, mode);
+        p = await agent.project(a.project);
+        const ap = p;
+        const o = requireObject(ap, a.object);
+        if (o.type !== 'MESH' || !o.data)
+          throw new ToolError(`'${o.name}' is not a mesh object.`, 'POLL_FAILED');
+        const refused = operatorRefusal(a.operator);
+        if (refused) throw new ToolError(refused.error, refused.code);
+        const mode = inferSelectMode(a.selection, a.select_mode);
+        before = { ...ap.state };
+        // an element index out of range throws before the operator runs (POLL_FAILED)
+        res = ap.step(() => {
+          ap.state.mode = 'OBJECT';
+          ap.state.selectedIds = [o.id];
+          ap.state.activeId = o.id;
+          enterEditMode(ap.context(), o.id);
+          ap.state.selectMode = mode;
+          ap.state.meshSelection = meshSelection(ap, o.id, a.selection, mode);
           try {
-            return p.run(a.operator, a.params ?? {});
+            return ap.run(a.operator, a.params ?? {});
           } finally {
-            p.state.mode = 'OBJECT';
+            ap.state.mode = 'OBJECT';
           }
         });
+        const after = ap.scene.getObject(o.id);
+        const mesh = after?.data ? ap.scene.getMesh(after.data) : null;
+        const sel = ap.state.meshSelection;
+        const out = {
+          ok: res.ok,
+          operator: a.operator,
+          result: res.result ?? null,
+          ...(res.ok ? {} : { error: oneLine(res.error ?? 'unknown error'), code: errorCode(res) }),
+          reports: res.reports,
+          mesh: mesh ? meshStats(mesh) : null,
+          selection_after: {
+            select_mode: ap.state.selectMode,
+            verts: [...sel.verts].slice(0, 500),
+            faces: [...sel.faces].slice(0, 500),
+          },
+        };
+        // a call that fails changes nothing: the agent's selection and mode stay as they were
+        if (!res.ok) restoreState(ap, before);
+        ap.publishPresence();
+        if (!res.ok)
+          return failure(`${a.operator} failed: ${res.error}`, { ...out, selection: selectionSummary(ap) });
+        return out;
       } catch (err) {
-        // an element index out of range: nothing changed, the agent's selection included
-        restoreState(p, before);
-        throw err;
+        if (p && before && !res?.ok) restoreState(p, before);
+        return callFailure('edit_mesh', a.operator, err, p);
       }
-      const after = p.scene.getObject(o.id);
-      const mesh = after?.data ? p.scene.getMesh(after.data) : null;
-      const sel = p.state.meshSelection;
-      const out = {
-        ok: res.ok,
-        operator: a.operator,
-        result: res.result ?? null,
-        ...(res.ok ? {} : { error: res.error ?? 'unknown error', code: errorCode(res) }),
-        reports: res.reports,
-        mesh: mesh ? meshStats(mesh) : null,
-        selection_after: {
-          select_mode: p.state.selectMode,
-          verts: [...sel.verts].slice(0, 500),
-          faces: [...sel.faces].slice(0, 500),
-        },
-      };
-      // a call that fails changes nothing: the agent's selection and mode stay as they were
-      if (!res.ok) restoreState(p, before);
-      p.publishPresence();
-      if (!res.ok) return failure(`${a.operator} failed: ${res.error}`, out);
-      return out;
     },
   );
 
@@ -2155,8 +2323,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'render_image',
     {
       title: 'Render image',
-      description:
-        "Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, same look as the viewport) when available, otherwise the server's software rasterizer; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel), or with renderer browser on a browser editor's render workers. The server's software rasterizer (RASTER without a browser editor) draws no shadows, and its glossy reflections come from one small reflection probe in front of what the image centre shows, looked up by direction only: water, floors and large glossy tables far from that point can show reflections the path tracer does not (a wide smear of a nearby object, a far end that is too bright), so judge shadows and reflections with PATHTRACER. Film > Transparent (set_scene_settings film_transparent) gives a transparent background with both engines. Defaults to the scene camera; pass `camera` (camera object) or `view` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications. The JSON text after the image gives renderer, engine, size, frame, timing, for path tracing samples (reached) and requested_samples, and `warnings` (e.g. textures that could not be used, or degenerate triangles skipped, with the objects they belong to).",
+      description: `Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, same look as the viewport) when available, otherwise the server's software rasterizer: renderer auto waits ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s for the editor's image and then renders on the server (\`note\` says why), renderer browser waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s (a heavy scene in an editor without GPU acceleration, software WebGL, takes tens of seconds) and then fails with what to do instead; an editor may still be drawing an image the server stopped waiting for, and holds up its next renders and commands until it has: meanwhile renders go to another connected editor that is not busy, else renderer auto renders on the server without asking it (\`note\` says so), as it also does for ${SLOW_EDITOR_RETRY_MS / 1000} s after an editor needed longer than auto waits for a RASTER image; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel), or with renderer browser on a browser editor's render workers. The server's software rasterizer (RASTER without a browser editor) draws no shadows, and its glossy reflections come from one small reflection probe in front of what the image centre shows, looked up by direction only: water, floors and large glossy tables far from that point can show reflections the path tracer does not (a wide smear of a nearby object, a far end that is too bright), so judge shadows and reflections with PATHTRACER. Film > Transparent (set_scene_settings film_transparent) gives a transparent background with both engines. Defaults to the scene camera; pass \`camera\` (camera object) or \`view\` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications. The JSON text after the image gives renderer, engine, size, frame, timing, for path tracing samples (reached) and requested_samples, and \`warnings\` (e.g. textures that could not be used, or degenerate triangles skipped, with the objects they belong to).`,
       annotations: READ_ONLY,
     },
     {
@@ -2213,7 +2380,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .enum(['auto', 'browser', 'software'])
         .default('auto')
         .describe(
-          "auto: RASTER on a connected browser editor (WebGL, the viewport's look; else the server's rasterizer), PATHTRACER on the server (all its cores); browser: only a browser editor: RASTER with WebGL, PATHTRACER on the editor's render workers (samples, max_bounces, denoise, time_limit, seed; the result does not include the samples reached); software: always the server",
+          `auto: RASTER on a connected browser editor (WebGL, the viewport's look; the server's rasterizer when none is connected, the editor fails, it has no image after ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s, it is still busy with an earlier image or it was too slow for its last one: asked again ${SLOW_EDITOR_RETRY_MS / 1000} s later), PATHTRACER on the server (all its cores); browser: only a browser editor: RASTER with WebGL (waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s: heavy scenes in software WebGL take tens of seconds), PATHTRACER on the editor's render workers (samples, max_bounces, denoise, time_limit, seed; waits time_limit + ${BROWSER_PATHTRACE_EXTRA_MS / 1000} s; the result does not include the samples reached); software: always the server`,
         ),
       shading: z
         .enum(['SOLID', 'MATERIAL'])
@@ -2252,26 +2419,46 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         ? { position: a.view.position, target: a.view.target, up: a.view.up, fov_degrees: fovDegrees }
         : null;
       let fallbackReason: string | undefined;
+      let fallbackAdvice = "Open the project in a browser or use renderer 'software'.";
       if (a.renderer === 'browser' || (a.renderer === 'auto' && engine === 'RASTER')) {
-        const conn = p.room.pickRpcTarget('render', a.client);
-        if (conn) {
+        const renderer = a.renderer;
+        const { conn, busy, slow } = renderEditor(p.room, { client: a.client, renderer, shading: a.shading });
+        if (conn && busy && a.renderer === 'auto')
+          fallbackReason =
+            `the browser editor is still busy with an earlier request that the server stopped waiting for (${busy}): ` +
+            "renderer 'auto' renders on the server until it has finished";
+        else if (conn && slow && a.renderer === 'auto')
+          fallbackReason =
+            `the browser editor ${slow}: renderer 'auto' renders on the server and asks that editor again ` +
+            `${SLOW_EDITOR_RETRY_MS / 1000} s after that image; renderer 'browser' waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s`;
+        else if (conn) {
           // the editor path traces on its render workers when asked (SOLID shading rasterizes)
           const browserPT = engine === 'PATHTRACER' && a.shading !== 'SOLID';
           const timeLimit = a.time_limit ?? DEFAULT_IMAGE_TIME_LIMIT;
           const requested = a.samples ?? rs.samples;
-          // long browser renders send no progress of their own: keep the request alive
-          const progress = browserPT ? progressReporter(extra) : undefined;
+          // path tracing: time_limit plus loading, compiling, denoising and the PNG; RASTER: long
+          // enough for heavy scenes in software WebGL when the browser is asked for, short with
+          // 'auto', which then renders on the server
+          const timeoutMs = browserRenderTimeout(a.renderer, browserPT, timeLimit);
+          // long browser renders send no progress of their own: keep the request alive (renderer
+          // 'browser' only: with 'auto' the server's renderer may follow, with its own progress)
           const t0 = Date.now();
-          const keepAlive = progress
-            ? setInterval(() => {
-                const seconds = Math.floor((Date.now() - t0) / 1000);
-                progress({
-                  progress: Math.min(seconds, Math.ceil(timeLimit)),
-                  total: Math.ceil(timeLimit),
-                  message: `path tracing in the browser editor: ${seconds} s (time_limit ${timeLimit} s)`,
-                });
-              }, 5000)
-            : null;
+          const stopKeepAlive =
+            a.renderer === 'browser'
+              ? keepAlive(extra, (seconds) =>
+                  browserPT
+                    ? {
+                        progress: Math.min(seconds, Math.ceil(timeLimit)),
+                        total: Math.ceil(timeLimit),
+                        message: `path tracing in the browser editor: ${seconds} s (time_limit ${timeLimit} s)`,
+                      }
+                    : {
+                        progress: seconds,
+                        total: timeoutMs / 1000,
+                        message: `rendering in the browser editor: ${seconds} s (waiting up to ${timeoutMs / 1000} s)`,
+                      },
+                )
+              : () => undefined;
           try {
             const result = await p.room.rpcTo(
               conn,
@@ -2294,8 +2481,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
                     }
                   : { engine: 'RASTER' }),
               },
-              // path tracing takes up to time_limit plus loading, compiling, denoising and the PNG
-              browserPT ? timeLimit * 1000 + 30_000 : 15_000,
+              timeoutMs,
             );
             const img = decodeRenderResult(result);
             if (!img) throw new Error('the editor returned no image');
@@ -2340,13 +2526,21 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
               ],
             };
           } catch (err) {
-            fallbackReason = `browser render failed: ${err instanceof RpcError ? err.message : errorMessage(err)}`;
+            const failed = browserRenderFailure(err, {
+              renderer: a.renderer,
+              pathTrace: browserPT,
+              timeoutMs,
+              timeLimit,
+              shading: a.shading,
+              busy,
+            });
+            fallbackReason = failed.reason;
+            fallbackAdvice = failed.advice;
           } finally {
-            if (keepAlive) clearInterval(keepAlive);
+            stopKeepAlive();
           }
         } else fallbackReason = 'no connected browser editor can render';
-        if (a.renderer === 'browser')
-          throw new ToolError(`${fallbackReason}. Open the project in a browser or use renderer=software.`);
+        if (a.renderer === 'browser') throw new ToolError(`${fallbackReason}. ${fallbackAdvice}`);
       }
       const options: FrameOptions = {
         width,
@@ -2684,7 +2878,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'editor_command',
     {
       title: 'Editor command',
-      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`). Commands and their \`params\`: ${editorCommandList()}. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected.`,
+      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`; get_connected_clients lists them). Commands and their \`params\`: ${editorCommandList()}. run_operator runs the operators of the browser editor's own user interface (view3d.*, wm.*, screen.*, ed.* …), which the run_operator tool does not have (it names them when asked for one), on that editor's selection and undo history. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected. \`timeout_ms\` (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}: under the 60 s request timeout MCP SDK clients use by default) is how long to wait for the editor's answer: in an editor without GPU acceleration (software WebGL, e.g. a headless browser) a heavy scene drawn with materials and lights takes tens of seconds per frame (screenshots, which are drawn that way whatever the editor's shading; the first one also compiles the shaders) and seconds per viewport frame in MATERIAL or RENDERED shading, which other commands wait for; so raise timeout_ms there, switch the viewport to SOLID, take a quick look with render_image {shading: 'SOLID'} (grey clay, much faster) and make final images with render_image. On a timeout the error says so and what to do; the editor may still carry the command out, and its next commands and renders wait until it has (a later timeout names that earlier request; render_image renderer auto renders on the server meanwhile).`,
       annotations: { ...EDIT, openWorldHint: true },
       argsHint: 'Command parameters go inside `params` (editor_command {project, command, params: {…}}).',
     },
@@ -2696,12 +2890,29 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .optional()
         .describe("The command's parameters, e.g. {view: 'TOP'}"),
       client: z.string().optional().describe('Connection id or client name'),
-      timeout_ms: z.number().int().min(100).max(60_000).default(10_000),
+      timeout_ms: z
+        .number()
+        .int()
+        .min(100)
+        .max(MAX_EDITOR_TIMEOUT_MS)
+        .default(DEFAULT_EDITOR_TIMEOUT_MS)
+        .describe(
+          `How long to wait for the editor's answer in ms (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}, under the 60 s default request timeout of MCP SDK clients); heavy scenes in software WebGL take tens of seconds per screenshot`,
+        ),
     },
     async (a, extra) => {
       // a misspelled command or parameter would be ignored by the editor: refuse it first
       checkEditorCommand(a.command, a.params ?? {});
       const p = await agent.project(a.project);
+      // what the editor is still busy with (requests the server stopped waiting for), for a timeout
+      const target = p.room.pickRpcTarget('ui', a.client);
+      const busy = target ? describeLateRpcs(blockingLateRpcs(p.room.lateRpcs(target))) : null;
+      // the editor sends no progress: keep requests with a progress token alive while it works
+      const stopKeepAlive = keepAlive(extra, (seconds) => ({
+        progress: seconds,
+        total: a.timeout_ms / 1000,
+        message: `waiting for the editor: ${seconds} s (timeout_ms ${a.timeout_ms})`,
+      }));
       try {
         const result = await p.room.rpc(
           'ui',
@@ -2719,7 +2930,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             `No browser editor accepting UI commands is connected to this project. Open ${editorUrl(extra, p.id)} in a browser.`,
           );
         }
+        if (err instanceof RpcError && err.code === 'TIMEOUT')
+          throw new ToolError(editorTimeoutMessage(a.command, a.timeout_ms, busy));
         throw new ToolError(`editor_command '${a.command}' failed: ${errorMessage(err)}`);
+      } finally {
+        stopKeepAlive();
       }
     },
   );

@@ -5,6 +5,7 @@ import {
   isValidProjectId,
   type EditorState,
   type OperatorContext,
+  type OperatorError,
   type OperatorRegistry,
   type PresenceState,
   type ReportLevel,
@@ -17,11 +18,33 @@ import { randomClientId } from '../sync/awareness';
 import { toolOnlyOperator } from './operator-groups';
 import { AgentHistory, type HistoryLimits } from './history';
 
-/** Errors with a message meant for the agent (returned as `isError` tool results). */
+/**
+ * Kind of a failure, as the core operator registry reports operator failures (OperatorError):
+ * INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED. run_operator, batch and edit_mesh return it
+ * as `code` with every failure.
+ */
+export type ErrorCode = OperatorError['code'];
+
+/**
+ * Errors with a message meant for the agent (returned as `isError` tool results). `code` is the
+ * kind of failure where the thrower knows it (a selection that cannot be applied: POLL_FAILED;
+ * unknown things: {@link NotFoundError}).
+ */
 export class ToolError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly code?: ErrorCode,
+  ) {
     super(message);
     this.name = 'ToolError';
+  }
+}
+
+/** Something the agent named does not exist (a project, an object): code NOT_FOUND. */
+export class NotFoundError extends ToolError {
+  constructor(message: string) {
+    super(message, 'NOT_FOUND');
+    this.name = 'NotFoundError';
   }
 }
 
@@ -363,7 +386,7 @@ export class AgentSession {
       .slice(0, 20)
       .map((p) => `'${p.name}' (${p.id})`)
       .join(', ');
-    throw new ToolError(
+    throw new NotFoundError(
       `Project '${r}' not found.${known ? ` Known projects: ${known}.` : ' There are no projects yet.'} Use list_projects or create_project.`,
     );
   }
@@ -378,7 +401,7 @@ export class AgentSession {
     if (existing?.alive) return existing;
     existing?.dispose();
     const room = await this.deps.rooms.open(id);
-    if (!room) throw new ToolError(`Project '${ref}' not found. Use list_projects or create_project.`);
+    if (!room) throw new NotFoundError(`Project '${ref}' not found. Use list_projects or create_project.`);
     const p = new AgentProject(room, this, this.deps);
     this.projects.set(id, p);
     return p;

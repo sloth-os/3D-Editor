@@ -1512,6 +1512,28 @@ type IkField =
   | `ik_stiffness_${IkAxis}`;
 
 /**
+ * Every IK setting of a pose bone (pose.ik_settings_set) as the solver uses it, with Blender's
+ * ranges and defaults (core ikSettingsOf): locks and limits on only when set, ik_min_* in −π … 0
+ * (default −π), ik_max_* in 0 … π (default π), stiffness in 0 … 0.99 (default 0). What the bone's
+ * Inverse Kinematics panel and the Adjust Last Operation panel show.
+ */
+export function ikSettingValues(pb: PoseBone | undefined): Record<IkField, boolean | number> {
+  const num = (k: IkField, def: number, lo: number, hi: number) => {
+    const v = pb?.[k];
+    return typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def;
+  };
+  const out = {} as Record<IkField, boolean | number>;
+  for (const a of IK_AXES) {
+    out[`lock_ik_${a}`] = pb?.[`lock_ik_${a}`] === true;
+    out[`use_ik_limit_${a}`] = pb?.[`use_ik_limit_${a}`] === true;
+    out[`ik_min_${a}`] = num(`ik_min_${a}`, -Math.PI, -Math.PI, 0);
+    out[`ik_max_${a}`] = num(`ik_max_${a}`, Math.PI, 0, Math.PI);
+    out[`ik_stiffness_${a}`] = num(`ik_stiffness_${a}`, 0, 0, 0.99);
+  }
+  return out;
+}
+
+/**
  * The IK constraints of an armature object whose chains contain `bone` (core pose.ik_settings_set
  * reports the same): the bone's IK settings apply to every chain it is part of.
  */
@@ -1561,13 +1583,9 @@ function BoneIkPanel({
   bone: BoneData;
   bones: BoneData[];
 }) {
-  const pb: PoseBone | undefined = o.pose?.bones?.[bone.name];
-  const flag = (k: IkField) => pb?.[k] === true;
-  // stored values with Blender's ranges and defaults (core ikSettingsOf)
-  const num = (k: IkField, def: number, lo: number, hi: number) => {
-    const v = pb?.[k];
-    return typeof v === 'number' && Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def;
-  };
+  const values = ikSettingValues(o.pose?.bones?.[bone.name]);
+  const flag = (k: IkField) => values[k] === true;
+  const num = (k: IkField) => values[k] as number;
   const set = (patch: Partial<Record<IkField, boolean | number>>) =>
     run('pose.ik_settings_set', { object: o.id, bone: bone.name, ...patch }, 'ui');
   /** Writes one IK field of this bone into the current pose (drag previews and their restore). */
@@ -1624,7 +1642,7 @@ function BoneIkPanel({
             <div key={a} style={dim(!flag(`lock_ik_${a}`))}>
               <NumberField
                 label={a.toUpperCase()}
-                value={num(`ik_stiffness_${a}`, 0, 0, 0.99)}
+                value={num(`ik_stiffness_${a}`)}
                 min={0}
                 max={0.99}
                 slider
@@ -1657,7 +1675,7 @@ function BoneIkPanel({
               <div class="vector" style={dim(limited && !locked)}>
                 <NumberField
                   label="Min"
-                  value={num(`ik_min_${a}`, -Math.PI, -Math.PI, 0)}
+                  value={num(`ik_min_${a}`)}
                   min={-Math.PI}
                   max={0}
                   unit="°"
@@ -1668,7 +1686,7 @@ function BoneIkPanel({
                 />
                 <NumberField
                   label="Max"
-                  value={num(`ik_max_${a}`, Math.PI, 0, Math.PI)}
+                  value={num(`ik_max_${a}`)}
                   min={0}
                   max={Math.PI}
                   unit="°"

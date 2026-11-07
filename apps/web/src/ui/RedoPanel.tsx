@@ -17,6 +17,7 @@ import { registry } from '../editor/editor';
 import { lastOperator, redoLast, type LastOperator } from '../editor/runner';
 import { SchemaForm, type SchemaChoice } from './SchemaForm';
 import { isRecord } from './properties/ObjectTab';
+import { ikSettingValues } from './properties/DataTab';
 
 type Params = Record<string, unknown>;
 
@@ -117,6 +118,13 @@ function keptValues(doc: SceneDoc, last: LastOperator, params: Params): Params {
         rotation_euler: pb?.rotation_euler ?? [0, 0, 0],
         scale: pb?.scale ?? [1, 1, 1],
       };
+    }
+    case 'pose.ik_settings_set': {
+      // the bone's IK settings as its Inverse Kinematics panel shows them (Blender's defaults for
+      // a bone without any)
+      const bones = objectOrActive(doc, last, params.object)?.pose?.bones;
+      const name = String(params.bone ?? '');
+      return ikSettingValues(bones && Object.hasOwn(bones, name) ? bones[name] : undefined);
     }
     case 'armature.bone_update': {
       const o = objectOrActive(doc, last, params.object);
@@ -306,6 +314,9 @@ export function redoParams(doc: SceneDoc, last: LastOperator, key: string, value
 export function RedoPanel({ s }: { s: ProjectSession }) {
   const last = lastOperator.value;
   void s.undoRevision.value;
+  // kept values show what the operation edits as it is now, also after others (MCP agents, other
+  // users) change it: their edits are not on this undo stack
+  void s.revision.value;
   const [open, setOpen] = useState(true);
   // bumped when a value is rejected, so the fields show the kept parameters again
   const [, setRejected] = useState(0);

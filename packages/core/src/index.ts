@@ -6,6 +6,7 @@ export * from './anim';
 export * from './modifiers';
 export * from './eval';
 export * from './operators';
+export * from './operators/browser-ui-operators';
 export * from './sync';
 export * from './storage';
 export * from './io';

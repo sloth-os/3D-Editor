@@ -80,7 +80,8 @@ export const lastRepeat = signal<RepeatAction | null>(null);
 /**
  * Operators the Properties editor and the outliner run to change values of something that exists
  * (a typed or dragged field, a rename). In Blender these are property edits, not operators, so
- * they never replace what Repeat Last repeats.
+ * they never replace what Repeat Last repeats. They set the values they are given, so running one
+ * again sets the same values (Adjust Last Operation relies on that, see {@link redoLast}).
  */
 const PROPERTY_EDITS = new Set([
   'data.set_property',
@@ -312,12 +313,37 @@ function stepHistory(session: ProjectSession, operator: string, direction: 'undo
 }
 
 /**
+ * Undoes the last step of the session's history, the own step of the operation being adjusted.
+ * Others (an MCP agent, another user) may since have overwritten everything the step changed, e.g.
+ * by setting the same object's pose: Yjs then drops the step, which has nothing left to undo, and
+ * undoes the one before it instead. That one is redone at once, so adjusting an operation never
+ * reverts an earlier one. Returns whether the step itself was undone.
+ */
+function undoOwnStep(session: ProjectSession, operator: string): boolean {
+  const own = session.undo.undoStack[session.undo.undoStack.length - 1];
+  session.currentOperator = operator;
+  try {
+    const undone = session.undo.undo();
+    if (undone && undone !== own) session.undo.redo();
+    return !!undone && undone === own;
+  } finally {
+    session.currentOperator = null;
+  }
+}
+
+/**
  * Re-runs the last redoable operator with new parameters (Adjust Last Operation): undoes it and
  * runs it again, from the selection it started with, as one undo step. When the re-run fails (the
  * operator rejects a value, e.g. a constraint target of the wrong type) the original result is
  * brought back with the selection it left, and the operation stays adjustable with its previous
  * parameters: a rejected value changes nothing. Returns null when the last operation can no
- * longer be adjusted (something else was done or undone since).
+ * longer be adjusted (something else was done or undone since, or others overwrote what it did).
+ *
+ * When others (MCP agents, other users) have overwritten everything the operation changed, there
+ * is nothing left to undo: a property edit (setting values of something that exists) then runs
+ * again on top of their edits, which keeps them and changes only what the adjusted parameters set.
+ * Any other operation would be applied twice (a second constraint, a double move), so it can no
+ * longer be adjusted.
  */
 export function redoLast(
   session: ProjectSession,
@@ -343,10 +369,20 @@ function redoLastOperation(
   registry: OperatorRegistry,
   last: LastOperator,
   params: unknown,
-): RunResult {
+): RunResult | null {
   const after = selectionSnapshot(session);
   // an operation that changed nothing has no undo step of its own: undoing would revert the one before
-  if (last.undoStep) stepHistory(session, last.id, 'undo');
+  const undone = last.undoStep && undoOwnStep(session, last.id);
+  // its step had nothing left to undo: others overwrote all of it (and Yjs dropped the step)
+  const overwritten = last.undoStep && !undone;
+  if (overwritten && !PROPERTY_EDITS.has(last.id)) {
+    restoreSelection(session, after);
+    lastOperator.value = null;
+    const message = `${last.label} can no longer be adjusted: an agent or another user has changed what it did since`;
+    logInfo('WARNING', message, last.id);
+    toast(message, 'warning');
+    return null;
+  }
   const depth = session.undo.undoStack.length;
   // restore the selection the operator originally ran with (operators may change it)
   restoreSelection(session, last.before);
@@ -364,9 +400,13 @@ function redoLastOperation(
     stepHistory(session, last.id, 'undo');
     session.undo.clear(false, true);
   }
-  if (!last.undoStep || (!partial && stepHistory(session, last.id, 'redo'))) {
-    // the original step is redone as it was (or it changed nothing): same objects, same ids
+  if (!undone || (!partial && stepHistory(session, last.id, 'redo'))) {
+    // the original step is redone as it was (or it changed nothing, or others overwrote it, so
+    // nothing of it was undone): same objects, same ids
     restoreSelection(session, after);
+    // an overwritten step is gone from the history: adjusting again runs on top again
+    if (overwritten)
+      lastOperator.value = { ...last, undoDepth: session.undo.undoStack.length, undoStep: false };
     return res;
   }
   // the original's redo step is gone: run it again with its parameters from its starting selection

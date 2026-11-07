@@ -1,4 +1,5 @@
 import { suggestNames } from '@3d-editor/core';
+import type { LateRpc } from '../sync/room';
 import { ToolError } from './agent';
 
 /*
@@ -77,7 +78,7 @@ export const EDITOR_COMMANDS: Record<string, EditorCommand> = {
     },
   },
   screenshot: {
-    doc: 'a PNG of the editor viewport as the person sees it',
+    doc: "a PNG of the editor's viewport: its view (the scene camera when it looks through it), drawn with materials and lights (RENDERED) whatever the viewport's shading, without overlays",
     params: {
       width: { doc: 'pixels (default: the viewport size)', check: pixels },
       height: { doc: 'pixels (default: the viewport size)', check: pixels },
@@ -85,6 +86,82 @@ export const EDITOR_COMMANDS: Record<string, EditorCommand> = {
   },
   get_view: { doc: 'the viewport camera (target, distance, yaw, pitch, ortho, camera view)', params: {} },
 };
+
+/** Default `timeout_ms` of editor_command: how long the server waits for the editor's answer. */
+export const DEFAULT_EDITOR_TIMEOUT_MS = 10_000;
+/**
+ * The longest the server waits for a browser editor outside path tracing (editor_command's largest
+ * `timeout_ms`, render_image's wait for a RASTER image with renderer 'browser'): under the 60 s
+ * request timeout that MCP clients built on the TypeScript SDK use by default, so the server's
+ * error, which says what to do, arrives before such a client gives up with "Request timed out".
+ */
+export const MAX_EDITOR_WAIT_MS = 55_000;
+/** Largest `timeout_ms` of editor_command. */
+export const MAX_EDITOR_TIMEOUT_MS = MAX_EDITOR_WAIT_MS;
+
+/**
+ * The requests among `late` (an editor's requests that the server stopped waiting for and it has
+ * not answered yet, Room.lateRpcs) that keep its main thread busy, so that its next commands and
+ * renders wait for them: all but path traced renders, which run on its render workers.
+ */
+export function blockingLateRpcs(late: readonly LateRpc[]): LateRpc[] {
+  return late.filter((l) => !(l.method === 'render' && l.engine === 'PATHTRACER'));
+}
+
+/**
+ * The oldest of an editor's unanswered requests (see {@link blockingLateRpcs}) for messages, e.g.
+ * "a RASTER render sent 16 s ago" or "editor_command 'screenshot' sent 40 s ago and 1 more";
+ * null when there are none.
+ */
+export function describeLateRpcs(late: readonly LateRpc[], now = Date.now()): string | null {
+  if (!late.length) return null;
+  const l = late[0];
+  const what =
+    l.method === 'render'
+      ? `a ${l.engine === 'PATHTRACER' ? 'path traced' : 'RASTER'} render`
+      : l.method === 'ui'
+        ? `editor_command '${l.command ?? '?'}'`
+        : `a '${l.method}' request`;
+  const age = Math.max(0, Math.round((now - l.sentAt) / 1000));
+  return `${what} sent ${age} s ago${late.length > 1 ? ` and ${late.length - 1} more` : ''}`;
+}
+
+/**
+ * The error of an editor command the editor did not answer within `timeoutMs`: how long the server
+ * waited (`timeout_ms` and its maximum), that the editor may still carry the command out (and holds
+ * its next commands and renders until it has), the earlier request it was still busy with
+ * (`busy`, see {@link describeLateRpcs}), why it can take that long and what to do instead.
+ * Screenshots are drawn with materials and lights whatever the viewport's shading: in software
+ * WebGL they took about 20 s each for a 71-material scene, where a SOLID (grey clay) render_image
+ * took 0.5–2 s. Other commands draw nothing themselves, but wait while the editor draws its
+ * viewport, which takes seconds per frame for such a scene in MATERIAL or RENDERED shading.
+ */
+export function editorTimeoutMessage(command: string, timeoutMs: number, busy?: string | null): string {
+  const wait =
+    timeoutMs < MAX_EDITOR_TIMEOUT_MS
+      ? `pass a larger timeout_ms (at most ${MAX_EDITOR_TIMEOUT_MS})`
+      : `timeout_ms is at its maximum (${MAX_EDITOR_TIMEOUT_MS})`;
+  const head =
+    `editor_command '${command}' failed: the editor did not answer within timeout_ms = ${timeoutMs} ms ` +
+    `(at most ${MAX_EDITOR_TIMEOUT_MS}); it may still carry the command out, and its next commands and ` +
+    'renders wait until it has.' +
+    (busy
+      ? ` It was still busy with an earlier request that the server had stopped waiting for (${busy}).`
+      : '');
+  if (command === 'screenshot')
+    return (
+      `${head} An editor without GPU acceleration (software WebGL, e.g. a headless browser) can take tens of ` +
+      'seconds per frame for a heavy scene drawn with materials and lights, as screenshots are whatever the ' +
+      `viewport's shading, the first time also compiling the shaders: ${wait}; for a quick look use ` +
+      "render_image with shading 'SOLID' (grey clay, much faster), and render_image for final images."
+    );
+  return (
+    `${head} '${command}' waits while the editor draws its viewport, which takes seconds per frame for a ` +
+    'heavy scene in MATERIAL or RENDERED shading without GPU acceleration (software WebGL, e.g. a headless ' +
+    `browser), tens of seconds the first time while it compiles the shaders: ${wait}, or switch the ` +
+    "viewport to SOLID shading (editor_command view.shading {shading: 'SOLID'}), which draws much faster."
+  );
+}
 
 const quote = (s: string) => `'${s}'`;
 
