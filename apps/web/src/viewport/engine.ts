@@ -79,20 +79,36 @@ export const VIEWPORT_MSAA_SAMPLES = 4;
  * A viewport frame that keeps the GPU busy longer than this turns the scene target's multisampling
  * off ({@link ViewportEngine.multisampling}): software WebGL (SwiftShader, no GPU) rasterizes every
  * sample, so 4× MSAA makes a heavy scene's frames about four times slower (lighthouse-cove's 2.6 M
- * triangles in Rendered shading: 3.2 s → 0.8 s per frame). A GPU draws such frames in milliseconds.
+ * triangles in Solid shading: 3.2 s → 0.8 s per frame). A GPU draws such frames in milliseconds. It
+ * is high enough that a light scene's frames, slowed down for a moment (a busy machine), keep it:
+ * screenshots taken a moment apart compare edge for edge.
  */
-export const MSAA_OFF_FRAME_MS = 250;
+export const MSAA_OFF_FRAME_MS = 1000;
 /** Multisampling comes back once a frame without it takes less than this (MSAA can cost several times more). */
 export const MSAA_ON_FRAME_MS = MSAA_OFF_FRAME_MS / 8;
+/**
+ * A scene that comes to draw more triangles than this (meshes and instances) turns multisampling
+ * off before its first frame: in software WebGL that frame (shader compiles included) would take
+ * minutes with it. Frames fast enough ({@link MSAA_ON_FRAME_MS}, a GPU) bring it back.
+ */
+export const MSAA_HEAVY_TRIANGLES = 1_000_000;
 /** A frame the GPU has not finished after this long is given up on (it no longer holds frames back). */
 const FENCE_TIMEOUT_MS = 10 * 60_000;
 /**
- * Frames the GPU may be drawing at once. A change starts its frame at once even while the GPU still
- * draws the previous one, so a screenshot taken after it shows it (software WebGL can take a second
- * for a light scene's frame, minutes for a heavy one); further frames wait instead of queueing up
- * behind them, and the frame drawn next shows the view as it is by then.
+ * Frames the GPU may be drawing at once while frames are slow ({@link SLOW_QUEUE_FRAME_MS}): a change
+ * still starts its frame at once, behind the one being drawn, so a screenshot taken after it shows
+ * it; further frames wait instead of queueing up behind them (software WebGL can take minutes for
+ * a heavy scene's frame), and the frame drawn next shows the view as it is by then.
  */
 export const MAX_FRAMES_IN_FLIGHT = 2;
+/**
+ * Frames the GPU may be drawing at once while frames take less than {@link SLOW_QUEUE_FRAME_MS}:
+ * every change starts its frame at once (software WebGL takes a few hundred milliseconds for a
+ * light scene's frame, while an agent or a test changes the scene and takes a screenshot in less).
+ */
+export const MAX_FAST_FRAMES_IN_FLIGHT = 6;
+/** Frames that took this long (or one drawn for this long so far) limit the queue to {@link MAX_FRAMES_IN_FLIGHT}. */
+export const SLOW_QUEUE_FRAME_MS = 1000;
 
 /** A frame the GPU has not finished yet (WebGL2 fence) and what is known of it. */
 interface FrameInFlight {
@@ -235,14 +251,18 @@ export class ViewportEngine {
   private resizeObserver: ResizeObserver;
   private lastFrameTime = 0;
   /**
-   * The frames the GPU still draws, oldest first (WebGL2 fences): at most
-   * {@link MAX_FRAMES_IN_FLIGHT}, so a slow GPU (software WebGL drawing a heavy scene for seconds)
-   * never gets a queue of frames behind the one it draws, and each frame's cost is known
-   * ({@link slowFrameMs}).
+   * The frames the GPU still draws, oldest first (WebGL2 fences): a few at most
+   * ({@link MAX_FRAMES_IN_FLIGHT}, {@link MAX_FAST_FRAMES_IN_FLIGHT}), so a slow GPU (software
+   * WebGL drawing a heavy scene for seconds) never gets a queue of frames behind the one it draws,
+   * and each frame's cost is known ({@link slowFrameMs}).
    */
   private framesInFlight: FrameInFlight[] = [];
   /** When the last frame was seen finished: a frame queued behind it started drawing then. */
   private lastFrameDone = 0;
+  /** How long the last finished frame took (see {@link frameDone}). */
+  private lastFrameMs = 0;
+  /** Whether the last sync drew more than {@link MSAA_HEAVY_TRIANGLES} triangles. */
+  private heavyScene = false;
   /**
    * Whether the viewport's scene target is multisampled: off while frames are slow (software
    * WebGL, see {@link MSAA_OFF_FRAME_MS}), on again once they are fast.
@@ -430,12 +450,13 @@ export class ViewportEngine {
   }
 
   /**
-   * Retires the frames the GPU has finished, oldest first, and says whether another one may start
-   * (fewer than {@link MAX_FRAMES_IN_FLIGHT} in flight; always without WebGL2 fences). A finished
-   * frame's cost updates {@link slowFrameMs} (from the start of the frame, scene sync included, or
-   * from when the frame before it finished) and the multisampling ({@link adaptMultisampling}, from
-   * the start of its renders). A frame of a lost context, or not done after
-   * {@link FENCE_TIMEOUT_MS}, is given up on.
+   * Retires the frames the GPU has finished, oldest first, and says whether another one may start:
+   * fewer than {@link MAX_FRAMES_IN_FLIGHT} in flight while frames are slow
+   * ({@link SLOW_QUEUE_FRAME_MS}), fewer than {@link MAX_FAST_FRAMES_IN_FLIGHT} otherwise, always
+   * without WebGL2 fences. A finished frame's cost updates {@link slowFrameMs} (from the start of
+   * the frame, scene sync included, or from when the frame before it finished) and the
+   * multisampling ({@link adaptMultisampling}, from the start of its renders). A frame of a lost
+   * context, or not done after {@link FENCE_TIMEOUT_MS}, is given up on.
    */
   private frameDone(): boolean {
     const gl = this.renderer.getContext?.();
@@ -452,13 +473,18 @@ export class ViewportEngine {
       const elapsed = now - Math.max(f.start, this.lastFrameDone);
       const renders = now - Math.max(f.renderStart, this.lastFrameDone);
       this.lastFrameDone = now;
+      this.lastFrameMs = elapsed;
       this.adaptMultisampling(renders, f.compiled);
       const slow = elapsed > SLOW_FRAME_MS && document.visibilityState === 'visible' ? elapsed : 0;
       if (slowFrameMs.value !== slow) slowFrameMs.value = slow;
       const compiled = slow > 0 && f.compiled;
       if (slowFrameCompiled.value !== compiled) slowFrameCompiled.value = compiled;
     }
-    return this.framesInFlight.length < MAX_FRAMES_IN_FLIGHT;
+    const oldest = this.framesInFlight[0];
+    if (!oldest) return true;
+    const drawing = performance.now() - Math.max(oldest.start, this.lastFrameDone);
+    const slow = this.lastFrameMs >= SLOW_QUEUE_FRAME_MS || drawing >= SLOW_QUEUE_FRAME_MS;
+    return this.framesInFlight.length < (slow ? MAX_FRAMES_IN_FLIGHT : MAX_FAST_FRAMES_IN_FLIGHT);
   }
 
   /**
@@ -478,12 +504,14 @@ export class ViewportEngine {
   /**
    * Turns the scene target's multisampling off after a frame whose renders took longer than
    * {@link MSAA_OFF_FRAME_MS} and draws the view again without it; turns it back on (and redraws)
-   * once a frame takes less than {@link MSAA_ON_FRAME_MS}. A frame that compiled shaders only counts
-   * as slow: the frame after it shows what the scene itself costs.
+   * once a frame takes less than {@link MSAA_ON_FRAME_MS}. A frame that compiled shaders changes
+   * nothing: its time is the compiler's (seconds in software WebGL, even for a light scene), and the
+   * frames after it show what the scene itself costs.
    */
   private adaptMultisampling(ms: number, compiled: boolean): void {
+    if (compiled) return;
     if (this.multisampling && ms > MSAA_OFF_FRAME_MS) this.setMultisampling(false);
-    else if (!this.multisampling && !compiled && ms < MSAA_ON_FRAME_MS) this.setMultisampling(true);
+    else if (!this.multisampling && ms < MSAA_ON_FRAME_MS) this.setMultisampling(true);
   }
 
   private setMultisampling(on: boolean): void {
@@ -531,6 +559,9 @@ export class ViewportEngine {
       imagesRevision: this.imagesRevision,
       overlays,
     });
+    const heavy = this.objects.drawnTriangles() > MSAA_HEAVY_TRIANGLES;
+    if (heavy && !this.heavyScene && this.multisampling) this.setMultisampling(false);
+    this.heavyScene = heavy;
     this.applyShading();
     // edit overlay (picking keeps using its cage while it is hidden)
     if (editId) {

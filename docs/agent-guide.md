@@ -39,8 +39,9 @@ Contents:
   (`set_scene_settings {"sampels": 5}`), a misspelled key inside `view`, `selection` or a batch
   operation, and a misspelled operator or modifier parameter all fail with did-you-mean
   suggestions and the valid names before anything changes (in a `batch`, the operations before
-  the failing one stay applied). Tool input schemas are in `tools/list`; operator parameters go
-  inside `params`. The catalogues explain themselves:
+  the failing one stay applied). Tool input schemas are in `tools/list`
+  (`node scripts/mcp.mjs tools <tool>` prints a tool's arguments with types, ranges and defaults);
+  operator parameters go inside `params`. The catalogues explain themselves:
   - `list_operators {category: "<group>"}` returns the operators of a feature with their JSON
     schemas, e.g. `Curves`, `Constraints`, `Rigging`, `Physics`, `Generators`, `Drivers`,
     `Shading`, `Lights and Cameras`, `Layout`, `Scene`;
@@ -55,7 +56,9 @@ Contents:
 Every example project follows the same loop:
 
 1. **Start from a clean project.** Delete an older project of the same name and create it with
-   `empty: true`, so the build is reproducible (all five example scripts do this).
+   `empty: true`, so the build is reproducible (all five example scripts do this). Project names
+   are unique, ignoring letter case: `create_project` refuses a taken name and gives the id of the
+   project that has it.
 2. **Set the scene up first** with one `set_scene_settings` call: resolution, frame range and
    fps, render engine, samples, bounces, denoising, view transform.
 3. **Build in stages.** Group the operators of one stage into a `batch`: it is one undo step, the
@@ -65,13 +68,20 @@ Every example project follows the same loop:
    - `get_scene {max_objects}`: `counts` and especially `problems`;
    - `get_object {object, frame}`: evaluated transforms at a frame, `world_transform`,
      constraint and modifier errors;
-   - `scene.measure`, `scene.raycast`, `scene.stats` (operators, read-only; they take `frame`);
-   - `get_mesh_data` for vertex indices, face materials, UVs and terrain heightmaps;
+   - `scene.measure`, `scene.raycast`, `scene.stats` (operators, read-only; they take `frame`).
+     `scene.measure` computes exact surface distances for up to 25 objects, nearest pairs first,
+     within about 3 s; a pair left out says why in `surface_distance_skipped` (`time budget`, or
+     an object without faces), and `surface_distances {computed, skipped, no_surface}` adds up to
+     the number of pairs;
+   - `get_mesh_data` for vertex indices, face materials, vertex colours, UVs and terrain
+     heightmaps; `get_instances` for where scattered instances are;
    - per feature: `armature.describe {frame}`, `constraint.describe {frame}`,
      `rigidbody.describe {frame}`, `anim.driver_list {frame}`.
 5. **Look at it**: a `RASTER` `render_image` for layout, a small path-traced still for lighting
    and materials, a `render_animation` contact sheet for motion.
-6. **Fix and repeat.** `undo` reverts your last tool call (a whole batch at once).
+6. **Fix and repeat.** `undo` reverts your last tool call (a whole batch at once). Your history
+   keeps the last 100 steps per project and at most 64 MB of replaced or deleted data (server
+   defaults), so undo soon after a change and rebuild rather than undo far back.
 7. **Final outputs**: the path-traced still, the animation, the export.
 
 A minimal script skeleton with `scripts/mcp.mjs`, close to what the example scripts use:
@@ -177,12 +187,18 @@ Each agent has its own selection, active object and mode, separate from every hu
   Passing `objects` to such an operator fails with a message that tells you so. Running one
   without setting the selection silently acts on whatever was selected last.
 
-- Inside a `batch` there is no `selection` argument: put `object.select {objects, active}` before
-  the selection-based operation (the product-shot script does this for `object.shade_smooth`).
+- Inside a `batch`, give an operation its own `selection` (`{operator, params, selection}`; it
+  stays set for the following operations), or put `object.select {objects, active}` before the
+  selection-based operation (the product-shot script does this for `object.shade_smooth`).
+- A call that fails changes nothing, your editor state included: a `selection` is applied all or
+  nothing, and when the operator (or a batch operation) fails, your selection, active object and
+  mode stay as they were before it.
 - `mesh.*` operators need Edit Mode. Use `edit_mesh`, which enters Edit Mode on one object,
-  selects the elements you list, runs the operator and returns to Object Mode. If you enter Edit
-  Mode yourself through `run_operator {selection: {mode: "EDIT"}}`, you stay there until you pass
-  `selection: {mode: "OBJECT"}`, and object operators fail their mode checks meanwhile.
+  selects the elements you list, runs the operator and returns to Object Mode, leaving the object
+  selected and active. If you enter Edit Mode yourself through
+  `run_operator {selection: {mode: "EDIT"}}` (an element selection in `selection.mesh` needs
+  `mode: "EDIT"`), you stay there until you pass `selection: {mode: "OBJECT"}`, and object
+  operators fail their mode checks meanwhile.
 - Element indices are those of the stored (base) mesh: read them with
   `get_mesh_data {source: "BASE"}`. Operators that change topology renumber elements, so read again
   after them.
@@ -218,7 +234,8 @@ Each agent has its own selection, active object and mode, separate from every hu
   glass, water, ceramics, stone, wood, fabrics, emissive, ground, patterns);
   `material.preset_apply {preset, objects, name, slot}` creates one material from a preset for the
   given objects. Tweak it afterwards with `material.update` (which also sets `coat_weight`,
-  `coat_roughness`, `sheen_weight`).
+  `coat_roughness`, `sheen_weight`, `sheen_tint`, `normal_strength`, `alpha_threshold` and
+  `use_backface_culling`).
 - **Procedural textures**: `material.procedural_set {material, channel, procedural}` puts one
   texture on a channel: `base_color`, `metallic`, `roughness`, `normal` (bump), `emission` or
   `alpha`. Types: `NOISE`, `VORONOI`, `CHECKER`, `GRADIENT`, `WAVE`, `BRICK`, `MARBLE`, `WOOD`,
@@ -227,12 +244,23 @@ Each agent has its own selection, active object and mode, separate from every hu
   (e.g. `BRICK {brick_width, row_height, mortar_size}`, `WAVE {wave_type, direction}`; see the
   operator's schema). Fields you pass are merged into the channel's existing texture unless
   `replace: true`. The viewport, both renderers and the glTF bake evaluate textures the same way.
+- **Line widths come from the ramp**, not from the type options: for thin `MARBLE` veins set
+  `ramp_low: 0`, `ramp_high` about 0.25 and `params.ramp_interpolation: "EASE"` (with the default
+  0..1 ramp, marble is a soft, cloudy mix of both colours); narrow the ramp the same way for thin
+  `WAVE` or `WOOD` lines. `WOOD` rings go around `params.axis`: `Z` (the default) suits a post or
+  log standing up; set `X` or `Y` for table tops and floor boards running along X or Y, so the
+  grain follows the boards.
 - **Watch the warnings**: presets and procedurals warn when an object is scaled (OBJECT mapping
   stretches with the scale: apply the scale first), when alpha is used with `blend_method: OPAQUE`
   (set `CLIP` or `BLEND`) or emission has strength 0.
 - **Glass and liquids**: `transmission: 1`, `roughness: 0`, `ior` (1.45–1.5 for glass, about 1.33
-  for water). Light passes through several surfaces, so raise `max_bounces` (a glass bottle with
-  liquid inside means six refractions before the backdrop; the product shot sets 8–10).
+  for water). The camera sees through several surfaces, so raise `max_bounces` (a glass bottle
+  with liquid inside means six refractions before the backdrop; the product shot sets 10). Lamps
+  inside glass (lanterns, bulbs) light their surroundings without tricks: the path tracer lets
+  direct light through glass as through a thin sheet, tinted by the base colour and dimmed by the
+  reflection, and index-matched glass (IOR 1) casts almost no shadow. Glass casts no caustics
+  (no bright focus under a glass ball), and reflections of glass in glossy (not mirror-smooth)
+  surfaces show it as a thin sheet, without refraction.
 - **Several materials on one mesh**: fill slots 0, 1, 2 … with `set_material {slot}`, then assign
   faces in Edit Mode with `edit_mesh` and the operator `object.material_slot_assign {index}`,
   passing the faces as `selection: {faces: [...], all: false}` (the lighthouse terrain zones and
@@ -243,8 +271,9 @@ Each agent has its own selection, active object and mode, separate from every hu
   changes every generated rock. Pass `materials: false` to get empty slots, or assign new
   materials.
 - **Vertex colours**: `paint.vertex_color_set` / `paint.vertex_color_stroke` multiply the base
-  colour; `paint.vertex_color_set_data {object, colors | indices | ranges}` writes exact linear
-  colours per vertex (in `get_mesh_data` vertex order), e.g. computed from height and slope.
+  colour; `paint.vertex_color_set_data {object, colors}` (with `indices` or `start`, or `ranges`
+  instead) writes exact linear colours per vertex in one call (in `get_mesh_data` vertex order),
+  e.g. computed from height and slope; `get_mesh_data {include: ["colors"]}` reads them back.
 - Image textures cannot be loaded through MCP; they arrive with imported glTF files or through
   the web editor's Material tab.
 
@@ -259,16 +288,21 @@ Each agent has its own selection, active object and mode, separate from every hu
   `bevel_mode: "OBJECT"` with `bevel_object` naming another (usually 2D, cyclic) curve whose shape
   is swept along this one. Hide the profile afterwards with
   `data.set_property {kind: "objects", target, values: {hide_viewport: true, hide_render: true}}`.
-  `twist_mode: "Z_UP"` keeps a profile level along a path. Change these later with
+  `twist_mode: "Z_UP"` keeps a profile level along a path. A point's `tilt` (radians) rolls the
+  profile: positive tilt raises its left (+x) side, seen along the direction of travel, like a road
+  banked for a right turn; with `fill_mode: "HALF"`, `twist_mode: "Z_UP"` and a tilt of −π/2 on
+  every point, a half tube opens upward (a gutter). Change these later with
   `curve.properties_set`, points with `curve.spline_set_points`.
 - **A wire curve has no surface**: `get_scene` says so in its data summary, and `get_mesh_data`
   refuses it. Modifiers still work on the wire, so a `SCREW` modifier on a profile curve makes a
   lathed object: the product shot turns its bottle, perfume, cap and pedestal this way (a POLY
   profile in a vertical plane, `SCREW {axis: "Z", steps}`, then `SMOOTH_BY_ANGLE`).
 - **Text**: `object.text_add {body, size, extrude, align_x, align_y}` (the built-in font,
-  printable ASCII and Latin-1; `\n` for new lines). Its result gives `width`, `height` and
-  `bounds`, so you can fit text to a plate and resize it with `font.text_set {object, size}` (the
-  orrery's motto plate). `size` is the em height; capitals are 0.7 × size.
+  printable ASCII and Latin-1; `\n` for new lines). Its result gives the layout box from the font
+  metrics (`width`, `height`, `bounds`: what `align_x` and `align_y` place) and the extent of the
+  letters themselves (`ink_width`, `ink_height`, `ink_bounds`: what `scene.measure` reports), so
+  you can fit text to a plate and resize it with `font.text_set {object, size}` (the orrery's
+  motto plate). `size` is the em height; capitals are 0.7 × size.
 - **Materials** work on curves and text like on meshes (`set_material`).
 - **Convert** to a mesh for booleans, mesh editing or exact geometry:
   `object.convert {target: "MESH"}` with `selection: {objects: [...]}`. It keeps name, transform
@@ -291,7 +325,13 @@ Each agent has its own selection, active object and mode, separate from every hu
 - **Lamps are invisible to the camera in the path tracer**; they only appear in reflections. For a
   visible lamp, add an emissive mesh (the lighthouse lamp is a sphere with
   `emission_strength: 45` next to a point light). The path tracer has no volumes either: the
-  lighthouse beams are emissive, mostly transparent cones.
+  lighthouse beams are glowing cones of index-matched glass (`transmission: 1`, `ior: 1`), which
+  camera rays and light pass straight through.
+- **Emissive meshes light their surroundings only in the path tracer.** RASTER renders and the
+  viewport draw the emitter itself but light nothing with it, so a scene lit only by mesh lights
+  looks dark in a RASTER preview. A scene with no lamp, no sky or environment light, no emissive
+  material and a dark world is lit by a camera-relative studio rig in every renderer, so it is
+  never black; that rig disappears as soon as you add a light.
 - **Cameras**: `add_object {type: "camera", params: {lens}}` (the first camera becomes the scene
   camera), aim it with `object.look_at` or a tracking constraint, and switch with
   `set_active_camera`. `camera.properties_set` changes `lens`, clipping, `type: "ORTHO"`,
@@ -397,7 +437,9 @@ Each agent has its own selection, active object and mode, separate from every hu
    of a `chain_count`-bone chain on a target object (usually an empty you animate) or bone.
    `pose.ik_settings_set {object, bone, …}` locks (`lock_ik_x`), limits (`use_ik_limit_z` with
    `ik_min_z` / `ik_max_z`, radians from the rest pose) or stiffens (`ik_stiffness_y`) a bone's
-   rotation in every IK chain that contains it; a base bone that may only yaw locks X and Z.
+   rotation in every IK chain that contains it; a base bone that may only yaw locks X and Z (two
+   locks make a hinge about the third axis; `lock_ik_y` alone allows swing without twist). The
+   web editor shows these settings in the Inverse Kinematics panel of the active bone.
    Other bone constraints (`pose.constraint_add`): `COPY_ROTATION`, `COPY_LOCATION`,
    `DAMPED_TRACK`, `LIMIT_ROTATION`. The robot keeps its wrist vertical with a `DAMPED_TRACK` to an
    empty below the IK target.
@@ -416,7 +458,9 @@ Each agent has its own selection, active object and mode, separate from every hu
    `collision_margin`, `linear_damping` and `angular_damping`. Defaults follow Blender: 1 kg,
    friction 0.5, restitution 0, margin 0.04 m, `CONVEX_HULL` for ACTIVE and `MESH` for PASSIVE.
    Shapes: `BOX`, `SPHERE`, `CAPSULE`, `CYLINDER`, `CONE`, `CONVEX_HULL`, `MESH`. Only mesh objects
-   can have rigid bodies.
+   can have rigid bodies. Collision shapes keep the true thickness of thin objects (a domino, a
+   coin, a card) down to 0.2 % of their largest dimension; a thinner mesh is simulated thicker,
+   and the result's `collision_note` (and a warning) says so.
 2. **Small objects need small margins.** `collision_margin` is the distance within which contacts
    are detected before surfaces touch (shapes are not inflated by it). The 4 cm default is more
    than the gap between closely spaced dominoes; the domino cascade uses 0.001–0.002 m. Bounces
@@ -430,10 +474,14 @@ Each agent has its own selection, active object and mode, separate from every hu
    domino cascade uses 20 substeps and 20 iterations).
 4. **Inspect** with `rigidbody.describe {frame, objects}` (world location and rotation, whether a
    body is moving, `sleeping`, the simulated shape and problems), `get_object {frame}`, and a
-   `RASTER` contact sheet. Any change to bodies or the world resets the simulation cache.
+   `RASTER` contact sheet. Any change to bodies or the world resets the simulation cache;
+   `rigidbody.cache_free` forces a fresh simulation (and drops the shared collision shapes).
 5. **Bake** when the motion is right: `rigidbody.bake_to_keyframes {objects, frame_start, frame_end}`
-   writes LINEAR keys (every `step` frames) and removes the baked objects' rigid bodies. The domino
-   script compares the keyed positions with the simulation before and after (at most 2 mm apart).
+   writes LINEAR keys (every `step` frames) and removes the baked objects' rigid bodies. They get
+   the custom property `rigid_body_baked` (`"frames A-B step S"`), so `rigidbody.describe` keeps
+   listing them (motion `KEYFRAMED`, `baked_objects`); `rigidbody.object_add` on such an object
+   removes the marker. The domino script compares the keyed positions with the simulation before
+   and after (at most 2 mm apart).
    Unbaked scenes also render and export: renders simulate, and the glTF exporter samples the
    evaluated motion (see [Exporting](#exporting)).
 
@@ -450,7 +498,9 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
 `generate_pipe` (along points), `generate_table`, `generate_chair`, `generate_shelf`,
 `generate_barrel`, `generate_wheel`, `generate_gear`, `generate_spring`. Their results report
 `dimensions`, world `bounds` and `material_slots`. They run in Object Mode, place the object at the
-3D cursor unless you pass `location`, and refuse meshes over 1,000,000 faces.
+3D cursor unless you pass `location`, and refuse meshes over 1,000,000 faces. `generate_cloud`
+makes one connected cloud at any proportions (flat layers, long streaks), so generate clouds at
+their final size instead of scaling small ones.
 
 **Placing things** (category Layout):
 
@@ -471,7 +521,9 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
   `size_random`, `rotation_random`, `align_to_normal`, `vertex_group`, `name`) adds a particle
   system that instances the source objects (up to 200,000 instances in a scene). Instances are
   cheap and render and export, but are not objects: `get_scene` counts them under
-  `counts.instances`. The sources are hidden by default. Each instance's origin sits on the
+  `counts.instances`, and `get_instances {object}` lists each one's source object and world
+  transform (to check spacing, paths and beaches without making them real). The sources are hidden
+  by default (`get_scene` lists them under `counts.not_rendered`). Each instance's origin sits on the
   surface, so sources should have their origin at the base (generators do; mesh primitives have
   it at the centre and sink halfway).
 - Density maps are vertex groups: write one weight per surface vertex with
@@ -491,6 +543,11 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
 | Final still                    | `PATHTRACER`, 1280×720, 128–256 samples, `denoise: true`, `max_bounces` 6–10, `time_limit` 420–480     |
 | Animation (contact sheet, GIF) | `PATHTRACER`, 320×180 tiles or 480×270 GIF frames, 6–32 samples, `denoise: true`, `time_limit` 200–600 |
 
+- `RASTER` is for layout and motion, not for light: the server's rasterizer draws no shadows,
+  takes glossy reflections from one probe in front of what the image centre shows (water, floors
+  and large glossy tables far from that point can show reflections the path tracer does not), and
+  no rasterizer lights anything with emissive meshes. Judge shadows, reflections, glass and mesh
+  lights in a small path-traced preview.
 - Path tracing time grows with pixels × samples × bounces and with scene complexity. `time_limit`
   is wall-clock time: sampling stops when it is used up, after at least one sample per pixel. The
   result says what was reached (`samples` against `requested_samples`, `time_limit_reached`), so
@@ -506,8 +563,9 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
   (`scripts/mcp.mjs` does). Disconnecting cancels the render.
 - `seed` fixes the noise pattern, so two renders with the same settings are comparable.
 - `view_transform` (`AGX` default, `STANDARD`, `FILMIC`, `ACES`, `NEUTRAL`) and `exposure` change
-  the look. The orrery uses `STANDARD` to keep a saturated sun; the product shot uses `NEUTRAL` for
-  faithful product colours.
+  the look of path-traced and `RASTER` renders alike (and of the editor's Rendered view, which
+  uses the same curves and light units). The orrery uses `STANDARD` to keep a saturated sun; the
+  product shot uses `NEUTRAL` for faithful product colours.
 - In a browser, the web editor path traces on Web Workers (F12, Ctrl+F12). `render_image` path
   traces on the server unless you pass `renderer: "browser"`, which uses those workers of a
   connected editor; the result then does not report the samples reached. `render_animation`
@@ -516,23 +574,35 @@ named material slots: `object.generate_terrain`, `generate_rock`, `generate_tree
 ## Exporting
 
 - `export_scene {format: "glb"}` (or `gltf`, `obj`, `stl`, `ply`; `objects` for a subset,
-  `apply_modifiers`, `frame`) exports at your current frame unless you pass `frame`, and returns
-  the file embedded (up to 20 MiB) with a download link. Always read `warnings`.
+  `apply_modifiers`, `frame`, `bake_resolution`) exports at your current frame unless you pass
+  `frame`, and returns the file embedded (up to 20 MiB) with a download link and `elapsed_ms`. It
+  runs on a server render thread; a glTF export samples every frame of the scene range, so long
+  ranges and large scenes take seconds. Always read `warnings`.
 - The download link exports again when it is fetched, with the same format, objects,
-  `apply_modifiers` and frame (after later edits it gives the project as it is then); it needs the
-  server's `AUTH_TOKEN` when one is set.
+  `apply_modifiers`, frame and `bake_resolution` (after later edits it gives the project as it is
+  then); it needs the server's `AUTH_TOKEN` when one is set.
 - OBJ, STL and PLY hold static, world-space meshes.
-- <!-- re-check: gltf-export (matched packages/core/src/io/gltf-export.ts on 2026-11-06) --> glTF:
-  hierarchy, materials with procedural textures baked to 512×512 PNGs (UVs are generated for
-  meshes without them), cameras, lights (area lights become point lights), instances, and
-  animation sampled every frame over the scene range (keyframes, drivers, constraints, IK and
-  physics as node transforms; shape keys as morph targets; armature-deformed meshes as skins;
-  other deformation baked to morph targets). Sky, mist and the drivers and constraints themselves
-  are not exported.
-- The orrery script bakes its driven and constrained motion into keyframes inside one batch
-  (`anim.bake_transforms`), exports, then calls `undo` to get the live drivers back. The glTF
-  exporter described above samples evaluated motion itself, but the pattern is useful whenever you
-  need plain keyframes (for another tool, or to edit the motion by hand).
+- <!-- re-check: gltf-export (matched packages/core/src/io/gltf-export.ts on 2026-11-07) --> glTF:
+  hierarchy, materials (procedural textures baked to PNG), cameras, lights (area lights become
+  point lights), instances, and animation sampled every frame over the scene range (keyframes,
+  drivers, constraints, IK and physics as node transforms, with 2 or 4 keys per frame where a
+  motion curves between frames; shape keys as morph targets; armature-deformed meshes as skins,
+  also with `apply_modifiers: false`; other deformation baked to morph targets, every n-th frame
+  beyond a size budget, with a warning). Sky, mist, the drivers and constraints themselves and
+  animated camera, light, material and world properties are not exported (a warning names the
+  properties; the file keeps their values at the export frame).
+- Procedural bakes are sized per mesh at about 64 texels per metre of surface (512–2048 px),
+  within a budget for the whole export, but never below 512 px. A material whose bake depends on
+  the mesh (GENERATED or OBJECT mapping, bump) is baked once per distinct mesh and written as
+  `Name`, `Name.001` …, so a large scene with many such meshes can still make a large file: pass a
+  smaller `bake_resolution` (64–4096 px; it sets every bake and skips the budget). Pass a larger
+  one when a large object (a terrain, a floor) looks blurry. Meshes without UVs, or with
+  overlapping UVs, get generated UVs for those textures.
+- The glTF exporter samples the evaluated motion itself, so live drivers and constraints export
+  as they are: the orrery exports its driven gear train and the moon's Follow Path directly,
+  extending the frame range by one frame for the export so the clip ends where it starts. To get
+  plain keyframes (for another tool, or to edit the motion by hand), bake with
+  `anim.bake_transforms` inside one batch and `undo` it afterwards to get the live setup back.
 
 ## Common errors and how to read them
 
@@ -553,6 +623,8 @@ selection or object type), `NOT_FOUND` (operator, object or datablock) or `FAILE
 | `'render.render_software' would render on the server's main thread …`                                 | Use `render_image` / `render_animation`                                                               |
 | `Object 'X' not found in project 'P'. Objects: …`                                                     | The name changed (`.001` suffix) or the object was deleted; use names from results                    |
 | `Several projects are named 'X' …`                                                                    | Pass the project id                                                                                   |
+| `A project named 'X' already exists (id …) …`                                                         | Names are unique, ignoring case: work in that project, delete it first or pick another name           |
+| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                     | Pass `mode: "EDIT"` with an element selection, or use `edit_mesh`                                     |
 | `'…' is not animatable on object. Animatable: …`                                                      | Key a listed path; use `data.` for light, camera, curve and mesh data and `material.` for materials   |
 | `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" …`        | The path names something that does not exist; check names with `get_object`                           |
 | `n of m operation(s) failed`                                                                          | Find the first `ok: false` in `results`; earlier operations were applied (one undo step reverts them) |
@@ -589,22 +661,30 @@ Pitfalls the example projects ran into:
 - The default 4 cm collision margin is too large for small, closely spaced rigid bodies.
 - `object.drop_to_ground` takes `surface` as a list.
 - `time_limit` is capped at 600 s per render call; larger values are rejected.
+- A `RASTER` preview of a scene lit by emissive meshes looks dark: only the path tracer lights
+  with them.
+- A held value keyed with two equal `BEZIER` keys (a light's energy, a material's roughness) can
+  still be reported by `export_scene` as an animated property it does not export, from rounding;
+  `LINEAR` or `CONSTANT` keys avoid it.
 
 ## Example projects
 
-Five projects were built from nothing through MCP alone. Each folder has a re-runnable
-`build.mjs` (it deletes and rebuilds its project, checks it and writes its renders into the folder;
-`--export-only` writes `scene.glb` instead, and each script's header lists its other modes; run it
-with `MCP_URL=http://host:port/mcp node examples/<name>/build.mjs`) and the outputs it produced.
-The scripts were still being finished when this guide was written, so the operator ids below are
-the best search terms; function names and numbers may differ.
+Five projects were built from nothing through MCP alone, and re-run on the final editor. Each
+folder has a re-runnable `build.mjs` (it deletes and rebuilds its project, checks it and writes its
+renders into the folder; `--export-only` writes `scene.glb` instead, and each script's header lists
+its other modes; run it with `MCP_URL=http://host:port/mcp node examples/<name>/build.mjs`), the
+outputs it produced (`render.png`, `contact_sheet.png`, `preview.gif`, `scene.glb`, `editor.png`)
+and a README. The [examples index](../examples/README.md) summarizes each project, the editor
+features and MCP tools it uses and how to rebuild it. The operator ids below are the best search
+terms in the scripts.
 
 ### Lighthouse Cove
 
 [Folder](../examples/lighthouse-cove/), [build.mjs](../examples/lighthouse-cove/build.mjs),
 [README](../examples/lighthouse-cove/README.md). A coastal scene at dusk. Look for:
 `object.generate_terrain` shaped with `sculpt.brush_stroke` (GRAB, FLATTEN); per-face ground zones
-with `edit_mesh` and `object.material_slot_assign`; heights from batched `scene.raycast`; a
+with `edit_mesh` and `object.material_slot_assign`; per-vertex colours computed in the script and
+written with `paint.vertex_color_set_data`; heights from batched `scene.raycast`; a
 flagstone path built with `curve.add_from_points` and `bevel_mode: "OBJECT"`;
 `object.generate_fence` along points with heights; density maps written with
 `object.vertex_group_set_weights` and used by `object.scatter_add`; `world.sky_set`,
@@ -613,13 +693,14 @@ flagstone path built with `curve.add_from_points` and `bevel_mode: "OBJECT"`;
 
 ### Clockwork Orrery
 
-[Folder](../examples/clockwork-orrery/), [build.mjs](../examples/clockwork-orrery/build.mjs). A
-brass orrery. Look for: one master channel (`anim.keyframes_insert_many` with
-`anim.extrapolation_set` CYCLIC) and a `batch` of `anim.driver_add` drivers with variables for
-every planet and gear ratio; `object.generate_gear`; numerals and an engraved motto
-(`object.text_add`, `font.text_set`, `object.convert`, `BOOLEAN`); a moon on `FOLLOW_PATH` timed
-with `constraint.followpath_path_animate`; depth of field; the motion checked with `get_object` at
-several frames; `anim.bake_transforms` before the export, then `undo`.
+[Folder](../examples/clockwork-orrery/), [build.mjs](../examples/clockwork-orrery/build.mjs),
+[README](../examples/clockwork-orrery/README.md). A brass orrery. Look for: one master channel
+(`anim.keyframes_insert_many` with `anim.extrapolation_set` CYCLIC) and a `batch` of
+`anim.driver_add` drivers with variables for every planet and gear ratio; `object.generate_gear`;
+numerals and an engraved motto (`object.text_add`, `font.text_set`, `object.convert`, `BOOLEAN`);
+a moon on `FOLLOW_PATH` timed with `constraint.followpath_path_animate`; depth of field; the
+motion checked with `get_object` and clearances with `scene.measure` at several frames; the live
+drivers and constraint exported directly to glTF over frames 1–49 for a seamless loop.
 
 ### Robot Workcell
 
@@ -627,7 +708,8 @@ several frames; `anim.bake_transforms` before the export, then `undo`.
 [README](../examples/robot-workcell/README.md). A palletizing robot. Look for: parts from raw
 geometry (`object.add_mesh_from_data` in batches); a rig from `object.armature_add`,
 `armature.bone_update` and `armature.chain_add`; rigid parts parented with `type: "BONE"`; a hose
-skinned with `ARMATURE_AUTO`; `pose.ik_add` with a keyed target and a `DAMPED_TRACK` bone
+skinned with `ARMATURE_AUTO`; `pose.ik_add` (a three-bone chain) with a keyed target, per-bone IK
+locks and limits (`pose.ik_settings_set`) that make it a palletizer, and a `DAMPED_TRACK` bone
 constraint; a gripper shape key; a crate carried with `CHILD_OF` and keyed influence, its positions
 read with `constraint.describe`; the IK error measured with `armature.describe`; `ARRAY` and
 `MIRROR` modifiers; a driver on a material's `emission_strength`.
@@ -671,9 +753,9 @@ Compared with Blender, these are missing; plan around them rather than searching
   constraints are limited to IK, Copy Rotation, Copy Location, Damped Track and Limit Rotation;
   object constraints to the 16 types listed above.
 - **Rendering**: a CPU path tracer and rasterizers; no GPU path tracing, volumes, subsurface
-  scattering, motion blur, render passes or light linking. The denoiser is a simple filter, so
-  very low sample counts stay blotchy. Animations come out as GIF, APNG, PNG sequences or contact
-  sheets, not video files.
+  scattering, caustics, motion blur, render passes or light linking. The denoiser is a simple
+  filter, so very low sample counts stay blotchy. Animations come out as GIF, APNG, PNG sequences
+  or contact sheets, not video files.
 - **Text and UVs**: one built-in font without text boxes or word wrap; UV unwrapping is
   projection-based (Smart UV Project, cube, cylinder, sphere), without angle-based unwrapping.
 - **Images**: no operator loads image textures through MCP.

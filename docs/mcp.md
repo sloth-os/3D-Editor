@@ -7,7 +7,7 @@ export files, and render stills and animations on the server. Every change syncs
 editors that have the project open. The agent shows up there as a peer named "AI agent (_client
 name_)", with its own selection.
 
-This page is the reference for the endpoint, its 35 tools, the related REST endpoints and the
+This page is the reference for the endpoint, its 36 tools, the related REST endpoints and the
 `scripts/mcp.mjs` client. For a task-oriented guide (workflow, recipes, render budgets, common
 errors, the example projects) see [agent-guide.md](agent-guide.md).
 
@@ -79,7 +79,7 @@ request headers and exposes `mcp-session-id`.
 For every project it touches, an MCP session has:
 
 - an **undo history** that tracks only that agent's changes (`undo` never reverts other people's
-  work),
+  work; bounded, see [Undo and redo](#undo-and-redo)),
 - an **editor state**: selected objects, active object, mode (`OBJECT` or `EDIT`), current frame
   (1 at the start), 3D cursor and the edit-mode element selection,
 - a **presence** entry: the avatar "AI agent (_client title or name from `initialize`_)" with its
@@ -127,16 +127,19 @@ for animations, and the elapsed seconds every 5 s while a browser editor path tr
 - Colours are **linear** RGB or RGBA, components 0..1. Convert sRGB values (colour pickers, hex
   codes) first.
 - Objects, materials and projects are referenced by id or exact name. Names are unique per kind; a
-  taken name gets a suffix (`Cube.001`), so use the name a result returns.
+  taken object or material name gets a suffix (`Cube.001`), so use the name a result returns.
+  Project names are unique on the server, ignoring letter case: `create_project` and
+  `rename_project` refuse a name another project has (see [Projects](#projects)).
 - Operators and their parameters use Blender's ids and names (`mesh.primitive_cube_add`,
   `object.modifier_add`, `bevel_depth`, `energy`); data paths use Blender syntax
   (`pose.bones["Arm"].rotation_euler`, `constraints["Track To"].influence`).
 - **Strict names.** Unknown or misspelled names are rejected with did-you-mean suggestions and the
   list of valid names.
   - **Tool arguments** are checked before a tool runs, for names as well as types and ranges, at
-    the top level and inside `view`, `selection` (and its `mesh`) and the `operations` of `batch`,
-    so a rejected call changes nothing: `set_scene_settings {"sampels": 5}` fails with "Input
-    validation error: Invalid arguments for tool set_scene_settings: unknown argument 'sampels'
+    the top level and inside `view`, `selection` (and its `mesh`) and the `operations` of `batch`
+    (and their `selection`), so a rejected call changes nothing: `set_scene_settings {"sampels": 5}`
+    fails with "Input validation error: Invalid arguments for tool set_scene_settings: unknown
+    argument 'sampels'
     (did you mean 'samples'?). Valid arguments: …". A key that belongs inside a nested argument is
     pointed there (`'position' goes inside 'view'`). For a key that is no typo of a valid
     argument, the tools that take `params` add a hint that operator, modifier or command
@@ -147,6 +150,8 @@ for animations, and the elapsed seconds every 5 s while a browser editor path tr
     `add_object` and the modifier tools) are checked by the operator registry, at every nesting
     level, before the operator runs; in a `batch`, the operations before a rejected one stay
     applied. Operator JSON schemas carry `additionalProperties: false`.
+  - **`editor_command`** commands and their parameter names are checked by the server before
+    anything is sent to an editor, also when no editor is connected.
 - **Evaluated and stored values.** `get_scene` and `get_object` report values at a frame after
   keyframes, drivers, F-curve modifiers, constraints and physics, like Blender's properties
   editor. Where animation overrides the value stored in the document, the stored value is listed
@@ -155,26 +160,33 @@ for animations, and the elapsed seconds every 5 s while a browser editor path tr
   such as `transform_object` and the `*.properties_set` operators change stored values, which
   keyframes and drivers then override.
 - **Frames.** Tools that evaluate the scene (`get_scene`, `get_object`, `get_mesh_data`,
-  `render_image`, `export_scene`) use the agent's current frame unless they get a `frame`. It is 1
-  in a new session and changes with `set_scene_settings {frame_current}` or the `scene.frame_set`
-  operator.
+  `get_instances`, `render_image`, `export_scene`) use the agent's current frame unless they get a
+  `frame`. It is 1 in a new session and changes with `set_scene_settings {frame_current}` or the
+  `scene.frame_set` operator.
+- **Failed calls change nothing**, the agent's editor state included: a `selection` is applied all
+  or nothing, and when a `run_operator`, `edit_mesh` or `batch` operation fails, the agent's
+  selection, active object and mode are put back as they were before it (the failure's `selection`
+  shows them).
+- **Precision.** `get_scene` rounds numbers to 4 decimals (0.1 mm), `get_object` and the object
+  briefs that `add_object`, `create_mesh`, `transform_object`, `duplicate_object`, `set_parent` and
+  `import_model` return to 6 (1 µm); `get_scene` and `get_object` take `decimals` (0–6).
 
 ## Tools
 
-| Area             | Tools                                                                                               |
-| ---------------- | --------------------------------------------------------------------------------------------------- |
-| Projects         | `list_projects`, `create_project`, `get_project`, `rename_project`, `delete_project`                |
-| Inspection       | `get_scene`, `get_object`, `get_mesh_data`, `list_operators`, `list_modifier_types`                 |
-| Any operator     | `run_operator`, `batch`                                                                             |
-| Objects          | `add_object`, `create_mesh`, `transform_object`, `delete_objects`, `duplicate_object`, `set_parent` |
-| Materials        | `set_material`                                                                                      |
-| Modifiers        | `add_modifier`, `update_modifier`, `remove_modifier`, `apply_modifier`                              |
-| Mesh editing     | `edit_mesh`                                                                                         |
-| Animation, scene | `insert_keyframe`, `set_scene_settings`, `set_active_camera`                                        |
-| History          | `undo`, `redo`                                                                                      |
-| Files            | `import_model`, `export_scene`                                                                      |
-| Rendering        | `render_image`, `render_animation`                                                                  |
-| Live editors     | `get_connected_clients`, `editor_command`                                                           |
+| Area             | Tools                                                                                                |
+| ---------------- | ---------------------------------------------------------------------------------------------------- |
+| Projects         | `list_projects`, `create_project`, `get_project`, `rename_project`, `delete_project`                 |
+| Inspection       | `get_scene`, `get_object`, `get_mesh_data`, `get_instances`, `list_operators`, `list_modifier_types` |
+| Any operator     | `run_operator`, `batch`                                                                              |
+| Objects          | `add_object`, `create_mesh`, `transform_object`, `delete_objects`, `duplicate_object`, `set_parent`  |
+| Materials        | `set_material`                                                                                       |
+| Modifiers        | `add_modifier`, `update_modifier`, `remove_modifier`, `apply_modifier`                               |
+| Mesh editing     | `edit_mesh`                                                                                          |
+| Animation, scene | `insert_keyframe`, `set_scene_settings`, `set_active_camera`                                         |
+| History          | `undo`, `redo`                                                                                       |
+| Files            | `import_model`, `export_scene`                                                                       |
+| Rendering        | `render_image`, `render_animation`                                                                   |
+| Live editors     | `get_connected_clients`, `editor_command`                                                            |
 
 Every tool that changes the document is **one undo step** (`batch` included; `delete_project`
 cannot be undone). Read-only tools (`list_*`, `get_*`, `export_scene`, `render_image`,
@@ -196,6 +208,12 @@ Results are JSON text, except where noted (images, embedded files). Failures are
 
 - `project` arguments take a project id or its exact name (a case-insensitive match is tried when
   no exact one exists). Several projects with the same name are an error that lists their ids.
+- Project names are unique, ignoring letter case. `create_project` and `rename_project` refuse a
+  name another project already has (`Lighthouse` when `lighthouse` exists, too) with an error that
+  gives that project's id: work in it, delete it first (`delete_project`) or choose another name.
+  Renaming a project to another case of its own name is allowed. The REST API applies the same
+  rule; projects that browser editors create (locally, then synced) and renames in the editor's
+  Scene tab are not checked, so a duplicate name can still appear (pass the id then).
 - `create_project` starts with Blender's startup scene (a 2 m cube `Cube` with `Material`, a
   `Camera` and a point `Light`) unless `empty` is true. `editor_url` (`/?project=<id>`) opens the
   project in the web editor.
@@ -210,7 +228,8 @@ Results are JSON text, except where noted (images, embedded files). Failures are
 
 #### `get_scene`
 
-Arguments: `project`, `frame` (default: the agent's frame), `max_objects` (1–5000, default 300).
+Arguments: `project`, `frame` (default: the agent's frame), `max_objects` (1–5000, default 300),
+`decimals` (0–6, default 4 = 0.1 mm).
 
 Describes the whole scene at one frame with evaluated values (see
 [Conventions](#conventions)):
@@ -218,12 +237,18 @@ Describes the whole scene at one frame with evaluated values (see
 - `frame`, `units` (`{up_axis: "Z", length: "meters", angles: "radians"}`), `active_camera`.
 - `counts`: `objects`, `by_type`, `vertices` / `faces` (the **base** meshes of mesh objects, before
   modifiers; curves and text not included), `evaluated {vertices, faces, triangles}` (what renders
-  show: after shape keys, modifiers with their render settings such as SUBSURF `render_levels`,
-  SCREW `render_steps` and `show_render`, curve bevels and text, without instances),
-  `evaluated_viewport` (the same with the viewport settings, listed only when the viewport shows
-  other geometry), `materials`, `instances` and `instance_triangles` (particle and collection
-  instances in renders), `viewport_instances` (when the viewport shows fewer), `drivers`,
-  `rigid_bodies`.
+  show, of the objects shown in renders, the same objects the renderers and `export_scene` use:
+  after shape keys, modifiers with their render settings such as SUBSURF `render_levels`, SCREW
+  `render_steps` and `show_render`, curve bevels and text, without instances), `not_rendered`
+  (objects hidden from renders with `hide_render`, such as Boolean cutters, helpers and the hidden
+  sources of scatters: `{objects, vertices, faces, triangles}` with at most 24 names and
+  `objects_total`, plus `instances` / `instance_triangles` of hidden emitters), `evaluated_viewport`
+  (the objects shown in the viewport with the viewport settings, like the editor's statistics
+  overlay; listed whenever it differs), `materials`, `instances` and `instance_triangles` (particle
+  and collection instances whose emitter or instancing empty is shown in renders),
+  `viewport_instances` (when the viewport shows a different number), `drivers`, `rigid_bodies`. A
+  collection's `hide_render` is not applied (its objects still render and export, and are counted
+  in `evaluated`); a collection hidden with `hide_viewport` is left out of renders too.
 - `scene` (frame range, fps, units, gravity and `rigidbody_world` when there are rigid bodies),
   `render` (engine, resolution, samples, max_bounces, use_denoising, film_transparent,
   view_transform, exposure) and `world` (colour, strength, environment, sky, mist; `animated` and
@@ -255,7 +280,8 @@ Evaluations are cached per document state and frame, so repeated `get_scene`, `g
 
 #### `get_object`
 
-Arguments: `project`, `object`, `frame`.
+Arguments: `project`, `object`, `frame`, `decimals` (0–6, default 6 = 1 µm, so sub-millimetre
+parts such as labels, engravings and fine bevels read back as they were made).
 
 Everything about one object at a frame: the `get_scene` entry in full detail, plus `world_location`
 and `world_transform {location, rotation_euler, rotation_degrees, scale}` (the final world
@@ -263,7 +289,10 @@ transform after parents, constraints and physics), `children`, materials per slo
 property, the modifier stack with parameters (`stored_params` where animated), constraints with
 parameters and errors, particle systems with settings, rigid body settings, drivers with
 variables, `animation` (F-curves with up to 100 keyframes each, extrapolation and F-curve
-modifiers, including the object's data), custom properties, display and visibility flags.
+modifiers, including the object's data), custom properties, display and visibility flags. The
+mesh statistics in `data` are those of the object itself, also when it is hidden from renders
+(`get_scene` then counts it in `not_rendered`). Particle systems give instance counts; their
+transforms come from [`get_instances`](#get_instances).
 
 Type-specific detail: curves list every shape setting (`fill_mode`, bevel, `bevel_factor`,
 extrude, offset, caps, twist, resolutions, path settings) and their splines with point
@@ -277,7 +306,7 @@ Reads the geometry of a mesh, curve or text object, in pages.
 
 | Argument                                | Default                                            | Meaning                                                                                                                                                                                                                                                                                                                        |
 | --------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `include`                               | `["vertices", "faces", "face_materials"]`          | Any of `vertices`, `normals`, `faces`, `face_materials`, `face_smooth`, `face_normals`, `face_centers`, `uvs`, `loose_edges`, `vertex_groups`, `heightmap`                                                                                                                                                                     |
+| `include`                               | `["vertices", "faces", "face_materials"]`          | Any of `vertices`, `normals`, `colors`, `faces`, `face_materials`, `face_smooth`, `face_normals`, `face_centers`, `uvs`, `loose_edges`, `vertex_groups`, `heightmap`                                                                                                                                                           |
 | `source`                                | `BASE` for meshes, `EVALUATED` for curves and text | `BASE`: the stored mesh, whose indices `edit_mesh`, vertex groups and shape keys use; `EVALUATED`: after shape keys and modifiers at the frame, with the viewport settings (what `evaluated_viewport` counts); `RENDER`: with the render settings, e.g. subdivision `render_levels` (what `evaluated` counts and renders show) |
 | `space`                                 | `LOCAL`                                            | `LOCAL` (object space) or `WORLD`, for positions, normals and centres                                                                                                                                                                                                                                                          |
 | `vertex_offset`, `face_offset`, `limit` | 0, 0, 2000 (max 20000)                             | Paging: at most `limit` vertices and faces per call                                                                                                                                                                                                                                                                            |
@@ -288,11 +317,38 @@ Reads the geometry of a mesh, curve or text object, in pages.
 The result has `totals` (vertices, faces, triangles, loose edges), the requested fields for the
 page, `material_slots` (with `face_materials`) and, when more remains, `truncated: true` and
 `next {vertex_offset, face_offset}` for the next call. Faces are vertex index loops,
-counter-clockwise seen from the front. `vertex_groups` (BASE only) maps each group name to the
-page's weights. `heightmap` is a world-space grid of the highest surface point:
-`heights[j][i]` is the height at `x = min_xy[0] + i·step[0]`, `y = min_xy[1] + j·step[1]` (`null`
-where the surface does not reach), useful for placing things on terrain. The JSON is compact (no
-indentation).
+counter-clockwise seen from the front. `colors` are linear `[r, g, b, a]` (0..1) per vertex from
+the vertex colour layer that `paint.vertex_color_set`, `_stroke` and `_set_data` write (`null`
+without one). `vertex_groups` (BASE only) maps each group name to the page's weights.
+`heightmap` is a world-space grid of the highest surface point: `heights[j][i]` is the height at
+`x = min_xy[0] + i·step[0]`, `y = min_xy[1] + j·step[1]` (`null` where the surface does not
+reach), useful for placing things on terrain. The JSON is compact (no indentation).
+
+#### `get_instances`
+
+Lists the instances an object generates, with the world transform of each, in pages: every
+particle of its particle systems (`object.scatter_add`, `object.particle_system_add`; a particle
+that instances a whole collection gives one entry per collection object) and the objects of the
+collection it instances (`object.collection_instance_add`). Use it to check a scatter (spacing,
+nothing on a path or in the water, sizes, orientations) without making the instances real.
+
+| Argument          | Default            | Meaning                                                                                                                                                 |
+| ----------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `object`          | –                  | The particle emitter or collection-instancing empty (id or name)                                                                                        |
+| `particle_system` | all of them        | Only this particle system (name or id)                                                                                                                  |
+| `source`          | `RENDER`           | `RENDER`: what renders show (every particle of the systems with `show_render`); `VIEWPORT`: what the editor shows (display percentage, `show_viewport`) |
+| `frame`           | the agent's frame  | Frame to evaluate                                                                                                                                       |
+| `offset`, `limit` | 0, 1000 (max 5000) | Paging                                                                                                                                                  |
+| `decimals`        | 4                  | Rounding (0–6)                                                                                                                                          |
+
+Each entry of `instances` is `{system, particle}` (or `{collection}` for a collection instance),
+the instanced `source` object, and its world `location` (m), `rotation_euler` (radians, XYZ) and
+`scale`. The result also has, per particle system, `instance_object` or `instance_collection`,
+`count`, the `particles` and `instances` placed and `location_bounds` (min/max of the instance
+locations), with `shown: false` when the system is switched off for that `source`; `total` (of the
+listed kind), `range`, `problems` (instancing errors) and `emitter_hidden` when the emitter itself
+is hidden there. When more remain, `truncated: true` and `next {offset}`. An object without
+particle systems or an instanced collection is an error. The JSON is compact.
 
 #### `list_operators`
 
@@ -337,12 +393,17 @@ Runs one operator with its defaults filled in, as one undo step. Operators act o
 selection and mode, like in Blender. `selection` sets them before the operator runs and **persists
 for the agent's later calls**:
 
-| `selection` field | Meaning                                                                                                                                                      |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `objects`         | Objects to select (ids or names); replaces the selection                                                                                                     |
-| `active`          | The active object (default: the last of `objects`)                                                                                                           |
-| `mode`            | `OBJECT` or `EDIT` (edit mode needs an active mesh object)                                                                                                   |
-| `mesh`            | Edit-mode element selection: `verts`, `edges` (`[a, b]` pairs), `faces`, `all`, `select_mode` (`VERT`, `EDGE`, `FACE`; inferred from the lists when omitted) |
+| `selection` field | Meaning                                                                                                                                                                             |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `objects`         | Objects to select (ids or names); replaces the selection                                                                                                                            |
+| `active`          | The active object (default: the last of `objects`)                                                                                                                                  |
+| `mode`            | `OBJECT` or `EDIT` (edit mode needs an active mesh object)                                                                                                                          |
+| `mesh`            | Edit-mode element selection (needs `mode: "EDIT"`): `verts`, `edges` (`[a, b]` pairs), `faces`, `all`, `select_mode` (`VERT`, `EDGE`, `FACE`; inferred from the lists when omitted) |
+
+A `selection` is applied all or nothing: one that cannot be applied (an unknown object, Edit Mode
+without an active mesh, `mesh` without `mode: "EDIT"`, an element index out of range) fails the
+call and changes nothing, and when the operator itself fails, the agent's selection, active object
+and mode go back to what they were before the call.
 
 Many operators take explicit object arguments (`object`, `objects`, `target`). Operators that act
 on the selection take none: `object.transform_apply`, `object.shade_smooth`, `object.convert`,
@@ -372,17 +433,22 @@ Refused operators (failures too, with the `code` named here):
 
 #### `batch`
 
-Arguments: `project`, `operations` (1–200 items of `{operator, params}`), `stop_on_error`
-(default true).
+Arguments: `project`, `operations` (1–200 items of `{operator, params, selection}`),
+`stop_on_error` (default true).
 
-Runs operators in order as **one undo step**: one `undo` reverts all of them. There is no
-per-operation `selection`; change the selection inside the batch with `object.select`
-(`{objects, active, extend}`), `object.mode_set` or `mesh.select_elements`. With `stop_on_error`
-the batch stops at the first failure and keeps the changes made before it.
+Runs operators in order as **one undo step**: one `undo` reverts all of them. An operation's
+optional `selection` (as for `run_operator`: objects, active object, mode, edit-mode elements) is
+set before that operation runs and stays set for the following ones, for operators that act on the
+selection (`object.convert`, `object.transform_apply`, `object.shade_smooth` …); `object.select`
+(`{objects, active, extend}`), `object.mode_set` and `mesh.select_elements` work inside a batch
+too. An operation that fails changes nothing in the agent's editor state: its selection is not
+kept, so the following operations see the selection of before it. With `stop_on_error` the batch
+stops at the first failure and keeps the changes made before it.
 
 The result is `{ok, executed, failed, results, selection}`. Each entry of `results` is
-`{operator, ok, result}` or `{operator, ok: false, error, code}` (`code` as for `run_operator`),
-with `reports` when the operator reported anything. `operations_with_warnings` is added when some
+`{operator, ok, result}` or `{operator, ok: false, error, code}` (`code` as for `run_operator`; a
+`selection` naming an unknown object fails its operation with `NOT_FOUND`), with `reports` when
+the operator reported anything. `operations_with_warnings` is added when some
 operations reported a WARNING or ERROR (failed ones included) and counts them. When an operation
 failed, the tool result is an error whose text starts with "_n_ of _m_ operation(s) failed"
 followed by the same JSON.
@@ -414,8 +480,8 @@ followed by the same JSON.
 - `transform_object` sets stored values. On an animated channel the keyframes still win at their
   frames; key the channel instead (`insert_keyframe`).
 - `add_object`, `create_mesh`, `transform_object`, `duplicate_object` and `set_parent` return a
-  brief of each object (`id`, `name`, `type`, `location`, `rotation_euler`, `scale`, `parent`);
-  `delete_objects` returns `{deleted, remaining}` (counts).
+  brief of each object (`id`, `name`, `type`, `location`, `rotation_euler`, `scale`, `parent`;
+  transforms rounded to 6 decimals); `delete_objects` returns `{deleted, remaining}` (counts).
 
 ### Materials
 
@@ -433,9 +499,11 @@ Gives a mesh, curve or text object a principled material in a slot, as one undo 
   material "_object_ Material" is created.
 
 The result is `{object, slot, created, material}`. Curve splines and text pick their slot with the
-spline's `material_index`. Presets, procedural textures, coat and sheen are operators:
-`material.preset_list`, `material.preset_apply`, `material.procedural_set`, `material.new`,
-`material.update` (`list_operators {category: "Shading"}`).
+spline's `material_index`. Presets, procedural textures and the other Principled settings
+(`coat_weight`, `coat_roughness`, `sheen_weight`, `sheen_tint`, `normal_strength`,
+`alpha_threshold`, `use_backface_culling`) are operators: `material.preset_list`,
+`material.preset_apply`, `material.procedural_set`, `material.new`, `material.update`
+(`list_operators {category: "Shading"}`).
 
 ### Modifiers
 
@@ -449,7 +517,9 @@ spline's `material_index`. Presets, procedural textures, coat and sheen are oper
 - Modifiers work on mesh, curve and text objects; on curves and text they act on the generated
   surface, or on the wire of a curve that has none (so `SCREW` revolves a profile curve).
 - Parameter names follow Blender; `list_modifier_types {type}` gives the schema. Unknown names and
-  invalid values are rejected together with that schema. Object parameters (`BOOLEAN object`,
+  invalid values are rejected together with that schema. `show_viewport`, `show_render`,
+  `show_in_editmode` or `name` given inside `params` (when the type has no parameter of that name)
+  are an error that says they are arguments of the tool itself. Object parameters (`BOOLEAN object`,
   `ARMATURE object`, `CURVE object`, `ARRAY offset_object`, `MIRROR mirror_object`, …) take object
   names or ids.
 - `apply_modifier` bakes the stack up to that modifier into the mesh and removes it (mesh objects
@@ -473,8 +543,10 @@ for `mesh.*` operators (`mesh.extrude_region_move {value}`, `mesh.inset`, `mesh.
 face selection and the `uv.*` unwrap operators. Indices are those of the base mesh
 (`get_mesh_data` with `source: BASE`). The result is
 `{ok, operator, result, reports, mesh, selection_after}`: `mesh` statistics and the selected
-element indices afterwards (at most 500 of each kind). A failure is an error result with the same
-JSON plus `error` and `code`, as for `run_operator`.
+element indices afterwards (at most 500 of each kind). Afterwards the object is the agent's
+selected and active object, in Object Mode. A failure (an element index out of range, the
+operator's own failure) leaves the agent's selection and mode as they were; it is an error result
+with the same JSON plus `error` and `code`, as for `run_operator`.
 
 ### Animation and scene settings
 
@@ -544,6 +616,12 @@ The scope is the session, or the agent id when the client sends one (see
 `{undone | redone, can_undo, can_redo}`, plus a `note` naming the history when fewer steps than
 asked were available.
 
+The history is bounded per agent and project: it keeps the last 100 steps and at most 64 MB of
+replaced or deleted data (the server settings `MCP_UNDO_STEPS` and `MCP_UNDO_MEMORY_MB`; the
+`undo` tool's description states this server's limits). Older steps are dropped, the newest one
+is always kept, and the `note` says when steps were dropped. Undo soon after a change, and rebuild
+rather than undo far back.
+
 ### Import and export
 
 #### `import_model`
@@ -560,19 +638,22 @@ objects become selected. The result is `{format, bytes, objects, warnings}`.
 
 Arguments: `project`, `format` (`glb` default, `gltf`, `obj`, `stl`, `ply`), `objects` (a subset;
 default every object visible in renders), `apply_modifiers` (default true), `frame` (default: the
-agent's current frame).
+agent's current frame), `bake_resolution` (glTF/GLB: the size in pixels, 64–4096, of the square
+images procedural textures are baked into, for every bake; default: per mesh, see below).
 
-Exports the scene evaluated at `frame`. The content is the JSON
-`{format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, warnings}`
-(`objects` lists the requested object names, or is `"all"`), the file as an embedded base64
-`resource` (up to 20 MiB) and a `resource_link` to `download_url`. **Check `warnings`**: they list
-what the format could not represent.
+Exports the scene evaluated at `frame`, on a render thread, so a long export does not hold up the
+server (a glTF export samples every frame of the scene range, which takes seconds for long ranges
+and large scenes). The content is the JSON
+`{format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, elapsed_ms, warnings}`
+(`objects` lists the requested object names, or is `"all"`; `bake_resolution` is added when it was
+given), the file as an embedded base64 `resource` (up to 20 MiB) and a `resource_link` to
+`download_url`. **Check `warnings`**: they list what the format could not represent.
 
 `download_url` is `GET /api/projects/<id>/export` with the same options as query parameters
-(`format` and `frame`, plus `objects` when a subset was exported and `apply_modifiers=false` when
-modifiers were not applied; see [REST endpoints](#rest-endpoints)). It exports again when it is
-fetched: the same file as the embedded one while the scene is unchanged, the project's current
-state after later edits.
+(`format` and `frame`, plus `objects` when a subset was exported, `apply_modifiers=false` when
+modifiers were not applied and `bake_resolution` when it was given; see
+[REST endpoints](#rest-endpoints)). It exports again when it is fetched: the same file as the
+embedded one while the scene is unchanged, the project's current state after later edits.
 
 What the formats contain:
 
@@ -580,17 +661,39 @@ What the formats contain:
   `usemtl` material groups; STL is binary and triangulated; PLY is binary with UVs and vertex
   colours when present. Particle and collection instances are included.
 - **glTF / GLB** <!-- re-check: gltf-export (matched packages/core/src/io/gltf-export.ts on
-  2026-11-06) -->: the object hierarchy (armature bones as nodes, bone-parented objects under
-  their bone), meshes with one primitive per material, principled materials, cameras, lights
-  (`KHR_lights_punctual`; area lights become point lights, with a warning), and particle and
-  collection instances as nodes sharing their source's mesh. Animation is sampled once per frame
-  over the scene frame range (at most 10000 frames): node transforms wherever an object or bone
-  moves, whatever moves it (keyframes, drivers, constraints, IK, rigid bodies). Shape keys become
-  morph targets; a mesh deformed only by an Armature modifier becomes a glTF skin (at most 4 bone
-  influences per vertex); other changing deformation is baked into morph targets. Procedural
-  textures are baked into 512×512 PNG images; a mesh without UVs gets generated UVs (Smart UV
-  Project) for the bake, with a warning. Sky, mist, the world, drivers and constraints themselves
-  are not exported; camera lens shift is dropped with a warning.
+  2026-11-07) -->: the object hierarchy (armature bones as nodes, bone-parented objects under
+  their bone), meshes with one primitive per material, principled materials (with
+  `KHR_materials_emissive_strength`, `_transmission`, `_ior`, `_clearcoat` and `_sheen`), cameras,
+  lights (`KHR_lights_punctual`; area lights become point lights, with a warning), and particle and
+  collection instances as nodes sharing their source's mesh.
+  - **Animation** is sampled once per frame over the scene frame range (at most 10000 frames):
+    node transforms wherever an object or bone moves, whatever moves it (keyframes, drivers,
+    constraints, IK, rigid bodies). Where an object's motion curves between frames (a fast orbit),
+    it gets 2 or 4 keys per frame in those frame intervals; motion that is straight between frames
+    (LINEAR keys, rigid bodies) keeps one key per frame. A warning names a node whose sub-frame
+    samples still deviate by more than 0.5 mm (or 0.1 % of its path's extent), or says when the
+    budget of 3000 sub-frame scene evaluations ran out.
+  - **Deformation**: shape keys become morph targets; a mesh deformed only by an Armature modifier
+    becomes a glTF skin (at most 4 bone influences per vertex; with `apply_modifiers: false`, a
+    mesh whose first Armature modifier uses an exported armature, without its other modifiers);
+    other changing deformation is baked into morph targets, at most about 12 million floats of
+    them (counted per written vertex), keeping every n-th frame beyond that, with a warning.
+  - **Procedural textures** are baked into PNG images sized per mesh at about 64 texels per metre
+    of surface (512–2048 px, powers of two; a UV-mapped bake shared by several meshes is sized for
+    the largest), all automatic bakes within a budget of 3 × 2048² texels (but none below 512
+    px). `bake_resolution` sets one size for every bake, without the budget: raise it for large
+    objects that look blurry, lower it for scenes with many baked meshes, whose files can
+    otherwise be large. A material
+    whose bake depends on the mesh (GENERATED or OBJECT mapping, bump) is written once per
+    distinct mesh, named `Name`, `Name.001` … (images follow), with a warning. A mesh without UVs,
+    or with overlapping UVs, gets generated UVs (Smart UV Project) for its GENERATED/OBJECT-mapped
+    textures, with a warning; when image textures or UV-mapped procedurals need its own UVs, those
+    are kept and a warning says the bake is wrong where faces overlap. Image textures on a mesh
+    without UVs are dropped, with a warning.
+  - **Not exported**: the sky, mist, the world, drivers and constraints themselves, and animated
+    camera, light, material and world properties (a warning names them; the file keeps their values
+    at the export frame; a value held by two equal BEZIER keys can be reported too, from rounding);
+    camera lens shift is dropped with a warning.
 
 ### Rendering
 
@@ -600,22 +703,27 @@ agents) or, for `render_image`, in a connected browser editor. `run_operator` re
 
 #### Engines and routing
 
-- `RASTER`: a fast rasterizer for checking layout, materials and animation. The server's software
-  rasterizer draws no shadows; a browser editor renders with WebGL in its Rendered shading (scene
-  lights with shadow maps).
+- `RASTER`: a fast rasterizer for checking layout, materials and animation, with the scene's view
+  transform and exposure and Film > Transparent. The server's software rasterizer draws no
+  shadows, and its glossy reflections come from one small reflection probe in front of what the
+  image centre shows, looked up by direction only: water, floors and large glossy tables far from
+  that point can show reflections the path tracer does not (a wide smear of a nearby object, a far
+  end that is too bright). A browser editor renders with WebGL in its Rendered shading (scene
+  lights with shadow maps). Neither rasterizer lights other surfaces with emissive meshes. Judge
+  shadows, reflections and mesh lights with `PATHTRACER`.
 - `PATHTRACER`: the CPU path tracer (principled BSDF, soft shadows, global illumination,
   reflections, glass, sky, mist, depth of field, procedural textures, instances, view transforms)
   for final images. It renders in parallel on all render threads. Lamps are not visible to the
-  camera directly (only in reflections); use emissive materials for visible light sources. It has
-  no volumes, subsurface scattering or motion blur.
-- `shading: "SOLID"` (grey clay) always rasterizes. Without `shading`, renders show materials and
-  scene lights. Leave it out for raster renders in a browser editor: an explicit `MATERIAL` there
-  gives the viewport's Material Preview (studio light, scene lamps off), while on the server and
-  for path tracing it is the default look.
+  camera directly (only in reflections); use emissive materials for visible light sources. Light
+  passes glass as through a thin sheet (tinted and dimmed, never focused), so lamps inside
+  lanterns and bulbs light their surroundings, but glass casts no caustics. It has no volumes,
+  subsurface scattering or motion blur.
+- `shading: "SOLID"` (grey clay) always rasterizes. Without `shading`, or with `MATERIAL`, renders
+  show materials, scene lights and the world, in a browser editor too (its final-render look, not
+  the viewport's Material Preview).
 
-<!-- re-check: browser raster shading (apps/web/src/editor/rpc.ts, viewport/engine.ts renderPixels)
-matched the code on 2026-11-06 while a change to the web editor's final renders (render
-visibility, RPC shading) was in progress -->
+<!-- re-check: browser raster shading (apps/web/src/editor/rpc.ts rpcRenderShading,
+viewport/engine.ts renderPixels) matched the code on 2026-11-07 -->
 
 `engine` defaults to the scene's render engine (`set_scene_settings {engine}`), whichever renderer
 is used. `render_image` chooses where to render with `renderer`:
@@ -633,9 +741,11 @@ a progress token). The web editor's own Render Image (F12) and Render Animation 
 path trace on the same Web Workers. `render_animation` always renders on the server.
 
 The server's render threads: `RENDER_WORKERS` (default: CPU cores, at most 8; `0` renders on the
-main thread) plus one thread for raster stills, which never wait for long renders. Long renders
-(path-traced stills and all animations) use every render thread; at most two run at once, sharing
-the threads, and further ones wait their turn.
+main thread) plus one thread for raster stills and exports, which never wait for long renders.
+Long renders (path-traced stills and all animations) use every render thread; at most two run at
+once, sharing the threads, and further ones wait their turn. On Linux the render threads run at a
+lower CPU priority (`RENDER_WORKER_NICE`, default 10), so the server keeps answering while they
+work.
 
 #### `render_image`
 
@@ -727,9 +837,10 @@ id, `agent_id`).
 Arguments: `project`, `command`, `params`, `client` (connection id or client name; default: the
 most recently active editor that accepts UI commands), `timeout_ms` (100–60000, default 10000).
 
-Sends a UI command to a live browser editor that has the project open. It fails when none is
-connected ("No browser editor accepting UI commands is connected … Open _editor_url_ in a
-browser"). Commands:
+Sends a UI command to a live browser editor that has the project open. The server first checks the
+command and the names of its parameters (with did-you-mean suggestions and the valid names, also
+when no editor is connected), then fails when no editor is connected ("No browser editor accepting
+UI commands is connected … Open _editor_url_ in a browser"). Commands:
 
 | Command               | Params                                                                          | Effect                                                                                           |
 | --------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
@@ -743,12 +854,17 @@ browser"). Commands:
 | `play`                | `playing` (default true)                                                        | Start or stop playback                                                                           |
 | `notify`              | `message`                                                                       | Show a message to the user                                                                       |
 | `run_operator`        | `operator`, `params`                                                            | Run an operator in that editor, with its selection and its undo history (also UI-only operators) |
-| `screenshot`          | `width`, `height`                                                               | A PNG of the viewport as the user sees it (returned as an image)                                 |
+| `screenshot`          | `width`, `height` (whole pixels, 16–4096; default: the viewport size)           | A PNG of the viewport as the user sees it (returned as an image)                                 |
 | `get_view`            | –                                                                               | The viewport's target, distance, yaw, pitch, orthographic flag and camera view state             |
 
-Enum values are case-insensitive. Invalid parameters (an unknown view or shading, objects that do
-not exist, a missing `frame`) and unknown commands are errors that say what is wrong and leave the
-editor as it was.
+Enum values are case-insensitive. Unknown commands and misspelled parameter names are refused by
+the server; invalid values (an unknown view, shading or mode, objects that do not exist, a missing
+or non-numeric `frame`) are errors from the editor. Either way the error says what is wrong and the
+editor stays as it was. The tool returns `{command, result}` with the editor's answer:
+`view.set_view`, `view.shading` and `set_mode` report the view, shading or mode the editor has
+afterwards, and a command the editor cannot carry out (Edit Mode without an active mesh, the
+camera view without a scene camera) answers `ok: false` with the reason in `error`. `select`
+answers `{selected, names}`; `[]` deselects everything.
 
 ### Resources
 
@@ -775,6 +891,10 @@ is the full result as JSON (for `batch`, including the operations that succeeded
 | `'render.render_software' would render on the server's main thread … Use the render_image tool instead`                                           | `render.*` through `run_operator` / `batch` / `edit_mesh`                                             |
 | `Object 'Nope' not found in project 'P'. Objects: …`                                                                                              | A wrong object reference (the message lists up to 40 names)                                           |
 | `Project 'X' not found. Known projects: …` / `Several projects are named 'X': … Pass the project id instead.`                                     | A wrong or ambiguous project reference                                                                |
+| `A project named 'Lighthouse' already exists (id …). … Project names are unique because tools find projects by name …`                            | `create_project` / `rename_project` with a name another project has (letter case ignored)             |
+| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                                                                 | An element selection without `mode: "EDIT"`                                                           |
+| `'show_render' is not a parameter of the BEVEL modifier. Its visibility (show_render) is set after adding it, with update_modifier …`             | A modifier setting given inside `params` instead of as a tool argument                                |
+| `Unknown parameter 'veiw' (did you mean 'view'?) for the editor command view.set_view. Its parameters: …`                                         | A misspelled `editor_command` command or parameter (refused before anything is sent)                  |
 | `'dimensions' is not animatable on object. Animatable: …`                                                                                         | `insert_keyframe` on a property that cannot be keyed                                                  |
 | `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" (it is empty).`                                       | `insert_keyframe` on a path that does not resolve                                                     |
 | `A path traced image of 2048×2048 is too large (at most 2621440 pixels, e.g. 2048×1280): render smaller`                                          | Render limits                                                                                         |
@@ -820,6 +940,8 @@ driver) and the `problems` list of `get_scene`.
 | `undo` / `redo`                            | 100 steps per call                                                                                                                                                                 |
 | `get_scene`                                | `max_objects` up to 5000 (default 300); `problems` up to 40                                                                                                                        |
 | `get_mesh_data`                            | 20000 vertices and faces per page (default 2000); heightmap up to 256 samples per side                                                                                             |
+| `get_instances`                            | 5000 instances per page (default 1000)                                                                                                                                             |
+| Undo history                               | 100 steps and 64 MB of replaced or deleted data per agent and project (`MCP_UNDO_STEPS`, `MCP_UNDO_MEMORY_MB`); older steps are dropped                                            |
 | `list_operators`                           | Parameter schemas when a filter matches at most 60 operators (or `include_parameters: true`)                                                                                       |
 | `render_image`                             | 16–2048 per side; path tracing on the server at most 2,621,440 pixels; `time_limit` up to 600 s (default 30)                                                                       |
 | Browser renders                            | Raster: 15 s per render request; path tracing: `time_limit` + 30 s                                                                                                                 |
@@ -828,29 +950,35 @@ driver) and the `problems` list of `get_scene`.
 | Embedded files                             | 20 MiB (`export_scene`, `render_animation`); larger animations are stored and linked                                                                                               |
 | Stored renders                             | 1 hour, 256 MiB in all (oldest dropped first); kept in memory                                                                                                                      |
 | `import_model`                             | 50 MB; URL downloads time out after 60 s                                                                                                                                           |
-| `editor_command`                           | `timeout_ms` up to 60000                                                                                                                                                           |
+| `editor_command`                           | `timeout_ms` up to 60000; screenshots 16–4096 px per side                                                                                                                          |
 
 ## REST endpoints
 
 The same server offers plain HTTP endpoints under `/api` (protected by `AUTH_TOKEN`, not by
 `MCP_TOKEN`). Those relevant to agents:
 
-| Endpoint                                      | Purpose                                                         |
-| --------------------------------------------- | --------------------------------------------------------------- |
-| `GET /api/projects`                           | `{projects: [...]}`                                             |
-| `POST /api/projects`                          | Body `{name, empty}`; 201 `{id, name}`                          |
-| `GET` / `PATCH` / `DELETE /api/projects/:id`  | Details (with `persistence`) / rename (`{name}`) / delete (204) |
-| `GET /api/projects/:id/snapshot`              | The document as JSON                                            |
-| `GET /api/projects/:id/export?format=glb`     | An export (`glb`, `gltf`, `obj`, `stl`, `ply`); see below       |
-| `GET /api/projects/:id/render.png`            | Renders a PNG on the server                                     |
-| `GET /api/projects/:id/renders/:render`       | `{id, files: [{name, mime, bytes}]}` of a stored render         |
-| `GET /api/projects/:id/renders/:render/:file` | A stored render file (kept for an hour)                         |
+| Endpoint                                      | Purpose                                                                                                                                     |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/projects`                           | `{projects: [...]}`                                                                                                                         |
+| `POST /api/projects`                          | Body `{name, empty}`; 201 `{id, name}`; 409 `{error, id, ids}` for a taken name; without `name` the first free `Untitled`, `Untitled.001` … |
+| `GET` / `PATCH` / `DELETE /api/projects/:id`  | Details (with `persistence`) / rename (`{name}`; 409 for a name another project has) / delete (204)                                         |
+| `GET /api/projects/:id/snapshot`              | The document as JSON                                                                                                                        |
+| `GET /api/projects/:id/export?format=glb`     | An export (`glb`, `gltf`, `obj`, `stl`, `ply`); see below                                                                                   |
+| `GET /api/projects/:id/render.png`            | Renders a PNG on the server                                                                                                                 |
+| `GET /api/projects/:id/renders/:render`       | `{id, files: [{name, mime, bytes}]}` of a stored render                                                                                     |
+| `GET /api/projects/:id/renders/:render/:file` | A stored render file (kept for an hour)                                                                                                     |
+
+Project names are unique ignoring letter case, as for the MCP tools: `POST` and `PATCH` answer 409
+with the error, the holder's `id` and all matching `ids` when another project has the name.
 
 `export` takes the query parameters `format` (default `glb`), `objects` (comma-separated object
 ids or names; default every object visible in renders; an unknown one is a 400 error),
-`apply_modifiers` (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`; default true) and `frame`
-(default: the scene's `frame_start`), and answers with the file as an attachment. The
-`download_url` of `export_scene` uses these parameters.
+`apply_modifiers` (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`; default true), `frame`
+(default: the scene's `frame_start`) and `bake_resolution` (glTF: 64–4096 px for every procedural
+texture bake; default per mesh, as for `export_scene`), and answers with the file as an attachment
+and the header `x-export-time-ms`. It exports on a render thread; 499 when the client went away,
+503 when the server stopped the export. The `download_url` of `export_scene` uses these
+parameters.
 
 `render.png` takes the query parameters `width` (16–2048, default 800), `height` (default from the
 render aspect), `camera` (name or id), `frame` (default: the scene's `frame_start`), `engine`,
@@ -861,9 +989,9 @@ render aspect), `camera` (name or id), `frame` (default: the scene's `frame_star
 `x-render-samples`.
 
 Errors: 400 for invalid parameters, an unknown camera or a path-traced image that is too large; 404
-for an unknown project; 499 when the client went away during the render; 503 when the server
-stopped the render or the storage is unavailable; 501 when a format or engine is not available in
-the build; 500 for other failures.
+for an unknown project; 409 for a project name another project has; 499 when the client went
+away during a render or export; 503 when the server stopped it or the storage is unavailable; 501
+when a format or engine is not available in the build; 500 for other failures.
 
 ## `scripts/mcp.mjs` (CLI and module)
 
@@ -880,12 +1008,15 @@ Environment:
 CLI:
 
 ```bash
-node scripts/mcp.mjs tools [filter]                      # tool names with the first sentence of their description
+node scripts/mcp.mjs tools [filter] [--json]             # tool names and first sentences; with a filter, each matching tool in full
 node scripts/mcp.mjs ops [search]                        # list_operators (with a search string)
 node scripts/mcp.mjs call <tool> ['<json args>'] [--out file] [--out-dir dir]
 node scripts/mcp.mjs batch <calls.json> [--out-dir dir]  # [{ "tool": "...", "args": {...} }, ...]
 ```
 
+- `tools` without a filter prints each tool's name and the first sentence of its description; with
+  a filter (a tool name or part of one), each matching tool's full description and its arguments
+  with types, ranges, defaults and nested fields; `--json` prints their input schemas instead.
 - `call` prints `{saved, result, elapsed_ms}`; images and embedded files in `result` are replaced by
   their base64 sizes. `--out` writes the first image or embedded file, `--out-dir` every image and
   embedded file (named by their URIs: `frame_0001.png`, exports by file name, images as

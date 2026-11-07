@@ -14,7 +14,7 @@
 ┌──────────────────────────────▼───────────────────▼──────────────────────────────┐
 │ Node server (Fastify): static PWA · /sync rooms (Yjs) · /mcp (AI agents)        │
 │ /api (projects, export, render.png) · /dav WebDAV proxy · /otlp · /metrics      │
-│ render threads (worker_threads): path tracing, CPU rasterizer, encoders         │
+│ render threads (worker_threads): path tracing, CPU rasterizer, encoders, export │
 │ persistence: memory | disk | WebDAV (CRDT merge, If-Match)                      │
 └──────┬──────────────────────────────────────────────────────────────────────────┘
        ▼
@@ -37,36 +37,36 @@ and the importers/exporters are isomorphic (no DOM, no Node APIs).
 
 ### Where each subsystem lives
 
-| Subsystem                                                                                                                 | Location                                                      |
-| ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
-| Vectors, matrices, quaternions                                                                                            | `packages/core/src/math`                                      |
-| Mesh kernel: topology, normals, triangulation, UV projections, sculpt and paint dabs, shape key blending, edit operations | `packages/core/src/mesh` (edit operations in `mesh/ops`)      |
-| Document model: `SceneDoc`, datablock types and defaults                                                                  | `packages/core/src/doc`                                       |
-| Operator registry and all built-in operators                                                                              | `packages/core/src/operators`                                 |
-| Modifier registry and the 22 modifier types                                                                               | `packages/core/src/modifiers`                                 |
-| F-curves, F-curve modifiers, drivers and their expression language, animatable data paths                                 | `packages/core/src/anim`                                      |
-| Splines (Bezier, NURBS), curve-to-mesh (bevel, extrude, fill), built-in font, text layout, paths                          | `packages/core/src/curve`                                     |
-| Constraint catalogue and schemas, solvers, dependency graph, baking                                                       | `packages/core/src/constraints`                               |
-| Armatures: pose evaluation, IK (FABRIK), bone constraints, skinning, automatic weights                                    | `packages/core/src/armature`                                  |
-| Collection instances and particle systems: distribution, expansion, export items                                          | `packages/core/src/instancing`                                |
-| Rigid bodies: shapes, broad and narrow phase, solver, simulation cache                                                    | `packages/core/src/physics`                                   |
-| Procedural textures, material presets, surface sampling, generated coordinates                                            | `packages/core/src/material`                                  |
-| Per-frame state and scene evaluation (`FrameState`, `SceneEvaluator`)                                                     | `packages/core/src/eval`                                      |
-| CPU rasterizer, sky, environment lighting, animation encoders (GIF, APNG, contact sheets)                                 | `packages/core/src/render`                                    |
-| Path tracer: scene compiler, BVH, BSDF, lights, integrator, film, denoiser, display                                       | `packages/core/src/render/pathtrace`                          |
-| Procedural generators and spatial queries (ray casts, drops, distances)                                                   | `packages/core/src/generate`                                  |
-| glTF, OBJ, STL, PLY import and export; procedural texture baking                                                          | `packages/core/src/io`                                        |
-| Sync protocol, WebDAV client, project store                                                                               | `packages/core/src/sync`, `packages/core/src/storage`         |
-| UI: layout, outliner, Properties tabs, dope sheet, timeline, dialogs                                                      | `apps/web/src/ui`                                             |
-| Keymap, menus, UI-only operators, operator runner, RPC handler                                                            | `apps/web/src/editor`                                         |
-| three.js viewport: scene mirroring, materials and procedural GLSL, sky, picking, modal transforms, brushes                | `apps/web/src/viewport`                                       |
-| Browser rendering: worker pool, progressive path tracing, animation rendering                                             | `apps/web/src/render`                                         |
-| Project session, local index, WebDAV storage, sync provider, telemetry, PWA                                               | `apps/web/src/project`, `storage`, `sync`, `telemetry`, `pwa` |
-| Server app, configuration, authentication                                                                                 | `apps/server/src/app.ts`, `config.ts`, `auth.ts`              |
-| Sync rooms and persistence                                                                                                | `apps/server/src/sync`, `apps/server/src/persistence`         |
-| MCP tools, instructions, scene summaries, operator groups                                                                 | `apps/server/src/mcp`                                         |
-| Render threads                                                                                                            | `apps/server/src/render`                                      |
-| REST API, WebDAV proxy, observability                                                                                     | `apps/server/src/api`, `dav`, `observability`                 |
+| Subsystem                                                                                                                                                                             | Location                                                      |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| Vectors, matrices, quaternions                                                                                                                                                        | `packages/core/src/math`                                      |
+| Mesh kernel: topology, normals, triangulation, UV projections, sculpt and paint dabs, shape key blending, edit operations                                                             | `packages/core/src/mesh` (edit operations in `mesh/ops`)      |
+| Document model: `SceneDoc`, datablock types and defaults                                                                                                                              | `packages/core/src/doc`                                       |
+| Operator registry and all built-in operators                                                                                                                                          | `packages/core/src/operators`                                 |
+| Modifier registry and the 22 modifier types                                                                                                                                           | `packages/core/src/modifiers`                                 |
+| F-curves, F-curve modifiers, drivers and their expression language, animatable data paths                                                                                             | `packages/core/src/anim`                                      |
+| Splines (Bezier, NURBS), curve-to-mesh (bevel, extrude, fill), built-in font, text layout, paths                                                                                      | `packages/core/src/curve`                                     |
+| Constraint catalogue and schemas, solvers, dependency graph, baking                                                                                                                   | `packages/core/src/constraints`                               |
+| Armatures: pose evaluation, IK (FABRIK), bone constraints, skinning, automatic weights                                                                                                | `packages/core/src/armature`                                  |
+| Collection instances and particle systems: distribution, expansion, export items                                                                                                      | `packages/core/src/instancing`                                |
+| Rigid bodies: shapes, broad and narrow phase, solver, simulation cache                                                                                                                | `packages/core/src/physics`                                   |
+| Procedural textures, material presets, surface sampling, generated coordinates                                                                                                        | `packages/core/src/material`                                  |
+| Per-frame state and scene evaluation (`FrameState`, `SceneEvaluator`)                                                                                                                 | `packages/core/src/eval`                                      |
+| CPU rasterizer, sky, environment lighting, animation encoders (GIF, APNG, contact sheets)                                                                                             | `packages/core/src/render`                                    |
+| Path tracer: scene compiler, BVH, BSDF, lights, integrator, film, denoiser, display                                                                                                   | `packages/core/src/render/pathtrace`                          |
+| Procedural generators and spatial queries (ray casts, drops, distances)                                                                                                               | `packages/core/src/generate`                                  |
+| glTF, OBJ, STL, PLY import and export; procedural texture baking                                                                                                                      | `packages/core/src/io`                                        |
+| Sync protocol, WebDAV client, project store                                                                                                                                           | `packages/core/src/sync`, `packages/core/src/storage`         |
+| UI: layout, outliner, Properties tabs, dope sheet, timeline, dialogs                                                                                                                  | `apps/web/src/ui`                                             |
+| Keymap, menus, UI-only operators, operator runner, RPC handler                                                                                                                        | `apps/web/src/editor`                                         |
+| three.js viewport: scene mirroring, materials and procedural GLSL, sky and world environment, colour management, glass layers, sun shadow fitting, picking, modal transforms, brushes | `apps/web/src/viewport`                                       |
+| Browser rendering: worker pool, progressive path tracing, animation rendering                                                                                                         | `apps/web/src/render`                                         |
+| Project session, local index, WebDAV storage, sync provider, telemetry, PWA                                                                                                           | `apps/web/src/project`, `storage`, `sync`, `telemetry`, `pwa` |
+| Server app, configuration, authentication                                                                                                                                             | `apps/server/src/app.ts`, `config.ts`, `auth.ts`              |
+| Sync rooms, unique project names and persistence                                                                                                                                      | `apps/server/src/sync`, `apps/server/src/persistence`         |
+| MCP tools, instructions, scene summaries, operator groups, editor commands, bounded undo histories                                                                                    | `apps/server/src/mcp`                                         |
+| Render threads (renders and exports), their CPU priority                                                                                                                              | `apps/server/src/render`                                      |
+| REST API, WebDAV proxy, observability                                                                                                                                                 | `apps/server/src/api`, `dav`, `observability`                 |
 
 ## Document model
 
@@ -128,6 +128,15 @@ someone else's work_. MCP agents get their own undo history per project. Session
 same agent id (`x-mcp-agent-id` header or `?agent=`) share one history and one editor state, so a
 CLI that opens a session per call can still undo its previous call; the history is kept for six
 hours after the last session ends.
+
+The server bounds every agent's history (`apps/server/src/mcp/history.ts`). A `Y.UndoManager`
+keeps everything a tracked change deleted so that undo can restore it, and Yjs never
+garbage-collects such items, so an agent that kept replacing large meshes used to make the
+server's replica (and the saved project) grow with its whole edit history. Each agent now keeps at
+most `MCP_UNDO_STEPS` steps (default 100) and `MCP_UNDO_MEMORY_MB` of replaced or deleted data
+(default 64 MB) per project, the newest step always included. Dropped steps, data created and
+deleted again within one step, and everything a history held when it ends (its session or agent id
+expired, the project was deleted or unloaded) are garbage-collected.
 
 ## Scene evaluation
 
@@ -196,8 +205,22 @@ The viewport (`apps/web/src/viewport`) mirrors the evaluated scene into three.js
 their evaluated geometry, `InstancedMesh`es for instances, line helpers for curves, empties, lights,
 cameras and bones. Materials are built from the Principled fields, with procedural textures
 compiled to GLSL (`procedural-glsl.ts`, the same functions the CPU renderers use). Shading modes:
-Wireframe, Solid, Material Preview (studio environment) and Rendered (scene lights with shadow
-maps, environment or procedural sky, mist, the render view transform and exposure).
+Wireframe, Solid, Material Preview (a studio HDRI, whatever the world) and Rendered (scene lights
+with shadow maps, the world's environment, procedural sky or colour, mist, the render view
+transform and exposure).
+
+Rendered shading and the browser's final renders (F12, Render Animation, MCP renders) are made to
+look like the core renderers: lamps get the intensities the CPU rasterizer and the path tracer use
+(Blender's watts and W/m², `scene-objects.ts`); exposure and the view transform are applied by an
+output pass with the core's curves (`view-transform.ts`) instead of three.js tone mapping; STUDIO
+and IMAGE worlds are sampled from the core's environment and lit with image-based lighting
+(`world-env.ts`); a scene without any light gets the core renderers' camera-relative studio rig.
+Glass is drawn from a picture of what lies behind it (`transmission.ts`), in levels so that glass
+seen through glass shows (up to three levels, one above about a million drawn triangles), with the
+refraction offset scaled to the object's size. A sun's shadow map is fitted to what the camera
+sees before every render (`sun-shadow.ts`). Final renders evaluate the document as it is, at the
+requested frame, for rendering: objects visible in renders (`hide_render`), modifiers, curves and
+particles with their render settings.
 
 ### Renderers
 
@@ -205,7 +228,11 @@ There are two render engines (`render.engine`):
 
 - **RASTER**: in the browser, WebGL with the Rendered look; on the server (and in tools without a
   browser), the CPU rasterizer in `packages/core/src/render` (Z-buffered triangles, Blender light
-  units, studio/image/sky lighting, procedural textures, sorted transparency, no shadows).
+  units, studio/image/sky lighting with prefiltered reflections, procedural textures, sorted
+  transparency, the view transform and exposure, Film > Transparent, no shadows). Glossy surfaces
+  also reflect the lit scene through one 32 px cube-map probe placed in front of what the image
+  centre shows and looked up by direction only (no parallax); meshes over 20,000 triangles are
+  drawn into it from coarse stand-ins. Neither rasterizer lights surfaces with emissive meshes.
 - **PATHTRACER**: the CPU path tracer in `packages/core/src/render/pathtrace`. `preparePathTrace`
   evaluates the scene and compiles it (one BVH per distinct mesh plus a top-level BVH over the
   instances, compiled materials, lamps and emissive triangles as light sources, an importance
@@ -216,7 +243,11 @@ There are two render engines (`render.engine`):
   and exposure. Samples are pure functions of
   pixel, sample index and seed, so without a time limit an image is identical however the work is
   split across threads. Rendering is progressive (passes of 1, 2, 4, 8, then 16 samples per pixel)
-  and can stop at a time limit after at least one sample per pixel.
+  and can stop at a time limit after at least one sample per pixel. Shadow rays treat glass and
+  alpha-transparent surfaces as thin sheets that tint and dim the light, so lamps inside glass light
+  their surroundings; glass reached from a diffuse or glossy vertex is thin-walled for that path
+  too, so caustics are not rendered, while the camera, mirrors and smooth glass still see
+  refraction (`integrator.ts`). Mist follows the camera path through glass and transparent layers.
 
 `renderSceneSoftware` (`render/index.ts`) dispatches between the two for headless callers, and
 `renderAnimation` (`render/animation.ts`) renders frame ranges into GIF, APNG, PNG sequences or
@@ -248,11 +279,17 @@ Server-side rendering (`apps/server/src/render`) serves the MCP tools `render_im
   cores, at most 8); one more worker is started on demand for quick raster renders. With
   `RENDER_WORKERS=0`, or when workers cannot start, a single "thread" runs the same engine on the
   main thread between event loop turns. Workers start lazily, warm up before taking work, drop
-  their document caches after two idle minutes and stop after ten.
+  their document caches after two idle minutes and stop after ten. On Linux they run at a lower
+  CPU priority (nice 10, `RENDER_WORKER_NICE`; `priority.ts`): they still use every core the main
+  thread leaves idle, but the main thread (HTTP, sync rooms, MCP, health checks) and the garbage
+  collector get a core as soon as they have work, which keeps `/healthz` answering quickly under
+  combined render load.
 - **Leasing.** Long renders (path-traced stills, animations) lease all render threads; up to two
   of them share the threads, which alternate between their tasks, and further ones wait in order.
   Quick raster renders lease one free thread (the extra worker or an idle one) and never wait for
-  long renders. At most two path-traced stills hold a film at a time.
+  long renders; so do exports (MCP `export_scene` and the REST export), since a glTF export samples
+  the animation frame by frame and bakes procedural textures, which takes seconds for large
+  scenes. At most two path-traced stills hold a film at a time.
 - **Documents.** The project's Yjs state is shared with the threads as an update; each thread
   caches up to three documents together with their `SceneEvaluator`, so geometry, instancing and
   simulation caches survive between renders. In scenes with an unbaked rigid-body simulation, one
@@ -278,11 +315,17 @@ Server-side rendering (`apps/server/src/render`) serves the MCP tools `render_im
   the Yjs document and relays the binary Yjs protocol and awareness between WebSocket clients
   (`/sync/:projectId`). Rooms load from and save to the persistence backend (debounced,
   `PERSIST_DEBOUNCE_MS`) and unload after `ROOM_IDLE_TTL_SECONDS` without clients. Rooms also carry
-  RPC requests from the server to browser editors (`render`, `ui`).
+  RPC requests from the server to browser editors (`render`, `ui`). Project names are unique on a
+  server, ignoring letter case: MCP `create_project` / `rename_project` and REST `POST` / `PATCH`
+  check them one request at a time (`project-names.ts`). Projects that browser editors create
+  (locally, then synced) and renames in the editor's Scene tab are not checked.
 - **MCP** (`apps/server/src/mcp`): a Streamable HTTP endpoint. Every MCP session is an agent that
   edits the room's replica through the same operator registry, with its own transaction origin,
-  undo history, editor state and presence (shown as "AI agent" in the editors). Scene summaries
-  (`scene-summary.ts`) report evaluated values next to stored ones. See [mcp.md](mcp.md).
+  undo history (bounded, see [Undo](#undo)), editor state and presence (shown as "AI agent" in
+  the editors). Tool arguments are checked strictly (`strict-args.ts`), and so are the commands
+  and parameter names of `editor_command` before they reach an editor (`editor-commands.ts`).
+  Scene summaries (`scene-summary.ts`) report evaluated values next to stored ones. See
+  [mcp.md](mcp.md).
 - **REST API** (`apps/server/src/api`): project listing and management, snapshots, exports,
   `render.png` and stored renders, `/api/config`, `/healthz`, `/readyz`, `/metrics`.
 

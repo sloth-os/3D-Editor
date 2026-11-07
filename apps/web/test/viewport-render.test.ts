@@ -20,6 +20,8 @@ import { renderOutputSize, type PathTraceOptions } from '../src/render';
 import { applyLensShift, sceneCameraView } from '../src/render/view';
 import {
   MAX_FRAMES_IN_FLIGHT,
+  SLOW_QUEUE_FRAME_MS,
+  MSAA_HEAVY_TRIANGLES,
   MSAA_OFF_FRAME_MS,
   MSAA_ON_FRAME_MS,
   VIEWPORT_MSAA_SAMPLES,
@@ -1169,6 +1171,29 @@ describe('heavy scenes in Rendered shading', () => {
     expect(light.skip).toBe(false);
   });
 
+  it('draws a heavy scene’s first frame without multisampling; fast frames bring it back', () => {
+    // regression: a heavy scene's first frames (shaders compiling, which says nothing about what a
+    // frame costs) were drawn with 4× MSAA: minutes in software WebGL
+    const heavy = engine(scatterScene(400));
+    const fences = fenceContext(heavy.gl);
+    const composer = (heavy.e as unknown as { composer: EffectComposer }).composer;
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    frame(heavy.e);
+    expect(heavy.e.objects.drawnTriangles()).toBeGreaterThan(MSAA_HEAVY_TRIANGLES);
+    expect(heavy.e.multisampling).toBe(false);
+    expect([composer.renderTarget1.samples, composer.renderTarget2.samples]).toEqual([0, 0]);
+    // a GPU draws it fast: multisampling comes back
+    now += MSAA_ON_FRAME_MS / 2;
+    fences[0].done = true;
+    frame(heavy.e);
+    expect(heavy.e.multisampling).toBe(true);
+    // a light scene starts with it
+    const light = engine(scatterScene(20));
+    frame(light.e);
+    expect(light.e.multisampling).toBe(true);
+  });
+
   it('draws one transmission picture in heavy scenes, levels for nested glass otherwise', () => {
     const glassScene = (count: number) => {
       const s = count ? scatterScene(count) : session();
@@ -1195,7 +1220,7 @@ describe('heavy scenes in Rendered shading', () => {
     expect(pictures(glassScene(400))).toBe(1);
   });
 
-  it('starts a change’s frame while the GPU draws the last one, queues no more, and says how long a slow frame took', () => {
+  it('starts a change’s frame while the GPU draws the last one, queues no more behind slow frames, and says how long a slow frame took', () => {
     // regressions: in software WebGL a heavy frame drew for minutes with frames queueing behind it
     // and nothing on screen saying so; then a change made while the GPU still drew the frame before
     // it waited for that frame, so a screenshot taken right after the change (an e2e test, an
@@ -1205,39 +1230,49 @@ describe('heavy scenes in Rendered shading', () => {
     const fences = fenceContext(gl);
     let now = 1000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const change = (ms: number) => {
+      now += ms;
+      e.requestRender();
+      frame(e);
+    };
     frame(e);
     expect(scenePasses(e, gl)).toHaveLength(1);
     expect(fences).toHaveLength(1);
-    // a change while the GPU is busy: its frame starts at once, behind the one being drawn
-    now += 500;
-    e.requestRender();
-    frame(e);
-    expect(MAX_FRAMES_IN_FLIGHT).toBe(2);
-    expect(scenePasses(e, gl)).toHaveLength(2);
-    // the view keeps changing: nothing more queues up behind those two
-    now += 4500;
-    e.requestRender();
-    frame(e);
-    frame(e);
-    expect(scenePasses(e, gl)).toHaveLength(2);
-    expect(fences).toHaveLength(2);
-    expect(slowFrameMs.value).toBe(0);
-    // the first frame is done after 12.5 s: the notice says how long it took, and the view as it is
-    // now is drawn next
-    now += 7500;
-    fences[0].done = true;
-    frame(e);
-    expect(slowFrameMs.value).toBe(12_500);
+    // fast frames: every change starts its frame at once
+    change(20);
+    change(20);
     expect(scenePasses(e, gl)).toHaveLength(3);
-    // the second one is done 3 s later: it took 3 s, not the 15 s since it was started
+    now += 20;
+    for (const f of fences) f.done = true;
+    frame(e);
+    expect(slowFrameMs.value).toBe(0);
+    // a slow frame (drawn for more than SLOW_QUEUE_FRAME_MS): a change still starts its frame behind
+    // it, and nothing more queues up behind those two
+    change(100);
+    expect(scenePasses(e, gl)).toHaveLength(4);
+    change(SLOW_QUEUE_FRAME_MS + 100);
+    expect(scenePasses(e, gl)).toHaveLength(5);
+    expect(MAX_FRAMES_IN_FLIGHT).toBe(2);
+    change(3500);
+    frame(e);
+    expect(scenePasses(e, gl)).toHaveLength(5);
+    expect(slowFrameMs.value).toBe(0);
+    // the slow frame is done 12.1 s after it started: the notice says so, and the view as it is now
+    // is drawn next
+    now += 7500;
+    fences[3].done = true;
+    frame(e);
+    expect(slowFrameMs.value).toBe(12_100);
+    expect(scenePasses(e, gl)).toHaveLength(6);
+    // the one behind it is done 3 s later: it took 3 s, not the 14 s since it was started
     now += 3000;
-    fences[1].done = true;
+    fences[4].done = true;
     frame(e);
     expect(slowFrameMs.value).toBe(3000);
-    expect(scenePasses(e, gl)).toHaveLength(3);
+    expect(scenePasses(e, gl)).toHaveLength(6);
     // a fast frame clears it
     now += SLOW_FRAME_MS / 4;
-    fences[2].done = true;
+    fences[5].done = true;
     frame(e);
     expect(slowFrameMs.value).toBe(0);
   });
@@ -1275,21 +1310,30 @@ describe('heavy scenes in Rendered shading', () => {
     expect(e.multisampling).toBe(true);
     expect(samples()).toEqual([VIEWPORT_MSAA_SAMPLES, VIEWPORT_MSAA_SAMPLES]);
     expect(scenePasses(e, gl)).toHaveLength(4);
-    // a frame that compiled shaders (the first one in Rendered shading) only counts as slow
+    // a slow frame that compiled shaders (the first one in Rendered shading) changes nothing: its
+    // time is the compiler's (regression: a light scene's first frames, slow while compiling, turned
+    // multisampling off and the next fast ones on again, so its edges changed between screenshots)
     gl.onRender = () => gl.info.programs.push({});
     finish(MSAA_ON_FRAME_MS / 2, true);
     gl.onRender = null;
     expect(scenePasses(e, gl)).toHaveLength(5);
     finish(SLOW_FRAME_MS + 1000);
-    expect(e.multisampling).toBe(false);
+    expect(e.multisampling).toBe(true);
     expect(slowFrameMs.value).toBe(SLOW_FRAME_MS + 1000);
     expect(slowFrameCompiled.value).toBe(true);
-    // the frame after it (drawn unasked, no new shaders) shows what the scene costs
-    expect(scenePasses(e, gl)).toHaveLength(6);
+    expect(scenePasses(e, gl)).toHaveLength(5);
+    // the frames after it show what the scene costs
+    e.requestRender();
+    frame(e);
+    finish(SLOW_FRAME_MS + 1000);
+    expect(e.multisampling).toBe(false);
+    expect(slowFrameCompiled.value).toBe(false);
+    expect(scenePasses(e, gl)).toHaveLength(7);
     finish(MSAA_ON_FRAME_MS / 2);
     expect(e.multisampling).toBe(true);
     expect(slowFrameMs.value).toBe(0);
-    expect(slowFrameCompiled.value).toBe(false);
+    // a light scene's frame slowed down for a moment (a busy machine) keeps it
+    expect(MSAA_OFF_FRAME_MS).toBeGreaterThanOrEqual(1000);
     // fast frames that compile shaders do not bring multisampling back
     gl.onRender = () => gl.info.programs.push({});
     finish(MSAA_OFF_FRAME_MS * 2);

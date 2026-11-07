@@ -36,6 +36,10 @@ protocol is Yjs sync + awareness (presence) plus JSON RPC and control frames
 - A device that was offline merges automatically when it reconnects.
 - Share a project with _File → Copy Share Link_; opening the link on another device joins the same
   live session (and, with WebDAV, the project also shows up in that device's project list).
+- Project names are unique on a server, ignoring letter case: MCP agents and the REST API cannot
+  create or rename a project to a name another project has. Projects created in a browser (also
+  offline) and renamed in the editor's Scene tab are synced as they are, so a duplicate name can
+  still appear; tools then refer to such a project by its id.
 
 `SYNC_PERSISTENCE` controls what the server does with live rooms: `memory` (rooms live while
 devices are connected plus `ROOM_IDLE_TTL_SECONDS`; browsers keep their own copies; lost when the
