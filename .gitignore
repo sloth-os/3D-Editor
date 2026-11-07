@@ -14,3 +14,4 @@ e2e/.cache/
 .vite/
 *.tsbuildinfo
 dev-dist/
+.vitest/

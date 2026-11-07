@@ -76,8 +76,9 @@ test.describe('curves and text', () => {
       .poll(async () => (await callJson(client, 'get_object', { project: id, object: 'Text' })).data)
       .toMatchObject({ kind: 'text', body: 'Hello\nWorld', evaluated: { triangles: text } });
 
-    // Object > Convert > Mesh: the same surface as an editable mesh
-    await expect(page.getByTestId('prop-tab-modifiers')).toHaveCount(0);
+    // Object > Convert > Mesh: the same surface as an editable mesh (text objects already have a
+    // Modifiers tab, as in Blender; the text body field goes away with the conversion)
+    await expect(page.getByTestId('prop-tab-modifiers')).toBeVisible();
     await menuPath(page, ['Object', 'Convert', 'Mesh']);
     await expect(page.getByTestId('prop-tab-modifiers')).toBeVisible();
     await expect(page.getByTestId('font-body')).toHaveCount(0);
