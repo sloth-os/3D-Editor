@@ -303,7 +303,12 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'view3d.toggle_shading',
       label: 'Viewport Shading',
-      description: 'Switch viewport shading: WIREFRAME, SOLID, MATERIAL preview or RENDERED.',
+      description:
+        'Switch viewport shading: WIREFRAME, SOLID, MATERIAL preview or RENDERED. Without GPU ' +
+        'acceleration (software WebGL, e.g. a headless browser) MATERIAL and RENDERED frames of a heavy ' +
+        'scene are slow: the first one compiles the shaders (can take tens of seconds), later ones take ' +
+        'seconds each and are drawn without anti-aliasing; the viewport info then shows "Slow viewport: ' +
+        'N s". SOLID is fast; render_image gives the final image.',
       category: 'View',
       ...ui,
       schema: z.object({ type: z.enum(['WIREFRAME', 'SOLID', 'MATERIAL', 'RENDERED']) }),

@@ -19,7 +19,11 @@ import * as THREE from 'three';
  * glass itself (the label in front of it) refracts nothing: it takes what lies straight behind the
  * glass. three.js's materials keep `transmission` 0, so its own pass never runs: the level-0 picture
  * replaces it, each further level costs one more render of the scene, and only frames where
- * transmissive objects overlap pay for them; at most {@link MAX_TRANSMISSION_LEVELS} levels.
+ * transmissive objects overlap pay for them; at most {@link MAX_TRANSMISSION_LEVELS} levels. A
+ * picture is only drawn where its objects read it ({@link lookupRect}: their screen area, widened by
+ * how far a lookup can move and by the blur of rough glass): a few panes of glass do not cost a
+ * second render of everything around them (lighthouse-cove's light beams in a sky of 2.5 M grass
+ * triangles: half of each viewport frame in software WebGL).
  *
  * three.js also offsets the refracted lookup by the material's `thickness` (how far light travels
  * inside the object). It is the object's size ({@link transmissionThickness}) instead of a fixed
@@ -46,6 +50,11 @@ export interface TransmissionUniforms {
   map: { value: THREE.Texture | null };
   depth: { value: THREE.Texture | null };
   size: { value: THREE.Vector2 };
+  /**
+   * How much the material blurs what it refracts, at most: three.js's roughness of the lookup,
+   * `roughness × clamp(2 × ior − 2, 0, 1)` (0 for clear glass; a roughness texture can reach 1).
+   */
+  blur: number;
 }
 
 /** three.js's transmission lookup (transmission_pars_fragment), validated against the picture's depth. */
@@ -113,16 +122,22 @@ export function patchTransmission(shader: { vertexShader: string; fragmentShader
 /**
  * Makes a transmissive physical material refract the pictures of {@link TransmissionLayers}: its
  * transmission moves into the material's own uniforms (three.js sees an opaque material and runs no
- * transmission pass of its own). Idempotent; materials without transmission are left alone.
+ * transmission pass of its own). `maxRoughness` is the most roughness its surface has (1 when a
+ * procedural texture sets it). Idempotent; materials without transmission are left alone.
  */
-export function installTransmissionLayer(material: THREE.MeshPhysicalMaterial): void {
+export function installTransmissionLayer(
+  material: THREE.MeshPhysicalMaterial,
+  maxRoughness = material.roughness,
+): void {
   if (material.userData[LAYER] || !(material.transmission > 0)) return;
+  const clamp01 = (v: number) => (Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 1);
   const u: TransmissionUniforms = {
     transmission: { value: material.transmission },
     thickness: { value: material.thickness },
     map: { value: null },
     depth: { value: null },
     size: { value: new THREE.Vector2(1, 1) },
+    blur: clamp01(maxRoughness) * clamp01(material.ior * 2 - 2),
   };
   material.userData[LAYER] = u;
   material.transmission = 0;
@@ -255,6 +270,76 @@ function screenRect(box: THREE.Box3, camera: THREE.Camera): [number, number, num
 const materialsOf = (m: THREE.Mesh): THREE.Material[] =>
   Array.isArray(m.material) ? m.material : [m.material];
 
+/** A mesh's bounding box in its own space (an instanced mesh's covers all its instances). */
+function localBox(m: THREE.Mesh): THREE.Box3 {
+  const im = m as THREE.InstancedMesh;
+  if (im.isInstancedMesh) {
+    if (!im.boundingBox) im.computeBoundingBox();
+    return im.boundingBox!.clone();
+  }
+  if (!m.geometry.boundingBox) m.geometry.computeBoundingBox();
+  return m.geometry.boundingBox!.clone();
+}
+
+/** A rectangle of a picture in pixels from its bottom left corner: x0, y0, x1, y1 (exclusive). */
+export type PixelRect = [number, number, number, number];
+
+/**
+ * Roughness three.js adds to every surface (at least 0.0525, more where the normal turns quickly
+ * from pixel to pixel), which blurs even clear glass's lookups a little.
+ */
+const GEOMETRY_BLUR = 0.1;
+
+/**
+ * Pixels around a lookup that a material with blur `blur` ({@link TransmissionUniforms.blur}) reads
+ * in a `width` pixels wide picture: three.js filters the picture's mip level `log2(width) × blur`
+ * bicubically (about three texels of 2^level pixels each way), and the depth check reads two
+ * pixels around it.
+ */
+export function blurMargin(width: number, blur: number): number {
+  return 8 + 6 * Math.pow(Math.max(1, width), Math.min(1, Math.max(0, blur)));
+}
+
+/**
+ * The part of a `width` × `height` picture an object's lookups read: its box seen by `camera`,
+ * widened by how far a lookup moves from the surface (three.js offsets it along the refracted ray
+ * by the material's `thickness`, scaled like the object) and by the blur of rough glass. Null when
+ * it may read any part of it (the box reaches behind the camera); an empty rectangle when it reads
+ * nothing (the object is off screen).
+ */
+export function lookupRect(
+  it: LayerItem,
+  camera: THREE.Camera,
+  width: number,
+  height: number,
+): PixelRect | null {
+  const scale = it.mesh.matrixWorld.getMaxScaleOnAxis();
+  let reach = 0;
+  let blur = 0;
+  for (const x of materialsOf(it.mesh)) {
+    const u = transmissionOf(x);
+    if (!u) continue;
+    reach = Math.max(reach, u.thickness.value * scale);
+    blur = Math.max(blur, u.blur);
+  }
+  const [x0, y0, x1, y1] = screenRect(it.box.clone().expandByScalar(reach), camera);
+  if (x0 <= -1 && y0 <= -1 && x1 >= 1 && y1 >= 1) return null;
+  // three.js roughens curved surfaces a little more where their normals turn quickly on screen
+  const m = Math.ceil(blurMargin(width, Math.min(1, blur + GEOMETRY_BLUR)));
+  /** A normalized device coordinate in pixels, `pad` more (clamped to the picture). */
+  const px = (ndc: number, size: number, pad: number) => {
+    const v = ((ndc + 1) / 2) * size;
+    return Math.min(size, Math.max(0, (pad < 0 ? Math.floor(v) : Math.ceil(v)) + pad));
+  };
+  return [px(x0, width, -m), px(y0, height, -m), px(x1, width, m), px(y1, height, m)];
+}
+
+/**
+ * Pictures that cover less than this part of the frame are drawn with a scissor (only there): over
+ * it, drawing all of it costs about the same.
+ */
+const SCISSOR_MAX_AREA = 0.75;
+
 /** Draws the pictures transmissive objects refract (see the module comment). */
 export class TransmissionLayers {
   private targets: THREE.WebGLRenderTarget[] = [];
@@ -262,6 +347,8 @@ export class TransmissionLayers {
   lastItems: LayerItem[] = [];
   /** Pictures drawn by the last {@link prepare}. */
   lastPictures = 0;
+  /** The part of each picture the last {@link prepare} drew (null: all of it; tests and diagnostics). */
+  lastRects: (PixelRect | null)[] = [];
 
   /**
    * Call right before rendering `scene` with `camera` into a `width` × `height` target: draws the
@@ -279,6 +366,8 @@ export class TransmissionLayers {
     clearAlpha = 1,
     maxLevels = MAX_TRANSMISSION_LEVELS,
   ): void {
+    // where the objects are now (three.js updates the matrices in render(), after this)
+    scene.updateMatrixWorld();
     camera.updateMatrixWorld();
     const eye = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
     const items: LayerItem[] = [];
@@ -287,19 +376,44 @@ export class TransmissionLayers {
       if ((o as THREE.Light).isLight && shadow) shadow.camera.layers.enable(HIDDEN_LAYER);
       const m = o as THREE.Mesh;
       if (!m.isMesh || !materialsOf(m).some(transmissionOf)) return;
-      if (!m.geometry.boundingBox) m.geometry.computeBoundingBox();
-      const box = m.geometry.boundingBox!.clone().applyMatrix4(m.matrixWorld);
+      const box = localBox(m).applyMatrix4(m.matrixWorld);
       if (box.isEmpty()) return;
       const centre = box.getCenter(new THREE.Vector3());
       items.push({ mesh: m, box, rect: screenRect(box, camera), distance: centre.distanceTo(eye), level: 0 });
     });
     this.lastItems = items;
     this.lastPictures = 0;
+    this.lastRects = [];
     if (!items.length) return;
     if (items.length <= MAX_LAYERED_OBJECTS && maxLevels > 1) assignLevels(items, maxLevels - 1);
     const top = Math.max(...items.map((it) => it.level));
     const w = Math.max(1, Math.round(width));
     const h = Math.max(1, Math.round(height));
+    // the part of each picture its objects read (a picture nobody on screen reads is not drawn)
+    const rects: (PixelRect | null)[] = [];
+    for (let l = 0; l <= top; l++) {
+      let union: PixelRect | null = [w, h, 0, 0];
+      for (const it of items) {
+        if (it.level !== l || !union) continue;
+        const r = lookupRect(it, camera, w, h);
+        if (!r) union = null;
+        else if (r[2] > r[0] && r[3] > r[1])
+          union = [
+            Math.min(union[0], r[0]),
+            Math.min(union[1], r[1]),
+            Math.max(union[2], r[2]),
+            Math.max(union[3], r[3]),
+          ];
+      }
+      if (
+        union &&
+        union[2] > union[0] &&
+        (union[2] - union[0]) * (union[3] - union[1]) > SCISSOR_MAX_AREA * w * h
+      )
+        union = null;
+      rects.push(union);
+    }
+    this.lastRects = rects;
     for (let l = 0; l <= top; l++) {
       let t = this.targets[l];
       if (!t) {
@@ -341,12 +455,27 @@ export class TransmissionLayers {
           else it.mesh.layers.mask = layers[i];
         });
         point(l - 1);
-        renderer.setRenderTarget(this.targets[l]);
+        const t = this.targets[l];
+        const r = rects[l];
+        // its objects are off screen: nothing reads it
+        if (r && !(r[2] > r[0] && r[3] > r[1])) continue;
+        t.scissorTest = false;
+        renderer.setRenderTarget(t);
+        if (r) {
+          // drawn only where its objects read it; around that it holds the clear colour (what the
+          // blur of rough glass may reach), not an older picture
+          renderer.clear();
+          t.scissor.set(r[0], r[1], r[2] - r[0], r[3] - r[1]);
+          t.scissorTest = true;
+          renderer.setRenderTarget(t);
+        }
         renderer.render(scene, camera);
+        t.scissorTest = false;
         this.lastPictures++;
       }
     } finally {
       items.forEach((it, i) => (it.mesh.layers.mask = layers[i]));
+      for (const t of this.targets) if (t) t.scissorTest = false;
       renderer.setRenderTarget(prevTarget);
       renderer.setClearColor(prevColor, prevAlpha);
     }

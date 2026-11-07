@@ -184,7 +184,7 @@ export function buildMaterial(
   const surface = proceduralSurface(d);
   if (surface) installProcedural(mat, d, surface, doc);
   // glass and liquids seen through other glass refract their own layer picture (transmission.ts)
-  if (mat.transmission > 0) installTransmissionLayer(mat);
+  if (mat.transmission > 0) installTransmissionLayer(mat, surface?.roughness ? 1 : mat.roughness);
   return mat;
 }
 

@@ -14,8 +14,11 @@ import { ViewportEngine } from '../src/viewport/engine';
 import { buildMaterial, TextureCache } from '../src/viewport/materials';
 import {
   HIDDEN_LAYER,
+  TransmissionLayers,
   assignLevels,
+  blurMargin,
   installTransmissionLayer,
+  lookupRect,
   patchTransmission,
   transmissionOf,
   transmissionThickness,
@@ -35,6 +38,8 @@ interface Draw {
   scene: unknown;
   target: unknown;
   drawn: string[];
+  /** The target's scissor rectangle (x, y, width, height) when it had the scissor test on. */
+  scissor: number[] | null;
 }
 
 vi.mock('three', async (importOriginal) => {
@@ -91,7 +96,9 @@ vi.mock('three', async (importOriginal) => {
         if (mats.some((x) => x?.userData?.pfxTransmission || (x as { transmission?: number }).transmission))
           drawn.push(String(m.userData.objectId ?? m.name));
       });
-      this.draws.push({ scene, target: this.target, drawn });
+      const t = this.target as InstanceType<typeof three.WebGLRenderTarget> | null;
+      const scissor = t?.scissorTest ? t.scissor.toArray() : null;
+      this.draws.push({ scene, target: this.target, drawn, scissor });
     }
     readRenderTargetPixels(_t: unknown, _x: number, _y: number, _w: number, _h: number, b: Uint8Array) {
       b.fill(0);
@@ -251,6 +258,153 @@ describe('transmission in the WebGL renders', () => {
     e.renderPixels({ width: 64, height: 48 });
     // the opaque scene, refracted by the bottle, then the image
     expect(gl.draws.filter((d) => d.scene === e.scene).map((d) => d.drawn.length)).toEqual([0, 1]);
+  });
+});
+
+describe('the part of a picture that is drawn', () => {
+  /*
+   * Regression: every frame rendered the whole scene again for the picture glass refracts, however
+   * little of the screen the glass covered: in lighthouse-cove (2.5 M grass triangles, two light
+   * beams and a lantern pane) that was half of each viewport frame in software WebGL.
+   */
+  /** A glass cube of `size` at `location` on a large floor, seen from 10 m above by the camera. */
+  function paneScene(
+    location: [number, number, number],
+    glass: Record<string, unknown> = {},
+  ): ProjectSession {
+    const s = session();
+    ok(s, 'mesh.primitive_plane_add', { name: 'Floor', size: 40 });
+    ok(s, 'mesh.primitive_cube_add', { name: 'Pane', size: 0.2, location });
+    material(s, 'Glass', ['Pane'], { transmission: 1, roughness: 0, ior: 1.5, ...glass });
+    ok(s, 'object.camera_add', { name: 'Cam', location: [0, 0, 10], rotation: [0, 0, 0] });
+    s.doc.updateScene({ camera: s.doc.findObjectByName('Cam')!.id });
+    s.doc.updateRender({ resolution_x: 400, resolution_y: 300, resolution_percentage: 100 });
+    return s;
+  }
+  const layersOf = (e: ViewportEngine) => (e as unknown as { transmission: TransmissionLayers }).transmission;
+  const area = (r: number[]) => r[2] * r[3];
+
+  it('is where the glass on screen reads it, not the whole frame', () => {
+    const s = paneScene([2.5, 1.5, 0.1]);
+    const { e, gl } = engine(s);
+    e.renderPixels({ width: 400, height: 300 });
+    const draws = gl.draws.filter((d) => d.scene === e.scene);
+    // the picture, drawn only around the pane, then the image itself, whole
+    expect(draws).toHaveLength(2);
+    const [x, y, w, h] = draws[0].scissor!;
+    // (the 20 cm pane, its 20 cm reach around it, and the blur margin: about 6 % of the frame)
+    expect(area([x, y, w, h])).toBeLessThan(0.08 * 400 * 300);
+    expect(draws[1].scissor).toBeNull();
+    // the pane is up and to the right of the centre; the rectangle holds all of it
+    const [nx0, ny0, nx1, ny1] = layersOf(e).lastItems[0].rect;
+    expect(x).toBeLessThanOrEqual(((nx0 + 1) / 2) * 400);
+    expect(y).toBeLessThanOrEqual(((ny0 + 1) / 2) * 300);
+    expect(x + w).toBeGreaterThanOrEqual(((nx1 + 1) / 2) * 400);
+    expect(y + h).toBeGreaterThanOrEqual(((ny1 + 1) / 2) * 300);
+    expect(x).toBeGreaterThan(200);
+    expect(y).toBeGreaterThan(150);
+    // the picture target is left without a scissor for the next frame
+    expect((draws[0].target as THREE.WebGLRenderTarget).scissorTest).toBe(false);
+  });
+
+  it('is larger around rough glass, which blurs what it shows', () => {
+    const clear = engine(paneScene([2.5, 1.5, 0.1]));
+    clear.e.renderPixels({ width: 400, height: 300 });
+    const frosted = engine(paneScene([2.5, 1.5, 0.1], { roughness: 0.4 }));
+    frosted.e.renderPixels({ width: 400, height: 300 });
+    const scissorOf = (x: { e: ViewportEngine; gl: { draws: Draw[] } }) =>
+      x.gl.draws.filter((d) => d.scene === x.e.scene)[0].scissor!;
+    expect(area(scissorOf(frosted))).toBeGreaterThan(4 * area(scissorOf(clear)));
+  });
+
+  it('is nothing when the glass is off screen', () => {
+    const s = paneScene([30, 0, 0.1]);
+    const { e, gl } = engine(s);
+    e.renderPixels({ width: 400, height: 300 });
+    // only the image: no picture is drawn for glass nobody sees
+    expect(gl.draws.filter((d) => d.scene === e.scene)).toHaveLength(1);
+    expect(layersOf(e).lastPictures).toBe(0);
+  });
+
+  it('is the object’s screen area widened by the light’s way through it and the blur of rough glass', () => {
+    const camera = new THREE.OrthographicCamera(-4, 4, 3, -3, 0.1, 100);
+    camera.position.set(0, 0, 10);
+    camera.updateMatrixWorld();
+    const glass = new THREE.MeshPhysicalMaterial({ transmission: 1, thickness: 0.5, roughness: 0, ior: 1.5 });
+    installTransmissionLayer(glass);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), glass);
+    mesh.updateMatrixWorld();
+    const it = {
+      mesh,
+      box: new THREE.Box3(new THREE.Vector3(-1, -1, -1), new THREE.Vector3(1, 1, 1)),
+      rect: [-0.25, -1 / 3, 0.25, 1 / 3],
+      distance: 10,
+      level: 0,
+    } as LayerItem;
+    // the box ±1 m widened by the thickness (0.5 m) is ±1.5 m: x 250–550 px, y 150–450 px, plus the
+    // margin clear glass blurs in
+    const m = Math.ceil(blurMargin(800, 0.1));
+    expect(m).toBeLessThan(25);
+    expect(lookupRect(it, camera, 800, 600)).toEqual([250 - m, 150 - m, 550 + m, 450 + m]);
+    // the thickness is scaled like the object: ±2 m
+    mesh.scale.setScalar(2);
+    mesh.updateMatrixWorld();
+    expect(lookupRect(it, camera, 800, 600)).toEqual([200 - m, 100 - m, 600 + m, 500 + m]);
+    // rough glass (roughness 0.6 at IOR 1.5) reads far around it
+    const rough = new THREE.MeshPhysicalMaterial({
+      transmission: 1,
+      thickness: 0.5,
+      roughness: 0.6,
+      ior: 1.5,
+    });
+    installTransmissionLayer(rough);
+    expect(transmissionOf(rough)!.blur).toBeCloseTo(0.6, 9);
+    mesh.material = rough;
+    expect(lookupRect(it, camera, 800, 600)).toEqual([0, 0, 800, 600]);
+    // a roughness texture can make any glass rough: its most roughness counts
+    const textured = new THREE.MeshPhysicalMaterial({ transmission: 1, roughness: 0.1, ior: 1.5 });
+    installTransmissionLayer(textured, 1);
+    expect(transmissionOf(textured)!.blur).toBe(1);
+    // IOR 1 bends nothing and blurs nothing (three.js: roughness × clamp(2 × ior − 2, 0, 1))
+    const air = new THREE.MeshPhysicalMaterial({ transmission: 1, roughness: 1, ior: 1 });
+    installTransmissionLayer(air);
+    expect(transmissionOf(air)!.blur).toBe(0);
+    // off screen: nothing
+    mesh.material = glass;
+    mesh.scale.setScalar(1);
+    mesh.updateMatrixWorld();
+    it.box.set(new THREE.Vector3(10, -1, -1), new THREE.Vector3(12, 1, 1));
+    const off = lookupRect(it, camera, 800, 600)!;
+    expect(off[2] > off[0] && off[3] > off[1]).toBe(false);
+    // a box reaching behind a perspective camera may cover any part of the view
+    const persp = new THREE.PerspectiveCamera(40, 4 / 3, 0.1, 100);
+    persp.position.set(0, 0, 0.5);
+    persp.updateMatrixWorld();
+    it.box.set(new THREE.Vector3(-1, -1, -1), new THREE.Vector3(1, 1, 1));
+    expect(lookupRect(it, persp, 800, 600)).toBeNull();
+  });
+
+  it('covers every instance of instanced glass', () => {
+    const geometry = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+    const glass = new THREE.MeshPhysicalMaterial({ transmission: 1, roughness: 0, ior: 1.5 });
+    installTransmissionLayer(glass);
+    const beads = new THREE.InstancedMesh(geometry, glass, 2);
+    beads.setMatrixAt(0, new THREE.Matrix4().makeTranslation(-3, 0, 0));
+    beads.setMatrixAt(1, new THREE.Matrix4().makeTranslation(3, 0, 0));
+    const scene = new THREE.Scene();
+    scene.add(beads);
+    scene.updateMatrixWorld();
+    const camera = new THREE.OrthographicCamera(-4, 4, 3, -3, 0.1, 100);
+    camera.position.set(0, 0, 10);
+    camera.updateMatrixWorld();
+    const layers = new TransmissionLayers();
+    layers.prepare(new THREE.WebGLRenderer(), scene, camera, 800, 600);
+    // regression: the box was the source geometry's, at the origin, so the picture would only have
+    // been drawn there
+    const box = layers.lastItems[0].box;
+    expect(box.min.x).toBeCloseTo(-3.05, 6);
+    expect(box.max.x).toBeCloseTo(3.05, 6);
+    layers.dispose();
   });
 });
 
