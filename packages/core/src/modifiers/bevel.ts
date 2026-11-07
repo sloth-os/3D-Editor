@@ -181,7 +181,12 @@ function norm(v: number[]): number {
  * corner − v), least squares (so pt is projected into the corner's plane); with `ab` the lengths of
  * those two edges.
  */
-function cornerCoords(m: MeshData, f: number, i: number, pt: number[]): { al: number; be: number; ab: number[] } {
+function cornerCoords(
+  m: MeshData,
+  f: number,
+  i: number,
+  pt: number[],
+): { al: number; be: number; ab: number[] } {
   const face = m.faces[f];
   const L = face.length;
   const v = face[i];
@@ -657,27 +662,25 @@ function bevelEdges(
     const [a, c] = topo.edges[e];
     return [dirFace.get(`${a},${c}`) ?? -1, dirFace.get(`${c},${a}`) ?? -1];
   };
-  /** Whether beveled edge e is convex: a corner of its second face lies below the first face's plane. */
+  /**
+   * Whether beveled edge e is convex: corners of its second face lie below the first face's plane and
+   * none above it (an edge between coplanar faces is not).
+   */
   const convexEdge = (e: number): boolean => {
     const [fa, fb] = stripFace(e);
     const [a] = topo.edges[e];
+    const tol = 1e-9 * edgeLen(e);
     let lowest = 0;
-    for (const x of m.faces[fb] ?? [])
-      lowest = Math.min(
-        lowest,
-        (P[x * 3] - P[a * 3]) * fn[fa * 3] +
-          (P[x * 3 + 1] - P[a * 3 + 1]) * fn[fa * 3 + 1] +
-          (P[x * 3 + 2] - P[a * 3 + 2]) * fn[fa * 3 + 2],
-      );
     let highest = 0;
-    for (const x of m.faces[fb] ?? [])
-      highest = Math.max(
-        highest,
+    for (const x of m.faces[fb] ?? []) {
+      const h =
         (P[x * 3] - P[a * 3]) * fn[fa * 3] +
-          (P[x * 3 + 1] - P[a * 3 + 1]) * fn[fa * 3 + 1] +
-          (P[x * 3 + 2] - P[a * 3 + 2]) * fn[fa * 3 + 2],
-      );
-    return lowest < 0 && highest <= 1e-9 * edgeLen(e);
+        (P[x * 3 + 1] - P[a * 3 + 1]) * fn[fa * 3 + 1] +
+        (P[x * 3 + 2] - P[a * 3 + 2]) * fn[fa * 3 + 2];
+      lowest = Math.min(lowest, h);
+      highest = Math.max(highest, h);
+    }
+    return lowest < -tol && highest <= tol;
   };
   const arcAt = (e: number, v: number): number[] => {
     const key = `${e}:${v}`;

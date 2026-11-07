@@ -1594,8 +1594,10 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'overlap) and the exact closest distance between the actual surfaces (meshes, curves, text and the ' +
         'geometry of collection instances) with the closest points (0 when they touch; intersecting=true when ' +
         'they cross). Surface distances are computed nearest pairs first within a time budget of about 3 s: ' +
-        'pairs left without one carry surface_distance_skipped, `surface_distances` gives {computed, skipped}, ' +
-        'and a WARNING says so (measure fewer objects at a time to get them all). More than 25 objects give no ' +
+        "pairs left without one carry surface_distance_skipped: 'time budget' (a WARNING says so; measure fewer " +
+        'objects at a time to get them all) or that an object has no surface geometry (empty, camera, light, ' +
+        'wire curve); `surface_distances` counts {computed, skipped (time budget), no_surface}, which add up to ' +
+        'the number of pairs. More than 25 objects give no ' +
         'pairs (`distances_skipped` says why). Units: metres. `frame` measures the scene at another frame ' +
         '(animated, driven or simulated objects) without changing the current frame.',
       category: 'Scene',
@@ -1686,24 +1688,42 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
               distances.push(entry);
             }
         }
-        // exact surface distances, nearest pairs (by bounding box gap) first, within a time budget
+        // exact surface distances, nearest pairs (by bounding box gap) first, within a time budget; every
+        // pair without one says why (surface_distance_skipped), and computed + skipped + no_surface
+        // counts all pairs
         let computed = 0;
         let skipped = 0;
+        let noSurface = 0;
         if (p.surface_distance && distances.length) {
           const deadline = Date.now() + MEASURE_SURFACE_BUDGET_MS;
           const order = distances
             .map((e, k) => ({ e, k }))
             .sort((x, y) => (x.e.bounds_gap as number) - (y.e.bounds_gap as number) || x.k - y.k);
+          /** The pair's object without surface geometry (empty, camera, light, wire curve), if any. */
+          const surfaceless = (e: Record<string, unknown>, built: boolean): string | null => {
+            for (const key of ['a', 'b'] as const) {
+              const id = e[key] as string;
+              if (built ? !trianglesOf(id) : !scene.hasGeometry(id)) return e[`${key}_name`] as string;
+            }
+            return null;
+          };
           for (const { e } of order) {
-            if (Date.now() > deadline) {
+            let none = surfaceless(e, false);
+            if (none === null && Date.now() > deadline) {
               e.surface_distance_skipped = 'time budget';
               skipped++;
               continue;
             }
-            const ta = trianglesOf(e.a as string);
-            const tb = ta ? trianglesOf(e.b as string) : null;
-            const d = ta && tb ? triangleSetDistance(ta, tb) : null;
-            if (!d) continue; // an object without surface geometry (empty, camera, light)
+            none ??= surfaceless(e, true);
+            const d =
+              none === null
+                ? triangleSetDistance(trianglesOf(e.a as string)!, trianglesOf(e.b as string)!)
+                : null;
+            if (!d) {
+              e.surface_distance_skipped = `'${none}' has no surface geometry (faces)`;
+              noSurface++;
+              continue;
+            }
             e.surface_distance = round(d.distance);
             e.closest_points = [r3(d.pointA), r3(d.pointB)];
             e.intersecting = d.intersecting;
@@ -1712,8 +1732,9 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           if (skipped)
             ctx.report(
               'WARNING',
-              `scene.measure: surface distances computed for ${computed} of ${computed + skipped} pairs ` +
-                `(time budget); the others have surface_distance_skipped (measure fewer objects at a time)`,
+              `scene.measure: surface distances computed for ${computed} of the ${computed + skipped} pairs ` +
+                `of objects with surfaces (time budget); the others have surface_distance_skipped 'time budget' ` +
+                `(measure fewer objects at a time)`,
             );
         }
         const tooMany = ids.length > MEASURE_MAX_PAIR_OBJECTS;
@@ -1729,7 +1750,9 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
             ? null
             : { ...boundsOut(all), center: r3(boundsCenter(all)), size: r3(boundsSize(all)) },
           ...(ids.length >= 2 && !tooMany ? { distances } : {}),
-          ...(p.surface_distance && distances.length ? { surface_distances: { computed, skipped } } : {}),
+          ...(p.surface_distance && distances.length
+            ? { surface_distances: { computed, skipped, no_surface: noSurface } }
+            : {}),
           ...(tooMany
             ? {
                 distances_skipped: `${ids.length} objects: pairwise distances need at most ${MEASURE_MAX_PAIR_OBJECTS} objects`,

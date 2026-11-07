@@ -1116,6 +1116,31 @@ describe('heavy scenes in Rendered shading', () => {
     );
   });
 
+  it('redraws other people’s selection boxes without syncing the scene', () => {
+    // regression: any presence change (this client's own frame or view, someone else's cursor) synced
+    // the whole scene, which also redrew the point and spot light shadow maps
+    const s = session();
+    s.view.shading.value = 'RENDERED';
+    const { e, gl } = engine(s);
+    frame(e);
+    const syncs = vi.spyOn(e, 'sync');
+    const cube = s.doc.listObjects().find((o) => o.type === 'MESH')!;
+    (s.peers as unknown as { value: unknown[] }).value = [
+      { clientId: 7, state: { user: { name: 'Ada', color: '#f00' }, selection: [cube.id] } },
+    ];
+    frame(e);
+    expect(syncs).not.toHaveBeenCalled();
+    expect(scenePasses(e, gl)).toHaveLength(2);
+    expect(shadowPasses(e, gl)).toHaveLength(1);
+    // Ada's selection box is drawn
+    const boxes = (e as unknown as { peerBoxes: THREE.Group }).peerBoxes;
+    expect(boxes.children).toHaveLength(1);
+    (s.peers as unknown as { value: unknown[] }).value = [];
+    frame(e);
+    expect(boxes.children).toHaveLength(0);
+    expect(syncs).not.toHaveBeenCalled();
+  });
+
   it('leaves big instance scatters out of point and spot light shadows; they keep the sun’s', () => {
     // regression: lighthouse-cove's 2.5 M instance triangles were drawn 14 times more per frame for the
     // shadow maps of two point lights (six cube faces each) and two spot lights

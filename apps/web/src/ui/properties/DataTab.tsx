@@ -1,6 +1,6 @@
 import { signal } from '@preact/signals';
 import { useEffect, useRef, useState } from 'preact/hooks';
-import type { ComponentChildren } from 'preact';
+import { Fragment, type ComponentChildren } from 'preact';
 import {
   BONE_CONSTRAINT_LABELS,
   decodeFloat32,
@@ -1639,46 +1639,50 @@ function BoneIkPanel({
         const limited = flag(`use_ik_limit_${a}`);
         const locked = flag(`lock_ik_${a}`);
         const A = a.toUpperCase();
+        const title = `Keep the IK rotation about ${A}, measured from the rest pose, between Min and Max`;
+        // Blender's Limit X / Min X / Max X: the checkbox on its row, the angles below it at full width
         return (
-          <Row
-            key={a}
-            label={`Limit ${A}`}
-            title={`Keep the IK rotation about ${A}, measured from the rest pose, between Min and Max`}
-          >
-            <div style={{ display: 'flex', gap: '4px', alignItems: 'center', ...dim(!locked) }}>
-              <Checkbox
-                value={limited}
-                testId={`pose-ik-limit-${a}`}
-                onChange={(v) => set({ [`use_ik_limit_${a}`]: v })}
-              />
-              <div style={{ flex: 1, minWidth: 0, ...dim(limited) }}>
-                <NumberField
-                  label="Min"
-                  value={num(`ik_min_${a}`, -Math.PI, -Math.PI, 0)}
-                  min={-Math.PI}
-                  max={0}
-                  unit="°"
-                  step={1}
-                  {...RAD}
-                  testId={`pose-ik-min-${a}`}
-                  onChange={(v, f) => setNumber(`ik_min_${a}`, v, f)}
+          <Fragment key={a}>
+            <Row label={`Limit ${A}`} title={title}>
+              <div style={dim(!locked)}>
+                <Checkbox
+                  value={limited}
+                  testId={`pose-ik-limit-${a}`}
+                  onChange={(v) => set({ [`use_ik_limit_${a}`]: v })}
                 />
               </div>
-              <div style={{ flex: 1, minWidth: 0, ...dim(limited) }}>
-                <NumberField
-                  label="Max"
-                  value={num(`ik_max_${a}`, Math.PI, 0, Math.PI)}
-                  min={0}
-                  max={Math.PI}
-                  unit="°"
-                  step={1}
-                  {...RAD}
-                  testId={`pose-ik-max-${a}`}
-                  onChange={(v, f) => setNumber(`ik_max_${a}`, v, f)}
-                />
+            </Row>
+            <Row label="" title={title}>
+              <div style={{ display: 'flex', gap: '4px', ...dim(limited && !locked) }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <NumberField
+                    label="Min"
+                    value={num(`ik_min_${a}`, -Math.PI, -Math.PI, 0)}
+                    min={-Math.PI}
+                    max={0}
+                    unit="°"
+                    step={1}
+                    {...RAD}
+                    testId={`pose-ik-min-${a}`}
+                    onChange={(v, f) => setNumber(`ik_min_${a}`, v, f)}
+                  />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <NumberField
+                    label="Max"
+                    value={num(`ik_max_${a}`, Math.PI, 0, Math.PI)}
+                    min={0}
+                    max={Math.PI}
+                    unit="°"
+                    step={1}
+                    {...RAD}
+                    testId={`pose-ik-max-${a}`}
+                    onChange={(v, f) => setNumber(`ik_max_${a}`, v, f)}
+                  />
+                </div>
               </div>
-            </div>
-          </Row>
+            </Row>
+          </Fragment>
         );
       })}
     </Panel>

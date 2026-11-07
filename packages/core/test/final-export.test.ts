@@ -238,8 +238,18 @@ describe('glTF export: animation of objects on curved paths', () => {
     });
     // a moon on a fast orbit in the same scene still gets keys between the frames
     run('mesh.primitive_uv_sphere_add', { name: 'Moon', radius: 0.005 });
-    run('anim.driver_add', { target: 'Moon', path: 'location', index: 0, expression: 'cos(frame * pi / 4) * 0.05' });
-    run('anim.driver_add', { target: 'Moon', path: 'location', index: 1, expression: 'sin(frame * pi / 4) * 0.05' });
+    run('anim.driver_add', {
+      target: 'Moon',
+      path: 'location',
+      index: 0,
+      expression: 'cos(frame * pi / 4) * 0.05',
+    });
+    run('anim.driver_add', {
+      target: 'Moon',
+      path: 'location',
+      index: 1,
+      expression: 'sin(frame * pi / 4) * 0.05',
+    });
     const res = exportScene(doc, 'glb');
     const { json, bin } = parseGltf(res.data);
     const keys = (name: string) => {

@@ -4,7 +4,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import { effect } from '@preact/signals';
+import { effect, untracked } from '@preact/signals';
 import {
   SceneEvaluator,
   cameraFovY,
@@ -326,8 +326,14 @@ export class ViewportEngine {
         void v.showGrid.value;
         void v.tool.value;
         void v.snapping.value;
-        void s.peers.value;
         this.invalidate();
+      }),
+      // other people's selections only move their boxes: no scene sync (a full one redraws the
+      // point and spot light shadow maps, seconds in software WebGL)
+      effect(() => {
+        void s.peers.value;
+        untracked(() => this.syncPeers());
+        this.requestRender();
       }),
       effect(() => {
         void st.$cursorLocation.value;

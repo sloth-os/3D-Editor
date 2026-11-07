@@ -52,8 +52,32 @@ describe('scene.measure with many objects', () => {
     for (const d of r.distances) expect(typeof d.surface_distance).toBe('number');
     const near = r.distances.find((d: any) => d.a_name === 'Ball.0' && d.b_name === 'Ball.1');
     expect(near.surface_distance).toBeCloseTo(0.2, 2);
-    expect(r.surface_distances).toEqual({ computed: 36, skipped: 0 });
+    expect(r.surface_distances).toEqual({ computed: 36, skipped: 0, no_surface: 0 });
     expect(reports.filter((m) => m.startsWith('WARNING'))).toEqual([]);
+  });
+
+  it('accounts for every pair: pairs with an object without surface geometry say so', () => {
+    // verifier repro: 25 orrery objects gave 300 pairs but surface_distances {computed: 153, skipped: 0}
+    const { run, reports } = setup();
+    run('mesh.primitive_cube_add', { name: 'Box', size: 0.5 });
+    run('mesh.primitive_uv_sphere_add', { name: 'Ball', radius: 0.25, location: [1, 0, 0] });
+    run('object.camera_add', { name: 'Cam', location: [0, -3, 1] });
+    run('object.light_add', { type: 'POINT', name: 'Lamp', location: [0, 0, 2] });
+    run('object.empty_add', { name: 'Marker', location: [2, 0, 0] });
+    const r = run('scene.measure', { objects: ['Box', 'Ball', 'Cam', 'Lamp', 'Marker'] });
+    expect(r.distances.length).toBe(10);
+    expect(r.surface_distances).toEqual({ computed: 1, skipped: 0, no_surface: 9 });
+    const { computed, skipped, no_surface } = r.surface_distances;
+    expect(computed + skipped + no_surface).toBe(r.distances.length);
+    for (const d of r.distances) {
+      if (d.a_name === 'Box' && d.b_name === 'Ball') expect(d.surface_distance).toBeCloseTo(0.5, 3);
+      else {
+        expect(d.surface_distance).toBeUndefined();
+        expect(d.surface_distance_skipped).toMatch(/'(Cam|Lamp|Marker)' has no surface geometry/);
+      }
+    }
+    expect(reports.filter((m) => m.startsWith('WARNING'))).toEqual([]);
+    expect(r.objects.find((o: any) => o.name === 'Lamp').has_geometry).toBe(false);
   });
 
   it('says so when there are too many objects for pairs', () => {
@@ -256,5 +280,16 @@ describe('collision shapes', () => {
     run('rigidbody.describe', { frame: 6 });
     expect(collisionShapeCacheSize()).toBe(before);
     void doc;
+  });
+});
+
+describe('render.render_software description (verifier note)', () => {
+  it("says that it renders with the scene's engine, not always as the RASTER preview", () => {
+    const def = createOperatorRegistry().get('render.render_software')!;
+    // the operator passes no engine: with render.engine PATHTRACER it path-traces, shadows included
+    expect(def.description).not.toMatch(/This is the RASTER preview/);
+    expect(def.description).toMatch(/scene's render engine \(render\.engine\)/);
+    expect(def.description).toMatch(/PATHTRACER path-traces/);
+    expect(def.description).toMatch(/RASTER is the preview rasterizer: no shadows/);
   });
 });

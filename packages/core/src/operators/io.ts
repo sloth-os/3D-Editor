@@ -199,7 +199,7 @@ export function registerIOOperators(reg: OperatorRegistry): void {
       id: 'render.render_software',
       label: 'Render Image (Software)',
       description:
-        'Render the scene on the CPU and return a PNG ({ mime, data_base64, width, height }). Camera: the given camera, else the scene camera, else an automatic view of all objects. Size defaults to the render resolution scaled to fit 800 px. This is the RASTER preview: no shadows, and glossy reflections come from one reflection probe in front of what the image centre shows, looked up by direction only, so water, floors and large tables far from it can show reflections the path tracer does not (judge reflections with a PATHTRACER render).',
+        "Render the scene on the CPU with the scene's render engine (render.engine) and return a PNG ({ mime, data_base64, width, height }). Camera: the given camera, else the scene camera, else an automatic view of all objects. Size defaults to the render resolution scaled to fit 800 px. PATHTRACER path-traces with the scene's sample settings (shadows, reflections, refraction); shading SOLID and wireframe always rasterize. RASTER is the preview rasterizer: no shadows, and glossy reflections come from one reflection probe in front of what the image centre shows, looked up by direction only, so water, floors and large tables far from it can show reflections the path tracer does not (judge reflections with PATHTRACER).",
       category: 'Render',
       undo: false,
       schema: z.object({
@@ -211,7 +211,9 @@ export function registerIOOperators(reg: OperatorRegistry): void {
         samples: z
           .union([z.literal(1), z.literal(2), z.literal(4)])
           .default(2)
-          .describe('Supersampling factor (anti-aliasing)'),
+          .describe(
+            'Supersampling factor (anti-aliasing) of RASTER renders (PATHTRACER uses the scene samples)',
+          ),
         frame: z.number().optional().describe('Frame to render (default: current frame)'),
       }),
       execute(ctx, p) {

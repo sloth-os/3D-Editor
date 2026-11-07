@@ -244,6 +244,11 @@ export class ProjectSession {
   }
   private pendingView: PresenceState['view'] | undefined;
 
+  /**
+   * Publishes the other clients' presences when they changed. Awareness also reports changes of this
+   * client's own presence (sent with every frame change, selection and view move): those leave
+   * `peers` as it is, so what depends on it (the viewport's peer boxes) is not redrawn for nothing.
+   */
   private refreshPeers(): void {
     const out: PeerInfo[] = [];
     for (const [clientId, st] of this.awareness.getStates()) {
@@ -251,6 +256,12 @@ export class ProjectSession {
       const state = st as PresenceState;
       if (state?.user) out.push({ clientId, state });
     }
+    const prev = this.peers.value;
+    if (
+      prev.length === out.length &&
+      prev.every((p, i) => p.clientId === out[i].clientId && p.state === out[i].state)
+    )
+      return;
     this.peers.value = out;
   }
 
