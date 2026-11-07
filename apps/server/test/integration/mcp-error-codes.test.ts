@@ -209,7 +209,9 @@ describe('run_operator: every failure is the message plus JSON with a code', () 
       "'view3d.view_all' is an operator of the browser editor's user interface (viewport, playback, tools, windows): " +
         'only a live editor can run it, not run_operator, batch or edit_mesh. Run it there with editor_command ' +
         "{project, command: 'run_operator', params: {operator: 'view3d.view_all', params: {…}}} " +
-        '(get_connected_clients lists the editors that have the project open).',
+        '(get_connected_clients lists the editors that have the project open): it frames every visible object in ' +
+        "that editor's viewport, changing the person's view, out of the camera view (editor_command " +
+        'view.frame_all does the same).',
     );
     expect(view.json).toEqual({
       ok: false,
@@ -462,12 +464,12 @@ describe('browser UI operators an agent means as an edit', () => {
       [
         'run_operator',
         { operator: 'view3d.transform_modal', params: { mode: 'translate' } },
-        /To move, rotate or scale use transform\.translate \{value\}, transform\.rotate \{value, orient_axis\} or transform\.resize \{value\} on your selection .*: it starts a move, rotation or scale of the editor's selection that follows the person's mouse\.$/,
+        /To move, rotate or scale use transform\.translate \{value\}, transform\.rotate \{value, orient_axis\} or transform\.resize \{value\} on your selection .*: it starts a move, rotation or scale of the editor's selection that follows the person's mouse until they click\.$/,
       ],
       [
         'edit_mesh',
         { object: 'Cube', operator: 'mesh.loopcut_pick' },
-        /To cut a loop use edit_mesh \{object, operator: 'mesh\.loopcut', params: \{edge: \[a, b\], number_cuts\}\}.*: it cuts the edge ring under the person's mouse pointer\.$/,
+        /To cut a loop use edit_mesh \{object, operator: 'mesh\.loopcut', params: \{edge: \[a, b\], number_cuts\}\}.*: in Edit Mode it cuts the edge ring of the editor's active mesh under the person's mouse pointer, and fails when the pointer is over no edge\.$/,
       ],
     ];
     for (const [tool, args, message] of cases) {
@@ -624,6 +626,428 @@ describe('misspelled browser UI operator ids are suggested', () => {
   });
 });
 
+describe('edges that are not edges of the mesh', () => {
+  /** A pair of vertices of the default cube that no edge connects: the diagonal of its first face. */
+  async function diagonal(project: string): Promise<[number, number]> {
+    const data = await ok('get_mesh_data', { project, object: 'Cube' });
+    const face = data.faces[0] as number[];
+    return [face[0], face[2]];
+  }
+  const HINT =
+    'an edge joins two vertices that follow each other in one of the faces get_mesh_data lists (the last ' +
+    "with the first), or is one of its loose_edges (include: ['loose_edges'])";
+
+  it('are refused in run_operator, batch and edit_mesh, in EDGE and VERT mode, and change nothing', async () => {
+    const { id } = await ok('create_project', { name: 'Edge selections' });
+    // a known Edit Mode element selection (one face) that a refused selection must keep
+    await ok('run_operator', {
+      project: id,
+      operator: 'scene.stats',
+      selection: { objects: ['Cube'], mode: 'EDIT', mesh: { faces: [1] } },
+    });
+    const before = await state(id);
+    expect(before).toMatchObject({ mode: 'EDIT', mesh: { select_mode: 'FACE', faces: 1 } });
+    const [a, c] = await diagonal(id);
+    const message = `edge [${a}, ${c}]: vertices ${a} and ${c} are not connected by an edge of the mesh: ${HINT}`;
+    for (const mesh of [{ edges: [[a, c]] }, { edges: [[a, c]], select_mode: 'VERT' }]) {
+      // mesh.delete would delete the selected elements if any of the selection were applied
+      const f = await failed('run_operator', {
+        project: id,
+        operator: 'mesh.delete',
+        selection: { objects: ['Cube'], mode: 'EDIT', mesh },
+      });
+      expect(f.message, JSON.stringify(mesh)).toBe(message);
+      expect(f.json).toEqual({
+        ok: false,
+        operator: 'mesh.delete',
+        error: message,
+        code: 'POLL_FAILED',
+        selection: before,
+      });
+      expect(await state(id)).toEqual(before);
+    }
+    const res = await call('batch', {
+      project: id,
+      operations: [
+        {
+          operator: 'mesh.delete',
+          selection: { objects: ['Cube'], mode: 'EDIT', mesh: { edges: [[c, a]] } },
+        },
+      ],
+    });
+    expect(res.raw.isError).toBe(true);
+    const out = JSON.parse(res.text.slice(res.text.indexOf('\n') + 1));
+    expect(out.results).toEqual([
+      {
+        operator: 'mesh.delete',
+        ok: false,
+        error: `selection: edge [${c}, ${a}]: vertices ${c} and ${a} are not connected by an edge of the mesh: ${HINT}`,
+        code: 'POLL_FAILED',
+      },
+    ]);
+    expect(out.selection).toEqual(before);
+    for (const selection of [{ edges: [[a, c]] }, { edges: [[a, c]], all: false }]) {
+      for (const select_mode of [undefined, 'VERT', 'EDGE']) {
+        const e = await failed('edit_mesh', {
+          project: id,
+          object: 'Cube',
+          operator: 'mesh.delete',
+          selection,
+          ...(select_mode ? { select_mode } : {}),
+        });
+        expect(e.message).toBe(message);
+        expect(e.json).toEqual({
+          ok: false,
+          operator: 'mesh.delete',
+          error: message,
+          code: 'POLL_FAILED',
+          selection: before,
+        });
+      }
+    }
+    // the same vertex twice
+    const same = await failed('edit_mesh', {
+      project: id,
+      object: 'Cube',
+      operator: 'mesh.delete',
+      selection: { edges: [[a, a]] },
+    });
+    expect(same.message).toBe(`edge [${a}, ${a}] names vertex ${a} twice: ${HINT}`);
+    expect(same.json.code).toBe('POLL_FAILED');
+    expect(await state(id)).toEqual(before);
+    expect((await ok('get_object', { project: id, object: 'Cube' })).data).toMatchObject({
+      vertices: 8,
+      faces: 6,
+    });
+    // an edge of the mesh is still fine, in either order
+    const face = (await ok('get_mesh_data', { project: id, object: 'Cube' })).faces[0] as number[];
+    const edge = await ok('edit_mesh', {
+      project: id,
+      object: 'Cube',
+      operator: 'scene.stats',
+      selection: { edges: [[face[1], face[0]]] },
+    });
+    expect(edge.selection_after).toMatchObject({
+      select_mode: 'EDGE',
+      verts: [face[0], face[1]].sort((x, y) => x - y),
+    });
+  });
+
+  it('loose (wire) edges are edges', async () => {
+    const { id } = await ok('create_project', { name: 'Wire edges', empty: true });
+    await ok('create_mesh', {
+      project: id,
+      name: 'Wire',
+      vertices: [
+        [0, 0, 0],
+        [1, 0, 0],
+        [2, 0, 0],
+      ],
+      edges: [
+        [0, 1],
+        [1, 2],
+      ],
+    });
+    const moved = await ok('edit_mesh', {
+      project: id,
+      object: 'Wire',
+      operator: 'transform.translate',
+      params: { value: [0, 0, 1] },
+      selection: { edges: [[2, 1]] },
+    });
+    expect(moved.ok).toBe(true);
+    const data = await ok('get_mesh_data', { project: id, object: 'Wire' });
+    expect(data.vertices).toEqual([
+      [0, 0, 0],
+      [1, 0, 1],
+      [2, 0, 1],
+    ]);
+    const f = await failed('edit_mesh', {
+      project: id,
+      object: 'Wire',
+      operator: 'transform.translate',
+      params: { value: [0, 0, 1] },
+      selection: { edges: [[0, 2]] },
+    });
+    expect(f.message).toBe(`edge [0, 2]: vertices 0 and 2 are not connected by an edge of the mesh: ${HINT}`);
+    expect(f.json.code).toBe('POLL_FAILED');
+    expect((await ok('get_mesh_data', { project: id, object: 'Wire' })).vertices).toEqual(data.vertices);
+  });
+});
+
+describe('selection lists that the select mode would not use', () => {
+  it('are refused in run_operator, batch and edit_mesh, like all: true with lists, and change nothing', async () => {
+    const { id } = await ok('create_project', { name: 'Select mode lists' });
+    // a known Edit Mode element selection (one face) that a refused selection must keep
+    await ok('run_operator', {
+      project: id,
+      operator: 'scene.stats',
+      selection: { objects: ['Cube'], mode: 'EDIT', mesh: { faces: [1] } },
+    });
+    const before = await state(id);
+    expect(before).toMatchObject({ mode: 'EDIT', mesh: { select_mode: 'FACE', faces: 1 } });
+    const face = (await ok('get_mesh_data', { project: id, object: 'Cube' })).faces[0] as number[];
+    const edge = [face[0], face[1]];
+    const VERT =
+      "leave select_mode out (or pass 'VERT') to select the listed vertices with the vertices of the listed " +
+      'edges and faces';
+    const cases: [Record<string, unknown>, string][] = [
+      [
+        { verts: [0, 1], select_mode: 'FACE' },
+        `select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: list only faces, or ${VERT}`,
+      ],
+      [
+        { verts: [0], edges: [edge], faces: [0], select_mode: 'FACE' },
+        `select_mode 'FACE' selects only the listed faces, so the listed verts and edges would be ignored: list only faces, or ${VERT}`,
+      ],
+      [
+        { edges: [edge], faces: [0], select_mode: 'EDGE' },
+        `select_mode 'EDGE' selects only the listed edges, so the listed faces would be ignored: list only edges, or ${VERT}`,
+      ],
+      [
+        { faces: [0], all: true },
+        'all: true selects every element, so the listed faces would change nothing: leave all out to select ' +
+          'only the listed elements, or leave the lists out to select everything',
+      ],
+      [
+        { verts: [0], edges: [edge], all: true, select_mode: 'VERT' },
+        'all: true selects every element, so the listed verts and edges would change nothing: leave all out to ' +
+          'select only the listed elements, or leave the lists out to select everything',
+      ],
+    ];
+    for (const [mesh, message] of cases) {
+      // mesh.delete would delete the selected elements if any of the selection were applied
+      const f = await failed('run_operator', {
+        project: id,
+        operator: 'mesh.delete',
+        selection: { objects: ['Cube'], mode: 'EDIT', mesh },
+      });
+      expect(f.message, JSON.stringify(mesh)).toBe(message);
+      expect(f.json).toEqual({
+        ok: false,
+        operator: 'mesh.delete',
+        error: message,
+        code: 'POLL_FAILED',
+        selection: before,
+      });
+      const res = await call('batch', {
+        project: id,
+        operations: [{ operator: 'mesh.delete', selection: { objects: ['Cube'], mode: 'EDIT', mesh } }],
+      });
+      expect(res.raw.isError).toBe(true);
+      const out = JSON.parse(res.text.slice(res.text.indexOf('\n') + 1));
+      expect(out.results).toEqual([
+        { operator: 'mesh.delete', ok: false, error: `selection: ${message}`, code: 'POLL_FAILED' },
+      ]);
+      // edit_mesh takes select_mode next to the selection
+      const { select_mode, ...selection } = mesh;
+      const e = await failed('edit_mesh', {
+        project: id,
+        object: 'Cube',
+        operator: 'mesh.delete',
+        selection,
+        ...(select_mode ? { select_mode } : {}),
+      });
+      expect(e.message).toBe(message);
+      expect(e.json).toEqual({
+        ok: false,
+        operator: 'mesh.delete',
+        error: message,
+        code: 'POLL_FAILED',
+        selection: before,
+      });
+      expect(await state(id)).toEqual(before);
+    }
+    expect((await ok('get_object', { project: id, object: 'Cube' })).data).toMatchObject({
+      vertices: 8,
+      faces: 6,
+    });
+    // the lists each mode uses still select: faces in FACE mode, edges in EDGE mode, all lists in
+    // VERT mode (by their vertices), and all: false with lists
+    const sorted = (after: { select_mode: string; verts: number[]; faces: number[] }) => ({
+      ...after,
+      verts: [...after.verts].sort((x, y) => x - y),
+    });
+    const faces = await ok('edit_mesh', {
+      project: id,
+      object: 'Cube',
+      operator: 'scene.stats',
+      selection: { faces: [0], all: false },
+      select_mode: 'FACE',
+    });
+    expect(sorted(faces.selection_after)).toEqual({
+      select_mode: 'FACE',
+      verts: [...face].sort((x, y) => x - y),
+      faces: [0],
+    });
+    const edges = await ok('edit_mesh', {
+      project: id,
+      object: 'Cube',
+      operator: 'scene.stats',
+      selection: { edges: [edge] },
+      select_mode: 'EDGE',
+    });
+    expect(sorted(edges.selection_after)).toEqual({
+      select_mode: 'EDGE',
+      verts: [...edge].sort((x, y) => x - y),
+      faces: [],
+    });
+    const verts = await ok('edit_mesh', {
+      project: id,
+      object: 'Cube',
+      operator: 'scene.stats',
+      selection: { verts: [face[2]], edges: [edge], faces: [] },
+      select_mode: 'VERT',
+    });
+    expect(sorted(verts.selection_after)).toEqual({
+      select_mode: 'VERT',
+      verts: [face[0], face[1], face[2]].sort((x, y) => x - y),
+      faces: [],
+    });
+  });
+});
+
+describe('an editor that leaves the project before it answers', () => {
+  it('wm.read_homefile: the error says that the editor switched to the new project, as expected', async () => {
+    const { id } = await ok('create_project', { name: 'Editor leaves' });
+    // like the web app: wm.read_homefile closes the project the editor has open (createProject)
+    // before the operator returns, so its answer is never sent
+    const browser: SyncTestClient = await editor(id, async (method, params) => {
+      if (method === 'ui' && params.command === 'run_operator') await browser.disconnect();
+      return { ok: true };
+    });
+    const r = await call('editor_command', {
+      project: id,
+      command: 'run_operator',
+      params: { operator: 'wm.read_homefile', params: { name: 'Switched' } },
+    });
+    expect(r.raw.isError).toBe(true);
+    expect(r.text).toBe(
+      "editor_command 'run_operator' got no answer for wm.read_homefile, as expected: the editor creates a new " +
+        "project ('Switched') and switches to it, which closes its connection to this project before it can " +
+        'answer; list_projects lists the new project, get_connected_clients the editors that still have this one open.',
+    );
+    expect(browser.rpcRequests.map((q) => q.params)).toEqual([
+      { command: 'run_operator', params: { operator: 'wm.read_homefile', params: { name: 'Switched' } } },
+    ]);
+  });
+
+  it('other commands: whether the editor carried them out is unknown', async () => {
+    const { id } = await ok('create_project', { name: 'Editor reloads' });
+    // the page is closed or reloaded while the editor works on the command
+    const browser: SyncTestClient = await editor(id, async () => {
+      await browser.disconnect();
+      return { ok: true };
+    });
+    const r = await call('editor_command', { project: id, command: 'view.frame_all' });
+    expect(r.raw.isError).toBe(true);
+    expect(r.text).toBe(
+      "editor_command 'view.frame_all' failed: the editor's connection to this project closed before it answered " +
+        '(its page was closed or reloaded, it opened another project or lost its connection, or the server ' +
+        'closed the project), so whether it carried the command out is unknown; get_connected_clients lists the ' +
+        'editors that have the project open.',
+    );
+    expect(r.text).not.toContain('client disconnected');
+  });
+});
+
+describe("browser UI operators that act on the person's editor say so", () => {
+  it('wm.read_homefile, wm.share and the other File operators, through run_operator, batch and edit_mesh', async () => {
+    const { id } = await ok('create_project', { name: 'Browser file ops' });
+    await ok('run_operator', { project: id, operator: 'scene.stats', selection: { objects: ['Cube'] } });
+    const before = await state(id);
+    const RUN = (op: string) =>
+      `editor_command {project, command: 'run_operator', params: {operator: '${op}', params: {…}}} ` +
+      '(get_connected_clients lists the editors that have the project open)';
+    const HEAD = (op: string) =>
+      `'${op}' is an operator of the browser editor's user interface (viewport, playback, tools, windows): ` +
+      'only a live editor can run it, not run_operator, batch or edit_mesh.';
+    const home = await failed('run_operator', {
+      project: id,
+      operator: 'wm.read_homefile',
+      params: { name: 'X' },
+    });
+    expect(home.message).toBe(
+      `${HEAD('wm.read_homefile')} To create a project use create_project. In a live editor run it with ` +
+        `${RUN('wm.read_homefile')}: it creates a new project ({name, empty}) and switches the person's editor to ` +
+        'it, away from the project it had open, which it leaves before it can answer (editor_command says so; ' +
+        'list_projects lists the new project).',
+    );
+    expect(home.json).toEqual({
+      ok: false,
+      operator: 'wm.read_homefile',
+      error: home.message,
+      code: 'NOT_FOUND',
+      selection: before,
+    });
+    const share = await failed('edit_mesh', { project: id, object: 'Cube', operator: 'wm.share' });
+    expect(share.message).toBe(
+      `${HEAD('wm.share')} For the project's link use get_project (editor_url). In a live editor run it with ` +
+        `${RUN('wm.share')}: it puts the project's link on the person's clipboard, replacing what they had ` +
+        'copied (a browser that refuses the copy shows them the link in a message; an editor page without ' +
+        'clipboard access, served over plain HTTP from a host other than localhost, does nothing).',
+    );
+    const res = await call('batch', {
+      project: id,
+      stop_on_error: false,
+      operations: [
+        { operator: 'wm.import' },
+        { operator: 'wm.export' },
+        { operator: 'wm.open_mainfile' },
+        { operator: 'wm.search_menu' },
+        { operator: 'wm.save_mainfile' },
+      ],
+    });
+    const out = JSON.parse(res.text.slice(res.text.indexOf('\n') + 1));
+    expect(out.results.map((r: { code: string }) => r.code)).toEqual(Array(5).fill('NOT_FOUND'));
+    const [imp, exp, open, search, save] = out.results.map((r: { error: string }) => r.error);
+    expect(imp).toContain(
+      "it asks the browser to open a file chooser on the person's screen, which browsers block unless the person " +
+        'has just clicked or pressed a key, so from editor_command it normally opens nothing (and still answers ok).',
+    );
+    expect(exp).toMatch(/: it opens the Export window on the person's screen\.$/);
+    expect(open).toMatch(/: it opens the project browser on the person's screen\.$/);
+    expect(search).toMatch(/: it opens the operator search on the person's screen\.$/);
+    expect(save).toMatch(/: it makes that editor sync its WebDAV copy at once if it has one/);
+    expect(await state(id)).toEqual(before);
+  });
+});
+
+describe('did-you-mean: completions of the id come first', () => {
+  it("'wm.save', 'view3d.view' and 'object.dupli', with each note's advice naming its id", async () => {
+    const { id } = await ok('create_project', { name: 'Completions' });
+    const save = await failed('run_operator', { project: id, operator: 'wm.save' });
+    expect(save.message).toBe(
+      "Unknown operator 'wm.save'. Did you mean: wm.save_mainfile, wm.share? They are operators of the browser " +
+        "editor's user interface (instead: nothing (the server stores projects) for wm.save_mainfile, get_project " +
+        "for wm.share): a live editor runs them with editor_command {project, command: 'run_operator', params: " +
+        '{operator, params}}. Use list_operators.',
+    );
+    expect(save.json.code).toBe('NOT_FOUND');
+    const view = await failed('edit_mesh', { project: id, object: 'Cube', operator: 'VIEW3D.View' });
+    expect(view.message).toMatch(
+      /^Unknown operator 'VIEW3D\.View'\. Did you mean: view3d\.view_all, view3d\.view_axis, view3d\.view_orbit, view3d\.view_camera, view3d\.view_selected, view3d\.view_persportho\b/,
+    );
+    const res = await call('batch', { project: id, operations: [{ operator: 'object.dupli' }] });
+    const dup = JSON.parse(res.text.slice(res.text.indexOf('\n') + 1)).results[0];
+    expect(dup.code).toBe('NOT_FOUND');
+    expect(dup.error).toMatch(
+      /^Unknown operator 'object\.dupli'\. Did you mean: object\.duplicate, object\.duplicate_move, object\.duplicates_make_real, /,
+    );
+    expect(dup.error).toContain(
+      "? object.duplicate_move is an operator of the browser editor's user interface (instead: object.duplicate " +
+        '{offset}): a live editor runs it',
+    );
+    // a single suggestion that does not complete the id names the id its advice is for
+    const share = await failed('run_operator', { project: id, operator: 'wm.sahre' });
+    expect(share.message).toBe(
+      "Unknown operator 'wm.sahre'. Did you mean: wm.share? It is an operator of the browser editor's user " +
+        'interface (instead: get_project for wm.share): a live editor runs it with editor_command {project, ' +
+        "command: 'run_operator', params: {operator, params}}. Use list_operators.",
+    );
+  });
+});
+
 describe('names with line breaks', () => {
   it('keep the message on the first line and the JSON after it', async () => {
     const { id } = await ok('create_project', { name: 'Line\nbreak project' });
@@ -724,11 +1148,36 @@ describe('tool descriptions', () => {
     );
     expect(run).toContain("object.duplicate {offset} for Shift+D's object.duplicate_move");
     const editor = tools.get('editor_command')!;
-    expect(editor.description).not.toMatch(/as the (person|user) sees it/);
     expect(editor.description).toContain(
-      "drawn with materials and lights (RENDERED) whatever the viewport's shading",
+      "screenshot {width: pixels (default: the viewport size); height: pixels (default: the viewport size); shading: WIREFRAME | SOLID | MATERIAL | RENDERED (default: the viewport's shading)} — a PNG of the editor's viewport as the person sees it",
     );
-    const timeout = (editor.inputSchema.properties as Record<string, { maximum?: number }>).timeout_ms;
+    expect(editor.description).toContain("in the viewport's shading or `shading`, without overlays");
+    expect(editor.description).not.toMatch(/whatever the (viewport's|editor's) shading/);
+    expect(editor.description).toContain("take screenshots with shading 'SOLID' (grey clay, much faster)");
+    // the cost of a screenshot depends on the viewport's shading: MATERIAL and RENDERED are not slow in
+    // themselves (about 1 s while the viewport shows that shading, 20-25 s while it shows another one)
+    const overstated = /tens of seconds per screenshot (and|in (them|MATERIAL or RENDERED))/;
+    expect(editor.description).not.toMatch(overstated);
+    expect(editor.description).toContain(
+      "a screenshot in MATERIAL or RENDERED shading while the viewport shows another one builds and compiles the scene's materials for that image (tens of seconds with many materials)",
+    );
+    expect(client.getInstructions()).not.toMatch(overstated);
+    expect(client.getInstructions()).toContain('while its viewport shows another shading');
+    // what the editor's UI operators do there, said plainly, and wm.read_homefile's missing answer
+    expect(editor.description).not.toContain('when asked for one it says what it does here');
+    expect(editor.description).toContain(
+      'the run_operator tool refuses them with a message that says what each one does there',
+    );
+    expect(editor.description).toContain(
+      'wm.read_homefile switches that editor to a new project, so it leaves this one before it can answer, and the error says so',
+    );
+    const timeout = (
+      editor.inputSchema.properties as Record<string, { maximum?: number; description?: string }>
+    ).timeout_ms;
+    expect(timeout.description).not.toMatch(overstated);
+    expect(timeout.description).toContain(
+      'and tens of seconds per screenshot in one of them while the viewport shows another shading',
+    );
     expect(timeout.maximum).toBe(55_000);
     expect(editor.description).toContain('at most 55000');
     expect(tools.get('render_image')!.description).toContain('renderer browser waits up to 55 s');
@@ -750,11 +1199,12 @@ describe('timeouts of the browser editor', () => {
     expect(r.raw.isError).toBe(true);
     expect(r.text).toBe(
       "editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 200 ms (at most 55000); " +
-        'it may still carry the command out, and its next commands and renders wait until it has. An editor ' +
-        'without GPU acceleration (software WebGL, e.g. a headless browser) can take tens of seconds per frame ' +
-        "for a heavy scene drawn with materials and lights, as screenshots are whatever the viewport's shading, " +
-        'the first time also compiling the shaders: pass a larger timeout_ms (at most 55000); for a quick look ' +
-        "use render_image with shading 'SOLID' (grey clay, much faster), and render_image for final images.",
+        'it may still carry the command out, and its next commands and renders wait until it has. The screenshot ' +
+        "is drawn in the viewport's shading, like a frame of the viewport, which takes seconds for a heavy scene " +
+        'in MATERIAL or RENDERED shading without GPU acceleration (software WebGL, e.g. a headless browser), tens ' +
+        'of seconds the first time while it compiles the shaders: pass a larger timeout_ms (at most 55000), or ' +
+        "pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use render_image " +
+        "with shading 'SOLID', and render_image for final images.",
     );
     // other failures keep their message
     expect(await ok('editor_command', { project: id, command: 'view.frame_all' })).toEqual({
@@ -762,6 +1212,69 @@ describe('timeouts of the browser editor', () => {
       result: { done: 'view.frame_all' },
     });
     expect(browser.rpcRequests.map((q) => q.method)).toEqual(['ui', 'ui']);
+  });
+
+  it('screenshot: the shading goes to the editor as given; a timeout advises for it, an unknown one is refused first', async () => {
+    const { id } = await ok('create_project', { name: 'Screenshot shading', empty: true });
+    const browser = await editor(id, (method, params) =>
+      method === 'ui' && params.command === 'screenshot' && params.params.shading !== 'Rendered'
+        ? never()
+        : { mime: 'image/png', data_base64: TINY_PNG, width: 1, height: 1 },
+    );
+    // the editor reads the shading letter case ignored: the server passes it on as given
+    const image = await call('editor_command', {
+      project: id,
+      command: 'screenshot',
+      params: { shading: 'Rendered', width: 64 },
+    });
+    expect(image.raw.isError).toBeFalsy();
+    expect(image.raw.content[0]).toMatchObject({ type: 'image', data: TINY_PNG, mimeType: 'image/png' });
+    expect(browser.rpcRequests.at(-1)?.params).toEqual({
+      command: 'screenshot',
+      params: { shading: 'Rendered', width: 64 },
+    });
+    // a timeout of a MATERIAL screenshot names that shading and advises SOLID
+    const material = await call('editor_command', {
+      project: id,
+      command: 'screenshot',
+      params: { shading: 'material' },
+      timeout_ms: 200,
+    });
+    expect(material.raw.isError).toBe(true);
+    expect(material.text).toContain(
+      'until it has. In MATERIAL shading an editor without GPU acceleration (software WebGL, e.g. a headless ' +
+        'browser) can take seconds per screenshot of a heavy scene, and tens of seconds while its viewport shows ' +
+        "another shading (each screenshot then builds and compiles the scene's materials for MATERIAL): pass a " +
+        "larger timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot (grey clay, much faster)",
+    );
+    // a SOLID one is not told to use SOLID
+    const solid = await call('editor_command', {
+      project: id,
+      command: 'screenshot',
+      params: { shading: 'SOLID' },
+      timeout_ms: 200,
+    });
+    expect(solid.raw.isError).toBe(true);
+    // (the editor is still busy with the MATERIAL screenshot, which the message names first)
+    expect(solid.text).toMatch(/sent \d+ s ago\)\. An editor without GPU acceleration/);
+    expect(solid.text).toContain(
+      'An editor without GPU acceleration (software WebGL, e.g. a headless browser) can take seconds ' +
+        'per screenshot of a scene with millions of triangles even in SOLID shading: pass a larger timeout_ms (at ' +
+        "most 55000); render_image renders without the editor with renderer 'software'.",
+    );
+    expect(solid.text).not.toContain("pass shading 'SOLID'");
+    // an unknown shading never reaches the editor
+    const sent = browser.rpcRequests.length;
+    const wrong = await call('editor_command', {
+      project: id,
+      command: 'screenshot',
+      params: { shading: 'SOILD' },
+    });
+    expect(wrong.raw.isError).toBe(true);
+    expect(wrong.text).toBe(
+      `screenshot: 'shading' must be WIREFRAME, SOLID, MATERIAL or RENDERED, letter case ignored (got "SOILD"; did you mean 'SOLID'?).`,
+    );
+    expect(browser.rpcRequests.length).toBe(sent);
   });
 
   /**

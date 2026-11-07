@@ -76,7 +76,8 @@ export function rpcRenderEngineOptions(p: Record<string, unknown>): RenderImageO
  * image, not a viewport shading: MATERIAL (its default) is materials, lights and the world, the look
  * of a final render (the viewport's Material Preview would light the scene with a studio HDRI and
  * show it instead of the world); SOLID is grey clay shading in front of the world colour. Null when
- * not given (a final render); unknown values are an error.
+ * not given: a final render is then drawn like MATERIAL, a capture (`use_viewport`) in the shading
+ * the viewport shows (see ViewportEngine.renderPixels). Unknown values are an error.
  */
 export function rpcRenderShading(shading: unknown): 'RENDERED' | 'SOLID' | null {
   if (shading === undefined || shading === null) return null;
@@ -227,9 +228,24 @@ export async function uiCommand(command: string, params: Record<string, unknown>
       return { ok: r.ok, error: r.error, result: r.result };
     }
     case 'screenshot': {
+      // The viewport's view without overlays, in the shading it shows now unless `shading` names
+      // one of the viewport's shadings (MATERIAL: Material Preview). The first picture in a shading
+      // this editor has not drawn yet builds that shading's materials and compiles their shaders.
+      // Materials are kept until they change (scene-objects.ts ObjectView.materialSets): the
+      // viewport's own while a picture is drawn in another shading, the picture's for later ones,
+      // so neither the viewport's next frames nor later pictures build them again. Measured in
+      // software WebGL (SwiftShader), 1280×720, a scene with 71 materials: in the viewport's
+      // shading about 0.7 s (SOLID) or 1 s (MATERIAL, RENDERED; the viewport's first frame in them
+      // compiled the shaders: 17 s); SOLID or WIREFRAME while the viewport showed MATERIAL or
+      // RENDERED 0.7 s, and a screenshot in the viewport's shading right after it 1.1–1.5 s;
+      // RENDERED or MATERIAL while the viewport showed SOLID 21–23 s the first time, 1 s later on.
+      // RENDERED is rasterized (WebGL), also when the render engine is PATHTRACER (see
+      // ViewportEngine.pathTraces).
+      const shading = uiEnumParam(params, ['shading'], SHADING_TYPES, s.view.shading.value);
       if (!e) throw new Error('no viewport');
       const r = await e.renderImage({
         useViewport: true,
+        shading,
         width: Number(params.width) || e.width,
         height: Number(params.height) || e.height,
       });
@@ -249,7 +265,7 @@ export async function uiCommand(command: string, params: Record<string, unknown>
     }
     default:
       throw new Error(
-        `unknown UI command '${command}'. Available: view.frame_all, view.frame_selected, view.set_view {view: ${VIEW_TYPES.join('|')}}, view.shading {shading: ${SHADING_TYPES.join('|')}}, select {objects: [names]}, set_mode {mode: ${MODES.join('|')}}, set_frame {frame: number}, play {playing: true|false}, notify {message}, run_operator {operator, params}, screenshot {width?, height?}, get_view`,
+        `unknown UI command '${command}'. Available: view.frame_all, view.frame_selected, view.set_view {view: ${VIEW_TYPES.join('|')}}, view.shading {shading: ${SHADING_TYPES.join('|')}}, select {objects: [names]}, set_mode {mode: ${MODES.join('|')}}, set_frame {frame: number}, play {playing: true|false}, notify {message}, run_operator {operator, params}, screenshot {width?, height?, shading?: ${SHADING_TYPES.join('|')}}, get_view`,
       );
   }
 }

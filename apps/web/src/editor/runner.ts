@@ -1,4 +1,5 @@
 import { signal } from '@preact/signals';
+import * as Y from 'yjs';
 import type {
   OperatorContext,
   OperatorDef,
@@ -37,6 +38,11 @@ export interface LastOperator {
   id: string;
   label: string;
   params: unknown;
+  /**
+   * What the run returned, e.g. which shape key, bone or particle system it edited, under the name
+   * it ended up with (a rename makes names unique: 'Key 2' may become 'Key 2.001').
+   */
+  result?: unknown;
   /** Undo stack depth right after it ran; redo is only valid while unchanged. */
   undoDepth: number;
   /**
@@ -248,6 +254,7 @@ export function runOperator(
       id,
       label: def.label,
       params: res.params,
+      result: res.result,
       undoDepth: depth,
       undoStep: depth > depthBefore,
       created: session.doc.objectIds().filter((o) => !existed.has(o)),
@@ -312,6 +319,96 @@ function stepHistory(session: ProjectSession, operator: string, direction: 'undo
   }
 }
 
+type StackItem = Y.UndoManager['undoStack'][number];
+type DeleteSet = StackItem['deletions'];
+
+/** Whether the clocks `from` … `to` − 1 of `client` all lie in `ds`. */
+function coveredBy(ds: DeleteSet, client: number, from: number, to: number): boolean {
+  const ranges = (ds.clients.get(client) ?? [])
+    .filter((r) => r.clock < to && r.clock + r.len > from)
+    .sort((a, b) => a.clock - b.clock);
+  let at = from;
+  for (const r of ranges) {
+    if (r.clock > at) return false;
+    at = Math.max(at, r.clock + r.len);
+  }
+  return at >= to;
+}
+
+/** The structs of the document's store that hold the clocks of `ds`, with each one's client. */
+function* structsOf(
+  doc: Y.Doc,
+  ds: DeleteSet,
+): Generator<{ client: number; s: Y.Item | Y.GC; from: number; to: number }> {
+  for (const [client, ranges] of ds.clients) {
+    const structs = doc.store.clients.get(client);
+    if (!structs) continue;
+    for (const { clock, len } of ranges) {
+      const end = clock + len;
+      for (let i = Y.findIndexSS(structs, clock); i < structs.length && structs[i].id.clock < end; i++) {
+        const s = structs[i];
+        yield { client, s, from: Math.max(clock, s.id.clock), to: Math.min(end, s.id.clock + s.length) };
+      }
+    }
+  }
+}
+
+/**
+ * Whether others (MCP agents, other users) have changed any part of what an undo step of this
+ * session changed since it was made. The document stores every field of an object or data block
+ * as one entry of the block's map, holding the field's whole value: an object's `location`,
+ * `rotation_euler` or `scale` (all three components), its `modifiers`, `constraints` or
+ * `particle_systems` (the whole list), an armature's `pose` (every bone), a mesh's geometry (`data`,
+ * one blob) and its `shape_keys` (every key) … Another origin's change is therefore part of the
+ * step's change when it
+ *  - set again or removed an entry the step set (any edit of the same field of the same block, also
+ *    of another list item, bone or vector component than the step's), or removed a block the step
+ *    changed (deleting the object or data block), or
+ *  - set again an entry the step removed.
+ * Changes of other fields of the same block, and of other blocks, are not. Undoing the step leaves
+ * those parts as the others left them (Yjs never overwrites remote changes) and reverts the rest.
+ * Reads the step's stack item (the entries it inserted and deleted) and changes nothing.
+ */
+function changedByOthers(undo: Y.UndoManager, step: StackItem): boolean {
+  const doc = undo.doc;
+  const inScope = (item: Y.Item) =>
+    undo.scope.some((t) => t === doc || Y.isParentOf(t as Y.AbstractType<unknown>, item));
+  // what the session's other undo and redo steps removed (Yjs passes over those, see redoItem)
+  const deletedByHistory = (id: Y.ID) =>
+    [...undo.undoStack, ...undo.redoStack].some((s) => s !== step && Y.isDeleted(s.deletions, id));
+  // the entries the step set: removed or replaced since, other than by the step itself (a field it
+  // set twice); an entry that an undo removed and brought back again counts as still there
+  for (const { client, s, from, to } of structsOf(doc, step.insertions)) {
+    let cur: Y.Item | Y.GC = s;
+    while (cur instanceof Y.Item && cur.deleted && cur.redone) cur = Y.getItem(doc.store, cur.redone);
+    if (!cur.deleted) continue;
+    if (cur === s && coveredBy(step.deletions, client, from, to)) continue;
+    // a removed child of a removed block may be left without its content (Y.GC): removed by others
+    if (cur instanceof Y.Item && !inScope(cur)) continue;
+    return true;
+  }
+  // the entries the step removed (not ones it set itself): set again since, or their block removed
+  // (Yjs's redo of a removed map entry gives up on the same conditions)
+  for (const { s } of structsOf(doc, step.deletions)) {
+    if (!(s instanceof Y.Item) || s.parentSub === null || Y.isDeleted(step.insertions, s.id)) continue;
+    if (!inScope(s)) continue;
+    const parent = (s.parent as Y.AbstractType<unknown>)._item;
+    if (parent?.deleted && !parent.redone && !Y.isDeleted(step.deletions, parent.id)) return true;
+    // the later values of the entry's key: the step's own, or ones an undo or redo removed
+    let left: Y.Item | Y.GC = s;
+    while (
+      left instanceof Y.Item &&
+      left.right &&
+      (left.right.redone || Y.isDeleted(step.insertions, left.right.id) || deletedByHistory(left.right.id))
+    ) {
+      left = left.right;
+      while (left instanceof Y.Item && left.redone) left = Y.getItem(doc.store, left.redone);
+    }
+    if (!(left instanceof Y.Item) || left.right) return true;
+  }
+  return false;
+}
+
 /**
  * Undoes the last step of the session's history, the own step of the operation being adjusted.
  * Others (an MCP agent, another user) may since have overwritten everything the step changed, e.g.
@@ -336,14 +433,18 @@ function undoOwnStep(session: ProjectSession, operator: string): boolean {
  * runs it again, from the selection it started with, as one undo step. When the re-run fails (the
  * operator rejects a value, e.g. a constraint target of the wrong type) the original result is
  * brought back with the selection it left, and the operation stays adjustable with its previous
- * parameters: a rejected value changes nothing. Returns null when the last operation can no
- * longer be adjusted (something else was done or undone since, or others overwrote what it did).
+ * parameters: a rejected value changes nothing. Returns null when there is no operation to adjust
+ * or it can no longer be adjusted: something else was done or undone since, or others changed what
+ * it did and it is not a property edit (below).
  *
- * When others (MCP agents, other users) have overwritten everything the operation changed, there
- * is nothing left to undo: a property edit (setting values of something that exists) then runs
- * again on top of their edits, which keeps them and changes only what the adjusted parameters set.
- * Any other operation would be applied twice (a second constraint, a double move), so it can no
- * longer be adjusted.
+ * Others (MCP agents, other users) may since have changed part or all of what the operation
+ * changed (see {@link changedByOthers}: e.g. moved one of the objects it moved, edited a
+ * constraint of the object it added a constraint to). Undoing it would then revert only the rest,
+ * or nothing. A property edit (setting values of something that exists) runs again on top of their
+ * edits, which keeps them and changes only what the adjusted parameters set. Any other operation
+ * would be applied again to what they changed (a double move, a second constraint, their new keys
+ * removed again), so it can no longer be adjusted: this is decided before anything is undone,
+ * nothing is undone or run again, and the panel closes with a warning (a toast and the Info log).
  */
 export function redoLast(
   session: ProjectSession,
@@ -364,6 +465,18 @@ export function redoLast(
   }
 }
 
+/**
+ * Gives up adjusting an operation that others have changed (see {@link redoLast}): the panel
+ * closes, and a warning toast and Info log line say why.
+ */
+function cannotAdjust(last: LastOperator): null {
+  lastOperator.value = null;
+  const message = `${last.label} can no longer be adjusted: an agent or another user has changed what it did since`;
+  logInfo('WARNING', message, last.id);
+  toast(message, 'warning');
+  return null;
+}
+
 function redoLastOperation(
   session: ProjectSession,
   registry: OperatorRegistry,
@@ -371,17 +484,16 @@ function redoLastOperation(
   params: unknown,
 ): RunResult | null {
   const after = selectionSnapshot(session);
+  // its own undo step (when it changed something), read before anything is undone
+  const own = last.undoStep ? session.undo.undoStack[session.undo.undoStack.length - 1] : undefined;
+  if (own && !PROPERTY_EDITS.has(last.id) && changedByOthers(session.undo, own)) return cannotAdjust(last);
   // an operation that changed nothing has no undo step of its own: undoing would revert the one before
   const undone = last.undoStep && undoOwnStep(session, last.id);
   // its step had nothing left to undo: others overwrote all of it (and Yjs dropped the step)
   const overwritten = last.undoStep && !undone;
   if (overwritten && !PROPERTY_EDITS.has(last.id)) {
     restoreSelection(session, after);
-    lastOperator.value = null;
-    const message = `${last.label} can no longer be adjusted: an agent or another user has changed what it did since`;
-    logInfo('WARNING', message, last.id);
-    toast(message, 'warning');
-    return null;
+    return cannotAdjust(last);
   }
   const depth = session.undo.undoStack.length;
   // restore the selection the operator originally ran with (operators may change it)

@@ -22,6 +22,17 @@ export interface ObjectView {
   mesh?: THREE.Mesh;
   meshKey?: string;
   matKey?: string;
+  /**
+   * The mesh's material sets by shading kind (Solid and Wireframe, or Material Preview and
+   * Rendered) and X-ray, with the key each was built for: the one the mesh draws with, and the
+   * ones it drew with before in another kind or X-ray state. Those are kept, not disposed, so
+   * drawing in their shading again (the viewport switching back, a screenshot or render in another
+   * shading than the viewport's, and the viewport's next frame after it) reuses them and the
+   * shader programs three.js compiled for them, which it keeps until their materials are disposed.
+   * Building and compiling them again took 17–22 s for a scene with 71 materials in software WebGL.
+   * A set is built again when its key changed (the materials, the object colour, the mesh's slots).
+   */
+  materialSets?: Map<string, { key: string; materials: THREE.Material[] }>;
   wire?: THREE.LineSegments;
   wireKey?: string;
   helper?: THREE.LineSegments;
@@ -126,6 +137,16 @@ function disposeObject(o: THREE.Object3D): void {
   });
 }
 
+/**
+ * Disposes the material sets a view keeps for other shadings (`materialSets`), not the one its mesh
+ * draws with (disposed with the mesh).
+ */
+function disposeKeptMaterials(v: ObjectView): void {
+  for (const set of v.materialSets?.values() ?? [])
+    if (set.materials !== v.mesh?.material) for (const m of set.materials) m.dispose();
+  v.materialSets = undefined;
+}
+
 export interface SyncOptions {
   shading: 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED';
   showWireOverlay: boolean;
@@ -207,6 +228,7 @@ export class SceneObjects {
       if (seen.has(id)) continue;
       this.scene.remove(v.root);
       this.overlay.remove(v.overlayRoot);
+      disposeKeptMaterials(v);
       disposeObject(v.root);
       disposeObject(v.overlayRoot);
       this.views.delete(id);
@@ -267,6 +289,7 @@ export class SceneObjects {
   private clearMesh(v: ObjectView): void {
     if (v.mesh) {
       v.root.remove(v.mesh);
+      disposeKeptMaterials(v);
       disposeObject(v.mesh);
       v.mesh = undefined;
       v.meshKey = undefined;
@@ -311,22 +334,28 @@ export class SceneObjects {
         materialKey(slots[i] ?? null, kind, hasColors, opts.imagesRevision),
       ).join('#');
     if (v.matKey !== mk) {
-      const old = v.mesh.material;
-      if (Array.isArray(old)) old.forEach((m) => m.dispose());
-      else old.dispose();
-      const mats = Array.from({ length: usedSlots }, (_, i) => {
-        const m = buildMaterial(slots[i] ?? null, kind, doc, this.textures, {
-          objectColor: o.data.color,
-          vertexColors: hasColors,
+      // the set of this shading kind and X-ray (see ObjectView.materialSets): kept from when they
+      // were last drawn, or built (again, after a change of the materials or the mesh's slots)
+      const sets = (v.materialSets ??= new Map());
+      const slot = `${kind}${opts.xray ? 'x' : ''}`;
+      let set = sets.get(slot);
+      if (set?.key !== mk) {
+        for (const m of set?.materials ?? []) m.dispose();
+        const materials = Array.from({ length: usedSlots }, (_, i) => {
+          const m = buildMaterial(slots[i] ?? null, kind, doc, this.textures, {
+            objectColor: o.data.color,
+            vertexColors: hasColors,
+          });
+          if (opts.xray) {
+            m.transparent = true;
+            m.opacity = Math.min(m.opacity, 0.45);
+            m.depthWrite = false;
+          }
+          return m;
         });
-        if (opts.xray) {
-          m.transparent = true;
-          m.opacity = Math.min(m.opacity, 0.45);
-          m.depthWrite = false;
-        }
-        return m;
-      });
-      v.mesh.material = mats;
+        sets.set(slot, (set = { key: mk, materials }));
+      }
+      v.mesh.material = set.materials;
       v.matKey = mk;
     }
     // how far light travels inside glass: the object's size, not a fixed 0.5 m (transmission.ts)
@@ -340,11 +369,14 @@ export class SceneObjects {
       opts.shading !== 'WIREFRAME' && o.data.display_type !== 'WIRE' && o.data.display_type !== 'BOUNDS';
     v.mesh.castShadow = opts.castShadows;
     v.mesh.receiveShadow = opts.castShadows;
-    // wireframe overlay (the wires of Wireframe shading are the shading, not an overlay)
-    const showWire =
-      !isEdit &&
-      (opts.shading === 'WIREFRAME' ||
-        (opts.overlays && (opts.showWireOverlay || o.data.show_wire || o.data.display_type === 'WIRE')));
+    // wireframe overlay (the wires of Wireframe shading are the shading, not an overlay). The object
+    // being edited shows its edges in the edit-mode cage, an overlay: its wires are drawn for
+    // Wireframe shading while the overlays are off (also in screenshots, which have none), so that
+    // Wireframe shading still shows it, and never as a wireframe overlay.
+    const showWire = isEdit
+      ? opts.shading === 'WIREFRAME' && !opts.overlays
+      : opts.shading === 'WIREFRAME' ||
+        (opts.overlays && (opts.showWireOverlay || o.data.show_wire || o.data.display_type === 'WIRE'));
     if (showWire) {
       const wk = `${v.meshKey}`;
       if (!v.wire || v.wireKey !== wk) {
@@ -360,10 +392,12 @@ export class SceneObjects {
         v.overlayRoot.add(v.wire);
         v.wireKey = wk;
       }
-      const sel = opts.selected.has(o.id);
+      // in Edit Mode the edited object is not highlighted as selected (no outline either): its
+      // selected elements are, in the cage
+      const sel = !isEdit && opts.selected.has(o.id);
       const mat = v.wire.material as THREE.LineBasicMaterial;
       mat.color.copy(
-        o.id === opts.activeId
+        !isEdit && o.id === opts.activeId
           ? COLORS.active
           : sel
             ? COLORS.selected
@@ -657,6 +691,7 @@ export class SceneObjects {
     }
     this.instanced.clear();
     for (const v of this.views.values()) {
+      disposeKeptMaterials(v);
       disposeObject(v.root);
       disposeObject(v.overlayRoot);
     }

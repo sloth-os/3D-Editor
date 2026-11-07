@@ -15,6 +15,9 @@ import {
   type OperatorContext,
 } from '@3d-editor/core';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
+import { viewport } from '../src/editor/editor';
+import { uiCommand } from '../src/editor/rpc';
+import { session as sessionSignal } from '../src/app/store';
 import type { ProjectSession } from '../src/project/session';
 import { renderOutputSize, type PathTraceOptions } from '../src/render';
 import { applyLensShift, sceneCameraView } from '../src/render/view';
@@ -603,6 +606,288 @@ describe('final renders (F12, Render Animation, MCP renders)', () => {
     expect([img.width, img.height]).toEqual([64, 16]);
     img = e.renderPixels({ width: 64 });
     expect([img.width, img.height]).toEqual([64, 32]);
+  });
+});
+
+describe('viewport captures (MCP editor_command screenshot)', () => {
+  type Shading = 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED';
+  /** What a picture of the scene looked like and what the viewport showed while it was drawn. */
+  interface Look {
+    /** The shading it was drawn in, told apart by what it looks like (see {@link recordLooks}). */
+    shading: Shading;
+    /** Whether the viewport's overlays were on while it was drawn. */
+    overlays: boolean;
+    /** Whether any of the editor's own parts of the overlay scene was drawn (grid, 3D cursor, gizmo …). */
+    editorParts: boolean;
+  }
+  /**
+   * Records the pictures of the scene (the scene and the overlay scene drawn over it). The world is
+   * dark red without an environment, so Material Preview has the studio HDRI as environment,
+   * Rendered shading the world colour behind it and shadow maps (the render settings' default),
+   * Wireframe no meshes but the objects' wires (drawn with the overlays), Solid opaque meshes in
+   * front of the viewport's grey.
+   */
+  function recordLooks(s: ProjectSession, e: ViewportEngine, gl: RecordingRenderer): Look[] {
+    s.doc.updateWorld({ environment: 'NONE', color: [0.8, 0.05, 0.05], strength: 1 });
+    const looks: Look[] = [];
+    let meshes = 0;
+    gl.onRender = (scene) => {
+      if (scene === e.overlay && looks.length) {
+        const last = looks[looks.length - 1];
+        let wires = 0;
+        scene.traverseVisible((o) => {
+          if ((o as THREE.LineSegments).isLineSegments && typeof o.userData.objectId === 'string') wires++;
+        });
+        if (last.shading === 'SOLID' && !meshes && wires) last.shading = 'WIREFRAME';
+        last.editorParts = e.overlay.children.some(
+          (c) => c.visible && typeof c.userData.objectId !== 'string',
+        );
+        return;
+      }
+      if (scene !== e.scene) return;
+      const bg = e.scene.background;
+      const red = bg instanceof THREE.Color && bg.r > 0.7 && bg.g < 0.1;
+      const shadows = (e.renderer as unknown as { shadowMap: { enabled: boolean } }).shadowMap.enabled;
+      meshes = drawnMeshes(s, scene).size;
+      const shading: Shading = e.scene.environment ? 'MATERIAL' : red && shadows ? 'RENDERED' : 'SOLID';
+      looks.push({ shading, overlays: s.view.overlays.value, editorParts: false });
+    };
+    return looks;
+  }
+  /** Runs one turn of the viewport's frame loop (what requestAnimationFrame would run). */
+  const viewportFrame = (e: ViewportEngine) =>
+    (e as unknown as { loop(now: number): void }).loop(performance.now());
+
+  it('draw in the shading the viewport shows unless another one is asked for', () => {
+    // regression: captures were always drawn in Rendered shading, so a screenshot of a viewport in
+    // Solid shading compiled every material and drew the shadow maps (20–25 s for a 71-material
+    // scene in software WebGL) and showed what the person did not see
+    const s = session();
+    const { e, gl } = engine(s);
+    const looks = recordLooks(s, e, gl);
+    for (const shading of ['SOLID', 'RENDERED', 'MATERIAL', 'WIREFRAME'] as const) {
+      s.view.shading.value = shading;
+      viewportFrame(e);
+      expect(looks.at(-1)).toEqual({ shading, overlays: true, editorParts: true });
+      e.renderPixels({ useViewport: true });
+      // without overlays (Wireframe shading's wires are the shading itself)
+      expect(looks.at(-1)).toEqual({ shading, overlays: false, editorParts: false });
+      expect(s.view.shading.value).toBe(shading);
+    }
+    s.view.shading.value = 'SOLID';
+    viewportFrame(e);
+    for (const shading of ['RENDERED', 'MATERIAL', 'WIREFRAME', 'SOLID'] as const) {
+      e.renderPixels({ useViewport: true, shading });
+      expect(looks.at(-1)).toEqual({ shading, overlays: false, editorParts: false });
+      expect(s.view.shading.value).toBe('SOLID');
+      expect(s.view.overlays.value).toBe(true);
+    }
+    // final renders are drawn with materials and lights unless asked otherwise
+    e.renderPixels();
+    expect(looks.at(-1)?.shading).toBe('RENDERED');
+    e.renderPixels({ shading: 'SOLID' });
+    expect(looks.at(-1)?.shading).not.toBe('RENDERED');
+  });
+
+  it('leave the viewport’s shading, overlays and frame as they were, also when the capture fails', () => {
+    const s = session();
+    const { e, gl } = engine(s);
+    const looks = recordLooks(s, e, gl);
+    // the transform gizmo is in the overlay scene, shown whatever the overlays (ViewportInteraction)
+    const gizmo = new THREE.Group();
+    e.overlay.add(gizmo);
+    s.state.frame = 3;
+    viewportFrame(e);
+    e.renderPixels({ useViewport: true, shading: 'RENDERED', frame: 7 });
+    expect(looks.at(-1)).toEqual({ shading: 'RENDERED', overlays: false, editorParts: false });
+    expect([s.view.shading.value, s.view.overlays.value, s.state.frame]).toEqual(['SOLID', true, 3]);
+    expect(gizmo.visible).toBe(true);
+    // the viewport's next frame shows its own shading and overlays again
+    viewportFrame(e);
+    expect(looks.at(-1)).toEqual({ shading: 'SOLID', overlays: true, editorParts: true });
+    // a capture that fails half-way (the camera view of a camera that is not there)
+    s.view.cameraView.value = true;
+    s.view.shading.value = 'MATERIAL';
+    expect(() => e.renderPixels({ useViewport: true, shading: 'RENDERED', cameraId: 'Nope' })).toThrow(
+      "Camera 'Nope' not found",
+    );
+    expect([s.view.shading.value, s.view.overlays.value, s.state.frame]).toEqual(['MATERIAL', true, 3]);
+    expect(gizmo.visible).toBe(true);
+    viewportFrame(e);
+    expect(looks.at(-1)).toEqual({ shading: 'MATERIAL', overlays: true, editorParts: true });
+    // one that fails after it hid the editor's parts of the overlay scene: while drawing the
+    // overlay scene, or reading the pixels back (a lost WebGL context)
+    const editorParts = () =>
+      e.overlay.children.filter((c) => c.visible && typeof c.userData.objectId !== 'string').length;
+    const fail = new Error('WebGL context lost');
+    for (const when of ['drawing', 'reading'] as const) {
+      const record = gl.onRender;
+      gl.onRender = (scene) => {
+        record?.(scene);
+        if (when === 'drawing' && scene === e.overlay) {
+          expect([editorParts(), gizmo.visible]).toEqual([0, false]);
+          throw fail;
+        }
+      };
+      gl.readPixels = () => {
+        expect([editorParts(), gizmo.visible]).toEqual([0, false]);
+        throw fail;
+      };
+      expect(() => e.renderPixels({ useViewport: true, shading: 'WIREFRAME', frame: 5 })).toThrow(fail);
+      gl.onRender = record;
+      gl.readPixels = (b) => b.fill(0);
+      expect([s.view.shading.value, s.view.overlays.value, s.state.frame]).toEqual(['MATERIAL', true, 3]);
+      // what the capture hid itself is shown again at once (the gizmo is not the scene sync's)
+      expect(gizmo.visible).toBe(true);
+      viewportFrame(e);
+      expect(looks.at(-1)).toEqual({ shading: 'MATERIAL', overlays: true, editorParts: true });
+    }
+  });
+
+  it('editor_command screenshot: the viewport’s shading by default, {shading} on request, an unknown one is an error', async () => {
+    const s = session();
+    const { e, gl } = engine(s);
+    const looks = recordLooks(s, e, gl);
+    sessionSignal.value = s;
+    viewport.engine = e;
+    try {
+      e.sync();
+      const shot = (await uiCommand('screenshot', { width: 32, height: 16 })) as Record<string, unknown>;
+      expect(shot).toMatchObject({ mime: 'image/png', width: 32, height: 16 });
+      expect(String(shot.data_base64).length).toBeGreaterThan(0);
+      expect(looks.at(-1)?.shading).toBe('SOLID');
+      await uiCommand('screenshot', { width: 32, height: 16, shading: 'rendered' });
+      expect(looks.at(-1)?.shading).toBe('RENDERED');
+      expect(s.view.shading.value).toBe('SOLID');
+      s.view.shading.value = 'MATERIAL';
+      await uiCommand('screenshot', { width: 32, height: 16 });
+      expect(looks.at(-1)?.shading).toBe('MATERIAL');
+      await uiCommand('screenshot', { width: 32, height: 16, shading: 'WIREFRAME' });
+      expect(looks.at(-1)?.shading).toBe('WIREFRAME');
+      // an unknown shading draws nothing and changes nothing
+      gl.renders.length = 0;
+      await expect(uiCommand('screenshot', { shading: 'TOON' })).rejects.toThrow(
+        "Unknown shading 'TOON': use one of WIREFRAME, SOLID, MATERIAL, RENDERED",
+      );
+      expect(gl.renders).toHaveLength(0);
+      expect([s.view.shading.value, s.view.overlays.value]).toEqual(['MATERIAL', true]);
+    } finally {
+      viewport.engine = null;
+      sessionSignal.value = null;
+    }
+  });
+
+  it('keep the materials of every shading drawn, so that neither the viewport nor the next picture builds them again', () => {
+    // regression: a capture in Solid or Wireframe shading disposed the materials of a viewport in
+    // Material Preview or Rendered shading, so its next frame built them and compiled their
+    // shaders again (three.js drops a material's shader programs with it): 17–22 s for a scene
+    // with 71 materials in software WebGL, which the next command waited for; and every capture in
+    // Rendered shading of a viewport in Solid shading built and compiled them for that picture
+    const s = session();
+    const { e, gl } = engine(s);
+    const cube = s.doc.listObjects().find((o) => o.type === 'MESH')!;
+    const cubeMaterials = () => e.objects.views.get(cube.id)!.mesh!.material as THREE.Material[];
+    const disposed = new Set<THREE.Material>();
+    const watch = (materials: THREE.Material[]) => {
+      for (const m of materials) m.addEventListener('dispose', () => disposed.add(m));
+      return materials;
+    };
+    /** The cube's materials in each picture of the scene drawn from now on. */
+    const pictures: THREE.Material[][] = [];
+    gl.onRender = (scene) => {
+      if (scene === e.scene && e.objects.views.has(cube.id)) pictures.push(cubeMaterials());
+    };
+    s.view.shading.value = 'RENDERED';
+    viewportFrame(e);
+    const pbr = watch(cubeMaterials());
+    expect(pbr[0]).toBeInstanceOf(THREE.MeshPhysicalMaterial);
+    for (const shading of ['SOLID', 'WIREFRAME', 'MATERIAL', 'SOLID'] as const) {
+      e.renderPixels({ useViewport: true, shading });
+      watch(pictures.at(-1)!);
+      // the viewport's next frame draws with its own materials again
+      viewportFrame(e);
+      expect(pictures.at(-1)).toBe(pbr);
+    }
+    expect(pictures.filter((p) => p !== pbr).map((p) => p[0].type)).toEqual([
+      'MeshMatcapMaterial',
+      'MeshMatcapMaterial',
+      'MeshMatcapMaterial',
+    ]);
+    // the Solid shading picture drawn twice used the same materials
+    const clay = pictures.filter((p) => p !== pbr);
+    expect(clay[2]).toBe(clay[0]);
+    expect(disposed.size).toBe(0);
+    // a viewport in Solid shading keeps them too: only the first picture in Rendered shading builds
+    s.view.shading.value = 'SOLID';
+    viewportFrame(e);
+    expect(pictures.at(-1)).toBe(clay[0]);
+    for (let i = 0; i < 2; i++) {
+      e.renderPixels({ useViewport: true, shading: 'RENDERED' });
+      expect(pictures.at(-1)).toBe(pbr);
+      viewportFrame(e);
+      expect(pictures.at(-1)).toBe(clay[0]);
+    }
+    expect(disposed.size).toBe(0);
+    // what a change of the material makes stale is built again, and the stale materials disposed,
+    // when its shading is drawn next
+    s.doc.updateMaterial(s.doc.getObject(cube.id)!.material_slots[0]!, { roughness: 0.25 });
+    viewportFrame(e);
+    expect(pictures.at(-1)).not.toBe(clay[0]);
+    expect([...disposed]).toEqual(clay[0]);
+    e.renderPixels({ useViewport: true, shading: 'RENDERED' });
+    expect(pictures.at(-1)).not.toBe(pbr);
+    expect((pictures.at(-1)![0] as THREE.MeshPhysicalMaterial).roughness).toBe(0.25);
+    expect(pbr.every((m) => disposed.has(m))).toBe(true);
+    // and the ones kept for other shadings go with the object
+    const kept = [...new Set(pictures.slice(-2).flat())];
+    watch(kept);
+    s.doc.removeObject(cube.id);
+    viewportFrame(e);
+    expect(kept.every((m) => disposed.has(m))).toBe(true);
+  });
+
+  it('draw the object being edited in Wireframe shading (its wires, without the edit-mode cage)', () => {
+    // regression: the object in Edit Mode drew no wires, its edges being the cage's, which a
+    // screenshot leaves out with the other overlays: Wireframe screenshots in Edit Mode showed
+    // nothing of it (and neither did the viewport with its overlays off)
+    const s = session();
+    const { e, gl } = engine(s);
+    const cube = s.doc.listObjects().find((o) => o.type === 'MESH')!;
+    s.state.selectedIds = [cube.id];
+    s.state.activeId = cube.id;
+    s.state.mode = 'EDIT';
+    s.view.shading.value = 'WIREFRAME';
+    /** The cube's wires and whether the cage was on screen, in each picture of the overlay scene. */
+    const pictures: { wires: number; color: number[]; cage: boolean }[] = [];
+    gl.onRender = (scene) => {
+      if (scene !== e.overlay) return;
+      const wires: THREE.LineSegments[] = [];
+      scene.traverseVisible((o) => {
+        if ((o as THREE.LineSegments).isLineSegments && o.userData.objectId === cube.id)
+          wires.push(o as THREE.LineSegments);
+      });
+      const color = wires[0] ? (wires[0].material as THREE.LineBasicMaterial).color.toArray() : [];
+      pictures.push({ wires: wires.length, color, cage: e.edit.group.visible });
+    };
+    viewportFrame(e);
+    // the person sees the cage (an overlay), which shows the edges
+    expect(pictures.at(-1)).toEqual({ wires: 0, color: [], cage: true });
+    e.renderPixels({ useViewport: true });
+    // the plain wire colour: the edited object is not highlighted as selected in Edit Mode
+    const grey = new THREE.Color(0xbbbbbb).toArray();
+    expect(pictures.at(-1)).toEqual({ wires: 1, color: grey, cage: false });
+    viewportFrame(e);
+    expect(pictures.at(-1)).toEqual({ wires: 0, color: [], cage: true });
+    // the viewport with its overlays off shows the wires too
+    s.view.overlays.value = false;
+    viewportFrame(e);
+    expect(pictures.at(-1)).toEqual({ wires: 1, color: grey, cage: false });
+    // other shadings draw its surface, no wires
+    s.view.overlays.value = true;
+    s.view.shading.value = 'SOLID';
+    e.renderPixels({ useViewport: true });
+    expect(pictures.at(-1)).toEqual({ wires: 0, color: [], cage: false });
+    expect(drawnMeshes(s, e.scene).has('Cube')).toBe(true);
   });
 });
 

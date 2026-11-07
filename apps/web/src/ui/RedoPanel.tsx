@@ -3,13 +3,17 @@ import { z } from 'zod';
 import {
   CONSTRAINT_TYPES,
   getConstraintTypeInfo,
+  poseBonePath,
   resolveConstraintType,
   safeJsonSchema,
   transformPoint3,
+  type AnimTargetType,
   type ConstraintData,
   type ConstraintTypeInfo,
   type ObjectData,
+  type ParticleSystemData,
   type SceneDoc,
+  type ShapeKeyData,
   type Vec3,
 } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
@@ -17,7 +21,9 @@ import { registry } from '../editor/editor';
 import { lastOperator, redoLast, type LastOperator } from '../editor/runner';
 import { SchemaForm, type SchemaChoice } from './SchemaForm';
 import { isRecord } from './properties/ObjectTab';
-import { ikSettingValues } from './properties/DataTab';
+import { ikSettingValues, shapeKeyPath } from './properties/DataTab';
+import { constraintPath } from './properties/ConstraintsTab';
+import { animatedValue } from './properties/prop-edit';
 
 type Params = Record<string, unknown>;
 
@@ -69,6 +75,27 @@ function findEntry<T extends { id: string; name: string }>(list: unknown, ref: u
   return items.find((x) => x.id === ref) ?? items.find((x) => x.name === ref) ?? null;
 }
 
+/** What the run returned under `key` (a name or id of what it edited), when it is a string. */
+function reported(last: LastOperator, key: string): string | null {
+  const r = last.result;
+  return isRecord(r) && typeof r[key] === 'string' ? r[key] : null;
+}
+
+/** The object the run reports it edited, else the one its parameters name (or the active one). */
+function editedObject(doc: SceneDoc, last: LastOperator, params: Params): ObjectData | null {
+  const id = reported(last, 'object');
+  return (id && doc.getObject(id)) || objectOrActive(doc, last, params.object);
+}
+
+/**
+ * The value of an animatable number at the current frame, as the Properties editor shows it
+ * (prop-edit.ts `animatedValue`): its driver's or its F-curve's value, else `base`, the stored value.
+ */
+export type ValueAt = (type: AnimTargetType, id: string, path: string, index: number, base: number) => number;
+
+/** The stored values (a form shown without a session, e.g. in tests). */
+const STORED: ValueAt = (_type, _id, _path, _index, base) => base;
+
 /** Bone names of an armature object (empty for other objects). */
 function boneNames(doc: SceneDoc, o: ObjectData | null): string[] {
   return o?.type === 'ARMATURE' && o.data ? (doc.getArmature(o.data)?.bones.map((b) => b.name) ?? []) : [];
@@ -103,20 +130,48 @@ function acceptsTarget(info: ConstraintTypeInfo, owner: ObjectData | null, targe
 }
 
 /**
- * What the operator keeps for parameters left unset ("only given values change"): the current
- * state of what it edits, shown instead of a default. Editing one component of such a vector
- * keeps the others as they are.
+ * The shape key Set Shape Key edited, under the name the run reports (a rename in the same call
+ * makes the name unique), the mesh it belongs to and the mesh's keys.
  */
-function keptValues(doc: SceneDoc, last: LastOperator, params: Params): Params {
+function shapeKeyOf(
+  doc: SceneDoc,
+  last: LastOperator,
+  params: Params,
+): { key: ShapeKeyData | null; keys: ShapeKeyData[]; meshId: string | null } {
+  const o = editedObject(doc, last, params);
+  const meshId = o?.type === 'MESH' && o.data ? o.data : null;
+  const keys = meshId ? doc.getShapeKeys(meshId) : [];
+  const named = (n: unknown) => keys.find((k) => k.name === n) ?? null;
+  // without a report: the key asked for, or the one renamed to the new name
+  const name = reported(last, 'key');
+  const key = name !== null ? named(name) : (named(params.key) ?? named(text(params.name)?.trim()));
+  return { key, keys, meshId };
+}
+
+/**
+ * What the operator keeps for parameters left unset ("only given values change"): the current
+ * state of what it edits, shown instead of a default, as the Properties editor shows it: the
+ * stored values, and for the numbers it shows at the current frame when they are animated (a pose
+ * bone's transform, a constraint's influence, a shape key's value) their value there (`at`).
+ * Editing one component of such a vector keeps the others as they are shown. The Properties
+ * editor and the outliner run these operators with only the field that changed.
+ */
+function keptValues(doc: SceneDoc, last: LastOperator, params: Params, at: ValueAt): Params {
   switch (last.id) {
     case 'pose.bone_transform_set': {
-      const bones = objectOrActive(doc, last, params.object)?.pose?.bones;
+      const o = objectOrActive(doc, last, params.object);
+      const bones = o?.pose?.bones;
       const name = String(params.bone ?? '');
       const pb = bones && Object.hasOwn(bones, name) ? bones[name] : undefined;
+      // at the current frame, as the bone's Pose panel shows them
+      const channel = (c: 'location' | 'rotation_euler' | 'scale', rest: number[]) => {
+        const v = pb?.[c] ?? rest;
+        return o ? v.map((x, i) => at('object', o.id, poseBonePath(name, c), i, x)) : v;
+      };
       return {
-        location: pb?.location ?? [0, 0, 0],
-        rotation_euler: pb?.rotation_euler ?? [0, 0, 0],
-        scale: pb?.scale ?? [1, 1, 1],
+        location: channel('location', [0, 0, 0]),
+        rotation_euler: channel('rotation_euler', [0, 0, 0]),
+        scale: channel('scale', [1, 1, 1]),
       };
     }
     case 'pose.ik_settings_set': {
@@ -127,30 +182,76 @@ function keptValues(doc: SceneDoc, last: LastOperator, params: Params): Params {
       return ikSettingValues(bones && Object.hasOwn(bones, name) ? bones[name] : undefined);
     }
     case 'armature.bone_update': {
-      const o = objectOrActive(doc, last, params.object);
+      const o = editedObject(doc, last, params);
       const bones = o?.type === 'ARMATURE' && o.data ? (doc.getArmature(o.data)?.bones ?? []) : [];
-      // a renamed bone is found under its new name
-      const bone =
-        bones.find((b) => b.name === params.bone) ?? bones.find((b) => b.name === text(params.name)?.trim());
+      const named = (n: unknown) => bones.find((b) => b.name === n);
+      // under the name the run reports (a rename in the same call makes the name unique); without
+      // a report, the bone asked for or the one renamed to the new name
+      const name = reported(last, 'bone');
+      const bone = name !== null ? named(name) : (named(params.bone) ?? named(text(params.name)?.trim()));
       if (!o || !bone) return {};
       const world = params.space === 'WORLD' ? doc.worldMatrix(o.id) : null;
       const point = (p: Vec3) => (world ? transformPoint3(world, p) : [...p]);
-      return { head: point(bone.head), tail: point(bone.tail), roll: bone.roll };
+      // the rest of what the Bone panel shows: parent, Connected, Deform; and the envelope
+      return {
+        head: point(bone.head),
+        tail: point(bone.tail),
+        roll: bone.roll,
+        parent: bone.parent ?? '',
+        use_connect: bone.use_connect,
+        use_deform: bone.use_deform,
+        envelope_distance: bone.envelope_distance,
+        envelope_weight: bone.envelope_weight,
+        head_radius: bone.head_radius,
+        tail_radius: bone.tail_radius,
+      };
     }
-    case 'constraint.update': {
-      const c = objectConstraint(doc, last, params)?.current;
-      return c
-        ? { target: c.target ?? undefined, subtarget: c.subtarget, influence: c.influence, mute: c.mute }
+    case 'object.shape_key_set': {
+      // the key's settings as the Shape Keys panel shows them (the value at the current frame)
+      const { key: k, meshId } = shapeKeyOf(doc, last, params);
+      return k && meshId
+        ? {
+            value: at('mesh', meshId, shapeKeyPath(k.name), 0, k.value),
+            slider_min: k.slider_min,
+            slider_max: k.slider_max,
+            mute: k.mute,
+            relative_key: k.relative_key,
+          }
         : {};
     }
+    case 'object.particle_system_update': {
+      // the system's visibility as the Particles tab and the outliner show it; the system is the
+      // one the run reports (without `particle_system` the operator edits an object's only one)
+      const systems = editedObject(doc, last, params)?.particle_systems ?? [];
+      const ref = reported(last, 'particle_system') ?? text(params.particle_system);
+      const ps = ref
+        ? findEntry<ParticleSystemData>(systems, ref)
+        : systems.length === 1 && isRecord(systems[0])
+          ? systems[0]
+          : null;
+      return ps ? { show_viewport: ps.show_viewport, show_render: ps.show_render } : {};
+    }
+    case 'constraint.update': {
+      const ctx = objectConstraint(doc, last, params);
+      const c = ctx?.current;
+      if (!c) return {};
+      // the influence at the current frame, as the Constraints tab shows it
+      const influence = ctx.owner
+        ? at('object', ctx.owner.id, constraintPath(c, 'influence'), 0, c.influence)
+        : c.influence;
+      return { target: c.target ?? undefined, subtarget: c.subtarget, influence, mute: c.mute };
+    }
     case 'pose.constraint_set': {
-      const bones = objectOrActive(doc, last, params.object)?.pose?.bones;
+      const o = objectOrActive(doc, last, params.object);
+      const bones = o?.pose?.bones;
       const name = String(params.bone ?? '');
       const pb = bones && Object.hasOwn(bones, name) ? bones[name] : undefined;
       const c = findEntry<ConstraintData>(pb?.constraints, params.constraint);
-      return c
-        ? { target: c.target ?? undefined, subtarget: c.subtarget, influence: c.influence, mute: c.mute }
-        : {};
+      if (!o || !c) return {};
+      // the influence at the current frame, as the bone's constraint panel shows it
+      const path = poseBonePath(name, `constraints[${JSON.stringify(c.name)}].influence`);
+      const influence = at('object', o.id, path, 0, c.influence);
+      return { target: c.target ?? undefined, subtarget: c.subtarget, influence, mute: c.mute };
     }
     case 'object.modifier_set': {
       const m = findEntry<{ id: string; name: string } & Params>(
@@ -181,14 +282,15 @@ export interface RedoForm {
 
 /**
  * The form for adjusting `last`: its parameters with the values the operator kept or computed
- * for unset ones, and pickers that only offer what the operator accepts. Objects the operation
- * created are never offered: adjusting it undoes it first, which deletes them.
+ * for unset ones (animated numbers at the current frame, from `at`), and pickers that only offer
+ * what the operator accepts. Objects the operation created are never offered: adjusting it undoes
+ * it first, which deletes them.
  */
-export function redoForm(doc: SceneDoc, last: LastOperator): RedoForm {
+export function redoForm(doc: SceneDoc, last: LastOperator, at: ValueAt = STORED): RedoForm {
   const params = (last.params ?? {}) as Params;
   const props = (paramSchema(last.id) as { properties?: Record<string, unknown> } | null)?.properties;
   const values: Params = { ...params };
-  for (const [k, v] of Object.entries(keptValues(doc, last, params)))
+  for (const [k, v] of Object.entries(keptValues(doc, last, params, at)))
     if (values[k] === undefined) values[k] = v;
   const exclude = [...HIDDEN, ...(HIDDEN_BY_OPERATOR[last.id] ?? [])];
   const objectKeys: string[] = [];
@@ -209,6 +311,15 @@ export function redoForm(doc: SceneDoc, last: LastOperator): RedoForm {
   }
 
   if (last.id === 'object.align') objectKeys.push('active');
+
+  if (last.id === 'object.shape_key_set') {
+    // Relative To as in the Shape Keys panel: the basis or another key of the mesh
+    const { key, keys } = shapeKeyOf(doc, last, params);
+    choices.relative_key = [
+      { value: '', label: 'Basis' },
+      ...keys.filter((k) => k !== key).map((k) => ({ value: k.name, label: k.name })),
+    ];
+  }
 
   if (last.id === 'object.constraint_add' || last.id === 'constraint.update') {
     if (last.id === 'object.constraint_add') {
@@ -323,7 +434,10 @@ export function RedoPanel({ s }: { s: ProjectSession }) {
   if (!last || s.undo.undoStack.length !== last.undoDepth) return null;
   const def = registry.get(last.id);
   if (!def) return null;
-  const form = redoForm(s.doc, last);
+  // animated kept values at the current frame (reading them follows the frame, like the panels)
+  const form = redoForm(s.doc, last, (type, id, path, index, base) =>
+    animatedValue(s, type, id, path, index, base),
+  );
   return (
     <div
       class="redo-panel"

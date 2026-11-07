@@ -11,6 +11,7 @@ import type {
 import {
   base64Decode,
   base64Encode,
+  buildTopology,
   detectFormat,
   enterEditMode,
   importFile,
@@ -82,6 +83,7 @@ import {
 import {
   browserUiOperator,
   browserUiOperatorsNote,
+  closestOperatorIds,
   findOperatorGroup,
   operatorGroupNames,
   toolOnlyOperator,
@@ -93,6 +95,7 @@ import {
   blockingLateRpcs,
   checkEditorCommand,
   describeLateRpcs,
+  editorClosedMessage,
   editorCommandList,
   editorTimeoutMessage,
 } from './editor-commands';
@@ -160,15 +163,24 @@ const meshSelectionShape = {
   edges: z
     .array(z.tuple([z.number().int().min(0), z.number().int().min(0)]))
     .optional()
-    .describe('Edges as [vertexA, vertexB] pairs'),
+    .describe(
+      'Edges of the mesh as [vertexA, vertexB] pairs: two vertices that follow each other in a face (get_mesh_data faces), or a loose edge',
+    ),
   faces: z.array(z.number().int().min(0)).optional().describe('Face indices'),
   all: z
     .boolean()
     .optional()
-    .describe('Select everything (true) or nothing (false) before applying the lists'),
+    .describe(
+      'Without verts, edges or faces: select everything (true, the default) or nothing (false). With them only the listed elements are selected (all: true is refused)',
+    ),
 };
 // nested argument objects are closed like the tools' arguments (see strict-args.ts)
 const meshSelectionSchema = strictArgObject(meshSelectionShape).describe('Edit-mode element selection');
+const selectModeArg = selectModeEnum
+  .optional()
+  .describe(
+    'VERT selects the listed vertices with the vertices of the listed edges and faces; EDGE only the listed edges and FACE only the listed faces (other lists are refused). Default: inferred (faces alone → FACE, edges alone → EDGE, else VERT)',
+  );
 
 const READ_ONLY: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
 const EDIT: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
@@ -313,9 +325,31 @@ function selectionSummary(p: AgentProject) {
   return out;
 }
 
+/** Where an agent finds the edges of a mesh, for the error of an edge the mesh does not have. */
+const EDGES_HINT =
+  'an edge joins two vertices that follow each other in one of the faces get_mesh_data lists (the last ' +
+  "with the first), or is one of its loose_edges (include: ['loose_edges'])";
+
+type MeshList = 'verts' | 'edges' | 'faces';
+/** The element lists of a mesh selection that each select mode selects from (VERT: by their vertices). */
+const MODE_LISTS: Record<SelectMode, readonly MeshList[]> = {
+  VERT: ['verts', 'edges', 'faces'],
+  EDGE: ['edges'],
+  FACE: ['faces'],
+};
+
+const andList = (items: readonly string[]) =>
+  items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}` : items[0];
+
 /**
- * The Edit Mode element selection `sel` asks for on an object's base mesh. An index the mesh does
- * not have is a ToolError with code POLL_FAILED (a selection that cannot be applied).
+ * The Edit Mode element selection `sel` asks for in select mode `mode` on an object's base mesh.
+ * What cannot be selected as asked is a ToolError with code POLL_FAILED (a selection that cannot be
+ * applied), not silently left out: a list that `mode` does not select from (EDGE uses only `edges`,
+ * FACE only `faces`: an explicit select_mode, as inferSelectMode infers them only from those lists
+ * alone), `all: true` with lists (everything, which the lists would not change), an index the mesh
+ * does not have, or an edge between two of its vertices that no edge of the mesh connects (the
+ * edges of its faces and its loose wire edges: the topology selectionFromEdges selects from, which
+ * would skip it in EDGE mode while VERT mode would select its two vertices).
  */
 function meshSelection(
   p: AgentProject,
@@ -327,8 +361,24 @@ function meshSelection(
   const mesh = o?.data ? p.scene.getMesh(o.data) : null;
   if (!mesh) throw new ToolError('object has no mesh data', 'POLL_FAILED');
   if (!sel) return selectAllElements(mesh);
-  const hasLists = !!(sel.verts?.length || sel.edges?.length || sel.faces?.length);
-  if (!hasLists) return sel.all === false ? emptySelection() : selectAllElements(mesh);
+  const lists = (['verts', 'edges', 'faces'] as const).filter((k) => sel[k]?.length);
+  if (!lists.length) return sel.all === false ? emptySelection() : selectAllElements(mesh);
+  const ignored = lists.filter((k) => !MODE_LISTS[mode].includes(k));
+  if (ignored.length) {
+    const used = mode === 'FACE' ? 'faces' : 'edges';
+    throw new ToolError(
+      `select_mode '${mode}' selects only the listed ${used}, so the listed ${andList(ignored)} would be ` +
+        `ignored: list only ${used}, or leave select_mode out (or pass 'VERT') to select the listed ` +
+        'vertices with the vertices of the listed edges and faces',
+      'POLL_FAILED',
+    );
+  }
+  if (sel.all === true)
+    throw new ToolError(
+      `all: true selects every element, so the listed ${andList(lists)} would change nothing: leave all ` +
+        'out to select only the listed elements, or leave the lists out to select everything',
+      'POLL_FAILED',
+    );
   const nv = mesh.positions.length / 3;
   for (const v of sel.verts ?? [])
     if (v >= nv)
@@ -345,11 +395,21 @@ function meshSelection(
         `face index ${f} out of range (mesh has ${mesh.faces.length} faces)`,
         'POLL_FAILED',
       );
+  const topo = sel.edges?.length ? buildTopology(mesh) : undefined;
+  for (const [a, b] of sel.edges ?? [])
+    if (!topo!.edgeIndex.has(edgeKey(a, b)))
+      throw new ToolError(
+        a === b
+          ? `edge [${a}, ${b}] names vertex ${a} twice: ${EDGES_HINT}`
+          : `edge [${a}, ${b}]: vertices ${a} and ${b} are not connected by an edge of the mesh: ${EDGES_HINT}`,
+        'POLL_FAILED',
+      );
   if (mode === 'FACE') return selectionFromFaces(mesh, sel.faces ?? []);
   if (mode === 'EDGE')
     return selectionFromEdges(
       mesh,
       (sel.edges ?? []).map(([a, b]) => edgeKey(a, b)),
+      topo,
     );
   const verts = new Set(sel.verts ?? []);
   for (const [a, b] of sel.edges ?? []) {
@@ -385,29 +445,14 @@ function codeOf(err: unknown, fallback: ErrorCode): ErrorCode {
   return fallback;
 }
 
-function editDistance(a: string, b: string): number {
-  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= a.length; i++) {
-    let diag = prev[0];
-    prev[0] = i;
-    for (let j = 1; j <= b.length; j++) {
-      const tmp = prev[j];
-      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
-      diag = tmp;
-    }
-  }
-  return prev[b.length];
-}
-
 /**
  * Closest operator ids to a (mistyped) id, ignoring letter case: the registry's and the browser
  * editor's UI operators (BROWSER_UI_OPERATORS), which the note after the list names as such, with
- * what to use instead and how a live editor runs them ('VIEW3D.VIEW_ALL' or 'view3d.view_al' →
- * view3d.view_all).
+ * what to use instead and how a live editor runs them. Completions of the id come first
+ * ('wm.save' → wm.save_mainfile, 'view3d.view' → view3d.view_all …), then the ids nearest by edit
+ * distance ('VIEW3D.VIEW_ALL' or 'view3d.viewall' → view3d.view_all); see closestOperatorIds.
  */
 function suggestOperators(registry: OperatorRegistry, id: string): string {
-  const needle = id.toLowerCase();
-  const tail = needle.split('.').pop() ?? needle;
   const candidates = [
     ...registry
       .list()
@@ -415,20 +460,10 @@ function suggestOperators(registry: OperatorRegistry, id: string): string {
       .map((d) => d.id),
     ...BROWSER_UI_OPERATORS.filter((b) => !registry.has(b)),
   ];
-  const scored = candidates
-    .map((c) => {
-      const cand = c.toLowerCase();
-      let score = editDistance(needle, cand);
-      if (tail.length > 2 && cand.includes(tail)) score -= 3;
-      return { id: c, score };
-    })
-    .sort((a, b) => a.score - b.score || a.id.localeCompare(b.id))
-    .filter((x) => x.score <= Math.max(4, Math.ceil(needle.length / 2)))
-    .slice(0, 8)
-    .map((x) => x.id);
+  const scored = closestOperatorIds(id, candidates);
   if (!scored.length) return '';
   const browser = scored.filter((s) => BROWSER_UI_OPERATORS.includes(s) && !registry.has(s));
-  return ` Did you mean: ${scored.join(', ')}?${browser.length ? ` ${browserUiOperatorsNote(browser, scored)}` : ''}`;
+  return ` Did you mean: ${scored.join(', ')}?${browser.length ? ` ${browserUiOperatorsNote(browser, scored, id)}` : ''}`;
 }
 
 const describeCache = new WeakMap<OperatorRegistry, OperatorInfo[]>();
@@ -956,7 +991,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       .describe('Objects to select (ids or names); replaces the selection'),
     active: z.string().optional().describe('Active object (id or name); defaults to the last selected'),
     mode: z.enum(['OBJECT', 'EDIT']).optional().describe('Interaction mode; EDIT edits the active mesh'),
-    mesh: strictArgObject({ ...meshSelectionShape, select_mode: selectModeEnum.optional() })
+    mesh: strictArgObject({ ...meshSelectionShape, select_mode: selectModeArg })
       .optional()
       .describe('Edit-mode element selection of the active mesh (with mode EDIT)'),
   }).describe(
@@ -967,8 +1002,9 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
    * Sets the agent's selection, active object and mode (and the Edit Mode element selection) from a
    * `selection` argument, all or nothing: when any part fails (an unknown object: NotFoundError;
    * Edit Mode without an active mesh, mesh elements without Edit Mode, an element index out of
-   * range: ToolError with code POLL_FAILED) the agent's editor state is left as it was, and the
-   * error says why.
+   * range, an edge the mesh does not have, lists the select mode does not select from, `all: true`
+   * with lists: ToolError with code POLL_FAILED) the agent's editor state is left as it was, and
+   * the error says why.
    */
   function applySelection(p: AgentProject, sel: z.infer<typeof selectionSchema> | undefined): void {
     if (!sel) return;
@@ -1074,7 +1110,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Run operator',
       description:
-        "Execute any operator by id with JSON parameters (see list_operators), as one undo step. Operators act on the agent's own selection like in Blender: use `selection` to choose objects, the active object and the mode (EDIT + mesh element selection for mesh.* operators) before running. Returns {ok, operator, result, reports, duration_ms, selection}. Every failure is an error result whose first line is the message, followed by JSON {ok: false, operator, error, code, selection} (plus result, reports and duration_ms when the operator ran; without selection when the project is unknown). `code`: INVALID_PARAMS (unknown, misspelled or invalid parameters: fix params), POLL_FAILED (wrong mode, selection or object type, or a `selection` that cannot be applied: mode EDIT without an active mesh, mesh elements without mode EDIT, an element index out of range; change the selection/mode), NOT_FOUND (an unknown project, object, datablock or operator id; unknown ids come with the closest ids, letter case ignored, and ids of the browser editor's own UI operators (view3d.*, wm.*, screen.*, ed.*, render.render …) with what to use here instead where the tools offer it (object.duplicate {offset} for Shift+D's object.duplicate_move, transform.translate / rotate / resize for view3d.transform_modal, mesh.loopcut through edit_mesh for mesh.loopcut_pick, the undo tool for ed.undo …) and how to run them in a live editor: editor_command {command: 'run_operator', params: {operator, params}}) or FAILED (the operator itself failed; render.render_software and render.render_animation are refused: use render_image / render_animation). The message is always one line (line breaks in names show as \\n). A call that fails changes nothing in the agent's editor state: a selection that cannot be applied is not applied at all, and when the operator fails the selection, active object and mode are put back as they were before the call (the failure's `selection` shows them).",
+        "Execute any operator by id with JSON parameters (see list_operators), as one undo step. Operators act on the agent's own selection like in Blender: use `selection` to choose objects, the active object and the mode (EDIT + mesh element selection for mesh.* operators) before running. Returns {ok, operator, result, reports, duration_ms, selection}. Every failure is an error result whose first line is the message, followed by JSON {ok: false, operator, error, code, selection} (plus result, reports and duration_ms when the operator ran; without selection when the project is unknown). `code`: INVALID_PARAMS (unknown, misspelled or invalid parameters: fix params), POLL_FAILED (wrong mode, selection or object type, or a `selection` that cannot be applied: mode EDIT without an active mesh, mesh elements without mode EDIT, an element index out of range, an edge [a, b] whose vertices no edge of the mesh connects, lists that select_mode does not select from (EDGE selects only edges, FACE only faces), all: true with lists; change the selection/mode), NOT_FOUND (an unknown project, object, datablock or operator id; unknown ids come with the closest ids, letter case ignored, the ids they are the beginning of first ('wm.save' → wm.save_mainfile), and ids of the browser editor's own UI operators (view3d.*, wm.*, screen.*, ed.*, render.render …) with what to use here instead where the tools offer it (object.duplicate {offset} for Shift+D's object.duplicate_move, transform.translate / rotate / resize for view3d.transform_modal, mesh.loopcut through edit_mesh for mesh.loopcut_pick, the undo tool for ed.undo, create_project for wm.read_homefile …), how to run them in a live editor (editor_command {command: 'run_operator', params: {operator, params}}) and what they do to the person's editor there) or FAILED (the operator itself failed; render.render_software and render.render_animation are refused: use render_image / render_animation). The message is always one line (line breaks in names show as \\n). A call that fails changes nothing in the agent's editor state: a selection that cannot be applied is not applied at all, and when the operator fails the selection, active object and mode are put back as they were before the call (the failure's `selection` shows them).",
       annotations: EDIT,
       argsHint:
         "Operator parameters go inside `params` (run_operator {project, operator, params: {…}, selection}); list_operators {search} gives each operator's parameters.",
@@ -1127,7 +1163,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Run several operators',
       description:
-        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). Each operation is {operator, params, selection?}: `selection` (as in run_operator: objects, active object, mode, edit-mode mesh elements) is set before that operation runs and stays set for the following ones, for operators that act on the selection (object.convert, object.transform_apply, export_mesh.* use_selection …). An operation that fails changes nothing in the agent's editor state: its selection is not kept (all or nothing, as in run_operator), so the following operations see the selection of before it. With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns {ok, executed, failed, results, selection} with per operation {operator, ok, result | error + code, reports} — `code` is INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED as in run_operator: a selection that cannot be applied fails its operation with an error starting 'selection: ', NOT_FOUND for an unknown object, else POLL_FAILED; unknown operator ids fail with NOT_FOUND and the closest ids, ids of the browser editor's UI operators (view3d.*, wm.*, render.render …) with NOT_FOUND, what to use instead and how to run them in a live editor (editor_command), render.render_software and render.render_animation with FAILED; `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR. When an operation failed, the result is an error whose first line is 'n of m operation(s) failed', followed by that JSON; when the call fails as a whole (an unknown project), the first line is the message and the JSON also has `error` and `code`.",
+        "Run a list of operators in order as a single undo step (one `undo` reverts all of them). Each operation is {operator, params, selection?}: `selection` (as in run_operator: objects, active object, mode, edit-mode mesh elements) is set before that operation runs and stays set for the following ones, for operators that act on the selection (object.convert, object.transform_apply, export_mesh.* use_selection …). An operation that fails changes nothing in the agent's editor state: its selection is not kept (all or nothing, as in run_operator), so the following operations see the selection of before it. With stop_on_error (default true) execution stops at the first failure; changes made before it are kept. Returns {ok, executed, failed, results, selection} with per operation {operator, ok, result | error + code, reports} — `code` is INVALID_PARAMS, POLL_FAILED, NOT_FOUND or FAILED as in run_operator: a selection that cannot be applied fails its operation with an error starting 'selection: ', NOT_FOUND for an unknown object, else POLL_FAILED; unknown operator ids fail with NOT_FOUND and the closest ids, ids of the browser editor's UI operators (view3d.*, wm.*, render.render …) with NOT_FOUND, what to use instead, how to run them in a live editor (editor_command) and what they do there, render.render_software and render.render_animation with FAILED; `reports` are the operator's warnings and notes (e.g. 'scaled object: apply the scale'), exactly as run_operator returns them; operations_with_warnings counts operations that reported a WARNING or ERROR. When an operation failed, the result is an error whose first line is 'n of m operation(s) failed', followed by that JSON; when the call fails as a whole (an unknown project), the first line is the message and the JSON also has `error` and `code`.",
       annotations: EDIT,
       argsHint:
         'Each operation is {operator, params, selection} inside `operations` (batch {project, operations: [{operator, params: {…}, selection: {objects: […]}}, …], stop_on_error}).',
@@ -1736,7 +1772,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Edit mesh',
       description:
-        "Run an edit-mode operator on a mesh object: enters Edit Mode on the object (headless), selects the given vertices/edges/faces (default: everything), runs the operator (mesh.* such as mesh.extrude_region_move {value}, mesh.inset, mesh.subdivide, mesh.loopcut, mesh.delete, mesh.merge, or transform.translate/rotate/resize to move the selected elements), then returns to Object Mode; the object is then the agent's selected and active object. Use list_operators (search 'mesh.') for the catalogue and parameters. One undo step. Returns {ok, operator, result, reports, mesh, selection_after}. Every failure is an error result whose first line is the message, followed by JSON {ok: false, operator, error, code, selection} (plus result, reports, mesh and selection_after when the operator ran; without selection when the project is unknown), with `code` as in run_operator: NOT_FOUND (an unknown project, object or operator id; ids of the browser editor's UI operators say what to use instead, e.g. mesh.loopcut {edge} for mesh.loopcut_pick and transform.* for view3d.transform_modal, and how to run them in a live editor: editor_command), POLL_FAILED (not a mesh object, an element index out of range, the operator's preconditions), INVALID_PARAMS (fix params) or FAILED (the operator itself failed). A call that fails changes nothing in the agent's editor state: its selection, active object and mode stay as they were (the failure's `selection` shows them).",
+        "Run an edit-mode operator on a mesh object: enters Edit Mode on the object (headless), selects the given vertices/edges/faces (default: everything), runs the operator (mesh.* such as mesh.extrude_region_move {value}, mesh.inset, mesh.subdivide, mesh.loopcut, mesh.delete, mesh.merge, or transform.translate/rotate/resize to move the selected elements), then returns to Object Mode; the object is then the agent's selected and active object. Use list_operators (search 'mesh.') for the catalogue and parameters. One undo step. Returns {ok, operator, result, reports, mesh, selection_after}. Every failure is an error result whose first line is the message, followed by JSON {ok: false, operator, error, code, selection} (plus result, reports, mesh and selection_after when the operator ran; without selection when the project is unknown), with `code` as in run_operator: NOT_FOUND (an unknown project, object or operator id; ids of the browser editor's UI operators say what to use instead, e.g. mesh.loopcut {edge} for mesh.loopcut_pick and transform.* for view3d.transform_modal, how to run them in a live editor (editor_command) and what they do there), POLL_FAILED (not a mesh object, an element index out of range, an edge [a, b] whose vertices no edge of the mesh connects, lists that select_mode does not select from (EDGE selects only edges, FACE only faces), all: true with lists, the operator's preconditions), INVALID_PARAMS (fix params) or FAILED (the operator itself failed). A call that fails changes nothing in the agent's editor state: its selection, active object and mode stay as they were (the failure's `selection` shows them).",
       annotations: EDIT,
       argsHint:
         'Operator parameters go inside `params`; the elements to select go inside `selection` {verts, edges, faces, all}.',
@@ -1747,9 +1783,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       operator: z.string().min(1).describe("e.g. 'mesh.extrude_region_move'"),
       params: z.record(z.string(), z.unknown()).optional(),
       selection: meshSelectionSchema.optional(),
-      select_mode: selectModeEnum
-        .optional()
-        .describe('Default: inferred from the selection (faces → FACE, edges → EDGE, else VERT)'),
+      select_mode: selectModeArg,
     },
     async (a) => {
       // every failure is the message plus JSON with a code (see callFailure), like operator failures
@@ -1766,7 +1800,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         if (refused) throw new ToolError(refused.error, refused.code);
         const mode = inferSelectMode(a.selection, a.select_mode);
         before = { ...ap.state };
-        // an element index out of range throws before the operator runs (POLL_FAILED)
+        // an element index out of range or an edge the mesh does not have throws before the
+        // operator runs (POLL_FAILED)
         res = ap.step(() => {
           ap.state.mode = 'OBJECT';
           ap.state.selectedIds = [o.id];
@@ -2323,7 +2358,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'render_image',
     {
       title: 'Render image',
-      description: `Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, same look as the viewport) when available, otherwise the server's software rasterizer: renderer auto waits ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s for the editor's image and then renders on the server (\`note\` says why), renderer browser waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s (a heavy scene in an editor without GPU acceleration, software WebGL, takes tens of seconds) and then fails with what to do instead; an editor may still be drawing an image the server stopped waiting for, and holds up its next renders and commands until it has: meanwhile renders go to another connected editor that is not busy, else renderer auto renders on the server without asking it (\`note\` says so), as it also does for ${SLOW_EDITOR_RETRY_MS / 1000} s after an editor needed longer than auto waits for a RASTER image; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel), or with renderer browser on a browser editor's render workers. The server's software rasterizer (RASTER without a browser editor) draws no shadows, and its glossy reflections come from one small reflection probe in front of what the image centre shows, looked up by direction only: water, floors and large glossy tables far from that point can show reflections the path tracer does not (a wide smear of a nearby object, a far end that is too bright), so judge shadows and reflections with PATHTRACER. Film > Transparent (set_scene_settings film_transparent) gives a transparent background with both engines. Defaults to the scene camera; pass \`camera\` (camera object) or \`view\` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications. The JSON text after the image gives renderer, engine, size, frame, timing, for path tracing samples (reached) and requested_samples, and \`warnings\` (e.g. textures that could not be used, or degenerate triangles skipped, with the objects they belong to).`,
+      description: `Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, the look of its Rendered viewport shading whatever shading it shows; SOLID: grey clay) when available, otherwise the server's software rasterizer: renderer auto waits ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s for the editor's image and then renders on the server (\`note\` says why), renderer browser waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s (a heavy scene in an editor without GPU acceleration, software WebGL, takes tens of seconds) and then fails with what to do instead; an editor may still be drawing an image the server stopped waiting for, and holds up its next renders and commands until it has: meanwhile renders go to another connected editor that is not busy, else renderer auto renders on the server without asking it (\`note\` says so), as it also does for ${SLOW_EDITOR_RETRY_MS / 1000} s after an editor needed longer than auto waits for a RASTER image; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel), or with renderer browser on a browser editor's render workers. The server's software rasterizer (RASTER without a browser editor) draws no shadows, and its glossy reflections come from one small reflection probe in front of what the image centre shows, looked up by direction only: water, floors and large glossy tables far from that point can show reflections the path tracer does not (a wide smear of a nearby object, a far end that is too bright), so judge shadows and reflections with PATHTRACER. Film > Transparent (set_scene_settings film_transparent) gives a transparent background with both engines. Defaults to the scene camera; pass \`camera\` (camera object) or \`view\` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications. The JSON text after the image gives renderer, engine, size, frame, timing, for path tracing samples (reached) and requested_samples, and \`warnings\` (e.g. textures that could not be used, or degenerate triangles skipped, with the objects they belong to).`,
       annotations: READ_ONLY,
     },
     {
@@ -2380,7 +2415,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .enum(['auto', 'browser', 'software'])
         .default('auto')
         .describe(
-          `auto: RASTER on a connected browser editor (WebGL, the viewport's look; the server's rasterizer when none is connected, the editor fails, it has no image after ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s, it is still busy with an earlier image or it was too slow for its last one: asked again ${SLOW_EDITOR_RETRY_MS / 1000} s later), PATHTRACER on the server (all its cores); browser: only a browser editor: RASTER with WebGL (waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s: heavy scenes in software WebGL take tens of seconds), PATHTRACER on the editor's render workers (samples, max_bounces, denoise, time_limit, seed; waits time_limit + ${BROWSER_PATHTRACE_EXTRA_MS / 1000} s; the result does not include the samples reached); software: always the server`,
+          `auto: RASTER on a connected browser editor (WebGL, the look of its Rendered viewport shading; the server's rasterizer when none is connected, the editor fails, it has no image after ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s, it is still busy with an earlier image or it was too slow for its last one: asked again ${SLOW_EDITOR_RETRY_MS / 1000} s later), PATHTRACER on the server (all its cores); browser: only a browser editor: RASTER with WebGL (waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s: heavy scenes in software WebGL take tens of seconds), PATHTRACER on the editor's render workers (samples, max_bounces, denoise, time_limit, seed; waits time_limit + ${BROWSER_PATHTRACE_EXTRA_MS / 1000} s; the result does not include the samples reached); software: always the server`,
         ),
       shading: z
         .enum(['SOLID', 'MATERIAL'])
@@ -2878,7 +2913,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'editor_command',
     {
       title: 'Editor command',
-      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`; get_connected_clients lists them). Commands and their \`params\`: ${editorCommandList()}. run_operator runs the operators of the browser editor's own user interface (view3d.*, wm.*, screen.*, ed.* …), which the run_operator tool does not have (it names them when asked for one), on that editor's selection and undo history. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected. \`timeout_ms\` (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}: under the 60 s request timeout MCP SDK clients use by default) is how long to wait for the editor's answer: in an editor without GPU acceleration (software WebGL, e.g. a headless browser) a heavy scene drawn with materials and lights takes tens of seconds per frame (screenshots, which are drawn that way whatever the editor's shading; the first one also compiles the shaders) and seconds per viewport frame in MATERIAL or RENDERED shading, which other commands wait for; so raise timeout_ms there, switch the viewport to SOLID, take a quick look with render_image {shading: 'SOLID'} (grey clay, much faster) and make final images with render_image. On a timeout the error says so and what to do; the editor may still carry the command out, and its next commands and renders wait until it has (a later timeout names that earlier request; render_image renderer auto renders on the server meanwhile).`,
+      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`; get_connected_clients lists them). Commands and their \`params\`: ${editorCommandList()}. run_operator runs the operators of the browser editor's own user interface (view3d.*, wm.*, screen.*, ed.* …) on the person's editor: its selection, view, frame and undo history, windows on the person's screen, even its project (wm.read_homefile switches that editor to a new project, so it leaves this one before it can answer, and the error says so) and the person's clipboard (wm.share); the run_operator tool refuses them with a message that says what each one does there. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected, or when the editor's connection to the project closes before it answers. \`timeout_ms\` (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}: under the 60 s request timeout MCP SDK clients use by default) is how long to wait for the editor's answer: in an editor without GPU acceleration (software WebGL, e.g. a headless browser) a heavy scene in MATERIAL or RENDERED shading takes seconds per viewport frame, which screenshots in the viewport's shading and the other commands wait for (tens of seconds for the first frame in a shading, which compiles its shaders), and a screenshot in MATERIAL or RENDERED shading while the viewport shows another one builds and compiles the scene's materials for that image (tens of seconds with many materials); so raise timeout_ms there, take screenshots with shading 'SOLID' (grey clay, much faster) or switch the viewport to SOLID, take a quick look with render_image {shading: 'SOLID'} and make final images with render_image. On a timeout the error says so and what to do; the editor may still carry the command out, and its next commands and renders wait until it has (a later timeout names that earlier request; render_image renderer auto renders on the server meanwhile).`,
       annotations: { ...EDIT, openWorldHint: true },
       argsHint: 'Command parameters go inside `params` (editor_command {project, command, params: {…}}).',
     },
@@ -2897,7 +2932,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .max(MAX_EDITOR_TIMEOUT_MS)
         .default(DEFAULT_EDITOR_TIMEOUT_MS)
         .describe(
-          `How long to wait for the editor's answer in ms (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}, under the 60 s default request timeout of MCP SDK clients); heavy scenes in software WebGL take tens of seconds per screenshot`,
+          `How long to wait for the editor's answer in ms (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}, under the 60 s default request timeout of MCP SDK clients); in software WebGL a heavy scene takes seconds per viewport frame in MATERIAL or RENDERED shading, and tens of seconds per screenshot in one of them while the viewport shows another shading`,
         ),
     },
     async (a, extra) => {
@@ -2931,7 +2966,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           );
         }
         if (err instanceof RpcError && err.code === 'TIMEOUT')
-          throw new ToolError(editorTimeoutMessage(a.command, a.timeout_ms, busy));
+          throw new ToolError(editorTimeoutMessage(a.command, a.timeout_ms, busy, a.params ?? {}));
+        // the editor left the project before it answered (wm.read_homefile does so on purpose)
+        if (err instanceof RpcError && err.code === 'CLOSED')
+          throw new ToolError(editorClosedMessage(a.command, a.params ?? {}));
         throw new ToolError(`editor_command '${a.command}' failed: ${errorMessage(err)}`);
       } finally {
         stopKeepAlive();

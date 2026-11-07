@@ -10,10 +10,13 @@ import {
   SceneDoc,
   SceneEvaluator,
   createEditorState,
+  createFCurve,
   defineOperator,
+  fcurveKey,
+  insertKeyframe,
   type OperatorContext,
 } from '@3d-editor/core';
-import { session as sessionSignal } from '../src/app/store';
+import { session as sessionSignal, toasts } from '../src/app/store';
 import { registry, runResult } from '../src/editor/editor';
 import { infoLog, lastOperator, redoLast, runOperator } from '../src/editor/runner';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
@@ -63,7 +66,9 @@ function select(s: ProjectSession, ...names: string[]): void {
  * An MCP agent's replica of the project, synced both ways like the sync hub: its edits reach the
  * session as remote updates, which are not on the session's undo stack.
  */
-function agentReplica(s: ProjectSession): (id: string, params: Record<string, unknown>) => void {
+/** Runs an operator as the agent; `doc` is the agent's replica (for edits without an operator). */
+type Agent = ((id: string, params: Record<string, unknown>) => void) & { doc: SceneDoc };
+function agentReplica(s: ProjectSession): Agent {
   const peer = SceneDoc.fromUpdate(s.doc.encodeState(), { type: 'agent' });
   s.doc.ydoc.on('update', (u: Uint8Array, origin: unknown) => {
     if (origin !== 'from-peer') Y.applyUpdate(peer.ydoc, u, 'from-main');
@@ -78,10 +83,11 @@ function agentReplica(s: ProjectSession): (id: string, params: Record<string, un
     source: 'mcp',
     report: () => undefined,
   };
-  return (id, params) => {
+  const run = (id: string, params: Record<string, unknown>) => {
     const r = registry.run(ctx, id, params);
     if (!r.ok) throw new Error(`${id} failed on the agent: ${r.error}`);
   };
+  return Object.assign(run, { doc: peer });
 }
 
 /** Whether the Adjust Last Operation panel is still offered for the last operator. */
@@ -526,6 +532,132 @@ describe('Adjust Last Operation shows what "set" operators keep', () => {
     expect(bone.roll).toBeCloseTo(0.25);
   });
 
+  it('Edit Bone: unset parent, Connected, Deform and envelope show the bone', () => {
+    // regression: after a click in the Bone panel (one setting passed) Connected read unchecked,
+    // the parent empty and the envelope settings "Auto", contradicting the Properties editor
+    ok('object.armature_add', { name: 'Rig', bone_name: 'Upper' });
+    const rig = id('Rig');
+    ok('armature.bone_add', { object: rig, name: 'Lower', parent: 'Upper' });
+    ok('armature.bone_update', {
+      object: rig,
+      bone: 'Lower',
+      use_connect: true,
+      envelope_distance: 0.4,
+      envelope_weight: 2,
+      head_radius: 0.2,
+      tail_radius: 0.15,
+    });
+    // what the Bone panel runs for a click on Deform
+    ok('armature.bone_update', { object: rig, bone: 'Lower', use_deform: false });
+    let root = panel();
+    expect(field(root, 'redo-panel')?.textContent).toContain('Edit Bone');
+    const on = (k: string) => field(root, `redo-${k}`)!.classList.contains('on');
+    const value = (k: string) => field(root, `redo-${k}`)!.querySelector('.nf-value')?.textContent;
+    const parent = field(root, 'redo-parent')!;
+    expect(
+      ((parent.tagName === 'INPUT' ? parent : parent.querySelector('input')) as HTMLInputElement).value,
+    ).toBe('Upper');
+    expect([on('use_connect'), on('use_deform')]).toEqual([true, false]);
+    expect(['envelope_distance', 'envelope_weight', 'head_radius', 'tail_radius'].map(value)).toEqual([
+      '0.4',
+      '2',
+      '0.2',
+      '0.15',
+    ]);
+    // a re-run passes the call's own parameters and the edited one: the rest stays as it is
+    typeNumber(field(root, 'redo-tail_radius')!, '0.1');
+    expect(lastOperator.value?.params).toMatchObject({ bone: 'Lower', use_deform: false, tail_radius: 0.1 });
+    expect(Object.keys(lastOperator.value!.params as object)).not.toContain('use_connect');
+    const bone = () => s.doc.getArmature(s.doc.getObject(rig)!.data!)!.bones.find((b) => b.name === 'Lower')!;
+    expect(bone()).toMatchObject({
+      parent: 'Upper',
+      use_connect: true,
+      use_deform: false,
+      envelope_distance: 0.4,
+      envelope_weight: 2,
+      head_radius: 0.2,
+      tail_radius: 0.1,
+    });
+    root = panel();
+    expect([on('use_connect'), value('tail_radius')]).toEqual([true, '0.1']);
+  });
+
+  it('Set Shape Key: unset settings show the key; a re-run changes only the edited one', () => {
+    // regression: after a value edit in the Shape Keys panel (only the value passed) Mute read
+    // unchecked and Slider Min / Max "Auto", contradicting the Properties editor
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    const cube = id('Cube');
+    ok('object.shape_key_add', { object: cube });
+    ok('object.shape_key_add', { object: cube });
+    const keys = () => s.doc.getShapeKeys(s.doc.getObject(cube)!.data!);
+    expect(keys().map((k) => k.name)).toEqual(['Key 1', 'Key 2']);
+    ok('object.shape_key_set', { object: cube, key: 'Key 1', mute: true, slider_min: -1, slider_max: 2 });
+    // what the Shape Keys panel runs for a value edit
+    ok('object.shape_key_set', { object: cube, key: 'Key 1', value: 0.5 });
+    let root = panel();
+    expect(field(root, 'redo-panel')?.textContent).toContain('Set Shape Key');
+    const on = (k: string) => field(root, `redo-${k}`)!.classList.contains('on');
+    const value = (k: string) => field(root, `redo-${k}`)!.querySelector('.nf-value')?.textContent;
+    expect(on('mute')).toBe(true);
+    expect(['value', 'slider_min', 'slider_max'].map(value)).toEqual(['0.5', '-1', '2']);
+    // Relative To as the Shape Keys panel offers it
+    const relative = field(root, 'redo-relative_key') as HTMLSelectElement;
+    expect(relative.value).toBe('');
+    expect(optionLabels(relative)).toEqual(['Basis', 'Key 2']);
+
+    // raising the maximum re-runs with only that setting changed
+    typeNumber(field(root, 'redo-slider_max')!, '3');
+    expect(lastOperator.value?.params).toMatchObject({ key: 'Key 1', value: 0.5, slider_max: 3 });
+    expect(Object.keys(lastOperator.value!.params as object)).not.toContain('mute');
+    expect(keys()[0]).toMatchObject({
+      value: 0.5,
+      mute: true,
+      slider_min: -1,
+      slider_max: 3,
+      relative_key: '',
+    });
+    root = panel();
+    expect([on('mute'), value('slider_min'), value('slider_max')]).toEqual([true, '-1', '3']);
+    // after a mute click (the value left out) the value shows the key's
+    ok('object.shape_key_set', { object: cube, key: 'Key 1', mute: false });
+    root = panel();
+    expect([on('mute'), value('value')]).toEqual([false, '0.5']);
+    fireEvent.change(field(root, 'redo-relative_key')!, { target: { value: 'Key 2' } });
+    expect(keys()[0]).toMatchObject({ mute: false, value: 0.5, relative_key: 'Key 2' });
+  });
+
+  it('Update Particle System: unset visibility shows the system’s; a re-run changes only the edited one', () => {
+    // regression: after the Particles tab's viewport toggle (only show_viewport passed) Show Render
+    // read unchecked, contradicting the Properties editor
+    ok('mesh.primitive_plane_add', { name: 'Ground' });
+    const ground = id('Ground');
+    ok('object.particle_system_add', { object: ground });
+    const ps = () => s.doc.getObject(ground)!.particle_systems[0];
+    ok('object.particle_system_update', {
+      object: ground,
+      particle_system: ps().id,
+      show_render: true,
+      show_viewport: true,
+    });
+    // what the Particles tab (and the outliner) runs for a click on the viewport toggle
+    ok('object.particle_system_update', { object: ground, particle_system: ps().id, show_viewport: false });
+    let root = panel();
+    expect(field(root, 'redo-panel')?.textContent).toContain('Update Particle System');
+    const on = (k: string) => field(root, `redo-${k}`)!.classList.contains('on');
+    expect([on('show_viewport'), on('show_render')]).toEqual([false, true]);
+    // unchecking Show Render re-runs with only that setting changed
+    fireEvent.click(field(root, 'redo-show_render')!);
+    expect(lastOperator.value?.params).toEqual({
+      object: ground,
+      particle_system: ps().id,
+      show_viewport: false,
+      show_render: false,
+    });
+    expect(ps()).toMatchObject({ show_viewport: false, show_render: false });
+    root = panel();
+    expect([on('show_viewport'), on('show_render')]).toEqual([false, false]);
+  });
+
   it('Edit Bone Constraint: shows the current target; with a bone set only armatures that have it', () => {
     ok('mesh.primitive_cube_add', { name: 'Cube' });
     ok('object.armature_add', { name: 'Rig', bone_name: 'Arm' });
@@ -609,6 +741,141 @@ describe('Adjust Last Operation shows what "set" operators keep', () => {
     const mod = () => s.doc.findObjectByName('Cube')!.modifiers[0];
     expect(mod().show_viewport).toBe(false);
     expect(mod().params.levels).toBe(2);
+  });
+});
+
+describe('Adjust Last Operation shows what the operation edited, however it was called', () => {
+  const on = (root: HTMLElement, k: string) => field(root, `redo-${k}`)!.classList.contains('on');
+  const value = (root: HTMLElement, k: string) =>
+    field(root, `redo-${k}`)!.querySelector('.nf-value')?.textContent;
+
+  it('Update Particle System without particle_system: the object’s only system', () => {
+    // regression: run without `particle_system` (the operator then edits the object's only system;
+    // the console, an agent's editor_command run_operator) Show Render read unchecked although on
+    ok('mesh.primitive_plane_add', { name: 'Ground' });
+    const ground = id('Ground');
+    ok('object.particle_system_add', { object: ground });
+    const ps = () => s.doc.getObject(ground)!.particle_systems[0];
+    // the emitter named, or the active object
+    for (const params of [{ object: ground }, {}]) {
+      select(s, 'Ground');
+      ok('object.particle_system_update', { ...params, show_viewport: false });
+      expect([ps().show_viewport, ps().show_render]).toEqual([false, true]);
+      let root = panel();
+      expect([on(root, 'show_viewport'), on(root, 'show_render')]).toEqual([false, true]);
+      // a re-run still passes only the call's own parameters and the edited one
+      fireEvent.click(field(root, 'redo-show_render')!);
+      expect(lastOperator.value?.params).toEqual({ ...params, show_viewport: false, show_render: false });
+      expect([ps().show_viewport, ps().show_render]).toEqual([false, false]);
+      root = panel();
+      expect([on(root, 'show_viewport'), on(root, 'show_render')]).toEqual([false, false]);
+      ok('object.particle_system_update', { object: ground, show_viewport: true, show_render: true });
+    }
+  });
+
+  it('Set Shape Key renaming to a taken name: the renamed key, not the one that has the name', () => {
+    // regression: the key was looked up under the name asked for, which the other key has ('Key 1'
+    // renamed to 'Key 2' became 'Key 2.001'), so the panel showed the other key's settings
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    const cube = id('Cube');
+    ok('object.shape_key_add', { object: cube });
+    ok('object.shape_key_add', { object: cube });
+    ok('object.shape_key_add', { object: cube });
+    const keys = () => s.doc.getShapeKeys(s.doc.getObject(cube)!.data!);
+    ok('object.shape_key_set', { object: cube, key: 'Key 1', mute: true, slider_max: 3 });
+    ok('object.shape_key_set', { object: cube, key: 'Key 1', name: 'Key 2' });
+    expect(keys().map((k) => k.name)).toEqual(['Key 2.001', 'Key 2', 'Key 3']);
+    let root = panel();
+    expect([on(root, 'mute'), value(root, 'slider_max')]).toEqual([true, '3']);
+    // Relative To offers the other keys, not the renamed key itself
+    expect(optionLabels(field(root, 'redo-relative_key'))).toEqual(['Basis', 'Key 2', 'Key 3']);
+    // adjusting renames it again, and the panel follows it
+    typeNumber(field(root, 'redo-slider_min')!, '-2');
+    expect(keys()[0]).toMatchObject({ name: 'Key 2.001', mute: true, slider_min: -2, slider_max: 3 });
+    expect(keys()[1]).toMatchObject({ name: 'Key 2', mute: false, slider_min: 0, slider_max: 1 });
+    root = panel();
+    expect([on(root, 'mute'), value(root, 'slider_min'), value(root, 'slider_max')]).toEqual([
+      true,
+      '-2',
+      '3',
+    ]);
+  });
+
+  it('Edit Bone renaming to a taken name: the renamed bone, not the one that has the name', () => {
+    ok('object.armature_add', { name: 'Rig', bone_name: 'Arm' });
+    const rig = id('Rig');
+    ok('armature.bone_add', { object: rig, name: 'Hand', head: [1, 0, 0], tail: [1, 0, 1] });
+    ok('armature.bone_update', { object: rig, bone: 'Arm', use_deform: false, envelope_distance: 0.4 });
+    ok('armature.bone_update', { object: rig, bone: 'Arm', name: 'Hand' });
+    const bones = () => s.doc.getArmature(s.doc.getObject(rig)!.data!)!.bones;
+    expect(bones().map((b) => b.name)).toEqual(['Hand.001', 'Hand']);
+    const root = panel();
+    expect(shown(root, 'tail')).toEqual(['0', '0', '1']);
+    expect([on(root, 'use_deform'), value(root, 'envelope_distance')]).toEqual([false, '0.4']);
+  });
+
+  describe('animated numbers show their value at the current frame, as the Properties editor shows them', () => {
+    // regression: kept values were the stored values, which an animation overrides: a shape key's
+    // value, a pose bone's transform and a constraint's influence read otherwise than in the
+    // Properties editor
+    /** Keys a channel from 0 at frame 1 to `to` at frame 11 (linear), and goes to frame 6. */
+    const animate = (type: 'object' | 'mesh', target: string, path: string, index: number, to: number) => {
+      let fc = createFCurve({ target_type: type, target_id: target, path, index });
+      fc = insertKeyframe(fc, 1, 0, 'LINEAR');
+      s.doc.setFCurve(insertKeyframe(fc, 11, to, 'LINEAR'));
+      s.state.frame = 6;
+    };
+
+    it('a shape key’s value, also when the frame changes', () => {
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      const cube = id('Cube');
+      ok('object.shape_key_add', { object: cube });
+      animate('mesh', s.doc.getObject(cube)!.data!, 'shape_keys["Key 1"].value', 0, 1);
+      ok('object.shape_key_set', { object: cube, key: 'Key 1', mute: true });
+      const root = panel();
+      expect(value(root, 'value')).toBe('0.5');
+      act(() => {
+        s.state.frame = 11;
+      });
+      expect(value(root, 'value')).toBe('1');
+    });
+
+    it('a pose bone’s transform', () => {
+      ok('object.armature_add', { name: 'Rig' });
+      const rig = id('Rig');
+      animate('object', rig, 'pose.bones["Bone"].location', 1, 2);
+      ok('pose.bone_transform_set', { object: rig, bone: 'Bone', scale: [2, 2, 2] });
+      const root = panel();
+      expect(shown(root, 'location')).toEqual(['0', '1', '0']);
+      expect(shown(root, 'scale')).toEqual(['2', '2', '2']);
+    });
+
+    it('an object constraint’s influence', () => {
+      ok('mesh.primitive_cube_add', { name: 'Goal', location: [3, 0, 0] });
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      const cube = id('Cube');
+      ok('object.constraint_add', { object: cube, type: 'COPY_LOCATION', target: 'Goal' });
+      const c = s.doc.getObject(cube)!.constraints[0];
+      animate('object', cube, `constraints["${c.name}"].influence`, 0, 1);
+      ok('constraint.update', { object: cube, constraint: c.id, mute: false });
+      expect(value(panel(), 'influence')).toBe('0.5');
+    });
+
+    it('a bone constraint’s influence; a re-run does not pass it', () => {
+      ok('mesh.primitive_cube_add', { name: 'Goal', location: [3, 0, 0] });
+      ok('object.armature_add', { name: 'Rig' });
+      const rig = id('Rig');
+      ok('pose.constraint_add', { object: rig, bone: 'Bone', type: 'COPY_LOCATION', target: 'Goal' });
+      const c = () => s.doc.getObject(rig)!.pose!.bones.Bone.constraints![0];
+      animate('object', rig, `pose.bones["Bone"].constraints["${c().name}"].influence`, 0, 1);
+      ok('pose.constraint_set', { object: rig, bone: 'Bone', constraint: c().id, mute: false });
+      const root = panel();
+      expect(value(root, 'influence')).toBe('0.5');
+      fireEvent.click(field(root, 'redo-mute')!);
+      expect(lastOperator.value?.params).toMatchObject({ mute: true });
+      expect(Object.keys(lastOperator.value!.params as object)).not.toContain('influence');
+      expect(c()).toMatchObject({ mute: true, influence: 1 });
+    });
   });
 });
 
@@ -734,5 +1001,205 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
     s.undo.undo();
     expect(s.doc.findObjectByName('Light')).toBeNull();
     expect(cube().constraints).toHaveLength(1);
+  });
+
+  /** Expects an object's location, component by component. */
+  const expectLocation = (name: string, xyz: number[]) =>
+    s.doc
+      .findObjectByName(name)!
+      .location.forEach((v, i) => expect(v, `${name}.location[${i}]`).toBeCloseTo(xyz[i], 9));
+  const MOVE_WARNING =
+    'Move can no longer be adjusted: an agent or another user has changed what it did since';
+
+  it('a move an agent changed part of can no longer be adjusted (adjusting would move that part twice)', () => {
+    // regression: only steps others had overwritten entirely were refused. Here Yjs undid the move
+    // of B only (the agent had set A's location since) and the re-run moved both objects again:
+    // A ended at 8 (the agent's 6 moved twice) and B at 2
+    ok('mesh.primitive_cube_add', { name: 'A' });
+    ok('mesh.primitive_cube_add', { name: 'B', location: [0, 5, 0] });
+    select(s, 'A', 'B');
+    ok('transform.translate', { value: [1, 0, 0] });
+    const root = panel();
+    const depth = s.undo.undoStack.length;
+    const selection = [...s.state.selectedIds];
+    const agent = agentReplica(s);
+    act(() => agent('object.transform_set', { objects: ['A'], location: [6, 0, 0] }));
+    // the agent's edit is not on this session's undo stack: the panel is still offered
+    expect(panelOffered(s)).toBe(true);
+    typeNumber(field(root, 'redo-value-0')!, '2');
+    // nothing is undone or run again
+    expectLocation('A', [6, 0, 0]);
+    expectLocation('B', [1, 5, 0]);
+    expect(s.undo.undoStack.length).toBe(depth);
+    expect(s.undo.redoStack).toHaveLength(0);
+    expect(s.state.selectedIds).toEqual(selection);
+    // the panel closes, saying why
+    expect(lastOperator.value).toBeNull();
+    expect(field(root, 'redo-panel')).toBeNull();
+    expect(infoLog.value.at(-1)).toMatchObject({ level: 'WARNING', message: MOVE_WARNING });
+    expect(toasts.value.at(-1)).toMatchObject({ level: 'warning', message: MOVE_WARNING });
+    // Ctrl+Z still undoes the move where the agent left it
+    s.undo.undo();
+    expectLocation('A', [6, 0, 0]);
+    expectLocation('B', [0, 5, 0]);
+  });
+
+  it('edits of other objects and of fields the operation did not write leave it adjustable', () => {
+    ok('mesh.primitive_cube_add', { name: 'A' });
+    ok('mesh.primitive_cube_add', { name: 'B', location: [0, 5, 0] });
+    ok('mesh.primitive_cube_add', { name: 'C', location: [0, -5, 0] });
+    select(s, 'A', 'B');
+    ok('transform.translate', { value: [1, 0, 0] });
+    const depth = s.undo.undoStack.length;
+    const agent = agentReplica(s);
+    // another object, and fields of a moved object that a move does not write: its name, its
+    // modifier stack and its visibility in renders
+    agent('object.transform_set', { objects: ['C'], location: [3, -5, 0] });
+    agent('object.rename', { object: 'A', name: 'Alpha' });
+    agent('object.modifier_add', { object: 'Alpha', type: 'SUBSURF' });
+    agent('data.set_property', { kind: 'objects', target: 'Alpha', values: { hide_render: true } });
+    const params = lastOperator.value!.params as Record<string, unknown>;
+    expect(redoLast(s, registry, { ...params, value: [2, 0, 0] })?.ok).toBe(true);
+    // the adjusted move, from where the objects were, with the agent's edits kept
+    expectLocation('Alpha', [2, 0, 0]);
+    expectLocation('B', [2, 5, 0]);
+    expectLocation('C', [3, -5, 0]);
+    const alpha = s.doc.findObjectByName('Alpha')!;
+    expect(alpha.modifiers.map((m) => m.type)).toEqual(['SUBSURF']);
+    expect(alpha.hide_render).toBe(true);
+    expect(s.undo.undoStack.length).toBe(depth);
+    expect(panelOffered(s)).toBe(true);
+    // one undo step reverts the adjusted move only
+    s.undo.undo();
+    expectLocation('Alpha', [0, 0, 0]);
+    expectLocation('B', [0, 5, 0]);
+    expectLocation('C', [3, -5, 0]);
+    expect(s.doc.findObjectByName('Alpha')!.modifiers).toHaveLength(1);
+  });
+
+  it('an edit of a field the operation wrote counts as changing it, whatever part of the field it edits', () => {
+    // every field of an object is stored whole: a move writes the location, rotation and scale of
+    // each object it moves, adding a modifier writes the object's whole modifier stack; deleting
+    // an object removes what an operation wrote into it
+    const cases: { name: string; label: string; setup: () => void; agent: (run: Agent) => void }[] = [
+      {
+        name: 'the rotation of a moved object',
+        label: 'Move',
+        setup: () => {
+          ok('mesh.primitive_cube_add', { name: 'A' });
+          select(s, 'A');
+          ok('transform.translate', { value: [1, 0, 0] });
+        },
+        agent: (run) => run('object.transform_set', { objects: ['A'], rotation_euler: [0, 0, 1] }),
+      },
+      {
+        name: 'another modifier of the object a modifier was added to',
+        label: 'Add Modifier',
+        setup: () => {
+          ok('mesh.primitive_cube_add', { name: 'A' });
+          ok('object.modifier_add', { object: 'A', type: 'BEVEL' });
+          select(s, 'A');
+          ok('object.modifier_add', { object: 'A', type: 'SUBSURF' });
+        },
+        agent: (run) => {
+          const bevel = s.doc.findObjectByName('A')!.modifiers[0].id;
+          run('object.modifier_set', { object: 'A', modifier: bevel, params: { width: 0.2 } });
+        },
+      },
+      {
+        name: 'deleting one of the moved objects',
+        label: 'Move',
+        setup: () => {
+          ok('mesh.primitive_cube_add', { name: 'A' });
+          ok('mesh.primitive_cube_add', { name: 'B', location: [0, 5, 0] });
+          select(s, 'A', 'B');
+          ok('transform.translate', { value: [1, 0, 0] });
+        },
+        agent: (run) => run('object.delete', { objects: ['B'] }),
+      },
+    ];
+    for (const c of cases) {
+      s = fakeSession();
+      sessionSignal.value = s;
+      lastOperator.value = null;
+      c.setup();
+      const before = s.doc.encodeState();
+      const depth = s.undo.undoStack.length;
+      expect(lastOperator.peek()?.label, c.name).toBe(c.label);
+      const agent = agentReplica(s);
+      c.agent(agent);
+      const changed = s.doc.encodeState();
+      expect(changed, c.name).not.toEqual(before);
+      const params = lastOperator.peek()!.params as Record<string, unknown>;
+      expect(redoLast(s, registry, params), c.name).toBeNull();
+      // nothing changed: the document is as the agent left it
+      expect(s.doc.encodeState(), c.name).toEqual(changed);
+      expect(s.undo.undoStack.length, c.name).toBe(depth);
+      expect(infoLog.value.at(-1)?.message, c.name).toBe(
+        `${c.label} can no longer be adjusted: an agent or another user has changed what it did since`,
+      );
+    }
+  });
+
+  it('an operation that removed an entry others have set again can no longer be adjusted', () => {
+    // an operator that removes a channel's F-curve and sets the frame range
+    const reg = new OperatorRegistry();
+    reg.register(
+      defineOperator({
+        id: 'test.clear_channel',
+        label: 'Clear Channel',
+        description: 'Removes the F-curve `fcurve` and sets frame_end',
+        category: 'Test',
+        redoable: true,
+        schema: z.object({ fcurve: z.string(), end: z.number() }),
+        execute(ctx, p) {
+          ctx.doc.removeFCurve(p.fcurve);
+          ctx.doc.updateScene({ frame_end: p.end });
+          return {};
+        },
+      }),
+    );
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    const channel = { target_type: 'object' as const, target_id: id('Cube'), path: 'location', index: 0 };
+    s.doc.setFCurve(insertKeyframe(createFCurve(channel), 1, 0, 'LINEAR'));
+    const key = fcurveKey(channel);
+    expect(runOperator(s, reg, 'test.clear_channel', { fcurve: key, end: 50 }, 'test').ok).toBe(true);
+    const depth = s.undo.undoStack.length;
+    // the agent keys the channel again, setting the F-curve entry the operation removed
+    const agent = agentReplica(s);
+    agent.doc.setFCurve(insertKeyframe(createFCurve(channel), 10, 3, 'LINEAR'));
+    // regression: Yjs could not bring the removed F-curve back (the agent's is newer) but undid the
+    // frame range, and the re-run removed the agent's F-curve
+    expect(redoLast(s, reg, { fcurve: key, end: 60 })).toBeNull();
+    expect(s.doc.getFCurve(key)?.keyframes.map((k) => [k.frame, k.value])).toEqual([[10, 3]]);
+    expect(s.doc.getScene().frame_end).toBe(50);
+    expect(s.undo.undoStack.length).toBe(depth);
+    expect(lastOperator.value).toBeNull();
+    expect(infoLog.value.at(-1)?.message).toBe(
+      'Clear Channel can no longer be adjusted: an agent or another user has changed what it did since',
+    );
+  });
+
+  it('a property edit others changed part of runs again on top of their change', () => {
+    ok('object.armature_add', { name: 'Rig', bone_name: 'Elbow' });
+    const rig = id('Rig');
+    ok('pose.bone_transform_set', { object: rig, bone: 'Elbow', location: [0, 0.5, 0], keyframe: true });
+    const depth = s.undo.undoStack.length;
+    // the agent sets an IK setting of the bone, which stores the armature's whole pose again: the
+    // pose is theirs now, the keyframes the edit inserted are still the edit's
+    const agent = agentReplica(s);
+    agent('pose.ik_settings_set', { object: 'Rig', bone: 'Elbow', ik_stiffness_x: 0.5 });
+    const params = lastOperator.value!.params as Record<string, unknown>;
+    expect(redoLast(s, registry, { ...params, location: [0, 1, 0] })?.ok).toBe(true);
+    expect(pb()).toMatchObject({ location: [0, 1, 0], ik_stiffness_x: 0.5 });
+    // the keyframes are the adjusted edit's, once
+    const keys = s.doc
+      .listFCurves(rig)
+      .filter((fc) => fc.path === 'pose.bones["Elbow"].location')
+      .sort((a, b) => a.index - b.index)
+      .map((fc) => fc.keyframes.map((k) => k.value));
+    expect(keys).toEqual([[0], [1], [0]]);
+    expect(s.undo.undoStack.length).toBe(depth);
+    expect(panelOffered(s)).toBe(true);
   });
 });

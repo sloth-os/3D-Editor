@@ -175,36 +175,43 @@ export function toolOnlyOperator(id: string): string | null {
 }
 
 /**
- * What agents use instead of some of the browser editor's UI operators, when they want the edit
- * rather than the editor's UI: `instead` is the sentence that says what (a server operator or a
- * tool, on the agent's own selection and undo history), `use` names it briefly for did-you-mean
- * lists, and `editor` says what the operator does in a live editor that an agent may not expect:
- * several are interactive there (they wait for the person's mouse), others act on the editor
- * user's selection, frame or undo history. Shift+D (object.duplicate_move), for one, is the id
- * agents know from Blender: run in a live editor it duplicates the person's selection and leaves a
- * mouse-driven move running.
+ * What the browser editor's UI operators do in a live editor, and what agents use instead where
+ * the tools offer it. `editor` says what the operator does there, which an agent may not expect:
+ * it acts on the person's editor, not on the agent's own state: their view and view settings,
+ * selection, frame, tool and undo history, windows and menus on their screen, their project and
+ * clipboard, and several are interactive (they wait for the person's mouse). Shift+D
+ * (object.duplicate_move), for one, is the id agents know from Blender: run in a live editor it
+ * duplicates the person's selection and leaves a mouse-driven move running. `instead` is the
+ * sentence that says what to use for the edit (a server operator or a tool, on the agent's own
+ * selection and undo history), and `use` names it briefly for did-you-mean lists. What each one
+ * does is ui-operators.ts in apps/web (the web editor registers them there).
  */
 interface BrowserOperatorAdvice {
-  instead: string;
+  editor: string;
+  instead?: string;
   use?: string;
-  editor?: string;
 }
 
 const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
   'ed.undo': {
     instead: 'To undo your own changes use the undo tool.',
     use: 'the undo tool',
-    editor: "it undoes the editor user's last change, not yours",
+    editor:
+      "it undoes the last change in that editor's undo history: the person's, or an operator run there with " +
+      'editor_command, never your changes made with the tools',
   },
   'ed.redo': {
     instead: 'To redo your own undone changes use the redo tool.',
     use: 'the redo tool',
-    editor: "it redoes the editor user's last undone change, not yours",
+    editor:
+      "it redoes the last change undone in that editor's undo history, never your changes made with the tools",
   },
   'screen.repeat_last': {
     instead: 'To repeat an operation run it again with run_operator (or several in one batch).',
     use: 'run_operator again',
-    editor: "it repeats the editor user's last operation on the editor's selection",
+    editor:
+      "it runs the person's last operation again (operations run with editor_command are not repeated) on " +
+      "the editor's selection, as a new step of the person's undo history",
   },
   'object.duplicate_move': {
     instead:
@@ -217,62 +224,175 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
     instead:
       'To move, rotate or scale use transform.translate {value}, transform.rotate {value, orient_axis} or transform.resize {value} on your selection (through edit_mesh for mesh elements), or the transform_object tool.',
     use: 'transform.translate / transform.rotate / transform.resize',
-    editor: "it starts a move, rotation or scale of the editor's selection that follows the person's mouse",
+    editor:
+      "it starts a move, rotation or scale of the editor's selection that follows the person's mouse until " +
+      'they click',
   },
   'mesh.loopcut_pick': {
     instead:
       "To cut a loop use edit_mesh {object, operator: 'mesh.loopcut', params: {edge: [a, b], number_cuts}}, where edge is an edge of the ring as two vertex indices of the base mesh (get_mesh_data).",
     use: 'mesh.loopcut through edit_mesh',
-    editor: "it cuts the edge ring under the person's mouse pointer",
+    editor:
+      "in Edit Mode it cuts the edge ring of the editor's active mesh under the person's mouse pointer, and " +
+      'fails when the pointer is over no edge',
   },
   'sculpt.commit_stroke': {
     instead:
       'To sculpt or paint use sculpt.brush_stroke or paint.vertex_color_stroke with the points of the stroke.',
     use: 'sculpt.brush_stroke / paint.vertex_color_stroke',
-    editor: 'it commits the stroke the person is drawing with the mouse',
+    editor:
+      'it commits the sculpt or paint stroke the person is drawing with the mouse, and fails when there is none',
   },
   'render.render': {
     instead: 'For an image use render_image (render_animation for an animation): they need no editor.',
     use: 'render_image',
-    editor: 'it opens the Render window',
+    editor:
+      "it opens the Render window on the person's screen and renders the scene there at the output " +
+      "resolution, from the scene camera (else the editor's view; path traced on that computer's render " +
+      'workers when the render engine is PATHTRACER; animation: true renders the frame range), without ' +
+      'returning the image',
   },
   'view3d.object_as_camera': {
     instead: 'To set the scene camera use set_active_camera.',
     use: 'set_active_camera',
+    editor:
+      "it makes the editor's active object, which must be a camera, the scene camera (a step of the person's " +
+      'undo history) and switches that editor to the camera view',
   },
   'view3d.camera_to_view': {
     instead:
       'To place a camera use transform_object (object.track_set aims it at a target); render_image takes a `view` {position, target} for any viewpoint without moving a camera.',
     use: 'transform_object on the camera',
-    editor: "it moves the scene camera to the editor's viewpoint",
+    editor:
+      "it moves the scene camera to the editor's viewpoint (a step of the person's undo history) and switches " +
+      'that editor to the camera view',
   },
   'screen.frame_offset': {
     instead: 'To set your own current frame use scene.frame_set {frame} (most tools also take a `frame`).',
     use: 'scene.frame_set',
-    editor: "it changes the editor's frame, not yours",
+    editor: "it moves the editor's current frame, not yours",
   },
   'screen.keyframe_jump': {
     instead:
       'To go to a keyframe use scene.frame_set {frame} with its frame from get_object (its animation lists the keyframes).',
     use: 'scene.frame_set',
-    editor: "it changes the editor's frame, not yours",
+    editor:
+      "it moves the editor's current frame, not yours, to the next or previous keyframe of the editor's " +
+      'selected objects (of all objects when none is selected)',
   },
   'screen.animation_play': {
     instead: 'To look at the animation use render_animation (a contact sheet, GIF or APNG).',
     use: 'render_animation',
+    editor:
+      'it starts or stops playback in that editor, whose frame then keeps changing (editor_command play ' +
+      '{playing} sets it)',
   },
-  'wm.search_menu': { instead: 'To find operators use list_operators {search}.', use: 'list_operators' },
-  'wm.export': { instead: 'To export the scene use export_scene.', use: 'export_scene' },
-  'wm.import': { instead: 'To import a file use import_model.', use: 'import_model' },
-  'wm.read_homefile': { instead: 'To create a project use create_project.', use: 'create_project' },
+  'wm.search_menu': {
+    instead: 'To find operators use list_operators {search}.',
+    use: 'list_operators',
+    editor: "it opens the operator search on the person's screen",
+  },
+  'wm.export': {
+    instead: 'To export the scene use export_scene.',
+    use: 'export_scene',
+    editor: "it opens the Export window on the person's screen",
+  },
+  'wm.import': {
+    instead: 'To import a file use import_model.',
+    use: 'import_model',
+    editor:
+      "it asks the browser to open a file chooser on the person's screen, which browsers block unless the " +
+      'person has just clicked or pressed a key, so from editor_command it normally opens nothing (and still ' +
+      'answers ok)',
+  },
+  'wm.read_homefile': {
+    instead: 'To create a project use create_project.',
+    use: 'create_project',
+    editor:
+      "it creates a new project ({name, empty}) and switches the person's editor to it, away from the project " +
+      'it had open, which it leaves before it can answer (editor_command says so; list_projects lists the ' +
+      'new project)',
+  },
   'wm.open_mainfile': {
     instead: 'To find projects use list_projects: every tool takes the project to work in.',
     use: 'list_projects',
+    editor: "it opens the project browser on the person's screen",
   },
-  'wm.share': { instead: "For the project's link use get_project (editor_url).", use: 'get_project' },
+  'wm.share': {
+    instead: "For the project's link use get_project (editor_url).",
+    use: 'get_project',
+    editor:
+      "it puts the project's link on the person's clipboard, replacing what they had copied (a browser that " +
+      'refuses the copy shows them the link in a message; an editor page without clipboard access, served ' +
+      'over plain HTTP from a host other than localhost, does nothing)',
+  },
   'wm.save_mainfile': {
     instead: 'Saving is not needed: the server stores projects itself (get_project says where).',
-    editor: 'it makes that editor save its own copy at once',
+    use: 'nothing (the server stores projects)',
+    editor:
+      'it makes that editor sync its WebDAV copy at once if it has one (its copy in the browser is always up ' +
+      "to date) and shows the person a 'Saved' message",
+  },
+  'view3d.view_all': {
+    editor:
+      "it frames every visible object in that editor's viewport, changing the person's view, out of the " +
+      'camera view (editor_command view.frame_all does the same)',
+  },
+  'view3d.view_selected': {
+    editor:
+      "it frames the editor's selection (in Edit Mode its selected vertices), changing the person's view, " +
+      'out of the camera view (editor_command view.frame_selected does the same)',
+  },
+  'view3d.view_axis': {
+    editor:
+      "it turns the person's view to an axis ({type: FRONT, BACK, RIGHT, LEFT, TOP or BOTTOM}, orthographic), " +
+      'out of the camera view (editor_command view.set_view does the same)',
+  },
+  'view3d.view_camera': {
+    editor:
+      "it switches the person's view into or out of the scene camera's view, and fails without a scene camera " +
+      "(editor_command view.set_view {view: 'CAMERA'} switches into it, never out of it, and fails the same " +
+      'way)',
+  },
+  'view3d.view_orbit': {
+    editor:
+      "it orbits the person's view by `angle` (radians, default π/12: 15°); in the camera view it changes only " +
+      'the view they get back when they leave it',
+  },
+  'view3d.view_persportho': {
+    editor:
+      "it switches the person's view between perspective and orthographic; in the camera view it changes only " +
+      'the view they get back when they leave it',
+  },
+  'view3d.zoom': { editor: "it zooms the person's view in or out, out of the camera view" },
+  'view3d.toggle_xray': {
+    editor: 'it turns X-ray on or off in that editor (what the person sees, and what their clicks select)',
+  },
+  'view3d.toggle_overlays': { editor: "it shows or hides the overlays of that editor's viewport" },
+  'view3d.toggle_sidebar': { editor: "it shows or hides the viewport's sidebar in that editor" },
+  'view3d.toggle_toolbar': { editor: "it shows or hides the viewport's tool bar in that editor" },
+  'view3d.toggle_wireframe_overlay': {
+    editor: "it shows or hides the wireframe over shaded objects in that editor's viewport",
+  },
+  'view3d.toggle_snapping': {
+    editor: "it turns snapping on or off for the person's transforms in that editor",
+  },
+  'view3d.toggle_shading': {
+    editor:
+      "it switches the shading of the person's viewport ({type}; WIREFRAME again goes back to SOLID; " +
+      'editor_command view.shading sets it)',
+  },
+  'wm.tool_set': {
+    editor:
+      "it changes the person's active tool in that editor, and with it what their mouse does in the viewport",
+  },
+  'wm.call_menu': {
+    editor: "it opens a popup menu on the person's screen (at their mouse pointer unless x and y are given)",
+  },
+  'wm.preferences': { editor: "it opens the Preferences window on the person's screen" },
+  'screen.workspace_set': {
+    editor:
+      "it switches the person's workspace layout (Shading also switches their viewport to Material Preview)",
   },
 };
 
@@ -286,11 +406,11 @@ function editorRun(id: string): string {
 
 /**
  * Why `id` cannot run through run_operator / batch / edit_mesh when it is an operator of the
- * browser editor's UI (one of BROWSER_UI_OPERATORS, or registered `uiOnly`), and how to run it in
- * a live editor instead; null for other ids. Where the tools offer the same edit (object.duplicate
- * for Shift+D's object.duplicate_move, transform.* for the interactive transform, mesh.loopcut for
- * the mouse-picked loop cut, the undo tool for ed.undo …) the message names that first and says
- * what the operator does in a live editor.
+ * browser editor's UI (one of BROWSER_UI_OPERATORS, or registered `uiOnly`), how to run it in a
+ * live editor instead and what it does there (on the person's editor); null for other ids. Where
+ * the tools offer the same edit (object.duplicate for Shift+D's object.duplicate_move, transform.*
+ * for the interactive transform, mesh.loopcut for the mouse-picked loop cut, the undo tool for
+ * ed.undo …) the message names that first.
  */
 export function browserUiOperator(id: string, uiOnly = false): string | null {
   if (!uiOnly && !BROWSER_UI_OPERATORS.includes(id)) return null;
@@ -299,18 +419,82 @@ export function browserUiOperator(id: string, uiOnly = false): string | null {
     'only a live editor can run it, not run_operator, batch or edit_mesh.';
   const advice = BROWSER_OPERATOR_ADVICE[id];
   if (!advice) return `${head} Run it there with ${editorRun(id)}.`;
-  return (
-    `${head} ${advice.instead} In a live editor run it with ${editorRun(id)}` +
-    `${advice.editor ? `: ${advice.editor}` : ''}.`
-  );
+  if (!advice.instead) return `${head} Run it there with ${editorRun(id)}: ${advice.editor}.`;
+  return `${head} ${advice.instead} In a live editor run it with ${editorRun(id)}: ${advice.editor}.`;
+}
+
+/** `id` in lower case, split at its last dot: the namespace ('' without one) and the last segment. */
+function idParts(id: string): { space: string; tail: string } {
+  const lower = id.toLowerCase();
+  const dot = lower.lastIndexOf('.');
+  return dot < 0 ? { space: '', tail: lower } : { space: lower.slice(0, dot), tail: lower.slice(dot + 1) };
 }
 
 /**
- * The note after a did-you-mean list that suggests operators of the browser editor's UI (`ids`,
- * of the `suggested` ids): what they are, what the tools offer instead where they do, and how a
- * live editor runs them.
+ * Whether `candidate` is a completion of the (unknown) operator id `typed`: the same namespace,
+ * and a last segment that starts with `typed`'s last segment of at least 3 characters, letter
+ * case ignored ('wm.save' → wm.save_mainfile, 'object.dupli' → object.duplicate).
  */
-export function browserUiOperatorsNote(ids: readonly string[], suggested: readonly string[]): string {
+export function completesOperatorId(typed: string, candidate: string): boolean {
+  const t = idParts(typed);
+  const c = idParts(candidate);
+  return t.space !== '' && t.space === c.space && t.tail.length >= 3 && c.tail.startsWith(t.tail);
+}
+
+function editDistance(a: string, b: string): number {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
+/**
+ * The operator ids among `candidates` closest to an unknown id `typed`, at most `max`, letter case
+ * ignored: first its completions ({@link completesOperatorId}, the shortest first: 'object.dupli' →
+ * object.duplicate, object.duplicate_move …), then the ids nearest by edit distance, where an id
+ * that contains `typed`'s last segment counts as nearer ('VIEW3D.VIEW_ALL' or 'view3d.viewall' →
+ * view3d.view_all).
+ */
+export function closestOperatorIds(typed: string, candidates: readonly string[], max = 8): string[] {
+  const needle = typed.toLowerCase();
+  const { tail } = idParts(typed);
+  const completions = candidates
+    .filter((c) => completesOperatorId(typed, c))
+    .sort((a, b) => a.length - b.length || a.localeCompare(b));
+  const near = candidates
+    .filter((c) => !completions.includes(c))
+    .map((c) => {
+      const cand = c.toLowerCase();
+      let score = editDistance(needle, cand);
+      if (tail.length > 2 && cand.includes(tail)) score -= 3;
+      return { id: c, score };
+    })
+    .filter((x) => x.score <= Math.max(4, Math.ceil(needle.length / 2)))
+    .sort((a, b) => a.score - b.score || a.id.localeCompare(b.id))
+    .map((x) => x.id);
+  return [...completions, ...near].slice(0, max);
+}
+
+/**
+ * The note after a did-you-mean list (`suggested`, for the unknown id `typed`) that suggests
+ * operators of the browser editor's UI (`ids`): what they are, what the tools offer instead where
+ * they do, and how a live editor runs them. Advice for one id must not read as advice for another
+ * one, such as the id the agent meant ('wm.save' suggests wm.save_mainfile and wm.share, and
+ * get_project is what to use for wm.share), so each piece of advice names its id, unless the note
+ * is about one id that its sentence names, or that is the only suggestion and completes `typed`.
+ */
+export function browserUiOperatorsNote(
+  ids: readonly string[],
+  suggested: readonly string[],
+  typed: string,
+): string {
   if (!ids.length) return '';
   const one = ids.length === 1;
   const all = ids.length === suggested.length;
@@ -320,9 +504,11 @@ export function browserUiOperatorsNote(ids: readonly string[], suggested: readon
       ? 'It is an operator'
       : 'They are operators'
     : `${list} ${one ? 'is an operator' : 'are operators'}`;
+  // "It is" names no id: its advice needs the id unless the agent evidently meant it
+  const plain = one && (!all || completesOperatorId(typed, ids[0]));
   const uses = ids.flatMap((id) => {
     const use = BROWSER_OPERATOR_ADVICE[id]?.use;
-    return use ? [one ? use : `${use} for ${id}`] : [];
+    return use ? [plain ? use : `${use} for ${id}`] : [];
   });
   return (
     `${subject} of the browser editor's user interface${uses.length ? ` (instead: ${uses.join(', ')})` : ''}: ` +

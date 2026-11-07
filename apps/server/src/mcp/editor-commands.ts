@@ -9,16 +9,20 @@ import { ToolError } from './agent';
  * silently: `view.set_view {veiw: 'TOP'}` answered ok and showed the default FRONT view. The server
  * therefore checks the command and the names of its parameters before it sends the request (also
  * when no editor is connected), with did-you-mean suggestions and the valid names, like tool
- * arguments and operator parameters; values the editor reads loosely are checked here too. The
- * editor checks the other values (view, shading and mode names, object names, frame numbers).
+ * arguments and operator parameters; values the editor reads loosely are checked here too, and so
+ * is the screenshot's `shading` (an editor older than that parameter would ignore it). The editor
+ * checks the other values (view, shading and mode names, object names, frame numbers).
  */
 
-type ParamCheck = (value: unknown) => string | null;
+/** What is wrong with a parameter value, and the values the agent may have meant. */
+type ParamProblem = string | { problem: string; suggestions: string[] };
+
+type ParamCheck = (value: unknown) => ParamProblem | null;
 
 interface EditorParam {
   /** What the parameter is (for the tool description and errors). */
   doc: string;
-  /** Checks a value the editor would read loosely: the problem, or null when the value is fine. */
+  /** Checks a value before it is sent: the problem, or null when the value is fine. */
   check?: ParamCheck;
 }
 
@@ -29,7 +33,9 @@ export interface EditorCommand {
 }
 
 const VIEWS = 'FRONT | BACK | RIGHT | LEFT | TOP | BOTTOM | CAMERA';
-const SHADINGS = 'WIREFRAME | SOLID | MATERIAL | RENDERED';
+/** The viewport shadings (view.shading, screenshot). */
+const SHADING_VALUES = ['WIREFRAME', 'SOLID', 'MATERIAL', 'RENDERED'] as const;
+const SHADINGS = SHADING_VALUES.join(' | ');
 const MODES = 'OBJECT | EDIT | SCULPT | VERTEX_PAINT';
 /** Largest screenshot side (pixels). */
 const MAX_SCREENSHOT = 4096;
@@ -43,11 +49,29 @@ const record: ParamCheck = (v) =>
   typeof v === 'object' && v !== null && !Array.isArray(v)
     ? null
     : 'must be an object of operator parameters';
+/**
+ * One of `values`, letter case ignored like the editor reads them (rpc.ts uiEnumParam); a
+ * misspelled value gets the closest ones as suggestions.
+ */
+const oneOf =
+  (values: readonly string[]): ParamCheck =>
+  (v) =>
+    typeof v === 'string' && values.includes(v.toUpperCase())
+      ? null
+      : {
+          problem: `must be ${values.slice(0, -1).join(', ')} or ${values[values.length - 1]}, letter case ignored`,
+          suggestions: typeof v === 'string' && v.trim() ? nearest(v.toUpperCase(), values) : [],
+        };
 
 /** The commands a browser editor runs, by name (keep in sync with apps/web/src/editor/rpc.ts). */
 export const EDITOR_COMMANDS: Record<string, EditorCommand> = {
-  'view.frame_all': { doc: 'frame every object in the viewport', params: {} },
-  'view.frame_selected': { doc: "frame the editor's selected objects", params: {} },
+  'view.frame_all': { doc: 'frame every visible object in the viewport, out of the camera view', params: {} },
+  'view.frame_selected': {
+    doc:
+      "frame the editor's selection, out of the camera view: its selected objects (every visible one when " +
+      'none is selected), in Edit Mode the selected vertices of its active mesh (all of them when none is)',
+    params: {},
+  },
   'view.set_view': {
     doc: 'switch to a standard view or the camera view',
     params: { view: { doc: `${VIEWS} (default FRONT)` }, type: { doc: 'the same as view' } },
@@ -78,10 +102,15 @@ export const EDITOR_COMMANDS: Record<string, EditorCommand> = {
     },
   },
   screenshot: {
-    doc: "a PNG of the editor's viewport: its view (the scene camera when it looks through it), drawn with materials and lights (RENDERED) whatever the viewport's shading, without overlays",
+    doc:
+      "a PNG of the editor's viewport as the person sees it: its view (the scene camera when it looks through it), " +
+      "in the viewport's shading or `shading`, without overlays, rasterized (WebGL) like the viewport, never path " +
+      "traced: MATERIAL is Material Preview (studio lighting), RENDERED the Rendered viewport (the scene's lights " +
+      'and world) also when the render engine is PATHTRACER (render_image path traces)',
     params: {
       width: { doc: 'pixels (default: the viewport size)', check: pixels },
       height: { doc: 'pixels (default: the viewport size)', check: pixels },
+      shading: { doc: `${SHADINGS} (default: the viewport's shading)`, check: oneOf(SHADING_VALUES) },
     },
   },
   get_view: { doc: 'the viewport camera (target, distance, yaw, pitch, ortho, camera view)', params: {} },
@@ -131,12 +160,21 @@ export function describeLateRpcs(late: readonly LateRpc[], now = Date.now()): st
  * waited (`timeout_ms` and its maximum), that the editor may still carry the command out (and holds
  * its next commands and renders until it has), the earlier request it was still busy with
  * (`busy`, see {@link describeLateRpcs}), why it can take that long and what to do instead.
- * Screenshots are drawn with materials and lights whatever the viewport's shading: in software
- * WebGL they took about 20 s each for a 71-material scene, where a SOLID (grey clay) render_image
- * took 0.5–2 s. Other commands draw nothing themselves, but wait while the editor draws its
- * viewport, which takes seconds per frame for such a scene in MATERIAL or RENDERED shading.
+ * Without GPU acceleration (software WebGL) the editor draws its viewport at seconds per frame for
+ * a heavy scene in MATERIAL or RENDERED shading, tens of seconds for the first frame in a shading,
+ * which compiles its shaders; other commands draw nothing themselves, but wait for those frames.
+ * A screenshot in the viewport's shading costs about one such frame; one in another shading
+ * (`params.shading`) builds and compiles the scene's materials for that image (apps/web rpc.ts): a
+ * RENDERED screenshot of a 71-material scene took 20–25 s while the viewport showed SOLID, about
+ * 1 s while it showed RENDERED, a SOLID one under 1 s, and a SOLID (grey clay) render_image
+ * 0.5–2 s; a scene of millions of triangles takes seconds per frame in SOLID shading too.
  */
-export function editorTimeoutMessage(command: string, timeoutMs: number, busy?: string | null): string {
+export function editorTimeoutMessage(
+  command: string,
+  timeoutMs: number,
+  busy?: string | null,
+  params: Record<string, unknown> = {},
+): string {
   const wait =
     timeoutMs < MAX_EDITOR_TIMEOUT_MS
       ? `pass a larger timeout_ms (at most ${MAX_EDITOR_TIMEOUT_MS})`
@@ -148,18 +186,67 @@ export function editorTimeoutMessage(command: string, timeoutMs: number, busy?: 
     (busy
       ? ` It was still busy with an earlier request that the server had stopped waiting for (${busy}).`
       : '');
-  if (command === 'screenshot')
+  const noGpu = 'without GPU acceleration (software WebGL, e.g. a headless browser)';
+  const slowShadings =
+    `for a heavy scene in MATERIAL or RENDERED shading ${noGpu}, tens of seconds the first time while it ` +
+    'compiles the shaders';
+  if (command === 'screenshot') {
+    const shading = typeof params.shading === 'string' ? params.shading.toUpperCase() : null;
+    const solid =
+      `or pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use ` +
+      "render_image with shading 'SOLID', and render_image for final images.";
+    // the fast shadings already: only a larger timeout or rendering without the editor helps
+    if (shading === 'SOLID' || shading === 'WIREFRAME')
+      return (
+        `${head} An editor ${noGpu} can take seconds per screenshot of a scene with millions of triangles ` +
+        `even in ${shading} shading: ${wait}; render_image renders without the editor with renderer 'software'.`
+      );
+    // another shading than the viewport's builds and compiles the materials for every image
+    if (shading)
+      return (
+        `${head} In ${shading} shading an editor ${noGpu} can take seconds per screenshot of a heavy scene, ` +
+        'and tens of seconds while its viewport shows another shading (each screenshot then builds and ' +
+        `compiles the scene's materials for ${shading}): ${wait}, ${solid}`
+      );
     return (
-      `${head} An editor without GPU acceleration (software WebGL, e.g. a headless browser) can take tens of ` +
-      'seconds per frame for a heavy scene drawn with materials and lights, as screenshots are whatever the ' +
-      `viewport's shading, the first time also compiling the shaders: ${wait}; for a quick look use ` +
-      "render_image with shading 'SOLID' (grey clay, much faster), and render_image for final images."
+      `${head} The screenshot is drawn in the viewport's shading, like a frame of the viewport, which takes ` +
+      `seconds ${slowShadings}: ${wait}, ${solid}`
     );
+  }
   return (
-    `${head} '${command}' waits while the editor draws its viewport, which takes seconds per frame for a ` +
-    'heavy scene in MATERIAL or RENDERED shading without GPU acceleration (software WebGL, e.g. a headless ' +
-    `browser), tens of seconds the first time while it compiles the shaders: ${wait}, or switch the ` +
-    "viewport to SOLID shading (editor_command view.shading {shading: 'SOLID'}), which draws much faster."
+    `${head} '${command}' waits while the editor draws its viewport, which takes seconds per frame ` +
+    `${slowShadings}: ${wait}, or switch the viewport to SOLID shading (editor_command view.shading ` +
+    "{shading: 'SOLID'}), which draws much faster."
+  );
+}
+
+/**
+ * The error of an editor command whose editor's connection to the project closed before it answered
+ * (RpcError CLOSED): its page was closed or reloaded, it opened another project or lost its
+ * connection, or the server closed the project, so whether it carried the command out is unknown.
+ * The editor's wm.read_homefile (`params.operator` of run_operator) closes it on purpose: it creates
+ * a new project and switches that editor to it, closing the project it had open before it can
+ * answer (createProject in apps/web/src/project/manager.ts).
+ */
+export function editorClosedMessage(command: string, params: Record<string, unknown> = {}): string {
+  if (command === 'run_operator' && params.operator === 'wm.read_homefile') {
+    const op = params.params;
+    const name =
+      typeof op === 'object' && op !== null && typeof (op as { name?: unknown }).name === 'string'
+        ? (op as { name: string }).name
+        : 'Untitled';
+    return (
+      "editor_command 'run_operator' got no answer for wm.read_homefile, as expected: the editor creates a " +
+      `new project ('${name}') and switches to it, which closes its connection to this project before it ` +
+      'can answer; list_projects lists the new project, get_connected_clients the editors that still have ' +
+      'this one open.'
+    );
+  }
+  return (
+    `editor_command '${command}' failed: the editor's connection to this project closed before it answered ` +
+    '(its page was closed or reloaded, it opened another project or lost its connection, or the server ' +
+    'closed the project), so whether it carried the command out is unknown; get_connected_clients lists ' +
+    'the editors that have the project open.'
   );
 }
 
@@ -242,8 +329,10 @@ export function checkEditorCommand(command: string, params: Record<string, unkno
   }
   for (const [k, p] of Object.entries(spec.params)) {
     if (params[k] === undefined || !p.check) continue;
-    const problem = p.check(params[k]);
-    if (problem)
-      throw new ToolError(`${command}: ${quote(k)} ${problem} (got ${JSON.stringify(params[k])}).`);
+    const found = p.check(params[k]);
+    if (!found) continue;
+    const { problem, suggestions } = typeof found === 'string' ? { problem: found, suggestions: [] } : found;
+    const near = suggestions.length ? `; did you mean ${suggestions.map(quote).join(' or ')}?` : '';
+    throw new ToolError(`${command}: ${quote(k)} ${problem} (got ${JSON.stringify(params[k])}${near}).`);
   }
 }

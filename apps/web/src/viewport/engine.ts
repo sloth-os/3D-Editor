@@ -154,7 +154,10 @@ export interface RenderImageOptions {
   useViewport?: boolean;
   /** Explicit viewpoint (world space, Z up); fov in degrees. */
   view?: { position: number[]; target: number[]; up?: number[]; fov_degrees?: number } | null;
-  /** Viewport shading for the image (default RENDERED). */
+  /**
+   * Viewport shading for the image: by default the viewport's current shading for a capture
+   * (`useViewport`), RENDERED for a final render.
+   */
   shading?: 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED' | null;
   /** Evaluate the scene at this frame. */
   frame?: number | null;
@@ -988,7 +991,12 @@ export class ViewportEngine {
     }
   }
 
-  /** Whether {@link renderImage} path traces with these options. */
+  /**
+   * Whether {@link renderImage} path traces with these options. A viewport capture (`useViewport`,
+   * editor_command 'screenshot') without an explicit engine is always rasterized: in RENDERED
+   * shading while the render engine is PATHTRACER it shows the viewport's WebGL Rendered shading,
+   * not a path traced image.
+   */
   pathTraces(opts: RenderImageOptions = {}): boolean {
     const engine = opts.engine ?? (opts.useViewport ? 'RASTER' : this.session.doc.getRender().engine);
     return engine === 'PATHTRACER' && opts.shading !== 'SOLID' && opts.shading !== 'WIREFRAME';
@@ -1077,29 +1085,35 @@ export class ViewportEngine {
   }
 
   /**
-   * Rasterizes the scene (WebGL, Rendered shading unless `shading` says otherwise) with
-   * {@link renderImage}'s camera choice and returns RGBA8 pixels (top row first).
+   * Rasterizes the scene (WebGL) with {@link renderImage}'s camera choice and returns RGBA8 pixels
+   * (top row first).
    *
    * A final render (F12, Render Animation, MCP renders) shows the document as it is now, evaluated
    * for rendering like the path tracer and the server's renderers: objects visible in renders
    * (`hide_render`, not `hide_viewport`), modifiers with their render settings (Subdivision render
    * levels, `show_render`), curve render resolution and render particle amounts, shape keys also
    * while the viewport is in Edit Mode, and none of the viewport's display settings (X-ray, Display
-   * As Wire / Bounds, live transform previews). A capture (`useViewport`) shows the viewport as it
-   * is, with `shading` and without overlays.
+   * As Wire / Bounds, live transform previews); in Rendered shading unless `shading` says otherwise.
+   * A capture (`useViewport`) shows the viewport as it is, without overlays, in the shading it shows
+   * now unless `shading` names another one. The first picture in a shading the viewport has not
+   * drawn yet builds that shading's materials and compiles their shaders (tens of seconds for a
+   * heavy scene in Rendered shading in software WebGL, see rpc.ts); they are kept for later
+   * pictures, and the viewport's own for its next frame (scene-objects.ts
+   * ObjectView.materialSets). The viewport's shading, overlays and frame are restored afterwards.
    */
   renderPixels(opts: RenderImageOptions = {}): PixelImage {
     const { width, height } = this.renderSize(opts);
     const aspect = width / height;
     const view = this.session.view;
     const state = this.session.state;
-    const shading = opts.shading ?? 'RENDERED';
+    const shading = opts.shading ?? (opts.useViewport ? view.shading.value : 'RENDERED');
     const frame = typeof opts.frame === 'number' && Number.isFinite(opts.frame) ? opts.frame : state.frame;
     const prevShading = view.shading.value;
     const prevOverlays = view.overlays.value;
     const prevFrame = state.frame;
     const prevBg = this.scene.background;
     const disposables: { dispose(): void }[] = [];
+    const hiddenOverlays: THREE.Object3D[] = [];
     try {
       // The camera comes from this evaluation too: the viewport's own one is from its last animation
       // frame (stale in hidden tabs, which get none) and at the viewport's frame.
@@ -1136,6 +1150,21 @@ export class ViewportEngine {
           transparent ? 0 : null,
         ),
       );
+      if (opts.useViewport) {
+        // The objects' part of the overlay scene, drawn over the scene like the viewport does: with
+        // overlays off it holds only the wires of Wireframe shading, which are the shading, not an
+        // overlay (scene-objects.ts). The editor's own parts of it (transform gizmo, grid, 3D
+        // cursor, origins, Edit Mode cage, others' selections) stay out of the picture.
+        for (const c of this.overlay.children)
+          if (c.visible && typeof c.userData.objectId !== 'string') {
+            c.visible = false;
+            hiddenOverlays.push(c);
+          }
+        const wires = new RenderPass(this.overlay, cam);
+        wires.clear = false;
+        wires.clearDepth = false;
+        comp.addPass(wires);
+      }
       if (transparent) {
         const unpremultiply = new ShaderPass(UNPREMULTIPLY_SHADER);
         disposables.push(unpremultiply);
@@ -1197,6 +1226,7 @@ export class ViewportEngine {
       return { width, height, data };
     } finally {
       for (const d of disposables) d.dispose();
+      for (const c of hiddenOverlays) c.visible = true;
       this.scene.background = prevBg;
       view.shading.value = prevShading;
       view.overlays.value = prevOverlays;
