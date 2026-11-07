@@ -246,8 +246,9 @@ There are two render engines (`render.engine`):
   and can stop at a time limit after at least one sample per pixel. Shadow rays treat glass and
   alpha-transparent surfaces as thin sheets that tint and dim the light, so lamps inside glass light
   their surroundings; glass reached from a diffuse or glossy vertex is thin-walled for that path
-  too, so caustics are not rendered, while the camera, mirrors and smooth glass still see
-  refraction (`integrator.ts`). Mist follows the camera path through glass and transparent layers.
+  too, so glass casts no caustics (mirrors do, blurred by Filter Glossy), while the camera,
+  mirrors and smooth glass still see refraction (`integrator.ts`). Mist follows the camera path
+  through glass and transparent layers.
 
 `renderSceneSoftware` (`render/index.ts`) dispatches between the two for headless callers, and
 `renderAnimation` (`render/animation.ts`) renders frame ranges into GIF, APNG, PNG sequences or

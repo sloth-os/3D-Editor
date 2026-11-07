@@ -241,14 +241,15 @@ Describes the whole scene at one frame with evaluated values (see
   after shape keys, modifiers with their render settings such as SUBSURF `render_levels`, SCREW
   `render_steps` and `show_render`, curve bevels and text, without instances), `not_rendered`
   (objects hidden from renders with `hide_render`, such as Boolean cutters, helpers and the hidden
-  sources of scatters: `{objects, vertices, faces, triangles}` with at most 24 names and
-  `objects_total`, plus `instances` / `instance_triangles` of hidden emitters), `evaluated_viewport`
-  (the objects shown in the viewport with the viewport settings, like the editor's statistics
-  overlay; listed whenever it differs), `materials`, `instances` and `instance_triangles` (particle
-  and collection instances whose emitter or instancing empty is shown in renders),
-  `viewport_instances` (when the viewport shows a different number), `drivers`, `rigid_bodies`. A
-  collection's `hide_render` is not applied (its objects still render and export, and are counted
-  in `evaluated`); a collection hidden with `hide_viewport` is left out of renders too.
+  sources of scatters: `{objects, vertices, faces, triangles}` with at most 24 names (plus
+  `objects_total` when there are more), and `instances` / `instance_triangles` of hidden
+  emitters), `evaluated_viewport` (the objects shown in the viewport with the viewport settings,
+  like the editor's statistics overlay; listed whenever it differs), `materials`, `instances` and
+  `instance_triangles` (particle and collection instances whose emitter or instancing empty is
+  shown in renders), `viewport_instances` (when the viewport shows a different number), `drivers`,
+  `rigid_bodies`. A collection's `hide_render` is not applied (its objects still render and export,
+  and are counted in `evaluated`); a collection hidden with `hide_viewport` is left out of renders
+  too.
 - `scene` (frame range, fps, units, gravity and `rigidbody_world` when there are rigid bodies),
   `render` (engine, resolution, samples, max_bounces, use_denoising, film_transparent,
   view_transform, exposure) and `world` (colour, strength, environment, sky, mist; `animated` and
@@ -418,18 +419,22 @@ systems …), `reports` its INFO / WARNING / ERROR messages (for example "apply 
 `selection` the agent's resulting `mode`, `selected`, `active` and `frame` (with element counts in
 edit mode). Read the reports: an operator can succeed and still warn that a setting has no effect.
 
-A failure is an error result: the first line is the message, followed by JSON with `ok: false`,
-`error` (the message) and `code`, one of `INVALID_PARAMS`, `POLL_FAILED`, `NOT_FOUND` and `FAILED`
-(see [Errors](#errors)), plus the fields above when the operator ran.
+A failure of the operator is an error result: the first line is the message, followed by JSON with
+`ok: false`, `error` (the message) and `code`, one of `INVALID_PARAMS`, `POLL_FAILED`, `NOT_FOUND`
+and `FAILED` (see [Errors](#errors)), plus the fields above when the operator ran. A `selection`
+that cannot be applied is a plain error message instead, without JSON or `code` (`Object 'Nope'
+not found in project …`, `face index 99 out of range (mesh has 6 faces)`); in a `batch` it fails
+its operation with a `code`.
 
 Refused operators (failures too, with the `code` named here):
 
-- unknown ids, with up to 8 closest ids ("Did you mean: …"), `NOT_FOUND`;
+- unknown ids, with up to 8 closest ids ("Did you mean: …"), `NOT_FOUND`. The browser UI's own
+  operators are unknown ids here too: the web app registers them for itself (view navigation such
+  as `view3d.view_all` or `view3d.view_axis`, `screen.animation_play`, `wm.save_mainfile`,
+  `ed.undo` …), and they run in a live editor through `editor_command` `run_operator`;
 - `render.render_software` and `render.render_animation`, `FAILED`: they would render on the
   server's main thread and stall every editor and agent, so `run_operator`, `batch` and
-  `edit_mesh` refuse them and name the tool to use instead (`render_image`, `render_animation`);
-- UI-only operators, which the web app registers for itself (none are part of the server's
-  registry), `POLL_FAILED`.
+  `edit_mesh` refuse them and name the tool to use instead (`render_image`, `render_animation`).
 
 #### `batch`
 
@@ -446,12 +451,13 @@ kept, so the following operations see the selection of before it. With `stop_on_
 stops at the first failure and keeps the changes made before it.
 
 The result is `{ok, executed, failed, results, selection}`. Each entry of `results` is
-`{operator, ok, result}` or `{operator, ok: false, error, code}` (`code` as for `run_operator`; a
-`selection` naming an unknown object fails its operation with `NOT_FOUND`), with `reports` when
-the operator reported anything. `operations_with_warnings` is added when some
-operations reported a WARNING or ERROR (failed ones included) and counts them. When an operation
-failed, the tool result is an error whose text starts with "_n_ of _m_ operation(s) failed"
-followed by the same JSON.
+`{operator, ok, result}` or `{operator, ok: false, error, code}` (`code` as for `run_operator`; an
+operation whose `selection` cannot be applied fails with an `error` starting with `selection:`,
+with `NOT_FOUND` for an unknown object and `POLL_FAILED` otherwise, such as an element index out
+of range or Edit Mode without an active mesh), with `reports` when the operator reported anything.
+`operations_with_warnings` is added when some operations reported a WARNING or ERROR (failed ones
+included) and counts them. When an operation failed, the tool result is an error whose text starts
+with "_n_ of _m_ operation(s) failed" followed by the same JSON.
 
 ### Objects
 
@@ -544,9 +550,11 @@ face selection and the `uv.*` unwrap operators. Indices are those of the base me
 (`get_mesh_data` with `source: BASE`). The result is
 `{ok, operator, result, reports, mesh, selection_after}`: `mesh` statistics and the selected
 element indices afterwards (at most 500 of each kind). Afterwards the object is the agent's
-selected and active object, in Object Mode. A failure (an element index out of range, the
-operator's own failure) leaves the agent's selection and mode as they were; it is an error result
-with the same JSON plus `error` and `code`, as for `run_operator`.
+selected and active object, in Object Mode. A failure leaves the agent's selection and mode as
+they were. When the operator fails, or is unknown or refused, the error result carries JSON with
+`error` and `code` as for `run_operator` (with the fields above when the operator ran); an element
+index out of range (`face index 99 out of range (mesh has 6 faces)`), an unknown object or an
+object that is not a mesh is a plain error message, without JSON or `code`.
 
 ### Animation and scene settings
 
@@ -874,8 +882,10 @@ project. `resources/list` lists one per project.
 ## Errors
 
 **Tool errors** are normal tool results with `isError: true` and a text message. Most messages say
-what to do. For `run_operator`, `batch` and `edit_mesh` the first line is the message and the rest
-is the full result as JSON (for `batch`, including the operations that succeeded).
+what to do. When an operator fails in `run_operator`, `batch` or `edit_mesh`, the first line is the
+message and the rest is the full result as JSON (for `batch`, including the operations that
+succeeded). A `selection` or element index that `run_operator` or `edit_mesh` cannot apply, and a
+wrong object reference, are plain messages without JSON.
 
 | Message (abridged)                                                                                                                                | Cause                                                                                                 |
 | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
@@ -893,6 +903,7 @@ is the full result as JSON (for `batch`, including the operations that succeeded
 | `Project 'X' not found. Known projects: …` / `Several projects are named 'X': … Pass the project id instead.`                                     | A wrong or ambiguous project reference                                                                |
 | `A project named 'Lighthouse' already exists (id …). … Project names are unique because tools find projects by name …`                            | `create_project` / `rename_project` with a name another project has (letter case ignored)             |
 | `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                                                                 | An element selection without `mode: "EDIT"`                                                           |
+| `face index 99 out of range (mesh has 6 faces)`                                                                                                   | An element index of a `selection` (`run_operator`, `edit_mesh`) that the base mesh does not have      |
 | `'show_render' is not a parameter of the BEVEL modifier. Its visibility (show_render) is set after adding it, with update_modifier …`             | A modifier setting given inside `params` instead of as a tool argument                                |
 | `Unknown parameter 'veiw' (did you mean 'view'?) for the editor command view.set_view. Its parameters: …`                                         | A misspelled `editor_command` command or parameter (refused before anything is sent)                  |
 | `'dimensions' is not animatable on object. Animatable: …`                                                                                         | `insert_keyframe` on a property that cannot be keyed                                                  |
@@ -903,14 +914,14 @@ is the full result as JSON (for `batch`, including the operations that succeeded
 | `<tool> failed: <message>`                                                                                                                        | An unexpected server error (also logged)                                                              |
 
 Failed `run_operator`, `edit_mesh` and `batch` operations also carry a `code` in their JSON (the
-kinds of the core operator registry):
+kinds of the core operator registry; plain selection errors have none):
 
-| `code`           | Meaning                                                                                         |
-| ---------------- | ----------------------------------------------------------------------------------------------- |
-| `INVALID_PARAMS` | Unknown, misspelled or invalid parameters: fix `params`                                         |
-| `POLL_FAILED`    | Wrong mode, selection or object type, or an operator only the browser UI offers                 |
-| `NOT_FOUND`      | An unknown operator, object or datablock                                                        |
-| `FAILED`         | The operator itself failed, or it is refused here (`render.*`: use the rendering tools instead) |
+| `code`           | Meaning                                                                                                                      |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `INVALID_PARAMS` | Unknown, misspelled or invalid parameters: fix `params`                                                                      |
+| `POLL_FAILED`    | Wrong mode, selection or object type; in a `batch`, also a `selection` that cannot be applied (other than an unknown object) |
+| `NOT_FOUND`      | An unknown operator (operators only the browser UI offers included: use `editor_command`), object or datablock               |
+| `FAILED`         | The operator itself failed, or it is refused here (`render.*`: use the rendering tools instead)                              |
 
 An operator can also **succeed with problems**: check `reports` (WARNING / ERROR), `errors` lists in
 results (`object.constraint_add`, `object.track_set`, particle systems, `anim.driver_add` per

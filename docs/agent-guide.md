@@ -117,7 +117,9 @@ async function batch(operations) {
 
 try {
   const { projects } = await mcp.call('list_projects');
-  for (const p of projects.filter((p) => p.name === NAME))
+  // compare names like create_project does (trimmed, ignoring letter case)
+  const key = (name) => name.trim().toLowerCase();
+  for (const p of projects.filter((p) => key(p.name) === key(NAME)))
     await mcp.call('delete_project', { project: p.id, confirm: true });
   project = (await mcp.call('create_project', { name: NAME, empty: true })).id;
   await tool('set_scene_settings', {
@@ -154,9 +156,13 @@ try {
 - **Scale versus size.** Generators and primitives take real sizes; `object.dimensions_set` scales
   an object to target dimensions. Procedural textures with `OBJECT` mapping are sized in object
   space, before the object's scale, so a cube scaled into a wall stretches its bricks: apply the
-  scale with `object.transform_apply {scale: true}` (a selection-based operator) first; the preset
-  and procedural operators warn about it. Children of a non-uniformly scaled parent shear when they
-  rotate, so scale meshes rather than parents (the robot workcell keeps every object scale at 1).
+  scale with `object.transform_apply {rotation: false, scale: true}` (a selection-based operator)
+  first; the preset and procedural operators warn about it. Pass `rotation: false`: it defaults to
+  true, so `{scale: true}` alone applies the rotation too, which resets `rotation_euler` to 0
+  (rotation keys and aims that follow start from there) and lines the texture up with the world
+  axes instead of the object's former ones. Children of a non-uniformly scaled parent shear when
+  they rotate, so scale meshes rather than parents (the robot workcell keeps every object scale
+  at 1).
 - **Colours are linear RGB(A)**, components 0..1. Convert sRGB colour values first:
 
   ```js
@@ -179,7 +185,7 @@ Each agent has its own selection, active object and mode, separate from every hu
   ```json
   {
     "operator": "object.transform_apply",
-    "params": { "scale": true },
+    "params": { "rotation": false, "scale": true },
     "selection": { "objects": ["Deck", "Post"], "mode": "OBJECT" }
   }
   ```
@@ -608,7 +614,10 @@ their final size instead of scaling small ones.
 
 Tool errors explain themselves; read the whole message, including the JSON after the first line.
 Failed operators carry a `code` in that JSON: `INVALID_PARAMS` (fix `params`), `POLL_FAILED` (mode,
-selection or object type), `NOT_FOUND` (operator, object or datablock) or `FAILED`.
+selection or object type), `NOT_FOUND` (operator, object or datablock) or `FAILED`. A `selection`
+that cannot be applied (an unknown object, an element index out of range) is a plain message
+without JSON or `code`, except in a `batch`, where its operation fails with `NOT_FOUND` (an unknown
+object) or `POLL_FAILED`.
 
 | You see                                                                                               | Meaning and fix                                                                                       |
 | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
@@ -619,7 +628,7 @@ selection or object type), `NOT_FOUND` (operator, object or datablock) or `FAILE
 | `unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …` | A selection-based operator; pass `selection: {objects: [...]}`                                        |
 | `surface: Invalid input: expected array, received string`                                             | Wrong value type; check the schema (`list_operators {search}`)                                        |
 | `Operator requires Edit Mode`                                                                         | A `mesh.*` operator through `run_operator`; use `edit_mesh`                                           |
-| `Unknown operator '…'. Did you mean: …`                                                               | Misspelled operator id                                                                                |
+| `Unknown operator '…'. Did you mean: …`                                                               | Misspelled operator id, or one the browser UI alone has (`view3d.view_all` …): use `editor_command`   |
 | `'render.render_software' would render on the server's main thread …`                                 | Use `render_image` / `render_animation`                                                               |
 | `Object 'X' not found in project 'P'. Objects: …`                                                     | The name changed (`.001` suffix) or the object was deleted; use names from results                    |
 | `Several projects are named 'X' …`                                                                    | Pass the project id                                                                                   |
@@ -753,9 +762,9 @@ Compared with Blender, these are missing; plan around them rather than searching
   constraints are limited to IK, Copy Rotation, Copy Location, Damped Track and Limit Rotation;
   object constraints to the 16 types listed above.
 - **Rendering**: a CPU path tracer and rasterizers; no GPU path tracing, volumes, subsurface
-  scattering, caustics, motion blur, render passes or light linking. The denoiser is a simple
-  filter, so very low sample counts stay blotchy. Animations come out as GIF, APNG, PNG sequences
-  or contact sheets, not video files.
+  scattering, glass (refractive) caustics, motion blur, render passes or light linking. The
+  denoiser is a simple filter, so very low sample counts stay blotchy. Animations come out as GIF,
+  APNG, PNG sequences or contact sheets, not video files.
 - **Text and UVs**: one built-in font without text boxes or word wrap; UV unwrapping is
   projection-based (Smart UV Project, cube, cylinder, sphere), without angle-based unwrapping.
 - **Images**: no operator loads image textures through MCP.
