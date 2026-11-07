@@ -13,6 +13,7 @@ import {
   type SceneDoc,
 } from '@3d-editor/core';
 import { installSunShadowOffset } from './sun-shadow';
+import { installTransmissionLayer } from './transmission';
 import {
   injectProceduralShader,
   proceduralProgramKey,
@@ -147,7 +148,8 @@ export function buildMaterial(
   mat.roughness = d.roughness;
   mat.ior = d.ior;
   mat.transmission = d.transmission;
-  mat.thickness = d.transmission > 0 ? 0.5 : 0;
+  // the object's size, set by SceneObjects (transmission.ts transmissionThickness)
+  mat.thickness = 0;
   mat.emissive.setRGB(d.emission_color[0], d.emission_color[1], d.emission_color[2]);
   mat.emissiveIntensity = d.emission_strength;
   mat.clearcoat = d.coat_weight;
@@ -181,6 +183,8 @@ export function buildMaterial(
   mat.alphaMap = tex('alpha', false);
   const surface = proceduralSurface(d);
   if (surface) installProcedural(mat, d, surface, doc);
+  // glass and liquids seen through other glass refract their own layer picture (transmission.ts)
+  if (mat.transmission > 0) installTransmissionLayer(mat);
   return mat;
 }
 

@@ -143,7 +143,7 @@ export function registerIOOperators(reg: OperatorRegistry): void {
       id: 'export_scene.gltf',
       label: 'Export glTF 2.0',
       description:
-        'Export the scene as glTF 2.0 (GLB binary or .gltf with an embedded buffer): hierarchy, meshes, materials, textures (procedural textures baked into images), cameras, KHR_lights_punctual lights and transform animation sampled per frame (objects on strongly curved paths 2–4 times per frame). Returns { filename, mime, data_base64, warnings }.',
+        'Export the scene as glTF 2.0 (GLB binary or .gltf with an embedded buffer): hierarchy, meshes, materials, textures (procedural textures baked into images), cameras, KHR_lights_punctual lights and transform animation sampled per frame (where the motion of an object curves between frames, e.g. on a fast orbit, 2 or 4 times per frame; motion that is straight between frames, like LINEAR keys or rigid bodies, keeps one key per frame). Returns { filename, mime, data_base64, warnings }.',
       category: 'Export',
       undo: false,
       schema: z.object({

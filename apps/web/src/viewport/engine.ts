@@ -35,6 +35,7 @@ import { ViewportSky } from './sky';
 import { ViewTransformPass } from './view-transform';
 import { STUDIO_RIG, STUDIO_RIG_AMBIENT, WorldEnvironment, aimStudioRig, needsStudioRig } from './world-env';
 import { EditOverlay } from './edit-overlay';
+import { MAX_TRANSMISSION_LEVELS, TransmissionLayers } from './transmission';
 import { createGrid, updateGrid } from './grid';
 import {
   DEFAULT_POSE,
@@ -46,7 +47,7 @@ import {
   viewLabel,
   type ViewPose,
 } from './navigation';
-import { recordFrame, resetFrameClock } from '../telemetry/perf';
+import { SLOW_FRAME_MS, recordFrame, resetFrameClock, slowFrameMs } from '../telemetry/perf';
 import { telemetry } from '../telemetry/telemetry';
 
 THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
@@ -58,6 +59,13 @@ export const RPC_PATH_TRACE_SECONDS = 10;
 
 /** The evaluator of final renders is dropped after this long without renders (its caches can be big). */
 const FINAL_EVALUATOR_IDLE_MS = 60_000;
+
+/**
+ * Above this many triangles drawn per frame (meshes and instances), transmissive objects seen through
+ * other transmissive objects are not drawn in layers of their own (transmission.ts): each layer
+ * renders the whole scene once more.
+ */
+export const TRANSMISSION_LAYER_TRIANGLES = 1_000_000;
 
 /**
  * Divides colour by alpha (straight alpha) for transparent-film renders: a render over a clear
@@ -169,6 +177,8 @@ export class ViewportEngine {
   private outputPass = new ViewTransformPass();
   /** The view transform and exposure (stops) the last `applyShading` chose. */
   private colorManagement: { view: string; exposure: number } = { view: 'STANDARD', exposure: 0 };
+  /** Pictures of transmissive objects seen through other ones (transmission.ts). */
+  private transmission = new TransmissionLayers();
   private grid = createGrid();
   private cursor: THREE.Sprite;
   private originDots: THREE.Points;
@@ -187,6 +197,13 @@ export class ViewportEngine {
   private disposers: (() => void)[] = [];
   private resizeObserver: ResizeObserver;
   private lastFrameTime = 0;
+  /**
+   * The GPU fence of the last frame (WebGL2) and when that frame started: the next frame waits for
+   * it, so a slow GPU (software WebGL drawing a heavy scene for seconds) never gets a queue of frames
+   * behind the one it draws, and the frame's cost is known ({@link slowFrameMs}).
+   */
+  private gpuFence: WebGLSync | null = null;
+  private gpuFenceStart = 0;
   imagesRevision = 0;
 
   constructor(
@@ -202,6 +219,9 @@ export class ViewportEngine {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
+    // shadow maps are drawn once per frame (render, renderPixels set needsUpdate), not again for
+    // every render of the scene in it (transmission pictures, selection outlines)
+    this.renderer.shadowMap.autoUpdate = false;
     this.pmrem = new THREE.PMREMGenerator(this.renderer);
     this.sky = new ViewportSky(this.pmrem);
     this.worldEnv = new WorldEnvironment(this.pmrem);
@@ -336,14 +356,48 @@ export class ViewportEngine {
       }
       this.dirty = true;
     }
+    if (!this.frameDone()) return;
     if (!this.dirty && !this.needsSync) {
       resetFrameClock();
       return;
     }
+    const start = performance.now();
     if (this.needsSync) this.sync();
     this.dirty = false;
     this.render();
     recordFrame(now);
+    this.fenceFrame(start);
+  }
+
+  /**
+   * Whether the GPU finished the last frame (always true without WebGL2 fences); when it did, its
+   * cost (from the start of the frame) updates {@link slowFrameMs}. A fence pending for more than two
+   * minutes (lost context) is dropped.
+   */
+  private frameDone(): boolean {
+    const fence = this.gpuFence;
+    if (!fence) return true;
+    const gl = this.renderer.getContext?.();
+    const elapsed = performance.now() - this.gpuFenceStart;
+    if (gl && 'getSyncParameter' in gl && elapsed < 120_000) {
+      const gl2 = gl as WebGL2RenderingContext;
+      if (gl2.getSyncParameter(fence, gl2.SYNC_STATUS) !== gl2.SIGNALED) return false;
+      gl2.deleteSync(fence);
+    }
+    this.gpuFence = null;
+    const slow = elapsed > SLOW_FRAME_MS && document.visibilityState === 'visible' ? elapsed : 0;
+    if (slowFrameMs.value !== slow) slowFrameMs.value = slow;
+    return true;
+  }
+
+  /** Puts a fence after the frame that started at `start` (WebGL2; see {@link frameDone}). */
+  private fenceFrame(start: number): void {
+    const gl = this.renderer.getContext?.();
+    if (!gl || !('fenceSync' in gl)) return;
+    const gl2 = gl as WebGL2RenderingContext;
+    this.gpuFence = gl2.fenceSync(gl2.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    this.gpuFenceStart = start;
+    gl2.flush();
   }
 
   // ------------------------------------------------------------------ scene sync
@@ -556,6 +610,23 @@ export class ViewportEngine {
     this.sky.fitShadow(camera, this.objects.shadowBoxes());
   }
 
+  /**
+   * Shadow maps of a frame: those of point and spot lights only after a scene change (they do not
+   * depend on the view; SceneObjects.renderLocalShadows, which also keeps big instance scatters out
+   * of them), the suns' (fitted to the frame's camera by fitShadows) with the frame's first render
+   * of the scene. Shadow maps are drawn once per frame, not again for every render of the scene in
+   * it (transmission pictures, selection outlines).
+   */
+  private drawShadows(): void {
+    if (this.renderer.shadowMap.enabled) this.objects.renderLocalShadows(this.renderer);
+    this.renderer.shadowMap.needsUpdate = true;
+  }
+
+  /** Levels of transmission pictures for this frame (one in heavy scenes, see transmission.ts). */
+  private transmissionLevels(): number {
+    return this.objects.drawnTriangles() > TRANSMISSION_LAYER_TRIANGLES ? 1 : MAX_TRANSMISSION_LEVELS;
+  }
+
   // ------------------------------------------------------------------ cameras & render
 
   get camera(): THREE.PerspectiveCamera | THREE.OrthographicCamera {
@@ -634,6 +705,17 @@ export class ViewportEngine {
     this.outlineActive.renderCamera = cam;
     this.aimRig(cam);
     this.fitShadows(cam);
+    this.drawShadows();
+    const pr = this.renderer.getPixelRatio();
+    this.transmission.prepare(
+      this.renderer,
+      this.scene,
+      cam,
+      this.width * pr,
+      this.height * pr,
+      1,
+      this.transmissionLevels(),
+    );
     this.composer.render();
     v.viewLabel.value = v.cameraView.value ? 'Camera Perspective' : viewLabel(this.pose);
     for (const cb of this.onAfterRender) cb();
@@ -935,6 +1017,16 @@ export class ViewportEngine {
       output.setTransform(this.colorManagement.view, this.colorManagement.exposure);
       disposables.push(output);
       comp.addPass(output);
+      this.drawShadows();
+      this.transmission.prepare(
+        this.renderer,
+        this.scene,
+        cam,
+        width,
+        height,
+        transparent ? 0 : 1,
+        this.transmissionLevels(),
+      );
       comp.render();
       // copy result (composer read buffer) into a byte target via a fullscreen quad, unblended
       const quad = new THREE.Mesh(
@@ -1096,6 +1188,7 @@ export class ViewportEngine {
     this.resizeObserver.disconnect();
     for (const d of this.disposers) d();
     this.objects.dispose();
+    this.transmission.dispose();
     this.edit.dispose();
     this.composer.dispose();
     this.sky.dispose();

@@ -12,6 +12,7 @@ import {
 import { buildMaterial, materialKey, TextureCache, type ShadingKind } from './materials';
 import { boneLines, cameraLines, emptyLines, lightLines, linesObject } from './helpers';
 import { fitSunShadow, SUN_SHADOW_MAP_SIZE } from './sun-shadow';
+import { HIDDEN_LAYER, transmissionOf, transmissionThickness } from './transmission';
 
 /** three.js representation of one document object. */
 export interface ObjectView {
@@ -40,6 +41,25 @@ export const COLORS = {
 };
 
 let rectInit = false;
+
+/**
+ * Budget of shadow-map work for point and spot lights, in triangles drawn per update: a point
+ * light's cube map draws every caster six times. Over it, instanced meshes (collection instances,
+ * particle scatters: grass, rocks, trees) cast no point or spot light shadows, only sun shadows
+ * (lighthouse-cove's 2.5 M instance triangles times two point and two spot lights made 35 M
+ * triangles of shadow maps per frame, minutes per frame in software WebGL).
+ */
+export const LOCAL_SHADOW_TRIANGLE_BUDGET = 4_000_000;
+/** Layer of the point and spot lights for {@link SceneObjects.renderLocalShadows} (meshes are not on it). */
+export const LOCAL_SHADOW_LAYER = 30;
+
+/** Triangles a mesh draws (instanced meshes: per instance times instances). */
+function trianglesOf(m: THREE.Mesh): number {
+  const g = m.geometry;
+  const n = g.index ? g.index.count : (g.getAttribute('position')?.count ?? 0);
+  const count = (m as THREE.InstancedMesh).isInstancedMesh ? (m as THREE.InstancedMesh).count : 1;
+  return (n / 3) * count;
+}
 
 /**
  * The three.js intensity of a lamp in Blender's units, exactly as the CPU rasterizer and the path
@@ -132,6 +152,13 @@ export class SceneObjects {
   readonly textures: TextureCache;
   /** {@link SceneObjects.shadowBoxes} of the last sync (null: not computed yet). */
   private boxes: THREE.Box3[] | null = null;
+  /**
+   * Whether the shadow maps of point and spot lights must be drawn again: they do not depend on the
+   * view, so they are kept while the view moves and drawn after each sync (scene changes, frames).
+   */
+  private localShadowsDirty = true;
+  /** Whether the last {@link renderLocalShadows} left the instanced meshes out (over the budget). */
+  localShadowsSkipInstances = false;
 
   constructor(
     private readonly scene: THREE.Scene,
@@ -144,6 +171,7 @@ export class SceneObjects {
   sync(doc: SceneDoc, ev: EvaluatedScene, opts: SyncOptions): void {
     const seen = new Set<string>();
     this.boxes = null;
+    this.localShadowsDirty = true;
     for (const o of ev.objects) {
       seen.add(o.id);
       let v = this.views.get(o.id);
@@ -300,6 +328,12 @@ export class SceneObjects {
       });
       v.mesh.material = mats;
       v.matKey = mk;
+    }
+    // how far light travels inside glass: the object's size, not a fixed 0.5 m (transmission.ts)
+    const thickness = transmissionThickness(v.mesh.geometry);
+    for (const m of v.mesh.material as THREE.Material[]) {
+      const t = transmissionOf(m);
+      if (t) t.thickness.value = thickness;
     }
     const isEdit = opts.editObjectId === o.id;
     v.mesh.visible =
@@ -480,7 +514,13 @@ export class SceneObjects {
       if (!(light instanceof THREE.DirectionalLight)) {
         sh.bias = -0.0005;
         sh.normalBias = 0.02;
+        // drawn by renderLocalShadows when the scene changed, not on every frame
+        sh.autoUpdate = false;
+        light.layers.enable(LOCAL_SHADOW_LAYER);
       }
+      // shadow cameras draw what is on their own layers (also the transmission pictures' hidden
+      // layer), whatever the layers of the camera rendering the scene
+      sh.camera.layers.enable(HIDDEN_LAYER);
     }
     light.visible = opts.shading === 'RENDERED';
   }
@@ -506,6 +546,79 @@ export class SceneObjects {
       if (im.boundingBox && !im.boundingBox.isEmpty()) out.push(im.boundingBox.clone());
     }
     return (this.boxes = out);
+  }
+
+  /** Camera of the shadow-only render of {@link renderLocalShadows}: it sees the local lights, no mesh. */
+  private readonly shadowPassCamera = (() => {
+    const c = new THREE.PerspectiveCamera();
+    c.layers.set(LOCAL_SHADOW_LAYER);
+    return c;
+  })();
+  /** The 1 × 1 target of that render (it draws nothing but the shadow maps). */
+  private shadowPassTarget: THREE.WebGLRenderTarget | null = null;
+
+  /**
+   * Draws the shadow maps of the shadow-casting point and spot lights when the scene changed since
+   * they were last drawn (they do not depend on the view): call it before a frame's renders, with
+   * shadow maps on. Over {@link LOCAL_SHADOW_TRIANGLE_BUDGET}, the instanced meshes are left out of
+   * them (they keep casting sun shadows). It renders the scene with a camera that sees only these
+   * lights (no mesh), with the suns' maps held, so three.js draws just these maps. Returns whether
+   * it drew anything.
+   */
+  renderLocalShadows(renderer: THREE.WebGLRenderer): boolean {
+    if (!this.localShadowsDirty) return false;
+    this.localShadowsDirty = false;
+    const lights: THREE.Light[] = [];
+    let faces = 0;
+    for (const v of this.views.values()) {
+      const l = v.light;
+      if (!l || !l.castShadow || !l.visible || !v.root.visible) continue;
+      if (l instanceof THREE.PointLight) faces += 6;
+      else if (l instanceof THREE.SpotLight) faces += 1;
+      else continue;
+      lights.push(l);
+    }
+    if (!lights.length) return false;
+    const instances = [...this.instanced.values()].filter((im) => im.visible && im.castShadow);
+    const instanceTriangles = instances.reduce((n, im) => n + trianglesOf(im), 0);
+    this.localShadowsSkipInstances = instanceTriangles * faces > LOCAL_SHADOW_TRIANGLE_BUDGET;
+    // the suns' maps are drawn with the frame's first render of the scene (fitted to its camera)
+    const suns: { shadow: THREE.LightShadow; autoUpdate: boolean }[] = [];
+    this.scene.traverse((o) => {
+      const d = o as THREE.DirectionalLight;
+      if (d.isDirectionalLight && d.castShadow) {
+        suns.push({ shadow: d.shadow, autoUpdate: d.shadow.autoUpdate });
+        d.shadow.autoUpdate = false;
+        d.shadow.needsUpdate = false;
+      }
+    });
+    if (this.localShadowsSkipInstances) for (const im of instances) im.castShadow = false;
+    this.shadowPassTarget ??= new THREE.WebGLRenderTarget(1, 1);
+    const prevTarget = renderer.getRenderTarget();
+    try {
+      for (const l of lights) (l as THREE.PointLight).shadow.needsUpdate = true;
+      renderer.shadowMap.needsUpdate = true;
+      renderer.setRenderTarget(this.shadowPassTarget);
+      renderer.render(this.scene, this.shadowPassCamera);
+    } finally {
+      renderer.setRenderTarget(prevTarget);
+      if (this.localShadowsSkipInstances) for (const im of instances) im.castShadow = true;
+      for (const sun of suns) sun.shadow.autoUpdate = sun.autoUpdate;
+    }
+    return true;
+  }
+
+  /** Draws the point and spot light shadow maps again before the next frame (e.g. after a final render). */
+  invalidateLocalShadows(): void {
+    this.localShadowsDirty = true;
+  }
+
+  /** Triangles the visible meshes and instances draw, as last synced. */
+  drawnTriangles(): number {
+    let n = 0;
+    for (const v of this.views.values()) if (v.mesh?.visible && v.root.visible) n += trianglesOf(v.mesh);
+    for (const im of this.instanced.values()) if (im.visible) n += trianglesOf(im);
+    return n;
   }
 
   /**
@@ -538,6 +651,7 @@ export class SceneObjects {
   }
 
   dispose(): void {
+    this.shadowPassTarget?.dispose();
     for (const im of this.instanced.values()) {
       this.scene.remove(im);
       im.dispose();

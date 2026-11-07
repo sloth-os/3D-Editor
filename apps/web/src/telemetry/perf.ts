@@ -4,6 +4,14 @@ import { telemetry } from './telemetry';
 /** Live frame statistics for the status bar and diagnostics. */
 export const fps = signal(0);
 export const frameTimeMs = signal(0);
+/**
+ * How long the viewport's last frame took to draw (until the next one could start), when that was
+ * longer than {@link SLOW_FRAME_MS}; 0 otherwise. Rendered shading of a heavy scene in software
+ * WebGL can take many seconds per frame: the viewport says so instead of looking frozen.
+ */
+export const slowFrameMs = signal(0);
+/** A frame slower than this is reported ({@link slowFrameMs}). */
+export const SLOW_FRAME_MS = 2000;
 
 let frames = 0;
 let acc = 0;

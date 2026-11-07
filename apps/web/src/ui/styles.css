@@ -401,6 +401,9 @@ select.select {
   flex-direction: column;
   gap: 3px;
 }
+.viewport-slow {
+  color: #f0b04a;
+}
 .prop-row {
   display: grid;
   /* minmax(0, …): the value column never grows past the row for wide content (a 1fr track

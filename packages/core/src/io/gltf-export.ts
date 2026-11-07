@@ -92,11 +92,15 @@ import { encodePNG, type PNGImage } from '../render/png';
  *   scene fps (LINEAR): node translation/rotation/scale wherever an object's or a bone's transform
  *   relative to its exported parent changes (keyframes, drivers, constraints, IK, physics …;
  *   rotations as normalized, sign-continuous quaternions) and morph target weights (shape key values,
- *   baked deformation). Nodes on strongly curved paths, whose linearly interpolated keys would cut
- *   chords (an object a constraint keeps on a fast orbit, keyed in world space), are sampled 2–4
- *   times per frame (`chordError`); a warning names those still off by more than the tolerance. Animated camera, light and material properties and the world are not
- *   exported (they would need KHR_animation_pointer; glTF has no world): a warning names the
- *   properties whose values change over the frame range, and the file keeps the export frame's.
+ *   baked deformation). Where a node's motion bends between frames, so its linearly interpolated
+ *   keys would cut chords (an object a constraint keeps on a fast orbit, keyed in world space), it
+ *   gets keys between those frames (2 or 4 per frame): candidate intervals come from the per-frame
+ *   keys (`chordErrors`), and the scene is sampled at their mid-frames to tell curves from motion
+ *   that is straight between frames (LINEAR keys, rigid bodies), which keeps one key per frame; a
+ *   warning names nodes still off by more than the tolerance. Animated camera, light and material
+ *   properties and the world are not exported (they would need KHR_animation_pointer; glTF has no
+ *   world): a warning names the properties whose values change over the frame range, and the file
+ *   keeps the export frame's.
  * - Procedural texture slots are baked to PNG images in UV space (bake-procedural.ts), sized per
  *   mesh by its surface area (`bakeResolution` overrides); materials whose bake depends on the
  *   geometry (GENERATED/OBJECT mapping, bump) get one glTF material per distinct mesh content
@@ -337,8 +341,11 @@ const MAX_INFLUENCES = 4;
 const MAX_BAKED_FLOATS = 12_000_000;
 /** Most frames sampled for the animation. */
 const MAX_FRAMES = 10000;
-/** Most samples per frame of nodes on curved paths (see `chordError`). */
-const MAX_SUBFRAMES = 4;
+/**
+ * Most extra scene evaluations for the sub-frame samples of nodes whose motion bends between frames
+ * (see `chordErrors`); the most bent frame intervals are checked first.
+ */
+const SUBFRAME_EVALUATIONS = 3000;
 /**
  * Automatic size of procedural bakes: about BAKE_TEXELS_PER_METRE texels per metre of the baked
  * surface (by its world-space area and the share of the UV square its layout covers), rounded up to
@@ -722,76 +729,144 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       warn(
         `'${n.name}' has a sheared transform (non-uniform parent scale); glTF animation cannot represent it exactly`,
       );
-  // glTF players interpolate translations linearly: a node on a strongly curved path (an object a
-  // constraint keeps on a rotating orbit, exported with world-space keys) cuts chords between the
-  // per-frame keys. Such nodes get keys at sub-frames too (2–4 per frame), enough to bring the
-  // chord error under CHORD_TOLERANCE where possible.
-  /** Sub-frame tracks (times in frames) of nodes on curved paths. */
-  const fineTracks = new Map<XNode, Track & { frames: Float64Array }>();
+  // glTF players interpolate translations linearly between keys, so where an object's motion bends
+  // between two frames (a constraint keeping it on a fast orbit, a driver on sin(frame), Bezier keys
+  // far apart …) per-frame keys cut chords. The per-frame keys show where a path bends
+  // (`chordErrors`); there the scene is evaluated at the mid-frame, and only where that sample lies
+  // off the straight line between the two frame keys by more than the tolerance does the node get
+  // keys between those frames (1, or 3 where the mid-frame offset calls for them). Motion that is
+  // straight between frames (LINEAR keyframes, rigid bodies, whose simulation is interpolated
+  // linearly between frames) keeps one key per frame, however sharply it turns at a frame.
+  /** Sub-frame tracks (key times in frames) of nodes whose motion bends between frames. */
+  const fineTracks = new Map<XNode, Track & { frames: Float64Array; sig: string }>();
   if (frames.length > 2) {
-    const curved = new Map<XNode, number>();
+    type Sample = { t: Vec3; q: Quat; s: Vec3 };
+    /** Moving nodes whose per-frame keys bend: chord error estimate per frame interval. */
+    const candidates = new Map<XNode, { tol: number; est: Float64Array }>();
     for (const n of moving) {
       const tr = tracks.get(n)!;
       if (!varies(tr.t, 3)) continue;
-      const err = chordError(tr.t);
-      if (err > chordTolerance(tr.t)) curved.set(n, err);
+      const tol = chordTolerance(tr.t);
+      const est = chordErrors(tr.t);
+      if (est.some((e) => e > tol)) candidates.set(n, { tol, est });
     }
-    if (curved.size) {
-      let k = 1;
-      for (const [n, err] of curved) {
-        const tol = chordTolerance(tracks.get(n)!.t);
-        k = Math.max(k, Math.min(MAX_SUBFRAMES, Math.ceil(Math.sqrt(err / tol))));
+    // frame intervals (frame i → i + 1) to check, the most bent first
+    const score = new Float64Array(frames.length - 1);
+    for (const { tol, est } of candidates.values())
+      est.forEach((e, i) => {
+        if (e > tol) score[i] = Math.max(score[i], e / tol);
+      });
+    const flagged: number[] = [];
+    score.forEach((s, i) => {
+      if (s > 0) flagged.push(i);
+    });
+    flagged.sort((a, b) => score[b] - score[a] || a - b);
+    const sampleOf = (sc: EvaluatedScene, n: XNode): Sample => {
+      const m = gltfLocal(n, sc) ?? gltfLocal(n, scene);
+      const trs = m ? trsOfMatrix(m) : null;
+      return trs
+        ? { t: trs.t, q: normalizeQuat(trs.q), s: trs.s }
+        : { t: [0, 0, 0], q: [0, 0, 0, 1], s: [1, 1, 1] };
+    };
+    const keyAt = (n: XNode, fi: number): Vec3 => {
+      const t = tracks.get(n)!.t;
+      return [t[fi * 3], t[fi * 3 + 1], t[fi * 3 + 2]];
+    };
+    /** Distance of p from the midpoint of a and b (the offset of p from the chord a–b at its middle). */
+    const offMid = (p: Vec3, a: Vec3, b: Vec3) =>
+      Math.hypot(p[0] - (a[0] + b[0]) / 2, p[1] - (a[1] + b[1]) / 2, p[2] - (a[2] + b[2]) / 2);
+    /** Per node: the samples between frame i and i + 1 it gets keys for (mid, or quarter-mid-quarter). */
+    const between = new Map<XNode, Map<number, Sample[]>>();
+    /** Per node: the largest chord error left (estimated), with the keys per frame there. */
+    const left = new Map<XNode, { err: number; k: number }>();
+    let budget = SUBFRAME_EVALUATIONS;
+    let checked = 0;
+    for (const i of flagged) {
+      if (budget < 1) break;
+      budget--;
+      checked++;
+      const mid = evaluator.evaluate(frames[i] + 0.5, { forRender: true });
+      const off: { n: XNode; m: Sample; d: number; tol: number }[] = [];
+      for (const [n, c] of candidates) {
+        const m = sampleOf(mid, n);
+        const d = offMid(m.t, keyAt(n, i), keyAt(n, i + 1));
+        if (d > c.tol) off.push({ n, m, d, tol: c.tol });
       }
-      const count = (frames.length - 1) * k + 1;
-      const at = new Float64Array(count);
-      for (let i = 0; i < count; i++) at[i] = frames[0] + i / k;
-      for (const n of curved.keys())
-        fineTracks.set(n, {
-          frames: at,
-          t: new Float32Array(count * 3),
-          r: new Float32Array(count * 4),
-          s: new Float32Array(count * 3),
-        });
-      const prevQ = new Map<XNode, Quat>();
-      for (let i = 0; i < count; i++) {
-        const fi = i / k;
-        const exactFrame = Number.isInteger(fi);
-        const sc = exactFrame ? null : evaluator.evaluate(at[i], { forRender: true });
-        for (const [n, ft] of fineTracks) {
-          let tq: { t: Vec3; q: Quat; s: Vec3 };
-          if (sc) {
-            const m = gltfLocal(n, sc) ?? gltfLocal(n, scene);
-            const trs = m ? trsOfMatrix(m) : null;
-            tq = trs
-              ? { t: trs.t, q: normalizeQuat(trs.q), s: trs.s }
-              : { t: [0, 0, 0], q: [0, 0, 0, 1], s: [1, 1, 1] };
-          } else {
-            const tr = tracks.get(n)!;
-            const o = fi;
-            tq = {
-              t: [tr.t[o * 3], tr.t[o * 3 + 1], tr.t[o * 3 + 2]],
-              q: [tr.r[o * 4], tr.r[o * 4 + 1], tr.r[o * 4 + 2], tr.r[o * 4 + 3]],
-              s: [tr.s[o * 3], tr.s[o * 3 + 1], tr.s[o * 3 + 2]],
-            };
-          }
-          let q = tq.q;
-          const prev = prevQ.get(n);
-          if (prev && prev[0] * q[0] + prev[1] * q[1] + prev[2] * q[2] + prev[3] * q[3] < 0)
-            q = [-q[0], -q[1], -q[2], -q[3]];
-          prevQ.set(n, q);
-          ft.t.set(tq.t, i * 3);
-          ft.r.set(q, i * 4);
-          ft.s.set(tq.s, i * 3);
+      if (!off.length) continue;
+      // a chord of half the length has about a quarter of the offset: 4 keys per frame where a
+      // mid-frame key alone leaves more than the tolerance
+      let quarter: [EvaluatedScene, EvaluatedScene] | null = null;
+      if (budget >= 2 && off.some(({ d, tol }) => d / 4 > tol)) {
+        budget -= 2;
+        quarter = [
+          evaluator.evaluate(frames[i] + 0.25, { forRender: true }),
+          evaluator.evaluate(frames[i] + 0.75, { forRender: true }),
+        ];
+      }
+      for (const { n, m, d, tol } of off) {
+        let samples = [m];
+        let err = d / 4;
+        if (quarter && d / 4 > tol) {
+          const a = sampleOf(quarter[0], n);
+          const b = sampleOf(quarter[1], n);
+          samples = [a, m, b];
+          err = Math.max(offMid(a.t, keyAt(n, i), m.t), offMid(b.t, m.t, keyAt(n, i + 1))) / 4;
         }
+        let per = between.get(n);
+        if (!per) between.set(n, (per = new Map()));
+        per.set(i, samples);
+        const was = left.get(n);
+        if (err > tol && (!was || err > was.err)) left.set(n, { err, k: samples.length + 1 });
       }
-      for (const [n, ft] of fineTracks) {
-        const left = chordError(ft.t);
-        const tol = chordTolerance(ft.t);
-        if (left > tol)
-          warn(
-            `'${n.name}' moves on a strongly curved path: sampled ${k} times per frame, its linearly interpolated glTF keys still cut chords of up to ${(left * 1000).toFixed(1)} mm (parent it to the rotating object, or use a higher frame rate, for a closer path)`,
-          );
+    }
+    for (const [n, per] of between) {
+      const tr = tracks.get(n)!;
+      const ivs = [...per.keys()].sort((a, b) => a - b);
+      let count = frames.length;
+      for (const i of ivs) count += per.get(i)!.length;
+      const ft = {
+        frames: new Float64Array(count),
+        t: new Float32Array(count * 3),
+        r: new Float32Array(count * 4),
+        s: new Float32Array(count * 3),
+        sig: ivs.map((i) => `${i}:${per.get(i)!.length}`).join(','),
+      };
+      let o = 0;
+      let prev: Quat | null = null;
+      const push = (f: number, smp: Sample) => {
+        let q = smp.q;
+        if (prev && prev[0] * q[0] + prev[1] * q[1] + prev[2] * q[2] + prev[3] * q[3] < 0)
+          q = [-q[0], -q[1], -q[2], -q[3]];
+        prev = q;
+        ft.frames[o] = f;
+        ft.t.set(smp.t, o * 3);
+        ft.r.set(q, o * 4);
+        ft.s.set(smp.s, o * 3);
+        o++;
+      };
+      for (let fi = 0; fi < frames.length; fi++) {
+        push(frames[fi], {
+          t: keyAt(n, fi),
+          q: [tr.r[fi * 4], tr.r[fi * 4 + 1], tr.r[fi * 4 + 2], tr.r[fi * 4 + 3]],
+          s: [tr.s[fi * 3], tr.s[fi * 3 + 1], tr.s[fi * 3 + 2]],
+        });
+        const smp = per.get(fi);
+        if (smp) smp.forEach((sm, j) => push(frames[fi] + (j + 1) / (smp.length + 1), sm));
       }
+      fineTracks.set(n, ft);
+    }
+    for (const [n, { err, k }] of left)
+      warn(
+        `'${n.name}' moves on a strongly curved path: with ${k} keys per frame${k < 4 ? ' (the budget of sub-frame samples ran out)' : ''} its linearly interpolated glTF keys still cut chords of about ${(err * 1000).toFixed(1)} mm (parent it to the rotating object, or use a higher frame rate, for a closer path)`,
+      );
+    if (checked < flagged.length) {
+      const rest = flagged.slice(checked);
+      const names = [...candidates]
+        .filter(([, c]) => rest.some((i) => c.est[i] > c.tol))
+        .map(([n]) => `'${n.name}'`);
+      warn(
+        `Curved paths: ${rest.length} of the ${flagged.length} frame intervals where the per-frame keys of ${names.length > 3 ? `${names.slice(0, 3).join(', ')} and ${names.length - 3} more` : names.join(', ')} bend were not checked between frames (budget of ${SUBFRAME_EVALUATIONS} sub-frame scene evaluations), so they keep one key per frame there; where the motion curves between frames, their linearly interpolated keys cut chords`,
+      );
     }
   }
 
@@ -1703,7 +1778,8 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       anim.samplers.push({ input: inp, output: w.accessor(data, type), interpolation: 'LINEAR' });
       anim.channels.push({ sampler: anim.samplers.length - 1, target: { node, path } });
     };
-    let fineInput = -1;
+    /** Time accessors of sub-frame tracks, shared by tracks with the same key times. */
+    const fineInputs = new Map<string, number>();
     for (const n of order) {
       const coarse = tracks.get(n);
       if (!coarse || !moving.has(n)) continue;
@@ -1711,12 +1787,14 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
       const tr = fine ?? coarse;
       const inp = () => {
         if (!fine) return timeInput();
-        if (fineInput < 0) {
+        let index = fineInputs.get(fine.sig);
+        if (index === undefined) {
           const t = new Float32Array(fine.frames.length);
           for (let i = 0; i < t.length; i++) t[i] = (fine.frames[i] - start) / fps;
-          fineInput = w.accessor(t, 'SCALAR', undefined, true);
+          index = w.accessor(t, 'SCALAR', undefined, true);
+          fineInputs.set(fine.sig, index);
         }
-        return fineInput;
+        return index;
       };
       if (varies(tr.t, 3)) channel(n.index, 'translation', tr.t, 'VEC3', inp());
       if (varies(tr.r, 4)) channel(n.index, 'rotation', tr.r, 'VEC4', inp());
@@ -1779,33 +1857,35 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
 // ------------------------------------------------------------------ helpers
 
 /**
- * Largest distance between the straight segments of a per-frame translation track (xyz per key)
- * and the circular arcs through consecutive keys: the chord error of linear interpolation.
+ * Chord error estimate of each interval between consecutive keys of a per-frame translation track
+ * (xyz per key): the sagitta of the circular arc through the interval's keys and a neighbouring
+ * key (the larger of the two neighbours). A path that turns at a key (a collision, LINEAR
+ * keyframes) looks bent here too: the exporter samples the scene between the frames to tell.
  */
-function chordError(t: Float32Array): number {
+function chordErrors(t: Float32Array): Float64Array {
   const n = t.length / 3;
-  let worst = 0;
+  const est = new Float64Array(Math.max(0, n - 1));
   const p = (i: number, k: number) => t[i * 3 + k];
   for (let i = 0; i + 2 < n; i++) {
-    const a = Math.hypot(p(i + 1, 0) - p(i, 0), p(i + 1, 1) - p(i, 1), p(i + 1, 2) - p(i, 2));
-    const b = Math.hypot(p(i + 2, 0) - p(i + 1, 0), p(i + 2, 1) - p(i + 1, 1), p(i + 2, 2) - p(i + 1, 2));
-    const c = Math.hypot(p(i + 2, 0) - p(i, 0), p(i + 2, 1) - p(i, 1), p(i + 2, 2) - p(i, 2));
-    // circumradius R = abc / (4 · area); the sagitta of a chord of length L is R − √(R² − L²/4)
     const ux = p(i + 1, 0) - p(i, 0);
     const uy = p(i + 1, 1) - p(i, 1);
     const uz = p(i + 1, 2) - p(i, 2);
     const vx = p(i + 2, 0) - p(i, 0);
     const vy = p(i + 2, 1) - p(i, 1);
     const vz = p(i + 2, 2) - p(i, 2);
+    const a = Math.hypot(ux, uy, uz);
+    const b = Math.hypot(p(i + 2, 0) - p(i + 1, 0), p(i + 2, 1) - p(i + 1, 1), p(i + 2, 2) - p(i + 1, 2));
+    const c = Math.hypot(vx, vy, vz);
     const area = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) / 2;
     if (!(area > 1e-12 * (a * b + 1e-30))) continue;
+    // circumradius R = abc / (4 · area); the sagitta of a chord of length L is R − √(R² − L²/4),
+    // written as (L²/4) / (R + √(R² − L²/4)) to stay exact for nearly straight paths
     const R = (a * b * c) / (4 * area);
-    for (const L of [a, b]) {
-      const h = R * R - (L * L) / 4;
-      worst = Math.max(worst, h > 0 ? R - Math.sqrt(h) : R);
-    }
+    const sagitta = (L: number) => (L * L) / 4 / (R + Math.sqrt(Math.max(0, R * R - (L * L) / 4)));
+    est[i] = Math.max(est[i], sagitta(a));
+    est[i + 1] = Math.max(est[i + 1], sagitta(b));
   }
-  return worst;
+  return est;
 }
 
 /** Acceptable chord error of a translation track: 0.5 mm, or 0.1% of the path's extent. */

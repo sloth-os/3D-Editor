@@ -20,7 +20,7 @@ import { Panel, Row, SelectField, NumberField, ColorField, Checkbox } from './fi
 import { TransformFields } from './properties/ObjectTab';
 import { NavGizmo } from './NavGizmo';
 import { importFiles } from '../io/import-export';
-import { fps } from '../telemetry/perf';
+import { fps, slowFrameMs } from '../telemetry/perf';
 import type { ToolId } from '../editor/state';
 
 function BrushSettings({ s }: { s: ProjectSession }) {
@@ -256,6 +256,7 @@ export function InfoOverlay({ s }: { s: ProjectSession }) {
   const stats = showStats ? s.sceneStats() : null;
   const mode = s.state.$mode.value;
   const sel = s.state.$meshSelection.value;
+  const slow = slowFrameMs.value;
   return (
     <>
       <div class="viewport-overlay viewport-info" data-testid="viewport-info">
@@ -263,6 +264,19 @@ export function InfoOverlay({ s }: { s: ProjectSession }) {
         <div>
           ({Math.round(frame)}) Scene Collection{active ? ` | ${active.name}` : ''}
         </div>
+        {slow > 0 && (
+          <div
+            class="viewport-slow"
+            data-testid="viewport-slow-frame"
+            title={
+              'The last frame took this long to draw. Rendered shading of a heavy scene (many triangles, ' +
+              'shadow-casting lamps, area lights) is slow in software WebGL; Solid or Material Preview ' +
+              'shading is much faster, and F12 / the path tracer renders the final image.'
+            }
+          >
+            Slow viewport: {(slow / 1000).toFixed(slow < 10_000 ? 1 : 0)} s per frame
+          </div>
+        )}
       </div>
       {stats && (
         <div class="viewport-overlay viewport-stats" data-testid="viewport-stats">
