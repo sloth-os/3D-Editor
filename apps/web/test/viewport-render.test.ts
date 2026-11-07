@@ -19,6 +19,7 @@ import type { ProjectSession } from '../src/project/session';
 import { renderOutputSize, type PathTraceOptions } from '../src/render';
 import { applyLensShift, sceneCameraView } from '../src/render/view';
 import {
+  MAX_FRAMES_IN_FLIGHT,
   MSAA_OFF_FRAME_MS,
   MSAA_ON_FRAME_MS,
   VIEWPORT_MSAA_SAMPLES,
@@ -1194,9 +1195,11 @@ describe('heavy scenes in Rendered shading', () => {
     expect(pictures(glassScene(400))).toBe(1);
   });
 
-  it('starts no frame while the GPU draws the last one, and says how long a slow frame took', () => {
-    // regression: in software WebGL a heavy frame drew for minutes with frames queueing behind it
-    // and nothing on screen saying so
+  it('starts a change’s frame while the GPU draws the last one, queues no more, and says how long a slow frame took', () => {
+    // regressions: in software WebGL a heavy frame drew for minutes with frames queueing behind it
+    // and nothing on screen saying so; then a change made while the GPU still drew the frame before
+    // it waited for that frame, so a screenshot taken right after the change (an e2e test, an
+    // agent) showed the view without it
     const s = session();
     const { e, gl } = engine(s);
     const fences = fenceContext(gl);
@@ -1205,25 +1208,37 @@ describe('heavy scenes in Rendered shading', () => {
     frame(e);
     expect(scenePasses(e, gl)).toHaveLength(1);
     expect(fences).toHaveLength(1);
-    // the view keeps changing while the GPU is busy: no frame is started
-    now += 5000;
+    // a change while the GPU is busy: its frame starts at once, behind the one being drawn
+    now += 500;
+    e.requestRender();
+    frame(e);
+    expect(MAX_FRAMES_IN_FLIGHT).toBe(2);
+    expect(scenePasses(e, gl)).toHaveLength(2);
+    // the view keeps changing: nothing more queues up behind those two
+    now += 4500;
     e.requestRender();
     frame(e);
     frame(e);
-    expect(scenePasses(e, gl)).toHaveLength(1);
+    expect(scenePasses(e, gl)).toHaveLength(2);
+    expect(fences).toHaveLength(2);
     expect(slowFrameMs.value).toBe(0);
-    // the frame is done after 12.5 s: the next one starts and the notice says how long it took
+    // the first frame is done after 12.5 s: the notice says how long it took, and the view as it is
+    // now is drawn next
     now += 7500;
     fences[0].done = true;
     frame(e);
-    expect(scenePasses(e, gl)).toHaveLength(2);
     expect(slowFrameMs.value).toBe(12_500);
+    expect(scenePasses(e, gl)).toHaveLength(3);
+    // the second one is done 3 s later: it took 3 s, not the 15 s since it was started
+    now += 3000;
+    fences[1].done = true;
+    frame(e);
+    expect(slowFrameMs.value).toBe(3000);
+    expect(scenePasses(e, gl)).toHaveLength(3);
     // a fast frame clears it
     now += SLOW_FRAME_MS / 4;
-    fences[1].done = true;
-    e.requestRender();
+    fences[2].done = true;
     frame(e);
-    expect(scenePasses(e, gl)).toHaveLength(3);
     expect(slowFrameMs.value).toBe(0);
   });
 

@@ -86,6 +86,23 @@ export const MSAA_OFF_FRAME_MS = 250;
 export const MSAA_ON_FRAME_MS = MSAA_OFF_FRAME_MS / 8;
 /** A frame the GPU has not finished after this long is given up on (it no longer holds frames back). */
 const FENCE_TIMEOUT_MS = 10 * 60_000;
+/**
+ * Frames the GPU may be drawing at once. A change starts its frame at once even while the GPU still
+ * draws the previous one, so a screenshot taken after it shows it (software WebGL can take a second
+ * for a light scene's frame, minutes for a heavy one); further frames wait instead of queueing up
+ * behind them, and the frame drawn next shows the view as it is by then.
+ */
+export const MAX_FRAMES_IN_FLIGHT = 2;
+
+/** A frame the GPU has not finished yet (WebGL2 fence) and what is known of it. */
+interface FrameInFlight {
+  fence: WebGLSync;
+  /** When the frame started (before its scene sync) and when its renders started. */
+  start: number;
+  renderStart: number;
+  /** Whether its renders compiled shader programs (the first frame of a shading, new materials). */
+  compiled: boolean;
+}
 
 /**
  * Divides colour by alpha (straight alpha) for transparent-film renders: a render over a clear
@@ -218,15 +235,14 @@ export class ViewportEngine {
   private resizeObserver: ResizeObserver;
   private lastFrameTime = 0;
   /**
-   * The GPU fence of the last frame (WebGL2) and when that frame started: the next frame waits for
-   * it, so a slow GPU (software WebGL drawing a heavy scene for seconds) never gets a queue of frames
-   * behind the one it draws, and the frame's cost is known ({@link slowFrameMs}).
+   * The frames the GPU still draws, oldest first (WebGL2 fences): at most
+   * {@link MAX_FRAMES_IN_FLIGHT}, so a slow GPU (software WebGL drawing a heavy scene for seconds)
+   * never gets a queue of frames behind the one it draws, and each frame's cost is known
+   * ({@link slowFrameMs}).
    */
-  private gpuFence: WebGLSync | null = null;
-  private gpuFenceStart = 0;
-  /** When that frame's renders started (after the scene sync) and the programs three.js had then. */
-  private gpuRenderStart = 0;
-  private gpuPrograms = 0;
+  private framesInFlight: FrameInFlight[] = [];
+  /** When the last frame was seen finished: a frame queued behind it started drawing then. */
+  private lastFrameDone = 0;
   /**
    * Whether the viewport's scene target is multisampled: off while frames are slow (software
    * WebGL, see {@link MSAA_OFF_FRAME_MS}), on again once they are fast.
@@ -405,7 +421,7 @@ export class ViewportEngine {
     const programs = this.programCount();
     this.render();
     recordFrame(now);
-    this.fenceFrame(start, renderStart, programs);
+    this.fenceFrame(start, renderStart, this.programCount() > programs);
   }
 
   /** Shader programs three.js has compiled (a frame that adds some compiled shaders). */
@@ -414,43 +430,48 @@ export class ViewportEngine {
   }
 
   /**
-   * Whether the GPU finished the last frame (always true without WebGL2 fences). When it did, its
-   * cost updates {@link slowFrameMs} (from the start of the frame, scene sync included) and the
-   * multisampling ({@link adaptMultisampling}, from the start of its renders). A frame of a lost
-   * context, or not done after {@link FENCE_TIMEOUT_MS}, is given up on.
+   * Retires the frames the GPU has finished, oldest first, and says whether another one may start
+   * (fewer than {@link MAX_FRAMES_IN_FLIGHT} in flight; always without WebGL2 fences). A finished
+   * frame's cost updates {@link slowFrameMs} (from the start of the frame, scene sync included, or
+   * from when the frame before it finished) and the multisampling ({@link adaptMultisampling}, from
+   * the start of its renders). A frame of a lost context, or not done after
+   * {@link FENCE_TIMEOUT_MS}, is given up on.
    */
   private frameDone(): boolean {
-    const fence = this.gpuFence;
-    if (!fence) return true;
     const gl = this.renderer.getContext?.();
-    const now = performance.now();
-    const elapsed = now - this.gpuFenceStart;
-    if (gl && 'getSyncParameter' in gl && !gl.isContextLost?.() && elapsed < FENCE_TIMEOUT_MS) {
-      const gl2 = gl as WebGL2RenderingContext;
-      if (gl2.getSyncParameter(fence, gl2.SYNC_STATUS) !== gl2.SIGNALED) return false;
-      gl2.deleteSync(fence);
+    while (this.framesInFlight.length) {
+      const f = this.framesInFlight[0];
+      const now = performance.now();
+      if (gl && 'getSyncParameter' in gl && !gl.isContextLost?.() && now - f.start < FENCE_TIMEOUT_MS) {
+        const gl2 = gl as WebGL2RenderingContext;
+        if (gl2.getSyncParameter(f.fence, gl2.SYNC_STATUS) !== gl2.SIGNALED) break;
+        gl2.deleteSync(f.fence);
+      }
+      this.framesInFlight.shift();
+      // a frame queued behind another one only started drawing when that one was done
+      const elapsed = now - Math.max(f.start, this.lastFrameDone);
+      const renders = now - Math.max(f.renderStart, this.lastFrameDone);
+      this.lastFrameDone = now;
+      this.adaptMultisampling(renders, f.compiled);
+      const slow = elapsed > SLOW_FRAME_MS && document.visibilityState === 'visible' ? elapsed : 0;
+      if (slowFrameMs.value !== slow) slowFrameMs.value = slow;
+      const compiled = slow > 0 && f.compiled;
+      if (slowFrameCompiled.value !== compiled) slowFrameCompiled.value = compiled;
     }
-    this.gpuFence = null;
-    const compiled = this.programCount() > this.gpuPrograms;
-    this.adaptMultisampling(now - this.gpuRenderStart, compiled);
-    const slow = elapsed > SLOW_FRAME_MS && document.visibilityState === 'visible' ? elapsed : 0;
-    if (slowFrameMs.value !== slow) slowFrameMs.value = slow;
-    if (slowFrameCompiled.value !== (slow > 0 && compiled)) slowFrameCompiled.value = slow > 0 && compiled;
-    return true;
+    return this.framesInFlight.length < MAX_FRAMES_IN_FLIGHT;
   }
 
   /**
-   * Puts a fence after the frame that started at `start` and rendered from `renderStart` with
-   * `programs` compiled shader programs before it (WebGL2; see {@link frameDone}).
+   * Puts a fence after the frame that started at `start`, rendered from `renderStart` and
+   * `compiled` shader programs or not (WebGL2; see {@link frameDone}).
    */
-  private fenceFrame(start: number, renderStart: number, programs: number): void {
+  private fenceFrame(start: number, renderStart: number, compiled: boolean): void {
     const gl = this.renderer.getContext?.();
     if (!gl || !('fenceSync' in gl)) return;
     const gl2 = gl as WebGL2RenderingContext;
-    this.gpuFence = gl2.fenceSync(gl2.SYNC_GPU_COMMANDS_COMPLETE, 0);
-    this.gpuFenceStart = start;
-    this.gpuRenderStart = renderStart;
-    this.gpuPrograms = programs;
+    const fence = gl2.fenceSync(gl2.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!fence) return;
+    this.framesInFlight.push({ fence, start, renderStart, compiled });
     gl2.flush();
   }
 

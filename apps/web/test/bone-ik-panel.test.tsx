@@ -143,6 +143,11 @@ describe('bone IK settings panel', () => {
     expect(pb().ik_min_y as number).toBeCloseTo(-Math.PI / 4, 9);
     expect(pb().ik_max_y as number).toBeCloseTo(Math.PI / 2, 9);
     expect(byTestId(container, 'pose-ik-max-y')?.textContent).toContain('90');
+    // Min and Max are stacked at the row's full width (side by side in the ~330 px editor, a
+    // 70 px field's "Min" label ran into its value)
+    const minField = byTestId(container, 'pose-ik-min-y')!;
+    expect(minField.parentElement?.classList.contains('vector')).toBe(true);
+    expect(byTestId(container, 'pose-ik-max-y')!.parentElement).toBe(minField.parentElement);
     // a slider drag previews live and commits one undo step
     const steps = (s.undo as Y.UndoManager).undoStack.length;
     dragNumber(byTestId(container, 'pose-ik-stiffness-y')!, 30);
