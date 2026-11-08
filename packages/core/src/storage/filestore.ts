@@ -13,6 +13,12 @@ export interface WriteOptions {
   /** Only write if the file does not exist ('*'). */
   ifNoneMatch?: '*';
   contentType?: string;
+  /**
+   * False: a write into a folder that does not exist fails with {@link MissingFolderError} instead
+   * of creating the folder (the folder of a file just written is gone only when another writer
+   * deleted it). Default true.
+   */
+  createFolders?: boolean;
 }
 
 export interface ReadOptions {
@@ -56,6 +62,14 @@ export class PreconditionFailedError extends Error {
   constructor(path: string) {
     super(`Precondition failed for ${path}`);
     this.name = 'PreconditionFailedError';
+  }
+}
+
+/** Thrown by a write with `createFolders: false` into a folder that does not exist (HTTP 409). */
+export class MissingFolderError extends Error {
+  constructor(path: string) {
+    super(`The folder of ${path} does not exist`);
+    this.name = 'MissingFolderError';
   }
 }
 
@@ -119,9 +133,18 @@ export class MemoryFileStore implements FileStore {
     const cur = this.files.get(p);
     if (opts.ifNoneMatch === '*' && cur) throw new PreconditionFailedError(p);
     if (opts.ifMatch && (!cur || cur.etag !== opts.ifMatch)) throw new PreconditionFailedError(p);
+    if (opts.createFolders === false && !this.folderExists(p.slice(0, p.lastIndexOf('/')) || '/'))
+      throw new MissingFolderError(p);
     const etag = `"m${++this.counter}"`;
     this.files.set(p, { data: data.slice(), etag, mtime: new Date().toUTCString() });
     return { etag };
+  }
+
+  /** A folder exists when it was created (mkdirp) or holds a file (writes create their folders). */
+  private folderExists(dir: string): boolean {
+    if (dir === '/' || this.dirs.has(dir)) return true;
+    for (const p of this.files.keys()) if (p.startsWith(`${dir}/`)) return true;
+    return false;
   }
 
   async remove(path: string) {

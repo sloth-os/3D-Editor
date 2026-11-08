@@ -10,7 +10,9 @@
 
 Projects are **always** cached in IndexedDB as well, which is what makes the app work offline.
 When WebDAV is configured the local copy is merged with the WebDAV copy on open, a moment
-after each change, every 20 s (to pick up other devices) and when the tab is hidden.
+after each change, every 20 s (to pick up other devices) and when the tab is hidden. A project
+deleted from WebDAV (on another device, or in another tab) is not stored there again unless the
+tab's copy changed since the browser's last sync (see [Deleted projects](#deleted-projects)).
 
 Saving is a CRDT merge (`ProjectFileStore.syncDocument`): read the stored state, merge it into
 the local document, and write the merged state back with `If-Match` (retrying on HTTP 412).
@@ -43,18 +45,18 @@ project at the same moment. Every writer:
 - **On WebDAV, checks and reads back**, as servers handle `If-Match` differently (table below):
   right before writing it checks that the document's ETag is still the one it read (HEAD, or
   PROPFIND when GET carries none) and sends the write next, with no request between (a new
-  project's folders are created before the check, which finds no document; when PROPFIND finds
-  one but reports no ETag, as nginx's does, a GET tells whether another writer created it
-  meanwhile); after writing it reads the write back (one GET, or just the ETag when the PUT
-  response carried one), and when another write replaced it, merges that one and writes again if
-  it lacks the writer's changes.
+  project's folders are created before the check, which finds no document; when the check cannot
+  tell, because nginx's PROPFIND reports no ETag or the request failed, a GET tells whether another
+  writer created the document meanwhile); after writing it reads the write back (one GET, or just
+  the ETag when the PUT response carried one), and when another write replaced it, merges that one
+  and writes again if it lacks the writer's changes.
 - **Reads storage again later.** A server room that wrote to WebDAV reads the document again in
   the next refresh (every 60 s), before it is evicted (idle for `ROOM_IDLE_TTL_SECONDS`) and when
   the server stops, and writes its changes again if they are missing; it is not evicted while that
-  read fails. Browsers sync every 20 s while the project is open.
-- **Does not bring back deleted projects.** When such a read finds no document because another
-  server deleted the project, a room with no unsaved changes writes nothing; a change made in the
-  room afterwards (by an editor still connected to it) saves the project again.
+  read fails. A room that nobody uses reads the document again before the server opens it, unless
+  it read it within the last 2 s; the server waits 5 s at most for that read. Browsers sync every
+  20 s while the project is open.
+- **Does not bring back deleted projects** (next section).
 
 `SYNC_PERSISTENCE=disk` checks `If-Match` and writes in one step under a lock, gives each version a
 later modification time than the one it replaces (the ETag is `"<size>-<mtime>"`), and reads a
@@ -120,6 +122,64 @@ A WebDAV server used directly from the browser must allow (CORS) the `PROPFIND`,
 and `DELETE` methods and the `Authorization`, `Content-Type`, `Depth`, `If-Match` and
 `If-None-Match` request headers, and should expose `ETag`: without it, every save takes the
 requests of a server that sends no ETag (above).
+
+### Deleted projects
+
+A project can be deleted (in a browser's project list, with the REST API or the MCP
+`delete_project` tool) while other servers and browsers have it open. They follow one rule: a
+writer stores a project that is gone from storage again only when it holds changes made since its
+last read or write of storage (unsaved changes), and so keeps that work; otherwise it writes
+nothing.
+
+- A writer that saved its changes has none left: when the deletion lands right after its write
+  (its read-back finds no document, or its write of `project.json` finds no folder), it writes
+  neither the document nor `project.json` again (writes never create a project's folder that is
+  gone; they used to, which left a `project.json` that every server listed without a document).
+  When another writer's save had replaced its write without its changes (servers that ignore
+  `If-Match`) before the deletion, those changes count as unsaved.
+- A server room learns of the deletion when it reads storage: in the periodic refresh (rooms with
+  editors connected, and rooms that wrote to WebDAV since their last read), in its read-back,
+  before eviction or at shutdown when it wrote since its last read, and before the server opens a
+  room that nobody uses (no editor connected, no MCP session, no unsaved changes), unless that
+  room read storage within the last 2 s. Without unsaved changes it writes nothing. A room that
+  nobody uses is then closed (right away, or by the next check for idle rooms, every 60 s by
+  default), and the server answers like the one that deleted the project: it does not list or
+  open it (MCP tools answer that the project was not found), and refuses sync connections to it
+  for an hour. A room in use stays open, and a change made in it saves the project again. The
+  server logs both at `info`:
+  - `project deleted from storage elsewhere: not saved again unless it changes on this server`
+  - `project deleted from storage elsewhere: saved again with the changes made on this server`
+- A server lists what storage lists, and the projects whose rooms are in use or have unsaved
+  changes. When storage does not list a loaded project that nobody uses, the server asks whether
+  its document is still stored (its `project.json` may be unreadable): when it is not, the room
+  reads storage and is closed. When listing storage fails, the server lists the projects it has
+  loaded and logs `listing projects failed` at `warn`.
+- The server that deleted a project refuses sync connections to it for an hour (they would upload
+  a browser's copy as a new project), but lists and opens it as soon as storage holds it again
+  (another writer saved its unsaved changes).
+- A browser remembers in localStorage, which all its tabs share, per project and WebDAV store, the
+  state vector of the stored states its syncs read or wrote (also of a write another writer
+  deleted right after). When the store no longer has a project the browser synced before, a tab
+  stores it again only if its copy holds changes made since (its own, or ones it received live
+  from others); else it shows `WebDAV deleted` in the status bar, says once that the project was
+  deleted (on another device, or in this browser), and keeps its copy. A later change, or Save
+  (Ctrl+S), stores it again and says so. Changes that only delete things do not count: they are
+  gone with the project. A project the browser never synced with that store is uploaded, unless
+  a tab of this browser deleted it.
+- Deleting a project in the browser keeps that record and notes the deletion before it deletes
+  the WebDAV copy, so that the browser's other tabs that have the project open follow the rule
+  (they used to upload it at their next sync, as a project they had never synced). It does not
+  sync the open project a last time first, and waits for a sync that is running: either could
+  land after the deletion.
+
+Limits: a browser that connects to a server more than an hour after the deletion (or to another
+server that has no room for the project, or one restarted since) uploads its copy over the sync
+connection, and the server stores it as a new project: it cannot tell such a copy from a project
+created offline. A browser with no record of syncing a project (a private window, blocked storage,
+or a project it last synced with an earlier version) treats it as never synced. The records stay
+in localStorage after a project is deleted. nginx with `create_full_put_path on` creates missing
+folders on PUT itself: a deletion between a save's document and its `project.json` leaves that
+`project.json`.
 
 ## Real-time sync
 

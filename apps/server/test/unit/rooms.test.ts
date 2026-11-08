@@ -11,7 +11,7 @@ import {
 } from '@3d-editor/core';
 import { RoomManager } from '../../src/sync/room-manager';
 import { ServerMetrics } from '../../src/observability/metrics';
-import { silentLog } from '../../src/observability/log';
+import { silentLog, type Log } from '../../src/observability/log';
 import { decodeAwarenessEntries, encodeAwarenessEntries } from '../../src/sync/awareness';
 import type { Persistence } from '../../src/persistence';
 import { mkcolPath, startWebDAV, type TestWebDAV, type TestWebDAVOptions } from '../helpers/webdav';
@@ -54,9 +54,33 @@ class SplitEtagStore extends MemoryFileStore {
   }
 }
 
+/** MemoryFileStore whose reads of documents can be held (storage that does not answer). */
+class HeldStore extends MemoryFileStore {
+  hold: Promise<void> | null = null;
+  documentReads = 0;
+  override async read(path: string) {
+    if (path.endsWith('/document.ybin')) {
+      this.documentReads++;
+      if (this.hold) await this.hold;
+    }
+    return super.read(path);
+  }
+}
+
+/** MemoryFileStore whose folder listings can be made to fail (storage outage for PROPFIND). */
+class ListFailStore extends MemoryFileStore {
+  failList = false;
+  override async list(dir: string) {
+    if (this.failList) throw new Error('storage offline');
+    return super.list(dir);
+  }
+}
+
 const managers: RoomManager[] = [];
 
-function setup(opts: { ttlMs?: number; debounceMs?: number; fs?: FileStore } = {}) {
+function setup(
+  opts: { ttlMs?: number; debounceMs?: number; fs?: FileStore; log?: Log; openReadWaitMs?: number } = {},
+) {
   const fs = opts.fs ?? new FlakyStore();
   const store = new ProjectFileStore(fs, '/');
   const persistence: Persistence = {
@@ -69,11 +93,12 @@ function setup(opts: { ttlMs?: number; debounceMs?: number; fs?: FileStore } = {
   const rooms = new RoomManager({
     persistence,
     metrics,
-    log: silentLog,
+    log: opts.log ?? silentLog,
     ttlMs: opts.ttlMs ?? 60_000,
     debounceMs: opts.debounceMs ?? 10,
     serverVersion: 'test',
     sweepIntervalMs: 3_600_000,
+    openReadWaitMs: opts.openReadWaitMs,
   });
   managers.push(rooms);
   return { rooms, store, fs, metrics };
@@ -105,7 +130,8 @@ async function sharedWebDAV(opts: TestWebDAVOptions) {
     dav,
     onRequest: (h: ((req: RequestHook) => unknown) | null) => (hook = h),
     /** A server (RoomManager) persisting to this WebDAV server; `writer` names its requests. */
-    server: (writer: string, ttlMs = 60_000) => setup({ fs: client(writer), ttlMs, debounceMs: 60_000 }),
+    server: (writer: string, ttlMs = 60_000, log?: Log) =>
+      setup({ fs: client(writer), ttlMs, debounceMs: 60_000, log }),
     docUrl: (id: string) => `${dav.origin}/files/projects/${id}/document.ybin`,
     /** The names of the objects of the stored document (null when none is stored). */
     stored: async (id: string) => {
@@ -122,6 +148,14 @@ async function sharedWebDAV(opts: TestWebDAVOptions) {
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** A log that keeps the level and message of each line. */
+function recordingLog() {
+  const lines: string[] = [];
+  const line = (level: string) => (_obj: unknown, msg?: string) => lines.push(`${level} ${msg ?? ''}`);
+  const log: Log = { debug: line('debug'), info: line('info'), warn: line('warn'), error: line('error') };
+  return { log, lines };
+}
 
 async function until(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -294,7 +328,9 @@ describe('RoomManager', () => {
   /*
    * Another server deleted the project after this one saved it, and the room has no unsaved
    * changes: reading its write back (before eviction, at shutdown, in the periodic refresh) used to
-   * write the project again.
+   * write the project again. Nobody uses the room: it is closed, and this server answers like the
+   * one that deleted the project (an idle room used to stay listed and open for up to an hour, and
+   * a change made by an agent that opened it saved the project again).
    */
   it.each(['eviction', 'shutdown', 'periodic refresh'] as const)(
     'does not bring back a project another server deleted, at %s',
@@ -314,14 +350,290 @@ describe('RoomManager', () => {
       expect(await shared.stored(a.id)).toBeNull();
       // nor its project.json: a server that did not know the project does not list it
       expect((await shared.server('three').rooms.listProjects()).map((p) => p.id)).toEqual([]);
-      if (when === 'eviction') expect(one.rooms.get(a.id)).toBeUndefined();
-      if (when === 'periodic refresh') {
-        expect(a.needsReadBack).toBe(false);
-        // a change made in the room afterwards is saved (its editors keep their work)
-        a.scene.addObject({ type: 'EMPTY', name: 'Made later' });
-        await a.flush();
-        expect(await shared.stored(a.id)).toEqual(['Made later', 'Made on one']);
+      expect(a.destroyed).toBe(true);
+      if (when === 'shutdown') return;
+      expect(one.rooms.get(a.id)).toBeUndefined();
+      expect(await one.rooms.listProjects()).toEqual([]);
+      expect(await one.rooms.open(a.id)).toBeNull();
+      expect(await one.rooms.exists(a.id)).toBe(false);
+      // a browser that still has the project cannot upload it again at once (as on server two)
+      expect(await one.rooms.open(a.id, { create: true })).toBeNull();
+    },
+  );
+
+  /*
+   * An editor or an MCP agent still uses the room when another server deletes the project: the
+   * room stays, and a change made in it afterwards saves the project again (its users keep their
+   * work). The server logs both.
+   */
+  it('keeps a room in use whose project another server deleted, and saves it again when it changes', async () => {
+    const shared = await sharedWebDAV({});
+    const rec = recordingLog();
+    const one = shared.server('one', 60_000, rec.log);
+    const two = shared.server('two');
+    const a = await one.rooms.createProject({ name: 'In use', empty: true });
+    a.holders.add('mcp-session');
+    a.scene.addObject({ type: 'EMPTY', name: 'Made on one' });
+    await a.flush();
+    expect(await two.rooms.deleteProject(a.id)).toBe(true);
+    await one.rooms.refreshActive();
+    expect(a.destroyed).toBe(false);
+    expect(a.deletedFromStorage).toBe(true);
+    expect(await shared.stored(a.id)).toBeNull();
+    a.scene.addObject({ type: 'EMPTY', name: 'Made later' });
+    await a.flush();
+    expect(await shared.stored(a.id)).toEqual(['Made later', 'Made on one']);
+    expect(a.deletedFromStorage).toBe(false);
+    expect(rec.lines.filter((l) => l.includes('deleted from storage'))).toEqual([
+      'info project deleted from storage elsewhere: not saved again unless it changes on this server',
+      'info project deleted from storage elsewhere: saved again with the changes made on this server',
+    ]);
+  });
+
+  /*
+   * Server one still has a room for the project that nobody uses and that has not read storage
+   * since another server deleted the project (it did not write recently): it used to list the
+   * project until the room was evicted (ROOM_IDLE_TTL_SECONDS, an hour by default). The listing
+   * finds the document gone, and the room reads storage and is closed. A room in use stays listed.
+   */
+  it('lists what storage lists for a room nobody uses', async () => {
+    const shared = await sharedWebDAV({});
+    const one = shared.server('one');
+    const two = shared.server('two');
+    const a = await one.rooms.createProject({ name: 'Listed', empty: true });
+    const b = await one.rooms.createProject({ name: 'In use', empty: true });
+    b.holders.add('mcp-session');
+    await one.rooms.refreshActive(); // finds its writes: nothing left to read back
+    expect(a.needsReadBack).toBe(false);
+    expect((await one.rooms.listProjects()).map((p) => p.name).sort()).toEqual(['In use', 'Listed']);
+    expect(await two.rooms.deleteProject(a.id)).toBe(true);
+    expect(await two.rooms.deleteProject(b.id)).toBe(true);
+    // in use, it is listed: a change made in it saves the project again
+    expect((await one.rooms.listProjects()).map((p) => p.name)).toEqual(['In use']);
+    expect(a.destroyed).toBe(true);
+    expect(await one.rooms.open(a.id)).toBeNull();
+  });
+
+  /*
+   * Storage does not list a project whose project.json cannot be read, but its document is there:
+   * a loaded room of it stays listed, and the listing asks only whether the document exists.
+   */
+  it('lists a loaded project whose project.json is gone, without downloading its document', async () => {
+    const shared = await sharedWebDAV({});
+    const one = shared.server('one');
+    const a = await one.rooms.createProject({ name: 'No project.json', empty: true });
+    await one.rooms.refreshActive(); // finds its write: nothing left to read back
+    const info = shared.docUrl(a.id).replace('document.ybin', 'project.json');
+    await fetch(info, { method: 'DELETE', headers: { authorization: shared.dav.authorization } });
+    const sent: string[] = [];
+    shared.onRequest((req) => {
+      if (req.headers['x-writer'] === 'one') sent.push(`${req.method} ${req.path.split('/').at(-1)}`);
+    });
+    expect((await one.rooms.listProjects()).map((p) => p.name)).toEqual(['No project.json']);
+    expect(sent).not.toContain('GET document.ybin');
+    expect(a.destroyed).toBe(false);
+  });
+
+  /*
+   * Server one loaded the project (an agent read it), and nobody uses the room since; another
+   * server deleted the project. Server one did not list it, but it opened it by id, and a change
+   * made in it saved the project again. A room nobody uses now reads storage before it is opened
+   * (unless it read it within the last 2 s), which also merges changes saved elsewhere since.
+   */
+  it('reads storage again before it opens a room nobody uses', async () => {
+    const shared = await sharedWebDAV({});
+    const one = shared.server('one');
+    const two = shared.server('two');
+    const a = await two.rooms.createProject({ name: 'Changed on two', empty: true });
+    const b = await two.rooms.createProject({ name: 'Deleted on two', empty: true });
+    const onOneA = (await one.rooms.open(a.id))!;
+    const onOneB = (await one.rooms.open(b.id))!;
+    // the rooms read storage just now: resolving and opening them reads nothing more
+    const sent: string[] = [];
+    shared.onRequest((req) => {
+      if (req.headers['x-writer'] === 'one') sent.push(`${req.method} ${req.path}`);
+    });
+    expect(await one.rooms.exists(a.id)).toBe(true);
+    expect(await one.rooms.open(a.id)).toBe(onOneA);
+    expect(sent).toEqual([]);
+    a.scene.addObject({ type: 'EMPTY', name: 'Saved on two' });
+    await a.flush();
+    expect(await two.rooms.deleteProject(b.id)).toBe(true);
+    onOneA.readAt = 0; // as when their last read is older than 2 s
+    onOneB.readAt = 0;
+    expect(await one.rooms.open(a.id)).toBe(onOneA);
+    expect(onOneA.scene.findObjectByName('Saved on two')).not.toBeNull();
+    expect(sent.splice(0)).toContain(`GET /files/projects/${a.id}/document.ybin`);
+    expect(await one.rooms.open(a.id)).toBe(onOneA);
+    expect(sent).toEqual([]);
+    expect(await one.rooms.exists(b.id)).toBe(false);
+    expect(onOneB.destroyed).toBe(true);
+    expect(await one.rooms.open(b.id)).toBeNull();
+  });
+
+  /*
+   * Storage does not answer: opening a room nobody uses waits for its read of storage only for a
+   * while (5 s by default, 50 ms here) and then hands out the room as it is; the read goes on, and
+   * opening the room again meanwhile sends no other one.
+   */
+  it('opens a room nobody uses without waiting long for storage that does not answer', async () => {
+    const fs = new HeldStore();
+    const { rooms } = setup({ fs, openReadWaitMs: 50 });
+    const a = await rooms.createProject({ name: 'Unanswered', empty: true });
+    let release!: () => void;
+    fs.hold = new Promise((resolve) => (release = resolve));
+    a.readAt = 0;
+    const reads = fs.documentReads;
+    // (would wait for the release, which comes only afterwards)
+    expect(await rooms.open(a.id)).toBe(a);
+    expect(await rooms.exists(a.id)).toBe(true);
+    release();
+    await a.flush(); // after the reads
+    expect(fs.documentReads - reads).toBe(1);
+    expect(a.readAt).toBeGreaterThan(0);
+  });
+
+  /*
+   * A room in use when its project was deleted elsewhere stays open; once nobody uses it, the next
+   * check for idle rooms closes it (before its idle time is up), and so does opening it or asking
+   * whether the project exists.
+   */
+  it.each(['sweep', 'open', 'exists'] as const)(
+    'closes a room found deleted once nobody uses it (%s)',
+    async (how) => {
+      const shared = await sharedWebDAV({});
+      const one = shared.server('one');
+      const two = shared.server('two');
+      const a = await one.rooms.createProject({ name: 'Left', empty: true });
+      a.holders.add('mcp-session');
+      expect(await two.rooms.deleteProject(a.id)).toBe(true);
+      await one.rooms.refreshActive();
+      expect(a.deletedFromStorage).toBe(true);
+      expect(a.destroyed).toBe(false);
+      a.holders.delete('mcp-session');
+      if (how === 'sweep') await one.rooms.sweep();
+      else if (how === 'open') expect(await one.rooms.open(a.id)).toBeNull();
+      else expect(await one.rooms.exists(a.id)).toBe(false);
+      expect(a.destroyed).toBe(true);
+      expect(one.rooms.get(a.id)).toBeUndefined();
+    },
+  );
+
+  /*
+   * A room a sync connection opened for an unknown project is not listed while it holds nothing,
+   * also after it read storage and found no document. A project in use that another server deleted
+   * is listed, like any project in use.
+   */
+  it('does not list a room opened for an unknown project, also after it read storage', async () => {
+    const shared = await sharedWebDAV({});
+    const one = shared.server('one');
+    const two = shared.server('two');
+    const blank = (await one.rooms.open(newUuid(), { create: true }))!;
+    await blank.refresh();
+    const kept = await one.rooms.createProject({ name: 'Empty, in use', empty: true });
+    kept.holders.add('mcp-session');
+    expect(await two.rooms.deleteProject(kept.id)).toBe(true);
+    await one.rooms.refreshActive();
+    expect(kept.deletedFromStorage).toBe(true);
+    expect((await one.rooms.listProjects()).map((p) => p.name)).toEqual(['Empty, in use']);
+  });
+
+  /*
+   * Storage cannot list the projects (an outage): the projects this server has loaded used to be
+   * hidden, as a failed listing read as one without projects, and tools found no project by name.
+   */
+  it('lists the projects it has loaded while storage cannot list projects', async () => {
+    const fs = new ListFailStore();
+    const rec = recordingLog();
+    const { rooms } = setup({ fs, log: rec.log });
+    await rooms.createProject({ name: 'Loaded', empty: true });
+    fs.failList = true;
+    expect((await rooms.listProjects()).map((p) => p.name)).toEqual(['Loaded']);
+    expect(rec.lines).toContain('warn listing projects failed');
+  });
+
+  /*
+   * Another server deletes a new project right after its first write: the room had not found the
+   * project stored before, but storage held its write, so the project was deleted after it.
+   */
+  it('knows that a new project was deleted right after its first write', async () => {
+    const shared = await sharedWebDAV({});
+    const rec = recordingLog();
+    const one = shared.server('one', 60_000, rec.log);
+    const two = shared.server('two');
+    let wrote = false;
+    shared.onRequest(async (req) => {
+      if (req.headers['x-writer'] !== 'one' || !req.path.endsWith('/document.ybin')) return;
+      if (req.method === 'PUT') wrote = true;
+      else if (wrote && req.method === 'GET') {
+        shared.onRequest(null);
+        await two.rooms.deleteProject(req.path.split('/').at(-2)!);
       }
+    });
+    const a = await one.rooms.createProject({ name: 'Short-lived', empty: true });
+    expect(await shared.stored(a.id)).toBeNull();
+    expect(a.deletedFromStorage).toBe(true);
+    expect(rec.lines).toContain(
+      'info project deleted from storage elsewhere: not saved again unless it changes on this server',
+    );
+    expect(await one.rooms.open(a.id)).toBeNull();
+  });
+
+  /*
+   * Server two deleted the project; a room of server one with unsaved changes saved it again. Server
+   * two used to hide it for an hour (its tombstone): it neither listed nor opened a project that
+   * storage held.
+   */
+  it('lists and opens a project another server saved again after this server deleted it', async () => {
+    const shared = await sharedWebDAV({});
+    const one = shared.server('one');
+    const two = shared.server('two');
+    const a = await one.rooms.createProject({ name: 'Saved again', empty: true });
+    a.holders.add('mcp-session');
+    expect(await two.rooms.deleteProject(a.id)).toBe(true);
+    expect(await two.rooms.open(a.id)).toBeNull();
+    a.scene.addObject({ type: 'EMPTY', name: 'Made on one' });
+    await a.flush();
+    expect(await shared.stored(a.id)).toEqual(['Made on one']);
+    expect((await two.rooms.listProjects()).map((p) => p.name)).toEqual(['Saved again']);
+    expect(await two.rooms.exists(a.id)).toBe(true);
+    expect((await two.rooms.open(a.id))?.scene.findObjectByName('Made on one')).not.toBeNull();
+  });
+
+  /*
+   * Server two deletes the project right after server one's write: one has no unsaved changes left,
+   * so its read-back must not write the document again, nor its project.json (the write of
+   * project.json into the deleted folder used to create the folder again, and every server listed
+   * the project without a document).
+   */
+  it.each(['read-back', 'project.json'] as const)(
+    "does not write again a project another server deletes right after this server's write (%s)",
+    async (when) => {
+      const shared = await sharedWebDAV({});
+      const one = shared.server('one');
+      const two = shared.server('two');
+      const a = await one.rooms.createProject({ name: 'Doomed', empty: true });
+      a.scene.addObject({ type: 'EMPTY', name: 'Made on one' });
+      let wrote = false;
+      shared.onRequest(async (req) => {
+        if (req.headers['x-writer'] !== 'one') return;
+        if (req.method === 'PUT' && req.path.endsWith('/document.ybin')) wrote = true;
+        else if (
+          wrote &&
+          (when === 'read-back'
+            ? req.method === 'GET' && req.path.endsWith('/document.ybin')
+            : req.method === 'PUT' && req.path.endsWith('/project.json'))
+        ) {
+          shared.onRequest(null);
+          await two.rooms.deleteProject(a.id);
+        }
+      });
+      await a.flush();
+      expect(await shared.stored(a.id)).toBeNull();
+      expect((await shared.server('three').rooms.listProjects()).map((p) => p.id)).toEqual([]);
+      expect(a.deletedFromStorage).toBe(true);
+      expect(a.needsReadBack).toBe(false);
+      expect(a.isDirty).toBe(false);
     },
   );
 

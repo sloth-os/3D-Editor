@@ -125,7 +125,7 @@ export class ProjectSession {
       return s;
     } catch (err) {
       span.setError(err instanceof Error ? err.message : String(err));
-      s.close(false);
+      void s.close(false);
       throw err;
     } finally {
       span.end();
@@ -292,20 +292,26 @@ export class ProjectSession {
     return { objects: ev.objects.length, vertices, faces, triangles };
   }
 
+  /** Saves to WebDAV now (Save, Ctrl+S): also a project another device deleted from WebDAV. */
   async flush(): Promise<void> {
-    await this.webdav?.syncNow();
+    await this.webdav?.syncNow({ save: true });
   }
 
-  close(flush = true): void {
+  /**
+   * Closes the project; `flush`: sync it to WebDAV a last time first. Resolves once WebDAV syncing
+   * has stopped (a sync that was running has finished).
+   */
+  close(flush = true): Promise<void> {
     for (const d of this.disposers) d();
     this.disposers = [];
     if (this.presenceTimer) clearTimeout(this.presenceTimer);
     if (this.indexTimer) clearTimeout(this.indexTimer);
-    void this.webdav?.stop(flush);
+    const stopped = this.webdav?.stop(flush) ?? Promise.resolve();
     this.provider?.destroy();
     void this.idb?.destroy();
     this.undo.destroy();
     this.doc.destroy();
+    return stopped;
   }
 
   /** Removes all locally stored data of this project (IndexedDB). */

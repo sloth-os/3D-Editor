@@ -1,5 +1,5 @@
 import type { FileEntry, FileStore, ReadOptions, WriteOptions } from './filestore';
-import { PreconditionFailedError, joinPath } from './filestore';
+import { MissingFolderError, PreconditionFailedError, joinPath } from './filestore';
 
 export interface WebDAVConfig {
   /** Base URL of the WebDAV collection, e.g. https://dav.example.com/remote.php/dav/files/me */
@@ -246,7 +246,8 @@ export class WebDAVClient implements FileStore {
     const res = await this.request('PUT', path, { headers, body: data as unknown as BodyInit });
     if (res.status === 412) throw new PreconditionFailedError(path);
     if (res.status === 409) {
-      // parent collection missing
+      // the folder does not exist (nginx answers 500, or creates it with create_full_put_path on)
+      if (opts.createFolders === false) throw new MissingFolderError(path);
       await this.mkdirp(path.split('/').slice(0, -1).join('/'));
       return this.write(path, data, opts);
     }

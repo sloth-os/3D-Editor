@@ -1,7 +1,7 @@
 import { suggestNames } from '@3d-editor/core';
 import type { LateRpc } from '../sync/room';
 import { ToolError } from './agent';
-import { MILLIONS_SOLID_SECONDS, NEW_SHADER_SECONDS } from './editor-costs';
+import { MEASURED_NOTE, MILLIONS_SOLID_SECONDS, NEW_SHADER_SECONDS } from './editor-costs';
 
 /*
  * The UI commands of browser editors (MCP editor_command → RPC `ui`, run by the web app's
@@ -116,8 +116,9 @@ export const EDITOR_COMMANDS: Record<string, EditorCommand> = {
   },
   get_view: {
     doc:
-      'the viewport camera (target, distance, yaw, pitch, ortho, camera view); during an animated view change ' +
-      '(view.set_view, view.frame_all, view.frame_selected) the view it ends on',
+      'the viewport camera (target, distance, yaw, pitch, ortho, camera view); while the viewport animates a ' +
+      'view change (an axis view, an orbit step or framing, asked for by a command, an operator or the person) ' +
+      'the view it ends on',
     params: {},
   },
 };
@@ -169,27 +170,37 @@ export function describeLateRpcs(late: readonly LateRpc[], now = Date.now()): st
  * larger timeout_ms while there is one (below the maximum), then the other remedies.
  *
  * Measured in headless Chromium with software WebGL (SwiftShader), a scene of 81 objects and 71
- * materials, 1280×720 (docs/mcp.md has the details; the times vary with the machine's load): the
- * first screenshot or viewport frame in MATERIAL or RENDERED shading after the editor opened the
- * project builds and compiles that shading's materials, 18.5–26.4 s for each of the two; the editor
- * keeps them (apps/web scene-objects.ts ObjectView.materialSets), so later screenshots in that
- * shading took 0.9–2.2 s, also after the viewport switched to it, and SOLID or WIREFRAME ones
- * 0.6–1.2 s. A material edit builds that material again and keeps the one it replaces until the new
- * one has been drawn in every shading the old one was drawn in (scene-objects.ts replaceSlot), so
- * three.js gives the new one the old one's shader when they need the same: after roughness edits of
- * untextured, procedural and glass materials the next screenshots in both shadings took 0.8–3.1 s,
- * and no shader was compiled. An edit that needs a shader no material had (coat or sheen turned on,
- * a procedural texture on a set of channels that no other material has) compiles it for the next
- * screenshot or frame in each of the two, which took 0.9–3.6 s (the viewport's frame after the
- * edit, or the first screenshot in a shading after it). A screenshot waits until the frame the
- * viewport is drawing is done, also in SOLID or WIREFRAME shading: when that frame compiles
- * shaders, up to that frame's time. The editor finishes a screenshot that timed out and keeps what
- * it compiled: a retry waits for the rest of it, then takes about one frame (a first RENDERED
- * screenshot that timed out after 3 s, retried at once, answered 17.7–19.8 s later). Other commands
- * draw nothing themselves but wait while the editor's main thread is busy: for 4.6–6.2 s after the
- * viewport switched to MATERIAL or RENDERED for the first time (it builds the materials and their
- * shaders), and while it draws a screenshot. With 4 million triangles a SOLID screenshot took
- * 5.5–8.9 s, a WIREFRAME one 6.7–15.4 s and a select 2.5–3.5 s.
+ * materials, 1280×720 (docs/mcp.md has the details; the times vary with the machine's load, which
+ * the messages say with {@link MEASURED_NOTE}): the first screenshot or viewport frame in MATERIAL
+ * or RENDERED shading after the editor opened the project builds and compiles that shading's
+ * materials, 18.5–30.6 s for each of the two; the editor keeps them (apps/web scene-objects.ts
+ * ObjectView.materialSets), so later screenshots in that shading compiled nothing and took
+ * 0.4–3.3 s, also after the viewport switched to it, and SOLID or WIREFRAME ones 0.5–2.0 s. A
+ * screenshot is drawn with the viewport's sample count, or with the other one when its shading was
+ * drawn only with that one (apps/web engine.ts captureSamples): software WebGL builds every
+ * material's pipelines again for another sample count, so the first MATERIAL or RENDERED screenshot
+ * after the viewport had drawn that shading without multisampling (more than a million triangles,
+ * slow frames) built none and took 0.4–2.3 s. A material edit builds that material again and keeps
+ * the one it replaces until the new one has been drawn in every shading the old one was drawn in
+ * (scene-objects.ts replaceSlot), so three.js gives the new one the old one's shader when they need
+ * the same: after roughness edits of untextured, procedural and glass materials the next
+ * screenshots in both shadings took 0.8–3.8 s, and no shader was compiled. An edit that needs a
+ * shader no material had (coat or sheen turned on, a procedural texture on a set of channels that
+ * no other material has) compiles it for the next screenshot or frame in each of the two, which
+ * took 0.6–4.5 s for the plastics and 10.8–12.9 s for the table's material, whose colour, roughness
+ * and bump are procedural textures (the viewport's frame after the edit, or the first screenshot in
+ * a shading after it). A screenshot waits until the frame the viewport is drawing is done, also in
+ * SOLID or WIREFRAME shading: when that frame compiles shaders, up to that frame's time. The editor
+ * finishes a screenshot that timed out and keeps what it compiled: a retry waits for the rest of it
+ * and compiles nothing again (a first RENDERED screenshot that timed out after 3 s, retried at
+ * once, answered 17.7–20.9 s later). Other commands draw nothing themselves but wait while the
+ * editor's main thread is busy: for 4.0–6.2 s after the viewport switched to MATERIAL or RENDERED
+ * for the first time (it builds the materials and their shaders), and while it draws a screenshot.
+ * With 4 million triangles (the viewport without multisampling) a SOLID screenshot took 3.3–5.2 s,
+ * a WIREFRAME one 4.1–11.9 s and a select 2.5–3.8 s. On the server, grey clay (render_image with
+ * shading 'SOLID' and renderer 'software', the remedy of SOLID and WIREFRAME screenshots) took
+ * 1.7–3.6 s for that scene and 2.2–2.5 s with a grid of a million triangles added, and ran out of
+ * memory after 17.4–21.4 s with a grid of 2 million triangles.
  */
 export function editorTimeoutMessage(
   command: string,
@@ -224,11 +235,16 @@ export function editorTimeoutMessage(
     const edited = (next: string) =>
       `After a material edit that needs a shader no material had (coat or sheen turned on, a procedural ` +
       `texture on a set of channels that no other material has), its next ${next} compiles it ` +
-      `(${NEW_SHADER_SECONDS} measured).`;
-    // the editor keeps what a screenshot that timed out compiled: retrying is worth it
+      `(${NEW_SHADER_SECONDS}). ${MEASURED_NOTE}`;
+    // the editor keeps what a screenshot that timed out compiled: retrying is worth it (the retry
+    // still costs a screenshot: a frame of its shading and the work of its own, see rpc.ts)
     const kept =
-      'It keeps what it compiled, so a retry waits for the editor to finish and then takes about one frame.';
-    // the fast shadings already: a retry, a larger timeout or rendering without the editor helps
+      'It keeps what it compiled, so a retry waits for the editor to finish and compiles nothing again.';
+    // the fast shadings already: a retry, a larger timeout or rendering without the editor helps; the
+    // render must be grey clay (shading 'SOLID'): with the scene's render engine, renderer 'software'
+    // path traces a PATHTRACER scene on the server, for up to its time_limit (rendering.ts
+    // DEFAULT_IMAGE_TIME_LIMIT, 30 s); the server's render worker ran out of memory for a mesh of 2
+    // million triangles (see the doc comment)
     if (shading === 'SOLID' || shading === 'WIREFRAME')
       return (
         `${head} An editor ${noGpu} can take seconds per screenshot of a scene with millions of triangles ` +
@@ -236,12 +252,13 @@ export function editorTimeoutMessage(
         'In MATERIAL or RENDERED shading that frame compiles shaders the first time after the editor opened ' +
         "the project (tens of seconds for a heavy scene, while it builds and compiles the scene's materials) " +
         'and after a material edit that needs a shader no material had (coat or sheen turned on, a ' +
-        `procedural texture on a set of channels that no other material has: ${NEW_SHADER_SECONDS} measured). ` +
-        `${kept} ` +
-        remedy("render without the editor: render_image with renderer 'software'.", {
-          retry: true,
-          atMaxFirst: 'retry or ',
-        })
+        `procedural texture on a set of channels that no other material has: ${NEW_SHADER_SECONDS}). ` +
+        `${MEASURED_NOTE} ${kept} ` +
+        remedy(
+          "render without the editor: render_image with shading 'SOLID' and renderer 'software' (grey clay, " +
+            'rendered on the server, which can run out of memory for millions of triangles).',
+          { retry: true, atMaxFirst: 'retry or ' },
+        )
       );
     if (shading)
       return (

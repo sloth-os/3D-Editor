@@ -87,7 +87,7 @@ export class SyncServer {
     if (!isAuthorized(this.opts.config, pathname, req.headers, req.url)) {
       return rejectUpgrade(socket, 401, 'unauthorized', { 'WWW-Authenticate': 'Bearer realm="3d-editor"' });
     }
-    if (this.opts.rooms.isDeleted(projectId)) return rejectUpgrade(socket, 410, 'project was deleted');
+    // null for a project deleted here within the hour (unless storage holds it again)
     const room = await this.opts.rooms.open(projectId, { create: true });
     if (!room) return rejectUpgrade(socket, 410, 'project was deleted');
     if (socket.destroyed) return;

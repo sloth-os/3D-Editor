@@ -1279,8 +1279,9 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
   });
 
   it('rotating a moved child of an unevenly scaled parent about its own origin keeps the move adjustable', () => {
-    // the rotation also gives the child a new scale (its matrix would be sheared), but not a new
-    // location: the move stays adjustable, and the re-run keeps the rotation and the scale
+    // the rotation writes only the child's rotation, as Blender's Rotate does (the scale stays, also
+    // under a parent scaled unevenly, where the child deforms as it turns), not its location: the
+    // move stays adjustable, and the re-run keeps the rotation and the scale
     ok('object.empty_add', { name: 'P' });
     ok('object.transform_set', { objects: ['P'], scale: [2, 1, 1] });
     ok('mesh.primitive_cube_add', { name: 'A', location: [2, 0, 0] });
@@ -1289,12 +1290,14 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
     select(s, 'A');
     ok('transform.translate', { value: [2, 0, 0] });
     expectLocation('A', [2, 0, 0]);
+    const scale = s.doc.findObjectByName('A')!.scale;
     const agent = agentReplica(s);
     agent.state.selectedIds = [id('A')];
     agent.state.activeId = id('A');
     agent('transform.rotate', { value: Math.PI / 4, orient_axis: 'Z' });
     const turned = s.doc.findObjectByName('A')!;
-    expect(turned.scale).not.toEqual([1, 1, 1]);
+    expect(turned.scale).toEqual(scale);
+    expect(turned.rotation_euler).not.toEqual([0, 0, 0]);
     expectLocation('A', [2, 0, 0]);
     expect(redoLast(s, registry, { value: [4, 0, 0] })?.ok).toBe(true);
     // 4 m along the world's X axis is 2 along the parent's
@@ -1328,24 +1331,40 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
   });
 
   it('a value an operation recomputed with its last digits changed still counts as left as it was', () => {
-    // Look At stores the scale of the object it turns again, read back from its new matrix: here a
-    // unit in the last place off. An agent's later scale edit is an edit of a value Look At left as
-    // it was: undoing Look At keeps it, and the re-run turns the object with the agent's scale
-    ok('mesh.primitive_cube_add', { name: 'T', location: [5, 5, 5] });
-    ok('mesh.primitive_cube_add', { name: 'A', location: [1, 2, 3] });
-    const deg = Math.PI / 180;
+    // Bake Transforms run again stores its keys with their last digits changed (SAME_NUMBER_TOLERANCE
+    // in runner.ts); this operator moves an object and stores its scale again, a unit in the last
+    // place off. An agent's later scale edit is an edit of a value it left as it was: undoing it
+    // keeps the agent's scale, and the re-run moves the object with it
+    const reg = new OperatorRegistry();
+    reg.register(
+      defineOperator({
+        id: 'test.nudge',
+        label: 'Nudge',
+        description: 'Moves `object` to x, storing its scale again with its last digit changed',
+        category: 'Test',
+        redoable: true,
+        schema: z.object({ object: z.string(), x: z.number() }),
+        execute(ctx, p) {
+          const o = ctx.doc.getObject(p.object)!;
+          ctx.doc.updateObject(p.object, {
+            location: [p.x, o.location[1], o.location[2]],
+            scale: [o.scale[0] * (1 + Number.EPSILON), o.scale[1], o.scale[2] * (1 + Number.EPSILON)],
+          });
+          return {};
+        },
+      }),
+    );
+    ok('mesh.primitive_cube_add', { name: 'A' });
     const scale = [1.3, 0.8, 2.1];
-    ok('object.transform_set', { objects: ['A'], rotation_euler: [10 * deg, 25 * deg, 40 * deg], scale });
-    select(s, 'A');
-    ok('object.look_at', { target: 'T' });
+    ok('object.transform_set', { objects: ['A'], scale });
+    expect(runOperator(s, reg, 'test.nudge', { object: id('A'), x: 1 }, 'test').ok).toBe(true);
     const stored = s.doc.findObjectByName('A')!.scale;
     expect(stored).not.toEqual(scale);
     stored.forEach((v, i) => expect(Math.abs(v - scale[i])).toBeLessThan(1e-15));
     agentReplica(s)('object.transform_set', { objects: ['A'], scale: [3, 3, 3] });
-    const params = lastOperator.value!.params as Record<string, unknown>;
-    expect(redoLast(s, registry, { ...params, track_axis: 'Y' })?.ok).toBe(true);
+    expect(redoLast(s, reg, { object: id('A'), x: 2 })?.ok).toBe(true);
+    expectLocation('A', [2, 0, 0]);
     expectVector('A', 'scale', [3, 3, 3]);
-    expect(lastOperator.value?.params).toMatchObject({ track_axis: 'Y' });
     expect(panelOffered(s)).toBe(true);
   });
 
@@ -1378,29 +1397,32 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
     );
   });
 
-  const LOOK_WARNING =
-    'Look At can no longer be adjusted: an agent or another user has changed what it did since';
-  /** Cubes T at [5, 5, 5] and A at x = 1 (selected), and A turned towards T with Look At. */
-  const lookAt = () => {
-    ok('mesh.primitive_cube_add', { name: 'T', location: [5, 5, 5] });
+  const RANDOM_WARNING =
+    'Randomize Transform can no longer be adjusted: an agent or another user has changed what it did since';
+  /**
+   * Cube A at x = 1 (selected) given a random scale with Randomize Transform, which stores its
+   * location and rotation again unchanged (their ranges default to 0).
+   */
+  const randomize = () => {
     ok('mesh.primitive_cube_add', { name: 'A', location: [1, 0, 0] });
     select(s, 'A');
-    ok('object.look_at', { target: 'T' });
+    ok('object.randomize_transform', { random_seed: 1 });
   };
-  /** Look At's parameters with another `track_axis`. */
-  const lookParams = (track_axis: string) => ({ ...(lastOperator.value!.params as object), track_axis });
+  /** Randomize Transform's parameters with another `random_seed`. */
+  const randomParams = (random_seed: number) => ({ ...(lastOperator.value!.params as object), random_seed });
 
   it('a value others set at the same time as an unchanged rewrite that lost to it still counts', () => {
-    // regression: the agent moved A while the user's Look At was on its way, so neither replica had
-    // the other's edit. Look At stores A's location again, unchanged. Yjs orders values of a field
-    // set at the same time by client id: with the smaller id the agent's location came before the
-    // rewrite and lost to it. Undoing Look At then removed its location and could not bring back the
-    // one before it (the agent's value follows that one), so the adjusted Look At left A at the origin
+    // regression: the agent moved A while the user's Randomize Transform was on its way, so neither
+    // replica had the other's edit. Randomize Transform stores A's location again, unchanged. Yjs
+    // orders values of a field set at the same time by client id: with the smaller id the agent's
+    // location came before the rewrite and lost to it. Undoing the randomize then removed its
+    // location and could not bring back the one before it (the agent's value follows that one), so
+    // the adjusted operation left A at the origin
     const cases: { name: string; agentClient: number; adjustable: boolean; session?: () => void }[] = [
       { name: "the agent's value lost", agentClient: 1, adjustable: false },
       { name: "the agent's value won", agentClient: 4_000_000_000, adjustable: true },
       {
-        // A's location is the copy of Look At's that the undo brought back
+        // A's location is the copy of the randomize's that the undo brought back
         name: "the agent's value lost, and the session set A's location and undid that",
         agentClient: 1,
         adjustable: false,
@@ -1410,7 +1432,7 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
         },
       },
       {
-        // A is the copy the undo brought back, with a copy of Look At's location
+        // A is the copy the undo brought back, with a copy of the randomize's location
         name: "the agent's value lost, and the session deleted A and undid that",
         agentClient: 1,
         adjustable: false,
@@ -1425,12 +1447,11 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
       sessionSignal.value = s;
       lastOperator.value = null;
       s.doc.ydoc.clientID = 2_000_000_000;
-      ok('mesh.primitive_cube_add', { name: 'T', location: [5, 5, 5] });
       ok('mesh.primitive_cube_add', { name: 'A', location: [1, 0, 0] });
       const agent = agentReplica(s, { clientID: c.agentClient });
       select(s, 'A');
       agent.pause();
-      ok('object.look_at', { target: 'T' });
+      ok('object.randomize_transform', { random_seed: 1 });
       agent('object.transform_set', { objects: ['A'], location: [3, 0, 0] });
       agent.resume();
       c.session?.();
@@ -1439,14 +1460,14 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
       const location = c.adjustable ? [3, 0, 0] : [1, 0, 0];
       expect(s.doc.findObjectByName('A')!.location, c.name).toEqual(location);
       expect(agent.doc.findObjectByName('A')!.location, c.name).toEqual(location);
-      const res = redoLast(s, registry, lookParams('Y'));
+      const res = redoLast(s, registry, randomParams(2));
       if (c.adjustable) {
-        // undoing keeps the agent's value: the adjusted Look At starts from it
+        // undoing keeps the agent's value: the adjusted randomize starts from it
         expect(res?.ok, c.name).toBe(true);
-        expect(lastOperator.peek()?.params, c.name).toMatchObject({ track_axis: 'Y' });
+        expect(lastOperator.peek()?.params, c.name).toMatchObject({ random_seed: 2 });
       } else {
         expect(res, c.name).toBeNull();
-        expect(infoLog.value.at(-1), c.name).toMatchObject({ level: 'WARNING', message: LOOK_WARNING });
+        expect(infoLog.value.at(-1), c.name).toMatchObject({ level: 'WARNING', message: RANDOM_WARNING });
       }
       expect(s.doc.findObjectByName('A')!.location, c.name).toEqual(location);
     }
@@ -1459,17 +1480,17 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
       s = fakeSession();
       sessionSignal.value = s;
       lastOperator.value = null;
-      lookAt();
+      randomize();
       const depth = s.undo.undoStack.length;
       const agent = agentReplica(s);
       const move = () => agent('object.transform_set', { objects: ['A'], location: [3, 0, 0] });
       if (agentFirst) move();
       ok('ed.undo');
-      expectVector('A', 'rotation_euler', [0, 0, 0]);
+      expectVector('A', 'scale', [1, 1, 1]);
       ok('ed.redo');
       if (!agentFirst) move();
       expect(panelOffered(s), `agent first: ${agentFirst}`).toBe(true);
-      expect(redoLast(s, registry, lookParams('Y'))?.ok, `agent first: ${agentFirst}`).toBe(true);
+      expect(redoLast(s, registry, randomParams(2))?.ok, `agent first: ${agentFirst}`).toBe(true);
       expectLocation('A', [3, 0, 0]);
       expect(s.undo.undoStack.length).toBe(depth);
     }
@@ -1491,19 +1512,19 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
   });
 
   it('the re-run of an adjusted operation knows which values it rewrote unchanged', () => {
-    lookAt();
+    randomize();
     const agent = agentReplica(s);
     agent('object.transform_set', { objects: ['A'], location: [3, 0, 0] });
-    expect(redoLast(s, registry, lookParams('Y'))?.ok).toBe(true);
-    // the re-run is a step of its own: the agent moves A again, then Look At is adjusted again
+    expect(redoLast(s, registry, randomParams(2))?.ok).toBe(true);
+    // the re-run is a step of its own: the agent moves A again, then the randomize is adjusted again
     agent('object.transform_set', { objects: ['A'], location: [4, 0, 0] });
-    expect(redoLast(s, registry, lookParams('-Z'))?.ok).toBe(true);
+    expect(redoLast(s, registry, randomParams(3))?.ok).toBe(true);
     expectLocation('A', [4, 0, 0]);
-    // its rotation is what the re-run changed
-    agent('object.transform_set', { objects: ['A'], rotation_euler: [0, 0, 1] });
-    expect(redoLast(s, registry, lookParams('Y'))).toBeNull();
-    expectVector('A', 'rotation_euler', [0, 0, 1]);
-    expect(infoLog.value.at(-1)).toMatchObject({ level: 'WARNING', message: LOOK_WARNING });
+    // its scale is what the re-run changed
+    agent('object.transform_set', { objects: ['A'], scale: [5, 5, 5] });
+    expect(redoLast(s, registry, randomParams(2))).toBeNull();
+    expectVector('A', 'scale', [5, 5, 5]);
+    expect(infoLog.value.at(-1)).toMatchObject({ level: 'WARNING', message: RANDOM_WARNING });
   });
 
   it('a move by 0 changes nothing: it adds no undo step, and adjusting it moves from where others left the object', () => {

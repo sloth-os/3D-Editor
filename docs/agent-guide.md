@@ -589,28 +589,30 @@ their final size instead of scaling small ones.
   render engine. An editor without GPU acceleration (software WebGL, e.g. a headless browser) is
   slow with heavy scenes in `MATERIAL` or `RENDERED` shading: the first screenshot or viewport frame
   in each of them after it opened the project builds and compiles the scene's materials for that
-  shading (18.5–26.4 s for a scene with 71 materials), and the editor keeps them, so later
-  screenshots in that shading take about one frame (0.9–2.2 s), also after the viewport switched to
-  it and after material edits that change values (colours, roughness, texture settings). An edit
+  shading (18.5–30.6 s for a scene with 71 materials), and the editor keeps them, so later
+  screenshots in that shading compile nothing and take 0.4–3.3 s, also after the viewport switched
+  to it or turned its anti-aliasing off (for slow frames or more than a million triangles), and
+  after material edits that change values (colours, roughness, texture settings: 0.8–3.8 s). An edit
   that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of
   channels that no other material has) compiles it for the next screenshot or frame in each of these
-  two shadings (0.9–3.6 s in that scene). A `SOLID` or `WIREFRAME` screenshot waits until the
-  viewport's frame in progress is done, also one that compiles; the other commands wait while the
-  editor's main thread is busy: during a screenshot, while it builds the materials after the
-  viewport switched to `MATERIAL` or `RENDERED` for the first time (4.6–6.2 s) and during each frame
-  of a scene with millions of triangles. X-ray changes nothing in `MATERIAL` or `RENDERED` shading
-  outside Edit Mode. A scene of millions of triangles takes seconds per frame in any shading
-  (5.5–8.9 s per `SOLID` screenshot with 4 million). With the default `renderer: "auto"`,
-  `render_image` waits 15 s for such an editor's raster image and then renders on the server (`note`
-  says so); `renderer: "browser"` waits up to 55 s and then fails, saying what to do. For
-  `editor_command` raise `timeout_ms` (default 10000, at most 55000: both stay under the 60 s an MCP
-  client built on the TypeScript SDK waits by default) and take screenshots with `shading: "SOLID"`
-  (0.6–1.2 s for that scene); for a quick look use `render_image {shading: "SOLID"}` (grey clay,
-  1.7–3.6 s at 1280×720), and make final images with `render_image`. These times were measured in
-  software WebGL (SwiftShader) and vary with the machine's load.
+  two shadings (0.6–4.5 s in that scene, up to 12.9 s for a material with several procedural
+  textures). A `SOLID` or `WIREFRAME` screenshot waits until the viewport's frame in progress is
+  done, also one that compiles; the other commands wait while the editor's main thread is busy:
+  during a screenshot, while it builds the materials after the viewport switched to `MATERIAL` or
+  `RENDERED` for the first time (4.0–6.2 s) and during each frame of a scene with millions of
+  triangles. X-ray changes nothing in `MATERIAL` or `RENDERED` shading outside Edit Mode. A scene of
+  millions of triangles takes seconds per frame in any shading (3.3–5.2 s per `SOLID` screenshot
+  with 4 million). With the default `renderer: "auto"`, `render_image` waits 15 s for such an
+  editor's raster image and then renders on the server (`note` says so); `renderer: "browser"` waits
+  up to 55 s and then fails, saying what to do. For `editor_command` raise `timeout_ms` (default
+  10000, at most 55000: both stay under the 60 s an MCP client built on the TypeScript SDK waits by
+  default) and take screenshots with `shading: "SOLID"` (0.5–2.0 s for that scene); for a quick look
+  use `render_image {shading: "SOLID"}` (grey clay, 1.7–3.6 s at 1280×720 on the server, which ran
+  out of memory with a mesh of 2 million triangles), and make final images with `render_image`.
+  These times were measured in software WebGL (SwiftShader) and vary with the machine's load.
 - An editor keeps drawing an image the server stopped waiting for, and its next renders and commands
   wait behind it; a screenshot that timed out still compiles what it needs and keeps it, so
-  retrying it waits for the rest and then takes about one frame. Until it has finished,
+  retrying it waits for the rest and compiles nothing again. Until it has finished,
   `render_image` uses another connected editor that is not busy, else `renderer: "auto"` renders on
   the server without asking it (`note` says so), and a timeout of `editor_command` or of a
   `renderer: "browser"` render names the earlier request it was still busy with: do not fire more

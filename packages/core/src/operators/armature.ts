@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { Mat4, Vec3 } from '../math/types';
-import { decompose4, invert4, multiply4 } from '../math/mat4';
+import { invert4, multiply4 } from '../math/mat4';
 import { transformDirection3, transformPoint3 } from '../math/vec3';
 import type {
   ArmatureData,
@@ -519,12 +519,9 @@ export function armatureParentSet(
       parent_bone: type === 'BONE' ? bone! : '',
     });
   if (opts.keep_transform !== false) {
+    // only the channels the new parent (the armature, or the bone) changes are written
     const after = new FrameState(ctx.doc, ctx.state.frame);
-    for (const id of children) {
-      const local = multiply4(invert4(after.parent(id)), worlds.get(id)!);
-      const d = decompose4(local);
-      ctx.doc.updateObject(id, { location: d.location, rotation_euler: d.rotation, scale: d.scale });
-    }
+    for (const id of children) ctx.doc.setWorldMatrix(id, worlds.get(id)!, after.parent(id));
   }
   const result: ArmatureParentResult = { parent: parentId, type, children: [...children] };
   if (bone) result.bone = bone;
@@ -611,15 +608,13 @@ export function armatureParentSet(
 
 /**
  * Removes bone parenting from an object (it becomes unparented), keeping its evaluated world
- * transform when `keepTransform` (the stored-transform helpers of SceneDoc ignore bones).
+ * transform when `keepTransform` (the stored-transform helpers of SceneDoc ignore bones): only the
+ * channels that world matrix changes are written (SceneDoc.setWorldMatrix).
  */
 export function clearBoneParent(ctx: OperatorContext, id: string, keepTransform: boolean): void {
   const world = keepTransform ? worldMatrixOf(ctx, id) : null;
   ctx.doc.updateObject(id, { parent: null, parent_type: 'OBJECT', parent_bone: '' });
-  if (world) {
-    const d = decompose4(world);
-    ctx.doc.updateObject(id, { location: d.location, rotation_euler: d.rotation, scale: d.scale });
-  }
+  if (world) ctx.doc.setWorldMatrix(id, world, null);
 }
 
 /** Object references of a constraint list remapped through `remap` (null when nothing changed). */

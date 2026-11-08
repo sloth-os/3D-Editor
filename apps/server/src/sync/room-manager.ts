@@ -29,9 +29,20 @@ export interface RoomManagerOptions {
    * write back (Room.needsReadBack). Default 60 s; 0 disables.
    */
   refreshIntervalMs?: number;
+  /**
+   * How long opening a loaded room nobody uses waits for its read of storage before it hands out
+   * the room as it is, while the read goes on (default 5 s): storage that does not answer (its
+   * requests time out after 30 s each) must not hold up every request that opens a project.
+   */
+  openReadWaitMs?: number;
 }
 
 const TOMBSTONE_TTL_MS = 60 * 60 * 1000;
+/**
+ * A loaded room nobody uses reads storage again before it is opened, unless it read it within this
+ * time (so that the request that resolves a project and the one that opens it read it once).
+ */
+const UNUSED_ROOM_READ_MS = 2000;
 
 /**
  * Loads projects into memory on demand (from the persistence backend), keeps them while they
@@ -42,6 +53,8 @@ export class RoomManager {
   private readonly loading = new Map<string, Promise<Room | null>>();
   /** Recently deleted project ids (refuses re-creation by reconnecting clients). */
   private readonly tombstones = new Map<string, number>();
+  /** The reads of storage that rooms nobody uses run before they are opened (see readUnused). */
+  private readonly reading = new WeakMap<Room, Promise<void>>();
   private readonly sweepTimer: ReturnType<typeof setInterval>;
   private readonly refreshTimer: ReturnType<typeof setInterval> | null = null;
   private sweeping = false;
@@ -68,7 +81,10 @@ export class RoomManager {
     if (this.refreshing || this.closed) return;
     this.refreshing = true;
     try {
-      for (const room of this.all()) if (room.conns.size > 0 || room.needsReadBack) await room.refresh();
+      for (const room of this.all()) {
+        if (room.conns.size > 0 || room.needsReadBack) await room.refresh();
+        if (this.abandoned(room)) await this.closeDeleted(room);
+      }
     } finally {
       this.refreshing = false;
     }
@@ -121,6 +137,10 @@ export class RoomManager {
     return [...this.rooms.values()].filter((r) => !r.destroyed);
   }
 
+  /**
+   * Whether this server deleted the project, or closed its room after finding it deleted from
+   * storage, within the last hour (see {@link stillDeleted}, which also asks storage).
+   */
   isDeleted(id: string): boolean {
     const t = this.tombstones.get(id);
     if (t === undefined) return false;
@@ -132,16 +152,86 @@ export class RoomManager {
   }
 
   /**
+   * {@link isDeleted}, unless storage holds the project's document again: another writer with
+   * unsaved changes (a room of another server, a browser) saved it after the deletion. Then the
+   * project exists, and this server lists and opens it again.
+   */
+  private async stillDeleted(id: string): Promise<boolean> {
+    if (!this.isDeleted(id)) return false;
+    const store = this.store;
+    if (!store || !(await store.hasDocument(id).catch(() => false))) return true;
+    this.tombstones.delete(id);
+    return false;
+  }
+
+  /** A room nobody uses (no editor connected, no MCP session) that has no unsaved changes. */
+  private unused(room: Room): boolean {
+    return !room.isDirty && room.conns.size === 0 && room.holders.size === 0;
+  }
+
+  /**
+   * A loaded room whose last read found its project deleted from storage by another writer, which
+   * nobody uses and which has no unsaved changes: it is closed like a room of a project deleted
+   * here, so that this server lists and opens what storage holds.
+   */
+  private abandoned(room: Room): boolean {
+    return !room.destroyed && room.deletedFromStorage && this.unused(room);
+  }
+
+  /**
+   * Before a loaded room nobody uses is opened: it reads storage again (another writer may have
+   * changed or deleted the project since it last read it), unless it did within
+   * {@link UNUSED_ROOM_READ_MS}, and it is closed when its project was deleted elsewhere. Without
+   * this, a project deleted elsewhere still opened by id (while not listed), and a change made in
+   * it saved it again. The read is awaited for {@link RoomManagerOptions.openReadWaitMs} at most;
+   * one read per room at a time.
+   */
+  private async readUnused(room: Room, force = false): Promise<void> {
+    if (!this.store || room.destroyed || !this.unused(room)) return;
+    if (!room.deletedFromStorage && (force || Date.now() - room.readAt >= UNUSED_ROOM_READ_MS)) {
+      let read = this.reading.get(room);
+      if (!read) {
+        read = room.refresh().finally(() => this.reading.delete(room));
+        this.reading.set(room, read);
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waited = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, this.opts.openReadWaitMs ?? 5000);
+        timer.unref?.();
+      });
+      await Promise.race([read, waited]);
+      clearTimeout(timer);
+    }
+    if (this.abandoned(room)) await this.closeDeleted(room);
+  }
+
+  /** Closes an abandoned room (see {@link abandoned}) and remembers the deletion for an hour. */
+  private async closeDeleted(room: Room): Promise<void> {
+    if (this.rooms.get(room.id) !== room) return;
+    this.rooms.delete(room.id);
+    this.updateGauge();
+    // like a deletion here: a browser that still has the project cannot upload it again at once
+    this.tombstones.set(room.id, Date.now());
+    await room.close({ flush: false, code: 4404, reason: 'project deleted' });
+    this.emitClosed(room);
+    this.opts.log.debug({ project: room.id }, 'closed the room of a project deleted from storage elsewhere');
+  }
+
+  /**
    * Returns the room of a project, loading it from storage if needed. With `create`, unknown
    * projects get a new empty room (used by sync connections: browsers may create projects
-   * offline and upload them on connect). Returns null for unknown or deleted projects.
-   * Throws {@link StorageUnavailableError} when storage fails and `create` is false.
+   * offline and upload them on connect). Returns null for unknown projects and for deleted ones
+   * (see {@link stillDeleted}; a loaded room nobody uses reads storage first, see
+   * {@link readUnused}). Throws {@link StorageUnavailableError} when storage fails and `create` is
+   * false.
    */
   async open(id: string, opts: { create?: boolean } = {}): Promise<Room | null> {
     if (this.closed) throw new Error('server is shutting down');
-    if (!isValidProjectId(id) || this.isDeleted(id)) return null;
+    if (!isValidProjectId(id)) return null;
     const live = this.get(id);
-    if (live) {
+    if (live) await this.readUnused(live);
+    if (await this.stillDeleted(id)) return null;
+    if (live && !live.destroyed) {
       live.touch();
       return live;
     }
@@ -188,7 +278,12 @@ export class RoomManager {
     if (!persisted && !create) return null;
     const ydoc = new Y.Doc();
     if (update) Y.applyUpdate(ydoc, update, STORAGE_ORIGIN);
-    const room = new Room(id, ydoc, this.roomDeps(), { info, persisted });
+    const room = new Room(id, ydoc, this.roomDeps(), {
+      info,
+      persisted,
+      documentStored: !!update,
+      readAt: store && !failed ? Date.now() : 0,
+    });
     this.rooms.set(id, room);
     this.updateGauge();
     // Storage was unreachable: the first save merges whatever is stored (CRDT) into this room.
@@ -197,10 +292,13 @@ export class RoomManager {
     return room;
   }
 
-  /** Whether a project exists (loaded, or persisted). */
+  /** Whether a project exists (loaded, or persisted; a loaded room nobody uses reads storage first). */
   async exists(id: string): Promise<boolean> {
-    if (!isValidProjectId(id) || this.isDeleted(id)) return false;
-    if (this.get(id)) return true;
+    if (!isValidProjectId(id)) return false;
+    const live = this.get(id);
+    if (live) await this.readUnused(live);
+    if (await this.stillDeleted(id)) return false;
+    if (live && !live.destroyed) return true;
     const store = this.store;
     if (!store) return false;
     return (
@@ -232,13 +330,16 @@ export class RoomManager {
   async listProjects(): Promise<ProjectListing[]> {
     const byId = new Map<string, ProjectListing>();
     const store = this.store;
+    /** The projects storage lists (null when listing them failed: then every loaded one is listed). */
+    let stored: Set<string> | null = null;
     if (store) {
       const { metrics } = this.opts;
       const end = metrics.persistenceDuration.startTimer({ op: 'list' });
       try {
         const infos = await withSpan('persistence.list', {}, () => store.listProjects());
+        stored = new Set(infos.map((info) => info.id));
         for (const info of infos)
-          if (!this.isDeleted(info.id)) byId.set(info.id, { ...info, peers: 0, live: false });
+          if (!(await this.stillDeleted(info.id))) byId.set(info.id, { ...info, peers: 0, live: false });
         metrics.persistenceOps.inc({ op: 'list', status: 'ok' });
       } catch (err) {
         metrics.persistenceOps.inc({ op: 'list', status: 'error' });
@@ -247,7 +348,20 @@ export class RoomManager {
         end();
       }
     }
+    if (store && stored) {
+      // a loaded room nobody uses whose project storage does not list, though the room found its
+      // document stored: deleted elsewhere since the room last read it (then the room reads it
+      // again, and is closed), unless storage still has the document (an unreadable project.json)
+      const listed = stored;
+      const unlisted = this.all().filter((r) => this.unused(r) && r.documentStored && !listed.has(r.id));
+      await Promise.all(
+        unlisted.map(async (room) => {
+          if (!(await store.hasDocument(room.id).catch(() => true))) await this.readUnused(room, true);
+        }),
+      );
+    }
     for (const room of this.all()) {
+      if (this.abandoned(room)) continue;
       if (!room.persisted && room.isEmpty() && !byId.has(room.id)) continue;
       byId.set(room.id, room.listing());
     }
@@ -299,8 +413,16 @@ export class RoomManager {
     this.sweeping = true;
     try {
       for (const room of this.all()) {
+        if (this.abandoned(room)) {
+          await this.closeDeleted(room);
+          continue;
+        }
         if (!room.isIdle(now, this.opts.ttlMs)) continue;
         await (room.needsReadBack ? room.refresh() : room.flush());
+        if (this.abandoned(room)) {
+          await this.closeDeleted(room);
+          continue;
+        }
         // Keep rooms whose changes could not be saved, rooms that could not read storage to find
         // their last write there (the refresh failed: it may have been replaced), and rooms that
         // got used meanwhile.

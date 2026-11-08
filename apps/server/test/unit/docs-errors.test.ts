@@ -3,11 +3,13 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { BROWSER_UI_OPERATORS, createOperatorRegistry } from '@3d-editor/core';
 import {
+  EDITOR_COMMANDS,
   MAX_EDITOR_TIMEOUT_MS,
   checkEditorCommand,
   editorClosedMessage,
   editorTimeoutMessage,
 } from '../../src/mcp/editor-commands';
+import { MILLIONS_SOLID_SECONDS, NEW_SHADER_SECONDS } from '../../src/mcp/editor-costs';
 import { AUTO_BROWSER_RASTER_TIMEOUT_MS, BROWSER_RASTER_TIMEOUT_MS } from '../../src/mcp/rendering';
 import {
   browserUiOperator,
@@ -88,6 +90,21 @@ describe('docs: browser editors', () => {
     );
   });
 
+  it('describe get_view during an animated view change by the kinds of change, like the command list', () => {
+    // the view changes the viewport animates are axis views, orbit steps and framing, from the view
+    // commands, run_operator or the person (editor-commands.test.ts checks them against the editor)
+    const getView = row(mcp, '`get_view`');
+    expect(getView).toContain(
+      'while the viewport animates a view change (an axis view, an orbit step or framing, asked for by a ' +
+        'command, an operator or the person) the view it ends on',
+    );
+    expect(getView).not.toMatch(/view\.set_view|view\.frame_all|view\.frame_selected/);
+    expect(EDITOR_COMMANDS.get_view.doc).toContain(
+      'while the viewport animates a view change (an axis view, an orbit step or framing, asked for by a ' +
+        'command, an operator or the person) the view it ends on',
+    );
+  });
+
   it('give the cost of screenshots: tens of seconds only for the first one in a shading, which the editor keeps', () => {
     for (const doc of [mcp, guide].map(flat)) {
       expect(doc).not.toMatch(/tens of seconds per `editor_command` screenshot in those shadings/);
@@ -105,21 +122,21 @@ describe('docs: browser editors', () => {
         'and keeps them for later ones',
     );
     expect(flat(mcp)).toContain(
-      'the first `MATERIAL` or `RENDERED` screenshot took 18.8–24.7 s, also when the other had been drawn before, ' +
-        'and the next ones 0.9–1.2 s',
+      'the first `MATERIAL` or `RENDERED` screenshot took 18.8–27.0 s, also when the other had been drawn before, ' +
+        'and the next ones 0.9–1.4 s',
     );
     expect(flat(mcp)).toContain(
-      'a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 17.7–19.8 s later (the rest ' +
-        'of the first one, then one frame)',
+      'a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 17.7–20.9 s later (the rest ' +
+        'of the first one, then a screenshot that compiled nothing)',
     );
     expect(flat(guide)).toContain(
       'the first screenshot or viewport frame in each of them after it opened the project builds and compiles ' +
-        "the scene's materials for that shading (18.5–26.4 s for a scene with 71 materials), and the editor keeps " +
-        'them, so later screenshots in that shading take about one frame (0.9–2.2 s)',
+        "the scene's materials for that shading (18.5–30.6 s for a scene with 71 materials), and the editor keeps " +
+        'them, so later screenshots in that shading compile nothing and take 0.4–3.3 s',
     );
     expect(flat(guide)).toContain(
       'a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the ' +
-        'rest and then takes about one frame',
+        'rest and compiles nothing again',
     );
   });
 
@@ -153,23 +170,174 @@ describe('docs: browser editors', () => {
     );
     expect(flat(mcp)).toContain(
       'After roughness edits of the table, the dowels, the floor, the glass marble and two plastics, the next ' +
-        'screenshots in both shadings took 0.8–3.1 s, in either order and with the viewport in any shading, and ' +
+        'screenshots in both shadings took 0.8–3.8 s, in either order and with the viewport in any shading, and ' +
         'no shader was compiled.',
     );
     expect(flat(mcp)).toContain("the times vary with the machine's load");
+    // the ranges cover every run, calm or busy, and the docs say under which loads they were measured
+    expect(flat(mcp)).toContain(
+      "each case in two or more runs at load averages from 0.4 to 6.7 on 4 CPUs; the times vary with the machine's load",
+    );
     expect(flat(mcp)).toContain(
       'the editor keeps what it built for both (a material edit that needs a shader no material had compiles ' +
         'it, see below)',
     );
     expect(flat(guide)).toContain(
-      'so later screenshots in that shading take about one frame (0.9–2.2 s), also after the viewport switched ' +
-        'to it and after material edits that change values (colours, roughness, texture settings). An edit ' +
-        'that needs a shader no material had',
+      'so later screenshots in that shading compile nothing and take 0.4–3.3 s, also after the viewport switched ' +
+        'to it or turned its anti-aliasing off (for slow frames or more than a million triangles), and after ' +
+        'material edits that change values (colours, roughness, texture settings: 0.8–3.8 s). An edit that needs a ' +
+        'shader no material had',
     );
     expect(flat(guide)).toContain("vary with the machine's load");
     expect(row(guide, "`editor_command '…' failed: the editor did not answer")).toContain(
       'or after a material edit that needs a new shader',
     );
+  });
+
+  it('say that a screenshot is drawn with the anti-aliasing of the viewport, so it compiles nothing', () => {
+    // engine.ts: a capture uses the viewport's sample count (captureSamples) or, when its draw context
+    // was drawn only with the other one, that one; the viewport turns multisampling off for more than
+    // a million drawn triangles and for slow settled frames, and on again for fast ones
+    const engine = readFileSync(
+      fileURLToPath(new URL('../../../web/src/viewport/engine.ts', import.meta.url)),
+      'utf8',
+    );
+    expect(engine).toContain('export const VIEWPORT_MSAA_SAMPLES = 4;');
+    expect(engine).toContain('export const MSAA_OFF_FRAME_MS = 1000;');
+    expect(engine).toContain('export const MSAA_ON_FRAME_MS = MSAA_OFF_FRAME_MS / 8;');
+    expect(engine).toContain('export const MSAA_HEAVY_TRIANGLES = 1_000_000;');
+    expect(engine).toContain('const samples = opts.useViewport ? this.captureSamples() : 8;');
+    // the switch reads the fence after the scene target's renders (the scene and its overlays)
+    expect(engine).toContain('this.multisampling && f.sceneBusyAt - begin > MSAA_OFF_FRAME_MS');
+    const doc = flat(mcp);
+    expect(doc).toContain(
+      "A screenshot is drawn with the viewport's anti-aliasing: 4× multisampling, which the viewport turns off " +
+        'for a scene of more than a million drawn triangles and after a frame whose scene and overlays took more ' +
+        'than a second to draw (its full-screen passes, such as selection outlines, do not count, nor do frames ' +
+        'that build shaders or their pipelines or that a screenshot held up), until drawing them takes less than ' +
+        '125 ms; a shading (with X-ray on or off) drawn before only with ' +
+        'the other sample count is drawn with that one. So a screenshot in a shading the editor has drawn ' +
+        '(in `SOLID` with the same X-ray setting) compiles nothing,',
+    );
+    expect(doc).toContain(
+      'With a grid of a million triangles added to the scene, the viewport drew without multisampling from the ' +
+        'start: its first `MATERIAL` or `RENDERED` frame took 12.3–14.8 s, and the next two screenshots in that ' +
+        'shading 1.2–3.3 s; after a 2600×1700 viewport had turned multisampling off, its first `MATERIAL` frame ' +
+        'back at 1400×860 took 12.0–15.3 s and the next two screenshots 0.4–1.3 s.',
+    );
+    expect(flat(guide)).toContain('also after the viewport switched to it or turned its anti-aliasing off');
+  });
+
+  it('say what a screenshot that compiles nothing costs, as rpc.ts does: not one frame of the viewport', () => {
+    // rpc.ts: a capture costs a frame of its own shading at its own size and work of its own (it
+    // waits for the frames in flight, syncs the scene to its shading, reads back and encodes a PNG);
+    // in the measurements a screenshot took longer than the viewport's frames, so no text calls a
+    // screenshot (or a retry) one frame
+    const rpc = readFileSync(
+      fileURLToPath(new URL('../../../web/src/editor/rpc.ts', import.meta.url)),
+      'utf8',
+    ).replace(/\s*\n\s*\/\/ ?/g, ' ');
+    expect(rpc).toContain("It costs a frame of its own shading, not of the viewport's, and work of its own");
+    expect(rpc).toContain('reads the pixels back and encodes a PNG');
+    expect(flat(mcp)).toContain(
+      'So a screenshot in a shading the editor has drawn (in `SOLID` with the same X-ray setting) compiles nothing, ' +
+        "unless a material edit needs a shader no material had; it costs a frame of that shading at the screenshot's " +
+        'size and work of its own: it waits ' +
+        'for the frames the GPU still draws for the viewport, prepares the scene for its shading, reads the pixels ' +
+        'back and encodes a PNG.',
+    );
+    for (const doc of [mcp, guide].map(flat))
+      expect(doc).not.toMatch(/about one frame|one frame of the viewport|then one frame/);
+  });
+
+  it('give later screenshots one range that covers each case of docs/mcp.md, in the guide and the doc comment', () => {
+    /** The range ("0.4–3.3 s" or "1.2 s") that the first group of `re` matches in `text`. */
+    const range = (text: string, re: RegExp): [number, number] => {
+      const found = text.match(re)?.[1];
+      expect(found, String(re)).toBeDefined();
+      const [lo, hi = lo] = found!.split('–').map(Number);
+      return [lo, hi];
+    };
+    const R = '([\\d.]+(?:–[\\d.]+)?) s';
+    const doc = flat(mcp);
+    // the screenshots in a shading the editor had drawn, case by case: the next ones with the viewport
+    // in SOLID, in the viewport's shading, in the other one, after the viewport drew without
+    // multisampling (a scene of a million triangles, a large viewport) and after a retry
+    const cases = [
+      `also when the other had been drawn before, and the next ones ${R}`,
+      `screenshots in its shading then took ${R}`,
+      `the first one in the other of the two [\\d.–]+ s and the next ones ${R}`,
+      `and the next two screenshots in that shading ${R}`,
+      `back at 1400×860 took [\\d.–]+ s and the next two screenshots ${R}`,
+      `then a screenshot that compiled nothing\\), and the next one in ${R}`,
+    ].map((re) => range(doc, new RegExp(re)));
+    const source = readFileSync(
+      fileURLToPath(new URL('../../src/mcp/editor-commands.ts', import.meta.url)),
+      'utf8',
+    );
+    const fn = source.indexOf('export function editorTimeoutMessage(');
+    const docComment = source.slice(source.lastIndexOf('/**', fn), fn).replace(/\s*\n\s*\* ?/g, ' ');
+    const later = [
+      range(flat(guide), new RegExp(`so later screenshots in that shading compile nothing and take ${R}`)),
+      range(docComment, new RegExp(`so later screenshots in that shading compiled nothing and took ${R}`)),
+    ];
+    for (const [lo, hi] of later)
+      for (const [a, b] of cases) {
+        expect(lo).toBeLessThanOrEqual(a);
+        expect(hi).toBeGreaterThanOrEqual(b);
+      }
+  });
+
+  it('advise grey clay rendered on the server when a SOLID or WIREFRAME screenshot timed out', () => {
+    // renderer 'software' alone renders with the scene's engine, so it path traces a PATHTRACER scene
+    // on the server for up to its time_limit; render_image draws shading 'SOLID' rasterized. The
+    // server's render worker ran out of memory for a grid of 2 million triangles: the texts say so
+    const tools = readFileSync(fileURLToPath(new URL('../../src/mcp/tools.ts', import.meta.url)), 'utf8');
+    expect(tools).toContain('SOLID: grey clay shading (always rasterized)');
+    expect(tools).toContain('software: always the server');
+    for (const shading of ['SOLID', 'WIREFRAME'])
+      expect(editorTimeoutMessage('screenshot', 10_000, null, { shading })).toContain(
+        "render without the editor: render_image with shading 'SOLID' and renderer 'software' (grey clay, " +
+          'rendered on the server, which can run out of memory for millions of triangles).',
+      );
+    expect(flat(mcp)).toContain(
+      'and advises a retry with a larger `timeout_ms` or `render_image` with `shading: "SOLID"` and ' +
+        '`renderer: "software"` (grey clay, rendered on the server without the editor, which can run out of ' +
+        'memory for millions of triangles: that render took 2.2–2.5 s with a grid of a million triangles added ' +
+        'to the scene, and ran out of memory after 17.4–21.4 s with a grid of 2 million triangles).',
+    );
+    expect(flat(guide)).toContain(
+      '`render_image {shading: "SOLID"}` (grey clay, 1.7–3.6 s at 1280×720 on the server, which ran out of ' +
+        'memory with a mesh of 2 million triangles)',
+    );
+    expect(flat(mcp)).not.toContain(
+      '`render_image` with `renderer: "software"`, which renders without the editor',
+    );
+  });
+
+  it('give the cost of new shaders for materials with procedural textures, and one range for edits of values', () => {
+    const doc = flat(mcp);
+    expect(doc).toContain(
+      "Turning sheen on took 10.8–12.9 s in each of the two shadings for the table's material, whose colour, " +
+        "roughness and bump are `BRICK` and `WAVE` textures, 8.3–11.4 s for the dowels' (`WOOD` on colour and bump) " +
+        "and 2.1–3.2 s for the floor's (`BRICK` on its colour).",
+    );
+    expect(flat(guide)).toContain(
+      '(0.6–4.5 s in that scene, up to 12.9 s for a material with several procedural textures)',
+    );
+    // the docs quote the ranges of the short texts (editor-costs.ts)
+    expect(doc).toContain(
+      `(${NEW_SHADER_SECONDS}; the times given were measured in software WebGL and vary with the machine's load)`,
+    );
+    expect(doc).toContain(
+      `a screenshot without \`shading\` or with \`shading: "SOLID"\` took ${MILLIONS_SOLID_SECONDS}`,
+    );
+    expect(flat(guide)).toContain(`(${MILLIONS_SOLID_SECONDS} per \`SOLID\` screenshot with 4 million)`);
+    // the screenshots after edits of material values: the same measured range in both docs
+    const inMcp = doc.match(/two plastics, the next screenshots in both shadings took ([\d.–]+ s)/)?.[1];
+    const inGuide = flat(guide).match(/\(colours, roughness, texture settings: ([\d.–]+ s)\)/)?.[1];
+    expect(inMcp).toBe('0.8–3.8 s');
+    expect(inGuide).toBe(inMcp);
   });
 
   it('say that requests wait for the work the editor is doing, not by when they arrived', () => {
@@ -181,7 +349,7 @@ describe('docs: browser editors', () => {
       'A screenshot waits until the frame the viewport is drawing is done, also a `SOLID` or `WIREFRAME` one',
     );
     expect(doc).toContain(
-      "The other commands draw nothing themselves, but wait while the editor's main thread is busy: for 4.6–6.2 s " +
+      "The other commands draw nothing themselves, but wait while the editor's main thread is busy: for 4.0–6.2 s " +
         'after the viewport switched to `MATERIAL` or `RENDERED` for the first time',
     );
     expect(doc).toContain('for the whole of a screenshot it draws');
@@ -198,20 +366,24 @@ describe('docs: browser editors', () => {
       fileURLToPath(new URL('../../src/mcp/rendering.ts', import.meta.url)),
       'utf8',
     ).replace(/\s*\n\s*\* ?/g, ' ');
-    for (const text of [flat(mcp), rendering]) {
+    // the raster passage of docs/mcp.md (12.9 s can be a shader's compile time elsewhere in it)
+    const doc = flat(mcp);
+    const raster = doc.slice(doc.indexOf('a raster image can take longer'), doc.indexOf('A faster answer'));
+    expect(doc).not.toMatch(/every (raster|RASTER) image of a heavy scene can take about 20 s|23–44 s/);
+    for (const text of [raster, rendering]) {
       expect(text).not.toMatch(
         /every (raster|RASTER) image of a heavy scene can take about 20 s|23–44 s|12\.9 s/,
       );
       expect(text).toContain('the first image of a 71-material scene');
     }
     expect(flat(mcp)).toContain(
-      'in a headless editor at the default 800×450, the first image of a 71-material scene took 21.9–26.7 s ' +
-        'while it compiled the materials, and the next ones 3.7–4.7 s; images of 4 million triangles took ' +
-        '4.6–10.2 s',
+      'in a headless editor at the default 800×450, the first image of a 71-material scene took 21.9–29.9 s ' +
+        'while it compiled the materials, and the next ones 3.7–7.4 s; images of 4 million triangles took ' +
+        '4.5–13.3 s',
     );
     expect(rendering).toContain(
-      'the first image of a 71-material scene took 21.9–26.7 s, as it built and compiled the materials, and ' +
-        'the next ones 3.7–4.7 s; images of 4 million triangles took 4.6–10.2 s',
+      'the first image of a 71-material scene took 21.9–29.9 s, as it built and compiled the materials, and ' +
+        'the next ones 3.7–7.4 s; images of 4 million triangles took 4.5–13.3 s',
     );
   });
 

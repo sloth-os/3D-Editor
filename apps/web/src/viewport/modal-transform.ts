@@ -155,7 +155,8 @@ export class ModalTransform {
       if (p0 && p1) delta = p1.sub(p0);
     }
     if (snap && num === null) {
-      const inc = this.engine.pose.distance > 4 ? 1 : 0.1;
+      // the grid's step in the view drawn (also during an animated view change)
+      const inc = this.engine.shownPose.distance > 4 ? 1 : 0.1;
       delta.set(
         Math.round(delta.x / inc) * inc,
         Math.round(delta.y / inc) * inc,

@@ -3,16 +3,26 @@ import * as Y from 'yjs';
 import type { Mat4, Vec3 } from '../math/types';
 import {
   axisAngle4,
+  compose4,
   decompose4,
-  determinant4,
   identity4,
   invert4,
   multiply4,
   scaling4,
   translation4,
 } from '../math/mat4';
-import { transformDirection3, transformPoint3 } from '../math/vec3';
-import { dataKindOf, type SceneDoc } from '../doc/scene-doc';
+import { cross3, dot3, length3, normalize3, transformDirection3, transformPoint3 } from '../math/vec3';
+import {
+  changedChannels,
+  dataKindOf,
+  transformBasis,
+  transformedChannels,
+  transformTolerance,
+  type SceneDoc,
+  type TransformBasis,
+  type TransformChannels,
+} from '../doc/scene-doc';
+import { invertSafe, linearPart, matrixFromAxes, matrixToStoredEuler } from '../constraints/math';
 import type { DatablockKind, ObjectData, ObjectType } from '../doc/types';
 import { defaultObject } from '../doc/defaults';
 import { meshStats, type MeshData, type MeshStats } from '../mesh/types';
@@ -208,34 +218,108 @@ class LayoutScene {
     // once edited in this run the stored value is current; before that the animated one is
     const o = this.editedIds.has(id) ? stored : this.ev.byId.get(id)?.data;
     if (!o || !stored) return;
-    const local = transformDirection3(invert4(this.parentWorld(id)), delta);
-    this.ctx.doc.updateObject(id, {
-      location: clean3([o.location[0] + local[0], o.location[1] + local[1], o.location[2] + local[2]]),
-    });
+    const basis = this.basis(id, o);
+    const moved = transformedChannels(o, basis, 'TRANSLATE', translation4(delta), [0, 0, 0]);
+    // a move by less than rounding (an object already where it goes) writes nothing
+    const patch = changedChannels(stored, { ...stored, location: moved.location }, transformTolerance(basis));
+    if (patch) this.ctx.doc.updateObject(id, { location: clean3(patch.location!) });
     this.record(id, translation4(delta));
   }
 
+  /** The transform basis of an object with channels `o` (see transformBasis in scene-doc.ts). */
+  private basis(id: string, o: TransformChannels): TransformBasis {
+    return transformBasis(o, this.world(id), this.hasParent(id) ? this.parentWorld(id) : null);
+  }
+
   /**
-   * Gives an object a new world matrix, written as location / rotation / scale through its parent
-   * with compatible eulers (closest to the current, animated rotation: consecutive edits and keys
-   * never jump by a full turn) and the current scale signs (a mirrored object stays mirrored).
+   * Writes new channels of an object: each one whose value differs from the stored one. `o` is what
+   * they were computed from (the stored values once edited in this run, else the animated ones): a
+   * channel the edit leaves as it was keeps the value it shows, which only differs from the stored
+   * one when it is animated (keying then sees the value the object shows, as for an edit of it). The
+   * change of the object's world matrix is recorded for the edits that follow in this run.
    */
-  setWorld(id: string, world: Readonly<Mat4>): void {
-    if (!world.every(Number.isFinite)) return;
+  private writeChannels(id: string, o: TransformChannels, next: TransformChannels, tol: number): void {
+    const stored = this.ctx.doc.getObject(id);
+    if (!stored) return;
+    const patch = changedChannels(stored, next, tol);
+    if (patch)
+      this.ctx.doc.updateObject(
+        id,
+        Object.fromEntries(Object.entries(patch).map(([k, v]) => [k, clean3(v as Vec3)])),
+      );
+    const parent = this.hasParent(id) ? this.parentWorld(id) : identity4();
+    const before = multiply4(parent, compose4(o.location, o.rotation_euler, o.scale));
+    const after = multiply4(parent, compose4(next.location, next.rotation_euler, next.scale));
+    this.record(id, multiply4(after, invertSafe(before)));
+  }
+
+  /** Whether the object has a parent in the evaluated scene (that is not a cycle back to it). */
+  private hasParent(id: string): boolean {
+    const p = this.get(id).data.parent;
+    return !!p && p !== id && this.ev.byId.has(p) && !this.ancestors(p).includes(id);
+  }
+
+  /**
+   * Turns an object by the world rotation `r` (3×3 part) about the world point `pivot`, then moves
+   * it by the world offset `offset`, as Blender's Rotate and Move change its channels
+   * (transformedChannels in scene-doc.ts): the rotation becomes the euler closest to the current
+   * one of the turn taken into the parent's space and applied to the current rotation, the location
+   * changes only by the offset of the origin, and the scale stays. Only the channels whose values
+   * change are written (see {@link writeChannels}).
+   */
+  turn(id: string, r: Readonly<Mat4>, pivot: Readonly<Vec3>, offset: Readonly<Vec3> = [0, 0, 0]): void {
+    if (![...r, ...pivot, ...offset].every(Number.isFinite)) return;
     const stored = this.ctx.doc.getObject(id);
     // once edited in this run the stored value is current; before that the animated one is
     const o = this.editedIds.has(id) ? stored : this.ev.byId.get(id)?.data;
     if (!o || !stored) return;
-    const cur = this.world(id);
-    const local = multiply4(invert4(this.parentWorld(id)), world);
-    const d = decomposeCompatible(local, o.rotation_euler, o.scale);
-    if (!d) return;
-    this.ctx.doc.updateObject(id, {
-      location: clean3(d.location),
-      rotation_euler: clean3(d.rotation),
-      scale: clean3(d.scale),
-    });
-    this.record(id, multiply4(world, invert4(cur)));
+    const basis = this.basis(id, o);
+    let next = transformedChannels(o, basis, 'ROTATE', r, pivot);
+    if (offset.some((v) => v !== 0))
+      next = transformedChannels(next, basis, 'TRANSLATE', translation4(offset), pivot);
+    this.writeChannels(id, o, next, transformTolerance(basis));
+  }
+
+  /**
+   * Turns an object about its origin so its `track` axis points along the world direction `dir` and
+   * its `up` axis as close as possible to world +Z (see trackRotation; `fallbackUp` when `dir` is
+   * vertical), keeping its location and scale: only the rotation can change. The rotation is found
+   * in the parent's space (the tracked axis exact also under a parent scaled unevenly, the up axis
+   * the closest one perpendicular to it there), as the euler closest to the current one; a mirrored
+   * object stays mirrored on the third axis. False when `dir` is zero.
+   */
+  aim(id: string, dir: Readonly<Vec3>, track: TrackAxis, up: UpAxis, fallbackUp: Readonly<Vec3>): boolean {
+    const rot = trackRotation(dir, track, up, [0, 0, 1], fallbackUp);
+    if (!rot) return false;
+    const stored = this.ctx.doc.getObject(id);
+    const o = this.editedIds.has(id) ? stored : this.ev.byId.get(id)?.data;
+    if (!o || !stored) return true;
+    const toParent = this.hasParent(id) ? invertSafe(linearPart(this.parentWorld(id))) : identity4();
+    const ti = AXIS_INDEX[track.slice(-1) as UpAxis];
+    const ui = AXIS_INDEX[up];
+    // the object's axes in the parent's space: the world axis of a negative scale points the other way
+    const local = (k: number) => {
+      const v = transformDirection3(toParent, [rot[k * 4], rot[k * 4 + 1], rot[k * 4 + 2]]);
+      return o.scale[k] < 0 ? ([-v[0], -v[1], -v[2]] as Vec3) : v;
+    };
+    const cols: Vec3[] = [
+      [0, 0, 0],
+      [0, 0, 0],
+      [0, 0, 0],
+    ];
+    const t = normalize3(local(ti));
+    const u0 = local(ui);
+    const along = dot3(u0, t);
+    const u = normalize3([u0[0] - t[0] * along, u0[1] - t[1] * along, u0[2] - t[2] * along]);
+    if (length3(t) === 0 || length3(u) === 0) return true;
+    cols[ti] = t;
+    cols[ui] = u;
+    const k = 3 - ti - ui;
+    cols[k] = cross3(cols[(k + 1) % 3], cols[(k + 2) % 3]);
+    const rotation = matrixToStoredEuler(matrixFromAxes(cols[0], cols[1], cols[2]), o.rotation_euler);
+    const next = { location: o.location, rotation_euler: rotation, scale: o.scale };
+    this.writeChannels(id, o, next, transformTolerance(this.basis(id, o)));
+    return true;
   }
 
   /** Records an edit made directly to an object's transform fields (for keying). */
@@ -803,7 +887,6 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
             }
             return all.length ? all : translationOf(w);
           };
-          let rotated = false;
           if (p.align_to_normal) {
             const b = pointsBounds(pointsOf(world));
             const c = p.use_origin ? origin : boundsCenter(b);
@@ -814,13 +897,9 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
               p.ground_plane,
             );
             if (probe) {
-              const r = rotationBetween(axisOf(world, 2), probe.normal);
-              const turn = multiply4(
-                translation4(origin),
-                multiply4(r, translation4([-origin[0], -origin[1], -origin[2]])),
-              );
-              world = multiply4(turn, world);
-              rotated = true;
+              // turned about its origin as Blender's Rotate turns it (only the rotation changes)
+              scene.turn(id, rotationBetween(axisOf(world, 2), probe.normal), origin);
+              world = scene.world(id);
             }
           }
           const pts = pointsOf(world);
@@ -836,14 +915,11 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           const drop = computeDrop(pts, geometry, targets, p.ground_plane);
           if (!drop) {
             ctx.report('WARNING', `Nothing below '${nameOf(ctx, id)}' to drop onto`);
-            if (rotated) scene.setWorld(id, world);
             out.push({ object: id, name: nameOf(ctx, id), dropped: false });
             continue;
           }
           const dz = drop.dz + p.offset;
-          const final = multiply4(translation4([0, 0, dz]), world);
-          if (rotated) scene.setWorld(id, final);
-          else scene.translate(id, [0, 0, dz]);
+          scene.translate(id, [0, 0, dz]);
           moves.set(id, dz);
           out.push({
             object: id,
@@ -963,9 +1039,11 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         ];
         const roots = ids.filter((id) => !scene.ancestors(id).some((a) => ids.includes(a)));
         if (p.align_to_normal) {
+          // the group turns about the snap point, as Blender's Rotate turns each object, and moves it
+          // onto the target
           const r = rotationBetween(axisOf(wRef, 2), n);
-          const g = multiply4(translation4(target), multiply4(r, translation4([-s[0], -s[1], -s[2]])));
-          for (const id of scene.byDepth(roots)) scene.setWorld(id, multiply4(g, scene.world(id)));
+          const offset: Vec3 = [target[0] - s[0], target[1] - s[1], target[2] - s[2]];
+          for (const id of scene.byDepth(roots)) scene.turn(id, r, s, offset);
         } else {
           const delta: Vec3 = [target[0] - s[0], target[1] - s[1], target[2] - s[2]];
           for (const id of scene.byDepth(roots)) scene.translate(id, delta);
@@ -1027,17 +1105,10 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           const pos = translationOf(w);
           const goal = targetId ? translationOf(scene.world(targetId)) : (p.point as Vec3);
           const dir: Vec3 = [goal[0] - pos[0], goal[1] - pos[1], goal[2] - pos[2]];
-          const rot = trackRotation(dir, track, up, [0, 0, 1], axisOf(w, AXIS_INDEX[up]));
-          if (!rot) {
+          if (!scene.aim(id, dir, track, up, axisOf(w, AXIS_INDEX[up]))) {
             ctx.report('WARNING', `'${nameOf(ctx, id)}' is at the target point; not rotated`);
             continue;
           }
-          const s = [0, 1, 2].map((k) => Math.hypot(w[k * 4], w[k * 4 + 1], w[k * 4 + 2]));
-          if (determinant4(w) < 0) {
-            // keep a mirrored object mirrored, on the axis that is neither tracked nor up
-            s[3 - AXIS_INDEX[track.slice(-1) as UpAxis] - AXIS_INDEX[up]] *= -1;
-          }
-          scene.setWorld(id, multiply4(translation4(pos), multiply4(rot, scaling4(s as Vec3))));
           out.push({
             object: id,
             name: nameOf(ctx, id),

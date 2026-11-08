@@ -17,9 +17,11 @@ import {
   OBJECT_CONTEXT,
   OBJECT_MENU,
   REDO_PANEL_OPERATORS,
+  VIEW_MENU,
   availableItems,
   constraintAddItems,
   menuByName,
+  xrayInactiveReason,
   type MenuItem,
 } from '../src/editor/menus';
 import type { ProjectSession } from '../src/project/session';
@@ -242,6 +244,45 @@ describe('menus', () => {
   it('makes the parameterised menu operators redoable', () => {
     for (const id of REDO_PANEL_OPERATORS) expect(registry.get(id)?.redoable, id).toBe(true);
     expect(constraintAddItems().filter((i) => i.op).length).toBe(16);
+  });
+
+  it('View > X-Ray is greyed out where X-ray changes nothing: Wireframe, Material Preview and Rendered outside Edit Mode', () => {
+    // regression: its checkmark said X-ray was on in Material Preview and Rendered shading, which draw
+    // objects as they are with it on or off outside Edit Mode (Blender greys its button out there),
+    // and in Wireframe shading, which always sees through objects (selecting objects ignores X-ray)
+    const xray = entry(VIEW_MENU(), ['X-Ray']);
+    s.view.xray.value = true;
+    const seen: Record<string, [boolean, boolean]> = {};
+    for (const shading of ['WIREFRAME', 'SOLID', 'MATERIAL', 'RENDERED'] as const)
+      for (const mode of ['OBJECT', 'EDIT'] as const) {
+        s.view.shading.value = shading;
+        s.state.mode = mode;
+        seen[`${shading} ${mode}`] = [xray.enabled!(), xray.checked!()];
+      }
+    // enabled, checked
+    expect(seen).toEqual({
+      'WIREFRAME OBJECT': [false, true],
+      'WIREFRAME EDIT': [true, true],
+      'SOLID OBJECT': [true, true],
+      'SOLID EDIT': [true, true],
+      'MATERIAL OBJECT': [false, true],
+      'MATERIAL EDIT': [true, true],
+      'RENDERED OBJECT': [false, true],
+      'RENDERED EDIT': [true, true],
+    });
+    // and says why (the header button's tooltip)
+    expect(xrayInactiveReason('RENDERED', 'OBJECT')).toBe(
+      'no effect in Rendered shading outside Edit Mode, as in Blender: it sees through objects in Solid ' +
+        'shading (Wireframe always does) and through the mesh in Edit Mode',
+    );
+    expect(xrayInactiveReason('WIREFRAME', 'OBJECT')).toBe(
+      'no effect in Wireframe shading outside Edit Mode: Wireframe always sees through objects here ' +
+        "(Blender's has an X-ray setting of its own); it sees through objects in Solid shading and " +
+        'through the mesh in Edit Mode',
+    );
+    expect(xrayInactiveReason('SOLID', 'OBJECT')).toBeNull();
+    expect(xrayInactiveReason('MATERIAL', 'EDIT')).toBeNull();
+    expect(xrayInactiveReason('WIREFRAME', 'EDIT')).toBeNull();
   });
 });
 

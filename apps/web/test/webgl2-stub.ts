@@ -2,7 +2,8 @@
  * A stand-in WebGL2 context that three.js's own WebGLRenderer runs on (the test environment has no
  * WebGL): it draws nothing, but three.js's bookkeeping runs as in a browser (shader program cache
  * and release, renderer.info, render targets, textures), and it counts the shader programs linked
- * and deleted. Constants are distinct numbers per name; queries answer like a capable GPU.
+ * and deleted, and the pipelines draws would need. Constants are distinct numbers per name; queries
+ * answer like a capable GPU.
  */
 
 /** What the stand-in recorded. */
@@ -11,6 +12,15 @@ export interface WebGL2Stub {
   /** Shader programs linked (gl.linkProgram) and deleted (gl.deleteProgram). */
   links: number;
   deletes: number;
+  /**
+   * The pipelines of the draws so far, as `program|samples`: the program (a number per
+   * gl.createProgram) and the sample count of the framebuffer drawn into (`canvas` for the
+   * canvas's own). Software WebGL (SwiftShader) builds a pipeline for each shader and sample count,
+   * seconds for a material's in Material Preview or Rendered shading.
+   */
+  pipelines: Set<string>;
+  /** While set, fences read as unsignalled: the GPU is still drawing what came before them. */
+  busy: boolean;
 }
 
 const FLOAT_EXTENSIONS = [
@@ -43,8 +53,22 @@ export function createWebGL2Stub(canvas: HTMLCanvasElement): WebGL2Stub {
     }
     return v;
   };
-  const stub: WebGL2Stub = { gl: null as unknown as WebGL2RenderingContext, links: 0, deletes: 0 };
+  const stub: WebGL2Stub = {
+    gl: null as unknown as WebGL2RenderingContext,
+    links: 0,
+    deletes: 0,
+    pipelines: new Set(),
+    busy: false,
+  };
   const object = () => ({});
+  // what draws go into: the bound framebuffer's sample count (its colour attachment's)
+  let programs = 0;
+  let program: { id: number } | null = null;
+  let renderbuffer: { samples: number } | null = null;
+  let framebuffer: { samples: number } | null = null;
+  const draw = () => {
+    if (program) stub.pipelines.add(`${program.id}|${framebuffer ? framebuffer.samples : 'canvas'}`);
+  };
   const target: Record<string, unknown> = {
     canvas,
     drawingBufferWidth: 1,
@@ -77,15 +101,41 @@ export function createWebGL2Stub(canvas: HTMLCanvasElement): WebGL2Stub {
     },
     getShaderPrecisionFormat: () => ({ precision: 23, rangeMin: 127, rangeMax: 127 }),
     createShader: object,
-    createProgram: object,
+    createProgram: () => ({ id: ++programs }),
     createTexture: object,
     createBuffer: object,
-    createFramebuffer: object,
-    createRenderbuffer: object,
+    createFramebuffer: () => ({ samples: 0 }),
+    createRenderbuffer: () => ({ samples: 0 }),
+    useProgram(p: { id: number } | null) {
+      program = p;
+    },
+    bindRenderbuffer(_target: number, rb: { samples: number } | null) {
+      renderbuffer = rb;
+    },
+    renderbufferStorage() {
+      if (renderbuffer) renderbuffer.samples = 0;
+    },
+    renderbufferStorageMultisample(_target: number, samples: number) {
+      if (renderbuffer) renderbuffer.samples = samples;
+    },
+    bindFramebuffer(target: number, fb: { samples: number } | null) {
+      if (byValue.get(target) !== 'READ_FRAMEBUFFER') framebuffer = fb;
+    },
+    framebufferRenderbuffer(_target: number, attachment: number, _rbTarget: number, rb: { samples: number }) {
+      if (framebuffer && byValue.get(attachment) === 'COLOR_ATTACHMENT0')
+        framebuffer.samples = rb?.samples ?? 0;
+    },
+    framebufferTexture2D(_target: number, attachment: number) {
+      if (framebuffer && byValue.get(attachment) === 'COLOR_ATTACHMENT0') framebuffer.samples = 0;
+    },
+    drawArrays: draw,
+    drawElements: draw,
+    drawArraysInstanced: draw,
+    drawElementsInstanced: draw,
     createVertexArray: object,
     createQuery: object,
     fenceSync: object,
-    getSyncParameter: () => constant('SIGNALED'),
+    getSyncParameter: () => constant(stub.busy ? 'UNSIGNALED' : 'SIGNALED'),
     clientWaitSync: () => constant('ALREADY_SIGNALED'),
     getShaderParameter: () => true,
     getShaderInfoLog: () => '',

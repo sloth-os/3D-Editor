@@ -380,24 +380,27 @@ const UNCHANGED_WRITES = 'unchanged-writes';
  * was. Running every redoable operator (and those the web UI makes redoable) with its default
  * parameters, then with parameters that change nothing or twice in a row where it can run again,
  * found these:
- * - Look At, and Drop to Ground and Snap to Surface with Align to Normal, store the location,
- *   rotation and scale of each object they place, read back from its new matrix, also the channels
- *   that stay as they were: Look At's location, their scales (with the last digits changed, see
- *   {@link SAME_NUMBER_TOLERANCE}), and all three when the object already is where they put it.
  * - Randomize Transform stores the location, rotation and scale of each object, also a channel it
  *   leaves as it was (switched off, or with a range of 0, the default for location and rotation).
  * - Set Dimensions stores the scale and Set Parent the parent, also when given the current ones.
  * - Set Interpolation, Move Keyframes and Bake Transforms store whole F-curves, also when the keys
- *   stay as they were (the interpolation the keys have, a move by 0 frames, a second bake); auto
- *   keying keys every transform channel of the objects a transform moved, which stores the F-curves
- *   of the channels it left as they were again when they have a key at the current frame.
+ *   stay as they were (the interpolation the keys have, a move by 0 frames, a second bake, which
+ *   recomputes the keys with their last digits changed, see {@link SAME_NUMBER_TOLERANCE}); auto
+ *   keying keys every transform channel of the objects a transform changes, which stores the
+ *   F-curves of the channels it left as they were again when they have a key at the current frame.
  * - An Edit Mode operator, and Shade Auto Smooth, store the mesh's whole geometry as one blob, also
  *   when they change nothing (a move by 0, marking seams that are marked).
  * - A property edit stores the whole field it edits (every bone of a pose, every modifier of a
  *   stack), also when it sets the value the field has.
- * The transform operators store only the channels they change (SceneDoc.setWorldMatrix): a Move
- * only the location, a rotation or scale about the object's own origin its rotation and scale, not
- * its location; so does Apply Transform (only the channels it resets).
+ * The operators that change objects' transforms store only the channels whose values change
+ * (SceneDoc.transformObject and SceneDoc.setWorldMatrix): a Move only the location; a rotation
+ * only the rotation and a scale only the scale, and the location too about another point than the
+ * object's own origin; a move by 0, a rotation by 0 or by whole turns and a scale by 1 nothing,
+ * except that a rotation leaving an object in gimbal lock (Y at ±90°) with Z not 0 rewrites its
+ * rotation with Z set to 0, as Blender's Rotate does (see transformTolerance in scene-doc.ts). So
+ * do Look At (which turns objects), Drop to Ground and Snap to Surface (which move them, and with
+ * Align to Normal turn them too), parenting and clearing a parent with Keep Transform (also to and
+ * from armatures and bones) and Apply Transform.
  */
 interface UnchangedWrites {
   /** The step's values of those entries (its items, by id). */
@@ -411,15 +414,15 @@ interface UnchangedWrites {
 /**
  * How far apart two numbers that are not both whole may be and still count as the same stored
  * value: this fraction of the larger one, or this much for numbers below 1. An operator that
- * recomputes a value it leaves as it was can change its last digits. The largest differences
- * measured (40,000 random objects for each case, 20,000 for Snap to Surface run twice; random
- * rotations, scales of 0.1 to 10; sample maxima, not bounds; relative to the value, or to 1 below
- * 1): Look At, Drop to Ground and Snap to Surface with Align to Normal stored the scale of an
- * unparented object up to 9 units in the last place off (1.2e-15) and, run a second time, its
- * location and rotation up to 8.9e-16 off; Look At stored the location of a child of a rotated,
- * scaled parent and grandparent up to 3.7e-13 off and, run again, its rotation up to 5.4e-14 off,
- * as the parents' inverses amplify rounding. A value further off counts as changed (see
- * {@link changedByOthers}), which errs on the side of refusing to adjust. The viewport draws in
+ * recomputes a value it leaves as it was can change its last digits: Bake Transforms run a second
+ * time over the same frames stored the keys of an unparented object up to 4.3e-16 off, and those
+ * of a child of a rotated, scaled parent up to 7.8e-14 off, as the parent's inverse amplifies
+ * rounding (5,000 random objects each, keyed at two frames with random rotations and scales of 0.1
+ * to 10, parents with random rotations and scales of 0.1 to 10; sample maxima, not bounds;
+ * relative to the value, or to 1 below 1). Set Dimensions given the current dimensions stores the
+ * scale it had exactly, and the operators that change transforms do not store a channel they leave
+ * within this of its value (see {@link UnchangedWrites}). A value further off counts as changed
+ * (see {@link changedByOthers}), which errs on the side of refusing to adjust. The viewport draws in
  * 32-bit floats, which are 1.2e-7 apart near 1. Whole numbers (frames, counts, seeds of any size)
  * count as the same only when equal.
  */
@@ -621,14 +624,14 @@ function undoOutlook(undo: Y.UndoManager, step: StackItem) {
  *    id, and undoing would remove the step's value without bringing back the one before it.
  * Others setting an entry the step rewrote unchanged otherwise do not count: undoing keeps their
  * value, which is what the entry would hold had they edited it before the step (the step only
- * rewrote it), e.g. moving an object whose location Look At stored again. Nor do changes of other
- * fields of the same block, and of other blocks: after a Move, which writes only the location of
- * each object it moves, setting the rotation or scale of a moved object, or rotating or scaling it
- * about its own origin (which writes its rotation and scale, not its location). Rotating or scaling
- * it about another point (the 3D cursor, the median of several objects) moves it, which sets the
- * location the Move changed. Reads the step's stack item (the entries it inserted and deleted, and
- * the no-op writes recorded in its meta; without that record every entry it set counts as changed)
- * and changes nothing.
+ * rewrote it), e.g. moving an object whose location Randomize Transform stored again. Nor do
+ * changes of other fields of the same block, and of other blocks: after a Move, which writes only
+ * the location of each object it moves, setting the rotation or scale of a moved object, or
+ * rotating or scaling it about its own origin (a rotation then writes only its rotation, a scale
+ * only its scale, neither its location). Rotating or scaling it about another point (the 3D
+ * cursor, the median of several objects) moves it, which sets the location the Move changed.
+ * Reads the step's stack item (the entries it inserted and deleted, and the no-op writes recorded
+ * in its meta; without that record every entry it set counts as changed) and changes nothing.
  */
 function changedByOthers(undo: Y.UndoManager, step: StackItem): boolean {
   const doc = undo.doc;
@@ -726,19 +729,19 @@ function undoOwnStep(session: ProjectSession, operator: string): boolean {
  * what it changed as it left it keep it adjustable: edits of other objects and fields (after a
  * Move, which writes only locations: setting the rotation or scale of a moved object, or rotating
  * or scaling it about its own origin), and new values of fields it rewrote unchanged (moving an
- * object whose location Look At stored again; see {@link UnchangedWrites}): undoing it keeps their
- * edits, and the re-run starts from them. Edits of part or all of what it changed (e.g. moving one
- * of the objects it moved, also by rotating or scaling it about another point than its origin,
- * editing a constraint of the object it added a constraint to) leave undoing it nothing or only the
- * rest to revert. A property edit (setting values of something that exists) then runs again on top
- * of the others' edits, which keeps those and changes only what the adjusted parameters set. Any
- * other operation would be applied again to what the others changed (a double move, a second
- * constraint, the keys they added removed again), so it can no longer be adjusted. Neither can any
- * operation after others set a field it wrote at the same time as it (neither had the other's
- * change yet) to a value that lost to its value: undoing would leave the field empty (see
- * {@link changedByOthers}), and a property edit would rebuild the field from what it sets (a pose
- * from the one bone channel it sets). This is decided before anything is undone: nothing is undone
- * or run again, and the panel closes with a warning (a toast and the Info log).
+ * object whose location Randomize Transform stored again; see {@link UnchangedWrites}): undoing it
+ * keeps their edits, and the re-run starts from them. Edits of part or all of what it changed (e.g.
+ * moving one of the objects it moved, also by rotating or scaling it about another point than its
+ * origin, editing a constraint of the object it added a constraint to) leave undoing it nothing or
+ * only the rest to revert. A property edit (setting values of something that exists) then runs
+ * again on top of the others' edits, which keeps those and changes only what the adjusted
+ * parameters set. Any other operation would be applied again to what the others changed (a double
+ * move, a second constraint, the keys they added removed again), so it can no longer be adjusted.
+ * Neither can any operation after others set a field it wrote at the same time as it (neither had
+ * the other's change yet) to a value that lost to its value: undoing would leave the field empty
+ * (see {@link changedByOthers}), and a property edit would rebuild the field from what it sets (a
+ * pose from the one bone channel it sets). This is decided before anything is undone: nothing is
+ * undone or run again, and the panel closes with a warning (a toast and the Info log).
  */
 export function redoLast(
   session: ProjectSession,

@@ -3,6 +3,7 @@ import { constants as fsConstants, promises as fs, type Stats } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import {
+  MissingFolderError,
   PreconditionFailedError,
   joinPath,
   type FileEntry,
@@ -136,7 +137,7 @@ export class DiskFileStore implements FileStore {
       if (opts.ifNoneMatch === '*' && cur) throw new PreconditionFailedError(p);
       if (opts.ifMatch && (!cur || etagFor(cur) !== opts.ifMatch)) throw new PreconditionFailedError(p);
       const dir = path.dirname(file);
-      await fs.mkdir(dir, { recursive: true });
+      if (opts.createFolders !== false) await fs.mkdir(dir, { recursive: true });
       const tmp = path.join(dir, `.${path.basename(file)}.${randomBytes(6).toString('hex')}.tmp`);
       let st: Stats;
       try {
@@ -161,7 +162,8 @@ export class DiskFileStore implements FileStore {
         await fs.rename(tmp, file);
       } catch (err) {
         await fs.rm(tmp, { force: true }).catch(() => undefined);
-        throw err;
+        // the folder is gone (createFolders: false, or removed while writing)
+        throw opts.createFolders === false && isNotFound(err) ? new MissingFolderError(p) : err;
       }
       return { etag: etagFor(st) };
     });

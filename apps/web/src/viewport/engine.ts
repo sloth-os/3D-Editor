@@ -31,7 +31,7 @@ import {
   type PathTraceOptions,
   type PixelImage,
 } from '../render';
-import { SceneObjects } from './scene-objects';
+import { SceneObjects, drawContext, type SyncOptions } from './scene-objects';
 import { ViewportSky } from './sky';
 import { ViewTransformPass } from './view-transform';
 import { STUDIO_RIG, STUDIO_RIG_AMBIENT, WorldEnvironment, aimStudioRig, needsStudioRig } from './world-env';
@@ -91,7 +91,9 @@ export const VIEWPORT_MSAA_SAMPLES = 4;
  * slow for their full-screen passes (selection outlines, view transform: the default cube's frames
  * took 0.4 s in SwiftShader with multisampling or without), for a busy machine (0.5–1.1 s) or for a
  * main thread busy with something else (a rigid body bake: the frame drawn before it is seen done
- * after it), keep it, and screenshots taken a moment apart compare edge for edge.
+ * after it), keep it, and screenshots taken a moment apart compare edge for edge. Frames slow from
+ * building shaders do not count either (see {@link FrameInFlight.settled}): turning multisampling
+ * off makes SwiftShader build every material's pipelines again, for the new sample count.
  */
 export const MSAA_OFF_FRAME_MS = 1000;
 /**
@@ -107,6 +109,17 @@ export const MSAA_ON_FRAME_MS = MSAA_OFF_FRAME_MS / 8;
 export const MSAA_HEAVY_TRIANGLES = 1_000_000;
 /** A frame the GPU has not finished after this long is given up on (it no longer holds frames back). */
 const FENCE_TIMEOUT_MS = 10 * 60_000;
+/**
+ * A frame's fences read as unsignalled count as "the GPU is still drawing it" only when the frame
+ * loop also read fences less than this before. WebGL changes a fence's state only between tasks,
+ * and Chrome reads it again from the GPU process a task later: the first read after the main
+ * thread was held up (a picture, a rigid body bake) can say "drawing" for a frame done long before.
+ * A frame of examples/domino-cascade in software WebGL (its frames took 0.3–0.7 s), drawn before a
+ * 1.5 s picture, was read as drawing 1.7 s after it began, then as done 2 ms later. A loop whose
+ * frames take up to 0.2 s of main-thread work (a scene evaluated for every frame of playback) still
+ * reads them often enough.
+ */
+export const FRESH_POLL_MS = 250;
 /**
  * Frames the GPU may be drawing at once while frames are slow ({@link SLOW_QUEUE_FRAME_MS}): a change
  * still starts its frame at once, behind the one being drawn, so a screenshot taken after it shows
@@ -129,8 +142,20 @@ interface FrameInFlight {
   /** When the frame started (before its scene sync) and when its renders started. */
   start: number;
   renderStart: number;
-  /** Whether its renders compiled shader programs (the first frame of a shading, new materials). */
+  /**
+   * Whether its scene sync or renders compiled shader programs (the first frame of a shading, new
+   * materials; see {@link ViewportEngine.compiledPrograms}).
+   */
   compiled: boolean;
+  /**
+   * Whether its time says what frames cost ({@link ViewportEngine.adaptMultisampling}): not when it
+   * compiled shader programs (a material edit that needs another shader) or is the first frame
+   * after something that has the GPU build pipelines also for compiled programs (seconds for a
+   * scene's materials in software WebGL): a change of shading or X-ray, a picture
+   * ({@link ViewportEngine.renderPixels}) or a change of multisampling; nor when a picture held the
+   * main thread up while the GPU drew it.
+   */
+  settled: boolean;
   /** The changes it shows ({@link ViewportEngine.changes} when it started). */
   changes: number;
   /** Signalled once its multisampled renders are done ({@link SceneEndPass}; null once seen so). */
@@ -335,6 +360,26 @@ export class ViewportEngine {
   private lastFrameDone = 0;
   /** How long the last finished frame took (see {@link frameDone}). */
   private lastFrameMs = 0;
+  /** When {@link frameDone} last read the frames' fences, and how many times ({@link FRESH_POLL_MS}). */
+  private lastPoll = -Infinity;
+  private polls = 0;
+  /** The read that saw the last frame done ({@link polls}), and whether it was fresh. */
+  private lastDonePoll = -1;
+  private lastDoneFresh = false;
+  /**
+   * Whether the next frame is the first after a change that has the GPU build pipelines (see
+   * {@link FrameInFlight.settled}).
+   */
+  private unsettled = true;
+  /** The shader programs three.js held when the frame being drawn began ({@link compiledPrograms}). */
+  private readonly framePrograms = new Set<unknown>();
+  /** The draw context (shading, X-ray) of the last scene sync ({@link drawContext}). */
+  private syncedContext = '';
+  /**
+   * The sample counts each draw context was drawn with, by the viewport or a capture: software
+   * WebGL keeps the pipelines it built for them ({@link captureSamples}).
+   */
+  private drawnSamples = new Map<string, Set<number>>();
   /** Whether the last sync drew more than {@link MSAA_HEAVY_TRIANGLES} triangles. */
   private heavyScene = false;
   /**
@@ -523,22 +568,44 @@ export class ViewportEngine {
       return;
     }
     const start = performance.now();
+    // (noted before the sync: the environment maps it can make compile programs too)
+    this.notePrograms();
     if (this.needsSync) this.sync();
     // the frame shows the changes asked for so far, also those of its sync (it can turn
     // multisampling off, which asks for a frame: this one)
     const changes = this.changes;
     this.dirty = false;
     const renderStart = performance.now();
-    const programs = this.programCount();
+    const settled = !this.unsettled;
+    this.unsettled = false;
     this.sceneEnd.armed = true;
     this.render(now);
+    this.noteDrawn(this.multisampling ? VIEWPORT_MSAA_SAMPLES : 0);
     recordFrame(now);
-    this.fenceFrame(start, renderStart, this.programCount() > programs, changes, this.sceneEnd.take());
+    const compiled = this.compiledPrograms();
+    this.fenceFrame(start, renderStart, compiled, settled && !compiled, changes, this.sceneEnd.take());
   }
 
-  /** Shader programs three.js has compiled (a frame that adds some compiled shaders). */
-  private programCount(): number {
-    return this.renderer.info?.programs?.length ?? 0;
+  /** Notes the shader programs three.js holds now ({@link compiledPrograms}). */
+  private notePrograms(): void {
+    this.framePrograms.clear();
+    for (const p of this.renderer.info?.programs ?? []) this.framePrograms.add(p);
+  }
+
+  /**
+   * Whether three.js holds a shader program it did not hold at the last {@link notePrograms}: one
+   * it compiled since. Neither the number of programs nor the last one says so. three.js appends a
+   * program it compiles to its list (renderer.info.programs) and takes one it releases out by
+   * moving the last one into its place (WebGLPrograms.releaseProgram): a frame that compiled one
+   * and released another (an edit that gives a material another shader, its old material disposed
+   * once the new one is drawn) keeps both, and a frame that only released one (an object with a
+   * material of its own deleted) changes the last one.
+   */
+  private compiledPrograms(): boolean {
+    const compiled = (this.renderer.info?.programs ?? []).some((p) => !this.framePrograms.has(p));
+    // (no hold on released programs until the next frame)
+    this.framePrograms.clear();
+    return compiled;
   }
 
   /**
@@ -553,6 +620,11 @@ export class ViewportEngine {
   private frameDone(): boolean {
     const gl = this.renderer.getContext?.();
     const gl2 = gl && 'getSyncParameter' in gl ? (gl as WebGL2RenderingContext) : null;
+    const poll = ++this.polls;
+    const polled = performance.now();
+    // "still drawing" is believed only from a read a moment after another one (FRESH_POLL_MS)
+    const fresh = polled - this.lastPoll < FRESH_POLL_MS;
+    this.lastPoll = polled;
     while (this.framesInFlight.length) {
       const f = this.framesInFlight[0];
       const now = performance.now();
@@ -562,7 +634,7 @@ export class ViewportEngine {
             gl2.deleteSync(f.scene);
             f.scene = null;
             f.sceneDoneAt = now;
-          } else f.sceneBusyAt = now;
+          } else if (fresh) f.sceneBusyAt = now;
         }
         if (gl2.getSyncParameter(f.fence, gl2.SYNC_STATUS) !== gl2.SIGNALED) break;
         gl2.deleteSync(f.fence);
@@ -573,12 +645,18 @@ export class ViewportEngine {
       }
       this.framesInFlight.shift();
       this.drawnChanges = f.changes;
-      // a frame queued behind another one only started drawing when that one was done
+      // a frame queued behind another one only started drawing when that one was done; when that
+      // was is known if a fresh read of an earlier turn saw it (read now, or by the first read
+      // after the main thread was held up, the GPU can have finished both long before)
+      const queued = this.lastFrameDone > f.renderStart;
+      const beginKnown = !queued || (this.lastDonePoll !== poll && this.lastDoneFresh);
       const begin = Math.max(f.renderStart, this.lastFrameDone);
       const elapsed = now - Math.max(f.start, this.lastFrameDone);
       this.lastFrameDone = now;
+      this.lastDonePoll = poll;
+      this.lastDoneFresh = fresh;
       this.lastFrameMs = elapsed;
-      this.adaptMultisampling(f, begin, now);
+      if (f.settled) this.adaptMultisampling(f, begin, beginKnown, now);
       const slow = elapsed > SLOW_FRAME_MS && document.visibilityState === 'visible' ? elapsed : 0;
       if (slowFrameMs.value !== slow) slowFrameMs.value = slow;
       const compiled = slow > 0 && f.compiled;
@@ -594,13 +672,15 @@ export class ViewportEngine {
 
   /**
    * Puts a fence after the frame that started at `start` showing `changes`, rendered from
-   * `renderStart` and `compiled` shader programs or not, whose multisampled renders end at the fence
-   * `scene` (WebGL2; see {@link frameDone}). Without fences, the frame counts as drawn.
+   * `renderStart`, `compiled` shader programs or not and `settled` or not (see
+   * {@link FrameInFlight}), whose multisampled renders end at the fence `scene` (WebGL2; see
+   * {@link frameDone}). Without fences, the frame counts as drawn.
    */
   private fenceFrame(
     start: number,
     renderStart: number,
     compiled: boolean,
+    settled: boolean,
     changes: number,
     scene: WebGLSync | null,
   ): void {
@@ -618,6 +698,7 @@ export class ViewportEngine {
       start,
       renderStart,
       compiled,
+      settled,
       changes,
       scene,
       sceneBusyAt: 0,
@@ -627,23 +708,26 @@ export class ViewportEngine {
   }
 
   /**
-   * Turns the scene target's multisampling off after a frame whose multisampled renders the GPU was
-   * seen still drawing {@link MSAA_OFF_FRAME_MS} after it could `begin` them, and draws the view
-   * again without it; turns it back on (and redraws) once a frame's renders are seen done in less
-   * than {@link MSAA_ON_FRAME_MS}. Only what was seen counts: a main thread busy with something else
-   * (a rigid body bake) sees a frame done long after the GPU finished it. A frame that compiled
-   * shaders changes nothing: its time is the compiler's (seconds in software WebGL, even for a light
-   * scene), and the frames after it show what the scene itself costs.
+   * Turns the scene target's multisampling off after a settled frame ({@link FrameInFlight.settled})
+   * whose multisampled renders the GPU was seen still drawing {@link MSAA_OFF_FRAME_MS} after it
+   * could `begin` them, and draws the view again without it; turns it back on (and redraws) once a
+   * settled frame's renders are seen done in less than {@link MSAA_ON_FRAME_MS} after a `begin`
+   * that is known (`beginKnown`, see {@link frameDone}). Only what was seen counts: a main thread
+   * busy with something else (a rigid body bake, a picture) sees a frame done long after the GPU
+   * finished it. A frame that built shaders changes nothing: its time is the compiler's (seconds in
+   * software WebGL, even for a light scene), and the frames after it show what the scene itself
+   * costs.
    */
-  private adaptMultisampling(f: FrameInFlight, begin: number, now: number): void {
-    if (f.compiled) return;
+  private adaptMultisampling(f: FrameInFlight, begin: number, beginKnown: boolean, now: number): void {
     if (this.multisampling && f.sceneBusyAt - begin > MSAA_OFF_FRAME_MS) this.setMultisampling(false);
-    else if (!this.multisampling && (f.sceneDoneAt || now) - begin < MSAA_ON_FRAME_MS)
+    else if (!this.multisampling && beginKnown && (f.sceneDoneAt || now) - begin < MSAA_ON_FRAME_MS)
       this.setMultisampling(true);
   }
 
   private setMultisampling(on: boolean): void {
     this.multisampling = on;
+    // the next frame builds every pipeline again, for the new sample count
+    this.unsettled = true;
     const samples = on ? VIEWPORT_MSAA_SAMPLES : 0;
     for (const t of [this.composer.renderTarget1, this.composer.renderTarget2]) {
       if (t.samples === samples) continue;
@@ -675,7 +759,7 @@ export class ViewportEngine {
     // origins, the grid, the 3D cursor, peers' boxes (and, in Viewport.tsx, the text info,
     // statistics and camera frame). Wireframe shading itself stays.
     const overlays = v.overlays.value;
-    this.objects.sync(s.doc, this.ev, {
+    const opts: SyncOptions = {
       shading,
       showWireOverlay: v.showWireframe.value,
       // X-ray sees through objects in Solid and Wireframe shading only, like Blender's (its Material
@@ -688,7 +772,15 @@ export class ViewportEngine {
       castShadows: shading === 'RENDERED' && render.use_shadows,
       imagesRevision: this.imagesRevision,
       overlays,
-    });
+    };
+    // another draw context (shading, X-ray) draws with other materials and render state: the GPU
+    // builds pipelines for the next frame also where their programs are compiled already (by a
+    // picture in that shading, or before multisampling changed). A material built again for new
+    // values reuses its program and pipelines; a new program is a compile (FrameInFlight.compiled).
+    const context = drawContext(opts, false);
+    if (context !== this.syncedContext) this.unsettled = true;
+    this.syncedContext = context;
+    this.objects.sync(s.doc, this.ev, opts);
     const heavy = this.objects.drawnTriangles() > MSAA_HEAVY_TRIANGLES;
     if (heavy && !this.heavyScene && this.multisampling) this.setMultisampling(false);
     this.heavyScene = heavy;
@@ -1272,8 +1364,16 @@ export class ViewportEngine {
    * heavy scene in Rendered shading in software WebGL, see rpc.ts); they are kept for later
    * pictures, and the viewport's own for its next frame (scene-objects.ts
    * ObjectView.materialSets). The viewport's shading, overlays and frame are restored afterwards.
+   *
+   * A capture is drawn with the viewport's multisampling, or with the other sample count when its
+   * shading was drawn with that one only ({@link captureSamples}); a final render with up to 8
+   * samples.
    */
   renderPixels(opts: RenderImageOptions = {}): PixelImage {
+    // the frames the GPU still draws are waited for with this picture, and the next frame comes
+    // after it: their times say nothing of what frames cost (adaptMultisampling)
+    for (const f of this.framesInFlight) f.settled = false;
+    this.unsettled = true;
     const { width, height } = this.renderSize(opts);
     const aspect = width / height;
     const view = this.session.view;
@@ -1300,7 +1400,8 @@ export class ViewportEngine {
       const cam = this.renderCamera(ev, opts, aspect);
       this.aimRig(cam);
       this.fitShadows(cam);
-      const target = new THREE.WebGLRenderTarget(width, height, { samples: 8, type: THREE.HalfFloatType });
+      const samples = opts.useViewport ? this.captureSamples() : 8;
+      const target = new THREE.WebGLRenderTarget(width, height, { samples, type: THREE.HalfFloatType });
       // The composer output is already tone mapped and sRGB encoded, so copy it raw (linear target).
       const out = new THREE.WebGLRenderTarget(width, height, { type: THREE.UnsignedByteType });
       const comp = new EffectComposer(this.renderer, target);
@@ -1353,6 +1454,7 @@ export class ViewportEngine {
         this.transmissionLevels(),
       );
       comp.render();
+      if (opts.useViewport) this.noteDrawn(samples);
       this.objects.disposeReplaced();
       // copy result (composer read buffer) into a byte target via a fullscreen quad, unblended
       parts.quad.material.map = comp.readBuffer.texture;
@@ -1389,6 +1491,37 @@ export class ViewportEngine {
       state.frame = prevFrame;
       this.invalidate();
     }
+  }
+
+  /**
+   * The samples of a capture (editor_command screenshot) in the draw context of the last sync: the
+   * viewport's, 4 while it is multisampled and none while it is not ({@link multisampling}: heavy
+   * scenes, slow frames), unless that context was drawn with the other count only (by the viewport
+   * before its multisampling changed, or by a capture; {@link drawnSamples}). Software WebGL
+   * (SwiftShader) builds a pipeline per shader and sample count: a picture with other samples than
+   * the frames before it builds a second one for every material. Measured with
+   * examples/domino-cascade (also with a 1 M triangle grid added), for the first Material Preview
+   * or Rendered picture after the viewport drew that shading without samples (no shader compiled):
+   * 9.8–13.5 s with 4 samples, 0.7–1.4 s with the viewport's. A picture with the viewport's samples
+   * shows what the viewport shows, as Blender's screenshot shows the viewport's pixels (its Solid
+   * shading draws one sample, with SMAA or no anti-aliasing, while the view moves or an animation
+   * plays). Timed in the page there, at 1280×720 with the viewport single-sampled, per picture
+   * without samples / with 4 (pipelines built) / supersampled 2×2 without: Rendered 0.42 / 0.96 /
+   * 1.58 s, Solid 0.14 / 0.60 / 0.46 s; edges, the mean difference from a 4×4-supersampled picture
+   * on its edge pixels (of 255): Rendered 12.6 / 10.4 / 5.8, Solid 6.7 / 3.0 / 2.4. FXAA (Rendered
+   * 8.3, +0.13 s) blurred the dominoes and doubled Wireframe lines.
+   */
+  private captureSamples(): number {
+    const own = this.multisampling ? VIEWPORT_MSAA_SAMPLES : 0;
+    const drawn = this.drawnSamples.get(this.syncedContext);
+    return !drawn || drawn.has(own) ? own : own ? 0 : VIEWPORT_MSAA_SAMPLES;
+  }
+
+  /** Notes that the draw context of the last sync was drawn with `samples` ({@link drawnSamples}). */
+  private noteDrawn(samples: number): void {
+    const drawn = this.drawnSamples.get(this.syncedContext);
+    if (drawn) drawn.add(samples);
+    else this.drawnSamples.set(this.syncedContext, new Set([samples]));
   }
 
   /**

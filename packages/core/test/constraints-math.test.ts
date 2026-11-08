@@ -9,6 +9,7 @@ import {
   matrixToAxisAngle,
   matrixToCompatibleEuler,
   matrixToEuler,
+  matrixToStoredEuler,
   orthogonalizeStable,
   polarDecompose,
   quatFromMatrix,
@@ -83,6 +84,24 @@ describe('euler orders', () => {
     expect(compatibleEuler([0.1, 0, 0], [2 * Math.PI, 0, 0])[0]).toBeCloseTo(0.1 + 2 * Math.PI);
     expect(compatibleEuler([-3, 0, 0], [3, 0, 0])[0]).toBeCloseTo(-3 + 2 * Math.PI);
     expect(compatibleEuler([0.5, 0.5, 0.5], [0, 0, 0])).toEqual([0.5, 0.5, 0.5]);
+  });
+
+  it('within 0.00215° of Y ±90° Blender’s conversion sets Z to 0; the angles transforms store keep the matrix', () => {
+    for (const y of [89.999, -89.999]) {
+      const e: [number, number, number] = [10 * DEG, y * DEG, 30 * DEG];
+      const m = eulerToMatrix(e);
+      // Blender's mat3_normalized_to_compatible_eulO (EULER_HYPOT_EPSILON): X takes X − Z (Y near
+      // 90°) or X + Z (near −90°) and Z is 0, which is up to 9.0e-6 off the matrix here
+      const blender = matrixToCompatibleEuler(m, [0, 0, 0]);
+      expect(blender[2], `Y ${y}°`).toBe(0);
+      expect(blender[0] / DEG, `Y ${y}°`).toBeCloseTo(y > 0 ? -20 : 40, 2);
+      // matrixToStoredEuler reads the angles the matrix has
+      const stored = matrixToStoredEuler(m, [0, 0, 0]);
+      const r = eulerToMatrix(stored);
+      for (const k of [0, 1, 2, 4, 5, 6, 8, 9, 10])
+        expect(Math.abs(r[k] - m[k]), `Y ${y}°: matrix[${k}]`).toBeLessThan(1e-14);
+      expect(stored[2] / DEG, `Y ${y}°`).toBeCloseTo(30, 9);
+    }
   });
 });
 

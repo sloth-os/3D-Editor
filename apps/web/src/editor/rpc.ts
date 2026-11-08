@@ -229,18 +229,20 @@ export async function uiCommand(command: string, params: Record<string, unknown>
     }
     case 'screenshot': {
       // The viewport's view without overlays, in the shading it shows now unless `shading` names
-      // one of the viewport's shadings (MATERIAL: Material Preview). The first picture in a shading
-      // this editor has not drawn yet builds that shading's materials and compiles their shaders.
-      // Materials are kept until they change (scene-objects.ts ObjectView.materialSets): the
-      // viewport's own while a picture is drawn in another shading, the picture's for later ones,
-      // so neither the viewport's next frames nor later pictures build them again. Measured in
-      // software WebGL (SwiftShader), 1280×720, a scene with 71 materials: in the viewport's
-      // shading about 0.7 s (SOLID) or 1 s (MATERIAL, RENDERED; the viewport's first frame in them
-      // compiled the shaders: 17 s); SOLID or WIREFRAME while the viewport showed MATERIAL or
-      // RENDERED 0.7 s, and a screenshot in the viewport's shading right after it 1.1–1.5 s;
-      // RENDERED or MATERIAL while the viewport showed SOLID 21–23 s the first time, 1 s later on.
-      // RENDERED is rasterized (WebGL), also when the render engine is PATHTRACER (see
-      // ViewportEngine.pathTraces).
+      // one of the viewport's shadings (MATERIAL: Material Preview), with the viewport's
+      // multisampling, or with the other sample count when that shading was drawn with that one
+      // only (ViewportEngine.captureSamples). The first picture in a shading this editor has not
+      // drawn yet builds that shading's materials and compiles their shaders. The materials of
+      // every shading drawn are kept (scene-objects.ts ObjectView.materialSets), and a changed one
+      // is built again and gets the shader program of the one it replaces when only values
+      // changed, so a picture in a shading this editor has drawn compiles nothing unless a material
+      // changed so that it needs another shader. It costs a frame of its own shading, not of the
+      // viewport's, and work of its own: it waits for the frames the GPU still draws for the
+      // viewport, syncs the scene to its shading (in Rendered shading with shadows, the point and
+      // spot light shadow maps are drawn again), draws into render targets of its size, reads the
+      // pixels back and encodes a PNG; the viewport syncs back for its next frame. Measured costs:
+      // docs/mcp.md (editor_command, `screenshot`). RENDERED is rasterized (WebGL), also when the
+      // render engine is PATHTRACER (see ViewportEngine.pathTraces).
       const shading = uiEnumParam(params, ['shading'], SHADING_TYPES, s.view.shading.value);
       if (!e) throw new Error('no viewport');
       const r = await e.renderImage({

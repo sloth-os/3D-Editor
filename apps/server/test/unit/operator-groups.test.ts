@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { BROWSER_UI_OPERATORS, createOperatorRegistry } from '@3d-editor/core';
 import { editorTimeoutMessage } from '../../src/mcp/editor-commands';
+import { NEW_SHADER_SECONDS } from '../../src/mcp/editor-costs';
 import {
   browserUiOperator,
   browserUiOperatorsNote,
@@ -140,9 +141,15 @@ describe('browserUiOperator', () => {
     const box = interaction.slice(interaction.indexOf('  boxSelect('));
     expect(box.slice(0, box.indexOf('\n  }\n'))).toContain('this.session.view.xray.value');
     const click = interaction.slice(interaction.indexOf('  private clickSelectEdit('));
-    expect(click.slice(0, click.indexOf('\n  }\n'))).toContain('const xray = this.session.view.xray.value;');
+    const clickBody = click.slice(0, click.indexOf('\n  }\n'));
+    expect(clickBody).toContain('const xray = this.session.view.xray.value;');
+    // a face click picks the face in front (pickFace takes no X-ray flag), and object selections
+    // (clicks, objectsInRect) are the same with X-ray on or off, as the editor's own description says
+    expect(clickBody).toContain('const f = pickFace(this.engine, x, y);');
+    expect(box.slice(0, box.indexOf('\n  }\n'))).toContain('const ids = objectsInRect(this.engine, r);');
+    expect(src('editor/ui-operators.ts')).toContain('Selecting objects ');
     expect(browserUiOperator('view3d.toggle_xray')).toMatch(
-      /: it turns X-ray on or off in that editor: in Solid shading its objects turn see-through \(Wireframe shading always shows them so; Material Preview and Rendered draw them as they are\), and in Edit Mode the edit cage shows through them and the person's box selections and clicks on vertices or edges also select hidden ones\.$/,
+      /: it turns X-ray on or off in that editor: in Solid shading its objects turn see-through \(Wireframe shading always shows them so; Material Preview and Rendered draw them as they are\), and in Edit Mode the edit cage shows through them and the person's box selections and clicks on vertices or edges also select hidden ones \(a click on a face picks the front one; selecting objects works the same with it on or off\)\.$/,
     );
   });
 
@@ -370,17 +377,21 @@ describe('the parameters the caveats name', () => {
 describe('the Shading group', () => {
   it("says which material edits cost a browser editor's next screenshot a compile, as the timeout error does", () => {
     // measured in software WebGL (docs/mcp.md): an edit that needs a shader no material had compiles it
-    // once in each of MATERIAL and RENDERED shading; an edit of values reuses the shader
-    const cost = '0.9–3.6 s measured';
+    // once in each of MATERIAL and RENDERED shading; an edit of values reuses the shader, so it compiles
+    // nothing (a screenshot still costs a frame of its shading and work of its own, not one frame)
     const shading = findOperatorGroup('Shading')!.description;
     expect(shading).toContain(
       'an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set ' +
         'of channels that no other material has) makes the next screenshot or viewport frame in MATERIAL and ' +
-        `in RENDERED shading compile it (${cost}; edits of values cost about one frame)`,
+        `in RENDERED shading compile it (${NEW_SHADER_SECONDS}, measured in software WebGL and varying with ` +
+        "the machine's load; edits of values compile nothing)",
     );
+    expect(shading).not.toMatch(/one frame/);
     expect(shading).toContain("pass editor_command a larger timeout_ms or shading 'SOLID'");
     expect(shading).not.toMatch(/compile shaders again|1\.2–11\.9|transmission/);
-    expect(editorTimeoutMessage('screenshot', 10_000, null, { shading: 'RENDERED' })).toContain(`(${cost})`);
+    expect(editorTimeoutMessage('screenshot', 10_000, null, { shading: 'RENDERED' })).toContain(
+      `(${NEW_SHADER_SECONDS})`,
+    );
   });
 });
 

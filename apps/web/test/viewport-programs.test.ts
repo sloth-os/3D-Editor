@@ -11,6 +11,7 @@ import {
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
 import { ViewportEngine } from '../src/viewport/engine';
+import { slowFrameCompiled, slowFrameMs } from '../src/telemetry/perf';
 import { createWebGL2Stub, type WebGL2Stub } from './webgl2-stub';
 
 /*
@@ -110,13 +111,20 @@ afterEach(() => {
 });
 
 describe('shader programs of the viewport (three.js on a stand-in WebGL2 context)', () => {
-  it('are not linked again when a material changes or X-ray is turned on and off in Material Preview and Rendered shading', () => {
-    // regression: a material edit built the object's whole material set again (its key covered
-    // every slot) and disposed the old materials before the new ones were drawn, so three.js
-    // deleted their shader programs and linked them again (the procedural material of the table
-    // when the plain one next to it changed, the dowels' shared one); X-ray built a set of
-    // transparent materials, each needing programs of its own
-    for (const shading of ['MATERIAL', 'RENDERED'] as const) {
+  // One test per shading, each with its own timeout: under coverage both shadings in one test took
+  // 0.9 s of the default 5 s at a load of 2–3; apart, Material Preview 0.21–0.27 s and Rendered
+  // 0.64–0.82 s at a load of 2.4–4.0 (five runs, two of them beside an end-to-end test run), and
+  // 0.27 s and 0.86 s with the core and server suites running beside them (as in CI's coverage job).
+  for (const [shading, name] of [
+    ['MATERIAL', 'Material Preview'],
+    ['RENDERED', 'Rendered'],
+  ] as const)
+    it(`are not linked again when a material changes or X-ray is turned on and off in ${name} shading`, () => {
+      // regression: a material edit built the object's whole material set again (its key covered
+      // every slot) and disposed the old materials before the new ones were drawn, so three.js
+      // deleted their shader programs and linked them again (the procedural material of the table
+      // when the plain one next to it changed, the dowels' shared one); X-ray built a set of
+      // transparent materials, each needing programs of its own
       const s = session();
       const e = engine(s);
       const m = dominoes(s);
@@ -156,8 +164,7 @@ describe('shader programs of the viewport (three.js on a stand-in WebGL2 context
       expect({ programs: info.programs!.length, ...info.memory }, shading).toEqual(held);
       // the replaced materials went once the new ones were drawn
       expect(e.objects.waitingMaterials(), shading).toBe(0);
-    }
-  });
+    }, 10_000);
 
   it('are kept for the other shadings a changed material was drawn in: drawing there again links none', () => {
     // regression: the material a change replaced was disposed once the new one had been drawn in one
@@ -341,6 +348,135 @@ describe('shader programs of the viewport (three.js on a stand-in WebGL2 context
     }
     expect(stub.links - links).toBe(0);
     expect(e.renderer.info.programs!.length).toBe(programs);
+  });
+
+  it('are not built again for pictures: a picture has the viewport’s samples, also when the viewport drops them', () => {
+    // regression: pictures (editor_command screenshot) always had 4 samples. Software WebGL
+    // (SwiftShader) builds a pipeline per shader and sample count: the first picture in a shading
+    // the viewport had drawn without multisampling (a heavy scene, slow frames) built every
+    // material's pipelines again, 9.8–13.5 s for examples/domino-cascade with no shader compiled
+    const ids = (keys: Iterable<string>) => new Set([...keys].map((k) => k.split('|')[0]));
+    const built: Record<string, string[]> = {};
+    for (const multisampled of [true, false])
+      for (const shading of ['MATERIAL', 'RENDERED', 'SOLID'] as const) {
+        const s = session();
+        const e = engine(s);
+        dominoes(s);
+        if (!multisampled) (e as unknown as { setMultisampling(on: boolean): void }).setMultisampling(false);
+        s.view.shading.value = shading;
+        frame(e);
+        // the programs the frame drew the scene with (into the scene target, not the canvas)
+        const scene = ids([...stub.pipelines].filter((k) => !k.endsWith('|canvas')));
+        const before = new Set(stub.pipelines);
+        e.renderPixels({ useViewport: true, width: 32, height: 16 });
+        frame(e);
+        built[`${shading}${multisampled ? '' : ' without multisampling'}`] = [...stub.pipelines].filter(
+          (k) => !before.has(k) && scene.has(k.split('|')[0]),
+        );
+        expect(e.multisampling).toBe(multisampled);
+      }
+    expect(built).toEqual({
+      MATERIAL: [],
+      RENDERED: [],
+      SOLID: [],
+      'MATERIAL without multisampling': [],
+      'RENDERED without multisampling': [],
+      'SOLID without multisampling': [],
+    });
+  });
+
+  it('are not built again for a picture in a shading drawn before the viewport’s multisampling changed', () => {
+    // the picture has the samples that shading was drawn with; with the viewport's new ones it
+    // would build every material's pipelines again
+    const ids = (keys: Iterable<string>) => new Set([...keys].map((k) => k.split('|')[0]));
+    const built: Record<string, string[]> = {};
+    for (const multisampled of [true, false])
+      for (const shading of ['MATERIAL', 'RENDERED'] as const) {
+        const s = session();
+        const e = engine(s);
+        dominoes(s);
+        const setMultisampling = (on: boolean) =>
+          (e as unknown as { setMultisampling(on: boolean): void }).setMultisampling(on);
+        setMultisampling(multisampled);
+        s.view.shading.value = shading;
+        frame(e);
+        const scene = ids([...stub.pipelines].filter((k) => !k.endsWith('|canvas')));
+        // the viewport goes on in Solid shading with the other sample count
+        s.view.shading.value = 'SOLID';
+        setMultisampling(!multisampled);
+        frame(e);
+        const before = new Set(stub.pipelines);
+        e.renderPixels({ useViewport: true, shading, width: 32, height: 16 });
+        built[`${shading} drawn ${multisampled ? 'with' : 'without'} multisampling`] = [
+          ...stub.pipelines,
+        ].filter((k) => !before.has(k) && scene.has(k.split('|')[0]));
+      }
+    expect(built).toEqual({
+      'MATERIAL drawn with multisampling': [],
+      'RENDERED drawn with multisampling': [],
+      'MATERIAL drawn without multisampling': [],
+      'RENDERED drawn without multisampling': [],
+    });
+  });
+
+  it('make a frame that links one count as compiling, also when it releases another, and not one that only releases one', () => {
+    // regression: the viewport took a frame for compiling when three.js's last program changed.
+    // three.js appends a program it links to its list and takes one it releases out by moving the
+    // last one into its place: an edit that gave a procedural material another shader (sheen)
+    // linked one and released the replaced material's in the same frame, which kept the last one,
+    // so its compile time counted for multisampling; deleting an object whose material had a
+    // program of its own released one, changed the last one and counted as compiling
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    /**
+     * Draws the frame of a change, which the GPU draws for 3 s (its fences read every 16 ms), and
+     * says how the viewport counted it: as slow from compiling shaders, and whether its time turned
+     * multisampling off.
+     */
+    const slowFrame = (e: ViewportEngine, change: () => void) => {
+      const links = stub.links;
+      const deletes = stub.deletes;
+      const programs = e.renderer.info.programs!.length;
+      change();
+      frame(e);
+      stub.busy = true;
+      for (let t = 0; t < 3000; t += 16) {
+        now += 16;
+        frame(e);
+      }
+      stub.busy = false;
+      now += 16;
+      frame(e);
+      return {
+        links: stub.links - links,
+        deletes: stub.deletes - deletes,
+        programs: e.renderer.info.programs!.length - programs,
+        compiling: slowFrameCompiled.value,
+        multisampling: e.multisampling,
+      };
+    };
+    try {
+      for (const shading of ['MATERIAL', 'RENDERED'] as const) {
+        const s = session();
+        const e = engine(s);
+        const m = dominoes(s);
+        s.view.shading.value = shading;
+        frame(e);
+        frame(e);
+        expect(
+          slowFrame(e, () => s.doc.updateMaterial(m.tiles, { sheen_weight: 0.5 })),
+          shading,
+        ).toEqual({ links: 1, deletes: 1, programs: 0, compiling: true, multisampling: true });
+        expect(
+          slowFrame(e, () => s.doc.removeObject(m.table)),
+          `${shading}: the table deleted`,
+        ).toEqual({ links: 0, deletes: 1, programs: -1, compiling: false, multisampling: false });
+      }
+    } finally {
+      slowFrameMs.value = 0;
+      slowFrameCompiled.value = false;
+      vi.restoreAllMocks();
+    }
   });
 
   it('link the see-through variants once in Solid shading: X-ray on and off again reuses them', () => {

@@ -204,11 +204,19 @@ export class Room {
   destroyed = false;
   /** Whether the project exists in the persistence backend. */
   persisted: boolean;
+  /** When the room last read its document from storage (loaded it, or saved or refreshed); 0: never. */
+  readAt: number;
   /** Last known `project.json` content. */
   info: ProjectInfo | null;
   private dirty = false;
   /** See {@link needsReadBack}. */
   private unconfirmedWrite = false;
+  /**
+   * What the room knows of its document in storage: 'stored' once it loaded, found or wrote it;
+   * 'deleted' when a later read found none (another writer deleted the project), until the room
+   * saves it again; 'unknown' before (a new project, or one with a project.json and no document).
+   */
+  private storage: 'unknown' | 'stored' | 'deleted';
   private firstDirtyAt = 0;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private saveChain: Promise<void> = Promise.resolve();
@@ -225,7 +233,7 @@ export class Room {
     readonly id: string,
     doc: Y.Doc,
     private readonly deps: RoomDeps,
-    init: { info?: ProjectInfo | null; persisted?: boolean } = {},
+    init: { info?: ProjectInfo | null; persisted?: boolean; documentStored?: boolean; readAt?: number } = {},
   ) {
     this.doc = doc;
     this.scene = new SceneDoc(doc, { type: 'server', room: id });
@@ -234,6 +242,8 @@ export class Room {
     this.awareness.setLocalState(null);
     this.info = init.info ?? null;
     this.persisted = !!init.persisted;
+    this.readAt = init.readAt ?? 0;
+    this.storage = init.documentStored ? 'stored' : 'unknown';
     doc.on('update', this.onDocUpdate);
     this.awareness.on('update', this.onAwarenessUpdate);
   }
@@ -341,6 +351,20 @@ export class Room {
   }
 
   /**
+   * Whether the room's last read of storage found its project deleted by another writer (another
+   * server, a browser saving to WebDAV) after the room had loaded or saved it. Such a room writes
+   * the project again only when it changes; the RoomManager closes it once nobody uses it.
+   */
+  get deletedFromStorage(): boolean {
+    return this.storage === 'deleted';
+  }
+
+  /** Whether the room's last read or write of storage found or stored its document. */
+  get documentStored(): boolean {
+    return this.storage === 'stored';
+  }
+
+  /**
    * Merges changes made to the stored document by others (other servers sharing the storage,
    * devices saving to WebDAV directly) into the room, and saves pending local changes.
    *
@@ -378,16 +402,35 @@ export class Room {
         const res = await store.syncDocument(this.id, this.doc, {
           origin: STORAGE_ORIGIN,
           info: () => (this.info = projectInfoFromScene(this.id, this.scene, prevInfo ?? this.info)),
-          // a refresh without unsaved changes does not bring back a project another server deleted
+          // a refresh without unsaved changes does not bring back a project another writer deleted
           // (the room's next change saves it again)
           create: wasDirty,
         });
-        if (res.missing && this.unconfirmedWrite)
-          log.info({ project: this.id }, 'project deleted from storage after this server saved it');
-        this.unconfirmedWrite = res.pushed && !store.fs.atomicConditionalWrites;
-        span.setAttributes({ 'persistence.pulled': res.pulled, 'persistence.pushed': res.pushed });
+        if (res.missing) {
+          if (this.storage === 'stored' || res.pushed) {
+            this.storage = 'deleted';
+            log.info(
+              { project: this.id },
+              'project deleted from storage elsewhere: not saved again unless it changes on this server',
+            );
+          }
+        } else {
+          if (res.created && this.storage !== 'unknown')
+            log.info(
+              { project: this.id },
+              'project deleted from storage elsewhere: saved again with the changes made on this server',
+            );
+          this.storage = 'stored';
+        }
+        this.persisted = !res.missing;
+        this.readAt = Date.now();
+        this.unconfirmedWrite = res.pushed && !res.missing && !store.fs.atomicConditionalWrites;
+        span.setAttributes({
+          'persistence.pulled': res.pulled,
+          'persistence.pushed': res.pushed,
+          'persistence.missing': !!res.missing,
+        });
       });
-      this.persisted = true;
       this.saveFailures = 0;
       metrics.persistenceOps.inc({ op, status: 'ok' });
     } catch (err) {

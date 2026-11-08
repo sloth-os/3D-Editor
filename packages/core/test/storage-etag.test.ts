@@ -17,6 +17,8 @@ interface DavOptions {
   propfindEtag?: boolean;
   /** Checks If-Match and If-None-Match on PUT (else ignores them, like nginx or rclone). */
   conditional?: boolean;
+  /** Status of a PUT into a folder that does not exist (default 409; nginx: 500). */
+  missingFolderStatus?: number;
 }
 
 interface Request {
@@ -55,6 +57,12 @@ class MemoryDav {
     return etag;
   }
 
+  /** Deletes a file or a folder with everything in it (another writer deleting a project). */
+  remove(path: string): void {
+    for (const p of [...this.files.keys()]) if (p === path || p.startsWith(`${path}/`)) this.files.delete(p);
+    for (const d of [...this.dirs]) if (d === path || d.startsWith(`${path}/`)) this.dirs.delete(d);
+  }
+
   private async runHooks(when: Hook['when'], req: Request): Promise<void> {
     const hook = this.hooks.find((h) => h.when === when && h.match(req));
     if (!hook) return;
@@ -87,7 +95,7 @@ class MemoryDav {
       }
       case 'PUT': {
         if (!this.dirs.has(path.slice(0, path.lastIndexOf('/')) || '/'))
-          return new Response(null, { status: 409 });
+          return new Response(null, { status: this.opts.missingFolderStatus ?? 409 });
         const ifMatch = headers.get('If-Match');
         const ifNoneMatch = headers.get('If-None-Match');
         if (this.opts.conditional && ((ifMatch && file?.etag !== ifMatch) || (ifNoneMatch === '*' && file)))
@@ -112,6 +120,10 @@ class MemoryDav {
         if (this.dirs.has(path)) return new Response(null, { status: 405 });
         this.dirs.add(path);
         return new Response(null, { status: 201 });
+      case 'DELETE':
+        if (!file && !this.dirs.has(path)) return new Response(null, { status: 404 });
+        this.remove(path);
+        return new Response(null, { status: 204 });
       default:
         return new Response(null, { status: 405 });
     }
@@ -135,9 +147,19 @@ function writer(dav: MemoryDav, who: string) {
     store,
     doc,
     set: (key: string) => doc.getMap('m').set(key, true),
-    sync: (opts: { lastEtag?: string; info?: () => ProjectInfo } = {}) => store.syncDocument(ID, doc, opts),
+    sync: (opts: Parameters<ProjectFileStore['syncDocument']>[2] = {}) => store.syncDocument(ID, doc, opts),
   };
 }
+
+/** WebDAV servers as the tests model them. */
+const servers: [string, DavOptions][] = [
+  ["the tests' webdav-server (no ETag with GET or PUT)", { conditional: false }],
+  ['nginx (ETag with GET, not with PUT)', { conditional: false, etagOnGet: true, missingFolderStatus: 500 }],
+  [
+    'Nextcloud (ETags with GET and PUT, If-Match checked)',
+    { conditional: true, etagOnGet: true, etagOnPut: true },
+  ],
+];
 
 /** The keys of the stored document. */
 function stored(dav: MemoryDav): string[] {
@@ -370,14 +392,6 @@ describe('ProjectFileStore.syncDocument on servers that ignore If-Match', () => 
  * (project.json, the read-back of a write) are a single GET.
  */
 describe('ProjectFileStore.syncDocument: the requests of a save', () => {
-  const servers: [string, DavOptions][] = [
-    ["the tests' webdav-server (no ETag with GET or PUT)", { conditional: false }],
-    ['nginx (ETag with GET, not with PUT)', { conditional: false, etagOnGet: true }],
-    [
-      'Nextcloud (ETags with GET and PUT, If-Match checked)',
-      { conditional: true, etagOnGet: true, etagOnPut: true },
-    ],
-  ];
   const sent = (dav: MemoryDav, from: number) =>
     dav.requests.slice(from).map((r) => `${r.method} ${r.path.replace(`/projects/${ID}`, '~')}`);
 
@@ -453,6 +467,126 @@ describe('ProjectFileStore.syncDocument: the requests of a save', () => {
       await b.sync();
       expect(stored(dav)).toEqual(['a', 'b']);
       expect(keys(b.doc)).toEqual(['a', 'b']);
+    },
+  );
+});
+
+/*
+ * Another writer deletes the project while a writer saves it. A writer that has written its changes
+ * has none left that storage lacks: when the deletion lands right after its write, it neither
+ * writes the document again (its read-back finds none) nor project.json (its folder is gone; a
+ * write used to create the folder again, and the project was listed without a document). A writer
+ * whose changes the deletion came before keeps them: it writes the project again, unless it was
+ * told not to create a document (`create: false`, a refresh without unsaved changes).
+ */
+describe('ProjectFileStore.syncDocument when another writer deletes the project', () => {
+  const PROJECT = `/projects/${ID}`;
+
+  async function twoWriters(opts: DavOptions) {
+    const dav = new MemoryDav(opts);
+    const a = writer(dav, 'A');
+    const b = writer(dav, 'B');
+    a.set('base');
+    await a.sync({ info });
+    await b.sync();
+    b.set('b');
+    return { dav, b };
+  }
+
+  it.each(servers)('does not write again a project deleted right after its write (%s)', async (_, opts) => {
+    const { dav, b } = await twoWriters(opts);
+    let written: Uint8Array | undefined;
+    dav.once('after', is('B', 'PUT'), () => {
+      written = dav.files.get(DOC)!.data;
+      dav.remove(PROJECT);
+    });
+    const res = await b.sync({ info });
+    expect(res).toMatchObject({ pushed: true, created: false, missing: true });
+    expect([...dav.files.keys()]).toEqual([]);
+    // what the deletion removed: a browser records it as synced, and does not store it again
+    expect(res.stored).toEqual(written);
+  });
+
+  /*
+   * Another write replaced this writer's write without its changes, then the project was deleted:
+   * storage never held those changes when it was deleted, so they are unsaved changes (the writer
+   * used to drop them, taking the deletion for one that came after its own write).
+   */
+  it.each(servers)(
+    'treats a deletion after another write replaced its own as one before its write (%s)',
+    async (_, opts) => {
+      for (const create of [true, false]) {
+        const { dav, b } = await twoWriters(opts);
+        const other = new Y.Doc();
+        Y.applyUpdate(other, dav.files.get(DOC)!.data);
+        other.getMap('m').set('c', true);
+        // a writer that read the document before B's write replaces it; B reads that back, and the
+        // project is deleted before B could write its change again
+        dav.once('after', is('B', 'PUT'), () => {
+          dav.put(DOC, Y.encodeStateAsUpdate(other));
+          dav.once('after', is('B', 'GET'), () => dav.remove(PROJECT));
+        });
+        const res = await b.sync({ info, create });
+        if (create) {
+          expect(res).toMatchObject({ pushed: true, created: true });
+          expect(stored(dav)).toEqual(['b', 'base', 'c']);
+        } else {
+          expect(res).toMatchObject({ pushed: true, missing: true });
+          expect([...dav.files.keys()]).toEqual([]);
+          // the last state it read
+          expect(res.stored).toEqual(Y.encodeStateAsUpdate(other));
+        }
+      }
+    },
+  );
+
+  it.each(servers.filter(([, opts]) => !opts.missingFolderStatus))(
+    'creates the folders again when they are deleted before the write of a new project (%s)',
+    async (_, opts) => {
+      const dav = new MemoryDav(opts);
+      const a = writer(dav, 'A');
+      a.set('a');
+      // its write finds no folder (HTTP 409): it reads again, finds no document, and creates it
+      dav.once('before', is('A', 'PUT'), () => dav.remove('/projects'));
+      expect(await a.sync({ info })).toMatchObject({ pushed: true, created: true });
+      expect(stored(dav)).toEqual(['a']);
+      expect([...dav.files.keys()].sort()).toEqual([DOC, `${PROJECT}/project.json`]);
+    },
+  );
+
+  it.each(servers)(
+    'does not write project.json again when the project is deleted after its document (%s)',
+    async (_, opts) => {
+      const { dav, b } = await twoWriters(opts);
+      dav.once('before', is('B', 'PUT', `${PROJECT}/project.json`), () => dav.remove(PROJECT));
+      expect(await b.sync({ info })).toMatchObject({ pushed: true, missing: true });
+      expect([...dav.files.keys()]).toEqual([]);
+    },
+  );
+
+  it.each(servers)(
+    'reads again when the deletion lands between its check and its write (%s)',
+    async (_, opts) => {
+      const { dav, b } = await twoWriters(opts);
+      dav.once('before', is('B', 'PUT'), () => dav.remove(PROJECT));
+      // its write finds no folder (HTTP 409; nginx: 500): it reads again and finds no document
+      expect(await b.sync({ info, create: false })).toMatchObject({ pushed: false, missing: true });
+      expect([...dav.files.keys()]).toEqual([]);
+    },
+  );
+
+  it.each(servers)(
+    'writes the project again when the deletion came before its write, unless create is false (%s)',
+    async (_, opts) => {
+      const { dav, b } = await twoWriters(opts);
+      // deleted after B read the document, before its check and write
+      dav.once('after', is('B', 'GET'), () => dav.remove(PROJECT));
+      expect(await b.sync({ info, create: false })).toMatchObject({ pushed: false, missing: true });
+      expect([...dav.files.keys()]).toEqual([]);
+      // a writer with changes keeps them: it creates the project again
+      expect(await b.sync({ info })).toMatchObject({ pushed: true, created: true });
+      expect(stored(dav)).toEqual(['b', 'base']);
+      expect([...dav.files.keys()].sort()).toEqual([DOC, `${PROJECT}/project.json`]);
     },
   );
 });

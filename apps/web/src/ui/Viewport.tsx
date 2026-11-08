@@ -3,6 +3,7 @@ import { transformPoint3 } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
 import { ViewportEngine } from '../viewport/engine';
 import { ViewportInteraction } from '../viewport/interaction';
+import { clonePose } from '../viewport/navigation';
 import { canRun, hoveredArea, popupMenu, run, viewport } from '../editor/editor';
 import { MenuButton } from './Menu';
 import {
@@ -13,6 +14,7 @@ import {
   SELECT_MENU_OBJECT,
   UV_MENU,
   VIEW_MENU,
+  xrayInactiveReason,
 } from '../editor/menus';
 import { Icon, type IconName } from './icons';
 import { RedoPanel } from './RedoPanel';
@@ -69,10 +71,12 @@ const TOOLS: { id: ToolId; icon: IconName; title: string; modes: string[] }[] = 
   { id: 'paint', icon: 'brush', title: 'Paint vertex colors', modes: ['VERTEX_PAINT'] },
 ];
 
-function ViewportHeader({ s }: { s: ProjectSession }) {
+/** The viewport's header: mode, select mode, menus, pivot, snapping, overlays, X-ray, shading. */
+export function ViewportHeader({ s }: { s: ProjectSession }) {
   const mode = s.state.$mode.value;
   const shading = s.view.shading.value;
   const selectMode = s.state.$selectMode.value;
+  const xrayInactive = xrayInactiveReason(shading, mode);
   const shadingBtn = (
     type: 'WIREFRAME' | 'SOLID' | 'MATERIAL' | 'RENDERED',
     icon: IconName,
@@ -167,8 +171,12 @@ function ViewportHeader({ s }: { s: ProjectSession }) {
       </button>
       <button
         class={`btn icon ${s.view.xray.value ? 'active' : ''}`}
-        title="X-Ray (Alt+Z)"
+        // greyed out where X-ray changes nothing (as Blender's is in Material Preview and Rendered
+        // shading); it still toggles the setting
+        title={xrayInactive ? `X-Ray (Alt+Z): ${xrayInactive}` : 'X-Ray (Alt+Z)'}
+        style={xrayInactive ? { opacity: 0.45 } : undefined}
         data-testid="xray"
+        data-inactive={xrayInactive ? 'true' : undefined}
         onClick={() => run('view3d.toggle_xray', {}, 'ui')}
       >
         <Icon name="xray" />
@@ -183,7 +191,8 @@ function ViewportHeader({ s }: { s: ProjectSession }) {
   );
 }
 
-function Sidebar({ s }: { s: ProjectSession }) {
+/** The viewport's sidebar (N): Transform, 3D Cursor, View. */
+export function Sidebar({ s }: { s: ProjectSession }) {
   void s.revision.value;
   const id = s.state.$activeId.value;
   const o = id ? s.doc.getObject(id) : null;
@@ -232,11 +241,15 @@ function Sidebar({ s }: { s: ProjectSession }) {
             min={1}
             max={500}
             unit=" mm"
+            testId="focal-length"
             onChange={(v) => {
               const e = viewport.engine;
               if (!e) return;
-              e.pose.fovY = 2 * Math.atan(18 / v);
-              e.requestRender();
+              // a change of the view (the one an animated view change goes to): saved and sent to
+              // the people following it, like the other ones
+              const p = clonePose(e.pose);
+              p.fovY = 2 * Math.atan(18 / v);
+              e.setPose(p);
             }}
           />
         </Row>

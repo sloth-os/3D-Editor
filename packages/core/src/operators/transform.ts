@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { Mat4, Vec3 } from '../math/types';
 import { axisAngle4, invert4, multiply4, rotationFromEuler, scaling4, translation4 } from '../math/mat4';
 import { normalize3, transformDirection3, transformPoint3 } from '../math/vec3';
-import type { SceneDoc } from '../doc/scene-doc';
+import type { SceneDoc, TransformMode } from '../doc/scene-doc';
 import type { MeshData } from '../mesh/types';
 import { cloneMesh, vertexCount } from '../mesh/types';
 import { selectedVertexSet } from '../mesh/selection';
@@ -71,8 +71,13 @@ export function aboutPivot(m: Mat4, pivot: Vec3): Mat4 {
   return multiply4(translation4(pivot), multiply4(m, translation4([-pivot[0], -pivot[1], -pivot[2]])));
 }
 
-/** Selected objects without those whose ancestor is also selected (they follow their parent). */
-export function transformRoots(doc: SceneDoc, ids: string[]): string[] {
+/**
+ * Selected objects without those whose ancestor is also selected (they follow their parent), as
+ * Blender's transforms leave those out (set_trans_object_base_flags). With `keepChildren` (a
+ * rotation about individual origins, see {@link transformObjects}) they are kept.
+ */
+export function transformRoots(doc: SceneDoc, ids: string[], keepChildren = false): string[] {
+  if (keepChildren) return ids.filter((id) => doc.getObject(id));
   const set = new Set(ids);
   return ids.filter((id) => {
     let p = doc.getObject(id)?.parent ?? null;
@@ -87,15 +92,19 @@ export function transformRoots(doc: SceneDoc, ids: string[]): string[] {
 }
 
 /**
- * Applies a world-space linear transform `m` (no pivot applied) to objects.
- * With INDIVIDUAL_ORIGINS each object rotates/scales about its own origin; otherwise about `pivot`.
- * Returns the new world matrices (also written to the document). SceneDoc.setWorldMatrix stores
- * only the channels each new matrix changes, as Blender's Move, Rotate and Scale do: a move only
- * the location, a rotation or scale about the object's own origin only its rotation or scale
- * (rotations as the euler closest to the stored one). Exceptions (see changedTransform in
- * scene-doc.ts): a result that would be sheared (a scale along other axes than the object's own, a
- * rotation of the child of an unevenly scaled parent) changes both, and a scale by negative factors
- * along two of the object's axes turns the rotation by 180° instead of negating those scales.
+ * Moves (`mode` TRANSLATE: `m` is a world translation), rotates (ROTATE) or scales (RESIZE: `m`'s
+ * 3×3 part is the world rotation or scale) objects; children of transformed objects follow them.
+ * With INDIVIDUAL_ORIGINS each object rotates or scales about its own origin, otherwise about the
+ * world point `pivot`. Each object's channels change as Blender's Move, Rotate and Scale change them
+ * (SceneDoc.transformObject; see transformedChannels in scene-doc.ts), and only the channels whose
+ * values change are written: a move writes the location; a rotation the rotation (the euler closest
+ * to the stored one) and a scale the scale, and both the location too about another point than the
+ * object's own origin. A selected object whose parent (or an ancestor) is selected too is left out
+ * and follows it, except in a rotation about individual origins: as in Blender (BA_TRANSFORM_CHILD)
+ * it then turns about its own origin as well, by the same rotation, in addition to following its
+ * parent (its location stays). As Blender does, every object's new channels are computed from the
+ * matrices before the transform, then written. Returns the new world matrices of the objects whose
+ * channels it computed.
  */
 export function transformObjects(
   doc: SceneDoc,
@@ -103,19 +112,19 @@ export function transformObjects(
   m: Mat4,
   pivot: Vec3,
   pivotMode: PivotPoint,
-  originals?: Map<string, Mat4>,
+  mode: TransformMode,
 ): Map<string, Mat4> {
-  const out = new Map<string, Mat4>();
-  doc.transact(() => {
-    for (const id of transformRoots(doc, ids)) {
-      const w0 = originals?.get(id) ?? doc.worldMatrix(id);
-      const p: Vec3 = pivotMode === 'INDIVIDUAL_ORIGINS' ? [w0[12], w0[13], w0[14]] : pivot;
-      const w1 = multiply4(aboutPivot(m, p), w0);
-      doc.setWorldMatrix(id, w1);
-      out.set(id, w1);
-    }
+  const individual = pivotMode === 'INDIVIDUAL_ORIGINS';
+  const targets = transformRoots(doc, ids, individual && mode === 'ROTATE');
+  const patches = targets.map((id) => {
+    const w0 = doc.worldMatrix(id);
+    const p: Vec3 = individual ? [w0[12], w0[13], w0[14]] : pivot;
+    return [id, doc.transformedPatch(id, mode, m, p)] as const;
   });
-  return out;
+  doc.transact(() => {
+    for (const [id, patch] of patches) if (patch) doc.updateObject(id, patch);
+  });
+  return new Map(targets.map((id) => [id, doc.worldMatrix(id)]));
 }
 
 export type Falloff = EditorState['proportionalFalloff'];
@@ -200,8 +209,16 @@ export function orientationMatrix(doc: SceneDoc, state: EditorState): Mat4 {
   return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 }
 
-/** Applies a world-space transform to the current selection (objects or edit-mode vertices). */
-export function transformSelection(ctx: OperatorContext, m: Mat4, pivotOverride?: Vec3): void {
+/**
+ * Applies a world-space transform to the current selection: edit-mode vertices, or objects as
+ * `mode` (Move, Rotate or Scale, see {@link transformObjects}).
+ */
+export function transformSelection(
+  ctx: OperatorContext,
+  mode: TransformMode,
+  m: Mat4,
+  pivotOverride?: Vec3,
+): void {
   const { doc, state } = ctx;
   const pivot = pivotOverride ?? selectionPivot(doc, state);
   if (state.mode === 'EDIT') {
@@ -218,8 +235,10 @@ export function transformSelection(ctx: OperatorContext, m: Mat4, pivotOverride?
   }
   const ids = selectedObjects(ctx).map((o) => o.id);
   if (ids.length === 0) throw new OperatorError('No objects selected', 'POLL_FAILED');
-  transformObjects(doc, ids, m, pivot, state.pivotPoint);
-  if (state.autoKeying) autoKeyTransforms(ctx, ids);
+  const moved = transformObjects(doc, ids, m, pivot, state.pivotPoint, mode);
+  // auto keying keys the objects the transform changes, as Blender's does, not the selected
+  // children that only follow their parents
+  if (state.autoKeying) autoKeyTransforms(ctx, [...moved.keys()]);
 }
 
 const orientEnum = z.enum(['GLOBAL', 'LOCAL']).default('GLOBAL');
@@ -262,7 +281,7 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
       execute(ctx, p) {
         let v = p.value as Vec3;
         if (p.orient_type === 'LOCAL') v = transformDirection3(orientAxes(ctx, 'LOCAL'), v);
-        transformSelection(ctx, translation4(v));
+        transformSelection(ctx, 'TRANSLATE', translation4(v));
       },
     }),
   );
@@ -290,7 +309,7 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
           if (axis[0] === 0 && axis[1] === 0 && axis[2] === 0)
             throw new OperatorError('Rotation axis must not be zero', 'INVALID_PARAMS');
         }
-        transformSelection(ctx, axisAngle4(axis, p.value), p.center as Vec3 | undefined);
+        transformSelection(ctx, 'ROTATE', axisAngle4(axis, p.value), p.center as Vec3 | undefined);
       },
     }),
   );
@@ -307,7 +326,7 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
       }),
       poll: pollTransform,
       execute(ctx, p) {
-        transformSelection(ctx, scaling4(p.value as Vec3), p.center as Vec3 | undefined);
+        transformSelection(ctx, 'RESIZE', scaling4(p.value as Vec3), p.center as Vec3 | undefined);
       },
     }),
   );

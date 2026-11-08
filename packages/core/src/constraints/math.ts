@@ -219,40 +219,126 @@ export function eulerToMatrix(e: Readonly<Vec3>, order: EulerOrder = 'XYZ'): Mat
 }
 
 /**
- * Gimbal lock threshold of the euler helpers below: when the cosine of the middle angle (Y for
+ * Gimbal lock threshold of Blender's euler conversions (EULER_HYPOT_EPSILON in Blender 4.1 and
+ * later; up to 4.0 it was 16 × FLT_EPSILON, 1.9e-6), which {@link matrixToEuler} and
+ * {@link matrixToCompatibleEuler} use as Blender does: when the cosine of the middle angle (Y for
  * 'XYZ') of a rotation with unit axes is at most this (the middle angle is within 0.00215° of
- * ±90°), only the sum or the difference of the first and last angles is defined, and they return
- * that sum or difference as the first angle, with 0 as the last angle.
+ * ±90°), Blender's mat3_normalized_to_eulO takes only the sum or the difference of the first and
+ * last angles from the matrix, as the first angle, and sets the last angle to 0. The matrices of the
+ * rotations it returns there are up to twice this off the given ones (7.50e-5 measured on 480,000
+ * rotations in the six orders with the cosine between 1e-6 and this).
  */
 export const EULER_GIMBAL_LOCK = 0.0000375;
 
-/** Both euler solutions of a rotation matrix with unit axes (identical in gimbal lock). */
-function eulerPair(m: Readonly<Mat4>, order: EulerOrder): [Vec3, Vec3] {
+/**
+ * Gimbal lock of {@link matrixToStoredEuler}, the euler angles a transform stores: only when the
+ * cosine of the middle angle is at most this (the middle angle within 5.7e-12° of ±90°, which
+ * rounding of a matrix in exact gimbal lock stays far below) does it set the last angle to 0 as
+ * Blender does. The matrix of what it returns is then at most twice this off the given one.
+ */
+const STORED_GIMBAL_LOCK = 1e-13;
+
+/**
+ * Below this cosine of the middle angle (within 0.57° of ±90°) {@link matrixToStoredEuler} reads
+ * the difference (middle angle near 90°) or the sum (near −90°) of the first and last angles from
+ * the matrix entries that do not shrink with the cosine (see {@link eulerPair}).
+ */
+const NEAR_GIMBAL_LOCK = 0.01;
+
+/** `a` plus or minus a multiple of 2π, between −π and π. */
+function wrapAngle(a: number): number {
+  return a - Math.round(a / (2 * Math.PI)) * 2 * Math.PI;
+}
+
+/**
+ * Whether a matrix with unit axes is a rotation up to rounding: its axes perpendicular to within
+ * 1e-12 (products of rotation matrices stay near 1e-16) and right-handed.
+ */
+function isRotation(m: Readonly<Mat4>): boolean {
+  const c = [0, 1, 2].map((k) => column(m, k));
+  return (
+    Math.abs(dot3(c[0], c[1])) <= 1e-12 &&
+    Math.abs(dot3(c[0], c[2])) <= 1e-12 &&
+    Math.abs(dot3(c[1], c[2])) <= 1e-12 &&
+    determinant3(m) > 0
+  );
+}
+
+/**
+ * Both euler solutions of a rotation matrix with unit axes (identical in gimbal lock), as Blender's
+ * mat3_normalized_to_eulo2 computes them: the first and last angles from the matrix entries that
+ * scale with the cosine of the middle angle, and in gimbal lock (cosine at most
+ * {@link EULER_GIMBAL_LOCK}) the first from the others, with 0 as the last. Near gimbal lock those
+ * entries are small and carry the rounding of the matrix: an error ε in them is an error of
+ * ε / cos in the first and last angles, and up to that much in the matrix of the result.
+ *
+ * With `precise` (the angles a transform stores, {@link matrixToStoredEuler}) and a rotation matrix
+ * ({@link isRotation}; Blender's formulas are what define the angles of other matrices), gimbal lock
+ * is only a cosine of at most {@link STORED_GIMBAL_LOCK}, and below {@link NEAR_GIMBAL_LOCK} the
+ * difference or sum of the first and last angles, which the matrix depends on almost alone there,
+ * comes from the entries that do not shrink (the identities below hold for rotations only).
+ * Measured on 480,000 rotations for each of nine ranges of the cosine between 1e-17 and 1 (the six
+ * orders, angles within ±π, half of the matrices made as products A·Aᵀ·R, whose small entries carry
+ * the rounding of the products): the matrix of the result was within 1.7e-15 of the given one for
+ * cosines from 1e-13 to 0.01 (Blender's formulas: up to 1.3e-11 just above their threshold, 7.5e-5
+ * below it), within 4.5e-14 above 0.01 (Blender's formulas, unchanged there) and within 2.0e-13 in
+ * exact gimbal lock, where the last angle is set to 0. Whole turns in the angles add the rounding of
+ * the larger angles (up to 3.6e-15 with two turns).
+ */
+function eulerPair(m: Readonly<Mat4>, order: EulerOrder, precise = false): [Vec3, Vec3] {
   const { axes, odd } = ORDER_AXES[order];
   const [i, j, k] = axes;
-  const R = (r: number, c: number) => m[c * 4 + r];
-  const s = odd ? -1 : 1;
-  const cy = Math.hypot(R(i, i), R(j, i));
+  // the matrix in the order's axes (Blender's mat[axes[c]][axes[r]]), for which the formulas below
+  // give the angles of the even orders and the negated angles of the odd ones
+  const M = (r: number, c: number) => m[axes[c] * 4 + axes[r]];
+  const cy = Math.hypot(M(0, 0), M(1, 0));
   const e1: Vec3 = [0, 0, 0];
   const e2: Vec3 = [0, 0, 0];
-  if (cy > EULER_GIMBAL_LOCK) {
-    e1[i] = Math.atan2(s * R(k, j), R(k, k));
-    e1[j] = Math.atan2(-s * R(k, i), cy);
-    e1[k] = Math.atan2(s * R(j, i), R(i, i));
-    e2[i] = Math.atan2(-s * R(k, j), -R(k, k));
-    e2[j] = Math.atan2(-s * R(k, i), -cy);
-    e2[k] = Math.atan2(-s * R(j, i), -R(i, i));
-    return [e1, e2];
+  // the entries used below only hold for a rotation: of other matrices (sheared ones, mirrors)
+  // Blender's formulas read the angles, which is what they are then
+  precise &&= isRotation(m);
+  const locked = !(cy > (precise ? STORED_GIMBAL_LOCK : EULER_GIMBAL_LOCK));
+  if (!locked) {
+    e1[i] = Math.atan2(M(2, 1), M(2, 2));
+    e1[j] = Math.atan2(-M(2, 0), cy);
+    e1[k] = Math.atan2(M(1, 0), M(0, 0));
+    e2[i] = Math.atan2(-M(2, 1), -M(2, 2));
+    e2[j] = Math.atan2(-M(2, 0), -cy);
+    e2[k] = Math.atan2(-M(1, 0), -M(0, 0));
+    if (precise && cy < NEAR_GIMBAL_LOCK) {
+      // M(0,1) − M(1,2) = (1 + sin b)·sin(a − c), M(1,1) + M(0,2) = (1 + sin b)·cos(a − c),
+      // −(M(0,1) + M(1,2)) = (1 − sin b)·sin(a + c), M(1,1) − M(0,2) = (1 − sin b)·cos(a + c)
+      const up = M(2, 0) <= 0;
+      const combined = up
+        ? Math.atan2(M(0, 1) - M(1, 2), M(1, 1) + M(0, 2))
+        : Math.atan2(-(M(0, 1) + M(1, 2)), M(1, 1) - M(0, 2));
+      for (const e of [e1, e2]) {
+        const d = wrapAngle(combined - (up ? e[i] - e[k] : e[i] + e[k])) / 2;
+        e[i] += d;
+        e[k] += up ? -d : d;
+      }
+    }
+  } else {
+    e1[i] = Math.atan2(-M(1, 2), M(1, 1));
+    e1[j] = Math.atan2(-M(2, 0), cy);
   }
-  e1[i] = Math.atan2(-s * R(j, k), R(j, j));
-  e1[j] = Math.atan2(-s * R(k, i), cy);
-  e1[k] = 0;
-  return [e1, [e1[0], e1[1], e1[2]]];
+  if (odd)
+    for (let n = 0; n < 3; n++) {
+      e1[n] = -e1[n];
+      e2[n] = -e2[n];
+    }
+  if (locked) {
+    e1[k] = 0;
+    e2[i] = e1[i];
+    e2[j] = e1[j];
+  }
+  return [e1, e2];
 }
 
 /**
  * Euler angles of a rotation (axes are normalised first; shear is ignored). Of the two possible
- * solutions the one with the smallest angles is returned, like Blender's `mat4_to_eulO`.
+ * solutions the one with the smallest angles is returned, like Blender's `mat4_to_eulO` (also in
+ * gimbal lock, see {@link EULER_GIMBAL_LOCK}).
  */
 export function matrixToEuler(m: Readonly<Mat4>, order: EulerOrder = 'XYZ'): Vec3 {
   const [e1, e2] = eulerPair(normalizedAxes(m), order);
@@ -263,7 +349,10 @@ export function matrixToEuler(m: Readonly<Mat4>, order: EulerOrder = 'XYZ'): Vec
 
 /**
  * Shifts euler angles by multiples of 2π so they are as close as possible to `old` (avoids
- * flips in animation and constraint results).
+ * flips in animation and constraint results): Blender's compatible_eul as of Blender 3.6. Each
+ * angle more than π from its old value moves by the whole turns that bring it closest; then an
+ * angle still more than π away while the other two are within π/2 moves by one more turn towards
+ * it. (Up to Blender 3.5 those limits were 5.1 for whole turns and 3.2 and 1.6 for the extra turn.)
  */
 export function compatibleEuler(e: Readonly<Vec3>, old: Readonly<Vec3>): Vec3 {
   const TWO_PI = Math.PI * 2;
@@ -289,18 +378,51 @@ export function compatibleEuler(e: Readonly<Vec3>, old: Readonly<Vec3>): Vec3 {
   return out;
 }
 
-/** Euler angles of a rotation chosen to be closest to `old` (Blender's compatible euler). */
-export function matrixToCompatibleEuler(
-  m: Readonly<Mat4>,
-  old: Readonly<Vec3>,
-  order: EulerOrder = 'XYZ',
-): Vec3 {
-  const [p1, p2] = eulerPair(normalizedAxes(m), order);
+/**
+ * Of the two euler solutions `pair`, each moved by {@link compatibleEuler} towards `old`, the one
+ * with the smaller sum of differences to `old` (the first on a tie).
+ */
+function closestEuler([p1, p2]: [Vec3, Vec3], old: Readonly<Vec3>): Vec3 {
   const e1 = compatibleEuler(p1, old);
   const e2 = compatibleEuler(p2, old);
   const d1 = Math.abs(e1[0] - old[0]) + Math.abs(e1[1] - old[1]) + Math.abs(e1[2] - old[2]);
   const d2 = Math.abs(e2[0] - old[0]) + Math.abs(e2[1] - old[1]) + Math.abs(e2[2] - old[2]);
   return d1 > d2 ? e2 : e1;
+}
+
+/**
+ * Euler angles of a rotation chosen to be closest to `old`, as Blender's mat3_to_compatible_eulO
+ * computes them: the axes are normalised first; of the two solutions, each moved by
+ * {@link compatibleEuler} towards `old`, the one with the smaller sum of differences to `old` is
+ * returned (the first on a tie); in gimbal lock (see {@link EULER_GIMBAL_LOCK}) the last angle is 0
+ * before the compatible turns. Copy Rotation uses it as Blender's does (constraints/copy.ts), and
+ * so do the operators that set an object's channels from its evaluated world matrix
+ * (worldMatrixToTransform in constraints/bake.ts: Apply Constraint, Apply Visual Transform, Bake
+ * Transforms, the rigid body bake and its report) and the copies Array Place and Scatter on Surface
+ * make (decomposeCompatible in generate/layout.ts), as Blender's BKE_object_apply_mat4 does. What
+ * transforms store comes from {@link matrixToStoredEuler}.
+ */
+export function matrixToCompatibleEuler(
+  m: Readonly<Mat4>,
+  old: Readonly<Vec3>,
+  order: EulerOrder = 'XYZ',
+): Vec3 {
+  return closestEuler(eulerPair(normalizedAxes(m), order), old);
+}
+
+/**
+ * The euler angles a transform stores for a new rotation (Rotate, and the turns of Look At and of
+ * Drop to Ground and Snap to Surface with Align to Normal, through SceneDoc.transformObject and
+ * scene-tools.ts; the operators that set world matrices through SceneDoc.setWorldMatrix):
+ * {@link matrixToCompatibleEuler} computed as precisely as a rotation matrix allows near and in
+ * gimbal lock (see {@link eulerPair}). Only in exact gimbal lock (the cosine of the middle angle at
+ * most 1e-13) is the last angle set to 0 (before the compatible turns), where Blender does it below
+ * a cosine of {@link EULER_GIMBAL_LOCK} (within 0.00215° of ±90°), which leaves its stored rotations
+ * up to 7.5e-5 off their matrices. Of other matrices (axes not perpendicular, or mirroring) it
+ * reads what Blender's formulas read, as matrixToCompatibleEuler does.
+ */
+export function matrixToStoredEuler(m: Readonly<Mat4>, old: Readonly<Vec3>, order: EulerOrder = 'XYZ'): Vec3 {
+  return closestEuler(eulerPair(normalizedAxes(m), order, true), old);
 }
 
 /** T · R(euler) · S with the given euler order. */

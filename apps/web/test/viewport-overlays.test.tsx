@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, render } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render } from '@testing-library/preact';
 import { signal } from '@preact/signals';
+import * as Y from 'yjs';
 import { SceneDoc, SceneEvaluator, type ObjectData } from '@3d-editor/core';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
 import { ViewportEngine } from '../src/viewport/engine';
-import { CameraFrame, InfoOverlay, PeerCursors } from '../src/ui/Viewport';
+import { CameraFrame, InfoOverlay, PeerCursors, Sidebar, ViewportHeader } from '../src/ui/Viewport';
+import { registry, viewport } from '../src/editor/editor';
+import { registerUiOperators } from '../src/editor/ui-operators';
+import { session as sessionSignal } from '../src/app/store';
+import { clonePose } from '../src/viewport/navigation';
 import { slowFrameCompiled, slowFrameMs } from '../src/telemetry/perf';
 
 /*
@@ -271,5 +276,120 @@ describe('slow viewport notice', () => {
     });
     expect(q('viewport-info')).not.toBeNull();
     expect(q('viewport-slow-frame')).toBeNull();
+  });
+});
+
+describe('viewport header and sidebar', () => {
+  beforeEach(() => {
+    if (!registry.has('wm.call_menu')) registerUiOperators(registry);
+  });
+  afterEach(() => {
+    sessionSignal.value = null;
+    viewport.engine = null;
+    localStorage.clear();
+  });
+
+  it('greys the X-ray button out where X-ray changes nothing (Wireframe, Material Preview and Rendered outside Edit Mode), and it still toggles', () => {
+    // regression: the button showed X-ray on in Material Preview and Rendered shading, which draw
+    // objects as they are with it on or off outside Edit Mode (pictures with it on and off were the
+    // same; Blender greys its button out there and keeps it working), and in Wireframe shading, which
+    // always sees through objects here
+    const s = session();
+    // (operators run with undo, like in the editor)
+    Object.assign(s, {
+      undo: new Y.UndoManager(s.doc.sharedTypes(), { trackedOrigins: new Set([s.doc.origin]) }),
+    });
+    sessionSignal.value = s;
+    const { getByTestId } = render(<ViewportHeader s={s} />);
+    const button = () => getByTestId('xray') as HTMLButtonElement;
+    act(() => {
+      s.view.xray.value = true;
+    });
+    const seen: Record<string, [boolean, boolean, string]> = {};
+    for (const shading of ['WIREFRAME', 'SOLID', 'MATERIAL', 'RENDERED'] as const)
+      for (const mode of ['OBJECT', 'EDIT'] as const) {
+        act(() => {
+          s.view.shading.value = shading;
+          s.state.mode = mode;
+        });
+        // greyed out, on (pressed), the opacity
+        seen[`${shading} ${mode}`] = [
+          button().dataset.inactive === 'true',
+          button().classList.contains('active'),
+          button().style.opacity,
+        ];
+      }
+    expect(seen).toEqual({
+      'WIREFRAME OBJECT': [true, true, '0.45'],
+      'WIREFRAME EDIT': [false, true, ''],
+      'SOLID OBJECT': [false, true, ''],
+      'SOLID EDIT': [false, true, ''],
+      'MATERIAL OBJECT': [true, true, '0.45'],
+      'MATERIAL EDIT': [false, true, ''],
+      'RENDERED OBJECT': [true, true, '0.45'],
+      'RENDERED EDIT': [false, true, ''],
+    });
+    // the tooltip says why
+    act(() => {
+      s.state.mode = 'OBJECT';
+      s.view.shading.value = 'MATERIAL';
+    });
+    expect(button().title).toBe(
+      'X-Ray (Alt+Z): no effect in Material Preview shading outside Edit Mode, as in Blender: it sees ' +
+        'through objects in Solid shading (Wireframe always does) and through the mesh in Edit Mode',
+    );
+    // a click there still toggles the setting, which Solid shading then uses
+    fireEvent.click(button());
+    expect(s.view.xray.value).toBe(false);
+    expect(button().classList.contains('active')).toBe(false);
+    act(() => {
+      s.view.shading.value = 'SOLID';
+    });
+    expect(button().dataset.inactive).toBeUndefined();
+    expect(button().title).toBe('X-Ray (Alt+Z)');
+    expect(button().classList.contains('active')).toBe(false);
+    // and in Wireframe shading
+    act(() => {
+      s.view.shading.value = 'WIREFRAME';
+    });
+    expect(button().title).toMatch(
+      /^X-Ray \(Alt\+Z\): no effect in Wireframe shading outside Edit Mode: Wireframe always sees through objects here/,
+    );
+    fireEvent.click(button());
+    expect(s.view.xray.value).toBe(true);
+    expect(button().classList.contains('active')).toBe(true);
+  });
+
+  it('Focal Length changes the view an animated view change goes to, saved and sent to the people following it', () => {
+    // regression: the field changed the lens in place without saving the view: followers (presence)
+    // and the next session (localStorage) kept the old lens until the next orbit, pan or zoom
+    const s = session();
+    const sent: { fov: number }[] = [];
+    (s as unknown as { schedulePresence: (v: { fov: number }) => void }).schedulePresence = (v) =>
+      sent.push(v);
+    const e = engine(s);
+    viewport.engine = e;
+    // the View panel open
+    localStorage.setItem('3d-editor:panel:n-view', '1');
+    const { getByTestId } = render(<Sidebar s={s} />);
+    // an animated view change runs (an axis view)
+    const to = clonePose(e.pose);
+    to.yaw = 1;
+    to.pitch = 0.5;
+    e.setPose(to, true);
+    sent.length = 0;
+    const field = getByTestId('focal-length');
+    fireEvent.pointerDown(field, { button: 0, clientX: 10, pointerId: 1 });
+    fireEvent.pointerUp(field, { button: 0, clientX: 10, pointerId: 1 });
+    const input = field.querySelector('input')!;
+    fireEvent.input(input, { target: { value: '35' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    const fov = 2 * Math.atan(18 / 35);
+    expect(e.pose.fovY).toBeCloseTo(fov, 12);
+    // on the view it went to
+    expect([e.pose.yaw, e.pose.pitch]).toEqual([1, 0.5]);
+    expect(sent.map((v) => v.fov)).toEqual([e.pose.fovY]);
+    const saved = JSON.parse(localStorage.getItem(`3d-editor:view:${s.id}`)!) as { fovY: number };
+    expect(saved.fovY).toBeCloseTo(fov, 12);
   });
 });

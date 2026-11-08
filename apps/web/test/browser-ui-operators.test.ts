@@ -53,12 +53,16 @@ describe('render.render', () => {
 describe('view3d.toggle_xray', () => {
   it('says where X-ray sees through: Solid shading, and the Edit Mode cage and selection', () => {
     // the menu tooltip and F3 search show this; Material Preview and Rendered draw objects as they
-    // are with X-ray on (engine.ts sync, scene-objects.ts setXray), like Blender's
+    // are with X-ray on (engine.ts sync, scene-objects.ts setXray), like Blender's. In Edit Mode a
+    // face click picks the front face either way (picking.ts pickFace); in Object Mode a click picks
+    // the front object and a box selects every object in it either way (interaction.ts,
+    // picking.ts objectsInRect)
     if (!registry.has('wm.call_menu')) registerUiOperators(registry);
     expect(registry.get('view3d.toggle_xray')!.description).toBe(
       'See through objects in Solid shading (Wireframe always does; Material Preview and Rendered draw them ' +
         'as they are); in Edit Mode the cage shows through and box selections and clicks on vertices or ' +
-        'edges also select hidden elements (Alt+Z).',
+        'edges also select hidden elements (a click on a face picks the front one). Selecting objects ' +
+        'works the same with it on or off (Alt+Z).',
     );
   });
 });

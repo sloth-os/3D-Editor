@@ -18,6 +18,7 @@ import { EditorStateSignals, ViewState } from '../src/editor/state';
 import { viewport } from '../src/editor/editor';
 import { registerUiOperators } from '../src/editor/ui-operators';
 import { ViewportInteraction } from '../src/viewport/interaction';
+import { ModalTransform } from '../src/viewport/modal-transform';
 import { clonePose, posePosition, type ViewPose } from '../src/viewport/navigation';
 import { uiCommand } from '../src/editor/rpc';
 import { session as sessionSignal } from '../src/app/store';
@@ -26,6 +27,7 @@ import { renderOutputSize, type PathTraceOptions } from '../src/render';
 import { applyLensShift, sceneCameraView } from '../src/render/view';
 import {
   VIEW_ANIMATION_MS,
+  FRESH_POLL_MS,
   MAX_FRAMES_IN_FLIGHT,
   SLOW_QUEUE_FRAME_MS,
   MSAA_HEAVY_TRIANGLES,
@@ -259,15 +261,17 @@ beforeEach(async () => {
   // lets vitest send its task events before the test (see below)
   await new Promise((done) => setTimeout(done, 0));
 });
-// Cheap: at most 8.6 ms under coverage in 300 runs, timed inside the hook. A reporter that times
-// hooks from vitest's task events (onHookStart / onHookEnd) can show it taking seconds: the worker
-// sends those events at most every 100 ms and leaves the rest to a timer, which cannot fire while
-// synchronous tests run, so the end of a hook can reach the reporter only after the tests that
-// follow it. The beforeEach above lets the timer fire before a test once it is due, 100 ms after
-// the worker's last send: the end of a hook shows late by the tests that start before then. Under
-// coverage the afterEach of 'keep the materials of every shading drawn …' was shown taking 4.0 s
-// (inside the hook: 0.1 ms): a 25 ms test ran after it, then 'lights a simple scene as brightly as
-// the path tracer …', which took 4.0 s.
+// Cheap: at most 2.5 ms in 132 runs under coverage (this file three times), timed inside the hook.
+// A reporter that times hooks from vitest's task events (onHookStart / onHookEnd) can show it
+// taking seconds: the worker sends those events at most every 100 ms and leaves the rest to a
+// timer, which cannot fire while synchronous tests run, so the end of a hook can reach the
+// reporter only after the tests that follow it. The beforeEach above lets the timer fire before a
+// test once it is due, 100 ms after the worker's last send: the end of a hook shows late by the
+// tests that start before then. Which hook that is varies from run to run, with the timer: in
+// those three runs the reporter showed the afterEach of 'editor_command screenshot: …' taking 3.4 s
+// and 3.2 s, and once that of 'keep the materials of every shading drawn …' taking 3.1 s (inside
+// the hooks: 0.1–0.2 ms), each late by 'lights a simple scene as brightly as the path tracer …'
+// (3.1–3.4 s), which ran two or three tests after it.
 afterEach(() => {
   for (const e of engines.splice(0)) e.dispose();
   vi.unstubAllGlobals();
@@ -1509,9 +1513,15 @@ describe('heavy scenes in Rendered shading', () => {
     expect(heavy.e.objects.drawnTriangles()).toBeGreaterThan(MSAA_HEAVY_TRIANGLES);
     expect(heavy.e.multisampling).toBe(false);
     expect([composer.renderTarget1.samples, composer.renderTarget2.samples]).toEqual([0, 0]);
-    // a GPU draws it fast: multisampling comes back
+    // a GPU draws its frames fast: multisampling comes back (the first frame's time is not what
+    // frames cost: it builds the pipelines)
     now += MSAA_ON_FRAME_MS / 2;
     fences[0].done = true;
+    heavy.e.requestRender();
+    frame(heavy.e);
+    expect(heavy.e.multisampling).toBe(false);
+    now += MSAA_ON_FRAME_MS / 2;
+    fences[1].done = true;
     frame(heavy.e);
     expect(heavy.e.multisampling).toBe(true);
     // a light scene starts with it
@@ -1687,66 +1697,76 @@ describe('heavy scenes in Rendered shading', () => {
     const samples = () => [composer.renderTarget1.samples, composer.renderTarget2.samples];
     let now = 1000;
     vi.spyOn(performance, 'now').mockImplementation(() => now);
+    /** Runs the loop on every animation frame (16 ms) for `ms` while the GPU draws. */
+    const wait = (ms: number) => {
+      for (let t = 0; t < ms; t += 16) {
+        now += Math.min(16, ms - t);
+        frame(e);
+      }
+    };
     /** Finishes the frame in flight after `ms` and runs the loop once (with a view change if asked). */
     const finish = (ms: number, change = false) => {
-      now += ms;
+      wait(ms);
       fences.at(-1)!.done = true;
       if (change) e.requestRender();
       frame(e);
     };
-    /** The loop sees the GPU still drawing the frame's multisampled renders after `ms`, then done. */
+    /** The GPU draws the frame in flight's multisampled renders for `ms`, then it is done. */
     const slow = (ms: number) => {
-      now += ms;
-      frame(e);
+      wait(ms);
       finish(1);
     };
+    // the first frame builds the pipelines: its time is not what frames cost
     frame(e);
+    finish(MSAA_ON_FRAME_MS / 2, true);
     expect(samples()).toEqual([VIEWPORT_MSAA_SAMPLES, VIEWPORT_MSAA_SAMPLES]);
     // a slow frame: multisampling goes off and the view is drawn again without it, unasked
     slow(MSAA_OFF_FRAME_MS + 50);
     expect(e.multisampling).toBe(false);
     expect(samples()).toEqual([0, 0]);
-    expect(scenePasses(e, gl)).toHaveLength(2);
-    // frames without it that are not fast enough keep it off
+    expect(scenePasses(e, gl)).toHaveLength(3);
+    // frames without it that are not fast enough keep it off (the first one, which builds the
+    // pipelines for the new sample count, does not count)
+    finish(MSAA_ON_FRAME_MS / 2, true);
     finish(MSAA_ON_FRAME_MS * 3, true);
     expect(e.multisampling).toBe(false);
-    expect(scenePasses(e, gl)).toHaveLength(3);
+    expect(scenePasses(e, gl)).toHaveLength(5);
     // a fast one brings it back, and the view is drawn again with it
     finish(MSAA_ON_FRAME_MS / 2);
     expect(e.multisampling).toBe(true);
     expect(samples()).toEqual([VIEWPORT_MSAA_SAMPLES, VIEWPORT_MSAA_SAMPLES]);
-    expect(scenePasses(e, gl)).toHaveLength(4);
+    expect(scenePasses(e, gl)).toHaveLength(6);
     // a slow frame that compiled shaders (the first one in Rendered shading) changes nothing: its
     // time is the compiler's (regression: a light scene's first frames, slow while compiling, turned
     // multisampling off and the next fast ones on again, so its edges changed between screenshots)
     gl.onRender = () => gl.info.programs.push({});
     finish(MSAA_ON_FRAME_MS / 2, true);
     gl.onRender = null;
-    expect(scenePasses(e, gl)).toHaveLength(5);
+    expect(scenePasses(e, gl)).toHaveLength(7);
     finish(SLOW_FRAME_MS + 1000);
     expect(e.multisampling).toBe(true);
     expect(slowFrameMs.value).toBe(SLOW_FRAME_MS + 1000);
     expect(slowFrameCompiled.value).toBe(true);
-    expect(scenePasses(e, gl)).toHaveLength(5);
+    expect(scenePasses(e, gl)).toHaveLength(7);
     // the frames after it show what the scene costs
     e.requestRender();
     frame(e);
     slow(SLOW_FRAME_MS + 1000);
     expect(e.multisampling).toBe(false);
     expect(slowFrameCompiled.value).toBe(false);
-    expect(scenePasses(e, gl)).toHaveLength(7);
+    expect(scenePasses(e, gl)).toHaveLength(9);
+    finish(MSAA_ON_FRAME_MS / 2, true);
     finish(MSAA_ON_FRAME_MS / 2);
     expect(e.multisampling).toBe(true);
     expect(slowFrameMs.value).toBe(0);
     // a light scene's frame slowed down for a moment (a busy machine) keeps it
     expect(MSAA_OFF_FRAME_MS).toBeGreaterThanOrEqual(1000);
     // fast frames that compile shaders do not bring multisampling back
-    gl.onRender = () => gl.info.programs.push({});
+    finish(MSAA_ON_FRAME_MS / 2, true);
     slow(MSAA_OFF_FRAME_MS * 2);
     expect(e.multisampling).toBe(false);
-    finish(MSAA_ON_FRAME_MS / 2, true);
-    expect(e.multisampling).toBe(false);
-    finish(MSAA_ON_FRAME_MS / 2, true);
+    gl.onRender = () => gl.info.programs.push({});
+    for (let i = 0; i < 3; i++) finish(MSAA_ON_FRAME_MS / 2, true);
     expect(e.multisampling).toBe(false);
     gl.onRender = null;
   });
@@ -1794,6 +1814,317 @@ describe('heavy scenes in Rendered shading', () => {
     frame(e);
     expect(e.multisampling).toBe(true);
     expect(scenePasses(e, gl)).toHaveLength(1);
+  });
+
+  /**
+   * A viewport whose loop runs on every animation frame (16 ms) while the test waits; its first
+   * frame (which builds the pipelines) is drawn in `firstFrameMs`.
+   */
+  function pacedEngine(s: ProjectSession, firstFrameMs = 50) {
+    const { e, gl } = engine(s);
+    const fences = fenceContext(gl);
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const clock = {
+      e,
+      gl,
+      fences,
+      /** Runs the loop every 16 ms for `ms`. */
+      wait(ms: number) {
+        for (let t = 0; t < ms; t += 16) {
+          now += Math.min(16, ms - t);
+          frame(e);
+        }
+      },
+      /** Moves the clock on without running the loop (the main thread is busy). */
+      hold(ms: number) {
+        now += ms;
+      },
+      /** The GPU finishes every frame in flight after `ms`; the loop sees it (and draws what is asked). */
+      finish(ms: number, change = false) {
+        clock.wait(ms);
+        for (const f of [...fences, ...fences.scenes]) f.done = true;
+        if (change) e.requestRender();
+        frame(e);
+      },
+      /** A frame of a change, which the GPU draws for `ms`. */
+      change(ms: number) {
+        e.requestRender();
+        frame(e);
+        clock.finish(ms);
+      },
+    };
+    // the first frame builds the pipelines; the next ones show what frames cost
+    frame(e);
+    clock.finish(firstFrameMs);
+    return clock;
+  }
+
+  it('keeps multisampling when the first fence read after the main thread was held up says a frame is still drawing', () => {
+    // regression: WebGL changes a fence's state only between tasks, and Chrome reads it again from
+    // the GPU process a task later. In software WebGL a frame of domino-cascade (0.3–0.7 s) drawn
+    // before a 1.5 s screenshot was read as drawing 1.7 s after it began (done 2 ms later):
+    // multisampling went off, the viewport drew Material Preview without it, and the first
+    // screenshot there (4 samples) built every material's pipelines again (13.2 s, no shader compiled)
+    const changes: Record<string, boolean[]> = {};
+    for (const heldUpBy of ['a long task', 'a picture'] as const) {
+      const s = session();
+      const c = pacedEngine(s);
+      const switched = (changes[heldUpBy] = [] as boolean[]);
+      const engine = c.e as unknown as { setMultisampling(on: boolean): void };
+      const set = engine.setMultisampling.bind(engine);
+      engine.setMultisampling = (on) => {
+        switched.push(on);
+        set(on);
+      };
+      c.e.requestRender();
+      frame(c.e);
+      c.wait(32);
+      if (heldUpBy === 'a picture') {
+        // the picture waits for the GPU to draw the frame and itself
+        c.gl.readPixels = (b) => {
+          c.hold(1600);
+          b.fill(0);
+        };
+        c.e.renderPixels({ useViewport: true, shading: 'SOLID', width: 32, height: 16 });
+      } else c.hold(1600);
+      // the first read says the frame is still drawing, the next one (2 ms later) that it is done
+      frame(c.e);
+      c.hold(2);
+      for (const f of [...c.fences, ...c.fences.scenes]) f.done = true;
+      frame(c.e);
+      expect(c.e.multisampling, heldUpBy).toBe(true);
+    }
+    // never turned off (and on again)
+    expect(changes).toEqual({ 'a long task': [], 'a picture': [] });
+  });
+
+  it('keeps multisampling when the read after a short picture says the frame drawn before it is still drawing', () => {
+    // a picture waits for the frames the GPU still draws, and the first fence read after it can still
+    // say "drawing" for one done before it (WebGL changes a fence's state only between tasks). After
+    // a picture shorter than FRESH_POLL_MS that read counts as fresh: a frame whose multisampled
+    // renders took 0.9 s, read as drawing 1.1 s after they began, turned multisampling off. Frames in
+    // flight while a picture is taken do not count.
+    const s = session();
+    const c = pacedEngine(s);
+    const switched: boolean[] = [];
+    const engine = c.e as unknown as { setMultisampling(on: boolean): void };
+    const set = engine.setMultisampling.bind(engine);
+    engine.setMultisampling = (on) => {
+      switched.push(on);
+      set(on);
+    };
+    c.e.requestRender();
+    frame(c.e);
+    // the GPU draws the frame for 0.9 s, read every 16 ms; then a picture of 0.2 s
+    c.wait(MSAA_OFF_FRAME_MS - 100);
+    c.gl.readPixels = (b) => {
+      c.hold(FRESH_POLL_MS - 50);
+      b.fill(0);
+    };
+    c.e.renderPixels({ useViewport: true, width: 32, height: 16 });
+    // the first read says the frame is still drawing, the next one (2 ms later) that it is done
+    frame(c.e);
+    c.hold(2);
+    for (const f of [...c.fences, ...c.fences.scenes]) f.done = true;
+    frame(c.e);
+    expect(switched).toEqual([]);
+    expect(c.e.multisampling).toBe(true);
+  });
+
+  it('keeps multisampling off when frames queued behind each other are seen done together', () => {
+    // regression: after the main thread was held up (a screenshot), the frames the GPU had drawn
+    // meanwhile were seen done in one turn of the loop; the second one counted from when the first
+    // was seen done, 0 ms, so multisampling came back, and the next frame built every pipeline
+    // again for 4 samples (seconds in software WebGL) and turned it off again
+    const s = scatterScene(400);
+    const c = pacedEngine(s, MSAA_ON_FRAME_MS * 4);
+    expect(c.e.multisampling).toBe(false);
+    // two frames, the second queued behind the first
+    c.e.requestRender();
+    frame(c.e);
+    c.e.requestRender();
+    frame(c.e);
+    expect(c.fences.length).toBe(3);
+    c.hold(1600);
+    for (const f of [...c.fences, ...c.fences.scenes]) f.done = true;
+    frame(c.e);
+    expect(c.e.multisampling).toBe(false);
+    // a frame seen fast from its start brings it back (a GPU)
+    c.change(MSAA_ON_FRAME_MS / 2);
+    expect(c.e.multisampling).toBe(true);
+  });
+
+  it('does not count the first frame after a change that has the GPU build pipelines without compiling a shader', () => {
+    // a shading or X-ray switch, a picture or new multisampling give frames other pipelines
+    // (SwiftShader builds one per shader, render state and sample count: seconds for a scene's
+    // materials in software WebGL), also where no program is linked for them: such a slow frame says
+    // nothing of what frames cost
+    const s = session();
+    s.view.shading.value = 'SOLID';
+    const c = pacedEngine(s);
+    const cube = s.doc.listObjects().find((o) => o.type === 'MESH')!;
+    const events: [string, () => void][] = [
+      ['a shading switch', () => (s.view.shading.value = 'MATERIAL')],
+      ['a shading switch back', () => (s.view.shading.value = 'SOLID')],
+      ['X-ray', () => (s.view.xray.value = true)],
+      ['a picture', () => c.e.renderPixels({ useViewport: true, width: 32, height: 16 })],
+    ];
+    for (const [what, event] of events) {
+      event();
+      frame(c.e);
+      c.finish(MSAA_OFF_FRAME_MS * 3);
+      expect(c.e.multisampling, what).toBe(true);
+      // the frames after it count
+      c.change(50);
+    }
+    // a material built again for new values reuses its shader program and pipelines (an animated
+    // colour during playback): its frame counts
+    s.doc.updateMaterial(cube.material_slots[0]!, { roughness: 0.31 });
+    frame(c.e);
+    c.finish(MSAA_OFF_FRAME_MS * 3);
+    expect(c.e.multisampling).toBe(false);
+    // the first frame without multisampling builds the pipelines again: fast or slow, it does not
+    // count; a fast frame after it brings multisampling back, and the first one with it does not
+    // count either
+    c.finish(MSAA_ON_FRAME_MS / 2);
+    expect(c.e.multisampling).toBe(false);
+    c.change(MSAA_ON_FRAME_MS / 2);
+    expect(c.e.multisampling).toBe(true);
+    c.finish(MSAA_OFF_FRAME_MS * 3);
+    expect(c.e.multisampling).toBe(true);
+  });
+
+  /**
+   * Takes a shader program out of the renderer's list as three.js does when it releases one
+   * (WebGLPrograms.releaseProgram): the last one moves into its place.
+   */
+  function releaseProgram(gl: RecordingRenderer, program: unknown) {
+    const programs = gl.info.programs;
+    const i = programs.indexOf(program);
+    programs[i] = programs[programs.length - 1];
+    programs.pop();
+  }
+
+  it('counts a frame that compiled a program as compiling, also when another program was released in it', () => {
+    // regression: three.js appends a program it compiles to its list and takes a released one out
+    // by moving the last one into its place. A frame that compiled a program and released another
+    // one (an edit that gives a material another shader: the old material goes once the new one is
+    // drawn) kept the number of programs and the last one, so its compile time counted as what
+    // frames cost; a frame that only released one (an object with a material of its own deleted)
+    // changed the last one and counted as compiling
+    const s = session();
+    const c = pacedEngine(s);
+    const programs = c.gl.info.programs;
+    const replaced = {};
+    programs.push(replaced, {});
+    c.gl.onRender = () => {
+      // the new material's program, compiled when it is drawn, then the old one's released
+      programs.push({});
+      releaseProgram(c.gl, replaced);
+      c.gl.onRender = null;
+    };
+    c.e.requestRender();
+    frame(c.e);
+    expect(programs).toHaveLength(2);
+    c.finish(MSAA_OFF_FRAME_MS * 3);
+    expect(c.e.multisampling).toBe(true);
+    expect(slowFrameCompiled.value).toBe(true);
+    // a frame that only released a program compiled none: its time is what frames cost
+    // (multisampling goes off, and the fast frames after it bring it back)
+    programs.push({});
+    const deleted = programs[0];
+    c.gl.onRender = () => {
+      releaseProgram(c.gl, deleted);
+      c.gl.onRender = null;
+    };
+    c.e.invalidate();
+    frame(c.e);
+    expect(programs).toHaveLength(2);
+    c.finish(MSAA_OFF_FRAME_MS * 3);
+    expect(c.e.multisampling).toBe(false);
+    expect(slowFrameCompiled.value).toBe(false);
+    c.finish(MSAA_ON_FRAME_MS / 2);
+    c.change(MSAA_ON_FRAME_MS / 2);
+    c.finish(MSAA_ON_FRAME_MS / 2);
+    expect(c.e.multisampling).toBe(true);
+    // a program compiled in the frame's scene sync (an environment map made for the shading) counts
+    // too: its GPU work comes before the frame's renders
+    const sync = c.e.sync.bind(c.e);
+    vi.spyOn(c.e, 'sync').mockImplementation(() => {
+      sync();
+      c.gl.info.programs.push({});
+    });
+    c.e.invalidate();
+    frame(c.e);
+    vi.mocked(c.e.sync).mockRestore();
+    c.finish(MSAA_OFF_FRAME_MS * 3);
+    expect(c.e.multisampling).toBe(true);
+    expect(slowFrameCompiled.value).toBe(true);
+    // and a frame that compiled nothing is what frames cost
+    c.e.invalidate();
+    frame(c.e);
+    c.finish(MSAA_OFF_FRAME_MS * 3);
+    expect(c.e.multisampling).toBe(false);
+  });
+
+  it('draws pictures with the viewport’s multisampling: 4 samples while it has them, none while it does not', () => {
+    // regression: pictures always had 4 samples (8 asked for); software WebGL builds pipelines per
+    // sample count, so the first picture in a shading the viewport had drawn single-sampled built
+    // every material's pipelines again: 9.8–13.5 s for domino-cascade, no shader compiled. A
+    // shading drawn with the other count only (before the viewport's changed) keeps that one.
+    const samplesOf = (
+      e: ViewportEngine,
+      gl: RecordingRenderer,
+      opts: Parameters<ViewportEngine['renderPixels']>[0],
+    ) => {
+      const seen: number[] = [];
+      gl.onRender = (scene) => {
+        const target = (
+          gl as unknown as { getRenderTarget(): THREE.WebGLRenderTarget | null }
+        ).getRenderTarget();
+        if (scene === e.scene && gl.renders.at(-1)!.camera.layers.isEnabled(0))
+          seen.push(target?.samples ?? -1);
+      };
+      e.renderPixels(opts);
+      gl.onRender = null;
+      return seen.at(-1);
+    };
+    const light = pacedEngine(session());
+    expect(light.e.multisampling).toBe(true);
+    for (const shading of ['SOLID', 'RENDERED', null] as const)
+      expect(
+        samplesOf(light.e, light.gl, { useViewport: true, shading, width: 32, height: 16 }),
+        String(shading),
+      ).toBe(VIEWPORT_MSAA_SAMPLES);
+    const heavy = pacedEngine(scatterScene(400));
+    expect(heavy.e.multisampling).toBe(false);
+    for (const shading of ['SOLID', 'MATERIAL', null] as const)
+      expect(
+        samplesOf(heavy.e, heavy.gl, { useViewport: true, shading, width: 32, height: 16 }),
+        String(shading),
+      ).toBe(0);
+    // a final render (F12, render_image in the browser) keeps its 8 (as many as the GPU has)
+    expect(samplesOf(heavy.e, heavy.gl, { width: 32, height: 16 })).toBe(8);
+    // the light scene's viewport (Solid) drops its samples: Rendered, drawn by a picture with 4
+    // only, keeps them; Solid, drawn by the viewport with both, and Material Preview, not drawn
+    // yet, have the viewport's
+    const setMultisampling = (on: boolean) =>
+      (light.e as unknown as { setMultisampling(on: boolean): void }).setMultisampling(on);
+    const capture = (shading: 'SOLID' | 'MATERIAL' | 'RENDERED' | null) =>
+      samplesOf(light.e, light.gl, { useViewport: true, shading, width: 32, height: 16 });
+    setMultisampling(false);
+    light.wait(32);
+    expect(capture('RENDERED')).toBe(VIEWPORT_MSAA_SAMPLES);
+    expect(capture(null)).toBe(0);
+    expect(capture('MATERIAL')).toBe(0);
+    // and back: Material Preview, drawn without samples only, keeps none
+    setMultisampling(true);
+    light.wait(32);
+    expect(light.e.multisampling).toBe(true);
+    expect(capture('MATERIAL')).toBe(0);
+    expect(capture('RENDERED')).toBe(VIEWPORT_MSAA_SAMPLES);
+    expect(capture(null)).toBe(VIEWPORT_MSAA_SAMPLES);
   });
 });
 
@@ -1973,5 +2304,44 @@ describe('animated view changes (Blender smooth view)', () => {
     // looking straight down
     const look = new THREE.Vector3(0, 0, -1).transformDirection(m);
     expect(look.z).toBeCloseTo(-1, 9);
+  });
+
+  it('snap moves to the grid step of the view the frames show (transform gizmo, G with Ctrl)', () => {
+    // regression: the snap increment (1 m when the view is farther than 4 m, else 0.1 m) came from
+    // the view an animated change goes to, while the frames still showed the grid of another one
+    const { s, e, i, frameAt } = setup();
+    e.width = 800;
+    e.height = 600;
+    const cube = s.doc.listObjects().find((o) => o.type === 'MESH')!;
+    s.state.selectedIds = [cube.id];
+    s.state.activeId = cube.id;
+    s.view.tool.value = 'move';
+    s.view.snapping.value = true;
+    const near = clonePose(e.pose);
+    near.distance = 3;
+    e.setPose(near);
+    frameAt(16);
+    const gizmo = (i as unknown as { gizmo: { translationSnap: number | null } }).gizmo;
+    expect(gizmo.translationSnap).toBe(0.1);
+    // Frame All to a far view: its first frames still show the near one
+    const far = clonePose(near);
+    far.distance = 30;
+    e.setPose(far, true);
+    frameAt(32);
+    expect(e.shownPose.distance).toBeLessThan(4);
+    expect(gizmo.translationSnap).toBe(0.1);
+    // a G move with Ctrl snaps to that step too
+    const at = e.project(new THREE.Vector3(0, 0, 0));
+    const g = new ModalTransform(e, s, 'translate', { x: at.x, y: at.y });
+    g.update({ x: at.x + 37, y: at.y + 11 }, { ctrl: true, shift: false });
+    const moved = g.current.slice(12, 15);
+    expect(moved.some((v) => Math.abs(v) > 1e-9)).toBe(true);
+    for (const v of moved) expect(Math.abs(v * 10 - Math.round(v * 10))).toBeLessThan(1e-9);
+    expect(moved.some((v) => Math.abs(v - Math.round(v)) > 1e-9)).toBe(true);
+    g.finish(false);
+    // once there, the far view's step
+    frameAt(400);
+    expect(e.shownPose.distance).toBe(30);
+    expect(gizmo.translationSnap).toBe(1);
   });
 });

@@ -261,6 +261,24 @@ describe('Copy constraints', () => {
     expectVec(col(m, 0), col(owner, 0)); // rotation untouched
   });
 
+  it('reads a target within 0.00215° of Y ±90° as Blender does: in gimbal lock the last angle is 0', () => {
+    // Blender 4.1 and later (rotlike_evaluate, mat4_to_compatible_eulO with EULER_HYPOT_EPSILON)
+    // put X − Z (Y near 90°) or X + Z (near −90°) into X and set Z to 0 there, so copying only the Z
+    // angle of a target at [10°, 89.999°, 30°] copies 0; at 89.9° it copies 30°
+    const owner = identity4();
+    for (const [y, z] of [
+      [89.999, 0],
+      [-89.999, 0],
+      [89.9, 30],
+    ] as const) {
+      const ctx = ctxWith({ T: rotationFromEuler([10 * DEG, y * DEG, 30 * DEG]) });
+      const onlyZ = decompose4(
+        solve(con('COPY_ROTATION', { use_x: false, use_y: false }), owner, ctx).matrix,
+      );
+      expect(onlyZ.rotation[2] / DEG, `target Y ${y}°`).toBeCloseTo(z, 6);
+    }
+  });
+
   it('copies rotation with mix modes', () => {
     const owner = compose4([1, 2, 3], [0, 0, 0.5], [2, 2, 2]);
     const ctx = ctxWith({ T: target });

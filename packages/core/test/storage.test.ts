@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { MemoryFileStore, ProjectFileStore, SceneDoc, parseMultistatus, updateAddsToState } from '../src';
+import {
+  MemoryFileStore,
+  MissingFolderError,
+  ProjectFileStore,
+  SceneDoc,
+  parseMultistatus,
+  updateAddsToState,
+} from '../src';
 
 describe('ProjectFileStore', () => {
   it('merge-syncs two replicas through a shared store without losing edits', async () => {
@@ -52,6 +59,37 @@ describe('ProjectFileStore', () => {
   it('rejects invalid project ids', () => {
     const store = new ProjectFileStore(new MemoryFileStore());
     expect(() => store.docPath('../etc')).toThrow();
+  });
+
+  /*
+   * A failed listing used to list no projects: callers then took every project for deleted (the
+   * editor server hid the projects it had loaded, and browsers showed no WebDAV error).
+   */
+  it('reports a failed listing instead of listing no projects', async () => {
+    const fs = new MemoryFileStore();
+    const store = new ProjectFileStore(fs, '/3d');
+    expect(await store.listProjects()).toEqual([]); // no projects folder yet
+    fs.list = async () => {
+      throw new Error('storage offline');
+    };
+    await expect(store.listProjects()).rejects.toThrow('storage offline');
+  });
+});
+
+describe('MemoryFileStore', () => {
+  it('writes into a missing folder only when it may create folders', async () => {
+    const fs = new MemoryFileStore();
+    const data = new Uint8Array([1]);
+    await expect(fs.write('/a/b/f', data, { createFolders: false })).rejects.toThrow(MissingFolderError);
+    expect(await fs.read('/a/b/f')).toBeNull();
+    expect(await fs.list('/a')).toEqual([]);
+    await fs.write('/a/b/f', data); // creates them by default
+    // a folder that holds a file exists, as does one made with mkdirp
+    await fs.write('/a/b/g', data, { createFolders: false });
+    await fs.mkdirp('/c');
+    await fs.write('/c/f', data, { createFolders: false });
+    await fs.remove('/a');
+    await expect(fs.write('/a/b/f', data, { createFolders: false })).rejects.toThrow(MissingFolderError);
   });
 });
 

@@ -83,6 +83,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
             translation4([c[0] - pivot[0], c[1] - pivot[1], c[2] - pivot[2]]),
             pivot,
             'MEDIAN_POINT',
+            'TRANSLATE',
           );
           return;
         }
@@ -94,6 +95,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
             translation4([c[0] - w[12], c[1] - w[13], c[2] - w[14]]),
             [0, 0, 0],
             'MEDIAN_POINT',
+            'TRANSLATE',
           );
         }
       },
@@ -123,6 +125,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
             translation4([target[0] - w[12], target[1] - w[13], target[2] - w[14]]),
             [0, 0, 0],
             'MEDIAN_POINT',
+            'TRANSLATE',
           );
         }
       },

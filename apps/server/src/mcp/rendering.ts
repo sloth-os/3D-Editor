@@ -31,8 +31,8 @@ export const MAX_RENDER_FRAMES = 1000;
  * How long render_image waits for a RASTER image of a browser editor with renderer 'browser' (ms):
  * an editor without GPU acceleration (software WebGL, e.g. a headless browser) takes tens of
  * seconds for a heavy scene. Measured in headless Chromium with SwiftShader at the default 800×450:
- * the first image of a 71-material scene took 21.9–26.7 s, as it built and compiled the materials,
- * and the next ones 3.7–4.7 s; images of 4 million triangles took 4.6–10.2 s. Under the 60 s
+ * the first image of a 71-material scene took 21.9–29.9 s, as it built and compiled the materials,
+ * and the next ones 3.7–7.4 s; images of 4 million triangles took 4.5–13.3 s. Under the 60 s
  * default request timeout of MCP clients (see {@link MAX_EDITOR_WAIT_MS}).
  */
 export const BROWSER_RASTER_TIMEOUT_MS = MAX_EDITOR_WAIT_MS;

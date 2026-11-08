@@ -283,7 +283,8 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     'xray',
     'See through objects in Solid shading (Wireframe always does; Material Preview and Rendered draw them ' +
       'as they are); in Edit Mode the cage shows through and box selections and clicks on vertices or ' +
-      'edges also select hidden elements (Alt+Z).',
+      'edges also select hidden elements (a click on a face picks the front one). Selecting objects ' +
+      'works the same with it on or off (Alt+Z).',
   );
   toggle(
     'view3d.toggle_overlays',

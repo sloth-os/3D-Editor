@@ -24,6 +24,31 @@ const sep: MenuItem = { sep: true };
 const note = (label: string): MenuItem => ({ label, enabled: () => false });
 
 /**
+ * Why X-ray changes nothing in the viewport now (null when it does). Outside Edit Mode (where box
+ * selections and clicks on vertices or edges select hidden elements with it, in every shading),
+ * Material Preview and Rendered shading draw objects as they are, X-ray on or off, and Blender greys
+ * its X-ray button out there; Wireframe shading always sees through objects, and selecting objects
+ * ignores X-ray (Blender's Wireframe has an X-ray setting of its own, which hides the wires behind
+ * faces when off; this editor's has none). The setting stays as it is for Solid shading and for Edit
+ * Mode.
+ */
+export function xrayInactiveReason(shading: string, mode: string): string | null {
+  if (mode === 'EDIT') return null;
+  if (shading === 'WIREFRAME')
+    return (
+      'no effect in Wireframe shading outside Edit Mode: Wireframe always sees through objects here ' +
+      "(Blender's has an X-ray setting of its own); it sees through objects in Solid shading and " +
+      'through the mesh in Edit Mode'
+    );
+  if (shading !== 'MATERIAL' && shading !== 'RENDERED') return null;
+  const name = shading === 'MATERIAL' ? 'Material Preview' : 'Rendered';
+  return (
+    `no effect in ${name} shading outside Edit Mode, as in Blender: it sees through objects in Solid ` +
+    'shading (Wireframe always does) and through the mesh in Edit Mode'
+  );
+}
+
+/**
  * Operators that menus run with default parameters and whose result is usually tuned afterwards.
  * The web UI makes them redoable so they open the "Adjust Last Operation" panel, like their
  * Blender counterparts (registry overrides only change UI behaviour, not the operators).
@@ -239,6 +264,11 @@ export const VIEW_MENU = (): MenuItem[] => [
     op: 'view3d.toggle_xray',
     shortcut: 'Alt Z',
     checked: () => !!session.value?.view.xray.value,
+    // greyed out where it changes nothing (the header button and Alt+Z still toggle it there)
+    enabled: () => {
+      const s = session.value;
+      return !s || !xrayInactiveReason(s.view.shading.value, s.state.mode);
+    },
   },
   { label: 'Overlays', op: 'view3d.toggle_overlays', checked: () => !!session.value?.view.overlays.value },
   {

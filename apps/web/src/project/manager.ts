@@ -1,7 +1,7 @@
 import { SceneDoc, newUuid, type ProjectInfo } from '@3d-editor/core';
 import { localIndex } from './local-index';
 import { ProjectSession } from './session';
-import { resolveWebDAV } from '../storage/webdav';
+import { resolveWebDAV, syncRecords } from '../storage/webdav';
 import { serverConfig, session, toast } from '../app/store';
 import { apiUrl, authHeaders } from '../app/server-config';
 import { telemetry } from '../telemetry/telemetry';
@@ -88,7 +88,7 @@ export async function openProject(id: string): Promise<ProjectSession> {
   const prev = session.value;
   if (prev?.id === id) return prev;
   session.value = null;
-  prev?.close();
+  void prev?.close();
   const s = await ProjectSession.open(id);
   session.value = s;
   setProjectInUrl(id);
@@ -103,7 +103,7 @@ export async function createProject(
   telemetry.count('editor.project.created', 1, { empty: !!opts.empty });
   const prev = session.value;
   session.value = null;
-  prev?.close();
+  void prev?.close();
   const initial = SceneDoc.create({ name, empty: opts.empty, generator: `3d-editor-web ${__APP_VERSION__}` });
   const s = await ProjectSession.open(id, { initial });
   initial.destroy();
@@ -113,11 +113,18 @@ export async function createProject(
 }
 
 export async function deleteProject(entry: ProjectListEntry): Promise<void> {
-  if (session.value?.id === entry.id) closeProject();
+  // without a last sync, which could land after the deletion and store the project again; a sync
+  // that is running finishes first, for the same reason
+  if (session.value?.id === entry.id) await closeProject(false);
   await ProjectSession.deleteLocal(entry.id).catch(() => undefined);
   const target = resolveWebDAV();
-  if (target && entry.sources.includes('webdav'))
-    await target.store.deleteProject(entry.id).catch((e) => toast(`WebDAV delete failed: ${e}`, 'error'));
+  if (target) {
+    // before the deletion: other tabs of this browser that have the project open must not upload
+    // it as one they never synced (they keep the record of what they synced, too)
+    syncRecords.setDeleted(target, entry.id, true);
+    if (entry.sources.includes('webdav'))
+      await target.store.deleteProject(entry.id).catch((e) => toast(`WebDAV delete failed: ${e}`, 'error'));
+  }
   if (serverConfig.value && entry.sources.includes('server'))
     await fetch(apiUrl(`/api/projects/${entry.id}`), { method: 'DELETE', headers: authHeaders() }).catch(
       () => undefined,
@@ -125,11 +132,16 @@ export async function deleteProject(entry: ProjectListEntry): Promise<void> {
   telemetry.count('editor.project.deleted');
 }
 
-export function closeProject(): void {
+/**
+ * Closes the open project; `flush`: sync it to WebDAV a last time (default). Resolves once WebDAV
+ * syncing has stopped.
+ */
+export function closeProject(flush = true): Promise<void> {
   const s = session.value;
   session.value = null;
-  s?.close();
+  const stopped = s?.close(flush) ?? Promise.resolve();
   setProjectInUrl(null);
+  return stopped;
 }
 
 function setProjectInUrl(id: string | null): void {

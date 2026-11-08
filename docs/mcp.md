@@ -508,7 +508,7 @@ runs it in a live editor (– : no counterpart among the tools):
 | `wm.preferences`, `wm.call_menu`                                                                                                                                                       | –                                                                                                                                                 | Open the Preferences window or a popup menu on the person's screen                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `wm.save_mainfile`                                                                                                                                                                     | Nothing: the server stores projects itself                                                                                                        | Makes that editor sync its WebDAV copy at once if it has one (its copy in the browser is always up to date) and shows the person a "Saved" message                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `view3d.view_all`, `view3d.view_selected`, `view3d.view_axis`, `view3d.view_camera`, `view3d.view_orbit`, `view3d.view_persportho`, `view3d.zoom`                                      | – (`render_image` takes a `view` for any viewpoint)                                                                                               | Change the person's view: `view3d.view_all`, `view3d.view_selected`, `view3d.view_axis` and `view3d.zoom` out of the camera view, `view3d.view_camera` into or out of it (it fails without a scene camera), and in the camera view `view3d.view_orbit` and `view3d.view_persportho` change only the view the person gets back when they leave it (`editor_command` `view.frame_all` and `view.frame_selected` do what `view3d.view_all` and `view3d.view_selected` do, and `view.set_view` what `view3d.view_axis` and `view3d.view_camera` do, but `view.set_view {view: "CAMERA"}` never leaves the camera view) |
-| `view3d.toggle_xray`, `view3d.toggle_overlays`, `view3d.toggle_sidebar`, `view3d.toggle_toolbar`, `view3d.toggle_wireframe_overlay`, `view3d.toggle_snapping`, `view3d.toggle_shading` | –                                                                                                                                                 | Change that editor's display: X-ray (see-through objects in Solid shading only; in Edit Mode the cage shows through and the person's box selections and vertex and edge clicks also select hidden elements), overlays, sidebar, tool bar, wireframe overlay, snapping of the person's transforms, viewport shading (`editor_command` `view.shading` sets it)                                                                                                                                                                                                                                                       |
+| `view3d.toggle_xray`, `view3d.toggle_overlays`, `view3d.toggle_sidebar`, `view3d.toggle_toolbar`, `view3d.toggle_wireframe_overlay`, `view3d.toggle_snapping`, `view3d.toggle_shading` | –                                                                                                                                                 | Change that editor's display: X-ray (see-through objects in Solid shading only; in Edit Mode the cage shows through and the person's box selections and vertex and edge clicks also select hidden elements, while a face click picks the front face; selecting objects works the same with it on or off), overlays, sidebar, tool bar, wireframe overlay, snapping of the person's transforms, viewport shading (`editor_command` `view.shading` sets it)                                                                                                                                                          |
 | `wm.tool_set`, `screen.workspace_set`                                                                                                                                                  | –                                                                                                                                                 | Change the person's active tool (what their mouse does) or workspace layout (Shading also switches their viewport to Material Preview)                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 Two of the messages (one line each):
@@ -877,8 +877,8 @@ answered its last raster image (of the same shading: `SOLID` is judged apart) af
 stopped waiting, or took longer than the 15 s `auto` waits, is not asked by `auto` for 2 minutes
 after that image either, so that `auto` does not wait 15 s in vain for each render of an editor that
 stays that slow: in software WebGL a raster image can take longer than `auto` waits (in a headless
-editor at the default 800×450, the first image of a 71-material scene took 21.9–26.7 s while it
-compiled the materials, and the next ones 3.7–4.7 s; images of 4 million triangles took 4.6–10.2 s).
+editor at the default 800×450, the first image of a 71-material scene took 21.9–29.9 s while it
+compiled the materials, and the next ones 3.7–7.4 s; images of 4 million triangles took 4.5–13.3 s).
 A faster answer (`renderer: "browser"`, which waits longer) makes `auto` use the editor again at
 once. The notes and the error of a raster image that timed out (one line each):
 
@@ -1011,20 +1011,20 @@ when no editor is connected), then fails when no editor is connected ("No browse
 UI commands is connected … Open _editor_url_ in a browser"), and when the editor's connection to the
 project closes before it answers (see `run_operator` below). Commands:
 
-| Command               | Params                                                                                                                            | Effect                                                                                                                                                                                                 |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `view.frame_all`      | –                                                                                                                                 | Frame every visible object in the viewport, out of the camera view                                                                                                                                     |
-| `view.frame_selected` | –                                                                                                                                 | Frame the editor's selection, out of the camera view: its selected objects (every visible one when none is selected), in Edit Mode the selected vertices of its active mesh (all of them when none is) |
-| `view.set_view`       | `view` (or `type`): `FRONT`, `BACK`, `RIGHT`, `LEFT`, `TOP`, `BOTTOM`, `CAMERA`                                                   | Align the viewport                                                                                                                                                                                     |
-| `view.shading`        | `shading` (or `type`): `WIREFRAME`, `SOLID`, `MATERIAL`, `RENDERED`                                                               | Viewport shading                                                                                                                                                                                       |
-| `select`              | `objects`                                                                                                                         | Set **that editor's** selection                                                                                                                                                                        |
-| `set_mode`            | `mode`                                                                                                                            | Switch that editor's mode (`OBJECT`, `EDIT`, `SCULPT`, `VERTEX_PAINT`)                                                                                                                                 |
-| `set_frame`           | `frame`                                                                                                                           | Set that editor's current frame                                                                                                                                                                        |
-| `play`                | `playing` (default true)                                                                                                          | Start or stop playback                                                                                                                                                                                 |
-| `notify`              | `message`                                                                                                                         | Show a message to the user                                                                                                                                                                             |
-| `run_operator`        | `operator`, `params`                                                                                                              | Run an operator in that editor, with its selection and its undo history (also UI-only operators)                                                                                                       |
-| `screenshot`          | `width`, `height` (whole pixels, 16–4096; default: the viewport size), `shading` (as for `view.shading`; default: the viewport's) | A PNG of the viewport as the person sees it (returned as an image), see below                                                                                                                          |
-| `get_view`            | –                                                                                                                                 | The viewport's target, distance, yaw, pitch, orthographic flag and camera view state; during an animated view change (`view.set_view`, `view.frame_all`, `view.frame_selected`) the view it ends on    |
+| Command               | Params                                                                                                                            | Effect                                                                                                                                                                                                                                          |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `view.frame_all`      | –                                                                                                                                 | Frame every visible object in the viewport, out of the camera view                                                                                                                                                                              |
+| `view.frame_selected` | –                                                                                                                                 | Frame the editor's selection, out of the camera view: its selected objects (every visible one when none is selected), in Edit Mode the selected vertices of its active mesh (all of them when none is)                                          |
+| `view.set_view`       | `view` (or `type`): `FRONT`, `BACK`, `RIGHT`, `LEFT`, `TOP`, `BOTTOM`, `CAMERA`                                                   | Align the viewport                                                                                                                                                                                                                              |
+| `view.shading`        | `shading` (or `type`): `WIREFRAME`, `SOLID`, `MATERIAL`, `RENDERED`                                                               | Viewport shading                                                                                                                                                                                                                                |
+| `select`              | `objects`                                                                                                                         | Set **that editor's** selection                                                                                                                                                                                                                 |
+| `set_mode`            | `mode`                                                                                                                            | Switch that editor's mode (`OBJECT`, `EDIT`, `SCULPT`, `VERTEX_PAINT`)                                                                                                                                                                          |
+| `set_frame`           | `frame`                                                                                                                           | Set that editor's current frame                                                                                                                                                                                                                 |
+| `play`                | `playing` (default true)                                                                                                          | Start or stop playback                                                                                                                                                                                                                          |
+| `notify`              | `message`                                                                                                                         | Show a message to the user                                                                                                                                                                                                                      |
+| `run_operator`        | `operator`, `params`                                                                                                              | Run an operator in that editor, with its selection and its undo history (also UI-only operators)                                                                                                                                                |
+| `screenshot`          | `width`, `height` (whole pixels, 16–4096; default: the viewport size), `shading` (as for `view.shading`; default: the viewport's) | A PNG of the viewport as the person sees it (returned as an image), see below                                                                                                                                                                   |
+| `get_view`            | –                                                                                                                                 | The viewport's target, distance, yaw, pitch, orthographic flag and camera view state; while the viewport animates a view change (an axis view, an orbit step or framing, asked for by a command, an operator or the person) the view it ends on |
 
 Enum values are case-insensitive. Unknown commands and misspelled parameter names are refused by the
 server, and so are invalid values of `screenshot` (a `width` or `height` that is not a whole number
@@ -1079,61 +1079,83 @@ until the new one has been drawn in every shading the old one was drawn in, so t
 old one's shader when they need the same one: an edit of values (colours, roughness, the type and
 settings of a procedural texture) compiles nothing, and an edit that needs a shader no material had
 (coat or sheen turned on, procedural textures on a set of channels that no other material has)
-compiles it for the next screenshot or frame in each of these shadings. Without GPU acceleration
-(software WebGL, as in a headless browser) the first time takes tens of seconds for a heavy scene,
-and compiling one shader seconds.
+compiles it for the next screenshot or frame in each of these shadings. A screenshot is drawn with
+the viewport's anti-aliasing: 4× multisampling, which the viewport turns off for a scene of more
+than a million drawn triangles and after a frame whose scene and overlays took more than a second to
+draw (its full-screen passes, such as selection outlines, do not count, nor do frames that build
+shaders or their pipelines or that a screenshot held up), until drawing them takes less than 125 ms;
+a shading (with X-ray on or off) drawn before only with the other sample count is drawn with that
+one. So a screenshot in a shading the editor has drawn (in `SOLID` with the same X-ray setting)
+compiles nothing, unless a material edit needs a shader no material had; it costs a frame of that
+shading at the screenshot's size and work of its own: it waits for the frames the GPU still draws
+for the viewport, prepares the scene for its shading, reads the pixels back and encodes a PNG.
+Without GPU acceleration (software WebGL, as in a headless browser) the first time takes tens of
+seconds for a heavy scene, and compiling one shader seconds, more for a material with procedural
+textures.
 
 Measured in such an editor (headless Chromium with SwiftShader, a scene of 81 objects and 71
-materials, 1280×720 screenshots, each case in two or more runs; the times vary with the machine's
-load), with the viewport in `SOLID`: the first `MATERIAL` or `RENDERED` screenshot took 18.8–24.7 s,
-also when the other had been drawn before, and the next ones 0.9–1.2 s; `SOLID` and `WIREFRAME`
-screenshots took 0.6–0.9 s, and `render_image` with `shading: "SOLID"` (grey clay; rendered on the
-server, as the scene's render engine was `PATHTRACER`) 1.7–3.6 s. Switching the viewport to
-`MATERIAL` or `RENDERED` the first time took 18.5–26.4 s until its first frame was drawn;
-screenshots in its shading then took 0.9–2.2 s, the first one in the other of the two 18.8–25.5 s
-and the next ones 1.3–1.9 s, and `SOLID` or `WIREFRAME` ones 0.9–1.2 s. After roughness edits of the
-table, the dowels, the floor, the glass marble and two plastics, the next screenshots in both
-shadings took 0.8–3.1 s, in either order and with the viewport in any shading, and no shader was
-compiled. After edits that needed a new shader (coat or sheen turned on, a `NOISE` or `VORONOI`
-texture on a channel that no material had textured), the viewport in `MATERIAL` or `RENDERED` had
-drawn the change 0.9–2.2 s after the edit, and the first screenshot in the other of the two took
-1.4–3.6 s; with the viewport in `SOLID`, the first screenshot in each of the two took 1.0–3.6 s. A
-screenshot waits until the frame the viewport is drawing is done, also a `SOLID` or `WIREFRAME` one,
-so one sent while the viewport draws such a change or its first frame in a shading takes up to that
-frame's time longer. X-ray changes nothing in `MATERIAL` or `RENDERED` shading outside Edit Mode:
-the viewport's next frame took 0.4–1.2 s, and no shader was compiled. A scene of millions of
-triangles takes seconds per frame in any shading: with 4 million triangles and the viewport in
-`SOLID`, a screenshot without `shading` or with `shading: "SOLID"` took 5.5–8.9 s, a `WIREFRAME` one
-6.7–15.4 s, and the first `MATERIAL` and `RENDERED` ones 8.2–9.2 s (6.1–7.4 s later). The other
-commands draw nothing themselves, but wait while the editor's main thread is busy: for 4.6–6.2 s
-after the viewport switched to `MATERIAL` or `RENDERED` for the first time (while it builds the
-scene's materials; the rest of that frame holds up only screenshots), for the whole of a screenshot
-it draws, and with 4 million triangles for each frame it draws (a `select` took 2.5–3.5 s there, and
-a `get_view` sent during a `select` or a screenshot waited until it was done: up to 8.5 s). An
-editor that was not busy answered a `get_view` in milliseconds.
+materials, 1280×720 screenshots, each case in two or more runs at load averages from 0.4 to 6.7 on 4
+CPUs; the times vary with the machine's load), with the viewport in `SOLID`: the first `MATERIAL` or
+`RENDERED` screenshot took 18.8–27.0 s, also when the other had been drawn before, and the next ones
+0.9–1.4 s; `SOLID` and `WIREFRAME` screenshots took 0.5–1.0 s, and `render_image` with
+`shading: "SOLID"` (grey clay; rendered on the server, as the scene's render engine was
+`PATHTRACER`) 1.7–3.6 s. Switching the viewport to `MATERIAL` or `RENDERED` the first time took
+18.5–30.6 s until its first frame was drawn; screenshots in its shading then took 0.9–2.9 s, the
+first one in the other of the two 18.8–25.8 s and the next ones 1.3–2.8 s, and `SOLID` or
+`WIREFRAME` ones 0.9–2.0 s. After roughness edits of the table, the dowels, the floor, the glass
+marble and two plastics, the next screenshots in both shadings took 0.8–3.8 s, in either order and
+with the viewport in any shading, and no shader was compiled. After edits that needed a new shader
+(coat or sheen turned on for a plastic, a `NOISE` or `VORONOI` texture on a channel that no material
+had textured), the viewport in `MATERIAL` or `RENDERED` had drawn the change 0.6–4.5 s after the
+edit, and the first screenshot in the other of the two took 1.4–3.8 s; with the viewport in `SOLID`,
+the first screenshot in each of the two took 1.0–3.8 s. Turning sheen on took 10.8–12.9 s in each of
+the two shadings for the table's material, whose colour, roughness and bump are `BRICK` and `WAVE`
+textures, 8.3–11.4 s for the dowels' (`WOOD` on colour and bump) and 2.1–3.2 s for the floor's
+(`BRICK` on its colour). A screenshot waits until the frame the viewport is drawing is done, also a
+`SOLID` or `WIREFRAME` one, so one sent while the viewport draws such a change or its first frame in
+a shading takes up to that frame's time longer. X-ray changes nothing in `MATERIAL` or `RENDERED`
+shading outside Edit Mode: the viewport's next frame took 0.4–1.7 s, and no shader was compiled.
+With a grid of a million triangles added to the scene, the viewport drew without multisampling from
+the start: its first `MATERIAL` or `RENDERED` frame took 12.3–14.8 s, and the next two screenshots
+in that shading 1.2–3.3 s; after a 2600×1700 viewport had turned multisampling off, its first
+`MATERIAL` frame back at 1400×860 took 12.0–15.3 s and the next two screenshots 0.4–1.3 s. A scene
+of millions of triangles takes seconds per frame in any shading: with 4 million triangles and the
+viewport in `SOLID` (without multisampling), a screenshot without `shading` or with
+`shading: "SOLID"` took 3.3–5.2 s, a `WIREFRAME` one 4.1–11.9 s, and the first `MATERIAL` and
+`RENDERED` ones 5.5–8.0 s (3.3–6.0 s later). The other commands draw nothing themselves, but wait
+while the editor's main thread is busy: for 4.0–6.2 s after the viewport switched to `MATERIAL` or
+`RENDERED` for the first time (while it builds the scene's materials; the rest of that frame holds
+up only screenshots), for the whole of a screenshot it draws, and with 4 million triangles for each
+frame it draws (a `select` took 2.5–3.8 s there, and a `get_view` sent during a `select` or a
+screenshot waited until it was done: up to 6.4 s). An editor that was not busy answered a `get_view`
+in milliseconds.
 
 The editor finishes a command the server stopped waiting for, and keeps what a screenshot compiled:
-a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 17.7–19.8 s later
-(the rest of the first one, then one frame), and the next one in 1.2–1.5 s. With the default
-`timeout_ms` a first `MATERIAL` screenshot and its first retry timed out, and the second retry
-answered in 2.1–4.3 s. After an edit that needed a new shader, `RENDERED` and `MATERIAL` screenshots
-with `timeout_ms: 1000` timed out, and their retries answered in 1.3–2.3 s. When the editor does not
-answer in time the error says so and what to do (one line each):
+a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 17.7–20.9 s later
+(the rest of the first one, then a screenshot that compiled nothing), and the next one in 1.0–1.7 s.
+With the default `timeout_ms` a first `MATERIAL` screenshot and its first retry timed out, and the
+second retry answered in 2.1–6.3 s. After an edit that needed a new shader, `RENDERED` and
+`MATERIAL` screenshots with `timeout_ms: 1000` timed out, and their retries answered in 1.0–3.0 s;
+after sheen was turned on for the table's or the dowels' material, the first screenshot in a shading
+with the default `timeout_ms` timed out, and its retry answered in 0.8–1.4 s. When the editor does
+not answer in time the error says so and what to do (one line each):
 
 ```text
 editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most
 55000); it may still carry the command out, and its next commands and renders wait until it has. The
 screenshot is drawn in the viewport's shading, like a frame of the viewport. An editor without GPU
 acceleration (software WebGL, e.g. a headless browser) takes seconds for that with a scene of
-millions of triangles in any shading (5.5–8.9 s in SOLID with 4 million) and with a heavy scene in
+millions of triangles in any shading (3.3–5.2 s in SOLID with 4 million) and with a heavy scene in
 MATERIAL or RENDERED shading, and tens of seconds for its first screenshot or frame in one of these
 two after it opened the project, while it builds and compiles the scene's materials for that
 shading. After a material edit that needs a shader no material had (coat or sheen turned on, a
 procedural texture on a set of channels that no other material has), its next screenshot or frame in
-each of these two compiles it (0.9–3.6 s measured). It keeps what it compiled, so a retry waits for
-the editor to finish and then takes about one frame. Retry with a larger timeout_ms (at most 55000),
-or pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use
-render_image with shading 'SOLID', and render_image for final images.
+each of these two compiles it (0.6–4.5 s, or up to 12.9 s for a material with several procedural
+textures). The times given were measured in software WebGL and vary with the machine's load. It
+keeps what it compiled, so a retry waits for the editor to finish and compiles nothing again. Retry
+with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot (grey clay,
+much faster); for a quick look use render_image with shading 'SOLID', and render_image for final
+images.
 
 editor_command 'select' failed: the editor did not answer within timeout_ms = 10000 ms (at most
 55000); it may still carry the command out, and its next commands and renders wait until it has.
@@ -1148,9 +1170,13 @@ A screenshot with `shading` `MATERIAL` or `RENDERED` says the same about that sh
 `shading` `SOLID` or `WIREFRAME` says that a scene with millions of triangles takes seconds even
 then, that a screenshot waits until the frame its viewport is drawing is done, which in `MATERIAL`
 or `RENDERED` shading compiles shaders the first time after the editor opened the project and after
-a material edit that needs a shader no material had (0.9–3.6 s measured), and that a retry then
-takes about one frame, and advises a retry with a larger `timeout_ms` or `render_image` with
-`renderer: "software"`, which renders without the editor. At the maximum the advice starts with
+a material edit that needs a shader no material had (0.6–4.5 s, or up to 12.9 s for a material with
+several procedural textures; the times given were measured in software WebGL and vary with the
+machine's load), and that a retry then compiles nothing again, and advises a retry with a larger
+`timeout_ms` or `render_image` with `shading: "SOLID"` and `renderer: "software"` (grey clay,
+rendered on the server without the editor, which can run out of memory for millions of triangles:
+that render took 2.2–2.5 s with a grid of a million triangles added to the scene, and ran out of
+memory after 17.4–21.4 s with a grid of 2 million triangles). At the maximum the advice starts with
 "With timeout_ms at its maximum (55000), …" instead of a larger `timeout_ms`. When the editor was
 still busy with an earlier request that the server had stopped waiting for (a screenshot or render
 that timed out), the error names it after the first sentence ("It was still busy with an earlier
