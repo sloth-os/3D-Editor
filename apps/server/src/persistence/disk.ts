@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { constants as fsConstants, promises as fs, type Stats } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import {
   PreconditionFailedError,
@@ -28,9 +29,13 @@ const TEMP_RE = /^\..+\.[0-9a-f]{12}\.tmp$/;
  *   renamed over the target, so readers never observe partial files.
  * - Conditional writes (If-Match / If-None-Match) are checked under a per-path lock, which
  *   makes them reliable within this process (the server is the only writer of its data dir).
- * - Every write produces a new ETag (the mtime is nudged if the clock did not advance).
+ * - Every write produces a new ETag: each version of a file gets a later mtime than the one it
+ *   replaces (nudged by 1 ms when the clock did not advance), set before it is renamed into place.
+ * - A read reports the ETag of the file it read: content and ETag come from one open file, which
+ *   no write changes (writes replace the file).
  */
 export class DiskFileStore implements FileStore {
+  readonly atomicConditionalWrites = true;
   readonly root: string;
   private readonly locks = new Map<string, Promise<unknown>>();
 
@@ -100,16 +105,28 @@ export class DiskFileStore implements FileStore {
 
   async read(p: string): Promise<{ data: Uint8Array; etag?: string } | null> {
     const file = this.resolve(p);
+    let fh: FileHandle;
     try {
-      // stat after reading: if a concurrent rename happened in between, the ETag is newer than
-      // the data, which makes a later If-Match fail safely (never the other way round).
-      const data = await fs.readFile(file);
-      const st = await fs.stat(file);
-      return { data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), etag: etagFor(st) };
+      fh = await fs.open(file, 'r');
     } catch (err) {
       if (isNotFound(err) || (err as NodeJS.ErrnoException).code === 'EISDIR') return null;
       throw err;
     }
+    try {
+      // stat and content of the same open file: a write renamed over the path meanwhile replaces
+      // the directory entry, not this file, so the ETag is the one of the content read
+      const st = await fh.stat();
+      if (!st.isFile()) return null;
+      const data = await fh.readFile();
+      return { data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), etag: etagFor(st) };
+    } finally {
+      await fh.close();
+    }
+  }
+
+  async etag(p: string): Promise<string | null> {
+    const st = await this.statOrNull(this.resolve(p));
+    return st ? etagFor(st) : null;
   }
 
   async write(p: string, data: Uint8Array, opts: WriteOptions = {}): Promise<{ etag?: string }> {
@@ -121,6 +138,7 @@ export class DiskFileStore implements FileStore {
       const dir = path.dirname(file);
       await fs.mkdir(dir, { recursive: true });
       const tmp = path.join(dir, `.${path.basename(file)}.${randomBytes(6).toString('hex')}.tmp`);
+      let st: Stats;
       try {
         const fh = await fs.open(tmp, 'w');
         try {
@@ -129,17 +147,21 @@ export class DiskFileStore implements FileStore {
         } finally {
           await fh.close();
         }
+        st = await fs.stat(tmp);
+        // The clock did not advance (or went back): a later mtime keeps every version's ETag new,
+        // also for a version of the same size as one before the previous one. Set before the
+        // rename, so that the file never shows up with another version's ETag. In seconds, not a
+        // Date (whole milliseconds, which the conversion to the file's time can round down to the
+        // previous value); 1 s more on file systems with coarser times.
+        for (const step of [1, 1000]) {
+          if (!cur || st.mtimeMs > cur.mtimeMs) break;
+          await fs.utimes(tmp, st.atime, (cur.mtimeMs + step) / 1000);
+          st = await fs.stat(tmp);
+        }
         await fs.rename(tmp, file);
       } catch (err) {
         await fs.rm(tmp, { force: true }).catch(() => undefined);
         throw err;
-      }
-      let st = await fs.stat(file);
-      if (cur && etagFor(st) === etagFor(cur)) {
-        // Same size and the clock did not tick: bump the mtime so the ETag changes.
-        const bumped = new Date(Math.floor(cur.mtimeMs) + 1);
-        await fs.utimes(file, st.atime, bumped);
-        st = await fs.stat(file);
       }
       return { etag: etagFor(st) };
     });

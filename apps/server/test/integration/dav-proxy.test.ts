@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { ProjectFileStore, SceneDoc, WebDAVClient, newUuid } from '@3d-editor/core';
+import { PreconditionFailedError, ProjectFileStore, SceneDoc, WebDAVClient, newUuid } from '@3d-editor/core';
 import { api, startServer, type TestServer } from '../helpers/app';
 import { mkcolPath, startWebDAV, type TestWebDAV } from '../helpers/webdav';
 
@@ -10,7 +10,8 @@ let server: TestServer;
 const TOKEN = 'proxy-token';
 
 beforeAll(async () => {
-  dav = await startWebDAV({ username: 'bob', password: 'hunter2' });
+  // like Nextcloud: ETags with GET, HEAD and PUT responses, If-Match and If-None-Match checked
+  dav = await startWebDAV({ username: 'bob', password: 'hunter2', etagHeaders: true, conditional: true });
   await mkcolPath(dav, '/users/bob smith');
   server = await startServer({
     WEBDAV_URL: `${dav.origin}/users/bob%20smith`,
@@ -82,6 +83,28 @@ describe('WebDAV proxy', () => {
 
     await client.remove('/3d-editor/projects/demo/hello.txt');
     expect(await client.read('/3d-editor/projects/demo/hello.txt')).toBeNull();
+  });
+
+  it('passes ETags and conditional writes through', async () => {
+    const client = proxiedClient();
+    await client.mkdirp('/3d-editor/projects/etags');
+    const path = '/3d-editor/projects/etags/doc.bin';
+    const first = await client.write(path, new Uint8Array([1]), { ifNoneMatch: '*' });
+    expect(first.etag).toMatch(/^"w\d+"$/);
+    expect((await client.read(path))!.etag).toBe(first.etag);
+    expect(await client.etag(path)).toBe(first.etag);
+    const second = await client.write(path, new Uint8Array([2]), { ifMatch: first.etag });
+    expect(second.etag).not.toBe(first.etag);
+    // a write based on the first version, and a create of an existing file, are refused (412)
+    await expect(client.write(path, new Uint8Array([3]), { ifMatch: first.etag })).rejects.toBeInstanceOf(
+      PreconditionFailedError,
+    );
+    await expect(client.write(path, new Uint8Array([3]), { ifNoneMatch: '*' })).rejects.toBeInstanceOf(
+      PreconditionFailedError,
+    );
+    const now = (await client.read(path))!;
+    expect([...now.data]).toEqual([2]);
+    expect(now.etag).toBe(second.etag);
   });
 
   it('rewrites PROPFIND hrefs to the /dav namespace', async () => {

@@ -28,7 +28,8 @@ export function NavGizmo({ engine }: { engine: ViewportEngine }) {
       if (!g) return;
       g.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
       g.clearRect(0, 0, size, size);
-      const { right, up, back } = poseBasis(engine.pose);
+      // the view of the frame drawn (on the way to engine.pose while an animated view change runs)
+      const { right, up, back } = poseBasis(engine.shownPose);
       const cx = size / 2;
       const cy = size / 2;
       const r = 32;

@@ -113,13 +113,19 @@ describe('disk persistence', () => {
 });
 
 describe('WebDAV persistence', () => {
+  /** Like webdav-server itself: no ETag with GET or PUT, If-Match ignored. */
   let dav: TestWebDAV;
+  /** Like Nextcloud: ETags with GET and PUT, If-Match and If-None-Match checked. */
+  let checking: TestWebDAV;
   beforeAll(async () => {
     dav = await startWebDAV();
     await mkcolPath(dav, '/files/alice');
+    checking = await startWebDAV({ etagHeaders: true, conditional: true });
+    await mkcolPath(checking, '/files/alice');
   });
   afterAll(async () => {
     await dav.stop();
+    await checking.stop();
   });
 
   it('stores projects at <base>/projects/<id>/document.ybin on the WebDAV server', async () => {
@@ -175,41 +181,45 @@ describe('WebDAV persistence', () => {
     expect(list.body.projects.map((p: { id: string }) => p.id)).toContain(id);
   });
 
-  it('keeps two servers sharing one WebDAV storage in sync (CRDT merge + refresh)', async () => {
-    const env = {
-      WEBDAV_URL: `${dav.origin}/files/alice`,
-      WEBDAV_USERNAME: dav.username,
-      WEBDAV_PASSWORD: dav.password,
-      WEBDAV_BASE_PATH: '/shared',
-      PERSIST_DEBOUNCE_MS: '20',
-    };
-    const one = await startServer(env, { refreshIntervalMs: 100 });
-    const two = await startServer(env, { refreshIntervalMs: 100 });
-    cleanup.push(
-      () => one.cleanup(),
-      () => two.cleanup(),
-      () => one.close(),
-      () => two.close(),
-    );
-    const created = await api(one.url, '/api/projects', { method: 'POST', json: { name: 'Two servers' } });
-    const id = created.body.id as string;
-    const a = new SyncTestClient({ baseUrl: one.url, projectId: id, name: 'On server one' });
-    const b = new SyncTestClient({ baseUrl: two.url, projectId: id, name: 'On server two' });
-    cleanup.push(
-      () => a.destroy(),
-      () => b.destroy(),
-    );
-    await a.connect();
-    await b.connect();
-    expect(b.scene.name).toBe('Two servers');
-    a.scene.addObject({ type: 'EMPTY', name: 'Made on one' });
-    b.scene.addObject({ type: 'EMPTY', name: 'Made on two' });
-    await eventually(
-      () => a.scene.findObjectByName('Made on two') && b.scene.findObjectByName('Made on one'),
-      10_000,
-      'cross-server convergence',
-    );
-  });
+  it.each(['ignores If-Match', 'checks If-Match'] as const)(
+    'keeps two servers sharing one WebDAV storage in sync (CRDT merge + refresh), server %s',
+    async (kind) => {
+      const shared = kind === 'checks If-Match' ? checking : dav;
+      const env = {
+        WEBDAV_URL: `${shared.origin}/files/alice`,
+        WEBDAV_USERNAME: shared.username,
+        WEBDAV_PASSWORD: shared.password,
+        WEBDAV_BASE_PATH: '/shared',
+        PERSIST_DEBOUNCE_MS: '20',
+      };
+      const one = await startServer(env, { refreshIntervalMs: 100 });
+      const two = await startServer(env, { refreshIntervalMs: 100 });
+      cleanup.push(
+        () => one.cleanup(),
+        () => two.cleanup(),
+        () => one.close(),
+        () => two.close(),
+      );
+      const created = await api(one.url, '/api/projects', { method: 'POST', json: { name: 'Two servers' } });
+      const id = created.body.id as string;
+      const a = new SyncTestClient({ baseUrl: one.url, projectId: id, name: 'On server one' });
+      const b = new SyncTestClient({ baseUrl: two.url, projectId: id, name: 'On server two' });
+      cleanup.push(
+        () => a.destroy(),
+        () => b.destroy(),
+      );
+      await a.connect();
+      await b.connect();
+      expect(b.scene.name).toBe('Two servers');
+      a.scene.addObject({ type: 'EMPTY', name: 'Made on one' });
+      b.scene.addObject({ type: 'EMPTY', name: 'Made on two' });
+      await eventually(
+        () => a.scene.findObjectByName('Made on two') && b.scene.findObjectByName('Made on one'),
+        10_000,
+        'cross-server convergence',
+      );
+    },
+  );
 
   it('reports unreachable storage on /readyz', async () => {
     const server = await startServer({

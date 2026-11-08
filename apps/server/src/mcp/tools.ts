@@ -99,6 +99,7 @@ import {
   editorCommandList,
   editorTimeoutMessage,
 } from './editor-commands';
+import { NEW_SHADER_SECONDS } from './editor-costs';
 import { isCancelled, type AnimationOutput, type FrameOptions, type Renderer } from '../render';
 import type { RenderStore, StoredFile } from '../render/store';
 import {
@@ -353,30 +354,42 @@ function vertModeSelects(lists: readonly MeshList[]): string {
 }
 
 /**
- * The refusal of a mesh selection `sel` whose lists `ignored` (of its non-empty `lists`) select mode
- * `mode` (EDGE or FACE) does not select from, with the remedies for these lists: listing what `mode`
- * selects, the mode that selects them, which leaving select_mode out infers (inferSelectMode: FACE
- * for faces alone, EDGE for edges alone, else VERT), and VERT, which selects the vertices of every
- * list.
+ * The refusal of a mesh selection `sel` whose element lists (`lists`, not empty) cannot be selected
+ * as asked, or null when they can: lists `ignored` that select mode `mode` (EDGE or FACE) does not
+ * select from, `all: true` (every element, which the lists would not change), or both in one
+ * message. The remedies for ignored lists: listing what `mode` selects, the mode that selects them,
+ * which leaving select_mode out infers (inferSelectMode: FACE for faces alone, EDGE for edges alone,
+ * else VERT), and VERT, which selects the vertices of every list; for `all: true`: leaving all out,
+ * or the lists. Every remedy it names is a call the server accepts as it is: with both problems
+ * each remedy for the lists also leaves all out, since a call that kept all: true would be refused
+ * again.
  */
-function ignoredListsMessage(
+function listsRefusal(
   mode: SelectMode,
   sel: z.infer<typeof meshSelectionSchema>,
   lists: readonly MeshList[],
   ignored: readonly MeshList[],
-): string {
+): string | null {
+  const all = sel.all === true;
+  if (!ignored.length)
+    return all
+      ? `all: true selects every element, so the listed ${andList(lists)} would change nothing: leave all ` +
+          'out to select only the listed elements, or leave the lists out to select everything'
+      : null;
   const used = mode === 'FACE' ? 'faces' : 'edges';
   const inferred = inferSelectMode(sel);
+  const andAll = all ? 'leave all out and ' : '';
   const remedies = [
-    lists.includes(used) ? `list only ${used}` : `list ${used} instead`,
-    inferred === 'VERT'
-      ? `leave select_mode out (or pass 'VERT') to select ${vertModeSelects(lists)}`
-      : `leave select_mode out (or pass '${inferred}') to select the listed ${andList(lists)}`,
-    ...(inferred === 'VERT' ? [] : [`pass 'VERT' to select ${vertModeSelects(lists)}`]),
+    `${andAll}${lists.includes(used) ? `list only ${used}` : `list ${used} instead`}`,
+    `${all ? 'leave all and select_mode out' : 'leave select_mode out'} (or ${andAll}pass '${inferred}') to ` +
+      `select ${inferred === 'VERT' ? vertModeSelects(lists) : `the listed ${andList(lists)}`}`,
+    ...(inferred === 'VERT' ? [] : [`${andAll}pass 'VERT' to select ${vertModeSelects(lists)}`]),
+    ...(all ? ['leave the lists out to select everything'] : []),
   ];
   return (
-    `select_mode '${mode}' selects only the listed ${used}, so the listed ${andList(ignored)} would be ` +
-    `ignored: ${remedies.slice(0, -1).join(', ')}, or ${remedies[remedies.length - 1]}`
+    `select_mode '${mode}' selects only the listed ${used}, so the listed ${andList(ignored)} would be ignored` +
+    `${all ? ', and all: true selects every element, so the lists would change nothing' : ''}: ` +
+    `${remedies.slice(0, -1).join(', ')}, or ${remedies[remedies.length - 1]}`
   );
 }
 
@@ -385,10 +398,11 @@ function ignoredListsMessage(
  * What cannot be selected as asked is a ToolError with code POLL_FAILED (a selection that cannot be
  * applied), not silently left out: a list that `mode` does not select from (EDGE uses only `edges`,
  * FACE only `faces`: an explicit select_mode, as inferSelectMode infers them only from those lists
- * alone), `all: true` with lists (everything, which the lists would not change), an index the mesh
- * does not have, or an edge between two of its vertices that no edge of the mesh connects (the
- * edges of its faces and its loose wire edges: the topology selectionFromEdges selects from, which
- * would skip it in EDGE mode while VERT mode would select its two vertices).
+ * alone) and `all: true` with lists (everything, which the lists would not change), both named in
+ * one message ({@link listsRefusal}); an index the mesh does not have, or an edge between two of its
+ * vertices that no edge of the mesh connects (the edges of its faces and its loose wire edges: the
+ * topology selectionFromEdges selects from, which would skip it in EDGE mode while VERT mode would
+ * select its two vertices).
  */
 function meshSelection(
   p: AgentProject,
@@ -403,13 +417,8 @@ function meshSelection(
   const lists = (['verts', 'edges', 'faces'] as const).filter((k) => sel[k]?.length);
   if (!lists.length) return sel.all === false ? emptySelection() : selectAllElements(mesh);
   const ignored = lists.filter((k) => !MODE_LISTS[mode].includes(k));
-  if (ignored.length) throw new ToolError(ignoredListsMessage(mode, sel, lists, ignored), 'POLL_FAILED');
-  if (sel.all === true)
-    throw new ToolError(
-      `all: true selects every element, so the listed ${andList(lists)} would change nothing: leave all ` +
-        'out to select only the listed elements, or leave the lists out to select everything',
-      'POLL_FAILED',
-    );
+  const refused = listsRefusal(mode, sel, lists, ignored);
+  if (refused) throw new ToolError(refused, 'POLL_FAILED');
   const nv = mesh.positions.length / 3;
   for (const v of sel.verts ?? [])
     if (v >= nv)
@@ -2944,7 +2953,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'editor_command',
     {
       title: 'Editor command',
-      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`; get_connected_clients lists them). Commands and their \`params\`: ${editorCommandList()}. run_operator runs the operators of the browser editor's own user interface (view3d.*, wm.*, screen.*, ed.* …) on the person's editor: its selection, view, frame and undo history, windows on the person's screen, even its project (wm.read_homefile switches that editor to a new project, so it leaves this one before it can answer, and the error says so) and the person's clipboard (wm.share); the run_operator tool refuses them with a message that says what each one does there. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected, or when the editor's connection to the project closes before it answers. \`timeout_ms\` (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}: under the 60 s request timeout MCP SDK clients use by default) is how long to wait for the editor's answer. In an editor without GPU acceleration (software WebGL, e.g. a headless browser) a screenshot of a heavy scene in MATERIAL or RENDERED shading takes seconds, and the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds: the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, take about one frame, except that after a material edit the next screenshot or frame in each of these shadings can compile the shaders of the objects with that material again (10–15 s for an object with procedural wood textures); the other commands wait while the viewport draws (seconds for its first frame in MATERIAL or RENDERED shading, and per frame for a scene with millions of triangles). So raise timeout_ms there, take screenshots with shading 'SOLID' (grey clay, much faster), take a quick look with render_image {shading: 'SOLID'} and make final images with render_image. On a timeout the error says so and what to do; the editor may still carry the command out, and its next commands and renders wait until it has (a later timeout names that earlier request; render_image renderer auto renders on the server meanwhile): a screenshot that timed out still builds its materials, so retrying it waits for the rest and then takes about one frame.`,
+      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`; get_connected_clients lists them). Commands and their \`params\`: ${editorCommandList()}. run_operator runs the operators of the browser editor's own user interface (view3d.*, wm.*, screen.*, ed.* …) on the person's editor: its selection, view, frame and undo history, windows on the person's screen, even its project (wm.read_homefile switches that editor to a new project, so it leaves this one before it can answer, and the error says so) and the person's clipboard (wm.share); the run_operator tool refuses them with a message that says what each one does there. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected, or when the editor's connection to the project closes before it answers. \`timeout_ms\` (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}: under the 60 s request timeout MCP SDK clients use by default) is how long to wait for the editor's answer. In an editor without GPU acceleration (software WebGL, e.g. a headless browser) a screenshot of a heavy scene in MATERIAL or RENDERED shading takes seconds, and the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds: the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, take about one frame, also after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${NEW_SHADER_SECONDS} measured); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a scene with millions of triangles takes seconds per frame in any shading; the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and per frame for a scene with millions of triangles). So raise timeout_ms there, take screenshots with shading 'SOLID' (grey clay, much faster), take a quick look with render_image {shading: 'SOLID'} and make final images with render_image. On a timeout the error says so and what to do; the editor may still carry the command out, and its next commands and renders wait until it has (a later timeout names that earlier request; render_image renderer auto renders on the server meanwhile): a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the rest and then takes about one frame.`,
       annotations: { ...EDIT, openWorldHint: true },
       argsHint: 'Command parameters go inside `params` (editor_command {project, command, params: {…}}).',
     },
@@ -2963,7 +2972,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .max(MAX_EDITOR_TIMEOUT_MS)
         .default(DEFAULT_EDITOR_TIMEOUT_MS)
         .describe(
-          `How long to wait for the editor's answer in ms (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}, under the 60 s default request timeout of MCP SDK clients); in software WebGL the first screenshot or viewport frame of a heavy scene in MATERIAL or RENDERED shading takes tens of seconds (the editor builds and compiles that shading's materials and keeps them), the first one after a material edit 10–15 s for an object with procedural wood textures (it can compile that object's shaders again), later ones seconds`,
+          `How long to wait for the editor's answer in ms (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}, under the 60 s default request timeout of MCP SDK clients); in software WebGL the first screenshot or viewport frame of a heavy scene in MATERIAL or RENDERED shading takes tens of seconds (the editor builds and compiles that shading's materials and keeps them), one after a material edit that needs a shader no material had ${NEW_SHADER_SECONDS} (it compiles it), later ones about one frame, and seconds in any shading with millions of triangles`,
         ),
     },
     async (a, extra) => {

@@ -9,6 +9,7 @@ import { importFromFilePicker } from '../io/import-export';
 import { shareLink } from '../project/manager';
 import { nearestEdge, projectEditVerts } from '../viewport/picking';
 import { takePendingStroke } from '../viewport/interaction';
+import { viewportCamera } from '../render/view';
 import { telemetry } from '../telemetry/telemetry';
 import { lastRepeat, repeatLast, runOperator } from './runner';
 
@@ -162,8 +163,8 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       execute(ctx) {
         const e = engine();
         const camId = ctx.doc.getScene().camera!;
-        const cam = e.pose.ortho ? e.orthoCam : e.perspCam;
-        cam.updateMatrixWorld(true);
+        // the view, also while an animated view change is still on its way there
+        const cam = viewportCamera(e.pose, e.width / Math.max(1, e.height));
         ctx.doc.setWorldMatrix(camId, cam.matrixWorld.toArray());
         session.value!.view.cameraView.value = true;
       },
@@ -280,7 +281,9 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     'view3d.toggle_xray',
     'Toggle X-Ray',
     'xray',
-    'See through objects; selection also selects hidden elements (Alt+Z).',
+    'See through objects in Solid shading (Wireframe always does; Material Preview and Rendered draw them ' +
+      'as they are); in Edit Mode the cage shows through and box selections and clicks on vertices or ' +
+      'edges also select hidden elements (Alt+Z).',
   );
   toggle(
     'view3d.toggle_overlays',
@@ -549,16 +552,21 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       id: 'render.render',
       label: 'Render Image',
       description:
-        'Render the active camera view at the output resolution (F12); with the PATHTRACER engine the image ' +
-        'refines progressively on the render workers. animation=true renders the frame range into an ' +
-        'animated PNG or GIF instead (Render Animation, Ctrl+F12).',
+        'Open the Render window and render the scene there at once (F12): at the output resolution, from the ' +
+        "scene camera (else the viewport's view); with the PATHTRACER engine the image refines progressively " +
+        'on the render workers. animation=true opens the Render Animation window instead (Ctrl+F12), which ' +
+        'renders nothing until its Render button is pressed (there the frame range is rendered into an ' +
+        'animated PNG or GIF).',
       category: 'Render',
       ...ui,
       schema: z.object({
         animation: z
           .boolean()
           .default(false)
-          .describe('Render the frame range into an animation (Ctrl+F12) instead of a still image'),
+          .describe(
+            'Open the Render Animation window (Ctrl+F12) instead of rendering a still image; it renders ' +
+              'nothing until its Render button is pressed',
+          ),
       }),
       execute(_ctx, p) {
         openDialog('render', p.animation ? { animation: true } : {});

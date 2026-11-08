@@ -68,7 +68,6 @@ export class WebDAVSync {
   readonly status = signal<WebDAVStatus>('idle');
   readonly lastSyncAt = signal<number | null>(null);
   readonly error = signal<string | null>(null);
-  private etag: string | undefined;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private poll: ReturnType<typeof setInterval> | null = null;
   private running: Promise<SyncResult | null> | null = null;
@@ -122,12 +121,15 @@ export class WebDAVSync {
       });
       this.status.value = 'syncing';
       try {
+        // Every sync merges the stored content it reads (no `lastEtag`): the ETags of WebDAV
+        // servers that make them from the modification time can repeat for another write (nginx:
+        // one of the same size within the same second), and skipping a write with the ETag of the
+        // last sync would leave this device without it. The skip would only save re-applying the
+        // document (3.6 ms for 0.48 MB), as the GET and the comparison happen either way.
         const res = await this.target.store.syncDocument(this.projectId, this.doc.ydoc, {
-          lastEtag: this.etag,
           origin: this.origin,
           info: this.info,
         });
-        this.etag = res.etag;
         this.status.value = 'synced';
         this.error.value = null;
         this.lastSyncAt.value = Date.now();

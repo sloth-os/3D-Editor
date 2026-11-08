@@ -415,17 +415,38 @@ export function crop(img: RgbaImage, r: Rect): RgbaImage {
 
 // ---------------------------------------------------------------- rendering in the editor
 
-/** A screenshot of the whole 3D viewport, overlays included. */
+/**
+ * Waits until the viewport shows every change made so far: the editor marks its canvas
+ * `data-view="drawn"` once the GPU has drawn a frame with all of them (software WebGL can take
+ * seconds for one, compiling shaders, while the page keeps showing the frame before), and the
+ * browser has presented it (two more animation frames). A picture taken right after a panel shows
+ * a change can otherwise show the frame before it.
+ */
+export async function viewportDrawn(page: Page): Promise<void> {
+  const canvas = page.getByTestId('viewport').locator('canvas[data-view]');
+  await expect(canvas).toHaveAttribute('data-view', 'drawn', { timeout: 60_000 });
+  await page.evaluate(
+    () => new Promise<void>((done) => requestAnimationFrame(() => requestAnimationFrame(() => done()))),
+  );
+}
+
+/**
+ * A screenshot of the whole 3D viewport, overlays included, once it shows every change
+ * ({@link viewportDrawn}).
+ */
 export async function viewportShot(page: Page): Promise<RgbaImage> {
+  await viewportDrawn(page);
   return decodePng(await page.getByTestId('viewport').screenshot());
 }
 
 /**
  * A screenshot of the middle of the 3D viewport, `size` pixels square: what the viewport draws
  * around the world origin in the default view, away from its overlays (header text, statistics,
- * navigation gizmo, the Adjust Last Operation panel).
+ * navigation gizmo, the Adjust Last Operation panel), once it shows every change
+ * ({@link viewportDrawn}).
  */
 export async function viewportCentre(page: Page, size = 160): Promise<RgbaImage> {
+  await viewportDrawn(page);
   const box = (await page.getByTestId('viewport').boundingBox())!;
   const clip = {
     x: Math.round(box.x + box.width / 2 - size / 2),

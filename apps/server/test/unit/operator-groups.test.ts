@@ -2,11 +2,13 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { BROWSER_UI_OPERATORS, createOperatorRegistry } from '@3d-editor/core';
+import { editorTimeoutMessage } from '../../src/mcp/editor-commands';
 import {
   browserUiOperator,
   browserUiOperatorsNote,
   closestOperatorIds,
   completesOperatorId,
+  findOperatorGroup,
 } from '../../src/mcp/operator-groups';
 
 /*
@@ -119,6 +121,28 @@ describe('browserUiOperator', () => {
     expect(zoomBy.slice(0, zoomBy.indexOf('\n  }\n'))).toContain('this.leaveCameraView()');
     expect(browserUiOperator('view3d.zoom')).toMatch(
       /: it zooms the person's view in by 1\.25× per unit of `delta` \(default 1; negative values zoom out\), out of the camera view\.$/,
+    );
+  });
+
+  it('view3d.toggle_xray: see-through objects in Solid shading only, selections through them in Edit Mode', () => {
+    const src = (path: string) =>
+      readFileSync(fileURLToPath(new URL(`../../../web/src/${path}`, import.meta.url)), 'utf8');
+    // the objects: see-through in Solid shading with X-ray on, always in Wireframe, never in Material
+    // Preview or Rendered (engine.ts sync, scene-objects.ts setXray)
+    const engine = src('viewport/engine.ts');
+    expect(engine).toContain("xray: shading === 'WIREFRAME' || (shading === 'SOLID' && v.xray.value)");
+    expect(src('viewport/scene-objects.ts')).toContain("setXray(e.material, opts.xray && kind === 'SOLID')");
+    // Edit Mode: the cage is drawn through (edit-overlay.ts depthTest), box selections and vertex and
+    // edge clicks project every vertex as visible (interaction.ts projectEditVerts), face clicks pick
+    // the face in front
+    expect(engine).toMatch(/this\.edit\.update\([^)]*v\.xray\.value/);
+    const interaction = src('viewport/interaction.ts');
+    const box = interaction.slice(interaction.indexOf('  boxSelect('));
+    expect(box.slice(0, box.indexOf('\n  }\n'))).toContain('this.session.view.xray.value');
+    const click = interaction.slice(interaction.indexOf('  private clickSelectEdit('));
+    expect(click.slice(0, click.indexOf('\n  }\n'))).toContain('const xray = this.session.view.xray.value;');
+    expect(browserUiOperator('view3d.toggle_xray')).toMatch(
+      /: it turns X-ray on or off in that editor: in Solid shading its objects turn see-through \(Wireframe shading always shows them so; Material Preview and Rendered draw them as they are\), and in Edit Mode the edit cage shows through them and the person's box selections and clicks on vertices or edges also select hidden ones\.$/,
     );
   });
 
@@ -340,6 +364,23 @@ describe('the parameters the caveats name', () => {
     const text = caveat('wm.call_menu');
     for (const m of menus) expect(text, m).toMatch(new RegExp(`[{ ]${m}[,}]| ${m} or `));
     expect(text).toContain('another name opens nothing');
+  });
+});
+
+describe('the Shading group', () => {
+  it("says which material edits cost a browser editor's next screenshot a compile, as the timeout error does", () => {
+    // measured in software WebGL (docs/mcp.md): an edit that needs a shader no material had compiles it
+    // once in each of MATERIAL and RENDERED shading; an edit of values reuses the shader
+    const cost = '0.9–3.6 s measured';
+    const shading = findOperatorGroup('Shading')!.description;
+    expect(shading).toContain(
+      'an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set ' +
+        'of channels that no other material has) makes the next screenshot or viewport frame in MATERIAL and ' +
+        `in RENDERED shading compile it (${cost}; edits of values cost about one frame)`,
+    );
+    expect(shading).toContain("pass editor_command a larger timeout_ms or shading 'SOLID'");
+    expect(shading).not.toMatch(/compile shaders again|1\.2–11\.9|transmission/);
+    expect(editorTimeoutMessage('screenshot', 10_000, null, { shading: 'RENDERED' })).toContain(`(${cost})`);
   });
 });
 

@@ -73,6 +73,18 @@ export function applyPoseToCamera(
   cam.updateProjectionMatrix();
 }
 
+/** Whether two poses are the same view (exactly). */
+export function samePose(a: ViewPose, b: ViewPose): boolean {
+  return (
+    a.target.equals(b.target) &&
+    a.distance === b.distance &&
+    a.yaw === b.yaw &&
+    a.pitch === b.pitch &&
+    a.ortho === b.ortho &&
+    a.fovY === b.fovY
+  );
+}
+
 export function lerpPose(a: ViewPose, b: ViewPose, t: number): ViewPose {
   let dy = b.yaw - a.yaw;
   dy = Math.atan2(Math.sin(dy), Math.cos(dy));

@@ -30,9 +30,10 @@ export const MAX_RENDER_FRAMES = 1000;
 /**
  * How long render_image waits for a RASTER image of a browser editor with renderer 'browser' (ms):
  * an editor without GPU acceleration (software WebGL, e.g. a headless browser) takes tens of
- * seconds for a heavy scene (a verifier's 71-material scene: one browser render took 12.9 s, two
- * did not finish within the 15 s the server used to wait, one took 30 s; its screenshots took
- * 23–44 s). Under the 60 s default request timeout of MCP clients (see {@link MAX_EDITOR_WAIT_MS}).
+ * seconds for a heavy scene. Measured in headless Chromium with SwiftShader at the default 800×450:
+ * the first image of a 71-material scene took 21.9–26.7 s, as it built and compiled the materials,
+ * and the next ones 3.7–4.7 s; images of 4 million triangles took 4.6–10.2 s. Under the 60 s
+ * default request timeout of MCP clients (see {@link MAX_EDITOR_WAIT_MS}).
  */
 export const BROWSER_RASTER_TIMEOUT_MS = MAX_EDITOR_WAIT_MS;
 /**
@@ -52,9 +53,10 @@ export const SLOW_EDITOR_RETRY_MS = 120_000;
  * Whether renderer 'auto' should render on the server instead of asking `conn` for a RASTER image
  * with this `shading`: the editor's last such image came after the server had stopped waiting, or
  * took longer than 'auto' waits ({@link AUTO_BROWSER_RASTER_TIMEOUT_MS}), less than
- * {@link SLOW_EDITOR_RETRY_MS} ago. In software WebGL every RASTER image of a heavy scene can take
- * about 20 s (a 71-material scene in a headless editor), so 'auto' would otherwise wait 15 s in
- * vain for every other render. A faster answer (renderer 'browser' waits longer) clears it.
+ * {@link SLOW_EDITOR_RETRY_MS} ago, so that 'auto' does not wait 15 s in vain for each render of an
+ * editor that stays that slow: in software WebGL a RASTER image can take longer than 'auto' waits
+ * (the first image of a 71-material scene, see {@link BROWSER_RASTER_TIMEOUT_MS}). A faster answer
+ * (renderer 'browser' waits longer) clears it.
  * Returns why, as a clause after "the browser editor", or null.
  */
 export function slowBrowserRaster(
@@ -229,13 +231,20 @@ export function progressReporter(extra: ToolExtra): ((p: RenderProgress) => void
  * While a request waits for a browser editor (which sends no progress of its own), sends a progress
  * notification every {@link KEEP_ALIVE_MS} (only when the client asked for progress), so clients
  * that reset their request timeout on progress keep waiting. `at` gives the notification after a
- * number of seconds. Returns the function that stops it.
+ * number of seconds: the whole seconds since the request started, and at least the intervals that
+ * have passed (Node counts a timer from the event loop's time, which can be some milliseconds
+ * earlier than Date.now() when the timer is set, so the first notification could otherwise say
+ * 4 s). Returns the function that stops it.
  */
 export function keepAlive(extra: ToolExtra, at: (seconds: number) => RenderProgress): () => void {
   const progress = progressReporter(extra);
   if (!progress) return () => undefined;
   const t0 = Date.now();
-  const timer = setInterval(() => progress(at(Math.floor((Date.now() - t0) / 1000))), KEEP_ALIVE_MS);
+  let ticks = 0;
+  const timer = setInterval(() => {
+    ticks++;
+    progress(at(Math.max((ticks * KEEP_ALIVE_MS) / 1000, Math.floor((Date.now() - t0) / 1000))));
+  }, KEEP_ALIVE_MS);
   return () => clearInterval(timer);
 }
 

@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { resolveWebDAV } from '../src/storage/webdav';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as Y from 'yjs';
+import { ProjectFileStore, SceneDoc, WebDAVClient } from '@3d-editor/core';
+import { WebDAVSync, resolveWebDAV } from '../src/storage/webdav';
 import { prefs, defaultPreferences } from '../src/app/prefs';
 import { serverConfig } from '../src/app/store';
 import { localIndex } from '../src/project/local-index';
@@ -65,5 +67,82 @@ describe('local project index (IndexedDB)', () => {
     expect((await localIndex.get('a'))?.name).toBe('A2');
     await localIndex.remove('a');
     expect((await localIndex.list()).map((p) => p.id)).toEqual(['b']);
+  });
+});
+
+/**
+ * A WebDAV server like the webdav-server the tests use: no ETag with GET or PUT, and an ETag in
+ * PROPFIND made from the modification time, which two writes within one tick of its clock share.
+ */
+function coarseEtagServer() {
+  const files = new Map<string, { data: Uint8Array; etag: string }>();
+  const server = {
+    files,
+    /** The server's clock: ETags only change when it moves. */
+    clock: 1,
+    put(path: string, data: Uint8Array) {
+      files.set(path, { data: data.slice(), etag: `"t${server.clock}"` });
+    },
+    fetch: async (input: string, init: RequestInit = {}) => {
+      const path = decodeURIComponent(new URL(input).pathname).replace(/(.)\/$/, '$1');
+      const file = files.get(path);
+      switch (init.method ?? 'GET') {
+        case 'GET':
+          return file
+            ? new Response(file.data.slice(), { status: 200 })
+            : new Response(null, { status: 404 });
+        case 'PUT':
+          server.put(path, init.body as Uint8Array);
+          return new Response(null, { status: 201 });
+        case 'PROPFIND':
+          if (!file) return new Response(null, { status: path.endsWith('.ybin') ? 404 : 207 });
+          return new Response(
+            `<d:multistatus xmlns:d="DAV:"><d:response><d:href>${path}</d:href><d:propstat><d:prop>` +
+              `<d:getetag>${file.etag}</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status>` +
+              `</d:propstat></d:response></d:multistatus>`,
+            { status: 207 },
+          );
+        default:
+          return new Response(null, { status: 201 });
+      }
+    },
+  };
+  return server;
+}
+
+describe('WebDAV sync of an open project', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("merges another device's save that has the ETag of the last sync", async () => {
+    // regression: a sync skipped the stored document when its ETag equalled the last sync's,
+    // and this device missed a save made within the same tick of the server's clock
+    const server = coarseEtagServer();
+    vi.stubGlobal('fetch', server.fetch);
+    const path = '/projects/p-dav/document.ybin';
+    const other = SceneDoc.create({ name: 'Shared', empty: true });
+    server.put(path, other.encodeState());
+    const doc = new SceneDoc(new Y.Doc());
+    const target = {
+      store: new ProjectFileStore(new WebDAVClient({ url: 'https://dav.test/' }), '/'),
+      label: 'test',
+      viaServer: false,
+    };
+    const origin = { type: 'storage' };
+    const sync = new WebDAVSync(
+      target,
+      'p-dav',
+      doc,
+      () => ({ id: 'p-dav', name: 'Shared', created_at: '', updated_at: '', schema_version: 1 }),
+      origin,
+    );
+    expect(await sync.syncNow()).toMatchObject({ pulled: true, pushed: false });
+    expect(doc.name).toBe('Shared');
+    // the other device saves again before the server's clock moved: same ETag, new content
+    other.addObject({ type: 'EMPTY', name: 'Saved elsewhere' });
+    server.put(path, other.encodeState());
+    expect(await sync.syncNow()).toMatchObject({ pulled: true });
+    expect(doc.findObjectByName('Saved elsewhere')).not.toBeNull();
+    await sync.stop(false);
+    other.destroy();
   });
 });

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -838,6 +840,22 @@ describe('selection lists that the select mode would not use', () => {
         'all: true selects every element, so the listed verts and edges would change nothing: leave all out to ' +
           'select only the listed elements, or leave the lists out to select everything',
       ],
+      // both: one message, and every remedy for the lists also leaves all out (a call that kept
+      // all: true would be refused for it)
+      [
+        { faces: [0], all: true, select_mode: 'EDGE' },
+        "select_mode 'EDGE' selects only the listed edges, so the listed faces would be ignored, and all: true " +
+          'selects every element, so the lists would change nothing: leave all out and list edges instead, leave ' +
+          "all and select_mode out (or leave all out and pass 'FACE') to select the listed faces, leave all out " +
+          "and pass 'VERT' to select the vertices of the listed faces, or leave the lists out to select everything",
+      ],
+      [
+        { verts: [0], edges: [edge], all: true, select_mode: 'FACE' },
+        "select_mode 'FACE' selects only the listed faces, so the listed verts and edges would be ignored, and " +
+          'all: true selects every element, so the lists would change nothing: leave all out and list faces ' +
+          "instead, leave all and select_mode out (or leave all out and pass 'VERT') to select the listed " +
+          'vertices with the vertices of the listed edges, or leave the lists out to select everything',
+      ],
     ];
     for (const [mesh, message] of cases) {
       // mesh.delete would delete the selected elements if any of the selection were applied
@@ -887,9 +905,9 @@ describe('selection lists that the select mode would not use', () => {
       faces: 6,
     });
     // the remedies are what the calls do: without select_mode the mode the message names selects the
-    // lists, and so does 'VERT' where the message offers it
+    // lists, and so does 'VERT' where the message offers it (with all: true too, below)
     for (const [mesh, message] of cases) {
-      if (!message.startsWith('select_mode ')) continue;
+      if (!message.startsWith('select_mode ') || mesh.all) continue;
       const lists = { ...mesh };
       delete lists.select_mode;
       const left = message.match(/leave select_mode out \(or pass '(\w+)'\)/)?.[1];
@@ -959,6 +977,196 @@ describe('selection lists that the select mode would not use', () => {
       verts: [face[0], face[1], face[2]].sort((x, y) => x - y),
       faces: [],
     });
+  });
+
+  it('name only remedies that the next call accepts as they are, for every combination of all, select_mode and lists', async () => {
+    const { id } = await ok('create_project', { name: 'Select mode remedies' });
+    const faces = (await ok('get_mesh_data', { project: id, object: 'Cube' })).faces as number[][];
+    // a face, an edge of another face and a vertex of neither: each list selects vertices of its own
+    const edge = [faces[1][0], faces[1][1]];
+    const vert = [0, 1, 2, 3, 4, 5, 6, 7].find((v) => !faces[0].includes(v) && !edge.includes(v))!;
+    const LISTS: { verts: number[]; edges: number[][]; faces: number[] } = {
+      verts: [vert],
+      edges: [edge],
+      faces: [0],
+    };
+    type List = keyof typeof LISTS;
+    type Mesh = {
+      verts?: number[];
+      edges?: number[][];
+      faces?: number[];
+      all?: boolean;
+      select_mode?: string;
+    };
+    const listsOf = (m: Mesh) => (['verts', 'edges', 'faces'] as const).filter((k) => m[k]);
+    const inferred = (m: Mesh) => {
+      const lists = listsOf(m).join();
+      return lists === 'faces' ? 'FACE' : lists === 'edges' ? 'EDGE' : 'VERT';
+    };
+    const sorted = (xs: Iterable<number>) => [...new Set(xs)].sort((a, b) => a - b);
+    /** What a selection the server accepts selects (mesh/selection.ts: the select mode's rules). */
+    function expected(m: Mesh): { select_mode: string; verts: number[]; faces: number[] } {
+      const mode = m.select_mode ?? inferred(m);
+      if (!listsOf(m).length) {
+        const all = m.all !== false;
+        return {
+          select_mode: mode,
+          verts: all ? [0, 1, 2, 3, 4, 5, 6, 7] : [],
+          faces: all ? [0, 1, 2, 3, 4, 5] : [],
+        };
+      }
+      const ofEdges = (m.edges ?? []).flat();
+      const ofFaces = (m.faces ?? []).flatMap((f) => faces[f]);
+      if (mode === 'FACE') return { select_mode: mode, verts: sorted(ofFaces), faces: sorted(m.faces ?? []) };
+      if (mode === 'EDGE') return { select_mode: mode, verts: sorted(ofEdges), faces: [] };
+      const verts = sorted([...(m.verts ?? []), ...ofEdges, ...ofFaces]);
+      return {
+        select_mode: mode,
+        verts,
+        faces: faces.flatMap((f, i) => (f.every((v) => verts.includes(v)) ? [i] : [])),
+      };
+    }
+    /** edit_mesh with the mesh selection `m` (its select_mode next to the selection). */
+    async function select(m: Mesh) {
+      const { select_mode, ...selection } = m;
+      return call('edit_mesh', {
+        project: id,
+        object: 'Cube',
+        operator: 'scene.stats',
+        selection,
+        ...(select_mode ? { select_mode } : {}),
+      });
+    }
+    /** The remedies of a refusal: after its last ': ', split at ', ' and ', or ' outside parentheses. */
+    function remedies(message: string): string[] {
+      const text = message.slice(message.lastIndexOf(': ') + 2);
+      const out: string[] = [];
+      let depth = 0;
+      let cur = '';
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] === '(') depth++;
+        if (text[i] === ')') depth--;
+        const sep = depth
+          ? null
+          : text.startsWith(', or ', i)
+            ? ', or '
+            : text.startsWith(', ', i)
+              ? ', '
+              : null;
+        if (sep) {
+          out.push(cur);
+          cur = '';
+          i += sep.length - 1;
+        } else cur += text[i];
+      }
+      return [...out, cur];
+    }
+    /** The call a remedy's action makes of `m`, e.g. "leave all out and pass 'VERT'". */
+    function apply(m: Mesh, action: string): Mesh {
+      const next = { ...m };
+      const prefix = 'leave all out and ';
+      const rest = action.startsWith(prefix) ? action.slice(prefix.length) : action;
+      if (rest !== action || rest === 'leave all out' || rest === 'leave all and select_mode out')
+        delete next.all;
+      if (rest === 'leave all out') return next;
+      if (rest === 'leave all and select_mode out' || rest === 'leave select_mode out') {
+        delete next.select_mode;
+        return next;
+      }
+      if (rest === 'leave the lists out') {
+        for (const k of listsOf(m)) delete next[k];
+        return next;
+      }
+      const only = rest.match(/^list only (verts|edges|faces)$/)?.[1];
+      const instead = rest.match(/^list (verts|edges|faces) instead$/)?.[1];
+      const mode = rest.match(/^pass '(VERT|EDGE|FACE)'$/)?.[1];
+      if (only) {
+        for (const k of listsOf(m)) if (k !== only) delete next[k];
+      } else if (instead) {
+        for (const k of listsOf(m)) delete next[k];
+        Object.assign(next, { [instead]: LISTS[instead as List] });
+      } else if (mode) next.select_mode = mode;
+      else throw new Error(`a remedy this test does not know: '${action}'`);
+      return next;
+    }
+    /** What "to select …" promises of the call `m` makes, checked against what the server selects. */
+    function promised(m: Mesh, what: string): void {
+      const lists = listsOf(m);
+      const mode = m.select_mode ?? inferred(m);
+      if (what === 'everything') expect(lists).toEqual([]);
+      else if (what === 'only the listed elements') expect(lists.length).toBeGreaterThan(0);
+      else if (what === 'the listed faces') expect([mode, lists.join()]).toEqual(['FACE', 'faces']);
+      else if (what === 'the listed edges') expect([mode, lists.join()]).toEqual(['EDGE', 'edges']);
+      else {
+        expect(mode, what).toBe('VERT');
+        const others = lists.filter((k) => k !== 'verts');
+        const of = `the vertices of the listed ${others.join(' and ')}`;
+        expect(what).toBe(
+          !others.length
+            ? 'the listed vertices'
+            : lists.includes('verts')
+              ? `the listed vertices with ${of}`
+              : of,
+        );
+      }
+    }
+    let refusals = 0;
+    let checked = 0;
+    for (const all of [undefined, true, false])
+      for (const select_mode of [undefined, 'VERT', 'EDGE', 'FACE'])
+        for (let bits = 0; bits < 8; bits++) {
+          const m: Mesh = {
+            ...(bits & 1 ? { verts: LISTS.verts } : {}),
+            ...(bits & 2 ? { edges: LISTS.edges } : {}),
+            ...(bits & 4 ? { faces: LISTS.faces } : {}),
+            ...(all === undefined ? {} : { all }),
+            ...(select_mode ? { select_mode } : {}),
+          };
+          const label = JSON.stringify(m);
+          const lists = listsOf(m);
+          const unused = lists.some(
+            (k) => (m.select_mode === 'EDGE' && k !== 'edges') || (m.select_mode === 'FACE' && k !== 'faces'),
+          );
+          const r = await select(m);
+          // refused exactly when lists come with all: true or with a mode that does not use them
+          expect(!!r.raw.isError, `${label}: ${r.text}`).toBe(lists.length > 0 && (all === true || unused));
+          if (!r.raw.isError) {
+            const after = JSON.parse(r.text).selection_after;
+            expect({ ...after, verts: sorted(after.verts) }, label).toEqual(expected(m));
+            continue;
+          }
+          refusals++;
+          const message = r.text.slice(0, r.text.indexOf('\n'));
+          expect(JSON.parse(r.text.slice(r.text.indexOf('\n') + 1)).code, label).toBe('POLL_FAILED');
+          // both problems are named in one message
+          if (unused) expect(message, label).toMatch(/^select_mode '(EDGE|FACE)' selects only the listed/);
+          if (all === true) expect(message, label).toContain('all: true selects every element');
+          for (const remedy of remedies(message)) {
+            const [, action, alternative, what] =
+              remedy.match(/^(.+?)(?: \(or (.+)\))?(?: to select (.+))?$/) ?? [];
+            for (const a of [action, alternative]) {
+              if (!a) continue;
+              const next = apply(m, a);
+              const again = await select(next);
+              expect(
+                again.raw.isError,
+                `${label} → ${a} (${JSON.stringify(next)}): ${again.text}`,
+              ).toBeFalsy();
+              const after = JSON.parse(again.text).selection_after;
+              expect({ ...after, verts: sorted(after.verts) }, `${label} → ${a}`).toEqual(expected(next));
+              if (what) promised(next, what);
+              checked++;
+            }
+          }
+        }
+    // 7 list sets with all: true in 4 modes, and 6 with EDGE and with FACE for all left out or false
+    expect(refusals).toBe(28 + 24);
+    expect(checked).toBeGreaterThan(2 * refusals);
+    // docs/mcp.md quotes the remedies of a message that names both problems
+    const both = await select({ faces: [0], all: true, select_mode: 'EDGE' });
+    const message = both.text.slice(0, both.text.indexOf('\n'));
+    const doc = readFileSync(fileURLToPath(new URL('../../../../docs/mcp.md', import.meta.url)), 'utf8');
+    expect(doc.replace(/\s+/g, ' ')).toContain(`("…: ${message.slice(message.lastIndexOf(': ') + 2)}")`);
   });
 });
 
@@ -1211,9 +1419,9 @@ describe('tool descriptions', () => {
     expect(editor.description).toContain("take screenshots with shading 'SOLID' (grey clay, much faster)");
     // the cost of a screenshot: tens of seconds only for the first screenshot or viewport frame in
     // MATERIAL or RENDERED shading after the editor opened the project, which builds and compiles the
-    // scene's materials for it; the editor keeps them, also for a screenshot that timed out, so later
-    // ones (and a retry) take about one frame: 20-24 s, then 1-2 s for 71 materials (docs/mcp.md),
-    // until a material edit: then the next one compiled the table's shaders again (10-15 s)
+    // scene's materials for it; the editor keeps them, also for a screenshot that timed out and through
+    // edits of material values, so later ones (and a retry) take about one frame (docs/mcp.md), except
+    // that an edit that needs a shader no material had compiles it once in each of these shadings
     const overstated =
       /tens of seconds (per screenshot|for a screenshot in)|each screenshot then builds|while (its|the) viewport shows another/;
     expect(editor.description).not.toMatch(overstated);
@@ -1221,15 +1429,21 @@ describe('tool descriptions', () => {
       "the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds: the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, take about one frame",
     );
     expect(editor.description).toContain(
-      'take about one frame, except that after a material edit the next screenshot or frame in each of these shadings can compile the shaders of the objects with that material again (10–15 s for an object with procedural wood textures)',
+      "take about one frame, also after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (0.9–3.6 s measured); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a scene with millions of triangles takes seconds per frame in any shading; the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and per frame for a scene with millions of triangles)",
     );
     expect(editor.description).toContain(
-      'a screenshot that timed out still builds its materials, so retrying it waits for the rest and then takes about one frame',
+      'a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the rest and then takes about one frame',
     );
+    expect(editor.description).not.toMatch(/10–15 s|procedural wood/);
+    // no recompile in a second shading after a value edit (the editor keeps the replaced material for
+    // every shading it was drawn in), and no example that reuses a shader (transmission in that scene)
+    for (const text of [editor.description, client.getInstructions()!])
+      expect(text).not.toMatch(/second of these two shadings|1\.2–11\.9|11\.9 s|transmission turned on/);
     expect(client.getInstructions()).not.toMatch(overstated);
     expect(client.getInstructions()).toContain(
-      "the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds (it builds and compiles the scene's materials for that shading and keeps them; after a material edit the next one in each can compile the shaders of the objects with that material again, 10–15 s for an object with procedural wood textures)",
+      "the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds (it builds and compiles the scene's materials for that shading and keeps them, also through material edits that change values; an edit that needs a shader no material had, such as coat or sheen turned on or a procedural texture on a set of channels that no other material has, makes the next one in each of them compile it, 0.9–3.6 s measured), and a scene with millions of triangles seconds per frame in any shading",
     );
+    expect(client.getInstructions()).not.toMatch(/10–15 s|procedural wood/);
     // what the editor's UI operators do there, said plainly, and wm.read_homefile's missing answer
     expect(editor.description).not.toContain('when asked for one it says what it does here');
     expect(editor.description).toContain(
@@ -1243,7 +1457,7 @@ describe('tool descriptions', () => {
     ).timeout_ms;
     expect(timeout.description).not.toMatch(overstated);
     expect(timeout.description).toContain(
-      "the first screenshot or viewport frame of a heavy scene in MATERIAL or RENDERED shading takes tens of seconds (the editor builds and compiles that shading's materials and keeps them), the first one after a material edit 10–15 s for an object with procedural wood textures (it can compile that object's shaders again), later ones seconds",
+      "the first screenshot or viewport frame of a heavy scene in MATERIAL or RENDERED shading takes tens of seconds (the editor builds and compiles that shading's materials and keeps them), one after a material edit that needs a shader no material had 0.9–3.6 s (it compiles it), later ones about one frame, and seconds in any shading with millions of triangles",
     );
     expect(timeout.maximum).toBe(55_000);
     expect(editor.description).toContain('at most 55000');
@@ -1265,17 +1479,20 @@ describe('timeouts of the browser editor', () => {
     const r = await call('editor_command', { project: id, command: 'screenshot', timeout_ms: 200 });
     expect(r.raw.isError).toBe(true);
     expect(r.text).toBe(
-      "editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 200 ms (at most 55000); " +
-        'it may still carry the command out, and its next commands and renders wait until it has. The screenshot ' +
-        "is drawn in the viewport's shading, like a frame of the viewport. An editor without GPU acceleration " +
-        '(software WebGL, e.g. a headless browser) takes seconds for that with a heavy scene in MATERIAL or ' +
-        'RENDERED shading, and tens of seconds for its first screenshot or frame in one of them after it opened ' +
-        "the project, while it builds and compiles the scene's materials for that shading. After a material " +
-        'edit, its next screenshot or frame in each of these shadings can compile the shaders of the objects with that ' +
-        'material again (10–15 s for an object with procedural wood textures). It keeps what it compiled, so a ' +
-        'retry waits for the editor to finish and then takes about one frame. Retry with a larger timeout_ms (at ' +
-        "most 55000), or pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use " +
-        "render_image with shading 'SOLID', and render_image for final images.",
+      "editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 200 ms (at " +
+        'most 55000); it may still carry the command out, and its next commands and renders wait until ' +
+        "it has. The screenshot is drawn in the viewport's shading, like a frame of the viewport. An " +
+        'editor without GPU acceleration (software WebGL, e.g. a headless browser) takes seconds for ' +
+        'that with a scene of millions of triangles in any shading (5.5–8.9 s in SOLID with 4 million) ' +
+        'and with a heavy scene in MATERIAL or RENDERED shading, and tens of seconds for its first ' +
+        'screenshot or frame in one of these two after it opened the project, while it builds and ' +
+        "compiles the scene's materials for that shading. After a material edit that needs a shader no " +
+        'material had (coat or sheen turned on, a procedural texture on a set of channels that no other ' +
+        'material has), its next screenshot or frame in each of these two compiles it (0.9–3.6 s ' +
+        'measured). It keeps what it compiled, so a retry waits for the editor to finish and then takes ' +
+        "about one frame. Retry with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for " +
+        'the screenshot (grey clay, much faster); for a quick look use render_image with shading ' +
+        "'SOLID', and render_image for final images.",
     );
     // other failures keep their message
     expect(await ok('editor_command', { project: id, command: 'view.frame_all' })).toEqual({
@@ -1313,14 +1530,15 @@ describe('timeouts of the browser editor', () => {
     });
     expect(material.raw.isError).toBe(true);
     expect(material.text).toContain(
-      'until it has. An editor without GPU acceleration (software WebGL, e.g. a headless browser) takes seconds ' +
-        'per MATERIAL screenshot of a heavy scene, and tens of seconds for its first MATERIAL screenshot or ' +
-        "viewport frame after it opened the project, while it builds and compiles the scene's materials for " +
-        'MATERIAL shading. After a material edit, its next MATERIAL screenshot or viewport frame can compile ' +
-        'the shaders of the objects with that material again (10–15 s for an object with procedural wood ' +
-        'textures). It keeps what it compiled, so a retry waits for the editor to finish and then takes about ' +
-        "one frame. Retry with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot " +
-        '(grey clay, much faster)',
+      'until it has. An editor without GPU acceleration (software WebGL, e.g. a headless browser) ' +
+        'takes seconds per MATERIAL screenshot of a heavy scene, and tens of seconds for its first ' +
+        'MATERIAL screenshot or viewport frame after it opened the project, while it builds and compiles ' +
+        "the scene's materials for MATERIAL shading. After a material edit that needs a shader no " +
+        'material had (coat or sheen turned on, a procedural texture on a set of channels that no other ' +
+        'material has), its next MATERIAL screenshot or viewport frame compiles it (0.9–3.6 s ' +
+        'measured). It keeps what it compiled, so a retry waits for the editor to finish and then takes ' +
+        "about one frame. Retry with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for " +
+        'the screenshot (grey clay, much faster)',
     );
     // a SOLID one is not told to use SOLID
     const solid = await call('editor_command', {
@@ -1334,11 +1552,15 @@ describe('timeouts of the browser editor', () => {
     expect(solid.text).toMatch(/sent \d+ s ago\)\. An editor without GPU acceleration/);
     expect(solid.text).toContain(
       'An editor without GPU acceleration (software WebGL, e.g. a headless browser) can take seconds ' +
-        'per screenshot of a scene with millions of triangles even in SOLID shading, and a screenshot waits for ' +
-        "the viewport's frames in MATERIAL or RENDERED shading that compile shaders: its first one (tens of " +
-        "seconds for a heavy scene, while the editor builds and compiles the scene's materials) and its first " +
-        'one after a material edit (seconds). Pass a larger timeout_ms (at most 55000), or render without the ' +
-        "editor: render_image with renderer 'software'.",
+        'per screenshot of a scene with millions of triangles even in SOLID shading, and a screenshot ' +
+        'waits until the frame its viewport is drawing is done. In MATERIAL or RENDERED shading that ' +
+        'frame compiles shaders the first time after the editor opened the project (tens of seconds for ' +
+        "a heavy scene, while it builds and compiles the scene's materials) and after a material edit " +
+        'that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of ' +
+        'channels that no other material has: 0.9–3.6 s measured). It keeps what it compiled, so a ' +
+        'retry waits for the editor to finish and then takes about one frame. Retry with a larger ' +
+        'timeout_ms (at most 55000), or render without the editor: render_image with renderer ' +
+        "'software'.",
     );
     expect(solid.text).not.toContain("pass shading 'SOLID'");
     // an unknown shading never reaches the editor

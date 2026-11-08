@@ -29,3 +29,36 @@ describe('BROWSER_UI_OPERATORS (packages/core)', () => {
     expect(new Set(BROWSER_UI_OPERATORS).size).toBe(BROWSER_UI_OPERATORS.length);
   });
 });
+
+describe('render.render', () => {
+  it('says that {animation: true} only opens the Render Animation window (Dialogs.tsx)', () => {
+    if (!registry.has('wm.call_menu')) registerUiOperators(registry);
+    const def = registry.get('render.render')!;
+    // the still renders as the window opens; the animation window waits for its Render button
+    expect(def.description).toContain('Open the Render window and render the scene there at once (F12)');
+    expect(def.description).toContain(
+      'animation=true opens the Render Animation window instead (Ctrl+F12), which renders nothing until ' +
+        'its Render button is pressed',
+    );
+    expect(def.description).not.toMatch(/animation=true renders/);
+    const animation = (def.schema as unknown as { shape: Record<string, { description?: string }> }).shape
+      .animation;
+    expect(animation.description).toBe(
+      'Open the Render Animation window (Ctrl+F12) instead of rendering a still image; it renders nothing ' +
+        'until its Render button is pressed',
+    );
+  });
+});
+
+describe('view3d.toggle_xray', () => {
+  it('says where X-ray sees through: Solid shading, and the Edit Mode cage and selection', () => {
+    // the menu tooltip and F3 search show this; Material Preview and Rendered draw objects as they
+    // are with X-ray on (engine.ts sync, scene-objects.ts setXray), like Blender's
+    if (!registry.has('wm.call_menu')) registerUiOperators(registry);
+    expect(registry.get('view3d.toggle_xray')!.description).toBe(
+      'See through objects in Solid shading (Wireframe always does; Material Preview and Rendered draw them ' +
+        'as they are); in Edit Mode the cage shows through and box selections and clicks on vertices or ' +
+        'edges also select hidden elements (Alt+Z).',
+    );
+  });
+});

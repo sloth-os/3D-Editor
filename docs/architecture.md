@@ -332,7 +332,17 @@ Server-side rendering (`apps/server/src/render`) serves the MCP tools `render_im
 
 ## Persistence & sync
 
-See [storage-and-sync.md](storage-and-sync.md).
+See [storage-and-sync.md](storage-and-sync.md). In code: `FileStore`
+(`packages/core/src/storage/filestore.ts`) is implemented by `MemoryFileStore`, the server's
+`DiskFileStore` (`apps/server/src/persistence/disk.ts`) and `WebDAVClient`
+(`packages/core/src/storage/webdav.ts`). A store reports an ETag only together with the content it
+belongs to, and `atomicConditionalWrites` says whether it checks `If-Match` in the same step as the
+write (memory and disk do, WebDAV servers do not all). `ProjectFileStore.syncDocument` merges and
+writes; on WebDAV it also checks the ETag right before writing (no request between the check and
+the write) and reads its write back. Server rooms (`apps/server/src/sync/room.ts`) save debounced,
+refresh every 60 s while editors are connected, and when they wrote to WebDAV read storage again
+in the next refresh, before eviction (a room whose read fails is not evicted) and at shutdown.
+Browsers sync open projects with WebDAV in `apps/web/src/storage/webdav.ts`.
 
 ## Observability
 

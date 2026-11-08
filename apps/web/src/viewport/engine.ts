@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass.js';
+import { Pass } from 'three/examples/jsm/postprocessing/Pass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { effect, untracked } from '@preact/signals';
@@ -44,6 +45,7 @@ import {
   lerpPose,
   poseToPresence,
   presenceToPose,
+  samePose,
   viewLabel,
   type ViewPose,
 } from './navigation';
@@ -73,18 +75,29 @@ const FINAL_EVALUATOR_IDLE_MS = 60_000;
  */
 export const TRANSMISSION_LAYER_TRIANGLES = 1_000_000;
 
+/** How long an animated view change takes ({@link ViewportEngine.setPose}). */
+export const VIEW_ANIMATION_MS = 220;
+
 /** Multisampling of the viewport's scene target (smooth edges). */
 export const VIEWPORT_MSAA_SAMPLES = 4;
 /**
- * A viewport frame that keeps the GPU busy longer than this turns the scene target's multisampling
- * off ({@link ViewportEngine.multisampling}): software WebGL (SwiftShader, no GPU) rasterizes every
- * sample, so 4× MSAA makes a heavy scene's frames about four times slower (lighthouse-cove's 2.6 M
- * triangles in Solid shading: 3.2 s → 0.8 s per frame). A GPU draws such frames in milliseconds. It
- * is high enough that a light scene's frames, slowed down for a moment (a busy machine), keep it:
- * screenshots taken a moment apart compare edge for edge.
+ * A viewport frame whose multisampled renders (shadow maps, the scene and its overlays, drawn into
+ * the scene target) the GPU is seen still drawing this long after it could start them turns the
+ * scene target's multisampling off ({@link ViewportEngine.multisampling}): software WebGL
+ * (SwiftShader, no GPU) rasterizes every sample, so 4× MSAA makes a heavy scene's frames several
+ * times slower (lighthouse-cove's 2.6 M triangles in Solid shading: 3.2 s → 0.8 s per frame;
+ * 720,000 triangles over a 1100×700 view: 0.5 s → 0.2 s). A GPU draws such frames in milliseconds.
+ * Only those renders count, and only while the GPU was seen drawing them: a light scene's frames,
+ * slow for their full-screen passes (selection outlines, view transform: the default cube's frames
+ * took 0.4 s in SwiftShader with multisampling or without), for a busy machine (0.5–1.1 s) or for a
+ * main thread busy with something else (a rigid body bake: the frame drawn before it is seen done
+ * after it), keep it, and screenshots taken a moment apart compare edge for edge.
  */
 export const MSAA_OFF_FRAME_MS = 1000;
-/** Multisampling comes back once a frame without it takes less than this (MSAA can cost several times more). */
+/**
+ * Multisampling comes back once a frame's multisampled renders without it are seen done in less
+ * than this (MSAA can cost several times more).
+ */
 export const MSAA_ON_FRAME_MS = MSAA_OFF_FRAME_MS / 8;
 /**
  * A scene that comes to draw more triangles than this (meshes and instances) turns multisampling
@@ -118,6 +131,49 @@ interface FrameInFlight {
   renderStart: number;
   /** Whether its renders compiled shader programs (the first frame of a shading, new materials). */
   compiled: boolean;
+  /** The changes it shows ({@link ViewportEngine.changes} when it started). */
+  changes: number;
+  /** Signalled once its multisampled renders are done ({@link SceneEndPass}; null once seen so). */
+  scene: WebGLSync | null;
+  /** When the GPU was last seen still drawing them, and when they were first seen done (0: not). */
+  sceneBusyAt: number;
+  sceneDoneAt: number;
+}
+
+/**
+ * Marks the end of a frame's multisampled renders in the GPU's work, with a WebGL2 fence the frame
+ * loop asks for ({@link armed}) and collects ({@link take}): shadow maps, the scene and its overlays
+ * are drawn before it; the full-screen passes after it (selection outlines, view transform) cost
+ * about the same with multisampling or without.
+ */
+class SceneEndPass extends Pass {
+  /** Whether the next render puts a fence (a frame of the loop, not a thumbnail). */
+  armed = false;
+  private fence: WebGLSync | null = null;
+
+  constructor() {
+    super();
+    this.needsSwap = false;
+  }
+
+  override render(renderer: THREE.WebGLRenderer): void {
+    if (!this.armed) return;
+    this.armed = false;
+    const gl = renderer.getContext?.();
+    if (!gl || !('fenceSync' in gl)) return;
+    const gl2 = gl as WebGL2RenderingContext;
+    // one a frame that threw after this pass never collected
+    if (this.fence) gl2.deleteSync(this.fence);
+    this.fence = gl2.fenceSync(gl2.SYNC_GPU_COMMANDS_COMPLETE, 0);
+  }
+
+  /** The fence the last render put, if any (the caller deletes it). */
+  take(): WebGLSync | null {
+    const f = this.fence;
+    this.fence = null;
+    this.armed = false;
+    return f;
+  }
 }
 
 /**
@@ -215,6 +271,12 @@ export class ViewportEngine {
   readonly sceneCam = new THREE.PerspectiveCamera(40, 1, 0.1, 1000);
   readonly objects: SceneObjects;
   readonly edit = new EditOverlay();
+  /**
+   * The view: what the viewport shows, or, while an animated view change runs ({@link setPose}),
+   * the view it is going to. Navigation changes it (in place or with setPose); get_view, renders of
+   * the viewport's view and Align Camera to View read it. The frames drawn meanwhile show
+   * {@link shownPose}.
+   */
   pose: ViewPose = DEFAULT_POSE();
   width = 1;
   height = 1;
@@ -229,6 +291,8 @@ export class ViewportEngine {
   private outlineActive: OutlinePass;
   private overlayPass: RenderPass;
   private renderPass: RenderPass;
+  /** Where a frame's multisampled renders end (see {@link adaptMultisampling}). */
+  private sceneEnd = new SceneEndPass();
   /** Exposure, view transform and sRGB encoding of the viewport (see view-transform.ts). */
   private outputPass = new ViewTransformPass();
   /** The view transform and exposure (stops) the last `applyShading` chose. */
@@ -249,7 +313,14 @@ export class ViewportEngine {
   private dirty = true;
   private needsSync = true;
   private raf = 0;
+  /**
+   * The animated view change running (Blender's smooth view): the frames drawn until `start + dur`
+   * show poses on the way from `from` (what was shown when it started) to `to` (a copy of
+   * {@link pose} then); see {@link framePose}.
+   */
   private animating: { from: ViewPose; to: ViewPose; start: number; dur: number } | null = null;
+  /** The pose of the last frame drawn (null: none drawn yet). */
+  private shown: ViewPose | null = null;
   private disposers: (() => void)[] = [];
   private resizeObserver: ResizeObserver;
   private lastFrameTime = 0;
@@ -336,6 +407,7 @@ export class ViewportEngine {
     }
     this.composer.addPass(this.renderPass);
     this.composer.addPass(this.overlayPass);
+    this.composer.addPass(this.sceneEnd);
     this.composer.addPass(this.outlineSel);
     this.composer.addPass(this.outlineActive);
     this.composer.addPass(this.outputPass);
@@ -397,11 +469,33 @@ export class ViewportEngine {
 
   invalidate(): void {
     this.needsSync = true;
-    this.dirty = true;
+    this.requestRender();
   }
 
   requestRender(): void {
     this.dirty = true;
+    this.changes++;
+    this.showViewState('pending');
+  }
+
+  /** Changes asked for so far (invalidate, requestRender), and those the last frame drawn shows. */
+  private changes = 0;
+  private drawnChanges = 0;
+
+  /**
+   * The canvas's `data-view` attribute: `drawn` once the GPU has drawn a frame that shows every
+   * change asked for so far (scene, view, shading, selection …), `pending` until then. End-to-end
+   * tests wait for `drawn` before they take a picture of the viewport: the browser shows the last
+   * frame drawn, which software WebGL can take seconds to draw (compiling shaders).
+   */
+  private showViewState(state: 'drawn' | 'pending'): void {
+    if (this.canvas.dataset.view !== state) this.canvas.dataset.view = state;
+  }
+
+  /** Says `drawn` (see {@link showViewState}) when no frame is in flight and nothing is left to draw. */
+  private updateViewState(): void {
+    if (!this.framesInFlight.length && !this.dirty && !this.needsSync && this.drawnChanges === this.changes)
+      this.showViewState('drawn');
   }
 
   private loop(now: number): void {
@@ -421,17 +515,8 @@ export class ViewportEngine {
         this.session.state.frame = f;
       }
     } else this.lastFrameTime = 0;
-    if (this.animating) {
-      const t = Math.min(1, (now - this.animating.start) / this.animating.dur);
-      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
-      this.pose = lerpPose(this.animating.from, this.animating.to, e);
-      if (t >= 1) {
-        this.pose = this.animating.to;
-        this.animating = null;
-        this.persistPose();
-      }
-      this.dirty = true;
-    }
+    // an animated view change draws a frame on every animation frame until it ends (framePose)
+    if (this.animating) this.dirty = true;
     if (!this.frameDone()) return;
     if (!this.dirty && !this.needsSync) {
       resetFrameClock();
@@ -439,12 +524,16 @@ export class ViewportEngine {
     }
     const start = performance.now();
     if (this.needsSync) this.sync();
+    // the frame shows the changes asked for so far, also those of its sync (it can turn
+    // multisampling off, which asks for a frame: this one)
+    const changes = this.changes;
     this.dirty = false;
     const renderStart = performance.now();
     const programs = this.programCount();
-    this.render();
+    this.sceneEnd.armed = true;
+    this.render(now);
     recordFrame(now);
-    this.fenceFrame(start, renderStart, this.programCount() > programs);
+    this.fenceFrame(start, renderStart, this.programCount() > programs, changes, this.sceneEnd.take());
   }
 
   /** Shader programs three.js has compiled (a frame that adds some compiled shaders). */
@@ -463,26 +552,39 @@ export class ViewportEngine {
    */
   private frameDone(): boolean {
     const gl = this.renderer.getContext?.();
+    const gl2 = gl && 'getSyncParameter' in gl ? (gl as WebGL2RenderingContext) : null;
     while (this.framesInFlight.length) {
       const f = this.framesInFlight[0];
       const now = performance.now();
-      if (gl && 'getSyncParameter' in gl && !gl.isContextLost?.() && now - f.start < FENCE_TIMEOUT_MS) {
-        const gl2 = gl as WebGL2RenderingContext;
+      if (gl2 && !gl2.isContextLost?.() && now - f.start < FENCE_TIMEOUT_MS) {
+        if (f.scene) {
+          if (gl2.getSyncParameter(f.scene, gl2.SYNC_STATUS) === gl2.SIGNALED) {
+            gl2.deleteSync(f.scene);
+            f.scene = null;
+            f.sceneDoneAt = now;
+          } else f.sceneBusyAt = now;
+        }
         if (gl2.getSyncParameter(f.fence, gl2.SYNC_STATUS) !== gl2.SIGNALED) break;
+        gl2.deleteSync(f.fence);
+      } else if (gl2 && !gl2.isContextLost?.()) {
+        // given up on after FENCE_TIMEOUT_MS
+        if (f.scene) gl2.deleteSync(f.scene);
         gl2.deleteSync(f.fence);
       }
       this.framesInFlight.shift();
+      this.drawnChanges = f.changes;
       // a frame queued behind another one only started drawing when that one was done
+      const begin = Math.max(f.renderStart, this.lastFrameDone);
       const elapsed = now - Math.max(f.start, this.lastFrameDone);
-      const renders = now - Math.max(f.renderStart, this.lastFrameDone);
       this.lastFrameDone = now;
       this.lastFrameMs = elapsed;
-      this.adaptMultisampling(renders, f.compiled);
+      this.adaptMultisampling(f, begin, now);
       const slow = elapsed > SLOW_FRAME_MS && document.visibilityState === 'visible' ? elapsed : 0;
       if (slowFrameMs.value !== slow) slowFrameMs.value = slow;
       const compiled = slow > 0 && f.compiled;
       if (slowFrameCompiled.value !== compiled) slowFrameCompiled.value = compiled;
     }
+    this.updateViewState();
     const oldest = this.framesInFlight[0];
     if (!oldest) return true;
     const drawing = performance.now() - Math.max(oldest.start, this.lastFrameDone);
@@ -491,30 +593,53 @@ export class ViewportEngine {
   }
 
   /**
-   * Puts a fence after the frame that started at `start`, rendered from `renderStart` and
-   * `compiled` shader programs or not (WebGL2; see {@link frameDone}).
+   * Puts a fence after the frame that started at `start` showing `changes`, rendered from
+   * `renderStart` and `compiled` shader programs or not, whose multisampled renders end at the fence
+   * `scene` (WebGL2; see {@link frameDone}). Without fences, the frame counts as drawn.
    */
-  private fenceFrame(start: number, renderStart: number, compiled: boolean): void {
+  private fenceFrame(
+    start: number,
+    renderStart: number,
+    compiled: boolean,
+    changes: number,
+    scene: WebGLSync | null,
+  ): void {
     const gl = this.renderer.getContext?.();
-    if (!gl || !('fenceSync' in gl)) return;
-    const gl2 = gl as WebGL2RenderingContext;
-    const fence = gl2.fenceSync(gl2.SYNC_GPU_COMMANDS_COMPLETE, 0);
-    if (!fence) return;
-    this.framesInFlight.push({ fence, start, renderStart, compiled });
+    const gl2 = gl && 'fenceSync' in gl ? (gl as WebGL2RenderingContext) : null;
+    const fence = gl2?.fenceSync(gl2.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!gl2 || !fence) {
+      if (scene) gl2?.deleteSync(scene);
+      this.drawnChanges = changes;
+      this.updateViewState();
+      return;
+    }
+    this.framesInFlight.push({
+      fence,
+      start,
+      renderStart,
+      compiled,
+      changes,
+      scene,
+      sceneBusyAt: 0,
+      sceneDoneAt: 0,
+    });
     gl2.flush();
   }
 
   /**
-   * Turns the scene target's multisampling off after a frame whose renders took longer than
-   * {@link MSAA_OFF_FRAME_MS} and draws the view again without it; turns it back on (and redraws)
-   * once a frame takes less than {@link MSAA_ON_FRAME_MS}. A frame that compiled shaders changes
-   * nothing: its time is the compiler's (seconds in software WebGL, even for a light scene), and the
-   * frames after it show what the scene itself costs.
+   * Turns the scene target's multisampling off after a frame whose multisampled renders the GPU was
+   * seen still drawing {@link MSAA_OFF_FRAME_MS} after it could `begin` them, and draws the view
+   * again without it; turns it back on (and redraws) once a frame's renders are seen done in less
+   * than {@link MSAA_ON_FRAME_MS}. Only what was seen counts: a main thread busy with something else
+   * (a rigid body bake) sees a frame done long after the GPU finished it. A frame that compiled
+   * shaders changes nothing: its time is the compiler's (seconds in software WebGL, even for a light
+   * scene), and the frames after it show what the scene itself costs.
    */
-  private adaptMultisampling(ms: number, compiled: boolean): void {
-    if (compiled) return;
-    if (this.multisampling && ms > MSAA_OFF_FRAME_MS) this.setMultisampling(false);
-    else if (!this.multisampling && ms < MSAA_ON_FRAME_MS) this.setMultisampling(true);
+  private adaptMultisampling(f: FrameInFlight, begin: number, now: number): void {
+    if (f.compiled) return;
+    if (this.multisampling && f.sceneBusyAt - begin > MSAA_OFF_FRAME_MS) this.setMultisampling(false);
+    else if (!this.multisampling && (f.sceneDoneAt || now) - begin < MSAA_ON_FRAME_MS)
+      this.setMultisampling(true);
   }
 
   private setMultisampling(on: boolean): void {
@@ -553,7 +678,9 @@ export class ViewportEngine {
     this.objects.sync(s.doc, this.ev, {
       shading,
       showWireOverlay: v.showWireframe.value,
-      xray: v.xray.value || shading === 'WIREFRAME',
+      // X-ray sees through objects in Solid and Wireframe shading only, like Blender's (its Material
+      // Preview and Rendered shading draw them as they are; Edit Mode clicks still select through)
+      xray: shading === 'WIREFRAME' || (shading === 'SOLID' && v.xray.value),
       selected: new Set(st.selectedIds),
       activeId: st.activeId,
       editObjectId: editId,
@@ -761,9 +888,38 @@ export class ViewportEngine {
 
   // ------------------------------------------------------------------ cameras & render
 
+  /** The camera of the frames drawn: the scene camera's view, else the viewport's (as last drawn). */
   get camera(): THREE.PerspectiveCamera | THREE.OrthographicCamera {
     if (this.session.view.cameraView.value && this.ev?.activeCamera?.camera) return this.updateSceneCamera();
-    return this.pose.ortho ? this.orthoCam : this.perspCam;
+    return this.shownPose.ortho ? this.orthoCam : this.perspCam;
+  }
+
+  /**
+   * The pose of the last frame drawn: {@link pose}, or a pose on the way to it while an animated
+   * view change runs. Picking and the view's camera use it (they work on what the person sees).
+   */
+  get shownPose(): ViewPose {
+    return this.shown ?? this.pose;
+  }
+
+  /**
+   * The pose a frame drawn at `now` shows: {@link pose}, or a pose on the way to it while an animated
+   * view change runs. A change of the view during the animation (zooming, panning, orbiting, the
+   * projection or focal length, following someone) ends it: the frame shows the view with the
+   * change, made on the view the animation was going to, like Blender, whose navigation finishes a
+   * running smooth view before it changes the view.
+   */
+  private framePose(now: number): ViewPose {
+    const a = this.animating;
+    if (!a) return this.pose;
+    const t = (now - a.start) / a.dur;
+    if (t >= 1 || !samePose(this.pose, a.to)) {
+      this.animating = null;
+      return this.pose;
+    }
+    // ease in and out; a frame's timestamp can be a little older than the change
+    const k = Math.max(0, t);
+    return lerpPose(a.from, a.to, k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
   }
 
   /** Viewport camera matching the active scene camera (frame fitted into the viewport). */
@@ -821,14 +977,15 @@ export class ViewportEngine {
     return { x: (this.width - w) / 2, y: (this.height - h) / 2, w, h };
   }
 
-  private render(): void {
+  private render(now = performance.now()): void {
     const v = this.session.view;
     const aspect = this.width / Math.max(1, this.height);
+    const pose = (this.shown = this.framePose(now));
     if (!(v.cameraView.value && this.ev?.activeCamera?.camera)) {
-      applyPoseToCamera(this.pose, this.pose.ortho ? this.orthoCam : this.perspCam, aspect);
+      applyPoseToCamera(pose, pose.ortho ? this.orthoCam : this.perspCam, aspect);
     }
     const cam = this.camera;
-    updateGrid(this.grid, this.pose.distance, this.pose.ortho);
+    updateGrid(this.grid, pose.distance, pose.ortho);
     const cl = this.session.state.cursorLocation;
     this.cursor.position.set(cl[0], cl[1], cl[2]);
     this.renderPass.camera = cam;
@@ -849,6 +1006,9 @@ export class ViewportEngine {
       this.transmissionLevels(),
     );
     this.composer.render();
+    // three.js has given the materials drawn their shader programs: those they replaced can go
+    // unless kept for a draw context they have not been drawn in yet (scene-objects.ts replaceSlot)
+    this.objects.disposeReplaced();
     v.viewLabel.value = v.cameraView.value ? 'Camera Perspective' : viewLabel(this.pose);
     for (const cb of this.onAfterRender) cb();
   }
@@ -868,13 +1028,25 @@ export class ViewportEngine {
 
   // ------------------------------------------------------------------ view manipulation
 
+  /**
+   * Sets the view. `animate` (a view change the person asks for: an axis view, an orbit step,
+   * framing) draws the next {@link VIEW_ANIMATION_MS} of frames on the way there from what they
+   * showed, like Blender's smooth view, while {@link pose} is the new view at once: get_view and
+   * renders of the viewport's view read it, and a change of the view made meanwhile (zooming,
+   * panning, orbiting, the projection, another view change) starts from it, so none is lost.
+   */
   setPose(p: ViewPose, animate = false): void {
     this.session.view.following.value = null;
-    if (animate) this.animating = { from: clonePose(this.pose), to: p, start: performance.now(), dur: 220 };
-    else {
-      this.pose = p;
-      this.persistPose();
-    }
+    this.animating = animate
+      ? {
+          from: clonePose(this.shownPose),
+          to: clonePose(p),
+          start: performance.now(),
+          dur: VIEW_ANIMATION_MS,
+        }
+      : null;
+    this.pose = p;
+    this.persistPose();
     this.requestRender();
   }
 
@@ -945,7 +1117,7 @@ export class ViewportEngine {
   rayAt(x: number, y: number): THREE.Raycaster {
     const rc = new THREE.Raycaster();
     rc.setFromCamera(new THREE.Vector2((x / this.width) * 2 - 1, -(y / this.height) * 2 + 1), this.camera);
-    rc.params.Line = { threshold: 0.05 * (this.pose.distance / 10) };
+    rc.params.Line = { threshold: 0.05 * (this.shownPose.distance / 10) };
     rc.params.Points = { threshold: 0.1 };
     return rc;
   }
@@ -1165,16 +1337,11 @@ export class ViewportEngine {
         wires.clearDepth = false;
         comp.addPass(wires);
       }
-      if (transparent) {
-        const unpremultiply = new ShaderPass(UNPREMULTIPLY_SHADER);
-        disposables.push(unpremultiply);
-        comp.addPass(unpremultiply);
-      }
+      const parts = this.captureParts();
+      if (transparent) comp.addPass(parts.unpremultiply);
       // exposure, view transform and sRGB encoding like the path tracer's film (view-transform.ts)
-      const output = new ViewTransformPass();
-      output.setTransform(this.colorManagement.view, this.colorManagement.exposure);
-      disposables.push(output);
-      comp.addPass(output);
+      parts.output.setTransform(this.colorManagement.view, this.colorManagement.exposure);
+      comp.addPass(parts.output);
       this.drawShadows();
       this.transmission.prepare(
         this.renderer,
@@ -1186,20 +1353,9 @@ export class ViewportEngine {
         this.transmissionLevels(),
       );
       comp.render();
+      this.objects.disposeReplaced();
       // copy result (composer read buffer) into a byte target via a fullscreen quad, unblended
-      const quad = new THREE.Mesh(
-        new THREE.PlaneGeometry(2, 2),
-        new THREE.MeshBasicMaterial({
-          map: comp.readBuffer.texture,
-          blending: THREE.NoBlending,
-          toneMapped: false,
-          depthTest: false,
-        }),
-      );
-      disposables.push(quad.geometry, quad.material);
-      const qs = new THREE.Scene();
-      qs.add(quad);
-      const qc = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      parts.quad.material.map = comp.readBuffer.texture;
       const prevTm = this.renderer.toneMapping;
       const prevClear = this.renderer.getClearColor(new THREE.Color());
       const prevAlpha = this.renderer.getClearAlpha();
@@ -1209,7 +1365,7 @@ export class ViewportEngine {
         this.renderer.setRenderTarget(out);
         this.renderer.setClearColor(0x000000, 0);
         this.renderer.clear();
-        this.renderer.render(qs, qc);
+        this.renderer.render(parts.quadScene, parts.quadCamera);
         this.renderer.readRenderTargetPixels(out, 0, 0, width, height, pixels);
       } finally {
         this.renderer.setRenderTarget(null);
@@ -1233,6 +1389,36 @@ export class ViewportEngine {
       state.frame = prevFrame;
       this.invalidate();
     }
+  }
+
+  /**
+   * The output passes and the copy quad of pictures ({@link renderPixels}): kept from one picture
+   * to the next, so that a picture does not link their shader programs again (three.js drops a
+   * program with the last material that uses it: two programs for every picture).
+   */
+  private capture: {
+    output: ViewTransformPass;
+    unpremultiply: ShaderPass;
+    quad: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
+    quadScene: THREE.Scene;
+    quadCamera: THREE.OrthographicCamera;
+  } | null = null;
+
+  private captureParts(): NonNullable<ViewportEngine['capture']> {
+    if (this.capture) return this.capture;
+    const quad = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      new THREE.MeshBasicMaterial({ blending: THREE.NoBlending, toneMapped: false, depthTest: false }),
+    );
+    const quadScene = new THREE.Scene();
+    quadScene.add(quad);
+    return (this.capture = {
+      output: new ViewTransformPass(),
+      unpremultiply: new ShaderPass(UNPREMULTIPLY_SHADER),
+      quad,
+      quadScene,
+      quadCamera: new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1),
+    });
   }
 
   /** Evaluator of final renders (see {@link finalEvaluator}) and the timer that drops it. */
@@ -1341,6 +1527,12 @@ export class ViewportEngine {
 
   dispose(): void {
     cancelAnimationFrame(this.raf);
+    if (this.capture) {
+      this.capture.output.dispose();
+      this.capture.unpremultiply.dispose();
+      this.capture.quad.geometry.dispose();
+      this.capture.quad.material.dispose();
+    }
     this.worldEnv.dispose();
     if (this.finalEvalTimer) clearTimeout(this.finalEvalTimer);
     this.finalEval = null;

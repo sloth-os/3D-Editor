@@ -14,6 +14,7 @@ import {
   defineOperator,
   fcurveKey,
   insertKeyframe,
+  type EditorState,
   type OperatorContext,
 } from '@3d-editor/core';
 import { session as sessionSignal, toasts } from '../src/app/store';
@@ -63,12 +64,14 @@ function select(s: ProjectSession, ...names: string[]): void {
 }
 
 /**
- * Runs an operator as the agent; `doc` is the agent's replica (for edits without an operator).
- * While paused, the replicas keep their updates for each other, as on a slow connection: their
- * edits are made at the same time, neither seeing the other's.
+ * Runs an operator as the agent; `doc` is the agent's replica (for edits without an operator) and
+ * `state` its editor state (its selection, pivot point and 3D cursor). While paused, the replicas
+ * keep their updates for each other, as on a slow connection: their edits are made at the same
+ * time, neither seeing the other's.
  */
 type Agent = ((id: string, params: Record<string, unknown>) => void) & {
   doc: SceneDoc;
+  state: EditorState;
   pause: () => void;
   resume: () => void;
 };
@@ -112,7 +115,7 @@ function agentReplica(s: ProjectSession, opts: { clientID?: number } = {}): Agen
     const r = registry.run(ctx, id, params);
     if (!r.ok) throw new Error(`${id} failed on the agent: ${r.error}`);
   };
-  return Object.assign(run, { doc: peer, pause, resume });
+  return Object.assign(run, { doc: peer, state: ctx.state, pause, resume });
 }
 
 /** Whether the Adjust Last Operation panel is still offered for the last operator. */
@@ -1108,66 +1111,151 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
     value.forEach((v, i) => expect(v, `${name}.${field}[${i}]`).toBeCloseTo(xyz[i], 9));
   };
 
-  it('rotating or scaling an object a move only moved leaves the move adjustable', () => {
-    // regression: a move writes the rotation and scale of each object it moves, unchanged, and an
-    // agent's later edit of them counted as a change of the move: the panel closed with a warning.
-    // Undoing the move keeps the agent's value (Yjs never overwrites a value another origin set)
-    // and the re-run starts from it
-    const cases = [
-      { objects: ['A'], field: 'rotation_euler', value: [0, 0, 1] },
-      { objects: ['A', 'B'], field: 'rotation_euler', value: [0, 0, 1] },
-      { objects: ['A'], field: 'scale', value: [2, 2, 2] },
-      { objects: ['A', 'B'], field: 'scale', value: [2, 2, 2] },
-    ] as const;
+  it('others rotating or scaling an object a move moved keep the move adjustable, unless they move it', () => {
+    // a move writes only the location of each object it moves. Setting the rotation or scale of a
+    // moved object (an agent's transform_object, the Properties editor), or rotating or scaling it
+    // about its own origin (R and S then write only its rotation or scale), edits other fields:
+    // undoing the move keeps the edit and the re-run starts from it. Rotating or scaling it about
+    // another point (the 3D cursor) moves it: that sets the location the move changed
+    const own = (agent: Agent) => {
+      agent.state.selectedIds = [id('A')];
+      agent.state.activeId = id('A');
+    };
+    const aboutCursor = (agent: Agent) => {
+      own(agent);
+      agent.state.pivotPoint = 'CURSOR';
+      agent.state.cursorLocation = [0, 3, 0];
+    };
+    const cases: {
+      name: string;
+      edit: (agent: Agent) => void;
+      adjustable: boolean;
+      field?: 'rotation_euler' | 'scale';
+      value?: number[];
+    }[] = [
+      {
+        name: 'setting the rotation with transform_object',
+        edit: (a) => a('object.transform_set', { objects: ['A'], rotation_euler: [0, 0, 1] }),
+        adjustable: true,
+        field: 'rotation_euler',
+        value: [0, 0, 1],
+      },
+      {
+        name: 'setting the scale in the Properties editor',
+        edit: (a) => a('data.set_property', { kind: 'objects', target: 'A', values: { scale: [2, 2, 2] } }),
+        adjustable: true,
+        field: 'scale',
+        value: [2, 2, 2],
+      },
+      {
+        name: 'rotating it about its own origin (an agent’s transform.rotate on its selection)',
+        edit: (a) => {
+          own(a);
+          a('transform.rotate', { value: 1, orient_axis: 'Z' });
+        },
+        adjustable: true,
+        field: 'rotation_euler',
+        value: [0, 0, 1],
+      },
+      {
+        name: 'rotating it about its own origin (another user’s R, which passes the pivot)',
+        edit: (a) => {
+          own(a);
+          a('transform.rotate', { value: 1, axis: [0, 0, 1], center: [1, 0, 0] });
+        },
+        adjustable: true,
+        field: 'rotation_euler',
+        value: [0, 0, 1],
+      },
+      {
+        name: 'scaling it about its own origin',
+        edit: (a) => {
+          own(a);
+          a('transform.resize', { value: [2, 2, 2] });
+        },
+        adjustable: true,
+        field: 'scale',
+        value: [2, 2, 2],
+      },
+      {
+        name: 'rotating it about the 3D cursor',
+        edit: (a) => {
+          aboutCursor(a);
+          a('transform.rotate', { value: 1, orient_axis: 'Z' });
+        },
+        adjustable: false,
+      },
+      {
+        name: 'scaling it about the 3D cursor',
+        edit: (a) => {
+          aboutCursor(a);
+          a('transform.resize', { value: [2, 2, 2] });
+        },
+        adjustable: false,
+      },
+    ];
     for (const c of cases) {
-      const name = `${c.field} after moving ${c.objects.join(' and ')}`;
       s = fakeSession();
       sessionSignal.value = s;
       lastOperator.value = null;
       cleanup();
       ok('mesh.primitive_cube_add', { name: 'A' });
       ok('mesh.primitive_cube_add', { name: 'B', location: [0, 5, 0] });
-      select(s, ...c.objects);
+      select(s, 'A', 'B');
       ok('transform.translate', { value: [1, 0, 0] });
       const depth = s.undo.undoStack.length;
       const root = panel();
       const agent = agentReplica(s);
-      act(() => agent('object.transform_set', { objects: ['A'], [c.field]: c.value }));
+      act(() => c.edit(agent));
+      const edited = s.doc.encodeState();
       typeNumber(field(root, 'redo-value-0')!, '2');
-      // the adjusted move, from where the objects were, with the agent's edit kept
-      expectLocation('A', [2, 0, 0]);
-      expectVector('A', c.field, c.value);
-      expectLocation('B', c.objects.length === 2 ? [2, 5, 0] : [0, 5, 0]);
-      expect(lastOperator.peek()?.params, name).toEqual({ value: [2, 0, 0], orient_type: 'GLOBAL' });
-      expect(field(root, 'redo-panel'), name).not.toBeNull();
-      expect(panelOffered(s), name).toBe(true);
-      expect(s.undo.undoStack.length, name).toBe(depth);
-      expect(infoLog.value.at(-1)?.level, name).not.toBe('WARNING');
-      // one undo step reverts the adjusted move, keeping the agent's edit
-      s.undo.undo();
-      expectLocation('A', [0, 0, 0]);
-      expectVector('A', c.field, c.value);
-      expectLocation('B', [0, 5, 0]);
+      if (c.adjustable) {
+        // the adjusted move, from where the objects were, with the edit kept
+        expectLocation('A', [2, 0, 0]);
+        expectLocation('B', [2, 5, 0]);
+        expectVector('A', c.field!, c.value!);
+        expect(lastOperator.peek()?.params, c.name).toEqual({ value: [2, 0, 0], orient_type: 'GLOBAL' });
+        expect(field(root, 'redo-panel'), c.name).not.toBeNull();
+        expect(panelOffered(s), c.name).toBe(true);
+        expect(s.undo.undoStack.length, c.name).toBe(depth);
+        expect(infoLog.value.at(-1)?.level, c.name).not.toBe('WARNING');
+        // one undo step reverts the adjusted move, keeping the edit
+        s.undo.undo();
+        expectLocation('A', [0, 0, 0]);
+        expectLocation('B', [0, 5, 0]);
+        expectVector('A', c.field!, c.value!);
+      } else {
+        // nothing is undone or run again, and the panel closes with a warning
+        expect(s.doc.encodeState(), c.name).toEqual(edited);
+        expect(lastOperator.value, c.name).toBeNull();
+        expect(field(root, 'redo-panel'), c.name).toBeNull();
+        expect(infoLog.value.at(-1), c.name).toMatchObject({ level: 'WARNING', message: MOVE_WARNING });
+      }
     }
   });
 
-  it('a rotation and scale the move stored again with rounding still count as left as they were', () => {
-    // regression: a move stores the rotation and scale of each object it moves as decomposed from
-    // its new matrix, which rounds their last digits differently (30° and 45° each lose a unit in
-    // the last place, a scale of 2 becomes 1.9999999999999998; a child of a rotated, scaled parent
-    // gets a rotation of 0 back as -1.1e-16): the rewrite counted as a change, and an agent's later
-    // rotation or scale edit closed the panel
+  it('a rotation or scale about the object’s own origin stays adjustable after others edit its other fields', () => {
+    // R and S about an object's own origin write only its rotation or its scale, also when the
+    // other values are ones a matrix gives back differently (a negative Y scale, a Y angle above 90°)
     const deg = Math.PI / 180;
-    const rotation = [30 * deg, 45 * deg, 60 * deg];
-    const scale = [1.5, 0.5, 2];
     const cases = [
-      { name: 'rotating a rotated, scaled object', edit: 'rotation_euler', value: [0, 0, 1] },
-      { name: 'scaling a rotated, scaled object', edit: 'scale', value: [3, 3, 3] },
       {
-        name: 'rotating the child of a rotated, scaled parent',
-        edit: 'rotation_euler',
-        value: [0, 0, 1],
-        child: true,
+        op: 'transform.rotate',
+        params: { value: 0.5, orient_axis: 'Z' },
+        adjusted: { value: 0.25 },
+        initial: { scale: [1, -1, 1] },
+        edit: { location: [4, 0, 0], scale: [3, -3, 3] },
+        field: 'rotation_euler',
+        expected: [0, 0, 0.25],
+      },
+      {
+        op: 'transform.resize',
+        params: { value: [2, 2, 2] },
+        adjusted: { value: [3, 3, 3] },
+        initial: { rotation_euler: [0, 120 * deg, 0] },
+        edit: { location: [4, 0, 0], rotation_euler: [0, 100 * deg, 0] },
+        field: 'scale',
+        expected: [3, 3, 3],
       },
     ] as const;
     for (const c of cases) {
@@ -1175,25 +1263,90 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
       sessionSignal.value = s;
       lastOperator.value = null;
       ok('mesh.primitive_cube_add', { name: 'A' });
-      ok('object.transform_set', { objects: ['A'], rotation_euler: rotation, scale });
-      let moved = 'A';
-      if ('child' in c) {
-        ok('mesh.primitive_cube_add', { name: 'C' });
-        s.doc.updateObject(id('C'), { parent: id('A') });
-        moved = 'C';
-      }
-      select(s, moved);
-      ok('transform.translate', { value: [1, 0, 0] });
-      agentReplica(s)('object.transform_set', { objects: [moved], [c.edit]: c.value });
-      expect(redoLast(s, registry, { value: [2, 0, 0], orient_type: 'GLOBAL' })?.ok, c.name).toBe(true);
-      const world = s.doc.worldMatrix(id(moved));
-      [12, 13, 14].forEach((k, i) =>
-        expect(world[k], `${c.name}: world location`).toBeCloseTo([2, 0, 0][i], 9),
-      );
-      expectVector(moved, c.edit, c.value);
-      const kept = c.edit === 'scale' ? 'rotation_euler' : 'scale';
-      expectVector(moved, kept, 'child' in c ? [1, 1, 1] : kept === 'scale' ? scale : rotation);
+      ok('object.transform_set', { objects: ['A'], ...c.initial });
+      select(s, 'A');
+      ok(c.op, c.params);
+      agentReplica(s)('object.transform_set', { objects: ['A'], ...c.edit });
+      const last = lastOperator.value!.params as Record<string, unknown>;
+      expect(redoLast(s, registry, { ...last, ...c.adjusted })?.ok, c.op).toBe(true);
+      expectVector('A', c.field, c.expected);
+      // the edits kept
+      for (const [k, v] of Object.entries(c.edit))
+        if (k === 'location') expectLocation('A', [...v]);
+        else expectVector('A', k as 'rotation_euler' | 'scale', v);
+      expect(panelOffered(s), c.op).toBe(true);
     }
+  });
+
+  it('rotating a moved child of an unevenly scaled parent about its own origin keeps the move adjustable', () => {
+    // the rotation also gives the child a new scale (its matrix would be sheared), but not a new
+    // location: the move stays adjustable, and the re-run keeps the rotation and the scale
+    ok('object.empty_add', { name: 'P' });
+    ok('object.transform_set', { objects: ['P'], scale: [2, 1, 1] });
+    ok('mesh.primitive_cube_add', { name: 'A', location: [2, 0, 0] });
+    ok('object.parent_to', { objects: ['A'], parent: 'P' });
+    expectLocation('A', [1, 0, 0]);
+    select(s, 'A');
+    ok('transform.translate', { value: [2, 0, 0] });
+    expectLocation('A', [2, 0, 0]);
+    const agent = agentReplica(s);
+    agent.state.selectedIds = [id('A')];
+    agent.state.activeId = id('A');
+    agent('transform.rotate', { value: Math.PI / 4, orient_axis: 'Z' });
+    const turned = s.doc.findObjectByName('A')!;
+    expect(turned.scale).not.toEqual([1, 1, 1]);
+    expectLocation('A', [2, 0, 0]);
+    expect(redoLast(s, registry, { value: [4, 0, 0] })?.ok).toBe(true);
+    // 4 m along the world's X axis is 2 along the parent's
+    expectLocation('A', [3, 0, 0]);
+    expectVector('A', 'rotation_euler', turned.rotation_euler);
+    expectVector('A', 'scale', turned.scale);
+    expect(panelOffered(s)).toBe(true);
+  });
+
+  it('Randomize Transform stays adjustable after others edit the channels its ranges leave as they were', () => {
+    // with its default ranges it changes only the scale, and stores the location and rotation again
+    // unchanged: an agent's new location and rotation are edits of values it left as they were
+    ok('mesh.primitive_cube_add', { name: 'A', location: [1, 2, 3] });
+    select(s, 'A');
+    ok('object.randomize_transform', { random_seed: 1 });
+    const scale = s.doc.findObjectByName('A')!.scale;
+    expect(scale).not.toEqual([1, 1, 1]);
+    agentReplica(s)('object.transform_set', {
+      objects: ['A'],
+      location: [4, 0, 0],
+      rotation_euler: [0, 0, 1],
+    });
+    const params = lastOperator.value!.params as Record<string, unknown>;
+    expect(redoLast(s, registry, { ...params, random_seed: 2 })?.ok).toBe(true);
+    expectLocation('A', [4, 0, 0]);
+    expectVector('A', 'rotation_euler', [0, 0, 1]);
+    // the scale randomized again from [1, 1, 1], with the other seed
+    expect(s.doc.findObjectByName('A')!.scale).not.toEqual(scale);
+    expect(lastOperator.value?.params).toMatchObject({ random_seed: 2 });
+    expect(panelOffered(s)).toBe(true);
+  });
+
+  it('a value an operation recomputed with its last digits changed still counts as left as it was', () => {
+    // Look At stores the scale of the object it turns again, read back from its new matrix: here a
+    // unit in the last place off. An agent's later scale edit is an edit of a value Look At left as
+    // it was: undoing Look At keeps it, and the re-run turns the object with the agent's scale
+    ok('mesh.primitive_cube_add', { name: 'T', location: [5, 5, 5] });
+    ok('mesh.primitive_cube_add', { name: 'A', location: [1, 2, 3] });
+    const deg = Math.PI / 180;
+    const scale = [1.3, 0.8, 2.1];
+    ok('object.transform_set', { objects: ['A'], rotation_euler: [10 * deg, 25 * deg, 40 * deg], scale });
+    select(s, 'A');
+    ok('object.look_at', { target: 'T' });
+    const stored = s.doc.findObjectByName('A')!.scale;
+    expect(stored).not.toEqual(scale);
+    stored.forEach((v, i) => expect(Math.abs(v - scale[i])).toBeLessThan(1e-15));
+    agentReplica(s)('object.transform_set', { objects: ['A'], scale: [3, 3, 3] });
+    const params = lastOperator.value!.params as Record<string, unknown>;
+    expect(redoLast(s, registry, { ...params, track_axis: 'Y' })?.ok).toBe(true);
+    expectVector('A', 'scale', [3, 3, 3]);
+    expect(lastOperator.value?.params).toMatchObject({ track_axis: 'Y' });
+    expect(panelOffered(s)).toBe(true);
   });
 
   it('a whole number the operation changed counts as changed, however large it is', () => {
@@ -1225,27 +1378,39 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
     );
   });
 
-  it('a value others set at the same time as the move that lost to its rewrite still counts', () => {
-    // regression: the agent scaled A while the user's move was on its way, so neither replica had
-    // the other's edit. Yjs orders values of a field set at the same time by client id: with the
-    // smaller id the agent's scale came before the move's rewrite of the scale and lost to it.
-    // Undoing the move then removed the move's scale and could not bring back the one before it
-    // (the agent's value follows that one), so the adjusted move left A at scale 1
+  const LOOK_WARNING =
+    'Look At can no longer be adjusted: an agent or another user has changed what it did since';
+  /** Cubes T at [5, 5, 5] and A at x = 1 (selected), and A turned towards T with Look At. */
+  const lookAt = () => {
+    ok('mesh.primitive_cube_add', { name: 'T', location: [5, 5, 5] });
+    ok('mesh.primitive_cube_add', { name: 'A', location: [1, 0, 0] });
+    select(s, 'A');
+    ok('object.look_at', { target: 'T' });
+  };
+  /** Look At's parameters with another `track_axis`. */
+  const lookParams = (track_axis: string) => ({ ...(lastOperator.value!.params as object), track_axis });
+
+  it('a value others set at the same time as an unchanged rewrite that lost to it still counts', () => {
+    // regression: the agent moved A while the user's Look At was on its way, so neither replica had
+    // the other's edit. Look At stores A's location again, unchanged. Yjs orders values of a field
+    // set at the same time by client id: with the smaller id the agent's location came before the
+    // rewrite and lost to it. Undoing Look At then removed its location and could not bring back the
+    // one before it (the agent's value follows that one), so the adjusted Look At left A at the origin
     const cases: { name: string; agentClient: number; adjustable: boolean; session?: () => void }[] = [
       { name: "the agent's value lost", agentClient: 1, adjustable: false },
       { name: "the agent's value won", agentClient: 4_000_000_000, adjustable: true },
       {
-        // A's scale is the copy of the move's that the undo brought back
-        name: "the agent's value lost, and the session set A's scale and undid that",
+        // A's location is the copy of Look At's that the undo brought back
+        name: "the agent's value lost, and the session set A's location and undid that",
         agentClient: 1,
         adjustable: false,
         session: () => {
-          s.doc.updateObject(id('A'), { scale: [5, 5, 5] });
+          s.doc.updateObject(id('A'), { location: [5, 5, 5] });
           s.undo.undo();
         },
       },
       {
-        // A is the copy the undo brought back, with a copy of the move's scale
+        // A is the copy the undo brought back, with a copy of Look At's location
         name: "the agent's value lost, and the session deleted A and undid that",
         agentClient: 1,
         adjustable: false,
@@ -1260,64 +1425,55 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
       sessionSignal.value = s;
       lastOperator.value = null;
       s.doc.ydoc.clientID = 2_000_000_000;
-      ok('mesh.primitive_cube_add', { name: 'A' });
-      ok('object.transform_set', { objects: ['A'], scale: [2, 2, 2] });
+      ok('mesh.primitive_cube_add', { name: 'T', location: [5, 5, 5] });
+      ok('mesh.primitive_cube_add', { name: 'A', location: [1, 0, 0] });
       const agent = agentReplica(s, { clientID: c.agentClient });
       select(s, 'A');
       agent.pause();
-      ok('transform.translate', { value: [1, 0, 0] });
-      agent('object.transform_set', { objects: ['A'], scale: [3, 3, 3] });
+      ok('object.look_at', { target: 'T' });
+      agent('object.transform_set', { objects: ['A'], location: [3, 0, 0] });
       agent.resume();
       c.session?.();
       expect(panelOffered(s), c.name).toBe(true);
       // both replicas hold the value that won
-      const scale = c.adjustable ? [3, 3, 3] : [2, 2, 2];
-      expect(s.doc.findObjectByName('A')!.scale, c.name).toEqual(scale);
-      expect(agent.doc.findObjectByName('A')!.scale, c.name).toEqual(scale);
-      const res = redoLast(s, registry, { value: [2, 0, 0], orient_type: 'GLOBAL' });
+      const location = c.adjustable ? [3, 0, 0] : [1, 0, 0];
+      expect(s.doc.findObjectByName('A')!.location, c.name).toEqual(location);
+      expect(agent.doc.findObjectByName('A')!.location, c.name).toEqual(location);
+      const res = redoLast(s, registry, lookParams('Y'));
       if (c.adjustable) {
-        // undoing keeps the agent's value: the adjusted move starts from it
+        // undoing keeps the agent's value: the adjusted Look At starts from it
         expect(res?.ok, c.name).toBe(true);
-        expectLocation('A', [2, 0, 0]);
+        expect(lastOperator.peek()?.params, c.name).toMatchObject({ track_axis: 'Y' });
       } else {
         expect(res, c.name).toBeNull();
-        expectLocation('A', [1, 0, 0]);
-        expect(infoLog.value.at(-1), c.name).toMatchObject({ level: 'WARNING', message: MOVE_WARNING });
+        expect(infoLog.value.at(-1), c.name).toMatchObject({ level: 'WARNING', message: LOOK_WARNING });
       }
-      expect(s.doc.findObjectByName('A')!.scale, c.name).toEqual(scale);
+      expect(s.doc.findObjectByName('A')!.location, c.name).toEqual(location);
     }
   });
 
-  it('after the session undid and redid the move, edits it only rewrote still leave it adjustable', () => {
+  it('after the session undid and redid an operation, edits of what it only rewrote leave it adjustable', () => {
     // Yjs redoes a step as a new stack item with new copies of what it wrote, before or after the
     // agent's edit: the copy knows which of its values are unchanged too
     for (const agentFirst of [false, true]) {
       s = fakeSession();
       sessionSignal.value = s;
       lastOperator.value = null;
-      ok('mesh.primitive_cube_add', { name: 'A' });
-      ok('mesh.primitive_cube_add', { name: 'B', location: [0, 5, 0] });
-      select(s, 'A', 'B');
-      ok('transform.translate', { value: [1, 0, 0] });
+      lookAt();
       const depth = s.undo.undoStack.length;
       const agent = agentReplica(s);
-      const rotate = () => agent('object.transform_set', { objects: ['A'], rotation_euler: [0, 0, 1] });
-      if (agentFirst) rotate();
+      const move = () => agent('object.transform_set', { objects: ['A'], location: [3, 0, 0] });
+      if (agentFirst) move();
       ok('ed.undo');
-      expectLocation('A', [0, 0, 0]);
+      expectVector('A', 'rotation_euler', [0, 0, 0]);
       ok('ed.redo');
-      if (!agentFirst) rotate();
+      if (!agentFirst) move();
       expect(panelOffered(s), `agent first: ${agentFirst}`).toBe(true);
-      const params = lastOperator.value!.params as Record<string, unknown>;
-      expect(redoLast(s, registry, { ...params, value: [2, 0, 0] })?.ok, `agent first: ${agentFirst}`).toBe(
-        true,
-      );
-      expectLocation('A', [2, 0, 0]);
-      expectVector('A', 'rotation_euler', [0, 0, 1]);
-      expectLocation('B', [2, 5, 0]);
+      expect(redoLast(s, registry, lookParams('Y'))?.ok, `agent first: ${agentFirst}`).toBe(true);
+      expectLocation('A', [3, 0, 0]);
       expect(s.undo.undoStack.length).toBe(depth);
     }
-    // what the move changed still counts after the session undid and redid it (round 5's repro)
+    // what a move changed still counts after the session undid and redid it (round 5's repro)
     s = fakeSession();
     sessionSignal.value = s;
     lastOperator.value = null;
@@ -1334,33 +1490,30 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
     expect(infoLog.value.at(-1)).toMatchObject({ level: 'WARNING', message: MOVE_WARNING });
   });
 
-  it('the re-run of an adjusted move knows which values it rewrote unchanged', () => {
-    ok('mesh.primitive_cube_add', { name: 'A' });
-    select(s, 'A');
-    ok('transform.translate', { value: [1, 0, 0] });
+  it('the re-run of an adjusted operation knows which values it rewrote unchanged', () => {
+    lookAt();
     const agent = agentReplica(s);
-    agent('object.transform_set', { objects: ['A'], rotation_euler: [0, 0, 1] });
-    expect(redoLast(s, registry, { value: [2, 0, 0], orient_type: 'GLOBAL' })?.ok).toBe(true);
-    // the re-run is a step of its own: the agent scales A, then the move is adjusted again
-    agent('object.transform_set', { objects: ['A'], scale: [3, 3, 3] });
-    expect(redoLast(s, registry, { value: [4, 0, 0], orient_type: 'GLOBAL' })?.ok).toBe(true);
+    agent('object.transform_set', { objects: ['A'], location: [3, 0, 0] });
+    expect(redoLast(s, registry, lookParams('Y'))?.ok).toBe(true);
+    // the re-run is a step of its own: the agent moves A again, then Look At is adjusted again
+    agent('object.transform_set', { objects: ['A'], location: [4, 0, 0] });
+    expect(redoLast(s, registry, lookParams('-Z'))?.ok).toBe(true);
     expectLocation('A', [4, 0, 0]);
+    // its rotation is what the re-run changed
+    agent('object.transform_set', { objects: ['A'], rotation_euler: [0, 0, 1] });
+    expect(redoLast(s, registry, lookParams('Y'))).toBeNull();
     expectVector('A', 'rotation_euler', [0, 0, 1]);
-    expectVector('A', 'scale', [3, 3, 3]);
-    // its location is what the re-run changed
-    agent('object.transform_set', { objects: ['A'], location: [7, 0, 0] });
-    expect(redoLast(s, registry, { value: [5, 0, 0], orient_type: 'GLOBAL' })).toBeNull();
-    expectLocation('A', [7, 0, 0]);
+    expect(infoLog.value.at(-1)).toMatchObject({ level: 'WARNING', message: LOOK_WARNING });
   });
 
-  it('a move that changed nothing runs again on top of edits of everything it rewrote', () => {
-    // a move by 0 rewrites the location, rotation and scale unchanged: once others have set all
-    // three, Yjs has nothing of it left to undo (it drops the step), and the move runs on top
+  it('a move by 0 changes nothing: it adds no undo step, and adjusting it moves from where others left the object', () => {
     ok('mesh.primitive_cube_add', { name: 'A' });
     ok('mesh.primitive_cube_add', { name: 'B', location: [0, 5, 0] });
     select(s, 'A');
-    ok('transform.translate', { value: [0, 0, 0] });
     const depth = s.undo.undoStack.length;
+    ok('transform.translate', { value: [0, 0, 0] });
+    expect(s.undo.undoStack.length).toBe(depth);
+    expect(lastOperator.value?.undoStep).toBe(false);
     agentReplica(s)('object.transform_set', {
       objects: ['A'],
       location: [3, 0, 0],
@@ -1371,12 +1524,95 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
     expectLocation('A', [4, 0, 0]);
     expectVector('A', 'rotation_euler', [0, 0, 1]);
     expectVector('A', 'scale', [2, 2, 2]);
-    // the earlier step (adding B) is still there, and one undo step reverts the move only
-    expect(s.undo.undoStack.length).toBe(depth);
+    // the adjusted move is one undo step after the earlier one (adding B), which is still there
+    expect(s.undo.undoStack.length).toBe(depth + 1);
     expect(panelOffered(s)).toBe(true);
     s.undo.undo();
     expectLocation('A', [3, 0, 0]);
     expect(s.doc.findObjectByName('B')).not.toBeNull();
+  });
+
+  /** A cube A in Edit Mode with all its vertices selected, and the lowest x and z of its mesh. */
+  const editCube = () => {
+    ok('mesh.primitive_cube_add', { name: 'A' });
+    select(s, 'A');
+    ok('object.mode_set', { mode: 'EDIT' });
+    ok('mesh.select_all', { action: 'SELECT' });
+    const meshId = s.doc.findObjectByName('A')!.data!;
+    const lowest = (axis: number) =>
+      Math.min(...Array.from(s.doc.getMesh(meshId)!.positions).filter((_, i) => i % 3 === axis));
+    return { meshId, minX: () => lowest(0), minZ: () => lowest(2) };
+  };
+
+  it('an operation that only rewrote values unchanged runs again on top of edits of all of them', () => {
+    // an Edit Mode move by 0 stores the mesh's geometry again, unchanged (one blob of binary data).
+    // Once others have stored it again too, Yjs has nothing of the move left to undo (it drops the
+    // step), and the move runs on top of their mesh
+    const { meshId, minX, minZ } = editCube();
+    ok('transform.translate', { value: [0, 0, 0] });
+    const depth = s.undo.undoStack.length;
+    const agent = agentReplica(s);
+    // the agent raises the mesh by 1
+    const raised = agent.doc.getMeshCopy(meshId)!;
+    for (let i = 2; i < raised.positions.length; i += 3) raised.positions[i] += 1;
+    agent.doc.setMesh(meshId, raised);
+    expect(redoLast(s, registry, { value: [1, 0, 0], orient_type: 'GLOBAL' })?.ok).toBe(true);
+    expect([minX(), minZ()]).toEqual([0, 0]);
+    expect(s.undo.undoStack.length).toBe(depth);
+    expect(panelOffered(s)).toBe(true);
+  });
+
+  it('an Edit Mode move others stored the mesh of again can no longer be adjusted (it would move twice)', () => {
+    // the mesh's geometry is one entry holding binary data: the move changed it (other bytes of the
+    // same length), and the agent's edit stores it again. Adjusting would undo nothing of the move
+    // (the agent's mesh is the newer value) and move the vertices again: x from 0 to 2
+    const { meshId, minX } = editCube();
+    ok('transform.translate', { value: [1, 0, 0] });
+    expect(minX()).toBe(0);
+    const agent = agentReplica(s);
+    agent.doc.setMesh(meshId, agent.doc.getMesh(meshId)!);
+    const edited = s.doc.encodeState();
+    expect(redoLast(s, registry, { value: [2, 0, 0], orient_type: 'GLOBAL' })).toBeNull();
+    expect(minX()).toBe(0);
+    expect(s.doc.encodeState()).toEqual(edited);
+    expect(infoLog.value.at(-1)).toMatchObject({ level: 'WARNING', message: MOVE_WARNING });
+  });
+
+  it('a value that is not plain data (a Yjs type, a class instance) always counts as changed', () => {
+    // an operator that replaces an entry with a new value equal to the one it had: a new empty Yjs
+    // map, a new Date. Others then set the entry again: adjusting would replace their value again
+    const reg = new OperatorRegistry();
+    reg.register(
+      defineOperator({
+        id: 'test.reset',
+        label: 'Reset',
+        description: 'Replaces the project meta entry `key` with a new empty Yjs map or a new Date(0)',
+        category: 'Test',
+        redoable: true,
+        schema: z.object({ key: z.enum(['layers', 'stamp']) }),
+        execute(ctx, p) {
+          ctx.doc.transact(() =>
+            ctx.doc.map('meta').set(p.key, p.key === 'layers' ? new Y.Map() : new Date(0)),
+          );
+          return {};
+        },
+      }),
+    );
+    for (const key of ['layers', 'stamp'] as const) {
+      s = fakeSession();
+      sessionSignal.value = s;
+      lastOperator.value = null;
+      expect(runOperator(s, reg, 'test.reset', { key }, 'test').ok, key).toBe(true);
+      expect(runOperator(s, reg, 'test.reset', { key }, 'test').ok, key).toBe(true);
+      const depth = s.undo.undoStack.length;
+      agentReplica(s).doc.map('meta').set(key, 'theirs');
+      expect(redoLast(s, reg, { key }), key).toBeNull();
+      expect(s.doc.map('meta').get(key), key).toBe('theirs');
+      expect(s.undo.undoStack.length, key).toBe(depth);
+      expect(infoLog.value.at(-1)?.message, key).toBe(
+        'Reset can no longer be adjusted: an agent or another user has changed what it did since',
+      );
+    }
   });
 
   it('an entry the operation added again, with the value it had before it was removed, counts as changed', () => {
@@ -1555,8 +1791,8 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
   });
 
   it('an edit of a field the operation changed counts as changing it, whatever part of the field it edits', () => {
-    // every field of an object is stored whole: a rotation writes the location, rotation and scale
-    // of each object it rotates, adding a modifier writes the object's whole modifier stack; setting
+    // every field of an object is stored whole: a rotation writes the whole rotation (all three
+    // angles) of each object it rotates, adding a modifier the object's whole modifier stack; setting
     // the value the operation set again counts too (undoing could not bring back the value from
     // before it); deleting an object removes what an operation wrote into it
     const cases: { name: string; label: string; setup: () => void; agent: (run: Agent) => void }[] = [

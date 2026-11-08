@@ -6,6 +6,7 @@ import {
   type EvaluatedObject,
   type EvaluatedScene,
   type LightData,
+  type MaterialData,
   type MeshData,
   type SceneDoc,
 } from '@3d-editor/core';
@@ -14,6 +15,45 @@ import { boneLines, cameraLines, emptyLines, lightLines, linesObject } from './h
 import { fitSunShadow, SUN_SHADOW_MAP_SIZE } from './sun-shadow';
 import { HIDDEN_LAYER, transmissionOf, transmissionThickness } from './transmission';
 
+/**
+ * The three.js material of one material slot of a mesh, with the key it was built for
+ * ({@link slotMaterialKey}).
+ */
+export interface SlotMaterial {
+  key: string;
+  material: THREE.Material;
+  /**
+   * The draw contexts it was drawn in ({@link drawContext}): three.js holds a shader program of it
+   * for each (see SceneObjects.replaceSlot).
+   */
+  drawnIn: Set<string>;
+  /**
+   * Materials the slot drew with before, kept for the draw contexts {@link material} has not been
+   * drawn in yet: for each such context, the last one drawn there (see SceneObjects.replaceSlot).
+   */
+  kept: Map<string, THREE.Material>;
+}
+
+/**
+ * The draw context of a material drawn after a sync with `opts` (see {@link SlotMaterial.drawnIn}):
+ * what the viewport switches between that changes the shader program three.js gives a material for
+ * a draw. The shading (Material Preview and Rendered light the scene in different ways: lights,
+ * environment, shadows), X-ray in Solid shading (see-through materials have programs of their own)
+ * and whether the object drawn is instanced (collection instances, particle scatters). Other
+ * changes that give every material other programs (a light added, mist turned on) are not told
+ * apart: going back after one links again the programs of the materials changed in between.
+ */
+export function drawContext(opts: Pick<SyncOptions, 'shading' | 'xray'>, instanced: boolean): string {
+  const shading = opts.shading === 'SOLID' && opts.xray ? 'SOLID X-ray' : opts.shading;
+  return instanced ? `${shading} instanced` : shading;
+}
+
+/** The materials of a mesh's slots in a shading kind, and the array the mesh draws with. */
+export interface MaterialSet {
+  slots: SlotMaterial[];
+  materials: THREE.Material[];
+}
+
 /** three.js representation of one document object. */
 export interface ObjectView {
   id: string;
@@ -21,18 +61,20 @@ export interface ObjectView {
   overlayRoot: THREE.Group;
   mesh?: THREE.Mesh;
   meshKey?: string;
-  matKey?: string;
   /**
-   * The mesh's material sets by shading kind (Solid and Wireframe, or Material Preview and
-   * Rendered) and X-ray, with the key each was built for: the one the mesh draws with, and the
-   * ones it drew with before in another kind or X-ray state. Those are kept, not disposed, so
-   * drawing in their shading again (the viewport switching back, a screenshot or render in another
-   * shading than the viewport's, and the viewport's next frame after it) reuses them and the
-   * shader programs three.js compiled for them, which it keeps until their materials are disposed.
-   * Building and compiling them again took 17–22 s for a scene with 71 materials in software WebGL.
-   * A set is built again when its key changed (the materials, the object colour, the mesh's slots).
+   * The mesh's materials by shading kind (Solid and Wireframe, or Material Preview and Rendered),
+   * one per material slot: those the mesh draws with, and those it drew with before in the other
+   * kind. Those are kept, not disposed, so drawing in their shading again (the viewport switching
+   * back, a screenshot or render in another shading than the viewport's, and the viewport's next
+   * frame after it) reuses them and the shader programs three.js compiled for them, which it keeps
+   * until their materials are disposed. Building and compiling them again took 17–22 s for a scene
+   * with 71 materials in software WebGL. Only the material of a slot whose key changed (its
+   * material's values, the object colour) is built again, and the one it replaces is kept until the
+   * new one has been drawn in each context it was drawn in ({@link drawContext}: the shading, X-ray
+   * in Solid shading, instancing): three.js then gives the new one the shader programs of the old
+   * one when their code is the same (the program cache key), instead of compiling them again.
    */
-  materialSets?: Map<string, { key: string; materials: THREE.Material[] }>;
+  materialSets?: Map<ShadingKind, MaterialSet>;
   wire?: THREE.LineSegments;
   wireKey?: string;
   helper?: THREE.LineSegments;
@@ -138,13 +180,43 @@ function disposeObject(o: THREE.Object3D): void {
 }
 
 /**
- * Disposes the material sets a view keeps for other shadings (`materialSets`), not the one its mesh
- * draws with (disposed with the mesh).
+ * The key a slot's material is built for: the material's values, the shading kind, vertex colours,
+ * the images and, for a slot without a material, the object colour (Solid shading draws it).
  */
-function disposeKeptMaterials(v: ObjectView): void {
-  for (const set of v.materialSets?.values() ?? [])
-    if (set.materials !== v.mesh?.material) for (const m of set.materials) m.dispose();
-  v.materialSets = undefined;
+export function slotMaterialKey(
+  m: MaterialData | null,
+  kind: ShadingKind,
+  vertexColors: boolean,
+  imagesRevision: number,
+  objectColor: readonly number[],
+): string {
+  return `${materialKey(m, kind, vertexColors, imagesRevision)}${m ? '' : `|${objectColor.join(',')}`}`;
+}
+
+/** Opacity of objects in X-ray (Solid shading). */
+export const XRAY_OPACITY = 0.45;
+
+/** What X-ray changes on a material, as built (see {@link setXray}). */
+const XRAY_BASE = 'pfxXrayBase';
+
+/**
+ * Makes a material see-through for X-ray, or as built again. three.js compiles another shader
+ * program for a material that turns transparent (its program cache key has `opaque`), and keeps
+ * both until the material is disposed: turning X-ray on and off again reuses them.
+ */
+export function setXray(m: THREE.Material, on: boolean): void {
+  const base = (m.userData[XRAY_BASE] ??= {
+    transparent: m.transparent,
+    opacity: m.opacity,
+    depthWrite: m.depthWrite,
+  }) as { transparent: boolean; opacity: number; depthWrite: boolean };
+  const transparent = on || base.transparent;
+  if (m.transparent !== transparent) {
+    m.transparent = transparent;
+    m.needsUpdate = true;
+  }
+  m.opacity = on ? Math.min(base.opacity, XRAY_OPACITY) : base.opacity;
+  m.depthWrite = on ? false : base.depthWrite;
 }
 
 export interface SyncOptions {
@@ -193,6 +265,8 @@ export class SceneObjects {
     const seen = new Set<string>();
     this.boxes = null;
     this.localShadowsDirty = true;
+    this.context.mesh = drawContext(opts, false);
+    this.context.instanced = drawContext(opts, true);
     for (const o of ev.objects) {
       seen.add(o.id);
       let v = this.views.get(o.id);
@@ -228,12 +302,102 @@ export class SceneObjects {
       if (seen.has(id)) continue;
       this.scene.remove(v.root);
       this.overlay.remove(v.overlayRoot);
-      disposeKeptMaterials(v);
+      this.retireMaterials(v);
       disposeObject(v.root);
       disposeObject(v.overlayRoot);
       this.views.delete(id);
     }
     this.syncInstances(ev, opts);
+  }
+
+  /** Materials no slot uses any more (objects, meshes or slots removed): disposed after the next render. */
+  private orphans: THREE.Material[] = [];
+  /** Slot materials that keep others (see {@link replaceSlot}). */
+  private pending = new Set<SlotMaterial>();
+  /** The draw contexts of the renders after the last sync, of meshes and of instanced meshes. */
+  private readonly context = { mesh: '', instanced: '' };
+
+  /**
+   * Builds the entry of a slot whose key changed, for its new material. three.js gives a material a
+   * shader program for each draw context it is drawn in ({@link drawContext}) and keeps it until the
+   * last material holding it is disposed. The material replaced is therefore kept, for each context
+   * it was drawn in, until the new one has been drawn there too ({@link disposeReplaced}): three.js
+   * then gives the new one the old one's program when their program cache keys are the same (a
+   * change of values that are uniforms: colours, roughness, the parameters of a procedural texture),
+   * instead of linking it again (seconds per program in software WebGL; a program only one material
+   * holds, e.g. a procedural one's, would go with it). Per context the last material drawn there is
+   * kept, no older one; a material never drawn holds no program: it is disposed at once.
+   */
+  private replaceSlot(old: SlotMaterial | undefined, key: string, material: THREE.Material): SlotMaterial {
+    const next: SlotMaterial = { key, material, drawnIn: new Set(), kept: old?.kept ?? new Map() };
+    // three.js calls a material's onBeforeRender right before it draws with it (and gives it its
+    // program for the draw)
+    const context = this.context;
+    const draw = material.onBeforeRender;
+    material.onBeforeRender = function (...args: Parameters<THREE.Material['onBeforeRender']>) {
+      next.drawnIn.add((args[4] as THREE.InstancedMesh).isInstancedMesh ? context.instanced : context.mesh);
+      draw.apply(this, args);
+    };
+    if (old) {
+      this.pending.delete(old);
+      const before = new Set<THREE.Material>();
+      for (const c of old.drawnIn) {
+        const k = next.kept.get(c);
+        if (k) before.add(k);
+        next.kept.set(c, old.material);
+      }
+      for (const k of before) this.release(next, k);
+      if (!old.drawnIn.size) old.material.dispose();
+    }
+    if (next.kept.size) this.pending.add(next);
+    return next;
+  }
+
+  /** Disposes a material a slot kept, once it keeps it for no context. */
+  private release(slot: SlotMaterial, m: THREE.Material): void {
+    for (const k of slot.kept.values()) if (k === m) return;
+    m.dispose();
+  }
+
+  /** Disposes slot materials with those they keep (none: after the next render). */
+  private retireSlots(set: SlotMaterial[]): void {
+    for (const e of set) {
+      this.pending.delete(e);
+      this.orphans.push(e.material, ...new Set(e.kept.values()));
+    }
+    set.length = 0;
+  }
+
+  /** Retires every material of a view's mesh (see {@link retireSlots}); its mesh no longer holds them. */
+  private retireMaterials(v: ObjectView): void {
+    for (const set of v.materialSets?.values() ?? []) this.retireSlots(set.slots);
+    v.materialSets = undefined;
+    if (v.mesh) v.mesh.material = [];
+  }
+
+  /**
+   * Disposes the materials kept for draw contexts the materials that replaced them have been drawn
+   * in since, and those no slot uses any more: call it after each render of the scene (the frame's,
+   * a picture's).
+   */
+  disposeReplaced(): void {
+    for (const e of this.pending) {
+      for (const c of e.drawnIn) {
+        const k = e.kept.get(c);
+        if (!k) continue;
+        e.kept.delete(c);
+        this.release(e, k);
+      }
+      if (!e.kept.size) this.pending.delete(e);
+    }
+    for (const m of this.orphans.splice(0)) m.dispose();
+  }
+
+  /** Materials disposed once others have been drawn (see {@link replaceSlot}). */
+  waitingMaterials(): number {
+    let n = this.orphans.length;
+    for (const e of this.pending) n += new Set(e.kept.values()).size;
+    return n;
   }
 
   /** Collection/particle instances: one InstancedMesh per (owner, source) sharing the source's buffers. */
@@ -289,11 +453,10 @@ export class SceneObjects {
   private clearMesh(v: ObjectView): void {
     if (v.mesh) {
       v.root.remove(v.mesh);
-      disposeKeptMaterials(v);
+      this.retireMaterials(v);
       disposeObject(v.mesh);
       v.mesh = undefined;
       v.meshKey = undefined;
-      v.matKey = undefined;
       v.triFace = undefined;
     }
     if (v.wire) {
@@ -328,36 +491,32 @@ export class SceneObjects {
       slots.length,
       ...v.mesh.geometry.groups.map((g) => (g.materialIndex ?? 0) + 1),
     );
-    const mk =
-      `${opts.xray ? 'x' : ''}|${o.data.color.join(',')}|` +
-      Array.from({ length: usedSlots }, (_, i) =>
-        materialKey(slots[i] ?? null, kind, hasColors, opts.imagesRevision),
-      ).join('#');
-    if (v.matKey !== mk) {
-      // the set of this shading kind and X-ray (see ObjectView.materialSets): kept from when they
-      // were last drawn, or built (again, after a change of the materials or the mesh's slots)
-      const sets = (v.materialSets ??= new Map());
-      const slot = `${kind}${opts.xray ? 'x' : ''}`;
-      let set = sets.get(slot);
-      if (set?.key !== mk) {
-        for (const m of set?.materials ?? []) m.dispose();
-        const materials = Array.from({ length: usedSlots }, (_, i) => {
-          const m = buildMaterial(slots[i] ?? null, kind, doc, this.textures, {
-            objectColor: o.data.color,
-            vertexColors: hasColors,
-          });
-          if (opts.xray) {
-            m.transparent = true;
-            m.opacity = Math.min(m.opacity, 0.45);
-            m.depthWrite = false;
-          }
-          return m;
-        });
-        sets.set(slot, (set = { key: mk, materials }));
-      }
-      v.mesh.material = set.materials;
-      v.matKey = mk;
+    // the materials of this shading kind (see ObjectView.materialSets): kept from when they were
+    // last drawn, a slot's built again when its key changed
+    const sets = (v.materialSets ??= new Map<ShadingKind, MaterialSet>());
+    let set = sets.get(kind);
+    if (!set) sets.set(kind, (set = { slots: [], materials: [] }));
+    const { slots: built } = set;
+    let changed = built.length !== usedSlots;
+    for (let i = 0; i < usedSlots; i++) {
+      const m = slots[i] ?? null;
+      const key = slotMaterialKey(m, kind, hasColors, opts.imagesRevision, o.data.color);
+      if (built[i]?.key === key) continue;
+      const material = buildMaterial(m, kind, doc, this.textures, {
+        objectColor: o.data.color,
+        vertexColors: hasColors,
+      });
+      built[i] = this.replaceSlot(built[i], key, material);
+      changed = true;
     }
+    if (built.length > usedSlots) this.retireSlots(built.splice(usedSlots));
+    // X-ray: see-through in Solid (and Wireframe) shading only, like Blender's, whose Material
+    // Preview and Rendered shading draw objects as they are with X-ray on (a material turned
+    // transparent needs shader programs of its own: tens of seconds for a scene's materials in
+    // Rendered shading in software WebGL)
+    for (const e of built) setXray(e.material, opts.xray && kind === 'SOLID');
+    if (changed) set.materials = built.map((e) => e.material);
+    v.mesh.material = set.materials;
     // how far light travels inside glass: the object's size, not a fixed 0.5 m (transmission.ts)
     const thickness = transmissionThickness(v.mesh.geometry);
     for (const m of v.mesh.material as THREE.Material[]) {
@@ -691,11 +850,12 @@ export class SceneObjects {
     }
     this.instanced.clear();
     for (const v of this.views.values()) {
-      disposeKeptMaterials(v);
+      this.retireMaterials(v);
       disposeObject(v.root);
       disposeObject(v.overlayRoot);
     }
     this.views.clear();
+    this.disposeReplaced();
     this.textures.dispose();
   }
 }

@@ -1,7 +1,17 @@
 import * as Y from 'yjs';
 import type { Vec3 } from '../math/types';
-import { compose4, decompose4, invert4, multiply4 } from '../math/mat4';
+import { compose4, invert4, multiply4, rotationFromEuler } from '../math/mat4';
 import type { Mat4 } from '../math/types';
+import { cross3, dot3, length3 } from '../math/vec3';
+import {
+  EULER_GIMBAL_LOCK,
+  column,
+  compatibleEuler,
+  determinant3,
+  matrixFromAxes,
+  matrixToCompatibleEuler,
+  normalizedAxes,
+} from '../constraints/math';
 import type { MeshData } from '../mesh/types';
 import { cloneMesh } from '../mesh/types';
 import { decodeMesh, encodeMesh, peekMeshCounts } from '../mesh/codec';
@@ -418,14 +428,25 @@ export class SceneDoc {
     return m;
   }
 
-  /** Sets the object's local transform so that its world matrix equals `world`. */
+  /**
+   * Sets the object's local transform so that its world matrix equals `world`, as far as a
+   * location, an XYZ euler rotation and a scale can hold it (shear is dropped). Only what the new
+   * matrix changes is written; a channel it leaves as it was keeps its stored value, bit for bit,
+   * and is not written at all (no Yjs write, nothing for undo, sync or Adjust Last Operation to
+   * see; see {@link changedTransform} for the rules). Every caller relies on that: the transform
+   * operators (Move, Rotate, Scale with typed values and snapping, Duplicate with an offset),
+   * parenting and clearing parents with Keep Transform, removing a parent, Set Origin and Apply
+   * Transform (their children keep their world matrices), and the editor's Align Active Camera to
+   * View.
+   */
   setWorldMatrix(id: string, world: Mat4): void {
     const o = this.getObject(id);
     if (!o) return;
     const parentWorld = o.parent ? this.worldMatrix(o.parent) : null;
-    const local = parentWorld ? multiply4(invert4(parentWorld), world) : world;
-    const d = decompose4(local);
-    this.updateObject(id, { location: d.location, rotation_euler: d.rotation, scale: d.scale });
+    // the world matrix of the stored values, computed as worldMatrix(id) computes it
+    const current = parentWorld ? multiply4(parentWorld, this.localMatrix(o)) : this.localMatrix(o);
+    const patch = changedTransform(o, world, current, parentWorld);
+    if (patch) this.updateObject(id, patch);
   }
 
   /** True if `ancestor` is `id` or one of its parents. */
@@ -1012,6 +1033,221 @@ export class SceneDoc {
     }, SYSTEM_ORIGIN);
     return doc;
   }
+}
+
+/**
+ * How far a transform value recomputed from a matrix may be from the stored one and still count as
+ * unchanged: this fraction of the larger of the two (of 1 m for world locations nearer the origin).
+ * It covers the rounding of the matrix products callers make (rotating 20,000 random objects about
+ * their own origins gave their world locations back up to 2.5e-16 of the largest coordinate off)
+ * and stays far below any change worth storing: a rotation by a billionth of a radian is a thousand
+ * times more. The rotation and scale of a child of a parent scaled unevenly get a larger tolerance
+ * (see {@link changedTransform}).
+ */
+const SAME_TRANSFORM = 1e-12;
+
+/** Whether every component of `a` is within `tol` of the one of `b` (never with a NaN). */
+function within(a: readonly number[], b: readonly number[], tol: number): boolean {
+  for (let i = 0; i < a.length; i++) if (!(Math.abs(a[i] - b[i]) <= tol)) return false;
+  return true;
+}
+
+/**
+ * The channels of object `o` that the world matrix `world` changes, or null when it changes none
+ * (see {@link SceneDoc.setWorldMatrix}). `current` is the world matrix of the stored values,
+ * `parentWorld` the parent's world matrix (null without a parent). Blender's transform tools work
+ * on the stored channels themselves; these rules give the same results from matrices:
+ *
+ * - The location changes only when the object's origin moves (by more than {@link SAME_TRANSFORM}):
+ *   a Move, or a rotation or scale about another point than the object's own origin (the 3D
+ *   cursor, the median point of several objects). Rotating or scaling an object about its own
+ *   origin leaves its location as stored. Blender's Rotate and Scale likewise add only the offset
+ *   of that origin to the stored location.
+ * - The rotation and the scale stay as stored while the 3×3 part of the world matrix is unchanged:
+ *   a Move never writes them (Blender's Move changes only the location). Otherwise each is compared
+ *   with its stored value on its own, in the parent's space: a rotation keeps the stored scale and
+ *   a scale along the object's own axes (any scale of an unrotated object, a uniform scale of any
+ *   object) keeps the stored rotation, as Blender's Rotate and Scale do, except where the result
+ *   would be sheared, or is a scale by negative factors along two axes (both below). The parent's
+ *   inverse amplifies rounding by about the ratio of its longest to its shortest axis, and the
+ *   tolerance of this comparison grows with it: without that, turning the child of a parent scaled
+ *   [1000, 0.01, 1] by 180° about the parent's Z axis (which changes only the child's rotation)
+ *   gave its scale back up to 1.0e-11 off, 8.5e-10 for a parent scaled [10000, 0.001, 1], and
+ *   stored it again.
+ * - A new rotation is the XYZ euler (objects have no other rotation mode or order) closest to the
+ *   stored one, as Blender's Rotate stores it (mat3_to_compatible_eulO): whole turns are kept
+ *   (170° + 20° gives 190°, 730° + 10° gives 740°), and so are |Y| above 90° and |X| or |Z| above
+ *   180°. In gimbal lock (Y within 0.00215° of ±90°) only X − Z or X + Z is defined: Blender then
+ *   sets Z to 0 (plus whole turns) and puts the rest into X; here Z keeps its stored value and X
+ *   takes the rest, which gives the same matrix with angles closer to the stored ones.
+ * - A new scale keeps the stored sign of each axis (a scale of [1, −1, 1] stays negative on Y)
+ *   when the matrix's handedness allows it. A mirroring matrix flips the sign of one axis, or of
+ *   all three, whichever leaves the rotation closest to the stored one: mirroring along the
+ *   object's own X axis flips its X scale and a uniform scale by −1 flips all three, as Blender's
+ *   Scale does (it multiplies each stored scale by the factor along that axis of the object).
+ *   A scale with negative factors along two of the object's axes does not mirror: it is a rotation
+ *   by 180° about the third axis with positive factors, so the signs stay and the rotation turns by
+ *   180° about that axis (S −1 along X and Y of an unrotated object stores a Z rotation of 180° and
+ *   keeps the scale). Blender's Scale keeps the rotation and negates those two scales instead; both
+ *   give the same matrix.
+ *
+ * Shear cannot be stored. A scale along other axes than the object's own (S X on a rotated object)
+ * would shear it: Blender's Scale then keeps the rotation and gives each axis of the object the
+ * factor it gets; here the new rotation and scale are read from the sheared matrix (its X axis
+ * keeps its direction). Rotating the child of a parent scaled unevenly would shear the child too:
+ * Blender's Rotate keeps its scale (the child deforms as it turns); here it takes the rotation and
+ * the scale of its new matrix, without the shear.
+ *
+ * Blender keeps a parent inverse matrix in each child, which this editor does not have. Blender's
+ * parenting keeps the child's channels and stores the inverse of the new parent's matrix; here Keep
+ * Transform recomputes the channels relative to the new parent by these rules (what the new parent
+ * leaves as it was keeps its stored value). Armature Deform and Bone parenting, and clearing a Bone
+ * parent, with Keep Transform do not come here (armatureParentSet and clearBoneParent in
+ * operators/armature.ts): they store all three channels as decompose4 reads them from the new
+ * matrix, also when it is unchanged. Set Origin changes only the object's location, like Blender's;
+ * its children keep their world matrices, which changes only their locations here (Blender
+ * recomputes their channels and their parent inverse instead). Align Active Camera to View sets the
+ * camera's location, rotation (the euler closest to its current one) and scale from the view, like
+ * Blender's (BKE_object_apply_mat4 with compatible eulers).
+ */
+function changedTransform(
+  o: ObjectData,
+  world: Mat4,
+  current: Mat4,
+  parentWorld: Mat4 | null,
+): Partial<ObjectData> | null {
+  const t0 = column(current, 3);
+  const t1 = column(world, 3);
+  const span = Math.max(1, ...t0.map(Math.abs), ...t1.map(Math.abs));
+  const sameLocation = within(t1, t0, SAME_TRANSFORM * span);
+  let sameLinear = true;
+  for (let c = 0; c < 3 && sameLinear; c++) {
+    const a = column(current, c);
+    const b = column(world, c);
+    sameLinear = within(b, a, SAME_TRANSFORM * Math.max(length3(a), length3(b)));
+  }
+  if (sameLocation && sameLinear) return null;
+  const parentInverse = parentWorld ? invert4(parentWorld) : null;
+  const local = parentInverse ? multiply4(parentInverse, world) : world;
+  const patch: Partial<ObjectData> = {};
+  if (!sameLocation) patch.location = column(local, 3);
+  if (!sameLinear) {
+    // the parent's inverse amplifies rounding by about the ratio of its axis lengths
+    let tol = SAME_TRANSFORM;
+    if (parentWorld && parentInverse) {
+      const frobenius = (m: Mat4) => Math.hypot(...[0, 1, 2, 4, 5, 6, 8, 9, 10].map((k) => m[k]));
+      tol *= Math.max(1, (frobenius(parentWorld) * frobenius(parentInverse)) / 3);
+    }
+    const { rotation, scale } = changedRotationScale(o, local, tol);
+    if (rotation) patch.rotation_euler = rotation;
+    if (scale) patch.scale = scale;
+  }
+  return Object.keys(patch).length ? patch : null;
+}
+
+/**
+ * The rotation and scale of object `o` read from the 3×3 part of its new local matrix, each null
+ * when it is its stored value within `tol` (see {@link changedTransform}).
+ */
+function changedRotationScale(
+  o: ObjectData,
+  local: Mat4,
+  tol: number,
+): { rotation: Vec3 | null; scale: Vec3 | null } {
+  const cols = [0, 1, 2].map((c) => column(local, c));
+  const lengths = cols.map(length3);
+  const stored = rotationFromEuler(o.rotation_euler);
+  const old = [0, 1, 2].map((c) => column(stored, c));
+  let signs: number[] = o.scale.map((s) => (s < 0 ? -1 : 1));
+  if (determinant3(local) * signs[0] * signs[1] * signs[2] < 0)
+    signs = mirroredSigns(signs, cols, lengths, old);
+  const scale = signs.map((s, i) => s * lengths[i]) as Vec3;
+  const sameScale = scale.every(
+    (v, i) => Math.abs(v - o.scale[i]) <= tol * Math.max(Math.abs(v), Math.abs(o.scale[i])),
+  );
+  const axes = rotationAxes(
+    cols.map((c, i) => (lengths[i] > 0 ? (c.map((v) => (v * signs[i]) / lengths[i]) as Vec3) : null)),
+    old,
+  );
+  const sameRotation = axes.every((a, i) => within(a, old[i], tol));
+  const rotation = sameRotation
+    ? null
+    : continuousEuler(matrixFromAxes(axes[0], axes[1], axes[2]), o.rotation_euler);
+  const differs = (a: Vec3 | null, b: Vec3) => !!a && a.some((v, i) => v !== b[i]);
+  return {
+    rotation: differs(rotation, o.rotation_euler) ? rotation : null,
+    scale: !sameScale && differs(scale, o.scale) ? scale : null,
+  };
+}
+
+/**
+ * The sign of each scale axis for a matrix whose handedness differs from that of the stored scale
+ * `signs` (it mirrors the object): one axis, or all three, flipped, whichever makes the axes
+ * `cols` (of lengths `lengths`) closest to the stored rotation's axes `old`. Ties go to X.
+ */
+function mirroredSigns(signs: number[], cols: Vec3[], lengths: number[], old: Vec3[]): number[] {
+  let best = signs;
+  let bestScore = -Infinity;
+  for (const flip of [[0], [1], [2], [0, 1, 2]]) {
+    const s = signs.map((v, i) => (flip.includes(i) ? -v : v));
+    let score = 0;
+    for (let i = 0; i < 3; i++) if (lengths[i] > 0) score += (s[i] * dot3(cols[i], old[i])) / lengths[i];
+    if (score > bestScore) {
+      best = s;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+/**
+ * Unit rotation axes from the directions of a matrix's axes (null for an axis scaled to 0, whose
+ * direction is lost): the lost ones are rebuilt perpendicular to the others, as close to the stored
+ * rotation's axes `old` as that allows, keeping the axes right-handed.
+ */
+function rotationAxes(dirs: (Vec3 | null)[], old: Vec3[]): Vec3[] {
+  const known = [0, 1, 2].filter((i) => dirs[i]);
+  if (known.length === 3) return dirs as Vec3[];
+  if (known.length === 0) return old;
+  const out = dirs.slice();
+  const unit = (v: Vec3): Vec3 | null => {
+    const l = length3(v);
+    return l > 1e-9 ? [v[0] / l, v[1] / l, v[2] / l] : null;
+  };
+  if (known.length === 2) {
+    const m = [0, 1, 2].find((i) => !dirs[i])!;
+    out[m] = unit(cross3(dirs[(m + 1) % 3]!, dirs[(m + 2) % 3]!)) ?? old[m];
+  } else {
+    const a = dirs[known[0]]!;
+    const b = (known[0] + 1) % 3;
+    const c = (known[0] + 2) % 3;
+    // the stored next axis made perpendicular to the known one (the one after it when parallel)
+    out[b] =
+      unit([0, 1, 2].map((k) => old[b][k] - a[k] * dot3(old[b], a)) as Vec3) ??
+      unit(cross3(old[c], a)) ??
+      old[b];
+    out[c] = cross3(a, out[b]!);
+  }
+  const axes = out as Vec3[];
+  // right-handed: flip the rebuilt axis if needed
+  if (dot3(cross3(axes[0], axes[1]), axes[2]) < 0) {
+    const m = [0, 1, 2].find((i) => !dirs[i])!;
+    axes[m] = [-axes[m][0], -axes[m][1], -axes[m][2]];
+  }
+  return axes;
+}
+
+/**
+ * The XYZ euler of rotation `rot` closest to `old` (see {@link changedTransform}): Blender's
+ * compatible euler, except that in gimbal lock Z keeps its stored value and X takes the rest.
+ */
+function continuousEuler(rot: Mat4, old: Readonly<Vec3>): Vec3 {
+  const e = matrixToCompatibleEuler(rot, old);
+  const n = normalizedAxes(rot);
+  if (Math.hypot(n[0], n[1]) > EULER_GIMBAL_LOCK) return e;
+  // only X − Z (Y = 90°, n[2] = −sin Y < 0) or X + Z (Y = −90°) is defined, and e has all of it in X
+  const dz = old[2] - e[2];
+  return compatibleEuler([e[0] + (n[2] < 0 ? dz : -dz), e[1], old[2]], old);
 }
 
 /** Convenience: location of the object's world-space origin from stored properties. */

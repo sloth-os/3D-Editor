@@ -664,6 +664,14 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           const loc: Vec3 = p.location ? [0, 0, 0] : o.location;
           const rot: Vec3 = p.rotation ? [0, 0, 0] : o.rotation_euler;
           const scl: Vec3 = p.scale ? [1, 1, 1] : o.scale;
+          // like Blender's Apply Object Transform, only the applied channels are reset; the others,
+          // and channels already at their reset value, are not written at all
+          const reset: Partial<ObjectData> = {};
+          const differs = (a: Vec3, b: Vec3) => a.some((v, i) => v !== b[i]);
+          if (differs(loc, o.location)) reset.location = loc;
+          if (differs(rot, o.rotation_euler)) reset.rotation_euler = rot;
+          if (differs(scl, o.scale)) reset.scale = scl;
+          if (Object.keys(reset).length === 0) continue;
           const before = compose4(o.location, o.rotation_euler, o.scale);
           const after = compose4(loc, rot, scl);
           const delta = multiply4(invert4(after), before); // vertex' = after⁻¹ · before · vertex
@@ -694,7 +702,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           }
           // children keep their world transform
           const childWorld = new Map(ctx.doc.childrenOf(o.id).map((c) => [c.id, ctx.doc.worldMatrix(c.id)]));
-          ctx.doc.updateObject(o.id, { location: loc, rotation_euler: rot, scale: scl });
+          ctx.doc.updateObject(o.id, reset);
           for (const [cid, w] of childWorld) ctx.doc.setWorldMatrix(cid, w);
         }
       },

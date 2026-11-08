@@ -138,16 +138,15 @@ for long renders. The server's own waits for a browser editor outside path traci
   (`pose.bones["Arm"].rotation_euler`, `constraints["Track To"].influence`).
 - **Strict names.** Unknown or misspelled names are rejected with did-you-mean suggestions and the
   list of valid names.
-  - **Tool arguments** are checked before a tool runs, for names as well as types and ranges, at
-    the top level and inside `view`, `selection` (and its `mesh`) and the `operations` of `batch`
-    (and their `selection`), so a rejected call changes nothing: `set_scene_settings {"sampels": 5}`
+  - **Tool arguments** are checked before a tool runs, for names as well as types and ranges, at the
+    top level and inside `view`, `selection` (and its `mesh`) and the `operations` of `batch` (and
+    their `selection`), so a rejected call changes nothing: `set_scene_settings {"sampels": 5}`
     fails with "Input validation error: Invalid arguments for tool set_scene_settings: unknown
-    argument 'sampels'
-    (did you mean 'samples'?). Valid arguments: …". A key that belongs inside a nested argument is
-    pointed there (`'position' goes inside 'view'`). For a key that is no typo of a valid
-    argument, the tools that take `params` add a hint that operator, modifier or command
-    parameters belong there, and `set_material`, `insert_keyframe` and `set_scene_settings` name
-    the operators for settings they do not take. The input schemas in `tools/list` are closed
+    argument 'sampels' (did you mean 'samples'?). Valid arguments: …". A key that belongs inside a
+    nested argument is pointed there (`'position' goes inside 'view'`). For a key that is no typo of
+    a valid argument, the tools that take `params` add a hint that operator, modifier or command
+    parameters belong there, and `set_material`, `insert_keyframe` and `set_scene_settings` name the
+    operators for settings they do not take. The input schemas in `tools/list` are closed
     (`additionalProperties: false`).
   - **Operator and modifier parameters** (the `params` of `run_operator`, `batch`, `edit_mesh`,
     `add_object` and the modifier tools) are checked by the operator registry, at every nesting
@@ -444,10 +443,15 @@ on the second line. A `selection` that cannot be applied fails with these messag
 | An edge the base mesh does not have: two of its vertices that no edge connects (or the same vertex twice) | `POLL_FAILED` | `edge [0, 3]: vertices 0 and 3 are not connected by an edge of the mesh: an edge joins …`                       |
 | A list that `select_mode` does not select from (`EDGE`: only `edges`, `FACE`: only `faces`)               | `POLL_FAILED` | `select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: list only faces, or …` |
 | `all: true` with `verts`, `edges` or `faces`                                                              | `POLL_FAILED` | `all: true selects every element, so the listed faces would change nothing: …`                                  |
+| Both: `all: true` with lists that `select_mode` does not select from                                      | `POLL_FAILED` | `select_mode 'EDGE' selects only the listed edges, so the listed faces would be ignored, and all: true …`       |
 | An unknown project                                                                                        | `NOT_FOUND`   | `Project 'X' not found. Known projects: …`                                                                      |
 
 The code is decided by the kind of error (an unknown project or object is a "not found" error),
-never by the wording of its message.
+never by the wording of its message. Every remedy that a refused element selection names is accepted
+as it is: one message names both problems when they come together, and each of its remedies for the
+lists also leaves `all` out ("…: leave all out and list edges instead, leave all and select_mode out
+(or leave all out and pass 'FACE') to select the listed faces, leave all out and pass 'VERT' to
+select the vertices of the listed faces, or leave the lists out to select everything").
 
 Refused operator ids (failures too, with the `code` named here):
 
@@ -504,7 +508,7 @@ runs it in a live editor (– : no counterpart among the tools):
 | `wm.preferences`, `wm.call_menu`                                                                                                                                                       | –                                                                                                                                                 | Open the Preferences window or a popup menu on the person's screen                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `wm.save_mainfile`                                                                                                                                                                     | Nothing: the server stores projects itself                                                                                                        | Makes that editor sync its WebDAV copy at once if it has one (its copy in the browser is always up to date) and shows the person a "Saved" message                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `view3d.view_all`, `view3d.view_selected`, `view3d.view_axis`, `view3d.view_camera`, `view3d.view_orbit`, `view3d.view_persportho`, `view3d.zoom`                                      | – (`render_image` takes a `view` for any viewpoint)                                                                                               | Change the person's view: `view3d.view_all`, `view3d.view_selected`, `view3d.view_axis` and `view3d.zoom` out of the camera view, `view3d.view_camera` into or out of it (it fails without a scene camera), and in the camera view `view3d.view_orbit` and `view3d.view_persportho` change only the view the person gets back when they leave it (`editor_command` `view.frame_all` and `view.frame_selected` do what `view3d.view_all` and `view3d.view_selected` do, and `view.set_view` what `view3d.view_axis` and `view3d.view_camera` do, but `view.set_view {view: "CAMERA"}` never leaves the camera view) |
-| `view3d.toggle_xray`, `view3d.toggle_overlays`, `view3d.toggle_sidebar`, `view3d.toggle_toolbar`, `view3d.toggle_wireframe_overlay`, `view3d.toggle_snapping`, `view3d.toggle_shading` | –                                                                                                                                                 | Change that editor's display: X-ray (also what the person's clicks select), overlays, sidebar, tool bar, wireframe overlay, snapping of the person's transforms, viewport shading (`editor_command` `view.shading` sets it)                                                                                                                                                                                                                                                                                                                                                                                        |
+| `view3d.toggle_xray`, `view3d.toggle_overlays`, `view3d.toggle_sidebar`, `view3d.toggle_toolbar`, `view3d.toggle_wireframe_overlay`, `view3d.toggle_snapping`, `view3d.toggle_shading` | –                                                                                                                                                 | Change that editor's display: X-ray (see-through objects in Solid shading only; in Edit Mode the cage shows through and the person's box selections and vertex and edge clicks also select hidden elements), overlays, sidebar, tool bar, wireframe overlay, snapping of the person's transforms, viewport shading (`editor_command` `view.shading` sets it)                                                                                                                                                                                                                                                       |
 | `wm.tool_set`, `screen.workspace_set`                                                                                                                                                  | –                                                                                                                                                 | Change the person's active tool (what their mouse does) or workspace layout (Shading also switches their viewport to Material Preview)                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 Two of the messages (one line each):
@@ -543,15 +547,14 @@ stops at the first failure and keeps the changes made before it.
 The result is `{ok, executed, failed, results, selection}`. Each entry of `results` is
 `{operator, ok, result}` or `{operator, ok: false, error, code}` (`code` as for `run_operator`: an
 operation whose `selection` cannot be applied fails with an `error` starting with `selection:` and
-the message of the table above, with `NOT_FOUND` for an unknown object and `POLL_FAILED`
-otherwise; unknown operator ids and the browser editor's UI operators are refused with the
-messages of `run_operator` and `NOT_FOUND`, `render.render_software` and `render.render_animation`
-with `FAILED`), with `reports` when the operator reported anything. `error` is one line, as in
-`run_operator`.
-`operations_with_warnings` is added when some operations reported a WARNING or ERROR (failed ones
-included) and counts them. When an operation failed, the tool result is an error whose text starts
-with "_n_ of _m_ operation(s) failed" followed by the same JSON. When the call fails as a whole (an
-unknown project), the first line is the message and the JSON adds `error` and `code`
+the message of the table above, with `NOT_FOUND` for an unknown object and `POLL_FAILED` otherwise;
+unknown operator ids and the browser editor's UI operators are refused with the messages of
+`run_operator` and `NOT_FOUND`, `render.render_software` and `render.render_animation` with
+`FAILED`), with `reports` when the operator reported anything. `error` is one line, as in
+`run_operator`. `operations_with_warnings` is added when some operations reported a WARNING or ERROR
+(failed ones included) and counts them. When an operation failed, the tool result is an error whose
+text starts with "_n_ of _m_ operation(s) failed" followed by the same JSON. When the call fails as
+a whole (an unknown project), the first line is the message and the JSON adds `error` and `code`
 (`{ok: false, executed: 0, failed: 0, results: [], error, code: "NOT_FOUND"}`).
 
 ### Objects
@@ -636,7 +639,7 @@ spline's `material_index`. Presets, procedural textures and the other Principled
 Arguments: `project`, `object`, `operator`, `params`, `selection` (`verts`, `edges`, `faces`,
 `all`), `select_mode` (`VERT`, `EDGE`, `FACE`; default: inferred from the lists), as in the `mesh`
 of a `run_operator` selection: `select_mode` `EDGE` selects only `edges` and `FACE` only `faces`,
-other lists with them are refused, and so is `all: true` with lists.
+other lists with them are refused, and so is `all: true` with lists (with the same messages).
 
 Runs an edit-mode operator on one mesh object: enters Edit Mode, selects the given elements
 (everything by default), runs the operator and returns to Object Mode, as one undo step. Use it for
@@ -645,9 +648,10 @@ Runs an edit-mode operator on one mesh object: enters Edit Mode, selects the giv
 `transform.rotate` and `transform.resize` on elements, `object.material_slot_assign {index}` on a
 face selection and the `uv.*` unwrap operators. Indices are those of the base mesh (`get_mesh_data`
 with `source: BASE`); an edge `[a, b]` is two vertices that follow each other in one of its faces
-(the last with the first), or one of its loose edges. The result is `{ok, operator, result, reports,
-mesh, selection_after}`: `mesh` statistics and the selected element indices afterwards (at most 500
-of each kind). Afterwards the object is the agent's selected and active object, in Object Mode.
+(the last with the first), or one of its loose edges. The result is
+`{ok, operator, result, reports, mesh, selection_after}`: `mesh` statistics and the selected element
+indices afterwards (at most 500 of each kind). Afterwards the object is the agent's selected and
+active object, in Object Mode.
 
 Every failure is an error result like those of `run_operator`: the first line is the message,
 followed by JSON `{ok: false, operator, error, code, selection}` (with `result`, `reports`, `mesh`
@@ -794,18 +798,17 @@ What the formats contain:
     mesh whose first Armature modifier uses an exported armature, without its other modifiers);
     other changing deformation is baked into morph targets, at most about 12 million floats of
     them (counted per written vertex), keeping every n-th frame beyond that, with a warning.
-  - **Procedural textures** are baked into PNG images sized per mesh at about 64 texels per metre
-    of surface (512–2048 px, powers of two; a UV-mapped bake shared by several meshes is sized for
-    the largest), all automatic bakes within a budget of 3 × 2048² texels (but none below 512
-    px). `bake_resolution` sets one size for every bake, without the budget: raise it for large
-    objects that look blurry, lower it for scenes with many baked meshes, whose files can
-    otherwise be large. A material
-    whose bake depends on the mesh (GENERATED or OBJECT mapping, bump) is written once per
-    distinct mesh, named `Name`, `Name.001` … (images follow), with a warning. A mesh without UVs,
-    or with overlapping UVs, gets generated UVs (Smart UV Project) for its GENERATED/OBJECT-mapped
-    textures, with a warning; when image textures or UV-mapped procedurals need its own UVs, those
-    are kept and a warning says the bake is wrong where faces overlap. Image textures on a mesh
-    without UVs are dropped, with a warning.
+  - **Procedural textures** are baked into PNG images sized per mesh at about 64 texels per metre of
+    surface (512–2048 px, powers of two; a UV-mapped bake shared by several meshes is sized for the
+    largest), all automatic bakes within a budget of 3 × 2048² texels (but none below 512 px).
+    `bake_resolution` sets one size for every bake, without the budget: raise it for large objects
+    that look blurry, lower it for scenes with many baked meshes, whose files can otherwise be
+    large. A material whose bake depends on the mesh (GENERATED or OBJECT mapping, bump) is written
+    once per distinct mesh, named `Name`, `Name.001` … (images follow), with a warning. A mesh
+    without UVs, or with overlapping UVs, gets generated UVs (Smart UV Project) for its
+    GENERATED/OBJECT-mapped textures, with a warning; when image textures or UV-mapped procedurals
+    need its own UVs, those are kept and a warning says the bake is wrong where faces overlap. Image
+    textures on a mesh without UVs are dropped, with a warning.
   - **Not exported**: the sky, mist, the world, drivers and constraints themselves, and animated
     camera, light, material and world properties (a warning names them; the file keeps their values
     at the export frame; a value held by two equal BEZIER keys can be reported too, from rounding);
@@ -861,22 +864,23 @@ arrives before such a client gives up with "Request timed out"; a path trace tha
 progress notifications (below), and the client needs a longer request timeout or one that it resets
 on progress.
 
-If a browser render fails or times out, `auto` renders on the server instead and says why in
-`note`, and `browser` fails with what to do (a path trace: lower `time_limit` or the size, or path
-trace on the server). The editor does not stop drawing an image the server stopped waiting for, and
-until it has finished, its next renders and commands wait behind it. Meanwhile `render_image`
-sends renders to another connected editor that is not busy (without `client`), else `auto` renders
-on the server without asking the busy editor (its `note` says so), and the errors of `browser`
-renders and `editor_command` name the earlier request the editor was still busy with ("it was
-still busy with an earlier request that the server had stopped waiting for: a RASTER render sent
-16 s ago"). A path trace runs on the editor's render workers and does not hold up its other
-requests. An editor that answered its last raster image (of the same shading: `SOLID` is judged
-apart) after the server had stopped waiting, or took longer than the 15 s `auto` waits, is not
-asked by `auto` for 2 minutes after that image either: in software WebGL every raster image of a
-heavy scene can take about 20 s (a 71-material scene in a headless editor), and `auto` would
-otherwise wait 15 s in vain for every other render. A faster answer (`renderer: "browser"`, which
-waits longer) makes `auto` use the editor again at once. The notes and the error of a raster image
-that timed out (one line each):
+If a browser render fails or times out, `auto` renders on the server instead and says why in `note`,
+and `browser` fails with what to do (a path trace: lower `time_limit` or the size, or path trace on
+the server). The editor does not stop drawing an image the server stopped waiting for, and until it
+has finished, its next renders and commands wait behind it. Meanwhile `render_image` sends renders
+to another connected editor that is not busy (without `client`), else `auto` renders on the server
+without asking the busy editor (its `note` says so), and the errors of `browser` renders and
+`editor_command` name the earlier request the editor was still busy with ("it was still busy with an
+earlier request that the server had stopped waiting for: a RASTER render sent 16 s ago"). A path
+trace runs on the editor's render workers and does not hold up its other requests. An editor that
+answered its last raster image (of the same shading: `SOLID` is judged apart) after the server had
+stopped waiting, or took longer than the 15 s `auto` waits, is not asked by `auto` for 2 minutes
+after that image either, so that `auto` does not wait 15 s in vain for each render of an editor that
+stays that slow: in software WebGL a raster image can take longer than `auto` waits (in a headless
+editor at the default 800×450, the first image of a 71-material scene took 21.9–26.7 s while it
+compiled the materials, and the next ones 3.7–4.7 s; images of 4 million triangles took 4.6–10.2 s).
+A faster answer (`renderer: "browser"`, which waits longer) makes `auto` use the editor again at
+once. The notes and the error of a raster image that timed out (one line each):
 
 ```text
 note:  browser render failed: the editor did not finish the RASTER image within 15 s (renderer 'auto'
@@ -1020,7 +1024,7 @@ project closes before it answers (see `run_operator` below). Commands:
 | `notify`              | `message`                                                                                                                         | Show a message to the user                                                                                                                                                                             |
 | `run_operator`        | `operator`, `params`                                                                                                              | Run an operator in that editor, with its selection and its undo history (also UI-only operators)                                                                                                       |
 | `screenshot`          | `width`, `height` (whole pixels, 16–4096; default: the viewport size), `shading` (as for `view.shading`; default: the viewport's) | A PNG of the viewport as the person sees it (returned as an image), see below                                                                                                                          |
-| `get_view`            | –                                                                                                                                 | The viewport's target, distance, yaw, pitch, orthographic flag and camera view state                                                                                                                   |
+| `get_view`            | –                                                                                                                                 | The viewport's target, distance, yaw, pitch, orthographic flag and camera view state; during an animated view change (`view.set_view`, `view.frame_all`, `view.frame_selected`) the view it ends on    |
 
 Enum values are case-insensitive. Unknown commands and misspelled parameter names are refused by the
 server, and so are invalid values of `screenshot` (a `width` or `height` that is not a whole number
@@ -1035,106 +1039,118 @@ mesh, the camera view without a scene camera) answers `ok: false` with the reaso
 `select` answers `{selected, names}`; `[]` deselects everything.
 
 `screenshot` shows the viewport as the person sees it: its view (the scene camera when the viewport
-looks through it), in the shading the viewport shows, or in `shading` when given, without overlays.
-It is rasterized (WebGL) like the viewport, never path traced: `MATERIAL` is Material Preview (a
-studio environment lights the scene, unlike the `MATERIAL` of `render_image`, which shows the
-scene's lights and world), and `RENDERED` is the Rendered viewport (the scene's lights and world,
-with shadows when the render settings use them), also when the scene's render engine is
-`PATHTRACER`: path traced images come from `render_image`. The first screenshot in a shading the
-editor has not drawn since it opened the project costs as much as the viewport's first frame in it,
-and the editor keeps what it built for both until the materials change (see below); the viewport
-keeps its own shading.
+looks through it; during an animated view change the view it ends on), in the shading the viewport
+shows, or in `shading` when given, without overlays. It is rasterized (WebGL) like the viewport,
+never path traced: `MATERIAL` is Material Preview (a studio environment lights the scene, unlike the
+`MATERIAL` of `render_image`, which shows the scene's lights and world), and `RENDERED` is the
+Rendered viewport (the scene's lights and world, with shadows when the render settings use them),
+also when the scene's render engine is `PATHTRACER`: path traced images come from `render_image`.
+The first screenshot in a shading the editor has not drawn since it opened the project costs as much
+as the viewport's first frame in it, and the editor keeps what it built for both (a material edit
+that needs a shader no material had compiles it, see below); the viewport keeps its own shading.
 
 `run_operator` is how agents run the operators of the browser editor's own user interface
 (`view3d.*`, `wm.*`, `screen.*`, `ed.*`, `render.render` …), which the `run_operator` tool refuses
-with a message that names this command (`editor_command {project, command: 'run_operator', params:
-{operator: 'view3d.view_all', params: {}}}`) and says what it does there. They act on that editor
-and the person at it: its view, its selection, its frame and its undo history (`ed.undo` undoes the
-last change there: the person's, or an operator the agent ran there with `editor_command`, never the
-agent's changes made with the tools: use the `undo` tool for those), windows on the person's
-screen, even the project it has open and the person's clipboard (`wm.share`), and the interactive
-ones wait for the person's mouse (`object.duplicate_move` duplicates the person's selection and
-leaves a move running, `view3d.transform_modal` starts one): for edits, use the server operators
-and tools the refusal names (`object.duplicate {offset}`, `transform.translate`, `create_project`
-…). `wm.read_homefile` creates a new project and switches the editor to it, which closes its
-connection to the agent's project before it can answer, so the tool answers with an error that
-says so: "editor_command 'run_operator' got no answer for wm.read_homefile, as expected: the editor
-creates a new project ('Untitled') and switches to it, which closes its connection to this project
-before it can answer; list_projects lists the new project, get_connected_clients the editors that
-still have this one open." When the connection closes before the answer for another reason (the
-page was closed or reloaded, the editor opened another project or lost its connection, or the
-server closed the project), the error says so and that whether the editor carried the command out
-is unknown.
+with a message that says what each one does there and names this command: `editor_command` with
+`{project, command: 'run_operator', params: {operator: 'view3d.view_all', params: {}}}`. They act on
+that editor and the person at it: its view, its selection, its frame and its undo history (`ed.undo`
+undoes the last change there: the person's, or an operator the agent ran there with
+`editor_command`, never the agent's changes made with the tools: use the `undo` tool for those),
+windows on the person's screen, even the project it has open and the person's clipboard
+(`wm.share`), and the interactive ones wait for the person's mouse (`object.duplicate_move`
+duplicates the person's selection and leaves a move running, `view3d.transform_modal` starts one):
+for edits, use the server operators and tools the refusal names (`object.duplicate {offset}`,
+`transform.translate`, `create_project` …). `wm.read_homefile` creates a new project and switches
+the editor to it, which closes its connection to the agent's project before it can answer, so the
+tool answers with an error that says so: "editor_command 'run_operator' got no answer for
+wm.read_homefile, as expected: the editor creates a new project ('Untitled') and switches to it,
+which closes its connection to this project before it can answer; list_projects lists the new
+project, get_connected_clients the editors that still have this one open." When the connection
+closes before the answer for another reason (the page was closed or reloaded, the editor opened
+another project or lost its connection, or the server closed the project), the error says so and
+that whether the editor carried the command out is unknown.
 
 `timeout_ms` is how long the server waits for the editor's answer, at most 55000 (less than the 60 s
 request timeout of MCP clients built on the TypeScript SDK, so the server's error arrives first). An
 editor builds and compiles the scene's materials for `MATERIAL` or `RENDERED` shading the first time
 it draws that shading after it opened the project, for a screenshot or a frame of its viewport, and
-keeps them for later ones until they change: after a material edit, the next screenshot or frame in
-each of these shadings builds the materials of the objects that use it again, and compiles their
-shaders again unless other objects' materials share them. Without GPU acceleration (software WebGL,
-as in a headless browser) the first time takes tens of seconds for a heavy scene, and compiling the
-shaders of one object again seconds. In such an editor (headless Chromium, a scene of 81 objects and
-71 materials, 1280×720 screenshots, the viewport in `SOLID`), the first `RENDERED` screenshot took
-20–24 s and the next ones 1.0–1.5 s, the first `MATERIAL` one 21–23 s (also after the `RENDERED`
-ones) and the next ones 1.3–1.5 s; `SOLID` and `WIREFRAME` screenshots took 0.7–1.4 s, and
-`render_image` with `shading: "SOLID"` (grey clay; rendered on the server, as the scene's render
-engine was `PATHTRACER`) 1.8–3 s. Switching the viewport to `RENDERED` after a `RENDERED` screenshot
-reused its materials (screenshots in its shading then took 1.3–2.0 s), while switching it to
-`MATERIAL` or `RENDERED` first took 20–23 s until its first frame was drawn, which screenshots
-waited for. After an edit of the material of the table or of the dowels (procedural wood textures,
-whose shaders no other object shares) the next `RENDERED` screenshot took 10–15 s, more than the
-default `timeout_ms`, and later ones 0.9–1.5 s again; after another such edit the next `MATERIAL`
-screenshot took 11.6 s and the next `RENDERED` one after it 12.1 s (each shading compiles its own);
-after edits of materials whose shaders other objects share (the plastics, the toy blocks, the
-aluminium, the plaster) it took 1.2–1.9 s, after those of the floor (a `BRICK` texture) and of the
-glass marble 2.6 s and 1.8 s. With the viewport in `RENDERED`, commands sent after such an edit
-answered in 11–78 ms, the next screenshot took 12.8–13.5 s (4.6–6.0 s when sent 20–45 s after the
-edit), and a `SOLID` screenshot sent right after the edit 6.5 s, as it waited for the viewport's
-frame. (These edit timings were measured while other test suites ran on the machine.) A scene of
-millions of triangles takes seconds per frame in any shading: with 4 million triangles a `SOLID`
-screenshot took 8.5–10.6 s and a `WIREFRAME` one 18 s. The other commands draw nothing themselves,
-but wait while the editor draws its viewport: 4.1–5.2 s after the viewport switched to `MATERIAL` or
-`RENDERED` for the first time (while it built the materials; compiling them then held up only
-screenshots), 3.1–3.2 s with 4 million triangles, milliseconds otherwise.
+keeps them for later ones. A material edit builds that material again and keeps the one it replaces
+until the new one has been drawn in every shading the old one was drawn in, so the new one gets the
+old one's shader when they need the same one: an edit of values (colours, roughness, the type and
+settings of a procedural texture) compiles nothing, and an edit that needs a shader no material had
+(coat or sheen turned on, procedural textures on a set of channels that no other material has)
+compiles it for the next screenshot or frame in each of these shadings. Without GPU acceleration
+(software WebGL, as in a headless browser) the first time takes tens of seconds for a heavy scene,
+and compiling one shader seconds.
 
-The editor finishes a command the server stopped waiting for, and keeps the materials a screenshot
-built: a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 21 s later
-(the rest of the first one, then one frame), and the next one in 1.2 s; a `get_view` sent right
-after the timeout also waited 22 s. With the default `timeout_ms` the first try and the first retry
-timed out, and the second retry answered in 4 s. After an edit of the table's material, a `RENDERED`
-screenshot that timed out after 3 s, retried at once, answered 9.5–11 s later and the next one in
-0.9–1.5 s; with the default `timeout_ms` the first try timed out and the retry answered in 3.4 s.
-When the editor does not answer in time the error says so and what to do (one line each):
+Measured in such an editor (headless Chromium with SwiftShader, a scene of 81 objects and 71
+materials, 1280×720 screenshots, each case in two or more runs; the times vary with the machine's
+load), with the viewport in `SOLID`: the first `MATERIAL` or `RENDERED` screenshot took 18.8–24.7 s,
+also when the other had been drawn before, and the next ones 0.9–1.2 s; `SOLID` and `WIREFRAME`
+screenshots took 0.6–0.9 s, and `render_image` with `shading: "SOLID"` (grey clay; rendered on the
+server, as the scene's render engine was `PATHTRACER`) 1.7–3.6 s. Switching the viewport to
+`MATERIAL` or `RENDERED` the first time took 18.5–26.4 s until its first frame was drawn;
+screenshots in its shading then took 0.9–2.2 s, the first one in the other of the two 18.8–25.5 s
+and the next ones 1.3–1.9 s, and `SOLID` or `WIREFRAME` ones 0.9–1.2 s. After roughness edits of the
+table, the dowels, the floor, the glass marble and two plastics, the next screenshots in both
+shadings took 0.8–3.1 s, in either order and with the viewport in any shading, and no shader was
+compiled. After edits that needed a new shader (coat or sheen turned on, a `NOISE` or `VORONOI`
+texture on a channel that no material had textured), the viewport in `MATERIAL` or `RENDERED` had
+drawn the change 0.9–2.2 s after the edit, and the first screenshot in the other of the two took
+1.4–3.6 s; with the viewport in `SOLID`, the first screenshot in each of the two took 1.0–3.6 s. A
+screenshot waits until the frame the viewport is drawing is done, also a `SOLID` or `WIREFRAME` one,
+so one sent while the viewport draws such a change or its first frame in a shading takes up to that
+frame's time longer. X-ray changes nothing in `MATERIAL` or `RENDERED` shading outside Edit Mode:
+the viewport's next frame took 0.4–1.2 s, and no shader was compiled. A scene of millions of
+triangles takes seconds per frame in any shading: with 4 million triangles and the viewport in
+`SOLID`, a screenshot without `shading` or with `shading: "SOLID"` took 5.5–8.9 s, a `WIREFRAME` one
+6.7–15.4 s, and the first `MATERIAL` and `RENDERED` ones 8.2–9.2 s (6.1–7.4 s later). The other
+commands draw nothing themselves, but wait while the editor's main thread is busy: for 4.6–6.2 s
+after the viewport switched to `MATERIAL` or `RENDERED` for the first time (while it builds the
+scene's materials; the rest of that frame holds up only screenshots), for the whole of a screenshot
+it draws, and with 4 million triangles for each frame it draws (a `select` took 2.5–3.5 s there, and
+a `get_view` sent during a `select` or a screenshot waited until it was done: up to 8.5 s). An
+editor that was not busy answered a `get_view` in milliseconds.
+
+The editor finishes a command the server stopped waiting for, and keeps what a screenshot compiled:
+a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 17.7–19.8 s later
+(the rest of the first one, then one frame), and the next one in 1.2–1.5 s. With the default
+`timeout_ms` a first `MATERIAL` screenshot and its first retry timed out, and the second retry
+answered in 2.1–4.3 s. After an edit that needed a new shader, `RENDERED` and `MATERIAL` screenshots
+with `timeout_ms: 1000` timed out, and their retries answered in 1.3–2.3 s. When the editor does not
+answer in time the error says so and what to do (one line each):
 
 ```text
 editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most
 55000); it may still carry the command out, and its next commands and renders wait until it has. The
 screenshot is drawn in the viewport's shading, like a frame of the viewport. An editor without GPU
-acceleration (software WebGL, e.g. a headless browser) takes seconds for that with a heavy scene in
-MATERIAL or RENDERED shading, and tens of seconds for its first screenshot or frame in one of them
-after it opened the project, while it builds and compiles the scene's materials for that shading.
-After a material edit, its next screenshot or frame in each of these shadings can compile the
-shaders of the objects with that material again (10–15 s for an object with procedural wood
-textures). It keeps what it compiled, so a retry waits for the editor to finish and then takes about
-one frame. Retry with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for the
-screenshot (grey clay, much faster); for a quick look use render_image with shading 'SOLID', and
-render_image for final images.
+acceleration (software WebGL, e.g. a headless browser) takes seconds for that with a scene of
+millions of triangles in any shading (5.5–8.9 s in SOLID with 4 million) and with a heavy scene in
+MATERIAL or RENDERED shading, and tens of seconds for its first screenshot or frame in one of these
+two after it opened the project, while it builds and compiles the scene's materials for that
+shading. After a material edit that needs a shader no material had (coat or sheen turned on, a
+procedural texture on a set of channels that no other material has), its next screenshot or frame in
+each of these two compiles it (0.9–3.6 s measured). It keeps what it compiled, so a retry waits for
+the editor to finish and then takes about one frame. Retry with a larger timeout_ms (at most 55000),
+or pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use
+render_image with shading 'SOLID', and render_image for final images.
 
 editor_command 'select' failed: the editor did not answer within timeout_ms = 10000 ms (at most
 55000); it may still carry the command out, and its next commands and renders wait until it has.
 'select' waits while the editor draws its viewport. An editor without GPU acceleration (software
 WebGL, e.g. a headless browser) takes seconds per frame for a scene with millions of triangles, and
-seconds for its first frame of a heavy scene in MATERIAL or RENDERED shading, while it builds the
-scene's materials. Pass a larger timeout_ms (at most 55000), or switch the viewport to SOLID shading
-(editor_command view.shading {shading: 'SOLID'}), which draws much faster.
+seconds for its first frame of a heavy scene in MATERIAL or RENDERED shading, while it builds and
+compiles the scene's materials. Pass a larger timeout_ms (at most 55000), or switch the viewport to
+SOLID shading (editor_command view.shading {shading: 'SOLID'}), which draws much faster.
 ```
 
 A screenshot with `shading` `MATERIAL` or `RENDERED` says the same about that shading; one with
 `shading` `SOLID` or `WIREFRAME` says that a scene with millions of triangles takes seconds even
-then and that a screenshot waits for the viewport's frames in `MATERIAL` or `RENDERED` shading that
-compile shaders (its first one, and its first one after a material edit), and advises `render_image`
-with `renderer: "software"`, which renders without the editor. At the maximum the advice starts with
+then, that a screenshot waits until the frame its viewport is drawing is done, which in `MATERIAL`
+or `RENDERED` shading compiles shaders the first time after the editor opened the project and after
+a material edit that needs a shader no material had (0.9–3.6 s measured), and that a retry then
+takes about one frame, and advises a retry with a larger `timeout_ms` or `render_image` with
+`renderer: "software"`, which renders without the editor. At the maximum the advice starts with
 "With timeout_ms at its maximum (55000), …" instead of a larger `timeout_ms`. When the editor was
 still busy with an earlier request that the server had stopped waiting for (a screenshot or render
 that timed out), the error names it after the first sentence ("It was still busy with an earlier
@@ -1178,7 +1194,7 @@ quotes are written as `\n`, `\r` or `\u2028`, as in JSON.
 | `Edit mode needs an active mesh object (selection.active): 'Camera' is a CAMERA object.`                                                                                              | `mode: "EDIT"` in a `selection` without an active mesh object (`POLL_FAILED`)                                                                                                                                                                                                       |
 | `face index 99 out of range (mesh has 6 faces)`                                                                                                                                       | An element index of a `selection` (`run_operator`, `edit_mesh`) that the base mesh does not have                                                                                                                                                                                    |
 | `edge [0, 3]: vertices 0 and 3 are not connected by an edge of the mesh: an edge joins two vertices that follow each other in one of the faces …`                                     | An edge of a `selection` that the base mesh does not have (`POLL_FAILED`): edges join neighbours in a face of `get_mesh_data`, or are its `loose_edges`                                                                                                                             |
-| `select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: …` / `all: true selects every element, so the listed faces would change nothing: …`          | Element lists that a `selection` would ignore (`POLL_FAILED`): `select_mode` `EDGE` selects only `edges`, `FACE` only `faces`; `all: true` selects everything                                                                                                                       |
+| `select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: …` / `all: true selects every element, so the listed faces would change nothing: …`          | Element lists that a `selection` would ignore (`POLL_FAILED`): `select_mode` `EDGE` selects only `edges`, `FACE` only `faces`; `all: true` selects everything (both together: one message); every remedy named is accepted as it is                                                 |
 | `'Camera' is not a mesh object.`                                                                                                                                                      | `edit_mesh` on an object that is not a mesh (`POLL_FAILED`)                                                                                                                                                                                                                         |
 | `'show_render' is not a parameter of the BEVEL modifier. Its visibility (show_render) is set after adding it, with update_modifier …`                                                 | A modifier setting given inside `params` instead of as a tool argument                                                                                                                                                                                                              |
 | `Unknown parameter 'veiw' (did you mean 'view'?) for the editor command view.set_view. Its parameters: …`                                                                             | A misspelled `editor_command` command or parameter (refused before anything is sent)                                                                                                                                                                                                |

@@ -89,7 +89,13 @@ export function transformRoots(doc: SceneDoc, ids: string[]): string[] {
 /**
  * Applies a world-space linear transform `m` (no pivot applied) to objects.
  * With INDIVIDUAL_ORIGINS each object rotates/scales about its own origin; otherwise about `pivot`.
- * Returns the new world matrices (also written to the document).
+ * Returns the new world matrices (also written to the document). SceneDoc.setWorldMatrix stores
+ * only the channels each new matrix changes, as Blender's Move, Rotate and Scale do: a move only
+ * the location, a rotation or scale about the object's own origin only its rotation or scale
+ * (rotations as the euler closest to the stored one). Exceptions (see changedTransform in
+ * scene-doc.ts): a result that would be sheared (a scale along other axes than the object's own, a
+ * rotation of the child of an unevenly scaled parent) changes both, and a scale by negative factors
+ * along two of the object's axes turns the rotation by 180° instead of negating those scales.
  */
 export function transformObjects(
   doc: SceneDoc,

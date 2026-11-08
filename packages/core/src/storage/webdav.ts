@@ -1,4 +1,4 @@
-import type { FileEntry, FileStore, WriteOptions } from './filestore';
+import type { FileEntry, FileStore, ReadOptions, WriteOptions } from './filestore';
 import { PreconditionFailedError, joinPath } from './filestore';
 
 export interface WebDAVConfig {
@@ -87,9 +87,20 @@ export function parseMultistatus(xml: string): DavResponse[] {
 const PROPFIND_BODY = `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getetag/><d:getlastmodified/><d:getcontenttype/></d:prop></d:propfind>`;
 
+/**
+ * How many times {@link WebDAVClient.read} reads a file whose ETag it can only learn from PROPFIND
+ * when another write changes the file during each read, before it reports the ETag as unknown.
+ */
+const PAIRED_READ_ATTEMPTS = 3;
+
 /** Small fetch-based WebDAV client (works in browsers, service workers and Node ≥ 18). */
 export class WebDAVClient implements FileStore {
   private readonly base: URL;
+  /**
+   * Whether the server's GET responses carry an ETag the client can read (unknown until the first
+   * read): some servers send none, and browsers hide it when CORS does not expose the header.
+   */
+  private getSendsEtag: boolean | undefined;
 
   constructor(
     readonly config: WebDAVConfig,
@@ -163,16 +174,62 @@ export class WebDAVClient implements FileStore {
     return out;
   }
 
-  async read(path: string): Promise<{ data: Uint8Array; etag?: string } | null> {
-    const res = await this.request('GET', path);
+  /**
+   * Reads a file with the ETag of the content read: the one the GET response carries, or else
+   * (servers that send none, browsers when CORS does not expose it) the one PROPFIND reports both
+   * right before and right after the GET, which no write came between. While writes keep coming
+   * between the two, it reads again, {@link PAIRED_READ_ATTEMPTS} times at most, and then reports
+   * no ETag rather than the ETag of content it did not read. With `etag: false` it sends just the
+   * GET (and reports the ETag only when the GET response carries one).
+   */
+  async read(path: string, opts: ReadOptions = {}): Promise<{ data: Uint8Array; etag?: string } | null> {
+    for (let attempt = 1; ; attempt++) {
+      const bracketed = opts.etag !== false && this.getSendsEtag !== true;
+      const before = bracketed ? await this.propfindEtag(path) : undefined;
+      const res = await this.request('GET', path);
+      if (res.status === 404) return null;
+      if (!res.ok) throw new WebDAVError(`GET ${path} failed: ${res.status}`, res.status);
+      const data = new Uint8Array(await res.arrayBuffer());
+      const etag = res.headers.get('ETag');
+      if (etag) {
+        this.getSendsEtag = true;
+        return { data, etag };
+      }
+      this.getSendsEtag = false;
+      if (opts.etag === false) return { data };
+      if (bracketed) {
+        // a server that reports no ETag at all: there is nothing to pair
+        if (before === undefined) return { data };
+        const after = await this.propfindEtag(path);
+        if (typeof before === 'string' && after === before) return { data, etag: before };
+        if (after === undefined) return { data };
+      }
+      // a write came between the two PROPFINDs (or this GET carried no ETag after all): read again
+      if (attempt >= PAIRED_READ_ATTEMPTS) return { data };
+    }
+  }
+
+  /**
+   * The current ETag of a file in the form {@link read} reports it: from a HEAD request when the
+   * server sends the ETag with GET, else from PROPFIND. Null when the file does not exist,
+   * undefined when the server reports none.
+   */
+  async etag(path: string): Promise<string | null | undefined> {
+    if (!this.getSendsEtag) return this.propfindEtag(path);
+    const res = await this.request('HEAD', path);
     if (res.status === 404) return null;
-    if (!res.ok) throw new WebDAVError(`GET ${path} failed: ${res.status}`, res.status);
-    const data = new Uint8Array(await res.arrayBuffer());
-    let etag = res.headers.get('ETag') ?? undefined;
-    // Some servers omit ETag on GET (or CORS hides it); PROPFIND still reports getetag, which keeps
-    // conditional (If-Match) writes possible.
-    if (!etag) etag = (await this.stat(path).catch(() => null))?.etag;
-    return { data, etag };
+    return res.ok ? (res.headers.get('ETag') ?? undefined) : undefined;
+  }
+
+  /** The getetag PROPFIND reports for a file: null when it does not exist, undefined when none. */
+  private async propfindEtag(path: string): Promise<string | null | undefined> {
+    let entries: DavResponse[];
+    try {
+      entries = await this.propfind(path, 0);
+    } catch {
+      return undefined;
+    }
+    return entries.length === 0 ? null : entries[0].etag || undefined;
   }
 
   async stat(path: string): Promise<DavResponse | null> {
@@ -194,9 +251,9 @@ export class WebDAVClient implements FileStore {
       return this.write(path, data, opts);
     }
     if (!res.ok) throw new WebDAVError(`PUT ${path} failed: ${res.status}`, res.status);
-    let etag = res.headers.get('ETag') ?? undefined;
-    if (!etag) etag = (await this.stat(path).catch(() => null))?.etag;
-    return { etag };
+    // Only the PUT response's own ETag is known to belong to this content: a PROPFIND sent after it
+    // can already report the ETag of another writer's write.
+    return { etag: res.headers.get('ETag') ?? undefined };
   }
 
   async remove(path: string): Promise<void> {

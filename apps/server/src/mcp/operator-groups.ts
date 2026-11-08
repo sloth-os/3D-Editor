@@ -1,4 +1,5 @@
 import { BROWSER_UI_OPERATORS } from '@3d-editor/core';
+import { NEW_SHADER_SECONDS } from './editor-costs';
 
 /*
  * Feature groups for `list_operators`: operators of one feature are spread over several registry
@@ -115,7 +116,12 @@ export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
   },
   {
     name: 'Shading',
-    description: 'Materials, presets, procedural textures, sky and mist',
+    description:
+      'Materials, presets, procedural textures, sky and mist. In a browser editor without GPU acceleration ' +
+      '(software WebGL), an edit that needs a shader no material had (coat or sheen turned on, a procedural ' +
+      'texture on a set of channels that no other material has) makes the next screenshot or viewport frame ' +
+      `in MATERIAL and in RENDERED shading compile it (${NEW_SHADER_SECONDS} measured; edits of values cost ` +
+      "about one frame): pass editor_command a larger timeout_ms or shading 'SOLID'",
     match: any(prefix('material.', 'world.'), ids('object.material_assign', 'object.material_slot_add')),
   },
   {
@@ -373,7 +379,11 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
       'of the camera view',
   },
   'view3d.toggle_xray': {
-    editor: 'it turns X-ray on or off in that editor (what the person sees, and what their clicks select)',
+    editor:
+      'it turns X-ray on or off in that editor: in Solid shading its objects turn see-through (Wireframe ' +
+      'shading always shows them so; Material Preview and Rendered draw them as they are), and in Edit Mode ' +
+      "the edit cage shows through them and the person's box selections and clicks on vertices or edges also " +
+      'select hidden ones',
   },
   'view3d.toggle_overlays': { editor: "it shows or hides the overlays of that editor's viewport" },
   'view3d.toggle_sidebar': { editor: "it shows or hides the viewport's sidebar in that editor" },

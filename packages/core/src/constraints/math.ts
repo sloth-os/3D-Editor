@@ -218,6 +218,14 @@ export function eulerToMatrix(e: Readonly<Vec3>, order: EulerOrder = 'XYZ'): Mat
   );
 }
 
+/**
+ * Gimbal lock threshold of the euler helpers below: when the cosine of the middle angle (Y for
+ * 'XYZ') of a rotation with unit axes is at most this (the middle angle is within 0.00215° of
+ * ±90°), only the sum or the difference of the first and last angles is defined, and they return
+ * that sum or difference as the first angle, with 0 as the last angle.
+ */
+export const EULER_GIMBAL_LOCK = 0.0000375;
+
 /** Both euler solutions of a rotation matrix with unit axes (identical in gimbal lock). */
 function eulerPair(m: Readonly<Mat4>, order: EulerOrder): [Vec3, Vec3] {
   const { axes, odd } = ORDER_AXES[order];
@@ -227,7 +235,7 @@ function eulerPair(m: Readonly<Mat4>, order: EulerOrder): [Vec3, Vec3] {
   const cy = Math.hypot(R(i, i), R(j, i));
   const e1: Vec3 = [0, 0, 0];
   const e2: Vec3 = [0, 0, 0];
-  if (cy > 0.0000375) {
+  if (cy > EULER_GIMBAL_LOCK) {
     e1[i] = Math.atan2(s * R(k, j), R(k, k));
     e1[j] = Math.atan2(-s * R(k, i), cy);
     e1[k] = Math.atan2(s * R(j, i), R(i, i));

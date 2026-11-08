@@ -15,12 +15,40 @@ export interface WriteOptions {
   contentType?: string;
 }
 
+export interface ReadOptions {
+  /**
+   * False when the caller does not use the ETag: the store may then leave it out instead of
+   * sending the requests it takes to learn it (WebDAV servers that send none with GET).
+   */
+  etag?: boolean;
+}
+
+/**
+ * ETags are only ever reported for the content they belong to: callers use them to skip content
+ * they already merged and for If-Match, so an ETag paired with other content (say, the ETag of a
+ * write that came between reading a file and asking for its ETag) would make them skip that write
+ * or replace it.
+ */
 export interface FileStore {
   list(dir: string): Promise<FileEntry[]>;
-  read(path: string): Promise<{ data: Uint8Array; etag?: string } | null>;
+  /** Reads a file. `etag` is the ETag of exactly `data`, or unset when the store cannot tell. */
+  read(path: string, opts?: ReadOptions): Promise<{ data: Uint8Array; etag?: string } | null>;
+  /** Writes a file. `etag` is the ETag of exactly `data`, or unset when the store cannot tell. */
   write(path: string, data: Uint8Array, opts?: WriteOptions): Promise<{ etag?: string }>;
   remove(path: string): Promise<void>;
   mkdirp(dir: string): Promise<void>;
+  /**
+   * The current ETag of a file without reading it, in the form `read` reports it: null when the
+   * file does not exist, undefined when the store cannot tell.
+   */
+  etag?(path: string): Promise<string | null | undefined>;
+  /**
+   * True when the store checks a conditional write (If-Match, If-None-Match) and applies it as one
+   * step, so that a write accepted with `ifMatch` never replaces a write it was not based on. The
+   * WebDAV client leaves it unset: some servers ignore If-Match, others check it before the upload
+   * of the new content ends (see docs/storage-and-sync.md), so its writers read their writes back.
+   */
+  readonly atomicConditionalWrites?: boolean;
 }
 
 /** Thrown when a conditional write fails (HTTP 412). */
@@ -41,6 +69,7 @@ export function joinPath(...parts: string[]): string {
 
 /** In-memory FileStore (tests and ephemeral servers). */
 export class MemoryFileStore implements FileStore {
+  readonly atomicConditionalWrites = true;
   private files = new Map<string, { data: Uint8Array; etag: string; mtime: string }>();
   private dirs = new Set<string>(['/']);
   private counter = 0;
@@ -79,6 +108,10 @@ export class MemoryFileStore implements FileStore {
   async read(path: string) {
     const f = this.files.get(this.norm(path));
     return f ? { data: f.data.slice(), etag: f.etag } : null;
+  }
+
+  async etag(path: string) {
+    return this.files.get(this.norm(path))?.etag ?? null;
   }
 
   async write(path: string, data: Uint8Array, opts: WriteOptions = {}) {

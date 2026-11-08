@@ -133,7 +133,13 @@ describe('ProjectSession (browser storage)', () => {
       events.push(`opened with ${s.doc.listObjects().length} objects`);
       return s;
     });
-    expect(events).toEqual(['GET /3d-editor/projects/proj-dav/document.ybin', 'opened with 3 objects']);
+    // a new client asks for the ETag with PROPFIND before its first GET: it cannot know yet whether
+    // the server sends the ETag with GET (this one does, so no PROPFIND follows the GET)
+    expect(events).toEqual([
+      'PROPFIND /3d-editor/projects/proj-dav/document.ybin',
+      'GET /3d-editor/projects/proj-dav/document.ybin',
+      'opened with 3 objects',
+    ]);
     expect(s.webdav).not.toBeNull();
     expect(s.doc.name).toBe('On WebDAV');
     s.close(false);

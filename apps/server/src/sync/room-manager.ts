@@ -25,7 +25,8 @@ export interface RoomManagerOptions {
   sweepIntervalMs?: number;
   /**
    * How often rooms with connected editors merge changes from storage made by others
-   * (other servers, devices saving to WebDAV directly). Default 60 s; 0 disables.
+   * (other servers, devices saving to WebDAV directly), and rooms that wrote to WebDAV read their
+   * write back (Room.needsReadBack). Default 60 s; 0 disables.
    */
   refreshIntervalMs?: number;
 }
@@ -59,12 +60,15 @@ export class RoomManager {
     }
   }
 
-  /** Merges storage changes into rooms that have connected editors (one room at a time). */
+  /**
+   * Merges storage changes into rooms that have connected editors, and into rooms that wrote to
+   * storage where another writer can replace their write (Room.needsReadBack), one room at a time.
+   */
   async refreshActive(): Promise<void> {
     if (this.refreshing || this.closed) return;
     this.refreshing = true;
     try {
-      for (const room of this.all()) if (room.conns.size > 0) await room.refresh();
+      for (const room of this.all()) if (room.conns.size > 0 || room.needsReadBack) await room.refresh();
     } finally {
       this.refreshing = false;
     }
@@ -163,7 +167,8 @@ export class RoomManager {
       const end = metrics.persistenceDuration.startTimer({ op: 'load' });
       try {
         await withSpan('persistence.load', { 'project.id': id }, async (span) => {
-          const doc = await store.loadDocument(id);
+          // the ETag is not used: on WebDAV a plain GET (no PROPFIND requests)
+          const doc = await store.loadDocument(id, { etag: false });
           info = await store.loadInfo(id).catch(() => null);
           if (doc) update = doc.update;
           persisted = !!doc || !!info;
@@ -199,7 +204,8 @@ export class RoomManager {
     const store = this.store;
     if (!store) return false;
     return (
-      !!(await store.loadInfo(id).catch(() => null)) || !!(await store.loadDocument(id).catch(() => null))
+      !!(await store.loadInfo(id).catch(() => null)) ||
+      !!(await store.loadDocument(id, { etag: false }).catch(() => null))
     );
   }
 
@@ -284,16 +290,21 @@ export class RoomManager {
     return existed;
   }
 
-  /** Evicts idle rooms (persisting them first). */
+  /**
+   * Evicts idle rooms, persisting them first: a room whose write another writer can have replaced
+   * since (Room.needsReadBack) refreshes, which writes its changes again when they are missing.
+   */
   async sweep(now = Date.now()): Promise<void> {
     if (this.sweeping || this.closed) return;
     this.sweeping = true;
     try {
       for (const room of this.all()) {
         if (!room.isIdle(now, this.opts.ttlMs)) continue;
-        await room.flush();
-        // Keep rooms whose changes could not be saved, and rooms that got used meanwhile.
-        if (room.isDirty && this.store) continue;
+        await (room.needsReadBack ? room.refresh() : room.flush());
+        // Keep rooms whose changes could not be saved, rooms that could not read storage to find
+        // their last write there (the refresh failed: it may have been replaced), and rooms that
+        // got used meanwhile.
+        if ((room.isDirty || room.needsReadBack) && this.store) continue;
         if (room.destroyed || !room.isIdle(Date.now(), this.opts.ttlMs) || this.rooms.get(room.id) !== room)
           continue;
         this.rooms.delete(room.id);

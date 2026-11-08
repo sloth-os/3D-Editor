@@ -1,8 +1,8 @@
-import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as Y from 'yjs';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PreconditionFailedError, ProjectFileStore, SceneDoc } from '@3d-editor/core';
 import { DiskFileStore, etagFor } from '../../src/persistence/disk';
 
@@ -61,6 +61,62 @@ describe('DiskFileStore', () => {
     const third = await store.write('/doc.bin', bytes('cccc'), { ifMatch: second.etag });
     expect(str((await store.read('/doc.bin'))!.data)).toBe('cccc');
     expect((await store.read('/doc.bin'))!.etag).toBe(third.etag);
+  });
+
+  it('reads the ETag of the content it read when a write replaces the file meanwhile', async () => {
+    const first = await store.write('/doc.bin', bytes('aaaa'));
+    let second: { etag?: string } | undefined;
+    // a write lands right after the read opened (or read) the file, before it learnt its ETag
+    const after = async () => {
+      if (second) return;
+      second = {};
+      second = await store.write('/doc.bin', bytes('bbbbbbbb'));
+    };
+    const fsp = (await import('node:fs')).promises;
+    const open = fsp.open.bind(fsp);
+    const readFile = fsp.readFile.bind(fsp);
+    const spies = [
+      vi.spyOn(fsp, 'open').mockImplementation(async (...args: Parameters<typeof fsp.open>) => {
+        const fh = await open(...args);
+        if (String(args[0]).endsWith('doc.bin') && (args[1] ?? 'r') === 'r') await after();
+        return fh;
+      }),
+      vi.spyOn(fsp, 'readFile').mockImplementation(async (...args: Parameters<typeof fsp.readFile>) => {
+        const data = await readFile(...args);
+        if (String(args[0]).endsWith('doc.bin')) await after();
+        return data;
+      }),
+    ];
+    try {
+      const r = (await store.read('/doc.bin'))!;
+      expect(second?.etag).toBeTruthy();
+      // the content read and its ETag belong to the same version (one or the other)
+      if (str(r.data) === 'aaaa') expect(r.etag).toBe(first.etag);
+      else expect(r.etag).toBe(second!.etag);
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
+
+  it('gives every version a later modification time than the one it replaces', async () => {
+    // a version whose mtime is ahead of the clock (the clock went back, or writes came within one
+    // tick and were nudged): its successors must still get later ones, or the ETag ("size-mtime")
+    // of a version of the same size as an earlier one could repeat it, and an If-Match based on
+    // that earlier version would be accepted
+    const first = await store.write('/doc.bin', bytes('aaaa'));
+    const ahead = new Date(Date.now() + 3_600_000);
+    await utimes(path.join(root, 'doc.bin'), ahead, ahead);
+    const mtimeOf = (etag?: string) => Number(etag!.slice(1, -1).split('-')[1]);
+    const second = await store.write('/doc.bin', bytes('bbbbbbbb'), {
+      ifMatch: etagFor(await stat(path.join(root, 'doc.bin'))),
+    });
+    const third = await store.write('/doc.bin', bytes('cccc'), { ifMatch: second.etag });
+    expect(mtimeOf(second.etag)).toBeGreaterThan(ahead.getTime());
+    expect(mtimeOf(third.etag)).toBeGreaterThan(mtimeOf(second.etag));
+    expect(new Set([first.etag, second.etag, third.etag]).size).toBe(3);
+    expect((await store.read('/doc.bin'))!.etag).toBe(third.etag);
+    expect(await store.etag('/doc.bin')).toBe(third.etag);
+    expect(await store.etag('/missing.bin')).toBeNull();
   });
 
   it('serializes concurrent conditional writes (exactly one wins)', async () => {

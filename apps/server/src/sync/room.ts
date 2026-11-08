@@ -207,6 +207,8 @@ export class Room {
   /** Last known `project.json` content. */
   info: ProjectInfo | null;
   private dirty = false;
+  /** See {@link needsReadBack}. */
+  private unconfirmedWrite = false;
   private firstDirtyAt = 0;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private saveChain: Promise<void> = Promise.resolve();
@@ -328,16 +330,31 @@ export class Room {
   }
 
   /**
+   * Whether the room wrote to a store on which another writer can replace its write (WebDAV: see
+   * FileStore.atomicConditionalWrites) and has not found its state stored by a later read: it
+   * refreshes before it is evicted or closed, and in the periodic refresh, so that it writes its
+   * changes again if another server's save replaced them after its own read-back. It is not
+   * evicted while such a refresh fails.
+   */
+  get needsReadBack(): boolean {
+    return this.unconfirmedWrite;
+  }
+
+  /**
    * Merges changes made to the stored document by others (other servers sharing the storage,
    * devices saving to WebDAV directly) into the room, and saves pending local changes.
    *
    * Every save and refresh merges the stored content it read: syncDocument is not given the ETag
    * of the last sync (`lastEtag`), with which it would skip that content when the stored ETag is
-   * unchanged and the room has nothing new. An ETag only says that when it was taken together with
-   * the content, and the WebDAV client takes it with a second request (PROPFIND) from servers that
-   * send none with GET or PUT, such as the webdav-server of the integration tests: another server's
-   * write between the two requests gave the room the ETag of a write it had not merged, and it
-   * never merged it (two servers sharing one storage stayed apart, test/unit/rooms.test.ts).
+   * unchanged and the room has nothing new. The ETags the stores report belong to the content read
+   * with them, but they do not always change with the content: WebDAV servers that make them from
+   * the modification time can give two writes the same ETag (nginx: writes of the same size within
+   * one second; the webdav-server of the integration tests: writes within one millisecond), and a
+   * skip there would leave the room without the second write. The skip saves little: a refresh
+   * that finds nothing new took 3.6 ms of CPU to re-apply a 0.48 MB document, besides 1.9 ms to
+   * encode the room's state and 9.5 ms to compare it with the stored one; 86 ms besides
+   * 176 + 176 ms for 134 MB; the GET (3.5 / 345 ms from a WebDAV server on the same machine)
+   * happens either way.
    */
   refresh(): Promise<void> {
     if (!this.deps.store || this.destroyed) return Promise.resolve();
@@ -361,7 +378,13 @@ export class Room {
         const res = await store.syncDocument(this.id, this.doc, {
           origin: STORAGE_ORIGIN,
           info: () => (this.info = projectInfoFromScene(this.id, this.scene, prevInfo ?? this.info)),
+          // a refresh without unsaved changes does not bring back a project another server deleted
+          // (the room's next change saves it again)
+          create: wasDirty,
         });
+        if (res.missing && this.unconfirmedWrite)
+          log.info({ project: this.id }, 'project deleted from storage after this server saved it');
+        this.unconfirmedWrite = res.pushed && !store.fs.atomicConditionalWrites;
         span.setAttributes({ 'persistence.pulled': res.pulled, 'persistence.pushed': res.pushed });
       });
       this.persisted = true;
@@ -370,7 +393,13 @@ export class Room {
     } catch (err) {
       metrics.persistenceOps.inc({ op, status: 'error' });
       if (!wasDirty) {
-        log.debug({ err: errorMessage(err), project: this.id }, 'refreshing project from storage failed');
+        // until a refresh finds the room's last write in storage, a change of the room may be
+        // missing there (another writer's save can have replaced it): the room is not evicted
+        // meanwhile, and the periodic refresh and the next sweep try again
+        if (this.unconfirmedWrite)
+          log.warn({ err: errorMessage(err), project: this.id }, 'checking the last save in storage failed');
+        else
+          log.debug({ err: errorMessage(err), project: this.id }, 'refreshing project from storage failed');
         return;
       }
       this.saveFailures++;
@@ -807,12 +836,12 @@ export class Room {
   // ---------------------------------------------------------------- shutdown
 
   /**
-   * Closes the room: optionally persists, disconnects every client with `code`, rejects
-   * pending RPCs and releases the document.
+   * Closes the room: optionally persists (a refresh when {@link needsReadBack}), disconnects every
+   * client with `code`, rejects pending RPCs and releases the document.
    */
   async close(opts: { flush?: boolean; code?: number; reason?: string } = {}): Promise<void> {
     if (this.destroyed) return;
-    if (opts.flush !== false) await this.flush();
+    if (opts.flush !== false) await (this.unconfirmedWrite ? this.refresh() : this.flush());
     else {
       if (this.saveTimer) clearTimeout(this.saveTimer);
       this.saveTimer = null;

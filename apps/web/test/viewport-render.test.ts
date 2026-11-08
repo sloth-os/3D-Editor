@@ -16,12 +16,16 @@ import {
 } from '@3d-editor/core';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import { viewport } from '../src/editor/editor';
+import { registerUiOperators } from '../src/editor/ui-operators';
+import { ViewportInteraction } from '../src/viewport/interaction';
+import { clonePose, posePosition, type ViewPose } from '../src/viewport/navigation';
 import { uiCommand } from '../src/editor/rpc';
 import { session as sessionSignal } from '../src/app/store';
 import type { ProjectSession } from '../src/project/session';
 import { renderOutputSize, type PathTraceOptions } from '../src/render';
 import { applyLensShift, sceneCameraView } from '../src/render/view';
 import {
+  VIEW_ANIMATION_MS,
   MAX_FRAMES_IN_FLIGHT,
   SLOW_QUEUE_FRAME_MS,
   MSAA_HEAVY_TRIANGLES,
@@ -135,6 +139,16 @@ vi.mock('three', async (importOriginal) => {
         toneMapping: this.toneMapping,
         toneMappingExposure: this.toneMappingExposure,
       });
+      // like three.js, which runs a material's onBeforeRender right before it draws with it (and
+      // gives it its shader program): scene-objects.ts disposes what a material replaced after that
+      const override = (scene as InstanceType<typeof three.Scene>).overrideMaterial ?? null;
+      if (!override)
+        scene.traverseVisible((o) => {
+          const mesh = o as InstanceType<typeof three.Mesh>;
+          if (!mesh.isMesh || !o.layers.test(camera.layers)) return;
+          for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material])
+            m?.onBeforeRender(this as never, scene as never, camera, mesh.geometry, mesh, null as never);
+        });
       this.onRender?.(scene);
     }
     readRenderTargetPixels(_t: unknown, _x: number, _y: number, _w: number, _h: number, buffer: Uint8Array) {
@@ -237,19 +251,23 @@ function keyLocation(s: ProjectSession, id: string, index: number, keys: [number
   s.doc.setFCurve(fc);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   // no animation frames: the viewport never evaluates on its own (hidden tabs get none)
   vi.stubGlobal('requestAnimationFrame', () => 0);
   vi.stubGlobal('cancelAnimationFrame', () => undefined);
   pathTraced.length = 0;
+  // lets vitest send its task events before the test (see below)
+  await new Promise((done) => setTimeout(done, 0));
 });
 // Cheap: at most 8.6 ms under coverage in 300 runs, timed inside the hook. A reporter that times
 // hooks from vitest's task events (onHookStart / onHookEnd) can show it taking seconds: the worker
 // sends those events at most every 100 ms and leaves the rest to a timer, which cannot fire while
 // synchronous tests run, so the end of a hook can reach the reporter only after the tests that
-// follow it. Which hook that hits varies from run to run; under coverage it was the afterEach of one
-// of the tests before 'lights a simple scene as brightly as the path tracer …', shown taking about
-// that test's time.
+// follow it. The beforeEach above lets the timer fire before a test once it is due, 100 ms after
+// the worker's last send: the end of a hook shows late by the tests that start before then. Under
+// coverage the afterEach of 'keep the materials of every shading drawn …' was shown taking 4.0 s
+// (inside the hook: 0.1 ms): a 25 ms test ran after it, then 'lights a simple scene as brightly as
+// the path tracer …', which took 4.0 s.
 afterEach(() => {
   for (const e of engines.splice(0)) e.dispose();
   vi.unstubAllGlobals();
@@ -835,18 +853,25 @@ describe('viewport captures (MCP editor_command screenshot)', () => {
       expect(pictures.at(-1)).toBe(clay[0]);
     }
     expect(disposed.size).toBe(0);
-    // what a change of the material makes stale is built again, and the stale materials disposed,
-    // when its shading is drawn next
+    // what a change of the material makes stale is built again when its shading is drawn next, and
+    // the stale materials are disposed once the new ones have been drawn wherever they were
+    // (scene-objects.ts replaceSlot): the Solid ones in Solid shading, the others in Rendered and
+    // Material Preview shading
     s.doc.updateMaterial(s.doc.getObject(cube.id)!.material_slots[0]!, { roughness: 0.25 });
     viewportFrame(e);
-    expect(pictures.at(-1)).not.toBe(clay[0]);
+    const clayNow = pictures.at(-1)!;
+    expect(clayNow).not.toBe(clay[0]);
     expect([...disposed]).toEqual(clay[0]);
     e.renderPixels({ useViewport: true, shading: 'RENDERED' });
-    expect(pictures.at(-1)).not.toBe(pbr);
-    expect((pictures.at(-1)![0] as THREE.MeshPhysicalMaterial).roughness).toBe(0.25);
+    const pbrNow = pictures.at(-1)!;
+    expect(pbrNow).not.toBe(pbr);
+    expect((pbrNow[0] as THREE.MeshPhysicalMaterial).roughness).toBe(0.25);
+    expect(pbr.some((m) => disposed.has(m))).toBe(false);
+    e.renderPixels({ useViewport: true, shading: 'MATERIAL' });
+    expect(pictures.at(-1)).toBe(pbrNow);
     expect(pbr.every((m) => disposed.has(m))).toBe(true);
     // and the ones kept for other shadings go with the object
-    const kept = [...new Set(pictures.slice(-2).flat())];
+    const kept = [...clayNow, ...pbrNow];
     watch(kept);
     s.doc.removeObject(cube.id);
     viewportFrame(e);
@@ -1368,22 +1393,31 @@ describe('heavy scenes in Rendered shading', () => {
   /** A stand-in WebGL2 context whose frame fences the test completes (`fences[i].done = true`). */
   function fenceContext(gl: RecordingRenderer) {
     const SIGNALED = 0x9119;
-    const fences: { done: boolean }[] = [];
+    type Fence = { done: boolean };
+    const all: Fence[] = [];
+    // the frames' fences (the engine flushes right after one), and those that end a frame's
+    // multisampled renders (`scenes`, put while the frame renders)
+    const fences: Fence[] = [];
+    const scenes: Fence[] = [];
     gl.context = {
       SYNC_STATUS: 0x9114,
       SIGNALED,
       SYNC_GPU_COMMANDS_COMPLETE: 0x9117,
       fenceSync: () => {
         const f = { done: false };
-        fences.push(f);
+        all.push(f);
+        scenes.push(f);
         return f;
       },
-      getSyncParameter: (f: { done: boolean }) => (f.done ? SIGNALED : 0x9118),
+      // like a GPU's, fences signal in order: done once it or a later one is
+      getSyncParameter: (f: Fence) => (all.slice(all.indexOf(f)).some((g) => g.done) ? SIGNALED : 0x9118),
       deleteSync: () => undefined,
-      flush: () => undefined,
+      flush: () => {
+        if (all.length && scenes.at(-1) === all.at(-1)) fences.push(scenes.pop()!);
+      },
       isContextLost: () => false,
     };
-    return fences;
+    return Object.assign(fences, { scenes });
   }
 
   it('draws point and spot light shadow maps after scene changes, not for every frame', () => {
@@ -1486,6 +1520,31 @@ describe('heavy scenes in Rendered shading', () => {
     expect(light.e.multisampling).toBe(true);
   });
 
+  it('says drawn once a heavy scene’s first frame is done (multisampling turned off in its sync)', () => {
+    // regression: the sync of a heavy scene's first frame turned multisampling off, which asks for a
+    // frame (requestRender); the frame drawn right after the sync showed that change, but counted as
+    // showing only those asked for before the sync, so data-view stayed pending until some other
+    // change: an end-to-end test waiting for a drawn frame of a scene over 1 M triangles timed out
+    const heavy = engine(scatterScene(400));
+    const fences = fenceContext(heavy.gl);
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    frame(heavy.e);
+    expect(heavy.e.multisampling).toBe(false);
+    expect(heavy.e.canvas.dataset.view).toBe('pending');
+    const passes = scenePasses(heavy.e, heavy.gl).length;
+    // the GPU takes 2 s for it (multisampling stays off), then nothing changes
+    now += 2000;
+    for (const f of [...fences, ...fences.scenes]) f.done = true;
+    for (let i = 0; i < 3; i++) {
+      now += 16;
+      frame(heavy.e);
+    }
+    expect(heavy.e.canvas.dataset.view).toBe('drawn');
+    // and no other frame was drawn: the first one showed every change
+    expect(scenePasses(heavy.e, heavy.gl)).toHaveLength(passes);
+  });
+
   it('draws one transmission picture in heavy scenes, levels for nested glass otherwise', () => {
     const glassScene = (count: number) => {
       const s = count ? scatterScene(count) : session();
@@ -1569,6 +1628,55 @@ describe('heavy scenes in Rendered shading', () => {
     expect(slowFrameMs.value).toBe(0);
   });
 
+  it('says on the canvas whether the GPU has drawn every change (data-view, for end-to-end tests)', () => {
+    // regression: an end-to-end test took a picture of the viewport right after the panel showed a
+    // change (a bake's cache text), while the browser still showed the frame before it (software
+    // WebGL took seconds to draw the selection outline's first frame): it compared later pictures
+    // with that one and failed
+    const s = session();
+    const { e, gl } = engine(s);
+    const fences = fenceContext(gl);
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const view = () => e.canvas.dataset.view;
+    expect(view()).toBe('pending');
+    frame(e);
+    // drawn, but not by the GPU yet
+    expect(view()).toBe('pending');
+    fences[0].done = true;
+    frame(e);
+    expect(view()).toBe('drawn');
+    // a change: pending at once, until a frame showing it is done
+    s.state.selectedIds = [s.doc.listObjects().find((o) => o.type === 'MESH')!.id];
+    expect(view()).toBe('pending');
+    frame(e);
+    // another change while that frame is drawn
+    e.requestRender();
+    fences[1].done = true;
+    frame(e);
+    expect(view()).toBe('pending');
+    fences[2].done = true;
+    frame(e);
+    expect(view()).toBe('drawn');
+    // an animated view change: pending until its last frame is done
+    const p = clonePose(e.pose);
+    p.yaw += 1;
+    now = 2000;
+    e.setPose(p, true);
+    for (const ms of [0, 50, 100, 150, 200]) {
+      now = 2000 + ms;
+      frame(e);
+      for (const f of fences) f.done = true;
+      expect(view(), `${ms} ms into it`).toBe('pending');
+    }
+    now = 2000 + VIEW_ANIMATION_MS;
+    frame(e);
+    expect(view()).toBe('pending');
+    for (const f of fences) f.done = true;
+    frame(e);
+    expect(view()).toBe('drawn');
+  });
+
   it('draws without multisampling while frames are slow, with it again once they are fast', () => {
     // regression: software WebGL rasterizes every MSAA sample: lighthouse-cove's Rendered frames took
     // 3.2 s with 4× MSAA and 0.8 s without
@@ -1586,10 +1694,16 @@ describe('heavy scenes in Rendered shading', () => {
       if (change) e.requestRender();
       frame(e);
     };
+    /** The loop sees the GPU still drawing the frame's multisampled renders after `ms`, then done. */
+    const slow = (ms: number) => {
+      now += ms;
+      frame(e);
+      finish(1);
+    };
     frame(e);
     expect(samples()).toEqual([VIEWPORT_MSAA_SAMPLES, VIEWPORT_MSAA_SAMPLES]);
     // a slow frame: multisampling goes off and the view is drawn again without it, unasked
-    finish(MSAA_OFF_FRAME_MS + 50);
+    slow(MSAA_OFF_FRAME_MS + 50);
     expect(e.multisampling).toBe(false);
     expect(samples()).toEqual([0, 0]);
     expect(scenePasses(e, gl)).toHaveLength(2);
@@ -1617,7 +1731,7 @@ describe('heavy scenes in Rendered shading', () => {
     // the frames after it show what the scene costs
     e.requestRender();
     frame(e);
-    finish(SLOW_FRAME_MS + 1000);
+    slow(SLOW_FRAME_MS + 1000);
     expect(e.multisampling).toBe(false);
     expect(slowFrameCompiled.value).toBe(false);
     expect(scenePasses(e, gl)).toHaveLength(7);
@@ -1628,12 +1742,236 @@ describe('heavy scenes in Rendered shading', () => {
     expect(MSAA_OFF_FRAME_MS).toBeGreaterThanOrEqual(1000);
     // fast frames that compile shaders do not bring multisampling back
     gl.onRender = () => gl.info.programs.push({});
-    finish(MSAA_OFF_FRAME_MS * 2);
+    slow(MSAA_OFF_FRAME_MS * 2);
     expect(e.multisampling).toBe(false);
     finish(MSAA_ON_FRAME_MS / 2, true);
     expect(e.multisampling).toBe(false);
     finish(MSAA_ON_FRAME_MS / 2, true);
     expect(e.multisampling).toBe(false);
     gl.onRender = null;
+  });
+
+  it('keeps multisampling for a frame seen done late because the main thread was busy (a rigid body bake)', () => {
+    // regression: in software WebGL a light scene lost its smooth edges for good after a rigid body
+    // bake, which kept the main thread busy for seconds: the frame drawn right before it was only
+    // seen done after it, and counted as that slow
+    const s = session();
+    const { e, gl } = engine(s);
+    const fences = fenceContext(gl);
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    frame(e);
+    // no frame of the loop runs for 1.5 s; the GPU is done by then
+    now += 1500;
+    fences.at(-1)!.done = true;
+    frame(e);
+    expect(e.multisampling).toBe(true);
+    expect(scenePasses(e, gl)).toHaveLength(1);
+  });
+
+  it('keeps multisampling for a frame slow after its multisampled renders (outlines, view transform)', () => {
+    // regression: on a busy machine the default cube's frames took more than a second in software
+    // WebGL, most of it for the full-screen passes after the scene (selection outlines, view
+    // transform), which cost as much without multisampling: it went off between two pictures of the
+    // same view in an end-to-end test, whose edges then differed (1.4 % of the pixels)
+    const s = session();
+    const { e, gl } = engine(s);
+    const fences = fenceContext(gl);
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    frame(e);
+    // the scene and its overlays are seen drawing after 30 ms and done after 40 ms
+    now += 30;
+    frame(e);
+    for (const f of fences.scenes) f.done = true;
+    now += 10;
+    frame(e);
+    // the rest of the frame takes 1.5 s more
+    now += 1500;
+    frame(e);
+    fences.at(-1)!.done = true;
+    now += 10;
+    frame(e);
+    expect(e.multisampling).toBe(true);
+    expect(scenePasses(e, gl)).toHaveLength(1);
+  });
+});
+
+describe('animated view changes (Blender smooth view)', () => {
+  /*
+   * Regression: a zoom, pan, orbit or projection toggle made within 220 ms of an animated view change
+   * (an orbit step, an axis view, framing) was lost, because every frame of the animation set the view
+   * again. Like Blender, whose navigation finishes a running smooth view before it changes the view,
+   * a change made meanwhile is made on the view the animation goes to, and the frames show it at once;
+   * get_view and pictures of the viewport's view show where the view goes from the start.
+   */
+  const uiRegistry = createOperatorRegistry();
+  registerUiOperators(uiRegistry);
+  /** Runs a browser UI operator as editor_command run_operator does (an agent's call). */
+  function op(s: ProjectSession, id: string, params: Record<string, unknown> = {}): void {
+    const ctx: OperatorContext = {
+      doc: s.doc,
+      state: s.state,
+      origin: s.doc.origin,
+      source: 'mcp',
+      report: () => undefined,
+      ui: {},
+    };
+    const r = uiRegistry.run(ctx, id, params);
+    if (!r.ok) throw new Error(`${id} failed: ${r.error}`);
+  }
+  let clock = 0;
+  /** A viewport with its pointer handling, as the editor sets them up, on a clock the test moves. */
+  function setup() {
+    clock = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    // the view a viewport saved (persistPose) is the next one's start (restorePose)
+    localStorage.clear();
+    const s = session();
+    const { e, gl } = engine(s);
+    const el = e.canvas.parentElement!;
+    const i = new ViewportInteraction(e, s, el, { run: () => true, openContextMenu: () => undefined });
+    sessionSignal.value = s;
+    viewport.engine = e;
+    viewport.interaction = i;
+    const t0 = clock;
+    /** Runs the frame loop as the animation frame `ms` after the start would. */
+    const frameAt = (ms: number) => {
+      clock = t0 + ms;
+      (e as unknown as { loop(now: number): void }).loop(clock);
+    };
+    frameAt(0);
+    return { s, e, gl, i, el, frameAt };
+  }
+  afterEach(() => {
+    viewport.interaction?.dispose();
+    viewport.interaction = null;
+    viewport.engine = null;
+    sessionSignal.value = null;
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+  /** The view of a pose as numbers (to compare views). */
+  const numbers = (p: ViewPose) => [
+    ...p.target.toArray(),
+    p.distance,
+    p.yaw,
+    p.pitch,
+    p.fovY,
+    p.ortho ? 1 : 0,
+  ];
+  const expectView = (p: ViewPose, q: ViewPose, label = '') =>
+    numbers(p).forEach((v, k) => expect(v, `${label}: component ${k}`).toBeCloseTo(numbers(q)[k], 9));
+
+  it('make a zoom right after an orbit step on the orbited view (editor_command run_operator)', async () => {
+    const { s, e, gl, frameAt } = setup();
+    const before = clonePose(e.pose);
+    op(s, 'view3d.view_orbit', { type: 'ORBITLEFT' });
+    op(s, 'view3d.zoom', {});
+    // an agent gets the view it goes to at once, also in a picture of the viewport's view
+    const view = (await uiCommand('get_view', {})) as { yaw: number; distance: number };
+    expect(view.yaw).toBeCloseTo(before.yaw + Math.PI / 12, 12);
+    expect(view.distance).toBeCloseTo(before.distance * 0.8, 12);
+    e.renderPixels({ useViewport: true, width: 32, height: 16 });
+    expect(sceneCamera(e, gl).position.distanceTo(posePosition(e.pose))).toBeLessThan(1e-9);
+    // the frames show it at once (the animation ended with the zoom), and keep showing it
+    for (const ms of [16, 33, 110, 400]) {
+      frameAt(ms);
+      expect(e.shownPose.yaw).toBeCloseTo(before.yaw + Math.PI / 12, 12);
+      expect(e.shownPose.distance).toBeCloseTo(before.distance * 0.8, 12);
+      expect(sceneCamera(e, gl).position.distanceTo(posePosition(e.pose))).toBeLessThan(1e-9);
+    }
+  });
+
+  it('give a change made while they run the view it gives after them, and show it at once', () => {
+    type Setup = ReturnType<typeof setup>;
+    const changes: [string, (x: Setup) => void][] = [
+      ['view3d.zoom', ({ s }) => op(s, 'view3d.zoom', { delta: -2 })],
+      ['the mouse wheel', ({ el }) => el.dispatchEvent(new WheelEvent('wheel', { deltaY: 100 }))],
+      ['a pinch (zoomBy)', ({ i }) => i.zoomBy(0.7)],
+      ['panning', ({ i }) => i.pan(30, -20)],
+      ['orbiting with the mouse', ({ i }) => i.orbit(25, 10)],
+      ['the projection', ({ s }) => op(s, 'view3d.view_persportho')],
+      ['the Focal Length field', ({ e }) => (e.pose.fovY = 0.5)],
+    ];
+    const animated: [string, (x: Setup) => void][] = [
+      ['an orbit step', ({ s }) => op(s, 'view3d.view_orbit', { type: 'ORBITUP', angle: 0.4 })],
+      ['an axis view', ({ s }) => op(s, 'view3d.view_axis', { type: 'TOP' })],
+      ['Frame All', ({ s }) => op(s, 'view3d.view_all')],
+      ['Frame Selected', ({ s }) => op(s, 'view3d.view_selected')],
+    ];
+    // every change, each during one of the animated changes (every one of them in turn)
+    for (const [k, [change, make]] of changes.entries()) {
+      const [what, animate] = animated[k % animated.length];
+      const label = `${change} during ${what}`;
+      // the view it gives after the animation
+      const after = setup();
+      animate(after);
+      after.frameAt(300);
+      make(after);
+      after.frameAt(320);
+      const expected = clonePose(after.e.shownPose);
+      after.e.dispose();
+      // made halfway through it
+      const x = setup();
+      const from = clonePose(x.e.pose);
+      animate(x);
+      const to = clonePose(x.e.pose);
+      x.frameAt(110);
+      // (the frames show poses on the way)
+      const halfway = numbers(x.e.shownPose);
+      expect(
+        numbers(from).some((v, k) => Math.abs(v - halfway[k]) > 1e-6),
+        label,
+      ).toBe(true);
+      expect(
+        numbers(to).some((v, k) => Math.abs(v - halfway[k]) > 1e-6),
+        label,
+      ).toBe(true);
+      make(x);
+      expect(
+        numbers(x.e.pose).some((v, k) => Math.abs(v - numbers(to)[k]) > 1e-6),
+        label,
+      ).toBe(true);
+      x.frameAt(130);
+      expectView(x.e.shownPose, expected, label);
+      expectView(x.e.pose, expected, label);
+      x.frameAt(400);
+      expectView(x.e.shownPose, expected, label);
+      x.e.dispose();
+    }
+  });
+
+  it('start an animated change made while another one runs from the view that one goes to', () => {
+    // two orbit steps in a row turn the view by two steps; Frame All right after an orbit step
+    // frames the orbited view
+    const { s, e, frameAt } = setup();
+    const before = clonePose(e.pose);
+    op(s, 'view3d.view_orbit', { type: 'ORBITLEFT' });
+    op(s, 'view3d.view_orbit', { type: 'ORBITLEFT' });
+    frameAt(50);
+    op(s, 'view3d.view_all');
+    const framed = clonePose(e.pose);
+    expect(framed.yaw).toBeCloseTo(before.yaw + Math.PI / 6, 12);
+    expect(framed.target.distanceTo(before.target)).toBeGreaterThan(1e-3);
+    // that animation starts from what the frames showed
+    frameAt(60);
+    expect(Math.abs(e.shownPose.yaw - framed.yaw)).toBeGreaterThan(1e-3);
+    frameAt(400);
+    expectView(e.shownPose, framed);
+  });
+
+  it('align the camera to the view an animated change goes to (Align Active Camera to View)', () => {
+    const { s, e } = setup();
+    op(s, 'view3d.view_axis', { type: 'TOP' });
+    // no frame drawn since: the camera goes to the top view, not to the view the frames showed
+    op(s, 'view3d.camera_to_view');
+    const cam = s.doc.getObject(s.doc.getScene().camera!)!;
+    const m = new THREE.Matrix4().fromArray(s.doc.worldMatrix(cam.id));
+    const position = new THREE.Vector3().setFromMatrixPosition(m);
+    expect(position.distanceTo(posePosition(e.pose))).toBeLessThan(1e-6);
+    // looking straight down
+    const look = new THREE.Vector3(0, 0, -1).transformDirection(m);
+    expect(look.z).toBeCloseTo(-1, 9);
   });
 });
