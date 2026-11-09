@@ -817,8 +817,9 @@ function RenderAnimationDialog() {
     const renderFrame = (frame: number): FrameRender => {
       if (!pathTrace)
         return {
-          // one frame per animation frame, so the window keeps updating
-          done: nextPaint().then(() => e.renderPixels({ frame, width, height })),
+          // one frame per animation frame, so the window keeps updating; multisampled, so that
+          // every frame gets the same anti-aliasing (ViewportEngine.finalSampling)
+          done: nextPaint().then(() => e.renderPixels({ frame, width, height, animation: true })),
           cancel: () => undefined,
         };
       const pt = e.startPathTrace({

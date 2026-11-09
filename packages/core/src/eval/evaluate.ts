@@ -23,6 +23,7 @@ import {
   modifierDependencies,
   registerBuiltinModifiers,
 } from '../modifiers';
+import { geometryMemoryRefusals } from './memory';
 import { stableStringify } from '../util/json';
 import type { ArmaturePose } from '../armature/types';
 import type { ConstraintError } from '../constraints/types';
@@ -360,6 +361,7 @@ export class SceneEvaluator {
           input = sk.mesh;
           for (const message of sk.errors) errors.push({ modifierId: 'shape_keys', message });
         }
+        const refusals = geometryMemoryRefusals();
         const res = evaluateModifierStack(input, active, {
           frame,
           objectMatrix: fs.world(id) ?? identity4(),
@@ -382,7 +384,10 @@ export class SceneEvaluator {
           vertexGroups: o.type === 'MESH' ? doc.getVertexGroups(o.data) : undefined,
         });
         errors.push(...res.errors);
-        this.meshCache.set(id, { key, mesh: res.mesh, errors });
+        // a modifier the host's memory check skipped (memory.ts) may fit later, when memory was
+        // freed elsewhere: such a result is not kept
+        if (geometryMemoryRefusals() !== refusals) this.meshCache.delete(id);
+        else this.meshCache.set(id, { key, mesh: res.mesh, errors });
         const r: MeshResult = { mesh: res.mesh, key, errors, base };
         evaluated.set(id, r);
         return r;

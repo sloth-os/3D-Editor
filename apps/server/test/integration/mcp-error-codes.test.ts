@@ -4,6 +4,14 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { BROWSER_UI_OPERATORS } from '@3d-editor/core';
+import { editorTimeoutMessage } from '../../src/mcp/editor-commands';
+import {
+  BROWSER_RASTER_SECONDS,
+  NEW_SHADER_SECONDS,
+  SERVER_SOLID_SECONDS,
+  measured,
+  measuredOnServer,
+} from '../../src/mcp/editor-costs';
 import { sharedRenderer } from '../../src/render';
 import type { Room } from '../../src/sync/room';
 import { eventually, sleep, startServer, type TestServer } from '../helpers/app';
@@ -1434,7 +1442,7 @@ describe('tool descriptions', () => {
       'the viewport switching to it, compile nothing, also after the viewport turned its anti-aliasing off',
     );
     expect(editor.description).toContain(
-      "compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (0.6–4.5 s, or up to 12.9 s for a material with several procedural textures, measured in software WebGL and varying with the machine's load); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a scene with millions of triangles takes seconds per frame in any shading; the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and per frame for a scene with millions of triangles)",
+      `compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${measured(NEW_SHADER_SECONDS)}); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a scene with millions of triangles takes seconds per frame in any shading; the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and per frame for a scene with millions of triangles)`,
     );
     expect(editor.description).toContain(
       'a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the rest and compiles nothing again',
@@ -1446,7 +1454,7 @@ describe('tool descriptions', () => {
       expect(text).not.toMatch(/second of these two shadings|1\.2–11\.9|11\.9 s|transmission turned on/);
     expect(client.getInstructions()).not.toMatch(overstated);
     expect(client.getInstructions()).toContain(
-      "the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds (it builds and compiles the scene's materials for that shading and keeps them, also when the viewport turns its anti-aliasing off and through material edits that change values; an edit that needs a shader no material had, such as coat or sheen turned on or a procedural texture on a set of channels that no other material has, makes the next one in each of them compile it: 0.6–4.5 s, or up to 12.9 s for a material with several procedural textures, measured in software WebGL and varying with the machine's load), and a scene with millions of triangles seconds per frame in any shading",
+      `the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds (it builds and compiles the scene's materials for that shading and keeps them, also when the viewport turns its anti-aliasing off and through material edits that change values; an edit that needs a shader no material had, such as coat or sheen turned on or a procedural texture on a set of channels that no other material has, makes the next one in each of them compile it: ${measured(NEW_SHADER_SECONDS)}), and a scene with millions of triangles seconds per frame in any shading`,
     );
     expect(client.getInstructions()).not.toMatch(/10–15 s|procedural wood/);
     // what the editor's UI operators do there, said plainly, and wm.read_homefile's missing answer
@@ -1462,13 +1470,53 @@ describe('tool descriptions', () => {
     ).timeout_ms;
     expect(timeout.description).not.toMatch(overstated);
     expect(timeout.description).toContain(
-      "the first screenshot or viewport frame of a heavy scene in MATERIAL or RENDERED shading takes tens of seconds (the editor builds and compiles that shading's materials and keeps them, so later ones compile nothing), one after a material edit that needs a shader no material had as long as compiling that shader takes (0.6–4.5 s, or up to 12.9 s for a material with several procedural textures, measured in software WebGL and varying with the machine's load), and every screenshot or frame seconds in any shading with millions of triangles",
+      `the first screenshot or viewport frame of a heavy scene in MATERIAL or RENDERED shading takes tens of seconds (the editor builds and compiles that shading's materials and keeps them, so later ones compile nothing), one after a material edit that needs a shader no material had as long as compiling that shader takes (${measured(NEW_SHADER_SECONDS)}), and every screenshot or frame seconds in any shading with millions of triangles`,
     );
     expect(timeout.description).not.toMatch(/one frame/);
     expect(timeout.description).toContain('so later ones compile nothing');
     expect(timeout.maximum).toBe(55_000);
     expect(editor.description).toContain('at most 55000');
     expect(tools.get('render_image')!.description).toContain('renderer browser waits up to 55 s');
+    // the quick look renders on the server while the editor is busy and for a PATHTRACER scene; what
+    // grey clay costs there, and what happens when the scene needs more memory than a server render has
+    for (const text of [editor.description!, client.getInstructions()!]) {
+      expect(text).toContain(
+        "render_image {shading: 'SOLID'} (grey clay, rendered on the server while the editor is busy and when " +
+          `the scene's render engine is PATHTRACER: ${measuredOnServer(SERVER_SOLID_SECONDS)}; a scene that ` +
+          "needs more memory than a server render has fails with 'Rendering failed: the render process ran out of memory …', and then",
+      );
+      expect(text).not.toMatch(/vary(ing)? with the machine's load/);
+    }
+    // render_image: how long a browser editor took for its RASTER images, not 'tens of seconds'
+    const render = tools.get('render_image')!;
+    expect(render.description).toContain(
+      `renderer browser waits up to 55 s (an editor without GPU acceleration took ${measured(BROWSER_RASTER_SECONDS)})`,
+    );
+    expect(render.description).toContain(
+      `The server renders in render processes of its own: grey clay (shading SOLID) at 1280×720 took ${measuredOnServer(SERVER_SOLID_SECONDS)}, ` +
+        "and a render that needs more memory than a render process has fails with 'Rendering failed: the render process ran out of memory …' while the server keeps running.",
+    );
+    const renderer = (render.inputSchema.properties as Record<string, { description?: string }>).renderer;
+    expect(renderer.description).toContain(
+      `browser: only a browser editor: RASTER with WebGL (waits up to 55 s; an editor without GPU acceleration took ${measured(BROWSER_RASTER_SECONDS)})`,
+    );
+    for (const text of [render.description!, renderer.description!]) {
+      expect(text).not.toMatch(/(heavy scenes? in software WebGL takes?|takes) tens of seconds/);
+      // measured() names software WebGL; the sentence around it does not again
+      expect(text).not.toMatch(/in software WebGL,? (an image )?took/);
+    }
+    // projects deleted from storage by another writer, and a failed listing of storage
+    expect(tools.get('delete_project')!.description).toContain(
+      'Editors and agents that have it open on another server sharing the storage stay connected there, and their next change stores the project again',
+    );
+    expect(tools.get('get_project')!.description).toContain(
+      'deleted_from_storage: true and deleted_from_storage_note',
+    );
+    // it checks storage before it answers (a room that only agents use reads it only when it saves)
+    expect(tools.get('get_project')!.description).toContain(
+      'It checks storage before it answers (unless this server read it in the last 2 s; it waits up to 5 s for that check)',
+    );
+    expect(tools.get('list_projects')!.description).toContain('storage_listing_failed: true');
     // a longer wait than the maximum is refused before anything is sent
     const { id } = await ok('create_project', { name: 'Editor timeout max', empty: true });
     const r = await call('editor_command', { project: id, command: 'get_view', timeout_ms: 60_000 });
@@ -1485,24 +1533,22 @@ describe('timeouts of the browser editor', () => {
     );
     const r = await call('editor_command', { project: id, command: 'screenshot', timeout_ms: 200 });
     expect(r.raw.isError).toBe(true);
-    expect(r.text).toBe(
+    expect(r.text).toBe(editorTimeoutMessage('screenshot', 200));
+    expect(r.text).toContain(
       "editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 200 ms (at " +
         'most 55000); it may still carry the command out, and its next commands and renders wait ' +
-        "until it has. The screenshot is drawn in the viewport's shading, like a frame of the " +
-        'viewport. An editor without GPU acceleration (software WebGL, e.g. a headless browser) takes ' +
-        'seconds for that with a scene of millions of triangles in any shading (3.3–5.2 s in SOLID ' +
-        'with 4 million) and with a heavy scene in MATERIAL or RENDERED shading, and tens of seconds ' +
-        'for its first screenshot or frame in one of these two after it opened the project, while it ' +
-        "builds and compiles the scene's materials for that shading. After a material edit that needs " +
-        'a shader no material had (coat or sheen turned on, a procedural texture on a set of channels ' +
-        'that no other material has), its next screenshot or frame in each of these two compiles it ' +
-        '(0.6–4.5 s, or up to 12.9 s for a material with several procedural textures). The times ' +
-        "given were measured in software WebGL and vary with the machine's load. It keeps what it " +
-        'compiled, so a retry waits for the editor to finish and compiles nothing again. Retry with a ' +
-        "larger timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot (grey clay, " +
-        "much faster); for a quick look use render_image with shading 'SOLID', and render_image for " +
-        'final images.',
+        "until it has. The screenshot is drawn in the viewport's shading, like a frame of the viewport.",
     );
+    // the quick look: where it renders right after this timeout, what it costs there, and the
+    // screenshot again when the server cannot hold the scene
+    expect(r.text).toContain(
+      "for a quick look use render_image with shading 'SOLID' (grey clay: while the editor is busy, as right " +
+        "after this timeout, and when the scene's render engine is PATHTRACER, it renders on the server: " +
+        `${SERVER_SOLID_SECONDS}; a scene that needs more memory than a server render has fails with ` +
+        "'Rendering failed: the render process ran out of memory …', and then retry the screenshot with a " +
+        'larger timeout_ms), and render_image for final images.',
+    );
+    expect(r.text).toMatch(/they took up to [\d.]+ times as long\.$/);
     // other failures keep their message
     expect(await ok('editor_command', { project: id, command: 'view.frame_all' })).toEqual({
       command: 'view.frame_all',
@@ -1538,6 +1584,7 @@ describe('timeouts of the browser editor', () => {
       timeout_ms: 200,
     });
     expect(material.raw.isError).toBe(true);
+    expect(material.text).toBe(editorTimeoutMessage('screenshot', 200, null, { shading: 'material' }));
     expect(material.text).toContain(
       'until it has. An editor without GPU acceleration (software WebGL, e.g. a headless browser) ' +
         'takes seconds per MATERIAL screenshot of a heavy scene, and tens of seconds for its first ' +
@@ -1545,11 +1592,9 @@ describe('timeouts of the browser editor', () => {
         "compiles the scene's materials for MATERIAL shading. After a material edit that needs a " +
         'shader no material had (coat or sheen turned on, a procedural texture on a set of channels ' +
         'that no other material has), its next MATERIAL screenshot or viewport frame compiles it ' +
-        '(0.6–4.5 s, or up to 12.9 s for a material with several procedural textures). The times ' +
-        "given were measured in software WebGL and vary with the machine's load. It keeps what it " +
-        'compiled, so a retry waits for the editor to finish and compiles nothing again. Retry with a ' +
-        "larger timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot (grey clay, " +
-        'much faster)',
+        `(${NEW_SHADER_SECONDS}). It keeps what it compiled, so a retry waits for the editor to finish and ` +
+        "compiles nothing again. Retry with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for " +
+        'the screenshot (grey clay, much faster)',
     );
     // a SOLID one is not told to use SOLID
     const solid = await call('editor_command', {
@@ -1568,13 +1613,14 @@ describe('timeouts of the browser editor', () => {
         'shading that frame compiles shaders the first time after the editor opened the project (tens ' +
         "of seconds for a heavy scene, while it builds and compiles the scene's materials) and after " +
         'a material edit that needs a shader no material had (coat or sheen turned on, a procedural ' +
-        'texture on a set of channels that no other material has: 0.6–4.5 s, or up to 12.9 s for a ' +
-        'material with several procedural textures). The times given were measured in software WebGL ' +
-        "and vary with the machine's load. It keeps what it compiled, so a retry waits for the editor " +
-        'to finish and compiles nothing again. Retry with a larger timeout_ms (at most 55000), or ' +
-        "render without the editor: render_image with shading 'SOLID' and renderer 'software' (grey " +
-        'clay, rendered on the server, which can run out of memory for millions of triangles).',
+        `texture on a set of channels that no other material has: ${NEW_SHADER_SECONDS}). It keeps what ` +
+        'it compiled, so a retry waits for the editor to finish and compiles nothing again. Retry with a ' +
+        "larger timeout_ms (at most 55000), or render without the editor: render_image with shading 'SOLID' " +
+        `and renderer 'software' (grey clay, rendered on the server: ${SERVER_SOLID_SECONDS}; a scene that ` +
+        "needs more memory than a server render has fails with 'Rendering failed: the render process ran out " +
+        "of memory …', and then retry the screenshot with a larger timeout_ms).",
     );
+    expect(solid.text).not.toMatch(/which can run out of memory for millions of triangles/);
     expect(solid.text).not.toContain("pass shading 'SOLID'");
     // an unknown shading never reaches the editor
     const sent = browser.rpcRequests.length;
@@ -1621,9 +1667,10 @@ describe('timeouts of the browser editor', () => {
     expect(browser.raw.isError).toBe(true);
     expect(browser.text).toBe(
       'browser render failed: the editor did not finish the RASTER image within 55 s. It may still be drawing ' +
-        'it, and its next renders and commands wait until it has. A heavy scene takes tens of seconds in an ' +
-        'editor without GPU acceleration (software WebGL, e.g. a headless browser): render on the server with ' +
-        "renderer 'software' (or 'auto'), render a smaller image, or pass shading 'SOLID' (grey clay, faster).",
+        'it, and its next renders and commands wait until it has. An editor without GPU acceleration (e.g. a ' +
+        `headless browser) took ${measured(BROWSER_RASTER_SECONDS)}, and longer for heavier ` +
+        "scenes: render on the server with renderer 'software' (or 'auto'), render a smaller image, or pass " +
+        "shading 'SOLID' (grey clay, faster).",
     );
     expect(waits).toEqual([55_000]);
 
@@ -1733,6 +1780,54 @@ describe('timeouts of the browser editor', () => {
     expect(fifth.renderer).toBe('browser');
     expect(fifth.note).toBeUndefined();
     expect(ctl.waits).toEqual([15_000, 10_000, 55_000, 15_000]);
+  });
+
+  it('renders the quick look on the server while the editor is busy and for a PATHTRACER scene, as the timeout messages say', async () => {
+    // a screenshot's timeout message advises render_image {shading: 'SOLID'} and says where it renders
+    // (editorTimeoutMessage): renderer 'auto' asks a browser editor only for RASTER images, and not
+    // while that editor still draws a request the server stopped waiting for
+    const answer = (method: string, params: any) =>
+      method === 'render'
+        ? { mime: 'image/png', data_base64: TINY_PNG, width: params.width, height: params.height }
+        : method === 'ui' && params.command === 'screenshot'
+          ? never()
+          : { done: params.command };
+    const look = async (project: string) => {
+      const r = await call('render_image', { project, shading: 'SOLID', width: 32, height: 24 });
+      expect(r.raw.isError, r.text).toBeFalsy();
+      return JSON.parse(r.raw.content.find((c) => c.type === 'text')!.text!);
+    };
+    const { id } = await ok('create_project', { name: 'Quick look' });
+    const browser = await editor(id, answer, 'Quick look editor');
+    // an idle editor draws the quick look of a RASTER scene
+    expect(await look(id)).toMatchObject({ renderer: 'browser', client: 'Quick look editor' });
+    // right after a screenshot timed out the editor still draws it, and the server renders
+    const shot = await call('editor_command', {
+      project: id,
+      command: 'screenshot',
+      params: {},
+      timeout_ms: 100,
+    });
+    expect(shot.raw.isError).toBe(true);
+    expect(shot.text).toContain(
+      "for a quick look use render_image with shading 'SOLID' (grey clay: while the editor is busy, as right " +
+        "after this timeout, and when the scene's render engine is PATHTRACER, it renders on the server:",
+    );
+    const sent = browser.rpcRequests.length;
+    const busy = await look(id);
+    expect(busy.renderer).toBe('software');
+    expect(busy.note).toMatch(
+      /^the browser editor is still busy with an earlier request that the server stopped waiting for \(editor_command 'screenshot' sent \d+ s ago\): renderer 'auto' renders on the server until it has finished$/,
+    );
+    expect(browser.rpcRequests.length).toBe(sent);
+
+    // a PATHTRACER scene: on the server, also with an idle editor
+    const pt = await ok('create_project', { name: 'Quick look path traced' });
+    await ok('set_scene_settings', { project: pt.id, engine: 'PATHTRACER' });
+    const idle = await editor(pt.id, answer, 'Idle editor of a path traced scene');
+    const asked = idle.rpcRequests.length;
+    expect(await look(pt.id)).toMatchObject({ renderer: 'software', engine: 'RASTER' });
+    expect(idle.rpcRequests.length).toBe(asked);
   });
 
   it('renders on an editor that is not busy when several are connected', async () => {

@@ -13,6 +13,7 @@ import { RoomManager } from '../../src/sync/room-manager';
 import { ServerMetrics } from '../../src/observability/metrics';
 import { silentLog, type Log } from '../../src/observability/log';
 import { decodeAwarenessEntries, encodeAwarenessEntries } from '../../src/sync/awareness';
+import { projectInfoFromScene } from '../../src/sync/project-info';
 import type { Persistence } from '../../src/persistence';
 import { mkcolPath, startWebDAV, type TestWebDAV, type TestWebDAVOptions } from '../helpers/webdav';
 
@@ -54,16 +55,25 @@ class SplitEtagStore extends MemoryFileStore {
   }
 }
 
-/** MemoryFileStore whose reads of documents can be held (storage that does not answer). */
+/**
+ * MemoryFileStore whose reads of documents, and requests for their ETags, can be held (storage that
+ * does not answer them).
+ */
 class HeldStore extends MemoryFileStore {
   hold: Promise<void> | null = null;
   documentReads = 0;
+  etagRequests = 0;
   override async read(path: string) {
     if (path.endsWith('/document.ybin')) {
       this.documentReads++;
       if (this.hold) await this.hold;
     }
     return super.read(path);
+  }
+  override async etag(path: string) {
+    this.etagRequests++;
+    if (this.hold) await this.hold;
+    return super.etag(path);
   }
 }
 
@@ -148,6 +158,11 @@ async function sharedWebDAV(opts: TestWebDAVOptions) {
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** What `p` resolves to, or 'still waiting' when it takes longer than `ms`. */
+function within<T>(p: Promise<T>, ms = 1000): Promise<T | 'still waiting'> {
+  return Promise.race([p, wait(ms).then(() => 'still waiting' as const)]);
+}
 
 /** A log that keeps the level and message of each line. */
 function recordingLog() {
@@ -494,6 +509,99 @@ describe('RoomManager', () => {
   });
 
   /*
+   * Storage does not answer: the check whether it holds a project deleted here within the hour
+   * again (saved by another writer with unsaved changes) waits for it only for a while (5 s by
+   * default, 50 ms here), and the project counts as still deleted. Opening it (MCP tools, REST, sync
+   * connections) and listing projects used to wait for storage's own timeouts: 30 s for HEAD or
+   * PROPFIND, then 30 s for a GET. The check goes on, and once storage answers, the project is found.
+   */
+  it('answers for a project deleted here without waiting long for storage that does not answer', async () => {
+    const fs = new HeldStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: 50 });
+    const a = await rooms.createProject({ name: 'Deleted here', empty: true });
+    expect(await rooms.deleteProject(a.id)).toBe(true);
+    // another writer saves it again; then storage stops answering this server's requests for it
+    const again = SceneDoc.create({ name: 'Saved again', empty: true });
+    await store.fs.write(store.docPath(a.id), again.encodeState());
+    await store.saveInfo({
+      id: a.id,
+      name: 'Saved again',
+      created_at: '',
+      updated_at: '',
+      schema_version: 1,
+    });
+    let release!: () => void;
+    fs.hold = new Promise((resolve) => (release = resolve));
+    expect(await within(rooms.open(a.id, { create: true }))).toBeNull(); // a sync connection
+    expect(await within(rooms.open(a.id))).toBeNull(); // MCP tools, REST
+    expect(await within(rooms.exists(a.id))).toBe(false);
+    expect(await within(rooms.listProjects())).toEqual([]); // storage lists it, but its document does not answer
+    expect(fs.etagRequests).toBe(1); // one check at a time
+    release();
+    await until(() => !rooms.isDeleted(a.id));
+    expect((await rooms.open(a.id))?.scene.name).toBe('Saved again');
+    again.destroy();
+  });
+
+  /*
+   * Storage does not answer: a request that asks about a project several times waits for it once.
+   * An MCP tool asks whether a project exists, then opens it, or lists the projects for its 'not
+   * found' answer; each question used to wait for the same unanswered read again (10 s instead of
+   * 5 s). Once a request stopped waiting for a read, the others answer at once while it goes on.
+   */
+  it('waits once for storage that does not answer about a project deleted here', async () => {
+    const fs = new HeldStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: 600 });
+    const a = await rooms.createProject({ name: 'Deleted here', empty: true });
+    expect(await rooms.deleteProject(a.id)).toBe(true);
+    const again = SceneDoc.create({ name: 'Saved again', empty: true });
+    await store.fs.write(store.docPath(a.id), again.encodeState());
+    await store.saveInfo({
+      id: a.id,
+      name: 'Saved again',
+      created_at: '',
+      updated_at: '',
+      schema_version: 1,
+    });
+    let release!: () => void;
+    fs.hold = new Promise((resolve) => (release = resolve));
+    try {
+      const t0 = Date.now();
+      expect(await rooms.exists(a.id)).toBe(false);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(550); // waited for the check
+      expect(await within(rooms.listProjects(), 200)).toEqual([]);
+      expect(await within(rooms.open(a.id), 200)).toBeNull();
+      expect(await within(rooms.open(a.id, { create: true }), 200)).toBeNull();
+      expect(fs.etagRequests).toBe(1);
+    } finally {
+      release();
+    }
+    await until(() => !rooms.isDeleted(a.id));
+    expect((await rooms.open(a.id))?.scene.name).toBe('Saved again');
+    again.destroy();
+  });
+
+  it('waits once for storage that does not answer about a room nobody uses', async () => {
+    const fs = new HeldStore();
+    const { rooms } = setup({ fs, openReadWaitMs: 600 });
+    const a = await rooms.createProject({ name: 'Unanswered', empty: true });
+    let release!: () => void;
+    fs.hold = new Promise((resolve) => (release = resolve));
+    a.readAt = 0;
+    const reads = fs.documentReads;
+    try {
+      const t0 = Date.now();
+      expect(await rooms.exists(a.id)).toBe(true);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(550); // waited for the read
+      expect(await within(rooms.open(a.id), 200)).toBe(a);
+    } finally {
+      release();
+    }
+    await a.flush(); // after the read
+    expect(fs.documentReads - reads).toBe(1);
+  });
+
+  /*
    * A room in use when its project was deleted elsewhere stays open; once nobody uses it, the next
    * check for idle rooms closes it (before its idle time is up), and so does opening it or asking
    * whether the project exists.
@@ -518,6 +626,122 @@ describe('RoomManager', () => {
       expect(one.rooms.get(a.id)).toBeUndefined();
     },
   );
+
+  /*
+   * Listing such a room does not close it (the next check for idle rooms does), but it no longer
+   * lists it: it used to list the project until then, though storage had it deleted.
+   */
+  it('does not list a room found deleted once nobody uses it, before it is closed', async () => {
+    const shared = await sharedWebDAV({});
+    const one = shared.server('one');
+    const two = shared.server('two');
+    const a = await one.rooms.createProject({ name: 'Left', empty: true });
+    a.holders.add('mcp-session');
+    expect(await two.rooms.deleteProject(a.id)).toBe(true);
+    await one.rooms.refreshActive();
+    expect(a.deletedFromStorage).toBe(true);
+    expect((await one.rooms.listProjects()).map((p) => p.name)).toEqual(['Left']);
+    a.holders.delete('mcp-session');
+    expect(await one.rooms.listProjects()).toEqual([]);
+  });
+
+  /*
+   * A room with unsaved changes is kept, like a room in use, also when nobody uses it: closing it
+   * lost them. It is listed, and its next save stores the project again with them.
+   */
+  it.each(['sweep', 'periodic refresh', 'open', 'exists', 'list'] as const)(
+    'keeps a room with unsaved changes whose project was deleted elsewhere (%s)',
+    async (how) => {
+      const shared = await sharedWebDAV({});
+      const one = shared.server('one');
+      const two = shared.server('two');
+      const a = await one.rooms.createProject({ name: 'Unsaved', empty: true });
+      await a.refresh(); // finds its write: nothing left to read back
+      expect(await two.rooms.deleteProject(a.id)).toBe(true);
+      await a.refresh(); // finds the project deleted
+      expect(a.deletedFromStorage).toBe(true);
+      a.scene.addObject({ type: 'EMPTY', name: 'Unsaved change' }); // saved after 60 s (debounce)
+      if (how === 'sweep') await one.rooms.sweep();
+      else if (how === 'periodic refresh') await one.rooms.refreshActive();
+      else if (how === 'open') expect(await one.rooms.open(a.id)).toBe(a);
+      else if (how === 'exists') expect(await one.rooms.exists(a.id)).toBe(true);
+      else expect((await one.rooms.listProjects()).map((p) => p.name)).toEqual(['Unsaved']);
+      expect(a.destroyed).toBe(false);
+      expect(a.isDirty).toBe(true);
+      await a.flush();
+      expect(await shared.stored(a.id)).toEqual(['Unsaved change']);
+    },
+  );
+
+  /*
+   * Storage holds a project's project.json and no document (a document deleted by hand, or nginx
+   * creating the folder again for the project.json of a save that a deletion came between): the
+   * room loaded for it did not find a document stored, so a read that finds none is no deletion.
+   * It used to be closed as a project deleted elsewhere, and hidden for an hour. Its first change
+   * writes the document.
+   */
+  it('keeps a loaded project that has a project.json and no document', async () => {
+    const fs = new FlakyStore();
+    const rec = recordingLog();
+    const one = setup({ fs, log: rec.log });
+    const two = setup({ fs });
+    const a = await two.rooms.createProject({ name: 'Info only', empty: true });
+    await fs.remove(two.store.docPath(a.id));
+    const r = (await one.rooms.open(a.id))!;
+    expect(r.documentStored).toBe(false);
+    await r.refresh();
+    expect(r.deletedFromStorage).toBe(false);
+    r.readAt = 0; // as when its last read is older than 2 s: opening it reads storage again
+    expect(await one.rooms.open(a.id)).toBe(r);
+    expect(await one.rooms.exists(a.id)).toBe(true);
+    expect((await one.rooms.listProjects()).map((p) => p.id)).toEqual([a.id]);
+    r.scene.addObject({ type: 'EMPTY', name: 'First change' });
+    await r.flush();
+    expect(await one.store.loadDocument(a.id)).not.toBeNull();
+    expect(rec.lines.filter((l) => l.includes('deleted from storage'))).toEqual([]);
+  });
+
+  /*
+   * The room loaded for a project.json without a document has a document without a name: it was
+   * listed (and MCP get_project answered) as 'Untitled', and its first save wrote 'Untitled' into
+   * project.json in place of the stored name.
+   */
+  it('keeps the stored name of a project that has a project.json and no document', async () => {
+    const fs = new FlakyStore();
+    const one = setup({ fs });
+    const two = setup({ fs });
+    const a = await two.rooms.createProject({ name: 'Info only', empty: true });
+    await fs.remove(two.store.docPath(a.id));
+    const r = (await one.rooms.open(a.id))!;
+    expect(r.scene.name).toBe('Info only'); // what editors and agents see
+    expect(r.isDirty).toBe(false); // read from storage: nothing to save
+    expect((await one.rooms.listProjects()).map((p) => p.name)).toEqual(['Info only']);
+    expect((await one.rooms.describe(a.id))?.name).toBe('Info only');
+    r.scene.addObject({ type: 'EMPTY', name: 'First change' });
+    await r.flush();
+    expect((await one.store.loadInfo(a.id))?.name).toBe('Info only');
+    const stored = new Y.Doc();
+    Y.applyUpdate(stored, (await one.store.loadDocument(a.id))!.update);
+    expect(new SceneDoc(stored).name).toBe('Info only');
+  });
+
+  /* A stored document without a name (written by a client that never named it) keeps the stored record's name. */
+  it("lists and saves a document without a name under project.json's name", () => {
+    const unnamed = new SceneDoc(new Y.Doc());
+    unnamed.addObject({ type: 'EMPTY', name: 'Something' });
+    const prev = {
+      id: 'p',
+      name: 'Stored name',
+      created_at: '2026-01-01',
+      updated_at: '',
+      schema_version: 1,
+    };
+    expect(projectInfoFromScene('p', unnamed, prev).name).toBe('Stored name');
+    expect(projectInfoFromScene('p', unnamed, null).name).toBe('Untitled');
+    unnamed.setName('Named');
+    expect(projectInfoFromScene('p', unnamed, prev).name).toBe('Named');
+    unnamed.destroy();
+  });
 
   /*
    * A room a sync connection opened for an unknown project is not listed while it holds nothing,

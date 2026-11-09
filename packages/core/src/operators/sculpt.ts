@@ -13,6 +13,7 @@ import {
 import { defineOperator, type OperatorRegistry } from './registry';
 import { OperatorError, type OperatorContext } from './context';
 import { vec3 } from './helpers';
+import { FrameState } from '../eval/frame-state';
 
 function target(ctx: OperatorContext, ref?: string) {
   const o = ref
@@ -30,7 +31,8 @@ function target(ctx: OperatorContext, ref?: string) {
     );
   const mesh = ctx.doc.getMesh(o.data);
   if (!mesh) throw new OperatorError('Mesh data missing');
-  const world = ctx.doc.worldMatrix(o.id);
+  // where the scene shows the object at the current frame (as the viewport's brush works)
+  const world = new FrameState(ctx.doc, ctx.state.frame).world(o.id) ?? ctx.doc.worldMatrix(o.id);
   const inv = invert4(world);
   const scale =
     Math.cbrt(

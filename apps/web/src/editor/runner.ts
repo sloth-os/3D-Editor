@@ -386,21 +386,23 @@ const UNCHANGED_WRITES = 'unchanged-writes';
  * - Set Interpolation, Move Keyframes and Bake Transforms store whole F-curves, also when the keys
  *   stay as they were (the interpolation the keys have, a move by 0 frames, a second bake, which
  *   recomputes the keys with their last digits changed, see {@link SAME_NUMBER_TOLERANCE}); auto
- *   keying keys every transform channel of the objects a transform changes, which stores the
- *   F-curves of the channels it left as they were again when they have a key at the current frame.
+ *   keying keys every transform channel of every object a transform transforms, also of one it
+ *   leaves as it was (a rotation by 0 keys all nine channels), which stores the F-curves of the
+ *   channels it left as they were again when they have a key at the current frame.
  * - An Edit Mode operator, and Shade Auto Smooth, store the mesh's whole geometry as one blob, also
  *   when they change nothing (a move by 0, marking seams that are marked).
  * - A property edit stores the whole field it edits (every bone of a pose, every modifier of a
  *   stack), also when it sets the value the field has.
  * The operators that change objects' transforms store only the channels whose values change
- * (SceneDoc.transformObject and SceneDoc.setWorldMatrix): a Move only the location; a rotation
+ * (changedChannels and SceneDoc.setWorldMatrix in scene-doc.ts): a Move only the location; a rotation
  * only the rotation and a scale only the scale, and the location too about another point than the
  * object's own origin; a move by 0, a rotation by 0 or by whole turns and a scale by 1 nothing,
  * except that a rotation leaving an object in gimbal lock (Y at ±90°) with Z not 0 rewrites its
  * rotation with Z set to 0, as Blender's Rotate does (see transformTolerance in scene-doc.ts). So
  * do Look At (which turns objects), Drop to Ground and Snap to Surface (which move them, and with
- * Align to Normal turn them too), parenting and clearing a parent with Keep Transform (also to and
- * from armatures and bones) and Apply Transform.
+ * Align to Normal turn them too), the Snap menu's Selection to Cursor and Selection to Grid,
+ * parenting and clearing a parent with Keep Transform (also to and from armatures and bones) and
+ * Apply Transform.
  */
 interface UnchangedWrites {
   /** The step's values of those entries (its items, by id). */

@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { BROWSER_UI_OPERATORS, createOperatorRegistry } from '@3d-editor/core';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { BROWSER_UI_OPERATORS, SceneDoc, createOperatorRegistry } from '@3d-editor/core';
 import { registry } from '../src/editor/editor';
 import { registerUiOperators } from '../src/editor/ui-operators';
+import { runOperator } from '../src/editor/runner';
+import { serverConfig, session, toasts } from '../src/app/store';
+import { defaultPreferences, prefs } from '../src/app/prefs';
+import { ProjectSession } from '../src/project/session';
 
 /*
  * The MCP server has no UI-only operators: for an id of BROWSER_UI_OPERATORS, run_operator, batch
@@ -64,5 +68,62 @@ describe('view3d.toggle_xray', () => {
         'edges also select hidden elements (a click on a face picks the front one). Selecting objects ' +
         'works the same with it on or off (Alt+Z).',
     );
+  });
+});
+
+/*
+ * Save (Ctrl+S) shows what the save did (ProjectSession.flush, WebDAVSync.save): it used to say
+ * "Saved to WebDAV" also when saving there failed.
+ */
+describe('wm.save_mainfile', () => {
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    await session.value?.close(false);
+    session.value = null;
+  });
+
+  /** Opens a new project in this browser; `webdav`: it also saves to https://dav.test/. */
+  async function openProject(id: string, webdav: boolean): Promise<void> {
+    if (!registry.has('wm.call_menu')) registerUiOperators(registry);
+    serverConfig.value = null;
+    const d = defaultPreferences();
+    prefs.value = {
+      ...d,
+      storage: webdav
+        ? { mode: 'webdav', webdav: { ...d.storage.webdav, url: 'https://dav.test/', basePath: '/' } }
+        : { ...d.storage, mode: 'browser' },
+    };
+    session.value = await ProjectSession.open(id, {
+      initial: SceneDoc.create({ name: 'Saved', empty: true }),
+    });
+  }
+
+  /** Runs Save and returns the toast it shows. */
+  async function save() {
+    toasts.value = [];
+    expect(runOperator(session.value!, registry, 'wm.save_mainfile', {}).ok).toBe(true);
+    await vi.waitFor(() => expect(toasts.value).toHaveLength(1));
+    const [{ level, message }] = toasts.value;
+    return { level, message };
+  }
+
+  it('says that saving to WebDAV failed, and why', async () => {
+    // a WebDAV server that has no room left: the project's folders are made, its document is refused
+    vi.stubGlobal(
+      'fetch',
+      async (_input: string, init: RequestInit = {}) =>
+        new Response(null, { status: init.method === 'PUT' ? 507 : init.method === 'MKCOL' ? 201 : 404 }),
+    );
+    await openProject('p-save-failed', true);
+    expect(await save()).toEqual({
+      level: 'error',
+      message:
+        'Not saved to WebDAV (PUT /projects/p-save-failed/document.ybin failed: 507). The project is saved in this browser.',
+    });
+  });
+
+  it('says that the project is saved in this browser when it has no WebDAV storage', async () => {
+    await openProject('p-save-browser', false);
+    expect(await save()).toEqual({ level: 'info', message: 'Saved in this browser' });
   });
 });

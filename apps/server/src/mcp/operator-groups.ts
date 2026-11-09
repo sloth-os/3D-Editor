@@ -118,7 +118,7 @@ export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
     name: 'Shading',
     description:
       'Materials, presets, procedural textures, sky and mist. In a browser editor without GPU acceleration ' +
-      '(software WebGL), an edit that needs a shader no material had (coat or sheen turned on, a procedural ' +
+      '(e.g. a headless browser), an edit that needs a shader no material had (coat or sheen turned on, a procedural ' +
       'texture on a set of channels that no other material has) makes the next screenshot or viewport frame ' +
       `in MATERIAL and in RENDERED shading compile it (${measured(NEW_SHADER_SECONDS)}; edits of values ` +
       "compile nothing): pass editor_command a larger timeout_ms or shading 'SOLID'",
@@ -176,7 +176,7 @@ export function toolOnlyOperator(id: string): string | null {
   return (
     `'${id}' would render on the server's main thread and stall every editor and agent until it is done, ` +
     `so it is not available through run_operator, batch or edit_mesh. Use the ${t.tool} tool instead ` +
-    `(${t.usage}): it renders on the server's render threads.`
+    `(${t.usage}): it renders in the server's render processes.`
   );
 }
 

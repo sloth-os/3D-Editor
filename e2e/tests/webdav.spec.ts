@@ -29,6 +29,54 @@ test.describe('WebDAV storage', () => {
     await deviceB.close();
   });
 
+  /*
+   * WebDAV through the server is the server's storage. A deletion on the server was told twice (the
+   * server's message, then WebDAV's 'deleted from WebDAV on another device'), and after a change
+   * stored the project there again, which the server then opened again, the page stayed
+   * disconnected from the server until a reload or Save.
+   */
+  test('says once that the server deleted a project, and syncs live again once a change stores it again', async ({
+    page,
+  }) => {
+    const id = await newProject(page, DAV_SERVER);
+    const storage = page.getByTestId('storage-status');
+    const sync = page.getByTestId('sync-status');
+    await expect(storage).toHaveAttribute('data-status', 'synced', { timeout: 30_000 });
+    await expect(sync).toHaveAttribute('data-status', 'connected');
+    // every toast the page shows, in order (a toast disappears after 10 s)
+    await page.evaluate(() => {
+      const w = window as unknown as { toastLog: string[] };
+      w.toastLog = [];
+      new MutationObserver((records) => {
+        for (const r of records)
+          for (const n of r.addedNodes)
+            if (n instanceof HTMLElement && n.dataset.testid === 'toast')
+              w.toastLog.push(n.textContent ?? '');
+      }).observe(document.body, { childList: true, subtree: true });
+    });
+    const toastLog = () => page.evaluate(() => (window as unknown as { toastLog: string[] }).toastLog);
+    const deleted =
+      '"Untitled" was deleted on the server. This browser keeps its copy and stores it on the server again when you change it or save (Ctrl+S).';
+    expect((await fetch(`${DAV_SERVER}/api/projects/${id}`, { method: 'DELETE' })).status).toBe(204);
+    await expect(sync).toHaveAttribute('data-status', 'deleted');
+    await expect.poll(toastLog).toEqual([deleted]);
+    // WebDAV's next sync finds the deletion, and nothing more is said
+    await page.evaluate(() => window.dispatchEvent(new Event('online'))); // syncs now
+    await expect(storage).toHaveAttribute('data-status', 'deleted');
+    expect((await fetch(`${DAV_SERVER}/api/projects/${id}`)).status).toBe(404);
+    // a change stores it again through the proxy, the server opens it again, and the page syncs live
+    await menuPath(page, ['Add', 'Mesh', 'Torus']);
+    await expect(storage).toHaveAttribute('data-status', 'synced');
+    await expect(sync).toHaveAttribute('data-status', 'connected');
+    expect(await toastLog()).toEqual([
+      deleted,
+      '"Untitled" was deleted on the server; this browser stored it there again.',
+    ]);
+    await expect
+      .poll(async () => (await (await fetch(`${DAV_SERVER}/api/projects/${id}`)).json()).peers)
+      .toBe(1);
+  });
+
   // webdav-server as it is (ETags only in PROPFIND, If-Match ignored: the client pairs ETags from
   // PROPFIND and reads its writes back), and under /nc like Nextcloud (ETags with GET and PUT,
   // If-Match checked: the client checks and confirms its writes with HEAD)

@@ -6,7 +6,7 @@ import { SceneEvaluator, type EvaluatedScene, type SceneDoc } from '@3d-editor/c
  * re-evaluated the whole scene from scratch (modifier stacks, curves, instancing, the rigid body
  * simulation): ~120 ms per get_object on a mid-sized scene, which made checking motion over many
  * frames and objects slow. Now each document keeps one evaluator per mode (their geometry and
- * simulation caches survive between calls, like in the browser and the render threads) and the
+ * simulation caches survive between calls, like in the browser and the render processes) and the
  * last evaluations by frame; any change to the document drops the evaluations.
  *
  * Evaluated scenes are shared between callers: treat them as immutable.

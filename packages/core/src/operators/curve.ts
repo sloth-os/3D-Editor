@@ -18,6 +18,8 @@ import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { activeObject, setSelection, vec3 } from './helpers';
 import { keyProperty, rekeyAnimated } from './anim';
+import { FrameState } from '../eval/frame-state';
+import { evaluatedWorld, moveOrigin } from './transform';
 
 /*
  * Curve and text operators (curve.*, object.text_add, font.*). Coordinates of spline points are
@@ -925,11 +927,14 @@ export function curveOriginSet(
   o: ObjectData,
   type: 'ORIGIN_GEOMETRY' | 'ORIGIN_CURSOR' | 'GEOMETRY_ORIGIN',
   center: 'MEDIAN' | 'BOUNDS',
+  before: FrameState = new FrameState(ctx.doc, ctx.state.frame),
+  changed: Set<string> = new Set(),
 ): void {
   if ((o.type !== 'CURVE' && o.type !== 'FONT') || !o.data) return;
   const src = ctx.doc.getCurve(o.data);
   if (!src) return;
-  const world = ctx.doc.worldMatrix(o.id);
+  // where the scene shows the object (a bone or an animated or constrained parent included)
+  const world = evaluatedWorld(before, o.id);
   const target =
     type === 'ORIGIN_CURSOR'
       ? transformPoint3(invert4(world), ctx.state.cursorLocation)
@@ -971,14 +976,7 @@ export function curveOriginSet(
   }
   if (type === 'GEOMETRY_ORIGIN') return;
   // the origin moves onto the old centre, so nothing moves visually; children keep their world transform
-  const origin = transformPoint3(world, target);
-  const children = new Map(ctx.doc.childrenOf(o.id).map((c) => [c.id, ctx.doc.worldMatrix(c.id)]));
-  const w = world.slice();
-  w[12] = origin[0];
-  w[13] = origin[1];
-  w[14] = origin[2];
-  ctx.doc.setWorldMatrix(o.id, w);
-  for (const [cid, cw] of children) ctx.doc.setWorldMatrix(cid, cw);
+  moveOrigin(ctx, o.id, target, before, changed);
 }
 
 /**

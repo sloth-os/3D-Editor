@@ -24,6 +24,7 @@ import { skySun } from '../render/sky';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { OperatorError, type OperatorContext } from './context';
 import { activeObject, resolveObjectIds, vec3, vec4 } from './helpers';
+import { FrameState } from '../eval/frame-state';
 
 /*
  * Operators for material presets, procedural textures and the world sky/mist
@@ -83,9 +84,12 @@ const fmt = (v: number) => String(Math.round(v * 1000) / 1000);
 function warnScaledUsers(ctx: OperatorContext, materialIds: readonly string[], what: string): void {
   if (!materialIds.length) return;
   const ids = new Set(materialIds);
+  // the scale the object is drawn with at the current frame (a scaled parent or bone, animation)
+  let fs: FrameState | null = null;
   for (const o of ctx.doc.listObjects()) {
     if (!o.material_slots.some((s) => s !== null && ids.has(s))) continue;
-    const m = ctx.doc.worldMatrix(o.id);
+    fs ??= new FrameState(ctx.doc, ctx.state.frame);
+    const m = fs.world(o.id) ?? ctx.doc.worldMatrix(o.id);
     const s = [Math.hypot(m[0], m[1], m[2]), Math.hypot(m[4], m[5], m[6]), Math.hypot(m[8], m[9], m[10])];
     if (s.every((v) => Math.abs(v - 1) <= 1e-3)) continue;
     ctx.report(

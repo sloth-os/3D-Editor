@@ -2,6 +2,7 @@ import { PathFilm, type PathTile } from '@3d-editor/core';
 import type { RenderThread } from './pool';
 import {
   RenderCancelledError,
+  primaryRenderError,
   type DocRef,
   type FilmBuffers,
   type FrameOptions,
@@ -111,8 +112,10 @@ export async function pathTraceParallel(
     try {
       info = await abortable(Promise.any(prepared), signal);
     } catch (err) {
-      const first = err instanceof AggregateError ? err.errors[0] : err;
-      throw first instanceof Error ? first : new Error(String(first));
+      throw (
+        (err instanceof AggregateError ? primaryRenderError(err.errors) : undefined) ??
+        (err instanceof Error ? err : new Error(String(err)))
+      );
     }
     const W = info.width;
     const H = info.height;
@@ -122,7 +125,8 @@ export async function pathTraceParallel(
     // threads able to render (prepared); a failed thread drops out, its band is requeued
     const ready = new Set<number>();
     const dead = new Set<number>();
-    let lastError: Error | null = null;
+    /** Why threads dropped out (the render's own failure first, see primaryRenderError). */
+    const errors: unknown[] = [];
     let wake: (() => void) | null = null;
     prepared.forEach((p, i) =>
       p.then(
@@ -132,7 +136,7 @@ export async function pathTraceParallel(
         },
         (err: unknown) => {
           dead.add(i);
-          lastError = err instanceof Error ? err : new Error(String(err));
+          errors.push(err);
           wake?.();
         },
       ),
@@ -207,14 +211,15 @@ export async function pathTraceParallel(
                   busy.delete(i);
                   ready.delete(i);
                   dead.add(i);
-                  lastError = err instanceof Error ? err : new Error(String(err));
+                  errors.push(err);
                   queue.unshift(band);
                   pump();
                 },
               );
           }
           if (!queue.length && busy.size === 0) return finish();
-          if (dead.size === threads.length) return finish(lastError ?? new Error('render threads failed'));
+          if (dead.size === threads.length)
+            return finish(primaryRenderError(errors) ?? new Error('render threads failed'));
         };
         wake = pump;
         pump();
@@ -272,27 +277,18 @@ export async function pathTraceParallel(
       normal: mean.normal,
       depth: mean.depth,
     };
-    const transfer =
-      finisher.kind === 'worker'
-        ? [mean.color, mean.emission, mean.variance, mean.albedo, mean.normal, mean.depth].map(
-            (a) => a.buffer as ArrayBuffer,
-          )
-        : [];
     const finished = await abortable(
-      finisher.call<ImageResult>(
-        {
-          type: 'finish',
-          film: buffers,
-          options: {
-            denoise: info.denoise,
-            exposure: info.exposure,
-            viewTransform: info.viewTransform,
-            displayBackground: info.displayBackground,
-            png: !!opts.png,
-          },
+      finisher.call<ImageResult>({
+        type: 'finish',
+        film: buffers,
+        options: {
+          denoise: info.denoise,
+          exposure: info.exposure,
+          viewTransform: info.viewTransform,
+          displayBackground: info.displayBackground,
+          png: !!opts.png,
         },
-        transfer,
-      ),
+      }),
       signal,
     );
     return {

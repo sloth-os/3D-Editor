@@ -606,17 +606,6 @@ export function armatureParentSet(
   return result;
 }
 
-/**
- * Removes bone parenting from an object (it becomes unparented), keeping its evaluated world
- * transform when `keepTransform` (the stored-transform helpers of SceneDoc ignore bones): only the
- * channels that world matrix changes are written (SceneDoc.setWorldMatrix).
- */
-export function clearBoneParent(ctx: OperatorContext, id: string, keepTransform: boolean): void {
-  const world = keepTransform ? worldMatrixOf(ctx, id) : null;
-  ctx.doc.updateObject(id, { parent: null, parent_type: 'OBJECT', parent_bone: '' });
-  if (world) ctx.doc.setWorldMatrix(id, world, null);
-}
-
 /** Object references of a constraint list remapped through `remap` (null when nothing changed). */
 function remapConstraintRefs(
   list: ConstraintData[] | undefined,

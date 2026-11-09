@@ -4,6 +4,7 @@ import { abortable, newJobId, pathTraceParallel } from './path-trace';
 import type { RenderThread } from './pool';
 import {
   RenderCancelledError,
+  primaryRenderError,
   type AutoViewResult,
   type DocRef,
   type EncodedResult,
@@ -225,6 +226,8 @@ export async function renderAnimationParallel(
         let next = 0;
         let inFlight = 0;
         let failed = false;
+        /** Why threads dropped out (the render's own failure first, see primaryRenderError). */
+        const deaths: unknown[] = [];
         const fail = (err: unknown) => {
           if (failed) return;
           failed = true;
@@ -265,7 +268,9 @@ export async function renderAnimationParallel(
                 inFlight--;
                 // a thread that died is dropped and its frame goes to another one; an error the
                 // render itself raised (bad data) would happen anywhere: give up
-                if (t.alive || !threads.some((x) => x.alive)) return fail(err);
+                if (t.alive) return fail(err);
+                deaths.push(err);
+                if (!threads.some((x) => x.alive)) return fail(primaryRenderError(deaths));
                 retry.push(i);
                 pump();
               },
@@ -307,22 +312,19 @@ export async function renderAnimationParallel(
       // GIF palettes and contact sheets of many frames take seconds: encode on a render thread
       const encoder = threads.find((t) => t.alive) ?? threads[0];
       const result = await abortable(
-        encoder.call<EncodedResult>(
-          {
-            type: 'encode',
-            frames: kept,
-            options: {
-              format: job.format,
-              fps: job.fps,
-              loop: job.loop,
-              dither: job.dither,
-              colors: job.colors,
-              columns: job.columns,
-              labels: frames.map((f) => String(Math.round(f * 100) / 100)),
-            },
+        encoder.call<EncodedResult>({
+          type: 'encode',
+          frames: kept,
+          options: {
+            format: job.format,
+            fps: job.fps,
+            loop: job.loop,
+            dither: job.dither,
+            colors: job.colors,
+            columns: job.columns,
+            labels: frames.map((f) => String(Math.round(f * 100) / 100)),
           },
-          encoder.kind === 'worker' ? kept.map((f) => f.data.buffer as ArrayBuffer) : [],
-        ),
+        }),
         signal,
       );
       out.data = result.data;
@@ -387,22 +389,18 @@ class APNGStream {
     this.error = fn;
   }
 
-  /** Sends the next frame (its pixel buffer is transferred to the encoder thread). */
+  /** Sends the next frame to the encoder thread. */
   add(frame: { width: number; height: number; data: Uint8ClampedArray }): void {
     if (this.failure) throw this.failure;
     const first = this.sent === 0;
     this.sent++;
-    const transfer = this.encoder.kind === 'worker' ? [frame.data.buffer as ArrayBuffer] : [];
     const a = this.anim;
-    const p = this.encoder.call(
-      {
-        type: 'apng-add',
-        job: this.job,
-        frame,
-        ...(first ? { init: { width: a.width, height: a.height, fps: a.fps, loop: a.loop } } : {}),
-      },
-      transfer,
-    );
+    const p = this.encoder.call({
+      type: 'apng-add',
+      job: this.job,
+      frame,
+      ...(first ? { init: { width: a.width, height: a.height, fps: a.fps, loop: a.loop } } : {}),
+    });
     this.last = p;
     p.then(
       () => {

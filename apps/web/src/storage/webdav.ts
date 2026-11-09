@@ -145,6 +145,25 @@ function holdsMoreThan(doc: Y.Doc, vector: Uint8Array): boolean {
   return false;
 }
 
+/** What Save (Ctrl+S) did, in the words the editor tells the person (see {@link WebDAVSync.save}). */
+export interface SaveReport {
+  message: string;
+  level: 'info' | 'warning' | 'error';
+}
+
+/** One sync: its result (null when it did not run or failed) and what Save tells the person. */
+interface SyncRun {
+  result: SyncResult | null;
+  report: SaveReport;
+}
+
+const SAVED: SaveReport = { message: 'Saved to WebDAV', level: 'info' };
+const OFFLINE: SaveReport = {
+  message:
+    'You are offline: the project is saved in this browser and syncs with WebDAV when you are back online.',
+  level: 'warning',
+};
+
 /**
  * Keeps one open project merged with its WebDAV copy: initial pull, debounced pushes after local
  * edits, periodic polling for changes made by other devices, and a final flush on page hide.
@@ -163,11 +182,25 @@ export class WebDAVSync {
   readonly error = signal<string | null>(null);
   private timer: ReturnType<typeof setTimeout> | null = null;
   private poll: ReturnType<typeof setInterval> | null = null;
-  private running: Promise<SyncResult | null> | null = null;
+  private running: Promise<SyncRun> | null = null;
   private again = false;
   private stopped = false;
   /** The person was told that the project was deleted from the store (until it is stored again). */
   private toldDeleted = false;
+  /** The last sync found the project gone from the store. */
+  private lost = false;
+  /**
+   * Counts the syncs that found the project in the store again after it was gone from it: this
+   * browser stored it again, or another writer did.
+   */
+  readonly restored = signal(0);
+  /**
+   * Whether the editor server said that it deleted the project (its sync connection was closed with
+   * 4404). Set for WebDAV through that server, which is the server's storage: a deletion found there
+   * is the one the server told of (the editor shows no second message for it), and the messages
+   * name the server.
+   */
+  deletedOnServer: () => boolean = () => false;
 
   constructor(
     readonly target: WebDAVTarget,
@@ -200,15 +233,31 @@ export class WebDAVSync {
     }, delay);
   }
 
+  /** Syncs now (or right after the sync that is running). */
+  async syncNow(): Promise<SyncResult | null> {
+    return (await this.run({})).result;
+  }
+
   /**
-   * Syncs now (or right after the sync that is running). `save`: write the project also when the
-   * store lost it and this browser has no changes since its last sync (Save, Ctrl+S).
+   * Saves now (Save, Ctrl+S), after the sync that is running: writes the project also when the
+   * store lost it and this browser has no changes since its last sync. Resolves with what to tell
+   * the person: saved, stored again after a deletion, deleted right after this save, offline, or
+   * failed with the reason (this sync shows no message of its own).
    */
-  async syncNow(opts: { save?: boolean } = {}): Promise<SyncResult | null> {
-    if (this.stopped) return null;
+  async save(): Promise<SaveReport> {
+    return (await this.run({ save: true })).report;
+  }
+
+  private async run(opts: { save?: boolean }): Promise<SyncRun> {
+    if (this.stopped) {
+      return {
+        result: null,
+        report: { message: 'Not saved to WebDAV: the project was closed.', level: 'warning' },
+      };
+    }
     if (!navigator.onLine) {
       this.status.value = 'offline';
-      return null;
+      return { result: null, report: OFFLINE };
     }
     if (this.running) {
       if (!opts.save) {
@@ -216,9 +265,9 @@ export class WebDAVSync {
         return this.running;
       }
       await this.running;
-      return this.syncNow(opts);
+      return this.run(opts);
     }
-    this.running = (async () => {
+    this.running = (async (): Promise<SyncRun> => {
       const span = telemetry.startSpan('storage.webdav.sync', {
         'storage.via_server': this.target.viaServer,
       });
@@ -253,45 +302,66 @@ export class WebDAVSync {
         // also when the document is gone: what this sync wrote or read right before another writer
         // deleted it is no change the store lacked (the next syncs would store it again)
         if (res.stored) syncRecords.addSynced(target, projectId, res.stored);
+        const serverTold = this.deletedOnServer();
+        const onServer = !deletedHere && serverTold;
         if (res.missing) {
           if (!synced && !deletedHere && !res.pushed) {
             this.status.value = 'idle';
-            return res;
+            return { result: res, report: SAVED };
           }
-          if (!this.toldDeleted)
-            toast(
-              deletedHere
-                ? `"${this.doc.name}" was deleted from WebDAV in this browser. This tab keeps its copy and stores it on WebDAV again when you change it or save (Ctrl+S).`
-                : `"${this.doc.name}" was deleted from WebDAV on another device. This browser keeps its copy and stores it on WebDAV again when you change it or save (Ctrl+S).`,
-              'warning',
-              10_000,
-            );
+          // a save writes with `create`: it finds the project gone only right after its own write
+          const when = opts.save ? ' right after this save' : '';
+          const deleted: SaveReport = {
+            message: deletedHere
+              ? `"${this.doc.name}" was deleted from WebDAV in this browser${when}. This tab keeps its copy and stores it on WebDAV again when you change it or save (Ctrl+S).`
+              : onServer
+                ? `"${this.doc.name}" was deleted on the server${when}. This browser keeps its copy and stores it on the server again when you change it or save (Ctrl+S).`
+                : `"${this.doc.name}" was deleted from WebDAV on another device${when}. This browser keeps its copy and stores it on WebDAV again when you change it or save (Ctrl+S).`,
+            level: 'warning',
+          };
+          // (the editor told of the deletion on the server already)
+          if (!this.toldDeleted && !opts.save && !serverTold) toast(deleted.message, deleted.level, 10_000);
           this.toldDeleted = true;
+          this.lost = true;
           this.status.value = 'deleted';
           this.error.value = deletedHere
             ? 'Deleted from WebDAV in this browser'
-            : 'Deleted from WebDAV on another device';
-          return res;
+            : onServer
+              ? 'Deleted on the server'
+              : 'Deleted from WebDAV on another device';
+          return { result: res, report: deleted };
         }
         this.toldDeleted = false;
         if (deletedHere) syncRecords.setDeleted(target, projectId, false);
-        if (res.created && (synced || deletedHere))
-          toast(
-            deletedHere
+        let report = SAVED;
+        const storedAgain = res.created && (!!synced || deletedHere);
+        if (storedAgain) {
+          report = {
+            message: deletedHere
               ? `"${this.doc.name}" was deleted from WebDAV in this browser; this tab stored it there again.`
-              : `"${this.doc.name}" was deleted from WebDAV on another device; this browser stored it there again.`,
-            'warning',
-            10_000,
-          );
+              : onServer
+                ? `"${this.doc.name}" was deleted on the server; this browser stored it there again.`
+                : `"${this.doc.name}" was deleted from WebDAV on another device; this browser stored it there again.`,
+            level: 'warning',
+          };
+          if (!opts.save) toast(report.message, report.level, 10_000);
+        }
         this.status.value = 'synced';
-        return res;
+        if (storedAgain || this.lost) {
+          this.lost = false;
+          this.restored.value++;
+        }
+        return { result: res, report };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.status.value = navigator.onLine ? 'error' : 'offline';
         this.error.value = msg;
         span.setError(msg).end();
         telemetry.log('WARN', `WebDAV sync failed: ${msg}`);
-        return null;
+        const report: SaveReport = navigator.onLine
+          ? { message: `Not saved to WebDAV (${msg}). The project is saved in this browser.`, level: 'error' }
+          : OFFLINE;
+        return { result: null, report };
       } finally {
         this.running = null;
         if (this.again) {

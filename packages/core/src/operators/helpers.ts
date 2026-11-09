@@ -7,6 +7,7 @@ import type { MeshData } from '../mesh/types';
 import { vertexCount } from '../mesh/types';
 import type { MeshSelection } from '../mesh/selection';
 import { flushSelection, selectedVertexSet } from '../mesh/selection';
+import { FrameState } from '../eval/frame-state';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 
@@ -76,7 +77,10 @@ export interface EditTarget {
   /** Immutable current mesh (clone before modifying). */
   mesh: MeshData;
   selection: MeshSelection;
-  /** Object world matrix. */
+  /**
+   * Object world matrix where the scene shows the object at the current frame (animation, a bone
+   * or another parent, poses and constraints included), as Blender's Edit Mode tools use it.
+   */
   matrix: Mat4;
 }
 
@@ -87,12 +91,17 @@ export function editTarget(ctx: OperatorContext): EditTarget {
   const object = activeObject(ctx)!;
   const mesh = ctx.doc.getMesh(object.data!);
   if (!mesh) throw new OperatorError('Mesh data missing', 'FAILED');
+  let matrix: Mat4 | null = null;
   return {
     object,
     meshId: object.data!,
     mesh,
     selection: ctx.state.meshSelection,
-    matrix: ctx.doc.worldMatrix(object.id),
+    // evaluated once, when a tool needs it
+    get matrix(): Mat4 {
+      return (matrix ??=
+        new FrameState(ctx.doc, ctx.state.frame).world(object.id) ?? ctx.doc.worldMatrix(object.id));
+    },
   };
 }
 

@@ -8,10 +8,19 @@ import {
   identity4,
   invert4,
   multiply4,
+  rotationFromEuler,
   scaling4,
   translation4,
 } from '../math/mat4';
-import { cross3, dot3, length3, normalize3, transformDirection3, transformPoint3 } from '../math/vec3';
+import {
+  anyPerpendicular3,
+  cross3,
+  dot3,
+  length3,
+  normalize3,
+  transformDirection3,
+  transformPoint3,
+} from '../math/vec3';
 import {
   changedChannels,
   dataKindOf,
@@ -53,7 +62,6 @@ import {
   pointsBounds,
   rotationBetween,
   sampleSurface,
-  trackRotation,
   unionBounds,
 } from '../generate/layout';
 import {
@@ -282,36 +290,54 @@ class LayoutScene {
 
   /**
    * Turns an object about its origin so its `track` axis points along the world direction `dir` and
-   * its `up` axis as close as possible to world +Z (see trackRotation; `fallbackUp` when `dir` is
-   * vertical), keeping its location and scale: only the rotation can change. The rotation is found
-   * in the parent's space (the tracked axis exact also under a parent scaled unevenly, the up axis
-   * the closest one perpendicular to it there), as the euler closest to the current one; a mirrored
-   * object stays mirrored on the third axis. False when `dir` is zero.
+   * its `up` axis as close as possible to world +Z (`fallbackUp` when every candidate is
+   * perpendicular to +Z, as when `dir` is vertical), keeping its location and scale: only the
+   * rotation can change. The rotation is solved in the parent's space: the tracked axis is the one
+   * whose world direction is `dir` exactly, also under a parent that shears the child's axes (scaled
+   * unevenly and turned); of the axes perpendicular to it there, the up axis is the one whose world
+   * direction is closest to +Z (the projection of +Z onto the plane their world directions span,
+   * which is perpendicular to `dir` unless the parent shears the child). A mirrored object stays
+   * mirrored. The rotation does not depend on the current one, so a second run changes nothing.
+   * False when `dir` is zero.
    */
   aim(id: string, dir: Readonly<Vec3>, track: TrackAxis, up: UpAxis, fallbackUp: Readonly<Vec3>): boolean {
-    const rot = trackRotation(dir, track, up, [0, 0, 1], fallbackUp);
-    if (!rot) return false;
+    if (!(length3(dir) > 0) || !dir.every(Number.isFinite)) return false;
     const stored = this.ctx.doc.getObject(id);
     const o = this.editedIds.has(id) ? stored : this.ev.byId.get(id)?.data;
     if (!o || !stored) return true;
-    const toParent = this.hasParent(id) ? invertSafe(linearPart(this.parentWorld(id))) : identity4();
+    const parent = this.hasParent(id) ? linearPart(this.parentWorld(id)) : identity4();
+    const toParent = invertSafe(parent);
     const ti = AXIS_INDEX[track.slice(-1) as UpAxis];
     const ui = AXIS_INDEX[up];
-    // the object's axes in the parent's space: the world axis of a negative scale points the other way
-    const local = (k: number) => {
-      const v = transformDirection3(toParent, [rot[k * 4], rot[k * 4 + 1], rot[k * 4 + 2]]);
-      return o.scale[k] < 0 ? ([-v[0], -v[1], -v[2]] as Vec3) : v;
+    // an object axis in the parent's space whose world direction (through a negative scale on that
+    // axis, which points it the other way) is `w`
+    const axisFor = (w: Readonly<Vec3>, k: number): Vec3 => {
+      const v = normalize3(transformDirection3(toParent, w));
+      return o.scale[k] < 0 ? [-v[0], -v[1], -v[2]] : v;
     };
+    const sign = track.startsWith('-') ? -1 : 1;
+    const t = axisFor([dir[0] * sign, dir[1] * sign, dir[2] * sign], ti);
+    if (length3(t) === 0) return true;
+    // the world directions the up axis can take span the image of the plane perpendicular to t
+    const a = anyPerpendicular3(t);
+    const plane = normalize3(
+      cross3(transformDirection3(parent, a), transformDirection3(parent, cross3(t, a))),
+    );
+    const onPlane = (v: Readonly<Vec3>): Vec3 | null => {
+      const k = dot3(v, plane);
+      const p: Vec3 = [v[0] - plane[0] * k, v[1] - plane[1] * k, v[2] - plane[2] * k];
+      return length3(p) > 1e-9 * Math.max(1, length3(v)) ? p : null;
+    };
+    const goal = onPlane([0, 0, 1]) ?? onPlane(fallbackUp) ?? transformDirection3(parent, a);
+    const u0 = axisFor(goal, ui);
+    const along = dot3(u0, t);
+    const u = normalize3([u0[0] - t[0] * along, u0[1] - t[1] * along, u0[2] - t[2] * along]);
+    if (length3(u) === 0) return true;
     const cols: Vec3[] = [
       [0, 0, 0],
       [0, 0, 0],
       [0, 0, 0],
     ];
-    const t = normalize3(local(ti));
-    const u0 = local(ui);
-    const along = dot3(u0, t);
-    const u = normalize3([u0[0] - t[0] * along, u0[1] - t[1] * along, u0[2] - t[2] * along]);
-    if (length3(t) === 0 || length3(u) === 0) return true;
     cols[ti] = t;
     cols[ui] = u;
     const k = 3 - ti - ui;
@@ -320,6 +346,33 @@ class LayoutScene {
     const next = { location: o.location, rotation_euler: rotation, scale: o.scale };
     this.writeChannels(id, o, next, transformTolerance(this.basis(id, o)));
     return true;
+  }
+
+  /**
+   * Turns an object about its origin so its local +Z axis points along the world direction `n`: of
+   * the rotations whose world +Z axis is along `n` (exactly, also under a parent that shears the
+   * child's axes; reversed through a negative Z scale), the one closest to the current rotation,
+   * which turns the current +Z axis onto it by the smallest angle in the parent's space. Under a
+   * parent that does not shear the child this is Blender's Rotate by the world rotation that turns
+   * the object's +Z axis onto `n`. Only the rotation changes; an axis already along `n` (within
+   * 1.4e-6 rad) is left as it is, so a second run changes nothing.
+   */
+  alignZ(id: string, n: Readonly<Vec3>): void {
+    const stored = this.ctx.doc.getObject(id);
+    const o = this.editedIds.has(id) ? stored : this.ev.byId.get(id)?.data;
+    if (!o || !stored || !(length3(n) > 0)) return;
+    const toParent = this.hasParent(id) ? invertSafe(linearPart(this.parentWorld(id))) : identity4();
+    const z = normalize3(transformDirection3(toParent, n));
+    if (length3(z) === 0) return;
+    const goal: Vec3 = o.scale[2] < 0 ? [-z[0], -z[1], -z[2]] : z;
+    const rot = rotationFromEuler(o.rotation_euler);
+    const turned = multiply4(rotationBetween([rot[8], rot[9], rot[10]], goal), rot);
+    const next = {
+      location: o.location,
+      rotation_euler: matrixToStoredEuler(turned, o.rotation_euler),
+      scale: o.scale,
+    };
+    this.writeChannels(id, o, next, transformTolerance(this.basis(id, o)));
   }
 
   /** Records an edit made directly to an object's transform fields (for keying). */
@@ -806,7 +859,9 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'is under a surface that faces up with nothing below it (buried under a terrain, inside a rock): there it ' +
         'is lifted onto that surface, e.g. objects generated at z = 0 under a terrain. Where no surface is below ' +
         'or above, the plane z = 0 is the ground (ground_plane; it lifts objects below it too). ' +
-        'align_to_normal first tilts the object so its local +Z follows the surface normal under its centre. ' +
+        'align_to_normal first turns the object about its origin so its local +Z points along the surface normal ' +
+        'under its centre, by the smallest turn of that axis (exactly along the normal also under a parent that is ' +
+        'scaled unevenly and turned; a second run changes nothing). ' +
         'Objects are dropped independently (never onto each other). A parent drops together with its children ' +
         '(e.g. an empty grouping the parts of a lamp post rests on the lowest point of the whole assembly, so ' +
         'no part ends up buried); objects given together with one of their ancestors move along with it ' +
@@ -897,8 +952,8 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
               p.ground_plane,
             );
             if (probe) {
-              // turned about its origin as Blender's Rotate turns it (only the rotation changes)
-              scene.turn(id, rotationBetween(axisOf(world, 2), probe.normal), origin);
+              // turned about its origin (only the rotation changes) so its +Z follows the normal
+              scene.alignZ(id, probe.normal);
               world = scene.world(id);
             }
           }
@@ -961,8 +1016,10 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         'particles), or only `surface`, and place the objects at the ' +
         'hit: the snap point of the reference object (the active one if it is among `objects`, else the first) ' +
         'lands on the hit point plus `offset` along the surface normal, and the other objects move along, keeping ' +
-        "their arrangement. align_to_normal also rotates the group so the reference object's local +Z follows " +
-        'the normal (facing the ray origin). Fails without changes when the ray hits nothing. Returns the hit ' +
+        "their arrangement. align_to_normal also rotates the group about the snap point so the reference object's " +
+        'local +Z points along the normal (facing the ray origin; exactly, also under a parent that is scaled ' +
+        'unevenly and turned, where the reference object gets a last turn of its own). Fails without changes when ' +
+        'the ray hits nothing. Returns the hit ' +
         '(object, point, normal, distance, face) and the new object locations.',
       category: 'Layout',
       redoable: true,
@@ -1039,11 +1096,15 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
         ];
         const roots = ids.filter((id) => !scene.ancestors(id).some((a) => ids.includes(a)));
         if (p.align_to_normal) {
-          // the group turns about the snap point, as Blender's Rotate turns each object, and moves it
-          // onto the target
+          // the group turns about the snap point, as Blender's Rotate turns each object; under a
+          // parent that shears it the reference object's +Z then misses the normal, so it is turned
+          // onto it; then the group moves so the snap point lands on the target
           const r = rotationBetween(axisOf(wRef, 2), n);
-          const offset: Vec3 = [target[0] - s[0], target[1] - s[1], target[2] - s[2]];
-          for (const id of scene.byDepth(roots)) scene.turn(id, r, s, offset);
+          for (const id of scene.byDepth(roots)) scene.turn(id, r, s);
+          scene.alignZ(ref, n);
+          const at = transformPoint3(scene.world(ref), snapLocal);
+          const delta: Vec3 = [target[0] - at[0], target[1] - at[1], target[2] - at[2]];
+          for (const id of scene.byDepth(roots)) scene.translate(id, delta);
         } else {
           const delta: Vec3 = [target[0] - s[0], target[1] - s[1], target[2] - s[2]];
           for (const id of scene.byDepth(roots)) scene.translate(id, delta);
@@ -1069,8 +1130,10 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
       description:
         "Rotate objects so one of their axes points at a target object's world origin or a world point (a one-off " +
         'Track To): `track_axis` (default −Z, the viewing direction of cameras and lights) points at the target ' +
-        'and `up_axis` points as close as possible to world +Z. Positions and scales are kept. Returns the new ' +
-        'rotation_euler of every object.',
+        'and `up_axis` points as close as possible to world +Z. Positions and scales are kept. Under a parent that ' +
+        'is scaled unevenly and turned, which shears the object, the tracked axis still points exactly at the ' +
+        'target and the up axis is the one closest to +Z of those the shear allows (no longer perpendicular to ' +
+        'the tracked one). A second run changes nothing. Returns the new rotation_euler of every object.',
       category: 'Layout',
       redoable: true,
       schema: z.object({

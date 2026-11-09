@@ -30,14 +30,33 @@ export interface RoomManagerOptions {
    */
   refreshIntervalMs?: number;
   /**
-   * How long opening a loaded room nobody uses waits for its read of storage before it hands out
-   * the room as it is, while the read goes on (default 5 s): storage that does not answer (its
-   * requests time out after 30 s each) must not hold up every request that opens a project.
+   * How long a request waits for storage before it answers without it, while the read goes on
+   * (default 5 s): opening a loaded room nobody uses hands out the room as it is (see
+   * RoomManager.readUnused), and a project deleted here within the hour counts as still deleted
+   * (see RoomManager.stillDeleted). Storage that does not answer (its requests time out after 30 s
+   * each) must not hold up every request that opens a project.
    */
   openReadWaitMs?: number;
 }
 
+/**
+ * The close code of the sync connections of a project deleted on this server (deleted here, or
+ * found deleted from storage), also of a new connection to it (see SyncServer): browsers stop
+ * connecting to it (apps/web/src/sync/provider.ts).
+ */
+export const PROJECT_DELETED_CLOSE_CODE = 4404;
+
 const TOMBSTONE_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * A read of storage that goes on while the requests that wait for it answer without it after
+ * {@link RoomManagerOptions.openReadWaitMs} (see RoomManager.waitFor).
+ */
+interface StorageRead {
+  done: Promise<void>;
+  /** A request stopped waiting for it: storage did not answer in time. */
+  late: boolean;
+}
 /**
  * A loaded room nobody uses reads storage again before it is opened, unless it read it within this
  * time (so that the request that resolves a project and the one that opens it read it once).
@@ -54,7 +73,9 @@ export class RoomManager {
   /** Recently deleted project ids (refuses re-creation by reconnecting clients). */
   private readonly tombstones = new Map<string, number>();
   /** The reads of storage that rooms nobody uses run before they are opened (see readUnused). */
-  private readonly reading = new WeakMap<Room, Promise<void>>();
+  private readonly reading = new WeakMap<Room, StorageRead>();
+  /** The checks whether storage holds a deleted project again, by id (see stillDeleted). */
+  private readonly checking = new Map<string, StorageRead>();
   private readonly sweepTimer: ReturnType<typeof setInterval>;
   private readonly refreshTimer: ReturnType<typeof setInterval> | null = null;
   private sweeping = false;
@@ -154,14 +175,53 @@ export class RoomManager {
   /**
    * {@link isDeleted}, unless storage holds the project's document again: another writer with
    * unsaved changes (a room of another server, a browser) saved it after the deletion. Then the
-   * project exists, and this server lists and opens it again.
+   * project exists, and this server lists and opens it again. The check of storage is awaited as
+   * {@link waitFor} says (no answer in time: still deleted) and goes on; when storage then holds the
+   * document, the next request finds the project. One check per project at a time.
    */
   private async stillDeleted(id: string): Promise<boolean> {
     if (!this.isDeleted(id)) return false;
     const store = this.store;
-    if (!store || !(await store.hasDocument(id).catch(() => false))) return true;
-    this.tombstones.delete(id);
-    return false;
+    if (!store) return true;
+    let check = this.checking.get(id);
+    if (!check) {
+      const started: StorageRead = {
+        late: false,
+        done: store
+          .hasDocument(id)
+          .catch(() => false)
+          .then((stored) => {
+            if (stored) this.tombstones.delete(id);
+          })
+          .finally(() => {
+            if (this.checking.get(id) === started) this.checking.delete(id);
+          }),
+      };
+      check = started;
+      this.checking.set(id, check);
+    }
+    await this.waitFor(check);
+    return this.isDeleted(id);
+  }
+
+  /**
+   * Waits for a read of storage for {@link RoomManagerOptions.openReadWaitMs} at most, and not at all
+   * once a request stopped waiting for it: a request that asks several times (an MCP tool asks
+   * whether a project exists, then opens it or lists the projects) waits once.
+   */
+  private async waitFor(read: StorageRead): Promise<void> {
+    if (read.late) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(true), this.opts.openReadWaitMs ?? 5000);
+      timer.unref?.();
+    });
+    const finished = read.done.then(
+      () => false,
+      () => false,
+    );
+    if (await Promise.race([finished, late])) read.late = true;
+    clearTimeout(timer);
   }
 
   /** A room nobody uses (no editor connected, no MCP session) that has no unsaved changes. */
@@ -183,24 +243,21 @@ export class RoomManager {
    * changed or deleted the project since it last read it), unless it did within
    * {@link UNUSED_ROOM_READ_MS}, and it is closed when its project was deleted elsewhere. Without
    * this, a project deleted elsewhere still opened by id (while not listed), and a change made in
-   * it saved it again. The read is awaited for {@link RoomManagerOptions.openReadWaitMs} at most;
-   * one read per room at a time.
+   * it saved it again. The read is awaited as {@link waitFor} says; one read per room at a time.
    */
   private async readUnused(room: Room, force = false): Promise<void> {
     if (!this.store || room.destroyed || !this.unused(room)) return;
     if (!room.deletedFromStorage && (force || Date.now() - room.readAt >= UNUSED_ROOM_READ_MS)) {
       let read = this.reading.get(room);
       if (!read) {
-        read = room.refresh().finally(() => this.reading.delete(room));
+        const started: StorageRead = {
+          late: false,
+          done: room.refresh().finally(() => this.reading.delete(room)),
+        };
+        read = started;
         this.reading.set(room, read);
       }
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const waited = new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, this.opts.openReadWaitMs ?? 5000);
-        timer.unref?.();
-      });
-      await Promise.race([read, waited]);
-      clearTimeout(timer);
+      await this.waitFor(read);
     }
     if (this.abandoned(room)) await this.closeDeleted(room);
   }
@@ -212,7 +269,7 @@ export class RoomManager {
     this.updateGauge();
     // like a deletion here: a browser that still has the project cannot upload it again at once
     this.tombstones.set(room.id, Date.now());
-    await room.close({ flush: false, code: 4404, reason: 'project deleted' });
+    await room.close({ flush: false, code: PROJECT_DELETED_CLOSE_CODE, reason: 'project deleted' });
     this.emitClosed(room);
     this.opts.log.debug({ project: room.id }, 'closed the room of a project deleted from storage elsewhere');
   }
@@ -277,7 +334,12 @@ export class RoomManager {
     if (this.closed) return null;
     if (!persisted && !create) return null;
     const ydoc = new Y.Doc();
+    const storedInfo = info as ProjectInfo | null;
     if (update) Y.applyUpdate(ydoc, update, STORAGE_ORIGIN);
+    // a project.json without a document: the room's document takes the stored name, as content read
+    // from storage (editors and agents see it; the first change saves it with the document)
+    else if (storedInfo?.name)
+      ydoc.transact(() => ydoc.getMap('meta').set('name', storedInfo.name), STORAGE_ORIGIN);
     const room = new Room(id, ydoc, this.roomDeps(), {
       info,
       persisted,
@@ -338,8 +400,10 @@ export class RoomManager {
       try {
         const infos = await withSpan('persistence.list', {}, () => store.listProjects());
         stored = new Set(infos.map((info) => info.id));
-        for (const info of infos)
-          if (!(await this.stillDeleted(info.id))) byId.set(info.id, { ...info, peers: 0, live: false });
+        const deleted = await Promise.all(infos.map((info) => this.stillDeleted(info.id)));
+        infos.forEach((info, i) => {
+          if (!deleted[i]) byId.set(info.id, { ...info, peers: 0, live: false });
+        });
         metrics.persistenceOps.inc({ op: 'list', status: 'ok' });
       } catch (err) {
         metrics.persistenceOps.inc({ op: 'list', status: 'error' });
@@ -383,7 +447,7 @@ export class RoomManager {
     if (room) {
       this.rooms.delete(id);
       this.updateGauge();
-      await room.close({ flush: false, code: 4404, reason: 'project deleted' });
+      await room.close({ flush: false, code: PROJECT_DELETED_CLOSE_CODE, reason: 'project deleted' });
       this.emitClosed(room);
     }
     const store = this.store;

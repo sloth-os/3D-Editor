@@ -479,7 +479,8 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       schema: z.object({}),
       execute() {
         const s = session.value!;
-        void s.flush().then(() => toast(s.webdav ? 'Saved to WebDAV' : 'Saved in this browser'));
+        // what the save did: saved, stored again after a deletion, offline, or failed and why
+        void s.flush().then((r) => toast(r.message, r.level, r.level === 'info' ? undefined : 10_000));
       },
     }),
   );

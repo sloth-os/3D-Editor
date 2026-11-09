@@ -6,7 +6,7 @@ import type { ServerConfig } from '../config';
 import { isAuthorized, pathnameOf } from '../auth';
 import type { Log } from '../observability/log';
 import { errorMessage } from '../observability/tracing';
-import type { RoomManager } from './room-manager';
+import { PROJECT_DELETED_CLOSE_CODE, type RoomManager } from './room-manager';
 import type { SyncConnection } from './room';
 
 const SYNC_PATH_RE = /^\/sync\/([^/]+)\/?$/;
@@ -89,17 +89,41 @@ export class SyncServer {
     }
     // null for a project deleted here within the hour (unless storage holds it again)
     const room = await this.opts.rooms.open(projectId, { create: true });
-    if (!room) return rejectUpgrade(socket, 410, 'project was deleted');
     if (socket.destroyed) return;
+    if (!room) {
+      // Browsers cannot read the status of a refused upgrade (they see code 1006, as for a lost
+      // network, and connect again and again): the connection is accepted and closed at once with
+      // the code a room closes its connections with when its project is deleted.
+      this.opts.log.debug({ project: projectId }, 'closed a sync connection to a deleted project');
+      this.wss.handleUpgrade(req, socket, head, (ws) =>
+        this.refuse(ws, projectId, PROJECT_DELETED_CLOSE_CODE, 'project deleted'),
+      );
+      return;
+    }
     this.wss.handleUpgrade(req, socket, head, (ws) => {
       if (room.destroyed || this.closing) {
-        ws.close(1012, 'room closed');
+        this.refuse(ws, projectId, 1012, 'room closed');
         return;
       }
       const conn = room.addConnection(ws, req.socket.remoteAddress);
       this.connections.set(ws, conn);
       ws.once('close', () => this.connections.delete(ws));
     });
+  }
+
+  /**
+   * Closes a connection that no room takes, as a room closes its connections (Room.close): a client
+   * that does not answer the close frame within 2 s is disconnected (ws itself would wait 30 s, and
+   * close() waits for every connection the server accepted). It gets an 'error' listener like a
+   * room's connections: ws emits 'error' when a client breaks the protocol (an unmasked frame, say),
+   * and an 'error' event that nobody listens to ends the process.
+   */
+  private refuse(ws: WebSocket, project: string, code: number, reason: string): void {
+    ws.on('error', (err) => this.opts.log.debug({ err: err.message, project }, 'websocket error'));
+    ws.close(code, reason);
+    const t = setTimeout(() => ws.terminate(), 2000);
+    t.unref?.();
+    ws.once('close', () => clearTimeout(t));
   }
 
   private ping(): void {

@@ -9,6 +9,7 @@ import {
 } from '@3d-editor/core';
 import { renderAnimationParallel, type AnimationOutput, type AnimationProgress } from './animation';
 import { pathTraces } from './engine';
+import { checkMainThreadRender, collectGarbage, freeHeapBytes, installGeometryMemoryGuard } from './memory';
 import { abortable, pathTraceParallel } from './path-trace';
 import {
   RenderPool,
@@ -31,18 +32,25 @@ import {
 
 export { RenderPool, defaultRenderThreads, MAX_SHARED_RENDERS } from './pool';
 export type { LeaseOptions, RenderPoolOptions, RenderLease, RenderThread } from './pool';
-export { RenderCancelledError, isCancelled } from './protocol';
+export { RENDER_HEAP_BYTES_PER_TRIANGLE, estimateRenderMemory, estimateRenderTriangles } from './memory';
+export { RenderCancelledError, RenderOutOfMemoryError, isCancelled, isOutOfMemory } from './protocol';
 export type { ExportJobOptions, ExportedFile, FrameOptions, ViewSpecInput } from './protocol';
 export type { AnimationOutput, AnimationProgress } from './animation';
+
+// the server's evaluations (scene summaries, mesh data, operators of MCP tools and the REST API)
+// skip a modifier whose result would not fit into the server's free heap instead of running the
+// whole server out of memory (memory.ts); render processes do not load this module
+installGeometryMemoryGuard();
 
 /*
  * Server-side rendering for MCP tools and the REST API, off the event loop: raster stills run on
  * one free render thread (interactive leases: they never wait for long renders), path traced
  * images on all render threads (bands of rows, see path-trace.ts) and animations frame by frame in
  * parallel (see animation.ts); two long renders share the threads (see pool.ts). Render threads
- * are worker threads (`RENDER_WORKERS`, default: CPU cores up to 8, plus one for interactive
- * renders) or, with RENDER_WORKERS=0 or when workers cannot start, the main thread (one band or
- * frame per event loop turn).
+ * are render processes (`RENDER_WORKERS`, default: CPU cores up to 8, plus one for interactive
+ * renders; a render that runs out of memory ends only its process) or, with RENDER_WORKERS=0 or
+ * when render processes cannot start, the main thread (one band or frame per event loop turn),
+ * where a render that would not fit into the server's free heap is refused (memory.ts).
  */
 
 /** Largest path traced image (pixels): film, denoiser and display buffers take ~150 bytes per pixel. */
@@ -94,7 +102,7 @@ export interface RenderImageResult {
   engine: 'RASTER' | 'PATHTRACER';
   /** Render threads used and where they run. */
   threads: number;
-  mode: 'workers' | 'main-thread';
+  mode: 'processes' | 'main-thread';
   elapsedMs: number;
   pathtrace?: {
     samples: number;
@@ -118,7 +126,7 @@ export interface ExportRequest {
 
 /** An exported file, with where and how long it took. */
 export interface ExportResult extends ExportedFile {
-  mode: 'workers' | 'main-thread';
+  mode: 'processes' | 'main-thread';
   elapsedMs: number;
 }
 
@@ -155,7 +163,8 @@ interface DocState {
   key: string;
   /** Version of the current document state, null after a change. */
   version: number | null;
-  buffer: WeakRef<SharedArrayBuffer> | null;
+  /** The encoded state of `version` while something still holds it. */
+  buffer: WeakRef<Uint8Array> | null;
   /** Rigid body matrices simulated for a version of the document, by frame. */
   physics: { version: number; frames: Map<number, PhysicsFrame>; numbers: number } | null;
 }
@@ -203,16 +212,51 @@ class Semaphore {
   }
 }
 
+/** Options of a {@link Renderer}. */
+export interface RendererOptions {
+  /**
+   * The free JavaScript heap of the server's process in bytes (default: from V8), which a render in
+   * single-thread mode must fit into (see memory.ts).
+   */
+  heapFree?: () => number;
+  /** Runs a full garbage collection before a render is refused (default: memory.ts `collectGarbage`). */
+  collectGarbage?: () => unknown;
+}
+
 /** Renders scenes on a {@link RenderPool}. */
 export class Renderer {
   private readonly states = new WeakMap<Y.Doc, DocState>();
   private readonly pathtraceSlots = new Semaphore(MAX_CONCURRENT_PATHTRACE);
+  private readonly heapFree: () => number;
+  private readonly collectGarbage: () => unknown;
 
-  constructor(readonly pool: RenderPool) {}
+  constructor(
+    readonly pool: RenderPool,
+    opts: RendererOptions = {},
+  ) {
+    this.heapFree = opts.heapFree ?? freeHeapBytes;
+    this.collectGarbage = opts.collectGarbage ?? collectGarbage;
+  }
 
   /**
-   * The state of `scene` for render threads: encoded once per document change and shared with
-   * every thread (threads that already have this version skip it).
+   * Refuses a render of `scene` on the server's main thread (single-thread mode) that would not
+   * fit into the server's free heap (a RenderOutOfMemoryError), instead of running it out of
+   * memory and stopping the server. Render processes need no such check: running out of memory
+   * there ends only the render process.
+   */
+  private guardMainThread(
+    threads: readonly RenderThread[],
+    scene: SceneDoc,
+    what: 'render' | 'export' = 'render',
+  ): void {
+    if (threads.some((t) => t.kind === 'main'))
+      checkMainThreadRender(scene, this.heapFree, this.collectGarbage, what);
+  }
+
+  /**
+   * The state of `scene` for render threads: encoded once per document change (and again only
+   * when the encoded state was garbage collected meanwhile); render processes that already have
+   * this version get the request without it (see `DocRef`).
    */
   docRef(projectId: string, scene: SceneDoc): DocRef {
     const ydoc = scene.ydoc;
@@ -233,9 +277,7 @@ export class Renderer {
     }
     let buffer = s.buffer?.deref();
     if (s.version === null || !buffer) {
-      const update = Y.encodeStateAsUpdate(ydoc);
-      buffer = new SharedArrayBuffer(update.byteLength);
-      new Uint8Array(buffer).set(update);
+      buffer = Y.encodeStateAsUpdate(ydoc);
       s.buffer = new WeakRef(buffer);
       // the same content keeps its version when only the buffer was collected
       s.version ??= nextVersion++;
@@ -323,6 +365,7 @@ export class Renderer {
       try {
         const lease = await this.pool.lease(Infinity, req.signal);
         try {
+          this.guardMainThread(lease.threads, req.scene);
           // the rigid body simulation runs once (not on every thread)
           const physics = await this.physics(req.scene, doc, [o.frame], lease.threads[0], req.signal);
           const options = physics?.has(o.frame) ? { ...o, physics: physics.get(o.frame) } : o;
@@ -363,6 +406,7 @@ export class Renderer {
     }
     const lease = await this.pool.lease(1, req.signal, { interactive: true });
     try {
+      this.guardMainThread(lease.threads, req.scene);
       const physics = await this.physics(req.scene, doc, [o.frame], lease.threads[0], req.signal);
       const options = physics?.has(o.frame) ? { ...o, physics: physics.get(o.frame) } : o;
       const img = await abortable(
@@ -396,6 +440,7 @@ export class Renderer {
     const doc = this.docRef(req.projectId, req.scene);
     const lease = await this.pool.lease(1, req.signal, { interactive: true });
     try {
+      this.guardMainThread(lease.threads, req.scene, 'export');
       const file = await abortable(
         lease.threads[0].call<ExportedFile>({
           type: 'export',
@@ -454,6 +499,7 @@ export class Renderer {
     try {
       const lease = await this.pool.lease(Infinity, req.signal);
       try {
+        this.guardMainThread(lease.threads, req.scene);
         return await renderAnimationParallel(
           lease.threads,
           doc,
@@ -497,7 +543,7 @@ export class Renderer {
   }
 }
 
-/** Render threads configured by `RENDER_WORKERS` (0 = main thread; default: CPU cores up to 8). */
+/** Render processes configured by `RENDER_WORKERS` (0 = main thread; default: CPU cores up to 8). */
 export function renderThreadsFromEnv(env: Record<string, string | undefined> = process.env): number {
   const raw = env.RENDER_WORKERS?.trim();
   if (!raw) return defaultRenderThreads();
@@ -507,11 +553,36 @@ export function renderThreadsFromEnv(env: Record<string, string | undefined> = p
   return Math.min(64, n);
 }
 
+/**
+ * The JavaScript heap limit of each render process configured by `RENDER_WORKER_MEMORY_MB` (MB,
+ * at least 64), or undefined for Node's default (2096 MB on a machine with 16 GB of memory).
+ */
+export function renderMemoryFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): number | undefined {
+  const raw = env.RENDER_WORKER_MEMORY_MB?.trim();
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 64)
+    throw new Error(`RENDER_WORKER_MEMORY_MB must be a whole number of megabytes >= 64 (got '${raw}')`);
+  return n;
+}
+
 let shared: Renderer | null = null;
 
 /**
- * The process-wide renderer (render threads are a machine resource shared by every app instance).
- * Created on first use; its worker threads start lazily and stop when idle.
+ * Stops the process-wide renderer's render processes (server shutdown): a busy render process
+ * would otherwise run on until its request ends.
+ */
+export async function closeSharedRenderer(): Promise<void> {
+  const r = shared;
+  shared = null;
+  await r?.close();
+}
+
+/**
+ * The process-wide renderer (render processes are a machine resource shared by every app
+ * instance). Created on first use; its render processes start lazily and stop when idle.
  */
 export function sharedRenderer(opts: { log?: RenderPoolLog } & RenderPoolOptions = {}): Renderer {
   if (!shared) {
@@ -524,7 +595,15 @@ export function sharedRenderer(opts: { log?: RenderPoolLog } & RenderPoolOptions
         threads = defaultRenderThreads();
       }
     }
-    shared = new Renderer(new RenderPool({ ...opts, threads }));
+    let heapLimitMb = opts.heapLimitMb;
+    if (heapLimitMb === undefined) {
+      try {
+        heapLimitMb = renderMemoryFromEnv();
+      } catch (err) {
+        opts.log?.warn({ err: String(err) }, "invalid RENDER_WORKER_MEMORY_MB, using Node's default");
+      }
+    }
+    shared = new Renderer(new RenderPool({ ...opts, threads, heapLimitMb }));
   }
   return shared;
 }

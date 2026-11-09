@@ -277,13 +277,16 @@ function isRotation(m: Readonly<Mat4>): boolean {
  * is only a cosine of at most {@link STORED_GIMBAL_LOCK}, and below {@link NEAR_GIMBAL_LOCK} the
  * difference or sum of the first and last angles, which the matrix depends on almost alone there,
  * comes from the entries that do not shrink (the identities below hold for rotations only).
- * Measured on 480,000 rotations for each of nine ranges of the cosine between 1e-17 and 1 (the six
- * orders, angles within ±π, half of the matrices made as products A·Aᵀ·R, whose small entries carry
- * the rounding of the products): the matrix of the result was within 1.7e-15 of the given one for
- * cosines from 1e-13 to 0.01 (Blender's formulas: up to 1.3e-11 just above their threshold, 7.5e-5
- * below it), within 4.5e-14 above 0.01 (Blender's formulas, unchanged there) and within 2.0e-13 in
- * exact gimbal lock, where the last angle is set to 0. Whole turns in the angles add the rounding of
- * the larger angles (up to 3.6e-15 with two turns).
+ * Measured on rotations in the six orders with angles within ±π, made three ways (from the
+ * angles; as products A·Aᵀ·R, whose small entries carry the rounding of the products; as products
+ * of the three rotations as quaternions), up to 480,000 of each way in each range of the cosine the
+ * matrix has: the matrix of the result was within 1.6e-15 of the given one for cosines from 1e-13
+ * to 0.01 (Blender's formulas, in two samples of 240,000: up to 1.44e-11 just above their
+ * threshold, 7.50e-5 below it), within 8.4e-14 above 0.01 (Blender's formulas, unchanged there;
+ * 9.5e-16 for the matrices made from the angles) and within 2.0e-13 in exact gimbal lock, where the
+ * last angle is set to 0. These are the largest errors of those samples, not bounds: other samples
+ * give other maxima. Old angles two whole turns away add the rounding of the larger angles (up to
+ * 3.7e-15 for cosines from 1e-13 to 0.01, in 240,000 rotations).
  */
 function eulerPair(m: Readonly<Mat4>, order: EulerOrder, precise = false): [Vec3, Vec3] {
   const { axes, odd } = ORDER_AXES[order];
@@ -411,9 +414,9 @@ export function matrixToCompatibleEuler(
 }
 
 /**
- * The euler angles a transform stores for a new rotation (Rotate, and the turns of Look At and of
- * Drop to Ground and Snap to Surface with Align to Normal, through SceneDoc.transformObject and
- * scene-tools.ts; the operators that set world matrices through SceneDoc.setWorldMatrix):
+ * The euler angles a transform stores for a new rotation (Rotate, through transformedChannels in
+ * scene-doc.ts; the turns of Look At and of Drop to Ground and Snap to Surface with Align to Normal
+ * in scene-tools.ts; the operators that set world matrices through SceneDoc.setWorldMatrix):
  * {@link matrixToCompatibleEuler} computed as precisely as a rotation matrix allows near and in
  * gimbal lock (see {@link eulerPair}). Only in exact gimbal lock (the cosine of the middle angle at
  * most 1e-13) is the last angle set to 0 (before the compatible turns), where Blender does it below

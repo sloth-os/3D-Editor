@@ -1,8 +1,10 @@
 import type { ExportFormat, PathTile, RenderEngine, ViewTransform } from '@3d-editor/core';
 
 /*
- * Messages between the render pool (main thread) and its worker threads. Everything is plain,
- * structured-cloneable data; pixel and tile buffers are transferred, document states are shared.
+ * Messages between the render pool (the server's main thread) and its render processes, over the
+ * IPC channel of `child_process.fork` with advanced serialization (the structured clone algorithm:
+ * typed arrays are copied, nothing is shared or transferred). The single-thread mode runs the same
+ * requests on the main thread.
  */
 
 export type Vec3Tuple = [number, number, number];
@@ -19,12 +21,14 @@ export interface ViewSpecInput {
 /**
  * A document state to render: `key` identifies the document instance (render threads keep a small
  * cache of documents by key and apply `update`, a full Yjs state update, on top of what they
- * have). `version` names this exact state: a thread that already applied it skips the update.
+ * have). `version` names this exact state: a thread that already applied it skips the update. The
+ * pool leaves `update` out of the message when the render process already has `version` (a
+ * process without it answers with a `missing-doc` error and gets the request again with it).
  */
 export interface DocRef {
   key: string;
   version: number;
-  update: Uint8Array | SharedArrayBuffer;
+  update?: Uint8Array;
 }
 
 /**
@@ -141,7 +145,7 @@ export interface ExportJobOptions {
   bakeResolution?: number;
 }
 
-/** An exported file (data transferred). */
+/** An exported file. */
 export interface ExportedFile {
   data: Uint8Array;
   mime: string;
@@ -169,7 +173,7 @@ export type WorkerRequest =
   | { type: 'release'; job: number }
   /** Renders a whole image on the thread; `png` returns the PNG file instead of the pixels. */
   | { type: 'image'; id: number; doc: DocRef; options: FrameOptions; png?: boolean }
-  /** Denoises and tone maps a film (buffers transferred). */
+  /** Denoises and tone maps a film. */
   | { type: 'finish'; id: number; film: FilmBuffers; options: FinishOptions }
   | {
       type: 'auto-view';
@@ -181,7 +185,7 @@ export type WorkerRequest =
       /** Stop sampling frames for the bounds after this many milliseconds. */
       budgetMs?: number;
     }
-  /** Encodes kept animation frames as a GIF or a contact sheet PNG (frame buffers transferred). */
+  /** Encodes kept animation frames as a GIF or a contact sheet PNG. */
   | { type: 'encode'; id: number; frames: RawFrame[]; options: EncodeOptions }
   /**
    * Adds the next frame of APNG job `job` (frames in order; the encoder of the job lives on this
@@ -192,11 +196,18 @@ export type WorkerRequest =
   | { type: 'apng-finish'; id: number; job: number }
   /** Simulates the rigid body world up to the given frames and returns their matrices. */
   | { type: 'simulate'; id: number; doc: DocRef; frames: number[] }
-  /** Exports the document (glTF, OBJ, STL, PLY) off the event loop; the file is transferred. */
+  /** Exports the document (glTF, OBJ, STL, PLY) off the event loop. */
   | { type: 'export'; id: number; doc: DocRef; format: ExportFormat; options: ExportJobOptions }
   /** Drops the cached documents (an idle thread frees its memory; no response). */
   | { type: 'clear' }
-  | { type: 'ping'; id: number };
+  | { type: 'ping'; id: number }
+  /**
+   * Test-only requests, answered only by render processes started with RENDER_WORKER_TEST_JOBS=1
+   * (else they fail): `test-allocate` allocates a buffer of `bytes` (to make an allocation fail),
+   * `test-busy` keeps the process busy for `ms`.
+   */
+  | { type: 'test-allocate'; id: number; bytes: number }
+  | { type: 'test-busy'; id: number; ms: number };
 
 /** Settings of an APNG encoder job (see `apng-add`). */
 export interface APNGInit {
@@ -248,8 +259,18 @@ export type WorkerResult =
   | ExportedFile
   | { ok: true };
 
+/**
+ * Why a render process could not do a request: `missing-doc` (the request left the document's
+ * state out, see {@link DocRef}, and the process does not have that version), `out-of-memory` (an
+ * allocation failed: the process is replaced).
+ */
+export type WorkerErrorKind = 'missing-doc' | 'out-of-memory';
+
 export type WorkerResponse =
-  { type: 'result'; id: number; result: WorkerResult } | { type: 'error'; id: number; message: string };
+  | { type: 'result'; id: number; result: WorkerResult }
+  | { type: 'error'; id: number; message: string; kind?: WorkerErrorKind }
+  /** Sent once by a render process that warmed up and takes requests. */
+  | { type: 'ready'; pid: number; heapLimitMb: number };
 
 /** Error raised when a render is cancelled (client abort, shutdown). */
 export class RenderCancelledError extends Error {
@@ -261,4 +282,42 @@ export class RenderCancelledError extends Error {
 
 export function isCancelled(err: unknown): err is RenderCancelledError {
   return err instanceof RenderCancelledError;
+}
+
+/**
+ * A render that needed more memory than its render process has: the process ran out of
+ * JavaScript heap (V8 aborted it, or an allocation failed), or it was killed with SIGKILL, which
+ * on Linux is what the kernel's out-of-memory killer does. The server itself keeps running and a
+ * new render process serves later renders. In single-thread mode (render on the main thread), a
+ * render that would not fit into the server's heap is refused with this error before it starts.
+ * Reason `shared`: the process ran out of memory while it worked on another render that shared it
+ * (two long renders share the render processes); this render was not the cause and can run again.
+ */
+export class RenderOutOfMemoryError extends Error {
+  constructor(
+    message: string,
+    /** The JavaScript heap limit of the process that ran out of memory (MB), when known. */
+    readonly heapLimitMb?: number,
+    /**
+     * How it ended: out of heap, killed (SIGKILL), refused before it started (single-thread mode),
+     * or ended by another render that shared the process (`shared`).
+     */
+    readonly reason: 'heap' | 'killed' | 'refused' | 'shared' = 'heap',
+  ) {
+    super(message);
+    this.name = 'RenderOutOfMemoryError';
+  }
+}
+
+export function isOutOfMemory(err: unknown): err is RenderOutOfMemoryError {
+  return err instanceof RenderOutOfMemoryError;
+}
+
+/**
+ * The error a render reports when several of its requests failed: the first one that is not a
+ * `shared` one (its own request ran a process out of memory, or another failure), else the first.
+ */
+export function primaryRenderError(errors: readonly unknown[]): Error | undefined {
+  const all = errors.map((e) => (e instanceof Error ? e : new Error(String(e))));
+  return all.find((e) => !(e instanceof RenderOutOfMemoryError && e.reason === 'shared')) ?? all[0];
 }

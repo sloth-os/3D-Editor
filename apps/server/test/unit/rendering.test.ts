@@ -12,6 +12,7 @@ import {
 } from '../../src/mcp/rendering';
 import { RpcError, type Room, type RpcAnswer, type SyncConnection } from '../../src/sync/room';
 import { MAX_EDITOR_TIMEOUT_MS, MAX_EDITOR_WAIT_MS } from '../../src/mcp/editor-commands';
+import { BROWSER_RASTER_SECONDS, measured } from '../../src/mcp/editor-costs';
 
 /*
  * render_image waits for a browser editor's image: long enough for heavy scenes in software WebGL
@@ -44,12 +45,15 @@ describe('browser render timeouts', () => {
     expect(browser.reason).toBe(
       'browser render failed: the editor did not finish the RASTER image within 55 s',
     );
+    // what such an editor took for its images (editor-costs.ts), not 'tens of seconds' without a range
     expect(browser.advice).toBe(
-      'It may still be drawing it, and its next renders and commands wait until it has. A heavy scene takes ' +
-        'tens of seconds in an editor without GPU acceleration (software WebGL, e.g. a headless browser): render ' +
-        "on the server with renderer 'software' (or 'auto'), render a smaller image, or pass shading 'SOLID' " +
-        '(grey clay, faster).',
+      'It may still be drawing it, and its next renders and commands wait until it has. An editor without GPU ' +
+        `acceleration (e.g. a headless browser) took ${measured(BROWSER_RASTER_SECONDS)}, and ` +
+        "longer for heavier scenes: render on the server with renderer 'software' (or 'auto'), render a smaller " +
+        "image, or pass shading 'SOLID' (grey clay, faster).",
     );
+    // software WebGL is named once (measured() says where the times were measured)
+    expect(browser.advice.match(/software WebGL/g)).toHaveLength(1);
     const auto = browserRenderFailure(timeout, { ...raster, renderer: 'auto', timeoutMs: 15_000 });
     expect(auto.reason).toBe(
       "browser render failed: the editor did not finish the RASTER image within 15 s (renderer 'auto' waits 15 s " +

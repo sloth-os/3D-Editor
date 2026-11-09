@@ -20,13 +20,26 @@ import {
 } from '@3d-editor/core';
 import { telemetry } from '../telemetry/telemetry';
 
-export type SyncStatus = 'disabled' | 'connecting' | 'connected' | 'offline';
+/**
+ * `deleted`: the server closed the connection with {@link PROJECT_DELETED_CLOSE_CODE}; the provider
+ * does not connect again by itself (see {@link SyncProvider.reconnect}).
+ */
+export type SyncStatus = 'disabled' | 'connecting' | 'connected' | 'offline' | 'deleted';
+
+/**
+ * The close code of the editor server for a project deleted there (apps/server/src/sync): its room
+ * closes its connections with it when the project is deleted on the server, and the server closes a
+ * new connection to a project it has deleted with it right away (browsers cannot read the HTTP
+ * status of a refused WebSocket upgrade).
+ */
+export const PROJECT_DELETED_CLOSE_CODE = 4404;
 
 export type RpcHandler = (method: string, params: unknown) => Promise<unknown> | unknown;
 
 /**
  * Real-time sync for one project:
- *  - WebSocket to the editor server (Yjs sync + awareness + RPC), reconnecting with backoff
+ *  - WebSocket to the editor server (Yjs sync + awareness + RPC), reconnecting with backoff, except
+ *    after the server said that the project was deleted there (status `deleted`)
  *  - BroadcastChannel between tabs of the same browser (works offline)
  */
 export class SyncProvider {
@@ -35,12 +48,19 @@ export class SyncProvider {
   readonly latencyMs = signal<number | null>(null);
   /** Set once the first full sync with the server completed. */
   readonly synced = signal(false);
+  /**
+   * A room of the server holds this connection: from the server's hello until the connection
+   * closes. The server closes a connection to a project it deleted without a hello.
+   */
+  readonly joined = signal(false);
   private ws: WebSocket | null = null;
   private bc: BroadcastChannel | null = null;
   private retries = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private destroyed = false;
+  /** The server closed the connection because it deleted the project: no reconnecting by itself. */
+  private deletedOnServer = false;
   private rpcHandler: RpcHandler | null = null;
   private connectSpan: ReturnType<typeof telemetry.startSpan> | null = null;
 
@@ -91,7 +111,7 @@ export class SyncProvider {
   }
 
   private onOnline = () => {
-    if (!this.ws && this.url) {
+    if (!this.ws && this.url && !this.deletedOnServer) {
       this.retries = 0;
       this.connect();
     }
@@ -146,10 +166,11 @@ export class SyncProvider {
       this.send(encodeJsonFrame(MSG_CONTROL, { kind: 'ping', t: Date.now() }));
     };
     ws.onmessage = (e) => this.onMessage(new Uint8Array(e.data as ArrayBuffer), 'ws');
-    ws.onclose = () => {
+    ws.onclose = (e?: CloseEvent) => {
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.pingTimer = null;
       this.ws = null;
+      this.joined.value = false;
       this.connectSpan?.setError('closed').end();
       this.connectSpan = null;
       // remove awareness of remote peers (they will be re-sent on reconnect)
@@ -157,12 +178,33 @@ export class SyncProvider {
       awarenessProtocol.removeAwarenessStates(this.awareness, remote, 'connection-closed');
       this.peers.value = 0;
       if (this.destroyed) return;
+      if (e?.code === PROJECT_DELETED_CLOSE_CODE) {
+        // every new connection would be closed the same way (for an hour, unless the server's
+        // storage holds the project again): local edits, the IndexedDB copy, other tabs and WebDAV
+        // syncing go on without it
+        this.deletedOnServer = true;
+        this.status.value = 'deleted';
+        return;
+      }
       this.status.value = navigator.onLine ? 'connecting' : 'offline';
       this.scheduleReconnect();
     };
     ws.onerror = () => {
       /* onclose follows */
     };
+  }
+
+  /**
+   * Connects again after the server deleted the project (status `deleted`): on an action of the
+   * person (Save), and when WebDAV through the server finds the project stored there again (see
+   * ProjectSession); a reload of the page connects again too. The server closes the connection again
+   * while it has the project deleted, unless its storage holds the project again.
+   */
+  reconnect(): void {
+    if (!this.deletedOnServer) return;
+    this.deletedOnServer = false;
+    this.retries = 0;
+    this.connect();
   }
 
   private scheduleReconnect(): void {
@@ -263,6 +305,8 @@ export class SyncProvider {
   }
 
   private onControl(msg: ControlMessage): void {
+    // (control frames come from the server only: other tabs send sync and awareness frames)
+    if (msg.kind === 'hello') this.joined.value = true;
     if (msg.kind === 'hello' || msg.kind === 'peers')
       this.peers.value = msg.kind === 'hello' ? msg.peers : msg.count;
     else if (msg.kind === 'pong') {

@@ -267,16 +267,38 @@ describe('WebDAV sync of a project another device deleted', () => {
     doc.destroy();
   });
 
-  it('stores it again on Save (Ctrl+S)', async () => {
+  it('stores it again on Save (Ctrl+S), and says so', async () => {
     const { server, doc, sync } = await deletedAfterSync();
     await sync.syncNow();
     expect(server.files.size).toBe(0);
-    expect(await sync.syncNow({ save: true })).toMatchObject({ pushed: true, created: true });
+    toasts.value = [];
+    expect(await sync.save()).toEqual({
+      message: '"Doomed" was deleted from WebDAV on another device; this browser stored it there again.',
+      level: 'warning',
+    });
     expect(server.files.has(DOC)).toBe(true);
     expect(sync.status.value).toBe('synced');
-    expect(toasts.value.map((t) => t.message).at(-1)).toBe(
-      '"Doomed" was deleted from WebDAV on another device; this browser stored it there again.',
-    );
+    // Save shows what it reports (wm.save_mainfile): the sync shows no message of its own
+    expect(toasts.value).toEqual([]);
+    await sync.stop(false);
+    doc.destroy();
+  });
+
+  /*
+   * Save (Ctrl+S) while a sync is running (the poll every 20 s) waits for that sync and then saves:
+   * it used to answer with the running sync, which stored nothing, and the project stayed deleted.
+   */
+  it('stores it again on Save while a sync is running', async () => {
+    const { server, doc, sync } = await deletedAfterSync();
+    const poll = sync.syncNow();
+    const saved = sync.save();
+    expect(await poll).toMatchObject({ pushed: false, missing: true });
+    expect(await saved).toEqual({
+      message: '"Doomed" was deleted from WebDAV on another device; this browser stored it there again.',
+      level: 'warning',
+    });
+    expect(server.files.has(DOC)).toBe(true);
+    expect(sync.status.value).toBe('synced');
     await sync.stop(false);
     doc.destroy();
   });
@@ -618,5 +640,137 @@ describe('WebDAV sync of a project deleted in another tab', () => {
       `DELETE /projects/${ID}`,
     ]);
     expect(server.files.size).toBe(0);
+  });
+});
+
+/*
+ * Save (Ctrl+S) tells the person what it did (wm.save_mainfile shows the report): it used to say
+ * "Saved to WebDAV" also when the sync failed, was offline, or found the project deleted.
+ */
+describe('Save (Ctrl+S) of a project synced with WebDAV', () => {
+  const ID = 'p-save';
+  const DIR = `/projects/${ID}`;
+  const DOC = `${DIR}/document.ybin`;
+
+  function open(doc: SceneDoc) {
+    const target = {
+      store: new ProjectFileStore(new WebDAVClient({ url: 'https://dav.test/' }), '/'),
+      label: 'test',
+      viaServer: false,
+    };
+    const info = () => ({ id: ID, name: doc.name, created_at: '', updated_at: '', schema_version: 1 });
+    return new WebDAVSync(target, ID, doc, info, { type: 'storage' });
+  }
+
+  /** A project this browser synced with a WebDAV server like Nextcloud. */
+  async function synced() {
+    localStorage.clear();
+    toasts.value = [];
+    const server = davServer();
+    vi.stubGlobal('fetch', server.fetch);
+    const doc = SceneDoc.create({ name: 'Saved', empty: true });
+    const sync = open(doc);
+    expect(await sync.syncNow()).toMatchObject({ pushed: true, created: true });
+    return { server, doc, sync };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('says that it saved', async () => {
+    const { server, doc, sync } = await synced();
+    doc.addObject({ type: 'EMPTY', name: 'Change' });
+    expect(await sync.save()).toEqual({ message: 'Saved to WebDAV', level: 'info' });
+    expect(server.files.has(DOC)).toBe(true);
+    await sync.stop(false);
+    doc.destroy();
+  });
+
+  it('says that saving failed, and why', async () => {
+    const { server, doc, sync } = await synced();
+    doc.addObject({ type: 'EMPTY', name: 'Change' });
+    vi.stubGlobal('fetch', async (input: string, init: RequestInit = {}) =>
+      init.method === 'PUT' ? new Response(null, { status: 507 }) : server.fetch(input, init),
+    );
+    expect(await sync.save()).toEqual({
+      message: `Not saved to WebDAV (PUT ${DOC} failed: 507). The project is saved in this browser.`,
+      level: 'error',
+    });
+    expect(sync.status.value).toBe('error');
+    await sync.stop(false);
+    doc.destroy();
+  });
+
+  it('says that it is offline', async () => {
+    const { doc, sync } = await synced();
+    vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false);
+    expect(await sync.save()).toEqual({
+      message:
+        'You are offline: the project is saved in this browser and syncs with WebDAV when you are back online.',
+      level: 'warning',
+    });
+    expect(sync.status.value).toBe('offline');
+    await sync.stop(false);
+    doc.destroy();
+  });
+
+  it('says that it did not save a project that was closed', async () => {
+    const { doc, sync } = await synced();
+    await sync.stop(false);
+    expect(await sync.save()).toEqual({
+      message: 'Not saved to WebDAV: the project was closed.',
+      level: 'warning',
+    });
+    doc.destroy();
+  });
+
+  it('says that the project was deleted right after this save', async () => {
+    const { server, doc, sync } = await synced();
+    doc.addObject({ type: 'EMPTY', name: 'Change' });
+    server.once('after', `PUT ${DOC}`, () => server.remove(DIR));
+    expect(await sync.save()).toEqual({
+      message:
+        '"Saved" was deleted from WebDAV on another device right after this save. This browser keeps its copy and stores it on WebDAV again when you change it or save (Ctrl+S).',
+      level: 'warning',
+    });
+    expect(sync.status.value).toBe('deleted');
+    expect(server.files.size).toBe(0);
+    // Save shows what it reports, and the next syncs do not say it again
+    await sync.syncNow();
+    expect(toasts.value).toEqual([]);
+    await sync.stop(false);
+    doc.destroy();
+  });
+
+  /*
+   * WebDAV through the editor server is the server's storage (ProjectSession sets deletedOnServer):
+   * after the server said that it deleted the project, the messages name the server, and a sync that
+   * finds the deletion says nothing (the editor told of it).
+   */
+  it('names the server when the server said that it deleted the project', async () => {
+    const { server, doc, sync } = await synced();
+    sync.deletedOnServer = () => true;
+    doc.addObject({ type: 'EMPTY', name: 'Change' });
+    server.once('after', `PUT ${DOC}`, () => server.remove(DIR));
+    expect(await sync.save()).toEqual({
+      message:
+        '"Saved" was deleted on the server right after this save. This browser keeps its copy and stores it on the server again when you change it or save (Ctrl+S).',
+      level: 'warning',
+    });
+    const restored = sync.restored.value;
+    expect(await sync.save()).toEqual({
+      message: '"Saved" was deleted on the server; this browser stored it there again.',
+      level: 'warning',
+    });
+    expect(sync.restored.value).toBe(restored + 1);
+    server.remove(DIR);
+    await sync.syncNow();
+    expect(sync.status.value).toBe('deleted');
+    expect(sync.error.value).toBe('Deleted on the server'); // the status bar's tooltip
+    expect(toasts.value).toEqual([]);
+    await sync.stop(false);
+    doc.destroy();
   });
 });

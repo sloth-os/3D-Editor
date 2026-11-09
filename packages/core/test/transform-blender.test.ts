@@ -21,176 +21,20 @@ import {
  * and independently of the editor's code, is compared with what the operators store.
  */
 
+import {
+  IDENTITY,
+  axisMatrix,
+  eulToMat3,
+  invertSafeOrtho,
+  mat3ToCompatibleEul,
+  mul,
+  mulV,
+  orthogonalizeZeroAxes,
+  transMat3ToSize,
+  type M3,
+} from './blender-transform-port';
+
 const deg = Math.PI / 180;
-
-// ---------------------------------------------------------------- the port of Blender's code
-
-type M3 = number[][];
-const IDENTITY: M3 = [
-  [1, 0, 0],
-  [0, 1, 0],
-  [0, 0, 1],
-];
-const mul = (a: M3, b: M3): M3 =>
-  [0, 1, 2].map((c) => [0, 1, 2].map((r) => a[0][r] * b[c][0] + a[1][r] * b[c][1] + a[2][r] * b[c][2]));
-const mulV = (a: M3, v: number[]) => [0, 1, 2].map((r) => a[0][r] * v[0] + a[1][r] * v[1] + a[2][r] * v[2]);
-const det = (m: M3) =>
-  m[0][0] * (m[1][1] * m[2][2] - m[2][1] * m[1][2]) -
-  m[1][0] * (m[0][1] * m[2][2] - m[2][1] * m[0][2]) +
-  m[2][0] * (m[0][1] * m[1][2] - m[1][1] * m[0][2]);
-const len = (v: number[]) => Math.hypot(v[0], v[1], v[2]);
-const cross = (a: number[], b: number[]) => [
-  a[1] * b[2] - a[2] * b[1],
-  a[2] * b[0] - a[0] * b[2],
-  a[0] * b[1] - a[1] * b[0],
-];
-
-/** invert_m3_m3 (null when the determinant is 0, or the matrix is singular up to rounding) */
-function invert(m: M3): M3 | null {
-  const d = det(m);
-  if (!(Math.abs(d) > 1e-12 * len(m[0]) * len(m[1]) * len(m[2]))) return null;
-  const at = (r: number, c: number) => m[c][r];
-  const cofactor = (r: number, c: number) => {
-    const rs = [0, 1, 2].filter((x) => x !== r);
-    const cs = [0, 1, 2].filter((x) => x !== c);
-    const v = at(rs[0], cs[0]) * at(rs[1], cs[1]) - at(rs[0], cs[1]) * at(rs[1], cs[0]);
-    return (r + c) % 2 ? -v : v;
-  };
-  return [0, 1, 2].map((c) => [0, 1, 2].map((r) => cofactor(c, r) / d));
-}
-
-/** eul_to_mat3 */
-function eulToMat3(e: number[]): M3 {
-  const [ci, cj, ch] = e.map(Math.cos);
-  const [si, sj, sh] = e.map(Math.sin);
-  const cc = ci * ch;
-  const cs = ci * sh;
-  const sc = si * ch;
-  const ss = si * sh;
-  return [
-    [cj * ch, cj * sh, -sj],
-    [sj * sc - cs, sj * ss + cc, cj * si],
-    [sj * cc + ss, sj * cs - sc, cj * ci],
-  ];
-}
-
-/** ortho_v3_v3 */
-function orthoV3(v: number[]): number[] {
-  const x = Math.abs(v[0]);
-  const y = Math.abs(v[1]);
-  const z = Math.abs(v[2]);
-  const axis = x > y ? (x > z ? 0 : 2) : y > z ? 1 : 2;
-  if (axis === 0) return [-v[1] - v[2], v[0], v[0]];
-  if (axis === 1) return [v[1], -v[0] - v[2], v[1]];
-  return [v[2], v[2], -v[0] - v[1]];
-}
-
-/** orthogonalize_m3_zero_axes(m, 1.0f) */
-function orthogonalizeZeroAxes(m0: M3): M3 {
-  const m = m0.map((c) => c.slice());
-  const flag = m.reduce((f, c, i) => f | (c[0] * c[0] + c[1] * c[1] + c[2] * c[2] === 0 ? 1 << i : 0), 0);
-  if (flag === 0 || flag === 7) return m;
-  if (flag === 3) m[1] = orthoV3(m[2]);
-  if (flag === 6) m[2] = orthoV3(m[0]);
-  if (flag === 5) m[0] = orthoV3(m[1]);
-  if (flag === 1 || flag === 3) m[0] = cross(m[1], m[2]);
-  if (flag === 2 || flag === 6) m[1] = cross(m[0], m[2]);
-  if (flag === 4 || flag === 5) m[2] = cross(m[0], m[1]);
-  for (let i = 0; i < 3; i++)
-    if (flag & (1 << i)) {
-      const l = len(m[i]);
-      if (l === 0) m[i][i] = 1;
-      else m[i] = m[i].map((v) => v / l);
-    }
-  return m;
-}
-
-/** invert_m3_m3_safe_ortho */
-const invertSafeOrtho = (m: M3): M3 => invert(m) ?? invert(orthogonalizeZeroAxes(m)) ?? IDENTITY;
-
-/** transform_orientations_create_from_axis */
-function axisMatrix(w: M3): M3 {
-  const out = w.map((c) => (len(c) === 0 ? [0, 0, 0] : c.map((v) => v / len(c))));
-  const zero = w.map((c) => len(c) === 0);
-  const count = zero.filter(Boolean).length;
-  if (count === 0) return out;
-  if (count === 1) {
-    const a = zero.indexOf(true);
-    const v = cross(out[(a + 1) % 3], out[(a + 2) % 3]);
-    if (len(v) !== 0) {
-      out[a] = v.map((x) => x / len(v));
-      return out;
-    }
-  } else if (count === 2) {
-    const axis = zero.indexOf(false);
-    for (const a of [(axis + 1) % 3, (axis + 2) % 3]) {
-      out[a] = [0, 0, 0];
-      out[a][a] = 1;
-      const d = out[a][0] * out[axis][0] + out[a][1] * out[axis][1] + out[a][2] * out[axis][2];
-      out[a] = out[a].map((v, i) => v - d * out[axis][i]);
-    }
-    const [a, b] = [(axis + 1) % 3, (axis + 2) % 3];
-    if (len(out[a]) !== 0 && len(out[b]) !== 0) {
-      out[a] = out[a].map((v) => v / len(out[a]));
-      out[b] = out[b].map((v) => v / len(out[b]));
-      return out;
-    }
-  }
-  return IDENTITY;
-}
-
-/** compatible_eul (Blender 3.6 and later) */
-function compatibleEul(e0: number[], old: number[]): number[] {
-  const e = e0.slice();
-  const d = [0, 0, 0];
-  const pi2 = 2 * Math.PI;
-  for (let i = 0; i < 3; i++) {
-    d[i] = e[i] - old[i];
-    if (d[i] > Math.PI) {
-      e[i] -= Math.floor(d[i] / pi2 + 0.5) * pi2;
-      d[i] = e[i] - old[i];
-    } else if (d[i] < -Math.PI) {
-      e[i] += Math.floor(-d[i] / pi2 + 0.5) * pi2;
-      d[i] = e[i] - old[i];
-    }
-  }
-  for (let i = 0, j = 1, k = 2; i < 3; j = k, k = i++)
-    if (Math.abs(d[i]) > Math.PI && Math.abs(d[j]) < Math.PI / 2 && Math.abs(d[k]) < Math.PI / 2)
-      e[i] += d[i] > 0 ? -pi2 : pi2;
-  return e;
-}
-
-/** mat3_to_compatible_eulO for XYZ (with mat3_normalized_to_eulo2 and EULER_HYPOT_EPSILON) */
-function mat3ToCompatibleEul(m0: M3, old: number[]): { euler: number[]; cosY: number } {
-  const m = m0.map((c) => (len(c) > 0 ? c.map((v) => v / len(c)) : [0, 0, 0]));
-  const cy = Math.hypot(m[0][0], m[0][1]);
-  let e1: number[];
-  let e2: number[];
-  if (cy > 0.0000375) {
-    e1 = [Math.atan2(m[1][2], m[2][2]), Math.atan2(-m[0][2], cy), Math.atan2(m[0][1], m[0][0])];
-    e2 = [Math.atan2(-m[1][2], -m[2][2]), Math.atan2(-m[0][2], -cy), Math.atan2(-m[0][1], -m[0][0])];
-  } else {
-    e1 = [Math.atan2(-m[2][1], m[1][1]), Math.atan2(-m[0][2], cy), 0];
-    e2 = e1.slice();
-  }
-  const a = compatibleEul(e1, old);
-  const b = compatibleEul(e2, old);
-  const sum = (e: number[]) => e.reduce((s, v, i) => s + Math.abs(v - old[i]), 0);
-  return { euler: sum(a) > sum(b) ? b : a, cosY: cy };
-}
-
-/** TransMat3ToSize (with mat3_to_rot_size) */
-function transMat3ToSize(mat: M3, smat: M3): number[] {
-  let rot = mat.map((c) => (len(c) > 0 ? c.map((v) => v / len(c)) : [0, 0, 0]));
-  let size = mat.map(len);
-  if (det(rot) < 0) {
-    rot = rot.map((c) => c.map((v) => -v));
-    size = size.map((v) => -v);
-  }
-  return size.map((s, i) =>
-    rot[i][0] * smat[i][0] + rot[i][1] * smat[i][1] + rot[i][2] * smat[i][2] < 0 ? -s : s,
-  );
-}
 
 interface Obj {
   loc: number[];
@@ -645,7 +489,7 @@ describe('Rotate and Scale store what Blender’s store', () => {
       }
     });
 
-    it('auto keying keys the objects a transform changes, not the selected children that follow them', () => {
+    it('auto keying keys every object a transform transforms, not the selected children that follow them', () => {
       const t = setup();
       const p = t.doc.addObject({ type: 'EMPTY', name: 'P' });
       const c = t.doc.addObject({ type: 'EMPTY', name: 'C', location: [2, 0, 0], parent: p });
@@ -660,6 +504,25 @@ describe('Rotate and Scale store what Blender’s store', () => {
       t.ctx.state.frame = 5;
       t.run('transform.rotate', { value: 30 * deg, orient_axis: 'Z' });
       expect(t.doc.listFCurves(c).length).toBe(9);
+      // a rotation by 0 writes no channel and still keys all nine, as Blender keys every object
+      // its transform transforms
+      const q = t.doc.addObject({ type: 'EMPTY', name: 'Q', rotation_euler: [0.1, 0.2, 0.3] });
+      t.ctx.state.selectedIds = [q];
+      t.ctx.state.activeId = q;
+      t.ctx.state.pivotPoint = 'MEDIAN_POINT';
+      const writes = objectWrites(t.doc, () => t.run('transform.rotate', { value: 0, orient_axis: 'Z' }));
+      expect(writes).toEqual({});
+      expect(t.doc.listFCurves(q).map((f) => [f.path, f.index, f.keyframes[0].value])).toEqual([
+        ['location', 0, 0],
+        ['location', 1, 0],
+        ['location', 2, 0],
+        ['rotation_euler', 0, 0.1],
+        ['rotation_euler', 1, 0.2],
+        ['rotation_euler', 2, 0.3],
+        ['scale', 0, 1],
+        ['scale', 1, 1],
+        ['scale', 2, 1],
+      ]);
     });
 
     it('with another, unselected object active, Active Element pivots about that object', () => {
@@ -744,6 +607,22 @@ describe('Rotate and Scale store what Blender’s store', () => {
           expect(writes, `case ${n}`).toEqual({});
         }
       });
+
+    it('also for an object with zero angles at the origin: the tolerance is relative to 1 below 1', () => {
+      // R X 360° gives the rotation back as [−2.4e-16, 0, 0] and R Z 360° about another point the
+      // location as [−4.4e-16, 2.2e-16, 0]: within the tolerance of values below 1, not written
+      const { doc, ctx, run } = setup();
+      const id = doc.addObject({ type: 'EMPTY', name: 'A' });
+      ctx.state.selectedIds = [id];
+      ctx.state.activeId = id;
+      const writes = objectWrites(doc, () => {
+        run('transform.rotate', { value: 2 * Math.PI, orient_axis: 'X' });
+        run('transform.rotate', { value: 2 * Math.PI, orient_axis: 'Z', center: [1, 2, 0] });
+      });
+      expect(writes).toEqual({});
+      expect(doc.getObject(id)!.location).toEqual([0, 0, 0]);
+      expect(doc.getObject(id)!.rotation_euler).toEqual([0, 0, 0]);
+    });
 
     it('except in gimbal lock, where a rotation by 0 rewrites the rotation with Z = 0, as Blender’s does', () => {
       // Y at ±90° leaves only X − Z (90°) or X + Z (−90°) defined: Blender's mat3_to_compatible_eulO

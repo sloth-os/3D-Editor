@@ -34,9 +34,16 @@ import {
   MSAA_OFF_FRAME_MS,
   MSAA_ON_FRAME_MS,
   VIEWPORT_MSAA_SAMPLES,
+  FINAL_RENDER_SAMPLES,
+  FINAL_SUPERSAMPLE_MS,
+  FINAL_SUPERSAMPLE_OFFSETS,
   ViewportEngine,
 } from '../src/viewport/engine';
 import type { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
+import type { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { SMAABlendShader } from 'three/examples/jsm/shaders/SMAAShader.js';
+import { glslFunction, glslProgram } from './glsl';
 import { LOCAL_SHADOW_LAYER, lightIntensity, spotCone } from '../src/viewport/scene-objects';
 import { SLOW_FRAME_MS, slowFrameCompiled, slowFrameMs } from '../src/telemetry/perf';
 import { viewTransformParams, viewTransformPixel } from '../src/viewport/view-transform';
@@ -2104,8 +2111,9 @@ describe('heavy scenes in Rendered shading', () => {
         samplesOf(heavy.e, heavy.gl, { useViewport: true, shading, width: 32, height: 16 }),
         String(shading),
       ).toBe(0);
-    // a final render (F12, render_image in the browser) keeps its 8 (as many as the GPU has)
-    expect(samplesOf(heavy.e, heavy.gl, { width: 32, height: 16 })).toBe(8);
+    // a final render (F12, render_image in the browser) of Rendered shading, drawn by the viewport
+    // without samples only, has none either: supersampled or smoothed with SMAA (see the next test)
+    expect(samplesOf(heavy.e, heavy.gl, { width: 32, height: 16 })).toBe(0);
     // the light scene's viewport (Solid) drops its samples: Rendered, drawn by a picture with 4
     // only, keeps them; Solid, drawn by the viewport with both, and Material Preview, not drawn
     // yet, have the viewport's
@@ -2125,6 +2133,366 @@ describe('heavy scenes in Rendered shading', () => {
     expect(capture('MATERIAL')).toBe(0);
     expect(capture('RENDERED')).toBe(VIEWPORT_MSAA_SAMPLES);
     expect(capture(null)).toBe(VIEWPORT_MSAA_SAMPLES);
+  });
+
+  /**
+   * What a render drew: the sample counts of the targets the scene was drawn into (in order) and
+   * the size of the last one, and how often SMAA ran.
+   */
+  type Drawn = { samples: number[]; size: [number, number]; smaa: number };
+  function drawnBy(
+    c: { e: ViewportEngine; gl: RecordingRenderer },
+    opts: Parameters<ViewportEngine['renderPixels']>[0],
+  ): Drawn {
+    const smaa = vi.spyOn(SMAAPass.prototype, 'render');
+    smaa.mockClear();
+    const samples: number[] = [];
+    let size: [number, number] = [0, 0];
+    c.gl.onRender = (scene) => {
+      const target = (
+        c.gl as unknown as { getRenderTarget(): THREE.WebGLRenderTarget | null }
+      ).getRenderTarget();
+      if (scene === c.e.scene && c.gl.renders.at(-1)!.camera.layers.isEnabled(0)) {
+        samples.push(target?.samples ?? -1);
+        size = [target?.width ?? 0, target?.height ?? 0];
+      }
+    };
+    try {
+      c.e.renderPixels(opts);
+    } finally {
+      c.gl.onRender = null;
+    }
+    return { samples, size, smaa: smaa.mock.calls.length };
+  }
+
+  /**
+   * The GPU times the next one-pixel read-backs wait for, in order (ms): a final render without
+   * samples reads one after the frames the GPU still draws for the viewport, and one after its first
+   * picture (see ViewportEngine.drawFinalScene).
+   */
+  function gpuTimes(c: { gl: RecordingRenderer; hold(ms: number): void }, ...ms: number[]): void {
+    c.gl.readPixels = (b) => {
+      if (b.length === 4 && ms.length) c.hold(ms.shift()!);
+      b.fill(0);
+    };
+  }
+
+  const setMultisampling = (e: ViewportEngine, on: boolean) =>
+    (e as unknown as { setMultisampling(on: boolean): void }).setMultisampling(on);
+  const passes = (e: ViewportEngine) =>
+    (
+      e as unknown as {
+        captureParts(): Record<
+          'unpremultiply' | 'premultiply' | 'unpremultiplyShown' | 'average',
+          ShaderPass
+        >;
+      }
+    ).captureParts();
+
+  it('draws final renders of a shading the viewport drew only without samples without them: supersampled when the first picture fits the time budget, else smoothed with SMAA; multisampled where it drew it with samples and in Render Animation', () => {
+    // regressions: final renders (F12, render_image in the browser) always asked for 8 samples (4
+    // in software WebGL): the first one after the viewport drew Rendered shading without samples (a
+    // heavy scene, slow frames) built every material's pipelines again: 19.4 s for the first F12 at
+    // 1280×720 and 11.4 s for the next one, in examples/domino-cascade with a 1 M triangle grid in
+    // software WebGL. Then SMAA alone smoothed them: rods 0.8 px wide came out dashed.
+    const heavy = pacedEngine(scatterScene(400));
+    expect(heavy.e.multisampling).toBe(false);
+    // the SMAA pass is made when the viewport goes without samples, before any final render, so
+    // the lookup textures it decodes from data URLs are there for the first one
+    expect((heavy.e as unknown as { smaa: SMAAPass | null }).smaa).toBeInstanceOf(SMAAPass);
+    const supersampled = (size: [number, number]): Drawn => ({
+      samples: FINAL_SUPERSAMPLE_OFFSETS.map(() => 0),
+      size,
+      smaa: 0,
+    });
+    const smoothed = (size: [number, number]): Drawn => ({ samples: [0], size, smaa: 1 });
+    // Rendered, drawn by the viewport without samples: the GPU drew the first picture in the budget
+    // (after 3 s of the viewport's frames, which do not count), so it draws four more, no SMAA
+    gpuTimes(heavy, 3000, FINAL_SUPERSAMPLE_MS);
+    expect(drawnBy(heavy, { width: 32, height: 16 })).toEqual(supersampled([32, 16]));
+    // a first picture that took longer is the only one, smoothed with SMAA
+    gpuTimes(heavy, 0, FINAL_SUPERSAMPLE_MS + 1);
+    expect(drawnBy(heavy, { width: 32, height: 16 })).toEqual(smoothed([32, 16]));
+    // so is clay shading (SOLID), not drawn yet, while the viewport has no samples
+    gpuTimes(heavy, 0, FINAL_SUPERSAMPLE_MS + 1);
+    expect(drawnBy(heavy, { width: 30, height: 20, shading: 'SOLID' })).toEqual(smoothed([30, 20]));
+    // a capture (editor_command screenshot) shows what the viewport shows: no SMAA
+    expect(drawnBy(heavy, { useViewport: true, width: 32, height: 16 })).toEqual({
+      samples: [0],
+      size: [32, 16],
+      smaa: 0,
+    });
+    // every frame of Render Animation is multisampled (they all get the same anti-aliasing: the
+    // first one builds the pipelines); Rendered is multisampled from then on
+    const multisampled = (size: [number, number]): Drawn => ({
+      samples: [FINAL_RENDER_SAMPLES],
+      size,
+      smaa: 0,
+    });
+    expect(drawnBy(heavy, { width: 32, height: 16, frame: 2, animation: true })).toEqual(
+      multisampled([32, 16]),
+    );
+    expect(drawnBy(heavy, { width: 32, height: 16 })).toEqual(multisampled([32, 16]));
+    // the Solid final render built Solid's pipelines without samples (noted for its own draw
+    // context, not the viewport's): once the viewport has samples again, a Solid picture and the
+    // next Solid final render still draw without them, a Material Preview picture with them
+    setMultisampling(heavy.e, true);
+    heavy.wait(32);
+    expect(heavy.e.multisampling).toBe(true);
+    expect(drawnBy(heavy, { useViewport: true, shading: 'SOLID', width: 32, height: 16 }).samples).toEqual([
+      0,
+    ]);
+    gpuTimes(heavy, 0, 10);
+    expect(drawnBy(heavy, { width: 30, height: 20, shading: 'SOLID' })).toEqual(supersampled([30, 20]));
+    expect(drawnBy(heavy, { useViewport: true, shading: 'MATERIAL', width: 32, height: 16 }).samples).toEqual(
+      [VIEWPORT_MSAA_SAMPLES],
+    );
+    // a light scene's viewport has samples: its final renders are multisampled (Rendered not drawn
+    // yet), also once the viewport drew Rendered with samples
+    const light = pacedEngine(session());
+    expect(light.e.multisampling).toBe(true);
+    expect(drawnBy(light, { width: 32, height: 16 })).toEqual(multisampled([32, 16]));
+    light.e.session.view.shading.value = 'RENDERED';
+    light.change(32);
+    expect(drawnBy(light, { width: 32, height: 16 })).toEqual(multisampled([32, 16]));
+    // and when the viewport then drops its samples, Rendered, drawn with them, keeps them
+    setMultisampling(light.e, false);
+    light.wait(32);
+    expect(drawnBy(light, { width: 32, height: 16 })).toEqual(multisampled([32, 16]));
+  });
+
+  it('moves the pictures of a supersampled final render by fractions of a pixel and averages them evenly, drawing transmission pictures for each', () => {
+    // a camera with a lens shift, which every picture keeps (setViewOffset would compute the
+    // projection anew without it)
+    const s = scatterScene(400);
+    s.doc.updateBlockByKind('cameras', cameraObject(s).data!, { shift_x: 0.3, shift_y: -0.1 });
+    const heavy = pacedEngine(s);
+    expect(heavy.e.multisampling).toBe(false);
+    // the camera each picture's transmission pictures are drawn with (glass refracts what that
+    // picture sees), as it is when they are drawn
+    const transmission = (heavy.e as unknown as { transmission: { prepare(...a: unknown[]): void } })
+      .transmission;
+    const prepare = transmission.prepare.bind(transmission);
+    const refracted: THREE.Camera[] = [];
+    vi.spyOn(transmission, 'prepare').mockImplementation((...a: unknown[]) => {
+      refracted.push((a[2] as THREE.Camera).clone());
+      prepare(...a);
+    });
+    const average = passes(heavy.e).average;
+    const weights: number[] = [];
+    /** The targets each mix into the average read and wrote (the average before, and after it). */
+    const mixes: { read: THREE.WebGLRenderTarget; write: THREE.WebGLRenderTarget }[] = [];
+    vi.spyOn(average, 'render').mockImplementation((_r, write, read) => {
+      weights.push(average.uniforms.weight.value as number);
+      mixes.push({ read, write });
+    });
+    const into: unknown[] = [];
+    heavy.gl.onRender = (scene) => {
+      if (scene === heavy.e.scene && heavy.gl.renders.at(-1)!.camera.layers.isEnabled(0))
+        into.push((heavy.gl as unknown as { getRenderTarget(): unknown }).getRenderTarget());
+    };
+    const [width, height] = [64, 36];
+    heavy.gl.renders.length = 0;
+    gpuTimes(heavy, 0, 1);
+    heavy.e.renderPixels({ width, height });
+    heavy.gl.onRender = null;
+    const pictures = scenePasses(heavy.e, heavy.gl).map((r) => r.camera);
+    expect(pictures).toHaveLength(FINAL_SUPERSAMPLE_OFFSETS.length);
+    // the first picture is the average so far; each mix reads the average the last one wrote, and
+    // the view transform the last one (no picture is mixed into a target it is read from)
+    expect(mixes).toHaveLength(FINAL_SUPERSAMPLE_OFFSETS.length - 1);
+    mixes.forEach((m, i) => {
+      expect(m.read, `mix ${i} reads`).toBe(i ? mixes[i - 1].write : into[0]);
+      expect([m.write === m.read, m.write === into[i + 1]], `mix ${i} writes`).toEqual([false, false]);
+    });
+    const output = (heavy.e as unknown as { captureParts(): { output: ShaderPass } }).captureParts().output;
+    expect(output.uniforms.tDiffuse.value).toBe(mixes.at(-1)!.write.texture);
+    // where a picture puts a point in front of the camera, in pixels from where the first one does
+    const at = (cam: THREE.Camera) => {
+      const p = new THREE.Vector3(0, 0, 1)
+        .applyMatrix4(cam.matrixWorldInverse)
+        .applyMatrix4(cam.projectionMatrix);
+      return [(p.x * width) / 2, (p.y * height) / 2];
+    };
+    const moved = (cams: THREE.Camera[]) =>
+      cams.map((cam) => at(cam).map((v, k) => +(v - at(pictures[0])[k]).toFixed(9)));
+    const offsets = FINAL_SUPERSAMPLE_OFFSETS.map((o) => o.map((v) => +v.toFixed(9)));
+    expect(moved(pictures)).toEqual(offsets);
+    expect(moved(refracted)).toEqual(offsets);
+    // 5 points per pixel, no two in the same row or column, centred on the pixel
+    expect(new Set(FINAL_SUPERSAMPLE_OFFSETS.map(([x]) => x)).size).toBe(5);
+    expect(new Set(FINAL_SUPERSAMPLE_OFFSETS.map(([, y]) => y)).size).toBe(5);
+    for (const k of [0, 1])
+      expect(FINAL_SUPERSAMPLE_OFFSETS.reduce((t, o) => t + o[k], 0)).toBeCloseTo(0, 12);
+    // the n-th picture is mixed into the average of those before it with weight 1 / n, so every
+    // picture counts the same: the shader, run on the CPU on pictures of colours 0, 1, … 4
+    expect(weights).toEqual([1 / 2, 1 / 3, 1 / 4, 1 / 5]);
+    let mean = [0, 0, 0, 0];
+    for (let i = 0; i < 5; i++) {
+      const averaged = glslProgram(glslFunction(average.material.fragmentShader, 'averaged'), {
+        globals: { weight: i ? weights[i - 1] : 1 },
+      });
+      mean = averaged('averaged', mean, [i, 2 * i, 0.5, 1]) as number[];
+    }
+    expect(mean.map((v) => +v.toFixed(12))).toEqual([2, 4, 0.5, 1]);
+  });
+
+  it('averages the pictures of a transparent film premultiplied, and smooths one with SMAA on colours premultiplied in its blend space', () => {
+    const heavy = pacedEngine(scatterScene(400));
+    heavy.e.session.doc.updateRender({ film_transparent: true });
+    const parts = passes(heavy.e);
+    const names = new Map<unknown, string>([
+      [parts.unpremultiply.material, 'unpremultiply'],
+      [parts.premultiply.material, 'premultiply'],
+      [parts.unpremultiplyShown.material, 'unpremultiply shown'],
+      [parts.average.material, 'average'],
+    ]);
+    const drawn = () => {
+      const seen: string[] = [];
+      heavy.gl.onRender = (scene) => {
+        const r = heavy.gl.renders.at(-1)!;
+        if (scene === heavy.e.scene && r.camera.layers.isEnabled(0)) seen.push(`scene ${r.clearAlpha}`);
+        const m = (scene as THREE.Mesh).material as THREE.ShaderMaterial | undefined;
+        const name = names.get(m);
+        if (name) seen.push(name);
+        else if (m?.uniforms?.tArea) seen.push('smaa weights');
+      };
+      heavy.e.renderPixels({ width: 32, height: 16 });
+      heavy.gl.onRender = null;
+      return seen;
+    };
+    // supersampled: the pictures cleared to a transparent background, averaged premultiplied (like
+    // the samples of a multisampled picture), then divided by alpha
+    gpuTimes(heavy, 0, 1);
+    expect(drawn()).toEqual([
+      'scene 0',
+      'scene 0',
+      'average',
+      'scene 0',
+      'average',
+      'scene 0',
+      'average',
+      'scene 0',
+      'average',
+      'unpremultiply',
+    ]);
+    // smoothed with SMAA: after the view transform, premultiplied and divided again around it
+    gpuTimes(heavy, 0, FINAL_SUPERSAMPLE_MS + 1);
+    expect(drawn()).toEqual([
+      'scene 0',
+      'unpremultiply',
+      'premultiply',
+      'smaa weights',
+      'unpremultiply shown',
+    ]);
+  });
+
+  it('keeps the colour of edges against a transparent background through SMAA, which blends colours raised to the power 2.2', () => {
+    // regression: the colours were premultiplied by alpha itself; three.js's SMAA blend
+    // (SMAABlendShader) mixes them raised to the power 2.2 and alpha as it is, so an edge pixel
+    // between an object and the transparent background came out (1 - s)^(1/2.2 - 1) times too
+    // bright at blend weight s: 1.65 times at 40 % coverage (rgb 220 where the object was 134)
+    const { e } = engine(session());
+    const parts = passes(e);
+    const premultiplied = glslProgram(
+      glslFunction(parts.premultiply.material.fragmentShader, 'premultiplied'),
+    );
+    const straight = glslProgram(glslFunction(parts.unpremultiplyShown.material.fragmentShader, 'straight'));
+    // three.js's own SMAA blend, run on the CPU on a row of 3 pixels (array parameters spelled out)
+    const blendSource = glslFunction(SMAABlendShader.fragmentShader, 'SMAANeighborhoodBlendingPS')
+      .replace('vec4 offset[ 2 ]', 'vec4 offset0, vec4 offset1')
+      .replace(/offset\[ (\d) \]/g, 'offset$1');
+    let colours: number[][] = [];
+    let weights: number[][] = [];
+    const W = 3;
+    const blend = glslProgram(blendSource, {
+      globals: { resolution: [1 / W, 1] },
+      natives: {
+        texture2D: (tex: 'colour' | 'weights', uv: number[]) => {
+          const x = Math.floor(uv[0] * W);
+          const inside = Math.floor(uv[1]) === 0 && x >= 0 && x < W;
+          return inside ? (tex === 'colour' ? colours : weights)[x] : [0, 0, 0, 0];
+        },
+      },
+    });
+    /**
+     * The middle pixel `own` after SMAA blends it with its left neighbour `left` by `s` (straight
+     * colours in, straight colours out), with or without the film's premultiplication around it.
+     */
+    const smaa = (own: number[], left: number[], s: number, film = true) => {
+      colours = [left, own, [0, 0, 0, 0]].map((c) =>
+        film ? (premultiplied('premultiplied', c) as number[]) : c,
+      );
+      // the middle pixel's blue weight blends it with the pixel on its left
+      weights = [
+        [0, 0, 0, 0],
+        [0, 0, s, 0],
+        [0, 0, 0, 0],
+      ];
+      const uv = [1.5 / W, 0.5];
+      const out = blend(
+        'SMAANeighborhoodBlendingPS',
+        uv,
+        [uv[0] - 1 / W, uv[1], uv[0], uv[1] + 1],
+        [uv[0] + 1 / W, uv[1], uv[0], uv[1] - 1],
+        'colour',
+        'weights',
+      ) as number[];
+      return (film ? (straight('straight', out) as number[]) : out).map((v) => +v.toFixed(6));
+    };
+    const object = [0.525, 0.35, 0.2, 1];
+    const clear = [0, 0, 0, 0];
+    for (const s of [0.1, 0.4, 0.75]) {
+      // the object's edge, blended with the background: its colour at the blended alpha
+      expect(smaa(object, clear, s), `object, ${s}`).toEqual([0.525, 0.35, 0.2, +(1 - s).toFixed(6)]);
+      // the background blended with the object's edge: the same
+      expect(smaa(clear, object, s), `background, ${s}`).toEqual([0.525, 0.35, 0.2, s]);
+      // a half transparent surface: its colour, at its alpha times the coverage
+      expect(smaa([0.2, 0.6, 0.9, 0.5], clear, s), `glass, ${s}`).toEqual([
+        0.2,
+        0.6,
+        0.9,
+        +(0.5 * (1 - s)).toFixed(6),
+      ]);
+      // two opaque objects blend as SMAA blends them without a transparent film
+      const other = [0.9, 0.1, 0.3, 1];
+      expect(smaa(object, other, s), `objects, ${s}`).toEqual(smaa(object, other, s, false));
+    }
+  });
+
+  it('notes the samples a final render was drawn with as the GPU drew it: a capture reuses them', () => {
+    // a GPU with 4 samples at most (software WebGL) draws the 8 of a final render with 4: a capture
+    // in that shading after the viewport dropped its samples has 4, the pipelines built
+    const capped = pacedEngine(session());
+    (capped.gl as unknown as { capabilities: { maxSamples: number } }).capabilities = { maxSamples: 4 };
+    expect(drawnBy(capped, { width: 32, height: 16 }).samples).toEqual([FINAL_RENDER_SAMPLES]);
+    setMultisampling(capped.e, false);
+    capped.wait(32);
+    expect(
+      drawnBy(capped, { useViewport: true, shading: 'RENDERED', width: 32, height: 16 }).samples,
+    ).toEqual([4]);
+    // a GPU with more draws them with 8: a capture in that shading has the viewport's own count (the
+    // pipelines of neither count are built, and the viewport's next frame needs its own)
+    const roomy = pacedEngine(session());
+    (roomy.gl as unknown as { capabilities: { maxSamples: number } }).capabilities = { maxSamples: 16 };
+    expect(drawnBy(roomy, { width: 32, height: 16 }).samples).toEqual([FINAL_RENDER_SAMPLES]);
+    expect(drawnBy(roomy, { useViewport: true, shading: 'RENDERED', width: 32, height: 16 }).samples).toEqual(
+      [VIEWPORT_MSAA_SAMPLES],
+    );
+  });
+
+  it('shrinks the SMAA targets after a final render and keeps the pass', () => {
+    const heavy = pacedEngine(scatterScene(400));
+    const smaa = (heavy.e as unknown as { smaa: SMAAPass }).smaa;
+    const sizes = vi.spyOn(smaa, 'setSize');
+    gpuTimes(heavy, 0, FINAL_SUPERSAMPLE_MS + 1);
+    expect(drawnBy(heavy, { width: 64, height: 36 }).smaa).toBe(1);
+    // sized for the picture while it ran, then to one pixel (its targets hold nothing between renders)
+    expect(sizes.mock.calls).toEqual([
+      [64, 36],
+      [1, 1],
+    ]);
+    expect((heavy.e as unknown as { smaa: SMAAPass }).smaa).toBe(smaa);
   });
 });
 

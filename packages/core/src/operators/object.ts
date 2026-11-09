@@ -1,7 +1,9 @@
 import { z } from 'zod';
 import type { Mat4, Vec3 } from '../math/types';
-import { compose4, invert4, multiply4 } from '../math/mat4';
+import { compose4, invert4, multiply4, translation4 } from '../math/mat4';
 import { transformPoint3 } from '../math/vec3';
+import { changedChannels, transformedChannels, transformTolerance } from '../doc/scene-doc';
+import { FrameState } from '../eval/frame-state';
 import type { EmptyDisplayType, LightData, LightType, ObjectData, ObjectType } from '../doc/types';
 import { ROOT_COLLECTION_ID } from '../doc/types';
 import { defaultCamera, defaultLight } from '../doc/defaults';
@@ -27,13 +29,16 @@ import {
   setSelection,
   vec3,
 } from './helpers';
-import { transformRoots } from './transform';
 import {
-  ARMATURE_PARENT_TYPES,
-  armatureParentSet,
-  clearBoneParent,
-  remapDuplicatedReferences,
-} from './armature';
+  evaluatedWorld,
+  keepChildrenWorld,
+  keyChannelChanges,
+  moveOrigin,
+  transformRoots,
+  transformStart,
+  type ChannelChange,
+} from './transform';
+import { ARMATURE_PARENT_TYPES, armatureParentSet, remapDuplicatedReferences } from './armature';
 import {
   applyCurveTransform,
   checkCurveTransformApply,
@@ -41,6 +46,37 @@ import {
   curveOriginSet,
   curveShadeSet,
 } from './curve';
+
+/**
+ * Parents object `id` to the object `parent` (null clears the parent; an object parent, so a bone
+ * parent's bone no longer applies), keeping its world matrix when `keep`, from where the scene
+ * shows it and the new parent at the frame of `fs`: under a bone or an animated, posed or
+ * constrained parent too (SceneDoc.setParent).
+ */
+function setParentAt(
+  ctx: OperatorContext,
+  fs: FrameState,
+  id: string,
+  parent: string | null,
+  keep: boolean,
+): void {
+  const evaluated = keep
+    ? { world: evaluatedWorld(fs, id), parentWorld: parent ? evaluatedWorld(fs, parent) : null }
+    : undefined;
+  ctx.doc.setParent(id, parent, keep, evaluated);
+}
+
+/**
+ * Removes an object; its children get its parent (an object parent) and keep their world
+ * matrices, from where the scene shows them at the frame of `fs`.
+ */
+function removeObjectAt(ctx: OperatorContext, fs: FrameState, id: string): void {
+  const o = ctx.doc.getObject(id);
+  if (!o) return;
+  const parent = o.parent && o.parent !== id && ctx.doc.getObject(o.parent) ? o.parent : null;
+  for (const child of ctx.doc.childrenOf(id)) setParentAt(ctx, fs, child.id, parent, true);
+  ctx.doc.removeObject(id);
+}
 
 const placement = {
   location: vec3.optional().describe('World location (defaults to the 3D cursor)'),
@@ -488,7 +524,9 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       execute(ctx, p) {
         const ids = resolveObjectIds(ctx, p.objects);
         if (ids.length === 0) throw new OperatorError('Nothing selected', 'POLL_FAILED');
-        for (const id of ids) ctx.doc.removeObject(id);
+        // children keep their world matrices where the scene shows them
+        const fs = new FrameState(ctx.doc, ctx.state.frame);
+        for (const id of ids) removeObjectAt(ctx, fs, id);
         setSelection(
           ctx,
           ctx.state.selectedIds.filter((id) => !ids.includes(id)),
@@ -559,15 +597,18 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         }
         // modifier objects and constraint targets inside the set point at the copies too
         remapDuplicatedReferences(ctx.doc, map);
-        for (const id of transformRoots(ctx.doc, [...map.values()])) {
-          const o = ctx.doc.getObject(id)!;
-          if (p.offset.some((v) => v !== 0)) {
-            const w = ctx.doc.worldMatrix(id);
-            w[12] += p.offset[0];
-            w[13] += p.offset[1];
-            w[14] += p.offset[2];
-            ctx.doc.setWorldMatrix(id, w);
-          } else void o;
+        // the offset moves the copies as Move does: in their parents' space as the scene shows it
+        // (a bone's posed matrix, an animated or constrained parent)
+        if (p.offset.some((v) => v !== 0)) {
+          const fs = new FrameState(ctx.doc, ctx.state.frame);
+          const offset = translation4(p.offset as Vec3);
+          for (const id of transformRoots(ctx.doc, [...map.values()])) {
+            const t = transformStart(fs, id, 'TRANSLATE');
+            if (!t) continue;
+            const next = transformedChannels(t.channels, t.basis, 'TRANSLATE', offset, [0, 0, 0]);
+            const patch = changedChannels(t.channels, next, transformTolerance(t.basis));
+            if (patch) ctx.doc.updateObject(id, patch);
+          }
         }
         const ids = [...map.values()];
         setSelection(ctx, ids, map.get(ctx.state.activeId ?? '') ?? ids[ids.length - 1] ?? null);
@@ -619,12 +660,29 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       defineOperator({
         id,
         label,
-        description: `Reset the ${field} of the selected objects.`,
+        description:
+          `Reset the ${field} of the selected objects. With auto keying their ${field} is keyed at the current ` +
+          'frame, as in Blender; without it an animated channel it changes is keyed there with its new value, ' +
+          'so the object shows it.',
         category: 'Object',
         schema: z.object({}),
         poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
         execute(ctx) {
-          for (const o of selectedObjects(ctx)) ctx.doc.updateObject(o.id, { [field]: value });
+          // keyed as Blender's Clear keys (its Location, Rotation or Scale keying set) with auto keying,
+          // and without it the animated channels it changes (see keyChannelChanges)
+          const fs = new FrameState(ctx.doc, ctx.state.frame);
+          const changes = new Map<string, ChannelChange>();
+          for (const o of selectedObjects(ctx)) {
+            const shown = fs.byId.get(o.id) ?? o;
+            const before = {
+              location: shown.location,
+              rotation_euler: shown.rotation_euler,
+              scale: shown.scale,
+            };
+            if (o[field].some((v, i) => v !== value[i])) ctx.doc.updateObject(o.id, { [field]: value });
+            changes.set(o.id, { before, after: { ...before, [field]: value } });
+          }
+          keyChannelChanges(ctx, changes, [field]);
         },
       }),
     );
@@ -656,26 +714,48 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       }),
       poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
       execute(ctx, p) {
+        // what the scene shows at the frame: Blender applies the values an animated object shows
+        // there (its channels hold them), and children keep their world matrices (keepChildrenWorld)
+        const shown = new FrameState(ctx.doc, ctx.state.frame);
+        const showing = (o: ObjectData, fs: FrameState): ObjectData => {
+          const c = fs.byId.get(o.id);
+          return c ? { ...o, location: c.location, rotation_euler: c.rotation_euler, scale: c.scale } : o;
+        };
         // curves and text cannot absorb every transform: refuse before anything changes
-        checkCurveTransformApply(ctx, selectedObjects(ctx), p);
+        checkCurveTransformApply(
+          ctx,
+          selectedObjects(ctx).map((o) => showing(o, shown)),
+          p,
+        );
+        const changed = new Set<string>();
+        const differs = (a: Vec3, b: Vec3) => a.some((v, i) => v !== b[i]);
         for (const sel of selectedObjects(ctx)) {
           // re-read: applying a selected parent changes the transforms of its children
           const o = ctx.doc.getObject(sel.id) ?? sel;
-          const loc: Vec3 = p.location ? [0, 0, 0] : o.location;
-          const rot: Vec3 = p.rotation ? [0, 0, 0] : o.rotation_euler;
-          const scl: Vec3 = p.scale ? [1, 1, 1] : o.scale;
+          const cur = showing(
+            o,
+            o.parent && changed.has(o.parent) ? new FrameState(ctx.doc, ctx.state.frame) : shown,
+          );
+          const loc: Vec3 = p.location ? [0, 0, 0] : cur.location;
+          const rot: Vec3 = p.rotation ? [0, 0, 0] : cur.rotation_euler;
+          const scl: Vec3 = p.scale ? [1, 1, 1] : cur.scale;
           // like Blender's Apply Object Transform, only the applied channels are reset; the others,
-          // and channels already at their reset value, are not written at all
+          // and channels whose stored values are at their reset values, are not written at all (an
+          // animated channel keeps its keys, which go on deciding what it shows, as in Blender once the
+          // frame changes)
           const reset: Partial<ObjectData> = {};
-          const differs = (a: Vec3, b: Vec3) => a.some((v, i) => v !== b[i]);
-          if (differs(loc, o.location)) reset.location = loc;
-          if (differs(rot, o.rotation_euler)) reset.rotation_euler = rot;
-          if (differs(scl, o.scale)) reset.scale = scl;
-          if (Object.keys(reset).length === 0) continue;
-          const before = compose4(o.location, o.rotation_euler, o.scale);
+          if (p.location && differs([0, 0, 0], o.location)) reset.location = [0, 0, 0];
+          if (p.rotation && differs([0, 0, 0], o.rotation_euler)) reset.rotation_euler = [0, 0, 0];
+          if (p.scale && differs([1, 1, 1], o.scale)) reset.scale = [1, 1, 1];
+          const bake =
+            differs(loc, cur.location) || differs(rot, cur.rotation_euler) || differs(scl, cur.scale);
+          if (!bake && Object.keys(reset).length === 0) continue;
+          const before = compose4(cur.location, cur.rotation_euler, cur.scale);
           const after = compose4(loc, rot, scl);
           const delta = multiply4(invert4(after), before); // vertex' = after⁻¹ · before · vertex
-          if (o.type === 'MESH' && o.data) {
+          if (!bake) {
+            // the values shown are the reset ones already: only the stored channels are reset
+          } else if (o.type === 'MESH' && o.data) {
             const meshId = singleUserMesh(ctx, o);
             const m = cloneMesh(ctx.doc.getMesh(meshId)!);
             for (let i = 0; i < vertexCount(m); i++) {
@@ -690,7 +770,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             }
             // Negative scale flips winding: keep normals pointing outward.
             const det = scl[0] * scl[1] * scl[2];
-            const det0 = o.scale[0] * o.scale[1] * o.scale[2];
+            const det0 = cur.scale[0] * cur.scale[1] * cur.scale[2];
             if (Math.sign(det) !== Math.sign(det0)) {
               m.faces = m.faces.map((f) => f.slice().reverse());
               if (m.uvs) m.uvs = m.uvs.map((uv) => reversePairs(uv));
@@ -701,9 +781,16 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             if (!applyCurveTransform(ctx, o, delta, p.properties)) continue;
           }
           // children keep their world transform
-          const childWorld = new Map(ctx.doc.childrenOf(o.id).map((c) => [c.id, ctx.doc.worldMatrix(c.id)]));
-          ctx.doc.updateObject(o.id, reset);
-          for (const [cid, w] of childWorld) ctx.doc.setWorldMatrix(cid, w);
+          keepChildrenWorld(
+            ctx,
+            o.id,
+            () => {
+              if (Object.keys(reset).length) ctx.doc.updateObject(o.id, reset);
+            },
+            shown,
+            changed,
+          );
+          changed.add(o.id);
         }
       },
     }),
@@ -722,15 +809,20 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       }),
       poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
       execute(ctx, p) {
+        // where the scene shows the objects (a bone or an animated or constrained parent included),
+        // read before anything changes: the operator keeps every other object's world matrix
+        const before = new FrameState(ctx.doc, ctx.state.frame);
+        const changed = new Set<string>();
         for (const o of selectedObjects(ctx)) {
           // curves move their control points, text its offset_x/offset_y
-          if (o.type === 'CURVE' || o.type === 'FONT') curveOriginSet(ctx, o, p.type, p.center);
+          if (o.type === 'CURVE' || o.type === 'FONT')
+            curveOriginSet(ctx, o, p.type, p.center, before, changed);
           if (o.type !== 'MESH' || !o.data) continue;
           const meshId = singleUserMesh(ctx, o);
           const m = cloneMesh(ctx.doc.getMesh(meshId)!);
           const n = vertexCount(m);
           if (n === 0) continue;
-          const world = ctx.doc.worldMatrix(o.id);
+          const world = evaluatedWorld(before, o.id);
           let centerLocal: Vec3;
           if (p.center === 'BOUNDS') {
             const b = meshBounds(m)!;
@@ -751,14 +843,8 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
               : centerLocal;
           for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) m.positions[i * 3 + k] -= target[k];
           ctx.doc.setMesh(meshId, m);
-          const newOriginWorld = transformPoint3(world, target);
-          const childWorld = new Map(ctx.doc.childrenOf(o.id).map((c) => [c.id, ctx.doc.worldMatrix(c.id)]));
-          const w = world.slice();
-          w[12] = newOriginWorld[0];
-          w[13] = newOriginWorld[1];
-          w[14] = newOriginWorld[2];
-          ctx.doc.setWorldMatrix(o.id, w);
-          for (const [cid, cw] of childWorld) ctx.doc.setWorldMatrix(cid, cw);
+          // the origin moves onto the old centre, so nothing moves visually
+          moveOrigin(ctx, o.id, target, before, changed);
         }
       },
     }),
@@ -879,11 +965,11 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             p.type,
             p,
           );
+        const fs = new FrameState(ctx.doc, ctx.state.frame);
         for (const o of selectedObjects(ctx)) {
           if (o.id === parent) continue;
           if (ctx.doc.isAncestor(o.id, parent)) throw new OperatorError('Loop in parents', 'FAILED');
-          if (o.parent_type === 'BONE') clearBoneParent(ctx, o.id, p.keep_transform);
-          ctx.doc.setParent(o.id, parent, p.keep_transform);
+          setParentAt(ctx, fs, o.id, parent, p.keep_transform);
         }
       },
     }),
@@ -917,10 +1003,10 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           if (!parent) throw new OperatorError(`Parent type ${p.type} needs a parent`, 'INVALID_PARAMS');
           return armatureParentSet(ctx, ids, parent, p.type, p);
         }
+        const fs = new FrameState(ctx.doc, ctx.state.frame);
         for (const id of ids) {
           if (id === parent) continue;
-          if (ctx.doc.getObject(id)?.parent_type === 'BONE') clearBoneParent(ctx, id, p.keep_transform);
-          ctx.doc.setParent(id, parent ?? null, p.keep_transform);
+          setParentAt(ctx, fs, id, parent ?? null, p.keep_transform);
         }
       },
     }),
@@ -934,10 +1020,9 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       schema: z.object({ type: z.enum(['CLEAR', 'CLEAR_KEEP_TRANSFORM']).default('CLEAR_KEEP_TRANSFORM') }),
       poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
       execute(ctx, p) {
-        for (const o of selectedObjects(ctx)) {
-          if (o.parent_type === 'BONE') clearBoneParent(ctx, o.id, p.type === 'CLEAR_KEEP_TRANSFORM');
-          else if (o.parent) ctx.doc.setParent(o.id, null, p.type === 'CLEAR_KEEP_TRANSFORM');
-        }
+        const fs = new FrameState(ctx.doc, ctx.state.frame);
+        for (const o of selectedObjects(ctx))
+          if (o.parent) setParentAt(ctx, fs, o.id, null, p.type === 'CLEAR_KEEP_TRANSFORM');
       },
     }),
   );
@@ -962,13 +1047,15 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         const active = activeObject(ctx)!;
         const activeMeshId = singleUserMesh(ctx, active);
         const out = cloneMesh(ctx.doc.getMesh(activeMeshId)!);
-        const inv = invert4(ctx.doc.worldMatrix(active.id));
+        // where the scene shows the objects (Blender joins with their evaluated matrices)
+        const fs = new FrameState(ctx.doc, ctx.state.frame);
+        const inv = invert4(evaluatedWorld(fs, active.id));
         const slots = [...active.material_slots];
         for (const o of selectedObjects(ctx)) {
           if (o.id === active.id || o.type !== 'MESH' || !o.data) continue;
           const src = ctx.doc.getMesh(o.data);
           if (!src) continue;
-          const toActive: Mat4 = multiply4(inv, ctx.doc.worldMatrix(o.id));
+          const toActive: Mat4 = multiply4(inv, evaluatedWorld(fs, o.id));
           // map material slots
           const slotMap = o.material_slots.map((mat) => {
             let i = slots.indexOf(mat);
@@ -981,7 +1068,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           const remapped = cloneMesh(src);
           remapped.faceMaterials = remapped.faceMaterials.map((mi) => slotMap[mi] ?? 0);
           appendMesh(out, remapped, (v) => transformPoint3(toActive, v));
-          ctx.doc.removeObject(o.id);
+          removeObjectAt(ctx, fs, o.id);
         }
         ctx.doc.setMesh(activeMeshId, out);
         ctx.doc.updateObject(active.id, { material_slots: slots });

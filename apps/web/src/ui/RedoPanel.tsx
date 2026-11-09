@@ -2,6 +2,7 @@ import { useState } from 'preact/hooks';
 import { z } from 'zod';
 import {
   CONSTRAINT_TYPES,
+  FrameState,
   getConstraintTypeInfo,
   poseBonePath,
   resolveConstraintType,
@@ -10,6 +11,7 @@ import {
   type AnimTargetType,
   type ConstraintData,
   type ConstraintTypeInfo,
+  type Mat4,
   type ObjectData,
   type ParticleSystemData,
   type SceneDoc,
@@ -96,6 +98,13 @@ export type ValueAt = (type: AnimTargetType, id: string, path: string, index: nu
 /** The stored values (a form shown without a session, e.g. in tests). */
 const STORED: ValueAt = (_type, _id, _path, _index, base) => base;
 
+/**
+ * The world matrix of an object where the scene shows it at the current frame (animation, a bone
+ * or another parent, poses and constraints included), as the operators read it. Null: from the
+ * stored values (a form shown without a session, e.g. in tests).
+ */
+export type WorldAt = ((id: string) => Mat4) | null;
+
 /** Bone names of an armature object (empty for other objects). */
 function boneNames(doc: SceneDoc, o: ObjectData | null): string[] {
   return o?.type === 'ARMATURE' && o.data ? (doc.getArmature(o.data)?.bones.map((b) => b.name) ?? []) : [];
@@ -156,7 +165,13 @@ function shapeKeyOf(
  * Editing one component of such a vector keeps the others as they are shown. The Properties
  * editor and the outliner run these operators with only the field that changed.
  */
-function keptValues(doc: SceneDoc, last: LastOperator, params: Params, at: ValueAt): Params {
+function keptValues(
+  doc: SceneDoc,
+  last: LastOperator,
+  params: Params,
+  at: ValueAt,
+  worldAt: WorldAt,
+): Params {
   switch (last.id) {
     case 'pose.bone_transform_set': {
       const o = objectOrActive(doc, last, params.object);
@@ -190,7 +205,8 @@ function keptValues(doc: SceneDoc, last: LastOperator, params: Params, at: Value
       const name = reported(last, 'bone');
       const bone = name !== null ? named(name) : (named(params.bone) ?? named(text(params.name)?.trim()));
       if (!o || !bone) return {};
-      const world = params.space === 'WORLD' ? doc.worldMatrix(o.id) : null;
+      // in world space where the armature is at the current frame, as the operator converts them
+      const world = params.space === 'WORLD' ? (worldAt ?? ((id) => doc.worldMatrix(id)))(o.id) : null;
       const point = (p: Vec3) => (world ? transformPoint3(world, p) : [...p]);
       // the rest of what the Bone panel shows: parent, Connected, Deform; and the envelope
       return {
@@ -286,11 +302,16 @@ export interface RedoForm {
  * what the operator accepts. Objects the operation created are never offered: adjusting it undoes
  * it first, which deletes them.
  */
-export function redoForm(doc: SceneDoc, last: LastOperator, at: ValueAt = STORED): RedoForm {
+export function redoForm(
+  doc: SceneDoc,
+  last: LastOperator,
+  at: ValueAt = STORED,
+  worldAt: WorldAt = null,
+): RedoForm {
   const params = (last.params ?? {}) as Params;
   const props = (paramSchema(last.id) as { properties?: Record<string, unknown> } | null)?.properties;
   const values: Params = { ...params };
-  for (const [k, v] of Object.entries(keptValues(doc, last, params, at)))
+  for (const [k, v] of Object.entries(keptValues(doc, last, params, at, worldAt)))
     if (values[k] === undefined) values[k] = v;
   const exclude = [...HIDDEN, ...(HIDDEN_BY_OPERATOR[last.id] ?? [])];
   const objectKeys: string[] = [];
@@ -435,8 +456,11 @@ export function RedoPanel({ s }: { s: ProjectSession }) {
   const def = registry.get(last.id);
   if (!def) return null;
   // animated kept values at the current frame (reading them follows the frame, like the panels)
-  const form = redoForm(s.doc, last, (type, id, path, index, base) =>
-    animatedValue(s, type, id, path, index, base),
+  const form = redoForm(
+    s.doc,
+    last,
+    (type, id, path, index, base) => animatedValue(s, type, id, path, index, base),
+    (id) => new FrameState(s.doc, s.state.frame).world(id) ?? s.doc.worldMatrix(id),
   );
   return (
     <div

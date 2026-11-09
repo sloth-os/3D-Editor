@@ -1,6 +1,7 @@
 import { loadConfig } from './config';
 import { createApp } from './app';
 import { persistenceNote } from './persistence';
+import { closeSharedRenderer } from './render';
 
 async function main(): Promise<void> {
   let config;
@@ -49,8 +50,9 @@ async function main(): Promise<void> {
       process.exit(1);
     }, 20_000);
     force.unref();
-    handle
-      .close()
+    // the render processes stop at once (renders in progress are cancelled); a busy one would
+    // otherwise finish its request first
+    Promise.all([handle.close(), closeSharedRenderer()])
       .then(() => {
         app.log.info('shutdown complete');
         process.exit(0);

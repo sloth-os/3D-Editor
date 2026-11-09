@@ -51,17 +51,18 @@ import type {
 } from './protocol';
 
 /*
- * The rendering work done by one render thread (a worker, or the main thread in single-thread
- * mode): documents are rebuilt from Yjs state updates and cached together with their scene
- * evaluator (so geometry, instancing and rigid body caches survive between renders of the same
- * project), path traced renders are prepared once per job and then rendered in bands of rows.
+ * The rendering work done by one render thread (a render process, or the main thread in
+ * single-thread mode): documents are rebuilt from Yjs state updates and cached together with their
+ * scene evaluator (so geometry, instancing and rigid body caches survive between renders of the
+ * same project), path traced renders are prepared once per job and then rendered in bands of rows.
  */
 
 /**
  * Documents kept per render thread (least recently used ones are dropped): the documents of the
- * two long renders that may share a thread and of one quick render.
+ * two long renders that may share a thread and of one quick render. The pool mirrors this cache
+ * to leave out the states a render process already has (see `DocRef`).
  */
-const MAX_DOCUMENTS = 3;
+export const MAX_DOCUMENTS = 3;
 /** Most frames evaluated to frame the automatic view of an animation (as core renderAnimation). */
 const AUTO_VIEW_SAMPLES = 64;
 
@@ -154,17 +155,32 @@ function pathTraceInput(
   };
 }
 
+/**
+ * A request named a document version without its state (see `DocRef`) and this thread does not
+ * have that version: the pool sends the request again with the state.
+ */
+export class MissingDocumentError extends Error {
+  constructor(key: string, version: number) {
+    super(`document ${key} version ${version} is not cached on this render thread`);
+    this.name = 'MissingDocumentError';
+  }
+}
+
 export class RenderEngine {
   private readonly docs = new Map<string, CachedDocument>();
   private readonly tracers = new Map<number, PathTracer>();
   private readonly encoders = new Map<number, APNGEncoder>();
   private clock = 0;
 
-  /** The cached document of `ref`, brought up to date with its state update. */
+  /**
+   * The cached document of `ref`, brought up to date with its state update. Throws a
+   * {@link MissingDocumentError} when `ref` has no update and this version is not cached.
+   */
   document(ref: DocRef): CachedDocument {
     let entry = this.docs.get(ref.key);
     if (!entry || entry.version !== ref.version) {
-      const update = ref.update instanceof Uint8Array ? ref.update : new Uint8Array(ref.update);
+      const update = ref.update;
+      if (!update) throw new MissingDocumentError(ref.key, ref.version);
       if (entry) entry.doc.applyUpdate(update, 'render');
       else {
         const doc = SceneDoc.fromUpdate(update);
@@ -184,11 +200,13 @@ export class RenderEngine {
             : simulate(d, frame, host);
         entry = created;
         this.docs.set(ref.key, entry);
-        this.evictDocuments();
       }
       entry.version = ref.version;
     }
     entry.used = ++this.clock;
+    // after marking this document as used: a new document drops the least recently used other one
+    // (not itself; the pool mirrors this order, see `DocRef`)
+    this.evictDocuments();
     // shared physics only apply to the render they came with (see documentFor)
     entry.physics = null;
     return entry;

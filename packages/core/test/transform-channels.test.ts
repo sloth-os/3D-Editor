@@ -21,10 +21,10 @@ import { matrixFromAxes, matrixToCompatibleEuler } from '../src/constraints/math
 
 /*
  * Move, Rotate and Scale change an object's channels (location, rotation_euler, scale) as Blender's
- * do (SceneDoc.transformObject); the other operators that give objects new world matrices write
- * only the channels the new matrix changes (SceneDoc.setWorldMatrix). Both keep the channels they
- * leave as they were bit for bit, and store rotations as the euler closest to the stored one.
- * transform-blender.test.ts compares Rotate and Scale with a port of Blender's code.
+ * do (transformObjects in operators/transform.ts); the other operators that give objects new world
+ * matrices write only the channels the new matrix changes (SceneDoc.setWorldMatrix). Both keep the
+ * channels they leave as they were bit for bit, and store rotations as the euler closest to the
+ * stored one. transform-blender.test.ts compares Rotate and Scale with a port of Blender's code.
  */
 
 const deg = Math.PI / 180;
@@ -729,6 +729,18 @@ describe('a new world matrix with axes scaled to 0 keeps a right-handed rotation
     expect(get('A').rotation_euler).toEqual(stored);
     get('A').scale.forEach((v, i) => expect(v).toBeCloseTo([0, 1.5, 2][i], 12));
   });
+
+  it('two axes scaled to 0 and the third along the stored next axis: the stored third axis crossed with it', () => {
+    // the stored next axis (Y) cannot be made perpendicular to the new X axis along it: the next
+    // axis is the stored Z axis crossed with X, here −X, and the rotation turns by 90° about Z
+    const { doc, add, get } = setup();
+    const id = add('A', { location: [1, 2, 3] });
+    const world: Mat4 = [0, 1.5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 1];
+    const writes = objectWrites(doc, () => doc.setWorldMatrix(id, world));
+    expect(writes).toEqual({ A: ['rotation_euler', 'scale'] });
+    expectDegrees(get('A').rotation_euler, [0, 0, 90], 'A');
+    get('A').scale.forEach((v, i) => expect(v).toBeCloseTo([1.5, 0, 0][i], 12));
+  });
 });
 
 describe('the tolerance within which recomputed channels count as unchanged grows with the parent’s axis ratio', () => {
@@ -841,6 +853,82 @@ describe('Look At, and Drop to Ground and Snap to Surface with Align to Normal, 
         'run 2',
       ).toEqual({});
     });
+});
+
+describe('under a parent that shears the child (scaled unevenly, turned), the world axes meet the goal as far as they can', () => {
+  /** A ground plane tilted by 10° and 5°, a parent P turned and scaled [2, 0.5, 1.5], its child the cube. */
+  function shearedChild() {
+    const t = setup();
+    t.run('mesh.primitive_plane_add', { size: 40, rotation: [10 * deg, 5 * deg, 0] });
+    t.add('P', { location: [0.5, -0.5, 4], rotation: [25 * deg, -40 * deg, 70 * deg], scale: [2, 0.5, 1.5] });
+    t.run('mesh.primitive_cube_add', { location: [0, 0, 0] });
+    const cube = t.get('Cube').id;
+    t.doc.updateObject(cube, {
+      parent: t.get('P').id,
+      location: [0.3, 0.6, 0.4],
+      rotation_euler: [0.7, -0.4, 1.9],
+      scale: [0.5, 0.8, -0.6],
+    });
+    t.ctx.state.selectedIds = [cube];
+    t.ctx.state.activeId = cube;
+    return { ...t, cube };
+  }
+
+  for (const op of ['object.drop_to_ground', 'object.snap_to_surface'])
+    it(`${op} with Align to Normal puts the child’s world +Z on the normal, and a second run writes nothing`, () => {
+      // Blender's Rotate by the world rotation that turns +Z onto the normal leaves a sheared child
+      // up to 85° off it (and every run turned it again); the rotation is solved in the parent's space
+      const { doc, run, get, cube } = shearedChild();
+      const params =
+        op === 'object.drop_to_ground'
+          ? { objects: ['Cube'], align_to_normal: true }
+          : { objects: ['Cube'], ray_origin: [0.5, -0.5, 10], align_to_normal: true };
+      run(op, params);
+      const n = axisOf(doc.worldMatrix(get('Plane').id), 2);
+      const z = axisOf(doc.worldMatrix(cube), 2);
+      expect(Math.acos(Math.min(1, z[0] * n[0] + z[1] * n[1] + z[2] * n[2]))).toBeLessThan(1e-9);
+      expect(get('Cube').scale).toEqual([0.5, 0.8, -0.6]);
+      expect(
+        objectWrites(doc, () => run(op, params)),
+        'run 2',
+      ).toEqual({});
+    });
+
+  it('Look At keeps the tracked axis on the target and points the up axis as close to +Z as the child can', () => {
+    const { doc, run, get, cube } = shearedChild();
+    const target: Vec3 = [4, -3, 1];
+    run('object.look_at', { objects: ['Cube'], point: target });
+    const w = doc.worldMatrix(cube);
+    const pos = [w[12], w[13], w[14]];
+    const d = normalize3([target[0] - pos[0], target[1] - pos[1], target[2] - pos[2]]);
+    // −Z on the target (the negative Z scale points the stored axis the other way)
+    const z = axisOf(w, 2);
+    expect(-(z[0] * d[0] + z[1] * d[1] + z[2] * d[2])).toBeCloseTo(1, 12);
+    // the up axis (Y) can only take the world directions of the plane P's matrix makes of the plane
+    // of the child's X and Y axes: of those, it takes the one closest to +Z
+    const x = axisOf(w, 0);
+    const y = axisOf(w, 1);
+    const normal = normalize3([
+      x[1] * y[2] - x[2] * y[1],
+      x[2] * y[0] - x[0] * y[2],
+      x[0] * y[1] - x[1] * y[0],
+    ]);
+    const best = normalize3([-normal[0] * normal[2], -normal[1] * normal[2], 1 - normal[2] * normal[2]]);
+    expect(y[0] * best[0] + y[1] * best[1] + y[2] * best[2]).toBeCloseTo(1, 12);
+    expect(get('Cube').scale).toEqual([0.5, 0.8, -0.6]);
+    expect(objectWrites(doc, () => run('object.look_at', { objects: ['Cube'], point: target }))).toEqual({});
+  });
+
+  it('Drop to Ground with Align to Normal turns the object about its own origin', () => {
+    // a cube at (3, 2, 5) stays above (3, 2); turned about the world origin it landed at (2.36, 1.20)
+    const { doc, run, get } = setup();
+    run('mesh.primitive_plane_add', { size: 20, rotation: [10 * deg, 5 * deg, 0] });
+    run('mesh.primitive_cube_add', { location: [3, 2, 5], rotation: [0.1, 0.2, 0.3] });
+    run('object.drop_to_ground', { objects: ['Cube'], align_to_normal: true });
+    const w = doc.worldMatrix(get('Cube').id);
+    expect(Math.abs(w[12] - 3)).toBeLessThan(1e-12);
+    expect(Math.abs(w[13] - 2)).toBeLessThan(1e-12);
+  });
 });
 
 /** Unit direction of an axis of a matrix. */

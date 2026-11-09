@@ -201,13 +201,13 @@ Results are JSON text, except where noted (images, embedded files). Failures are
 
 ### Projects
 
-| Tool             | Arguments                       | Returns                                                                                          |
-| ---------------- | ------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `list_projects`  | –                               | `projects[]`: `id`, `name`, `created_at`, `updated_at`, `stats`, `peers`, `loaded`, `editor_url` |
-| `create_project` | `name`, `empty` (default false) | `id`, `name`, `editor_url`, `objects[]`                                                          |
-| `get_project`    | `project`                       | Listing fields, `persistence`, `persistence_note`, `stored_at`, `editor_url`, `clients[]`        |
-| `rename_project` | `project`, `name`               | `id`, `name`                                                                                     |
-| `delete_project` | `project`, `confirm: true`      | `deleted` (id)                                                                                   |
+| Tool             | Arguments                       | Returns                                                                                                                                                    |
+| ---------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_projects`  | –                               | `projects[]`: `id`, `name`, `created_at`, `updated_at`, `stats`, `peers`, `loaded`, `deleted_from_storage`, `editor_url`; `storage_listing_failed`, `note` |
+| `create_project` | `name`, `empty` (default false) | `id`, `name`, `editor_url`, `objects[]`                                                                                                                    |
+| `get_project`    | `project`                       | Listing fields, `persistence`, `persistence_note`, `stored_at`, `deleted_from_storage`, `deleted_from_storage_note`, `editor_url`, `clients[]`             |
+| `rename_project` | `project`, `name`               | `id`, `name`                                                                                                                                               |
+| `delete_project` | `project`, `confirm: true`      | `deleted` (id)                                                                                                                                             |
 
 - `project` arguments take a project id or its exact name (a case-insensitive match is tried when
   no exact one exists). Several projects with the same name are an error that lists their ids.
@@ -224,8 +224,29 @@ Results are JSON text, except where noted (images, embedded files). Failures are
   saved and survive restarts) or `memory` (lost when the server stops); `persistence_note`
   explains it, and `stored_at` gives the directory or WebDAV location (not for `memory`).
   `clients` lists who has the project open (`name`, `kind`: human or agent).
-- `delete_project` removes the stored files and disconnects every editor; it cannot be undone. The
-  project's stored renders are no longer downloadable.
+- Another writer can delete a project from storage that this server has open: another server sharing
+  the storage, or a browser that syncs with it (see
+  [storage-and-sync.md](storage-and-sync.md#deleted-projects)). This server finds out when it reads
+  storage: `get_project` checks it before it answers (unless the server read it in the last 2 s; it
+  waits up to 5 s for that check), and a project open in an editor is read once a minute;
+  otherwise a project that only agents use is read only when it is saved. While editors or agents
+  use the project here, this server keeps it open, and the next change made here stores the whole
+  project in storage again; without a change it stays deleted, and the server closes it once nobody
+  uses it. Until then `get_project` has `deleted_from_storage: true` and `deleted_from_storage_note`
+  ("Another writer (a server sharing this storage, or a browser syncing with it) deleted this
+  project from storage after this server had loaded or saved it. …"), and once this server has read
+  storage, its `list_projects` entry has `deleted_from_storage: true`.
+- When listing the projects in storage fails, `list_projects` lists the projects the server has
+  loaded, with `storage_listing_failed: true` and a `note`: "Listing the projects in storage failed
+  (the server logged 'listing projects failed'), so only the projects this server has loaded are
+  listed; projects that are only in storage are missing until a later list_projects lists storage
+  again."
+- `delete_project` removes the stored files and closes the project for every editor and agent that
+  has it open on this server; it cannot be undone. The project's stored renders are no longer
+  downloadable. Editors and agents that have it open on another server sharing the storage stay
+  connected there, and their next change stores the project again (until then `get_project` on that
+  server, which checks storage first, shows `deleted_from_storage: true`); browsers that sync with the same WebDAV storage directly
+  keep their copy, and their next change or Save stores it again too.
 
 ### Inspecting the scene
 
@@ -761,7 +782,7 @@ default every object visible in renders), `apply_modifiers` (default true), `fra
 agent's current frame), `bake_resolution` (glTF/GLB: the size in pixels, 64–4096, of the square
 images procedural textures are baked into, for every bake; default: per mesh, see below).
 
-Exports the scene evaluated at `frame`, on a render thread, so a long export does not hold up the
+Exports the scene evaluated at `frame`, in a render process, so a long export does not hold up the
 server (a glTF export samples every frame of the scene range, which takes seconds for long ranges
 and large scenes). The content is the JSON
 `{format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, elapsed_ms, warnings}`
@@ -816,7 +837,7 @@ What the formats contain:
 
 ### Rendering
 
-Two tools render, on the server's render threads (off the event loop that serves editors and
+Two tools render, in the server's render processes (off the event loop that serves editors and
 agents) or, for `render_image`, in a connected browser editor. `run_operator`, `batch` and
 `edit_mesh` refuse the core render operators `render.render_software` and `render.render_animation`
 (`FAILED`, naming these tools) and the browser editor's `render.render`, which opens its Render
@@ -834,7 +855,7 @@ window (`NOT_FOUND`, as all its UI operators).
   shadows, reflections and mesh lights with `PATHTRACER`.
 - `PATHTRACER`: the CPU path tracer (principled BSDF, soft shadows, global illumination,
   reflections, glass, sky, mist, depth of field, procedural textures, instances, view transforms)
-  for final images. It renders in parallel on all render threads. Lamps are not visible to the
+  for final images. It renders in parallel in all render processes. Lamps are not visible to the
   camera directly (only in reflections); use emissive materials for visible light sources. Light
   passes glass as through a thin sheet (tinted and dimmed, never focused), so lamps inside
   lanterns and bulbs light their surroundings, but glass casts no caustics. It has no volumes,
@@ -857,7 +878,7 @@ is used. `render_image` chooses where to render with `renderer`:
 
 How long the server waits for an editor's image: with `auto`, 15 s for a raster image; with
 `browser`, 55 s for a raster image (an editor without GPU acceleration, software WebGL as in a
-headless browser, can take tens of seconds for a heavy scene) and `time_limit` + 30 s for a path
+headless browser, can take longer than 15 s: see the times below) and `time_limit` + 30 s for a path
 trace (loading, compiling, denoising and the PNG). 55 s is less than the 60 s that MCP clients built
 on the TypeScript SDK wait for a request by default, so the server's error, which says what to do,
 arrives before such a client gives up with "Request timed out"; a path trace that takes longer sends
@@ -877,10 +898,11 @@ answered its last raster image (of the same shading: `SOLID` is judged apart) af
 stopped waiting, or took longer than the 15 s `auto` waits, is not asked by `auto` for 2 minutes
 after that image either, so that `auto` does not wait 15 s in vain for each render of an editor that
 stays that slow: in software WebGL a raster image can take longer than `auto` waits (in a headless
-editor at the default 800×450, the first image of a 71-material scene took 21.9–29.9 s while it
-compiled the materials, and the next ones 3.7–7.4 s; images of 4 million triangles took 4.5–13.3 s).
-A faster answer (`renderer: "browser"`, which waits longer) makes `auto` use the editor again at
-once. The notes and the error of a raster image that timed out (one line each):
+editor at the default 800×450 on a calm machine with 4 CPUs, the first image of a 71-material scene
+took 22.8–23.3 s while it compiled the materials, and the next ones 3.5–4.1 s; images of 4 million
+triangles took 2.1–8.1 s; on a busy machine up to 4.6 times as long). A faster answer
+(`renderer: "browser"`, which waits longer) makes `auto` use the editor again at once. The notes and
+the error of a raster image that timed out (one line each):
 
 ```text
 note:  browser render failed: the editor did not finish the RASTER image within 15 s (renderer 'auto'
@@ -892,10 +914,12 @@ note:  the browser editor answered its last RASTER image after 21 s, when the se
        waiting for it: renderer 'auto' renders on the server and asks that editor again 120 s after
        that image; renderer 'browser' waits up to 55 s
 error: browser render failed: the editor did not finish the RASTER image within 55 s. It may still
-       be drawing it, and its next renders and commands wait until it has. A heavy scene takes tens
-       of seconds in an editor without GPU acceleration (software WebGL, e.g. a headless browser):
-       render on the server with renderer 'software' (or 'auto'), render a smaller image, or pass
-       shading 'SOLID' (grey clay, faster).
+       be drawing it, and its next renders and commands wait until it has. An editor without GPU
+       acceleration (e.g. a headless browser) took 22.8–23.3 s for the first image of a scene with
+       71 materials, as it compiled them, then 3.5–4.1 s, and 2.1–8.1 s for 4 million triangles,
+       measured on a calm machine with 4 CPUs in software WebGL, up to 4.6 times as long on a busy
+       one, and longer for heavier scenes: render on the server with renderer 'software' (or
+       'auto'), render a smaller image, or pass shading 'SOLID' (grey clay, faster).
 ```
 
 A `SOLID` render that times out is not told to use `SOLID`: its error ends with "render on the
@@ -908,31 +932,54 @@ their request timeout on progress keep waiting. The web editor's own Render Imag
 Animation (Ctrl+F12) windows path trace on the same Web Workers. `render_animation` always renders
 on the server.
 
-The server's render threads: `RENDER_WORKERS` (default: CPU cores, at most 8; `0` renders on the
-main thread) plus one thread for raster stills and exports, which never wait for long renders.
-Long renders (path-traced stills and all animations) use every render thread; at most two run at
-once, sharing the threads, and further ones wait their turn. On Linux the render threads run at a
-lower CPU priority (`RENDER_WORKER_NICE`, default 10), so the server keeps answering while they
-work.
+The server renders in render processes of its own
+([architecture.md](architecture.md#server-render-processes)): `RENDER_WORKERS` processes for long
+renders (default: CPU cores, at most 8; `0` renders in the server's own process) plus one for raster
+stills and exports, which never wait for long renders. Long renders (path-traced stills and all
+animations) use every render process; at most two run at once, sharing them, and further ones wait
+their turn. On Linux the render processes run at a lower CPU priority (`RENDER_WORKER_NICE`, default
+10), so the server keeps answering while they work. On a calm machine with 4 CPUs, grey clay
+(`shading: "SOLID"`) at 1280×720 took 1.6–3.1 s for the 71-material example scene (20,042
+triangles), 1.6–2.4 s with a grid of a million triangles added (3.2–3.5 s as the first render after
+the server started, which starts a render process), and 1.7–4.9 s for a grid of 2 million triangles,
+3.0–6.4 s for 4 million and 4.4–8.6 s for 6 million (the first render of a version of the scene,
+which sends it to the render process, took the longer times); a render process then held 1.6 GB for
+2 million triangles, 2.5 GB for 4 million and 3.2 GB for 6 million. With 4 million triangles, right
+after a screenshot had timed out and while the editor still drew it, the same render took 4.0–9.8 s.
+On a busy machine renders took up to 4.6 times as long. Each render process has a JavaScript heap of
+its own (Node's default, 2096 MB on a machine with 16 GB of memory, or `RENDER_WORKER_MEMORY_MB`). A
+render that needs more memory ends only its render process: the call fails with a plain message (no
+JSON and no `code`), and the server keeps running and starts a new render process for the next
+render. With `RENDER_WORKER_MEMORY_MB=256`, a grid of 2 million triangles failed after 2.1–2.7 s:
+"Rendering failed: the render process ran out of memory (its JavaScript heap is limited to 256 MB);
+the server keeps running and starts a new render process for the next render. The scene needs more
+memory than a server render has: render fewer triangles (hide large meshes from renders with
+hide_render, lower the render levels of Subdivision Surface modifiers, fewer particle instances), or
+render in a browser editor that has the project open (renderer 'browser')." The requests of another
+long render that waited behind it in the same render process fail with "Rendering failed: the render
+process ran out of memory while it worked on another render that shared it; this render was not the
+cause: run it again (a new render process serves it)." With `RENDER_WORKERS=0` a render or export
+whose estimated memory does not fit the server's free heap is refused before it starts, with an
+error that says so.
 
 #### `render_image`
 
-| Argument      | Default                             | Meaning                                                                                                                                                                                                                                                              |
-| ------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `width`       | 800                                 | 16–2048 pixels                                                                                                                                                                                                                                                       |
-| `height`      | from the render resolution's aspect | 16–2048 pixels; images path traced on the server may have at most 2,621,440 pixels (2048×1280)                                                                                                                                                                       |
-| `camera`      | the scene camera                    | A camera object (id or name)                                                                                                                                                                                                                                         |
-| `view`        | –                                   | A viewpoint without a camera: `position`, `target`, `up` (default `[0, 0, 1]`), and `fov_degrees` (**vertical** field of view, default 50) or `lens` (mm, as a Blender camera with a 36 mm sensor across the image's longer side: 50 mm ≈ 39.6° across it), not both |
-| `engine`      | the scene's engine                  | `RASTER` or `PATHTRACER`                                                                                                                                                                                                                                             |
-| `samples`     | render settings (64)                | `PATHTRACER`: samples per pixel (1–4096); `RASTER`: anti-aliasing supersampling 1, 2 or 4 (default 2)                                                                                                                                                                |
-| `max_bounces` | render settings (4)                 | `PATHTRACER`: light bounces of any kind (0–64; 0 = direct light only)                                                                                                                                                                                                |
-| `denoise`     | render settings (on)                | `PATHTRACER`: denoise the result                                                                                                                                                                                                                                     |
-| `time_limit`  | 30                                  | `PATHTRACER`: wall-clock seconds (0.1–600); sampling stops when they are used up, after at least one sample per pixel                                                                                                                                                |
-| `seed`        | 0                                   | `PATHTRACER`: noise pattern; the same seed and settings give the same image                                                                                                                                                                                          |
-| `frame`       | the agent's frame                   | Frame to render                                                                                                                                                                                                                                                      |
-| `renderer`    | `auto`                              | See the routing table                                                                                                                                                                                                                                                |
-| `shading`     | materials and lights                | `MATERIAL` or `SOLID` (see [Engines and routing](#engines-and-routing) for browser renders)                                                                                                                                                                          |
-| `client`      | most recently active editor         | Browser editor connection id or client name                                                                                                                                                                                                                          |
+| Argument      | Default                             | Meaning                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `width`       | 800                                 | 16–2048 pixels                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `height`      | from the render resolution's aspect | 16–2048 pixels; images path traced on the server may have at most 2,621,440 pixels (2048×1280)                                                                                                                                                                                                                                                                                                                   |
+| `camera`      | the scene camera                    | A camera object (id or name)                                                                                                                                                                                                                                                                                                                                                                                     |
+| `view`        | –                                   | A viewpoint without a camera: `position`, `target`, `up` (default `[0, 0, 1]`), and `fov_degrees` (**vertical** field of view, default 50) or `lens` (mm, as a Blender camera with a 36 mm sensor across the image's longer side: 50 mm ≈ 39.6° across it), not both                                                                                                                                             |
+| `engine`      | the scene's engine                  | `RASTER` or `PATHTRACER`                                                                                                                                                                                                                                                                                                                                                                                         |
+| `samples`     | render settings (64)                | `PATHTRACER`: samples per pixel (1–4096); `RASTER`: anti-aliasing supersampling 1, 2 or 4 (default 2) of the server's rasterizer; a browser editor ignores it (WebGL: 8 samples, or the GPU's maximum: 4 in software WebGL; where the viewport drew that shading only without multisampling, or has not drawn it while its multisampling is off: 5 pictures averaged when the first took at most 1 s, else SMAA) |
+| `max_bounces` | render settings (4)                 | `PATHTRACER`: light bounces of any kind (0–64; 0 = direct light only)                                                                                                                                                                                                                                                                                                                                            |
+| `denoise`     | render settings (on)                | `PATHTRACER`: denoise the result                                                                                                                                                                                                                                                                                                                                                                                 |
+| `time_limit`  | 30                                  | `PATHTRACER`: wall-clock seconds (0.1–600); sampling stops when they are used up, after at least one sample per pixel                                                                                                                                                                                                                                                                                            |
+| `seed`        | 0                                   | `PATHTRACER`: noise pattern; the same seed and settings give the same image                                                                                                                                                                                                                                                                                                                                      |
+| `frame`       | the agent's frame                   | Frame to render                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `renderer`    | `auto`                              | See the routing table                                                                                                                                                                                                                                                                                                                                                                                            |
+| `shading`     | materials and lights                | `MATERIAL` or `SOLID` (see [Engines and routing](#engines-and-routing) for browser renders)                                                                                                                                                                                                                                                                                                                      |
+| `client`      | most recently active editor         | Browser editor connection id or client name                                                                                                                                                                                                                                                                                                                                                                      |
 
 The horizontal field of view of a landscape image is wider than `fov_degrees`:
 `hfov = 2·atan(tan(fov/2)·width/height)`. Without a camera and a `view`, the server renders an
@@ -965,10 +1012,10 @@ renders add `client` and `connection`; path traced ones `requested_samples`, `ti
 | `columns`                                                        | a roughly square sheet                 | Contact sheet tiles per row                                                                                                                                        |
 | `store`                                                          | false                                  | Keep the files on the server for an hour and return download links                                                                                                 |
 
-Frames render in parallel, one per render thread (`parallelism: "FRAMES"`). When a path-traced
-animation has fewer frames than there are render threads, its frames render one after the other,
-each path traced by all threads (`parallelism: "BANDS"`). Rigid body simulation runs once per
-render and is shared by the threads.
+Frames render in parallel, one per render process (`parallelism: "FRAMES"`). When a path-traced
+animation has fewer frames than there are render processes, its frames render one after the other,
+each path traced by all of them (`parallelism: "BANDS"`). Rigid body simulation runs once per
+render and is shared by the render processes.
 
 **Time budget.** Each path-traced frame gets an equal share of the remaining `time_limit` (capped
 by `frame_time_limit`) and stops sampling when it runs out; frames that cannot start before the
@@ -1086,58 +1133,74 @@ draw (its full-screen passes, such as selection outlines, do not count, nor do f
 shaders or their pipelines or that a screenshot held up), until drawing them takes less than 125 ms;
 a shading (with X-ray on or off) drawn before only with the other sample count is drawn with that
 one. So a screenshot in a shading the editor has drawn (in `SOLID` with the same X-ray setting)
-compiles nothing, unless a material edit needs a shader no material had; it costs a frame of that
-shading at the screenshot's size and work of its own: it waits for the frames the GPU still draws
-for the viewport, prepares the scene for its shading, reads the pixels back and encodes a PNG.
-Without GPU acceleration (software WebGL, as in a headless browser) the first time takes tens of
-seconds for a heavy scene, and compiling one shader seconds, more for a material with procedural
-textures.
+compiles no material shaders, unless a material edit needs a shader no material had; only the first
+screenshot after the editor opened the project links two programs of its own (the pass that draws
+the picture and its copy, which the editor keeps; a browser render before it links them too). A
+screenshot costs a frame of its own shading, not of the viewport's, at its size, and work of its
+own: it waits for the frames the GPU still draws for the viewport, prepares the scene for its
+shading (in `RENDERED` with shadows it draws the shadow maps of point and spot lights again), draws
+into render targets of its size, reads the pixels back and encodes a PNG; the viewport then prepares
+the scene for its own shading again and draws its next frame at its usual cost. Without GPU
+acceleration (software WebGL, as in a headless browser) the first time takes tens of seconds for a
+heavy scene, and compiling one shader seconds, more for a material with procedural textures.
 
-Measured in such an editor (headless Chromium with SwiftShader, a scene of 81 objects and 71
-materials, 1280×720 screenshots, each case in two or more runs at load averages from 0.4 to 6.7 on 4
-CPUs; the times vary with the machine's load), with the viewport in `SOLID`: the first `MATERIAL` or
-`RENDERED` screenshot took 18.8–27.0 s, also when the other had been drawn before, and the next ones
-0.9–1.4 s; `SOLID` and `WIREFRAME` screenshots took 0.5–1.0 s, and `render_image` with
-`shading: "SOLID"` (grey clay; rendered on the server, as the scene's render engine was
-`PATHTRACER`) 1.7–3.6 s. Switching the viewport to `MATERIAL` or `RENDERED` the first time took
-18.5–30.6 s until its first frame was drawn; screenshots in its shading then took 0.9–2.9 s, the
-first one in the other of the two 18.8–25.8 s and the next ones 1.3–2.8 s, and `SOLID` or
-`WIREFRAME` ones 0.9–2.0 s. After roughness edits of the table, the dowels, the floor, the glass
-marble and two plastics, the next screenshots in both shadings took 0.8–3.8 s, in either order and
-with the viewport in any shading, and no shader was compiled. After edits that needed a new shader
-(coat or sheen turned on for a plastic, a `NOISE` or `VORONOI` texture on a channel that no material
-had textured), the viewport in `MATERIAL` or `RENDERED` had drawn the change 0.6–4.5 s after the
-edit, and the first screenshot in the other of the two took 1.4–3.8 s; with the viewport in `SOLID`,
-the first screenshot in each of the two took 1.0–3.8 s. Turning sheen on took 10.8–12.9 s in each of
-the two shadings for the table's material, whose colour, roughness and bump are `BRICK` and `WAVE`
-textures, 8.3–11.4 s for the dowels' (`WOOD` on colour and bump) and 2.1–3.2 s for the floor's
-(`BRICK` on its colour). A screenshot waits until the frame the viewport is drawing is done, also a
-`SOLID` or `WIREFRAME` one, so one sent while the viewport draws such a change or its first frame in
-a shading takes up to that frame's time longer. X-ray changes nothing in `MATERIAL` or `RENDERED`
-shading outside Edit Mode: the viewport's next frame took 0.4–1.7 s, and no shader was compiled.
-With a grid of a million triangles added to the scene, the viewport drew without multisampling from
-the start: its first `MATERIAL` or `RENDERED` frame took 12.3–14.8 s, and the next two screenshots
-in that shading 1.2–3.3 s; after a 2600×1700 viewport had turned multisampling off, its first
-`MATERIAL` frame back at 1400×860 took 12.0–15.3 s and the next two screenshots 0.4–1.3 s. A scene
-of millions of triangles takes seconds per frame in any shading: with 4 million triangles and the
-viewport in `SOLID` (without multisampling), a screenshot without `shading` or with
-`shading: "SOLID"` took 3.3–5.2 s, a `WIREFRAME` one 4.1–11.9 s, and the first `MATERIAL` and
-`RENDERED` ones 5.5–8.0 s (3.3–6.0 s later). The other commands draw nothing themselves, but wait
-while the editor's main thread is busy: for 4.0–6.2 s after the viewport switched to `MATERIAL` or
-`RENDERED` for the first time (while it builds the scene's materials; the rest of that frame holds
-up only screenshots), for the whole of a screenshot it draws, and with 4 million triangles for each
-frame it draws (a `select` took 2.5–3.8 s there, and a `get_view` sent during a `select` or a
-screenshot waited until it was done: up to 6.4 s). An editor that was not busy answered a `get_view`
-in milliseconds.
+Measured in such an editor: headless Chromium with SwiftShader on a machine with 4 CPUs and no other
+work (each run started once the CPUs had been at least 90 % idle for 5 s; the editor itself keeps
+every CPU busy while it compiles or draws), a scene of 81 objects and 71 materials, each case in two
+or more runs. On the same machine kept busy by other processes (1-minute load averages of 6–20 on
+its 4 CPUs), the same steps took up to 4.6 times as long as the upper end of the ranges below. With
+the viewport at 1067×631 (a page of 1400×860) and 4× multisampling, its frames took 0.19–0.29 s in
+`SOLID` and 0.42–0.67 s in `RENDERED`; in the editor, from its start of a screenshot to the PNG, a
+`SOLID` screenshot took 0.37–0.57 s at the viewport's size and 0.49–0.63 s at 1280×720 with the
+viewport in either shading, and a `RENDERED` one 0.60–0.72 s and 0.80–1.03 s with the viewport in
+`RENDERED`, 0.61–0.74 s and 0.81–1.02 s with the viewport in `SOLID`; the MCP round trip added
+30–100 ms, and the viewport had drawn its next frame 0.17–0.27 s (`SOLID`) or 0.39–0.64 s
+(`RENDERED`) after the screenshot's answer.
+
+With 1280×720 screenshots and the viewport in `SOLID`: the first `MATERIAL` or `RENDERED` screenshot
+took 18.7–22.5 s, also when the other had been drawn before, and the next ones 1.0–1.4 s; `SOLID`
+and `WIREFRAME` screenshots took 0.6–0.9 s, and `render_image` with `shading: "SOLID"` (grey clay;
+rendered on the server, as the scene's render engine was `PATHTRACER`) 1.6–3.1 s. Switching the
+viewport to `MATERIAL` or `RENDERED` the first time took 18.9–25.4 s until its first frame was
+drawn; screenshots in its shading then took 0.9–1.6 s, the first one in the other of the two
+18.6–22.7 s and the next ones 1.4–2.1 s, and `SOLID` or `WIREFRAME` ones 0.9–1.2 s (each sent when
+the screenshot before it had answered, so it waited for the viewport's next frame first). After
+roughness edits of the table, the dowels, the floor, the glass marble and two plastics, the next
+screenshots in both shadings took 0.8–3.1 s, in either order and with the viewport in any shading,
+and no shader was compiled. After edits that needed a new shader (coat or sheen turned on for a
+plastic, a `NOISE` or `VORONOI` texture on a channel that no material had textured), the viewport in
+`MATERIAL` or `RENDERED` had drawn the change 0.9–2.6 s after the edit, and the first screenshot in
+the other of the two took 1.4–2.7 s; with the viewport in `SOLID`, the first screenshot in each of
+the two took 1.1–3.1 s. Turning sheen on took 10.8–11.7 s in each of the two shadings for the
+table's material, whose colour, roughness and bump are `BRICK` and `WAVE` textures, 8.4–9.8 s for
+the dowels' (`WOOD` on colour and bump) and 2.2–2.8 s for the floor's (`BRICK` on its colour). A
+screenshot waits until the frame the viewport is drawing is done, also a `SOLID` or `WIREFRAME` one,
+so one sent while the viewport draws such a change or its first frame in a shading takes up to that
+frame's time longer. X-ray changes nothing in `MATERIAL` or `RENDERED` shading outside Edit Mode:
+the viewport's next frame took 0.4–1.0 s, and no shader was compiled. With a grid of a million
+triangles added to the scene, the viewport drew without multisampling from the start: its first
+`MATERIAL` or `RENDERED` frame took 11.9–13.3 s, and the next two screenshots in that shading
+1.2–2.6 s; after a 2600×1700 viewport had turned multisampling off, its first `MATERIAL` frame back
+at 1400×860 took 11.8–12.8 s and the next two screenshots 0.5–0.8 s. A scene of millions of
+triangles takes seconds per frame in any shading: with 4 million triangles and the viewport in
+`SOLID` (without multisampling), a screenshot without `shading` or with `shading: "SOLID"` took
+3.4–4.4 s, a `WIREFRAME` one 4.2–10.5 s, and the first `MATERIAL` and `RENDERED` ones 5.8–6.1 s
+(3.4–4.8 s later). The other commands draw nothing themselves, but wait while the editor's main
+thread is busy: for 4.0–4.7 s after the viewport switched to `MATERIAL` or `RENDERED` for the first
+time (while it builds the scene's materials; the rest of that frame holds up only screenshots), for
+the whole of a screenshot it draws, and with 4 million triangles for each frame it draws: a `select`
+took 2.6–3.6 s there, and a `get_view` sent during a `select` or a screenshot waited until it was
+done and the viewport had drawn its next frame, up to 8.6 s (one sent 0.1 s after a `select` had
+answered still waited 6.1 s). An editor that was not busy answered a `get_view` in milliseconds.
 
 The editor finishes a command the server stopped waiting for, and keeps what a screenshot compiled:
-a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 17.7–20.9 s later
-(the rest of the first one, then a screenshot that compiled nothing), and the next one in 1.0–1.7 s.
+a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered 18.8–20.8 s later
+(the rest of the first one, then a screenshot that compiled nothing), and the next one in 1.0–1.2 s.
 With the default `timeout_ms` a first `MATERIAL` screenshot and its first retry timed out, and the
-second retry answered in 2.1–6.3 s. After an edit that needed a new shader, `RENDERED` and
-`MATERIAL` screenshots with `timeout_ms: 1000` timed out, and their retries answered in 1.0–3.0 s;
+second retry answered in 2.4–5.0 s. After an edit that needed a new shader, `RENDERED` and
+`MATERIAL` screenshots with `timeout_ms: 1000` timed out, and their retries answered in 0.8–2.5 s;
 after sheen was turned on for the table's or the dowels' material, the first screenshot in a shading
-with the default `timeout_ms` timed out, and its retry answered in 0.8–1.4 s. When the editor does
+with the default `timeout_ms` timed out, and its retry answered in 0.8–1.0 s. When the editor does
 not answer in time the error says so and what to do (one line each):
 
 ```text
@@ -1145,43 +1208,53 @@ editor_command 'screenshot' failed: the editor did not answer within timeout_ms 
 55000); it may still carry the command out, and its next commands and renders wait until it has. The
 screenshot is drawn in the viewport's shading, like a frame of the viewport. An editor without GPU
 acceleration (software WebGL, e.g. a headless browser) takes seconds for that with a scene of
-millions of triangles in any shading (3.3–5.2 s in SOLID with 4 million) and with a heavy scene in
+millions of triangles in any shading (3.4–4.4 s in SOLID with 4 million) and with a heavy scene in
 MATERIAL or RENDERED shading, and tens of seconds for its first screenshot or frame in one of these
 two after it opened the project, while it builds and compiles the scene's materials for that
 shading. After a material edit that needs a shader no material had (coat or sheen turned on, a
 procedural texture on a set of channels that no other material has), its next screenshot or frame in
-each of these two compiles it (0.6–4.5 s, or up to 12.9 s for a material with several procedural
-textures). The times given were measured in software WebGL and vary with the machine's load. It
-keeps what it compiled, so a retry waits for the editor to finish and compiles nothing again. Retry
-with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot (grey clay,
-much faster); for a quick look use render_image with shading 'SOLID', and render_image for final
-images.
+each of these two compiles it (0.9–3.1 s, or up to 11.7 s for a material with several procedural
+textures). It keeps what it compiled, so a retry waits for the editor to finish and compiles nothing
+again. Retry with a larger timeout_ms (at most 55000), or pass shading 'SOLID' for the screenshot
+(grey clay, much faster); for a quick look use render_image with shading 'SOLID' (grey clay: while
+the editor is busy, as right after this timeout, and when the scene's render engine is PATHTRACER,
+it renders on the server: 1.7–6.0 s for 2 million triangles, 3.0–9.8 s for 4 or 6 million; a scene
+that needs more memory than a server render has fails with 'Rendering failed: the render process ran
+out of memory …', and then retry the screenshot with a larger timeout_ms), and render_image for
+final images. The times given were measured on a calm machine with 4 CPUs, the editor in software
+WebGL; on a busy one (load averages of 6–20) they took up to 4.6 times as long.
 
 editor_command 'select' failed: the editor did not answer within timeout_ms = 10000 ms (at most
 55000); it may still carry the command out, and its next commands and renders wait until it has.
 'select' waits while the editor draws its viewport. An editor without GPU acceleration (software
-WebGL, e.g. a headless browser) takes seconds per frame for a scene with millions of triangles, and
-seconds for its first frame of a heavy scene in MATERIAL or RENDERED shading, while it builds and
-compiles the scene's materials. Pass a larger timeout_ms (at most 55000), or switch the viewport to
-SOLID shading (editor_command view.shading {shading: 'SOLID'}), which draws much faster.
+WebGL, e.g. a headless browser) takes seconds per frame for a scene with millions of triangles, in
+any shading (a select took 2.6–3.6 s with 4 million in SOLID shading), and seconds for its first
+frame of a heavy scene in MATERIAL or RENDERED shading, while it builds and compiles the scene's
+materials. Pass a larger timeout_ms (at most 55000), or, if the viewport is not in SOLID shading,
+switch it to SOLID (editor_command view.shading {shading: 'SOLID'}), which draws much faster. The
+times given were measured on a calm machine with 4 CPUs, the editor in software WebGL; on a busy one
+(load averages of 6–20) they took up to 4.6 times as long.
 ```
 
 A screenshot with `shading` `MATERIAL` or `RENDERED` says the same about that shading; one with
 `shading` `SOLID` or `WIREFRAME` says that a scene with millions of triangles takes seconds even
 then, that a screenshot waits until the frame its viewport is drawing is done, which in `MATERIAL`
 or `RENDERED` shading compiles shaders the first time after the editor opened the project and after
-a material edit that needs a shader no material had (0.6–4.5 s, or up to 12.9 s for a material with
-several procedural textures; the times given were measured in software WebGL and vary with the
-machine's load), and that a retry then compiles nothing again, and advises a retry with a larger
-`timeout_ms` or `render_image` with `shading: "SOLID"` and `renderer: "software"` (grey clay,
-rendered on the server without the editor, which can run out of memory for millions of triangles:
-that render took 2.2–2.5 s with a grid of a million triangles added to the scene, and ran out of
-memory after 17.4–21.4 s with a grid of 2 million triangles). At the maximum the advice starts with
-"With timeout_ms at its maximum (55000), …" instead of a larger `timeout_ms`. When the editor was
-still busy with an earlier request that the server had stopped waiting for (a screenshot or render
-that timed out), the error names it after the first sentence ("It was still busy with an earlier
-request that the server had stopped waiting for (editor_command 'screenshot' sent 12 s ago).").
-While the tool waits, it sends a progress notification every 5 s to requests with a progress token.
+a material edit that needs a shader no material had (0.9–3.1 s, or up to 11.7 s for a material with
+several procedural textures), and that a retry then compiles nothing again, and advises a retry with
+a larger `timeout_ms` or `render_image` with `shading: "SOLID"` and `renderer: "software"` (grey
+clay, rendered on the server without the editor: 1.7–6.0 s for 2 million triangles, 3.0–9.8 s for 4
+or 6 million; a scene that needs more memory than a server render has fails with "Rendering failed:
+the render process ran out of memory …", see [Engines and routing](#engines-and-routing), and then
+the screenshot with a larger `timeout_ms` is what is left). At the maximum the advice starts with
+"With timeout_ms at its maximum (55000), …" instead of a larger `timeout_ms`, and for a scene that a
+server render cannot hold it advises a retry of the screenshot. The server cannot tell the
+viewport's shading, so the other commands advise switching it to `SOLID` only "if the viewport is
+not in SOLID shading". When the editor was still busy with an earlier request that the server had
+stopped waiting for (a screenshot or render that timed out), the error names it after the first
+sentence ("It was still busy with an earlier request that the server had stopped waiting for
+(editor_command 'screenshot' sent 12 s ago)."). While the tool waits, it sends a progress
+notification every 5 s to requests with a progress token.
 
 ### Resources
 
@@ -1200,40 +1273,41 @@ the tool arguments (`Input validation error: …`, checked before any tool runs)
 the other tools are plain messages. A message never spans lines: line breaks in the names it
 quotes are written as `\n`, `\r` or `\u2028`, as in JSON.
 
-| Message (abridged)                                                                                                                                                                    | Cause                                                                                                                                                                                                                                                                               |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MCP error -32602: Input validation error: Invalid arguments for tool get_object: Invalid input: expected number, received string at frame`                                           | A tool argument of the wrong type or out of range (e.g. `time_limit` above 600)                                                                                                                                                                                                     |
-| `… Invalid arguments for tool set_scene_settings: unknown argument 'sampels' (did you mean 'samples'?). Valid arguments: …`                                                           | A misspelled or unknown tool argument                                                                                                                                                                                                                                               |
-| `… Invalid arguments for tool render_image: unknown key 'fov' (did you mean 'lens' or 'fov_degrees'?) (valid keys: …) at view`                                                        | A misspelled key inside a nested tool argument (`view`, `selection`, batch `operations`)                                                                                                                                                                                            |
-| `… unknown argument 'name'. Valid arguments: project, operator, params, selection. Operator parameters go inside …`                                                                   | Operator parameters given as tool arguments                                                                                                                                                                                                                                         |
-| `Invalid parameters for mesh.primitive_cylinder_add: unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                                                        | A misspelled or unsupported operator parameter (also nested, e.g. in curve points)                                                                                                                                                                                                  |
-| `Invalid parameters for object.shade_smooth: unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …`                                     | A selection-based operator: pass `selection`                                                                                                                                                                                                                                        |
-| `Invalid parameters for object.drop_to_ground: surface: Invalid input: expected array, received string`                                                                               | A value of the wrong type or out of range                                                                                                                                                                                                                                           |
-| `mesh.subdivide failed: Operator requires Edit Mode`                                                                                                                                  | The operator's preconditions (mode, selection, object type) are not met; use `edit_mesh` for `mesh.*`                                                                                                                                                                               |
-| `Unknown operator 'mesh.primitive_cylindr_add'. Did you mean: …`                                                                                                                      | A misspelled or incomplete operator id (its completions first), letter case ignored; browser UI operators among the suggestions are named as such (`NOT_FOUND`)                                                                                                                     |
-| `'view3d.view_all' is an operator of the browser editor's user interface … Run it there with editor_command {project, command: 'run_operator', …}`                                    | An operator of the browser editor's UI through `run_operator` / `batch` / `edit_mesh` (`NOT_FOUND`); some name the tool or operator to use instead                                                                                                                                  |
-| `'render.render_software' would render on the server's main thread … Use the render_image tool instead`                                                                               | `render.render_software` or `render.render_animation` through `run_operator` / `batch` / `edit_mesh` (`FAILED`)                                                                                                                                                                     |
-| `Object 'Nope' not found in project 'P'. Objects: …`                                                                                                                                  | A wrong object reference (the message lists up to 40 names; `NOT_FOUND`)                                                                                                                                                                                                            |
-| `Project 'X' not found. Known projects: …` / `Several projects are named 'X': … Pass the project id instead.`                                                                         | A wrong or ambiguous project reference                                                                                                                                                                                                                                              |
-| `A project named 'Lighthouse' already exists (id …). … Project names are unique because tools find projects by name …`                                                                | `create_project` / `rename_project` with a name another project has (letter case ignored)                                                                                                                                                                                           |
-| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                                                                                                     | An element selection without `mode: "EDIT"` (`POLL_FAILED`)                                                                                                                                                                                                                         |
-| `Edit mode needs an active mesh object (selection.active): 'Camera' is a CAMERA object.`                                                                                              | `mode: "EDIT"` in a `selection` without an active mesh object (`POLL_FAILED`)                                                                                                                                                                                                       |
-| `face index 99 out of range (mesh has 6 faces)`                                                                                                                                       | An element index of a `selection` (`run_operator`, `edit_mesh`) that the base mesh does not have                                                                                                                                                                                    |
-| `edge [0, 3]: vertices 0 and 3 are not connected by an edge of the mesh: an edge joins two vertices that follow each other in one of the faces …`                                     | An edge of a `selection` that the base mesh does not have (`POLL_FAILED`): edges join neighbours in a face of `get_mesh_data`, or are its `loose_edges`                                                                                                                             |
-| `select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: …` / `all: true selects every element, so the listed faces would change nothing: …`          | Element lists that a `selection` would ignore (`POLL_FAILED`): `select_mode` `EDGE` selects only `edges`, `FACE` only `faces`; `all: true` selects everything (both together: one message); every remedy named is accepted as it is                                                 |
-| `'Camera' is not a mesh object.`                                                                                                                                                      | `edit_mesh` on an object that is not a mesh (`POLL_FAILED`)                                                                                                                                                                                                                         |
-| `'show_render' is not a parameter of the BEVEL modifier. Its visibility (show_render) is set after adding it, with update_modifier …`                                                 | A modifier setting given inside `params` instead of as a tool argument                                                                                                                                                                                                              |
-| `Unknown parameter 'veiw' (did you mean 'view'?) for the editor command view.set_view. Its parameters: …`                                                                             | A misspelled `editor_command` command or parameter (refused before anything is sent)                                                                                                                                                                                                |
-| `screenshot: 'shading' must be WIREFRAME, SOLID, MATERIAL or RENDERED, letter case ignored (got "SOILD"; did you mean 'SOLID'?).`                                                     | An invalid `screenshot` value (`width` and `height` too; refused before anything is sent)                                                                                                                                                                                           |
-| `editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000); …`                                                                       | The editor needed longer: retry with a larger `timeout_ms` (the editor keeps the materials it compiled) or take the screenshot with `shading: "SOLID"`; a quick look: `render_image {shading: "SOLID"}`; final images: `render_image`                                               |
-| `editor_command 'run_operator' got no answer for wm.read_homefile, as expected: …` / `editor_command '…' failed: the editor's connection to this project closed before it answered …` | The editor left the project before it answered: `wm.read_homefile` switched it to a new project; otherwise its page was closed or reloaded, it opened another project or lost its connection, or the server closed the project (whether it carried the command out is then unknown) |
-| `browser render failed: the editor did not finish the RASTER image within 55 s. …`                                                                                                    | `render_image` with `renderer: "browser"` on a heavy scene: render on the server, smaller or `SOLID`                                                                                                                                                                                |
-| `'dimensions' is not animatable on object. Animatable: …`                                                                                                                             | `insert_keyframe` on a property that cannot be keyed                                                                                                                                                                                                                                |
-| `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" (it is empty).`                                                                           | `insert_keyframe` on a path that does not resolve                                                                                                                                                                                                                                   |
-| `A path traced image of 2048×2048 is too large (at most 2621440 pixels, e.g. 2048×1280): render smaller`                                                                              | Render limits                                                                                                                                                                                                                                                                       |
-| `Too many frames (5000, at most 1000): shorten the range or raise frame_step.`                                                                                                        | `render_animation` limits                                                                                                                                                                                                                                                           |
-| `Rendering was cancelled.`                                                                                                                                                            | The request was cancelled or the client disconnected                                                                                                                                                                                                                                |
-| `<tool> failed: <message>`                                                                                                                                                            | An unexpected server error (also logged)                                                                                                                                                                                                                                            |
+| Message (abridged)                                                                                                                                                                    | Cause                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MCP error -32602: Input validation error: Invalid arguments for tool get_object: Invalid input: expected number, received string at frame`                                           | A tool argument of the wrong type or out of range (e.g. `time_limit` above 600)                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `… Invalid arguments for tool set_scene_settings: unknown argument 'sampels' (did you mean 'samples'?). Valid arguments: …`                                                           | A misspelled or unknown tool argument                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `… Invalid arguments for tool render_image: unknown key 'fov' (did you mean 'lens' or 'fov_degrees'?) (valid keys: …) at view`                                                        | A misspelled key inside a nested tool argument (`view`, `selection`, batch `operations`)                                                                                                                                                                                                                                                                                                                                                                                              |
+| `… unknown argument 'name'. Valid arguments: project, operator, params, selection. Operator parameters go inside …`                                                                   | Operator parameters given as tool arguments                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `Invalid parameters for mesh.primitive_cylinder_add: unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                                                        | A misspelled or unsupported operator parameter (also nested, e.g. in curve points)                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `Invalid parameters for object.shade_smooth: unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …`                                     | A selection-based operator: pass `selection`                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `Invalid parameters for object.drop_to_ground: surface: Invalid input: expected array, received string`                                                                               | A value of the wrong type or out of range                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `mesh.subdivide failed: Operator requires Edit Mode`                                                                                                                                  | The operator's preconditions (mode, selection, object type) are not met; use `edit_mesh` for `mesh.*`                                                                                                                                                                                                                                                                                                                                                                                 |
+| `Unknown operator 'mesh.primitive_cylindr_add'. Did you mean: …`                                                                                                                      | A misspelled or incomplete operator id (its completions first), letter case ignored; browser UI operators among the suggestions are named as such (`NOT_FOUND`)                                                                                                                                                                                                                                                                                                                       |
+| `'view3d.view_all' is an operator of the browser editor's user interface … Run it there with editor_command {project, command: 'run_operator', …}`                                    | An operator of the browser editor's UI through `run_operator` / `batch` / `edit_mesh` (`NOT_FOUND`); some name the tool or operator to use instead                                                                                                                                                                                                                                                                                                                                    |
+| `'render.render_software' would render on the server's main thread … Use the render_image tool instead`                                                                               | `render.render_software` or `render.render_animation` through `run_operator` / `batch` / `edit_mesh` (`FAILED`)                                                                                                                                                                                                                                                                                                                                                                       |
+| `Object 'Nope' not found in project 'P'. Objects: …`                                                                                                                                  | A wrong object reference (the message lists up to 40 names; `NOT_FOUND`)                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `Project 'X' not found. Known projects: …` / `Several projects are named 'X': … Pass the project id instead.`                                                                         | A wrong or ambiguous project reference                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `A project named 'Lighthouse' already exists (id …). … Project names are unique because tools find projects by name …`                                                                | `create_project` / `rename_project` with a name another project has (letter case ignored)                                                                                                                                                                                                                                                                                                                                                                                             |
+| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                                                                                                     | An element selection without `mode: "EDIT"` (`POLL_FAILED`)                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `Edit mode needs an active mesh object (selection.active): 'Camera' is a CAMERA object.`                                                                                              | `mode: "EDIT"` in a `selection` without an active mesh object (`POLL_FAILED`)                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `face index 99 out of range (mesh has 6 faces)`                                                                                                                                       | An element index of a `selection` (`run_operator`, `edit_mesh`) that the base mesh does not have                                                                                                                                                                                                                                                                                                                                                                                      |
+| `edge [0, 3]: vertices 0 and 3 are not connected by an edge of the mesh: an edge joins two vertices that follow each other in one of the faces …`                                     | An edge of a `selection` that the base mesh does not have (`POLL_FAILED`): edges join neighbours in a face of `get_mesh_data`, or are its `loose_edges`                                                                                                                                                                                                                                                                                                                               |
+| `select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: …` / `all: true selects every element, so the listed faces would change nothing: …`          | Element lists that a `selection` would ignore (`POLL_FAILED`): `select_mode` `EDGE` selects only `edges`, `FACE` only `faces`; `all: true` selects everything (both together: one message); every remedy named is accepted as it is                                                                                                                                                                                                                                                   |
+| `'Camera' is not a mesh object.`                                                                                                                                                      | `edit_mesh` on an object that is not a mesh (`POLL_FAILED`)                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `'show_render' is not a parameter of the BEVEL modifier. Its visibility (show_render) is set after adding it, with update_modifier …`                                                 | A modifier setting given inside `params` instead of as a tool argument                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `Unknown parameter 'veiw' (did you mean 'view'?) for the editor command view.set_view. Its parameters: …`                                                                             | A misspelled `editor_command` command or parameter (refused before anything is sent)                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `screenshot: 'shading' must be WIREFRAME, SOLID, MATERIAL or RENDERED, letter case ignored (got "SOILD"; did you mean 'SOLID'?).`                                                     | An invalid `screenshot` value (`width` and `height` too; refused before anything is sent)                                                                                                                                                                                                                                                                                                                                                                                             |
+| `editor_command 'screenshot' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000); …`                                                                       | The editor needed longer: retry with a larger `timeout_ms` (the editor keeps the materials it compiled) or take the screenshot with `shading: "SOLID"`; a quick look: `render_image {shading: "SOLID"}` (on the server while the editor is busy and for a `PATHTRACER` scene; a scene too large for a server render needs the screenshot again); final images: `render_image`                                                                                                         |
+| `editor_command 'run_operator' got no answer for wm.read_homefile, as expected: …` / `editor_command '…' failed: the editor's connection to this project closed before it answered …` | The editor left the project before it answered: `wm.read_homefile` switched it to a new project; otherwise its page was closed or reloaded, it opened another project or lost its connection, or the server closed the project (whether it carried the command out is then unknown)                                                                                                                                                                                                   |
+| `browser render failed: the editor did not finish the RASTER image within 55 s. …`                                                                                                    | `render_image` with `renderer: "browser"` on a heavy scene: render on the server, smaller or `SOLID`                                                                                                                                                                                                                                                                                                                                                                                  |
+| `Rendering failed: the render process ran out of memory (its JavaScript heap is limited to … MB); the server keeps running …`                                                         | A server render (`render_image`, `render_animation`) needed more memory than its render process has (a plain message without a `code`): render fewer triangles or in a browser editor (`renderer: "browser"`); after a screenshot that timed out, retry it with a larger `timeout_ms`; `export_scene` says `Export failed: …`; a render that only waited in the same process says `… while it worked on another render that shared it; this render was not the cause: run it again …` |
+| `'dimensions' is not animatable on object. Animatable: …`                                                                                                                             | `insert_keyframe` on a property that cannot be keyed                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" (it is empty).`                                                                           | `insert_keyframe` on a path that does not resolve                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `A path traced image of 2048×2048 is too large (at most 2621440 pixels, e.g. 2048×1280): render smaller`                                                                              | Render limits                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `Too many frames (5000, at most 1000): shorten the range or raise frame_step.`                                                                                                        | `render_animation` limits                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `Rendering was cancelled.`                                                                                                                                                            | The request was cancelled or the client disconnected                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `<tool> failed: <message>`                                                                                                                                                            | An unexpected server error (also logged)                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 The `code` of `run_operator`, `edit_mesh` and `batch` failures is one of the kinds of the core
 operator registry, decided by the kind of error, never by the wording of its message:
@@ -1279,7 +1353,7 @@ driver) and the `problems` list of `get_scene`.
 | `render_image`                             | 16–2048 per side; path tracing on the server at most 2,621,440 pixels; `time_limit` up to 600 s (default 30)                                                                       |
 | Browser renders                            | Raster: 55 s with `renderer: "browser"`, 15 s with `auto` (then the server renders); path tracing: `time_limit` + 30 s                                                             |
 | `render_animation`                         | 1000 frames, 2048 px per side, `time_limit` up to 600 s (default 60); GIFs and contact sheets at most 33,554,432 pixels over all frames; a contact sheet at most 16,777,216 pixels |
-| Concurrent long renders                    | 2 path-traced stills or animations at once (more wait their turn; raster stills have a thread of their own)                                                                        |
+| Concurrent long renders                    | 2 path-traced stills or animations at once (more wait their turn; raster stills have a render process of their own)                                                                |
 | Embedded files                             | 20 MiB (`export_scene`, `render_animation`); larger animations are stored and linked                                                                                               |
 | Stored renders                             | 1 hour, 256 MiB in all (oldest dropped first); kept in memory                                                                                                                      |
 | `import_model`                             | 50 MB; URL downloads time out after 60 s                                                                                                                                           |
@@ -1309,7 +1383,7 @@ ids or names; default every object visible in renders; an unknown one is a 400 e
 `apply_modifiers` (`true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`; default true), `frame`
 (default: the scene's `frame_start`) and `bake_resolution` (glTF: 64–4096 px for every procedural
 texture bake; default per mesh, as for `export_scene`), and answers with the file as an attachment
-and the header `x-export-time-ms`. It exports on a render thread; 499 when the client went away,
+and the header `x-export-time-ms`. It exports in a render process; 499 when the client went away,
 503 when the server stopped the export. The `download_url` of `export_scene` uses these
 parameters.
 

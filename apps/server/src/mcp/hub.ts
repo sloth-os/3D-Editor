@@ -256,7 +256,7 @@ export class McpHub {
     this.track(session, reply);
     // A POST's responses go out on its own response stream; without an event store (no stream
     // resumption) they can never be delivered once the client is gone (agent killed, connection
-    // dropped). Cancel those requests then, so a render does not hold render threads until its
+    // dropped). Cancel those requests then, so a render does not hold render processes until its
     // time limit for nobody.
     const ids = requestIds(body);
     if (ids.length)

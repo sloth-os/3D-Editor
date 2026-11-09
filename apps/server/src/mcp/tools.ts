@@ -99,7 +99,21 @@ import {
   editorCommandList,
   editorTimeoutMessage,
 } from './editor-commands';
-import { NEW_SHADER_SECONDS, measured } from './editor-costs';
+import {
+  BROWSER_RASTER_SECONDS,
+  NEW_SHADER_SECONDS,
+  SERVER_SOLID_SECONDS,
+  measured,
+  measuredOnServer,
+} from './editor-costs';
+import {
+  DELETED_ELSEWHERE_NOTE,
+  LIST_FAILED_NOTE,
+  PROJECT_READ_MAX_AGE_MS,
+  PROJECT_READ_WAIT_MS,
+  listProjects,
+  readBeforeAnswer,
+} from './project-storage';
 import { isCancelled, type AnimationOutput, type FrameOptions, type Renderer } from '../render';
 import type { RenderStore, StoredFile } from '../render/store';
 import {
@@ -133,7 +147,7 @@ export interface ToolContext {
   config: ServerConfig;
   metrics: ServerMetrics;
   log: Log;
-  /** Server-side renderer (render threads). */
+  /** Server-side renderer (render processes). */
   renderer: Renderer;
   /** Stored render results (render_animation `store`). */
   renderStore: RenderStore;
@@ -654,12 +668,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'List projects',
       description:
-        'List all projects on this server (persisted and currently open) with id, name, timestamps, statistics (objects, vertices, faces) and the number of connected editors (peers).',
+        'List all projects on this server (persisted and currently open) with id, name, timestamps, statistics (objects, vertices, faces) and the number of connected editors (peers). A loaded project whose last read of storage found that another writer had deleted it has deleted_from_storage: true (get_project checks storage before it answers, and says what that means). When listing the projects in storage fails, only the projects this server has loaded are listed, with storage_listing_failed: true and a note that says so.',
       annotations: READ_ONLY,
     },
     {},
     async (_args, extra) => {
-      const projects = await rooms.listProjects();
+      // RoomManager.listProjects reports a failed listing of storage only in its log and metric
+      const { projects, failed: listingFailed } = await listProjects(rooms);
       return {
         projects: projects.map((p) => ({
           id: p.id,
@@ -669,8 +684,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           stats: p.stats,
           peers: p.peers,
           loaded: p.live,
+          ...(p.live && rooms.get(p.id)?.deletedFromStorage ? { deleted_from_storage: true } : {}),
           editor_url: editorUrl(extra, p.id),
         })),
+        ...(listingFailed ? { storage_listing_failed: true, note: LIST_FAILED_NOTE } : {}),
       };
     },
   );
@@ -706,20 +723,24 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'get_project',
     {
       title: 'Get project',
-      description:
-        "Project details: name, timestamps, statistics, connected editors and agents, editor URL, and the server's persistence: `persistence` disk | webdav (saved, survives restarts) or memory (lost when the server stops) with an explanation.",
+      description: `Project details: name, timestamps, statistics, connected editors and agents, editor URL, and the server's persistence: \`persistence\` disk | webdav (saved, survives restarts) or memory (lost when the server stops) with an explanation. It checks storage before it answers (unless this server read it in the last ${PROJECT_READ_MAX_AGE_MS / 1000} s; it waits up to ${PROJECT_READ_WAIT_MS / 1000} s for that check): when another writer (a server sharing the storage, or a browser syncing with it) has deleted the project from storage while it is open here, it has deleted_from_storage: true and deleted_from_storage_note: this server keeps it open while editors or agents use it, and the next change made here stores it again.`,
       annotations: READ_ONLY,
     },
     { project: projectArg },
     async ({ project }, extra) => {
       const p = await agent.project(project);
-      const listing = p.room.listing();
       const persistence = rooms.persistence;
+      // a room that agents use reads storage only when it saves (see readBeforeAnswer)
+      await readBeforeAnswer(p.room, persistence.store);
+      const listing = p.room.listing();
       return {
         ...listing,
         persistence: persistence.mode,
         persistence_note: persistenceNote(persistence.mode),
         ...(persistence.mode === 'memory' ? {} : { stored_at: persistence.location }),
+        ...(p.room.deletedFromStorage
+          ? { deleted_from_storage: true, deleted_from_storage_note: DELETED_ELSEWHERE_NOTE }
+          : {}),
         editor_url: editorUrl(extra, p.id),
         clients: p.room.presence().map((e) => ({ name: e.state.user?.name ?? 'unknown', kind: e.kind })),
       };
@@ -753,7 +774,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Delete project',
       description:
-        'Permanently delete a project: disconnects every open editor and deletes its stored files. This cannot be undone. Requires confirm=true.',
+        'Permanently delete a project: deletes its stored files and closes it for every editor and agent that has it open on this server. This cannot be undone. Editors and agents that have it open on another server sharing the storage stay connected there, and their next change stores the project again (until then get_project on that server, which checks storage first, shows deleted_from_storage: true); browsers that sync with the same WebDAV storage directly keep their copy, and their next change or Save stores it again too. Requires confirm=true.',
       annotations: DESTRUCTIVE,
     },
     { project: projectArg, confirm: z.literal(true).describe('Must be true to confirm the deletion') },
@@ -2302,7 +2323,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Export scene',
       description:
-        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at a frame (default: the agent's current frame). OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images, by default about 64 texels per metre of surface (512–2048 px per mesh), or bake_resolution px; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame (2 or 4 times per frame where an object's motion curves between frames, e.g. on a fast orbit; motion that is straight between frames, like LINEAR keys or rigid bodies, keeps one key per frame) over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, elapsed_ms, warnings} plus the file as an embedded base64 resource (up to 20 MiB) and a download link. The export runs on a render thread, so it does not hold up the server; a glTF export samples every frame of the scene range, which takes seconds for long ranges and large scenes. download_url (an HTTP endpoint of this server) exports again when it is fetched, with the same options (format, objects, apply_modifiers, frame, bake_resolution): the same file as the embedded one while the scene is unchanged, the project's current state after later edits. `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped.",
+        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at a frame (default: the agent's current frame). OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images, by default about 64 texels per metre of surface (512–2048 px per mesh), or bake_resolution px; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame (2 or 4 times per frame where an object's motion curves between frames, e.g. on a fast orbit; motion that is straight between frames, like LINEAR keys or rigid bodies, keeps one key per frame) over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, elapsed_ms, warnings} plus the file as an embedded base64 resource (up to 20 MiB) and a download link. The export runs in a render process, so it does not hold up the server; a glTF export samples every frame of the scene range, which takes seconds for long ranges and large scenes. download_url (an HTTP endpoint of this server) exports again when it is fetched, with the same options (format, objects, apply_modifiers, frame, bake_resolution): the same file as the embedded one while the scene is unchanged, the project's current state after later edits. `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped.",
       annotations: READ_ONLY,
     },
     {
@@ -2333,7 +2354,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const frame = a.frame ?? p.state.frame;
       let res;
       try {
-        // on a render thread: a large glTF export (animation sampled per frame, texture bakes)
+        // in a render process: a large glTF export (animation sampled per frame, texture bakes)
         // takes seconds and must not hold up the event loop that serves editors and agents
         res = await renderer.exportScene({
           scene: p.scene,
@@ -2398,7 +2419,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'render_image',
     {
       title: 'Render image',
-      description: `Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, the look of its Rendered viewport shading whatever shading it shows; SOLID: grey clay) when available, otherwise the server's software rasterizer: renderer auto waits ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s for the editor's image and then renders on the server (\`note\` says why), renderer browser waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s (a heavy scene in an editor without GPU acceleration, software WebGL, takes tens of seconds) and then fails with what to do instead; an editor may still be drawing an image the server stopped waiting for, and holds up its next renders and commands until it has: meanwhile renders go to another connected editor that is not busy, else renderer auto renders on the server without asking it (\`note\` says so), as it also does for ${SLOW_EDITOR_RETRY_MS / 1000} s after an editor needed longer than auto waits for a RASTER image; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel), or with renderer browser on a browser editor's render workers. The server's software rasterizer (RASTER without a browser editor) draws no shadows, and its glossy reflections come from one small reflection probe in front of what the image centre shows, looked up by direction only: water, floors and large glossy tables far from that point can show reflections the path tracer does not (a wide smear of a nearby object, a far end that is too bright), so judge shadows and reflections with PATHTRACER. Film > Transparent (set_scene_settings film_transparent) gives a transparent background with both engines. Defaults to the scene camera; pass \`camera\` (camera object) or \`view\` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications. The JSON text after the image gives renderer, engine, size, frame, timing, for path tracing samples (reached) and requested_samples, and \`warnings\` (e.g. textures that could not be used, or degenerate triangles skipped, with the objects they belong to).`,
+      description: `Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, the look of its Rendered viewport shading whatever shading it shows; SOLID: grey clay) when available, otherwise the server's software rasterizer: renderer auto waits ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s for the editor's image and then renders on the server (\`note\` says why), renderer browser waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s (an editor without GPU acceleration took ${measured(BROWSER_RASTER_SECONDS)}) and then fails with what to do instead; an editor may still be drawing an image the server stopped waiting for, and holds up its next renders and commands until it has: meanwhile renders go to another connected editor that is not busy, else renderer auto renders on the server without asking it (\`note\` says so), as it also does for ${SLOW_EDITOR_RETRY_MS / 1000} s after an editor needed longer than auto waits for a RASTER image; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel), or with renderer browser on a browser editor's render workers. The server's software rasterizer (RASTER without a browser editor) draws no shadows, and its glossy reflections come from one small reflection probe in front of what the image centre shows, looked up by direction only: water, floors and large glossy tables far from that point can show reflections the path tracer does not (a wide smear of a nearby object, a far end that is too bright), so judge shadows and reflections with PATHTRACER. The server renders in render processes of its own: grey clay (shading SOLID) at 1280×720 took ${measuredOnServer(SERVER_SOLID_SECONDS)}, and a render that needs more memory than a render process has fails with 'Rendering failed: the render process ran out of memory …' while the server keeps running. Film > Transparent (set_scene_settings film_transparent) gives a transparent background with both engines. Defaults to the scene camera; pass \`camera\` (camera object) or \`view\` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications. The JSON text after the image gives renderer, engine, size, frame, timing, for path tracing samples (reached) and requested_samples, and \`warnings\` (e.g. textures that could not be used, or degenerate triangles skipped, with the objects they belong to).`,
       annotations: READ_ONLY,
     },
     {
@@ -2455,7 +2476,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .enum(['auto', 'browser', 'software'])
         .default('auto')
         .describe(
-          `auto: RASTER on a connected browser editor (WebGL, the look of its Rendered viewport shading; the server's rasterizer when none is connected, the editor fails, it has no image after ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s, it is still busy with an earlier image or it was too slow for its last one: asked again ${SLOW_EDITOR_RETRY_MS / 1000} s later), PATHTRACER on the server (all its cores); browser: only a browser editor: RASTER with WebGL (waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s: heavy scenes in software WebGL take tens of seconds), PATHTRACER on the editor's render workers (samples, max_bounces, denoise, time_limit, seed; waits time_limit + ${BROWSER_PATHTRACE_EXTRA_MS / 1000} s; the result does not include the samples reached); software: always the server`,
+          `auto: RASTER on a connected browser editor (WebGL, the look of its Rendered viewport shading; the server's rasterizer when none is connected, the editor fails, it has no image after ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s, it is still busy with an earlier image or it was too slow for its last one: asked again ${SLOW_EDITOR_RETRY_MS / 1000} s later), PATHTRACER on the server (all its cores); browser: only a browser editor: RASTER with WebGL (waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s; an editor without GPU acceleration took ${measured(BROWSER_RASTER_SECONDS)}), PATHTRACER on the editor's render workers (samples, max_bounces, denoise, time_limit, seed; waits time_limit + ${BROWSER_PATHTRACE_EXTRA_MS / 1000} s; the result does not include the samples reached); software: always the server`,
         ),
       shading: z
         .enum(['SOLID', 'MATERIAL'])
@@ -2953,7 +2974,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'editor_command',
     {
       title: 'Editor command',
-      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`; get_connected_clients lists them). Commands and their \`params\`: ${editorCommandList()}. run_operator runs the operators of the browser editor's own user interface (view3d.*, wm.*, screen.*, ed.* …) on the person's editor: its selection, view, frame and undo history, windows on the person's screen, even its project (wm.read_homefile switches that editor to a new project, so it leaves this one before it can answer, and the error says so) and the person's clipboard (wm.share); the run_operator tool refuses them with a message that says what each one does there. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected, or when the editor's connection to the project closes before it answers. \`timeout_ms\` (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}: under the 60 s request timeout MCP SDK clients use by default) is how long to wait for the editor's answer. In an editor without GPU acceleration (software WebGL, e.g. a headless browser) a screenshot of a heavy scene in MATERIAL or RENDERED shading takes seconds, and the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds: the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${measured(NEW_SHADER_SECONDS)}); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a scene with millions of triangles takes seconds per frame in any shading; the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and per frame for a scene with millions of triangles). So raise timeout_ms there, take screenshots with shading 'SOLID' (grey clay, much faster), take a quick look with render_image {shading: 'SOLID'} and make final images with render_image. On a timeout the error says so and what to do; the editor may still carry the command out, and its next commands and renders wait until it has (a later timeout names that earlier request; render_image renderer auto renders on the server meanwhile): a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the rest and compiles nothing again.`,
+      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`; get_connected_clients lists them). Commands and their \`params\`: ${editorCommandList()}. run_operator runs the operators of the browser editor's own user interface (view3d.*, wm.*, screen.*, ed.* …) on the person's editor: its selection, view, frame and undo history, windows on the person's screen, even its project (wm.read_homefile switches that editor to a new project, so it leaves this one before it can answer, and the error says so) and the person's clipboard (wm.share); the run_operator tool refuses them with a message that says what each one does there. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected, or when the editor's connection to the project closes before it answers. \`timeout_ms\` (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}: under the 60 s request timeout MCP SDK clients use by default) is how long to wait for the editor's answer. In an editor without GPU acceleration (software WebGL, e.g. a headless browser) a screenshot of a heavy scene in MATERIAL or RENDERED shading takes seconds, and the first screenshot or viewport frame in each of them after the editor opened the project tens of seconds: the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${measured(NEW_SHADER_SECONDS)}); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a scene with millions of triangles takes seconds per frame in any shading; the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and per frame for a scene with millions of triangles). So raise timeout_ms there, take screenshots with shading 'SOLID' (grey clay, much faster), take a quick look with render_image {shading: 'SOLID'} (grey clay, rendered on the server while the editor is busy and when the scene's render engine is PATHTRACER: ${measuredOnServer(SERVER_SOLID_SECONDS)}; a scene that needs more memory than a server render has fails with 'Rendering failed: the render process ran out of memory …', and then retry the screenshot with a larger timeout_ms) and make final images with render_image. On a timeout the error says so and what to do; the editor may still carry the command out, and its next commands and renders wait until it has (a later timeout names that earlier request; render_image renderer auto renders on the server meanwhile): a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the rest and compiles nothing again.`,
       annotations: { ...EDIT, openWorldHint: true },
       argsHint: 'Command parameters go inside `params` (editor_command {project, command, params: {…}}).',
     },

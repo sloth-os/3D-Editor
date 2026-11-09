@@ -854,6 +854,23 @@ describe('Adjust Last Operation shows what the operation edited, however it was 
       s.state.frame = 6;
     };
 
+    it('Edit Bone in world space: head and tail where the animated armature is at the frame', () => {
+      // the operator converts world points with the armature's matrix at the current frame; the
+      // panel shows the kept head and tail with the same matrix, so editing one component keeps
+      // the others where they are
+      ok('object.armature_add', { name: 'Rig', bone_name: 'Arm' });
+      const rig = id('Rig');
+      animate('object', rig, 'location', 0, 10);
+      ok('armature.bone_update', { object: rig, bone: 'Arm', roll: 0.25, space: 'WORLD' });
+      const root = panel();
+      expect(shown(root, 'head')).toEqual(['5', '0', '0']);
+      expect(shown(root, 'tail')).toEqual(['5', '0', '1']);
+      typeNumber(field(root, 'redo-tail-1')!, '1');
+      const bone = s.doc.getArmature(s.doc.getObject(rig)!.data!)!.bones[0];
+      expect(bone.head).toEqual([0, 0, 0]);
+      expect(bone.tail).toEqual([0, 1, 1]);
+    });
+
     it('a shape key’s value, also when the frame changes', () => {
       ok('mesh.primitive_cube_add', { name: 'Cube' });
       const cube = id('Cube');

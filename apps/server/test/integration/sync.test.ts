@@ -1,7 +1,9 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import net from 'node:net';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { newUuid } from '@3d-editor/core';
-import { api, eventually, startServer, type TestServer } from '../helpers/app';
+import { api, eventually, sleep, startServer, type TestServer } from '../helpers/app';
 import { SyncTestClient } from '../helpers/sync-client';
 
 let server: TestServer;
@@ -192,5 +194,138 @@ describe('real-time sync', () => {
       });
       ws.on('error', () => resolve());
     });
+  });
+});
+
+/**
+ * A WebSocket connection to `/sync/<id>` over a plain TCP socket: unlike a WebSocket client it can
+ * send frames that clients must not send, and leave the server's close frame unanswered.
+ */
+async function rawSyncSocket(base: string, id: string) {
+  const u = new URL(base);
+  const socket = net.connect(Number(u.port), u.hostname);
+  let received = Buffer.alloc(0);
+  socket.on('data', (d: Buffer) => {
+    received = Buffer.concat([received, d]);
+  });
+  socket.on('error', () => undefined);
+  const closed = new Promise<number>((resolve) => socket.once('close', () => resolve(Date.now())));
+  await new Promise<void>((resolve) => socket.once('connect', () => resolve()));
+  socket.write(
+    `GET /sync/${id} HTTP/1.1\r\nHost: ${u.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: ${randomBytes(16).toString('base64')}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+  );
+  /** The status line of the server's answer, and the close frame it sent after it (null until then). */
+  const closeFrame = (): { status: string; code: number; reason: string } | null => {
+    const end = received.indexOf('\r\n\r\n');
+    if (end < 0) return null;
+    const status = received.subarray(0, received.indexOf('\r\n')).toString('latin1');
+    const frame = received.subarray(end + 4);
+    // a server frame is not masked: FIN + opcode 8, payload length < 126, code, reason
+    if (frame.length < 2 || frame.length < 2 + frame[1]) return null;
+    expect(frame[0]).toBe(0x88);
+    return {
+      status,
+      code: frame.readUInt16BE(2),
+      reason: frame.subarray(4, 2 + frame[1]).toString('utf8'),
+    };
+  };
+  return { socket, closed, closeFrame };
+}
+
+/** Collects the uncaught exceptions of this process while `fn` runs (an unhandled 'error' event). */
+async function uncaughtDuring(fn: () => Promise<void>): Promise<unknown[]> {
+  const uncaught: unknown[] = [];
+  const onUncaught = (err: unknown) => void uncaught.push(err);
+  process.on('uncaughtException', onUncaught);
+  try {
+    await fn();
+    await sleep(50);
+  } finally {
+    process.off('uncaughtException', onUncaught);
+  }
+  return uncaught;
+}
+
+describe('sync connections that no room takes', () => {
+  async function deletedProject(base: string): Promise<string> {
+    const created = await api(base, '/api/projects', { method: 'POST', json: { name: 'Deleted' } });
+    expect((await api(base, `/api/projects/${created.body.id}`, { method: 'DELETE' })).status).toBe(204);
+    return created.body.id as string;
+  }
+
+  /** An unmasked binary frame: a client must mask its frames (ws reports a protocol error). */
+  const UNMASKED_FRAME = Buffer.from([0x82, 0x03, 1, 2, 3]);
+
+  it('keeps running when a client breaks the protocol on a connection to a deleted project', async () => {
+    const id = await deletedProject(server.url);
+    const uncaught = await uncaughtDuring(async () => {
+      const raw = await rawSyncSocket(server.url, id);
+      const answer = await eventually(() => raw.closeFrame(), 5000, 'the close frame');
+      expect(answer).toEqual({
+        status: 'HTTP/1.1 101 Switching Protocols',
+        code: 4404,
+        reason: 'project deleted',
+      });
+      raw.socket.write(UNMASKED_FRAME);
+      await raw.closed;
+    });
+    // without an 'error' listener on that connection, ws's 'error' event ended the server process
+    expect(uncaught).toEqual([]);
+    expect((await api(server.url, '/healthz')).status).toBe(200);
+    const c = client(newUuid());
+    await c.connect();
+    expect(c.synced).toBe(true);
+  });
+
+  it('keeps running when a client breaks the protocol on a connection to a room closed meanwhile', async () => {
+    const rooms = server.handle.rooms;
+    const open = rooms.open.bind(rooms);
+    // the room is closed between opening it and taking the connection (as by a deletion then)
+    const spy = vi.spyOn(rooms, 'open').mockImplementationOnce(async (projectId, opts) => {
+      const room = await open(projectId, opts);
+      await room?.close({ flush: false });
+      return room;
+    });
+    try {
+      const uncaught = await uncaughtDuring(async () => {
+        const raw = await rawSyncSocket(server.url, newUuid());
+        const answer = await eventually(() => raw.closeFrame(), 5000, 'the close frame');
+        expect(answer).toMatchObject({ code: 1012, reason: 'room closed' });
+        raw.socket.write(UNMASKED_FRAME);
+        await raw.closed;
+      });
+      expect(uncaught).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect((await api(server.url, '/healthz')).status).toBe(200);
+  });
+
+  it('disconnects a client that does not answer the close frame of a deleted project within seconds', async () => {
+    const id = await deletedProject(server.url);
+    const raw = await rawSyncSocket(server.url, id);
+    await eventually(() => raw.closeFrame(), 5000, 'the close frame');
+    const t0 = Date.now();
+    // 2 s (as a room does with its connections); ws alone waits 30 s for the answer
+    expect((await raw.closed) - t0).toBeLessThan(10_000);
+  });
+
+  it('does not wait long for such a client when it shuts down', async () => {
+    const s = await startServer();
+    try {
+      const id = await deletedProject(s.url);
+      const raw = await rawSyncSocket(s.url, id);
+      await eventually(() => raw.closeFrame(), 5000, 'the close frame');
+      const t0 = Date.now();
+      await s.close();
+      // the server waits up to 2 s for an answer to its close frames (ws alone waits 30 s)
+      expect(Date.now() - t0).toBeLessThan(10_000);
+      expect(s.handle.sync.wss.clients.size).toBe(0);
+      await raw.closed;
+    } finally {
+      await s.close();
+      await s.cleanup();
+    }
   });
 });

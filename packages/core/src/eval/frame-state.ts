@@ -8,9 +8,9 @@ import { evaluateDriver } from '../anim/drivers';
 import { createPoseEvaluation, type PoseEvaluation } from '../armature/pose';
 import type { ArmaturePose } from '../armature/types';
 import { solveConstraints } from '../constraints/solve';
-import { constraintContextFor } from '../constraints/context';
+import { constraintContextFor, constraintObjectInfo } from '../constraints/context';
 import { dependencyGraph, inParentLoop } from '../constraints/depgraph';
-import type { ConstraintError } from '../constraints/types';
+import type { ConstraintContext, ConstraintError } from '../constraints/types';
 import { buildCurvePath, type CurvePath } from '../curve/path';
 
 export interface EvalError {
@@ -20,6 +20,51 @@ export interface EvalError {
 }
 
 type CurveIndex = Map<string, FCurve[]>; // `${type}:${id}` → curves
+
+/** An object's location, rotation and scale. */
+type Channels = Pick<ObjectData, 'location' | 'rotation_euler' | 'scale'>;
+
+/** What a frame state reads from the document, once (see FrameStateOptions.base). */
+interface FrameInput {
+  raw: ObjectData[];
+  rawById: Map<string, ObjectData>;
+  curves: CurveIndex;
+  drivers: Map<string, DriverData[]>;
+}
+
+/** Options of a {@link FrameState}. */
+export interface FrameStateOptions {
+  /**
+   * A frame state of the same document whose reading of the document this one shares (the
+   * document must not have changed since): building it then reads nothing from the document.
+   */
+  base?: FrameState;
+  /**
+   * Objects whose location, rotation and scale are replaced at this frame: they show these values,
+   * whatever their stored values and keys give (their drivers still apply on top). What the scene
+   * evaluates once these channels are stored and keyed at the frame, as while a transform is
+   * previewed.
+   */
+  channels?: ReadonlyMap<string, Channels>;
+  /**
+   * With `base` (at the same frame, with the same simulated matrices): the only objects this frame
+   * state evaluates anew. It must hold every object whose evaluation `channels` can change: the
+   * objects in `channels` and every object reading one of them, directly or through others
+   * (parenting, constraints, drivers, armature poses). Everything else (the other objects' values,
+   * matrices and poses, datablocks without drivers, the dependency cycles found) is read from
+   * `base`, so replacing the channels of a few objects costs what evaluating those objects costs,
+   * not what the scene does. These objects are evaluated as they are asked for: ask for them
+   * dependencies first, so long chains do not recurse deeply. Without it (or without `base`) every
+   * object is evaluated anew.
+   */
+  affected?: ReadonlySet<string>;
+}
+
+/** A frame state that evaluates only some objects anew (FrameStateOptions.affected). */
+interface Overlay {
+  base: FrameState;
+  affected: ReadonlySet<string>;
+}
 
 function indexByTarget<T extends { target_type: string; target_id: string; mute: boolean }>(
   items: T[],
@@ -54,6 +99,13 @@ class AnimatedStore {
     private readonly curves: CurveIndex,
     private readonly drivers: Map<string, DriverData[]>,
     private readonly errors: EvalError[],
+    /** Objects' channels replacing what their F-curves and stored values give (before drivers). */
+    private readonly channels: ReadonlyMap<string, Channels> | null = null,
+    /**
+     * The store of the base frame state of an overlay (see FrameStateOptions.affected): objects not
+     * evaluated anew and datablocks without drivers are read from it.
+     */
+    private readonly fallback: { store: AnimatedStore; affected: ReadonlySet<string> } | null = null,
   ) {}
 
   private raw(type: AnimTargetType, id: string): Block | null {
@@ -91,6 +143,8 @@ class AnimatedStore {
         if (v !== undefined) writeChannel(out, fc.path, fc.index, v);
       }
     }
+    const c = raw && type === 'object' ? this.channels?.get(id) : undefined;
+    if (out && c) out = { ...out, location: c.location, rotation_euler: c.rotation_euler, scale: c.scale };
     this.animated.set(k, out);
     return out;
   }
@@ -98,6 +152,9 @@ class AnimatedStore {
   get<T = Block>(type: AnimTargetType, id: string): T | null {
     const k = `${type}:${id}`;
     if (this.final.has(k)) return this.final.get(k) as T | null;
+    const fb = this.fallback;
+    if (fb && (type === 'object' ? !fb.affected.has(id) : !this.drivers.has(k)))
+      return fb.store.get<T>(type, id);
     const base = this.animatedOnly(type, id);
     const ds = base ? this.drivers.get(k) : undefined;
     if (!base || !ds) {
@@ -130,14 +187,18 @@ class AnimatedStore {
 /**
  * Transform state of the scene at one frame: animated + driven datablocks, parenting (object and
  * bone), armature poses, constraints and rigid body overrides. Everything is computed lazily and
- * memoised; dependency cycles resolve to null (callers fall back to identity).
+ * memoised; dependency cycles resolve to null (callers fall back to identity). `options.channels`
+ * replaces the channels of some objects, and `options.affected` limits what is evaluated anew to
+ * the objects they change (see {@link FrameStateOptions}).
  */
 export class FrameState {
-  readonly objects: ObjectData[];
-  readonly byId: Map<string, ObjectData>;
+  private objectList: ObjectData[] | null = null;
+  private objectMap: Map<string, ObjectData> | null = null;
+  private readonly over: Overlay | null;
   readonly errors: EvalError[] = [];
   readonly constraintErrors = new Map<string, ConstraintError[]>();
   private readonly store: AnimatedStore;
+  private readonly input: FrameInput;
   private readonly localM = new Map<string, Mat4>();
   private readonly parentM = new Map<string, Mat4>();
   private readonly worldM = new Map<string, Mat4>();
@@ -152,14 +213,57 @@ export class FrameState {
     readonly frame: number,
     /** Simulated world matrices replacing the computed ones (rigid body world). */
     readonly simulated: ReadonlyMap<string, Mat4> | null = null,
+    options: FrameStateOptions = {},
   ) {
-    const raw = doc.listObjects();
-    const rawById = new Map(raw.map((o) => [o.id, o]));
-    const curves = indexByTarget(doc.listFCurves(), (fc) => fc.keyframes.length === 0);
-    const drivers = indexByTarget(doc.listDrivers(), () => false);
-    this.store = new AnimatedStore(doc, frame, rawById, curves, drivers, this.errors);
-    this.objects = raw.map((o) => this.store.get<ObjectData>('object', o.id)!);
-    this.byId = new Map(this.objects.map((o) => [o.id, o]));
+    let input = options.base?.input;
+    if (!input) {
+      const raw = doc.listObjects();
+      input = {
+        raw,
+        rawById: new Map(raw.map((o) => [o.id, o])),
+        curves: indexByTarget(doc.listFCurves(), (fc) => fc.keyframes.length === 0),
+        drivers: indexByTarget(doc.listDrivers(), () => false),
+      };
+    }
+    this.input = input;
+    const { base, affected } = options;
+    this.over =
+      base && affected && base.frame === frame && base.simulated === simulated ? { base, affected } : null;
+    const { rawById, curves, drivers } = input;
+    const fallback = this.over && { store: this.over.base.store, affected: this.over.affected };
+    this.store = new AnimatedStore(
+      doc,
+      frame,
+      rawById,
+      curves,
+      drivers,
+      this.errors,
+      options.channels,
+      fallback,
+    );
+    // an overlay lists the scene's objects only when asked for them
+    if (!this.over) void this.byId;
+  }
+
+  /** The scene's objects, animated and driven. */
+  get objects(): ObjectData[] {
+    return (this.objectList ??= this.input.raw.map((o) => this.store.get<ObjectData>('object', o.id)!));
+  }
+
+  /** The scene's objects by id, animated and driven. */
+  get byId(): Map<string, ObjectData> {
+    return (this.objectMap ??= new Map(this.objects.map((o) => [o.id, o])));
+  }
+
+  /** Animated object `id` (undefined when missing), found without listing the scene's objects. */
+  private object(id: string): ObjectData | undefined {
+    return this.store.get<ObjectData>('object', id) ?? undefined;
+  }
+
+  /** The base frame state when object `id` is read from it (FrameStateOptions.affected), else null. */
+  private fromBase(id: string): FrameState | null {
+    const over = this.over;
+    return over && !over.affected.has(id) ? over.base : null;
   }
 
   /** Animated + driven datablock (null when missing). */
@@ -172,12 +276,16 @@ export class FrameState {
   }
 
   local(id: string): Mat4 {
+    const base = this.fromBase(id);
+    if (base) return base.local(id);
     if (!this.localM.has(id)) this.world(id);
     return this.localM.get(id) ?? identity4();
   }
 
   /** World matrix of the object's parent (bone tail for bone parenting), identity if none. */
   parent(id: string): Mat4 {
+    const base = this.fromBase(id);
+    if (base) return base.parent(id);
     if (!this.parentM.has(id)) this.world(id);
     return this.parentM.get(id) ?? identity4();
   }
@@ -186,12 +294,15 @@ export class FrameState {
   world(id: string): Mat4 | null {
     const cached = this.worldM.get(id);
     if (cached) return cached;
-    const o = this.byId.get(id);
+    const base = this.fromBase(id);
+    if (base) return base.world(id);
+    const o = this.object(id);
     if (!o || this.computing.has(id)) return null;
     // the object's dependencies not handed out yet are evaluated first (dependency order), so long
     // parent / constraint chains never recurse deeply, also when a pose bone reads an object while
-    // another object is being evaluated
-    for (const dep of dependencyGraph(this).evaluationOrder(id)) this.world(dep);
+    // another object is being evaluated (an overlay evaluates them as they are asked for, see
+    // FrameStateOptions.affected)
+    if (!this.over) for (const dep of dependencyGraph(this).evaluationOrder(id)) this.world(dep);
     // a dependency may have evaluated this object already, through a relation inside an armature
     // pose (a cycle the object graph cannot see): keep that result, so every object is solved once
     // and its constraint errors match its matrix whatever the evaluation order
@@ -202,14 +313,16 @@ export class FrameState {
       const local = compose4(o.location, o.rotation_euler, o.scale);
       this.localM.set(id, local);
       let parent = identity4();
-      if (o.parent && o.parent !== id && this.byId.has(o.parent)) {
+      if (o.parent && o.parent !== id && this.object(o.parent)) {
         const pw = this.world(o.parent);
         const boneParent = o.parent_type === 'BONE' && !!o.parent_bone;
         // The parent (or the pose of the parent armature) is being evaluated and depends on this
         // object: a dependency cycle through parenting. Report this object as cyclic (null, not
         // cached) instead of caching it without its parent; only loops of parent links (corrupt
-        // data) fall back to an identity parent.
-        if (pw ? boneParent && this.boneCycle(o.parent, o.parent_bone) : !inParentLoop(this.byId, id))
+        // data) fall back to an identity parent (parent links are not animated: the stored ones).
+        if (
+          pw ? boneParent && this.boneCycle(o.parent, o.parent_bone) : !inParentLoop(this.input.rawById, id)
+        )
           return null;
         if (pw) {
           parent = pw;
@@ -225,7 +338,7 @@ export class FrameState {
       const sim = this.simulated?.get(id);
       if (sim) m = sim;
       else if (o.constraints?.length) {
-        const res = solveConstraints(o.constraints, m, constraintContextFor(this, id, parent));
+        const res = solveConstraints(o.constraints, m, this.constraintContext(id, parent));
         m = res.matrix;
         if (res.errors.length) this.constraintErrors.set(id, res.errors);
       }
@@ -237,13 +350,35 @@ export class FrameState {
   }
 
   /**
+   * The context solving the constraints of object `id`. An overlay finds the constraints on
+   * dependency cycles in its base's dependency graph (replaced channels change no relation) and
+   * reads other objects' info without listing the scene.
+   */
+  private constraintContext(id: string, parent: Mat4): ConstraintContext {
+    const ctx = constraintContextFor(this, id, parent);
+    const over = this.over;
+    if (!over) return ctx;
+    return {
+      ...ctx,
+      dependencyCycle: (c) => dependencyGraph(over.base).cycle(id, c),
+      getObjectInfo: (t) => {
+        const info = constraintObjectInfo(over.base, t);
+        if (!info || !over.affected.has(t)) return info;
+        return { ...info, parentMatrix: info.parentMatrix && this.parent(t), basisMatrix: this.local(t) };
+      },
+    };
+  }
+
+  /**
    * Incremental pose evaluation of an armature object (null if not an armature, or while the
    * armature object's own transform is being computed).
    */
   private poseEvaluation(id: string): PoseEvaluation | null {
+    const base = this.fromBase(id);
+    if (base) return base.poseEvaluation(id);
     const known = this.poseEvals.get(id);
     if (known !== undefined) return known;
-    const o = this.byId.get(id);
+    const o = this.object(id);
     const arm = o?.type === 'ARMATURE' && o.data ? this.doc.getArmature(o.data) : null;
     if (!o || !arm) {
       this.poseEvals.set(id, null);
@@ -270,6 +405,8 @@ export class FrameState {
    * reported in `errors` (source `pose:<id>`).
    */
   pose(id: string): ArmaturePose | null {
+    const base = this.fromBase(id);
+    if (base) return base.pose(id);
     if (this.poses.has(id)) return this.poses.get(id)!;
     const ev = this.poseEvaluation(id);
     // asked for while one of its bones is being evaluated: a dependency cycle
@@ -302,7 +439,9 @@ export class FrameState {
 
   /** Path along the first spline of a CURVE object, with its world matrix. */
   curvePath(id: string): { path: CurvePath; matrix: Mat4; curve: CurveData } | null {
-    const o = this.byId.get(id);
+    const base = this.fromBase(id);
+    if (base) return base.curvePath(id);
+    const o = this.object(id);
     if (!o || o.type !== 'CURVE' || !o.data) return null;
     const curve = this.curve(o.data);
     if (!curve) return null;

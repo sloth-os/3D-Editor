@@ -10,6 +10,8 @@ import {
   selectionFromVerts,
   selectionPivot,
   type MeshSelection,
+  type TransformMode,
+  type Vec3,
 } from '@3d-editor/core';
 import type { ViewportEngine } from './engine';
 import type { ProjectSession } from '../project/session';
@@ -112,7 +114,7 @@ export class ViewportInteraction {
     this.gizmo.setTranslationSnap(snap ? (this.engine.shownPose.distance > 4 ? 1 : 0.1) : null);
     this.gizmo.setRotationSnap(snap ? THREE.MathUtils.degToRad(5) : null);
     this.gizmo.setScaleSnap(snap ? 0.1 : null);
-    const p = selectionPivot(this.session.doc, st);
+    const p = this.gizmoPivot(gmode === 'translate' ? 'TRANSLATE' : gmode === 'rotate' ? 'ROTATE' : 'RESIZE');
     this.gizmoProxy.position.set(p[0], p[1], p[2]);
     this.gizmoProxy.quaternion.identity();
     this.gizmoProxy.scale.set(1, 1, 1);
@@ -122,6 +124,34 @@ export class ViewportInteraction {
       this.engine.requestRender();
     }
   };
+
+  private pivotCache: { key: unknown[]; pivot: Vec3 } | null = null;
+
+  /**
+   * Where the gizmo sits: the pivot a transform in `mode` uses (selectionPivot, where the scene
+   * shows the selection at the current frame), computed again only when the scene's evaluation, the
+   * selection, the pivot point or the cursor changed (the gizmo is placed after every frame).
+   */
+  private gizmoPivot(mode: TransformMode): Vec3 {
+    const st = this.session.state;
+    const key: unknown[] = [
+      this.engine.ev,
+      this.session.doc,
+      mode,
+      st.mode,
+      st.frame,
+      st.pivotPoint,
+      st.activeId,
+      st.selectedIds,
+      st.meshSelection,
+      st.cursorLocation.join(),
+    ];
+    const cached = this.pivotCache;
+    if (cached && cached.key.every((v, i) => v === key[i])) return cached.pivot;
+    const pivot = selectionPivot(this.session.doc, st, st.pivotPoint, { mode });
+    this.pivotCache = { key, pivot };
+    return pivot;
+  }
 
   private onGizmoDragging(dragging: boolean): void {
     if (dragging) {

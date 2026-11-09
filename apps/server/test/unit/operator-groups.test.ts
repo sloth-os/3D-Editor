@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { BROWSER_UI_OPERATORS, createOperatorRegistry } from '@3d-editor/core';
 import { editorTimeoutMessage } from '../../src/mcp/editor-commands';
-import { NEW_SHADER_SECONDS } from '../../src/mcp/editor-costs';
+import { BUSY_FACTOR, NEW_SHADER_SECONDS } from '../../src/mcp/editor-costs';
 import {
   browserUiOperator,
   browserUiOperatorsNote,
@@ -376,17 +376,20 @@ describe('the parameters the caveats name', () => {
 
 describe('the Shading group', () => {
   it("says which material edits cost a browser editor's next screenshot a compile, as the timeout error does", () => {
-    // measured in software WebGL (docs/mcp.md): an edit that needs a shader no material had compiles it
-    // once in each of MATERIAL and RENDERED shading; an edit of values reuses the shader, so it compiles
-    // nothing (a screenshot still costs a frame of its shading and work of its own, not one frame)
+    // measured in software WebGL on a calm machine (docs/mcp.md): an edit that needs a shader no
+    // material had compiles it once in each of MATERIAL and RENDERED shading; an edit of values reuses
+    // the shader, so it compiles nothing (a screenshot still costs a frame of its shading and work of
+    // its own, not one frame); the text says how much longer that took on a busy machine
     const shading = findOperatorGroup('Shading')!.description;
     expect(shading).toContain(
       'an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set ' +
         'of channels that no other material has) makes the next screenshot or viewport frame in MATERIAL and ' +
-        `in RENDERED shading compile it (${NEW_SHADER_SECONDS}, measured in software WebGL and varying with ` +
-        "the machine's load; edits of values compile nothing)",
+        `in RENDERED shading compile it (${NEW_SHADER_SECONDS}, measured on a calm machine with 4 CPUs in software ` +
+        `WebGL, up to ${BUSY_FACTOR} times as long on a busy one; edits of values compile nothing)`,
     );
     expect(shading).not.toMatch(/one frame/);
+    // software WebGL is named once, by measured()
+    expect(shading.match(/software WebGL/g)).toHaveLength(1);
     expect(shading).toContain("pass editor_command a larger timeout_ms or shading 'SOLID'");
     expect(shading).not.toMatch(/compile shaders again|1\.2–11\.9|transmission/);
     expect(editorTimeoutMessage('screenshot', 10_000, null, { shading: 'RENDERED' })).toContain(

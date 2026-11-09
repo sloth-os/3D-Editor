@@ -25,9 +25,9 @@ import type { RenderRequest } from '../../src/render/pool';
  * cancelled and time limited, animations match core renderAnimation, quick raster renders never
  * wait for long renders, fresh threads are warmed up outside time limits, APNG frames are
  * compressed on render threads, rigid body simulations run once per render (not on every thread)
- * and the pool falls back to the main thread when workers cannot start.
+ * and the pool falls back to the main thread when render processes cannot start.
  *
- * Worker threads run the TypeScript sources through tsx (worker-dev.mjs), which takes seconds to
+ * Render processes run the TypeScript sources through tsx (worker-dev.mjs), which takes seconds to
  * start on a loaded machine: the tests have explicit timeouts and the shared pool is started first.
  */
 
@@ -66,9 +66,9 @@ function recording(t: RenderThread, calls: RenderRequest['type'][]): RenderThrea
   return {
     id: t.id,
     kind: t.kind,
-    call: (req, transfer) => {
+    call: (req) => {
       calls.push(req.type);
-      return t.call(req, transfer);
+      return t.call(req);
     },
     release: (job) => t.release(job),
     get pending() {
@@ -125,7 +125,7 @@ describe('render pool', { timeout: 120_000 }, () => {
   const two = renderer(2);
   const main = renderer(0);
 
-  // start the worker threads before the first test (tsx transpiles the sources on start-up)
+  // start the render processes before the first test (tsx transpiles the sources on start-up)
   beforeAll(async () => {
     const lease = await two.pool.lease();
     lease.release();
@@ -139,7 +139,7 @@ describe('render pool', { timeout: 120_000 }, () => {
     expect(parallel).toMatchObject({
       engine: 'PATHTRACER',
       threads: 2,
-      mode: 'workers',
+      mode: 'processes',
       width: 40,
       height: 30,
     });
@@ -286,7 +286,7 @@ describe('render pool', { timeout: 120_000 }, () => {
     ).rejects.toThrow(/before frame_start/);
   });
 
-  it('finishes renders when a worker thread dies (its work moves to the others)', async () => {
+  it('finishes renders when a render process dies (its work moves to the others)', async () => {
     const r = renderer(2);
     const doc = scene();
     const opts = frame({ samples: 10 });
@@ -308,7 +308,7 @@ describe('render pool', { timeout: 120_000 }, () => {
     expect(new Uint8Array(res.data!)).toEqual(
       new Uint8Array(renderSceneSoftware(doc, opts as SoftwareRenderOptions).data),
     );
-    // frames of an animation are rendered again on another thread (a new worker replaces the dead one)
+    // frames of an animation are rendered again on another thread (a new process replaces the dead one)
     lease = await r.pool.lease();
     expect(lease.threads).toHaveLength(2);
     let frames = 0;
@@ -341,7 +341,7 @@ describe('render pool', { timeout: 120_000 }, () => {
 
   it('quick raster renders do not wait for long renders holding every render thread (review #2)', async () => {
     const doc = scene();
-    // start the thread kept for quick renders first (booting a tsx worker takes seconds under
+    // start the thread kept for quick renders first (booting a tsx render process takes seconds under
     // load): a quick render while the render threads are leased brings it up
     const hold = await two.pool.lease();
     await two.renderImage({
@@ -509,7 +509,7 @@ describe('render pool', { timeout: 120_000 }, () => {
     );
   });
 
-  it('falls back to the main thread when workers cannot start', async () => {
+  it('falls back to the main thread when render processes cannot start', async () => {
     const broken = renderer(2, { workerUrl: new URL('file:///nonexistent/render-worker.mjs') });
     const doc = scene();
     const r = await broken.renderImage({ scene: doc, projectId: 'p5', options: frame({ samples: 2 }) });

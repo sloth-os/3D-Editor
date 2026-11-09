@@ -14,7 +14,7 @@
 ┌──────────────────────────────▼───────────────────▼──────────────────────────────┐
 │ Node server (Fastify): static PWA · /sync rooms (Yjs) · /mcp (AI agents)        │
 │ /api (projects, export, render.png) · /dav WebDAV proxy · /otlp · /metrics      │
-│ render threads (worker_threads): path tracing, CPU rasterizer, encoders, export │
+│ render processes (forked): path tracing, CPU rasterizer, encoders, export       │
 │ persistence: memory | disk | WebDAV (CRDT merge, If-Match)                      │
 └──────┬──────────────────────────────────────────────────────────────────────────┘
        ▼
@@ -270,29 +270,77 @@ finished so far. The editor's RPC handler path traces on these workers when a re
 `renderer: browser` (with `renderer: auto` it path traces on the server and sends only raster
 renders to browsers).
 
-### Server render threads
+### Server render processes
 
-Server-side rendering (`apps/server/src/render`) serves the MCP tools `render_image` and
-`render_animation` and `GET /api/projects/:id/render.png`, off the event loop:
+Server-side rendering (`apps/server/src/render`) serves the MCP tools `render_image`,
+`render_animation` and `export_scene`, `GET /api/projects/:id/render.png` and the REST export, off
+the event loop:
 
-- **Threads.** A `RenderPool` of `worker_threads` running `dist/render-worker.js` (shipped next to
-  `dist/main.js`). `RENDER_WORKERS` sets the number of threads for long renders (default: the CPU
-  cores, at most 8); one more worker is started on demand for quick raster renders. With
-  `RENDER_WORKERS=0`, or when workers cannot start, a single "thread" runs the same engine on the
-  main thread between event loop turns. Workers start lazily, warm up before taking work, drop
-  their document caches after two idle minutes and stop after ten. On Linux they run at a lower
-  CPU priority (nice 10, `RENDER_WORKER_NICE`; `priority.ts`): they still use every core the main
-  thread leaves idle, but the main thread (HTTP, sync rooms, MCP, health checks) and the garbage
-  collector get a core as soon as they have work, which keeps `/healthz` answering quickly under
-  combined render load.
+- **Processes.** A `RenderPool` of child processes (`child_process.fork`, advanced serialization)
+  running `dist/render-worker.js` (shipped next to `dist/main.js`; from the sources,
+  `worker-dev.mjs` runs `worker.ts` through tsx). `RENDER_WORKERS` sets the number of processes for
+  long renders (default: the CPU cores, at most 8); one more is started on demand for quick raster
+  renders. They start lazily, warm up before taking work, drop their document caches after two idle
+  minutes and stop after ten. They never outlive the server: it stops them when it shuts down
+  (`main.ts`), they exit when its IPC channel closes, and a watchdog thread in each process
+  (`worker.ts`) ends a busy one when the server was killed or crashed: it checks every half second
+  that the server is still its parent; in tests it fired 34–88 ms after the server's death and the
+  system took the process down 1.2–2.1 s later. On Linux every thread of a render process runs at a
+  lower CPU priority (nice 10, `RENDER_WORKER_NICE`; `priority.ts`): render processes still use
+  every core the server leaves idle, but the server (HTTP, sync rooms, MCP, health checks) and its
+  garbage collector get a core as soon as they have work, which keeps `/healthz` answering quickly
+  under combined render load. Measured against the worker threads they replace (round 9, from the
+  bundles, interleaved on a busy machine, identical images): a render process (its watchdog
+  included) started in 488–1191 ms (median 532 ms, 12 starts), a worker thread in 684–1449 ms
+  (median 841 ms); a domino-cascade thumbnail took 358–517 ms (the first one, with the start,
+  1352–1902 ms), the 1280 × 720 raster still 5395–6222 ms (worker threads 5808–6405 ms), and the
+  path-traced still and the GIF the same time within the noise of the machine. After those renders
+  the server and its five render processes used 1060–1101 MB of memory (RSS), where the server with
+  its worker threads used 704–728 MB: each process has its own Node runtime and heap (148–204 MB
+  each here, about 13 MB of it the watchdog thread).
+- **Out of memory.** Each render process has its own JavaScript heap: Node's default (2096 MB on a
+  machine with 16 GB of memory) or `RENDER_WORKER_MEMORY_MB`. A render that needs more ends only
+  its render process: the request it was working on fails with a `RenderOutOfMemoryError` within
+  the time the process takes to die (MCP:
+  `Rendering failed: the render process ran out of memory (its JavaScript heap is limited to … MB); the server keeps running and starts a new render process for the next render.`
+  followed by what to do instead), the server logs `render process ran out of memory`, and the
+  next render starts a new process. Requests of another long render that were
+  waiting behind it in the same process (two long renders share the processes) fail with a `shared`
+  error that says this render was not the cause and can run again, without the advice about the
+  scene; a render reports its own failure when it has one (`primaryRenderError`). A process that
+  crashes otherwise names the error it died of (the `TypeError: …` line Node prints, not its
+  version banner). Renders do not run in worker threads because Node aborts the whole process when
+  a worker's heap allocation fails in some paths (V8's fatal "JavaScript heap out of memory"),
+  whatever the worker's resource limits: one render of a grid of 2 million triangles took the
+  server down that way. A render process killed with SIGKILL (the kernel's out-of-memory killer) is
+  reported the same way; render processes raise their `oom_score_adj` to 1000, so the kernel ends
+  them before the server. Since round 9 a SOLID raster render of 1280 × 720 of a grid of 2,000,012
+  triangles takes 4.8 s in a new render process and 2.0–2.2 s in a warm one, which peaks at 1190 MB
+  of memory (RSS); 4,000,012 triangles take 3.2–3.3 s warm and peak at 2018 MB (their render
+  buffers no longer take a string key and small arrays per corner: before, the 2 million triangles
+  needed 21.7 s and 2.8 GB of heap for them alone).
+- **Single-thread mode.** With `RENDER_WORKERS=0`, or after three render processes failed to start,
+  a single "thread" runs the same engine on the server's main thread between event loop turns, in
+  the server's own heap, where running out of memory stops the server. There a render or export is
+  refused with a `RenderOutOfMemoryError` before it starts when its estimated heap need does not fit
+  into the free heap with 256 MB left over (after a full garbage collection). The estimate
+  (`memory.ts`) needs no evaluation: 320 bytes per triangle of the meshes shown in renders, from
+  their stored counts (307 measured for a raster or path-traced render of a grid of 980,000
+  triangles, decoded mesh included), plus the peak heap of their modifiers (the estimates below)
+  or the render of their result at the same 320 bytes per triangle, whichever is larger; curves,
+  text and instances are not counted. A grid of 2,000,012 triangles with one level of Subdivision
+  Surface for renders is refused in 0.3 s (about 3,281 MB); the modifier check below also applies
+  there.
 - **Leasing.** Long renders (path-traced stills, animations) lease all render threads; up to two
   of them share the threads, which alternate between their tasks, and further ones wait in order.
-  Quick raster renders lease one free thread (the extra worker or an idle one) and never wait for
+  Quick raster renders lease one free thread (the extra process or an idle one) and never wait for
   long renders; so do exports (MCP `export_scene` and the REST export), since a glTF export samples
   the animation frame by frame and bakes procedural textures, which takes seconds for large
   scenes. At most two path-traced stills hold a film at a time.
-- **Documents.** The project's Yjs state is shared with the threads as an update; each thread
-  caches up to three documents together with their `SceneEvaluator`, so geometry, instancing and
+- **Documents.** The project's Yjs state goes to a render process as an update only when the
+  process does not have that version yet (requests name the version; each process caches up to
+  three documents together with their `SceneEvaluator`, the pool mirrors that cache, and a process
+  that dropped a document gets the request again with its state), so geometry, instancing and
   simulation caches survive between renders. In scenes with an unbaked rigid-body simulation, one
   thread simulates and the resulting matrices (up to 16 MB per document) are shared with the
   others, so the simulation is not repeated per thread.
@@ -309,6 +357,26 @@ Server-side rendering (`apps/server/src/render`) serves the MCP tools `render_im
   engines run in the editor, PATHTRACER on its render workers. `render_animation` and `render.png`
   always render on the server. Files from `render_animation {store: true}` are kept for an hour
   (at most 256 MiB) and served from `/api/projects/:id/renders/…`.
+- **The server's own process.** The MCP inspection tools (`get_scene`, `get_object`,
+  `get_mesh_data`) and the operators evaluate scenes in the server's process, in its heap (Node's
+  default: 2096 MB on a machine with 16 GB of memory); renders and exports run in render processes
+  and do not add to it. Loading the server's render module installs a memory check for every
+  modifier evaluated there (core `eval/memory.ts`, `setGeometryMemoryCheck`; render processes run
+  without it): each modifier's peak heap is estimated from its input and parameters before it runs,
+  per face of its result (Subdivision Surface 700 bytes, Array 400, Mirror 1500 with merging,
+  Solidify 1100, Wireframe 600, Triangulate 550) or of its input (Bevel 2800, Edge Split 2600,
+  Smooth 1600, Weld 700, deform modifiers 400–600, Decimate 6500), measured on grids, and a
+  modifier that does not fit into the free heap with 256 MB left over, after a full garbage
+  collection, is skipped with the error
+  `skipped on the server: this Subdivision Surface would need about … MB of JavaScript heap for a result of about … faces …`
+  (scene summaries list it with the RENDER evaluation's problems; Apply fails with it). A 125 × 125 grid with Subdivision Surface
+  levels 4 (4,000,000 faces, about 2,670 MB estimated, 2.4 GB measured) used to stop the server
+  from one `get_scene`; now `get_scene` answers in 1.8 s (server 363 MB RSS) and
+  `object.modifier_apply` fails with that error. A grid of 2,000,012 triangles with a default
+  Subdivision Surface: `get_scene` in 6.7 s, the server at 952 MB. Not covered: decoding stored
+  meshes (open projects keep them in the heap, 120–160 bytes per triangle, so projects of more than
+  about 8 million stored triangles in all can still exhaust it), curves, text and instancing, and
+  `object.convert`, which bakes the evaluated mesh, a skipped modifier left out like any failing one.
 
 ## Server
 
@@ -352,7 +420,12 @@ create a folder that is gone (`createFolders` is false); its result's `stored` t
 they synced, also when the deletion came right after. `RoomManager` reads storage again before it
 opens a room nobody uses, closes a room whose project was deleted elsewhere once nobody uses it,
 and remembers the deletion for an hour, as it does for its own deletions, unless storage holds the
-project again.
+project again; requests wait 5 s at most for these reads, and not for a read another request
+stopped waiting for (`openReadWaitMs`). The sync server closes connections to a deleted project with
+code 4404 (`PROJECT_DELETED_CLOSE_CODE`), after which the browser's `SyncProvider`
+(`apps/web/src/sync/provider.ts`) no longer reconnects by itself; with WebDAV through the server,
+`ProjectSession` connects it again once a WebDAV sync finds the project stored there again. Save
+(Ctrl+S) shows what `WebDAVSync.save` reports.
 
 ## Observability
 

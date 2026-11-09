@@ -419,6 +419,38 @@ describe('shader programs of the viewport (three.js on a stand-in WebGL2 context
     });
   });
 
+  it('are not built again for final renders: after the viewport drew their shading without samples, they are drawn without them', () => {
+    // regression: final renders (F12, Render Animation, render_image in the browser) asked for 8
+    // samples (4 here, as in software WebGL): the first one after the viewport drew Rendered
+    // shading without samples (a heavy scene, slow frames) built every material's pipelines again:
+    // 19.4 s for the first F12 at 1280×720 and 11.4 s for the next one, in examples/domino-cascade
+    // with a 1 M triangle grid in software WebGL
+    const ids = (keys: Iterable<string>) => new Set([...keys].map((k) => k.split('|')[0]));
+    const built: Record<string, string[]> = {};
+    for (const multisampled of [true, false])
+      for (const shading of ['RENDERED', 'SOLID'] as const) {
+        const s = session();
+        const e = engine(s);
+        dominoes(s);
+        if (!multisampled) (e as unknown as { setMultisampling(on: boolean): void }).setMultisampling(false);
+        s.view.shading.value = shading;
+        frame(e);
+        const scene = ids([...stub.pipelines].filter((k) => !k.endsWith('|canvas')));
+        const before = new Set(stub.pipelines);
+        e.renderPixels({ width: 32, height: 16, shading });
+        frame(e);
+        built[`${shading}${multisampled ? '' : ' without multisampling'}`] = [...stub.pipelines].filter(
+          (k) => !before.has(k) && scene.has(k.split('|')[0]),
+        );
+      }
+    expect(built).toEqual({
+      RENDERED: [],
+      SOLID: [],
+      'RENDERED without multisampling': [],
+      'SOLID without multisampling': [],
+    });
+  });
+
   it('make a frame that links one count as compiling, also when it releases another, and not one that only releases one', () => {
     // regression: the viewport took a frame for compiling when three.js's last program changed.
     // three.js appends a program it links to its list and takes one it releases out by moving the

@@ -23,13 +23,33 @@ export interface RenderBuffers {
 }
 
 export function buildRenderBuffers(m: MeshData): RenderBuffers {
-  const topo = buildTopology(m);
-  const nCorners = topo.cornerCount;
+  // Typed arrays throughout: a mesh of a million faces has four million corners, and per-corner
+  // objects (string keys, small arrays, Map entries) used to take more than 2 GB of heap and
+  // twenty seconds for it. The result is the same as with those structures, number for number.
+  const faces = m.faces;
+  const nFaces = faces.length;
+  const nv = Math.floor(vertexCount(m));
   const p = m.positions;
 
+  // --- flat corner numbering (face f has corners faceCornerStart[f] … faceCornerStart[f + 1] - 1)
+  const faceCornerStart = new Int32Array(nFaces + 1);
+  let nCorners = 0;
+  for (let f = 0; f < nFaces; f++) {
+    faceCornerStart[f] = nCorners;
+    const face = faces[f];
+    for (let i = 0; i < face.length; i++) {
+      const v = face[i];
+      // every corner names a vertex of the mesh (as the adjacency lists it used to fill required)
+      if (!(Number.isInteger(v) && v >= 0 && v < nv))
+        throw new TypeError(`face ${f} corner ${i}: vertex index ${v} is not a vertex of the mesh`);
+    }
+    nCorners += face.length;
+  }
+  faceCornerStart[nFaces] = nCorners;
+
   // --- face normals (unit) and corner angle weights
-  const faceN = new Float64Array(m.faces.length * 3);
-  for (let f = 0; f < m.faces.length; f++) {
+  const faceN = new Float64Array(nFaces * 3);
+  for (let f = 0; f < nFaces; f++) {
     const n = faceNormalRaw(m, f);
     const l = Math.hypot(n[0], n[1], n[2]) || 1;
     faceN[f * 3] = n[0] / l;
@@ -52,32 +72,15 @@ export function buildRenderBuffers(m: MeshData): RenderBuffers {
     const rb = find(b);
     if (ra !== rb) parent[ra] = rb;
   };
-  const cornerOf = (f: number, v: number): number => {
-    const face = m.faces[f];
-    const i = face.indexOf(v);
-    return i < 0 ? -1 : topo.faceCornerStart[f] + i;
-  };
-  for (let e = 0; e < topo.edges.length; e++) {
-    const ef = topo.edgeFaces[e];
-    if (ef.length !== 2) continue;
-    const [f0, f1] = ef;
-    if (!m.faceSmooth[f0] || !m.faceSmooth[f1]) continue;
-    const [a, b] = topo.edges[e];
-    if (m.edgeAttrs[edgeKey(a, b)]?.sharp) continue;
-    for (const v of [a, b]) {
-      const c0 = cornerOf(f0, v);
-      const c1 = cornerOf(f1, v);
-      if (c0 >= 0 && c1 >= 0) union(c0, c1);
-    }
-  }
+  joinSmoothFans(m, faceCornerStart, nCorners, union);
 
   // --- accumulate angle-weighted normals per fan root
   const fanN = new Float64Array(nCorners * 3);
-  for (let f = 0; f < m.faces.length; f++) {
-    const face = m.faces[f];
+  for (let f = 0; f < nFaces; f++) {
+    const face = faces[f];
     const n = face.length;
     for (let i = 0; i < n; i++) {
-      const c = topo.faceCornerStart[f] + i;
+      const c = faceCornerStart[f] + i;
       let w = 1;
       if (m.faceSmooth[f]) {
         const v = face[i] * 3;
@@ -103,92 +106,226 @@ export function buildRenderBuffers(m: MeshData): RenderBuffers {
     }
   }
 
-  // --- emit render vertices (deduplicated per vertex + fan + uv)
+  // --- render vertices: one per vertex + smoothing fan + UV, numbered in the order their first
+  // corner comes. The render vertices of each mesh vertex form a list (head / next); a corner
+  // takes the one with its fan and the same UV (equal as the numbers' decimal text: -0 and 0 are
+  // the same, NaN equals NaN), else makes a new one.
   const hasUV = !!m.uvs;
   const hasColor = !!m.colors && m.colors.length === vertexCount(m) * 4;
-  const posOut: number[] = [];
-  const nrmOut: number[] = [];
-  const uvOut: number[] = [];
-  const colOut: number[] = [];
-  const srcOut: number[] = [];
+  const uvs = m.uvs;
+  const sameUV = (a: unknown, b: unknown) => a === b || (a !== a && b !== b);
+  const head = new Int32Array(nv).fill(-1);
+  const next = new Int32Array(nCorners);
+  /** Fan root, face and corner within the face of every render vertex's first corner. */
+  const rvRoot = new Int32Array(nCorners);
+  const rvFace = new Int32Array(nCorners);
+  const rvCorner = new Int32Array(nCorners);
   const cornerVertex = new Int32Array(nCorners);
-  const dedupe = new Map<string, number>();
-  for (let f = 0; f < m.faces.length; f++) {
-    const face = m.faces[f];
-    const uv = hasUV ? m.uvs![f] : null;
+  let count = 0;
+  for (let f = 0; f < nFaces; f++) {
+    const face = faces[f];
+    const uv = hasUV ? uvs![f] : null;
     for (let i = 0; i < face.length; i++) {
-      const c = topo.faceCornerStart[f] + i;
+      const c = faceCornerStart[f] + i;
       const v = face[i];
       const r = find(c);
       const u0 = uv ? uv[i * 2] : 0;
       const u1 = uv ? uv[i * 2 + 1] : 0;
-      const key = hasUV ? `${v}|${r}|${u0}|${u1}` : `${v}|${r}`;
-      let idx = dedupe.get(key);
-      if (idx === undefined) {
-        idx = srcOut.length;
-        dedupe.set(key, idx);
-        posOut.push(p[v * 3], p[v * 3 + 1], p[v * 3 + 2]);
-        const nx = fanN[r * 3];
-        const ny = fanN[r * 3 + 1];
-        const nz = fanN[r * 3 + 2];
-        const l = Math.hypot(nx, ny, nz) || 1;
-        nrmOut.push(nx / l, ny / l, nz / l);
-        if (hasUV) uvOut.push(u0, u1);
-        if (hasColor) {
-          const cc = m.colors!;
-          colOut.push(cc[v * 4], cc[v * 4 + 1], cc[v * 4 + 2], cc[v * 4 + 3]);
+      let idx = head[v];
+      while (idx >= 0) {
+        if (rvRoot[idx] === r) {
+          if (!hasUV) break;
+          const ouv = uvs![rvFace[idx]];
+          const k = rvCorner[idx] * 2;
+          if (sameUV(ouv ? ouv[k] : 0, u0) && sameUV(ouv ? ouv[k + 1] : 0, u1)) break;
         }
-        srcOut.push(v);
+        idx = next[idx];
+      }
+      if (idx < 0) {
+        idx = count++;
+        rvRoot[idx] = r;
+        rvFace[idx] = f;
+        rvCorner[idx] = i;
+        next[idx] = head[v];
+        head[v] = idx;
       }
       cornerVertex[c] = idx;
     }
   }
-
-  // --- triangles grouped by material
-  const byMaterial = new Map<number, { tris: number[]; faces: number[] }>();
-  for (let f = 0; f < m.faces.length; f++) {
-    const mat = m.faceMaterials[f] ?? 0;
-    let bucket = byMaterial.get(mat);
-    if (!bucket) {
-      bucket = { tris: [], faces: [] };
-      byMaterial.set(mat, bucket);
+  const positions = new Float32Array(count * 3);
+  const normals = new Float32Array(count * 3);
+  const uvOut = hasUV ? new Float32Array(count * 2) : null;
+  const colors = hasColor ? new Float32Array(count * 4) : null;
+  const vertexSource = new Uint32Array(count);
+  const cc = m.colors;
+  for (let k = 0; k < count; k++) {
+    const f = rvFace[k];
+    const i = rvCorner[k];
+    const v = faces[f][i];
+    const r = rvRoot[k];
+    positions[k * 3] = p[v * 3];
+    positions[k * 3 + 1] = p[v * 3 + 1];
+    positions[k * 3 + 2] = p[v * 3 + 2];
+    const nx = fanN[r * 3];
+    const ny = fanN[r * 3 + 1];
+    const nz = fanN[r * 3 + 2];
+    const l = Math.hypot(nx, ny, nz) || 1;
+    normals[k * 3] = nx / l;
+    normals[k * 3 + 1] = ny / l;
+    normals[k * 3 + 2] = nz / l;
+    if (uvOut) {
+      const uv = uvs![f];
+      uvOut[k * 2] = (uv ? uv[i * 2] : 0) as number;
+      uvOut[k * 2 + 1] = (uv ? uv[i * 2 + 1] : 0) as number;
     }
-    const corners = triangulateFaceCorners(m, f);
-    const base = topo.faceCornerStart[f];
-    for (let i = 0; i < corners.length; i += 3) {
-      bucket.tris.push(
-        cornerVertex[base + corners[i]],
-        cornerVertex[base + corners[i + 1]],
-        cornerVertex[base + corners[i + 2]],
-      );
-      bucket.faces.push(f);
+    if (colors) {
+      colors[k * 4] = cc![v * 4];
+      colors[k * 4 + 1] = cc![v * 4 + 1];
+      colors[k * 4 + 2] = cc![v * 4 + 2];
+      colors[k * 4 + 3] = cc![v * 4 + 3];
     }
+    vertexSource[k] = v;
   }
-  const mats = [...byMaterial.keys()].sort((a, b) => a - b);
+
+  // --- triangles grouped by material (in face order within a material, materials ascending).
+  // Triangles are counted first (quads and triangles without triangulating them; larger polygons
+  // are triangulated once and kept for the second pass), then written in place.
+  const triCount = new Map<number, number>();
+  const polygons = new Map<number, number[]>();
+  for (let f = 0; f < nFaces; f++) {
+    const mat = m.faceMaterials[f] ?? 0;
+    const n = faces[f].length;
+    let t: number;
+    if (n < 3) t = 0;
+    else if (n === 3) t = 1;
+    else if (n === 4) t = 2;
+    else {
+      const corners = triangulateFaceCorners(m, f);
+      polygons.set(f, corners);
+      t = corners.length / 3;
+    }
+    triCount.set(mat, (triCount.get(mat) ?? 0) + t);
+  }
+  const mats = [...triCount.keys()].sort((a, b) => a - b);
   let total = 0;
-  for (const k of mats) total += byMaterial.get(k)!.tris.length;
+  const groups: RenderBuffers['groups'] = [];
+  const offset = new Map<number, number>();
+  for (const k of mats) {
+    const n = triCount.get(k)! * 3;
+    groups.push({ start: total, count: n, materialIndex: k });
+    offset.set(k, total);
+    total += n;
+  }
   const indices = new Uint32Array(total);
   const triFace = new Uint32Array(total / 3);
-  const groups: RenderBuffers['groups'] = [];
-  let o = 0;
-  for (const k of mats) {
-    const b = byMaterial.get(k)!;
-    indices.set(b.tris, o);
-    triFace.set(b.faces, o / 3);
-    groups.push({ start: o, count: b.tris.length, materialIndex: k });
-    o += b.tris.length;
+  for (let f = 0; f < nFaces; f++) {
+    const n = faces[f].length;
+    if (n < 3) continue;
+    const mat = m.faceMaterials[f] ?? 0;
+    const corners = n > 4 ? polygons.get(f)! : triangulateFaceCorners(m, f);
+    const base = faceCornerStart[f];
+    let o = offset.get(mat)!;
+    for (let i = 0; i < corners.length; i += 3) {
+      indices[o] = cornerVertex[base + corners[i]];
+      indices[o + 1] = cornerVertex[base + corners[i + 1]];
+      indices[o + 2] = cornerVertex[base + corners[i + 2]];
+      triFace[o / 3] = f;
+      o += 3;
+    }
+    offset.set(mat, o);
   }
 
   return {
-    positions: new Float32Array(posOut),
-    normals: new Float32Array(nrmOut),
-    uvs: hasUV ? new Float32Array(uvOut) : null,
-    colors: hasColor ? new Float32Array(colOut) : null,
+    positions,
+    normals,
+    uvs: uvOut,
+    colors,
     indices,
     groups,
     triFace,
-    vertexSource: new Uint32Array(srcOut),
+    vertexSource,
   };
+}
+
+/**
+ * Joins the corners of smooth faces around shared edges into smoothing fans: across every edge
+ * that exactly two faces use, both smooth and the edge not sharp, the corners of each of its two
+ * vertices in the two faces (the first corner of the vertex in each face). Edges are found with
+ * typed arrays: the corners' edges listed per lower vertex, in face order.
+ */
+function joinSmoothFans(
+  m: MeshData,
+  faceCornerStart: Int32Array,
+  nCorners: number,
+  union: (a: number, b: number) => void,
+): void {
+  const faces = m.faces;
+  const nFaces = faces.length;
+  if (!m.faceSmooth.some((s, f) => s && f < nFaces)) return;
+  const nv = Math.floor(vertexCount(m));
+  // the edge of every corner (to the next corner of its face), listed under its lower vertex
+  const start = new Int32Array(nv + 1);
+  for (let f = 0; f < nFaces; f++) {
+    const face = faces[f];
+    for (let i = 0; i < face.length; i++) start[Math.min(face[i], face[(i + 1) % face.length]) + 1]++;
+  }
+  for (let v = 0; v < nv; v++) start[v + 1] += start[v];
+  const fill = start.slice(0, nv);
+  const otherEnd = new Int32Array(nCorners);
+  const edgeFace = new Int32Array(nCorners);
+  for (let f = 0; f < nFaces; f++) {
+    const face = faces[f];
+    for (let i = 0; i < face.length; i++) {
+      const a = face[i];
+      const b = face[(i + 1) % face.length];
+      const lo = a < b ? a : b;
+      const k = fill[lo]++;
+      otherEnd[k] = a < b ? b : a;
+      edgeFace[k] = f;
+    }
+  }
+  const hasAttrs = Object.keys(m.edgeAttrs).length > 0;
+  const cornerOf = (f: number, v: number): number => {
+    const i = faces[f].indexOf(v);
+    return i < 0 ? -1 : faceCornerStart[f] + i;
+  };
+  // entries of one lower vertex, ordered by the other end (stable: faces stay in order)
+  let order: number[] = [];
+  for (let lo = 0; lo < nv; lo++) {
+    const s = start[lo];
+    const e = start[lo + 1];
+    if (e - s < 2) continue;
+    order.length = 0;
+    for (let k = s; k < e; k++) order.push(k);
+    if (e - s > 2) order.sort((x, y) => otherEnd[x] - otherEnd[y] || x - y);
+    else if (otherEnd[order[0]] > otherEnd[order[1]]) order = [order[1], order[0]];
+    for (let j = 0; j < order.length;) {
+      const hi = otherEnd[order[j]];
+      // the distinct faces of edge (lo, hi), in face order
+      let f0 = -1;
+      let f1 = -1;
+      let distinct = 0;
+      let last = -1;
+      let q = j;
+      for (; q < order.length && otherEnd[order[q]] === hi; q++) {
+        const f = edgeFace[order[q]];
+        if (f === last) continue;
+        last = f;
+        if (distinct === 0) f0 = f;
+        else if (distinct === 1) f1 = f;
+        distinct++;
+      }
+      j = q;
+      if (distinct !== 2) continue;
+      if (!m.faceSmooth[f0] || !m.faceSmooth[f1]) continue;
+      if (hasAttrs && m.edgeAttrs[edgeKey(lo, hi)]?.sharp) continue;
+      for (const v of [lo, hi]) {
+        const c0 = cornerOf(f0, v);
+        const c1 = cornerOf(f1, v);
+        if (c0 >= 0 && c1 >= 0) union(c0, c1);
+      }
+    }
+  }
 }
 
 /** Unique edges as flat vertex index pairs (for wireframe overlays). */

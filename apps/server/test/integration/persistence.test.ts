@@ -107,8 +107,11 @@ describe('disk persistence', () => {
     await eventually(() => c.closeCode === 4404, 10_000, 'socket closed with 4404');
     expect((await api(server.url, `/api/projects/${id}`)).status).toBe(404);
     expect((await api(server.url, `/api/projects/${id}`, { method: 'DELETE' })).status).toBe(404);
-    // a reconnecting client cannot resurrect a deleted project
-    await expect(c.connect()).rejects.toThrow(/410/);
+    // a reconnecting client cannot resurrect a deleted project: its connection is closed at once
+    // with the same code (it used to be refused with HTTP 410, which browsers cannot read: they
+    // took it for a lost network and connected again and again)
+    await expect(c.connect()).rejects.toThrow('sync client: closed (4404)');
+    expect(server.handle.rooms.get(id)).toBeUndefined();
   });
 });
 

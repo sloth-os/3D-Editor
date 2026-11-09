@@ -3,11 +3,12 @@ import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { SceneDoc } from '@3d-editor/core';
 import { isNotImplemented } from '../api/projects';
-import { RenderRequestError, isCancelled, type RenderProgress } from '../render';
+import { RenderRequestError, isCancelled, isOutOfMemory, type RenderProgress } from '../render';
 import { errorMessage } from '../observability/tracing';
 import { RpcError, type Room, type RpcAnswer, type SyncConnection } from '../sync/room';
 import { ToolError } from './agent';
 import { MAX_EDITOR_WAIT_MS } from './editor-commands';
+import { BROWSER_RASTER_SECONDS, measured } from './editor-costs';
 
 /*
  * Shared pieces of the rendering tools (render_image, render_animation): option schemas,
@@ -30,10 +31,11 @@ export const MAX_RENDER_FRAMES = 1000;
 /**
  * How long render_image waits for a RASTER image of a browser editor with renderer 'browser' (ms):
  * an editor without GPU acceleration (software WebGL, e.g. a headless browser) takes tens of
- * seconds for a heavy scene. Measured in headless Chromium with SwiftShader at the default 800×450:
- * the first image of a 71-material scene took 21.9–29.9 s, as it built and compiled the materials,
- * and the next ones 3.7–7.4 s; images of 4 million triangles took 4.5–13.3 s. Under the 60 s
- * default request timeout of MCP clients (see {@link MAX_EDITOR_WAIT_MS}).
+ * seconds for a heavy scene. Measured in headless Chromium with SwiftShader at the default 800×450
+ * on a calm machine with 4 CPUs (editor-costs.ts BROWSER_RASTER_SECONDS): the first image of a
+ * 71-material scene took 22.8–23.3 s, as it built and compiled the materials, and the next ones
+ * 3.5–4.1 s; images of 4 million triangles took 2.1–8.1 s; on a busy machine up to 4.6 times as
+ * long. Under the 60 s default request timeout of MCP clients (see {@link MAX_EDITOR_WAIT_MS}).
  */
 export const BROWSER_RASTER_TIMEOUT_MS = MAX_EDITOR_WAIT_MS;
 /**
@@ -144,8 +146,9 @@ export function browserRenderFailure(err: unknown, r: BrowserRender): { reason: 
   return {
     reason: `browser render failed: the editor did not finish the RASTER image within ${seconds} s${busy}`,
     advice:
-      'It may still be drawing it, and its next renders and commands wait until it has. ' +
-      'A heavy scene takes tens of seconds in an editor without GPU acceleration (software WebGL, e.g. a headless browser): ' +
+      'It may still be drawing it, and its next renders and commands wait until it has. An editor without GPU ' +
+      `acceleration (e.g. a headless browser) took ${measured(BROWSER_RASTER_SECONDS)}, and ` +
+      'longer for heavier scenes: ' +
       (r.shading === 'SOLID'
         ? "render on the server with renderer 'software' (or 'auto') or render a smaller image."
         : "render on the server with renderer 'software' (or 'auto'), render a smaller image, or pass shading 'SOLID' (grey clay, faster)."),
@@ -174,7 +177,10 @@ export const samplesArg = z
   .optional()
   .describe(
     'PATHTRACER: samples per pixel (default: the render settings samples, 64; 16–32 for previews, 128+ for clean finals). ' +
-      'RASTER: anti-aliasing supersampling 1, 2 or 4 (default 2)',
+      "RASTER: anti-aliasing supersampling 1, 2 or 4 (default 2) of the server's rasterizer; a browser editor's RASTER " +
+      "image ignores it (WebGL: 8 samples, or the GPU's maximum: 4 in software WebGL; where the viewport drew that " +
+      'shading only without multisampling, or has not drawn it while its multisampling is off: 5 pictures averaged ' +
+      'when the first took at most 1 s, else SMAA)',
   );
 
 /** `max_bounces` argument (path tracer). */
@@ -279,11 +285,28 @@ export function animationFrameSize(
   };
 }
 
-/** Converts render failures to tool errors with a useful message. */
+/**
+ * What to do when a render needed more memory than the server gives it (a RenderOutOfMemoryError:
+ * its render process ran out of memory, or single-thread mode refused it).
+ */
+export const OUT_OF_MEMORY_ADVICE =
+  'The scene needs more memory than a server render has: render fewer triangles (hide large meshes ' +
+  'from renders with hide_render, lower the render levels of Subdivision Surface modifiers, fewer ' +
+  "particle instances), or render in a browser editor that has the project open (renderer 'browser').";
+
+/**
+ * Converts render failures to tool errors with a useful message. A render that ran out of memory
+ * (code FAILED) says so, that the server keeps running, and what to do instead.
+ */
 export function renderToolError(err: unknown, what = 'Rendering'): ToolError {
   if (err instanceof ToolError) return err;
   if (err instanceof RenderRequestError) return new ToolError(err.message);
   if (isCancelled(err)) return new ToolError(`${what} was cancelled.`);
+  // another render that shared the render process ran it out of memory: this one can run again
+  if (isOutOfMemory(err) && err.reason === 'shared')
+    return new ToolError(`${what} failed: ${err.message}.`, 'FAILED');
+  if (isOutOfMemory(err))
+    return new ToolError(`${what} failed: ${err.message}. ${OUT_OF_MEMORY_ADVICE}`, 'FAILED');
   if (isNotImplemented(err))
     return new ToolError(`${what} is not available in this build (${errorMessage(err)}).`);
   return new ToolError(`${what} failed: ${errorMessage(err)}`);

@@ -105,6 +105,29 @@ describe('euler orders', () => {
   });
 });
 
+describe('stored eulers near gimbal lock', () => {
+  it('the first and last angles are corrected by the shortest way, also when their difference or sum wraps around', () => {
+    // with X and Z near ±180° their difference (Y near 90°) or sum (Y near −90°) is near ±360°,
+    // the same as the near 0 the matrix gives: the correction must wrap it, or it turns the angles
+    // by 180°, which leaves the matrix 0.02 off for cosines of Y between 0.001 and 0.01
+    let seed = 2026;
+    const rnd = () => ((seed = (seed * 16807) % 2147483647), seed / 2147483647);
+    let worst = 0;
+    for (let n = 0; n < 2000; n++) {
+      const cos = Math.exp(Math.log(1e-3) + rnd() * Math.log(10));
+      const up = rnd() < 0.5;
+      const x = (rnd() < 0.5 ? 1 : -1) * (Math.PI - rnd() * 0.3);
+      const z = (up ? -1 : 1) * Math.sign(x) * (Math.PI - rnd() * 0.3);
+      const e: [number, number, number] = [x, (up ? 1 : -1) * Math.acos(cos), z];
+      const m = eulerToMatrix(e);
+      const stored = matrixToStoredEuler(m, e);
+      const back = eulerToMatrix(stored);
+      for (const k of [0, 1, 2, 4, 5, 6, 8, 9, 10]) worst = Math.max(worst, Math.abs(back[k] - m[k]));
+    }
+    expect(worst).toBeLessThan(1e-14);
+  });
+});
+
 describe('decompositions', () => {
   it('splits mirrored matrices like Blender (all sizes negated, rotation kept proper)', () => {
     const m = compose4([1, 2, 3], [0.2, 0.3, 0.4], [-2, 3, 4]);

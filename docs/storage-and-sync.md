@@ -13,6 +13,10 @@ When WebDAV is configured the local copy is merged with the WebDAV copy on open,
 after each change, every 20 s (to pick up other devices) and when the tab is hidden. A project
 deleted from WebDAV (on another device, or in another tab) is not stored there again unless the
 tab's copy changed since the browser's last sync (see [Deleted projects](#deleted-projects)).
+Save (Ctrl+S) syncs at once and says what happened: `Saved to WebDAV`, `Saved in this browser`
+(no WebDAV), stored there again after a deletion, deleted right after this save, offline (saved in
+this browser; WebDAV syncs when the browser is back online), or `Not saved to WebDAV` with the
+reason.
 
 Saving is a CRDT merge (`ProjectFileStore.syncDocument`): read the stored state, merge it into
 the local document, and write the merged state back with `If-Match` (retrying on HTTP 412).
@@ -54,8 +58,11 @@ project at the same moment. Every writer:
   the next refresh (every 60 s), before it is evicted (idle for `ROOM_IDLE_TTL_SECONDS`) and when
   the server stops, and writes its changes again if they are missing; it is not evicted while that
   read fails. A room that nobody uses reads the document again before the server opens it, unless
-  it read it within the last 2 s; the server waits 5 s at most for that read. Browsers sync every
-  20 s while the project is open.
+  it read it within the last 2 s; the server waits 5 s at most for that read (and for the check
+  whether storage holds a project it deleted again, below), and once a request stopped waiting for
+  a read, the requests that come while it goes on do not wait for it (an MCP tool that asks whether
+  a project exists and then opens it, or lists the projects, waits 5 s, not twice that). Browsers
+  sync every 20 s while the project is open.
 - **Does not bring back deleted projects** (next section).
 
 `SYNC_PERSISTENCE=disk` checks `If-Match` and writes in one step under a lock, gives each version a
@@ -135,8 +142,15 @@ nothing.
   (its read-back finds no document, or its write of `project.json` finds no folder), it writes
   neither the document nor `project.json` again (writes never create a project's folder that is
   gone; they used to, which left a `project.json` that every server listed without a document).
-  When another writer's save had replaced its write without its changes (servers that ignore
-  `If-Match`) before the deletion, those changes count as unsaved.
+  When another writer's save replaced its write without its changes (servers that ignore
+  `If-Match`) and the deletion came after that, those changes count as unsaved only if the
+  writer's own save finds the replacement in its read-back and writes with `create`: a room's save
+  of unsaved changes, a browser's sync while its copy holds insertions beyond its record (below),
+  or Save. That save stores the project again. When the replacement lands after the writer's
+  read-back confirmed its write and the deletion comes before the writer's next read, that read
+  writes nothing unless the writer made changes since, or the person saves in a browser (a room's
+  refresh does not create a document, and the browser's record holds the replaced write): those
+  changes are gone with the project.
 - A server room learns of the deletion when it reads storage: in the periodic refresh (rooms with
   editors connected, and rooms that wrote to WebDAV since their last read), in its read-back,
   before eviction or at shutdown when it wrote since its last read, and before the server opens a
@@ -144,9 +158,9 @@ nothing.
   room read storage within the last 2 s. Without unsaved changes it writes nothing. A room that
   nobody uses is then closed (right away, or by the next check for idle rooms, every 60 s by
   default), and the server answers like the one that deleted the project: it does not list or
-  open it (MCP tools answer that the project was not found), and refuses sync connections to it
-  for an hour. A room in use stays open, and a change made in it saves the project again. The
-  server logs both at `info`:
+  open it (MCP tools answer that the project was not found), and closes sync connections to it
+  for an hour (code 4404, below). A room in use stays open, and a change made in it saves the
+  project again. The server logs both at `info`:
   - `project deleted from storage elsewhere: not saved again unless it changes on this server`
   - `project deleted from storage elsewhere: saved again with the changes made on this server`
 - A server lists what storage lists, and the projects whose rooms are in use or have unsaved
@@ -154,9 +168,33 @@ nothing.
   its document is still stored (its `project.json` may be unreadable): when it is not, the room
   reads storage and is closed. When listing storage fails, the server lists the projects it has
   loaded and logs `listing projects failed` at `warn`.
-- The server that deleted a project refuses sync connections to it for an hour (they would upload
+- The server that deleted a project closes sync connections to it for an hour (they would upload
   a browser's copy as a new project), but lists and opens it as soon as storage holds it again
-  (another writer saved its unsaved changes).
+  (another writer saved its unsaved changes). It asks storage whether it does when a request needs
+  the project (opening it, listing projects, a sync connection), and waits 5 s at most for the
+  answer, once (the requests that come while that check goes on, after one stopped waiting for it,
+  do not wait): without an answer, the project counts as still deleted, and the requests after the
+  answer find it.
+- When the server deletes a project, it closes the project's sync connections with code 4404
+  (`project deleted`); a new connection to a project it deleted, or whose room it closed after
+  finding the project deleted from storage, it accepts and closes at once the same way (browsers
+  cannot read the status of a refused WebSocket upgrade: they took HTTP 410 for a lost network
+  and connected again and again). A browser whose connection is closed with that code says that
+  the project was deleted on the server, shows `deleted` as its sync status (`Local only` in the
+  status bar), and no longer connects to the server for that project by itself; it keeps its copy
+  and its edits, in IndexedDB and in its other tabs, and syncs with WebDAV by the rules above.
+  Reloading the page, or Save (Ctrl+S), connects again; while the server has the project deleted it
+  closes that connection the same way, and the page says nothing more (a reload says it once
+  again). It says so again for a new deletion, after a room of the server took one of its
+  connections (the server held the project again).
+- With WebDAV through the server (`WEBDAV_URL`, the `/dav` proxy), WebDAV is the server's
+  storage: a browser says once that the project was deleted, whether the server's connection or a
+  WebDAV sync tells it first, and the server's message says that a change or Save stores the
+  project on the server again. When a WebDAV sync then finds the project stored there again (this
+  browser's change or Save stored it again, or another writer did), the browser connects to the
+  server again, which opens the project again, and the page syncs live again. With WebDAV used
+  directly, the browser's storage tells nothing about the server's, and it does not connect again
+  by itself.
 - A browser remembers in localStorage, which all its tabs share, per project and WebDAV store, the
   state vector of the stored states its syncs read or wrote (also of a write another writer
   deleted right after). When the store no longer has a project the browser synced before, a tab
@@ -179,7 +217,8 @@ created offline. A browser with no record of syncing a project (a private window
 or a project it last synced with an earlier version) treats it as never synced. The records stay
 in localStorage after a project is deleted. nginx with `create_full_put_path on` creates missing
 folders on PUT itself: a deletion between a save's document and its `project.json` leaves that
-`project.json`.
+`project.json`. Servers list such a project under the name in its `project.json` and open it with
+an empty scene of that name; its first change stores a document again.
 
 ## Real-time sync
 

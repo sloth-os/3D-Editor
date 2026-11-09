@@ -38,7 +38,10 @@ export function isSceneEmpty(scene: SceneDoc): boolean {
   return scene.map('meta').size === 0 && scene.objectIds().length === 0;
 }
 
-/** Builds the `project.json` record for a document, keeping fields such as the thumbnail. */
+/**
+ * Builds the `project.json` record for a document, keeping fields such as the thumbnail. A document
+ * without a name (`getMeta` says 'Untitled' then) keeps the stored record's name.
+ */
 export function projectInfoFromScene(
   id: string,
   scene: SceneDoc,
@@ -46,10 +49,11 @@ export function projectInfoFromScene(
   now = new Date(),
 ): ProjectInfo {
   const meta = scene.getMeta();
+  const named = scene.map('meta').has('name');
   return {
     ...(prev ?? {}),
     id,
-    name: meta.name || prev?.name || 'Untitled',
+    name: (named && meta.name) || prev?.name || 'Untitled',
     created_at: prev?.created_at || meta.created_at || now.toISOString(),
     updated_at: now.toISOString(),
     schema_version: meta.schema_version || SCHEMA_VERSION,

@@ -4,6 +4,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass.js';
 import { Pass } from 'three/examples/jsm/postprocessing/Pass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { effect, untracked } from '@preact/signals';
 import {
@@ -80,6 +81,36 @@ export const VIEW_ANIMATION_MS = 220;
 
 /** Multisampling of the viewport's scene target (smooth edges). */
 export const VIEWPORT_MSAA_SAMPLES = 4;
+/**
+ * Samples of a multisampled final render (F12, Render Animation, MCP renders; see
+ * {@link ViewportEngine.finalSampling}). three.js gives the GPU's maximum when it has fewer: 4 in
+ * software WebGL, the viewport's count.
+ */
+export const FINAL_RENDER_SAMPLES = 8;
+/**
+ * Where the pictures of a supersampled final render are moved, in pixels (x right, y up; see
+ * {@link ViewportEngine.finalSampling}): not at all for the first one, the picture SMAA smooths
+ * when the others do not fit {@link FINAL_SUPERSAMPLE_MS}; then by the offsets of Direct3D's
+ * standard 4× multisample pattern (a rotated grid). Averaged, they sample every pixel at 5 points,
+ * no two in the same row or column.
+ */
+export const FINAL_SUPERSAMPLE_OFFSETS: readonly (readonly [number, number])[] = [
+  [0, 0],
+  [-2 / 16, -6 / 16],
+  [6 / 16, -2 / 16],
+  [-6 / 16, 2 / 16],
+  [2 / 16, 6 / 16],
+];
+/**
+ * A final render drawn without samples is supersampled when the GPU drew its first picture in at
+ * most this long (ms; see {@link ViewportEngine.finalSampling}): the four more pictures are then
+ * projected to take at most 4 s, and the render stays well within the 15 s that render_image's
+ * renderer 'auto' waits for the browser. In software WebGL (SwiftShader) at 1280×720, the first
+ * picture of a light scene (the startup scene with 18 rods and a 1 M triangle grid out of view)
+ * took 0.4–0.7 s; that of examples/domino-cascade's camera view, which procedural wood fills,
+ * 8.0–10.4 s (3.2 s at 800×450).
+ */
+export const FINAL_SUPERSAMPLE_MS = 1000;
 /**
  * A viewport frame whose multisampled renders (shadow maps, the scene and its overlays, drawn into
  * the scene target) the GPU is seen still drawing this long after it could start them turns the
@@ -223,6 +254,92 @@ const UNPREMULTIPLY_SHADER = {
     }`,
 };
 
+/**
+ * SMAA on a transparent film (see renderPixels), around three.js's SMAA pass: premultiplies the
+ * shown (sRGB-encoded) colours by alpha, and divides them by it again after SMAA. SMAA's blend
+ * (SMAABlendShader) mixes neighbouring colours raised to the power 2.2, about linear light, and
+ * alpha as it is: the colours are premultiplied in that space (rgb · a^(1/2.2) = (rgb^2.2 · a)^(1/2.2)),
+ * so they are blended with the same weights as alpha, and an edge pixel between an object and the
+ * transparent background keeps the object's colour at the blended alpha (premultiplied by alpha
+ * itself, it came out a^(1/2.2 - 1) times too bright: 1.65 times at 40 % coverage).
+ */
+const SMAA_PREMULTIPLY_SHADER = {
+  name: 'SmaaPremultiplyShader',
+  uniforms: { tDiffuse: { value: null } },
+  vertexShader: UNPREMULTIPLY_SHADER.vertexShader,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    varying vec2 vUv;
+    vec4 premultiplied( vec4 c ) {
+      return vec4( c.rgb * pow( c.a, 1.0 / 2.2 ), c.a );
+    }
+    void main() {
+      gl_FragColor = premultiplied( texture2D( tDiffuse, vUv ) );
+    }`,
+};
+/** Divides SMAA's output by alpha again (see {@link SMAA_PREMULTIPLY_SHADER}). */
+const SMAA_UNPREMULTIPLY_SHADER = {
+  name: 'SmaaUnpremultiplyShader',
+  uniforms: { tDiffuse: { value: null } },
+  vertexShader: UNPREMULTIPLY_SHADER.vertexShader,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    varying vec2 vUv;
+    vec4 straight( vec4 c ) {
+      return c.a > 0.0 ? vec4( c.rgb / pow( c.a, 1.0 / 2.2 ), c.a ) : vec4( 0.0 );
+    }
+    void main() {
+      gl_FragColor = straight( texture2D( tDiffuse, vUv ) );
+    }`,
+};
+
+/**
+ * Averages the pictures of a supersampled final render ({@link FINAL_SUPERSAMPLE_OFFSETS}): mixes
+ * picture `tSample` into the average of those before it (`tDiffuse`) with `weight` 1 / n for the
+ * n-th, colour (linear, premultiplied on a transparent film) and alpha alike, like the resolve of a
+ * multisampled picture.
+ */
+const AVERAGE_SHADER = {
+  name: 'AverageShader',
+  uniforms: { tDiffuse: { value: null }, tSample: { value: null }, weight: { value: 1 } },
+  vertexShader: UNPREMULTIPLY_SHADER.vertexShader,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform sampler2D tSample;
+    uniform float weight;
+    varying vec2 vUv;
+    vec4 averaged( vec4 before, vec4 picture ) {
+      return mix( before, picture, weight );
+    }
+    void main() {
+      gl_FragColor = averaged( texture2D( tDiffuse, vUv ), texture2D( tSample, vUv ) );
+    }`,
+};
+
+/**
+ * Moves the picture of `cam` by `x`, `y` pixels of a `width` × `height` image (sub-pixel offsets
+ * of a supersampled render): its projection becomes `base` followed by that translation in clip
+ * space, which keeps a lens shift (render/view.ts applyLensShift edits the projection the same way;
+ * setViewOffset would compute the projection anew without it).
+ */
+function moveProjection(
+  cam: THREE.Camera,
+  base: THREE.Matrix4,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): void {
+  const e = cam.projectionMatrix.copy(base).elements;
+  const dx = (2 * x) / width;
+  const dy = (2 * y) / height;
+  for (let c = 0; c < 4; c++) {
+    e[c * 4] += dx * e[c * 4 + 3];
+    e[c * 4 + 1] += dy * e[c * 4 + 3];
+  }
+  cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+}
+
 /** Options of {@link ViewportEngine.renderImage} and the other render entry points. */
 export interface RenderImageOptions {
   width?: number;
@@ -235,6 +352,11 @@ export interface RenderImageOptions {
   useViewport?: boolean;
   /** Explicit viewpoint (world space, Z up); fov in degrees. */
   view?: { position: number[]; target: number[]; up?: number[]; fov_degrees?: number } | null;
+  /**
+   * A frame of Render Animation: multisampled ({@link FINAL_RENDER_SAMPLES}) whatever samples the
+   * viewport drew its shading with (see {@link ViewportEngine.finalSampling}).
+   */
+  animation?: boolean;
   /**
    * Viewport shading for the image: by default the viewport's current shading for a capture
    * (`useViewport`), RENDERED for a final render.
@@ -726,6 +848,8 @@ export class ViewportEngine {
 
   private setMultisampling(on: boolean): void {
     this.multisampling = on;
+    // final renders of what it draws now use SMAA: its lookup textures load meanwhile
+    if (!on) this.smaaPass();
     // the next frame builds every pipeline again, for the new sample count
     this.unsettled = true;
     const samples = on ? VIEWPORT_MSAA_SAMPLES : 0;
@@ -1367,7 +1491,8 @@ export class ViewportEngine {
    *
    * A capture is drawn with the viewport's multisampling, or with the other sample count when its
    * shading was drawn with that one only ({@link captureSamples}); a final render with up to 8
-   * samples.
+   * samples, or, where its shading was drawn without samples, without them: supersampled when that
+   * fits a time budget, else smoothed with SMAA ({@link finalSampling}).
    */
   renderPixels(opts: RenderImageOptions = {}): PixelImage {
     // the frames the GPU still draws are waited for with this picture, and the next frame comes
@@ -1386,6 +1511,7 @@ export class ViewportEngine {
     const prevBg = this.scene.background;
     const disposables: { dispose(): void }[] = [];
     const hiddenOverlays: THREE.Object3D[] = [];
+    let smaa: SMAAPass | null = null;
     try {
       // The camera comes from this evaluation too: the viewport's own one is from its last animation
       // frame (stale in hidden tabs, which get none) and at the viewport's frame.
@@ -1400,7 +1526,8 @@ export class ViewportEngine {
       const cam = this.renderCamera(ev, opts, aspect);
       this.aimRig(cam);
       this.fitShadows(cam);
-      const samples = opts.useViewport ? this.captureSamples() : 8;
+      const final = opts.useViewport ? null : this.finalSampling(shading, opts.animation === true);
+      const samples = final ? final.samples : this.captureSamples();
       const target = new THREE.WebGLRenderTarget(width, height, { samples, type: THREE.HalfFloatType });
       // The composer output is already tone mapped and sRGB encoded, so copy it raw (linear target).
       const out = new THREE.WebGLRenderTarget(width, height, { type: THREE.UnsignedByteType });
@@ -1414,15 +1541,18 @@ export class ViewportEngine {
       // mapping, so the PNG has straight alpha without dark fringes, like the path tracer's film.
       const transparent = ev.render.film_transparent;
       if (transparent) this.scene.background = null;
-      comp.addPass(
-        new RenderPass(
-          this.scene,
-          cam,
-          null,
-          transparent ? new THREE.Color(0, 0, 0) : null,
-          transparent ? 0 : null,
-        ),
+      const scenePass = new RenderPass(
+        this.scene,
+        cam,
+        null,
+        transparent ? new THREE.Color(0, 0, 0) : null,
+        transparent ? 0 : null,
       );
+      // a final render without samples draws its scene here (supersampled or not), the passes after
+      // it run in the composer
+      const supersampled =
+        final?.samples === 0 && this.drawFinalScene(scenePass, cam, comp, out, width, height, transparent);
+      if (final?.samples !== 0) comp.addPass(scenePass);
       if (opts.useViewport) {
         // The objects' part of the overlay scene, drawn over the scene like the viewport does: with
         // overlays off it holds only the wires of Wireframe shading, which are the shading, not an
@@ -1443,18 +1573,29 @@ export class ViewportEngine {
       // exposure, view transform and sRGB encoding like the path tracer's film (view-transform.ts)
       parts.output.setTransform(this.colorManagement.view, this.colorManagement.exposure);
       comp.addPass(parts.output);
-      this.drawShadows();
-      this.transmission.prepare(
-        this.renderer,
-        this.scene,
-        cam,
-        width,
-        height,
-        transparent ? 0 : 1,
-        this.transmissionLevels(),
-      );
+      if (final?.samples === 0 && !supersampled) {
+        // anti-aliasing of the picture as shown (after the view transform); on a transparent film
+        // it blends premultiplied colours, so the edges against the background keep their colour
+        if (transparent) comp.addPass(parts.premultiply);
+        smaa = this.smaaPass();
+        comp.addPass(smaa);
+        if (transparent) comp.addPass(parts.unpremultiplyShown);
+      }
+      if (final?.samples !== 0) {
+        this.drawShadows();
+        this.transmission.prepare(
+          this.renderer,
+          this.scene,
+          cam,
+          width,
+          height,
+          transparent ? 0 : 1,
+          this.transmissionLevels(),
+        );
+      }
       comp.render();
-      if (opts.useViewport) this.noteDrawn(samples);
+      if (final) this.noteDrawn(final.drawn, final.context);
+      else this.noteDrawn(samples);
       this.objects.disposeReplaced();
       // copy result (composer read buffer) into a byte target via a fullscreen quad, unblended
       parts.quad.material.map = comp.readBuffer.texture;
@@ -1484,6 +1625,8 @@ export class ViewportEngine {
       return { width, height, data };
     } finally {
       for (const d of disposables) d.dispose();
+      // the SMAA pass is kept (its shader programs); its targets go until the next render needs them
+      smaa?.setSize(1, 1);
       for (const c of hiddenOverlays) c.visible = true;
       this.scene.background = prevBg;
       view.shading.value = prevShading;
@@ -1513,15 +1656,129 @@ export class ViewportEngine {
    */
   private captureSamples(): number {
     const own = this.multisampling ? VIEWPORT_MSAA_SAMPLES : 0;
+    const other = own ? 0 : VIEWPORT_MSAA_SAMPLES;
     const drawn = this.drawnSamples.get(this.syncedContext);
-    return !drawn || drawn.has(own) ? own : own ? 0 : VIEWPORT_MSAA_SAMPLES;
+    return drawn && !drawn.has(own) && drawn.has(other) ? other : own;
   }
 
-  /** Notes that the draw context of the last sync was drawn with `samples` ({@link drawnSamples}). */
-  private noteDrawn(samples: number): void {
-    const drawn = this.drawnSamples.get(this.syncedContext);
+  /**
+   * How a final render (F12, Render Animation, MCP renders) in `shading` is anti-aliased without
+   * building a second set of pipelines in software WebGL (see {@link captureSamples}):
+   * multisampled ({@link FINAL_RENDER_SAMPLES}) where its draw context was drawn with samples, or
+   * has not been drawn while the viewport is multisampled, and in every frame of Render Animation
+   * (`animation`: its first frame builds the pipelines once if need be, and every frame gets the
+   * same anti-aliasing); else (`samples` 0) drawn without samples by {@link drawFinalScene}:
+   * supersampled, 5 pictures moved by fractions of a pixel and averaged, when the GPU drew the
+   * first one in at most {@link FINAL_SUPERSAMPLE_MS}, else that picture smoothed with SMAA after
+   * the view transform ({@link smaaPass}), which cannot draw what falls between pixel centres.
+   * With samples, the first final render after the viewport drew its shading without them (heavy
+   * scenes, slow frames) builds every material's pipelines again. Measured in software WebGL at
+   * 1280×720, in examples/domino-cascade with a 1 M triangle grid out of view (procedural wood fills
+   * the camera's picture): with 4 samples F12 took 17.9 s the first time (6 pipelines built) and
+   * 9.3 s the next, and render_image 'auto' gave up on the browser after 15 s (18.6 s in the page);
+   * without samples the first picture took 8.0–10.4 s, so SMAA: 8.3–8.8 s for F12, 10.1 s for
+   * render_image 'auto', which the browser answered. In the startup scene with 18 rods 0.8 px wide
+   * and the same grid, the first picture took 0.4–0.7 s, the supersampled render 1.6–3.4 s (4
+   * samples: 1.4–2.2 s); edges, the mean difference from a 4×4-supersampled render on its edge
+   * pixels (of 255), supersampled / 4 samples / SMAA / none: 5.8 / 6.6 / 10.7 / 13.8, the rods
+   * continuous with the first two and dashed with SMAA. `drawn` is the sample count noted for the
+   * context.
+   */
+  private finalSampling(
+    shading: NonNullable<RenderImageOptions['shading']>,
+    animation: boolean,
+  ): { samples: number; context: string; drawn: number } {
+    const context = drawContext({ shading, xray: false }, false);
+    const drawn = this.drawnSamples.get(context);
+    if (animation || (drawn ? [...drawn].some((n) => n > 0) : this.multisampling)) {
+      const samples = FINAL_RENDER_SAMPLES;
+      // three.js draws with the GPU's maximum when it has fewer
+      const max = this.renderer.capabilities?.maxSamples;
+      return { samples, context, drawn: max ? Math.min(samples, max) : samples };
+    }
+    return { samples: 0, context, drawn: 0 };
+  }
+
+  /**
+   * Draws the scene of a final render without samples ({@link finalSampling}) into the composer's
+   * read buffer with `pass`: one picture, timed by reading back one pixel of `sync` after the frames
+   * the GPU still drew for the viewport and after the picture; when that took at most
+   * {@link FINAL_SUPERSAMPLE_MS}, four more with the picture moved by fractions of a pixel
+   * ({@link FINAL_SUPERSAMPLE_OFFSETS}), averaged with it in linear light before the view transform
+   * (premultiplied on a transparent film), like the samples of a multisampled picture. Shadow maps
+   * are drawn once, transmission pictures for each picture, with its camera. Returns whether it
+   * supersampled (else the caller smooths the picture with SMAA).
+   */
+  private drawFinalScene(
+    pass: RenderPass,
+    cam: THREE.PerspectiveCamera | THREE.OrthographicCamera,
+    comp: EffectComposer,
+    sync: THREE.WebGLRenderTarget,
+    width: number,
+    height: number,
+    transparent: boolean,
+  ): boolean {
+    const levels = this.transmissionLevels();
+    const draw = (into: THREE.WebGLRenderTarget) => {
+      this.transmission.prepare(this.renderer, this.scene, cam, width, height, transparent ? 0 : 1, levels);
+      pass.render(this.renderer, into, into, 0, false);
+    };
+    const start = this.gpuDone(sync);
+    this.drawShadows();
+    draw(comp.readBuffer);
+    if (this.gpuDone(sync) - start > FINAL_SUPERSAMPLE_MS) return false;
+    const base = cam.projectionMatrix.clone();
+    const picture = new THREE.WebGLRenderTarget(width, height, { type: THREE.HalfFloatType });
+    const average = this.captureParts().average;
+    try {
+      for (let i = 1; i < FINAL_SUPERSAMPLE_OFFSETS.length; i++) {
+        const [x, y] = FINAL_SUPERSAMPLE_OFFSETS[i];
+        moveProjection(cam, base, x, y, width, height);
+        draw(picture);
+        average.uniforms.tSample.value = picture.texture;
+        average.uniforms.weight.value = 1 / (i + 1);
+        average.render(this.renderer, comp.writeBuffer, comp.readBuffer, 0, false);
+        comp.swapBuffers();
+      }
+    } finally {
+      cam.projectionMatrix.copy(base);
+      cam.projectionMatrixInverse.copy(base).invert();
+      average.uniforms.tSample.value = null;
+      picture.dispose();
+    }
+    return true;
+  }
+
+  /**
+   * Reads one pixel of `target` back: returns, with the time, once the GPU has drawn everything it
+   * was given (WebGL has no other wait for the GPU).
+   */
+  private gpuDone(target: THREE.WebGLRenderTarget): number {
+    this.renderer.setRenderTarget(target);
+    this.renderer.readRenderTargetPixels(target, 0, 0, 1, 1, new Uint8Array(4));
+    return performance.now();
+  }
+
+  /** SMAA of final renders drawn without samples ({@link finalSampling}). */
+  private smaa: SMAAPass | null = null;
+
+  /**
+   * The SMAA pass, made when first asked for: when the viewport first draws without samples
+   * ({@link setMultisampling}), so the lookup textures it decodes from data URLs are loaded before a
+   * final render uses it. Kept with its shader programs; its targets shrink after each render.
+   */
+  private smaaPass(): SMAAPass {
+    return (this.smaa ??= new SMAAPass());
+  }
+
+  /**
+   * Notes that a draw context (by default the one of the last sync) was drawn with `samples`
+   * ({@link drawnSamples}).
+   */
+  private noteDrawn(samples: number, context = this.syncedContext): void {
+    const drawn = this.drawnSamples.get(context);
     if (drawn) drawn.add(samples);
-    else this.drawnSamples.set(this.syncedContext, new Set([samples]));
+    else this.drawnSamples.set(context, new Set([samples]));
   }
 
   /**
@@ -1532,6 +1789,11 @@ export class ViewportEngine {
   private capture: {
     output: ViewTransformPass;
     unpremultiply: ShaderPass;
+    /** SMAA of a final render on a transparent film (see renderPixels). */
+    premultiply: ShaderPass;
+    unpremultiplyShown: ShaderPass;
+    /** The average of a supersampled final render's pictures ({@link drawFinalScene}). */
+    average: ShaderPass;
     quad: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
     quadScene: THREE.Scene;
     quadCamera: THREE.OrthographicCamera;
@@ -1548,6 +1810,9 @@ export class ViewportEngine {
     return (this.capture = {
       output: new ViewTransformPass(),
       unpremultiply: new ShaderPass(UNPREMULTIPLY_SHADER),
+      premultiply: new ShaderPass(SMAA_PREMULTIPLY_SHADER),
+      unpremultiplyShown: new ShaderPass(SMAA_UNPREMULTIPLY_SHADER),
+      average: new ShaderPass(AVERAGE_SHADER),
       quad,
       quadScene,
       quadCamera: new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1),
@@ -1663,9 +1928,13 @@ export class ViewportEngine {
     if (this.capture) {
       this.capture.output.dispose();
       this.capture.unpremultiply.dispose();
+      this.capture.premultiply.dispose();
+      this.capture.unpremultiplyShown.dispose();
+      this.capture.average.dispose();
       this.capture.quad.geometry.dispose();
       this.capture.quad.material.dispose();
     }
+    this.smaa?.dispose();
     this.worldEnv.dispose();
     if (this.finalEvalTimer) clearTimeout(this.finalEvalTimer);
     this.finalEval = null;

@@ -434,10 +434,13 @@ export class SceneDoc {
    * and is not written at all (no Yjs write, nothing for undo, sync or Adjust Last Operation to
    * see; see {@link changedTransform} for the rules). Every caller relies on that: parenting and
    * clearing parents with Keep Transform (also to and from armatures and bones), removing a parent,
-   * Set Origin and Apply Transform (their children keep their world matrices), Duplicate with an
-   * offset, and the editor's Align Active Camera to View. The transform operators change channels
-   * as Blender's do instead ({@link transformObject}). `parentWorld` replaces the parent's world
-   * matrix from the stored values (a bone's evaluated matrix for an object parented to a bone).
+   * Set Origin and Apply Transform (their children keep their world matrices), and the editor's
+   * Align Active Camera to View. The transform operators (and Duplicate with an offset, a Move)
+   * change channels as Blender's do instead (transformObjects in operators/transform.ts).
+   * `parentWorld` is the parent's matrix as the scene evaluates it at the current frame
+   * (FrameState.parent: a bone's posed matrix for an object parented to a bone, an animated or
+   * constrained parent where it is); left out, it is computed from the stored values, which know
+   * nothing of bones, poses, animation or constraints.
    */
   setWorldMatrix(id: string, world: Mat4, parentWorld?: Mat4 | null): void {
     const o = this.getObject(id);
@@ -447,38 +450,6 @@ export class SceneDoc {
     const current = parent ? multiply4(parent, this.localMatrix(o)) : this.localMatrix(o);
     const patch = changedTransform(o, world, current, parent);
     if (patch) this.updateObject(id, patch);
-  }
-
-  /**
-   * Moves, rotates or scales an object as Blender's Move, Rotate and Scale change its channels (see
-   * {@link transformedChannels}), writing only the channels whose values change by more than
-   * rounding ({@link transformTolerance}): `m` is a world translation (TRANSLATE) or the world
-   * rotation or scale (ROTATE, RESIZE) about the world point `pivot`. Reads the parent's world
-   * matrix from the stored values.
-   */
-  transformObject(id: string, mode: TransformMode, m: Readonly<Mat4>, pivot: Readonly<Vec3>): void {
-    const patch = this.transformedPatch(id, mode, m, pivot);
-    if (patch) this.updateObject(id, patch);
-  }
-
-  /**
-   * The channels {@link transformObject} writes, computed from the stored values without writing
-   * anything (null when none changes, or the object does not exist).
-   */
-  transformedPatch(
-    id: string,
-    mode: TransformMode,
-    m: Readonly<Mat4>,
-    pivot: Readonly<Vec3>,
-  ): Partial<ObjectData> | null {
-    const o = this.getObject(id);
-    if (!o) return null;
-    const parentWorld = o.parent && this.getObject(o.parent) ? this.worldMatrix(o.parent) : null;
-    const local = this.localMatrix(o);
-    const world = parentWorld ? multiply4(parentWorld, local) : local;
-    const basis = transformBasis(o, world, parentWorld);
-    const next = transformedChannels(o, basis, mode, m, pivot);
-    return changedChannels(o, next, transformTolerance(basis));
   }
 
   /** True if `ancestor` is `id` or one of its parents. */
@@ -493,14 +464,31 @@ export class SceneDoc {
     return false;
   }
 
-  /** Re-parents keeping the world transform (Blender "Object (Keep Transform)"). */
-  setParent(id: string, parent: string | null, keepTransform = true): void {
+  /**
+   * Parents an object to `parent` (an object parent; null clears it), keeping its world transform
+   * when `keepTransform` (Blender "Object (Keep Transform)", see {@link setWorldMatrix}).
+   * `evaluated`: the object's world matrix and the new parent's world matrix as the scene evaluates
+   * them at the current frame (FrameState.world: bones, poses, animation and constraints included);
+   * left out, both are computed from the stored values, which know nothing of those.
+   */
+  setParent(
+    id: string,
+    parent: string | null,
+    keepTransform = true,
+    evaluated?: { world: Mat4; parentWorld: Mat4 | null },
+  ): void {
     if (parent && this.isAncestor(id, parent))
       throw new Error('cannot parent an object to its own descendant');
     this.transact(() => {
-      const world = this.worldMatrix(id);
-      this.updateObject(id, { parent });
-      if (keepTransform) this.setWorldMatrix(id, world);
+      const o = this.getObject(id);
+      if (!o) return;
+      const world = evaluated?.world ?? this.worldMatrix(id);
+      const patch: Partial<ObjectData> = { parent };
+      // an object parent: a bone parent's bone no longer applies
+      if (o.parent_type !== 'OBJECT') patch.parent_type = 'OBJECT';
+      if (o.parent_bone) patch.parent_bone = '';
+      this.updateObject(id, patch);
+      if (keepTransform) this.setWorldMatrix(id, world, evaluated ? evaluated.parentWorld : undefined);
     });
   }
 
@@ -1264,9 +1252,13 @@ export type TransformMode = 'TRANSLATE' | 'ROTATE' | 'RESIZE';
 export interface TransformBasis {
   /** The world location of the object's origin (td->center). */
   center: Vec3;
-  /** World space to the parent's space (td->smtx): the inverse of the parent's world 3×3. */
+  /**
+   * World space to the space of the object's channels (td->smtx): the object's local 3×3 times the
+   * inverse of its world 3×3, which is the inverse of the parent's world 3×3 unless the world
+   * matrix includes constraints (see {@link transformBasis}).
+   */
   smtx: Mat4;
-  /** The parent's space to world space (td->mtx): the parent's world 3×3. */
+  /** The space of the object's channels to world space (td->mtx): the inverse of smtx. */
   mtx: Mat4;
   /** The object's world axes, normalized (td->axismtx). */
   axismtx: Mat4;
@@ -1330,9 +1322,10 @@ function invertSafeOrtho(m: Readonly<Mat4>): Mat4 {
 /**
  * Blender's transform_orientations_create_from_axis for an object's world axes: each normalized; a
  * zero axis is rebuilt from the others (one: their cross product; two: the other unit axes made
- * perpendicular to the third), else the identity.
+ * perpendicular to the third), else the identity. Blender's LOCAL orientation (the active object's
+ * axes) and an object's td->axismtx.
  */
-function orientationAxes(world: Readonly<Mat4>): Mat4 {
+export function orientationAxes(world: Readonly<Mat4>): Mat4 {
   const cols = [0, 1, 2].map((c) => column(world, c));
   const lengths = cols.map(length3);
   const out = cols.map((c, i) => (lengths[i] > 0 ? (c.map((v) => v / lengths[i]) as Vec3) : null));
@@ -1358,23 +1351,33 @@ function orientationAxes(world: Readonly<Mat4>): Mat4 {
 
 /**
  * The {@link TransformBasis} of an object with channels `o`, world matrix `world` and parent world
- * matrix `parentWorld` (null without a parent). Blender computes the conversion to the parent's
- * space as the local 3×3 times the inverse of the world 3×3 (each with zero axes made unit length
- * first, see {@link orthogonalizeZeroAxes}), which is the inverse of the parent's 3×3 when neither
- * has a zero axis; that inverse is computed directly then.
+ * matrix `parentWorld` (null without a parent), as ObjectToTransData reads them at the current
+ * frame: `o` holds the values the object shows there (Blender's channels hold the animated
+ * values), `parentWorld` is its parent's evaluated matrix (a bone's posed matrix for a bone child)
+ * and `world` = parentWorld · o, without the object's own constraints, which Blender switches off
+ * for this, or with them when `constrained` (Blender's constraints_list_needinv: constraints such
+ * as Follow Path that need their effect taken out). `shown`: the world matrix the object shows,
+ * its constraints applied, whose axes are td->axismtx. Blender computes the conversion to the
+ * parent's space as the local 3×3 times the inverse of the world 3×3 (each with zero axes made unit
+ * length first, see {@link orthogonalizeZeroAxes}), which is the inverse of the parent's 3×3 when
+ * neither has a zero axis and the world matrix has no constraints in it; that inverse is computed
+ * directly then.
  */
 export function transformBasis(
   o: TransformChannels,
   world: Readonly<Mat4>,
   parentWorld: Readonly<Mat4> | null,
+  shown: Readonly<Mat4> = world,
+  constrained = false,
 ): TransformBasis {
   const center = column(world, 3);
-  const axismtx = orientationAxes(world);
-  if (!parentWorld) return { center, smtx: identity4(), mtx: identity4(), axismtx };
+  const axismtx = orientationAxes(shown);
+  if (!parentWorld && !constrained) return { center, smtx: identity4(), mtx: identity4(), axismtx };
   const local = linearPart(compose4(o.location, o.rotation_euler, o.scale));
-  const parent = linearPart(parentWorld);
+  const parent = parentWorld ? linearPart(parentWorld) : null;
   const zeroAxis = [0, 1, 2].some((c) => length3(column(local, c)) === 0);
-  if (!zeroAxis && invertible3(parent)) return { center, smtx: invert4(parent), mtx: parent, axismtx };
+  if (parent && !constrained && !zeroAxis && invertible3(parent))
+    return { center, smtx: invert4(parent), mtx: parent, axismtx };
   const smtx = multiply4(
     orthogonalizeZeroAxes(local),
     invertSafeOrtho(orthogonalizeZeroAxes(linearPart(world))),
@@ -1460,14 +1463,15 @@ export function transformedChannels(
  * {@link SAME_TRANSFORM}, grown by about the ratio of the parent's longest to its shortest axis as
  * in {@link changedTransform}, since the conversions to and from the parent's space amplify
  * rounding by about that much. A rotation by 0 or by whole turns, a scale by 1 and a move by 0 then
- * write nothing, with one exception: the rotation they compute came back up to 4.8e-15 off without
- * a parent or under one scaled uniformly, 5.0e-11 under a parent scaled [1000, 0.01, 1] and 4.7e-9
- * under one scaled [10000, 0.001, 1], less than 1/200 of this tolerance (40,000 random objects
- * each, randomly turned parents; the scale came back up to 4.3e-16 off, the location exactly). The
- * exception is an object in gimbal lock (Y at ±90°, see matrixToStoredEuler) with Z not 0: a
- * rotation that leaves it in gimbal lock, such as one by 0 or by whole turns, rewrites its rotation
- * with Z set to 0 and X taking the rest, as Blender's Rotate does (whose gimbal lock is wider,
- * within 0.00215° of ±90°).
+ * write nothing, except to an object in gimbal lock (Y at ±90°, see matrixToStoredEuler) with Z
+ * not 0: a rotation that leaves it in gimbal lock, such as one by 0 or by whole turns, rewrites its
+ * rotation with Z set to 0 and X taking the rest, as Blender's Rotate does (whose gimbal lock is
+ * wider, within 0.00215° of ±90°). Outside gimbal lock, the rotation they compute came back up to
+ * 4.8e-15 off without a parent or under one scaled uniformly, 5.0e-11 under a parent scaled
+ * [1000, 0.01, 1] and 4.7e-9 under one scaled [10000, 0.001, 1], less than 1/200 of this tolerance
+ * (40,000 random objects each, randomly turned parents; the scale came back up to 4.3e-16 off, the
+ * location exactly). Auto keying keys every object a transform transforms all the same (see
+ * keyChannelChanges in operators/transform.ts).
  */
 export function transformTolerance(basis: TransformBasis): number {
   const frobenius = (m: Readonly<Mat4>) => Math.hypot(...[0, 1, 2, 4, 5, 6, 8, 9, 10].map((k) => m[k]));

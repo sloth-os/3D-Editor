@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { h } from 'preact';
 import { signal } from '@preact/signals';
@@ -8,12 +8,14 @@ import { session as sessionSignal } from '../src/app/store';
 import { hoveredArea, popupMenu, registry, run, runResult } from '../src/editor/editor';
 import { lastOperator, redoLast } from '../src/editor/runner';
 import { SchemaForm } from '../src/ui/SchemaForm';
+import { MenuList } from '../src/ui/Menu';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import { registerUiOperators } from '../src/editor/ui-operators';
 import { installKeymap } from '../src/editor/keymap';
 import {
   ADD_MENU,
   APPLY_MENU,
+  EDIT_MENU,
   OBJECT_CONTEXT,
   OBJECT_MENU,
   REDO_PANEL_OPERATORS,
@@ -249,17 +251,19 @@ describe('menus', () => {
   it('View > X-Ray is greyed out where X-ray changes nothing: Wireframe, Material Preview and Rendered outside Edit Mode', () => {
     // regression: its checkmark said X-ray was on in Material Preview and Rendered shading, which draw
     // objects as they are with it on or off outside Edit Mode (Blender greys its button out there),
-    // and in Wireframe shading, which always sees through objects (selecting objects ignores X-ray)
+    // and in Wireframe shading, which always sees through objects (selecting objects ignores X-ray).
+    // Greyed out, not disabled: it still toggles the setting there (see the MenuList tests below)
     const xray = entry(VIEW_MENU(), ['X-Ray']);
+    expect(xray.enabled).toBeUndefined();
     s.view.xray.value = true;
     const seen: Record<string, [boolean, boolean]> = {};
     for (const shading of ['WIREFRAME', 'SOLID', 'MATERIAL', 'RENDERED'] as const)
       for (const mode of ['OBJECT', 'EDIT'] as const) {
         s.view.shading.value = shading;
         s.state.mode = mode;
-        seen[`${shading} ${mode}`] = [xray.enabled!(), xray.checked!()];
+        seen[`${shading} ${mode}`] = [xray.inactive!() === null, xray.checked!()];
       }
-    // enabled, checked
+    // active (not greyed out), checked
     expect(seen).toEqual({
       'WIREFRAME OBJECT': [false, true],
       'WIREFRAME EDIT': [true, true],
@@ -270,7 +274,10 @@ describe('menus', () => {
       'RENDERED OBJECT': [false, true],
       'RENDERED EDIT': [true, true],
     });
-    // and says why (the header button's tooltip)
+    // and says why (the menu item's and the header button's tooltip)
+    s.view.shading.value = 'RENDERED';
+    s.state.mode = 'OBJECT';
+    expect(xray.inactive!()).toBe(xrayInactiveReason('RENDERED', 'OBJECT'));
     expect(xrayInactiveReason('RENDERED', 'OBJECT')).toBe(
       'no effect in Rendered shading outside Edit Mode, as in Blender: it sees through objects in Solid ' +
         'shading (Wireframe always does) and through the mesh in Edit Mode',
@@ -283,6 +290,80 @@ describe('menus', () => {
     expect(xrayInactiveReason('SOLID', 'OBJECT')).toBeNull();
     expect(xrayInactiveReason('MATERIAL', 'EDIT')).toBeNull();
     expect(xrayInactiveReason('WIREFRAME', 'EDIT')).toBeNull();
+  });
+});
+
+describe('MenuList', () => {
+  afterEach(cleanup);
+
+  /** Renders a menu as MenuButton and the popup host do; returns the item element by label. */
+  function show(items: MenuItem[]) {
+    const onClose = vi.fn();
+    const view = render(h(MenuList, { items, x: 0, y: 0, onClose }));
+    const item = (label: string) =>
+      view.getByTestId(`menu-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`) as HTMLElement;
+    return { onClose, item };
+  }
+
+  it('runs View > X-Ray where it is greyed out: a click toggles X-ray in Material Preview', () => {
+    // regression: the item was disabled there and ignored clicks, while the header button and Alt+Z
+    // toggled X-ray (Blender greys such entries out with layout.active and they still work)
+    s.view.shading.value = 'MATERIAL';
+    s.state.mode = 'OBJECT';
+    s.view.xray.value = false;
+    const { onClose, item } = show(VIEW_MENU());
+    const xray = item('X-Ray');
+    fireEvent.click(xray);
+    expect(s.view.xray.value).toBe(true);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    // greyed out, with the reason as its tooltip
+    expect(xray.dataset.inactive).toBe('true');
+    expect(xray.classList.contains('disabled')).toBe(false);
+    expect(xray.style.color).toBe('var(--text-faint)');
+    expect(xray.title).toBe(`X-Ray: ${xrayInactiveReason('MATERIAL', 'OBJECT')}`);
+    // the setting it changed applies in Solid shading, where the item is not greyed out
+    cleanup();
+    s.view.shading.value = 'SOLID';
+    const solid = show(VIEW_MENU());
+    const active = solid.item('X-Ray');
+    expect(active.dataset.inactive).toBeUndefined();
+    expect(active.style.color).toBe('');
+    expect(active.title).toBe(registry.get('view3d.toggle_xray')!.description);
+    expect(active.querySelector('.check')!.textContent).toBe('\u2713');
+    fireEvent.click(active);
+    expect(s.view.xray.value).toBe(false);
+    expect(solid.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores clicks on disabled items, also when they say why they would be greyed out', () => {
+    const disabled = vi.fn();
+    const both = vi.fn();
+    const greyed = vi.fn();
+    const { onClose, item } = show([
+      { label: 'Disabled', action: disabled, enabled: () => false },
+      { label: 'Both', action: both, enabled: () => false, inactive: () => 'no effect now' },
+      { label: 'Greyed', action: greyed, inactive: () => 'no effect now' },
+    ]);
+    for (const label of ['Disabled', 'Both']) {
+      const el = item(label);
+      expect(el.classList.contains('disabled')).toBe(true);
+      expect(el.dataset.inactive).toBeUndefined();
+      fireEvent.click(el);
+    }
+    expect(disabled).not.toHaveBeenCalled();
+    expect(both).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(item('Greyed').dataset.inactive).toBe('true');
+    fireEvent.click(item('Greyed'));
+    expect(greyed).toHaveBeenCalledTimes(1);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    // the Edit menu's Undo with nothing to undo is disabled
+    cleanup();
+    const edit = show(EDIT_MENU());
+    const undo = edit.item('Undo');
+    expect(undo.classList.contains('disabled')).toBe(true);
+    fireEvent.click(undo);
+    expect(edit.onClose).not.toHaveBeenCalled();
   });
 });
 

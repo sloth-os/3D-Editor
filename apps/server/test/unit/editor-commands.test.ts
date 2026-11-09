@@ -14,13 +14,20 @@ import {
   editorTimeoutMessage,
 } from '../../src/mcp/editor-commands';
 import {
+  BROWSER_RASTER_SECONDS,
+  BUSY_FACTOR,
+  BUSY_LOADS,
   MEASURED_NOTE,
+  MILLIONS_SELECT_SECONDS,
   MILLIONS_SOLID_SECONDS,
   NEW_SHADER_SECONDS,
+  SERVER_SOLID_SECONDS,
   measured,
+  measuredOnServer,
 } from '../../src/mcp/editor-costs';
 import { MCP_INSTRUCTIONS } from '../../src/mcp/instructions';
-import { KEEP_ALIVE_MS, keepAlive } from '../../src/mcp/rendering';
+import { KEEP_ALIVE_MS, keepAlive, renderToolError } from '../../src/mcp/rendering';
+import { RenderOutOfMemoryError } from '../../src/render';
 import type { LateRpc } from '../../src/sync/room';
 
 /*
@@ -108,23 +115,22 @@ describe('editor command catalogue', () => {
 describe('editor command timeouts', () => {
   const HEAD = 'it may still carry the command out, and its next commands and renders wait until it has.';
   const NO_GPU = 'An editor without GPU acceleration (software WebGL, e.g. a headless browser)';
-  const SOLID_ADVICE =
-    "pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use render_image " +
-    "with shading 'SOLID', and render_image for final images.";
   /**
    * Measured (docs/mcp.md, editor-costs.ts): an edit that needs a shader no material had until it is
-   * drawn, and a SOLID screenshot of 4 million triangles; the sentence after them says where they
-   * were measured and that they vary.
+   * drawn, a SOLID screenshot and a select of 4 million triangles, and grey clay rendered on the
+   * server; the last sentence says where they were measured and how much longer they took on a busy
+   * machine.
    */
   const NEW_SHADER = NEW_SHADER_SECONDS;
   const HEAVY = `${MILLIONS_SOLID_SECONDS} in SOLID with 4 million`;
-  const MEASURED = "The times given were measured in software WebGL and vary with the machine's load.";
+  const MEASURED =
+    'The times given were measured on a calm machine with 4 CPUs, the editor in software WebGL; on a busy ' +
+    `one (load averages of ${BUSY_LOADS}) they took up to ${BUSY_FACTOR} times as long.`;
   /** Only an edit that needs a shader no material had makes the next screenshot compile one. */
   const NEEDS =
     'a material edit that needs a shader no material had (coat or sheen turned on, a procedural texture ' +
     'on a set of channels that no other material has)';
-  const edited = (next: string) =>
-    `After ${NEEDS}, its next ${next} compiles it (${NEW_SHADER}). ${MEASURED}`;
+  const edited = (next: string) => `After ${NEEDS}, its next ${next} compiles it (${NEW_SHADER}).`;
   const KEPT =
     'It keeps what it compiled, so a retry waits for the editor to finish and compiles nothing again.';
   const VIEWPORT =
@@ -144,22 +150,47 @@ describe('editor command timeouts', () => {
     'RENDERED shading that frame compiles shaders the first time after the editor opened the project (tens ' +
     "of seconds for a heavy scene, while it builds and compiles the scene's materials) and after a material " +
     'edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of ' +
-    `channels that no other material has: ${NEW_SHADER}). ${MEASURED} ${KEPT}`;
+    `channels that no other material has: ${NEW_SHADER}). ${KEPT}`;
   const viewport = (command: string) =>
     `'${command}' waits while the editor draws its viewport. ${NO_GPU} takes seconds per frame for a scene ` +
-    'with millions of triangles, and seconds for its first frame of a heavy scene in MATERIAL or RENDERED ' +
-    "shading, while it builds and compiles the scene's materials.";
+    `with millions of triangles, in any shading (a select took ${MILLIONS_SELECT_SECONDS} with 4 million in ` +
+    'SOLID shading), and seconds for its first frame of a heavy scene in MATERIAL or RENDERED shading, while ' +
+    "it builds and compiles the scene's materials.";
+  /**
+   * The server cannot know the viewport's shading (the person can change it): switching to SOLID is
+   * advised only for a viewport in another shading (a select of 4 million triangles in SOLID shading
+   * used to be told to switch to SOLID).
+   */
   const SWITCH =
-    "switch the viewport to SOLID shading (editor_command view.shading {shading: 'SOLID'}), which draws much faster.";
+    "if the viewport is not in SOLID shading, switch it to SOLID (editor_command view.shading {shading: 'SOLID'}), " +
+    'which draws much faster.';
+  /**
+   * Grey clay rendered on the server: a render process holds the scene (SERVER_SOLID_SECONDS); a
+   * scene that needs more memory than a render process has fails, and then only a retry of the
+   * screenshot shows it (round 8 named an out-of-memory error after 17.4–21.4 s with 2 million
+   * triangles, where the server now renders them).
+   */
+  const tooLarge = (atMax: boolean) =>
+    "a scene that needs more memory than a server render has fails with 'Rendering failed: the render " +
+    `process ran out of memory …', and then retry the screenshot${atMax ? '' : ' with a larger timeout_ms'}`;
+  /**
+   * The quick look of the other screenshots: renderer 'auto' renders on the server while the editor
+   * is busy (right after the timeout) and for a PATHTRACER scene (render_image asks a browser editor
+   * only for RASTER images).
+   */
+  const solidAdvice = (atMax: boolean) =>
+    "pass shading 'SOLID' for the screenshot (grey clay, much faster); for a quick look use render_image " +
+    "with shading 'SOLID' (grey clay: while the editor is busy, as right after this timeout, and when the " +
+    `scene's render engine is PATHTRACER, it renders on the server: ${SERVER_SOLID_SECONDS}; ${tooLarge(atMax)}), ` +
+    'and render_image for final images.';
   /**
    * A look without the editor after a SOLID or WIREFRAME screenshot timed out: grey clay on the server.
    * Without shading 'SOLID', renderer 'software' renders with the scene's engine, and so path traces
-   * a PATHTRACER scene (domino-cascade: 31.1 and 32.8 s at 640×360, its time_limit reached). The
-   * server's render worker ran out of memory for a grid of 2 million triangles (docs/mcp.md).
+   * a PATHTRACER scene (domino-cascade: 31.1 and 32.8 s at 640×360, its time_limit reached).
    */
-  const SOLID_RENDER =
+  const solidRender = (atMax: boolean) =>
     "render without the editor: render_image with shading 'SOLID' and renderer 'software' (grey clay, " +
-    'rendered on the server, which can run out of memory for millions of triangles).';
+    `rendered on the server: ${SERVER_SOLID_SECONDS}; ${tooLarge(atMax)}).`;
   const BUSY =
     "It was still busy with an earlier request that the server had stopped waiting for (editor_command 'screenshot' sent 12 s ago).";
   /** The cases: command, params, why it can take long, the advice below and at the maximum. */
@@ -168,16 +199,16 @@ describe('editor command timeouts', () => {
       'screenshot',
       {},
       VIEWPORT,
-      `Retry with a larger timeout_ms (at most 55000), or ${SOLID_ADVICE}`,
-      `With timeout_ms at its maximum (55000), retry or ${SOLID_ADVICE}`,
+      `Retry with a larger timeout_ms (at most 55000), or ${solidAdvice(false)} ${MEASURED}`,
+      `With timeout_ms at its maximum (55000), retry or ${solidAdvice(true)} ${MEASURED}`,
     ],
     ...(['MATERIAL', 'rendered'] as const).map(
       (shading): [string, Record<string, unknown>, string, string, string] => [
         'screenshot',
         { shading, width: 640 },
         shaded(shading.toUpperCase()),
-        `Retry with a larger timeout_ms (at most 55000), or ${SOLID_ADVICE}`,
-        `With timeout_ms at its maximum (55000), retry or ${SOLID_ADVICE}`,
+        `Retry with a larger timeout_ms (at most 55000), or ${solidAdvice(false)} ${MEASURED}`,
+        `With timeout_ms at its maximum (55000), retry or ${solidAdvice(true)} ${MEASURED}`,
       ],
     ),
     ...(['SOLID', 'wireframe'] as const).map(
@@ -185,8 +216,8 @@ describe('editor command timeouts', () => {
         'screenshot',
         { shading },
         fast(shading.toUpperCase()),
-        `Retry with a larger timeout_ms (at most 55000), or ${SOLID_RENDER}`,
-        `With timeout_ms at its maximum (55000), retry or ${SOLID_RENDER}`,
+        `Retry with a larger timeout_ms (at most 55000), or ${solidRender(false)} ${MEASURED}`,
+        `With timeout_ms at its maximum (55000), retry or ${solidRender(true)} ${MEASURED}`,
       ],
     ),
     ...['select', 'set_frame', 'view.set_view', 'run_operator'].map(
@@ -194,8 +225,8 @@ describe('editor command timeouts', () => {
         command,
         {},
         viewport(command),
-        `Pass a larger timeout_ms (at most 55000), or ${SWITCH}`,
-        `With timeout_ms at its maximum (55000), ${SWITCH}`,
+        `Pass a larger timeout_ms (at most 55000), or, ${SWITCH} ${MEASURED}`,
+        `With timeout_ms at its maximum (55000), retry, or, ${SWITCH} ${MEASURED}`,
       ],
     ),
   ];
@@ -240,9 +271,12 @@ describe('editor command timeouts', () => {
           expect(msg.includes('With timeout_ms at its maximum (55000), '), label).toBe(
             timeout === MAX_EDITOR_TIMEOUT_MS,
           );
-          expect(msg.includes('a larger timeout_ms (at most 55000), or '), label).toBe(
+          expect(/a larger timeout_ms \(at most 55000\), or[ ,]/.test(msg), label).toBe(
             timeout < MAX_EDITOR_TIMEOUT_MS,
           );
+          // the times of every message were measured on a calm machine, and it says how much longer
+          // they took on a busy one
+          expect(msg.endsWith(` ${MEASURED_NOTE}`), label).toBe(true);
         }
   });
 
@@ -254,6 +288,57 @@ describe('editor command timeouts', () => {
         command === 'screenshot' && shading !== 'SOLID' && shading !== 'WIREFRAME',
       );
     }
+  });
+
+  it('give the server render with its measured times, and the screenshot again where the server cannot hold the scene', () => {
+    // round 8 sent agents to grey clay on the server with "which can run out of memory for millions of
+    // triangles", although its render worker then took the whole server down for a grid of 2 million;
+    // render processes (round 9) hold millions of triangles, and a render that runs out of memory
+    // fails with renderToolError's message: then only the editor can show the scene
+    for (const shading of [undefined, 'MATERIAL', 'RENDERED', 'SOLID', 'WIREFRAME'])
+      for (const timeout of [10_000, MAX_EDITOR_TIMEOUT_MS]) {
+        const msg = editorTimeoutMessage('screenshot', timeout, null, shading ? { shading } : {});
+        const label = `${shading} ${timeout}`;
+        expect(msg, label).toContain(`on the server: ${SERVER_SOLID_SECONDS};`);
+        expect(msg, label).toContain(
+          "a scene that needs more memory than a server render has fails with 'Rendering failed: the render " +
+            "process ran out of memory …', and then retry the screenshot",
+        );
+        expect(msg.includes('and then retry the screenshot with a larger timeout_ms'), label).toBe(
+          timeout < MAX_EDITOR_TIMEOUT_MS,
+        );
+        expect(msg, label).not.toMatch(/which can run out of memory|ran out of memory after/);
+      }
+    // the server's message for a render that ran out of memory starts as the advice quotes it
+    const oom = new RenderOutOfMemoryError(
+      'the render process ran out of memory (its JavaScript heap is limited to 256 MB)',
+      256,
+      'heap',
+    );
+    expect(renderToolError(oom).message).toMatch(/^Rendering failed: the render process ran out of memory /);
+  });
+
+  it('say where the quick look renders: on the server while the editor is busy and for a PATHTRACER scene', () => {
+    // right after a timeout the editor still draws the screenshot, so renderer 'auto' renders on the
+    // server; it asks a browser editor only for RASTER images (mcp-error-codes.test.ts renders the
+    // quick look in both cases and with an idle editor)
+    for (const shading of [undefined, 'MATERIAL', 'RENDERED'])
+      expect(editorTimeoutMessage('screenshot', 10_000, null, shading ? { shading } : {})).toContain(
+        "for a quick look use render_image with shading 'SOLID' (grey clay: while the editor is busy, as right " +
+          "after this timeout, and when the scene's render engine is PATHTRACER, it renders on the server: " +
+          `${SERVER_SOLID_SECONDS};`,
+      );
+  });
+
+  it('advise switching the viewport to SOLID only for a viewport in another shading', () => {
+    // a select of a 4 million triangle scene timed out in SOLID shading, and the message told the
+    // agent to switch the viewport to SOLID; the server cannot know the viewport's shading
+    for (const command of ['select', 'set_frame', 'run_operator'])
+      for (const timeout of [10_000, MAX_EDITOR_TIMEOUT_MS]) {
+        const msg = editorTimeoutMessage(command, timeout);
+        expect(msg).toContain(`, or, ${SWITCH}`);
+        expect(msg).not.toMatch(/, or switch the viewport to SOLID shading/);
+      }
   });
 
   it('explain commands that draw nothing by the viewport they wait for, not by screenshots', () => {
@@ -268,18 +353,39 @@ describe('editor command timeouts', () => {
 });
 
 describe('the measured costs', () => {
-  it('are the ranges measured in software WebGL, and every text that gives one says so', () => {
-    // docs/mcp.md has the measurements behind them (examples/domino-cascade in headless Chromium)
-    expect(NEW_SHADER_SECONDS).toBe(
-      '0.6–4.5 s, or up to 12.9 s for a material with several procedural textures',
+  it('are the ranges measured on a calm machine, and every text that gives one says how much longer they took on a busy one', () => {
+    // docs/mcp.md has the measurements behind them (examples/domino-cascade in headless Chromium,
+    // server renders through MCP; calm runs, and the same steps on the machine kept busy), and
+    // docs-errors.test.ts checks that it gives the same values; here: each is a measured range
+    const ranges = (text: string) =>
+      [...text.matchAll(/(\d+(?:\.\d+)?)–(\d+(?:\.\d+)?) s\b/g)].map((m) => [Number(m[1]), Number(m[2])]);
+    for (const [name, text, count] of [
+      ['NEW_SHADER_SECONDS', NEW_SHADER_SECONDS, 1],
+      ['MILLIONS_SOLID_SECONDS', MILLIONS_SOLID_SECONDS, 1],
+      ['MILLIONS_SELECT_SECONDS', MILLIONS_SELECT_SECONDS, 1],
+      ['SERVER_SOLID_SECONDS', SERVER_SOLID_SECONDS, 2],
+      ['BROWSER_RASTER_SECONDS', BROWSER_RASTER_SECONDS, 3],
+    ] as const) {
+      const found = ranges(text);
+      expect(found, name).toHaveLength(count);
+      for (const [lo, hi] of found) expect(lo, name).toBeLessThan(hi);
+    }
+    expect(Number(BUSY_FACTOR)).toBeGreaterThan(1);
+    expect(BUSY_LOADS).toMatch(/^\d+(\.\d+)?–\d+(\.\d+)?$/);
+    expect(measured('1–2 s')).toBe(
+      `1–2 s, measured on a calm machine with 4 CPUs in software WebGL, up to ${BUSY_FACTOR} times as long on a busy one`,
     );
-    expect(MILLIONS_SOLID_SECONDS).toBe('3.3–5.2 s');
-    expect(measured('1–2 s')).toBe("1–2 s, measured in software WebGL and varying with the machine's load");
+    expect(measuredOnServer('1–2 s')).toBe(
+      `1–2 s, measured on a calm server with 4 CPUs, up to ${BUSY_FACTOR} times as long on a busy one`,
+    );
     expect(MEASURED_NOTE).toBe(
-      "The times given were measured in software WebGL and vary with the machine's load.",
+      'The times given were measured on a calm machine with 4 CPUs, the editor in software WebGL; on a busy ' +
+        `one (load averages of ${BUSY_LOADS}) they took up to ${BUSY_FACTOR} times as long.`,
     );
-    // round 7's rule: a short text that gives a measured time says where it was measured and that it
-    // varies (the descriptions of editor_command are checked in mcp-error-codes.test.ts)
+    // a range that held on a calm machine reads as one at any load unless the text says how much
+    // longer it took on a busy one (round 8: 46 of 137 values of a busy machine were outside the
+    // ranges, which said only that the times vary); the descriptions of editor_command and
+    // render_image are checked in mcp-error-codes.test.ts
     const texts = [
       MCP_INSTRUCTIONS,
       ...[undefined, 'MATERIAL', 'RENDERED', 'SOLID', 'WIREFRAME'].flatMap((shading) =>
@@ -287,15 +393,17 @@ describe('the measured costs', () => {
           editorTimeoutMessage('screenshot', t, null, shading ? { shading } : {}),
         ),
       ),
-      editorTimeoutMessage('select', 10_000),
+      ...[10_000, MAX_EDITOR_TIMEOUT_MS].map((t) => editorTimeoutMessage('select', t)),
     ];
-    let withTimes = 0;
     for (const text of texts) {
-      if (!/\d s\b/.test(text.replace(/\d+ s ago/g, ''))) continue;
-      withTimes++;
-      expect(text).toMatch(/measured in software WebGL and vary(ing)? with the machine's load/);
+      expect(text).toMatch(/\d s\b/);
+      expect(text).toMatch(
+        new RegExp(
+          `on a calm (machine|server) with 4 CPUs.*up to ${BUSY_FACTOR.replace('.', '\\.')} times as long`,
+        ),
+      );
+      expect(text).not.toMatch(/vary(ing)? with the machine's load/);
     }
-    expect(withTimes).toBe(texts.length - 1);
   });
 });
 
@@ -365,16 +473,15 @@ describe('the cost of screenshots', () => {
 
   it('name the material edits that compile a shader, with the measured range, and only those', () => {
     const cost = NEW_SHADER_SECONDS;
-    const note = "The times given were measured in software WebGL and vary with the machine's load.";
     const needs =
       'a material edit that needs a shader no material had (coat or sheen turned on, a procedural texture on ' +
       'a set of channels that no other material has)';
     for (const shading of ['MATERIAL', 'rendered'])
       expect(editorTimeoutMessage('screenshot', 10_000, null, { shading })).toContain(
-        `After ${needs}, its next ${shading.toUpperCase()} screenshot or viewport frame compiles it (${cost}). ${note}`,
+        `After ${needs}, its next ${shading.toUpperCase()} screenshot or viewport frame compiles it (${cost}).`,
       );
     expect(editorTimeoutMessage('screenshot', 10_000)).toContain(
-      `After ${needs}, its next screenshot or frame in each of these two compiles it (${cost}). ${note}`,
+      `After ${needs}, its next screenshot or frame in each of these two compiles it (${cost}).`,
     );
     // SOLID and WIREFRAME screenshots wait for the viewport's frame, also one that compiles; a retry is cheap
     for (const shading of ['SOLID', 'WIREFRAME']) {
@@ -382,17 +489,18 @@ describe('the cost of screenshots', () => {
       expect(msg).toContain('a screenshot waits until the frame its viewport is drawing is done.');
       expect(msg).toContain(
         'and after a material edit that needs a shader no material had (coat or sheen turned on, a procedural ' +
-          `texture on a set of channels that no other material has: ${cost}). ${note}`,
+          `texture on a set of channels that no other material has: ${cost}).`,
       );
       expect(msg).toContain('so a retry waits for the editor to finish and compiles nothing again.');
       expect(msg).toContain('Retry with a larger timeout_ms (at most 55000)');
+      expect(msg.endsWith(MEASURED_NOTE)).toBe(true);
     }
     expect(MCP_INSTRUCTIONS).toContain(
       "it builds and compiles the scene's materials for that shading and keeps them, also when the viewport " +
         'turns its anti-aliasing off and through material edits that change values; an edit that needs a ' +
         'shader no material had, such as coat or sheen turned ' +
         'on or a procedural texture on a set of channels that no other material has, makes the next one in ' +
-        `each of them compile it: ${cost}, measured in software WebGL and varying with the machine's load)`,
+        `each of them compile it: ${measured(cost)})`,
     );
     // no text promises reuse without the exception
     for (const text of [MCP_INSTRUCTIONS, ...screenshots])
@@ -441,7 +549,7 @@ describe('the cost of screenshots', () => {
     const [plastics, procedural] = NEW_SHADER_SECONDS.match(/^([\d.–]+ s), or up to ([\d.]+ s) /)!.slice(1);
     expect(docComment).toContain(
       `compiles it for the next screenshot or frame in each of the two, which took ${plastics} for the ` +
-        "plastics and 10.8–12.9 s for the table's material, whose colour, roughness and bump are procedural textures",
+        "plastics and 10.8–11.7 s for the table's material, whose colour, roughness and bump are procedural textures",
     );
     expect(docComment.match(/for the plastics and [\d.]+–([\d.]+ s) for the table's material/)?.[1]).toBe(
       procedural,
@@ -456,9 +564,23 @@ describe('the cost of screenshots', () => {
         'was drawn only with that one (apps/web engine.ts captureSamples)',
     );
     expect(docComment).toContain(
-      '(more than a million triangles, slow frames) built none and took 0.4–2.3 s',
+      '(more than a million triangles, slow frames) built none and took 0.5–1.4 s',
     );
     expect(docComment).not.toMatch(/one frame/);
+    // the busy factor of the messages, and the server renders of the quick look and the remedy of SOLID
+    // and WIREFRAME screenshots (render processes since round 9, which rendered millions of triangles)
+    expect(docComment).toContain(
+      `on the same machine kept busy by other processes the times were up to ${BUSY_FACTOR} times as long`,
+    );
+    expect(docComment).toMatch(
+      new RegExp(
+        "On the server, grey clay \\(render_image with shading 'SOLID' and renderer 'software', [^)]*\\) took " +
+          `[\\d.–]+ s for that scene, [\\d.–]+ s with a grid of a million triangles added, and ${SERVER_SOLID_SECONDS}, ` +
+          'in a render process that held up to [\\d.]+ GB of memory for 6 million triangles; a render that runs out ' +
+          'of the memory of its render process fails \\(with RENDER_WORKER_MEMORY_MB=256',
+      ),
+    );
+    expect(docComment).not.toMatch(/ran out of memory after|which can run out of memory/);
     const engineSource = readFileSync(
       fileURLToPath(new URL('../../../web/src/viewport/engine.ts', import.meta.url)),
       'utf8',

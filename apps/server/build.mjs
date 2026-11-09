@@ -1,5 +1,6 @@
 // Bundles the server into ESM files: dist/main.js (the server) and dist/render-worker.js (the
-// render worker thread entry, started by src/render/pool.ts from the directory of main.js).
+// entry of the render processes, which src/render/pool.ts starts with child_process.fork from
+// the directory of main.js).
 // @3d-editor/* workspace packages are bundled from their TypeScript sources; every other
 // package stays external and is resolved from node_modules at runtime.
 import { build } from 'esbuild';

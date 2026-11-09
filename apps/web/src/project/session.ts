@@ -14,10 +14,10 @@ import {
 } from '@3d-editor/core';
 import { EditorStateSignals, ViewState } from '../editor/state';
 import { SyncProvider } from '../sync/provider';
-import { WebDAVSync, resolveWebDAV } from '../storage/webdav';
+import { WebDAVSync, resolveWebDAV, type SaveReport } from '../storage/webdav';
 import { localIndex, projectDbName } from './local-index';
 import { prefs } from '../app/prefs';
-import { serverConfig } from '../app/store';
+import { serverConfig, toast } from '../app/store';
 import { wsUrl } from '../app/server-config';
 import { telemetry } from '../telemetry/telemetry';
 
@@ -56,6 +56,8 @@ export class ProjectSession {
   thumbnailProvider: (() => string | null) | null = null;
   /** Operator currently executing (recorded on undo steps for telemetry). */
   currentOperator: string | null = null;
+  /** The person was told that the server deleted the project (see tellWhenDeletedOnServer). */
+  private deletionTold = false;
 
   private constructor(readonly id: string) {
     this.doc = new SceneDoc(new Y.Doc(), { type: 'local' });
@@ -110,6 +112,7 @@ export class ProjectSession {
       if (opts.initial) Y.applyUpdate(s.doc.ydoc, opts.initial.encodeState(), s.storageOrigin);
       s.setupPresence();
       s.provider = new SyncProvider(id, s.doc.ydoc, s.awareness, null);
+      s.tellWhenDeletedOnServer(s.provider);
       s.attachRemotes();
       // If nothing exists locally yet (opening a remote project on a fresh device), wait briefly for
       // the server/WebDAV so the UI does not flash an empty scene. Only when one is attached: without
@@ -144,11 +147,65 @@ export class ProjectSession {
     if (!this.webdav) {
       const target = resolveWebDAV();
       if (target) {
-        this.webdav = new WebDAVSync(target, this.id, this.doc, () => this.projectInfo(), this.storageOrigin);
+        const webdav = new WebDAVSync(
+          target,
+          this.id,
+          this.doc,
+          () => this.projectInfo(),
+          this.storageOrigin,
+        );
+        this.webdav = webdav;
+        if (target.viaServer) this.followServerStorage(webdav);
         // Do not block opening on the network; merge in the background.
-        void this.webdav.syncNow();
+        void webdav.syncNow();
       }
     }
+  }
+
+  /**
+   * Tells the person when the server closes the project's sync connection because it deleted the
+   * project (the provider then stops connecting by itself), once per deletion: a connection the
+   * server closes the same way again (after Save) says nothing more until a room of the server has
+   * taken a connection again (a reload, which opens a new session, says it once again). With WebDAV
+   * through the server, a deletion its sync told of first is the same one.
+   */
+  private tellWhenDeletedOnServer(provider: SyncProvider): void {
+    this.disposers.push(
+      provider.joined.subscribe((joined) => {
+        if (joined) this.deletionTold = false;
+      }),
+      provider.status.subscribe((st) => {
+        if (st !== 'deleted' || this.deletionTold) return;
+        this.deletionTold = true;
+        const viaServer = !!this.webdav?.target.viaServer;
+        if (viaServer && this.webdav?.status.value === 'deleted') return;
+        toast(
+          viaServer
+            ? `"${this.doc.name}" was deleted on the server. This browser keeps its copy and stores it on the server again when you change it or save (Ctrl+S).`
+            : `"${this.doc.name}" was deleted on the server. This browser keeps its copy and no longer syncs it with the server.`,
+          'warning',
+          10_000,
+        );
+      }),
+    );
+  }
+
+  /**
+   * WebDAV through the editor server is the server's storage: a deletion its sync finds after the
+   * server said it deleted the project is that deletion (WebDAVSync says nothing more of it), and
+   * once a sync finds the project stored there again (this browser stored it again, or another
+   * writer did), the server opens it again: the provider connects again.
+   */
+  private followServerStorage(webdav: WebDAVSync): void {
+    webdav.deletedOnServer = () => this.provider?.status.value === 'deleted';
+    let restored = webdav.restored.value;
+    this.disposers.push(
+      webdav.restored.subscribe((n) => {
+        if (n === restored) return;
+        restored = n;
+        if (this.provider?.status.value === 'deleted') this.provider.reconnect();
+      }),
+    );
   }
 
   private waitForRemote(ms: number): Promise<void> {
@@ -165,7 +222,14 @@ export class ProjectSession {
       const stopSynced = this.provider?.synced.subscribe((v) => {
         if (v) done();
       });
-      this.disposers.push(() => stopSynced?.());
+      // the server deleted the project: nothing comes from it
+      const stopDeleted = this.provider?.status.subscribe((st) => {
+        if (st === 'deleted') done();
+      });
+      this.disposers.push(
+        () => stopSynced?.(),
+        () => stopDeleted?.(),
+      );
     });
   }
 
@@ -292,9 +356,17 @@ export class ProjectSession {
     return { objects: ev.objects.length, vertices, faces, triangles };
   }
 
-  /** Saves to WebDAV now (Save, Ctrl+S): also a project another device deleted from WebDAV. */
-  async flush(): Promise<void> {
-    await this.webdav?.syncNow({ save: true });
+  /**
+   * Saves now (Save, Ctrl+S): to WebDAV, also a project another device deleted from WebDAV (the
+   * browser's IndexedDB copy saves continuously), and connects to the server again when the server
+   * had deleted the project (see SyncProvider.reconnect). Resolves with what to tell the person.
+   */
+  async flush(): Promise<SaveReport> {
+    const report: SaveReport = this.webdav
+      ? await this.webdav.save()
+      : { message: 'Saved in this browser', level: 'info' };
+    this.provider?.reconnect();
+    return report;
   }
 
   /**

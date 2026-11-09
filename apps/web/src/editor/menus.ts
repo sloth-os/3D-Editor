@@ -13,7 +13,14 @@ export interface MenuItem {
   shortcut?: string;
   submenu?: MenuItem[] | (() => MenuItem[]);
   checked?: () => boolean;
+  /** False greys the item out and ignores clicks on it (Blender's `layout.enabled = False`). */
   enabled?: () => boolean;
+  /**
+   * Why the item is greyed out although a click still runs it (Blender's `layout.active = False`:
+   * what it changes has no visible effect now); null when it is not. MenuList shows it as the
+   * item's tooltip.
+   */
+  inactive?: () => string | null;
   sep?: true;
   title?: string;
 }
@@ -264,10 +271,11 @@ export const VIEW_MENU = (): MenuItem[] => [
     op: 'view3d.toggle_xray',
     shortcut: 'Alt Z',
     checked: () => !!session.value?.view.xray.value,
-    // greyed out where it changes nothing (the header button and Alt+Z still toggle it there)
-    enabled: () => {
+    // greyed out where it changes nothing, and still toggles there, like the header button, Alt+Z
+    // and Blender's menu entry (the setting applies again in Solid shading and in Edit Mode)
+    inactive: () => {
       const s = session.value;
-      return !s || !xrayInactiveReason(s.view.shading.value, s.state.mode);
+      return s ? xrayInactiveReason(s.view.shading.value, s.state.mode) : null;
     },
   },
   { label: 'Overlays', op: 'view3d.toggle_overlays', checked: () => !!session.value?.view.overlays.value },

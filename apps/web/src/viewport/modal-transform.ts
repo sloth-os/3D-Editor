@@ -1,14 +1,16 @@
 import * as THREE from 'three';
 import {
+  FrameState,
+  ObjectTransform,
   axisAngle4,
-  multiply4,
+  evaluatedWorld,
   scaling4,
   selectedVertexSet,
   selectionPivot,
-  transformRoots,
   transformVertices,
   translation4,
   type Mat4,
+  type TransformMode,
   type Vec3,
 } from '@3d-editor/core';
 import type { ViewportEngine } from './engine';
@@ -28,11 +30,22 @@ export interface ModalResult {
   params: Record<string, unknown>;
 }
 
+/** The core transform mode of a modal kind. */
+const MODES: Record<ModalKind, TransformMode> = {
+  translate: 'TRANSLATE',
+  rotate: 'ROTATE',
+  resize: 'RESIZE',
+};
+
 /**
  * Interactive G / R / S transform (Blender style): mouse-driven with axis/plane constraints
  * (X/Y/Z, Shift+X/Y/Z), typed numeric input, Ctrl snapping and Shift precision.
  * The preview is local only; confirming runs the equivalent core operator so the result is one
- * undo step that syncs to every device.
+ * undo step that syncs to every device. The preview shows what confirming stores: every object the
+ * transform can move is drawn with the world matrix the scene evaluates once the operator stored
+ * (and keyed, where they are animated) the channels it computes (Blender's Move, Rotate and Scale,
+ * from where the scene shows the objects at the current frame): the objects it transforms, their
+ * children, and the objects whose constraints or drivers read them (see ObjectTransform.worlds).
  */
 export class ModalTransform {
   readonly pivot: THREE.Vector3;
@@ -45,7 +58,8 @@ export class ModalTransform {
   private angleAcc = 0;
   private lastAngle: number;
   private precisionOrigin: { x: number; y: number } | null = null;
-  private originals = new Map<string, Mat4>();
+  /** The objects the operator changes and what it reads from each (Object Mode). */
+  private readonly objects: ObjectTransform | null = null;
   private editBase: {
     id: string;
     mesh: import('@3d-editor/core').MeshData;
@@ -62,35 +76,33 @@ export class ModalTransform {
     mouse: { x: number; y: number },
   ) {
     const { doc, state } = session;
-    this.pivot = new THREE.Vector3(...selectionPivot(doc, state));
-    this.pivotScreen = engine.project(this.pivot);
-    this.start = { ...mouse };
-    this.last = { ...mouse };
-    this.lastAngle = Math.atan2(mouse.y - this.pivotScreen.y, mouse.x - this.pivotScreen.x);
-    if (state.mode === 'EDIT' && state.activeId) {
-      const o = doc.getObject(state.activeId);
+    // what the operator reads when the transform is confirmed: the scene at the current frame
+    const fs = new FrameState(doc, state.frame);
+    const mode = MODES[kind];
+    if (state.mode === 'EDIT') {
+      this.pivot = new THREE.Vector3(...selectionPivot(doc, state, state.pivotPoint, { mode, fs }));
+      const o = state.activeId ? doc.getObject(state.activeId) : null;
       const mesh = o?.data ? doc.getMesh(o.data) : null;
       if (o && mesh)
         this.editBase = {
           id: o.id,
           mesh,
           verts: selectedVertexSet(mesh, state.meshSelection),
-          world: doc.worldMatrix(o.id),
+          world: evaluatedWorld(fs, o.id),
         };
     } else {
-      for (const id of transformRoots(
-        doc,
-        state.selectedIds.filter((id) => doc.getObject(id)),
-      )) {
-        const ev = engine.ev?.byId.get(id);
-        this.originals.set(id, ev ? ev.worldMatrix.slice() : doc.worldMatrix(id));
-      }
+      this.objects = new ObjectTransform(fs, state.selectedIds, state.pivotPoint, mode);
+      this.pivot = new THREE.Vector3(...this.objects.pivot(state));
     }
+    this.pivotScreen = engine.project(this.pivot);
+    this.start = { ...mouse };
+    this.last = { ...mouse };
+    this.lastAngle = Math.atan2(mouse.y - this.pivotScreen.y, mouse.x - this.pivotScreen.x);
     this.update(mouse, { ctrl: false, shift: false });
   }
 
   get isEmpty(): boolean {
-    return this.editBase ? this.editBase.verts.size === 0 : this.originals.size === 0;
+    return this.editBase ? this.editBase.verts.size === 0 : !this.objects?.targets.length;
   }
 
   setAxis(axis: Axis, exclude: boolean): void {
@@ -245,43 +257,23 @@ export class ModalTransform {
         },
       );
       this.engine.setMeshOverride(this.editBase.id, mesh);
-    } else {
-      const out = new Map<string, number[]>();
-      const pivotMode = state.pivotPoint;
-      const T = (p: Vec3) =>
-        multiply4(translation4(p), multiply4(this.current, translation4([-p[0], -p[1], -p[2]])));
-      for (const [id, w0] of this.originals) {
-        const p: Vec3 = pivotMode === 'INDIVIDUAL_ORIGINS' ? [w0[12], w0[13], w0[14]] : pivot;
-        out.set(id, multiply4(T(p), w0));
-      }
-      // children follow their (overridden) parents
-      this.engine.setMatrixOverrides(this.withDescendants(out));
+    } else if (this.objects) {
+      // the channels confirming stores, and the world matrices the scene evaluates from them
+      this.engine.setMatrixOverrides(this.previewMatrices());
     }
     const constraint = this.axis ? `${this.planeExclude ? 'plane ⟂ ' : 'along '}${this.axis}` : '';
     this.session.view.hud.value = `${this.summary}${constraint ? `  ${constraint}` : ''}${this.numeric ? `  [${this.numeric}]` : ''}`;
   }
 
-  private withDescendants(roots: Map<string, number[]>): Map<string, number[]> {
-    const ev = this.engine.ev;
-    if (!ev) return roots;
-    const out = new Map(roots);
-    const deltas = new Map<string, Mat4>();
-    for (const [id, w1] of roots) {
-      const w0 = this.originals.get(id)!;
-      deltas.set(id, multiply4(w1, invert(w0)));
-    }
-    for (const o of ev.objects) {
-      let p = o.data.parent;
-      while (p) {
-        const delta = deltas.get(p);
-        if (delta) {
-          out.set(o.id, multiply4(delta, o.worldMatrix));
-          break;
-        }
-        p = ev.byId.get(p)?.data.parent ?? null;
-      }
-    }
-    return out;
+  /**
+   * The world matrices the preview draws (Object Mode): those the scene evaluates after the
+   * operator stores the channels of the transform shown (see ObjectTransform.worlds), for every
+   * object the transform can move.
+   */
+  previewMatrices(): Map<string, Mat4> {
+    if (!this.objects) return new Map();
+    const pivot: Vec3 = [this.pivot.x, this.pivot.y, this.pivot.z];
+    return this.objects.worlds(this.objects.channels(this.current, pivot));
   }
 
   /** Ends the modal; returns the operator call that reproduces the transform (or null if cancelled). */
@@ -302,8 +294,4 @@ export class ModalTransform {
       };
     return { operator: 'transform.resize', params: { value: this.scaleValue, center: pivot } };
   }
-}
-
-function invert(m: Mat4): Mat4 {
-  return new THREE.Matrix4().fromArray(m).invert().toArray();
 }

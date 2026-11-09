@@ -1,27 +1,47 @@
+import { fork, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { Worker } from 'node:worker_threads';
-import { RenderEngine } from './engine';
-import { RenderCancelledError, type WorkerRequest, type WorkerResponse, type WorkerResult } from './protocol';
+import { MAX_DOCUMENTS, RenderEngine } from './engine';
+import {
+  RenderCancelledError,
+  RenderOutOfMemoryError,
+  type DocRef,
+  type WorkerRequest,
+  type WorkerResponse,
+  type WorkerResult,
+} from './protocol';
 
 /*
- * A pool of render threads: worker threads running `worker.ts` (one CPU core each), or, in
- * single-thread mode (RENDER_WORKERS=0, or when workers cannot start), one "thread" that runs the
- * same engine on the main thread between event loop turns.
+ * A pool of render threads: render processes (`child_process.fork` of `worker.ts`, one CPU core
+ * each), or, in single-thread mode (RENDER_WORKERS=0, or when render processes cannot start), one
+ * "thread" that runs the same engine on the main thread between event loop turns.
+ *
+ * Processes, not worker threads: when a worker thread's heap allocation fails in some paths
+ * (V8's fatal "JavaScript heap out of memory", e.g. growing a large Map), Node aborts the whole
+ * process whatever the worker's resourceLimits, so one render of a scene too large for its heap
+ * took the server down with every editor and agent. A render process that runs out of memory only
+ * ends itself: its requests fail with a RenderOutOfMemoryError, the pool logs it, and a new process
+ * serves later renders (when two long renders share the processes, only the request the process
+ * was working on fails with that error; the other render's requests waiting behind it fail with a
+ * `shared` one, which says it can run again). Render processes also run at a lower CPU priority and
+ * are the first ones the kernel's out-of-memory killer ends (priority.ts). They never outlive the
+ * server: it stops them when it shuts down (main.ts), they exit when its IPC channel closes, and a
+ * watchdog thread ends a busy one within a second when the server was killed (worker.ts).
  *
  * Renders lease threads, in two kinds:
- * - Long renders (path traced images, animations) lease every render thread (`size` workers). Up
- *   to two of them run at once and share the threads: a thread works through the tasks (bands of
- *   rows, frames) of both in turn, so a second long render does not wait minutes for the first.
+ * - Long renders (path traced images, animations) lease every render thread (`size` processes).
+ *   Up to two of them run at once and share the threads: a thread works through the tasks (bands
+ *   of rows, frames) of both in turn, so a second long render does not wait minutes for the first.
  *   Further long renders wait, first come first served.
  * - Interactive renders (raster stills: previews, thumbnails) lease one free thread: one more
- *   worker kept for them (started on first use), or an idle render thread. They never wait for
+ *   process kept for them (started on first use), or an idle render thread. They never wait for
  *   long renders.
  * In single-thread mode every lease shares the main thread (the tasks of all renders interleave).
  *
- * Workers start lazily, warm up (see `RenderEngine.warmUp`) before they take work, drop their
- * document caches after `cacheIdleMs` without work and stop after `idleTimeoutMs`.
+ * Render processes start lazily, warm up (see `RenderEngine.warmUp`) before they take work, drop
+ * their document caches after `cacheIdleMs` without work and stop after `idleTimeoutMs`. Requests
+ * carry a document's state only when the process does not have that version yet (IPC copies it).
  */
 
 /** A request without its id (the thread assigns ids). */
@@ -31,12 +51,12 @@ export type RenderRequest = WorkerRequest extends infer R
     : never
   : never;
 
-/** One render thread (a worker, or the main thread). */
+/** One render thread (a render process, or the main thread). */
 export interface RenderThread {
   readonly id: number;
-  readonly kind: 'worker' | 'main';
+  readonly kind: 'process' | 'main';
   /** Calls the thread (requests are handled one at a time, in order). */
-  call<T extends WorkerResult>(req: RenderRequest, transfer?: ArrayBuffer[]): Promise<T>;
+  call<T extends WorkerResult>(req: RenderRequest): Promise<T>;
   /** Frees what a job keeps on the thread: a prepared path tracer, an APNG encoder (fire and forget). */
   release(job: number): void;
   /** Requests sent and not answered yet. */
@@ -47,24 +67,33 @@ export interface RenderThread {
 export interface RenderPoolLog {
   warn(obj: object, msg: string): void;
   info?(obj: object, msg: string): void;
+  debug?(obj: object, msg: string): void;
 }
 
 export interface RenderPoolOptions {
   /**
-   * Render threads of long renders (default: CPU cores, at most 8; 0 = render on the main thread).
-   * One more worker is started for interactive renders when they need it.
+   * Render processes of long renders (default: CPU cores, at most 8; 0 = render on the main
+   * thread). One more process is started for interactive renders when they need it.
    */
   threads?: number;
-  /** Idle workers are stopped after this time (default 10 minutes). */
+  /** Idle render processes are stopped after this time (default 10 minutes). */
   idleTimeoutMs?: number;
-  /** Idle workers drop their cached documents after this time, freeing most memory (default 2 minutes). */
+  /** Idle render processes drop their cached documents after this time, freeing most memory (default 2 minutes). */
   cacheIdleMs?: number;
   /**
-   * Worker entry point (default: `render-worker.js` next to the bundle, else the development
-   * bootstrap `worker-dev.mjs` that runs the TypeScript sources).
+   * Render process entry point (default: `render-worker.js` next to the bundle, else the
+   * development bootstrap `worker-dev.mjs` that runs the TypeScript sources).
    */
   workerUrl?: URL;
-  /** Abandoned work (after a cancellation) may run this long before its worker is stopped. */
+  /**
+   * JavaScript heap limit of each render process in MB (`--max-heap-size`; default: Node's
+   * default for the machine, 2096 MB on a machine with 16 GB of memory). A render that needs more
+   * fails with a RenderOutOfMemoryError and its process is replaced.
+   */
+  heapLimitMb?: number;
+  /** A render process that is not ready after this time is stopped (a failed start; default 2 minutes). */
+  startTimeoutMs?: number;
+  /** Abandoned work (after a cancellation) may run this long before its process is stopped. */
   drainTimeoutMs?: number;
   log?: RenderPoolLog;
 }
@@ -87,47 +116,208 @@ export interface RenderLease {
 /** Long renders that may share the render threads at once (others wait for one to finish). */
 export const MAX_SHARED_RENDERS = 2;
 
-/** Default number of worker threads: the CPU cores, at most 8. */
+/** Default number of render processes: the CPU cores, at most 8. */
 export function defaultRenderThreads(): number {
   return Math.max(1, Math.min(8, availableParallelism()));
 }
 
-/** The worker entry point next to the running module (bundle) or the development bootstrap. */
+/** The render process entry point next to the running module (bundle) or the development bootstrap. */
 export function defaultWorkerUrl(): URL {
   const bundled = new URL('./render-worker.js', import.meta.url);
   if (bundled.protocol === 'file:' && existsSync(fileURLToPath(bundled))) return bundled;
   return new URL('./worker-dev.mjs', import.meta.url);
 }
 
-type Pending = { resolve: (v: never) => void; reject: (e: Error) => void };
-/** Threads of long renders, or the worker kept for interactive renders. */
+type Pending = {
+  resolve: (v: never) => void;
+  reject: (e: Error) => void;
+  req: RenderRequest;
+  /** Sent again with the document's state after a `missing-doc` answer. */
+  resent: boolean;
+};
+/** Threads of long renders, or the process kept for interactive renders. */
 type Role = 'bulk' | 'interactive';
 
-class WorkerThread implements RenderThread {
-  readonly kind = 'worker' as const;
+/** Bytes of a render process's stderr kept to tell how it ended. */
+const STDERR_TAIL_BYTES = 16 * 1024;
+/** What V8 prints when a heap allocation fails ("FATAL ERROR: … JavaScript heap out of memory"). */
+const HEAP_OOM = /heap out of memory|allocation failed|out of memory/i;
+
+/** How the errors of a render process that ran out of memory end (the pool replaces it). */
+const REPLACED = 'the server keeps running and starts a new render process for the next render';
+
+/** The message of a render process that ran out of JavaScript heap. */
+function outOfHeapMessage(heapLimitMb: number | undefined): string {
+  const limit = heapLimitMb ? ` (its JavaScript heap is limited to ${heapLimitMb} MB)` : '';
+  return `the render process ran out of memory${limit}; ${REPLACED}`;
+}
+
+/**
+ * The line of a crashed render process's stderr that says why: the error line of an uncaught
+ * exception ("TypeError: …"), not the source line, the stack frames, Node's hints or the "Node.js
+ * vX" banner Node prints after it; else the last other line.
+ */
+export function crashReason(stderr: string): string | undefined {
+  const lines = stderr
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(
+      (l) => l && !/^at\s/.test(l) && !/^Node\.js v\d/.test(l) && !/^\^+$/.test(l) && !/^\(Use `node/.test(l),
+    );
+  for (let i = lines.length - 1; i >= 0; i--)
+    if (/^(?:Uncaught\s+)?(?:[A-Z]\w*)?(?:Error|Exception)\b/.test(lines[i])) return lines[i];
+  return lines.pop();
+}
+
+/**
+ * The error of a render process that ended by itself: out of heap (V8's fatal error on stderr),
+ * killed with SIGKILL (what the kernel's out-of-memory killer sends), or another crash.
+ */
+export function renderProcessExitError(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  stderr: string,
+  heapLimitMb?: number,
+): Error {
+  if (HEAP_OOM.test(stderr))
+    return new RenderOutOfMemoryError(outOfHeapMessage(heapLimitMb), heapLimitMb, 'heap');
+  if (signal === 'SIGKILL')
+    return new RenderOutOfMemoryError(
+      `the render process was killed (SIGKILL), most likely by the system because the machine ran out of memory; ${REPLACED}`,
+      heapLimitMb,
+      'killed',
+    );
+  const reason = crashReason(stderr);
+  return new Error(
+    `the render process exited unexpectedly (${signal ? `signal ${signal}` : `exit code ${code}`})${reason ? `: ${reason}` : ''}`,
+  );
+}
+
+/**
+ * The error of a request that was waiting in a render process behind the request that ended it
+ * (`cause`): two long renders share the render processes, and the other render's request ran the
+ * process out of memory (or crashed it). This render was not the cause: it can run again.
+ */
+export function sharedProcessError(cause: Error): Error {
+  if (cause instanceof RenderOutOfMemoryError) {
+    const what =
+      cause.reason === 'killed'
+        ? 'was killed (SIGKILL), most likely by the system because the machine ran out of memory,'
+        : 'ran out of memory';
+    return new RenderOutOfMemoryError(
+      `the render process ${what} while it worked on another render that shared it; this render was not ` +
+        'the cause: run it again (a new render process serves it)',
+      cause.heapLimitMb,
+      'shared',
+    );
+  }
+  return new Error(
+    `the render process stopped while it worked on another render that shared it (${cause.message}); ` +
+      'run this render again (a new render process serves it)',
+  );
+}
+
+class ProcessThread implements RenderThread {
+  readonly kind = 'process' as const;
   lastUsed = Date.now();
   /** The document caches were dropped since the last call (see RenderPool.sweep). */
   cleared = false;
-  private readonly worker: Worker;
+  /** The process reported that it is ready (warmed up). */
+  started = false;
+  /** The process id, and its JavaScript heap limit in MB once it reported it. */
+  readonly pid: number | undefined;
+  heapLimitMb: number | undefined;
+  readonly ready: Promise<void>;
+  /** Resolves when the process has exited. */
+  readonly exited: Promise<void>;
+  private readonly child: ChildProcess;
   private readonly calls = new Map<number, Pending>();
+  /**
+   * Ids of the pending calls in the order their messages went to the process, which handles them
+   * one at a time in that order: the first one is the one it is working on.
+   */
+  private readonly order: number[] = [];
   private nextId = 1;
   private failure: Error | null = null;
+  /** What calls made after the end get: a `shared` error when a request ended the process. */
+  private lateFailure: Error | null = null;
   private idleWaiters: (() => void)[] = [];
-  readonly ready: Promise<void>;
+  /** Messages for the process before it is ready (null once it is). */
+  private outbox: WorkerRequest[] | null = [];
+  /** Documents (key → version) the process holds, least recently used first (see MAX_DOCUMENTS). */
+  private readonly docs = new Map<string, number>();
+  private stderrTail = '';
+  /** terminate() was called: the exit is expected. */
+  private stopping = false;
+  private settleReady: ((err?: Error) => void) | null = null;
 
   constructor(
     readonly id: number,
     readonly role: Role,
-    url: URL,
-    private readonly onExit: (t: WorkerThread, err: Error) => void,
+    entry: URL,
+    opts: { heapLimitMb?: number; startTimeoutMs: number },
+    private readonly onExit: (t: ProcessThread, err: Error) => void,
   ) {
-    this.worker = new Worker(url, { name: `render-${id}` });
-    this.worker.unref();
-    this.worker.on('message', (m: WorkerResponse) => this.onMessage(m));
-    this.worker.on('error', (err) => this.fail(err instanceof Error ? err : new Error(String(err))));
-    this.worker.on('exit', (code) => this.fail(new Error(`render worker exited with code ${code}`)));
-    this.ready = this.call({ type: 'ping' }).then(() => undefined);
+    let resolveExited!: () => void;
+    this.exited = new Promise<void>((r) => (resolveExited = r));
+    this.ready = new Promise<void>((resolve, reject) => {
+      this.settleReady = (err) => {
+        this.settleReady = null;
+        clearTimeout(timer);
+        if (err) reject(err);
+        else resolve();
+      };
+    });
     this.ready.catch(() => undefined);
+    // the server's own Node flags (loaders, heap limit) are not passed on: worker-dev.mjs registers
+    // the TypeScript loader itself, and the heap limit is the render process's own (heap flags in
+    // NODE_OPTIONS would override it). --expose-gc lets an idle process give the memory of the
+    // documents it dropped back (see clearCaches)
+    const heapFlags = /--max-(old-space|heap|semi-space)-size(=\S*)?/g;
+    const env = { ...process.env };
+    if (opts.heapLimitMb && env.NODE_OPTIONS)
+      env.NODE_OPTIONS = env.NODE_OPTIONS.replace(heapFlags, '').replace(/\s+/g, ' ').trim();
+    this.child = fork(fileURLToPath(entry), [], {
+      execArgv: [
+        '--expose-gc',
+        ...(opts.heapLimitMb ? [`--max-heap-size=${Math.round(opts.heapLimitMb)}`] : []),
+      ],
+      env,
+      serialization: 'advanced',
+      stdio: ['ignore', 'inherit', 'pipe', 'ipc'],
+    });
+    this.pid = this.child.pid;
+    const timer = setTimeout(() => {
+      const ms = opts.startTimeoutMs;
+      this.fail(
+        new Error(`the render process did not start within ${ms % 1000 ? `${ms} ms` : `${ms / 1000} s`}`),
+      );
+    }, opts.startTimeoutMs);
+    timer.unref?.();
+    this.child.on('message', (m: WorkerResponse) => this.onMessage(m));
+    this.child.on('error', (err) => this.fail(err));
+    this.child.stderr?.on('data', (chunk: Buffer) => {
+      // V8's out-of-memory report and any warning go to the server's stderr too
+      process.stderr.write(chunk);
+      this.stderrTail = (this.stderrTail + chunk.toString('utf8')).slice(-STDERR_TAIL_BYTES);
+    });
+    let closed = false;
+    const onEnded = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (closed) return;
+      closed = true;
+      resolveExited();
+      if (this.stopping) this.fail(new RenderCancelledError('render process stopped'));
+      else
+        this.fail(renderProcessExitError(code, signal, this.stderrTail, this.heapLimitMb), {
+          working: this.order.find((id) => this.calls.has(id)),
+        });
+    };
+    // 'close' comes once stderr is read to its end (V8's out-of-memory report included); 'exit'
+    // alone if the pipe stays open for some reason
+    this.child.on('close', onEnded);
+    this.child.on('exit', (code, signal) => {
+      setTimeout(() => onEnded(code, signal), 1000).unref?.();
+    });
   }
 
   get pending(): number {
@@ -138,32 +328,43 @@ class WorkerThread implements RenderThread {
     return !this.failure;
   }
 
-  call<T extends WorkerResult>(req: RenderRequest, transfer: ArrayBuffer[] = []): Promise<T> {
-    if (this.failure) return Promise.reject(this.failure);
+  call<T extends WorkerResult>(req: RenderRequest): Promise<T> {
+    if (this.failure) return Promise.reject(this.lateFailure ?? this.failure);
     const id = this.nextId++;
     this.cleared = false;
     return new Promise<T>((resolve, reject) => {
-      this.calls.set(id, { resolve: resolve as (v: never) => void, reject });
-      if (this.calls.size === 1) this.worker.ref();
+      this.calls.set(id, { resolve: resolve as (v: never) => void, reject, req, resent: false });
+      if (this.calls.size === 1) this.hold(true);
       try {
-        this.worker.postMessage({ ...req, id }, transfer);
+        this.post(this.message(id, req, false));
+        this.order.push(id);
       } catch (err) {
         this.calls.delete(id);
-        if (!this.calls.size) this.worker.unref();
+        if (!this.calls.size) this.hold(false);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
   }
 
   release(job: number): void {
-    if (!this.failure) this.worker.postMessage({ type: 'release', job } satisfies WorkerRequest);
+    if (!this.failure) this.tell({ type: 'release', job });
   }
 
-  /** Drops the worker's cached documents (fire and forget). */
+  /** Drops the process's cached documents (fire and forget). */
   clearCaches(): void {
     if (this.failure || this.cleared) return;
     this.cleared = true;
-    this.worker.postMessage({ type: 'clear' } satisfies WorkerRequest);
+    this.docs.clear();
+    this.tell({ type: 'clear' });
+  }
+
+  /** Sends a message without an answer; a process that is gone needs none (its exit is handled). */
+  private tell(msg: WorkerRequest): void {
+    try {
+      this.post(msg);
+    } catch {
+      // the process exited or is exiting
+    }
   }
 
   /** Resolves when no call is pending (true) or after `timeoutMs` (false). */
@@ -183,38 +384,172 @@ class WorkerThread implements RenderThread {
     });
   }
 
+  /** Stops the process (its pending calls fail with a RenderCancelledError). */
+  terminate(): Promise<void> {
+    this.stopping = true;
+    this.fail(new RenderCancelledError('render process stopped'));
+    return this.exited;
+  }
+
+  /**
+   * The message of request `id`: a document's state is left out when the process already has
+   * that version (the update is encoded and copied only for processes that need it).
+   */
+  private message(id: number, req: RenderRequest, withState: boolean): WorkerRequest {
+    if (!('doc' in req)) return { ...req, id } as WorkerRequest;
+    const d: DocRef = req.doc;
+    const has = !withState && this.docs.get(d.key) === d.version;
+    return {
+      ...req,
+      id,
+      doc: has ? { key: d.key, version: d.version } : { key: d.key, version: d.version, update: d.update },
+    } as WorkerRequest;
+  }
+
+  /** Records that the process holds `doc` (mirrors its least-recently-used document cache). */
+  private holds(doc: DocRef): void {
+    this.docs.delete(doc.key);
+    this.docs.set(doc.key, doc.version);
+    while (this.docs.size > MAX_DOCUMENTS) this.docs.delete(this.docs.keys().next().value!);
+  }
+
+  private post(msg: WorkerRequest): void {
+    if (this.outbox) {
+      this.outbox.push(msg);
+      return;
+    }
+    if (!this.child.connected) throw this.failure ?? new Error('the render process is not connected');
+    this.child.send(msg, (err) => {
+      if (err) this.fail(err);
+    });
+  }
+
+  /**
+   * Keeps the server's event loop alive while calls are pending (an idle render process does not
+   * keep a process that has nothing else to do from exiting).
+   */
+  private hold(on: boolean): void {
+    const handles = [this.child, this.child.channel, this.child.stderr] as (
+      | {
+          ref?: () => void;
+          unref?: () => void;
+        }
+      | null
+      | undefined
+    )[];
+    for (const h of handles) {
+      if (on) h?.ref?.();
+      else h?.unref?.();
+    }
+  }
+
   private onMessage(m: WorkerResponse): void {
+    if (m.type === 'ready') {
+      // too late (the start timed out): the process is being stopped
+      if (this.failure) return;
+      this.started = true;
+      this.heapLimitMb = m.heapLimitMb;
+      this.lastUsed = Date.now();
+      const queued = this.outbox ?? [];
+      this.outbox = null;
+      try {
+        for (const msg of queued) this.post(msg);
+      } catch (err) {
+        this.fail(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+      if (!this.calls.size) this.hold(false);
+      this.settleReady?.();
+      return;
+    }
     const c = this.calls.get(m.id);
     if (!c) return;
+    if (m.type === 'error' && m.kind === 'missing-doc' && !c.resent && 'doc' in c.req) {
+      // the process dropped the document (or never had it): the same request with its state
+      c.resent = true;
+      this.docs.delete(c.req.doc.key);
+      this.unorder(m.id);
+      try {
+        this.post(this.message(m.id, c.req, true));
+        this.order.push(m.id);
+        return;
+      } catch (err) {
+        this.calls.delete(m.id);
+        c.reject(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+    }
     this.calls.delete(m.id);
+    this.unorder(m.id);
     this.lastUsed = Date.now();
-    if (m.type === 'error') c.reject(new Error(m.message));
-    else c.resolve(m.result as never);
+    if (m.type === 'error') {
+      if (m.kind === 'out-of-memory') {
+        // an allocation failed (a buffer, outside the JavaScript heap, or V8 reported it)
+        const err = new RenderOutOfMemoryError(
+          `the render process ran out of memory (${m.message}); ${REPLACED}`,
+          this.heapLimitMb,
+          'heap',
+        );
+        c.reject(err);
+        // it may be out of memory for good: a new process takes the next requests, and the
+        // requests waiting behind this one were not the cause
+        this.fail(err, { working: undefined });
+        return;
+      }
+      c.reject(new Error(m.message));
+    } else {
+      if ('doc' in c.req) this.holds(c.req.doc);
+      c.resolve(m.result as never);
+    }
     if (!this.calls.size) {
-      this.worker.unref();
+      this.hold(false);
       const waiters = this.idleWaiters;
       this.idleWaiters = [];
       for (const w of waiters) w();
     }
   }
 
-  private fail(err: Error): void {
-    if (this.failure) return;
-    this.failure = err;
-    for (const c of this.calls.values()) c.reject(err);
-    this.calls.clear();
-    for (const w of this.idleWaiters) w();
-    this.idleWaiters = [];
-    this.onExit(this, err);
+  private unorder(id: number): void {
+    const i = this.order.indexOf(id);
+    if (i >= 0) this.order.splice(i, 1);
   }
 
-  terminate(): void {
-    this.fail(new RenderCancelledError('render worker stopped'));
-    void this.worker.terminate().catch(() => undefined);
+  /**
+   * Ends the thread: pending calls fail with `err`, the process is stopped if it still runs. With
+   * `shared` (a request ran the process out of memory or crashed it), only the call it was working
+   * on (`shared.working`, if still pending) fails with `err`; the calls waiting behind it get a
+   * {@link sharedProcessError}.
+   */
+  private fail(err: Error, shared?: { working: number | undefined }): void {
+    if (this.failure) return;
+    this.failure = err;
+    // a request that comes after the end was not the cause either
+    this.lateFailure = shared ? sharedProcessError(err) : err;
+    this.outbox = null;
+    for (const [id, c] of this.calls) c.reject(shared && id !== shared.working ? this.lateFailure : err);
+    this.calls.clear();
+    this.order.length = 0;
+    for (const w of this.idleWaiters) w();
+    this.idleWaiters = [];
+    this.settleReady?.(err);
+    if (this.child.exitCode === null && this.child.signalCode === null) {
+      // referenced until it has exited, so that waiting for `exited` (RenderPool.close) works
+      this.hold(true);
+      try {
+        this.child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+    }
+    this.onExit(this, err);
   }
 }
 
-/** Runs the render engine on the main thread, one request per event loop turn. */
+/**
+ * Runs the render engine on the main thread, one request per event loop turn (single-thread
+ * mode). The server's heap is its heap: the Renderer refuses renders that would not fit into it
+ * (memory.ts).
+ */
 class MainThread implements RenderThread {
   readonly kind = 'main' as const;
   readonly alive = true;
@@ -244,7 +579,7 @@ class MainThread implements RenderThread {
   }
 
   release(job: number): void {
-    // in order with the calls, like a worker (a queued prepare must not outlive its release)
+    // in order with the calls, like a render process (a queued prepare must not outlive its release)
     const run = () => this.engine.release(job);
     this.queue = this.queue.then(run, run);
   }
@@ -273,6 +608,9 @@ class MainThread implements RenderThread {
         return this.engine.exportFile(req.doc, req.format, req.options);
       case 'ping':
         return { ok: true };
+      case 'test-allocate':
+      case 'test-busy':
+        throw new Error(`'${req.type}' is a test request for render processes`);
     }
   }
 }
@@ -288,19 +626,21 @@ interface Waiter {
 
 /** Render thread pool (see the module comment). */
 export class RenderPool {
-  /** Configured worker threads of long renders (0 = main thread only). */
+  /** Configured render processes of long renders (0 = main thread only). */
   readonly size: number;
   private readonly idleTimeoutMs: number;
   private readonly cacheIdleMs: number;
   private readonly drainTimeoutMs: number;
+  private readonly startTimeoutMs: number;
+  private readonly heapLimitMb: number | undefined;
   private readonly workerUrl: URL | null;
   private readonly log: RenderPoolLog | undefined;
-  private readonly workers = new Set<WorkerThread>();
+  private readonly workers = new Set<ProcessThread>();
   /** Started threads without a lease. */
   private readonly free = new Set<RenderThread>();
   /** Number of leases holding each leased thread. */
   private readonly holders = new Map<RenderThread, number>();
-  private readonly booting = new Set<WorkerThread>();
+  private readonly booting = new Set<ProcessThread>();
   /** Threads finishing abandoned work before they return to the pool. */
   private readonly draining = new Set<RenderThread>();
   private readonly waiters: Waiter[] = [];
@@ -308,9 +648,9 @@ export class RenderPool {
   private shared = 0;
   private main: MainThread | null = null;
   private nextThreadId = 1;
-  /** Why worker threads are not used (they failed to start), or null. */
+  /** Why render processes are not used (they failed to start), or null. */
   private brokenReason: string | null = null;
-  /** Worker starts that failed in a row (3 switch the pool to the main thread). */
+  /** Render process starts that failed in a row (3 switch the pool to the main thread). */
   private startFailures = 0;
   private closed = false;
   private readonly sweeper: ReturnType<typeof setInterval>;
@@ -321,23 +661,28 @@ export class RenderPool {
     this.idleTimeoutMs = opts.idleTimeoutMs ?? 600_000;
     this.cacheIdleMs = Math.min(opts.cacheIdleMs ?? 120_000, this.idleTimeoutMs);
     this.drainTimeoutMs = opts.drainTimeoutMs ?? 10_000;
+    this.startTimeoutMs = opts.startTimeoutMs ?? 120_000;
+    this.heapLimitMb =
+      opts.heapLimitMb !== undefined && Number.isFinite(opts.heapLimitMb) && opts.heapLimitMb > 0
+        ? Math.round(opts.heapLimitMb)
+        : undefined;
     this.workerUrl = this.size > 0 ? (opts.workerUrl ?? defaultWorkerUrl()) : null;
     this.log = opts.log;
     this.sweeper = setInterval(() => this.sweep(), Math.max(1000, Math.min(30_000, this.cacheIdleMs / 2)));
     this.sweeper.unref?.();
   }
 
-  /** 'workers' when rendering on worker threads, 'main-thread' in single-thread mode. */
-  get mode(): 'workers' | 'main-thread' {
-    return this.size > 0 && !this.brokenReason ? 'workers' : 'main-thread';
+  /** 'processes' when rendering in render processes, 'main-thread' in single-thread mode. */
+  get mode(): 'processes' | 'main-thread' {
+    return this.size > 0 && !this.brokenReason ? 'processes' : 'main-thread';
   }
 
   /** Threads a long render can use at most. */
   get capacity(): number {
-    return this.mode === 'workers' ? this.size : 1;
+    return this.mode === 'processes' ? this.size : 1;
   }
 
-  /** Live worker threads (started lazily, stopped when idle). */
+  /** Live render processes (started lazily, stopped when idle). */
   get running(): number {
     return this.workers.size;
   }
@@ -376,7 +721,7 @@ export class RenderPool {
     });
   }
 
-  /** Stops every worker and rejects waiting leases. */
+  /** Stops every render process (resolves once they exited, at most 5 s) and rejects waiting leases. */
   async close(): Promise<void> {
     this.closed = true;
     clearInterval(this.sweeper);
@@ -384,10 +729,20 @@ export class RenderPool {
       if (w.onAbort) w.signal?.removeEventListener('abort', w.onAbort);
       w.reject(new RenderCancelledError('render pool closed'));
     }
-    for (const t of [...this.workers]) t.terminate();
+    const exits = [...this.workers].map((t) => t.terminate());
     this.workers.clear();
     this.free.clear();
     this.holders.clear();
+    if (!exits.length) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.all(exits),
+      new Promise<void>((r) => {
+        timer = setTimeout(r, 5000);
+        timer.unref?.();
+      }),
+    ]);
+    clearTimeout(timer);
   }
 
   /** Hands threads to waiting renders, starting threads when needed. */
@@ -450,13 +805,13 @@ export class RenderPool {
   }
 
   /**
-   * Starts the workers waiting renders need: every render thread for a long render, the thread
-   * kept for interactive renders (and idle render threads when several wait). Returns true when
-   * threads became available at once (main thread fallback).
+   * Starts the render processes waiting renders need: every render thread for a long render, the
+   * process kept for interactive renders (and idle render threads when several wait). Returns true
+   * when threads became available at once (main thread fallback).
    */
   private ensureThreads(): boolean {
     if (this.closed) return false;
-    if (this.mode === 'workers') {
+    if (this.mode === 'processes') {
       let bulk = 0;
       let interactive = 0;
       for (const t of this.workers) {
@@ -471,20 +826,25 @@ export class RenderPool {
         const soon = this.free.size + this.booting.size;
         if (quickWaiting > soon) target = Math.max(target, Math.min(this.size, bulk + quickWaiting - soon));
       }
-      for (let n = bulk; n < target && this.mode === 'workers'; n++) this.spawn('bulk');
+      for (let n = bulk; n < target && this.mode === 'processes'; n++) this.spawn('bulk');
     }
-    // single-thread mode (configured, or workers could not start)
-    if (this.mode === 'workers' || this.main) return false;
+    // single-thread mode (configured, or render processes could not start)
+    if (this.mode === 'processes' || this.main) return false;
     this.main = new MainThread(this.nextThreadId++);
     this.free.add(this.main);
     return true;
   }
 
   private spawn(role: Role): void {
-    let t: WorkerThread;
+    let t: ProcessThread;
+    const t0 = performance.now();
     try {
-      t = new WorkerThread(this.nextThreadId++, role, this.workerUrl!, (thread, err) =>
-        this.onWorkerExit(thread, err),
+      t = new ProcessThread(
+        this.nextThreadId++,
+        role,
+        this.workerUrl!,
+        { heapLimitMb: this.heapLimitMb, startTimeoutMs: this.startTimeoutMs },
+        (thread, err) => this.onWorkerExit(thread, err),
       );
     } catch (err) {
       this.markBroken(err);
@@ -496,6 +856,16 @@ export class RenderPool {
       .then(
         () => {
           this.startFailures = 0;
+          this.log?.debug?.(
+            {
+              thread: t.id,
+              pid: t.pid,
+              role,
+              heapLimitMb: t.heapLimitMb,
+              ms: Math.round(performance.now() - t0),
+            },
+            'render process started',
+          );
           if (t.alive && !this.closed) {
             t.lastUsed = Date.now();
             this.free.add(t);
@@ -503,8 +873,9 @@ export class RenderPool {
         },
         (err: unknown) => {
           this.workers.delete(t);
+          if (this.closed) return;
           if (++this.startFailures >= 3) this.markBroken(err);
-          else this.log?.warn({ err: String(err) }, 'render worker failed to start');
+          else this.log?.warn({ err: String(err) }, 'render process failed to start');
         },
       )
       .finally(() => {
@@ -518,20 +889,28 @@ export class RenderPool {
     this.brokenReason = err instanceof Error ? err.message : String(err);
     this.log?.warn(
       { err: this.brokenReason, worker: this.workerUrl?.href },
-      'render worker threads unavailable: rendering on the main thread',
+      'render processes unavailable: rendering on the main thread',
     );
-    for (const t of [...this.workers]) t.terminate();
+    for (const t of [...this.workers]) void t.terminate();
     this.workers.clear();
     this.free.clear();
     this.booting.clear();
   }
 
-  private onWorkerExit(t: WorkerThread, err: Error): void {
+  private onWorkerExit(t: ProcessThread, err: Error): void {
     const known = this.workers.delete(t);
     this.free.delete(t);
     this.holders.delete(t);
-    if (known && !(err instanceof RenderCancelledError) && !this.closed)
-      this.log?.warn({ err: err.message, thread: t.id }, 'render worker stopped unexpectedly');
+    // a process that never became ready is reported as a failed start (see spawn)
+    if (known && t.started && !(err instanceof RenderCancelledError) && !this.closed) {
+      if (err instanceof RenderOutOfMemoryError)
+        this.log?.warn(
+          { err: err.message, thread: t.id, pid: t.pid, heapLimitMb: err.heapLimitMb },
+          'render process ran out of memory: its renders failed, a new process serves the next ones',
+        );
+      else
+        this.log?.warn({ err: err.message, thread: t.id, pid: t.pid }, 'render process stopped unexpectedly');
+    }
     // a long render waiting for a replacement thread
     if (this.waiters.length && !this.closed) queueMicrotask(() => this.dispatch());
   }
@@ -567,20 +946,20 @@ export class RenderPool {
    * it when that takes too long).
    */
   private async giveBack(t: RenderThread): Promise<void> {
-    if (t instanceof WorkerThread && t.pending > 0 && t.alive) {
+    if (t instanceof ProcessThread && t.pending > 0 && t.alive) {
       this.draining.add(t);
       try {
         const drained = await t.drain(this.drainTimeoutMs);
         if (!drained) {
-          this.log?.warn({ thread: t.id }, 'stopping a render worker busy with cancelled work');
-          t.terminate();
+          this.log?.warn({ thread: t.id, pid: t.pid }, 'stopping a render process busy with cancelled work');
+          void t.terminate();
         }
       } finally {
         this.draining.delete(t);
       }
     }
     if (t.alive && !this.closed && !this.holders.has(t)) {
-      if (t instanceof WorkerThread) t.lastUsed = Date.now();
+      if (t instanceof ProcessThread) t.lastUsed = Date.now();
       this.free.add(t);
     }
     this.dispatch();
@@ -589,17 +968,17 @@ export class RenderPool {
   private sweep(): void {
     const now = Date.now();
     for (const t of [...this.free]) {
-      if (!(t instanceof WorkerThread) || t.pending > 0) continue;
+      if (!(t instanceof ProcessThread) || t.pending > 0) continue;
       const idle = now - t.lastUsed;
       if (idle >= this.idleTimeoutMs) {
         this.free.delete(t);
         this.workers.delete(t);
-        t.terminate();
+        void t.terminate();
       } else if (idle >= this.cacheIdleMs) t.clearCaches();
     }
   }
 }
 
 function roleOf(t: RenderThread): Role {
-  return t instanceof WorkerThread ? t.role : 'bulk';
+  return t instanceof ProcessThread ? t.role : 'bulk';
 }
