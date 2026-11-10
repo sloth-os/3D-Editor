@@ -21,6 +21,7 @@ import {
   type PresenceState,
   type ProjectFileStore,
   type ProjectInfo,
+  type ProjectMeta,
   type RpcMessage,
   type RpcRequest,
   type RpcResponse,
@@ -182,9 +183,41 @@ function requestInfo(method: string, params: unknown, sentAt: number): RpcReques
   };
 }
 
+/**
+ * How {@link Room.deleteFromStorage} ended: storage deleted the project, or the deletion did not
+ * start ('timed out': the room's earlier reads and writes of storage did not finish in time; 'storage
+ * late': one that a request stopped waiting for was still going on, and the deletion did not wait).
+ */
+export type DeletionOutcome = 'deleted' | 'timed out' | 'storage late';
+
 /** The key of the kind of a request for {@link Room.lastAnswer}: its method and what it asked for. */
 function answerKey(r: Pick<RpcRequestInfo, 'method' | 'command' | 'engine' | 'shading'>): string {
   return [r.method, r.command ?? '', r.engine ?? '', r.shading ?? ''].join('|');
+}
+
+/**
+ * A room's scene: while its document has no name (a project with a project.json and no document:
+ * RoomManager loads an empty document), its name is the stored one (`storedName`, project.json's),
+ * which editors and agents see (get_scene, REST, error messages) and listings and saves keep
+ * (projectInfoFromScene). The document gets no name item from the server: a new item would be a
+ * concurrent write of the name, and a browser that renamed the project in its copy of the full
+ * document could lose its rename to it when the two merge (concurrent sets of one Y.Map key are
+ * resolved by client id).
+ */
+class RoomScene extends SceneDoc {
+  constructor(
+    doc: Y.Doc,
+    origin: object,
+    private readonly storedName: () => string | undefined,
+  ) {
+    super(doc, origin);
+  }
+
+  override getMeta(): ProjectMeta {
+    const meta = super.getMeta();
+    const stored = this.map('meta').has('name') ? undefined : this.storedName();
+    return stored ? { ...meta, name: stored } : meta;
+  }
 }
 
 /**
@@ -217,9 +250,16 @@ export class Room {
    * saves it again; 'unknown' before (a new project, or one with a project.json and no document).
    */
   private storage: 'unknown' | 'stored' | 'deleted';
+  /** Storage deleted the project at this server's request (see {@link deleteFromStorage}). */
+  private removed = false;
+  /** See {@link storageLate}. */
+  private readonly lateReads = new Set<Promise<unknown>>();
   private firstDirtyAt = 0;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The room's reads and writes of storage, one at a time (see {@link enqueue}). */
   private saveChain: Promise<void> = Promise.resolve();
+  /** How many of them are queued or running. */
+  private queued = 0;
   private saveFailures = 0;
   private readonly pendingRpc = new Map<string, PendingRpc>();
   /** Requests that timed out, by id, until the editor answers them late (see {@link lateRpcs}). */
@@ -236,7 +276,7 @@ export class Room {
     init: { info?: ProjectInfo | null; persisted?: boolean; documentStored?: boolean; readAt?: number } = {},
   ) {
     this.doc = doc;
-    this.scene = new SceneDoc(doc, { type: 'server', room: id });
+    this.scene = new RoomScene(doc, { type: 'server', room: id }, () => this.info?.name);
     this.awareness = new awarenessProtocol.Awareness(doc);
     // The server itself is not a participant.
     this.awareness.setLocalState(null);
@@ -313,7 +353,7 @@ export class Room {
 
   /** Schedules a debounced save (bounded by a maximum delay under continuous editing). */
   markDirty(): void {
-    if (!this.deps.store || this.destroyed) return;
+    if (!this.deps.store || this.destroyed || this.removed) return;
     this.dirty = true;
     const now = Date.now();
     if (!this.firstDirtyAt) this.firstDirtyAt = now;
@@ -334,8 +374,20 @@ export class Room {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    const run = this.saveChain.then(() => this.save(false));
-    this.saveChain = run.catch(() => undefined);
+    return this.enqueue(() => this.save(false));
+  }
+
+  /**
+   * Runs `task`, a read or write of storage (a save, a refresh, the deletion), after the ones asked
+   * for before have finished.
+   */
+  private enqueue(task: () => Promise<void>): Promise<void> {
+    this.queued++;
+    const run = this.saveChain.then(task);
+    const finished = () => {
+      this.queued--;
+    };
+    this.saveChain = run.then(finished, finished);
     return run;
   }
 
@@ -365,6 +417,25 @@ export class Room {
   }
 
   /**
+   * Whether a read of storage for this room that a request stopped waiting for (storage did not
+   * answer in time) is still going on (see {@link readIsLate}): requests then answer without
+   * waiting for storage again, so that one request waits for storage that does not answer once
+   * (RoomManager.readUnused, then get_project's check, readBeforeAnswer, or a deletion,
+   * deleteFromStorage), not once per read.
+   */
+  get storageLate(): boolean {
+    return this.lateReads.size > 0;
+  }
+
+  /** Records that a request stopped waiting for `read`, a read of storage for this room. */
+  readIsLate(read: Promise<unknown>): void {
+    if (this.lateReads.has(read)) return;
+    this.lateReads.add(read);
+    const done = () => this.lateReads.delete(read);
+    read.then(done, done);
+  }
+
+  /**
    * Merges changes made to the stored document by others (other servers sharing the storage,
    * devices saving to WebDAV directly) into the room, and saves pending local changes.
    *
@@ -382,14 +453,58 @@ export class Room {
    */
   refresh(): Promise<void> {
     if (!this.deps.store || this.destroyed) return Promise.resolve();
-    const run = this.saveChain.then(() => this.save(true));
-    this.saveChain = run.catch(() => undefined);
-    return run;
+    return this.enqueue(() => this.save(true));
+  }
+
+  /**
+   * Deletes the project from storage with `remove` (RoomManager.deleteProject) between the room's
+   * reads and writes of storage: after the ones asked for before, before the ones asked for
+   * meanwhile, which wait for it. Resolves 'deleted' once storage deleted the project: from then on
+   * the room writes nothing (a save would store the project again), and it is to be closed. Rejects
+   * when `remove` fails: the room goes on saving (its changes made meanwhile too). Resolves with why
+   * the deletion did not start, and then it never starts: 'timed out' when the earlier reads and
+   * writes did not finish within `waitMs` (storage does not answer them: each request may take
+   * 30 s), 'storage late' at once when they had not finished while one that a request stopped
+   * waiting for went on (storageLate; the deletion then waits for none, as other requests do not).
+   */
+  deleteFromStorage(remove: () => Promise<void>, waitMs: number): Promise<DeletionOutcome> {
+    if (this.queued > 0 && this.storageLate) return Promise.resolve('storage late');
+    let state: 'waiting' | 'started' | 'given up' = 'waiting';
+    const run = this.enqueue(async () => {
+      if (state === 'given up') return;
+      state = 'started';
+      await remove();
+      this.removed = true;
+      if (this.saveTimer) clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    });
+    return new Promise<DeletionOutcome>((resolve, reject) => {
+      // (an idle queue starts the deletion before the timer fires, also with no time left)
+      const timer = setTimeout(
+        () => {
+          if (state !== 'waiting') return;
+          state = 'given up';
+          resolve('timed out');
+        },
+        Math.max(0, waitMs),
+      );
+      timer.unref?.();
+      run.then(
+        () => {
+          clearTimeout(timer);
+          if (state === 'started') resolve('deleted');
+        },
+        (err: unknown) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
   }
 
   private async save(refresh: boolean): Promise<void> {
     const store = this.deps.store;
-    if (!store || this.destroyed || (!this.dirty && !refresh)) return;
+    if (!store || this.destroyed || this.removed || (!this.dirty && !refresh)) return;
     const wasDirty = this.dirty;
     this.dirty = false;
     this.firstDirtyAt = 0;

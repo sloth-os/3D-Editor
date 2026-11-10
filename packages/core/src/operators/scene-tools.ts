@@ -44,6 +44,7 @@ import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { pollObjectMode, resolveObjectIds, setSelection, vec3 } from './helpers';
 import { autoKeyTransforms, rekeyAnimated } from './anim';
+import { keyChannelChanges, type ChannelChange, type ChannelPath } from './transform';
 import { remapDuplicatedReferences } from './armature';
 import { Rng } from '../generate/random';
 import {
@@ -133,6 +134,8 @@ class LayoutScene {
   private fsCache: FrameState | null = null;
   private readonly log: { id: string; change: Mat4 }[] = [];
   private readonly editedIds = new Set<string>();
+  /** The channels this run wrote, per object (the values keying takes from the stored ones). */
+  private readonly written = new Map<string, Set<ChannelPath>>();
   private readonly ancestorCache = new Map<string, string[]>();
   private readonly pointCache = new Map<string, ArrayLike<number> | null>();
 
@@ -230,7 +233,10 @@ class LayoutScene {
     const moved = transformedChannels(o, basis, 'TRANSLATE', translation4(delta), [0, 0, 0]);
     // a move by less than rounding (an object already where it goes) writes nothing
     const patch = changedChannels(stored, { ...stored, location: moved.location }, transformTolerance(basis));
-    if (patch) this.ctx.doc.updateObject(id, { location: clean3(patch.location!) });
+    if (patch) {
+      this.ctx.doc.updateObject(id, { location: clean3(patch.location!) });
+      this.wrote(id, ['location']);
+    }
     this.record(id, translation4(delta));
   }
 
@@ -250,11 +256,13 @@ class LayoutScene {
     const stored = this.ctx.doc.getObject(id);
     if (!stored) return;
     const patch = changedChannels(stored, next, tol);
-    if (patch)
+    if (patch) {
       this.ctx.doc.updateObject(
         id,
         Object.fromEntries(Object.entries(patch).map(([k, v]) => [k, clean3(v as Vec3)])),
       );
+      this.wrote(id, Object.keys(patch) as ChannelPath[]);
+    }
     const parent = this.hasParent(id) ? this.parentWorld(id) : identity4();
     const before = multiply4(parent, compose4(o.location, o.rotation_euler, o.scale));
     const after = multiply4(parent, compose4(next.location, next.rotation_euler, next.scale));
@@ -375,9 +383,16 @@ class LayoutScene {
     this.writeChannels(id, o, next, transformTolerance(this.basis(id, o)));
   }
 
-  /** Records an edit made directly to an object's transform fields (for keying). */
-  touch(id: string): void {
+  /** Records an edit made directly to the `channels` of an object (for keying). */
+  touch(id: string, channels: readonly ChannelPath[]): void {
     this.editedIds.add(id);
+    this.wrote(id, channels);
+  }
+
+  private wrote(id: string, channels: readonly ChannelPath[]): void {
+    let set = this.written.get(id);
+    if (!set) this.written.set(id, (set = new Set()));
+    for (const c of channels) set.add(c);
   }
 
   /**
@@ -503,11 +518,25 @@ class LayoutScene {
     return out;
   }
 
-  /** Keys the edited objects like the transform operators; returns their ids. */
+  /**
+   * Keys the edited objects as the transform operators key (keyChannelChanges): with auto keying
+   * all their channels with the values they show afterwards, without it the animated channels this
+   * run changed. A channel the run did not write shows what it showed before (an animated one its
+   * value at the frame, not its stored one). Returns their ids.
+   */
   commit(): string[] {
     const ids = [...this.editedIds].filter((id) => this.ctx.doc.getObject(id));
-    if (this.ctx.state.autoKeying) autoKeyTransforms(this.ctx, ids);
-    else for (const id of ids) rekeyAnimated(this.ctx, 'object', id, ['location', 'rotation_euler', 'scale']);
+    const changes = new Map<string, ChannelChange>();
+    for (const id of ids) {
+      const shown = this.ev.byId.get(id)?.data;
+      const stored = this.ctx.doc.getObject(id)!;
+      if (!shown) continue;
+      const before = { location: shown.location, rotation_euler: shown.rotation_euler, scale: shown.scale };
+      const after = { ...before };
+      for (const c of this.written.get(id) ?? []) after[c] = stored[c];
+      changes.set(id, { before, after });
+    }
+    keyChannelChanges(this.ctx, changes);
     return ids;
   }
 }
@@ -1699,7 +1728,7 @@ export function registerSceneToolsOperators(reg: OperatorRegistry): void {
           } else f = factor.map((v) => v ?? 1);
           const scale = clean3(o.scale.map((v, k) => v * f[k]) as Vec3);
           ctx.doc.updateObject(id, { scale });
-          scene.touch(id);
+          scene.touch(id, ['scale']);
           out.push({
             object: id,
             name: o.name,

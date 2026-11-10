@@ -15,6 +15,16 @@
   --text: #e6e6e6;
   --text-dim: #a8a8a8;
   --text-faint: #777;
+  /*
+   * A menu item under the pointer, as Blender 4.2 draws it (interface_widgets.cc,
+   * widget_state_menu_item, UI_HOVER): the menu background (--bg-menu) blended 20% toward the text
+   * colour (--text), behind a white label. A greyed-out item (Blender's layout.active = False) gets
+   * the same highlight with a label of white blended halfway into it: contrast 3.90:1, where
+   * --text-faint on the blue highlight (--accent) menu items had before was 1.08:1.
+   */
+  --bg-menu-hover: #414141;
+  --text-menu-hover: #fff;
+  --text-inactive-hover: #a0a0a0;
   --accent: #4772b3;
   --accent-hi: #5680c2;
   --select: #f17e2a;
@@ -340,11 +350,20 @@ select.select {
 }
 .menu-item:hover,
 .menu-item.hover {
-  background: var(--accent);
+  background: var(--bg-menu-hover);
+  color: var(--text-menu-hover);
 }
 .menu-item.disabled {
   color: var(--text-faint);
   cursor: default;
+}
+/* greyed out, but a click still runs it (Blender's layout.active = False) */
+.menu-item[data-inactive] {
+  color: var(--text-faint);
+}
+.menu-item[data-inactive]:hover {
+  background: var(--bg-menu-hover);
+  color: var(--text-inactive-hover);
 }
 .menu-item.disabled:hover {
   background: transparent;
@@ -355,6 +374,12 @@ select.select {
 .menu-item .shortcut {
   color: var(--text-dim);
   font-size: 11px;
+}
+/* the shortcut of a greyed-out item: its label's colour at half alpha, as Blender draws the hint part
+   of a menu item (interface_widgets.cc, widget_draw_text: wcol->text, col[3] *= 0.5f) */
+.menu-item[data-inactive] .shortcut {
+  color: inherit;
+  opacity: 0.5;
 }
 .menu-item .check {
   width: 12px;

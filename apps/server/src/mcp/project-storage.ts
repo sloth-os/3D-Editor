@@ -37,7 +37,10 @@ export const LIST_FAILED_NOTE =
 export const PROJECT_READ_MAX_AGE_MS = 2000;
 /**
  * How long get_project waits for that check; it goes on, and the next get_project does not wait
- * for it again (storage that does not answer takes 30 s per request).
+ * for it again (storage that does not answer takes 30 s per request). Nor does a get_project wait
+ * for it after waiting as long for another read of the room (Room.storageLate: opening a room
+ * nobody uses reads storage first, RoomManager.readUnused, for as long at most): one get_project
+ * waits once.
  */
 export const PROJECT_READ_WAIT_MS = 5000;
 
@@ -51,14 +54,15 @@ const checks = new WeakMap<Room, { done: Promise<void>; late: boolean }>();
  * storage (another writer deleted the project, or stored it again), the room reads it (Room.refresh,
  * which sets Room.deletedFromStorage or merges what the other writer stored). Waits at most
  * {@link PROJECT_READ_WAIT_MS}, and not at all for a check that a get_project already stopped
- * waiting for. A failed check leaves the room as it was.
+ * waiting for, nor while another read of the room that a request stopped waiting for goes on
+ * (Room.storageLate). A failed check leaves the room as it was.
  */
 export async function readBeforeAnswer(
   room: Room,
   store: ProjectFileStore | null,
   now = Date.now(),
 ): Promise<void> {
-  if (!store || room.destroyed) return;
+  if (!store || room.destroyed || room.storageLate) return;
   let check = checks.get(room);
   if (!check) {
     if (now - room.readAt < PROJECT_READ_MAX_AGE_MS) return;
@@ -82,7 +86,10 @@ export async function readBeforeAnswer(
     timer = setTimeout(() => resolve(true), PROJECT_READ_WAIT_MS);
     timer.unref?.();
   });
-  if (await Promise.race([check.done.then(() => false), late])) check.late = true;
+  if (await Promise.race([check.done.then(() => false), late])) {
+    check.late = true;
+    room.readIsLate(check.done);
+  }
   clearTimeout(timer);
 }
 

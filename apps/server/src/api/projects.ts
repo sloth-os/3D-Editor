@@ -11,8 +11,9 @@ import {
 } from '../sync/project-names';
 import type { Room } from '../sync/room';
 import { errorMessage, withSpan, withSpanSync } from '../observability/tracing';
-import { RenderRequestError, isCancelled, sharedRenderer, type Renderer } from '../render';
+import { RenderRequestError, isCancelled, isOutOfMemory, sharedRenderer, type Renderer } from '../render';
 import { sharedRenderStore, type RenderStore } from '../render/store';
+import { snapshotRefusal } from '../render/memory';
 
 export const EXPORT_FORMATS = ['glb', 'gltf', 'obj', 'stl', 'ply'] as const;
 
@@ -95,6 +96,28 @@ function nameTaken(reply: FastifyReply, err: ProjectNameTakenError) {
     id: ids[0],
     ids,
   });
+}
+
+/**
+ * The reply of a render or export that ran out of memory (render.png, export): 507 Insufficient
+ * Storage with code OUT_OF_MEMORY (the scene needs more memory than a render process has: retrying
+ * does not help), or 503 with code INTERRUPTED and Retry-After when another render that shared the
+ * render process ran it out of memory (this one can run again). Null for other errors.
+ */
+export function outOfMemoryReply(
+  err: unknown,
+  what: 'render' | 'export',
+): { status: number; body: { error: string; code: string }; retryAfter?: number } | null {
+  if (!isOutOfMemory(err)) return null;
+  const error = `${what} failed: ${err.message}`;
+  return err.reason === 'shared'
+    ? { status: 503, body: { error, code: 'INTERRUPTED' }, retryAfter: 1 }
+    : { status: 507, body: { error, code: 'OUT_OF_MEMORY' } };
+}
+
+function sendOutOfMemory(reply: FastifyReply, r: NonNullable<ReturnType<typeof outOfMemoryReply>>) {
+  if (r.retryAfter !== undefined) reply.header('retry-after', String(r.retryAfter));
+  return reply.code(r.status).send(r.body);
 }
 
 /** Builds a safe download file name from a project name. */
@@ -190,6 +213,13 @@ export function registerProjectRoutes(
     const { id } = idParams.parse(request.params);
     const room = await roomOr404(id, reply);
     if (!room) return reply;
+    // the copy of the meshes and its JSON take the server's own heap (render/memory.ts)
+    const refused = snapshotRefusal(room.scene);
+    if (refused)
+      return sendOutOfMemory(reply, {
+        status: 507,
+        body: { error: `snapshot failed: ${refused}`, code: 'OUT_OF_MEMORY' },
+      });
     return withSpanSync('project.snapshot', { 'project.id': id }, () => room.scene.toSnapshot());
   });
 
@@ -256,6 +286,8 @@ export function registerProjectRoutes(
           .code(abort.signal.aborted && reply.raw.writable ? 503 : 499)
           .send({ error: 'export cancelled' });
       if (isNotImplemented(err)) return reply.code(501).send({ error: errorMessage(err) });
+      const oom = outOfMemoryReply(err, 'export');
+      if (oom) return sendOutOfMemory(reply, oom);
       return reply.code(500).send({ error: `export failed: ${errorMessage(err)}` });
     } finally {
       rendering.delete(abort);
@@ -333,6 +365,8 @@ export function registerProjectRoutes(
           .send({ error: 'render cancelled' });
       if (err instanceof RenderRequestError) return reply.code(400).send({ error: err.message });
       if (isNotImplemented(err)) return reply.code(501).send({ error: errorMessage(err) });
+      const oom = outOfMemoryReply(err, 'render');
+      if (oom) return sendOutOfMemory(reply, oom);
       return reply.code(500).send({ error: `render failed: ${errorMessage(err)}` });
     } finally {
       rendering.delete(abort);

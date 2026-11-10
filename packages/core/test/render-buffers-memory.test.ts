@@ -140,6 +140,20 @@ describe('render buffers with typed arrays', () => {
     check({ ...m, faceSmooth: m.faceSmooth.map(() => false), uvs: null });
   });
 
+  it('share one render vertex among corners whose UVs are NaN, or -0 and 0, like the old one', () => {
+    // a smooth grid: the corners around each vertex form one fan, and corners of a vertex with the
+    // same UV share one render vertex (the old version keyed them by the numbers' text: 'NaN' = 'NaN',
+    // '0' for -0 and 0)
+    const grid = createGrid({ x_subdivisions: 3, y_subdivisions: 3 });
+    grid.faceSmooth = grid.faceSmooth.map(() => true);
+    grid.uvs = grid.faces.map((face, f) =>
+      face.flatMap((v) => (v % 3 === 0 ? [NaN, NaN] : v % 3 === 1 ? [f % 2 ? -0 : 0, 0.5] : [0.25, NaN])),
+    );
+    check(grid);
+    // one render vertex per vertex: the 16 vertices of the grid
+    expect(buildRenderBuffers(grid).positions.length / 3).toBe(16);
+  });
+
   it('match on random meshes', () => {
     for (let seed = 1; seed <= 40; seed++) {
       const r = rng(seed);

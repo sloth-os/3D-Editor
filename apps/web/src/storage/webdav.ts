@@ -201,6 +201,17 @@ export class WebDAVSync {
    * name the server.
    */
   deletedOnServer: () => boolean = () => false;
+  /**
+   * The name in the project's stored project.json, read once for a document that has no name
+   * (ProjectSession.storedName): before a sync that can write project.json (the document has
+   * content, or Save), so that what this browser writes into it keeps the name (`info` reads it
+   * through the session) instead of the document's 'Untitled'; and after a sync that leaves the
+   * document without a name, so that the editor shows it. Null until read, and when project.json has
+   * none.
+   */
+  readonly storedName = signal<string | null>(null);
+  /** Whether storage answered the read of {@link storedName} (a read that failed is sent again). */
+  private storedNameRead = false;
 
   constructor(
     readonly target: WebDAVTarget,
@@ -281,6 +292,8 @@ export class WebDAVSync {
         // project opened from elsewhere before it arrived, or a tab of this browser deleted it);
         // one it synced, whose document is gone, only with changes made since
         const changed = synced ? holdsMoreThan(ydoc, synced) : !deletedHere && ydoc.store.clients.size > 0;
+        // a document without a name keeps the stored one in the project.json this sync can write
+        if (ydoc.store.clients.size > 0 || opts.save) await this.readStoredName();
         // Every sync merges the stored content it reads (no `lastEtag`): the ETags of WebDAV
         // servers that make them from the modification time can repeat for another write (nginx:
         // one of the same size within the same second), and skipping a write with the ETag of the
@@ -297,6 +310,8 @@ export class WebDAVSync {
           .setAttribute('storage.missing', !!res.missing)
           .setOk();
         telemetry.histogram('editor.storage.save_ms', span.end());
+        // and shows it while no sync brings it a name (a project.json without a document)
+        await this.readStoredName();
         this.error.value = null;
         this.lastSyncAt.value = Date.now();
         // also when the document is gone: what this sync wrote or read right before another writer
@@ -371,6 +386,19 @@ export class WebDAVSync {
       }
     })();
     return this.running;
+  }
+
+  /** Reads {@link storedName} for a document without a name, unless storage answered that read. */
+  private async readStoredName(): Promise<void> {
+    if (this.storedNameRead || this.doc.map('meta').has('name')) return;
+    try {
+      const stored = await this.target.store.loadInfo(this.projectId);
+      this.storedNameRead = true;
+      if (stored?.name) this.storedName.value = stored.name;
+    } catch (err) {
+      // (an unreadable project.json has no name; a request that failed is sent again)
+      if (err instanceof SyntaxError) this.storedNameRead = true;
+    }
   }
 
   /**

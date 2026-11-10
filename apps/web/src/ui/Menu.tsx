@@ -52,7 +52,8 @@ export function MenuList(p: {
               ? canRun(it.op) || !!registry.get(it.op)?.uiOnly
               : true;
           const hasSub = !!it.submenu;
-          // greyed out like a disabled item, but a click still runs it (Blender's layout.active)
+          // greyed out like a disabled item, but a click still runs it (Blender's layout.active); its
+          // colours are in styles.css ([data-inactive]), readable under the pointer too
           const inactive = enabled && !hasSub ? (it.inactive?.() ?? null) : null;
           return (
             <div
@@ -61,7 +62,6 @@ export function MenuList(p: {
               title={
                 inactive ? `${it.label}: ${inactive}` : it.op ? registry.get(it.op)?.description : undefined
               }
-              style={inactive ? { color: 'var(--text-faint)' } : undefined}
               data-inactive={inactive ? 'true' : undefined}
               data-testid={`menu-${(it.label ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`}
               onPointerEnter={(e) => {

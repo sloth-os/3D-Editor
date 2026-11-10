@@ -1,12 +1,12 @@
 import { STATUS_CODES, type IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { isValidProjectId } from '@3d-editor/core';
+import { PROJECT_DELETED_CLOSE_CODE, isValidProjectId } from '@3d-editor/core';
 import type { ServerConfig } from '../config';
 import { isAuthorized, pathnameOf } from '../auth';
 import type { Log } from '../observability/log';
 import { errorMessage } from '../observability/tracing';
-import { PROJECT_DELETED_CLOSE_CODE, type RoomManager } from './room-manager';
+import type { RoomManager } from './room-manager';
 import type { SyncConnection } from './room';
 
 const SYNC_PATH_RE = /^\/sync\/([^/]+)\/?$/;

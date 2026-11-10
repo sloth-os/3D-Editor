@@ -4,6 +4,8 @@ import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { MAX_DOCUMENTS, RenderEngine } from './engine';
 import {
+  INTERRUPTED_PREFIX,
+  OUT_OF_MEMORY_PREFIX,
   RenderCancelledError,
   RenderOutOfMemoryError,
   type DocRef,
@@ -95,6 +97,12 @@ export interface RenderPoolOptions {
   startTimeoutMs?: number;
   /** Abandoned work (after a cancellation) may run this long before its process is stopped. */
   drainTimeoutMs?: number;
+  /**
+   * How long after a render process exited its calls wait for the end of its output (V8's
+   * out-of-memory report on stderr) before they fail anyway (default 1 s; normally the output ends
+   * with the process).
+   */
+  closeFallbackMs?: number;
   log?: RenderPoolLog;
 }
 
@@ -136,7 +144,7 @@ type Pending = {
   resent: boolean;
 };
 /** Threads of long renders, or the process kept for interactive renders. */
-type Role = 'bulk' | 'interactive';
+export type Role = 'bulk' | 'interactive';
 
 /** Bytes of a render process's stderr kept to tell how it ended. */
 const STDERR_TAIL_BYTES = 16 * 1024;
@@ -146,10 +154,10 @@ const HEAP_OOM = /heap out of memory|allocation failed|out of memory/i;
 /** How the errors of a render process that ran out of memory end (the pool replaces it). */
 const REPLACED = 'the server keeps running and starts a new render process for the next render';
 
-/** The message of a render process that ran out of JavaScript heap. */
+/** The message of a render process that ran out of JavaScript heap (its limit when known). */
 function outOfHeapMessage(heapLimitMb: number | undefined): string {
-  const limit = heapLimitMb ? ` (its JavaScript heap is limited to ${heapLimitMb} MB)` : '';
-  return `the render process ran out of memory${limit}; ${REPLACED}`;
+  const heap = heapLimitMb ? `its ${heapLimitMb} MB JavaScript heap` : 'its JavaScript heap';
+  return `${OUT_OF_MEMORY_PREFIX}the render process ran out of ${heap}; ${REPLACED}`;
 }
 
 /**
@@ -183,7 +191,8 @@ export function renderProcessExitError(
     return new RenderOutOfMemoryError(outOfHeapMessage(heapLimitMb), heapLimitMb, 'heap');
   if (signal === 'SIGKILL')
     return new RenderOutOfMemoryError(
-      `the render process was killed (SIGKILL), most likely by the system because the machine ran out of memory; ${REPLACED}`,
+      `${OUT_OF_MEMORY_PREFIX}the render process was killed (SIGKILL), most likely by the system because the ` +
+        `machine ran out of memory; ${REPLACED}`,
       heapLimitMb,
       'killed',
     );
@@ -205,19 +214,20 @@ export function sharedProcessError(cause: Error): Error {
         ? 'was killed (SIGKILL), most likely by the system because the machine ran out of memory,'
         : 'ran out of memory';
     return new RenderOutOfMemoryError(
-      `the render process ${what} while it worked on another render that shared it; this render was not ` +
-        'the cause: run it again (a new render process serves it)',
+      `${INTERRUPTED_PREFIX}the render process ${what} while it worked on another render that shared it; ` +
+        'this render was not the cause: run it again (a new render process serves it)',
       cause.heapLimitMb,
       'shared',
     );
   }
   return new Error(
-    `the render process stopped while it worked on another render that shared it (${cause.message}); ` +
+    `${INTERRUPTED_PREFIX}the render process stopped while it worked on another render that shared it (${cause.message}); ` +
       'run this render again (a new render process serves it)',
   );
 }
 
-class ProcessThread implements RenderThread {
+/** A render process (exported for tests; the pool creates them). */
+export class ProcessThread implements RenderThread {
   readonly kind = 'process' as const;
   lastUsed = Date.now();
   /** The document caches were dropped since the last call (see RenderPool.sweep). */
@@ -255,7 +265,7 @@ class ProcessThread implements RenderThread {
     readonly id: number,
     readonly role: Role,
     entry: URL,
-    opts: { heapLimitMb?: number; startTimeoutMs: number },
+    opts: { heapLimitMb?: number; startTimeoutMs: number; closeFallbackMs?: number },
     private readonly onExit: (t: ProcessThread, err: Error) => void,
   ) {
     let resolveExited!: () => void;
@@ -316,7 +326,7 @@ class ProcessThread implements RenderThread {
     // alone if the pipe stays open for some reason
     this.child.on('close', onEnded);
     this.child.on('exit', (code, signal) => {
-      setTimeout(() => onEnded(code, signal), 1000).unref?.();
+      setTimeout(() => onEnded(code, signal), opts.closeFallbackMs ?? 1000).unref?.();
     });
   }
 
@@ -486,7 +496,7 @@ class ProcessThread implements RenderThread {
       if (m.kind === 'out-of-memory') {
         // an allocation failed (a buffer, outside the JavaScript heap, or V8 reported it)
         const err = new RenderOutOfMemoryError(
-          `the render process ran out of memory (${m.message}); ${REPLACED}`,
+          `${OUT_OF_MEMORY_PREFIX}the render process could not allocate memory (${m.message}); ${REPLACED}`,
           this.heapLimitMb,
           'heap',
         );
@@ -632,6 +642,7 @@ export class RenderPool {
   private readonly cacheIdleMs: number;
   private readonly drainTimeoutMs: number;
   private readonly startTimeoutMs: number;
+  private readonly closeFallbackMs: number | undefined;
   private readonly heapLimitMb: number | undefined;
   private readonly workerUrl: URL | null;
   private readonly log: RenderPoolLog | undefined;
@@ -662,6 +673,7 @@ export class RenderPool {
     this.cacheIdleMs = Math.min(opts.cacheIdleMs ?? 120_000, this.idleTimeoutMs);
     this.drainTimeoutMs = opts.drainTimeoutMs ?? 10_000;
     this.startTimeoutMs = opts.startTimeoutMs ?? 120_000;
+    this.closeFallbackMs = opts.closeFallbackMs;
     this.heapLimitMb =
       opts.heapLimitMb !== undefined && Number.isFinite(opts.heapLimitMb) && opts.heapLimitMb > 0
         ? Math.round(opts.heapLimitMb)
@@ -843,7 +855,11 @@ export class RenderPool {
         this.nextThreadId++,
         role,
         this.workerUrl!,
-        { heapLimitMb: this.heapLimitMb, startTimeoutMs: this.startTimeoutMs },
+        {
+          heapLimitMb: this.heapLimitMb,
+          startTimeoutMs: this.startTimeoutMs,
+          closeFallbackMs: this.closeFallbackMs,
+        },
         (thread, err) => this.onWorkerExit(thread, err),
       );
     } catch (err) {

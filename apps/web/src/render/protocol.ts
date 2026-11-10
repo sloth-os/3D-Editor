@@ -1,14 +1,27 @@
-import { pathTileTransferables, type GIFDither, type PathTile, type ViewTransform } from '@3d-editor/core';
+import {
+  pathTileTransferables,
+  type CompiledScene,
+  type GIFDither,
+  type PathTile,
+  type PathTracerSettings,
+  type ViewTransform,
+} from '@3d-editor/core';
+import type { RenderEstimate, TabMemory } from './memory';
 
 /*
  * Messages between the browser render pool (main thread) and its Web Workers. Everything is plain,
  * structured-cloneable data; tile, film and pixel buffers are transferred.
  *
- * A path traced render: every worker gets the document (`prepare`: a Yjs state update, the whole
- * state the first time and only the difference afterwards), evaluates and compiles the scene itself
- * and then renders bands of rows for ranges of sample indices (`rows`). The main thread adds the
- * tiles to one film, shows it progressively, and has a worker denoise and tone map the mean film
- * (`finish`). Animations are encoded on a worker as well (`encode-*`).
+ * A path traced render: the first worker gets the document (`prepare`: a Yjs state update, the
+ * whole state the first time and only the difference afterwards) and evaluates and compiles the
+ * scene; the other workers get a copy of the compiled scene (`share` from the first, `adopt` on
+ * each of them), so only one worker holds the document and the evaluated scene (see memory.ts).
+ * With the tab's memory in the request, the first worker checks that one render thread fits it while
+ * it evaluates the scene (every modifier before it runs, guard.ts) and once it evaluated it, before
+ * it compiles it, and refuses the render otherwise (`RenderMemoryError`).
+ * Every worker then renders bands of rows for ranges of sample indices (`rows`). The main thread
+ * adds the tiles to one film, shows it progressively, and has a worker denoise and tone map the
+ * mean film (`finish`). Animations are encoded on a worker as well (`encode-*`).
  */
 
 export type Vec3T = [number, number, number];
@@ -81,6 +94,23 @@ export interface PreparedInfo {
   warnings: string[];
   /** Milliseconds spent decoding images, evaluating and compiling the scene. */
   prepareMs: number;
+  /** Triangles of the compiled scene (each geometry once, however many instances show it). */
+  triangles: number;
+  /**
+   * Triangles of every geometry the worker evaluated and keeps (each once): those of objects hidden in
+   * renders too, which core evaluates all the same (counted from their faces).
+   */
+  evaluatedTriangles: number;
+  /** Instances of the compiled scene (objects and particle or collection instances shown in renders). */
+  instances: number;
+  /** Bytes of the compiled scene's typed arrays (what a worker that adopts it holds). */
+  sceneBytes: number;
+}
+
+/** A compiled scene and its tracer settings: what a worker needs to render a prepared job. */
+export interface SharedTrace {
+  scene: CompiledScene;
+  settings: PathTracerSettings;
 }
 
 /** Mean values of a path traced film (`PathFilm.resolve()`), denoised and tone mapped by `finish`. */
@@ -132,7 +162,23 @@ export interface EncodedFile {
 }
 
 export type WorkerRequest =
-  | { type: 'prepare'; id: number; job: number; doc: DocPayload; options: PathTraceFrameOptions }
+  | {
+      type: 'prepare';
+      id: number;
+      job: number;
+      doc: DocPayload;
+      options: PathTraceFrameOptions;
+      /**
+       * The tab's memory, what other renders hold included: the worker refuses the render when one
+       * render thread does not fit it (checked while and after evaluating, before compiling the scene).
+       */
+      memory?: TabMemory;
+      /**
+       * The estimate of the document the render started from (`estimateRender`), for the check of
+       * the evaluation (default: the worker estimates its document itself).
+       */
+      estimate?: RenderEstimate;
+    }
   | {
       type: 'rows';
       id: number;
@@ -142,6 +188,10 @@ export type WorkerRequest =
       sampleStart: number;
       sampleCount: number;
     }
+  /** The compiled scene of a job this worker prepared (copied to the main thread), for `adopt`. */
+  | { type: 'share'; id: number; job: number }
+  /** Renders a job from a compiled scene another worker prepared (`share`). */
+  | { type: 'adopt'; id: number; job: number; trace: SharedTrace }
   /** Frees a prepared job (no response). */
   | { type: 'release'; job: number }
   | { type: 'finish'; id: number; film: FilmBuffers; options: FinishOptions }
@@ -152,10 +202,10 @@ export type WorkerRequest =
   | { type: 'encode-abort'; session: number }
   | { type: 'ping'; id: number };
 
-export type WorkerResult = PreparedInfo | PathTile | PixelImage | EncodedFile | { ok: true };
+export type WorkerResult = PreparedInfo | PathTile | PixelImage | EncodedFile | SharedTrace | { ok: true };
 
 /** Error codes the main thread acts on. */
-export type WorkerErrorCode = 'STALE_DOCUMENT';
+export type WorkerErrorCode = 'STALE_DOCUMENT' | 'RENDER_MEMORY';
 
 export type WorkerResponse =
   | { type: 'result'; id: number; result: WorkerResult }
@@ -166,6 +216,18 @@ export class RenderCancelledError extends Error {
   constructor(message = 'Render cancelled') {
     super(message);
     this.name = 'RenderCancelledError';
+  }
+}
+
+/**
+ * Raised when a path traced render does not fit the tab's memory (the message says why, for the
+ * user and for agents); nothing is wrong with the worker or its document.
+ */
+export class RenderMemoryError extends Error {
+  readonly code = 'RENDER_MEMORY' as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'RenderMemoryError';
   }
 }
 
@@ -183,6 +245,26 @@ export function resultTransferables(result: WorkerResult): ArrayBuffer[] {
   if ('lum2' in result) return pathTileTransferables(result);
   if ('data' in result) return [result.data.buffer as ArrayBuffer];
   return [];
+}
+
+/**
+ * The ArrayBuffers of a compiled scene (each once): moved to the last worker that adopts it, and
+ * counted as the bytes an adopting worker holds.
+ */
+export function sceneBuffers(scene: CompiledScene): ArrayBuffer[] {
+  const out = new Set<ArrayBuffer>();
+  const seen = new Set<object>();
+  const visit = (v: unknown): void => {
+    if (!v || typeof v !== 'object' || seen.has(v)) return;
+    seen.add(v);
+    if (ArrayBuffer.isView(v)) {
+      if (v.buffer instanceof ArrayBuffer) out.add(v.buffer);
+      return;
+    }
+    for (const x of Array.isArray(v) ? v : Object.values(v)) visit(x);
+  };
+  visit(scene);
+  return [...out];
 }
 
 /** The transferable buffers of a mean film (moved to the worker that finishes it). */

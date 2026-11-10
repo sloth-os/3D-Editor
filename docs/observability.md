@@ -39,7 +39,7 @@ _Bottom area → Diagnostics_ shows the live numbers and recent spans in the app
   - undo/redo counters per operator (`editor.undo` / `editor.redo` with `undo.operator`) and other
     client counters are forwarded to the OTLP collector for product analysis
 - **Health**: `/healthz` (liveness) and `/readyz` (persistence reachable). On Linux the render
-  threads run at a lower CPU priority (`RENDER_WORKER_NICE`, default 10), so health checks and
+  processes run at a lower CPU priority (`RENDER_WORKER_NICE`, default 10), so health checks and
   other requests are answered promptly while renders keep every core busy.
 
 ## Running the stack

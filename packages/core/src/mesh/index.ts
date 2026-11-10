@@ -1,5 +1,6 @@
 export * from './types';
 export * from './codec';
+export * from './memory';
 export * from './topology';
 export * from './selection';
 export * from './normals';

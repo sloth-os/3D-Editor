@@ -848,7 +848,9 @@ export class ViewportEngine {
 
   private setMultisampling(on: boolean): void {
     this.multisampling = on;
-    // final renders of what it draws now use SMAA: its lookup textures load meanwhile
+    // final renders of a shading it draws now go without samples too: supersampled when their first
+    // picture fits FINAL_SUPERSAMPLE_MS, else smoothed with SMAA, whose pass is made now so that its
+    // lookup textures load before a render needs them (finalSampling, drawFinalScene)
     if (!on) this.smaaPass();
     // the next frame builds every pipeline again, for the new sample count
     this.unsettled = true;
@@ -1765,7 +1767,8 @@ export class ViewportEngine {
   /**
    * The SMAA pass, made when first asked for: when the viewport first draws without samples
    * ({@link setMultisampling}), so the lookup textures it decodes from data URLs are loaded before a
-   * final render uses it. Kept with its shader programs; its targets shrink after each render.
+   * final render that is not supersampled uses it. Kept with its shader programs; its targets
+   * shrink after each render.
    */
   private smaaPass(): SMAAPass {
     return (this.smaa ??= new SMAAPass());

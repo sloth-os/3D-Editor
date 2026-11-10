@@ -1,12 +1,13 @@
 import * as THREE from 'three';
 import {
-  FrameState,
   ObjectTransform,
   axisAngle4,
   evaluatedWorld,
+  normalize3,
   scaling4,
   selectedVertexSet,
   selectionPivot,
+  transformFrameState,
   transformVertices,
   translation4,
   type Mat4,
@@ -44,8 +45,10 @@ const MODES: Record<ModalKind, TransformMode> = {
  * undo step that syncs to every device. The preview shows what confirming stores: every object the
  * transform can move is drawn with the world matrix the scene evaluates once the operator stored
  * (and keyed, where they are animated) the channels it computes (Blender's Move, Rotate and Scale,
- * from where the scene shows the objects at the current frame): the objects it transforms, their
- * children, and the objects whose constraints or drivers read them (see ObjectTransform.worlds).
+ * from where the scene shows the objects at the current frame, rigid bodies where the simulation
+ * has them): the objects it transforms, their children, and every object that reads them through
+ * constraints, drivers or other datablocks (see ObjectTransform.worlds). Cancelling draws every
+ * object as before and changes nothing.
  */
 export class ModalTransform {
   readonly pivot: THREE.Vector3;
@@ -76,8 +79,9 @@ export class ModalTransform {
     mouse: { x: number; y: number },
   ) {
     const { doc, state } = session;
-    // what the operator reads when the transform is confirmed: the scene at the current frame
-    const fs = new FrameState(doc, state.frame);
+    // what the operator reads when the transform is confirmed: the scene at the current frame, as
+    // the viewport shows it (rigid bodies where the simulation has them)
+    const fs = transformFrameState(doc, state.frame);
     const mode = MODES[kind];
     if (state.mode === 'EDIT') {
       this.pivot = new THREE.Vector3(...selectionPivot(doc, state, state.pivotPoint, { mode, fs }));
@@ -217,7 +221,9 @@ export class ModalTransform {
     this.rotAxis = [axis.x, axis.y, axis.z];
     this.rotAngle = angle;
     this.summary = `Rot: ${THREE.MathUtils.radToDeg(angle).toFixed(2)}°${this.axis ? ` along ${this.axis}` : ''}`;
-    return axisAngle4([axis.x, axis.y, axis.z], angle);
+    // the matrix transform.rotate builds from the parameters confirming passes (it normalizes the
+    // axis again, which can change its last bits), so the preview shows exactly what it stores
+    return axisAngle4(normalize3(this.rotAxis), angle);
   }
   rotAxis: Vec3 = [0, 0, 1];
   rotAngle = 0;
@@ -267,13 +273,16 @@ export class ModalTransform {
 
   /**
    * The world matrices the preview draws (Object Mode): those the scene evaluates after the
-   * operator stores the channels of the transform shown (see ObjectTransform.worlds), for every
-   * object the transform can move.
+   * operator stores the channels of the transform shown and keys them as confirming keys them,
+   * with the editor's auto keying (see ObjectTransform.worlds), for every object the transform can
+   * move.
    */
   previewMatrices(): Map<string, Mat4> {
     if (!this.objects) return new Map();
     const pivot: Vec3 = [this.pivot.x, this.pivot.y, this.pivot.z];
-    return this.objects.worlds(this.objects.channels(this.current, pivot));
+    return this.objects.worlds(this.objects.channels(this.current, pivot), {
+      autoKeying: this.session.state.autoKeying,
+    });
   }
 
   /** Ends the modal; returns the operator call that reproduces the transform (or null if cancelled). */

@@ -14,6 +14,7 @@ import {
   Renderer,
   estimateRenderMemory,
   estimateRenderTriangles,
+  renderMemoryFromEnv,
 } from '../../src/render';
 import {
   RENDER_HEAP_BYTES_PER_TRIANGLE,
@@ -59,6 +60,19 @@ function addGrid(doc: SceneDoc, n: number, name = 'Grid'): string {
     data: doc.addMesh(name, createGrid({ x_subdivisions: n, y_subdivisions: n })),
   });
 }
+
+describe('RENDER_WORKER_MEMORY_MB', () => {
+  it('takes whole numbers of megabytes from 64 up (a smaller heap does not hold a warmed-up render process)', () => {
+    expect(renderMemoryFromEnv({})).toBeUndefined();
+    expect(renderMemoryFromEnv({ RENDER_WORKER_MEMORY_MB: ' ' })).toBeUndefined();
+    expect(renderMemoryFromEnv({ RENDER_WORKER_MEMORY_MB: '64' })).toBe(64);
+    expect(renderMemoryFromEnv({ RENDER_WORKER_MEMORY_MB: ' 3072 ' })).toBe(3072);
+    for (const raw of ['63', '0', '-128', '1.5', '2GB'])
+      expect(() => renderMemoryFromEnv({ RENDER_WORKER_MEMORY_MB: raw })).toThrow(
+        `RENDER_WORKER_MEMORY_MB must be a whole number of megabytes >= 64 (got '${raw}')`,
+      );
+  });
+});
 
 describe('renders in the server process', () => {
   it('estimate the triangles of a render from the stored meshes and their generating modifiers', () => {
@@ -178,13 +192,13 @@ describe('renders in the server process', () => {
       const what = call === exportCall ? 'export' : 'render';
       expect((err as Error).message).toMatch(
         new RegExp(
-          `^this ${what} was not started: it needs about 98 MB of JavaScript heap \\(about 320,000 triangles\\), and ${what}s run in the server's own process \\(its render processes are off: RENDER_WORKERS=0, or they could not start\\), which has 300 MB of its \\d+ MB heap free; running out of it would stop the server$`,
+          `^out of memory: this ${what} was not started: it needs about 98 MB of JavaScript heap \\(about 320,000 triangles\\), and ${what}s run in the server's own process \\(its render processes are off: RENDER_WORKERS=0, or they could not start\\), which has 300 MB of its \\d+ MB heap free; running out of it would stop the server$`,
         ),
       );
       expect(renderToolError(err).message).toBe(
         `Rendering failed: ${(err as Error).message}. ${OUT_OF_MEMORY_ADVICE}`,
       );
-      expect(renderToolError(err).code).toBe('FAILED');
+      expect(renderToolError(err).code).toBe('OUT_OF_MEMORY');
     }
     const small = scene();
     addGrid(small, 100); // 20,000 triangles: about 6 MB
@@ -212,7 +226,7 @@ describe('renders in the server process', () => {
       (e: unknown) => e,
     );
     expect((err as Error).message).toMatch(
-      /^this render was not started: it needs about 33 MB of JavaScript heap \(about 80,000 triangles\)/,
+      /^out of memory: this render was not started: it needs about 33 MB of JavaScript heap \(about 80,000 triangles\)/,
     );
     // a full garbage collection ran before the render was refused
     expect(collected).toBe(1);

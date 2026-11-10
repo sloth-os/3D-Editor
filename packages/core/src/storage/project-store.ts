@@ -82,6 +82,21 @@ export function updateAddsToState(base: Uint8Array | null, update: Uint8Array): 
   }
 }
 
+/**
+ * A listing of the stored projects in which reading some `project.json` files failed (storage did
+ * not answer, or answered with an error): those projects are missing from `listed`, which holds the
+ * ones that were read.
+ */
+export class IncompleteListingError extends Error {
+  constructor(
+    message: string,
+    readonly listed: ProjectInfo[],
+  ) {
+    super(message);
+    this.name = 'IncompleteListingError';
+  }
+}
+
 export class ProjectFileStore {
   constructor(
     readonly fs: FileStore,
@@ -103,17 +118,33 @@ export class ProjectFileStore {
   }
 
   /**
-   * The stored projects whose project.json can be read, most recently updated first. Throws when
-   * storage cannot list the projects folder (a folder that does not exist lists no projects): an
-   * empty list would tell callers that every project is gone.
+   * The stored projects that have a project.json, most recently updated first (a project.json that
+   * is not valid JSON lists no project, as a missing one). Throws when storage cannot list the
+   * projects folder (a folder that does not exist lists no projects): an empty list would tell
+   * callers that every project is gone; and {@link IncompleteListingError}, with the projects that
+   * were read, when reading a project.json fails: a list without those projects would tell callers
+   * that they do not exist (it used to).
    */
   async listProjects(): Promise<ProjectInfo[]> {
     const entries = await this.fs.list(this.projectsDir());
     const ids = entries.filter((e) => e.isDir && isValidProjectId(e.name)).map((e) => e.name);
-    const infos = await Promise.all(ids.map((id) => this.loadInfo(id).catch(() => null)));
-    return infos
-      .filter((x): x is ProjectInfo => !!x)
-      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    const reads = await Promise.allSettled(ids.map((id) => this.loadInfo(id)));
+    const infos: ProjectInfo[] = [];
+    const failures: unknown[] = [];
+    for (const read of reads) {
+      if (read.status === 'fulfilled') {
+        if (read.value) infos.push(read.value);
+      } else if (!(read.reason instanceof SyntaxError)) failures.push(read.reason);
+    }
+    infos.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    if (failures.length > 0) {
+      const reason = failures[0] instanceof Error ? failures[0].message : String(failures[0]);
+      throw new IncompleteListingError(
+        `could not read the project.json of ${failures.length} of ${ids.length} stored projects (${reason})`,
+        infos,
+      );
+    }
+    return infos;
   }
 
   async loadInfo(id: string): Promise<ProjectInfo | null> {

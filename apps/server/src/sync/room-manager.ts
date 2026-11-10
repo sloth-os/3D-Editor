@@ -1,10 +1,17 @@
 import * as Y from 'yjs';
-import { SceneDoc, isValidProjectId, newUuid, type ProjectInfo } from '@3d-editor/core';
+import {
+  PROJECT_DELETED_CLOSE_CODE,
+  SceneDoc,
+  isValidProjectId,
+  newUuid,
+  type ProjectFileStore,
+  type ProjectInfo,
+} from '@3d-editor/core';
 import type { Persistence } from '../persistence';
 import type { ServerMetrics } from '../observability/metrics';
 import type { Log } from '../observability/log';
 import { errorMessage, withSpan } from '../observability/tracing';
-import { Room, STORAGE_ORIGIN, type ProjectListing } from './room';
+import { Room, STORAGE_ORIGIN, type DeletionOutcome, type ProjectListing } from './room';
 
 export class StorageUnavailableError extends Error {
   constructor(message: string) {
@@ -39,13 +46,6 @@ export interface RoomManagerOptions {
   openReadWaitMs?: number;
 }
 
-/**
- * The close code of the sync connections of a project deleted on this server (deleted here, or
- * found deleted from storage), also of a new connection to it (see SyncServer): browsers stop
- * connecting to it (apps/web/src/sync/provider.ts).
- */
-export const PROJECT_DELETED_CLOSE_CODE = 4404;
-
 const TOMBSTONE_TTL_MS = 60 * 60 * 1000;
 
 /**
@@ -63,6 +63,24 @@ interface StorageRead {
  */
 const UNUSED_ROOM_READ_MS = 2000;
 
+/** Whether `p` settles before `deadline` (a time in ms since the epoch), which it waits for at most. */
+async function settlesBefore(p: Promise<unknown>, deadline: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
+    timer.unref?.();
+  });
+  const settled = p.then(
+    () => true,
+    () => true,
+  );
+  try {
+    return await Promise.race([settled, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Loads projects into memory on demand (from the persistence backend), keeps them while they
  * are in use and evicts idle ones after persisting them.
@@ -76,6 +94,13 @@ export class RoomManager {
   private readonly reading = new WeakMap<Room, StorageRead>();
   /** The checks whether storage holds a deleted project again, by id (see stillDeleted). */
   private readonly checking = new Map<string, StorageRead>();
+  /**
+   * The checks whether storage holds a project whose id is also the name of a loaded project, by
+   * that id, with storage's answer once it gave one (see exists).
+   */
+  private readonly asking = new Map<string, StorageRead & { found: boolean }>();
+  /** The deletions of projects from storage that are in progress, by id (see deleteProject). */
+  private readonly deleting = new Map<string, Promise<void>>();
   private readonly sweepTimer: ReturnType<typeof setInterval>;
   private readonly refreshTimer: ReturnType<typeof setInterval> | null = null;
   private sweeping = false;
@@ -207,10 +232,13 @@ export class RoomManager {
   /**
    * Waits for a read of storage for {@link RoomManagerOptions.openReadWaitMs} at most, and not at all
    * once a request stopped waiting for it: a request that asks several times (an MCP tool asks
-   * whether a project exists, then opens it or lists the projects) waits once.
+   * whether a project exists, then opens it or lists the projects) waits once. A read for a loaded
+   * `room` is not waited for either while another read for it that a request stopped waiting for
+   * goes on (Room.storageLate: get_project's check, readBeforeAnswer, waits for none after
+   * readUnused, and the other way round).
    */
-  private async waitFor(read: StorageRead): Promise<void> {
-    if (read.late) return;
+  private async waitFor(read: StorageRead, room?: Room): Promise<void> {
+    if (read.late || room?.storageLate) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<boolean>((resolve) => {
       timer = setTimeout(() => resolve(true), this.opts.openReadWaitMs ?? 5000);
@@ -220,7 +248,10 @@ export class RoomManager {
       () => false,
       () => false,
     );
-    if (await Promise.race([finished, late])) read.late = true;
+    if (await Promise.race([finished, late])) {
+      read.late = true;
+      room?.readIsLate(read.done);
+    }
     clearTimeout(timer);
   }
 
@@ -257,7 +288,7 @@ export class RoomManager {
         read = started;
         this.reading.set(room, read);
       }
-      await this.waitFor(read);
+      await this.waitFor(read, room);
     }
     if (this.abandoned(room)) await this.closeDeleted(room);
   }
@@ -279,8 +310,9 @@ export class RoomManager {
    * projects get a new empty room (used by sync connections: browsers may create projects
    * offline and upload them on connect). Returns null for unknown projects and for deleted ones
    * (see {@link stillDeleted}; a loaded room nobody uses reads storage first, see
-   * {@link readUnused}). Throws {@link StorageUnavailableError} when storage fails and `create` is
-   * false.
+   * {@link readUnused}). A project that is not loaded is loaded once a deletion of it in progress
+   * has finished (see deleteProject). Throws {@link StorageUnavailableError} when storage fails and
+   * `create` is false.
    */
   async open(id: string, opts: { create?: boolean } = {}): Promise<Room | null> {
     if (this.closed) throw new Error('server is shutting down');
@@ -296,6 +328,12 @@ export class RoomManager {
     if (pending) {
       const r = await pending;
       if (r || !opts.create) return r && !r.destroyed ? r : null;
+      return this.open(id, opts);
+    }
+    // no load while a deletion of the project runs (see deleteProject): after it, the project is
+    // deleted, or still stored when storage could not delete it
+    if (this.deleting.has(id)) {
+      await this.afterDeletion(id);
       return this.open(id, opts);
     }
     const p = this.load(id, !!opts.create).finally(() => this.loading.delete(id));
@@ -334,12 +372,9 @@ export class RoomManager {
     if (this.closed) return null;
     if (!persisted && !create) return null;
     const ydoc = new Y.Doc();
-    const storedInfo = info as ProjectInfo | null;
+    // (a project.json without a document: the empty document has no name, and the room's scene has
+    // the stored one, see Room.scene)
     if (update) Y.applyUpdate(ydoc, update, STORAGE_ORIGIN);
-    // a project.json without a document: the room's document takes the stored name, as content read
-    // from storage (editors and agents see it; the first change saves it with the document)
-    else if (storedInfo?.name)
-      ydoc.transact(() => ydoc.getMap('meta').set('name', storedInfo.name), STORAGE_ORIGIN);
     const room = new Room(id, ydoc, this.roomDeps(), {
       info,
       persisted,
@@ -354,19 +389,83 @@ export class RoomManager {
     return room;
   }
 
-  /** Whether a project exists (loaded, or persisted; a loaded room nobody uses reads storage first). */
+  /**
+   * Whether a project exists (loaded, or persisted; a loaded room nobody uses reads storage first).
+   * A project that is not loaded is asked about once a deletion of it in progress has finished (see
+   * deleteProject). Throws {@link StorageUnavailableError} when storage cannot tell whether a project
+   * that is not loaded exists, unless `id` is also the name of a loaded project (see
+   * {@link loadedNamed}): MCP tools take a project's id or name and ask about the id first
+   * (AgentSession.resolveProjectId), and a name such as 'Lighthouse' is a valid id too. Then storage
+   * is awaited as {@link waitFor} says, and when it fails or does not answer in time the answer is
+   * false, so that the name finds the loaded project (an error used to fail every call that named a
+   * loaded project so while storage failed); it is false at once, without asking storage, while a
+   * read for a project of that name that a request stopped waiting for goes on (Room.storageLate).
+   * A check that a request stopped waiting for counts as such a read for those projects while it
+   * goes on (so that get_project, which reads storage too, waits once). One such check per id at a
+   * time.
+   */
   async exists(id: string): Promise<boolean> {
     if (!isValidProjectId(id)) return false;
+    if (!this.get(id)) await this.afterDeletion(id);
+    const named = this.get(id) ? [] : this.loadedNamed(id);
+    if (named.length === 0) return this.found(id);
+    if (named.some((room) => room.storageLate)) return false;
+    let check = this.asking.get(id);
+    if (!check) {
+      const started: StorageRead & { found: boolean } = {
+        late: false,
+        found: false,
+        done: this.found(id)
+          .then(
+            (found) => {
+              started.found = found;
+            },
+            () => undefined,
+          )
+          .finally(() => {
+            if (this.asking.get(id) === started) this.asking.delete(id);
+          }),
+      };
+      check = started;
+      this.asking.set(id, check);
+    }
+    await this.waitFor(check);
+    if (check.late) for (const room of named) room.readIsLate(check.done);
+    return check.found;
+  }
+
+  /**
+   * The projects this server has loaded and lists (see {@link listProjects}) that are named `name`,
+   * ignoring letter case, as MCP tools match names.
+   */
+  private loadedNamed(name: string): Room[] {
+    const key = name.toLowerCase();
+    return this.all().filter(
+      (room) =>
+        !this.abandoned(room) && (room.persisted || !room.isEmpty()) && room.scene.name.toLowerCase() === key,
+    );
+  }
+
+  /** {@link exists}, without waiting for a deletion of the project in progress (deleteProject's). */
+  private async found(id: string): Promise<boolean> {
     const live = this.get(id);
     if (live) await this.readUnused(live);
     if (await this.stillDeleted(id)) return false;
     if (live && !live.destroyed) return true;
     const store = this.store;
     if (!store) return false;
-    return (
-      !!(await store.loadInfo(id).catch(() => null)) ||
-      !!(await store.loadDocument(id, { etag: false }).catch(() => null))
-    );
+    // storage that fails (or gets no answer within its timeout) cannot tell: an error says so (it
+    // used to read as 'no such project', after up to two timeouts); an unreadable project.json
+    // reads as none
+    const read = async <T>(stored: Promise<T>): Promise<T | null> => {
+      try {
+        return await stored;
+      } catch (err) {
+        if (err instanceof SyntaxError) return null;
+        throw new StorageUnavailableError(`could not read project ${id} from storage (${errorMessage(err)})`);
+      }
+    };
+    return !!(await read(store.loadInfo(id))) || !!(await read(store.loadDocument(id, { etag: false })));
   }
 
   /** Creates a new project with Blender's default scene (or an empty one) and persists it. */
@@ -415,12 +514,24 @@ export class RoomManager {
     if (store && stored) {
       // a loaded room nobody uses whose project storage does not list, though the room found its
       // document stored: deleted elsewhere since the room last read it (then the room reads it
-      // again, and is closed), unless storage still has the document (an unreadable project.json)
+      // again, and is closed), unless storage still has the document (an unreadable project.json);
+      // the check is awaited as waitFor says (no answer in time: still stored)
       const listed = stored;
       const unlisted = this.all().filter((r) => this.unused(r) && r.documentStored && !listed.has(r.id));
       await Promise.all(
         unlisted.map(async (room) => {
-          if (!(await store.hasDocument(room.id).catch(() => true))) await this.readUnused(room, true);
+          let gone = false;
+          const check: StorageRead = {
+            late: false,
+            done: store.hasDocument(room.id).then(
+              (has) => {
+                gone = !has;
+              },
+              () => undefined,
+            ),
+          };
+          await this.waitFor(check, room);
+          if (gone) await this.readUnused(room, true);
         }),
       );
     }
@@ -438,11 +549,47 @@ export class RoomManager {
     return room ? room.listing() : null;
   }
 
-  /** Deletes a project: disconnects its clients and removes the stored files. */
-  async deleteProject(id: string): Promise<boolean> {
-    if (!isValidProjectId(id)) return false;
-    await this.loading.get(id)?.catch(() => null);
-    const existed = await this.exists(id);
+  /**
+   * Deletes a project: removes its stored files, then closes its room with
+   * {@link PROJECT_DELETED_CLOSE_CODE} (browsers stop connecting to it) and remembers the deletion
+   * for an hour. Until storage deleted the project, the room serves its editors and agents, and
+   * from then on it writes nothing (Room.deleteFromStorage). Before it asks storage, it waits for
+   * the project's earlier reads and writes of storage (a load of it, a read of storage, saves)
+   * {@link RoomManagerOptions.openReadWaitMs} at most in all, and for none while one that a request
+   * stopped waiting for goes on (Room.storageLate): when they have not finished, nothing is deleted
+   * (then or later). One deletion of a project runs at a time (another one asked for meanwhile
+   * waits for it, and after one that deleted the project finds it deleted), and requests that would
+   * load the project from storage wait for it. When storage fails to delete the project, or nothing
+   * was deleted, the room goes on serving, nothing is remembered, and a
+   * {@link StorageUnavailableError} is thrown.
+   */
+  deleteProject(id: string): Promise<boolean> {
+    if (!isValidProjectId(id)) return Promise.resolve(false);
+    const earlier = this.deleting.get(id) ?? Promise.resolve();
+    const deletion = earlier
+      .then(() => this.deleteNow(id))
+      .finally(() => {
+        if (this.deleting.get(id) === settled) this.deleting.delete(id);
+      });
+    const settled = deletion.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.deleting.set(id, settled);
+    return deletion;
+  }
+
+  /** {@link deleteProject}, once the deletions of the project asked for before have finished. */
+  private async deleteNow(id: string): Promise<boolean> {
+    const waitMs = this.opts.openReadWaitMs ?? 5000;
+    const deadline = Date.now() + waitMs;
+    // (a load that started before the deletion: the ones asked for later wait for it, see open)
+    const loading = this.loading.get(id);
+    if (loading && !(await settlesBefore(loading, deadline))) throw this.notDeleted(id, null, 'timed out');
+    const existed = await this.found(id);
+    const store = this.store;
+    if (store && existed) await this.deleteStored(store, id, this.get(id), deadline);
+    if (existed) this.tombstones.set(id, Date.now());
     const room = this.rooms.get(id);
     if (room) {
       this.rooms.delete(id);
@@ -450,22 +597,72 @@ export class RoomManager {
       await room.close({ flush: false, code: PROJECT_DELETED_CLOSE_CODE, reason: 'project deleted' });
       this.emitClosed(room);
     }
-    const store = this.store;
-    if (store && existed) {
-      const { metrics } = this.opts;
-      const end = metrics.persistenceDuration.startTimer({ op: 'delete' });
-      try {
-        await withSpan('persistence.delete', { 'project.id': id }, () => store.deleteProject(id));
-        metrics.persistenceOps.inc({ op: 'delete', status: 'ok' });
-      } catch (err) {
-        metrics.persistenceOps.inc({ op: 'delete', status: 'error' });
-        throw err;
-      } finally {
-        end();
-      }
-    }
-    if (existed) this.tombstones.set(id, Date.now());
     return existed;
+  }
+
+  /**
+   * Deletes a project's stored files, between the reads and writes of storage of its room when it
+   * is loaded (which it waits for until `deadline` at most).
+   */
+  private async deleteStored(
+    store: ProjectFileStore,
+    id: string,
+    room: Room | undefined,
+    deadline: number,
+  ): Promise<void> {
+    const { metrics, log } = this.opts;
+    const end = metrics.persistenceDuration.startTimer({ op: 'delete' });
+    const remove = () => withSpan('persistence.delete', { 'project.id': id }, () => store.deleteProject(id));
+    let outcome: DeletionOutcome = 'deleted';
+    try {
+      if (room) outcome = await room.deleteFromStorage(remove, deadline - Date.now());
+      else await remove();
+    } catch (err) {
+      metrics.persistenceOps.inc({ op: 'delete', status: 'error' });
+      log.warn({ err: errorMessage(err), project: id }, 'deleting project failed');
+      const kept = room
+        ? 'the project stays open on this server for its editors and agents, and storage may still hold all or part of it'
+        : 'storage may still hold all or part of it';
+      throw new StorageUnavailableError(
+        `could not delete project ${id} from storage (${errorMessage(err)}); ${kept}: delete it again`,
+      );
+    } finally {
+      end();
+    }
+    if (outcome !== 'deleted') throw this.notDeleted(id, room, outcome);
+    metrics.persistenceOps.inc({ op: 'delete', status: 'ok' });
+  }
+
+  /**
+   * The error of a deletion that did not start: the project's earlier reads and writes of storage
+   * (`room`'s, or a load of the project) had not finished (see deleteProject), when the deletion's
+   * wait ended ('timed out'), or when it asked, while a read of the project that a request stopped
+   * waiting for went on ('storage late': the deletion did not wait).
+   */
+  private notDeleted(
+    id: string,
+    room: Room | null | undefined,
+    why: Exclude<DeletionOutcome, 'deleted'>,
+  ): StorageUnavailableError {
+    const waitMs = this.opts.openReadWaitMs ?? 5000;
+    const reason =
+      why === 'timed out'
+        ? `storage did not finish this project's earlier reads and writes within ${waitMs / 1000} s`
+        : `storage has not finished a read of this project that a request stopped waiting for after ${waitMs / 1000} s`;
+    this.opts.metrics.persistenceOps.inc({ op: 'delete', status: 'error' });
+    this.opts.log.warn({ err: reason, project: id }, 'deleting project failed');
+    const kept = room ? ', and the project stays open on this server for its editors and agents' : '';
+    return new StorageUnavailableError(
+      `could not delete project ${id} from storage (${reason}); nothing was deleted${kept}: delete it again`,
+    );
+  }
+
+  /**
+   * Waits for a deletion of the project that is in progress (see deleteProject), so that a request
+   * does not load the project while storage deletes it.
+   */
+  private async afterDeletion(id: string): Promise<void> {
+    await this.deleting.get(id);
   }
 
   /**

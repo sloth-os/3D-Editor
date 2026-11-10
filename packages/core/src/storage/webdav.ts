@@ -128,35 +128,65 @@ export class WebDAVClient implements FileStore {
     return h;
   }
 
-  private async request(
+  /** Sends a request; it fails when no answer comes within the timeout (`timeoutMs`, 30 s by default). */
+  private request(
     method: string,
     path: string,
     init: { headers?: Record<string, string>; body?: BodyInit } = {},
   ): Promise<Response> {
+    return this.exchange(method, path, init, async (res) => res);
+  }
+
+  /**
+   * Sends a request and reads the body of its answer within the same timeout: a server that sends
+   * the headers and then stops sending fails the request too, instead of holding the caller (a
+   * room's saves, a listing of the projects, a browser's sync) for ever.
+   */
+  private requestBody(
+    method: string,
+    path: string,
+    init: { headers?: Record<string, string>; body?: BodyInit } = {},
+  ): Promise<{ res: Response; body: ArrayBuffer }> {
+    return this.exchange(method, path, init, async (res) => ({ res, body: await res.arrayBuffer() }));
+  }
+
+  private async exchange<T>(
+    method: string,
+    path: string,
+    init: { headers?: Record<string, string>; body?: BodyInit },
+    answer: (res: Response) => Promise<T>,
+  ): Promise<T> {
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
-    const timer = ctrl ? setTimeout(() => ctrl.abort(), this.config.timeoutMs ?? 30000) : undefined;
+    const timeoutMs = this.config.timeoutMs ?? 30000;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : undefined;
     try {
-      return await this.fetchImpl(this.urlFor(path), {
+      const res = await this.fetchImpl(this.urlFor(path), {
         method,
         headers: this.headers(init.headers),
         body: init.body,
         signal: ctrl?.signal,
         cache: 'no-store',
       } as RequestInit);
+      return await answer(res);
+    } catch (err) {
+      // (the only abort is the timeout's: say so, rather than 'This operation was aborted')
+      if (ctrl?.signal.aborted)
+        throw new WebDAVError(`${method} ${path} got no complete answer within ${timeoutMs / 1000} s`, 0);
+      throw err;
     } finally {
       if (timer) clearTimeout(timer);
     }
   }
 
   async propfind(path: string, depth: 0 | 1 = 1): Promise<DavResponse[]> {
-    const res = await this.request('PROPFIND', path, {
+    const { res, body } = await this.requestBody('PROPFIND', path, {
       headers: { Depth: String(depth), 'Content-Type': 'application/xml; charset=utf-8' },
       body: PROPFIND_BODY,
     });
     if (res.status === 404) return [];
     if (res.status !== 207 && !res.ok)
       throw new WebDAVError(`PROPFIND ${path} failed: ${res.status}`, res.status);
-    return parseMultistatus(await res.text());
+    return parseMultistatus(new TextDecoder().decode(body));
   }
 
   async list(dir: string): Promise<FileEntry[]> {
@@ -186,10 +216,10 @@ export class WebDAVClient implements FileStore {
     for (let attempt = 1; ; attempt++) {
       const bracketed = opts.etag !== false && this.getSendsEtag !== true;
       const before = bracketed ? await this.propfindEtag(path) : undefined;
-      const res = await this.request('GET', path);
+      const { res, body } = await this.requestBody('GET', path);
       if (res.status === 404) return null;
       if (!res.ok) throw new WebDAVError(`GET ${path} failed: ${res.status}`, res.status);
-      const data = new Uint8Array(await res.arrayBuffer());
+      const data = new Uint8Array(body);
       const etag = res.headers.get('ETag');
       if (etag) {
         this.getSendsEtag = true;
@@ -259,6 +289,9 @@ export class WebDAVClient implements FileStore {
 
   async remove(path: string): Promise<void> {
     const res = await this.request('DELETE', path);
+    // 207 (Multi-Status): some of a folder's files could not be deleted (RFC 4918, 9.6.1)
+    if (res.status === 207)
+      throw new WebDAVError(`DELETE ${path} failed: 207 (some files were not deleted)`, res.status);
     if (!res.ok && res.status !== 404)
       throw new WebDAVError(`DELETE ${path} failed: ${res.status}`, res.status);
   }

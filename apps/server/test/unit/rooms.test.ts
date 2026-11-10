@@ -10,6 +10,7 @@ import {
   type WriteOptions,
 } from '@3d-editor/core';
 import { RoomManager } from '../../src/sync/room-manager';
+import { readBeforeAnswer } from '../../src/mcp/project-storage';
 import { ServerMetrics } from '../../src/observability/metrics';
 import { silentLog, type Log } from '../../src/observability/log';
 import { decodeAwarenessEntries, encodeAwarenessEntries } from '../../src/sync/awareness';
@@ -77,12 +78,61 @@ class HeldStore extends MemoryFileStore {
   }
 }
 
+/**
+ * MemoryFileStore whose removals (a project's deletion) and writes of documents can be held, and
+ * whose removals can be made to fail (storage that refuses a deletion).
+ */
+class DeletionStore extends MemoryFileStore {
+  holdRemove: Promise<void> | null = null;
+  failRemove = false;
+  removals = 0;
+  holdWrite: Promise<void> | null = null;
+  heldWrites = 0;
+  override async remove(path: string) {
+    this.removals++;
+    if (this.holdRemove) await this.holdRemove;
+    if (this.failRemove) throw new Error('storage refuses the deletion');
+    return super.remove(path);
+  }
+  override async write(path: string, data: Uint8Array, opts?: WriteOptions) {
+    if (this.holdWrite && path.endsWith('/document.ybin')) {
+      this.heldWrites++;
+      await this.holdWrite;
+    }
+    return super.write(path, data, opts);
+  }
+}
+
+/** MemoryFileStore whose reads of project.json files can be held. */
+class InfoHeldStore extends MemoryFileStore {
+  holdInfo: Promise<void> | null = null;
+  infoReads = 0;
+  override async read(path: string) {
+    if (path.endsWith('/project.json')) {
+      this.infoReads++;
+      if (this.holdInfo) await this.holdInfo;
+    }
+    return super.read(path);
+  }
+}
+
 /** MemoryFileStore whose folder listings can be made to fail (storage outage for PROPFIND). */
 class ListFailStore extends MemoryFileStore {
   failList = false;
   override async list(dir: string) {
     if (this.failList) throw new Error('storage offline');
     return super.list(dir);
+  }
+}
+
+/** MemoryFileStore whose reads can be made to fail (storage outage for GET). */
+class ReadFailStore extends MemoryFileStore {
+  failReads = false;
+  reads = 0;
+  override async read(path: string) {
+    this.reads++;
+    if (this.failReads) throw new Error('storage offline');
+    return super.read(path);
   }
 }
 
@@ -450,6 +500,28 @@ describe('RoomManager', () => {
   });
 
   /*
+   * Storage lists the projects but does not answer whether the document of a loaded project it
+   * does not list is stored: listing waited for that check as long as storage took (30 s per
+   * request), unlike the other checks of single projects.
+   */
+  it('lists a loaded project storage does not list without waiting long for storage that does not answer about it', async () => {
+    const fs = new HeldStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: 50 });
+    const a = await rooms.createProject({ name: 'No project.json', empty: true });
+    await fs.remove(store.infoPath(a.id));
+    let release!: () => void;
+    fs.hold = new Promise((resolve) => (release = resolve));
+    try {
+      const listed = await within(rooms.listProjects(), 1000);
+      expect(listed === 'still waiting' ? listed : listed.map((p) => p.name)).toEqual(['No project.json']);
+      expect(fs.etagRequests).toBe(1);
+    } finally {
+      release();
+    }
+    expect(a.destroyed).toBe(false);
+  });
+
+  /*
    * Server one loaded the project (an agent read it), and nobody uses the room since; another
    * server deleted the project. Server one did not list it, but it opened it by id, and a change
    * made in it saved the project again. A room nobody uses now reads storage before it is opened
@@ -602,6 +674,39 @@ describe('RoomManager', () => {
   });
 
   /*
+   * Storage accepts connections and never answers: MCP get_project on a loaded room nobody uses
+   * (an agent's one-shot session created it) asks whether the project exists, opens it, and checks
+   * storage before it answers (readBeforeAnswer). Opening the room waited for its read of storage,
+   * and then get_project waited for its own check as long again: 10 s instead of the 5 s it says.
+   */
+  it('waits once in get_project for storage that does not answer about a room nobody uses', async () => {
+    const fs = new HeldStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: 600 });
+    const a = await rooms.createProject({ name: 'Unanswered', empty: true });
+    const b = await rooms.createProject({ name: 'Unanswered too', empty: true });
+    let release!: () => void;
+    fs.hold = new Promise((resolve) => (release = resolve));
+    a.readAt = 0;
+    try {
+      const t0 = Date.now();
+      expect(await rooms.exists(a.id)).toBe(true);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(550); // waited for the room's read
+      expect(await within(rooms.open(a.id), 200)).toBe(a);
+      expect(await within(readBeforeAnswer(a, store), 1000)).toBeUndefined();
+      expect(fs.etagRequests).toBe(0); // no check of its own while the read goes on
+      // the other way round: a read of the room that a request stopped waiting for goes on (as
+      // get_project's check does once it waited 5 s): opening the room waits for nothing
+      b.readIsLate(fs.hold);
+      b.readAt = 0;
+      expect(await within(rooms.exists(b.id), 200)).toBe(true);
+    } finally {
+      release();
+    }
+    await a.flush(); // after the read
+    expect(a.storageLate).toBe(false);
+  });
+
+  /*
    * A room in use when its project was deleted elsewhere stays open; once nobody uses it, the next
    * check for idle rooms closes it (before its idle time is up), and so does opening it or asking
    * whether the project exists.
@@ -704,7 +809,8 @@ describe('RoomManager', () => {
   /*
    * The room loaded for a project.json without a document has a document without a name: it was
    * listed (and MCP get_project answered) as 'Untitled', and its first save wrote 'Untitled' into
-   * project.json in place of the stored name.
+   * project.json in place of the stored name. The room's scene has the stored name; the document
+   * gets no name item from the server (see the next test).
    */
   it('keeps the stored name of a project that has a project.json and no document', async () => {
     const fs = new FlakyStore();
@@ -714,15 +820,53 @@ describe('RoomManager', () => {
     await fs.remove(two.store.docPath(a.id));
     const r = (await one.rooms.open(a.id))!;
     expect(r.scene.name).toBe('Info only'); // what editors and agents see
+    expect(r.scene.toSnapshot().meta.name).toBe('Info only'); // REST snapshot
+    expect(r.doc.getMap('meta').has('name')).toBe(false);
     expect(r.isDirty).toBe(false); // read from storage: nothing to save
     expect((await one.rooms.listProjects()).map((p) => p.name)).toEqual(['Info only']);
     expect((await one.rooms.describe(a.id))?.name).toBe('Info only');
     r.scene.addObject({ type: 'EMPTY', name: 'First change' });
     await r.flush();
     expect((await one.store.loadInfo(a.id))?.name).toBe('Info only');
+    // the stored document has no name either; the name stays in project.json until one is given
     const stored = new Y.Doc();
     Y.applyUpdate(stored, (await one.store.loadDocument(a.id))!.update);
-    expect(new SceneDoc(stored).name).toBe('Info only');
+    expect(stored.getMap('meta').has('name')).toBe(false);
+    // a rename names the document
+    r.scene.setName('Named at last');
+    await r.flush();
+    expect(r.scene.name).toBe('Named at last');
+    expect((await one.store.loadInfo(a.id))?.name).toBe('Named at last');
+  });
+
+  /*
+   * The room of a project.json without a document wrote the stored name into its new document, as a
+   * new item of the server's: a browser that had renamed the project in its copy of the full
+   * document merged that copy with the room's, and the two concurrent writes of the name were
+   * resolved by client id, so the browser's rename was lost in about half of the cases (here its
+   * first name was written by client 1, which loses to any other client id).
+   */
+  it("keeps a browser's rename when it brings the full document to a room of a project.json without one", async () => {
+    const fs = new FlakyStore();
+    const one = setup({ fs });
+    const two = setup({ fs });
+    const a = await two.rooms.createProject({ name: 'Old name', empty: true });
+    await fs.remove(two.store.docPath(a.id));
+    const browser = new Y.Doc();
+    browser.clientID = 1;
+    const copy = new SceneDoc(browser);
+    copy.setName('Old name');
+    copy.addObject({ type: 'EMPTY', name: 'Made in the browser' });
+    copy.setName('Renamed in the browser');
+    const r = (await one.rooms.open(a.id, { create: true }))!;
+    // the sync connection: the room and the browser exchange their states
+    Y.applyUpdate(r.doc, Y.encodeStateAsUpdate(browser));
+    Y.applyUpdate(browser, Y.encodeStateAsUpdate(r.doc));
+    expect(r.scene.name).toBe('Renamed in the browser');
+    expect(copy.name).toBe('Renamed in the browser');
+    await r.flush();
+    expect((await one.store.loadInfo(a.id))?.name).toBe('Renamed in the browser');
+    copy.destroy();
   });
 
   /* A stored document without a name (written by a client that never named it) keeps the stored record's name. */
@@ -981,6 +1125,569 @@ describe('RoomManager', () => {
     expect(rooms.isDeleted(room.id)).toBe(true);
     expect(await rooms.open(room.id, { create: true })).toBeNull();
     expect(await rooms.deleteProject(room.id)).toBe(false);
+  });
+
+  /*
+   * Storage refuses the deletion: the room used to be closed (its browsers told, with 4404, that
+   * the project was deleted, and no longer connecting) before storage was asked, so the project
+   * stayed in storage while every editor had lost it. The room now serves until storage deleted the
+   * project, and goes on serving, and saving, when the deletion fails.
+   */
+  it('keeps serving and saving a project whose deletion storage refuses', async () => {
+    const fs = new DeletionStore();
+    const { rooms, store } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Kept', empty: true });
+    fs.failRemove = true;
+    let release!: () => void;
+    fs.holdRemove = new Promise((resolve) => (release = resolve));
+    const deleting = rooms.deleteProject(a.id);
+    const refused = expect(deleting).rejects.toThrow(
+      `could not delete project ${a.id} from storage (storage refuses the deletion); the project stays open on this server`,
+    );
+    await until(() => fs.removals === 1);
+    expect(a.destroyed).toBe(false); // serves while storage deletes the project
+    a.scene.addObject({ type: 'EMPTY', name: 'Made meanwhile' });
+    release();
+    await refused;
+    expect(a.destroyed).toBe(false);
+    expect(rooms.isDeleted(a.id)).toBe(false);
+    expect(await rooms.open(a.id)).toBe(a);
+    await a.flush();
+    const stored = new Y.Doc();
+    Y.applyUpdate(stored, (await store.loadDocument(a.id))!.update);
+    expect(new SceneDoc(stored).findObjectByName('Made meanwhile')).not.toBeNull();
+  });
+
+  /*
+   * Once storage deleted the project, its room writes nothing: a save asked for while storage
+   * deleted it (a change, an agent's flush) used to be able to store the project again after the
+   * deletion.
+   */
+  it('stores nothing again that a save asked for while storage deleted the project', async () => {
+    const fs = new DeletionStore();
+    const { rooms, store } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Doomed', empty: true });
+    let release!: () => void;
+    fs.holdRemove = new Promise((resolve) => (release = resolve));
+    const deleting = rooms.deleteProject(a.id);
+    await until(() => fs.removals === 1);
+    expect(a.destroyed).toBe(false);
+    a.scene.addObject({ type: 'EMPTY', name: 'Made meanwhile' });
+    const saved = a.flush();
+    release();
+    expect(await deleting).toBe(true);
+    await saved;
+    await wait(50); // (the debounced save of the change, 10 ms here, would have run)
+    expect(a.destroyed).toBe(true);
+    expect(rooms.isDeleted(a.id)).toBe(true);
+    expect(await store.loadDocument(a.id)).toBeNull();
+    expect(await store.loadInfo(a.id)).toBeNull();
+    expect((await fs.list(store.projectsDir())).map((e) => e.name)).not.toContain(a.id);
+  });
+
+  /* A save that is running when the deletion starts ends first: written after it, it would store the project again. */
+  it('deletes a project after the save that is running', async () => {
+    const fs = new DeletionStore();
+    const { rooms, store } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Doomed', empty: true });
+    let release!: () => void;
+    fs.holdWrite = new Promise((resolve) => (release = resolve));
+    a.scene.addObject({ type: 'EMPTY', name: 'Being saved' });
+    const saving = a.flush();
+    await until(() => fs.heldWrites === 1);
+    const deleting = rooms.deleteProject(a.id);
+    await wait(20);
+    expect(fs.removals).toBe(0); // waits for the save
+    release();
+    await saving;
+    expect(await deleting).toBe(true);
+    expect(await store.loadDocument(a.id)).toBeNull();
+    expect((await fs.list(store.projectsDir())).map((e) => e.name)).not.toContain(a.id);
+  });
+
+  /*
+   * Storage does not answer the room's earlier reads and writes (each of their requests can take
+   * 30 s, and a refresh sends up to three): the deletion waited behind them before it sent its
+   * DELETE (175 s in a live run with storage that accepts connections and never answers, longer
+   * than MCP clients wait). It now waits for them as long as other requests wait for storage, and
+   * fails; the deletion it gave up does not run later.
+   */
+  it('gives up deleting a project whose earlier saves storage does not finish', async () => {
+    const fs = new DeletionStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: 100 });
+    const a = await rooms.createProject({ name: 'Busy', empty: true });
+    let release!: () => void;
+    fs.holdWrite = new Promise((resolve) => (release = resolve));
+    a.scene.addObject({ type: 'EMPTY', name: 'Being saved' });
+    const saving = a.flush();
+    await until(() => fs.heldWrites === 1);
+    await expect(within(rooms.deleteProject(a.id), 2000)).rejects.toThrow(
+      `could not delete project ${a.id} from storage (storage did not finish this project's earlier reads and writes within 0.1 s)`,
+    );
+    expect(a.destroyed).toBe(false);
+    release();
+    await saving;
+    await a.flush();
+    expect(fs.removals).toBe(0); // the deletion it gave up never ran
+    expect(await store.loadDocument(a.id)).not.toBeNull();
+    expect(await rooms.deleteProject(a.id)).toBe(true);
+    expect(a.destroyed).toBe(true);
+  });
+
+  /*
+   * A request that would load the project from storage while storage deletes it (a sync
+   * connection, after the room was evicted) waits for the deletion: it used to load the project
+   * from storage halfway through, and its room could store it again.
+   */
+  it('loads nothing while storage deletes a project that is not loaded', async () => {
+    const fs = new DeletionStore();
+    const { rooms } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Doomed', empty: true });
+    a.lastActive = 0;
+    await rooms.sweep(); // evicted
+    expect(rooms.get(a.id)).toBeUndefined();
+    let release!: () => void;
+    fs.holdRemove = new Promise((resolve) => (release = resolve));
+    const deleting = rooms.deleteProject(a.id);
+    await until(() => fs.removals === 1);
+    const opening = rooms.open(a.id, { create: true });
+    expect(await within(opening, 50)).toBe('still waiting');
+    release();
+    expect(await deleting).toBe(true);
+    expect(await opening).toBeNull();
+  });
+
+  /*
+   * A request that would load the project while a deletion checks whether it exists (a sync
+   * connection, during the deletion's read of project.json) waits for the deletion too: the
+   * deletion used to let it load the project halfway through, and then deleted the project without
+   * its room's saves, which could store it again.
+   */
+  it('loads nothing that is asked for while a deletion checks whether the project exists', async () => {
+    const fs = new InfoHeldStore();
+    const { rooms, store } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Doomed', empty: true });
+    a.lastActive = 0;
+    await rooms.sweep(); // evicted
+    expect(rooms.get(a.id)).toBeUndefined();
+    let release!: () => void;
+    fs.holdInfo = new Promise((resolve) => (release = resolve));
+    const reads = fs.infoReads;
+    const deleting = rooms.deleteProject(a.id);
+    await until(() => fs.infoReads > reads); // the deletion reads project.json
+    fs.holdInfo = null;
+    const opening = rooms.open(a.id, { create: true });
+    expect(await within(opening, 50)).toBe('still waiting');
+    release();
+    expect(await deleting).toBe(true);
+    expect(await opening).toBeNull();
+    expect(rooms.get(a.id)).toBeUndefined();
+    expect(await store.loadInfo(a.id)).toBeNull();
+    expect(await store.loadDocument(a.id)).toBeNull();
+  });
+
+  /*
+   * The same when the request asked before the deletion started, and was still checking whether
+   * storage holds the project again (deleted here within the hour, then stored again by another
+   * writer) when it began: it goes on only once the deletion has finished.
+   */
+  it('loads nothing that a request asked for before a deletion started and would load during it', async () => {
+    const fs = new HeldStore();
+    const { rooms, store } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Deleted here', empty: true });
+    expect(await rooms.deleteProject(a.id)).toBe(true);
+    const again = SceneDoc.create({ name: 'Saved again', empty: true });
+    await store.fs.write(store.docPath(a.id), again.encodeState());
+    await store.saveInfo({
+      id: a.id,
+      name: 'Saved again',
+      created_at: '',
+      updated_at: '',
+      schema_version: 1,
+    });
+    let release!: () => void;
+    fs.hold = new Promise((resolve) => (release = resolve));
+    const opening = rooms.open(a.id, { create: true }); // asks storage whether it holds it again
+    await until(() => fs.etagRequests === 1);
+    const deleting = rooms.deleteProject(a.id);
+    release();
+    expect(await deleting).toBe(true);
+    expect(await opening).toBeNull();
+    expect(rooms.get(a.id)).toBeUndefined();
+    expect(await store.loadDocument(a.id)).toBeNull();
+    again.destroy();
+  });
+
+  /*
+   * Asking whether a project that is not loaded exists while storage deletes it waits for the
+   * deletion: it used to read project.json halfway through, and answered that the project existed.
+   */
+  it('answers whether a project that is not loaded exists once its deletion has finished', async () => {
+    const fs = new DeletionStore();
+    const { rooms } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Doomed', empty: true });
+    a.lastActive = 0;
+    await rooms.sweep(); // evicted
+    let release!: () => void;
+    fs.holdRemove = new Promise((resolve) => (release = resolve));
+    const deleting = rooms.deleteProject(a.id);
+    await until(() => fs.removals === 1);
+    const asked = rooms.exists(a.id);
+    expect(await within(asked, 50)).toBe('still waiting');
+    release();
+    expect(await deleting).toBe(true);
+    expect(await asked).toBe(false);
+  });
+
+  /*
+   * Two deletions of a project at the same time (two agents, a REST call and an agent): the second
+   * waits for the first and then finds the project deleted. Both used to ask storage to delete it,
+   * and both answered that they deleted it.
+   */
+  it('runs one deletion of a project at a time', async () => {
+    const fs = new DeletionStore();
+    const { rooms } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Doomed', empty: true });
+    let release!: () => void;
+    fs.holdRemove = new Promise((resolve) => (release = resolve));
+    const first = rooms.deleteProject(a.id);
+    const second = rooms.deleteProject(a.id);
+    await until(() => fs.removals === 1);
+    expect(await within(second, 50)).toBe('still waiting');
+    release();
+    expect(await first).toBe(true);
+    expect(await second).toBe(false);
+    expect(fs.removals).toBe(1);
+    expect(a.destroyed).toBe(true);
+  });
+
+  /*
+   * Storage does not answer a load of the project that started before the deletion (a sync
+   * connection opening it): the deletion waited for the load as long as storage took (30 s per
+   * request on WebDAV). It now waits as long as for the project's other reads, and deletes nothing.
+   */
+  it('deletes nothing while a load of the project that storage does not answer goes on', async () => {
+    const fs = new HeldStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: 300 });
+    const a = await rooms.createProject({ name: 'Loading', empty: true });
+    a.lastActive = 0;
+    await rooms.sweep(); // evicted
+    let release!: () => void;
+    fs.hold = new Promise((resolve) => (release = resolve));
+    const reads = fs.documentReads;
+    const opening = rooms.open(a.id, { create: true });
+    await until(() => fs.documentReads > reads); // the load reads the document
+    try {
+      await expect(within(rooms.deleteProject(a.id), 1200)).rejects.toThrow(
+        `could not delete project ${a.id} from storage (storage did not finish this project's earlier reads and writes within 0.3 s); nothing was deleted: delete it again`,
+      );
+    } finally {
+      release();
+    }
+    const room = await opening;
+    expect(room?.id).toBe(a.id);
+    expect(room?.destroyed).toBe(false);
+    expect(rooms.isDeleted(a.id)).toBe(false);
+    expect(await store.loadDocument(a.id)).not.toBeNull();
+  });
+
+  /*
+   * Storage accepts connections and never answers: MCP delete_project asks whether the project
+   * exists (a loaded room nobody uses reads storage first, for 5 s at most), then deletes it, which
+   * waited for that read as long again (10 s in a live run); REST DELETE, whose deletion reads
+   * storage itself, too. The deletion now waits for none of the room's reads and writes while one
+   * that a request stopped waiting for goes on, and deletes nothing. Its reason says so: it said
+   * that storage did not finish them within the wait, also when the deletion had not waited.
+   */
+  it('waits once in a deletion for storage that does not answer about a room nobody uses', async () => {
+    const fs = new HeldStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: 500 });
+    const a = await rooms.createProject({ name: 'Unanswered', empty: true });
+    const b = await rooms.createProject({ name: 'Unanswered too', empty: true });
+    let release!: () => void;
+    fs.hold = new Promise((resolve) => (release = resolve));
+    a.readAt = 0;
+    b.readAt = 0;
+    const notDeleted = (id: string) =>
+      `could not delete project ${id} from storage (storage has not finished a read of this project that a request stopped waiting for after 0.5 s); nothing was deleted, and the project stays open on this server for its editors and agents: delete it again`;
+    try {
+      // as MCP delete_project: whether the project exists, then the deletion
+      let t0 = Date.now();
+      expect(await rooms.exists(a.id)).toBe(true);
+      const waited = Date.now() - t0; // one wait for the room's read
+      expect(waited).toBeGreaterThanOrEqual(450);
+      await expect(within(rooms.deleteProject(a.id), 200)).rejects.toThrow(notDeleted(a.id));
+      // as REST DELETE
+      t0 = Date.now();
+      await expect(rooms.deleteProject(b.id)).rejects.toThrow(notDeleted(b.id));
+      expect(Date.now() - t0).toBeLessThan(waited + 250); // one wait, not two
+    } finally {
+      release();
+    }
+    await Promise.all([a.flush(), b.flush()]); // after the reads
+    expect(a.destroyed || b.destroyed).toBe(false);
+    expect(rooms.isDeleted(a.id) || rooms.isDeleted(b.id)).toBe(false);
+    expect(await store.loadDocument(a.id)).not.toBeNull();
+    expect(await store.loadDocument(b.id)).not.toBeNull();
+    expect(await rooms.deleteProject(a.id)).toBe(true);
+  });
+
+  /*
+   * The deletion waits for the project's earlier reads and writes of storage as long as other
+   * requests wait for storage in all, not once per read or write: here the room's read of storage
+   * (as REST DELETE opens a room nobody uses) ends in time, and a save of a change made meanwhile
+   * ends after that wait, before a second wait would end. The deletion used to wait for the save as
+   * long again, and then deleted the project. (No bound on the time: timers fire in the order they
+   * are due, also on a busy machine, so the save ends after the deletion gave up.)
+   */
+  it('waits for the earlier reads and writes of storage once in all before it deletes a project', async () => {
+    const waitMs = 600;
+    const fs = new HeldStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: waitMs });
+    const a = await rooms.createProject({ name: 'Busy', empty: true });
+    let releaseRead!: () => void;
+    let releaseSave!: () => void;
+    const save = new Promise<void>((resolve) => (releaseSave = resolve));
+    fs.hold = new Promise((resolve) => (releaseRead = resolve));
+    a.readAt = 0;
+    const reads = fs.documentReads;
+    const t0 = Date.now();
+    const deleting = rooms.deleteProject(a.id).then(
+      (deleted) => ({ deleted, after: Date.now() - t0 }),
+      (err: Error) => ({ error: err.message, after: Date.now() - t0 }),
+    );
+    try {
+      await until(() => fs.documentReads > reads); // the room reads storage first
+      a.scene.addObject({ type: 'EMPTY', name: 'Made meanwhile' }); // its save waits for the read
+      await wait(0.8 * waitMs - (Date.now() - t0));
+      fs.hold = save;
+      releaseRead(); // the read ends in time; the save's read of storage goes on
+      await wait(1.4 * waitMs - (Date.now() - t0));
+      releaseSave();
+      const result = await deleting;
+      expect(result).toMatchObject({
+        error: `could not delete project ${a.id} from storage (storage did not finish this project's earlier reads and writes within 0.6 s); nothing was deleted, and the project stays open on this server for its editors and agents: delete it again`,
+      });
+      expect(result.after).toBeGreaterThanOrEqual(waitMs - 50);
+    } finally {
+      releaseRead();
+      releaseSave();
+    }
+    await a.flush();
+    expect(a.destroyed).toBe(false);
+    expect(await store.loadDocument(a.id)).not.toBeNull();
+    expect(await rooms.deleteProject(a.id)).toBe(true);
+  });
+
+  /*
+   * A deletion that started in time is not given up when storage takes longer than the rest of the
+   * wait to delete the project: it reports the deletion, records it and closes the room (it is not
+   * reported as one that deleted nothing while storage deletes the project).
+   */
+  it('reports a deletion whose request to storage outlasts the wait as done', async () => {
+    const fs = new DeletionStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: 100 });
+    const a = await rooms.createProject({ name: 'Slow to delete', empty: true });
+    let release!: () => void;
+    fs.holdRemove = new Promise((resolve) => (release = resolve));
+    const deleting = rooms.deleteProject(a.id);
+    await until(() => fs.removals === 1); // started at once (the room's queue is idle)
+    await wait(300); // past the wait
+    release();
+    expect(await deleting).toBe(true);
+    expect(a.destroyed).toBe(true);
+    expect(rooms.isDeleted(a.id)).toBe(true);
+    expect(await store.loadDocument(a.id)).toBeNull();
+  });
+
+  /*
+   * A read that a request stopped waiting for and that is not in the room's queue of reads and
+   * writes (MCP get_project's check whether the document is stored) does not stop a deletion while
+   * the queue is idle: the deletion waits for nothing then.
+   */
+  it('deletes a project while a late check outside the queue of its room goes on', async () => {
+    const fs = new DeletionStore();
+    const { rooms, store } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Checked', empty: true });
+    let release!: () => void;
+    a.readIsLate(new Promise<void>((resolve) => (release = resolve))); // as get_project's check is marked
+    try {
+      expect(a.storageLate).toBe(true);
+      expect(await within(rooms.deleteProject(a.id), 2000)).toBe(true);
+    } finally {
+      release();
+    }
+    expect(a.destroyed).toBe(true);
+    expect(await store.loadDocument(a.id)).toBeNull();
+  });
+
+  /*
+   * Three deletions of a project asked for at once, the first refused by storage: loads of the
+   * project also wait for the second one, which deletes it (the end of the first one must not let
+   * them load the project while storage deletes it).
+   */
+  it('loads nothing while the deletion after a refused one deletes the project', async () => {
+    const fs = new DeletionStore();
+    const { rooms } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Thrice', empty: true });
+    a.lastActive = 0;
+    await rooms.sweep(); // evicted
+    expect(rooms.get(a.id)).toBeUndefined();
+    fs.failRemove = true;
+    let releaseFirst!: () => void;
+    fs.holdRemove = new Promise((resolve) => (releaseFirst = resolve));
+    const outcome = (p: Promise<boolean>) =>
+      p.then(
+        (deleted) => deleted,
+        (err: Error) => err.message,
+      );
+    const first = outcome(rooms.deleteProject(a.id));
+    const second = outcome(rooms.deleteProject(a.id));
+    const third = outcome(rooms.deleteProject(a.id));
+    await until(() => fs.removals === 1);
+    let releaseSecond!: () => void;
+    fs.holdRemove = new Promise((resolve) => (releaseSecond = resolve));
+    releaseFirst();
+    expect(await first).toBe(
+      `could not delete project ${a.id} from storage (storage refuses the deletion); storage may still hold all or part of it: delete it again`,
+    );
+    fs.failRemove = false;
+    await until(() => fs.removals === 2); // the second deletion asks storage
+    const opening = rooms.open(a.id, { create: true });
+    expect(await within(opening, 50)).toBe('still waiting');
+    releaseSecond();
+    expect(await second).toBe(true);
+    expect(await third).toBe(false);
+    expect(await opening).toBeNull();
+    expect(fs.removals).toBe(2);
+  });
+
+  /* A refused deletion of a project that is not loaded says nothing of a room that stays open. */
+  it('says why it could not delete a project that is not loaded', async () => {
+    const fs = new DeletionStore();
+    const { rooms } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Stored', empty: true });
+    a.lastActive = 0;
+    await rooms.sweep(); // evicted
+    expect(rooms.get(a.id)).toBeUndefined();
+    fs.failRemove = true;
+    expect(await rooms.deleteProject(a.id).catch((err: Error) => err.message)).toBe(
+      `could not delete project ${a.id} from storage (storage refuses the deletion); storage may still hold all or part of it: delete it again`,
+    );
+    expect(rooms.isDeleted(a.id)).toBe(false);
+    fs.failRemove = false;
+    expect(await rooms.deleteProject(a.id)).toBe(true);
+  });
+
+  /*
+   * Storage fails (on WebDAV also: gets no answer within 30 s) when a request asks about a project
+   * that is not loaded: exists() answered that there was no such project once both of its reads had
+   * failed, so MCP tools answered that the project was not found (after 90 s with storage that
+   * accepts connections and does not answer: the two reads and a listing of the projects) and REST
+   * DELETE 404. It now says that storage could not tell, after the first read.
+   */
+  it('says that storage cannot tell whether a project that is not loaded exists', async () => {
+    const fs = new ReadFailStore();
+    const { rooms, store } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Stored', empty: true });
+    a.lastActive = 0;
+    await rooms.sweep(); // evicted
+    expect(rooms.get(a.id)).toBeUndefined();
+    fs.failReads = true;
+    fs.reads = 0;
+    const error = `could not read project ${a.id} from storage (storage offline)`;
+    await expect(rooms.exists(a.id)).rejects.toThrow(error);
+    expect(fs.reads).toBe(1);
+    await expect(rooms.deleteProject(a.id)).rejects.toThrow(error);
+    fs.failReads = false;
+    expect(rooms.isDeleted(a.id)).toBe(false);
+    expect(await rooms.exists(a.id)).toBe(true);
+    expect(await rooms.exists(newUuid())).toBe(false);
+    // an unreadable project.json reads as none, as before
+    await fs.write(store.infoPath(a.id), new TextEncoder().encode('{'));
+    expect(await rooms.exists(a.id)).toBe(true);
+    await fs.remove(store.docPath(a.id));
+    expect(await rooms.exists(a.id)).toBe(false);
+  });
+
+  /*
+   * MCP tools take a project's id or name and ask whether the reference is a project's id first
+   * (AgentSession.resolveProjectId); a name such as 'Lighthouse' is a valid id too. While storage
+   * failed, that question threw ('could not read project Lighthouse from storage'), and every tool
+   * call that named a loaded project so failed, also for the agent working on it. The name now
+   * finds the loaded project; a name no loaded project has still says that storage cannot tell.
+   */
+  it('leaves a name of a loaded project to find it while storage fails', async () => {
+    const fs = new ReadFailStore();
+    const { rooms, store } = setup({ fs });
+    const a = await rooms.createProject({ name: 'Lighthouse', empty: true });
+    const unsaved = await rooms.open('Unsaved', { create: true }); // listed once it has content
+    fs.failReads = true;
+    expect(await rooms.exists('Lighthouse')).toBe(false); // not an id: the name finds the project
+    expect(await rooms.exists('lighthouse')).toBe(false); // ignoring letter case, as tools match names
+    expect(await rooms.exists(a.id)).toBe(true);
+    const cannotTell = (ref: string) => `could not read project ${ref} from storage (storage offline)`;
+    await expect(rooms.exists('Harbour')).rejects.toThrow(cannotTell('Harbour'));
+    // a room that is not listed (opened for an unknown project, nothing in it) names nothing
+    await expect(rooms.exists('Untitled')).rejects.toThrow(cannotTell('Untitled'));
+    unsaved!.scene.addObject({ type: 'EMPTY', name: 'Content' });
+    expect(await rooms.exists('untitled')).toBe(false);
+    // nor does a room nobody uses whose project another writer deleted (it is not listed)
+    fs.failReads = false;
+    const gone = await rooms.createProject({ name: 'Gone', empty: true });
+    await store.deleteProject(gone.id);
+    await gone.refresh();
+    expect(gone.deletedFromStorage).toBe(true);
+    fs.failReads = true;
+    await expect(rooms.exists('Gone')).rejects.toThrow(cannotTell('Gone'));
+    // storage that answers: the id comes first
+    fs.failReads = false;
+    expect(await rooms.exists('Lighthouse')).toBe(false);
+    await store.saveInfo({
+      id: 'Lighthouse',
+      name: 'Stored',
+      created_at: '',
+      updated_at: '',
+      schema_version: 1,
+    });
+    expect(await rooms.exists('Lighthouse')).toBe(true);
+  });
+
+  /*
+   * The same with storage that does not answer: the question waited for storage (30 s per request
+   * on WebDAV) and then failed, for a project loaded here. It now waits as other requests wait for
+   * storage (openReadWaitMs, 5 s), once while the read goes on, and leaves the name to find the
+   * project; the read's answer counts for the requests after it.
+   */
+  it('leaves a name of a loaded project to find it without waiting long for storage that does not answer', async () => {
+    const fs = new InfoHeldStore();
+    const { rooms, store } = setup({ fs, openReadWaitMs: 300 });
+    const lighthouse = await rooms.createProject({ name: 'Lighthouse', empty: true });
+    await store.saveInfo({
+      id: 'Lighthouse',
+      name: 'Stored',
+      created_at: '',
+      updated_at: '',
+      schema_version: 1,
+    });
+    let release!: () => void;
+    fs.holdInfo = new Promise((resolve) => (release = resolve));
+    const reads = fs.infoReads;
+    const harbour = rooms.exists('Harbour'); // a name no loaded project has: it waits for storage
+    try {
+      expect(await within(rooms.exists('Lighthouse'), 3000)).toBe(false); // after 300 ms
+      // requests for the project the name finds wait for that read no more (get_project's check)
+      expect(lighthouse.storageLate).toBe(true);
+      expect(await within(rooms.exists('Lighthouse'), 150)).toBe(false); // at once: the read goes on
+      expect(await within(rooms.exists('lighthouse'), 150)).toBe(false); // the same project: at once
+      expect(fs.infoReads).toBe(reads + 2); // 'Harbour' and 'Lighthouse'
+      expect(await within(harbour, 50)).toBe('still waiting');
+    } finally {
+      release();
+    }
+    expect(await harbour).toBe(false);
+    await until(() => !lighthouse.storageLate);
+    expect(await rooms.exists('Lighthouse')).toBe(true); // storage answered: the id comes first
   });
 });
 

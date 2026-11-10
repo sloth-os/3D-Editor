@@ -9,19 +9,26 @@ import {
   transformTolerance,
   type TransformChannels,
 } from '../doc/scene-doc';
-import { FrameState } from '../eval/frame-state';
+import type { FrameState } from '../eval/frame-state';
 import { selectedVertexSet } from '../mesh/selection';
 import { vertexCount } from '../mesh/types';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
-import { evaluatedWorld, keyChannelChanges, transformRoots, type ChannelChange } from './transform';
+import {
+  evaluatedWorld,
+  keyChannelChanges,
+  transformFrameState,
+  transformRoots,
+  type ChannelChange,
+} from './transform';
 import { selectedObjects, vec3 } from './helpers';
 
 /**
  * The center of the selection as Blender's Cursor to Selected finds it (snap_curs_to_sel_ex), at
  * the frame of `fs`: in Object Mode the origins of all selected objects (a selected child of a
- * selected parent too) where the scene shows them, constraints applied; in Edit Mode the selected
+ * selected parent too) where the scene shows them, constraints applied (rigid bodies where the
+ * simulation has them, with a frame state from transformFrameState); in Edit Mode the selected
  * vertices. The center of their bounding box with the Bounding Box Center pivot point, else their
  * median. Null when nothing is selected.
  */
@@ -63,7 +70,9 @@ function selectionCenter(ctx: OperatorContext, fs: FrameState): Vec3 | null {
  * Selection to Grid): `offsets` maps each object to the world offset that takes its origin, where
  * the scene shows it at the frame of `fs`, to its target. Each location changes by the offset taken
  * into the parent's space with the inverse of the parent's matrix there (a bone's posed matrix for
- * a bone child), starting from the location the object shows (an animated value at the frame),
+ * a bone child), starting from the location its channels hold at the frame (an animated value
+ * there; for a rigid body the simulation moves, the location it starts the simulation from, to
+ * which Blender's snap_selected_to_location adds the offset from where the simulation shows it),
  * all computed before any is written. Only locations that change are written. Auto keying keys the
  * location of every object in `offsets` with the value it shows afterwards (also one already at its
  * target), as Blender's snapping keys its Location keying set; without it an animated location it
@@ -118,7 +127,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
       undo: false,
       schema: z.object({}),
       execute(ctx) {
-        const c = selectionCenter(ctx, new FrameState(ctx.doc, ctx.state.frame));
+        const c = selectionCenter(ctx, transformFrameState(ctx.doc, ctx.state.frame));
         if (c) ctx.state.cursorLocation = c;
       },
     }),
@@ -135,7 +144,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
       execute(ctx) {
         const id = ctx.state.activeId;
         if (!id || !ctx.doc.getObject(id)) return;
-        const w = evaluatedWorld(new FrameState(ctx.doc, ctx.state.frame), id);
+        const w = evaluatedWorld(transformFrameState(ctx.doc, ctx.state.frame), id);
         ctx.state.cursorLocation = [w[12], w[13], w[14]];
       },
     }),
@@ -182,7 +191,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
       poll: (ctx) =>
         ctx.state.mode === 'OBJECT' && selectedObjects(ctx).length ? true : 'Select objects in Object Mode',
       execute(ctx, p) {
-        const fs = new FrameState(ctx.doc, ctx.state.frame);
+        const fs = transformFrameState(ctx.doc, ctx.state.frame);
         const ids = selectedObjects(ctx).map((o) => o.id);
         const c = ctx.state.cursorLocation;
         const offsets = new Map<string, Vec3>();
@@ -224,7 +233,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
       poll: (ctx) =>
         ctx.state.mode === 'OBJECT' && selectedObjects(ctx).length ? true : 'Select objects in Object Mode',
       execute(ctx, p) {
-        const fs = new FrameState(ctx.doc, ctx.state.frame);
+        const fs = transformFrameState(ctx.doc, ctx.state.frame);
         const g = p.grid_size;
         const offsets = new Map<string, Vec3>();
         for (const o of selectedObjects(ctx)) {

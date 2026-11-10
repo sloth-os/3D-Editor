@@ -224,6 +224,74 @@ describe('WebDAV persistence', () => {
     },
   );
 
+  /*
+   * Storage refuses the deletion: the server used to close the project's sync connections with 4404
+   * (browsers say that the project was deleted and stop connecting) before it asked storage, and
+   * then answered the request with an error while the project still existed.
+   */
+  it('closes the sync connections of a deleted project only once storage deleted it', async () => {
+    let refuseDeletion = false;
+    const refusing = await startWebDAV({
+      onRequest: (req) => {
+        if (refuseDeletion && req.method === 'DELETE') throw new Error('storage refuses the deletion');
+      },
+    });
+    cleanup.push(() => refusing.stop());
+    await mkcolPath(refusing, '/files/alice');
+    const server = await startServer({
+      WEBDAV_URL: `${refusing.origin}/files/alice`,
+      WEBDAV_USERNAME: refusing.username,
+      WEBDAV_PASSWORD: refusing.password,
+    });
+    cleanup.push(
+      () => server.cleanup(),
+      () => server.close(),
+    );
+    const created = await api(server.url, '/api/projects', { method: 'POST', json: { name: 'Refused' } });
+    const id = created.body.id as string;
+    const c = new SyncTestClient({ baseUrl: server.url, projectId: id });
+    cleanup.push(() => c.destroy());
+    await c.connect();
+
+    refuseDeletion = true;
+    const refused = await api(server.url, `/api/projects/${id}`, { method: 'DELETE' });
+    expect(refused.status).toBe(500);
+    expect(refused.body.message).toBe(
+      `could not delete project ${id} from storage (fetch failed); the project stays open on this server for its editors and agents, and storage may still hold all or part of it: delete it again`,
+    );
+    await sleep(200);
+    expect(c.closeCode).toBeNull();
+    expect(c.connected).toBe(true);
+    // the project lives on: listed, opened, and the client's changes are saved
+    expect((await api(server.url, `/api/projects/${id}`)).status).toBe(200);
+    c.scene.addObject({ type: 'EMPTY', name: 'After the refusal' });
+    const store = new ProjectFileStore(
+      new WebDAVClient({
+        url: `${refusing.origin}/files/alice`,
+        username: refusing.username,
+        password: refusing.password,
+      }),
+      '/3d-editor',
+    );
+    await eventually(
+      async () => {
+        const stored = await store.loadDocument(id);
+        if (!stored) return false;
+        const doc = new Y.Doc();
+        Y.applyUpdate(doc, stored.update);
+        return new SceneDoc(doc).findObjectByName('After the refusal');
+      },
+      10_000,
+      'the change saved',
+    );
+
+    refuseDeletion = false;
+    expect((await api(server.url, `/api/projects/${id}`, { method: 'DELETE' })).status).toBe(204);
+    await eventually(() => c.closeCode === 4404, 10_000, 'socket closed with 4404');
+    expect(await store.loadDocument(id)).toBeNull();
+    expect(await store.loadInfo(id)).toBeNull();
+  });
+
   it('reports unreachable storage on /readyz', async () => {
     const server = await startServer({
       WEBDAV_URL: 'http://127.0.0.1:9/nothing',

@@ -25,6 +25,7 @@ export * from './registry';
 export * from './helpers';
 export * from './transform';
 export * from './anim';
+export * from './memory';
 export { addObjectAndSelect, enterEditMode, evaluatedMesh } from './object';
 
 /** Creates a registry with every built-in (headless-capable) operator registered. */

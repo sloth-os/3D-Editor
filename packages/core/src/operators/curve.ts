@@ -1426,7 +1426,12 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
             'Channel of vector properties (0 = x, 1 = y, 2 = z; single values only have 0); -1 keys all',
           ),
         frame: z.number().optional().describe('Frame to key (default: the current frame)'),
-        value: z.number().optional().describe('Value to key (default: the current value of the property)'),
+        value: z
+          .number()
+          .optional()
+          .describe(
+            'Value to key (default: the value the property shows at the current frame, an animated or driven value there)',
+          ),
         interpolation: z
           .enum(['CONSTANT', 'LINEAR', 'BEZIER'])
           .default('BEZIER')
@@ -1436,10 +1441,12 @@ export function registerCurveOperators(reg: OperatorRegistry): void {
         const { object: o, curve } = curveTarget(ctx, p.object);
         checkCurveChannel(o, curve, p.path, p.index);
         const frame = p.frame ?? ctx.state.frame;
+        // without a value, what the curve shows at the current frame (an animated or driven value)
         const inserted = keyProperty(ctx, 'curve', curve.id, p.path, frame, {
           index: p.index,
           value: p.value,
           interpolation: p.interpolation,
+          shown: new FrameState(ctx.doc, ctx.state.frame),
         });
         const fcurves = ctx.doc
           .listFCurves(curve.id)

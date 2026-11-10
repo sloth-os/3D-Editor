@@ -1,8 +1,18 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { geometryMemoryCheck, setGeometryMemoryCheck, type GeometryMemoryCheck } from '@3d-editor/core';
-import { geometryCheck } from '../../src/render/memory';
+import {
+  geometryMemoryCheck,
+  meshMemoryCheck,
+  operatorMemoryCheck,
+  setGeometryMemoryCheck,
+  setMeshMemoryCheck,
+  setOperatorMemoryCheck,
+  type GeometryMemoryCheck,
+  type MeshMemoryCheck,
+  type OperatorMemoryCheck,
+} from '@3d-editor/core';
+import { decodeCheck, geometryCheck, operatorCheck } from '../../src/render/memory';
 import { startServer, type TestServer } from '../helpers/app';
 
 /*
@@ -17,6 +27,8 @@ import { startServer, type TestServer } from '../helpers/app';
 let server: TestServer;
 let client: Client;
 let installed: GeometryMemoryCheck | null = null;
+let installedOperatorCheck: OperatorMemoryCheck | null = null;
+let installedDecodeCheck: MeshMemoryCheck | null = null;
 
 type ToolResult = { content: { type: string; text?: string }[]; isError?: boolean };
 
@@ -38,10 +50,14 @@ beforeAll(async () => {
   client = new Client({ name: 'memory-agent', version: '1.0.0' });
   await client.connect(new StreamableHTTPClientTransport(new URL(`${server.url}/mcp`)));
   installed = geometryMemoryCheck();
+  installedOperatorCheck = operatorMemoryCheck();
+  installedDecodeCheck = meshMemoryCheck();
 });
 
 afterAll(async () => {
   setGeometryMemoryCheck(installed);
+  setOperatorMemoryCheck(installedOperatorCheck);
+  setMeshMemoryCheck(installedDecodeCheck);
   await client?.close();
   await server?.close();
   await server?.cleanup();
@@ -78,18 +94,30 @@ describe("evaluations in the server's process", () => {
         message: expect.stringContaining(message),
       }),
     );
+    // listed once, though the viewport's evaluation skips it too: with the advice that names both
+    expect(problems.filter((p) => p.source === 'modifier')).toHaveLength(1);
     expect(problems.find((p) => p.source === 'modifier')!.message).toMatch(
-      / heap free and keeps 256 MB of it for its other work\. Lower render_levels to evaluate it on the server \(a browser editor evaluates it itself\)$/,
+      / heap free and keeps 256 MB of it for its other work\. Lower levels \(render_levels for renders\) to evaluate it on the server \(a browser editor evaluates it itself\)$/,
     );
 
-    // Apply computes the stack itself: refused the same way, the modifier stays
-    const apply = await call('run_operator', {
-      project: id,
-      operator: 'object.modifier_apply',
-      params: { modifier: 'Subdivision' },
-    });
+    // Apply computes the stack itself: refused the same way (here the operator's own estimate,
+    // checked before it runs, is let through), the modifier stays
+    expect(installedOperatorCheck).toBeTypeOf('function');
+    setOperatorMemoryCheck(operatorCheck({ heapFree: () => 4096 * MB, collect: () => undefined }));
+    const applyArgs = { project: id, operator: 'object.modifier_apply', params: { modifier: 'Subdivision' } };
+    const apply = await call('run_operator', applyArgs);
     expect(apply.isError).toBe(true);
     expect(apply.content[0].text).toContain(message);
+    expect(JSON.parse(apply.content[0].text!.split('\n').slice(1).join('\n'))).toMatchObject({
+      code: 'OUT_OF_MEMORY',
+    });
+    // the operator's estimate refuses it before it runs when the free heap is that small
+    setOperatorMemoryCheck(operatorCheck({ heapFree: () => 300 * MB, collect: () => undefined }));
+    const refused = await call('run_operator', applyArgs);
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toMatch(
+      /^object\.modifier_apply failed: not run on the server: it would need about [\d,]+ MB of JavaScript heap for a mesh of about 1,000,000 faces, and the server's process has 300 MB /,
+    );
     expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
 
     // with room for it, the same evaluation runs (no result was kept from the refusal)
@@ -103,5 +131,33 @@ describe("evaluations in the server's process", () => {
     expect(((after.problems ?? []) as { source: string }[]).filter((p) => p.source === 'modifier')).toEqual(
       [],
     );
+  });
+});
+
+describe("stored meshes the server's process does not load", () => {
+  it('are refused by get_mesh_data with code OUT_OF_MEMORY, like the operators that read them', async () => {
+    expect(installedDecodeCheck).toBeTypeOf('function');
+    const { id } = await ok('create_project', { name: 'unloaded', empty: true });
+    await ok('run_operator', {
+      project: id,
+      operator: 'mesh.primitive_grid_add',
+      params: { x_subdivisions: 100, y_subdivisions: 100 },
+    });
+    // a heap with 1 MB free above the reserve: the grid of 20,000 triangles (2 MB) is not decoded
+    setMeshMemoryCheck(decodeCheck({ heapFree: () => 257 * MB, collect: () => undefined }));
+    try {
+      const res = await call('get_mesh_data', { project: id, object: 'Grid' });
+      expect(res.isError).toBe(true);
+      const [first, ...rest] = res.content[0].text!.split('\n');
+      expect(first).toMatch(
+        /^get_mesh_data failed: this mesh of 20,000 triangles was not loaded on the server: decoding it needs about 2 MB of JavaScript heap/,
+      );
+      expect(JSON.parse(rest.join('\n'))).toEqual({ code: 'OUT_OF_MEMORY' });
+    } finally {
+      setMeshMemoryCheck(installedDecodeCheck);
+    }
+    expect((await ok('get_mesh_data', { project: id, object: 'Grid' })).totals).toMatchObject({
+      faces: 10_000,
+    });
   });
 });

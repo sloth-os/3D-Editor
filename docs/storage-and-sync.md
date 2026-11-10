@@ -54,15 +54,19 @@ project at the same moment. Every writer:
   writer created the document meanwhile); after writing it reads the write back (one GET, or just
   the ETag when the PUT response carried one), and when another write replaced it, merges that one
   and writes again if it lacks the writer's changes.
-- **Reads storage again later.** A server room that wrote to WebDAV reads the document again in
-  the next refresh (every 60 s), before it is evicted (idle for `ROOM_IDLE_TTL_SECONDS`) and when
-  the server stops, and writes its changes again if they are missing; it is not evicted while that
-  read fails. A room that nobody uses reads the document again before the server opens it, unless
-  it read it within the last 2 s; the server waits 5 s at most for that read (and for the check
-  whether storage holds a project it deleted again, below), and once a request stopped waiting for
-  a read, the requests that come while it goes on do not wait for it (an MCP tool that asks whether
-  a project exists and then opens it, or lists the projects, waits 5 s, not twice that). Browsers
-  sync every 20 s while the project is open.
+- **Reads storage again later.** A server room that wrote to WebDAV reads the document again in the
+  next refresh (every 60 s), before it is evicted (idle for `ROOM_IDLE_TTL_SECONDS`) and when the
+  server stops, and writes its changes again if they are missing; it is not evicted while that read
+  fails. A room that nobody uses reads the document again before the server opens it, unless it read
+  it within the last 2 s; the server waits 5 s at most for that read (and for the check whether
+  storage holds a project it deleted again, for the check whether a project has an id that is also
+  the name of a loaded project, both below, and for MCP get_project's check of storage before it
+  answers), and once a request stopped waiting for a read of a project, the requests that come while
+  that read goes on wait for none of that project's reads: an MCP tool that asks whether a project
+  exists and then opens it, deletes it, or checks storage before it answers, as get_project does,
+  waits 5 s for that project's reads, not twice that (when it lists the projects too, the listing
+  waits for none of them, but the listing itself can take 30 s, below). Browsers sync every 20 s
+  while the project is open.
 - **Does not bring back deleted projects** (next section).
 
 `SYNC_PERSISTENCE=disk` checks `If-Match` and writes in one step under a lock, gives each version a
@@ -164,10 +168,29 @@ nothing.
   - `project deleted from storage elsewhere: not saved again unless it changes on this server`
   - `project deleted from storage elsewhere: saved again with the changes made on this server`
 - A server lists what storage lists, and the projects whose rooms are in use or have unsaved
-  changes. When storage does not list a loaded project that nobody uses, the server asks whether
-  its document is still stored (its `project.json` may be unreadable): when it is not, the room
-  reads storage and is closed. When listing storage fails, the server lists the projects it has
-  loaded and logs `listing projects failed` at `warn`.
+  changes. When storage does not list a loaded project that nobody uses, the server asks whether its
+  document is still stored (its `project.json` may be unreadable), and waits 5 s at most for the
+  answer (without one, the project counts as stored): when it is not stored, the room reads storage
+  and is closed. When listing storage fails, the server lists the projects it has loaded and logs
+  `listing projects failed` at `warn`. Listing fails too when reading the `project.json` of a listed
+  project fails (a `project.json` that is not valid JSON lists no project, as a missing one), with
+  the reason `could not read the project.json of <n> of <m> stored projects (<reason>)`: such a
+  project used to be left out without a word, as if it did not exist. A browser's project list then
+  shows the projects whose `project.json` it read, and the reason. A storage request that gets no
+  complete answer fails after 30 s (on WebDAV; also one whose answer stops coming), with the reason
+  `<method> <path> got no complete answer within 30 s`, so with storage that accepts connections and
+  does not answer, listing the projects (MCP `list_projects`, `GET /api/projects`) takes 30 s before
+  the server lists the projects it has loaded (`list_projects` then says `storage_listing_failed`).
+  A request that names a project the server has not loaded (an MCP tool, REST
+  `DELETE /api/projects/<id>`) reads its `project.json` (without one, its document): when that read
+  fails, the request fails with `could not read project <id> from storage (<reason>)`, on WebDAV
+  after 30 s with storage that does not answer (it used to answer that the project was not found,
+  after 90 s). MCP tools take a project's id or name and try the id first, and a name such as
+  `Lighthouse` is a valid id too: when a project the server has loaded has that name (ignoring
+  letter case), storage that fails, or does not answer within 5 s, leaves the name to find that
+  project (such calls used to fail with that error while storage failed, also for the agent working
+  on the project); while a read that a request stopped waiting for goes on, the requests that name
+  the project, or check storage for it as get_project does, do not wait for storage again.
 - The server that deleted a project closes sync connections to it for an hour (they would upload
   a browser's copy as a new project), but lists and opens it as soon as storage holds it again
   (another writer saved its unsaved changes). It asks storage whether it does when a request needs
@@ -175,18 +198,40 @@ nothing.
   answer, once (the requests that come while that check goes on, after one stopped waiting for it,
   do not wait): without an answer, the project counts as still deleted, and the requests after the
   answer find it.
-- When the server deletes a project, it closes the project's sync connections with code 4404
-  (`project deleted`); a new connection to a project it deleted, or whose room it closed after
-  finding the project deleted from storage, it accepts and closes at once the same way (browsers
-  cannot read the status of a refused WebSocket upgrade: they took HTTP 410 for a lost network
-  and connected again and again). A browser whose connection is closed with that code says that
-  the project was deleted on the server, shows `deleted` as its sync status (`Local only` in the
-  status bar), and no longer connects to the server for that project by itself; it keeps its copy
-  and its edits, in IndexedDB and in its other tabs, and syncs with WebDAV by the rules above.
-  Reloading the page, or Save (Ctrl+S), connects again; while the server has the project deleted it
-  closes that connection the same way, and the page says nothing more (a reload says it once
-  again). It says so again for a new deletion, after a room of the server took one of its
-  connections (the server held the project again).
+- When the server deletes a project (REST `DELETE /api/projects/<id>`, MCP `delete_project`), it
+  deletes the stored files first: until storage has deleted them, the project's room serves its
+  editors and agents, and from then on it saves nothing (a save would store the project again). Only
+  then does the server close the project's sync connections, with code 4404 (`project deleted`). The
+  deletion first waits for the project's earlier reads and writes of storage (a load of the project,
+  the read before the server opens a room nobody uses, saves) 5 s at most in all, and not at all
+  while one that a request stopped waiting for goes on (the rule above); when they have not
+  finished, it deletes nothing, then or later. One deletion of a project runs at a time (another one
+  asked for meanwhile waits for it, and after one that deleted the project finds it deleted), and
+  requests that would load the project from storage wait for the deletion. When nothing was deleted,
+  or storage fails to delete the project (on WebDAV: the DELETE fails, gets no answer within 30 s,
+  or is answered with 207 Multi-Status because some files were not deleted), the room goes on
+  serving and saving, its connections stay open, the server does not count the project as deleted,
+  and the request fails: REST answers 500 and MCP `delete_project` an error, which say that the
+  server could not delete the project from storage and why (when nothing was deleted:
+  `storage did not finish this project's earlier reads and writes within 5 s`, or
+  `storage has not finished a read of this project that a request stopped waiting for after 5 s`
+  when the deletion did not wait because such a read went on), that nothing was deleted or that
+  storage may still hold all or part of it, that the project stays open on this server for its
+  editors and agents (when it is loaded), and to delete it again. With storage that accepts
+  connections and does not answer, a deletion fails after 5 s (its waits; at once while such a read
+  goes on) or after 30 s (its own request: the DELETE or, for a project the server has not loaded,
+  the read of its `project.json`). A new connection to a project it deleted, or whose room it closed
+  after finding the project deleted from storage, the server accepts and closes at once with code
+  4404 (browsers cannot read the status of a refused WebSocket upgrade: they took HTTP 410 for a
+  lost network and connected again and again). A browser whose connection is closed with that code
+  says that the project was deleted on the server, shows `Deleted on server` in the status bar (sync
+  status `deleted`, a red dot; the tooltip says what the browser does with the project), and no
+  longer connects to the server for that project by itself; it keeps its copy and its edits, in
+  IndexedDB and in its other tabs, and syncs with WebDAV by the rules above. Reloading the page, or
+  Save (Ctrl+S), connects again; while the server has the project deleted it closes that connection
+  the same way, and the page says nothing more (a reload says it once again). It says so again for a
+  new deletion, after a room of the server took one of its connections (the server held the project
+  again).
 - With WebDAV through the server (`WEBDAV_URL`, the `/dav` proxy), WebDAV is the server's
   storage: a browser says once that the project was deleted, whether the server's connection or a
   WebDAV sync tells it first, and the server's message says that a change or Save stores the
@@ -214,11 +259,20 @@ Limits: a browser that connects to a server more than an hour after the deletion
 server that has no room for the project, or one restarted since) uploads its copy over the sync
 connection, and the server stores it as a new project: it cannot tell such a copy from a project
 created offline. A browser with no record of syncing a project (a private window, blocked storage,
-or a project it last synced with an earlier version) treats it as never synced. The records stay
-in localStorage after a project is deleted. nginx with `create_full_put_path on` creates missing
+or a project it last synced with an earlier version) treats it as never synced. The records stay in
+localStorage after a project is deleted. nginx with `create_full_put_path on` creates missing
 folders on PUT itself: a deletion between a save's document and its `project.json` leaves that
-`project.json`. Servers list such a project under the name in its `project.json` and open it with
-an empty scene of that name; its first change stores a document again.
+`project.json`. Servers list such a project under the name in its `project.json` and open it with an
+empty scene; its first change stores a document again. The server writes no name into that scene's
+document (a name the server wrote would be a new write of the name, and a browser that renamed the
+project in its copy of the full document could lose its rename when the two copies merge, as Yjs
+resolves two concurrent writes of one key by client id): agents, and editors wherever they show the
+project's name (the title, the Scene tab, the names of rendered and exported files, messages,
+project lists), see the name in `project.json` instead, saves keep it there, and the document gets a
+name when someone renames the project. Browsers get that name from the server after their first sync
+with it (`GET /api/projects/<id>`), or from WebDAV (they read `project.json` once: before a sync
+that can write it, or after a sync that leaves the document without a name); until then they show
+`Untitled`.
 
 ## Real-time sync
 

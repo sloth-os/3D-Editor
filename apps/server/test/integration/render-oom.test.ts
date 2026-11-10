@@ -74,12 +74,15 @@ describe('server render out of memory', () => {
     expect(checks).toBeGreaterThan(0);
     const res = await render;
     expect(res.isError).toBe(true);
+    // the message, then the code as JSON on the next line
     expect(res.content[0].text).toBe(
-      'Rendering failed: the render process ran out of memory (its JavaScript heap is limited to 128 MB); ' +
-        'the server keeps running and starts a new render process for the next render. The scene needs more ' +
-        'memory than a server render has: render fewer triangles (hide large meshes from renders with ' +
-        'hide_render, lower the render levels of Subdivision Surface modifiers, fewer particle instances), or ' +
-        "render in a browser editor that has the project open (renderer 'browser').",
+      'Rendering failed: out of memory: the render process ran out of its 128 MB JavaScript heap; the server ' +
+        'keeps running and starts a new render process for the next render. The scene needs more memory than a ' +
+        'server render has. A server render loads and evaluates every mesh of the scene with its modifiers at ' +
+        'their render settings, also meshes hidden from renders (hide_render): lower the render levels ' +
+        '(render_levels) of Subdivision Surface modifiers or the number of particle instances, delete meshes the ' +
+        "project no longer needs, or render in a browser editor that has the project open (renderer 'browser').\n" +
+        JSON.stringify({ code: 'OUT_OF_MEMORY' }, null, 2),
     );
     expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
     // a new render process renders the next scene
@@ -93,5 +96,41 @@ describe('server render out of memory', () => {
       engine: 'RASTER',
       threads: 1,
     });
+  });
+
+  it('answers an export that runs out of memory with what an export can lower, and so does the REST API', async () => {
+    const { id } = await ok('create_project', { name: 'Huge export', empty: true });
+    await ok('run_operator', {
+      project: id,
+      operator: 'mesh.primitive_grid_add',
+      params: { x_subdivisions: 700, y_subdivisions: 700, size: 2 },
+    });
+    const replaced = 'the server keeps running and starts a new render process for the next render';
+    const res = await call('export_scene', { project: id, format: 'glb' });
+    expect(res.isError).toBe(true);
+    const [message, ...json] = res.content[0].text!.split('\n');
+    expect(message).toMatch(/^Export failed: out of memory: the render process /);
+    expect(message).toContain(
+      `${replaced}. The export needs more memory than a render process has. An export loads and evaluates ` +
+        'every mesh of the scene with its modifiers at their render settings, whichever objects it writes and ' +
+        'also with apply_modifiers: false: lower the render levels (render_levels) of Subdivision Surface ' +
+        'modifiers or delete meshes the project no longer needs. Writing the file needs memory too, less with ' +
+        "fewer objects (objects), base meshes (apply_modifiers: false), fewer particle instances or format 'glb'.",
+    );
+    expect(JSON.parse(json.join('\n'))).toEqual({ code: 'OUT_OF_MEMORY' });
+    // REST: 507 with the message and a code, for the render and the export
+    const png = await fetch(`${server.url}/api/projects/${id}/render.png?width=320&height=180&shading=SOLID`);
+    expect(png.status).toBe(507);
+    expect(await png.json()).toEqual({
+      error: `render failed: out of memory: the render process ran out of its 128 MB JavaScript heap; ${replaced}`,
+      code: 'OUT_OF_MEMORY',
+    });
+    const glb = await fetch(`${server.url}/api/projects/${id}/export?format=glb`);
+    expect(glb.status).toBe(507);
+    expect(await glb.json()).toMatchObject({
+      error: expect.stringMatching(/^export failed: out of memory: the render process /),
+      code: 'OUT_OF_MEMORY',
+    });
+    expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
   });
 });

@@ -32,10 +32,11 @@ export const MAX_RENDER_FRAMES = 1000;
  * How long render_image waits for a RASTER image of a browser editor with renderer 'browser' (ms):
  * an editor without GPU acceleration (software WebGL, e.g. a headless browser) takes tens of
  * seconds for a heavy scene. Measured in headless Chromium with SwiftShader at the default 800×450
- * on a calm machine with 4 CPUs (editor-costs.ts BROWSER_RASTER_SECONDS): the first image of a
- * 71-material scene took 22.8–23.3 s, as it built and compiled the materials, and the next ones
- * 3.5–4.1 s; images of 4 million triangles took 2.1–8.1 s; on a busy machine up to 4.6 times as
- * long. Under the 60 s default request timeout of MCP clients (see {@link MAX_EDITOR_WAIT_MS}).
+ * on a calm machine with 4 CPUs (editor-costs.ts BROWSER_RASTER_SECONDS, which says how its ranges
+ * were made): the first image of a 71-material scene, as it built and compiled the materials, took
+ * the longest, the next ones less, and images of 4 million triangles a few seconds; on a busy
+ * machine up to BUSY_FACTOR times as long. Under the 60 s default request timeout of MCP clients
+ * (see {@link MAX_EDITOR_WAIT_MS}).
  */
 export const BROWSER_RASTER_TIMEOUT_MS = MAX_EDITOR_WAIT_MS;
 /**
@@ -51,14 +52,64 @@ export const BROWSER_PATHTRACE_EXTRA_MS = 30_000;
  */
 export const SLOW_EDITOR_RETRY_MS = 120_000;
 
+const n = (v: number): string => Math.round(v).toLocaleString('en-US');
+
+/** RASTER images render_image asked of each browser editor: when, and how many pixels. */
+const rasterRequests = new WeakMap<SyncConnection, { sentAt: number; pixels: number }[]>();
+/** Requests remembered per editor (the last ones). */
+const RASTER_REQUESTS_KEPT = 16;
+/** How far apart the noted time of a request and the time the room recorded for it may be (ms). */
+const SENT_AT_SLACK_MS = 1000;
+
+/**
+ * Notes the size of a RASTER image render_image is about to ask `conn` for, so that
+ * {@link slowBrowserRaster} can scale the time of a slow image to the size of the next one.
+ */
+export function noteBrowserRaster(
+  conn: SyncConnection,
+  width: number,
+  height: number,
+  now = Date.now(),
+): void {
+  let list = rasterRequests.get(conn);
+  if (!list) rasterRequests.set(conn, (list = []));
+  list.push({ sentAt: now, pixels: Math.max(1, width * height) });
+  if (list.length > RASTER_REQUESTS_KEPT) list.shift();
+}
+
+/** The pixels of the RASTER image `conn` was asked for at `sentAt` (null when it was not noted). */
+function notedPixels(conn: SyncConnection, sentAt: number): number | null {
+  let best: { sentAt: number; pixels: number } | null = null;
+  for (const r of rasterRequests.get(conn) ?? [])
+    if (
+      Math.abs(r.sentAt - sentAt) <= SENT_AT_SLACK_MS &&
+      (!best || Math.abs(r.sentAt - sentAt) < Math.abs(best.sentAt - sentAt))
+    )
+      best = r;
+  return best?.pixels ?? null;
+}
+
+/**
+ * Shortest time of an editor's RASTER image that render_image scales up to a larger image (ms): a
+ * third of what 'auto' waits. Shorter images are mostly fixed costs (uploading the scene, compiling
+ * its materials, reading the image back), which a larger image does not multiply.
+ */
+export const SCALE_UP_MIN_MS = AUTO_BROWSER_RASTER_TIMEOUT_MS / 3;
+
 /**
  * Whether renderer 'auto' should render on the server instead of asking `conn` for a RASTER image
- * with this `shading`: the editor's last such image came after the server had stopped waiting, or
- * took longer than 'auto' waits ({@link AUTO_BROWSER_RASTER_TIMEOUT_MS}), less than
- * {@link SLOW_EDITOR_RETRY_MS} ago, so that 'auto' does not wait 15 s in vain for each render of an
- * editor that stays that slow: in software WebGL a RASTER image can take longer than 'auto' waits
- * (the first image of a 71-material scene, see {@link BROWSER_RASTER_TIMEOUT_MS}). A faster answer
- * (renderer 'browser' waits longer) clears it.
+ * of `pixels` pixels with this `shading`, because the editor's last such image, less than
+ * {@link SLOW_EDITOR_RETRY_MS} ago, says that this one would take longer than 'auto' waits
+ * ({@link AUTO_BROWSER_RASTER_TIMEOUT_MS}), so that 'auto' does not wait 15 s in vain for each
+ * render of an editor that is that slow: in software WebGL a RASTER image can take longer than
+ * 'auto' waits (the first image of a 71-material scene, see {@link BROWSER_RASTER_TIMEOUT_MS}).
+ * The editor is too slow when its last image came after the server had stopped waiting, or took
+ * longer than 'auto' waits; its time is scaled to the size of this image (time per pixel;
+ * render_image notes the size of the images it asks for, see {@link noteBrowserRaster}) when this
+ * one is smaller: a 2048×2048 image that took 32 s does not keep a 1280×720 one, which would take
+ * about 7 s, from the editor. A faster last image that took {@link SCALE_UP_MIN_MS} or longer is
+ * scaled up the same way to a larger one: a 1280×720 image of 12.5 s makes a 1920×1080 one about
+ * 28 s. A faster answer for an image as large (renderer 'browser' waits longer) clears it.
  * Returns why, as a clause after "the browser editor", or null.
  */
 export function slowBrowserRaster(
@@ -66,6 +117,7 @@ export function slowBrowserRaster(
   conn: SyncConnection,
   shading: 'SOLID' | 'MATERIAL' | undefined,
   now = Date.now(),
+  pixels?: number,
 ): string | null {
   // without a shading (or with MATERIAL) the editor draws materials and lights; SOLID is separate
   const shadings = shading === 'SOLID' ? ['SOLID'] : [undefined, 'MATERIAL'];
@@ -73,9 +125,27 @@ export function slowBrowserRaster(
     .map((s) => room.lastAnswer(conn, { method: 'render', engine: 'RASTER', shading: s }))
     .filter((x): x is RpcAnswer => !!x)
     .sort((a, b) => b.sentAt - a.sentAt)[0];
-  if (!last || !(last.late || last.tookMs > AUTO_BROWSER_RASTER_TIMEOUT_MS)) return null;
+  if (!last) return null;
   if (now - (last.sentAt + last.tookMs) >= SLOW_EDITOR_RETRY_MS) return null;
+  const slow = last.late || last.tookMs > AUTO_BROWSER_RASTER_TIMEOUT_MS;
+  const lastPixels = notedPixels(conn, last.sentAt);
   const seconds = Math.round(last.tookMs / 1000);
+  // the time of the last image scaled to the size of this one: a smaller image after a slow one
+  // (one as large or larger takes at least as long), a larger one after a fast one that took long
+  // enough not to be mostly fixed costs
+  if (
+    pixels !== undefined &&
+    lastPixels !== null &&
+    (slow ? pixels < lastPixels : pixels > lastPixels && last.tookMs >= SCALE_UP_MIN_MS)
+  ) {
+    const expected = (last.tookMs * pixels) / lastPixels;
+    if (expected <= AUTO_BROWSER_RASTER_TIMEOUT_MS) return null;
+    return (
+      `needed ${seconds} s for its last RASTER image (${n(lastPixels)} pixels), about ${Math.round(expected / 1000)} s ` +
+      `for this image's ${n(pixels)} pixels, longer than renderer 'auto' waits (${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s)`
+    );
+  }
+  if (!slow) return null;
   return last.late
     ? `answered its last RASTER image after ${seconds} s, when the server had stopped waiting for it`
     : `needed ${seconds} s for its last RASTER image, longer than renderer 'auto' waits (${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s)`;
@@ -116,9 +186,10 @@ export interface BrowserRender {
  * the earlier request the editor was still busy with.
  */
 export function browserRenderFailure(err: unknown, r: BrowserRender): { reason: string; advice: string } {
+  // the editor's message may end a sentence: the error puts '. ' and the advice after the reason
   if (!(err instanceof RpcError && err.code === 'TIMEOUT'))
     return {
-      reason: `browser render failed: ${errorMessage(err)}`,
+      reason: `browser render failed: ${errorMessage(err).replace(/[.\s]+$/, '')}`,
       advice: "Use renderer 'software' to render on the server.",
     };
   const seconds = Math.round(r.timeoutMs / 1000);
@@ -181,6 +252,21 @@ export const samplesArg = z
       "image ignores it (WebGL: 8 samples, or the GPU's maximum: 4 in software WebGL; where the viewport drew that " +
       'shading only without multisampling, or has not drawn it while its multisampling is off: 5 pictures averaged ' +
       'when the first took at most 1 s, else SMAA)',
+  );
+
+/**
+ * `samples` of render_animation, which renders on the server only: what a browser editor does with
+ * `samples` (samplesArg) does not apply.
+ */
+export const animationSamplesArg = z
+  .number()
+  .int()
+  .min(1)
+  .max(4096)
+  .optional()
+  .describe(
+    'PATHTRACER: samples per pixel of each frame (default: the render settings samples, 64; keep it small for ' +
+      "many frames). RASTER: anti-aliasing supersampling 1, 2 or 4 (default 2) of the server's rasterizer",
   );
 
 /** `max_bounces` argument (path tracer). */
@@ -286,27 +372,70 @@ export function animationFrameSize(
 }
 
 /**
- * What to do when a render needed more memory than the server gives it (a RenderOutOfMemoryError:
- * its render process ran out of memory, or single-thread mode refused it).
+ * What a server render evaluates, whatever it shows: core SceneEvaluator.evaluate(frame, {forRender})
+ * evaluates every mesh, curve and text object, hidden from renders or not (hide_render only leaves
+ * it out of the image), with the render settings of its modifiers (SUBSURF render_levels).
+ */
+const SERVER_RENDER_EVALUATES =
+  'A server render loads and evaluates every mesh of the scene with its modifiers at their render ' +
+  'settings, also meshes hidden from renders (hide_render): lower the render levels (render_levels) of ' +
+  'Subdivision Surface modifiers or the number of particle instances, delete meshes the project no ' +
+  'longer needs';
+
+/**
+ * What to do when a render_image render needed more memory than the server gives it (a
+ * RenderOutOfMemoryError: its render process ran out of memory, or single-thread mode refused it).
  */
 export const OUT_OF_MEMORY_ADVICE =
-  'The scene needs more memory than a server render has: render fewer triangles (hide large meshes ' +
-  'from renders with hide_render, lower the render levels of Subdivision Surface modifiers, fewer ' +
-  "particle instances), or render in a browser editor that has the project open (renderer 'browser').";
+  `The scene needs more memory than a server render has. ${SERVER_RENDER_EVALUATES}, or render in a ` +
+  "browser editor that has the project open (renderer 'browser').";
+
+/** The same for render_animation, which renders on the server only. */
+export const ANIMATION_OUT_OF_MEMORY_ADVICE =
+  `The scene needs more memory than a server render has. ${SERVER_RENDER_EVALUATES}, or render its ` +
+  "frames one by one with render_image {frame, renderer: 'browser'} in a browser editor that has the " +
+  'project open.';
+
+/**
+ * The same for export_scene (and the REST export), which exports in a render process. Every export
+ * evaluates the whole scene at render settings before it picks what to write (core collectExport),
+ * so `objects` and apply_modifiers: false lower only the memory of writing the file; OBJ, STL and
+ * PLY write a copy of each instance and took more memory than GLB.
+ */
+export const EXPORT_OUT_OF_MEMORY_ADVICE =
+  'The export needs more memory than a render process has. An export loads and evaluates every mesh of ' +
+  'the scene with its modifiers at their render settings, whichever objects it writes and also with ' +
+  'apply_modifiers: false: lower the render levels (render_levels) of Subdivision Surface modifiers or ' +
+  'delete meshes the project no longer needs. Writing the file needs memory too, less with fewer ' +
+  "objects (objects), base meshes (apply_modifiers: false), fewer particle instances or format 'glb'.";
+
+/** The advice of each tool's out-of-memory error, by the `what` it starts with. */
+const OUT_OF_MEMORY_ADVICE_BY_TOOL: Readonly<Record<string, string>> = {
+  Rendering: OUT_OF_MEMORY_ADVICE,
+  'Rendering the animation': ANIMATION_OUT_OF_MEMORY_ADVICE,
+  Export: EXPORT_OUT_OF_MEMORY_ADVICE,
+};
 
 /**
  * Converts render failures to tool errors with a useful message. A render that ran out of memory
- * (code FAILED) says so, that the server keeps running, and what to do instead.
+ * says so with a stable start, "<what> failed: out of memory: …", that the server keeps running and
+ * what to do instead (the advice of the tool, see OUT_OF_MEMORY_ADVICE_BY_TOOL), with code
+ * OUT_OF_MEMORY (the tools print it as JSON on the next line). One that only shared its render
+ * process with the render that ran it out of memory starts "<what> failed: interrupted: …" and says
+ * it can run again.
  */
-export function renderToolError(err: unknown, what = 'Rendering'): ToolError {
+export function renderToolError(
+  err: unknown,
+  what = 'Rendering',
+  advice = OUT_OF_MEMORY_ADVICE_BY_TOOL[what] ?? OUT_OF_MEMORY_ADVICE,
+): ToolError {
   if (err instanceof ToolError) return err;
   if (err instanceof RenderRequestError) return new ToolError(err.message);
   if (isCancelled(err)) return new ToolError(`${what} was cancelled.`);
   // another render that shared the render process ran it out of memory: this one can run again
   if (isOutOfMemory(err) && err.reason === 'shared')
     return new ToolError(`${what} failed: ${err.message}.`, 'FAILED');
-  if (isOutOfMemory(err))
-    return new ToolError(`${what} failed: ${err.message}. ${OUT_OF_MEMORY_ADVICE}`, 'FAILED');
+  if (isOutOfMemory(err)) return new ToolError(`${what} failed: ${err.message}. ${advice}`, 'OUT_OF_MEMORY');
   if (isNotImplemented(err))
     return new ToolError(`${what} is not available in this build (${errorMessage(err)}).`);
   return new ToolError(`${what} failed: ${errorMessage(err)}`);

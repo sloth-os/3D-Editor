@@ -4,8 +4,12 @@ import {
   FrameState,
   SceneDoc,
   createEditorState,
+  createConstraint,
   createFCurve,
   createOperatorRegistry,
+  defaultSpline,
+  defaultSplinePoint,
+  evaluateScene,
   fcurveKey,
   insertKeyframe,
   type EditorState,
@@ -263,6 +267,34 @@ describe('the modal preview draws the matrices the scene evaluates after confirm
     expectSame(preview, after, new Map([[id, 'A']]));
   });
 
+  it('a rigid body mid-simulation moves on from where the simulation shows it; cancelling changes nothing', () => {
+    // Blender reads the location and rotation from the simulated matrix (ObjectToTransData) and
+    // restores the channels on cancel (BKE_rigidbody_aftertrans_update)
+    const t = setup();
+    t.run('mesh.primitive_plane_add', { size: 20 });
+    t.run('rigidbody.object_add', { type: 'PASSIVE' });
+    t.run('mesh.primitive_cube_add', { location: [0, 0, 5], rotation: [0.3, 0, 0] });
+    const id = t.state.activeId!;
+    t.run('rigidbody.object_add', { type: 'ACTIVE' });
+    t.state.frame = 30;
+    const shown = evaluateScene(t.doc, 30).byId.get(id)!.worldMatrix;
+    expect(Math.abs(shown[14] - 1)).toBeLessThan(1e-2);
+    const before = JSON.stringify(t.doc.toSnapshot());
+    const cancelled = t.start('translate');
+    t.type(cancelled, 'X1');
+    const moved = [shown[12] + 1, shown[13], shown[14]];
+    expect(maxDiff(t.engine.overrides!.get(id)!, [...shown.slice(0, 12), ...moved, 1])).toBeLessThan(1e-12);
+    expect(cancelled.finish(false)).toBe(null);
+    expect(t.engine.overrides).toBe(null);
+    expect(JSON.stringify(t.doc.toSnapshot())).toBe(before);
+    const m = t.start('translate');
+    t.type(m, 'X1');
+    const { preview, after } = t.confirm(m);
+    // the channels hold where it was put (the simulation then starts from there)
+    expectSame(preview, after, new Map([[id, 'Cube']]));
+    expect(maxDiff(t.doc.getObject(id)!.location, moved)).toBeLessThan(1e-12);
+  });
+
   it('Ctrl increments and typed values preview what the operator then stores', () => {
     const t = setup();
     const id = t.doc.addObject({
@@ -483,6 +515,62 @@ describe('the modal preview draws the matrices the scene evaluates after confirm
     expect(maxDiff(after.get(c)!.slice(12, 15), [0, 3, 0])).toBeLessThan(1e-12);
   });
 
+  it('G of a Follow Path follower moves it with the pointer: the offset goes through the path’s space', () => {
+    const t = setup();
+    const data = t.doc.addCurve({
+      splines: [
+        { ...defaultSpline('POLY'), points: [defaultSplinePoint([0, 0, 0]), defaultSplinePoint([10, 0, 0])] },
+      ],
+    });
+    const path = t.doc.addObject({ type: 'CURVE', name: 'Path', data, rotation_euler: [0, 0, 90 * deg] });
+    const id = t.doc.addObject({ type: 'EMPTY', name: 'F' });
+    t.doc.updateObject(id, { constraints: [createConstraint('FOLLOW_PATH', { target: path })] });
+    const before = new FrameState(t.doc, t.state.frame).world(id)!;
+    t.state.selectedIds = [id];
+    t.state.activeId = id;
+    const m = t.start('translate');
+    t.type(m, 'X1');
+    expect(
+      maxDiff(t.engine.overrides!.get(id)!.slice(12, 15), [before[12] + 1, before[13], before[14]]),
+    ).toBeLessThan(1e-12);
+    const { preview, after } = t.confirm(m);
+    expectSame(preview, after, new Map([[id, 'F']]));
+    expect(maxDiff(t.doc.getObject(id)!.location, [0, -1, 0])).toBeLessThan(1e-12);
+  });
+
+  it('G and S of an object with Copy Transforms mixed Before Split read it without the constraint', () => {
+    const t = setup();
+    const target = t.doc.addObject({
+      type: 'EMPTY',
+      name: 'T',
+      location: [2, 0, 0],
+      rotation_euler: [0, 0, 90 * deg],
+    });
+    const id = t.doc.addObject({ type: 'EMPTY', name: 'A', location: [1, 0, 0] });
+    t.doc.updateObject(id, {
+      constraints: [createConstraint('COPY_TRANSFORMS', { target, params: { mix_mode: 'BEFORE_SPLIT' } })],
+    });
+    t.state.selectedIds = [id];
+    t.state.activeId = id;
+    const before = new FrameState(t.doc, t.state.frame).world(id)!;
+    const g = t.start('translate');
+    t.type(g, 'X1');
+    expect(
+      maxDiff(t.engine.overrides!.get(id)!.slice(12, 15), [before[12] + 1, before[13], before[14]]),
+    ).toBeLessThan(1e-12);
+    const moved = t.confirm(g);
+    expectSame(moved.preview, moved.after, new Map([[id, 'A']]));
+    expect(t.doc.getObject(id)!.location).toEqual([2, 0, 0]);
+    // S 2 about the 3D cursor at the origin: the origin read without the constraint, (2, 0, 0)
+    t.state.pivotPoint = 'CURSOR';
+    t.state.cursorLocation = [0, 0, 0];
+    const s = t.start('resize');
+    t.type(s, '2');
+    const { preview, after } = t.confirm(s);
+    expectSame(preview, after, new Map([[id, 'A']]));
+    expect(maxDiff(t.doc.getObject(id)!.location, [4, 0, 0])).toBeLessThan(1e-12);
+  });
+
   it('S of an object with Copy Transforms mixed Before scales about its origin as Blender reads it for Scale', () => {
     // Blender switches the constraint off for Scale (constraints_list_needinv), so the pivot is the
     // origin without it; for Move it is part of the space and the origin where it is shown
@@ -514,6 +602,64 @@ describe('the modal preview draws the matrices the scene evaluates after confirm
     expect(maxDiff(after.get(other)!.slice(12, 15), [5, 0, 0])).toBeLessThan(1e-12);
   });
 
+  it('R about the view axis previews exactly what confirming stores', () => {
+    // transform.rotate normalizes the axis it is given again, which changes the last bits of this
+    // view's axis: the preview builds its rotation the same way, so not one bit differs
+    const t = setup();
+    t.engine.camera.position.set(4, -6, 7);
+    t.engine.camera.lookAt(0, 0, 0);
+    t.engine.camera.updateMatrixWorld(true);
+    const parent = t.doc.addObject({
+      type: 'EMPTY',
+      name: 'P',
+      location: [1, 2, 0.5],
+      rotation_euler: [0.4, 0.1, 0.9],
+    });
+    const child = t.doc.addObject({ type: 'EMPTY', name: 'C', location: [0.5, 0, 1], parent });
+    t.state.selectedIds = [parent];
+    t.state.activeId = parent;
+    const m = t.start('rotate');
+    t.type(m, '30');
+    const { preview, after } = t.confirm(m);
+    expect([...preview.keys()].sort()).toEqual([parent, child].sort());
+    for (const [id, w] of preview) expect(w).toEqual(after.get(id));
+  });
+
+  it('with auto keying, previews the values confirming keys, which a driver loop reads', () => {
+    // X's X scale is driven through a loop that reads its value before the driver (stored 1):
+    // 0.1 · that + 1 = 1.1; auto keying keys the scale too, with the 1.1 it shows, so afterwards the
+    // loop reads 1.1 and gives 1.11
+    const t = setup();
+    const x = t.doc.addObject({ type: 'EMPTY', name: 'X' });
+    const material = t.doc.addMaterial({ name: 'Mat' });
+    t.doc.setDriver({
+      target_type: 'object',
+      target_id: x,
+      path: 'scale',
+      index: 0,
+      expression: 'v * 0.5 + 1',
+      variables: [{ name: 'v', target_type: 'material', target_id: material, path: 'roughness', index: 0 }],
+      mute: false,
+    });
+    t.doc.setDriver({
+      target_type: 'material',
+      target_id: material,
+      path: 'roughness',
+      index: 0,
+      expression: 'v * 0.2',
+      variables: [{ name: 'v', target_type: 'object', target_id: x, path: 'scale', index: 0 }],
+      mute: false,
+    });
+    t.state.autoKeying = true;
+    t.state.selectedIds = [x];
+    t.state.activeId = x;
+    const m = t.start('translate');
+    t.type(m, 'X1');
+    const { preview, after } = t.confirm(m);
+    expect(after.get(x)![0]).toBeCloseTo(1.11, 12);
+    expect(preview.get(x)).toEqual(after.get(x));
+  });
+
   it('is cheap per pointer move with hundreds of selected objects', () => {
     // 300 selected objects, each with a child: the matrices of 600 objects per move
     const t = setup();
@@ -529,6 +675,17 @@ describe('the modal preview draws the matrices the scene evaluates after confirm
       t.doc.addObject({ type: 'EMPTY', name: `C${i}`, location: [0, 0, 1], parent: id });
       ids.push(id);
     }
+    // the baseline, measured here: what evaluating every object of the scene once costs, from the
+    // document read once (as a transform reads it); the median of ten runs after three warm-ups
+    const read = new FrameState(t.doc, t.state.frame);
+    const runs: number[] = [];
+    for (let k = 0; k < 13; k++) {
+      const t0 = performance.now();
+      const fs = new FrameState(t.doc, t.state.frame, null, { base: read });
+      for (const o of fs.objects) fs.world(o.id);
+      runs.push(performance.now() - t0);
+    }
+    const scene = runs.slice(3).sort((x, y) => x - y)[5];
     t.state.selectedIds = ids;
     t.state.activeId = ids[0];
     const m = t.start('rotate');
@@ -537,9 +694,72 @@ describe('the modal preview draws the matrices the scene evaluates after confirm
     for (let k = 0; k < moves; k++) m.update({ x: 420 + k, y: 280 + k / 2 }, { ctrl: false, shift: false });
     const perMove = (performance.now() - t0) / moves;
     expect(t.engine.overrides!.size).toBe(600);
-    // measured 2.1–3.4 ms per move in plain runs (five runs) and 3.3–4.1 ms under coverage (three
-    // runs); the bound is one frame at 60 Hz
-    expect(perMove).toBeLessThan(16);
+    // about one evaluation of the scene per move: measured 0.87–1.13 times the scene's evaluation in
+    // plain runs and 0.93–1.17 under coverage (five runs each; 2.8–5.3 ms per move)
+    expect(perMove).toBeLessThan(scene * 4);
     m.finish(false);
+  });
+
+  it('stays cheap in a scene with a dependency cycle, unless the moved objects touch the cycle', () => {
+    // 300 objects, each with a child, and two objects whose Copy Location constraints read each other
+    const t = setup();
+    const ids: string[] = [];
+    for (let i = 0; i < 300; i++) {
+      const id = t.doc.addObject({ type: 'EMPTY', name: `E${i}`, location: [i % 20, Math.floor(i / 20), 0] });
+      t.doc.addObject({ type: 'EMPTY', name: `C${i}`, location: [0, 0, 1], parent: id });
+      ids.push(id);
+    }
+    const a = t.doc.addObject({ type: 'EMPTY', name: 'CycA', location: [0, 0, 5] });
+    const b = t.doc.addObject({ type: 'EMPTY', name: 'CycB', location: [1, 0, 5] });
+    t.doc.updateObject(a, {
+      constraints: [createConstraint('COPY_LOCATION', { target: b, influence: 0.5 })],
+    });
+    t.doc.updateObject(b, {
+      constraints: [createConstraint('COPY_LOCATION', { target: a, influence: 0.5 })],
+    });
+    const perMove = (m: ModalTransform) => {
+      const moves = 20;
+      const t0 = performance.now();
+      for (let k = 0; k < moves; k++) m.update({ x: 420 + k, y: 280 + k / 2 }, { ctrl: false, shift: false });
+      return (performance.now() - t0) / moves;
+    };
+    // the baseline, measured here: what evaluating every object of the scene once costs, from the
+    // document read once (as a transform reads it)
+    const read = new FrameState(t.doc, t.state.frame);
+    const evaluate = () => {
+      const fs = new FrameState(t.doc, t.state.frame, null, { base: read });
+      for (const o of fs.objects) fs.world(o.id);
+    };
+    const runs: number[] = [];
+    for (let k = 0; k < 13; k++) {
+      const t0 = performance.now();
+      evaluate();
+      runs.push(performance.now() - t0);
+    }
+    // the median of the last ten runs (the first three warm up)
+    const scene = runs.slice(3).sort((x, y) => x - y)[5];
+    // the cycle does not touch the moved object: only it and its child are evaluated anew
+    t.state.selectedIds = [ids[0]];
+    t.state.activeId = ids[0];
+    const m = t.start('rotate');
+    const apart = perMove(m);
+    expect(t.engine.overrides!.size).toBe(2);
+    m.finish(false);
+    // measured 0.030–0.053 times the scene's evaluation per move in plain runs and 0.019–0.026
+    // under coverage (five runs each)
+    expect(apart).toBeLessThan(scene / 4);
+    // moving an object on the cycle evaluates the whole scene in the document's order, as the
+    // viewport does, so the preview shows what confirming shows
+    t.state.selectedIds = [a];
+    t.state.activeId = a;
+    const g = t.start('translate');
+    const onCycle = perMove(g);
+    t.type(g, 'X1');
+    const { preview, after } = t.confirm(g);
+    expectSame(preview, after, new Map([...preview.keys()].map((id) => [id, t.doc.getObject(id)!.name])));
+    expect(preview.has(b)).toBe(true);
+    // measured 0.66–0.96 times the scene's evaluation per move in plain runs and 0.74–1.08 under
+    // coverage (five runs each)
+    expect(onCycle).toBeLessThan(scene * 4);
   });
 });

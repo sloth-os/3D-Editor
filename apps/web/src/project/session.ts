@@ -10,6 +10,7 @@ import {
   selectionToJSON,
   type PresenceState,
   type ProjectInfo,
+  type ProjectMeta,
   type SelectionJSON,
 } from '@3d-editor/core';
 import { EditorStateSignals, ViewState } from '../editor/state';
@@ -18,12 +19,50 @@ import { WebDAVSync, resolveWebDAV, type SaveReport } from '../storage/webdav';
 import { localIndex, projectDbName } from './local-index';
 import { prefs } from '../app/prefs';
 import { serverConfig, toast } from '../app/store';
-import { wsUrl } from '../app/server-config';
+import { apiUrl, authHeaders, wsUrl } from '../app/server-config';
 import { telemetry } from '../telemetry/telemetry';
+
+/**
+ * What this browser does with a project the server deleted (SyncProvider status `deleted`), as the
+ * toast says it once (ProjectSession.tellWhenDeletedOnServer) and the status bar's tooltip while it
+ * lasts. `viaServer`: WebDAV through the server, which is the server's storage: a change or Save
+ * stores the project there again, and the server opens it again (ProjectSession.followServerStorage).
+ */
+export function deletedOnServerNote(viaServer: boolean): string {
+  return viaServer
+    ? 'This browser keeps its copy and stores it on the server again when you change it or save (Ctrl+S).'
+    : 'This browser keeps its copy and no longer syncs it with the server.';
+}
 
 export interface PeerInfo {
   clientId: number;
   state: PresenceState;
+}
+
+/**
+ * The scene of a session: while its document has no name, its name is the stored one
+ * (`storedName`, ProjectSession.storedName), wherever the editor reads it (the title, the Scene
+ * tab's Project name, the names of files it renders and exports, its messages, projectInfo). Like
+ * the server's rooms (Room.scene), it writes no name into the document for it: a new name item
+ * would be a concurrent write of the name, which a rename made elsewhere in a copy of the full
+ * document could lose to when the two merge (concurrent sets of one Y.Map key are resolved by client
+ * id). Reading the name in a component or a computed signal subscribes to the stored name.
+ */
+class SessionScene extends SceneDoc {
+  constructor(
+    ydoc: Y.Doc,
+    origin: object,
+    private readonly storedName: () => string | null,
+  ) {
+    super(ydoc, origin);
+  }
+
+  override getMeta(): ProjectMeta {
+    const meta = super.getMeta();
+    if (this.map('meta').has('name')) return meta;
+    const stored = this.storedName();
+    return stored ? { ...meta, name: stored } : meta;
+  }
 }
 
 /**
@@ -41,6 +80,15 @@ export class ProjectSession {
   readonly revision = signal(0);
   readonly undoRevision = signal(0);
   readonly peers = signal<PeerInfo[]>([]);
+  /**
+   * The project's name in storage (its project.json, as the server or WebDAV has it) while its
+   * document has no name: a project stored as a project.json without a document has an empty
+   * document without a name until someone gives it one (the server writes no name into it, and nor
+   * does this browser: a rename in a copy of the full document could lose to that write when they
+   * merge). It is the document's name meanwhile (see SessionScene), and saves keep it in
+   * project.json (projectInfo).
+   */
+  readonly storedName = signal<string | null>(null);
   readonly title = computed(() => {
     void this.revision.value;
     return this.doc.name;
@@ -60,7 +108,7 @@ export class ProjectSession {
   private deletionTold = false;
 
   private constructor(readonly id: string) {
-    this.doc = new SceneDoc(new Y.Doc(), { type: 'local' });
+    this.doc = new SessionScene(new Y.Doc(), { type: 'local' }, () => this.storedName.value);
     this.awareness = new Awareness(this.doc.ydoc);
     this.undo = new Y.UndoManager(this.doc.sharedTypes(), {
       trackedOrigins: new Set([this.doc.origin]),
@@ -113,6 +161,7 @@ export class ProjectSession {
       s.setupPresence();
       s.provider = new SyncProvider(id, s.doc.ydoc, s.awareness, null);
       s.tellWhenDeletedOnServer(s.provider);
+      s.askServerForStoredName(s.provider);
       s.attachRemotes();
       // If nothing exists locally yet (opening a remote project on a fresh device), wait briefly for
       // the server/WebDAV so the UI does not flash an empty scene. Only when one is attached: without
@@ -155,6 +204,11 @@ export class ProjectSession {
           this.storageOrigin,
         );
         this.webdav = webdav;
+        this.disposers.push(
+          webdav.storedName.subscribe((name) => {
+            if (name !== null) this.useStoredName(name);
+          }),
+        );
         if (target.viaServer) this.followServerStorage(webdav);
         // Do not block opening on the network; merge in the background.
         void webdav.syncNow();
@@ -180,9 +234,7 @@ export class ProjectSession {
         const viaServer = !!this.webdav?.target.viaServer;
         if (viaServer && this.webdav?.status.value === 'deleted') return;
         toast(
-          viaServer
-            ? `"${this.doc.name}" was deleted on the server. This browser keeps its copy and stores it on the server again when you change it or save (Ctrl+S).`
-            : `"${this.doc.name}" was deleted on the server. This browser keeps its copy and no longer syncs it with the server.`,
+          `"${this.title.value}" was deleted on the server. ${deletedOnServerNote(viaServer)}`,
           'warning',
           10_000,
         );
@@ -206,6 +258,45 @@ export class ProjectSession {
         if (this.provider?.status.value === 'deleted') this.provider.reconnect();
       }),
     );
+  }
+
+  /** Whether the document has a name of its own (see {@link storedName}). */
+  private named(): boolean {
+    return this.doc.map('meta').has('name');
+  }
+
+  /**
+   * Asks the server for the stored name of a project whose document has none (see
+   * {@link storedName}) once the first sync with it is complete: GET /api/projects/<id> lists it
+   * under the name in its project.json.
+   */
+  private askServerForStoredName(provider: SyncProvider): void {
+    this.disposers.push(
+      provider.synced.subscribe((synced) => {
+        if (synced && !this.named() && this.storedName.value === null) void this.fetchStoredName();
+      }),
+    );
+  }
+
+  private async fetchStoredName(): Promise<void> {
+    try {
+      const res = await fetch(apiUrl(`/api/projects/${encodeURIComponent(this.id)}`), {
+        headers: authHeaders(),
+        cache: 'no-store',
+      });
+      if (!res.ok) return;
+      const { name } = (await res.json()) as { name?: unknown };
+      if (typeof name === 'string') this.useStoredName(name);
+    } catch {
+      /* the server is not reachable: the title stays the document's */
+    }
+  }
+
+  /** Takes the stored name while the document has none (and the local project list with it). */
+  private useStoredName(name: string): void {
+    if (this.named() || this.storedName.value === name) return;
+    this.storedName.value = name;
+    this.scheduleIndexUpdate();
   }
 
   private waitForRemote(ms: number): Promise<void> {

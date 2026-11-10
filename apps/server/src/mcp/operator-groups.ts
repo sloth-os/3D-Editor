@@ -255,10 +255,11 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
     use: 'render_image',
     editor:
       "it opens the Render window on the person's screen and renders the scene there at once, at the output " +
-      "resolution, from the scene camera (else the editor's view; path traced on that computer's render " +
-      'workers when the render engine is PATHTRACER), without returning the image; with {animation: true} it ' +
-      'opens the Render Animation window instead, which renders nothing until the person presses its Render ' +
-      'button',
+      "resolution, from the scene camera (else the editor's view; with the render engine PATHTRACER path " +
+      "traced on that computer's render workers, as many as its tab's memory allows, and not started when " +
+      'it would not fit into that memory: the window says why), without returning the image; with ' +
+      '{animation: true} it opens the Render Animation window instead, which renders nothing until the ' +
+      'person presses its Render button',
   },
   'view3d.object_as_camera': {
     instead: 'To set the scene camera use set_active_camera.',
@@ -272,8 +273,9 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
       'To place a camera use transform_object (object.track_set aims it at a target); render_image takes a `view` {position, target} for any viewpoint without moving a camera.',
     use: 'transform_object on the camera',
     editor:
-      "it moves the scene camera to the editor's viewpoint (a step of the person's undo history) and switches " +
-      'that editor to the camera view, and fails without a scene camera',
+      "it moves the scene camera to the editor's viewpoint (a step of the person's undo history; under a parent " +
+      "in the parent's space as the scene shows it at the editor's frame, and an animated channel it changes is " +
+      'keyed there with its new value) and switches that editor to the camera view, and fails without a scene camera',
   },
   'screen.frame_offset': {
     instead: 'To set your own current frame use scene.frame_set {frame} (most tools also take a `frame`).',
@@ -339,8 +341,11 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
     instead: 'Saving is not needed: the server stores projects itself (get_project says where).',
     use: 'nothing (the server stores projects)',
     editor:
-      'it makes that editor sync its WebDAV copy at once if it has one (its copy in the browser is always up ' +
-      "to date) and shows the person a 'Saved' message",
+      'it makes that editor store its copy in WebDAV at once if it syncs with WebDAV (its copy in the browser is ' +
+      "always up to date) and shows the person what happened: 'Saved to WebDAV', 'Saved in this browser' (no " +
+      "WebDAV), 'Not saved to WebDAV (<reason>). The project is saved in this browser.', or that it syncs once " +
+      'back online; a project that the server or another device had deleted is stored there again (\'"<name>" ' +
+      "was deleted on the server; this browser stored it there again.')",
   },
   'view3d.view_all': {
     editor:

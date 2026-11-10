@@ -14,9 +14,10 @@ import { createPrimitive, type PrimitiveType } from '../mesh/primitives';
 import { buildTopology } from '../mesh/topology';
 import { faceNormal } from '../mesh/normals';
 import { selectAllElements, selectionFromVerts } from '../mesh/selection';
-import { SceneEvaluator } from '../eval/evaluate';
+import { SceneEvaluator, type EvaluatedScene } from '../eval/evaluate';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
+import { editModeMemoryRefusal } from './memory';
 import { defineOperator, type OperatorRegistry } from './registry';
 import {
   activeObject,
@@ -39,6 +40,7 @@ import {
   type ChannelChange,
 } from './transform';
 import { ARMATURE_PARENT_TYPES, armatureParentSet, remapDuplicatedReferences } from './armature';
+import { copyAnimation } from './anim';
 import {
   applyCurveTransform,
   checkCurveTransformApply,
@@ -142,6 +144,9 @@ export function enterEditMode(ctx: OperatorContext, id: string): void {
   const o = ctx.doc.getObject(id);
   if (!o || o.type !== 'MESH' || !o.data)
     throw new OperatorError('Edit Mode requires a mesh object', 'POLL_FAILED');
+  // the host's memory check (the server's process): selecting every element of a large mesh
+  const refused = editModeMemoryRefusal(ctx, o.data);
+  if (refused) throw new OperatorError(`Edit Mode on '${o.name}': ${refused}`, 'OUT_OF_MEMORY');
   const mesh = ctx.doc.getMesh(o.data)!;
   ctx.state.activeId = id;
   if (!ctx.state.selectedIds.includes(id)) ctx.state.selectedIds = [...ctx.state.selectedIds, id];
@@ -155,6 +160,46 @@ const fillType = z.enum(['NOTHING', 'NGON', 'TRIFAN']);
 export function evaluatedMesh(ctx: OperatorContext, id: string): MeshData | null {
   const ev = new SceneEvaluator(ctx.doc).evaluate(ctx.state.frame).byId.get(id);
   return ev?.mesh ?? null;
+}
+
+/**
+ * object.convert to MESH bakes the evaluated geometry and drops the modifier stack. Like Apply
+ * (object.modifier_apply; Blender's "Modifier is disabled or returned error, skipping apply"), the
+ * selected objects whose geometry did not evaluate fully are refused instead of being baked without
+ * what failed: a modifier error, a stored mesh that was not loaded, a curve or text without the
+ * surface it should have. Blender's Convert bakes whatever its evaluation shows, but there a
+ * modifier fails only where Blender itself shows the failure; here a modifier is also skipped over a
+ * limit of its own (Subdivision Surface results over 4,000,000 faces) or for the server's memory,
+ * which a browser editor evaluates and Blender computes, so baking without it would lose it.
+ */
+function refuseIncompleteGeometry(ctx: OperatorContext, ev: EvaluatedScene, target: string): void {
+  if (target !== 'MESH') return;
+  const problems: string[] = [];
+  // a stored mesh the host did not load (its evaluation error `mesh:<id>`) was refused for memory
+  let unloaded = false;
+  for (const o of selectedObjects(ctx)) {
+    const curve = o.type === 'CURVE' || o.type === 'FONT';
+    if (!curve && !(o.type === 'MESH' && o.modifiers.length)) continue;
+    const e = ev.byId.get(o.id);
+    const messages = (e?.modifierErrors ?? []).map(
+      (m) =>
+        `${m.modifierId === 'shape_keys' ? 'shape keys' : `modifier '${o.modifiers.find((x) => x.id === m.modifierId)?.name ?? m.modifierId}'`}: ${m.message}`,
+    );
+    // a curve problem leaves the object without geometry only when it has neither a surface nor a wire
+    const noGeometry = !e?.mesh && !e?.lines;
+    for (const err of ev.errors)
+      if (err.source === `mesh:${o.id}` || (err.source === `curve:${o.id}` && noGeometry)) {
+        messages.push(err.message);
+        if (err.source === `mesh:${o.id}`) unloaded = true;
+      }
+    if (messages.length) problems.push(`'${o.name}': ${messages.join('; ')}`);
+  }
+  if (problems.length)
+    throw new OperatorError(
+      `Cannot convert ${problems.join('; ')}. Nothing was converted: fix or remove what failed (lower what ` +
+        'was skipped for memory) and convert again',
+      unloaded ? 'OUT_OF_MEMORY' : 'FAILED',
+    );
 }
 
 function singleUserMesh(ctx: OperatorContext, o: ObjectData): string {
@@ -543,9 +588,14 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       id: 'object.duplicate',
       label: 'Duplicate Objects',
       description:
-        'Duplicate selected objects (linked=true shares mesh data like Alt+D). The copies become the selection. ' +
+        'Duplicate selected objects (linked=true shares the object data, a mesh, curve, armature, light or camera, ' +
+        'like Alt+D). The copies become the selection. ' +
         'References between duplicated objects (parents, modifier objects such as the Armature modifier, ' +
-        'constraint and bone constraint targets) point at the copies.',
+        'constraint and bone constraint targets, driver variables) point at the copies. As Blender does by ' +
+        'default, each copy gets its own copy of the animation (keyframes and drivers) of the object and, ' +
+        'unless linked, of its data (shape keys, curve, light and camera values); Blender shares the object ' +
+        'action between linked duplicates instead, where later key edits change both. `offset` moves the ' +
+        'copies as transform.translate does (keying as it keys).',
       category: 'Object',
       redoable: true,
       schema: z.object({ linked: z.boolean().default(false), offset: vec3.default([0, 0, 0]) }),
@@ -553,9 +603,22 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       execute(ctx, p) {
         const sel = selectedObjects(ctx);
         const map = new Map<string, string>();
+        // the datablocks copied (`<type>:<id>` as animation names them) and their copies' ids; data
+        // shared by several duplicated objects is copied once, as Blender does
+        const copies = new Map<string, string>();
+        const dataTypes: Partial<Record<ObjectType, string>> = {
+          MESH: 'mesh',
+          CURVE: 'curve',
+          FONT: 'curve',
+          LIGHT: 'light',
+          CAMERA: 'camera',
+          ARMATURE: 'armature',
+        };
         for (const o of sel) {
           let data = o.data;
-          if (o.data && !p.linked) {
+          const dataKey = `${dataTypes[o.type]}:${o.data}`;
+          if (o.data && !p.linked && copies.has(dataKey)) data = copies.get(dataKey)!;
+          else if (o.data && !p.linked) {
             if (o.type === 'MESH') {
               data = ctx.doc.addMesh(
                 ctx.doc.getMeshBlock(o.data)?.name ?? o.name,
@@ -578,6 +641,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
               const { id: _id, ...c } = ctx.doc.getCamera(o.data)!;
               data = ctx.doc.addCamera(c);
             }
+            if (data && data !== o.data) copies.set(dataKey, data);
           }
           const { id: _id, ...rest } = o;
           const nid = ctx.doc.addObject({
@@ -589,7 +653,10 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             })),
           });
           map.set(o.id, nid);
+          copies.set(`object:${o.id}`, nid);
         }
+        // the copies' own keyframes and drivers, drivers reading duplicated datablocks reading the copies
+        copyAnimation(ctx.doc, copies);
         // Re-link parents inside the duplicated set; offset only the roots.
         for (const [src, dst] of map) {
           const o = ctx.doc.getObject(src)!;
@@ -602,13 +669,17 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         if (p.offset.some((v) => v !== 0)) {
           const fs = new FrameState(ctx.doc, ctx.state.frame);
           const offset = translation4(p.offset as Vec3);
+          const changes = new Map<string, ChannelChange>();
           for (const id of transformRoots(ctx.doc, [...map.values()])) {
             const t = transformStart(fs, id, 'TRANSLATE');
             if (!t) continue;
             const next = transformedChannels(t.channels, t.basis, 'TRANSLATE', offset, [0, 0, 0]);
             const patch = changedChannels(t.channels, next, transformTolerance(t.basis));
             if (patch) ctx.doc.updateObject(id, patch);
+            changes.set(id, { before: t.channels, after: { ...t.channels, ...patch } });
           }
+          // a copied animated location keeps the offset (keyed as Move keys)
+          keyChannelChanges(ctx, changes);
         }
         const ids = [...map.values()];
         setSelection(ctx, ids, map.get(ctx.state.activeId ?? '') ?? ids[ids.length - 1] ?? null);
@@ -695,9 +766,13 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       id: 'object.transform_apply',
       label: 'Apply Transform',
       description:
-        "Apply the selected objects' location/rotation/scale to their mesh data (Ctrl+A). Curves transform " +
-        'their control points; 2D curves can only take rotations about Z and X/Y locations, text only a uniform ' +
-        'scale (the operator fails without changing anything otherwise).',
+        "Apply the selected objects' location/rotation/scale to their mesh data (Ctrl+A), as the objects show " +
+        'them at the current frame; children keep their places. Curves transform their control points; 2D ' +
+        'curves can only take rotations about Z and X/Y locations, text only a uniform scale (the operator ' +
+        'fails without changing anything otherwise). An animated channel it resets is keyed at the current ' +
+        'frame with its reset value, so nothing moves there; at other frames its keys go on moving, turning or ' +
+        'scaling the object on top of what the data now holds (Blender keeps the reset value without a key ' +
+        'until the frame changes, then its keys do the same).',
       category: 'Object',
       redoable: true,
       schema: z.object({
@@ -741,8 +816,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           const scl: Vec3 = p.scale ? [1, 1, 1] : cur.scale;
           // like Blender's Apply Object Transform, only the applied channels are reset; the others,
           // and channels whose stored values are at their reset values, are not written at all (an
-          // animated channel keeps its keys, which go on deciding what it shows, as in Blender once the
-          // frame changes)
+          // animated channel keeps its keys and is keyed with its reset value at the frame, below)
           const reset: Partial<ObjectData> = {};
           if (p.location && differs([0, 0, 0], o.location)) reset.location = [0, 0, 0];
           if (p.rotation && differs([0, 0, 0], o.rotation_euler)) reset.rotation_euler = [0, 0, 0];
@@ -786,6 +860,12 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             o.id,
             () => {
               if (Object.keys(reset).length) ctx.doc.updateObject(o.id, reset);
+              // an animated channel it resets is keyed with its reset value at the frame, where
+              // Blender keeps the reset value without a key until the frame changes (its Apply
+              // does not auto key)
+              const held = { location: cur.location, rotation_euler: cur.rotation_euler, scale: cur.scale };
+              const applied = { location: loc, rotation_euler: rot, scale: scl };
+              keyChannelChanges(ctx, new Map([[o.id, { before: held, after: applied }]]), undefined, false);
             },
             shown,
             changed,
@@ -801,7 +881,13 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       id: 'object.origin_set',
       label: 'Set Origin',
       description:
-        'Move the object origin (ORIGIN_GEOMETRY, ORIGIN_CURSOR) or the geometry (GEOMETRY_ORIGIN) without moving the visual result.',
+        'Move the object origin onto the centre of its geometry (ORIGIN_GEOMETRY) or onto the 3D cursor ' +
+        '(ORIGIN_CURSOR) without moving the geometry where it shows at the current frame, or move the geometry so ' +
+        'that its centre is on the origin (GEOMETRY_ORIGIN, which moves what is shown); children keep their places. ' +
+        'An animated location the origin move changes is keyed at the current frame with its new value, so the ' +
+        "geometry stays where it is there; the location's other keys do not change, so at those keyframes the " +
+        'geometry shows moved by the opposite of the origin move (Blender keeps the new value without a key until ' +
+        'the frame changes, and from then on shows the geometry moved so at every frame).',
       category: 'Object',
       schema: z.object({
         type: z.enum(['ORIGIN_GEOMETRY', 'ORIGIN_CURSOR', 'GEOMETRY_ORIGIN']).default('ORIGIN_GEOMETRY'),
@@ -1085,7 +1171,10 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         'curve and text objects become meshes (surface, or loose edges for plain wires) keeping name, transform and ' +
         'materials. CURVE: turns text objects into 2D curve objects of their glyph outlines. ' +
         'Returns {converted: [{object, name, type}]} listing every object that changed (mesh objects whose ' +
-        'modifiers were applied included).',
+        'modifiers were applied included). Like object.modifier_apply, objects whose geometry did not evaluate ' +
+        'fully (a modifier that failed or was skipped, a curve or text surface that was not built: the problems ' +
+        'of get_scene) are refused with those errors and nothing is converted, instead of baking the geometry ' +
+        'without them.',
       category: 'Object',
       schema: z.object({
         target: z.enum(['MESH', 'CURVE']).default('MESH').describe('Object type to convert to'),
@@ -1099,6 +1188,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       poll: (ctx) => (pollObjectMode(ctx) === true ? pollHasSelection(ctx) : pollObjectMode(ctx)),
       execute(ctx, p) {
         const ev = new SceneEvaluator(ctx.doc).evaluate(ctx.state.frame);
+        refuseIncompleteGeometry(ctx, ev, p.target);
         const converted: { object: string; name: string; type: string }[] = [];
         for (const o of selectedObjects(ctx)) {
           if (o.type === 'CURVE' || o.type === 'FONT') {

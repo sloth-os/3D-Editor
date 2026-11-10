@@ -25,6 +25,15 @@ export const MSG_CONTROL = 5;
 
 export const PROTOCOL_VERSION = 1;
 
+/**
+ * WebSocket close code of the sync connections of a project the editor server deleted (deleted
+ * there, or found deleted from storage by another writer), once storage deleted it; also of a new
+ * connection to such a project, which the server accepts and closes at once, as browsers cannot
+ * read the HTTP status of a refused upgrade. Browsers stop connecting to the project by themselves
+ * (apps/web/src/sync/provider.ts).
+ */
+export const PROJECT_DELETED_CLOSE_CODE = 4404;
+
 export interface RpcRequest {
   kind: 'req';
   id: string;

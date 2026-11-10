@@ -1,5 +1,7 @@
-import type { ModifierData } from '../doc/types';
+import type { CurveData, ModifierData } from '../doc/types';
 import type { MeshData } from '../mesh/types';
+import { roundBevelProfile, type BevelFillType } from '../curve/bevel';
+import { glyphOutline } from '../curve/font';
 import {
   getModifierDef,
   listModifierDefs,
@@ -69,6 +71,11 @@ export interface ModifierEstimate {
   bytes: number;
   /** What to lower for a smaller result (for messages), e.g. "levels (render_levels for renders)". */
   lower: string;
+  /**
+   * The modifier fails by itself (invalid parameters, or a result over its own limit): its
+   * evaluation reports an error instead of a result.
+   */
+  failsByItself?: boolean;
 }
 
 export interface EstimateContext {
@@ -149,7 +156,7 @@ export function estimateModifier(mod: ModifierData, input: MeshSize, ctx: Estima
   registerBuiltinModifiers();
   const def = getModifierDef(mod.type);
   const parsed = def?.schema.safeParse(mod.params ?? {});
-  if (!parsed?.success) return { result: same(input), bytes: 0, lower: '' };
+  if (!parsed?.success) return { result: same(input), bytes: 0, lower: '', failsByItself: true };
   return estimateParsed(mod.type, parsed.data as Record<string, unknown>, input, ctx);
 }
 
@@ -171,7 +178,7 @@ function estimateParsed(
       const levels = Math.round(num(ctx.forRender ? p.render_levels : p.levels, 0));
       if (levels <= 0 || V === 0) return none;
       const faces = C * 4 ** (levels - 1);
-      if (faces > SUBSURF_MAX_FACES) return none;
+      if (faces > SUBSURF_MAX_FACES) return { ...none, failsByItself: true };
       const result = { faces, corners: 4 * faces, vertices: faces + V };
       return {
         result,
@@ -197,7 +204,8 @@ function estimateParsed(
         }
         count = Math.max(1, Math.min(10_000, count, Math.floor(ARRAY_MAX_VERTICES / Math.max(1, V))));
       }
-      if (V === 0 || count * V > ARRAY_MAX_VERTICES) return none;
+      if (V === 0) return none;
+      if (count * V > ARRAY_MAX_VERTICES) return { ...none, failsByItself: true };
       const result = { faces: F * count, corners: C * count, vertices: V * count };
       return { result, bytes: K.ARRAY * elements(result), lower: 'count' };
     }
@@ -257,6 +265,221 @@ function estimateParsed(
   }
 }
 
+/**
+ * Peak heap the surface of a text object takes per character with a glyph (bytes), filled flat with
+ * the default resolution: 54,800–61,700 measured (texts of 4,909 to 16,363 glyphs of the built-in
+ * font, 'The quick brown fox jumps over the lazy dog 0123456789' repeated; 44,000 for 20,000 glyphs
+ * of a plainer text), rounded up. Server checks count text surfaces from their glyph outlines
+ * ({@link estimateCurveSurface}), at least at this cost.
+ */
+export const TEXT_BYTES_PER_CHARACTER = 64_000;
+/** Faces of a text surface per character (28.5 measured, rounded up). */
+export const TEXT_FACES_PER_CHARACTER = 30;
+
+/** Characters of a text body that have a glyph (whitespace has none). */
+export function textGlyphCount(body: string): number {
+  let n = 0;
+  for (const ch of body) if (!/\s/.test(ch)) n++;
+  return n;
+}
+
+/**
+ * Young-generation garbage of building a curve or text surface (bytes), part of every peak measured
+ * with --trace-gc, like core operators/memory.ts OPERATOR_FIXED_BYTES.
+ */
+export const CURVE_FIXED_BYTES = 32 * 1024 * 1024;
+/**
+ * Peak heap per point the splines (or glyph outlines) of a curve or text are sampled into, beyond
+ * {@link CURVE_FIXED_BYTES} (bytes): the samples, their frames, the wire built from them (860–870
+ * measured on wires of 100,000 and 250,000 samples) or a flat 2D fill of them (690–780 with the fill,
+ * text of 2,000 and 5,000 characters and a circle of 64,000 points), rounded up.
+ */
+export const CURVE_BYTES_PER_SAMPLE = 1000;
+/**
+ * Peak heap per vertex of the surface swept along a curve or a text (bevel, extrusion) and of the
+ * fills of 2D curves and text, beyond the samples (bytes): 260–300 measured on smooth sweeps of
+ * 0.8 to 2.9 million vertices (round and object bevels, extruded 2D fills, beveled text), 406–463
+ * where every sample is a sharp corner (sharp edges are stored per edge); rounded up.
+ */
+export const CURVE_BYTES_PER_VERTEX = 520;
+
+/** Most points a spline is sampled into (curve/spline.ts MAX_SAMPLES_PER_SPLINE). */
+const MAX_SPLINE_SAMPLES = 250_000;
+/** Largest surface swept along a curve (vertices, curve/to-mesh.ts MAX_VERTICES); denser ones are not swept. */
+const CURVE_MAX_SWEEP_VERTICES = 3_000_000;
+
+/**
+ * Points a spline of `curve` is sampled into, at most: what curve/spline.ts evaluateSpline makes of
+ * its points and resolution (POLY splines keep their points; Bezier and NURBS splines take
+ * `resolution` points per segment, at most MAX_SPLINE_SAMPLES).
+ */
+function splineSamples(curve: CurveData, raw: unknown, forRender: boolean): number {
+  const s = (raw && typeof raw === 'object' ? raw : {}) as {
+    type?: unknown;
+    points?: unknown;
+    resolution_u?: unknown;
+  };
+  const n = Array.isArray(s.points) ? s.points.length : 0;
+  if (n <= 1 || s.type === 'POLY') return n;
+  const own = Math.max(0, Math.min(1024, Math.round(num(s.resolution_u, 0))));
+  const base =
+    forRender && num(curve.render_resolution_u, 0) > 0 ? curve.render_resolution_u : curve.resolution_u;
+  const r = own > 0 ? own : base;
+  let res = Math.max(1, Math.min(1024, Math.round(Number.isFinite(r) ? r : 12)));
+  if (n * res > MAX_SPLINE_SAMPLES) res = Math.max(1, Math.floor(MAX_SPLINE_SAMPLES / n));
+  return n * res + 1;
+}
+
+/** The estimated surface of a curve or text, and the heap building it takes. */
+export interface CurveSurfaceEstimate {
+  /** Points of the sampled splines or glyph outlines (contours). */
+  samples: number;
+  /** Size of the surface (all 0 when the curve gets only a wire). */
+  result: MeshSize;
+  /** Peak heap of building it (bytes). */
+  bytes: number;
+  /** What to lower for a smaller surface, completing "Lower …". */
+  lower: string;
+}
+
+/**
+ * The surface curve/to-mesh.ts curveToMesh builds for `curve` (a CURVE object's data, or a FONT
+ * object's with `isText`), estimated from its splines or glyphs and its settings without building
+ * anything: every spline (or glyph outline) is swept with the bevel profile (ROUND: bevel_depth and
+ * bevel_resolution; OBJECT: the sampled splines of `bevelCurve`, the bevel object's curve) or the
+ * extrusion, and 2D curves and text fill their closed outlines (front and back when swept). An upper
+ * bound: every sampled point counted, two more per contour for bevel factors, fills counted as many
+ * triangles as outline points.
+ */
+export function estimateCurveSurface(
+  curve: CurveData,
+  opts: { isText: boolean; forRender: boolean; bevelCurve?: CurveData | null },
+): CurveSurfaceEstimate {
+  // the viewport's advice names both settings, like Subdivision Surface's: get_scene lists a
+  // surface both evaluations skip once, with the viewport's message
+  const renderResolution = num(curve.render_resolution_u, 0) > 0;
+  const resolutionName = !renderResolution
+    ? 'resolution_u'
+    : opts.forRender
+      ? 'render_resolution_u'
+      : 'resolution_u (render_resolution_u for renders)';
+  // contours: the glyph outlines of a text, the sampled splines of a curve
+  let points = 0;
+  let contours = 0;
+  if (opts.isText) {
+    const res =
+      opts.forRender && curve.render_resolution_u > 0 ? curve.render_resolution_u : curve.resolution_u;
+    const seg = Math.max(2, Math.min(64, Math.round(num(res, 12))));
+    const perGlyph = new Map<string, [number, number]>();
+    for (const ch of typeof curve.body === 'string' ? curve.body : '') {
+      // laid-out characters with a glyph (curve/text.ts: control characters dropped, spaces empty)
+      if (ch < ' ' || ch === ' ' || ch === ' ') continue;
+      let g = perGlyph.get(ch);
+      if (!g) {
+        const outline = glyphOutline(ch, seg).contours;
+        g = [outline.reduce((a, c) => a + c.length, 0), outline.length];
+        perGlyph.set(ch, g);
+      }
+      points += g[0];
+      contours += g[1];
+    }
+  } else {
+    for (const s of Array.isArray(curve.splines) ? curve.splines : []) {
+      points += splineSamples(curve, s, opts.forRender);
+      contours++;
+    }
+  }
+  // the profile (curve/to-mesh.ts readSettings and buildCurveMesh)
+  const is2D = opts.isText || curve.dimensions === '2D';
+  const mode = curve.fill_mode;
+  const fill2D = mode === 'NONE' ? 'NONE' : mode === 'FRONT' ? 'FRONT' : mode === 'BACK' ? 'BACK' : 'BOTH';
+  const bevelFill: BevelFillType = is2D
+    ? fill2D === 'NONE'
+      ? 'FULL'
+      : fill2D === 'BOTH'
+        ? 'HALF'
+        : fill2D
+    : mode === 'HALF' || mode === 'BOTH'
+      ? 'HALF'
+      : mode === 'FRONT'
+        ? 'FRONT'
+        : mode === 'BACK'
+          ? 'BACK'
+          : 'FULL';
+  const depth = Math.max(0, num(curve.bevel_depth, 0));
+  const extrude = Math.max(0, num(curve.extrude, 0));
+  let profile = 0;
+  let profiles = 0;
+  let profileName = '';
+  if (curve.bevel_mode === 'OBJECT') {
+    if (curve.bevel_object && opts.bevelCurve) {
+      for (const s of Array.isArray(opts.bevelCurve.splines) ? opts.bevelCurve.splines : []) {
+        profile += splineSamples(opts.bevelCurve, s, opts.forRender);
+        profiles++;
+      }
+      profileName = "the bevel object's resolution_u";
+    }
+  } else if (depth > 0) {
+    const resolution = Math.max(0, Math.min(32, Math.round(num(curve.bevel_resolution, 4))));
+    profile = roundBevelProfile(depth, extrude, resolution, bevelFill)?.points.length ?? 0;
+    profiles = profile ? 1 : 0;
+    profileName = 'bevel_resolution';
+  } else if (extrude > 0) {
+    profile = 2;
+    profiles = 1;
+  }
+  const along = points + 2 * contours;
+  // swept surface: one ring of profile points per sample (none over the sweep limit)
+  const swept = profile ? Math.min(points * profile, CURVE_MAX_SWEEP_VERTICES) + 2 * contours * profile : 0;
+  // 2D fills: the closed outlines on the front and back of a swept profile, else once (flat)
+  const filled = is2D && fill2D !== 'NONE' ? (profile ? 2 : 1) * along : 0;
+  // end caps of open sweeps
+  const caps = curve.use_fill_caps ? 2 * contours * profiles : 0;
+  const result: MeshSize = {
+    vertices: swept + filled,
+    faces: swept + filled + caps,
+    corners: 4 * swept + 3 * filled + (curve.use_fill_caps ? 2 * contours * profile : 0),
+  };
+  const lower = [
+    opts.isText ? 'the length of the text' : '',
+    resolutionName,
+    profileName,
+    opts.isText ? '' : 'the number of spline points',
+  ].filter(Boolean);
+  return {
+    samples: points,
+    result,
+    bytes: CURVE_FIXED_BYTES + CURVE_BYTES_PER_SAMPLE * along + CURVE_BYTES_PER_VERTEX * (swept + filled),
+    lower: lower.length > 1 ? `${lower.slice(0, -1).join(', ')} or ${lower[lower.length - 1]}` : lower[0],
+  };
+}
+
+/**
+ * Why the surface of curve or text object `o` is not built (null: build it): asks the installed
+ * check with its estimate ({@link estimateCurveSurface}; for text at least the measured cost per
+ * character, {@link TEXT_BYTES_PER_CHARACTER}). `bevelCurve`: the curve of its bevel object
+ * (bevel_mode OBJECT). Nothing to do without a check.
+ */
+export function curveMemoryRefusal(
+  o: { type: string },
+  curve: CurveData,
+  opts: { forRender: boolean; bevelCurve?: CurveData | null },
+): string | null {
+  const check = installed;
+  if (!check || (o.type !== 'CURVE' && o.type !== 'FONT')) return null;
+  const isText = o.type === 'FONT';
+  const e = estimateCurveSurface(curve, { isText, forRender: opts.forRender, bevelCurve: opts.bevelCurve });
+  const bytes = Math.max(e.bytes, isText ? textGlyphCount(curve.body ?? '') * TEXT_BYTES_PER_CHARACTER : 0);
+  if (!bytes) return null;
+  const reason = check({
+    type: isText ? 'TEXT' : 'CURVE',
+    label: isText ? 'text surface' : 'curve surface',
+    estimate: { result: e.result, bytes, lower: e.lower },
+  });
+  if (reason) refused(reason);
+  return reason;
+}
+
 /** What a {@link GeometryMemoryCheck} is asked before a modifier runs. */
 export interface GeometryMemoryRequest {
   /** Modifier type, e.g. "SUBSURF". */
@@ -271,6 +494,15 @@ export type GeometryMemoryCheck = (req: GeometryMemoryRequest) => string | null;
 
 let installed: GeometryMemoryCheck | null = null;
 let refusals = 0;
+/** The last refusals' messages, numbered like `refusals` (see {@link geometryMemoryRefusalsSince}). */
+const recent: { n: number; message: string }[] = [];
+
+/** Counts a refusal and keeps its message. */
+function refused(message: string): void {
+  refusals++;
+  recent.push({ n: refusals, message });
+  if (recent.length > 32) recent.shift();
+}
 /** The registered modifiers as they were before they were wrapped, by type. */
 const unwrapped = new Map<string, ModifierDef>();
 
@@ -292,7 +524,7 @@ function guarded(def: ModifierDef): ModifierDef {
         );
         const reason = estimate.bytes > 0 ? check({ type: def.type, label: def.label, estimate }) : null;
         if (reason) {
-          refusals++;
+          refused(reason);
           throw new Error(reason);
         }
       }
@@ -330,4 +562,9 @@ export function geometryMemoryCheck(): GeometryMemoryCheck | null {
 /** Modifiers the installed checks refused so far (a result with one of them is not cached). */
 export function geometryMemoryRefusals(): number {
   return refusals;
+}
+
+/** Messages of the refusals after the first `count` (the last 32 at most). */
+export function geometryMemoryRefusalsSince(count: number): string[] {
+  return recent.filter((r) => r.n > count).map((r) => r.message);
 }

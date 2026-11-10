@@ -23,7 +23,9 @@ function store(hasDocument: () => Promise<boolean>) {
   };
 }
 
-function room(opts: { readAt?: number; stored?: boolean; deleted?: boolean } = {}) {
+function room(opts: { readAt?: number; stored?: boolean; deleted?: boolean; late?: boolean } = {}) {
+  /** The reads of storage for the room that a request stopped waiting for (Room.storageLate). */
+  const late = new Set<unknown>(opts.late ? ['readUnused'] : []);
   return {
     id: 'p',
     destroyed: false,
@@ -31,6 +33,10 @@ function room(opts: { readAt?: number; stored?: boolean; deleted?: boolean } = {
     documentStored: opts.stored ?? true,
     deletedFromStorage: opts.deleted ?? false,
     refresh: vi.fn(async () => undefined),
+    get storageLate() {
+      return late.size > 0;
+    },
+    readIsLate: (read: unknown) => late.add(read),
   } as unknown as Room & { refresh: ReturnType<typeof vi.fn> };
 }
 
@@ -89,6 +95,8 @@ describe('readBeforeAnswer (get_project)', () => {
     await vi.advanceTimersByTimeAsync(1);
     await first;
     expect(answered).toBe(true);
+    // other requests that would read the room (opening it while nobody uses it) do not wait either
+    expect(r.storageLate).toBe(true);
     // the check goes on; the next get_project neither waits for it nor starts another
     let next = false;
     void readBeforeAnswer(r, s, NOW + PROJECT_READ_WAIT_MS).then(() => {
@@ -97,6 +105,23 @@ describe('readBeforeAnswer (get_project)', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(next).toBe(true);
     expect(s.hasDocument).toHaveBeenCalledTimes(1);
+  });
+
+  /*
+   * Opening a room nobody uses read storage first (RoomManager.readUnused) and stopped waiting for
+   * it: get_project then started its own check and waited for it too (10 s, as storage that
+   * accepts connections and never answers showed, not the 5 s get_project says it waits).
+   */
+  it('waits for nothing while another read of the room that a request stopped waiting for goes on', async () => {
+    const r = room({ late: true });
+    const s = store(() => new Promise<boolean>(() => undefined));
+    let answered = false;
+    void readBeforeAnswer(r, s, NOW).then(() => {
+      answered = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answered).toBe(true);
+    expect(s.hasDocument).not.toHaveBeenCalled();
   });
 
   it('answers after a failed check like after none', async () => {

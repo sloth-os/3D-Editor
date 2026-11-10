@@ -517,3 +517,150 @@ describe('ProjectSession with WebDAV through the server, of a project the server
     await s.close(false);
   });
 });
+
+/*
+ * A project a server opened from a project.json without a document has an empty document without a
+ * name: the server no longer writes the stored name into it (a browser's rename in its copy of the
+ * full document could lose to that write when they merge). The browser showed and saved it as
+ * 'Untitled' (its project.json written by WebDAV syncs too); it now takes the stored name until the
+ * document has one.
+ */
+describe('ProjectSession of a project whose document has no name', () => {
+  it('shows and keeps the name the server lists, until the document has one', async () => {
+    withSyncServer();
+    vi.stubGlobal('fetch', async (url: string) =>
+      url.endsWith('/api/projects/proj-unnamed')
+        ? Response.json({ id: 'proj-unnamed', name: 'Stored name' })
+        : new Response(null, { status: 404 }),
+    );
+    const opening = ProjectSession.open('proj-unnamed');
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(1));
+    // the server's document: a change of an agent, no name
+    const remote = new SceneDoc(new Y.Doc());
+    remote.addObject({ type: 'EMPTY', name: 'Made by an agent' });
+    FakeSocket.created[0].receive(
+      encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep2(enc, remote.ydoc)),
+    );
+    const s = await opening;
+    await vi.waitFor(() => expect(s.title.value).toBe('Stored name'));
+    expect(s.projectInfo().name).toBe('Stored name');
+    expect(s.doc.ydoc.getMap('meta').has('name')).toBe(false); // nothing written into the document
+    s.doc.setName('Named here');
+    expect(s.title.value).toBe('Named here');
+    expect(s.projectInfo().name).toBe('Named here');
+    await s.close(false);
+    remote.destroy();
+  });
+
+  /*
+   * The stored name was only the title and the name saves keep: what reads the document's name (the
+   * Scene tab's Project name, the names of rendered and exported files, WebDAV's messages) showed
+   * 'Untitled', and with WebDAV alone the title and the local project list did too until the first
+   * change (project.json was read only before a sync that could write it).
+   */
+  it('shows the stored name wherever the editor reads the name, before any change (WebDAV only)', async () => {
+    const dav = memoryDav();
+    withSyncServerAndWebDAV(dav, 'direct');
+    serverConfig.value = null; // WebDAV only
+    toasts.value = [];
+    const info = { id: 'proj-shown', name: 'Stored name', created_at: '', updated_at: '', schema_version: 1 };
+    dav.put('/projects/proj-shown/project.json', new TextEncoder().encode(JSON.stringify(info)));
+    ProjectSession.remoteWaitMs = 200; // (nothing arrives: there is no document)
+    const s = await ProjectSession.open('proj-shown');
+    expect(s.title.value).toBe('Stored name');
+    expect(s.doc.name).toBe('Stored name'); // the Scene tab, file names, messages
+    expect(s.doc.toSnapshot().meta.name).toBe('Stored name');
+    expect(s.projectInfo().name).toBe('Stored name');
+    expect((await localIndex.get('proj-shown'))?.name).toBe('Stored name');
+    expect(s.doc.ydoc.getMap('meta').has('name')).toBe(false); // nothing written into the document
+    // stored with a change, then deleted on another device: the message names it
+    s.doc.addObject({ type: 'EMPTY', name: 'First change' });
+    await s.webdav!.syncNow();
+    dav.remove('/projects/proj-shown/');
+    await s.webdav!.syncNow();
+    expect(toasts.value.map((t) => t.message)).toEqual([
+      '"Stored name" was deleted from WebDAV on another device. This browser keeps its copy and stores it on WebDAV again when you change it or save (Ctrl+S).',
+    ]);
+    s.doc.setName('Named here');
+    expect(s.title.value).toBe('Named here');
+    expect(s.projectInfo().name).toBe('Named here');
+    await s.close(false);
+  });
+
+  /*
+   * The name the server lists can arrive after opening wrote the project into the local project
+   * list, with no change of the document to write it again (a slow answer): the list kept
+   * 'Untitled'. Taking the stored name writes the list again.
+   */
+  it('writes the name the server lists into the local project list when it arrives after opening', async () => {
+    withSyncServer();
+    let answer!: () => void;
+    const answered = new Promise<void>((resolve) => (answer = resolve));
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (!url.endsWith('/api/projects/proj-late')) return new Response(null, { status: 404 });
+      await answered;
+      return Response.json({ id: 'proj-late', name: 'Late name' });
+    });
+    const opening = ProjectSession.open('proj-late');
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(1));
+    // the server's document is empty: the first sync changes nothing
+    FakeSocket.created[0].receive(
+      encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep2(enc, new Y.Doc())),
+    );
+    const s = await opening;
+    expect((await localIndex.get('proj-late'))?.name).toBe('Untitled');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      answer();
+      await vi.waitFor(() => expect(s.title.value).toBe('Late name'));
+      vi.advanceTimersByTime(3000); // the list is written 3 s after a change
+    } finally {
+      vi.useRealTimers();
+    }
+    await vi.waitFor(async () => expect((await localIndex.get('proj-late'))?.name).toBe('Late name'));
+    await s.close(false);
+  });
+
+  it('shows the name the server lists in the Scene tab and the names of files', async () => {
+    withSyncServer();
+    vi.stubGlobal('fetch', async (url: string) =>
+      url.endsWith('/api/projects/proj-listed')
+        ? Response.json({ id: 'proj-listed', name: 'Listed name' })
+        : new Response(null, { status: 404 }),
+    );
+    const opening = ProjectSession.open('proj-listed');
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(1));
+    const remote = new SceneDoc(new Y.Doc());
+    remote.addObject({ type: 'EMPTY', name: 'Made by an agent' });
+    FakeSocket.created[0].receive(
+      encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep2(enc, remote.ydoc)),
+    );
+    const s = await opening;
+    await vi.waitFor(() => expect(s.doc.name).toBe('Listed name'));
+    expect(s.doc.getMeta().name).toBe('Listed name');
+    expect(s.doc.ydoc.getMap('meta').has('name')).toBe(false);
+    await s.close(false);
+    remote.destroy();
+  });
+
+  it('keeps the stored name in the project.json it writes to WebDAV', async () => {
+    const dav = memoryDav();
+    withSyncServerAndWebDAV(dav, 'direct');
+    serverConfig.value = null; // WebDAV only
+    const info = { id: 'proj-info', name: 'Stored name', created_at: '', updated_at: '', schema_version: 1 };
+    dav.put('/projects/proj-info/project.json', new TextEncoder().encode(JSON.stringify(info)));
+    ProjectSession.remoteWaitMs = 50; // (nothing arrives: there is no document)
+    const s = await ProjectSession.open('proj-info');
+    await s.webdav!.syncNow();
+    // the first change: the sync that stores it reads project.json first
+    s.doc.addObject({ type: 'EMPTY', name: 'First change' });
+    await s.webdav!.syncNow();
+    expect(s.title.value).toBe('Stored name');
+    expect(dav.files.has('/projects/proj-info/document.ybin')).toBe(true);
+    const written = JSON.parse(
+      new TextDecoder().decode(dav.files.get('/projects/proj-info/project.json')!.data),
+    );
+    expect(written.name).toBe('Stored name');
+    await s.close(false);
+  });
+});

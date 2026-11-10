@@ -120,6 +120,62 @@ export function ensureUVs(m: MeshData): number[][] {
 
 /** Number of unique edges (face edges + loose edges). */
 export function countEdges(m: MeshData): number {
+  // vertex indices as they should be: count with typed arrays (a few bytes per corner outside the
+  // JavaScript heap) instead of a string per edge (about 100 bytes of heap each, 200 MB for a grid
+  // of a million faces)
+  let max = -1;
+  let n = m.looseEdges.length / 2;
+  for (const f of m.faces) {
+    n += f.length;
+    for (const v of f) {
+      if (!Number.isInteger(v) || v < 0) return countEdgesByKey(m);
+      if (v > max) max = v;
+    }
+  }
+  for (const v of m.looseEdges) {
+    if (!Number.isInteger(v) || v < 0) return countEdgesByKey(m);
+    if (v > max) max = v;
+  }
+  if (n === 0) return 0;
+  if (max >= 0x7fffffff) return countEdgesByKey(m);
+  // edges by their smaller vertex (CSR), then the distinct larger vertices of each
+  const W = max + 1;
+  const start = new Int32Array(W + 1);
+  const each = (fn: (lo: number, hi: number) => void) => {
+    for (const f of m.faces)
+      for (let i = 0; i < f.length; i++) {
+        const a = f[i];
+        const b = f[(i + 1) % f.length];
+        fn(a < b ? a : b, a < b ? b : a);
+      }
+    for (let i = 0; i < m.looseEdges.length; i += 2) {
+      const a = m.looseEdges[i];
+      const b = m.looseEdges[i + 1];
+      fn(a < b ? a : b, a < b ? b : a);
+    }
+  };
+  each((lo) => start[lo + 1]++);
+  for (let i = 0; i < W; i++) start[i + 1] += start[i];
+  const fill = start.slice(0, W);
+  const his = new Int32Array(n);
+  each((lo, hi) => {
+    his[fill[lo]++] = hi;
+  });
+  const seen = new Int32Array(W).fill(-1);
+  let count = 0;
+  for (let lo = 0; lo < W; lo++)
+    for (let k = start[lo]; k < start[lo + 1]; k++) {
+      const hi = his[k];
+      if (seen[hi] !== lo) {
+        seen[hi] = lo;
+        count++;
+      }
+    }
+  return count;
+}
+
+/** {@link countEdges} by edge keys, for meshes with indices that are not small non-negative integers. */
+function countEdgesByKey(m: MeshData): number {
   const set = new Set<string>();
   for (const f of m.faces) for (let i = 0; i < f.length; i++) set.add(edgeKey(f[i], f[(i + 1) % f.length]));
   for (let i = 0; i < m.looseEdges.length; i += 2) set.add(edgeKey(m.looseEdges[i], m.looseEdges[i + 1]));

@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { BROWSER_UI_OPERATORS, createOperatorRegistry } from '@3d-editor/core';
 import { editorTimeoutMessage } from '../../src/mcp/editor-commands';
-import { BUSY_FACTOR, NEW_SHADER_SECONDS } from '../../src/mcp/editor-costs';
+import { BUSY_FACTOR, MARGIN_PERCENT, NEW_SHADER_SECONDS, measured } from '../../src/mcp/editor-costs';
 import {
   browserUiOperator,
   browserUiOperatorsNote,
@@ -65,7 +65,7 @@ describe('browserUiOperator', () => {
       ['wm.open_mainfile', "it opens the project browser on the person's screen."],
       ['wm.search_menu', "it opens the operator search on the person's screen."],
       ['wm.preferences', "it opens the Preferences window on the person's screen."],
-      ['wm.save_mainfile', 'sync its WebDAV copy at once if it has one'],
+      ['wm.save_mainfile', 'it makes that editor store its copy in WebDAV at once if it syncs with WebDAV'],
       ['render.render', "it opens the Render window on the person's screen and renders the scene there"],
       [
         'view3d.object_as_camera',
@@ -362,6 +362,19 @@ describe('the parameters the caveats name', () => {
     expect(caveat('render.render')).not.toMatch(/animation: true renders/);
   });
 
+  it("render.render: path traced on as many render workers as the tab's memory allows, or not started", () => {
+    // apps/web render/memory.ts sizes the workers to the tab's memory and refuses a path trace that
+    // would not fit even one; the Render window says why (the operator's own description says so)
+    expect(UI).toContain(
+      "on the render workers, as many as the tab's memory allows, and a path traced render that ",
+    );
+    expect(UI).toContain("'fit into it is not started: the window says why.");
+    expect(caveat('render.render')).toContain(
+      "with the render engine PATHTRACER path traced on that computer's render workers, as many as its tab's " +
+        'memory allows, and not started when it would not fit into that memory: the window says why',
+    );
+  });
+
   it('wm.call_menu: names every menu the editor has', () => {
     const start = MENUS.indexOf('export function menuByName(');
     const menus = [...MENUS.slice(start, MENUS.indexOf('\n}\n', start)).matchAll(/case '(\w+)':/g)].map(
@@ -384,8 +397,12 @@ describe('the Shading group', () => {
     expect(shading).toContain(
       'an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set ' +
         'of channels that no other material has) makes the next screenshot or viewport frame in MATERIAL and ' +
-        `in RENDERED shading compile it (${NEW_SHADER_SECONDS}, measured on a calm machine with 4 CPUs in software ` +
-        `WebGL, up to ${BUSY_FACTOR} times as long on a busy one; edits of values compile nothing)`,
+        `in RENDERED shading compile it (${measured(NEW_SHADER_SECONDS)}; edits of values compile nothing)`,
+    );
+    // how the range was made, and how much longer it took on a busy machine
+    expect(measured(NEW_SHADER_SECONDS)).toBe(
+      `${NEW_SHADER_SECONDS}, measured on a calm machine with 4 CPUs in software WebGL (the range widened by ` +
+        `${MARGIN_PERCENT} %), up to ${BUSY_FACTOR} times as long on a busy one`,
     );
     expect(shading).not.toMatch(/one frame/);
     // software WebGL is named once, by measured()

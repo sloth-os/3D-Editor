@@ -5,6 +5,7 @@ import {
   constraintTargets,
   decodeFloat32,
   decompose4,
+  isMeshMemoryError,
   meshStats,
   modifierObjectParams,
   normalizeParticleSettings,
@@ -182,9 +183,39 @@ function boundsOf(points: Iterable<Vec3>): Bounds | null {
   };
 }
 
-function* worldVertices(mesh: MeshData, m: Mat4): Generator<Vec3> {
+/**
+ * World-space bounds of a mesh's vertices without an array per vertex (a mesh of millions of
+ * vertices would otherwise allocate hundreds of megabytes of garbage). Same numbers as
+ * transformPoint3 (divided by w unless it is 0).
+ */
+function meshWorldBounds(mesh: MeshData, m: Mat4): Bounds | null {
   const p = mesh.positions;
-  for (let i = 0; i + 2 < p.length; i += 3) yield transformPoint3(m, [p[i], p[i + 1], p[i + 2]]);
+  const min: Vec3 = [Infinity, Infinity, Infinity];
+  const max: Vec3 = [-Infinity, -Infinity, -Infinity];
+  let any = false;
+  const q: Vec3 = [0, 0, 0];
+  for (let i = 0; i + 2 < p.length; i += 3) {
+    const x = p[i];
+    const y = p[i + 1];
+    const z = p[i + 2];
+    const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+    const iw = w !== 0 ? 1 / w : 1;
+    q[0] = (m[0] * x + m[4] * y + m[8] * z + m[12]) * iw;
+    q[1] = (m[1] * x + m[5] * y + m[9] * z + m[13]) * iw;
+    q[2] = (m[2] * x + m[6] * y + m[10] * z + m[14]) * iw;
+    any = true;
+    for (let k = 0; k < 3; k++) {
+      if (q[k] < min[k]) min[k] = q[k];
+      if (q[k] > max[k]) max[k] = q[k];
+    }
+  }
+  if (!any) return null;
+  return {
+    min: roundVec(min),
+    max: roundVec(max),
+    size: roundVec([max[0] - min[0], max[1] - min[1], max[2] - min[2]]),
+    center: roundVec([(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2]),
+  };
 }
 
 function* worldLinePoints(lines: Float32Array, m: Mat4): Generator<Vec3> {
@@ -205,7 +236,9 @@ function* posedBonePoints(ev: EvaluatedObject): Generator<Vec3> {
  * modifiers such as ARRAY), its posed bones (armatures), otherwise its origin.
  */
 export function worldBounds(ev: EvaluatedObject): Bounds | null {
-  if (ev.mesh && ev.mesh.positions.length >= 3) return boundsOf(worldVertices(ev.mesh, ev.worldMatrix));
+  if (ev.mesh && ev.mesh.positions.length >= 3) return meshWorldBounds(ev.mesh, ev.worldMatrix);
+  // a mesh the server did not load (or could not evaluate): its extent is not known
+  if (ev.data.type === 'MESH' && ev.data.data && !ev.mesh) return null;
   if (ev.lines && ev.lines.length >= 3) return boundsOf(worldLinePoints(ev.lines, ev.worldMatrix));
   if (ev.pose?.bones.size) return boundsOf(posedBonePoints(ev));
   const m = ev.worldMatrix;
@@ -282,9 +315,42 @@ function modifierErrors(scene: SceneDoc, ev: EvaluatedObject): { modifier: strin
 
 /**
  * Every evaluation problem of the scene, for the top-level `problems` list: scene errors (drivers,
- * poses, curves, instancing, physics), constraint errors and modifier errors of every object.
+ * poses, curves, instancing, physics), constraint errors and modifier errors of every object; then
+ * those that only the VIEWPORT evaluation has (`viewport` when the viewport may differ), marked
+ * `viewport: true`: a Subdivision Surface whose viewport levels are skipped while its render_levels
+ * evaluate, for one, which the viewport counts (`evaluated_viewport`) show unsubdivided.
  */
-function allProblems(scene: SceneDoc, ev: EvaluatedScene): Record<string, unknown>[] {
+function allProblems(
+  scene: SceneDoc,
+  ev: EvaluatedScene,
+  viewport: EvaluatedScene | null = null,
+): Record<string, unknown>[] {
+  const out = problemsOf(scene, ev);
+  if (!viewport || viewport === ev) return out;
+  const index = new Map(out.map((p, i) => [sameProblem(p), i]));
+  for (const p of problemsOf(scene, viewport)) {
+    const i = index.get(sameProblem(p));
+    if (i === undefined) out.push({ ...p, viewport: true });
+    // both evaluations skipped it for memory: the viewport's advice names both settings
+    // ("levels (render_levels for renders)")
+    else out[i] = { ...out[i], message: p.message };
+  }
+  return out;
+}
+
+/**
+ * What tells two problems apart, also across the two evaluations: everything but the free heap a
+ * memory refusal names, which changes between the evaluations of one call, and the setting it
+ * says to lower, which the render evaluation names for renders only.
+ */
+function sameProblem(p: unknown): string {
+  return JSON.stringify(p)
+    .replace(/has [\d,]+ MB of its/g, 'has MB of its')
+    .replace(/\. Lower [^"]*? to evaluate it on the server/g, '. Lower to evaluate it on the server');
+}
+
+/** The problems of one evaluation (see {@link allProblems}). */
+function problemsOf(scene: SceneDoc, ev: EvaluatedScene): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = ev.errors.map((e) => describeProblem(scene, e));
   for (const o of ev.objects) {
     for (const e of o.constraintErrors) {
@@ -641,13 +707,29 @@ function dataSummary(
   ctx?: SummaryContext,
 ): Record<string, unknown> | null {
   if (o.type === 'MESH' && o.data) {
-    const base = scene.getMesh(o.data);
+    let base: MeshData | null = null;
+    // a mesh too large to decode in the server's heap (core mesh/memory.ts): its stored counts
+    let notLoaded: string | null = null;
+    try {
+      base = scene.getMesh(o.data);
+    } catch (e) {
+      if (!isMeshMemoryError(e)) throw e;
+      notLoaded = e.message;
+    }
     const block = scene.getMeshBlock(o.data);
     const out: Record<string, unknown> = {
       kind: 'mesh',
       mesh: block?.name ?? o.data,
       users: scene.dataUsers(o.data),
     };
+    const stored = notLoaded ? scene.meshCounts(o.data) : null;
+    if (stored)
+      Object.assign(out, {
+        vertices: stored.vertices,
+        faces: stored.faces,
+        triangles: stored.corners - 2 * stored.faces,
+        not_loaded: notLoaded,
+      });
     if (base) {
       Object.assign(out, meshStats(base));
       // the geometry renders show (listed whenever modifiers or shape keys could change it); the
@@ -795,6 +877,8 @@ interface SummaryContext {
   /** The scene evaluated for rendering (what the summaries describe). */
   ev: EvaluatedScene;
   problems: Map<string, EvalError[]>;
+  /** Problems of the VIEWPORT evaluation by object (empty when the viewport cannot differ). */
+  viewportProblems: Map<string, EvalError[]>;
   /** Instances in renders (every particle of the systems shown in renders). */
   instances: InstanceCounts;
   /** Instances in the viewport, when they differ from the render counts. */
@@ -846,6 +930,7 @@ function summaryContext(
   return {
     ev,
     problems: problemsByObject(scene, ev),
+    viewportProblems: viewportEv && viewportEv !== ev ? problemsByObject(scene, viewportEv) : new Map(),
     instances,
     viewport,
     viewportOf: (id) => (viewportEv && viewportEv !== ev ? viewportEv.byId.get(id) : undefined),
@@ -871,13 +956,30 @@ export function summarizeObject(
   const drivers = scene.listDrivers(o.id);
   if (o.data) drivers.push(...scene.listDrivers(o.data));
   const constraintErrors = ev?.constraintErrors ?? [];
-  const problems = ctx?.problems.get(o.id) ?? [];
+  const problems = (ctx?.problems.get(o.id) ?? []).map((e) => `${e.source.split(':')[0]}: ${e.message}`);
   const instances = ctx?.instances.byOwner.get(o.id) ?? 0;
   const viewportInstances = ctx?.viewport ? (ctx.viewport.byOwner.get(o.id) ?? 0) : instances;
   // the object at the frame: animated / driven transforms, constraints, modifiers, particle settings
   const a = ev?.data ?? o;
   const rb = a.rigid_body;
-  const modErrors = ev ? modifierErrors(scene, ev) : [];
+  const modErrors: { modifier: string; message: string; viewport?: true }[] = ev
+    ? modifierErrors(scene, ev)
+    : [];
+  // what only the viewport's evaluation has (its own modifier settings), marked as such
+  const viewportEv = ctx?.viewportOf(o.id);
+  if (viewportEv) {
+    const index = new Map(modErrors.map((e, i) => [sameProblem(e), i]));
+    for (const e of modifierErrors(scene, viewportEv)) {
+      const i = index.get(sameProblem(e));
+      if (i === undefined) modErrors.push({ ...e, viewport: true });
+      else modErrors[i] = { ...modErrors[i], message: e.message };
+    }
+    const own = new Set(problems.map(sameProblem));
+    for (const e of ctx?.viewportProblems.get(o.id) ?? []) {
+      const text = `${e.source.split(':')[0]} (viewport): ${e.message}`;
+      if (!own.has(sameProblem(`${e.source.split(':')[0]}: ${e.message}`))) problems.push(text);
+    }
+  }
   return {
     id: o.id,
     name: o.name,
@@ -962,13 +1064,7 @@ export function summarizeObject(
         )
       : {}),
     ...(modErrors.length ? listField('modifier_errors', modErrors, max) : {}),
-    ...(problems.length
-      ? listField(
-          'problems',
-          problems.map((e) => `${e.source.split(':')[0]}: ${e.message}`),
-          max,
-        )
-      : {}),
+    ...(problems.length ? listField('problems', problems, max) : {}),
   };
 }
 
@@ -1295,7 +1391,7 @@ function sceneSummary(scene: SceneDoc, opts: SceneSummaryOptions) {
         ...listField('objects', members, 50),
       };
     }),
-    ...listField('problems', allProblems(scene, ev), MAX_PROBLEMS),
+    ...listField('problems', allProblems(scene, ev, both.viewport), MAX_PROBLEMS),
   };
 }
 

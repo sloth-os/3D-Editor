@@ -10,6 +10,7 @@ import {
   MSG_QUERY_AWARENESS,
   MSG_RPC,
   MSG_SYNC,
+  PROJECT_DELETED_CLOSE_CODE,
   encodeFrame,
   encodeJsonFrame,
   readFrameType,
@@ -25,14 +26,6 @@ import { telemetry } from '../telemetry/telemetry';
  * does not connect again by itself (see {@link SyncProvider.reconnect}).
  */
 export type SyncStatus = 'disabled' | 'connecting' | 'connected' | 'offline' | 'deleted';
-
-/**
- * The close code of the editor server for a project deleted there (apps/server/src/sync): its room
- * closes its connections with it when the project is deleted on the server, and the server closes a
- * new connection to a project it has deleted with it right away (browsers cannot read the HTTP
- * status of a refused WebSocket upgrade).
- */
-export const PROJECT_DELETED_CLOSE_CODE = 4404;
 
 export type RpcHandler = (method: string, params: unknown) => Promise<unknown> | unknown;
 

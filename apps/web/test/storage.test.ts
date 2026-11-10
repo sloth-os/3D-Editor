@@ -5,7 +5,7 @@ import { WebDAVSync, resolveWebDAV, syncRecords } from '../src/storage/webdav';
 import { prefs, defaultPreferences } from '../src/app/prefs';
 import { serverConfig, session, toasts } from '../src/app/store';
 import { localIndex } from '../src/project/local-index';
-import { deleteProject } from '../src/project/manager';
+import { deleteProject, listProjects } from '../src/project/manager';
 import { ProjectSession } from '../src/project/session';
 
 describe('storage selection', () => {
@@ -459,6 +459,126 @@ function davServer() {
     },
   };
 }
+
+/*
+ * The project list of a browser that saves to WebDAV: when reading the project.json of a stored
+ * project failed, the list left that project out without a word. It now lists the others and says
+ * what failed.
+ */
+describe('project list with WebDAV', () => {
+  it('lists the projects whose project.json it read, and says which read failed', async () => {
+    useWebDAVDirectly();
+    const folder = (href: string) =>
+      `<d:response><d:href>${href}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`;
+    const info = {
+      id: 'listed',
+      name: 'Listed',
+      created_at: '',
+      updated_at: '2026-01-01',
+      schema_version: 1,
+    };
+    vi.stubGlobal('fetch', async (input: string, init: RequestInit = {}) => {
+      const path = new URL(input).pathname.replace(/(.)\/$/, '$1');
+      if (init.method === 'PROPFIND' && path === '/projects')
+        return new Response(
+          `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">${['/projects/', '/projects/listed/', '/projects/unread/'].map(folder).join('')}</d:multistatus>`,
+          { status: 207 },
+        );
+      if (path === '/projects/listed/project.json') return new Response(JSON.stringify(info));
+      if (path === '/projects/unread/project.json') return new Response(null, { status: 503 });
+      return new Response(null, { status: 404 });
+    });
+    const { projects, errors } = await listProjects();
+    expect(projects.filter((p) => p.sources.includes('webdav')).map((p) => p.name)).toEqual(['Listed']);
+    expect(errors).toEqual([
+      'WebDAV: could not read the project.json of 1 of 2 stored projects (GET /projects/unread/project.json failed: 503)',
+    ]);
+  });
+});
+
+/*
+ * A document without a name (a project stored as a project.json without a document, opened from a
+ * server or another device): the project.json its syncs write keeps the stored name (the session
+ * names the document with it, see ProjectSession.storedName), also when its first sync writes, and
+ * when Save writes an empty document. project.json is read once (a read that failed, again).
+ */
+describe('WebDAV sync of a document without a name', () => {
+  const ID = 'p-unnamed';
+  const INFO = `/projects/${ID}/project.json`;
+
+  /** A server with the project's project.json and no document, and a sync of `doc` with it. */
+  function withStoredInfo(doc: SceneDoc) {
+    localStorage.clear();
+    toasts.value = [];
+    const server = memoryServer();
+    vi.stubGlobal('fetch', server.fetch);
+    const info = { id: ID, name: 'Stored name', created_at: '', updated_at: '', schema_version: 1 };
+    server.files.set(INFO, new TextEncoder().encode(JSON.stringify(info)));
+    const target = {
+      store: new ProjectFileStore(new WebDAVClient({ url: 'https://dav.test/' }), '/'),
+      label: 'test',
+      viaServer: false,
+    };
+    // (as the session: the stored name while the document has none)
+    const sync: WebDAVSync = new WebDAVSync(
+      target,
+      ID,
+      doc,
+      () => ({
+        id: ID,
+        name: doc.map('meta').has('name') ? doc.name : (sync.storedName.value ?? doc.name),
+        created_at: '',
+        updated_at: '',
+        schema_version: 1,
+      }),
+      { type: 'storage' },
+    );
+    const written = () => JSON.parse(new TextDecoder().decode(server.files.get(INFO))).name as string;
+    return { server, sync, written };
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('keeps the stored name in the project.json that its first sync writes', async () => {
+    const doc = new SceneDoc(new Y.Doc());
+    doc.addObject({ type: 'EMPTY', name: 'Made elsewhere' }); // content, no name
+    const { sync, written } = withStoredInfo(doc);
+    expect(await sync.syncNow()).toMatchObject({ pushed: true, created: true });
+    expect(sync.storedName.value).toBe('Stored name');
+    expect(written()).toBe('Stored name');
+    await sync.stop(false);
+  });
+
+  it('keeps the stored name in the project.json that Save writes with an empty document', async () => {
+    const doc = new SceneDoc(new Y.Doc());
+    const { server, sync, written } = withStoredInfo(doc);
+    expect(await sync.save()).toEqual({ message: 'Saved to WebDAV', level: 'info' });
+    expect(server.files.has(`/projects/${ID}/document.ybin`)).toBe(true);
+    expect(written()).toBe('Stored name');
+    await sync.stop(false);
+  });
+
+  it('reads the stored name once, and again after a read that failed', async () => {
+    const doc = new SceneDoc(new Y.Doc());
+    const { server, sync } = withStoredInfo(doc);
+    let fail = true;
+    vi.stubGlobal('fetch', async (input: string, init: RequestInit = {}) => {
+      if (fail && input.endsWith('/project.json')) {
+        fail = false;
+        throw new TypeError('Failed to fetch');
+      }
+      return server.fetch(input, init);
+    });
+    const reads = () => server.requests.filter((r) => r === `GET ${INFO}`).length;
+    await sync.syncNow();
+    expect(sync.storedName.value).toBeNull();
+    await sync.syncNow();
+    expect(sync.storedName.value).toBe('Stored name');
+    await sync.syncNow();
+    expect(reads()).toBe(1); // (the one that failed reached no server)
+    await sync.stop(false);
+  });
+});
 
 /*
  * Another writer deletes the project right after this browser's own write. That write held all of

@@ -285,6 +285,19 @@ export function isCancelled(err: unknown): err is RenderCancelledError {
 }
 
 /**
+ * How every out-of-memory error starts, whatever ended the render process (its heap, an allocation,
+ * the system's out-of-memory killer) or refused the render (single-thread mode): agents match it
+ * (the tools put "Rendering failed: " and the like in front, see mcp/rendering.ts).
+ */
+export const OUT_OF_MEMORY_PREFIX = 'out of memory: ';
+/**
+ * How the error of a render that was not the cause starts: another render that shared its render
+ * process ran the process out of memory or crashed it (it can run again, see pool.ts
+ * sharedProcessError).
+ */
+export const INTERRUPTED_PREFIX = 'interrupted: ';
+
+/**
  * A render that needed more memory than its render process has: the process ran out of
  * JavaScript heap (V8 aborted it, or an allocation failed), or it was killed with SIGKILL, which
  * on Linux is what the kernel's out-of-memory killer does. The server itself keeps running and a

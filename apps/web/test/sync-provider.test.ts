@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { Awareness } from 'y-protocols/awareness';
-import { MSG_CONTROL, encodeJsonFrame } from '@3d-editor/core';
-import { PROJECT_DELETED_CLOSE_CODE, SyncProvider } from '../src/sync/provider';
+import { MSG_CONTROL, PROJECT_DELETED_CLOSE_CODE, encodeJsonFrame } from '@3d-editor/core';
+import { SyncProvider } from '../src/sync/provider';
 
 /** A WebSocket the test opens and closes as the editor server would. */
 class FakeSocket {

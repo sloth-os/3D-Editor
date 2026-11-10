@@ -58,6 +58,20 @@ export interface FrameStateOptions {
    * object is evaluated anew.
    */
   affected?: ReadonlySet<string>;
+  /**
+   * With `affected`: the datablocks other than objects (`<type>:<id>`, e.g. `curve:<id>`) this
+   * frame state evaluates anew, those whose drivers read what `channels` changes, directly or
+   * through others; the others are read from `base`. Without it every datablock with a driver is
+   * evaluated anew.
+   */
+  affectedData?: ReadonlySet<string>;
+  /**
+   * Objects whose simulated matrices (the `simulated` of the constructor) this frame state leaves
+   * out: they are evaluated from their channels, as Blender evaluates a rigid body while a
+   * transform moves it (BKE_rigidbody_sync_transforms leaves the simulation out for the selected
+   * objects while G.moving is set). With `affected` they must be among it.
+   */
+  unsimulated?: ReadonlySet<string>;
 }
 
 /** A frame state that evaluates only some objects anew (FrameStateOptions.affected). */
@@ -103,9 +117,14 @@ class AnimatedStore {
     private readonly channels: ReadonlyMap<string, Channels> | null = null,
     /**
      * The store of the base frame state of an overlay (see FrameStateOptions.affected): objects not
-     * evaluated anew and datablocks without drivers are read from it.
+     * evaluated anew, and the other datablocks not in `data` (without it: those without drivers),
+     * are read from it.
      */
-    private readonly fallback: { store: AnimatedStore; affected: ReadonlySet<string> } | null = null,
+    private readonly fallback: {
+      store: AnimatedStore;
+      affected: ReadonlySet<string>;
+      data: ReadonlySet<string> | null;
+    } | null = null,
   ) {}
 
   private raw(type: AnimTargetType, id: string): Block | null {
@@ -153,7 +172,7 @@ class AnimatedStore {
     const k = `${type}:${id}`;
     if (this.final.has(k)) return this.final.get(k) as T | null;
     const fb = this.fallback;
-    if (fb && (type === 'object' ? !fb.affected.has(id) : !this.drivers.has(k)))
+    if (fb && (type === 'object' ? !fb.affected.has(id) : fb.data ? !fb.data.has(k) : !this.drivers.has(k)))
       return fb.store.get<T>(type, id);
     const base = this.animatedOnly(type, id);
     const ds = base ? this.drivers.get(k) : undefined;
@@ -207,14 +226,24 @@ export class FrameState {
   /** Incremental pose evaluations (bones are evaluated on demand, see `boneMatrix`). */
   private readonly poseEvals = new Map<string, PoseEvaluation | null>();
   private readonly paths = new Map<string, CurvePath | null>();
+  /**
+   * Simulated world matrices replacing the computed ones (rigid body world), without those of
+   * FrameStateOptions.unsimulated.
+   */
+  readonly simulated: ReadonlyMap<string, Mat4> | null;
 
   constructor(
     readonly doc: SceneDoc,
     readonly frame: number,
     /** Simulated world matrices replacing the computed ones (rigid body world). */
-    readonly simulated: ReadonlyMap<string, Mat4> | null = null,
+    simulated: ReadonlyMap<string, Mat4> | null = null,
     options: FrameStateOptions = {},
   ) {
+    const released = options.unsimulated;
+    this.simulated =
+      simulated && released && [...released].some((id) => simulated.has(id))
+        ? new Map([...simulated].filter(([id]) => !released.has(id)))
+        : simulated;
     let input = options.base?.input;
     if (!input) {
       const raw = doc.listObjects();
@@ -230,7 +259,11 @@ export class FrameState {
     this.over =
       base && affected && base.frame === frame && base.simulated === simulated ? { base, affected } : null;
     const { rawById, curves, drivers } = input;
-    const fallback = this.over && { store: this.over.base.store, affected: this.over.affected };
+    const fallback = this.over && {
+      store: this.over.base.store,
+      affected: this.over.affected,
+      data: options.affectedData ?? null,
+    };
     this.store = new AnimatedStore(
       doc,
       frame,

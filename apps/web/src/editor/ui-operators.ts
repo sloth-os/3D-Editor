@@ -1,6 +1,12 @@
 import { z } from 'zod';
 import * as THREE from 'three';
-import { defineOperator, parseEdgeKey, type OperatorRegistry } from '@3d-editor/core';
+import {
+  FrameState,
+  defineOperator,
+  keyChannelChanges,
+  parseEdgeKey,
+  type OperatorRegistry,
+} from '@3d-editor/core';
 import { session, openDialog, toast, workspace, type Workspace } from '../app/store';
 import { registry, viewport, popupMenu, paletteOpen } from './editor';
 import { axisViewAngles, clonePose, type AxisView } from '../viewport/navigation';
@@ -165,7 +171,27 @@ export function registerUiOperators(reg: OperatorRegistry): void {
         const camId = ctx.doc.getScene().camera!;
         // the view, also while an animated view change is still on its way there
         const cam = viewportCamera(e.pose, e.width / Math.max(1, e.height));
-        ctx.doc.setWorldMatrix(camId, cam.matrixWorld.toArray());
+        // in the space of the parent as the scene shows it at the current frame (a bone's posed
+        // matrix, an animated or constrained parent), as Blender's ED_view3d_to_object reads the
+        // evaluated parent, and from the values the camera's channels hold there: an animated
+        // channel it changes is keyed at the frame, as the editor keeps edits of animated channels
+        const fs = new FrameState(ctx.doc, ctx.state.frame);
+        const o = fs.byId.get(camId);
+        const parented = !!o?.parent && o.parent !== camId && fs.byId.has(o.parent);
+        const held = o && { location: o.location, rotation_euler: o.rotation_euler, scale: o.scale };
+        const patch = ctx.doc.setWorldMatrix(
+          camId,
+          cam.matrixWorld.toArray(),
+          parented ? fs.parent(camId) : null,
+          held,
+        );
+        if (held && patch)
+          keyChannelChanges(
+            ctx,
+            new Map([[camId, { before: held, after: { ...held, ...patch } }]]),
+            undefined,
+            false,
+          );
         session.value!.view.cameraView.value = true;
       },
     }),
@@ -556,9 +582,10 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       description:
         'Open the Render window and render the scene there at once (F12): at the output resolution, from the ' +
         "scene camera (else the viewport's view); with the PATHTRACER engine the image refines progressively " +
-        'on the render workers. animation=true opens the Render Animation window instead (Ctrl+F12), which ' +
-        'renders nothing until its Render button is pressed (there the frame range is rendered into an ' +
-        'animated PNG or GIF).',
+        "on the render workers, as many as the tab's memory allows, and a path traced render that would not " +
+        'fit into it is not started: the window says why. animation=true opens the Render Animation window ' +
+        'instead (Ctrl+F12), which renders nothing until its Render button is pressed (there the frame range ' +
+        'is rendered into an animated PNG or GIF).',
       category: 'Render',
       ...ui,
       schema: z.object({

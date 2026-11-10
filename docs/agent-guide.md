@@ -37,10 +37,10 @@ Contents:
   the server stops. Export what you need (`export_scene`) or ask for a server with `DATA_DIR`. When
   another server sharing the storage, or a browser syncing with it, deleted the project while you
   work on it, `get_project` says so (`deleted_from_storage: true`: it checks storage before it
-  answers, unless the server read it in the last 2 s): your next change stores the whole project
-  again, so call `get_project` before you go on after a pause, and stop if the deletion was meant. When
-  `list_projects` has `storage_listing_failed: true`, it lists only the projects loaded on the
-  server.
+  answers, unless the server read it in the last 2 s, and waits up to 5 s for that): your next
+  change stores the whole project again, so call `get_project` before you go on after a pause, and
+  stop if the deletion was meant. When `list_projects` has `storage_listing_failed: true` (storage
+  failed or did not answer within 30 s), it lists only the projects loaded on the server.
 - **Read schemas instead of guessing.** Names are strict: a misspelled tool argument
   (`set_scene_settings {"sampels": 5}`), a misspelled key inside `view`, `selection` or a batch
   operation, and a misspelled operator or modifier parameter all fail with did-you-mean
@@ -325,9 +325,12 @@ Each agent has its own selection, active object and mode, separate from every hu
   motto plate). `size` is the em height; capitals are 0.7 × size.
 - **Materials** work on curves and text like on meshes (`set_material`).
 - **Convert** to a mesh for booleans, mesh editing or exact geometry:
-  `object.convert {target: "MESH"}` with `selection: {objects: [...]}`. It keeps name, transform
-  and materials, and bakes the object's modifiers. The orrery engraves its motto: text → mesh →
-  `BOOLEAN DIFFERENCE` on the plate.
+  `object.convert {target: "MESH"}` with `selection: {objects: [...]}`. It keeps name, transform and
+  materials, and bakes the object's modifiers. An object whose geometry did not evaluate fully (a
+  modifier that failed or was skipped for memory, a surface that was not built: the `problems` of
+  `get_scene`) is refused with those errors and nothing is converted (`OUT_OF_MEMORY` when memory
+  was the cause, else `FAILED`). The orrery engraves its motto: text → mesh → `BOOLEAN DIFFERENCE`
+  on the plate.
 - **Animate** a growing curve with `insert_keyframe {property: "data.bevel_factor_end"}`, a curve
   path with `data.eval_time` or `constraint.followpath_path_animate`.
 
@@ -378,13 +381,14 @@ Each agent has its own selection, active object and mode, separate from every hu
 ## Animation
 
 - **Set the range first**: `set_scene_settings {frame_start, frame_end, fps}`.
-- **Keyframes**: `insert_keyframe {object, property, frame, value}` for single keys; paths include
-  pose bones, constraint influences, modifier and particle settings, light, camera and curve data
-  (`data.…`), shape keys, materials (`material.…`) and the world (`object: "world"`); see the
-  [path table](mcp.md#insert_keyframe). For many keys use
+- **Keyframes**: `insert_keyframe {object, property, frame, value}` for single keys (without `value`
+  it keys the value the property shows at your current frame, an animated or driven one too, as
+  Blender keys the current value); paths include pose bones, constraint influences, modifier and
+  particle settings, light, camera and curve data (`data.…`), shape keys, materials (`material.…`)
+  and the world (`object: "world"`); see the [path table](mcp.md#insert_keyframe). For many keys use
   `anim.keyframes_insert_many {target, path, index, frames, values, interpolation, easing}` (one
-  channel per call, all in one batch). The robot script keys 96 frames of an IK target and two
-  bone rotations in one batch this way.
+  channel per call, all in one batch). The robot script keys 96 frames of an IK target and two bone
+  rotations in one batch this way.
 - **Interpolation**: `BEZIER` (default, eased), `LINEAR`, `CONSTANT` (hold: switches and on/off
   states).
 - **Loops**: make the last key equal the first one, one loop length later, and set
@@ -403,9 +407,13 @@ Each agent has its own selection, active object and mode, separate from every hu
 - **F-curve modifiers**: `anim.fmodifier_add {target, path, index, type, params}` with `NOISE`
   (`{strength, scale}`: camera shake, flicker), `STEPPED` (stop motion), `GENERATOR`, `LIMITS` or
   `ENVELOPE`; `anim.fmodifier_type_list` has the schemas.
-- **Stored versus evaluated**: `transform_object` and the `*.properties_set` operators change
-  stored values; on an animated channel the keyframes win. `get_object {frame}` shows evaluated
-  values with the stored ones under `stored`.
+- **Stored versus evaluated**: `transform_object` and the `*.properties_set` operators set values; a
+  channel that already has keyframes is keyed at your current frame with its new value, so the
+  object shows it there, while its keys at other frames stay and it still moves between them (key
+  those frames too, or remove keys with `anim.keyframes_remove`, to change the motion).
+  `object.origin_set` and `object.transform_apply` key an animated channel they change at your
+  current frame the same way. Drivers override keys and stored values. `get_object {frame}` shows
+  evaluated values with the stored ones under `stored`.
 - **Check motion** with `get_object {object, frame}` at a few frames (`world_transform` for
   parented or constrained objects), `anim.driver_list {frame}`, and a `render_animation` contact
   sheet with a `frame_step` that gives 12–24 tiles.
@@ -537,15 +545,15 @@ their final size instead of scaling small ones.
 
 **Scattering**:
 
-- `object.scatter_add {surface, objects, count, seed, min_distance}` (plus `size`,
-  `size_random`, `rotation_random`, `align_to_normal`, `vertex_group`, `name`) adds a particle
-  system that instances the source objects (up to 200,000 instances in a scene). Instances are
-  cheap and render and export, but are not objects: `get_scene` counts them under
-  `counts.instances`, and `get_instances {object}` lists each one's source object and world
-  transform (to check spacing, paths and beaches without making them real). The sources are hidden
-  by default (`get_scene` lists them under `counts.not_rendered`). Each instance's origin sits on the
-  surface, so sources should have their origin at the base (generators do; mesh primitives have
-  it at the centre and sink halfway).
+- `object.scatter_add {surface, objects, count, seed, min_distance}` (plus `size`, `size_random`,
+  `rotation_random`, `align_to_normal`, `vertex_group`, `name`) adds a particle system that
+  instances the source objects (up to 200,000 instances in a scene). Instances are cheap and render
+  and export, but are not objects: `get_scene` counts them under `counts.instances`, and
+  `get_instances {object}` lists each one's source object and world transform (to check spacing,
+  paths and beaches without making them real). The sources are hidden by default (`get_scene` lists
+  them under `counts.not_rendered`). Each instance's origin sits on the surface, so sources should
+  have their origin at the base (generators do; mesh primitives have it at the centre and sink
+  halfway).
 - Density maps are vertex groups: write one weight per surface vertex with
   `object.vertex_group_set_weights {object, group, weights}` and pass `vertex_group`. The
   lighthouse keeps trees off paths, beaches and building pads this way.
@@ -578,11 +586,20 @@ their final size instead of scaling small ones.
   reached. `frame_time_limit` caps one frame. Low sample counts work with `denoise: true`.
 - Renders run in the server's shared render processes. At most two long renders (path-traced stills
   and animations) run at once across all agents and REST clients; others wait, while raster stills
-  always get a render process of their own. The 600 s limit applies per call. A render that needs
-  more memory than a render process has fails with a plain message without a `code` ("Rendering
-  failed: the render process ran out of memory …", with what to do instead), and the server keeps
-  running; another long render that waited in the same process fails too ("… this render was not
-  the cause: run it again …").
+  always get a render process of their own. The 600 s limit applies per call. A render or export
+  that needs more memory than its render process has ends only that process: the server keeps
+  running and starts a new one. The call fails with code `OUT_OF_MEMORY` (JSON after the message)
+  and a message that starts "Rendering failed: out of memory: " (`render_animation`: "Rendering the
+  animation failed: out of memory: ", `export_scene`: "Export failed: out of memory: ") and ends
+  with what to lower. A server render or export loads and evaluates every mesh of the scene with its
+  modifiers at their render settings, also meshes hidden from renders (`hide_render`) and, for an
+  export, meshes it does not write and with `apply_modifiers: false`: lower the render levels
+  (`render_levels`) of Subdivision Surface modifiers or the number of particle instances, or delete
+  meshes the project no longer needs; or render in a browser editor that has the project open
+  (`renderer: "browser"`; for an animation, its frames one by one with `render_image`). An export
+  also needs less memory to write fewer `objects`, base meshes (`apply_modifiers: false`) or format
+  `glb`. Another long render that waited in the same process fails with "Rendering failed:
+  interrupted: …" and no code: it was not the cause, so run it again.
 - Long renders send progress notifications; make your client's timeout reset on progress
   (`scripts/mcp.mjs` does). Disconnecting cancels the render.
 - `seed` fixes the noise pattern, so two renders with the same settings are comparable.
@@ -599,32 +616,34 @@ their final size instead of scaling small ones.
   render engine. An editor without GPU acceleration (software WebGL, e.g. a headless browser) is
   slow with heavy scenes in `MATERIAL` or `RENDERED` shading: the first screenshot or viewport frame
   in each of them after it opened the project builds and compiles the scene's materials for that
-  shading (18.6–25.4 s for a scene with 71 materials), and the editor keeps them, so later
-  screenshots in that shading compile nothing and take 0.5–2.6 s, also after the viewport switched
-  to it or turned its anti-aliasing off (for slow frames or more than a million triangles), and
-  after material edits that change values (colours, roughness, texture settings: 0.8–3.1 s). An edit
-  that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of
-  channels that no other material has) compiles it for the next screenshot or frame in each of these
-  two shadings (0.9–3.1 s in that scene, up to 11.7 s for a material with several procedural
-  textures). A `SOLID` or `WIREFRAME` screenshot waits until the viewport's frame in progress is
-  done, also one that compiles; the other commands wait while the editor's main thread is busy:
+  shading (13–33 s for a scene with 71 materials), and the editor keeps them, so later screenshots
+  in that shading compile nothing and take 0.3–3.9 s, also after the viewport switched to it, turned
+  its anti-aliasing off (for slow frames or more than a million triangles) or toggled X-ray, and
+  after material edits that change values (colours, roughness, texture settings). An edit that needs
+  a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that
+  no other material has) compiles it for the next screenshot or frame in each of these two shadings
+  (0.6–4.2 s in that scene, up to 16 s for a material with several procedural textures). A `SOLID`
+  or `WIREFRAME` screenshot (0.4–1.5 s for that scene) waits until the viewport's frame in progress
+  is done, also one that compiles; the other commands wait while the editor's main thread is busy:
   during a screenshot, while it builds the materials after the viewport switched to `MATERIAL` or
-  `RENDERED` for the first time (4.0–4.7 s) and during each frame of a scene with millions of
-  triangles. X-ray changes nothing in `MATERIAL` or `RENDERED` shading outside Edit Mode. A scene of
-  millions of triangles takes seconds per frame in any shading (3.4–4.4 s per `SOLID` screenshot
-  with 4 million). With the default `renderer: "auto"`, `render_image` waits 15 s for such an
-  editor's raster image and then renders on the server (`note` says so); `renderer: "browser"` waits
-  up to 55 s and then fails, saying what to do. For `editor_command` raise `timeout_ms` (default
-  10000, at most 55000: both stay under the 60 s an MCP client built on the TypeScript SDK waits by
-  default) and take screenshots with `shading: "SOLID"` (0.6–1.2 s for that scene); for a quick look
-  use `render_image {shading: "SOLID"}`: grey clay, which renders on the server while the editor is
-  busy (right after a timeout) and when the scene's render engine is `PATHTRACER` (1.6–3.1 s at
-  1280×720 for that scene, 1.7–6.0 s for 2 million triangles, 3.0–9.8 s for 4 or 6 million); a scene
-  that needs more memory than a server render has fails with "Rendering failed: the render process
-  ran out of memory …", and then only a screenshot with a larger `timeout_ms` shows it. Make final
-  images with `render_image`. These times were measured on a calm machine with 4 CPUs, the editor in
-  software WebGL (SwiftShader); on a busy one (load averages of 6–20) they took up to 4.6 times as
-  long.
+  `RENDERED` for the first time and during each frame of a scene with millions of triangles. X-ray
+  changes nothing in `MATERIAL` or `RENDERED` shading outside Edit Mode. A screenshot of a scene of
+  millions of triangles takes about a second or more in any shading (0.5–1.8 s per `SOLID`
+  screenshot with 4 million), and several times as long for the first `WIREFRAME` screenshot or
+  frame of such a scene, while the editor builds the wires of every mesh. With the default
+  `renderer: "auto"`, `render_image` waits 15 s for such an editor's raster image and then renders
+  on the server (`note` says so); `renderer: "browser"` waits up to 55 s and then fails, saying what
+  to do. For `editor_command` raise `timeout_ms` (default 10000, at most 55000: both stay under the
+  60 s an MCP client built on the TypeScript SDK waits by default) and take screenshots with
+  `shading: "SOLID"`; for a quick look use `render_image {shading: "SOLID"}`: grey clay, which
+  renders on the server while the editor is busy (right after a timeout) and when the scene's render
+  engine is `PATHTRACER` (1.1–4.0 s at 1280×720 for that scene, 1.2–7.4 s for 2 million triangles,
+  2.2–14 s for 4 or 6 million); a scene that needs more memory than a server render has fails with
+  "Rendering failed: out of memory: …" (`OUT_OF_MEMORY`), and then only a screenshot with a larger
+  `timeout_ms` shows it. Make final images with `render_image`. These times are the ranges measured
+  on a calm machine with 4 CPUs, the editor in software WebGL (SwiftShader), widened by 25 %
+  ([how](mcp.md#live-editors)); on a busy one (load averages of 4–15) the same steps took up to 3.5
+  times as long.
 - An editor keeps drawing an image the server stopped waiting for, and its next renders and commands
   wait behind it; a screenshot that timed out still compiles what it needs and keeps it, so
   retrying it waits for the rest and compiles nothing again. Until it has finished,
@@ -702,46 +721,53 @@ object and mode, which the failed call left as they were. In a `batch` each fail
   `undo` instead of `ed.undo`, `scene.frame_set` instead of `screen.frame_offset`, `create_project`
   instead of `wm.read_homefile`, `get_project` (`editor_url`) instead of `wm.share`;
 - `FAILED`: the operator itself failed, or `render.render_software` / `render.render_animation`
-  (use `render_image` / `render_animation`; `render.render` is a browser UI operator: `NOT_FOUND`).
+  (use `render_image` / `render_animation`; `render.render` is a browser UI operator: `NOT_FOUND`);
+- `OUT_OF_MEMORY`: the server's process would run out of memory: the operator was not run, or a mesh
+  it reads was not loaded (`get_scene` lists such a mesh with `not_loaded`). The message says how
+  much it needs, what is free and what to lower (where the operator has something to lower); a
+  browser editor that has the project open runs it in its own memory. Renders and exports that ran
+  out of memory carry this code too.
 
 The message is always one line (line breaks in names show as `\n`), so the JSON starts on the
 second line.
 
 The codes come from the kind of error, never from the wording of the message.
 
-| You see                                                                                               | Meaning and fix                                                                                                                                                                                                                                                                                                                                                             |
-| ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                            | Misspelled or unsupported operator parameter; use a listed name                                                                                                                                                                                                                                                                                                             |
-| `unknown argument 'sampels' (did you mean 'samples'?). Valid arguments: …`                            | Misspelled tool argument; operator parameters go inside `params`                                                                                                                                                                                                                                                                                                            |
-| `unknown key 'fov' (did you mean 'lens' or 'fov_degrees'?) (valid keys: …) at view`                   | Misspelled key inside `view`, `selection` or a batch operation                                                                                                                                                                                                                                                                                                              |
-| `Input validation error: Invalid arguments for tool get_object: … at frame`                           | A tool argument of the wrong type or out of range (e.g. `time_limit` above 600)                                                                                                                                                                                                                                                                                             |
-| `unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …` | A selection-based operator; pass `selection: {objects: [...]}`                                                                                                                                                                                                                                                                                                              |
-| `surface: Invalid input: expected array, received string`                                             | Wrong value type; check the schema (`list_operators {search}`)                                                                                                                                                                                                                                                                                                              |
-| `Operator requires Edit Mode`                                                                         | A `mesh.*` operator through `run_operator`; use `edit_mesh`                                                                                                                                                                                                                                                                                                                 |
-| `Unknown operator '…'. Did you mean: …`                                                               | Misspelled operator id (`NOT_FOUND`); use one of the suggested ids                                                                                                                                                                                                                                                                                                          |
-| `'view3d.view_all' is an operator of the browser editor's user interface … Run it there with …`       | An operator of the editor's UI (`NOT_FOUND`): use what it names instead, or `editor_command` in a live editor                                                                                                                                                                                                                                                               |
-| `Edit mode needs an active mesh object (selection.active): 'Camera' is a CAMERA object.`              | `mode: "EDIT"` needs a mesh as the active object (`POLL_FAILED`)                                                                                                                                                                                                                                                                                                            |
-| `'Camera' is not a mesh object.`                                                                      | `edit_mesh` works on mesh objects only (`POLL_FAILED`)                                                                                                                                                                                                                                                                                                                      |
-| `face index 99 out of range (mesh has 6 faces)`                                                       | An element index the base mesh does not have (`POLL_FAILED`); read indices with `get_mesh_data`                                                                                                                                                                                                                                                                             |
-| `edge [0, 3]: vertices 0 and 3 are not connected by an edge of the mesh: …`                           | Not an edge (`POLL_FAILED`): pick neighbours in a face of `get_mesh_data`, or a loose edge                                                                                                                                                                                                                                                                                  |
-| `select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: …`           | Lists the select mode does not use (`POLL_FAILED`): list only faces (`FACE`) or edges (`EDGE`), or pass the mode the message names (left out, `select_mode` is `FACE` for faces alone, `EDGE` for edges alone, else `VERT`); with `all: true` also leave `all` out                                                                                                          |
-| `'render.render_software' would render on the server's main thread …`                                 | Use `render_image` / `render_animation` (`FAILED`)                                                                                                                                                                                                                                                                                                                          |
-| `Object 'X' not found in project 'P'. Objects: …`                                                     | The name changed (`.001` suffix) or the object was deleted; use names from results                                                                                                                                                                                                                                                                                          |
-| `Several projects are named 'X' …`                                                                    | Pass the project id                                                                                                                                                                                                                                                                                                                                                         |
-| `A project named 'X' already exists (id …) …`                                                         | Names are unique, ignoring case: work in that project, delete it first or pick another name                                                                                                                                                                                                                                                                                 |
-| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                     | Pass `mode: "EDIT"` with an element selection, or use `edit_mesh`                                                                                                                                                                                                                                                                                                           |
-| `'…' is not animatable on object. Animatable: …`                                                      | Key a listed path; use `data.` for light, camera, curve and mesh data and `material.` for materials                                                                                                                                                                                                                                                                         |
-| `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" …`        | The path names something that does not exist; check names with `get_object`                                                                                                                                                                                                                                                                                                 |
-| `n of m operation(s) failed`                                                                          | Find the first `ok: false` in `results`; earlier operations were applied (one undo step reverts them)                                                                                                                                                                                                                                                                       |
-| `A path traced image of … is too large (at most 2621440 pixels …)`                                    | Render smaller                                                                                                                                                                                                                                                                                                                                                              |
-| `Too many frames (…, at most 1000)`                                                                   | Raise `frame_step` or shorten the range                                                                                                                                                                                                                                                                                                                                     |
-| `No browser editor accepting UI commands is connected …`                                              | `editor_command` needs the project open in a browser                                                                                                                                                                                                                                                                                                                        |
-| `editor_command '…' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000) …` | Slow editor (first `MATERIAL`/`RENDERED` screenshot, or after a material edit that needs a new shader): retry with a larger `timeout_ms` (it keeps what it compiled); screenshots `shading: "SOLID"`; quick look: `render_image {shading: "SOLID"}` (on the server while the editor is busy and for a `PATHTRACER` scene; if that runs out of memory, retry the screenshot) |
-| `editor_command '…' failed: the editor's connection to this project closed before it answered …`      | Its page was closed or reloaded, it opened another project or lost its connection: whether it ran the command is unknown (`wm.read_homefile` gets its own message: the editor switched to the new project)                                                                                                                                                                  |
-| `browser render failed: the editor did not finish the RASTER image within 55 s …`                     | `renderer: "browser"` on a heavy scene: use `software` / `auto`, a smaller size or `shading: "SOLID"`                                                                                                                                                                                                                                                                       |
-| `Rendering failed: the render process ran out of memory …`                                            | The scene needs more memory than a server render has: render fewer triangles, or in a browser editor (`renderer: "browser"`); the server keeps running                                                                                                                                                                                                                      |
-| `Nothing to undo in the history of this MCP session …`                                                | The session is new: send an agent id to undo across connections                                                                                                                                                                                                                                                                                                             |
-| HTTP 404 `Session not found`                                                                          | The session expired (30 minutes idle) or the server restarted: connect again                                                                                                                                                                                                                                                                                                |
+| You see                                                                                               | Meaning and fix                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unknown parameter 'raduis' (did you mean 'radius'?). Valid parameters: …`                            | Misspelled or unsupported operator parameter; use a listed name                                                                                                                                                                                                                                                                                                                                                             |
+| `unknown argument 'sampels' (did you mean 'samples'?). Valid arguments: …`                            | Misspelled tool argument; operator parameters go inside `params`                                                                                                                                                                                                                                                                                                                                                            |
+| `unknown key 'fov' (did you mean 'lens' or 'fov_degrees'?) (valid keys: …) at view`                   | Misspelled key inside `view`, `selection` or a batch operation                                                                                                                                                                                                                                                                                                                                                              |
+| `Input validation error: Invalid arguments for tool get_object: … at frame`                           | A tool argument of the wrong type or out of range (e.g. `time_limit` above 600)                                                                                                                                                                                                                                                                                                                                             |
+| `unknown parameter 'objects'. Valid parameters: (none). This operator acts on the selected objects …` | A selection-based operator; pass `selection: {objects: [...]}`                                                                                                                                                                                                                                                                                                                                                              |
+| `surface: Invalid input: expected array, received string`                                             | Wrong value type; check the schema (`list_operators {search}`)                                                                                                                                                                                                                                                                                                                                                              |
+| `Operator requires Edit Mode`                                                                         | A `mesh.*` operator through `run_operator`; use `edit_mesh`                                                                                                                                                                                                                                                                                                                                                                 |
+| `Unknown operator '…'. Did you mean: …`                                                               | Misspelled operator id (`NOT_FOUND`); use one of the suggested ids                                                                                                                                                                                                                                                                                                                                                          |
+| `'view3d.view_all' is an operator of the browser editor's user interface … Run it there with …`       | An operator of the editor's UI (`NOT_FOUND`): use what it names instead, or `editor_command` in a live editor                                                                                                                                                                                                                                                                                                               |
+| `Edit mode needs an active mesh object (selection.active): 'Camera' is a CAMERA object.`              | `mode: "EDIT"` needs a mesh as the active object (`POLL_FAILED`)                                                                                                                                                                                                                                                                                                                                                            |
+| `'Camera' is not a mesh object.`                                                                      | `edit_mesh` works on mesh objects only (`POLL_FAILED`)                                                                                                                                                                                                                                                                                                                                                                      |
+| `face index 99 out of range (mesh has 6 faces)`                                                       | An element index the base mesh does not have (`POLL_FAILED`); read indices with `get_mesh_data`                                                                                                                                                                                                                                                                                                                             |
+| `edge [0, 3]: vertices 0 and 3 are not connected by an edge of the mesh: …`                           | Not an edge (`POLL_FAILED`): pick neighbours in a face of `get_mesh_data`, or a loose edge                                                                                                                                                                                                                                                                                                                                  |
+| `select_mode 'FACE' selects only the listed faces, so the listed verts would be ignored: …`           | Lists the select mode does not use (`POLL_FAILED`): list only faces (`FACE`) or edges (`EDGE`), or pass the mode the message names (left out, `select_mode` is `FACE` for faces alone, `EDGE` for edges alone, else `VERT`); with `all: true` also leave `all` out                                                                                                                                                          |
+| `'render.render_software' would render on the server's main thread …`                                 | Use `render_image` / `render_animation` (`FAILED`)                                                                                                                                                                                                                                                                                                                                                                          |
+| `Object 'X' not found in project 'P'. Objects: …`                                                     | The name changed (`.001` suffix) or the object was deleted; use names from results                                                                                                                                                                                                                                                                                                                                          |
+| `Several projects are named 'X' …`                                                                    | Pass the project id                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `A project named 'X' already exists (id …) …`                                                         | Names are unique, ignoring case: work in that project, delete it first or pick another name                                                                                                                                                                                                                                                                                                                                 |
+| `selection.mesh selects vertices, edges or faces in Edit Mode: add mode 'EDIT' …`                     | Pass `mode: "EDIT"` with an element selection, or use `edit_mesh`                                                                                                                                                                                                                                                                                                                                                           |
+| `'…' is not animatable on object. Animatable: …`                                                      | Key a listed path; use `data.` for light, camera, curve and mesh data and `material.` for materials                                                                                                                                                                                                                                                                                                                         |
+| `'constraints["Nope"].influence' does not exist on object 'Cube': constraints has no "Nope" …`        | The path names something that does not exist; check names with `get_object`                                                                                                                                                                                                                                                                                                                                                 |
+| `n of m operation(s) failed`                                                                          | Find the first `ok: false` in `results`; earlier operations were applied (one undo step reverts them)                                                                                                                                                                                                                                                                                                                       |
+| `A path traced image of … is too large (at most 2621440 pixels …)`                                    | Render smaller                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `Too many frames (…, at most 1000)`                                                                   | Raise `frame_step` or shorten the range                                                                                                                                                                                                                                                                                                                                                                                     |
+| `No browser editor accepting UI commands is connected …`                                              | `editor_command` needs the project open in a browser                                                                                                                                                                                                                                                                                                                                                                        |
+| `editor_command '…' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000) …` | Slow editor (first `MATERIAL`/`RENDERED` screenshot, first `WIREFRAME` one of millions of triangles, or after a material edit that needs a new shader): retry with a larger `timeout_ms` (it keeps what it compiled); screenshots `shading: "SOLID"`; quick look: `render_image {shading: "SOLID"}` (on the server while the editor is busy and for a `PATHTRACER` scene; if that runs out of memory, retry the screenshot) |
+| `editor_command '…' failed: the editor's connection to this project closed before it answered …`      | Its page was closed or reloaded, it opened another project or lost its connection: whether it ran the command is unknown (`wm.read_homefile` gets its own message: the editor switched to the new project)                                                                                                                                                                                                                  |
+| `browser render failed: the editor did not finish the RASTER image within 55 s …`                     | `renderer: "browser"` on a heavy scene: use `software` / `auto`, a smaller size or `shading: "SOLID"`                                                                                                                                                                                                                                                                                                                       |
+| `browser render failed: Path tracing was not started: it needs about … GB of memory …`                | A `renderer: "browser"` path trace that would not fit into the editor tab's memory: lower the resolution or the triangles, use `RASTER`, or render on the server (`renderer: "software"`)                                                                                                                                                                                                                                   |
+| `Rendering failed: out of memory: the render process ran out of its 2096 MB JavaScript heap; …`       | A server render needed more memory than its render process has (`OUT_OF_MEMORY`; the server keeps running): lower the render levels of Subdivision Surface modifiers or the particle instances (hiding meshes from renders does not help: they are evaluated too), or render in a browser editor (`renderer: "browser"`); `render_animation` and `export_scene` fail the same way with their own advice                     |
+| `mesh.subdivide failed: not run on the server: it would need about … MB of JavaScript heap …`         | An operator that would not fit into the server's free heap (`OUT_OF_MEMORY`): lower what the message names, if it names something, or run it in a browser editor that has the project open                                                                                                                                                                                                                                  |
+| `Nothing to undo in the history of this MCP session …`                                                | The session is new: send an agent id to undo across connections                                                                                                                                                                                                                                                                                                                                                             |
+| HTTP 404 `Session not found`                                                                          | The session expired (30 minutes idle) or the server restarted: connect again                                                                                                                                                                                                                                                                                                                                                |
 
 Problems that do not fail a call:
 
@@ -762,7 +788,8 @@ Pitfalls the example projects ran into:
 - Operator parameters given as tool arguments fail the call, like misspelled tool arguments
   (`base_colour`, `rotaton`, `parms`): `run_operator {operator: "object.empty_add", name: "E"}`
   is rejected with a message that operator parameters go inside `params`.
-- `transform_object` on an animated channel changes only the stored value; the keys win.
+- `transform_object` on an animated channel keys the new value at your current frame only: its keys
+  at other frames stay, so the object still moves between them.
 - `get_scene`, `get_object` and `render_image` use your current frame, which starts at 1.
 - A scaled object stretches its OBJECT-mapped procedural textures: apply the scale first.
 - Light that should be visible in the image needs an emissive surface.

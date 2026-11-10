@@ -1,25 +1,44 @@
 import { PathFilm, type PathTile, type SceneDoc } from '@3d-editor/core';
+import {
+  estimateRender,
+  estimatedNeeds,
+  pageHeapEstimate,
+  planRenderThreads,
+  renderMemory,
+  tabMemory,
+  type RenderEstimate,
+  type TabMemory,
+} from './memory';
 import { DocumentSnapshot, resetThreadDocument, type RenderPool, type RenderThread } from './pool';
 import {
   RenderCancelledError,
+  RenderMemoryError,
   StaleDocumentError,
   filmTransferables,
+  sceneBuffers,
   type FilmBuffers,
   type PathTraceFrameOptions,
   type PixelImage,
   type PreparedInfo,
+  type SharedTrace,
 } from './protocol';
 import { filmRowsToRGBA8 } from './preview';
 import { nextPassSize, passSamples, planPass } from './schedule';
 
 /*
- * A progressive, parallel path traced render in the browser. Every worker of the pool evaluates
- * the document snapshot and compiles the scene itself; the first one ready starts rendering and the
- * others join as soon as they are. Bands of rows are handed out pass by pass (see `schedule.ts`),
- * the tiles are added to one film on the main thread and the preview is converted row by row on
- * demand (`takeDirtyRows`). At the end a worker denoises and tone maps the mean film. Without a time
- * limit the image is identical to core `renderSceneSoftware` with the same options, whatever the
- * number of workers.
+ * A progressive, parallel path traced render in the browser. The first worker of the pool
+ * evaluates the document snapshot, compiles the scene and starts rendering; the other workers get a
+ * copy of the compiled scene, one after the other, and join as soon as they have it (only one
+ * worker holds the document and the evaluated scene). How many workers render depends on the
+ * tab's memory (`memory.ts`); only the workers it leaves room for start. A render that cannot fit
+ * even one worker is refused with an explanation instead of ending the tab: before any worker starts
+ * when the estimate from the document shows it, else by the first worker, before a modifier that
+ * would not fit runs (`guard.ts`) or once it evaluated the scene, before it compiles it.
+ * Bands of rows are handed out pass by pass (see
+ * `schedule.ts`), the tiles are added to one film on the main thread and the preview is converted
+ * row by row on demand (`takeDirtyRows`). At the end a worker denoises and tone maps the mean film.
+ * Without a time limit the image is identical to core `renderSceneSoftware` with the same options,
+ * whatever the number of workers.
  */
 
 /** Options of a path traced render. */
@@ -29,6 +48,8 @@ export interface PathTraceOptions extends PathTraceFrameOptions {
    * none). The first sample of every pixel is always rendered.
    */
   timeLimit?: number;
+  /** The tab's memory (default: {@link tabMemory} when the render starts). */
+  memory?: TabMemory;
 }
 
 export type PathTracePhase = 'preparing' | 'rendering' | 'finishing' | 'done' | 'cancelled' | 'failed';
@@ -46,6 +67,8 @@ export interface PathTraceStatus {
   elapsedMs: number;
   /** Workers rendering. */
   threads: number;
+  /** True when the tab's memory allows fewer workers than the pool has (see memory.ts). */
+  limitedByMemory: boolean;
   /** Failure message (phase 'failed'). */
   error?: string;
 }
@@ -63,6 +86,8 @@ export interface PathTraceResult extends PixelImage {
   /** Milliseconds until the first worker was ready. */
   prepareMs: number;
   threads: number;
+  /** True when the tab's memory allowed fewer workers than the pool has. */
+  limitedByMemory: boolean;
   warnings: string[];
 }
 
@@ -72,6 +97,26 @@ const DISPLAY_MS_PER_PIXEL = 0.2e-3;
 
 let nextJob = 1;
 const now = () => performance.now();
+
+/**
+ * After a render, the workers that adopted a copy of its compiled scene are stopped when the copies
+ * take this part of the render budget or more (1/8): see the end of `PathTraceJob.render`.
+ */
+export const ADOPTER_COPIES_STOP = 8;
+
+/** What the path traced renders running now hold, by job (their {@link renderMemory}). */
+const running = new Map<number, { total: number; heap: number }>();
+
+/** `memory` with what the renders running now, other than `job`, hold. */
+function withRunning(memory: TabMemory, job: number): TabMemory {
+  const held = { ...memory.held };
+  for (const [id, m] of running)
+    if (id !== job) {
+      held.total += m.total;
+      held.heap += m.heap;
+    }
+  return { ...memory, held };
+}
 
 /** The frame options sent to the workers (drops main-thread-only settings and unset values). */
 function frameOptions(o: PathTraceOptions): PathTraceFrameOptions {
@@ -112,6 +157,10 @@ export class PathTraceJob {
   private dirty: [number, number] | null = null;
   /** True once `pixels` hold the final image (no more preview conversion). */
   private final = false;
+  /** What the document needed when the render started, estimated (see `estimateRender`). */
+  private readonly estimate: RenderEstimate;
+  /** The page's own heap, estimated from its scene (see `pageHeapEstimate`). */
+  private readonly pageHeap: number;
 
   constructor(
     private readonly pool: RenderPool,
@@ -122,9 +171,19 @@ export class PathTraceJob {
     this.width = Math.max(1, Math.round(options.width));
     this.height = Math.max(1, Math.round(options.height));
     this.pixels = new Uint8ClampedArray(this.width * this.height * 4);
-    this.status = { phase: 'preparing', samples: 0, total: 0, fraction: 0, elapsedMs: 0, threads: 0 };
+    this.status = {
+      phase: 'preparing',
+      samples: 0,
+      total: 0,
+      fraction: 0,
+      elapsedMs: 0,
+      threads: 0,
+      limitedByMemory: false,
+    };
     // the document as it is now (later edits do not change this render)
     const snapshot = new DocumentSnapshot(doc);
+    this.estimate = estimateRender(doc);
+    this.pageHeap = options.memory ? 0 : pageHeapEstimate(doc);
     this.result = this.run(snapshot);
     this.result.catch(() => undefined);
   }
@@ -220,14 +279,31 @@ export class PathTraceJob {
     }
   }
 
-  /** Prepares the render on a thread (re-sending the whole document when it lost track of it). */
-  private async prepare(t: RenderThread, snapshot: DocumentSnapshot): Promise<PreparedInfo> {
+  /**
+   * Prepares the render on a thread (re-sending the whole document when it lost track of it); the
+   * thread refuses it when one render thread does not fit `memory` (RenderMemoryError).
+   */
+  private async prepare(
+    t: RenderThread,
+    snapshot: DocumentSnapshot,
+    memory: TabMemory,
+  ): Promise<PreparedInfo> {
     const options = frameOptions(this.options);
+    const estimate = this.estimate;
     const send = () =>
-      t.call<PreparedInfo>({ type: 'prepare', job: this.id, doc: snapshot.payload(t), options });
+      t.call<PreparedInfo>({
+        type: 'prepare',
+        job: this.id,
+        doc: snapshot.payload(t),
+        options,
+        memory,
+        estimate,
+      });
     try {
       return await send();
     } catch (err) {
+      // the worker has the document: it only found the scene too large
+      if (err instanceof RenderMemoryError) throw err;
       // what the worker has is unknown now: the next document it gets is the whole state
       resetThreadDocument(t);
       if (err instanceof StaleDocumentError) return await send();
@@ -252,6 +328,7 @@ export class PathTraceJob {
       elapsedMs: now() - this.t0,
       prepareMs,
       threads,
+      limitedByMemory: this.status.limitedByMemory,
       warnings,
     };
     this.markDirty(0, this.height);
@@ -259,26 +336,92 @@ export class PathTraceJob {
     return r;
   }
 
-  private async render(snapshot: DocumentSnapshot, mayRetry: boolean): Promise<PathTraceResult> {
-    const threads = this.pool.acquire();
+  /**
+   * Copies the compiled scene of the first worker to the others, one after the other (each copy is
+   * the size of the compiled scene), and marks each ready when it has it; the last one gets the
+   * main thread's copy itself. Stops when the render is over (`over`).
+   */
+  private async adopt(
+    threads: RenderThread[],
+    ready: Set<number>,
+    fail: (i: number, err: unknown) => void,
+    over: () => boolean,
+  ): Promise<void> {
+    if (threads.length < 2 || over()) return;
     const job = this.id;
-    const prepared = threads.map((t) => this.prepare(t, snapshot));
-    for (const p of prepared) p.catch(() => undefined);
-    this.emit({ phase: 'preparing' });
+    let trace: SharedTrace;
     try {
+      trace = await threads[0].call<SharedTrace>({ type: 'share', job });
+    } catch (err) {
+      for (let i = 1; i < threads.length; i++) fail(i, err);
+      return;
+    }
+    for (let i = 1; i < threads.length && !over(); i++) {
+      const t = threads[i];
+      const last = i === threads.length - 1;
+      try {
+        await t.call(
+          { type: 'adopt', job, trace },
+          last && t.kind === 'worker' ? sceneBuffers(trace.scene) : [],
+        );
+        if (over()) return;
+        ready.add(i);
+        this.wake?.();
+      } catch (err) {
+        fail(i, err);
+      }
+    }
+  }
+
+  private async render(snapshot: DocumentSnapshot, mayRetry: boolean): Promise<PathTraceResult> {
+    const job = this.id;
+    const tab = this.options.memory ?? tabMemory(this.pageHeap);
+    // a render that cannot fit one worker (estimated from the document, its evaluation included)
+    // next to the path traced renders running now is not started
+    const estimated = estimatedNeeds(this.estimate, this.width * this.height);
+    const estimate = planRenderThreads(estimated, 1, withRunning(tab, job));
+    if (estimate.refusal) throw new Error(estimate.refusal);
+    /** Set when the render is over: no more copies of the compiled scene are sent. */
+    let over = false;
+    const all: RenderThread[] = [];
+    try {
+      // what this render holds while its first worker prepares, for renders that start meanwhile
+      running.set(job, renderMemory(estimated, 1));
+      // the workers the estimate leaves room for start now (they load meanwhile); the first evaluates
+      // and compiles the scene, and refuses it when it does not fit one render thread
+      const expected = planRenderThreads(estimated, this.pool.threadCount, withRunning(tab, job)).threads;
+      for (let i = 0; i < Math.min(Math.max(1, expected), this.pool.threadCount); i++)
+        all.push(this.pool.thread(i));
+      const prepared = this.prepare(all[0], snapshot, withRunning(tab, job));
+      prepared.catch(() => undefined);
+      this.emit({ phase: 'preparing' });
       let info: PreparedInfo;
       try {
-        info = await this.untilCancelled(Promise.any(prepared));
+        info = await this.untilCancelled(prepared);
       } catch (err) {
         if (err instanceof RenderCancelledError) return this.cancelledResult(0, [], now() - this.t0);
         // workers that cannot start make the pool fall back to the main thread: try once more there
-        if (mayRetry && this.pool.inProcess && threads.some((t) => t.kind === 'worker'))
+        if (mayRetry && this.pool.inProcess && all[0].kind === 'worker')
           return await this.render(snapshot, false);
-        const first = err instanceof AggregateError ? err.errors[0] : err;
-        throw first instanceof Error ? first : new Error(String(first));
+        throw err instanceof Error ? err : new Error(String(err));
       }
       const prepareMs = now() - this.t0;
       this.info = info;
+      // the workers that fit the tab's memory, with the scene as compiled
+      const needs = {
+        triangles: info.triangles,
+        evaluatedTriangles: info.evaluatedTriangles,
+        instances: info.instances,
+        sceneBytes: info.sceneBytes,
+        pixels: info.width * info.height,
+      };
+      const plan = planRenderThreads(needs, this.pool.threadCount, withRunning(tab, job));
+      if (plan.refusal) throw new Error(plan.refusal);
+      running.set(job, renderMemory(needs, plan.threads));
+      // the compiled scene may leave room for more workers than the estimate did: they start now
+      while (all.length < Math.min(plan.threads, this.pool.threadCount))
+        all.push(this.pool.thread(all.length));
+      const threads = all.slice(0, plan.threads);
       const W = info.width;
       const H = info.height;
       const film = new PathFilm(W, H);
@@ -286,23 +429,16 @@ export class PathTraceJob {
       const total = info.samples;
 
       // threads able to render; a failed thread drops out and its band is handed out again
-      const ready = new Set<number>();
+      const ready = new Set<number>([0]);
       const dead = new Set<number>();
       let lastError: Error | null = null;
-      prepared.forEach((p, i) =>
-        p.then(
-          () => {
-            ready.add(i);
-            this.wake?.();
-          },
-          (err: unknown) => {
-            dead.add(i);
-            lastError = err instanceof Error ? err : new Error(String(err));
-            this.wake?.();
-          },
-        ),
-      );
-      this.emit({ phase: 'rendering', total, threads: 1 });
+      const fail = (i: number, err: unknown) => {
+        dead.add(i);
+        lastError = err instanceof Error ? err : new Error(String(err));
+        this.wake?.();
+      };
+      void this.adopt(threads, ready, fail, () => over || this.cancelled);
+      this.emit({ phase: 'rendering', total, threads: 1, limitedByMemory: plan.limited });
 
       const tRender = now();
       // a time limit covers preparing, sampling and the estimated denoising and display conversion
@@ -416,6 +552,7 @@ export class PathTraceJob {
       }
 
       // the mean film is denoised and tone mapped on a worker (seconds for large images)
+      over = true;
       this.emit({ phase: 'finishing' });
       const mean = film.resolve();
       const buffers: FilmBuffers = {
@@ -465,12 +602,22 @@ export class PathTraceJob {
         elapsedMs: now() - this.t0,
         prepareMs,
         threads: ready.size,
+        limitedByMemory: plan.limited,
         warnings: info.warnings,
       };
       this.emit({ phase: 'done', threads: ready.size });
       return result;
     } finally {
-      for (const t of threads) t.notify({ type: 'release', job });
+      over = true;
+      running.delete(job);
+      for (const t of all) t.notify({ type: 'release', job });
+      // the other workers hold nothing but their copy of the compiled scene, which stays in their
+      // memory after the release until they collect garbage, unseen by the next render's plan:
+      // copies that take an eighth of the budget or more go at once with their workers (they start
+      // again for the next render), unless another render uses the workers
+      const info = this.info;
+      if (!running.size && info && (all.length - 1) * info.sceneBytes >= tab.budget / ADOPTER_COPIES_STOP)
+        for (const t of all.slice(1)) t.stop();
     }
   }
 }

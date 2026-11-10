@@ -1,4 +1,6 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
 import * as Y from 'yjs';
 import { h } from 'preact';
 import { signal } from '@preact/signals';
@@ -27,6 +29,55 @@ import {
   type MenuItem,
 } from '../src/editor/menus';
 import type { ProjectSession } from '../src/project/session';
+
+/** The menu rules of styles.css: declarations by exact selector, colours with :root variables resolved. */
+const menuStyle = (() => {
+  const css = `\n${readFileSync(resolvePath(__dirname, '../src/ui/styles.css'), 'utf8')}`.replace(
+    /\/\*[\s\S]*?\*\//g,
+    '',
+  );
+  const rule = (selector: string): Record<string, string> => {
+    const at = css.indexOf(`\n${selector} {`);
+    if (at < 0) throw new Error(`no rule '${selector}' in styles.css`);
+    const body = css.slice(css.indexOf('{', at) + 1, css.indexOf('}', at));
+    return Object.fromEntries(
+      body
+        .split(';')
+        .map((d) => d.split(':').map((x) => x.trim()))
+        .filter((d) => d.length === 2 && d[0]),
+    );
+  };
+  const root = rule(':root');
+  const color = (value: string): [number, number, number] => {
+    const v = value.replace(/^var\((--[\w-]+)\)$/, (_, name: string) => root[name]);
+    const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(v)?.[1];
+    if (!hex) throw new Error(`not a hex colour: ${value} (${v})`);
+    const full = hex.length === 3 ? [...hex].map((c) => c + c).join('') : hex;
+    return [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16)) as [number, number, number];
+  };
+  return { rule, color };
+})();
+
+type RGB = [number, number, number];
+
+/** WCAG 2 relative luminance of an sRGB colour. */
+function luminance(c: RGB): number {
+  const [r, g, b] = c.map((v) => {
+    const x = v / 255;
+    return x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/** WCAG 2 contrast ratio of two sRGB colours. */
+function contrast(a: RGB, b: RGB): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/** Blender's color_blend_v3_v3 (interface_widgets.cc): `a` moved `fac` of the way to `b`, truncated. */
+const blend = (a: RGB, b: RGB, fac: number): RGB =>
+  a.map((v, i) => Math.trunc((1 - fac) * v + fac * b[i])) as RGB;
 
 function fakeSession(): ProjectSession {
   const doc = SceneDoc.create({ empty: true });
@@ -316,10 +367,11 @@ describe('MenuList', () => {
     fireEvent.click(xray);
     expect(s.view.xray.value).toBe(true);
     expect(onClose).toHaveBeenCalledTimes(1);
-    // greyed out, with the reason as its tooltip
+    // greyed out (styles.css [data-inactive]: --text-faint, readable under the pointer; see the
+    // next test), with the reason as its tooltip
     expect(xray.dataset.inactive).toBe('true');
     expect(xray.classList.contains('disabled')).toBe(false);
-    expect(xray.style.color).toBe('var(--text-faint)');
+    expect(menuStyle.rule('.menu-item[data-inactive]').color).toBe('var(--text-faint)');
     expect(xray.title).toBe(`X-Ray: ${xrayInactiveReason('MATERIAL', 'OBJECT')}`);
     // the setting it changed applies in Solid shading, where the item is not greyed out
     cleanup();
@@ -327,12 +379,63 @@ describe('MenuList', () => {
     const solid = show(VIEW_MENU());
     const active = solid.item('X-Ray');
     expect(active.dataset.inactive).toBeUndefined();
-    expect(active.style.color).toBe('');
     expect(active.title).toBe(registry.get('view3d.toggle_xray')!.description);
     expect(active.querySelector('.check')!.textContent).toBe('\u2713');
     fireEvent.click(active);
     expect(s.view.xray.value).toBe(false);
     expect(solid.onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('draws a greyed-out item under the pointer as Blender does: readable, and still greyed out', () => {
+    // regression: a greyed-out item kept #777 (--text-faint) on the highlight #4772b3 (--accent) of
+    // the other items, a contrast of 1.08:1: the label nearly vanished under the pointer. Blender 4.2
+    // (interface_widgets.cc, widget_state_menu_item, UI_BUT_INACTIVE with UI_HOVER):
+    //   color_blend_v3_v3(wt->wcol.inner, wt->wcol.text, 0.2f);
+    //   copy_v3_v3_uchar(wt->wcol.text, wt->wcol.text_sel);
+    //   ...
+    //   color_blend_v3_v3(wt->wcol.text, wt->wcol.inner, 0.5f);
+    const { item } = show([
+      { label: 'Greyed', action: () => undefined, inactive: () => 'no effect now', shortcut: 'Alt Z' },
+      { label: 'Active', action: () => undefined },
+    ]);
+    expect(item('Greyed').dataset.inactive).toBe('true');
+    expect(item('Greyed').getAttribute('style') ?? '').not.toContain('color');
+    const text = menuStyle.color('var(--text)');
+    const greyed = menuStyle.color(menuStyle.rule('.menu-item[data-inactive]').color);
+    const hovered = menuStyle.rule('.menu-item[data-inactive]:hover');
+    const background = menuStyle.color(hovered.background);
+    const label = menuStyle.color(hovered.color);
+    // the menu background blended 20% toward the text colour, a label of white blended halfway into it
+    expect(background).toEqual(blend(menuStyle.color(menuStyle.rule('.menu').background), text, 0.2));
+    expect(label).toEqual(blend([255, 255, 255], background, 0.5));
+    // readable (WCAG's 3:1 for large text and interface parts), where it had 1.08:1
+    expect(contrast(label, background)).toBeGreaterThanOrEqual(3);
+    expect(contrast(greyed, menuStyle.color('var(--accent)'))).toBeLessThan(1.1);
+    // the highlight of every item under the pointer, as Blender's regular hover (UI_HOVER:
+    // color_blend_v3_v3(inner, text, 0.2f); copy_v3_v3_uchar(text, text_sel)): the same grey behind a
+    // white label, where it was the blue --accent; a greyed-out item differs only by its label
+    const regular = menuStyle.rule('.menu-item:hover,\n.menu-item.hover');
+    expect(menuStyle.color(regular.background)).toEqual(background);
+    expect(menuStyle.color(regular.color)).toEqual([255, 255, 255]);
+    expect(contrast(menuStyle.color(regular.color), background)).toBeGreaterThan(7);
+    // still greyed out: darker than the label of an active item
+    expect(luminance(label)).toBeLessThan(luminance(text) / 2);
+    // off the pointer it stays as grey as before
+    expect(greyed).toEqual(menuStyle.color('var(--text-faint)'));
+    // its shortcut greyed out with it: the label's colour at half alpha, as Blender draws the hint
+    // part of a menu item (widget_draw_text: copy_v4_v4_uchar(col, wcol->text); col[3] *= 0.5f),
+    // where it kept --text-dim, brighter than the greyed label
+    expect(item('Greyed').querySelector('.shortcut')!.textContent).toBe('Alt Z');
+    expect(menuStyle.rule('.menu-item[data-inactive] .shortcut')).toEqual({
+      color: 'inherit',
+      opacity: '0.5',
+    });
+    const menu = menuStyle.color(menuStyle.rule('.menu').background);
+    for (const [colour, under] of [
+      [greyed, menu],
+      [label, background],
+    ] as const)
+      expect(luminance(blend(colour, under, 0.5))).toBeLessThan(luminance(colour));
   });
 
   it('ignores clicks on disabled items, also when they say why they would be greyed out', () => {

@@ -1068,7 +1068,11 @@ function webglLuminance(e: ViewportEngine, gl: RecordingRenderer, width: number,
 }
 
 describe('final render brightness', () => {
-  it('lights a simple scene as brightly as the path tracer and the CPU rasterizer', () => {
+  it('lights a simple scene as brightly as the path tracer and the CPU rasterizer', async () => {
+    // the longest test of the file (2.7 s under coverage, all synchronous): first a wait past the
+    // 100 ms in which vitest's worker sends its task events, so the end of the hook before it is
+    // sent now, not after this test (it showed that hook taking up to 5 s, see the afterEach above)
+    await new Promise((done) => setTimeout(done, 110));
     // regression: WebGL renders (F12, Render Animation, browser MCP renders) were 15–20 % brighter
     // (8-bit mean) than the path tracer and the server's renderer: lamps were 12× (point, spot,
     // area) or 2.5× (sun) the core's Blender units and three.js's AgX / ACES / Neutral tone mapping
@@ -2335,6 +2339,86 @@ describe('heavy scenes in Rendered shading', () => {
       mean = averaged('averaged', mean, [i, 2 * i, 0.5, 1]) as number[];
     }
     expect(mean.map((v) => +v.toFixed(12))).toEqual([2, 4, 0.5, 1]);
+  });
+
+  it('draws the shadow maps once for the five pictures of a supersampled final render, into a half-float picture freed afterwards', () => {
+    // the shadow maps do not depend on the camera: redrawing them for every picture moved by a
+    // fraction of a pixel cost four more shadow passes per render; the pictures are averaged in
+    // linear light, which an 8-bit target would clamp at 1 and quantize; and the picture target,
+    // as large as the image with a depth buffer, was GPU memory kept after each render
+    const heavy = pacedEngine(scatterScene(400));
+    expect(heavy.e.multisampling).toBe(false);
+    const gl = heavy.gl as unknown as {
+      shadowMap: { enabled: boolean; needsUpdate?: boolean };
+      getRenderTarget(): THREE.WebGLRenderTarget | null;
+    };
+    // the shadow maps as three.js draws them: in the next render after a request (needsUpdate)
+    let requested = false;
+    const shadowPasses: number[] = [];
+    Object.defineProperty(gl.shadowMap, 'needsUpdate', {
+      configurable: true,
+      get: () => requested,
+      set: (v: boolean) => void (requested = v),
+    });
+    const local = vi.spyOn(heavy.e.objects, 'renderLocalShadows');
+    const pictures: THREE.WebGLRenderTarget[] = [];
+    const freed = new Set<THREE.WebGLRenderTarget>();
+    heavy.gl.onRender = (scene) => {
+      if (requested) {
+        shadowPasses.push(heavy.gl.renders.length);
+        requested = false;
+      }
+      const target = gl.getRenderTarget();
+      if (scene !== heavy.e.scene || !heavy.gl.renders.at(-1)!.camera.layers.isEnabled(0) || !target) return;
+      if (!pictures.includes(target)) target.addEventListener('dispose', () => freed.add(target));
+      pictures.push(target);
+    };
+    gpuTimes(heavy, 0, 1);
+    try {
+      heavy.e.renderPixels({ width: 64, height: 36 });
+    } finally {
+      heavy.gl.onRender = null;
+      delete (gl.shadowMap as { needsUpdate?: boolean }).needsUpdate;
+    }
+    expect(pictures).toHaveLength(FINAL_SUPERSAMPLE_OFFSETS.length);
+    expect(gl.shadowMap.enabled).toBe(true);
+    // the maps of point and spot lights in a pass of their own, the suns' with the first picture
+    expect(local).toHaveBeenCalledTimes(1);
+    expect(local.mock.results[0].value).toBe(true);
+    expect(shadowPasses).toHaveLength(2);
+    // the first picture goes into the composer's buffer, the four moved ones into a picture target
+    // of their own: half floats like the composer's, as large as the image, freed after the render
+    const [first, ...moved] = pictures;
+    expect(new Set(moved).size).toBe(1);
+    expect(moved[0]).not.toBe(first);
+    expect([moved[0].texture.type, first.texture.type]).toEqual([THREE.HalfFloatType, THREE.HalfFloatType]);
+    expect([moved[0].width, moved[0].height]).toEqual([64, 36]);
+    expect(freed.has(moved[0])).toBe(true);
+  });
+
+  it("chooses the samples of a final render by what was drawn in its own shading, not by the viewport's shading", () => {
+    // a light scene, its viewport multisampled in Solid shading, showed Rendered for a while
+    // without samples: Rendered has been drawn without them only, Solid with them
+    const light = pacedEngine(session());
+    expect(light.e.multisampling).toBe(true);
+    setMultisampling(light.e, false);
+    light.e.session.view.shading.value = 'RENDERED';
+    light.change(32);
+    light.e.session.view.shading.value = 'SOLID';
+    setMultisampling(light.e, true);
+    light.change(32);
+    expect(light.e.multisampling).toBe(true);
+    // a final render in Rendered goes without samples (supersampled: the first picture was quick),
+    // so it builds no pipelines with them; one in Solid has the samples Solid was drawn with
+    gpuTimes(light, 0, 1);
+    expect(drawnBy(light, { width: 32, height: 16 })).toEqual({
+      samples: FINAL_SUPERSAMPLE_OFFSETS.map(() => 0),
+      size: [32, 16],
+      smaa: 0,
+    });
+    expect(drawnBy(light, { width: 32, height: 16, shading: 'SOLID' }).samples).toEqual([
+      FINAL_RENDER_SAMPLES,
+    ]);
   });
 
   it('averages the pictures of a transparent film premultiplied, and smooths one with SMAA on colours premultiplied in its blend space', () => {

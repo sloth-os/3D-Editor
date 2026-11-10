@@ -2,6 +2,9 @@ import { z } from 'zod';
 import type { OperatorContext, OperatorSource, ReportLevel } from './context';
 import { OperatorError } from './context';
 import { Emitter } from '../util/emitter';
+import { isMeshMemoryError } from '../mesh/memory';
+import { geometryMemoryRefusals, geometryMemoryRefusalsSince } from '../eval/memory';
+import { operatorMemoryRefusal } from './memory';
 import {
   closeJsonSchemaObjects,
   describeUnknownParams,
@@ -65,7 +68,9 @@ export interface RunResult<T = unknown> {
   error?: string;
   /**
    * Failure kind when the operator failed with an OperatorError: INVALID_PARAMS (e.g. unknown or
-   * misspelled parameter names), POLL_FAILED (wrong mode/selection), NOT_FOUND or FAILED.
+   * misspelled parameter names), POLL_FAILED (wrong mode/selection), NOT_FOUND, FAILED, or
+   * OUT_OF_MEMORY (the host's memory check refused it, a mesh it reads or a modifier it evaluates:
+   * operators/memory.ts).
    */
   code?: OperatorError['code'];
   reports: { level: ReportLevel; message: string }[];
@@ -199,10 +204,15 @@ export class OperatorRegistry {
         params: parsed,
       };
     };
+    const refusals = geometryMemoryRefusals();
     try {
       parsed = this.parseParams(id, params);
       const p = this.poll(ctx, id);
       if (p !== true) throw new OperatorError(p, 'POLL_FAILED');
+      // a host that keeps its heap in bounds (the server) refuses an operator whose estimated peak
+      // heap does not fit (operators/memory.ts)
+      const refused = operatorMemoryRefusal(id, wrapped, parsed);
+      if (refused) throw new OperatorError(refused, 'OUT_OF_MEMORY');
       let result: unknown;
       if (def!.undo === false) {
         // Non-undoable operators (selection, view, undo/redo itself) run outside a transaction so
@@ -217,6 +227,14 @@ export class OperatorRegistry {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (err instanceof OperatorError) code = err.code;
+      // a stored mesh the host would not decode, or a failure that reports a modifier (or text
+      // surface) the host skipped for memory during the run (Apply, Convert): lower the geometry
+      if (isMeshMemoryError(err)) code = 'OUT_OF_MEMORY';
+      else if (
+        (code ?? 'FAILED') === 'FAILED' &&
+        geometryMemoryRefusalsSince(refusals).some((m) => message.includes(m))
+      )
+        code = 'OUT_OF_MEMORY';
       wrapped.report('ERROR', message);
       return finish(false, undefined, message);
     }

@@ -1,11 +1,23 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { BROWSER_UI_OPERATORS, SceneDoc, createOperatorRegistry } from '@3d-editor/core';
-import { registry } from '../src/editor/editor';
+import * as THREE from 'three';
+import {
+  BROWSER_UI_OPERATORS,
+  FrameState,
+  SceneDoc,
+  createFCurve,
+  createOperatorRegistry,
+  fcurveKey,
+  insertKeyframe,
+} from '@3d-editor/core';
+import { registry, viewport } from '../src/editor/editor';
 import { registerUiOperators } from '../src/editor/ui-operators';
 import { runOperator } from '../src/editor/runner';
 import { serverConfig, session, toasts } from '../src/app/store';
 import { defaultPreferences, prefs } from '../src/app/prefs';
 import { ProjectSession } from '../src/project/session';
+import { viewportCamera } from '../src/render/view';
+import { DEFAULT_POSE } from '../src/viewport/navigation';
+import type { ViewportEngine } from '../src/viewport/engine';
 
 /*
  * The MCP server has no UI-only operators: for an id of BROWSER_UI_OPERATORS, run_operator, batch
@@ -125,5 +137,84 @@ describe('wm.save_mainfile', () => {
   it('says that the project is saved in this browser when it has no WebDAV storage', async () => {
     await openProject('p-save-browser', false);
     expect(await save()).toEqual({ level: 'info', message: 'Saved in this browser' });
+  });
+});
+
+/*
+ * Align Active Camera to View puts the camera where the view is, as the scene shows it at the
+ * current frame: in the space of its parent there (Blender's ED_view3d_to_object reads the
+ * evaluated parent), keeping an animated channel it changes by keying it at the frame.
+ */
+describe('view3d.camera_to_view', () => {
+  afterEach(async () => {
+    viewport.engine = null;
+    await session.value?.close(false);
+    session.value = null;
+  });
+
+  it('puts the camera on the view under an animated parent, keying its animated location', async () => {
+    if (!registry.has('wm.call_menu')) registerUiOperators(registry);
+    serverConfig.value = null;
+    const d = defaultPreferences();
+    prefs.value = { ...d, storage: { ...d.storage, mode: 'browser' } };
+    session.value = await ProjectSession.open('p-camera-to-view', {
+      initial: SceneDoc.create({ name: 'Camera', empty: true }),
+    });
+    const s = session.value!;
+    const doc = s.doc;
+    const parent = doc.addObject({ type: 'EMPTY', name: 'Rig' });
+    const cam = doc.addObject({ type: 'CAMERA', name: 'Camera', parent, location: [0, -5, 1] });
+    doc.updateScene({ camera: cam });
+    const animate = (id: string, index: number, from: number, to: number) => {
+      let fc = createFCurve({ target_type: 'object', target_id: id, path: 'location', index });
+      fc = insertKeyframe(fc, 1, from, 'LINEAR');
+      fc = insertKeyframe(fc, 11, to, 'LINEAR');
+      doc.setFCurve(fc);
+    };
+    animate(parent, 0, 0, 10);
+    animate(cam, 2, 1, 3);
+    s.state.frame = 6;
+    const pose = { ...DEFAULT_POSE(), target: new THREE.Vector3(1, 2, 0.5) };
+    viewport.engine = { pose, width: 800, height: 600 } as unknown as ViewportEngine;
+    expect(runOperator(s, registry, 'view3d.camera_to_view', {}).ok).toBe(true);
+    const view = viewportCamera(pose, 800 / 600).matrixWorld.toArray();
+    const shown = new FrameState(doc, 6).world(cam)!;
+    expect(Math.max(...shown.map((v, i) => Math.abs(v - view[i])))).toBeLessThan(1e-9);
+    // the animated Z location is keyed at frame 6 with the value that puts the camera there
+    const key = doc
+      .getFCurve(fcurveKey({ target_type: 'object', target_id: cam, path: 'location', index: 2 }))!
+      .keyframes.find((k) => k.frame === 6)!;
+    expect(key.value).toBeCloseTo(view[14], 9);
+  });
+
+  it('keys an animated rotation on the turn it shows, beyond a full turn', async () => {
+    // the camera's Z rotation shows 2π + 0.2 at frame 6: the view's rotation is keyed as the angle
+    // closest to that, not the same angle a whole turn back
+    if (!registry.has('wm.call_menu')) registerUiOperators(registry);
+    serverConfig.value = null;
+    const d = defaultPreferences();
+    prefs.value = { ...d, storage: { ...d.storage, mode: 'browser' } };
+    session.value = await ProjectSession.open('p-camera-to-view-turn', {
+      initial: SceneDoc.create({ name: 'Camera', empty: true }),
+    });
+    const s = session.value!;
+    const doc = s.doc;
+    const cam = doc.addObject({ type: 'CAMERA', name: 'Camera', location: [0, -5, 1] });
+    doc.updateScene({ camera: cam });
+    let fc = createFCurve({ target_type: 'object', target_id: cam, path: 'rotation_euler', index: 2 });
+    fc = insertKeyframe(fc, 1, 2 * Math.PI + 0.1, 'LINEAR');
+    fc = insertKeyframe(fc, 11, 2 * Math.PI + 0.3, 'LINEAR');
+    doc.setFCurve(fc);
+    s.state.frame = 6;
+    const pose = { ...DEFAULT_POSE(), target: new THREE.Vector3(1, 2, 0.5) };
+    viewport.engine = { pose, width: 800, height: 600 } as unknown as ViewportEngine;
+    expect(runOperator(s, registry, 'view3d.camera_to_view', {}).ok).toBe(true);
+    const view = viewportCamera(pose, 800 / 600).matrixWorld.toArray();
+    const shown = new FrameState(doc, 6).world(cam)!;
+    expect(Math.max(...shown.map((v, i) => Math.abs(v - view[i])))).toBeLessThan(1e-9);
+    const key = doc
+      .getFCurve(fcurveKey({ target_type: 'object', target_id: cam, path: 'rotation_euler', index: 2 }))!
+      .keyframes.find((k) => k.frame === 6)!;
+    expect(Math.abs(key.value - (2 * Math.PI + 0.2))).toBeLessThan(Math.PI);
   });
 });

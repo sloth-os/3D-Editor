@@ -212,6 +212,108 @@ describe('MCP fixes for agents', () => {
     expect(tracked.world_transform.rotation_euler).not.toEqual(tracked.rotation_euler);
   });
 
+  it('insert_keyframe without value keys the value a shape key shows at the current frame', async () => {
+    // like the other targets (anim.keyframe_insert_property), not the stored value: the shape key is
+    // keyed 0 at frame 1 and 1 at frame 11 (stored 0), so at frame 6 it shows 0.5, and a key at frame
+    // 20 without value holds what frame 6 showed
+    const { id } = await ok('create_project', { name: 'Shape key shown value' });
+    await op(id, 'object.shape_key_add', { object: 'Cube', name: 'Smile' });
+    for (const [frame, value] of [
+      [1, 0],
+      [11, 1],
+    ])
+      await ok('insert_keyframe', {
+        project: id,
+        object: 'Cube',
+        property: 'shape_keys["Smile"].value',
+        frame,
+        value,
+        interpolation: 'LINEAR',
+      });
+    await ok('set_scene_settings', { project: id, frame_current: 6 });
+    for (const [property, frame] of [
+      ['shape_keys["Smile"].value', 20],
+      ['data.shape_keys["Smile"].value', 30],
+    ] as const)
+      expect(await ok('insert_keyframe', { project: id, object: 'Cube', property, frame })).toMatchObject({
+        inserted: 1,
+      });
+    for (const frame of [20, 30]) {
+      const cube = await ok('get_object', { project: id, object: 'Cube', frame });
+      expect(cube.data.shape_keys, `frame ${frame}`).toEqual([
+        expect.objectContaining({ name: 'Smile', value: 0.5, stored_value: 0 }),
+      ]);
+    }
+  });
+
+  it('transform_object relative starts from the values the object shows at the agent frame', async () => {
+    // like Blender's G / R / S and a Python `location.x += 1`: the cube's location is keyed (1, 2, 3)
+    // at frame 1 and (8, 1, 1) at frame 11 (LINEAR), its stored location stays (0, 0, 0); at frame 6
+    // it shows (4.5, 1.5, 2), and +1 on x keys and shows (5.5, 1.5, 2) there, not (1, 0, 0)
+    const { id } = await ok('create_project', { name: 'Relative from shown' });
+    for (const [frame, value] of [
+      [1, [1, 2, 3]],
+      [11, [8, 1, 1]],
+    ] as const)
+      await ok('insert_keyframe', {
+        project: id,
+        object: 'Cube',
+        property: 'location',
+        frame,
+        value,
+        interpolation: 'LINEAR',
+      });
+    await ok('insert_keyframe', {
+      project: id,
+      object: 'Cube',
+      property: 'scale',
+      frame: 1,
+      value: [2, 2, 2],
+      interpolation: 'LINEAR',
+    });
+    await ok('set_scene_settings', { project: id, frame_current: 6 });
+    expect((await ok('get_object', { project: id, object: 'Cube', frame: 6 })).location).toEqual([
+      4.5, 1.5, 2,
+    ]);
+    await ok('transform_object', {
+      project: id,
+      object: 'Cube',
+      location: [1, 0, 0],
+      scale: [1.5, 1.5, 1.5],
+      relative: true,
+    });
+    const cube = await ok('get_object', { project: id, object: 'Cube', frame: 6 });
+    expect(cube.location).toEqual([5.5, 1.5, 2]);
+    expect(cube.scale).toEqual([3, 3, 3]);
+    // the keys at other frames stay
+    expect((await ok('get_object', { project: id, object: 'Cube', frame: 11 })).location).toEqual([8, 1, 1]);
+  });
+
+  it('transform_object relative reads the values of all its objects before it changes any', async () => {
+    // like Blender's transform data: Follower's x is driven by 2 * Cube.x + 10 and shows 10 when the
+    // call starts, so +1 stores 11 there, also though Cube (moved first) makes the driver give 12 now
+    const { id } = await ok('create_project', { name: 'Relative together' });
+    await ok('add_object', { project: id, type: 'cube', name: 'Follower', location: [0, 5, 0] });
+    await op(id, 'anim.driver_add', {
+      target: 'Follower',
+      path: 'location',
+      index: 0,
+      expression: '2 * x + 10',
+      variables: [{ name: 'x', target: 'Cube', path: 'location', index: 0 }],
+    });
+    expect((await ok('get_object', { project: id, object: 'Follower' })).location).toEqual([10, 5, 0]);
+    await ok('transform_object', {
+      project: id,
+      objects: ['Cube', 'Follower'],
+      location: [1, 0, 0],
+      relative: true,
+    });
+    expect((await ok('get_object', { project: id, object: 'Cube' })).location).toEqual([1, 0, 0]);
+    const follower = await ok('get_object', { project: id, object: 'Follower' });
+    expect(follower.location).toEqual([12, 5, 0]);
+    expect(follower.stored).toEqual({ location: [11, 5, 0] });
+  });
+
   it('lists constraint and modifier errors as problems, by name (review #8)', async () => {
     const { id } = await ok('create_project', { name: 'Problems' });
     await ok('add_object', { project: id, type: 'cube', name: 'Box' });

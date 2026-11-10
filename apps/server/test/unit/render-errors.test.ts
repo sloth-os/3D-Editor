@@ -9,6 +9,14 @@ import {
   type PreparedInfo,
   type WorkerResult,
 } from '../../src/render/protocol';
+import { renderProcessExitError, sharedProcessError } from '../../src/render/pool';
+import {
+  ANIMATION_OUT_OF_MEMORY_ADVICE,
+  EXPORT_OUT_OF_MEMORY_ADVICE,
+  OUT_OF_MEMORY_ADVICE,
+  renderToolError,
+} from '../../src/mcp/rendering';
+import { outOfMemoryReply } from '../../src/api/projects';
 
 /*
  * A long render whose render processes ended reports its own failure: when one of its requests ran
@@ -95,5 +103,61 @@ describe('a render whose processes ended', () => {
         base: { engine: 'RASTER', cameraId: 'camera' },
       }),
     ).rejects.toMatchObject({ reason: 'heap' });
+  });
+});
+
+describe('out-of-memory errors of each tool', () => {
+  const REPLACED = 'the server keeps running and starts a new render process for the next render';
+  const oom = renderProcessExitError(null, 'SIGABRT', 'FATAL ERROR: JavaScript heap out of memory', 2096);
+  const killed = renderProcessExitError(null, 'SIGKILL', '', 2096);
+  const interrupted = sharedProcessError(oom);
+
+  it('start the same way whatever ended the render process, and give the advice of the tool', () => {
+    expect(oom.message).toBe(
+      `out of memory: the render process ran out of its 2096 MB JavaScript heap; ${REPLACED}`,
+    );
+    expect(killed.message).toMatch(/^out of memory: the render process was killed \(SIGKILL\)/);
+    for (const err of [oom, killed]) {
+      expect(renderToolError(err)).toMatchObject({
+        message: `Rendering failed: ${err.message}. ${OUT_OF_MEMORY_ADVICE}`,
+        code: 'OUT_OF_MEMORY',
+      });
+      expect(renderToolError(err, 'Rendering the animation')).toMatchObject({
+        message: `Rendering the animation failed: ${err.message}. ${ANIMATION_OUT_OF_MEMORY_ADVICE}`,
+        code: 'OUT_OF_MEMORY',
+      });
+      expect(renderToolError(err, 'Export')).toMatchObject({
+        message: `Export failed: ${err.message}. ${EXPORT_OUT_OF_MEMORY_ADVICE}`,
+        code: 'OUT_OF_MEMORY',
+      });
+    }
+    // render_animation renders on the server only: its advice names render_image for a browser editor
+    expect(ANIMATION_OUT_OF_MEMORY_ADVICE).not.toContain("(renderer 'browser')");
+    expect(ANIMATION_OUT_OF_MEMORY_ADVICE).toContain("render_image {frame, renderer: 'browser'}");
+    // a render that only shared the process: run it again, no advice about its scene, no code
+    expect(interrupted.message).toMatch(
+      /^interrupted: the render process ran out of memory while it worked on/,
+    );
+    expect(renderToolError(interrupted, 'Export')).toMatchObject({
+      message: `Export failed: ${interrupted.message}.`,
+      code: 'FAILED',
+    });
+  });
+
+  it('give the REST API its own status and a code', () => {
+    expect(outOfMemoryReply(oom, 'render')).toEqual({
+      status: 507,
+      body: { error: `render failed: ${oom.message}`, code: 'OUT_OF_MEMORY' },
+    });
+    expect(outOfMemoryReply(killed, 'export')).toEqual({
+      status: 507,
+      body: { error: `export failed: ${killed.message}`, code: 'OUT_OF_MEMORY' },
+    });
+    expect(outOfMemoryReply(interrupted, 'render')).toEqual({
+      status: 503,
+      body: { error: `render failed: ${interrupted.message}`, code: 'INTERRUPTED' },
+      retryAfter: 1,
+    });
+    expect(outOfMemoryReply(new Error('boom'), 'render')).toBeNull();
   });
 });

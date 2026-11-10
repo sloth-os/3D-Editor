@@ -79,7 +79,7 @@ export interface OperatorContext {
 export class OperatorError extends Error {
   constructor(
     message: string,
-    readonly code: 'POLL_FAILED' | 'INVALID_PARAMS' | 'NOT_FOUND' | 'FAILED' = 'FAILED',
+    readonly code: 'POLL_FAILED' | 'INVALID_PARAMS' | 'NOT_FOUND' | 'FAILED' | 'OUT_OF_MEMORY' = 'FAILED',
   ) {
     super(message);
     this.name = 'OperatorError';

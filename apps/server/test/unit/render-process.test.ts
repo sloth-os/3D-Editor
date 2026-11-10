@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process';
+import { existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
 import { SceneDoc, createGrid, decodePNG, renderSceneSoftware } from '@3d-editor/core';
@@ -13,7 +16,12 @@ import {
   type FrameOptions,
   type RenderThread,
 } from '../../src/render';
-import { crashReason, renderProcessExitError, type RenderPoolOptions } from '../../src/render/pool';
+import {
+  ProcessThread,
+  crashReason,
+  renderProcessExitError,
+  type RenderPoolOptions,
+} from '../../src/render/pool';
 import type { DocRef } from '../../src/render/protocol';
 import { OUT_OF_MEMORY_ADVICE, renderToolError } from '../../src/mcp/rendering';
 
@@ -50,8 +58,8 @@ const fixture = (name: string): URL => new URL(`./fixtures/${name}`, import.meta
 
 /** The message a pending request gets when another request ran its process out of memory. */
 const SHARED_OOM =
-  'the render process ran out of memory while it worked on another render that shared it; this render was ' +
-  'not the cause: run it again (a new render process serves it)';
+  'interrupted: the render process ran out of memory while it worked on another render that shared it; this ' +
+  'render was not the cause: run it again (a new render process serves it)';
 
 /** Runs `fn` with environment variables set (render processes copy the environment when they start). */
 async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
@@ -83,6 +91,12 @@ function alive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+/** When the process `pid` is gone (polled every 20 ms; performance.now()). */
+async function endOf(pid: number): Promise<number> {
+  while (alive(pid)) await new Promise((r) => setTimeout(r, 20));
+  return performance.now();
 }
 
 async function until(cond: () => boolean, ms: number, what: string): Promise<void> {
@@ -121,26 +135,28 @@ async function quickPid(p: RenderPool): Promise<number> {
   return pid;
 }
 
-describe('render processes', { timeout: 60_000 }, () => {
+// the slowest tests take 3 to 5 s on a calm machine and took up to 26 s at a load of 10 to 18 (4 CPUs)
+describe('render processes', { timeout: 90_000 }, () => {
   it('answers a render that runs out of memory with an explained error, logs it and renders again in a new process', async () => {
     const logs: Logged[] = [];
     // a heap of 128 MB holds a warmed-up render process, not the 490,000 faces of this grid
     // (980,000 triangles; a grid of 500 × 500 still renders in it)
     const r = new Renderer(pool({ threads: 1, heapLimitMb: 128 }, logs));
     const first = await quickPid(r.pool);
-    const t0 = performance.now();
+    const ended = endOf(first);
     const err = await r.renderImage({ scene: gridScene(700), projectId: 'big', options: solid() }).then(
       () => null,
       (e: unknown) => e,
     );
+    const answered = performance.now();
     expect(isOutOfMemory(err)).toBe(true);
     expect((err as RenderOutOfMemoryError).heapLimitMb).toBe(128);
     expect((err as Error).message).toBe(
-      'the render process ran out of memory (its JavaScript heap is limited to 128 MB); the server keeps ' +
-        'running and starts a new render process for the next render',
+      'out of memory: the render process ran out of its 128 MB JavaScript heap; the server keeps running and ' +
+        'starts a new render process for the next render',
     );
-    // answered when the process died, not after a timeout
-    expect(performance.now() - t0).toBeLessThan(20_000);
+    // answered when the process died (its output ended), not after a timeout
+    expect(answered - (await ended)).toBeLessThan(5_000);
     expect(alive(first)).toBe(false);
     expect(logs.find((l) => l.msg.startsWith('render process ran out of memory'))?.obj).toMatchObject({
       pid: first,
@@ -178,7 +194,7 @@ describe('render processes', { timeout: 60_000 }, () => {
     expect(err).toBeInstanceOf(RenderOutOfMemoryError);
     expect((err as RenderOutOfMemoryError).reason).toBe('killed');
     expect((err as Error).message).toMatch(
-      /^the render process was killed \(SIGKILL\), most likely by the system/,
+      /^out of memory: the render process was killed \(SIGKILL\), most likely by the system/,
     );
     const again = await r.renderImage({ scene: gridScene(4), projectId: 'killed', options: solid() });
     expect(again.width).toBe(64);
@@ -289,10 +305,23 @@ describe('render processes', { timeout: 60_000 }, () => {
     );
     expect(oom).toBeInstanceOf(RenderOutOfMemoryError);
     expect((oom as RenderOutOfMemoryError).reason).toBe('heap');
-    expect(oom.message).toMatch(
-      /^the render process ran out of memory \(its JavaScript heap is limited to 512 MB\)/,
+    expect(oom.message).toBe(
+      'out of memory: the render process ran out of its 512 MB JavaScript heap; the server keeps running and ' +
+        'starts a new render process for the next render',
     );
-    expect((renderProcessExitError(null, 'SIGKILL', '') as RenderOutOfMemoryError).reason).toBe('killed');
+    // every out-of-memory variant starts the same way (OUT_OF_MEMORY_PREFIX), with or without a known limit
+    expect(
+      renderProcessExitError(null, 'SIGABRT', 'FATAL ERROR: Reached heap limit Allocation failed').message,
+    ).toBe(
+      'out of memory: the render process ran out of its JavaScript heap; the server keeps running and starts a ' +
+        'new render process for the next render',
+    );
+    const killed = renderProcessExitError(null, 'SIGKILL', '') as RenderOutOfMemoryError;
+    expect(killed.reason).toBe('killed');
+    expect(killed.message).toBe(
+      'out of memory: the render process was killed (SIGKILL), most likely by the system because the machine ' +
+        'ran out of memory; the server keeps running and starts a new render process for the next render',
+    );
     // what Node prints for an uncaught exception: the source line, the error, its stack, its banner
     const stderr =
       'file:///app/dist/render-worker.js:12\n    throw new TypeError(`bad ${x}`);\n    ^\n\n' +
@@ -335,6 +364,7 @@ describe('render processes', { timeout: 60_000 }, () => {
       expect(renderToolError(b).message).toBe(`Rendering failed: ${SHARED_OOM}.`);
       expect(renderToolError(b).code).toBe('FAILED');
       expect(renderToolError(a).message).toContain(OUT_OF_MEMORY_ADVICE);
+      expect(renderToolError(a).code).toBe('OUT_OF_MEMORY');
       expect(alive(pid)).toBe(false);
       // a request sent to the ended process later was not the cause either (a long render that
       // shares the process sends its next band there)
@@ -398,8 +428,8 @@ describe('render processes', { timeout: 60_000 }, () => {
     lease.release();
     expect(a).toBeInstanceOf(RenderOutOfMemoryError);
     expect((a as Error).message).toBe(
-      'the render process ran out of memory (Array buffer allocation failed); the server keeps running and starts ' +
-        'a new render process for the next render',
+      'out of memory: the render process could not allocate memory (Array buffer allocation failed); the server ' +
+        'keeps running and starts a new render process for the next render',
     );
     expect((b as RenderOutOfMemoryError).reason).toBe('shared');
     await until(() => !alive(pid), 10_000, 'the process to be stopped');
@@ -494,18 +524,63 @@ describe('render processes', { timeout: 60_000 }, () => {
 
   it('tells why a render process crashed (its error, not the Node.js banner); the requests behind it can run again', async () => {
     const logs: Logged[] = [];
-    const p = pool({ threads: 1, workerUrl: fixture('render-crash.mjs') }, logs);
+    // the calls are answered once the process's output has ended ('close'), not when the wait for
+    // that end after its exit runs out (30 s here)
+    const p = pool({ threads: 1, workerUrl: fixture('render-crash.mjs'), closeFallbackMs: 30_000 }, logs);
     const lease = await p.lease(1, undefined, { interactive: true });
     const t = lease.threads[0];
+    const t0 = performance.now();
     const [a, b] = await Promise.all([settle(t.call({ type: 'ping' })), settle(t.call({ type: 'ping' }))]);
+    expect(performance.now() - t0).toBeLessThan(10_000);
     lease.release();
     const reason =
       'the render process exited unexpectedly (exit code 1): TypeError: boom in a render process';
     expect((a as Error).message).toBe(reason);
     expect((b as Error).message).toBe(
-      `the render process stopped while it worked on another render that shared it (${reason}); run this render again (a new render process serves it)`,
+      `interrupted: the render process stopped while it worked on another render that shared it (${reason}); run this render again (a new render process serves it)`,
     );
     expect(logs.find((l) => l.msg === 'render process stopped unexpectedly')?.obj.err).toBe(reason);
+  });
+
+  it('ignores a ready message that comes after its start timed out (the process is being stopped)', async () => {
+    const marker = path.join(tmpdir(), `3d-editor-render-ready-${process.pid}-${Date.now()}`);
+    let t!: ProcessThread;
+    // the process starts in a setImmediate callback that blocks the event loop until the process
+    // has sent 'ready': the next turn runs the start timer that ran out (timers come before I/O)
+    // and only then reads the message
+    await new Promise<void>((resolve) =>
+      setImmediate(() => {
+        process.env.RENDER_READY_MARKER = marker;
+        try {
+          t = new ProcessThread(
+            1,
+            'interactive',
+            fixture('render-late-ready.mjs'),
+            { startTimeoutMs: 1 },
+            () => {},
+          );
+        } finally {
+          delete process.env.RENDER_READY_MARKER;
+        }
+        const until = Date.now() + 10_000;
+        while (!existsSync(marker) && Date.now() < until) {
+          // blocks the event loop on purpose
+        }
+        resolve();
+      }),
+    );
+    try {
+      expect(existsSync(marker)).toBe(true);
+      await expect(t.ready).rejects.toThrow('the render process did not start within 1 ms');
+      // its output and IPC channel end after the message that was on its way
+      await t.exited;
+      expect(t.started).toBe(false);
+      expect(t.heapLimitMb).toBeUndefined();
+      expect(t.alive).toBe(false);
+      await expect(t.call({ type: 'ping' })).rejects.toThrow('the render process did not start within 1 ms');
+    } finally {
+      rmSync(marker, { force: true });
+    }
   });
 
   it('ends a busy render process within seconds when its server is killed', async () => {

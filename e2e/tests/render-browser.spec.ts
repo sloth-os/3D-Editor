@@ -91,6 +91,32 @@ test.describe('rendering in the browser', () => {
     await expect(page.getByTestId('render-dialog')).toHaveCount(0);
   });
 
+  test('F12 with the path tracer does not start a render that does not fit into the memory of the tab', async ({
+    page,
+  }) => {
+    // a device that reports 0.25 GB: a render may use half of it, less than a path traced
+    // 1920×1080 image needs (its film, preview and denoising)
+    await page.addInitScript(() =>
+      Object.defineProperty(navigator, 'deviceMemory', { value: 0.25, configurable: true }),
+    );
+    await newProject(page);
+    await page.getByTestId('prop-tab-render').click();
+    await page.getByTestId('render-engine').selectOption('PATHTRACER');
+    await page.getByTestId('viewport').hover();
+    await page.keyboard.press('F12');
+    const dialog = page.getByTestId('render-dialog');
+    await expect(dialog.locator('.error-text')).toHaveText(
+      /^Path tracing was not started: it needs about \d+\.\d GB of memory with one render thread, more than the 0\.1 GB a render may use in this tab \(half the device memory the browser reports, 0\.25 GB, at most 4\.0 GB\) \(about 12 triangles, 2,073,600 pixels\), and running out of memory would end the tab\. Lower the resolution/,
+    );
+    await expect(page.getByTestId('render-status')).toContainText('Failed');
+    // refused before any render worker started
+    expect(page.workers().filter((w) => /\/render\.worker-[\w-]+\.js$/.test(w.url()))).toHaveLength(0);
+    // the tab keeps working
+    await page.locator('.modal .close').click();
+    await expect(page.getByTestId('render-dialog')).toHaveCount(0);
+    await expect(page.getByTestId('outliner-Cube')).toBeVisible();
+  });
+
   test('Render Animation (Ctrl+F12) encodes a few rasterized frames into an animated PNG download', async ({
     page,
   }) => {

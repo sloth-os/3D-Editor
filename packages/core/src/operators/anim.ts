@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { AnimTargetType, FCurve, Interpolation } from '../doc/types';
-import { fcurveKey } from '../doc/scene-doc';
+import { fcurveKey, type SceneDoc } from '../doc/scene-doc';
+import { FrameState } from '../eval/frame-state';
 import { createFCurve, evaluateFCurve, hasKeyframeAt, insertKeyframe, removeKeyframe } from '../anim/fcurve';
 import { isAnimatable, propertyLength, readChannel } from '../anim/properties';
 import type { OperatorContext } from './context';
@@ -38,14 +39,19 @@ export function readTarget(
   }
 }
 
-/** Inserts keyframes for every channel of `path` (or one `index`) at `frame` using current values. */
+/**
+ * Inserts keyframes for every channel of `path` (or one `index`) at `frame` using current values:
+ * `opts.value`, else the value the property shows at the frame of `opts.shown` (a FrameState: an
+ * animated or driven value where it has one, as Blender keys a property's current value), else its
+ * stored value (what an operator that has just set it keys).
+ */
 export function keyProperty(
   ctx: OperatorContext,
   type: AnimTargetType,
   id: string,
   path: string,
   frame: number,
-  opts: { index?: number; value?: number; interpolation?: Interpolation } = {},
+  opts: { index?: number; value?: number; interpolation?: Interpolation; shown?: FrameState } = {},
 ): number {
   if (!isAnimatable(type, path))
     throw new OperatorError(`Property '${path}' of ${type} is not animatable`, 'INVALID_PARAMS');
@@ -54,6 +60,7 @@ export function keyProperty(
   const len = propertyLength(type, path, target);
   if (!len || (readChannel(target, path, 0) === undefined && opts.value === undefined))
     throw new OperatorError(`Property '${path}' does not exist on this ${type}`, 'INVALID_PARAMS');
+  const source = (opts.shown?.get<Record<string, unknown>>(type, id) ?? null) || target;
   const indices =
     opts.index !== undefined && opts.index >= 0 ? [opts.index] : Array.from({ length: len }, (_, i) => i);
   let n = 0;
@@ -61,7 +68,7 @@ export function keyProperty(
     const key = fcurveKey({ target_type: type, target_id: id, path, index });
     const fc: FCurve =
       ctx.doc.getFCurve(key) ?? createFCurve({ target_type: type, target_id: id, path, index });
-    const value = opts.value ?? readChannel(target, path, index);
+    const value = opts.value ?? readChannel(source, path, index) ?? readChannel(target, path, index);
     if (value === undefined) continue;
     ctx.doc.setFCurve(insertKeyframe(fc, frame, value, opts.interpolation));
     n++;
@@ -79,6 +86,33 @@ export function autoKeyTransforms(ctx: OperatorContext, ids: string[]): void {
   for (const id of ids)
     for (const path of ['location', 'rotation_euler', 'scale'])
       keyProperty(ctx, 'object', id, path, ctx.state.frame);
+}
+
+/**
+ * Gives duplicated datablocks their own copy of the originals' animation, as Blender's Duplicate
+ * does with its default Duplicate Data settings (U.dupflag includes Action, so
+ * BKE_id_copy_for_duplicate copies the action of the object, of its data and of the data's shape
+ * keys). `copies` maps each original datablock (`<type>:<id>`, as F-curves and drivers name their
+ * targets) to its copy's id. Its F-curves are copied to the copy, and so are its drivers (Blender
+ * copies the drivers with the animation data), whose variables reading a duplicated datablock read
+ * its copy (Blender relinks the copies' ID pointers to the duplicated IDs: copy_object_set_idnew).
+ */
+export function copyAnimation(doc: SceneDoc, copies: ReadonlyMap<string, string>): void {
+  for (const [key, copy] of copies) {
+    const sep = key.indexOf(':');
+    const type = key.slice(0, sep);
+    const id = key.slice(sep + 1);
+    for (const fc of doc.listFCurves(id))
+      if (fc.target_type === type) doc.setFCurve({ ...fc, target_id: copy });
+    for (const d of doc.listDrivers(id)) {
+      if (d.target_type !== type) continue;
+      const variables = (Array.isArray(d.variables) ? d.variables : []).map((v) => {
+        const to = copies.get(`${v.target_type}:${v.target_id}`);
+        return to ? { ...v, target_id: to } : v;
+      });
+      doc.setDriver({ ...d, target_id: copy, variables });
+    }
+  }
 }
 
 /** Updates keyframes of channels that are already animated (keeps edits visible). */
@@ -117,18 +151,26 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
       id: 'anim.keyframe_insert',
       label: 'Insert Keyframe',
       description:
-        'Insert keyframes on the selected objects for the given keying set at the current (or given) frame.',
+        'Insert keyframes on the selected objects for the given keying set at the current (or given) frame, with ' +
+        'the values the objects show at the current frame (an animated or driven channel its value there, as ' +
+        'Blender keys the current values; a key at another frame gets the value shown at the current one). ' +
+        'Available keys each F-curve the object has, channel by channel.',
       category: 'Animation',
       schema: z.object({ type: keyingSet, frame: z.number().optional() }),
       poll: (ctx) => (selectedObjects(ctx).length ? true : 'No objects selected'),
       execute(ctx, p) {
         const frame = p.frame ?? ctx.state.frame;
+        const shown = new FrameState(ctx.doc, ctx.state.frame);
         let n = 0;
         for (const o of selectedObjects(ctx)) {
           if (p.type === 'Available') {
-            const animated = new Set(ctx.doc.listFCurves(o.id).map((f) => f.path));
-            for (const path of animated) n += keyProperty(ctx, 'object', o.id, path, frame);
-          } else for (const path of pathsFor(p.type)) n += keyProperty(ctx, 'object', o.id, path, frame);
+            // each F-curve the object has, channel by channel (Blender's RKS_GEN_available)
+            for (const fc of ctx.doc.listFCurves(o.id))
+              if (fc.target_type === 'object')
+                n += keyProperty(ctx, 'object', o.id, fc.path, frame, { index: fc.index, shown });
+          } else
+            for (const path of pathsFor(p.type))
+              n += keyProperty(ctx, 'object', o.id, path, frame, { shown });
         }
         ctx.report('INFO', `Inserted ${n} keyframes at frame ${frame}`);
         return { inserted: n };
@@ -180,7 +222,9 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
         'Insert a keyframe on any animatable property: target_type object|material|light|camera|world, path e.g. ' +
         '"location", "energy", "base_color". target: an object name or id (for light/camera the light/camera ' +
         'object, for material an object with one material), or a datablock id or name; "world" for the world. ' +
-        'index -1 keys all channels. value overrides the current value. Returns {inserted, target_id}.',
+        'index -1 keys all channels. value overrides the current value: without it the value the property shows ' +
+        'at the current frame is keyed (an animated or driven value there, as Blender keys the current value), ' +
+        'also into another `frame`. Returns {inserted, target_id}.',
       category: 'Animation',
       schema: z.object({
         target_type: z.enum(['object', 'material', 'light', 'camera', 'world']),
@@ -213,6 +257,7 @@ export function registerAnimOperators(reg: OperatorRegistry): void {
           index: p.index,
           value: p.value,
           interpolation: p.interpolation,
+          shown: new FrameState(ctx.doc, ctx.state.frame),
         });
         return { inserted: n, target_id: id };
       },

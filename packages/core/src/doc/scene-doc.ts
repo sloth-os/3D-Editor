@@ -440,16 +440,27 @@ export class SceneDoc {
    * `parentWorld` is the parent's matrix as the scene evaluates it at the current frame
    * (FrameState.parent: a bone's posed matrix for an object parented to a bone, an animated or
    * constrained parent where it is); left out, it is computed from the stored values, which know
-   * nothing of bones, poses, animation or constraints.
+   * nothing of bones, poses, animation or constraints. `held`: the values the object's channels
+   * hold at the current frame (an animated channel's value there, FrameState.byId), which the new
+   * channels are compared with and kept from (whole turns, signs) instead of the stored ones; a
+   * channel it does not change is then not written either. Returns the channels written (null
+   * when none).
    */
-  setWorldMatrix(id: string, world: Mat4, parentWorld?: Mat4 | null): void {
-    const o = this.getObject(id);
-    if (!o) return;
+  setWorldMatrix(
+    id: string,
+    world: Mat4,
+    parentWorld?: Mat4 | null,
+    held?: TransformChannels,
+  ): Partial<ObjectData> | null {
+    const stored = this.getObject(id);
+    if (!stored) return null;
+    const o = held ? { ...stored, ...held } : stored;
     const parent = parentWorld === undefined ? (o.parent ? this.worldMatrix(o.parent) : null) : parentWorld;
-    // the world matrix of the stored values, computed as worldMatrix(id) computes it
+    // the world matrix of the channels, computed as worldMatrix(id) computes it
     const current = parent ? multiply4(parent, this.localMatrix(o)) : this.localMatrix(o);
     const patch = changedTransform(o, world, current, parent);
     if (patch) this.updateObject(id, patch);
+    return patch;
   }
 
   /** True if `ancestor` is `id` or one of its parents. */

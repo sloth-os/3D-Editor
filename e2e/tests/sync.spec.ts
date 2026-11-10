@@ -56,6 +56,12 @@ test.describe('multi-device real-time sync', () => {
     const del = await fetch(`${PLAIN}/api/projects/${id}`, { method: 'DELETE' });
     expect(del.status).toBe(204);
     await expect(status).toHaveAttribute('data-status', 'deleted');
+    // (the status bar used to say 'Local only', as for a browser without a server)
+    await expect(status).toHaveText('Deleted on server');
+    await expect(status).toHaveAttribute(
+      'title',
+      /^The server deleted this project\. This browser keeps its copy/,
+    );
     await expect(page.getByText('was deleted on the server. This browser keeps its copy')).toHaveCount(1);
     // it does not connect again by itself, also when the browser comes back online
     await page.evaluate(() => window.dispatchEvent(new Event('online')));

@@ -23,7 +23,8 @@ import {
   modifierDependencies,
   registerBuiltinModifiers,
 } from '../modifiers';
-import { geometryMemoryRefusals } from './memory';
+import { curveMemoryRefusal, geometryMemoryRefusals } from './memory';
+import { isMeshMemoryError } from '../mesh/memory';
 import { stableStringify } from '../util/json';
 import type { ArmaturePose } from '../armature/types';
 import type { ConstraintError } from '../constraints/types';
@@ -229,7 +230,11 @@ export class SceneEvaluator {
           bevelObj ? `${bevelObj.scale[0]},${bevelObj.scale[1]}` : '',
         ].join('#');
         const cached = this.curveCache.get(o.id);
-        if (cached && cached.key === key) entry = cached;
+        // a host's memory check (memory.ts) may refuse the surface of a dense curve or a long text:
+        // none is built, nor its wire
+        const refused = cached?.key === key ? null : curveMemoryRefusal(o, curve, { forRender, bevelCurve });
+        if (refused) fs.errors.push({ source: `curve:${o.id}`, message: refused });
+        else if (cached && cached.key === key) entry = cached;
         else {
           const result = curveToMesh(curve, {
             forRender,
@@ -242,7 +247,8 @@ export class SceneEvaluator {
           this.curveCache.set(o.id, entry);
         }
         // curve problems (missing bevel object, surface too dense, …) are reported every evaluation
-        for (const message of entry.result.errors ?? []) fs.errors.push({ source: `curve:${o.id}`, message });
+        for (const message of entry?.result.errors ?? [])
+          fs.errors.push({ source: `curve:${o.id}`, message });
       }
       curveResults.set(o.id, entry);
       return entry;
@@ -291,7 +297,16 @@ export class SceneEvaluator {
         let shapeKeys: ShapeKeyData[] = [];
         if (o.type === 'MESH') {
           const override = opts.meshOverrides?.get(id);
-          base = override ?? doc.getMesh(o.data);
+          try {
+            base = override ?? doc.getMesh(o.data);
+          } catch (e) {
+            // a host's memory check refused to decode the stored mesh (mesh/memory.ts): the object
+            // has no geometry in this evaluation, and says why
+            if (!isMeshMemoryError(e)) throw e;
+            fs.errors.push({ source: `mesh:${o.id}`, message: e.message });
+            evaluated.set(id, null);
+            return null;
+          }
           if (override) {
             let t = this.overrideTokens.get(override);
             if (t === undefined) this.overrideTokens.set(override, (t = ++this.overrideCounter));

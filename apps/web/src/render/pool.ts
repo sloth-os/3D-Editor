@@ -3,6 +3,7 @@ import type { SceneDoc } from '@3d-editor/core';
 import { RenderWorkerEngine, handleWorkerMessage } from './worker-engine';
 import {
   RenderCancelledError,
+  RenderMemoryError,
   StaleDocumentError,
   type DocPayload,
   type WorkerRequest,
@@ -17,7 +18,7 @@ import {
  * "worker" runs the same code on the main thread between event loop turns.
  */
 
-/** Most render workers (more cores would mostly add memory: every worker holds the scene). */
+/** Most render workers (more cores would mostly add memory: every rendering worker holds a copy of the scene). */
 export const MAX_THREADS = 8;
 /** Workers without work are stopped after this long (milliseconds). */
 const IDLE_TIMEOUT_MS = 90_000;
@@ -153,7 +154,13 @@ export class RenderThread {
     if (!c) return;
     this.calls.delete(m.id);
     if (m.type === 'error')
-      c.reject(m.code === 'STALE_DOCUMENT' ? new StaleDocumentError(m.message) : new Error(m.message));
+      c.reject(
+        m.code === 'STALE_DOCUMENT'
+          ? new StaleDocumentError(m.message)
+          : m.code === 'RENDER_MEMORY'
+            ? new RenderMemoryError(m.message)
+            : new Error(m.message),
+      );
     else c.resolve(m.result as never);
     if (!this.calls.size) this.scheduleIdle();
   }

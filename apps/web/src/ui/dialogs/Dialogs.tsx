@@ -573,13 +573,17 @@ const PHASE_TEXT: Record<PathTraceStatus['phase'], string> = {
 };
 
 /** Blender-style render info line of a path traced render. */
-function pathTraceInfo(job: PathTraceJob, frame: number): string {
+export function pathTraceInfo(
+  job: Pick<PathTraceJob, 'status' | 'elapsedMs' | 'width' | 'height'>,
+  frame: number,
+): string {
   const st = job.status;
   const parts = [`Frame ${frame}`, `Time ${formatRenderTime(job.elapsedMs)}`];
   if (st.phase === 'rendering' || st.phase === 'cancelled' || st.phase === 'done')
     parts.push(st.total ? `Sample ${st.samples}/${st.total}` : `Sample ${st.samples}`);
   if (st.phase === 'finishing') parts.push(job.status.total ? 'Denoising' : 'Finishing');
-  if (st.threads) parts.push(`${st.threads} thread${st.threads === 1 ? '' : 's'}`);
+  if (st.threads)
+    parts.push(`${st.threads} thread${st.threads === 1 ? '' : 's'}${st.limitedByMemory ? ' (memory)' : ''}`);
   parts.push(`${job.width}×${job.height}`);
   return parts.join(' | ');
 }

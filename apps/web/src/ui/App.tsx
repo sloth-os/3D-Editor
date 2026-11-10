@@ -15,7 +15,7 @@ import { DialogHost, ProjectList } from './dialogs/Dialogs';
 import { hoveredArea, run } from '../editor/editor';
 import { createProject } from '../project/manager';
 import { Icon } from './icons';
-import type { ProjectSession } from '../project/session';
+import { deletedOnServerNote, type ProjectSession } from '../project/session';
 import { pwaUpdate, applyPwaUpdate } from '../pwa/register';
 
 function Splitter({ dir, onDrag }: { dir: 'v' | 'h'; onDrag: (delta: number) => void }) {
@@ -76,11 +76,16 @@ function Presence({ s }: { s: ProjectSession }) {
   );
 }
 
-function SyncStatus({ s }: { s: ProjectSession }) {
+/**
+ * The status bar's sync and storage status. Sync status `deleted`: the server closed the connection
+ * because it deleted the project, and the browser no longer connects to it by itself; the tooltip
+ * says what the toast said then (ProjectSession.tellWhenDeletedOnServer).
+ */
+export function SyncStatus({ s }: { s: ProjectSession }) {
   const st = s.provider?.status.value ?? 'disabled';
   const wd = s.webdav;
   const wdStatus = wd?.status.value;
-  const dot = st === 'connected' ? 'ok' : st === 'connecting' ? 'warn' : 'off';
+  const dot = st === 'connected' ? 'ok' : st === 'connecting' ? 'warn' : st === 'deleted' ? 'err' : 'off';
   const label =
     st === 'connected'
       ? `Live · ${s.peers.value.length + 1} device(s)`
@@ -88,10 +93,18 @@ function SyncStatus({ s }: { s: ProjectSession }) {
         ? 'Connecting…'
         : st === 'offline'
           ? 'Offline'
-          : 'Local only';
+          : st === 'deleted'
+            ? 'Deleted on server'
+            : 'Local only';
+  const title =
+    st !== 'deleted'
+      ? 'Real-time sync'
+      : wd?.target.viaServer
+        ? `The server deleted this project. ${deletedOnServerNote(true)}`
+        : `The server deleted this project. ${deletedOnServerNote(false)} Save (Ctrl+S) or a reload tries the server again.`;
   return (
     <>
-      <span title="Real-time sync" data-testid="sync-status" data-status={st}>
+      <span title={title} data-testid="sync-status" data-status={st}>
         <span class={`dot ${dot}`} />
         {label}
         {s.provider?.latencyMs.value != null && st === 'connected'

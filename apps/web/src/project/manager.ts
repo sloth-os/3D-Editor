@@ -1,4 +1,4 @@
-import { SceneDoc, newUuid, type ProjectInfo } from '@3d-editor/core';
+import { IncompleteListingError, SceneDoc, newUuid, type ProjectInfo } from '@3d-editor/core';
 import { localIndex } from './local-index';
 import { ProjectSession } from './session';
 import { resolveWebDAV, syncRecords } from '../storage/webdav';
@@ -42,7 +42,8 @@ export async function listProjects(): Promise<{ projects: ProjectListEntry[]; er
     target && navigator.onLine
       ? target.store.listProjects().catch((e: unknown) => {
           errors.push(`WebDAV: ${e instanceof Error ? e.message : String(e)}`);
-          return [] as ProjectInfo[];
+          // the projects whose project.json was read are listed; the error names the others
+          return e instanceof IncompleteListingError ? e.listed : ([] as ProjectInfo[]);
         })
       : Promise.resolve([] as ProjectInfo[]),
     serverProjects(),

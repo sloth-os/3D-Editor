@@ -1,5 +1,6 @@
 import type { EdgeAttr, MeshData } from './types';
 import { edgeKey, parseEdgeKey } from './types';
+import { checkMeshDecode, type MeshLayout } from './memory';
 
 /*
  * Compact little-endian binary encoding of MeshData, used to store meshes inside the Yjs document
@@ -100,6 +101,16 @@ export function decodeMesh(bytes: Uint8Array): MeshData {
     o += 4;
     return n;
   });
+  // a host that keeps its heap in bounds (the server) may refuse a mesh too large for it (memory.ts)
+  checkMeshDecode({
+    vertices: V,
+    faces: F,
+    corners: C,
+    uvs: (flags & 1) !== 0,
+    colors: (flags & 2) !== 0,
+    edgeAttrs: E,
+    looseEdges: L,
+  });
   const positions = new Array<number>(V * 3);
   for (let i = 0; i < V * 3; i++, o += 4) positions[i] = dv.getFloat32(o, true);
   const sizes = new Array<number>(F);
@@ -153,4 +164,19 @@ export function decodeMesh(bytes: Uint8Array): MeshData {
 export function peekMeshCounts(bytes: Uint8Array): { vertices: number; faces: number; corners: number } {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return { vertices: dv.getUint32(8, true), faces: dv.getUint32(12, true), corners: dv.getUint32(16, true) };
+}
+
+/** Reads only the header: the counts and layers (cheap, for memory estimates; see memory.ts). */
+export function peekMeshLayout(bytes: Uint8Array): MeshLayout {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const flags = dv.getUint16(6, true);
+  return {
+    vertices: dv.getUint32(8, true),
+    faces: dv.getUint32(12, true),
+    corners: dv.getUint32(16, true),
+    uvs: (flags & 1) !== 0,
+    colors: (flags & 2) !== 0,
+    edgeAttrs: dv.getUint32(20, true),
+    looseEdges: dv.getUint32(24, true),
+  };
 }

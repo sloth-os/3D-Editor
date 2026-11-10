@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import * as THREE from 'three';
-import { SceneDoc, createEditorState, createOperatorRegistry, type OperatorContext } from '@3d-editor/core';
+import {
+  SceneDoc,
+  createEditorState,
+  createFCurve,
+  createOperatorRegistry,
+  insertKeyframe,
+  type OperatorContext,
+} from '@3d-editor/core';
 import { ViewportInteraction } from '../src/viewport/interaction';
 import type { ViewportEngine } from '../src/viewport/engine';
 import type { ProjectSession } from '../src/project/session';
@@ -34,7 +41,7 @@ function setup() {
     overlay: new THREE.Scene(),
     onAfterRender: afterRender,
     shownPose: { distance: 10 },
-    ev: null,
+    ev: null as unknown,
     requestRender() {},
   };
   const tool = { value: 'move' };
@@ -51,7 +58,7 @@ function setup() {
     for (const f of afterRender) f();
     return (interaction as unknown as { gizmoProxy: THREE.Object3D }).gizmoProxy.position.toArray();
   };
-  return { doc, state, run, tool, gizmoAt };
+  return { doc, state, run, tool, engine, gizmoAt };
 }
 
 describe('the transform gizmo sits on the pivot of the transform it starts', () => {
@@ -68,5 +75,24 @@ describe('the transform gizmo sits on the pivot of the transform it starts', () 
     expect(t.gizmoAt()).toEqual([1, 0, 0]);
     t.tool.value = 'rotate';
     expect(t.gizmoAt()).toEqual([1, 4, 0]);
+  });
+
+  it('moves when the scene is evaluated anew and when the frame changes', () => {
+    const t = setup();
+    const id = t.doc.addObject({ type: 'EMPTY', name: 'A', location: [1, 0, 0] });
+    let fc = createFCurve({ target_type: 'object', target_id: id, path: 'location', index: 1 });
+    fc = insertKeyframe(fc, 1, 0, 'LINEAR');
+    fc = insertKeyframe(fc, 11, 10, 'LINEAR');
+    t.doc.setFCurve(fc);
+    t.state.selectedIds = [id];
+    t.state.activeId = id;
+    expect(t.gizmoAt()).toEqual([1, 0, 0]);
+    // another frame, before the viewport evaluated it
+    t.state.frame = 6;
+    expect(t.gizmoAt()).toEqual([1, 5, 0]);
+    // an edit the viewport evaluated (the document, the selection and the frame stay the same)
+    t.doc.updateObject(id, { location: [3, 0, 0] });
+    t.engine.ev = {};
+    expect(t.gizmoAt()).toEqual([3, 5, 0]);
   });
 });
