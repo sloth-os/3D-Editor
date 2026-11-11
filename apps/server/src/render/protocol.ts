@@ -200,6 +200,12 @@ export type WorkerRequest =
   | { type: 'export'; id: number; doc: DocRef; format: ExportFormat; options: ExportJobOptions }
   /** Drops the cached documents (an idle thread frees its memory; no response). */
   | { type: 'clear' }
+  /**
+   * Part of the state of document `key` at `version` (`total` bytes; this part starts at
+   * `offset`; no response). The pool sends a state larger than `DOC_PART_BYTES` in such parts,
+   * followed by the request that needs it, whose `doc` then has no `update`.
+   */
+  | { type: 'doc-part'; key: string; version: number; offset: number; total: number; bytes: Uint8Array }
   | { type: 'ping'; id: number }
   /**
    * Test-only requests, answered only by render processes started with RENDER_WORKER_TEST_JOBS=1

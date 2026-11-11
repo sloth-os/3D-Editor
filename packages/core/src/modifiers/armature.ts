@@ -9,7 +9,7 @@ import {
   meshToArmatureSpace,
   skinPositions,
 } from '../armature/skinning';
-import type { ModifierDef } from './registry';
+import { disabledObjectParam, type ModifierDef } from './registry';
 import { transformPositions, withPositions, zObjectRef } from './util';
 
 const schema = z.object({
@@ -44,6 +44,10 @@ export const armatureModifier: ModifierDef<typeof schema> = {
     'modifiers that change the topology (e.g. Subdivision), since vertex groups only match the original vertices.',
   schema,
   dependencies: (p) => (p.object ? [p.object] : []),
+  // rna_modifier.cc: `RNA_MOD_OBJECT_SET(Armature, object, OB_ARMATURE);`
+  objectTypes: { object: ['ARMATURE'] },
+  // MOD_armature.cc is_disabled: `return !amd->object || amd->object->type != OB_ARMATURE;`
+  disabled: (p, ctx) => disabledObjectParam(ctx, p.object, ['ARMATURE'], 'object', 'an armature'),
   apply(mesh, p, ctx) {
     if (!p.object) return mesh;
     const n = vertexCount(mesh);

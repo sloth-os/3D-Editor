@@ -320,17 +320,31 @@ describe('MCP fixes for agents', () => {
     await ok('add_object', { project: id, type: 'uv_sphere', name: 'Target' });
     await op(id, 'object.constraint_add', { object: 'Box', type: 'COPY_LOCATION', target: 'Target' });
     await op(id, 'object.constraint_add', { object: 'Target', type: 'COPY_LOCATION', target: 'Box' });
-    await ok('add_modifier', { project: id, object: 'Cube', type: 'ARMATURE', params: { object: 'Box' } });
+    // a modifier that fails when it is evaluated: a Curve modifier with a curve to follow and a vertex
+    // group the mesh does not have (an Armature modifier whose object is a mesh, used here before, is
+    // refused by object.modifier_add since round 11, as Blender's object setter refuses it)
+    await ok('add_object', { project: id, type: 'bezier_curve', name: 'Path' });
+    await ok('add_modifier', {
+      project: id,
+      object: 'Cube',
+      type: 'CURVE',
+      params: { object: 'Path', vertex_group: 'Missing' },
+    });
     // only one object listed: the problems still cover all of them
     const scene = await ok('get_scene', { project: id, max_objects: 1 });
     expect(scene.problems).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ source: 'constraint', message: expect.stringMatching(/cycle/) }),
-        expect.objectContaining({ source: 'modifier', object: 'Cube', modifier: 'Armature' }),
+        expect.objectContaining({
+          source: 'modifier',
+          object: 'Cube',
+          modifier: 'Curve',
+          message: expect.stringMatching(/Vertex group 'Missing' not found/),
+        }),
       ]),
     );
     const cube = await ok('get_object', { project: id, object: 'Cube' });
-    expect(cube.modifier_errors[0]).toMatchObject({ modifier: 'Armature' });
+    expect(cube.modifier_errors[0]).toMatchObject({ modifier: 'Curve' });
   });
 
   it('counts the instances renders show and bounds material users (review #9, #12)', async () => {

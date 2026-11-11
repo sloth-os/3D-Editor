@@ -61,14 +61,20 @@ export function instanceBound(
     if (!ref || ref === ROOT_COLLECTION_ID) return null;
     return collectionIds.has(ref) ? ref : (collectionNames.get(ref) ?? null);
   };
+  // lists grown in place: copying a collection's list for every object it holds took seconds for
+  // tens of thousands of objects (20,000 in one collection: 3.3–3.6 s)
+  const append = <T>(m: Map<string, T[]>, key: string, value: T) => {
+    const list = m.get(key);
+    if (list) list.push(value);
+    else m.set(key, [value]);
+  };
   const children = new Map<string, string[]>();
   for (const c of collections) {
     if (c.id === ROOT_COLLECTION_ID) continue;
-    const parent = c.parent ?? ROOT_COLLECTION_ID;
-    children.set(parent, [...(children.get(parent) ?? []), c.id]);
+    append(children, c.parent ?? ROOT_COLLECTION_ID, c.id);
   }
   const inCollection = new Map<string, ObjectData[]>();
-  for (const o of objects) inCollection.set(o.collection, [...(inCollection.get(o.collection) ?? []), o]);
+  for (const o of objects) append(inCollection, o.collection, o);
   const memberMemo = new Map<string, ObjectData[]>();
   /** Objects of a collection and its child collections. */
   const members = (cid: string): ObjectData[] => {

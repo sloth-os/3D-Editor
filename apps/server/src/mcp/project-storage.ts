@@ -1,14 +1,15 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { IncompleteListingError, type ProjectFileStore } from '@3d-editor/core';
-import type { ProjectListing, Room } from '../sync/room';
-import type { RoomManager } from '../sync/room-manager';
+import { settlesBefore, type ProjectListing, type Room } from '../sync/room';
+import type { RoomManager, StoredNames } from '../sync/room-manager';
 
 /*
  * What the project tools tell agents about storage that other writers share: a project deleted
  * from storage elsewhere while this server has it open (Room.deletedFromStorage), and a listing of
  * the projects in storage that failed (RoomManager.listProjects then lists the projects this
- * server has loaded, and those whose project.json it read when only some of those reads failed).
- * docs/storage-and-sync.md (Deleted projects) has the rules.
+ * server has loaded, and those whose project.json it read when only some of those reads failed),
+ * also when a tool looks up a project by name (listForName). docs/storage-and-sync.md (Deleted
+ * projects) has the rules.
  */
 
 /**
@@ -154,4 +155,102 @@ export async function listProjects(
   const call: ListingOutcome = { failed: false, partial: false };
   const projects = await listing.run(call, () => rooms.listProjects());
   return { projects, ...call };
+}
+
+/** A listing of storage that lookups of projects by name share (see {@link listForName}). */
+interface NameListing {
+  done: Promise<StoredNames>;
+  /** A lookup stopped waiting for it: storage did not answer in time. */
+  late: boolean;
+}
+
+/**
+ * The last listing for lookups by name that listed storage (not `failed`) and when it finished, and
+ * whether the last listing that finished, whatever it found, took longer than requests wait for
+ * storage (RoomManager.readWaitMs): see {@link listForName}.
+ */
+interface LastNames {
+  names: StoredNames | null;
+  at: number;
+  slow: boolean;
+}
+
+/** The listing that lookups of projects by name share while it goes on, by server. */
+const nameListings = new WeakMap<RoomManager, NameListing>();
+/** The last listings for lookups by name that finished, by server. */
+const lastNames = new WeakMap<RoomManager, LastNames>();
+
+/**
+ * How old a listing for lookups by name may be that a lookup compares a name with at once while
+ * storage lists its projects slowly (see {@link listForName}).
+ */
+export const SLOW_LISTING_MAX_AGE_MS = 60_000;
+
+/** A listing for lookups by name that a lookup compares with at once (see {@link listForName}). */
+export interface EarlierNames {
+  names: StoredNames;
+  /** How long ago it finished. */
+  ageMs: number;
+}
+
+/**
+ * The listing of storage that a lookup of a project by name compares names with
+ * (AgentSession.findProject; RoomManager.listNames: one listing of the projects folder, and the
+ * project.json of the stored projects that this server has not loaded and that are new or changed):
+ * `answered` when it finished by `deadline`, else null, and `finished` whenever it finishes (storage
+ * that does not answer takes 30 s per request on WebDAV). The lookups that come while a listing goes
+ * on share it, and once one of them stopped waiting for it, the others do not wait for it until it
+ * has finished (`answered` is null at once), as requests wait for other reads of storage
+ * (RoomManager.waitFor). When the last listing that finished took longer than requests wait for
+ * storage (RoomManager.readWaitMs: storage that lists its projects slowly), a lookup does not wait
+ * for one: `earlier` is the last listing that listed storage, when it finished within
+ * {@link SLOW_LISTING_MAX_AGE_MS}, and a new listing goes on meanwhile (each round of listings used
+ * to cost a lookup the whole wait: 5 s every second or third call while listing took 6 s). Without
+ * storage, the projects this server has loaded are all the projects: they are `answered` at once.
+ */
+export async function listForName(
+  rooms: RoomManager,
+  deadline: number,
+): Promise<{ answered: StoredNames | null; finished: Promise<StoredNames>; earlier?: EarlierNames }> {
+  if (!rooms.persistence.store) {
+    const names = await rooms.listNames();
+    return { answered: names, finished: Promise.resolve(names) };
+  }
+  let shared = nameListings.get(rooms);
+  if (!shared) {
+    const startedAt = Date.now();
+    const started: NameListing = {
+      late: false,
+      done: rooms
+        .listNames()
+        .then((names) => {
+          const at = Date.now();
+          const before = lastNames.get(rooms);
+          // (a listing that failed, also in part, keeps the one before as the last that listed storage)
+          const kept = !names.failed ? { names, at } : before ? { names: before.names, at: before.at } : null;
+          lastNames.set(rooms, {
+            names: kept?.names ?? null,
+            at: kept?.at ?? at,
+            slow: at - startedAt > rooms.readWaitMs,
+          });
+          return names;
+        })
+        .finally(() => {
+          if (nameListings.get(rooms) === started) nameListings.delete(rooms);
+        }),
+    };
+    // a lookup that got its answer elsewhere does not wait for this listing
+    started.done.catch(() => undefined);
+    shared = started;
+    nameListings.set(rooms, shared);
+  }
+  const { done } = shared;
+  const now = Date.now();
+  const last = lastNames.get(rooms);
+  if (last?.slow && last.names && now - last.at <= SLOW_LISTING_MAX_AGE_MS)
+    return { answered: null, finished: done, earlier: { names: last.names, ageMs: now - last.at } };
+  const waits = !shared.late && deadline > now;
+  if (await settlesBefore(done, waits ? deadline : now)) return { answered: await done, finished: done };
+  if (waits) shared.late = true;
+  return { answered: null, finished: done };
 }

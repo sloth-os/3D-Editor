@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   SceneDoc,
   SceneEvaluator,
+  createFCurve,
   createMesh,
   getModifierDef,
+  insertKeyframe,
   meshSize,
   registerBuiltinModifiers,
   registerModifier,
@@ -15,6 +17,7 @@ import { InProcessWorker, RenderPool, startPathTrace, type WorkerLike } from '..
 import { ADOPTER_COPIES_STOP, stopsAdopters } from '../src/render/path-trace';
 import {
   EvaluationGuard,
+  RasterEvaluationGuard,
   SKIPPED_AFTER_REFUSAL,
   bevelEstimate,
   guardedEvaluation,
@@ -22,14 +25,17 @@ import {
 } from '../src/render/guard';
 import {
   BEVEL_HEAP_BYTES,
+  COMPILED_BYTES_PER_TRIANGLE,
   INSTANCE_BYTES,
   PREPARE_BYTES_PER_TRIANGLE,
+  RASTER_BYTES_PER_TRIANGLE,
   WORKER_BASE_BYTES,
   YOUNG_GENERATION_BYTES,
   estimateRender,
   estimatedNeeds,
   planRenderThreads,
   renderMemory,
+  type RenderEstimate,
   type RenderNeeds,
   type TabMemory,
 } from '../src/render/memory';
@@ -115,19 +121,27 @@ function countBevels(): { count: () => number; restore: () => void } {
   return { count: () => n, restore: () => registerModifier(def) };
 }
 
-/** A worker engine with its own thread record, and its prepare. */
+/**
+ * A worker engine with its own thread record, and its prepare of frame 1: with the tab's `memory`,
+ * the page's estimate of the document at that frame unless `estimate` is given (null: none).
+ */
 function engine() {
   const e = new RenderWorkerEngine(null);
   const thread = { docKey: null as string | null, stateVector: null as Uint8Array | null };
   return {
     engine: e,
-    prepare: (doc: SceneDoc, memory?: TabMemory, job = 1): Promise<PreparedInfo> =>
+    prepare: (
+      doc: SceneDoc,
+      memory?: TabMemory,
+      job = 1,
+      estimate?: RenderEstimate | null,
+    ): Promise<PreparedInfo> =>
       e.prepare(
         job,
         new DocumentSnapshot(doc).payload(thread),
         { width: 24, height: 16, frame: 1 },
         memory,
-        memory ? estimateRender(doc) : undefined,
+        estimate === null ? undefined : (estimate ?? (memory ? estimateRender(doc, true, 1) : undefined)),
       ),
   };
 }
@@ -253,8 +267,12 @@ describe('Bevel sizes counted from the edges it bevels', () => {
       ['subdivided 6 times, every edge, 2 segments', [subdivided(6)], grid(2), 148],
       ['subdivided 6 times, every edge, 1 segment', [subdivided(6)], grid(1), 94],
     ];
+    // (the subdivided cube evaluated once for both)
+    const meshes = new Map<string, MeshData>();
     for (const [name, mods, p, mb] of measured) {
-      const bytes = bevelEstimate(evaluated(mods), params({ width: 0.05, ...p })).bytes;
+      const key = JSON.stringify(mods);
+      if (!meshes.has(key)) meshes.set(key, evaluated(mods));
+      const bytes = bevelEstimate(meshes.get(key)!, params({ width: 0.05, ...p })).bytes;
       expect(bytes, name).toBeGreaterThanOrEqual(mb * MB);
       expect(bytes, name).toBeLessThan(1.7 * mb * MB);
     }
@@ -262,7 +280,9 @@ describe('Bevel sizes counted from the edges it bevels', () => {
     // nothing to bevel, 258 MB (40 MB without the Bevel)
     expect(BEVEL_HEAP_BYTES.input * 196_864).toBeGreaterThanOrEqual((258 - 40) * MB);
     expect(BEVEL_HEAP_BYTES.input * 196_864).toBeLessThan(1.7 * (258 - 40) * MB);
-  });
+    // six evaluated meshes of up to 24,576 faces and seven Bevels counted: 0.9 s under coverage with
+    // the render tests only, 1.8 s in the whole suite on a busy machine
+  }, 15_000);
 });
 
 describe('the check of the first worker while it evaluates the scene', () => {
@@ -279,7 +299,7 @@ describe('the check of the first worker while it evaluates the scene', () => {
       const refused = w.prepare(doc, memory);
       await expect(refused).rejects.toThrow(RenderMemoryError);
       await expect(refused).rejects.toThrow(
-        /^Path tracing was not started: its render thread needs about 0\.034 GB of JavaScript heap, and the tab, which already uses 0\.0 GB, has 0\.032 GB of its 0\.2 GB left for it \(about 11,532 triangles, 384 pixels\), and running out of memory would end the tab\. The Bevel modifier 'Bev' of 'BevCube' would make 11,532 of these triangles \(lower its segments\)\. Lower the resolution or the triangles/,
+        /^Path tracing was not started: its render thread needs about 0\.034 GB of JavaScript heap, more than the 0\.032 GB the tab has left for it: a render may fill 0\.032 GB of its 0\.165 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working \(about 11,532 triangles, 384 pixels\), and running out of memory would end the tab\. The Bevel modifier 'Bev' of 'BevCube' would make 11,532 of these triangles \(lower its segments\)\. Lower the triangles \(subdivision render levels, curve and text render resolution, objects in the scene\), or render with the RASTER engine\.$/,
       );
       // the Bevel never ran, and nothing was compiled for the job
       expect(bevels.count()).toBe(0);
@@ -350,6 +370,56 @@ describe('the check of the first worker while it evaluates the scene', () => {
     );
     expect(renderMemory(small.refusal!.needs, 1).heap).toBe(
       WORKER_BASE_BYTES + (12 + made) * PREPARE_BYTES_PER_TRIANGLE.heap + INSTANCE_BYTES.heap * est.instances,
+    );
+  });
+
+  it("counts what a modifier makes from its real input: an Array's length, a Boolean's operand, the scene's images", async () => {
+    // a tab without a budget refuses the first modifier checked, and says what it would make
+    const reason = (doc: SceneDoc) =>
+      engine()
+        .prepare(doc, { ...roomy, budget: 0 })
+        .then(
+          () => 'prepared',
+          (err: Error) => err.message,
+        );
+    // an Array fitted to 40 m: 21 copies of the 2 m cube (the length is measured on its input)
+    const fitted = SceneDoc.create();
+    const cube = fitted.findObjectByName('Cube')!;
+    fitted.updateObject(cube.id, {
+      modifiers: [modifier('A', 'ARRAY', { fit_type: 'FIT_LENGTH', fit_length: 40 })],
+    });
+    expect(await reason(fitted)).toContain(
+      "The Array modifier 'A' of 'Cube' would make 252 of these triangles (lower its count).",
+    );
+    // a Boolean with a grid of 1,600 faces: the operand's faces are in its result
+    const cut = SceneDoc.create();
+    const positions: number[] = [];
+    const faces: number[][] = [];
+    for (let y = 0; y <= 40; y++) for (let x = 0; x <= 40; x++) positions.push(x / 10 - 2, y / 10 - 2, 0);
+    for (let y = 0; y < 40; y++)
+      for (let x = 0; x < 40; x++) faces.push([y * 41 + x, y * 41 + x + 1, y * 41 + x + 42, y * 41 + x + 41]);
+    const operand = cut.addObject({
+      name: 'Cutter',
+      type: 'MESH',
+      data: cut.addMesh('Grid', createMesh({ positions, faces })),
+      hide_render: true,
+    });
+    cut.updateObject(cut.findObjectByName('Cube')!.id, {
+      modifiers: [modifier('b', 'BOOLEAN', { object: operand, operation: 'UNION' })],
+    });
+    expect(await reason(cut)).toContain(
+      "The Boolean modifier 'b' of 'Cube' would make 3,212 of these triangles (lower the faces of both meshes).",
+    );
+    // the decoded images are in the compiled scene the check counts
+    const est = { ...estimateRender(SceneDoc.create(), true, 1), imageBytes: 5 * MB };
+    const guard = new EvaluationGuard(est, 24 * 16, { ...roomy, budget: 0 });
+    guard.before(
+      { type: 'TRIANGULATE', label: 'Triangulate' },
+      { result: { faces: 12, corners: 36, vertices: 8 }, bytes: 1, lower: 'the faces of the mesh' },
+      12,
+    );
+    expect(guard.refusal!.needs.sceneBytes).toBe(
+      12 * COMPILED_BYTES_PER_TRIANGLE + est.instances * INSTANCE_BYTES.scene + 5 * MB,
     );
   });
 
@@ -430,6 +500,66 @@ describe('the check of the first worker while it evaluates the scene', () => {
     }
   });
 
+  it('estimates the document at the frame it renders when the page sent no estimate', async () => {
+    // a cable stored without a bevel (a wire) whose keyed bevel depth makes a tube at frame 1: 5 spans
+    // × 24 samples + 1 points, a ring of 12, 2,880 triangles, triangulated by its modifier
+    const doc = SceneDoc.create();
+    doc.updateRender({ resolution_x: 24, resolution_y: 16 });
+    const point = (i: number) => ({
+      co: [i * 0.4, Math.sin(i) * 0.6, 0.3] as [number, number, number],
+      handle_left: null,
+      handle_right: null,
+      handle_left_type: 'AUTO' as const,
+      handle_right_type: 'AUTO' as const,
+      radius: 1,
+      tilt: 0,
+      weight: 1,
+    });
+    const data = doc.addCurve({
+      splines: [
+        {
+          type: 'BEZIER',
+          points: [0, 1, 2, 3, 4, 5].map(point),
+          use_cyclic_u: false,
+          resolution_u: 0,
+          order_u: 4,
+          use_endpoint_u: true,
+          use_smooth: true,
+          material_index: 0,
+        },
+      ],
+      resolution_u: 1,
+      render_resolution_u: 24,
+      bevel_depth: 0,
+      bevel_resolution: 4,
+    });
+    doc.addObject({ name: 'Cable', type: 'CURVE', data, modifiers: [modifier('T', 'TRIANGULATE', {})] });
+    doc.setFCurve(
+      insertKeyframe(
+        createFCurve({ target_type: 'curve', target_id: data, path: 'bevel_depth', index: 0 }),
+        1,
+        0.05,
+      ),
+    );
+    // a tab without a budget: the check refuses the modifier, with what the evaluation holds
+    const memory = { ...roomy, budget: 0 };
+    const w = engine();
+    const reason = (estimate?: RenderEstimate | null) =>
+      w.prepare(doc, memory, 1, estimate).then(
+        () => 'prepared',
+        (err: Error) => err.message,
+      );
+    const atFrame = await reason(estimateRender(doc, true, 1));
+    expect(atFrame).toContain(
+      "The Triangulate modifier 'T' of 'Cable' would make 2,880 of these triangles (lower the faces of the mesh).",
+    );
+    // the tube is held from the start: counted once as built and once as what the modifier makes
+    expect(atFrame).toContain('(about 5,772 triangles, 384 pixels)');
+    expect(await reason(null)).toBe(atFrame);
+    // the stored values have no tube
+    expect(await reason(estimateRender(doc))).toContain('(about 2,892 triangles, 384 pixels)');
+  });
+
   it('checks next to the path traced renders running in the tab', async () => {
     const pool = new RenderPool({ size: 2, idleMs: 0, factory: () => new InProcessWorker() });
     pools.push(pool);
@@ -478,6 +608,66 @@ describe('the check of the first worker while it evaluates the scene', () => {
       first.cancel();
       await first.result;
     }
+  });
+});
+
+describe("the check of a RASTER render's evaluation on the page", () => {
+  /** The estimate of the default scene with the given counts of what its evaluation builds. */
+  const estimate = (built: number, builtBase: number, instances: number): RenderEstimate => ({
+    ...estimateRender(SceneDoc.create()),
+    builtTriangles: built,
+    builtBaseTriangles: builtBase,
+    instances,
+  });
+  /** A modifier about to run: `bytes` of heap at its peak, a result of `faces` triangles. */
+  const run = (bytes: number, faces: number) => ({
+    bytes,
+    result: { faces, corners: 3 * faces, vertices: faces },
+    lower: 'its segments',
+  });
+  const bevel = { type: 'BEVEL', label: 'Bevel' };
+
+  it('counts what the stacks evaluated so far made, the instances, and the peak of the modifier about to run', () => {
+    // 1 MB a render may fill
+    const memory = { ...roomy, heapLimit: YOUNG_GENERATION_BYTES + MB };
+    const guard = new RasterEvaluationGuard(estimate(1_000, 100, 50), memory);
+    // a stack made 5,000 triangles from 10 so far, more than the estimate saw: the evaluation holds
+    // them besides the surfaces it built before the modifiers
+    guard.after(10, 5_000);
+    expect(guard.heldTriangles).toBe(100 + 4_990);
+    expect(guard.before(bevel, run(2 * MB, 3_000), 20)).toMatch(/^The RASTER render was not started: /);
+    expect(guard.refusal!.needs).toEqual({
+      // its result replaces the 20 triangles of its input
+      triangles: 100 + 4_990 - 20 + 3_000,
+      heap: (100 + 4_990) * RASTER_BYTES_PER_TRIANGLE + 50 * INSTANCE_BYTES.heap + 2 * MB,
+    });
+    expect(guard.refusal!.triangles).toBe(3_000);
+    // at least what the estimate says the evaluation builds
+    const early = new RasterEvaluationGuard(estimate(80_000, 100, 0), memory);
+    early.before(bevel, run(0, 10), 0);
+    expect(early.refusal!.needs).toEqual({
+      triangles: 80_000,
+      heap: 80_000 * RASTER_BYTES_PER_TRIANGLE,
+    });
+    // with room, nothing is refused
+    expect(
+      new RasterEvaluationGuard(estimate(1_000, 100, 50), roomy).before(bevel, run(2 * MB, 3_000), 20),
+    ).toBeNull();
+  });
+
+  it('suggests the RASTER engine for a modifier the first worker refuses only where it fits the page', () => {
+    // 20 MB a render may fill: a render thread needs more than that (32 MB of its own)
+    const memory = { ...roomy, heapLimit: YOUNG_GENERATION_BYTES + 20 * MB };
+    const refusal = (bytes: number) => {
+      const guard = new EvaluationGuard(estimate(1_000, 100, 50), 24 * 16, memory);
+      return guard.before(bevel, run(bytes, 3_000), 20);
+    };
+    // a modifier whose peak fits the page: a RASTER render would evaluate it there
+    expect(refusal(MB)).toMatch(/, or render with the RASTER engine\.$/);
+    // one whose peak does not
+    const both = refusal(30 * MB);
+    expect(both).toMatch(/^Path tracing was not started: /);
+    expect(both).not.toContain('RASTER');
   });
 });
 
@@ -553,7 +743,8 @@ describe('render workers', () => {
     expect(r.threads).toBe(2);
   });
 
-  it('stops the workers that hold copies of a large compiled scene once the render is over', async () => {
+  /** A pool of 8 in-process workers that records which ones start and which ones are stopped. */
+  function trackedPool(): { pool: RenderPool; started: number[]; stopped: number[] } {
     const started: number[] = [];
     const stopped: number[] = [];
     class Tracked extends InProcessWorker {
@@ -574,15 +765,12 @@ describe('render workers', () => {
       },
     });
     pools.push(pool);
-    const options = { width: 24, height: 16, frame: 1, samples: 1 };
-    const adopters = [1, 2, 3, 4, 5, 6, 7];
-    // a light scene: its copies stay with the workers
-    const light = SceneDoc.create();
-    await startPathTrace(pool, light, { ...options, memory: roomy }).result;
-    expect([started, stopped]).toEqual([[0, ...adopters], []]);
-    // a grid of 48,672 triangles whose 7 copies take an eighth of the budget of 8 workers or more
+    return { pool, started, stopped };
+  }
+
+  /** The default scene and a grid of 2 × n² triangles (48,672 for n = 156). */
+  function gridScene(n = 156): SceneDoc {
     const doc = SceneDoc.create();
-    const n = 156;
     const positions: number[] = [];
     const faces: number[][] = [];
     for (let y = 0; y <= n; y++)
@@ -597,14 +785,30 @@ describe('render workers', () => {
       type: 'MESH',
       data: doc.addMesh('Grid', createMesh({ positions, faces })),
     });
+    return doc;
+  }
+
+  /** The needs of a render of 24 × 16 pixels as its first worker reported them. */
+  const needsOf = (info: PreparedInfo): RenderNeeds => ({
+    triangles: info.triangles,
+    evaluatedTriangles: info.evaluatedTriangles,
+    instances: info.instances,
+    sceneBytes: info.sceneBytes,
+    pixels: 24 * 16,
+  });
+
+  it('stops the workers that hold copies of a large compiled scene once the render is over', async () => {
+    const { pool, started, stopped } = trackedPool();
+    const options = { width: 24, height: 16, frame: 1, samples: 1 };
+    const adopters = [1, 2, 3, 4, 5, 6, 7];
+    // a light scene: its copies stay with the workers
+    const light = SceneDoc.create();
+    await startPathTrace(pool, light, { ...options, memory: roomy }).result;
+    expect([started, stopped]).toEqual([[0, ...adopters], []]);
+    // a grid whose 7 copies take an eighth of the budget of 8 workers or more
+    const doc = gridScene();
     const info = await engine().prepare(doc);
-    const needs: RenderNeeds = {
-      triangles: info.triangles,
-      evaluatedTriangles: info.evaluatedTriangles,
-      instances: info.instances,
-      sceneBytes: info.sceneBytes,
-      pixels: 24 * 16,
-    };
+    const needs = needsOf(info);
     const memory = { ...roomy, budget: renderMemory(needs, 8).total };
     expect(7 * info.sceneBytes).toBeGreaterThanOrEqual(memory.budget / ADOPTER_COPIES_STOP);
     started.length = 0;
@@ -617,6 +821,107 @@ describe('render workers', () => {
     // other test files
   }, 15_000);
 
+  it('stops no adopter of a large compiled scene while another path traced render runs in the tab', async () => {
+    const { pool, started, stopped } = trackedPool();
+    // a render of the cube on one thread (the memory its tab allows) that samples until cancelled
+    const light = SceneDoc.create();
+    light.updateRender({ resolution_x: 24, resolution_y: 16 });
+    const lightNeeds = needsOf(await engine().prepare(light));
+    const lightMemory = { ...roomy, budget: renderMemory(lightNeeds, 1).total + 16 * MB };
+    expect(renderMemory(estimatedNeeds(estimateRender(light, true, 1), 24 * 16), 1).total).toBeLessThan(
+      lightMemory.budget,
+    );
+    expect(planRenderThreads(lightNeeds, 8, lightMemory).threads).toBe(1);
+    const running = startPathTrace(pool, light, {
+      width: 24,
+      height: 16,
+      frame: 1,
+      samples: 1 << 16,
+      memory: lightMemory,
+    });
+    await new Promise<void>((resolve) => {
+      const off = running.subscribe(() => {
+        if (running.status.phase !== 'rendering') return;
+        off();
+        resolve();
+      });
+    });
+    expect(started).toEqual([0]);
+    try {
+      // a grid of 64,800 triangles on all 8 workers next to it, its 7 copies an eighth of its budget
+      // or more: stopped once it is over, were it alone
+      const doc = gridScene(180);
+      const info = await engine().prepare(doc);
+      const memory = {
+        ...roomy,
+        budget: renderMemory(lightNeeds, 1).total + renderMemory(needsOf(info), 8).total,
+      };
+      expect(stopsAdopters(0, 7, info.sceneBytes, memory.budget)).toBe(true);
+      const r = await startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory })
+        .result;
+      expect(started).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+      expect(r.threads).toBeGreaterThan(1);
+      // the other render runs on: its workers stay
+      expect(running.running).toBe(true);
+      expect(stopped).toEqual([]);
+    } finally {
+      running.cancel();
+      await running.result;
+    }
+    // the render of the cube held no copies: nothing to stop after it either
+    expect(stopped).toEqual([]);
+    // two evaluations and compilations of the grid, as above
+  }, 15_000);
+
+  it('stops the other workers it started for a render its first worker refused', async () => {
+    const { pool, started, stopped } = trackedPool();
+    // the estimate leaves room for 2 workers; the first refuses the Bevel the estimate does not see
+    const doc = bevelScene(6);
+    const estimated = estimatedNeeds(estimateRender(doc, true, 1), 24 * 16);
+    const memory = { ...roomy, budget: renderMemory(estimated, 2).total };
+    expect(planRenderThreads(estimated, 8, memory).threads).toBe(2);
+    const bevels = countBevels();
+    try {
+      await expect(
+        startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory }).result,
+      ).rejects.toThrow(/The Bevel modifier 'Bev' of 'BevCube' would make 69,192 of these triangles/);
+      expect(bevels.count()).toBe(0);
+    } finally {
+      bevels.restore();
+    }
+    expect([started, stopped]).toEqual([[0, 1], [1]]);
+    // while another render runs, the workers stay (it may use them)
+    stopped.length = 0;
+    const light = SceneDoc.create();
+    light.updateRender({ resolution_x: 24, resolution_y: 16 });
+    const lightNeeds = needsOf(await engine().prepare(light));
+    const running = startPathTrace(pool, light, {
+      width: 24,
+      height: 16,
+      frame: 1,
+      samples: 1 << 16,
+      memory: { ...roomy, budget: renderMemory(lightNeeds, 1).total + 16 * MB },
+    });
+    await new Promise<void>((resolve) => {
+      const off = running.subscribe(() => {
+        if (running.status.phase !== 'rendering') return;
+        off();
+        resolve();
+      });
+    });
+    try {
+      const next = { ...memory, budget: renderMemory(lightNeeds, 1).total + memory.budget };
+      await expect(
+        startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory: next }).result,
+      ).rejects.toThrow(/The Bevel modifier 'Bev' of 'BevCube'/);
+      expect(started.slice(2)).toEqual([1]);
+      expect(stopped).toEqual([]);
+    } finally {
+      running.cancel();
+      await running.result;
+    }
+  });
+
   it('stops no worker another path traced render may use, and none for copies under an eighth of the budget', () => {
     const budget = 4 * GB;
     // three copies of 200 MB: 600 MB, more than an eighth of 4 GB
@@ -628,6 +933,60 @@ describe('render workers', () => {
     expect(stopsAdopters(0, 2, 256 * MB - 1, budget)).toBe(false);
     // no copies
     expect(stopsAdopters(0, 0, 200 * MB, budget)).toBe(false);
+  });
+
+  it('renders with only the workers the compiled scene leaves room for, fewer than the estimate started', async () => {
+    // the estimate sees the cubes, not what a Bevel limited by angle makes of them: it starts 3
+    // workers, and the compiled scene leaves room for 2
+    const doc = bevelScene(3);
+    const sent: string[][] = Array.from({ length: 4 }, () => []);
+    class Recording extends InProcessWorker {
+      constructor(private readonly index: number) {
+        super();
+      }
+      override postMessage(msg: WorkerRequest): void {
+        sent[this.index].push(msg.type);
+        super.postMessage(msg);
+      }
+    }
+    const pool = new RenderPool({ size: 4, idleMs: 0, factory: (i) => new Recording(i) });
+    pools.push(pool);
+    const info = await engine().prepare(doc);
+    const memory = { ...roomy, budget: renderMemory(needsOf(info), 2).total };
+    expect(planRenderThreads(estimatedNeeds(estimateRender(doc, true, 1), 24 * 16), 4, memory).threads).toBe(
+      3,
+    );
+    expect(planRenderThreads(needsOf(info), 4, memory).threads).toBe(2);
+    const r = await startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 4, memory }).result;
+    expect(r.threads).toBeLessThanOrEqual(2);
+    expect(r.limitedByMemory).toBe(true);
+    // the workers beyond them got no copy of the scene and no rows
+    for (const s of sent.slice(2)) expect(s.filter((t) => t !== 'release')).toEqual([]);
+    // two evaluations of the Bevels (34,596 triangles) and compilations: 0.6 s alone without coverage
+  }, 15_000);
+
+  it('counts no worker that got its copy of the compiled scene after the render was over', async () => {
+    // the second worker's copy arrives once the render is finishing (its sampling over)
+    let finishing = () => {};
+    const finished = new Promise<void>((resolve) => (finishing = resolve));
+    class Late extends InProcessWorker {
+      constructor(private readonly index: number) {
+        super();
+      }
+      override postMessage(msg: WorkerRequest): void {
+        if (msg.type === 'finish') {
+          finishing();
+          setTimeout(() => super.postMessage(msg), 100);
+        } else if (this.index === 1 && msg.type === 'adopt') void finished.then(() => super.postMessage(msg));
+        else super.postMessage(msg);
+      }
+    }
+    const pool = new RenderPool({ size: 2, idleMs: 0, factory: (i) => new Late(i) });
+    pools.push(pool);
+    const doc = SceneDoc.create();
+    const r = await startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory: roomy })
+      .result;
+    expect(r.threads).toBe(1);
   });
 
   it('starts only the workers the memory leaves room for', async () => {

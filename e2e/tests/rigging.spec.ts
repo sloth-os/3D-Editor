@@ -9,6 +9,7 @@ import {
   newProject,
   region,
   setNumberField,
+  viewportPictures,
   viewportShot,
   type RgbaImage,
 } from './helpers';
@@ -116,11 +117,26 @@ test.describe('rigging', () => {
     await expect.poll(() => fieldNumber(page, 'pose-rotation-0')).toBe(0);
     await expect.poll(() => fieldNumber(page, 'pose-rotation-2')).toBeCloseTo(28.648, 2);
 
-    // Clear Transform puts the root bone back to its rest pose
-    await page.getByTestId('pose-clear').click();
-    await expect.poll(() => fieldNumber(page, 'pose-rotation-2')).toBe(0);
-    await expect.poll(async () => (await bone('Bone')).posed_tail_world).toEqual([0, 0, 1]);
-    await expect.poll(async () => bonesChange(rest, await viewportShot(page))).toBeLessThan(0.001);
+    // Clear Transform puts the root bone back to its rest pose: pictures of the cleared, rotated and
+    // cleared bone drawn with the same multisampling (a busy machine can turn it off between
+    // pictures, and edges then differ)
+    const clear = async () => {
+      await page.getByTestId('pose-clear').click();
+      await expect.poll(() => fieldNumber(page, 'pose-rotation-2')).toBe(0);
+      await expect.poll(() => fieldNumber(page, 'pose-rotation-0')).toBe(0);
+      await expect.poll(async () => (await bone('Bone')).posed_tail_world).toEqual([0, 0, 1]);
+    };
+    const tilt = async () => {
+      await setNumberField(page, 'pose-rotation-0', 30);
+      await expect
+        .poll(async () => dist((await bone('Bone')).posed_tail_world, [0, -0.5, 0.866]))
+        .toBeLessThan(0.002);
+    };
+    const [cleared, tilted, clearedAgain] = await viewportPictures(page, [clear, tilt, clear]);
+    expect(bonesChange(cleared, tilted)).toBeGreaterThan(0.01);
+    expect(bonesChange(cleared, clearedAgain)).toBeLessThan(0.001);
+    // as before it was posed
+    if (rest.samples === cleared.samples) expect(bonesChange(rest, cleared)).toBeLessThan(0.001);
     await client.close();
   });
 });

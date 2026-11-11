@@ -99,9 +99,10 @@ export const MILLIONS_SOLID_SECONDS = '0.5–5.3 s';
 
 /**
  * A select (editor_command) in that scene, the viewport in SOLID shading: the editor carries it out
- * once its main thread is free (after the frame or screenshot it is drawing), also one sent as soon
- * as a screenshot had answered. The upper end is {@link MILLIONS_MARGIN_PERCENT} % above the longest
- * time.
+ * once its main thread is free (after a screenshot it is drawing; the viewport's frames do not hold it
+ * up, apart from the first ones that build materials or wires), counting the edges of every mesh
+ * again for the statistics overlay, also one sent as soon as a screenshot had answered. The upper end
+ * is {@link MILLIONS_MARGIN_PERCENT} % above the longest time.
  */
 export const MILLIONS_SELECT_SECONDS = '0.1–1.2 s';
 

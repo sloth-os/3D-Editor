@@ -245,7 +245,7 @@ describe(`server process with a ${HEAP_MB} MB heap`, () => {
     expect(res.isError).toBe(true);
     const [first, ...rest] = (res.content[0]?.text ?? '').split('\n');
     expect(first).toMatch(
-      /^object\.join failed: not run on the server: the project's meshes would then take about [\d,]+ MB of JavaScript heap decoded \(now 21 MB\), more than the [\d,]+ MB the server's process keeps for the meshes of one project/,
+      /^object\.join failed: not run on the server: the project's meshes and objects would then take about [\d,]+ MB of JavaScript heap \(now 22 MB with 30 objects\), and a save of it about [\d,]+ MB more for a moment \(3 times what its objects, datablocks and keyframes take\): [\d,]+ MB in all, more than the [\d,]+ MB the server's process keeps for one project/,
     );
     expect(JSON.parse(rest.join('\n'))).toMatchObject({ code: 'OUT_OF_MEMORY' });
     expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
@@ -351,7 +351,7 @@ describe(`server process with a ${HEAP_MB} MB heap`, () => {
       expect(res.isError).toBe(true);
       const [first, ...rest] = (res.content[0]?.text ?? '').split('\n');
       expect(first).toMatch(
-        /^Import failed: not run on the server: it would need about [\d,]+ MB of JavaScript heap for a mesh of about 600,000 faces, and the server's process has [\d,]+ MB of its [\d,]+ MB heap free and keeps 256 MB of it for its other work\. Lower the size of the file \(import fewer or simpler meshes\) to run it on the server \(a browser editor runs it in its own memory\)$/,
+        /^Import failed: not run on the server: it would need about [\d,]+ MB of JavaScript heap for a mesh of about 600,000 faces, and the server's process has [\d,]+ MB of its [\d,]+ MB heap free and keeps 256 MB of it for its other work\. Lower the size of the file \(import fewer or simpler meshes\) to run it on the server \(a browser editor runs it in its own memory: editor_command \{command: 'run_operator', params: \{operator: 'import_mesh\.stl', params: \{data_base64\}\}\}\)$/,
       );
       expect(JSON.parse(rest.join('\n'))).toEqual({ code: 'OUT_OF_MEMORY' });
       expect((await ok('get_scene', { project: id })).counts.objects).toBe(0);
@@ -363,6 +363,249 @@ describe(`server process with a ${HEAP_MB} MB heap`, () => {
     } finally {
       files.close();
     }
+  });
+
+  /** The first line of a refused call's error, and its code (the JSON after it). */
+  async function refused(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<{ first: string; code: string }> {
+    const res = await call(name, args).catch((err: unknown) => {
+      throw new Error(
+        `${name} got no answer (${String(err)}); the server's output:\n${server.output().slice(-1500)}`,
+      );
+    });
+    expect(res.isError, res.content[0]?.text).toBe(true);
+    const [first, ...rest] = (res.content[0]?.text ?? '').split('\n');
+    return { first, code: (JSON.parse(rest.join('\n')) as { code: string }).code };
+  }
+
+  it('refuses Separate by loose parts of many parts (an object each), and keeps answering', async () => {
+    const { id } = await ok('create_project', { name: 'Parts', empty: true });
+    // 30,000 quads none of which touches another: Separate by loose parts would make 29,999 objects
+    // with a mesh each, about 14 KB each to keep and more to make (round 10: 200,000 such parts took
+    // a server with the default heap down, estimated by their 200,000 faces)
+    const vertices: number[][] = [];
+    const faces: number[][] = [];
+    for (let i = 0; i < 30_000; i++) {
+      const x = 2 * (i % 200);
+      const y = 2 * Math.floor(i / 200);
+      vertices.push([x, y, 0], [x + 1, y, 0], [x + 1, y + 1, 0], [x, y + 1, 0]);
+      faces.push([4 * i, 4 * i + 1, 4 * i + 2, 4 * i + 3]);
+    }
+    await ok('run_operator', {
+      project: id,
+      operator: 'object.add_mesh_from_data',
+      params: { name: 'Parts', vertices, faces },
+    });
+    const r = await refused('edit_mesh', {
+      project: id,
+      object: 'Parts',
+      operator: 'mesh.separate',
+      params: { type: 'LOOSE' },
+    });
+    expect(r.code).toBe('OUT_OF_MEMORY');
+    expect(r.first).toMatch(
+      /^mesh\.separate failed: not run on the server: .* 29,999 new objects .*Lower the number of loose parts \(separate some of them with type SELECTED first, then separate that object by loose parts\)/,
+    );
+    expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
+    expect((await ok('get_scene', { project: id })).counts.objects).toBe(1);
+    expect(server.child.exitCode).toBeNull();
+  });
+
+  it('refuses a glTF import of many nodes (an object each), and keeps answering', async () => {
+    const { id } = await ok('create_project', { name: 'Nodes', empty: true });
+    // 40,000 nodes of one triangle mesh in a file of 2 MB: 40,000 objects
+    const nodes = Array.from({ length: 40_000 }, (_, i) => ({
+      mesh: 0,
+      translation: [i % 200, Math.floor(i / 200), 0],
+    }));
+    const triangle = Buffer.from(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]).buffer).toString('base64');
+    const gltf = {
+      asset: { version: '2.0' },
+      scene: 0,
+      scenes: [{ nodes: nodes.map((_, i) => i) }],
+      nodes,
+      meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [0, 0, 0], max: [1, 1, 0] },
+      ],
+      bufferViews: [{ buffer: 0, byteLength: 36 }],
+      buffers: [{ byteLength: 36, uri: `data:application/octet-stream;base64,${triangle}` }],
+    };
+    const r = await refused('run_operator', {
+      project: id,
+      operator: 'import_scene.gltf',
+      params: { data_base64: Buffer.from(JSON.stringify(gltf)).toString('base64') },
+    });
+    expect(r.code).toBe('OUT_OF_MEMORY');
+    expect(r.first).toMatch(/^import_scene\.gltf failed: not run on the server: .*40,000 new objects/);
+    expect(r.first).toMatch(/Lower the nodes \(objects\) of the file/);
+    expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
+    expect((await ok('get_scene', { project: id })).counts.objects).toBe(0);
+    expect(server.child.exitCode).toBeNull();
+  });
+
+  it('refuses a GLB whose meshes share accessors by what it decodes, not by its size, and keeps answering', async () => {
+    // 8 glTF meshes that all use the accessors of one grid of 300 × 300 quads: a file of 3 MB from
+    // which the importer decodes 8 meshes of 180,000 triangles, within what the server keeps for one
+    // project but not within its free heap (round 10: 40 such meshes of a 600 × 600 grid, estimated
+    // by the file's size, took the server down)
+    const n = 300;
+    const V = (n + 1) * (n + 1);
+    const pos = new Float32Array(3 * V);
+    for (let y = 0, i = 0; y <= n; y++) for (let x = 0; x <= n; x++, i++) pos.set([x / n, 0, y / n], 3 * i);
+    const idx = new Uint32Array(6 * n * n);
+    for (let y = 0, t = 0; y < n; y++)
+      for (let x = 0; x < n; x++, t++) {
+        const a = y * (n + 1) + x;
+        idx.set([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1], 6 * t);
+      }
+    const bin = Buffer.concat([Buffer.from(pos.buffer), Buffer.from(idx.buffer)]);
+    const json = Buffer.from(
+      JSON.stringify({
+        asset: { version: '2.0' },
+        scene: 0,
+        scenes: [{ nodes: Array.from({ length: 8 }, (_, i) => i) }],
+        nodes: Array.from({ length: 8 }, (_, i) => ({ mesh: i, translation: [1.5 * i, 0, 0] })),
+        meshes: Array.from({ length: 8 }, () => ({
+          primitives: [{ attributes: { POSITION: 0 }, indices: 1 }],
+        })),
+        accessors: [
+          { bufferView: 0, componentType: 5126, count: V, type: 'VEC3', min: [0, 0, 0], max: [1, 0, 1] },
+          { bufferView: 1, componentType: 5125, count: idx.length, type: 'SCALAR' },
+        ],
+        bufferViews: [
+          { buffer: 0, byteOffset: 0, byteLength: pos.byteLength },
+          { buffer: 0, byteOffset: pos.byteLength, byteLength: idx.byteLength },
+        ],
+        buffers: [{ byteLength: bin.byteLength }],
+      }),
+    );
+    const jsonChunk = Buffer.concat([json, Buffer.alloc((4 - (json.length % 4)) % 4, 0x20)]);
+    const head = Buffer.alloc(20);
+    head.writeUInt32LE(0x46546c67, 0);
+    head.writeUInt32LE(2, 4);
+    head.writeUInt32LE(20 + jsonChunk.length + 8 + bin.length, 8);
+    head.writeUInt32LE(jsonChunk.length, 12);
+    head.writeUInt32LE(0x4e4f534a, 16);
+    const binHead = Buffer.alloc(8);
+    binHead.writeUInt32LE(bin.length, 0);
+    binHead.writeUInt32LE(0x004e4942, 4);
+    const glb = Buffer.concat([head, jsonChunk, binHead, bin]);
+    const files = createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'model/gltf-binary' });
+      res.end(glb);
+    });
+    await new Promise<void>((resolve) => files.listen(0, '127.0.0.1', resolve));
+    try {
+      const { id } = await ok('create_project', { name: 'Shared accessors', empty: true });
+      const url = `http://127.0.0.1:${(files.address() as AddressInfo).port}/shared.glb`;
+      const r = await refused('import_model', { project: id, url });
+      expect(r.code).toBe('OUT_OF_MEMORY');
+      expect(r.first).toMatch(
+        /^Import failed: not run on the server: it would need about [\d,]+ MB of JavaScript heap for 8 meshes of about 1,440,000 faces in all and 8 new objects, and the server's process has [\d,]+ MB of its [\d,]+ MB heap free and keeps 256 MB of it for its other work\. Lower the meshes of the file \(every glTF mesh is decoded into a mesh of its own, also where meshes share the same accessors\) to run it on the server \(a browser editor runs it in its own memory: editor_command \{command: 'run_operator', params: \{operator: 'import_scene\.gltf', params: \{data_base64\}\}\}\)$/,
+      );
+      expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
+      expect((await ok('get_scene', { project: id })).counts.objects).toBe(0);
+      expect(server.child.exitCode).toBeNull();
+    } finally {
+      files.close();
+    }
+  });
+
+  it('skips a Bevel limited by angle that would run its heap out in get_scene, and keeps answering', async () => {
+    const { id } = await ok('create_project', { name: 'Bevel', empty: true });
+    // every edge of a torus of 16,384 faces meets its faces at more than 0.01 rad: ten segments
+    // would make about 1,561,088 faces, 2,548 MB estimated (round 10: a Bevel by angle was
+    // estimated without them)
+    await ok('run_operator', {
+      project: id,
+      operator: 'mesh.primitive_torus_add',
+      params: { major_segments: 256, minor_segments: 64, name: 'Ring' },
+    });
+    await ok('add_modifier', {
+      project: id,
+      object: 'Ring',
+      type: 'BEVEL',
+      params: { limit_method: 'ANGLE', angle_limit: 0.01, segments: 10, width: 0.001 },
+    });
+    // a small one still runs
+    await ok('run_operator', {
+      project: id,
+      operator: 'mesh.primitive_cube_add',
+      params: { location: [5, 0, 0] },
+    });
+    await ok('add_modifier', {
+      project: id,
+      object: 'Cube',
+      type: 'BEVEL',
+      params: { limit_method: 'ANGLE', segments: 2, width: 0.1 },
+    });
+    const scene = await call('get_scene', { project: id }).catch((err: unknown) => {
+      throw new Error(
+        `get_scene got no answer (${String(err)}); the server's output:\n${server.output().slice(-1500)}`,
+      );
+    });
+    expect(scene.isError, scene.content[0]?.text).toBeFalsy();
+    const summary = JSON.parse(scene.content[0]!.text!) as {
+      problems: { source: string; object?: string; message: string }[];
+      objects: { name: string; faces?: number; evaluated?: { faces?: number } }[];
+    };
+    const ring = summary.problems.filter((p) => p.source === 'modifier' && p.object === 'Ring');
+    expect(ring.length).toBeGreaterThan(0);
+    expect(ring[0].message).toMatch(/^skipped on the server: /);
+    expect(summary.problems.some((p) => p.object === 'Cube')).toBe(false);
+    const cube = await ok('get_object', { project: id, object: 'Cube' });
+    expect(JSON.stringify(cube)).toMatch(/"faces":\s*(?!6\b)\d+/);
+    expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
+    expect(server.child.exitCode).toBeNull();
+  });
+
+  it('keeps the evaluations get_object caches frame by frame within its heap, and keeps answering', async () => {
+    const { id } = await ok('create_project', { name: 'Moving scatter', empty: true });
+    await ok('run_operator', {
+      project: id,
+      operator: 'mesh.primitive_plane_add',
+      params: { size: 20, name: 'Ground' },
+    });
+    await ok('run_operator', {
+      project: id,
+      operator: 'mesh.primitive_cube_add',
+      params: { size: 0.1, location: [0, 0, 5], name: 'Pebble' },
+    });
+    // 200,000 instances (the most a scene has) on an emitter that moves: every frame evaluated has
+    // instances of its own, about 60 MB, which the cache of 16 evaluations per project kept until
+    // the heap ran out (eval-cache.ts; now within a budget of a third of what one project may keep)
+    await ok('run_operator', {
+      project: id,
+      operator: 'object.scatter_add',
+      params: { surface: 'Ground', objects: ['Pebble'], count: 200_000 },
+    });
+    for (const [frame, x] of [
+      [1, 0],
+      [100, 10],
+    ])
+      await ok('insert_keyframe', {
+        project: id,
+        object: 'Ground',
+        property: 'location',
+        frame,
+        value: [x, 0, 0],
+        interpolation: 'LINEAR',
+      });
+    for (let frame = 2; frame <= 17; frame++) {
+      const res = await call('get_object', { project: id, object: 'Ground', frame }).catch((err: unknown) => {
+        throw new Error(
+          `get_object at frame ${frame} got no answer (${String(err)}); the server's output:\n${server.output().slice(-1500)}`,
+        );
+      });
+      expect(res.isError, res.content[0]?.text).toBeFalsy();
+      expect(JSON.parse(res.content[0]!.text!).world_location[0]).toBeCloseTo((10 * (frame - 1)) / 99, 3);
+    }
+    expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
+    expect(server.child.exitCode).toBeNull();
+    await ok('delete_project', { project: id, confirm: true });
   });
 
   it('refuses a REST snapshot that would run its heap out, and keeps answering', async () => {

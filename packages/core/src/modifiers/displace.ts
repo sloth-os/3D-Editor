@@ -83,6 +83,15 @@ export const displaceModifier: ModifierDef<typeof schema> = {
     'a local/global axis, or per-channel along XYZ (RGB_TO_XYZ). Textures: CLOUDS (seeded fractal gradient noise, ' +
     '`noise_scale`, `noise_depth`), WAVES, CHECKER or NONE (uniform push). Topology is unchanged.',
   schema,
+  // MOD_displace.cc is_disabled:
+  // `return ((!dmd->texture && dmd->direction == MOD_DISP_DIR_RGB_XYZ) || dmd->strength == 0.0f);`
+  // (texture_type NONE displaces as Blender does without a texture)
+  disabled: (p) =>
+    p.strength === 0
+      ? 'has a strength of 0'
+      : p.direction === 'RGB_TO_XYZ' && p.texture_type === 'NONE'
+        ? 'displaces along RGB_TO_XYZ without a texture (texture_type NONE)'
+        : null,
   apply(mesh, p, ctx) {
     const n = vertexCount(mesh);
     if (n === 0 || p.strength === 0) return mesh;

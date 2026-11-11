@@ -39,6 +39,16 @@ export interface ServerConfig {
   persistence: PersistenceMode;
   roomIdleTtlSeconds: number;
   persistDebounceMs: number;
+  /**
+   * How long a shutdown (SIGTERM, SIGINT) may take before the server exits anyway
+   * (`SHUTDOWN_TIMEOUT_SECONDS`, default 9 s: Docker sends SIGKILL 10 s after SIGTERM).
+   */
+  shutdownTimeoutMs: number;
+  /**
+   * How long a shutdown waits for storage to save the loaded projects: {@link shutdownSaveWait} of
+   * `shutdownTimeoutMs` (7 s by default).
+   */
+  shutdownSaveWaitMs: number;
   webdav: WebDAVSettings | null;
   /** Expose the upstream WebDAV server to browsers under `/dav`. */
   webdavProxy: boolean;
@@ -98,6 +108,7 @@ const envSchema = z.object({
   SYNC_PERSISTENCE: z.enum(['memory', 'disk', 'webdav']).optional(),
   ROOM_IDLE_TTL_SECONDS: z.coerce.number().positive().default(3600),
   PERSIST_DEBOUNCE_MS: z.coerce.number().int().min(0).default(1500),
+  SHUTDOWN_TIMEOUT_SECONDS: z.coerce.number().positive().max(3600).default(9),
   WEBDAV_URL: httpUrl.optional(),
   WEBDAV_USERNAME: z.string().optional(),
   WEBDAV_PASSWORD: z.string().optional(),
@@ -120,6 +131,15 @@ const envSchema = z.object({
   CORS_ORIGINS: z.string().optional(),
   APP_VERSION: z.string().optional(),
 });
+
+/**
+ * How long a shutdown that may take `timeoutMs` in all waits for storage to save the loaded
+ * projects: 2 s less, so that the server closes them, logs which stayed unsaved and stops the rest
+ * before it exits anyway (half of `timeoutMs` below 4 s). 7 s of the default 9 s.
+ */
+export function shutdownSaveWait(timeoutMs: number): number {
+  return Math.max(timeoutMs - 2000, timeoutMs / 2);
+}
 
 /** Normalizes a WebDAV folder path: leading slash, no trailing slash ('' for the root). */
 export function normalizeBasePath(p: string): string {
@@ -221,6 +241,8 @@ export function loadConfig(
     persistence,
     roomIdleTtlSeconds: e.ROOM_IDLE_TTL_SECONDS,
     persistDebounceMs: e.PERSIST_DEBOUNCE_MS,
+    shutdownTimeoutMs: e.SHUTDOWN_TIMEOUT_SECONDS * 1000,
+    shutdownSaveWaitMs: shutdownSaveWait(e.SHUTDOWN_TIMEOUT_SECONDS * 1000),
     webdav,
     webdavProxy: !!webdav && (e.WEBDAV_PROXY ?? true),
     authToken: e.AUTH_TOKEN ?? null,

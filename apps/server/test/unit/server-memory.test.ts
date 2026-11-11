@@ -16,6 +16,15 @@ import {
   setMeshMemoryCheck,
   setOperatorMemoryCheck,
   storedMeshBytes,
+  projectStoredBytes,
+  importMemoryRefusal,
+  OBJECT_STORED_BYTES,
+  DATABLOCK_STORED_BYTES,
+  OBJECT_JSON_STORED_BYTES,
+  extraJsonChars,
+  SAVE_BYTES_PER_KEPT_BYTE,
+  projectObjects,
+  saveBytes,
   type OperatorContext,
 } from '@3d-editor/core';
 import {
@@ -30,6 +39,7 @@ import {
   serverHeapReserve,
   snapshotMeshChars,
   snapshotRefusal,
+  storedMeshesMessage,
   throttledGarbageCollector,
 } from '../../src/render/memory';
 import { describeObject, summarizeScene } from '../../src/mcp/scene-summary';
@@ -140,31 +150,61 @@ describe("operators in the server's process", () => {
     const grid = { x_subdivisions: 200, y_subdivisions: 200, location: [0, 0, 0] };
     expect(run('mesh.primitive_grid_add', grid).ok).toBe(true);
     expect(run('mesh.primitive_grid_add', { ...grid, location: [3, 0, 0] }).ok).toBe(true);
-    // two grids of 40,000 faces take about 10 MB each decoded: a third does not fit
-    const before = storedMeshBytes(doc);
+    // two grids of 40,000 faces take about 10 MB each decoded (and their objects about 14 KB each): a
+    // third does not fit
+    const before = projectStoredBytes(doc);
+    expect(before).toBe(storedMeshBytes(doc) + 2 * (OBJECT_STORED_BYTES + DATABLOCK_STORED_BYTES.meshes));
     const added = estimateOperator('mesh.primitive_grid_add', ctx, grid)!.addedStoredBytes;
     expect(before).toBeLessThan(22 * MB);
     expect(before + added).toBeGreaterThan(22 * MB);
     const res = run('mesh.primitive_grid_add', { ...grid, location: [6, 0, 0] });
     expect(res).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
     const mb = (bytes: number) => Math.round(bytes / MB);
+    // needs rounded up (the limit rounded down): a refused need never shows as the limit; a save of
+    // the project takes three times what its 3 objects and their meshes' datablocks keep (126 KB)
+    const up = (bytes: number) => Math.ceil(bytes / MB);
+    const save = saveBytes(3 * (OBJECT_STORED_BYTES + DATABLOCK_STORED_BYTES.meshes));
+    expect(save).toBe(126_000);
     expect(res.error).toBe(
-      `not run on the server: the project's meshes would then take about ${mb(before + added)} MB of JavaScript ` +
-        `heap decoded (now ${mb(before)} MB), more than the 22 MB the server's process keeps for the meshes of ` +
-        'one project (half of its 300 MB heap less the 256 MB it keeps for its other work). Lower ' +
-        'x_subdivisions and y_subdivisions, or delete meshes the project no longer needs',
+      `not run on the server: the project's meshes and objects would then take about ${up(before + added)} MB of ` +
+        `JavaScript heap (now ${mb(before)} MB with 2 objects), and a save of it about 1 MB more for a moment ` +
+        `(3 times what its objects, datablocks and keyframes take): ${up(before + added) + 1} MB in all, more than ` +
+        "the 22 MB the server's process keeps for one project (half of its 300 MB heap less the 256 MB it keeps " +
+        'for its other work). Lower x_subdivisions and y_subdivisions, or delete objects and meshes the project no ' +
+        'longer needs',
     );
     expect(doc.listObjects()).toHaveLength(2);
-    // operators that add no geometry still run
+    // operators that add nothing still run
     expect(run('object.shade_smooth').ok).toBe(true);
-    // a cube adds next to nothing: there is nothing of it to lower, only meshes to delete
+    // a project already past it (grown in a browser editor, or with a smaller heap): a cube or an
+    // empty adds next to nothing, but adds; there is nothing of them to lower, only objects to delete
     setOperatorMemoryCheck(
       operatorCheck({ heapFree: () => 4096 * MB, collect: () => 0, heapLimit: () => 290 * MB }),
     );
-    const cube = run('mesh.primitive_cube_add', { location: [9, 0, 0] });
-    expect(cube).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
-    expect(cube.error).toMatch(
-      / more than the 17 MB the server's process keeps for the meshes of one project \(half of its 290 MB heap less the 256 MB it keeps for its other work\)\. Delete meshes the project no longer needs$/,
+    const past =
+      `not run on the server: the project's meshes and objects already take about ${up(before)} MB of JavaScript ` +
+      `heap with 2 objects, and a save of it about 1 MB more for a moment (3 times what its objects, datablocks ` +
+      `and keyframes take): ${up(before) + 1} MB in all, more than the 17 MB the server's process keeps for one ` +
+      'project (half of its 290 MB heap less the 256 MB it keeps for its other work), and this operator would ' +
+      'add to them. Delete objects and meshes the project no longer needs';
+    for (const op of ['mesh.primitive_cube_add', 'object.empty_add']) {
+      const res = run(op, { location: [9, 0, 0] });
+      expect(res, op).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY', error: past });
+    }
+    // within it before, past it after, nothing to lower: only objects to delete
+    expect(
+      storedMeshesMessage(
+        {
+          operator: 'x',
+          storedBytes: 10 * MB,
+          estimate: { bytes: 0, faces: 0, addedStoredBytes: 20 * MB, lower: '' },
+        },
+        300 * MB,
+      ),
+    ).toBe(
+      "not run on the server: the project's meshes and objects would then take about 30 MB of JavaScript heap " +
+        "(now 10 MB), more than the 22 MB the server's process keeps for one project (half of its 300 MB heap " +
+        'less the 256 MB it keeps for its other work). Delete objects and meshes the project no longer needs',
     );
   });
 
@@ -224,6 +264,129 @@ describe("operators in the server's process", () => {
       /^Cannot convert 'Grid': modifier 'Subdivision': Subdivision result too large \(~92160000 faces\); lower the levels\. Nothing was converted/,
     );
     expect(doc.getObject(ctx.state.activeId!)!.modifiers).toHaveLength(1);
+  });
+});
+
+describe('imports and operators that add objects', () => {
+  it('say how a browser editor runs a refused import: editor_command run_operator with the file in base64', () => {
+    const { doc, run } = project();
+    setOperatorMemoryCheck(operatorCheck({ heapFree: () => 300 * MB, heapLimit: () => 1024 * MB }));
+    // a binary STL that declares 400,000 triangles
+    const stl = new Uint8Array(84 + 50 * 400_000);
+    new DataView(stl.buffer).setUint32(80, 400_000, true);
+    const browser = (operator: string) =>
+      `(a browser editor runs it in its own memory: editor_command {command: 'run_operator', params: ` +
+      `{operator: '${operator}', params: {data_base64}}})`;
+    const res = run('import_mesh.stl', { data_base64: Buffer.from(stl).toString('base64') });
+    expect(res).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
+    expect(res.error).toMatch(
+      /^not run on the server: it would need about [\d,]+ MB of JavaScript heap for a mesh of about 400,000 faces, and the server's process has 300 MB of its 1,024 MB heap free and keeps 256 MB of it for its other work\. Lower the size of the file \(import fewer or simpler meshes\) to run it on the server /,
+    );
+    expect(res.error!.endsWith(browser('import_mesh.stl'))).toBe(true);
+    // MCP import_model asks the same check, named after the import operator of the file's format
+    for (const [format, operator] of [
+      ['stl', 'import_mesh.stl'],
+      ['glb', 'import_scene.gltf'],
+    ] as const)
+      expect(importMemoryRefusal(doc, format, stl)?.endsWith(browser(operator)), format).toBe(true);
+    // other operators: the browser editor without a command
+    expect(run('mesh.primitive_grid_add', { x_subdivisions: 1000, y_subdivisions: 1000 }).error).toMatch(
+      /to run it on the server \(a browser editor runs it in its own memory\)$/,
+    );
+  });
+
+  it('name the objects an operator would add in its refusal', () => {
+    const { ctx, run } = project();
+    expect(run('mesh.primitive_cube_add', {}).ok).toBe(true);
+    ctx.state.selectedIds = [ctx.state.activeId!];
+    // 2,999 linked copies: about 13 KB each at the peak (69 MB with the young generation's 32 MB, more
+    // than the 44 MB free above the reserve), 11 KB each kept (and 33 KB more each while the project is
+    // saved: 126 MB in all, within the 384 MB a heap of 1,024 MB keeps for one project)
+    setOperatorMemoryCheck(operatorCheck({ heapFree: () => 300 * MB, heapLimit: () => 1024 * MB }));
+    const res = run('object.array_place', { count: 3_000, linked: true });
+    expect(res).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
+    expect(res.error).toMatch(
+      /^not run on the server: it would need about [\d,]+ MB of JavaScript heap for 2,999 new objects, and the server's process has 300 MB of its 1,024 MB heap free and keeps 256 MB of it for its other work\. Lower count to run it on the server \(a browser editor runs it in its own memory\)$/,
+    );
+    expect(ctx.doc.objectIds()).toHaveLength(1);
+  });
+
+  it('round what a refused project would take up and the limit down, so that the first is the larger', () => {
+    const refused = (limitMb: number, storedBytes: number, added: number) =>
+      storedMeshesMessage(
+        {
+          operator: 'x',
+          storedBytes,
+          estimate: { bytes: 0, faces: 0, addedStoredBytes: added, lower: 'count' },
+        },
+        limitMb * MB,
+      );
+    // a heap of 2,098 MB keeps (2,098 - 524.5) / 2 = 786.75 MB for one project: 786 MB, rounded down
+    expect(maxProjectMeshBytes(2098 * MB)).toBe(786.75 * MB);
+    // 786.8 MB: about 787 MB, more than the 786 MB (rounded to the nearest, both were 787)
+    expect(refused(2098, 786.5 * MB, 0.3 * MB)).toMatch(
+      /would then take about 787 MB of JavaScript heap \(now 787 MB\), more than the 786 MB the server's process keeps/,
+    );
+    expect(refused(2098, 786.75 * MB + 1, 1)).toMatch(/already take about 787 MB .* more than the 786 MB /);
+    // a heap of 2,097 MB keeps 786.375 MB: 786.4 MB is about 787 MB, rounded up (to the nearest, 786)
+    expect(maxProjectMeshBytes(2097 * MB)).toBe(786.375 * MB);
+    expect(refused(2097, 700 * MB, 86.4 * MB)).toMatch(
+      /would then take about 787 MB .* more than the 786 MB /,
+    );
+    expect(refused(2097, 786.4 * MB, 1)).toMatch(/already take about 787 MB .* more than the 786 MB /);
+  });
+
+  it('refuse objects whose save the server could not hold, also with its heap free', () => {
+    // the server saves a project after every change (core storage/project-store.ts syncDocument): the
+    // save decodes the whole stored state three times, about three times what the project's objects
+    // keep, and saves of 70,000 linked cubes, which the limit per project allowed by what they keep,
+    // ended a server of Node's default heap. 9,999 linked copies keep 105 MB, within the 384 MB a heap
+    // of 1,024 MB keeps for one project, but a save of them takes 315 MB more for a moment
+    const { doc, ctx, run } = project();
+    expect(run('mesh.primitive_cube_add', {}).ok).toBe(true);
+    ctx.state.selectedIds = [ctx.state.activeId!];
+    setOperatorMemoryCheck(
+      operatorCheck({ heapFree: () => 4096 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
+    );
+    const params = { count: 10_000, linked: true };
+    const e = estimateOperator('object.array_place', ctx, params)!;
+    expect(e.addedStoredBytes).toBe(9_999 * OBJECT_STORED_BYTES);
+    expect(e.addedSaveBytes).toBe(SAVE_BYTES_PER_KEPT_BYTE * 9_999 * OBJECT_STORED_BYTES);
+    const before = projectStoredBytes(doc);
+    const kept = before + e.addedStoredBytes;
+    const save = saveBytes(projectObjects(doc).bytes) + e.addedSaveBytes!;
+    expect(kept).toBeLessThan(maxProjectMeshBytes(1024 * MB));
+    expect(kept + save).toBeGreaterThan(maxProjectMeshBytes(1024 * MB));
+    const res = run('object.array_place', params);
+    expect(res).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
+    const up = (bytes: number) => Math.ceil(bytes / MB);
+    expect([up(kept), up(save)]).toEqual([105, 315]);
+    expect(res.error).toBe(
+      "not run on the server: the project's meshes and objects would then take about 105 MB of JavaScript heap " +
+        'with 9,999 new objects (now 0 MB with 1 object), and a save of it about 315 MB more for a moment (3 times ' +
+        "what its objects, datablocks and keyframes take): 420 MB in all, more than the 384 MB the server's " +
+        'process keeps for one project (half of its 1,024 MB heap less the 256 MB it keeps for its other work). ' +
+        'Lower count, or delete objects and meshes the project no longer needs',
+    );
+    expect(doc.objectIds()).toHaveLength(1);
+    // 2,999 copies keep 32 MB and a save of them takes 95 MB more: they fit
+    expect(run('object.array_place', { count: 3_000, linked: true }).ok).toBe(true);
+    expect(doc.objectIds()).toHaveLength(3_000);
+    // a project already past it with its save (grown in a browser editor): nothing to lower
+    setOperatorMemoryCheck(
+      operatorCheck({ heapFree: () => 4096 * MB, collect: () => 0, heapLimit: () => 500 * MB }),
+    );
+    const now = projectStoredBytes(doc);
+    const nowSave = saveBytes(projectObjects(doc).bytes);
+    expect(now).toBeLessThan(maxProjectMeshBytes(500 * MB));
+    expect(now + nowSave).toBeGreaterThan(maxProjectMeshBytes(500 * MB));
+    expect(run('object.empty_add', {}).error).toBe(
+      `not run on the server: the project's meshes and objects already take about ${up(now)} MB of JavaScript ` +
+        `heap with 3,000 objects, and a save of it about ${up(nowSave)} MB more for a moment (3 times what its ` +
+        `objects, datablocks and keyframes take): ${up(now) + up(nowSave)} MB in all, more than the 122 MB the ` +
+        "server's process keeps for one project (half of its 500 MB heap less the 256 MB it keeps for its other " +
+        'work), and this operator would add to them. Delete objects and meshes the project no longer needs',
+    );
   });
 });
 
@@ -320,17 +483,26 @@ describe('linked duplicates', () => {
     );
     const res = run('object.join');
     expect(res).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
+    // a save of the project takes three times what its 12 objects and one mesh datablock keep (405 KB)
+    const json = doc.listObjects().reduce((sum, o) => sum + extraJsonChars(o), 0);
+    expect(saveBytes(projectObjects(doc).bytes)).toBe(
+      3 * (12 * OBJECT_STORED_BYTES + DATABLOCK_STORED_BYTES.meshes + OBJECT_JSON_STORED_BYTES * json),
+    );
+    expect(saveBytes(projectObjects(doc).bytes)).toBeLessThan(406_000);
     expect(res.error).toBe(
-      "not run on the server: the project's meshes would then take about 28 MB of JavaScript heap decoded (now 2 MB), " +
-        "more than the 22 MB the server's process keeps for the meshes of one project (half of its 300 MB heap less the " +
-        '256 MB it keeps for its other work). Lower the number or size of the joined meshes, or delete meshes the ' +
-        'project no longer needs',
+      "not run on the server: the project's meshes and objects would then take about 29 MB of JavaScript heap " +
+        '(now 2 MB with 12 objects), and a save of it about 1 MB more for a moment (3 times what its objects, ' +
+        "datablocks and keyframes take): 30 MB in all, more than the 22 MB the server's process keeps for one " +
+        'project (half of its 300 MB heap less the 256 MB it keeps for its other work). Lower the number or size ' +
+        'of the joined meshes, or delete objects and meshes the project no longer needs',
     );
     expect(doc.listObjects()).toHaveLength(12);
     // Apply Transform gives each duplicate a copy of its own: 11 more meshes, refused the same way
     const apply = run('object.transform_apply', { location: true });
     expect(apply).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
-    expect(apply.error).toMatch(/^not run on the server: the project's meshes would then take about 28 MB /);
+    expect(apply.error).toMatch(
+      /^not run on the server: the project's meshes and objects would then take about 29 MB /,
+    );
     expect(doc.listMeshBlocks()).toHaveLength(1);
   });
 });
@@ -560,6 +732,26 @@ describe("stored meshes in the server's process", () => {
 });
 
 describe('get_scene problems', () => {
+  it('list every problem of an object, and the problems of a shared datablock on each object using it', () => {
+    const { doc, run } = project(SceneDoc.create({ name: 'Problems', empty: true }));
+    expect(run('mesh.primitive_cube_add', { name: 'Cube' }).ok).toBe(true);
+    expect(run('material.new', { name: 'Paint' }).ok).toBe(true);
+    // a linked duplicate: the same mesh and material
+    expect(run('object.duplicate', { linked: true }).ok).toBe(true);
+    // drivers that fail at every frame: one of the shared material, three of the first cube
+    const material = { target_type: 'material', target: 'Paint', path: 'roughness', expression: '1 / 0' };
+    expect(run('anim.driver_add', material).ok).toBe(true);
+    expect(
+      run('anim.driver_add', { target: 'Cube', path: 'location', index: -1, expression: '2 / 0' }).ok,
+    ).toBe(true);
+    const s = summarizeScene(doc) as any;
+    const problems = (name: string) => [...s.objects.find((o: any) => o.name === name).problems].sort();
+    const fails = (expression: string) => `driver: division by zero at column 3 in "${expression}"`;
+    expect(problems('Cube')).toEqual([fails('1 / 0'), fails('2 / 0'), fails('2 / 0'), fails('2 / 0')]);
+    expect(problems('Cube.001')).toEqual([fails('1 / 0')]);
+    expect(s.problems).toHaveLength(4);
+  });
+
   it("list what only the viewport's evaluation has, marked viewport", () => {
     const { doc, ctx, run } = project(SceneDoc.create({ name: 'Viewport', empty: true }));
     expect(run('mesh.primitive_grid_add', { x_subdivisions: 50, y_subdivisions: 50 }).ok).toBe(true);

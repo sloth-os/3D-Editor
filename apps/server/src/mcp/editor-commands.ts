@@ -103,7 +103,11 @@ export const EDITOR_COMMANDS: Record<string, EditorCommand> = {
     params: { message: { doc: 'the text', check: text } },
   },
   run_operator: {
-    doc: 'run an operator in the editor: for UI-only operators such as view3d.*; edit the document with the run_operator tool',
+    doc:
+      "run an operator in the editor: for UI-only operators such as view3d.*, and for an operator the server's " +
+      'process refused for memory, which the editor runs in its own memory (an import with the file in base64, ' +
+      'as the refusal says: {operator: "import_scene.gltf", params: {data_base64}}); edit the document with the ' +
+      'run_operator tool otherwise',
     params: {
       operator: { doc: 'operator id (required)', check: text },
       params: { doc: 'operator parameters', check: record },
@@ -209,8 +213,11 @@ export function describeLateRpcs(late: readonly LateRpc[], now = Date.now()): st
  * the other shadings about as long or longer, the first one in WIREFRAME, MATERIAL or RENDERED
  * shading seconds longer (the first WIREFRAME one several times as long, while the editor builds
  * the wires of every mesh), and a select {@link MILLIONS_SELECT_SECONDS}; a SOLID screenshot sent as
- * soon as a select had answered, and a select sent as soon as a screenshot had answered, wait for the
- * frame the viewport draws then, and these ranges include them. On the server,
+ * soon as a select had answered waits for the frame the viewport draws then (a screenshot waits for
+ * the frames in progress), and these ranges include it and selects sent as soon as a screenshot had
+ * answered. Other commands do not wait for the viewport's frames, only for the work that holds the
+ * editor's main thread: with 4 million triangles a select took {@link MILLIONS_SELECT_SECONDS}, as the
+ * statistics overlay counts the edges of every mesh again (apps/web session.ts sceneStats). On the server,
  * grey clay (render_image with shading 'SOLID' and renderer 'software', the remedy of SOLID and
  * WIREFRAME screenshots, and the quick look of the others while the editor is busy or for a
  * PATHTRACER scene) took {@link SERVER_SOLID_SECONDS} in a render process; a render that runs out of
@@ -331,11 +338,12 @@ export function editorTimeoutMessage(
     "if the viewport is not in SOLID shading, switch it to SOLID (editor_command view.shading {shading: 'SOLID'}), " +
     'which draws much faster.';
   return (
-    `${head} '${command}' waits while the editor draws its viewport. An editor ${noGpu} takes seconds ` +
-    'for its first frame of a heavy scene in MATERIAL or RENDERED shading, while it builds and compiles ' +
-    "the scene's materials, draws a scene with millions of triangles slowly in any shading (with 4 " +
-    `million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}), and takes seconds for its first ` +
-    'WIREFRAME frame of such a scene, while it builds the wires of every mesh. ' +
+    `${head} '${command}' waits while the editor's main thread is busy. An editor ${noGpu} is busy for ` +
+    'seconds with its first frame of a heavy scene in MATERIAL or RENDERED shading, while it builds and ' +
+    "compiles the scene's materials, and with its first WIREFRAME frame of a scene with millions of " +
+    'triangles, while it builds the wires of every mesh; with millions of triangles it is also busy while ' +
+    `it carries out a command (with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}), ` +
+    'but not while it draws its other frames. ' +
     (atMax
       ? `With timeout_ms at its maximum (${MAX_EDITOR_TIMEOUT_MS}), retry, or, ${toSolid}`
       : `Pass a larger timeout_ms (at most ${MAX_EDITOR_TIMEOUT_MS}), or, ${toSolid}`) +

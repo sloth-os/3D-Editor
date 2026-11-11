@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_REQUEST_TIMEOUT_MSEC } from '@modelcontextprotocol/sdk/shared/protocol.js';
+import { createOperatorRegistry } from '@3d-editor/core';
 import {
   EDITOR_COMMANDS,
   MAX_EDITOR_TIMEOUT_MS,
@@ -33,6 +34,7 @@ import {
 } from '../../src/mcp/editor-costs';
 import { MCP_INSTRUCTIONS } from '../../src/mcp/instructions';
 import { KEEP_ALIVE_MS, keepAlive, renderToolError } from '../../src/mcp/rendering';
+import { inBrowserEditor } from '../../src/render/memory';
 import { renderProcessExitError } from '../../src/render/pool';
 import type { LateRpc } from '../../src/sync/room';
 
@@ -124,6 +126,37 @@ describe('editor command catalogue', () => {
       "screenshot {width: pixels (default: the viewport size); height: pixels (default: the viewport size); shading: WIREFRAME | SOLID | MATERIAL | RENDERED (default: the viewport's shading)} — a PNG of the editor's viewport as the person sees it",
     );
   });
+
+  /*
+   * An import the server's process has no memory for ends its refusal with the editor_command call
+   * that runs it in a browser editor (render/memory.ts inBrowserEditor), and the run_operator
+   * command's doc says it is for that too: the call the refusal gives must pass this catalogue's
+   * check, name an operator of the registry (which the browser editor runs) that takes the file as
+   * data_base64, and have the shape the command's doc gives.
+   */
+  it("accepts the editor_command call that an import's memory refusal gives, as run_operator's doc says", () => {
+    const registry = createOperatorRegistry();
+    const doc = EDITOR_COMMANDS.run_operator.doc;
+    expect(doc).toContain("for an operator the server's process refused for memory");
+    expect(doc).toContain('{operator: "import_scene.gltf", params: {data_base64}}');
+    for (const operator of ['import_scene.gltf', 'import_mesh.stl', 'import_mesh.ply', 'import_scene.obj']) {
+      const advice = inBrowserEditor(operator);
+      expect(advice).toBe(
+        `a browser editor runs it in its own memory: editor_command {command: 'run_operator', params: {operator: '${operator}', params: {data_base64}}}`,
+      );
+      expect(registry.has(operator), operator).toBe(true);
+      const schema = registry.describe().find((d) => d.id === operator)?.parameters as
+        { properties?: Record<string, unknown> } | undefined;
+      expect(Object.keys(schema?.properties ?? {}), operator).toContain('data_base64');
+      expect(() =>
+        checkEditorCommand('run_operator', { operator, params: { data_base64: 'Z2xURg==' } }),
+      ).not.toThrow();
+    }
+    // the doc's example has the refusal's shape: the operator and the file in params.data_base64
+    expect(inBrowserEditor('import_scene.gltf')).toContain(
+      doc.slice(doc.indexOf('{operator: "import_scene.gltf"'), doc.indexOf('}}') + 2).replace(/"/g, "'"),
+    );
+  });
 });
 
 /**
@@ -179,12 +212,20 @@ describe('editor command timeouts', () => {
     'materials) and after a material ' +
     'edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of ' +
     `channels that no other material has: ${NEW_SHADER}). ${KEPT}`;
+  /**
+   * A command other than a screenshot waits for the editor's main thread, not for the viewport's
+   * frames: only the first ones in MATERIAL, RENDERED or WIREFRAME shading build materials or wires
+   * on it (round 11 said that commands wait while the editor draws its viewport and that it draws a
+   * scene of millions of triangles slowly: get_view probes sent while the viewport drew its frames
+   * answered within 0.14 s).
+   */
   const viewport = (command: string) =>
-    `'${command}' waits while the editor draws its viewport. ${NO_GPU} takes seconds for its first frame of a ` +
-    "heavy scene in MATERIAL or RENDERED shading, while it builds and compiles the scene's materials, draws " +
-    'a scene with millions of triangles slowly in any shading (with 4 million in SOLID shading a select ' +
-    `took ${MILLIONS_SELECT_SECONDS}), and takes seconds for its first WIREFRAME frame of such a scene, while it ` +
-    'builds the wires of every mesh.';
+    `'${command}' waits while the editor's main thread is busy. ${NO_GPU} is busy for seconds with its first ` +
+    "frame of a heavy scene in MATERIAL or RENDERED shading, while it builds and compiles the scene's " +
+    'materials, and with its first WIREFRAME frame of a scene with millions of triangles, while it builds ' +
+    'the wires of every mesh; with millions of triangles it is also busy while it carries out a command ' +
+    `(with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}), but not while it draws its ` +
+    'other frames.';
   /**
    * The server cannot know the viewport's shading (the person can change it): switching to SOLID is
    * advised only for a viewport in another shading (a select of 4 million triangles in SOLID shading
@@ -584,7 +625,14 @@ describe('the cost of screenshots', () => {
     // a select took a fraction of a second: its first WIREFRAME frame is not "several times as long"
     // as that but seconds (docs/mcp.md gives the measured range with 4 million triangles)
     expect(editorTimeoutMessage('select', 10_000)).toContain(
-      'and takes seconds for its first WIREFRAME frame of such a scene, while it builds the wires of every mesh.',
+      'and with its first WIREFRAME frame of a scene with millions of triangles, while it builds the wires of ' +
+        'every mesh;',
+    );
+    // the viewport's other frames do not hold commands up (get_view probes sent while the viewport
+    // drew them answered within 0.14 s): round 11 said that a command waits while the editor draws
+    // its viewport and that it draws a scene with millions of triangles slowly
+    expect(editorTimeoutMessage('select', 10_000)).not.toMatch(
+      /waits while the editor draws its viewport|draws a scene with millions of triangles slowly/,
     );
     expect(editorTimeoutMessage('select', 10_000)).not.toContain('several times as long');
     expect(MCP_INSTRUCTIONS).toContain(
@@ -611,6 +659,27 @@ describe('the cost of screenshots', () => {
     }
   });
 
+  /*
+   * The doc comment of MILLIONS_SELECT_SECONDS said a select waits "after the frame or screenshot it
+   * is drawing": the viewport's frames do not hold a command up (round 11's TEXTS agent profiled the
+   * select: the statistics overlay counts the edges of every mesh again), only a screenshot, and the
+   * first frames that build materials or wires, do.
+   */
+  it("say in the doc comment of MILLIONS_SELECT_SECONDS that the viewport's frames do not hold a select up", () => {
+    const src = readFileSync(
+      fileURLToPath(new URL('../../src/mcp/editor-costs.ts', import.meta.url)),
+      'utf8',
+    );
+    const at = src.indexOf('export const MILLIONS_SELECT_SECONDS');
+    const comment = src.slice(src.lastIndexOf('/**', at), at).replace(/\s*\n\s*\* ?/g, ' ');
+    expect(comment).toContain(
+      "once its main thread is free (after a screenshot it is drawing; the viewport's frames do not hold it " +
+        'up, apart from the first ones that build materials or wires), counting the edges of every mesh ' +
+        'again for the statistics overlay',
+    );
+    expect(comment).not.toContain('after the frame or screenshot it is drawing');
+  });
+
   it('give the measurements behind the texts in the doc comment of editorTimeoutMessage', () => {
     // the doc comment names the mechanism (scene-objects.ts replaceSlot keeps the replaced material
     // for every shading it was drawn in) and the constants of editor-costs.ts, whose header says how
@@ -633,9 +702,10 @@ describe('the cost of screenshots', () => {
       "({@link NEW_SHADER_SECONDS}: longest for the table's material, whose colour, roughness and bump are " +
         'procedural textures)',
       'a SOLID screenshot took {@link MILLIONS_SOLID_SECONDS}',
-      'a select {@link MILLIONS_SELECT_SECONDS}; a SOLID screenshot sent as soon as a select had answered, and ' +
-        'a select sent as soon as a screenshot had answered, wait for the frame the viewport draws then, and ' +
-        'these ranges include them.',
+      'a select {@link MILLIONS_SELECT_SECONDS}; a SOLID screenshot sent as soon as a select had answered ' +
+        'waits for the frame the viewport draws then (a screenshot waits for the frames in progress), and ' +
+        'these ranges include it and selects sent as soon as a screenshot had answered. Other commands do ' +
+        "not wait for the viewport's frames, only for the work that holds the editor's main thread",
       'took {@link SERVER_SOLID_SECONDS} in a render process',
     ])
       expect(docComment).toContain(name);

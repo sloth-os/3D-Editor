@@ -8,6 +8,7 @@ import {
   newProject,
   setNumberField,
   viewportCentre,
+  viewportPictures,
 } from './helpers';
 
 test.describe('physics and scattering', () => {
@@ -34,21 +35,27 @@ test.describe('physics and scattering', () => {
     await expect(cache).toContainText('Cached frames 1–250 of 1–250', { timeout: 60_000 });
     await expect(page.getByTestId('scene-rigidbody-bake')).toBeEnabled();
 
-    // frame 40: the cube has fallen out of the middle of the view (there is no floor). The picture
-    // at rest is taken once the viewport has drawn the selected cube (viewportCentre waits for it):
-    // right after the bake's text, the page could still show a frame from before the click that
-    // selected it (software WebGL took seconds for the first frame with a selection outline). The
-    // pictures compare edge for edge: the viewport keeps its multisampling on a busy machine (it
-    // turned it off between them, and 1.4 % of the pixels, the cube's edges, differed)
-    const atRest = await viewportCentre(page);
-    await setNumberField(page, 'current-frame', 40);
-    await expect(page.getByTestId('viewport-info')).toContainText('(40)');
-    await expect.poll(async () => changedFraction(atRest, await viewportCentre(page))).toBeGreaterThan(0.1);
+    // frame 40: the cube has fallen out of the middle of the view (there is no floor), and back at
+    // the start frame it is where it was. The pictures are taken once the viewport has drawn every
+    // change (viewportCentre waits for it: right after the bake's text, the page could still show a
+    // frame from before the click that selected the cube; software WebGL took seconds for the first
+    // frame with a selection outline), and drawn with the same multisampling: a busy machine can
+    // turn it off between them, and 1.4 % of the pixels, the cube's edges, then differ
+    const frame = async (f: number) => {
+      await setNumberField(page, 'current-frame', f);
+      await expect(page.getByTestId('viewport-info')).toContainText(`(${f})`);
+    };
+    const [atRest, fallen, back] = await viewportPictures(
+      page,
+      [() => frame(1), () => frame(40), () => frame(1)],
+      viewportCentre,
+    );
+    expect(changedFraction(atRest, fallen)).toBeGreaterThan(0.1);
+    expect(changedFraction(atRest, back)).toBeLessThan(0.01);
+    await frame(40);
     await page.getByTestId('prop-tab-physics').click();
     await expect(page.getByTestId('rigidbody-status')).toHaveText('Simulated at frame 40');
-    // and back at the start frame it is where it was
-    await setNumberField(page, 'current-frame', 1);
-    await expect.poll(async () => changedFraction(atRest, await viewportCentre(page))).toBeLessThan(0.01);
+    await frame(1);
 
     // Bake to Keyframes turns the simulated motion into keys of the location (and removes the rigid body)
     await page.getByTestId('prop-tab-scene').click();

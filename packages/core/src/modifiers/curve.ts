@@ -4,7 +4,7 @@ import { invert4, multiply4 } from '../math/mat4';
 import { vertexCount } from '../mesh/types';
 import { decodeFloat32 } from '../mesh/shape-keys';
 import type { CurveSample } from '../curve/path';
-import type { ModifierDef } from './registry';
+import { disabledObjectParam, type ModifierDef } from './registry';
 import { transformPositions, withPositions, zObjectRef } from './util';
 
 const AXES = ['POS_X', 'POS_Y', 'POS_Z', 'NEG_X', 'NEG_Y', 'NEG_Z'] as const;
@@ -88,6 +88,11 @@ export const curveModifier: ModifierDef<typeof curveSchema> = {
     'continues straight along the end tangent; closed curves wrap around. `use_stretch` fits the mesh length to the curve.',
   schema: curveSchema,
   dependencies: (p) => (p.object ? [p.object] : []),
+  // rna_modifier.cc: `RNA_MOD_OBJECT_SET(Curve, object, OB_CURVES_LEGACY);`
+  objectTypes: { object: ['CURVE'] },
+  // MOD_curve.cc is_disabled: `return !cmd->object || cmd->object->type != OB_CURVES_LEGACY;` (a
+  // curve object, not a text or surface)
+  disabled: (p, ctx) => disabledObjectParam(ctx, p.object, ['CURVE'], 'object', 'a curve'),
   apply(mesh, p, ctx) {
     const n = vertexCount(mesh);
     if (!p.object || n === 0) return mesh;

@@ -2,10 +2,13 @@ import { constants as bufferConstants } from 'node:buffer';
 import v8 from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import {
+  OPERATOR_FIXED_BYTES,
+  SAVE_BYTES_PER_KEPT_BYTE,
   decodedMeshBytes,
   estimateModifier,
   isMeshMemoryError,
   meshSize,
+  modifierContext,
   setGeometryMemoryCheck,
   setMeshMemoryCheck,
   setOperatorMemoryCheck,
@@ -30,8 +33,9 @@ import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
  * - Operators (MCP tools and the REST API): before an operator runs, the core registry asks
  *   `operatorCheck` with its estimated peak heap (core operators/memory.ts). One that does not fit
  *   into the free heap, less the reserve, fails with code OUT_OF_MEMORY and says what
- *   to lower; so does one that adds geometry beyond what the server keeps decoded for one project
- *   ({@link maxProjectMeshBytes}).
+ *   to lower; so does one that adds meshes or objects beyond what the server keeps for one project:
+ *   its meshes decoded, its objects, datablocks and keyframes, and what a save of the project
+ *   takes for a moment ({@link maxProjectMeshBytes}).
  * - Decoding stored meshes (scene summaries, mesh data, operators, exports in the server's process):
  *   `decodeCheck` refuses a mesh whose decoded arrays do not fit (core mesh/memory.ts); scene
  *   summaries then list its stored counts, other calls fail and say why.
@@ -95,7 +99,9 @@ const triangles = (s: MeshSize): number => Math.max(0, s.corners - 2 * s.faces);
 /**
  * Heap a render of `scene` takes, estimated without evaluating it: each mesh shown in renders
  * (its modifier stack counted once when objects share both) by its stored counts, its modifiers
- * enabled for renders by their estimates (core `estimateModifier`), and the render of the result.
+ * enabled for renders by their estimates (core `estimateModifier`; a Bevel limited by angle by the
+ * edges it bevels on the stored mesh when it comes first in the stack, else as if every edge were
+ * sharp: core `modifierContext`), and the render of the result.
  */
 export function estimateRenderMemory(scene: SceneDoc): { triangles: number; bytes: number } {
   const seen = new Set<string>();
@@ -117,8 +123,11 @@ export function estimateRenderMemory(scene: SceneDoc): { triangles: number; byte
     }
     const base = triangles(size) * RENDER_HEAP_BYTES_PER_TRIANGLE;
     let peaks = 0;
+    let first = true;
     for (const m of mods) {
-      const e = estimateModifier(m, size, { forRender: true });
+      // a Bevel by angle: counted on the stored mesh when it comes first, else every edge
+      const e = estimateModifier(m, size, modifierContext(scene, o, m, first, true));
+      first = false;
       peaks += e.bytes;
       size = { ...e.result, extent: size.extent };
     }
@@ -226,6 +235,12 @@ const n = (v: number): string => Math.round(v).toLocaleString('en-US');
 
 const mb = (bytes: number): string => n(Math.max(0, bytes) / MB);
 
+/** Megabytes rounded up (a need): shown next to a limit rounded down, it never shows as equal to it. */
+const mbUp = (bytes: number): string => n(Math.ceil(Math.max(0, bytes) / MB));
+
+/** Megabytes rounded down (a limit). */
+const mbDown = (bytes: number): string => n(Math.floor(Math.max(0, bytes) / MB));
+
 /** "…, and the server's process has F MB of its L MB heap free and keeps R MB of it for its other work". */
 const heapClause = (free: number, limit: number): string =>
   `the server's process has ${mb(free)} MB of its ${mb(limit)} MB heap free and keeps ` +
@@ -267,13 +282,100 @@ export function geometryCheck(
 }
 
 /**
- * Decoded meshes of one project the server keeps at most (bytes): half of its heap less the reserve,
- * so that the project's meshes, decoded, leave room for the operators that edit them and for other
- * projects (with Node's default heap of 2,096 MB: 786 MB, about 6.6 million triangles of grids with
- * UVs at 124 bytes each).
+ * What the server keeps for one project at most (bytes): its meshes decoded, its objects, datablocks
+ * and keyframes (core operators/memory-objects.ts projectStoredBytes), and what a save of the project
+ * takes for a moment besides (core saveBytes: three times what its objects, datablocks and keyframes
+ * keep; the server saves a project after every change), up to half of its heap less the reserve, so
+ * that they leave room for the operators that edit them, the cached evaluations
+ * ({@link evaluationCacheBytes}) and other projects. With Node's default heap of 2,096 MB: 786 MB,
+ * about 6.6 million triangles of grids with UVs at 124 bytes each, or about 18,700 objects without
+ * meshes at 44,000 bytes each (11,000 kept, 33,000 more while the project is saved).
  */
 export function maxProjectMeshBytes(limit = heapLimitBytes()): number {
   return Math.max(0, (limit - serverHeapReserve(limit)) / 2);
+}
+
+/**
+ * Heap the server keeps cached scene evaluations in, for all projects together (bytes): a third of
+ * what it keeps for one project ({@link maxProjectMeshBytes}), 262 MB of Node's default heap of
+ * 2,096 MB. The inspection tools (get_scene, get_object, get_mesh_data, get_instances) keep the last
+ * evaluations of each project by frame (mcp/eval-cache.ts), and one evaluation keeps about 1.6 KB per
+ * object (core memory-objects.ts sceneEvaluationBytes): 16 of them for a project of 18,700 objects,
+ * which the limit per project allows, would take about 460 MB.
+ */
+export function evaluationCacheBytes(limit = heapLimitBytes()): number {
+  return maxProjectMeshBytes(limit) / 3;
+}
+
+/**
+ * The error of a scene evaluation the server does not run for its inspection tools (`need`: its
+ * estimated peak heap; `free`, `limit`: the free heap and the heap limit; bytes).
+ */
+export function refusedEvaluationMessage(
+  objects: number,
+  need: number,
+  free: number,
+  limit = heapLimitBytes(),
+): string {
+  return (
+    `not evaluated on the server: evaluating the scene's ${n(objects)} object${objects === 1 ? '' : 's'} would need ` +
+    `about ${mb(need)} MB of JavaScript heap, and ${heapClause(free, limit)}. Delete objects the project no ` +
+    'longer needs (a browser editor that has the project open evaluates it in its own memory)'
+  );
+}
+
+/** Why an evaluation of `objects` objects whose peak heap is `need` bytes is not run (null: run it). */
+export type EvaluationCheck = (objects: number, need: number, release: () => void) => string | null;
+
+/**
+ * The server's check before it evaluates a scene for its inspection tools (mcp/eval-cache.ts): null
+ * when the evaluation's estimated peak heap (`need`, core memory-objects.ts sceneEvaluationBytes) is
+ * below the young generation's garbage every operator estimate starts from (core
+ * OPERATOR_FIXED_BYTES, 32 MB: about 5,800 objects of the default size), or fits into the free heap
+ * less the reserve ({@link serverHeapReserve}), after `release` dropped the cached evaluations and a
+ * garbage collection when it did not; else why it is not evaluated. Smaller evaluations ran
+ * unchecked before and cannot run the heap out on their own, while the free heap counts garbage until
+ * a collection runs (at most one a second, {@link collectGarbage}): checked, the evaluations of a
+ * scene of two objects asked for frame after frame were refused while those of other frames filled
+ * the heap with garbage.
+ */
+export function evaluationCheck(
+  opts: { heapFree?: () => number; collect?: () => unknown; heapLimit?: () => number } = {},
+): EvaluationCheck {
+  const heapFree = opts.heapFree ?? freeHeapBytes;
+  const collect = opts.collect ?? collectGarbage;
+  const heapLimit = opts.heapLimit ?? heapLimitBytes;
+  return (objects, need, release) => {
+    if (need < OPERATOR_FIXED_BYTES) return null;
+    const limit = heapLimit();
+    if (need <= heapFree() - serverHeapReserve(limit)) return null;
+    release();
+    const { ok, free } = fits(need, heapFree, collect, limit);
+    return ok ? null : refusedEvaluationMessage(objects, need, free, limit);
+  };
+}
+
+/** What an operator builds, for messages: " for a mesh of about F faces and N new objects" (or less). */
+function builds(e: OperatorMemoryRequest['estimate']): string {
+  const meshes = e.meshes ?? 0;
+  const objects = e.objects ?? 0;
+  const faces = !e.faces
+    ? ''
+    : meshes > 1
+      ? ` for ${n(meshes)} meshes of about ${n(e.faces)} faces in all`
+      : ` for a mesh of about ${n(e.faces)} faces`;
+  return objects > 1 ? `${faces || ' for'}${faces ? ' and' : ''} ${n(objects)} new objects` : faces;
+}
+
+/**
+ * Where else an operator runs: a browser editor that has the project open runs it in its own
+ * memory; an import (import_* operators, MCP import_model) gets there with editor_command
+ * run_operator and the file in base64.
+ */
+export function inBrowserEditor(operator: string | undefined): string {
+  return operator?.startsWith('import_')
+    ? `a browser editor runs it in its own memory: editor_command {command: 'run_operator', params: {operator: '${operator}', params: {data_base64}}}`
+    : 'a browser editor runs it in its own memory';
 }
 
 /**
@@ -286,28 +388,62 @@ export function refusedOperatorMessage(
   limit = heapLimitBytes(),
 ): string {
   const e = req.estimate;
+  const browser = inBrowserEditor(req.operator);
   return (
-    `not run on the server: it would need about ${mb(e.bytes)} MB of JavaScript heap` +
-    `${e.faces ? ` for a mesh of about ${n(e.faces)} faces` : ''}, and ${heapClause(free, limit)}. ` +
+    `not run on the server: it would need about ${mb(e.bytes)} MB of JavaScript heap${builds(e)}, and ` +
+    `${heapClause(free, limit)}. ` +
     (e.lower
-      ? `Lower ${e.lower} to run it on the server (a browser editor runs it in its own memory)`
-      : 'A browser editor runs it in its own memory')
+      ? `Lower ${e.lower} to run it on the server (${browser})`
+      : `${browser[0].toUpperCase()}${browser.slice(1)}`)
   );
 }
 
 /**
- * The error of an operator the server does not run because the project's meshes would not fit
- * decoded (`limit`: the heap limit in bytes, see {@link maxProjectMeshBytes}).
+ * The heap the server keeps for a project of `stored` bytes (its meshes decoded, its objects,
+ * datablocks and keyframes) whose save takes `save` bytes more for a moment (core saveBytes), held
+ * against {@link maxProjectMeshBytes}.
+ */
+const projectNeed = (stored: number, save = 0): number => stored + Math.max(0, save);
+
+/**
+ * The error of an operator the server does not run because the project would then need more than
+ * the server keeps for one: its meshes decoded, its objects, datablocks and keyframes, and what a
+ * save of it takes for a moment (`limit`: the heap limit in bytes, see {@link maxProjectMeshBytes}).
  */
 export function storedMeshesMessage(req: OperatorMemoryRequest, limit = heapLimitBytes()): string {
   const e = req.estimate;
+  const max = maxProjectMeshBytes(limit);
+  const save = req.saveBytes ?? 0;
+  const added = (e.objects ?? 0) > 1 ? ` with ${n(e.objects!)} new objects` : '';
+  const now =
+    req.objects === undefined ? '' : ` with ${n(req.objects)} object${req.objects === 1 ? '' : 's'}`;
+  const keeps =
+    `more than the ${mbDown(max)} MB the server's process keeps for one project (half of its ${mb(limit)} MB heap ` +
+    `less the ${mb(serverHeapReserve(limit))} MB it keeps for its other work)`;
+  // "…, and a save of it about S MB more for a moment (…): T MB in all, " (', ' without objects)
+  const saving = (kept: number, saved: number): string => {
+    if (!(saved > 0)) return ', ';
+    const k = Math.ceil(kept / MB);
+    const s = Math.ceil(saved / MB);
+    return (
+      `, and a save of it about ${n(s)} MB more for a moment (${n(SAVE_BYTES_PER_KEPT_BYTE)} times what its ` +
+      `objects, datablocks and keyframes take): ${n(k + s)} MB in all, `
+    );
+  };
+  // a project already past it (grown in browser editors): nothing of the operator to lower
+  if (projectNeed(req.storedBytes, save) > max)
+    return (
+      `not run on the server: the project's meshes and objects already take about ${mbUp(req.storedBytes)} MB of ` +
+      `JavaScript heap${now}${saving(req.storedBytes, save)}${keeps}, and this operator would add to them. ` +
+      'Delete objects and meshes the project no longer needs'
+    );
+  const kept = req.storedBytes + e.addedStoredBytes;
   return (
-    `not run on the server: the project's meshes would then take about ${mb(req.storedBytes + e.addedStoredBytes)} ` +
-    `MB of JavaScript heap decoded (now ${mb(req.storedBytes)} MB), more than the ` +
-    `${mb(maxProjectMeshBytes(limit))} MB the server's process keeps for the meshes of one project (half of ` +
-    `its ${mb(limit)} MB heap less the ${mb(serverHeapReserve(limit))} MB it keeps for its other work). ` +
+    `not run on the server: the project's meshes and objects would then take about ${mbUp(kept)} MB of ` +
+    `JavaScript heap${added} (now ${mb(req.storedBytes)} MB${now})${saving(kept, save + (e.addedSaveBytes ?? 0))}` +
+    `${keeps}. ` +
     (e.lower ? `Lower ${e.lower}, or delete` : 'Delete') +
-    ' meshes the project no longer needs'
+    ' objects and meshes the project no longer needs'
   );
 }
 
@@ -323,9 +459,10 @@ export function refusedDecodeMessage(req: MeshMemoryRequest, free: number, limit
 }
 
 /**
- * The server's check of operators (core `setOperatorMemoryCheck`): refuses one that adds geometry
- * beyond {@link maxProjectMeshBytes}, or whose estimated peak heap does not fit into the free heap
- * less the reserve ({@link serverHeapReserve}).
+ * The server's check of operators (core `setOperatorMemoryCheck`): refuses one that adds meshes or
+ * objects beyond {@link maxProjectMeshBytes} (counted with what a save of the project takes), or
+ * whose estimated peak heap does not fit into the free heap less the reserve
+ * ({@link serverHeapReserve}).
  */
 export function operatorCheck(
   opts: { heapFree?: () => number; collect?: () => unknown; heapLimit?: () => number } = {},
@@ -336,7 +473,11 @@ export function operatorCheck(
   return (req) => {
     const e = req.estimate;
     const limit = heapLimit();
-    if (e.addedStoredBytes > 0 && req.storedBytes + e.addedStoredBytes > maxProjectMeshBytes(limit))
+    if (
+      e.addedStoredBytes > 0 &&
+      projectNeed(req.storedBytes + e.addedStoredBytes, (req.saveBytes ?? 0) + (e.addedSaveBytes ?? 0)) >
+        maxProjectMeshBytes(limit)
+    )
       return storedMeshesMessage(req, limit);
     const { ok, free } = fits(e.bytes, heapFree, collect, limit);
     return ok ? null : refusedOperatorMessage(req, free, limit);

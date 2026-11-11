@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { invert4, multiply4 } from '../math/mat4';
 import { createMesh, meshBounds, vertexCount } from '../mesh/types';
 import type { MeshData } from '../mesh/types';
-import type { ModifierDef } from './registry';
+import { disabledObjectParam, type ModifierDef } from './registry';
 import { csgMeshBoolean } from './csg';
 import { transformPositions } from './util';
 
@@ -49,6 +49,11 @@ export const booleanModifier: ModifierDef<typeof schema> = {
     'slot. Implemented with BSP trees; the result is welded, T-junction free and merged back into n-gons.',
   schema,
   dependencies: (p) => (p.object ? [p.object] : []),
+  // rna_modifier.cc: `RNA_MOD_OBJECT_SET(Boolean, object, OB_MESH);`
+  objectTypes: { object: ['MESH'] },
+  // MOD_boolean.cc is_disabled, with an object operand (the only one here):
+  // `return !bmd->object || bmd->object->type != OB_MESH;`
+  disabled: (p, ctx) => disabledObjectParam(ctx, p.object, ['MESH'], 'object', 'a mesh'),
   apply(mesh, p, ctx) {
     if (!p.object) return mesh;
     const operand = ctx.getObjectMesh(p.object);

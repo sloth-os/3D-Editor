@@ -3,7 +3,7 @@ import { invert4, multiply4 } from '../math/mat4';
 import { vertexCount } from '../mesh/types';
 import { computeVertexNormals } from '../mesh/normals';
 import { triangulateMesh } from '../mesh/triangulate';
-import type { ModifierDef } from './registry';
+import { disabledObjectParam, type ModifierDef } from './registry';
 import { Bvh } from './bvh';
 import { det3, transformPositions, withPositions } from './util';
 
@@ -44,6 +44,11 @@ export const shrinkwrapModifier: ModifierDef<typeof schema> = {
     'keeps a distance from the surface; wrap modes restrict which vertices move. Vertices without a hit stay put.',
   schema,
   dependencies: (p) => (p.target ? [p.target] : []),
+  // rna_modifier.cc: `RNA_MOD_OBJECT_SET(Shrinkwrap, target, OB_MESH);`
+  objectTypes: { target: ['MESH'] },
+  // MOD_shrinkwrap.cc is_disabled: `if (!smd->target || smd->target->type != OB_MESH) return true;`
+  // (its auxiliary target is not supported here)
+  disabled: (p, ctx) => disabledObjectParam(ctx, p.target, ['MESH'], 'target', 'a mesh'),
   apply(mesh, p, ctx) {
     if (!p.target || vertexCount(mesh) === 0) return mesh;
     const tgt = ctx.getObjectMesh(p.target);

@@ -8,6 +8,7 @@ import {
   newProject,
   region,
   setNumberField,
+  viewportPictures,
   viewportShot,
   type RgbaImage,
 } from './helpers';
@@ -91,16 +92,30 @@ test.describe('object constraints', () => {
     await expect.poll(async () => arrowChange(upright, await viewportShot(page))).toBeGreaterThan(0.003);
 
     // picking the target is one undo step (the picker keeps the keyboard focus: leave it first)
-    await target.blur();
-    await page.getByTestId('viewport').hover();
-    await page.keyboard.press('Control+z');
-    await expect(target).toHaveValue('');
-    await expect(page.getByTestId('constraint-Track To-error')).toBeVisible();
-    await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual([0, 0, 0]);
-    await expect.poll(async () => arrowChange(upright, await viewportShot(page))).toBeLessThan(0.001);
-    await page.keyboard.press('Control+Shift+z');
-    await expect(target.locator('option:checked')).toHaveText('Cube');
-    await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual(wt.rotation_euler);
+    const aimed = wt.rotation_euler;
+    const undo = async () => {
+      await target.blur();
+      await page.getByTestId('viewport').hover();
+      if ((await target.inputValue()) !== '') await page.keyboard.press('Control+z');
+      await expect(target).toHaveValue('');
+      await expect(page.getByTestId('constraint-Track To-error')).toBeVisible();
+      await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual([0, 0, 0]);
+    };
+    const redo = async () => {
+      await page.getByTestId('viewport').hover();
+      if ((await target.inputValue()) === '') await page.keyboard.press('Control+Shift+z');
+      await expect(target.locator('option:checked')).toHaveText('Cube');
+      await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual(aimed);
+    };
+    // the viewport draws it upright again, and aimed after a redo: pictures of these states drawn
+    // with the same multisampling (a busy machine can turn it off between pictures, and edges then
+    // differ: 0.8 % of the pixels around the arrow)
+    const [undone, redone, again] = await viewportPictures(page, [undo, redo, undo]);
+    expect(arrowChange(undone, redone)).toBeGreaterThan(0.003);
+    expect(arrowChange(undone, again)).toBeLessThan(0.001);
+    // as before the target was picked
+    if (upright.samples === undone.samples) expect(arrowChange(upright, undone)).toBeLessThan(0.001);
+    await redo();
 
     // the Outliner badge of the constraint opens this tab
     await page.getByTestId('prop-tab-object').click();
@@ -114,17 +129,30 @@ test.describe('object constraints', () => {
       .poll(async () => closeTo(localAxis((await worldTransform()).rotation_euler, 'Z'), [0, -1, 0]))
       .toBe(true);
 
-    // influence 0 turns the constraint off
-    await setNumberField(page, 'constraint-Track To-influence', 0);
-    await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual([0, 0, 0]);
-    const off = await viewportShot(page);
-    // and muting it from the panel header does the same at full influence
-    await setNumberField(page, 'constraint-Track To-influence', 1);
-    await expect.poll(async () => (await worldTransform()).rotation_euler).not.toEqual([0, 0, 0]);
-    await expect.poll(async () => arrowChange(off, await viewportShot(page))).toBeGreaterThan(0.003);
-    await page.getByTestId('constraint-Track To-mute').click();
-    await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual([0, 0, 0]);
-    await expect.poll(async () => arrowChange(off, await viewportShot(page))).toBeLessThan(0.001);
+    // influence 0 turns the constraint off, and muting it from the panel header does the same at
+    // full influence (pictures drawn with the same multisampling, as above)
+    const mute = page.getByTestId('constraint-Track To-mute');
+    const setMuted = async (muted: boolean) => {
+      if ((await mute.getAttribute('aria-pressed')) === String(muted)) await mute.click();
+      await expect(mute).toHaveAttribute('aria-pressed', String(!muted));
+    };
+    const [off, full, muted] = await viewportPictures(page, [
+      async () => {
+        await setMuted(false);
+        await setNumberField(page, 'constraint-Track To-influence', 0);
+        await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual([0, 0, 0]);
+      },
+      async () => {
+        await setNumberField(page, 'constraint-Track To-influence', 1);
+        await expect.poll(async () => (await worldTransform()).rotation_euler).not.toEqual([0, 0, 0]);
+      },
+      async () => {
+        await setMuted(true);
+        await expect.poll(async () => (await worldTransform()).rotation_euler).toEqual([0, 0, 0]);
+      },
+    ]);
+    expect(arrowChange(off, full)).toBeGreaterThan(0.003);
+    expect(arrowChange(off, muted)).toBeLessThan(0.001);
     wt = await worldTransform();
     expect(wt.location).toEqual([4, 0, 0]);
     await client.close();

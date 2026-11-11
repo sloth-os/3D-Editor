@@ -3,7 +3,7 @@ import type { Mat4 } from '../math/types';
 import { identity4, invert4, multiply4 } from '../math/mat4';
 import type { MeshData } from '../mesh/types';
 import { meshBounds, parseEdgeKey, vertexCount } from '../mesh/types';
-import type { ModifierDef } from './registry';
+import { disabledObjectParam, type ModifierDef } from './registry';
 import {
   MeshBuilder,
   PointGrid,
@@ -121,6 +121,15 @@ export const arrayModifier: ModifierDef<typeof schema> = {
   schema,
   dependencies: (p) =>
     [p.use_object_offset ? p.offset_object : null, p.start_cap, p.end_cap].filter((x): x is string => !!x),
+  // rna_modifier.cc: `RNA_MOD_OBJECT_SET(Array, start_cap, OB_MESH);` (the same for end_cap; the
+  // offset object is any object)
+  objectTypes: { start_cap: ['MESH'], end_cap: ['MESH'] },
+  // MOD_array.cc is_disabled: a cap object that is not a mesh
+  // (`if (amd->start_cap && amd->start_cap->type != OB_MESH) return true;`, the same for the end
+  // cap); the curve of Fit Curve, also checked there, is not supported here
+  disabled: (p, ctx) =>
+    disabledObjectParam(ctx, p.start_cap, ['MESH'], 'start cap', 'a mesh', false) ??
+    disabledObjectParam(ctx, p.end_cap, ['MESH'], 'end cap', 'a mesh', false),
   apply(mesh, p, ctx) {
     const nv = vertexCount(mesh);
     if (nv === 0) return mesh;

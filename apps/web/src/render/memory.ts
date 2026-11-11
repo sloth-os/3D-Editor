@@ -1,4 +1,5 @@
 import {
+  FrameState,
   MAX_INSTANCES,
   TEXT_BYTES_PER_CHARACTER,
   estimateModifier,
@@ -17,6 +18,7 @@ import {
   type ModifierEstimate,
   type ObjectData,
   type SceneDoc,
+  type ShapeKeyData,
   type Spline,
 } from '@3d-editor/core';
 
@@ -51,10 +53,11 @@ import {
  * in renders too (core `SceneEvaluator` evaluates them all; they stay in its heap), and compiles the
  * geometry of the objects shown in renders and of the objects they instance. Four checks keep a
  * render from ending the tab:
- * - before any worker starts, an estimate from the document ({@link estimateRender}: meshes by their
- *   stored counts, curve and text surfaces counted from their splines and glyphs, all through their
- *   modifiers, the instances of particle systems and collections, and the decoded image textures),
- *   with the heap the modifiers take while the first worker evaluates them;
+ * - before any worker starts, an estimate from the document at the render's frame ({@link
+ *   estimateRender}: meshes by their stored counts, curve and text surfaces counted from their
+ *   splines and glyphs, all through their modifiers, the instances of particle systems and
+ *   collections, with the animated and driven values of that frame; and the decoded image
+ *   textures), with the heap the modifiers take while the first worker evaluates them;
  * - on the first worker, while it evaluates the scene, every modifier right before it runs, from its
  *   real input (guard.ts: what the estimate cannot see, such as the edges a Bevel limited by angle
  *   bevels);
@@ -63,6 +66,14 @@ import {
  * - with the exact compiled scene, the number of workers.
  * A render that does not fit one worker is not path traced: the first three checks refuse it with an
  * explanation instead of ending the tab.
+ *
+ * A RASTER render (F12, Render Animation, agents' renders with the WebGL rasterizer) evaluates the
+ * scene at its render settings on the page itself, next to the viewport's evaluation: the geometry
+ * it builds (curve and text surfaces, modifier and shape key results) must fit the room the tab's
+ * heap has, or running out of it ends the tab. It is checked the same way, before the evaluation
+ * from the estimate at the frame it renders ({@link rasterNeeds}, {@link rasterRefusal}) and during it
+ * every modifier right before it runs (guard.ts `RasterEvaluationGuard`); a path tracing refusal
+ * suggests the RASTER engine only where that check passes.
  */
 
 const MB = 1024 * 1024;
@@ -295,11 +306,20 @@ function fillOf(
   return { fill2D, bevel };
 }
 
+/** A curve datablock by id: as stored, or as an evaluation of one frame reads it (see {@link estimateRender}). */
+type CurveReader = (id: string) => CurveData | null;
+
 /** The bevel profiles core sweeps along the splines of `curve` (points, closed). */
-function curveProfiles(doc: SceneDoc, curve: CurveData, is2D: boolean, forRender: boolean): Contour[] {
+function curveProfiles(
+  doc: SceneDoc,
+  curve: CurveData,
+  is2D: boolean,
+  forRender: boolean,
+  curveOf: CurveReader,
+): Contour[] {
   if (curve.bevel_mode === 'OBJECT') {
     const bo = curve.bevel_object ? doc.getObject(curve.bevel_object) : null;
-    const bc = bo?.type === 'CURVE' && bo.data ? doc.getCurve(bo.data) : null;
+    const bc = bo?.type === 'CURVE' && bo.data ? curveOf(bo.data) : null;
     if (!bc) return [];
     return (Array.isArray(bc.splines) ? bc.splines : [])
       .map((s) => splineSampleCount(bc, s, forRender))
@@ -331,13 +351,15 @@ export interface CurveSurfaceSize {
  * or the glyphs of its body, sampled at the render resolution (the viewport's when `forRender` is
  * false), swept by the bevel profile, with end caps and 2D fills; none when it would pass core's
  * limit of 3,000,000 vertices, as core builds none then. Counted, not built: a curve whose surface
- * would take gigabytes is counted in microseconds.
+ * would take gigabytes is counted in microseconds. `curveOf` reads the curve of a bevel object
+ * (default: as stored).
  */
 export function curveSurfaceSize(
   doc: SceneDoc,
   curve: CurveData,
   isText: boolean,
   forRender = true,
+  curveOf: CurveReader = (id) => doc.getCurve(id),
 ): CurveSurfaceSize {
   const contours: Contour[] = [];
   let glyphs = 0;
@@ -362,7 +384,7 @@ export function curveSurfaceSize(
   const surface: MeshSize = { faces: 0, corners: 0, vertices: 0 };
   if (!contours.length) return { surface, wirePoints, glyphs };
   const is2D = isText || curve.dimensions === '2D';
-  let profiles = curveProfiles(doc, curve, is2D, forRender);
+  let profiles = curveProfiles(doc, curve, is2D, forRender, curveOf);
   let vertices = 0;
   for (const c of contours) for (const p of profiles) vertices += c.points * p.points;
   // core counts the points it kept (duplicates dropped, at most a few): within 5% of its limit the
@@ -437,6 +459,19 @@ export interface RenderEstimate {
    * document stores): every image of a material, and the world's.
    */
   imageBytes: number;
+  /**
+   * Triangles of the geometry the evaluation builds and keeps itself: the surfaces of curves and
+   * text, and the results of modifier stacks and of shape keys. The rest of `evaluatedTriangles` are
+   * meshes as the document stores them, which the page has decoded already: what a RASTER render
+   * adds to the page's heap is this ({@link rasterNeeds}).
+   */
+  builtTriangles: number;
+  /**
+   * The part of `builtTriangles` that no modifier makes: the surfaces of curves and text (core
+   * builds them before their modifiers), and meshes with shape keys and no modifier. The check of a
+   * RASTER render's evaluation (guard.ts) adds what the modifiers make.
+   */
+  builtBaseTriangles: number;
 }
 
 /** Bytes per pixel of a decoded image texture (RGBA8). */
@@ -488,14 +523,24 @@ function collectionTrees(doc: SceneDoc, ids: Iterable<string>): Set<string> {
 }
 
 /**
- * What a path traced render of `doc` evaluates, compiles and instances, estimated without evaluating
- * it (the viewport's evaluation with `forRender` false): each mesh by its stored counts, each curve
- * and text by the surface core builds for it ({@link curveSurfaceSize}), through its modifiers
- * enabled for renders ({@link modifierEstimate}). A mesh's geometry is shared by the objects that
- * show it unmodified; one with modifiers is evaluated per object, as core does.
+ * What a path traced render of `doc` at `frame` evaluates, compiles and instances, estimated without
+ * evaluating it (the viewport's evaluation with `forRender` false): each mesh by its stored counts,
+ * each curve and text by the surface core builds for it ({@link curveSurfaceSize}), through its
+ * modifiers enabled for renders ({@link modifierEstimate}). A mesh's geometry is shared by the
+ * objects that show it unmodified; one with modifiers is evaluated per object, as core does.
+ *
+ * The scene is read as core's evaluation of `frame` reads it (core `FrameState`): with the animated
+ * and driven values of objects (modifier and particle settings), curves (bevel depth, extrusion,
+ * resolutions, …) and shape keys. A curve stored without a bevel whose bevel depth is keyed has a
+ * surface at that frame, which the first worker builds before any modifier runs. Without `frame`,
+ * the values as stored.
  */
-export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate {
-  const objects = doc.listObjects();
+export function estimateRender(doc: SceneDoc, forRender = true, frame?: number): RenderEstimate {
+  const fs = frame !== undefined && Number.isFinite(frame) ? new FrameState(doc, frame) : null;
+  const objects = fs ? fs.objects : doc.listObjects();
+  const curveOf: CurveReader = fs ? (id) => fs.curve(id) : (id) => doc.getCurve(id);
+  const shapeKeysOf = (mesh: string): readonly Pick<ShapeKeyData, 'mute' | 'value'>[] =>
+    fs ? (fs.get<{ shape_keys?: ShapeKeyData[] }>('mesh', mesh)?.shape_keys ?? []) : doc.getShapeKeys(mesh);
   const byId = new Map(objects.map((o) => [o.id, o]));
   const byName = new Map(objects.map((o) => [o.name, o]));
   const meshUsers = new Map<string, number>();
@@ -510,6 +555,10 @@ export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate 
     peak: number;
     /** Triangles not made by modifiers: the mesh without modifiers, a curve's or text's surface. */
     stored: number;
+    /** Triangles the evaluation builds and keeps (see {@link RenderEstimate.builtTriangles}). */
+    built: number;
+    /** The part of `built` no modifier makes (see {@link RenderEstimate.builtBaseTriangles}). */
+    builtBase: number;
   }
   const done = new Map<string, Evaluated | null>();
   const visiting = new Set<string>();
@@ -533,25 +582,26 @@ export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate 
     let size: MeshSize;
     let peak = 0;
     let key = o.id;
+    // triangles the evaluation builds before any modifier: a curve's or text's surface, a mesh's
+    // shape keys applied (core keeps them as the evaluated mesh when no modifier follows)
+    let builtBase = 0;
     if (o.type === 'MESH') {
       const counts = doc.meshCounts(o.data);
       if (!counts) return null;
       size = counts;
+      const keyed = shapeKeysOf(o.data).some((k) => !k.mute && k.value !== 0);
       // users of a mesh share it unless modifiers or shape keys make one per object
-      if (
-        !mods.length &&
-        !((meshUsers.get(o.data) ?? 0) > 1 && doc.getShapeKeys(o.data).some((k) => !k.mute && k.value !== 0))
-      )
-        key = `mesh:${o.data}`;
+      if (!mods.length && !((meshUsers.get(o.data) ?? 0) > 1 && keyed)) key = `mesh:${o.data}`;
+      if (!mods.length && keyed) builtBase = triangles(size);
       // Array with FIT_LENGTH counts its copies from the mesh's size
       if (mods.some((m) => m.type === 'ARRAY' && m.params?.fit_type === 'FIT_LENGTH')) {
         const mesh = doc.getMesh(o.data);
         if (mesh) size = sizeWithExtent(mesh);
       }
     } else {
-      const curve = doc.getCurve(o.data);
+      const curve = curveOf(o.data);
       if (!curve) return null;
-      const built = curveSurfaceSize(doc, curve, o.type === 'FONT', forRender);
+      const built = curveSurfaceSize(doc, curve, o.type === 'FONT', forRender, curveOf);
       size = built.surface;
       peak += built.glyphs * TEXT_BYTES_PER_CHARACTER;
       // a curve without a surface feeds its wire to its modifiers, and shows nothing without them
@@ -559,11 +609,15 @@ export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate 
         if (!mods.length || o.type !== 'CURVE') return null;
         size = { faces: 0, corners: 0, vertices: built.wirePoints };
       }
+      builtBase = triangles(size);
     }
     // what the evaluation holds without running a modifier: the mesh as stored when it has none, a
     // curve's or text's surface (core builds it before the modifiers)
     const stored = o.type !== 'MESH' || !mods.length ? triangles(size) : 0;
     const extent = size.extent;
+    // whether a modifier makes a mesh of its own (one that does nothing, e.g. Subdivision Surface at
+    // level 0, hands its input on)
+    let modified = false;
     for (const m of mods) {
       const e = modifierEstimate(m, size, {
         forRender,
@@ -573,9 +627,12 @@ export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate 
         },
       });
       peak += e.bytes;
+      if (e.bytes > 0) modified = true;
       size = { ...e.result, extent };
     }
-    return { key, size, peak, stored };
+    // the result of the modifiers is kept besides what they started from (core caches both)
+    const built = builtBase + (modified ? triangles(size) : 0);
+    return { key, size, peak, stored, built, builtBase };
   };
 
   // what the objects instance: the objects of instanced collections, particle instance objects
@@ -629,6 +686,8 @@ export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate 
 
   const evaluated = new Map<string, number>();
   const stored = new Map<string, number>();
+  const built = new Map<string, number>();
+  const builtBase = new Map<string, number>();
   const compiled = new Map<string, number>();
   let evaluationHeap = 0;
   for (const o of objects) {
@@ -637,6 +696,8 @@ export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate 
     const tris = triangles(e.size);
     evaluated.set(e.key, tris);
     stored.set(e.key, e.stored);
+    built.set(e.key, e.built);
+    builtBase.set(e.key, e.builtBase);
     evaluationHeap = Math.max(evaluationHeap, e.peak);
     const shown = !o.hide_render && doc.isCollectionVisible(o.collection);
     if (shown) instances++;
@@ -650,15 +711,18 @@ export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate 
     instances,
     evaluationHeap,
     imageBytes: imageBytesOf(doc),
+    builtTriangles: sum(built),
+    builtBaseTriangles: sum(builtBase),
   };
 }
 
 /**
- * The page's own JavaScript heap, estimated from its scene: the editor evaluates every object for the
- * viewport and keeps the document and the evaluated meshes, as a render's first worker does.
+ * The page's own JavaScript heap, estimated from its scene at `frame`: the editor evaluates every
+ * object for the viewport and keeps the document and the evaluated meshes, as a render's first
+ * worker does.
  */
-export function pageHeapEstimate(doc: SceneDoc): number {
-  const e = estimateRender(doc, false);
+export function pageHeapEstimate(doc: SceneDoc, frame?: number): number {
+  const e = estimateRender(doc, false, frame);
   return e.evaluatedTriangles * PREPARE_BYTES_PER_TRIANGLE.heap + e.instances * INSTANCE_BYTES.heap;
 }
 
@@ -681,6 +745,11 @@ export interface RenderNeeds {
    * 'Bev' of 'Cube'"), what to lower ("its segments") and the triangles it would make.
    */
   cause?: { name: string; lower: string; triangles: number };
+  /**
+   * A RASTER render of the scene fits the page's heap ({@link rasterRefusal}): a refusal then
+   * suggests the RASTER engine, and only then.
+   */
+  rasterFits?: boolean;
 }
 
 /** The needs of a render of `pixels` pixels from the estimate of its document (before any worker reports). */
@@ -728,20 +797,58 @@ export interface ThreadPlan {
 /** Bytes as gigabytes for messages, with `digits` decimals. */
 const gbText = (b: number, digits = 1) => (b / GB).toFixed(digits);
 
+/** Figures of a refusal as printed (gigabytes): see {@link refusalFigures}. */
+export interface RefusalFigures {
+  need: string;
+  total: string;
+  used: string;
+  /** The room: the printed total less the printed use; null when that leaves none. */
+  room: string | null;
+  /** Decimals of the figures. */
+  digits: number;
+}
+
 /**
- * The memory a render needs and the room it is refused for (need > room), as gigabytes that never
- * print the same: one decimal, more where one would print both alike (0.53 GB more than 0.50 GB),
- * and at three decimals the need rounded up and the room down.
+ * The figures of a refusal in gigabytes, printed so that they add up and the need never prints like
+ * the room: `need`, and the room left of `total` once `used` is taken (the need is larger), with
+ * `digits` decimals; more decimals, at most three, where a figure that is not 0 (the room included)
+ * would print as 0, or the need would print no larger than the room. The room printed is the total
+ * printed less the use printed. At three decimals the need is rounded up, the total down and the use
+ * up.
  */
-function apart(need: number, room: number): [string, string] {
-  for (let digits = 1; digits <= 3; digits++) {
-    const texts: [string, string] = [gbText(need, digits), gbText(room, digits)];
-    if (texts[0] !== texts[1]) return texts;
-  }
-  return [
-    (Math.ceil((need / GB) * 1000) / 1000).toFixed(3),
-    (Math.floor((room / GB) * 1000) / 1000).toFixed(3),
-  ];
+export function refusalFigures(need: number, total: number, used: number, digits = 1): RefusalFigures {
+  const units = (b: number, d: number, round: (x: number) => number = Math.round) =>
+    round((Math.max(0, b) / GB) * 10 ** d);
+  const at = (d: number) => [units(need, d), units(total, d), units(used, d)];
+  let d = Math.max(0, Math.min(3, Math.floor(digits)));
+  let [n, t, s] = at(d);
+  const zero = () => [need, total, used].some((b) => b > 0 && units(b, d) === 0) || (total > used && t <= s);
+  while (d < 3 && (zero() || n <= t - s)) [n, t, s] = at(++d);
+  if (n <= t - s)
+    [n, t, s] = [units(need, d, Math.ceil), units(total, d, Math.floor), units(used, d, Math.ceil)];
+  const text = (u: number) => (u / 10 ** d).toFixed(d);
+  return { need: text(n), total: text(t), used: text(s), room: t - s > 0 ? text(t - s) : null, digits: d };
+}
+
+/**
+ * Why `subject` (e.g. "its render thread") does not fit with `need` bytes of JavaScript heap: the
+ * room a render has in the tab's heap is the share of its limit a render may fill ({@link
+ * usableHeap}) less what the page, and the path traced renders running in it, use.
+ */
+function heapReason(subject: string, need: number, mem: TabMemory): string {
+  const used = mem.heapUsed + mem.held.heap;
+  const f = refusalFigures(need, usableHeap(mem.heapLimit), used, 2);
+  const users =
+    mem.held.heap > 0 ? 'the page and the path traced renders running in it use' : 'the page uses';
+  const share =
+    `a render may fill ${f.total} GB of its ${gbText(mem.heapLimit, f.digits)} GB heap limit, the rest ` +
+    "being kept free for V8's young generation and for the page to keep working";
+  const left =
+    f.room === null
+      ? 'and the tab has none left for it'
+      : `more than the ${f.room} GB the tab has left for it`;
+  const use = used > 0 ? `, and ${users} ${f.used} GB${f.room === null ? '' : ' of that'}` : '';
+  return `${subject} needs about ${f.need} GB of JavaScript heap, ${left}: ${share}${use}`;
 }
 
 /** Whether `threads` workers fit the tab's memory. */
@@ -757,6 +864,18 @@ function fits(n: RenderNeeds, threads: number, mem: TabMemory): boolean {
 const triangleCount = (t: number): string =>
   t >= 100_000 ? `${(t / 1e6).toFixed(1)} million` : Math.round(t).toLocaleString('en-US');
 
+/** The sentence a refusal says about the modifier it did not run (guard.ts), or ''. */
+function causeSentence(c: RenderNeeds['cause']): string {
+  return c
+    ? ` ${c.name[0].toUpperCase()}${c.name.slice(1)} would make ${triangleCount(c.triangles)} of these ` +
+        `triangles (lower ${c.lower}).`
+    : '';
+}
+
+/** What to lower for fewer triangles, for the refusals. */
+const LOWER_TRIANGLES =
+  'the triangles (subdivision render levels, curve and text render resolution, objects in the scene)';
+
 /**
  * The workers a render of `needs` may use, at most `maxThreads`: the largest number that fits the
  * tab's memory (see the module comment), or a refusal when even one does not.
@@ -767,27 +886,24 @@ export function planRenderThreads(needs: RenderNeeds, maxThreads: number, mem: T
   while (threads < max && fits(needs, threads + 1, mem)) threads++;
   if (threads > 0) return { threads, limited: threads < max, refusal: null };
   const m = renderMemory(needs, 1);
-  const used = mem.heapUsed + mem.held.heap;
-  const heapRoom = usableHeap(mem.heapLimit) - used;
   const overBudget = m.total + mem.held.total > mem.budget;
-  // the need and the room the reason compares never print the same; other figures with one decimal
-  const need = overBudget ? m.total : m.heap;
-  const roomLeft = overBudget ? Math.max(0, mem.budget - mem.held.total) : Math.max(0, heapRoom);
-  const [needText, roomText] = apart(need, roomLeft);
-  const gb = (b: number) => (b === need ? needText : b === roomLeft ? roomText : gbText(b));
-  const device = mem.deviceGB
-    ? `the device memory the browser reports, ${mem.deviceGB} GB`
-    : `the device memory, taken as ${DEFAULT_DEVICE_GB} GB where the browser does not report it`;
-  const budget = `a render may use in this tab (half ${device}, at most ${gbText(MAX_RENDER_BUDGET)} GB)`;
-  const room =
-    mem.held.total > 0
-      ? `the ${gb(Math.max(0, mem.budget - mem.held.total))} GB left of the ${gb(mem.budget)} GB ${budget}, ` +
-        `${gb(mem.held.total)} GB of which other path traced renders running in it hold`
-      : `the ${gb(mem.budget)} GB ${budget}`;
-  const reason = overBudget
-    ? `it needs about ${gb(m.total)} GB of memory with one render thread, more than ${room}`
-    : `its render thread needs about ${gb(m.heap)} GB of JavaScript heap, and the tab, which already uses ` +
-      `${gb(used)} GB, has ${gb(Math.max(0, heapRoom))} GB of its ${gb(mem.heapLimit)} GB left for it`;
+  let reason: string;
+  if (overBudget) {
+    // the budget, less what the renders running in the tab hold
+    const f = refusalFigures(m.total, mem.budget, mem.held.total, 1);
+    const device = mem.deviceGB
+      ? `the device memory the browser reports, ${mem.deviceGB} GB`
+      : `the device memory, taken as ${DEFAULT_DEVICE_GB} GB where the browser does not report it`;
+    const budget = `a render may use in this tab (half ${device}, at most ${gbText(MAX_RENDER_BUDGET)} GB)`;
+    const needs1 = `it needs about ${f.need} GB of memory with one render thread`;
+    reason = !(mem.held.total > 0)
+      ? `${needs1}, more than the ${f.total} GB ${budget}`
+      : f.room === null
+        ? `${needs1}, and none is left of the ${f.total} GB ${budget}: other path traced renders running ` +
+          `in it hold ${f.used} GB`
+        : `${needs1}, more than the ${f.room} GB left of the ${f.total} GB ${budget}, ${f.used} GB of which ` +
+          'other path traced renders running in it hold';
+  } else reason = heapReason('its render thread', m.heap, mem);
   // every triangle the render evaluates; objects hidden in renders are evaluated all the same: say so
   // when they hold much of it
   const tris = triangleCount(Math.max(needs.triangles, needs.evaluatedTriangles ?? 0));
@@ -796,19 +912,70 @@ export function planRenderThreads(needs: RenderNeeds, maxThreads: number, mem: T
     hidden >= 100_000 && hidden >= needs.triangles / 10
       ? `${triangleCount(hidden)} of them in objects hidden in renders, which are evaluated all the same, `
       : '';
-  // the modifier the first worker did not run (guard.ts): what it would make and what to lower
-  const c = needs.cause;
-  const cause = c
-    ? ` ${c.name[0].toUpperCase()}${c.name.slice(1)} would make ${triangleCount(c.triangles)} of these ` +
-      `triangles (lower ${c.lower}).`
-    : '';
+  // the image counts towards the memory of the tab, not towards the heap; the RASTER engine only
+  // where a RASTER render of the scene fits the page (rasterRefusal)
+  const lower = overBudget ? `the resolution or ${LOWER_TRIANGLES}` : LOWER_TRIANGLES;
   return {
     threads: 0,
     limited: true,
     refusal:
       `Path tracing was not started: ${reason} (about ${tris} triangles, ` +
       `${hiddenPart}${needs.pixels.toLocaleString('en-US')} pixels), and running out of memory would end the ` +
-      `tab.${cause} Lower the resolution or the triangles (subdivision render levels, curve and text render ` +
-      'resolution, objects in the scene), or render with the RASTER engine.',
+      `tab.${causeSentence(needs.cause)} Lower ${lower}` +
+      (needs.rasterFits ? ', or render with the RASTER engine.' : '.'),
   };
+}
+
+/**
+ * The JavaScript heap a RASTER render (F12, Render Animation and agents' renders with the WebGL
+ * rasterizer) adds on the page per triangle of the geometry its evaluation builds (bytes). Measured
+ * in Chrome 153 (headless, software WebGL), F12 with the RASTER engine on a curve whose surface only
+ * renders, the page holding 18–22 MB before: 3,237,900 and 3,777,548 triangles rendered with
+ * --max-old-space-size=400 (a heap limit of 497 MB); 4,317,196 ended the tab with 400 and rendered
+ * with 425: 88–94 bytes per triangle; a quarter more, rounded up. Modifiers count with core's
+ * estimates of their peak, measured in Node, more than Chrome needed: a grid of 129,600 faces
+ * subdivided once in renders (518,400 faces; core: 346 MB) rendered with --max-old-space-size=250,
+ * subdivided twice (2,073,600 faces; core: 1,384 MB) with 850, not with 700.
+ */
+export const RASTER_BYTES_PER_TRIANGLE = 120;
+
+/** What a RASTER render adds to the page's heap while it evaluates the scene. */
+export interface RasterNeeds {
+  /** Triangles of the geometry its evaluation builds ({@link RenderEstimate.builtTriangles}). */
+  triangles: number;
+  /** Bytes of JavaScript heap: that geometry, the evaluated instances, and the evaluation running. */
+  heap: number;
+  /** The modifier whose evaluation does not fit (guard.ts), as in {@link RenderNeeds.cause}. */
+  cause?: RenderNeeds['cause'];
+}
+
+/**
+ * The JavaScript heap a RASTER render of a document adds on the page, from its estimate at the
+ * frame it renders: the render evaluates the scene at its render settings with an evaluator of its
+ * own (the viewport's evaluation stays), which keeps the geometry it builds ({@link
+ * RenderEstimate.builtTriangles}, {@link RASTER_BYTES_PER_TRIANGLE}) and the evaluated instances, and
+ * needs the heap of the evaluation of the heaviest object while it runs ({@link
+ * RenderEstimate.evaluationHeap}). Meshes as the document stores them are the page's already: the
+ * viewport shows them.
+ */
+export function rasterNeeds(e: RenderEstimate): RasterNeeds {
+  return {
+    triangles: e.builtTriangles,
+    heap: e.builtTriangles * RASTER_BYTES_PER_TRIANGLE + e.instances * INSTANCE_BYTES.heap + e.evaluationHeap,
+  };
+}
+
+/**
+ * Why a RASTER render of `needs` is not started: its geometry does not fit the room the tab's heap
+ * has for a render (see {@link usableHeap}, next to the page and the path traced renders running in
+ * it), and running out of it would end the tab; null when it fits.
+ */
+export function rasterRefusal(needs: RasterNeeds, mem: TabMemory): string | null {
+  if (mem.heapUsed + mem.held.heap + needs.heap <= usableHeap(mem.heapLimit)) return null;
+  return (
+    'The RASTER render was not started: ' +
+    heapReason('the geometry it evaluates at the render settings', needs.heap, mem) +
+    ` (about ${triangleCount(needs.triangles)} triangles: curve and text surfaces, modifier and shape key ` +
+    `results), and running out of memory would end the tab.${causeSentence(needs.cause)} Lower ${LOWER_TRIANGLES}.`
+  );
 }

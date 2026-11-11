@@ -319,6 +319,17 @@ export const subsurfModifier: ModifierDef<typeof schema> = {
     'loose edges; edge creases (0..1) make edges semi-sharp (1 = fully sharp). Each level multiplies the face count by ~4. ' +
     'UVs and vertex colors are interpolated linearly. Limitation: the limit-surface projection is not applied.',
   schema,
+  // MOD_subsurf.cc is_disabled: `int levels = (use_render_params) ? smd->renderLevels : smd->levels;
+  // return get_render_subsurf_level(&scene->r, levels, use_render_params != 0) == 0;` (there is no
+  // Simplify setting here to lower them)
+  disabled: (p, ctx) =>
+    ctx.forRender
+      ? p.render_levels === 0
+        ? 'has 0 render levels (render_levels)'
+        : null
+      : p.levels === 0
+        ? 'has 0 viewport levels (levels)'
+        : null,
   apply(mesh, p, ctx) {
     const levels = ctx.forRender ? p.render_levels : p.levels;
     if (levels <= 0 || mesh.positions.length === 0) return mesh;

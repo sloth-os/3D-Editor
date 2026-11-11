@@ -24,9 +24,11 @@ import {
   createEditorState,
   createFCurve,
   defaultBone,
+  defaultPoseBone,
   insertKeyframe,
   selectionPivot,
   translation4,
+  type ConstraintData,
 } from '../src';
 
 /*
@@ -159,6 +161,120 @@ describe('a pointer move of a transform', () => {
     const out = xf.worlds(channels);
     expect([...out.keys()].sort()).toEqual([target, doc.resolveObject('Rig')!.id, child].sort());
     expect(curves).not.toHaveBeenCalled();
+  });
+
+  it('is no dependency cycle where a driver of a parent reads its child’s channel', () => {
+    // Y's Z location is driven by the X location of X, its child: drivers read channels, not
+    // matrices, so moving X evaluates X and Y, none of the 300 animated objects
+    const doc = SceneDoc.create({ empty: true });
+    let x = '';
+    let y = '';
+    doc.transact(() => {
+      for (let i = 0; i < 300; i++) {
+        const id = doc.addObject({ type: 'EMPTY', name: `A${i}`, location: [i, 0, 0] });
+        let fc = createFCurve({ target_type: 'object', target_id: id, path: 'location', index: 2 });
+        fc = insertKeyframe(insertKeyframe(fc, 1, 0), 9, 4);
+        doc.setFCurve(fc);
+      }
+      y = doc.addObject({ type: 'EMPTY', name: 'Y' });
+      x = doc.addObject({ type: 'EMPTY', name: 'X', parent: y, location: [1, 0, 0] });
+      doc.setDriver({
+        target_type: 'object',
+        target_id: y,
+        path: 'location',
+        index: 2,
+        expression: 'v * 0.5',
+        variables: [{ name: 'v', target_type: 'object', target_id: x, path: 'location', index: 0 }],
+        mute: false,
+      });
+    });
+    const fs = new FrameState(doc, 4);
+    fs.allWorldMatrices();
+    const xf = new ObjectTransform(fs, [x], 'MEDIAN_POINT', 'TRANSLATE');
+    const channels = xf.channels(translation4([1, 0, 0]), [0, 0, 0]);
+    xf.worlds(channels);
+    const curves = vi.mocked(evaluateFCurve);
+    curves.mockClear();
+    const out = xf.worlds(channels);
+    // X at 2 drives Y up to 1; X follows it
+    expect(Array.from(out.get(y)!.slice(12, 15))).toEqual([0, 0, 1]);
+    expect(Array.from(out.get(x)!.slice(12, 15))).toEqual([2, 0, 1]);
+    expect(curves).not.toHaveBeenCalled();
+  });
+
+  it('finds the pivot without evaluating the scene when a dependency cycle elsewhere does not reach the selection', () => {
+    // six armatures with IK chains and objects on their bones (costly to evaluate), the selected
+    // empty, and, in the second scene only, a cycle between two other empties (each copies the
+    // other's location): the pivot evaluates as many objects in both scenes, and costs about as
+    // much (0.8-1.0 times, measured here alternately; evaluating the whole scene first made it
+    // 3.7-4.0 times)
+    const scene = (cycle: boolean) => {
+      const doc = SceneDoc.create({ empty: true });
+      let selected = '';
+      doc.transact(() => {
+        selected = doc.addObject({ type: 'EMPTY', name: 'Sel', location: [5, 5, 0] });
+        for (let r = 0; r < 6; r++) {
+          const bones = Array.from({ length: 20 }, (_, i) => ({
+            ...defaultBone(`B${i}`, [0, 0, i * 0.2], [0, 0.05, (i + 1) * 0.2]),
+            ...(i ? { parent: `B${i - 1}`, use_connect: true } : {}),
+          }));
+          const rig = doc.addObject({
+            type: 'ARMATURE',
+            name: `Rig${r}`,
+            location: [r * 3, 0, 0],
+            data: doc.addArmature({ bones }),
+          });
+          const target = doc.addObject({ type: 'EMPTY', name: `T${r}`, location: [r * 3 + 2, 1, 3] });
+          const ik = createConstraint('IK' as ConstraintData['type'], { target });
+          const pose: Record<string, unknown> = {};
+          for (let i = 0; i < 19; i++) pose[`B${i}`] = defaultPoseBone();
+          pose.B19 = { ...defaultPoseBone(), constraints: [{ ...ik, params: { chain_count: 0 } }] };
+          doc.updateObject(rig, { pose: { bones: pose } as never });
+          for (let i = 0; i < 20; i++)
+            doc.addObject({
+              type: 'EMPTY',
+              name: `K${r}_${i}`,
+              parent: rig,
+              parent_type: 'BONE',
+              parent_bone: `B${i}`,
+            });
+        }
+        if (cycle) {
+          const a = doc.addObject({ type: 'EMPTY', name: 'CycA' });
+          const b = doc.addObject({ type: 'EMPTY', name: 'CycB', location: [1, 0, 0] });
+          doc.updateObject(a, { constraints: [createConstraint('COPY_LOCATION', { target: b })] });
+          doc.updateObject(b, { constraints: [createConstraint('COPY_LOCATION', { target: a })] });
+        }
+      });
+      const state = createEditorState();
+      Object.assign(state, { selectedIds: [selected], activeId: selected });
+      return { doc, state };
+    };
+    const plain = scene(false);
+    const cyclic = scene(true);
+    const pivot = (s: typeof plain, frame: number) => {
+      s.state.frame = frame;
+      const t0 = performance.now();
+      expect(selectionPivot(s.doc, s.state, 'MEDIAN_POINT')).toEqual([5, 5, 0]);
+      return performance.now() - t0;
+    };
+    const evaluated = (s: typeof plain) => {
+      const world = vi.spyOn(FrameState.prototype, 'world');
+      try {
+        pivot(s, 1);
+        return new Set(world.mock.calls.map(([id]) => id)).size;
+      } finally {
+        world.mockRestore();
+      }
+    };
+    expect(evaluated(cyclic)).toBe(evaluated(plain));
+    const times: [number[], number[]] = [[], []];
+    for (let frame = 2; frame < 22; frame++) {
+      const order = frame % 2 ? [0, 1] : [1, 0];
+      for (const k of order) times[k].push(pivot(k ? cyclic : plain, frame));
+    }
+    const median = (l: number[]) => [...l].sort((a, b) => a - b)[l.length >> 1];
+    expect(median(times[1])).toBeLessThan(2 * median(times[0]));
   });
 
   it('reads the scene from the document once for the gizmo’s pivot, which follows every frame change', () => {

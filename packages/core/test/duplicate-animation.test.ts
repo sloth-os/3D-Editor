@@ -137,6 +137,27 @@ describe('Duplicate copies the animation of what it copies', () => {
     ]);
   });
 
+  it('Duplicate copies a text object’s data with its keyframes', () => {
+    const t = setup();
+    t.run('object.text_add', { body: 'Hi' });
+    const text = t.state.activeId!;
+    const data = t.doc.getObject(text)!.data!;
+    t.run('curve.keyframe_insert', { object: text, path: 'extrude', frame: 1, value: 0.1 });
+    t.run('curve.keyframe_insert', { object: text, path: 'extrude', frame: 10, value: 0.5 });
+    t.select(text);
+    const [copy] = t.duplicate();
+    const copied = t.doc.getObject(copy)!.data!;
+    expect(copied).not.toBe(data);
+    expect(t.keys('curve', copied, 'extrude', 0)).toEqual([
+      [1, 0.1],
+      [10, 0.5],
+    ]);
+    expect(t.keys('curve', data, 'extrude', 0)).toEqual([
+      [1, 0.1],
+      [10, 0.5],
+    ]);
+  });
+
   it('Duplicate Linked shares the data and its animation and copies the object’s keyframes', () => {
     const t = setup();
     t.run('object.light_add', { type: 'POINT', name: 'Lamp' });

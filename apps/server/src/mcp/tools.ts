@@ -51,7 +51,14 @@ import { RpcError, type Room, type SyncConnection } from '../sync/room';
 import { ProjectNameTakenError, requireFreeProjectName, withProjectNames } from '../sync/project-names';
 import { isNotImplemented, safeFileName } from '../api/projects';
 import { persistenceNote } from '../persistence';
-import { NotFoundError, ToolError, type AgentProject, type AgentSession, type ErrorCode } from './agent';
+import {
+  NotFoundError,
+  ToolError,
+  collectProjectNotes,
+  type AgentProject,
+  type AgentSession,
+  type ErrorCode,
+} from './agent';
 import type { HistoryLimits } from './history';
 import {
   DEFAULT_MAX_OBJECTS,
@@ -106,6 +113,7 @@ import {
 import {
   BROWSER_RASTER_SECONDS,
   FIRST_SHADING_SECONDS,
+  MILLIONS_SELECT_SECONDS,
   NEW_SHADER_SECONDS,
   SERVER_SOLID_SECONDS,
   measured,
@@ -185,7 +193,12 @@ const MAX_EMBEDDED_EXPORT_BYTES = 20 * 1024 * 1024;
 const vec3 = z.tuple([z.number(), z.number(), z.number()]);
 const vec4 = z.tuple([z.number(), z.number(), z.number(), z.number()]);
 const color = z.union([vec3, vec4]).describe('Linear RGB or RGBA, components 0..1');
-const projectArg = z.string().min(1).describe('Project id or exact project name (see list_projects)');
+const projectArg = z
+  .string()
+  .min(1)
+  .describe(
+    'Project id or name (see list_projects): the exact name, or, when no project has it, the name in another letter case',
+  );
 const objectArg = z.string().min(1).describe('Object id or exact object name');
 const objectList = z.array(z.string().min(1)).min(1).describe('Object ids or exact names');
 const selectModeEnum = z.enum(['VERT', 'EDGE', 'FACE']);
@@ -281,6 +294,71 @@ function failure(message: string, details?: unknown): CallToolResult {
 
 function isCallToolResult(v: unknown): v is CallToolResult {
   return typeof v === 'object' && v !== null && Array.isArray((v as { content?: unknown }).content);
+}
+
+/** `s` parsed as a JSON object, or null when it is not one. */
+function jsonObject(s: string): Record<string, unknown> | null {
+  if (!s.trimStart().startsWith('{')) return null;
+  try {
+    const v: unknown = JSON.parse(s);
+    return typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A tool's result with the notes of the projects it found by a name that was not compared with
+ * every project (agent.ts collectProjectNotes: storage did not answer in time, listing it failed, or
+ * reading some project.json files failed), so that the agent knows another project may have that
+ * name and can pass the id instead: `project_note` in the result's JSON, a result object or the JSON
+ * that comes with an image or a file (one text, which scripts/mcp.mjs parses), and in the JSON after
+ * a failure's message (a JSON of its own after a message that had none); a result without JSON (a
+ * screenshot) gets a text of its own after its content. A note that a failure's message already
+ * gives is not repeated.
+ */
+function withProjectNotes(out: ToolOutput, notes: string[]): CallToolResult {
+  const r = isCallToolResult(out) ? out : null;
+  const said = (n: string) => !!r?.isError && r.content.some((c) => c.type === 'text' && c.text.includes(n));
+  const project_note = notes.filter((n) => !said(n)).join(' ');
+  if (!project_note) return r ?? text(out);
+  const own = { type: 'text' as const, text: JSON.stringify({ project_note }) };
+  if (r?.isError) {
+    // failure(): the message on its first line, then its JSON
+    const [first] = r.content;
+    if (r.content.length === 1 && first.type === 'text') {
+      const nl = first.text.indexOf('\n');
+      const details = nl < 0 ? {} : jsonObject(first.text.slice(nl + 1));
+      const message = nl < 0 ? first.text : first.text.slice(0, nl);
+      if (details)
+        return {
+          ...r,
+          content: [
+            { type: 'text', text: `${message}\n${JSON.stringify({ ...details, project_note }, null, 2)}` },
+          ],
+        };
+    }
+    return { ...r, content: [...r.content, own] };
+  }
+  if (r) {
+    const at = r.content.findIndex((c) => c.type === 'text' && jsonObject(c.text) !== null);
+    if (at < 0) return { ...r, content: [...r.content, own] };
+    const content = r.content.map((c, i) =>
+      i === at && c.type === 'text'
+        ? {
+            ...c,
+            text: JSON.stringify(
+              { ...jsonObject(c.text), project_note },
+              null,
+              c.text.includes('\n') ? 2 : undefined,
+            ),
+          }
+        : c,
+    );
+    return { ...r, content };
+  }
+  if (typeof out === 'object' && out !== null && !Array.isArray(out)) return text({ ...out, project_note });
+  return { content: [...text(out).content, own] };
 }
 
 /** Origin of the MCP request (used for editor/download links). */
@@ -643,6 +721,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     const cb = async (args: z.output<z.ZodObject<S>>, extra: ToolExtra): Promise<CallToolResult> => {
       const end = metrics.mcpToolDuration.startTimer({ tool: name });
       const projectRef = (args as { project?: unknown }).project;
+      // the notes of the projects the call found by name (withProjectNotes), also when it fails
+      let notes: string[] = [];
       try {
         const result = await withSpan(
           `mcp.tool ${name}`,
@@ -652,8 +732,16 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             ...(typeof projectRef === 'string' ? { 'project.ref': projectRef } : {}),
           },
           async (span) => {
-            const out = await handler(args, extra);
-            const r = isCallToolResult(out) ? out : text(out);
+            const run = await collectProjectNotes(async () => {
+              try {
+                return { out: await handler(args, extra) };
+              } catch (err) {
+                return { err };
+              }
+            });
+            notes = run.notes;
+            if ('err' in run.value) throw run.value.err;
+            const r = withProjectNotes(run.value.out, notes);
             if (r.isError) span.setAttribute('mcp.tool.error', true);
             return r;
           },
@@ -664,13 +752,18 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         metrics.mcpToolCalls.inc({ tool: name, status: 'error' });
         // the out-of-memory errors of the rendering and export tools carry their code as JSON on
         // the next line (like run_operator's failures); every other tool error stays one message
+        // (with a project_note, also that as JSON)
         if (err instanceof ToolError)
-          return failure(err.message, err.code === 'OUT_OF_MEMORY' ? { code: err.code } : undefined);
+          return withProjectNotes(
+            failure(err.message, err.code === 'OUT_OF_MEMORY' ? { code: err.code } : undefined),
+            notes,
+          );
         // a stored mesh the server's process has no memory to decode (get_mesh_data …), as the
         // operators that read it say it: code OUT_OF_MEMORY
-        if (isMeshMemoryError(err)) return failure(`${name} failed: ${err.message}`, { code: err.code });
+        if (isMeshMemoryError(err))
+          return withProjectNotes(failure(`${name} failed: ${err.message}`, { code: err.code }), notes);
         log.warn({ err: errorMessage(err), tool: name, session: agent.id }, 'MCP tool failed');
-        return failure(`${name} failed: ${errorMessage(err)}`);
+        return withProjectNotes(failure(`${name} failed: ${errorMessage(err)}`), notes);
       } finally {
         end();
       }
@@ -798,12 +891,15 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Delete project',
       description:
-        "Permanently delete a project: deletes its stored files, and once storage has deleted them, closes the project for every editor and agent that has it open on this server (browser editors show 'Deleted on server'). This cannot be undone. When storage fails, or the project's earlier reads and writes of storage do not finish within 5 s, nothing is closed and the call fails with 'delete_project failed: could not delete project <id> from storage (<reason>); …: delete it again' (the project stays open here, and storage may still hold all or part of it). With WebDAV storage, whose requests each wait up to 30 s for an answer, the call takes up to 5 s plus one request for a project loaded on this server, and up to three requests one after another for one that is not (its project.json, read twice, then the deletion; five when it has no project.json), when you pass the project's id. A name is looked up first: one that could be an id (letters, digits, '-' and '_') is tried as an id first (up to two more requests one after another; at most 5 s when this server has loaded a project of that name), and a project this server has not loaded is found by listing storage (one request, then every project's project.json at once) instead of the first read of its project.json. Editors and agents that have it open on another server sharing the storage stay connected there, and their next change stores the project again (until then get_project on that server, which checks storage first, shows deleted_from_storage: true); browsers that sync with the same WebDAV storage keep their copy, and their next change or Save stores it again too: with WebDAV through this server's /dav proxy, this server then opens the project again and those browsers sync with it live, which undoes the deletion for everyone. Requires confirm=true.",
+        "Permanently delete a project: deletes its stored files, and once storage has deleted them, closes the project for every editor and agent that has it open on this server (browser editors show 'Deleted on server'). This cannot be undone. When storage fails, or the project's earlier reads and writes of storage do not finish within 5 s, nothing is closed and the call fails with 'delete_project failed: could not delete project <id> from storage (<reason>); …: delete it again' (the project stays open here, and storage may still hold all or part of it). With WebDAV storage, whose requests each wait up to 30 s for an answer, the call takes up to 5 s plus one request for a project loaded on this server, and up to three requests one after another for one that is not (its project.json, read twice, then the deletion; five when it has no project.json), when you pass the project's id. A name is looked up first: one that could be an id (letters, digits, '-' and '_') is tried as an id first (up to two more requests one after another), then storage is listed to compare the name with every project (one request, then the project.json of each stored project that is new or changed since this server read it, or that it read more than a minute ago), at most 5 s in all when this server has loaded a project of that name; a project this server has not loaded is found by that listing instead of the first read of its project.json. A deletion needs the name compared with every project as storage holds it: when storage does not answer in that time or listing it fails (the name is then compared with the projects this server has loaded only, or without those whose project.json could not be read), or took longer than 5 s to list its projects the last time (the name is then compared with that listing), the call deletes nothing: it fails with 'delete_project deleted nothing: Project '<name>' was found by name, but …', which gives the project's id to pass instead. Editors and agents that have it open on another server sharing the storage stay connected there, and their next change stores the project again (until then get_project on that server, which checks storage first, shows deleted_from_storage: true); browsers that sync with the same WebDAV storage keep their copy, and their next change or Save stores it again too: with WebDAV through this server's /dav proxy, this server then opens the project again and those browsers sync with it live, which undoes the deletion for everyone. Requires confirm=true.",
       annotations: DESTRUCTIVE,
     },
     { project: projectArg, confirm: z.literal(true).describe('Must be true to confirm the deletion') },
     async ({ project }) => {
-      const id = await agent.resolveProjectId(project);
+      // a deletion cannot be undone: a name that was not compared with every project (storage did
+      // not answer in time, or listing it failed) may name another project than the one meant
+      const { id, note } = await agent.findProject(project);
+      if (note) throw new ToolError(`delete_project deleted nothing: ${note}`);
       const deleted = await rooms.deleteProject(id);
       if (!deleted) throw new ToolError(`Project '${project}' not found.`);
       // only now: a deletion that storage refused leaves the project open here, and the agent keeps
@@ -1611,7 +1707,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Duplicate object',
       description:
-        "Duplicate an object (Shift+D; linked=true shares the mesh data like Alt+D), optionally offset (meters) and renamed. The copy gets its own copy of the object's keyframes and drivers and, unless linked, of its data's (shape keys, curve, light and camera values), as Blender's Shift+D does by default; Blender's linked duplicates (Alt+D) share the object's action with the original instead, so that later key edits change both, while here a linked copy gets its own keyframes too. An offset of an animated location is keyed like a move. The copy becomes selected and active.",
+        "Duplicate an object (Shift+D; linked=true shares the object data, a mesh, curve, text, armature, light or camera, like Alt+D), optionally offset (meters) and renamed. The copy gets its own copy of the object's keyframes and drivers and, unless linked, of its data's (shape keys, curve, light and camera values), as Blender's Shift+D does by default; Blender's linked duplicates (Alt+D) share the object's action with the original instead, so that later key edits change both, while here a linked copy gets its own keyframes too. An offset of an animated location is keyed like a move. The copy becomes selected and active.",
       annotations: EDIT,
     },
     {
@@ -1906,8 +2002,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'apply_modifier',
     {
       title: 'Apply modifier',
-      description:
-        'Apply (bake) a modifier into the object\'s mesh data and remove it from the stack (like Blender\'s Apply; destructive to the base mesh). Mesh objects only: convert a curve or text object to a mesh, which bakes all of its modifiers, with run_operator {operator: "object.convert", params: {target: "MESH"}, selection: {objects: ["<name>"]}} (object.convert acts on the selection). An object whose geometry did not evaluate fully (a modifier that failed or was skipped for memory, a mesh the server did not load: the problems of get_scene) is refused with those errors and nothing changes; when memory was the cause, code OUT_OF_MEMORY follows as JSON after the message.',
+      description: `Apply (bake) a modifier into the object's mesh data and remove it from the stack (like Blender's Apply; destructive to the base mesh). Mesh objects only: convert a curve or text object to a mesh, which bakes all of its modifiers, with run_operator {operator: "object.convert", params: {target: "MESH"}, selection: {objects: ["<name>"]}} (object.convert acts on the selection). An object whose geometry did not evaluate fully (a modifier that failed or was skipped for memory, a mesh the server did not load: the problems of get_scene) is refused with those errors and nothing changes; when memory was the cause, code OUT_OF_MEMORY follows as JSON after the message. As in Blender, a modifier that can change nothing is not applied and stays (a Boolean, Armature or Curve modifier without an object, a Shrinkwrap without a target, a Bevel of width 0, a Subdivision Surface with 0 viewport levels, …): 'object.modifier_apply failed: Modifier is disabled, skipping apply: the Boolean modifier 'Boolean' has no object, so it changes nothing; change it with object.modifier_set or remove it with object.modifier_remove'. A modifier hidden in the viewport is refused too ('… is disabled in the viewport; enable it before applying'), unlike Blender, which applies it.`,
       annotations: EDIT,
     },
     { project: projectArg, object: objectArg, modifier: z.string().min(1) },
@@ -2377,7 +2472,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'import_model',
     {
       title: 'Import model',
-      description: `Import a 3D file (gltf, glb, obj, stl, ply) into a project from base64 data or an http(s) URL (max ${MAX_IMPORT_BYTES / 1024 / 1024} MB). Y-up formats are converted to the editor's Z-up space. Imported objects become selected. One undo step. The import runs in the server's own process: one it does not have the memory for (a binary STL counted by its triangles, other files by their size) fails before it starts with 'Import failed: not run on the server: …', what to lower and code OUT_OF_MEMORY (as JSON after the message).`,
+      description: `Import a 3D file (gltf, glb, obj, stl, ply) into a project from base64 data or an http(s) URL (max ${MAX_IMPORT_BYTES / 1024 / 1024} MB). Y-up formats are converted to the editor's Z-up space. Imported objects become selected. One undo step. The import runs in the server's own process: one it does not have the memory for (a binary STL counted by its triangles, a glTF file by the meshes its JSON makes the importer decode and by its nodes, a PLY file by its header, an OBJ file by its size and its objects, an ASCII STL by its size) fails before it starts with 'Import failed: not run on the server: …', what to lower, how a browser editor that has the project open runs it (editor_command run_operator with the file in base64) and code OUT_OF_MEMORY (as JSON after the message).`,
       annotations: { ...EDIT, openWorldHint: true },
     },
     {
@@ -2442,7 +2537,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Export scene',
       description:
-        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at a frame (default: the agent's current frame). OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images, by default about 64 texels per metre of surface (512–2048 px per mesh), or bake_resolution px; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame (2 or 4 times per frame where an object's motion curves between frames, e.g. on a fast orbit; motion that is straight between frames, like LINEAR keys or rigid bodies, keeps one key per frame) over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, elapsed_ms, warnings} plus the file as an embedded base64 resource (up to 20 MiB) and a download link. The export runs in a render process, so it does not hold up the server; a glTF export samples every frame of the scene range, which takes seconds for long ranges and large scenes. download_url (an HTTP endpoint of this server) exports again when it is fetched, with the same options (format, objects, apply_modifiers, frame, bake_resolution): the same file as the embedded one while the scene is unchanged, the project's current state after later edits. `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped. The export runs in a render process: one that needs more memory than a render process has fails with 'Export failed: out of memory: …', what to lower and code OUT_OF_MEMORY (as JSON after the message) while the server keeps running: every export evaluates all meshes of the scene with their modifiers at render settings (SUBSURF render_levels), also those it does not write and with apply_modifiers: false, which lower only the memory of writing the file.",
+        "Export the scene (or some objects) as glb, gltf, obj, stl or ply at a frame (default: the agent's current frame). OBJ/STL/PLY hold world-space meshes. glTF/GLB keep the hierarchy (armature bones as nodes, BONE-parented objects under their bone), materials (procedural textures baked into images, by default about 64 texels per metre of surface (512–2048 px per mesh), or bake_resolution px; meshes without UVs get generated UVs for them), cameras, lights and the animation sampled once per frame (2 or 4 times per frame where an object's motion curves between frames, e.g. on a fast orbit; motion that is straight between frames, like LINEAR keys or rigid bodies, keeps one key per frame) over the scene frame range from the evaluated scene (keyframes, drivers, constraints, IK, rigid body physics), with shape keys as morph targets and Armature-deformed meshes as skins. Returns {format, filename, mime, bytes, frame, objects, apply_modifiers, download_url, elapsed_ms, warnings} plus the file as an embedded base64 resource (up to 20 MiB) and a download link. The export runs in a render process, so it does not hold up the server; a glTF export samples every frame of the scene range, which takes seconds for long ranges and large scenes. download_url (an HTTP endpoint of this server) exports again when it is fetched, with the same options (format, objects, apply_modifiers, frame, bake_resolution): the same file as the embedded one while the scene is unchanged, the project's current state after later edits. `warnings` lists what the format could not represent — check it: e.g. area lights become point lights, other animated deformation (modifier stacks) is baked into per-frame morph targets, image textures on meshes without UVs are dropped. The export runs in a render process: one that needs more memory than a render process has fails with 'Export failed: out of memory: …', what to lower and code OUT_OF_MEMORY (as JSON after the message) while the server keeps running: every export evaluates all meshes of the scene with their modifiers at render settings (SUBSURF render_levels), also those it does not write and with apply_modifiers: false, which lower only the memory of writing the file. Without render processes (RENDER_WORKERS=0, or they could not start) the export runs in the server's own process, and one it does not have the memory for is not started ('Export failed: out of memory: this export was not started: …', what to lower and code OUT_OF_MEMORY): that check counts only the meshes shown in renders, so hiding a heavy mesh from renders (hide_render; an export without objects leaves it out of the file) lets the export start.",
       annotations: READ_ONLY,
     },
     {
@@ -2540,7 +2635,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'render_image',
     {
       title: 'Render image',
-      description: `Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, the look of its Rendered viewport shading whatever shading it shows; SOLID: grey clay) when available, otherwise the server's software rasterizer: renderer auto waits ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s for the editor's image and then renders on the server (\`note\` says why), renderer browser waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s (an editor without GPU acceleration took ${measuredBrowserImages(BROWSER_RASTER_SECONDS)}) and then fails with what to do instead; an editor may still be drawing an image the server stopped waiting for, and holds up its next renders and commands until it has: meanwhile renders go to another connected editor that is not busy, else renderer auto renders on the server without asking it (\`note\` says so), as it also does for ${SLOW_EDITOR_RETRY_MS / 1000} s after an editor needed longer than auto waits for a RASTER image (for a smaller image, when that time scaled to its pixels is longer too), and for a larger image after one that took ${SCALE_UP_MIN_MS / 1000} s or more, when that time scaled to its pixels is longer than auto waits; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel), or with renderer browser on a browser editor's render workers (as many as the tab's memory allows; a path trace that would not fit into it is not started, and the error says why). The server's software rasterizer (RASTER without a browser editor) draws no shadows, and its glossy reflections come from one small reflection probe in front of what the image centre shows, looked up by direction only: water, floors and large glossy tables far from that point can show reflections the path tracer does not (a wide smear of a nearby object, a far end that is too bright), so judge shadows and reflections with PATHTRACER. The server renders in render processes of its own: grey clay (shading SOLID) at 1280×720 took ${measuredOnServer(SERVER_SOLID_SECONDS)}, and a render that needs more memory than a render process has fails with 'Rendering failed: out of memory: …', what to do and code OUT_OF_MEMORY (as JSON after the message) while the server keeps running. Film > Transparent (set_scene_settings film_transparent) gives a transparent background with both engines. Defaults to the scene camera; pass \`camera\` (camera object) or \`view\` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications. The JSON text after the image gives renderer, engine, size, frame, timing, for path tracing samples (reached) and requested_samples, and \`warnings\` (e.g. textures that could not be used, or degenerate triangles skipped, with the objects they belong to).`,
+      description: `Render a PNG of the scene to check your work or make a final picture. engine RASTER (fast, default for most scenes) or PATHTRACER (physically based, soft shadows, global illumination; default: the scene's render engine). RASTER renders use a connected browser editor (WebGL, the look of its Rendered viewport shading whatever shading it shows; SOLID: grey clay) when available, otherwise the server's software rasterizer: renderer auto waits ${AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000} s for the editor's image and then renders on the server (\`note\` says why), renderer browser waits up to ${BROWSER_RASTER_TIMEOUT_MS / 1000} s (an editor without GPU acceleration took ${measuredBrowserImages(BROWSER_RASTER_SECONDS)}) and then fails with what to do instead; an editor does not start a RASTER image whose geometry at the render settings would not fit into its tab's JavaScript heap (renderer auto then renders on the server, \`note\` says why; renderer browser fails with why and what to lower); an editor may still be drawing an image the server stopped waiting for, and holds up its next renders and commands until it has: meanwhile renders go to another connected editor that is not busy, else renderer auto renders on the server without asking it (\`note\` says so), as it also does for ${SLOW_EDITOR_RETRY_MS / 1000} s after an editor needed longer than auto waits for a RASTER image (for a smaller image, when that time scaled to its pixels is longer too), and for a larger image after one that took ${SCALE_UP_MIN_MS / 1000} s or more, when that time scaled to its pixels is longer than auto waits; PATHTRACER renders run on the server's CPU cores in parallel (samples per pixel, max_bounces, denoise, time_limit in seconds — the render stops sampling when the time is up, after at least one sample per pixel), or with renderer browser on a browser editor's render workers (as many as the tab's memory allows; a path trace that would not fit into it is not started, and the error says why). The server's software rasterizer (RASTER without a browser editor) draws no shadows, and its glossy reflections come from one small reflection probe in front of what the image centre shows, looked up by direction only: water, floors and large glossy tables far from that point can show reflections the path tracer does not (a wide smear of a nearby object, a far end that is too bright), so judge shadows and reflections with PATHTRACER. The server renders in render processes of its own: grey clay (shading SOLID) at 1280×720 took ${measuredOnServer(SERVER_SOLID_SECONDS)}, and a render that needs more memory than a render process has fails with 'Rendering failed: out of memory: …', what to do and code OUT_OF_MEMORY (as JSON after the message) while the server keeps running. Without render processes (RENDER_WORKERS=0, or they could not start) the server renders in its own process, and a render it does not have the memory for is not started ('Rendering failed: out of memory: this render was not started: …', what to do and code OUT_OF_MEMORY): that check counts only the meshes shown in renders, so hiding a heavy mesh from renders (hide_render) lets the render start. Film > Transparent (set_scene_settings film_transparent) gives a transparent background with both engines. Defaults to the scene camera; pass \`camera\` (camera object) or \`view\` {position, target, up?, fov_degrees? (VERTICAL angle) | lens? (mm)} for another viewpoint. Max 2048x2048 (path tracing: 2048x1280). Long renders send progress notifications. The JSON text after the image gives renderer, engine, size, frame, timing, for path tracing samples (reached) and requested_samples, and \`warnings\` (e.g. textures that could not be used, or degenerate triangles skipped, with the objects they belong to).`,
       annotations: READ_ONLY,
     },
     {
@@ -2842,7 +2937,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Render animation',
       description:
-        "Render a range of frames on the server to check motion (keyframes, drivers, F-curve modifiers, constraints, armatures, physics, turntables) or to make an animated result. format CONTACT_SHEET (default: one PNG showing every rendered frame in a labelled grid — the easiest way to review a whole animation; sample long ranges to 12–24 tiles with frame_step), GIF (animated, 256 colours), APNG (animated PNG, returned as image/png) or PNG_SEQUENCE (one PNG per frame, returned as embedded image/png resources named frame_0001.png …). Frames frame_start..frame_end every frame_step (default: the scene frame range). Camera: `camera`, else the scene camera, else one fixed automatic view framing all frames (returned as view). engine RASTER (fast) or PATHTRACER (frames path traced in parallel on all CPU cores; keep size, samples and frame count small). time_limit bounds the whole render (default 60 s): path traced frames get an equal share and stop sampling early, frames that cannot start in time are dropped (truncated: true). Path traced results report requested_samples, samples_reached {min, mean, max} and frame_samples (the samples per pixel each frame reached, aligned with frames) plus undersampled_frames (frames that stopped early). store=true keeps the files on the server for an hour and returns download links (results too large to embed are stored automatically). The frames render in the server's render processes: a render that needs more memory than a render process has fails with 'Rendering the animation failed: out of memory: …', what to lower and code OUT_OF_MEMORY (as JSON after the message) while the server keeps running.",
+        "Render a range of frames on the server to check motion (keyframes, drivers, F-curve modifiers, constraints, armatures, physics, turntables) or to make an animated result. format CONTACT_SHEET (default: one PNG showing every rendered frame in a labelled grid — the easiest way to review a whole animation; sample long ranges to 12–24 tiles with frame_step), GIF (animated, 256 colours), APNG (animated PNG, returned as image/png) or PNG_SEQUENCE (one PNG per frame, returned as embedded image/png resources named frame_0001.png …). Frames frame_start..frame_end every frame_step (default: the scene frame range). Camera: `camera`, else the scene camera, else one fixed automatic view framing all frames (returned as view). engine RASTER (fast) or PATHTRACER (frames path traced in parallel on all CPU cores; keep size, samples and frame count small). time_limit bounds the whole render (default 60 s): path traced frames get an equal share and stop sampling early, frames that cannot start in time are dropped (truncated: true). Path traced results report requested_samples, samples_reached {min, mean, max} and frame_samples (the samples per pixel each frame reached, aligned with frames) plus undersampled_frames (frames that stopped early). store=true keeps the files on the server for an hour and returns download links (results too large to embed are stored automatically). The frames render in the server's render processes: a render that needs more memory than a render process has fails with 'Rendering the animation failed: out of memory: …', what to lower and code OUT_OF_MEMORY (as JSON after the message) while the server keeps running. Without render processes (RENDER_WORKERS=0, or they could not start) the frames render in the server's own process, and an animation it does not have the memory for is not started ('Rendering the animation failed: out of memory: this render was not started: …', what to lower and code OUT_OF_MEMORY): that check counts only the meshes shown in renders, so hiding a heavy mesh from renders (hide_render) lets it start.",
       annotations: READ_ONLY,
     },
     {
@@ -3102,7 +3197,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'editor_command',
     {
       title: 'Editor command',
-      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`; get_connected_clients lists them). Commands and their \`params\`: ${editorCommandList()}. run_operator runs the operators of the browser editor's own user interface (view3d.*, wm.*, screen.*, ed.* …) on the person's editor: its selection, view, frame and undo history, windows on the person's screen, even its project (wm.read_homefile switches that editor to a new project, so it leaves this one before it can answer, and the error says so) and the person's clipboard (wm.share); the run_operator tool refuses them with a message that says what each one does there. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected, or when the editor's connection to the project closes before it answers. \`timeout_ms\` (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}: under the 60 s request timeout MCP SDK clients use by default) is how long to wait for the editor's answer. In an editor without GPU acceleration (software WebGL, e.g. a headless browser) a screenshot of a heavy scene in MATERIAL or RENDERED shading takes seconds, and the first screenshot or viewport frame in each of them after the editor opened the project longer (${measured(`${FIRST_SHADING_SECONDS} for a scene with 71 materials`)}): the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${measured(NEW_SHADER_SECONDS)}); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a screenshot of a scene with millions of triangles takes half a second or more in any shading, and the first WIREFRAME screenshot or frame of such a scene several times as long (the editor builds the wires of every mesh); the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and while it draws a frame of a scene with millions of triangles). So raise timeout_ms there, take screenshots with shading 'SOLID' (grey clay, much faster), take a quick look with render_image {shading: 'SOLID'} (grey clay, rendered on the server while the editor is busy and when the scene's render engine is PATHTRACER: ${measuredOnServer(SERVER_SOLID_SECONDS)}; a scene that needs more memory than a server render has fails with 'Rendering failed: out of memory: …' and code OUT_OF_MEMORY, and then retry the screenshot with a larger timeout_ms) and make final images with render_image. On a timeout the error says so and what to do; the editor may still carry the command out, and its next commands and renders wait until it has (a later timeout names that earlier request; render_image renderer auto renders on the server meanwhile): a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the rest and compiles nothing again.`,
+      description: `Send a UI command to a live browser editor that has the project open (most recently active one, or \`client\`; get_connected_clients lists them). Commands and their \`params\`: ${editorCommandList()}. run_operator runs the operators of the browser editor's own user interface (view3d.*, wm.*, screen.*, ed.* …) on the person's editor: its selection, view, frame and undo history, windows on the person's screen, even its project (wm.read_homefile switches that editor to a new project, so it leaves this one before it can answer, and the error says so) and the person's clipboard (wm.share); the run_operator tool refuses them with a message that says what each one does there. Unknown commands and unknown or misspelled parameter names are rejected with suggestions before anything is sent. Fails when no browser editor accepting UI commands is connected, or when the editor's connection to the project closes before it answers. \`timeout_ms\` (default ${DEFAULT_EDITOR_TIMEOUT_MS}, at most ${MAX_EDITOR_TIMEOUT_MS}: under the 60 s request timeout MCP SDK clients use by default) is how long to wait for the editor's answer. In an editor without GPU acceleration (software WebGL, e.g. a headless browser) a screenshot of a heavy scene in MATERIAL or RENDERED shading takes seconds, and the first screenshot or viewport frame in each of them after the editor opened the project longer (${measured(`${FIRST_SHADING_SECONDS} for a scene with 71 materials`)}): the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${measured(NEW_SHADER_SECONDS)}); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a screenshot of a scene with millions of triangles takes half a second or more in any shading, and the first WIREFRAME screenshot or frame of such a scene several times as long (the editor builds the wires of every mesh); the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and while it carries out a command: with 4 million triangles in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}; the viewport's frames do not hold them up). So raise timeout_ms there, take screenshots with shading 'SOLID' (grey clay, much faster), take a quick look with render_image {shading: 'SOLID'} (grey clay, rendered on the server while the editor is busy and when the scene's render engine is PATHTRACER: ${measuredOnServer(SERVER_SOLID_SECONDS)}; a scene that needs more memory than a server render has fails with 'Rendering failed: out of memory: …' and code OUT_OF_MEMORY, and then retry the screenshot with a larger timeout_ms) and make final images with render_image. On a timeout the error says so and what to do; the editor may still carry the command out, and its next commands and renders wait until it has (a later timeout names that earlier request; render_image renderer auto renders on the server meanwhile): a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the rest and compiles nothing again.`,
       annotations: { ...EDIT, openWorldHint: true },
       argsHint: 'Command parameters go inside `params` (editor_command {project, command, params: {…}}).',
     },

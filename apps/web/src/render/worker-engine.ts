@@ -29,6 +29,8 @@ import {
   INSTANCE_BYTES,
   estimateRender,
   planRenderThreads,
+  rasterNeeds,
+  rasterRefusal,
   type RenderEstimate,
   type TabMemory,
 } from './memory';
@@ -226,9 +228,8 @@ export class RenderWorkerEngine {
     const doc = cached.doc;
     const width = Math.max(1, Math.round(o.width));
     const height = Math.max(1, Math.round(o.height));
-    const guard = memory
-      ? new EvaluationGuard(estimate ?? estimateRender(doc), width * height, memory)
-      : null;
+    const est = memory ? (estimate ?? estimateRender(doc, true, o.frame)) : null;
+    const guard = memory && est ? new EvaluationGuard(est, width * height, memory) : null;
     const evaluate = () => cached.evaluator.evaluate(o.frame, { forRender: true });
     const scene = guard ? guardedEvaluation(guard, evaluate) : evaluate();
     if (guard?.refusal && memory) {
@@ -257,6 +258,8 @@ export class RenderWorkerEngine {
           instances: items.length,
           sceneBytes: tris * COMPILED_BYTES_PER_TRIANGLE + items.length * INSTANCE_BYTES.scene + imageBytes,
           pixels: width * height,
+          // a RASTER render evaluates the scene on the page: suggested where that fits
+          rasterFits: !!est && !rasterRefusal(rasterNeeds(est), memory),
         },
         1,
         memory,

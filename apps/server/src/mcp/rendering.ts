@@ -384,7 +384,8 @@ const SERVER_RENDER_EVALUATES =
 
 /**
  * What to do when a render_image render needed more memory than the server gives it (a
- * RenderOutOfMemoryError: its render process ran out of memory, or single-thread mode refused it).
+ * RenderOutOfMemoryError: its render process ran out of memory; a render that single-thread mode
+ * did not start gets {@link SINGLE_THREAD_RENDER_ADVICE}).
  */
 export const OUT_OF_MEMORY_ADVICE =
   `The scene needs more memory than a server render has. ${SERVER_RENDER_EVALUATES}, or render in a ` +
@@ -417,12 +418,57 @@ const OUT_OF_MEMORY_ADVICE_BY_TOOL: Readonly<Record<string, string>> = {
 };
 
 /**
+ * What single-thread mode checks before a render or export starts in the server's own process
+ * (render/memory.ts checkMainThreadRender, a RenderOutOfMemoryError with reason 'refused'): its
+ * estimate (estimateRenderMemory) counts the meshes shown in renders by their stored counts, with
+ * their modifiers enabled for renders at their render settings. Meshes hidden from renders
+ * (hide_render) and modifiers turned off for renders (show_render) are left out, and so are curves,
+ * text and particle and collection instances: hiding the heavy mesh from renders lets the render
+ * start (its evaluation in the server's process is capped by the server's own guards, which skip a
+ * modifier that would not fit, see installGeometryMemoryGuard).
+ */
+const SINGLE_THREAD_COUNTS =
+  'The check counts the meshes shown in renders, with their modifiers at their render settings';
+
+/** What to do when single-thread mode refused a render_image render. */
+export const SINGLE_THREAD_RENDER_ADVICE =
+  `${SINGLE_THREAD_COUNTS}: lower the render levels (render_levels) of Subdivision Surface modifiers or ` +
+  'turn modifiers off for renders (show_render), hide meshes from renders (hide_render) or delete meshes the ' +
+  "project no longer needs, or render in a browser editor that has the project open (renderer 'browser').";
+
+/** The same for render_animation, which renders on the server only. */
+export const SINGLE_THREAD_ANIMATION_ADVICE =
+  `${SINGLE_THREAD_COUNTS}: lower the render levels (render_levels) of Subdivision Surface modifiers or ` +
+  'turn modifiers off for renders (show_render), hide meshes from renders (hide_render) or delete meshes the ' +
+  "project no longer needs, or render the frames one by one with render_image {frame, renderer: 'browser'} " +
+  'in a browser editor that has the project open.';
+
+/**
+ * The same for export_scene: the estimate does not depend on `objects` or apply_modifiers, and an
+ * export without `objects` writes the objects shown in renders only (core collectExport).
+ */
+export const SINGLE_THREAD_EXPORT_ADVICE =
+  `${SINGLE_THREAD_COUNTS}, whichever objects the export writes and also with apply_modifiers: false: lower ` +
+  'the render levels (render_levels) of Subdivision Surface modifiers or turn modifiers off for renders ' +
+  '(show_render), hide meshes from renders (hide_render: an export without objects leaves them out of the ' +
+  'file) or delete meshes the project no longer needs.';
+
+/** The advice of each tool's refusal in single-thread mode, by the `what` it starts with. */
+const SINGLE_THREAD_ADVICE_BY_TOOL: Readonly<Record<string, string>> = {
+  Rendering: SINGLE_THREAD_RENDER_ADVICE,
+  'Rendering the animation': SINGLE_THREAD_ANIMATION_ADVICE,
+  Export: SINGLE_THREAD_EXPORT_ADVICE,
+};
+
+/**
  * Converts render failures to tool errors with a useful message. A render that ran out of memory
  * says so with a stable start, "<what> failed: out of memory: …", that the server keeps running and
  * what to do instead (the advice of the tool, see OUT_OF_MEMORY_ADVICE_BY_TOOL), with code
- * OUT_OF_MEMORY (the tools print it as JSON on the next line). One that only shared its render
- * process with the render that ran it out of memory starts "<what> failed: interrupted: …" and says
- * it can run again.
+ * OUT_OF_MEMORY (the tools print it as JSON on the next line). One that single-thread mode did not
+ * start ("… was not started: …", reason 'refused') gets the advice of that mode instead
+ * (SINGLE_THREAD_ADVICE_BY_TOOL): there, unlike in a render process, a mesh hidden from renders
+ * does not count. One that only shared its render process with the render that ran it out of
+ * memory starts "<what> failed: interrupted: …" and says it can run again.
  */
 export function renderToolError(
   err: unknown,
@@ -435,6 +481,11 @@ export function renderToolError(
   // another render that shared the render process ran it out of memory: this one can run again
   if (isOutOfMemory(err) && err.reason === 'shared')
     return new ToolError(`${what} failed: ${err.message}.`, 'FAILED');
+  if (isOutOfMemory(err) && err.reason === 'refused')
+    return new ToolError(
+      `${what} failed: ${err.message}. ${SINGLE_THREAD_ADVICE_BY_TOOL[what] ?? SINGLE_THREAD_RENDER_ADVICE}`,
+      'OUT_OF_MEMORY',
+    );
   if (isOutOfMemory(err)) return new ToolError(`${what} failed: ${err.message}. ${advice}`, 'OUT_OF_MEMORY');
   if (isNotImplemented(err))
     return new ToolError(`${what} is not available in this build (${errorMessage(err)}).`);

@@ -6,12 +6,20 @@ import {
   IMPORT_BYTES_PER_FILE_BYTE,
   IMPORT_BYTES_PER_STL_TRIANGLE,
   IMPORT_STORED_BYTES_PER_FILE_BYTE,
+  OBJECT_STORED_BYTES,
+  DATABLOCK_STORED_BYTES,
   OPERATOR_ESTIMATES,
   OPERATOR_FIXED_BYTES,
   binaryStlTriangles,
   editOperatorMemoryRefusal,
   importEstimate,
   importMemoryRefusal,
+  base64Reader,
+  bytesReader,
+  extraJsonChars,
+  newObjectsBytes,
+  saveBytes,
+  projectStoredBytes,
   storedMeshBytes,
   createEditorState,
   createOperatorRegistry,
@@ -93,7 +101,7 @@ function peak(
   op: string,
   n: number,
   params: object,
-  mode: 'edit' | 'object' | 'scatter' | 'import' | 'CURVE' | 'FONT',
+  mode: 'edit' | 'object' | 'scatter' | 'import' | 'shared-glb' | 'loose' | 'CURVE' | 'FONT',
 ) {
   const run = spawnSync(
     process.execPath,
@@ -224,35 +232,45 @@ describe('operator memory estimates', () => {
     expect(reg.run(ctx, 'mesh.subdivide', { number_cuts: 3 }).ok).toBe(true);
   });
 
-  it('keep each estimate above the peak heap the operator takes (V8 GC trace in a child process)', () => {
-    for (const [op, n, params, mode] of [
-      ['mesh.subdivide', 60, { number_cuts: 2 }, 'edit'],
-      ['mesh.vertices_smooth', 120, {}, 'edit'],
-      ['mesh.extrude_faces_move', 80, { value: 0.1 }, 'edit'],
-      ['mesh.primitive_grid_add', 0, { x_subdivisions: 300, y_subdivisions: 300 }, 'object'],
-    ] as const) {
+  // one child process per test: five of them in one test took 32.7 s at a load of 11 (round 10)
+  it.each([
+    { op: 'mesh.subdivide', n: 60, params: { number_cuts: 2 }, mode: 'edit' },
+    { op: 'mesh.vertices_smooth', n: 120, params: {}, mode: 'edit' },
+    { op: 'mesh.extrude_faces_move', n: 80, params: { value: 0.1 }, mode: 'edit' },
+    {
+      op: 'mesh.primitive_grid_add',
+      n: 0,
+      params: { x_subdivisions: 300, y_subdivisions: 300 },
+      mode: 'object',
+    },
+  ] as const)(
+    'keep the estimate of $op above the peak heap it takes (V8 GC trace in a child process)',
+    ({ op, n, params, mode }) => {
       const r = peak(op, n, params, mode);
       expect(r.estimate, op).toBeGreaterThanOrEqual(r.peak);
       // and not far above it (the estimates are the largest measured per face, rounded up)
       expect(r.estimate, op).toBeLessThan(r.peak * 6);
-    }
-  }, 30_000);
+    },
+    30_000,
+  );
 
-  it('hold where the per-face costs and the young generation make up the peak', () => {
-    // per face of the edited mesh (EDIT_BYTES_PER_FACE): 25,600 faces smoothed peak at about 89 MB;
-    // per added face (ADDED_FACE_BYTES): two cuts add 51,200 faces (about 150 MB); a grid of 900
-    // faces subdivided peaks at about 17 MB, mostly garbage of the young generation, which
-    // OPERATOR_FIXED_BYTES covers
-    for (const [op, n, params] of [
-      ['mesh.vertices_smooth', 160, {}],
-      ['mesh.subdivide', 80, { number_cuts: 2 }],
-      ['mesh.subdivide', 30, { number_cuts: 1 }],
-    ] as const) {
+  // per face of the edited mesh (EDIT_BYTES_PER_FACE): 25,600 faces smoothed peak at about 89 MB;
+  // per added face (ADDED_FACE_BYTES): two cuts add 51,200 faces (about 150 MB); a grid of 900
+  // faces subdivided peaks at about 17 MB, mostly garbage of the young generation, which
+  // OPERATOR_FIXED_BYTES covers
+  it.each([
+    { op: 'mesh.vertices_smooth', n: 160, params: {} },
+    { op: 'mesh.subdivide', n: 80, params: { number_cuts: 2 } },
+    { op: 'mesh.subdivide', n: 30, params: { number_cuts: 1 } },
+  ] as const)(
+    'hold where the per-face costs and the young generation make up the peak ($op on $n × $n faces)',
+    ({ op, n, params }) => {
       const r = peak(op, n, params, 'edit');
       expect(r.estimate, `${op} ${n}`).toBeGreaterThanOrEqual(r.peak);
       expect(r.estimate, `${op} ${n}`).toBeLessThan(r.peak * 4);
-    }
-  }, 30_000);
+    },
+    30_000,
+  );
 
   it('count the copies Spin keeps of every selected vertex for every step', () => {
     // 10,201 vertices in 12 steps: the 4,800 faces Spin adds take less than its copies
@@ -331,19 +349,44 @@ describe('operator memory estimates', () => {
       uvs: false,
       colors: false,
     });
-    expect(importEstimate('stl', stl, stl.byteLength)).toEqual({
-      bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_STL_TRIANGLE * 1000 + stored,
+    // one object with its mesh
+    const object = newObjectsBytes({ objects: 1, datablocks: { meshes: 1 } });
+    expect(importEstimate('stl', bytesReader(stl))).toEqual({
+      bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_STL_TRIANGLE * 1000 + stored + object.peak,
       faces: 1000,
-      addedStoredBytes: stored,
+      addedStoredBytes: stored + object.stored,
+      // a save of the project decodes the new object and its mesh's datablock, not the mesh's data
+      addedSaveBytes: saveBytes(object.stored),
+      objects: 1,
       lower: 'the size of the file (import fewer or simpler meshes)',
     });
-    // the operators read the same from base64, also from a data URI
+    // the operators read the same from base64, also from a data URI and with whitespace inside
     const { ctx } = gridScene(1, false);
     const b64 = Buffer.from(stl).toString('base64');
-    for (const data_base64 of [b64, `data:model/stl;base64,${b64}`, `  ${b64}\n`])
+    const spaced = b64.replace(/(.{76})/g, '$1\n');
+    for (const data_base64 of [b64, `data:model/stl;base64,${b64}`, `  ${b64}\n`, spaced])
       expect(estimateOperator('import_mesh.stl', ctx, { data_base64 })).toEqual(
-        importEstimate('stl', stl, stl.byteLength),
+        importEstimate('stl', bytesReader(stl)),
       );
+    // ranges of a file in base64, decoded where they are read
+    const bytes = Uint8Array.from({ length: 1000 }, (_, i) => (i * 37) % 256);
+    for (const text of [
+      Buffer.from(bytes).toString('base64'),
+      Buffer.from(bytes)
+        .toString('base64')
+        .replace(/(.{60})/g, '$1\n'),
+    ]) {
+      const r = base64Reader(text);
+      expect(r.byteLength).toBe(1000);
+      for (const [a, b] of [
+        [0, 1000],
+        [1, 2],
+        [3, 7],
+        [998, 1000],
+        [500, 1200],
+      ])
+        expect([...r.read(a, b)], `${a}-${b}`).toEqual([...bytes.subarray(a, b)]);
+    }
     // other formats, and STL files that are not binary, by their size
     const text = new TextEncoder().encode('solid x\n  facet normal 0 0 1\n'.repeat(100));
     for (const [format, data] of [
@@ -351,25 +394,48 @@ describe('operator memory estimates', () => {
       ['obj', text],
       ['glb', stl],
     ] as const)
-      expect(importEstimate(format, data, data.byteLength), format).toMatchObject({
-        bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_FILE_BYTE * data.byteLength,
-        addedStoredBytes: IMPORT_STORED_BYTES_PER_FILE_BYTE * data.byteLength,
+      expect(importEstimate(format, bytesReader(data)), format).toMatchObject({
+        bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_FILE_BYTE * data.byteLength + object.peak,
+        addedStoredBytes: IMPORT_STORED_BYTES_PER_FILE_BYTE * data.byteLength + object.stored,
       });
-    // tools that import without the registry (MCP import_model) ask the installed check the same
+    // tools that import without the registry (MCP import_model) ask the installed check the same,
+    // with what the project keeps: its meshes decoded and its objects
     const asked: OperatorMemoryRequest[] = [];
     expect(importMemoryRefusal(ctx.doc, 'stl', stl)).toBeNull();
     setOperatorMemoryCheck((req) => (asked.push(req), 'no room'));
     expect(importMemoryRefusal(ctx.doc, 'stl', stl)).toBe('no room');
     expect(asked[0]).toEqual({
       operator: 'import_mesh.stl',
-      estimate: importEstimate('stl', stl, stl.byteLength),
-      storedBytes: storedMeshBytes(ctx.doc),
+      estimate: importEstimate('stl', bytesReader(stl)),
+      storedBytes: projectStoredBytes(ctx.doc),
+      // what a save of the project takes for its object and mesh datablock
+      saveBytes: saveBytes(OBJECT_STORED_BYTES + DATABLOCK_STORED_BYTES.meshes),
+      objects: 1,
     });
+    expect(projectStoredBytes(ctx.doc)).toBe(
+      storedMeshBytes(ctx.doc) + OBJECT_STORED_BYTES + DATABLOCK_STORED_BYTES.meshes,
+    );
   });
 
   it('keep the import estimate of a binary STL above the peak heap of importing it (V8 GC trace in a child process)', () => {
     // 180,000 triangles (9 MB), imported from base64: about 120 MB at the peak
     const r = peak('import_mesh.stl', 300, {}, 'import');
+    expect(r.estimate).toBeGreaterThanOrEqual(r.peak);
+    expect(r.estimate).toBeLessThan(r.peak * 3);
+  }, 30_000);
+
+  it('keep the import estimate of a GLB whose meshes share accessors above its peak heap (V8 GC trace in a child process)', () => {
+    // 12 glTF meshes that use the accessors of one grid of 150 × 150 quads: 540,000 triangles decoded
+    // from a file of 0.6 MB, about 115 MB at the peak (round 10: estimated by its size, 47 MB)
+    const r = peak('import_scene.gltf', 150, { meshes: 12 }, 'shared-glb');
+    expect(r.estimate).toBeGreaterThanOrEqual(r.peak);
+    expect(r.estimate).toBeLessThan(r.peak * 3);
+  }, 30_000);
+
+  it('keep the estimate of Separate by loose parts above its peak heap (V8 GC trace in a child process)', () => {
+    // 5,000 quads, each a part of its own: 4,999 new objects with a mesh each, about 95 MB at the
+    // peak for 5,000 faces
+    const r = peak('mesh.separate', 5000, { type: 'LOOSE' }, 'loose');
     expect(r.estimate).toBeGreaterThanOrEqual(r.peak);
     expect(r.estimate).toBeLessThan(r.peak * 3);
   }, 30_000);
@@ -381,17 +447,25 @@ describe('operator memory estimates', () => {
     expect(r.estimate).toBeLessThan(r.peak * 4);
   }, 30_000);
 
-  it('size generated objects from their parameters, above their peak heap', () => {
-    // a tree of 197,474 faces and a fence of 133,906 faces (pickets 5 mm wide without gaps)
-    for (const [op, params] of [
-      ['object.generate_tree', { branch_levels: 4, branches: 5, resolution: 12, leaf_density: 1 }],
-      ['object.generate_fence', { length: 100, post_spacing: 2, picket_width: 0.005, picket_gap: 0 }],
-    ] as const) {
+  // a tree of 197,474 faces and a fence of 133,906 faces (pickets 5 mm wide without gaps)
+  it.each([
+    {
+      op: 'object.generate_tree',
+      params: { branch_levels: 4, branches: 5, resolution: 12, leaf_density: 1 },
+    },
+    {
+      op: 'object.generate_fence',
+      params: { length: 100, post_spacing: 2, picket_width: 0.005, picket_gap: 0 },
+    },
+  ] as const)(
+    'size $op from its parameters, above its peak heap',
+    ({ op, params }) => {
       const r = peak(op, 0, params, 'object');
       expect(r.estimate, op).toBeGreaterThanOrEqual(r.peak);
       expect(r.estimate, op).toBeLessThan(r.peak * 3);
-    }
-  }, 30_000);
+    },
+    30_000,
+  );
 });
 
 describe('decoding stored meshes', () => {
@@ -516,9 +590,20 @@ describe('linked duplicates', () => {
       expect(e.faces, id).toBe(2000);
       expect(e.addedStoredBytes, id).toBe(4 * one);
     }
-    // shading changes the shared mesh once, Duplicate copies it once
+    // shading changes the shared mesh once, Duplicate copies it once (and every object, with a
+    // datablock for the copy)
     expect(estimate('object.shade_smooth')).toMatchObject({ faces: 400, addedStoredBytes: 0 });
-    expect(estimate('object.duplicate')).toMatchObject({ faces: 400, addedStoredBytes: one });
+    const objects = doc.listObjects();
+    const extraJson = objects.reduce((n, o) => n + extraJsonChars(o), 0);
+    expect(estimate('object.duplicate')).toMatchObject({
+      faces: 400,
+      objects: 5,
+      addedStoredBytes: one + newObjectsBytes({ objects: 5, datablocks: { meshes: 1 }, extraJson }).stored,
+    });
+    expect(estimate('object.duplicate', { linked: true })).toMatchObject({
+      objects: 5,
+      addedStoredBytes: newObjectsBytes({ objects: 5, extraJson }).stored,
+    });
     // what the project holds afterwards
     const before = storedMeshBytes(doc);
     const apply = estimate('object.transform_apply', { location: true })!;
@@ -652,25 +737,40 @@ describe('curve and text surfaces', () => {
     expect(e.result.faces).toBeGreaterThanOrEqual(mesh.faces.length);
   });
 
-  it('are estimated above the peak heap of building them (V8 GC trace in a child process)', () => {
-    // a smooth tube of 458,532 vertices (round bevel), a POLY zigzag of 400,000 that turns sharply at
-    // every point (its edges sharp: the most per vertex), a text of 2,000 characters filled flat, the
-    // wire of 249,876 samples of a curve without a surface, and a tube of 10,512 vertices, whose peak
-    // is mostly garbage of the young generation (CURVE_FIXED_BYTES)
-    for (const [params, type] of [
-      [{ __wave: 200, resolution_u: 64, bevel_depth: 0.05, bevel_resolution: 16 }, 'CURVE'],
-      [{ __zigzag: 20000, bevel_depth: 0.02, bevel_resolution: 8 }, 'CURVE'],
-      [{ __text: 2000, fill_mode: 'BOTH' }, 'FONT'],
-      [{ __wave: 2000, resolution_u: 125 }, 'CURVE'],
-      [{ __wave: 30, resolution_u: 24, bevel_depth: 0.05, bevel_resolution: 4 }, 'CURVE'],
-    ] as const) {
+  // a smooth tube of 458,532 vertices (round bevel), a POLY zigzag of 400,000 that turns sharply at
+  // every point (its edges sharp: the most per vertex), a text of 2,000 characters filled flat, the
+  // wire of 249,876 samples of a curve without a surface, and a tube of 10,512 vertices, whose peak
+  // is mostly garbage of the young generation (CURVE_FIXED_BYTES); one child process per test (the
+  // five in one test took 32.7 s at a load of 11, round 10)
+  it.each([
+    {
+      what: 'a smooth tube',
+      params: { __wave: 200, resolution_u: 64, bevel_depth: 0.05, bevel_resolution: 16 },
+      type: 'CURVE',
+    },
+    {
+      what: 'a sharp zigzag tube',
+      params: { __zigzag: 20000, bevel_depth: 0.02, bevel_resolution: 8 },
+      type: 'CURVE',
+    },
+    { what: 'a text filled flat', params: { __text: 2000, fill_mode: 'BOTH' }, type: 'FONT' },
+    { what: 'a wire', params: { __wave: 2000, resolution_u: 125 }, type: 'CURVE' },
+    {
+      what: 'a small tube',
+      params: { __wave: 30, resolution_u: 24, bevel_depth: 0.05, bevel_resolution: 4 },
+      type: 'CURVE',
+    },
+  ] as const)(
+    'are estimated above the peak heap of building them: $what (V8 GC trace in a child process)',
+    ({ params, type }) => {
       const r = peak('curve', 0, params, type);
       const what = JSON.stringify(params);
       expect(r.estimate, what).toBeGreaterThanOrEqual(r.peak);
       expect(r.estimate, what).toBeLessThan(r.peak * 3);
       expect(r.out.estimate.result!.vertices, what).toBeGreaterThanOrEqual(r.out.vertices!);
-    }
-  }, 30_000);
+    },
+    30_000,
+  );
 
   it('cost at most TEXT_BYTES_PER_CHARACTER per glyph for a text filled flat (what browser editors count)', () => {
     // 6,000 characters, 4,909 glyphs: about 260 MB at the peak
@@ -808,10 +908,18 @@ describe('copies of array_place and scatter_on_surface', () => {
     const { run, estimate, state, doc } = scene();
     run('mesh.primitive_grid_add', { x_subdivisions: 20, y_subdivisions: 20, name: 'Grid' });
     const one = storedMeshBytes(doc);
+    const json = extraJsonChars(doc.resolveObject('Grid')!);
+    // every copy is an object; with linked false it has a mesh of its own
+    const copies = (n: number, own: boolean) =>
+      newObjectsBytes({ objects: n, datablocks: own ? { meshes: n } : {}, extraJson: n * json }).stored;
     expect(
       estimate('object.array_place', { objects: ['Grid'], count: 5, linked: false })!.addedStoredBytes,
-    ).toBe(4 * one);
-    expect(estimate('object.array_place', { objects: ['Grid'], count: 5 })).toBeNull();
+    ).toBe(4 * one + copies(4, true));
+    expect(estimate('object.array_place', { objects: ['Grid'], count: 5 })).toMatchObject({
+      objects: 4,
+      addedStoredBytes: copies(4, false),
+      lower: 'count',
+    });
     expect(
       estimate('object.array_place', {
         objects: ['Grid'],
@@ -820,12 +928,15 @@ describe('copies of array_place and scatter_on_surface', () => {
         rows: 2,
         linked: false,
       })!,
-    ).toMatchObject({ addedStoredBytes: 5 * one, lower: 'columns and rows (or pass linked: true)' });
+    ).toMatchObject({
+      addedStoredBytes: 5 * one + copies(5, true),
+      lower: 'columns and rows (or pass linked: true)',
+    });
     run('mesh.primitive_plane_add', { size: 10, name: 'Ground' });
     state.selectedIds = [doc.resolveObject('Grid')!.id];
     expect(
       estimate('object.scatter_on_surface', { surface: 'Ground', count: 7, linked: false })!.addedStoredBytes,
-    ).toBe(7 * one);
+    ).toBe(7 * one + copies(7, true));
   });
 });
 

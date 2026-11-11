@@ -17,7 +17,7 @@ import {
   renderMemoryFromEnv,
 } from '../../src/render';
 import { RENDER_HEAP_BYTES_PER_TRIANGLE, geometryCheck, serverHeapReserve } from '../../src/render/memory';
-import { OUT_OF_MEMORY_ADVICE, renderToolError } from '../../src/mcp/rendering';
+import { SINGLE_THREAD_RENDER_ADVICE, renderToolError } from '../../src/mcp/rendering';
 
 /*
  * The server's own process: a render there (single-thread mode: RENDER_WORKERS=0, or render
@@ -193,7 +193,7 @@ describe('renders in the server process', () => {
         ),
       );
       expect(renderToolError(err).message).toBe(
-        `Rendering failed: ${(err as Error).message}. ${OUT_OF_MEMORY_ADVICE}`,
+        `Rendering failed: ${(err as Error).message}. ${SINGLE_THREAD_RENDER_ADVICE}`,
       );
       expect(renderToolError(err).code).toBe('OUT_OF_MEMORY');
     }

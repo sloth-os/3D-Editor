@@ -15,6 +15,7 @@ import {
   insertKeyframe,
   normalize3,
   scaling4,
+  selectionPivot,
   translation4,
   type ConstraintData,
   type Mat4,
@@ -517,6 +518,300 @@ describe('the transform preview where IK chains are solved together or a depende
   });
 });
 
+/** An armature object named Rig with `bones` and the pose bones `pose` gives (by bone name). */
+function rigWith(
+  doc: SceneDoc,
+  bones: ReturnType<typeof defaultBone>[],
+  pose: (rig: string) => Record<string, unknown>,
+) {
+  const rig = doc.addObject({ type: 'ARMATURE', name: 'Rig', data: doc.addArmature({ bones }) });
+  doc.updateObject(rig, { pose: { bones: pose(rig) } as never });
+  return rig;
+}
+
+/** An empty named `name` parented to bone `bone` of `rig`. */
+const boneChild = (doc: SceneDoc, rig: string, bone: string, name = 'Y') =>
+  doc.addObject({
+    type: 'EMPTY',
+    name,
+    parent: rig,
+    parent_type: 'BONE',
+    parent_bone: bone,
+    location: [0.3, 0, 0],
+  });
+
+describe('the transform preview follows what a moved object changes inside a pose', () => {
+  /**
+   * Moves `moved` by `v` and checks that the preview shows what the scene shows afterwards, and
+   * that `child` (parented to a bone the move reaches) moves and is in the preview.
+   */
+  function checkBoneChild(doc: SceneDoc, moved: string, child: string, v: Vec3) {
+    const before = settled(new FrameState(doc, 1)).world(child)!;
+    const { mismatches, preview, after } = previewMismatches(
+      doc,
+      [moved],
+      'TRANSLATE',
+      translation4(v),
+      'transform.translate',
+      { value: v },
+    );
+    expect(maxRel(before, after.world(child)!)).toBeGreaterThan(1e-3);
+    expect(preview.has(child)).toBe(true);
+    expect(mismatches).toEqual([]);
+  }
+
+  it('solves an IK chain anew when a constraint of one of its bones reads the moved object', () => {
+    // B copies 0.6 of X's location and reaches for T with R (chain_count 2): moving X moves B's
+    // start, so the chain turns R, which Y hangs from
+    const doc = SceneDoc.create({ empty: true });
+    const t = doc.addObject({ type: 'EMPTY', name: 'T', location: [0.8, 0.3, 1.6] });
+    const x = doc.addObject({ type: 'EMPTY', name: 'X', location: [0.2, 0.1, 1.3] });
+    const ik = createConstraint('IK' as ConstraintData['type'], { target: t });
+    const rig = rigWith(
+      doc,
+      [defaultBone('R', [0, 0, 0], [0, 0, 1]), { ...defaultBone('B', [0, 0, 1.2], [0, 0, 2]), parent: 'R' }],
+      () => ({
+        R: defaultPoseBone(),
+        B: {
+          ...defaultPoseBone(),
+          constraints: [
+            createConstraint('COPY_LOCATION', { target: x, influence: 0.6 }),
+            { ...ik, params: { chain_count: 2 } },
+          ],
+        },
+      }),
+    );
+    checkBoneChild(doc, x, boneChild(doc, rig, 'R'), [0.3, -0.2, 0.1]);
+  });
+
+  it('follows a bone constraint that targets another bone of the same armature', () => {
+    // B1 tracks X; B2 copies B1's rotation, and Y hangs from B2
+    const doc = SceneDoc.create({ empty: true });
+    const x = doc.addObject({ type: 'EMPTY', name: 'X', location: [2, 1, 3] });
+    const rig = rigWith(
+      doc,
+      [
+        defaultBone('R', [0, 0, 0], [0, 0, 1]),
+        { ...defaultBone('B1', [0, 0, 1], [0, 0, 2]), parent: 'R' },
+        { ...defaultBone('B2', [0, 0, 1], [1, 0, 1]), parent: 'R' },
+      ],
+      (self) => ({
+        R: defaultPoseBone(),
+        B1: {
+          ...defaultPoseBone(),
+          constraints: [createConstraint('DAMPED_TRACK' as ConstraintData['type'], { target: x })],
+        },
+        B2: {
+          ...defaultPoseBone(),
+          constraints: [
+            createConstraint('COPY_ROTATION' as ConstraintData['type'], { target: self, subtarget: 'B1' }),
+          ],
+        },
+      }),
+    );
+    checkBoneChild(doc, x, boneChild(doc, rig, 'B2'), [-1, 0.5, 0]);
+  });
+
+  it('starts an IK chain without its tail (use_tail off) at the parent of the IK bone', () => {
+    // B reaches for T with its parent P only (chain_count 1, use_tail off), and Y hangs from P
+    const doc = SceneDoc.create({ empty: true });
+    const t = doc.addObject({ type: 'EMPTY', name: 'T', location: [1, 0, 1.5] });
+    const ik = createConstraint('IK' as ConstraintData['type'], { target: t });
+    const rig = rigWith(
+      doc,
+      [
+        defaultBone('R', [0, 0, 0], [0, 0, 1]),
+        { ...defaultBone('P', [0, 0, 1], [0, 0, 2]), parent: 'R', use_connect: true },
+        { ...defaultBone('B', [0, 0, 2], [0, 0, 3]), parent: 'P', use_connect: true },
+      ],
+      () => ({
+        R: defaultPoseBone(),
+        P: defaultPoseBone(),
+        B: { ...defaultPoseBone(), constraints: [{ ...ik, params: { chain_count: 1, use_tail: false } }] },
+      }),
+    );
+    checkBoneChild(doc, t, boneChild(doc, rig, 'P'), [-1, 0.5, 0.2]);
+  });
+
+  it('evaluates the scene in name order where two objects drive each other', () => {
+    // Alpha's Z location reads Zed's Y location and Zed's Y location reads Alpha's Z location: the
+    // viewport enters the loop at Alpha, first by name, also when Zed moves
+    const doc = SceneDoc.create({ empty: true });
+    const alpha = doc.addObject({ type: 'EMPTY', name: 'Alpha', location: [0, 0, 5] });
+    const zed = doc.addObject({ type: 'EMPTY', name: 'Zed', location: [3, 1, 0] });
+    drive(doc, ['object', alpha, 'location', 2], 'v + 1', ['object', zed, 'location', 1]);
+    drive(doc, ['object', zed, 'location', 1], 'v * 0.5', ['object', alpha, 'location', 2]);
+    const { mismatches, preview } = previewMismatches(
+      doc,
+      [zed],
+      'TRANSLATE',
+      translation4([1, 2, 0.5]),
+      'transform.translate',
+      { value: [1, 2, 0.5] },
+    );
+    expect(preview.has(alpha)).toBe(true);
+    expect(mismatches).toEqual([]);
+  });
+});
+
+/**
+ * A dependency cycle inside a pose, which the scene evaluates differently depending on where its
+ * evaluation enters it: T is parented to bone B2 of Rig and is the IK target of B3's chain (B3, B2,
+ * B0). X, parented to B0, reads the cycle: evaluated first, it shows no matrix (its bone breaks the
+ * cycle there), while the viewport, which evaluates the objects by name (A_T first), shows it on
+ * B0.
+ */
+function poseCycleScene() {
+  const doc = SceneDoc.create({ empty: true });
+  const rig = doc.addObject({
+    type: 'ARMATURE',
+    name: 'Rig',
+    data: doc.addArmature({
+      bones: [
+        defaultBone('B0', [0, 0, 0], [0, 0, 1]),
+        { ...defaultBone('B2', [0, 0, 1], [0, 0, 2]), parent: 'B0', use_connect: true },
+        { ...defaultBone('B3', [0, 0, 2], [0, 0.5, 2.8]), parent: 'B2', use_connect: true },
+      ],
+    }),
+  });
+  const t = doc.addObject({
+    type: 'EMPTY',
+    name: 'A_T',
+    parent: rig,
+    parent_type: 'BONE',
+    parent_bone: 'B2',
+    location: [0.8, 0.3, 0],
+  });
+  const ik = createConstraint('IK' as ConstraintData['type'], { target: t });
+  doc.updateObject(rig, {
+    pose: {
+      bones: {
+        B0: { ...defaultPoseBone(), rotation_euler: [0.3, 0, 0] },
+        B2: { ...defaultPoseBone(), rotation_euler: [0.2, 0.1, 0] },
+        B3: { ...defaultPoseBone(), constraints: [{ ...ik, params: { chain_count: 0 } }] },
+      },
+    } as never,
+  });
+  const x = doc.addObject({
+    type: 'EMPTY',
+    name: 'X',
+    parent: rig,
+    parent_type: 'BONE',
+    parent_bone: 'B0',
+    location: [0.2, 0, 0.1],
+  });
+  expect(new FrameState(doc, 1).world(x)).toBeNull();
+  const shown = settled(new FrameState(doc, 1)).world(x)!;
+  expect(shown).not.toBeNull();
+  return { doc, rig, t, x, shown };
+}
+
+describe('the transform reads what a dependency cycle gives as the viewport shows it', () => {
+  it('starts an object that reads a cycle where the viewport shows it', () => {
+    const { doc, x, shown } = poseCycleScene();
+    const ctx = context(doc);
+    Object.assign(ctx.state, { selectedIds: [x], activeId: x });
+    expect(selectionPivot(doc, ctx.state, 'MEDIAN_POINT')).toEqual([shown[12], shown[13], shown[14]]);
+    expect(reg.run(ctx, 'transform.translate', { value: [0, 0, 1] }).ok).toBe(true);
+    const after = settled(new FrameState(doc, 1)).world(x)!;
+    expect(maxRel(after.slice(12, 15), [shown[12], shown[13], shown[14] + 1])).toBeLessThan(1e-12);
+  });
+
+  it('places the Active Element pivot on an active object that reads a cycle, which it does not move', () => {
+    const { doc, x, shown } = poseCycleScene();
+    const u = doc.addObject({ type: 'EMPTY', name: 'U', location: [5, 0, 0] });
+    const state = createEditorState();
+    Object.assign(state, { selectedIds: [u], activeId: x });
+    expect(selectionPivot(doc, state, 'ACTIVE_ELEMENT')).toEqual([shown[12], shown[13], shown[14]]);
+  });
+
+  it('previews an object that reads both the moved object and a cycle the move does not reach', () => {
+    // Q is X's child and copies half of M's location
+    const { doc, x } = poseCycleScene();
+    const m = doc.addObject({ type: 'EMPTY', name: 'M', location: [3, 0, 0] });
+    const q = doc.addObject({
+      type: 'EMPTY',
+      name: 'Q',
+      parent: x,
+      location: [0, 1, 0],
+      constraints: [createConstraint('COPY_LOCATION', { target: m, influence: 0.5 })],
+    });
+    const { mismatches, preview } = previewMismatches(
+      doc,
+      [m],
+      'TRANSLATE',
+      translation4([0, 2, 1]),
+      'transform.translate',
+      { value: [0, 2, 1] },
+    );
+    expect(preview.has(q)).toBe(true);
+    expect(mismatches).toEqual([]);
+  });
+});
+
+describe('Edit Mode reads the edited object where the scene shows it, also on a dependency cycle', () => {
+  /** A cube parented to bone B0 of the pose cycle, in Edit Mode with every vertex selected. */
+  function editedOnCycle() {
+    const { doc, rig } = poseCycleScene();
+    const ctx = context(doc);
+    expect(reg.run(ctx, 'mesh.primitive_cube_add', { name: 'M', size: 0.2 }).ok).toBe(true);
+    const m = ctx.state.activeId!;
+    doc.updateObject(m, { parent: rig, parent_type: 'BONE', parent_bone: 'B0', location: [0.2, 0, 0.1] });
+    // evaluated first, it enters the cycle at its own bone and has no matrix
+    expect(new FrameState(doc, 1).world(m)).toBeNull();
+    const shown = settled(new FrameState(doc, 1)).world(m)!;
+    expect(reg.run(ctx, 'object.mode_set', { mode: 'EDIT' }).ok).toBe(true);
+    const verts = () => {
+      const p = doc.getMesh(doc.getObject(m)!.data!)!.positions;
+      const w = settled(new FrameState(doc, 1)).world(m)!;
+      const out: number[] = [];
+      for (let i = 0; i < p.length; i += 3)
+        for (let k = 0; k < 3; k++)
+          out.push(w[k] * p[i] + w[4 + k] * p[i + 1] + w[8 + k] * p[i + 2] + w[12 + k]);
+      return out;
+    };
+    return { doc, ctx, shown, verts };
+  }
+
+  it('places the pivot of the selected vertices where the viewport shows them', () => {
+    const { doc, ctx, shown } = editedOnCycle();
+    // the median of the cube's vertices is its origin
+    const pivot = selectionPivot(doc, ctx.state, 'MEDIAN_POINT');
+    expect(maxRel(pivot, [shown[12], shown[13], shown[14]])).toBeLessThan(1e-9);
+  });
+
+  it('moves the vertices in the space the viewport shows the object in', () => {
+    const { ctx, verts } = editedOnCycle();
+    const before = verts();
+    expect(reg.run(ctx, 'transform.translate', { value: [0, 0, 1] }).ok).toBe(true);
+    // the mesh keeps 32-bit floats
+    expect(
+      maxRel(
+        verts(),
+        before.map((v, i) => (i % 3 === 2 ? v + 1 : v)),
+      ),
+    ).toBeLessThan(1e-6);
+  });
+
+  it('rotates the vertices about a given center in that space', () => {
+    // with `center` the operator finds no pivot: the vertices' space is read on its own
+    const { ctx, shown, verts } = editedOnCycle();
+    const before = verts();
+    const c: Vec3 = [shown[12], shown[13], shown[14]];
+    expect(reg.run(ctx, 'transform.rotate', { value: Math.PI / 2, orient_axis: 'Z', center: c }).ok).toBe(
+      true,
+    );
+    // a quarter turn about Z through c: (x, y) - c turns to (-(y - cy), x - cx)
+    const turned = before.map((v, i) => {
+      const k = i % 3;
+      const x = before[i - k] - c[0];
+      const y = before[i - k + 1] - c[1];
+      return k === 0 ? c[0] - y : k === 1 ? c[1] + x : v;
+    });
+    expect(maxRel(verts(), turned)).toBeLessThan(1e-6);
+  });
+});
+
 /**
  * A random scene: two armatures with a 3-bone chain each (IK with pole targets, bone constraints
  * reading objects and the other armature), curves (one curve datablock shared by two objects),
@@ -753,12 +1048,15 @@ function checkPreviews(seed: number, count: number, dag: boolean) {
     const fs = new FrameState(doc, frame);
     const xf = new ObjectTransform(fs, sel, pivot, mode);
     const view = settled(new FrameState(doc, frame));
-    for (const id of all) {
+    // what the transform reads (its objects' matrices, the pivot) is what the viewport shows
+    for (const { id } of xf.targets) {
       const a = fs.world(id);
       const b = view.world(id);
       if (!!a !== !!b || (a && b && maxRel(a, b) > 0)) fails.push(`scene ${n}: start != view (${id})`);
     }
     const center = xf.pivot(ctx.state);
+    const viewCenter = new ObjectTransform(view, sel, pivot, mode).pivot(ctx.state);
+    if (maxRel(center, viewCenter) > 0) fails.push(`scene ${n}: pivot != view`);
     let m: Mat4;
     let op: string;
     let params: Record<string, unknown>;

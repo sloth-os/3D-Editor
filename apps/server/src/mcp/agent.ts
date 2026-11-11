@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import * as Y from 'yjs';
 import {
   colorForName,
@@ -12,12 +13,12 @@ import {
   type RunResult,
 } from '@3d-editor/core';
 import type { Room } from '../sync/room';
-import type { RoomManager } from '../sync/room-manager';
+import type { NamedProject, RoomManager, StoredNames } from '../sync/room-manager';
 import type { Log } from '../observability/log';
 import { randomClientId } from '../sync/awareness';
 import { toolOnlyOperator } from './operator-groups';
 import { AgentHistory, type HistoryLimits } from './history';
-import { listProjects } from './project-storage';
+import { listForName } from './project-storage';
 
 /**
  * Kind of a failure, as the core operator registry reports operator failures (OperatorError):
@@ -58,18 +59,84 @@ export interface AgentDeps {
 }
 
 /**
- * The id of the project named `name` among `projects` (an exact match first, else one ignoring
- * letter case); null when none is; a {@link ToolError} when several are.
+ * Why a lookup of a project by name (AgentSession.findProject) compared its name with only some of
+ * the projects: listing the projects in storage failed ('failed'), reading the project.json of some
+ * of them failed ('partial'), or storage did not answer in time ('late'); or why it compared the
+ * projects in storage as an earlier listing found them: storage took longer than requests wait for
+ * it the last time it listed them ('slow').
  */
-function projectNamed(projects: { id: string; name: string }[], name: string): string | null {
-  let matches = projects.filter((p) => p.name === name);
-  if (matches.length === 0) matches = projects.filter((p) => p.name.toLowerCase() === name.toLowerCase());
+type Unlisted = 'failed' | 'partial' | 'late' | 'slow';
+
+/** What a lookup by name that could not compare every project compared, as its notes say it. */
+function compared(why: Unlisted, waitMs: number, ageMs = 0): string {
+  if (why === 'partial')
+    return "reading the project.json of some projects in storage failed (the server logged 'listing projects failed'), so those projects were not compared";
+  if (why === 'slow')
+    return `storage took longer than ${waitMs / 1000} s to list its projects, so the projects in storage were compared as it listed them ${ageMs < 1000 ? 'less than 1' : Math.round(ageMs / 1000)} s ago`;
+  const reason =
+    why === 'failed'
+      ? "listing the projects in storage failed (the server logged 'listing projects failed')"
+      : `storage did not answer within ${waitMs / 1000} s`;
+  return `${reason}, so only the projects this server has loaded were compared`;
+}
+
+/**
+ * The projects named `name` among `projects`: those with that exact name, else those whose name
+ * matches it ignoring letter case.
+ */
+function matching<P extends { name: string }>(projects: P[], name: string): P[] {
+  const exact = projects.filter((p) => p.name === name);
+  return exact.length > 0 ? exact : projects.filter((p) => p.name.toLowerCase() === name.toLowerCase());
+}
+
+/**
+ * The id of the project named `name` among `projects` (an exact match first, else one ignoring
+ * letter case); null when none is; a {@link ToolError} when several are (which says so when the
+ * lookup could not compare every project, `unlisted`).
+ */
+function projectNamed(
+  projects: { id: string; name: string }[],
+  name: string,
+  unlisted?: { why: Unlisted; waitMs: number },
+): string | null {
+  const matches = matching(projects, name);
   if (matches.length > 1) {
+    const which = unlisted ? compared(unlisted.why, unlisted.waitMs) : '';
     throw new ToolError(
-      `Several projects are named '${name}': ${matches.map((m) => m.id).join(', ')}. Pass the project id instead.`,
+      `Several projects are named '${name}': ${matches.map((m) => m.id).join(', ')}. Pass the project id instead.` +
+        (which ? ` ${which[0].toUpperCase()}${which.slice(1)}.` : ''),
     );
   }
   return matches[0]?.id ?? null;
+}
+
+/**
+ * The note of a project found by a name that was not compared with every project (see
+ * AgentSession.findProject): another project may have the name too.
+ */
+function foundWithout(name: string, id: string, why: Unlisted, waitMs: number, ageMs = 0): string {
+  const others =
+    why === 'partial'
+      ? 'one of those'
+      : why === 'slow'
+        ? 'a project stored or renamed since then'
+        : 'a project that is only in storage';
+  return `Project '${name}' was found by name, but ${compared(why, waitMs, ageMs)}: ${others} may have this name too. Pass the id ${id} to name this project without a lookup.`;
+}
+
+/** The notes of the tool call running in this context (see {@link collectProjectNotes}). */
+const projectNotes = new AsyncLocalStorage<Set<string>>();
+
+/**
+ * Runs a tool call and returns its value with the notes of the projects it found by a name that was
+ * not compared with every project (AgentSession.resolveProjectId: listing storage failed, or storage
+ * did not answer in time; an error says the same when no project was found). A tool's result carries
+ * them, so that the agent knows that another project may have that name.
+ */
+export async function collectProjectNotes<T>(call: () => Promise<T>): Promise<{ value: T; notes: string[] }> {
+  const notes = new Set<string>();
+  const value = await projectNotes.run(notes, call);
+  return { value, notes: [...notes] };
 }
 
 /** Characters allowed in agent ids (`x-mcp-agent-id` header / `agent` query parameter). */
@@ -381,28 +448,79 @@ export class AgentSession {
   }
 
   /**
-   * Resolves a project reference (an id, or a name: exact, else ignoring letter case) to a project
-   * id. An id comes first (RoomManager.exists); then the names of the projects this agent holds, then
-   * of those this server has loaded, which need no listing of storage (storage that does not answer
-   * takes 30 s per request: a name of a loaded project used to wait for that); then the names of
-   * the projects in storage. When listing storage fails, or reading some project.json files does, a
-   * name that nothing matches gets an error that says so (a project that is only in storage may
-   * have it), instead of 'There are no projects yet'.
+   * Resolves a project reference to a project id (see {@link findProject}), and adds the note of a
+   * project found by a name that was not compared with every project to the notes of the tool call
+   * (see {@link collectProjectNotes}).
    */
   async resolveProjectId(ref: string): Promise<string> {
+    const { id, note } = await this.findProject(ref);
+    if (note) projectNotes.getStore()?.add(note);
+    return id;
+  }
+
+  /**
+   * Resolves a project reference: an id, or a name, as docs/mcp.md says: an exact match first, else
+   * one ignoring letter case, among the projects this server has loaded and those in storage
+   * together (the projects list_projects lists); several projects with the name are an error that
+   * lists their ids. An id comes first (RoomManager.exists). A name is compared with a listing of
+   * storage made for it (listForName, RoomManager.listNames: one listing of the projects folder, and
+   * the project.json of the stored projects that are new or changed since a lookup last read them;
+   * every project.json used to be read at every lookup). A request waits for storage {@link
+   * RoomManager.readWaitMs} (5 s) in all, for the id and the listing (and not for the listing while
+   * a read of a loaded project of that name that a request stopped waiting for goes on,
+   * Room.storageLate). When the listing has not answered by then, a name that a loaded project has
+   * finds that project (`note` says that the projects in storage were not compared; while the
+   * listing goes on, the project counts as one whose read a request stopped waiting for, so that
+   * get_project does not wait for storage again), and a name that none has waits for the listing
+   * (storage that does not answer takes 30 s per request on WebDAV). When the last listing took
+   * longer than that wait (storage that lists slowly), a name that one project has in the last
+   * listing that listed storage (within the last 60 s) finds that project at once (`note` says how
+   * old that listing is), and other names wait for the listing that goes on. When listing storage
+   * fails, the projects this server has loaded are those compared, and when reading some
+   * project.json files fails, the others; a project found then has a `note`, and a name that
+   * nothing matches gets an error that says why, instead of 'There are no projects yet'. Names of
+   * the projects this server had loaded used to be compared before storage was listed, so a project
+   * that was only in storage with the same name (made by a browser) was ignored, and a loaded
+   * project matched ignoring letter case won over one in storage with the exact name. Without
+   * storage, the projects this server has loaded are all the projects, and no listing is waited for.
+   */
+  async findProject(ref: string): Promise<{ id: string; note?: string }> {
     const r = ref.trim();
     if (!r) throw new ToolError('project is required (id or name; see list_projects)');
     const { rooms } = this.deps;
-    if (isValidProjectId(r) && (await rooms.exists(r))) return r;
-    // Fast path: a project this agent is already working on (avoids listing the storage backend).
-    const held = this.held().filter((p) => p.scene.name === r);
-    if (held.length === 1) return held[0].id;
-    const loaded = rooms.loadedNamed(r).map((room) => ({ id: room.id, name: room.scene.name }));
-    const loadedId = projectNamed(loaded, r);
-    if (loadedId) return loadedId;
-    const { projects: all, failed, partial } = await listProjects(rooms);
-    const id = projectNamed(all, r);
-    if (id) return id;
+    const waitMs = rooms.readWaitMs;
+    const deadline = Date.now() + waitMs;
+    if (isValidProjectId(r) && (await rooms.exists(r))) return { id: r };
+    const late = rooms.loadedNamed(r).some((room) => room.storageLate);
+    const { answered, finished, earlier } = await listForName(rooms, late ? 0 : deadline);
+    if (earlier) {
+      // storage lists slowly: a name that one project has in the last listing finds it at once
+      const [match, ...others] = matching(rooms.namesOf(earlier.names), r);
+      if (match && others.length === 0)
+        return { id: match.id, note: foundWithout(r, match.id, 'slow', waitMs, earlier.ageMs) };
+      return this.named(r, await finished, waitMs);
+    }
+    if (!answered) {
+      // storage did not answer in time: the names of the loaded projects decide, when one has it
+      const loaded = rooms.loadedNamed(r).map((room) => ({ id: room.id, name: room.scene.name }));
+      const id = projectNamed(loaded, r, { why: 'late', waitMs });
+      if (id) {
+        // the request has waited for storage: while the listing goes on, the request does not wait
+        // for that project's reads again (get_project's check of storage, Room.storageLate)
+        rooms.get(id)?.readIsLate(finished);
+        return { id, note: foundWithout(r, id, 'late', waitMs) };
+      }
+    }
+    return this.named(r, answered ?? (await finished), waitMs);
+  }
+
+  /** {@link findProject} by name among the projects of a listing (RoomManager.namesOf). */
+  private named(r: string, listed: StoredNames, waitMs: number): { id: string; note?: string } {
+    const { failed, partial } = listed;
+    const all: NamedProject[] = this.deps.rooms.namesOf(listed);
+    const why: Unlisted | null = failed ? (partial ? 'partial' : 'failed') : null;
+    const id = projectNamed(all, r, why ? { why, waitMs } : undefined);
+    if (id) return why ? { id, note: foundWithout(r, id, why, waitMs) } : { id };
     const known = all
       .slice(0, 20)
       .map((p) => `'${p.name}' (${p.id})`)

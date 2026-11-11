@@ -176,7 +176,10 @@ describe('view3d.camera_to_view', () => {
     s.state.frame = 6;
     const pose = { ...DEFAULT_POSE(), target: new THREE.Vector3(1, 2, 0.5) };
     viewport.engine = { pose, width: 800, height: 600 } as unknown as ViewportEngine;
+    expect(s.view.cameraView.value).toBe(false);
     expect(runOperator(s, registry, 'view3d.camera_to_view', {}).ok).toBe(true);
+    // and the editor looks through the camera
+    expect(s.view.cameraView.value).toBe(true);
     const view = viewportCamera(pose, 800 / 600).matrixWorld.toArray();
     const shown = new FrameState(doc, 6).world(cam)!;
     expect(Math.max(...shown.map((v, i) => Math.abs(v - view[i])))).toBeLessThan(1e-9);

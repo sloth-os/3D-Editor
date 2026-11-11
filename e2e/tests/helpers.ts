@@ -430,13 +430,42 @@ export async function viewportDrawn(page: Page): Promise<void> {
   );
 }
 
+/** A picture of the 3D viewport and the samples per pixel of the frame it shows. */
+export interface ViewportPicture extends RgbaImage {
+  /**
+   * Samples per pixel of the frame drawn (the canvas's `data-samples`): 4, or 0 while the viewport
+   * draws without multisampling (frames over a second, e.g. on a busy machine). Pictures compare
+   * edge for edge only when they agree: 0.8–1.4 % of the pixels, the edges, differed between
+   * pictures of the same view drawn with and without it.
+   */
+  samples: number;
+}
+
+/**
+ * A picture of the viewport once it shows every change ({@link viewportDrawn}), and the samples of
+ * the frame it shows; taken again when the viewport drew another frame meanwhile (it turns its
+ * multisampling off or on by itself, and draws the view again).
+ */
+async function viewportPicture(page: Page, shoot: () => Promise<Buffer>): Promise<ViewportPicture> {
+  const canvas = page.getByTestId('viewport').locator('canvas[data-view]');
+  for (let attempt = 1; ; attempt++) {
+    await viewportDrawn(page);
+    const samples = Number(await canvas.getAttribute('data-samples'));
+    const img = decodePng(await shoot());
+    const [view, after] = await Promise.all([
+      canvas.getAttribute('data-view'),
+      canvas.getAttribute('data-samples'),
+    ]);
+    if ((view === 'drawn' && Number(after) === samples) || attempt === 3) return { ...img, samples };
+  }
+}
+
 /**
  * A screenshot of the whole 3D viewport, overlays included, once it shows every change
  * ({@link viewportDrawn}).
  */
-export async function viewportShot(page: Page): Promise<RgbaImage> {
-  await viewportDrawn(page);
-  return decodePng(await page.getByTestId('viewport').screenshot());
+export async function viewportShot(page: Page): Promise<ViewportPicture> {
+  return viewportPicture(page, () => page.getByTestId('viewport').screenshot());
 }
 
 /**
@@ -445,16 +474,47 @@ export async function viewportShot(page: Page): Promise<RgbaImage> {
  * navigation gizmo, the Adjust Last Operation panel), once it shows every change
  * ({@link viewportDrawn}).
  */
-export async function viewportCentre(page: Page, size = 160): Promise<RgbaImage> {
-  await viewportDrawn(page);
-  const box = (await page.getByTestId('viewport').boundingBox())!;
-  const clip = {
-    x: Math.round(box.x + box.width / 2 - size / 2),
-    y: Math.round(box.y + box.height / 2 - size / 2),
-    width: size,
-    height: size,
-  };
-  return decodePng(await page.screenshot({ clip }));
+export async function viewportCentre(page: Page, size = 160): Promise<ViewportPicture> {
+  return viewportPicture(page, async () => {
+    const box = (await page.getByTestId('viewport').boundingBox())!;
+    const clip = {
+      x: Math.round(box.x + box.width / 2 - size / 2),
+      y: Math.round(box.y + box.height / 2 - size / 2),
+      width: size,
+      height: size,
+    };
+    return page.screenshot({ clip });
+  });
+}
+
+/**
+ * Pictures of the viewport in the states `steps` put the scene into, one after each step (a step
+ * waits until the editor shows its state), all drawn with the same samples per pixel (see
+ * {@link ViewportPicture.samples}): while the viewport turns its multisampling off or on between
+ * them, the steps run again from the first, at most `attempts` times. The steps must reach the
+ * same states from wherever the last one left the scene.
+ */
+export async function viewportPictures(
+  page: Page,
+  steps: (() => Promise<void>)[],
+  take: (page: Page) => Promise<ViewportPicture> = viewportShot,
+  attempts = 4,
+): Promise<ViewportPicture[]> {
+  const drawn: number[][] = [];
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const pictures: ViewportPicture[] = [];
+    for (const step of steps) {
+      await step();
+      pictures.push(await take(page));
+    }
+    if (pictures.every((p) => p.samples === pictures[0].samples)) return pictures;
+    drawn.push(pictures.map((p) => p.samples));
+  }
+  throw new Error(
+    `the viewport changed its multisampling between pictures each time (samples per pixel: ${drawn
+      .map((d) => d.join(', '))
+      .join('; ')})`,
+  );
 }
 
 /** Sets the output resolution scale (Output tab, "%"), e.g. 5 % of 1920×1080 = 96×54 pixels. */

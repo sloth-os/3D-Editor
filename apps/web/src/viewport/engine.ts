@@ -20,13 +20,24 @@ import {
 } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
 import {
+  INSTANCE_BYTES,
+  RASTER_BYTES_PER_TRIANGLE,
+  RasterEvaluationGuard,
   applyLensShift,
+  estimateRender,
   finalRenderScene,
+  guardedEvaluation,
+  pageHeapEstimate,
   pathTraceDocument,
   pixelsToDataUrl,
+  rasterNeeds,
+  rasterRefusal,
+  rasterRefusalWithModifier,
+  refusedModifier,
   renderOutputSize,
   renderViewFromCamera,
   sceneCameraView,
+  tabMemoryWithRenders,
   viewportCamera,
   type PathTraceJob,
   type PathTraceOptions,
@@ -189,6 +200,8 @@ interface FrameInFlight {
   settled: boolean;
   /** The changes it shows ({@link ViewportEngine.changes} when it started). */
   changes: number;
+  /** The samples per pixel of the scene target it was drawn into (0: multisampling off). */
+  samples: number;
   /** Signalled once its multisampled renders are done ({@link SceneEndPass}; null once seen so). */
   scene: WebGLSync | null;
   /** When the GPU was last seen still drawing them, and when they were first seen done (0: not). */
@@ -648,14 +661,22 @@ export class ViewportEngine {
   /** Changes asked for so far (invalidate, requestRender), and those the last frame drawn shows. */
   private changes = 0;
   private drawnChanges = 0;
+  /** The samples per pixel the last frame drawn was drawn with ({@link FrameInFlight.samples}). */
+  private drawnFrameSamples = 0;
 
   /**
    * The canvas's `data-view` attribute: `drawn` once the GPU has drawn a frame that shows every
    * change asked for so far (scene, view, shading, selection …), `pending` until then. End-to-end
    * tests wait for `drawn` before they take a picture of the viewport: the browser shows the last
-   * frame drawn, which software WebGL can take seconds to draw (compiling shaders).
+   * frame drawn, which software WebGL can take seconds to draw (compiling shaders). With `drawn`,
+   * `data-samples` says how many samples per pixel that frame was drawn with (4, or 0 while frames
+   * are slow, {@link multisampling}): pictures compare edge for edge only when they agree.
    */
   private showViewState(state: 'drawn' | 'pending'): void {
+    if (state === 'drawn') {
+      const samples = String(this.drawnFrameSamples);
+      if (this.canvas.dataset.samples !== samples) this.canvas.dataset.samples = samples;
+    }
     if (this.canvas.dataset.view !== state) this.canvas.dataset.view = state;
   }
 
@@ -702,10 +723,19 @@ export class ViewportEngine {
     this.unsettled = false;
     this.sceneEnd.armed = true;
     this.render(now);
-    this.noteDrawn(this.multisampling ? VIEWPORT_MSAA_SAMPLES : 0);
+    const samples = this.multisampling ? VIEWPORT_MSAA_SAMPLES : 0;
+    this.noteDrawn(samples);
     recordFrame(now);
     const compiled = this.compiledPrograms();
-    this.fenceFrame(start, renderStart, compiled, settled && !compiled, changes, this.sceneEnd.take());
+    this.fenceFrame(
+      start,
+      renderStart,
+      compiled,
+      settled && !compiled,
+      changes,
+      samples,
+      this.sceneEnd.take(),
+    );
   }
 
   /** Notes the shader programs three.js holds now ({@link compiledPrograms}). */
@@ -767,6 +797,7 @@ export class ViewportEngine {
       }
       this.framesInFlight.shift();
       this.drawnChanges = f.changes;
+      this.drawnFrameSamples = f.samples;
       // a frame queued behind another one only started drawing when that one was done; when that
       // was is known if a fresh read of an earlier turn saw it (read now, or by the first read
       // after the main thread was held up, the GPU can have finished both long before)
@@ -794,7 +825,7 @@ export class ViewportEngine {
 
   /**
    * Puts a fence after the frame that started at `start` showing `changes`, rendered from
-   * `renderStart`, `compiled` shader programs or not and `settled` or not (see
+   * `renderStart` with `samples`, `compiled` shader programs or not and `settled` or not (see
    * {@link FrameInFlight}), whose multisampled renders end at the fence `scene` (WebGL2; see
    * {@link frameDone}). Without fences, the frame counts as drawn.
    */
@@ -804,6 +835,7 @@ export class ViewportEngine {
     compiled: boolean,
     settled: boolean,
     changes: number,
+    samples: number,
     scene: WebGLSync | null,
   ): void {
     const gl = this.renderer.getContext?.();
@@ -812,6 +844,7 @@ export class ViewportEngine {
     if (!gl2 || !fence) {
       if (scene) gl2?.deleteSync(scene);
       this.drawnChanges = changes;
+      this.drawnFrameSamples = samples;
       this.updateViewState();
       return;
     }
@@ -822,6 +855,7 @@ export class ViewportEngine {
       compiled,
       settled,
       changes,
+      samples,
       scene,
       sceneBusyAt: 0,
       sceneDoneAt: 0,
@@ -1417,7 +1451,8 @@ export class ViewportEngine {
     const { width, height } = this.renderSize(opts);
     const frame =
       typeof opts.frame === 'number' && Number.isFinite(opts.frame) ? opts.frame : this.session.state.frame;
-    const o: PathTraceOptions = { width, height, frame };
+    // the page's heap: the viewport's evaluation, at the viewport's frame
+    const o: PathTraceOptions = { width, height, frame, pageFrame: this.session.state.frame };
     if (opts.samples !== undefined) o.samples = opts.samples;
     if (opts.max_bounces !== undefined) o.max_bounces = opts.max_bounces;
     if (opts.denoise !== undefined) o.denoise = opts.denoise;
@@ -1825,6 +1860,8 @@ export class ViewportEngine {
   /** Evaluator of final renders (see {@link finalEvaluator}) and the timer that drops it. */
   private finalEval: SceneEvaluator | null = null;
   private finalEvalTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The JavaScript heap the evaluator of final renders holds: its last render's geometry (estimated). */
+  private finalHeld = 0;
 
   /**
    * The evaluator of final renders. It is not the viewport's: its caches keep the geometry evaluated
@@ -1834,11 +1871,61 @@ export class ViewportEngine {
   private finalEvaluator(): SceneEvaluator {
     this.finalEval ??= new SceneEvaluator(this.session.doc);
     if (this.finalEvalTimer) clearTimeout(this.finalEvalTimer);
-    this.finalEvalTimer = setTimeout(() => {
-      this.finalEval = null;
-      this.finalEvalTimer = null;
-    }, FINAL_EVALUATOR_IDLE_MS);
+    this.finalEvalTimer = setTimeout(() => this.dropFinalEvaluator(), FINAL_EVALUATOR_IDLE_MS);
     return this.finalEval;
+  }
+
+  /** Drops the evaluator of final renders and what its caches hold. */
+  private dropFinalEvaluator(): void {
+    if (this.finalEvalTimer) clearTimeout(this.finalEvalTimer);
+    this.finalEvalTimer = null;
+    this.finalEval = null;
+    this.finalHeld = 0;
+  }
+
+  /**
+   * The scene evaluated at `frame` with the render settings for a final render (F12, Render
+   * Animation, MCP renders), when that fits the tab's JavaScript heap. The evaluation runs on the
+   * page, next to the viewport's (render/memory.ts `rasterNeeds`): a scene whose geometry at the
+   * render settings does not fit the room the heap has left is refused before it is evaluated
+   * (`rasterRefusal`, from its estimate at `frame`), and while it is evaluated every modifier is
+   * checked right before it runs, from its real input (render/guard.ts `RasterEvaluationGuard`):
+   * running out of heap would end the tab. A refusal is thrown with the reason. The geometry the
+   * evaluator keeps from an earlier render stays in the heap while this one is evaluated: it goes
+   * first where it and the new one would not fit together, and, where a modifier then does not fit
+   * next to it, the scene is evaluated once more without it.
+   */
+  private evaluateFinal(frame: number): EvaluatedScene {
+    const s = this.session;
+    const estimate = estimateRender(s.doc, true, frame);
+    // the page's heap: the viewport's evaluation, at the viewport's frame
+    const memory = tabMemoryWithRenders(pageHeapEstimate(s.doc, s.state.frame));
+    const needs = rasterNeeds(estimate);
+    const refusal = rasterRefusal(needs, memory);
+    if (refusal) throw new Error(refusal);
+    if (this.finalEval && rasterRefusal({ ...needs, heap: needs.heap + this.finalHeld }, memory))
+      this.dropFinalEvaluator();
+    const evaluate = (kept: number) => {
+      const guard = new RasterEvaluationGuard(estimate, { ...memory, heapUsed: memory.heapUsed + kept });
+      const evaluator = this.finalEvaluator();
+      return { guard, ev: guardedEvaluation(guard, () => evaluator.evaluate(frame, { forRender: true })) };
+    };
+    const kept = this.finalEval ? this.finalHeld : 0;
+    let { guard, ev } = evaluate(kept);
+    if (guard.refusal && kept > 0) {
+      this.dropFinalEvaluator();
+      ({ guard, ev } = evaluate(0));
+    }
+    if (guard.refusal) {
+      // the evaluator kept results without the modifiers it skipped: the next render starts afresh
+      this.dropFinalEvaluator();
+      throw new Error(
+        rasterRefusalWithModifier(guard.refusal, memory, refusedModifier(s.doc, ev, guard.refusal.message)),
+      );
+    }
+    this.finalHeld =
+      guard.heldTriangles * RASTER_BYTES_PER_TRIANGLE + estimate.instances * INSTANCE_BYTES.heap;
+    return ev;
   }
 
   /**
@@ -1852,7 +1939,7 @@ export class ViewportEngine {
     shading: NonNullable<RenderImageOptions['shading']>,
   ): EvaluatedScene {
     const s = this.session;
-    const ev = finalRenderScene(this.finalEvaluator().evaluate(frame, { forRender: true }));
+    const ev = finalRenderScene(this.evaluateFinal(frame));
     const render = ev.render;
     this.objects.sync(s.doc, ev, {
       shading,
@@ -1939,8 +2026,7 @@ export class ViewportEngine {
     }
     this.smaa?.dispose();
     this.worldEnv.dispose();
-    if (this.finalEvalTimer) clearTimeout(this.finalEvalTimer);
-    this.finalEval = null;
+    this.dropFinalEvaluator();
     this.resizeObserver.disconnect();
     for (const d of this.disposers) d();
     this.objects.dispose();

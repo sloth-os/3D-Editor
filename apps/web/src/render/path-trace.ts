@@ -4,6 +4,8 @@ import {
   estimatedNeeds,
   pageHeapEstimate,
   planRenderThreads,
+  rasterNeeds,
+  rasterRefusal,
   renderMemory,
   tabMemory,
   type RenderEstimate,
@@ -50,6 +52,11 @@ export interface PathTraceOptions extends PathTraceFrameOptions {
   timeLimit?: number;
   /** The tab's memory (default: {@link tabMemory} when the render starts). */
   memory?: TabMemory;
+  /**
+   * The frame the page's viewport shows, whose evaluation the page holds (default: `frame`): its
+   * heap is estimated from the scene at that frame ({@link pageHeapEstimate}).
+   */
+  pageFrame?: number;
 }
 
 export type PathTracePhase = 'preparing' | 'rendering' | 'finishing' | 'done' | 'cancelled' | 'failed';
@@ -132,6 +139,15 @@ function withRunning(memory: TabMemory, job: number): TabMemory {
   return { ...memory, held };
 }
 
+/**
+ * The tab's memory now ({@link tabMemory}, with `pageHeap` the page's own heap estimated from its
+ * scene), with what the path traced renders running in it hold: for a render that starts now on the
+ * page (a RASTER render).
+ */
+export function tabMemoryWithRenders(pageHeap = 0): TabMemory {
+  return withRunning(tabMemory(pageHeap), 0);
+}
+
 /** The frame options sent to the workers (drops main-thread-only settings and unset values). */
 function frameOptions(o: PathTraceOptions): PathTraceFrameOptions {
   const out: PathTraceFrameOptions = {
@@ -171,7 +187,7 @@ export class PathTraceJob {
   private dirty: [number, number] | null = null;
   /** True once `pixels` hold the final image (no more preview conversion). */
   private final = false;
-  /** What the document needed when the render started, estimated (see `estimateRender`). */
+  /** What the document needs at the frame it renders, estimated when the render started (`estimateRender`). */
   private readonly estimate: RenderEstimate;
   /** The page's own heap, estimated from its scene (see `pageHeapEstimate`). */
   private readonly pageHeap: number;
@@ -194,10 +210,10 @@ export class PathTraceJob {
       threads: 0,
       limitedByMemory: false,
     };
-    // the document as it is now (later edits do not change this render)
+    // the document as it is now (later edits do not change this render), at the frame it renders
     const snapshot = new DocumentSnapshot(doc);
-    this.estimate = estimateRender(doc);
-    this.pageHeap = options.memory ? 0 : pageHeapEstimate(doc);
+    this.estimate = estimateRender(doc, true, options.frame);
+    this.pageHeap = options.memory ? 0 : pageHeapEstimate(doc, options.pageFrame ?? options.frame);
     this.result = this.run(snapshot);
     this.result.catch(() => undefined);
   }
@@ -391,8 +407,10 @@ export class PathTraceJob {
     const job = this.id;
     const tab = this.options.memory ?? tabMemory(this.pageHeap);
     // a render that cannot fit one worker (estimated from the document, its evaluation included)
-    // next to the path traced renders running now is not started
-    const estimated = estimatedNeeds(this.estimate, this.width * this.height);
+    // next to the path traced renders running now is not started; its refusal suggests the RASTER
+    // engine where a RASTER render of the scene fits the page
+    const rasterFits = !rasterRefusal(rasterNeeds(this.estimate), withRunning(tab, job));
+    const estimated = { ...estimatedNeeds(this.estimate, this.width * this.height), rasterFits };
     const estimate = planRenderThreads(estimated, 1, withRunning(tab, job));
     if (estimate.refusal) throw new Error(estimate.refusal);
     /** Set when the render is over: no more copies of the compiled scene are sent. */
@@ -428,6 +446,7 @@ export class PathTraceJob {
         instances: info.instances,
         sceneBytes: info.sceneBytes,
         pixels: info.width * info.height,
+        rasterFits,
       };
       const plan = planRenderThreads(needs, this.pool.threadCount, withRunning(tab, job));
       if (plan.refusal) throw new Error(plan.refusal);
@@ -632,6 +651,9 @@ export class PathTraceJob {
       const info = this.info;
       if (info && stopsAdopters(running.size, all.length - 1, info.sceneBytes, tab.budget))
         for (const t of all.slice(1)) t.stop();
+      // a render its first worker refused (or that ended before it was prepared) gave the other
+      // workers it started nothing to do: they go too, unless another render may use them
+      else if (!info && running.size === 0) for (const t of all.slice(1)) t.stop();
     }
   }
 }

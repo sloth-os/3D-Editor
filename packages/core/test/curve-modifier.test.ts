@@ -232,4 +232,54 @@ describe('CURVE modifier', () => {
     expect(ev.modifierErrors).toEqual([]);
     expect(ev.mesh!.positions.every(Number.isFinite)).toBe(true);
   });
+
+  it('is applied with object.modifier_apply as the scene shows it', () => {
+    // Apply evaluates the Curve modifier with the path of the curve where the scene shows it, as
+    // the viewport does (it had no curve paths: "Curve paths are not available in this evaluation
+    // context")
+    const doc = SceneDoc.create({ empty: true });
+    const reg = createOperatorRegistry();
+    const ctx: OperatorContext = {
+      doc,
+      state: createEditorState(),
+      origin: doc.origin,
+      source: 'test',
+      report: () => {},
+    };
+    const run = (id: string, params: Record<string, unknown>) => reg.run(ctx, id, params);
+    expect(run('curve.primitive_nurbs_path_add', { location: [0, 1, 0], rotation: [0, 0, 0.4] }).ok).toBe(
+      true,
+    );
+    const path = ctx.state.activeId!;
+    expect(
+      run('mesh.primitive_cylinder_add', { radius: 0.1, depth: 4, rotation: [0, Math.PI / 2, 0] }).ok,
+    ).toBe(true);
+    const cyl = ctx.state.activeId!;
+    expect(run('object.modifier_add', { type: 'CURVE', params: { object: 'NurbsPath' } }).ok).toBe(true);
+    const shown = new SceneEvaluator(doc).evaluate(1).byId.get(cyl)!;
+    expect(shown.modifierErrors).toEqual([]);
+    const base = doc.getMesh(doc.getObject(cyl)!.data!)!;
+    expect(Array.from(shown.mesh!.positions)).not.toEqual(Array.from(base.positions));
+    const r = run('object.modifier_apply', { object: cyl, modifier: 'Curve' });
+    expect(r.ok, r.error).toBe(true);
+    expect(doc.getObject(cyl)!.modifiers).toEqual([]);
+    // the stored mesh keeps 32-bit floats
+    const applied = doc.getMesh(doc.getObject(cyl)!.data!)!.positions;
+    expect(applied.length).toBe(shown.mesh!.positions.length);
+    expect(Math.max(...Array.from(applied, (v, i) => Math.abs(v - shown.mesh!.positions[i])))).toBeLessThan(
+      1e-6,
+    );
+    // a curve without two distinct points cannot bend it: Apply names the curve object by name
+    expect(run('object.modifier_add', { object: cyl, type: 'CURVE', params: { object: path } }).ok).toBe(
+      true,
+    );
+    doc.updateCurve(doc.getObject(path)!.data!, { splines: [poly([pt([1, 1, 1]), pt([1, 1, 1])])] });
+    const failed = run('object.modifier_apply', { object: cyl, modifier: 'Curve' });
+    expect(failed).toMatchObject({
+      ok: false,
+      code: 'FAILED',
+      error:
+        "Cannot apply modifier: 'Curve': Object 'NurbsPath' is not a curve with at least two distinct points",
+    });
+  });
 });

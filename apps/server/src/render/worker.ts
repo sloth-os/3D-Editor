@@ -105,11 +105,52 @@ function handle(msg: WorkerRequest): WorkerResult {
       return testJob(msg);
     case 'release':
     case 'clear':
+    case 'doc-part':
       throw new Error(`'${msg.type}' has no answer`);
   }
 }
 
+/** A document state on its way in parts (see `doc-part` in protocol.ts), or why it could not be kept. */
+let incoming: {
+  key: string;
+  version: number;
+  bytes: Uint8Array | null;
+  received: number;
+  error?: string;
+} | null = null;
+
+/** Keeps a part of a document state; the request that needs the state comes after its last part. */
+function receivePart(msg: Extract<WorkerRequest, { type: 'doc-part' }>): void {
+  if (!incoming || incoming.key !== msg.key || incoming.version !== msg.version || msg.offset === 0) {
+    incoming = { key: msg.key, version: msg.version, bytes: null, received: 0 };
+    try {
+      incoming.bytes = new Uint8Array(msg.total);
+    } catch (err) {
+      // answered with the request that needs the state (an out-of-memory error)
+      incoming.error = err instanceof Error ? err.message : String(err);
+    }
+  }
+  if (!incoming.bytes) return;
+  incoming.bytes.set(msg.bytes, msg.offset);
+  incoming.received += msg.bytes.byteLength;
+}
+
+/** The request with the state its parts brought (`doc` without `update` after `doc-part` messages). */
+function withParts(msg: WorkerRequest): WorkerRequest {
+  if (!('doc' in msg) || msg.doc.update || !incoming) return msg;
+  const parts = incoming;
+  if (parts.key !== msg.doc.key || parts.version !== msg.doc.version) return msg;
+  incoming = null;
+  if (parts.error) throw new RangeError(`Array buffer allocation failed: ${parts.error}`);
+  if (!parts.bytes || parts.received !== parts.bytes.byteLength) return msg;
+  return { ...msg, doc: { ...msg.doc, update: parts.bytes } } as WorkerRequest;
+}
+
 process.on('message', (msg: WorkerRequest) => {
+  if (msg.type === 'doc-part') {
+    receivePart(msg);
+    return;
+  }
   if (msg.type === 'release') {
     engine.release(msg.job);
     return;
@@ -121,7 +162,7 @@ process.on('message', (msg: WorkerRequest) => {
     return;
   }
   try {
-    post({ type: 'result', id: msg.id, result: handle(msg) });
+    post({ type: 'result', id: msg.id, result: handle(withParts(msg)) });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const kind = errorKind(err);

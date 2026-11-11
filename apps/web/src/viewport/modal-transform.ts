@@ -2,11 +2,11 @@ import * as THREE from 'three';
 import {
   ObjectTransform,
   axisAngle4,
-  evaluatedWorld,
   normalize3,
   scaling4,
   selectedVertexSet,
   selectionPivot,
+  shownWorld,
   transformFrameState,
   transformVertices,
   translation4,
@@ -92,7 +92,9 @@ export class ModalTransform {
           id: o.id,
           mesh,
           verts: selectedVertexSet(mesh, state.meshSelection),
-          world: evaluatedWorld(fs, o.id),
+          // where the scene shows the object (also where it reads a dependency cycle), as the
+          // operator confirming the transform reads it
+          world: shownWorld(fs, o.id),
         };
     } else {
       this.objects = new ObjectTransform(fs, state.selectedIds, state.pivotPoint, mode);

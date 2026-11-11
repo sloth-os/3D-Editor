@@ -8,6 +8,7 @@ import { editorTimeoutMessage } from '../../src/mcp/editor-commands';
 import {
   BROWSER_RASTER_SECONDS,
   FIRST_SHADING_SECONDS,
+  MILLIONS_SELECT_SECONDS,
   NEW_SHADER_SECONDS,
   SERVER_SOLID_SECONDS,
   measured,
@@ -1482,7 +1483,7 @@ describe('tool descriptions', () => {
       'the viewport switching to it, compile nothing, also after the viewport turned its anti-aliasing off',
     );
     expect(editor.description).toContain(
-      `compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${measured(NEW_SHADER_SECONDS)}); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a screenshot of a scene with millions of triangles takes half a second or more in any shading, and the first WIREFRAME screenshot or frame of such a scene several times as long (the editor builds the wires of every mesh); the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and while it draws a frame of a scene with millions of triangles)`,
+      `compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${measured(NEW_SHADER_SECONDS)}); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a screenshot of a scene with millions of triangles takes half a second or more in any shading, and the first WIREFRAME screenshot or frame of such a scene several times as long (the editor builds the wires of every mesh); the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and while it carries out a command: with 4 million triangles in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}; the viewport's frames do not hold them up)`,
     );
     expect(editor.description).toContain(
       'a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the rest and compiles nothing again',
@@ -1803,7 +1804,7 @@ describe('timeouts of the browser editor', () => {
     const select = await call('editor_command', { project: id, command: 'select', params: { objects: [] } });
     expect(select.raw.isError).toBe(true);
     expect(select.text).toMatch(
-      /^editor_command 'select' failed: the editor did not answer within timeout_ms = 10000 ms \(at most 55000\); it may still carry the command out, and its next commands and renders wait until it has\. It was still busy with an earlier request that the server had stopped waiting for \(a RASTER render sent \d+ s ago\)\. 'select' waits while the editor draws its viewport/,
+      /^editor_command 'select' failed: the editor did not answer within timeout_ms = 10000 ms \(at most 55000\); it may still carry the command out, and its next commands and renders wait until it has\. It was still busy with an earlier request that the server had stopped waiting for \(a RASTER render sent \d+ s ago\)\. 'select' waits while the editor's main thread is busy/,
     );
     // once the editor has answered both late, auto still renders on the server for a while: the
     // editor was too slow for its last image, and asking it again would only wait in vain

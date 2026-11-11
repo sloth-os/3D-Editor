@@ -1,7 +1,16 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { BROWSER_UI_OPERATORS, createOperatorRegistry } from '@3d-editor/core';
+import {
+  BROWSER_UI_OPERATORS,
+  SceneDoc,
+  createEditorState,
+  createOperatorRegistry,
+  modifierObjectRefusal,
+  modifierObjectTypes,
+  registerBuiltinModifiers,
+  type OperatorContext,
+} from '@3d-editor/core';
 import {
   EDITOR_COMMANDS,
   MAX_EDITOR_TIMEOUT_MS,
@@ -44,13 +53,23 @@ import {
   EXPORT_OUT_OF_MEMORY_ADVICE,
   OUT_OF_MEMORY_ADVICE,
   SCALE_UP_MIN_MS,
+  SINGLE_THREAD_ANIMATION_ADVICE,
+  SINGLE_THREAD_EXPORT_ADVICE,
+  SINGLE_THREAD_RENDER_ADVICE,
+  SLOW_EDITOR_RETRY_MS,
   browserRenderFailure,
   renderToolError,
   samplesArg,
 } from '../../src/mcp/rendering';
 import { RpcError } from '../../src/sync/room';
 import { renderProcessExitError, sharedProcessError } from '../../src/render/pool';
-import { refusedOperatorMessage } from '../../src/render/memory';
+import {
+  checkMainThreadRender,
+  refusedEvaluationMessage,
+  operatorCheck,
+  refusedOperatorMessage,
+  storedMeshesMessage,
+} from '../../src/render/memory';
 import { outOfMemoryReply } from '../../src/api/projects';
 import {
   browserUiOperator,
@@ -127,9 +146,12 @@ const M = {
   CPU_MAX: '3.9',
   CPU_MEDIAN: '1.4',
   FIRST_NO_MSAA: '7.9–21 s',
-  GET_VIEW_AFTER: '0.2 s',
-  GET_VIEW_DURING: '0.2 s',
-  GET_VIEW_RUNS: 19,
+  GET_VIEW_AFTER: '0.4 s',
+  GET_VIEW_AFTER_MAX: '0.28',
+  GET_VIEW_AGENTS: 'ten',
+  GET_VIEW_DURING: '0.4 s',
+  GET_VIEW_DURING_MAX: '0.30',
+  GET_VIEW_RUNS: 37,
   LOO: "Those of a `select` and a `SOLID` screenshot with 4 million triangles, which include requests sent as soon as the one before had answered, run to 50 % more than their longest time: with 25 %, earlier ranges made from fewer runs missed such runs of later agents (up to 0.735 s against 0.1–0.7 s, and 3.478 s against 0.5–3.4 s). A range made that way from all but one agent's runs held all the runs of the agent left out.",
   MILLIONS_SELECT_MAX: '0.735',
   MILLIONS_SOLID_MAX: '3.478',
@@ -139,6 +161,58 @@ const M = {
   SWITCH: '2.9–7.0 s',
 };
 // measured ranges: end
+
+/**
+ * How long the server held up every request with 4 million triangles (a stored document of 134 MB), in
+ * calm runs of round 11's five TEXTS agents on 2026-11-11, with /healthz probes: the longest wait of a
+ * request in each hold. The fix rounds probed open loop every 10 ms (a hold is the union of the slow
+ * requests' overlapping waits): the first from the process that drove the browser and, in its last two
+ * runs, also from a process of its own (the longer wait of the two; a slow request alone in a hold of
+ * its own, or a hold with far fewer requests than 10 ms apart, was a stall of the first process, not of
+ * the server, and is left out), the second fix round and the second verifier from a process of their
+ * own only (a process that watched the CPUs every 2 s left out the holds next to other processes'
+ * work); the others probed closed loop (waits back to back are separate holds there). A hold at the
+ * minute's read is the read's (also while an editor loaded the project); one while an editor opened
+ * the project at another time is the open's.
+ */
+const HOLDS = {
+  // the minute's read (RoomManager.refreshActive) of a project with editors open: round 11's agent
+  // (an idle editor), its first verifier (idle editors; one drawing SOLID screenshots back to back;
+  // one more editor opened 3 s before the read), the first fix round (idle editors, an editor drawing
+  // screenshots back to back, one more editor opened 3 to 0 s before the read, the only editor opened
+  // 3 to 0 s before it, an idle editor), the second verifier (idle editors, editors stepping through
+  // selects and screenshots, one drawing screenshots back to back, one more editor or the only one
+  // opened 3 to 0 s before the read) and the second fix round (idle and stepping editors)
+  REFRESH_MS: [
+    570, 540, 532, 686, 512, 437, 652, 802, 502, 652, 592, 796, 743, 1140, 794, 1470, 761, 730, 520, 556, 577,
+    616, 548, 533, 782, 1029, 934, 877, 823, 874, 1159, 923, 743, 837, 1104, 771, 997, 1304, 945, 1122, 852,
+    600, 589, 579, 952, 565, 637, 506, 541, 595, 503, 524, 543, 536,
+    // the second verifier (its first run had no CPU watcher yet; vmstat showed the CPUs idle)
+    567, 558, 689, 687, 534, 523, 922, 831, 1249, 526, 894, 831, 575, 590, 599, 548, 531, 470, 565, 538,
+    // the second fix round
+    704, 528, 496, 522, 558, 448, 612, 506, 576, 552,
+  ],
+  // an editor opening the project without a copy of it: the first editor of a project nobody had open
+  // (the read before it opens, RoomManager.readUnused, then the document sent to it), and one more
+  // editor (the document)
+  OPEN_MS: [
+    684, 553, 568, 610, 480, 348, 352, 325, 944, 917, 1071, 867, 353, 422, 380, 394, 539, 438, 364, 406, 459,
+    590, 414, 565, 625, 915, 990, 819, 779, 834, 712, 734, 579, 797, 785, 963,
+    // the second verifier (1306: its first editor, before the CPU watcher; vmstat showed the CPUs idle)
+    1306, 777, 514, 349, 865, 822, 373, 408, 383, 424, 350, 926, 575, 936, 691,
+    // the second fix round
+    889, 543, 410, 962, 851,
+  ],
+  // a get_view sent with no command running, the editor idle, that a hold overlapped: how long after
+  // the hold's end it answered, the longest of each of the agents that probed it with a process of
+  // their own (the first fix round, the second verifier, the second fix round)
+  GET_VIEW_AFTER_HOLD_MS: [12, 7, 14],
+  // the longest such get_view, and the hold it waited for (the second verifier: a refresh)
+  GET_VIEW_HELD: { waitMs: 677, holdMs: 687 },
+  // a get_view that no hold overlapped, the editor idle, open loop every 100 ms: the longest of the
+  // second verifier and of the second fix round
+  GET_VIEW_IDLE_MS: [18, 38],
+};
 
 /** The parts of NEW_SHADER_SECONDS: the range of the plastics and the longest time (the table's). */
 const [NEW_SHADER, PROCEDURAL_MAX] = /^(.+), or up to (.+) for a material with several procedural textures$/
@@ -204,15 +278,82 @@ describe('docs: error codes of refused render operators', () => {
       "`mesh.subdivide failed: not run on the server: it would need about … MB of JavaScript heap for a mesh of about … faces, and the server's process has … MB of its … MB heap free …`";
     expect(`mesh.subdivide failed: ${refusal}`).toContain(quoted.slice(1, -' …`'.length));
     expect(row(mcp, quoted)).toContain('`OUT_OF_MEMORY`');
-    // the project's meshes over what the server keeps for one project: every operator that adds
-    // geometry is refused (render/memory.ts operatorCheck), so lowering its own parameters cannot help
-    expect(source('render/memory.ts')).toContain(
-      'if (e.addedStoredBytes > 0 && req.storedBytes + e.addedStoredBytes > maxProjectMeshBytes(limit))',
+    // a project that already needs more than the server keeps for one: every operator that adds
+    // geometry or objects is refused (render/memory.ts operatorCheck), so lowering its own parameters
+    // cannot help, and one that adds nothing runs (asked of the check itself, with room in the heap)
+    const MB = 1024 * 1024;
+    const check = operatorCheck({
+      heapFree: () => 4096 * MB,
+      collect: () => undefined,
+      heapLimit: () => 2096 * MB,
+    });
+    const full = { storedBytes: 700 * MB, saveBytes: 200 * MB, objects: 15_000 };
+    const adds = { bytes: 1, faces: 6, objects: 1, addedStoredBytes: 11_000, addedSaveBytes: 33_000 };
+    expect(check({ operator: 'mesh.primitive_cube_add', estimate: adds, ...full } as never)).toMatch(
+      /^not run on the server: the project's meshes and objects already take about 700 MB .*, and this operator would add to them\. /,
+    );
+    expect(
+      check({
+        operator: 'object.shade_smooth',
+        estimate: { bytes: 1, faces: 6, addedStoredBytes: 0 },
+        ...full,
+      } as never),
+    ).toBeNull();
+    expect(row(mcp, quoted)).toContain(
+      'When the project already needs more than that (grown in a browser editor or on a server with a ' +
+        'larger heap; meshes the server did not load count too), every operator that adds geometry or ' +
+        'objects is refused until some are deleted (`delete_objects`): ',
+    );
+    // what it needs: its meshes, objects and datablocks (MEM round 11: objects count too) and a save
+    // of it (MEM fix round 2: the server's saves of projects at the ceiling ran it out of memory),
+    // quoted as storedMeshesMessage says it
+    const would = storedMeshesMessage(
+      {
+        operator: 'object.array_place',
+        estimate: { bytes: 1, faces: 6, objects: 8000, addedStoredBytes: 400 * MB, addedSaveBytes: 300 * MB },
+        storedBytes: 100 * MB,
+        saveBytes: 30 * MB,
+        objects: 2000,
+      } as never,
+      2096 * MB,
+    );
+    const dottedWould = would
+      .replace(/\(\d+ times what its objects, datablocks and keyframes take\)/, '(…)')
+      .replace(/\(half of its [^)]*\)/, '(…)')
+      .replace(/[\d,]+ (MB|new objects|objects)/g, '… $1');
+    const kept = ' keeps for one project';
+    expect(row(mcp, quoted)).toContain(
+      `\`… ${dottedWould.slice('not run on the server: '.length, dottedWould.indexOf(kept) + kept.length)} …\``,
     );
     expect(row(mcp, quoted)).toContain(
-      "When the project's meshes already take more than the server keeps for them (`now` is over it; meshes " +
-        'the server did not load count too), every operator that adds geometry is refused until meshes are ' +
-        'deleted (`delete_objects`).',
+      "`… the project's meshes and objects would then take about … MB of JavaScript heap with … new objects " +
+        '(now … MB with … objects), and a save of it about … MB more for a moment (…): … MB in all, more than the ' +
+        "… MB the server's process keeps for one project …`",
+    );
+    expect(row(mcp, quoted)).toContain(
+      'for a save of it, which takes three times what its objects, datablocks and keyframes take for a moment',
+    );
+    expect(would).toContain('(3 times what its objects, datablocks and keyframes take)');
+    // the import's (import_model): the same message after 'Import failed: ', with what to lower
+    const imported = storedMeshesMessage(
+      {
+        operator: 'import_scene.gltf',
+        estimate: {
+          bytes: 1,
+          faces: 6,
+          objects: 8000,
+          addedStoredBytes: 400 * MB,
+          addedSaveBytes: 300 * MB,
+          lower: 'the nodes (objects) of the file',
+        },
+        storedBytes: 100 * MB,
+        saveBytes: 30 * MB,
+        objects: 2000,
+      } as never,
+      2096 * MB,
+    );
+    expect(flat(mcp)).toContain(
+      `"Import failed: ${imported.replace(/[\d,]+ (MB|new objects|objects)/g, '… $1')}" (or what else the file has too much of)`,
     );
     expect(
       row(
@@ -227,10 +368,10 @@ describe('docs: error codes of refused render operators', () => {
     // (renders, exports, import_model's memory check) and a mesh the server could not decode
     expect(tools).toContain("throw new ToolError(`Import failed: ${refused}`, 'OUT_OF_MEMORY');");
     expect(tools).toContain(
-      "return failure(err.message, err.code === 'OUT_OF_MEMORY' ? { code: err.code } : undefined);",
+      "return withProjectNotes( failure(err.message, err.code === 'OUT_OF_MEMORY' ? { code: err.code } : undefined),",
     );
     expect(tools).toContain(
-      'if (isMeshMemoryError(err)) return failure(`${name} failed: ${err.message}`, { code: err.code });',
+      'if (isMeshMemoryError(err)) return withProjectNotes(failure(`${name} failed: ${err.message}`, { code: err.code }), notes);',
     );
     expect(flat(mcp)).toContain(
       'The out-of-memory errors of `render_image`, `render_animation`, `export_scene`, `import_model` and ' +
@@ -504,7 +645,11 @@ describe('docs: browser editors', () => {
   it('say that requests wait for the work the editor is doing, not by when they arrived', () => {
     // a SOLID or WIREFRAME screenshot waits for the viewport's frame in progress; the other commands for
     // the editor's main thread: during a screenshot and while it builds the materials after the
-    // viewport's first switch to MATERIAL or RENDERED (measured with get_view sent every 300 ms)
+    // viewport's first switch to MATERIAL or RENDERED (measured with get_view sent every 300 ms), and
+    // while it carries out a command. Not for the viewport's frames: with 4 million triangles in SOLID
+    // shading a get_view sent every 100 ms after a select or a screenshot answered within 0.09 s while
+    // the next frame took 0.6-3.3 s to be drawn (r11 TEXTS gv-probe runs); a CPU profile of the page
+    // showed the select's own 0.2 s in the statistics overlay's sceneStats (countEdges)
     const doc = flat(mcp);
     expect(doc).toContain(
       'A screenshot waits until the frame the viewport is drawing is done, also a `SOLID` or `WIREFRAME` one',
@@ -513,8 +658,20 @@ describe('docs: browser editors', () => {
       "The other commands draw nothing themselves, but wait while the editor's main thread is busy: after the " +
         "viewport switched to `MATERIAL` or `RENDERED` for the first time (while it builds the scene's " +
         'materials; the rest of that frame holds up only screenshots), for the whole of a screenshot it draws, ' +
-        'and while it draws a frame of a scene with millions of triangles.',
+        'and while it carries out a command: with 4 million triangles in `SOLID` shading a `select` took ' +
+        `${MILLIONS_SELECT_SECONDS} (see the table), as the statistics overlay counts the edges of every mesh ` +
+        'again (after a screenshot too).',
     );
+    // "tenths of a second" understated the measured 0.1-1.2 s (editor-costs.ts MILLIONS_SELECT_SECONDS)
+    for (const text of agentTexts()) expect(text).not.toContain('tenths of a second');
+    expect(joined(source('mcp/tools.ts'))).toContain(
+      'while it carries out a command: with 4 million triangles in SOLID shading a select took ' +
+        `\${MILLIONS_SELECT_SECONDS}; the viewport's frames do not hold them up)`,
+    );
+    for (const text of [doc, flat(guide), joined(source('mcp/tools.ts'))])
+      expect(text).not.toMatch(
+        /while it draws a frame of a scene with millions|during each frame of a scene/,
+      );
     expect(cell(row(mcp, 'Other commands, after the viewport switched to `MATERIAL` or `RENDERED`'), 2)).toBe(
       M.SWITCH,
     );
@@ -674,18 +831,116 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
   it('say exactly how long a get_view waited with 4 million triangles: during and after a command', () => {
     // round 9 said that a get_view sent during or after a select waited seconds for the viewport's
     // frames: on round 9's code one more update of the statistics overlay, which counted the scene's
-    // edges; on this round's code one sent during a select or a screenshot answered right after it,
-    // and one sent after it in milliseconds (this round's calm runs of HEAVYP/HEAVYQ)
+    // edges. Round 10 said 0.2 s from the probes' first 1.5 s after a command; probes sent for 5 s
+    // after it waited longer with no command running: the server's holds (below), which the docs
+    // give apart. The editor's own longest: 0.30 s (during) and 0.28 s (after) right after the first
+    // select since it had opened the project (a round-10 verifier's T2X run); 37 calm runs of ten
+    // agents, pooled (round 11's first verifier: 75 and 136 ms in four runs; its second verifier: 263
+    // and 245 ms, and its second fix round 213 and 181 ms, in two runs each). Round 11's first fix
+    // attached "unless the server held it up" only to the editor that was not busy, so the 0.4 s read
+    // as a bound of every get_view, also one the server held up (0.677 s)
     const doc = flat(mcp);
     expect(doc).toContain(
-      `With 4 million triangles, in ${M.GET_VIEW_RUNS} calm runs of this round, a \`get_view\` sent while the ` +
-        `editor carried out a \`select\` or drew a screenshot answered at most ${M.GET_VIEW_DURING} after it, ` +
-        `and one sent after it had answered took at most ${M.GET_VIEW_AFTER} (the longest times measured, ` +
-        `widened by ${MARGIN_PERCENT} % and rounded up to 0.1 s); an editor that was not busy answered a ` +
-        '`get_view` in milliseconds.',
+      `Leaving out the requests that the server held up (below), with 4 million triangles in \`SOLID\` shading, ` +
+        `in ${M.GET_VIEW_RUNS} calm runs of ${M.GET_VIEW_AGENTS} agents (rounds 10 and 11), a \`get_view\` sent ` +
+        'while the editor carried out a `select` or drew a screenshot answered at most ' +
+        `${M.GET_VIEW_DURING} after it, and one sent after it had answered, also while the viewport still drew ` +
+        `its next frame, took at most ${M.GET_VIEW_AFTER} (the longest times measured, ${M.GET_VIEW_DURING_MAX} ` +
+        `and ${M.GET_VIEW_AFTER_MAX} s, both right after the first \`select\` since the editor had opened the ` +
+        `project, widened by ${MARGIN_PERCENT} % and rounded up to 0.1 s); an editor that was not busy answered a ` +
+        `\`get_view\` within 0.1 s (${(Math.max(...HOLDS.GET_VIEW_IDLE_MS) / 1000).toFixed(3)} s measured).`,
     );
+    expect(
+      Math.ceil((Math.max(...HOLDS.GET_VIEW_IDLE_MS) / 1000) * (1 + Number(MARGIN_PERCENT) / 100) * 10) / 10,
+    ).toBe(0.1);
+    expect(doc).not.toContain('one sent after it had answered took at most 0.2 s');
+    expect(doc).not.toContain('in milliseconds, unless the server held it up');
     expect(doc).not.toMatch(
       /0\.1 s after a `select`|waited until it was done and the viewport had drawn|waited for the frames the viewport drew after the selection changed/,
+    );
+  });
+
+  /*
+   * The server holds up every request while it reads back from storage a project that an editor has
+   * open (once a minute) and while it gives an editor that opens a project the whole document. Round 11
+   * gave 0.3-0.8 s from idle editors only (0.44-0.57 s measured); its first verifier measured 1.14 s
+   * with the editor drawing screenshots back to back and 1.47 s with an editor loading the project at
+   * the minute's read, a get_view held 0.596 s, and the holds of an editor opening the project, which
+   * the docs did not give. Its second verifier measured a get_view held 0.677 s with no command
+   * running, more than the 0.60 s the first fix gave as the longest: such a get_view waits for the rest
+   * of the hold, and answered at most 0.014 s after it had ended; and an editor's first open of 1.306 s.
+   */
+  it("say how long the server holds up every request: the minute's read and an editor opening the project", () => {
+    const doc = flat(mcp);
+    const range = (ms: readonly number[]) => {
+      const lo = Math.min(...ms) / 1000;
+      const hi = Math.max(...ms) / 1000;
+      const pct = Number(MARGIN_PERCENT) / 100;
+      const down = Math.floor(Number((lo * (1 - pct) * 10).toFixed(6))) / 10;
+      const up = Math.ceil(Number((hi * (1 + pct) * 10).toFixed(6))) / 10;
+      return { widened: `${down}–${up} s`, measured: `${lo.toFixed(2)}–${hi.toFixed(2)} s` };
+    };
+    const refresh = range(HOLDS.REFRESH_MS);
+    const open = range(HOLDS.OPEN_MS);
+    // the longest measured (seconds, as measured), and the bound widened and rounded up to 0.1 s
+    const afterMax = Math.max(...HOLDS.GET_VIEW_AFTER_HOLD_MS) / 1000;
+    const afterHold = {
+      widened: `${Math.ceil(Number((afterMax * (1 + Number(MARGIN_PERCENT) / 100) * 10).toFixed(6))) / 10} s`,
+      measured: `${afterMax.toFixed(3)} s`,
+    };
+    expect(doc).toContain(
+      'The server itself holds up every request, `get_view` too, while it reads a project that a browser ' +
+        'editor has open back from storage and merges what it read into the open one, which it does once a ' +
+        'minute (to take in what other writers stored), and when a browser editor opens the project, while it ' +
+        'reads it back from storage (when no editor or agent had it open) and sends the editor what its own copy ' +
+        'lacks (all of it, for an editor that has none). With 4 million triangles (a stored document of 134 MB), ' +
+        "in the calm runs of this round's five TEXTS agents, the minute's read held them " +
+        `${refresh.widened} each time (${refresh.measured} measured, widened like the ranges above; the longest ` +
+        'while an editor drew screenshots back to back or loaded the project), and an editor that opened the ' +
+        `project without a copy of it ${open.widened} (${open.measured} measured; the longest when no editor or ` +
+        'agent had it open). A request sent during a hold waits for the rest of it: a `get_view` sent with no ' +
+        `command running, the editor idle, answered at most ${afterHold.widened} after the hold had ended ` +
+        `(${afterHold.measured} measured, widened like the ranges above), so it waited about as long as the ` +
+        `rest of the hold (the longest, ${(HOLDS.GET_VIEW_HELD.waitMs / 1000).toFixed(2)} s, in a hold of ` +
+        `${(HOLDS.GET_VIEW_HELD.holdMs / 1000).toFixed(2)} s).`,
+    );
+    // the longest held get_view waited for the rest of its hold, and no longer than it
+    expect(HOLDS.GET_VIEW_HELD.waitMs).toBeLessThanOrEqual(
+      HOLDS.GET_VIEW_HELD.holdMs + Math.max(...HOLDS.GET_VIEW_AFTER_HOLD_MS),
+    );
+    expect(HOLDS.REFRESH_MS).toContain(HOLDS.GET_VIEW_HELD.holdMs);
+    expect(doc).not.toMatch(/A request sent as a hold starts waits for all of it|waited up to 0\.60 s/);
+    expect(flat(guide)).toContain(
+      'Once a minute the server holds up every request while it merges what storage holds of a project ' +
+        `that an editor has open (${refresh.widened} with 4 million triangles), and while it sends a project ` +
+        `to an editor that has no copy of it yet (${open.widened}); a request sent during such a hold waits for ` +
+        'the rest of it.',
+    );
+    expect(flat(guide)).toContain(
+      'with 4 million triangles in `SOLID` shading a `select` took ' +
+        `${MILLIONS_SELECT_SECONDS}; a \`get_view\` sent then answered at most ${M.GET_VIEW_AFTER} after it, not ` +
+        "waiting for the viewport's frames, when the server did not hold it up)",
+    );
+    for (const text of [doc, flat(guide)]) expect(text).not.toMatch(/0\.3–0\.8 s|up to 0\.57 s/);
+    // the minute's read: every 60 s, of rooms with connected editors (and rooms whose write to WebDAV
+    // another writer may have replaced); a room nobody uses (no editor, no agent, no unsaved change)
+    // is read back before it opens, unless it was read in the last 2 s; an editor that connects gets
+    // the server's state vector, and the whole document as the answer to its own (y-protocols sync)
+    const rooms = source('sync/room-manager.ts');
+    expect(rooms).toContain('const refreshMs = opts.refreshIntervalMs ?? 60_000;');
+    expect(rooms).toContain('if (room.conns.size > 0 || room.needsReadBack) await room.refresh();');
+    expect(rooms).toContain('return !room.isDirty && room.conns.size === 0 && room.holders.size === 0;');
+    expect(rooms).toContain('const UNUSED_ROOM_READ_MS = 2000;');
+    expect(rooms).toContain('if (live) await this.readUnused(live);');
+    const room = source('sync/room.ts');
+    expect(room).toContain('encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep1(enc, this.doc)),');
+    expect(room).toContain('syncProtocol.readSyncMessage(decoder, enc, this.doc, conn);');
+    // a browser editor keeps a copy of the project in IndexedDB and asks for what it lacks
+    expect(web('project/session.ts')).toContain(
+      's.idb = new IndexeddbPersistence(projectDbName(id), s.doc.ydoc);',
+    );
+    expect(web('sync/provider.ts')).toContain(
+      'this.send(encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep1(enc, this.doc)));',
     );
   });
 });
@@ -707,9 +962,11 @@ describe('docs: measured times', () => {
         'counted the edges of every mesh each time it was updated, also after every slow frame, which took ' +
         "seconds with 4 million triangles and held these steps up by seconds; this round's code counts them in a " +
         'fraction of that time. A `SOLID` screenshot there includes screenshots sent as soon as a `select` had ' +
-        'answered, and a `select` selects sent as soon as a screenshot had answered: they waited for the frame ' +
-        'the viewport drew then.',
+        'answered, which waited for the frame the viewport drew then (a screenshot waits for the frames in ' +
+        'progress), and a `select` selects sent as soon as a screenshot had answered.',
     );
+    // commands other than screenshots do not wait for the viewport's frames (editor-commands.ts)
+    expect(doc).not.toContain('answered: they waited for the frame the viewport drew then');
     // the select and the SOLID screenshot with 4 million triangles: ranges made with MARGIN_PERCENT from
     // fewer runs missed a later agent's runs of them (round 10's third verifier: 0.731 s against 0.1–0.7 s,
     // 3.478 s against 0.5–3.4 s), so their upper ends run MILLIONS_MARGIN_PERCENT above the longest time
@@ -1118,8 +1375,18 @@ describe('docs: server renders', () => {
 });
 
 describe('docs: browser path traces and the Render window', () => {
-  it('say that a path trace that does not fit into the tab is not started, and what the error says', () => {
-    // apps/web: F12, Render Animation and the editor's render_image refuse a path trace that would not
+  /*
+   * VIEW's round 11 refuses a path trace in two ways (render/memory.ts planRenderThreads): over the
+   * memory a render may use in the tab ("it needs about … GB of memory with one render thread, more
+   * than …"; lower the resolution or the triangles) and over the tab's JavaScript heap ("its render
+   * thread needs about … GB of JavaScript heap, more than the … GB the tab has left for it: …"; lower
+   * the triangles), with "or render with the RASTER engine" only when a RASTER render would fit; and
+   * a WebGL render whose geometry would not fit the page's heap ("The RASTER render was not started:
+   * …", rasterRefusal, thrown by the engine for F12, Render Animation and render_image). The docs
+   * quoted the first form only, with "(resolution, triangles)", and said only path traces may not start.
+   */
+  it('say that a render that does not fit into the tab is not started, and what the error says', () => {
+    // apps/web: F12, Render Animation and the editor's render_image refuse a render that would not
     // fit into the tab's memory; the server joins the editor's reason with its advice
     const ui = joined(web('editor/ui-operators.ts'));
     expect(ui).toContain(
@@ -1129,37 +1396,94 @@ describe('docs: browser path traces and the Render window', () => {
     const caveat = browserUiOperator('render.render')!;
     expect(caveat).toContain(
       "with the render engine PATHTRACER path traced on that computer's render workers, as many as its tab's " +
-        'memory allows, and not started when it would not fit into that memory: the window says why',
+        "memory allows; a render that would not fit into the tab's memory, path traced or with WebGL, is not " +
+        'started: the window says why',
     );
     expect(row(mcp, '`render.render`')).toContain(
       "(with `PATHTRACER` path traced on that computer's render workers, as many as the tab's memory allows; a " +
-        'path trace that would not fit into it is not started, and the window says why)',
+        "render that would not fit into the tab's memory, path traced or with WebGL, is not started, and the " +
+        'window says why)',
     );
-    expect(joined(source('mcp/tools.ts'))).toContain(
+    const tools = joined(source('mcp/tools.ts'));
+    expect(tools).toContain(
       "PATHTRACER on the editor's render workers, as many as the tab's memory allows (samples, max_bounces, " +
         'denoise, time_limit, seed; waits time_limit + ',
     );
-    // the editor's refusal and the server's error (one sentence end, no double period)
-    const refusal = 'Path tracing was not started: it needs about 4.3 GB of memory with one render thread.';
+    expect(tools).toContain(
+      "an editor does not start a RASTER image whose geometry at the render settings would not fit into its tab's " +
+        'JavaScript heap (renderer auto then renders on the server, `note` says why; renderer browser fails ' +
+        'with why and what to lower)',
+    );
+    // the editor's refusals (apps/web render/memory.ts) and how the server passes them on
     const memory = web('render/memory.ts');
     expect(memory).toContain('`Path tracing was not started: ${reason} (about ${tris} triangles, `');
     expect(memory).toContain(
-      '`it needs about ${gb(m.total)} GB of memory with one render thread, more than ${room}`',
+      'const needs1 = `it needs about ${f.need} GB of memory with one render thread`;',
     );
-    const failure = browserRenderFailure(new RpcError(refusal, 'REMOTE'), {
-      renderer: 'browser',
-      pathTrace: true,
-      timeoutMs: 60_000,
-      timeLimit: 30,
-    });
-    expect(failure.reason).toBe(
-      'browser render failed: Path tracing was not started: it needs about 4.3 GB of memory with one render thread',
+    expect(memory).toContain('? `${needs1}, more than the ${f.total} GB ${budget}`');
+    expect(memory).toContain("} else reason = heapReason('its render thread', m.heap, mem);");
+    expect(memory).toContain(
+      'return `${subject} needs about ${f.need} GB of JavaScript heap, ${left}: ${share}${use}`;',
     );
-    expect(`${failure.reason}. ${failure.advice}`).not.toContain('..');
-    for (const doc of [mcp, guide])
-      expect(
-        row(doc, '`browser render failed: Path tracing was not started: it needs about … GB of memory'),
-      ).toContain('`renderer: "software"`');
+    expect(memory).toContain(': `more than the ${f.room} GB the tab has left for it`;');
+    expect(memory).toContain(
+      'const lower = overBudget ? `the resolution or ${LOWER_TRIANGLES}` : LOWER_TRIANGLES;',
+    );
+    expect(memory).toContain("(needs.rasterFits ? ', or render with the RASTER engine.' : '.'),");
+    expect(memory).toContain("'The RASTER render was not started: ' +");
+    expect(memory).toContain(
+      "heapReason('the geometry it evaluates at the render settings', needs.heap, mem) +",
+    );
+    for (const refusal of [
+      'Path tracing was not started: it needs about 4.3 GB of memory with one render thread.',
+      'The RASTER render was not started: the geometry it evaluates at the render settings needs about 0.48 GB ' +
+        'of JavaScript heap.',
+    ]) {
+      const failure = browserRenderFailure(new RpcError(refusal, 'REMOTE'), {
+        renderer: 'browser',
+        pathTrace: refusal.startsWith('Path'),
+        timeoutMs: 60_000,
+        timeLimit: 30,
+      });
+      // one sentence end, no double period
+      expect(failure.reason).toBe(`browser render failed: ${refusal.slice(0, -1)}`);
+      expect(failure.advice).toBe("Use renderer 'software' to render on the server.");
+      expect(`${failure.reason}. ${failure.advice}`).not.toContain('..');
+    }
+    // the rows of docs/mcp.md: the three refusals, what each says to lower, and the advice
+    const budgetRow = row(
+      mcp,
+      '`browser render failed: Path tracing was not started: it needs about … GB of memory with one render thread, more than …`',
+    );
+    expect(budgetRow).toContain('the message says what to lower (the resolution or the triangles)');
+    const heapRow = row(
+      mcp,
+      '`browser render failed: Path tracing was not started: its render thread needs about … GB of JavaScript heap, more than the … GB the tab has left for it: …`',
+    );
+    expect(heapRow).toContain('the message says what to lower (the triangles)');
+    for (const r of [budgetRow, heapRow])
+      expect(r).toContain(
+        'adds "or render with the RASTER engine" when a RASTER render of the scene would fit, and the advice to ' +
+          'render on the server (`renderer: "software"`)',
+      );
+    const rasterRow = row(
+      mcp,
+      '`browser render failed: The RASTER render was not started: the geometry it evaluates at the render settings needs about … GB of JavaScript heap, …`',
+    );
+    expect(rasterRow).toContain(
+      'the message says what to lower (the triangles) and the advice to render on the server (`renderer: "software"`). ' +
+        'With `renderer: "auto"` the server renders the image, and `note` gives this reason',
+    );
+    expect(flat(mcp)).not.toContain('the message says what to lower (resolution, triangles)');
+    expect(
+      row(
+        guide,
+        '`browser render failed: Path tracing was not started: …`, `browser render failed: The RASTER render was not started: …`',
+      ),
+    ).toContain(
+      "lower what the message names (the triangles; for a path trace that does not fit the tab's memory also the " +
+        'resolution), use `RASTER` where the message suggests it, or render on the server (`renderer: "software"`)',
+    );
   });
 });
 
@@ -1237,28 +1561,62 @@ describe('docs: keys of animated channels', () => {
     expect(flat(mcp)).toContain(
       'Blender shares one action between linked duplicates; here each linked copy gets its own keyframes.',
     );
+    // a linked duplicate shares whatever data the object has (core object.duplicate keeps `data` for
+    // every type), not only a mesh
     expect(cell(row(mcp, '`duplicate_object` |'), 3)).toBe(
-      '`linked: true` shares the mesh data and its animation (Alt+D); a linked copy, too, gets its own copy ' +
-        "of the object's keyframes and drivers",
+      '`linked: true` shares the object data (a mesh, curve, text, armature, light or camera) and its ' +
+        "animation (Alt+D); a linked copy, too, gets its own copy of the object's keyframes and drivers",
     );
+    expect(joined(source('mcp/tools.ts'))).toContain(
+      'Duplicate an object (Shift+D; linked=true shares the object data, a mesh, curve, text, armature, ' +
+        'light or camera, like Alt+D)',
+    );
+    expect(joined(source('mcp/tools.ts'))).not.toContain('linked=true shares the mesh data');
   });
 });
 
 describe('docs: projects in storage that others share', () => {
   it("say that delete_project's bound is for an id, and what looking up a name adds", () => {
     // a verifier measured 6 rounds of requests (3 stated) deleting by a name that could be an id, 7 for a
-    // loaded project (5 s plus one request stated): AgentSession.resolveProjectId tries such a name as an
-    // id first (RoomManager.exists: project.json, then document.ybin) and lists storage for a project
-    // this server has not loaded
+    // loaded project (5 s plus one request stated): AgentSession.findProject tries such a name as an
+    // id first (RoomManager.exists: project.json, then document.ybin), then lists storage to compare
+    // the name with every project, also one this server has loaded (round 11: the name rule over
+    // loaded and stored projects together), within one 5 s wait when a loaded project has the name
     const agentSrc = source('mcp/agent.ts');
-    expect(agentSrc).toContain('if (isValidProjectId(r) && (await rooms.exists(r))) return r;');
-    expect(agentSrc).toContain('await listProjects(rooms)');
+    expect(agentSrc).toContain('if (isValidProjectId(r) && (await rooms.exists(r))) return { id: r };');
+    expect(agentSrc).toContain('await listForName(rooms, late ? 0 : deadline)');
+    // the listing reads the project.json only of stored projects that are new or changed, or read more
+    // than a minute ago (round 11 STORAGE fix1: RoomManager.listNames; round 11 said "then every
+    // project's project.json at once")
+    expect(source('sync/room-manager.ts')).toContain('listNames');
     expect(flat(mcp)).toContain(
       "five when it has no `project.json`), when you pass the project's id. A name is looked up first: one " +
         'that could be an id (letters, digits, `-` and `_`) is tried as an id first (up to two more requests ' +
-        'one after another; at most 5 s when this server has loaded a project of that name), and a project ' +
-        "this server has not loaded is found by listing storage (one request, then every project's " +
-        '`project.json` at once) instead of the first read of its `project.json`.',
+        'one after another), then storage is listed to compare the name with every project (one request, ' +
+        'then the `project.json` of each stored project that is new or changed since this server read it, or ' +
+        'that it read more than a minute ago), at most 5 s in all when this server has loaded a project of ' +
+        'that name; a project this server has not loaded is found by that listing instead of the first read ' +
+        'of its `project.json`.',
+    );
+    for (const text of [flat(mcp), joined(source('mcp/tools.ts'))])
+      expect(text).not.toMatch(/then every project's `?project\.json`? at once/);
+    // also when storage listed slowly the last time: the name was compared with that listing (agent.ts
+    // findProject, note 'slow')
+    expect(source('mcp/agent.ts')).toContain(
+      "note: foundWithout(r, match.id, 'slow', waitMs, earlier.ageMs)",
+    );
+    expect(flat(mcp)).toContain(
+      'or took longer than 5 s to list its projects the last time (the name is then compared with that ' +
+        'listing), the call deletes nothing',
+    );
+    // a deletion by a name that was not compared with every project deletes nothing (tools.ts
+    // delete_project asks findProject for its note): another project in storage may have that name
+    expect(source('mcp/tools.ts')).toContain(
+      'if (note) throw new ToolError(`delete_project deleted nothing: ${note}`);',
+    );
+    expect(flat(mcp)).toContain(
+      "the call deletes nothing and fails with \"delete_project deleted nothing: Project '<name>' was found " +
+        'by name, but …: … may have this name too. Pass the id <id> to name this project without a lookup."',
     );
   });
 
@@ -1268,8 +1626,30 @@ describe('docs: projects in storage that others share', () => {
     expect(doc).toContain(`"${LIST_FAILED_NOTE}"`);
     expect(doc).toContain(`"${LIST_PARTIAL_NOTE}"`);
     expect(doc).toContain(
-      'Names of the projects this server has loaded are matched before storage is listed, so they find ' +
-        'those projects while storage fails or does not answer',
+      'When listing storage fails or does not answer in that time, a name that a project this server has ' +
+        'loaded has finds that project, compared with the loaded projects only',
+    );
+    // and the result of such a call says so (tools.ts withProjectNotes, agent.ts collectProjectNotes)
+    expect(doc).toContain(
+      "says so in its result: `project_note` (\"Project '<name>' was found by name, but storage did not " +
+        'answer within 5 s, so only the projects this server has loaded were compared: a project that is ' +
+        'only in storage may have this name too. Pass the id <id> to name this project without a lookup.")',
+    );
+    // in the result's JSON, also next to an image or a file (one text, which scripts/mcp.mjs parses;
+    // round 11's first fix gave it a text of its own), and in failures (it left them out)
+    expect(doc).toContain(
+      "a field of the result's JSON (also of the JSON that comes with an image or a file; a screenshot, " +
+        'which has none, gets a text of its own after the image) and of the JSON after the message of a ' +
+        'call that failed (a JSON of its own after a message that has none)',
+    );
+    expect(doc).toContain(
+      'A call that found its project by a name compared with fewer projects than all adds `project_note` ' +
+        '(see [Projects](#projects)) to the JSON after its message, or as JSON of its own after a plain message.',
+    );
+    expect(doc).not.toContain('a field of the result object, or a text of its own after an image or a file');
+    const tools = source('mcp/tools.ts');
+    expect(tools).toContain(
+      'return withProjectNotes(failure(`${name} failed: ${errorMessage(err)}`), notes);',
     );
     expect(doc).toContain(
       'Editors and agents that have the project open on another server sharing the storage stay connected ' +
@@ -1419,7 +1799,9 @@ describe('docs: wrapping', () => {
       .filter(([line, next]) => {
         // a code span is one word with what touches it, also an opening parenthesis: "(`{…}`,"
         const word = next.trim().match(/^(\S*?`[^`]*`\S*|\S+)/)![0];
-        return line.length < 60 && line.length + 1 + word.length <= 100;
+        // a line cut 20 or more columns short (round 11 left "… ends its advice with "… or render" at 61
+        // columns and four more of 65-76 columns, which the old limit of 60 let through)
+        return line.length < 80 && line.length + 1 + word.length <= 100;
       })
       .map(([line]) => line);
   // a line longer than 100 columns holds one word that cannot be broken (a long code span)
@@ -1522,5 +1904,425 @@ describe('docs: browser UI operators', () => {
     const quoted = flat(mcp).match(/`wm\.save` gets "(Did you mean: [^"]*) …"/)?.[1];
     expect(quoted).toBeDefined();
     expect(message.startsWith(quoted!)).toBe(true);
+  });
+});
+
+describe('docs: single-thread renders', () => {
+  /*
+   * With RENDER_WORKERS=0 the refusals of renders and exports gave the advice of a render process,
+   * which evaluates meshes hidden from renders too, and the docs quoted it; the check of the server's
+   * own process counts the meshes shown in renders only (render/memory.ts estimateRenderMemory).
+   */
+  it("quote the refusals of the server's own process with the advice of that mode", () => {
+    const doc = flat(mcp);
+    const MB = 1024 * 1024;
+    // an empty scene with no free heap: refused, with numbers the docs leave out
+    const scene = SceneDoc.create({ name: 'Single thread', empty: true });
+    const refused = (what: 'render' | 'export') => {
+      try {
+        checkMainThreadRender(
+          scene,
+          () => 0,
+          () => undefined,
+          what,
+          () => 1024 * MB,
+        );
+      } catch (err) {
+        return err as Error;
+      }
+      throw new Error('not refused');
+    };
+    // the messages with their numbers as the docs leave them out
+    const dotted = (m: string) =>
+      m
+        .replace(/about \d+ MB/, 'about … MB')
+        .replace(/about [\d,]+ triangles/, 'about … triangles')
+        .replace(/has \d+ MB of its \d+ MB/, 'has … MB of its … MB');
+    const render = dotted(renderToolError(refused('render')).message);
+    expect(render).toBe(
+      "Rendering failed: out of memory: this render was not started: it needs about … MB of JavaScript heap (about … triangles), and renders run in the server's own process (its render processes are off: RENDER_WORKERS=0, or they could not start), which has … MB of its … MB heap free; running out of it would stop the server. " +
+        SINGLE_THREAD_RENDER_ADVICE,
+    );
+    expect(doc).toContain(`with \`code\` \`OUT_OF_MEMORY\`: "${render}"`);
+    const animation = renderToolError(refused('render'), 'Rendering the animation').message;
+    const tail =
+      "or render the frames one by one with render_image {frame, renderer: 'browser'} in a browser editor that has the project open.";
+    expect(animation.endsWith(tail)).toBe(true);
+    expect(doc).toContain(`\`render_animation\` ends its advice with "… ${tail}"`);
+    const exported = renderToolError(refused('export'), 'Export').message;
+    expect(exported.endsWith(`running out of it would stop the server. ${SINGLE_THREAD_EXPORT_ADVICE}`)).toBe(
+      true,
+    );
+    expect(doc).toContain(
+      'An export says "Export failed: out of memory: this export was not started: … and exports run in the ' +
+        "server's own process (…), which has … MB of its … MB heap free; running out of it would stop the " +
+        `server. ${SINGLE_THREAD_EXPORT_ADVICE}"`,
+    );
+    expect(SINGLE_THREAD_ANIMATION_ADVICE.endsWith(tail)).toBe(true);
+    // what the check counts, as measured (a 748 MB heap; rendering.test.ts gives the estimate)
+    expect(doc).toContain(
+      'Unlike a render process, this check leaves meshes hidden from renders out (the render still ' +
+        "evaluates them, and the server's guard skips a modifier of theirs that would not fit into its heap), " +
+        'so hiding the heavy mesh lets the render start: with a 748 MB heap (`--max-old-space-size=700`), a ' +
+        'grid of 100×100 quads with a Subdivision Surface of render level 4 was refused ("it needs about 1716 ' +
+        'MB of JavaScript heap (about 5,120,012 triangles) … which has 673 MB of its 748 MB heap free …"), and ' +
+        'once it was hidden from renders `render_image`, `render_animation` and `export_scene` worked.',
+    );
+    // an export that names the hidden mesh writes what the guard let it evaluate, and says nothing
+    // (round 11's TEXTS agent and its verifier, live: the binary STL of objects ['G'] had 1,000,084
+    // bytes, 84 + 50 per triangle: the 20,000 triangles of the grid; warnings [])
+    expect((1_000_084 - 84) / 50).toBe(2 * 100 * 100);
+    expect(doc).toContain(
+      "An export that names such a hidden mesh in `objects` writes it as the server's guard let it " +
+        'evaluate, and `warnings` does not say what is missing: with `objects: ["G"]` the STL file held the ' +
+        '20,000 triangles of the grid without its Subdivision Surface.',
+    );
+    // the error tables
+    expect(
+      row(
+        mcp,
+        '`Rendering failed: out of memory: the render process ran out of its 2096 MB JavaScript heap; the server keeps running …`',
+      ),
+    ).toContain(
+      "Without render processes (`RENDER_WORKERS=0`) one that would not fit into the server's heap is not " +
+        'started (`Rendering failed: out of memory: this render was not started: …`); that check counts the ' +
+        'meshes shown in renders only, so hiding a mesh from renders (`hide_render`) helps there.',
+    );
+    const guideRow = row(
+      guide,
+      '`Rendering failed: out of memory: the render process ran out of its 2096 MB JavaScript heap; …`',
+    );
+    expect(guideRow).toContain(
+      '(hiding meshes from renders helps only without render processes: `… was not started: …`)',
+    );
+    expect(guideRow).not.toContain('hiding meshes from renders does not help');
+  });
+
+  /*
+   * The descriptions of render_image, render_animation and export_scene said only what a render
+   * process does (it evaluates every mesh, also those hidden from renders): without render processes
+   * the server's own process renders and exports, refuses one it has no memory for with its own
+   * message, and its check leaves meshes hidden from renders out.
+   */
+  it('say in the descriptions of the render and export tools what that mode refuses and what helps there', () => {
+    const tools = joined(source('mcp/tools.ts'));
+    const scene = SceneDoc.create({ name: 'Single thread', empty: true });
+    const refused = (what: 'render' | 'export') => {
+      try {
+        checkMainThreadRender(
+          scene,
+          () => 0,
+          () => undefined,
+          what,
+          () => 1024 * 1024 * 1024,
+        );
+      } catch (err) {
+        return err as Error;
+      }
+      throw new Error('not refused');
+    };
+    const start = (m: string) => m.slice(0, m.indexOf(' was not started: ') + ' was not started: '.length);
+    for (const [message, sentence] of [
+      [
+        renderToolError(refused('render')).message,
+        'Without render processes (RENDER_WORKERS=0, or they could not start) the server renders in its own process, and a render it does not have the memory for is not started (',
+      ],
+      [
+        renderToolError(refused('render'), 'Rendering the animation').message,
+        "Without render processes (RENDER_WORKERS=0, or they could not start) the frames render in the server's own process, and an animation it does not have the memory for is not started (",
+      ],
+      [
+        renderToolError(refused('export'), 'Export').message,
+        "Without render processes (RENDER_WORKERS=0, or they could not start) the export runs in the server's own process, and one it does not have the memory for is not started (",
+      ],
+    ]) {
+      expect(tools).toContain(`${sentence}'${start(message)}…'`);
+    }
+    expect(tools).toContain(
+      'that check counts only the meshes shown in renders, so hiding a heavy mesh from renders (hide_render) lets the render start.',
+    );
+    expect(tools).toContain(
+      'that check counts only the meshes shown in renders, so hiding a heavy mesh from renders (hide_render; an export without objects leaves it out of the file) lets the export start.',
+    );
+  });
+});
+
+describe('docs: agent guide (round 11)', () => {
+  it('say that a listing that read some stored projects lists them', () => {
+    // LIST_FAILED_NOTE (listing failed: loaded projects only) and LIST_PARTIAL_NOTE (some project.json
+    // reads failed: only those missing), as list_projects says them
+    expect(LIST_FAILED_NOTE).toContain('so only the projects this server has loaded are listed');
+    expect(LIST_PARTIAL_NOTE).toContain(
+      'so those projects are missing until a later list_projects reads them; the other projects in storage ' +
+        'and the projects this server has loaded are listed',
+    );
+    const doc = flat(guide);
+    expect(doc).toContain(
+      'When `list_projects` has `storage_listing_failed: true`, some projects in storage are missing from it, ' +
+        'and its `note` says which: when listing storage failed or did not answer within 30 s, it lists only ' +
+        'the projects loaded on the server; when reading the `project.json` of some stored projects failed, ' +
+        'only those are missing.',
+    );
+    expect(doc).not.toContain(
+      '`storage_listing_failed: true` (storage failed or did not answer within 30 s), it lists only the ' +
+        'projects loaded on the server.',
+    );
+  });
+
+  it("say which images renderer 'auto' renders on the server after a slow or long one, scaled to their pixels", () => {
+    const auto = AUTO_BROWSER_RASTER_TIMEOUT_MS / 1000;
+    const minutes = SLOW_EDITOR_RETRY_MS / 60_000;
+    expect(minutes).toBe(2);
+    const doc = flat(guide);
+    expect(doc).toContain(
+      `After an editor needed longer than \`auto\` waits (${auto} s) for a raster image, \`auto\` renders on ` +
+        `the server without asking it for ${minutes} minutes after that image (so it stays fast), except a ` +
+        `smaller image whose time, that one's scaled to its pixels, comes to at most ${auto} s; for ` +
+        `${minutes} minutes after an image that took ${SCALE_UP_MIN_MS / 1000} s or more, a larger image whose ` +
+        `time scaled that way comes to more than ${auto} s goes to the server too (\`SOLID\` images and the ` +
+        'others are judged apart). `renderer: "browser"` still uses the editor, and once it has drawn an image ' +
+        `within ${auto} s, \`auto\` asks it again (for a larger image, by the rule above).`,
+    );
+    expect(doc).not.toContain(
+      '`auto` renders on the server for 2 minutes without asking it (so it stays fast);',
+    );
+  });
+});
+
+describe("docs: other areas' messages (round 11)", () => {
+  const MB = 1024 * 1024;
+
+  /*
+   * MEM: an import that would not fit is refused with the editor_command call that runs it in a
+   * browser editor; one that would make the project hold more than the server keeps for one project
+   * says what to lower, and a browser editor would not help. mcp.md quotes a measured refusal
+   * (8 glTF meshes sharing the accessors of a grid of 300×300 quads, on a 688 MB heap) and the
+   * ceiling's wording.
+   */
+  it('quote the import refusals as the server words them', () => {
+    const core = joined(file('../../../../packages/core/src/operators/memory.ts'));
+    const meshes =
+      'the meshes of the file (every glTF mesh is decoded into a mesh of its own, also where meshes share the same accessors)';
+    const nodes = 'the nodes (objects) of the file';
+    for (const lower of [meshes, nodes]) expect(core).toContain(`'${lower}'`);
+    const peak = refusedOperatorMessage(
+      {
+        operator: 'import_scene.gltf',
+        estimate: {
+          bytes: 380 * MB,
+          faces: 1_440_000,
+          meshes: 8,
+          objects: 8,
+          addedStoredBytes: 1,
+          lower: meshes,
+        },
+        storedBytes: 0,
+      } as never,
+      623 * MB,
+      688 * MB,
+    );
+    expect(flat(mcp)).toContain(`for example (one line): "Import failed: ${peak}"`);
+    expect(peak).toContain(
+      "(a browser editor runs it in its own memory: editor_command {command: 'run_operator', params: {operator: 'import_scene.gltf', params: {data_base64}}})",
+    );
+    // 25,000 nodes: 11,000 bytes kept and 33,000 more while the project is saved for each (MEM fix
+    // round 2: the save counts too)
+    const ceiling = storedMeshesMessage(
+      {
+        operator: 'import_scene.gltf',
+        estimate: {
+          bytes: 1,
+          faces: 0,
+          objects: 25_000,
+          addedStoredBytes: 262 * MB,
+          addedSaveBytes: 786 * MB,
+          lower: nodes,
+        },
+        storedBytes: 0,
+        saveBytes: 0,
+        objects: 0,
+      } as never,
+      688 * MB,
+    );
+    const dotted = ceiling.replace(/[\d,]+ (MB|new objects|objects)/g, '… $1');
+    expect(dotted).toContain(
+      'and a save of it about … MB more for a moment (3 times what its objects, datablocks and keyframes take): … MB in all, more than the … MB',
+    );
+    expect(flat(mcp)).toContain(`fails with "Import failed: ${dotted}"`);
+    expect(ceiling).not.toContain('a browser editor');
+  });
+
+  /*
+   * BONE: object.modifier_apply refuses a modifier that can change nothing (Blender's is_disabled,
+   * "Modifier is disabled, skipping apply") and keeps it; mcp.md and the apply_modifier description
+   * quote the message.
+   */
+  it("quote Apply's refusal of a modifier that can change nothing", () => {
+    const doc = SceneDoc.create({ name: 'Apply', empty: true });
+    const registry = createOperatorRegistry();
+    const ctx: OperatorContext = {
+      doc,
+      state: createEditorState(),
+      origin: { type: 'test' },
+      source: 'test',
+      report: () => undefined,
+    };
+    expect(registry.run(ctx, 'mesh.primitive_cube_add', { name: 'Box' }).ok).toBe(true);
+    expect(registry.run(ctx, 'object.modifier_add', { type: 'BOOLEAN' }).ok).toBe(true);
+    const refused = registry.run(ctx, 'object.modifier_apply', { object: 'Box', modifier: 'Boolean' });
+    expect(refused).toMatchObject({ ok: false, code: 'FAILED' });
+    const message = `object.modifier_apply failed: ${(refused as { error: string }).error}`;
+    expect(message).toBe(
+      "object.modifier_apply failed: Modifier is disabled, skipping apply: the Boolean modifier 'Boolean' has no object, so it changes nothing; change it with object.modifier_set or remove it with object.modifier_remove",
+    );
+    expect(doc.getObject(ctx.state.activeId!)!.modifiers.map((m) => m.name)).toEqual(['Boolean']);
+    expect(flat(mcp)).toContain(`("${message}", \`code\` \`FAILED\` in \`run_operator\`)`);
+    expect(joined(source('mcp/tools.ts'))).toContain(`'${message}'`);
+    // and one hidden in the viewport
+    expect(
+      registry.run(ctx, 'object.modifier_set', { object: 'Box', modifier: 'Boolean', show_viewport: false })
+        .ok,
+    ).toBe(true);
+    const hidden = registry.run(ctx, 'object.modifier_apply', { object: 'Box', modifier: 'Boolean' });
+    expect((hidden as { error: string }).error).toBe(
+      "Modifier 'Boolean' is disabled in the viewport; enable it before applying",
+    );
+    expect(flat(mcp)).toContain(
+      '"object.modifier_apply failed: Modifier \'Bevel\' is disabled in the viewport; enable it before applying"',
+    );
+    // that refusal is this editor's: Blender 4.2 applies a modifier hidden in the viewport
+    // (object_modifier.cc, ED_object_modifier_apply: "Force mode on the evaluated modifier, enforcing
+    // the modifier evaluation in the apply() functions", md_eval->mode |= eModifierMode_Realtime on a
+    // dependency graph built without visibility optimizations); round 11 credited it to Blender
+    expect(flat(mcp)).toContain(
+      'A modifier hidden in the viewport is refused too, unlike Blender, which applies it ("object.modifier_apply failed: Modifier',
+    );
+    expect(joined(source('mcp/tools.ts'))).toContain(
+      "A modifier hidden in the viewport is refused too ('… is disabled in the viewport; enable it before applying'), unlike Blender, which applies it.",
+    );
+    for (const text of [flat(mcp), joined(source('mcp/tools.ts'))])
+      expect(text).not.toMatch(/(nor|neither) is one hidden in the viewport/);
+  });
+
+  /*
+   * BONE fix1: a modifier parameter that names an object takes the object types Blender stores there,
+   * and object.modifier_add and object.modifier_set refuse another type. MCP add_modifier and
+   * update_modifier run those operators on mesh objects only (modifiers.ts operatorsApply) and edit
+   * the stack of a curve or text object directly, without that check (checked live: an Armature
+   * modifier on a curve with a mesh as its object is stored with via 'document' and reports the
+   * error below in get_scene problems). The docs said only that these parameters take names or ids.
+   */
+  it('say which object types modifier object parameters take, and where add_modifier refuses another', () => {
+    registerBuiltinModifiers();
+    const doc = flat(mcp);
+    expect(modifierObjectTypes('BOOLEAN', 'object')).toEqual(['MESH']);
+    expect(modifierObjectTypes('ARRAY', 'start_cap')).toEqual(['MESH']);
+    expect(modifierObjectTypes('ARRAY', 'end_cap')).toEqual(['MESH']);
+    expect(modifierObjectTypes('SHRINKWRAP', 'target')).toEqual(['MESH']);
+    expect(modifierObjectTypes('ARMATURE', 'object')).toEqual(['ARMATURE']);
+    expect(modifierObjectTypes('CURVE', 'object')).toEqual(['CURVE']);
+    expect(modifierObjectTypes('ARRAY', 'offset_object')).toBeNull();
+    expect(modifierObjectTypes('MIRROR', 'mirror_object')).toBeNull();
+    expect(doc).toContain(
+      'As in Blender, some take objects of one type only: a mesh for `BOOLEAN object`, `ARRAY start_cap` ' +
+        'and `end_cap` and `SHRINKWRAP target`, an armature for `ARMATURE object`, a curve for `CURVE object`.',
+    );
+    // the refusal the docs quote, as the tools give it (modifiers.ts prefixes the operator's error)
+    const refusal = modifierObjectRefusal('ARMATURE', 'object', { name: 'Box', type: 'MESH' });
+    // both hints of object.convert (the docs named only the one to MESH)
+    expect(doc).toContain(
+      `On a mesh object, \`add_modifier\` and \`update_modifier\` refuse an object of another type ("object.modifier_add failed: ${refusal}", ` +
+        '`object.modifier_set failed: …` for `update_modifier`; a curve or text where a mesh is needed adds ' +
+        '"(object.convert with target MESH makes it one)", a text where a curve is needed "(object.convert with ' +
+        'target CURVE makes it one)").',
+    );
+    for (const type of ['CURVE', 'FONT'])
+      expect(modifierObjectRefusal('BOOLEAN', 'object', { name: 'Label', type })).toMatch(
+        / \(object\.convert with target MESH makes it one\)$/,
+      );
+    expect(modifierObjectRefusal('CURVE', 'object', { name: 'Label', type: 'FONT' })).toMatch(
+      / \(object\.convert with target CURVE makes it one\)$/,
+    );
+    expect(modifierObjectRefusal('CURVE', 'object', { name: 'Box', type: 'MESH' })).not.toMatch(
+      /object\.convert/,
+    );
+    const modifiers = source('mcp/modifiers.ts');
+    expect(modifiers).toContain(
+      'if (!res.ok) throw new ToolError(`object.modifier_add failed: ${res.error}`);',
+    );
+    expect(modifiers).toContain(
+      'if (!res.ok) throw new ToolError(`object.modifier_set failed: ${res.error}`);',
+    );
+    expect(modifiers).toContain("return o.type === 'MESH';");
+    expect(doc).toContain(
+      'On a curve or text object they store it without that check (`via: "document"`); look at the ' +
+        '`problems` of `get_scene` then (an Armature modifier whose object is a mesh: "armature object not ' +
+        'found (or it is not an armature)").',
+    );
+    expect(file('../../../../packages/core/src/modifiers/armature.ts')).toContain(
+      "throw new Error('armature object not found (or it is not an armature)');",
+    );
+  });
+
+  /*
+   * MEM fix1: the inspection tools (get_scene, get_object, get_mesh_data, get_instances) refuse an
+   * evaluation the server's heap has no room for (mcp/eval-cache.ts), and an operator that adds to a
+   * project already over what the server keeps for one says so instead of naming the operator's
+   * share; the docs quoted neither.
+   */
+  it('quote the refusal of an evaluation and of a project already over what the server keeps for one', () => {
+    const evaluation = refusedEvaluationMessage(70_000, 400 * MB, 300 * MB, 2096 * MB);
+    const dottedEvaluation = evaluation
+      .replace(/scene's [\d,]+ objects/, "scene's … objects")
+      .replace(/about [\d,]+ MB/, 'about … MB')
+      .replace(
+        /has [\d,]+ MB of its [\d,]+ MB heap free and keeps [\d,]+ MB/,
+        'has … MB of its … MB heap free and keeps … MB',
+      );
+    expect(flat(mcp)).toContain(`"get_scene failed: ${dottedEvaluation}" (\`get_object failed: …\``);
+    // the tools give it their name and code OUT_OF_MEMORY (a MeshMemoryError), as JSON after it
+    expect(joined(source('mcp/tools.ts'))).toContain(
+      'if (isMeshMemoryError(err)) return withProjectNotes(failure(`${name} failed: ${err.message}`, { code: err.code }), notes);',
+    );
+    expect(source('mcp/eval-cache.ts')).toContain('if (refused) throw new MeshMemoryError(refused);');
+    expect(flat(guide)).toContain(
+      '`get_scene`, `get_object`, `get_mesh_data` and `get_instances` fail with it when the server has no room to evaluate a scene of many objects ("not evaluated on the server: …").',
+    );
+    const over = storedMeshesMessage(
+      {
+        operator: 'mesh.primitive_cube_add',
+        estimate: { bytes: 1, faces: 6, objects: 1, addedStoredBytes: 1 },
+        storedBytes: 700 * MB,
+        saveBytes: 200 * MB,
+        objects: 5,
+      } as never,
+      2096 * MB,
+    );
+    const dottedOver = over
+      .replace(/\(\d+ times what its objects, datablocks and keyframes take\)/, '(…)')
+      .replace(/\(half of its [^)]*\)/, '(…)')
+      .replace(/[\d,]+ (MB|objects)/g, '… $1');
+    expect(dottedOver).toBe(
+      "not run on the server: the project's meshes and objects already take about … MB of JavaScript heap with … objects, and a save of it about … MB more for a moment (…): … MB in all, more than the … MB the server's process keeps for one project (…), and this operator would add to them. Delete objects and meshes the project no longer needs",
+    );
+    expect(row(mcp, '`mesh.subdivide failed: not run on the server:')).toContain(
+      `\`… ${dottedOver.slice('not run on the server: '.length)}\``,
+    );
+    expect(flat(guide)).toContain('or "… already take about … MB …" when it needs more already');
+    expect(flat(guide)).toContain('counting what a save of it takes for a moment');
+  });
+
+  /*
+   * A project argument takes the exact name, and a name in another letter case when no project has
+   * the exact one (agent.ts matching); the argument's description said "exact project name".
+   */
+  it('say that a project argument also takes a name in another letter case', () => {
+    expect(source('mcp/tools.ts')).toContain(
+      "'Project id or name (see list_projects): the exact name, or, when no project has it, the name in another letter case'",
+    );
+    expect(source('mcp/tools.ts')).not.toContain('exact project name');
+    expect(source('mcp/agent.ts')).toContain(
+      'return exact.length > 0 ? exact : projects.filter((p) => p.name.toLowerCase() === name.toLowerCase());',
+    );
   });
 });

@@ -83,6 +83,15 @@ export interface EstimateContext {
   forRender: boolean;
   /** Faces of another object's evaluated mesh (Boolean operands), when known. */
   operandFaces?: (objectId: string) => number | null;
+  /**
+   * A Bevel limited by angle bevels only the edges whose faces meet at more than its angle_limit,
+   * which the counts of its input do not tell. With `bevelInput` (its input mesh itself) they are
+   * counted ({@link bevelCount}); else with `bevelUpperBound` every edge is (limit_method NONE's
+   * bound); else none is (a browser's estimate before its render, whose first worker counts them on
+   * the real input before the Bevel runs: apps/web/src/render/guard.ts).
+   */
+  bevelInput?: MeshData | null;
+  bevelUpperBound?: boolean;
 }
 
 /** Peak heap per face of the result (bytes), for modifiers that grow the mesh. */
@@ -247,12 +256,22 @@ function estimateParsed(
       return { result, bytes: K.TRIANGULATE * Math.max(faces, V), lower: 'the faces of the mesh' };
     }
     case 'BEVEL': {
+      if (ctx.bevelInput) {
+        // the edges and corners it bevels, counted on its input
+        const c = bevelCount(ctx.bevelInput, p as unknown as BevelSizeParams);
+        return {
+          result: c.result,
+          bytes: c.runs ? perInput + K.BEVEL_ADDED * c.added : 0,
+          lower: 'segments',
+        };
+      }
+      // limit_method NONE bevels every edge and every vertex: an upper bound from the counts alone
+      // (bevelUpperBound: also for ANGLE); else ANGLE only sharp edges, not counted here
+      if (p.limit_method !== 'NONE' && !ctx.bevelUpperBound)
+        return { ...none, bytes: perInput, lower: 'segments' };
       const s = Math.max(1, Math.round(num(p.segments, 1)));
-      // limit_method NONE bevels every edge (about corners / 2) and every vertex; ANGLE only sharp
-      // edges, which the estimate cannot know: their faces are not counted
-      const added = p.limit_method === 'NONE' ? Math.round((C / 2) * s + V * s * s) : 0;
-      const result = { faces: F + added, corners: C + 4 * added, vertices: V + added };
-      return { result, bytes: perInput + K.BEVEL_ADDED * added, lower: 'segments' };
+      const b = bevelBound(input, s);
+      return { result: b.result, bytes: perInput + K.BEVEL_ADDED * b.added, lower: 'segments' };
     }
     case 'BOOLEAN': {
       const other = typeof p.object === 'string' ? (ctx.operandFaces?.(p.object) ?? 0) : 0;
@@ -263,6 +282,290 @@ function estimateParsed(
     default:
       return { result: same(input), bytes: perInput, lower: 'the faces of the mesh' };
   }
+}
+
+/** The parameters of the Bevel modifier that decide its size (as its schema fills them in). */
+export interface BevelSizeParams {
+  width: number;
+  segments: number;
+  limit_method: string;
+  angle_limit: number;
+  affect: string;
+}
+
+/** What the Bevel modifier makes of a mesh, counted without beveling it ({@link bevelCount}). */
+export interface BevelCount {
+  /** Size of the result, an upper bound. */
+  result: MeshSize;
+  /** Faces it adds. */
+  added: number;
+  /** Edges it bevels (affect EDGES). */
+  edges: number;
+  /** Vertices it gives a patch. */
+  patched: number;
+  /** Whether it runs at all (a width above 0 and faces to bevel): it builds the topology of its input. */
+  runs: boolean;
+}
+
+/**
+ * The size of what the Bevel modifier (modifiers/bevel.ts) makes of `mesh`, counted from the edges
+ * and corners it bevels without beveling them, in typed arrays: an edge between two faces
+ * (limit_method NONE, or ANGLE when its faces meet at more than angle_limit) gets a strip of
+ * `segments` faces; a corner where such edges meet gets a patch (three or more edges and two or more
+ * segments: a quad grid of ⌊segments / 2⌋ × ⌈segments / 2⌉ faces per edge, one more in the middle
+ * when the segments are odd; else one polygon). With affect VERTICES every corner with such an edge
+ * gets the patch of its faces. An upper bound: Bevel bevels only edges whose ends have a closed fan
+ * of faces, and merges or welds some patches. Browser render workers size their check of a Bevel
+ * with it (apps/web/src/render/guard.ts), the server its check before the Bevel runs.
+ */
+export function bevelCount(mesh: MeshData, p: BevelSizeParams): BevelCount {
+  const faces = mesh.faces;
+  const F = faces.length;
+  const V = Math.floor(mesh.positions.length / 3);
+  let C = 0;
+  for (const f of faces) C += f.length;
+  const input: MeshSize = { faces: F, corners: C, vertices: V };
+  if (!(p.width > 0) || F === 0) return { result: input, added: 0, edges: 0, patched: 0, runs: false };
+  const S = Math.max(1, Math.round(p.segments));
+  const angle = p.limit_method !== 'NONE';
+  // the corners of each vertex by the vertex after them in their face: one number per corner, the
+  // next vertex × C + the corner (its place in all faces' corners, faceStart[face] + its place in the
+  // face), sorted per vertex. The faces of an edge (a, b) are then found by binary searches among the
+  // corners of a and of b, not a scan of every corner of a for every edge, which took O(valence²) at
+  // the centre of a fan (20 s for two cones of 20,000 triangles around one vertex each)
+  if ((V + 1) * C > Number.MAX_SAFE_INTEGER) {
+    // too many to number (no mesh in a JavaScript heap is that large): every edge beveled
+    const b = bevelBound(input, S);
+    return { result: b.result, added: b.added, edges: 0, patched: 0, runs: true };
+  }
+  const faceStart = new Int32Array(F + 1);
+  const faceOf = new Int32Array(C);
+  for (let f = 0, k = 0; f < F; f++) {
+    for (let i = faces[f].length; i > 0; i--) faceOf[k++] = f;
+    faceStart[f + 1] = k;
+  }
+  const start = new Int32Array(V + 1);
+  for (const f of faces) for (const v of f) if (v >= 0 && v < V) start[v + 1]++;
+  for (let v = 0; v < V; v++) start[v + 1] += start[v];
+  const next = start.slice(0, V);
+  const after = new Float64Array(start[V]);
+  for (let f = 0; f < F; f++) {
+    const face = faces[f];
+    for (let i = 0; i < face.length; i++) {
+      const v = face[i];
+      if (v < 0 || v >= V) continue;
+      after[next[v]++] = face[(i + 1) % face.length] * C + faceStart[f] + i;
+    }
+  }
+  for (let v = 0; v < V; v++) {
+    const s = start[v];
+    const e = start[v + 1];
+    if (e - s > 16) {
+      after.subarray(s, e).sort();
+      continue;
+    }
+    // few corners: insertion sort, without a typed array view per vertex
+    for (let i = s + 1; i < e; i++) {
+      const x = after[i];
+      let j = i - 1;
+      while (j >= s && after[j] > x) {
+        after[j + 1] = after[j];
+        j--;
+      }
+      after[j + 1] = x;
+    }
+  }
+  /** The first corner of `v` (in `after`) whose key is `x` or more. */
+  const firstAtLeast = (v: number, x: number): number => {
+    let i = start[v];
+    let j = start[v + 1];
+    if (j - i <= 16) {
+      while (i < j && after[i] < x) i++;
+      return i;
+    }
+    while (i < j) {
+      const mid = (i + j) >>> 1;
+      if (after[mid] < x) i = mid + 1;
+      else j = mid;
+    }
+    return i;
+  };
+  // unit face normals (Newell, as the Bevel modifier computes them; zero for degenerate faces)
+  const normals = angle ? new Float64Array(3 * F) : null;
+  if (normals) {
+    const P = mesh.positions;
+    for (let f = 0; f < F; f++) {
+      const face = faces[f];
+      let nx = 0;
+      let ny = 0;
+      let nz = 0;
+      for (let i = 0; i < face.length; i++) {
+        const a = face[i] * 3;
+        const b = face[(i + 1) % face.length] * 3;
+        nx += (P[a + 1] - P[b + 1]) * (P[a + 2] + P[b + 2]);
+        ny += (P[a + 2] - P[b + 2]) * (P[a] + P[b]);
+        nz += (P[a] - P[b]) * (P[a + 1] + P[b + 1]);
+      }
+      const l = Math.hypot(nx, ny, nz);
+      if (l > 1e-30) {
+        normals[f * 3] = nx / l;
+        normals[f * 3 + 1] = ny / l;
+        normals[f * 3 + 2] = nz / l;
+      }
+    }
+  }
+  const cosLimit = Math.cos(p.angle_limit);
+  let users = 0;
+  let first = 0;
+  let other = -1;
+  /**
+   * The faces of edge (a, b) of face f, as the corners of a next to b in their face, each counted
+   * once: those followed by b, and those after a corner of b that are not followed by b too. Sets
+   * `users` (how many; counting stops at 3, enough to tell that the edge has more than two), and
+   * with two of them `first` (the face of lowest index) and `other` (the face that is not f).
+   */
+  const edgeFaces = (f: number, a: number, b: number) => {
+    users = 0;
+    first = f;
+    other = -1;
+    const keyB = b * C;
+    const i0 = firstAtLeast(a, keyB);
+    let i1 = i0;
+    for (const e = start[a + 1], hi = keyB + C; i1 < e && after[i1] < hi; i1++) {
+      const g = faceOf[after[i1] - keyB];
+      if (++users > 2) return;
+      if (g < first) first = g;
+      if (g !== f) other = g;
+    }
+    const keyA = a * C;
+    for (let j = firstAtLeast(b, keyA), e = start[b + 1], hi = keyA + C; j < e && after[j] < hi; j++) {
+      // the corner of a after this corner of b
+      const kb = after[j] - keyA;
+      const fb = faceOf[kb];
+      const ka = kb + 1 < faceStart[fb + 1] ? kb + 1 : faceStart[fb];
+      let counted = false;
+      for (let i = i0; i < i1 && !counted; i++) counted = after[i] === keyB + ka;
+      if (counted) continue;
+      if (++users > 2) return;
+      if (fb < first) first = fb;
+      if (fb !== f) other = fb;
+    }
+  };
+  // the Bevel modifier bevels only around vertices with a closed fan of faces: not at an edge with
+  // one face or more than two (open borders, non-manifold parts)
+  const fan = new Uint8Array(V).fill(1);
+  for (let f = 0; f < F; f++) {
+    const face = faces[f];
+    for (let i = 0; i < face.length; i++) {
+      const a = face[i];
+      const b = face[(i + 1) % face.length];
+      if (a < 0 || a >= V || b < 0 || b >= V) continue;
+      if (a === b) fan[a] = 0;
+      else {
+        edgeFaces(f, a, b);
+        if (users !== 2) fan[a] = fan[b] = 0;
+      }
+    }
+  }
+  // beveled edges per vertex; each edge is counted from the first face that has it
+  const beveled = new Int32Array(V);
+  let edges = 0;
+  for (let f = 0; f < F; f++) {
+    const face = faces[f];
+    const L = face.length;
+    for (let i = 0; i < L; i++) {
+      const a = face[i];
+      const b = face[(i + 1) % L];
+      if (a === b || a < 0 || a >= V || b < 0 || b >= V || !fan[a] || !fan[b]) continue;
+      edgeFaces(f, a, b);
+      if (users !== 2 || first !== f) continue;
+      if (normals && other >= 0) {
+        const dot =
+          normals[f * 3] * normals[other * 3] +
+          normals[f * 3 + 1] * normals[other * 3 + 1] +
+          normals[f * 3 + 2] * normals[other * 3 + 2];
+        // the modifier: sharper than the limit (minus 1e-9); counted generously here
+        if (!(dot < cosLimit + 1e-9)) continue;
+      }
+      edges++;
+      beveled[a]++;
+      beveled[b]++;
+    }
+  }
+  const half = Math.floor(S / 2);
+  const odd = S % 2;
+  let added = 0;
+  // corners of the new faces, and the corners the faces around beveled corners gain
+  let corners = 0;
+  let selected = 0;
+  /**
+   * The patch where n profiles meet at a vertex: a quad grid, else one polygon of `polygon` corners
+   * (the profiles' points, and the points on the edges between them).
+   */
+  const patch = (n: number, polygon: number) => {
+    if (n >= 3 && S >= 2) {
+      const quads = n * half * (half + odd);
+      added += quads + odd;
+      corners += 4 * quads + odd * n;
+    } else {
+      added++;
+      corners += polygon;
+    }
+  };
+  // vertices that get a patch
+  let patched = 0;
+  if (p.affect === 'VERTICES') {
+    for (let v = 0; v < V; v++) {
+      const valence = start[v + 1] - start[v];
+      if (!valence || !fan[v] || (angle && !beveled[v])) continue;
+      patch(valence, S * valence);
+      patched++;
+      // each corner of the vertex becomes an arc of S + 1 points in its face
+      corners += S * valence;
+      selected += valence;
+    }
+  } else if (edges) {
+    added += S * edges;
+    corners += 4 * S * edges;
+    for (let v = 0; v < V; v++) {
+      const k = beveled[v];
+      if (!k) continue;
+      const valence = start[v + 1] - start[v];
+      patch(k, S * k + 2 * (valence - k));
+      patched++;
+      // the edges next to a beveled one get a slide point, in the loops of both their faces
+      corners += 2 * Math.min(2 * k, valence - k);
+    }
+  }
+  if (!added) return { result: input, added: 0, edges, patched, runs: true };
+  return {
+    result: { faces: F + added, corners: C + corners, vertices: V + C + added + S * selected },
+    added,
+    edges: p.affect === 'VERTICES' ? 0 : edges,
+    patched,
+    runs: true,
+  };
+}
+
+/**
+ * What the Bevel modifier makes of a mesh of `input`'s size with every edge and corner beveled
+ * (limit_method NONE), at most, in `s` segments: a strip of s faces per edge (at most corners / 2
+ * edges have two faces), a patch per corner of at most ⌊s/2⌋ × ⌈s/2⌉ faces per edge it joins (each
+ * edge joins two: corners in all) and one more face. The corners and vertices bound those
+ * {@link bevelCount} counts.
+ */
+function bevelBound(input: MeshSize, s: number): { result: MeshSize; added: number } {
+  const C = input.corners;
+  const V = input.vertices;
+  const added = Math.round((C / 2) * s + C * Math.floor(s / 2) * Math.ceil(s / 2) + V);
+  return {
+    added,
+    result: {
+      faces: input.faces + added,
+      corners: C + 4 * added + (s + 4) * C,
+      vertices: V + C + added + s * C,
+    },
+  };
 }
 
 /**
@@ -520,6 +823,8 @@ function guarded(def: ModifierDef): ModifierDef {
           {
             forRender: ctx.forRender,
             operandFaces: (id) => ctx.getObjectMesh(id)?.mesh.faces.length ?? null,
+            // a Bevel by angle: the edges it bevels, counted on its input
+            bevelInput: def.type === 'BEVEL' ? mesh : null,
           },
         );
         const reason = estimate.bytes > 0 ? check({ type: def.type, label: def.label, estimate }) : null;

@@ -2,13 +2,17 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   SceneDoc,
   TEXT_BYTES_PER_CHARACTER,
+  createFCurve,
   createMesh,
   curveToMesh,
   defaultCurve,
+  defaultProcedural,
   estimateModifier,
   evaluateCurveSplines,
+  insertKeyframe,
   meshSize,
   renderSceneSoftware,
+  type AnimTargetType,
   type CurveData,
   type MeshData,
   type ModifierData,
@@ -34,12 +38,16 @@ import {
   PREPARE_BYTES_PER_TRIANGLE,
   WORKER_BASE_BYTES,
   YOUNG_GENERATION_BYTES,
+  RASTER_BYTES_PER_TRIANGLE,
   bevelHeap,
   curveSurfaceSize,
   estimateRender,
   estimatedNeeds,
   pageHeapEstimate,
   planRenderThreads,
+  rasterNeeds,
+  rasterRefusal,
+  refusalFigures,
   renderMemory,
   renderMemoryBudget,
   splineSampleCount,
@@ -187,11 +195,18 @@ function wave(
   };
 }
 
-/** What the first worker reports for `doc` (exact triangles, instances and bytes). */
-async function preparedInfo(doc: SceneDoc, width: number, height: number): Promise<PreparedInfo> {
+/** What the first worker reports for `doc` at `frame` (exact triangles, instances and bytes). */
+async function preparedInfo(doc: SceneDoc, width: number, height: number, frame = 1): Promise<PreparedInfo> {
   const engine = new RenderWorkerEngine(null);
   const thread = { docKey: null as string | null, stateVector: null as Uint8Array | null };
-  return engine.prepare(1, new DocumentSnapshot(doc).payload(thread), { width, height, frame: 1 });
+  return engine.prepare(1, new DocumentSnapshot(doc).payload(thread), { width, height, frame });
+}
+
+/** Keys `path` of a datablock: `keys` as [frame, value] pairs. */
+function key(doc: SceneDoc, type: AnimTargetType, id: string, path: string, keys: [number, number][]): void {
+  let fc = createFCurve({ target_type: type, target_id: id, path, index: 0 });
+  for (const [frame, value] of keys) fc = insertKeyframe(fc, frame, value);
+  doc.setFCurve(fc);
 }
 
 /** The needs of a render as its first worker reported them. */
@@ -214,6 +229,15 @@ describe('memory of browser path traced renders', () => {
     const mem = tabMemory();
     expect(mem.budget).toBeGreaterThan(0);
     expect(mem.heapLimit).toBeGreaterThan(0);
+    // a browser without performance.memory (Firefox, Safari): a heap limit of 4 GB is assumed
+    const before = Object.getOwnPropertyDescriptor(performance, 'memory');
+    Object.defineProperty(performance, 'memory', { value: undefined, configurable: true });
+    try {
+      expect(tabMemory().heapLimit).toBe(4 * GB);
+    } finally {
+      if (before) Object.defineProperty(performance, 'memory', before);
+      else delete (performance as { memory?: unknown }).memory;
+    }
   });
 
   it('takes the heap of the page from its scene where the browser reports a figure it seldom refreshes', async () => {
@@ -250,8 +274,10 @@ describe('memory of browser path traced renders', () => {
       expect(estimateRender(doc, false).evaluatedTriangles).toBe(12 + 2 * 2 * 4096 * 4 * 4 ** 3);
       const { pool, started } = recordingPool(2);
       const job = startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1 });
+      // the page alone uses more than the share a render may fill: the tab has none left, and the
+      // figures say so instead of a room of 0.00 GB "of that"
       await expect(job.result).rejects.toThrow(
-        /needs about 0\.03 GB of JavaScript heap, and the tab, which already uses 0\.6 GB, has 0\.00 GB of its 0\.5 GB left/,
+        /needs about 0\.03 GB of JavaScript heap, and the tab has none left for it: a render may fill 0\.37 GB of its 0\.50 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, and the page uses 0\.6\d GB \(about/,
       );
       expect(started).toEqual([]);
     } finally {
@@ -427,6 +453,8 @@ describe('memory of browser path traced renders', () => {
       wave('BEZIER', 9, false, (i) => (i % 3 ? 'VECTOR' : 'AUTO')),
       wave('NURBS', 9),
       wave('NURBS', 9, true),
+      // cyclic with two points: sampled open
+      wave('NURBS', 2, true),
       wave('POLY', 9, true),
       // a spline that would pass 250,000 points: core lowers its resolution
       wave('BEZIER', 300),
@@ -501,6 +529,62 @@ describe('memory of browser path traced renders', () => {
     expect(estimateRender(doc).triangles).toBe(both.triangles - 2 * 120 * 12);
   });
 
+  it('counts the scene at the frame it renders: keyed and driven curve values, keyed modifier settings and shape keys', async () => {
+    const doc = scene();
+    // a cable stored without a bevel (a wire, which renders nothing) whose bevel depth is keyed: a
+    // tube at frame 1, none from frame 10; its render resolution driven to 24 samples per span
+    const data = doc.getObject(cable(doc, 6, 4, 4))!.data!;
+    doc.updateCurve(data, { bevel_depth: 0 });
+    key(doc, 'curve', data, 'bevel_depth', [
+      [1, 0.05],
+      [10, 0],
+    ]);
+    doc.setDriver({
+      target_type: 'curve',
+      target_id: data,
+      path: 'render_resolution_u',
+      index: 0,
+      expression: '24',
+      variables: [],
+      mute: false,
+    });
+    // the cube subdivided twice in renders by a keyed render_levels (once as stored)
+    const cube = doc.findObjectByName('Cube')!;
+    doc.updateObject(cube.id, { modifiers: [modifier('Sub', 'SUBSURF', { levels: 0, render_levels: 1 })] });
+    key(doc, 'object', cube.id, 'modifiers["Sub"].render_levels', [[1, 2]]);
+    // 5 spans × 24 samples + 1 points, a ring of 12: 120 × 12 quads; the cube's 6 × 4² quads
+    const atFrame = estimateRender(doc, true, 1);
+    expect(atFrame).toMatchObject({ triangles: 2 * 120 * 12 + 2 * 6 * 16, instances: 2 });
+    const exact = await preparedInfo(doc, 24, 16, 1);
+    expect([exact.triangles, exact.instances]).toEqual([atFrame.triangles, atFrame.instances]);
+    // the curve's surface is built before any modifier runs: what the first worker holds as stored
+    expect(atFrame.storedTriangles).toBe(2 * 120 * 12);
+    // no tube at frame 10, and none as stored, where the cube is subdivided once
+    expect(estimateRender(doc, true, 10).triangles).toBe(2 * 6 * 16);
+    expect((await preparedInfo(doc, 24, 16, 10)).triangles).toBe(2 * 6 * 16);
+    expect(estimateRender(doc).triangles).toBe(2 * 6 * 4);
+    // two objects of one mesh with a shape key keyed from 0: one geometry each at frame 1
+    const keyed = scene();
+    const box = keyed.findObjectByName('Cube')!;
+    keyed.addObject({ name: 'Twin', type: 'MESH', data: box.data, location: [3, 0, 0] });
+    const positions = new Float32Array(keyed.getMesh(box.data!)!.positions);
+    keyed.setShapeKeys(box.data!, [
+      {
+        name: 'Key',
+        value: 0,
+        slider_min: 0,
+        slider_max: 1,
+        mute: false,
+        relative_key: '',
+        data: new Uint8Array(positions.map((p) => p * 1.2).buffer),
+      },
+    ]);
+    key(keyed, 'mesh', box.data!, 'shape_keys["Key"].value', [[1, 0.5]]);
+    expect((await preparedInfo(keyed, 24, 16, 1)).evaluatedTriangles).toBe(24);
+    expect(estimateRender(keyed, true, 1).evaluatedTriangles).toBe(24);
+    expect(estimateRender(keyed).evaluatedTriangles).toBe(12);
+  });
+
   it('counts bevel objects, clamped bevel resolutions, end caps and glyph fills with holes as core builds them', () => {
     const doc = SceneDoc.create({ empty: true });
     const point = (co: [number, number, number]) => ({
@@ -563,6 +647,16 @@ describe('memory of browser path traced renders', () => {
           bevel_depth: 0.1,
           bevel_resolution: 3,
           use_fill_caps: true,
+        }),
+      ],
+      // a closed spline: a quad between its last and first rings too
+      [
+        'cyclic sweep',
+        base({
+          splines: [wave('BEZIER', 6, true)],
+          render_resolution_u: 8,
+          bevel_depth: 0.05,
+          bevel_resolution: 2,
         }),
       ],
     ];
@@ -754,6 +848,17 @@ describe('memory of browser path traced renders', () => {
     expect(planRenderThreads(needs, 4, { ...roomy, budget: 0.5 * GB, deviceGB: null }).refusal).toContain(
       'more than the 0.5 GB a render may use in this tab (half the device memory, taken as 8 GB where the browser does not report it, at most 4.0 GB)',
     );
+    // other path traced renders running in the tab hold all of it: none is left, not "0.0 GB left"
+    expect(
+      planRenderThreads(needs, 4, {
+        ...roomy,
+        budget: 0.5 * GB,
+        deviceGB: 1,
+        held: { total: 0.6 * GB, heap: 0 },
+      }).refusal,
+    ).toMatch(
+      /^Path tracing was not started: it needs about \d+\.\d GB of memory with one render thread, and none is left of the 0\.5 GB a render may use in this tab \(half the device memory the browser reports, 1 GB, at most 4\.0 GB\): other path traced renders running in it hold 0\.6 GB \(about 1\.0 million triangles/,
+    );
     // small scenes by their count
     expect(planRenderThreads({ ...needs, triangles: 12 }, 4, { ...roomy, budget: 0 }).refusal).toContain(
       '(about 12 triangles, 921,600 pixels)',
@@ -768,14 +873,22 @@ describe('memory of browser path traced renders', () => {
       '(about 1.4 million triangles, 0.4 million of them in objects hidden in renders, which are evaluated all the same, 921,600 pixels)',
     );
     expect(tight.refusal).toContain('running out of memory would end the tab');
-    expect(tight.refusal).toContain(
-      'Lower the resolution or the triangles (subdivision render levels, curve and text render resolution, objects in the scene), or render with the RASTER engine.',
+    // the image counts towards the memory, and the RASTER engine is suggested only where a RASTER
+    // render of the scene fits the page (rasterRefusal)
+    expect(tight.refusal).toMatch(
+      /Lower the resolution or the triangles \(subdivision render levels, curve and text render resolution, objects in the scene\)\.$/,
+    );
+    expect(
+      planRenderThreads({ ...needs, rasterFits: true }, 4, { ...roomy, budget: 0.5 * GB, deviceGB: 1 })
+        .refusal,
+    ).toMatch(
+      /Lower the resolution or the triangles \(subdivision render levels, curve and text render resolution, objects in the scene\), or render with the RASTER engine\.$/,
     );
     // the JavaScript heap of the tab (Chrome: one 4 GB cage for the page and its workers)
     const full = planRenderThreads(needs, 4, { ...roomy, heapUsed: 3.1e9 });
     expect(full.threads).toBe(0);
     expect(full.refusal).toMatch(
-      /its render thread needs about 0\.\d GB of JavaScript heap, and the tab, which already uses 2\.9 GB, has 0\.\d GB of its 3\.5 GB left for it/,
+      /its render thread needs about 0\.\d\d GB of JavaScript heap, more than the 0\.09 GB the tab has left for it: a render may fill 2\.98 GB of its 3\.50 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, and the page uses 2\.89 GB of that/,
     );
     // ... the heap other path traced renders hold in it included
     const heap = renderMemory(needs, 1).heap;
@@ -786,8 +899,18 @@ describe('memory of browser path traced renders', () => {
     const others = room - heap + 1;
     const held = planRenderThreads(needs, 1, { ...roomy, held: { total: 0, heap: others } });
     expect(held.threads).toBe(0);
-    expect(held.refusal).toContain(
-      `of JavaScript heap, and the tab, which already uses ${((roomy.heapUsed + others) / GB).toFixed(1)} GB`,
+    const figures = held.refusal!.match(
+      /more than the (\d\.\d+) GB the tab has left for it: a render may fill (\d\.\d+) GB of its \d\.\d+ GB heap limit, .*, and the page and the path traced renders running in it use (\d\.\d+) GB of that/,
+    );
+    expect(figures, held.refusal!).not.toBeNull();
+    // one byte short: three decimals, the need rounded up, the share down and the use up, keep the
+    // need and the room apart, and every figure has them
+    const digits = figures![3].split('.')[1].length;
+    expect(digits).toBe(3);
+    expect(figures![3]).toBe((Math.ceil(((roomy.heapUsed + others) / GB) * 1000) / 1000).toFixed(3));
+    // the figures add up: the room is the share less what the page and the renders use, as printed
+    expect(Math.round((Number(figures![2]) - Number(figures![3])) * 10 ** digits)).toBe(
+      Math.round(Number(figures![1]) * 10 ** digits),
     );
   });
 
@@ -813,7 +936,7 @@ describe('memory of browser path traced renders', () => {
     const refused = planRenderThreads(needs, 1, tab);
     expect(refused.threads).toBe(0);
     expect(refused.refusal).toContain(
-      'its render thread needs about 0.37 GB of JavaScript heap, and the tab, which already uses 0.0 GB, has 0.35 GB of its 0.5 GB left for it',
+      "its render thread needs about 0.37 GB of JavaScript heap, more than the 0.35 GB the tab has left for it: a render may fill 0.35 GB of its 0.49 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working (about",
     );
     expect(
       planRenderThreads({ ...needs, evaluationHeap: 340 * MB - WORKER_BASE_BYTES }, 1, tab).threads,
@@ -950,6 +1073,30 @@ describe('memory of browser path traced renders', () => {
     expect(r.threads).toBeGreaterThan(0);
   });
 
+  it('refuses before any worker starts a curve whose surface only its keyed bevel depth makes', async () => {
+    const doc = scene();
+    // stored without a bevel: a wire, nothing to render; keyed at frame 1: 15 spans × 16 samples + 1
+    // points, a ring of 20, 9,600 triangles the first worker builds before any modifier runs
+    const data = doc.getObject(cable(doc, 16, 16, 8))!.data!;
+    doc.updateCurve(data, { bevel_depth: 0 });
+    key(doc, 'curve', data, 'bevel_depth', [[1, 0.05]]);
+    const stored = renderMemory(estimatedNeeds(estimateRender(doc), 24 * 16), 1).total;
+    const atFrame = renderMemory(estimatedNeeds(estimateRender(doc, true, 1), 24 * 16), 1).total;
+    expect(atFrame).toBeGreaterThan(stored);
+    // room for the cube, not for the tube: refused before any worker evaluates it
+    const { pool, started } = recordingPool(2);
+    const memory = { ...roomy, budget: (stored + atFrame) / 2, deviceGB: 0.25 };
+    const job = startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory });
+    await expect(job.result).rejects.toThrow(
+      /^Path tracing was not started: .*\(about 9,612 triangles, 384 pixels\)/,
+    );
+    expect(started).toEqual([]);
+    // with room for it, it renders
+    const r = await startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory: roomy })
+      .result;
+    expect(r.threads).toBeGreaterThan(0);
+  });
+
   it('refuses a render of objects hidden in renders that the first worker would evaluate all the same', async () => {
     const doc = scene();
     doc.updateObject(doc.findObjectByName('Cube')!.id, { hide_render: true });
@@ -1027,26 +1174,54 @@ describe('memory of browser path traced renders', () => {
       instances: 0,
       evaluationHeap: 0,
       imageBytes: 0,
+      builtTriangles: 0,
+      builtBaseTriangles: 0,
     };
     const engine = new RenderWorkerEngine(null);
     const thread = { docKey: null as string | null, stateVector: null as Uint8Array | null };
-    const prepare = (budget: number, job: number) =>
+    const prepare = (budget: number, job: number, estimate = nothing) =>
       engine.prepare(
         job,
         new DocumentSnapshot(doc).payload(thread),
         { width: 24, height: 16, frame: 1 },
         { ...roomy, budget, deviceGB: 1 },
-        nothing,
+        estimate,
       );
-    // one byte short: refused, with the exact numbers, nothing compiled or kept for the job
+    // one byte short: refused, with the exact numbers, nothing compiled or kept for the job; a RASTER
+    // render of what the estimate says fits the page
     const refused = prepare(renderMemory(checked, 1).total - 1, 1);
     await expect(refused).rejects.toThrow(RenderMemoryError);
     await expect(refused).rejects.toThrow(
-      /^Path tracing was not started: it needs about 0\.\d+ GB of memory with one render thread, more than the 0\.\d+ GB a render may use in this tab .*\(about 3,212 triangles, 384 pixels\)/,
+      /^Path tracing was not started: it needs about 0\.\d+ GB of memory with one render thread, more than the 0\.\d+ GB a render may use in this tab .*\(about 3,212 triangles, 384 pixels\).*, or render with the RASTER engine\.$/,
     );
     expect(() => engine.share(1)).toThrow(/not prepared/);
+    // an estimate whose geometry would not fit the page's heap either: no RASTER engine to suggest
+    const heavy = { ...nothing, builtTriangles: 100_000_000 };
+    await expect(prepare(renderMemory(checked, 1).total - 1, 7, heavy)).rejects.toThrow(
+      /objects in the scene\)\.$/,
+    );
     // with that byte it compiles
     expect((await prepare(renderMemory(checked, 1).total, 2)).triangles).toBe(3212);
+    // the world's image counts too, on the first worker as in the estimate
+    doc.updateWorld({ environment: 'IMAGE', environment_image: sky });
+    const withSky = { ...checked, sceneBytes: checked.sceneBytes + 16 * 8 * 4 };
+    await expect(prepare(renderMemory(withSky, 1).total - 1, 3)).rejects.toThrow(RenderMemoryError);
+    expect((await prepare(renderMemory(withSky, 1).total, 4)).triangles).toBe(3212);
+    // a procedural texture samples no image, even with one set in its slot: in neither
+    doc.updateWorld({ environment: 'SKY', environment_image: null });
+    doc.updateMaterial(cube.material_slots[0]!, {
+      textures: {
+        base_color: {
+          image,
+          scale: [1, 1],
+          offset: [0, 0],
+          procedural: defaultProcedural('NOISE'),
+        },
+      },
+    });
+    expect(estimateRender(doc).imageBytes).toBe(0);
+    const procedural = { ...checked, sceneBytes: checked.sceneBytes - 64 * 32 * 4 };
+    expect((await prepare(renderMemory(procedural, 1).total, 5)).triangles).toBe(3212);
   });
 
   it('keeps the document on a worker that refused a render: the next render sends only what changed', async () => {
@@ -1166,10 +1341,14 @@ describe('memory of browser path traced renders', () => {
       (err: Error) => err.message,
     );
     const figures = message.match(
-      /it needs about (0\.\d{3}) GB of memory with one render thread, more than the (0\.\d{3}) GB left of the 0\.\d GB a render may use in this tab \(.*\), 0\.\d GB of which other path traced renders running in it hold/,
+      /it needs about (0\.\d{3}) GB of memory with one render thread, more than the (0\.\d{3}) GB left of the (0\.\d{3}) GB a render may use in this tab \(.*\), (0\.\d{3}) GB of which other path traced renders running in it hold/,
     );
     expect(figures, message).not.toBeNull();
     expect(Number(figures![1])).toBeGreaterThan(Number(figures![2]));
+    // the figures add up: the room is the budget less what the others hold, as printed
+    expect(Math.round((Number(figures![3]) - Number(figures![4])) * 1000)).toBe(
+      Math.round(Number(figures![2]) * 1000),
+    );
     big.cancel();
     await big.result;
   });
@@ -1206,6 +1385,277 @@ describe('memory of browser path traced renders', () => {
     } finally {
       if (before) Object.defineProperty(navigator, 'deviceMemory', before);
       else delete (navigator as { deviceMemory?: number }).deviceMemory;
+    }
+  });
+});
+
+describe('RASTER renders on the page', () => {
+  it('counts what a RASTER render builds on the page: surfaces and modifier and shape key results, not stored meshes', () => {
+    const doc = scene();
+    // the default cube as stored: the page has decoded it for the viewport already
+    expect(estimateRender(doc)).toMatchObject({ builtTriangles: 0, builtBaseTriangles: 0 });
+    const cube = doc.findObjectByName('Cube')!;
+    // a Subdivision Surface result (6 quads × 4² at render level 2) is built, from a stored mesh
+    doc.updateObject(cube.id, { modifiers: [modifier('Sub', 'SUBSURF', { levels: 0, render_levels: 2 })] });
+    expect(estimateRender(doc)).toMatchObject({ builtTriangles: 2 * 6 * 16, builtBaseTriangles: 0 });
+    // the viewport's level 0 for the page's own evaluation: the modifier hands its input on
+    expect(estimateRender(doc, false)).toMatchObject({ builtTriangles: 0, builtBaseTriangles: 0 });
+    // a curve's surface is built before its modifiers, and kept besides their result: 5 spans × 4 + 1
+    // points, a ring of 12, and the surface subdivided once
+    doc.updateObject(cube.id, { modifiers: [] });
+    const cableObject = cable(doc, 6, 4, 4);
+    const surface = 2 * 20 * 12;
+    expect(estimateRender(doc)).toMatchObject({ builtTriangles: surface, builtBaseTriangles: surface });
+    doc.updateObject(cableObject, {
+      modifiers: [modifier('Sub', 'SUBSURF', { levels: 0, render_levels: 1 })],
+    });
+    expect(estimateRender(doc)).toMatchObject({
+      builtTriangles: surface + 2 * 4 * (surface / 2),
+      builtBaseTriangles: surface,
+    });
+    // a mesh with a shape key at work and no modifier: the keyed copy is built, the stored one kept
+    const keyed = scene();
+    const box = keyed.findObjectByName('Cube')!;
+    const positions = new Float32Array(keyed.getMesh(box.data!)!.positions);
+    keyed.setShapeKeys(box.data!, [
+      {
+        name: 'Key',
+        value: 0.5,
+        slider_min: 0,
+        slider_max: 1,
+        mute: false,
+        relative_key: '',
+        data: new Uint8Array(positions.map((p) => p * 1.2).buffer),
+      },
+    ]);
+    expect(estimateRender(keyed)).toMatchObject({ builtTriangles: 12, builtBaseTriangles: 12 });
+    // what that adds to the page's heap: the built geometry, the evaluated instances and the heaviest
+    // object's evaluation
+    const e = estimateRender(doc);
+    expect(rasterNeeds(e)).toEqual({
+      triangles: e.builtTriangles,
+      heap:
+        e.builtTriangles * RASTER_BYTES_PER_TRIANGLE + e.instances * INSTANCE_BYTES.heap + e.evaluationHeap,
+    });
+  });
+
+  it("refuses a RASTER render whose geometry does not fit what the tab's heap has left, saying why", () => {
+    // a heap like Chromium's with --max-old-space-size=400 (limit 497 MB), the page using 20 MB
+    const tab: TabMemory = { ...roomy, heapLimit: 497 * MB, heapUsed: 20 * MB };
+    const room = usableHeap(tab.heapLimit) - tab.heapUsed;
+    const needs = { triangles: 4_317_196, heap: 4_317_196 * RASTER_BYTES_PER_TRIANGLE };
+    expect(rasterRefusal({ ...needs, heap: room }, tab)).toBeNull();
+    expect(rasterRefusal(needs, tab)).toBe(
+      'The RASTER render was not started: the geometry it evaluates at the render settings needs about ' +
+        "0.48 GB of JavaScript heap, more than the 0.33 GB the tab has left for it: a render may fill 0.35 GB of its 0.49 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, " +
+        'and the page uses 0.02 GB of that (about 4.3 million triangles: curve and text surfaces, modifier and ' +
+        'shape key results), and running out of memory would end the tab. Lower the triangles (subdivision ' +
+        'render levels, curve and text render resolution, objects in the scene).',
+    );
+    // one byte more than the room: three decimals keep them apart
+    expect(rasterRefusal({ ...needs, heap: room + 1 }, tab)).toMatch(
+      /needs about (0\.\d{3}) GB of JavaScript heap, more than the (0\.\d{3}) GB the tab has left/,
+    );
+    // what the path traced renders running in the tab hold is not the page's to use
+    const held = { ...tab, held: { total: 0, heap: room / 2 } };
+    expect(rasterRefusal({ ...needs, heap: room / 2 }, held)).toBeNull();
+    expect(rasterRefusal({ ...needs, heap: room / 2 + MB }, held)).toContain(
+      'and the page and the path traced renders running in it use',
+    );
+    // the modifier its evaluation would not run, by name
+    expect(
+      rasterRefusal(
+        {
+          ...needs,
+          cause: { name: "the Bevel modifier 'Bev' of 'Cube'", lower: 'its segments', triangles: 69_192 },
+        },
+        tab,
+      ),
+    ).toContain(
+      "would end the tab. The Bevel modifier 'Bev' of 'Cube' would make 69,192 of these triangles (lower its segments).",
+    );
+  });
+
+  it('prints the figures of a refusal so that they add up and the need never prints like the room', () => {
+    // one decimal: 0.9 GB needed, 0.3 GB left of 2.0 GB, 1.7 GB of which others hold
+    expect(refusalFigures(0.9 * GB, 2 * GB, 1.7 * GB)).toEqual({
+      need: '0.9',
+      total: '2.0',
+      used: '1.7',
+      room: '0.3',
+      digits: 1,
+    });
+    // rounded alone, 0.35 GB less 0.09 GB would print 0.27 GB of room: the room is what they print
+    expect(refusalFigures(0.38 * GB, 0.3549 * GB, 0.0851 * GB, 2)).toMatchObject({
+      total: '0.35',
+      used: '0.09',
+      room: '0.26',
+    });
+    // a figure that is not 0 never prints as 0: 3 MB with three decimals
+    expect(refusalFigures(0.5 * GB, 0.4 * GB, 3 * MB, 2)).toEqual({
+      need: '0.500',
+      total: '0.400',
+      used: '0.003',
+      room: '0.397',
+      digits: 3,
+    });
+    // nor does the room that is left: 31 MB of 94 MB
+    expect(refusalFigures(32 * MB, 94 * MB, 63 * MB)).toMatchObject({
+      need: '0.031',
+      total: '0.092',
+      used: '0.062',
+      room: '0.030',
+    });
+    // a need one byte over the room: three decimals, the need rounded up, the total down, the use up
+    const f = refusalFigures(0.5 * GB + 1, 0.7 * GB, 0.2 * GB);
+    expect(Number(f.need)).toBeGreaterThan(Number(f.room));
+    expect(Number(f.total) - Number(f.used)).toBeCloseTo(Number(f.room), 9);
+    // when the use takes it all, there is no room
+    expect(refusalFigures(0.03 * GB, 0.37 * GB, 0.63 * GB, 2).room).toBeNull();
+  });
+
+  it('suggests the RASTER engine for a path traced render it refuses only where a RASTER render fits the page', async () => {
+    const { pool } = recordingPool(2);
+    // a tab of 64 MB budget: the image of 1024 × 1024 pixels does not fit, the scene's geometry does
+    const memory = { ...roomy, budget: 64 * MB, deviceGB: 0.125 };
+    const fits = startPathTrace(pool, scene(), { width: 1024, height: 1024, frame: 1, samples: 1, memory });
+    await expect(fits.result).rejects.toThrow(/, or render with the RASTER engine\.$/);
+    // a cable whose surface would not fit the page's heap either
+    const dense = scene();
+    cable(dense, 32, 1024, 32);
+    const heap = { ...memory, heapLimit: 497 * MB, heapUsed: 20 * MB };
+    const refused = startPathTrace(pool, dense, {
+      width: 1024,
+      height: 1024,
+      frame: 1,
+      samples: 1,
+      memory: heap,
+    });
+    const message = await refused.result.then(
+      () => '',
+      (err: Error) => err.message,
+    );
+    expect(message).toMatch(/^Path tracing was not started: /);
+    expect(message).not.toContain('RASTER');
+    expect(rasterRefusal(rasterNeeds(estimateRender(dense, true, 1)), heap)).not.toBeNull();
+    // a RASTER render fits the page with 1 MB to spare, but not next to the heap a path traced render
+    // running in the tab holds: suggested only while none runs
+    const raster = rasterNeeds(estimateRender(scene(), true, 1)).heap;
+    const page = { ...memory, heapLimit: 497 * MB, heapUsed: usableHeap(497 * MB) - raster - MB };
+    const big = { width: 1024, height: 1024, frame: 1, samples: 1, memory: page };
+    await expect(startPathTrace(pool, scene(), big).result).rejects.toThrow(
+      /, or render with the RASTER engine\.$/,
+    );
+    const running = startPathTrace(pool, scene(), {
+      width: 24,
+      height: 16,
+      frame: 1,
+      samples: 1 << 16,
+      memory: roomy,
+    });
+    await new Promise<void>((resolve) => {
+      const off = running.subscribe(() => {
+        if (running.status.phase !== 'rendering') return;
+        off();
+        resolve();
+      });
+    });
+    const next = await startPathTrace(pool, scene(), big).result.then(
+      () => '',
+      (err: Error) => err.message,
+    );
+    expect(next).toMatch(/^Path tracing was not started: /);
+    expect(next).not.toContain('RASTER');
+    running.cancel();
+    await running.result;
+    // the room shrinks while the first worker prepares (here the budget; in a tab, renders that start
+    // meanwhile): the plan with the compiled scene refuses the render, and suggests RASTER all the same
+    const one = recordingPool(1);
+    const shrinking = { ...roomy };
+    const late = startPathTrace(one.pool, scene(), {
+      width: 24,
+      height: 16,
+      frame: 1,
+      samples: 1,
+      memory: shrinking,
+    });
+    shrinking.budget = 0;
+    await expect(late.result).rejects.toThrow(
+      /^Path tracing was not started: .*, or render with the RASTER engine\.$/,
+    );
+    // refused once its first worker had prepared the scene
+    expect(one.sent.flat().filter((t) => t.startsWith('prepare'))).toHaveLength(1);
+  });
+
+  it("counts the bevel object's curve at the frame it renders, as the first worker builds it", async () => {
+    const doc = scene();
+    // an open profile of 3 points (no fill of its own) sampled at its render resolution, keyed from 2
+    // to 24 samples per span: 5 and 49 points, 13 as stored
+    const profile = doc.addCurve({ dimensions: '2D', splines: [wave('BEZIER', 3)], render_resolution_u: 6 });
+    const profileObject = doc.addObject({
+      name: 'Profile',
+      type: 'CURVE',
+      data: profile,
+      location: [0, 5, 0],
+    });
+    key(doc, 'curve', profile, 'render_resolution_u', [
+      [1, 2],
+      [10, 24],
+    ]);
+    const data = doc.getObject(cable(doc, 6, 4, 4))!.data!;
+    doc.updateCurve(data, { bevel_mode: 'OBJECT', bevel_object: profileObject });
+    // the cable's 21 points swept by the profile: 20 × 12 quads as stored
+    expect(estimateRender(doc, true).triangles).toBe(12 + 2 * 20 * 12);
+    for (const [frame, quads] of [
+      [1, 20 * 4],
+      [10, 20 * 48],
+    ]) {
+      expect(estimateRender(doc, true, frame).triangles).toBe(12 + 2 * quads);
+      expect((await preparedInfo(doc, 24, 16, frame)).triangles).toBe(12 + 2 * quads);
+    }
+  });
+
+  it("takes the page's heap from its viewport geometry at the frame the viewport shows, by default the one it renders", async () => {
+    const perf = performance as { memory?: unknown };
+    const before = Object.getOwnPropertyDescriptor(performance, 'memory');
+    // a heap limit of 400 MB, the browser's figure stale at 10 MB
+    Object.defineProperty(performance, 'memory', {
+      value: { jsHeapSizeLimit: 400 * MB, usedJSHeapSize: 10 * MB },
+      configurable: true,
+    });
+    try {
+      // a grid subdivided four times in the viewport at frame 1 (keyed; stored and from frame 10: none)
+      const doc = scene();
+      doc.addObject({
+        name: 'Grid',
+        type: 'MESH',
+        data: grid(doc, 64),
+        modifiers: [modifier('Sub', 'SUBSURF', { levels: 0, render_levels: 0 })],
+      });
+      const id = doc.findObjectByName('Grid')!.id;
+      key(doc, 'object', id, 'modifiers["Sub"].levels', [
+        [1, 4],
+        [10, 0],
+      ]);
+      expect(pageHeapEstimate(doc, 1)).toBeGreaterThan(usableHeap(400 * MB));
+      expect(pageHeapEstimate(doc)).toBeLessThan(2 * MB);
+      expect(pageHeapEstimate(doc, 10)).toBeLessThan(2 * MB);
+      const { pool, started } = recordingPool(2);
+      await expect(
+        startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1 }).result,
+      ).rejects.toThrow(/and the tab has none left for it: .*, and the page uses 0\.\d\d GB \(about/);
+      expect(started).toEqual([]);
+      const r = await startPathTrace(pool, doc, { width: 24, height: 16, frame: 10, samples: 1 }).result;
+      expect(r.samples).toBe(1);
+      // the page holds the viewport's evaluation: at the frame the viewport shows where it is given
+      await expect(
+        startPathTrace(pool, doc, { width: 24, height: 16, frame: 10, pageFrame: 1, samples: 1 }).result,
+      ).rejects.toThrow(/and the tab has none left for it: .*, and the page uses 0\.\d\d GB \(about/);
+      const shown = startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, pageFrame: 10, samples: 1 });
+      expect((await shown.result).samples).toBe(1);
+    } finally {
+      if (before) Object.defineProperty(performance, 'memory', before);
+      else delete perf.memory;
     }
   });
 });

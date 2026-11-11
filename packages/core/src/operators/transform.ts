@@ -68,7 +68,7 @@ export function selectionPivot(
     const o = doc.getObject(state.activeId);
     const mesh = o?.data ? doc.getMesh(o.data) : null;
     if (!o || !mesh) return [0, 0, 0];
-    const mw = evaluatedWorld(fs, o.id);
+    const mw = shownWorld(fs, o.id);
     const verts = [...selectedVertexSet(mesh, state.meshSelection)].filter((v) => v < vertexCount(mesh));
     if (verts.length === 0) return transformPoint3(mw, [0, 0, 0]);
     const pts = verts.map((v) =>
@@ -528,6 +528,73 @@ function cyclicNodes(graph: ReadonlyMap<string, readonly string[]>): Set<string>
   return out;
 }
 
+/** The relations of the scene at the frame of `fs` (see {@link sceneRelations}), computed once. */
+const relationsOfState = new WeakMap<FrameState, SceneRelations>();
+function relationsOf(fs: FrameState): SceneRelations {
+  let r = relationsOfState.get(fs);
+  if (!r) relationsOfState.set(fs, (r = sceneRelations(fs)));
+  return r;
+}
+
+/**
+ * The nodes whose evaluation reads a node on a dependency cycle, directly or through others, the
+ * nodes on cycles included (see {@link sceneRelations}): what evaluating one of these gives
+ * depends on where the evaluation enters the cycle. Empty without a cycle; computed once.
+ */
+const readersOfCycles = new WeakMap<SceneRelations, ReadonlySet<string>>();
+function cycleReaders(relations: SceneRelations): ReadonlySet<string> {
+  const known = readersOfCycles.get(relations);
+  if (known) return known;
+  const { readers, cyclic } = relations;
+  const queue = [...cyclic];
+  const found = new Set(queue);
+  for (let i = 0; i < queue.length; i++)
+    for (const r of readers.get(queue[i]) ?? [])
+      if (!found.has(r)) {
+        found.add(r);
+        queue.push(r);
+      }
+  readersOfCycles.set(relations, found);
+  return found;
+}
+
+/** Whether evaluating `node` (see {@link sceneRelations}) reads a dependency cycle. */
+function readsCycle(relations: SceneRelations, node: string): boolean {
+  return relations.cyclic.size > 0 && cycleReaders(relations).has(node);
+}
+
+/**
+ * Evaluates every object of `fs` in the document's order (once), as the viewport and the
+ * operators' evaluation of the scene do: what is read from `fs` afterwards is what the scene shows,
+ * also where it reads a dependency cycle (see {@link readsCycle}).
+ */
+const settledStates = new WeakSet<FrameState>();
+function settle(fs: FrameState): void {
+  if (settledStates.has(fs)) return;
+  settledStates.add(fs);
+  for (const o of fs.objects) fs.world(o.id);
+}
+
+/**
+ * The world matrix of object `id` where the scene shows it at the frame of `fs` (see
+ * {@link evaluatedWorld}), for `fs` a frame state that has not evaluated the object yet: where
+ * evaluating it reads a dependency cycle (see {@link sceneRelations}), what evaluation gives can
+ * depend on the order objects are evaluated in (an object parented to a bone of a pose cycle shows
+ * no matrix when evaluated first), so `fs` then first evaluates every object in the document's
+ * order, as the viewport does (see {@link ObjectTransform}). The matrix of an object without a
+ * parent, constraints or drivers of its channels reads nothing else: no relations are needed.
+ */
+export function shownWorld(fs: FrameState, id: string): Mat4 {
+  const o = fs.byId.get(id);
+  const readsOthers =
+    !!o &&
+    (!!o.parent ||
+      !!o.constraints?.length ||
+      fs.doc.listDrivers().some((d) => !d.mute && animNode(d.target_type, d.target_id) === `chan:${id}`));
+  if (readsOthers && readsCycle(relationsOf(fs), `object:${id}`)) settle(fs);
+  return evaluatedWorld(fs, id);
+}
+
 /** An object's channels before and after an operator changed them (or left them as they were). */
 export interface ChannelChange {
   before: TransformChannels;
@@ -557,10 +624,12 @@ export class ObjectTransform {
 
   /**
    * Reads what the transform starts from at the frame of `fs`, a frame state nothing has read
-   * world matrices from yet. In a scene with a dependency cycle (see {@link sceneRelations}), where
-   * what evaluation gives depends on the order objects are evaluated in (the cycle breaks where it
-   * is entered), `fs` first evaluates every object in the document's order, as the viewport and the
-   * operators' evaluation of the scene do, so the transform starts from what the scene shows.
+   * world matrices from yet. Where what an object the transform transforms shows reads a
+   * dependency cycle (see {@link sceneRelations}), what evaluation gives depends on the order
+   * objects are evaluated in (the cycle breaks where it is entered): `fs` then first evaluates
+   * every object in the document's order, as the viewport and the operators' evaluation of the
+   * scene do, so the transform starts from what the scene shows ({@link settle}). A cycle elsewhere
+   * in the scene costs nothing more.
    */
   constructor(
     readonly fs: FrameState,
@@ -568,11 +637,11 @@ export class ObjectTransform {
     readonly pivotMode: PivotPoint,
     readonly mode: TransformMode,
   ) {
-    this.relations = sceneRelations(fs);
-    if (this.relations.cyclic.size) for (const o of fs.objects) fs.world(o.id);
+    this.relations = relationsOf(fs);
     const existing = ids.filter((id) => fs.byId.has(id));
     const keepChildren = pivotMode === 'INDIVIDUAL_ORIGINS' && mode === 'ROTATE';
     const roots = transformRoots(fs.doc, existing, keepChildren);
+    if (roots.some((id) => this.readsCycle(`object:${id}`))) this.settle();
     const sorted = roots
       .map((id, i) => ({ id, i, d: depthOf(fs, id) }))
       .sort((a, b) => a.d - b.d || a.i - b.i);
@@ -594,6 +663,21 @@ export class ObjectTransform {
     return this.byId.get(id);
   }
 
+  /** Whether evaluating `node` (see {@link sceneRelations}) reads a dependency cycle. */
+  private readsCycle(node: string): boolean {
+    return readsCycle(this.relations, node);
+  }
+
+  /**
+   * Evaluates every object of the frame state the transform starts from, `fs`, in the document's
+   * order (once), as the viewport and the operators' evaluation of the scene do: what is read from
+   * `fs` afterwards is what the scene shows, also where it reads a dependency cycle (see
+   * {@link readsCycle}).
+   */
+  private settle(): void {
+    settle(this.fs);
+  }
+
   /**
    * The pivot for `state`'s 3D cursor and active object, as Blender's calculateCenter finds it: the
    * cursor; with Active Element the active object's origin (where the transform reads it when it
@@ -610,6 +694,7 @@ export class ObjectTransform {
     if (this.pivotMode === 'ACTIVE_ELEMENT' && active && this.fs.byId.has(active)) {
       const own = this.byId.get(active);
       if (own) return [...own.basis.center] as Vec3;
+      if (this.readsCycle(`object:${active}`)) this.settle();
       const w = evaluatedWorld(this.fs, active);
       return [w[12], w[13], w[14]];
     }
@@ -681,12 +766,13 @@ export class ObjectTransform {
    * object). A rigid body the transform moves follows its channels, without the simulation, as in
    * Blender while it is being transformed (FrameStateOptions.unsimulated). Only these objects are
    * evaluated anew, the rest is read from the frame state the transform started from
-   * (FrameStateOptions.affected): a move costs what these objects cost, whatever the size of the
-   * scene. Where a dependency cycle runs through what these objects evaluate anew (see
-   * {@link affectedObjects}), whose result depends on the order of evaluation, every object is
-   * evaluated anew in the document's order instead, as the scene is once the transform is
-   * confirmed: a move then costs what evaluating the scene costs. Objects on a dependency cycle that
-   * this evaluation leaves without a matrix are left out.
+   * (FrameStateOptions.affected; where they read a dependency cycle, as the scene evaluates it in
+   * the document's order, see {@link affectedObjects}): a move costs what these objects cost,
+   * whatever the size of the scene. Where a dependency cycle runs through what these objects
+   * evaluate anew (see {@link affectedObjects}), whose result depends on the order of evaluation,
+   * every object is evaluated anew in the document's order instead, as the scene is once the
+   * transform is confirmed: a move then costs what evaluating the scene costs. Objects on a
+   * dependency cycle that this evaluation leaves without a matrix are left out.
    */
   worlds(
     channels: ReadonlyMap<string, TransformChannels>,
@@ -820,7 +906,10 @@ export class ObjectTransform {
    * among them (`<type>:<id>`); `cyclic`: whether a dependency cycle runs through what an overlay
    * evaluates anew, all of each object in `set` (its values, matrix and pose, also where the
    * transform does not reach them) and the datablocks in `data`; `unsimulated`: the rigid bodies
-   * the transform moves whose matrices the simulation sets.
+   * the transform moves whose matrices the simulation sets. Where what an overlay evaluates anew
+   * reads a dependency cycle it does not run through, the frame state the transform started from,
+   * which the overlay reads the cycle from, evaluates every object in the document's order first
+   * ({@link settle}).
    */
   private affectedObjects(): NonNullable<ObjectTransform['affected']> {
     if (this.affected) return this.affected;
@@ -872,14 +961,19 @@ export class ObjectTransform {
     // an overlay evaluates the objects in `set` anew, all of each (its values, matrix and pose, also
     // where the transform does not reach them), and the datablocks in `data`: where one of these is
     // on a dependency cycle, what it gives depends on where its evaluation enters the cycle
-    let touchesCycle = false;
-    for (const n of cyclic) {
+    const evaluatedAnew = (n: string) => {
       const id = objectOf(n);
-      if (id === null ? visited.has(n) : set.has(id)) {
+      return id === null ? visited.has(n) : set.has(id);
+    };
+    let touchesCycle = false;
+    for (const n of cyclic)
+      if (evaluatedAnew(n)) {
         touchesCycle = true;
         break;
       }
-    }
+    // else, where what the overlay evaluates anew reads a dependency cycle (one it does not evaluate
+    // anew), it reads what the cycle gives from `fs`, which must give what the scene shows
+    if (!touchesCycle && [...cycleReaders(this.relations)].some(evaluatedAnew)) this.settle();
     const unsimulated = new Set(this.targets.filter((t) => fs.simulated?.has(t.id)).map((t) => t.id));
     return (this.affected = { order, set, data, cyclic: touchesCycle, unsimulated });
   }
@@ -1157,7 +1251,7 @@ export function transformSelection(
     const verts = selectedVertexSet(t.mesh, t.selection);
     if (verts.size === 0) throw new OperatorError('No vertices selected', 'POLL_FAILED');
     const pivot = pivotOverride ?? selectionPivot(doc, state, state.pivotPoint, { mode, fs });
-    const mesh = transformVertices(t.mesh, verts, evaluatedWorld(fs, t.object.id), m, pivot, {
+    const mesh = transformVertices(t.mesh, verts, shownWorld(fs, t.object.id), m, pivot, {
       proportional: state.proportionalEditing,
       proportionalSize: state.proportionalSize,
       falloff: state.proportionalFalloff,

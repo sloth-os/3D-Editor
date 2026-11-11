@@ -266,16 +266,23 @@ function problemTarget(source: string): string | null {
 
 /** Evaluation problems by object id (data ids are mapped to the objects using them). */
 function problemsByObject(scene: SceneDoc, ev: EvaluatedScene): Map<string, EvalError[]> {
+  // lists grown in place: copying them per user took seconds for thousands of linked duplicates
+  const add = <T>(m: Map<string, T[]>, key: string, value: T) => {
+    const list = m.get(key);
+    if (list) list.push(value);
+    else m.set(key, [value]);
+  };
   const byData = new Map<string, string[]>();
-  for (const o of scene.listObjects()) {
-    if (o.data) byData.set(o.data, [...(byData.get(o.data) ?? []), o.id]);
-    for (const m of o.material_slots) if (m) byData.set(m, [...(byData.get(m) ?? []), o.id]);
+  // the evaluated objects: their data and material slots as stored, without reading the objects again
+  for (const { data: o } of ev.objects) {
+    if (o.data) add(byData, o.data, o.id);
+    for (const m of o.material_slots) if (m) add(byData, m, o.id);
   }
   const out = new Map<string, EvalError[]>();
   for (const e of ev.errors) {
     const t = problemTarget(e.source);
     if (!t) continue;
-    for (const id of ev.byId.has(t) ? [t] : (byData.get(t) ?? [])) out.set(id, [...(out.get(id) ?? []), e]);
+    for (const id of ev.byId.has(t) ? [t] : (byData.get(t) ?? [])) add(out, id, e);
   }
   return out;
 }

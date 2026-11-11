@@ -7,11 +7,15 @@ import {
   getModifierDef,
   isModifierEnabled,
   listModifierDefs,
+  modifierDisabledReason,
   modifierObjectParams,
+  modifierObjectRefusal,
   registerBuiltinModifiers,
   type ModifierDef,
+  type ModifierDisabledContext,
 } from '../modifiers';
 import { SceneEvaluator } from '../eval/evaluate';
+import { buildCurvePath } from '../curve/path';
 import { newId } from '../util/id';
 import { uniqueName } from '../util/names';
 import { cloneJson } from '../util/json';
@@ -22,6 +26,15 @@ import { activeObject } from './helpers';
 
 const objectRef = z.string().optional().describe('Object id or name (default: the active object)');
 const modifierRef = z.string().describe('Modifier id or name');
+
+/**
+ * The object types of parameters that name an object, for the operators' descriptions (the
+ * modifiers' objectTypes, as Blender's setters accept them).
+ */
+const OBJECT_TYPES_RULE =
+  'A parameter naming an object takes the types Blender accepts there: a mesh for the Boolean `object`, ' +
+  'the Array `start_cap`/`end_cap` and the Shrinkwrap `target`, an armature for the Armature `object`, a curve ' +
+  'for the Curve `object` (others take any object); an object of another type is refused (INVALID_PARAMS).';
 
 /** Types whose modifiers start disabled in edit mode (like Blender). */
 const EDITMODE_OFF = new Set(['BOOLEAN', 'BUILD', 'DECIMATE']);
@@ -109,6 +122,9 @@ function validateParams(
         `Parameter '${k}' cannot reference the modifier's own object`,
         'INVALID_PARAMS',
       );
+    // Blender stores no object of another type there (rna_modifier.cc modifier_object_set)
+    const refused = modifierObjectRefusal(def.type, k, ref);
+    if (refused) throw new OperatorError(refused, 'INVALID_PARAMS');
     merged[k] = ref.id;
   }
   const res = def.schema.safeParse(merged);
@@ -117,6 +133,14 @@ function validateParams(
     throw new OperatorError(`Invalid ${def.type} parameters: ${msg}`, 'INVALID_PARAMS');
   }
   return cloneJson(res.data as Record<string, unknown>);
+}
+
+/** `message` with the ids of objects, quoted as modifiers report them ('<id>'), replaced by their names. */
+function withObjectNames(ctx: OperatorContext, message: string): string {
+  return message.replace(/'([^'\s]+)'/g, (quoted, id: string) => {
+    const o = ctx.doc.getObject(id);
+    return o ? `'${o.name}'` : quoted;
+  });
 }
 
 function uniqueModifierName(o: ObjectData, base: string, except = -1): string {
@@ -151,7 +175,8 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
         'on curves and text it acts on the generated surface, or on the wire of a curve without one, so SCREW ' +
         'revolves a profile curve). `type` is a Blender ' +
         `modifier type (${typeList}); optional initial \`params\` are validated against the type's parameters. ` +
-        'Returns the new modifier id and its unique name (e.g. "Subdivision", "Subdivision.001").',
+        OBJECT_TYPES_RULE +
+        ' Returns the new modifier id and its unique name (e.g. "Subdivision", "Subdivision.001").',
       category: 'Object',
       redoable: true,
       schema: z.object({
@@ -216,8 +241,11 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
       label: 'Apply Modifier',
       description:
         "Bake the modifier stack up to and including the given modifier into the object's mesh data (shared mesh data " +
-        'is made single-user first) and remove the applied modifiers. Modifiers disabled in the viewport before it ' +
-        'are skipped and kept. Not available in Edit Mode.',
+        'is made single-user first) and remove the applied modifiers. Modifiers before it that are disabled in the ' +
+        'viewport, or that Blender disables because they can do nothing (a Boolean without a mesh object, an ' +
+        'Armature without an armature, a Subdivision Surface with 0 levels, a Smooth or Cast with factor 0, …), are ' +
+        'skipped and kept; such a modifier itself is refused, as in Blender ("Modifier is disabled, skipping ' +
+        'apply"), and kept. Not available in Edit Mode.',
       category: 'Object',
       schema: z.object({ modifier: modifierRef, object: objectRef }),
       execute(ctx, p) {
@@ -239,8 +267,25 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
             'FAILED',
           );
         }
+        // Blender's is_disabled (modifier_apply_obdata, with the viewport's settings): a modifier
+        // that can do nothing is not applied ("Modifier is disabled, skipping apply") and stays
+        const disabledCtx: ModifierDisabledContext = {
+          forRender: false,
+          objectType: (id) => ctx.doc.getObject(id)?.type ?? null,
+          objectName: (id) => ctx.doc.getObject(id)?.name ?? id,
+        };
+        const reason = modifierDisabledReason(target, disabledCtx);
+        if (reason)
+          throw new OperatorError(
+            `Modifier is disabled, skipping apply: the ${getModifierDef(target.type)?.label ?? target.type} ` +
+              `modifier '${target.name}' ${reason}, so it changes nothing; change it with object.modifier_set or ` +
+              'remove it with object.modifier_remove',
+            'FAILED',
+          );
         const flags = { forRender: false, editMode: false };
-        const stack = o.modifiers.slice(0, idx + 1).filter((m) => isModifierEnabled(m, flags));
+        const stack = o.modifiers
+          .slice(0, idx + 1)
+          .filter((m) => isModifierEnabled(m, flags) && !modifierDisabledReason(m, disabledCtx));
         const base = ctx.doc.getMesh(o.data!);
         if (!base) throw new OperatorError('Mesh data missing', 'FAILED');
         const ev = new SceneEvaluator(ctx.doc).evaluate(ctx.state.frame);
@@ -260,13 +305,20 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
             const e = ev.byId.get(id);
             return e?.pose ? { pose: e.pose, matrix: e.worldMatrix } : null;
           },
+          // Curve modifier: the path of the curve's evaluated data, where the scene shows the curve
+          getCurvePath: (id) => {
+            const e = ev.byId.get(id);
+            const path = e?.type === 'CURVE' && e.curve ? buildCurvePath(e.curve) : null;
+            return e && path ? { path, matrix: e.worldMatrix } : null;
+          },
           vertexGroups: ctx.doc.getVertexGroups(o.data!),
         });
         if (result.errors.length) {
           const msg = result.errors
             .map(
               (e) =>
-                `'${o.modifiers.find((m) => m.id === e.modifierId)?.name ?? e.modifierId}': ${e.message}`,
+                `'${o.modifiers.find((m) => m.id === e.modifierId)?.name ?? e.modifierId}': ` +
+                withObjectNames(ctx, e.message),
             )
             .join('; ');
           throw new OperatorError(`Cannot apply modifier: ${msg}`, 'FAILED');
@@ -342,7 +394,8 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
       description:
         'Change a modifier: `params` is a partial set of type-specific parameters (merged with the current values and ' +
         'validated; unknown keys are rejected with the list of valid ones), plus optional name and visibility flags ' +
-        '(show_viewport, show_render, show_in_editmode, show_expanded).',
+        '(show_viewport, show_render, show_in_editmode, show_expanded). ' +
+        OBJECT_TYPES_RULE,
       category: 'Object',
       redoable: true,
       schema: z.object({

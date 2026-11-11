@@ -13,6 +13,8 @@ describe('loadConfig', () => {
     expect(c.persistence).toBe('memory');
     expect(c.roomIdleTtlSeconds).toBe(3600);
     expect(c.persistDebounceMs).toBe(1500);
+    expect(c.shutdownTimeoutMs).toBe(9000);
+    expect(c.shutdownSaveWaitMs).toBe(7000);
     expect(c.webdav).toBeNull();
     expect(c.webdavProxy).toBe(false);
     expect(c.authToken).toBeNull();
@@ -33,6 +35,7 @@ describe('loadConfig', () => {
         HOST: '127.0.0.1',
         ROOM_IDLE_TTL_SECONDS: '60',
         PERSIST_DEBOUNCE_MS: '0',
+        SHUTDOWN_TIMEOUT_SECONDS: '29.5',
         MCP_ENABLED: 'false',
         TELEMETRY_ENABLED: 'no',
         LOG_LEVEL: 'DEBUG',
@@ -47,6 +50,8 @@ describe('loadConfig', () => {
     expect(c.host).toBe('127.0.0.1');
     expect(c.roomIdleTtlSeconds).toBe(60);
     expect(c.persistDebounceMs).toBe(0);
+    expect(c.shutdownTimeoutMs).toBe(29_500);
+    expect(c.shutdownSaveWaitMs).toBe(27_500);
     expect(c.mcpEnabled).toBe(false);
     expect(c.telemetryEnabled).toBe(false);
     expect(c.logLevel).toBe('debug');
@@ -134,6 +139,7 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ SYNC_PERSISTENCE: 'webdav' }, noFiles)).toThrow(/WEBDAV_URL/);
     expect(() => loadConfig({ WEBDAV_URL: 'ftp://x' }, noFiles)).toThrow(/WEBDAV_URL/);
     expect(() => loadConfig({ LOG_LEVEL: 'loud' }, noFiles)).toThrow(/LOG_LEVEL/);
+    expect(() => loadConfig({ SHUTDOWN_TIMEOUT_SECONDS: '0' }, noFiles)).toThrow(/SHUTDOWN_TIMEOUT_SECONDS/);
   });
 
   it('finds the public directory next to the bundle, then apps/web/dist', () => {

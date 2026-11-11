@@ -161,7 +161,11 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'view3d.camera_to_view',
       label: 'Align Active Camera to View',
-      description: 'Move the scene camera to the current viewpoint (Ctrl+Alt+Numpad 0).',
+      description:
+        'Move the scene camera to the current viewpoint and switch to the camera view (Ctrl+Alt+Numpad 0). ' +
+        "Under a parent the camera is set in the parent's space as the scene shows it at the current frame " +
+        '(a bone, an animated or constrained parent); an animated channel it changes is keyed at the frame ' +
+        'with its new value.',
       category: 'View',
       uiOnly: true,
       schema: z.object({}),

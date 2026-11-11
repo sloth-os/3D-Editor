@@ -5,6 +5,9 @@
 //   argv: <operator | 'decode' | 'curve'> <grid size n (scatter: instances)> <params JSON (curve: its data)>
 //         <'edit' | 'object' | 'scatter' | 'import' | 'CURVE' | 'FONT'>
 //   import: the grid of n × n faces exported in the format of the import operator, imported from base64
+//   shared-glb: a GLB of `meshes` (params) glTF meshes that all use the accessors of one grid of n × n
+//     quads, imported with the operator
+//   loose: n loose quads in one mesh, in Edit Mode with everything selected
 import v8 from 'node:v8';
 import { createEditorState, createOperatorRegistry, estimateOperator } from '../src/operators';
 import { selectAllElements } from '../src/mesh/selection';
@@ -15,6 +18,57 @@ import { SceneDoc } from '../src/doc/scene-doc';
 import { SceneEvaluator, TEXT_BYTES_PER_CHARACTER, estimateCurveSurface, textGlyphCount } from '../src/eval';
 import { exportScene } from '../src/io';
 import { base64Encode } from '../src/util/json';
+import { createMesh } from '../src/mesh/types';
+
+/** A GLB of `meshes` glTF meshes that all use the positions and indices of one grid of n × n quads. */
+function sharedGlb(n: number, meshes: number): Uint8Array {
+  const V = (n + 1) * (n + 1);
+  const pos = new Float32Array(3 * V);
+  for (let y = 0, i = 0; y <= n; y++) for (let x = 0; x <= n; x++, i++) pos.set([x / n, 0, y / n], 3 * i);
+  const idx = new Uint32Array(6 * n * n);
+  for (let y = 0, t = 0; y < n; y++)
+    for (let x = 0; x < n; x++, t++) {
+      const a = y * (n + 1) + x;
+      idx.set([a, a + 1, a + n + 2, a, a + n + 2, a + n + 1], 6 * t);
+    }
+  const bin = new Uint8Array(pos.byteLength + idx.byteLength);
+  bin.set(new Uint8Array(pos.buffer));
+  bin.set(new Uint8Array(idx.buffer), pos.byteLength);
+  const json = new TextEncoder().encode(
+    JSON.stringify({
+      asset: { version: '2.0' },
+      scene: 0,
+      scenes: [{ nodes: Array.from({ length: meshes }, (_, i) => i) }],
+      nodes: Array.from({ length: meshes }, (_, i) => ({ mesh: i, translation: [1.5 * i, 0, 0] })),
+      meshes: Array.from({ length: meshes }, () => ({
+        primitives: [{ attributes: { POSITION: 0 }, indices: 1 }],
+      })),
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: V, type: 'VEC3', min: [0, 0, 0], max: [1, 0, 1] },
+        { bufferView: 1, componentType: 5125, count: idx.length, type: 'SCALAR' },
+      ],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: pos.byteLength },
+        { buffer: 0, byteOffset: pos.byteLength, byteLength: idx.byteLength },
+      ],
+      buffers: [{ byteLength: bin.byteLength }],
+    }),
+  );
+  const jsonLength = Math.ceil(json.length / 4) * 4;
+  const file = new Uint8Array(28 + jsonLength + bin.byteLength);
+  const dv = new DataView(file.buffer);
+  dv.setUint32(0, 0x46546c67, true);
+  dv.setUint32(4, 2, true);
+  dv.setUint32(8, file.byteLength, true);
+  dv.setUint32(12, jsonLength, true);
+  dv.setUint32(16, 0x4e4f534a, true);
+  file.fill(0x20, 20, 20 + jsonLength);
+  file.set(json, 20);
+  dv.setUint32(20 + jsonLength, bin.byteLength, true);
+  dv.setUint32(24 + jsonLength, 0x004e4942, true);
+  file.set(bin, 28 + jsonLength);
+  return file;
+}
 
 const [op, nArg, paramsJson, mode] = process.argv.slice(2);
 const n = Number(nArg);
@@ -116,6 +170,24 @@ if (op === 'curve') {
       const r = reg.run(ctx, id, params);
       if (!r.ok) throw new Error(`${id}: ${r.error}`);
     }
+  } else if (mode === 'shared-glb') {
+    const { meshes, ...rest } = JSON.parse(paramsJson) as { meshes: number };
+    paramsText = JSON.stringify({ ...rest, data_base64: base64Encode(sharedGlb(n, meshes)) });
+  } else if (mode === 'loose') {
+    const positions: number[] = [];
+    const faces: number[][] = [];
+    for (let i = 0; i < n; i++) {
+      const x = 2 * (i % 300);
+      const y = 2 * Math.floor(i / 300);
+      positions.push(x, y, 0, x + 1, y, 0, x + 1, y + 1, 0, x, y + 1, 0);
+      faces.push([4 * i, 4 * i + 1, 4 * i + 2, 4 * i + 3]);
+    }
+    const meshId = doc.addMesh('Parts', createMesh({ positions, faces }));
+    const id = doc.addObject({ type: 'MESH', name: 'Parts', data: meshId });
+    state.selectedIds = [id];
+    state.activeId = id;
+    state.mode = 'EDIT';
+    state.meshSelection = selectAllElements(doc.getMesh(meshId)!);
   } else if (mode === 'import') {
     const source = SceneDoc.create({ empty: true });
     const id = source.addMesh('Grid', createGrid({ x_subdivisions: n, y_subdivisions: n }));

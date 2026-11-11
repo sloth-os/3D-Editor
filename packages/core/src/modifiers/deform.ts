@@ -61,6 +61,13 @@ export const castModifier: ModifierDef<typeof castSchema> = {
     'the affected region; per-axis toggles restrict the effect.',
   schema: castSchema,
   dependencies: (p) => (p.object ? [p.object] : []),
+  // MOD_cast.cc is_disabled: `if ((cmd->fac == 0.0f) || flag == 0) return true;` (flag: the axes)
+  disabled: (p) =>
+    p.factor === 0
+      ? 'has a factor of 0'
+      : p.use_x || p.use_y || p.use_z
+        ? null
+        : 'uses no axis (use_x, use_y and use_z are off)',
   apply(mesh, p, ctx) {
     const n = vertexCount(mesh);
     const axes = [p.use_x, p.use_y, p.use_z];

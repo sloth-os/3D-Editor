@@ -1095,6 +1095,8 @@ export const bevelModifier: ModifierDef<typeof schema> = {
     'very different angles meet (every rim vertex of a cylinder with limit_method NONE) have shallow dents (under ' +
     '0.6% of the width).',
   schema,
+  // MOD_bevel.cc is_disabled: `return (bmd->value == 0.0f);` (Blender's Amount, `width` here)
+  disabled: (p) => (p.width === 0 ? 'has a width of 0' : null),
   apply(mesh, p) {
     return bevelMesh(mesh, p);
   },

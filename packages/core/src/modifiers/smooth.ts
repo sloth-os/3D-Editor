@@ -61,6 +61,13 @@ export const smoothModifier: ModifierDef<typeof smoothSchema> = {
     'Laplacian smoothing: each iteration moves every vertex toward the average of its edge-connected neighbours by ' +
     '`factor`, optionally limited to some axes. Shrinks and relaxes the shape; topology is unchanged.',
   schema: smoothSchema,
+  // MOD_smooth.cc is_disabled: `if (smd->fac == 0.0f || flag == 0) return true;` (flag: the axes)
+  disabled: (p) =>
+    p.factor === 0
+      ? 'has a factor of 0'
+      : p.use_x || p.use_y || p.use_z
+        ? null
+        : 'uses no axis (use_x, use_y and use_z are off)',
   apply(mesh, p) {
     if (p.iterations === 0 || p.factor === 0 || !(p.use_x || p.use_y || p.use_z)) return mesh;
     return withPositions(mesh, smoothPositions(mesh, p.factor, p.iterations, [p.use_x, p.use_y, p.use_z]));

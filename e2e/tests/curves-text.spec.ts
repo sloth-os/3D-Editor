@@ -9,6 +9,7 @@ import {
   setNumberField,
   statNumber,
   viewportCentre,
+  viewportPictures,
 } from './helpers';
 
 test.describe('curves and text', () => {
@@ -46,10 +47,22 @@ test.describe('curves and text', () => {
     // a finer bevel profile gives more geometry
     await setNumberField(page, 'curve-bevel-resolution', 8);
     await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(tube);
-    // and depth 0 is a wire again, in the viewport too
-    await setNumberField(page, 'curve-bevel-depth', 0);
-    await expect.poll(() => statNumber(page, 'stats-triangles')).toBe(0);
-    await expect.poll(async () => changedFraction(wire, await viewportCentre(page))).toBeLessThan(0.01);
+    // and depth 0 is a wire again, in the viewport too: pictures of depths 0, 0.1 and 0 drawn with
+    // the same multisampling (a busy machine can turn it off between pictures, and edges then differ)
+    const depth = async (d: number) => {
+      await setNumberField(page, 'curve-bevel-depth', d);
+      if (d) await expect.poll(() => statNumber(page, 'stats-triangles')).toBeGreaterThan(tube);
+      else await expect.poll(() => statNumber(page, 'stats-triangles')).toBe(0);
+    };
+    const [flat, swept, flatAgain] = await viewportPictures(
+      page,
+      [() => depth(0), () => depth(0.1), () => depth(0)],
+      viewportCentre,
+    );
+    expect(changedFraction(flat, swept)).toBeGreaterThan(0.03);
+    expect(changedFraction(flat, flatAgain)).toBeLessThan(0.01);
+    // as before the bevel
+    if (wire.samples === flat.samples) expect(changedFraction(wire, flat)).toBeLessThan(0.01);
     await client.close();
   });
 

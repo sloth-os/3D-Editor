@@ -57,6 +57,17 @@ export {
   type RenderOutputSize,
 } from './final';
 export { filmRowsToRGBA8 } from './preview';
+export {
+  INSTANCE_BYTES,
+  RASTER_BYTES_PER_TRIANGLE,
+  estimateRender,
+  pageHeapEstimate,
+  rasterNeeds,
+  rasterRefusal,
+} from './memory';
+export { RasterEvaluationGuard, guardedEvaluation, rasterRefusalWithModifier } from './guard';
+export { refusedModifier } from './worker-engine';
+export { tabMemoryWithRenders } from './path-trace';
 export { RenderCancelledError, type PixelImage, type RenderViewData, type EncodeFormat } from './protocol';
 
 /** Path traces `doc` (as it is now) on the editor's render workers. */

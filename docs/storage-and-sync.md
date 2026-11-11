@@ -60,20 +60,30 @@ project at the same moment. Every writer:
   fails. A room that nobody uses reads the document again before the server opens it, unless it read
   it within the last 2 s; the server waits 5 s at most for that read (and for the check whether
   storage holds a project it deleted again, for the check whether a project has an id that is also
-  the name of a loaded project, both below, and for MCP get_project's check of storage before it
-  answers), and once a request stopped waiting for a read of a project, the requests that come while
-  that read goes on wait for none of that project's reads: an MCP tool that asks whether a project
-  exists and then opens it, deletes it, or checks storage before it answers, as get_project does,
-  waits 5 s for that project's reads, not twice that (a name of a project the server has loaded
-  finds it without a listing of the projects; when a tool lists them, the listing waits for none of
-  them, but it can itself take 30 s, below). Browsers sync every 20 s while the project is open.
-- **Stops within 10 s.** When the server stops (SIGTERM, SIGINT), it saves the projects it has
-  loaded, waits 7 s at most for storage, and closes them; it exits 9 s after the signal at the
-  latest (Docker sends SIGKILL 10 s after SIGTERM; with storage that did not answer, the server used
-  to wait until it gave up after 20 s). It logs the projects whose save failed or did not finish at
-  `error`, `projects not saved at shutdown`, with their ids and names: storage lacks their changes
-  since their last save (a browser that had the project open still holds them, and its next sync
-  stores them).
+  the name of a loaded project, and for the listing of the projects that an MCP tool compares a name
+  with, all below, and for MCP get_project's check of storage before it answers), and once a request
+  stopped waiting for a read of a project, the requests that come while that read goes on wait for
+  none of that project's reads: an MCP tool that asks whether a project exists and then opens it,
+  deletes it, or checks storage before it answers, as get_project does, waits 5 s for that project's
+  reads, not twice that (a listing of the projects waits for none of them, but it can itself take
+  30 s, below). Browsers sync every 20 s while the project is open.
+- **Stops within `SHUTDOWN_TIMEOUT_SECONDS`** (9 s by default). When the server stops (SIGTERM,
+  SIGINT), it saves the projects it has loaded, waits for storage 2 s less than that (7 s by
+  default, half of it below 4 s), and closes them; it exits `SHUTDOWN_TIMEOUT_SECONDS` after the
+  signal at the latest. Docker sends SIGKILL 10 s after SIGTERM (`docker stop -t <s>`, Compose
+  `stop_grace_period`), Kubernetes `terminationGracePeriodSeconds` (30 s by default) after it: set
+  `SHUTDOWN_TIMEOUT_SECONDS` a second below that (29 for Kubernetes' default), so that storage that
+  saves a large project slowly gets that time (with the default, a save that takes longer than 7 s
+  is dropped; with storage that did not answer, the server used to wait until it gave up after
+  20 s). It logs the projects whose save failed or did not finish at `error`,
+  `projects not saved at shutdown`, with their ids and names: storage lacks their changes since
+  their last save (a browser that had the project open still holds them, and its next sync stores
+  them). When the time runs out before the server closed them (a request that does not end holds the
+  shutdown), it names the projects with unsaved changes the same way, with the reason
+  `the shutdown ran out of time before storage saved their changes`, and logs
+  `shutdown timed out after <n> s, exiting`. A second SIGTERM or SIGINT during the shutdown does
+  not stop it (`shutdown already running, signal ignored` at `warn`); a second signal used to end
+  the server at once, without those lines. SIGKILL still ends it at once.
 - **Does not bring back deleted projects** (next section).
 
 `SYNC_PERSISTENCE=disk` checks `If-Match` and writes in one step under a lock, gives each version a
@@ -205,12 +215,37 @@ nothing.
   not answer within 5 s, leaves the name to find that project (such calls used to fail with that
   error while storage failed, also for the agent working on the project); while a read that a
   request stopped waiting for goes on, the requests that name the project, or check storage for it
-  as get_project does, do not wait for storage again. Names are matched against the projects the
-  server has loaded (exactly, then ignoring letter case) before storage is listed, so they find
-  those projects without the listing (it took 30 s with storage that does not answer); a name that
-  nothing matches while listing storage fails, or reading some `project.json` files fails, gets an
-  error that says so and to try again once `list_projects` no longer has
-  `storage_listing_failed: true`, instead of `There are no projects yet`.
+  as get_project does, do not wait for storage again. A name is compared with the projects the
+  server has loaded and those storage lists together, as `list_projects` lists them (exactly, then
+  ignoring letter case; several projects with the name are an error that lists their ids): the
+  names of the loaded projects used to be compared first, so a loaded project hid one that was only
+  in storage with the same name (a browser does not check names), or with the exact name when the
+  loaded one matched only ignoring letter case. The listing for a name lists the projects folder
+  once (WebDAV: one PROPFIND) and reads the `project.json` of a stored project that the server has
+  not loaded only when it has not read it before, when the listing reports another ETag or
+  modification time for its folder (where it reports neither, as the disk does: another ETag of the
+  `project.json`, a stat), or a minute after it last read it (WebDAV servers whose folders keep
+  their ETag when a file in them is written again tell no change: a project that another writer
+  renamed is compared by its new name within a minute there); a project the server loads is read
+  again once it is closed. It read every `project.json` at every lookup before (202 requests per
+  call with 200 projects on WebDAV). The lookups that come while a listing goes on share it. When
+  the server has loaded a project of that name, a lookup waits 5 s at most in all for storage (the
+  check of the name as an id, then the listing), and not for the listing while a read of a loaded
+  project of that name that a request stopped waiting for goes on; when the listing fails, or has
+  not answered by then, a name that a loaded project has finds that project among the loaded
+  projects only (the tool's result says so in `project_note`, `delete_project` deletes nothing by
+  such a name, and the error when several loaded projects have the name says so too; while the
+  listing goes on, the request waits for none of that project's reads, so get_project waits 5 s in
+  all), and a name that none has waits for storage as long as it takes (for the check of the name as
+  an id, then the listing; 30 s per request with storage that does not answer). When the last
+  listing took longer than 5 s (storage that lists slowly), a lookup does not wait for one: a name
+  that one project has in the last listing that listed storage, made within the last minute, finds
+  that project at once (with a `project_note` that says how old that listing is), and a new listing
+  goes on; a name that it does not settle waits for that one (each round of listings used to cost a
+  lookup 5 s: 5 s every second or third call while listing took 6 s). A name that nothing matches
+  while listing storage fails, or reading some `project.json` files fails, gets an error that says
+  so and to try again once `list_projects` no longer has `storage_listing_failed: true`, instead of
+  `There are no projects yet`.
 - The server that deleted a project closes sync connections to it for an hour (they would upload
   a browser's copy as a new project), but lists and opens it as soon as storage holds it again
   (another writer saved its unsaved changes). It asks storage whether it does when a request needs

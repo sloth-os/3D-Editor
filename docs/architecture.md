@@ -149,7 +149,8 @@ viewport, both renderers, the exporters, the MCP scene summaries and the scene-t
 read the scene through it. One evaluator lives in every project session, render worker and server
 render process, and keeps its caches between calls. The MCP inspection tools keep two per document
 (render and viewport settings) and reuse the 16 most recent evaluations (by frame and settings)
-until the document changes (`apps/server/src/mcp/eval-cache.ts`).
+until the document changes, fewer where they would take more of the server's heap than it keeps for
+them (`apps/server/src/mcp/eval-cache.ts`; see Scene evaluations in the server's process below).
 
 In short, per frame: F-curves → drivers → parenting → armature poses → constraints (in dependency
 order) → rigid body overrides, then shape keys → curves and text → modifier stacks → instancing.
@@ -259,16 +260,49 @@ labeled contact sheets.
 F12 with the path tracer and Ctrl+F12 run on a pool of Web Workers (`apps/web/src/render`): one per
 core (`navigator.hardwareConcurrency`, at most 8), started on first use and stopped after 90
 seconds without work; where workers cannot start, an in-process stand-in runs the same code between
-event loop turns. Each worker receives the document as a Yjs state update (later renders send only
-the difference), evaluates and compiles the scene itself, and renders bands of rows handed out pass
-by pass (`schedule.ts`). The main thread adds the tiles to one film and refreshes the preview row by
-row; at the end a worker denoises and tone maps the mean film. Animation frames are rendered one
-after the other (path traced on the workers, or rasterized with WebGL) and streamed to an APNG or
-GIF encoder on a worker, so the main thread keeps no frames. Canceling keeps the samples or frames
-finished so far. The editor's RPC handler path traces on these workers when a request asks for
-`engine: PATHTRACER`: the server's MCP `render_image` sends such requests with
-`renderer: browser` (with `renderer: auto` it path traces on the server and sends only raster
-renders to browsers).
+event loop turns. The first worker receives the document as a Yjs state update (later renders send
+only the difference), evaluates the scene at the render's frame with the render settings and
+compiles it. The other workers get a copy of the compiled scene, one after the other, and join as
+soon as they have it; the last one gets the main thread's copy itself (its buffers transferred), so
+only the first worker holds the document and the evaluated scene. Every worker renders bands of
+rows handed out pass by pass (`schedule.ts`). The main thread adds the tiles to one film and
+refreshes the preview row by row; at the end a worker denoises and tone maps the mean film.
+
+The tab's memory decides how many workers a render uses (`memory.ts`): the JavaScript heap, whose
+limit the page and its workers share (Chrome's `performance.memory`), and a budget of half the
+device memory the browser reports (at most 4 GB), next to the path traced renders already running
+in the tab. Only the workers an estimate of the document leaves room for start with the render, more
+once the first worker reports the compiled scene; the render window shows "(memory)" after the
+thread count when the memory allows fewer threads than the pool has. A render that does not fit one
+worker is refused with the reason instead of ending the tab (V8 ends the whole tab when a worker
+runs out of heap): before any worker starts, when the estimate shows it (the document at the
+render's frame, with its animated and driven values); else on the first worker, before a modifier
+that would not fit runs, counted from its real input (`guard.ts`: the edges a Bevel limited by angle
+bevels, for one), or once the scene is evaluated, before it is compiled. After a render, the workers
+that adopted copies of the compiled scene are stopped when the copies take an eighth of the budget
+or more, and those a refused render started are stopped at once, unless another path traced render
+runs in the tab.
+
+A RASTER render (F12, Ctrl+F12, or an RPC request for the WebGL rasterizer) evaluates the scene with
+the render settings on the page itself, with an evaluator of its own next to the viewport's
+(`ViewportEngine.evaluateFinal`). The geometry it builds and keeps (curve and text surfaces, modifier
+and shape key results; meshes as stored are the page's already) must fit the part of the heap limit a
+render may fill, less the page's own heap (the larger of Chrome's figure and an estimate of the
+viewport's scene) and what the path traced renders running in the tab hold. It is checked like the
+first worker of a path traced render, and refused with the reason when it does not fit: before the
+evaluation, from the document at the frame it renders (120 bytes of heap per triangle built; Chrome
+took 88 to 94), and during it, before each modifier, from its real input (`RasterEvaluationGuard`).
+The geometry an earlier final render kept goes first when it and the new one would not fit together,
+or when a modifier does not fit next to it: the scene is then evaluated once more without it.
+A path tracing refusal suggests the RASTER engine only where this check passes. The MCP
+`render_image` with `renderer: auto` renders on the server when the editor refuses.
+
+Animation frames are rendered one after the other (path traced on the workers, or rasterized with
+WebGL) and streamed to an APNG or GIF encoder on a worker, so the main thread keeps no frames.
+Canceling keeps the samples or frames finished so far. The editor's RPC handler path traces on these
+workers when a request asks for `engine: PATHTRACER`: the server's MCP `render_image` sends such
+requests with `renderer: browser` (with `renderer: auto` it path traces on the server and sends only
+raster renders to browsers).
 
 ### Server render processes
 
@@ -357,7 +391,18 @@ the event loop:
   process does not have that version yet (requests name the version; each process caches up to
   three documents together with their `SceneEvaluator`, the pool mirrors that cache, and a process
   that dropped a document gets the request again with its state), so geometry, instancing and
-  simulation caches survive between renders. In scenes with an unbaked rigid-body simulation, one
+  simulation caches survive between renders. A state larger than 8 MB goes in parts of 8 MB, each
+  sent once the one before was written to the IPC channel (`DOC_PART_BYTES` in `pool.ts`); the
+  render process puts them together. Sent whole, the channel's serializer copied the state into one
+  message in the server's memory outside its JavaScript heap, for every render process at once.
+  What remains is the encoding of the state (`Renderer.docRef`, Yjs `encodeStateAsUpdate`): after
+  each change, the next render encodes the whole state, which takes about three times its size
+  outside the heap at the peak, and keeps it until the first garbage collection after the render's
+  requests (it is held weakly, for the next render of that version). Sending eight stored grids of
+  1,000,000 faces (a state of 511 MB) to a render process takes 1,478 MB of the server's memory
+  outside its heap at the peak and 1,031 MB more RSS (before: 1,982 MB and 1,496 MB); two grids of
+  250,000 faces sent to four render processes 88 MB (before: 160 MB). In scenes with an unbaked
+  rigid-body simulation, one
   process simulates and the resulting matrices (up to 16 MB per document) are shared with the
   others, so the simulation is not repeated per process.
 - **Path-traced stills** are split into bands of rows over sample ranges (tasks of about 25,000
@@ -385,7 +430,22 @@ the event loop:
   modifier that does not fit into the free heap with the reserve left over is skipped with the
   error
   `skipped on the server: this Subdivision Surface would need about … MB of JavaScript heap for a result of about … faces …`
-  (scene summaries list it with the RENDER evaluation's problems; Apply fails with it). A 125 × 125 grid with Subdivision Surface
+  (scene summaries list it with the RENDER evaluation's problems; Apply fails with it). A Bevel
+  limited by angle is counted on its real input right before it runs: the edges whose faces meet at
+  more than its angle and the corners where they meet, in typed arrays (core `bevelCount`, which
+  browser render workers use for the same check, `apps/web/src/render/guard.ts`), and 1,700 bytes per
+  face it adds; it used to count no added face at all. The faces of each edge are found by binary
+  searches among the corners of its two vertices, sorted once: the count scanned every corner of a
+  vertex for each of its edges, and took 20 s for two cones of 20,000 triangles around one vertex
+  each on the server's main thread before the Bevel ran; now two cones of 40,000 take 134 ms, with
+  the same counts as before on 1,308 meshes and parameters. A torus of 16,384 faces beveled by an angle of
+  0.01 rad in 10 segments (about 1,561,088 faces, 2,548 MB estimated) is skipped, and `get_scene`
+  answers. The estimates made before an evaluation (Convert and Apply, the render check of
+  single-thread mode) count those edges on the object's mesh, decoded if the decode check lets it,
+  else every edge as if `limit_method` were NONE; so they do on a mesh with shape keys that are not
+  muted, which deform it before its modifiers: a flat grid of 3,600 faces that a shape key folds
+  into a zigzag has no edge sharper than the angle, and its Bevel made 17,406 faces (estimated
+  93,721 faces now; counted on the flat mesh before, 3,600). A 125 × 125 grid with Subdivision Surface
   levels 4 (4,000,000 faces, about 2,670 MB estimated, 2.4 GB measured) used to stop the server
   from one `get_scene`; now `get_scene` answers in 1.8 s (server 363 MB RSS) and
   `object.modifier_apply` fails with that error. A grid of 2,000,012 triangles with a default
@@ -433,11 +493,59 @@ the event loop:
   multiply geometry, or are bounded by limits of their own, are listed with the reason
   (`UNESTIMATED_OPERATORS`, a test keeps the list complete). An operator that does not fit into
   the free heap with the reserve left over fails with code `OUT_OF_MEMORY` and
-  `not run on the server: it would need about … MB of JavaScript heap for a mesh of about … faces, and the server's process has … MB of its … MB heap free and keeps … MB of it for its other work. Lower … to run it on the server (a browser editor runs it in its own memory)`.
-  One that adds geometry also fails when the project's meshes would then take more than half of the
-  heap less the reserve decoded (786 MB with the default heap: about 6.6 million triangles of grids
-  with UVs at 124 bytes each):
-  `not run on the server: the project's meshes would then take about … MB of JavaScript heap decoded (now … MB), more than the … MB the server's process keeps for the meshes of one project …`.
+  `not run on the server: it would need about … MB of JavaScript heap for a mesh of about … faces, and the server's process has … MB of its … MB heap free and keeps … MB of it for its other work. Lower … to run it on the server (a browser editor runs it in its own memory)`
+  (`for … meshes of about … faces in all`, and `… and … new objects` or `for … new objects` where
+  it adds those). The refusal of an import (`import_*` operators, MCP `import_model`) ends with how
+  to run it in a browser editor that has the project open:
+  `(a browser editor runs it in its own memory: editor_command {command: 'run_operator', params: {operator: 'import_scene.gltf', params: {data_base64}}})`
+  (`import_mesh.stl`, `import_mesh.ply` or `import_scene.obj` for those files). Every object an
+  operator adds counts too: each is a Yjs map of its 31 fields, about 10 KB of heap whatever its
+  geometry (9,400–10,200 bytes kept, measured with `--trace-gc` on runs that added 2,000 to 40,000
+  objects). The estimates count 18,000 bytes at the peak and 11,000 kept per object, more for its
+  datablock (at the peak and kept: a mesh 5,000 and 3,000, a material 9,000 and 7,500, a light
+  6,000 and 5,000, a camera 5,500, a curve or text 13,000 and 12,000, an armature 5,000 and 4,000)
+  and 3 and 2 bytes per character of its JSON beyond 600 (modifiers, constraints and the like) and
+  of its datablock's JSON beyond what the datablock's bytes cover (1,000 characters of a curve or
+  text, 400 of a material or an armature, 300 of a light or a camera: the splines of a curve, the
+  bones of an armature), copies included (core `operators/memory-objects.ts`). What a project
+  keeps is counted the same way, the JSON from up to 32 objects and datablocks of each kind spread
+  over the project and scaled to all of them. Separate (by loose parts counted with a union-find over the faces
+  in typed arrays, by material from the face materials), Duplicate, `object.array_place`,
+  `object.scatter_on_surface` and `object.scatter_add` (linked or not), Make Instances Real (every
+  particle and collection instance), the add and primitive operators, the generators, Convert with
+  `keep_original` and the imports count the objects they add. Separating 200,000 loose quads by
+  loose parts used to end a server with the default heap; now it fails in 0.23 s, a glTF file of
+  200,000 nodes in 1.1 s, and `object.array_place {linked: true, count: 10000}` runs in about a
+  second on a new project (1.07–1.25 s measured on a busy machine), the server at 328 MB RSS at
+  most until it saves the project. The peaks of operators adding 10,000 to 100,000 objects (linked
+  duplicates, layouts, glTF nodes, made-real instances, scattered copies) stayed below their
+  estimates; the closest, 80,000 linked duplicates, peaked at 1,173 MB in three runs on a heap of
+  3,000 MB and at 1,308 MB at most on one of 3,500 MB (round 11's verification), estimated
+  1,407 MB (1,025 MB with the 13,000 bytes per object counted before). One that adds geometry or
+  objects also fails when the project would then need more than half of the heap less the reserve
+  (786 MB with the default heap): its meshes decoded, its objects, datablocks and keyframes (120
+  bytes each), counted from the document's maps without reading them, and what a save of the
+  project takes for a moment, three times what its objects, datablocks and keyframes keep. With
+  disk or WebDAV persistence the server saves a project after every change, and a save (core
+  `storage/project-store.ts`) decodes the whole stored state in the heap about three times: linked
+  cubes needed 30.9 KB more per object for it (10,000 of them; 31.6 KB for 20,000, 2.9 times what
+  they keep), keyframes about 260 bytes each (270,000 of them, 2.2 times), meshes almost nothing
+  (they are read in place: 0.3 MB for four grids of 250,000 faces); a save of 40,000 linked cubes
+  completed with a heap of 1,537 MB at the least. The limit counted only what objects keep before
+  (about 75,000 objects with the default heap), and saves of 70,000 linked cubes ended a server with
+  the default heap; it now holds about 6.6 million triangles of grids with UVs at 124 bytes each, or
+  about 18,700 objects at 44,000 bytes each (11,000 kept, 33,000 more while the project is saved),
+  counted the same with memory persistence:
+  `not run on the server: the project's meshes and objects would then take about … MB of JavaScript heap with … new objects (now … MB with … objects), and a save of it about … MB more for a moment (3 times what its objects, datablocks and keyframes take): … MB in all, more than the … MB the server's process keeps for one project (half of its … MB heap less the … MB it keeps for its other work). Lower …, or delete objects and meshes the project no longer needs`.
+  A project already past that limit (grown in browser editors, or with a heap made smaller) has
+  nothing of the operator to lower:
+  `not run on the server: the project's meshes and objects already take about … MB of JavaScript heap with … objects, and a save of it about … MB more for a moment (3 times what its objects, datablocks and keyframes take): … MB in all, more than the … MB the server's process keeps for one project (…), and this operator would add to them. Delete objects and meshes the project no longer needs`.
+  These two refusals of an import give no browser advice: a browser editor that imported the file
+  would make the project as large, and the server would then hold it too. With the default heap and
+  disk persistence, `object.array_place {linked: true}` of 10,000 and then 8,000 cubes ran in 1.2
+  and 2.1 s, and 1,000 more were refused (17,999 objects, 799 MB in all); saving the project after
+  each change and answering `get_scene` and `get_object` at frames 2 to 17, the server used
+  1,425 MB RSS at most and answered `/healthz` within 1.8 s.
   An operator in Edit Mode (`edit_mesh`, and `run_operator` or `batch` with a selection in mode
   `EDIT`) is checked before Edit Mode is entered and its selection built, from the stored counts of
   the mesh and the size of the selection (the elements listed, or all of them), and again in Edit
@@ -446,8 +554,21 @@ the event loop:
   million faces took; now `mesh.subdivide {number_cuts: 2}` and an extrude of all its faces fail in
   5–13 ms through each of the three tools, the server at 681 MB of memory (RSS) at most. MCP
   `import_model` asks the same check before the import starts: a binary STL by the triangles its
-  header declares (700 bytes each, 406–527 measured, and the mesh decoded), other files by their
-  size (26 bytes per byte of the file, 3–25 measured, and 10 per byte for the meshes they add). With
+  header declares (700 bytes each, 406–527 measured, and the mesh decoded); a glTF file (GLB or
+  `.gltf`) by its JSON (core `io/import-size.ts`), where every glTF mesh a node of the imported
+  scene uses is decoded into a mesh of its own, also where meshes share accessors: the vertices of
+  each mesh's POSITION accessors and its triangles, twice their decoded size and 100 bytes per
+  corner of the largest mesh, 60 bytes per morph target vertex, 250 per keyframe, its nodes as
+  objects and 3 bytes per character of its JSON (estimates 1.16–1.57 times the measured peaks of
+  files of 2,000 to 100,000 nodes, 2.25 times for 300 meshes sharing one small grid); a PLY
+  file by the counts its header declares, its face corners bounded by the bytes after the header;
+  OBJ and ASCII STL files by their size (26 bytes per byte of the file, 3–25 measured, and 10 per
+  byte for the meshes they add), and an OBJ's objects by its `o` and `g` lines. Round 10 estimated
+  glTF files by their size, and a GLB of 40 meshes that all use the accessors of one grid of 600 ×
+  600 quads ended the server; now a GLB of 8 such meshes of a 300 × 300 grid (3.1 MB) needs about
+  381 MB: a new server with a heap of 640 MB, run from the sources, had 627 MB of its 688 MB heap
+  free, kept 256 MB of it and refused the file in 0.14 s; a server with more free heap imports it,
+  and a browser editor imports it with the advised `editor_command` in 6.7 s. With
   six grids of 1,000,000 faces decoded, importing a binary STL of 980,000 triangles (49 MB) fails in
   0.25 s with
   `Import failed: not run on the server: it would need about 843 MB of JavaScript heap …` and code
@@ -459,7 +580,9 @@ the event loop:
   processes run operators without a check.
 - **Stored meshes in the server's process.** The open projects keep their meshes decoded
   (`SceneDoc.getMesh`: 24 bytes per vertex, 72 per face and 8 per corner, with UVs 56 more per face
-  and 16 per corner, core `mesh/memory.ts`). Decoding one asks the server's check first; a mesh
+  and 16 per corner, core `mesh/memory.ts`), and their shape keys as stored, counted at 16 bytes
+  per vertex and key with the project's meshes (15.3–15.4 measured on a grid of 150 × 150 quads
+  with 16 and 32 keys; an import counts its morph targets the same). Decoding one asks the server's check first; a mesh
   that does not fit into the free heap with the reserve left over is not loaded:
   `this mesh of … triangles was not loaded on the server: decoding it needs about … MB of JavaScript heap, …`.
   `get_scene` then lists its stored counts with that reason (`not_loaded`, and among the problems),
@@ -473,7 +596,9 @@ the event loop:
   glyphs) are sampled into and 520 bytes per vertex of the surface swept along them (bevel,
   extrusion) and of 2D fills, counted from the splines' points and resolution, the bevel profile
   and the text's glyphs without building anything, at most the 3,000,000 swept vertices a curve
-  gets (`curve/to-mesh.ts`); text at least 64,000 bytes per character with a glyph. Peaks measured
+  gets (`curve/to-mesh.ts`); text at least 64,000 bytes per character with a glyph. Convert counts
+  the 32 MB once for all the curves and texts it converts (300 texts: 125 MB estimated, 9,729 MB
+  before; the conversion peaked at 27.7 MB). Peaks measured
   with `--trace-gc` per vertex: 260–300 bytes on smooth sweeps of 0.8 to 2.9 million vertices,
   up to 463 where every sample is a sharp corner; per sample 860–870 on wires of 100,000 and
   250,000 samples. A surface that does not fit into the free heap with the reserve left over is not
@@ -499,6 +624,40 @@ the event loop:
   or `… the snapshot would be more than the 512 MB of JSON a JavaScript string can hold. …`.
   Three grids of 291,600 faces used to end a server with a 640 MB heap; now the snapshot is
   refused in 0.1 s and the server keeps answering.
+- **Scene evaluations in the server's process.** The inspection tools (`get_scene`, `get_object`,
+  `get_mesh_data`, `get_instances`) keep the evaluations they make, by frame and settings, until the
+  document changes (`apps/server/src/mcp/eval-cache.ts`): at most 16 per project, and those of all
+  projects together within a third of what the server keeps for one project
+  (`evaluationCacheBytes`, 262 MB of the default heap); the least recently used go first, and a
+  closed project's leave with it. An evaluation keeps about 1,500 bytes per object whatever its
+  geometry (1,504–1,563 measured on 10,000 to 30,000 cubes, curves and texts; 2,239–2,244 for lights
+  and cameras, 3,738 for an object with four modifiers, 3,434 for an armature of one bone), the
+  instances of particle systems that move (298 bytes per instance and frame measured; still ones
+  share theirs between frames) and the meshes its modifiers and shape keys make. The cache counts
+  1,600 bytes per object and 3 more per character of the objects' JSON beyond 600 (light, camera
+  and armature datablocks included, from up to 64 objects spread over the project) and 800 per bone
+  (core `sceneEvaluationBytes`), 320 bytes per instance and the meshes by their decoded size, each
+  once however many evaluations hold it. Before an evaluation that is not cached the server asks
+  the same check as everywhere else for its peak, three times what it keeps and 1,000 bytes more
+  per object (4.0–9.7 KB per object measured), when that peak is 32 MB or more (about 5,800
+  objects; the instances a scene expands, at most 200,000 and about 75 MB at the peak, are counted
+  once evaluated). Smaller ones run unchecked, as every evaluation did before: they cannot run the
+  heap out on their own, and the free heap a check reads counts garbage until a collection runs (at
+  most one a second), so that checked, the frames of a scene of two objects asked for in a row were
+  refused while the garbage of the frames before filled the heap. When the
+  peak does not fit into the free heap with the reserve left over, the server drops every cached
+  evaluation, collects garbage and measures again, and an evaluation that still does not fit is
+  not run:
+  `get_object failed: not evaluated on the server: evaluating the scene's … objects would need about … MB of JavaScript heap, and the server's process has … MB of its … MB heap free and keeps … MB of it for its other work. Delete objects the project no longer needs (a browser editor that has the project open evaluates it in its own memory)`
+  with code `OUT_OF_MEMORY` (likewise for the other tools). All 16 evaluations were kept before,
+  whatever they held: `get_object` on an emitter of 200,000 moving instances ended a server with a
+  640 MB heap at the 9th frame asked about. Now, with disk persistence, a server with a 1 GB heap
+  answers `get_scene` and `get_object` about 9,000 linked cubes (one `object.array_place` of 9,000;
+  the limit per project refused 1,000 more) at frames 2 to 17 in 0.43–0.72 s each, at 583 MB RSS
+  at most, and one with the default heap about 17,999 cubes at frames 2 to 17 in 1.1–1.7 s each
+  (each evaluation holds up the server meanwhile), at 1,425 MB RSS at most. `get_object` grouped the objects by the datablocks they use by copying the
+  list of a datablock's users for each user, which took seconds for thousands of linked duplicates;
+  now it adds to the lists, and takes 1.7–2.1 s for 30,000 linked cubes instead of 6.8–7.2 s.
 
 ## Server
 
@@ -550,9 +709,20 @@ and the timeout. `RoomManager.exists` throws `StorageUnavailableError` when stor
 whether a project that is not loaded exists (it used to answer no), unless the id is also the name
 of a loaded project: then storage that fails, or does not answer within 5 s, makes it answer no, so
 that MCP tools, which ask about a reference as an id first (`AgentSession.resolveProjectId`), find
-that project by its name; `resolveProjectId` then matches the names of the loaded projects
-(`RoomManager.loadedNamed`) before it lists storage, and says when that listing failed or was
-partial (`listProjects` in `apps/server/src/mcp/project-storage.ts`).
+that project by its name; `AgentSession.findProject` then compares the name with the projects this
+server has loaded and those in storage together (`RoomManager.namesOf` of a listing of
+`listForName` in `apps/server/src/mcp/project-storage.ts`: one listing at a time that lookups share,
+waited for 5 s at most in all with the check of the id when a loaded project has the name), and
+with the loaded projects alone (`RoomManager.loadedNamed`) when the listing fails or does not answer
+in time; when the last listing took longer than that, with the last one that listed storage (made
+within `SLOW_LISTING_MAX_AGE_MS`, 60 s) at once while a new one goes on. The listing,
+`RoomManager.listNames`, lists the projects folder once and reads the `project.json` of a stored
+project that the server has not loaded only when it is new, when the listing reports another ETag
+or modification time for its folder (where it reports neither: another `FileStore.etag` of the
+`project.json`), or `STORED_NAME_MAX_AGE_MS` (60 s) after it read it last (`storedNames`, dropped
+when a room closes). A lookup that did not compare every project says so in its error, or in the
+note that `collectProjectNotes` gives the tool call, which `tools.ts` adds to the result as
+`project_note` (and `delete_project` then deletes nothing).
 `ProjectFileStore.listProjects` throws `IncompleteListingError`, with the projects it read
 (`listed`) and the ids it could not read (`unread`), when reading some `project.json` files fails;
 `RoomManager.listProjects` lists the projects it read, so their names stay taken
@@ -563,12 +733,16 @@ It waits for the project's earlier reads and writes of storage (a load, the room
 and writes) 5 s at most in all, and not at all while a read that a request stopped waiting for goes
 on (`Room.storageLate`); when they have not finished, it deletes nothing. It runs one deletion of a
 project at a time, and loads of the project wait for it; a failed deletion is logged once, and REST
-`DELETE` answers 503 with `{error}`. At shutdown `RoomManager.close` waits `shutdownWaitMs` (7 s) at
-most for storage and logs the projects that stayed unsaved (`Room.hasUnsavedChanges`);
-`apps/server/src/main.ts` exits 9 s after SIGTERM at the latest and names those it finds unsaved
-then (`RoomManager.unsaved`). The sync server closes connections to a deleted project with code 4404
-(`PROJECT_DELETED_CLOSE_CODE`, `packages/core/src/sync/protocol.ts`), after which the browser's
-`SyncProvider` (`apps/web/src/sync/provider.ts`) no longer reconnects by itself (status `deleted`,
+`DELETE` answers 503 with `{error}`. On SIGTERM and SIGINT `apps/server/src/main.ts` runs the
+shutdown of `apps/server/src/shutdown.ts` (`stopOnSignals`, whose listeners stay for the whole
+shutdown, so that a second signal is logged and ignored instead of ending the process at once),
+which exits `SHUTDOWN_TIMEOUT_SECONDS` (9 s) after the signal at the latest and names the projects
+it finds unsaved then (`RoomManager.unsaved`);
+`RoomManager.close` waits 2 s less for storage (`setShutdownWait`; `shutdownWaitMs`, 7 s by default)
+and logs the projects that stayed unsaved (`Room.hasUnsavedChanges`). The sync server closes
+connections to a deleted project with code 4404 (`PROJECT_DELETED_CLOSE_CODE`,
+`packages/core/src/sync/protocol.ts`), after which the browser's `SyncProvider`
+(`apps/web/src/sync/provider.ts`) no longer reconnects by itself (status `deleted`,
 which the status bar shows as `Deleted on server`); with WebDAV through the server, `ProjectSession`
 connects it again once a WebDAV sync finds the project stored there again. Save (Ctrl+S) shows what
 `WebDAVSync.save` reports. A room of a project that has a `project.json` and no document writes no

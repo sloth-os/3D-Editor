@@ -364,15 +364,29 @@ describe('the parameters the caveats name', () => {
 
   it("render.render: path traced on as many render workers as the tab's memory allows, or not started", () => {
     // apps/web render/memory.ts sizes the workers to the tab's memory and refuses a path trace that
-    // would not fit even one; the Render window says why (the operator's own description says so)
+    // would not fit even one; the Render window says why (the operator's own description says so).
+    // Since round 11 a render with WebGL is refused too when the geometry it evaluates would not fit
+    // the page's heap (rasterRefusal, thrown by the engine's evaluateFinal for F12, Render Animation
+    // and agents' renders), which the caveat said only of a path traced one
     expect(UI).toContain(
       "on the render workers, as many as the tab's memory allows, and a path traced render that ",
     );
     expect(UI).toContain("'fit into it is not started: the window says why.");
     expect(caveat('render.render')).toContain(
       "with the render engine PATHTRACER path traced on that computer's render workers, as many as its tab's " +
-        'memory allows, and not started when it would not fit into that memory: the window says why',
+        "memory allows; a render that would not fit into the tab's memory, path traced or with WebGL, is not " +
+        'started: the window says why',
     );
+    const web = (path: string) =>
+      readFileSync(fileURLToPath(new URL(`../../../web/src/${path}`, import.meta.url)), 'utf8');
+    expect(web('render/memory.ts')).toContain("'The RASTER render was not started: '");
+    const engine = web('viewport/engine.ts');
+    const final = engine.slice(
+      engine.indexOf('private evaluateFinal('),
+      engine.indexOf('return ev;', engine.indexOf('private evaluateFinal(')),
+    );
+    expect(final).toContain('const refusal = rasterRefusal(needs, memory);');
+    expect(final).toContain('if (refusal) throw new Error(refusal);');
   });
 
   it('wm.call_menu: names every menu the editor has', () => {

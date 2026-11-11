@@ -1,22 +1,83 @@
 import type { ObjectData } from '../doc/types';
 import type { SceneDoc } from '../doc/scene-doc';
-import { decodedMeshBytes, type MeshLayout } from '../mesh/memory';
+import { decodedMeshBytes, isMeshMemoryError, type MeshLayout } from '../mesh/memory';
 import { base64Decode } from '../util/json';
 import {
+  CURVE_FIXED_BYTES,
   TEXT_BYTES_PER_CHARACTER,
   estimateCurveSurface,
   estimateModifier,
   textGlyphCount,
   type CurveSurfaceEstimate,
+  type EstimateContext,
   type MeshSize,
 } from '../eval/memory';
+import type { MeshData } from '../mesh/types';
 import { isModifierEnabled } from '../modifiers';
 import { MAX_GENERATED_FACES } from '../generate/types';
 import type { OperatorContext } from './context';
 import { GENERATOR_LOWER, generatorFaces } from './memory-generators';
 import { instanceBound } from './memory-instances';
+import { isGLB } from '../io/glb';
+import {
+  bytesReader,
+  gltfImportSize,
+  objObjects,
+  plyImportSize,
+  readGltfJson,
+  type ImportReader,
+  type ImportSize,
+} from '../io/import-size';
+import {
+  KEYFRAME_STORED_BYTES,
+  SHAPE_KEY_STORED_BYTES_PER_VERTEX,
+  dataKindOf,
+  datablockExtraJsonChars,
+  extraJsonChars,
+  looseParts,
+  materialParts,
+  newObjectsBytes,
+  projectObjects,
+  saveBytes,
+  storedMeshBytes,
+  type CountedKind,
+  type NewObjects,
+} from './memory-objects';
 
 export { GENERATOR_LOWER, ISOSURFACE_FACES_PER_CELL, generatorFaces } from './memory-generators';
+export { bytesReader, type ImportReader, type ImportSize } from '../io/import-size';
+export {
+  DATABLOCK_ADD_BYTES,
+  DATABLOCK_BASE_JSON_CHARS,
+  EVALUATED_BONE_BYTES,
+  EVALUATED_BYTES_PER_JSON_CHAR,
+  EVALUATED_INSTANCE_BYTES,
+  EVALUATED_OBJECT_BYTES,
+  EVALUATION_PEAK_BYTES,
+  EVALUATION_PEAK_FACTOR,
+  KEYFRAME_STORED_BYTES,
+  DATABLOCK_STORED_BYTES,
+  OBJECT_ADD_BYTES,
+  OBJECT_BASE_JSON_CHARS,
+  OBJECT_JSON_ADD_BYTES,
+  OBJECT_JSON_STORED_BYTES,
+  OBJECT_STORED_BYTES,
+  PROJECT_JSON_SAMPLE,
+  SAVE_BYTES_PER_KEPT_BYTE,
+  SHAPE_KEY_STORED_BYTES_PER_VERTEX,
+  datablockExtraJsonChars,
+  extraJsonChars,
+  looseParts,
+  materialParts,
+  newObjectsBytes,
+  projectObjects,
+  projectStoredBytes,
+  saveBytes,
+  sceneEvaluationBytes,
+  storedMeshBytes,
+  type EvaluationSize,
+  type NewObjects,
+} from './memory-objects';
 
 /*
  * Memory estimates of operators, and the check a host can run before each operator.
@@ -39,7 +100,13 @@ export { GENERATOR_LOWER, ISOSURFACE_FACES_PER_CELL, generatorFaces } from './me
  * Convert) count every object, linked duplicates included, and the meshes they add; Convert and
  * the exports also count curve and text surfaces (eval/memory.ts estimateCurveSurface) and what
  * their new evaluation of the whole scene keeps, the exports every particle and collection
- * instance they write (memory-instances.ts).
+ * instance they write (memory-instances.ts). Every operator and import that adds objects counts
+ * them and their datablocks (memory-objects.ts: about 18 KB each at the peak, 11 KB kept): Separate
+ * by loose parts or by material from the parts it will make, duplicates, made-real instances,
+ * layouts, primitives, generators and the objects of an imported file. The project's objects and
+ * datablocks count with its decoded meshes towards what the server keeps for one project, and so
+ * does what a save of the project takes for a moment (memory-objects.ts saveBytes: three times
+ * what its objects, datablocks and keyframes keep).
  *
  * Every registered operator is either estimated here (OPERATOR_ESTIMATES) or listed with the reason
  * it cannot grow the geometry much past what it reads (UNESTIMATED_OPERATORS); a test checks that
@@ -55,8 +122,20 @@ export interface OperatorEstimate {
   bytes: number;
   /** Faces of the mesh(es) it builds or edits, for messages (0: none). */
   faces: number;
-  /** Decoded bytes of the meshes it adds to the document (0 when it adds none). */
+  /**
+   * Heap the document keeps of what it adds (0 when it adds nothing): the decoded size of the
+   * meshes it adds, and its new objects and datablocks (memory-objects.ts).
+   */
   addedStoredBytes: number;
+  /**
+   * Heap a save of the project takes for a moment for what it adds, beyond addedStoredBytes
+   * (memory-objects.ts saveBytes of its new objects, datablocks and keyframes; 0 or absent: none).
+   */
+  addedSaveBytes?: number;
+  /** Objects it adds (for messages; 0 or absent: none). */
+  objects?: number;
+  /** Meshes it builds when more than one (an import; for messages, with `faces` their faces in all). */
+  meshes?: number;
   /**
    * What to lower for a smaller result, completing "Lower …" (e.g. "number_cuts"); empty when the
    * operator adds next to nothing (a cube).
@@ -70,10 +149,18 @@ export interface OperatorMemoryRequest {
   operator: string;
   estimate: OperatorEstimate;
   /**
-   * Decoded bytes of all meshes of the document before the operator, from their stored counts
-   * (counted when the operator adds geometry, else 0).
+   * Heap the project keeps before the operator (memory-objects.ts projectStoredBytes): its meshes
+   * decoded (from their stored counts) and its objects and datablocks; counted when the operator
+   * adds to it (addedStoredBytes > 0), else 0.
    */
   storedBytes: number;
+  /**
+   * Heap a save of the project takes for a moment beyond storedBytes (memory-objects.ts saveBytes of
+   * its objects, datablocks and keyframes), counted with storedBytes (else 0 or absent).
+   */
+  saveBytes?: number;
+  /** The project's objects before the operator (counted with storedBytes, else absent). */
+  objects?: number;
 }
 
 /** Returns null to run the operator, or why it is not run (it then fails with code OUT_OF_MEMORY). */
@@ -217,6 +304,39 @@ export const IMPORT_STORED_BYTES_PER_FILE_BYTE = 10;
 export const IMPORT_BYTES_PER_STL_TRIANGLE = 700;
 
 /**
+ * Imports counted from their files (glTF, GLB, PLY: io/import-size.ts), per byte of the meshes they
+ * decode (mesh/memory.ts decodedMeshBytes, summed over the meshes): the importer holds every mesh it
+ * parsed until it stores them all, and the garbage of parsing them: 1.3–2.1 times their decoded size
+ * measured beyond OPERATOR_FIXED_BYTES and the term per corner below (GLBs of 1 to 40 meshes sharing
+ * the accessors of grids of 40,000 to 1,440,000 triangles, with and without normals, UVs and colors,
+ * a .gltf with its data embedded, PLY files of 90,000 and 360,000 quads), rounded up.
+ */
+export const IMPORT_BYTES_PER_DECODED_BYTE = 2;
+
+/**
+ * Imports counted from their files, per face corner of the largest mesh: what the importer builds for
+ * one mesh at a time (its edges as a set of strings, arrays grown while they are filled), 42–68
+ * bytes left by the decoded term above on single meshes of 180,000 and 720,000 triangles, rounded up.
+ */
+export const IMPORT_BYTES_PER_CORNER_OF_LARGEST_MESH = 100;
+
+/** glTF morph targets, per vertex of every target (its shape key's positions): 39 measured, rounded up. */
+export const IMPORT_BYTES_PER_MORPH_VERTEX = 60;
+
+/**
+ * glTF animation keyframes the import adds (one per key and component of a channel): 162–207 bytes
+ * measured at the peak (300,000 to 900,000 keyframes), rounded up; the document keeps about 100 of
+ * them (memory-objects.ts KEYFRAME_STORED_BYTES).
+ */
+export const IMPORT_BYTES_PER_KEYFRAME = 250;
+
+/**
+ * glTF JSON text the import parses, per character (the text and the objects it is parsed into; a
+ * .gltf file's whole text, data URIs included): 2.4 measured, rounded up.
+ */
+export const IMPORT_BYTES_PER_JSON_CHAR = 3;
+
+/**
  * Peak heap of the export operators (export_scene.*, export_mesh.*, run in the server's process
  * through run_operator and batch) per face of the meshes they write (bytes): the file is built in
  * that heap and returned in base64. Measured on grids of 90,000 and 250,000 faces: OBJ (text)
@@ -262,14 +382,34 @@ function decodedFaces(faces: number, cornersPerFace = 4): number {
   });
 }
 
-/** Decoded bytes of every mesh of the document, from their stored counts. */
-export function storedMeshBytes(doc: SceneDoc): number {
-  let bytes = 0;
-  for (const b of doc.listMeshBlocks()) bytes += decodedMeshBytes(storedLayout(doc, b.id) ?? EMPTY);
-  return bytes;
+const EMPTY: MeshLayout = { vertices: 0, faces: 0, corners: 0, uvs: false, colors: false };
+
+/**
+ * `e` with the objects and datablocks an operator adds (memory-objects.ts): their peak heap on top
+ * of its own, and what the document keeps of them added to what it stores. An operator with no
+ * estimate of its own gets the young generation's garbage (OPERATOR_FIXED_BYTES) and these, and
+ * `lower` (also when `e` has nothing to lower).
+ */
+function withObjects(e: OperatorEstimate | null, a: NewObjects, lower = ''): OperatorEstimate | null {
+  const datablocks = Object.values(a.datablocks ?? {}).reduce((n, k) => n + (k ?? 0), 0);
+  if (!(a.objects > 0) && !(datablocks > 0)) return e;
+  const { peak, stored } = newObjectsBytes(a);
+  return {
+    ...e,
+    bytes: (e?.bytes ?? OPERATOR_FIXED_BYTES) + peak,
+    faces: e?.faces ?? 0,
+    addedStoredBytes: (e?.addedStoredBytes ?? 0) + stored,
+    addedSaveBytes: (e?.addedSaveBytes ?? 0) + saveBytes(stored),
+    objects: (e?.objects ?? 0) + Math.max(0, a.objects),
+    lower: e?.lower || lower,
+  };
 }
 
-const EMPTY: MeshLayout = { vertices: 0, faces: 0, corners: 0, uvs: false, colors: false };
+/** One new object (and its datablock of `kind`, if any): the add operators. */
+const oneObject =
+  (kind: CountedKind | null, lower = ''): Estimator =>
+  () =>
+    withObjects(null, { objects: 1, datablocks: kind ? { [kind]: 1 } : {} }, lower);
 
 /** The mesh edited in Edit Mode and the sizes of its selection, or null outside mesh Edit Mode. */
 interface EditGeometry {
@@ -446,12 +586,15 @@ function primitive(type: string, lower: string): Estimator {
         lower: lower ? `${lower} (or the faces of the edited mesh)` : 'the faces of the edited mesh',
       };
     }
-    return {
-      bytes: OPERATOR_FIXED_BYTES + PRIMITIVE_BYTES_PER_FACE * faces + stored,
-      faces,
-      addedStoredBytes: stored,
-      lower,
-    };
+    return withObjects(
+      {
+        bytes: OPERATOR_FIXED_BYTES + PRIMITIVE_BYTES_PER_FACE * faces + stored,
+        faces,
+        addedStoredBytes: stored,
+        lower,
+      },
+      { objects: 1, datablocks: { meshes: 1 } },
+    );
   };
 }
 
@@ -539,10 +682,63 @@ function objectMeshes(lower: string, opts: { copies?: boolean; singleUser?: bool
 }
 
 /**
- * The surface curve or text object `o` gets in an evaluation (eval/memory.ts estimateCurveSurface;
- * text at least at the measured cost per character), or null without curve data.
+ * Whether the stored mesh `meshId` has shape keys that are not muted: the evaluation then deforms it
+ * before its modifiers (by their values at the frame, which animation can change), so the stored
+ * mesh is not their input. Reads the stored keys in place (no copy of their data).
  */
-function curveSurface(ctx: OperatorContext, o: ObjectData, forRender: boolean): CurveSurfaceEstimate | null {
+function hasShapeKeys(doc: SceneDoc, meshId: string): boolean {
+  const keys = (doc.map('meshes').get(meshId) as { get(key: string): unknown } | undefined)?.get(
+    'shape_keys',
+  );
+  return Array.isArray(keys) && keys.some((k) => !(k as { mute?: unknown } | null)?.mute);
+}
+
+/**
+ * How the estimates size modifier `m` of object `o` from stored counts (eval/memory.ts
+ * estimateModifier): a Bevel limited by angle that is the first modifier of a mesh without shape
+ * keys counts the edges it bevels on the stored mesh, decoded (the evaluation decodes it all the
+ * same; one the host does not decode counts like the rest); every other one by angle as if every edge
+ * were sharp (limit_method NONE's bound), since its input's shape is not known before the evaluation
+ * (shape keys deform it first: a flat grid of 3,600 faces with a shape key that folds it, beveled by
+ * 0.1 rad in 4 segments, gave 17,406 faces where its stored shape counted none).
+ */
+export function modifierContext(
+  doc: SceneDoc,
+  o: ObjectData,
+  m: { type: string; params?: Record<string, unknown> },
+  first: boolean,
+  forRender: boolean,
+): EstimateContext {
+  let bevelInput: MeshData | null = null;
+  if (
+    m.type === 'BEVEL' &&
+    m.params?.limit_method !== 'NONE' &&
+    first &&
+    o.type === 'MESH' &&
+    o.data &&
+    !hasShapeKeys(doc, o.data)
+  ) {
+    try {
+      bevelInput = doc.getMesh(o.data);
+    } catch (err) {
+      if (!isMeshMemoryError(err)) throw err;
+    }
+  }
+  return { forRender, bevelInput, bevelUpperBound: true };
+}
+
+/**
+ * The surface curve or text object `o` gets in an evaluation (eval/memory.ts estimateCurveSurface;
+ * text at least at the measured cost per character), or null without curve data. `fixed`: the part of
+ * its peak that is the young generation's garbage (CURVE_FIXED_BYTES, which an operator's estimate
+ * counts once as OPERATOR_FIXED_BYTES however many surfaces it builds), 0 when the cost per character
+ * of a text sets the peak.
+ */
+function curveSurface(
+  ctx: OperatorContext,
+  o: ObjectData,
+  forRender: boolean,
+): (CurveSurfaceEstimate & { fixed: number }) | null {
   const curve = o.data ? ctx.doc.getCurve(o.data) : null;
   if (!curve) return null;
   const bevelObject =
@@ -550,9 +746,10 @@ function curveSurface(ctx: OperatorContext, o: ObjectData, forRender: boolean): 
   const bevelCurve =
     bevelObject?.type === 'CURVE' && bevelObject.data ? ctx.doc.getCurve(bevelObject.data) : null;
   const e = estimateCurveSurface(curve, { isText: o.type === 'FONT', forRender, bevelCurve });
-  if (o.type === 'FONT')
-    e.bytes = Math.max(e.bytes, textGlyphCount(curve.body ?? '') * TEXT_BYTES_PER_CHARACTER);
-  return e;
+  const glyphs = o.type === 'FONT' ? textGlyphCount(curve.body ?? '') * TEXT_BYTES_PER_CHARACTER : 0;
+  const fixed = glyphs > e.bytes ? 0 : CURVE_FIXED_BYTES;
+  e.bytes = Math.max(e.bytes, glyphs);
+  return { ...e, fixed };
 }
 
 /** What an evaluation builds for one object (see {@link evaluatedGeometry}). */
@@ -563,6 +760,12 @@ interface EvaluatedGeometry {
   decoded: number;
   /** Peak heap of building the largest of them (bytes). */
   peak: number;
+  /**
+   * The part of `peak` that is the young generation's garbage (a curve or text surface's
+   * CURVE_FIXED_BYTES when it sets the peak, else 0): an operator that builds the geometry of many
+   * objects counts it once (OPERATOR_FIXED_BYTES).
+   */
+  fixed: number;
   /** What to lower for that peak, completing "Lower …". */
   lower: string;
 }
@@ -582,6 +785,7 @@ function evaluatedGeometry(
 ): EvaluatedGeometry | null {
   let size: MeshSize;
   let peak = 0;
+  let fixed = 0;
   let lower = '';
   let built = false;
   if (o.type === 'MESH' && o.data) {
@@ -594,16 +798,20 @@ function evaluatedGeometry(
     // a curve without a surface feeds its wire (one vertex per sample) to its modifiers
     size = c.result.vertices ? c.result : { faces: 0, corners: 0, vertices: c.samples };
     peak = c.bytes;
+    fixed = c.fixed;
     lower = c.lower;
     built = true;
   } else return null;
   const base = size;
+  let first = o.type === 'MESH';
   for (const m of o.modifiers) {
     if (!isModifierEnabled(m, { forRender, editMode: false })) continue;
-    const e = estimateModifier(m, size, { forRender });
+    const e = estimateModifier(m, size, modifierContext(ctx.doc, o, m, first, forRender));
+    first = false;
     if (e.failsByItself) break;
     if (e.bytes > peak) {
       peak = e.bytes;
+      fixed = 0;
       lower = `${e.lower} of the modifiers`;
     }
     size = e.result;
@@ -613,6 +821,7 @@ function evaluatedGeometry(
     size: applyModifiers ? size : base,
     decoded: built ? decodedMeshBytes({ ...size, uvs: true, colors: false }) : 0,
     peak,
+    fixed,
     lower,
   };
 }
@@ -647,9 +856,11 @@ function stackEstimate(
   let peak = 0;
   let lower = '';
   const mods = o.modifiers.slice(0, upTo === null ? undefined : upTo + 1);
+  let first = true;
   for (const m of mods) {
     if (!isModifierEnabled(m, { forRender: false, editMode: false })) continue;
-    const e = estimateModifier(m, size, { forRender: false });
+    const e = estimateModifier(m, size, modifierContext(ctx.doc, o, m, first, false));
+    first = false;
     if (e.failsByItself) return null;
     if (e.bytes > peak) {
       peak = e.bytes;
@@ -664,7 +875,10 @@ function stackEstimate(
  * object.modifier_apply: the stack's peak up to the modifier, a copy of its result and the stored
  * result. object.convert to MESH: a new evaluation of the whole scene (evaluationBytes), then for every
  * selected object it bakes (a mesh with modifiers, a curve or a text; linked duplicates each, every
- * one gets a mesh of its own) the peak of building its geometry, a copy of it and the stored copy.
+ * one gets a mesh of its own) the peak of building its geometry, a copy of it and the stored copy; the
+ * young generation's garbage of building curve and text surfaces once (OPERATOR_FIXED_BYTES), not
+ * once per surface: converting 300 texts peaked at 27.7 MB and was estimated at 9,729 MB with it
+ * counted for each.
  */
 function bakeStack(which: 'convert' | 'apply'): Estimator {
   return (ctx, p) => {
@@ -681,6 +895,8 @@ function bakeStack(which: 'convert' | 'apply'): Estimator {
     let faces = 0;
     let added = 0;
     let lower = '';
+    // Convert gives a curve or text a new mesh, and with keep_original every converted object a copy
+    const fresh: NewObjects = { objects: 0, datablocks: { meshes: 0 } };
     for (const o of objects) {
       if (!o) continue;
       let peak: number;
@@ -701,9 +917,14 @@ function bakeStack(which: 'convert' | 'apply'): Estimator {
         if (o.type === 'MESH' && !stackEstimate(ctx, o, null)) continue;
         const g = evaluatedGeometry(ctx, o, false);
         if (!g) continue;
-        peak = g.peak;
+        peak = g.peak - g.fixed;
         result = g.size;
         what = g.lower;
+        if (p.keep_original) {
+          fresh.objects++;
+          fresh.extraJson = (fresh.extraJson ?? 0) + extraJsonChars(o);
+        }
+        if (p.keep_original || o.type !== 'MESH') fresh.datablocks!.meshes!++;
       }
       const stored = decodedMeshBytes({ ...result, uvs: true, colors: false });
       bytes += peak + OBJECT_MESH_BYTES_PER_FACE * result.faces + stored;
@@ -712,13 +933,17 @@ function bakeStack(which: 'convert' | 'apply'): Estimator {
       lower ||= what;
     }
     if (!bytes) return null;
-    return {
-      bytes: OPERATOR_FIXED_BYTES + bytes + (which === 'convert' ? evaluationBytes(ctx, false) : 0),
-      faces,
-      addedStoredBytes: added,
-      lower:
-        lower || (which === 'apply' ? 'the faces of the mesh' : 'the number or size of the converted meshes'),
-    };
+    return withObjects(
+      {
+        bytes: OPERATOR_FIXED_BYTES + bytes + (which === 'convert' ? evaluationBytes(ctx, false) : 0),
+        faces,
+        addedStoredBytes: added,
+        lower:
+          lower ||
+          (which === 'apply' ? 'the faces of the mesh' : 'the number or size of the converted meshes'),
+      },
+      fresh,
+    );
   };
 }
 
@@ -734,12 +959,15 @@ function generator(kind: string): Estimator {
       generatorFaces(kind, p) ?? GENERATOR_MAX_FACES[kind] ?? MAX_GENERATED_FACES,
     );
     const stored = decodedFaces(faces);
-    return {
-      bytes: OPERATOR_FIXED_BYTES + GENERATOR_BYTES_PER_FACE * faces + stored,
-      faces,
-      addedStoredBytes: stored,
-      lower: GENERATOR_LOWER[kind] ?? 'the parameters that set its size or detail',
-    };
+    return withObjects(
+      {
+        bytes: OPERATOR_FIXED_BYTES + GENERATOR_BYTES_PER_FACE * faces + stored,
+        faces,
+        addedStoredBytes: stored,
+        lower: GENERATOR_LOWER[kind] ?? 'the parameters that set its size or detail',
+      },
+      { objects: 1, datablocks: { meshes: 1 } },
+    );
   };
 }
 
@@ -751,14 +979,75 @@ export function binaryStlTriangles(head: Uint8Array, fileBytes: number): number 
 }
 
 /**
- * Importing a file of `fileBytes` bytes in `format` (stl, obj, ply, gltf or glb) that begins with
- * `head` (its first 84 bytes, or fewer): a binary STL by the triangles its header declares, any
- * other file by its size.
+ * What to lower for a smaller import, by what takes most of its memory (the meshes of a glTF file
+ * with more than one mesh, which may share accessors; the size of other files).
  */
-export function importEstimate(format: string, head: Uint8Array, fileBytes: number): OperatorEstimate {
-  const lower = 'the size of the file (import fewer or simpler meshes)';
-  const tris = format === 'stl' ? binaryStlTriangles(head, fileBytes) : null;
-  if (tris !== null) {
+const IMPORT_LOWER = {
+  size: 'the size of the file (import fewer or simpler meshes)',
+  meshes:
+    'the meshes of the file (every glTF mesh is decoded into a mesh of its own, also where meshes share the same accessors)',
+  objects: 'the nodes (objects) of the file',
+  keyframes: 'the animation keyframes of the file',
+};
+
+/** An import counted from its file (io/import-size.ts): the meshes it decodes, its objects, keyframes and JSON. */
+function countedImport(s: ImportSize): OperatorEstimate {
+  const meshes =
+    IMPORT_BYTES_PER_DECODED_BYTE * s.decodedBytes +
+    IMPORT_BYTES_PER_CORNER_OF_LARGEST_MESH * s.largestCorners +
+    IMPORT_BYTES_PER_MORPH_VERTEX * s.morphVertices;
+  const keyframes = IMPORT_BYTES_PER_KEYFRAME * s.keyframes;
+  const objects = newObjectsBytes({ objects: s.objects }).peak;
+  const lower =
+    objects > meshes && objects > keyframes
+      ? IMPORT_LOWER.objects
+      : keyframes > meshes
+        ? IMPORT_LOWER.keyframes
+        : s.jsonChars && s.meshes > 1
+          ? IMPORT_LOWER.meshes
+          : IMPORT_LOWER.size;
+  return withObjects(
+    {
+      bytes: OPERATOR_FIXED_BYTES + meshes + keyframes + IMPORT_BYTES_PER_JSON_CHAR * s.jsonChars,
+      faces: s.faces,
+      meshes: s.meshes,
+      addedStoredBytes:
+        s.decodedBytes +
+        SHAPE_KEY_STORED_BYTES_PER_VERTEX * s.morphVertices +
+        KEYFRAME_STORED_BYTES * s.keyframes,
+      addedSaveBytes: saveBytes(KEYFRAME_STORED_BYTES * s.keyframes),
+      lower,
+    },
+    {
+      objects: s.objects,
+      datablocks: { meshes: s.meshes, materials: s.materials, cameras: s.cameras, lights: s.lights },
+    },
+  )!;
+}
+
+/**
+ * Importing `file` in `format` (stl, obj, ply, gltf or glb): a glTF file (GLB or .gltf) by what its
+ * JSON says the importer decodes (every glTF mesh a node uses, its objects, morph targets and
+ * keyframes: io/import-size.ts), a PLY file by the counts its header declares, a binary STL by the
+ * triangles its header declares, an OBJ file and an ASCII STL by their size and (OBJ) their `o` and
+ * `g` lines; each with the objects and datablocks it adds.
+ */
+export function importEstimate(format: string, file: ImportReader): OperatorEstimate {
+  const lower = IMPORT_LOWER.size;
+  const bySize = (objects: number) =>
+    withObjects(
+      {
+        bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_FILE_BYTE * file.byteLength,
+        faces: 0,
+        addedStoredBytes: IMPORT_STORED_BYTES_PER_FILE_BYTE * file.byteLength,
+        lower,
+      },
+      { objects, datablocks: { meshes: objects } },
+      lower,
+    )!;
+  if (format === 'stl') {
+    const tris = binaryStlTriangles(file.read(0, 84), file.byteLength);
+    if (tris === null) return bySize(1);
     const stored = decodedMeshBytes({
       vertices: 3 * tris,
       faces: tris,
@@ -766,26 +1055,39 @@ export function importEstimate(format: string, head: Uint8Array, fileBytes: numb
       uvs: false,
       colors: false,
     });
-    return {
-      bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_STL_TRIANGLE * tris + stored,
-      faces: tris,
-      addedStoredBytes: stored,
-      lower,
-    };
+    return withObjects(
+      {
+        bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_STL_TRIANGLE * tris + stored,
+        faces: tris,
+        addedStoredBytes: stored,
+        lower,
+      },
+      { objects: 1, datablocks: { meshes: 1 } },
+    )!;
   }
-  return {
-    bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_FILE_BYTE * fileBytes,
-    faces: 0,
-    addedStoredBytes: IMPORT_STORED_BYTES_PER_FILE_BYTE * fileBytes,
-    lower,
-  };
+  if (format === 'obj') {
+    const objects = objObjects(file);
+    const e = bySize(objects);
+    return objects > 1 && newObjectsBytes({ objects }).peak > IMPORT_BYTES_PER_FILE_BYTE * file.byteLength
+      ? { ...e, lower: IMPORT_LOWER.objects }
+      : e;
+  }
+  let size: ImportSize | null = null;
+  if (format === 'ply') size = plyImportSize(file);
+  else if (format === 'gltf' || format === 'glb') {
+    const json = readGltfJson(file);
+    if (json) size = gltfImportSize(json.json, json.chars);
+  }
+  // a file that is not what it claims: the import fails by itself, after reading at most its size
+  return size ? countedImport(size) : bySize(1);
 }
 
 /**
- * The size of a file given in base64 (3 bytes per 4 characters; a data URI too) and its first 84
- * bytes, without decoding the rest.
+ * A file given in base64 (a data URI too, whitespace around it ignored) as an {@link ImportReader}:
+ * its size from the number of characters, and ranges of it decoded when they are read (the whole
+ * file at once when there is whitespace, or a character base64 does not have, inside it).
  */
-function base64File(b64: string): { head: Uint8Array; fileBytes: number } {
+export function base64Reader(b64: string): ImportReader {
   let start = 0;
   while (start < b64.length && b64.charCodeAt(start) <= 32) start++;
   if (b64.startsWith('data:', start)) start = b64.indexOf(',', start) + 1;
@@ -793,21 +1095,37 @@ function base64File(b64: string): { head: Uint8Array; fileBytes: number } {
   while (end > start && b64.charCodeAt(end - 1) <= 32) end--;
   let padding = 0;
   while (padding < 2 && end - padding > start && b64[end - 1 - padding] === '=') padding++;
-  let head: Uint8Array;
-  try {
-    head = base64Decode(b64.slice(start, start + 112));
-  } catch {
-    head = new Uint8Array(0);
-  }
-  return { head, fileBytes: Math.max(0, Math.floor(((end - start) * 3) / 4) - padding) };
+  const decode = (s: string): Uint8Array => {
+    try {
+      return base64Decode(s);
+    } catch {
+      return new Uint8Array(0);
+    }
+  };
+  // whitespace or other characters base64 does not have inside (the decoder skips them), or
+  // padding before the end: the offsets of the characters are not those of the bytes
+  if (/[^A-Za-z0-9+/_-]/.test(b64.slice(start, end - padding)))
+    return bytesReader(decode(b64.slice(start, end)));
+  const byteLength = Math.max(0, Math.floor(((end - start) * 3) / 4) - padding);
+  return {
+    byteLength,
+    read(from, to) {
+      const e = Math.min(to, byteLength);
+      if (e <= from) return new Uint8Array(0);
+      const q = Math.floor(from / 3);
+      const bytes = decode(b64.slice(start + 4 * q, Math.min(end, start + 4 * Math.ceil(e / 3))));
+      return bytes.subarray(from - 3 * q, e - 3 * q);
+    },
+  };
 }
 
 /** import_*: the file given in base64 ({@link importEstimate}). */
 const importOperator =
   (format: string): Estimator =>
   (_ctx, p) => {
-    const { head, fileBytes } = base64File(String(p.data_base64 ?? ''));
-    return importEstimate(format, head, fileBytes);
+    const file = base64Reader(String(p.data_base64 ?? ''));
+    if (format === 'gltf' && isGLB(file.read(0, 4))) return importEstimate('glb', file);
+    return importEstimate(format, file);
   };
 
 /**
@@ -852,42 +1170,221 @@ function exportFile(format: (p: Record<string, unknown>) => keyof typeof EXPORT_
 }
 
 /**
- * object.array_place and object.scatter_on_surface with linked false: the copies share the encoded
- * data of their sources (copied without decoding it, at most MAX_COPY_BYTES of it per run), so the run
- * takes little heap, but the project then holds every copy as a mesh of its own: the decoded size of
- * the copies is what counts (array_place: every object copied for every item; scatter_on_surface:
- * `count` copies of one source each, the largest counted). Linked copies share their data: nothing.
+ * object.array_place and object.scatter_on_surface: a new object for every copy (array_place: every
+ * object copied for every item; scatter_on_surface: `count` copies, each of one source, the one with
+ * the largest data and JSON counted), each with the modifiers and settings of its source. With linked
+ * false every copy also gets its own datablocks: copied meshes share the encoded data of their sources
+ * (copied without decoding it, at most MAX_COPY_BYTES of it per run), so the run takes little heap for
+ * them, but the project then holds every copy as a mesh of its own: their decoded size counts; copied
+ * curves, lights, cameras and armatures keep their JSON (a curve's splines), counted per character
+ * (memory-objects.ts datablockExtraJsonChars). Linked copies share their data.
  */
-function layoutCopies(kind: 'array' | 'scatter'): Estimator {
+function layout(kind: 'array' | 'scatter'): Estimator {
   return (ctx, p) => {
-    if (p.linked !== false) return null;
     const refs = Array.isArray(p.objects) ? p.objects.map(String) : null;
     const surface =
       kind === 'scatter' ? ctx.doc.resolveObject(String(p.surface ?? ctx.state.activeId ?? '')) : null;
     const sources = (refs ?? ctx.state.selectedIds)
       .map((r) => ctx.doc.resolveObject(r))
-      .filter((o): o is ObjectData => !!o && (refs !== null || o.id !== surface?.id));
-    let per = 0;
-    for (const o of sources)
-      if (o.type === 'MESH')
-        per = kind === 'array' ? per + meshBytes(ctx.doc, o.data) : Math.max(per, meshBytes(ctx.doc, o.data));
-    const copies =
+      .filter((o): o is ObjectData => !!o && o.id !== surface?.id);
+    if (!sources.length) return null;
+    const copies = Math.max(
+      0,
       kind === 'array'
         ? (p.pattern === 'GRID' ? num(p.columns, 3) * num(p.rows, 3) : num(p.count, 5)) - 1
-        : num(p.count, 20);
-    const added = per * Math.max(0, copies);
-    if (!added) return null;
-    return {
-      bytes: OPERATOR_FIXED_BYTES,
-      faces: 0,
-      addedStoredBytes: added,
-      lower:
-        kind === 'array' && p.pattern === 'GRID'
-          ? 'columns and rows (or pass linked: true)'
-          : 'count (or pass linked: true)',
-    };
+        : num(p.count, 20),
+    );
+    if (!copies) return null;
+    const linked = p.linked !== false;
+    // per item: every source (array_place), one of them (scatter_on_surface: the largest)
+    let meshes = 0;
+    let extraJson = 0;
+    const datablocks: Partial<Record<CountedKind, number>> = {};
+    const shared = new Set<string>();
+    for (const o of sources) {
+      const json = extraJsonChars(o);
+      const bytes = o.type === 'MESH' ? meshBytes(ctx.doc, o.data) : 0;
+      const dataKind = o.data && !linked ? dataKindOf(o.type) : null;
+      // the JSON of a copied curve, light, camera or armature beyond what its constants cover
+      const dataJson = dataKind ? datablockExtraJsonChars(ctx.doc, dataKind, o.data!) : 0;
+      if (kind === 'scatter') {
+        meshes = Math.max(meshes, bytes);
+        extraJson = Math.max(extraJson, json + dataJson);
+        if (dataKind) datablocks[dataKind] = copies;
+        continue;
+      }
+      extraJson += json;
+      // objects of the group sharing data share its copy too (like Blender's Shift+D)
+      if (!o.data || shared.has(o.data)) continue;
+      shared.add(o.data);
+      meshes += bytes;
+      extraJson += dataJson;
+      if (dataKind) datablocks[dataKind] = (datablocks[dataKind] ?? 0) + copies;
+    }
+    const added = linked ? 0 : meshes * copies;
+    const lower =
+      kind === 'array' && p.pattern === 'GRID'
+        ? `columns and rows${added ? ' (or pass linked: true)' : ''}`
+        : `count${added ? ' (or pass linked: true)' : ''}`;
+    return withObjects(
+      added ? { bytes: OPERATOR_FIXED_BYTES, faces: 0, addedStoredBytes: added, lower } : null,
+      {
+        objects: kind === 'array' ? copies * sources.length : copies,
+        datablocks,
+        extraJson: copies * extraJson,
+      },
+      lower,
+    );
   };
 }
+
+/**
+ * object.duplicate: a copy of every selected object (each linked duplicate too, with its modifiers
+ * and settings) and, with linked false, of every datablock they use, once each as object.ts copies
+ * shared data once: the meshes decoded, copied and stored (objectMeshes), the curves, lights,
+ * cameras and armatures with their JSON (memory-objects.ts datablockExtraJsonChars).
+ */
+const duplicate: Estimator = (ctx, p) => {
+  const selected = ctx.state.selectedIds
+    .map((id) => ctx.doc.getObject(id))
+    .filter((o): o is ObjectData => !!o);
+  if (!selected.length) return null;
+  const datablocks: Partial<Record<CountedKind, number>> = {};
+  const seen = new Set<string>();
+  let extraJson = 0;
+  for (const o of selected) {
+    extraJson += extraJsonChars(o);
+    const kind = p.linked ? null : dataKindOf(o.type);
+    if (!kind || !o.data || seen.has(o.data)) continue;
+    seen.add(o.data);
+    datablocks[kind] = (datablocks[kind] ?? 0) + 1;
+    extraJson += datablockExtraJsonChars(ctx.doc, kind, o.data);
+  }
+  const meshes = p.linked
+    ? null
+    : objectMeshes('the number or size of the duplicated meshes (or pass linked: true)', { copies: true })(
+        ctx,
+        p,
+      );
+  return withObjects(
+    meshes,
+    { objects: selected.length, datablocks, extraJson },
+    'the number of selected objects',
+  );
+};
+
+/** Most objects object.duplicates_make_real makes per run (operators/instancing.ts MAX_MAKE_REAL). */
+export const MAKE_REAL_MAX_OBJECTS = 10_000;
+
+/**
+ * The objects instancers `owners` take their instances from, one level down: the members of the
+ * collections they instance (empties, particle systems) and the objects of their particle systems.
+ */
+function instanceSources(doc: SceneDoc, owners: readonly ObjectData[]): ObjectData[] {
+  const collections = new Set<string>();
+  const objects = new Set<string>();
+  for (const o of owners) {
+    if (o.instance_type === 'COLLECTION' && o.instance_collection) collections.add(o.instance_collection);
+    for (const ps of Array.isArray(o.particle_systems) ? o.particle_systems : []) {
+      const s = (ps?.settings ?? {}) as { instance_object?: unknown; instance_collection?: unknown };
+      if (typeof s.instance_object === 'string') objects.add(s.instance_object);
+      if (typeof s.instance_collection === 'string') collections.add(s.instance_collection);
+    }
+  }
+  const byName = new Map(doc.listCollections().map((c) => [c.name, c.id]));
+  const ids = new Set([...collections].map((c) => byName.get(c) ?? c));
+  return doc.listObjects().filter((o) => objects.has(o.id) || objects.has(o.name) || ids.has(o.collection));
+}
+
+/**
+ * object.duplicates_make_real: an object for every particle and collection instance of the
+ * instancers (at most MAKE_REAL_MAX_OBJECTS, beyond which it refuses), each a linked duplicate of
+ * its source with the source's modifiers: counted as the evaluation counts instances
+ * (memory-instances.ts), the larger of render and viewport settings, each at the JSON of the
+ * largest source.
+ */
+const makeReal: Estimator = (ctx, p) => {
+  const refs = Array.isArray(p.objects) ? p.objects.map(String) : ctx.state.selectedIds;
+  const owners = refs.map((r) => ctx.doc.resolveObject(r)).filter((o): o is ObjectData => !!o);
+  if (!owners.length) return null;
+  const count = (forRender: boolean) =>
+    instanceBound(ctx.doc, owners, { forRender, facesOf: () => 0 }).instances;
+  const objects = Math.min(MAKE_REAL_MAX_OBJECTS, Math.max(count(true), count(false)));
+  if (!objects) return null;
+  let extraJson = 0;
+  for (const o of instanceSources(ctx.doc, owners)) extraJson = Math.max(extraJson, extraJsonChars(o));
+  return withObjects(
+    null,
+    { objects, extraJson: objects * extraJson },
+    'the particle count of the emitters (or the objects of the instanced collections)',
+  );
+};
+
+/** What to lower for a Separate that makes too many objects, by type. */
+const SEPARATE_LOWER: Readonly<Record<string, string>> = {
+  LOOSE:
+    'the number of loose parts (separate some of them with type SELECTED first, then separate that object by loose parts)',
+  MATERIAL: 'the number of material indices the faces use',
+};
+
+/**
+ * mesh.separate: the Edit Mode cost of the edited mesh (edit), and a new object with a mesh of its
+ * own for every part: the selection (SELECTED), every material index its faces use but the first
+ * (MATERIAL), every connected part but the first (LOOSE, counted on the mesh with a union-find in
+ * typed arrays, memory-objects.ts looseParts); each copies the edited object (its modifiers).
+ */
+const separate: Estimator = (ctx, p) => {
+  const base = edit('mesh.separate')(ctx, p);
+  const g = editGeometry(ctx);
+  const o = ctx.state.activeId ? ctx.doc.getObject(ctx.state.activeId) : null;
+  if (!base || !g || !o) return base;
+  let parts = 1;
+  if (p.type === 'LOOSE' || p.type === 'MATERIAL') {
+    const mesh = ctx.doc.getMesh(g.meshId);
+    if (mesh) parts = Math.max(0, (p.type === 'LOOSE' ? looseParts(mesh) : materialParts(mesh)) - 1);
+  }
+  const e = withObjects(base, {
+    objects: parts,
+    datablocks: { meshes: parts },
+    extraJson: parts * extraJsonChars(o),
+  });
+  return e && { ...e, lower: SEPARATE_LOWER[String(p.type)] ?? base.lower };
+};
+
+/**
+ * object.scatter_add: no mesh copied (the evaluation counts the instances), but of several `objects`
+ * each one whose collection another object instances gets a hidden linked duplicate in the new
+ * sources collection (operators/instancing.ts): at most one object per given object.
+ */
+const scatterAdd: Estimator = (ctx, p) => {
+  const sources = (Array.isArray(p.objects) ? p.objects : [])
+    .map((r) => ctx.doc.resolveObject(String(r)))
+    .filter((o): o is ObjectData => !!o);
+  if (sources.length < 2) return null;
+  let extraJson = 0;
+  for (const o of sources) extraJson += extraJsonChars(o);
+  return withObjects(null, { objects: sources.length, extraJson }, 'the number of objects to scatter');
+};
+
+/** anim.turntable: an empty as the pivot and, without a given camera, a camera. */
+const turntable: Estimator = (_ctx, p) =>
+  withObjects(null, { objects: p.camera ? 1 : 2, datablocks: p.camera ? {} : { cameras: 1 } });
+
+/**
+ * curve.add_from_points and the curve primitives: a curve object and its curve datablock, whose
+ * spline points it keeps as JSON in the document (`points`: their JSON characters count like an
+ * object's).
+ */
+const curveObject: Estimator = (_ctx, p) =>
+  withObjects(
+    null,
+    {
+      objects: 1,
+      datablocks: { curves: 1 },
+      extraJson: Array.isArray(p.points) ? JSON.stringify(p.points).length : 0,
+    },
+    'the number of spline points',
+  );
 
 /** object.add_mesh_from_data: the given vertices and faces. */
 const meshFromData: Estimator = (_ctx, p) => {
@@ -896,12 +1393,15 @@ const meshFromData: Estimator = (_ctx, p) => {
   let corners = 0;
   if (Array.isArray(p.faces)) for (const f of p.faces) corners += Array.isArray(f) ? f.length : 0;
   const stored = decodedMeshBytes({ vertices: verts, faces, corners, uvs: !!p.uvs, colors: false });
-  return {
-    bytes: OPERATOR_FIXED_BYTES + OBJECT_MESH_BYTES_PER_FACE * faces + stored,
-    faces,
-    addedStoredBytes: stored,
-    lower: 'the number of vertices and faces',
-  };
+  return withObjects(
+    {
+      bytes: OPERATOR_FIXED_BYTES + OBJECT_MESH_BYTES_PER_FACE * faces + stored,
+      faces,
+      addedStoredBytes: stored,
+      lower: 'the number of vertices and faces',
+    },
+    { objects: 1, datablocks: { meshes: 1 } },
+  );
 };
 
 /**
@@ -973,7 +1473,6 @@ const editIds = [
   'mesh.remove_doubles',
   'mesh.edge_face_add',
   'mesh.split',
-  'mesh.separate',
   'mesh.flip_normals',
   'mesh.normals_make_consistent',
   'mesh.vertices_smooth',
@@ -1080,20 +1579,32 @@ export const OPERATOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
   'mesh.primitive_cone_add': primitive('CONE', 'vertices'),
   'mesh.primitive_torus_add': primitive('TORUS', 'major_segments and minor_segments'),
   'object.add_mesh_from_data': meshFromData,
-  'object.duplicate': (ctx, p) =>
-    p.linked
-      ? null
-      : objectMeshes('the number or size of the duplicated meshes (or pass linked: true)', { copies: true })(
-          ctx,
-          p,
-        ),
+  'object.duplicate': duplicate,
+  'object.duplicates_make_real': makeReal,
+  'mesh.separate': separate,
+  'anim.turntable': turntable,
+  'curve.add_from_points': curveObject,
+  ...Object.fromEntries(
+    ['bezier_circle', 'bezier_curve', 'nurbs_circle', 'nurbs_curve', 'nurbs_path', 'poly'].map((k) => [
+      `curve.primitive_${k}_add`,
+      curveObject,
+    ]),
+  ),
+  'object.empty_add': oneObject(null),
+  'object.camera_add': oneObject('cameras'),
+  'object.light_add': oneObject('lights'),
+  'object.armature_add': oneObject('armatures'),
+  'object.text_add': oneObject('curves', 'the length of the text'),
+  'object.collection_instance_add': oneObject(null),
+  'material.new': (_ctx) => withObjects(null, { objects: 0, datablocks: { materials: 1 } }),
   'object.join': join,
   'object.convert': bakeStack('convert'),
   'object.modifier_apply': bakeStack('apply'),
   'object.transform_apply': objectMeshes('the number or size of the selected meshes', { singleUser: true }),
   'object.origin_set': objectMeshes('the number or size of the selected meshes', { singleUser: true }),
-  'object.array_place': layoutCopies('array'),
-  'object.scatter_on_surface': layoutCopies('scatter'),
+  'object.array_place': layout('array'),
+  'object.scatter_on_surface': layout('scatter'),
+  'object.scatter_add': scatterAdd,
   'object.shade_smooth': objectMeshes('the number or size of the selected meshes'),
   'object.shade_flat': objectMeshes('the number or size of the selected meshes'),
   'object.shade_auto_smooth': objectMeshes('the number or size of the selected meshes'),
@@ -1139,13 +1650,17 @@ export const OPERATOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
  * operators bound, or build what is bounded elsewhere.
  */
 export const UNESTIMATED_OPERATORS: readonly { match: string; reason: string }[] = [
-  { match: 'anim.', reason: 'keyframes, drivers and F-curve modifiers: no mesh' },
+  {
+    match: 'anim.',
+    reason:
+      'keyframes, drivers and F-curve modifiers: no mesh (anim.turntable, which adds objects, is estimated)',
+  },
   { match: 'armature.', reason: 'bones: no mesh' },
   { match: 'pose.', reason: 'pose channels and bone constraints: no mesh' },
   { match: 'constraint.', reason: 'object constraints: no mesh' },
   { match: 'camera.', reason: 'camera data: no mesh' },
   { match: 'light.', reason: 'light data: no mesh' },
-  { match: 'material.', reason: 'materials: no mesh' },
+  { match: 'material.', reason: 'material settings: no mesh (material.new is estimated)' },
   { match: 'world.', reason: 'world settings: no mesh' },
   { match: 'collection.', reason: 'collections: no mesh' },
   { match: 'data.', reason: 'a property of a datablock: no mesh' },
@@ -1163,22 +1678,12 @@ export const UNESTIMATED_OPERATORS: readonly { match: string; reason: string }[]
   {
     match: 'curve.',
     reason:
-      'spline points: the evaluation builds the surface, and the server checks it per curve first (eval/memory.ts)',
+      'spline points of an existing curve (the operators that add curve objects are estimated): the evaluation builds the surface, and the server checks it per curve first (eval/memory.ts)',
   },
   {
     match: 'font.',
     reason:
       'text content: the evaluation builds its surface, and the server checks it per text first (eval/memory.ts)',
-  },
-  {
-    match: 'object.text_add',
-    reason:
-      'a text object: the evaluation builds its surface, and the server checks it per text first (eval/memory.ts)',
-  },
-  {
-    match: 'object.duplicates_make_real',
-    reason:
-      'linked duplicates of the instanced objects (their data is shared), at most MAX_MAKE_REAL objects per run',
   },
   { match: 'render.', reason: 'refused through MCP tools in favour of render_image and render_animation' },
   {
@@ -1212,13 +1717,10 @@ export const UNESTIMATED_OPERATORS: readonly { match: string; reason: string }[]
     match,
     reason: 'object transforms from rays cast at evaluated meshes (their evaluations are checked)',
   })),
-  ...['object.armature_add', 'object.camera_add', 'object.empty_add', 'object.light_add'].map((match) => ({
-    match,
-    reason: 'a new object without a mesh',
-  })),
-  ...['object.collection_instance_add', 'object.instance_collection_set', 'object.scatter_add'].map(
-    (match) => ({ match, reason: 'instances: no mesh copied (the evaluation counts them)' }),
-  ),
+  {
+    match: 'object.instance_collection_set',
+    reason: 'instances: no mesh copied, no object added (the evaluation counts the instances)',
+  },
   ...['object.delete', 'object.rename', 'object.move_to_collection'].map((match) => ({
     match,
     reason: 'names, links and deletions: no mesh built',
@@ -1285,11 +1787,14 @@ const IMPORT_OPERATORS: Readonly<Record<string, string>> = {
 export function importMemoryRefusal(doc: SceneDoc, format: string, data: Uint8Array): string | null {
   const check = installed;
   if (!check) return null;
-  const estimate = importEstimate(format, data.subarray(0, 84), data.byteLength);
+  const estimate = importEstimate(format, bytesReader(data));
+  const project = projectObjects(doc);
   return check({
     operator: IMPORT_OPERATORS[format] ?? 'import',
     estimate,
-    storedBytes: storedMeshBytes(doc),
+    storedBytes: storedMeshBytes(doc) + project.bytes,
+    saveBytes: saveBytes(project.bytes),
+    objects: project.objects,
   });
 }
 
@@ -1334,9 +1839,24 @@ export function editOperatorMemoryRefusal(
 export function operatorMemoryRefusal(id: string, ctx: OperatorContext, params: unknown): string | null {
   const check = installed;
   if (!check) return null;
-  const estimate = estimateOperator(id, ctx, params);
+  let estimate: OperatorEstimate | null;
+  try {
+    estimate = estimateOperator(id, ctx, params);
+  } catch (err) {
+    // an estimate that reads a stored mesh the host would not decode (Separate counts the parts of
+    // the edited mesh): the operator could not read it either
+    if (isMeshMemoryError(err)) return err.message;
+    throw err;
+  }
   if (!estimate || estimate.bytes <= 0) return null;
-  // the document's meshes are counted only for operators that add geometry
-  const storedBytes = estimate.addedStoredBytes > 0 ? storedMeshBytes(ctx.doc) : 0;
-  return check({ operator: id, estimate, storedBytes });
+  // what the project keeps is counted only for operators that add to it
+  if (!(estimate.addedStoredBytes > 0)) return check({ operator: id, estimate, storedBytes: 0 });
+  const project = projectObjects(ctx.doc);
+  return check({
+    operator: id,
+    estimate,
+    storedBytes: storedMeshBytes(ctx.doc) + project.bytes,
+    saveBytes: saveBytes(project.bytes),
+    objects: project.objects,
+  });
 }

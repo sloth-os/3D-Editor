@@ -7,13 +7,17 @@ import {
   createConstraint,
   createFCurve,
   createOperatorRegistry,
+  defaultBone,
+  defaultPoseBone,
   defaultSpline,
   defaultSplinePoint,
   evaluateScene,
   fcurveKey,
   insertKeyframe,
+  type ConstraintData,
   type EditorState,
   type Mat4,
+  type MeshData,
   type OperatorContext,
   type Vec3,
 } from '@3d-editor/core';
@@ -761,5 +765,73 @@ describe('the modal preview draws the matrices the scene evaluates after confirm
     // measured 0.66–0.96 times the scene's evaluation per move in plain runs and 0.74–1.08 under
     // coverage (five runs each)
     expect(onCycle).toBeLessThan(scene * 4);
+  });
+
+  it('R in Edit Mode turns the vertices of a mesh on a dependency cycle about its origin as the viewport shows it', () => {
+    // M is parented to bone B0 of a pose cycle (the IK target of B3's chain is parented to B2):
+    // evaluated first, M shows no matrix; the viewport, which evaluates the objects by name, shows
+    // it on B0
+    const t = setup();
+    const doc = t.doc;
+    const rig = doc.addObject({
+      type: 'ARMATURE',
+      name: 'Rig',
+      data: doc.addArmature({
+        bones: [
+          defaultBone('B0', [0, 0, 0], [0, 0, 1]),
+          { ...defaultBone('B2', [0, 0, 1], [0, 0, 2]), parent: 'B0', use_connect: true },
+          { ...defaultBone('B3', [0, 0, 2], [0, 0.5, 2.8]), parent: 'B2', use_connect: true },
+        ],
+      }),
+    });
+    const target = doc.addObject({
+      type: 'EMPTY',
+      name: 'A_T',
+      parent: rig,
+      parent_type: 'BONE',
+      parent_bone: 'B2',
+      location: [0.8, 0.3, 0],
+    });
+    const ik = createConstraint('IK' as ConstraintData['type'], { target });
+    doc.updateObject(rig, {
+      pose: {
+        bones: {
+          B0: { ...defaultPoseBone(), rotation_euler: [0.3, 0, 0] },
+          B2: { ...defaultPoseBone(), rotation_euler: [0.2, 0.1, 0] },
+          B3: { ...defaultPoseBone(), constraints: [{ ...ik, params: { chain_count: 0 } }] },
+        },
+      } as never,
+    });
+    t.run('mesh.primitive_cube_add', { name: 'M', size: 0.2 });
+    const m = t.state.activeId!;
+    doc.updateObject(m, { parent: rig, parent_type: 'BONE', parent_bone: 'B0', location: [0.2, 0, 0.1] });
+    t.run('object.mode_set', { mode: 'EDIT' });
+    const shown = () => {
+      const fs = new FrameState(doc, t.state.frame);
+      for (const o of fs.objects) fs.world(o.id);
+      return fs.world(m)!;
+    };
+    const world = (w: Mat4, p: ArrayLike<number>) =>
+      Array.from(p, (_, i) => {
+        const v = i - (i % 3);
+        const k = i % 3;
+        return w[k] * p[v] + w[4 + k] * p[v + 1] + w[8 + k] * p[v + 2] + w[12 + k];
+      });
+    const centroid = (p: number[]) =>
+      [0, 1, 2].map((k) => p.filter((_, i) => i % 3 === k).reduce((a, b) => a + b, 0) / (p.length / 3));
+    const origin = shown().slice(12, 15);
+    const base = world(shown(), doc.getMesh(doc.getObject(m)!.data!)!.positions);
+    // every vertex is selected: the pivot is the cube's origin, where the viewport shows it
+    expect(maxDiff(centroid(base), origin)).toBeLessThan(1e-9);
+    const r = t.start('rotate');
+    t.type(r, 'Z90');
+    const preview = world(shown(), (t.engine.meshOverrides.get(m) as MeshData).positions);
+    expect(maxDiff(preview, base)).toBeGreaterThan(0.05);
+    expect(maxDiff(centroid(preview), origin)).toBeLessThan(1e-9);
+    const res = r.finish(true)!;
+    t.run(res.operator, res.params);
+    // confirming stores what the preview showed (the mesh keeps 32-bit floats)
+    const stored = world(shown(), doc.getMesh(doc.getObject(m)!.data!)!.positions);
+    expect(maxDiff(stored, preview)).toBeLessThan(1e-6);
   });
 });

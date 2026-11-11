@@ -5,6 +5,7 @@ import {
   SceneDoc,
   isValidProjectId,
   newUuid,
+  type FileEntry,
   type ProjectFileStore,
   type ProjectInfo,
 } from '@3d-editor/core';
@@ -47,16 +48,19 @@ export interface RoomManagerOptions {
   openReadWaitMs?: number;
   /**
    * How long a shutdown ({@link RoomManager.close}) waits for storage to save the loaded projects
-   * (default {@link SHUTDOWN_SAVE_WAIT_MS}).
+   * (default {@link SHUTDOWN_SAVE_WAIT_MS}; a shutdown sets it from SHUTDOWN_TIMEOUT_SECONDS, see
+   * RoomManager.setShutdownWait).
    */
   shutdownWaitMs?: number;
 }
 
 const TOMBSTONE_TTL_MS = 60 * 60 * 1000;
 /**
- * How long a shutdown waits for storage to save the loaded projects, by default: Docker stops a
- * container 10 s after SIGTERM, and main.ts exits by itself before that. Storage that does not
- * answer (WebDAV: 30 s per request) used to hold the shutdown until main.ts gave up after 20 s.
+ * How long a shutdown waits for storage to save the loaded projects, by default: the save wait of
+ * the default SHUTDOWN_TIMEOUT_SECONDS (9 s, see config.ts shutdownSaveWait): Docker stops a
+ * container 10 s after SIGTERM, and the server exits by itself before that (shutdown.ts). Storage
+ * that does not answer (WebDAV: 30 s per request) used to hold the shutdown until main.ts gave up
+ * after 20 s.
  */
 export const SHUTDOWN_SAVE_WAIT_MS = 7000;
 
@@ -74,6 +78,51 @@ interface StorageRead {
  * time (so that the request that resolves a project and the one that opens it read it once).
  */
 const UNUSED_ROOM_READ_MS = 2000;
+
+/**
+ * How long a lookup of a project by name ({@link RoomManager.listNames}) goes on using the name it
+ * read from a stored project's project.json while storage lists the project's folder unchanged: a
+ * WebDAV server whose folders keep their ETag and modification time when a file in them is written
+ * again (one that writes files in place) tells no change, so a project renamed by another writer is
+ * read again after this time at the latest.
+ */
+export const STORED_NAME_MAX_AGE_MS = 60_000;
+
+/** A stored project's name as a lookup by name last read it (see RoomManager.listNames). */
+interface StoredName {
+  /** The name its project.json gives; null when it has none (or one that is not a JSON object). */
+  name: string | null;
+  updated_at: string;
+  /**
+   * What storage reported for the project when it was read: its folder's ETag or modification time
+   * in the listing, or else the ETag of its project.json (null: there is none; undefined: storage
+   * reported nothing, then the project.json is read at every lookup).
+   */
+  tag: string | null | undefined;
+  readAt: number;
+}
+
+/** A project that a lookup by name compares names with (see RoomManager.namesOf). */
+export interface NamedProject {
+  id: string;
+  name: string;
+  updated_at: string;
+}
+
+/** What a listing of storage for a lookup by name found (see RoomManager.listNames). */
+export interface StoredNames {
+  /**
+   * The projects storage listed that this server had not loaded, and not deleted, with the names
+   * their project.json gives (a folder without one lists no project, as in list_projects).
+   */
+  stored: NamedProject[];
+  /** The project folders storage listed, by id; null when listing storage failed (or no storage). */
+  listed: Set<string> | null;
+  /** Listing storage failed, or reading the project.json of some projects did (`partial`). */
+  failed: boolean;
+  /** Storage listed its projects, but reading the project.json of some of them failed. */
+  partial: boolean;
+}
 
 /**
  * Loads projects into memory on demand (from the persistence backend), keeps them while they
@@ -95,16 +144,24 @@ export class RoomManager {
   private readonly asking = new Map<string, StorageRead & { found: boolean }>();
   /** The deletions of projects from storage that are in progress, by id (see deleteProject). */
   private readonly deleting = new Map<string, Promise<void>>();
+  /**
+   * The names of the stored projects this server has not loaded, as lookups by name last read them
+   * from their project.json, by id (see listNames).
+   */
+  private readonly storedNames = new Map<string, StoredName>();
   private readonly sweepTimer: ReturnType<typeof setInterval>;
   private readonly refreshTimer: ReturnType<typeof setInterval> | null = null;
   private sweeping = false;
   private refreshing = false;
   private closed = false;
+  /** How long {@link close} waits for storage (see {@link setShutdownWait}). */
+  private shutdownWaitMs: number;
   /** The rooms that a shutdown is closing until it has said which stayed unsaved (see close). */
   private closing: Room[] = [];
   private readonly closedListeners = new Set<(room: Room) => void>();
 
   constructor(private readonly opts: RoomManagerOptions) {
+    this.shutdownWaitMs = opts.shutdownWaitMs ?? SHUTDOWN_SAVE_WAIT_MS;
     const interval = opts.sweepIntervalMs ?? Math.max(250, Math.min(60_000, Math.floor(opts.ttlMs / 2)));
     this.sweepTimer = setInterval(() => void this.sweep(), interval);
     this.sweepTimer.unref?.();
@@ -137,6 +194,14 @@ export class RoomManager {
   }
 
   /**
+   * How long a request waits for a read of storage before it answers without it
+   * ({@link RoomManagerOptions.openReadWaitMs}, 5 s by default).
+   */
+  get readWaitMs(): number {
+    return this.opts.openReadWaitMs ?? 5000;
+  }
+
+  /**
    * Calls `listener` after a loaded room was closed because its project was deleted or because it
    * was evicted while idle, so that whoever kept state for it (MCP undo histories) lets go of its
    * document. Returns the unsubscribe function.
@@ -147,6 +212,9 @@ export class RoomManager {
   }
 
   private emitClosed(room: Room): void {
+    // a lookup by name reads its project.json again (the room may have renamed the project, and a
+    // folder whose ETag storage does not change with the files in it would not tell, see listNames)
+    this.storedNames.delete(room.id);
     for (const listener of [...this.closedListeners]) {
       try {
         listener(room);
@@ -432,8 +500,8 @@ export class RoomManager {
 
   /**
    * The projects this server has loaded and lists (see {@link listProjects}) that are named `name`,
-   * ignoring letter case, as MCP tools match names (AgentSession.resolveProjectId matches these
-   * before it lists storage).
+   * ignoring letter case, as MCP tools match names (AgentSession.resolveProjectId compares these
+   * alone when the listing of storage fails or does not answer in time).
    */
   loadedNamed(name: string): Room[] {
     const key = name.toLowerCase();
@@ -525,34 +593,153 @@ export class RoomManager {
         end();
       }
     }
-    if (store && stored) {
-      // a loaded room nobody uses whose project storage does not list, though the room found its
-      // document stored: deleted elsewhere since the room last read it (then the room reads it
-      // again, and is closed), unless storage still has the document (an unreadable project.json);
-      // the check is awaited as waitFor says (no answer in time: still stored)
-      const listed = stored;
-      const unlisted = this.all().filter((r) => this.unused(r) && r.documentStored && !listed.has(r.id));
-      await Promise.all(
-        unlisted.map(async (room) => {
-          let gone = false;
-          const check: StorageRead = {
-            late: false,
-            done: store.hasDocument(room.id).then(
-              (has) => {
-                gone = !has;
-              },
-              () => undefined,
-            ),
-          };
-          await this.waitFor(check, room);
-          if (gone) await this.readUnused(room, true);
-        }),
-      );
-    }
+    if (store && stored) await this.checkUnlisted(store, stored);
     for (const room of this.all()) {
       if (this.abandoned(room)) continue;
       if (!room.persisted && room.isEmpty() && !byId.has(room.id)) continue;
       byId.set(room.id, room.listing());
+    }
+    return [...byId.values()].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  }
+
+  /**
+   * A loaded room nobody uses whose project storage does not list (`listed`), though the room found
+   * its document stored: deleted elsewhere since the room last read it (then the room reads it
+   * again, and is closed), unless storage still has the document (an unreadable project.json). The
+   * check is awaited as waitFor says (no answer in time: still stored).
+   */
+  private async checkUnlisted(store: ProjectFileStore, listed: Set<string>): Promise<void> {
+    const unlisted = this.all().filter((r) => this.unused(r) && r.documentStored && !listed.has(r.id));
+    await Promise.all(
+      unlisted.map(async (room) => {
+        let gone = false;
+        const check: StorageRead = {
+          late: false,
+          done: store.hasDocument(room.id).then(
+            (has) => {
+              gone = !has;
+            },
+            () => undefined,
+          ),
+        };
+        await this.waitFor(check, room);
+        if (gone) await this.readUnused(room, true);
+      }),
+    );
+  }
+
+  /**
+   * Lists storage for a lookup of a project by name (AgentSession.findProject, which compares the
+   * projects of {@link namesOf}: these and the loaded ones, as list_projects lists them), with one
+   * listing of the projects folder (WebDAV: one PROPFIND; the disk: one directory read). It reads
+   * the project.json of a stored project this server has not loaded only when it has not read it
+   * before, when the listing reports another ETag or modification time for its folder than when it
+   * read it (where the listing reports neither for folders, as the disk's does: another ETag of its
+   * project.json, a stat each), or when it read it {@link STORED_NAME_MAX_AGE_MS} ago or more. A
+   * lookup by name read every project.json at every call before (list_projects's listing): 202
+   * requests per call with 200 projects on WebDAV. A project this server loads is read again once
+   * it is closed (it may have been renamed here). Projects deleted here are left out (stillDeleted),
+   * and loaded rooms nobody uses that storage does not list are checked as list_projects checks
+   * them. Listing storage failing, and reading some project.json files failing (those projects are
+   * left out), are logged ('listing projects failed') and counted as list_projects's are.
+   */
+  async listNames(): Promise<StoredNames> {
+    const store = this.store;
+    if (!store) return { stored: [], listed: null, failed: false, partial: false };
+    const { metrics, log } = this.opts;
+    const end = metrics.persistenceDuration.startTimer({ op: 'list' });
+    try {
+      let entries: FileEntry[];
+      try {
+        entries = await withSpan('persistence.list', {}, () => store.fs.list(store.projectsDir()));
+      } catch (err) {
+        metrics.persistenceOps.inc({ op: 'list', status: 'error' });
+        log.warn({ err: errorMessage(err) }, 'listing projects failed');
+        return { stored: [], listed: null, failed: true, partial: false };
+      }
+      const folders = entries.filter((e) => e.isDir && isValidProjectId(e.name));
+      const listed = new Set(folders.map((e) => e.name));
+      for (const id of [...this.storedNames.keys()]) if (!listed.has(id)) this.storedNames.delete(id);
+      const now = Date.now();
+      const stored: NamedProject[] = [];
+      const failures: unknown[] = [];
+      await Promise.all(
+        folders.map(async (entry) => {
+          const room = this.get(entry.name);
+          // a loaded project is compared by the name it has now (namesOf)
+          if ((room && !this.abandoned(room)) || (await this.stillDeleted(entry.name))) return;
+          try {
+            const known = await this.storedName(store, entry, now);
+            if (known.name !== null)
+              stored.push({ id: entry.name, name: known.name, updated_at: known.updated_at });
+          } catch (err) {
+            failures.push(err);
+          }
+        }),
+      );
+      await this.checkUnlisted(store, listed);
+      if (failures.length > 0) {
+        metrics.persistenceOps.inc({ op: 'list', status: 'error' });
+        const reason = errorMessage(failures[0]);
+        log.warn(
+          {
+            err: `could not read the project.json of ${failures.length} of ${folders.length} stored projects (${reason})`,
+          },
+          'listing projects failed',
+        );
+      } else metrics.persistenceOps.inc({ op: 'list', status: 'ok' });
+      return { stored, listed, failed: failures.length > 0, partial: failures.length > 0 };
+    } finally {
+      end();
+    }
+  }
+
+  /**
+   * The name of a stored project from its project.json, read again only when needed (see
+   * {@link listNames}). Throws when reading it fails (a project.json that is not a JSON object
+   * gives no name, as in list_projects).
+   */
+  private async storedName(store: ProjectFileStore, entry: FileEntry, now: number): Promise<StoredName> {
+    const id = entry.name;
+    const tag =
+      entry.etag ??
+      entry.lastModified ??
+      (store.fs.etag ? await store.fs.etag(store.infoPath(id)) : undefined);
+    const known = this.storedNames.get(id);
+    if (known && tag !== undefined && known.tag === tag && now - known.readAt < STORED_NAME_MAX_AGE_MS)
+      return known;
+    let info: ProjectInfo | null = null;
+    try {
+      info = await store.loadInfo(id);
+    } catch (err) {
+      if (!(err instanceof SyntaxError)) throw err;
+    }
+    const read: StoredName = {
+      name: info?.name ?? null,
+      updated_at: info?.updated_at ?? '',
+      tag,
+      readAt: now,
+    };
+    this.storedNames.set(id, read);
+    return read;
+  }
+
+  /**
+   * The projects a lookup by name compares names with, as list_projects lists them: the projects of
+   * a listing for names ({@link listNames}; also an earlier one) that this server has not loaded or
+   * deleted since, and the loaded ones by the names they have now (most recently updated first).
+   */
+  namesOf(names: StoredNames): NamedProject[] {
+    const byId = new Map<string, NamedProject>();
+    for (const p of names.stored) if (!this.isDeleted(p.id)) byId.set(p.id, p);
+    for (const room of this.all()) {
+      if (this.abandoned(room)) continue;
+      if (!room.persisted && room.isEmpty() && !names.listed?.has(room.id)) continue;
+      byId.set(room.id, {
+        id: room.id,
+        name: room.scene.name,
+        updated_at: new Date(room.lastModified).toISOString(),
+      });
     }
     return [...byId.values()].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   }
@@ -732,8 +919,8 @@ export class RoomManager {
 
   /**
    * The loaded projects with changes that storage may not hold (Room.hasUnsavedChanges), also those
-   * a shutdown is closing until it has said which stayed unsaved: main.ts names them when the
-   * shutdown runs out of time first.
+   * a shutdown is closing until it has said which stayed unsaved: the shutdown (shutdown.ts) names
+   * them when it runs out of time first.
    */
   unsaved(): { id: string; name: string }[] {
     return [...this.rooms.values(), ...this.closing]
@@ -742,18 +929,27 @@ export class RoomManager {
   }
 
   /**
+   * Sets how long a shutdown ({@link close}) waits for storage: the server's shutdown sets it from
+   * SHUTDOWN_TIMEOUT_SECONDS before it closes the app (shutdown.ts), so that the rooms stop waiting
+   * before the server exits anyway.
+   */
+  setShutdownWait(ms: number): void {
+    this.shutdownWaitMs = ms;
+  }
+
+  /**
    * Persists and closes every room (server shutdown). It waits for storage
-   * {@link RoomManagerOptions.shutdownWaitMs} at most, for loads and saves together: a room whose
-   * save failed or has not finished by then is closed without it, and the projects that stayed
-   * unsaved are logged at error ('projects not saved at shutdown', with their ids and names): their
-   * changes since their last save are lost.
+   * {@link RoomManagerOptions.shutdownWaitMs} at most (see {@link setShutdownWait}), for loads and
+   * saves together: a room whose save failed or has not finished by then is closed without it, and
+   * the projects that stayed unsaved are logged at error ('projects not saved at shutdown', with
+   * their ids and names): their changes since their last save are lost.
    */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.sweepTimer);
     if (this.refreshTimer) clearInterval(this.refreshTimer);
-    const waitMs = this.opts.shutdownWaitMs ?? SHUTDOWN_SAVE_WAIT_MS;
+    const waitMs = this.shutdownWaitMs;
     const deadline = Date.now() + waitMs;
     // (a load that finishes now adds no room, see load: it is waited for with the saves)
     const loads = Promise.allSettled([...this.loading.values()]);

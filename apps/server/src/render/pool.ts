@@ -43,7 +43,8 @@ import {
  *
  * Render processes start lazily, warm up (see `RenderEngine.warmUp`) before they take work, drop
  * their document caches after `cacheIdleMs` without work and stop after `idleTimeoutMs`. Requests
- * carry a document's state only when the process does not have that version yet (IPC copies it).
+ * carry a document's state only when the process does not have that version yet (IPC copies it;
+ * a large state goes in parts, see DOC_PART_BYTES).
  */
 
 /** A request without its id (the thread assigns ids). */
@@ -103,6 +104,8 @@ export interface RenderPoolOptions {
    * with the process).
    */
   closeFallbackMs?: number;
+  /** The size of the parts a large document state is sent in (default {@link DOC_PART_BYTES}; for tests). */
+  docPartBytes?: number;
   log?: RenderPoolLog;
 }
 
@@ -123,6 +126,14 @@ export interface RenderLease {
 
 /** Long renders that may share the render threads at once (others wait for one to finish). */
 export const MAX_SHARED_RENDERS = 2;
+
+/**
+ * A document state larger than this goes to a render process in parts of this size (`doc-part`
+ * messages), each part sent once the one before was written to the IPC channel. Sent whole, the
+ * channel copied it into one message of its size in the server's memory (outside its JavaScript
+ * heap), and one more for every render process a path traced render sends it to.
+ */
+export const DOC_PART_BYTES = 8 * 1024 * 1024;
 
 /** Default number of render processes: the CPU cores, at most 8. */
 export function defaultRenderThreads(): number {
@@ -254,20 +265,25 @@ export class ProcessThread implements RenderThread {
   private idleWaiters: (() => void)[] = [];
   /** Messages for the process before it is ready (null once it is). */
   private outbox: WorkerRequest[] | null = [];
+  /** Messages waiting for the parts of a document state still on their way (null: none are). */
+  private behindParts: WorkerRequest[] | null = null;
   /** Documents (key → version) the process holds, least recently used first (see MAX_DOCUMENTS). */
   private readonly docs = new Map<string, number>();
   private stderrTail = '';
   /** terminate() was called: the exit is expected. */
   private stopping = false;
   private settleReady: ((err?: Error) => void) | null = null;
+  /** The size of the parts a large document state is sent in (see DOC_PART_BYTES). */
+  private readonly partBytes: number;
 
   constructor(
     readonly id: number,
     readonly role: Role,
     entry: URL,
-    opts: { heapLimitMb?: number; startTimeoutMs: number; closeFallbackMs?: number },
+    opts: { heapLimitMb?: number; startTimeoutMs: number; closeFallbackMs?: number; docPartBytes?: number },
     private readonly onExit: (t: ProcessThread, err: Error) => void,
   ) {
+    this.partBytes = opts.docPartBytes ?? DOC_PART_BYTES;
     let resolveExited!: () => void;
     this.exited = new Promise<void>((r) => (resolveExited = r));
     this.ready = new Promise<void>((resolve, reject) => {
@@ -429,8 +445,51 @@ export class ProcessThread implements RenderThread {
       return;
     }
     if (!this.child.connected) throw this.failure ?? new Error('the render process is not connected');
+    if (this.behindParts) {
+      this.behindParts.push(msg);
+      return;
+    }
+    const update = 'doc' in msg ? msg.doc.update : undefined;
+    if (!update || update.byteLength <= this.partBytes) {
+      this.write(msg);
+      return;
+    }
+    // the state in parts, each serialized once the one before was written, then the request
+    // without it (see DOC_PART_BYTES); later messages wait for them
+    const { key, version } = (msg as Extract<WorkerRequest, { doc: DocRef }>).doc;
+    const request = { ...msg, doc: { key, version } } as WorkerRequest;
+    const total = update.byteLength;
+    this.behindParts = [];
+    let offset = 0;
+    const next = (): void => {
+      if (this.failure) {
+        this.behindParts = null;
+        return;
+      }
+      if (offset < total) {
+        const bytes = update.subarray(offset, offset + this.partBytes);
+        const part: WorkerRequest = { type: 'doc-part', key, version, offset, total, bytes };
+        offset += bytes.byteLength;
+        this.write(part, next);
+        return;
+      }
+      const waiting = this.behindParts ?? [];
+      this.behindParts = null;
+      this.write(request);
+      try {
+        for (const m of waiting) this.post(m);
+      } catch (err) {
+        this.fail(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+    next();
+  }
+
+  /** Sends one message; `written` runs once the IPC channel has written it. */
+  private write(msg: WorkerRequest, written?: () => void): void {
     this.child.send(msg, (err) => {
       if (err) this.fail(err);
+      else written?.();
     });
   }
 
@@ -536,6 +595,7 @@ export class ProcessThread implements RenderThread {
     // a request that comes after the end was not the cause either
     this.lateFailure = shared ? sharedProcessError(err) : err;
     this.outbox = null;
+    this.behindParts = null;
     for (const [id, c] of this.calls) c.reject(shared && id !== shared.working ? this.lateFailure : err);
     this.calls.clear();
     this.order.length = 0;
@@ -643,6 +703,7 @@ export class RenderPool {
   private readonly drainTimeoutMs: number;
   private readonly startTimeoutMs: number;
   private readonly closeFallbackMs: number | undefined;
+  private readonly docPartBytes: number | undefined;
   private readonly heapLimitMb: number | undefined;
   private readonly workerUrl: URL | null;
   private readonly log: RenderPoolLog | undefined;
@@ -674,6 +735,7 @@ export class RenderPool {
     this.drainTimeoutMs = opts.drainTimeoutMs ?? 10_000;
     this.startTimeoutMs = opts.startTimeoutMs ?? 120_000;
     this.closeFallbackMs = opts.closeFallbackMs;
+    this.docPartBytes = opts.docPartBytes;
     this.heapLimitMb =
       opts.heapLimitMb !== undefined && Number.isFinite(opts.heapLimitMb) && opts.heapLimitMb > 0
         ? Math.round(opts.heapLimitMb)
@@ -859,6 +921,7 @@ export class RenderPool {
           heapLimitMb: this.heapLimitMb,
           startTimeoutMs: this.startTimeoutMs,
           closeFallbackMs: this.closeFallbackMs,
+          docPartBytes: this.docPartBytes,
         },
         (thread, err) => this.onWorkerExit(thread, err),
       );

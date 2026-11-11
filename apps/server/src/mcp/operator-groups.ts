@@ -256,8 +256,9 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
     editor:
       "it opens the Render window on the person's screen and renders the scene there at once, at the output " +
       "resolution, from the scene camera (else the editor's view; with the render engine PATHTRACER path " +
-      "traced on that computer's render workers, as many as its tab's memory allows, and not started when " +
-      'it would not fit into that memory: the window says why), without returning the image; with ' +
+      "traced on that computer's render workers, as many as its tab's memory allows; a render that would " +
+      "not fit into the tab's memory, path traced or with WebGL, is not started: the window says why), " +
+      'without returning the image; with ' +
       '{animation: true} it opens the Render Animation window instead, which renders nothing until the ' +
       'person presses its Render button',
   },

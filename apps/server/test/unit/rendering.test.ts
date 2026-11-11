@@ -22,8 +22,14 @@ import {
   keepAlive,
   noteBrowserRaster,
   SCALE_UP_MIN_MS,
+  SINGLE_THREAD_ANIMATION_ADVICE,
+  SINGLE_THREAD_EXPORT_ADVICE,
+  SINGLE_THREAD_RENDER_ADVICE,
+  renderToolError,
   slowBrowserRaster,
 } from '../../src/mcp/rendering';
+import { RenderOutOfMemoryError } from '../../src/render';
+import { checkMainThreadRender } from '../../src/render/memory';
 import { RpcError, type Room, type RpcAnswer, type SyncConnection } from '../../src/sync/room';
 import { MAX_EDITOR_TIMEOUT_MS, MAX_EDITOR_WAIT_MS } from '../../src/mcp/editor-commands';
 import { BROWSER_RASTER_SECONDS, measuredBrowserImages } from '../../src/mcp/editor-costs';
@@ -339,6 +345,114 @@ describe('out-of-memory advice', () => {
     // what objects and apply_modifiers: false do lower: what is written
     expect(EXPORT_OUT_OF_MEMORY_ADVICE).toContain(
       'Writing the file needs memory too, less with fewer objects (objects), base meshes (apply_modifiers: false)',
+    );
+  });
+});
+
+/*
+ * With RENDER_WORKERS=0 (or render processes that could not start) a render or export runs in the
+ * server's own process, and checkMainThreadRender does not start one whose estimate does not fit
+ * into its free heap. That estimate counts the meshes shown in renders only, but the refusals gave
+ * the advice of a render process ("also meshes hidden from renders (hide_render)"): a verifier's
+ * render was refused at about 1,716 MB and rendered in 242 ms once the heavy mesh was hidden from
+ * renders.
+ */
+describe('single-thread refusals', () => {
+  const MB = 1024 * 1024;
+  const scene = () => {
+    // a grid of 100×100 quads whose Subdivision Surface subdivides for renders only (5,120,000
+    // triangles at render level 4), and a cube
+    const doc = SceneDoc.create({ name: 'Single thread', empty: true });
+    const registry = createOperatorRegistry();
+    const ctx: OperatorContext = {
+      doc,
+      state: createEditorState(),
+      origin: { type: 'test' },
+      source: 'test',
+      report: () => undefined,
+    };
+    const run = (id: string, params: Record<string, unknown>) =>
+      expect(registry.run(ctx, id, params).ok).toBe(true);
+    run('mesh.primitive_grid_add', { x_subdivisions: 100, y_subdivisions: 100, name: 'Heavy' });
+    run('object.modifier_add', { type: 'SUBSURF', params: { levels: 0, render_levels: 4 } });
+    run('mesh.primitive_cube_add', { name: 'Small', location: [3, 0, 0] });
+    return { doc, run };
+  };
+  // the check of the server's process with 600 MB of its 1024 MB heap free
+  const refusal = (doc: SceneDoc, what: 'render' | 'export'): unknown => {
+    try {
+      checkMainThreadRender(
+        doc,
+        () => 600 * MB,
+        () => undefined,
+        what,
+        () => 1024 * MB,
+      );
+      return null;
+    } catch (err) {
+      return err;
+    }
+  };
+
+  it('advise what the check counts: the meshes shown in renders, so hiding one from renders helps', () => {
+    const { doc, run } = scene();
+    for (const [what, tool, advice] of [
+      ['render', 'Rendering', SINGLE_THREAD_RENDER_ADVICE],
+      ['render', 'Rendering the animation', SINGLE_THREAD_ANIMATION_ADVICE],
+      ['export', 'Export', SINGLE_THREAD_EXPORT_ADVICE],
+    ] as const) {
+      const err = refusal(doc, what);
+      expect(err).toBeInstanceOf(RenderOutOfMemoryError);
+      expect((err as RenderOutOfMemoryError).reason).toBe('refused');
+      expect((err as Error).message).toContain(
+        `this ${what} was not started: it needs about 1716 MB of JavaScript heap (about 5,120,012 triangles)`,
+      );
+      const error = renderToolError(err, tool);
+      expect(error.code).toBe('OUT_OF_MEMORY');
+      expect(error.message).toBe(`${tool} failed: ${(err as Error).message}. ${advice}`);
+      expect(error.message).not.toContain('also meshes hidden from renders');
+      expect(error.message).toContain(
+        'The check counts the meshes shown in renders, with their modifiers at their render settings',
+      );
+      expect(error.message).toContain('hide meshes from renders (hide_render');
+    }
+    expect(SINGLE_THREAD_RENDER_ADVICE).toContain(
+      "or render in a browser editor that has the project open (renderer 'browser').",
+    );
+    expect(SINGLE_THREAD_ANIMATION_ADVICE).toContain(
+      "or render the frames one by one with render_image {frame, renderer: 'browser'} in a browser editor that has the project open.",
+    );
+    // an export without objects writes the objects shown in renders: hiding the mesh leaves it out
+    expect(SINGLE_THREAD_EXPORT_ADVICE).toContain(
+      'whichever objects the export writes and also with apply_modifiers: false',
+    );
+    expect(SINGLE_THREAD_EXPORT_ADVICE).toContain(
+      'hide meshes from renders (hide_render: an export without objects leaves them out of the file)',
+    );
+    expect(SINGLE_THREAD_EXPORT_ADVICE).not.toContain("renderer 'browser'");
+
+    // what the advice says: a modifier turned off for renders, or the mesh hidden from renders,
+    // lets the render and the export start
+    run('object.modifier_set', { object: 'Heavy', modifier: 'Subdivision', show_render: false });
+    expect(refusal(doc, 'render')).toBeNull();
+    run('object.modifier_set', { object: 'Heavy', modifier: 'Subdivision', show_render: true });
+    expect(refusal(doc, 'render')).toBeInstanceOf(RenderOutOfMemoryError);
+    run('data.set_property', { kind: 'objects', target: 'Heavy', values: { hide_render: true } });
+    expect(refusal(doc, 'render')).toBeNull();
+    expect(refusal(doc, 'export')).toBeNull();
+  });
+
+  it('keep the advice of render processes for a render process that ran out of memory', () => {
+    const err = new RenderOutOfMemoryError(
+      'out of memory: the render process ran out of its 256 MB JavaScript heap; the server keeps running',
+      256,
+    );
+    expect(renderToolError(err).message).toBe(`Rendering failed: ${err.message}. ${OUT_OF_MEMORY_ADVICE}`);
+    expect(renderToolError(err, 'Rendering the animation').message).toBe(
+      `Rendering the animation failed: ${err.message}. ${ANIMATION_OUT_OF_MEMORY_ADVICE}`,
+    );
+    expect(renderToolError(err, 'Export').message).toBe(
+      `Export failed: ${err.message}. ${EXPORT_OUT_OF_MEMORY_ADVICE}`,
     );
   });
 });

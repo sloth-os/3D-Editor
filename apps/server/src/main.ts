@@ -2,12 +2,7 @@ import { loadConfig } from './config';
 import { createApp } from './app';
 import { persistenceNote } from './persistence';
 import { closeSharedRenderer } from './render';
-
-/**
- * How long a shutdown (SIGTERM, SIGINT) may take before the server exits anyway: Docker sends
- * SIGKILL 10 s after SIGTERM.
- */
-const SHUTDOWN_EXIT_MS = 9000;
+import { stopOnSignals } from './shutdown';
 
 async function main(): Promise<void> {
   let config;
@@ -28,6 +23,7 @@ async function main(): Promise<void> {
       webdavProxy: config.webdavProxy,
       otel: config.otel?.endpoint ?? null,
       publicDir: config.publicDir,
+      shutdownTimeoutSeconds: config.shutdownTimeoutMs / 1000,
     },
     '3d-editor server starting',
   );
@@ -46,38 +42,18 @@ async function main(): Promise<void> {
     'server listening',
   );
 
-  let stopping = false;
-  const shutdown = (signal: NodeJS.Signals) => {
-    if (stopping) return;
-    stopping = true;
-    app.log.info({ signal }, 'shutting down: closing connections and saving projects');
-    // within Docker's stop timeout (SIGKILL 10 s after SIGTERM); the rooms wait for storage 7 s
-    // at most (RoomManager.close), and say which projects stayed unsaved
-    const force = setTimeout(() => {
-      const unsaved = handle.rooms.unsaved();
-      if (unsaved.length > 0)
-        app.log.error(
-          { projects: unsaved, reason: 'the shutdown ran out of time before storage saved their changes' },
-          'projects not saved at shutdown',
-        );
-      app.log.error(`shutdown timed out after ${SHUTDOWN_EXIT_MS / 1000} s, exiting`);
-      process.exit(1);
-    }, SHUTDOWN_EXIT_MS);
-    force.unref();
-    // the render processes stop at once (renders in progress are cancelled); a busy one would
-    // otherwise finish its request first
-    Promise.all([handle.close(), closeSharedRenderer()])
-      .then(() => {
-        app.log.info('shutdown complete');
-        process.exit(0);
-      })
-      .catch((err: unknown) => {
-        app.log.error({ err }, 'shutdown failed');
-        process.exit(1);
-      });
-  };
-  process.once('SIGTERM', shutdown);
-  process.once('SIGINT', shutdown);
+  // SIGTERM, SIGINT: within SHUTDOWN_TIMEOUT_SECONDS (9 s by default: Docker sends SIGKILL 10 s
+  // after SIGTERM), naming the projects that stayed unsaved; the render processes stop at once
+  // (renders in progress are cancelled), a busy one would otherwise finish its request first
+  stopOnSignals(
+    {
+      log: app.log,
+      rooms: handle.rooms,
+      close: () => Promise.all([handle.close(), closeSharedRenderer()]),
+    },
+    config,
+    (code) => process.exit(code),
+  );
   process.on('unhandledRejection', (reason) => app.log.error({ err: reason }, 'unhandled promise rejection'));
 }
 
