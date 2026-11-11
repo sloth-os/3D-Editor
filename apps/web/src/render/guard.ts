@@ -1,7 +1,4 @@
 import {
-  MODIFIER_BYTES_PER_INPUT_FACE,
-  MODIFIER_BYTES_PER_RESULT_FACE,
-  estimateModifier,
   listModifierDefs,
   meshSize,
   registerBuiltinModifiers,
@@ -15,6 +12,9 @@ import {
 import {
   COMPILED_BYTES_PER_TRIANGLE,
   INSTANCE_BYTES,
+  PREPARE_BYTES_PER_TRIANGLE,
+  bevelHeap,
+  modifierEstimate,
   planRenderThreads,
   type RenderEstimate,
   type RenderNeeds,
@@ -53,8 +53,8 @@ export interface BevelSizeParams {
  * ⌊segments / 2⌋ × ⌈segments / 2⌉ faces per edge, one more in the middle when the segments are odd;
  * else one polygon). With affect VERTICES every corner with such an edge gets the patch of its faces.
  * An upper bound: core bevels only edges whose ends have a closed fan of faces, and merges or welds
- * some patches. The heap: core's per input face and per added face (MODIFIER_BYTES_PER_INPUT_FACE,
- * MODIFIER_BYTES_PER_RESULT_FACE), as it estimates limit_method NONE.
+ * some patches. The heap: as Chrome takes it per input face or vertex, per edge and corner it
+ * bevels and per face it adds ({@link bevelHeap}).
  */
 export function bevelEstimate(mesh: MeshData, p: BevelSizeParams): ModifierEstimate {
   const faces = mesh.faces;
@@ -181,11 +181,14 @@ export function bevelEstimate(mesh: MeshData, p: BevelSizeParams): ModifierEstim
       corners += polygon;
     }
   };
+  // vertices that get a patch
+  let patched = 0;
   if (p.affect === 'VERTICES') {
     for (let v = 0; v < V; v++) {
       const valence = start[v + 1] - start[v];
       if (!valence || !fan[v] || (angle && !beveled[v])) continue;
       patch(valence, S * valence);
+      patched++;
       // each corner of the vertex becomes an arc of S + 1 points in its face
       corners += S * valence;
       selected += valence;
@@ -198,17 +201,15 @@ export function bevelEstimate(mesh: MeshData, p: BevelSizeParams): ModifierEstim
       if (!k) continue;
       const valence = start[v + 1] - start[v];
       patch(k, S * k + 2 * (valence - k));
+      patched++;
       // the edges next to a beveled one get a slide point, in the loops of both their faces
       corners += 2 * Math.min(2 * k, valence - k);
     }
   }
-  if (!added)
-    return { result: input, bytes: MODIFIER_BYTES_PER_INPUT_FACE.BEVEL * Math.max(F, V), lower: 'segments' };
+  if (!added) return { result: input, bytes: bevelHeap(input, 0, 0), lower: 'segments' };
   return {
     result: { faces: F + added, corners: C + corners, vertices: V + C + added + S * selected },
-    bytes:
-      MODIFIER_BYTES_PER_INPUT_FACE.BEVEL * Math.max(F, V) +
-      MODIFIER_BYTES_PER_RESULT_FACE.BEVEL_ADDED * added,
+    bytes: bevelHeap(input, added, (p.affect === 'VERTICES' ? 0 : edges) + patched),
     lower: 'segments',
   };
 }
@@ -273,13 +274,19 @@ export class EvaluationGuard {
     // what the scene holds beyond the estimate once the modifier ran: compiled, as far as anyone knows
     const grown = Math.max(0, e.storedTriangles + this.results - replaces + made - e.evaluatedTriangles);
     const triangles = e.triangles + grown;
+    const held = this.heldTriangles;
+    // the heap while it runs: what the evaluation holds (its input included) and the modifier's peak
+    // above its input (its result included); `renderMemory` counts the heap of the larger of the
+    // compiled and the held triangles (its result among them), so only the rest of the peak on top
+    const perTriangle = PREPARE_BYTES_PER_TRIANGLE.heap;
+    const peak = held * perTriangle + estimate.bytes;
     const needs: RenderNeeds = {
       triangles,
-      evaluatedTriangles: this.heldTriangles,
+      evaluatedTriangles: held,
       instances: e.instances,
       sceneBytes: triangles * COMPILED_BYTES_PER_TRIANGLE + e.instances * INSTANCE_BYTES.scene + e.imageBytes,
       pixels: this.pixels,
-      evaluationHeap: estimate.bytes,
+      evaluationHeap: Math.max(0, peak - Math.max(triangles, held) * perTriangle),
     };
     const plan = planRenderThreads(needs, 1, this.memory);
     if (!plan.refusal) return null;
@@ -322,7 +329,7 @@ function guardedModifier(
       const estimate =
         def.type === 'BEVEL'
           ? bevelEstimate(mesh, params as unknown as BevelSizeParams)
-          : estimateModifier(
+          : modifierEstimate(
               { type: def.type, params } as unknown as ModifierData,
               meshSize(mesh, def.type === 'ARRAY'),
               {

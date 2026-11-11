@@ -1,15 +1,19 @@
 import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import {
+  PLAIN,
+  callJson,
   changedFraction,
   decodeApng,
   decodePng,
   decodePngDataUrl,
   imageStats,
+  mcpConnect,
   newProject,
   renderStill,
   setNumberField,
   setOutputPercentage,
+  toolText,
 } from './helpers';
 
 test.describe('rendering in the browser', () => {
@@ -115,6 +119,62 @@ test.describe('rendering in the browser', () => {
     await page.locator('.modal .close').click();
     await expect(page.getByTestId('render-dialog')).toHaveCount(0);
     await expect(page.getByTestId('outliner-Cube')).toBeVisible();
+  });
+
+  test('a Bevel that only renders is refused on the first render worker before it runs, for F12 and for agents', async ({
+    page,
+  }) => {
+    // a device that reports 0.25 GB: room for the copies of the cube the estimate before the render
+    // counts, not for the faces a Bevel limited by angle adds to them (only the worker can count those)
+    await page.addInitScript(() =>
+      Object.defineProperty(navigator, 'deviceMemory', { value: 0.25, configurable: true }),
+    );
+    const project = await newProject(page);
+    // 5 % of 1920×1080
+    await setOutputPercentage(page, 5);
+    await page.getByTestId('prop-tab-render').click();
+    await page.getByTestId('render-engine').selectOption('PATHTRACER');
+    const client = await mcpConnect(PLAIN);
+    try {
+      // the cube as 40 copies, beveled with 30 segments in renders only (461,280 triangles)
+      const run = (operator: string, params: Record<string, unknown>) =>
+        callJson(client, 'run_operator', { project, operator, params });
+      await run('object.modifier_add', {
+        object: 'Cube',
+        type: 'ARRAY',
+        name: 'Arr',
+        params: { count: 40, relative_offset_displace: [1.5, 0, 0] },
+      });
+      await run('object.modifier_add', {
+        object: 'Cube',
+        type: 'BEVEL',
+        name: 'Bev',
+        params: { width: 0.05 },
+      });
+      await run('object.modifier_set', { object: 'Cube', modifier: 'Bev', show_viewport: false });
+      await run('object.modifier_set', { object: 'Cube', modifier: 'Bev', params: { segments: 30 } });
+      const refusal =
+        /^Path tracing was not started: it needs about \d+\.\d+ GB of memory with one render thread, more than the 0\.1 GB a render may use in this tab \(half the device memory the browser reports, 0\.25 GB, at most 4\.0 GB\) \(about 0\.5 million triangles, 5,184 pixels\), and running out of memory would end the tab\. The Bevel modifier 'Bev' of 'Cube' would make 0\.5 million of these triangles \(lower its segments\)\. Lower the resolution/;
+      await page.getByTestId('viewport').hover();
+      await page.keyboard.press('F12');
+      const dialog = page.getByTestId('render-dialog');
+      await expect(dialog.locator('.error-text')).toHaveText(refusal, { timeout: 30_000 });
+      await expect(page.getByTestId('render-status')).toContainText('Failed');
+      await page.locator('.modal .close').click();
+      // an agent's path traced render in this editor: the same reason, and what to do instead
+      const res = await client.callTool({
+        name: 'render_image',
+        arguments: { project, renderer: 'browser', engine: 'PATHTRACER', width: 96, height: 54, samples: 1 },
+      });
+      expect(res.isError).toBe(true);
+      const text = toolText(res);
+      expect(text).toContain("The Bevel modifier 'Bev' of 'Cube' would make 0.5 million of these triangles");
+      expect(text).toContain("Use renderer 'software' to render on the server.");
+      // the tab keeps working
+      await expect(page.getByTestId('outliner-Cube')).toBeVisible();
+    } finally {
+      await client.close();
+    }
   });
 
   test('Render Animation (Ctrl+F12) encodes a few rasterized frames into an animated PNG download', async ({

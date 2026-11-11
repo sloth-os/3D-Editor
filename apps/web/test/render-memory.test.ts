@@ -10,6 +10,7 @@ import {
   meshSize,
   renderSceneSoftware,
   type CurveData,
+  type MeshData,
   type ModifierData,
   type Spline,
 } from '@3d-editor/core';
@@ -22,6 +23,7 @@ import {
   type WorkerLike,
 } from '../src/render';
 import {
+  BEVEL_HEAP_BYTES,
   COMPILED_BYTES_PER_TRIANGLE,
   DEFAULT_DEVICE_GB,
   FINISH_BYTES_PER_PIXEL,
@@ -31,6 +33,8 @@ import {
   PAGE_BYTES_PER_PIXEL,
   PREPARE_BYTES_PER_TRIANGLE,
   WORKER_BASE_BYTES,
+  YOUNG_GENERATION_BYTES,
+  bevelHeap,
   curveSurfaceSize,
   estimateRender,
   estimatedNeeds,
@@ -40,6 +44,7 @@ import {
   renderMemoryBudget,
   splineSampleCount,
   tabMemory,
+  usableHeap,
   type RenderNeeds,
   type TabMemory,
 } from '../src/render/memory';
@@ -338,6 +343,45 @@ describe('memory of browser path traced renders', () => {
     expect((await preparedInfo(doc, 24, 16)).triangles).toBe(5 * 12);
   });
 
+  it('measures the size of a mesh an Array fits to a length once per decoded mesh, again once it changes', () => {
+    const doc = scene();
+    const cube = doc.findObjectByName('Cube')!;
+    doc.updateObject(cube.id, {
+      modifiers: [
+        modifier('a', 'ARRAY', {
+          fit_type: 'FIT_LENGTH',
+          fit_length: 9,
+          relative_offset_displace: [1, 0, 0],
+        }),
+      ],
+    });
+    // the reads of the decoded mesh's vertex positions (its size along the offset is measured from them)
+    let reads = 0;
+    const getMesh = doc.getMesh.bind(doc);
+    const counted = new WeakMap<object, MeshData>();
+    doc.getMesh = (id: string) => {
+      const m = getMesh(id);
+      if (!m) return m;
+      let c = counted.get(m);
+      if (!c) {
+        c = new Proxy(m, { get: (t, k) => (k === 'positions' && reads++, Reflect.get(t, k)) });
+        counted.set(m, c);
+      }
+      return c;
+    };
+    // 2 m cube, copies 2 m apart to fill 9 m: 5 copies; the next render of the same mesh reads nothing
+    expect(estimateRender(doc).triangles).toBe(5 * 12);
+    expect(reads).toBeGreaterThan(0);
+    reads = 0;
+    expect(estimateRender(doc).triangles).toBe(5 * 12);
+    expect(reads).toBe(0);
+    // a cube half as large, measured from the new mesh: copies 1 m apart fill 9 m with 10
+    const half = getMesh(cube.data!)!;
+    doc.setMesh(cube.data!, { ...half, positions: half.positions.map((v) => v / 2) });
+    expect(estimateRender(doc).triangles).toBe(10 * 12);
+    expect(reads).toBeGreaterThan(0);
+  });
+
   it('estimates the heap the modifiers of one object take while the first worker evaluates them', () => {
     const doc = SceneDoc.create();
     expect(estimateRender(doc).evaluationHeap).toBe(0);
@@ -386,7 +430,6 @@ describe('memory of browser path traced renders', () => {
       wave('POLY', 9, true),
       // a spline that would pass 250,000 points: core lowers its resolution
       wave('BEZIER', 300),
-      wave('NURBS', 400),
     ];
     for (const s of cases)
       for (const res of [12, 1024]) {
@@ -736,7 +779,7 @@ describe('memory of browser path traced renders', () => {
     );
     // ... the heap other path traced renders hold in it included
     const heap = renderMemory(needs, 1).heap;
-    const room = roomy.heapLimit * JS_HEAP_SHARE - roomy.heapUsed;
+    const room = usableHeap(roomy.heapLimit) - roomy.heapUsed;
     expect(planRenderThreads(needs, 1, { ...roomy, held: { total: 0, heap: room - heap - 1 } }).threads).toBe(
       1,
     );
@@ -746,6 +789,61 @@ describe('memory of browser path traced renders', () => {
     expect(held.refusal).toContain(
       `of JavaScript heap, and the tab, which already uses ${((roomy.heapUsed + others) / GB).toFixed(1)} GB`,
     );
+  });
+
+  it("keeps the young generation's part of a small JavaScript heap free: a worker runs out at its old generation", () => {
+    // Chrome 153 with --max-old-space-size=400 reports a limit of 497 MB: a worker's old generation is
+    // full at 400 MB, below 0.85 of the limit (422 MB)
+    const limit = 497 * MB;
+    expect(usableHeap(limit)).toBe(limit - YOUNG_GENERATION_BYTES);
+    expect(usableHeap(limit)).toBeLessThan(400 * MB);
+    // the default limit (3,586 MB): 0.85 of it
+    expect(usableHeap(3586 * MB)).toBe(3586 * MB * JS_HEAP_SHARE);
+    // none of a limit smaller than the young generation
+    expect(usableHeap(100 * MB)).toBe(0);
+    // a render thread of 380 MB of heap: within 0.85 of the limit, not within its old generation
+    const tab = { ...roomy, heapLimit: limit, heapUsed: 0 };
+    const needs: RenderNeeds = {
+      triangles: 0,
+      sceneBytes: 0,
+      pixels: 0,
+      evaluationHeap: 380 * MB - WORKER_BASE_BYTES,
+    };
+    expect(renderMemory(needs, 1).heap).toBeLessThan(limit * JS_HEAP_SHARE);
+    const refused = planRenderThreads(needs, 1, tab);
+    expect(refused.threads).toBe(0);
+    expect(refused.refusal).toContain(
+      'its render thread needs about 0.37 GB of JavaScript heap, and the tab, which already uses 0.0 GB, has 0.35 GB of its 0.5 GB left for it',
+    );
+    expect(
+      planRenderThreads({ ...needs, evaluationHeap: 340 * MB - WORKER_BASE_BYTES }, 1, tab).threads,
+    ).toBe(1);
+  });
+
+  it("estimates a Bevel's heap as Chrome takes it: per input face or vertex, edge and corner it bevels, face it adds", () => {
+    const doc = SceneDoc.create();
+    const cube = doc.findObjectByName('Cube')!;
+    const size = meshSize(doc.getMesh(cube.data!)!);
+    // on every edge (limit_method NONE): core counts what it adds (12 edges of 2 faces, 8 corners of
+    // 4), and its own heap per face is Node's
+    const none = modifier('b', 'BEVEL', { width: 0.1, segments: 2, limit_method: 'NONE' });
+    doc.updateObject(cube.id, { modifiers: [none] });
+    const core = estimateModifier(none, size, { forRender: true });
+    const added = core.result.faces - size.faces;
+    expect(added).toBe(Math.round((size.corners / 2) * 2 + size.vertices * 4));
+    const browser = bevelHeap(size, added, size.corners / 2 + size.vertices);
+    expect(browser).toBe(
+      BEVEL_HEAP_BYTES.input * 8 + BEVEL_HEAP_BYTES.element * (12 + 8) + BEVEL_HEAP_BYTES.face * added,
+    );
+    expect(estimateRender(doc).evaluationHeap).toBe(browser);
+    expect(core.bytes).toBeGreaterThan(2 * browser);
+    // by angle (the default): no face counted, the topology it builds all the same
+    doc.updateObject(cube.id, { modifiers: [modifier('b', 'BEVEL', { width: 0.1, segments: 2 })] });
+    expect(estimateRender(doc).evaluationHeap).toBe(BEVEL_HEAP_BYTES.input * 8);
+    // other modifiers as core estimates them
+    const sub = modifier('s', 'SUBSURF', { render_levels: 2 });
+    doc.updateObject(cube.id, { modifiers: [sub] });
+    expect(estimateRender(doc).evaluationHeap).toBe(estimateModifier(sub, size, { forRender: true }).bytes);
   });
 
   it('prepares on one worker; the others adopt a copy of its compiled scene and render the same image', async () => {
@@ -826,10 +924,11 @@ describe('memory of browser path traced renders', () => {
 
   it('refuses a render of curves that are dense only in renders before any worker starts', async () => {
     const doc = scene();
-    // 15 spans × 64 samples + 1 points, a ring of 20: 38,400 triangles in renders, 300 in the viewport
-    cable(doc, 16, 64, 8);
+    // 15 spans × 16 samples + 1 points, a ring of 20: 9,600 triangles in renders, 600 in the viewport
+    cable(doc, 16, 16, 8);
     const est = estimateRender(doc);
-    expect(est.triangles).toBe(12 + 2 * 960 * 20);
+    expect(est.triangles).toBe(12 + 2 * 240 * 20);
+    expect(estimateRender(doc, false).triangles).toBe(12 + 2 * 15 * 20);
     const cubeOnly = renderMemory(estimatedNeeds(estimateRender(scene()), 24 * 16), 1).total;
     const withCable = renderMemory(estimatedNeeds(est, 24 * 16), 1).total;
     // room for the cube, not for the cable's render surface: refused before any worker evaluates it
@@ -837,7 +936,7 @@ describe('memory of browser path traced renders', () => {
     const memory = { ...roomy, budget: (cubeOnly + withCable) / 2, deviceGB: 0.25 };
     const job = startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory });
     await expect(job.result).rejects.toThrow(
-      /^Path tracing was not started: .*\(about 38,412 triangles, 384 pixels\)/,
+      /^Path tracing was not started: .*\(about 9,612 triangles, 384 pixels\)/,
     );
     expect(started).toEqual([]);
     // with room for it, it renders

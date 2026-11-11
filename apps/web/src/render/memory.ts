@@ -14,6 +14,7 @@ import {
   type BevelFillType,
   type CurveData,
   type MeshSize,
+  type ModifierEstimate,
   type ObjectData,
   type SceneDoc,
   type Spline,
@@ -42,7 +43,7 @@ import {
  * of heap and 212–214 MB of ArrayBuffers each in that render, whose tab then peaked at 1.9–2.0 GB
  * (three runs). The number of workers is the largest that fits:
  * - the JavaScript heap: the page's heap, the first worker's evaluated scene and every worker's
- *   own heap, within {@link JS_HEAP_SHARE} of the tab's limit;
+ *   own heap, within the part of the tab's limit a render may fill ({@link usableHeap});
  * - the tab's memory budget ({@link renderMemoryBudget}): the first worker (evaluated scene,
  *   compiled scene and what compiling leaves behind), a compiled scene per other worker, the
  *   page's copy of it while it hands it out, and the film, preview and denoising of the image.
@@ -92,6 +93,48 @@ export const COMPILED_BYTES_PER_TRIANGLE = 200;
  */
 export const INSTANCE_BYTES = { scene: 400, heap: 400 } as const;
 
+/**
+ * The JavaScript heap core's Bevel modifier takes at its peak in Chrome, above its input (bytes):
+ * per face it adds; per edge it bevels and per vertex it patches (its records of edges, corners and
+ * profiles); per face or vertex of its input, the larger (the topology it builds, also when it
+ * bevels nothing). Fitted to the smallest --max-old-space-size with which a dedicated worker of
+ * Chrome 153 evaluated a Bevel that only renders: the default cube as 20 to 4,000 copies (1, 2, 8,
+ * 30 and 100 segments, by angle) and subdivided (all edges, 1 and 2 segments), 80 to 447 MB, and
+ * 218 MB for a smooth input of 196,608 faces that it bevels nothing of; 360, 370–760 and 1,110
+ * bytes, and a quarter more. core's own figures (MODIFIER_BYTES_PER_RESULT_FACE.BEVEL_ADDED,
+ * MODIFIER_BYTES_PER_INPUT_FACE.BEVEL) were measured in Node: they come to 1.6 GB for the cube as
+ * 160 copies with 30 segments, which a worker here evaluates in 331 MB.
+ */
+export const BEVEL_HEAP_BYTES = { face: 450, element: 950, input: 1400 } as const;
+
+/**
+ * The heap a Bevel takes in the browser ({@link BEVEL_HEAP_BYTES}) on an input of `input`'s size,
+ * adding `added` faces at `elements` edges and vertices.
+ */
+export function bevelHeap(input: MeshSize, added: number, elements: number): number {
+  return (
+    BEVEL_HEAP_BYTES.input * Math.max(input.faces, input.vertices) +
+    BEVEL_HEAP_BYTES.element * elements +
+    BEVEL_HEAP_BYTES.face * added
+  );
+}
+
+/**
+ * core `estimateModifier` with the browser's heap for a Bevel ({@link bevelHeap}) on its faces as
+ * core counts them: every edge and vertex with limit_method NONE, none by angle (which edges those
+ * are the check of the first worker's evaluation counts from its real input, guard.ts).
+ */
+export function modifierEstimate(
+  mod: Parameters<typeof estimateModifier>[0],
+  input: MeshSize,
+  ctx: Parameters<typeof estimateModifier>[2],
+): ModifierEstimate {
+  const e = estimateModifier(mod, input, ctx);
+  if (mod.type !== 'BEVEL' || !e.bytes) return e;
+  const added = Math.max(0, e.result.faces - input.faces);
+  return { ...e, bytes: bevelHeap(input, added, added ? input.corners / 2 + input.vertices : 0) };
+}
+
 /** A render worker that holds no scene: its JavaScript heap and code (measured 7–27 MB, rounded up). */
 export const WORKER_BASE_BYTES = 32 * MB;
 
@@ -113,6 +156,22 @@ export const FINISH_BYTES_PER_PIXEL = 133;
 
 /** Share of the tab's JavaScript heap limit a render may fill (the page needs the rest to keep working). */
 export const JS_HEAP_SHARE = 0.85;
+
+/**
+ * The part of the JavaScript heap limit V8 keeps for its young generation (bytes): a worker runs out
+ * of memory when its old generation is full, and the jsHeapSizeLimit Chrome reports is 97–136 MB
+ * above that (--max-old-space-size from 112 to 1024 MB, Chrome 153). A tab with a small limit can
+ * fill less than {@link JS_HEAP_SHARE} of it: 0.36 GB of a 0.49 GB limit (--max-old-space-size=400).
+ */
+export const YOUNG_GENERATION_BYTES = 136 * MB;
+
+/**
+ * The JavaScript heap a render may fill in a tab whose limit is `limit` (bytes): {@link JS_HEAP_SHARE}
+ * of it, and never the part kept for the young generation ({@link YOUNG_GENERATION_BYTES}).
+ */
+export function usableHeap(limit: number): number {
+  return Math.max(0, Math.min(limit * JS_HEAP_SHARE, limit - YOUNG_GENERATION_BYTES));
+}
 
 /** The tab's memory as the browser reports it. */
 export interface TabMemory {
@@ -367,9 +426,10 @@ export interface RenderEstimate {
   instances: number;
   /**
    * The largest JavaScript heap the evaluation of one object takes while it runs (bytes): the sum of
-   * core `estimateModifier` peaks over its modifiers, results included, as the server counts them,
-   * and for text the glyphs (core TEXT_BYTES_PER_CHARACTER). The first worker needs it on top of the
-   * evaluated scene until the evaluation is over.
+   * the peaks of its modifiers, results included ({@link modifierEstimate}: core `estimateModifier`,
+   * as the server counts them, a Bevel's as Chrome takes it), and for text the glyphs (core
+   * TEXT_BYTES_PER_CHARACTER). The first worker needs it on top of the evaluated scene until the
+   * evaluation is over.
    */
   evaluationHeap: number;
   /**
@@ -431,7 +491,7 @@ function collectionTrees(doc: SceneDoc, ids: Iterable<string>): Set<string> {
  * What a path traced render of `doc` evaluates, compiles and instances, estimated without evaluating
  * it (the viewport's evaluation with `forRender` false): each mesh by its stored counts, each curve
  * and text by the surface core builds for it ({@link curveSurfaceSize}), through its modifiers
- * enabled for renders (core `estimateModifier`). A mesh's geometry is shared by the objects that
+ * enabled for renders ({@link modifierEstimate}). A mesh's geometry is shared by the objects that
  * show it unmodified; one with modifiers is evaluated per object, as core does.
  */
 export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate {
@@ -505,7 +565,7 @@ export function estimateRender(doc: SceneDoc, forRender = true): RenderEstimate 
     const stored = o.type !== 'MESH' || !mods.length ? triangles(size) : 0;
     const extent = size.extent;
     for (const m of mods) {
-      const e = estimateModifier(m, size, {
+      const e = modifierEstimate(m, size, {
         forRender,
         operandFaces: (id) => {
           const other = byId.get(id) ?? byName.get(id);
@@ -689,7 +749,7 @@ function fits(n: RenderNeeds, threads: number, mem: TabMemory): boolean {
   const m = renderMemory(n, threads);
   return (
     m.total + mem.held.total <= mem.budget &&
-    mem.heapUsed + mem.held.heap + m.heap <= mem.heapLimit * JS_HEAP_SHARE
+    mem.heapUsed + mem.held.heap + m.heap <= usableHeap(mem.heapLimit)
   );
 }
 
@@ -708,7 +768,7 @@ export function planRenderThreads(needs: RenderNeeds, maxThreads: number, mem: T
   if (threads > 0) return { threads, limited: threads < max, refusal: null };
   const m = renderMemory(needs, 1);
   const used = mem.heapUsed + mem.held.heap;
-  const heapRoom = mem.heapLimit * JS_HEAP_SHARE - used;
+  const heapRoom = usableHeap(mem.heapLimit) - used;
   const overBudget = m.total + mem.held.total > mem.budget;
   // the need and the room the reason compares never print the same; other figures with one decimal
   const need = overBudget ? m.total : m.heap;

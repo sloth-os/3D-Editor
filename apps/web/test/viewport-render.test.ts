@@ -278,7 +278,8 @@ beforeEach(async () => {
 // those three runs the reporter showed the afterEach of 'editor_command screenshot: …' taking 3.4 s
 // and 3.2 s, and once that of 'keep the materials of every shading drawn …' taking 3.1 s (inside
 // the hooks: 0.1–0.2 ms), each late by 'lights a simple scene as brightly as the path tracer …'
-// (3.1–3.4 s), which ran two or three tests after it.
+// (3.1–3.4 s), which ran two or three tests after it; a later run showed 5.0 s. That test now waits
+// 110 ms before its synchronous work, past the timer, so the hook ends are sent before it.
 afterEach(() => {
   for (const e of engines.splice(0)) e.dispose();
   vi.unstubAllGlobals();

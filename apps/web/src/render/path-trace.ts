@@ -104,6 +104,20 @@ const now = () => performance.now();
  */
 export const ADOPTER_COPIES_STOP = 8;
 
+/**
+ * Whether the workers that adopted copies of a finished render's compiled scene are stopped: when
+ * no other path traced render runs (it may use them) and the `copies` of `sceneBytes` each take
+ * 1/{@link ADOPTER_COPIES_STOP} of the render `budget` or more.
+ */
+export function stopsAdopters(
+  othersRunning: number,
+  copies: number,
+  sceneBytes: number,
+  budget: number,
+): boolean {
+  return othersRunning === 0 && copies * sceneBytes >= budget / ADOPTER_COPIES_STOP;
+}
+
 /** What the path traced renders running now hold, by job (their {@link renderMemory}). */
 const running = new Map<number, { total: number; heap: number }>();
 
@@ -616,7 +630,7 @@ export class PathTraceJob {
       // copies that take an eighth of the budget or more go at once with their workers (they start
       // again for the next render), unless another render uses the workers
       const info = this.info;
-      if (!running.size && info && (all.length - 1) * info.sceneBytes >= tab.budget / ADOPTER_COPIES_STOP)
+      if (info && stopsAdopters(running.size, all.length - 1, info.sceneBytes, tab.budget))
         for (const t of all.slice(1)) t.stop();
     }
   }
