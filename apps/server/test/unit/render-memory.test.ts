@@ -16,11 +16,7 @@ import {
   estimateRenderTriangles,
   renderMemoryFromEnv,
 } from '../../src/render';
-import {
-  RENDER_HEAP_BYTES_PER_TRIANGLE,
-  SERVER_HEAP_RESERVE_BYTES,
-  geometryCheck,
-} from '../../src/render/memory';
+import { RENDER_HEAP_BYTES_PER_TRIANGLE, geometryCheck, serverHeapReserve } from '../../src/render/memory';
 import { OUT_OF_MEMORY_ADVICE, renderToolError } from '../../src/mcp/rendering';
 
 /*
@@ -149,16 +145,17 @@ describe('renders in the server process', () => {
   });
 
   it('refuse a render the free heap cannot hold, with an explained error, and render one it can', async () => {
-    // a heap with 300 MB free: 256 MB stay for the rest of the server, 44 MB for the render
+    // a heap of 1,024 MB with 300 MB free: 256 MB stay for the rest of the server, 44 MB for the render
     const free = 300 * MB;
     const r = new Renderer(new RenderPool({ threads: 0 }), {
       heapFree: () => free,
       collectGarbage: () => undefined,
+      heapLimit: () => 1024 * MB,
     });
     renderers.push(r);
     const big = scene();
     addGrid(big, 400); // 320,000 triangles: about 98 MB
-    expect(320_000 * RENDER_HEAP_BYTES_PER_TRIANGLE).toBeGreaterThan(free - SERVER_HEAP_RESERVE_BYTES);
+    expect(320_000 * RENDER_HEAP_BYTES_PER_TRIANGLE).toBeGreaterThan(free - serverHeapReserve(1024 * MB));
     const options = { width: 32, height: 24, frame: 1, engine: 'RASTER' as const, shading: 'SOLID' as const };
     const exportCall = () => r.exportScene({ scene: big, projectId: 'big', format: 'obj', options: {} });
     for (const call of [
@@ -192,7 +189,7 @@ describe('renders in the server process', () => {
       const what = call === exportCall ? 'export' : 'render';
       expect((err as Error).message).toMatch(
         new RegExp(
-          `^out of memory: this ${what} was not started: it needs about 98 MB of JavaScript heap \\(about 320,000 triangles\\), and ${what}s run in the server's own process \\(its render processes are off: RENDER_WORKERS=0, or they could not start\\), which has 300 MB of its \\d+ MB heap free; running out of it would stop the server$`,
+          `^out of memory: this ${what} was not started: it needs about 98 MB of JavaScript heap \\(about 320,000 triangles\\), and ${what}s run in the server's own process \\(its render processes are off: RENDER_WORKERS=0, or they could not start\\), which has 300 MB of its 1024 MB heap free; running out of it would stop the server$`,
         ),
       );
       expect(renderToolError(err).message).toBe(
@@ -213,6 +210,7 @@ describe('renders in the server process', () => {
     const r = new Renderer(new RenderPool({ threads: 0 }), {
       heapFree: () => 276 * MB,
       collectGarbage: () => collected++,
+      heapLimit: () => 1024 * MB,
     });
     renderers.push(r);
     const doc = scene();
@@ -244,7 +242,9 @@ describe("modifiers evaluated in the server's process", () => {
     const before = geometryMemoryCheck();
     let free = 270 * MB;
     let collected = 0;
-    setGeometryMemoryCheck(geometryCheck({ heapFree: () => free, collect: () => collected++ }));
+    setGeometryMemoryCheck(
+      geometryCheck({ heapFree: () => free, collect: () => collected++, heapLimit: () => 1024 * MB }),
+    );
     try {
       const doc = scene();
       const grid = addGrid(doc, 50);

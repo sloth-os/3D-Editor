@@ -282,13 +282,13 @@ the printed `editor:` URL), runs every check above, and then does what the mode 
 
 | Mode | What it does | Time |
 | --- | --- | --- |
-| `--final` (default) | build + checks, `render.png`, `contact_sheet.png`, `preview.gif` | 13 min with 3 render threads on a busy 4-core machine (see below) |
+| `--final` (default) | build + checks, `render.png`, `contact_sheet.png`, `preview.gif` | 13 min with 3 render processes on a busy 4-core machine (see below) |
 | `--build-only` | build + checks, no renders | 41 s (38 s of it the clearance sweep) |
-| `--preview` | build + checks + 960×540 RASTER still, 640×360 path-traced still (16 spp) and RASTER contact sheet in `$PREVIEW_DIR` (default `$TMPDIR/clockwork-orrery-previews`); nothing is written next to the script | 111 s with 1 render thread on a busy machine |
-| `--export-only` | build + checks + `scene.glb` (no renders) | 71 s (the export itself 15 s, 2 render threads) |
+| `--preview` | build + checks + 960×540 RASTER still, 640×360 path-traced still (16 spp) and RASTER contact sheet in `$PREVIEW_DIR` (default `$TMPDIR/clockwork-orrery-previews`); nothing is written next to the script | 111 s with 1 render process on a busy machine |
+| `--export-only` | build + checks + `scene.glb` (no renders) | 71 s (the export itself 15 s, 2 render processes) |
 | `--stages build,still,…` | any combination of `build`, `preview`, `still`, `anim`, `export` | |
 
-The times of the last three modes were measured on the same busy machine with one render thread
+The times of the last three modes were measured on the same busy machine with one render process
 (`--export-only` with two, on the final code).
 `--out-dir DIR` writes `render.png`, `contact_sheet.png`, `preview.gif` and `scene.glb` to another
 folder. The command line is strict: an unknown argument (e.g. `build-only` without the dashes), an
@@ -302,7 +302,7 @@ it with exit code 1.
 ## Final production run
 
 `render.png`, `contact_sheet.png` and `preview.gif` come from one run of the default mode on a
-fresh editor server with an empty data directory and three render threads, so the run also proves
+fresh editor server with an empty data directory and three render processes, so the run also proves
 that the project rebuilds from scratch. The server was this repository's production build
 (`npm run build` at commit `999b4dc`), started like `npm start`:
 
@@ -332,7 +332,7 @@ On a patch of the table (x 380–480, y 150–230) the mean difference between c
 high-pass noise of the same patch (standard deviation of the patch minus its 3 × 3 box blur) is
 3.63–3.68 grey levels in all 48 frames, so the table does not shimmer.
 
-`editor.png` was made with a second server running the same build (one render thread): the
+`editor.png` was made with a second server running the same build (one render process): the
 screenshot shows the project of an `--export-only` run open in the editor. `scene.glb` comes from
 an `--export-only` run on the final code (2026-11-07, after the last fixes to the exporter and the
 triangulation; 71 s, the export itself 15 s; a second run wrote a byte-identical file). A preview
@@ -352,7 +352,7 @@ degenerate triangles, so the renders were kept.
   therefore shows a bright sheen that the path tracer does not have. Use them for layout and
   motion, not for judging the light.
 * On a busy machine the still's 470 s budget is not enough for 160 spp at 1280×720 with three
-  render threads: the final run stopped at 71 spp under a load average of 11–16. The denoiser
+  render processes: the final run stopped at 71 spp under a load average of 11–16. The denoiser
   cleans the result, but a quieter machine gives a more converged image.
 * Most of the build time is the clearance sweep: 192 `scene.measure` calls (48 frames × 4 groups),
   because a call measures one frame and the script measures groups of at most 8 objects (the limit

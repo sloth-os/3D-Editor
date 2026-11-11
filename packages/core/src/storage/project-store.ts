@@ -84,13 +84,14 @@ export function updateAddsToState(base: Uint8Array | null, update: Uint8Array): 
 
 /**
  * A listing of the stored projects in which reading some `project.json` files failed (storage did
- * not answer, or answered with an error): those projects are missing from `listed`, which holds the
- * ones that were read.
+ * not answer, or answered with an error): those projects (`unread`, their ids) are missing from
+ * `listed`, which holds the ones that were read.
  */
 export class IncompleteListingError extends Error {
   constructor(
     message: string,
     readonly listed: ProjectInfo[],
+    readonly unread: string[] = [],
   ) {
     super(message);
     this.name = 'IncompleteListingError';
@@ -119,7 +120,7 @@ export class ProjectFileStore {
 
   /**
    * The stored projects that have a project.json, most recently updated first (a project.json that
-   * is not valid JSON lists no project, as a missing one). Throws when storage cannot list the
+   * is not a JSON object lists no project, as a missing one). Throws when storage cannot list the
    * projects folder (a folder that does not exist lists no projects): an empty list would tell
    * callers that every project is gone; and {@link IncompleteListingError}, with the projects that
    * were read, when reading a project.json fails: a list without those projects would tell callers
@@ -130,29 +131,53 @@ export class ProjectFileStore {
     const ids = entries.filter((e) => e.isDir && isValidProjectId(e.name)).map((e) => e.name);
     const reads = await Promise.allSettled(ids.map((id) => this.loadInfo(id)));
     const infos: ProjectInfo[] = [];
+    const unread: string[] = [];
     const failures: unknown[] = [];
-    for (const read of reads) {
+    reads.forEach((read, i) => {
       if (read.status === 'fulfilled') {
         if (read.value) infos.push(read.value);
-      } else if (!(read.reason instanceof SyntaxError)) failures.push(read.reason);
-    }
+      } else if (!(read.reason instanceof SyntaxError)) {
+        unread.push(ids[i]);
+        failures.push(read.reason);
+      }
+    });
     infos.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
     if (failures.length > 0) {
       const reason = failures[0] instanceof Error ? failures[0].message : String(failures[0]);
       throw new IncompleteListingError(
         `could not read the project.json of ${failures.length} of ${ids.length} stored projects (${reason})`,
         infos,
+        unread,
       );
     }
     return infos;
   }
 
+  /**
+   * The project's project.json; null when there is none. Throws a SyntaxError when it is not a JSON
+   * object (as for invalid JSON), and gives fields that callers compare and sort by the types they
+   * expect when they are missing or of another type (a file written by another program, or by hand):
+   * `name` 'Untitled' (the name of a document without one), `created_at` '' and `updated_at`
+   * `created_at` (a project.json without them used to fail every listing, which sorts by
+   * `updated_at`).
+   */
   async loadInfo(id: string): Promise<ProjectInfo | null> {
     // nothing uses the ETag of project.json (on WebDAV: one GET, no PROPFIND requests)
     const r = await this.fs.read(this.infoPath(id), { etag: false });
     if (!r) return null;
-    const info = JSON.parse(new TextDecoder().decode(r.data)) as ProjectInfo;
-    return { ...info, id };
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(r.data));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
+      throw new SyntaxError(`${this.infoPath(id)} is not a JSON object`);
+    const info = parsed as Partial<Record<keyof ProjectInfo, unknown>>;
+    const text = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined);
+    const created = text(info.created_at) ?? '';
+    return {
+      ...(parsed as ProjectInfo),
+      id,
+      name: text(info.name) ?? 'Untitled',
+      created_at: created,
+      updated_at: text(info.updated_at) ?? created,
+    };
   }
 
   async saveInfo(info: ProjectInfo): Promise<void> {

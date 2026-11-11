@@ -221,7 +221,7 @@ MCP_URL=http://127.0.0.1:8080/mcp node examples/product-shot/build.mjs --build-o
 MCP_URL=http://127.0.0.1:8080/mcp node examples/product-shot/build.mjs --export-only  # scene.glb only
 ```
 
-| Mode flag | Runs | Time (3 render threads) |
+| Mode flag | Runs | Time (3 render processes) |
 | --- | --- | --- |
 | `--final` (default) | Build and verify, then `render.png`, `contact_sheet.png` and `preview.gif` | about 9.5 min |
 | `--build-only` | Build and verify the project only, no renders | about 1 s |
@@ -245,7 +245,7 @@ A value flag without its value (for example `--out-dir` with the path forgotten)
 ## Final production run
 
 `render.png`, `contact_sheet.png` and `preview.gif` come from a single run of `build.mjs --final`
-against a freshly started server with a new, empty data directory and 3 render threads, which is
+against a freshly started server with a new, empty data directory and 3 render processes, which is
 also the proof that the project rebuilds from scratch:
 
 ```bash
@@ -253,7 +253,7 @@ PORT=8080 DATA_DIR=/tmp/ps-final RENDER_WORKERS=3 npm start &
 MCP_URL=http://127.0.0.1:8080/mcp node examples/product-shot/build.mjs --final
 ```
 
-Measured on 2026-11-06 on 4 CPU cores shared with other jobs, with 3 render threads:
+Measured on 2026-11-06 on 4 CPU cores shared with other jobs, with 3 render processes:
 
 | Stage | Time | Result |
 | --- | --- | --- |

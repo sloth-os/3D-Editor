@@ -3,6 +3,12 @@ import { createApp } from './app';
 import { persistenceNote } from './persistence';
 import { closeSharedRenderer } from './render';
 
+/**
+ * How long a shutdown (SIGTERM, SIGINT) may take before the server exits anyway: Docker sends
+ * SIGKILL 10 s after SIGTERM.
+ */
+const SHUTDOWN_EXIT_MS = 9000;
+
 async function main(): Promise<void> {
   let config;
   try {
@@ -45,10 +51,18 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     app.log.info({ signal }, 'shutting down: closing connections and saving projects');
+    // within Docker's stop timeout (SIGKILL 10 s after SIGTERM); the rooms wait for storage 7 s
+    // at most (RoomManager.close), and say which projects stayed unsaved
     const force = setTimeout(() => {
-      app.log.error('shutdown timed out, exiting');
+      const unsaved = handle.rooms.unsaved();
+      if (unsaved.length > 0)
+        app.log.error(
+          { projects: unsaved, reason: 'the shutdown ran out of time before storage saved their changes' },
+          'projects not saved at shutdown',
+        );
+      app.log.error(`shutdown timed out after ${SHUTDOWN_EXIT_MS / 1000} s, exiting`);
       process.exit(1);
-    }, 20_000);
+    }, SHUTDOWN_EXIT_MS);
     force.unref();
     // the render processes stop at once (renders in progress are cancelled); a busy one would
     // otherwise finish its request first

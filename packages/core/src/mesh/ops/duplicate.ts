@@ -103,6 +103,10 @@ export function extractMesh(
   faces: readonly number[],
   wire: readonly [number, number][] = [],
   extraVerts: readonly number[] = [],
+  /** The face records of `src` (allFaceRecs), when the caller extracts several parts. */
+  recs: readonly FaceRec[] = allFaceRecs(src),
+  /** The keys of `src.edgeAttrs` that may join two of the part's vertices (default: all). */
+  edgeKeys: Iterable<string> = Object.keys(src.edgeAttrs),
 ): MeshData {
   const map = new Map<number, number>();
   const positions: number[] = [];
@@ -117,14 +121,13 @@ export function extractMesh(
     }
     return i;
   };
-  const recs = allFaceRecs(src);
   const list: FaceRec[] = faces.map((f) => ({ ...recs[f], v: recs[f].v.map(use) }));
   const looseEdges: number[] = [];
   for (const [a, b] of wire) looseEdges.push(use(a), use(b));
   for (const v of extraVerts) use(v);
   const out = createMesh({ positions, colors, uvs: src.uvs ? [] : null, looseEdges });
   writeFaces(out, list);
-  for (const k in src.edgeAttrs) {
+  for (const k of edgeKeys) {
     const [a, b] = parseEdgeKey(k);
     const ma = map.get(a);
     const mb = map.get(b);
@@ -179,20 +182,58 @@ export function separateMesh(
   if (type !== 'SELECTED' && groups.length < 2)
     throw new Error(type === 'LOOSE' ? 'Mesh has only one connected part' : 'Mesh uses only one material');
   const stay = type === 'SELECTED' ? 0 : groups[0];
+  // the faces, wire edges and lone vertices of every group, and the edge attributes whose two
+  // vertices it uses, collected in one pass: a pass per group took minutes for 20,000 loose parts
+  const facesOf = new Map<number, number[]>();
+  const wiresOf = new Map<number, [number, number][]>();
+  const vertsOf = new Map<number, number[]>();
+  const edgeKeysOf = new Map<number, string[]>();
+  const add = <T>(m: Map<number, T[]>, g: number, x: T) => {
+    const list = m.get(g);
+    if (list) list.push(x);
+    else m.set(g, [x]);
+  };
+  // the groups each vertex belongs to (a vertex of faces of two materials belongs to both)
+  const groupsOfVertex = new Map<number, number[]>();
+  const touch = (v: number, g: number) => {
+    const list = groupsOfVertex.get(v);
+    if (!list) groupsOfVertex.set(v, [g]);
+    else if (!list.includes(g)) list.push(g);
+  };
+  faceGroup.forEach((g, f) => {
+    add(facesOf, g, f);
+    for (const v of src.faces[f]) touch(v, g);
+  });
+  wireGroup.forEach((g, i) => {
+    add(wiresOf, g, wirePairs[i]);
+    touch(wirePairs[i][0], g);
+    touch(wirePairs[i][1], g);
+  });
+  vertGroup.forEach((g, i) => {
+    add(vertsOf, g, isolated[i]);
+    touch(isolated[i], g);
+  });
+  for (const k in src.edgeAttrs) {
+    const [a, b] = parseEdgeKey(k);
+    const of = groupsOfVertex.get(b);
+    for (const g of groupsOfVertex.get(a) ?? []) if (of?.includes(g)) add(edgeKeysOf, g, k);
+  }
+  const recs = allFaceRecs(src);
   const parts: MeshData[] = [];
   for (const g of groups) {
     if (g === stay) continue;
     parts.push(
       extractMesh(
         src,
-        faceGroup.flatMap((x, f) => (x === g ? [f] : [])),
-        wirePairs.filter((_, i) => wireGroup[i] === g),
-        isolated.filter((_, i) => vertGroup[i] === g),
+        facesOf.get(g) ?? [],
+        wiresOf.get(g) ?? [],
+        vertsOf.get(g) ?? [],
+        recs,
+        edgeKeysOf.get(g) ?? [],
       ),
     );
   }
   const m = cloneMesh(src);
-  const recs = allFaceRecs(src);
   const leaving = new Set<number>();
   faceGroup.forEach((g, f) => {
     if (g !== stay) for (const v of src.faces[f]) leaving.add(v);

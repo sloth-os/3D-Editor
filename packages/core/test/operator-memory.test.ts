@@ -3,7 +3,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  IMPORT_BYTES_PER_FILE_BYTE,
+  IMPORT_BYTES_PER_STL_TRIANGLE,
+  IMPORT_STORED_BYTES_PER_FILE_BYTE,
   OPERATOR_ESTIMATES,
+  OPERATOR_FIXED_BYTES,
+  binaryStlTriangles,
+  editOperatorMemoryRefusal,
+  importEstimate,
+  importMemoryRefusal,
   storedMeshBytes,
   createEditorState,
   createOperatorRegistry,
@@ -23,6 +31,7 @@ import {
   createMesh,
   edgeKey,
   selectAllElements,
+  selectionFromFaces,
   setMeshMemoryCheck,
   type MeshData,
 } from '../src/mesh';
@@ -80,7 +89,12 @@ function gridScene(n: number, edit = true) {
  * 2 GB: V8 collects less often in a larger heap, and peaks measured in a heap of 1 GB came out up
  * to 38% lower.
  */
-function peak(op: string, n: number, params: object, mode: 'edit' | 'object' | 'scatter' | 'CURVE' | 'FONT') {
+function peak(
+  op: string,
+  n: number,
+  params: object,
+  mode: 'edit' | 'object' | 'scatter' | 'import' | 'CURVE' | 'FONT',
+) {
   const run = spawnSync(
     process.execPath,
     [
@@ -264,6 +278,107 @@ describe('operator memory estimates', () => {
       expect(r.estimate, op).toBeGreaterThanOrEqual(r.peak);
       expect(r.estimate, op).toBeLessThan(r.peak * 3);
     }
+  }, 30_000);
+
+  it('estimate Edit Mode operators before Edit Mode is entered: at most what the registry asks with the selection', () => {
+    const cases = [
+      ['mesh.subdivide', { number_cuts: 2 }],
+      ['mesh.bevel', { segments: 3 }],
+      ['mesh.extrude_region_move', {}],
+      ['mesh.spin', { steps: 8 }],
+      ['mesh.inset', {}],
+      ['mesh.vertices_smooth', {}],
+      ['transform.translate', { value: [0, 0, 1] }],
+    ] as const;
+    for (const [op, params] of cases)
+      for (const faces of [null, [0, 1, 2, 21, 22]] as const) {
+        const { ctx, reg, doc, meshId, id } = gridScene(20, false);
+        const asked: OperatorMemoryRequest[] = [];
+        setOperatorMemoryCheck((req) => (asked.push(req), null));
+        const sizes = faces ? { verts: 0, edges: 0, faces: faces.length } : ('all' as const);
+        expect(editOperatorMemoryRefusal(ctx, op, reg.parseParams(op, params), id, sizes)).toBeNull();
+        // nothing changed: the editor is still in Object Mode, nothing selected in the mesh
+        expect(ctx.state.mode).toBe('OBJECT');
+        // the registry, in Edit Mode with that selection
+        ctx.state.mode = 'EDIT';
+        const mesh = doc.getMesh(meshId)!;
+        ctx.state.meshSelection = faces ? selectionFromFaces(mesh, [...faces]) : selectAllElements(mesh);
+        expect(reg.run(ctx, op, params).ok, op).toBe(true);
+        expect(asked.map((r) => r.operator)).toEqual([op, op]);
+        const [early, real] = asked.map((r) => r.estimate);
+        expect(early.bytes, `${op} ${faces ? 'some' : 'all'}`).toBeLessThanOrEqual(real.bytes);
+        expect(early.faces, op).toBeLessThanOrEqual(real.faces);
+      }
+    // object-mode operators, and no check installed: nothing asked
+    const { ctx, id } = gridScene(20, false);
+    expect(editOperatorMemoryRefusal(ctx, 'object.shade_smooth', {}, id, 'all')).toBeNull();
+    setOperatorMemoryCheck(() => 'refused');
+    expect(editOperatorMemoryRefusal(ctx, 'object.shade_smooth', {}, id, 'all')).toBeNull();
+    expect(editOperatorMemoryRefusal(ctx, 'mesh.subdivide', { number_cuts: 1 }, id, 'all')).toBe('refused');
+  });
+
+  it('size imports from the file: a binary STL by the triangles its header declares, others by their size', () => {
+    // a binary STL of 1,000 triangles: an 84-byte header, then 50 bytes per triangle
+    const stl = new Uint8Array(84 + 50 * 1000);
+    new DataView(stl.buffer).setUint32(80, 1000, true);
+    expect(binaryStlTriangles(stl, stl.byteLength)).toBe(1000);
+    // a header that does not match the size is not a binary STL
+    expect(binaryStlTriangles(stl, stl.byteLength + 1)).toBeNull();
+    const stored = decodedMeshBytes({
+      vertices: 3000,
+      faces: 1000,
+      corners: 3000,
+      uvs: false,
+      colors: false,
+    });
+    expect(importEstimate('stl', stl, stl.byteLength)).toEqual({
+      bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_STL_TRIANGLE * 1000 + stored,
+      faces: 1000,
+      addedStoredBytes: stored,
+      lower: 'the size of the file (import fewer or simpler meshes)',
+    });
+    // the operators read the same from base64, also from a data URI
+    const { ctx } = gridScene(1, false);
+    const b64 = Buffer.from(stl).toString('base64');
+    for (const data_base64 of [b64, `data:model/stl;base64,${b64}`, `  ${b64}\n`])
+      expect(estimateOperator('import_mesh.stl', ctx, { data_base64 })).toEqual(
+        importEstimate('stl', stl, stl.byteLength),
+      );
+    // other formats, and STL files that are not binary, by their size
+    const text = new TextEncoder().encode('solid x\n  facet normal 0 0 1\n'.repeat(100));
+    for (const [format, data] of [
+      ['stl', text],
+      ['obj', text],
+      ['glb', stl],
+    ] as const)
+      expect(importEstimate(format, data, data.byteLength), format).toMatchObject({
+        bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_FILE_BYTE * data.byteLength,
+        addedStoredBytes: IMPORT_STORED_BYTES_PER_FILE_BYTE * data.byteLength,
+      });
+    // tools that import without the registry (MCP import_model) ask the installed check the same
+    const asked: OperatorMemoryRequest[] = [];
+    expect(importMemoryRefusal(ctx.doc, 'stl', stl)).toBeNull();
+    setOperatorMemoryCheck((req) => (asked.push(req), 'no room'));
+    expect(importMemoryRefusal(ctx.doc, 'stl', stl)).toBe('no room');
+    expect(asked[0]).toEqual({
+      operator: 'import_mesh.stl',
+      estimate: importEstimate('stl', stl, stl.byteLength),
+      storedBytes: storedMeshBytes(ctx.doc),
+    });
+  });
+
+  it('keep the import estimate of a binary STL above the peak heap of importing it (V8 GC trace in a child process)', () => {
+    // 180,000 triangles (9 MB), imported from base64: about 120 MB at the peak
+    const r = peak('import_mesh.stl', 300, {}, 'import');
+    expect(r.estimate).toBeGreaterThanOrEqual(r.peak);
+    expect(r.estimate).toBeLessThan(r.peak * 3);
+  }, 30_000);
+
+  it('keep the import estimate of other files, by their size, above the peak heap of importing them', () => {
+    // an OBJ of 90,000 quads with UVs (8 MB): about 110 MB at the peak
+    const r = peak('import_scene.obj', 300, {}, 'import');
+    expect(r.estimate).toBeGreaterThanOrEqual(r.peak);
+    expect(r.estimate).toBeLessThan(r.peak * 4);
   }, 30_000);
 
   it('size generated objects from their parameters, above their peak heap', () => {

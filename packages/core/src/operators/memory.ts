@@ -1,6 +1,7 @@
 import type { ObjectData } from '../doc/types';
 import type { SceneDoc } from '../doc/scene-doc';
 import { decodedMeshBytes, type MeshLayout } from '../mesh/memory';
+import { base64Decode } from '../util/json';
 import {
   TEXT_BYTES_PER_CHARACTER,
   estimateCurveSurface,
@@ -191,8 +192,29 @@ export const GENERATOR_MAX_FACES: Readonly<Record<string, number>> = {
  */
 export const OBJECT_MESH_BYTES_PER_FACE = 1000;
 
-/** Imported meshes, per byte of the file: parsing, welding and the stored mesh (not measured; 1 KB per face of a 50 B STL triangle). */
-export const IMPORT_BYTES_PER_FILE_BYTE = 24;
+/**
+ * Imported meshes, per byte of the file, where the format's header does not count them: parsing,
+ * the meshes built and stored, and their decoded size. Measured with --trace-gc beyond
+ * OPERATOR_FIXED_BYTES, the decoded meshes added: 8–14 per byte of grids exported with normals and
+ * UVs (OBJ, PLY, glTF and GLB of 1.5 to 51 MB; ASCII STL 3), 18–23 per byte of files of nothing but
+ * positions and triangles (a GLB of 17 MB and an OBJ of 29 MB, 980,000 triangles each), 24.7 per
+ * byte of such an OBJ of 5 MB; rounded up.
+ */
+export const IMPORT_BYTES_PER_FILE_BYTE = 26;
+
+/**
+ * Decoded bytes of the meshes an import adds per byte of the file, at most (a GLB of triangles with
+ * UVs and nothing else, the densest of the formats: 9.6).
+ */
+export const IMPORT_STORED_BYTES_PER_FILE_BYTE = 10;
+
+/**
+ * A binary STL, per triangle its header declares: reading and welding the triangles, 406–527 bytes
+ * measured on files of 80,000 to 1,040,000 triangles (561 through run_operator, which decodes the
+ * file from base64), rounded up; the decoded mesh is added apart (at most three vertices per
+ * triangle).
+ */
+export const IMPORT_BYTES_PER_STL_TRIANGLE = 700;
 
 /**
  * Peak heap of the export operators (export_scene.*, export_mesh.*, run in the server's process
@@ -262,6 +284,9 @@ interface EditGeometry {
   selVerts: number;
 }
 
+/** Selection sizes the estimates assume instead of the editor's (see editOperatorMemoryRefusal). */
+let assumedSelection: { verts: number; edges: number; faces: number } | null = null;
+
 function editGeometry(ctx: OperatorContext): EditGeometry | null {
   if (ctx.state.mode !== 'EDIT') return null;
   const o = ctx.state.activeId ? ctx.doc.getObject(ctx.state.activeId) : null;
@@ -269,15 +294,16 @@ function editGeometry(ctx: OperatorContext): EditGeometry | null {
   const c = ctx.doc.meshCounts(o.data);
   if (!c) return null;
   const sel = ctx.state.meshSelection;
+  const sizes = assumedSelection ?? { verts: sel.verts.size, edges: sel.edges.size, faces: sel.faces.size };
   return {
     meshId: o.data,
     faces: c.faces,
     corners: c.corners,
     vertices: c.vertices,
     m: c.faces ? c.corners / c.faces : 4,
-    selFaces: sel.faces.size,
-    selEdges: sel.edges.size,
-    selVerts: sel.verts.size,
+    selFaces: sizes.faces,
+    selEdges: sizes.edges,
+    selVerts: sizes.verts,
   };
 }
 
@@ -717,17 +743,72 @@ function generator(kind: string): Estimator {
   };
 }
 
-/** import_*: the file's size (base64 holds 3 bytes per 4 characters). */
-const importFile: Estimator = (_ctx, p) => {
-  const fileBytes = Math.floor((String(p.data_base64 ?? '').length * 3) / 4);
-  const bytes = IMPORT_BYTES_PER_FILE_BYTE * fileBytes;
+/** Triangles of a binary STL of `fileBytes` bytes that begins with `head` (null: not one). */
+export function binaryStlTriangles(head: Uint8Array, fileBytes: number): number | null {
+  if (head.byteLength < 84) return null;
+  const n = new DataView(head.buffer, head.byteOffset, 84).getUint32(80, true);
+  return 84 + 50 * n === fileBytes ? n : null;
+}
+
+/**
+ * Importing a file of `fileBytes` bytes in `format` (stl, obj, ply, gltf or glb) that begins with
+ * `head` (its first 84 bytes, or fewer): a binary STL by the triangles its header declares, any
+ * other file by its size.
+ */
+export function importEstimate(format: string, head: Uint8Array, fileBytes: number): OperatorEstimate {
+  const lower = 'the size of the file (import fewer or simpler meshes)';
+  const tris = format === 'stl' ? binaryStlTriangles(head, fileBytes) : null;
+  if (tris !== null) {
+    const stored = decodedMeshBytes({
+      vertices: 3 * tris,
+      faces: tris,
+      corners: 3 * tris,
+      uvs: false,
+      colors: false,
+    });
+    return {
+      bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_STL_TRIANGLE * tris + stored,
+      faces: tris,
+      addedStoredBytes: stored,
+      lower,
+    };
+  }
   return {
-    bytes: OPERATOR_FIXED_BYTES + bytes,
+    bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_FILE_BYTE * fileBytes,
     faces: 0,
-    addedStoredBytes: bytes / 3,
-    lower: 'the size of the file (import fewer or simpler meshes)',
+    addedStoredBytes: IMPORT_STORED_BYTES_PER_FILE_BYTE * fileBytes,
+    lower,
   };
-};
+}
+
+/**
+ * The size of a file given in base64 (3 bytes per 4 characters; a data URI too) and its first 84
+ * bytes, without decoding the rest.
+ */
+function base64File(b64: string): { head: Uint8Array; fileBytes: number } {
+  let start = 0;
+  while (start < b64.length && b64.charCodeAt(start) <= 32) start++;
+  if (b64.startsWith('data:', start)) start = b64.indexOf(',', start) + 1;
+  let end = b64.length;
+  while (end > start && b64.charCodeAt(end - 1) <= 32) end--;
+  let padding = 0;
+  while (padding < 2 && end - padding > start && b64[end - 1 - padding] === '=') padding++;
+  let head: Uint8Array;
+  try {
+    head = base64Decode(b64.slice(start, start + 112));
+  } catch {
+    head = new Uint8Array(0);
+  }
+  return { head, fileBytes: Math.max(0, Math.floor(((end - start) * 3) / 4) - padding) };
+}
+
+/** import_*: the file given in base64 ({@link importEstimate}). */
+const importOperator =
+  (format: string): Estimator =>
+  (_ctx, p) => {
+    const { head, fileBytes } = base64File(String(p.data_base64 ?? ''));
+    return importEstimate(format, head, fileBytes);
+  };
 
 /**
  * export_*: the faces the file holds: the objects shown in renders (or the selected ones), their
@@ -1021,10 +1102,10 @@ export const OPERATOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
   'export_scene.obj': exportFile(() => 'obj'),
   'export_mesh.stl': exportFile(() => 'stl'),
   'export_mesh.ply': exportFile(() => 'ply'),
-  'import_scene.gltf': importFile,
-  'import_scene.obj': importFile,
-  'import_mesh.stl': importFile,
-  'import_mesh.ply': importFile,
+  'import_scene.gltf': importOperator('gltf'),
+  'import_scene.obj': importOperator('obj'),
+  'import_mesh.stl': importOperator('stl'),
+  'import_mesh.ply': importOperator('ply'),
   ...Object.fromEntries(
     [
       'arch',
@@ -1185,6 +1266,65 @@ export function editModeMemoryRefusal(ctx: OperatorContext, meshId: string): str
   const check = installed;
   if (!check) return null;
   return check({ operator: 'object.mode_set', estimate: editModeEstimate(ctx.doc, meshId), storedBytes: 0 });
+}
+
+/** The import operator of each file format (the operator id a refused import names). */
+const IMPORT_OPERATORS: Readonly<Record<string, string>> = {
+  stl: 'import_mesh.stl',
+  ply: 'import_mesh.ply',
+  obj: 'import_scene.obj',
+  gltf: 'import_scene.gltf',
+  glb: 'import_scene.gltf',
+};
+
+/**
+ * Why importing file `data` in `format` is not run (null: import it): the import's estimate
+ * ({@link importEstimate}) asked from the installed check like the import_* operators, for tools
+ * such as MCP import_model that import without the registry. Nothing to do without a check.
+ */
+export function importMemoryRefusal(doc: SceneDoc, format: string, data: Uint8Array): string | null {
+  const check = installed;
+  if (!check) return null;
+  const estimate = importEstimate(format, data.subarray(0, 84), data.byteLength);
+  return check({
+    operator: IMPORT_OPERATORS[format] ?? 'import',
+    estimate,
+    storedBytes: storedMeshBytes(doc),
+  });
+}
+
+/** Vertices, edges and faces selected in Edit Mode, or 'all' (every element of the mesh). */
+export type EditSelectionSizes = { verts: number; edges: number; faces: number } | 'all';
+
+/**
+ * Why Edit Mode operator `id` (mesh.*, transform.*, uv.*) would be refused on the mesh of object
+ * `objectId` (null: it may run), asked before Edit Mode is entered and `selection` is selected:
+ * selecting the elements of a mesh of millions of faces takes seconds, and MCP tools (edit_mesh, a
+ * run_operator or batch `selection` with mode EDIT) do that before the registry checks the
+ * operator. The estimate comes from the mesh's stored counts and the selection's sizes with no
+ * edges counted: no estimate shrinks with more selected edges, so it is at most what the registry
+ * asks with the real selection, and what this refuses would be refused after that work. `params`
+ * with their defaults (OperatorRegistry.parseParams). Nothing to do without a check.
+ */
+export function editOperatorMemoryRefusal(
+  ctx: OperatorContext,
+  id: string,
+  params: unknown,
+  objectId: string,
+  selection: EditSelectionSizes,
+): string | null {
+  if (!installed || !OPERATOR_ESTIMATES[id] || !/^(mesh|transform|uv)\./.test(id)) return null;
+  const o = ctx.doc.getObject(objectId);
+  const c = o?.type === 'MESH' && o.data ? ctx.doc.meshCounts(o.data) : null;
+  if (!c) return null;
+  const state = { ...ctx.state, mode: 'EDIT' as const, activeId: objectId, selectedIds: [objectId] };
+  assumedSelection =
+    selection === 'all' ? { verts: c.vertices, edges: 0, faces: c.faces } : { ...selection, edges: 0 };
+  try {
+    return operatorMemoryRefusal(id, { ...ctx, state }, params);
+  } finally {
+    assumedSelection = null;
+  }
 }
 
 /**

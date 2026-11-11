@@ -547,8 +547,11 @@ their final size instead of scaling small ones.
 
 - `object.scatter_add {surface, objects, count, seed, min_distance}` (plus `size`, `size_random`,
   `rotation_random`, `align_to_normal`, `vertex_group`, `name`) adds a particle system that
-  instances the source objects (up to 200,000 instances in a scene). Instances are cheap and render
-  and export, but are not objects: `get_scene` counts them under `counts.instances`, and
+  instances the source objects (up to 200,000 instances in a scene). Instances cost far less than
+  real objects and render and export, but each one drawn still takes memory in a server render (it
+  grows with the number of instances and the size of the source), and OBJ, STL and PLY exports
+  write each one as a copy: when a server render or export runs out of memory, lower `count` or the
+  source's detail. Instances are not objects: `get_scene` counts them under `counts.instances`, and
   `get_instances {object}` lists each one's source object and world transform (to check spacing,
   paths and beaches without making them real). The sources are hidden by default (`get_scene` lists
   them under `counts.not_rendered`). Each instance's origin sits on the surface, so sources should
@@ -616,34 +619,34 @@ their final size instead of scaling small ones.
   render engine. An editor without GPU acceleration (software WebGL, e.g. a headless browser) is
   slow with heavy scenes in `MATERIAL` or `RENDERED` shading: the first screenshot or viewport frame
   in each of them after it opened the project builds and compiles the scene's materials for that
-  shading (13–33 s for a scene with 71 materials), and the editor keeps them, so later screenshots
+  shading (13–38 s for a scene with 71 materials), and the editor keeps them, so later screenshots
   in that shading compile nothing and take 0.3–3.9 s, also after the viewport switched to it, turned
   its anti-aliasing off (for slow frames or more than a million triangles) or toggled X-ray, and
   after material edits that change values (colours, roughness, texture settings). An edit that needs
   a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that
   no other material has) compiles it for the next screenshot or frame in each of these two shadings
-  (0.6–4.2 s in that scene, up to 16 s for a material with several procedural textures). A `SOLID`
-  or `WIREFRAME` screenshot (0.4–1.5 s for that scene) waits until the viewport's frame in progress
+  (0.6–4.2 s in that scene, up to 18 s for a material with several procedural textures). A `SOLID`
+  or `WIREFRAME` screenshot (0.4–1.7 s for that scene) waits until the viewport's frame in progress
   is done, also one that compiles; the other commands wait while the editor's main thread is busy:
   during a screenshot, while it builds the materials after the viewport switched to `MATERIAL` or
   `RENDERED` for the first time and during each frame of a scene with millions of triangles. X-ray
   changes nothing in `MATERIAL` or `RENDERED` shading outside Edit Mode. A screenshot of a scene of
-  millions of triangles takes about a second or more in any shading (0.5–1.8 s per `SOLID`
-  screenshot with 4 million), and several times as long for the first `WIREFRAME` screenshot or
-  frame of such a scene, while the editor builds the wires of every mesh. With the default
-  `renderer: "auto"`, `render_image` waits 15 s for such an editor's raster image and then renders
-  on the server (`note` says so); `renderer: "browser"` waits up to 55 s and then fails, saying what
-  to do. For `editor_command` raise `timeout_ms` (default 10000, at most 55000: both stay under the
-  60 s an MCP client built on the TypeScript SDK waits by default) and take screenshots with
-  `shading: "SOLID"`; for a quick look use `render_image {shading: "SOLID"}`: grey clay, which
-  renders on the server while the editor is busy (right after a timeout) and when the scene's render
-  engine is `PATHTRACER` (1.1–4.0 s at 1280×720 for that scene, 1.2–7.4 s for 2 million triangles,
-  2.2–14 s for 4 or 6 million); a scene that needs more memory than a server render has fails with
-  "Rendering failed: out of memory: …" (`OUT_OF_MEMORY`), and then only a screenshot with a larger
-  `timeout_ms` shows it. Make final images with `render_image`. These times are the ranges measured
-  on a calm machine with 4 CPUs, the editor in software WebGL (SwiftShader), widened by 25 %
-  ([how](mcp.md#live-editors)); on a busy one (load averages of 4–15) the same steps took up to 3.5
-  times as long.
+  millions of triangles takes half a second or more in any shading (0.5–5.3 s per `SOLID` screenshot
+  with 4 million), and several times as long for the first `WIREFRAME` screenshot or frame of such a
+  scene, while the editor builds the wires of every mesh. With the default `renderer: "auto"`,
+  `render_image` waits 15 s for such an editor's raster image and then renders on the server (`note`
+  says so); `renderer: "browser"` waits up to 55 s and then fails, saying what to do. For
+  `editor_command` raise `timeout_ms` (default 10000, at most 55000: both stay under the 60 s an MCP
+  client built on the TypeScript SDK waits by default) and take screenshots with `shading: "SOLID"`;
+  for a quick look use `render_image {shading: "SOLID"}`: grey clay, which renders on the server
+  while the editor is busy (right after a timeout) and when the scene's render engine is
+  `PATHTRACER` (1.1–4.0 s at 1280×720 for that scene, 1.2–7.4 s for 2 million triangles, 2.2–14 s
+  for 4 or 6 million); a scene that needs more memory than a server render has fails with "Rendering
+  failed: out of memory: …" (`OUT_OF_MEMORY`), and then only a screenshot with a larger `timeout_ms`
+  shows it. Make final images with `render_image`. These times are the ranges measured on a calm
+  machine with 4 CPUs, the editor in software WebGL (SwiftShader), widened by 25 % (the longest
+  `SOLID` screenshot with 4 million triangles by 50 %; [how](mcp.md#live-editors)); on a busy one
+  (load averages of 3–15) the same steps took up to 3.5 times as long.
 - An editor keeps drawing an image the server stopped waiting for, and its next renders and commands
   wait behind it; a screenshot that timed out still compiles what it needs and keeps it, so
   retrying it waits for the rest and compiles nothing again. Until it has finished,

@@ -21,13 +21,14 @@ import {
   FIRST_SHADING_SECONDS,
   LATER_SECONDS,
   MARGIN_PERCENT,
-  MEASURED_NOTE,
+  MILLIONS_MARGIN_PERCENT,
   MILLIONS_SELECT_SECONDS,
   MILLIONS_SOLID_SECONDS,
   NEW_SHADER_SECONDS,
   SERVER_SOLID_SCENE_SECONDS,
   SERVER_SOLID_SECONDS,
   measured,
+  measuredNote,
   measuredOnServer,
 } from '../../src/mcp/editor-costs';
 import { MCP_INSTRUCTIONS } from '../../src/mcp/instructions';
@@ -125,6 +126,18 @@ describe('editor command catalogue', () => {
   });
 });
 
+/**
+ * The last sentence of an editor_command timeout: how the ranges were made and how much longer the
+ * steps took on a busy machine. `millions`: the step with 4 million triangles whose time the message
+ * gives, whose range runs further above its longest time; a message names only its own step (a
+ * select's timeout says nothing of screenshots).
+ */
+const measuredSentence = (millions?: string) =>
+  'The times given are the ranges measured on a calm machine with 4 CPUs, the editor in software WebGL, ' +
+  `widened by ${MARGIN_PERCENT} %` +
+  (millions ? ` (the longest ${millions} with 4 million triangles by ${MILLIONS_MARGIN_PERCENT} %)` : '') +
+  `; on a busy one (load averages of ${BUSY_LOADS}) the same steps took up to ${BUSY_FACTOR} times as long.`;
+
 describe('editor command timeouts', () => {
   const HEAD = 'it may still carry the command out, and its next commands and renders wait until it has.';
   const NO_GPU = 'An editor without GPU acceleration (software WebGL, e.g. a headless browser)';
@@ -136,10 +149,6 @@ describe('editor command timeouts', () => {
    */
   const NEW_SHADER = NEW_SHADER_SECONDS;
   const HEAVY = `${MILLIONS_SOLID_SECONDS} in SOLID with 4 million`;
-  const MEASURED =
-    'The times given are the ranges measured on a calm machine with 4 CPUs, the editor in software WebGL, ' +
-    `widened by ${MARGIN_PERCENT} %; on a busy one (load averages of ${BUSY_LOADS}) the same steps took up ` +
-    `to ${BUSY_FACTOR} times as long.`;
   /** The first screenshot or frame in a shading: the editor builds and compiles its materials. */
   const FIRST = `(${FIRST_SHADING_SECONDS} for a scene with 71 materials)`;
   /** Only an edit that needs a shader no material had makes the next screenshot compile one. */
@@ -151,7 +160,7 @@ describe('editor command timeouts', () => {
     'It keeps what it compiled, so a retry waits for the editor to finish and compiles nothing again.';
   const VIEWPORT =
     "The screenshot is drawn in the viewport's shading, like a frame of the viewport. An editor without GPU " +
-    'acceleration (software WebGL, e.g. a headless browser) takes about a second or more for that with a ' +
+    'acceleration (software WebGL, e.g. a headless browser) takes half a second or more for that with a ' +
     `scene of millions of triangles in any shading (${HEAVY}), ${WIRES}, seconds with a heavy scene in ` +
     'MATERIAL or RENDERED shading, and its ' +
     'first screenshot or frame in one of these two after it opened the project takes longer, while it ' +
@@ -163,7 +172,7 @@ describe('editor command timeouts', () => {
     `the scene's materials for ${shading} shading ${FIRST}. ` +
     `${edited(`${shading} screenshot or viewport frame`)} ${KEPT}`;
   const fast = (shading: string) =>
-    `${NO_GPU} takes about a second or more per screenshot of a scene with millions of triangles even in ` +
+    `${NO_GPU} takes half a second or more per screenshot of a scene with millions of triangles even in ` +
     `${shading} shading, ${WIRES}, and a screenshot waits until the frame its viewport is drawing is done. In MATERIAL or ` +
     `RENDERED shading that frame compiles shaders the first time after the editor opened the project ` +
     `(${FIRST_SHADING_SECONDS} for a scene with 71 materials, while it builds and compiles the scene's ` +
@@ -220,16 +229,16 @@ describe('editor command timeouts', () => {
       'screenshot',
       {},
       VIEWPORT,
-      `Retry with a larger timeout_ms (at most 55000), or ${solidAdvice(false)} ${MEASURED}`,
-      `With timeout_ms at its maximum (55000), retry or ${solidAdvice(true)} ${MEASURED}`,
+      `Retry with a larger timeout_ms (at most 55000), or ${solidAdvice(false)} ${measuredSentence('SOLID screenshot')}`,
+      `With timeout_ms at its maximum (55000), retry or ${solidAdvice(true)} ${measuredSentence('SOLID screenshot')}`,
     ],
     ...(['MATERIAL', 'rendered'] as const).map(
       (shading): [string, Record<string, unknown>, string, string, string] => [
         'screenshot',
         { shading, width: 640 },
         shaded(shading.toUpperCase()),
-        `Retry with a larger timeout_ms (at most 55000), or ${solidAdvice(false)} ${MEASURED}`,
-        `With timeout_ms at its maximum (55000), retry or ${solidAdvice(true)} ${MEASURED}`,
+        `Retry with a larger timeout_ms (at most 55000), or ${solidAdvice(false)} ${measuredSentence()}`,
+        `With timeout_ms at its maximum (55000), retry or ${solidAdvice(true)} ${measuredSentence()}`,
       ],
     ),
     ...(['SOLID', 'wireframe'] as const).map(
@@ -237,8 +246,8 @@ describe('editor command timeouts', () => {
         'screenshot',
         { shading },
         fast(shading.toUpperCase()),
-        `Retry with a larger timeout_ms (at most 55000), or ${solidRender(false)} ${MEASURED}`,
-        `With timeout_ms at its maximum (55000), retry or ${solidRender(true)} ${MEASURED}`,
+        `Retry with a larger timeout_ms (at most 55000), or ${solidRender(false)} ${measuredSentence()}`,
+        `With timeout_ms at its maximum (55000), retry or ${solidRender(true)} ${measuredSentence()}`,
       ],
     ),
     ...['select', 'set_frame', 'view.set_view', 'run_operator'].map(
@@ -246,8 +255,8 @@ describe('editor command timeouts', () => {
         command,
         {},
         viewport(command),
-        `Pass a larger timeout_ms (at most 55000), or, ${SWITCH} ${MEASURED}`,
-        `With timeout_ms at its maximum (55000), retry, or, ${SWITCH} ${MEASURED}`,
+        `Pass a larger timeout_ms (at most 55000), or, ${SWITCH} ${measuredSentence('select')}`,
+        `With timeout_ms at its maximum (55000), retry, or, ${SWITCH} ${measuredSentence('select')}`,
       ],
     ),
   ];
@@ -297,7 +306,9 @@ describe('editor command timeouts', () => {
           );
           // the times of every message were measured on a calm machine, and it says how much longer
           // they took on a busy one
-          expect(msg.endsWith(` ${MEASURED_NOTE}`), label).toBe(true);
+          const millions =
+            command !== 'screenshot' ? 'select' : params.shading ? undefined : 'SOLID screenshot';
+          expect(msg.endsWith(` ${measuredNote(millions)}`), label).toBe(true);
         }
   });
 
@@ -409,11 +420,12 @@ describe('the measured costs', () => {
     expect(measuredOnServer('1–2 s')).toBe(
       `1–2 s, measured on a calm server with 4 CPUs (${made}), up to ${BUSY_FACTOR} times as long on a busy one`,
     );
-    expect(MEASURED_NOTE).toBe(
-      'The times given are the ranges measured on a calm machine with 4 CPUs, the editor in software WebGL, ' +
-        `widened by ${MARGIN_PERCENT} %; on a busy one (load averages of ${BUSY_LOADS}) the same steps took up ` +
-        `to ${BUSY_FACTOR} times as long.`,
-    );
+    for (const millions of [undefined, 'select', 'SOLID screenshot'] as const)
+      expect(measuredNote(millions), millions).toBe(measuredSentence(millions));
+    // the ranges of a select and a SOLID screenshot with 4 million triangles run further above their
+    // longest time: made with MARGIN_PERCENT from fewer agents' runs, they missed later agents' runs
+    // (round 10's third verifier: 0.731 s against 0.1–0.7 s, 3.478 s against 0.5–3.4 s)
+    expect(Number(MILLIONS_MARGIN_PERCENT)).toBeGreaterThan(Number(MARGIN_PERCENT));
     // a range that held on a calm machine reads as one at any load unless the text says how much
     // longer it took on a busy one (round 8: 46 of 137 values of a busy machine were outside the
     // ranges, which said only that the times vary); the descriptions of editor_command and
@@ -499,8 +511,8 @@ describe('the cost of screenshots', () => {
     expect(MCP_INSTRUCTIONS).toContain(
       'a screenshot of a heavy scene in MATERIAL or RENDERED shading takes seconds, the first screenshot or ' +
         'viewport frame in each of them after the editor opened the project longer (it builds and compiles ' +
-        `the scene's materials for that shading, ${FIRST_SHADING_SECONDS} for a scene with 71 materials, and ` +
-        'keeps them',
+        `the scene's materials for that shading, ${measured(`${FIRST_SHADING_SECONDS} for a scene with 71 materials`)}, ` +
+        'and keeps them',
     );
     // round 9 gave the first one as "tens of seconds" without a number
     for (const text of [MCP_INSTRUCTIONS, ...screenshots]) expect(text).not.toMatch(/tens of seconds/);
@@ -531,11 +543,11 @@ describe('the cost of screenshots', () => {
       );
       expect(msg).toContain('so a retry waits for the editor to finish and compiles nothing again.');
       expect(msg).toContain('Retry with a larger timeout_ms (at most 55000)');
-      expect(msg.endsWith(MEASURED_NOTE)).toBe(true);
+      expect(msg.endsWith(measuredNote())).toBe(true);
     }
     expect(MCP_INSTRUCTIONS).toContain(
       "it builds and compiles the scene's materials for that shading, " +
-        `${FIRST_SHADING_SECONDS} for a scene with 71 materials, and keeps them, also when the viewport ` +
+        `${measured(`${FIRST_SHADING_SECONDS} for a scene with 71 materials`)}, and keeps them, also when the viewport ` +
         'turns its anti-aliasing off and through material edits that change values; an edit that needs a ' +
         'shader no material had, such as coat or sheen turned ' +
         'on or a procedural texture on a set of channels that no other material has, makes the next one in ' +
@@ -551,12 +563,12 @@ describe('the cost of screenshots', () => {
     // spent seconds per frame counting the scene's edges for the statistics overlay): no text says
     // that such a scene takes seconds per frame or per screenshot in any shading
     expect(editorTimeoutMessage('screenshot', 10_000)).toContain(
-      'takes about a second or more for that with a scene of millions of triangles in any shading ' +
+      'takes half a second or more for that with a scene of millions of triangles in any shading ' +
         `(${MILLIONS_SOLID_SECONDS} in SOLID with 4 million)`,
     );
     for (const shading of ['SOLID', 'WIREFRAME'])
       expect(editorTimeoutMessage('screenshot', 10_000, null, { shading })).toContain(
-        `takes about a second or more per screenshot of a scene with millions of triangles even in ${shading} shading`,
+        `takes half a second or more per screenshot of a scene with millions of triangles even in ${shading} shading`,
       );
     // the first WIREFRAME screenshot or frame of a mesh builds its wires (with 4 million triangles
     // several times as long as a SOLID screenshot), which a SOLID screenshot also waits for when
@@ -570,13 +582,13 @@ describe('the cost of screenshots', () => {
         'RENDERED shading',
     );
     // a select took a fraction of a second: its first WIREFRAME frame is not "several times as long"
-    // as that but seconds (docs/mcp.md: 6.1–11 s with 4 million triangles)
+    // as that but seconds (docs/mcp.md gives the measured range with 4 million triangles)
     expect(editorTimeoutMessage('select', 10_000)).toContain(
       'and takes seconds for its first WIREFRAME frame of such a scene, while it builds the wires of every mesh.',
     );
     expect(editorTimeoutMessage('select', 10_000)).not.toContain('several times as long');
     expect(MCP_INSTRUCTIONS).toContain(
-      'and one of a scene with millions of triangles about a second or more in any shading, the first in ' +
+      'and one of a scene with millions of triangles half a second or more in any shading, the first in ' +
         'WIREFRAME shading several times as long:',
     );
     for (const text of [MCP_INSTRUCTIONS, ...screenshots, editorTimeoutMessage('select', 10_000)])
@@ -609,9 +621,10 @@ describe('the cost of screenshots', () => {
     );
     expect(docComment).toContain(
       'The times come from editor-costs.ts (its header says how they were measured and made: calm runs of ' +
-        'four agents in headless Chromium with software WebGL, pooled, widened by MARGIN_PERCENT; on a ' +
-        'machine kept busy by other processes the same steps took up to BUSY_FACTOR times as long, which the ' +
-        'messages say with {@link MEASURED_NOTE}).',
+        'nine agents in headless Chromium with software WebGL, pooled, widened by MARGIN_PERCENT, the longest ' +
+        'select and SOLID screenshot with 4 million triangles by MILLIONS_MARGIN_PERCENT; on a machine kept ' +
+        'busy by other processes the same steps took up to BUSY_FACTOR times as long, which the messages say ' +
+        'with {@link measuredNote}).',
     );
     for (const name of [
       '{@link FIRST_SHADING_SECONDS} for a scene of 81 objects and 71 materials',
@@ -620,7 +633,9 @@ describe('the cost of screenshots', () => {
       "({@link NEW_SHADER_SECONDS}: longest for the table's material, whose colour, roughness and bump are " +
         'procedural textures)',
       'a SOLID screenshot took {@link MILLIONS_SOLID_SECONDS}',
-      'a select {@link MILLIONS_SELECT_SECONDS}',
+      'a select {@link MILLIONS_SELECT_SECONDS}; a SOLID screenshot sent as soon as a select had answered, and ' +
+        'a select sent as soon as a screenshot had answered, wait for the frame the viewport draws then, and ' +
+        'these ranges include them.',
       'took {@link SERVER_SOLID_SECONDS} in a render process',
     ])
       expect(docComment).toContain(name);

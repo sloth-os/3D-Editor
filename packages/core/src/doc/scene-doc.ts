@@ -72,6 +72,18 @@ export const BLOCK_KINDS: DatablockKind[] = [
 export const CURVE_MAPS = ['fcurves', 'drivers'] as const;
 export type ChangeKind = DatablockKind | 'fcurves' | 'drivers';
 
+/** The names of one kind of datablock while a transaction runs (see SceneDoc.names). */
+interface BlockNames {
+  taken: Set<string>;
+  /** The suffix uniqueName tries first per name stem. */
+  next: Map<string, number>;
+  /**
+   * Keys the kind's map had when `taken` was last current (Y.Map's `_map`, deleted keys included:
+   * counting the live ones takes a pass over all of them); a datablock added by other code adds one.
+   */
+  keys: number;
+}
+
 /** Aggregated description of what changed in one Yjs transaction. */
 export interface DocChanges {
   origin: unknown;
@@ -108,6 +120,9 @@ export class SceneDoc {
   private readonly listeners = new Set<DocChangeListener>();
   private pending: DocChanges | null = null;
   private readonly meshCache = new WeakMap<Uint8Array, MeshData>();
+  /** Nesting of transact calls; datablock names are kept per kind while it is above 0 (see names). */
+  private transactionDepth = 0;
+  private readonly namesInTransaction = new Map<DatablockKind, BlockNames>();
   private readonly blobVersions = new WeakMap<object, number>();
   private blobCounter = 0;
   private readonly unobserve: (() => void)[] = [];
@@ -156,9 +171,14 @@ export class SceneDoc {
 
   transact<T>(fn: () => T, origin: unknown = this.origin): T {
     let result!: T;
-    this.ydoc.transact(() => {
-      result = fn();
-    }, origin);
+    this.transactionDepth++;
+    try {
+      this.ydoc.transact(() => {
+        result = fn();
+      }, origin);
+    } finally {
+      if (--this.transactionDepth === 0) this.namesInTransaction.clear();
+    }
     return result;
   }
 
@@ -262,10 +282,31 @@ export class SceneDoc {
     }
   }
 
-  private names(kind: DatablockKind): Set<string> {
-    const s = new Set<string>();
-    for (const m of this.map(kind).values()) s.add(String((m as Y.Map<any>).get('name') ?? ''));
-    return s;
+  /**
+   * The names of the datablocks of `kind` (`taken`) and the suffix to try first per name
+   * (`next`, see uniqueName). While a transaction runs they are collected once and kept current by
+   * createBlock and rename, so that an operator that adds thousands of datablocks in one step
+   * (Separate by loose parts) names each in constant time: collecting every name and trying the
+   * suffixes .001, .002 … again for each new one took more than ten minutes for 20,000 parts.
+   * Collected again when other code added datablocks of the kind, and after removeObject and the
+   * other remove methods (see forgetNames); remote updates and undo come in transactions of their
+   * own.
+   */
+  private names(kind: DatablockKind): BlockNames {
+    const keys = this.map(kind)._map.size;
+    let names = this.transactionDepth > 0 ? this.namesInTransaction.get(kind) : undefined;
+    if (!names || names.keys !== keys) {
+      const taken = new Set<string>();
+      for (const m of this.map(kind).values()) taken.add(String((m as Y.Map<any>).get('name') ?? ''));
+      names = { taken, next: new Map(), keys };
+      if (this.transactionDepth > 0) this.namesInTransaction.set(kind, names);
+    }
+    return names;
+  }
+
+  /** Forgets the names kept for the running transaction (see names): a datablock was removed. */
+  private forgetNames(kind: DatablockKind): void {
+    this.namesInTransaction.delete(kind);
   }
 
   private createBlock(
@@ -274,12 +315,15 @@ export class SceneDoc {
     id = newId(),
   ): string {
     const ymap = new Y.Map<any>();
-    const name = uniqueName(fields.name, this.names(kind));
+    const names = this.names(kind);
+    const name = uniqueName(fields.name, names.taken, names.next);
     this.transact(() => {
       this.map(kind).set(id, ymap);
       ymap.set('id', id);
       this.writeFields(ymap, { ...fields, name });
     });
+    names.taken.add(name);
+    names.keys = this.map(kind)._map.size;
     return id;
   }
 
@@ -289,8 +333,12 @@ export class SceneDoc {
     if (!ymap) throw new Error(`${kind} ${id} not found`);
     if (ymap.get('name') === name) return name;
     const names = this.names(kind);
-    names.delete(String(ymap.get('name')));
-    const final = uniqueName(name, names);
+    const old = String(ymap.get('name'));
+    names.taken.delete(old);
+    // the old name's suffix is free again: try its stem's suffixes from the first
+    names.next.delete(old.replace(/\.\d{3,}$/, ''));
+    const final = uniqueName(name, names.taken, names.next);
+    names.taken.add(final);
     this.transact(() => ymap.set('name', final));
     return final;
   }
@@ -513,10 +561,12 @@ export class SceneDoc {
     this.transact(() => {
       for (const child of this.childrenOf(id)) this.setParent(child.id, o.parent, true);
       this.map('objects').delete(id);
+      this.forgetNames('objects');
       for (const fc of this.listFCurves(id)) this.map('fcurves').delete(fcurveKey(fc));
       if (o.data && this.dataUsers(o.data) === 0) {
         const kind = dataKindOf(o.type);
         if (kind) this.map(kind).delete(o.data);
+        if (kind) this.forgetNames(kind);
       }
       for (const d of this.listDrivers(id)) this.map('drivers').delete(fcurveKey(d));
       const scene = this.getScene();
@@ -603,6 +653,7 @@ export class SceneDoc {
 
   removeMesh(id: string): void {
     this.transact(() => this.map('meshes').delete(id));
+    this.forgetNames('meshes');
   }
 
   // ---------------------------------------------------------------- materials
@@ -627,6 +678,7 @@ export class SceneDoc {
   }
 
   removeMaterial(id: string): void {
+    this.forgetNames('materials');
     this.transact(() => {
       this.map('materials').delete(id);
       for (const o of this.listObjects()) {
@@ -715,6 +767,7 @@ export class SceneDoc {
 
   removeImage(id: string): void {
     this.transact(() => this.map('images').delete(id));
+    this.forgetNames('images');
   }
 
   // ---------------------------------------------------------------- collections
@@ -757,6 +810,7 @@ export class SceneDoc {
       for (const cc of this.listCollections()) if (cc.parent === id) this.updateCollection(cc.id, { parent });
       this.map('collections').delete(id);
     });
+    this.forgetNames('collections');
   }
 
   /** Effective visibility of a collection (false if it or any ancestor is hidden). */

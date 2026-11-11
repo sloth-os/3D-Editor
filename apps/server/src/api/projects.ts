@@ -203,7 +203,15 @@ export function registerProjectRoutes(
 
   app.delete('/api/projects/:id', async (request, reply) => {
     const { id } = idParams.parse(request.params);
-    const deleted = await rooms.deleteProject(id);
+    let deleted: boolean;
+    try {
+      deleted = await rooms.deleteProject(id);
+    } catch (err) {
+      // storage could not delete the project, or tell whether it exists: 503 with the reason, like
+      // the GET routes (RoomManager logged it: 'deleting project failed')
+      if (err instanceof StorageUnavailableError) return reply.code(503).send({ error: err.message });
+      throw err;
+    }
     if (!deleted) return reply.code(404).send({ error: `project '${id}' not found` });
     renderStore.forgetProject(id);
     return reply.code(204).send();

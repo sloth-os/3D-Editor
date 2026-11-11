@@ -10,6 +10,7 @@ import {
   editorTimeoutMessage,
 } from '../../src/mcp/editor-commands';
 import {
+  BROWSER_BUSY_FACTOR,
   BROWSER_RASTER_SECONDS,
   BUSY_FACTOR,
   BUSY_LOADS,
@@ -17,19 +18,22 @@ import {
   FIRST_SHADING_SECONDS,
   LATER_SECONDS,
   MARGIN_PERCENT,
-  MEASURED_NOTE,
+  MILLIONS_MARGIN_PERCENT,
   MILLIONS_SELECT_SECONDS,
   MILLIONS_SOLID_SECONDS,
   NEW_SHADER_SECONDS,
   SERVER_SOLID_SCENE_SECONDS,
   SERVER_SOLID_SECONDS,
   measured,
+  measuredBrowserImages,
+  measuredNote,
   measuredOnServer,
 } from '../../src/mcp/editor-costs';
 import { MCP_INSTRUCTIONS } from '../../src/mcp/instructions';
 import {
   DELETED_ELSEWHERE_NOTE,
   LIST_FAILED_NOTE,
+  LIST_PARTIAL_NOTE,
   PROJECT_READ_MAX_AGE_MS,
   PROJECT_READ_WAIT_MS,
 } from '../../src/mcp/project-storage';
@@ -108,24 +112,31 @@ const describeOperator = (() => {
  * waited after the first switch to MATERIAL or RENDERED, the first WIREFRAME screenshot of 4 million
  * triangles, get_view with 4 million triangles (sent during a select or a screenshot, and after it:
  * this round's runs), a server render with a 256 MB heap, the editor's own CPU use, the number of
- * calm runs pooled (all, and of the scene with 4 million triangles) and how far a range of all but
- * one agent's runs missed the runs of the one left out.
+ * agents and of calm runs pooled (all, and of the scene with 4 million triangles), the longest select
+ * and SOLID screenshot with 4 million triangles, and the sentences that say how far above that their
+ * ranges run and why (LOO, which also says that a range of all but one agent's runs held the runs of
+ * the one left out).
  */
 // measured ranges: begin
 const M = {
-  CALM_RUNS: 109,
+  AGENTS: 9,
+  BROWSER_BUSY_RAW: '4.30',
+  BUSY_LOO_HELD: true,
+  BUSY_RAW: '2.52',
+  CALM_RUNS: 225,
   CPU_MAX: '3.9',
   CPU_MEDIAN: '1.4',
-  FIRST_NO_MSAA: '8.8–19 s',
+  FIRST_NO_MSAA: '7.9–21 s',
   GET_VIEW_AFTER: '0.2 s',
   GET_VIEW_DURING: '0.2 s',
-  GET_VIEW_RUNS: 4,
-  LOO_4M: 'A range made the same way from all but one of these runs held the run left out.',
-  LOO_MAX: 24,
-  MILLIONS_WIRE_FIRST: '6.1–11 s',
-  OOM_256: '1.6–3.4 s',
-  RUNS_4M: 13,
-  SWITCH: '2.9–6.3 s',
+  GET_VIEW_RUNS: 19,
+  LOO: "Those of a `select` and a `SOLID` screenshot with 4 million triangles, which include requests sent as soon as the one before had answered, run to 50 % more than their longest time: with 25 %, earlier ranges made from fewer runs missed such runs of later agents (up to 0.735 s against 0.1–0.7 s, and 3.478 s against 0.5–3.4 s). A range made that way from all but one agent's runs held all the runs of the agent left out.",
+  MILLIONS_SELECT_MAX: '0.735',
+  MILLIONS_SOLID_MAX: '3.478',
+  MILLIONS_WIRE_FIRST: '6.0–14 s',
+  OOM_256: '0.9–3.4 s',
+  RUNS_4M: 52,
+  SWITCH: '2.9–7.0 s',
 };
 // measured ranges: end
 
@@ -193,6 +204,16 @@ describe('docs: error codes of refused render operators', () => {
       "`mesh.subdivide failed: not run on the server: it would need about … MB of JavaScript heap for a mesh of about … faces, and the server's process has … MB of its … MB heap free …`";
     expect(`mesh.subdivide failed: ${refusal}`).toContain(quoted.slice(1, -' …`'.length));
     expect(row(mcp, quoted)).toContain('`OUT_OF_MEMORY`');
+    // the project's meshes over what the server keeps for one project: every operator that adds
+    // geometry is refused (render/memory.ts operatorCheck), so lowering its own parameters cannot help
+    expect(source('render/memory.ts')).toContain(
+      'if (e.addedStoredBytes > 0 && req.storedBytes + e.addedStoredBytes > maxProjectMeshBytes(limit))',
+    );
+    expect(row(mcp, quoted)).toContain(
+      "When the project's meshes already take more than the server keeps for them (`now` is over it; meshes " +
+        'the server did not load count too), every operator that adds geometry is refused until meshes are ' +
+        'deleted (`delete_objects`).',
+    );
     expect(
       row(
         guide,
@@ -202,6 +223,20 @@ describe('docs: error codes of refused render operators', () => {
     // run_operator, batch and edit_mesh name the code
     const tools = joined(source('mcp/tools.ts'));
     expect(tools).toContain('OUT_OF_MEMORY (the server');
+    // the tools whose other errors carry the code as JSON: every ToolError with code OUT_OF_MEMORY
+    // (renders, exports, import_model's memory check) and a mesh the server could not decode
+    expect(tools).toContain("throw new ToolError(`Import failed: ${refused}`, 'OUT_OF_MEMORY');");
+    expect(tools).toContain(
+      "return failure(err.message, err.code === 'OUT_OF_MEMORY' ? { code: err.code } : undefined);",
+    );
+    expect(tools).toContain(
+      'if (isMeshMemoryError(err)) return failure(`${name} failed: ${err.message}`, { code: err.code });',
+    );
+    expect(flat(mcp)).toContain(
+      'The out-of-memory errors of `render_image`, `render_animation`, `export_scene`, `import_model` and ' +
+        "`apply_modifier`, and the error of a tool that reads a stored mesh the server's process has no memory to decode " +
+        '(`get_mesh_data` …), carry `{"code": "OUT_OF_MEMORY"}` as JSON after the message',
+    );
   });
 });
 
@@ -434,13 +469,17 @@ describe('docs: browser editors', () => {
     expect(cell(row(mcp, '4 million triangles: a `select`'), 2)).toBe(MILLIONS_SELECT_SECONDS);
     expect(flat(guide)).toContain(`(${MILLIONS_SOLID_SECONDS} per \`SOLID\` screenshot with 4 million)`);
     expect(flat(mcp)).toContain(
-      'A screenshot of a scene of millions of triangles takes about a second or more in any shading: with 4 ' +
+      'A screenshot of a scene of millions of triangles takes half a second or more in any shading: with 4 ' +
         'million triangles, the first one in `WIREFRAME`, `MATERIAL` or `RENDERED` shading took seconds longer ' +
         '(the first `WIREFRAME` one most, see the table) and later ones about as long as a `SOLID` one or longer.',
     );
     expect(flat(guide)).toContain(
-      'A screenshot of a scene of millions of triangles takes about a second or more in any shading (',
+      'A screenshot of a scene of millions of triangles takes half a second or more in any shading (',
     );
+    // "half a second or more" agrees with the measured range, whose lower end is 0.5 s or more (round
+    // 10 said "about a second or more" next to "0.5–1.8 s")
+    expect(Number(/^([\d.]+)–/.exec(MILLIONS_SOLID_SECONDS)![1])).toBeGreaterThanOrEqual(0.5);
+    for (const text of agentTexts()) expect(text).not.toMatch(/about a second or more/);
     // the first WIREFRAME screenshot builds the wires of every mesh: measured (docs) and said (guide)
     expect(
       cell(
@@ -502,7 +541,7 @@ describe('docs: browser editors', () => {
       `in a headless editor at the default 800×450, the first image of a 71-material scene took ${BR_FIRST} ` +
         `while it compiled the materials, the next ones ${BR_LATER}, and images of 4 million triangles ` +
         `${BR_MILLIONS} (on a calm machine with 4 CPUs, widened like the ranges under ` +
-        `[\`editor_command\`](#editor_command); on a busy machine up to ${BUSY_FACTOR} times as long)`,
+        `[\`editor_command\`](#editor_command); on a busy machine up to ${BROWSER_BUSY_FACTOR} times as long)`,
     );
     // rendering.ts names the constant instead of repeating its numbers
     expect(rendering).toContain(
@@ -519,7 +558,10 @@ describe('docs: browser editors', () => {
       },
     );
     expect(doc).toContain(`error: ${failure.reason}. ${failure.advice}`);
-    expect(failure.advice).toContain(measured(BROWSER_RASTER_SECONDS));
+    // a browser editor's images took longer on a busy machine than the other steps: their own factor
+    expect(failure.advice).toContain(measuredBrowserImages(BROWSER_RASTER_SECONDS));
+    expect(measuredBrowserImages('1 s')).toBe(measured('1 s', BROWSER_BUSY_FACTOR));
+    expect(Number(BROWSER_BUSY_FACTOR)).toBeGreaterThan(Number(BUSY_FACTOR));
     expect(doc).not.toMatch(
       /A heavy scene takes tens of seconds in an editor|can take tens of seconds for a heavy scene/,
     );
@@ -649,33 +691,75 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
 });
 
 describe('docs: measured times', () => {
-  it('say how the ranges were made: pooled calm runs widened by a margin, and the busy factor', () => {
+  it('say how the ranges were made: pooled calm runs widened by a margin, and the busy factors', () => {
     const doc = flat(mcp);
     expect(doc).toContain(
       'Each run started once the CPUs had been at least 90 % idle for 5 s, and runs that other processes ' +
         'disturbed are left out;',
     );
+    expect(M.AGENTS).toBe(9);
     expect(doc).toContain(
-      `Each range below pools the ${M.CALM_RUNS} calm runs of four agents on 2026-11-09 (the TEXTS agent of ` +
-        "round 9 in four passes, its two verifiers and this round's TEXTS agent) and runs from " +
-        `${MARGIN_PERCENT} % less than the shortest to ${MARGIN_PERCENT} % more than the longest time measured, ` +
-        "rounded outward to 0.1 s (to 1 s from 10 s on): a range made from all but one agent's runs missed the " +
-        `runs of the agent left out by up to ${M.LOO_MAX} %. Times with 4 million triangles pool this round's ` +
-        `${M.RUNS_4M} runs only: on round 9's code the editor's statistics overlay counted the edges of every ` +
-        'mesh each time it was updated, also after every slow frame, which took seconds with 4 million ' +
-        "triangles and held these steps up by seconds; this round's code counts them in a fraction of that " +
-        `time. ${M.LOO_4M}`,
+      `Each range below pools the ${M.CALM_RUNS} calm runs of nine agents on 2026-11-09 and 2026-11-11 (the ` +
+        "TEXTS agent of round 9 in four passes and its two verifiers, this round's TEXTS agents and their three " +
+        `verifiers) and runs from ${MARGIN_PERCENT} % less than the shortest to ${MARGIN_PERCENT} % more than the ` +
+        `longest time measured, rounded outward to 0.1 s (to 1 s from 10 s on). ${M.LOO} Times with 4 million ` +
+        `triangles pool this round's ${M.RUNS_4M} runs only: on round 9's code the editor's statistics overlay ` +
+        'counted the edges of every mesh each time it was updated, also after every slow frame, which took ' +
+        "seconds with 4 million triangles and held these steps up by seconds; this round's code counts them in a " +
+        'fraction of that time. A `SOLID` screenshot there includes screenshots sent as soon as a `select` had ' +
+        'answered, and a `select` selects sent as soon as a screenshot had answered: they waited for the frame ' +
+        'the viewport drew then.',
     );
-    // the margin covers what one agent's runs added to the others'
-    expect(M.LOO_MAX).toBeLessThan(Number(MARGIN_PERCENT));
+    // the select and the SOLID screenshot with 4 million triangles: ranges made with MARGIN_PERCENT from
+    // fewer runs missed a later agent's runs of them (round 10's third verifier: 0.731 s against 0.1–0.7 s,
+    // 3.478 s against 0.5–3.4 s), so their upper ends run MILLIONS_MARGIN_PERCENT above the longest time
+    expect(M.LOO).toContain(
+      `Those of a \`select\` and a \`SOLID\` screenshot with 4 million triangles, which include requests sent as ` +
+        `soon as the one before had answered, run to ${MILLIONS_MARGIN_PERCENT} % more than their longest time: ` +
+        `with ${MARGIN_PERCENT} %, earlier ranges made from fewer runs missed such runs of later agents (up to `,
+    );
+    const missed = /up to ([\d.]+) s against 0\.1–0\.7 s, and ([\d.]+) s against 0\.5–3\.4 s\)/.exec(M.LOO)!;
+    expect(Number(missed[1])).toBeGreaterThanOrEqual(0.731);
+    expect(Number(missed[2])).toBeGreaterThanOrEqual(3.478);
+    const upperEnd = (range: string) => Number(/–([\d.]+) s$/.exec(range)![1]);
+    const lowerEnd = (range: string) => Number(/^([\d.]+)–/.exec(range)![1]);
+    const widenedUp = (max: string, pct: string) =>
+      Math.ceil(Number((Number(max) * (1 + Number(pct) / 100) * 10).toFixed(6))) / 10;
+    expect(upperEnd(MILLIONS_SOLID_SECONDS)).toBe(widenedUp(M.MILLIONS_SOLID_MAX, MILLIONS_MARGIN_PERCENT));
+    expect(upperEnd(MILLIONS_SELECT_SECONDS)).toBe(widenedUp(M.MILLIONS_SELECT_MAX, MILLIONS_MARGIN_PERCENT));
+    expect(Number(M.MILLIONS_SOLID_MAX)).toBeGreaterThanOrEqual(3.478);
+    expect(Number(M.MILLIONS_SELECT_MAX)).toBeGreaterThanOrEqual(0.731);
+    // their lower ends, like every other end, are MARGIN_PERCENT below the shortest time
+    expect(lowerEnd(MILLIONS_SOLID_SECONDS)).toBeLessThanOrEqual(0.78 * (1 - Number(MARGIN_PERCENT) / 100));
+    // round 10 gave one busy factor without a margin (3.5, the largest ratio of the busy runs pooled
+    // then): a browser editor's later raster images took 4.5 times the upper end of their range in a
+    // verifier's two runs with four CPU-bound processes (30.4 s and 29.7 s against 2.6–6.7 s). Each
+    // factor is now the largest ratio of every busy run pooled, widened like the ranges and rounded up
+    // to 0.5, the browser images' apart; the longest such image a verifier measured fits
     expect(doc).toContain(
-      `On the same machine kept busy by other processes (1-minute load averages of ${BUSY_LOADS} on its 4 ` +
-        `CPUs), the same steps took up to ${BUSY_FACTOR} times as long as the upper end of their range.`,
+      'On the same machine kept busy by other processes (four CPU-bound processes and other work, 1-minute load ' +
+        `averages of ${BUSY_LOADS} on its 4 CPUs), the same steps took up to ${M.BUSY_RAW} times as long as the ` +
+        `upper end of their range, and a browser editor's raster images up to ${M.BROWSER_BUSY_RAW} times (an ` +
+        'image right after one that timed out, which it waited for, left out); widened by ' +
+        `${MARGIN_PERCENT} % and rounded up to 0.5, the texts say up to ${BUSY_FACTOR} and ${BROWSER_BUSY_FACTOR} ` +
+        'times as long' +
+        (M.BUSY_LOO_HELD
+          ? ", and factors made that way from all but one agent's busy runs held the busy runs of the agent left out."
+          : '.'),
+    );
+    const widen = (raw: string) => Math.ceil(Number(raw) * (1 + Number(MARGIN_PERCENT) / 100) * 2) / 2;
+    expect(Number(BUSY_FACTOR)).toBe(widen(M.BUSY_RAW));
+    expect(Number(BROWSER_BUSY_FACTOR)).toBe(widen(M.BROWSER_BUSY_RAW));
+    // the longest such images measured with four CPU-bound processes: 30.41 s (round 10's verifier) and
+    // 33.96 s (its second fix round)
+    expect(Number(BR_LATER.split('–')[1].split(' ')[0]) * Number(BROWSER_BUSY_FACTOR)).toBeGreaterThanOrEqual(
+      33.96,
     );
     expect(flat(guide)).toContain(
       'These times are the ranges measured on a calm machine with 4 CPUs, the editor in software WebGL ' +
-        `(SwiftShader), widened by ${MARGIN_PERCENT} % ([how](mcp.md#live-editors)); on a busy one (load ` +
-        `averages of ${BUSY_LOADS}) the same steps took up to ${BUSY_FACTOR} times as long.`,
+        `(SwiftShader), widened by ${MARGIN_PERCENT} % (the longest \`SOLID\` screenshot with 4 million ` +
+        `triangles by ${MILLIONS_MARGIN_PERCENT} %; [how](mcp.md#live-editors)); on a busy one (load averages of ` +
+        `${BUSY_LOADS}) the same steps took up to ${BUSY_FACTOR} times as long.`,
     );
     // the short texts say the same
     const made = `the range widened by ${MARGIN_PERCENT} %`;
@@ -685,13 +769,30 @@ describe('docs: measured times', () => {
     expect(measuredOnServer('1 s')).toBe(
       `1 s, measured on a calm server with 4 CPUs (${made}), up to ${BUSY_FACTOR} times as long on a busy one`,
     );
-    expect(MEASURED_NOTE).toBe(
+    // a message says how the range of its own step with 4 million triangles was made: a select's
+    // says nothing of screenshots
+    const note = (millions: string) =>
       'The times given are the ranges measured on a calm machine with 4 CPUs, the editor in software WebGL, ' +
-        `widened by ${MARGIN_PERCENT} %; on a busy one (load averages of ${BUSY_LOADS}) the same steps took up ` +
-        `to ${BUSY_FACTOR} times as long.`,
-    );
-    for (const command of ['screenshot', 'select', 'get_view'] as const)
-      expect(editorTimeoutMessage(command, 10_000).endsWith(` ${MEASURED_NOTE}`), command).toBe(true);
+      `widened by ${MARGIN_PERCENT} %${millions}; on a busy one (load averages of ${BUSY_LOADS}) the same steps ` +
+      `took up to ${BUSY_FACTOR} times as long.`;
+    const by = `with 4 million triangles by ${MILLIONS_MARGIN_PERCENT} %`;
+    expect(measuredNote()).toBe(note(''));
+    expect(measuredNote('select')).toBe(note(` (the longest select ${by})`));
+    expect(measuredNote('SOLID screenshot')).toBe(note(` (the longest SOLID screenshot ${by})`));
+    for (const [command, params, millions] of [
+      ['screenshot', {}, 'SOLID screenshot'],
+      ['screenshot', { shading: 'SOLID' }, undefined],
+      ['screenshot', { shading: 'MATERIAL' }, undefined],
+      ['select', {}, 'select'],
+      ['get_view', {}, 'select'],
+    ] as const)
+      expect(
+        editorTimeoutMessage(command, 10_000, null, params).endsWith(` ${measuredNote(millions)}`),
+        command,
+      ).toBe(true);
+    // the quoted messages of the Live editors section (a screenshot's and a select's) end so
+    for (const millions of ['SOLID screenshot', 'select'] as const)
+      expect(doc).toContain(measuredNote(millions));
     for (const text of [doc, flat(guide)]) expect(text).not.toMatch(/vary with the machine's load/);
   });
 
@@ -730,15 +831,83 @@ describe('docs: measured times', () => {
     }
   });
 
+  it('hold the calm times that the verifiers of round 10 measured outside the earlier ranges', () => {
+    // round 10's ranges left out a calm select with 4 million triangles (516 ms, a select sent right
+    // after a WIREFRAME screenshot, against 0.1–0.5 s) and the raw-SDK out-of-memory probes with
+    // RENDER_WORKER_MEMORY_MB=256 (1.26–1.38 s, against 1.6–3.4 s): every calm run is pooled now, and the
+    // select and SOLID screenshot with 4 million triangles get a wider upper end
+    const holds = (range: string, value: number) => {
+      const [lo, hi] = /^([\d.]+)–([\d.]+) s$/.exec(range)!.slice(1).map(Number);
+      return lo <= value && value <= hi;
+    };
+    for (const v of [0.165, 0.516]) expect(holds(MILLIONS_SELECT_SECONDS, v), `${v} s`).toBe(true);
+    // round 10's third verifier: a select sent as soon as a WIREFRAME screenshot had answered (731 ms,
+    // against 0.1–0.7 s) and a SOLID screenshot sent as soon as a select had answered (3478 ms, against
+    // 0.5–3.4 s), both in calm runs
+    expect(holds(MILLIONS_SELECT_SECONDS, 0.731)).toBe(true);
+    expect(holds(MILLIONS_SOLID_SECONDS, 3.478)).toBe(true);
+    expect(
+      cell(
+        row(
+          mcp,
+          '4 million triangles, the viewport in `SOLID` (without multisampling): a `SOLID` screenshot',
+        ),
+        2,
+      ),
+    ).toBe(MILLIONS_SOLID_SECONDS);
+    for (const v of [1.26, 1.307, 1.37, 1.379, 2.38]) expect(holds(M.OOM_256, v), `${v} s`).toBe(true);
+    expect(cell(row(mcp, '4 million triangles: a `select`'), 2)).toBe(MILLIONS_SELECT_SECONDS);
+    expect(flat(mcp)).toContain(`a grid of 2 million triangles failed after ${M.OOM_256} `);
+  });
+
   it('state no number of an earlier round any more', () => {
     // round 9's ranges (one agent's calm runs), its busy factor and loads, and its server render ranges
     const old =
       /18\.6–25\.4|0\.5–2\.6 s|0\.8–3\.1|0\.9–3\.1|11\.7 s|4\.0–4\.7|3\.4–4\.4|0\.6–1\.2 s|1\.6–3\.1 s|1\.7–6\.0|3\.0–9\.8|1\.7–4\.9|3\.0–6\.4|4\.4–8\.6|22\.8–23\.3|3\.5–4\.1 s|2\.1–8\.1|load averages of 6–20|4\.6 times/;
     for (const text of agentTexts()) expect(text).not.toMatch(old);
+    // round 10's ranges that its verifiers' runs disproved or that pooling every calm run changed, its
+    // busy loads and its count of calm runs and of a leave-one-agent-out miss
+    const round10 =
+      /0\.4–1\.5 s|0\.5–1\.8 s|0\.1–0\.5 s|8\.8–19 s|1\.6–3\.4 s|6\.1–11 s|load averages of 4–15|109 calm runs|by up to 24 %/;
+    for (const text of agentTexts()) expect(text).not.toMatch(round10);
+    // the ranges and factors of round 10's second fix round that the runs of its third verifier and
+    // third fix round changed (the method paragraph quotes the two that a later agent's runs missed:
+    // "… against 0.1–0.7 s, and … against 0.5–3.4 s"), and its counts of runs
+    const fix2 =
+      /13–33 s|7\.9–19 s|0\.4–1\.6 s|2\.9–6\.3 s|(?<!against )0\.5–3\.4 s|(?<!against )0\.1–0\.7 s|6\.0–12 s|17–34 s|2\.6–6\.7 s|1\.5–4\.7 s|up to 16 s for|6\.5 times as long|157 calm runs|this round's 28 runs/;
+    for (const text of agentTexts()) expect(text).not.toMatch(fix2);
   });
 });
 
 describe('docs: server renders', () => {
+  it('say that instances take memory in server renders and exports, as the out-of-memory advice does', () => {
+    // the software rasterizer keeps world-space vertices per drawn item (core raster.ts worldCache,
+    // keyed by its world matrix), so a server render's memory grows with the instances it draws
+    expect(file('../../../../packages/core/src/render/raster.ts')).toContain(
+      'worldCache: Map<Mat4, WorldVertices> | null = null;',
+    );
+    expect(OUT_OF_MEMORY_ADVICE).toContain('the number of particle instances');
+    // OBJ, STL and PLY write every export item, instances included (core io/common.ts), as a world-space
+    // copy of its mesh
+    expect(file('../../../../packages/core/src/io/common.ts')).toContain(
+      'for (const it of instanceExportItems(scene, new Set(picked.map((o) => o.id)), apply)) items.push(it);',
+    );
+    for (const format of ['obj', 'stl'])
+      expect(file(`../../../../packages/core/src/io/${format}.ts`), format).toContain(
+        'const mesh = bakeWorldMesh(it.mesh, it.ev.worldMatrix);',
+      );
+    expect(file('../../../../packages/core/src/io/ply.ts')).toContain(
+      '.map((it) => bakeWorldMesh(it.mesh!, it.ev.worldMatrix));',
+    );
+    expect(flat(guide)).toContain(
+      'Instances cost far less than real objects and render and export, but each one drawn still takes memory ' +
+        'in a server render (it grows with the number of instances and the size of the source), and OBJ, STL ' +
+        'and PLY exports write each one as a copy: when a server render or export runs out of memory, lower ' +
+        "`count` or the source's detail. Instances are not objects:",
+    );
+    expect(flat(guide)).not.toMatch(/Instances are cheap/);
+  });
+
   it('give one range for grey clay of 2 million triangles, everywhere', () => {
     const doc = flat(mcp);
     expect(doc).toContain(
@@ -916,11 +1085,20 @@ describe('docs: server renders', () => {
       'Both refuse an object whose geometry did not evaluate fully (a modifier that failed or was skipped for ' +
         'memory, a mesh the server did not load; for `object.convert` also a curve or text surface that was not ' +
         "built: the `problems` of `get_scene`) with those errors and change nothing; the failure's `code` in " +
-        '`run_operator` is `OUT_OF_MEMORY` when memory was the cause, else `FAILED`, while `apply_modifier` ' +
-        'gives the message only ("object.modifier_apply failed: …").',
+        '`run_operator` is `OUT_OF_MEMORY` when memory was the cause, else `FAILED`, and `apply_modifier` ' +
+        '("object.modifier_apply failed: …") carries `{"code": "OUT_OF_MEMORY"}` after the message when memory ' +
+        'was the cause.',
     );
-    // apply_modifier's error is the operator's message (modifiers.ts applyModifier)
-    expect(source('mcp/modifiers.ts')).toContain('`object.modifier_apply failed: ${res.error}`');
+    // apply_modifier's error is the operator's message with the operator's OUT_OF_MEMORY code
+    // (modifiers.ts applyModifier), which the tool wrapper prints as JSON after it (tools.ts)
+    expect(joined(source('mcp/modifiers.ts'))).toContain(
+      "`object.modifier_apply failed: ${res.error}`, res.code === 'OUT_OF_MEMORY' ? 'OUT_OF_MEMORY' : undefined,",
+    );
+    expect(flat(mcp)).toContain(
+      'The out-of-memory errors of `render_image`, `render_animation`, `export_scene`, `import_model` and ' +
+        '`apply_modifier`, and the error of a tool that reads a stored mesh',
+    );
+    expect(flat(mcp)).not.toContain('gives the message only');
     expect(flat(guide)).toContain(
       'An object whose geometry did not evaluate fully (a modifier that failed or was skipped for memory, a ' +
         'surface that was not built: the `problems` of `get_scene`) is refused with those errors and nothing is ' +
@@ -1042,20 +1220,57 @@ describe('docs: keys of animated channels', () => {
     expect(describeOperator('object.duplicate')).toContain(
       'each copy gets its own copy of the animation (keyframes and drivers) of the object',
     );
+    // Blender's Duplicate Linked shares the object's action (object_add.cc: dupflag 0 copies no action):
+    // the texts do not say that a linked copy gets its own keyframes as Blender does
     expect(joined(source('mcp/tools.ts'))).toContain(
-      "As Blender does by default, the copy gets its own copy of the object's keyframes and drivers",
+      "The copy gets its own copy of the object's keyframes and drivers and, unless linked, of its data's " +
+        "(shape keys, curve, light and camera values), as Blender's Shift+D does by default; Blender's linked " +
+        "duplicates (Alt+D) share the object's action with the original instead, so that later key edits " +
+        'change both, while here a linked copy gets its own keyframes too.',
+    );
+    expect(joined(source('mcp/tools.ts'))).not.toContain(
+      'As Blender does by default, the copy gets its own copy',
     );
     expect(flat(mcp)).toContain(
       '`duplicate_object` (and `object.duplicate`) copies the animation as Blender does by default',
+    );
+    expect(flat(mcp)).toContain(
+      'Blender shares one action between linked duplicates; here each linked copy gets its own keyframes.',
+    );
+    expect(cell(row(mcp, '`duplicate_object` |'), 3)).toBe(
+      '`linked: true` shares the mesh data and its animation (Alt+D); a linked copy, too, gets its own copy ' +
+        "of the object's keyframes and drivers",
     );
   });
 });
 
 describe('docs: projects in storage that others share', () => {
+  it("say that delete_project's bound is for an id, and what looking up a name adds", () => {
+    // a verifier measured 6 rounds of requests (3 stated) deleting by a name that could be an id, 7 for a
+    // loaded project (5 s plus one request stated): AgentSession.resolveProjectId tries such a name as an
+    // id first (RoomManager.exists: project.json, then document.ybin) and lists storage for a project
+    // this server has not loaded
+    const agentSrc = source('mcp/agent.ts');
+    expect(agentSrc).toContain('if (isValidProjectId(r) && (await rooms.exists(r))) return r;');
+    expect(agentSrc).toContain('await listProjects(rooms)');
+    expect(flat(mcp)).toContain(
+      "five when it has no `project.json`), when you pass the project's id. A name is looked up first: one " +
+        'that could be an id (letters, digits, `-` and `_`) is tried as an id first (up to two more requests ' +
+        'one after another; at most 5 s when this server has loaded a project of that name), and a project ' +
+        "this server has not loaded is found by listing storage (one request, then every project's " +
+        '`project.json` at once) instead of the first read of its `project.json`.',
+    );
+  });
+
   it('say when another writer deleted a project this server has open, and when listing storage failed', () => {
     const doc = flat(mcp);
     expect(doc).toContain(DELETED_ELSEWHERE_NOTE.slice(0, DELETED_ELSEWHERE_NOTE.indexOf(' This server')));
     expect(doc).toContain(`"${LIST_FAILED_NOTE}"`);
+    expect(doc).toContain(`"${LIST_PARTIAL_NOTE}"`);
+    expect(doc).toContain(
+      'Names of the projects this server has loaded are matched before storage is listed, so they find ' +
+        'those projects while storage fails or does not answer',
+    );
     expect(doc).toContain(
       'Editors and agents that have the project open on another server sharing the storage stay connected ' +
         'there, and their next change stores the project again',
@@ -1107,11 +1322,17 @@ describe('docs: projects in storage that others share', () => {
       "with WebDAV through this server's `/dav` proxy, this server then opens the project again and those " +
         'browsers sync with it live, which undoes the deletion for everyone.',
     );
-    // the REST endpoint's answer to a deletion that failed
-    expect(doc).toContain(
-      "500 for other failures, also when storage fails to delete a project (`DELETE`: Fastify's " +
-        '`{statusCode, error, message}` with "could not delete project <id> from storage (<reason>); …").',
+    // the REST endpoint's answer to a deletion that storage failed: 503 with the reason, like the GET
+    // routes (api/projects.ts; it answered Fastify's 500 before round 10's last fix)
+    expect(source('api/projects.ts')).toContain(
+      'if (err instanceof StorageUnavailableError) return reply.code(503).send({ error: err.message });',
     );
+    expect(doc).toContain(
+      '503 when the server stopped it or the storage is unavailable, also for a `DELETE` that storage could ' +
+        'not carry out (`{"error": "could not delete project <id> from storage (<reason>); …"}`, or "could not ' +
+        'read project <id> from storage (<reason>)" for a project the server has not loaded);',
+    );
+    expect(doc).not.toMatch(/Fastify's `\{statusCode, error, message\}`/);
   });
 
   it("say what wm.save_mainfile shows the person, as the editor's toasts do", () => {
@@ -1123,6 +1344,30 @@ describe('docs: projects in storage that others share', () => {
         "WebDAV (<reason>). The project is saved in this browser.', or that it syncs once back online",
     );
     for (const text of agentTexts()) expect(text).not.toMatch(/shows the person a Saved message/);
+    // only a save to WebDAV stores a deleted project again (WebDAVSync.save); Save always connects
+    // to the server again (ProjectSession.flush), which closes the connection of a project it
+    // deleted within the hour (RoomManager's tombstones) unless storage holds it again
+    expect(web('project/session.ts')).toMatch(
+      /: \{ message: 'Saved in this browser', level: 'info' \};\s*this\.provider\?\.reconnect\(\);/,
+    );
+    expect(source('sync/room-manager.ts')).toContain('const TOMBSTONE_TTL_MS = 60 * 60 * 1000;');
+    const reconnect =
+      'It also connects that editor to the server again, which closes the connection again while the server ' +
+      'has the project deleted (within an hour of deleting it, unless storage holds it again)';
+    // the toast names who deleted it (the server, another device, another tab): one example is quoted
+    expect(web('storage/webdav.ts')).toContain(
+      '`"${this.doc.name}" was deleted from WebDAV on another device; this browser stored it there again.`',
+    );
+    expect(caveat).toContain(
+      'with WebDAV, a project that the server or another device had deleted is stored there again (for example \'"<name>" ' +
+        `was deleted on the server; this browser stored it there again.'). ${reconnect}`,
+    );
+    expect(flat(mcp)).toContain(
+      'with WebDAV, a project that the server or another device had deleted is stored there again (for example "\\"<name>\\" ' +
+        `was deleted on the server; this browser stored it there again."). ${reconnect}`,
+    );
+    for (const text of [caveat, flat(mcp)])
+      expect(text).not.toMatch(/back online; a project that the server/);
   });
 });
 
@@ -1172,7 +1417,8 @@ describe('docs: wrapping', () => {
     prose(doc)
       .filter(([line, next]) => line.trim() && next.trim() && !/^\s*([-*|#]\s|```|\d+\.\s|<!--)/.test(next))
       .filter(([line, next]) => {
-        const word = next.trim().match(/^(`[^`]*`\S*|\S+)/)![0];
+        // a code span is one word with what touches it, also an opening parenthesis: "(`{…}`,"
+        const word = next.trim().match(/^(\S*?`[^`]*`\S*|\S+)/)![0];
         return line.length < 60 && line.length + 1 + word.length <= 100;
       })
       .map(([line]) => line);

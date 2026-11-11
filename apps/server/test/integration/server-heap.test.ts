@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,7 +18,8 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
  * heap of 640 MB (--max-old-space-size), in which subdividing a grid of 90,000 faces once does not
  * fit: without the check the process runs out of heap and ends, and nothing answers any more. The
  * same holds for a REST snapshot, which copies the meshes and serializes them in that heap
- * (render/memory.ts snapshotRefusal), while generators at their defaults, estimated from their
+ * (render/memory.ts snapshotRefusal), and for import_model, which imports without the operator
+ * registry (core importMemoryRefusal), while generators at their defaults, estimated from their
  * parameters, run.
  */
 
@@ -115,6 +118,15 @@ async function stopServerProcess(s: ServerProcess | undefined): Promise<void> {
   clearTimeout(timer);
   // whatever the server started in its group (esbuild's service of tsx, a render process)
   signal('SIGKILL');
+}
+
+/** A binary STL of one triangle. */
+function smallStl(): Uint8Array {
+  const stl = new Uint8Array(84 + 50);
+  const view = new DataView(stl.buffer);
+  view.setUint32(80, 1, true);
+  [0, 0, 0, 1, 0, 0, 0, 1, 0].forEach((v, i) => view.setFloat32(84 + 12 + 4 * i, v, true));
+  return stl;
 }
 
 async function call(name: string, args: Record<string, unknown> = {}): Promise<ToolResult> {
@@ -306,6 +318,51 @@ describe(`server process with a ${HEAP_MB} MB heap`, () => {
     );
     expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
     expect(server.child.exitCode).toBeNull();
+  });
+
+  it('refuses an import_model that would run its heap out, and keeps answering', async () => {
+    // a binary STL of 600,000 triangles (30 MB), served over HTTP: reading and welding it takes
+    // about 330 MB of heap, then about 100 MB decoded
+    const triangles = 600_000;
+    const stl = new Uint8Array(84 + 50 * triangles);
+    const view = new DataView(stl.buffer);
+    view.setUint32(80, triangles, true);
+    for (let t = 0; t < triangles; t++)
+      for (let k = 0; k < 3; k++) {
+        const o = 84 + 50 * t + 12 + 12 * k;
+        view.setFloat32(o, (t % 1000) + k, true);
+        view.setFloat32(o + 4, Math.floor(t / 1000) + (k === 2 ? 1 : 0), true);
+      }
+    const files = createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'model/stl' });
+      res.end(req.url === '/big.stl' ? stl : smallStl());
+    });
+    await new Promise<void>((resolve) => files.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(files.address() as AddressInfo).port}`;
+    try {
+      const { id } = await ok('create_project', { name: 'Import', empty: true });
+      const res = await call('import_model', { project: id, url: `${base}/big.stl` }).catch(
+        (err: unknown) => {
+          throw new Error(
+            `import_model got no answer (${String(err)}); the server's output:\n${server.output().slice(-1500)}`,
+          );
+        },
+      );
+      expect(res.isError).toBe(true);
+      const [first, ...rest] = (res.content[0]?.text ?? '').split('\n');
+      expect(first).toMatch(
+        /^Import failed: not run on the server: it would need about [\d,]+ MB of JavaScript heap for a mesh of about 600,000 faces, and the server's process has [\d,]+ MB of its [\d,]+ MB heap free and keeps 256 MB of it for its other work\. Lower the size of the file \(import fewer or simpler meshes\) to run it on the server \(a browser editor runs it in its own memory\)$/,
+      );
+      expect(JSON.parse(rest.join('\n'))).toEqual({ code: 'OUT_OF_MEMORY' });
+      expect((await ok('get_scene', { project: id })).counts.objects).toBe(0);
+      // the server keeps answering, and a small file is imported
+      expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
+      const small = await ok('import_model', { project: id, url: `${base}/small.stl` });
+      expect(small.objects).toHaveLength(1);
+      expect(server.child.exitCode).toBeNull();
+    } finally {
+      files.close();
+    }
   });
 
   it('refuses a REST snapshot that would run its heap out, and keeps answering', async () => {

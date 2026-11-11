@@ -44,11 +44,12 @@ The modes:
 
 - no mode: the full run. It builds and checks the scene, then renders `render.png`,
   `contact_sheet.png` and `preview.gif` into this folder. It does not export `scene.glb`. It
-  takes about 12 minutes with 3 render threads (see [Final production run](#final-production-run)).
+  takes about 12 minutes with 3 render processes (see
+  [Final production run](#final-production-run)).
 - `--build-only`: the scene and the checks only (3–5 s).
 - `--preview`: the scene and the checks, then a RASTER preview and a 16-spp path-traced preview
   (640×360) in `$TMPDIR/lighthouse-cove-preview`; nothing is written next to `build.mjs` (about
-  50 s with one render thread).
+  50 s with one render process).
 - `--export-only`: the scene and the checks, then `scene.glb`, no renders (15–25 s).
 
 The flags:
@@ -106,9 +107,10 @@ driver sets it. The outliner lists the beam's two shaft cones under it.
 ## scene.glb
 
 `--export-only` (or `--export`) writes `scene.glb` with `export_scene {format: glb, objects,
-bake_resolution: 512}`. The export runs on a server render thread and takes 10–20 s. It holds every
-object the renders show except the four cloud streaks: they are flat shapes 0.8–1 km away that glow
-in the mist colour and only read through the world mist, which glTF cannot carry (nor the sky).
+bake_resolution: 512}`. The export runs in a server render process and takes 10–20 s. It holds
+every object the renders show except the four cloud streaks: they are flat shapes 0.8–1 km away
+that glow in the mist colour and only read through the world mist, which glTF cannot carry (nor the
+sky).
 Leaving them out keeps the file under 6 MB (5.85 MB; with the clouds it would be 7.7 MB) and lets a
 viewer that frames the whole scene frame the island and the 600 m sea rather than a 2 km box of sky.
 The procedural textures are baked at 512 × 512 pixels: at the exporter's automatic size (about
@@ -201,7 +203,7 @@ render have 60k vertices and 98k faces evaluated (118k triangles), and the 11 hi
 ## Final production run
 
 The final production run used a fresh editor server with an empty data directory and 3 render
-threads, and ran the whole `build.mjs` in its default mode. It also proves that the project
+processes, and ran the whole `build.mjs` in its default mode. It also proves that the project
 rebuilds from scratch:
 
 ```bash
@@ -215,7 +217,7 @@ machine's 4 cores were shared with other agents (load average 4–16). Exit code
 | Stage | Settings | Time | Result |
 | --- | --- | --- | --- |
 | Build and checks | the whole scene, then the material, beam, path, colour, camera and placement checks | 3.1 s | all checks passed (island 0.8 s, checks 0.4 s) |
-| Final still `render.png` | 1280×720, path tracer, 128 spp, 8 bounces, denoise, ACES, time limit 480 s | 371.8 s | **128 of 128 spp**, 3 threads, 0.63 MB |
+| Final still `render.png` | 1280×720, path tracer, 128 spp, 8 bounces, denoise, ACES, time limit 480 s | 371.8 s | **128 of 128 spp**, 3 render processes, 0.63 MB |
 | `contact_sheet.png` | 24 frames, 320×180 each, 6 columns, path tracer, 12 spp, denoise | 56.1 s | 24 frames, every frame at 12 spp, 1.04 MB |
 | `preview.gif` | 24 frames, 480×270, 10 fps, path tracer, 16 spp, denoise, Floyd–Steinberg dither | 288.7 s | 24 frames, every frame at 16 spp, 0.96 MB |
 | **Total** | | **719.7 s (12.0 min)** | |

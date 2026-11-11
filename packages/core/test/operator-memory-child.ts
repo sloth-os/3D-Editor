@@ -3,7 +3,8 @@
 // '#MARK before', runs, '#MARK done' and a JSON line; the parent reads the peak heap between the
 // marks from V8's GC lines.
 //   argv: <operator | 'decode' | 'curve'> <grid size n (scatter: instances)> <params JSON (curve: its data)>
-//         <'edit' | 'object' | 'scatter' | 'CURVE' | 'FONT'>
+//         <'edit' | 'object' | 'scatter' | 'import' | 'CURVE' | 'FONT'>
+//   import: the grid of n × n faces exported in the format of the import operator, imported from base64
 import v8 from 'node:v8';
 import { createEditorState, createOperatorRegistry, estimateOperator } from '../src/operators';
 import { selectAllElements } from '../src/mesh/selection';
@@ -12,6 +13,8 @@ import { decodeMesh, encodeMesh, peekMeshLayout } from '../src/mesh/codec';
 import { decodedMeshBytes } from '../src/mesh/memory';
 import { SceneDoc } from '../src/doc/scene-doc';
 import { SceneEvaluator, TEXT_BYTES_PER_CHARACTER, estimateCurveSurface, textGlyphCount } from '../src/eval';
+import { exportScene } from '../src/io';
+import { base64Encode } from '../src/util/json';
 
 const [op, nArg, paramsJson, mode] = process.argv.slice(2);
 const n = Number(nArg);
@@ -102,6 +105,7 @@ if (op === 'curve') {
   const reg = createOperatorRegistry();
   const state = createEditorState();
   const ctx = { doc, state, origin: { type: 'test' }, source: 'test' as const, report: () => undefined };
+  let paramsText = paramsJson;
   if (mode === 'scatter') {
     // n instances of a plane scattered over a ground plane (the pebble hidden in renders)
     for (const [id, params] of [
@@ -112,6 +116,13 @@ if (op === 'curve') {
       const r = reg.run(ctx, id, params);
       if (!r.ok) throw new Error(`${id}: ${r.error}`);
     }
+  } else if (mode === 'import') {
+    const source = SceneDoc.create({ empty: true });
+    const id = source.addMesh('Grid', createGrid({ x_subdivisions: n, y_subdivisions: n }));
+    source.addObject({ type: 'MESH', name: 'Grid', data: id });
+    const format = op.split('.')[1] as 'stl' | 'obj' | 'ply' | 'gltf';
+    const file = exportScene(source, format === 'gltf' ? 'glb' : format).data;
+    paramsText = JSON.stringify({ data_base64: base64Encode(file) });
   } else if (n > 0) {
     const meshId = doc.addMesh('Grid', createGrid({ x_subdivisions: n, y_subdivisions: n }));
     const id = doc.addObject({ type: 'MESH', name: 'Grid', data: meshId });
@@ -124,7 +135,7 @@ if (op === 'curve') {
       state.meshSelection = selectAllElements(mesh);
     }
   }
-  const params = JSON.parse(paramsJson || '{}') as Record<string, unknown>;
+  const params = JSON.parse(paramsText || '{}') as Record<string, unknown>;
   const estimate = estimateOperator(op, ctx, reg.parseParams(op, params));
   gc();
   gc();

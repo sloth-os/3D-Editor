@@ -183,6 +183,24 @@ function requestInfo(method: string, params: unknown, sentAt: number): RpcReques
   };
 }
 
+/** Whether `p` settles before `deadline` (a time in ms since the epoch), which it waits for at most. */
+export async function settlesBefore(p: Promise<unknown>, deadline: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
+    timer.unref?.();
+  });
+  const settled = p.then(
+    () => true,
+    () => true,
+  );
+  try {
+    return await Promise.race([settled, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * How {@link Room.deleteFromStorage} ended: storage deleted the project, or the deletion did not
  * start ('timed out': the room's earlier reads and writes of storage did not finish in time; 'storage
@@ -242,6 +260,8 @@ export class Room {
   /** Last known `project.json` content. */
   info: ProjectInfo | null;
   private dirty = false;
+  /** A save of changes is going on (see {@link hasUnsavedChanges}). */
+  private saving = false;
   /** See {@link needsReadBack}. */
   private unconfirmedWrite = false;
   /**
@@ -296,6 +316,14 @@ export class Room {
 
   get isDirty(): boolean {
     return this.dirty;
+  }
+
+  /**
+   * Whether the room has changes that storage may not hold: changes not saved yet (also after a
+   * save of them failed), or a save of them that has not finished.
+   */
+  get hasUnsavedChanges(): boolean {
+    return this.dirty || this.saving;
   }
 
   get peers(): number {
@@ -507,6 +535,7 @@ export class Room {
     if (!store || this.destroyed || this.removed || (!this.dirty && !refresh)) return;
     const wasDirty = this.dirty;
     this.dirty = false;
+    this.saving = wasDirty;
     this.firstDirtyAt = 0;
     const op = wasDirty ? 'save' : 'refresh';
     const { metrics, log } = this.deps;
@@ -579,6 +608,7 @@ export class Room {
         this.saveTimer.unref?.();
       } else this.dirty = true;
     } finally {
+      this.saving = false;
       end();
     }
   }
@@ -995,17 +1025,28 @@ export class Room {
 
   /**
    * Closes the room: optionally persists (a refresh when {@link needsReadBack}), disconnects every
-   * client with `code`, rejects pending RPCs and releases the document.
+   * client with `code`, rejects pending RPCs and releases the document. With `deadline` (ms since
+   * the epoch), it waits for storage until then at most: a save that has not finished by then goes
+   * on without the room (server shutdown, RoomManager.close). Resolves whether storage holds the
+   * room's changes as far as the room knows (false: a save failed or did not finish, see
+   * {@link hasUnsavedChanges}).
    */
-  async close(opts: { flush?: boolean; code?: number; reason?: string } = {}): Promise<void> {
-    if (this.destroyed) return;
-    if (opts.flush !== false) await (this.unconfirmedWrite ? this.refresh() : this.flush());
-    else {
+  async close(
+    opts: { flush?: boolean; code?: number; reason?: string; deadline?: number } = {},
+  ): Promise<boolean> {
+    if (this.destroyed) return !this.hasUnsavedChanges;
+    if (opts.flush !== false) {
+      const persisting = this.unconfirmedWrite ? this.refresh() : this.flush();
+      if (opts.deadline === undefined) await persisting;
+      else await settlesBefore(persisting, opts.deadline);
+    } else {
       if (this.saveTimer) clearTimeout(this.saveTimer);
       this.saveTimer = null;
-      await this.saveChain;
+      if (opts.deadline === undefined) await this.saveChain;
+      else await settlesBefore(this.saveChain, opts.deadline);
     }
-    if (this.destroyed) return;
+    const saved = !this.hasUnsavedChanges;
+    if (this.destroyed) return saved;
     this.destroyed = true;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = null;
@@ -1035,5 +1076,6 @@ export class Room {
     this.scene.destroy();
     this.awareness.destroy();
     this.doc.destroy();
+    return saved;
   }
 }

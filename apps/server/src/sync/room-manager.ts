@@ -1,5 +1,6 @@
 import * as Y from 'yjs';
 import {
+  IncompleteListingError,
   PROJECT_DELETED_CLOSE_CODE,
   SceneDoc,
   isValidProjectId,
@@ -11,7 +12,7 @@ import type { Persistence } from '../persistence';
 import type { ServerMetrics } from '../observability/metrics';
 import type { Log } from '../observability/log';
 import { errorMessage, withSpan } from '../observability/tracing';
-import { Room, STORAGE_ORIGIN, type DeletionOutcome, type ProjectListing } from './room';
+import { Room, STORAGE_ORIGIN, settlesBefore, type DeletionOutcome, type ProjectListing } from './room';
 
 export class StorageUnavailableError extends Error {
   constructor(message: string) {
@@ -44,9 +45,20 @@ export interface RoomManagerOptions {
    * each) must not hold up every request that opens a project.
    */
   openReadWaitMs?: number;
+  /**
+   * How long a shutdown ({@link RoomManager.close}) waits for storage to save the loaded projects
+   * (default {@link SHUTDOWN_SAVE_WAIT_MS}).
+   */
+  shutdownWaitMs?: number;
 }
 
 const TOMBSTONE_TTL_MS = 60 * 60 * 1000;
+/**
+ * How long a shutdown waits for storage to save the loaded projects, by default: Docker stops a
+ * container 10 s after SIGTERM, and main.ts exits by itself before that. Storage that does not
+ * answer (WebDAV: 30 s per request) used to hold the shutdown until main.ts gave up after 20 s.
+ */
+export const SHUTDOWN_SAVE_WAIT_MS = 7000;
 
 /**
  * A read of storage that goes on while the requests that wait for it answer without it after
@@ -62,24 +74,6 @@ interface StorageRead {
  * time (so that the request that resolves a project and the one that opens it read it once).
  */
 const UNUSED_ROOM_READ_MS = 2000;
-
-/** Whether `p` settles before `deadline` (a time in ms since the epoch), which it waits for at most. */
-async function settlesBefore(p: Promise<unknown>, deadline: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<boolean>((resolve) => {
-    timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
-    timer.unref?.();
-  });
-  const settled = p.then(
-    () => true,
-    () => true,
-  );
-  try {
-    return await Promise.race([settled, late]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 /**
  * Loads projects into memory on demand (from the persistence backend), keeps them while they
@@ -106,6 +100,8 @@ export class RoomManager {
   private sweeping = false;
   private refreshing = false;
   private closed = false;
+  /** The rooms that a shutdown is closing until it has said which stayed unsaved (see close). */
+  private closing: Room[] = [];
   private readonly closedListeners = new Set<(room: Room) => void>();
 
   constructor(private readonly opts: RoomManagerOptions) {
@@ -436,9 +432,10 @@ export class RoomManager {
 
   /**
    * The projects this server has loaded and lists (see {@link listProjects}) that are named `name`,
-   * ignoring letter case, as MCP tools match names.
+   * ignoring letter case, as MCP tools match names (AgentSession.resolveProjectId matches these
+   * before it lists storage).
    */
-  private loadedNamed(name: string): Room[] {
+  loadedNamed(name: string): Room[] {
     const key = name.toLowerCase();
     return this.all().filter(
       (room) =>
@@ -487,7 +484,14 @@ export class RoomManager {
     return room;
   }
 
-  /** Persisted projects merged with live rooms (most recently updated first). */
+  /**
+   * Persisted projects merged with live rooms (most recently updated first). When listing storage
+   * fails, the projects this server has loaded are listed; when only reading some project.json
+   * files fails (IncompleteListingError), the projects that were read are listed too: their names
+   * stay taken (project-names.ts) and tools find them by name (it used to list only the loaded ones
+   * then, so that one unreadable project.json hid every other project that is only in storage).
+   * Either way it logs 'listing projects failed' and counts a failed listing.
+   */
   async listProjects(): Promise<ProjectListing[]> {
     const byId = new Map<string, ProjectListing>();
     const store = this.store;
@@ -497,16 +501,26 @@ export class RoomManager {
       const { metrics } = this.opts;
       const end = metrics.persistenceDuration.startTimer({ op: 'list' });
       try {
-        const infos = await withSpan('persistence.list', {}, () => store.listProjects());
-        stored = new Set(infos.map((info) => info.id));
-        const deleted = await Promise.all(infos.map((info) => this.stillDeleted(info.id)));
-        infos.forEach((info, i) => {
-          if (!deleted[i]) byId.set(info.id, { ...info, peers: 0, live: false });
-        });
-        metrics.persistenceOps.inc({ op: 'list', status: 'ok' });
-      } catch (err) {
-        metrics.persistenceOps.inc({ op: 'list', status: 'error' });
-        this.opts.log.warn({ err: errorMessage(err) }, 'listing projects failed');
+        let infos: ProjectInfo[] | null = null;
+        try {
+          infos = await withSpan('persistence.list', {}, () => store.listProjects());
+          stored = new Set(infos.map((info) => info.id));
+          metrics.persistenceOps.inc({ op: 'list', status: 'ok' });
+        } catch (err) {
+          metrics.persistenceOps.inc({ op: 'list', status: 'error' });
+          this.opts.log.warn({ err: errorMessage(err) }, 'listing projects failed');
+          if (err instanceof IncompleteListingError) {
+            infos = err.listed;
+            // (storage lists those it could not read: none of them was deleted elsewhere)
+            stored = new Set([...infos.map((info) => info.id), ...err.unread]);
+          }
+        }
+        if (infos) {
+          const deleted = await Promise.all(infos.map((info) => this.stillDeleted(info.id)));
+          infos.forEach((info, i) => {
+            if (!deleted[i]) byId.set(info.id, { ...info, peers: 0, live: false });
+          });
+        }
       } finally {
         end();
       }
@@ -586,7 +600,16 @@ export class RoomManager {
     // (a load that started before the deletion: the ones asked for later wait for it, see open)
     const loading = this.loading.get(id);
     if (loading && !(await settlesBefore(loading, deadline))) throw this.notDeleted(id, null, 'timed out');
-    const existed = await this.found(id);
+    let existed: boolean;
+    try {
+      existed = await this.found(id);
+    } catch (err) {
+      // storage cannot tell whether the project exists (StorageUnavailableError): logged and
+      // counted as every failed deletion is, once (REST DELETE answers 503 without logging it again)
+      this.opts.metrics.persistenceOps.inc({ op: 'delete', status: 'error' });
+      this.opts.log.warn({ err: errorMessage(err), project: id }, 'deleting project failed');
+      throw err;
+    }
     const store = this.store;
     if (store && existed) await this.deleteStored(store, id, this.get(id), deadline);
     if (existed) this.tombstones.set(id, Date.now());
@@ -707,18 +730,53 @@ export class RoomManager {
     await Promise.all(this.all().map((r) => r.flush()));
   }
 
-  /** Persists and closes every room (server shutdown). */
+  /**
+   * The loaded projects with changes that storage may not hold (Room.hasUnsavedChanges), also those
+   * a shutdown is closing until it has said which stayed unsaved: main.ts names them when the
+   * shutdown runs out of time first.
+   */
+  unsaved(): { id: string; name: string }[] {
+    return [...this.rooms.values(), ...this.closing]
+      .filter((room) => room.hasUnsavedChanges)
+      .map((room) => ({ id: room.id, name: room.scene.name }));
+  }
+
+  /**
+   * Persists and closes every room (server shutdown). It waits for storage
+   * {@link RoomManagerOptions.shutdownWaitMs} at most, for loads and saves together: a room whose
+   * save failed or has not finished by then is closed without it, and the projects that stayed
+   * unsaved are logged at error ('projects not saved at shutdown', with their ids and names): their
+   * changes since their last save are lost.
+   */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.sweepTimer);
     if (this.refreshTimer) clearInterval(this.refreshTimer);
-    await Promise.allSettled([...this.loading.values()]);
+    const waitMs = this.opts.shutdownWaitMs ?? SHUTDOWN_SAVE_WAIT_MS;
+    const deadline = Date.now() + waitMs;
+    // (a load that finishes now adds no room, see load: it is waited for with the saves)
+    const loads = Promise.allSettled([...this.loading.values()]);
     const rooms = this.all();
     this.rooms.clear();
-    await Promise.allSettled(
-      rooms.map((r) => r.close({ flush: true, code: 1001, reason: 'server shutting down' })),
+    this.closing = rooms;
+    const names = rooms.map((room) => room.scene.name);
+    const saved = await Promise.all(
+      rooms.map((room) =>
+        room.close({ flush: true, code: 1001, reason: 'server shutting down', deadline }).catch(() => false),
+      ),
     );
+    await settlesBefore(loads, deadline);
+    this.closing = [];
     this.updateGauge();
+    const unsaved = rooms.flatMap((room, i) => (saved[i] ? [] : [{ id: room.id, name: names[i] }]));
+    if (unsaved.length > 0)
+      this.opts.log.error(
+        {
+          projects: unsaved,
+          reason: `storage did not save their changes within ${waitMs / 1000} s, or refused them: the changes since their last save are lost`,
+        },
+        'projects not saved at shutdown',
+      );
   }
 }

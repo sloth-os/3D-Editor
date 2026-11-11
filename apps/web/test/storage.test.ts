@@ -558,6 +558,19 @@ describe('WebDAV sync of a document without a name', () => {
     await sync.stop(false);
   });
 
+  it('reads no stored name for a document that has a name of its own', async () => {
+    const doc = new SceneDoc(new Y.Doc());
+    doc.setName('Own name');
+    doc.addObject({ type: 'EMPTY', name: 'Content' });
+    const { server, sync, written } = withStoredInfo(doc);
+    await sync.syncNow();
+    await sync.save();
+    expect(server.requests.filter((r) => r === `GET ${INFO}`)).toEqual([]);
+    expect(sync.storedName.value).toBeNull();
+    expect(written()).toBe('Own name');
+    await sync.stop(false);
+  });
+
   it('reads the stored name once, and again after a read that failed', async () => {
     const doc = new SceneDoc(new Y.Doc());
     const { server, sync } = withStoredInfo(doc);

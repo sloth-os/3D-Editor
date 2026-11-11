@@ -19,9 +19,9 @@ import { startServer, type TestServer } from '../helpers/app';
  * The server evaluates scenes in its own process (scene summaries, operators), where running out
  * of JavaScript heap stops the whole server: a Subdivision Surface whose result does not fit into
  * the server's free heap is skipped with an explained modifier error instead (get_scene reports
- * it, Apply refuses it), and the server keeps answering. The server's free heap is replaced by a
- * fixed 300 MB here, so that 1,000,000 faces (about 668 MB) do not fit, like 4,000,000 faces do not
- * with the real free heap of about 1.8 GB.
+ * it, Apply refuses it), and the server keeps answering. The server's heap is replaced by one of
+ * 1,024 MB with a fixed 300 MB free here, so that 1,000,000 faces (about 668 MB) do not fit, like
+ * 4,000,000 faces do not with the real free heap of about 1.8 GB.
  */
 
 let server: TestServer;
@@ -67,7 +67,9 @@ describe("evaluations in the server's process", () => {
   it('skip a modifier whose result does not fit into the free heap, with an explained error, and keep serving', async () => {
     // the server checks every modifier it evaluates against its own free heap
     expect(installed).toBeTypeOf('function');
-    setGeometryMemoryCheck(geometryCheck({ heapFree: () => 300 * MB, collect: () => undefined }));
+    setGeometryMemoryCheck(
+      geometryCheck({ heapFree: () => 300 * MB, collect: () => undefined, heapLimit: () => 1024 * MB }),
+    );
 
     const { id } = await ok('create_project', { name: 'terrain', empty: true });
     await ok('run_operator', {
@@ -103,7 +105,9 @@ describe("evaluations in the server's process", () => {
     // Apply computes the stack itself: refused the same way (here the operator's own estimate,
     // checked before it runs, is let through), the modifier stays
     expect(installedOperatorCheck).toBeTypeOf('function');
-    setOperatorMemoryCheck(operatorCheck({ heapFree: () => 4096 * MB, collect: () => undefined }));
+    setOperatorMemoryCheck(
+      operatorCheck({ heapFree: () => 4096 * MB, collect: () => undefined, heapLimit: () => 1024 * MB }),
+    );
     const applyArgs = { project: id, operator: 'object.modifier_apply', params: { modifier: 'Subdivision' } };
     const apply = await call('run_operator', applyArgs);
     expect(apply.isError).toBe(true);
@@ -112,7 +116,9 @@ describe("evaluations in the server's process", () => {
       code: 'OUT_OF_MEMORY',
     });
     // the operator's estimate refuses it before it runs when the free heap is that small
-    setOperatorMemoryCheck(operatorCheck({ heapFree: () => 300 * MB, collect: () => undefined }));
+    setOperatorMemoryCheck(
+      operatorCheck({ heapFree: () => 300 * MB, collect: () => undefined, heapLimit: () => 1024 * MB }),
+    );
     const refused = await call('run_operator', applyArgs);
     expect(refused.isError).toBe(true);
     expect(refused.content[0].text).toMatch(
@@ -121,7 +127,9 @@ describe("evaluations in the server's process", () => {
     expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
 
     // with room for it, the same evaluation runs (no result was kept from the refusal)
-    setGeometryMemoryCheck(geometryCheck({ heapFree: () => 2000 * MB, collect: () => undefined }));
+    setGeometryMemoryCheck(
+      geometryCheck({ heapFree: () => 2000 * MB, collect: () => undefined, heapLimit: () => 1024 * MB }),
+    );
     await ok('run_operator', {
       project: id,
       operator: 'object.modifier_set',
@@ -144,7 +152,9 @@ describe("stored meshes the server's process does not load", () => {
       params: { x_subdivisions: 100, y_subdivisions: 100 },
     });
     // a heap with 1 MB free above the reserve: the grid of 20,000 triangles (2 MB) is not decoded
-    setMeshMemoryCheck(decodeCheck({ heapFree: () => 257 * MB, collect: () => undefined }));
+    setMeshMemoryCheck(
+      decodeCheck({ heapFree: () => 257 * MB, collect: () => undefined, heapLimit: () => 1024 * MB }),
+    );
     try {
       const res = await call('get_mesh_data', { project: id, object: 'Grid' });
       expect(res.isError).toBe(true);
@@ -159,5 +169,82 @@ describe("stored meshes the server's process does not load", () => {
     expect((await ok('get_mesh_data', { project: id, object: 'Grid' })).totals).toMatchObject({
       faces: 10_000,
     });
+  });
+});
+
+describe('Edit Mode operators the server does not run', () => {
+  it('are refused before Edit Mode is entered and the elements are selected (edit_mesh, run_operator, batch)', async () => {
+    const { id } = await ok('create_project', { name: 'edit-early', empty: true });
+    await ok('run_operator', {
+      project: id,
+      operator: 'mesh.primitive_grid_add',
+      params: { x_subdivisions: 50, y_subdivisions: 50 },
+    });
+    // a check that refuses Subdivide and records what it is asked: entering Edit Mode would ask
+    // about object.mode_set first (and select the 2,500 faces) before the operator is checked
+    const asked: string[] = [];
+    setOperatorMemoryCheck((req) => {
+      asked.push(req.operator);
+      return req.operator === 'mesh.subdivide' ? `no room for ${req.estimate.faces} faces` : null;
+    });
+    try {
+      const edit = await call('edit_mesh', {
+        project: id,
+        object: 'Grid',
+        operator: 'mesh.subdivide',
+        params: { number_cuts: 1 },
+      });
+      expect(edit.isError).toBe(true);
+      const [first, ...rest] = edit.content[0].text!.split('\n');
+      expect(first).toBe('mesh.subdivide failed: no room for 10000 faces');
+      expect(JSON.parse(rest.join('\n'))).toMatchObject({
+        ok: false,
+        operator: 'mesh.subdivide',
+        error: 'no room for 10000 faces',
+        code: 'OUT_OF_MEMORY',
+        mesh: { vertices: 2601, faces: 2500, triangles: 5000 },
+        selection: { mode: 'OBJECT' },
+      });
+      expect(asked).toEqual(['mesh.subdivide']);
+
+      asked.length = 0;
+      const selection = { objects: ['Grid'], mode: 'EDIT', mesh: { faces: [0, 1, 2, 3] } };
+      const run = await call('run_operator', {
+        project: id,
+        operator: 'mesh.subdivide',
+        params: { number_cuts: 1 },
+        selection,
+      });
+      expect(run.isError).toBe(true);
+      // 2,500 faces, 4 of them selected and cut in four
+      expect(run.content[0].text!.split('\n')[0]).toBe('mesh.subdivide failed: no room for 2512 faces');
+      expect(JSON.parse(run.content[0].text!.split('\n').slice(1).join('\n'))).toMatchObject({
+        code: 'OUT_OF_MEMORY',
+        selection: { mode: 'OBJECT' },
+      });
+      expect(asked).toEqual(['mesh.subdivide']);
+
+      asked.length = 0;
+      const batch = await call('batch', {
+        project: id,
+        operations: [{ operator: 'mesh.subdivide', params: { number_cuts: 1 }, selection }],
+      });
+      expect(batch.isError).toBe(true);
+      expect(JSON.parse(batch.content[0].text!.split('\n').slice(1).join('\n')).results[0]).toEqual({
+        operator: 'mesh.subdivide',
+        ok: false,
+        error: 'no room for 2512 faces',
+        code: 'OUT_OF_MEMORY',
+      });
+      expect(asked).toEqual(['mesh.subdivide']);
+
+      // an operator that fits enters Edit Mode, and the registry checks it again with the selection
+      asked.length = 0;
+      const smooth = await ok('edit_mesh', { project: id, object: 'Grid', operator: 'mesh.vertices_smooth' });
+      expect(smooth.ok).toBe(true);
+      expect(asked).toEqual(['mesh.vertices_smooth', 'object.mode_set', 'mesh.vertices_smooth']);
+    } finally {
+      setOperatorMemoryCheck(installedOperatorCheck);
+    }
   });
 });

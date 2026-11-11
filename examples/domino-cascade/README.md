@@ -224,22 +224,22 @@ stops with an error on any tool error or failed check.
 | Mode | Stages | Writes |
 | --- | --- | --- |
 | `--final` (default) | scene, verify, animate, inspect, bake, still, sheet, gif | `render.png`, `contact_sheet.png`, `preview.gif` |
-| `--build-only` | scene, verify, animate, inspect, bake | inspection sheets only (≈ 20 s with one render thread) |
-| `--preview` | scene, verify, animate, bake, preview | 640 × 360 RASTER + 24 spp path-traced check images (≈ 40 s with one render thread) |
+| `--build-only` | scene, verify, animate, inspect, bake | inspection sheets only (≈ 20 s with one render process) |
+| `--preview` | scene, verify, animate, bake, preview | 640 × 360 RASTER + 24 spp path-traced check images (≈ 40 s with one render process) |
 | `--export-only` | scene, verify, animate, bake, export | `scene.glb` (≈ 15 s, no renders) |
 | `--stages=a,b,…` | any of the stages above | stages without `scene` work on the existing project, baked or not: `verify` then checks the keyframes and `bake` leaves a baked project alone (e.g. `--stages=verify`, `--stages=animate,still`) |
 
 Options: `--still-samples=N` / `--still-time=S` (default 256 spp / 450 s), `--frame=F` (still
 frame, default 55), `--draft` (low-sample still, sheet, GIF and export written to
 `$WORK_DIR/draft` instead of next to the script: a quick test of the whole pipeline, ≈ 3 min
-with one render thread). Environment: `MCP_URL`, `MCP_TOKEN`, `WORK_DIR` (inspection sheets and
+with one render process). Environment: `MCP_URL`, `MCP_TOKEN`, `WORK_DIR` (inspection sheets and
 `timings.json` with every render's samples, default `$TMPDIR/domino-cascade-work`),
 `PROJECT_NAME`.
 
 ## Final production run
 
 The committed outputs come from one run of `--final` on a fresh server with an empty data
-directory and 3 render threads, on 4 CPU cores shared with other agents' editor servers and
+directory and 3 render processes, on 4 CPU cores shared with other agents' editor servers and
 renders (load average 10–13 during the run), so the render times are pessimistic. The
 server was this repository's production build (`npm run build`; bundle of 2026-11-06 16:15 UTC,
 after commit `999b4dc`), started like `npm start`:

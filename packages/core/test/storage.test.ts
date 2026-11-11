@@ -112,6 +112,41 @@ describe('ProjectFileStore', () => {
       'could not read the project.json of 1 of 4 stored projects (GET /3d/projects/c/project.json failed: 503)',
     );
     expect((failure as IncompleteListingError).listed.map((p) => p.id)).toEqual(['b', 'a']);
+    expect((failure as IncompleteListingError).unread).toEqual(['c']);
+  });
+
+  /*
+   * A project.json that another program wrote (or someone by hand) without the fields the listing
+   * sorts by failed every listing ('Cannot read properties of undefined (reading localeCompare)'),
+   * and one holding JSON null listed a project without a name, which name lookups failed on.
+   */
+  it('lists a project.json without the fields it sorts by, and none that is not a JSON object', async () => {
+    const fs = new MemoryFileStore();
+    const store = new ProjectFileStore(fs, '/3d');
+    const write = (id: string, json: string) => fs.write(store.infoPath(id), new TextEncoder().encode(json));
+    await store.saveInfo({
+      id: 'full',
+      name: 'Full',
+      created_at: '2026-01-01',
+      updated_at: '2026-01-02',
+      schema_version: 1,
+    });
+    await write('bare', '{"name": "Bare"}');
+    await write('created', '{"created_at": "2026-01-03", "name": 7}');
+    await write('null', 'null');
+    await write('list', '[]');
+    await write('text', '"a project"');
+    const listed = await store.listProjects();
+    expect(listed.map((p) => [p.id, p.name, p.created_at, p.updated_at])).toEqual([
+      ['created', 'Untitled', '2026-01-03', '2026-01-03'],
+      ['full', 'Full', '2026-01-01', '2026-01-02'],
+      ['bare', 'Bare', '', ''],
+    ]);
+    // a project.json that is not a JSON object reads as an invalid one
+    await expect(store.loadInfo('null')).rejects.toThrow(SyntaxError);
+    await expect(store.loadInfo('list')).rejects.toThrow(
+      '/3d/projects/list/project.json is not a JSON object',
+    );
   });
 });
 

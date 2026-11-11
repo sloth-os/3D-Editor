@@ -26,7 +26,7 @@ import {
 } from '../../src/mcp/rendering';
 import { RpcError, type Room, type RpcAnswer, type SyncConnection } from '../../src/sync/room';
 import { MAX_EDITOR_TIMEOUT_MS, MAX_EDITOR_WAIT_MS } from '../../src/mcp/editor-commands';
-import { BROWSER_RASTER_SECONDS, measured } from '../../src/mcp/editor-costs';
+import { BROWSER_RASTER_SECONDS, measuredBrowserImages } from '../../src/mcp/editor-costs';
 
 /*
  * render_image waits for a browser editor's image: long enough for heavy scenes in software WebGL
@@ -62,7 +62,7 @@ describe('browser render timeouts', () => {
     // what such an editor took for its images (editor-costs.ts), not 'tens of seconds' without a range
     expect(browser.advice).toBe(
       'It may still be drawing it, and its next renders and commands wait until it has. An editor without GPU ' +
-        `acceleration (e.g. a headless browser) took ${measured(BROWSER_RASTER_SECONDS)}, and ` +
+        `acceleration (e.g. a headless browser) took ${measuredBrowserImages(BROWSER_RASTER_SECONDS)}, and ` +
         "longer for heavier scenes: render on the server with renderer 'software' (or 'auto'), render a smaller " +
         "image, or pass shading 'SOLID' (grey clay, faster).",
     );

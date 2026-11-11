@@ -143,7 +143,7 @@ fails:
 
 `--export-only` rebuilds and verifies the scene and writes `scene.glb` with
 `export_scene {format: 'glb', frame: 1, bake_resolution: 512}`: 4.16 MB (4,159,296 bytes),
-exported in 6.1 s on a server with two render threads.
+exported in 6.1 s on a server with two render processes.
 
 - **Nodes:** 81, one per object (at its frame-1 pose) plus the four bones J1_Base … J4_Wrist,
   with the bone-parented robot parts under their bones. 69 meshes in 79 primitives (one per
@@ -239,7 +239,7 @@ constraints, the shape key and the driver in the web editor.
 ## Final production run
 
 `render.png`, `contact_sheet.png` and `preview.gif` come from a single default-mode run (no flag)
-on a fresh server with an empty data directory and 3 render threads. The same run shows that the
+on a fresh server with an empty data directory and 3 render processes. The same run shows that the
 project rebuilds from scratch. The server was this repository's production build
 (`npm run build`; bundle of 2026-11-06 16:15 UTC, after commit `999b4dc`), started like
 `npm start`:

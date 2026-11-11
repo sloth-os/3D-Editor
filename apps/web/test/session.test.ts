@@ -621,6 +621,37 @@ describe('ProjectSession of a project whose document has no name', () => {
     await s.close(false);
   });
 
+  /*
+   * The stored name is the document's name only while the document has none: an answer of the
+   * server that arrives after the document got a name of its own (a rename here, or one that synced
+   * in) is not taken.
+   */
+  it('takes no stored name that arrives after the document got a name of its own', async () => {
+    withSyncServer();
+    let answer!: () => void;
+    const answered = new Promise<void>((resolve) => (answer = resolve));
+    let asked = 0;
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (!url.endsWith('/api/projects/proj-named-meanwhile')) return new Response(null, { status: 404 });
+      asked++;
+      await answered;
+      return Response.json({ id: 'proj-named-meanwhile', name: 'Stored name' });
+    });
+    const opening = ProjectSession.open('proj-named-meanwhile');
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(1));
+    FakeSocket.created[0].receive(
+      encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep2(enc, new Y.Doc())),
+    );
+    const s = await opening;
+    await vi.waitFor(() => expect(asked).toBe(1));
+    s.doc.setName('Named here');
+    answer();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(s.storedName.value).toBeNull();
+    expect(s.title.value).toBe('Named here');
+    await s.close(false);
+  });
+
   it('shows the name the server lists in the Scene tab and the names of files', async () => {
     withSyncServer();
     vi.stubGlobal('fetch', async (url: string) =>

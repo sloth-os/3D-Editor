@@ -8,7 +8,7 @@ import { errorMessage } from '../observability/tracing';
 import { RpcError, type Room, type RpcAnswer, type SyncConnection } from '../sync/room';
 import { ToolError } from './agent';
 import { MAX_EDITOR_WAIT_MS } from './editor-commands';
-import { BROWSER_RASTER_SECONDS, measured } from './editor-costs';
+import { BROWSER_RASTER_SECONDS, measuredBrowserImages } from './editor-costs';
 
 /*
  * Shared pieces of the rendering tools (render_image, render_animation): option schemas,
@@ -35,7 +35,7 @@ export const MAX_RENDER_FRAMES = 1000;
  * on a calm machine with 4 CPUs (editor-costs.ts BROWSER_RASTER_SECONDS, which says how its ranges
  * were made): the first image of a 71-material scene, as it built and compiled the materials, took
  * the longest, the next ones less, and images of 4 million triangles a few seconds; on a busy
- * machine up to BUSY_FACTOR times as long. Under the 60 s default request timeout of MCP clients
+ * machine up to BROWSER_BUSY_FACTOR times as long. Under the 60 s default request timeout of MCP clients
  * (see {@link MAX_EDITOR_WAIT_MS}).
  */
 export const BROWSER_RASTER_TIMEOUT_MS = MAX_EDITOR_WAIT_MS;
@@ -218,7 +218,7 @@ export function browserRenderFailure(err: unknown, r: BrowserRender): { reason: 
     reason: `browser render failed: the editor did not finish the RASTER image within ${seconds} s${busy}`,
     advice:
       'It may still be drawing it, and its next renders and commands wait until it has. An editor without GPU ' +
-      `acceleration (e.g. a headless browser) took ${measured(BROWSER_RASTER_SECONDS)}, and ` +
+      `acceleration (e.g. a headless browser) took ${measuredBrowserImages(BROWSER_RASTER_SECONDS)}, and ` +
       'longer for heavier scenes: ' +
       (r.shading === 'SOLID'
         ? "render on the server with renderer 'software' (or 'auto') or render a smaller image."

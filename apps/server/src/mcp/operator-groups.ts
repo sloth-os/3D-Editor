@@ -344,8 +344,10 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
       'it makes that editor store its copy in WebDAV at once if it syncs with WebDAV (its copy in the browser is ' +
       "always up to date) and shows the person what happened: 'Saved to WebDAV', 'Saved in this browser' (no " +
       "WebDAV), 'Not saved to WebDAV (<reason>). The project is saved in this browser.', or that it syncs once " +
-      'back online; a project that the server or another device had deleted is stored there again (\'"<name>" ' +
-      "was deleted on the server; this browser stored it there again.')",
+      'back online; with WebDAV, a project that the server or another device had deleted is stored there again ' +
+      '(for example \'"<name>" was deleted on the server; this browser stored it there again.\'). It also connects that ' +
+      'editor to the server again, which closes the connection again while the server has the project deleted ' +
+      '(within an hour of deleting it, unless storage holds it again)',
   },
   'view3d.view_all': {
     editor:

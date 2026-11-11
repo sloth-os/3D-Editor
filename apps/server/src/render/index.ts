@@ -221,6 +221,8 @@ export interface RendererOptions {
   heapFree?: () => number;
   /** Runs a full garbage collection before a render is refused (default: memory.ts `collectGarbage`). */
   collectGarbage?: () => unknown;
+  /** The JavaScript heap limit of the server's process in bytes (default: from V8). */
+  heapLimit?: () => number;
 }
 
 /** Renders scenes on a {@link RenderPool}. */
@@ -229,6 +231,7 @@ export class Renderer {
   private readonly pathtraceSlots = new Semaphore(MAX_CONCURRENT_PATHTRACE);
   private readonly heapFree: () => number;
   private readonly collectGarbage: () => unknown;
+  private readonly heapLimit: (() => number) | undefined;
 
   constructor(
     readonly pool: RenderPool,
@@ -236,6 +239,7 @@ export class Renderer {
   ) {
     this.heapFree = opts.heapFree ?? freeHeapBytes;
     this.collectGarbage = opts.collectGarbage ?? collectGarbage;
+    this.heapLimit = opts.heapLimit;
   }
 
   /**
@@ -250,7 +254,7 @@ export class Renderer {
     what: 'render' | 'export' = 'render',
   ): void {
     if (threads.some((t) => t.kind === 'main'))
-      checkMainThreadRender(scene, this.heapFree, this.collectGarbage, what);
+      checkMainThreadRender(scene, this.heapFree, this.collectGarbage, what, this.heapLimit);
   }
 
   /**

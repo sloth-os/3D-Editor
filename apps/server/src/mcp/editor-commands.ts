@@ -3,7 +3,7 @@ import type { LateRpc } from '../sync/room';
 import { ToolError } from './agent';
 import {
   FIRST_SHADING_SECONDS,
-  MEASURED_NOTE,
+  measuredNote,
   MILLIONS_SELECT_SECONDS,
   MILLIONS_SOLID_SECONDS,
   NEW_SHADER_SECONDS,
@@ -179,9 +179,10 @@ export function describeLateRpcs(late: readonly LateRpc[], now = Date.now()): st
  * to SOLID says that it helps only when the viewport is not in SOLID shading.
  *
  * The times come from editor-costs.ts (its header says how they were measured and made: calm runs of
- * four agents in headless Chromium with software WebGL, pooled, widened by MARGIN_PERCENT; on a
+ * nine agents in headless Chromium with software WebGL, pooled, widened by MARGIN_PERCENT, the
+ * longest select and SOLID screenshot with 4 million triangles by MILLIONS_MARGIN_PERCENT; on a
  * machine kept busy by other processes the same steps took up to BUSY_FACTOR times as long, which
- * the messages say with {@link MEASURED_NOTE}). The first screenshot or viewport frame in MATERIAL
+ * the messages say with {@link measuredNote}). The first screenshot or viewport frame in MATERIAL
  * or RENDERED shading after the editor opened the project builds and compiles that shading's
  * materials ({@link FIRST_SHADING_SECONDS} for a scene of 81 objects and 71 materials, the scene of
  * the measurements); the editor keeps them (apps/web scene-objects.ts ObjectView.materialSets), so
@@ -207,7 +208,9 @@ export function describeLateRpcs(late: readonly LateRpc[], now = Date.now()): st
  * without multisampling) a SOLID screenshot took {@link MILLIONS_SOLID_SECONDS}, later screenshots in
  * the other shadings about as long or longer, the first one in WIREFRAME, MATERIAL or RENDERED
  * shading seconds longer (the first WIREFRAME one several times as long, while the editor builds
- * the wires of every mesh), and a select {@link MILLIONS_SELECT_SECONDS}. On the server,
+ * the wires of every mesh), and a select {@link MILLIONS_SELECT_SECONDS}; a SOLID screenshot sent as
+ * soon as a select had answered, and a select sent as soon as a screenshot had answered, wait for the
+ * frame the viewport draws then, and these ranges include them. On the server,
  * grey clay (render_image with shading 'SOLID' and renderer 'software', the remedy of SOLID and
  * WIREFRAME screenshots, and the quick look of the others while the editor is busy or for a
  * PATHTRACER scene) took {@link SERVER_SOLID_SECONDS} in a render process; a render that runs out of
@@ -283,7 +286,7 @@ export function editorTimeoutMessage(
     // DEFAULT_IMAGE_TIME_LIMIT, 30 s)
     if (shading === 'SOLID' || shading === 'WIREFRAME')
       return (
-        `${head} An editor ${noGpu} takes about a second or more per screenshot of a scene with ` +
+        `${head} An editor ${noGpu} takes half a second or more per screenshot of a scene with ` +
         `millions of triangles even in ${shading} shading, ${wires}, and a screenshot waits until the ` +
         'frame its viewport is drawing is done. In MATERIAL or RENDERED shading that frame compiles ' +
         'shaders the first time after the editor opened the project ' +
@@ -297,7 +300,7 @@ export function editorTimeoutMessage(
             `rendered on the server: ${SERVER_SOLID_SECONDS}; ${tooLarge}).`,
           { retry: true, atMaxFirst: 'retry or ' },
         ) +
-        ` ${MEASURED_NOTE}`
+        ` ${measuredNote()}`
       );
     if (shading)
       return (
@@ -309,18 +312,18 @@ export function editorTimeoutMessage(
         '. ' +
         `${edited(`${shading} screenshot or viewport frame`)} ${kept} ` +
         remedy(solid, { retry: true, atMaxFirst: 'retry or ' }) +
-        ` ${MEASURED_NOTE}`
+        ` ${measuredNote()}`
       );
     return (
       `${head} The screenshot is drawn in the viewport's shading, like a frame of the viewport. An editor ` +
-      `${noGpu} takes about a second or more for that with a scene of millions of triangles in any ` +
+      `${noGpu} takes half a second or more for that with a scene of millions of triangles in any ` +
       `shading (${MILLIONS_SOLID_SECONDS} in SOLID with 4 million), ${wires}, seconds with a heavy ` +
       'scene in MATERIAL or RENDERED shading, and ' +
       first('its first screenshot or frame in one of these two after it opened the project', 'that shading') +
       '. ' +
       `${edited('screenshot or frame in each of these two')} ${kept} ` +
       remedy(solid, { retry: true, atMaxFirst: 'retry or ' }) +
-      ` ${MEASURED_NOTE}`
+      ` ${measuredNote('SOLID screenshot')}`
     );
   }
   // the server cannot know the viewport's shading: switching to SOLID helps only when it is not
@@ -336,7 +339,7 @@ export function editorTimeoutMessage(
     (atMax
       ? `With timeout_ms at its maximum (${MAX_EDITOR_TIMEOUT_MS}), retry, or, ${toSolid}`
       : `Pass a larger timeout_ms (at most ${MAX_EDITOR_TIMEOUT_MS}), or, ${toSolid}`) +
-    ` ${MEASURED_NOTE}`
+    ` ${measuredNote('select')}`
   );
 }
 

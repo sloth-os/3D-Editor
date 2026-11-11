@@ -503,7 +503,13 @@ export function applyModifier(
         'object.modifier_apply',
         buildParams(names, { objectId: object.id, modifierRef: mod.name }),
       );
-      if (!res.ok) throw new ToolError(`object.modifier_apply failed: ${res.error}`);
+      // an apply refused for memory carries its code, as in run_operator (the tool wrapper prints it
+      // as JSON after the message)
+      if (!res.ok)
+        throw new ToolError(
+          `object.modifier_apply failed: ${res.error}`,
+          res.code === 'OUT_OF_MEMORY' ? 'OUT_OF_MEMORY' : undefined,
+        );
       if (!p.scene.getObject(object.id)?.modifiers.some((m) => m.id === mod.id))
         return { modifier: mod, via: 'operator' };
     }

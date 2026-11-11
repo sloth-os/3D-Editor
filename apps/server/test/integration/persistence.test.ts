@@ -238,11 +238,15 @@ describe('WebDAV persistence', () => {
     });
     cleanup.push(() => refusing.stop());
     await mkcolPath(refusing, '/files/alice');
-    const server = await startServer({
-      WEBDAV_URL: `${refusing.origin}/files/alice`,
-      WEBDAV_USERNAME: refusing.username,
-      WEBDAV_PASSWORD: refusing.password,
-    });
+    const logged: { level: number; msg: string }[] = [];
+    const server = await startServer(
+      {
+        WEBDAV_URL: `${refusing.origin}/files/alice`,
+        WEBDAV_USERNAME: refusing.username,
+        WEBDAV_PASSWORD: refusing.password,
+      },
+      { logger: { level: 'warn', stream: { write: (line: string) => logged.push(JSON.parse(line)) } } },
+    );
     cleanup.push(
       () => server.cleanup(),
       () => server.close(),
@@ -255,10 +259,15 @@ describe('WebDAV persistence', () => {
 
     refuseDeletion = true;
     const refused = await api(server.url, `/api/projects/${id}`, { method: 'DELETE' });
-    expect(refused.status).toBe(500);
-    expect(refused.body.message).toBe(
-      `could not delete project ${id} from storage (fetch failed); the project stays open on this server for its editors and agents, and storage may still hold all or part of it: delete it again`,
-    );
+    // like the GET routes when storage fails: 503 with the reason (it was Fastify's 500 for any
+    // error, which logged the failure a second time)
+    expect(refused.status).toBe(503);
+    expect(refused.body).toEqual({
+      error: `could not delete project ${id} from storage (fetch failed); the project stays open on this server for its editors and agents, and storage may still hold all or part of it: delete it again`,
+    });
+    expect(logged.filter((l) => l.msg !== 'request completed').map((l) => l.msg)).toEqual([
+      'deleting project failed',
+    ]);
     await sleep(200);
     expect(c.closeCode).toBeNull();
     expect(c.connected).toBe(true);

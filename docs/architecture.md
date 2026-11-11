@@ -338,7 +338,8 @@ the event loop:
   a single "thread" runs the same engine on the server's main thread between event loop turns, in
   the server's own heap, where running out of memory stops the server. There a render or export is
   refused with a `RenderOutOfMemoryError` before it starts when its estimated heap need does not fit
-  into the free heap with 256 MB left over (after a full garbage collection). The estimate
+  into the free heap with the reserve left over (below: a quarter of the heap, at least 256 MB).
+  The estimate
   (`memory.ts`) needs no evaluation: 320 bytes per triangle of the meshes shown in renders, from
   their stored counts (307 measured for a raster or path-traced render of a grid of 980,000
   triangles, decoded mesh included), plus the peak heap of their modifiers (the estimates below)
@@ -381,14 +382,29 @@ the event loop:
   per face of its result (Subdivision Surface 700 bytes, Array 400, Mirror 1500 with merging,
   Solidify 1100, Wireframe 600, Triangulate 550) or of its input (Bevel 2800, Edge Split 2600,
   Smooth 1600, Weld 700, deform modifiers 400–600, Decimate 6500), measured on grids, and a
-  modifier that does not fit into the free heap with 256 MB left over, after a full garbage
-  collection, is skipped with the error
+  modifier that does not fit into the free heap with the reserve left over is skipped with the
+  error
   `skipped on the server: this Subdivision Surface would need about … MB of JavaScript heap for a result of about … faces …`
   (scene summaries list it with the RENDER evaluation's problems; Apply fails with it). A 125 × 125 grid with Subdivision Surface
   levels 4 (4,000,000 faces, about 2,670 MB estimated, 2.4 GB measured) used to stop the server
   from one `get_scene`; now `get_scene` answers in 1.8 s (server 363 MB RSS) and
   `object.modifier_apply` fails with that error. A grid of 2,000,012 triangles with a default
   Subdivision Surface: `get_scene` in 6.7 s, the server at 952 MB.
+- **The reserve.** Every check in the server's process keeps a quarter of its heap free for the rest
+  of the server, at least 256 MB (`serverHeapReserve` in the server's `render/memory.ts`: 524 MB of
+  Node's default 2,096 MB heap). The heap in use counts garbage, so before a check refuses it runs a
+  full garbage collection and measures again: at most one a second, or one per four times the last
+  one's duration when that is longer, and none for a request larger than the heap less the reserve
+  (`collectGarbage`). V8 ends a process (`FATAL ERROR: Ineffective mark-compacts near heap limit`)
+  when four full collections in a row leave its old generation at 80% of its limit or more while the
+  program ran less than 40% of the time between them. With 256 MB kept, decoded meshes filled Node's
+  default heap to 88%, and one forced collection per refusal ended the server after six refusals in
+  a row: during the first `get_scene` of a project of seven stored grids of 1,000,000 faces and
+  twenty of 40,000 faces, or when an agent asked `get_object` again and again about a grid that was
+  not loaded. Now that `get_scene` answers in 7.8 s (10 meshes not loaded; 1.2 and 1.7 s the next
+  times; three forced collections in all, after which 1,565 MB of the heap were in use, 76% of the
+  old generation's limit), and eight `get_object` calls about a mesh that was not loaded answer in
+  4–17 ms each.
 - **Operators in the server's process.** Before an operator runs there (MCP tools, the REST API),
   the registry asks the server's check (core `operators/memory.ts`, `setOperatorMemoryCheck`) with
   the operator's estimated peak heap, from its parameters and the size of its input: in Edit Mode
@@ -415,25 +431,36 @@ the event loop:
   with `linked: false` count the meshes their copies add. The numbers are the peak heap of
   `--trace-gc`, garbage included, on grids of growing size, rounded up; the operators that cannot
   multiply geometry, or are bounded by limits of their own, are listed with the reason
-  (`UNESTIMATED_OPERATORS`, a test keeps the list complete). An operator
-  that does not fit into the free heap with 256 MB left over, after a full garbage collection,
-  fails with code `OUT_OF_MEMORY` and
-  `not run on the server: it would need about … MB of JavaScript heap for a mesh of about … faces, and the server's process has … MB of its … MB heap free and keeps 256 MB of it for its other work. Lower … to run it on the server (a browser editor runs it in its own memory)`.
+  (`UNESTIMATED_OPERATORS`, a test keeps the list complete). An operator that does not fit into
+  the free heap with the reserve left over fails with code `OUT_OF_MEMORY` and
+  `not run on the server: it would need about … MB of JavaScript heap for a mesh of about … faces, and the server's process has … MB of its … MB heap free and keeps … MB of it for its other work. Lower … to run it on the server (a browser editor runs it in its own memory)`.
   One that adds geometry also fails when the project's meshes would then take more than half of the
-  heap less those 256 MB decoded (920 MB with the default heap: about 7.8 million triangles of grids
+  heap less the reserve decoded (786 MB with the default heap: about 6.6 million triangles of grids
   with UVs at 124 bytes each):
   `not run on the server: the project's meshes would then take about … MB of JavaScript heap decoded (now … MB), more than the … MB the server's process keeps for the meshes of one project …`.
-  `edit_mesh mesh.subdivide {number_cuts: 1}` on a grid of 1,000,000 faces used to end the server
-  after about 67 s; now it fails that way after 5.4 s (selecting the million faces), the server at
-  1,398 MB of memory (RSS) at most. Joining 40 linked duplicates of a grid of 250,000 faces used to
-  end the server after 20.7 s, and an OBJ export of 5,000 particle instances of a sphere of 1,280
-  faces after 42 s; now the join fails in 11 ms (the project's meshes would take 2,366 MB) and the
-  export in 28 ms (6,400,001 faces, 11,028 MB estimated), the server at 353 MB and 183 MB (RSS) at
-  most. Browser editors and render processes run operators without a check.
+  An operator in Edit Mode (`edit_mesh`, and `run_operator` or `batch` with a selection in mode
+  `EDIT`) is checked before Edit Mode is entered and its selection built, from the stored counts of
+  the mesh and the size of the selection (the elements listed, or all of them), and again in Edit
+  Mode. `edit_mesh mesh.subdivide {number_cuts: 1}` on a grid of 1,000,000 faces used to end the
+  server after about 67 s, and then failed after 5.4 s, the time Edit Mode and the selection of the
+  million faces took; now `mesh.subdivide {number_cuts: 2}` and an extrude of all its faces fail in
+  5–13 ms through each of the three tools, the server at 681 MB of memory (RSS) at most. MCP
+  `import_model` asks the same check before the import starts: a binary STL by the triangles its
+  header declares (700 bytes each, 406–527 measured, and the mesh decoded), other files by their
+  size (26 bytes per byte of the file, 3–25 measured, and 10 per byte for the meshes they add). With
+  six grids of 1,000,000 faces decoded, importing a binary STL of 980,000 triangles (49 MB) fails in
+  0.25 s with
+  `Import failed: not run on the server: it would need about 843 MB of JavaScript heap …` and code
+  `OUT_OF_MEMORY`; on a server with nothing else open it runs in 8.7 s (940 MB RSS at most). Joining
+  40 linked duplicates of a grid of 250,000 faces used to end the server after 20.7 s, and an OBJ
+  export of 5,000 particle instances of a sphere of 1,280 faces after 42 s; now the join fails in
+  11 ms (the project's meshes would take 2,366 MB) and the export in 28 ms (6,400,001 faces,
+  11,028 MB estimated), the server at 353 MB and 183 MB (RSS) at most. Browser editors and render
+  processes run operators without a check.
 - **Stored meshes in the server's process.** The open projects keep their meshes decoded
   (`SceneDoc.getMesh`: 24 bytes per vertex, 72 per face and 8 per corner, with UVs 56 more per face
   and 16 per corner, core `mesh/memory.ts`). Decoding one asks the server's check first; a mesh
-  that does not fit into the free heap with 256 MB left over is not loaded:
+  that does not fit into the free heap with the reserve left over is not loaded:
   `this mesh of … triangles was not loaded on the server: decoding it needs about … MB of JavaScript heap, …`.
   `get_scene` then lists its stored counts with that reason (`not_loaded`, and among the problems),
   operators on it fail with code `OUT_OF_MEMORY`, other tools with the reason and that code.
@@ -449,7 +476,7 @@ the event loop:
   gets (`curve/to-mesh.ts`); text at least 64,000 bytes per character with a glyph. Peaks measured
   with `--trace-gc` per vertex: 260–300 bytes on smooth sweeps of 0.8 to 2.9 million vertices,
   up to 463 where every sample is a sharp corner; per sample 860–870 on wires of 100,000 and
-  250,000 samples. A surface that does not fit into the free heap with 256 MB left over is not
+  250,000 samples. A surface that does not fit into the free heap with the reserve left over is not
   built, nor its wire:
   `skipped on the server: this curve surface would need about … MB of JavaScript heap for a result of about … faces, … Lower resolution_u, bevel_resolution or the number of spline points to evaluate it on the server (a browser editor evaluates it itself)`
   (text: `this text surface`, `Lower the length of the text or resolution_u …`). `get_scene` lists
@@ -462,12 +489,14 @@ the event loop:
   size at the peak (a grid of 640,000 faces; 2.95 times when the meshes were not decoded yet). The
   server estimates the copy plus at most 307 characters of JSON per face of a grid (230 measured)
   and the base64 of shape keys, vertex groups and images; when that bound is over the 512 MB a
-  JavaScript string can hold, it counts the characters of the meshes' values instead (0.7 s for a
-  grid of 1,000,000 faces, within 30 characters of the JSON). It answers 507 with code
-  `OUT_OF_MEMORY` when the copy and the JSON do not fit into the free heap with 256 MB left over,
-  or when the JSON is longer than a string can be:
+  JavaScript string can hold, it counts the characters of the meshes' values instead (0.55–0.64 s
+  for a grid of 1,000,000 faces with UVs, within 30 characters of the JSON), and stops counting at
+  the first part of a mesh (positions, faces, UVs …) that takes the count past that limit, so the
+  time no longer grows with the number of meshes. It answers 507 with code `OUT_OF_MEMORY` when the
+  copy and the JSON do not fit into the free heap with the reserve left over, or when the JSON is
+  longer than a string can be:
   `snapshot failed: not built on the server: it would need about … MB of JavaScript heap (a copy of the meshes and up to … MB of JSON), …`
-  or `… the snapshot would be … MB of JSON, more than the 512 MB a JavaScript string can hold. …`.
+  or `… the snapshot would be more than the 512 MB of JSON a JavaScript string can hold. …`.
   Three grids of 291,600 faces used to end a server with a 640 MB heap; now the snapshot is
   refused in 0.1 s and the server keeps answering.
 
@@ -521,22 +550,31 @@ and the timeout. `RoomManager.exists` throws `StorageUnavailableError` when stor
 whether a project that is not loaded exists (it used to answer no), unless the id is also the name
 of a loaded project: then storage that fails, or does not answer within 5 s, makes it answer no, so
 that MCP tools, which ask about a reference as an id first (`AgentSession.resolveProjectId`), find
-that project by its name. `RoomManager.deleteProject` deletes the stored files between the room's
-saves (`Room.deleteFromStorage`: the room writes nothing once storage deleted the project) and
-closes the room only then; when storage fails to delete it, the room goes on serving. It waits for
-the project's earlier reads and writes of storage (a load, the room's queue of reads and writes) 5 s
-at most in all, and not at all while a read that a request stopped waiting for goes on
-(`Room.storageLate`); when they have not finished, it deletes nothing. It runs one deletion of a
-project at a time, and loads of the project wait for it. The sync server closes connections to a
-deleted project with code 4404 (`PROJECT_DELETED_CLOSE_CODE`, `packages/core/src/sync/protocol.ts`),
-after which the browser's `SyncProvider` (`apps/web/src/sync/provider.ts`) no longer reconnects by
-itself (status `deleted`, which the status bar shows as `Deleted on server`); with WebDAV through
-the server, `ProjectSession` connects it again once a WebDAV sync finds the project stored there
-again. Save (Ctrl+S) shows what `WebDAVSync.save` reports. A room of a project that has a
-`project.json` and no document writes no name into its new document (a new name item could win over
-a browser's rename when the two merge); its scene (`RoomScene`) has the stored name, and so does a
-browser's (`SessionScene`), which takes it from the server or WebDAV (`ProjectSession.storedName`)
-until the document has a name.
+that project by its name; `resolveProjectId` then matches the names of the loaded projects
+(`RoomManager.loadedNamed`) before it lists storage, and says when that listing failed or was
+partial (`listProjects` in `apps/server/src/mcp/project-storage.ts`).
+`ProjectFileStore.listProjects` throws `IncompleteListingError`, with the projects it read
+(`listed`) and the ids it could not read (`unread`), when reading some `project.json` files fails;
+`RoomManager.listProjects` lists the projects it read, so their names stay taken
+(`apps/server/src/sync/project-names.ts`). `RoomManager.deleteProject` deletes the stored files
+between the room's saves (`Room.deleteFromStorage`: the room writes nothing once storage deleted the
+project) and closes the room only then; when storage fails to delete it, the room goes on serving.
+It waits for the project's earlier reads and writes of storage (a load, the room's queue of reads
+and writes) 5 s at most in all, and not at all while a read that a request stopped waiting for goes
+on (`Room.storageLate`); when they have not finished, it deletes nothing. It runs one deletion of a
+project at a time, and loads of the project wait for it; a failed deletion is logged once, and REST
+`DELETE` answers 503 with `{error}`. At shutdown `RoomManager.close` waits `shutdownWaitMs` (7 s) at
+most for storage and logs the projects that stayed unsaved (`Room.hasUnsavedChanges`);
+`apps/server/src/main.ts` exits 9 s after SIGTERM at the latest and names those it finds unsaved
+then (`RoomManager.unsaved`). The sync server closes connections to a deleted project with code 4404
+(`PROJECT_DELETED_CLOSE_CODE`, `packages/core/src/sync/protocol.ts`), after which the browser's
+`SyncProvider` (`apps/web/src/sync/provider.ts`) no longer reconnects by itself (status `deleted`,
+which the status bar shows as `Deleted on server`); with WebDAV through the server, `ProjectSession`
+connects it again once a WebDAV sync finds the project stored there again. Save (Ctrl+S) shows what
+`WebDAVSync.save` reports. A room of a project that has a `project.json` and no document writes no
+name into its new document (a new name item could win over a browser's rename when the two merge);
+its scene (`RoomScene`) has the stored name, and so does a browser's (`SessionScene`), which takes
+it from the server or WebDAV (`ProjectSession.storedName`) until the document has a name.
 
 ## Observability
 

@@ -10,6 +10,7 @@ import {
   type WriteOptions,
 } from '@3d-editor/core';
 import { RoomManager } from '../../src/sync/room-manager';
+import { ProjectNameTakenError, requireFreeProjectName } from '../../src/sync/project-names';
 import { readBeforeAnswer } from '../../src/mcp/project-storage';
 import { ServerMetrics } from '../../src/observability/metrics';
 import { silentLog, type Log } from '../../src/observability/log';
@@ -136,10 +137,61 @@ class ReadFailStore extends MemoryFileStore {
   }
 }
 
+/**
+ * MemoryFileStore in which reading some files fails (a file the server may not read: 403), and
+ * whose ETag requests are recorded.
+ */
+class FileFailStore extends MemoryFileStore {
+  readonly failing = new Set<string>();
+  readonly etags: string[] = [];
+  override async read(path: string) {
+    if (this.failing.has(path)) throw new Error('403 Forbidden');
+    return super.read(path);
+  }
+  override async etag(path: string) {
+    this.etags.push(path);
+    return super.etag(path);
+  }
+}
+
+/**
+ * MemoryFileStore that does not answer reads of some files (until `release`), and refuses writes of
+ * others (storage that does not answer, or refuses, a project's save).
+ */
+class SaveHeldStore extends MemoryFileStore {
+  readonly unanswered = new Set<string>();
+  readonly refused = new Set<string>();
+  /** Reads that wait for `release`. */
+  waiting = 0;
+  private released!: () => void;
+  private readonly answer = new Promise<void>((resolve) => (this.released = resolve));
+  release(): void {
+    this.released();
+  }
+  override async read(path: string) {
+    if (this.unanswered.has(path)) {
+      this.waiting++;
+      await this.answer;
+    }
+    return super.read(path);
+  }
+  override async write(path: string, data: Uint8Array, opts?: WriteOptions) {
+    if (this.refused.has(path)) throw new Error('storage refuses the write');
+    return super.write(path, data, opts);
+  }
+}
+
 const managers: RoomManager[] = [];
 
 function setup(
-  opts: { ttlMs?: number; debounceMs?: number; fs?: FileStore; log?: Log; openReadWaitMs?: number } = {},
+  opts: {
+    ttlMs?: number;
+    debounceMs?: number;
+    fs?: FileStore;
+    log?: Log;
+    openReadWaitMs?: number;
+    shutdownWaitMs?: number;
+  } = {},
 ) {
   const fs = opts.fs ?? new FlakyStore();
   const store = new ProjectFileStore(fs, '/');
@@ -159,6 +211,7 @@ function setup(
     serverVersion: 'test',
     sweepIntervalMs: 3_600_000,
     openReadWaitMs: opts.openReadWaitMs,
+    shutdownWaitMs: opts.shutdownWaitMs,
   });
   managers.push(rooms);
   return { rooms, store, fs, metrics };
@@ -1688,6 +1741,147 @@ describe('RoomManager', () => {
     expect(await harbour).toBe(false);
     await until(() => !lighthouse.storageLate);
     expect(await rooms.exists('Lighthouse')).toBe(true); // storage answered: the id comes first
+  });
+
+  /* Questions about one name asked at the same time share one read of storage. */
+  it('asks storage once about a name of a loaded project that several requests ask about at once', async () => {
+    const fs = new InfoHeldStore();
+    const { rooms } = setup({ fs, openReadWaitMs: 300 });
+    await rooms.createProject({ name: 'Lighthouse', empty: true });
+    let release!: () => void;
+    fs.holdInfo = new Promise((resolve) => (release = resolve));
+    const reads = fs.infoReads;
+    try {
+      const asked = [rooms.exists('Lighthouse'), rooms.exists('Lighthouse'), rooms.exists('lighthouse')];
+      expect(await within(Promise.all(asked), 3000)).toEqual([false, false, false]);
+      expect(fs.infoReads).toBe(reads + 2); // 'Lighthouse' once, and 'lighthouse'
+    } finally {
+      release();
+    }
+  });
+
+  /*
+   * Storage lists the projects, but reading the project.json of one of them fails (a file the
+   * server may not read, a 403 for one file, or one request of the listing that fails): the server
+   * listed only the projects it had loaded then, so tools found no project that is only in storage
+   * by name, and create_project took their names again. It lists those whose project.json it read,
+   * and asks storage nothing more about loaded ones it could not read (they are stored).
+   */
+  it('lists the projects whose project.json it read while reading another one fails', async () => {
+    const fs = new FileFailStore();
+    const rec = recordingLog();
+    const { rooms, store, metrics } = setup({ fs, log: rec.log });
+    await rooms.createProject({ name: 'Loaded here', empty: true });
+    const unreadable = await rooms.createProject({ name: 'Loaded, unreadable', empty: true });
+    const info = (id: string, name: string) => ({
+      id,
+      name,
+      created_at: '2026-01-01',
+      updated_at: '2026-01-01',
+      schema_version: 1,
+    });
+    await store.saveInfo(info('readable', 'Readable Stored'));
+    await store.saveInfo(info('broken', 'Broken Stored'));
+    fs.failing.add(store.infoPath('broken'));
+    fs.failing.add(store.infoPath(unreadable.id));
+    fs.etags.length = 0;
+    const names = (await rooms.listProjects()).map((p) => p.name).sort();
+    expect(names).toEqual(['Loaded here', 'Loaded, unreadable', 'Readable Stored']);
+    expect(fs.etags).toEqual([]);
+    expect(rec.lines).toContain('warn listing projects failed');
+    expect(await metrics.render()).toContain('persistence_operations_total{op="list",status="error"} 1');
+    // the name of a project that is only in storage is taken while the listing is incomplete
+    await expect(requireFreeProjectName(rooms, 'readable stored')).rejects.toThrow(ProjectNameTakenError);
+  });
+
+  /*
+   * A failed deletion is logged ('deleting project failed') and counted once, also when storage
+   * cannot tell whether the project exists: REST DELETE answers 503 without logging it again.
+   */
+  it('logs and counts a deletion that storage cannot tell about once', async () => {
+    const fs = new ReadFailStore();
+    const rec = recordingLog();
+    const { rooms, metrics } = setup({ fs, log: rec.log });
+    const a = await rooms.createProject({ name: 'Stored', empty: true });
+    a.lastActive = 0;
+    await rooms.sweep(); // evicted
+    fs.failReads = true;
+    await expect(rooms.deleteProject(a.id)).rejects.toThrow(
+      `could not read project ${a.id} from storage (storage offline)`,
+    );
+    expect(rec.lines.filter((l) => l.startsWith('warn deleting project failed'))).toHaveLength(1);
+    expect(await metrics.render()).toContain('persistence_operations_total{op="delete",status="error"} 1');
+  });
+
+  /*
+   * A shutdown with storage that does not answer: closing waited for every room's save, which waits
+   * for storage's timeouts (30 s per request on WebDAV), so the server outlived Docker's stop timeout
+   * (10 s) and was killed without a word about what it had not saved. It waits shutdownWaitMs for
+   * storage now, closes the rooms, and names the projects that stayed unsaved: a save that has not
+   * finished, or one that storage refused.
+   */
+  it('closes within its wait for storage at shutdown and names the projects that stayed unsaved', async () => {
+    const fs = new SaveHeldStore();
+    const logged: { level: string; obj: unknown; msg?: string }[] = [];
+    const entry = (level: string) => (obj: unknown, msg?: string) => logged.push({ level, obj, msg });
+    const log: Log = {
+      debug: entry('debug'),
+      info: entry('info'),
+      warn: entry('warn'),
+      error: entry('error'),
+    };
+    const { rooms, store } = setup({ fs, log, debounceMs: 60_000, shutdownWaitMs: 300 });
+    const saved = await rooms.createProject({ name: 'Saved', empty: true });
+    const held = await rooms.createProject({ name: 'Held', empty: true });
+    const refused = await rooms.createProject({ name: 'Refused', empty: true });
+    await rooms.createProject({ name: 'Unchanged', empty: true });
+    for (const room of [saved, held, refused]) room.scene.addObject({ type: 'EMPTY', name: 'Change' });
+    fs.unanswered.add(store.docPath(held.id));
+    fs.refused.add(store.docPath(refused.id));
+    // and a load of a project that storage does not answer
+    await store.saveInfo({
+      id: 'loading',
+      name: 'Loading',
+      created_at: '',
+      updated_at: '',
+      schema_version: 1,
+    });
+    fs.unanswered.add(store.docPath('loading'));
+    const loading = rooms.open('loading').catch(() => null);
+    await until(() => fs.waiting === 1);
+    expect(rooms.unsaved().map((p) => p.name)).toEqual(['Saved', 'Held', 'Refused']);
+    try {
+      const closing = rooms.close();
+      await until(() => !saved.hasUnsavedChanges && refused.isDirty);
+      // the rooms it is closing count until it has named them (main.ts names them when it runs out of time)
+      expect(rooms.unsaved().map((p) => p.name)).toEqual(['Held', 'Refused']);
+      expect(await within(closing, 3000)).toBeUndefined();
+      expect(held.destroyed && refused.destroyed && saved.destroyed).toBe(true);
+      const report = logged.filter((l) => l.msg === 'projects not saved at shutdown');
+      expect(report).toEqual([
+        {
+          level: 'error',
+          obj: {
+            projects: [
+              { id: held.id, name: 'Held' },
+              { id: refused.id, name: 'Refused' },
+            ],
+            reason:
+              'storage did not save their changes within 0.3 s, or refused them: the changes since their last save are lost',
+          },
+          msg: 'projects not saved at shutdown',
+        },
+      ]);
+      expect(rooms.unsaved()).toEqual([]);
+      expect(await within(loading, 50)).toBe('still waiting');
+      const stored = await store.loadDocument(saved.id);
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, stored!.update);
+      expect(new SceneDoc(doc).findObjectByName('Change')).toBeTruthy();
+    } finally {
+      fs.release();
+    }
+    expect(await loading).toBeNull(); // the server is closed: no room for it
   });
 });
 

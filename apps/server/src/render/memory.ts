@@ -29,7 +29,7 @@ import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
  *
  * - Operators (MCP tools and the REST API): before an operator runs, the core registry asks
  *   `operatorCheck` with its estimated peak heap (core operators/memory.ts). One that does not fit
- *   into the free heap, less SERVER_HEAP_RESERVE_BYTES, fails with code OUT_OF_MEMORY and says what
+ *   into the free heap, less the reserve, fails with code OUT_OF_MEMORY and says what
  *   to lower; so does one that adds geometry beyond what the server keeps decoded for one project
  *   ({@link maxProjectMeshBytes}).
  * - Decoding stored meshes (scene summaries, mesh data, operators, exports in the server's process):
@@ -38,13 +38,13 @@ import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
  * - Modifier evaluations and curve and text surfaces (scene summaries, mesh data, operators such
  *   as Apply and Convert of MCP tools and the REST API): every modifier, and the surface of every
  *   curve and text object, asks `geometryCheck` before it is built (core eval/memory.ts); one whose
- *   estimated peak heap does not fit into the free heap, less SERVER_HEAP_RESERVE_BYTES, is skipped
+ *   estimated peak heap does not fit into the free heap, less the reserve, is skipped
  *   and reported as that modifier's (or curve's) error. Installed by `installGeometryMemoryGuard` when
  *   the server's render module loads (index.ts); render processes do not install it (running out
  *   of memory there ends only the render process).
  * - Project snapshots (REST GET /api/projects/:id/snapshot): the server copies every mesh and
  *   serializes the copy to JSON in its own heap; `snapshotRefusal` refuses one that does not fit
- *   into the free heap, less SERVER_HEAP_RESERVE_BYTES, or that no JavaScript string can hold.
+ *   into the free heap, less the reserve, or that no JavaScript string can hold.
  * - Renders and exports in the server's own process (single-thread mode: RENDER_WORKERS=0, or
  *   render processes could not start): refused first when their estimated heap need does not fit
  *   (`checkMainThreadRender`). The estimate is cheap (no evaluation): the triangles of the meshes
@@ -52,8 +52,10 @@ import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
  *   of their modifiers and the render of their result (the same modifier estimates). Other geometry
  *   (curves, text, particle and collection instances) is not counted.
  *
- * Before refusing, both run a full garbage collection and measure again: the heap in use counts
- * garbage not collected yet.
+ * Each keeps a quarter of the heap free for the rest of the server, at least 256 MB
+ * ({@link serverHeapReserve}). Before refusing, they run a full garbage collection and measure
+ * again (the heap in use counts garbage not collected yet), at most one a second
+ * ({@link collectGarbage}).
  */
 
 /**
@@ -63,10 +65,30 @@ import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
  */
 export const RENDER_HEAP_BYTES_PER_TRIANGLE = 320;
 
-/** Heap kept free for the rest of the server (requests, rooms, other agents). */
+/** Least heap the guards keep free for the rest of the server (requests, rooms, other agents). */
 export const SERVER_HEAP_RESERVE_BYTES = 256 * 1024 * 1024;
 
+/** Share of its heap limit the server keeps free at least (see {@link serverHeapReserve}). */
+export const SERVER_HEAP_RESERVE_SHARE = 0.25;
+
 const MB = 1024 * 1024;
+
+/** This process's JavaScript heap limit (bytes). */
+const heapLimitBytes = (): number => v8.getHeapStatistics().heap_size_limit;
+
+/**
+ * Heap the guards keep free for the rest of the server in a heap of `limit` bytes: a quarter of it,
+ * at least {@link SERVER_HEAP_RESERVE_BYTES} (524 MB of Node's default heap of 2,096 MB). V8 ends a
+ * process ("Ineffective mark-compacts near heap limit") when four full garbage collections in a
+ * row leave its old generation at 80% of its limit or more while the program ran for less than 40%
+ * of the time between them: with the guards letting the heap fill up to its limit less 256 MB (88%
+ * of the default heap), the collections of requests refused in a row ended the server that way.
+ * What the guards let in now stays below that mark: 75% of the limit, which includes the 48 MB
+ * young generation, so at most 79% of the old generation's limit.
+ */
+export function serverHeapReserve(limit: number = heapLimitBytes()): number {
+  return Math.max(SERVER_HEAP_RESERVE_BYTES, Math.ceil(limit * SERVER_HEAP_RESERVE_SHARE));
+}
 
 const triangles = (s: MeshSize): number => Math.max(0, s.corners - 2 * s.faces);
 
@@ -119,19 +141,13 @@ export function freeHeapBytes(): number {
   return h.heap_size_limit - h.used_heap_size;
 }
 
-/** This process's JavaScript heap limit in MB. */
-function heapLimitMb(): number {
-  return Math.round(v8.getHeapStatistics().heap_size_limit / MB);
-}
-
 let gcFunction: (() => void) | null | undefined;
 
 /**
- * Runs a full garbage collection (the heap in use counts garbage until one runs). Uses `gc` when
- * the process was started with --expose-gc, else exposes it at run time (V8's `gc` of a new
- * context). Returns whether a collection ran.
+ * Runs a full garbage collection now. Uses `gc` when the process was started with --expose-gc,
+ * else exposes it at run time (V8's `gc` of a new context). Returns whether a collection ran.
  */
-export function collectGarbage(): boolean {
+function fullGarbageCollection(): boolean {
   if (gcFunction === undefined) {
     const own = (globalThis as { gc?: () => void }).gc;
     if (own) gcFunction = own;
@@ -150,16 +166,70 @@ export function collectGarbage(): boolean {
   return true;
 }
 
-/** Whether `need` bytes fit into the free heap less the reserve (after a garbage collection when needed). */
-function fits(need: number, heapFree: () => number, collect: () => unknown): { ok: boolean; free: number } {
+/** Least time between two full garbage collections of the guards (ms, see {@link collectGarbage}). */
+export const GC_MIN_INTERVAL_MS = 1000;
+
+/** After a collection, the guards wait at least this many times as long as it took before the next. */
+export const GC_INTERVAL_PER_DURATION = 4;
+
+/**
+ * A full garbage collection for the guards, at most one per {@link GC_MIN_INTERVAL_MS} (and
+ * {@link GC_INTERVAL_PER_DURATION} times the last one's duration, when longer): a request refused
+ * soon after the last collection is decided on the heap as it is. Returns whether one ran. `gc` runs
+ * the collection (default: V8's); `now` is the clock in milliseconds.
+ */
+export function throttledGarbageCollector(
+  opts: { gc?: () => boolean; now?: () => number } = {},
+): () => boolean {
+  const gc = opts.gc ?? fullGarbageCollection;
+  const now = opts.now ?? (() => performance.now());
+  let next = -Infinity;
+  return () => {
+    const start = now();
+    if (start < next) return false;
+    const ran = gc();
+    const end = now();
+    next = end + Math.max(GC_MIN_INTERVAL_MS, GC_INTERVAL_PER_DURATION * (end - start));
+    return ran;
+  };
+}
+
+/**
+ * Runs a full garbage collection before a guard refuses (the heap in use counts garbage until one
+ * runs), shared by all the guards and at most one a second, so that requests refused in a row
+ * leave the program most of its time: one collection of a full default heap took 0.5–0.6 s, and
+ * V8 ends a process whose full collections in a row leave it less than 40% of the time near its
+ * heap limit (see {@link serverHeapReserve}). Returns whether one ran.
+ */
+export const collectGarbage: () => boolean = throttledGarbageCollector();
+
+/**
+ * Whether `need` bytes fit into the free heap less the reserve of a heap of `limit` bytes (after a
+ * garbage collection when needed and when one could make room for them).
+ */
+function fits(
+  need: number,
+  heapFree: () => number,
+  collect: () => unknown,
+  limit: number,
+): { ok: boolean; free: number; reserve: number } {
+  const reserve = serverHeapReserve(limit);
   let free = heapFree();
-  if (need <= free - SERVER_HEAP_RESERVE_BYTES) return { ok: true, free };
+  // no collection makes room for more than the whole heap less the reserve
+  if (need <= free - reserve || need > limit - reserve) return { ok: need <= free - reserve, free, reserve };
   collect();
   free = heapFree();
-  return { ok: need <= free - SERVER_HEAP_RESERVE_BYTES, free };
+  return { ok: need <= free - reserve, free, reserve };
 }
 
 const n = (v: number): string => Math.round(v).toLocaleString('en-US');
+
+const mb = (bytes: number): string => n(Math.max(0, bytes) / MB);
+
+/** "…, and the server's process has F MB of its L MB heap free and keeps R MB of it for its other work". */
+const heapClause = (free: number, limit: number): string =>
+  `the server's process has ${mb(free)} MB of its ${mb(limit)} MB heap free and keeps ` +
+  `${mb(serverHeapReserve(limit))} MB of it for its other work`;
 
 /**
  * The error of a modifier, or a curve or text surface, the server skips for memory (see
@@ -168,48 +238,43 @@ const n = (v: number): string => Math.round(v).toLocaleString('en-US');
 export function skippedModifierMessage(
   req: GeometryMemoryRequest,
   free: number,
-  limit = v8.getHeapStatistics().heap_size_limit,
+  limit = heapLimitBytes(),
 ): string {
   const e = req.estimate;
   return (
     `skipped on the server: this ${req.label} would need about ${n(e.bytes / MB)} MB of JavaScript heap for ` +
-    `a result of about ${n(e.result.faces)} faces, and the server's process has ${n(Math.max(0, free) / MB)} MB ` +
-    `of its ${n(limit / MB)} MB heap free and keeps ${n(SERVER_HEAP_RESERVE_BYTES / MB)} MB of it for its ` +
-    `other work. Lower ${e.lower} to evaluate it on the server (a browser editor evaluates it itself)`
+    `a result of about ${n(e.result.faces)} faces, and ${heapClause(free, limit)}. Lower ${e.lower} to ` +
+    'evaluate it on the server (a browser editor evaluates it itself)'
   );
 }
 
 /**
  * The server's check of modifier evaluations and of curve and text surfaces (core
  * `setGeometryMemoryCheck`): skips one whose estimated peak heap does not fit into the free heap less
- * SERVER_HEAP_RESERVE_BYTES.
+ * the reserve ({@link serverHeapReserve}).
  */
 export function geometryCheck(
   opts: { heapFree?: () => number; collect?: () => unknown; heapLimit?: () => number } = {},
 ): GeometryMemoryCheck {
   const heapFree = opts.heapFree ?? freeHeapBytes;
   const collect = opts.collect ?? collectGarbage;
-  const heapLimit = opts.heapLimit ?? (() => v8.getHeapStatistics().heap_size_limit);
+  const heapLimit = opts.heapLimit ?? heapLimitBytes;
   return (req) => {
-    const { ok, free } = fits(req.estimate.bytes, heapFree, collect);
-    return ok ? null : skippedModifierMessage(req, free, heapLimit());
+    const limit = heapLimit();
+    const { ok, free } = fits(req.estimate.bytes, heapFree, collect, limit);
+    return ok ? null : skippedModifierMessage(req, free, limit);
   };
 }
 
 /**
  * Decoded meshes of one project the server keeps at most (bytes): half of its heap less the reserve,
  * so that the project's meshes, decoded, leave room for the operators that edit them and for other
- * projects (with Node's default heap of 2,096 MB: 920 MB, about 7.8 million triangles of grids with
+ * projects (with Node's default heap of 2,096 MB: 786 MB, about 6.6 million triangles of grids with
  * UVs at 124 bytes each).
  */
-export function maxProjectMeshBytes(limit = v8.getHeapStatistics().heap_size_limit): number {
-  return Math.max(0, (limit - SERVER_HEAP_RESERVE_BYTES) / 2);
+export function maxProjectMeshBytes(limit = heapLimitBytes()): number {
+  return Math.max(0, (limit - serverHeapReserve(limit)) / 2);
 }
-
-const mb = (bytes: number): string => n(Math.max(0, bytes) / MB);
-
-/** This process's JavaScript heap limit (bytes). */
-const heapLimitBytes = (): number => v8.getHeapStatistics().heap_size_limit;
 
 /**
  * The error of an operator the server does not run because its peak heap does not fit (`free`:
@@ -223,9 +288,7 @@ export function refusedOperatorMessage(
   const e = req.estimate;
   return (
     `not run on the server: it would need about ${mb(e.bytes)} MB of JavaScript heap` +
-    `${e.faces ? ` for a mesh of about ${n(e.faces)} faces` : ''}, and the server's process has ${mb(free)} MB ` +
-    `of its ${mb(limit)} MB heap free and keeps ${mb(SERVER_HEAP_RESERVE_BYTES)} MB of it for its other ` +
-    'work. ' +
+    `${e.faces ? ` for a mesh of about ${n(e.faces)} faces` : ''}, and ${heapClause(free, limit)}. ` +
     (e.lower
       ? `Lower ${e.lower} to run it on the server (a browser editor runs it in its own memory)`
       : 'A browser editor runs it in its own memory')
@@ -242,7 +305,7 @@ export function storedMeshesMessage(req: OperatorMemoryRequest, limit = heapLimi
     `not run on the server: the project's meshes would then take about ${mb(req.storedBytes + e.addedStoredBytes)} ` +
     `MB of JavaScript heap decoded (now ${mb(req.storedBytes)} MB), more than the ` +
     `${mb(maxProjectMeshBytes(limit))} MB the server's process keeps for the meshes of one project (half of ` +
-    `its ${mb(limit)} MB heap less the ${mb(SERVER_HEAP_RESERVE_BYTES)} MB it keeps for its other work). ` +
+    `its ${mb(limit)} MB heap less the ${mb(serverHeapReserve(limit))} MB it keeps for its other work). ` +
     (e.lower ? `Lower ${e.lower}, or delete` : 'Delete') +
     ' meshes the project no longer needs'
   );
@@ -253,8 +316,7 @@ export function refusedDecodeMessage(req: MeshMemoryRequest, free: number, limit
   const l = req.layout;
   return (
     `this mesh of ${n(Math.max(0, l.corners - 2 * l.faces))} triangles was not loaded on the server: decoding it ` +
-    `needs about ${mb(req.bytes)} MB of JavaScript heap, and the server's process has ${mb(free)} MB of its ` +
-    `${mb(limit)} MB heap free and keeps ${mb(SERVER_HEAP_RESERVE_BYTES)} MB of it for its other work ` +
+    `needs about ${mb(req.bytes)} MB of JavaScript heap, and ${heapClause(free, limit)} ` +
     '(the open projects keep their meshes decoded). Delete or simplify large meshes, or work on it in a browser ' +
     'editor that has the project open, which loads it in its own memory'
   );
@@ -263,7 +325,7 @@ export function refusedDecodeMessage(req: MeshMemoryRequest, free: number, limit
 /**
  * The server's check of operators (core `setOperatorMemoryCheck`): refuses one that adds geometry
  * beyond {@link maxProjectMeshBytes}, or whose estimated peak heap does not fit into the free heap
- * less SERVER_HEAP_RESERVE_BYTES.
+ * less the reserve ({@link serverHeapReserve}).
  */
 export function operatorCheck(
   opts: { heapFree?: () => number; collect?: () => unknown; heapLimit?: () => number } = {},
@@ -276,7 +338,7 @@ export function operatorCheck(
     const limit = heapLimit();
     if (e.addedStoredBytes > 0 && req.storedBytes + e.addedStoredBytes > maxProjectMeshBytes(limit))
       return storedMeshesMessage(req, limit);
-    const { ok, free } = fits(e.bytes, heapFree, collect);
+    const { ok, free } = fits(e.bytes, heapFree, collect, limit);
     return ok ? null : refusedOperatorMessage(req, free, limit);
   };
 }
@@ -289,8 +351,9 @@ export function decodeCheck(
   const collect = opts.collect ?? collectGarbage;
   const heapLimit = opts.heapLimit ?? heapLimitBytes;
   return (req) => {
-    const { ok, free } = fits(req.bytes, heapFree, collect);
-    return ok ? null : refusedDecodeMessage(req, free, heapLimit());
+    const limit = heapLimit();
+    const { ok, free } = fits(req.bytes, heapFree, collect, limit);
+    return ok ? null : refusedDecodeMessage(req, free, limit);
   };
 }
 
@@ -353,21 +416,30 @@ function nestedChars(a: readonly ArrayLike<number>[]): number {
  * JSON.stringify writes, its 98 characters of keys and braces rounded up to 128): exact where
  * {@link snapshotMeshChars}, the bound from the counts alone, says the JSON may not fit into a
  * JavaScript string. A string per number, no copy of the mesh: about a second per million faces.
+ * The count stops after the part of the mesh (positions, faces, UVs …) that takes it past
+ * `budget`, and is then less than the mesh's.
  */
-export function meshJsonChars(mesh: MeshData): number {
-  let smooth = 2 + Math.max(0, mesh.faceSmooth.length - 1);
-  for (const b of mesh.faceSmooth) smooth += b ? 4 : 5;
-  return (
-    128 +
-    numbersChars(mesh.positions) +
-    nestedChars(mesh.faces) +
-    numbersChars(mesh.faceMaterials) +
-    smooth +
-    (mesh.uvs ? nestedChars(mesh.uvs) : 4) +
-    (mesh.colors ? numbersChars(mesh.colors) : 4) +
-    JSON.stringify(mesh.edgeAttrs).length +
-    numbersChars(mesh.looseEdges)
-  );
+export function meshJsonChars(mesh: MeshData, budget = Infinity): number {
+  const parts: (() => number)[] = [
+    () => numbersChars(mesh.positions),
+    () => nestedChars(mesh.faces),
+    () => numbersChars(mesh.faceMaterials),
+    () => {
+      let smooth = 2 + Math.max(0, mesh.faceSmooth.length - 1);
+      for (const b of mesh.faceSmooth) smooth += b ? 4 : 5;
+      return smooth;
+    },
+    () => (mesh.uvs ? nestedChars(mesh.uvs) : 4),
+    () => (mesh.colors ? numbersChars(mesh.colors) : 4),
+    () => JSON.stringify(mesh.edgeAttrs).length,
+    () => numbersChars(mesh.looseEdges),
+  ];
+  let chars = 128;
+  for (const part of parts) {
+    chars += part();
+    if (chars > budget) break;
+  }
+  return chars;
 }
 
 /**
@@ -376,7 +448,7 @@ export function meshJsonChars(mesh: MeshData): number {
  * string, all in its own heap: a copy of the meshes plus the JSON (one byte per character), at
  * most {@link snapshotMeshChars} per mesh and base64 of the shape keys, vertex groups and images
  * (a grid of 640,000 faces took 1.93 times its decoded size at the peak, measured; this estimate
- * gives 2.24). Refused when that does not fit into the free heap less SERVER_HEAP_RESERVE_BYTES,
+ * gives 2.24). Refused when that does not fit into the free heap less the reserve,
  * when the JSON would be longer than a JavaScript string can be, or when a stored mesh is not
  * decoded (the decode check's message). Reading the meshes decodes those not decoded yet.
  */
@@ -428,41 +500,45 @@ export function snapshotRefusal(
     'Export the meshes instead (GET /api/projects/:id/export builds the file in a render process), or delete ' +
     'meshes the project no longer needs';
   // the bound from the counts allows the longest number for every value: count the values
-  // themselves before refusing a snapshot that may fit
+  // themselves before refusing a snapshot that may fit, until the count is past the limit
   if (chars > maxChars) {
     chars = other;
-    for (const m of meshes) chars += meshJsonChars(m) + 256;
+    for (const m of meshes) {
+      chars += meshJsonChars(m, maxChars - chars) + 256;
+      if (chars > maxChars) break;
+    }
   }
   if (chars > maxChars)
     return (
-      `not built on the server: the snapshot would be ${n(Math.ceil(chars / MB))} MB of JSON, more than the ` +
-      `${mb(maxChars)} MB a JavaScript string can hold. ${advice}`
+      `not built on the server: the snapshot would be more than the ${mb(maxChars)} MB of JSON a JavaScript ` +
+      `string can hold. ${advice}`
     );
   const need = copies + chars;
-  const { ok, free } = fits(need, heapFree, collect);
+  const { ok, free } = fits(need, heapFree, collect, limit);
   if (ok) return null;
   return (
     `not built on the server: it would need about ${mb(need)} MB of JavaScript heap (a copy of the meshes and up ` +
-    `to ${mb(chars)} MB of JSON), and the server's process has ${mb(free)} MB of its ${mb(limit)} MB heap free ` +
-    `and keeps ${mb(SERVER_HEAP_RESERVE_BYTES)} MB of it for its other work. ${advice}`
+    `to ${mb(chars)} MB of JSON), and ${heapClause(free, limit)}. ${advice}`
   );
 }
 
 /**
  * Throws a RenderOutOfMemoryError (reason 'refused') when a render (or export) of `scene` in the
  * server's own process would not fit into its free heap (`heapFree`, bytes) with
- * {@link SERVER_HEAP_RESERVE_BYTES} left for the rest of the server.
+ * the reserve ({@link serverHeapReserve}) left for the rest of the server.
  */
 export function checkMainThreadRender(
   scene: SceneDoc,
   heapFree: () => number = freeHeapBytes,
   collect: () => unknown = collectGarbage,
   what: 'render' | 'export' = 'render',
+  heapLimit: () => number = heapLimitBytes,
 ): void {
   const est = estimateRenderMemory(scene);
-  const { ok, free } = fits(est.bytes, heapFree, collect);
+  const limitBytes = heapLimit();
+  const { ok, free } = fits(est.bytes, heapFree, collect, limitBytes);
   if (ok) return;
-  const limit = heapLimitMb();
+  const limit = Math.round(limitBytes / MB);
   throw new RenderOutOfMemoryError(
     `${OUT_OF_MEMORY_PREFIX}this ${what} was not started: it needs about ${Math.ceil(est.bytes / MB)} MB of JavaScript heap ` +
       `(about ${est.triangles.toLocaleString('en-US')} triangles), and ${what}s run in the server's own process ` +

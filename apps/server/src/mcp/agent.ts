@@ -17,6 +17,7 @@ import type { Log } from '../observability/log';
 import { randomClientId } from '../sync/awareness';
 import { toolOnlyOperator } from './operator-groups';
 import { AgentHistory, type HistoryLimits } from './history';
+import { listProjects } from './project-storage';
 
 /**
  * Kind of a failure, as the core operator registry reports operator failures (OperatorError):
@@ -54,6 +55,21 @@ export interface AgentDeps {
   log: Log;
   /** Limits of the undo history of each agent and project (see {@link AgentHistory}). */
   history?: Partial<HistoryLimits>;
+}
+
+/**
+ * The id of the project named `name` among `projects` (an exact match first, else one ignoring
+ * letter case); null when none is; a {@link ToolError} when several are.
+ */
+function projectNamed(projects: { id: string; name: string }[], name: string): string | null {
+  let matches = projects.filter((p) => p.name === name);
+  if (matches.length === 0) matches = projects.filter((p) => p.name.toLowerCase() === name.toLowerCase());
+  if (matches.length > 1) {
+    throw new ToolError(
+      `Several projects are named '${name}': ${matches.map((m) => m.id).join(', ')}. Pass the project id instead.`,
+    );
+  }
+  return matches[0]?.id ?? null;
 }
 
 /** Characters allowed in agent ids (`x-mcp-agent-id` header / `agent` query parameter). */
@@ -364,7 +380,15 @@ export class AgentSession {
     for (const p of this.projects.values()) p.publishPresence(true);
   }
 
-  /** Resolves a project reference (id or exact name) to a project id. */
+  /**
+   * Resolves a project reference (an id, or a name: exact, else ignoring letter case) to a project
+   * id. An id comes first (RoomManager.exists); then the names of the projects this agent holds, then
+   * of those this server has loaded, which need no listing of storage (storage that does not answer
+   * takes 30 s per request: a name of a loaded project used to wait for that); then the names of
+   * the projects in storage. When listing storage fails, or reading some project.json files does, a
+   * name that nothing matches gets an error that says so (a project that is only in storage may
+   * have it), instead of 'There are no projects yet'.
+   */
   async resolveProjectId(ref: string): Promise<string> {
     const r = ref.trim();
     if (!r) throw new ToolError('project is required (id or name; see list_projects)');
@@ -373,21 +397,27 @@ export class AgentSession {
     // Fast path: a project this agent is already working on (avoids listing the storage backend).
     const held = this.held().filter((p) => p.scene.name === r);
     if (held.length === 1) return held[0].id;
-    const all = await rooms.listProjects();
-    let matches = all.filter((p) => p.name === r);
-    if (matches.length === 0) matches = all.filter((p) => p.name.toLowerCase() === r.toLowerCase());
-    if (matches.length === 1) return matches[0].id;
-    if (matches.length > 1) {
-      throw new ToolError(
-        `Several projects are named '${r}': ${matches.map((m) => m.id).join(', ')}. Pass the project id instead.`,
-      );
-    }
+    const loaded = rooms.loadedNamed(r).map((room) => ({ id: room.id, name: room.scene.name }));
+    const loadedId = projectNamed(loaded, r);
+    if (loadedId) return loadedId;
+    const { projects: all, failed, partial } = await listProjects(rooms);
+    const id = projectNamed(all, r);
+    if (id) return id;
     const known = all
       .slice(0, 20)
       .map((p) => `'${p.name}' (${p.id})`)
       .join(', ');
+    const knownProjects = known ? ` Known projects: ${known}.` : '';
+    if (failed) {
+      const missing = partial
+        ? "Reading the project.json of some projects in storage failed (the server logged 'listing projects failed'), so a project among those"
+        : "Listing the projects in storage failed (the server logged 'listing projects failed'), so a project that is only in storage";
+      throw new ToolError(
+        `Project '${r}' not found.${knownProjects} ${missing} is not found by name now: try again once list_projects no longer has storage_listing_failed: true.`,
+      );
+    }
     throw new NotFoundError(
-      `Project '${r}' not found.${known ? ` Known projects: ${known}.` : ' There are no projects yet.'} Use list_projects or create_project.`,
+      `Project '${r}' not found.${knownProjects || ' There are no projects yet.'} Use list_projects or create_project.`,
     );
   }
 

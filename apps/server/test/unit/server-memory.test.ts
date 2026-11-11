@@ -19,24 +19,29 @@ import {
   type OperatorContext,
 } from '@3d-editor/core';
 import {
+  GC_MIN_INTERVAL_MS,
+  collectGarbage,
   decodeCheck,
   geometryCheck,
   installGeometryMemoryGuard,
   maxProjectMeshBytes,
   meshJsonChars,
   operatorCheck,
+  serverHeapReserve,
   snapshotMeshChars,
   snapshotRefusal,
+  throttledGarbageCollector,
 } from '../../src/render/memory';
 import { describeObject, summarizeScene } from '../../src/mcp/scene-summary';
 
 /*
  * The operators of MCP tools and the REST API run in the server's own process, whose JavaScript
  * heap every connection and project shares; V8 ends the whole process when it runs out. The
- * server refuses an operator whose estimated peak heap does not fit into the free heap less the
- * 256 MB it keeps, one that would leave more decoded meshes in a project than half of the heap less
- * those 256 MB, and the decoding of a stored mesh that does not fit (get_scene then lists the
- * stored counts). The heap is injected here (the real checks read V8's heap statistics).
+ * server refuses an operator whose estimated peak heap does not fit into the free heap less what it
+ * keeps (a quarter of the heap, at least 256 MB: 256 MB of the heap of 1,024 MB most tests here
+ * give it), one that would leave more decoded meshes in a project than half of the heap less that,
+ * and the decoding of a stored mesh that does not fit (get_scene then lists the stored counts). The
+ * heap is injected here (the real checks read V8's heap statistics).
  */
 
 const MB = 1024 * 1024;
@@ -71,7 +76,7 @@ describe("operators in the server's process", () => {
     expect(run('object.mode_set', { mode: 'EDIT' }).ok).toBe(true);
     let collected = 0;
     setOperatorMemoryCheck(
-      operatorCheck({ heapFree: () => 400 * MB, collect: () => collected++, heapLimit: () => 2048 * MB }),
+      operatorCheck({ heapFree: () => 400 * MB, collect: () => collected++, heapLimit: () => 1024 * MB }),
     );
     // 4 cuts: 62,500 faces, about 260 MB at its peak, of which 144 MB fit above the reserve
     const res = run('mesh.subdivide', { number_cuts: 4 });
@@ -80,7 +85,7 @@ describe("operators in the server's process", () => {
     expect(need.faces).toBe(62_500);
     expect(res.error).toBe(
       `not run on the server: it would need about ${Math.round(need.bytes / MB).toLocaleString('en-US')} MB of ` +
-        "JavaScript heap for a mesh of about 62,500 faces, and the server's process has 400 MB of its 2,048 MB " +
+        "JavaScript heap for a mesh of about 62,500 faces, and the server's process has 400 MB of its 1,024 MB " +
         'heap free and keeps 256 MB of it for its other work. Lower number_cuts, or select fewer faces to run it ' +
         'on the server (a browser editor runs it in its own memory)',
     );
@@ -98,7 +103,7 @@ describe("operators in the server's process", () => {
     const id = ctx.state.activeId!;
     // 32 MB and 600 bytes per face: 38 MB, of which 14 MB fit above the reserve
     setOperatorMemoryCheck(
-      operatorCheck({ heapFree: () => 270 * MB, collect: () => 0, heapLimit: () => 2048 * MB }),
+      operatorCheck({ heapFree: () => 270 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
     );
     let err: unknown = null;
     try {
@@ -111,14 +116,16 @@ describe("operators in the server's process", () => {
       code: 'OUT_OF_MEMORY',
       message:
         "Edit Mode on 'Grid': not run on the server: it would need about 38 MB of JavaScript heap for a mesh of " +
-        "about 10,000 faces, and the server's process has 270 MB of its 2,048 MB heap free and keeps 256 MB of it " +
+        "about 10,000 faces, and the server's process has 270 MB of its 1,024 MB heap free and keeps 256 MB of it " +
         'for its other work. Lower the number of faces of the mesh to run it on the server (a browser editor runs ' +
         'it in its own memory)',
     });
     expect(ctx.state.mode).toBe('OBJECT');
     expect(run('object.mode_set', { mode: 'EDIT' })).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
     // with room for it
-    setOperatorMemoryCheck(operatorCheck({ heapFree: () => 400 * MB, collect: () => 0 }));
+    setOperatorMemoryCheck(
+      operatorCheck({ heapFree: () => 400 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
+    );
     enterEditMode(ctx, id);
     expect(ctx.state.mode).toBe('EDIT');
   });
@@ -191,7 +198,7 @@ describe("operators in the server's process", () => {
     expect(res.error).toBe(
       `not run on the server: it would need about ${Math.round(need.bytes / MB).toLocaleString('en-US')} MB of ` +
         `JavaScript heap for a mesh of about ${need.faces.toLocaleString('en-US')} faces, and the server's ` +
-        'process has 400 MB of its 1,072 MB heap free and keeps 256 MB of it for its other work. Lower ' +
+        'process has 400 MB of its 1,072 MB heap free and keeps 268 MB of it for its other work. Lower ' +
         'branch_levels, branches, leaf_density or resolution to run it on the server (a browser editor runs it ' +
         'in its own memory)',
     );
@@ -209,7 +216,7 @@ describe("operators in the server's process", () => {
     // a copy of the 90,000 faces would not fit into the 94 MB above the reserve, but Convert copies
     // nothing: it refuses the object for its failed modifier
     setOperatorMemoryCheck(
-      operatorCheck({ heapFree: () => 350 * MB, collect: () => 0, heapLimit: () => 2048 * MB }),
+      operatorCheck({ heapFree: () => 350 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
     );
     const res = run('object.convert', { target: 'MESH' });
     expect(res).toMatchObject({ ok: false, code: 'FAILED' });
@@ -227,6 +234,74 @@ describe("the server's checks", () => {
     expect(geometryMemoryCheck()).toBeTypeOf('function');
     expect(operatorMemoryCheck()).toBeTypeOf('function');
     expect(meshMemoryCheck()).toBeTypeOf('function');
+  });
+});
+
+describe("the server's heap near its limit", () => {
+  // V8 ends a process ("Ineffective mark-compacts near heap limit") when four full garbage
+  // collections in a row leave its old generation at 80% of its limit or more while the program ran
+  // for less than 40% of the time between them; the young generation (48 MB) is part of the limit
+  it('keeps a quarter of the heap free, at least 256 MB: what the checks let in stays below 80% of the old generation', () => {
+    expect(serverHeapReserve(688 * MB)).toBe(256 * MB); // --max-old-space-size=640
+    expect(serverHeapReserve(2096 * MB)).toBe(524 * MB); // Node's default on a machine with 16 GB
+    for (const oldSpace of [384, 640, 976, 1024, 1280, 1536, 2048, 4096, 8192]) {
+      const limit = (oldSpace + 48) * MB;
+      expect(limit - serverHeapReserve(limit), `${oldSpace} MB`).toBeLessThan(0.8 * oldSpace * MB);
+    }
+    // the meshes of one project: half of the heap less the reserve (786 MB of the default heap)
+    expect(maxProjectMeshBytes(2096 * MB)).toBe(786 * MB);
+    const check = operatorCheck({ heapFree: () => 2000 * MB, collect: () => 0, heapLimit: () => 2096 * MB });
+    const estimate = { bytes: 1500 * MB, faces: 1_000_000, addedStoredBytes: 0, lower: 'number_cuts' };
+    expect(check({ operator: 'mesh.subdivide', estimate, storedBytes: 0 })).toMatch(
+      /the server's process has 2,000 MB of its 2,096 MB heap free and keeps 524 MB of it for its other work\. /,
+    );
+    expect(
+      check({ operator: 'mesh.subdivide', estimate: { ...estimate, bytes: 1400 * MB }, storedBytes: 0 }),
+    ).toBeNull();
+  });
+
+  it('runs a full garbage collection before refusing, at most one a second for refusals in a row', () => {
+    let now = 0;
+    let runs = 0;
+    let took = 100;
+    const collect = throttledGarbageCollector({
+      gc: () => {
+        runs++;
+        now += took;
+        return true;
+      },
+      now: () => now,
+    });
+    const check = decodeCheck({ heapFree: () => 600 * MB, collect, heapLimit: () => 1024 * MB });
+    const layout = { vertices: 1_000_000, faces: 1_000_000, corners: 4_000_000, uvs: true, colors: false };
+    // 400 MB: more than the 344 MB free above the reserve
+    const req = { layout, bytes: 400 * MB };
+    for (let i = 0; i < 6; i++)
+      expect(check(req)).toMatch(/^this mesh of 2,000,000 triangles was not loaded/);
+    expect(runs).toBe(1);
+    // the next one a second after the last ended
+    now += GC_MIN_INTERVAL_MS - 1;
+    check(req);
+    expect(runs).toBe(1);
+    now += 1;
+    check(req);
+    expect(runs).toBe(2);
+    // after a collection of 0.5 s, the guards wait four times as long: 2 s
+    now += GC_MIN_INTERVAL_MS;
+    took = 500;
+    expect(collect()).toBe(true);
+    now += 1999;
+    expect(collect()).toBe(false);
+    now += 1;
+    expect(collect()).toBe(true);
+    expect(runs).toBe(4);
+    // a request larger than the whole heap less the reserve is refused without a collection
+    now += 10_000;
+    expect(check({ layout, bytes: 800 * MB })).toMatch(/^this mesh/);
+    expect(runs).toBe(4);
+    // the guards' own collector, which every check uses by default, is throttled the same way
+    collectGarbage();
+    expect(collectGarbage()).toBe(false);
   });
 });
 
@@ -277,19 +352,21 @@ describe('curve surfaces', () => {
     const e = estimateCurveSurface(curve, { isText: false, forRender: true });
     // 128,060 vertices at most, about 99 MB to build: 300 MB free leave 44 MB above the reserve
     setGeometryMemoryCheck(
-      geometryCheck({ heapFree: () => 300 * MB, collect: () => 0, heapLimit: () => 2048 * MB }),
+      geometryCheck({ heapFree: () => 300 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
     );
     const s = summarizeScene(doc) as any;
     const message =
       `skipped on the server: this curve surface would need about ${Math.round(e.bytes / MB)} MB of JavaScript ` +
       `heap for a result of about ${e.result.faces.toLocaleString('en-US')} faces, and the server's process has ` +
-      '300 MB of its 2,048 MB heap free and keeps 256 MB of it for its other work. Lower resolution_u, ' +
+      '300 MB of its 1,024 MB heap free and keeps 256 MB of it for its other work. Lower resolution_u, ' +
       'bevel_resolution or the number of spline points to evaluate it on the server (a browser editor evaluates ' +
       'it itself)';
     expect(s.problems).toEqual([{ source: 'curve', object: 'Curve', message }]);
     expect(s.counts.evaluated).toMatchObject({ faces: 0 });
     // with room for it (in a copy of the project: evaluations are cached per document state)
-    setGeometryMemoryCheck(geometryCheck({ heapFree: () => 600 * MB, collect: () => 0 }));
+    setGeometryMemoryCheck(
+      geometryCheck({ heapFree: () => 600 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
+    );
     const built = summarizeScene(SceneDoc.fromUpdate(doc.encodeState())) as any;
     expect(built.problems).toBeUndefined();
     expect(built.counts.evaluated.faces).toBeGreaterThan(100_000);
@@ -308,14 +385,14 @@ describe('curve surfaces', () => {
       }).ok,
     ).toBe(true);
     setOperatorMemoryCheck(
-      operatorCheck({ heapFree: () => 400 * MB, collect: () => 0, heapLimit: () => 2048 * MB }),
+      operatorCheck({ heapFree: () => 400 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
     );
     const need = estimateOperator('object.convert', ctx, { target: 'MESH', keep_original: false })!;
     const res = run('object.convert', { target: 'MESH' });
     expect(res).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
     expect(res.error).toBe(
       `not run on the server: it would need about ${Math.round(need.bytes / MB)} MB of JavaScript heap for a mesh ` +
-        `of about ${need.faces.toLocaleString('en-US')} faces, and the server's process has 400 MB of its 2,048 MB ` +
+        `of about ${need.faces.toLocaleString('en-US')} faces, and the server's process has 400 MB of its 1,024 MB ` +
         'heap free and keeps 256 MB of it for its other work. Lower resolution_u, bevel_resolution or the number of ' +
         'spline points to run it on the server (a browser editor runs it in its own memory)',
     );
@@ -337,13 +414,13 @@ describe('exports run in the process', () => {
     ).toBe(true);
     expect(run('object.scatter_add', { surface: 'Ground', objects: ['Pebble'], count: 5000 }).ok).toBe(true);
     setOperatorMemoryCheck(
-      operatorCheck({ heapFree: () => 1500 * MB, collect: () => 0, heapLimit: () => 2048 * MB }),
+      operatorCheck({ heapFree: () => 1500 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
     );
     // 5,000 instances of 1,280 faces: the OBJ holds 6,400,001 faces (about 11 GB to build)
     const res = run('export_scene.obj');
     expect(res).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
     expect(res.error).toMatch(
-      /^not run on the server: it would need about [\d,]+ MB of JavaScript heap for a mesh of about 6,400,001 faces, and the server's process has 1,500 MB of its 2,048 MB heap free and keeps 256 MB of it for its other work\. Lower the faces of the exported meshes and instances \(export fewer objects with use_selection, lower the counts of particle systems, or use the export_scene tool, which builds the file in a render process\) to run it on the server \(a browser editor runs it in its own memory\)$/,
+      /^not run on the server: it would need about [\d,]+ MB of JavaScript heap for a mesh of about 6,400,001 faces, and the server's process has 1,500 MB of its 1,024 MB heap free and keeps 256 MB of it for its other work\. Lower the faces of the exported meshes and instances \(export fewer objects with use_selection, lower the counts of particle systems, or use the export_scene tool, which builds the file in a render process\) to run it on the server \(a browser editor runs it in its own memory\)$/,
     );
   });
 });
@@ -370,14 +447,16 @@ describe('project snapshots (REST GET /api/projects/:id/snapshot)', () => {
     const refused = snapshotRefusal(doc, {
       heapFree: () => 266 * MB,
       collect: () => collected++,
-      heapLimit: () => 2048 * MB,
+      heapLimit: () => 1024 * MB,
     });
     expect(refused).toBe(
-      "not built on the server: it would need about 11 MB of JavaScript heap (a copy of the meshes and up to 6 MB of JSON), and the server's process has 266 MB of its 2,048 MB heap free and keeps 256 MB of it for its other work. Export the meshes instead (GET /api/projects/:id/export builds the file in a render process), or delete meshes the project no longer needs",
+      "not built on the server: it would need about 11 MB of JavaScript heap (a copy of the meshes and up to 6 MB of JSON), and the server's process has 266 MB of its 1,024 MB heap free and keeps 256 MB of it for its other work. Export the meshes instead (GET /api/projects/:id/export builds the file in a render process), or delete meshes the project no longer needs",
     );
     expect(collected).toBe(1);
     // with room for it
-    expect(snapshotRefusal(doc, { heapFree: () => 300 * MB, collect: () => 0 })).toBeNull();
+    expect(
+      snapshotRefusal(doc, { heapFree: () => 300 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
+    ).toBeNull();
     // JSON longer than a JavaScript string holds: the bound from the counts (6 MB) does not refuse a
     // snapshot whose values print shorter (4.6 MB), counted when the bound is over the limit
     const mesh = doc.getMesh(doc.listMeshBlocks()[0].id)!;
@@ -389,14 +468,37 @@ describe('project snapshots (REST GET /api/projects/:id/snapshot)', () => {
       snapshotRefusal(doc, { heapFree: () => 4096 * MB, collect: () => 0, maxChars: 5 * MB }),
     ).toBeNull();
     expect(snapshotRefusal(doc, { heapFree: () => 4096 * MB, collect: () => 0, maxChars: 4 * MB })).toBe(
-      'not built on the server: the snapshot would be 5 MB of JSON, more than the 4 MB a JavaScript string can hold. Export the meshes instead (GET /api/projects/:id/export builds the file in a render process), or delete meshes the project no longer needs',
+      'not built on the server: the snapshot would be more than the 4 MB of JSON a JavaScript string can hold. Export the meshes instead (GET /api/projects/:id/export builds the file in a render process), or delete meshes the project no longer needs',
     );
+    // the count stops once it is past the limit: after the positions of a mesh, before its faces
+    const positions = JSON.stringify(Array.from(mesh.positions)).length;
+    expect(meshJsonChars(mesh, positions)).toBe(128 + positions);
+    expect(meshJsonChars(mesh, 100)).toBe(meshJsonChars(mesh, positions));
+    expect(meshJsonChars(mesh, 100)).toBeLessThan(meshJsonChars(mesh));
+    // and the meshes after the one that took it past the limit are not counted at all
+    const second = doc.listMeshBlocks()[1].id;
+    const getMesh = doc.getMesh.bind(doc);
+    let read = 0;
+    doc.getMesh = (id) => {
+      const m = getMesh(id);
+      if (id !== second || !m) return m;
+      return new Proxy(m, {
+        get: (target, key, receiver) => {
+          if (key === 'positions') read++;
+          return Reflect.get(target, key, receiver) as unknown;
+        },
+      });
+    };
+    expect(snapshotRefusal(doc, { heapFree: () => 4096 * MB, collect: () => 0, maxChars: 100 })).toMatch(
+      /^not built on the server: the snapshot would be more than the 0 MB of JSON/,
+    );
+    expect(read).toBe(0);
   });
 
   it("pass on the decode refusal of a stored mesh the server's process does not load", () => {
     const stored = SceneDoc.fromUpdate(Y.encodeStateAsUpdate(grids(1, 100).ydoc));
     setMeshMemoryCheck(
-      decodeCheck({ heapFree: () => 257 * MB, collect: () => 0, heapLimit: () => 2048 * MB }),
+      decodeCheck({ heapFree: () => 257 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
     );
     expect(snapshotRefusal(stored, { heapFree: () => 4096 * MB, collect: () => 0 })).toMatch(
       /^this mesh of 20,000 triangles was not loaded on the server: decoding it needs about 2 MB of JavaScript heap/,
@@ -414,11 +516,11 @@ describe("stored meshes in the server's process", () => {
   }
 
   const REFUSED =
-    "this mesh of 20,000 triangles was not loaded on the server: decoding it needs about 2 MB of JavaScript heap, and the server's process has 257 MB of its 2,048 MB heap free and keeps 256 MB of it for its other work (the open projects keep their meshes decoded). Delete or simplify large meshes, or work on it in a browser editor that has the project open, which loads it in its own memory";
+    "this mesh of 20,000 triangles was not loaded on the server: decoding it needs about 2 MB of JavaScript heap, and the server's process has 257 MB of its 1,024 MB heap free and keeps 256 MB of it for its other work (the open projects keep their meshes decoded). Delete or simplify large meshes, or work on it in a browser editor that has the project open, which loads it in its own memory";
 
   it('are not decoded when they do not fit: get_scene lists their stored counts and why', () => {
     setMeshMemoryCheck(
-      decodeCheck({ heapFree: () => 257 * MB, collect: () => 0, heapLimit: () => 2048 * MB }),
+      decodeCheck({ heapFree: () => 257 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
     );
     const s = summarizeScene(stored()) as any;
     expect(s.counts).toMatchObject({ vertices: 10_201, faces: 10_000 });
@@ -445,11 +547,13 @@ describe("stored meshes in the server's process", () => {
     ctx.state.selectedIds = [id];
     ctx.state.activeId = id;
     setMeshMemoryCheck(
-      decodeCheck({ heapFree: () => 257 * MB, collect: () => 0, heapLimit: () => 2048 * MB }),
+      decodeCheck({ heapFree: () => 257 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
     );
     expect(run('object.shade_smooth')).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY', error: REFUSED });
     // with room for it, the same mesh loads and the operator runs
-    setMeshMemoryCheck(decodeCheck({ heapFree: () => 400 * MB, collect: () => 0 }));
+    setMeshMemoryCheck(
+      decodeCheck({ heapFree: () => 400 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
+    );
     expect(run('object.shade_smooth').ok).toBe(true);
     expect((summarizeScene(doc) as any).objects[0].data).toMatchObject({ vertices: 10_201, faces: 10_000 });
   });
@@ -484,7 +588,9 @@ describe('get_scene problems', () => {
     );
     // every evaluation finds a little less heap free
     let free = 400;
-    setGeometryMemoryCheck(geometryCheck({ heapFree: () => (free -= 3) * MB, collect: () => 0 }));
+    setGeometryMemoryCheck(
+      geometryCheck({ heapFree: () => (free -= 3) * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
+    );
     const s = summarizeScene(doc) as any;
     expect(s.problems).toHaveLength(1);
     expect(s.problems[0]).toMatchObject({ object: 'Grid', modifier: 'Subdivision' });

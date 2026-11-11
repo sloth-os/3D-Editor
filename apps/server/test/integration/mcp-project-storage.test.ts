@@ -4,6 +4,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import {
   DELETED_ELSEWHERE_NOTE,
   LIST_FAILED_NOTE,
+  LIST_PARTIAL_NOTE,
   PROJECT_READ_MAX_AGE_MS,
 } from '../../src/mcp/project-storage';
 import { api, makeTempDir, startServer, type TestServer } from '../helpers/app';
@@ -129,13 +130,100 @@ describe('project tools with storage shared by other writers', () => {
     try {
       const listed = await ok(agent, 'list_projects');
       expect(listed.storage_listing_failed).toBe(true);
-      expect(listed.note).toBe(LIST_FAILED_NOTE);
+      expect(listed.note).toBe(LIST_PARTIAL_NOTE);
       expect(ids(listed)).toContain(loaded);
       expect(ids(listed)).not.toContain(stored);
     } finally {
       fs.read = read;
     }
     expect(ids(await ok(agent, 'list_projects'))).toContain(stored);
+  });
+
+  /*
+   * One project.json that cannot be read (a file the server may not read, a 403 for one file) hid
+   * every project that is only in storage: the server listed only the projects it had loaded, so
+   * tools found none of the others by name ("not found. Known projects: …"), and create_project
+   * made a second project with the name of one of them. Only the project whose project.json cannot
+   * be read is missing now, and a name that nothing matches says why.
+   */
+  it('list, find and keep the names of the stored projects whose project.json was read when another read fails', async () => {
+    const agent = await connect(one);
+    const other = await connect(two);
+    const { id: loaded } = await ok(agent, 'create_project', { name: 'Partly loaded', empty: true });
+    const { id: readable } = await ok(other, 'create_project', { name: 'Readable stored', empty: true });
+    const { id: broken } = await ok(other, 'create_project', { name: 'Broken stored', empty: true });
+    await two.handle.rooms.flushAll();
+    const fs = one.handle.rooms.persistence.store!.fs;
+    const read = fs.read.bind(fs);
+    fs.read = async (path, opts) => {
+      if (path.endsWith(`/${broken}/project.json`)) throw new Error('403 Forbidden');
+      return read(path, opts);
+    };
+    try {
+      const listed = await ok(agent, 'list_projects');
+      expect(listed).toMatchObject({ storage_listing_failed: true, note: LIST_PARTIAL_NOTE });
+      const ids = listed.projects.map((p: { id: string }) => p.id);
+      expect(ids).toEqual(expect.arrayContaining([loaded, readable]));
+      expect(ids).not.toContain(broken);
+      expect(await ok(agent, 'get_project', { project: 'readable stored' })).toMatchObject({ id: readable });
+      await expect(ok(agent, 'create_project', { name: 'Readable Stored', empty: true })).rejects.toThrow(
+        `A project named 'Readable stored' already exists (id ${readable})`,
+      );
+      const error = await ok(agent, 'get_scene', { project: 'Broken stored' }).catch(
+        (err: Error) => err.message,
+      );
+      expect(error).toMatch(/^get_scene failed: Project 'Broken stored' not found\. Known projects: /);
+      expect(error).toContain(
+        "Reading the project.json of some projects in storage failed (the server logged 'listing projects failed'), so a project among those is not found by name now: try again once list_projects no longer has storage_listing_failed: true.",
+      );
+    } finally {
+      fs.read = read;
+    }
+    expect(await ok(agent, 'get_project', { project: 'Broken stored' })).toMatchObject({ id: broken });
+  });
+
+  /*
+   * A tool that names a project this server has loaded found it only after listing storage: with
+   * storage that does not answer, another agent's get_project 'lighthouse' took 35 s (30 s of them
+   * listing storage). Names of loaded projects are matched first now; a name that nothing matches
+   * says that listing storage failed (it said 'There are no projects yet' when nothing was loaded).
+   */
+  it('find a loaded project by name without listing storage, and say when listing storage failed', async () => {
+    const agent = await connect(one);
+    const other = await connect(one);
+    const { id } = await ok(agent, 'create_project', { name: 'Harbour light', empty: true });
+    const fs = one.handle.rooms.persistence.store!.fs;
+    const list = fs.list.bind(fs);
+    let listings = 0;
+    let answer!: () => void;
+    const unanswered = new Promise<void>((resolve) => (answer = resolve));
+    fs.list = async (...args: Parameters<typeof list>) => {
+      listings++;
+      await unanswered;
+      return list(...args);
+    };
+    try {
+      const found = ok(other, 'get_project', { project: 'harbour LIGHT' });
+      const late = sleep(3000).then(() => 'still waiting');
+      expect(await Promise.race([found, late])).toMatchObject({ id, name: 'Harbour light' });
+      expect(listings).toBe(0);
+      fs.list = async () => {
+        throw new Error('storage offline');
+      };
+      await expect(ok(other, 'get_scene', { project: 'No such harbour' })).rejects.toThrow(
+        `get_scene failed: Project 'No such harbour' not found. Known projects: `,
+      );
+      const error = await ok(other, 'get_scene', { project: 'No such harbour' }).catch(
+        (err: Error) => err.message,
+      );
+      expect(error).toContain(
+        "Listing the projects in storage failed (the server logged 'listing projects failed'), so a project that is only in storage is not found by name now: try again once list_projects no longer has storage_listing_failed: true.",
+      );
+      expect(error).not.toContain('There are no projects yet');
+    } finally {
+      fs.list = list;
+      answer();
+    }
   });
 
   it('say so only in the list_projects whose listing failed, not in one that listed storage meanwhile', async () => {
@@ -262,6 +350,77 @@ describe('project tools with storage shared by other writers', () => {
     expect(tools.find((t) => t.name === 'delete_project')!.description).toContain(
       'up to three requests one after another for one that is not (its project.json, read twice, then ' +
         'the deletion; five when it has no project.json)',
+    );
+  });
+
+  /*
+   * The bound above holds for a project passed by its id: a name is looked up first. A name that could
+   * be an id is tried as one (project.json and document.ybin of that id, one after another), and a
+   * project this server has not loaded is found by listing storage (the listing, then every
+   * project.json at once) instead of the first read of its project.json. The description said
+   * nothing of it, so deleting by name took up to three more requests than it said (a verifier
+   * measured 6 rounds of requests instead of 3 through a WebDAV server that answered in 1 s).
+   */
+  it('delete_project of a project passed by name looks the name up first, as its description says', async () => {
+    const agent = await connect(one);
+    const other = await connect(two);
+    const slug = await ok(agent, 'create_project', { name: 'harbour-by-slug', empty: true });
+    const spaced = await ok(agent, 'create_project', { name: 'Harbour By Name', empty: true });
+    await one.handle.rooms.get(slug.id)!.flush();
+    await one.handle.rooms.get(spaced.id)!.flush();
+    expect(two.handle.rooms.get(slug.id)).toBeUndefined();
+    expect(two.handle.rooms.get(spaced.id)).toBeUndefined();
+    const fs = two.handle.rooms.persistence.store!.fs;
+    const original = { read: fs.read, remove: fs.remove, list: fs.list };
+    let requests: string[] = [];
+    fs.read = async (path, opts) => (requests.push(`read ${path}`), original.read.call(fs, path, opts));
+    fs.remove = async (path) => (requests.push(`remove ${path}`), original.remove.call(fs, path));
+    fs.list = async (dir) => (requests.push(`list ${dir}`), original.list.call(fs, dir));
+    const listing = (from: number) => {
+      // the listing, then the project.json of every project in storage (at once), this one's too
+      expect(requests[from]).toMatch(/^list \/projects\/?$/);
+      const infos = requests.slice(from + 1, requests.length - 2);
+      expect(infos.length).toBeGreaterThan(0);
+      for (const r of infos) expect(r).toMatch(/^read \/projects\/[^/]+\/project\.json$/);
+      return infos;
+    };
+    try {
+      expect(await ok(other, 'delete_project', { project: 'harbour-by-slug', confirm: true })).toEqual({
+        deleted: slug.id,
+      });
+      // tried as an id first: two requests, one after another
+      expect(requests.slice(0, 2)).toEqual([
+        'read /projects/harbour-by-slug/project.json',
+        'read /projects/harbour-by-slug/document.ybin',
+      ]);
+      expect(listing(2)).toContain(`read /projects/${slug.id}/project.json`);
+      expect(requests.slice(-2)).toEqual([
+        `read /projects/${slug.id}/project.json`,
+        `remove /projects/${slug.id}`,
+      ]);
+
+      requests = [];
+      expect(await ok(other, 'delete_project', { project: 'Harbour By Name', confirm: true })).toEqual({
+        deleted: spaced.id,
+      });
+      // not an id: the listing in place of the first read of its project.json
+      expect(listing(0)).toContain(`read /projects/${spaced.id}/project.json`);
+      expect(requests.slice(-2)).toEqual([
+        `read /projects/${spaced.id}/project.json`,
+        `remove /projects/${spaced.id}`,
+      ]);
+    } finally {
+      Object.assign(fs, original);
+    }
+    const description = (await other.listTools()).tools.find(
+      (t) => t.name === 'delete_project',
+    )!.description!;
+    expect(description).toContain(
+      "five when it has no project.json), when you pass the project's id. A name is looked up first: one " +
+        "that could be an id (letters, digits, '-' and '_') is tried as an id first (up to two more requests " +
+        'one after another; at most 5 s when this server has loaded a project of that name), and a project ' +
+        "this server has not loaded is found by listing storage (one request, then every project's " +
+        'project.json at once) instead of the first read of its project.json.',
     );
   });
 

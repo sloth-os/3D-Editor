@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { ProjectFileStore } from '@3d-editor/core';
+import { IncompleteListingError, type ProjectFileStore } from '@3d-editor/core';
 import type { ProjectListing, Room } from '../sync/room';
 import type { RoomManager } from '../sync/room-manager';
 
@@ -7,7 +7,8 @@ import type { RoomManager } from '../sync/room-manager';
  * What the project tools tell agents about storage that other writers share: a project deleted
  * from storage elsewhere while this server has it open (Room.deletedFromStorage), and a listing of
  * the projects in storage that failed (RoomManager.listProjects then lists the projects this
- * server has loaded). docs/storage-and-sync.md (Deleted projects) has the rules.
+ * server has loaded, and those whose project.json it read when only some of those reads failed).
+ * docs/storage-and-sync.md (Deleted projects) has the rules.
  */
 
 /**
@@ -22,11 +23,27 @@ export const DELETED_ELSEWHERE_NOTE =
   'or agents use it here, and the next change made here stores the whole project in storage ' +
   'again; without a change it stays deleted, and this server closes it once nobody uses it.';
 
-/** The `note` of list_projects when listing the projects in storage failed. */
+/**
+ * The `note` of list_projects when listing the projects in storage failed (RoomManager.listProjects
+ * then lists the projects this server has loaded). Tools find projects by name in that list, and
+ * create_project and rename_project check new names against it (project-names.ts).
+ */
 export const LIST_FAILED_NOTE =
   "Listing the projects in storage failed (the server logged 'listing projects failed'), so only " +
   'the projects this server has loaded are listed; projects that are only in storage are missing ' +
-  'until a later list_projects lists storage again.';
+  'until a later list_projects lists storage again. Meanwhile tools do not find those projects by ' +
+  'name, and create_project and rename_project do not refuse a name that one of them has.';
+
+/**
+ * The `note` of list_projects when storage listed its projects but reading the project.json of some
+ * of them failed (IncompleteListingError: RoomManager.listProjects lists the others).
+ */
+export const LIST_PARTIAL_NOTE =
+  "Reading the project.json of some projects in storage failed (the server logged 'listing projects " +
+  "failed'), so those projects are missing until a later list_projects reads them; the other " +
+  'projects in storage and the projects this server has loaded are listed. Meanwhile tools do not ' +
+  'find the missing projects by name, and create_project and rename_project do not refuse a name ' +
+  'that one of them has.';
 
 /**
  * get_project checks storage before it answers unless the room read it within this time (like
@@ -93,21 +110,30 @@ export async function readBeforeAnswer(
   clearTimeout(timer);
 }
 
-/** The listing of storage that the current list_projects call made (see {@link listProjects}). */
-const listing = new AsyncLocalStorage<{ failed: boolean }>();
+/** How the listing of storage that a call made went (see {@link listProjects}). */
+interface ListingOutcome {
+  /** Listing storage failed, or reading some project.json files did (`partial`). */
+  failed: boolean;
+  /** Storage listed its projects, but reading the project.json of some of them failed. */
+  partial: boolean;
+}
+
+/** The listing of storage that the current call made (see {@link listProjects}). */
+const listing = new AsyncLocalStorage<ListingOutcome>();
 /** Stores whose listProjects reports its failures to {@link listing}. */
 const watched = new WeakSet<ProjectFileStore>();
 
 /**
  * RoomManager.listProjects with whether its listing of storage failed. RoomManager.listProjects
  * only logs and counts a failure ('listing projects failed', metric persistence op 'list' status
- * 'error') and then lists the projects this server has loaded; the store's listProjects is wrapped
- * once so that a failure is recorded for the call whose listing failed (its async context), not
- * for another request's listing that failed at the same time.
+ * 'error') and then lists the projects this server has loaded, and those whose project.json it
+ * read (`partial`); the store's listProjects is wrapped once so that a failure is recorded for the
+ * call whose listing failed (its async context), not for another request's listing that failed at
+ * the same time.
  */
 export async function listProjects(
   rooms: RoomManager,
-): Promise<{ projects: ProjectListing[]; failed: boolean }> {
+): Promise<{ projects: ProjectListing[] } & ListingOutcome> {
   const store = rooms.persistence.store;
   if (store && !watched.has(store)) {
     watched.add(store);
@@ -117,12 +143,15 @@ export async function listProjects(
         return await list();
       } catch (err) {
         const call = listing.getStore();
-        if (call) call.failed = true;
+        if (call) {
+          call.failed = true;
+          call.partial = err instanceof IncompleteListingError;
+        }
         throw err;
       }
     };
   }
-  const call = { failed: false };
+  const call: ListingOutcome = { failed: false, partial: false };
   const projects = await listing.run(call, () => rooms.listProjects());
-  return { projects, failed: call.failed };
+  return { projects, ...call };
 }

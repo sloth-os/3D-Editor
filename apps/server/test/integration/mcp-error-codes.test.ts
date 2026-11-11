@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { BROWSER_UI_OPERATORS } from '@3d-editor/core';
+import { BROWSER_UI_OPERATORS, operatorMemoryCheck, setOperatorMemoryCheck } from '@3d-editor/core';
 import { editorTimeoutMessage } from '../../src/mcp/editor-commands';
 import {
   BROWSER_RASTER_SECONDS,
@@ -11,6 +11,7 @@ import {
   NEW_SHADER_SECONDS,
   SERVER_SOLID_SECONDS,
   measured,
+  measuredBrowserImages,
   measuredOnServer,
 } from '../../src/mcp/editor-costs';
 import { sharedRenderer } from '../../src/render';
@@ -286,6 +287,41 @@ describe('run_operator: every failure is the message plus JSON with a code', () 
     expect(f.json.code).toBe('INVALID_PARAMS');
     expect(Array.isArray(f.json.reports)).toBe(true);
     expect(await state(id)).toEqual(before);
+  });
+});
+
+describe('apply_modifier refused for memory', () => {
+  /*
+   * apply_modifier runs object.modifier_apply, whose refusal for memory (the operator memory check,
+   * a modifier skipped for memory, a mesh not loaded) has code OUT_OF_MEMORY in run_operator; the tool
+   * dropped it, so an agent could not tell that refusal from the others.
+   */
+  it('carries code OUT_OF_MEMORY after the message, as run_operator does; other failures stay plain', async () => {
+    const { id } = await ok('create_project', { name: 'Apply refused for memory' });
+    await ok('add_modifier', { project: id, object: 'Cube', type: 'SUBSURF' });
+    const before = operatorMemoryCheck();
+    setOperatorMemoryCheck((req) =>
+      req.operator === 'object.modifier_apply' ? 'not run on the server: a refusal of this test' : null,
+    );
+    try {
+      const r = await call('apply_modifier', { project: id, object: 'Cube', modifier: 'Subdivision' });
+      expect(r.raw.isError).toBe(true);
+      const nl = r.text.indexOf('\n');
+      expect(r.text.slice(0, nl)).toBe(
+        'object.modifier_apply failed: not run on the server: a refusal of this test',
+      );
+      expect(JSON.parse(r.text.slice(nl + 1))).toEqual({ code: 'OUT_OF_MEMORY' });
+    } finally {
+      setOperatorMemoryCheck(before);
+    }
+    // nothing changed, and a failure that is not about memory is the message alone
+    const cube = (await ok('get_scene', { project: id })).objects.find(
+      (o: { name: string }) => o.name === 'Cube',
+    );
+    expect(cube.modifiers.map((m: { name: string }) => m.name)).toEqual(['Subdivision']);
+    const missing = await call('apply_modifier', { project: id, object: 'Cube', modifier: 'Nope' });
+    expect(missing.raw.isError).toBe(true);
+    expect(missing.text).not.toContain('\n');
   });
 });
 
@@ -1438,7 +1474,7 @@ describe('tool descriptions', () => {
       /tens of seconds (per screenshot|for a screenshot in)|each screenshot then builds|while (its|the) viewport shows another/;
     expect(editor.description).not.toMatch(overstated);
     expect(editor.description).toContain(
-      `the first screenshot or viewport frame in each of them after the editor opened the project longer (${FIRST_SHADING_SECONDS} for a scene with 71 materials): the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, compile nothing`,
+      `the first screenshot or viewport frame in each of them after the editor opened the project longer (${measured(`${FIRST_SHADING_SECONDS} for a scene with 71 materials`)}): the editor builds and compiles the scene's materials for that shading and keeps them, so later screenshots in it, and the viewport switching to it, compile nothing`,
     );
     // a screenshot costs a frame of its own shading and work of its own (rpc.ts), not one frame
     for (const text of [editor.description, client.getInstructions()!]) expect(text).not.toMatch(/one frame/);
@@ -1446,7 +1482,7 @@ describe('tool descriptions', () => {
       'the viewport switching to it, compile nothing, also after the viewport turned its anti-aliasing off',
     );
     expect(editor.description).toContain(
-      `compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${measured(NEW_SHADER_SECONDS)}); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a screenshot of a scene with millions of triangles takes about a second or more in any shading, and the first WIREFRAME screenshot or frame of such a scene several times as long (the editor builds the wires of every mesh); the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and while it draws a frame of a scene with millions of triangles)`,
+      `compile nothing, also after the viewport turned its anti-aliasing off (for slow frames or more than a million triangles) and after material edits that change values (colours, roughness, texture settings), while an edit that needs a shader no material had (coat or sheen turned on, a procedural texture on a set of channels that no other material has) makes the next one in each of these two shadings compile it (${measured(NEW_SHADER_SECONDS)}); SOLID and WIREFRAME screenshots wait until the frame the viewport is drawing is done, also one that compiles; a screenshot of a scene with millions of triangles takes half a second or more in any shading, and the first WIREFRAME screenshot or frame of such a scene several times as long (the editor builds the wires of every mesh); the other commands wait while the editor's main thread is busy (during a screenshot, seconds after the viewport switched to MATERIAL or RENDERED for the first time, while it builds the scene's materials, and while it draws a frame of a scene with millions of triangles)`,
     );
     expect(editor.description).toContain(
       'a screenshot that timed out still compiles what it needs and keeps it, so retrying it waits for the rest and compiles nothing again',
@@ -1458,9 +1494,15 @@ describe('tool descriptions', () => {
       expect(text).not.toMatch(/second of these two shadings|1\.2–11\.9|11\.9 s|transmission turned on/);
     expect(client.getInstructions()).not.toMatch(overstated);
     expect(client.getInstructions()).toContain(
-      `the first screenshot or viewport frame in each of them after the editor opened the project longer (it builds and compiles the scene's materials for that shading, ${FIRST_SHADING_SECONDS} for a scene with 71 materials, and keeps them, also when the viewport turns its anti-aliasing off and through material edits that change values; an edit that needs a shader no material had, such as coat or sheen turned on or a procedural texture on a set of channels that no other material has, makes the next one in each of them compile it: ${measured(NEW_SHADER_SECONDS)}), and one of a scene with millions of triangles about a second or more in any shading`,
+      `the first screenshot or viewport frame in each of them after the editor opened the project longer (it builds and compiles the scene's materials for that shading, ${measured(`${FIRST_SHADING_SECONDS} for a scene with 71 materials`)}, and keeps them, also when the viewport turns its anti-aliasing off and through material edits that change values; an edit that needs a shader no material had, such as coat or sheen turned on or a procedural texture on a set of channels that no other material has, makes the next one in each of them compile it: ${measured(NEW_SHADER_SECONDS)}), and one of a scene with millions of triangles half a second or more in any shading`,
     );
     expect(client.getInstructions()).not.toMatch(/10–15 s|procedural wood/);
+    // the first frame in a shading drives timeout_ms: like the other times, it says how it was measured
+    // and how much longer it took on a busy machine (it used to stand alone)
+    for (const text of [editor.description, client.getInstructions()!])
+      expect(text).toContain(
+        `${FIRST_SHADING_SECONDS} for a scene with 71 materials, measured on a calm machine with 4 CPUs in software WebGL`,
+      );
     // what the editor's UI operators do there, said plainly, and wm.read_homefile's missing answer
     expect(editor.description).not.toContain('when asked for one it says what it does here');
     expect(editor.description).toContain(
@@ -1474,7 +1516,7 @@ describe('tool descriptions', () => {
     ).timeout_ms;
     expect(timeout.description).not.toMatch(overstated);
     expect(timeout.description).toContain(
-      `the first screenshot or viewport frame of a heavy scene in MATERIAL or RENDERED shading takes longer (${FIRST_SHADING_SECONDS} for a scene with 71 materials: the editor builds and compiles that shading's materials and keeps them, so later ones compile nothing), one after a material edit that needs a shader no material had as long as compiling that shader takes (${measured(NEW_SHADER_SECONDS)}), and every screenshot about a second or more in any shading with millions of triangles`,
+      `the first screenshot or viewport frame of a heavy scene in MATERIAL or RENDERED shading takes longer (${measured(`${FIRST_SHADING_SECONDS} for a scene with 71 materials`)}: the editor builds and compiles that shading's materials and keeps them, so later ones compile nothing), one after a material edit that needs a shader no material had as long as compiling that shader takes (${measured(NEW_SHADER_SECONDS)}), and every screenshot half a second or more in any shading with millions of triangles`,
     );
     expect(timeout.description).not.toMatch(/one frame/);
     expect(timeout.description).toContain('so later ones compile nothing');
@@ -1494,7 +1536,7 @@ describe('tool descriptions', () => {
     // render_image: how long a browser editor took for its RASTER images, not 'tens of seconds'
     const render = tools.get('render_image')!;
     expect(render.description).toContain(
-      `renderer browser waits up to 55 s (an editor without GPU acceleration took ${measured(BROWSER_RASTER_SECONDS)})`,
+      `renderer browser waits up to 55 s (an editor without GPU acceleration took ${measuredBrowserImages(BROWSER_RASTER_SECONDS)})`,
     );
     expect(render.description).toContain(
       `The server renders in render processes of its own: grey clay (shading SOLID) at 1280×720 took ${measuredOnServer(SERVER_SOLID_SECONDS)}, ` +
@@ -1502,7 +1544,7 @@ describe('tool descriptions', () => {
     );
     const renderer = (render.inputSchema.properties as Record<string, { description?: string }>).renderer;
     expect(renderer.description).toContain(
-      `browser: only a browser editor: RASTER with WebGL (waits up to 55 s; an editor without GPU acceleration took ${measured(BROWSER_RASTER_SECONDS)})`,
+      `browser: only a browser editor: RASTER with WebGL (waits up to 55 s; an editor without GPU acceleration took ${measuredBrowserImages(BROWSER_RASTER_SECONDS)})`,
     );
     for (const text of [render.description!, renderer.description!]) {
       expect(text).not.toMatch(/(heavy scenes? in software WebGL takes?|takes) tens of seconds/);
@@ -1612,7 +1654,7 @@ describe('timeouts of the browser editor', () => {
     // (the editor is still busy with the MATERIAL screenshot, which the message names first)
     expect(solid.text).toMatch(/sent \d+ s ago\)\. An editor without GPU acceleration/);
     expect(solid.text).toContain(
-      'An editor without GPU acceleration (software WebGL, e.g. a headless browser) takes about a ' +
+      'An editor without GPU acceleration (software WebGL, e.g. a headless browser) takes half a ' +
         'second or more per screenshot of a scene with millions of triangles even in SOLID shading, several ' +
         'times as long for its first WIREFRAME screenshot or frame of such a scene (it builds the wires of ' +
         'every mesh then, and keeps them while the mesh stays the same), and a screenshot waits until the ' +
@@ -1676,7 +1718,7 @@ describe('timeouts of the browser editor', () => {
     expect(browser.text).toBe(
       'browser render failed: the editor did not finish the RASTER image within 55 s. It may still be drawing ' +
         'it, and its next renders and commands wait until it has. An editor without GPU acceleration (e.g. a ' +
-        `headless browser) took ${measured(BROWSER_RASTER_SECONDS)}, and longer for heavier ` +
+        `headless browser) took ${measuredBrowserImages(BROWSER_RASTER_SECONDS)}, and longer for heavier ` +
         "scenes: render on the server with renderer 'software' (or 'auto'), render a smaller image, or pass " +
         "shading 'SOLID' (grey clay, faster).",
     );
