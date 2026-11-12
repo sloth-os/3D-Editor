@@ -173,7 +173,7 @@ describe(`server process with a ${HEAP_MB} MB heap that saves its projects to di
     const big = await refused('run_operator', place(10_000));
     expect(big.code).toBe('OUT_OF_MEMORY');
     expect(big.first).toMatch(
-      /^object\.array_place failed: not run on the server: the project's meshes and objects would then take about 105 MB of JavaScript heap with 9,999 new objects \(now 0 MB with 1 object\), and a save of it about 315 MB more for a moment \(3 times what its objects, datablocks and keyframes take\): 420 MB in all, more than the [\d,]+ MB the server's process keeps for one project \(half of its [\d,]+ MB heap less the 256 MB it keeps for its other work\)\. Lower count, or delete objects and meshes the project no longer needs$/,
+      /^object\.array_place failed: not run on the server: the project's meshes, objects, keyframes and images would then take about 105 MB of memory with 9,999 new objects \(now 0 MB with 1 object\), and a save of it about 315 MB more for a moment \(3 times what its objects, datablocks and keyframes take, 5 times its images\): 420 MB in all, more than the [\d,]+ MB the server's process keeps for one project \(half of its [\d,]+ MB heap less the 256 MB it keeps for its other work\)\. Lower count, or delete objects and meshes the project no longer needs$/,
     );
     // 3,999 fit with their saves (176 MB)
     await ok('run_operator', place(4_000));

@@ -174,6 +174,7 @@ function rasterNeedsAt(
   return {
     triangles: Math.max(held, e.builtBaseTriangles + results - replaces + trianglesOf(estimate.result)),
     heap: held * RASTER_BYTES_PER_TRIANGLE + e.instances * INSTANCE_BYTES.heap + estimate.bytes,
+    instances: e.instances,
   };
 }
 

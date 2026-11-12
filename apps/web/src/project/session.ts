@@ -9,13 +9,15 @@ import {
   selectionFromJSON,
   selectionToJSON,
   type PresenceState,
+  type ProjectFileStore,
   type ProjectInfo,
   type ProjectMeta,
   type SelectionJSON,
+  type WriteOptions,
 } from '@3d-editor/core';
 import { EditorStateSignals, ViewState } from '../editor/state';
 import { SyncProvider } from '../sync/provider';
-import { WebDAVSync, resolveWebDAV, type SaveReport } from '../storage/webdav';
+import { WebDAVSync, resolveWebDAV, type SaveReport, type WebDAVTarget } from '../storage/webdav';
 import { localIndex, projectDbName } from './local-index';
 import { prefs } from '../app/prefs';
 import { serverConfig, toast } from '../app/store';
@@ -34,10 +36,97 @@ export function deletedOnServerNote(viaServer: boolean): string {
     : 'This browser keeps its copy and no longer syncs it with the server.';
 }
 
+/**
+ * What this browser does with a project whose changes the server did not take for memory
+ * (SyncProvider status `refused`), after the server's reason (SyncProvider.refusal), as the toast
+ * says it once (ProjectSession.tellWhenDeletedOnServer) and the status bar's tooltip while it lasts.
+ * `viaServer`: WebDAV through the server, which is the server's storage: it gets nothing of the
+ * project either until the server took its changes (ProjectSession.guardServerStorage).
+ */
+export function refusedOnServerNote(viaServer: boolean): string {
+  return viaServer
+    ? 'This browser keeps the project with your changes (in this browser and in its other tabs) and no longer ' +
+        'syncs it with the server, nor saves it to WebDAV through the server; Save (Ctrl+S) or a reload sends ' +
+        'it to the server again.'
+    : 'This browser keeps the project with your changes (in this browser, in its other tabs and in WebDAV when ' +
+        'it saves there) and no longer syncs it with the server; Save (Ctrl+S) or a reload sends it to the ' +
+        'server again.';
+}
+
+/**
+ * What this browser does with a stored project the server cannot load for memory (SyncProvider
+ * status `refused`, SyncRefusal.load), after the server's reason, which names the project.
+ */
+export const LOAD_REFUSED_NOTE =
+  'This browser shows what it holds of the project (in this browser, or from WebDAV) and does not sync it ' +
+  'with the server; Save (Ctrl+S) or a reload asks the server to open it again.';
+
+/**
+ * How long a write of WebDAV through the server waits at most for the server to answer that it
+ * holds what the write stores (ProjectSession.guardServerStorage), ms.
+ */
+export const SERVER_HOLDS_WAIT_MS = 20_000;
+
+/**
+ * Projects whose changes the editor server did not take for memory, until it answered that it holds
+ * this browser's state again: their writes to WebDAV through that server wait for that answer, also
+ * in other tabs and after a reload (localStorage, which all tabs share; nothing is kept where it is
+ * blocked).
+ */
+export const refusedOnServer = {
+  key: (projectId: string) => `3d-editor:refused-on-server:${projectId}`,
+  has(projectId: string): boolean {
+    try {
+      return localStorage.getItem(this.key(projectId)) !== null;
+    } catch {
+      return false;
+    }
+  },
+  set(projectId: string, refused: boolean): void {
+    try {
+      if (refused) localStorage.setItem(this.key(projectId), new Date().toISOString());
+      else localStorage.removeItem(this.key(projectId));
+    } catch {
+      /* storage blocked */
+    }
+  },
+};
+
+/**
+ * Why a write of WebDAV through the server did not happen (see ProjectSession.serverTakes), in the
+ * words WebDAV's status and Save say it: "Not saved to WebDAV (…). The project is saved in this
+ * browser."
+ */
+const NOT_TAKEN =
+  "the server did not take this project's changes, so WebDAV through it gets them only once it does";
+const NOT_CONFIRMED = `the server did not answer within ${SERVER_HOLDS_WAIT_MS / 1000} s that it took this project's changes`;
+
+/**
+ * The toast of a refusal for memory (SyncProvider status `refused`): the project's title and the
+ * server's reason for changes it did not take; the reason alone, which names the project, for a
+ * stored project it cannot load (the browser may hold nothing of it, and no name).
+ */
+export function refusedToast(
+  title: string,
+  refusal: { message: string; load: boolean } | null,
+  viaServer: boolean,
+): string {
+  if (refusal?.load) return `The server did not open this project: ${refusal.message}. ${LOAD_REFUSED_NOTE}`;
+  const why = refusal ? `: ${refusal.message}.` : '.';
+  return `"${title}" is not synced with the server${why} ${refusedOnServerNote(viaServer)}`;
+}
+
 export interface PeerInfo {
   clientId: number;
   state: PresenceState;
 }
+
+/** How long after a change of the document its entry in the local project list is written (ms). */
+export const INDEX_UPDATE_MS = 3000;
+/** How often the entry asks the viewport again for a thumbnail of the latest changes (ms). */
+export const THUMBNAIL_RETRY_MS = 500;
+/** How long after a change the entry waits at most for that thumbnail (ms); then it keeps the last one. */
+export const THUMBNAIL_WAIT_MS = 30_000;
 
 /**
  * The scene of a session: while its document has no name, its name is the stored one
@@ -106,6 +195,8 @@ export class ProjectSession {
   currentOperator: string | null = null;
   /** The person was told that the server deleted the project (see tellWhenDeletedOnServer). */
   private deletionTold = false;
+  /** The person was told that the server did not take the changes for memory (same). */
+  private refusalTold = false;
 
   private constructor(readonly id: string) {
     this.doc = new SessionScene(new Y.Doc(), { type: 'local' }, () => this.storedName.value);
@@ -157,6 +248,8 @@ export class ProjectSession {
     try {
       s.idb = new IndexeddbPersistence(projectDbName(id), s.doc.ydoc);
       await s.idb.whenSynced;
+      // the thumbnail the local project list has, kept until the viewport gives one
+      s.lastThumbnail = (await localIndex.get(id).catch(() => undefined))?.thumbnail;
       if (opts.initial) Y.applyUpdate(s.doc.ydoc, opts.initial.encodeState(), s.storageOrigin);
       s.setupPresence();
       s.provider = new SyncProvider(id, s.doc.ydoc, s.awareness, null);
@@ -197,7 +290,7 @@ export class ProjectSession {
       const target = resolveWebDAV();
       if (target) {
         const webdav = new WebDAVSync(
-          target,
+          target.viaServer ? this.guardServerStorage(target) : target,
           this.id,
           this.doc,
           () => this.projectInfo(),
@@ -217,6 +310,54 @@ export class ProjectSession {
   }
 
   /**
+   * WebDAV through the editor server writes into the server's storage, whose project its rooms read
+   * and other editors sync with: a document the server's sync did not take for memory must not get
+   * there (another browser's WebDAV sync would bring it to the server again, which would refuse that
+   * browser too, and the room would not merge it). So a write of the project's document waits until
+   * the server answered that it holds what the write stores ({@link serverTakes}).
+   */
+  private guardServerStorage(target: WebDAVTarget): WebDAVTarget {
+    const { store } = target;
+    const docPath = store.docPath(this.id);
+    const fs = new Proxy(store.fs, {
+      get: (fsTarget, prop) => {
+        if (prop === 'write')
+          return async (path: string, data: Uint8Array, opts?: WriteOptions) => {
+            if (path === docPath) await this.serverTakes(data);
+            return fsTarget.write(path, data, opts);
+          };
+        const value: unknown = Reflect.get(fsTarget, prop, fsTarget);
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(fsTarget) : value;
+      },
+    });
+    return { ...target, store: Object.create(store, { fs: { value: fs } }) as ProjectFileStore };
+  }
+
+  /**
+   * Resolves when WebDAV through the server may store `data` (a state of the project's document),
+   * throws why not. While the sync connection is open: once the server answered that it holds all
+   * of it (SyncProvider.serverHolds, at most {@link SERVER_HOLDS_WAIT_MS}). Never while the server
+   * does not take this browser's changes (status `refused`), and after such a refusal (also in a
+   * page loaded again: refusedOnServer) only once it answered so. As before without live sync, while
+   * the connection is not open in a browser the server never refused, and for a project the server
+   * deleted or cannot load.
+   */
+  private async serverTakes(data: Uint8Array): Promise<void> {
+    const provider = this.provider;
+    if (!provider?.enabled) return;
+    const changesRefused = () => provider.status.value === 'refused' && !provider.refusal.value?.load;
+    if (changesRefused()) throw new Error(NOT_TAKEN);
+    const st = provider.status.value;
+    const waits = st === 'connecting' || st === 'offline' ? refusedOnServer.has(this.id) : st === 'connected';
+    if (!waits) return;
+    if (await provider.serverHolds(Y.encodeStateVectorFromUpdate(data), SERVER_HOLDS_WAIT_MS)) {
+      refusedOnServer.set(this.id, false);
+      return;
+    }
+    throw new Error(changesRefused() ? NOT_TAKEN : NOT_CONFIRMED);
+  }
+
+  /**
    * Tells the person when the server closes the project's sync connection because it deleted the
    * project (the provider then stops connecting by itself), once per deletion: a connection the
    * server closes the same way again (after Save) says nothing more until a room of the server has
@@ -226,7 +367,25 @@ export class ProjectSession {
   private tellWhenDeletedOnServer(provider: SyncProvider): void {
     this.disposers.push(
       provider.joined.subscribe((joined) => {
-        if (joined) this.deletionTold = false;
+        if (joined) {
+          this.deletionTold = false;
+          this.refusalTold = false;
+          // a room takes this browser's state again: once it holds all of it, WebDAV through the
+          // server writes as it did before the refusal
+          if (refusedOnServer.has(this.id))
+            void provider
+              .serverHolds(Y.encodeStateVector(this.doc.ydoc), SERVER_HOLDS_WAIT_MS)
+              .then((holds) => holds && refusedOnServer.set(this.id, false));
+        }
+      }),
+      // the server did not take this browser's changes (or cannot load the project) for memory
+      provider.status.subscribe((st) => {
+        if (st !== 'refused') return;
+        const refusal = provider.refusal.value;
+        if (!refusal?.load) refusedOnServer.set(this.id, true);
+        if (this.refusalTold) return;
+        this.refusalTold = true;
+        toast(refusedToast(this.title.value, refusal, !!this.webdav?.target.viaServer), 'warning', 20_000);
       }),
       provider.status.subscribe((st) => {
         if (st !== 'deleted' || this.deletionTold) return;
@@ -313,9 +472,9 @@ export class ProjectSession {
       const stopSynced = this.provider?.synced.subscribe((v) => {
         if (v) done();
       });
-      // the server deleted the project: nothing comes from it
+      // the server deleted the project, or refused it for memory: nothing comes from it
       const stopDeleted = this.provider?.status.subscribe((st) => {
-        if (st === 'deleted') done();
+        if (st === 'deleted' || st === 'refused') done();
       });
       this.disposers.push(
         () => stopSynced?.(),
@@ -324,7 +483,14 @@ export class ProjectSession {
     });
   }
 
+  /** The project's info, with a thumbnail of the viewport as it shows the project now when it can give one. */
   projectInfo(): ProjectInfo {
+    this.takeThumbnail();
+    return this.info();
+  }
+
+  /** The project's info, with the last thumbnail the viewport gave ({@link takeThumbnail}). */
+  private info(): ProjectInfo {
     const meta = this.doc.getMeta();
     let vertices = 0;
     let faces = 0;
@@ -335,31 +501,59 @@ export class ProjectSession {
         faces += c.faces;
       }
     }
-    let thumbnail: string | undefined;
-    try {
-      thumbnail = this.thumbnailProvider?.() ?? undefined;
-    } catch {
-      thumbnail = undefined;
-    }
     return {
       id: this.id,
       name: meta.name,
       created_at: meta.created_at || new Date().toISOString(),
       updated_at: new Date().toISOString(),
       schema_version: meta.schema_version,
-      thumbnail,
+      thumbnail: this.lastThumbnail,
       stats: { objects: this.doc.objectIds().length, vertices, faces },
     };
   }
 
+  /**
+   * The last thumbnail the viewport gave (see {@link takeThumbnail}); at first the one the local
+   * project list has (the viewport gives none before it drew a frame, and a hidden page draws none).
+   */
+  private lastThumbnail: string | undefined;
+
+  /**
+   * A thumbnail of the viewport as it shows the project now (`thumbnailProvider`,
+   * ViewportEngine.thumbnail: the frame the viewport drew, scaled down), kept as the project's
+   * thumbnail; null while the viewport has not drawn the latest changes, or has no viewport.
+   */
+  private takeThumbnail(): string | null {
+    try {
+      const t = this.thumbnailProvider?.() ?? null;
+      if (t) this.lastThumbnail = t;
+      return t;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Writes the project's entry in the local index {@link INDEX_UPDATE_MS} after a change, with a
+   * thumbnail of the viewport: while the viewport has not drawn the latest changes (the GPU can take
+   * a second or more for a frame of a heavy scene), every {@link THUMBNAIL_RETRY_MS}, at most until
+   * {@link THUMBNAIL_WAIT_MS} after the change, then with the thumbnail it gave last; with that one at
+   * once while the page is hidden (it draws no frames then).
+   */
   private scheduleIndexUpdate(): void {
     if (this.indexTimer) return;
-    this.indexTimer = setTimeout(() => {
+    const since = Date.now();
+    const update = () => {
       this.indexTimer = null;
-      void localIndex
-        .put({ ...this.projectInfo(), last_opened: new Date().toISOString() })
-        .catch(() => undefined);
-    }, 3000);
+      const fresh = this.takeThumbnail();
+      const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      if (fresh === null && this.thumbnailProvider && !hidden && Date.now() - since < THUMBNAIL_WAIT_MS) {
+        this.indexTimer = setTimeout(update, THUMBNAIL_RETRY_MS);
+        return;
+      }
+      void localIndex.put({ ...this.info(), last_opened: new Date().toISOString() }).catch(() => undefined);
+    };
+    this.indexTimer = setTimeout(update, INDEX_UPDATE_MS);
   }
 
   // ----------------------------------------------------------------- presence
@@ -450,9 +644,13 @@ export class ProjectSession {
   /**
    * Saves now (Save, Ctrl+S): to WebDAV, also a project another device deleted from WebDAV (the
    * browser's IndexedDB copy saves continuously), and connects to the server again when the server
-   * had deleted the project (see SyncProvider.reconnect). Resolves with what to tell the person.
+   * had deleted the project or had not taken its changes for memory (see SyncProvider.reconnect).
+   * Resolves with what to tell the person.
    */
   async flush(): Promise<SaveReport> {
+    // after a refusal for memory, the server takes the project again first (WebDAV through it waits
+    // for that); after a deletion, the save stores it again first (the server then opens it again)
+    if (this.provider?.status.value === 'refused') this.provider.reconnect();
     const report: SaveReport = this.webdav
       ? await this.webdav.save()
       : { message: 'Saved in this browser', level: 'info' };

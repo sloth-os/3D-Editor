@@ -5,9 +5,12 @@ import {
   faceCenter,
   faceNormal,
   invert4,
+  isModifierEnabled,
+  modifierDisabledMessage,
   transformPoint3,
   type Mat4,
   type MeshData,
+  type ModifierDisabledContext,
   type ObjectData,
   type SceneDoc,
   type Vec3,
@@ -180,6 +183,44 @@ function heightmap(mesh: MeshData, world: Mat4, resolution: number, round: (v: n
   };
 }
 
+/**
+ * The modifiers an evaluation of `o` left out, named as get_scene names them: those with an error of
+ * their own or skipped on the server because they would not fit into its heap (`errors`, the
+ * evaluated object's), and those Blender's is_disabled leaves out (`disabled: true`: a Bevel of width
+ * 0, a Boolean without a mesh object …). Nothing when there are none.
+ */
+function leftOutModifiers(
+  scene: SceneDoc,
+  o: ObjectData,
+  errors: readonly { modifierId: string; message: string }[],
+  forRender: boolean,
+): Record<string, unknown> {
+  const left: { modifier: string; disabled?: true; message: string }[] = errors.map((m) => ({
+    modifier:
+      m.modifierId === 'shape_keys'
+        ? 'shape keys'
+        : (o.modifiers.find((x) => x.id === m.modifierId)?.name ?? m.modifierId),
+    message: m.message.replace(/[A-Za-z0-9_-]{8,40}/g, (w) => scene.getObject(w)?.name ?? w),
+  }));
+  const ctx: ModifierDisabledContext = {
+    forRender,
+    objectType: (id) => scene.getObject(id)?.type ?? null,
+    objectName: (id) => scene.getObject(id)?.name ?? id,
+  };
+  for (const m of o.modifiers) {
+    if (!isModifierEnabled(m, { forRender, editMode: false })) continue;
+    const disabled = modifierDisabledMessage(m, ctx);
+    if (disabled) left.push({ modifier: m.name, disabled: true, message: disabled });
+  }
+  if (!left.length) return {};
+  return {
+    modifier_errors: left,
+    modifier_errors_note:
+      'this geometry is the result without the modifiers listed in modifier_errors: the evaluation left each of ' +
+      'them out for the reason given (get_scene lists them too)',
+  };
+}
+
 /** The geometry of an object for get_mesh_data (see the tool description). */
 export function meshData(scene: SceneDoc, o: ObjectData, opts: MeshDataOptions): Record<string, unknown> {
   const isMesh = o.type === 'MESH';
@@ -253,6 +294,7 @@ export function meshData(scene: SceneDoc, o: ObjectData, opts: MeshDataOptions):
           indices:
             'evaluated geometry: indices differ from the stored mesh when modifiers change the topology',
         }),
+    ...(source !== 'BASE' ? leftOutModifiers(scene, o, e?.modifierErrors ?? [], source === 'RENDER') : {}),
   };
   if (vertexRange) out.vertex_range = { offset: v0, count: v1 - v0 };
   if (faceRange) out.face_range = { offset: f0, count: f1 - f0 };

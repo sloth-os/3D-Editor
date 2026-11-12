@@ -8,6 +8,7 @@ import {
   extraJsonChars,
   EVALUATED_BYTES_PER_JSON_CHAR,
   EVALUATED_OBJECT_BYTES,
+  FCURVE_STORED_BYTES,
   IMPORT_BYTES_PER_FILE_BYTE,
   KEYFRAME_STORED_BYTES,
   MAKE_REAL_MAX_OBJECTS,
@@ -35,6 +36,7 @@ import {
   sceneEvaluationBytes,
   setOperatorMemoryCheck,
   storedMeshBytes,
+  vertexGroupBytes,
   type OperatorContext,
   type OperatorMemoryRequest,
 } from '../src/operators';
@@ -611,8 +613,9 @@ describe('objects that operators add', () => {
         4 * DATABLOCK_STORED_BYTES.lights +
         DATABLOCK_STORED_BYTES.materials +
         DATABLOCK_STORED_BYTES.meshes +
-        // three keyframes on each of location's three channels
+        // three keyframes on each of location's three channels, an F-curve each
         9 * KEYFRAME_STORED_BYTES +
+        3 * FCURVE_STORED_BYTES +
         OBJECT_JSON_STORED_BYTES * json,
     );
     // deleted objects are not counted
@@ -623,6 +626,18 @@ describe('objects that operators add', () => {
 });
 
 describe('what a project keeps and what saving it takes', () => {
+  it('counts the weights of vertex groups, a float per vertex and group', () => {
+    const s = scene();
+    s.run('mesh.primitive_grid_add', { x_subdivisions: 50, y_subdivisions: 50, name: 'Grid' });
+    const mesh = s.doc.getObject(s.state.activeId!)!.data!;
+    const before = storedMeshBytes(s.doc);
+    // an armature bound with automatic weights has a group per deforming bone
+    for (let i = 0; i < 8; i++) s.run('object.vertex_group_add', { name: `Bone.${i}` });
+    expect(vertexGroupBytes(s.doc, mesh)).toBe(8 * 4 * 51 * 51);
+    expect(storedMeshBytes(s.doc) - before).toBe(8 * 4 * 51 * 51);
+    expect(projectStoredBytes(s.doc) - before).toBeGreaterThanOrEqual(8 * 4 * 51 * 51);
+  });
+
   it("counts what a save of the project takes besides what it keeps: three times its objects' part", () => {
     const s = scene();
     s.run('mesh.primitive_grid_add', { x_subdivisions: 50, y_subdivisions: 50, name: 'Grid' });
@@ -924,14 +939,15 @@ describe('imports counted from their files', () => {
     expect(both).toMatchObject({ objects: 4, cameras: 1, lights: 1 });
   });
 
-  it('take the counts of a PLY file from its header, its corners bounded by the bytes after it', () => {
+  it('take the counts of a PLY file from its body as the importer reads it, also of a header that declares more', () => {
     const header = (format: string, v: number, f: number) =>
       `ply\nformat ${format} 1.0\nelement vertex ${v}\nproperty float x\nproperty float y\nproperty float z\n` +
       `property float u\nproperty float v\nelement face ${f}\nproperty list uchar uint vertex_indices\nend_header\n`;
-    // binary: 1,000 vertices of 20 bytes, 500 quads (1 + 16 bytes each)
+    // binary: 1,000 vertices of 20 bytes, 500 quads (a count byte and four indices of 4 bytes each)
     const head = new TextEncoder().encode(header('binary_little_endian', 1000, 500));
     const binary = new Uint8Array(head.length + 20 * 1000 + 17 * 500);
     binary.set(head);
+    for (let f = 0; f < 500; f++) binary[head.length + 20 * 1000 + 17 * f] = 4;
     const size = plyImportSize(bytesReader(binary))!;
     expect(size).toMatchObject({ meshes: 1, objects: 1, faces: 500, largestCorners: 2000 });
     expect(size.decodedBytes).toBe(
@@ -944,13 +960,59 @@ describe('imports counted from their files', () => {
         looseEdges: 0,
       }),
     );
-    // a header that declares a million faces: they are decoded whatever the file's size
-    const huge = new TextEncoder().encode(header('ascii', 1_000_000, 1_000_000));
-    expect(plyImportSize(bytesReader(huge))).toMatchObject({ faces: 1_000_000 });
-    expect(importEstimate('ply', bytesReader(huge)).bytes).toBeGreaterThan(
-      decodedMeshBytes({ vertices: 1_000_000, faces: 1_000_000, corners: 0, uvs: true, colors: false }),
+    // the project counts the mesh with a UV layer and without colors
+    expect(size.storedBytes).toBe(
+      decodedMeshBytes({ vertices: 1000, faces: 500, corners: 2000, uvs: true, colors: false }),
     );
+    // ASCII: the faces' corners as their counts say (triangles here), not bounded by the characters
+    const ascii = new TextEncoder().encode(
+      header('ascii', 4, 2) + '0 0 0 0 0\n1 0 0 1 0\n1 1 0 1 1\n0 1 0 0 1\n3 0 1 2\n3 0 2 3\n',
+    );
+    expect(plyImportSize(bytesReader(ascii))).toMatchObject({ faces: 2, largestCorners: 6 });
+    // a header that declares more than its body holds: the counts of what the body has (the import
+    // fails as truncated after reading them), not 100,000,000 vertices of 4,610 MB
+    const bogus = new TextEncoder().encode(
+      'ply\nformat ascii 1.0\nelement vertex 100000000\nproperty float x\nproperty float y\nproperty float z\n' +
+        'element face 1\nproperty list uchar int vertex_indices\nend_header\n0 0 0\n1 0 0\n0 1 0\n3 0 1 2\n',
+    );
+    expect(plyImportSize(bytesReader(bogus))).toMatchObject({ faces: 0, largestCorners: 0 });
+    const bogusBinary = new Uint8Array([
+      ...new TextEncoder().encode(
+        'ply\nformat binary_little_endian 1.0\nelement vertex 50000000\nproperty float x\nproperty float y\n' +
+          'property float z\nend_header\n',
+      ),
+      ...new Uint8Array(36),
+    ]);
+    expect(plyImportSize(bytesReader(bogusBinary))!.decodedBytes).toBe(
+      decodedMeshBytes({ vertices: 3, faces: 0, corners: 0, uvs: false, colors: false, looseEdges: 0 }),
+    );
+    const s = scene();
+    setOperatorMemoryCheck(() => null);
+    for (const file of [bogus, bogusBinary]) {
+      expect(importEstimate('ply', bytesReader(file)).bytes).toBeLessThan(OPERATOR_FIXED_BYTES + MB);
+      expect(s.reg.run(s.ctx, 'import_mesh.ply', { data_base64: base64Encode(file) })).toMatchObject({
+        ok: false,
+        error: 'Import failed: PLY data is truncated',
+      });
+    }
     expect(plyImportSize(bytesReader(new TextEncoder().encode('ply\nformat ascii 1.0\n')))).toBeNull();
+  });
+
+  it('name what to lower for a smaller import in the words of its format', () => {
+    // a PLY file is one object (an empty one counts most here): its size, not glTF nodes
+    const ply = new TextEncoder().encode(
+      'ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\n' +
+        'end_header\n0 0 0\n1 0 0\n0 1 0\n',
+    );
+    expect(importEstimate('ply', bytesReader(ply)).lower).toBe(
+      'the size of the file (import fewer or simpler meshes)',
+    );
+    // an OBJ file of 2,000 small objects: its o and g lines
+    let text = '';
+    for (let i = 0; i < 2000; i++) text += `o P${i}\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf -3 -2 -1\n`;
+    expect(importEstimate('obj', bytesReader(new TextEncoder().encode(text))).lower).toBe(
+      'the objects of the file (its o and g lines)',
+    );
   });
 
   it("count an OBJ file's objects by its o and g lines", () => {
@@ -1210,5 +1272,61 @@ describe('a Bevel limited by angle', () => {
     const made = s.doc.meshCounts(s.doc.getObject(id)!.data!)!;
     expect(made.faces).toBeGreaterThan(torus.faces.length);
     expect(e.faces).toBeGreaterThanOrEqual(made.faces);
+  });
+});
+
+describe('instances and keyframes counted by render and viewport settings', () => {
+  it('count the objects make-real makes of an emitter shown in the viewport only (more than in renders)', () => {
+    const s = scene();
+    s.run('mesh.primitive_plane_add', { size: 20, name: 'Ground' });
+    s.run('mesh.primitive_cube_add', { size: 0.1, location: [0, 0, 5], name: 'Pebble' });
+    s.run('object.scatter_add', { surface: 'Ground', objects: ['Pebble'], count: 25 });
+    const ground = s.doc.findObjectByName('Ground')!;
+    // the system hidden in renders: none there, 25 in the viewport, which make-real makes real
+    s.doc.updateObject(ground.id, {
+      particle_systems: ground.particle_systems!.map((ps) => ({ ...ps, show_render: false })),
+    });
+    s.state.selectedIds = [ground.id];
+    s.state.activeId = ground.id;
+    const hidden = s.doc.getObject(ground.id)!;
+    expect(instanceBound(s.doc, [hidden], { forRender: true, facesOf: () => 0 }).instances).toBe(0);
+    expect(instanceBound(s.doc, [hidden], { forRender: false, facesOf: () => 0 }).instances).toBe(25);
+    const e = s.estimate('object.duplicates_make_real', {})!;
+    expect(e.objects).toBe(25);
+    const before = s.doc.listObjects().length;
+    s.run('object.duplicates_make_real', {});
+    expect(s.doc.listObjects().length - before).toBe(25);
+  });
+
+  it('count the keyframes of animated morph target weights, one per target and key', () => {
+    const accessors = [
+      { count: 3, type: 'VEC3' },
+      { count: 3, type: 'VEC3' },
+      { count: 3, type: 'VEC3' },
+      // 10 keys
+      { count: 10, type: 'SCALAR' },
+      // 2 targets × 10 keys
+      { count: 20, type: 'SCALAR' },
+    ];
+    const size = gltfImportSize(
+      {
+        asset: { version: '2.0' },
+        scenes: [{ nodes: [0] }],
+        nodes: [{ mesh: 0 }],
+        meshes: [
+          { primitives: [{ attributes: { POSITION: 0 }, targets: [{ POSITION: 1 }, { POSITION: 2 }] }] },
+        ],
+        accessors,
+        animations: [
+          {
+            samplers: [{ input: 3, output: 4 }],
+            channels: [{ sampler: 0, target: { node: 0, path: 'weights' } }],
+          },
+        ],
+      },
+      0,
+    );
+    expect(size.keyframes).toBe(20);
+    expect(size.morphVertices).toBe(2 * 3);
   });
 });

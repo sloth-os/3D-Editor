@@ -12,9 +12,13 @@ vi.mock('../src/pwa/register', () => ({ pwaUpdate: { value: false }, applyPwaUpd
 afterEach(() => cleanup());
 
 /** The parts of a ProjectSession the status bar reads: its sync provider and WebDAV storage. */
-function session(status: Status, webdav: 'none' | 'via server' | 'direct' = 'none') {
+function session(
+  status: Status,
+  webdav: 'none' | 'via server' | 'direct' = 'none',
+  refusal: { message: string; load: boolean } | null = null,
+) {
   return {
-    provider: { status: signal(status), latencyMs: signal<number | null>(null) },
+    provider: { status: signal(status), latencyMs: signal<number | null>(null), refusal: signal(refusal) },
     peers: signal([]),
     webdav:
       webdav === 'none'
@@ -55,6 +59,48 @@ describe('SyncStatus (status bar)', () => {
     expect(viaServer.textContent).toBe('Deleted on server');
     expect(viaServer.title).toBe(
       'The server deleted this project. This browser keeps its copy and stores it on the server again when you change it or save (Ctrl+S).',
+    );
+  });
+
+  /*
+   * The server did not take this browser's changes for memory (it closed the connection with 4507
+   * after an error that says why) and the browser no longer connects by itself: the status bar says
+   * so, as for a deletion, with the server's reason and what the browser does.
+   */
+  it("says that the project is too large for the server, with the server's reason", () => {
+    const why = { message: 'changes not applied on the server: they add 50 new objects (test)', load: false };
+    const refused = syncStatus(session('refused', 'none', why));
+    expect(refused.dataset.status).toBe('refused');
+    expect(refused.textContent).toBe('Too large for server');
+    expect(refused.querySelector('.dot')!.className).toBe('dot err');
+    expect(refused.title).toBe(
+      'The server did not take this project: changes not applied on the server: they add 50 new objects (test). ' +
+        'This browser keeps the project with your changes (in this browser, in its other tabs and in WebDAV when it ' +
+        'saves there) and no longer syncs it with the server; Save (Ctrl+S) or a reload sends it to the server again.',
+    );
+    cleanup();
+    // WebDAV through the server is the server's storage: it gets nothing the server did not take
+    expect(syncStatus(session('refused', 'via server', why)).title).toBe(
+      'The server did not take this project: changes not applied on the server: they add 50 new objects (test). ' +
+        'This browser keeps the project with your changes (in this browser and in its other tabs) and no longer ' +
+        'syncs it with the server, nor saves it to WebDAV through the server; Save (Ctrl+S) or a reload sends it ' +
+        'to the server again.',
+    );
+  });
+
+  /* A stored project the server cannot load: the browser may hold nothing of it, and no changes. */
+  it('says that the server did not open a stored project it cannot load, with its reason', () => {
+    const refused = syncStatus(
+      session('refused', 'via server', {
+        message: "project 'Huge' (p1) was not loaded on the server: it would not fit (test)",
+        load: true,
+      }),
+    );
+    expect(refused.textContent).toBe('Too large for server');
+    expect(refused.title).toBe(
+      "The server did not open this project: project 'Huge' (p1) was not loaded on the server: it would not fit " +
+        '(test). This browser shows what it holds of the project (in this browser, or from WebDAV) and does not ' +
+        'sync it with the server; Save (Ctrl+S) or a reload asks the server to open it again.',
     );
   });
 

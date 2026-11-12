@@ -127,6 +127,40 @@ export const SERVER_SOLID_SCENE_SECONDS = '1.1–4.0 s';
 export const BROWSER_RASTER_SECONDS =
   '17–41 s for the first image of a scene with 71 materials, as it compiled them, then 2.6–7.9 s, and 1.5–5.9 s for 4 million triangles';
 
+/*
+ * What holds up an editor's commands besides the work of the commands themselves, with 4 million
+ * triangles (two grids of 1000×1000 quads, a stored document of 134 MB, disk storage): the calm runs
+ * of round 11's and round 12's TEXTS agents and verifiers (2026-11-11 and 2026-11-12), the server
+ * probed with /healthz every 10 ms from a process of its own, the editor's main thread with its long
+ * tasks. Each range is made as above ({@link MARGIN_PERCENT}); docs/mcp.md (Live editors) has the
+ * measured values.
+ */
+
+/**
+ * The editor's main thread while it applies a change made elsewhere: another agent's move of one of
+ * the grids (its long task right after the change, the viewport in SOLID shading).
+ */
+export const CHANGE_APPLY_SECONDS = '0.1–0.4 s';
+
+/**
+ * The server holds up every request while it saves a project after a change (Room.save: it reads the
+ * stored project, merges it into the open one, encodes the project, compares the two and writes it).
+ */
+export const SAVE_HOLD_SECONDS = '0.3–0.9 s';
+
+/**
+ * Right after a save the server holds up every request twice more, while it takes a fingerprint of
+ * the document it wrote (Room.guarded and Room.save storedPrint, to tell the room's own state from
+ * other writers'): at most this long each.
+ */
+export const AFTER_SAVE_HOLD_SECONDS = '0.2 s';
+
+/**
+ * The server holds up every request while it reads back from storage a project that an editor has
+ * open (once a minute) and while it sends a project to an editor that opens it.
+ */
+export const READ_HOLD_SECONDS = '0.2–1.9 s';
+
 /** How the ranges were made, after a time: see the header. */
 const MADE = `the range widened by ${MARGIN_PERCENT} %`;
 

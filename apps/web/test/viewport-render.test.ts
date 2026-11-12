@@ -41,7 +41,7 @@ import {
   type PathTraceOptions,
 } from '../src/render';
 import { startPathTrace } from '../src/render/path-trace';
-import { YOUNG_GENERATION_BYTES } from '../src/render/memory';
+import { YOUNG_GENERATION_BYTES, pageHeapEstimate } from '../src/render/memory';
 import { applyLensShift, sceneCameraView } from '../src/render/view';
 import {
   VIEW_ANIMATION_MS,
@@ -56,6 +56,7 @@ import {
   FINAL_SUPERSAMPLE_MS,
   FINAL_SUPERSAMPLE_OFFSETS,
   ViewportEngine,
+  thumbnailJpeg,
 } from '../src/viewport/engine';
 import type { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
@@ -1350,7 +1351,8 @@ describe('sun shadows', () => {
       fovY: THREE.MathUtils.degToRad(39.6),
     });
     e.sync();
-    e.thumbnail();
+    // a frame of the viewport
+    (e as unknown as { loop(now: number): void }).loop(performance.now());
     const light = [...shadowSuns(e).values()][0];
     const close = shadowMetrics(light).texel;
     for (const p of objectPoints(e, s, 'Box')) expect(inShadowMap(light, p)).toBe(true);
@@ -1450,6 +1452,256 @@ describe('heavy scenes in Rendered shading', () => {
     };
     return Object.assign(fences, { scenes });
   }
+
+  /**
+   * Records the copies of the canvas made into 2D canvases (happy-dom has no 2D canvas): a 2D context
+   * that records what is drawn into it with drawImage and does nothing else.
+   */
+  function recordCopies(): { copied: unknown[]; restore(): void } {
+    const copied: unknown[] = [];
+    const context = new Proxy({} as Record<string | symbol, unknown>, {
+      get: (_target, key) =>
+        key === 'drawImage'
+          ? (src: unknown) => copied.push(src)
+          : key === 'createImageData'
+            ? (w: number, h: number) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) })
+            : () => undefined,
+    });
+    const spy = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context as never);
+    return { copied, restore: () => spy.mockRestore() };
+  }
+
+  /**
+   * {@link fenceContext} that also reads pixels back into buffers (WebGL2 pixel pack buffers): the
+   * reads it was asked for (the framebuffer and buffer bound then), and what is bound now. Its
+   * buffers hold pixels of 200.
+   */
+  function readbackContext(gl: RecordingRenderer) {
+    const fences = fenceContext(gl);
+    const READ_FRAMEBUFFER = 0x8ca8;
+    const PIXEL_PACK_BUFFER = 0x88eb;
+    const bound = { read: 'three.js framebuffer' as unknown, pack: null as unknown };
+    const reads: { framebuffer: unknown; buffer: unknown; offset: unknown }[] = [];
+    Object.assign(gl.context as object, {
+      READ_FRAMEBUFFER,
+      READ_FRAMEBUFFER_BINDING: 0x8caa,
+      PIXEL_PACK_BUFFER,
+      PIXEL_PACK_BUFFER_BINDING: 0x88ed,
+      STREAM_READ: 0x88e1,
+      RGBA: 0x1908,
+      UNSIGNED_BYTE: 0x1401,
+      drawingBufferWidth: 8,
+      drawingBufferHeight: 4,
+      getParameter: (p: number) => (p === 0x8caa ? bound.read : p === 0x88ed ? bound.pack : null),
+      bindFramebuffer: (target: number, fb: unknown) => {
+        if (target === READ_FRAMEBUFFER) bound.read = fb;
+      },
+      bindBuffer: (target: number, buffer: unknown) => {
+        if (target === PIXEL_PACK_BUFFER) bound.pack = buffer;
+      },
+      createBuffer: () => ({ buffer: reads.length }),
+      bufferData: () => undefined,
+      readPixels: (...args: unknown[]) =>
+        reads.push({ framebuffer: bound.read, buffer: bound.pack, offset: args[6] }),
+      getBufferSubData: (_target: number, _offset: number, dst: Uint8Array) => dst.fill(200),
+      deleteBuffer: () => undefined,
+    });
+    return { fences, reads, bound };
+  }
+
+  it("draws no frame for the project's thumbnail: copies the frame the viewport drew, reads back one the GPU still draws", () => {
+    // regression: the thumbnail drew a frame of its own (with 4 million triangles in software WebGL
+    // its copy waited 0.55 to 0.95 s for the GPU, 3 s after every change); a copy of the canvas
+    // waits for the frames the GPU still draws (1.16 to 1.28 s while the animation played)
+    const s = session();
+    const { e, gl } = engine(s);
+    const { fences, reads, bound } = readbackContext(gl);
+    // the copies of the canvas made (drawImage), and the JPEGs made, of copies or read backs
+    const { copied, restore } = recordCopies();
+    let encoded = 0;
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockImplementation(
+      () => `data:image/jpeg;base64,${++encoded}`,
+    );
+    const done = () => {
+      for (const f of [...fences, ...fences.scenes]) f.done = true;
+    };
+    try {
+      // before the viewport drew anything: none, and no frame drawn for it (a hidden page draws none)
+      let renders = scenePasses(e, gl).length;
+      expect(e.thumbnail()).toBeNull();
+      expect(scenePasses(e, gl).length).toBe(renders);
+      // a frame the GPU still draws: none, nothing copied; the loop reads the canvas back after it,
+      // into a buffer, without waiting, and binds back what three.js had bound
+      frame(e);
+      renders = scenePasses(e, gl).length;
+      expect(e.thumbnail()).toBeNull();
+      frame(e);
+      expect(reads).toEqual([{ framebuffer: null, buffer: { buffer: 0 }, offset: 0 }]);
+      expect(bound).toEqual({ read: 'three.js framebuffer', pack: null });
+      expect(e.thumbnail()).toBeNull();
+      frame(e);
+      expect(reads).toHaveLength(1);
+      // drawn: the next turn of the loop makes the thumbnail of the pixels read back
+      done();
+      frame(e);
+      expect(encoded).toBe(1);
+      expect(copied).toEqual([]);
+      expect(e.thumbnail()).toBe('data:image/jpeg;base64,1');
+      expect(scenePasses(e, gl).length).toBe(renders);
+      // nothing in flight and the canvas shows the document: a copy of a frame drawn since, at once
+      e.requestRender();
+      frame(e);
+      done();
+      frame(e);
+      expect(e.thumbnail()).toBe('data:image/jpeg;base64,2');
+      expect(copied).toEqual([e.renderer.domElement]);
+      // a frame that shows no change of the document (the view moved) in flight: the copy of the
+      // frame before, which shows the same document, without waiting for it
+      e.requestRender();
+      frame(e);
+      expect(e.thumbnail()).toBe('data:image/jpeg;base64,2');
+      expect(copied).toHaveLength(1);
+      // a change of the document drawn in a frame the GPU still draws: none until it is read back
+      done();
+      frame(e);
+      s.doc.addObject({ type: 'EMPTY', name: 'Marker' });
+      frame(e);
+      expect(e.thumbnail()).toBeNull();
+      expect(copied).toHaveLength(1);
+      frame(e);
+      expect(reads).toHaveLength(2);
+      done();
+      frame(e);
+      expect(e.thumbnail()).toBe('data:image/jpeg;base64,3');
+      expect(copied).toHaveLength(1);
+      // a resize clears the canvas: a frame of another change drawn before it is not copied after it
+      s.doc.addObject({ type: 'EMPTY', name: 'Marker 2' });
+      frame(e);
+      done();
+      frame(e);
+      e.resize();
+      expect(e.thumbnail()).toBeNull();
+      expect(copied).toHaveLength(1);
+      frame(e);
+      done();
+      frame(e);
+      expect(e.thumbnail()).toBe('data:image/jpeg;base64,4');
+      expect(copied).toHaveLength(2);
+    } finally {
+      restore();
+    }
+  });
+
+  it('scales the pixels read back down into the thumbnail, the top row of the image first', () => {
+    // WebGL reads rows from the bottom: 4 × 2 pixels, the bottom row red, the top row green, each
+    // column brighter than the one on its left
+    const pixels = new Uint8Array(4 * 2 * 4);
+    for (let y = 0; y < 2; y++)
+      for (let x = 0; x < 4; x++) {
+        const k = (y * 4 + x) * 4;
+        const v = [40, 80, 160, 200][x];
+        pixels.set(y === 0 ? [v, 0, 0, 255] : [0, v, 0, 255], k);
+      }
+    let put: ImageData | null = null;
+    const context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+      createImageData: (w: number, h: number) => ({
+        width: w,
+        height: h,
+        data: new Uint8ClampedArray(w * h * 4),
+      }),
+      putImageData: (img: ImageData) => (put = img),
+    } as never);
+    const encode = vi
+      .spyOn(HTMLCanvasElement.prototype, 'toDataURL')
+      .mockReturnValue('data:image/jpeg;base64,AA==');
+    try {
+      expect(thumbnailJpeg(pixels, 4, 2, 2)).toBe('data:image/jpeg;base64,AA==');
+      // 2 × 1: each pixel the mean of the 2 × 2 it covers
+      expect(put!.width).toBe(2);
+      expect(put!.height).toBe(1);
+      expect([...put!.data]).toEqual([30, 30, 0, 255, 90, 90, 0, 255]);
+      // at full size: the top row of the image (green) first
+      expect(thumbnailJpeg(pixels, 4, 2, 4)).toBe('data:image/jpeg;base64,AA==');
+      expect([...put!.data.slice(0, 4)]).toEqual([0, 40, 0, 255]);
+      expect([...put!.data.slice(16, 20)]).toEqual([40, 0, 0, 255]);
+      expect(encode).toHaveBeenCalledWith('image/jpeg', 0.7);
+    } finally {
+      context.mockRestore();
+      encode.mockRestore();
+    }
+  });
+
+  it('reads back the thumbnail of a change while the viewport draws without a pause, holding no frame back', () => {
+    // regression: while the animation played the viewport always had frames in flight, and the
+    // thumbnail of a change waited until it stopped (30 s at most): a light project's list entry
+    // kept its old picture
+    const s = session();
+    const { e, gl } = engine(s);
+    const { fences, reads } = readbackContext(gl);
+    const { copied, restore } = recordCopies();
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/jpeg;base64,AA==');
+    /**
+     * A turn of the loop while the animation plays: the frame changes, the GPU is done with the oldest
+     * fence (and so with everything before it: fences signal in order).
+     */
+    const play = () => {
+      fences.find((f) => !f.done)!.done = true;
+      s.state.frame += 1;
+      frame(e);
+    };
+    try {
+      // the GPU draws three frames of the animation at a time
+      for (let i = 0; i < 3; i++) {
+        s.state.frame += 1;
+        frame(e);
+      }
+      const renders = () => scenePasses(e, gl).length;
+      play();
+      // a change of the document; its thumbnail is asked for while frames are in flight
+      s.doc.addObject({ type: 'EMPTY', name: 'Marker' });
+      play();
+      expect(e.thumbnail()).toBeNull();
+      // read back after the frame that shows it, and the animation goes on: a frame every turn
+      let before = renders();
+      play();
+      expect(reads).toHaveLength(1);
+      expect(renders()).toBeGreaterThan(before);
+      before = renders();
+      play();
+      expect(renders()).toBeGreaterThan(before);
+      expect(e.thumbnail()).toBeNull();
+      // once the GPU has filled its buffer: the thumbnail, no copy of the canvas made, no more reads
+      for (let i = 0; i < 4; i++) play();
+      expect(e.thumbnail()).toBe('data:image/jpeg;base64,AA==');
+      expect(copied).toEqual([]);
+      expect(reads).toHaveLength(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it('copies the frame of a change once for a thumbnail asked for before it was drawn, without WebGL2 fences', () => {
+    // without fences no frame is in flight: the loop copies the canvas once it shows the change
+    const s = session();
+    const { e } = engine(s);
+    const { copied, restore } = recordCopies();
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/jpeg;base64,AA==');
+    try {
+      frame(e);
+      s.doc.addObject({ type: 'EMPTY', name: 'Marker' });
+      expect(e.thumbnail()).toBeNull();
+      frame(e);
+      expect(copied).toEqual([]);
+      frame(e);
+      expect(copied).toEqual([e.renderer.domElement]);
+      expect(e.thumbnail()).toBe('data:image/jpeg;base64,AA==');
+      // and nothing more while the viewport draws nothing new
+      for (let i = 0; i < 3; i++) frame(e);
+      expect(copied).toHaveLength(1);
+    } finally {
+      restore();
+    }
+  });
 
   it('draws point and spot light shadow maps after scene changes, not for every frame', () => {
     // regression: every frame drew the point light's six cube faces again, also while only the view moved
@@ -2863,11 +3115,14 @@ describe('animated view changes (Blender smooth view)', () => {
 });
 
 describe('RASTER final renders and the heap of the tab', () => {
-  /** Runs `fn` with Chromium's performance.memory of a `limit`-byte heap limit, `used` bytes in use. */
-  function withHeap<T>(limit: number, used: number, fn: () => T): T {
+  /**
+   * Runs `fn` with Chromium's performance.memory of a `limit`-byte heap limit (and a usedJSHeapSize
+   * of 10 MB, which the editor does not read: the page's heap is estimated from its scene).
+   */
+  function withHeap<T>(limit: number, fn: () => T): T {
     const before = Object.getOwnPropertyDescriptor(performance, 'memory');
     Object.defineProperty(performance, 'memory', {
-      value: { jsHeapSizeLimit: limit, usedJSHeapSize: used },
+      value: { jsHeapSizeLimit: limit, usedJSHeapSize: 10 * MB },
       configurable: true,
     });
     const restore = () => {
@@ -2927,8 +3182,11 @@ describe('RASTER final renders and the heap of the tab', () => {
     s.doc.setFCurve(insertKeyframe(fc, 10, 0, 'CONSTANT'));
   }
 
-  /** The default cube as 6 copies (Array) with a Bevel by angle of 30 segments that only renders. */
-  function renderOnlyBevel(s: ProjectSession): void {
+  /**
+   * The default cube as `count` copies (Array) with a Bevel by angle of `segments` that only renders:
+   * 6 copies of 30 segments unless given.
+   */
+  function renderOnlyBevel(s: ProjectSession, count = 6, segments = 30): void {
     const cube = s.doc.listObjects().find((o) => o.type === 'MESH')!;
     const mod = (id: string, type: string, params: Record<string, unknown>, show_viewport: boolean) => ({
       id,
@@ -2943,8 +3201,8 @@ describe('RASTER final renders and the heap of the tab', () => {
     s.doc.updateObject(cube.id, {
       name: 'BevCube',
       modifiers: [
-        mod('Arr', 'ARRAY', { count: 6, relative_offset_displace: [1.5, 0, 0] }, true),
-        mod('Bev', 'BEVEL', { width: 0.05, segments: 30 }, false),
+        mod('Arr', 'ARRAY', { count, relative_offset_displace: [1.5, 0, 0] }, true),
+        mod('Bev', 'BEVEL', { width: 0.05, segments }, false),
       ] as never,
     });
   }
@@ -2957,7 +3215,9 @@ describe('RASTER final renders and the heap of the tab', () => {
     denseCable(s);
     s.view.shading.value = 'SOLID';
     const { e, gl } = engine(s);
-    // a small heap: 50 MB a render may fill, the page using 20 MB of it
+    // a small heap: 50 MB a render may fill, the page's own heap (its scene, 0.02 GB) included
+    expect(pageHeapEstimate(s.doc, 1)).toBeGreaterThan(15 * MB);
+    expect(pageHeapEstimate(s.doc, 1)).toBeLessThan(20 * MB);
     const heap = YOUNG_GENERATION_BYTES + 50 * MB;
     const refusal =
       'The RASTER render was not started: the geometry it evaluates at the render settings needs about 0.06 GB ' +
@@ -2965,7 +3225,7 @@ describe('RASTER final renders and the heap of the tab', () => {
       '(about 0.5 million triangles: curve and text surfaces, modifier and shape key results), and running out of ' +
       'memory would end the tab. Lower the triangles (subdivision render levels, curve and text render resolution, ' +
       'objects in the scene).';
-    withHeap(heap, 20 * MB, () => {
+    withHeap(heap, () => {
       expect(() => e.renderPixels()).toThrow(refusal);
       // nothing evaluated nor drawn, and the viewport as it was
       expect(finalEvaluator(e)).toBeNull();
@@ -2974,28 +3234,66 @@ describe('RASTER final renders and the heap of the tab', () => {
       // a frame of Render Animation, and an agent's render_image (renderer browser, engine RASTER)
       expect(() => e.renderPixels({ frame: 1, width: 64, height: 36, animation: true })).toThrow(refusal);
     });
-    await withHeap(heap, 20 * MB, () => expect(e.renderImage({ engine: 'RASTER' })).rejects.toThrow(refusal));
+    await withHeap(heap, () => expect(e.renderImage({ engine: 'RASTER' })).rejects.toThrow(refusal));
     // at frame 10 the cable has no bevel: no surface, nothing to refuse
-    withHeap(heap, 20 * MB, () => expect(e.renderPixels({ frame: 10 }).width).toBe(40));
+    withHeap(heap, () => expect(e.renderPixels({ frame: 10 }).width).toBe(40));
     // a capture of the viewport draws what the viewport evaluated: not refused
-    withHeap(heap, 20 * MB, () => expect(e.renderPixels({ useViewport: true }).width).toBe(40));
+    withHeap(heap, () => expect(e.renderPixels({ useViewport: true }).width).toBe(40));
+  });
+
+  it("renders a scene that builds nothing beyond what the page holds, whatever the page's own heap is estimated at", async () => {
+    // regression: four 720 × 720 grids, a page estimated past the share a render may fill (it lives
+    // with its heap), were refused for every RASTER render, which builds nothing: "needs about 0.001
+    // GB of JavaScript heap, and the tab has none left for it … (about 0 triangles …)"
+    const s = session();
+    const { e } = engine(s);
+    // a heap of 8 MB a render may fill, less than the page's own (its scene, 0.02 GB)
+    const heap = YOUNG_GENERATION_BYTES + 8 * MB;
+    expect(pageHeapEstimate(s.doc, 1)).toBeGreaterThan(8 * MB);
+    withHeap(heap, () => {
+      expect(e.renderPixels().width).toBe(40);
+      expect(e.renderPixels({ frame: 1, width: 64, height: 36, animation: true }).width).toBe(64);
+    });
+    await withHeap(heap, async () => expect((await e.renderImage({ engine: 'RASTER' })).width).toBe(40));
+    // the cube subdivided in renders builds geometry: refused there
+    const cube = s.doc.listObjects().find((o) => o.type === 'MESH')!;
+    s.doc.updateObject(cube.id, {
+      modifiers: [
+        {
+          id: 'Sub',
+          name: 'Sub',
+          type: 'SUBSURF',
+          show_viewport: true,
+          show_render: true,
+          show_in_editmode: true,
+          show_expanded: true,
+          params: { levels: 0, render_levels: 1 },
+        },
+      ] as never,
+    });
+    withHeap(heap, () =>
+      expect(() => e.renderPixels()).toThrow(
+        /^The RASTER render was not started: .*and the tab has none left for it: .*\(about 48 triangles: /,
+      ),
+    );
   });
 
   it('refuses a modifier the estimate cannot see before it runs on the page, naming it, and keeps no result without it', () => {
     // the estimate counts no edge of a Bevel limited by angle: the evaluation counts them from its
     // real input right before it runs (render/guard.ts RasterEvaluationGuard)
     const s = session();
-    renderOnlyBevel(s);
+    // 2 cubes beveled with 16 segments (bevelling the 6 cubes of 30 segments is slow under coverage)
+    renderOnlyBevel(s, 2, 16);
     const { e } = engine(s);
     registerBuiltinModifiers();
     const bevel = getModifierDef('BEVEL')!;
     let bevels = 0;
     registerModifier({ ...bevel, apply: (mesh, params, ctx) => (bevels++, bevel.apply(mesh, params, ctx)) });
     try {
-      // 9 MB the page may fill, 1 MB of it used: room for the cubes, not for their bevels
-      withHeap(YOUNG_GENERATION_BYTES + 9 * MB, MB, () => {
+      // 1 MB of room beside the page's own heap: room for the cubes, not for their bevels
+      withHeap(YOUNG_GENERATION_BYTES + pageHeapEstimate(s.doc, 1) + MB, () => {
         expect(() => e.renderPixels()).toThrow(
-          /^The RASTER render was not started: the geometry it evaluates at the render settings needs about 0\.015 GB of JavaScript heap, more than the 0\.008 GB the tab has left for it: .*\(about 69,192 triangles: curve and text surfaces, modifier and shape key results\), and running out of memory would end the tab\. The Bevel modifier 'Bev' of 'BevCube' would make 69,192 of these triangles \(lower its segments\)\. Lower the triangles/,
+          /^The RASTER render was not started: the geometry it evaluates at the render settings needs about 0\.002 GB of JavaScript heap, more than the 0\.001 GB the tab has left for it: .*\(about 6,936 triangles: curve and text surfaces, modifier and shape key results\), and running out of memory would end the tab\. The Bevel modifier 'Bev' of 'BevCube' would make 6,936 of these triangles \(lower its segments\)\. Lower the triangles/,
         );
       });
       expect(bevels).toBe(0);
@@ -3005,7 +3303,7 @@ describe('RASTER final renders and the heap of the tab', () => {
       e.renderPixels();
       expect(bevels).toBe(1);
       expect((e as unknown as { finalHeld: number }).finalHeld).toBe(
-        69_192 * RASTER_BYTES_PER_TRIANGLE + INSTANCE_BYTES.heap,
+        6_936 * RASTER_BYTES_PER_TRIANGLE + INSTANCE_BYTES.heap,
       );
     } finally {
       registerModifier(bevel);
@@ -3037,11 +3335,12 @@ describe('RASTER final renders and the heap of the tab', () => {
     // and its instance
     const needs = rasterNeeds(estimateRender(s.doc, true, 1)).heap;
     const kept = 192 * RASTER_BYTES_PER_TRIANGLE + 1 * INSTANCE_BYTES.heap;
-    // room for both: the evaluator and its caches are kept
-    withHeap(YOUNG_GENERATION_BYTES + MB + needs + kept, MB, () => e.renderPixels());
+    // room for both beside the page's own heap: the evaluator and its caches are kept
+    const page = pageHeapEstimate(s.doc, 1);
+    withHeap(YOUNG_GENERATION_BYTES + page + needs + kept, () => e.renderPixels());
     expect(finalEvaluator(e)).toBe(first);
     // room for the new one only: the kept one goes first, and the render evaluates afresh
-    withHeap(YOUNG_GENERATION_BYTES + MB + needs + kept - 1, MB, () => e.renderPixels());
+    withHeap(YOUNG_GENERATION_BYTES + page + needs + kept - 1, () => e.renderPixels());
     expect(finalEvaluator(e)).not.toBe(first);
     expect(finalEvaluator(e)).not.toBeNull();
   });
@@ -3082,9 +3381,9 @@ describe('RASTER final renders and the heap of the tab', () => {
       const need = probe.refusal!.needs.heap;
       // room for it, but not next to what the earlier render kept; the estimate of the scene, which
       // sees no edge the Bevel bevels, fits next to it: the evaluator is kept for the render
-      const heap = YOUNG_GENERATION_BYTES + MB + need + kept / 2;
+      const heap = YOUNG_GENERATION_BYTES + pageHeapEstimate(s.doc, 1) + need + kept / 2;
       expect(rasterNeeds(estimate).heap + kept).toBeLessThan(need + kept / 2);
-      withHeap(heap, MB, () => e.renderPixels());
+      withHeap(heap, () => e.renderPixels());
       // the Bevel was refused next to it and ran once evaluated without it
       expect(bevels).toBe(2);
       expect(finalEvaluator(e)).not.toBe(first);
@@ -3092,6 +3391,38 @@ describe('RASTER final renders and the heap of the tab', () => {
     } finally {
       registerModifier(bevel);
     }
+  });
+
+  it('tells a path traced render what the evaluator of final renders keeps on the page, while it keeps it', () => {
+    // a cube subdivided twice in renders: the evaluator keeps its 192 triangles and its instance
+    const s = session();
+    const cube = s.doc.listObjects().find((o) => o.type === 'MESH')!;
+    s.doc.updateObject(cube.id, {
+      modifiers: [
+        {
+          id: 'Sub',
+          name: 'Sub',
+          type: 'SUBSURF',
+          show_viewport: true,
+          show_render: true,
+          show_in_editmode: true,
+          show_expanded: true,
+          params: { levels: 0, render_levels: 2 },
+        },
+      ] as never,
+    });
+    const { e } = engine(s);
+    e.startPathTrace({ samples: 1 });
+    expect(pathTraced.at(-1)).toMatchObject({ pageHeld: 0 });
+    e.renderPixels();
+    const kept = 192 * RASTER_BYTES_PER_TRIANGLE + INSTANCE_BYTES.heap;
+    expect((e as unknown as { finalHeld: number }).finalHeld).toBe(kept);
+    e.startPathTrace({ samples: 1 });
+    expect(pathTraced.at(-1)).toMatchObject({ pageHeld: kept });
+    // once the evaluator is dropped (after a minute without final renders), nothing
+    (e as unknown as { dropFinalEvaluator(): void }).dropFinalEvaluator();
+    e.startPathTrace({ samples: 1 });
+    expect(pathTraced.at(-1)).toMatchObject({ pageHeld: 0 });
   });
 
   it("takes the page's own heap at the viewport's frame, not at the frame it renders", () => {
@@ -3139,8 +3470,9 @@ describe('RASTER final renders and the heap of the tab', () => {
     s.doc.setFCurve(insertKeyframe(fc, 10, 4, 'CONSTANT'));
     s.state.frame = 10;
     const { e } = engine(s);
-    // a heap of 400 MB, the browser's figure stale at 10 MB: the page's own scene is over the share
-    withHeap(400 * MB, 10 * MB, () =>
+    // a heap of 300 MB: the page's own scene at frame 10 is over the share
+    expect(pageHeapEstimate(s.doc, 10)).toBeGreaterThan(300 * MB - YOUNG_GENERATION_BYTES);
+    withHeap(300 * MB, () =>
       expect(() => e.renderPixels({ frame: 1 })).toThrow(
         /and the tab has none left for it: .*, and the page uses 0\.\d+ GB \(about 32,768 triangles/,
       ),
@@ -3149,7 +3481,7 @@ describe('RASTER final renders and the heap of the tab', () => {
     e.startPathTrace({ frame: 1, samples: 1 });
     expect(pathTraced.at(-1)).toMatchObject({ frame: 1, pageFrame: 10 });
     s.state.frame = 1;
-    withHeap(400 * MB, 10 * MB, () => expect(e.renderPixels({ frame: 1 }).width).toBe(40));
+    withHeap(300 * MB, () => expect(e.renderPixels({ frame: 1 }).width).toBe(40));
   });
 
   it('counts the heap the path traced renders running in the tab hold', async () => {
@@ -3171,7 +3503,8 @@ describe('RASTER final renders and the heap of the tab', () => {
       const held = tabMemoryWithRenders(0).held.heap;
       expect(held).toBeGreaterThan(0);
       // the room of the page alone, less one byte of what the running render holds
-      withHeap(YOUNG_GENERATION_BYTES + 20 * MB + needs + held - 1, 20 * MB, () =>
+      const page = pageHeapEstimate(s.doc, 1);
+      withHeap(YOUNG_GENERATION_BYTES + page + needs + held - 1, () =>
         expect(() => e.renderPixels()).toThrow(/and the page and the path traced renders running in it use/),
       );
       job.cancel();

@@ -1,7 +1,9 @@
 import {
   listModifierDefs,
   getModifierDef,
+  modifierDisabledMessage,
   modifierObjectParams,
+  modifierObjectTypes,
   safeJsonSchema,
   type ModifierData,
   type ObjectData,
@@ -100,6 +102,27 @@ export function modifierApplyBlocked(o: ObjectData): string | null {
   );
 }
 
+/**
+ * Why Blender's is_disabled leaves modifier `m` out of the stack in the viewport (null when it does
+ * not): "Modifier is disabled: the Boolean modifier 'Boolean' has no object, so it changes nothing"
+ * (modifierDisabledMessage), the tooltip of the header the tab draws red for it, as Blender's
+ * modifier_panel_header draws such a modifier's icon with uiLayoutSetRedAlert.
+ */
+export function modifierDisabledHint(s: ProjectSession, m: ModifierData): string | null {
+  const disabled = modifierDisabledMessage(m, {
+    forRender: false,
+    objectType: (id) => s.doc.getObject(id)?.type ?? null,
+    objectName: (id) => s.doc.getObject(id)?.name ?? id,
+  });
+  return disabled ? `Modifier is disabled: ${disabled}` : null;
+}
+
+/**
+ * The header colour of a disabled modifier's panel: the panel's text (--text, #e6e6e6) on it has a
+ * contrast of 8.4:1, its dim chevron (--text-dim) 4.4:1.
+ */
+const DISABLED_HEADER = '#6b2b2b';
+
 export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const ev = s.evaluator.evaluate(s.state.frame).byId.get(o.id);
   const applyBlocked = modifierApplyBlocked(o);
@@ -124,9 +147,10 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
       {o.modifiers.map((m, i) => {
         const def = getModifierDef(m.type);
         const err = ev?.modifierErrors.find((e) => e.modifierId === m.id);
-        return (
+        // with its parameters at the frame (animated ones too), as the viewport evaluates it
+        const disabled = modifierDisabledHint(s, ev?.data.modifiers.find((x) => x.id === m.id) ?? m);
+        const panel = (
           <Panel
-            key={m.id}
             id={`mod-${m.id}`}
             title={`${m.name}`}
             actions={
@@ -214,6 +238,12 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
                 values={m.params}
                 doc={s.doc}
                 objectKeys={modifierObjectParams(m.type)}
+                // the object types the parameter takes (Blender's RNA polls: a mesh for the Boolean
+                // object, an armature for the Armature object, a curve for the Curve object, …)
+                objectFilter={(key, obj) => {
+                  const types = modifierObjectTypes(m.type, key);
+                  return !types || (types as readonly string[]).includes(obj.type);
+                }}
                 testIdPrefix={`mod-${m.type.toLowerCase()}`}
                 onChange={(k, v, final) => setParam(s, o, m, k, v, final)}
               />
@@ -221,6 +251,20 @@ export function ModifiersTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
               <div class="hint">Unknown modifier type {m.type}</div>
             )}
           </Panel>
+        );
+        // the same wrapper for every modifier, so that a drag which disables the modifier (Bevel
+        // width 0) or enables it again changes only its attributes: another element would remount
+        // the panel, ending the drag with its preview left in the document
+        return (
+          <div
+            key={m.id}
+            class={disabled ? 'modifier-disabled' : undefined}
+            title={disabled ?? undefined}
+            data-testid={disabled ? `modifier-disabled-${m.name}` : undefined}
+            style={disabled ? `--bg-panel-header: ${DISABLED_HEADER}` : undefined}
+          >
+            {panel}
+          </div>
         );
       })}
     </>

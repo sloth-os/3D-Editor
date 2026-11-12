@@ -14,6 +14,8 @@ import {
   defaultSplinePoint,
   insertKeyframe,
   normalize3,
+  orientAxes,
+  orientationMatrix,
   scaling4,
   selectionPivot,
   translation4,
@@ -715,6 +717,38 @@ describe('the transform reads what a dependency cycle gives as the viewport show
     expect(reg.run(ctx, 'transform.translate', { value: [0, 0, 1] }).ok).toBe(true);
     const after = settled(new FrameState(doc, 1)).world(x)!;
     expect(maxRel(after.slice(12, 15), [shown[12], shown[13], shown[14] + 1])).toBeLessThan(1e-12);
+  });
+
+  it('starts every selected object that reads a cycle where the viewport shows it, before or after one that does not', () => {
+    // U reads nothing; X reads the cycle, selected after U, then before it
+    for (const xFirst of [false, true]) {
+      const { doc, x, shown } = poseCycleScene();
+      const u = doc.addObject({ type: 'EMPTY', name: 'U', location: [4, 0, 0] });
+      const ctx = context(doc);
+      Object.assign(ctx.state, { selectedIds: xFirst ? [x, u] : [u, x], activeId: x });
+      const median = [(4 + shown[12]) / 2, shown[13] / 2, shown[14] / 2];
+      expect(maxRel(selectionPivot(doc, ctx.state, 'MEDIAN_POINT'), median)).toBeLessThan(1e-12);
+      expect(reg.run(ctx, 'transform.translate', { value: [0, 0, 1] }).ok).toBe(true);
+      const after = settled(new FrameState(doc, 1)).world(x)!;
+      expect(maxRel(after.slice(12, 15), [shown[12], shown[13], shown[14] + 1])).toBeLessThan(1e-12);
+    }
+  });
+
+  it('moves along the LOCAL axes the viewport shows an active object that reads a cycle', () => {
+    // X turned about its Z axis: evaluated first it shows no matrix, and its stored axes are not the
+    // ones its bone's pose turns it to
+    const { doc, x } = poseCycleScene();
+    doc.updateObject(x, { rotation_euler: [0, 0, 0.7] });
+    const view = settled(new FrameState(doc, 1));
+    const before = view.world(x)!;
+    const axes = orientAxes(view, x);
+    const ctx = context(doc);
+    Object.assign(ctx.state, { selectedIds: [x], activeId: x, transformOrientation: 'LOCAL' });
+    expect(maxRel(orientationMatrix(doc, ctx.state), axes)).toBeLessThan(1e-12);
+    expect(reg.run(ctx, 'transform.translate', { value: [1, 0, 0], orient_type: 'LOCAL' }).ok).toBe(true);
+    const after = settled(new FrameState(doc, 1)).world(x)!;
+    const moved = [0, 1, 2].map((k) => after[12 + k] - before[12 + k]);
+    expect(maxRel(moved, [axes[0], axes[1], axes[2]])).toBeLessThan(1e-9);
   });
 
   it('places the Active Element pivot on an active object that reads a cycle, which it does not move', () => {

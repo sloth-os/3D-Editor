@@ -1,4 +1,4 @@
-import type { ObjectData } from '../doc/types';
+import type { ModifierData, ObjectData } from '../doc/types';
 import type { SceneDoc } from '../doc/scene-doc';
 import { decodedMeshBytes, isMeshMemoryError, type MeshLayout } from '../mesh/memory';
 import { base64Decode } from '../util/json';
@@ -13,42 +13,105 @@ import {
   type MeshSize,
 } from '../eval/memory';
 import type { MeshData } from '../mesh/types';
-import { isModifierEnabled } from '../modifiers';
+import { isModifierEnabled, modifierDisabledReason } from '../modifiers';
 import { MAX_GENERATED_FACES } from '../generate/types';
 import type { OperatorContext } from './context';
 import { GENERATOR_LOWER, generatorFaces } from './memory-generators';
 import { instanceBound } from './memory-instances';
+import {
+  LAYER_WRITE_BYTES_PER_BYTE,
+  SHAPE_KEY_BYTES_PER_VERTEX,
+  armatureParentWrites,
+  boneRenameWrites,
+  shapeKeyWrites,
+  vertexGroupWrites,
+  type LayerKind,
+  type LayerWrites,
+  type ShapeKeyChange,
+  type VertexGroupChange,
+} from './memory-layers';
+import {
+  bakeTransformsWrites,
+  copiedAnimationWrites,
+  insertManyWrites,
+  keyframeInsertWrites,
+  rigidBodyBakeWrites,
+  type KeyframeWrites,
+} from './memory-keyframes';
 import { isGLB } from '../io/glb';
+import { sanitizeRigidBodyWorld } from '../physics/settings';
 import {
   bytesReader,
   gltfImportSize,
-  objObjects,
+  objImportSize,
   plyImportSize,
   readGltfJson,
+  stlImportSize,
   type ImportReader,
   type ImportSize,
 } from '../io/import-size';
 import {
   KEYFRAME_STORED_BYTES,
+  SAVE_BYTES_PER_IMAGE_BYTE,
+  SAVE_BYTES_PER_LAYER_BYTE,
   SHAPE_KEY_STORED_BYTES_PER_VERTEX,
   dataKindOf,
   datablockExtraJsonChars,
   extraJsonChars,
   looseParts,
   materialParts,
+  meshLayerBytes,
   newObjectsBytes,
   projectObjects,
   saveBytes,
+  shapeKeyCount,
   storedMeshBytes,
+  vertexGroupBytes,
   type CountedKind,
   type NewObjects,
 } from './memory-objects';
 
 export { GENERATOR_LOWER, ISOSURFACE_FACES_PER_CELL, generatorFaces } from './memory-generators';
+export {
+  BAKE_BYTES_PER_OBJECT_FRAME,
+  BAKE_FCURVE_BYTES,
+  BAKE_GARBAGE_GROWTH,
+  BAKE_HEAP_BYTES,
+  BAKE_TRANSFORMS_MAX_FRAMES,
+  DRIVER_ADD_BYTES,
+  FRAME_STATE_BYTES_PER_DRIVER,
+  FRAME_STATE_BYTES_PER_KEYFRAME,
+  FRAME_STATE_BYTES_PER_OBJECT,
+  INSERT_MANY_BYTES_PER_KEYFRAME,
+  INSERT_MANY_REWRITE_BYTES,
+  KEYFRAME_COPY_BYTES,
+  animationByTarget,
+  copiedAnimationWrites,
+  FCURVE_ADD_BYTES,
+  KEYFRAME_ADD_BYTES,
+  KEYFRAME_REWRITE_BYTES,
+  RIGID_BODY_BAKE_BYTES,
+  RIGID_BODY_BAKE_BYTES_PER_BODY_FRAME,
+  frameSamplingBytes,
+  frameStateBytes,
+  type KeyframeWrites,
+} from './memory-keyframes';
+export {
+  ENVELOPE_WEIGHTS_BYTES_PER_VERTEX,
+  HEAT_WEIGHTS_BYTES_PER_VERTEX,
+  LAYER_OP_BYTES_PER_VERTEX,
+  LAYER_WRITE_BYTES_PER_BYTE,
+  SHAPE_KEY_BYTES_PER_VERTEX,
+  VERTEX_GROUP_BYTES_PER_VERTEX,
+  type LayerKind,
+} from './memory-layers';
 export { bytesReader, type ImportReader, type ImportSize } from '../io/import-size';
 export {
   DATABLOCK_ADD_BYTES,
   DATABLOCK_BASE_JSON_CHARS,
+  DRIVER_BASE_JSON_CHARS,
+  DRIVER_STORED_BYTES,
+  FCURVE_STORED_BYTES,
   EVALUATED_BONE_BYTES,
   EVALUATED_BYTES_PER_JSON_CHAR,
   EVALUATED_INSTANCE_BYTES,
@@ -63,18 +126,26 @@ export {
   OBJECT_JSON_STORED_BYTES,
   OBJECT_STORED_BYTES,
   PROJECT_JSON_SAMPLE,
+  SAVE_BYTES_PER_IMAGE_BYTE,
   SAVE_BYTES_PER_KEPT_BYTE,
+  SAVE_BYTES_PER_LAYER_BYTE,
   SHAPE_KEY_STORED_BYTES_PER_VERTEX,
   datablockExtraJsonChars,
+  driverExtraJsonChars,
   extraJsonChars,
+  layerBytes,
   looseParts,
   materialParts,
+  meshLayerBytes,
   newObjectsBytes,
   projectObjects,
   projectStoredBytes,
   saveBytes,
   sceneEvaluationBytes,
+  shapeKeyBytes,
+  storedImageBytes,
   storedMeshBytes,
+  vertexGroupBytes,
   type EvaluationSize,
   type NewObjects,
 } from './memory-objects';
@@ -134,8 +205,20 @@ export interface OperatorEstimate {
   addedSaveBytes?: number;
   /** Objects it adds (for messages; 0 or absent: none). */
   objects?: number;
+  /** Keyframes it adds at most (for messages; 0 or absent: none). */
+  keyframes?: number;
+  /**
+   * Bytes of rigid body frames it simulates that the document's cache keeps afterwards (physics/
+   * memory.ts; part of addedStoredBytes, not saved; 0 or absent: none).
+   */
+  simulationBytes?: number;
   /** Meshes it builds when more than one (an import; for messages, with `faces` their faces in all). */
   meshes?: number;
+  /**
+   * The vertex groups or shape keys of meshes it writes (memory-layers.ts; for messages: their kind and
+   * bytes, the more of before and after); absent: none.
+   */
+  layers?: { kind: LayerKind; bytes: number };
   /**
    * What to lower for a smaller result, completing "Lower …" (e.g. "number_cuts"); empty when the
    * operator adds next to nothing (a cube).
@@ -161,6 +244,11 @@ export interface OperatorMemoryRequest {
   saveBytes?: number;
   /** The project's objects before the operator (counted with storedBytes, else absent). */
   objects?: number;
+  /**
+   * The document the operator runs on (the server counts it with its other open projects); absent
+   * where the caller has none.
+   */
+  doc?: SceneDoc;
 }
 
 /** Returns null to run the operator, or why it is not run (it then fails with code OUT_OF_MEMORY). */
@@ -306,12 +394,13 @@ export const IMPORT_BYTES_PER_STL_TRIANGLE = 700;
 /**
  * Imports counted from their files (glTF, GLB, PLY: io/import-size.ts), per byte of the meshes they
  * decode (mesh/memory.ts decodedMeshBytes, summed over the meshes): the importer holds every mesh it
- * parsed until it stores them all, and the garbage of parsing them: 1.3–2.1 times their decoded size
- * measured beyond OPERATOR_FIXED_BYTES and the term per corner below (GLBs of 1 to 40 meshes sharing
- * the accessors of grids of 40,000 to 1,440,000 triangles, with and without normals, UVs and colors,
- * a .gltf with its data embedded, PLY files of 90,000 and 360,000 quads), rounded up.
+ * parsed until it stores them all, and the garbage of parsing them: up to 2.04 times their decoded
+ * size measured beyond OPERATOR_FIXED_BYTES and the term per corner below (GLBs of 2 to 24 meshes
+ * sharing the accessors of grids of 150 × 150 to 600 × 600 quads; 2.04 for 8 meshes of a grid of
+ * 300 × 300, which peaked at 386 MB). With 2.5 every import estimate measured is at least 1.18 times
+ * its peak (that GLB: 455 MB estimated; with 2, 381 MB, at its peak).
  */
-export const IMPORT_BYTES_PER_DECODED_BYTE = 2;
+export const IMPORT_BYTES_PER_DECODED_BYTE = 2.5;
 
 /**
  * Imports counted from their files, per face corner of the largest mesh: what the importer builds for
@@ -329,6 +418,26 @@ export const IMPORT_BYTES_PER_MORPH_VERTEX = 60;
  * them (memory-objects.ts KEYFRAME_STORED_BYTES).
  */
 export const IMPORT_BYTES_PER_KEYFRAME = 250;
+
+/**
+ * glTF images embedded in a file, per byte of those the import stores (io/import-size.ts imageBytes):
+ * the importer keeps them as they are (outside the JavaScript heap, in memory all the same); the file
+ * it decodes, the copy it takes, the document's, the update of the import's transaction and the sync
+ * frame the project's room makes of that update are held at once: 5.0 times their bytes measured as
+ * resident memory at the peak with the server's listeners on the document (GLBs with an image of 20,
+ * 40 and 60 MB: 105.1, 210.1 and 315.0 MB; test/operator-memory-rss-child.ts), rounded up: estimates
+ * 1.31–1.52 times those peaks. The project keeps them once, and a save copies them 3.0–4.0 times for
+ * a moment (memory-objects.ts storedImageBytes, SAVE_BYTES_PER_IMAGE_BYTE).
+ */
+export const IMPORT_BYTES_PER_IMAGE_BYTE = 6;
+
+/**
+ * glTF images embedded in a file that the import leaves out (of materials no imported mesh uses), per
+ * byte: the file the import decodes holds them while it runs (1 per byte read from the code: the GLB's
+ * binary chunk is a view of the decoded file; a GLB of 60 MB with 2 such images of 20 MB peaked 40 MB
+ * above the same file with one), rounded up.
+ */
+export const IMPORT_BYTES_PER_UNUSED_IMAGE_BYTE = 1.5;
 
 /**
  * glTF JSON text the import parses, per character (the text and the objects it is parsed into; a
@@ -672,10 +781,29 @@ function objectMeshes(lower: string, opts: { copies?: boolean; singleUser?: bool
     for (const o of objects) decoded += meshBytes(ctx.doc, o.data);
     const faces = facesOf(ctx, objects);
     const added = opts.copies ? decoded : opts.singleUser ? singleUserCopies(ctx.doc, objects) : 0;
+    // the copies of meshes also get their vertex groups and shape keys (object.ts duplicate), each list
+    // read and written again (memory-layers.ts), kept and saved as the project counts them
+    let layers = 0;
+    let layersKept = 0;
+    if (opts.copies)
+      for (const o of objects) {
+        layers += meshLayerBytes(ctx.doc, o.data!);
+        layersKept +=
+          vertexGroupBytes(ctx.doc, o.data!) +
+          SHAPE_KEY_STORED_BYTES_PER_VERTEX *
+            shapeKeyCount(ctx.doc, o.data!) *
+            (ctx.doc.meshCounts(o.data!)?.vertices ?? 0);
+      }
     return {
-      bytes: OPERATOR_FIXED_BYTES + OBJECT_MESH_BYTES_PER_FACE * faces + decoded + added,
+      bytes:
+        OPERATOR_FIXED_BYTES +
+        OBJECT_MESH_BYTES_PER_FACE * faces +
+        decoded +
+        added +
+        LAYER_WRITE_BYTES_PER_BYTE * layers,
       faces,
-      addedStoredBytes: added,
+      addedStoredBytes: added + layersKept,
+      ...(layers > 0 ? { addedSaveBytes: SAVE_BYTES_PER_LAYER_BYTE * layers } : {}),
       lower,
     };
   };
@@ -771,6 +899,18 @@ interface EvaluatedGeometry {
 }
 
 /**
+ * Whether an evaluation runs modifier `m` of an object of `doc` (modifiers/registry.ts
+ * evaluateModifierStack): enabled in the mode evaluated (render or viewport settings) and not
+ * disabled by its type's rule (Blender's is_disabled: a Boolean whose object is not a mesh, an Array
+ * whose cap is not one, a Curve modifier without a curve …), which reads the types of the objects
+ * it names.
+ */
+export function modifierRuns(doc: SceneDoc, m: ModifierData, forRender: boolean): boolean {
+  if (!isModifierEnabled(m, { forRender, editMode: false })) return false;
+  return !modifierDisabledReason(m, { forRender, objectType: (id) => doc.getObject(id)?.type ?? null });
+}
+
+/**
  * The geometry an evaluation gives object `o` (render or viewport settings), estimated from stored
  * counts like a server evaluation: a mesh and its enabled modifiers (each estimated, eval/memory.ts),
  * a curve or text surface (or the wire of a curve without one) and its modifiers. Null for objects
@@ -805,7 +945,7 @@ function evaluatedGeometry(
   const base = size;
   let first = o.type === 'MESH';
   for (const m of o.modifiers) {
-    if (!isModifierEnabled(m, { forRender, editMode: false })) continue;
+    if (!modifierRuns(ctx.doc, m, forRender)) continue;
     const e = estimateModifier(m, size, modifierContext(ctx.doc, o, m, first, forRender));
     first = false;
     if (e.failsByItself) break;
@@ -841,9 +981,11 @@ function evaluationBytes(ctx: OperatorContext, forRender: boolean): number {
 /**
  * The modifier stack of `o` up to and including modifier `upTo` (all when null), estimated from its
  * stored counts like a server evaluation (eval/memory.ts): the peak of its modifiers and the size of
- * its result. Null when a modifier of it fails by itself (over its own limit): the operator then
- * refuses the object without building anything (object.convert and object.modifier_apply refuse
- * stacks with errors).
+ * its result. The modifiers that run are the ones the operator runs (modifierRuns, viewport
+ * settings), and modifier `upTo` also when the viewport hides it: object.modifier_apply applies it
+ * turned on, as Blender does. Null when a modifier of it fails by itself (over its own limit): the
+ * operator then refuses the object without building anything (object.convert and
+ * object.modifier_apply refuse stacks with errors).
  */
 function stackEstimate(
   ctx: OperatorContext,
@@ -857,8 +999,8 @@ function stackEstimate(
   let lower = '';
   const mods = o.modifiers.slice(0, upTo === null ? undefined : upTo + 1);
   let first = true;
-  for (const m of mods) {
-    if (!isModifierEnabled(m, { forRender: false, editMode: false })) continue;
+  for (const [i, m] of mods.entries()) {
+    if (!modifierRuns(ctx.doc, i === upTo ? { ...m, show_viewport: true } : m, false)) continue;
     const e = estimateModifier(m, size, modifierContext(ctx.doc, o, m, first, false));
     first = false;
     if (e.failsByItself) return null;
@@ -872,8 +1014,9 @@ function stackEstimate(
 }
 
 /**
- * object.modifier_apply: the stack's peak up to the modifier, a copy of its result and the stored
- * result. object.convert to MESH: a new evaluation of the whole scene (evaluationBytes), then for every
+ * object.modifier_apply: a new evaluation of the whole scene (evaluationBytes: it evaluates the scene
+ * for the objects its modifiers name), the stack's peak up to the modifier, a copy of its result and
+ * the stored result. object.convert to MESH: a new evaluation of the whole scene, then for every
  * selected object it bakes (a mesh with modifiers, a curve or a text; linked duplicates each, every
  * one gets a mesh of its own) the peak of building its geometry, a copy of it and the stored copy; the
  * young generation's garbage of building curve and text surfaces once (OPERATOR_FIXED_BYTES), not
@@ -935,7 +1078,8 @@ function bakeStack(which: 'convert' | 'apply'): Estimator {
     if (!bytes) return null;
     return withObjects(
       {
-        bytes: OPERATOR_FIXED_BYTES + bytes + (which === 'convert' ? evaluationBytes(ctx, false) : 0),
+        // both evaluate the whole scene first (the objects a Boolean or a Curve modifier names)
+        bytes: OPERATOR_FIXED_BYTES + bytes + evaluationBytes(ctx, false),
         faces,
         addedStoredBytes: added,
         lower:
@@ -980,14 +1124,17 @@ export function binaryStlTriangles(head: Uint8Array, fileBytes: number): number 
 
 /**
  * What to lower for a smaller import, by what takes most of its memory (the meshes of a glTF file
- * with more than one mesh, which may share accessors; the size of other files).
+ * with more than one mesh, which may share accessors; the objects of a glTF or OBJ file that makes
+ * more than one, in the words of its format; the size of other files).
  */
 const IMPORT_LOWER = {
   size: 'the size of the file (import fewer or simpler meshes)',
   meshes:
     'the meshes of the file (every glTF mesh is decoded into a mesh of its own, also where meshes share the same accessors)',
   objects: 'the nodes (objects) of the file',
+  objBlocks: 'the objects of the file (its o and g lines)',
   keyframes: 'the animation keyframes of the file',
+  images: 'the images embedded in the file (fewer or smaller textures)',
 };
 
 /** An import counted from its file (io/import-size.ts): the meshes it decodes, its objects, keyframes and JSON. */
@@ -997,25 +1144,37 @@ function countedImport(s: ImportSize): OperatorEstimate {
     IMPORT_BYTES_PER_CORNER_OF_LARGEST_MESH * s.largestCorners +
     IMPORT_BYTES_PER_MORPH_VERTEX * s.morphVertices;
   const keyframes = IMPORT_BYTES_PER_KEYFRAME * s.keyframes;
+  const images =
+    IMPORT_BYTES_PER_IMAGE_BYTE * s.imageBytes +
+    IMPORT_BYTES_PER_UNUSED_IMAGE_BYTE * Math.max(0, s.fileImageBytes - s.imageBytes);
   const objects = newObjectsBytes({ objects: s.objects }).peak;
   const lower =
-    objects > meshes && objects > keyframes
-      ? IMPORT_LOWER.objects
-      : keyframes > meshes
-        ? IMPORT_LOWER.keyframes
-        : s.jsonChars && s.meshes > 1
-          ? IMPORT_LOWER.meshes
-          : IMPORT_LOWER.size;
+    images > meshes && images > keyframes && images > objects
+      ? IMPORT_LOWER.images
+      : s.objects > 1 && objects > meshes && objects > keyframes
+        ? IMPORT_LOWER.objects
+        : keyframes > meshes
+          ? IMPORT_LOWER.keyframes
+          : s.jsonChars && s.meshes > 1
+            ? IMPORT_LOWER.meshes
+            : IMPORT_LOWER.size;
   return withObjects(
     {
-      bytes: OPERATOR_FIXED_BYTES + meshes + keyframes + IMPORT_BYTES_PER_JSON_CHAR * s.jsonChars,
+      bytes: OPERATOR_FIXED_BYTES + meshes + keyframes + images + IMPORT_BYTES_PER_JSON_CHAR * s.jsonChars,
       faces: s.faces,
       meshes: s.meshes,
+      // the meshes as the project counts them afterwards (every stored mesh with a UV layer), and
+      // the images it keeps
       addedStoredBytes:
-        s.decodedBytes +
+        s.storedBytes +
         SHAPE_KEY_STORED_BYTES_PER_VERTEX * s.morphVertices +
-        KEYFRAME_STORED_BYTES * s.keyframes,
-      addedSaveBytes: saveBytes(KEYFRAME_STORED_BYTES * s.keyframes),
+        KEYFRAME_STORED_BYTES * s.keyframes +
+        s.imageBytes,
+      // a save copies the images, and the positions of the morph targets' shape keys
+      addedSaveBytes:
+        saveBytes(KEYFRAME_STORED_BYTES * s.keyframes) +
+        SAVE_BYTES_PER_IMAGE_BYTE * s.imageBytes +
+        SAVE_BYTES_PER_LAYER_BYTE * SHAPE_KEY_BYTES_PER_VERTEX * s.morphVertices,
       lower,
     },
     {
@@ -1034,30 +1193,37 @@ function countedImport(s: ImportSize): OperatorEstimate {
  */
 export function importEstimate(format: string, file: ImportReader): OperatorEstimate {
   const lower = IMPORT_LOWER.size;
-  const bySize = (objects: number) =>
+  // the peak by the file's size; the meshes kept as counted (`counted`) or by the size too
+  const bySize = (objects: number, counted?: { faces: number; stored: number }) =>
     withObjects(
       {
         bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_FILE_BYTE * file.byteLength,
-        faces: 0,
-        addedStoredBytes: IMPORT_STORED_BYTES_PER_FILE_BYTE * file.byteLength,
+        faces: counted?.faces ?? 0,
+        addedStoredBytes: counted ? counted.stored : IMPORT_STORED_BYTES_PER_FILE_BYTE * file.byteLength,
         lower,
       },
       { objects, datablocks: { meshes: objects } },
       lower,
     )!;
   if (format === 'stl') {
-    const tris = binaryStlTriangles(file.read(0, 84), file.byteLength);
-    if (tris === null) return bySize(1);
+    const s = stlImportSize(file);
+    // the mesh as the project counts it afterwards: welded, with a UV layer
     const stored = decodedMeshBytes({
-      vertices: 3 * tris,
-      faces: tris,
-      corners: 3 * tris,
-      uvs: false,
+      vertices: s.vertices,
+      faces: s.faces,
+      corners: s.corners,
+      uvs: true,
       colors: false,
     });
+    const tris = s.triangles;
+    if (tris === null) return bySize(1, { faces: s.faces, stored });
     return withObjects(
       {
-        bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_STL_TRIANGLE * tris + stored,
+        // the triangles read and welded, and the mesh decoded before welding
+        bytes:
+          OPERATOR_FIXED_BYTES +
+          IMPORT_BYTES_PER_STL_TRIANGLE * tris +
+          decodedMeshBytes({ vertices: 3 * tris, faces: tris, corners: 3 * tris, uvs: false, colors: false }),
         faces: tris,
         addedStoredBytes: stored,
         lower,
@@ -1066,10 +1232,21 @@ export function importEstimate(format: string, file: ImportReader): OperatorEsti
     )!;
   }
   if (format === 'obj') {
-    const objects = objObjects(file);
-    const e = bySize(objects);
-    return objects > 1 && newObjectsBytes({ objects }).peak > IMPORT_BYTES_PER_FILE_BYTE * file.byteLength
-      ? { ...e, lower: IMPORT_LOWER.objects }
+    const s = objImportSize(file);
+    // the meshes as the project counts them afterwards (with a UV layer)
+    const e = bySize(s.objects, {
+      faces: s.faces,
+      stored: decodedMeshBytes({
+        vertices: s.vertices,
+        faces: s.faces,
+        corners: s.corners,
+        uvs: true,
+        colors: false,
+      }),
+    });
+    return s.objects > 1 &&
+      newObjectsBytes({ objects: s.objects }).peak > IMPORT_BYTES_PER_FILE_BYTE * file.byteLength
+      ? { ...e, lower: IMPORT_LOWER.objBlocks }
       : e;
   }
   let size: ImportSize | null = null;
@@ -1238,11 +1415,24 @@ function layout(kind: 'array' | 'scatter'): Estimator {
   };
 }
 
+/** The type F-curves and drivers name an object's data by (object.ts duplicate, anim.ts copyAnimation). */
+const ANIMATION_DATA_TYPE: Partial<Record<ObjectData['type'], string>> = {
+  MESH: 'mesh',
+  CURVE: 'curve',
+  FONT: 'curve',
+  LIGHT: 'light',
+  CAMERA: 'camera',
+  ARMATURE: 'armature',
+};
+
 /**
  * object.duplicate: a copy of every selected object (each linked duplicate too, with its modifiers
  * and settings) and, with linked false, of every datablock they use, once each as object.ts copies
  * shared data once: the meshes decoded, copied and stored (objectMeshes), the curves, lights,
- * cameras and armatures with their JSON (memory-objects.ts datablockExtraJsonChars).
+ * cameras and armatures with their JSON (memory-objects.ts datablockExtraJsonChars); and the
+ * animation the copies get (anim.ts copyAnimation: the F-curves, keyframes and drivers of every
+ * duplicated object and copied datablock, memory-keyframes.ts copiedAnimationWrites). What to lower
+ * names what takes most of it: the selected objects, the meshes copied or the animation.
  */
 const duplicate: Estimator = (ctx, p) => {
   const selected = ctx.state.selectedIds
@@ -1251,26 +1441,44 @@ const duplicate: Estimator = (ctx, p) => {
   if (!selected.length) return null;
   const datablocks: Partial<Record<CountedKind, number>> = {};
   const seen = new Set<string>();
+  const animated: string[] = [];
   let extraJson = 0;
   for (const o of selected) {
     extraJson += extraJsonChars(o);
+    animated.push(`object:${o.id}`);
     const kind = p.linked ? null : dataKindOf(o.type);
     if (!kind || !o.data || seen.has(o.data)) continue;
     seen.add(o.data);
     datablocks[kind] = (datablocks[kind] ?? 0) + 1;
     extraJson += datablockExtraJsonChars(ctx.doc, kind, o.data);
+    if (ANIMATION_DATA_TYPE[o.type]) animated.push(`${ANIMATION_DATA_TYPE[o.type]}:${o.data}`);
   }
+  const added: NewObjects = { objects: selected.length, datablocks, extraJson };
   const meshes = p.linked
     ? null
     : objectMeshes('the number or size of the duplicated meshes (or pass linked: true)', { copies: true })(
         ctx,
         p,
       );
-  return withObjects(
-    meshes,
-    { objects: selected.length, datablocks, extraJson },
-    'the number of selected objects',
-  );
+  const anim = copiedAnimationWrites(ctx.doc, animated);
+  const objectsPeak = newObjectsBytes(added).peak;
+  const meshesPeak = meshes ? meshes.bytes - OPERATOR_FIXED_BYTES : 0;
+  const animPeak = anim?.bytes ?? 0;
+  const lower =
+    meshes && meshesPeak >= objectsPeak && meshesPeak >= animPeak
+      ? meshes.lower
+      : anim && animPeak > objectsPeak
+        ? anim.lower
+        : 'the number of selected objects';
+  const e = withObjects(meshes, added, lower)!;
+  return {
+    ...e,
+    bytes: e.bytes + animPeak,
+    addedStoredBytes: (e.addedStoredBytes ?? 0) + (anim?.stored ?? 0),
+    addedSaveBytes: (e.addedSaveBytes ?? 0) + (anim?.save ?? 0),
+    ...(anim ? { keyframes: anim.keys } : {}),
+    lower,
+  };
 };
 
 /** Most objects object.duplicates_make_real makes per run (operators/instancing.ts MAX_MAKE_REAL). */
@@ -1392,12 +1600,13 @@ const meshFromData: Estimator = (_ctx, p) => {
   const faces = Array.isArray(p.faces) ? p.faces.length : 0;
   let corners = 0;
   if (Array.isArray(p.faces)) for (const f of p.faces) corners += Array.isArray(f) ? f.length : 0;
-  const stored = decodedMeshBytes({ vertices: verts, faces, corners, uvs: !!p.uvs, colors: false });
+  const built = decodedMeshBytes({ vertices: verts, faces, corners, uvs: !!p.uvs, colors: false });
   return withObjects(
     {
-      bytes: OPERATOR_FIXED_BYTES + OBJECT_MESH_BYTES_PER_FACE * faces + stored,
+      bytes: OPERATOR_FIXED_BYTES + OBJECT_MESH_BYTES_PER_FACE * faces + built,
       faces,
-      addedStoredBytes: stored,
+      // as the project counts the mesh afterwards (with a UV layer)
+      addedStoredBytes: decodedMeshBytes({ vertices: verts, faces, corners, uvs: true, colors: false }),
       lower: 'the number of vertices and faces',
     },
     { objects: 1, datablocks: { meshes: 1 } },
@@ -1454,6 +1663,188 @@ const modeSet: Estimator = (ctx, p) => {
   const o = ctx.state.activeId ? ctx.doc.getObject(ctx.state.activeId) : null;
   if (!o || o.type !== 'MESH' || !o.data) return null;
   return editModeEstimate(ctx.doc, o.data);
+};
+
+/**
+ * An operator that writes keyframes (memory-keyframes.ts); null when it fails by itself. The rigid body
+ * frames a bake simulates count with what the project keeps (its cache holds them), not saved.
+ */
+function keyframeEstimate(w: KeyframeWrites | null): OperatorEstimate | null {
+  if (!w) return null;
+  const simulation = w.simulation ?? 0;
+  return {
+    bytes: OPERATOR_FIXED_BYTES + w.bytes,
+    faces: 0,
+    addedStoredBytes: w.stored + simulation,
+    addedSaveBytes: w.save,
+    keyframes: w.keys,
+    ...(simulation > 0 ? { simulationBytes: simulation } : {}),
+    lower: w.lower,
+  };
+}
+
+/**
+ * The objects `refs` names (ids or names, each once; unknown ones left out: the operator reports
+ * them itself), or the selected objects without any.
+ */
+function refObjects(ctx: OperatorContext, refs: unknown): ObjectData[] {
+  const list = Array.isArray(refs) && refs.length ? refs.map(String) : ctx.state.selectedIds;
+  const seen = new Set<string>();
+  const out: ObjectData[] = [];
+  for (const r of list) {
+    const o = ctx.doc.getObject(r) ?? ctx.doc.resolveObject(r);
+    if (!o || seen.has(o.id)) continue;
+    seen.add(o.id);
+    out.push(o);
+  }
+  return out;
+}
+
+/** anim.bake_transforms (memory-keyframes.ts bakeTransformsWrites). */
+const bakeTransforms: Estimator = (ctx, p) => {
+  const scene = ctx.doc.getScene();
+  return keyframeEstimate(
+    bakeTransformsWrites(
+      ctx.doc,
+      refObjects(ctx, p.objects).map((o) => o.id),
+      {
+        start: num(p.frame_start, scene.frame_start),
+        end: num(p.frame_end, scene.frame_end),
+        step: num(p.step, 1),
+        channels: Array.isArray(p.channels)
+          ? p.channels.map(String)
+          : ['location', 'rotation_euler', 'scale'],
+        clearParents: p.clear_parents === true,
+      },
+    ),
+  );
+};
+
+/** rigidbody.bake_to_keyframes (memory-keyframes.ts rigidBodyBakeWrites); the range defaults to the world's. */
+const rigidBodyBake: Estimator = (ctx, p) => {
+  const world = sanitizeRigidBodyWorld(ctx.doc.getScene().rigidbody_world);
+  return keyframeEstimate(
+    rigidBodyBakeWrites(ctx.doc, refObjects(ctx, p.objects), {
+      start: num(p.frame_start, world.frame_start),
+      end: num(p.frame_end, world.frame_end),
+      step: num(p.step, 1),
+    }),
+  );
+};
+
+/**
+ * anim.keyframes_insert_many: the keyframes given, on the channel of an object (the F-curve it may
+ * already have is rewritten); other datablocks' channels count as new F-curves.
+ */
+const insertMany: Estimator = (ctx, p) => {
+  const keys = Array.isArray(p.frames) ? p.frames.length : 0;
+  if (!keys) return null;
+  const target =
+    (p.target_type ?? 'object') !== 'object'
+      ? null
+      : p.target !== undefined
+        ? ctx.doc.resolveObject(String(p.target))
+        : ctx.state.activeId
+          ? ctx.doc.getObject(ctx.state.activeId)
+          : null;
+  const ref = target
+    ? {
+        target_type: 'object' as const,
+        target_id: target.id,
+        path: String(p.path ?? ''),
+        index: num(p.index, 0),
+      }
+    : null;
+  return keyframeEstimate(insertManyWrites(ctx.doc, ref, keys, p.replace === true));
+};
+
+/** anim.keyframe_insert: a keyframe per channel of the keying set on every selected object. */
+const keyframeInsert: Estimator = (ctx, p) => {
+  const objects = refObjects(ctx, null);
+  return objects.length
+    ? keyframeEstimate(keyframeInsertWrites(ctx.doc, objects, String(p.type ?? 'LocRotScale')))
+    : null;
+};
+
+/**
+ * An operator that writes vertex groups or shape keys (memory-layers.ts), with the decoded size of the
+ * meshes it reads; null when it writes none.
+ */
+function layerEstimate(ctx: OperatorContext, w: LayerWrites | null): OperatorEstimate | null {
+  if (!w) return null;
+  let decoded = 0;
+  if (w.decodes) for (const id of w.meshes) decoded += meshBytes(ctx.doc, id);
+  return {
+    bytes: OPERATOR_FIXED_BYTES + w.bytes + decoded,
+    faces: 0,
+    addedStoredBytes: w.stored,
+    addedSaveBytes: w.save,
+    layers: { kind: w.kind, bytes: w.written },
+    lower: w.lower,
+  };
+}
+
+/** The mesh object operator `p.object` names, or the active object (null: none, or not a mesh). */
+function meshTargetOf(ctx: OperatorContext, p: Record<string, unknown>): string | null {
+  const o =
+    p.object !== undefined
+      ? ctx.doc.resolveObject(String(p.object))
+      : ctx.state.activeId
+        ? ctx.doc.getObject(ctx.state.activeId)
+        : null;
+  return o?.type === 'MESH' && o.data && ctx.doc.meshCounts(o.data) ? o.data : null;
+}
+
+/** object.parent_set: the selected objects parented to the active one (memory-layers.ts armatureParentWrites). */
+const parentSet: Estimator = (ctx, p) =>
+  layerEstimate(
+    ctx,
+    armatureParentWrites(ctx.doc, ctx.state.selectedIds, ctx.state.activeId, String(p.type ?? 'OBJECT')),
+  );
+
+/** object.parent_to: `objects` (or the selection) parented to `parent` (memory-layers.ts armatureParentWrites). */
+const parentTo: Estimator = (ctx, p) => {
+  const parent = typeof p.parent === 'string' ? ctx.doc.resolveObject(p.parent) : null;
+  return layerEstimate(
+    ctx,
+    armatureParentWrites(
+      ctx.doc,
+      refObjects(ctx, p.objects).map((o) => o.id),
+      parent?.id,
+      String(p.type ?? 'OBJECT'),
+    ),
+  );
+};
+
+/** An object.vertex_group_* operator (memory-layers.ts vertexGroupWrites). */
+function vertexGroupOperator(change: (p: Record<string, unknown>) => VertexGroupChange): Estimator {
+  return (ctx, p) => {
+    const mesh = meshTargetOf(ctx, p);
+    return mesh ? layerEstimate(ctx, vertexGroupWrites(ctx.doc, mesh, change(p))) : null;
+  };
+}
+
+/** An object.shape_key_* operator (memory-layers.ts shapeKeyWrites). */
+function shapeKeyOperator(change: (p: Record<string, unknown>) => ShapeKeyChange): Estimator {
+  return (ctx, p) => {
+    const mesh = meshTargetOf(ctx, p);
+    return mesh ? layerEstimate(ctx, shapeKeyWrites(ctx.doc, mesh, change(p))) : null;
+  };
+}
+
+/**
+ * armature.bone_update renaming a bone (`name`): the vertex groups of the meshes the armature deforms
+ * follow it (memory-layers.ts boneRenameWrites); other changes of a bone are a few hundred bytes.
+ */
+const boneUpdate: Estimator = (ctx, p) => {
+  if (typeof p.name !== 'string' || typeof p.bone !== 'string' || p.name === p.bone) return null;
+  const o =
+    p.object !== undefined
+      ? ctx.doc.resolveObject(String(p.object))
+      : ctx.state.activeId
+        ? ctx.doc.getObject(ctx.state.activeId)
+        : null;
+  return o ? layerEstimate(ctx, boneRenameWrites(ctx.doc, o, p.bone)) : null;
 };
 
 // ---------------------------------------------------------------- the table
@@ -1579,6 +1970,29 @@ export const OPERATOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
   'mesh.primitive_cone_add': primitive('CONE', 'vertices'),
   'mesh.primitive_torus_add': primitive('TORUS', 'major_segments and minor_segments'),
   'object.add_mesh_from_data': meshFromData,
+  'anim.bake_transforms': bakeTransforms,
+  'rigidbody.bake_to_keyframes': rigidBodyBake,
+  'anim.keyframes_insert_many': insertMany,
+  'anim.keyframe_insert': keyframeInsert,
+  'object.parent_set': parentSet,
+  'object.parent_to': parentTo,
+  'armature.bone_update': boneUpdate,
+  'object.vertex_group_add': vertexGroupOperator(() => ({ op: 'add' })),
+  'object.vertex_group_assign': vertexGroupOperator((p) => ({ op: 'ensure', group: String(p.group) })),
+  'object.vertex_group_set_weights': vertexGroupOperator((p) => ({ op: 'ensure', group: String(p.group) })),
+  'object.vertex_group_remove': vertexGroupOperator(() => ({ op: 'rewrite' })),
+  'object.vertex_group_remove_from': vertexGroupOperator(() => ({ op: 'rewrite' })),
+  'object.vertex_group_normalize': vertexGroupOperator(() => ({ op: 'rewrite' })),
+  'object.vertex_group_normalize_all': vertexGroupOperator(() => ({ op: 'rewrite' })),
+  'object.vertex_group_rename': vertexGroupOperator(() => ({ op: 'rewrite' })),
+  'object.shape_key_add': shapeKeyOperator(() => ({ op: 'add' })),
+  'object.shape_key_remove': shapeKeyOperator((p) => ({
+    op: 'rewrite',
+    decodes: p.all === true && p.apply_mix === true,
+  })),
+  'object.shape_key_set': shapeKeyOperator(() => ({ op: 'rewrite', decodes: false })),
+  'object.shape_key_set_positions': shapeKeyOperator(() => ({ op: 'rewrite', decodes: true })),
+  'object.shape_key_clear': shapeKeyOperator(() => ({ op: 'rewrite', decodes: false })),
   'object.duplicate': duplicate,
   'object.duplicates_make_real': makeReal,
   'mesh.separate': separate,
@@ -1644,97 +2058,295 @@ export const OPERATOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
   ),
 };
 
+/** Operators sharing one reason (see {@link UNESTIMATED_OPERATORS}). */
+const because = (reason: string, ids: readonly string[]) => ids.map((match) => ({ match, reason }));
+
 /**
- * Operators without an estimate, by id prefix or id, and why they cannot grow the geometry much past
- * what they read: they change no mesh, change one in place at a cost the estimates of the Edit Mode
- * operators bound, or build what is bounded elsewhere.
+ * Operators without an estimate, by id, and why they cannot add much to what the project keeps or
+ * take much heap beyond it: they read the document, change the editor's state, change settings of
+ * the datablocks they name, remove what they name, rewrite F-curves the project keeps, store values
+ * given in the request, or build what is checked elsewhere (evaluations: eval/memory.ts; the rigid
+ * body simulation: physics/memory.ts). A test checks that every operator is estimated or listed
+ * here, and that every parameter of these that counts something is in
+ * {@link BOUNDED_GROWTH_PARAMETERS}.
  */
 export const UNESTIMATED_OPERATORS: readonly { match: string; reason: string }[] = [
-  {
-    match: 'anim.',
-    reason:
-      'keyframes, drivers and F-curve modifiers: no mesh (anim.turntable, which adds objects, is estimated)',
-  },
-  { match: 'armature.', reason: 'bones: no mesh' },
-  { match: 'pose.', reason: 'pose channels and bone constraints: no mesh' },
-  { match: 'constraint.', reason: 'object constraints: no mesh' },
-  { match: 'camera.', reason: 'camera data: no mesh' },
-  { match: 'light.', reason: 'light data: no mesh' },
-  { match: 'material.', reason: 'material settings: no mesh (material.new is estimated)' },
-  { match: 'world.', reason: 'world settings: no mesh' },
-  { match: 'collection.', reason: 'collections: no mesh' },
-  { match: 'data.', reason: 'a property of a datablock: no mesh' },
-  {
-    match: 'rigidbody.',
-    reason:
-      'rigid body settings; the simulation runs in renders and evaluations, whose memory is checked there',
-  },
-  {
-    match: 'scene.',
-    reason: 'reads the evaluated scene (its modifier evaluations are checked by eval/memory.ts)',
-  },
-  { match: 'screen.', reason: 'the frame: no mesh' },
-  { match: 'view3d.', reason: 'the 3D cursor or object transforms: no mesh' },
-  {
-    match: 'curve.',
-    reason:
-      'spline points of an existing curve (the operators that add curve objects are estimated): the evaluation builds the surface, and the server checks it per curve first (eval/memory.ts)',
-  },
-  {
-    match: 'font.',
-    reason:
-      'text content: the evaluation builds its surface, and the server checks it per text first (eval/memory.ts)',
-  },
-  { match: 'render.', reason: 'refused through MCP tools in favour of render_image and render_animation' },
-  {
-    match: 'object.modifier_',
-    reason: 'the modifier stack (modifier_apply is estimated): evaluations are checked per modifier',
-  },
-  { match: 'object.constraint_', reason: 'object constraints: no mesh' },
-  { match: 'object.constraints_', reason: 'object constraints: no mesh' },
-  { match: 'object.vertex_group_', reason: 'vertex weights: one float per vertex' },
-  { match: 'object.shape_key_', reason: 'shape keys: three floats per vertex and key' },
-  { match: 'object.material_', reason: 'material slots: no mesh' },
-  { match: 'object.particle_system_', reason: 'particle settings: instances are counted by the evaluation' },
-  { match: 'object.select', reason: 'the object selection: no mesh' },
-  { match: 'object.select_', reason: 'the object selection: no mesh' },
-  { match: 'object.hide_view_', reason: 'visibility: no mesh' },
-  { match: 'object.parent_', reason: 'parenting: no mesh' },
-  ...[
+  ...because('reads the document or the evaluated scene, changes nothing', [
+    'anim.driver_list',
+    'anim.fmodifier_type_list',
+    'armature.describe',
+    'constraint.describe',
+    'constraint.type_list',
+    'material.preset_list',
+    'scene.measure',
+    'scene.raycast',
+    'scene.stats',
+  ]),
+  ...because(
+    'builds the bodies of the rigid body world and their collision shapes to describe them, steps no frame',
+    ['rigidbody.describe'],
+  ),
+  ...because('the editor state (frame, selection, 3D cursor): nothing stored', [
+    'scene.frame_set',
+    'screen.frame_jump',
+    'object.select',
+    'object.select_all',
+    'object.select_by_type',
+    'object.select_pattern',
+    'view3d.cursor_set',
+    'view3d.snap_cursor_to_active',
+    'view3d.snap_cursor_to_center',
+    'view3d.snap_cursor_to_selected',
+  ]),
+  ...because(
+    'settings of the datablocks, objects or bones it names: a few hundred bytes each, counted with them',
+    [
+      'anim.driver_update',
+      'anim.fmodifier_add',
+      'anim.fmodifier_update',
+      'armature.bone_add',
+      'armature.properties_set',
+      'camera.properties_set',
+      'collection.create',
+      'constraint.childof_clear_inverse',
+      'constraint.childof_set_inverse',
+      'constraint.limitdistance_reset',
+      'constraint.move_to_index',
+      'constraint.update',
+      'curve.cyclic_toggle',
+      'curve.handle_type_set',
+      'curve.switch_direction',
+      'data.set_property',
+      'light.properties_set',
+      'material.preset_apply',
+      'material.procedural_set',
+      'material.update',
+      'object.constraint_add',
+      'object.hide_view_clear',
+      'object.hide_view_set',
+      'object.instance_collection_set',
+      'object.material_assign',
+      'object.material_slot_add',
+      'object.material_slot_assign',
+      'object.move_to_collection',
+      'object.parent_clear',
+      'object.rename',
+      'object.track_set',
+      'pose.constraint_add',
+      'pose.constraint_set',
+      'pose.ik_add',
+      'pose.ik_settings_set',
+      'rigidbody.object_add',
+      'rigidbody.object_settings_set',
+      'world.mist_set',
+      'world.sky_set',
+    ],
+  ),
+  ...because(
+    'one driver per channel of the property (at most four), each with at most 64 variables: a few kilobytes',
+    ['anim.driver_add'],
+  ),
+  ...because(
+    'the modifier stack: the evaluation checks every modifier before it is built (eval/memory.ts; modifier_apply is estimated)',
+    [
+      'object.modifier_add',
+      'object.modifier_copy',
+      'object.modifier_move_down',
+      'object.modifier_move_to_index',
+      'object.modifier_move_up',
+      'object.modifier_set',
+    ],
+  ),
+  ...because(
+    'particle settings: the evaluation makes their instances, at most 200,000 per scene, and counts them',
+    ['object.particle_system_add', 'object.particle_system_update'],
+  ),
+  ...because(
+    "curve settings and text: the evaluation checks every curve's or text's surface before it is built (eval/memory.ts)",
+    ['curve.properties_set', 'font.text_set'],
+  ),
+  ...because(
+    'spline points given in the request, kept as they are (the project counts curves by their JSON)',
+    ['curve.spline_add', 'curve.spline_set_points'],
+  ),
+  ...because('a bone per point given in the request (the project counts armatures by their JSON)', [
+    'armature.chain_add',
+  ]),
+  ...because(
+    "rigid body world settings: the server checks a simulation's frames before it steps them (physics/memory.ts)",
+    ['rigidbody.world_set'],
+  ),
+  ...because('removes what it names', [
+    'anim.driver_remove',
+    'anim.fmodifier_remove',
+    'anim.keyframe_clear',
+    'armature.bone_remove',
+    'collection.delete',
+    'constraint.delete',
+    'curve.spline_remove',
+    'material.delete',
+    'object.constraints_clear',
+    'object.delete',
+    'object.material_slot_remove',
+    'object.modifier_remove',
+    'object.particle_system_remove',
+    'pose.constraint_remove',
+    'rigidbody.cache_free',
+    'rigidbody.object_remove',
+  ]),
+  ...because(
+    'rewrites F-curves the project keeps, or adds at most four keyframes to one: at the peak about KEYFRAME_REWRITE_BYTES (180) per keyframe of the curves it rewrites, less than half of what the limit per project counts per keyframe with its save (480)',
+    [
+      'anim.extrapolation_set',
+      'anim.interpolation_type',
+      'anim.keyframe_delete',
+      'anim.keyframe_insert_property',
+      'anim.keyframes_move',
+      'anim.keyframes_remove',
+      'constraint.followpath_path_animate',
+      'curve.keyframe_insert',
+      'pose.bone_transform_set',
+      'pose.transforms_clear',
+    ],
+  ),
+  ...because(
+    'object transforms (with auto keying, a keyframe on each of the 9 transform channels of every moved object, else on each animated channel whose value changes; their F-curves rewritten as above)',
+    [
+      'constraint.apply',
+      'object.align',
+      'object.dimensions_set',
+      'object.distribute',
+      'object.location_clear',
+      'object.look_at',
+      'object.randomize_transform',
+      'object.rotation_clear',
+      'object.scale_clear',
+      'object.transform_set',
+      'object.visual_transform_apply',
+      'view3d.snap_selected_to_cursor',
+      'view3d.snap_selected_to_grid',
+    ],
+  ),
+  ...because(
+    'object transforms from rays cast at evaluated meshes (their evaluations are checked by eval/memory.ts)',
+    ['object.drop_to_ground', 'object.snap_to_surface'],
+  ),
+  ...because('refused through MCP tools in favour of render_image and render_animation', [
+    'render.render_animation',
+    'render.render_software',
+  ]),
+];
+
+/**
+ * Parameters of the operators in {@link UNESTIMATED_OPERATORS} whose names say they count something
+ * (frames, objects, points, counts, resolutions …), by `<operator id>.<parameter path>`, and why
+ * what they count stays small or is checked elsewhere. A test checks that every such parameter of an
+ * operator without an estimate is listed here: an operator whose output grows with a parameter needs
+ * an estimate (OPERATOR_ESTIMATES) or a reason here.
+ */
+export const BOUNDED_GROWTH_PARAMETERS: Readonly<Record<string, string>> = (() => {
+  const frame =
+    'one frame, at which the scene is evaluated (its modifiers and rigid body simulation are checked when they are built and stepped)';
+  const objects = 'the objects it changes: a few hundred bytes each at most, counted with the objects';
+  const keys =
+    'keyframes of F-curves the project keeps, moved or removed (rewritten: see UNESTIMATED_OPERATORS)';
+  const given = 'values given in the request, kept as they are';
+  const curve = "the curve's surface is checked when it is evaluated (eval/memory.ts)";
+  const particles = 'instances the evaluation makes and counts: at most 200,000 per scene';
+  const render = 'refused through MCP tools in favour of render_image and render_animation';
+  const out: Record<string, string> = {
+    'anim.driver_add.variables': 'at most 64 variables of a few hundred bytes each',
+    'anim.driver_update.variables': 'at most 64 variables of a few hundred bytes each',
+    'anim.keyframes_move.keys': keys,
+    'anim.keyframes_move.keys.frame': keys,
+    'anim.keyframes_remove.keys': keys,
+    'anim.keyframes_remove.keys.frame': keys,
+    'armature.bone_add.length': "a bone's length, not a count",
+    'armature.bone_remove.bones': 'bones it removes',
+    'armature.chain_add.points': given,
+    'armature.chain_add.names': given,
+    'camera.properties_set.sensor_width': 'a camera setting, not a count',
+    'constraint.followpath_path_animate.frame_start': 'two keyframes whatever the frames',
+    'constraint.followpath_path_animate.length': 'two keyframes whatever the length',
+    'curve.handle_type_set.points': 'points of a spline the project keeps, changed in place',
+    'curve.properties_set.resolution_u': curve,
+    'curve.properties_set.render_resolution_u': curve,
+    'curve.properties_set.bevel_resolution': curve,
+    'curve.spline_add.points': given,
+    'curve.spline_add.resolution_u': curve,
+    'curve.spline_set_points.points': given,
+    'curve.spline_set_points.resolution_u': curve,
+    'object.particle_system_add.settings.count': particles,
+    'object.particle_system_add.settings.grid_resolution': particles,
+    'object.particle_system_add.settings.instance_weights': given,
+    'object.particle_system_update.settings.count': particles,
+    'object.particle_system_update.settings.grid_resolution': particles,
+    'object.particle_system_update.settings.instance_weights': given,
+    'pose.ik_add.chain_count': 'one constraint, whatever the length of its chain',
+    'pose.ik_add.iterations': "the solver's iterations take time, not memory",
+    'pose.transforms_clear.bones': 'bones it clears',
+    'rigidbody.world_set.frame_start':
+      "the simulation's frames are checked before the server steps them (physics/memory.ts)",
+    'rigidbody.world_set.frame_end':
+      "the simulation's frames are checked before the server steps them (physics/memory.ts)",
+    'rigidbody.world_set.substeps_per_frame':
+      'substeps take time, not memory (a frame keeps one pose per body)',
+    'rigidbody.world_set.solver_iterations': "the solver's iterations take time, not memory",
+  };
+  for (const id of ['anim.driver_list', 'armature.describe', 'camera.properties_set', 'constraint.describe'])
+    out[`${id}.frame`] = frame;
+  for (const id of [
+    'anim.keyframe_delete',
+    'anim.keyframe_insert_property',
+    'curve.keyframe_insert',
+    'light.properties_set',
+    'pose.bone_transform_set',
+    'pose.constraint_set',
+    'rigidbody.describe',
+    'scene.frame_set',
+    'scene.measure',
+    'scene.raycast',
+    'scene.stats',
+  ])
+    out[`${id}.frame`] = frame;
+  for (const id of [
+    'anim.extrapolation_set',
+    'camera.properties_set',
+    'light.properties_set',
+    'material.preset_apply',
     'object.align',
+    'object.constraints_clear',
+    'object.delete',
     'object.dimensions_set',
     'object.distribute',
-    'object.location_clear',
+    'object.drop_to_ground',
     'object.look_at',
+    'object.material_assign',
     'object.randomize_transform',
-    'object.rotation_clear',
-    'object.scale_clear',
+    'object.select',
+    'object.snap_to_surface',
     'object.track_set',
     'object.transform_set',
     'object.visual_transform_apply',
-  ].map((match) => ({ match, reason: 'object transforms: no mesh' })),
-  ...['object.drop_to_ground', 'object.snap_to_surface'].map((match) => ({
-    match,
-    reason: 'object transforms from rays cast at evaluated meshes (their evaluations are checked)',
-  })),
-  {
-    match: 'object.instance_collection_set',
-    reason: 'instances: no mesh copied, no object added (the evaluation counts the instances)',
-  },
-  ...['object.delete', 'object.rename', 'object.move_to_collection'].map((match) => ({
-    match,
-    reason: 'names, links and deletions: no mesh built',
-  })),
-];
+    'rigidbody.describe',
+    'rigidbody.object_add',
+    'rigidbody.object_remove',
+    'rigidbody.object_settings_set',
+    'scene.measure',
+    'scene.raycast',
+  ])
+    out[`${id}.objects`] = objects;
+  for (const param of ['frame_start', 'frame_end', 'frame_step', 'width', 'height', 'samples'])
+    out[`render.render_animation.${param}`] = render;
+  for (const param of ['width', 'height', 'samples', 'frame'])
+    out[`render.render_software.${param}`] = render;
+  return out;
+})();
 
-/** Why operator `id` has no estimate (null when it has one or is not classified). */
+/** Why operator `id` has no estimate (null when it has one or is not listed). */
 export function unestimatedReason(id: string): string | null {
   if (OPERATOR_ESTIMATES[id]) return null;
-  return (
-    UNESTIMATED_OPERATORS.find((u) =>
-      u.match.endsWith('.') || u.match.endsWith('_') ? id.startsWith(u.match) : id === u.match,
-    )?.reason ?? null
-  );
+  return UNESTIMATED_OPERATORS.find((u) => u.match === id)?.reason ?? null;
 }
 
 /** The memory estimate of running operator `id` with `params` (schema defaults filled in) now. */
@@ -1793,8 +2405,9 @@ export function importMemoryRefusal(doc: SceneDoc, format: string, data: Uint8Ar
     operator: IMPORT_OPERATORS[format] ?? 'import',
     estimate,
     storedBytes: storedMeshBytes(doc) + project.bytes,
-    saveBytes: saveBytes(project.bytes),
+    saveBytes: project.save,
     objects: project.objects,
+    doc,
   });
 }
 
@@ -1850,13 +2463,15 @@ export function operatorMemoryRefusal(id: string, ctx: OperatorContext, params: 
   }
   if (!estimate || estimate.bytes <= 0) return null;
   // what the project keeps is counted only for operators that add to it
-  if (!(estimate.addedStoredBytes > 0)) return check({ operator: id, estimate, storedBytes: 0 });
+  if (!(estimate.addedStoredBytes > 0))
+    return check({ operator: id, estimate, storedBytes: 0, doc: ctx.doc });
   const project = projectObjects(ctx.doc);
   return check({
     operator: id,
     estimate,
     storedBytes: storedMeshBytes(ctx.doc) + project.bytes,
-    saveBytes: saveBytes(project.bytes),
+    saveBytes: project.save,
     objects: project.objects,
+    doc: ctx.doc,
   });
 }

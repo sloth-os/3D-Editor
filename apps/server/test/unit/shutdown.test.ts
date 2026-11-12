@@ -1,14 +1,17 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as Y from 'yjs';
+import { symbols as pinoSymbols } from 'pino';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryFileStore, ProjectFileStore, SceneDoc, type WriteOptions } from '@3d-editor/core';
 import { loadConfig } from '../../src/config';
+import { EXIT_LOG_DRAIN_MS, exitWithoutWaitingForLogs } from '../../src/observability/logger';
 import { shutdown, stopOnSignals, type ShutdownTarget } from '../../src/shutdown';
 import { RoomManager, SHUTDOWN_SAVE_WAIT_MS } from '../../src/sync/room-manager';
 import { ServerMetrics } from '../../src/observability/metrics';
@@ -97,7 +100,7 @@ describe('server shutdown', () => {
     // main.ts stops the server with these times
     const main = readFileSync(new URL('../../src/main.ts', import.meta.url), 'utf8');
     expect(main).toMatch(/stopOnSignals\(\s*\{\s*log: app\.log,\s*rooms: handle\.rooms,/);
-    expect(main).toMatch(/\},\s*config,\s*\(code\) => process\.exit\(code\),\s*\);/);
+    expect(main).toMatch(/\},\s*config,\s*\(code\) => exitWithoutWaitingForLogs\(app\.log, code\),\s*\);/);
   });
 
   it('exits with 0 once the app has closed and storage has saved the projects', async () => {
@@ -290,6 +293,142 @@ describe('server shutdown', () => {
         ],
       });
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /*
+   * The projects named when the time runs out are those unsaved then: storage may save some of the
+   * projects unsaved at the signal meanwhile, and editors still connected may change others.
+   */
+  it('names the projects that are unsaved when the time runs out', async () => {
+    const rec = recordingLog();
+    const exit = vi.fn();
+    let unsaved = [{ id: 'saved-meanwhile', name: 'Saved meanwhile' }];
+    const rooms = { setShutdownWait: vi.fn(), unsaved: () => unsaved };
+    const target: ShutdownTarget = { log: rec.log, rooms, close: () => new Promise(() => undefined) };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    void shutdown(target, { timeoutMs: 1000, saveWaitMs: 500 }, exit);
+    unsaved = [{ id: 'changed-meanwhile', name: 'Changed meanwhile' }];
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(exit.mock.calls).toEqual([[1]]);
+    expect(rec.lines.find((l) => l.msg === 'projects not saved at shutdown')?.obj).toMatchObject({
+      projects: [{ id: 'changed-meanwhile', name: 'Changed meanwhile' }],
+    });
+  });
+
+  /*
+   * In a process of its own, with the server's logger (pino): when the reader of the process's
+   * output closed the pipe during the shutdown (spawnSync's timeout does that after its signal), the
+   * logger's flush at exit retried its write for ever, and process.exit never ended the process.
+   * The exit of main.ts (exitWithoutWaitingForLogs) writes what the logger holds once and ends it;
+   * with a pipe that still reads, the last lines are there.
+   */
+  it('ends its process also when the reader of its output closed the pipe', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'shutdown-test-'));
+    const shutdownModule = fileURLToPath(new URL('../../src/shutdown.ts', import.meta.url));
+    const loggerModule = fileURLToPath(new URL('../../src/observability/logger.ts', import.meta.url));
+    const pino = createRequire(import.meta.url).resolve('pino');
+    const script = path.join(dir, 'closed.mts');
+    await writeFile(
+      script,
+      [
+        `import pino from ${JSON.stringify(pino)};`,
+        `import { shutdown } from ${JSON.stringify(shutdownModule)};`,
+        `import { exitWithoutWaitingForLogs } from ${JSON.stringify(loggerModule)};`,
+        'const log = pino();',
+        "const rooms = { setShutdownWait() {}, unsaved: () => [{ id: 'p', name: 'Kept open' }] };",
+        'const target = { log, rooms, close: () => new Promise(() => undefined) };',
+        'const exit = (code) => exitWithoutWaitingForLogs(log, code);',
+        "process.on('SIGTERM', () => void shutdown(target, { timeoutMs: 300, saveWaitMs: 100 }, exit));",
+        'setInterval(() => undefined, 1000);',
+        "log.info('ready');",
+      ].join('\n'),
+    );
+    const repo = fileURLToPath(new URL('../../../../', import.meta.url));
+    /** Runs the script; `closePipe`: the output's reader closes the pipe once the shutdown began. */
+    const run = (closePipe: boolean) =>
+      new Promise<{ code: number | null; signal: NodeJS.Signals | null; out: string }>((resolve) => {
+        const child = spawn(process.execPath, ['--import', 'tsx', script], { cwd: repo });
+        let out = '';
+        let signalled = false;
+        child.stdout.on('data', (chunk: Buffer) => {
+          out += chunk.toString();
+          if (!signalled && out.includes('"msg":"ready"')) {
+            signalled = true;
+            child.kill('SIGTERM');
+          } else if (closePipe && out.includes('"msg":"shutting down')) child.stdout.destroy();
+        });
+        child.stderr.on('data', (chunk: Buffer) => (out += chunk.toString()));
+        // (a process that does not end is stopped after 3 s)
+        const stuck = setTimeout(() => child.kill('SIGKILL'), 3000);
+        child.once('exit', (code, signal) => {
+          clearTimeout(stuck);
+          resolve({ code, signal, out });
+        });
+      });
+    try {
+      const [closed, open] = await Promise.all([run(true), run(false)]);
+      expect({ code: closed.code, signal: closed.signal }).toEqual({ code: 1, signal: null });
+      expect({ code: open.code, signal: open.signal }).toEqual({ code: 1, signal: null });
+      const messages = open.out
+        .trim()
+        .split('\n')
+        .map((l) => (JSON.parse(l) as { msg: string }).msg);
+      expect(messages).toEqual([
+        'ready',
+        'shutting down: closing connections and saving projects',
+        'projects not saved at shutdown',
+        'shutdown timed out after 0.3 s, exiting',
+      ]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  /*
+   * The parts of that exit on their own, with a destination as pino's (sonic-boom 4) is when it
+   * exits: a write in progress, lines waiting for it, and its flushSync, which pino calls when the
+   * process exits and which retried for ever on a pipe that took nothing.
+   */
+  it('writes the lines the logger holds once, and leaves nothing to flush at exit', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'exit-logs-test-'));
+    const file = path.join(dir, 'out.log');
+    const fd = openSync(file, 'w');
+    try {
+      const flush = vi.fn();
+      // a write in progress that never ends (a pipe that takes nothing), and two lines after it
+      const dest = {
+        fd,
+        _writing: true,
+        _writingBuf: 'in progress\n',
+        _bufs: ['held 1\n'],
+        flushSync: flush,
+      };
+      const logger = { [pinoSymbols.streamSym]: dest };
+      const codes: number[] = [];
+      const t0 = Date.now();
+      await new Promise<void>((resolve) =>
+        exitWithoutWaitingForLogs(logger, 3, (code) => {
+          codes.push(code);
+          resolve();
+        }),
+      );
+      expect(codes).toEqual([3]);
+      // it gave the write in progress its time, then wrote what waited for it, once
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(EXIT_LOG_DRAIN_MS - 5);
+      expect(readFileSync(file, 'utf8')).toBe('held 1\n');
+      // pino's flush at exit does nothing
+      (dest.flushSync as () => void)();
+      expect(flush).not.toHaveBeenCalled();
+      // no write in progress: its line and the ones after it, at once
+      const idle = { fd, _writing: false, _writingBuf: 'last 1\n', _bufs: ['last 2\n'], flushSync: flush };
+      await new Promise<void>((resolve) =>
+        exitWithoutWaitingForLogs({ [pinoSymbols.streamSym]: idle }, 0, () => resolve()),
+      );
+      expect(readFileSync(file, 'utf8')).toBe('held 1\nlast 1\nlast 2\n');
+    } finally {
+      closeSync(fd);
       await rm(dir, { recursive: true, force: true });
     }
   });

@@ -12,7 +12,7 @@ import {
   type ReportLevel,
   type RunResult,
 } from '@3d-editor/core';
-import type { Room } from '../sync/room';
+import { settlesBefore, type Room } from '../sync/room';
 import type { NamedProject, RoomManager, StoredNames } from '../sync/room-manager';
 import type { Log } from '../observability/log';
 import { randomClientId } from '../sync/awareness';
@@ -97,11 +97,11 @@ function matching<P extends { name: string }>(projects: P[], name: string): P[] 
 function projectNamed(
   projects: { id: string; name: string }[],
   name: string,
-  unlisted?: { why: Unlisted; waitMs: number },
+  unlisted?: { why: Unlisted; waitMs: number; ageMs?: number },
 ): string | null {
   const matches = matching(projects, name);
   if (matches.length > 1) {
-    const which = unlisted ? compared(unlisted.why, unlisted.waitMs) : '';
+    const which = unlisted ? compared(unlisted.why, unlisted.waitMs, unlisted.ageMs) : '';
     throw new ToolError(
       `Several projects are named '${name}': ${matches.map((m) => m.id).join(', ')}. Pass the project id instead.` +
         (which ? ` ${which[0].toUpperCase()}${which.slice(1)}.` : ''),
@@ -498,7 +498,14 @@ export class AgentSession {
       const [match, ...others] = matching(rooms.namesOf(earlier.names), r);
       if (match && others.length === 0)
         return { id: match.id, note: foundWithout(r, match.id, 'slow', waitMs, earlier.ageMs) };
-      return this.named(r, await finished, waitMs);
+      // a name that no loaded project has waits for the new listing (only storage can find that
+      // project); one that a loaded project has waits for it until the deadline (5 s in all, none
+      // while a read of that project that a request stopped waiting for goes on), then the last
+      // listing answers (several projects with the name are an error that says so)
+      if (rooms.loadedNamed(r).length === 0) return this.named(r, await finished, waitMs);
+      const since = Date.now();
+      if (await settlesBefore(finished, late ? 0 : deadline)) return this.named(r, await finished, waitMs);
+      return this.named(r, earlier.names, waitMs, earlier.ageMs + Date.now() - since);
     }
     if (!answered) {
       // storage did not answer in time: the names of the loaded projects decide, when one has it
@@ -514,18 +521,33 @@ export class AgentSession {
     return this.named(r, answered ?? (await finished), waitMs);
   }
 
-  /** {@link findProject} by name among the projects of a listing (RoomManager.namesOf). */
-  private named(r: string, listed: StoredNames, waitMs: number): { id: string; note?: string } {
+  /**
+   * {@link findProject} by name among the projects of a listing (RoomManager.namesOf); `slowAgeMs`:
+   * the listing is the last one that listed storage, made that long ago, while storage lists slowly.
+   */
+  private named(
+    r: string,
+    listed: StoredNames,
+    waitMs: number,
+    slowAgeMs?: number,
+  ): { id: string; note?: string } {
     const { failed, partial } = listed;
     const all: NamedProject[] = this.deps.rooms.namesOf(listed);
-    const why: Unlisted | null = failed ? (partial ? 'partial' : 'failed') : null;
-    const id = projectNamed(all, r, why ? { why, waitMs } : undefined);
-    if (id) return why ? { id, note: foundWithout(r, id, why, waitMs) } : { id };
+    const why: Unlisted | null =
+      slowAgeMs !== undefined ? 'slow' : failed ? (partial ? 'partial' : 'failed') : null;
+    const id = projectNamed(all, r, why ? { why, waitMs, ageMs: slowAgeMs } : undefined);
+    if (id) return why ? { id, note: foundWithout(r, id, why, waitMs, slowAgeMs) } : { id };
     const known = all
       .slice(0, 20)
       .map((p) => `'${p.name}' (${p.id})`)
       .join(', ');
     const knownProjects = known ? ` Known projects: ${known}.` : '';
+    if (why === 'slow') {
+      const which = compared('slow', waitMs, slowAgeMs);
+      throw new ToolError(
+        `Project '${r}' not found.${knownProjects} ${which[0].toUpperCase()}${which.slice(1)}: a project stored or renamed since then is not found by name now. Pass its id, or call list_projects, which waits for storage to list its projects.`,
+      );
+    }
     if (failed) {
       const missing = partial
         ? "Reading the project.json of some projects in storage failed (the server logged 'listing projects failed'), so a project among those"

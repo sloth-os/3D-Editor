@@ -8,6 +8,12 @@
 //   shared-glb: a GLB of `meshes` (params) glTF meshes that all use the accessors of one grid of n × n
 //     quads, imported with the operator
 //   loose: n loose quads in one mesh, in Edit Mode with everything selected
+//   cubes: n linked cubes in a row, all selected (bakes to keyframes)
+//   baked: n linked cubes in a row baked over frames 1-30, and a cube 'Solo' (not baked) selected
+//   keyed: a cube whose location x has n keyframes (frames 1 … n), with a listener on the document's
+//     updates as the server's; params `{"__between": true}` insert n keyframes between them (frames
+//     1.5 … n + 0.5) with anim.keyframes_insert_many, `{"__fresh": true}` n keyframes on location y
+//   rigid: n ACTIVE rigid body cubes in a grid falling on a PASSIVE floor, the cubes selected
 import v8 from 'node:v8';
 import { createEditorState, createOperatorRegistry, estimateOperator } from '../src/operators';
 import { selectAllElements } from '../src/mesh/selection';
@@ -188,6 +194,55 @@ if (op === 'curve') {
     state.activeId = id;
     state.mode = 'EDIT';
     state.meshSelection = selectAllElements(doc.getMesh(meshId)!);
+  } else if (mode === 'cubes' || mode === 'rigid' || mode === 'baked') {
+    const run = (id: string, params: object) => {
+      const r = reg.run(ctx, id, params);
+      if (!r.ok) throw new Error(`${id}: ${r.error}`);
+    };
+    run('mesh.primitive_cube_add', { name: 'Cube' });
+    if (mode === 'rigid') run('rigidbody.object_add', { type: 'ACTIVE' });
+    const side = Math.ceil(Math.sqrt(n));
+    if (n > 1)
+      run(
+        'object.array_place',
+        mode === 'rigid'
+          ? {
+              objects: ['Cube'],
+              linked: true,
+              pattern: 'GRID',
+              columns: side,
+              rows: Math.ceil(n / side),
+              offset: [2.05, 2.05, 0],
+            }
+          : { objects: ['Cube'], linked: true, count: n, offset: [3, 0, 0] },
+      );
+    const cubes = doc.objectIds();
+    if (mode === 'rigid') {
+      run('mesh.primitive_plane_add', { name: 'Floor', size: 400, location: [0, 0, -3] });
+      run('rigidbody.object_add', { type: 'PASSIVE' });
+    }
+    state.selectedIds = cubes;
+    state.activeId = cubes[0];
+    if (mode === 'baked') {
+      run('anim.bake_transforms', { frame_start: 1, frame_end: 30 });
+      run('mesh.primitive_cube_add', { name: 'Solo', location: [0, 0, 5] });
+    }
+  } else if (mode === 'keyed') {
+    const frames = Array.from({ length: n }, (_, i) => i + 1);
+    const keys = { target: 'Cube', path: 'location', index: 0, frames, values: frames };
+    for (const [id, params] of [
+      ['mesh.primitive_cube_add', { name: 'Cube' }],
+      ['anim.keyframes_insert_many', keys],
+    ] as const) {
+      const r = reg.run(ctx, id, params);
+      if (!r.ok) throw new Error(`${id}: ${r.error}`);
+    }
+    const { __between, __fresh } = JSON.parse(paramsJson) as { __between?: boolean; __fresh?: boolean };
+    if (__between) paramsText = JSON.stringify({ ...keys, frames: frames.map((f) => f + 0.5) });
+    if (__fresh) paramsText = JSON.stringify({ ...keys, index: 1 });
+    // the server's process encodes every transaction's update for its listeners
+    let updates = 0;
+    doc.ydoc.on('update', (u: Uint8Array) => (updates += u.byteLength));
   } else if (mode === 'import') {
     const source = SceneDoc.create({ empty: true });
     const id = source.addMesh('Grid', createGrid({ x_subdivisions: n, y_subdivisions: n }));

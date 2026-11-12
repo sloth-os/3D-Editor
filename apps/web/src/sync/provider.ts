@@ -10,6 +10,7 @@ import {
   MSG_QUERY_AWARENESS,
   MSG_RPC,
   MSG_SYNC,
+  OUT_OF_MEMORY_CLOSE_CODE,
   PROJECT_DELETED_CLOSE_CODE,
   encodeFrame,
   encodeJsonFrame,
@@ -22,10 +23,24 @@ import {
 import { telemetry } from '../telemetry/telemetry';
 
 /**
- * `deleted`: the server closed the connection with {@link PROJECT_DELETED_CLOSE_CODE}; the provider
- * does not connect again by itself (see {@link SyncProvider.reconnect}).
+ * `deleted`: the server closed the connection with {@link PROJECT_DELETED_CLOSE_CODE}; `refused`:
+ * with {@link OUT_OF_MEMORY_CLOSE_CODE}, after an error that says why (SyncProvider.refusal: it did
+ * not apply this browser's changes, or cannot load the project, for memory). The provider does not
+ * connect again by itself after either (see {@link SyncProvider.reconnect}).
  */
-export type SyncStatus = 'disabled' | 'connecting' | 'connected' | 'offline' | 'deleted';
+export type SyncStatus = 'disabled' | 'connecting' | 'connected' | 'offline' | 'deleted' | 'refused';
+
+/**
+ * Why the server refused (its error with code OUT_OF_MEMORY): `load`, it cannot load the stored
+ * project (no room of it held the connection); else it did not apply this browser's changes.
+ */
+export interface SyncRefusal {
+  message: string;
+  load: boolean;
+}
+
+/** Unanswered pings a connection keeps for {@link SyncProvider.serverHolds} (the oldest go first). */
+const MAX_PINGS = 64;
 
 export type RpcHandler = (method: string, params: unknown) => Promise<unknown> | unknown;
 
@@ -46,6 +61,11 @@ export class SyncProvider {
    * closes. The server closes a connection to a project it deleted without a hello.
    */
   readonly joined = signal(false);
+  /**
+   * Why the server refused this browser's changes or the project (its error with code
+   * OUT_OF_MEMORY), from that error until a room of the server takes a connection again.
+   */
+  readonly refusal = signal<SyncRefusal | null>(null);
   private ws: WebSocket | null = null;
   private bc: BroadcastChannel | null = null;
   private retries = 0;
@@ -54,8 +74,23 @@ export class SyncProvider {
   private destroyed = false;
   /** The server closed the connection because it deleted the project: no reconnecting by itself. */
   private deletedOnServer = false;
+  /** The server closed the connection for memory (status `refused`): no reconnecting by itself. */
+  private refusedOnServer = false;
   private rpcHandler: RpcHandler | null = null;
   private connectSpan: ReturnType<typeof telemetry.startSpan> | null = null;
+  /** Counts the connections (see serverHolds). */
+  private connection = 0;
+  /** This connection sent the server its sync step 2: all of this document the server lacked. */
+  private sentState = false;
+  /**
+   * The pings of this connection the server has not answered yet, each with this document's state
+   * vector when it was sent after the step 2 (null before).
+   */
+  private pings: { t: number; state: Map<number, number> | null }[] = [];
+  /** The state vector the server answered that it holds on this connection (see serverHolds). */
+  private held: Map<number, number> | null = null;
+  /** Calls of serverHolds waiting for an answer, told of every answer, step 2 and close. */
+  private readonly holdWaiters = new Set<() => void>();
 
   constructor(
     readonly projectId: string,
@@ -104,7 +139,7 @@ export class SyncProvider {
   }
 
   private onOnline = () => {
-    if (!this.ws && this.url && !this.deletedOnServer) {
+    if (!this.ws && this.url && !this.deletedOnServer && !this.refusedOnServer) {
       this.retries = 0;
       this.connect();
     }
@@ -128,6 +163,7 @@ export class SyncProvider {
     }
     ws.binaryType = 'arraybuffer';
     this.ws = ws;
+    this.connection++;
     ws.onopen = () => {
       this.retries = 0;
       this.status.value = 'connected';
@@ -152,11 +188,8 @@ export class SyncProvider {
           capabilities: this.capabilities,
         }),
       );
-      this.pingTimer = setInterval(
-        () => this.send(encodeJsonFrame(MSG_CONTROL, { kind: 'ping', t: Date.now() })),
-        10_000,
-      );
-      this.send(encodeJsonFrame(MSG_CONTROL, { kind: 'ping', t: Date.now() }));
+      this.pingTimer = setInterval(() => this.ping(), 10_000);
+      this.ping();
     };
     ws.onmessage = (e) => this.onMessage(new Uint8Array(e.data as ArrayBuffer), 'ws');
     ws.onclose = (e?: CloseEvent) => {
@@ -164,6 +197,9 @@ export class SyncProvider {
       this.pingTimer = null;
       this.ws = null;
       this.joined.value = false;
+      this.sentState = false;
+      this.pings = [];
+      this.held = null;
       this.connectSpan?.setError('closed').end();
       this.connectSpan = null;
       // remove awareness of remote peers (they will be re-sent on reconnect)
@@ -177,10 +213,17 @@ export class SyncProvider {
         // syncing go on without it
         this.deletedOnServer = true;
         this.status.value = 'deleted';
-        return;
+      } else if (e?.code === OUT_OF_MEMORY_CLOSE_CODE) {
+        // the server did not apply this browser's changes (or cannot load the project): every new
+        // connection would send them again, so the browser keeps them (IndexedDB, other tabs,
+        // WebDAV) and connects again on Save, once the person made the project smaller
+        this.refusedOnServer = true;
+        this.status.value = 'refused';
+      } else {
+        this.status.value = navigator.onLine ? 'connecting' : 'offline';
+        this.scheduleReconnect();
       }
-      this.status.value = navigator.onLine ? 'connecting' : 'offline';
-      this.scheduleReconnect();
+      this.wakeHoldWaiters();
     };
     ws.onerror = () => {
       /* onclose follows */
@@ -188,16 +231,71 @@ export class SyncProvider {
   }
 
   /**
-   * Connects again after the server deleted the project (status `deleted`): on an action of the
-   * person (Save), and when WebDAV through the server finds the project stored there again (see
-   * ProjectSession); a reload of the page connects again too. The server closes the connection again
-   * while it has the project deleted, unless its storage holds the project again.
+   * Connects again after the server deleted the project (status `deleted`) or refused this browser's
+   * changes for memory (status `refused`): on an action of the person (Save), and after a deletion
+   * when WebDAV through the server finds the project stored there again (see ProjectSession); a
+   * reload of the page connects again too. The server closes the connection again while it has the
+   * project deleted (unless its storage holds the project again), or while the project would still
+   * not fit.
    */
   reconnect(): void {
-    if (!this.deletedOnServer) return;
+    if (!this.deletedOnServer && !this.refusedOnServer) return;
     this.deletedOnServer = false;
+    this.refusedOnServer = false;
     this.retries = 0;
     this.connect();
+  }
+
+  /**
+   * Resolves with whether the server holds all of a state of this document (`stateVector`, Yjs
+   * encoded: of what a WebDAV sync writes, see ProjectSession): this connection sent it before a
+   * ping the server answered. The server handles a connection's messages in order, and answers none
+   * once it refused its changes. Sends that ping once the connection sent its sync step 2 (also
+   * after connecting again), and waits for the answer at most `timeoutMs`; false when the server
+   * refuses or deletes the project meanwhile, or does not answer in time.
+   */
+  serverHolds(stateVector: Uint8Array, timeoutMs: number): Promise<boolean> {
+    const wanted = Y.decodeStateVector(stateVector);
+    const holds = () => {
+      const held = this.held;
+      if (!held) return false;
+      for (const [client, clock] of wanted) if (clock > (held.get(client) ?? 0)) return false;
+      return true;
+    };
+    if (holds()) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let askedOn = -1;
+      const done = (holding: boolean) => {
+        clearTimeout(timer);
+        this.holdWaiters.delete(check);
+        resolve(holding);
+      };
+      const check = () => {
+        const st = this.status.value;
+        if (holds()) done(true);
+        else if (this.destroyed || st === 'refused' || st === 'deleted') done(false);
+        else if (this.sentState && askedOn !== this.connection) {
+          askedOn = this.connection;
+          this.ping();
+        }
+      };
+      const timer = setTimeout(() => done(false), timeoutMs);
+      this.holdWaiters.add(check);
+      check();
+    });
+  }
+
+  private wakeHoldWaiters(): void {
+    for (const check of [...this.holdWaiters]) check();
+  }
+
+  /** A ping; after the step 2 with this document's state vector, which its answer confirms. */
+  private ping(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const t = Date.now();
+    this.pings.push({ t, state: this.sentState ? Y.decodeStateVector(Y.encodeStateVector(this.doc)) : null });
+    if (this.pings.length > MAX_PINGS) this.pings.shift();
+    this.send(encodeJsonFrame(MSG_CONTROL, { kind: 'ping', t }));
   }
 
   private scheduleReconnect(): void {
@@ -267,6 +365,16 @@ export class SyncProvider {
           if (via === 'ws') this.send(encoding.toUint8Array(enc));
           else this.bcSend(encoding.toUint8Array(enc));
         }
+        // the answer to the server's step 1 is this connection's step 2; every later change of the
+        // document goes to the server as it happens
+        if (
+          via === 'ws' &&
+          kind === syncProtocol.messageYjsSyncStep1 &&
+          this.ws?.readyState === WebSocket.OPEN
+        ) {
+          this.sentState = true;
+          this.wakeHoldWaiters();
+        }
         break;
       }
       case MSG_AWARENESS:
@@ -299,15 +407,34 @@ export class SyncProvider {
 
   private onControl(msg: ControlMessage): void {
     // (control frames come from the server only: other tabs send sync and awareness frames)
-    if (msg.kind === 'hello') this.joined.value = true;
+    if (msg.kind === 'hello') {
+      this.joined.value = true;
+      this.refusal.value = null;
+    }
     if (msg.kind === 'hello' || msg.kind === 'peers')
       this.peers.value = msg.kind === 'hello' ? msg.peers : msg.count;
     else if (msg.kind === 'pong') {
       const rtt = Date.now() - msg.t;
       this.latencyMs.value = rtt;
       telemetry.histogram('editor.sync.latency_ms', rtt);
+      // the server holds what this connection sent before that ping
+      const i = this.pings.findIndex((p) => p.t === msg.t);
+      if (i >= 0) {
+        const { state } = this.pings[i];
+        this.pings.splice(0, i + 1);
+        if (state) {
+          this.held = state;
+          this.wakeHoldWaiters();
+        }
+      }
     } else if (msg.kind === 'ping') this.send(encodeJsonFrame(MSG_CONTROL, { kind: 'pong', t: msg.t }));
-    else if (msg.kind === 'error') telemetry.log('WARN', `sync server error: ${msg.message}`);
+    else if (msg.kind === 'error') {
+      telemetry.log('WARN', `sync server error: ${msg.message}`);
+      // the reason of the close that follows (OUT_OF_MEMORY_CLOSE_CODE); a connection no room held
+      // is one to a stored project the server cannot load
+      if (msg.code === 'OUT_OF_MEMORY')
+        this.refusal.value = { message: msg.message, load: !this.joined.value };
+    }
   }
 
   private async onRpc(msg: RpcMessage): Promise<void> {
@@ -330,6 +457,7 @@ export class SyncProvider {
 
   destroy(): void {
     this.destroyed = true;
+    this.wakeHoldWaiters();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.pingTimer) clearInterval(this.pingTimer);
     this.doc.off('update', this.onDocUpdate);

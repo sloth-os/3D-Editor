@@ -6,7 +6,10 @@ import {
   decodeFloat32,
   decompose4,
   isMeshMemoryError,
+  isModifierEnabled,
   meshStats,
+  modifierDisabledMessage,
+  modifierDisabledReason,
   modifierObjectParams,
   normalizeParticleSettings,
   transformPoint3,
@@ -19,6 +22,7 @@ import {
   type FCurve,
   type Mat4,
   type MeshData,
+  type ModifierDisabledContext,
   type ObjectData,
   type SceneDoc,
   type ShapeKeyData,
@@ -325,24 +329,33 @@ function modifierErrors(scene: SceneDoc, ev: EvaluatedObject): { modifier: strin
  * poses, curves, instancing, physics), constraint errors and modifier errors of every object; then
  * those that only the VIEWPORT evaluation has (`viewport` when the viewport may differ), marked
  * `viewport: true`: a Subdivision Surface whose viewport levels are skipped while its render_levels
- * evaluate, for one, which the viewport counts (`evaluated_viewport`) show unsubdivided.
+ * evaluate, for one, which the viewport counts (`evaluated_viewport`) show unsubdivided. The
+ * modifiers Blender's is_disabled leaves out (`disabled: true`) come last.
  */
 function allProblems(
   scene: SceneDoc,
   ev: EvaluatedScene,
   viewport: EvaluatedScene | null = null,
 ): Record<string, unknown>[] {
-  const out = problemsOf(scene, ev);
-  if (!viewport || viewport === ev) return out;
+  const out = problemsOf(scene, ev, true);
+  if (!viewport || viewport === ev) return disabledLast(out);
   const index = new Map(out.map((p, i) => [sameProblem(p), i]));
-  for (const p of problemsOf(scene, viewport)) {
+  for (const p of problemsOf(scene, viewport, false)) {
     const i = index.get(sameProblem(p));
     if (i === undefined) out.push({ ...p, viewport: true });
     // both evaluations skipped it for memory: the viewport's advice names both settings
     // ("levels (render_levels for renders)")
     else out[i] = { ...out[i], message: p.message };
   }
-  return out;
+  return disabledLast(out);
+}
+
+/**
+ * `problems` with the disabled modifiers after the errors, so that the list's cap (MAX_PROBLEMS)
+ * leaves out disabled modifiers before it leaves out an error.
+ */
+function disabledLast(problems: Record<string, unknown>[]): Record<string, unknown>[] {
+  return [...problems.filter((p) => !p.disabled), ...problems.filter((p) => p.disabled)];
 }
 
 /**
@@ -356,9 +369,21 @@ function sameProblem(p: unknown): string {
     .replace(/\. Lower [^"]*? to evaluate it on the server/g, '. Lower to evaluate it on the server');
 }
 
-/** The problems of one evaluation (see {@link allProblems}). */
-function problemsOf(scene: SceneDoc, ev: EvaluatedScene): Record<string, unknown>[] {
+/**
+ * The problems of one evaluation (see {@link allProblems}), made with the render settings of the
+ * modifiers when `forRender`, else the viewport's: also every modifier of the evaluation that
+ * Blender's is_disabled leaves out (modifierDisabledMessage: a Boolean without a mesh object, a
+ * Subdivision Surface with 0 levels, …), which changes nothing there. One that only the viewport's
+ * settings disable (a Subdivision Surface with 0 levels and render_levels above 0, a common way to
+ * keep the viewport light) is used by renders, so it is not one to remove.
+ */
+function problemsOf(scene: SceneDoc, ev: EvaluatedScene, forRender: boolean): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = ev.errors.map((e) => describeProblem(scene, e));
+  const disabledCtx: ModifierDisabledContext = {
+    forRender,
+    objectType: (id) => scene.getObject(id)?.type ?? null,
+    objectName: (id) => scene.getObject(id)?.name ?? id,
+  };
   for (const o of ev.objects) {
     for (const e of o.constraintErrors) {
       const c = o.data.constraints?.find((x) => x.id === e.constraintId);
@@ -371,6 +396,24 @@ function problemsOf(scene: SceneDoc, ev: EvaluatedScene): Record<string, unknown
     }
     for (const e of modifierErrors(scene, o))
       out.push({ source: 'modifier', object: o.name, modifier: e.modifier, message: e.message });
+    for (const m of o.data.modifiers) {
+      if (!isModifierEnabled(m, { forRender, editMode: false })) continue;
+      const disabled = modifierDisabledMessage(m, disabledCtx);
+      if (!disabled) continue;
+      const rendered =
+        !forRender &&
+        isModifierEnabled(m, { forRender: true, editMode: false }) &&
+        !modifierDisabledReason(m, { ...disabledCtx, forRender: true });
+      out.push({
+        source: 'modifier',
+        object: o.name,
+        modifier: m.name,
+        disabled: true,
+        message: rendered
+          ? `Modifier is disabled: ${disabled} in the viewport; renders use it`
+          : `Modifier is disabled: ${disabled}; change it with update_modifier or remove it with remove_modifier`,
+      });
+    }
   }
   return out;
 }

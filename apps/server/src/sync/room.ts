@@ -10,6 +10,7 @@ import {
   MSG_QUERY_AWARENESS,
   MSG_RPC,
   MSG_SYNC,
+  OUT_OF_MEMORY_CLOSE_CODE,
   PROTOCOL_VERSION,
   SceneDoc,
   encodeFrame,
@@ -22,6 +23,8 @@ import {
   type ProjectFileStore,
   type ProjectInfo,
   type ProjectMeta,
+  type ReadOptions,
+  type WriteOptions,
   type RpcMessage,
   type RpcRequest,
   type RpcResponse,
@@ -31,6 +34,14 @@ import type { Log } from '../observability/log';
 import { currentTraceparent, errorMessage, withSpan, withSpanSync } from '../observability/tracing';
 import { encodeAwarenessEntries } from './awareness';
 import { isSceneEmpty, projectInfoFromScene, sceneStats, type SceneStats } from './project-info';
+import {
+  StoredChangesRefusedError,
+  growthCheck,
+  refusedChangesMessage,
+  storedChangesMessage,
+  type GrowthCheck,
+} from './project-memory';
+import { measureUpdate, type UpdateSize } from './update-size';
 
 /** Transaction origin of changes merged from storage (not re-persisted, still broadcast). */
 export const STORAGE_ORIGIN = Symbol('storage');
@@ -83,6 +94,11 @@ export class SyncConnection {
   /** Awareness client ids published through this connection (removed when it closes). */
   readonly awarenessIds = new Set<number>();
   alive = true;
+  /**
+   * The server did not apply changes this connection sent (the project would not fit, see
+   * Room.handleMessage): it is closed, and what it sends meanwhile is ignored.
+   */
+  refused = false;
 
   constructor(
     readonly ws: WebSocket,
@@ -108,6 +124,11 @@ export interface RoomDeps {
   log: Log;
   debounceMs: number;
   serverVersion: string;
+  /**
+   * Asked before a change a sync client sends is applied, when it adds to the project (default:
+   * project-memory.ts growthCheck, the check of operators that add to a project).
+   */
+  growthCheck?: GrowthCheck;
 }
 
 export interface RpcOptions {
@@ -214,6 +235,21 @@ function answerKey(r: Pick<RpcRequestInfo, 'method' | 'command' | 'engine' | 'sh
 }
 
 /**
+ * A fingerprint of a stored document's bytes (their length and an FNV-1a hash of them), to tell the
+ * state a room last read or wrote from another writer's (see Room.storedGrowthRefusal): 3–5 ms for 8 MB.
+ */
+export function fingerprint(bytes: Uint8Array): string {
+  let h = 0x811c9dc5;
+  const words = bytes.byteOffset % 4 === 0 ? bytes.byteLength >> 2 : 0;
+  if (words) {
+    const w = new Uint32Array(bytes.buffer, bytes.byteOffset, words);
+    for (let i = 0; i < words; i++) h = Math.imul(h ^ w[i], 0x01000193);
+  }
+  for (let i = words << 2; i < bytes.byteLength; i++) h = Math.imul(h ^ bytes[i], 0x01000193);
+  return `${bytes.byteLength}:${(h >>> 0).toString(16)}`;
+}
+
+/**
  * A room's scene: while its document has no name (a project with a project.json and no document:
  * RoomManager loads an empty document), its name is the stored one (`storedName`, project.json's),
  * which editors and agents see (get_scene, REST, error messages) and listings and saves keep
@@ -274,6 +310,8 @@ export class Room {
   private removed = false;
   /** See {@link storageLate}. */
   private readonly lateReads = new Set<Promise<unknown>>();
+  /** Fingerprint of the stored state the room last read or wrote (see storedGrowthRefusal). */
+  private storedPrint: string | null;
   private firstDirtyAt = 0;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   /** The room's reads and writes of storage, one at a time (see {@link enqueue}). */
@@ -293,7 +331,14 @@ export class Room {
     readonly id: string,
     doc: Y.Doc,
     private readonly deps: RoomDeps,
-    init: { info?: ProjectInfo | null; persisted?: boolean; documentStored?: boolean; readAt?: number } = {},
+    init: {
+      info?: ProjectInfo | null;
+      persisted?: boolean;
+      documentStored?: boolean;
+      readAt?: number;
+      /** The stored document the room was loaded from. */
+      stored?: Uint8Array;
+    } = {},
   ) {
     this.doc = doc;
     this.scene = new RoomScene(doc, { type: 'server', room: id }, () => this.info?.name);
@@ -304,6 +349,7 @@ export class Room {
     this.persisted = !!init.persisted;
     this.readAt = init.readAt ?? 0;
     this.storage = init.documentStored ? 'stored' : 'unknown';
+    this.storedPrint = init.stored ? fingerprint(init.stored) : null;
     doc.on('update', this.onDocUpdate);
     this.awareness.on('update', this.onAwarenessUpdate);
   }
@@ -543,7 +589,7 @@ export class Room {
     try {
       await withSpan(`persistence.${op}`, { 'project.id': this.id }, async (span) => {
         const prevInfo = await store.loadInfo(this.id).catch(() => null);
-        const res = await store.syncDocument(this.id, this.doc, {
+        const res = await this.guarded(store).syncDocument(this.id, this.doc, {
           origin: STORAGE_ORIGIN,
           info: () => (this.info = projectInfoFromScene(this.id, this.scene, prevInfo ?? this.info)),
           // a refresh without unsaved changes does not bring back a project another writer deleted
@@ -568,6 +614,7 @@ export class Room {
         }
         this.persisted = !res.missing;
         this.readAt = Date.now();
+        if (res.stored) this.storedPrint = fingerprint(res.stored);
         this.unconfirmedWrite = res.pushed && !res.missing && !store.fs.atomicConditionalWrites;
         span.setAttributes({
           'persistence.pulled': res.pulled,
@@ -579,6 +626,12 @@ export class Room {
       metrics.persistenceOps.inc({ op, status: 'ok' });
     } catch (err) {
       metrics.persistenceOps.inc({ op, status: 'error' });
+      // another writer stored changes the project cannot take: not merged (see guarded)
+      if (err instanceof StoredChangesRefusedError)
+        log.warn(
+          { err: err.message, project: this.id },
+          'changes in storage not merged: the project cannot take them',
+        );
       if (!wasDirty) {
         // until a refresh finds the room's last write in storage, a change of the room may be
         // missing there (another writer's save can have replaced it): the room is not evicted
@@ -590,10 +643,11 @@ export class Room {
         return;
       }
       this.saveFailures++;
-      log.warn(
-        { err: errorMessage(err), project: this.id, failures: this.saveFailures },
-        'saving project failed, will retry',
-      );
+      if (!(err instanceof StoredChangesRefusedError))
+        log.warn(
+          { err: errorMessage(err), project: this.id, failures: this.saveFailures },
+          'saving project failed, will retry',
+        );
       if (!this.destroyed) {
         this.dirty = true;
         const delay = Math.min(
@@ -611,6 +665,64 @@ export class Room {
       this.saving = false;
       end();
     }
+  }
+
+  /**
+   * `store` for the room's reads and writes of storage, whose reads of the stored state that a save
+   * or refresh merges into the room are asked about first (storedGrowthRefusal): a state another
+   * writer stored with more than the project can take (a browser that saves to WebDAV, directly or
+   * through this server's /dav, what this server did not take from its sync; another server) is not
+   * merged: the save or refresh fails with a {@link StoredChangesRefusedError} and is tried again
+   * as one that failed. A read back of the room's own write (storage whose conditional writes are
+   * not one step) is not measured again; one that finds another writer's state is (that write came
+   * between the room's write and the read).
+   */
+  private guarded(store: ProjectFileStore): ProjectFileStore {
+    const docPath = store.docPath(this.id);
+    /** Fingerprint of the document this save or refresh wrote last. */
+    let wrote: string | null = null;
+    const fs = new Proxy(store.fs, {
+      get: (target, prop) => {
+        if (prop === 'write')
+          return async (path: string, data: Uint8Array, opts?: WriteOptions) => {
+            const r = await target.write(path, data, opts);
+            if (path === docPath) wrote = fingerprint(data);
+            return r;
+          };
+        const value: unknown = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const loadDocument = async (id: string, opts?: ReadOptions) => {
+      const r = await store.loadDocument(id, opts);
+      if (r && !(opts?.etag === false && wrote !== null && fingerprint(r.update) === wrote)) {
+        const refused = this.storedGrowthRefusal(r.update);
+        if (refused) throw new StoredChangesRefusedError(refused);
+      }
+      return r;
+    };
+    return Object.create(store, {
+      loadDocument: { value: loadDocument },
+      fs: { value: fs },
+    }) as ProjectFileStore;
+  }
+
+  /**
+   * Why the room does not merge `stored`, the stored state a save or refresh read (null: it does):
+   * it adds to the project what the project cannot take (RoomDeps.growthCheck, as for sync clients).
+   * A state the room last read or wrote itself is not measured again (storedPrint).
+   */
+  private storedGrowthRefusal(stored: Uint8Array): string | null {
+    if (this.storedPrint !== null && fingerprint(stored) === this.storedPrint) return null;
+    let size: UpdateSize;
+    try {
+      size = measureUpdate(stored, this.scene);
+    } catch {
+      return null;
+    }
+    if (!(size.kept > 0)) return null;
+    const clause = (this.deps.growthCheck ?? growthCheck)(this.scene, size.kept, size.saved);
+    return clause ? storedChangesMessage(size, clause) : null;
   }
 
   // ---------------------------------------------------------------- connections
@@ -718,6 +830,7 @@ export class Room {
   // ---------------------------------------------------------------- incoming messages
 
   handleMessage(conn: SyncConnection, data: Uint8Array): void {
+    if (conn.refused) return;
     conn.lastActivity = Date.now();
     this.touch();
     let type: number;
@@ -737,6 +850,12 @@ export class Room {
             'sync.message',
             { 'sync.room': this.id, 'sync.type': typeName, 'sync.bytes': data.byteLength },
             () => {
+              // changes (sync step 2 and updates) the project cannot take are not applied
+              const refused = this.growthRefusal(decoding.clone(decoder));
+              if (refused) {
+                this.refuse(conn, refused);
+                return;
+              }
               const enc = encoding.createEncoder();
               encoding.writeVarUint(enc, MSG_SYNC);
               syncProtocol.readSyncMessage(decoder, enc, this.doc, conn);
@@ -785,6 +904,59 @@ export class Room {
         code: 'BAD_MESSAGE',
       });
     }
+  }
+
+  /**
+   * Why the server does not apply the changes of a sync message (`decoder` at its sync payload: step
+   * 2 or an update; other messages change nothing), null when it applies them: they add objects,
+   * datablocks, keyframes, geometry or images (sync/update-size.ts, in the terms the memory checks
+   * count a project) that the project cannot take (RoomDeps.growthCheck). Changes and deletions of
+   * what the project has are applied as before, also in a project already past its limit (and so is
+   * a message the measure cannot read: Yjs decides as before).
+   */
+  private growthRefusal(decoder: decoding.Decoder): { message: string; size: UpdateSize } | null {
+    const kind = decoding.readVarUint(decoder);
+    if (kind !== syncProtocol.messageYjsSyncStep2 && kind !== syncProtocol.messageYjsUpdate) return null;
+    let size: UpdateSize;
+    try {
+      size = measureUpdate(decoding.readVarUint8Array(decoder), this.scene);
+    } catch {
+      return null;
+    }
+    if (!(size.kept > 0)) return null;
+    const clause = (this.deps.growthCheck ?? growthCheck)(this.scene, size.kept, size.saved);
+    return clause ? { message: refusedChangesMessage(size, clause), size } : null;
+  }
+
+  /**
+   * Refuses the changes `conn` sent: a control error with code OUT_OF_MEMORY and the reason, then
+   * the connection is closed with OUT_OF_MEMORY_CLOSE_CODE (a client that does not answer the close
+   * frame within 2 s is disconnected). The other connections of the room go on.
+   */
+  private refuse(conn: SyncConnection, refused: { message: string; size: UpdateSize }): void {
+    conn.refused = true;
+    const { size } = refused;
+    this.deps.log.warn(
+      {
+        project: this.id,
+        conn: conn.id,
+        objects: size.objects,
+        keyframes: size.keyframes,
+        addedMB: Math.round(size.kept / (1024 * 1024)),
+        err: refused.message,
+      },
+      'sync changes not applied: the project cannot take them',
+    );
+    this.sendControl(conn, { kind: 'error', message: refused.message, code: 'OUT_OF_MEMORY' });
+    const ws = conn.ws;
+    try {
+      ws.close(OUT_OF_MEMORY_CLOSE_CODE, 'project too large for the server');
+    } catch {
+      ws.terminate();
+    }
+    const t = setTimeout(() => ws.terminate(), 2000);
+    t.unref?.();
+    ws.once('close', () => clearTimeout(t));
   }
 
   private handleControl(conn: SyncConnection, msg: ControlMessage): void {

@@ -34,6 +34,16 @@ export const PROTOCOL_VERSION = 1;
  */
 export const PROJECT_DELETED_CLOSE_CODE = 4404;
 
+/**
+ * WebSocket close code of a sync connection whose changes the editor server did not apply because
+ * the project would then need more memory than the server keeps for it (it sends a control error
+ * with code OUT_OF_MEMORY and the reason first), and of a new connection to a stored project the
+ * server cannot load for memory, which it accepts and closes at once (as for
+ * {@link PROJECT_DELETED_CLOSE_CODE}). Browsers keep the project and stop connecting to it by
+ * themselves until Save (apps/web/src/sync/provider.ts).
+ */
+export const OUT_OF_MEMORY_CLOSE_CODE = 4507;
+
 export interface RpcRequest {
   kind: 'req';
   id: string;

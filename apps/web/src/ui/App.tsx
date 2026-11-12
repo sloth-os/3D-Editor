@@ -15,7 +15,12 @@ import { DialogHost, ProjectList } from './dialogs/Dialogs';
 import { hoveredArea, run } from '../editor/editor';
 import { createProject } from '../project/manager';
 import { Icon } from './icons';
-import { deletedOnServerNote, type ProjectSession } from '../project/session';
+import {
+  LOAD_REFUSED_NOTE,
+  deletedOnServerNote,
+  refusedOnServerNote,
+  type ProjectSession,
+} from '../project/session';
 import { pwaUpdate, applyPwaUpdate } from '../pwa/register';
 
 function Splitter({ dir, onDrag }: { dir: 'v' | 'h'; onDrag: (delta: number) => void }) {
@@ -78,14 +83,22 @@ function Presence({ s }: { s: ProjectSession }) {
 
 /**
  * The status bar's sync and storage status. Sync status `deleted`: the server closed the connection
- * because it deleted the project, and the browser no longer connects to it by itself; the tooltip
- * says what the toast said then (ProjectSession.tellWhenDeletedOnServer).
+ * because it deleted the project; `refused`: because it did not take this browser's changes (or
+ * cannot load the project: SyncRefusal.load) for memory. The browser then no longer connects to it
+ * by itself; the tooltip says what the toast said then (ProjectSession.tellWhenDeletedOnServer).
  */
 export function SyncStatus({ s }: { s: ProjectSession }) {
   const st = s.provider?.status.value ?? 'disabled';
   const wd = s.webdav;
   const wdStatus = wd?.status.value;
-  const dot = st === 'connected' ? 'ok' : st === 'connecting' ? 'warn' : st === 'deleted' ? 'err' : 'off';
+  const dot =
+    st === 'connected'
+      ? 'ok'
+      : st === 'connecting'
+        ? 'warn'
+        : st === 'deleted' || st === 'refused'
+          ? 'err'
+          : 'off';
   const label =
     st === 'connected'
       ? `Live · ${s.peers.value.length + 1} device(s)`
@@ -95,13 +108,20 @@ export function SyncStatus({ s }: { s: ProjectSession }) {
           ? 'Offline'
           : st === 'deleted'
             ? 'Deleted on server'
-            : 'Local only';
+            : st === 'refused'
+              ? 'Too large for server'
+              : 'Local only';
+  const refusal = st === 'refused' ? s.provider?.refusal.value : null;
   const title =
-    st !== 'deleted'
-      ? 'Real-time sync'
-      : wd?.target.viaServer
-        ? `The server deleted this project. ${deletedOnServerNote(true)}`
-        : `The server deleted this project. ${deletedOnServerNote(false)} Save (Ctrl+S) or a reload tries the server again.`;
+    st === 'refused'
+      ? refusal?.load
+        ? `The server did not open this project: ${refusal.message}. ${LOAD_REFUSED_NOTE}`
+        : `The server did not take this project${refusal ? `: ${refusal.message}.` : '.'} ${refusedOnServerNote(!!wd?.target.viaServer)}`
+      : st !== 'deleted'
+        ? 'Real-time sync'
+        : wd?.target.viaServer
+          ? `The server deleted this project. ${deletedOnServerNote(true)}`
+          : `The server deleted this project. ${deletedOnServerNote(false)} Save (Ctrl+S) or a reload tries the server again.`;
   return (
     <>
       <span title={title} data-testid="sync-status" data-status={st}>

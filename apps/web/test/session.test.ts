@@ -2,8 +2,25 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from 'y-protocols/awareness';
 import * as syncProtocol from 'y-protocols/sync';
-import { MSG_CONTROL, MSG_SYNC, SceneDoc, encodeFrame, encodeJsonFrame } from '@3d-editor/core';
-import { ProjectSession } from '../src/project/session';
+import {
+  MSG_CONTROL,
+  MSG_SYNC,
+  SceneDoc,
+  encodeFrame,
+  encodeJsonFrame,
+  readFrameType,
+  readJsonPayload,
+  type ControlMessage,
+} from '@3d-editor/core';
+import {
+  INDEX_UPDATE_MS,
+  LOAD_REFUSED_NOTE,
+  ProjectSession,
+  THUMBNAIL_RETRY_MS,
+  THUMBNAIL_WAIT_MS,
+  refusedOnServer,
+  refusedOnServerNote,
+} from '../src/project/session';
 import { localIndex } from '../src/project/local-index';
 import { serverConfig, toasts } from '../src/app/store';
 import { prefs, defaultPreferences } from '../src/app/prefs';
@@ -18,10 +35,18 @@ class FakeSocket {
   onmessage: ((e: { data: ArrayBuffer }) => void) | null = null;
   onclose: ((e: { code: number }) => void) | null = null;
   onerror: (() => void) | null = null;
+  /** Whether the test's server answers pings (as the editor server does while it applies changes). */
+  answersPings = false;
   constructor(readonly url: string) {
     FakeSocket.created.push(this);
   }
-  send(): void {}
+  send(frame: Uint8Array): void {
+    const { type, decoder } = readFrameType(frame);
+    if (type !== MSG_CONTROL || !this.answersPings) return;
+    const msg = readJsonPayload<ControlMessage>(decoder);
+    if (msg.kind === 'ping')
+      queueMicrotask(() => this.receive(encodeJsonFrame(MSG_CONTROL, { kind: 'pong', t: msg.t })));
+  }
   close(): void {
     this.readyState = 3;
   }
@@ -65,6 +90,17 @@ function hello(socket: FakeSocket, room: string): void {
       peers: 1,
     }),
   );
+}
+
+/**
+ * The test's server takes the connection as a room of the editor server does: hello, its sync step 1
+ * (the browser answers with its step 2), and answers to pings when `answersPings`.
+ */
+function serve(socket: FakeSocket, room: string, answersPings = true): void {
+  socket.answersPings = answersPings;
+  socket.open();
+  hello(socket, room);
+  socket.receive(encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep1(enc, new Y.Doc())));
 }
 
 /** A WebDAV server in memory with ETags in GET, HEAD and PUT responses. */
@@ -288,6 +324,122 @@ describe('ProjectSession (browser storage)', () => {
   });
 });
 
+describe('ProjectSession: the thumbnail of the local project list', () => {
+  /*
+   * The viewport gives a thumbnail only of a frame it drew that shows every change (its canvas keeps
+   * it): a thumbnail of its own, drawn 3 s after every change, held the tab for as long as the GPU
+   * drew the frame (0.55 to 0.95 s with 4 million triangles in software WebGL).
+   */
+  it('takes the thumbnail once the viewport shows the latest change, and keeps the last one meanwhile', async () => {
+    serverConfig.value = null;
+    prefs.value = { ...defaultPreferences(), storage: { ...defaultPreferences().storage, mode: 'browser' } };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const s = await ProjectSession.open('proj-thumb', { initial: SceneDoc.create({ name: 'Thumb' }) });
+    let shown: string | null = 'thumb-1';
+    let asked = 0;
+    try {
+      s.thumbnailProvider = () => (asked++, shown);
+      // the entry of the opening
+      vi.advanceTimersByTime(INDEX_UPDATE_MS);
+      expect(s.projectInfo().thumbnail).toBe('thumb-1');
+      // the project's info (what WebDAV's project.json stores too) takes the thumbnail of the
+      // viewport as it shows the project now
+      shown = 'thumb-1b';
+      expect(s.projectInfo().thumbnail).toBe('thumb-1b');
+      // the viewport has not drawn the latest change: the project's info keeps the last thumbnail
+      shown = null;
+      expect(s.projectInfo().thumbnail).toBe('thumb-1b');
+      asked = 0;
+      s.doc.addObject({ type: 'EMPTY', name: 'Marker' });
+      vi.advanceTimersByTime(INDEX_UPDATE_MS - 1);
+      expect(asked).toBe(0);
+      vi.advanceTimersByTime(1);
+      expect(asked).toBe(1);
+      // asked again while the viewport has not drawn it, then written with the thumbnail of it
+      vi.advanceTimersByTime(THUMBNAIL_RETRY_MS);
+      expect(asked).toBe(2);
+      shown = 'thumb-2';
+      vi.advanceTimersByTime(THUMBNAIL_RETRY_MS);
+      expect(asked).toBe(3);
+      vi.advanceTimersByTime(10 * THUMBNAIL_RETRY_MS);
+      expect(asked).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+    await vi.waitFor(async () => expect((await localIndex.get('proj-thumb'))?.thumbnail).toBe('thumb-2'));
+    // a viewport that does not draw the change: written with the last thumbnail at last
+    shown = null;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      asked = 0;
+      s.doc.addObject({ type: 'EMPTY', name: 'Marker 2' });
+      vi.advanceTimersByTime(INDEX_UPDATE_MS + THUMBNAIL_WAIT_MS);
+      // asked every THUMBNAIL_RETRY_MS from INDEX_UPDATE_MS after the change to THUMBNAIL_WAIT_MS
+      const asks = asked;
+      expect(asks).toBe((THUMBNAIL_WAIT_MS - INDEX_UPDATE_MS) / THUMBNAIL_RETRY_MS + 1);
+      vi.advanceTimersByTime(10 * THUMBNAIL_RETRY_MS);
+      expect(asked).toBe(asks);
+    } finally {
+      vi.useRealTimers();
+    }
+    await vi.waitFor(async () => expect((await localIndex.get('proj-thumb'))?.stats?.objects).toBe(5));
+    expect((await localIndex.get('proj-thumb'))?.thumbnail).toBe('thumb-2');
+    // a hidden page draws no frames: written with the last thumbnail at once
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      asked = 0;
+      s.doc.addObject({ type: 'EMPTY', name: 'Marker 3' });
+      vi.advanceTimersByTime(INDEX_UPDATE_MS);
+      expect(asked).toBe(1);
+      vi.advanceTimersByTime(10 * THUMBNAIL_RETRY_MS);
+      expect(asked).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      visibility.mockRestore();
+    }
+    await vi.waitFor(async () => expect((await localIndex.get('proj-thumb'))?.stats?.objects).toBe(6));
+    expect((await localIndex.get('proj-thumb'))?.thumbnail).toBe('thumb-2');
+    await s.close(false);
+    await ProjectSession.deleteLocal('proj-thumb');
+  });
+
+  it('keeps the thumbnail the local project list has until the viewport gives one', async () => {
+    // the viewport draws no frame for a thumbnail: a page opened hidden gives none until it is shown
+    serverConfig.value = null;
+    prefs.value = { ...defaultPreferences(), storage: { ...defaultPreferences().storage, mode: 'browser' } };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      const first = await ProjectSession.open('proj-kept', { initial: SceneDoc.create({ name: 'Kept' }) });
+      first.thumbnailProvider = () => 'stored';
+      first.doc.addObject({ type: 'EMPTY', name: 'Marker' });
+      vi.advanceTimersByTime(INDEX_UPDATE_MS);
+      await first.close(false);
+    } finally {
+      vi.useRealTimers();
+    }
+    await vi.waitFor(async () => expect((await localIndex.get('proj-kept'))?.thumbnail).toBe('stored'));
+    // opened again in a hidden page, before a viewport: the entry and the project's info keep it
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const s = await ProjectSession.open('proj-kept');
+    try {
+      expect(s.projectInfo().thumbnail).toBe('stored');
+      // its viewport drew nothing: written after a change, still with it
+      s.thumbnailProvider = () => null;
+      s.doc.addObject({ type: 'EMPTY', name: 'Marker 2' });
+      vi.advanceTimersByTime(INDEX_UPDATE_MS);
+    } finally {
+      vi.useRealTimers();
+      visibility.mockRestore();
+    }
+    await vi.waitFor(async () => expect((await localIndex.get('proj-kept'))?.stats?.objects).toBe(5));
+    expect((await localIndex.get('proj-kept'))?.thumbnail).toBe('stored');
+    await s.close(false);
+    await ProjectSession.deleteLocal('proj-kept');
+  });
+});
+
 /*
  * The server deleted the project (deleted there, or found deleted from its storage): it closes the
  * connection with 4404, and every new one the same way. The browser used to connect again and again
@@ -375,6 +527,198 @@ describe('ProjectSession of a project the server deleted', () => {
     // the wait it must not do is 10 s
     expect(performance.now() - t0).toBeLessThan(5000);
     expect(s.provider?.status.value).toBe('deleted');
+    await s.close(false);
+  });
+});
+
+/*
+ * The server did not take this browser's changes for memory (an error with code OUT_OF_MEMORY, then
+ * the close code 4507): the session says so once with the server's reason, keeps the project with
+ * its changes, does not wait for the server when it opens one it has nothing of, and Save connects
+ * again.
+ */
+describe('ProjectSession of a project whose changes the server did not take', () => {
+  const reason = 'changes not applied on the server: they add 50 new objects to the project (test)';
+  const refusedMessage =
+    `"Large" is not synced with the server: ${reason}. This browser keeps the project with your changes (in ` +
+    'this browser, in its other tabs and in WebDAV when it saves there) and no longer syncs it with the server; ' +
+    'Save (Ctrl+S) or a reload sends it to the server again.';
+  const refuse = (socket: FakeSocket) => {
+    socket.receive(encodeJsonFrame(MSG_CONTROL, { kind: 'error', code: 'OUT_OF_MEMORY', message: reason }));
+    socket.closedBy(4507);
+  };
+
+  it('says so once with the reason, keeps the changes, and connects again on Save', async () => {
+    withSyncServer();
+    toasts.value = [];
+    const s = await ProjectSession.open('proj-refused', {
+      initial: SceneDoc.create({ name: 'Large', empty: true }),
+    });
+    FakeSocket.created[0].open();
+    hello(FakeSocket.created[0], 'proj-refused');
+    s.doc.addObject({ type: 'EMPTY', name: 'Not taken' });
+    refuse(FakeSocket.created[0]);
+    expect(s.provider?.status.value).toBe('refused');
+    expect(toasts.value.map((t) => [t.level, t.message])).toEqual([['warning', refusedMessage]]);
+    expect(s.doc.findObjectByName('Not taken')).not.toBeNull();
+    // Save connects again; refused again, nothing more is said
+    await s.flush();
+    expect(FakeSocket.created).toHaveLength(2);
+    FakeSocket.created[1].open();
+    refuse(FakeSocket.created[1]);
+    expect(toasts.value.filter((t) => t.message === refusedMessage)).toHaveLength(1);
+    // the project fits now (the person deleted what it no longer needs): the connection stays
+    await s.flush();
+    FakeSocket.created[2].open();
+    hello(FakeSocket.created[2], 'proj-refused');
+    expect(s.provider?.status.value).toBe('connected');
+    await s.close(false);
+  });
+
+  /*
+   * A stored project the server cannot load: the toast said '"Untitled" is not synced with the
+   * server' and that the browser keeps the project with the person's changes, of a project it never
+   * had.
+   */
+  it('says that the server did not open a stored project it cannot load, with its reason', async () => {
+    withSyncServer();
+    toasts.value = [];
+    refusedOnServer.set('proj-huge', false);
+    const why = "project 'Huge' (proj-huge) was not loaded on the server: it would not fit (test)";
+    const opening = ProjectSession.open('proj-huge');
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(1));
+    FakeSocket.created[0].open();
+    FakeSocket.created[0].receive(
+      encodeJsonFrame(MSG_CONTROL, { kind: 'error', code: 'OUT_OF_MEMORY', message: why }),
+    );
+    FakeSocket.created[0].closedBy(4507);
+    const s = await opening;
+    expect(toasts.value.map((t) => [t.level, t.message])).toEqual([
+      ['warning', `The server did not open this project: ${why}. ${LOAD_REFUSED_NOTE}`],
+    ]);
+    expect(refusedOnServer.has('proj-huge')).toBe(false);
+    await s.close(false);
+  });
+
+  it('opens a project it has nothing of without waiting for a server that refused it', async () => {
+    withSyncServer();
+    ProjectSession.remoteWaitMs = 10_000;
+    const t0 = performance.now();
+    const opening = ProjectSession.open('proj-refused-load');
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(1));
+    FakeSocket.created[0].open();
+    refuse(FakeSocket.created[0]);
+    const s = await opening;
+    // the wait it must not do is 10 s
+    expect(performance.now() - t0).toBeLessThan(5000);
+    expect(s.provider?.status.value).toBe('refused');
+    await s.close(false);
+  });
+});
+
+/*
+ * WebDAV through the editor server (WEBDAV_URL) is the server's storage, which its rooms read and
+ * every editor of the project syncs with. A browser whose changes the server did not take saved them
+ * there all the same: the next WebDAV sync of every other browser brought them to the server again,
+ * which refused those browsers too, and the room no longer saved.
+ */
+describe('ProjectSession with WebDAV through the server, of changes the server did not take', () => {
+  // (one project per test: the browser's IndexedDB keeps each project's document across tests)
+  let ID = '';
+  let DOC = '';
+  const reason = 'changes not applied on the server: they add 1 new object to the project (test)';
+  const notTaken =
+    "Not saved to WebDAV (the server did not take this project's changes, so WebDAV through it gets them only " +
+    'once it does). The project is saved in this browser.';
+  const refuse = (socket: FakeSocket) => {
+    socket.receive(encodeJsonFrame(MSG_CONTROL, { kind: 'error', code: 'OUT_OF_MEMORY', message: reason }));
+    socket.closedBy(4507);
+  };
+  /** The project as WebDAV holds it. */
+  const stored = (dav: ReturnType<typeof memoryDav>) => {
+    const doc = new SceneDoc(new Y.Doc());
+    Y.applyUpdate(doc.ydoc, dav.files.get(DOC)!.data);
+    return doc;
+  };
+
+  /** A project open in this browser, stored in WebDAV, live with the server. */
+  async function openLive(dav: ReturnType<typeof memoryDav>, id: string) {
+    ID = id;
+    DOC = `/dav/3d-editor/projects/${ID}/document.ybin`;
+    withSyncServerAndWebDAV(dav, 'server');
+    toasts.value = [];
+    const s = await ProjectSession.open(ID, { initial: SceneDoc.create({ name: 'Large', empty: true }) });
+    await s.webdav!.syncNow();
+    expect(dav.files.has(DOC)).toBe(true);
+    serve(FakeSocket.created[0], ID);
+    return s;
+  }
+
+  it('saves nothing there while the server does not take them, also on Save, and saves them once it does', async () => {
+    const dav = memoryDav();
+    const s = await openLive(dav, 'proj-proxy-refused');
+    s.doc.addObject({ type: 'EMPTY', name: 'Not taken' });
+    refuse(FakeSocket.created[0]);
+    expect(refusedOnServer.has(ID)).toBe(true);
+    expect(toasts.value.map((t) => t.message)).toEqual([
+      `"Large" is not synced with the server: ${reason}. ${refusedOnServerNote(true)}`,
+    ]);
+    expect(await s.webdav!.syncNow()).toBeNull();
+    expect(s.webdav!.status.value).toBe('error');
+    expect(stored(dav).findObjectByName('Not taken')).toBeNull();
+    // Save connects again first; the server refuses again: WebDAV gets nothing, and Save says why
+    const saving = s.flush();
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(2));
+    FakeSocket.created[1].open();
+    hello(FakeSocket.created[1], ID);
+    refuse(FakeSocket.created[1]);
+    expect(await saving).toEqual({ message: notTaken, level: 'error' });
+    expect(stored(dav).findObjectByName('Not taken')).toBeNull();
+    // the person deletes what the server could not take: Save, the server takes it, then WebDAV
+    s.doc.removeObject(s.doc.findObjectByName('Not taken')!.id);
+    s.doc.addObject({ type: 'EMPTY', name: 'Small' });
+    const again = s.flush();
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(3));
+    serve(FakeSocket.created[2], ID);
+    expect(await again).toEqual({ message: 'Saved to WebDAV', level: 'info' });
+    expect(stored(dav).findObjectByName('Small')).not.toBeNull();
+    expect(refusedOnServer.has(ID)).toBe(false);
+    await s.close(false);
+  });
+
+  it('writes there only what the server answered it holds, so a refusal that comes later stops the write', async () => {
+    const dav = memoryDav();
+    const s = await openLive(dav, 'proj-proxy-race');
+    FakeSocket.created[0].answersPings = false;
+    s.doc.addObject({ type: 'EMPTY', name: 'Not taken' });
+    const sync = s.webdav!.syncNow();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(stored(dav).findObjectByName('Not taken')).toBeNull();
+    refuse(FakeSocket.created[0]);
+    expect(await sync).toBeNull();
+    expect(stored(dav).findObjectByName('Not taken')).toBeNull();
+    await s.close(false);
+  });
+
+  it('after a reload, saves nothing there until the server answered that it holds the changes', async () => {
+    const dav = memoryDav();
+    const first = await openLive(dav, 'proj-proxy-reload');
+    first.doc.addObject({ type: 'EMPTY', name: 'Not taken' });
+    refuse(FakeSocket.created[0]);
+    await new Promise((r) => setTimeout(r, 50));
+    await first.close(false);
+    // the page loaded again: its first WebDAV sync starts before the server says anything
+    const s = await ProjectSession.open(ID);
+    expect(s.doc.findObjectByName('Not taken')).not.toBeNull();
+    const sync = s.webdav!.syncNow();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(stored(dav).findObjectByName('Not taken')).toBeNull();
+    FakeSocket.created[1].open();
+    hello(FakeSocket.created[1], ID);
+    refuse(FakeSocket.created[1]);
+    expect(await sync).toBeNull();
+    expect(stored(dav).findObjectByName('Not taken')).toBeNull();
+    expect(refusedOnServer.has(ID)).toBe(true);
     await s.close(false);
   });
 });

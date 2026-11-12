@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   SceneDoc,
+  bevelCount,
   createEditorState,
   createGrid,
   createOperatorRegistry,
@@ -15,6 +16,8 @@ import {
   setGeometryMemoryCheck,
   setMeshMemoryCheck,
   setOperatorMemoryCheck,
+  setSimulationMemoryCheck,
+  simulationMemoryCheck,
   storedMeshBytes,
   projectStoredBytes,
   importMemoryRefusal,
@@ -31,6 +34,7 @@ import {
   GC_MIN_INTERVAL_MS,
   collectGarbage,
   decodeCheck,
+  estimateRenderMemory,
   geometryCheck,
   installGeometryMemoryGuard,
   maxProjectMeshBytes,
@@ -43,6 +47,7 @@ import {
   throttledGarbageCollector,
 } from '../../src/render/memory';
 import { describeObject, summarizeScene } from '../../src/mcp/scene-summary';
+import { meshData } from '../../src/mcp/mesh-data';
 
 /*
  * The operators of MCP tools and the REST API run in the server's own process, whose JavaScript
@@ -60,6 +65,7 @@ afterEach(() => {
   setOperatorMemoryCheck(null);
   setMeshMemoryCheck(null);
   setGeometryMemoryCheck(null);
+  setSimulationMemoryCheck(null);
 });
 
 function project(doc = SceneDoc.create({ empty: true })) {
@@ -166,9 +172,9 @@ describe("operators in the server's process", () => {
     const save = saveBytes(3 * (OBJECT_STORED_BYTES + DATABLOCK_STORED_BYTES.meshes));
     expect(save).toBe(126_000);
     expect(res.error).toBe(
-      `not run on the server: the project's meshes and objects would then take about ${up(before + added)} MB of ` +
-        `JavaScript heap (now ${mb(before)} MB with 2 objects), and a save of it about 1 MB more for a moment ` +
-        `(3 times what its objects, datablocks and keyframes take): ${up(before + added) + 1} MB in all, more than ` +
+      `not run on the server: the project's meshes, objects, keyframes and images would then take about ${up(before + added)} MB of ` +
+        `memory (now ${mb(before)} MB with 2 objects), and a save of it about 1 MB more for a moment ` +
+        `(3 times what its objects, datablocks and keyframes take, 5 times its images): ${up(before + added) + 1} MB in all, more than ` +
         "the 22 MB the server's process keeps for one project (half of its 300 MB heap less the 256 MB it keeps " +
         'for its other work). Lower x_subdivisions and y_subdivisions, or delete objects and meshes the project no ' +
         'longer needs',
@@ -182,9 +188,9 @@ describe("operators in the server's process", () => {
       operatorCheck({ heapFree: () => 4096 * MB, collect: () => 0, heapLimit: () => 290 * MB }),
     );
     const past =
-      `not run on the server: the project's meshes and objects already take about ${up(before)} MB of JavaScript ` +
-      `heap with 2 objects, and a save of it about 1 MB more for a moment (3 times what its objects, datablocks ` +
-      `and keyframes take): ${up(before) + 1} MB in all, more than the 17 MB the server's process keeps for one ` +
+      `not run on the server: the project's meshes, objects, keyframes and images already take about ${up(before)} MB of memory ` +
+      `with 2 objects, and a save of it about 1 MB more for a moment (3 times what its objects, datablocks ` +
+      `and keyframes take, 5 times its images): ${up(before) + 1} MB in all, more than the 17 MB the server's process keeps for one ` +
       'project (half of its 290 MB heap less the 256 MB it keeps for its other work), and this operator would ' +
       'add to them. Delete objects and meshes the project no longer needs';
     for (const op of ['mesh.primitive_cube_add', 'object.empty_add']) {
@@ -202,24 +208,29 @@ describe("operators in the server's process", () => {
         300 * MB,
       ),
     ).toBe(
-      "not run on the server: the project's meshes and objects would then take about 30 MB of JavaScript heap " +
+      "not run on the server: the project's meshes, objects, keyframes and images would then take about 30 MB of memory " +
         "(now 10 MB), more than the 22 MB the server's process keeps for one project (half of its 300 MB heap " +
         'less the 256 MB it keeps for its other work). Delete objects and meshes the project no longer needs',
     );
   });
 
-  it('run the generators at their defaults on a server with a 1 GB heap (estimated from their parameters)', () => {
-    // an empty server with Node's 1 GB heap has about 1,000 MB of its 1,072 MB free; the six generators
-    // that check their own size were estimated at the 1,000,000 faces they may build at most (1.3 GB)
-    setOperatorMemoryCheck(
-      operatorCheck({ heapFree: () => 1000 * MB, collect: () => 0, heapLimit: () => 1072 * MB }),
-    );
-    for (const kind of ['tree', 'fence', 'spring', 'building', 'pipe', 'arch', 'blob', 'cloud']) {
-      const { doc, run } = project();
-      expect(run(`object.generate_${kind}`), kind).toMatchObject({ ok: true });
-      expect(doc.listObjects(), kind).toHaveLength(1);
-    }
-  });
+  // eight generators build their meshes: 1.8 s under coverage instrumentation
+  it(
+    'run the generators at their defaults on a server with a 1 GB heap (estimated from their parameters)',
+    { timeout: 15_000 },
+    () => {
+      // an empty server with Node's 1 GB heap has about 1,000 MB of its 1,072 MB free; the six generators
+      // that check their own size were estimated at the 1,000,000 faces they may build at most (1.3 GB)
+      setOperatorMemoryCheck(
+        operatorCheck({ heapFree: () => 1000 * MB, collect: () => 0, heapLimit: () => 1072 * MB }),
+      );
+      for (const kind of ['tree', 'fence', 'spring', 'building', 'pipe', 'arch', 'blob', 'cloud']) {
+        const { doc, run } = project();
+        expect(run(`object.generate_${kind}`), kind).toMatchObject({ ok: true });
+        expect(doc.listObjects(), kind).toHaveLength(1);
+      }
+    },
+  );
 
   it('name the parameters of a generator to lower when it does not fit', () => {
     setOperatorMemoryCheck(
@@ -325,7 +336,7 @@ describe('imports and operators that add objects', () => {
     expect(maxProjectMeshBytes(2098 * MB)).toBe(786.75 * MB);
     // 786.8 MB: about 787 MB, more than the 786 MB (rounded to the nearest, both were 787)
     expect(refused(2098, 786.5 * MB, 0.3 * MB)).toMatch(
-      /would then take about 787 MB of JavaScript heap \(now 787 MB\), more than the 786 MB the server's process keeps/,
+      /would then take about 787 MB of memory \(now 787 MB\), more than the 786 MB the server's process keeps/,
     );
     expect(refused(2098, 786.75 * MB + 1, 1)).toMatch(/already take about 787 MB .* more than the 786 MB /);
     // a heap of 2,097 MB keeps 786.375 MB: 786.4 MB is about 787 MB, rounded up (to the nearest, 786)
@@ -362,9 +373,9 @@ describe('imports and operators that add objects', () => {
     const up = (bytes: number) => Math.ceil(bytes / MB);
     expect([up(kept), up(save)]).toEqual([105, 315]);
     expect(res.error).toBe(
-      "not run on the server: the project's meshes and objects would then take about 105 MB of JavaScript heap " +
+      "not run on the server: the project's meshes, objects, keyframes and images would then take about 105 MB of memory " +
         'with 9,999 new objects (now 0 MB with 1 object), and a save of it about 315 MB more for a moment (3 times ' +
-        "what its objects, datablocks and keyframes take): 420 MB in all, more than the 384 MB the server's " +
+        "what its objects, datablocks and keyframes take, 5 times its images): 420 MB in all, more than the 384 MB the server's " +
         'process keeps for one project (half of its 1,024 MB heap less the 256 MB it keeps for its other work). ' +
         'Lower count, or delete objects and meshes the project no longer needs',
     );
@@ -381,9 +392,9 @@ describe('imports and operators that add objects', () => {
     expect(now).toBeLessThan(maxProjectMeshBytes(500 * MB));
     expect(now + nowSave).toBeGreaterThan(maxProjectMeshBytes(500 * MB));
     expect(run('object.empty_add', {}).error).toBe(
-      `not run on the server: the project's meshes and objects already take about ${up(now)} MB of JavaScript ` +
-        `heap with 3,000 objects, and a save of it about ${up(nowSave)} MB more for a moment (3 times what its ` +
-        `objects, datablocks and keyframes take): ${up(now) + up(nowSave)} MB in all, more than the 122 MB the ` +
+      `not run on the server: the project's meshes, objects, keyframes and images already take about ${up(now)} MB of memory ` +
+        `with 3,000 objects, and a save of it about ${up(nowSave)} MB more for a moment (3 times what its ` +
+        `objects, datablocks and keyframes take, 5 times its images): ${up(now) + up(nowSave)} MB in all, more than the 122 MB the ` +
         "server's process keeps for one project (half of its 500 MB heap less the 256 MB it keeps for its other " +
         'work), and this operator would add to them. Delete objects and meshes the project no longer needs',
     );
@@ -391,12 +402,27 @@ describe('imports and operators that add objects', () => {
 });
 
 describe("the server's checks", () => {
-  it('are all installed when the render module loads (modifiers, operators, decoding stored meshes)', () => {
-    expect([geometryMemoryCheck(), operatorMemoryCheck(), meshMemoryCheck()]).toEqual([null, null, null]);
+  it('are all installed when the render module loads (modifiers, operators, decoding stored meshes, rigid body simulations)', () => {
+    expect([
+      geometryMemoryCheck(),
+      operatorMemoryCheck(),
+      meshMemoryCheck(),
+      simulationMemoryCheck(),
+    ]).toEqual([null, null, null, null]);
     installGeometryMemoryGuard();
     expect(geometryMemoryCheck()).toBeTypeOf('function');
     expect(operatorMemoryCheck()).toBeTypeOf('function');
     expect(meshMemoryCheck()).toBeTypeOf('function');
+    // the server's: frames no heap holds are refused, what to lower named
+    const frames = {
+      bodies: { simulated: 1e6, kinematic: 0 },
+      frame: 20_000,
+      frames: 19_999,
+      bytes: 2 ** 50,
+    };
+    expect(simulationMemoryCheck()?.(frames)).toMatch(
+      /^not simulated on the server: simulating 1,000,000 rigid bodies to frame 20,000 keeps 19,999 more frames of their poses, .*Lower the rigid body world's frame range/,
+    );
   });
 });
 
@@ -490,9 +516,9 @@ describe('linked duplicates', () => {
     );
     expect(saveBytes(projectObjects(doc).bytes)).toBeLessThan(406_000);
     expect(res.error).toBe(
-      "not run on the server: the project's meshes and objects would then take about 29 MB of JavaScript heap " +
+      "not run on the server: the project's meshes, objects, keyframes and images would then take about 29 MB of memory " +
         '(now 2 MB with 12 objects), and a save of it about 1 MB more for a moment (3 times what its objects, ' +
-        "datablocks and keyframes take): 30 MB in all, more than the 22 MB the server's process keeps for one " +
+        "datablocks and keyframes take, 5 times its images): 30 MB in all, more than the 22 MB the server's process keeps for one " +
         'project (half of its 300 MB heap less the 256 MB it keeps for its other work). Lower the number or size ' +
         'of the joined meshes, or delete objects and meshes the project no longer needs',
     );
@@ -501,7 +527,7 @@ describe('linked duplicates', () => {
     const apply = run('object.transform_apply', { location: true });
     expect(apply).toMatchObject({ ok: false, code: 'OUT_OF_MEMORY' });
     expect(apply.error).toMatch(
-      /^not run on the server: the project's meshes and objects would then take about 29 MB /,
+      /^not run on the server: the project's meshes, objects, keyframes and images would then take about 29 MB /,
     );
     expect(doc.listMeshBlocks()).toHaveLength(1);
   });
@@ -594,6 +620,53 @@ describe('exports run in the process', () => {
     expect(res.error).toMatch(
       /^not run on the server: it would need about [\d,]+ MB of JavaScript heap for a mesh of about 6,400,001 faces, and the server's process has 1,500 MB of its 1,024 MB heap free and keeps 256 MB of it for its other work\. Lower the faces of the exported meshes and instances \(export fewer objects with use_selection, lower the counts of particle systems, or use the export_scene tool, which builds the file in a render process\) to run it on the server \(a browser editor runs it in its own memory\)$/,
     );
+  });
+});
+
+describe('renders in the process', () => {
+  /**
+   * Triangles a render is estimated to show: a flat grid of 100 × 100 quads (or a cube), plain and
+   * with a Bevel of `params`.
+   */
+  function bevelledGrid(
+    params: Record<string, unknown>,
+    flags: { show_render?: boolean } = {},
+    add: [string, Record<string, unknown>] = [
+      'mesh.primitive_grid_add',
+      { x_subdivisions: 100, y_subdivisions: 100 },
+    ],
+  ) {
+    const { doc, run } = project();
+    expect(run(...add).ok).toBe(true);
+    const plain = estimateRenderMemory(doc).triangles;
+    expect(run('object.modifier_add', { type: 'BEVEL', params }).ok).toBe(true);
+    if (flags.show_render !== undefined)
+      expect(run('object.modifier_set', { modifier: 'Bevel', ...flags }).ok).toBe(true);
+    const o = doc.listObjects()[0];
+    return { plain, triangles: estimateRenderMemory(doc).triangles, mesh: doc.getMesh(o.data!)! };
+  }
+
+  it('count a Bevel limited by angle by the edges it bevels on the stored mesh (none of a flat grid)', () => {
+    const params = { limit_method: 'ANGLE', width: 0.01, segments: 30 };
+    const grid = bevelledGrid(params);
+    expect(grid.plain).toBe(20_000);
+    // as if every edge were sharp: about 60 times as many
+    expect(grid.triangles).toBe(grid.plain);
+    // a cube: its 12 edges are sharp (90°, more than the angle limit of 30°)
+    const cube = bevelledGrid(params, {}, ['mesh.primitive_cube_add', {}]);
+    const c = bevelCount(cube.mesh, { ...params, angle_limit: Math.PI / 6, affect: 'EDGES' });
+    expect(c.edges).toBe(12);
+    expect(cube.triangles).toBe(c.result.corners - 2 * c.result.faces);
+    expect(cube.triangles).toBeGreaterThan(100 * cube.plain);
+  });
+
+  it('leave out the modifiers a render does not run: hidden in renders, or disabled by their type (a Bevel of width 0)', () => {
+    const heavy = bevelledGrid({ limit_method: 'NONE', width: 0.01, segments: 20 });
+    expect(heavy.triangles).toBeGreaterThan(10 * heavy.plain);
+    const hidden = bevelledGrid({ limit_method: 'NONE', width: 0.01, segments: 20 }, { show_render: false });
+    expect(hidden.triangles).toBe(hidden.plain);
+    const disabled = bevelledGrid({ limit_method: 'NONE', width: 0, segments: 20 });
+    expect(disabled.triangles).toBe(disabled.plain);
   });
 });
 
@@ -798,5 +871,45 @@ describe('get_scene problems', () => {
     expect(grid.modifier_errors[0].message).toMatch(
       /\. Lower levels \(render_levels for renders\) to evaluate/,
     );
+  });
+
+  it('are named by get_mesh_data too: its evaluated geometry says which modifier the server left out and why', () => {
+    const { doc, run } = project(SceneDoc.create({ name: 'Skipped', empty: true }));
+    expect(run('mesh.primitive_grid_add', { x_subdivisions: 50, y_subdivisions: 50 }).ok).toBe(true);
+    expect(run('object.modifier_add', { type: 'SUBSURF', params: { levels: 4, render_levels: 4 } }).ok).toBe(
+      true,
+    );
+    setGeometryMemoryCheck(
+      geometryCheck({ heapFree: () => 400 * MB, collect: () => 0, heapLimit: () => 1024 * MB }),
+    );
+    const grid = doc.listObjects()[0];
+    const data = meshData(doc, grid, { source: 'RENDER', frame: 1, include: [] }) as any;
+    // the 2,500 faces of the grid, without the Subdivision Surface
+    expect(data.totals.faces).toBe(2500);
+    expect(data.modifier_errors).toEqual([{ modifier: 'Subdivision', message: expect.any(String) }]);
+    expect(data.modifier_errors[0].message).toMatch(
+      /^skipped on the server: this Subdivision Surface would need about [\d,]+ MB of JavaScript heap/,
+    );
+    expect(data.modifier_errors_note).toBe(
+      'this geometry is the result without the modifiers listed in modifier_errors: the evaluation left ' +
+        'each of them out for the reason given (get_scene lists them too)',
+    );
+    // the stored mesh has nothing left out
+    const base = meshData(doc, grid, { source: 'BASE', frame: 1, include: [] }) as any;
+    expect(base.modifier_errors).toBeUndefined();
+    // a modifier Blender's rule disables (a Bevel of width 0) is named too, as get_scene names it
+    const small = project(SceneDoc.create({ name: 'Disabled', empty: true }));
+    expect(small.run('mesh.primitive_grid_add', { x_subdivisions: 10, y_subdivisions: 10 }).ok).toBe(true);
+    expect(small.run('object.modifier_add', { type: 'BEVEL', params: { width: 0 } }).ok).toBe(true);
+    const o = small.doc.listObjects()[0];
+    const viewport = meshData(small.doc, o, { source: 'EVALUATED', frame: 1, include: [] }) as any;
+    expect(viewport.totals.faces).toBe(100);
+    expect(viewport.modifier_errors).toEqual([
+      {
+        modifier: 'Bevel',
+        disabled: true,
+        message: "the Bevel modifier 'Bevel' has a width of 0, so it changes nothing",
+      },
+    ]);
   });
 });

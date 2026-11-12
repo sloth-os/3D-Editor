@@ -3,15 +3,24 @@ import v8 from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import {
   OPERATOR_FIXED_BYTES,
+  SAVE_BYTES_PER_IMAGE_BYTE,
   SAVE_BYTES_PER_KEPT_BYTE,
+  SAVE_BYTES_PER_LAYER_BYTE,
   decodedMeshBytes,
   estimateModifier,
   isMeshMemoryError,
+  layerBytes,
+  modifierRuns,
   meshSize,
   modifierContext,
+  projectObjects,
+  rigidBodyCacheBytes,
+  rigidBodyCachesBytes,
   setGeometryMemoryCheck,
   setMeshMemoryCheck,
   setOperatorMemoryCheck,
+  setSimulationMemoryCheck,
+  storedMeshBytes,
   type GeometryMemoryCheck,
   type GeometryMemoryRequest,
   type MeshData,
@@ -22,6 +31,8 @@ import {
   type OperatorMemoryCheck,
   type OperatorMemoryRequest,
   type SceneDoc,
+  type SimulationMemoryCheck,
+  type SimulationMemoryRequest,
 } from '@3d-editor/core';
 import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
 
@@ -33,9 +44,22 @@ import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
  * - Operators (MCP tools and the REST API): before an operator runs, the core registry asks
  *   `operatorCheck` with its estimated peak heap (core operators/memory.ts). One that does not fit
  *   into the free heap, less the reserve, fails with code OUT_OF_MEMORY and says what
- *   to lower; so does one that adds meshes or objects beyond what the server keeps for one project:
- *   its meshes decoded, its objects, datablocks and keyframes, and what a save of the project
- *   takes for a moment ({@link maxProjectMeshBytes}).
+ *   to lower; so does one that adds meshes, objects or keyframes beyond what the server keeps for
+ *   one project: its meshes decoded, its objects, datablocks and animation, and what a save of the
+ *   project takes for a moment ({@link maxProjectMeshBytes}); and one that would take what all open
+ *   projects keep, with the largest save among them, past what the server keeps for all of them
+ *   ({@link maxOpenProjectsBytes}; the projects are those the checks have seen, see
+ *   {@link trackOpenProject}). {@link projectGrowthRefusal} asks the same of a change that does not
+ *   come from an operator (the sync of a browser editor).
+ * - Rigid body simulations (the inspection tools' evaluations, bakes, renders in the server's own
+ *   process): before a simulation steps, `simulationCheck` is asked with what the frames still to
+ *   simulate will keep (core physics/memory.ts). The frames a document's cache holds stay until its
+ *   inputs change (core physics/rigid-body.ts), so they count with what its project keeps; one
+ *   simulation that would take its project, or all open projects, past what the server keeps for
+ *   them, or that does not fit into the free heap less the reserve, is not simulated (an evaluation
+ *   reports it as the rigid body world's problem, an operator fails with code OUT_OF_MEMORY). Their
+ *   frames are ArrayBuffers outside the JavaScript heap for the most part: the free heap of every
+ *   check is counted without them ({@link freeHeapBytes}).
  * - Decoding stored meshes (scene summaries, mesh data, operators, exports in the server's process):
  *   `decodeCheck` refuses a mesh whose decoded arrays do not fit (core mesh/memory.ts); scene
  *   summaries then list its stored counts, other calls fail and say why.
@@ -98,8 +122,9 @@ const triangles = (s: MeshSize): number => Math.max(0, s.corners - 2 * s.faces);
 
 /**
  * Heap a render of `scene` takes, estimated without evaluating it: each mesh shown in renders
- * (its modifier stack counted once when objects share both) by its stored counts, its modifiers
- * enabled for renders by their estimates (core `estimateModifier`; a Bevel limited by angle by the
+ * (its modifier stack counted once when objects share both) by its stored counts, the modifiers a
+ * render runs (core `modifierRuns`: enabled for renders and not disabled by their type's rule) by
+ * their estimates (core `estimateModifier`; a Bevel limited by angle by the
  * edges it bevels on the stored mesh when it comes first in the stack, else as if every edge were
  * sharp: core `modifierContext`), and the render of the result.
  */
@@ -109,7 +134,8 @@ export function estimateRenderMemory(scene: SceneDoc): { triangles: number; byte
   let bytes = 0;
   for (const o of scene.listObjects()) {
     if (o.type !== 'MESH' || !o.data || o.hide_render) continue;
-    const mods = o.modifiers.filter((m) => m.show_render !== false);
+    // the modifiers a render runs (show_render, and not disabled by their type's rule)
+    const mods = o.modifiers.filter((m) => modifierRuns(scene, m, true));
     const key = `${o.data}|${JSON.stringify(mods.map((m) => [m.type, m.params]))}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -144,10 +170,14 @@ export function estimateRenderTriangles(scene: SceneDoc): number {
   return estimateRenderMemory(scene).triangles;
 }
 
-/** Free JavaScript heap of this process (bytes): its limit minus what is in use. */
+/**
+ * Free JavaScript heap of this process (bytes): its limit minus what is in use, less the frames that
+ * cached rigid body simulations keep outside the heap (core rigidBodyCachesBytes: ArrayBuffers V8's
+ * heap statistics leave out, which the process holds all the same).
+ */
 export function freeHeapBytes(): number {
   const h = v8.getHeapStatistics();
-  return h.heap_size_limit - h.used_heap_size;
+  return h.heap_size_limit - h.used_heap_size - rigidBodyCachesBytes({ outsideHeap: true });
 }
 
 let gcFunction: (() => void) | null | undefined;
@@ -241,10 +271,20 @@ const mbUp = (bytes: number): string => n(Math.ceil(Math.max(0, bytes) / MB));
 /** Megabytes rounded down (a limit). */
 const mbDown = (bytes: number): string => n(Math.floor(Math.max(0, bytes) / MB));
 
-/** "…, and the server's process has F MB of its L MB heap free and keeps R MB of it for its other work". */
-const heapClause = (free: number, limit: number): string =>
-  `the server's process has ${mb(free)} MB of its ${mb(limit)} MB heap free and keeps ` +
-  `${mb(serverHeapReserve(limit))} MB of it for its other work`;
+/**
+ * "…, and the server's process has F MB of its L MB heap free and keeps R MB of it for its other work";
+ * while cached rigid body simulations hold C MB outside the heap ({@link freeHeapBytes} leaves them
+ * out of `free`): "has F + C MB of its L MB heap free, less the C MB its cached rigid body simulations
+ * hold outside it, and keeps …".
+ */
+function heapClause(free: number, limit: number): string {
+  const reserve = `keeps ${mb(serverHeapReserve(limit))} MB of it for its other work`;
+  const simulations = rigidBodyCachesBytes({ outsideHeap: true });
+  return simulations >= MB
+    ? `the server's process has ${mb(free + simulations)} MB of its ${mb(limit)} MB heap free, less the ` +
+        `${mb(simulations)} MB its cached rigid body simulations hold outside it, and ${reserve}`
+    : `the server's process has ${mb(free)} MB of its ${mb(limit)} MB heap free and ${reserve}`;
+}
 
 /**
  * The error of a modifier, or a curve or text surface, the server skips for memory (see
@@ -308,6 +348,150 @@ export function evaluationCacheBytes(limit = heapLimitBytes()): number {
 }
 
 /**
+ * What the server keeps for all open projects together (bytes): what they keep (their meshes decoded,
+ * objects, datablocks and animation, as {@link maxProjectMeshBytes} counts them) and the largest save
+ * among them, up to its heap less the reserve and the cached evaluations' budget
+ * ({@link evaluationCacheBytes}): 1,310 MB of Node's default heap of 2,096 MB. It counts the largest
+ * save once, though saves run one at a time only per project (sync/room.ts): the saves of different
+ * projects can overlap. The operators that edit them are checked against the free heap. Without it,
+ * eight projects of 15,000 linked cubes each (158 MB kept, 473 MB more while saved, which the limit
+ * per project allows every one of) filled the default heap to 1,670–1,683 MB after their saves:
+ * every round of saves then stalled the server for up to 9.5 s and a request to get_project took
+ * 24–29 s. With it, five of them reached 15,000 cubes and the other three were refused at their
+ * first 5,000 (1,314 MB of 1,310 MB); a change in each then stalled the server for up to 4 s and
+ * get_project took 0.2 s at most.
+ */
+export function maxOpenProjectsBytes(limit = heapLimitBytes()): number {
+  return Math.max(0, limit - serverHeapReserve(limit) - evaluationCacheBytes(limit));
+}
+
+// ---------------------------------------------------------------- open projects
+
+/** What an open project keeps and what a save of it takes for a moment besides (bytes). */
+export interface OpenProjectSize {
+  /** Project id (the room's), '' when the document is not a room's. */
+  id: string;
+  name: string;
+  /** Heap it keeps: core projectStoredBytes (its meshes decoded, objects, datablocks, animation). */
+  kept: number;
+  /** Heap a save of it takes for a moment beyond `kept` (core saveBytes of its objects' part). */
+  save: number;
+  /**
+   * Bytes its rigid body cache keeps (core rigidBodyCacheBytes), part of `kept`; absent when it holds
+   * none. Not saved.
+   */
+  simulation?: number;
+}
+
+interface TrackedProject {
+  scene: SceneDoc;
+  /** Changes seen (bumped by every update of its document). */
+  version: number;
+  /** What it keeps but its rigid body cache, its save and its objects, at document version `version`. */
+  size: { version: number; value: OpenProjectSize; objects: number } | null;
+}
+
+/** The open projects the memory checks count, by Y.Doc (see {@link trackOpenProject}). */
+const openProjects = new Map<object, TrackedProject>();
+
+/** The project id of a room's scene (its transaction origin is `{ type: 'server', room }`), else ''. */
+function projectIdOf(scene: SceneDoc): string {
+  const o = scene.origin as { type?: unknown; room?: unknown };
+  return o.type === 'server' && typeof o.room === 'string' ? o.room : '';
+}
+
+/**
+ * Counts `scene` among the projects the server has open, until its document is destroyed (its room
+ * closes). The checks track every room whose project they see: the operators run on it, the imports
+ * into it, the evaluations of the inspection tools and the changes {@link projectGrowthRefusal} is
+ * asked about; the room manager can track a room when it loads it. Calling it again does nothing.
+ */
+export function trackOpenProject(scene: SceneDoc): void {
+  const y = scene.ydoc;
+  if (openProjects.has(y)) return;
+  const t: TrackedProject = { scene, version: 0, size: null };
+  const onUpdate = () => {
+    t.version++;
+  };
+  y.on('update', onUpdate);
+  y.on('destroy', () => {
+    y.off('update', onUpdate);
+    openProjects.delete(y);
+  });
+  openProjects.set(y, t);
+}
+
+/**
+ * Tracks a room's scene as open ({@link trackOpenProject}); other documents (tests, scratch documents)
+ * only when they are passed to {@link trackOpenProject} itself.
+ */
+export function trackOpenRoom(scene: SceneDoc | undefined): void {
+  if (scene && projectIdOf(scene)) trackOpenProject(scene);
+}
+
+/**
+ * What `scene` keeps but its rigid body cache, what its save takes and its objects, counted once per
+ * version of its document.
+ */
+function baseSize(t: TrackedProject): NonNullable<TrackedProject['size']> {
+  if (t.size?.version !== t.version) {
+    const project = projectObjects(t.scene);
+    t.size = {
+      version: t.version,
+      value: {
+        id: projectIdOf(t.scene),
+        name: t.scene.getMeta().name,
+        kept: storedMeshBytes(t.scene) + project.bytes,
+        save: project.save,
+      },
+      objects: project.objects,
+    };
+  }
+  return t.size;
+}
+
+/**
+ * What `scene` keeps and its save takes: counted once per version of its document, and the frames
+ * its rigid body cache holds (they change with the frames evaluated, not with the document).
+ */
+function sizeOf(t: TrackedProject): OpenProjectSize {
+  const value = baseSize(t).value;
+  const simulation = rigidBodyCacheBytes(t.scene);
+  return simulation > 0 ? { ...value, kept: value.kept + simulation, simulation } : value;
+}
+
+/**
+ * What the project of `scene` keeps (its rigid body cache included, `simulation`), what its save takes
+ * and its objects: counted once per version of its document when it is an open project.
+ */
+function projectSize(scene: SceneDoc): { stored: number; save: number; objects: number; simulation: number } {
+  const t = openProjects.get(scene.ydoc);
+  let stored: number;
+  let save: number;
+  let objects: number;
+  if (t) {
+    const size = baseSize(t);
+    stored = size.value.kept;
+    save = size.value.save;
+    objects = size.objects;
+  } else {
+    const project = projectObjects(scene);
+    stored = storedMeshBytes(scene) + project.bytes;
+    save = project.save;
+    objects = project.objects;
+  }
+  const simulation = rigidBodyCacheBytes(scene);
+  return { stored: stored + simulation, save, objects, simulation };
+}
+
+/** The open projects the checks count but `scene`, largest first. */
+export function otherOpenProjects(scene?: SceneDoc): OpenProjectSize[] {
+  const out: OpenProjectSize[] = [];
+  for (const [y, t] of openProjects) if (y !== scene?.ydoc) out.push(sizeOf(t));
+  return out.sort((a, b) => b.kept + b.save - (a.kept + a.save));
+}
+
+/**
  * The error of a scene evaluation the server does not run for its inspection tools (`need`: its
  * estimated peak heap; `free`, `limit`: the free heap and the heap limit; bytes).
  */
@@ -355,7 +539,10 @@ export function evaluationCheck(
   };
 }
 
-/** What an operator builds, for messages: " for a mesh of about F faces and N new objects" (or less). */
+/**
+ * What an operator builds, for messages: " for a mesh of about F faces and N new objects" (or less),
+ * " for K new keyframes".
+ */
 function builds(e: OperatorMemoryRequest['estimate']): string {
   const meshes = e.meshes ?? 0;
   const objects = e.objects ?? 0;
@@ -364,7 +551,21 @@ function builds(e: OperatorMemoryRequest['estimate']): string {
     : meshes > 1
       ? ` for ${n(meshes)} meshes of about ${n(e.faces)} faces in all`
       : ` for a mesh of about ${n(e.faces)} faces`;
-  return objects > 1 ? `${faces || ' for'}${faces ? ' and' : ''} ${n(objects)} new objects` : faces;
+  const built = objects > 1 ? `${faces || ' for'}${faces ? ' and' : ''} ${n(objects)} new objects` : faces;
+  const keys = e.keyframes ?? 0;
+  const withKeys = keys > 0 ? `${built || ' for'}${built ? ' and' : ''} ${n(keys)} new keyframes` : built;
+  // vertex groups and shape keys an operator writes (core memory-layers.ts)
+  const layers =
+    e.layers && e.layers.bytes > 0 ? ` to write about ${mbUp(e.layers.bytes)} MB of ${e.layers.kind}` : '';
+  return `${withKeys}${layers}`;
+}
+
+/** " with N new objects" / " with K new keyframes" (or both) of what an operator adds, for messages. */
+function adds(e: OperatorMemoryRequest['estimate']): string {
+  const parts: string[] = [];
+  if ((e.objects ?? 0) > 1) parts.push(`${n(e.objects!)} new objects`);
+  if ((e.keyframes ?? 0) > 0) parts.push(`${n(e.keyframes!)} new keyframes`);
+  return parts.length ? ` with ${parts.join(' and ')}` : '';
 }
 
 /**
@@ -400,51 +601,237 @@ export function refusedOperatorMessage(
 
 /**
  * The heap the server keeps for a project of `stored` bytes (its meshes decoded, its objects,
- * datablocks and keyframes) whose save takes `save` bytes more for a moment (core saveBytes), held
+ * datablocks and animation) whose save takes `save` bytes more for a moment (core saveBytes), held
  * against {@link maxProjectMeshBytes}.
  */
 const projectNeed = (stored: number, save = 0): number => stored + Math.max(0, save);
 
 /**
- * The error of an operator the server does not run because the project would then need more than
- * the server keeps for one: its meshes decoded, its objects, datablocks and keyframes, and what a
- * save of it takes for a moment (`limit`: the heap limit in bytes, see {@link maxProjectMeshBytes}).
+ * A request held against what the server keeps for one project and for all open projects: an
+ * operator's, or a rigid body simulation's frames (`simulating`).
  */
-export function storedMeshesMessage(req: OperatorMemoryRequest, limit = heapLimitBytes()): string {
+interface ProjectRequest extends OperatorMemoryRequest {
+  /** Bytes of the project's rigid body cache (core rigidBodyCacheBytes), part of storedBytes. */
+  simulation?: number;
+  /** What it adds is (or holds) rigid body frames: a simulation, or a bake that simulates. */
+  simulating?: boolean;
+}
+
+/** Whether `req` adds rigid body frames to its project's cache. */
+const addsFrames = (req: ProjectRequest): boolean =>
+  !!req.simulating || (req.estimate.simulationBytes ?? 0) > 0;
+
+/** What projects keep, for messages: with their rigid body caches when one counts. */
+const contents = (caches: boolean, projects = 1): string =>
+  caches
+    ? `meshes, objects, keyframes, images and rigid body cache${projects > 1 ? 's' : ''}`
+    : 'meshes, objects, keyframes and images';
+
+/** The advice to free a rigid body cache a project holds (empty when it holds none). */
+const freeCacheAdvice = (held: boolean, projects = 1): string =>
+  held
+    ? `, or free ${projects > 1 ? 'their rigid body caches' : 'its rigid body cache'} (rigidbody.cache_free)`
+    : '';
+
+/** `req` with the rigid body cache of its project counted in what the project keeps. */
+function withRigidBodyCache(req: OperatorMemoryRequest): ProjectRequest {
+  const simulation = req.doc ? rigidBodyCacheBytes(req.doc) : 0;
+  return simulation > 0 ? { ...req, storedBytes: req.storedBytes + simulation, simulation } : req;
+}
+
+/**
+ * "…, and a save of it about S MB more for a moment (…): T MB in all, " (', ' without a save); `layers`:
+ * the save counts vertex groups or shape keys (core SAVE_BYTES_PER_LAYER_BYTE), named only then.
+ */
+function savingClause(kept: number, saved: number, layers = false): string {
+  if (!(saved > 0)) return ', ';
+  const k = Math.ceil(kept / MB);
+  const s = Math.ceil(saved / MB);
+  const layerPart = layers ? `, ${n(SAVE_BYTES_PER_LAYER_BYTE)} times its vertex groups and shape keys` : '';
+  return (
+    `, and a save of it about ${n(s)} MB more for a moment (${n(SAVE_BYTES_PER_KEPT_BYTE)} times what its ` +
+    `objects, datablocks and keyframes take, ${n(SAVE_BYTES_PER_IMAGE_BYTE)} times its images${layerPart}): ` +
+    `${n(k + s)} MB in all, `
+  );
+}
+
+/** Whether the project of `req` holds vertex groups or shape keys (core layerBytes). */
+const holdsLayers = (req: OperatorMemoryRequest): boolean => !!req.doc && layerBytes(req.doc) > 0;
+
+/**
+ * Why a project that keeps `req.storedBytes` (its save `req.saveBytes` more) cannot take what
+ * `req.estimate` adds (null: it can), held against what the server keeps for one project
+ * ({@link maxProjectMeshBytes}): a clause without a verb before it ("the project's meshes, objects,
+ * keyframes and images would then take about …"), and whether the project was already past the limit.
+ */
+function projectLimitReason(req: ProjectRequest, limit: number): { reason: string; already: boolean } | null {
   const e = req.estimate;
   const max = maxProjectMeshBytes(limit);
   const save = req.saveBytes ?? 0;
-  const added = (e.objects ?? 0) > 1 ? ` with ${n(e.objects!)} new objects` : '';
+  const kept = req.storedBytes + e.addedStoredBytes;
+  if (projectNeed(kept, save + (e.addedSaveBytes ?? 0)) <= max) return null;
+  const simulation = req.simulation ?? 0;
+  const what = `the project's ${contents(simulation > 0 || addsFrames(req))}`;
   const now =
     req.objects === undefined ? '' : ` with ${n(req.objects)} object${req.objects === 1 ? '' : 's'}`;
+  const cache = simulation > 0 ? `${mbUp(simulation)} MB of it its rigid body cache` : '';
   const keeps =
     `more than the ${mbDown(max)} MB the server's process keeps for one project (half of its ${mb(limit)} MB heap ` +
     `less the ${mb(serverHeapReserve(limit))} MB it keeps for its other work)`;
-  // "…, and a save of it about S MB more for a moment (…): T MB in all, " (', ' without objects)
-  const saving = (kept: number, saved: number): string => {
-    if (!(saved > 0)) return ', ';
-    const k = Math.ceil(kept / MB);
-    const s = Math.ceil(saved / MB);
-    return (
-      `, and a save of it about ${n(s)} MB more for a moment (${n(SAVE_BYTES_PER_KEPT_BYTE)} times what its ` +
-      `objects, datablocks and keyframes take): ${n(k + s)} MB in all, `
-    );
-  };
   // a project already past it (grown in browser editors): nothing of the operator to lower
+  const layers = holdsLayers(req);
   if (projectNeed(req.storedBytes, save) > max)
-    return (
-      `not run on the server: the project's meshes and objects already take about ${mbUp(req.storedBytes)} MB of ` +
-      `JavaScript heap${now}${saving(req.storedBytes, save)}${keeps}, and this operator would add to them. ` +
-      'Delete objects and meshes the project no longer needs'
-    );
-  const kept = req.storedBytes + e.addedStoredBytes;
+    return {
+      reason:
+        `${what} already take about ${mbUp(req.storedBytes)} MB of memory${now}${cache ? ` (${cache})` : ''}` +
+        `${savingClause(req.storedBytes, save, layers)}${keeps}`,
+      already: true,
+    };
+  return {
+    reason:
+      `${what} would then take about ${mbUp(kept)} MB of memory${adds(e)} (now ${mb(req.storedBytes)} MB${now}` +
+      `${cache ? `, ${cache}` : ''})` +
+      `${savingClause(kept, save + (e.addedSaveBytes ?? 0), layers || (e.layers?.bytes ?? 0) > 0)}${keeps}`,
+    already: false,
+  };
+}
+
+/**
+ * The error of an operator the server does not run because the project would then need more than
+ * the server keeps for one: its meshes decoded, its objects, datablocks and animation, and what a
+ * save of it takes for a moment (`limit`: the heap limit in bytes, see {@link maxProjectMeshBytes}).
+ * `req` must be past that limit (see {@link operatorCheck}).
+ */
+export function storedMeshesMessage(req: ProjectRequest, limit = heapLimitBytes()): string {
+  const r = projectLimitReason(req, limit) ?? {
+    reason: projectLimitReason({ ...req, storedBytes: Infinity }, limit)!.reason,
+    already: true,
+  };
+  const free = freeCacheAdvice((req.simulation ?? 0) > 0);
+  if (r.already)
+    return `not run on the server: ${r.reason}, and this operator would add to them. Delete objects and meshes the project no longer needs${free}`;
+  const e = req.estimate;
   return (
-    `not run on the server: the project's meshes and objects would then take about ${mbUp(kept)} MB of ` +
-    `JavaScript heap${added} (now ${mb(req.storedBytes)} MB${now})${saving(kept, save + (e.addedSaveBytes ?? 0))}` +
-    `${keeps}. ` +
+    `not run on the server: ${r.reason}. ` +
     (e.lower ? `Lower ${e.lower}, or delete` : 'Delete') +
-    ' objects and meshes the project no longer needs'
+    ` objects and meshes the project no longer needs${free}`
   );
+}
+
+/** At most this many other open projects are named in a refusal (the rest are summed up). */
+export const NAMED_OPEN_PROJECTS = 5;
+
+/**
+ * Why what `req.estimate` adds to the project of `req` would take all open projects past what the
+ * server keeps for them ({@link maxOpenProjectsBytes}: what they keep and the largest save among
+ * them; null: it fits): a clause without a verb before it, naming the other open projects and what
+ * they take.
+ */
+function openProjectsReason(
+  req: ProjectRequest,
+  others: readonly OpenProjectSize[],
+  limit: number,
+): string | null {
+  if (!others.length) return null;
+  const e = req.estimate;
+  const kept = req.storedBytes + e.addedStoredBytes;
+  const save = (req.saveBytes ?? 0) + (e.addedSaveBytes ?? 0);
+  let othersKept = 0;
+  let largestSave = save;
+  for (const o of others) {
+    othersKept += o.kept;
+    largestSave = Math.max(largestSave, o.save);
+  }
+  const max = maxOpenProjectsBytes(limit);
+  const all = othersKept + kept;
+  if (all + largestSave <= max) return null;
+  const named = others
+    .slice(0, NAMED_OPEN_PROJECTS)
+    .map(
+      (o) =>
+        `'${o.name}'${o.id ? ` (${o.id})` : ''} ${mbUp(o.kept)} MB` +
+        (o.simulation ? ` (${mbUp(o.simulation)} MB of it its rigid body cache)` : ''),
+    );
+  const rest = others.slice(NAMED_OPEN_PROJECTS);
+  if (rest.length) named.push(`${n(rest.length)} more ${mbUp(rest.reduce((t, o) => t + o.kept, 0))} MB`);
+  const a = Math.ceil(all / MB);
+  const s = Math.ceil(largestSave / MB);
+  const caches = heldRigidBodyCaches(req, others) || addsFrames(req);
+  return (
+    `the open projects' ${contents(caches, 2)} would then take about ${n(a)} MB of ` +
+    `memory${adds(e)}, and the largest save among them about ${n(s)} MB more for a moment: ${n(a + s)} MB in ` +
+    `all, more than the ${mbDown(max)} MB the server's process keeps for all open projects (its ${mb(limit)} MB ` +
+    `heap less the ${mb(serverHeapReserve(limit))} MB it keeps for its other work and the ` +
+    `${mb(evaluationCacheBytes(limit))} MB of cached scene evaluations). Other open projects take ` +
+    `${mbUp(othersKept)} MB of it: ${named.join(', ')}`
+  );
+}
+
+/** Whether the project of `req` or one of `others` holds a rigid body cache. */
+const heldRigidBodyCaches = (req: ProjectRequest, others: readonly OpenProjectSize[]): boolean =>
+  (req.simulation ?? 0) > 0 || others.some((o) => (o.simulation ?? 0) > 0);
+
+/** The advice after {@link openProjectsReason}: what to lower, what to delete, when projects close. */
+const OPEN_PROJECTS_ADVICE =
+  'objects and meshes the projects no longer need (a project nobody has open, no editor and no MCP session, ' +
+  'is unloaded after ROOM_IDLE_TTL_SECONDS, default 3600 s)';
+
+/**
+ * The error of an operator the server does not run because all open projects would then need more
+ * than it keeps for them ({@link maxOpenProjectsBytes}); `req` must be past that limit with `others`.
+ */
+export function openProjectsMessage(
+  req: ProjectRequest,
+  others: readonly OpenProjectSize[],
+  limit = heapLimitBytes(),
+): string {
+  const reason = openProjectsReason(req, others, limit);
+  const e = req.estimate;
+  return (
+    `not run on the server: ${reason}. ` +
+    (e.lower ? `Lower ${e.lower}, or delete ` : 'Delete ') +
+    OPEN_PROJECTS_ADVICE +
+    freeCacheAdvice(heldRigidBodyCaches(req, others), 2)
+  );
+}
+
+/**
+ * Whether the project of `scene` can take `kept` more bytes that it keeps and `saved` more that a
+ * save of it takes for a moment (core memory-objects.ts: KEYFRAME_STORED_BYTES, OBJECT_STORED_BYTES …
+ * and saveBytes), for a change that does not come from an operator (the sync of a browser editor):
+ * null when it fits, else why not, as a clause the caller completes (e.g. "the project's meshes,
+ * objects, keyframes and images would then take about 812 MB of memory (now 700 MB with 15,000
+ * objects), and a save of it … more than the 786 MB the server's process keeps for one project (…)",
+ * or the same of all open projects, naming the others). Held against the limit per project
+ * ({@link maxProjectMeshBytes}) and, with the other open projects, against
+ * {@link maxOpenProjectsBytes}; what a project keeps includes its rigid body cache (core
+ * rigidBodyCacheBytes; the clause then names it). Tracks `scene` as open ({@link trackOpenProject}).
+ * `heapLimit`: the heap limit in bytes (default: this process's).
+ */
+export function projectGrowthRefusal(
+  scene: SceneDoc,
+  kept: number,
+  saved: number,
+  opts: { heapLimit?: () => number } = {},
+): string | null {
+  trackOpenProject(scene);
+  const limit = (opts.heapLimit ?? heapLimitBytes)();
+  const project = projectObjects(scene);
+  const req = withRigidBodyCache({
+    operator: '',
+    estimate: {
+      bytes: 0,
+      faces: 0,
+      addedStoredBytes: Math.max(0, kept),
+      addedSaveBytes: Math.max(0, saved),
+      lower: '',
+    },
+    storedBytes: storedMeshBytes(scene) + project.bytes,
+    saveBytes: project.save,
+    objects: project.objects,
+    doc: scene,
+  });
+  return projectLimitReason(req, limit)?.reason ?? openProjectsReason(req, otherOpenProjects(scene), limit);
 }
 
 /** The error of a stored mesh the server does not decode (see `decodeCheck`; bytes as above). */
@@ -460,9 +847,9 @@ export function refusedDecodeMessage(req: MeshMemoryRequest, free: number, limit
 
 /**
  * The server's check of operators (core `setOperatorMemoryCheck`): refuses one that adds meshes or
- * objects beyond {@link maxProjectMeshBytes} (counted with what a save of the project takes), or
- * whose estimated peak heap does not fit into the free heap less the reserve
- * ({@link serverHeapReserve}).
+ * objects beyond {@link maxProjectMeshBytes} (counted with what a save of the project takes and its
+ * rigid body cache) or beyond {@link maxOpenProjectsBytes} with the other open projects, or whose
+ * estimated peak heap does not fit into the free heap less the reserve ({@link serverHeapReserve}).
  */
 export function operatorCheck(
   opts: { heapFree?: () => number; collect?: () => unknown; heapLimit?: () => number } = {},
@@ -473,12 +860,13 @@ export function operatorCheck(
   return (req) => {
     const e = req.estimate;
     const limit = heapLimit();
-    if (
-      e.addedStoredBytes > 0 &&
-      projectNeed(req.storedBytes + e.addedStoredBytes, (req.saveBytes ?? 0) + (e.addedSaveBytes ?? 0)) >
-        maxProjectMeshBytes(limit)
-    )
-      return storedMeshesMessage(req, limit);
+    trackOpenRoom(req.doc);
+    if (e.addedStoredBytes > 0) {
+      const r = withRigidBodyCache(req);
+      if (projectLimitReason(r, limit)) return storedMeshesMessage(r, limit);
+      const others = otherOpenProjects(req.doc);
+      if (openProjectsReason(r, others, limit)) return openProjectsMessage(r, others, limit);
+    }
     const { ok, free } = fits(e.bytes, heapFree, collect, limit);
     return ok ? null : refusedOperatorMessage(req, free, limit);
   };
@@ -498,15 +886,106 @@ export function decodeCheck(
   };
 }
 
+/** "not simulated on the server: simulating N rigid bodies to frame F keeps K more frames of their poses, about X MB". */
+function simulationClause(req: SimulationMemoryRequest): string {
+  const bodies = req.bodies.simulated + req.bodies.kinematic;
+  return (
+    `not simulated on the server: simulating ${n(bodies)} rigid bod${bodies === 1 ? 'y' : 'ies'} to frame ` +
+    `${n(req.frame)} keeps ${n(req.frames)} more frames of their poses, about ${mbUp(req.bytes)} MB`
+  );
+}
+
+/** What to lower for a simulation the server does not step. */
+const SIMULATION_ADVICE =
+  "Lower the rigid body world's frame range (rigidbody.world_set frame_end) or the number of rigid bodies to " +
+  'simulate it on the server (a browser editor simulates it itself)';
+
+/**
+ * The error of a rigid body simulation the server does not step because its frames do not fit into
+ * the free heap less the reserve (see `simulationCheck`; `free`, `limit`: the free heap and the heap
+ * limit, in bytes).
+ */
+export function refusedSimulationMessage(
+  req: SimulationMemoryRequest,
+  free: number,
+  limit = heapLimitBytes(),
+): string {
+  return `${simulationClause(req)}, and ${heapClause(free, limit)}. ${SIMULATION_ADVICE}`;
+}
+
+/**
+ * The error of a rigid body simulation the server does not step because its frames would take its
+ * project past what the server keeps for one (`reason`: the clause of the limit), or all open
+ * projects past what it keeps for them (`others`: the other open projects then). Only the caches of
+ * other projects are worth freeing: the frames its own cache holds are the first of those it needs.
+ */
+export function simulationLimitMessage(
+  req: SimulationMemoryRequest,
+  reason: string,
+  others?: readonly OpenProjectSize[],
+): string {
+  const held = !!others?.some((o) => (o.simulation ?? 0) > 0);
+  return (
+    `${simulationClause(req)}, and ${reason}. ${SIMULATION_ADVICE}, or delete ` +
+    (others
+      ? `${OPEN_PROJECTS_ADVICE}${freeCacheAdvice(held, 2)}`
+      : 'objects and meshes the project no longer needs')
+  );
+}
+
+/**
+ * The server's check of rigid body simulations (core `setSimulationMemoryCheck`): refuses frames that
+ * would take the simulated document's project past what the server keeps for one
+ * ({@link maxProjectMeshBytes}: its rigid body cache counts with what it keeps) or, with the other
+ * open projects, past {@link maxOpenProjectsBytes}; and frames that do not fit into the free heap
+ * less the reserve ({@link serverHeapReserve}): a simulation's frames are ArrayBuffers outside the
+ * heap's limit for the most part, which the process holds all the same, so the free heap is counted
+ * without those all cached simulations hold ({@link freeHeapBytes}). Tracks a room's document as an
+ * open project.
+ */
+export function simulationCheck(
+  opts: { heapFree?: () => number; collect?: () => unknown; heapLimit?: () => number } = {},
+): SimulationMemoryCheck {
+  const heapFree = opts.heapFree ?? freeHeapBytes;
+  const collect = opts.collect ?? collectGarbage;
+  const heapLimit = opts.heapLimit ?? heapLimitBytes;
+  return (req) => {
+    const limit = heapLimit();
+    const doc = req.doc;
+    if (doc) {
+      trackOpenRoom(doc);
+      const p = projectSize(doc);
+      const r: ProjectRequest = {
+        operator: '',
+        estimate: { bytes: req.bytes, faces: 0, addedStoredBytes: req.bytes, addedSaveBytes: 0, lower: '' },
+        storedBytes: p.stored,
+        saveBytes: p.save,
+        objects: p.objects,
+        doc,
+        simulation: p.simulation,
+        simulating: true,
+      };
+      const project = projectLimitReason(r, limit);
+      if (project) return simulationLimitMessage(req, project.reason);
+      const others = otherOpenProjects(doc);
+      const all = openProjectsReason(r, others, limit);
+      if (all) return simulationLimitMessage(req, all, others);
+    }
+    const { ok, free } = fits(req.bytes, heapFree, collect, limit);
+    return ok ? null : refusedSimulationMessage(req, free, limit);
+  };
+}
+
 /**
  * Installs the server's memory checks for this process (the server's process only): modifier
- * evaluations ({@link geometryCheck}), operators ({@link operatorCheck}) and decoding stored meshes
- * ({@link decodeCheck}).
+ * evaluations ({@link geometryCheck}), operators ({@link operatorCheck}), decoding stored meshes
+ * ({@link decodeCheck}) and rigid body simulations ({@link simulationCheck}).
  */
 export function installGeometryMemoryGuard(): void {
   setGeometryMemoryCheck(geometryCheck());
   setOperatorMemoryCheck(operatorCheck());
   setMeshMemoryCheck(decodeCheck());
+  setSimulationMemoryCheck(simulationCheck());
 }
 
 /** Most characters a JavaScript string holds (V8 on 64-bit: 2^29 − 24); longer JSON cannot be built. */

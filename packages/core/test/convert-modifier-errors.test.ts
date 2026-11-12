@@ -4,6 +4,7 @@ import { createEditorState, createOperatorRegistry, type OperatorContext } from 
 import { createGrid, setMeshMemoryCheck } from '../src/mesh';
 import { setGeometryMemoryCheck } from '../src/eval';
 import { SceneDoc } from '../src/doc/scene-doc';
+import { defaultSpline, defaultSplinePoint } from '../src/doc/defaults';
 
 /*
  * object.convert bakes the evaluated geometry and drops the modifier stack. A modifier that failed
@@ -93,5 +94,42 @@ describe('object.convert with modifier errors', () => {
     expect(res.ok).toBe(true);
     expect(doc.getObject(id)!.modifiers).toEqual([]);
     expect(doc.meshCounts(meshId)!.faces).toBe(10_000);
+  });
+
+  it('names the objects the failed modifier reads, not their ids', () => {
+    // a Curve modifier along a curve whose two points are one: the curve has no path
+    const { doc, reg, ctx, id } = scene(1);
+    const curve = doc.addCurve({
+      splines: [defaultSpline('POLY', [defaultSplinePoint([1, 1, 1]), defaultSplinePoint([1, 1, 1])])],
+    });
+    const path = doc.addObject({ type: 'CURVE', name: 'Rail', data: curve });
+    expect(reg.run(ctx, 'object.modifier_add', { type: 'CURVE', params: { object: path } }).ok).toBe(true);
+    const res = reg.run(ctx, 'object.convert', { target: 'MESH' });
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe(
+      "Cannot convert 'Grid': modifier 'Curve': Object 'Rail' is not a curve with at least two distinct " +
+        'points. Nothing was converted: fix or remove what failed (lower what was skipped for memory) and ' +
+        'convert again',
+    );
+    expect(doc.getObject(id)!.modifiers.map((m) => m.type)).toEqual(['SUBSURF', 'CURVE']);
+  });
+
+  it('names the bevel object of a curve that is left without geometry, not its id', () => {
+    // a curve of one point beveled by a mesh: no profile, so neither a surface nor a wire
+    const { doc, reg, ctx } = scene(1);
+    const curve = doc.addCurve({
+      splines: [defaultSpline('POLY', [defaultSplinePoint([0, 0, 0])])],
+      bevel_mode: 'OBJECT',
+      bevel_object: doc.findObjectByName('Grid')!.id,
+    });
+    const path = doc.addObject({ type: 'CURVE', name: 'Rail', data: curve });
+    Object.assign(ctx.state, { selectedIds: [path], activeId: path });
+    const res = reg.run(ctx, 'object.convert', { target: 'MESH' });
+    expect(res.ok).toBe(false);
+    expect(res.error).toBe(
+      "Cannot convert 'Rail': bevel object 'Grid' is missing or has no usable profile. Nothing was converted: " +
+        'fix or remove what failed (lower what was skipped for memory) and convert again',
+    );
+    expect(doc.getObject(path)!.type).toBe('CURVE');
   });
 });

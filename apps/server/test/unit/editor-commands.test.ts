@@ -15,9 +15,11 @@ import {
   editorTimeoutMessage,
 } from '../../src/mcp/editor-commands';
 import {
+  AFTER_SAVE_HOLD_SECONDS,
   BROWSER_RASTER_SECONDS,
   BUSY_FACTOR,
   BUSY_LOADS,
+  CHANGE_APPLY_SECONDS,
   FAST_SECONDS,
   FIRST_SHADING_SECONDS,
   LATER_SECONDS,
@@ -26,6 +28,8 @@ import {
   MILLIONS_SELECT_SECONDS,
   MILLIONS_SOLID_SECONDS,
   NEW_SHADER_SECONDS,
+  READ_HOLD_SECONDS,
+  SAVE_HOLD_SECONDS,
   SERVER_SOLID_SCENE_SECONDS,
   SERVER_SOLID_SECONDS,
   measured,
@@ -217,15 +221,22 @@ describe('editor command timeouts', () => {
    * frames: only the first ones in MATERIAL, RENDERED or WIREFRAME shading build materials or wires
    * on it (round 11 said that commands wait while the editor draws its viewport and that it draws a
    * scene of millions of triangles slowly: get_view probes sent while the viewport drew its frames
-   * answered within 0.14 s).
+   * answered within 0.14 s). It also waits while the editor applies a change made elsewhere, and
+   * every request waits while the server holds up its event loop (a save and the two short holds
+   * right after it, the minute's read, an editor opening the project): a timeout_ms of a few seconds
+   * can run out in these alone, which round 12's message did not name.
    */
   const viewport = (command: string) =>
-    `'${command}' waits while the editor's main thread is busy. ${NO_GPU} is busy for seconds with its first ` +
-    "frame of a heavy scene in MATERIAL or RENDERED shading, while it builds and compiles the scene's " +
+    `'${command}' waits while the editor's main thread is busy, and while the server holds up every request: ` +
+    `while it saves a project after a change (with 4 million triangles ${SAVE_HOLD_SECONDS}, then twice more ` +
+    `for at most ${AFTER_SAVE_HOLD_SECONDS}), reads back from storage a project that an editor has open (once ` +
+    `a minute) or sends a project to an editor that opens it (${READ_HOLD_SECONDS}). ${NO_GPU} is busy for ` +
+    "seconds with its first frame of a heavy scene in MATERIAL or RENDERED shading, while it builds and compiles the scene's " +
     'materials, and with its first WIREFRAME frame of a scene with millions of triangles, while it builds ' +
     'the wires of every mesh; with millions of triangles it is also busy while it carries out a command ' +
-    `(with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}), but not while it draws its ` +
-    'other frames.';
+    `(with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}) and while it applies a change ` +
+    `made elsewhere (${CHANGE_APPLY_SECONDS} for an agent's move of an object among 4 million triangles), but ` +
+    'not while it draws its other frames.';
   /**
    * The server cannot know the viewport's shading (the person can change it): switching to SOLID is
    * advised only for a viewport in another shading (a select of 4 million triangles in SOLID shading
@@ -707,6 +718,12 @@ describe('the cost of screenshots', () => {
         'these ranges include it and selects sent as soon as a screenshot had answered. Other commands do ' +
         "not wait for the viewport's frames, only for the work that holds the editor's main thread",
       'took {@link SERVER_SOLID_SECONDS} in a render process',
+      // round 12: what else holds a command up (the editor applying a change made elsewhere, the
+      // server's holds), which a timeout_ms of a few seconds can run out in
+      "and applying a change made elsewhere (another agent's move of an object) {@link CHANGE_APPLY_SECONDS}",
+      'while it saves a project after a change ({@link SAVE_HOLD_SECONDS}, then twice more for at most ' +
+        '{@link AFTER_SAVE_HOLD_SECONDS} while it takes fingerprints of what it wrote)',
+      'sends a project to an editor that opens it ({@link READ_HOLD_SECONDS})',
     ])
       expect(docComment).toContain(name);
     expect(docComment).not.toMatch(/\d\.\d+–\d|\d s\b/);

@@ -264,11 +264,14 @@ export class SceneEvaluator {
     const evaluated = new Map<string, MeshResult | null>();
     const inProgress = new Set<string>();
 
-    /** Signature of everything a dependent modifier may read from object `d`. */
+    /**
+     * Signature of everything a dependent modifier may read from object `d`, its type included
+     * (which disables some modifiers: ModifierContext.getObjectType).
+     */
     const depSignature = (d: string): string => {
       const o = fs.byId.get(d);
       if (!o) return `${d}:missing`;
-      const parts = [d, fmtMatrix(fs.world(d))];
+      const parts = [d, o.type, fmtMatrix(fs.world(d))];
       const r = evalMesh(d);
       parts.push(r ? r.key : 'nomesh');
       if (o.type === 'ARMATURE') {
@@ -396,6 +399,9 @@ export class SceneEvaluator {
             const r = fs.curvePath(dep);
             return r ? { path: r.path, matrix: r.matrix } : null;
           },
+          // Blender's is_disabled reads the types of the objects a modifier names: a Boolean whose
+          // object is a text, a Curve modifier whose curve became a mesh, … are left out
+          getObjectType: (dep) => fs.byId.get(dep)?.type ?? null,
           vertexGroups: o.type === 'MESH' ? doc.getVertexGroups(o.data) : undefined,
         });
         errors.push(...res.errors);

@@ -245,7 +245,7 @@ describe(`server process with a ${HEAP_MB} MB heap`, () => {
     expect(res.isError).toBe(true);
     const [first, ...rest] = (res.content[0]?.text ?? '').split('\n');
     expect(first).toMatch(
-      /^object\.join failed: not run on the server: the project's meshes and objects would then take about [\d,]+ MB of JavaScript heap \(now 22 MB with 30 objects\), and a save of it about [\d,]+ MB more for a moment \(3 times what its objects, datablocks and keyframes take\): [\d,]+ MB in all, more than the [\d,]+ MB the server's process keeps for one project/,
+      /^object\.join failed: not run on the server: the project's meshes, objects, keyframes and images would then take about [\d,]+ MB of memory \(now 22 MB with 30 objects\), and a save of it about [\d,]+ MB more for a moment \(3 times what its objects, datablocks and keyframes take, 5 times its images\): [\d,]+ MB in all, more than the [\d,]+ MB the server's process keeps for one project/,
     );
     expect(JSON.parse(rest.join('\n'))).toMatchObject({ code: 'OUT_OF_MEMORY' });
     expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
@@ -448,9 +448,11 @@ describe(`server process with a ${HEAP_MB} MB heap`, () => {
 
   it('refuses a GLB whose meshes share accessors by what it decodes, not by its size, and keeps answering', async () => {
     // 8 glTF meshes that all use the accessors of one grid of 300 × 300 quads: a file of 3 MB from
-    // which the importer decodes 8 meshes of 180,000 triangles, within what the server keeps for one
-    // project but not within its free heap (round 10: 40 such meshes of a 600 × 600 grid, estimated
-    // by the file's size, took the server down)
+    // which the importer decodes 8 meshes of 180,000 triangles, which the project then counts as
+    // 291 MB (each with a UV layer, as memory-objects.ts storedMeshBytes counts stored meshes): more
+    // than the 216 MB the server keeps for one project (round 10: 40 such meshes of a 600 × 600
+    // grid, estimated by the file's size, took the server down; round 11 counted them as 148 MB,
+    // without the UV layer, and let a project grow past what the server keeps for it)
     const n = 300;
     const V = (n + 1) * (n + 1);
     const pos = new Float32Array(3 * V);
@@ -503,9 +505,15 @@ describe(`server process with a ${HEAP_MB} MB heap`, () => {
       const url = `http://127.0.0.1:${(files.address() as AddressInfo).port}/shared.glb`;
       const r = await refused('import_model', { project: id, url });
       expect(r.code).toBe('OUT_OF_MEMORY');
-      expect(r.first).toMatch(
-        /^Import failed: not run on the server: it would need about [\d,]+ MB of JavaScript heap for 8 meshes of about 1,440,000 faces in all and 8 new objects, and the server's process has [\d,]+ MB of its [\d,]+ MB heap free and keeps 256 MB of it for its other work\. Lower the meshes of the file \(every glTF mesh is decoded into a mesh of its own, also where meshes share the same accessors\) to run it on the server \(a browser editor runs it in its own memory: editor_command \{command: 'run_operator', params: \{operator: 'import_scene\.gltf', params: \{data_base64\}\}\}\)$/,
-      );
+      const m =
+        /^Import failed: not run on the server: the project's meshes, objects, keyframes and images would then take about ([\d,]+) MB of memory with 8 new objects \(now 0 MB with 0 objects\), and a save of it about [\d,]+ MB more for a moment \(3 times what its objects, datablocks and keyframes take, 5 times its images\): ([\d,]+) MB in all, more than the ([\d,]+) MB the server's process keeps for one project \(half of its [\d,]+ MB heap less the 256 MB it keeps for its other work\)\. Lower the meshes of the file \(every glTF mesh is decoded into a mesh of its own, also where meshes share the same accessors\), or delete objects and meshes the project no longer needs$/.exec(
+          r.first,
+        );
+      expect(m, r.first).not.toBeNull();
+      const mb = (s: string) => Number(s.replace(/,/g, ''));
+      // the meshes it decodes (291 MB), not the 3 MB of the file
+      expect(mb(m![1])).toBeGreaterThanOrEqual(291);
+      expect(mb(m![2])).toBeGreaterThan(mb(m![3]));
       expect((await fetch(`${server.url}/healthz`)).status).toBe(200);
       expect((await ok('get_scene', { project: id })).counts.objects).toBe(0);
       expect(server.child.exitCode).toBeNull();

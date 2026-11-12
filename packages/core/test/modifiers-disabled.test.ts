@@ -6,7 +6,9 @@ import {
   createMesh,
   createOperatorRegistry,
   evaluateModifierStack,
+  evaluatedOrco,
   identity4,
+  modifierDisabledMessage,
   modifierDisabledReason,
   modifierObjectTypes,
   registerBuiltinModifiers,
@@ -228,6 +230,32 @@ describe('Apply refuses a disabled modifier, as Blender', () => {
     expect(names()).toEqual(['Boolean']);
   });
 
+  it('applies a modifier hidden in the viewport, as Blender does, and refuses one that is disabled', () => {
+    // object_modifier.cc (ED_object_modifier_apply): a modifier not enabled in the viewport is
+    // evaluated with "md_eval->mode |= eModifierMode_Realtime" ("Force mode on the evaluated
+    // modifier, enforcing the modifier evaluation in the apply() functions"), then
+    // modifier_apply_obdata refuses it when is_disabled
+    const { run, box, mesh, names } = setup();
+    run('object.modifier_add', { object: box, type: 'BOOLEAN' });
+    run('object.modifier_add', { object: box, type: 'SUBSURF', params: { levels: 1 } });
+    for (const modifier of ['Boolean', 'Subdivision'])
+      expect(run('object.modifier_set', { object: box, modifier, show_viewport: false }).ok).toBe(true);
+    const before = mesh();
+    const refused = run('object.modifier_apply', { object: box, modifier: 'Boolean' });
+    expect(refused).toMatchObject({
+      ok: false,
+      code: 'FAILED',
+      error:
+        "Modifier is disabled, skipping apply: the Boolean modifier 'Boolean' has no object, so it changes " +
+        'nothing; change it with object.modifier_set or remove it with object.modifier_remove',
+    });
+    expect(mesh()).toEqual(before);
+    const r = run('object.modifier_apply', { object: box, modifier: 'Subdivision' });
+    expect(r.ok).toBe(true);
+    expect(mesh().faces.length).toBe(24);
+    expect(names()).toEqual(['Boolean']);
+  });
+
   it('converts an object with a disabled modifier to its evaluated mesh', () => {
     const { ctx, doc, run, box, mesh } = setup();
     run('object.modifier_add', {
@@ -389,15 +417,15 @@ describe("parameters naming an object take the types Blender's setters accept", 
   });
 });
 
-describe('the evaluation recognizes armature and curve objects without object types', () => {
+describe('the evaluation, Convert and Apply leave out a modifier whose object is of the wrong type', () => {
   /*
-   * The scene's evaluation gives modifiers no object types (ModifierContext.getObjectType): an
-   * object with an armature pose is an armature, one with a curve path a curve. An Array whose start
-   * cap is one of them is disabled (MOD_array.cc), as Apply finds with the objects' types. Such caps
-   * cannot be set any more (Blender's setter refuses them); they are written here as an older
-   * document has them.
+   * The scene's evaluation gives modifiers the types of the objects they name
+   * (ModifierContext.getObjectType), as Blender's is_disabled reads them: an Array whose start cap
+   * is not a mesh is disabled (MOD_array.cc), as Apply finds it. Such caps cannot be set any more
+   * (Blender's setter refuses them); they are written here as an older document has them, or as an
+   * object that changed type afterwards has them.
    */
-  function capped(kind: 'armature' | 'curve' | 'mesh') {
+  function capped(kind: 'armature' | 'curve' | 'mesh' | 'text' | 'empty' | 'camera') {
     const doc = SceneDoc.create({ empty: true });
     const reg = createOperatorRegistry();
     const ctx: OperatorContext = {
@@ -410,7 +438,13 @@ describe('the evaluation recognizes armature and curve objects without object ty
     const run = (id: string, params?: unknown) => reg.run(ctx, id, params);
     expect(run('mesh.primitive_cube_add', { name: 'Box' }).ok).toBe(true);
     const box = ctx.state.activeId!;
-    const op = { armature: 'object.armature_add', curve: 'curve.primitive_bezier_curve_add' }[kind as string];
+    const op = {
+      armature: 'object.armature_add',
+      curve: 'curve.primitive_bezier_curve_add',
+      text: 'object.text_add',
+      empty: 'object.empty_add',
+      camera: 'object.camera_add',
+    }[kind as string];
     expect(run(op ?? 'mesh.primitive_cube_add', { location: [0, 0, 3] }).ok).toBe(true);
     const cap = ctx.state.activeId!;
     expect(run('object.modifier_add', { object: box, type: 'ARRAY', params: { count: 2 } }).ok).toBe(true);
@@ -421,11 +455,11 @@ describe('the evaluation recognizes armature and curve objects without object ty
     return { verts: evaluated.mesh!.positions.length / 3, errors: evaluated.modifierErrors, apply };
   }
 
-  it('leaves out an Array whose start cap is an armature or a curve', () => {
+  it('leaves out an Array whose start cap is not a mesh', () => {
     const mesh = capped('mesh');
     expect(mesh.verts).toBe(24);
     expect(mesh.apply.ok).toBe(true);
-    for (const kind of ['armature', 'curve'] as const) {
+    for (const kind of ['armature', 'curve', 'text', 'empty', 'camera'] as const) {
       const r = capped(kind);
       expect(r.verts, kind).toBe(8);
       expect(r.errors).toEqual([]);
@@ -435,5 +469,101 @@ describe('the evaluation recognizes armature and curve objects without object ty
         ),
       );
     }
+  });
+
+  function scene() {
+    const doc = SceneDoc.create({ empty: true });
+    const reg = createOperatorRegistry();
+    const ctx: OperatorContext = {
+      doc,
+      state: createEditorState(),
+      origin: doc.origin,
+      source: 'test',
+      report: () => undefined,
+    };
+    const run = (id: string, params?: unknown) => reg.run(ctx, id, params);
+    const add = (id: string, params: Record<string, unknown> = {}) => {
+      expect(run(id, params).ok).toBe(true);
+      return ctx.state.activeId!;
+    };
+    return { doc, ctx, run, add };
+  }
+
+  it('converts an object whose Curve modifier names a curve converted to a mesh, as the viewport shows it', () => {
+    // Blender's MOD_curve.cc is_disabled: `!cmd->object || cmd->object->type != OB_CURVES_LEGACY`
+    const { doc, ctx, run, add } = scene();
+    const path = add('curve.primitive_bezier_curve_add');
+    const box = add('mesh.primitive_cube_add', { name: 'Box', location: [0, 3, 0] });
+    expect(run('object.modifier_add', { object: box, type: 'CURVE', params: { object: path } }).ok).toBe(
+      true,
+    );
+    Object.assign(ctx.state, { selectedIds: [path], activeId: path });
+    expect(run('object.convert', { target: 'MESH' }).ok).toBe(true);
+    expect(doc.getObject(path)!.type).toBe('MESH');
+    const base = Array.from(doc.getMesh(doc.getObject(box)!.data!)!.positions);
+    // the viewport leaves the modifier out, without an error
+    const shown = new SceneEvaluator(doc).evaluate(1).byId.get(box)!;
+    expect(shown.modifierErrors).toEqual([]);
+    expect(Array.from(shown.mesh!.positions)).toEqual(base);
+    // Apply refuses it, and Convert bakes what the viewport shows
+    expect(run('object.modifier_apply', { object: box, modifier: 'Curve' }).error).toMatch(
+      /^Modifier is disabled, skipping apply: the Curve modifier 'Curve' has an object, 'BezierCurve', that is not a curve,/,
+    );
+    Object.assign(ctx.state, { selectedIds: [box], activeId: box });
+    const converted = run('object.convert', { target: 'MESH' });
+    expect(converted.ok, converted.error).toBe(true);
+    expect(doc.getObject(box)!.modifiers).toEqual([]);
+    expect(Array.from(doc.getMesh(doc.getObject(box)!.data!)!.positions)).toEqual(base);
+  });
+
+  it('leaves out a Boolean or Shrinkwrap whose object is a text, and an Armature whose object is a mesh', () => {
+    const { doc, run, add } = scene();
+    const label = add('object.text_add', { body: 'Hi', location: [0, 0, 0.5] });
+    const ball = add('mesh.primitive_uv_sphere_add', { location: [3, 0, 0] });
+    const box = add('mesh.primitive_cube_add', { name: 'Box' });
+    const base = Array.from(doc.getMesh(doc.getObject(box)!.data!)!.positions);
+    const set = (type: string, params: Record<string, unknown>) => {
+      expect(run('object.modifier_add', { object: box, type }).ok).toBe(true);
+      const m = doc.getObject(box)!.modifiers[0];
+      // as an older document has it: the operators refuse these objects (INVALID_PARAMS)
+      doc.updateObject(box, { modifiers: [{ ...m, params: { ...m.params, ...params } }] });
+      const shown = new SceneEvaluator(doc).evaluate(1).byId.get(box)!;
+      expect(shown.modifierErrors, type).toEqual([]);
+      expect(Array.from(shown.mesh!.positions), type).toEqual(base);
+      expect(run('object.modifier_remove', { object: box, modifier: m.name }).ok).toBe(true);
+    };
+    set('BOOLEAN', { object: label });
+    set('SHRINKWRAP', { target: label });
+    set('ARMATURE', { object: ball });
+  });
+
+  it('leaves it out of the undeformed coordinates too (GENERATED texture coordinates)', () => {
+    // an Array with a text as its start cap (disabled, MOD_array.cc) and a deforming Displace: the
+    // undeformed coordinates leave the Array out as the evaluated mesh does, and match it
+    const { doc, run, add } = scene();
+    const label = add('object.text_add', { body: 'Hi', location: [0, 0, 3] });
+    const box = add('mesh.primitive_cube_add', { name: 'Box' });
+    expect(run('object.modifier_add', { object: box, type: 'ARRAY', params: { count: 2 } }).ok).toBe(true);
+    expect(run('object.modifier_add', { object: box, type: 'DISPLACE', params: { strength: 0.1 } }).ok).toBe(
+      true,
+    );
+    const [array, displace] = doc.getObject(box)!.modifiers;
+    doc.updateObject(box, {
+      modifiers: [{ ...array, params: { ...array.params, start_cap: label } }, displace],
+    });
+    const scene1 = new SceneEvaluator(doc).evaluate(1);
+    const ev = scene1.byId.get(box)!;
+    expect(ev.mesh!.positions.length / 3).toBe(8);
+    const orco = evaluatedOrco(doc, scene1, ev, false);
+    expect(orco).not.toBeNull();
+    expect(orco!.length).toBe(ev.mesh!.positions.length);
+  });
+
+  it('names why in the words Apply, get_scene and the Modifiers tab use', () => {
+    const ctx: ModifierDisabledContext = { forRender: false, objectType: () => null };
+    expect(modifierDisabledMessage({ ...modifier('BOOLEAN'), name: 'Cut' }, ctx)).toBe(
+      "the Boolean modifier 'Cut' has no object, so it changes nothing",
+    );
+    expect(modifierDisabledMessage(modifier('SUBSURF', { levels: 2 }), ctx)).toBeNull();
   });
 });

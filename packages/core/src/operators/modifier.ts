@@ -7,6 +7,7 @@ import {
   getModifierDef,
   isModifierEnabled,
   listModifierDefs,
+  modifierDisabledMessage,
   modifierDisabledReason,
   modifierObjectParams,
   modifierObjectRefusal,
@@ -241,11 +242,13 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
       label: 'Apply Modifier',
       description:
         "Bake the modifier stack up to and including the given modifier into the object's mesh data (shared mesh data " +
-        'is made single-user first) and remove the applied modifiers. Modifiers before it that are disabled in the ' +
-        'viewport, or that Blender disables because they can do nothing (a Boolean without a mesh object, an ' +
+        'is made single-user first) and remove the applied modifiers (Blender applies only the given modifier, to ' +
+        'the mesh without the modifiers before it, and keeps those). The given modifier is applied also when it is ' +
+        'hidden in the viewport, as in Blender, which turns it on for the Apply. Modifiers before it that are hidden ' +
+        'in the viewport, or that Blender disables because they can do nothing (a Boolean without a mesh object, an ' +
         'Armature without an armature, a Subdivision Surface with 0 levels, a Smooth or Cast with factor 0, …), are ' +
-        'skipped and kept; such a modifier itself is refused, as in Blender ("Modifier is disabled, skipping ' +
-        'apply"), and kept. Not available in Edit Mode.',
+        'skipped and kept; the given modifier, when it can do nothing, is refused, as in Blender ("Modifier is ' +
+        'disabled, skipping apply"), and kept. Not available in Edit Mode.',
       category: 'Object',
       schema: z.object({ modifier: modifierRef, object: objectRef }),
       execute(ctx, p) {
@@ -261,31 +264,32 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
         }
         const idx = findModifier(o, p.modifier);
         const target = o.modifiers[idx];
-        if (!target.show_viewport) {
-          throw new OperatorError(
-            `Modifier '${target.name}' is disabled in the viewport; enable it before applying`,
-            'FAILED',
-          );
-        }
         // Blender's is_disabled (modifier_apply_obdata, with the viewport's settings): a modifier
-        // that can do nothing is not applied ("Modifier is disabled, skipping apply") and stays
+        // that can do nothing is not applied ("Modifier is disabled, skipping apply") and stays,
+        // also one hidden in the viewport
         const disabledCtx: ModifierDisabledContext = {
           forRender: false,
           objectType: (id) => ctx.doc.getObject(id)?.type ?? null,
           objectName: (id) => ctx.doc.getObject(id)?.name ?? id,
         };
-        const reason = modifierDisabledReason(target, disabledCtx);
-        if (reason)
+        const disabled = modifierDisabledMessage(target, disabledCtx);
+        if (disabled)
           throw new OperatorError(
-            `Modifier is disabled, skipping apply: the ${getModifierDef(target.type)?.label ?? target.type} ` +
-              `modifier '${target.name}' ${reason}, so it changes nothing; change it with object.modifier_set or ` +
+            `Modifier is disabled, skipping apply: ${disabled}; change it with object.modifier_set or ` +
               'remove it with object.modifier_remove',
             'FAILED',
           );
         const flags = { forRender: false, editMode: false };
-        const stack = o.modifiers
-          .slice(0, idx + 1)
-          .filter((m) => isModifierEnabled(m, flags) && !modifierDisabledReason(m, disabledCtx));
+        // the modifiers before it that the viewport shows and that can do something, then the
+        // modifier itself, also when it is hidden in the viewport: Blender's ED_object_modifier_apply
+        // evaluates such a modifier with eModifierMode_Realtime forced on ("Force mode on the
+        // evaluated modifier, enforcing the modifier evaluation in the apply() functions")
+        const stack = [
+          ...o.modifiers
+            .slice(0, idx)
+            .filter((m) => isModifierEnabled(m, flags) && !modifierDisabledReason(m, disabledCtx)),
+          { ...target, show_viewport: true },
+        ];
         const base = ctx.doc.getMesh(o.data!);
         if (!base) throw new OperatorError('Mesh data missing', 'FAILED');
         const ev = new SceneEvaluator(ctx.doc).evaluate(ctx.state.frame);
@@ -311,6 +315,7 @@ export function registerModifierOperators(reg: OperatorRegistry): void {
             const path = e?.type === 'CURVE' && e.curve ? buildCurvePath(e.curve) : null;
             return e && path ? { path, matrix: e.worldMatrix } : null;
           },
+          getObjectType: (id) => ctx.doc.getObject(id)?.type ?? null,
           vertexGroups: ctx.doc.getVertexGroups(o.data!),
         });
         if (result.errors.length) {

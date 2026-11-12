@@ -155,23 +155,33 @@ describe('modifier operators', () => {
     expect(doc.getMesh(doc.getObject(twin)!.data!)!.faces.length).toBe(6);
   });
 
-  it('skips disabled modifiers, refuses disabled targets and edit mode, and reports failures', () => {
+  it('skips hidden modifiers before the one applied, applies a hidden one, refuses edit mode, and reports failures', () => {
     const { doc, run, cube, mods } = setup();
+    const faces = () => doc.getMesh(doc.getObject(cube)!.data!)!.faces.length;
     run('object.modifier_add', { type: 'SUBSURF' });
     run('object.modifier_add', { type: 'TRIANGULATE' });
     run('object.modifier_set', { modifier: 'Subdivision', show_viewport: false });
-    expect(run('object.modifier_apply', { modifier: 'Subdivision' }).error).toMatch(/disabled/);
+    // the Subdivision hidden in the viewport before it is skipped and kept
     expect(run('object.modifier_apply', { modifier: 'Triangulate' }).ok).toBe(true);
-    expect(doc.getMesh(doc.getObject(cube)!.data!)!.faces.length).toBe(12);
+    expect(faces()).toBe(12);
     expect(mods().map((m) => m.name)).toEqual(['Subdivision']);
-    // broken parameters stored on the object are reported
-    doc.updateObject(cube, { modifiers: [{ ...mods()[0], show_viewport: true, params: { levels: 42 } }] });
+    // broken parameters stored on the object are reported, also of a modifier hidden in the viewport
+    doc.updateObject(cube, { modifiers: [{ ...mods()[0], params: { levels: 42 } }] });
     const broken = run('object.modifier_apply', { modifier: 'Subdivision' });
     expect(broken.ok).toBe(false);
     expect(broken.error).toMatch(/Subdivision.*levels/);
-    expect(doc.getMesh(doc.getObject(cube)!.data!)!.faces.length).toBe(12);
+    expect(faces()).toBe(12);
+    // a modifier hidden in the viewport is applied, as Blender applies it (each triangle in 3 quads)
+    doc.updateObject(cube, { modifiers: [{ ...mods()[0], params: { levels: 1 } }] });
+    expect(mods()[0].show_viewport).toBe(false);
+    const hidden = run('object.modifier_apply', { modifier: 'Subdivision' });
+    expect(hidden.ok).toBe(true);
+    expect(hidden.result.applied).toEqual(['Subdivision']);
+    expect(faces()).toBe(36);
+    expect(mods()).toEqual([]);
+    run('object.modifier_add', { type: 'TRIANGULATE' });
     run('object.mode_set', { mode: 'EDIT' });
-    expect(run('object.modifier_apply', { modifier: 'Subdivision' }).error).toMatch(/Edit Mode/);
+    expect(run('object.modifier_apply', { modifier: 'Triangulate' }).error).toMatch(/Edit Mode/);
   });
 
   it('resolves object references by name and applies booleans using the evaluated operand', () => {

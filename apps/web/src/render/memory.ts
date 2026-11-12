@@ -73,7 +73,9 @@ import {
  * heap has, or running out of it ends the tab. It is checked the same way, before the evaluation
  * from the estimate at the frame it renders ({@link rasterNeeds}, {@link rasterRefusal}) and during it
  * every modifier right before it runs (guard.ts `RasterEvaluationGuard`); a path tracing refusal
- * suggests the RASTER engine only where that check passes.
+ * suggests the RASTER engine only where that check passes. A RASTER render that builds nothing
+ * beyond what the page holds (meshes as the document stores them, no particle or collection
+ * instances) is not refused: the page lives with its own heap, whatever its estimate says.
  */
 
 const MB = 1024 * 1024;
@@ -184,6 +186,22 @@ export function usableHeap(limit: number): number {
   return Math.max(0, Math.min(limit * JS_HEAP_SHARE, limit - YOUNG_GENERATION_BYTES));
 }
 
+/**
+ * The editor page's own JavaScript heap (bytes), as Chrome 153 holds it (headless, software WebGL;
+ * the page's heap after a garbage collection, read with the DevTools protocol's
+ * Runtime.getHeapUsage), for {@link pageHeapEstimate}:
+ * - `base`: a new project (its cube, camera and light): 11.9 MiB;
+ * - `object`: per object of the document (its data and the editor's records of it): 30.7 and 34.0
+ *   KB with 2,000 and 8,000 linked copies of a cube;
+ * - `triangle`: per triangle the page keeps (the meshes the document stores, decoded, and the
+ *   geometry its evaluation for the viewport builds, a modifier stack's input kept besides its
+ *   result): 84 bytes with one and with two 720×720 grids (1,036,800 triangles each), 85 with a
+ *   360×360 grid subdivided once in the viewport (its 259,200 triangles and the 1,036,800 of the
+ *   result), 89 with the surface of a curve (1,079,308 triangles).
+ * A quarter more, rounded up.
+ */
+export const PAGE_HEAP_BYTES = { base: 16 * MB, object: 43_000, triangle: 112 } as const;
+
 /** The tab's memory as the browser reports it. */
 export interface TabMemory {
   /** Memory the page and its render workers may use for a render (bytes, see {@link renderMemoryBudget}). */
@@ -191,10 +209,12 @@ export interface TabMemory {
   /** The JavaScript heap limit of the tab (bytes): performance.memory.jsHeapSizeLimit, else 4 GB. */
   heapLimit: number;
   /**
-   * The page's JavaScript heap (bytes): the larger of performance.memory.usedJSHeapSize and the
-   * page's own evaluated scene ({@link pageHeapEstimate}). Chrome refreshes usedJSHeapSize at most
-   * every 20 minutes in a page that is not cross-origin isolated, as the editor's is not (it stayed
-   * at 10 MB after the page allocated 300 MB), so the estimate is what follows the scene.
+   * The page's own JavaScript heap (bytes), estimated from its scene ({@link pageHeapEstimate}).
+   * Not performance.memory.usedJSHeapSize: Chrome counts the page's ArrayBuffers in it, which the
+   * heap limit does not hold (with three 720×720 grids it said 631 MiB, for a heap of 262 MiB and
+   * 340 MiB of ArrayBuffers; a page that made a 200 MiB ArrayBuffer read 210 MB more there, its
+   * heap 0.04 MB more), and in the headless Chromium of the tests it kept the figure of its first
+   * read (10,000,000 bytes after the page allocated 200 MiB of ArrayBuffers and 1 million objects).
    */
   heapUsed: number;
   /** The device memory the budget comes from (GB, navigator.deviceMemory), null when unknown. */
@@ -204,6 +224,13 @@ export interface TabMemory {
    * a render gets the budget and the heap they leave.
    */
   held: { total: number; heap: number };
+  /**
+   * The part of `heapUsed` that the evaluator of RASTER final renders keeps from its last render
+   * (bytes, its geometry; `ViewportEngine`). A path traced render counts it; a RASTER render does
+   * not ({@link rasterRefusal}): the evaluator lets it go first where it and the new render's
+   * geometry do not fit together.
+   */
+  rasterKept?: number;
 }
 
 /** Largest budget of a render (bytes). */
@@ -225,22 +252,23 @@ export function renderMemoryBudget(deviceGB: number | null): number {
 }
 
 /**
- * The tab's memory now (Chrome's performance.memory, navigator.deviceMemory); `pageHeap` is the
- * page's own heap estimated from its scene ({@link pageHeapEstimate}), the floor of `heapUsed`.
+ * The tab's memory now (Chrome's performance.memory.jsHeapSizeLimit, navigator.deviceMemory);
+ * `pageHeap` is the page's own heap estimated from its scene ({@link pageHeapEstimate}), and
+ * `rasterKept` what the evaluator of RASTER final renders keeps besides ({@link TabMemory.rasterKept}).
  */
-export function tabMemory(pageHeap = 0): TabMemory {
-  const perf = (globalThis.performance as { memory?: { jsHeapSizeLimit?: number; usedJSHeapSize?: number } })
-    ?.memory;
+export function tabMemory(pageHeap = 0, rasterKept = 0): TabMemory {
+  const perf = (globalThis.performance as { memory?: { jsHeapSizeLimit?: number } })?.memory;
   const nav = (globalThis as { navigator?: { deviceMemory?: number } }).navigator;
   const deviceGB = typeof nav?.deviceMemory === 'number' ? nav.deviceMemory : null;
   const limit = perf?.jsHeapSizeLimit;
-  const used = perf?.usedJSHeapSize;
+  const kept = rasterKept > 0 ? rasterKept : 0;
   return {
     budget: renderMemoryBudget(deviceGB),
     heapLimit: typeof limit === 'number' && limit > 0 ? limit : 4 * GB,
-    heapUsed: Math.max(typeof used === 'number' && used > 0 ? used : 0, pageHeap > 0 ? pageHeap : 0),
+    heapUsed: (pageHeap > 0 ? pageHeap : 0) + kept,
     deviceGB,
     held: { total: 0, heap: 0 },
+    rasterKept: kept,
   };
 }
 
@@ -447,6 +475,11 @@ export interface RenderEstimate {
   /** Instances of the compiled scene: the objects shown in renders, and particle and collection instances. */
   instances: number;
   /**
+   * The part of `instances` the evaluation makes: particle instances and the objects of collections
+   * instanced whole (the rest are the objects shown in renders).
+   */
+  builtInstances: number;
+  /**
    * The largest JavaScript heap the evaluation of one object takes while it runs (bytes): the sum of
    * the peaks of its modifiers, results included ({@link modifierEstimate}: core `estimateModifier`,
    * as the server counts them, a Bevel's as Chrome takes it), and for text the glyphs (core
@@ -472,6 +505,11 @@ export interface RenderEstimate {
    * RASTER render's evaluation (guard.ts) adds what the modifiers make.
    */
   builtBaseTriangles: number;
+  /**
+   * Triangles of the meshes the document stores that the objects show or feed to their modifiers,
+   * each mesh once, as stored: what the page has decoded ({@link pageHeapEstimate}).
+   */
+  meshTriangles: number;
 }
 
 /** Bytes per pixel of a decoded image texture (RGBA8). */
@@ -683,16 +721,22 @@ export function estimateRender(doc: SceneDoc, forRender = true, frame?: number):
     const tree = collectionTrees(doc, [w.collection]);
     instances += w.times * objects.filter((o) => tree.has(o.collection)).length;
   }
+  const builtInstances = instances;
 
   const evaluated = new Map<string, number>();
   const stored = new Map<string, number>();
   const built = new Map<string, number>();
   const builtBase = new Map<string, number>();
   const compiled = new Map<string, number>();
+  const meshes = new Map<string, number>();
   let evaluationHeap = 0;
   for (const o of objects) {
     const e = evaluate(o);
     if (!e) continue;
+    if (o.type === 'MESH' && o.data && !meshes.has(o.data)) {
+      const counts = doc.meshCounts(o.data);
+      if (counts) meshes.set(o.data, triangles(counts));
+    }
     const tris = triangles(e.size);
     evaluated.set(e.key, tris);
     stored.set(e.key, e.stored);
@@ -709,21 +753,28 @@ export function estimateRender(doc: SceneDoc, forRender = true, frame?: number):
     evaluatedTriangles: sum(evaluated),
     storedTriangles: sum(stored),
     instances,
+    builtInstances,
     evaluationHeap,
     imageBytes: imageBytesOf(doc),
     builtTriangles: sum(built),
     builtBaseTriangles: sum(builtBase),
+    meshTriangles: sum(meshes),
   };
 }
 
 /**
- * The page's own JavaScript heap, estimated from its scene at `frame`: the editor evaluates every
- * object for the viewport and keeps the document and the evaluated meshes, as a render's first
- * worker does.
+ * The page's own JavaScript heap, estimated from its scene at `frame` ({@link PAGE_HEAP_BYTES}):
+ * the editor keeps the document's objects and decoded meshes, and evaluates every object for the
+ * viewport, keeping the geometry that evaluation builds and the evaluated instances.
  */
 export function pageHeapEstimate(doc: SceneDoc, frame?: number): number {
   const e = estimateRender(doc, false, frame);
-  return e.evaluatedTriangles * PREPARE_BYTES_PER_TRIANGLE.heap + e.instances * INSTANCE_BYTES.heap;
+  return (
+    PAGE_HEAP_BYTES.base +
+    doc.objectIds().length * PAGE_HEAP_BYTES.object +
+    (e.meshTriangles + e.builtTriangles) * PAGE_HEAP_BYTES.triangle +
+    e.instances * INSTANCE_BYTES.heap
+  );
 }
 
 /** What a render needs, per role (bytes). */
@@ -813,8 +864,8 @@ export interface RefusalFigures {
  * the room: `need`, and the room left of `total` once `used` is taken (the need is larger), with
  * `digits` decimals; more decimals, at most three, where a figure that is not 0 (the room included)
  * would print as 0, or the need would print no larger than the room. The room printed is the total
- * printed less the use printed. At three decimals the need is rounded up, the total down and the use
- * up.
+ * printed less the use printed. Where three decimals are not enough, the need and the use are
+ * rounded up and the total down, so that a need or a use that is not 0 prints as 0.001 GB at least.
  */
 export function refusalFigures(need: number, total: number, used: number, digits = 1): RefusalFigures {
   const units = (b: number, d: number, round: (x: number) => number = Math.round) =>
@@ -824,7 +875,7 @@ export function refusalFigures(need: number, total: number, used: number, digits
   let [n, t, s] = at(d);
   const zero = () => [need, total, used].some((b) => b > 0 && units(b, d) === 0) || (total > used && t <= s);
   while (d < 3 && (zero() || n <= t - s)) [n, t, s] = at(++d);
-  if (n <= t - s)
+  if (zero() || n <= t - s)
     [n, t, s] = [units(need, d, Math.ceil), units(total, d, Math.floor), units(used, d, Math.ceil)];
   const text = (u: number) => (u / 10 ** d).toFixed(d);
   return { need: text(n), total: text(t), used: text(s), room: t - s > 0 ? text(t - s) : null, digits: d };
@@ -945,6 +996,18 @@ export interface RasterNeeds {
   triangles: number;
   /** Bytes of JavaScript heap: that geometry, the evaluated instances, and the evaluation running. */
   heap: number;
+  /** The instances it evaluates ({@link RenderEstimate.instances}), for a refusal without geometry. */
+  instances?: number;
+  /**
+   * The render builds nothing beyond what the page holds: no geometry (no curve or text surface, no
+   * modifier or shape key result: its meshes are the page's, as the document stores them) and no
+   * particle or collection instances, only a record of each object it evaluates (about 400 bytes,
+   * {@link INSTANCE_BYTES}; the page holds about a hundred times as much for each object). It is
+   * not refused ({@link rasterRefusal}): the page already lives with what it renders, whatever the
+   * estimate of the page's own heap says (an estimate with a margin, which can exceed the share of
+   * the heap a render may fill when the page itself is near its heap limit).
+   */
+  buildsNothing?: boolean;
   /** The modifier whose evaluation does not fit (guard.ts), as in {@link RenderNeeds.cause}. */
   cause?: RenderNeeds['cause'];
 }
@@ -956,26 +1019,44 @@ export interface RasterNeeds {
  * RenderEstimate.builtTriangles}, {@link RASTER_BYTES_PER_TRIANGLE}) and the evaluated instances, and
  * needs the heap of the evaluation of the heaviest object while it runs ({@link
  * RenderEstimate.evaluationHeap}). Meshes as the document stores them are the page's already: the
- * viewport shows them.
+ * viewport shows them. A render without geometry, particle or collection instances or a modifier
+ * to run builds nothing beyond what the page holds ({@link RasterNeeds.buildsNothing}).
  */
 export function rasterNeeds(e: RenderEstimate): RasterNeeds {
   return {
     triangles: e.builtTriangles,
     heap: e.builtTriangles * RASTER_BYTES_PER_TRIANGLE + e.instances * INSTANCE_BYTES.heap + e.evaluationHeap,
+    instances: e.instances,
+    buildsNothing: e.builtTriangles === 0 && e.builtInstances === 0 && e.evaluationHeap === 0,
   };
 }
+
+/** What to lower for fewer instances, for a RASTER refusal without geometry. */
+const LOWER_INSTANCES = 'the instances (particle counts, instanced collections, objects in the scene)';
 
 /**
  * Why a RASTER render of `needs` is not started: its geometry does not fit the room the tab's heap
  * has for a render (see {@link usableHeap}, next to the page and the path traced renders running in
- * it), and running out of it would end the tab; null when it fits.
+ * it), and running out of it would end the tab; null when it fits, and for a render that builds
+ * nothing beyond what the page holds ({@link RasterNeeds.buildsNothing}). The geometry the evaluator
+ * of RASTER renders keeps from its last render is not counted ({@link TabMemory.rasterKept}): it goes
+ * first where it and this render's do not fit together.
  */
-export function rasterRefusal(needs: RasterNeeds, mem: TabMemory): string | null {
+export function rasterRefusal(needs: RasterNeeds, memory: TabMemory): string | null {
+  if (needs.buildsNothing) return null;
+  const kept = Math.min(memory.heapUsed, Math.max(0, memory.rasterKept ?? 0));
+  const mem: TabMemory = kept > 0 ? { ...memory, heapUsed: memory.heapUsed - kept, rasterKept: 0 } : memory;
   if (mem.heapUsed + mem.held.heap + needs.heap <= usableHeap(mem.heapLimit)) return null;
+  // no geometry: its heap is the instances it evaluates
+  const what =
+    needs.triangles > 0
+      ? `about ${triangleCount(needs.triangles)} triangles: curve and text surfaces, modifier and shape key results`
+      : `about ${triangleCount(needs.instances ?? 0)} instances of objects, particles and collections, and no ` +
+        'curve or text surface, modifier or shape key result';
   return (
     'The RASTER render was not started: ' +
     heapReason('the geometry it evaluates at the render settings', needs.heap, mem) +
-    ` (about ${triangleCount(needs.triangles)} triangles: curve and text surfaces, modifier and shape key ` +
-    `results), and running out of memory would end the tab.${causeSentence(needs.cause)} Lower ${LOWER_TRIANGLES}.`
+    ` (${what}), and running out of memory would end the tab.${causeSentence(needs.cause)} ` +
+    `Lower ${needs.triangles > 0 ? LOWER_TRIANGLES : LOWER_INSTANCES}.`
   );
 }

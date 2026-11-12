@@ -582,7 +582,8 @@ function settle(fs: FrameState): void {
  * depend on the order objects are evaluated in (an object parented to a bone of a pose cycle shows
  * no matrix when evaluated first), so `fs` then first evaluates every object in the document's
  * order, as the viewport does (see {@link ObjectTransform}). The matrix of an object without a
- * parent, constraints or drivers of its channels reads nothing else: no relations are needed.
+ * parent, constraints or drivers of its channels reads nothing else: no relations are needed. The
+ * Edit Mode pivot and transform and the LOCAL orientation ({@link orientAxes}) read the object so.
  */
 export function shownWorld(fs: FrameState, id: string): Mat4 {
   const o = fs.byId.get(id);
@@ -1222,13 +1223,14 @@ export function orientationMatrix(doc: SceneDoc, state: EditorState): Mat4 {
 
 /**
  * The axes of Blender's LOCAL orientation for an active object: its world axes where the scene
- * shows it at the frame of `fs` (its constraints applied), each normalized, an axis it scales to 0
- * rebuilt from the others as Blender's transform_orientations_create_from_axis rebuilds it (one
- * zero axis: the cross product of the other two; two: the world axes made perpendicular to the
- * third), the world axes when all three are 0.
+ * shows it at the frame of `fs` (its constraints applied; where it reads a dependency cycle, as the
+ * viewport shows it, see {@link shownWorld}), each normalized, an axis it scales to 0 rebuilt from
+ * the others as Blender's transform_orientations_create_from_axis rebuilds it (one zero axis: the
+ * cross product of the other two; two: the world axes made perpendicular to the third), the world
+ * axes when all three are 0.
  */
 export function orientAxes(fs: FrameState, activeId: string): Mat4 {
-  return orientationAxes(evaluatedWorld(fs, activeId));
+  return orientationAxes(shownWorld(fs, activeId));
 }
 
 /**

@@ -31,7 +31,9 @@ export interface OrcoDependencies {
   getObjectMesh: ModifierContext['getObjectMesh'];
   getObjectMatrix?: ModifierContext['getObjectMatrix'];
   getArmature?: ModifierContext['getArmature'];
-  /** Cache signature of everything the modifiers may read from object `id`. */
+  /** The types of objects, which disable some modifiers as in the evaluation (ModifierContext). */
+  getObjectType?: ModifierContext['getObjectType'];
+  /** Cache signature of everything the modifiers may read from object `id`, its type included. */
   signature(id: string): string;
 }
 
@@ -96,6 +98,7 @@ export function orcoMesh(input: OrcoInput): MeshData | null {
   const hit = entries?.find((e) => e.key === key);
   if (hit) return hit.mesh;
   let mesh: MeshData | null;
+  const getObjectType = input.deps?.getObjectType;
   try {
     mesh = evaluateModifierStack(input.base, generate, {
       frame: input.frame ?? 0,
@@ -105,6 +108,7 @@ export function orcoMesh(input: OrcoInput): MeshData | null {
       getObjectMesh: (id) => input.deps?.getObjectMesh(id) ?? null,
       getObjectMatrix: (id) => input.deps?.getObjectMatrix?.(id) ?? null,
       getArmature: (id) => input.deps?.getArmature?.(id) ?? null,
+      ...(getObjectType ? { getObjectType: (id: string) => getObjectType(id) } : {}),
     }).mesh;
   } catch {
     mesh = null;
@@ -127,9 +131,10 @@ export function sceneOrcoDependencies(scene: EvaluatedScene): OrcoDependencies {
       const o = scene.byId.get(id);
       return o?.pose ? { pose: o.pose, matrix: o.worldMatrix } : null;
     },
+    getObjectType: (id) => scene.byId.get(id)?.type ?? null,
     signature: (id) => {
       const o = scene.byId.get(id);
-      return o ? `${id}:${o.meshKey ?? ''}:${o.worldMatrix.join(',')}` : `${id}:missing`;
+      return o ? `${id}:${o.type}:${o.meshKey ?? ''}:${o.worldMatrix.join(',')}` : `${id}:missing`;
     },
   };
 }

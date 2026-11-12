@@ -13,7 +13,10 @@ import type { Persistence } from '../persistence';
 import type { ServerMetrics } from '../observability/metrics';
 import type { Log } from '../observability/log';
 import { errorMessage, withSpan } from '../observability/tracing';
+import { trackOpenRoom } from '../render/memory';
 import { Room, STORAGE_ORIGIN, settlesBefore, type DeletionOutcome, type ProjectListing } from './room';
+import { ProjectMemoryError, loadRefusal, type GrowthCheck, type HeapProbe } from './project-memory';
+import { measureUpdate } from './update-size';
 
 export class StorageUnavailableError extends Error {
   constructor(message: string) {
@@ -52,6 +55,13 @@ export interface RoomManagerOptions {
    * RoomManager.setShutdownWait).
    */
   shutdownWaitMs?: number;
+  /**
+   * Asked before a change a sync client sends is applied, when it adds to its project (default: the
+   * check of operators that add to a project, see Room.handleMessage).
+   */
+  growthCheck?: GrowthCheck;
+  /** The heap a stored project's load is held against (default: this process's; see load). */
+  heap?: HeapProbe;
 }
 
 const TOMBSTONE_TTL_MS = 60 * 60 * 1000;
@@ -229,8 +239,8 @@ export class RoomManager {
   }
 
   private roomDeps() {
-    const { metrics, log, debounceMs, serverVersion } = this.opts;
-    return { store: this.store, metrics, log, debounceMs, serverVersion };
+    const { metrics, log, debounceMs, serverVersion, growthCheck } = this.opts;
+    return { store: this.store, metrics, log, debounceMs, serverVersion, growthCheck };
   }
 
   private updateGauge(): void {
@@ -435,6 +445,7 @@ export class RoomManager {
     }
     if (this.closed) return null;
     if (!persisted && !create) return null;
+    if (update) this.checkLoad(id, update, info);
     const ydoc = new Y.Doc();
     // (a project.json without a document: the empty document has no name, and the room's scene has
     // the stored one, see Room.scene)
@@ -444,13 +455,34 @@ export class RoomManager {
       persisted,
       documentStored: !!update,
       readAt: store && !failed ? Date.now() : 0,
+      stored: update ?? undefined,
     });
     this.rooms.set(id, room);
     this.updateGauge();
+    // the memory checks count it among the open projects (render/memory.ts)
+    trackOpenRoom(room.scene);
     // Storage was unreachable: the first save merges whatever is stored (CRDT) into this room.
     if (failed) room.markDirty();
     this.opts.log.debug({ project: id, persisted }, 'room loaded');
     return room;
+  }
+
+  /**
+   * Throws a {@link ProjectMemoryError} (code OUT_OF_MEMORY) when loading the stored document
+   * `update` of project `id`, and saving it once, would not fit into the server's free heap
+   * (project-memory.ts loadRefusal), instead of letting the load end the server. A document the
+   * measure cannot read is loaded as before (Yjs decides).
+   */
+  private checkLoad(id: string, update: Uint8Array, info: ProjectInfo | null): void {
+    let refused: string | null;
+    try {
+      refused = loadRefusal({ id, name: info?.name ?? id }, measureUpdate(update), this.opts.heap);
+    } catch {
+      return;
+    }
+    if (!refused) return;
+    this.opts.log.warn({ project: id, err: refused }, 'project not loaded: the server cannot hold it');
+    throw new ProjectMemoryError(refused);
   }
 
   /**
@@ -547,6 +579,7 @@ export class RoomManager {
     const room = new Room(id, ydoc, this.roomDeps(), { persisted: false });
     this.rooms.set(id, room);
     this.updateGauge();
+    trackOpenRoom(room.scene);
     room.markDirty();
     await room.flush();
     return room;
@@ -570,6 +603,7 @@ export class RoomManager {
       const end = metrics.persistenceDuration.startTimer({ op: 'list' });
       try {
         let infos: ProjectInfo[] | null = null;
+        const listedAt = Date.now();
         try {
           infos = await withSpan('persistence.list', {}, () => store.listProjects());
           stored = new Set(infos.map((info) => info.id));
@@ -584,6 +618,7 @@ export class RoomManager {
           }
         }
         if (infos) {
+          this.refreshStoredNames(infos, listedAt);
           const deleted = await Promise.all(infos.map((info) => this.stillDeleted(info.id)));
           infos.forEach((info, i) => {
             if (!deleted[i]) byId.set(info.id, { ...info, peers: 0, live: false });
@@ -600,6 +635,26 @@ export class RoomManager {
       byId.set(room.id, room.listing());
     }
     return [...byId.values()].sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  }
+
+  /**
+   * The names a lookup by name compares ({@link listNames}) from the project.json files that
+   * list_projects read (`infos`, read from `listedAt` on): a project another writer renamed is found
+   * by its new name at once after list_projects lists it, also where storage tells no change of its
+   * folder (else after {@link STORED_NAME_MAX_AGE_MS} at the latest). A name read after `listedAt`
+   * is kept.
+   */
+  private refreshStoredNames(infos: ProjectInfo[], listedAt: number): void {
+    for (const info of infos) {
+      const known = this.storedNames.get(info.id);
+      if (!known || known.readAt > listedAt) continue;
+      this.storedNames.set(info.id, {
+        ...known,
+        name: info.name ?? null,
+        updated_at: info.updated_at ?? '',
+        readAt: listedAt,
+      });
+    }
   }
 
   /**
@@ -635,8 +690,9 @@ export class RoomManager {
    * the project.json of a stored project this server has not loaded only when it has not read it
    * before, when the listing reports another ETag or modification time for its folder than when it
    * read it (where the listing reports neither for folders, as the disk's does: another ETag of its
-   * project.json, a stat each), or when it read it {@link STORED_NAME_MAX_AGE_MS} ago or more. A
-   * lookup by name read every project.json at every call before (list_projects's listing): 202
+   * project.json, a stat each), when it read it {@link STORED_NAME_MAX_AGE_MS} ago or more, or when
+   * it found no name then (no project.json yet); list_projects's listing gives it the names it reads
+   * (refreshStoredNames). A lookup by name read every project.json at every call before: 202
    * requests per call with 200 projects on WebDAV. A project this server loads is read again once
    * it is closed (it may have been renamed here). Projects deleted here are left out (stillDeleted),
    * and loaded rooms nobody uses that storage does not list are checked as list_projects checks
@@ -706,7 +762,15 @@ export class RoomManager {
       entry.lastModified ??
       (store.fs.etag ? await store.fs.etag(store.infoPath(id)) : undefined);
     const known = this.storedNames.get(id);
-    if (known && tag !== undefined && known.tag === tag && now - known.readAt < STORED_NAME_MAX_AGE_MS)
+    // (a missing name is read again at every lookup: a folder whose project.json another writer has
+    // not written yet, while it creates the project, gets one without a change the listing reports)
+    if (
+      known &&
+      known.name !== null &&
+      tag !== undefined &&
+      known.tag === tag &&
+      now - known.readAt < STORED_NAME_MAX_AGE_MS
+    )
       return known;
     let info: ProjectInfo | null = null;
     try {

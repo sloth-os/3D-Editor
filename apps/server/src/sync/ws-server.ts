@@ -1,13 +1,20 @@
 import { STATUS_CODES, type IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { PROJECT_DELETED_CLOSE_CODE, isValidProjectId } from '@3d-editor/core';
+import {
+  MSG_CONTROL,
+  OUT_OF_MEMORY_CLOSE_CODE,
+  PROJECT_DELETED_CLOSE_CODE,
+  encodeJsonFrame,
+  isValidProjectId,
+} from '@3d-editor/core';
 import type { ServerConfig } from '../config';
 import { isAuthorized, pathnameOf } from '../auth';
 import type { Log } from '../observability/log';
 import { errorMessage } from '../observability/tracing';
 import type { RoomManager } from './room-manager';
-import type { SyncConnection } from './room';
+import type { Room, SyncConnection } from './room';
+import { ProjectMemoryError } from './project-memory';
 
 const SYNC_PATH_RE = /^\/sync\/([^/]+)\/?$/;
 const KEEPALIVE_MS = 30_000;
@@ -88,7 +95,25 @@ export class SyncServer {
       return rejectUpgrade(socket, 401, 'unauthorized', { 'WWW-Authenticate': 'Bearer realm="3d-editor"' });
     }
     // null for a project deleted here within the hour (unless storage holds it again)
-    const room = await this.opts.rooms.open(projectId, { create: true });
+    let room: Room | null;
+    try {
+      room = await this.opts.rooms.open(projectId, { create: true });
+    } catch (err) {
+      if (!(err instanceof ProjectMemoryError)) throw err;
+      if (socket.destroyed) return;
+      // a stored project the server cannot load (RoomManager.load): the reason, then the close code
+      // a room closes a connection with whose changes the project cannot take
+      this.wss.handleUpgrade(req, socket, head, (ws) => {
+        ws.send(
+          encodeJsonFrame(MSG_CONTROL, { kind: 'error', message: err.message, code: 'OUT_OF_MEMORY' }),
+          {
+            binary: true,
+          },
+        );
+        this.refuse(ws, projectId, OUT_OF_MEMORY_CLOSE_CODE, 'project too large for the server');
+      });
+      return;
+    }
     if (socket.destroyed) return;
     if (!room) {
       // Browsers cannot read the status of a refused upgrade (they see code 1006, as for a lost

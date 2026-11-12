@@ -175,6 +175,17 @@ export function modifierDisabledReason(mod: ModifierData, ctx: ModifierDisabledC
 }
 
 /**
+ * What a disabled modifier does, as Apply's refusal, get_scene's problems and the Modifiers tab say
+ * it: "the <label> modifier '<name>' <reason>, so it changes nothing" (see
+ * {@link modifierDisabledReason}), or null when it is not disabled.
+ */
+export function modifierDisabledMessage(mod: ModifierData, ctx: ModifierDisabledContext): string | null {
+  const reason = modifierDisabledReason(mod, ctx);
+  if (!reason) return null;
+  return `the ${registry.get(mod.type)?.label ?? mod.type} modifier '${mod.name}' ${reason}, so it changes nothing`;
+}
+
+/**
  * The type of object `id` as an evaluation context tells it (see ModifierContext.getObjectType):
  * without object types, an armature (with a pose) or a curve (with a path) where the context's
  * accessors make that certain, else not known (undefined).

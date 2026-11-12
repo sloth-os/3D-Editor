@@ -299,12 +299,14 @@ describe('ARMATURE modifier', () => {
     expect(ringCenter(s.evaluated().mesh!.positions, 0, SEG)[2]).toBeCloseTo(1, 6);
   });
 
-  it('reports missing armatures and vertex groups that do not match the mesh', () => {
+  it('leaves out an object that is not an armature and reports vertex groups that do not match the mesh', () => {
     const s = rigScene();
     const empty = s.doc.addObject({ type: 'EMPTY', name: 'Empty' });
     s.doc.updateObject(s.obj, { modifiers: [armatureModifier(empty)] });
+    // without an error, as Blender's is_disabled (MOD_armature.cc: `!amd->object ||
+    // amd->object->type != OB_ARMATURE`) leaves the modifier out
     let ev = s.evaluated();
-    expect(ev.modifierErrors[0].message).toMatch(/not an armature/);
+    expect(ev.modifierErrors).toEqual([]);
     expect(ev.mesh!.positions).toEqual(s.base.positions);
     s.doc.updateObject(s.obj, { modifiers: [armatureModifier(s.rig)] });
     s.doc.setVertexGroups(s.meshId, [{ name: 'Lower', weights: encodeFloat32([1, 1, 1]) }]);

@@ -1,9 +1,11 @@
 import {
+  buildCurvePath,
   cloneMesh,
   evaluateModifierStack,
   getModifierDef,
   listModifierDefs,
   modifierObjectParams,
+  modifierObjectRefusal,
   newId,
   registerBuiltinModifiers,
   safeJsonSchema,
@@ -40,7 +42,10 @@ function operatorsApply(o: ObjectData): boolean {
 
 /**
  * Resolves object references (by id or name) in a parameter patch of `type` to object ids
- * ('' or null clears them). Throws a ToolError for unknown objects or self references.
+ * ('' or null clears them). Throws a ToolError for unknown objects or self references, and, for a
+ * curve or text owner (whose stack is edited here, not by the operators), for an object of a type
+ * the parameter does not take, as object.modifier_add and object.modifier_set refuse it on a mesh
+ * (code INVALID_PARAMS; Blender's setter stores no such object).
  */
 export function resolveObjectParams(
   p: AgentProject,
@@ -63,6 +68,10 @@ export function resolveObjectParams(
       throw new ToolError(
         `Modifier parameter '${k}' cannot reference the modifier's own object '${owner.name}'.`,
       );
+    if (!operatorsApply(owner)) {
+      const refused = modifierObjectRefusal(type, k, ref);
+      if (refused) throw new ToolError(refused, 'INVALID_PARAMS');
+    }
     out[k] = ref.id;
   }
   return out;
@@ -466,6 +475,14 @@ function applyDirect(p: AgentProject, object: ObjectData, mod: ModifierData): vo
       const e = ev.byId.get(id);
       return e?.pose ? { pose: e.pose, matrix: e.worldMatrix } : null;
     },
+    // Curve modifier: the path of the curve where the scene shows it, as object.modifier_apply
+    getCurvePath: (id) => {
+      const e = ev.byId.get(id);
+      const path = e?.type === 'CURVE' && e.curve ? buildCurvePath(e.curve) : null;
+      return e && path ? { path, matrix: e.worldMatrix } : null;
+    },
+    // the types of the objects it names, which disable it as in the scene's evaluation
+    getObjectType: (id) => p.scene.getObject(id)?.type ?? null,
     vertexGroups: p.scene.getVertexGroups(object.data),
     forRender: false,
     editMode: false,

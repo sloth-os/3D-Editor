@@ -177,19 +177,25 @@ function refuseIncompleteGeometry(ctx: OperatorContext, ev: EvaluatedScene, targ
   const problems: string[] = [];
   // a stored mesh the host did not load (its evaluation error `mesh:<id>`) was refused for memory
   let unloaded = false;
+  // the evaluation's messages quote the objects they name by id ('<id>'): the refusal names them
+  const named = (message: string) =>
+    message.replace(/'([^'\s]+)'/g, (quoted, id: string) => {
+      const x = ctx.doc.getObject(id);
+      return x ? `'${x.name}'` : quoted;
+    });
   for (const o of selectedObjects(ctx)) {
     const curve = o.type === 'CURVE' || o.type === 'FONT';
     if (!curve && !(o.type === 'MESH' && o.modifiers.length)) continue;
     const e = ev.byId.get(o.id);
     const messages = (e?.modifierErrors ?? []).map(
       (m) =>
-        `${m.modifierId === 'shape_keys' ? 'shape keys' : `modifier '${o.modifiers.find((x) => x.id === m.modifierId)?.name ?? m.modifierId}'`}: ${m.message}`,
+        `${m.modifierId === 'shape_keys' ? 'shape keys' : `modifier '${o.modifiers.find((x) => x.id === m.modifierId)?.name ?? m.modifierId}'`}: ${named(m.message)}`,
     );
     // a curve problem leaves the object without geometry only when it has neither a surface nor a wire
     const noGeometry = !e?.mesh && !e?.lines;
     for (const err of ev.errors)
       if (err.source === `mesh:${o.id}` || (err.source === `curve:${o.id}` && noGeometry)) {
-        messages.push(err.message);
+        messages.push(named(err.message));
         if (err.source === `mesh:${o.id}`) unloaded = true;
       }
     if (messages.length) problems.push(`'${o.name}': ${messages.join('; ')}`);
@@ -588,8 +594,8 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       id: 'object.duplicate',
       label: 'Duplicate Objects',
       description:
-        'Duplicate selected objects (linked=true shares the object data, a mesh, curve, armature, light or camera, ' +
-        'like Alt+D). The copies become the selection. ' +
+        'Duplicate selected objects (linked=true shares the object data, a mesh, curve, text, armature, light or ' +
+        'camera, like Alt+D). The copies become the selection. ' +
         'References between duplicated objects (parents, modifier objects such as the Armature modifier, ' +
         'constraint and bone constraint targets, driver variables) point at the copies. As Blender does by ' +
         'default, each copy gets its own copy of the animation (keyframes and drivers) of the object and, ' +

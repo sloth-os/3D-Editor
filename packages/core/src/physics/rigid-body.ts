@@ -13,6 +13,7 @@ import {
 import type { AnimTargetType, CollisionShape, DriverData, FCurve } from '../doc/types';
 import { meshKey } from './mesh-key';
 import { clearCollisionShapeCache } from './shapes';
+import { checkSimulation, simulationCacheBytes, simulationOutsideHeapBytes } from './memory';
 import {
   Simulation,
   compareBodyOrder,
@@ -91,6 +92,55 @@ const caches = new WeakMap<object, CacheEntry>();
 const trackers = new WeakMap<object, { version: number }>();
 
 const cacheKey = (doc: SceneDoc): object => doc.ydoc ?? doc;
+
+/*
+ * The frames every cache keeps, for a host that counts its memory (the server: physics/memory.ts).
+ * The documents that have had a simulation are held weakly; a Y.Doc's cache is dropped when the
+ * document is destroyed (a closed project), so that its frames are neither kept nor counted.
+ */
+const simulatedKeys = new Set<WeakRef<object>>();
+const registeredKeys = new WeakSet<object>();
+
+function registerCache(key: object): void {
+  if (registeredKeys.has(key)) return;
+  registeredKeys.add(key);
+  simulatedKeys.add(new WeakRef(key));
+  const y = key as { on?: (event: 'destroy', f: () => void) => void };
+  if (typeof y.on === 'function') y.on('destroy', () => caches.delete(key));
+}
+
+/** Bytes the frames of `entry`'s simulation keep (physics/memory.ts), or only those outside the heap. */
+function entryBytes(entry: CacheEntry | undefined, outsideHeap: boolean): number {
+  const sim = entry?.sim;
+  if (!sim) return 0;
+  const bodies = { simulated: sim.outputs.length, kinematic: sim.kinematic.length };
+  const frames = sim.current - sim.frameStart;
+  return outsideHeap ? simulationOutsideHeapBytes(bodies, frames) : simulationCacheBytes(bodies, frames);
+}
+
+/**
+ * Bytes the rigid body cache of `doc` keeps: the frames simulated so far (physics/memory.ts
+ * simulationCacheBytes; 0 when nothing is cached). They stay until the simulation's inputs change,
+ * rigidbody.cache_free drops them or the document is destroyed.
+ */
+export function rigidBodyCacheBytes(doc: SceneDoc): number {
+  return entryBytes(caches.get(cacheKey(doc)), false);
+}
+
+/**
+ * Bytes the rigid body caches of every document of this process keep (see
+ * {@link rigidBodyCacheBytes}); with `outsideHeap`, only the part outside the JavaScript heap
+ * (physics/memory.ts simulationOutsideHeapBytes), which V8's heap statistics leave out.
+ */
+export function rigidBodyCachesBytes(opts: { outsideHeap?: boolean } = {}): number {
+  let bytes = 0;
+  for (const ref of simulatedKeys) {
+    const key = ref.deref();
+    if (key) bytes += entryBytes(caches.get(key), !!opts.outsideHeap);
+    else simulatedKeys.delete(ref);
+  }
+  return bytes;
+}
 
 /** Token that changes whenever the document may have changed (null: unknown, always re-check). */
 function changeToken(doc: SceneDoc): string | null {
@@ -270,6 +320,7 @@ function validEntry(
         shapeSource: sim ?? (reuse && { shapes: reuse.shapes, spareShapes: reuse.spareShapes }),
       };
       caches.set(key, entry);
+      if (sim) registerCache(key);
     } else {
       entry.token = token;
       // the animation of kinematic bodies may have changed: re-check cached frames lazily
@@ -340,6 +391,14 @@ export class RigidBodySimulator {
         entry.kinematicVerified = f;
       }
     }
+    // a host that keeps its memory in bounds (the server) refuses frames whose cache does not fit
+    if (sim.current < need)
+      checkSimulation(
+        { simulated: sim.outputs.length, kinematic: sim.kinematic.length },
+        need,
+        need - sim.current,
+        doc,
+      );
     while (sim.current < need) sim.advance(sim.kinematic.length ? host.transformsAt(sim.current + 1) : null);
     entry.kinematicVerified = Math.max(entry.kinematicVerified, need);
     return sim.matrices(target);

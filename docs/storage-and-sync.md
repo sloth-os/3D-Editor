@@ -83,7 +83,10 @@ project at the same moment. Every writer:
   `the shutdown ran out of time before storage saved their changes`, and logs
   `shutdown timed out after <n> s, exiting`. A second SIGTERM or SIGINT during the shutdown does
   not stop it (`shutdown already running, signal ignored` at `warn`); a second signal used to end
-  the server at once, without those lines. SIGKILL still ends it at once.
+  the server at once, without those lines. SIGKILL still ends it at once. The server also ends
+  when the reader of its output closed the pipe meanwhile: it writes the lines it still holds once,
+  as far as the pipe takes them, and exits (its exit used to wait for ever on such a pipe). Its
+  render processes stop before it exits.
 - **Does not bring back deleted projects** (next section).
 
 `SYNC_PERSISTENCE=disk` checks `If-Match` and writes in one step under a lock, gives each version a
@@ -222,29 +225,34 @@ nothing.
   in storage with the same name (a browser does not check names), or with the exact name when the
   loaded one matched only ignoring letter case. The listing for a name lists the projects folder
   once (WebDAV: one PROPFIND) and reads the `project.json` of a stored project that the server has
-  not loaded only when it has not read it before, when the listing reports another ETag or
+  not loaded only when it has not read it before, when it had no `project.json` then (a writer
+  that creates a project writes its document first), when the listing reports another ETag or
   modification time for its folder (where it reports neither, as the disk does: another ETag of the
-  `project.json`, a stat), or a minute after it last read it (WebDAV servers whose folders keep
+  `project.json`, a stat), or a minute after it last read it; `list_projects` reads every
+  `project.json`, and a lookup then compares the names it read. WebDAV servers whose folders keep
   their ETag when a file in them is written again tell no change: a project that another writer
-  renamed is compared by its new name within a minute there); a project the server loads is read
-  again once it is closed. It read every `project.json` at every lookup before (202 requests per
-  call with 200 projects on WebDAV). The lookups that come while a listing goes on share it. When
-  the server has loaded a project of that name, a lookup waits 5 s at most in all for storage (the
-  check of the name as an id, then the listing), and not for the listing while a read of a loaded
-  project of that name that a request stopped waiting for goes on; when the listing fails, or has
-  not answered by then, a name that a loaded project has finds that project among the loaded
-  projects only (the tool's result says so in `project_note`, `delete_project` deletes nothing by
-  such a name, and the error when several loaded projects have the name says so too; while the
-  listing goes on, the request waits for none of that project's reads, so get_project waits 5 s in
-  all), and a name that none has waits for storage as long as it takes (for the check of the name as
-  an id, then the listing; 30 s per request with storage that does not answer). When the last
-  listing took longer than 5 s (storage that lists slowly), a lookup does not wait for one: a name
-  that one project has in the last listing that listed storage, made within the last minute, finds
-  that project at once (with a `project_note` that says how old that listing is), and a new listing
-  goes on; a name that it does not settle waits for that one (each round of listings used to cost a
-  lookup 5 s: 5 s every second or third call while listing took 6 s). A name that nothing matches
-  while listing storage fails, or reading some `project.json` files fails, gets an error that says
-  so and to try again once `list_projects` no longer has `storage_listing_failed: true`, instead of
+  renamed is compared by its new name within a minute there, or at once after `list_projects`
+  listed it. A project the server loads is read again once it is closed. It read every
+  `project.json` at every lookup before (202 requests per call with 200 projects on WebDAV). The
+  lookups that come while a listing goes on share it. When the server has loaded a project of that
+  name, a lookup waits 5 s at most in all for storage (the check of the name as an id, then the
+  listing), and not for the listing while a read of a loaded project of that name that a request
+  stopped waiting for goes on; when the listing fails, or has not answered by then, a name that a
+  loaded project has finds that project among the loaded projects only (the tool's result says so in
+  `project_note`, `delete_project` deletes nothing by such a name, and the error when several loaded
+  projects have the name says so too; while the listing goes on, the request waits for none of that
+  project's reads, so get_project waits 5 s in all), and a name that none has waits for storage as
+  long as it takes (for the check of the name as an id, then the listing; 30 s per request with
+  storage that does not answer). When the last listing took longer than 5 s (storage that lists
+  slowly), a lookup does not wait for one: a name that one project has in the last listing that
+  listed storage, made within the last minute, finds that project at once (with a `project_note`
+  that says how old that listing is), and a new listing goes on; a name that it does not settle
+  waits for that one (each round of listings used to cost a lookup 5 s: 5 s every second or third
+  call while listing took 6 s); one that a loaded project has waits for it 5 s at most in all (it
+  waited as long as that listing took), then the last listing answers: several projects with the
+  name are an error that says how old that listing is. A name that nothing matches while listing
+  storage fails, or reading some `project.json` files fails, gets an error that says so and to try
+  again once `list_projects` no longer has `storage_listing_failed: true`, instead of
   `There are no projects yet`.
 - The server that deleted a project closes sync connections to it for an hour (they would upload
   a browser's copy as a new project), but lists and opens it as soon as storage holds it again
@@ -355,6 +363,63 @@ server stops), `disk` (`DATA_DIR`, recommended for Docker so MCP-created project
 or `webdav`. Without it the server uses `webdav` when `WEBDAV_URL` is set, `disk` when `DATA_DIR`
 is set (the Docker image sets it), and `memory` otherwise; the active mode is logged at startup
 and reported by the MCP `get_project` tool.
+
+### Changes the server cannot hold
+
+The editor server keeps every project it has open in its own JavaScript heap. Its operators refuse
+what a project cannot take (`apps/server/src/render/memory.ts`: one project's meshes, objects,
+keyframes and images, with what a save of it takes for a moment, may take half of the heap less
+what the server keeps for its other work, the larger of 256 MB and a quarter of the heap; all open
+projects together have a limit too). Changes that browsers send are held against the same limits:
+
+- Before the server applies changes a sync connection sends (sync step 2 or an update), it measures
+  what they add in the terms these checks count (`apps/server/src/sync/update-size.ts`: new objects,
+  meshes and other datablocks, keyframes, drivers, mesh geometry with its shape keys and vertex
+  groups, and images): 3–15 µs for a small change (applying it takes 25–102 µs), 0.23–0.41 s for an
+  update of 10,000 linked cubes (8 MB; applying it takes 0.42–0.80 s), in runs on a machine shared
+  with other work. The measure takes memory by the structs of the update, not by the clock units
+  they declare (a few bytes can declare a billion). Changes and deletions of what the project has
+  are applied as before, also in a project already past its limit, so such a project can still be
+  edited and made smaller.
+- Changes the project cannot take are not applied: the server sends that connection an error with
+  code `OUT_OF_MEMORY` (for example "changes not applied on the server: they add 5,999 new objects
+  to the project, and the project's meshes, objects, keyframes and images would then take about 63
+  MB of memory … Delete objects and meshes the project no longer needs, then Save (Ctrl+S) to send
+  it to the server again"), logs `sync changes not applied: the project cannot take them` at `warn`,
+  and closes the connection with code 4507 (`OUT_OF_MEMORY_CLOSE_CODE`). The project's other
+  connections go on and get nothing of those changes.
+- The browser keeps the project with its changes (in IndexedDB, in its other tabs, and in WebDAV
+  when it saves there directly), says once why the server did not take them, shows
+  `Too large for server` in the status bar (sync status `refused`, a red dot; the tooltip has the
+  server's reason), and no longer connects to the server for that project by itself. Save (Ctrl+S)
+  or a reload connects again: once the person deleted what the project no longer needs, the server
+  takes the project again; else it refuses the changes again the same way.
+- WebDAV through the server (`WEBDAV_URL`) is the server's storage, which its rooms read and every
+  editor of the project syncs with. A browser with live sync writes the project's document there
+  only once the server answered that it holds what the write stores (a ping sent after the
+  connection's sync step 2: the server handles a connection's messages in order and answers none
+  after it refused its changes), waiting 20 s at most; after a refusal it writes nothing there until
+  the server answers so, also in a page loaded again. So changes the server did not take reach
+  neither its storage nor the other browsers; WebDAV's status shows `error` with "the server did not
+  take this project's changes, so WebDAV through it gets them only once it does", and Save (Ctrl+S)
+  first connects again, then writes once the server took the project. A browser without live sync
+  (turned off in its preferences) writes as before.
+- A stored project is loaded only when loading it and saving it once fits into the free heap, less
+  what the server keeps for its other work (`apps/server/src/sync/project-memory.ts` `loadNeed`: 4.5
+  times what its objects, datablocks and keyframes count, 6 times its images; measured: 451 MB for
+  10,000 linked cubes, estimated at 472 MB). Else MCP tools fail with code `OUT_OF_MEMORY` ("project
+  '<name>' (<id>) was not loaded on the server: loading it and saving it would take about 709 MB of
+  JavaScript heap for its 15,000 objects, … Open it again once the server has more heap free …, or
+  start the server with a larger heap (NODE_OPTIONS=--max-old-space-size=<MB>)"), the REST API
+  answers 507 with that message, browsers get it and close code 4507 (the browser says "The server
+  did not open this project: <reason>", shows what it holds of the project and does not sync it with
+  the server until Save or a reload), and the server logs
+  `project not loaded: the server cannot hold it` at `warn`.
+- A state another writer stored (a browser that saves what the server did not take to WebDAV
+  directly, or without live sync; another server) is not merged into the project the server has open
+  when it adds what the project cannot take: that save or refresh fails, logs
+  `changes in storage not merged: the project cannot take them` at `warn`, and is tried again later;
+  the server stores its own changes once storage holds a project it can take.
 
 ## Offline / PWA
 

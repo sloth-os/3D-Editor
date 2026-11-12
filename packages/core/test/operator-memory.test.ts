@@ -51,6 +51,8 @@ import {
   type GeometryMemoryRequest,
 } from '../src/eval';
 import { SceneDoc } from '../src/doc/scene-doc';
+import { stlImportSize } from '../src/io/import-size';
+import { defaultModifierParams } from '../src/modifiers';
 
 /*
  * Operators the server runs in its own process could exhaust its heap: one Subdivide of a grid of
@@ -336,23 +338,50 @@ describe('operator memory estimates', () => {
   });
 
   it('size imports from the file: a binary STL by the triangles its header declares, others by their size', () => {
-    // a binary STL of 1,000 triangles: an 84-byte header, then 50 bytes per triangle
+    // a binary STL of 1,000 triangles: an 84-byte header, then 50 bytes per triangle (two per quad of
+    // a grid of 25 × 20 quads, whose 26 × 21 corners the importer welds them to)
     const stl = new Uint8Array(84 + 50 * 1000);
-    new DataView(stl.buffer).setUint32(80, 1000, true);
+    const dv = new DataView(stl.buffer);
+    dv.setUint32(80, 1000, true);
+    let t = 0;
+    for (let y = 0; y < 20; y++)
+      for (let x = 0; x < 25; x++)
+        for (const tri of [
+          [x, y, x + 1, y, x + 1, y + 1],
+          [x, y, x + 1, y + 1, x, y + 1],
+        ]) {
+          for (let k = 0; k < 3; k++) {
+            dv.setFloat32(84 + 50 * t + 12 + 12 * k, tri[2 * k], true);
+            dv.setFloat32(84 + 50 * t + 16 + 12 * k, tri[2 * k + 1], true);
+          }
+          t++;
+        }
     expect(binaryStlTriangles(stl, stl.byteLength)).toBe(1000);
     // a header that does not match the size is not a binary STL
     expect(binaryStlTriangles(stl, stl.byteLength + 1)).toBeNull();
-    const stored = decodedMeshBytes({
+    // the welded vertices, counted from the positions' hashes (546 exactly)
+    const size = stlImportSize(bytesReader(stl));
+    expect(size).toMatchObject({ triangles: 1000, faces: 1000, corners: 3000 });
+    expect(Math.abs(size.vertices - 26 * 21)).toBeLessThanOrEqual(5);
+    // the peak decodes the triangles before welding; the project keeps the welded mesh with a UV layer
+    const decoded = decodedMeshBytes({
       vertices: 3000,
       faces: 1000,
       corners: 3000,
       uvs: false,
       colors: false,
     });
+    const stored = decodedMeshBytes({
+      vertices: size.vertices,
+      faces: 1000,
+      corners: 3000,
+      uvs: true,
+      colors: false,
+    });
     // one object with its mesh
     const object = newObjectsBytes({ objects: 1, datablocks: { meshes: 1 } });
     expect(importEstimate('stl', bytesReader(stl))).toEqual({
-      bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_STL_TRIANGLE * 1000 + stored + object.peak,
+      bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_STL_TRIANGLE * 1000 + decoded + object.peak,
       faces: 1000,
       addedStoredBytes: stored + object.stored,
       // a save of the project decodes the new object and its mesh's datablock, not the mesh's data
@@ -387,16 +416,17 @@ describe('operator memory estimates', () => {
       ])
         expect([...r.read(a, b)], `${a}-${b}`).toEqual([...bytes.subarray(a, b)]);
     }
-    // other formats, and STL files that are not binary, by their size
+    // OBJ files and STL files that are not binary: the peak by their size, the meshes kept as
+    // counted (none in these); files that are not what they claim by their size
     const text = new TextEncoder().encode('solid x\n  facet normal 0 0 1\n'.repeat(100));
-    for (const [format, data] of [
-      ['stl', text],
-      ['obj', text],
-      ['glb', stl],
+    for (const [format, data, kept] of [
+      ['stl', text, 0],
+      ['obj', text, 0],
+      ['glb', stl, IMPORT_STORED_BYTES_PER_FILE_BYTE * stl.byteLength],
     ] as const)
       expect(importEstimate(format, bytesReader(data)), format).toMatchObject({
         bytes: OPERATOR_FIXED_BYTES + IMPORT_BYTES_PER_FILE_BYTE * data.byteLength + object.peak,
-        addedStoredBytes: IMPORT_STORED_BYTES_PER_FILE_BYTE * data.byteLength + object.stored,
+        addedStoredBytes: kept + object.stored,
       });
     // tools that import without the registry (MCP import_model) ask the installed check the same,
     // with what the project keeps: its meshes decoded and its objects
@@ -411,6 +441,8 @@ describe('operator memory estimates', () => {
       // what a save of the project takes for its object and mesh datablock
       saveBytes: saveBytes(OBJECT_STORED_BYTES + DATABLOCK_STORED_BYTES.meshes),
       objects: 1,
+      // the server counts the project with its other open projects
+      doc: ctx.doc,
     });
     expect(projectStoredBytes(ctx.doc)).toBe(
       storedMeshBytes(ctx.doc) + OBJECT_STORED_BYTES + DATABLOCK_STORED_BYTES.meshes,
@@ -424,11 +456,12 @@ describe('operator memory estimates', () => {
     expect(r.estimate).toBeLessThan(r.peak * 3);
   }, 30_000);
 
-  it('keep the import estimate of a GLB whose meshes share accessors above its peak heap (V8 GC trace in a child process)', () => {
-    // 12 glTF meshes that use the accessors of one grid of 150 × 150 quads: 540,000 triangles decoded
-    // from a file of 0.6 MB, about 115 MB at the peak (round 10: estimated by its size, 47 MB)
-    const r = peak('import_scene.gltf', 150, { meshes: 12 }, 'shared-glb');
-    expect(r.estimate).toBeGreaterThanOrEqual(r.peak);
+  it('keep the import estimate of a GLB whose meshes share accessors 10% above its peak heap (V8 GC trace in a child process)', () => {
+    // 8 glTF meshes that use the accessors of one grid of 300 × 300 quads: 1,440,000 triangles
+    // decoded from a file of 3.1 MB, 386 MB at the peak (round 10: estimated by its size, 47 MB for
+    // 12 meshes of 150 × 150; round 11: 381 MB, at its peak)
+    const r = peak('import_scene.gltf', 300, { meshes: 8 }, 'shared-glb');
+    expect(r.estimate).toBeGreaterThanOrEqual(1.1 * r.peak);
     expect(r.estimate).toBeLessThan(r.peak * 3);
   }, 30_000);
 
@@ -837,6 +870,92 @@ describe('curve and text surfaces', () => {
     expect(e.lower).toBe('resolution_u, bevel_resolution or the number of spline points');
     // text to 2D curves builds no mesh
     expect(estimate('object.convert', { target: 'CURVE' })).toBeNull();
+  });
+});
+
+describe('modifier stacks', () => {
+  /**
+   * A grid of 50 × 50 quads (2,500 faces) in Object Mode, an empty, and the modifiers `mods(empty)`
+   * on the grid, written as a client of the document may write them (no operator checks them).
+   */
+  function stack(
+    mods: (empty: string) => { type: string; params?: Record<string, unknown>; show_viewport?: boolean }[],
+  ) {
+    const s = gridScene(50, false);
+    const empty = s.doc.addObject({ type: 'EMPTY', name: 'Cap' });
+    s.doc.updateObject(s.id, {
+      modifiers: mods(empty).map((m, i) => ({
+        id: `m${i}`,
+        name: `${m.type}.${i}`,
+        type: m.type,
+        show_viewport: m.show_viewport ?? true,
+        show_render: true,
+        show_in_editmode: false,
+        show_expanded: true,
+        params: { ...defaultModifierParams(m.type), ...m.params },
+      })),
+    });
+    const faces = (op: string, p: Record<string, unknown>) =>
+      estimateOperator(op, s.ctx, s.reg.parseParams(op, p))?.faces;
+    return { ...s, faces };
+  }
+
+  it("leave out the modifiers evaluation skips by their type's rule (Blender's is_disabled)", () => {
+    // an Array whose start cap is an empty: disabled, the evaluation makes no copies
+    const capped = stack((empty) => [{ type: 'ARRAY', params: { count: 100, start_cap: empty } }]);
+    expect(capped.faces('object.convert', { target: 'MESH' })).toBe(2500);
+    expect(capped.faces('export_scene.obj', {})).toBe(2500);
+    // the same Array without the cap: 100 copies
+    const copies = stack(() => [{ type: 'ARRAY', params: { count: 100 } }]);
+    expect(copies.faces('object.convert', { target: 'MESH' })).toBe(250_000);
+    // a Bevel of width 0 after a Subdivision Surface: disabled (else counted as if it bevelled every edge)
+    const bevel = stack(() => [
+      { type: 'SUBSURF', params: { levels: 1 } },
+      { type: 'BEVEL', params: { width: 0, segments: 20, limit_method: 'NONE' } },
+    ]);
+    expect(bevel.faces('object.convert', { target: 'MESH' })).toBe(10_000);
+    expect(bevel.faces('object.modifier_apply', { modifier: 'SUBSURF.0' })).toBe(10_000);
+  });
+
+  it("count the evaluation of the whole scene Apply runs first: the other objects' modifier results", () => {
+    const s = stack(() => [{ type: 'SUBSURF', params: { levels: 1 } }]);
+    const apply = () =>
+      estimateOperator(
+        'object.modifier_apply',
+        s.ctx,
+        s.reg.parseParams('object.modifier_apply', { modifier: 'SUBSURF.0' }),
+      )!.bytes;
+    const alone = apply();
+    // another grid whose Subdivision Surface makes 40,000 faces, which the evaluation keeps meanwhile
+    s.doc.addObject({
+      type: 'MESH',
+      name: 'Other',
+      data: s.doc.addMesh('Other', createGrid({ x_subdivisions: 50, y_subdivisions: 50 })),
+      modifiers: [
+        {
+          id: 'o0',
+          name: 'Subdivision',
+          type: 'SUBSURF',
+          show_viewport: true,
+          show_render: true,
+          show_in_editmode: false,
+          show_expanded: true,
+          params: { ...defaultModifierParams('SUBSURF'), levels: 2 },
+        },
+      ],
+    });
+    expect(apply() - alone).toBeGreaterThanOrEqual(
+      decodedMeshBytes({ vertices: 201 * 201, faces: 40_000, corners: 160_000, uvs: true, colors: false }),
+    );
+  });
+
+  it('count the modifier Apply applies also when the viewport hides it, as the operator applies it', () => {
+    const s = stack(() => [{ type: 'SUBSURF', params: { levels: 2 }, show_viewport: false }]);
+    // Convert evaluates with the viewport's settings: the hidden modifier does not run
+    expect(s.faces('object.convert', { target: 'MESH' })).toBe(2500);
+    expect(s.faces('object.modifier_apply', { modifier: 'SUBSURF.0' })).toBe(40_000);
+    expect(s.reg.run(s.ctx, 'object.modifier_apply', { modifier: 'SUBSURF.0' }).ok).toBe(true);
+    expect(s.doc.meshCounts(s.meshId)?.faces).toBe(40_000);
   });
 });
 

@@ -391,6 +391,51 @@ export interface RenderImageOptions {
   seed?: number;
 }
 
+/**
+ * A JPEG of `width` × `height` RGBA pixels read back from WebGL (bottom row first), scaled down to
+ * `maxW` pixels wide, each pixel the mean of up to 3 × 3 pixels of the area it covers; null without
+ * a 2D canvas. The project's thumbnail of a canvas read back without waiting for the GPU
+ * (ViewportEngine.readThumbnail).
+ */
+export function thumbnailJpeg(pixels: Uint8Array, width: number, height: number, maxW = 320): string | null {
+  const w = Math.max(1, Math.min(width, Math.round(maxW)));
+  const h = Math.max(1, Math.round((height * w) / width));
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  const img = ctx.createImageData(w, h);
+  const sx = width / w;
+  const sy = height / h;
+  const tx = Math.min(3, Math.ceil(sx));
+  const ty = Math.min(3, Math.ceil(sy));
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      for (let j = 0; j < ty; j++) {
+        // the image's top row is the last one WebGL reads
+        const row = height - 1 - Math.min(height - 1, Math.floor((y + (j + 0.5) / ty) * sy));
+        for (let i = 0; i < tx; i++) {
+          const k = (row * width + Math.min(width - 1, Math.floor((x + (i + 0.5) / tx) * sx))) * 4;
+          r += pixels[k];
+          g += pixels[k + 1];
+          b += pixels[k + 2];
+        }
+      }
+      const n = tx * ty;
+      const o = (y * w + x) * 4;
+      img.data[o] = r / n;
+      img.data[o + 1] = g / n;
+      img.data[o + 2] = b / n;
+      img.data[o + 3] = 255;
+    }
+  ctx.putImageData(img, 0, 0);
+  return c.toDataURL('image/jpeg', 0.7);
+}
+
 function cursorTexture(): THREE.Texture {
   const c = document.createElement('canvas');
   c.width = c.height = 64;
@@ -661,6 +706,36 @@ export class ViewportEngine {
   /** Changes asked for so far (invalidate, requestRender), and those the last frame drawn shows. */
   private changes = 0;
   private drawnChanges = 0;
+  /**
+   * The document revision (ProjectSession.revision) the canvas shows once the frames in flight are
+   * drawn: that of the frame the loop drew last; -1 while it shows none (no frame drawn yet, or a
+   * resize cleared it).
+   */
+  private canvasRevision = -1;
+  /** Frames the loop drew so far (the canvas shows the last one). */
+  private canvasFrames = 0;
+  /**
+   * The project's thumbnail as last copied from the canvas ({@link thumbnail}): the revision it
+   * shows, and the frame it was copied from ({@link canvasFrames}).
+   */
+  private thumb: { url: string; revision: number; frame: number } | null = null;
+  /**
+   * A thumbnail of the latest revision was asked for while the GPU drew a frame: the frame loop
+   * reads the canvas back once a frame of that revision was started ({@link readThumbnail}).
+   */
+  private thumbWanted = false;
+  /**
+   * The read back of the canvas for the project's thumbnail on its way ({@link readThumbnail}): the
+   * pixel buffer the GPU fills, its fence, the size of the canvas and the revision and frame it shows.
+   */
+  private thumbRead: {
+    buffer: WebGLBuffer;
+    fence: WebGLSync;
+    width: number;
+    height: number;
+    revision: number;
+    frame: number;
+  } | null = null;
   /** The samples per pixel the last frame drawn was drawn with ({@link FrameInFlight.samples}). */
   private drawnFrameSamples = 0;
 
@@ -680,10 +755,16 @@ export class ViewportEngine {
     if (this.canvas.dataset.view !== state) this.canvas.dataset.view = state;
   }
 
+  /** Whether no frame is in flight and nothing is left to draw: the canvas shows every change asked for. */
+  private get viewDrawn(): boolean {
+    return (
+      !this.framesInFlight.length && !this.dirty && !this.needsSync && this.drawnChanges === this.changes
+    );
+  }
+
   /** Says `drawn` (see {@link showViewState}) when no frame is in flight and nothing is left to draw. */
   private updateViewState(): void {
-    if (!this.framesInFlight.length && !this.dirty && !this.needsSync && this.drawnChanges === this.changes)
-      this.showViewState('drawn');
+    if (this.viewDrawn) this.showViewState('drawn');
   }
 
   private loop(now: number): void {
@@ -706,6 +787,11 @@ export class ViewportEngine {
     // an animated view change draws a frame on every animation frame until it ends (framePose)
     if (this.animating) this.dirty = true;
     if (!this.frameDone()) return;
+    // the project's thumbnail asked for while the GPU drew (thumbnail): read back without waiting
+    // for the GPU, from the frame that shows the latest document
+    this.finishThumbnail();
+    if (this.thumbWanted && !this.thumbRead && this.canvasRevision === this.session.revision.peek())
+      this.readThumbnail();
     if (!this.dirty && !this.needsSync) {
       resetFrameClock();
       return;
@@ -722,6 +808,9 @@ export class ViewportEngine {
     const settled = !this.unsettled;
     this.unsettled = false;
     this.sceneEnd.armed = true;
+    // (the scene was synced with the document as it is now: a change of it asks for a sync)
+    this.canvasRevision = this.session.revision.peek();
+    this.canvasFrames++;
     this.render(now);
     const samples = this.multisampling ? VIEWPORT_MSAA_SAMPLES : 0;
     this.noteDrawn(samples);
@@ -1275,6 +1364,8 @@ export class ViewportEngine {
     const pr = this.renderer.getPixelRatio();
     this.composer.setPixelRatio(pr);
     this.composer.setSize(w, h);
+    // resizing the canvas clears it: it shows no frame until the next one
+    this.canvasRevision = -1;
     this.requestRender();
   }
 
@@ -1451,8 +1542,16 @@ export class ViewportEngine {
     const { width, height } = this.renderSize(opts);
     const frame =
       typeof opts.frame === 'number' && Number.isFinite(opts.frame) ? opts.frame : this.session.state.frame;
-    // the page's heap: the viewport's evaluation, at the viewport's frame
-    const o: PathTraceOptions = { width, height, frame, pageFrame: this.session.state.frame };
+    // the page's own heap (its document and the viewport's evaluation, at the viewport's frame) and
+    // the geometry the evaluator of RASTER final renders keeps (which counts the path traced renders
+    // running in turn, evaluateFinal)
+    const o: PathTraceOptions = {
+      width,
+      height,
+      frame,
+      pageFrame: this.session.state.frame,
+      pageHeld: this.finalEval ? this.finalHeld : 0,
+    };
     if (opts.samples !== undefined) o.samples = opts.samples;
     if (opts.max_bounces !== undefined) o.max_bounces = opts.max_bounces;
     if (opts.denoise !== undefined) o.denoise = opts.denoise;
@@ -1898,7 +1997,7 @@ export class ViewportEngine {
   private evaluateFinal(frame: number): EvaluatedScene {
     const s = this.session;
     const estimate = estimateRender(s.doc, true, frame);
-    // the page's heap: the viewport's evaluation, at the viewport's frame
+    // the page's own heap: its document and the viewport's evaluation, at the viewport's frame
     const memory = tabMemoryWithRenders(pageHeapEstimate(s.doc, s.state.frame));
     const needs = rasterNeeds(estimate);
     const refusal = rasterRefusal(needs, memory);
@@ -1997,17 +2096,114 @@ export class ViewportEngine {
     return vc;
   }
 
-  /** Small JPEG of the current viewport for project thumbnails. */
+  /**
+   * A small JPEG of the viewport for the project's thumbnail: a frame that shows the document as it
+   * is (its revision), scaled down. The canvas keeps the last frame drawn (preserveDrawingBuffer), so
+   * no frame is drawn for it, which held the main thread for as long as the GPU drew it (0.55–0.95 s
+   * with 4 million triangles in software WebGL). A copy of the canvas waits for the frames the GPU
+   * still draws (1.16–1.28 s for the default cube while the animation played, in software WebGL):
+   * while the GPU draws one, the thumbnail is what the frame loop read back of a frame of this
+   * revision, without waiting ({@link readThumbnail}; the loop reads one back when asked); null until
+   * then, and while the viewport drew no frame (a hidden page draws none).
+   */
   thumbnail(maxW = 320): string | null {
+    const revision = this.session.revision.peek();
+    const last = this.thumb;
+    // the canvas shows the document as it is and the GPU draws nothing: a copy of it (the one made
+    // already when no frame was drawn since)
+    if (!this.framesInFlight.length && this.canvasRevision === revision)
+      return last?.frame === this.canvasFrames ? last.url : this.copyThumbnail(maxW);
+    if (last?.revision === revision) return last.url;
+    // (one on its way already)
+    if (this.thumbRead?.revision !== revision) this.thumbWanted = true;
+    return null;
+  }
+
+  /**
+   * Starts reading the canvas back for the project's thumbnail without waiting for the GPU (WebGL2):
+   * its pixels go into a buffer after the frames the GPU draws, and a fence says when they are there
+   * ({@link finishThumbnail}). Without WebGL2 (no frames in flight then), a copy of the canvas.
+   */
+  private readThumbnail(): void {
+    const gl = this.renderer.getContext?.();
+    const gl2 = gl && 'fenceSync' in gl ? (gl as WebGL2RenderingContext) : null;
+    if (!gl2) {
+      if (!this.framesInFlight.length) this.copyThumbnail();
+      return;
+    }
+    if (gl2.isContextLost?.()) return;
+    const width = gl2.drawingBufferWidth;
+    const height = gl2.drawingBufferHeight;
+    const buffer = gl2.createBuffer();
+    if (!buffer || !(width > 0) || !(height > 0)) return;
+    // what three.js has bound stays bound
+    const read = gl2.getParameter(gl2.READ_FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
+    const pack = gl2.getParameter(gl2.PIXEL_PACK_BUFFER_BINDING) as WebGLBuffer | null;
+    gl2.bindFramebuffer(gl2.READ_FRAMEBUFFER, null);
+    gl2.bindBuffer(gl2.PIXEL_PACK_BUFFER, buffer);
+    gl2.bufferData(gl2.PIXEL_PACK_BUFFER, width * height * 4, gl2.STREAM_READ);
+    gl2.readPixels(0, 0, width, height, gl2.RGBA, gl2.UNSIGNED_BYTE, 0);
+    gl2.bindBuffer(gl2.PIXEL_PACK_BUFFER, pack);
+    gl2.bindFramebuffer(gl2.READ_FRAMEBUFFER, read);
+    const fence = gl2.fenceSync(gl2.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl2.flush();
+    if (!fence) {
+      gl2.deleteBuffer(buffer);
+      return;
+    }
+    this.thumbWanted = false;
+    this.thumbRead = {
+      buffer,
+      fence,
+      width,
+      height,
+      revision: this.canvasRevision,
+      frame: this.canvasFrames,
+    };
+  }
+
+  /**
+   * Makes the project's thumbnail of the canvas read back ({@link readThumbnail}) once the GPU has
+   * put it into its buffer, without waiting for the frames drawn since: one task of 28–277 ms while
+   * the default cube's animation played in software WebGL (12–261 ms of it to take the 1067 × 631
+   * pixels from the buffer, the rest to scale them down and encode them), where a copy of the
+   * canvas waited 1.16–1.28 s.
+   */
+  private finishThumbnail(maxW = 320): void {
+    const r = this.thumbRead;
+    if (!r) return;
+    const gl = this.renderer.getContext?.();
+    const gl2 = gl && 'fenceSync' in gl ? (gl as WebGL2RenderingContext) : null;
+    if (!gl2 || gl2.isContextLost?.()) {
+      this.thumbRead = null;
+      return;
+    }
+    if (gl2.getSyncParameter(r.fence, gl2.SYNC_STATUS) !== gl2.SIGNALED) return;
+    this.thumbRead = null;
+    gl2.deleteSync(r.fence);
+    const pixels = new Uint8Array(r.width * r.height * 4);
+    const pack = gl2.getParameter(gl2.PIXEL_PACK_BUFFER_BINDING) as WebGLBuffer | null;
+    gl2.bindBuffer(gl2.PIXEL_PACK_BUFFER, r.buffer);
+    gl2.getBufferSubData(gl2.PIXEL_PACK_BUFFER, 0, pixels);
+    gl2.bindBuffer(gl2.PIXEL_PACK_BUFFER, pack);
+    gl2.deleteBuffer(r.buffer);
+    const url = thumbnailJpeg(pixels, r.width, r.height, maxW);
+    if (url) this.thumb = { url, revision: r.revision, frame: r.frame };
+  }
+
+  /** Copies the canvas, scaled down to `maxW` pixels wide, into the project's thumbnail (a JPEG). */
+  private copyThumbnail(maxW = 320): string | null {
+    this.thumbWanted = false;
     try {
-      this.render();
       const src = this.renderer.domElement;
       const scale = maxW / Math.max(1, src.width);
       const c = document.createElement('canvas');
       c.width = Math.round(src.width * scale);
       c.height = Math.round(src.height * scale);
       c.getContext('2d')?.drawImage(src, 0, 0, c.width, c.height);
-      return c.toDataURL('image/jpeg', 0.7);
+      const url = c.toDataURL('image/jpeg', 0.7);
+      this.thumb = { url, revision: this.canvasRevision, frame: this.canvasFrames };
+      return url;
     } catch {
       return null;
     }
@@ -2015,6 +2211,14 @@ export class ViewportEngine {
 
   dispose(): void {
     cancelAnimationFrame(this.raf);
+    if (this.thumbRead) {
+      const gl = this.renderer.getContext?.() as WebGL2RenderingContext | undefined;
+      if (gl && !gl.isContextLost?.()) {
+        gl.deleteSync?.(this.thumbRead.fence);
+        gl.deleteBuffer?.(this.thumbRead.buffer);
+      }
+      this.thumbRead = null;
+    }
     if (this.capture) {
       this.capture.output.dispose();
       this.capture.unpremultiply.dispose();

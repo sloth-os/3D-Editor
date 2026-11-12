@@ -11,7 +11,7 @@ import { RoomManager, STORED_NAME_MAX_AGE_MS } from '../../src/sync/room-manager
 import { AgentSession, collectProjectNotes } from '../../src/mcp/agent';
 import { SLOW_LISTING_MAX_AGE_MS, listForName } from '../../src/mcp/project-storage';
 import { ServerMetrics } from '../../src/observability/metrics';
-import { silentLog } from '../../src/observability/log';
+import { silentLog, type Log } from '../../src/observability/log';
 import type { Persistence } from '../../src/persistence';
 
 /*
@@ -43,6 +43,8 @@ class NamesStore extends MemoryFileStore {
    */
   folderTag: string | undefined;
   readonly folderTags = new Map<string, string>();
+  /** The modification time the listing reports for a project folder, by name (and no ETag). */
+  readonly folderModified = new Map<string, string>();
   readonly failing = new Set<string>();
   override async list(dir: string): Promise<FileEntry[]> {
     this.lists++;
@@ -51,6 +53,8 @@ class NamesStore extends MemoryFileStore {
     if (this.failList) throw new Error('storage offline');
     const entries = await super.list(dir);
     return entries.map((e) => {
+      const lastModified = e.isDir ? this.folderModified.get(e.name) : undefined;
+      if (lastModified) return { ...e, lastModified };
       const etag = e.isDir ? (this.folderTags.get(e.name) ?? this.folderTag) : undefined;
       return etag ? { ...e, etag } : e;
     });
@@ -75,7 +79,7 @@ afterEach(async () => {
 });
 
 /** A server (RoomManager) whose projects are in `fs` (none: in memory), and a session of an agent. */
-function setup(opts: { fs?: NamesStore | null; openReadWaitMs?: number; ttlMs?: number } = {}) {
+function setup(opts: { fs?: NamesStore | null; openReadWaitMs?: number; ttlMs?: number; log?: Log } = {}) {
   const fs = opts.fs === undefined ? new NamesStore() : opts.fs;
   const store = fs ? new ProjectFileStore(fs, '/') : null;
   const persistence: Persistence = {
@@ -87,7 +91,7 @@ function setup(opts: { fs?: NamesStore | null; openReadWaitMs?: number; ttlMs?: 
   const rooms = new RoomManager({
     persistence,
     metrics: new ServerMetrics({ defaultMetrics: false }),
-    log: silentLog,
+    log: opts.log ?? silentLog,
     ttlMs: opts.ttlMs ?? 60_000,
     debounceMs: 10,
     serverVersion: 'test',
@@ -303,7 +307,9 @@ describe('AgentSession project names', () => {
 
   it('says which projects it compared when listing storage fails, or reading some project.json files does', async () => {
     const fs = new NamesStore();
-    const { rooms, store, session } = setup({ fs });
+    const warnings: { obj: unknown; msg?: string }[] = [];
+    const log: Log = { ...silentLog, warn: (obj, msg) => void warnings.push({ obj, msg }) };
+    const { rooms, store, session } = setup({ fs, log });
     const agent = session();
     const harbour = await rooms.createProject({ name: 'Harbour light', empty: true });
     const twin = await rooms.createProject({ name: 'Twin', empty: true });
@@ -327,6 +333,11 @@ describe('AgentSession project names', () => {
     await expect(agent.findProject('No such harbour')).rejects.toThrow(
       "Listing the projects in storage failed (the server logged 'listing projects failed'), so a project that is only in storage is not found by name now",
     );
+    // (the server logs it, as the errors say)
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(warnings.every((w) => w.msg === 'listing projects failed')).toBe(true);
+    expect(warnings[0].obj).toEqual({ err: 'storage offline' });
+    warnings.length = 0;
 
     // storage lists its projects, but one project.json cannot be read
     fs.failList = false;
@@ -340,6 +351,10 @@ describe('AgentSession project names', () => {
     await expect(agent.findProject('Broken stored')).rejects.toThrow(
       "Reading the project.json of some projects in storage failed (the server logged 'listing projects failed'), so a project among those is not found by name now",
     );
+    expect(warnings.map((w) => w.msg)).toEqual(['listing projects failed', 'listing projects failed']);
+    expect(warnings[0].obj).toEqual({
+      err: 'could not read the project.json of 1 of 5 stored projects (403 Forbidden)',
+    });
     fs.failing.clear();
     expect(await agent.findProject('Broken stored')).toEqual({ id: broken });
   });
@@ -427,6 +442,85 @@ describe('AgentSession project names', () => {
     await expect(agent.findProject('Beta site 2')).rejects.toThrow("Project 'Beta site 2' not found.");
     await store!.saveInfo(info(beta, 'Beta site 3'));
     expect(await agent.findProject('Beta site 3')).toEqual({ id: beta });
+  });
+
+  /*
+   * A WebDAV listing that reports a modification time and no ETag for each project folder: the
+   * project.json is read again when that time changes, and not while it stays (here storage has no
+   * ETags at all: without the modification time, a lookup would read every project.json each time).
+   */
+  it('reads a project.json again when the listing reports another modification time of its folder', async () => {
+    const fs = new NamesStore();
+    Object.defineProperty(fs, 'etag', { value: undefined });
+    const { store, session } = setup({ fs });
+    const agent = session();
+    const delta = await storedOnly(store!, 'Delta site');
+    fs.folderModified.set(delta, 'Thu, 01 Jan 2026 00:00:00 GMT');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    expect(await agent.findProject('Delta site')).toEqual({ id: delta });
+    const reads = fs.infoReads;
+    expect(await agent.findProject('delta site')).toEqual({ id: delta });
+    expect(fs.infoReads).toBe(reads);
+    // another writer renames it: its folder's modification time changes
+    await store!.saveInfo({ ...(await store!.loadInfo(delta))!, name: 'Delta site 2' });
+    fs.folderModified.set(delta, 'Thu, 01 Jan 2026 00:05:00 GMT');
+    expect(await agent.findProject('Delta site 2')).toEqual({ id: delta });
+    expect(fs.infoReads).toBe(reads + 2);
+  });
+
+  /*
+   * A lookup that listed a project folder whose project.json another writer had not written yet (it
+   * creates the project) kept that missing name while storage told no change of the folder: the
+   * project was not found by its name for STORED_NAME_MAX_AGE_MS (60 s). A missing name is read
+   * again at every lookup.
+   */
+  it('reads a project.json again that was missing when a lookup listed its folder', async () => {
+    const fs = new NamesStore();
+    fs.folderTag = '"same"';
+    const { store, session } = setup({ fs });
+    const agent = session();
+    const id = newUuid();
+    // the writer stores the document first, then project.json
+    await fs.write(store!.docPath(id), Y.encodeStateAsUpdate(new Y.Doc()));
+    vi.useFakeTimers({ toFake: ['Date'] });
+    await expect(agent.findProject('Being made')).rejects.toThrow("Project 'Being made' not found.");
+    const reads = fs.infoReads;
+    await store!.saveInfo({
+      id,
+      name: 'Being made',
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+      schema_version: 1,
+    });
+    expect(await agent.findProject('Being made')).toEqual({ id });
+    expect(fs.infoReads).toBe(reads + 1);
+    // once it has a name, it is compared as before (no read while the folder tells no change)
+    expect(await agent.findProject('being made')).toEqual({ id });
+    expect(fs.infoReads).toBe(reads + 1);
+  });
+
+  /*
+   * list_projects reads every project.json: a lookup by name compares the names it read, so a project
+   * another writer renamed is found by the name list_projects shows at once, also where storage tells
+   * no change of its folder (before, only STORED_NAME_MAX_AGE_MS after the lookup read it).
+   */
+  it('compares the names list_projects read', async () => {
+    const fs = new NamesStore();
+    fs.folderTag = '"same"';
+    const { rooms, store, session } = setup({ fs });
+    const agent = session();
+    const gamma = await storedOnly(store!, 'Gamma site');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    expect(await agent.findProject('Gamma site')).toEqual({ id: gamma });
+    await store!.saveInfo({ ...(await store!.loadInfo(gamma))!, name: 'Gamma site 2' });
+    // the folder tells no change: the name read before is compared
+    await expect(agent.findProject('Gamma site 2')).rejects.toThrow("Project 'Gamma site 2' not found.");
+    const listed = await rooms.listProjects();
+    expect(listed.map((p) => p.name)).toEqual(['Gamma site 2']);
+    const reads = fs.infoReads;
+    expect(await agent.findProject('Gamma site 2')).toEqual({ id: gamma });
+    await expect(agent.findProject('Gamma site')).rejects.toThrow("Project 'Gamma site' not found.");
+    expect(fs.infoReads).toBe(reads);
   });
 
   /*
@@ -574,6 +668,43 @@ describe('AgentSession project names', () => {
       await listForName(rooms, 0)
     ).finished;
     expect(await session().findProject('Harbour light')).toEqual({ id: harbour.id });
+  });
+
+  /*
+   * A name that a loaded project has waits 5 s at most in all for storage. While storage lists slowly,
+   * one that the last listing did not settle (a project only in storage has it too) waited for the new
+   * listing as long as it took (6 s here, 35 s with storage that did not answer): it waits until the
+   * deadline, then the last listing answers, here that several projects have the name.
+   */
+  it('answers a name that a loaded project has within the wait while storage lists slowly', async () => {
+    const fs = new NamesStore();
+    const waitMs = 5000;
+    const { rooms, store, session } = setup({ fs, openReadWaitMs: waitMs });
+    const loaded = await rooms.createProject({ name: 'Harbour light', empty: true });
+    const stored = await storedOnly(store!, 'Harbour light');
+    fs.listDelayMs = 6000;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    // the first listing takes 6 s: the lookup answers from the loaded projects after 5 s
+    const first = track(session().findProject('Harbour light'));
+    await vi.advanceTimersByTimeAsync(waitMs + 1);
+    expect(first).toMatchObject({ done: true, value: { id: loaded.id } });
+    await vi.advanceTimersByTimeAsync(1000);
+    // that listing found both: the name is not settled by it, and the new listing takes 6 s again
+    const second = track(failure(session().findProject('Harbour light')));
+    await vi.advanceTimersByTimeAsync(waitMs - 10);
+    expect(second.done).toBe(false);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(second).toEqual({
+      done: true,
+      value: `Several projects are named 'Harbour light': ${loaded.id}, ${stored}. Pass the project id instead. Storage took longer than 5 s to list its projects, so the projects in storage were compared as it listed them 5 s ago.`,
+    });
+    // a name that no loaded project has waits for the new listing (it ends 6 s after it began)
+    const made = await storedOnly(store!, 'Made since');
+    const fromNew = track(session().findProject('Made since'));
+    await vi.advanceTimersByTimeAsync(900);
+    expect(fromNew.done).toBe(false);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(fromNew).toEqual({ done: true, value: { id: made } });
   });
 
   /*

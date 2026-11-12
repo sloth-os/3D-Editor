@@ -178,16 +178,28 @@ describe('CURVE modifier', () => {
     expect(s.positions().errors[0].message).toMatch(/Vertex group/);
   });
 
-  it('reports missing or non-curve targets without failing the evaluation', () => {
+  it('leaves out a missing or non-curve object, as Blender does, and reports a curve without a path', () => {
+    // MOD_curve.cc is_disabled: `!cmd->object || cmd->object->type != OB_CURVES_LEGACY` (Blender
+    // clears the pointer of a deleted object)
     const s = scene(poly([pt([0, 0, 0]), pt([1, 0, 0])]), [1, 2, 3], { object: 'missing' });
     const r = s.positions();
     expect(r.p).toEqual([1, 2, 3]);
-    expect(r.errors[0].message).toMatch(/not a curve/);
+    expect(r.errors).toEqual([]);
+    const meshObject = scene(poly([pt([0, 0, 0]), pt([1, 0, 0])]), [1, 2, 3]);
+    const other = meshObject.doc.addObject({
+      type: 'MESH',
+      name: 'Other',
+      data: meshObject.doc.addMesh('Other', createMesh({ positions: [0, 0, 0], faces: [] })),
+    });
+    meshObject.doc.updateObject(meshObject.obj, { modifiers: [modifier({ object: other })] });
+    expect(meshObject.positions()).toEqual({ p: [1, 2, 3], errors: [] });
     const unset = scene(poly([pt([0, 0, 0]), pt([1, 0, 0])]), [1, 2, 3], { object: null }).positions();
     expect(unset.errors).toEqual([]);
     expect(unset.p).toEqual([1, 2, 3]);
     const degenerate = scene(poly([pt([1, 1, 1]), pt([1, 1, 1])]), [1, 2, 3]).positions();
-    expect(degenerate.errors).toHaveLength(1);
+    expect(degenerate.errors.map((e) => e.message)).toEqual([
+      expect.stringMatching(/^Object '\w+' is not a curve with at least two distinct points$/),
+    ]);
   });
 
   it('works without an evaluator context path provider', async () => {

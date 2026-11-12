@@ -76,9 +76,25 @@ export const DATABLOCK_ADD_BYTES: Readonly<Record<CountedKind, number>> = {
 
 /**
  * Heap one animation keyframe keeps in the document (its F-curve's JSON in the Yjs map): 97–104
- * measured (glTF imports of 300,000 to 900,000 keyframes), rounded up.
+ * measured (glTF imports of 300,000 to 900,000 keyframes), 77 for baked keyframes; rounded up.
  */
 export const KEYFRAME_STORED_BYTES = 120;
+
+/**
+ * Heap one F-curve keeps in the document besides its keyframes (its entry in the Yjs map, key and
+ * fields): 548 bytes measured with its one keyframe (anim.keyframe_insert on 10,000 objects, 90,000
+ * F-curves), rounded up.
+ */
+export const FCURVE_STORED_BYTES = 600;
+
+/**
+ * Heap one driver keeps in the document: 819 bytes measured for a driver of 240 characters of JSON
+ * (one variable), 1,935 for one of 989 (eight variables), 1.5 bytes per character more; rounded up:
+ * {@link DRIVER_STORED_BYTES} for a driver of up to {@link DRIVER_BASE_JSON_CHARS} characters,
+ * {@link OBJECT_JSON_STORED_BYTES} per character beyond.
+ */
+export const DRIVER_STORED_BYTES = 1_000;
+export const DRIVER_BASE_JSON_CHARS = 250;
 
 /**
  * Heap a save of the project takes for a moment in the server's process, beyond what the project
@@ -165,6 +181,12 @@ export function datablockExtraJsonChars(doc: SceneDoc, kind: CountedKind, id: st
   return y ? Math.max(0, JSON.stringify(y.toJSON()).length - DATABLOCK_BASE_JSON_CHARS[kind]) : 0;
 }
 
+/** Characters of the JSON of driver `key` beyond {@link DRIVER_BASE_JSON_CHARS} (0 when it is missing). */
+export function driverExtraJsonChars(doc: SceneDoc, key: string): number {
+  const d = doc.map('drivers').get(key) as unknown;
+  return d ? Math.max(0, JSON.stringify(d).length - DRIVER_BASE_JSON_CHARS) : 0;
+}
+
 /** Objects and datablocks an operator adds. */
 export interface NewObjects {
   objects: number;
@@ -190,10 +212,10 @@ export function newObjectsBytes(a: NewObjects): { peak: number; stored: number }
 }
 
 /**
- * Live entries of one of the document's datablock maps, without reading them (Y.Map's `size` builds
- * an array of all its entries first).
+ * Live entries of one of the document's datablock maps (or its F-curves or drivers), without reading
+ * them (Y.Map's `size` builds an array of all its entries first).
  */
-function blocks(doc: SceneDoc, kind: DatablockKind): number {
+function blocks(doc: SceneDoc, kind: DatablockKind | 'fcurves' | 'drivers'): number {
   let n = 0;
   for (const item of doc.map(kind)._map.values()) if (!item.deleted) n++;
   return n;
@@ -202,20 +224,74 @@ function blocks(doc: SceneDoc, kind: DatablockKind): number {
 /**
  * Heap one shape key keeps per vertex of its mesh (its positions, stored with the mesh's datablock):
  * 15.3 and 15.4 measured (glTF imports of a mesh on a grid of 150 × 150 with 16 and 32 morph targets,
- * against the same mesh without them), rounded up. A save of the project reads them in place (0.3
- * MB more for four such meshes of 32 keys), so they count once.
+ * against the same mesh without them), rounded up. A save of the project copies their positions
+ * outside the JavaScript heap ({@link SAVE_BYTES_PER_LAYER_BYTE}).
  */
 export const SHAPE_KEY_STORED_BYTES_PER_VERTEX = 16;
 
+/**
+ * What a save of a project takes for a moment per byte of its meshes' vertex group weights and shape
+ * key positions (binary data the document keeps as it is, like images): the save copies them as it
+ * encodes, reads back and merges the project's state, 4.5 and 4.7 times their bytes measured as
+ * resident memory (the second save, to a disk store, of projects holding 97 MiB of vertex groups and
+ * 61 MiB of shape keys), rounded up. (The JavaScript heap does not show these copies: measured with
+ * --trace-gc a save took next to nothing for them.)
+ */
+export const SAVE_BYTES_PER_LAYER_BYTE = 6;
+
+/**
+ * Bytes of the positions of stored mesh `id`'s shape keys (three floats per vertex and key), read in
+ * place (no copy of them).
+ */
+export function shapeKeyBytes(doc: SceneDoc, id: string): number {
+  const keys = (doc.map('meshes').get(id) as { get(key: string): unknown } | undefined)?.get('shape_keys');
+  if (!Array.isArray(keys)) return 0;
+  let bytes = 0;
+  for (const k of keys) bytes += (k as { data?: { byteLength?: number } } | null)?.data?.byteLength ?? 0;
+  return bytes;
+}
+
+/**
+ * Bytes of the layers of stored mesh `id` that the document keeps as binary data: the weights of its
+ * vertex groups ({@link vertexGroupBytes}) and the positions of its shape keys ({@link shapeKeyBytes}).
+ */
+export function meshLayerBytes(doc: SceneDoc, id: string): number {
+  return vertexGroupBytes(doc, id) + shapeKeyBytes(doc, id);
+}
+
+/** Bytes of the vertex groups and shape keys of every mesh of the document ({@link meshLayerBytes}). */
+export function layerBytes(doc: SceneDoc): number {
+  let bytes = 0;
+  for (const id of doc.map('meshes').keys()) bytes += meshLayerBytes(doc, id);
+  return bytes;
+}
+
 /** Shape keys of stored mesh `id` (not counting its basis), read in place (no copy of their data). */
-function shapeKeyCount(doc: SceneDoc, id: string): number {
+export function shapeKeyCount(doc: SceneDoc, id: string): number {
   const keys = (doc.map('meshes').get(id) as { get(key: string): unknown } | undefined)?.get('shape_keys');
   return Array.isArray(keys) ? keys.length : 0;
 }
 
 /**
+ * Bytes of the weights of stored mesh `id`'s vertex groups (a float per vertex and group: an armature
+ * bound with automatic weights has a group per deforming bone), read in place (no copy of them). A save
+ * of the project copies them outside the JavaScript heap ({@link SAVE_BYTES_PER_LAYER_BYTE}).
+ */
+export function vertexGroupBytes(doc: SceneDoc, id: string): number {
+  const groups = (doc.map('meshes').get(id) as { get(key: string): unknown } | undefined)?.get(
+    'vertex_groups',
+  );
+  if (!Array.isArray(groups)) return 0;
+  let bytes = 0;
+  for (const g of groups)
+    bytes += (g as { weights?: { byteLength?: number } } | null)?.weights?.byteLength ?? 0;
+  return bytes;
+}
+
+/**
  * Decoded bytes of every mesh of the document, from their stored counts (not decoding them), and the
- * heap their shape keys keep ({@link SHAPE_KEY_STORED_BYTES_PER_VERTEX}).
+ * heap their shape keys ({@link SHAPE_KEY_STORED_BYTES_PER_VERTEX}) and vertex groups
+ * ({@link vertexGroupBytes}) keep.
  */
 export function storedMeshBytes(doc: SceneDoc): number {
   let bytes = 0;
@@ -225,6 +301,7 @@ export function storedMeshBytes(doc: SceneDoc): number {
     // with a UV layer: the decoded size errs on the safe side
     bytes += decodedMeshBytes({ ...c, uvs: true, colors: false });
     bytes += SHAPE_KEY_STORED_BYTES_PER_VERTEX * shapeKeyCount(doc, id) * c.vertices;
+    bytes += vertexGroupBytes(doc, id);
   }
   return bytes;
 }
@@ -252,7 +329,7 @@ export const PROJECT_JSON_SAMPLE = 32;
  */
 function sampledExtraJson(
   doc: SceneDoc,
-  kind: DatablockKind,
+  kind: DatablockKind | 'drivers',
   count: number,
   chars: (id: string) => number,
 ): number {
@@ -271,15 +348,32 @@ function sampledExtraJson(
 }
 
 /**
- * Objects of the document and the heap they, their datablocks and the keyframes of their animation
- * keep (see {@link projectStoredBytes}): each at its constant, and the characters of their JSON
- * beyond the default ones (modifiers, constraints and other settings of objects; splines of curves,
- * bones of armatures) at {@link OBJECT_JSON_STORED_BYTES} each, counted from up to
- * {@link PROJECT_JSON_SAMPLE} objects and datablocks of each kind.
+ * Objects of the document and the heap they, their datablocks and their animation (F-curves and
+ * their keyframes, drivers) keep (see {@link projectStoredBytes}): each at its constant, and the
+ * characters of their JSON beyond the default ones (modifiers, constraints and other settings of
+ * objects; splines of curves, bones of armatures; variables of drivers) at
+ * {@link OBJECT_JSON_STORED_BYTES} each, counted from up to {@link PROJECT_JSON_SAMPLE} objects,
+ * datablocks and drivers of each kind; and the bytes of its images ({@link storedImageBytes}).
+ * `save`: what a save of the project takes for a moment beyond that ({@link saveBytes} of its
+ * objects, datablocks and keyframes, {@link SAVE_BYTES_PER_IMAGE_BYTE} of its images,
+ * {@link SAVE_BYTES_PER_LAYER_BYTE} of its meshes' vertex groups and shape keys, `layers` bytes,
+ * which {@link storedMeshBytes} counts with the meshes).
  */
-export function projectObjects(doc: SceneDoc): { objects: number; bytes: number } {
+export function projectObjects(doc: SceneDoc): {
+  objects: number;
+  bytes: number;
+  save: number;
+  layers: number;
+} {
   const objects = blocks(doc, 'objects');
-  let bytes = OBJECT_STORED_BYTES * objects + KEYFRAME_STORED_BYTES * keyframes(doc);
+  const drivers = blocks(doc, 'drivers');
+  const images = storedImageBytes(doc);
+  const layers = layerBytes(doc);
+  let bytes =
+    OBJECT_STORED_BYTES * objects +
+    KEYFRAME_STORED_BYTES * keyframes(doc) +
+    FCURVE_STORED_BYTES * blocks(doc, 'fcurves') +
+    DRIVER_STORED_BYTES * drivers;
   let extraJson = sampledExtraJson(doc, 'objects', objects, (id) => {
     const o = doc.getObject(id);
     return o ? extraJsonChars(o) : 0;
@@ -290,7 +384,33 @@ export function projectObjects(doc: SceneDoc): { objects: number; bytes: number 
     if (kind !== 'meshes')
       extraJson += sampledExtraJson(doc, kind, n, (id) => datablockExtraJsonChars(doc, kind, id));
   }
-  return { objects, bytes: bytes + OBJECT_JSON_STORED_BYTES * extraJson };
+  extraJson += sampledExtraJson(doc, 'drivers', drivers, (key) => driverExtraJsonChars(doc, key));
+  bytes += OBJECT_JSON_STORED_BYTES * extraJson;
+  return {
+    objects,
+    bytes: bytes + images,
+    save: saveBytes(bytes) + SAVE_BYTES_PER_IMAGE_BYTE * images + SAVE_BYTES_PER_LAYER_BYTE * layers,
+    layers,
+  };
+}
+
+/**
+ * What a save of a project takes for a moment per byte of its images (beyond the images it keeps):
+ * the save copies them as it encodes, reads back and merges the project's state, 3.0–4.0 times their
+ * bytes measured as resident memory (saves of projects with an image of 10, 40 and 80 MB to a disk
+ * store, the project stored before), rounded up.
+ */
+export const SAVE_BYTES_PER_IMAGE_BYTE = 5;
+
+/**
+ * Bytes of the document's images (their data, read in place). The document keeps them as they are,
+ * outside the JavaScript heap but in the server's memory all the same, so a project counts them with
+ * what it keeps, and a save of it with what it copies ({@link SAVE_BYTES_PER_IMAGE_BYTE}).
+ */
+export function storedImageBytes(doc: SceneDoc): number {
+  let bytes = 0;
+  for (const id of doc.map('images').keys()) bytes += doc.getImageBytes(id)?.byteLength ?? 0;
+  return bytes;
 }
 
 /**

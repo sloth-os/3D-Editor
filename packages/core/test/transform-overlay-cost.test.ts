@@ -23,12 +23,14 @@ import {
   createConstraint,
   createEditorState,
   createFCurve,
+  createOperatorRegistry,
   defaultBone,
   defaultPoseBone,
   insertKeyframe,
   selectionPivot,
   translation4,
   type ConstraintData,
+  type OperatorContext,
 } from '../src';
 
 /*
@@ -37,6 +39,19 @@ import {
  * objects) is read from the frame state the transform started from, and no dependency graph of
  * the whole scene is built again.
  */
+
+const reg = createOperatorRegistry();
+
+/** How many objects `run` evaluates (FrameState.world, by id). */
+function evaluatedDuring(run: () => void): number {
+  const world = vi.spyOn(FrameState.prototype, 'world');
+  try {
+    run();
+    return new Set(world.mock.calls.map(([id]) => id)).size;
+  } finally {
+    world.mockRestore();
+  }
+}
 
 describe('a pointer move of a transform', () => {
   it('evaluates only the moved object and the objects reading it, whatever the size of the scene', () => {
@@ -205,9 +220,9 @@ describe('a pointer move of a transform', () => {
   it('finds the pivot without evaluating the scene when a dependency cycle elsewhere does not reach the selection', () => {
     // six armatures with IK chains and objects on their bones (costly to evaluate), the selected
     // empty, and, in the second scene only, a cycle between two other empties (each copies the
-    // other's location): the pivot evaluates as many objects in both scenes, and costs about as
-    // much (0.8-1.0 times, measured here alternately; evaluating the whole scene first made it
-    // 3.7-4.0 times)
+    // other's location): in both scenes the pivot evaluates the selected empty alone, where
+    // evaluating the whole scene first evaluated all of its objects (a count, not a time: the
+    // times of the two scenes, a few milliseconds each, differ by more than that on a busy machine)
     const scene = (cycle: boolean) => {
       const doc = SceneDoc.create({ empty: true });
       let selected = '';
@@ -250,31 +265,75 @@ describe('a pointer move of a transform', () => {
       Object.assign(state, { selectedIds: [selected], activeId: selected });
       return { doc, state };
     };
-    const plain = scene(false);
-    const cyclic = scene(true);
-    const pivot = (s: typeof plain, frame: number) => {
-      s.state.frame = frame;
-      const t0 = performance.now();
-      expect(selectionPivot(s.doc, s.state, 'MEDIAN_POINT')).toEqual([5, 5, 0]);
-      return performance.now() - t0;
-    };
-    const evaluated = (s: typeof plain) => {
-      const world = vi.spyOn(FrameState.prototype, 'world');
-      try {
-        pivot(s, 1);
-        return new Set(world.mock.calls.map(([id]) => id)).size;
-      } finally {
-        world.mockRestore();
-      }
-    };
-    expect(evaluated(cyclic)).toBe(evaluated(plain));
-    const times: [number[], number[]] = [[], []];
-    for (let frame = 2; frame < 22; frame++) {
-      const order = frame % 2 ? [0, 1] : [1, 0];
-      for (const k of order) times[k].push(pivot(k ? cyclic : plain, frame));
+    for (const s of [scene(false), scene(true)]) {
+      expect(s.doc.listObjects().length).toBeGreaterThanOrEqual(133);
+      expect(
+        evaluatedDuring(() => expect(selectionPivot(s.doc, s.state, 'MEDIAN_POINT')).toEqual([5, 5, 0])),
+      ).toBe(1);
     }
-    const median = (l: number[]) => [...l].sort((a, b) => a - b)[l.length >> 1];
-    expect(median(times[1])).toBeLessThan(2 * median(times[0]));
+  });
+
+  /** The selected empty `Sel`, 400 other empties and, with `cycle`, two that copy each other's location. */
+  function emptiesScene(cycle: boolean) {
+    const doc = SceneDoc.create({ empty: true });
+    let sel = '';
+    doc.transact(() => {
+      sel = doc.addObject({ type: 'EMPTY', name: 'Sel', location: [5, 5, 0] });
+      for (let i = 0; i < 400; i++) doc.addObject({ type: 'EMPTY', name: `E${i}`, location: [i, 0, 0] });
+      if (cycle) {
+        const a = doc.addObject({ type: 'EMPTY', name: 'CycA' });
+        const b = doc.addObject({ type: 'EMPTY', name: 'CycB', location: [1, 0, 0] });
+        doc.updateObject(a, { constraints: [createConstraint('COPY_LOCATION', { target: b })] });
+        doc.updateObject(b, { constraints: [createConstraint('COPY_LOCATION', { target: a })] });
+      }
+    });
+    return { doc, sel };
+  }
+
+  it('places an Active Element pivot on an unselected active object without evaluating the scene, with a cycle elsewhere', () => {
+    for (const cycle of [false, true]) {
+      const { doc, sel } = emptiesScene(cycle);
+      const state = createEditorState();
+      Object.assign(state, { selectedIds: [sel], activeId: doc.resolveObject('E7')!.id });
+      // the selected empty (what the transform reads) and the active one
+      expect(
+        evaluatedDuring(() => expect(selectionPivot(doc, state, 'ACTIVE_ELEMENT')).toEqual([7, 0, 0])),
+      ).toBe(2);
+    }
+  });
+
+  it('evaluates only the moved object at the first pointer move, with a cycle elsewhere', () => {
+    for (const cycle of [false, true]) {
+      const { doc, sel } = emptiesScene(cycle);
+      const xf = new ObjectTransform(new FrameState(doc, 1), [sel], 'MEDIAN_POINT', 'TRANSLATE');
+      let out = new Map<string, readonly number[]>();
+      expect(evaluatedDuring(() => (out = xf.worlds(xf.channels(translation4([1, 0, 0]), [0, 0, 0]))))).toBe(
+        1,
+      );
+      expect([...out.keys()]).toEqual([sel]);
+      expect(out.get(sel)!.slice(12, 15)).toEqual([6, 5, 0]);
+    }
+  });
+
+  it('finds the Edit Mode pivot from the edited object and its parent alone, with a cycle elsewhere', () => {
+    for (const cycle of [false, true]) {
+      const { doc } = emptiesScene(cycle);
+      const holder = doc.addObject({ type: 'EMPTY', name: 'Holder', location: [0, 0, 2] });
+      const ctx: OperatorContext = {
+        doc,
+        state: createEditorState(),
+        origin: doc.origin,
+        source: 'test',
+        report: () => undefined,
+      };
+      expect(reg.run(ctx, 'mesh.primitive_cube_add', { name: 'M' }).ok).toBe(true);
+      doc.updateObject(ctx.state.activeId!, { parent: holder, location: [1, 0, 0] });
+      expect(reg.run(ctx, 'object.mode_set', { mode: 'EDIT' }).ok).toBe(true);
+      // the median of the cube's vertices is its origin
+      expect(
+        evaluatedDuring(() => expect(selectionPivot(doc, ctx.state, 'MEDIAN_POINT')).toEqual([1, 0, 2])),
+      ).toBe(2);
+    }
   });
 
   it('reads the scene from the document once for the gizmo’s pivot, which follows every frame change', () => {

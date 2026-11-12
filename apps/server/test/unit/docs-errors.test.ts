@@ -3,9 +3,13 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   BROWSER_UI_OPERATORS,
+  OUT_OF_MEMORY_CLOSE_CODE,
+  SAVE_BYTES_PER_LAYER_BYTE,
   SceneDoc,
+  bytesReader,
   createEditorState,
   createOperatorRegistry,
+  importEstimate,
   modifierObjectRefusal,
   modifierObjectTypes,
   registerBuiltinModifiers,
@@ -19,10 +23,12 @@ import {
   editorTimeoutMessage,
 } from '../../src/mcp/editor-commands';
 import {
+  AFTER_SAVE_HOLD_SECONDS,
   BROWSER_BUSY_FACTOR,
   BROWSER_RASTER_SECONDS,
   BUSY_FACTOR,
   BUSY_LOADS,
+  CHANGE_APPLY_SECONDS,
   FAST_SECONDS,
   FIRST_SHADING_SECONDS,
   LATER_SECONDS,
@@ -31,6 +37,8 @@ import {
   MILLIONS_SELECT_SECONDS,
   MILLIONS_SOLID_SECONDS,
   NEW_SHADER_SECONDS,
+  READ_HOLD_SECONDS,
+  SAVE_HOLD_SECONDS,
   SERVER_SOLID_SCENE_SECONDS,
   SERVER_SOLID_SECONDS,
   measured,
@@ -66,10 +74,14 @@ import { renderProcessExitError, sharedProcessError } from '../../src/render/poo
 import {
   checkMainThreadRender,
   refusedEvaluationMessage,
+  NAMED_OPEN_PROJECTS,
+  openProjectsMessage,
   operatorCheck,
   refusedOperatorMessage,
+  refusedSimulationMessage,
   storedMeshesMessage,
 } from '../../src/render/memory';
+import { ProjectMemoryError, loadRefusal, refusedChangesMessage } from '../../src/sync/project-memory';
 import { outOfMemoryReply } from '../../src/api/projects';
 import {
   browserUiOperator,
@@ -212,6 +224,79 @@ const HOLDS = {
   // a get_view that no hold overlapped, the editor idle, open loop every 100 ms: the longest of the
   // second verifier and of the second fix round
   GET_VIEW_IDLE_MS: [18, 38],
+  // the saves after an agent's transform_object of one grid (Room.save, PERSIST_DEBOUNCE_MS after the
+  // change): round 12's TEXTS agent (2026-11-12; probes open loop every 10 ms from a process of their own,
+  // a process watching the CPUs every 2 s; 19 calm saves: 6 and 2 with an editor open, 5 and 6 with none),
+  // round 11's third verifier (6 saves, an editor open), round 12's verifier and its fix round (the same
+  // probes, a process watching the CPUs every second; calm: other processes used less than a quarter
+  // of a CPU from 5 s before the change to 9 s after it; also saves after a person's move in an editor)
+  SAVE_MS: [
+    504, 500, 523, 544, 532, 508, 494, 511, 545, 554, 514, 497, 505, 499, 530, 565, 515, 518, 499,
+    // round 11's third verifier
+    605, 512, 509, 579, 498, 597,
+    // round 12's verifier (27 calm saves: 11 with an editor open, 12 with none, 4 after a person's move)
+    565, 507, 506, 495, 481, 554, 537, 518, 519, 494, 493, 637, 629, 553, 613, 692, 496, 518, 500, 530, 499,
+    525, 532, 549, 470, 558, 528,
+    // round 12's fix round (17 calm saves: 9 with an editor open, 6 with none, 2 after a person's move)
+    610, 519, 512, 492, 515, 604, 534, 513, 620, 658, 514, 522, 525, 563, 565, 546, 492,
+  ],
+  // on round 12's code (sync/room.ts: Room.guarded fingerprints the document it wrote, Room.save the
+  // stored state, storedPrint) every save held every request twice more, a fingerprint of the 134 MB
+  // each: round 12's TEXTS agent (38), its verifier (54) and its fix round (34), two after each save
+  SAVE_AFTER_MS: [
+    77, 71, 69, 67, 78, 61, 70, 66, 79, 69, 66, 69, 76, 65, 68, 73, 61, 58, 69, 54, 64, 69, 64, 70, 72, 62,
+    71, 71, 67, 68, 67, 76, 61, 65, 69, 62, 68, 61,
+    // round 12's verifier
+    77, 69, 71, 66, 67, 61, 58, 60, 67, 63, 79, 67, 61, 69, 72, 61, 70, 57, 68, 60, 69, 61, 93, 71, 73, 83,
+    67, 70, 70, 75, 81, 68, 70, 62, 65, 70, 69, 68, 66, 71, 58, 55, 81, 62, 73, 67, 61, 65, 64, 63, 70, 64,
+    58, 57,
+    // round 12's fix round
+    77, 62, 68, 56, 62, 63, 63, 64, 69, 62, 77, 76, 66, 74, 66, 73, 68, 68, 76, 75, 81, 72, 75, 66, 71, 66,
+    61, 67, 81, 67, 69, 62, 67, 58,
+  ],
+  // when they began after the save's hold had begun: the earliest and the latest (round 12)
+  SAVE_AFTER_START_MS: [721, 1124],
+  // when the first hold of a save began after the call that made the change had answered: the earliest
+  // and the latest (both round 11's third verifier's: a hold before 2 of its saves began at 1.53 and
+  // 1.56 s, and its saves at 1.70-2.00 s; round 12's at 1.63-1.74 s)
+  SAVE_START_MS: [1530, 2000],
+  // those holds before 2 saves (round 11's third verifier; none before round 12's)
+  SAVE_BEFORE_MS: [233, 152],
+  // the editor's main thread while it applied another agent's move of one grid among 4 million
+  // triangles: its long task right after the change (PerformanceObserver 'longtask'), round 12's calm runs
+  // (its TEXTS agent, then its verifier and its fix round)
+  APPLY_MS: [
+    191, 188, 168, 184, 169, 185, 176, 182, 178, 229, 178, 171, 169, 248, 209, 204, 233, 170, 168, 252, 182,
+    216, 213, 187, 169, 187, 169, 180,
+  ],
+  // a get_view sent then, which no hold overlapped: the longest of round 12's TEXTS agent, of round 11's
+  // third verifier, of round 12's verifier and of its fix round (each the first move after the editor
+  // had opened the project)
+  GET_VIEW_APPLY_MS: [231, 266, 290, 299],
+  // the project's thumbnail 3 s after a change (session.ts INDEX_UPDATE_MS), the viewport idle: the long
+  // tasks it made the first time after the editor opened the project (round 12's TEXTS agent, its
+  // verifier and its fix round; later ones made none: a task under 50 ms, the JPEG 5.7-18.6 ms of it)
+  THUMBNAIL_MS: [56, 69, 56, 54],
+};
+
+/** Seconds with two decimals, from milliseconds (605 ms: 0.61 s). */
+const secs = (ms: number) => (Math.round(ms / 10) / 100).toFixed(2);
+/**
+ * A range of hold times as the docs give it: from MARGIN_PERCENT less than the shortest to MARGIN_PERCENT
+ * more than the longest, rounded outward to 0.1 s, and the measured range.
+ */
+const holdRange = (ms: readonly number[]) => {
+  const pct = Number(MARGIN_PERCENT) / 100;
+  const lo = Math.min(...ms) / 1000;
+  const hi = Math.max(...ms) / 1000;
+  const down = Math.floor(Number((lo * (1 - pct) * 10).toFixed(6))) / 10;
+  const up = Math.ceil(Number((hi * (1 + pct) * 10).toFixed(6))) / 10;
+  return {
+    widened: `${down}–${up} s`,
+    measured: `${secs(Math.min(...ms))}–${secs(Math.max(...ms))} s`,
+    upTo: `${up} s`,
+    max: `${secs(Math.max(...ms))} s`,
+  };
 };
 
 /** The parts of NEW_SHADER_SECONDS: the range of the plastics and the longest time (the table's). */
@@ -290,7 +375,7 @@ describe('docs: error codes of refused render operators', () => {
     const full = { storedBytes: 700 * MB, saveBytes: 200 * MB, objects: 15_000 };
     const adds = { bytes: 1, faces: 6, objects: 1, addedStoredBytes: 11_000, addedSaveBytes: 33_000 };
     expect(check({ operator: 'mesh.primitive_cube_add', estimate: adds, ...full } as never)).toMatch(
-      /^not run on the server: the project's meshes and objects already take about 700 MB .*, and this operator would add to them\. /,
+      /^not run on the server: the project's meshes, objects, keyframes and images already take about 700 MB .*, and this operator would add to them\. Delete objects and meshes the project no longer needs$/,
     );
     expect(
       check({
@@ -301,8 +386,8 @@ describe('docs: error codes of refused render operators', () => {
     ).toBeNull();
     expect(row(mcp, quoted)).toContain(
       'When the project already needs more than that (grown in a browser editor or on a server with a ' +
-        'larger heap; meshes the server did not load count too), every operator that adds geometry or ' +
-        'objects is refused until some are deleted (`delete_objects`): ',
+        'larger heap; meshes the server did not load count too), every operator that adds geometry, ' +
+        'objects, keyframes or images is refused until some are deleted (`delete_objects`): ',
     );
     // what it needs: its meshes, objects and datablocks (MEM round 11: objects count too) and a save
     // of it (MEM fix round 2: the server's saves of projects at the ceiling ran it out of memory),
@@ -318,22 +403,69 @@ describe('docs: error codes of refused render operators', () => {
       2096 * MB,
     );
     const dottedWould = would
-      .replace(/\(\d+ times what its objects, datablocks and keyframes take\)/, '(…)')
+      .replace(/\(\d+ times what its objects, datablocks and keyframes take, \d+ times its images\)/, '(…)')
       .replace(/\(half of its [^)]*\)/, '(…)')
-      .replace(/[\d,]+ (MB|new objects|objects)/g, '… $1');
+      .replace(/\d[\d,]* (MB|new objects|objects)/g, '… $1');
     const kept = ' keeps for one project';
     expect(row(mcp, quoted)).toContain(
       `\`… ${dottedWould.slice('not run on the server: '.length, dottedWould.indexOf(kept) + kept.length)} …\``,
     );
     expect(row(mcp, quoted)).toContain(
-      "`… the project's meshes and objects would then take about … MB of JavaScript heap with … new objects " +
-        '(now … MB with … objects), and a save of it about … MB more for a moment (…): … MB in all, more than the ' +
-        "… MB the server's process keeps for one project …`",
+      "`… the project's meshes, objects, keyframes and images would then take about … MB of memory with … new " +
+        'objects (now … MB with … objects), and a save of it about … MB more for a moment (…): … MB in all, more ' +
+        "than the … MB the server's process keeps for one project …`",
     );
     expect(row(mcp, quoted)).toContain(
-      'for a save of it, which takes three times what its objects, datablocks and keyframes take for a moment',
+      'for a save of it, which takes three times what its objects, datablocks and keyframes take and five ' +
+        'times its images for a moment (and six times its vertex groups and shape keys, which the message then ' +
+        'names)',
     );
-    expect(would).toContain('(3 times what its objects, datablocks and keyframes take)');
+    // MEM's fix round 2: a project or operator with vertex groups or shape keys has their save named too
+    // (render/memory.ts savingClause, core SAVE_BYTES_PER_LAYER_BYTE)
+    expect(SAVE_BYTES_PER_LAYER_BYTE).toBe(6);
+    expect(file('../../src/render/memory.ts')).toContain(
+      "const layerPart = layers ? `, ${n(SAVE_BYTES_PER_LAYER_BYTE)} times its vertex groups and shape keys` : '';",
+    );
+    expect(would).toContain('(3 times what its objects, datablocks and keyframes take, 5 times its images)');
+    // round 12: one limit for all open projects (render/memory.ts openProjectsMessage), quoted as it says
+    // it, at most NAMED_OPEN_PROJECTS other projects named; a browser editor would not help with either
+    // limit: the server refuses its changes for the same reason (sync/room.ts)
+    const openRefusal = openProjectsMessage(
+      {
+        operator: 'object.duplicate',
+        estimate: {
+          bytes: 1,
+          faces: 6,
+          objects: 5000,
+          addedStoredBytes: 600 * MB,
+          addedSaveBytes: 0,
+          lower: 'X',
+        },
+        storedBytes: 0,
+        saveBytes: 400 * MB,
+        objects: 10,
+      } as never,
+      [
+        { name: 'Alpha', id: 'p1', kept: 300 * MB, save: 100 * MB },
+        { name: 'Beta', id: 'p2', kept: 250 * MB, save: 100 * MB },
+      ] as never,
+      2096 * MB,
+    );
+    const dottedOpen = openRefusal
+      .replace(/\(its [^)]*\)/, '(…)')
+      .replace(/'Alpha' \(p1\) [\d,]+ MB, 'Beta' \(p2\) [\d,]+ MB/, "'…' (…) … MB, …")
+      .replace(/\d[\d,]* (MB|new objects)/g, '… $1');
+    expect(row(mcp, quoted)).toContain(
+      `(\`… ${dottedOpen.slice('not run on the server: '.length, dottedOpen.indexOf('. Lower '))}\`, at most ` +
+        `${NAMED_OPEN_PROJECTS === 5 ? 'five' : NAMED_OPEN_PROJECTS} named; " with … new objects" is there when`,
+    );
+    expect(openRefusal).toMatch(
+      /\. Lower X, or delete objects and meshes the projects no longer need \(a project nobody has open, no editor and no MCP session, is unloaded after ROOM_IDLE_TTL_SECONDS, default 3600 s\)$/,
+    );
+    expect(row(mcp, quoted)).toContain(
+      ': a browser editor would not help, as the server refuses its changes for the same reason (the editor ' +
+        'then shows `Too large for server`).',
+    );
     // the import's (import_model): the same message after 'Import failed: ', with what to lower
     const imported = storedMeshesMessage(
       {
@@ -353,8 +485,67 @@ describe('docs: error codes of refused render operators', () => {
       2096 * MB,
     );
     expect(flat(mcp)).toContain(
-      `"Import failed: ${imported.replace(/[\d,]+ (MB|new objects|objects)/g, '… $1')}" (or what else the file has too much of)`,
+      `"Import failed: ${imported.replace(/\d[\d,]* (MB|new objects|objects)/g, '… $1')}" (without " with … ` +
+        'new objects" for a file of one object, and with what else the file has too much of in place of its ' +
+        'nodes: its size, its meshes, its keyframes, "the images embedded in the file (fewer or smaller ' +
+        'textures)", or for an OBJ file "the objects of the file (its o and g lines)")',
     );
+    // " with N new objects" only for more than one new object (render/memory.ts adds): an import of one
+    // object, or any operator that adds one, says "would then take about … MB of memory (now …"; with
+    // keyframes it names them too (the docs quoted " with … new objects" as if every refusal had it)
+    const oneObject = storedMeshesMessage(
+      {
+        operator: 'import_mesh.stl',
+        estimate: {
+          bytes: 1,
+          faces: 6,
+          objects: 1,
+          addedStoredBytes: 700 * MB,
+          addedSaveBytes: 0,
+          lower: 'X',
+        },
+        storedBytes: 100 * MB,
+        saveBytes: 30 * MB,
+        objects: 2000,
+      } as never,
+      2096 * MB,
+    );
+    expect(oneObject).toMatch(
+      /would then take about [\d,]+ MB of memory \(now [\d,]+ MB with 2,000 objects\)/,
+    );
+    const withKeys = storedMeshesMessage(
+      {
+        operator: 'object.duplicate',
+        estimate: {
+          bytes: 1,
+          faces: 6,
+          objects: 3,
+          keyframes: 40,
+          addedStoredBytes: 700 * MB,
+          addedSaveBytes: 0,
+          lower: 'X',
+        },
+        storedBytes: 100 * MB,
+        saveBytes: 30 * MB,
+        objects: 2000,
+      } as never,
+      2096 * MB,
+    );
+    expect(withKeys).toMatch(/MB of memory with 3 new objects and 40 new keyframes \(now /);
+    expect(row(mcp, quoted)).toContain(
+      '" with … new objects" is there when the operator adds more than one object, " with … new keyframes" ' +
+        'when it adds keyframes, and " with … new objects and … new keyframes" when both',
+    );
+    // what the core estimate names (operators/memory.ts IMPORT_LOWER)
+    const coreMemory = file('../../../../packages/core/src/operators/memory.ts');
+    for (const lower of [
+      "size: 'the size of the file (import fewer or simpler meshes)',",
+      "objects: 'the nodes (objects) of the file',",
+      "objBlocks: 'the objects of the file (its o and g lines)',",
+      "keyframes: 'the animation keyframes of the file',",
+      "images: 'the images embedded in the file (fewer or smaller textures)',",
+    ])
+      expect(coreMemory).toContain(lower);
     expect(
       row(
         guide,
@@ -654,19 +845,29 @@ describe('docs: browser editors', () => {
     expect(doc).toContain(
       'A screenshot waits until the frame the viewport is drawing is done, also a `SOLID` or `WIREFRAME` one',
     );
+    // round 12: the editor is busy too while it applies a change made elsewhere (an agent's move of one
+    // grid among 4 million triangles: HOLDS.APPLY_MS)
+    const apply = holdRange(HOLDS.APPLY_MS);
     expect(doc).toContain(
       "The other commands draw nothing themselves, but wait while the editor's main thread is busy: after the " +
         "viewport switched to `MATERIAL` or `RENDERED` for the first time (while it builds the scene's " +
         'materials; the rest of that frame holds up only screenshots), for the whole of a screenshot it draws, ' +
-        'and while it carries out a command: with 4 million triangles in `SOLID` shading a `select` took ' +
+        'while it carries out a command: with 4 million triangles in `SOLID` shading a `select` took ' +
         `${MILLIONS_SELECT_SECONDS} (see the table), as the statistics overlay counts the edges of every mesh ` +
-        'again (after a screenshot too).',
+        'again (after a screenshot too), and while it applies a change made elsewhere (by an agent or in ' +
+        "another editor): with 4 million triangles, an agent's move of one object held it " +
+        `${apply.widened} (${apply.measured} measured in the calm runs of round 12's TEXTS agents, widened like ` +
+        'the ranges above).',
     );
+    // round 12's verifier measured 0.248 s and its fix round 0.252 s, past the 0.24 s that 0.1-0.3 s held
+    expect(apply.widened).toBe('0.1–0.4 s');
+    expect(CHANGE_APPLY_SECONDS).toBe(apply.widened);
     // "tenths of a second" understated the measured 0.1-1.2 s (editor-costs.ts MILLIONS_SELECT_SECONDS)
     for (const text of agentTexts()) expect(text).not.toContain('tenths of a second');
     expect(joined(source('mcp/tools.ts'))).toContain(
       'while it carries out a command: with 4 million triangles in SOLID shading a select took ' +
-        `\${MILLIONS_SELECT_SECONDS}; the viewport's frames do not hold them up)`,
+        `\${MILLIONS_SELECT_SECONDS}, and while it applies a change made elsewhere: \${CHANGE_APPLY_SECONDS} for ` +
+        "an agent's move of an object among 4 million triangles; the viewport's frames do not hold them up)",
     );
     for (const text of [doc, flat(guide), joined(source('mcp/tools.ts'))])
       expect(text).not.toMatch(
@@ -838,8 +1039,13 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
     // agents, pooled (round 11's first verifier: 75 and 136 ms in four runs; its second verifier: 263
     // and 245 ms, and its second fix round 213 and 181 ms, in two runs each). Round 11's first fix
     // attached "unless the server held it up" only to the editor that was not busy, so the 0.4 s read
-    // as a bound of every get_view, also one the server held up (0.677 s)
+    // as a bound of every get_view, also one the server held up (0.677 s). Round 12: a get_view sent
+    // while the editor applied another agent's change, and the project's thumbnail 3 s after a change
+    // (round 11's third verifier: 0.49-0.64 s while the editor drew a frame for it; it copies the
+    // frame the canvas keeps since round 12's VIEW change)
     const doc = flat(mcp);
+    const getViewApply = holdRange(HOLDS.GET_VIEW_APPLY_MS);
+    const thumbnail = holdRange(HOLDS.THUMBNAIL_MS);
     expect(doc).toContain(
       `Leaving out the requests that the server held up (below), with 4 million triangles in \`SOLID\` shading, ` +
         `in ${M.GET_VIEW_RUNS} calm runs of ${M.GET_VIEW_AGENTS} agents (rounds 10 and 11), a \`get_view\` sent ` +
@@ -847,12 +1053,27 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
         `${M.GET_VIEW_DURING} after it, and one sent after it had answered, also while the viewport still drew ` +
         `its next frame, took at most ${M.GET_VIEW_AFTER} (the longest times measured, ${M.GET_VIEW_DURING_MAX} ` +
         `and ${M.GET_VIEW_AFTER_MAX} s, both right after the first \`select\` since the editor had opened the ` +
-        `project, widened by ${MARGIN_PERCENT} % and rounded up to 0.1 s); an editor that was not busy answered a ` +
-        `\`get_view\` within 0.1 s (${(Math.max(...HOLDS.GET_VIEW_IDLE_MS) / 1000).toFixed(3)} s measured).`,
+        `project, widened by ${MARGIN_PERCENT} % and rounded up to 0.1 s); one sent while the editor applied an ` +
+        `agent's move took at most ${getViewApply.upTo} too (${getViewApply.max} measured, in the calm runs of the ` +
+        'TEXTS agents of rounds 11 and 12); an editor that was not busy answered a `get_view` within 0.1 s ' +
+        `(${(Math.max(...HOLDS.GET_VIEW_IDLE_MS) / 1000).toFixed(3)} s measured). 3 s after a change the editor ` +
+        "also copies the frame its viewport drew into the project's thumbnail, which held it at most " +
+        `${thumbnail.upTo} with 4 million triangles (${thumbnail.max} measured in round 12, the viewport idle).`,
     );
     expect(
       Math.ceil((Math.max(...HOLDS.GET_VIEW_IDLE_MS) / 1000) * (1 + Number(MARGIN_PERCENT) / 100) * 10) / 10,
     ).toBe(0.1);
+    // "too": as long as a get_view during a command; the thumbnail 3 s after a change (session.ts), copied
+    // from the frame the canvas keeps (engine.ts), no frame drawn for it
+    expect(getViewApply.upTo).toBe(M.GET_VIEW_DURING);
+    expect(web('project/session.ts')).toContain('export const INDEX_UPDATE_MS = 3000;');
+    expect(web('viewport/engine.ts')).toContain("const url = c.toDataURL('image/jpeg', 0.7);");
+    expect(flat(guide)).toContain(
+      "and while it applies a change made elsewhere (a `get_view` sent while it applied another agent's move " +
+        `of an object among 4 million triangles answered at most ${getViewApply.upTo} after it; 3 s after a ` +
+        "change it also copies its viewport into the project's thumbnail, which took at most " +
+        `${thumbnail.upTo}).`,
+    );
     expect(doc).not.toContain('one sent after it had answered took at most 0.2 s');
     expect(doc).not.toContain('in milliseconds, unless the server held it up');
     expect(doc).not.toMatch(
@@ -870,18 +1091,26 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
    * running, more than the 0.60 s the first fix gave as the longest: such a get_view waits for the rest
    * of the hold, and answered at most 0.014 s after it had ended; and an editor's first open of 1.306 s.
    */
-  it("say how long the server holds up every request: the minute's read and an editor opening the project", () => {
+  it("say how long the server holds up every request: a save, the minute's read and an editor opening the project", () => {
     const doc = flat(mcp);
-    const range = (ms: readonly number[]) => {
-      const lo = Math.min(...ms) / 1000;
-      const hi = Math.max(...ms) / 1000;
-      const pct = Number(MARGIN_PERCENT) / 100;
-      const down = Math.floor(Number((lo * (1 - pct) * 10).toFixed(6))) / 10;
-      const up = Math.ceil(Number((hi * (1 + pct) * 10).toFixed(6))) / 10;
-      return { widened: `${down}–${up} s`, measured: `${lo.toFixed(2)}–${hi.toFixed(2)} s` };
-    };
-    const refresh = range(HOLDS.REFRESH_MS);
-    const open = range(HOLDS.OPEN_MS);
+    const save = holdRange(HOLDS.SAVE_MS);
+    const refresh = holdRange(HOLDS.REFRESH_MS);
+    const open = holdRange(HOLDS.OPEN_MS);
+    // when a save's first hold began, rounded outward to 0.1 s (not widened: the save is due
+    // PERSIST_DEBOUNCE_MS after the change, the hold begins once it has read the stored project)
+    const start =
+      `${(Math.floor(HOLDS.SAVE_START_MS[0] / 100) / 10).toFixed(1)}–` +
+      `${(Math.ceil(HOLDS.SAVE_START_MS[1] / 100) / 10).toFixed(1)} s`;
+    const before = `${secs(Math.min(...HOLDS.SAVE_BEFORE_MS))}–${secs(Math.max(...HOLDS.SAVE_BEFORE_MS))} s`;
+    // the two short holds after every save on round 12's code, and when they began after the save's,
+    // rounded outward to 0.1 s (not widened, as the save's start)
+    const after = holdRange(HOLDS.SAVE_AFTER_MS);
+    const afterStart =
+      `${(Math.floor(HOLDS.SAVE_AFTER_START_MS[0] / 100) / 10).toFixed(1)}–` +
+      `${(Math.ceil(HOLDS.SAVE_AFTER_START_MS[1] / 100) / 10).toFixed(1)} s`;
+    // saves of round 12's code: all but round 11's third verifier's 6 (the six values after the first 19)
+    const round12Saves = HOLDS.SAVE_MS.length - 6;
+    expect(HOLDS.SAVE_AFTER_MS.length).toBe(2 * round12Saves);
     // the longest measured (seconds, as measured), and the bound widened and rounded up to 0.1 s
     const afterMax = Math.max(...HOLDS.GET_VIEW_AFTER_HOLD_MS) / 1000;
     const afterHold = {
@@ -889,13 +1118,21 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
       measured: `${afterMax.toFixed(3)} s`,
     };
     expect(doc).toContain(
-      'The server itself holds up every request, `get_view` too, while it reads a project that a browser ' +
-        'editor has open back from storage and merges what it read into the open one, which it does once a ' +
-        'minute (to take in what other writers stored), and when a browser editor opens the project, while it ' +
-        'reads it back from storage (when no editor or agent had it open) and sends the editor what its own copy ' +
-        'lacks (all of it, for an editor that has none). With 4 million triangles (a stored document of 134 MB), ' +
-        "in the calm runs of this round's five TEXTS agents, the minute's read held them " +
-        `${refresh.widened} each time (${refresh.measured} measured, widened like the ranges above; the longest ` +
+      'The server itself holds up every request, `get_view` too, while it saves a project after a change, an ' +
+        "agent's or a person's (1.5 s after the last change, `PERSIST_DEBOUNCE_MS`, and at most 15 s after the " +
+        'first one it has not saved: it reads the stored project, merges it into the open one, encodes the ' +
+        'project, compares the two and writes it, then takes two fingerprints of what it wrote, to tell it from ' +
+        'what other writers store); while it reads a project that a browser editor has open back ' +
+        'from storage and merges what it read into the open one, which it does once a minute (to take in what ' +
+        'other writers stored); and when a browser editor opens the project, while it reads it back from storage ' +
+        '(when no editor or agent had it open) and sends the editor what its own copy lacks (all of it, for an ' +
+        'editor that has none). With 4 million triangles (a stored document of 134 MB), in the calm runs of the ' +
+        `TEXTS agents of rounds 11 and 12, a save held them ${save.widened} each time, starting ${start} after an ` +
+        `agent's change, with an editor open or none (${save.measured} measured in ${HOLDS.SAVE_MS.length} saves, ` +
+        `widened like the ranges above; before ${HOLDS.SAVE_BEFORE_MS.length} of round 11's 6, one more hold ` +
+        `of ${before}), and on round 12's code twice more, ${afterStart} after it began, for at most ` +
+        `${after.upTo} each while it takes the fingerprints (${after.measured} measured, after each of round ` +
+        `12's ${round12Saves} saves), the minute's read ${refresh.widened} (${refresh.measured} measured; the longest ` +
         'while an editor drew screenshots back to back or loaded the project), and an editor that opened the ' +
         `project without a copy of it ${open.widened} (${open.measured} measured; the longest when no editor or ` +
         'agent had it open). A request sent during a hold waits for the rest of it: a `get_view` sent with no ' +
@@ -910,18 +1147,47 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
     );
     expect(HOLDS.REFRESH_MS).toContain(HOLDS.GET_VIEW_HELD.holdMs);
     expect(doc).not.toMatch(/A request sent as a hold starts waits for all of it|waited up to 0\.60 s/);
+    // round 11's guide put the opening under "Once a minute" too
     expect(flat(guide)).toContain(
-      'Once a minute the server holds up every request while it merges what storage holds of a project ' +
-        `that an editor has open (${refresh.widened} with 4 million triangles), and while it sends a project ` +
-        `to an editor that has no copy of it yet (${open.widened}); a request sent during such a hold waits for ` +
-        'the rest of it.',
+      'The server holds up every request while it saves a project, 1.5 s after a change (at least every 15 s ' +
+        `while changes keep coming; ${save.widened} each time with 4 million triangles, then twice more, ` +
+        `${afterStart} after it began, for at most ${after.upTo} each), while it merges what ` +
+        `storage holds of a project that an editor has open, once a minute (${refresh.widened}), and while it ` +
+        `sends a project to an editor that has no copy of it yet (${open.widened}); a request sent during such a ` +
+        'hold waits for the rest of it.',
+    );
+    expect(flat(guide)).not.toContain('Once a minute the server holds up every request');
+    // editor_command's description and the timeout message of its commands other than screenshots give
+    // the holds too, as editor-costs.ts has them: the ranges made from the measurements above (round 12's
+    // fix round: the description gave a save 0.3-0.8 s and left out the two holds after it, and the
+    // timeout message named none of the server's holds, which a timeout_ms of a few seconds runs out in)
+    expect(SAVE_HOLD_SECONDS).toBe(save.widened);
+    expect(AFTER_SAVE_HOLD_SECONDS).toBe(after.upTo);
+    expect(READ_HOLD_SECONDS).toBe(`${open.widened.split('–')[0]}–${refresh.widened.split('–')[1]}`);
+    expect(save.widened).toBe('0.3–0.9 s');
+    expect(after.upTo).toBe('0.2 s');
+    expect(joined(source('mcp/tools.ts'))).toContain(
+      'and the server holds up every request, these too, while it saves a project 1.5 s after a change (and ' +
+        'twice more right after it), while it reads back from storage a project that an editor has open (once ' +
+        'a minute) and while it sends a project to an editor that opens it (with 4 million triangles ' +
+        '${SAVE_HOLD_SECONDS} for a save and at most ${AFTER_SAVE_HOLD_SECONDS} for each of the two after it, ' +
+        '${READ_HOLD_SECONDS} for the others).',
+    );
+    expect(editorTimeoutMessage('select', 10_000)).toContain(
+      "'select' waits while the editor's main thread is busy, and while the server holds up every request: " +
+        `while it saves a project after a change (with 4 million triangles ${save.widened}, then twice more for ` +
+        'at most ' +
+        `${after.upTo}), reads back from storage a project that an editor has open (once a minute) or sends a ` +
+        `project to an editor that opens it (${READ_HOLD_SECONDS}).`,
     );
     expect(flat(guide)).toContain(
       'with 4 million triangles in `SOLID` shading a `select` took ' +
         `${MILLIONS_SELECT_SECONDS}; a \`get_view\` sent then answered at most ${M.GET_VIEW_AFTER} after it, not ` +
         "waiting for the viewport's frames, when the server did not hold it up)",
     );
-    for (const text of [doc, flat(guide)]) expect(text).not.toMatch(/0\.3–0\.8 s|up to 0\.57 s/);
+    // round 11 first gave the minute's read 0.3-0.8 s (idle editors only); 0.3-0.8 s is now a save's
+    for (const text of [doc, flat(guide)])
+      expect(text).not.toMatch(/read held them 0\.3–0\.8 s|has open \(0\.3–0\.8 s|up to 0\.57 s/);
     // the minute's read: every 60 s, of rooms with connected editors (and rooms whose write to WebDAV
     // another writer may have replaced); a room nobody uses (no editor, no agent, no unsaved change)
     // is read back before it opens, unless it was read in the last 2 s; an editor that connects gets
@@ -935,6 +1201,21 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
     const room = source('sync/room.ts');
     expect(room).toContain('encodeFrame(MSG_SYNC, (enc) => syncProtocol.writeSyncStep1(enc, this.doc)),');
     expect(room).toContain('syncProtocol.readSyncMessage(decoder, enc, this.doc, conn);');
+    // a save: PERSIST_DEBOUNCE_MS (1.5 s) after the last change, at most 10 times that (at least 5 s)
+    // after the first unsaved one; it reads the stored project, merges it, encodes the project, compares
+    // the two and writes it (ProjectStore.syncDocument)
+    expect(source('config.ts')).toContain(
+      'PERSIST_DEBOUNCE_MS: z.coerce.number().int().min(0).default(1500),',
+    );
+    expect(room).toContain('const maxWait = Math.max(debounce * 10, 5000);');
+    expect(room).toContain('const due = Math.max(0, Math.min(debounce, this.firstDirtyAt + maxWait - now));');
+    expect(room).toContain('const res = await this.guarded(store).syncDocument(this.id, this.doc, {');
+    const store = file('../../../../packages/core/src/storage/project-store.ts');
+    expect(store).toContain('const remote = await this.loadDocument(id);');
+    expect(store).toContain("Y.applyUpdate(ydoc, update, opts.origin ?? 'storage');");
+    expect(store).toContain(
+      'if (remote && !updateAddsToState(remote.update, local)) return done(remote.etag, remote.update);',
+    );
     // a browser editor keeps a copy of the project in IndexedDB and asks for what it lacks
     expect(web('project/session.ts')).toContain(
       's.idb = new IndexeddbPersistence(projectDbName(id), s.doc.ydoc);',
@@ -955,12 +1236,12 @@ describe('docs: measured times', () => {
     expect(M.AGENTS).toBe(9);
     expect(doc).toContain(
       `Each range below pools the ${M.CALM_RUNS} calm runs of nine agents on 2026-11-09 and 2026-11-11 (the ` +
-        "TEXTS agent of round 9 in four passes and its two verifiers, this round's TEXTS agents and their three " +
+        "TEXTS agent of round 9 in four passes and its two verifiers, round 10's TEXTS agents and their three " +
         `verifiers) and runs from ${MARGIN_PERCENT} % less than the shortest to ${MARGIN_PERCENT} % more than the ` +
         `longest time measured, rounded outward to 0.1 s (to 1 s from 10 s on). ${M.LOO} Times with 4 million ` +
-        `triangles pool this round's ${M.RUNS_4M} runs only: on round 9's code the editor's statistics overlay ` +
+        `triangles pool round 10's ${M.RUNS_4M} runs only: on round 9's code the editor's statistics overlay ` +
         'counted the edges of every mesh each time it was updated, also after every slow frame, which took ' +
-        "seconds with 4 million triangles and held these steps up by seconds; this round's code counts them in a " +
+        "seconds with 4 million triangles and held these steps up by seconds; round 10's code counts them in a " +
         'fraction of that time. A `SOLID` screenshot there includes screenshots sent as soon as a `select` had ' +
         'answered, which waited for the frame the viewport drew then (a screenshot waits for the frames in ' +
         'progress), and a `select` selects sent as soon as a screenshot had answered.',
@@ -1470,8 +1751,19 @@ describe('docs: browser path traces and the Render window', () => {
       mcp,
       '`browser render failed: The RASTER render was not started: the geometry it evaluates at the render settings needs about … GB of JavaScript heap, …`',
     );
+    // a RASTER render whose heap is only the instances it evaluates (no geometry) names them and says to
+    // lower the instances, not the triangles (render/memory.ts rasterRefusal, LOWER_INSTANCES; round 12's
+    // rows said the triangles only)
+    expect(memory).toContain(
+      "const LOWER_INSTANCES = 'the instances (particle counts, instanced collections, objects in the scene)';",
+    );
+    expect(memory).toContain("'curve or text surface, modifier or shape key result'");
+    expect(memory).toContain('`Lower ${needs.triangles > 0 ? LOWER_TRIANGLES : LOWER_INSTANCES}.`');
     expect(rasterRow).toContain(
-      'the message says what to lower (the triangles) and the advice to render on the server (`renderer: "software"`). ' +
+      'the geometry the editor evaluates at the render settings (curve and text surfaces, modifier and shape key ' +
+        "results, particle and collection instances) would not fit into its tab's JavaScript heap; the message " +
+        'says what to lower (the triangles, or the instances when the render builds no curve or text surface, ' +
+        'modifier or shape key result) and the advice to render on the server (`renderer: "software"`). ' +
         'With `renderer: "auto"` the server renders the image, and `note` gives this reason',
     );
     expect(flat(mcp)).not.toContain('the message says what to lower (resolution, triangles)');
@@ -1481,7 +1773,8 @@ describe('docs: browser path traces and the Render window', () => {
         '`browser render failed: Path tracing was not started: …`, `browser render failed: The RASTER render was not started: …`',
       ),
     ).toContain(
-      "lower what the message names (the triangles; for a path trace that does not fit the tab's memory also the " +
+      'lower what the message names (the triangles, or the instances when a `RASTER` render builds no curve or ' +
+        "text surface, modifier or shape key result; for a path trace that does not fit the tab's memory also the " +
         'resolution), use `RASTER` where the message suggests it, or render on the server (`renderer: "software"`)',
     );
   });
@@ -1593,8 +1886,9 @@ describe('docs: projects in storage that others share', () => {
       "five when it has no `project.json`), when you pass the project's id. A name is looked up first: one " +
         'that could be an id (letters, digits, `-` and `_`) is tried as an id first (up to two more requests ' +
         'one after another), then storage is listed to compare the name with every project (one request, ' +
-        'then the `project.json` of each stored project that is new or changed since this server read it, or ' +
-        'that it read more than a minute ago), at most 5 s in all when this server has loaded a project of ' +
+        'then the `project.json` of each stored project that is new or changed since this server last read it, ' +
+        'that had none then, or that it read more than a minute ago), at most 5 s in all when this server has ' +
+        'loaded a project of ' +
         'that name; a project this server has not loaded is found by that listing instead of the first read ' +
         'of its `project.json`.',
     );
@@ -1605,9 +1899,18 @@ describe('docs: projects in storage that others share', () => {
     expect(source('mcp/agent.ts')).toContain(
       "note: foundWithout(r, match.id, 'slow', waitMs, earlier.ageMs)",
     );
+    // that listing counts while it is at most a minute old (project-storage.ts SLOW_LISTING_MAX_AGE_MS)
+    const storage = source('mcp/project-storage.ts');
+    expect(storage).toContain('export const SLOW_LISTING_MAX_AGE_MS = 60_000;');
+    expect(storage).toContain('if (last?.slow && last.names && now - last.at <= SLOW_LISTING_MAX_AGE_MS)');
+    expect(source('sync/room-manager.ts')).toContain('export const STORED_NAME_MAX_AGE_MS = 60_000;');
     expect(flat(mcp)).toContain(
       'or took longer than 5 s to list its projects the last time (the name is then compared with that ' +
-        'listing), the call deletes nothing',
+        'listing, while it is at most a minute old), the call deletes nothing',
+    );
+    expect(joined(source('mcp/tools.ts'))).toContain(
+      'or took longer than 5 s to list its projects the last time (the name is then compared with that listing, ' +
+        'while it is at most a minute old)',
     );
     // a deletion by a name that was not compared with every project deletes nothing (tools.ts
     // delete_project asks findProject for its note): another project in storage may have that name
@@ -2121,7 +2424,12 @@ describe("docs: other areas' messages (round 11)", () => {
       623 * MB,
       688 * MB,
     );
-    expect(flat(mcp)).toContain(`for example (one line): "Import failed: ${peak}"`);
+    // the example gives the file's counts, the memory as "…" (it depends on the heap and the project)
+    expect(flat(mcp)).toContain(
+      `for example (one line, for a GLB of 8 meshes that use the accessors of one grid of 300 × 300 quads): ` +
+        `"Import failed: ${peak.replace(/\d[\d,]* MB/g, '… MB')}"`,
+    );
+    expect(peak).toContain('for 8 meshes of about 1,440,000 faces in all and 8 new objects,');
     expect(peak).toContain(
       "(a browser editor runs it in its own memory: editor_command {command: 'run_operator', params: {operator: 'import_scene.gltf', params: {data_base64}}})",
     );
@@ -2144,9 +2452,10 @@ describe("docs: other areas' messages (round 11)", () => {
       } as never,
       688 * MB,
     );
-    const dotted = ceiling.replace(/[\d,]+ (MB|new objects|objects)/g, '… $1');
+    const dotted = ceiling.replace(/\d[\d,]* (MB|new objects|objects)/g, '… $1');
     expect(dotted).toContain(
-      'and a save of it about … MB more for a moment (3 times what its objects, datablocks and keyframes take): … MB in all, more than the … MB',
+      'and a save of it about … MB more for a moment (3 times what its objects, datablocks and keyframes take, ' +
+        '5 times its images): … MB in all, more than the … MB',
     );
     expect(flat(mcp)).toContain(`fails with "Import failed: ${dotted}"`);
     expect(ceiling).not.toContain('a browser editor');
@@ -2178,39 +2487,42 @@ describe("docs: other areas' messages (round 11)", () => {
     expect(doc.getObject(ctx.state.activeId!)!.modifiers.map((m) => m.name)).toEqual(['Boolean']);
     expect(flat(mcp)).toContain(`("${message}", \`code\` \`FAILED\` in \`run_operator\`)`);
     expect(joined(source('mcp/tools.ts'))).toContain(`'${message}'`);
-    // and one hidden in the viewport
+    // round 12 (BONE): as in Blender 4.2, Apply applies a modifier hidden in the viewport
+    // (object_modifier.cc, modifier_apply_obdata: "Force mode on the evaluated modifier, enforcing the
+    // modifier evaluation in the apply() functions", md_eval->mode |= eModifierMode_Realtime); round 11's
+    // refusal of it, and the texts that called it this editor's own, are gone
+    expect(registry.run(ctx, 'object.modifier_remove', { object: 'Box', modifier: 'Boolean' }).ok).toBe(true);
+    expect(registry.run(ctx, 'object.modifier_add', { type: 'SUBSURF' }).ok).toBe(true);
+    const box = () => doc.getObject(ctx.state.activeId!)!;
+    const sub = box().modifiers[0].name;
     expect(
-      registry.run(ctx, 'object.modifier_set', { object: 'Box', modifier: 'Boolean', show_viewport: false })
-        .ok,
+      registry.run(ctx, 'object.modifier_set', { object: 'Box', modifier: sub, show_viewport: false }).ok,
     ).toBe(true);
-    const hidden = registry.run(ctx, 'object.modifier_apply', { object: 'Box', modifier: 'Boolean' });
-    expect((hidden as { error: string }).error).toBe(
-      "Modifier 'Boolean' is disabled in the viewport; enable it before applying",
-    );
+    expect(registry.run(ctx, 'object.modifier_apply', { object: 'Box', modifier: sub }).ok).toBe(true);
+    expect(box().modifiers).toEqual([]);
     expect(flat(mcp)).toContain(
-      '"object.modifier_apply failed: Modifier \'Bevel\' is disabled in the viewport; enable it before applying"',
-    );
-    // that refusal is this editor's: Blender 4.2 applies a modifier hidden in the viewport
-    // (object_modifier.cc, ED_object_modifier_apply: "Force mode on the evaluated modifier, enforcing
-    // the modifier evaluation in the apply() functions", md_eval->mode |= eModifierMode_Realtime on a
-    // dependency graph built without visibility optimizations); round 11 credited it to Blender
-    expect(flat(mcp)).toContain(
-      'A modifier hidden in the viewport is refused too, unlike Blender, which applies it ("object.modifier_apply failed: Modifier',
+      'As in Blender, the modifier is applied also when it is hidden in the viewport (Blender turns it on for ' +
+        'the Apply), and the modifiers before it that are hidden in the viewport or can change nothing are ' +
+        'skipped and kept.',
     );
     expect(joined(source('mcp/tools.ts'))).toContain(
-      "A modifier hidden in the viewport is refused too ('… is disabled in the viewport; enable it before applying'), unlike Blender, which applies it.",
+      'As in Blender, the modifier is applied also when it is hidden in the viewport; modifiers before it ' +
+        'that are hidden in the viewport or can change nothing are skipped and kept.',
     );
-    for (const text of [flat(mcp), joined(source('mcp/tools.ts'))])
+    for (const text of agentTexts().concat(flat(guide))) {
+      expect(text).not.toContain('unlike Blender, which applies it');
+      expect(text).not.toContain('is disabled in the viewport; enable it before applying');
       expect(text).not.toMatch(/(nor|neither) is one hidden in the viewport/);
+    }
   });
 
   /*
    * BONE fix1: a modifier parameter that names an object takes the object types Blender stores there,
    * and object.modifier_add and object.modifier_set refuse another type. MCP add_modifier and
    * update_modifier run those operators on mesh objects only (modifiers.ts operatorsApply) and edit
-   * the stack of a curve or text object directly, without that check (checked live: an Armature
-   * modifier on a curve with a mesh as its object is stored with via 'document' and reports the
-   * error below in get_scene problems). The docs said only that these parameters take names or ids.
+   * the stack of a curve or text object directly; since round 12 (BONE) they refuse another type
+   * there too (modifiers.ts resolveObjectParams, code INVALID_PARAMS). A modifier whose object became
+   * of another type later changes nothing, as in Blender, and get_scene lists it.
    */
   it('say which object types modifier object parameters take, and where add_modifier refuses another', () => {
     registerBuiltinModifiers();
@@ -2227,14 +2539,16 @@ describe("docs: other areas' messages (round 11)", () => {
       'As in Blender, some take objects of one type only: a mesh for `BOOLEAN object`, `ARRAY start_cap` ' +
         'and `end_cap` and `SHRINKWRAP target`, an armature for `ARMATURE object`, a curve for `CURVE object`.',
     );
-    // the refusal the docs quote, as the tools give it (modifiers.ts prefixes the operator's error)
+    // the refusal the docs quote, as the tools give it (modifiers.ts prefixes the operator's error on a
+    // mesh; round 12 (BONE): on a curve or text owner the tool refuses it too, without the prefix)
     const refusal = modifierObjectRefusal('ARMATURE', 'object', { name: 'Box', type: 'MESH' });
     // both hints of object.convert (the docs named only the one to MESH)
     expect(doc).toContain(
-      `On a mesh object, \`add_modifier\` and \`update_modifier\` refuse an object of another type ("object.modifier_add failed: ${refusal}", ` +
-        '`object.modifier_set failed: …` for `update_modifier`; a curve or text where a mesh is needed adds ' +
-        '"(object.convert with target MESH makes it one)", a text where a curve is needed "(object.convert with ' +
-        'target CURVE makes it one)").',
+      '`add_modifier` and `update_modifier` refuse an object of another type and store nothing: on a mesh ' +
+        `object "object.modifier_add failed: ${refusal}" (\`object.modifier_set failed: …\` for ` +
+        '`update_modifier`), on a curve or text object the same message without that prefix; a curve or text ' +
+        'where a mesh is needed adds "(object.convert with target MESH makes it one)", a text where a curve is ' +
+        'needed "(object.convert with target CURVE makes it one)".',
     );
     for (const type of ['CURVE', 'FONT'])
       expect(modifierObjectRefusal('BOOLEAN', 'object', { name: 'Label', type })).toMatch(
@@ -2254,13 +2568,26 @@ describe("docs: other areas' messages (round 11)", () => {
       'if (!res.ok) throw new ToolError(`object.modifier_set failed: ${res.error}`);',
     );
     expect(modifiers).toContain("return o.type === 'MESH';");
+    expect(modifiers).toContain(
+      'const refused = modifierObjectRefusal(type, k, ref);\n      if (refused) throw new ToolError(refused, ' +
+        "'INVALID_PARAMS');",
+    );
+    // round 11 said the tools store it on a curve or text without that check
+    expect(doc).not.toContain('they store it without that check');
+    // what a modifier whose object is of another type does: nothing, and get_scene says so (core
+    // registry disabledObjectParam, as get_scene's problems word it)
     expect(doc).toContain(
-      'On a curve or text object they store it without that check (`via: "document"`); look at the ' +
-        '`problems` of `get_scene` then (an Armature modifier whose object is a mesh: "armature object not ' +
-        'found (or it is not an armature)").',
+      'As in Blender, a modifier whose object is of another type, or that has none (one deleted or ' +
+        'converted since), changes nothing: the viewport, renders, Convert and Apply leave it out, and ' +
+        "`get_scene` lists it in `problems` (\"Modifier is disabled: the Armature modifier 'Armature' has an " +
+        "object, 'Other', that is not an armature, so it changes nothing; change it with update_modifier or " +
+        'remove it with remove_modifier").',
     );
     expect(file('../../../../packages/core/src/modifiers/armature.ts')).toContain(
-      "throw new Error('armature object not found (or it is not an armature)');",
+      "disabled: (p, ctx) => disabledObjectParam(ctx, p.object, ['ARMATURE'], 'object', 'an armature'),",
+    );
+    expect(file('../../../../packages/core/src/modifiers/registry.ts')).toContain(
+      "return `has ${article} ${what}, '${ctx.objectName?.(id) ?? id}', that is not ${kind}`;",
     );
   });
 
@@ -2299,11 +2626,11 @@ describe("docs: other areas' messages (round 11)", () => {
       2096 * MB,
     );
     const dottedOver = over
-      .replace(/\(\d+ times what its objects, datablocks and keyframes take\)/, '(…)')
+      .replace(/\(\d+ times what its objects, datablocks and keyframes take, \d+ times its images\)/, '(…)')
       .replace(/\(half of its [^)]*\)/, '(…)')
-      .replace(/[\d,]+ (MB|objects)/g, '… $1');
+      .replace(/\d[\d,]* (MB|objects)/g, '… $1');
     expect(dottedOver).toBe(
-      "not run on the server: the project's meshes and objects already take about … MB of JavaScript heap with … objects, and a save of it about … MB more for a moment (…): … MB in all, more than the … MB the server's process keeps for one project (…), and this operator would add to them. Delete objects and meshes the project no longer needs",
+      "not run on the server: the project's meshes, objects, keyframes and images already take about … MB of memory with … objects, and a save of it about … MB more for a moment (…): … MB in all, more than the … MB the server's process keeps for one project (…), and this operator would add to them. Delete objects and meshes the project no longer needs",
     );
     expect(row(mcp, '`mesh.subdivide failed: not run on the server:')).toContain(
       `\`… ${dottedOver.slice('not run on the server: '.length)}\``,
@@ -2321,8 +2648,361 @@ describe("docs: other areas' messages (round 11)", () => {
       "'Project id or name (see list_projects): the exact name, or, when no project has it, the name in another letter case'",
     );
     expect(source('mcp/tools.ts')).not.toContain('exact project name');
+    // round 12: the instructions and the conventions of mcp.md said "exact name" for projects too
+    expect(MCP_INSTRUCTIONS).toContain(
+      'objects, materials and projects can be referenced by id or exact name (a project also by its name in ' +
+        'another letter case when no project has the exact one).',
+    );
+    expect(flat(mcp)).toContain(
+      '- Objects, materials and projects are referenced by id or exact name (a project also by its name in ' +
+        'another letter case when no project has the exact one).',
+    );
     expect(source('mcp/agent.ts')).toContain(
       'return exact.length > 0 ? exact : projects.filter((p) => p.name.toLowerCase() === name.toLowerCase());',
+    );
+  });
+});
+
+describe("docs: other areas' messages (round 12)", () => {
+  const MB = 1024 * 1024;
+
+  /*
+   * A refused operator says that a browser editor runs it in its own memory only where that helps:
+   * the free heap of the server's process. The limits of a project and of all open projects hold for
+   * the changes a browser editor sends too (sync/room.ts growthRefusal), so those refusals say what to
+   * delete instead. Round 11's run_operator and edit_mesh descriptions and the instructions offered the
+   * browser editor for every OUT_OF_MEMORY refusal, and import_model's for every import refusal.
+   */
+  it('offer a browser editor only for a refusal where it helps', () => {
+    const heap = refusedOperatorMessage(
+      {
+        estimate: { bytes: 900 * MB, faces: 4_000_000, lower: 'number_cuts', addedStoredBytes: 0 },
+        storedBytes: 0,
+      } as never,
+      600 * MB,
+      2096 * MB,
+    );
+    expect(heap).toMatch(/ to run it on the server \(a browser editor runs it in its own memory\)$/);
+    const project = storedMeshesMessage(
+      {
+        operator: 'object.array_place',
+        estimate: { bytes: 1, faces: 6, objects: 8000, addedStoredBytes: 400 * MB, addedSaveBytes: 300 * MB },
+        storedBytes: 100 * MB,
+        saveBytes: 30 * MB,
+        objects: 2000,
+      } as never,
+      2096 * MB,
+    );
+    const open = openProjectsMessage(
+      {
+        operator: 'object.duplicate',
+        estimate: { bytes: 1, faces: 6, objects: 5000, addedStoredBytes: 600 * MB, addedSaveBytes: 0 },
+        storedBytes: 0,
+        saveBytes: 400 * MB,
+        objects: 10,
+      } as never,
+      [{ name: 'Alpha', id: 'p1', kept: 300 * MB, save: 100 * MB }] as never,
+      2096 * MB,
+    );
+    for (const refusal of [project, open]) expect(refusal).not.toContain('browser editor');
+    // a browser editor's changes are held against the same limits (and say so to that editor)
+    const changes = refusedChangesMessage(
+      {
+        objects: 3,
+        datablocks: {},
+        keyframes: 0,
+        meshBytes: 0,
+        imageBytes: 0,
+        objectsPart: 1,
+        kept: 1,
+        saved: 1,
+      },
+      'CLAUSE',
+    );
+    expect(changes).toBe(
+      'changes not applied on the server: they add 3 new objects to the project, and CLAUSE. Delete objects and ' +
+        'meshes the project no longer needs, then Save (Ctrl+S) to send it to the server again',
+    );
+    // the texts that say what a browser editor does with an OUT_OF_MEMORY refusal name the exception
+    const exception =
+      'except when the project, or all the projects the server has open, would then need more than the server ' +
+      "keeps for them ('the project's … would then take about …' or 'the open projects' …'): the server refuses an " +
+      "editor's changes for the same reason";
+    const tools = joined(source('mcp/tools.ts'));
+    expect(tools).toContain(
+      `and a browser editor that has the project open runs it in its own memory, ${exception}`,
+    );
+    expect(tools).toContain(
+      `and a browser editor runs it in its own memory, ${exception}) or FAILED (the operator itself failed).`,
+    );
+    expect(MCP_INSTRUCTIONS).toContain(
+      'a browser editor runs it in its own memory, except when the project, or all the projects the server has ' +
+        'open, would then need more than the server keeps for them ("the project\'s … would then take about …" or ' +
+        '"the open projects\' …"): the server refuses an editor\'s changes for the same reason) or FAILED.',
+    );
+    expect(tools).toContain(
+      "When the server's free heap is too small, the message also says how a browser editor that has the project " +
+        'open runs the import in its own memory (editor_command run_operator with the file in base64); when the ' +
+        'project, or all the projects the server has open, would then need more than the server keeps for them ' +
+        "('the project's … would then take about …' or 'the open projects' …'), it does not, as the server refuses " +
+        "that editor's changes for the same reason.",
+    );
+    expect(row(mcp, '`OUT_OF_MEMORY`')).toContain(
+      'and a browser editor that has the project open runs it in its own memory, except when the project, or all ' +
+        'the projects the server has open, would then need more than the server keeps for them: the server refuses ' +
+        "an editor's changes for the same reason",
+    );
+    for (const text of [tools, MCP_INSTRUCTIONS])
+      expect(text).not.toMatch(/a browser editor (that has the project open )?runs it in its own memory\)/);
+  });
+
+  /*
+   * import_model counts each format as core importEstimate does (operators/memory.ts, io/import-size.ts):
+   * round 10 said "other files by their size"; reverting the clause passed every test (round 11's third
+   * verifier). Each part is checked against the estimate of a small file of that format.
+   */
+  it('say how import_model counts each format, as the estimate does', () => {
+    // the importer keeps a glTF file's embedded images as they are, without decoding them (core
+    // io/import-size.ts imageBytes, fileImageBytes): round 12 said its JSON makes the importer decode them
+    expect(joined(source('mcp/tools.ts'))).toContain(
+      "The import runs in the server's own process, which checks first that it has the memory for it, counted " +
+        'from the file: a binary STL by its triangles and distinct vertices, an ASCII STL by its size, faces and ' +
+        'vertices, an OBJ file by its size, objects, vertices and faces, a glTF file by the meshes, nodes and ' +
+        'keyframes its JSON makes the importer decode and by the images embedded in it, a PLY file by the ' +
+        'elements its body holds.',
+    );
+    expect(flat(mcp)).toContain(
+      'counted from the file: a glTF or GLB file by the meshes, nodes and keyframes its JSON makes the importer ' +
+        'decode and by the images embedded in it, which the importer keeps as they are (every mesh is decoded ' +
+        'into a mesh of its own, also where meshes share the same accessors; images the file links to by URL ' +
+        'are not counted), a PLY file by the elements its body holds (a header that declares more than that ' +
+        'fails the import with "Import failed: PLY data is truncated"), a binary STL by its triangles and ' +
+        'distinct vertices, an ASCII STL by its size, faces and vertices, an OBJ file by its size, objects, ' +
+        'vertices and faces.',
+    );
+    expect(file('../../../../packages/core/src/io/import-size.ts')).toContain(
+      'the importer keeps them as they are, without decoding them',
+    );
+    for (const text of [joined(source('mcp/tools.ts')), flat(mcp)])
+      expect(text).not.toContain('embedded images its JSON makes the importer decode');
+    const enc = (s: string) => new TextEncoder().encode(s);
+    const estimate = (format: string, data: Uint8Array) => importEstimate(format, bytesReader(data));
+    // binary STL: two triangles, with 4 or 6 distinct corners
+    const binary = (tris: number[][][]) => {
+      const dv = new DataView(new ArrayBuffer(84 + 50 * tris.length));
+      dv.setUint32(80, tris.length, true);
+      tris.forEach((t, i) =>
+        t.forEach((v, j) => v.forEach((c, k) => dv.setFloat32(84 + 50 * i + 12 * (j + 1) + 4 * k, c, true))),
+      );
+      return new Uint8Array(dv.buffer);
+    };
+    const shared = estimate(
+      'stl',
+      binary([
+        [
+          [0, 0, 0],
+          [1, 0, 0],
+          [0, 1, 0],
+        ],
+        [
+          [1, 0, 0],
+          [1, 1, 0],
+          [0, 1, 0],
+        ],
+      ]),
+    );
+    const apart = estimate(
+      'stl',
+      binary([
+        [
+          [0, 0, 0],
+          [1, 0, 0],
+          [0, 1, 0],
+        ],
+        [
+          [5, 0, 0],
+          [6, 1, 0],
+          [5, 1, 0],
+        ],
+      ]),
+    );
+    expect([shared.faces, apart.faces]).toEqual([2, 2]);
+    expect(apart.bytes).toBe(shared.bytes);
+    expect(apart.addedStoredBytes).toBeGreaterThan(shared.addedStoredBytes);
+    // ASCII STL: the same two facets, then 20,000 more bytes of blank space
+    const facet = (a: number[], b: number[], c: number[]) =>
+      `facet normal 0 0 1\nouter loop\nvertex ${a.join(' ')}\nvertex ${b.join(' ')}\nvertex ${c.join(' ')}\nendloop\nendfacet\n`;
+    const ascii = `solid a\n${facet([0, 0, 0], [1, 0, 0], [0, 1, 0])}${facet([1, 0, 0], [1, 1, 0], [0, 1, 0])}endsolid a\n`;
+    const small = estimate('stl', enc(ascii));
+    const padded = estimate('stl', enc(ascii + ' '.repeat(20_000)));
+    expect([small.faces, padded.faces]).toEqual([2, 2]);
+    expect(padded.addedStoredBytes).toBe(small.addedStoredBytes);
+    expect(padded.bytes).toBeGreaterThan(small.bytes);
+    // OBJ: two objects (an `o` line each), then 20,000 more bytes of a comment
+    const obj = 'o A\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\no B\nv 0 0 1\nv 1 0 1\nv 0 1 1\nf 4 5 6\n';
+    const objSmall = estimate('obj', enc(obj));
+    const objPadded = estimate('obj', enc(`${obj}#${' '.repeat(20_000)}\n`));
+    const objOne = estimate('obj', enc('o A\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n'));
+    expect(objSmall.faces).toBe(2);
+    expect(objSmall.objects!).toBeGreaterThan(objOne.objects!);
+    expect(objPadded.bytes).toBeGreaterThan(objSmall.bytes);
+    expect(objPadded.addedStoredBytes).toBe(objSmall.addedStoredBytes);
+    // PLY: a header that declares 100,000,000 vertices over a body of three counts three
+    const ply = (n: number) =>
+      enc(
+        `ply\nformat ascii 1.0\nelement vertex ${n}\nproperty float x\nproperty float y\nproperty float z\nend_header\n0 0 0\n1 0 0\n0 1 0\n`,
+      );
+    expect(estimate('ply', ply(100_000_000))).toEqual(estimate('ply', ply(3)));
+    // glTF: one mesh used by one node or by three, and an embedded image
+    const gltf = (nodes: number, image: boolean) =>
+      enc(
+        JSON.stringify({
+          asset: { version: '2.0' },
+          scene: 0,
+          scenes: [{ nodes: Array.from({ length: nodes }, (_, i) => i) }],
+          nodes: Array.from({ length: nodes }, () => ({ mesh: 0 })),
+          meshes: [{ primitives: [{ attributes: { POSITION: 0 } }] }],
+          buffers: [{ byteLength: 36, uri: `data:application/octet-stream;base64,${'A'.repeat(48)}` }],
+          bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 36 }],
+          accessors: [
+            { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', max: [1, 1, 0], min: [0, 0, 0] },
+          ],
+          ...(image ? { images: [{ uri: `data:image/png;base64,${'A'.repeat(400_000)}` }] } : {}),
+        }),
+      );
+    const one = estimate('gltf', gltf(1, false));
+    const three = estimate('gltf', gltf(3, false));
+    const withImage = estimate('gltf', gltf(3, true));
+    expect([one.objects, three.objects]).toEqual([1, 3]);
+    expect(three.faces).toBe(one.faces);
+    expect(withImage.bytes).toBeGreaterThan(three.bytes);
+    expect(withImage.lower).toBe('the images embedded in the file (fewer or smaller textures)');
+  });
+
+  /*
+   * SYNC: changes a browser editor sends that would take the project past what the server keeps for
+   * it are not applied (refusedChangesMessage, then close code OUT_OF_MEMORY_CLOSE_CODE); the editor
+   * keeps them and shows 'Too large for server' (no reconnecting by itself); a stored project the
+   * server's heap cannot load is refused to tools (OUT_OF_MEMORY), REST (507) and browsers (4507).
+   */
+  it('quote what a browser editor and agents get when the server cannot hold a project', () => {
+    const doc = flat(mcp);
+    const size = {
+      objects: 15_000,
+      datablocks: {},
+      keyframes: 0,
+      meshBytes: 0,
+      imageBytes: 0,
+      objectsPart: 158 * MB,
+      kept: 1,
+      saved: 1,
+    };
+    const load = loadRefusal({ id: 'abc', name: 'Big' }, size, {
+      heapFree: () => 400 * MB,
+      heapLimit: () => 2096 * MB,
+      collect: () => undefined,
+    })!;
+    const dottedLoad = load
+      .replace("project 'Big' (abc)", "project '<name>' (<id>)")
+      .replace(/\d[\d,]* (MB|objects)/g, '… $1');
+    expect(doc).toContain(`tools fail with code \`OUT_OF_MEMORY\` ("get_project failed: ${dottedLoad}"; `);
+    // a project with keyframes or images has them named after its objects (project-memory.ts loadRefusal)
+    const withKeys = loadRefusal(
+      { id: 'abc', name: 'Big' },
+      { ...size, keyframes: 40, imageBytes: 3 * MB },
+      {
+        heapFree: () => 400 * MB,
+        heapLimit: () => 2096 * MB,
+        collect: () => undefined,
+      },
+    )!;
+    expect(withKeys).toContain('for its 15,000 objects, 40 keyframes, 3 MB of images, and the server');
+    expect(doc).toContain(
+      '", … keyframes" and ", … MB of images" follow "… objects" when the project has them), the REST API ' +
+        'answers 507 and browser editors are closed with code 4507.',
+    );
+    expect(OUT_OF_MEMORY_CLOSE_CODE).toBe(4507);
+    expect(new ProjectMemoryError('x').statusCode).toBe(507);
+    const changes = refusedChangesMessage({ ...size, objects: 3 }, 'CLAUSE');
+    expect(doc).toContain(
+      `and that editor gets the reason ("${changes.replace('3 new objects', '…').replace('CLAUSE', "the project's meshes, objects, keyframes and images would then take about … MB of memory …")}"), ` +
+        'is closed with code 4507, keeps its changes in the browser and shows `Too large for server` until Save ' +
+        '(Ctrl+S) or a reload connects it again.',
+    );
+    expect(web('ui/App.tsx')).toContain("? 'Too large for server'");
+    expect(web('sync/provider.ts')).toContain(
+      'if (!this.ws && this.url && !this.deletedOnServer && !this.refusedOnServer) {',
+    );
+    expect(flat(guide)).toContain('`Too large for server`');
+  });
+
+  /*
+   * MEM: the operators that add keyframes are counted as meshes and objects are; their refusals name
+   * what to lower (core operators/memory-keyframes.ts), and a browser editor would not help.
+   */
+  it('quote the keyframe refusals as the server words them', () => {
+    const lower =
+      'the frame range (frame_start to frame_end, or a larger step) or the number of objects to bake (objects, or the selected objects)';
+    const refusal = storedMeshesMessage(
+      {
+        operator: 'anim.bake_transforms',
+        estimate: {
+          bytes: 1,
+          faces: 0,
+          keyframes: 22_500_000,
+          addedStoredBytes: 2000 * MB,
+          addedSaveBytes: 6000 * MB,
+          lower,
+        },
+        storedBytes: 5 * MB,
+        saveBytes: 2 * MB,
+        objects: 500,
+      } as never,
+      2096 * MB,
+    );
+    const dotted = refusal
+      .replace(/\(\d+ times what its objects, datablocks and keyframes take, \d+ times its images\)/, '(…)')
+      .replace(/\(half of its [^)]*\)/, '(…)')
+      .replace(/\d[\d,]* (MB|new keyframes|objects)/g, '… $1');
+    const doc = flat(mcp);
+    expect(doc).toContain(`("anim.bake_transforms failed: ${dotted}";`);
+    const core = file('../../../../packages/core/src/operators/memory-keyframes.ts');
+    for (const other of [
+      lower,
+      'the frame range (frame_start to frame_end, or a larger step) or the number of rigid bodies to bake (objects, or the selected objects)',
+      'the number of frames and values',
+      'the number of selected objects',
+    ])
+      expect(core).toContain(`'${other}'`);
+    expect(core).toContain("lower: 'the number of selected objects (or their animation)',");
+    expect(doc).toContain(
+      'the other operators name "the number of rigid bodies to bake", "the number of frames and values", "the ' +
+        'number of selected objects" and "the number of selected objects (or their animation)"). A browser editor ' +
+        'would not help: the server refuses its changes for the same reason.',
+    );
+  });
+
+  /*
+   * MEM: a rigid body simulation the server has no memory for is not stepped; get_scene lists it in
+   * problems (source rigidbody), and an operator that needs it fails with it.
+   */
+  it('quote the refusal of a rigid body simulation', () => {
+    const refusal = refusedSimulationMessage(
+      { bodies: { simulated: 1024, kinematic: 0 }, frame: 20_000, frames: 19_999, bytes: 1117 * MB } as never,
+      600 * MB,
+      2096 * MB,
+    );
+    const dotted = refusal
+      .replace(
+        /simulating [\d,]+ rigid bodies to frame [\d,]+ keeps [\d,]+ more frames/,
+        'simulating … rigid bodies to frame … keeps … more frames',
+      )
+      .replace(/about [\d,]+ MB, and [^.]*\./, 'about … MB, and ….');
+    expect(flat(mcp)).toContain(
+      `\`get_scene\` lists "${dotted}" among its \`problems\` (source \`rigidbody\`;`,
+    );
+    expect(file('../../../../packages/core/src/eval/evaluate.ts')).toContain(
+      "physicsErrors.push({ source: 'rigidbody', message: (e as Error).message });",
     );
   });
 });

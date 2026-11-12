@@ -2,11 +2,15 @@ import { suggestNames } from '@3d-editor/core';
 import type { LateRpc } from '../sync/room';
 import { ToolError } from './agent';
 import {
+  AFTER_SAVE_HOLD_SECONDS,
+  CHANGE_APPLY_SECONDS,
   FIRST_SHADING_SECONDS,
   measuredNote,
   MILLIONS_SELECT_SECONDS,
   MILLIONS_SOLID_SECONDS,
   NEW_SHADER_SECONDS,
+  READ_HOLD_SECONDS,
+  SAVE_HOLD_SECONDS,
   SERVER_SOLID_SECONDS,
 } from './editor-costs';
 
@@ -217,12 +221,20 @@ export function describeLateRpcs(late: readonly LateRpc[], now = Date.now()): st
  * the frames in progress), and these ranges include it and selects sent as soon as a screenshot had
  * answered. Other commands do not wait for the viewport's frames, only for the work that holds the
  * editor's main thread: with 4 million triangles a select took {@link MILLIONS_SELECT_SECONDS}, as the
- * statistics overlay counts the edges of every mesh again (apps/web session.ts sceneStats). On the server,
- * grey clay (render_image with shading 'SOLID' and renderer 'software', the remedy of SOLID and
- * WIREFRAME screenshots, and the quick look of the others while the editor is busy or for a
- * PATHTRACER scene) took {@link SERVER_SOLID_SECONDS} in a render process; a render that runs out of
- * the memory of its render process fails with renderToolError's message (rendering.ts), which
- * starts "Rendering failed: out of memory: ", and the next render uses a new render process.
+ * statistics overlay counts the edges of every mesh again (apps/web session.ts sceneStats), and
+ * applying a change made elsewhere (another agent's move of an object) {@link CHANGE_APPLY_SECONDS}.
+ * Every request, a command too, also waits while the server holds up its event loop (a project of
+ * 4 million triangles): while it saves a project after a change ({@link SAVE_HOLD_SECONDS}, then twice
+ * more for at most {@link AFTER_SAVE_HOLD_SECONDS} while it takes fingerprints of what it wrote),
+ * while it reads back a project that an editor has open from storage (once a minute) and while it
+ * sends a project to an editor that opens it ({@link READ_HOLD_SECONDS}). A timeout_ms of a few
+ * seconds or less can run out in such waits alone, so the message of a command other than a
+ * screenshot names them. On the server, grey clay (render_image with shading 'SOLID' and renderer
+ * 'software', the remedy of SOLID and WIREFRAME screenshots, and the quick look of the others while
+ * the editor is busy or for a PATHTRACER scene) took {@link SERVER_SOLID_SECONDS} in a render
+ * process; a render that runs out of the memory of its render process fails with renderToolError's
+ * message (rendering.ts), which starts "Rendering failed: out of memory: ", and the next render
+ * uses a new render process.
  */
 export function editorTimeoutMessage(
   command: string,
@@ -337,13 +349,20 @@ export function editorTimeoutMessage(
   const toSolid =
     "if the viewport is not in SOLID shading, switch it to SOLID (editor_command view.shading {shading: 'SOLID'}), " +
     'which draws much faster.';
+  // the waits that a timeout_ms of a few seconds or less can run out in alone: the editor applying a
+  // change made elsewhere, and the server's holds (see above)
   return (
-    `${head} '${command}' waits while the editor's main thread is busy. An editor ${noGpu} is busy for ` +
+    `${head} '${command}' waits while the editor's main thread is busy, and while the server holds up ` +
+    'every request: while it saves a project after a change (with 4 million triangles ' +
+    `${SAVE_HOLD_SECONDS}, then twice more for at most ${AFTER_SAVE_HOLD_SECONDS}), reads back from storage ` +
+    'a project that an editor has open (once a minute) or sends a project to an editor that opens it ' +
+    `(${READ_HOLD_SECONDS}). An editor ${noGpu} is busy for ` +
     'seconds with its first frame of a heavy scene in MATERIAL or RENDERED shading, while it builds and ' +
     "compiles the scene's materials, and with its first WIREFRAME frame of a scene with millions of " +
     'triangles, while it builds the wires of every mesh; with millions of triangles it is also busy while ' +
-    `it carries out a command (with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}), ` +
-    'but not while it draws its other frames. ' +
+    `it carries out a command (with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}) ` +
+    `and while it applies a change made elsewhere (${CHANGE_APPLY_SECONDS} for an agent's move of an ` +
+    'object among 4 million triangles), but not while it draws its other frames. ' +
     (atMax
       ? `With timeout_ms at its maximum (${MAX_EDITOR_TIMEOUT_MS}), retry, or, ${toSolid}`
       : `Pass a larger timeout_ms (at most ${MAX_EDITOR_TIMEOUT_MS}), or, ${toSolid}`) +

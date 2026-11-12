@@ -57,6 +57,13 @@ export interface PathTraceOptions extends PathTraceFrameOptions {
    * heap is estimated from the scene at that frame ({@link pageHeapEstimate}).
    */
   pageFrame?: number;
+  /**
+   * What the page holds besides its scene and the viewport's evaluation (bytes): the geometry the
+   * evaluator of RASTER final renders keeps from its last render (`ViewportEngine`). The render counts
+   * it; whether a RASTER render of the scene would fit (the advice of a refusal) does not
+   * ({@link TabMemory.rasterKept}).
+   */
+  pageHeld?: number;
 }
 
 export type PathTracePhase = 'preparing' | 'rendering' | 'finishing' | 'done' | 'cancelled' | 'failed';
@@ -191,6 +198,8 @@ export class PathTraceJob {
   private readonly estimate: RenderEstimate;
   /** The page's own heap, estimated from its scene (see `pageHeapEstimate`). */
   private readonly pageHeap: number;
+  /** What the evaluator of RASTER final renders keeps besides ({@link PathTraceOptions.pageHeld}). */
+  private readonly pageHeld: number;
 
   constructor(
     private readonly pool: RenderPool,
@@ -214,6 +223,7 @@ export class PathTraceJob {
     const snapshot = new DocumentSnapshot(doc);
     this.estimate = estimateRender(doc, true, options.frame);
     this.pageHeap = options.memory ? 0 : pageHeapEstimate(doc, options.pageFrame ?? options.frame);
+    this.pageHeld = options.memory ? 0 : Math.max(0, options.pageHeld ?? 0);
     this.result = this.run(snapshot);
     this.result.catch(() => undefined);
   }
@@ -405,7 +415,9 @@ export class PathTraceJob {
 
   private async render(snapshot: DocumentSnapshot, mayRetry: boolean): Promise<PathTraceResult> {
     const job = this.id;
-    const tab = this.options.memory ?? tabMemory(this.pageHeap);
+    // the page's heap counts what the evaluator of RASTER renders keeps; a RASTER render does not
+    // (it lets it go first where the two do not fit together: rasterRefusal)
+    const tab = this.options.memory ?? tabMemory(this.pageHeap, this.pageHeld);
     // a render that cannot fit one worker (estimated from the document, its evaluation included)
     // next to the path traced renders running now is not started; its refusal suggests the RASTER
     // engine where a RASTER render of the scene fits the page

@@ -9,7 +9,7 @@ import {
   type MeshData,
   type SceneDoc,
 } from '@3d-editor/core';
-import { evaluationCacheBytes, evaluationCheck, type EvaluationCheck } from '../render/memory';
+import { evaluationCacheBytes, evaluationCheck, trackOpenRoom, type EvaluationCheck } from '../render/memory';
 
 /*
  * Scene evaluations of the MCP inspection tools (get_scene, get_object, get_mesh_data …), cached
@@ -164,6 +164,8 @@ function makeRoom(extra: number): void {
 function entry(scene: SceneDoc): DocEvaluations {
   let e = caches.get(scene);
   if (!e) {
+    // a project the inspection tools read is open: the memory checks count it with the others
+    trackOpenRoom(scene);
     const created: DocEvaluations = {
       version: 0,
       evaluators: { RENDER: new SceneEvaluator(scene), VIEWPORT: new SceneEvaluator(scene) },

@@ -203,3 +203,141 @@ describe('Modifiers tab of curve and text objects', () => {
 function availableTabsOf(name: string) {
   return availableTabs(s.doc.findObjectByName(name));
 }
+
+/** The Modifiers tab of object `name`. */
+function modifiersOf(name: string) {
+  const o = s.doc.findObjectByName(name)!;
+  s.state.selectedIds = [o.id];
+  s.state.activeId = o.id;
+  activePropertiesTab.value = 'modifiers';
+  return render(<Properties session={s} />).container;
+}
+
+describe('Modifiers tab of disabled modifiers and object parameters', () => {
+  it("draws the header of a modifier Blender's is_disabled leaves out red, with why as its tooltip", () => {
+    // MOD_ui_common.cc modifier_panel_header: is_disabled -> uiLayoutSetRedAlert
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('mesh.primitive_cube_add', { name: 'Cutter', location: [1, 0, 0] });
+    ok('object.modifier_add', { object: 'Cube', type: 'BOOLEAN' });
+    ok('object.modifier_add', { object: 'Cube', type: 'SUBSURF', params: { levels: 1 } });
+    const container = modifiersOf('Cube');
+    const disabled = byTestId(container, 'modifier-disabled-Boolean')!;
+    expect(disabled.title).toBe(
+      "Modifier is disabled: the Boolean modifier 'Boolean' has no object, so it changes nothing",
+    );
+    expect(disabled.getAttribute('style')).toMatch(/^--bg-panel-header: #6b2b2b;?$/);
+    expect(disabled.querySelector('.panel-header')?.textContent).toContain('Boolean');
+    expect(byTestId(container, 'modifier-disabled-Subdivision')).toBeNull();
+    // given a mesh object it does something, and the header is drawn as the others
+    act(() =>
+      ok('object.modifier_set', { object: 'Cube', modifier: 'Boolean', params: { object: 'Cutter' } }),
+    );
+    expect(byTestId(container, 'modifier-disabled-Boolean')).toBeNull();
+    expect(container.textContent).toContain('Boolean');
+  });
+
+  it('draws it red at the frames where its animated parameters disable it, as the viewport evaluates it', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.modifier_add', { object: 'Cube', type: 'BEVEL' });
+    for (const [frame, value] of [
+      [1, 0],
+      [10, 0.2],
+    ])
+      ok('anim.keyframe_insert_property', {
+        target_type: 'object',
+        target: 'Cube',
+        path: 'modifiers["Bevel"].width',
+        frame,
+        value,
+      });
+    // the stored width is not 0: only the keyed one at frame 1 is
+    ok('object.modifier_set', { object: 'Cube', modifier: 'Bevel', params: { width: 0.1 } });
+    expect(s.doc.findObjectByName('Cube')!.modifiers[0].params.width).toBe(0.1);
+    s.state.frame = 1;
+    const container = modifiersOf('Cube');
+    expect(byTestId(container, 'modifier-disabled-Bevel')?.title).toBe(
+      "Modifier is disabled: the Bevel modifier 'Bevel' has a width of 0, so it changes nothing",
+    );
+    act(() => {
+      s.state.frame = 10;
+    });
+    expect(byTestId(container, 'modifier-disabled-Bevel')).toBeNull();
+  });
+
+  it('judges a modifier with its viewport settings, as Blender draws the header', () => {
+    // MOD_ui_common.cc modifier_panel_header: `mti->is_disabled(scene, md, false)`, the viewport's
+    // settings: a Subdivision Surface with 0 viewport levels is red although renders use 2 levels
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    for (const [name, levels, render_levels] of [
+      ['Light', 0, 2],
+      ['Heavy', 2, 0],
+    ] as const)
+      ok('object.modifier_add', { object: 'Cube', type: 'SUBSURF', name, params: { levels, render_levels } });
+    const container = modifiersOf('Cube');
+    expect(byTestId(container, 'modifier-disabled-Light')?.title).toBe(
+      "Modifier is disabled: the Subdivision Surface modifier 'Light' has 0 viewport levels (levels), so it " +
+        'changes nothing',
+    );
+    expect(byTestId(container, 'modifier-disabled-Heavy')).toBeNull();
+    expect(container.textContent).toContain('Heavy');
+  });
+
+  it('keeps a drag going while it disables the modifier and enables it again, one undo step', () => {
+    // regression: only a disabled modifier had the wrapper that draws its header red, so a drag
+    // that reached a Bevel width of 0 (MOD_bevel.cc is_disabled) remounted the panel; the field lost
+    // its drag, and the preview it had written stayed in the document, out of reach of Ctrl+Z
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.modifier_add', { object: 'Cube', type: 'BEVEL', params: { width: 0.1 } });
+    const container = modifiersOf('Cube');
+    const width = () => s.doc.findObjectByName('Cube')!.modifiers[0].params.width;
+    const red = () => byTestId(container, 'modifier-disabled-Bevel');
+    const depth = s.undo.undoStack.length;
+    const field = byTestId(container, 'mod-bevel-width')!;
+    // each event goes to the field under the pointer, as in a browser, where a removed field loses
+    // its pointer capture
+    const under = () => byTestId(container, 'mod-bevel-width')!;
+    fireEvent.pointerDown(field, { button: 0, clientX: 100, pointerId: 1 });
+    fireEvent.pointerMove(under(), { clientX: 70, pointerId: 1 });
+    expect(width()).toBe(0);
+    expect(red()?.title).toBe(
+      "Modifier is disabled: the Bevel modifier 'Bevel' has a width of 0, so it changes nothing",
+    );
+    fireEvent.pointerMove(under(), { clientX: 140, pointerId: 1 });
+    expect(width()).toBeCloseTo(0.5, 9);
+    expect(red()).toBeNull();
+    fireEvent.pointerUp(under(), { clientX: 140, pointerId: 1 });
+    expect(width()).toBeCloseTo(0.5, 9);
+    expect(s.undo.undoStack.length).toBe(depth + 1);
+    act(() => {
+      s.undo.undo();
+    });
+    expect(width()).toBe(0.1);
+    expect(red()).toBeNull();
+    // the field was never replaced
+    expect(under()).toBe(field);
+  });
+
+  it('lists in an object picker only the objects of the types the parameter takes', () => {
+    // Blender's RNA polls: rna_Mesh_object_poll for the Boolean object, rna_Curve_object_poll for
+    // the Curve object; the Mirror object takes any object
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('mesh.primitive_uv_sphere_add', { name: 'Ball' });
+    ok('object.text_add', { body: 'Hi', name: 'Label' });
+    ok('curve.primitive_bezier_curve_add', { name: 'Path' });
+    ok('object.empty_add', { name: 'Marker' });
+    for (const type of ['BOOLEAN', 'CURVE', 'MIRROR']) ok('object.modifier_add', { object: 'Cube', type });
+    const container = modifiersOf('Cube');
+    const options = (id: string) =>
+      [...byTestId(container, id)!.querySelectorAll('option')].map((o) => o.textContent);
+    expect(options('mod-boolean-object')).toEqual(['— none —', 'Ball', 'Cube']);
+    expect(options('mod-curve-object')).toEqual(['— none —', 'Path']);
+    expect(options('mod-mirror-mirror_object')).toEqual([
+      '— none —',
+      'Ball',
+      'Cube',
+      'Label',
+      'Marker',
+      'Path',
+    ]);
+  });
+});

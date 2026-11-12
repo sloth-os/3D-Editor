@@ -14,7 +14,7 @@ import {
   type ModifierData,
 } from '@3d-editor/core';
 import { InProcessWorker, RenderPool, startPathTrace, type WorkerLike } from '../src/render';
-import { ADOPTER_COPIES_STOP, stopsAdopters } from '../src/render/path-trace';
+import { ADOPTER_COPIES_STOP, stopsAdopters, type PathTraceResult } from '../src/render/path-trace';
 import {
   EvaluationGuard,
   RasterEvaluationGuard,
@@ -90,9 +90,10 @@ const modifier = (
 
 /**
  * The verifier's scene, smaller: the default cube as `n` copies (Array) beveled with 30 segments in
- * renders only (Bevel limited by angle, off in the viewport): 11,532 triangles per copy in renders.
+ * renders only (Bevel limited by angle, off in the viewport): 11,532 triangles per copy in renders;
+ * with 10 `segments`, 1,452.
  */
-function bevelScene(n: number): SceneDoc {
+function bevelScene(n: number, segments = 30): SceneDoc {
   const doc = SceneDoc.create();
   doc.updateRender({ resolution_x: 24, resolution_y: 16, samples: 1, max_bounces: 2 });
   const cube = doc.findObjectByName('Cube')!;
@@ -100,7 +101,7 @@ function bevelScene(n: number): SceneDoc {
     name: 'BevCube',
     modifiers: [
       modifier('Arr', 'ARRAY', { count: n, relative_offset_displace: [1.5, 0, 0] }),
-      modifier('Bev', 'BEVEL', { width: 0.05, segments: 30 }, false),
+      modifier('Bev', 'BEVEL', { width: 0.05, segments }, false),
     ],
   });
   return doc;
@@ -640,6 +641,7 @@ describe("the check of a RASTER render's evaluation on the page", () => {
       // its result replaces the 20 triangles of its input
       triangles: 100 + 4_990 - 20 + 3_000,
       heap: (100 + 4_990) * RASTER_BYTES_PER_TRIANGLE + 50 * INSTANCE_BYTES.heap + 2 * MB,
+      instances: 50,
     });
     expect(guard.refusal!.triangles).toBe(3_000);
     // at least what the estimate says the evaluation builds
@@ -648,11 +650,29 @@ describe("the check of a RASTER render's evaluation on the page", () => {
     expect(early.refusal!.needs).toEqual({
       triangles: 80_000,
       heap: 80_000 * RASTER_BYTES_PER_TRIANGLE,
+      instances: 0,
     });
     // with room, nothing is refused
     expect(
       new RasterEvaluationGuard(estimate(1_000, 100, 50), roomy).before(bevel, run(2 * MB, 3_000), 20),
     ).toBeNull();
+  });
+
+  it('builds nothing more after its first refusal: later modifiers are skipped, the first one is named', () => {
+    // 1 MB a render may fill: a Bevel of 2 MB is refused
+    const memory = { ...roomy, heapLimit: YOUNG_GENERATION_BYTES + MB };
+    const guard = new RasterEvaluationGuard(estimate(1_000, 100, 50), memory);
+    const first = guard.before(bevel, run(2 * MB, 3_000), 20);
+    expect(first).toMatch(/^The RASTER render was not started: /);
+    // a small modifier after it would fit: skipped all the same, with a short note
+    expect(guard.before({ type: 'SUBSURF', label: 'Subdivision Surface' }, run(1_000, 10), 0)).toBe(
+      SKIPPED_AFTER_REFUSAL,
+    );
+    // a large one does not take the refusal over: the reason names the first modifier
+    expect(guard.before({ type: 'ARRAY', label: 'Array' }, run(4 * MB, 6_000), 0)).toBe(
+      SKIPPED_AFTER_REFUSAL,
+    );
+    expect(guard.refusal).toMatchObject({ type: 'BEVEL', label: 'Bevel', message: first, triangles: 3_000 });
   });
 
   it('suggests the RASTER engine for a modifier the first worker refuses only where it fits the page', () => {
@@ -936,33 +956,58 @@ describe('render workers', () => {
   });
 
   it('renders with only the workers the compiled scene leaves room for, fewer than the estimate started', async () => {
-    // the estimate sees the cubes, not what a Bevel limited by angle makes of them: it starts 3
-    // workers, and the compiled scene leaves room for 2
-    const doc = bevelScene(3);
+    // the estimate sees the cubes, not what a Bevel limited by angle makes of them (4,356
+    // triangles): it starts 3 workers, and the compiled scene leaves room for 2
+    const doc = bevelScene(3, 10);
     const sent: string[][] = Array.from({ length: 4 }, () => []);
     class Recording extends InProcessWorker {
-      constructor(private readonly index: number) {
-        super();
+      constructor(
+        private readonly index: number,
+        engine?: RenderWorkerEngine,
+      ) {
+        super(engine);
       }
       override postMessage(msg: WorkerRequest): void {
         sent[this.index].push(msg.type);
         super.postMessage(msg);
       }
     }
-    const pool = new RenderPool({ size: 4, idleMs: 0, factory: (i) => new Recording(i) });
+    // the first worker's engine finds the exact needs: the render's prepare then reuses its evaluation
+    // (the Bevels are evaluated once: the slow part of the test under coverage)
+    const first = new RenderWorkerEngine(null);
+    const pool = new RenderPool({
+      size: 4,
+      idleMs: 0,
+      factory: (i) => new Recording(i, i === 0 ? first : undefined),
+    });
     pools.push(pool);
-    const info = await engine().prepare(doc);
-    const memory = { ...roomy, budget: renderMemory(needsOf(info), 2).total };
-    expect(planRenderThreads(estimatedNeeds(estimateRender(doc, true, 1), 24 * 16), 4, memory).threads).toBe(
-      3,
-    );
-    expect(planRenderThreads(needsOf(info), 4, memory).threads).toBe(2);
-    const r = await startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 4, memory }).result;
+    const thread = { docKey: null as string | null, stateVector: null as Uint8Array | null };
+    const bevels = countBevels();
+    let r: PathTraceResult;
+    try {
+      const info = await first.prepare(0, new DocumentSnapshot(doc).payload(thread), {
+        width: 24,
+        height: 16,
+        frame: 1,
+      });
+      first.release(0);
+      // a byte short of 3 workers with the compiled scene
+      const memory = { ...roomy, budget: renderMemory(needsOf(info), 3).total - 1 };
+      expect(
+        planRenderThreads(estimatedNeeds(estimateRender(doc, true, 1), 24 * 16), 4, memory).threads,
+      ).toBe(3);
+      expect(planRenderThreads(needsOf(info), 4, memory).threads).toBe(2);
+      r = await startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 4, memory }).result;
+      // the render's first worker evaluated nothing again
+      expect(bevels.count()).toBe(1);
+    } finally {
+      bevels.restore();
+    }
     expect(r.threads).toBeLessThanOrEqual(2);
     expect(r.limitedByMemory).toBe(true);
     // the workers beyond them got no copy of the scene and no rows
     for (const s of sent.slice(2)) expect(s.filter((t) => t !== 'release')).toEqual([]);
-    // two evaluations of the Bevels (34,596 triangles) and compilations: 0.6 s alone without coverage
+    // one evaluation of the Bevels, two compilations
   }, 15_000);
 
   it('counts no worker that got its copy of the compiled scene after the render was over', async () => {

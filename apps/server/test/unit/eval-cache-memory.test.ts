@@ -11,7 +11,7 @@ import {
   type MeshData,
 } from '@3d-editor/core';
 import { evaluateCached, evaluationMemory, evaluationStats } from '../../src/mcp/eval-cache';
-import { evaluationCheck } from '../../src/render/memory';
+import { evaluationCheck, otherOpenProjects } from '../../src/render/memory';
 
 /*
  * The inspection tools cache each project's last evaluations by frame (eval-cache.ts). Every
@@ -267,5 +267,20 @@ describe('evaluation cache memory', () => {
     expect(size.peak).toBeLessThan(OPERATOR_FIXED_BYTES);
     evaluationMemory.check = check;
     expect(evaluateCached(doc, 1, 'RENDER').objects).toHaveLength(300);
+  });
+});
+
+describe('a project the inspection tools evaluate', () => {
+  it('is counted among the open projects the memory checks hold against the heap', () => {
+    // a room's document (its transaction origin names it), evaluated without any operator run on it
+    const room = new SceneDoc(undefined, { type: 'server', room: 'p-evaluated' });
+    room.map('meta').set('name', 'Evaluated');
+    docs.push(room);
+    expect(otherOpenProjects().map((p) => p.id)).not.toContain('p-evaluated');
+    evaluateCached(room, 1, 'VIEWPORT');
+    expect(otherOpenProjects().find((p) => p.id === 'p-evaluated')).toMatchObject({ name: 'Evaluated' });
+    // a closed project leaves them
+    room.ydoc.destroy();
+    expect(otherOpenProjects().map((p) => p.id)).not.toContain('p-evaluated');
   });
 });

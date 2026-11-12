@@ -3,6 +3,7 @@ import { createApp } from './app';
 import { persistenceNote } from './persistence';
 import { closeSharedRenderer } from './render';
 import { stopOnSignals } from './shutdown';
+import { exitWithoutWaitingForLogs } from './observability/logger';
 
 async function main(): Promise<void> {
   let config;
@@ -44,7 +45,9 @@ async function main(): Promise<void> {
 
   // SIGTERM, SIGINT: within SHUTDOWN_TIMEOUT_SECONDS (9 s by default: Docker sends SIGKILL 10 s
   // after SIGTERM), naming the projects that stayed unsaved; the render processes stop at once
-  // (renders in progress are cancelled), a busy one would otherwise finish its request first
+  // (renders in progress are cancelled), a busy one would otherwise finish its request first. The
+  // process ends also when the reader of its output closed the pipe (the logger's own flush at exit
+  // waited for ever then)
   stopOnSignals(
     {
       log: app.log,
@@ -52,7 +55,7 @@ async function main(): Promise<void> {
       close: () => Promise.all([handle.close(), closeSharedRenderer()]),
     },
     config,
-    (code) => process.exit(code),
+    (code) => exitWithoutWaitingForLogs(app.log, code),
   );
   process.on('unhandledRejection', (reason) => app.log.error({ err: reason }, 'unhandled promise rejection'));
 }
