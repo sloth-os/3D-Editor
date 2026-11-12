@@ -5,12 +5,13 @@ import { signal, computed } from '@preact/signals';
 import {
   SceneDoc,
   SceneEvaluator,
-  meshStats,
+  countTriangles,
   selectionFromJSON,
   selectionToJSON,
   type PresenceState,
   type ProjectFileStore,
   type ProjectInfo,
+  type MeshData,
   type ProjectMeta,
   type SelectionJSON,
   type WriteOptions,
@@ -152,6 +153,30 @@ class SessionScene extends SceneDoc {
     const stored = this.storedName();
     return stored ? { ...meta, name: stored } : meta;
   }
+}
+
+/** What the statistics overlay shows of a mesh. */
+interface MeshCounts {
+  vertices: number;
+  faces: number;
+  triangles: number;
+}
+
+const countsOfMesh = new WeakMap<MeshData, MeshCounts>();
+
+/**
+ * The vertices, faces and triangles of an evaluated mesh, counted once per mesh: no code changes them
+ * in place (an edit that changes them makes a new mesh). Edges are not counted: the overlay does not
+ * show them, and counting them took most of the time (in Node, 0.21–0.41 s with them and 0.02–0.05 s
+ * without for 4 million triangles).
+ */
+export function meshCounts(m: MeshData): MeshCounts {
+  let c = countsOfMesh.get(m);
+  if (!c) {
+    c = { vertices: m.positions.length / 3, faces: m.faces.length, triangles: countTriangles(m) };
+    countsOfMesh.set(m, c);
+  }
+  return c;
 }
 
 /**
@@ -623,7 +648,12 @@ export class ProjectSession {
     this.peers.value = out;
   }
 
-  /** Approximate scene complexity for status bar / telemetry. */
+  /**
+   * The objects, vertices, faces and triangles of the scene as the viewport shows it (the statistics
+   * overlay). Each evaluated mesh is counted once (see {@link meshCounts}): the evaluator keeps the
+   * meshes of objects whose geometry did not change, so drawing the overlay again (for a new frame
+   * rate, a selection, a move) counts nothing again, however large the scene.
+   */
   sceneStats(): { objects: number; vertices: number; faces: number; triangles: number } {
     let vertices = 0;
     let faces = 0;
@@ -633,10 +663,10 @@ export class ProjectSession {
     });
     for (const o of ev.objects) {
       if (!o.mesh || !o.visible) continue;
-      const s = meshStats(o.mesh);
-      vertices += s.vertices;
-      faces += s.faces;
-      triangles += s.triangles;
+      const c = meshCounts(o.mesh);
+      vertices += c.vertices;
+      faces += c.faces;
+      triangles += c.triangles;
     }
     return { objects: ev.objects.length, vertices, faces, triangles };
   }

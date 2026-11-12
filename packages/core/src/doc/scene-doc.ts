@@ -104,6 +104,21 @@ export function fcurveKey(fc: Pick<FCurve, 'target_type' | 'target_id' | 'path' 
   return `${fc.target_type}:${fc.target_id}:${fc.path}:${fc.index}`;
 }
 
+/**
+ * The keys of the animation curves or drivers in `map` (fcurveKey of each) by their target id, in
+ * the map's order: what listFCurves(id) and listDrivers(id) list, for every id at once.
+ */
+function keysByTarget(map: Y.Map<unknown>): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const v of map.values()) {
+    const fc = v as FCurve;
+    let keys = out.get(fc.target_id);
+    if (!keys) out.set(fc.target_id, (keys = []));
+    keys.push(fcurveKey(fc));
+  }
+  return out;
+}
+
 /** Origin used for transactions that should not be tracked by undo managers (e.g. migrations). */
 export const SYSTEM_ORIGIN = { type: 'system' };
 
@@ -455,6 +470,36 @@ export class SceneDoc {
     return n;
   }
 
+  /**
+   * The ids of every object's children by parent id (null: the root objects), each list in the
+   * order {@link childrenOf} gives, read once. For operators that look up the children of many
+   * objects: childrenOf reads every object, so looking them up again for each of N objects took
+   * time in N² (Apply Transform on 2,000 linked cubes took 36 s). It describes the parents of the
+   * moment it was read.
+   */
+  childrenIndex(): Map<string | null, string[]> {
+    const out = new Map<string | null, string[]>();
+    for (const o of this.listObjects()) {
+      const list = out.get(o.parent);
+      if (list) list.push(o.id);
+      else out.set(o.parent, [o.id]);
+    }
+    return out;
+  }
+
+  /**
+   * The number of objects using each data block ({@link dataUsers} of all of them), read once, for
+   * operators that ask it for many objects; they keep it current as they give objects other data.
+   */
+  dataUserCounts(): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const y of this.map('objects').values()) {
+      const data = (y as Y.Map<any>).get('data') as unknown;
+      if (typeof data === 'string') out.set(data, (out.get(data) ?? 0) + 1);
+    }
+    return out;
+  }
+
   /** Local transform matrix of an object (from its stored, non-animated properties). */
   localMatrix(o: Pick<ObjectData, 'location' | 'rotation_euler' | 'scale'>): Mat4 {
     return compose4(o.location, o.rotation_euler, o.scale);
@@ -556,21 +601,73 @@ export class SceneDoc {
    * world transform; animation curves and orphaned object data are removed as well.
    */
   removeObject(id: string): void {
-    const o = this.getObject(id);
-    if (!o) return;
+    this.removeObjects([id]);
+  }
+
+  /**
+   * Removes objects one after another, each as {@link removeObject} removes it: its children (also
+   * those an object removed before it left to it) are re-parented by `reparent`, in the order
+   * {@link childrenOf} lists them (by default to the removed object's parent, keeping their world
+   * transform; a child `reparent` leaves on the removed object gets that), then the object, its
+   * animation curves and drivers, its data when no other object uses it, and the scene camera when
+   * it is. The objects, data users, animation curves and drivers are indexed once for all of them:
+   * looking them up again for each object made removing N objects take time in N² (1,000 linked
+   * cubes took 4–6 s).
+   */
+  removeObjects(
+    ids: Iterable<string>,
+    reparent: (child: string, removed: ObjectData) => void = (child, removed) =>
+      this.setParent(child, removed.parent, true),
+  ): void {
+    const objects = this.map('objects');
+    const list = [...ids].filter((id) => objects.has(id));
+    if (!list.length) return;
     this.transact(() => {
-      for (const child of this.childrenOf(id)) this.setParent(child.id, o.parent, true);
-      this.map('objects').delete(id);
-      this.forgetNames('objects');
-      for (const fc of this.listFCurves(id)) this.map('fcurves').delete(fcurveKey(fc));
-      if (o.data && this.dataUsers(o.data) === 0) {
-        const kind = dataKindOf(o.type);
-        if (kind) this.map(kind).delete(o.data);
-        if (kind) this.forgetNames(kind);
+      // children by parent, in childrenOf's order (rank: the objects sorted by name), and data users
+      const rank = new Map<string, number>();
+      const children = new Map<string | null, Set<string>>();
+      const users = new Map<string, number>();
+      this.listObjects().forEach((o, i) => {
+        rank.set(o.id, i);
+        let set = children.get(o.parent);
+        if (!set) children.set(o.parent, (set = new Set()));
+        set.add(o.id);
+        if (o.data) users.set(o.data, (users.get(o.data) ?? 0) + 1);
+      });
+      const curves = keysByTarget(this.map('fcurves'));
+      const drivers = keysByTarget(this.map('drivers'));
+      const parentOf = (id: string): string | null =>
+        ((objects.get(id) as Y.Map<any> | undefined)?.get('parent') as string | null | undefined) ?? null;
+      for (const id of list) {
+        const o = this.getObject(id);
+        if (!o) continue;
+        const kids = [...(children.get(id) ?? [])].sort((a, b) => rank.get(a)! - rank.get(b)!);
+        for (const child of kids) reparent(child, o);
+        for (const child of kids) if (parentOf(child) === id) this.setParent(child, o.parent, true);
+        for (const child of kids) {
+          const parent = parentOf(child);
+          let set = children.get(parent);
+          if (!set) children.set(parent, (set = new Set()));
+          set.add(child);
+        }
+        children.delete(id);
+        // (the sets hold the objects that exist, as childrenOf lists them)
+        children.get(parentOf(id))?.delete(id);
+        objects.delete(id);
+        this.forgetNames('objects');
+        for (const key of curves.get(id) ?? []) this.map('fcurves').delete(key);
+        if (o.data) {
+          const left = (users.get(o.data) ?? 1) - 1;
+          users.set(o.data, left);
+          const kind = left === 0 ? dataKindOf(o.type) : null;
+          if (kind) {
+            this.map(kind).delete(o.data);
+            this.forgetNames(kind);
+          }
+        }
+        for (const key of drivers.get(id) ?? []) this.map('drivers').delete(key);
+        if (this.getScene().camera === id) this.updateScene({ camera: null });
       }
-      for (const d of this.listDrivers(id)) this.map('drivers').delete(fcurveKey(d));
-      const scene = this.getScene();
-      if (scene.camera === id) this.updateScene({ camera: null });
     });
   }
 

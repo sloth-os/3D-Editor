@@ -611,6 +611,9 @@ function drivenChannels(fs: FrameState): ReadonlySet<string> {
   return driven;
 }
 
+/** A transform for every object (world space), or the transform of each object by its id. */
+export type ObjectMatrix = Readonly<Mat4> | ((id: string) => Readonly<Mat4>);
+
 /** An object's channels before and after an operator changed them (or left them as they were). */
 export interface ChannelChange {
   before: TransformChannels;
@@ -726,9 +729,10 @@ export class ObjectTransform {
    * Rotate and Scale (see transformedChannels in scene-doc.ts), computed from what it shows before
    * the transform, of which only the channels whose values change by more than rounding
    * (transformTolerance in scene-doc.ts) take the new values; the others keep, exactly, the values
-   * they hold before ({@link TransformStart.held}).
+   * they hold before ({@link TransformStart.held}). `m` is one transform for all of them, or each
+   * object's own (a LOCAL constraint on several objects, see {@link transformSelection}).
    */
-  channels(m: Readonly<Mat4>, pivot: Readonly<Vec3>): Map<string, TransformChannels> {
+  channels(m: ObjectMatrix, pivot: Readonly<Vec3>): Map<string, TransformChannels> {
     const out = new Map<string, TransformChannels>();
     const individual = this.pivotMode === 'INDIVIDUAL_ORIGINS';
     for (const t of this.targets) {
@@ -736,7 +740,7 @@ export class ObjectTransform {
         t.channels,
         t.basis,
         this.mode,
-        m,
+        typeof m === 'function' ? m(t.id) : m,
         individual ? t.basis.center : pivot,
       );
       out.set(t.id, { ...t.held, ...changedChannels(t.held, next, transformTolerance(t.basis)) });
@@ -755,7 +759,7 @@ export class ObjectTransform {
    * nothing to), the values its channels held before and those they hold afterwards: the new value
    * of each channel it wrote, the value held before of the others (see {@link keyChannelChanges}).
    */
-  apply(m: Readonly<Mat4>, pivot: Readonly<Vec3>): Map<string, ChannelChange> {
+  apply(m: ObjectMatrix, pivot: Readonly<Vec3>): Map<string, ChannelChange> {
     const next = this.channels(m, pivot);
     const changes = new Map<string, ChannelChange>();
     const doc = this.fs.doc;
@@ -1085,6 +1089,9 @@ function heldChannels(fs: FrameState, id: string): TransformChannels | null {
  * hold at the frame. An animated channel of a child that this changes is keyed at the current
  * frame with its new value, as the operators keep edits of animated channels (keyChannelChanges
  * without auto keying, which Blender's Set Origin and Apply Transform do not key with).
+ * `children`: every object's children (SceneDoc.childrenIndex), when an operator that changes many
+ * objects read them once (it must not change parents while it uses them); without it they are
+ * looked up in the document.
  */
 export function keepChildrenWorld(
   ctx: OperatorContext,
@@ -1092,11 +1099,12 @@ export function keepChildrenWorld(
   change: () => void,
   before: FrameState,
   changed: ReadonlySet<string>,
+  children: ReadonlyMap<string | null, readonly string[]> | null = null,
 ): void {
-  const children = ctx.doc.childrenOf(id).map((c) => c.id);
-  if (!children.length) return change();
-  const fs = children.some((c) => changed.has(c)) ? new FrameState(ctx.doc, ctx.state.frame) : before;
-  const worlds = children.map((c) => [c, evaluatedWorld(fs, c), heldChannels(fs, c)] as const);
+  const kids = children ? (children.get(id) ?? []) : ctx.doc.childrenOf(id).map((c) => c.id);
+  if (!kids.length) return change();
+  const fs = kids.some((c) => changed.has(c)) ? new FrameState(ctx.doc, ctx.state.frame) : before;
+  const worlds = kids.map((c) => [c, evaluatedWorld(fs, c), heldChannels(fs, c)] as const);
   change();
   const after = new FrameState(ctx.doc, ctx.state.frame);
   const changes = new Map<string, ChannelChange>();
@@ -1118,7 +1126,8 @@ export function keepChildrenWorld(
  * frame with its new value (keyChannelChanges without auto keying), so the geometry stays where it
  * shows there; Blender keeps the new value without a key until the frame changes, then its keys
  * decide again. Either way the location's other keys do not change, so at those keyframes the
- * geometry, which moved for good, shows moved by the opposite of the origin's move.
+ * geometry, which moved for good, shows moved by the opposite of the origin's move. `children`: as
+ * keepChildrenWorld takes them.
  */
 export function moveOrigin(
   ctx: OperatorContext,
@@ -1126,6 +1135,7 @@ export function moveOrigin(
   target: Vec3,
   before: FrameState,
   changed: Set<string>,
+  children: ReadonlyMap<string | null, readonly string[]> | null = null,
 ): void {
   const stored = ctx.doc.getObject(id);
   if (!stored) return;
@@ -1149,6 +1159,7 @@ export function moveOrigin(
     },
     before,
     changed,
+    children,
   );
   changed.add(id);
 }
@@ -1253,13 +1264,19 @@ export function orientAxes(fs: FrameState, activeId: string): Mat4 {
  * frame: edit-mode vertices (with the edited object's evaluated matrix), or objects as `mode`
  * (Move, Rotate or Scale, see {@link ObjectTransform}). Auto keying keys every object the
  * transform transforms, also one it writes nothing to; without it the animated channels it changes
- * are keyed at the frame (see {@link keyChannelChanges}).
+ * are keyed at the frame (see {@link keyChannelChanges}). `local` builds the transform of a
+ * constraint in the LOCAL orientation from the axes it is in; `m` is the one it builds from the
+ * active object's axes. As Blender's setLocalConstraint (transform_constraints.cc) does, `m` applies
+ * in Edit Mode and when the transform transforms one object, while several objects each take the
+ * transform built from their own axes (setAxisMatrixConstraint: applyObjectConstraintVec, Size and
+ * Rot read each object's axismtx, its world axes as {@link orientAxes} gives them).
  */
 export function transformSelection(
   ctx: OperatorContext,
   mode: TransformMode,
   m: Mat4,
   pivotOverride?: Vec3,
+  local?: (axes: Mat4) => Mat4,
 ): void {
   const { doc, state } = ctx;
   const fs = transformFrameState(doc, state.frame);
@@ -1279,9 +1296,12 @@ export function transformSelection(
   const ids = selectedObjects(ctx).map((o) => o.id);
   if (ids.length === 0) throw new OperatorError('No objects selected', 'POLL_FAILED');
   const xf = new ObjectTransform(fs, ids, state.pivotPoint, mode);
+  // (each object's axes read from a frame state of their own, as orientationOf reads the active one's)
+  const axesFs = local && xf.targets.length > 1 ? transformFrameState(doc, state.frame) : null;
+  const each: ObjectMatrix = axesFs && local ? (id) => local(orientAxes(axesFs, id)) : m;
   // auto keying keys every object the transform transforms, also by 0, as Blender's does, not the
   // selected children that only follow their parents; without it the animated channels it changed
-  keyChannelChanges(ctx, xf.apply(m, pivotOverride ?? xf.pivot(state)));
+  keyChannelChanges(ctx, xf.apply(each, pivotOverride ?? xf.pivot(state)));
 }
 
 /** What the object transforms' descriptions say about the frame they work at and keying. */
@@ -1318,7 +1338,10 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
       id: 'transform.translate',
       label: 'Move',
       description:
-        'Move selected objects (or selected vertices in Edit Mode) by a world-space offset.' + KEYING,
+        'Move selected objects (or selected vertices in Edit Mode) by `value` along the axes of `orient_type` ' +
+        "(GLOBAL: the world axes; LOCAL: the active object's axes in Edit Mode or when one object moves, else each " +
+        "object's own axes, as Blender's G X X)." +
+        KEYING,
       category: 'Transform',
       redoable: true,
       schema: z.object({
@@ -1327,9 +1350,10 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
       }),
       poll: pollTransform,
       execute(ctx, p) {
-        let v = p.value as Vec3;
-        if (p.orient_type === 'LOCAL') v = transformDirection3(orientationOf(ctx, 'LOCAL'), v);
-        transformSelection(ctx, 'TRANSLATE', translation4(v));
+        const value = p.value as Vec3;
+        if (p.orient_type !== 'LOCAL') return transformSelection(ctx, 'TRANSLATE', translation4(value));
+        const along = (axes: Mat4) => translation4(transformDirection3(axes, value));
+        transformSelection(ctx, 'TRANSLATE', along(orientationOf(ctx, 'LOCAL')), undefined, along);
       },
     }),
   );
@@ -1338,7 +1362,10 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
       id: 'transform.rotate',
       label: 'Rotate',
       description:
-        'Rotate the selection around an axis through the pivot point. `value` is in radians.' + KEYING,
+        'Rotate the selection by `value` (radians) about an axis through the pivot point: `axis` (world space), ' +
+        "else axis `orient_axis` of `orient_type` (GLOBAL: the world's; LOCAL: the active object's in Edit Mode or " +
+        "when one object turns, else each object's own, as Blender's R X X)." +
+        KEYING,
       category: 'Transform',
       redoable: true,
       schema: z.object({
@@ -1351,15 +1378,17 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
       poll: pollTransform,
       execute(ctx, p) {
         const k = p.orient_axis === 'X' ? 0 : p.orient_axis === 'Y' ? 1 : 2;
-        // a unit axis of the orientation (LOCAL rebuilds an axis the active object scales to 0)
-        const o = p.orient_type === 'LOCAL' ? orientationOf(ctx, 'LOCAL') : identity4();
-        let axis: Vec3 = [o[k * 4], o[k * 4 + 1], o[k * 4 + 2]];
+        const center = p.center as Vec3 | undefined;
         if (p.axis) {
-          axis = normalize3(p.axis as Vec3);
+          const axis = normalize3(p.axis as Vec3);
           if (axis[0] === 0 && axis[1] === 0 && axis[2] === 0)
             throw new OperatorError('Rotation axis must not be zero', 'INVALID_PARAMS');
+          return transformSelection(ctx, 'ROTATE', axisAngle4(axis, p.value), center);
         }
-        transformSelection(ctx, 'ROTATE', axisAngle4(axis, p.value), p.center as Vec3 | undefined);
+        // a unit axis of the orientation (LOCAL rebuilds an axis an object scales to 0)
+        const about = (o: Mat4) => axisAngle4([o[k * 4], o[k * 4 + 1], o[k * 4 + 2]], p.value);
+        if (p.orient_type !== 'LOCAL') return transformSelection(ctx, 'ROTATE', about(identity4()), center);
+        transformSelection(ctx, 'ROTATE', about(orientationOf(ctx, 'LOCAL')), center, about);
       },
     }),
   );
@@ -1367,16 +1396,28 @@ export function registerTransformOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'transform.resize',
       label: 'Scale',
-      description: 'Scale the selection about the pivot point.' + KEYING,
+      description:
+        'Scale the selection about the pivot point, `value` along the axes of `orient_type` (GLOBAL: the ' +
+        "world axes; LOCAL: the active object's axes in Edit Mode or when one object scales, else each object's " +
+        "own axes, as Blender's S X X)." +
+        KEYING,
       category: 'Transform',
       redoable: true,
       schema: z.object({
         value: vec3.default([1, 1, 1]),
+        orient_type: orientEnum,
         center: vec3.optional(),
       }),
       poll: pollTransform,
       execute(ctx, p) {
-        transformSelection(ctx, 'RESIZE', scaling4(p.value as Vec3), p.center as Vec3 | undefined);
+        const m = scaling4(p.value as Vec3);
+        const center = p.center as Vec3 | undefined;
+        if (p.orient_type !== 'LOCAL') return transformSelection(ctx, 'RESIZE', m, center);
+        // Blender's Resize under a constraint scales in the constraint space (transform_constraints.cc
+        // applyAxisConstraintSize: smat = spacemtx · size · spacemtx⁻¹; applyObjectConstraintSize the
+        // same in each object's axes)
+        const along = (o: Mat4) => multiply4(o, multiply4(m, invert4(o)));
+        transformSelection(ctx, 'RESIZE', along(orientationOf(ctx, 'LOCAL')), center, along);
       },
     }),
   );

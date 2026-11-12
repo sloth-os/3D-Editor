@@ -225,10 +225,11 @@ describe('editor command timeouts', () => {
    * every request waits while the server holds up its event loop (a save and the two short holds
    * right after it, the minute's read, an editor opening the project): a timeout_ms of a few seconds
    * can run out in these alone, which round 12's message did not name. Round 13 names the editor's
-   * own short holds too: its statistics overlay counting every mesh again when the frame rate it
-   * shows changes (Viewport.tsx InfoOverlay reads fps; session.ts sceneStats), measured 0.197-0.244 s
-   * with 4 million triangles 1.1-1.8 s after a person's own edit, and its thumbnail copy
-   * (session.ts scheduleIndexUpdate).
+   * thumbnail copy too (session.ts scheduleIndexUpdate). Round 13's first change named its statistics
+   * overlay counting every mesh again when the frame rate it showed changed (0.197-0.244 s with 4
+   * million triangles, 1.1-1.8 s after a person's own edit); the overlay now counts a mesh once, when
+   * it changes (session.ts meshCounts), and draws the frame rate apart (Viewport.tsx FrameRate), so
+   * the message names it no more, and gives the select's and a move's times measured since.
    */
   const viewport = (command: string) =>
     `'${command}' waits while the editor's main thread is busy, and while the server holds up every request: ` +
@@ -240,11 +241,9 @@ describe('editor command timeouts', () => {
     'the wires of every mesh; with millions of triangles it is also busy while it carries out a command ' +
     `(with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}) and while it applies a change ` +
     `made elsewhere (${CHANGE_APPLY_SECONDS} for an agent's move of an object among 4 million triangles); it is ` +
-    'also busy while its statistics overlay counts every mesh again, which it does when the frame rate it shows ' +
-    "changes as the viewport keeps drawing (0.19–0.25 s with 4 million triangles, 1.1–1.8 s after a person's own " +
-    "edit in it), and while it copies the frame its viewport drew into the project's thumbnail (at most 0.1 s " +
-    'with 4 million triangles), once per change, 3 s after it or, until the viewport has drawn it, at the first ' +
-    'of its tries every 0.5 s after that, but not while it draws its other frames.';
+    "also busy while it copies the frame its viewport drew into the project's thumbnail (at most 0.1 s with 4 " +
+    'million triangles), once per change, 3 s after it or, until the viewport has drawn it, at the first of its ' +
+    'tries every 0.5 s after that, but not while it draws its other frames.';
   /**
    * The server cannot know the viewport's shading (the person can change it): switching to SOLID is
    * advised only for a viewport in another shading (a select of 4 million triangles in SOLID shading
@@ -460,7 +459,6 @@ describe('the measured costs', () => {
       ['FAST_SECONDS', FAST_SECONDS, 1],
       ['NEW_SHADER_SECONDS', NEW_SHADER_SECONDS, 1],
       ['MILLIONS_SOLID_SECONDS', MILLIONS_SOLID_SECONDS, 1],
-      ['MILLIONS_SELECT_SECONDS', MILLIONS_SELECT_SECONDS, 1],
       ['SERVER_SOLID_SECONDS', SERVER_SOLID_SECONDS, 2],
       ['SERVER_SOLID_SCENE_SECONDS', SERVER_SOLID_SCENE_SECONDS, 1],
       ['BROWSER_RASTER_SECONDS', BROWSER_RASTER_SECONDS, 3],
@@ -469,6 +467,10 @@ describe('the measured costs', () => {
       expect(found, name).toHaveLength(count);
       for (const [lo, hi] of found) expect(lo, name).toBeLessThan(hi);
     }
+    // a select with 4 million triangles takes hundredths of a second since round 13 (its range's lower
+    // end rounds to 0), and an agent's move holds the editor for no long task: upper bounds
+    expect(MILLIONS_SELECT_SECONDS).toMatch(/^at most \d\.\d s$/);
+    expect(CHANGE_APPLY_SECONDS).toMatch(/^at most \d\.\d s$/);
     expect(Number(BUSY_FACTOR)).toBeGreaterThan(1);
     expect(BUSY_LOADS).toMatch(/^\d+(\.\d+)?–\d+(\.\d+)?$/);
     // every range was widened by the margin (editor-costs.ts says why), and the texts say so
@@ -681,8 +683,8 @@ describe('the cost of screenshots', () => {
   /*
    * The doc comment of MILLIONS_SELECT_SECONDS said a select waits "after the frame or screenshot it
    * is drawing": the viewport's frames do not hold a command up (round 11's TEXTS agent profiled the
-   * select: the statistics overlay counts the edges of every mesh again), only a screenshot, and the
-   * first frames that build materials or wires, do.
+   * select: the statistics overlay counted the edges of every mesh again, which round 13's code no
+   * longer does), only a screenshot, and the first frames that build materials or wires, do.
    */
   it("say in the doc comment of MILLIONS_SELECT_SECONDS that the viewport's frames do not hold a select up", () => {
     const src = readFileSync(
@@ -693,10 +695,11 @@ describe('the cost of screenshots', () => {
     const comment = src.slice(src.lastIndexOf('/**', at), at).replace(/\s*\n\s*\* ?/g, ' ');
     expect(comment).toContain(
       "once its main thread is free (after a screenshot it is drawing; the viewport's frames do not hold it " +
-        'up, apart from the first ones that build materials or wires), counting the edges of every mesh ' +
-        'again for the statistics overlay',
+        'up, apart from the first ones that build materials or wires), also one sent as soon as a SOLID ' +
+        'screenshot had answered.',
     );
     expect(comment).not.toContain('after the frame or screenshot it is drawing');
+    expect(comment).not.toContain('statistics overlay');
   });
 
   it('give the measurements behind the texts in the doc comment of editorTimeoutMessage', () => {
@@ -709,10 +712,10 @@ describe('the cost of screenshots', () => {
     );
     expect(docComment).toContain(
       'The times come from editor-costs.ts (its header says how they were measured and made: calm runs of ' +
-        'nine agents in headless Chromium with software WebGL, pooled, widened by MARGIN_PERCENT, the longest ' +
-        'select and SOLID screenshot with 4 million triangles by MILLIONS_MARGIN_PERCENT; on a machine kept ' +
-        'busy by other processes the same steps took up to BUSY_FACTOR times as long, which the messages say ' +
-        'with {@link measuredNote}).',
+        "nine agents in headless Chromium with software WebGL, pooled (a select with 4 million triangles: one agent's " +
+        "runs of round 13's code), widened by MARGIN_PERCENT, the longest select and SOLID screenshot with 4 " +
+        'million triangles by MILLIONS_MARGIN_PERCENT; on a machine kept busy by other processes the same steps ' +
+        'took up to BUSY_FACTOR times as long, which the messages say with {@link measuredNote}).',
     );
     for (const name of [
       '{@link FIRST_SHADING_SECONDS} for a scene of 81 objects and 71 materials',

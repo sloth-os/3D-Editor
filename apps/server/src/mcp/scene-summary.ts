@@ -773,7 +773,7 @@ function dataSummary(
     const out: Record<string, unknown> = {
       kind: 'mesh',
       mesh: block?.name ?? o.data,
-      users: scene.dataUsers(o.data),
+      users: ctx ? ctx.users(o.data) : scene.dataUsers(o.data),
     };
     const stored = notLoaded ? scene.meshCounts(o.data) : null;
     if (stored)
@@ -845,7 +845,7 @@ function dataSummary(
     if (!c) return null;
     const out = curveSummary(c, o.type, detailed);
     if (typeof out.bevel_object === 'string') out.bevel_object = nameOf(scene, out.bevel_object);
-    out.users = scene.dataUsers(o.data);
+    out.users = ctx ? ctx.users(o.data) : scene.dataUsers(o.data);
     if (ev?.mesh) out.evaluated = meshStats(ev.mesh);
     else {
       out.evaluated = 'wire (no surface: add bevel_depth, extrude or a 2D fill)';
@@ -940,6 +940,12 @@ interface SummaryContext {
   viewportOf(id: string): EvaluatedObject | undefined;
   /** Shape keys of a mesh with their values at the frame. */
   shapeKeys(meshId: string): ShapeKeyData[];
+  /**
+   * The number of objects using a data block, from one count of all of them per context: asking
+   * SceneDoc.dataUsers for each listed object read every object again, so get_scene took time in N²
+   * (5,000 listed objects of 10,000 read 50 million).
+   */
+  users(dataId: string): number;
 }
 
 /**
@@ -980,6 +986,7 @@ function summaryContext(
       ? shown
       : null;
   let fs: FrameState | null = null;
+  let users: Map<string, number> | null = null;
   return {
     ev,
     problems: problemsByObject(scene, ev),
@@ -991,6 +998,7 @@ function summaryContext(
       fs ??= new FrameState(scene, ev.frame);
       return fs.get<{ shape_keys: ShapeKeyData[] }>('mesh', meshId)?.shape_keys ?? scene.getShapeKeys(meshId);
     },
+    users: (dataId) => (users ??= scene.dataUserCounts()).get(dataId) ?? 0,
   };
 }
 

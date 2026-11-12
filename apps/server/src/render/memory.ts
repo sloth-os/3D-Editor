@@ -409,9 +409,11 @@ export interface OpenProjectSize {
  * changes): per byte kept 3.1 for vertex group weights, 3.1 for shape keys and 5.7 for meshes (53, 53
  * and 63 MB kept; resident memory, the heap does not hold this binary data), rounded up as core
  * SAVE_BYTES_PER_LAYER_BYTE; per item, the locations of objects that 100 moves of 1,000 and 2,000
- * objects replaced (100,000 and 200,000 items of 152 bytes each counted): 1,103 and 1,254 bytes of
- * heap at the peak of the save (before its garbage collections), of which {@link
- * HISTORY_SAVE_BYTES_PER_BYTE} counts 912; rounded up.
+ * objects replaced (100,000 and 200,000 items of 152 bytes each counted): 1,084–1,171 and
+ * 1,116–1,685 bytes of heap at the peak of the save (before its garbage collections; the peak with
+ * the history less the peak without it, over 3 and 4 runs of each, which vary with when the save's
+ * garbage collections run), of which {@link HISTORY_SAVE_BYTES_PER_BYTE} counts 912: with these
+ * 1,000 bytes, 1,912 per item, 13% above the largest.
  */
 export const HISTORY_SAVE_BYTES_PER_BYTE = 6;
 export const HISTORY_SAVE_BYTES_PER_ITEM = 1_000;
@@ -419,8 +421,9 @@ export const HISTORY_SAVE_BYTES_PER_ITEM = 1_000;
 /**
  * What the agents' undo histories keep in the document of `scene` (`kept`, bytes; core counts none of
  * it) and what a save of the project takes for it for a moment besides (`save`). Each history keeps
- * at most MCP_UNDO_MEMORY_MB of replaced or deleted data and its newest step, and frees it when its
- * session (or agent id) ends (mcp/history.ts).
+ * at most MCP_UNDO_MEMORY_MB of replaced or deleted data, each item counted with its share of a save
+ * (mcp/history.ts BUDGET_BYTES_PER_ITEM: so its save takes at most 6 times MCP_UNDO_MEMORY_MB), and
+ * its newest step, and frees it when its session (or agent id) ends (mcp/history.ts).
  */
 export function heldByHistories(scene: SceneDoc): { kept: number; save: number } {
   const h = historyKept(scene.ydoc);
@@ -734,24 +737,37 @@ function withHeld(req: OperatorMemoryRequest): ProjectRequest {
 function heldShares(p: { simulation?: number; history?: number }): string[] {
   const shares: string[] = [];
   if ((p.simulation ?? 0) > 0) shares.push(`${mbUp(p.simulation!)} MB of it its rigid body cache`);
-  if ((p.history ?? 0) >= MB) shares.push(`${mbUp(p.history!)} MB of it kept by agents' undo histories`);
+  if ((p.history ?? 0) >= MB) shares.push(`${mbUp(p.history!)} ${HISTORY_SHARE}`);
   return shares;
 }
+
+/** The end of the share {@link heldShares} names for what the agents' undo histories keep. */
+const HISTORY_SHARE = "MB of it kept by agents' undo histories";
 
 /**
  * The end of a refusal that names what agents' undo histories keep ({@link heldShares}): when the
  * agents get it back (mcp/history.ts; deleting objects moves them into the deleting agent's
  * history; a step is dropped at a later step of its agent, the newest step always kept; agent ids
- * end 6 hours after their last session, mcp/hub.ts).
+ * end 6 hours after their last session, or when more than 200 are kept and one without a session
+ * is the least recently used, mcp/hub.ts).
  */
 export const HISTORY_ADVICE =
   ". What agents' undo histories keep (the objects an agent deletes too) is freed when the agent's " +
-  'session ends (for an agent id, 6 hours after its last session) or its step is dropped: the oldest ' +
-  "steps are, beyond MCP_UNDO_STEPS steps or MCP_UNDO_MEMORY_MB of what they keep, at that agent's next step";
+  'session ends (for an agent id, 6 hours after its last session, or earlier when the server keeps ' +
+  'more than 200 agent ids and this one is the least recently used without a session) or its step is ' +
+  "dropped: the oldest steps are, beyond MCP_UNDO_STEPS steps or MCP_UNDO_MEMORY_MB of what they keep, at that agent's next step";
 
 /** {@link HISTORY_ADVICE} when one of `projects` names its undo histories' share (from 1 MB). */
 const historyAdvice = (...projects: readonly { history?: number }[]): string =>
   projects.some((p) => (p.history ?? 0) >= MB) ? HISTORY_ADVICE : '';
+
+/**
+ * {@link HISTORY_ADVICE} when `clause` (a reason {@link projectGrowthRefusal} gave) names what the
+ * agents' undo histories keep in a project, else '': for the refusals of changes that do not come
+ * from an operator (sync/project-memory.ts).
+ */
+export const historyAdviceFor = (clause: string): string =>
+  clause.includes(HISTORY_SHARE) ? HISTORY_ADVICE : '';
 
 /**
  * "…, and a save of it about S MB more for a moment (…): T MB in all, " (', ' without a save); `layers`:

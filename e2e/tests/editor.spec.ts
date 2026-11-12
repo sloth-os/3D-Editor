@@ -1,5 +1,13 @@
 import { test, expect } from '@playwright/test';
-import { menuPath, newProject, outlinerNames, runFromPalette, setNumberField, statNumber } from './helpers';
+import {
+  fieldNumber,
+  menuPath,
+  newProject,
+  outlinerNames,
+  runFromPalette,
+  setNumberField,
+  statNumber,
+} from './helpers';
 
 test.describe('editor', () => {
   test('creates a project with the default scene and adds objects from menus', async ({ page }) => {
@@ -66,6 +74,28 @@ test.describe('editor', () => {
     await page.keyboard.press('Escape');
     await expect(page.getByTestId('hud')).toHaveCount(0);
     await expect(page.getByTestId('loc-1')).toContainText('2 m');
+  });
+
+  test('S X X scales along the object’s own X axis (LOCAL)', async ({ page }) => {
+    await newProject(page);
+    await page.getByTestId('outliner-Cube').click();
+    await page.getByTestId('prop-tab-object').click();
+    await setNumberField(page, 'rot-2', 90);
+    const vp = page.getByTestId('viewport');
+    await vp.hover();
+    await page.keyboard.press('s');
+    await page.keyboard.press('x');
+    await expect(page.getByTestId('hud')).toContainText('along global X');
+    await page.keyboard.press('x');
+    await expect(page.getByTestId('hud')).toContainText('along local X');
+    await page.keyboard.type('2');
+    await expect(page.getByTestId('hud')).toContainText('Scale X: 2.0000  Y: 1.0000  Z: 1.0000');
+    await page.keyboard.press('Enter');
+    // the cube is turned 90° about Z: along its own X axis its X scale doubles (along the world's
+    // X axis its Y scale would)
+    await expect.poll(() => fieldNumber(page, 'scale-0')).toBeCloseTo(2, 3);
+    await expect.poll(() => fieldNumber(page, 'scale-1')).toBeCloseTo(1, 3);
+    await expect.poll(() => fieldNumber(page, 'rot-2')).toBeCloseTo(90, 3);
   });
 
   test('Esc closes the Projects window (Ctrl+O), also after a click inside it', async ({ page }) => {

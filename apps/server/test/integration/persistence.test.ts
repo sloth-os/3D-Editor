@@ -139,7 +139,8 @@ describe('WebDAV persistence', () => {
       WEBDAV_BASE_PATH: '/3d-editor',
     };
     let server = await startServer(env);
-    cleanup.push(() => server.cleanup());
+    const first = server;
+    cleanup.push(() => first.cleanup());
     expect(server.handle.persistence.mode).toBe('webdav');
     const ready = await api(server.url, '/readyz');
     expect(ready.status).toBe(200);
@@ -175,6 +176,7 @@ describe('WebDAV persistence', () => {
     await server.close();
 
     server = await startServer(env);
+    cleanup.push(() => server.cleanup());
     cleanup.push(() => server.close());
     const snap = await api(server.url, `/api/projects/${id}/snapshot`);
     const names = snap.body.objects.map((o: { name: string }) => o.name);

@@ -16,8 +16,9 @@ import * as Y from 'yjs';
  * AgentHistory owns an agent's UndoManager in one project and keeps what it holds bounded:
  * - data created and deleted inside one step (a batch that edits the same mesh many times) is never
  *   needed to undo or redo that step (Yjs skips it), so it is collected right away;
- * - at most `maxSteps` undo steps are kept, and at most `maxBytes` of replaced or deleted data
- *   (the newest step is always kept); older steps are dropped and their data collected;
+ * - at most `maxSteps` undo steps are kept, and at most `maxBytes` of replaced or deleted data,
+ *   each item counted with its share of a save ({@link BUDGET_BYTES_PER_ITEM}; the newest step is
+ *   always kept); older steps are dropped and their data collected;
  * - steps that Yjs drops itself are collected: redo steps (a new change after an undo) and undo or
  *   redo steps that had nothing left to change when they were applied (Yjs discards those silently);
  * - restored copies (undo and redo restore deleted data as copies, which Yjs keeps from the start)
@@ -61,10 +62,22 @@ export interface HistoryLimits {
   maxSteps: number;
   /**
    * Replaced or deleted data kept for undo, per agent and project, in bytes (an estimate of the
-   * items' content); the oldest steps are dropped beyond it, but the newest step is always kept.
+   * items' content, and {@link BUDGET_BYTES_PER_ITEM} per item); the oldest steps are dropped
+   * beyond it, but the newest step is always kept.
    */
   maxBytes: number;
 }
+
+/**
+ * What `maxBytes` counts for each item a history keeps besides the item's bytes: its share of a
+ * save. A save of the project takes 6 times the bytes the histories keep and 1,000 bytes for each
+ * item (render/memory.ts HISTORY_SAVE_BYTES_PER_BYTE, HISTORY_SAVE_BYTES_PER_ITEM; 1,000 / 6,
+ * rounded up), so what a history within its budget adds to a save is at most 6 times `maxBytes`,
+ * also when it keeps many small values: counted by their bytes alone, 64 MB held 441,505 replaced
+ * locations (152 bytes each), whose save was estimated at 805 MB, more than the server keeps for a
+ * whole project with the default heap.
+ */
+export const BUDGET_BYTES_PER_ITEM = 167;
 
 export const DEFAULT_HISTORY_LIMITS: HistoryLimits = {
   maxSteps: 100,
@@ -215,11 +228,14 @@ function liveSteps(doc: Y.Doc): StackItem[] {
   return steps;
 }
 
-/** Calls `f` with every struct of `store` that has a clock in `ds` (whole structs, none split). */
-function structsIn(store: Y.Doc['store'], ds: DeleteSet, f: (struct: Y.AbstractStruct) => void): void {
-  ds.clients.forEach((ranges, client) => {
+/**
+ * Calls `f` with every struct of `store` that has a clock in `ds` (whole structs, none split), until
+ * `f` returns false.
+ */
+function structsIn(store: Y.Doc['store'], ds: DeleteSet, f: (struct: Y.AbstractStruct) => boolean): void {
+  for (const [client, ranges] of ds.clients) {
     const structs = store.clients.get(client);
-    if (!structs?.length) return;
+    if (!structs?.length) continue;
     const last = structs[structs.length - 1];
     const state = last.id.clock + last.length;
     for (const { clock, len } of ranges) {
@@ -229,9 +245,9 @@ function structsIn(store: Y.Doc['store'], ds: DeleteSet, f: (struct: Y.AbstractS
         i < structs.length && structs[i].id.clock < clock + len;
         i++
       )
-        f(structs[i]);
+        if (!f(structs[i])) return;
     }
-  });
+  }
 }
 
 /** Calls `f` with every item below the container `c` (in its map and its list, nested ones too). */
@@ -257,8 +273,34 @@ function keptBelow(c: Y.Item): boolean {
   return kept;
 }
 
-/** Items the live steps may visit at most when the server looks for those that reach containers. */
-const REACH_BUDGET = 500_000;
+/**
+ * The live steps of `doc` in the order {@link reachers} visits them: the undo steps of all histories
+ * from the newest (those kept longest), then the redo steps (the agent's next change clears them). So
+ * the steps that count as reaching everything past {@link reachSearch}'s budget are those dropped
+ * soonest.
+ */
+function stepsNewestFirst(doc: Y.Doc): StackItem[] {
+  const hs = [...(histories.get(doc) ?? [])];
+  const steps: StackItem[] = [];
+  for (let i = 1, more = true; more; i++) {
+    more = false;
+    for (const h of hs) {
+      const undo = h.undo.undoStack;
+      if (undo.length < i) continue;
+      steps.push(undo[undo.length - i]);
+      more = true;
+    }
+  }
+  for (const h of hs) steps.push(...h.undo.redoStack);
+  return steps;
+}
+
+/**
+ * `budget`: items the live steps may visit at most when the server looks for those that reach
+ * containers ({@link reachers}; tests lower it). A visit takes 0.1–0.2 µs (measured over 200,000 and
+ * 500,000 items), so a search takes 10–30 ms at most.
+ */
+export const reachSearch = { budget: 100_000 };
 
 /**
  * For each deleted container of `candidates`, the live undo and redo steps of `doc`'s histories that
@@ -269,8 +311,8 @@ const REACH_BUDGET = 500_000;
  * it are replaced by bare placeholders: a link that leads below it would end there (an undo then
  * leaves a copy it should delete, or fails inside Yjs). redoItem also walks the items next to a
  * deleted item (after it under its key, or in its list) and their links: those are the children of
- * its parent or of the parent's copies, which the parent's links reach. Past {@link REACH_BUDGET}
- * items, every step left counts as reaching every candidate.
+ * its parent or of the parent's copies, which the parent's links reach. Past the budget of
+ * {@link reachSearch}, every step left counts as reaching every candidate.
  */
 function reachers(doc: Y.Doc, candidates: Set<Y.Item>): Map<Y.Item, Set<StackItem>> {
   const store = doc.store;
@@ -280,27 +322,32 @@ function reachers(doc: Y.Doc, candidates: Set<Y.Item>): Map<Y.Item, Set<StackIte
     if (!steps) out.set(c, (steps = new Set()));
     steps.add(s);
   };
-  let budget = REACH_BUDGET;
-  for (const s of liveSteps(doc)) {
-    const seen = new Set<Y.Item>();
-    const queue: Y.Item[] = [];
-    const visit = (struct: Y.AbstractStruct | null): void => {
-      if (!(struct instanceof Y.Item) || seen.has(struct) || budget <= 0) return;
-      seen.add(struct);
-      budget--;
-      for (let item: Y.Item | null = struct; item; item = (item.parent as Y.AbstractType<any>)._item)
-        if (candidates.has(item)) reached(item, s);
-      queue.push(struct);
-    };
-    structsIn(store, s.insertions, visit);
-    structsIn(store, s.deletions, (d) => {
-      if (!(d instanceof Y.Item)) return;
-      visit(d);
-      const parent = (d.parent as Y.AbstractType<any>)._item;
-      if (parent?.deleted) visit(parent);
-    });
-    for (let item = queue.pop(); item; item = queue.pop())
-      if (item.redone) visit(Y.getItem(store, item.redone));
+  let budget = reachSearch.budget;
+  for (const s of stepsNewestFirst(doc)) {
+    if (budget > 0) {
+      const seen = new Set<Y.Item>();
+      const queue: Y.Item[] = [];
+      /** Visits `struct` once; false when the budget is spent. */
+      const visit = (struct: Y.AbstractStruct | null): boolean => {
+        if (budget <= 0) return false;
+        if (!(struct instanceof Y.Item) || seen.has(struct)) return true;
+        seen.add(struct);
+        budget--;
+        for (let item: Y.Item | null = struct; item; item = (item.parent as Y.AbstractType<any>)._item)
+          if (candidates.has(item)) reached(item, s);
+        queue.push(struct);
+        return true;
+      };
+      structsIn(store, s.insertions, visit);
+      structsIn(store, s.deletions, (d) => {
+        if (!(d instanceof Y.Item)) return true;
+        const parent = (d.parent as Y.AbstractType<any>)._item;
+        return visit(d) && (!parent?.deleted || visit(parent));
+      });
+      for (let item = queue.pop(); item && budget > 0; item = queue.pop())
+        if (item.redone) visit(Y.getItem(store, item.redone));
+    }
+    // past the budget (also for this step, when it ran out in it), it counts as reaching them all
     if (budget <= 0) for (const c of candidates) reached(c, s);
   }
   return out;
@@ -660,7 +707,10 @@ export class AgentHistory {
     });
   }
 
-  /** Kept bytes of a stack item; collects the data created and deleted within it when it changed. */
+  /**
+   * What a stack item counts against `maxBytes`: its kept bytes and {@link BUDGET_BYTES_PER_ITEM}
+   * per kept item. Collects the data created and deleted within it when it changed.
+   */
   private sizeOf(s: StackItem): number {
     let size = this.sizes.get(s);
     if (size === undefined || this.stale.has(s)) {
@@ -668,7 +718,7 @@ export class AgentHistory {
       this.sizes.set(s, size);
       this.stale.delete(s);
     }
-    return size.bytes;
+    return size.bytes + BUDGET_BYTES_PER_ITEM * size.items;
   }
 
   /**

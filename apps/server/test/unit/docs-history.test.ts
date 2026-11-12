@@ -1,8 +1,17 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SceneDoc, createGrid } from '@3d-editor/core';
-import { AgentHistory, DEFAULT_HISTORY_LIMITS, KEPT_CONTAINER_ITEM_BYTES } from '../../src/mcp/history';
+import {
+  AgentHistory,
+  BUDGET_BYTES_PER_ITEM,
+  DEFAULT_HISTORY_LIMITS,
+  KEPT_CONTAINER_ITEM_BYTES,
+} from '../../src/mcp/history';
+import { registerTools, type ToolContext } from '../../src/mcp/tools';
 import {
   HISTORY_ADVICE,
   HISTORY_SAVE_BYTES_PER_BYTE,
@@ -77,7 +86,9 @@ describe("docs: what the agents' undo histories keep", () => {
     );
     expect(mcp).toContain("(`… MB of it kept by agents' undo histories`, see [Errors](#errors))");
     // the advice that ends an operator's refusal naming the share, word for word
-    expect(mcp).toContain(`An operator's refusal that names it ends \`${HISTORY_ADVICE}\`;`);
+    expect(mcp).toContain(
+      `An operator's refusal that names it, and the refusal of a browser editor's changes, ends \`${HISTORY_ADVICE}\`;`,
+    );
     expect(architecture).toContain(
       `an operator's refusal ends with when it is freed: \`${HISTORY_ADVICE}\`.`,
     );
@@ -91,8 +102,16 @@ describe("docs: what the agents' undo histories keep", () => {
     const config = source('config.ts');
     expect(config).toContain('MCP_UNDO_STEPS: z.coerce.number().int().min(1).max(10000).default(100),');
     expect(config).toContain('MCP_UNDO_MEMORY_MB: z.coerce.number().min(0).max(65536).default(64),');
-    // agent identities (and their histories) end 6 hours after their last session
+    // agent identities (and their histories) end 6 hours after their last session, and beyond 200
+    // the least recently used without a session end first
     expect(source('mcp/hub.ts')).toContain('this.identityTtlMs = opts.identityTtlMs ?? 6 * 60 * 60 * 1000;');
+    expect(source('mcp/hub.ts')).toContain('const max = Math.max(1, this.opts.maxIdentities ?? 200);');
+    expect(source('mcp/hub.ts')).toContain('.filter((x) => x.sessions <= 0 && x !== id)');
+    // so a refusal's advice says both
+    expect(HISTORY_ADVICE).toContain(
+      "is freed when the agent's session ends (for an agent id, 6 hours after its last session, or earlier " +
+        'when the server keeps more than 200 agent ids and this one is the least recently used without a session)',
+    );
     expect(mcp).toContain(
       'it keeps the last 100 steps and at most 64 MB of replaced or deleted data (the server settings ' +
         '`MCP_UNDO_STEPS` and `MCP_UNDO_MEMORY_MB`;',
@@ -100,13 +119,24 @@ describe("docs: what the agents' undo histories keep", () => {
     expect(mcp).toContain(
       'Older steps are dropped and what they kept is freed, the newest one is always kept',
     );
+    // the limit counts each replaced value with its share of a save (64 MB: 210,000 moved locations)
+    expect(mcp).toContain(
+      `So the limit counts each replaced value with ${BUDGET_BYTES_PER_ITEM} bytes more than its own (its share of a ` +
+        'save), and a history adds at most six times the limit to a save, also with many small values: 64 MB hold ' +
+        '210,000 replaced locations of 152 bytes (30 MB), whose save takes about 383 MB more.',
+    );
+    expect(mcp).toContain(
+      `per agent and project, each replaced value counted with ${BUDGET_BYTES_PER_ITEM} bytes more, and always its newest step)`,
+    );
     expect(mcp).toContain(
       'It is freed when the history ends: when the session ends, or for an agent id 6 hours after its ' +
-        'last session, and when the project is unloaded or deleted.',
+        'last session (or earlier when the server keeps more than 200 agent ids and this one is the least ' +
+        'recently used without a session), and when the project is unloaded or deleted.',
     );
     expect(mcp).toContain(
       '| Undo history | 100 steps and 64 MB of replaced or deleted data per agent and project ' +
-        "(`MCP_UNDO_STEPS`, `MCP_UNDO_MEMORY_MB`; the newest step always kept), counted in the project's memory limit |",
+        `(\`MCP_UNDO_STEPS\`, \`MCP_UNDO_MEMORY_MB\`; each replaced value counted with ${BUDGET_BYTES_PER_ITEM} bytes more; ` +
+        "the newest step always kept), counted in the project's memory limit |",
     );
     expect(architecture).toContain(
       'at most `MCP_UNDO_MEMORY_MB` per agent and project and always its newest step, freed when the ' +
@@ -119,15 +149,51 @@ describe("docs: what the agents' undo histories keep", () => {
     expect(architecture).toContain('The memory checks count them at 280 bytes for each item they keep');
     expect(architecture).toContain("and deleted objects kept for undo's links, 280 bytes per item)");
     expect(guide).toContain(
+      'at most 64 MB of replaced or deleted data (server defaults; each replaced value counts with ' +
+        `${BUDGET_BYTES_PER_ITEM} bytes more)`,
+    );
+    expect(guide).toContain(
       'counts in the memory the server keeps for the project until your session ends (with an agent id, ' +
-        '6 hours after your last session).',
+        '6 hours after your last session, or earlier when the server keeps more than 200 agent ids and ' +
+        'yours is the least recently used without a session).',
     );
     const readme = repo('README.md')
       .split('\n')
       .find((l) => l.startsWith('| `MCP_UNDO_MEMORY_MB`'));
     expect(flat(readme ?? '')).toContain(
-      "(the newest step is always kept). It counts in the project's memory limit and is freed when the " +
-        'session or agent id ends',
+      `in MB (${BUDGET_BYTES_PER_ITEM} bytes more per value); older steps are dropped beyond it, never the newest. ` +
+        "It counts in the project's memory limit and is freed when the session or agent id ends",
     );
+  });
+
+  it("the undo and redo tools say when the history ends and that it counts in the project's memory", async () => {
+    const server = new McpServer({ name: 'docs-history', version: '0' });
+    // registration reads only the history limits (the handlers use the rest of the context)
+    registerTools(server, { historyLimits: { maxSteps: 7, maxBytes: 3 * MB } } as unknown as ToolContext);
+    const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: 'docs-history', version: '0' });
+    await server.connect(serverSide);
+    await client.connect(clientSide);
+    try {
+      const { tools } = await client.listTools();
+      for (const name of ['undo', 'redo']) {
+        const description = tools.find((t) => t.name === name)?.description ?? '';
+        expect(description, name).toContain(
+          'It ends, and what it keeps is freed, when the session ends (for an agent id, 6 hours after ' +
+            'its last session, or earlier when the server keeps more than 200 agent ids and this one is the ' +
+            'least recently used without a session), when the project is unloaded or deleted, or when the ' +
+            'server restarts.',
+        );
+        expect(description, name).toContain(
+          'It keeps the last 7 steps per project and at most 3 MB of replaced or deleted data, each replaced ' +
+            `value counted with ${BUDGET_BYTES_PER_ITEM} bytes more for what a save of the project takes for it ` +
+            '(older steps are dropped; the newest step is always kept). What it keeps, also the objects the ' +
+            "agent deleted, counts in the project's memory limit.",
+        );
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 });

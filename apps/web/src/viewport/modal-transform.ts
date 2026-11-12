@@ -5,6 +5,7 @@ import {
   cross3,
   identity4,
   invert4,
+  multiply4,
   normalize3,
   orientAxes,
   scaling4,
@@ -16,6 +17,7 @@ import {
   transformVertices,
   translation4,
   type Mat4,
+  type ObjectMatrix,
   type TransformMode,
   type Vec3,
 } from '@3d-editor/core';
@@ -24,7 +26,10 @@ import type { ProjectSession } from '../project/session';
 
 export type ModalKind = 'translate' | 'rotate' | 'resize';
 type Axis = 'X' | 'Y' | 'Z';
-/** The axes a constraint is in: the world's, or the active object's (Blender's LOCAL orientation). */
+/**
+ * The axes a constraint is in: the world's, or the active object's (Blender's LOCAL orientation;
+ * several objects each move in their own).
+ */
 export type ConstraintOrientation = 'GLOBAL' | 'LOCAL';
 
 const AXIS_INDEX: Record<Axis, 0 | 1 | 2> = { X: 0, Y: 1, Z: 2 };
@@ -49,8 +54,9 @@ const MODES: Record<ModalKind, TransformMode> = {
 
 /**
  * Interactive G / R / S transform (Blender style): mouse-driven with axis/plane constraints
- * (X/Y/Z, Shift+X/Y/Z; for a move or rotation pressed again in the active object's axes, see
- * {@link setAxis}), typed numeric input, Ctrl snapping and Shift precision.
+ * (X/Y/Z, Shift+X/Y/Z; pressed again, in the LOCAL orientation: the active object's axes, or each
+ * object's own when several move, see {@link setAxis}), typed numeric input, Ctrl snapping and
+ * Shift precision.
  * The preview is local only; confirming runs the equivalent core operator so the result is one
  * undo step that syncs to every device. The preview shows what confirming stores: every object the
  * transform can move is drawn with the world matrix the scene evaluates once the operator stored
@@ -72,12 +78,13 @@ export class ModalTransform {
    * transform_generics.cc): the default and the scene's orientation (the editor's transform
    * orientation), then the other one (LOCAL when the scene's is GLOBAL, else GLOBAL). The
    * constraint is in the slot `orientSlot` (t->orient_curr), 0 while there is none (see setAxis).
-   * A scale has the world's axes only (see the constructor).
    */
   private readonly orientSlots: readonly ConstraintOrientation[];
   private orientSlot = 0;
   /** The LOCAL axes, as the operator confirming the transform reads them (read when first needed). */
   private localAxesRead: Mat4 | null = null;
+  /** Each object's own axes, by id, for a LOCAL constraint on several objects (see {@link objectMatrix}). */
+  private ownAxesRead: Map<string, Mat4> | null = null;
   /** A move's value in the axes of its constraint's orientation (what transform.translate stores). */
   private moveValue: Vec3 = [0, 0, 0];
   numeric = '';
@@ -105,11 +112,7 @@ export class ModalTransform {
     // the editor's orientations other than GLOBAL and LOCAL cannot be set (the operators take only
     // those two): they count as GLOBAL
     const scene: ConstraintOrientation = state.transformOrientation === 'LOCAL' ? 'LOCAL' : 'GLOBAL';
-    // a scale is confirmed by transform.resize, which scales along the world's axes only (it takes
-    // no orient_type, unlike Blender's Scale): its axis keys constrain along those, and a second
-    // press removes the constraint
-    this.orientSlots =
-      kind === 'resize' ? ['GLOBAL', 'GLOBAL'] : [scene, scene, scene === 'GLOBAL' ? 'LOCAL' : 'GLOBAL'];
+    this.orientSlots = [scene, scene, scene === 'GLOBAL' ? 'LOCAL' : 'GLOBAL'];
     // what the operator reads when the transform is confirmed: the scene at the current frame, as
     // the viewport shows it (rigid bodies where the simulation has them)
     const fs = transformFrameState(doc, state.frame);
@@ -151,10 +154,10 @@ export class ModalTransform {
    * An axis key (X, Y, Z; with Shift the plane without that axis), as Blender's
    * transform_event_modal_constraint (transform.cc) takes it: the first press constrains in the
    * scene's orientation (the editor's transform orientation, GLOBAL by default), the same key again
-   * in the next slot's (LOCAL after GLOBAL: the active object's axes, as transform.translate and
-   * transform.rotate take them with orient_type LOCAL), a third press removes the constraint;
-   * another axis or plane constrains in the scene's orientation again. A scale has no LOCAL slot
-   * (see orientSlots): its second press removes the constraint.
+   * in the next slot's (LOCAL after GLOBAL: the active object's axes, each object's own when several
+   * objects move, as transform.translate, transform.rotate and transform.resize take them with
+   * orient_type LOCAL), a third press removes the constraint; another axis or plane constrains in
+   * the scene's orientation again.
    */
   setAxis(axis: Axis, exclude: boolean): void {
     const same = this.axis === axis && this.planeExclude === exclude;
@@ -168,15 +171,16 @@ export class ModalTransform {
     this.update(this.last, { ctrl: false, shift: false });
   }
 
-  /** Whether the constraint is in the active object's axes (LOCAL). */
+  /** Whether the constraint is in the LOCAL orientation. */
   private get local(): boolean {
     return this.axis !== null && this.orientation === 'LOCAL';
   }
 
   /**
-   * The axes of the LOCAL orientation (columns X, Y, Z) as transform.translate and transform.rotate
-   * read them for orient_type LOCAL when the transform is confirmed (orientationOf in core's
-   * transform.ts): the active object's (see orientAxes), the world's without an active object.
+   * The axes of the LOCAL orientation (columns X, Y, Z) as transform.translate, transform.rotate and
+   * transform.resize read them for orient_type LOCAL when the transform is confirmed (orientationOf
+   * in core's transform.ts): the active object's (see orientAxes), the world's without an active
+   * object.
    */
   private get localAxes(): Mat4 {
     if (!this.localAxesRead) {
@@ -192,6 +196,37 @@ export class ModalTransform {
   /** The axes of the constraint's orientation, or null for the world's. */
   private constraintAxes(): Mat4 | null {
     return this.local ? this.localAxes : null;
+  }
+
+  /**
+   * The transform the preview gives each object (Object Mode): `current` for all, except under a
+   * LOCAL constraint on several objects, where transform.translate, transform.rotate and
+   * transform.resize build each object's from its own axes (Blender's setLocalConstraint; read as
+   * orientAxes gives them, from the scene at the current frame), with the value the header shows.
+   */
+  private objectMatrix(): ObjectMatrix {
+    if (!this.local || !this.objects || this.objects.targets.length < 2) return this.current;
+    if (!this.ownAxesRead) {
+      const { doc, state } = this.session;
+      const fs = transformFrameState(doc, state.frame);
+      this.ownAxesRead = new Map(this.objects.targets.map((t) => [t.id, orientAxes(fs, t.id)]));
+    }
+    const axes = this.ownAxesRead;
+    const k = AXIS_INDEX[this.axis ?? 'X'];
+    if (this.kind === 'translate')
+      return (id) => translation4(transformDirection3(axes.get(id)!, this.moveValue));
+    if (this.kind === 'rotate') {
+      const angle = this.rotAngle;
+      return (id) => {
+        const o = axes.get(id)!;
+        return axisAngle4([o[k * 4], o[k * 4 + 1], o[k * 4 + 2]], angle);
+      };
+    }
+    const s = scaling4(this.scaleValue);
+    return (id) => {
+      const o = axes.get(id)!;
+      return multiply4(o, multiply4(s, invert4(o)));
+    };
   }
 
   typeKey(key: string): boolean {
@@ -351,7 +386,9 @@ export class ModalTransform {
     }
     this.scaleValue = s;
     this.summary = `Scale X: ${s[0].toFixed(4)}  Y: ${s[1].toFixed(4)}  Z: ${s[2].toFixed(4)}`;
-    return scaling4(s);
+    // the matrix transform.resize builds for orient_type LOCAL: the scale along the LOCAL axes
+    const o = this.constraintAxes();
+    return o ? multiply4(o, multiply4(scaling4(s), invert4(o))) : scaling4(s);
   }
   scaleValue: Vec3 = [1, 1, 1];
 
@@ -392,7 +429,7 @@ export class ModalTransform {
   previewMatrices(): Map<string, Mat4> {
     if (!this.objects) return new Map();
     const pivot: Vec3 = [this.pivot.x, this.pivot.y, this.pivot.z];
-    return this.objects.worlds(this.objects.channels(this.current, pivot), {
+    return this.objects.worlds(this.objects.channels(this.objectMatrix(), pivot), {
       autoKeying: this.session.state.autoKeying,
     });
   }
@@ -419,6 +456,6 @@ export class ModalTransform {
           ? { value: this.rotAngle, orient_axis: this.axis, ...local, center: pivot }
           : { value: this.rotAngle, axis: this.rotAxis, center: pivot },
       };
-    return { operator: 'transform.resize', params: { value: this.scaleValue, center: pivot } };
+    return { operator: 'transform.resize', params: { value: this.scaleValue, ...local, center: pivot } };
   }
 }

@@ -134,10 +134,14 @@ keeps everything a tracked change deleted so that undo can restore it, and Yjs n
 garbage-collects such items, so an agent that kept replacing large meshes used to make the
 server's replica (and the saved project) grow with its whole edit history. Each agent now keeps at
 most `MCP_UNDO_STEPS` steps (default 100) and `MCP_UNDO_MEMORY_MB` of replaced or deleted data
-(default 64 MB) per project, the newest step always included. Dropped steps, data created and
-deleted again within one step, and everything a history held when it ends (its session or agent id
-expired, the project was deleted or unloaded) are garbage-collected; when the last history of a
-document ends, so is every item still kept in it.
+(default 64 MB) per project, the newest step always included. That budget counts each replaced
+value with 167 bytes more than its own (`BUDGET_BYTES_PER_ITEM`): a save takes 1,000 bytes for each
+besides six times the bytes, so a history within its budget adds at most six times it to a save,
+also when it keeps many small values (64 MB of moved locations alone held 441,505 of them, a save
+of about 805 MB; now 210,000, about 383 MB). Dropped steps, data created and deleted again within
+one step, and everything a history held when it ends (its session or agent id expired, the project
+was deleted or unloaded) are garbage-collected; when the last history of a document ends, so is
+every item still kept in it.
 
 The values one client writes to one key one after another (an agent moving an object, renaming
 vertex groups, adding shape keys; mesh data is binary and never merges) are items that Yjs merges
@@ -149,8 +153,8 @@ a history); it now holds 220,140 bytes, the value and the ten it replaced. An ag
 vertex group of a grid of 251,001 vertices back and forth (64 groups, which every rename writes
 again: 97 MB per step) added 97 MB to the saved project with every rename, and the server passed
 3.8 GB of resident memory at the eighth; now the project stays at 209 MB over 20 renames and the
-server at 1,437 MB at most (default heap, disk persistence). What the histories keep counts in the
-server's memory checks, and in a save of the project, which carries it (see
+server peaked at 1,432–1,442 MB in three runs (default heap, disk persistence). What the histories
+keep counts in the server's memory checks, and in a save of the project, which carries it (see
 [Server render processes](#server-render-processes)).
 
 Undo and redo restore deleted items as copies and link each original to its copy; undoing a step
@@ -159,10 +163,12 @@ the latest copy of a deleted parent. A deleted object (a nested map) is collecte
 below it, which leaves bare placeholders without links there, so the history keeps a deleted object
 whose fields have such links, their values collected, while a step of any agent that can follow a
 link into it is kept. No later step can, so it is collected once those steps are dropped, applied or
-cleared. An agent that deleted 1,000 linked cubes and undid it, six times, kept 6,021 deleted
-objects until the step that created the cubes was dropped, then none: the encoded document went
-from 4,691 to 1,298 KB and the heap from 88 to 64 MB (the history before kept them until the last
-history of the document ended). The memory checks count them at 280 bytes for each item they keep,
+cleared. The search for those steps visits at most 100,000 items of the live steps, newest steps
+first (10–30 ms measured); past that, the oldest steps count as reaching it. An agent that deleted
+1,000 linked cubes and undid it, six times, kept 6,021 deleted objects until the step that created
+the cubes was dropped, then none: the encoded document went from 4,691 to 1,298 KB and the heap
+from 88–93 to 64–69 MB in four runs (the history before kept them until the last history of the
+document ended). The memory checks count them at 280 bytes for each item they keep,
 the object and each of its fields (225–274 bytes measured after full garbage collections, over
 rounds of deleting 400 and 1,000 cubes and undoing it: 6.8–8.2 KB per cube).
 
@@ -568,8 +574,8 @@ the event loop:
   keyframes count them (core `operators/memory-keyframes.ts`): 180 bytes per keyframe at the peak
   and 120 kept, 1,200 per F-curve written (3,500 for a bake), 180 per keyframe of an F-curve they
   rewrite (`anim.keyframes_insert_many` 200 and 400: 100,000 keyframes between the 100,000 of a
-  curve peaked at 63–73 MB with a listener on the document's updates, as the server has, estimated
-  89 MB); `anim.bake_transforms` also 1,000 bytes per object
+  curve peaked at 64–73.8 MiB with a listener on the document's updates, as the server has,
+  estimated 89 MiB); `anim.bake_transforms` also 1,000 bytes per object
   and frame it samples, and `rigidbody.bake_to_keyframes` 128 MB and 1,200 bytes per body and frame
   for the simulation it steps. A bake samples every frame with a frame state that copies every
   object, F-curve and driver of the document (100 bytes per keyframe, 1,500 per object and 1,000 per
@@ -588,18 +594,25 @@ the event loop:
   rest), and its refusal names the objects when they take most of it. Operators that write the
   vertex groups or shape keys of a mesh (`object.parent_set` and `object.parent_to` with
   ARMATURE_NAME, ARMATURE_ENVELOPE or ARMATURE_AUTO, `object.vertex_group_*`,
-  `object.shape_key_*`, a bone rename, which renames the groups of the meshes the armature deforms)
-  count them (core `operators/memory-layers.ts`): the document keeps all groups (or keys) of a mesh
-  as one value, so every write copies, encodes and stores all of them again, and the server's process
-  copies the transaction's update twice more. Parenting a mesh of a million vertices to an armature
-  of 150 deforming bones with ARMATURE_NAME writes 600 MB of weights and took a server past 3.8 GB of
-  resident memory within 3.4 s. They count 7 bytes per byte of the mesh's groups (or keys) before or
-  after the write, whichever is more (5.0–5.2 measured as resident memory on 59–97 MiB, 5.4–6.3 on
-  35 MiB), 64 per vertex and the decoded mesh, and the bone weights of parenting: 160 bytes per vertex
-  with ARMATURE_ENVELOPE, 2,000 with ARMATURE_AUTO (its bone heat, up to 1,373 measured); the groups
-  and keys they add count with what the project keeps. A refusal for the free heap names what they
-  write (`shape keys` for those):
-  `not run on the server: it would need about … MB of JavaScript heap to write about … MB of vertex groups, and …`.
+  `object.shape_key_*`, a bone rename, which renames the groups of the meshes the armature deforms,
+  `object.join`, which merges the groups and keys of the joined meshes by name and writes each one
+  for every vertex of the joined mesh, and `object.transform_apply` and `object.origin_set`, which
+  give the copy they make of a linked duplicate's mesh its groups and keys and write the keys again,
+  moved with the vertices) count them (core `operators/memory-layers.ts`): the document keeps all
+  groups (or keys) of a mesh as one value, so every write copies, encodes and stores all of them
+  again, and the server's process copies the transaction's update twice more. Parenting a mesh of a
+  million vertices to an armature of 150 deforming bones with ARMATURE_NAME writes 600 MB of weights
+  and took a server past 3.8 GB of resident memory within 3.4 s. They count 7 bytes per byte of the
+  groups and keys they write, the more of a mesh's before and after the write (5.0–5.2
+  measured as resident memory on 59–97 MiB, 5.4–6.3 on 35 MiB, 6.2–6.4 for a join of 65 MiB and
+  5.8–6.2 for Apply Scale's copies and moved keys of 16–43 MiB, their meshes included), 64 per
+  vertex, the decoded mesh where they read it (parenting, and adding a shape key, setting its
+  positions or removing one with `apply_mix`), and the bone weights of parenting: 160 bytes per
+  vertex with ARMATURE_ENVELOPE, 2,000 with ARMATURE_AUTO (its bone heat, up to 1,373 measured); the
+  groups and keys they add count with what the project keeps. A refusal for the free heap names what
+  they write (`vertex groups`, `shape keys`, or `vertex groups and shape keys` when a join, an Apply
+  or a Set Origin writes both):
+  `not run on the server: it would need about … MB of JavaScript heap to write about … MB of vertex groups and shape keys, and …`.
   Every operator without an
   estimate is listed by id with the reason it cannot add much (`UNESTIMATED_OPERATORS`), and every
   parameter of those that counts something with the reason it stays small
@@ -638,14 +651,15 @@ the event loop:
   counts with what it keeps, and a save of it six times its bytes and 1,000 bytes for each
   replaced value it keeps (the second saves of projects whose histories kept 53 MB of vertex
   groups, 53 MB of shape keys and 63 MB of meshes peaked at 3.1, 3.1 and 5.7 times those bytes of
-  resident memory; 100,000 and 200,000 replaced locations at 1,103 and 1,254 bytes of heap each;
-  the objects that two and five deletions of 1,000 cubes and undoing them left at 877 and 1,082
-  bytes of heap per item). From 1 MB the message gives its share,
+  resident memory; 100,000 and 200,000 replaced locations at 1,084–1,171 and 1,116–1,685 bytes of
+  heap each, varying with when the save's garbage collections run; the objects that two and five
+  deletions of 1,000 cubes and undoing them left at 877 and 1,082 bytes of heap per item). From 1 MB
+  the message gives its share,
   `(now … MB with … objects, … MB of it kept by agents' undo histories)`, after the rigid body
   cache's; its save clause adds
   `, 6 times what agents' undo histories keep and 1,000 bytes for each replaced value they keep`
   whenever they keep something, and an operator's refusal ends with when it is freed:
-  `. What agents' undo histories keep (the objects an agent deletes too) is freed when the agent's session ends (for an agent id, 6 hours after its last session) or its step is dropped: the oldest steps are, beyond MCP_UNDO_STEPS steps or MCP_UNDO_MEMORY_MB of what they keep, at that agent's next step`.
+  `. What agents' undo histories keep (the objects an agent deletes too) is freed when the agent's session ends (for an agent id, 6 hours after its last session, or earlier when the server keeps more than 200 agent ids and this one is the least recently used without a session) or its step is dropped: the oldest steps are, beyond MCP_UNDO_STEPS steps or MCP_UNDO_MEMORY_MB of what they keep, at that agent's next step`.
   The open projects share one heap: what all of them keep and the largest save among them are held
   against the heap less the reserve and the cached evaluations (1,310 MB with the default heap,
   `maxOpenProjectsBytes`), and an operator that would take them past it fails with

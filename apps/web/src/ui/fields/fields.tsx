@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { Icon } from '../icons';
 
@@ -355,6 +355,19 @@ export function ToggleGroup(p: {
   );
 }
 
+/**
+ * The text a field edits: it starts as `value` and is set to it again whenever `value` changes (an
+ * undo, an agent, an edit that failed). It is set in the commit that brings the new value: an effect
+ * would run after the next frame, or sooner when the field renders again, and on a new field it
+ * replaced what was typed in it before then (a name typed as soon as the Projects window appeared, so
+ * the Escape meant to cancel the typing closed the window).
+ */
+export function useEditedText(value: string): [string, (text: string) => void] {
+  const [text, setText] = useState(value);
+  useLayoutEffect(() => setText(value), [value]);
+  return [text, setText];
+}
+
 export function TextField(p: {
   value: string;
   onChange: (v: string) => void;
@@ -368,13 +381,12 @@ export function TextField(p: {
   /** Accessible name when there is no visible label. */
   ariaLabel?: string;
 }) {
-  const [v, setV] = useState(p.value);
+  const [v, setV] = useEditedText(p.value);
   /**
    * The text committed last: a blur right after Enter (e.g. when the commit renamed what the field
    * shows and the field is removed while focused) must not commit it again with stale props.
    */
   const committed = useRef<string | null>(null);
-  useEffect(() => setV(p.value), [p.value]);
   const commit = () => {
     if (v === p.value || v === committed.current) return;
     committed.current = v;

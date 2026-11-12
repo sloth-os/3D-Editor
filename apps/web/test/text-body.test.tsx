@@ -107,6 +107,35 @@ describe('text body field', () => {
     expect(body()).toBe('Typo');
   });
 
+  it('keeps text typed as soon as the tab shows the field', async () => {
+    // regression: the field copied the document's text in an effect, which runs after the next frame
+    // or, sooner, when the field renders again: text typed before then (an e2e test filling the field
+    // right after opening the tab) was replaced by the document's text
+    ok('object.text_add', { body: 'Hello', name: 'Title' });
+    const id = s.doc.findObjectByName('Title')!.id;
+    s.state.selectedIds = [id];
+    s.state.activeId = id;
+    activePropertiesTab.value = 'object';
+    const { container } = render(<Properties session={s} />);
+    const typed = new Promise<HTMLTextAreaElement>((resolve) => {
+      const observer = new MutationObserver(() => {
+        const box = container.querySelector<HTMLTextAreaElement>('[data-testid="font-body"]');
+        if (!box) return;
+        observer.disconnect();
+        box.focus();
+        fireEvent.input(box, { target: { value: 'Typed' } });
+        resolve(box);
+      });
+      observer.observe(container, { childList: true, subtree: true });
+    });
+    // not in act(): the tab's effects run as in the browser
+    activePropertiesTab.value = 'data';
+    const box = await typed;
+    expect(box.value).toBe('Typed');
+    fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true });
+    expect(s.doc.getCurve(s.doc.findObjectByName('Title')!.data!)!.body).toBe('Typed');
+  });
+
   it('shows the document’s text again when applying it failed', () => {
     const { container } = render(<TextBody value="Hello" onCommit={() => false} />);
     const box = container.querySelector('textarea')!;

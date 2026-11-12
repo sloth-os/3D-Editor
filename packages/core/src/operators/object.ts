@@ -79,15 +79,16 @@ function setParentAt(
 }
 
 /**
- * Removes an object; its children get its parent (an object parent) and keep their world
- * matrices, from where the scene shows them at the frame of `fs`.
+ * Removes objects one after another; the children of each get its parent (an object parent) and
+ * keep their world matrices, from where the scene shows them at the frame of `fs`. One pass over
+ * the document for all of them (SceneDoc.removeObjects): removing them one by one looked up every
+ * object, animation curve and driver again for each.
  */
-function removeObjectAt(ctx: OperatorContext, fs: FrameState, id: string): void {
-  const o = ctx.doc.getObject(id);
-  if (!o) return;
-  const parent = o.parent && o.parent !== id && ctx.doc.getObject(o.parent) ? o.parent : null;
-  for (const child of ctx.doc.childrenOf(id)) setParentAt(ctx, fs, child.id, parent, true);
-  ctx.doc.removeObject(id);
+function removeObjectsAt(ctx: OperatorContext, fs: FrameState, ids: readonly string[]): void {
+  ctx.doc.removeObjects(ids, (child, o) => {
+    const parent = o.parent && o.parent !== o.id && ctx.doc.getObject(o.parent) ? o.parent : null;
+    setParentAt(ctx, fs, child, parent, true);
+  });
 }
 
 /**
@@ -287,10 +288,18 @@ function refuseIncompleteGeometry(ctx: OperatorContext, ev: EvaluatedScene, targ
  * groups and shape keys of the mesh unless `layers` is false (as Blender's single-user copy keeps
  * them: single_obdata_users copies the mesh with BKE_id_copy_ex(…, LIB_ID_COPY_DEFAULT …), whose
  * LIB_ID_COPY_SHAPEKEY copies its key, and mesh_copy_data its vertex group names and weights).
+ * `users`: the number of objects using each data block, when the operator counted them once for
+ * the many objects it changes (SceneDoc.dataUserCounts); kept current here.
  */
-function singleUserMesh(ctx: OperatorContext, o: ObjectData, layers = true): string {
+function singleUserMesh(
+  ctx: OperatorContext,
+  o: ObjectData,
+  layers = true,
+  users: Map<string, number> | null = null,
+): string {
   if (!o.data) throw new OperatorError('Object has no data');
-  if (ctx.doc.dataUsers(o.data) <= 1) return o.data;
+  const n = users ? (users.get(o.data) ?? 0) : ctx.doc.dataUsers(o.data);
+  if (n <= 1) return o.data;
   const copy = ctx.doc.addMesh(ctx.doc.getMeshBlock(o.data)?.name ?? o.name, ctx.doc.getMeshCopy(o.data)!);
   if (layers) {
     const groups = ctx.doc.getVertexGroups(o.data);
@@ -299,6 +308,7 @@ function singleUserMesh(ctx: OperatorContext, o: ObjectData, layers = true): str
     if (keys.length) ctx.doc.setShapeKeys(copy, keys);
   }
   ctx.doc.updateObject(o.id, { data: copy });
+  users?.set(o.data, n - 1).set(copy, 1);
   return copy;
 }
 
@@ -682,11 +692,12 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         if (ids.length === 0) throw new OperatorError('Nothing selected', 'POLL_FAILED');
         // children keep their world matrices where the scene shows them
         const fs = new FrameState(ctx.doc, ctx.state.frame);
-        for (const id of ids) removeObjectAt(ctx, fs, id);
+        removeObjectsAt(ctx, fs, ids);
+        const gone = new Set(ids);
         setSelection(
           ctx,
-          ctx.state.selectedIds.filter((id) => !ids.includes(id)),
-          ids.includes(ctx.state.activeId ?? '') ? null : ctx.state.activeId,
+          ctx.state.selectedIds.filter((id) => !gone.has(id)),
+          gone.has(ctx.state.activeId ?? '') ? null : ctx.state.activeId,
         );
         ctx.report('INFO', `Deleted ${ids.length} object(s)`);
         return { deleted: ids.length };
@@ -915,6 +926,10 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         );
         const changed = new Set<string>();
         const differs = (a: Vec3, b: Vec3) => a.some((v, i) => v !== b[i]);
+        // the children and data users of the objects, read once for all of them (Apply changes
+        // no parent; singleUserMesh and applyCurveTransform keep the counts current)
+        const children = ctx.doc.childrenIndex();
+        const users = ctx.doc.dataUserCounts();
         for (const sel of selectedObjects(ctx)) {
           // re-read: applying a selected parent changes the transforms of its children
           const o = ctx.doc.getObject(sel.id) ?? sel;
@@ -941,7 +956,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           if (!bake) {
             // the values shown are the reset ones already: only the stored channels are reset
           } else if (o.type === 'MESH' && o.data) {
-            const meshId = singleUserMesh(ctx, o);
+            const meshId = singleUserMesh(ctx, o, true, users);
             const m = cloneMesh(ctx.doc.getMesh(meshId)!);
             for (let i = 0; i < vertexCount(m); i++) {
               const q = transformPoint3(delta, [
@@ -964,7 +979,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             moveShapeKeys(ctx, meshId, (q) => transformPoint3(delta, q));
           } else if (o.type === 'CURVE' || o.type === 'FONT') {
             // false (with a warning) when its data cannot take the transform: it stays on the object
-            if (!applyCurveTransform(ctx, o, delta, p.properties)) continue;
+            if (!applyCurveTransform(ctx, o, delta, p.properties, users)) continue;
           }
           // children keep their world transform
           keepChildrenWorld(
@@ -981,6 +996,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             },
             shown,
             changed,
+            children,
           );
           changed.add(o.id);
         }
@@ -1011,12 +1027,16 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         // read before anything changes: the operator keeps every other object's world matrix
         const before = new FrameState(ctx.doc, ctx.state.frame);
         const changed = new Set<string>();
+        // the children and data users of the objects, read once for all of them (Set Origin
+        // changes no parent; singleUserMesh and curveOriginSet keep the counts current)
+        const children = ctx.doc.childrenIndex();
+        const users = ctx.doc.dataUserCounts();
         for (const o of selectedObjects(ctx)) {
           // curves move their control points, text its offset_x/offset_y
           if (o.type === 'CURVE' || o.type === 'FONT')
-            curveOriginSet(ctx, o, p.type, p.center, before, changed);
+            curveOriginSet(ctx, o, p.type, p.center, before, changed, children, users);
           if (o.type !== 'MESH' || !o.data) continue;
-          const meshId = singleUserMesh(ctx, o);
+          const meshId = singleUserMesh(ctx, o, true, users);
           const m = cloneMesh(ctx.doc.getMesh(meshId)!);
           const n = vertexCount(m);
           if (n === 0) continue;
@@ -1045,7 +1065,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
               : centerLocal;
           shift(target);
           // the origin moves onto the old centre, so nothing moves visually
-          moveOrigin(ctx, o.id, target, before, changed);
+          moveOrigin(ctx, o.id, target, before, changed, children);
         }
       },
     }),
@@ -1268,6 +1288,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             toActive: null,
           },
         ];
+        const joined: string[] = [];
         for (const o of selectedObjects(ctx)) {
           if (o.id === active.id || o.type !== 'MESH' || !o.data) continue;
           const src = ctx.doc.getMesh(o.data);
@@ -1291,8 +1312,10 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             keys: ctx.doc.getShapeKeys(o.data),
             toActive,
           });
-          removeObjectAt(ctx, fs, o.id);
+          joined.push(o.id);
         }
+        // (fs holds the matrices from before: removing the objects first changes none of the parts)
+        removeObjectsAt(ctx, fs, joined);
         ctx.doc.setMesh(activeMeshId, out);
         const layers = joinedLayers(parts, out.positions, vertexCount(out));
         if (layers.groups) ctx.doc.setVertexGroups(activeMeshId, layers.groups);
@@ -1330,9 +1353,12 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
         const ev = new SceneEvaluator(ctx.doc).evaluate(ctx.state.frame);
         refuseIncompleteGeometry(ctx, ev, p.target);
         const converted: { object: string; name: string; type: string }[] = [];
+        // the data users, counted once for all the objects (singleUserMesh and convertCurveObject
+        // keep the counts current)
+        const users = ctx.doc.dataUserCounts();
         for (const o of selectedObjects(ctx)) {
           if (o.type === 'CURVE' || o.type === 'FONT') {
-            const r = convertCurveObject(ctx, o, p.target, ev, p.keep_original);
+            const r = convertCurveObject(ctx, o, p.target, ev, p.keep_original, users);
             if (r) converted.push(r);
             continue;
           }
@@ -1348,7 +1374,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             continue;
           }
           // a copy of a mesh other objects use takes the baked geometry only, no vertex groups or shape keys
-          const meshId = singleUserMesh(ctx, o, false);
+          const meshId = singleUserMesh(ctx, o, false, users);
           ctx.doc.setMesh(meshId, cloneMesh(mesh));
           ctx.doc.updateObject(o.id, { modifiers: [] });
           converted.push({ object: o.id, name: o.name, type: 'MESH' });

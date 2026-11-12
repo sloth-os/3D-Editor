@@ -6,7 +6,9 @@ import {
   storedMeshBytes,
   type OperatorMemoryRequest,
 } from '@3d-editor/core';
-import { AgentHistory, historyKept } from '../../src/mcp/history';
+import { AgentHistory, BUDGET_BYTES_PER_ITEM, historyKept } from '../../src/mcp/history';
+import { refusedChangesMessage, storedChangesMessage } from '../../src/sync/project-memory';
+import type { UpdateSize } from '../../src/sync/update-size';
 import {
   HISTORY_ADVICE,
   HISTORY_SAVE_BYTES_PER_BYTE,
@@ -102,6 +104,70 @@ describe("agents' undo histories in the server's memory checks", () => {
     history.destroy();
     expect(historyKept(doc.ydoc)).toEqual({ bytes: 0, items: 0 });
     expect(heldByHistories(doc)).toEqual({ kept: 0, save: 0 });
+  });
+
+  it('add at most six times their budget to a save, also when they keep many small values', () => {
+    // a save takes 1,000 bytes per item kept: the budget counts each item's share of it
+    expect(BUDGET_BYTES_PER_ITEM * HISTORY_SAVE_BYTES_PER_BYTE).toBeGreaterThanOrEqual(
+      HISTORY_SAVE_BYTES_PER_ITEM,
+    );
+    const doc = SceneDoc.create({ name: 'Moves', empty: true });
+    opened.push(doc);
+    const ids = Array.from({ length: 300 }, (_, i) => doc.addObject({ type: 'EMPTY', name: `E${i}` }));
+    const origin = { type: 'mcp', session: 'mover' };
+    const history = new AgentHistory(doc.ydoc, doc.sharedTypes(), origin, { maxBytes: MB });
+    histories.push(history);
+    const agent = new SceneDoc(doc.ydoc, origin);
+    // 40 moves of the 300 objects, a step each: each step replaces 300 locations of 152 bytes
+    for (let m = 1; m <= 40; m++) {
+      history.undo.stopCapturing();
+      doc.ydoc.transact(() => {
+        for (const id of ids) agent.updateObject(id, { location: [m, 0, 0] });
+      }, origin);
+      history.maintain();
+    }
+    const kept = historyKept(doc.ydoc);
+    expect(kept.bytes / kept.items).toBe(152);
+    // (counted by their bytes alone, 1 MB held 22 steps: 6,600 locations, a save of 12.6 MB)
+    expect(history.undo.undoStack.length).toBe(10);
+    expect(kept.bytes + BUDGET_BYTES_PER_ITEM * kept.items).toBeLessThanOrEqual(MB);
+    expect(heldByHistories(doc).save).toBeLessThanOrEqual(HISTORY_SAVE_BYTES_PER_BYTE * MB);
+  });
+
+  it("end a browser's refused changes with when what they keep is freed, when the reason names it", () => {
+    const limit = 300 * MB;
+    const doc = openProject('Solo');
+    const history = agentReplacingGroups(doc, 5);
+    const s = sizes(doc);
+    const h = heldByHistories(doc);
+    const added = maxProjectMeshBytes(limit) - s.stored - s.save - h.kept / 2 - h.save;
+    const clause = projectGrowthRefusal(doc, added, 0, { heapLimit: () => limit })!;
+    expect(clause).toContain(`${up(h.kept)} MB of it kept by agents' undo histories`);
+    const size: UpdateSize = {
+      objects: 2,
+      datablocks: {},
+      keyframes: 0,
+      meshBytes: 0,
+      imageBytes: 0,
+      objectsPart: 1,
+      kept: added,
+      saved: 0,
+    };
+    expect(refusedChangesMessage(size, clause)).toBe(
+      `changes not applied on the server: they add 2 new objects to the project, and ${clause}. Delete objects and ` +
+        `meshes the project no longer needs, then Save (Ctrl+S) to send it to the server again${HISTORY_ADVICE}`,
+    );
+    expect(storedChangesMessage(size, clause)).toMatch(
+      new RegExp(
+        `\\(delete objects and meshes the project no longer needs where they were added, and save there\\)${literal(HISTORY_ADVICE)}$`,
+      ),
+    );
+    // without the share (the history ended), no advice about it
+    history.destroy();
+    const plain = projectGrowthRefusal(doc, maxProjectMeshBytes(limit), 0, { heapLimit: () => limit })!;
+    expect(plain).not.toContain('undo histories');
+    expect(refusedChangesMessage(size, plain)).toMatch(/to send it to the server again$/);
+    expect(storedChangesMessage(size, plain)).toMatch(/and save there\)$/);
   });
 
   it('take a project past its limit, which names their share; ended histories free it', () => {

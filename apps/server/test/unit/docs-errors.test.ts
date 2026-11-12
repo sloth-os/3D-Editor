@@ -165,7 +165,7 @@ const M = {
   GET_VIEW_DURING_MAX: '0.30',
   GET_VIEW_RUNS: 37,
   LOO: "Those of a `select` and a `SOLID` screenshot with 4 million triangles, which include requests sent as soon as the one before had answered, run to 50 % more than their longest time: with 25 %, earlier ranges made from fewer runs missed such runs of later agents (up to 0.735 s against 0.1–0.7 s, and 3.478 s against 0.5–3.4 s). A range made that way from all but one agent's runs held all the runs of the agent left out.",
-  MILLIONS_SELECT_MAX: '0.735',
+  MILLIONS_SELECT_MAX: '0.024',
   MILLIONS_SOLID_MAX: '3.478',
   MILLIONS_WIRE_FIRST: '6.0–14 s',
   OOM_256: '0.9–3.4 s',
@@ -277,6 +277,32 @@ const HOLDS = {
   // tasks it made the first time after the editor opened the project (round 12's TEXTS agent, its
   // verifier and its fix round; later ones made none: a task under 50 ms, the JPEG 5.7-18.6 ms of it)
   THUMBNAIL_MS: [56, 69, 56, 54],
+};
+
+/**
+ * Round 13's LAST agent (2026-11-12): 4 million triangles (two grids of 1000×1000 quads), the viewport in
+ * SOLID shading, headless Chromium with SwiftShader, calm runs (each started once the CPUs had been at
+ * least 90 % idle for 5 s), two passes on round 13's code and two with round 12's statistics overlay
+ * (Viewport.tsx and session.ts before round 13's change). Each pass: 8 selects alone, 6 sent as soon as a
+ * SOLID screenshot had answered and 6 followed at once by one (SELECT_MS, OLD_SELECT_MS and
+ * OLD_SELECT_AFTER_SCREENSHOT_MS: the editor_command round trip), 8 moves of one grid by another agent
+ * and 8 by a person (G X 0.01 Enter in the editor), with the longest of the editor's long tasks (tasks of
+ * 50 ms or more, PerformanceObserver; 0: none) within 3 s of an agent's move and 3.5 s of a person's.
+ */
+const R13 = {
+  SELECT_MS: [
+    23, 7, 11, 8, 9, 8, 8, 7, 11, 8, 15, 7, 14, 6, 14, 11, 18, 7, 14, 7, 22, 11, 9, 9, 12, 8, 9, 9, 13, 9, 24,
+    7, 9, 6, 14, 7, 13, 7, 12, 7,
+  ],
+  MOVE_LONG_TASK_MS: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  PERSON_LONG_TASK_MS: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+  OLD_SELECT_MS: [
+    223, 271, 254, 251, 248, 214, 248, 181, 200, 230, 211, 191, 259, 182, 202, 241, 272, 251, 275, 176, 238,
+    241, 226, 309, 227, 221, 232, 205,
+  ],
+  OLD_SELECT_AFTER_SCREENSHOT_MS: [357, 215, 189, 1123, 228, 304, 312, 204, 176, 208, 207, 228],
+  OLD_MOVE_LONG_TASK_MS: [348, 299, 253, 212, 211, 188, 269, 195, 243, 234, 200, 200, 228, 174, 178, 219],
+  OLD_PERSON_LONG_TASK_MS: [213, 288, 282, 218, 338, 234, 195, 195, 349, 239, 304, 272, 456, 296, 255, 291],
 };
 
 /** Seconds with two decimals, from milliseconds (605 ms: 0.61 s). */
@@ -840,34 +866,45 @@ describe('docs: browser editors', () => {
     // while it carries out a command. Not for the viewport's frames: with 4 million triangles in SOLID
     // shading a get_view sent every 100 ms after a select or a screenshot answered within 0.09 s while
     // the next frame took 0.6-3.3 s to be drawn (r11 TEXTS gv-probe runs); a CPU profile of the page
-    // showed the select's own 0.2 s in the statistics overlay's sceneStats (countEdges)
+    // showed the select's own 0.2 s in the statistics overlay's sceneStats (countEdges), which round 13's
+    // code no longer runs for a select (session.ts meshCounts: R13.SELECT_MS)
     const doc = flat(mcp);
     expect(doc).toContain(
       'A screenshot waits until the frame the viewport is drawing is done, also a `SOLID` or `WIREFRAME` one',
     );
     // round 12: the editor is busy too while it applies a change made elsewhere (an agent's move of one
-    // grid among 4 million triangles: HOLDS.APPLY_MS)
+    // grid among 4 million triangles: HOLDS.APPLY_MS, most of it the statistics overlay counting every
+    // mesh again); on round 13's code such a move made no long task (R13.MOVE_LONG_TASK_MS)
     const apply = holdRange(HOLDS.APPLY_MS);
     expect(doc).toContain(
       "The other commands draw nothing themselves, but wait while the editor's main thread is busy: after the " +
         "viewport switched to `MATERIAL` or `RENDERED` for the first time (while it builds the scene's " +
         'materials; the rest of that frame holds up only screenshots), for the whole of a screenshot it draws, ' +
         'while it carries out a command: with 4 million triangles in `SOLID` shading a `select` took ' +
-        `${MILLIONS_SELECT_SECONDS} (see the table), as the statistics overlay counts the edges of every mesh ` +
-        'again (after a screenshot too), and while it applies a change made elsewhere (by an agent or in ' +
-        "another editor): with 4 million triangles, an agent's move of one object held it " +
-        `${apply.widened} (${apply.measured} measured in the calm runs of round 12's TEXTS agents, widened like ` +
-        'the ranges above).',
+        `${MILLIONS_SELECT_SECONDS} (see the table), and while it applies a change made elsewhere (by an agent ` +
+        "or in another editor): with 4 million triangles, an agent's move of one object held it " +
+        `${CHANGE_APPLY_SECONDS} (no task of 50 ms or more in the ${R13.MOVE_LONG_TASK_MS.length} calm runs of ` +
+        "round 13's LAST agent, the bound widened like the ranges above; on round 12's code " +
+        `${apply.measured}, most of it the statistics overlay counting every mesh again).`,
     );
-    // round 12's verifier measured 0.248 s and its fix round 0.252 s, past the 0.24 s that 0.1-0.3 s held
-    expect(apply.widened).toBe('0.1–0.4 s');
-    expect(CHANGE_APPLY_SECONDS).toBe(apply.widened);
+    expect(apply.measured).toBe('0.17–0.25 s');
+    expect(R13.MOVE_LONG_TASK_MS.length).toBeGreaterThanOrEqual(16);
+    expect(R13.MOVE_LONG_TASK_MS.every((ms) => ms === 0)).toBe(true);
+    // no long task: under 0.05 s, widened by MARGIN_PERCENT and rounded up to 0.1 s
+    const underLongTask = Math.ceil(Number((0.05 * (1 + Number(MARGIN_PERCENT) / 100) * 10).toFixed(6))) / 10;
+    expect(CHANGE_APPLY_SECONDS).toBe(`at most ${underLongTask} s`);
+    // round 12's code: the statistics overlay's count was most of the move's long task
+    expect(Math.min(...R13.OLD_MOVE_LONG_TASK_MS)).toBeGreaterThan(150);
+    for (const text of agentTexts())
+      expect(text).not.toMatch(
+        /0\.1–1\.2 s|0\.1–0\.4 s|0\.19–0\.25 s|1\.1–1\.8 s|counts the edges of every mesh/,
+      );
     // "tenths of a second" understated the measured 0.1-1.2 s (editor-costs.ts MILLIONS_SELECT_SECONDS)
     for (const text of agentTexts()) expect(text).not.toContain('tenths of a second');
     expect(joined(source('mcp/tools.ts'))).toContain(
       'while it carries out a command: with 4 million triangles in SOLID shading a select took ' +
         `\${MILLIONS_SELECT_SECONDS}, while it applies a change made elsewhere: \${CHANGE_APPLY_SECONDS} for ` +
-        "an agent's move of an object among 4 million triangles, while its statistics overlay counts every mesh again,",
+        "an agent's move of an object among 4 million triangles, and while it copies the frame its viewport drew",
     );
     for (const text of [doc, flat(guide), joined(source('mcp/tools.ts'))])
       expect(text).not.toMatch(
@@ -1230,6 +1267,10 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
 describe('docs: measured times', () => {
   it('say how the ranges were made: pooled calm runs widened by a margin, and the busy factors', () => {
     const doc = flat(mcp);
+    const widenedUp = (max: string, pct: string) =>
+      Math.ceil(Number((Number(max) * (1 + Number(pct) / 100) * 10).toFixed(6))) / 10;
+    const oldSelect = `${secs(Math.min(...R13.OLD_SELECT_MS))}–${secs(Math.max(...R13.OLD_SELECT_MS))} s`;
+    const oldAfterShot = `${secs(Math.max(...R13.OLD_SELECT_AFTER_SCREENSHOT_MS))} s`;
     expect(doc).toContain(
       'Each run started once the CPUs had been at least 90 % idle for 5 s, and runs that other processes ' +
         'disturbed are left out;',
@@ -1240,13 +1281,25 @@ describe('docs: measured times', () => {
         "TEXTS agent of round 9 in four passes and its two verifiers, round 10's TEXTS agents and their three " +
         `verifiers) and runs from ${MARGIN_PERCENT} % less than the shortest to ${MARGIN_PERCENT} % more than the ` +
         `longest time measured, rounded outward to 0.1 s (to 1 s from 10 s on). ${M.LOO} Times with 4 million ` +
-        `triangles pool round 10's ${M.RUNS_4M} runs only: on round 9's code the editor's statistics overlay ` +
-        'counted the edges of every mesh each time it was updated, also after every slow frame, which took ' +
-        "seconds with 4 million triangles and held these steps up by seconds; round 10's code counts them in a " +
-        'fraction of that time. A `SOLID` screenshot there includes screenshots sent as soon as a `select` had ' +
+        `triangles pool round 10's ${M.RUNS_4M} runs only, but for a \`select\`: on round 9's code the editor's ` +
+        'statistics overlay counted the edges of every mesh each time it was updated, also after every slow ' +
+        "frame, which took seconds with 4 million triangles and held these steps up by seconds; round 10's code " +
+        'counts them in a fraction of that time. A `select` there pools the ' +
+        `${R13.SELECT_MS.length} calm runs of round 13's LAST agent (2026-11-12) only: until round 12 the ` +
+        'overlay counted every mesh again each time it was drawn, also when the frame rate it shows changed, ' +
+        `and a \`select\` waited for that (${oldSelect} in that agent's runs of round 12's code, up to ` +
+        `${oldAfterShot} when sent as soon as a screenshot had answered); round 13's code counts a mesh once, ` +
+        'when it changes. A `SOLID` screenshot there includes screenshots sent as soon as a `select` had ' +
         'answered, which waited for the frame the viewport drew then (a screenshot waits for the frames in ' +
-        'progress), and a `select` selects sent as soon as a screenshot had answered.',
+        'progress), and a `select` selects sent as soon as a `SOLID` screenshot had answered.',
     );
+    // round 13's selects took hundredths of a second: the range runs from 0 (MARGIN_PERCENT below the
+    // shortest rounds down to 0) to MILLIONS_MARGIN_PERCENT above the longest, so the texts say "at most"
+    expect(Math.floor(Number(((Math.min(...R13.SELECT_MS) / 1000) * 0.75 * 10).toFixed(6)))).toBe(0);
+    expect(MILLIONS_SELECT_SECONDS).toBe(
+      `at most ${widenedUp(M.MILLIONS_SELECT_MAX, MILLIONS_MARGIN_PERCENT)} s`,
+    );
+    expect(M.MILLIONS_SELECT_MAX).toBe((Math.max(...R13.SELECT_MS) / 1000).toFixed(3));
     // commands other than screenshots do not wait for the viewport's frames (editor-commands.ts)
     expect(doc).not.toContain('answered: they waited for the frame the viewport drew then');
     // the select and the SOLID screenshot with 4 million triangles: ranges made with MARGIN_PERCENT from
@@ -1262,12 +1315,8 @@ describe('docs: measured times', () => {
     expect(Number(missed[2])).toBeGreaterThanOrEqual(3.478);
     const upperEnd = (range: string) => Number(/–([\d.]+) s$/.exec(range)![1]);
     const lowerEnd = (range: string) => Number(/^([\d.]+)–/.exec(range)![1]);
-    const widenedUp = (max: string, pct: string) =>
-      Math.ceil(Number((Number(max) * (1 + Number(pct) / 100) * 10).toFixed(6))) / 10;
     expect(upperEnd(MILLIONS_SOLID_SECONDS)).toBe(widenedUp(M.MILLIONS_SOLID_MAX, MILLIONS_MARGIN_PERCENT));
-    expect(upperEnd(MILLIONS_SELECT_SECONDS)).toBe(widenedUp(M.MILLIONS_SELECT_MAX, MILLIONS_MARGIN_PERCENT));
     expect(Number(M.MILLIONS_SOLID_MAX)).toBeGreaterThanOrEqual(3.478);
-    expect(Number(M.MILLIONS_SELECT_MAX)).toBeGreaterThanOrEqual(0.731);
     // their lower ends, like every other end, are MARGIN_PERCENT below the shortest time
     expect(lowerEnd(MILLIONS_SOLID_SECONDS)).toBeLessThanOrEqual(0.78 * (1 - Number(MARGIN_PERCENT) / 100));
     // round 10 gave one busy factor without a margin (3.5, the largest ratio of the busy runs pooled
@@ -1352,7 +1401,6 @@ describe('docs: measured times', () => {
       NEW_SHADER,
       PROCEDURAL_MAX,
       MILLIONS_SOLID_SECONDS,
-      MILLIONS_SELECT_SECONDS,
       SERVER_SOLID_SCENE_SECONDS,
       ...SERVER_SOLID_SECONDS.split(', ').map((s) => s.split(' for ')[0]),
       BR_FIRST,
@@ -1368,6 +1416,8 @@ describe('docs: measured times', () => {
       expect(values, range).toBeDefined();
       for (const v of values!) expect(v, range).toMatch(Number(v) >= 10 ? /^\d+$/ : /^\d\.\d$/);
     }
+    // a select with 4 million triangles: an upper end only, rounded up to 0.1 s
+    expect(MILLIONS_SELECT_SECONDS).toMatch(/^at most \d\.\d s$/);
   });
 
   it('hold the calm times that the verifiers of round 10 measured outside the earlier ranges', () => {
@@ -1379,12 +1429,16 @@ describe('docs: measured times', () => {
       const [lo, hi] = /^([\d.]+)–([\d.]+) s$/.exec(range)!.slice(1).map(Number);
       return lo <= value && value <= hi;
     };
-    for (const v of [0.165, 0.516]) expect(holds(MILLIONS_SELECT_SECONDS, v), `${v} s`).toBe(true);
-    // round 10's third verifier: a select sent as soon as a WIREFRAME screenshot had answered (731 ms,
-    // against 0.1–0.7 s) and a SOLID screenshot sent as soon as a select had answered (3478 ms, against
-    // 0.5–3.4 s), both in calm runs
-    expect(holds(MILLIONS_SELECT_SECONDS, 0.731)).toBe(true);
+    // round 10's third verifier: a SOLID screenshot sent as soon as a select had answered (3478 ms, against
+    // 0.5–3.4 s) in a calm run
     expect(holds(MILLIONS_SOLID_SECONDS, 3.478)).toBe(true);
+    // those selects (0.165, 0.516 and 0.731 s) waited for the statistics overlay of round 12's code, which
+    // counted every mesh again; round 13's range holds every select of round 13's runs, and none of round
+    // 12's code
+    const atMost = Number(/^at most ([\d.]+) s$/.exec(MILLIONS_SELECT_SECONDS)![1]);
+    for (const ms of R13.SELECT_MS) expect(ms / 1000).toBeLessThanOrEqual(atMost);
+    for (const ms of [...R13.OLD_SELECT_MS, ...R13.OLD_SELECT_AFTER_SCREENSHOT_MS, 165, 516, 731])
+      expect(ms / 1000).toBeGreaterThan(atMost);
     expect(
       cell(
         row(
@@ -3134,48 +3188,54 @@ describe('docs: round 13 (EDGE)', () => {
    * What holds an editor's commands besides the commands themselves: its thumbnail copy, which
    * session.ts scheduleIndexUpdate makes 3 s after a change, or later when the viewport has not drawn
    * the change (every 0.5 s, for up to 30 s: 4.25-5.07 s after a person's edit in round 12's TEXTS
-   * verifier runs), and its statistics overlay, which counts every mesh again whenever the overlay
-   * renders, also when the frame rate it shows changes (Viewport.tsx InfoOverlay reads fps; 0.197-0.244 s
-   * with 4 million triangles 1.1-1.8 s after a person's own edit, measured in round 12's TEXTS
-   * verifier runs and round 13). Round 12 said "3 s after a change" and named neither in
-   * editor_command's description or the timeout message.
+   * verifier runs). Until round 12 its statistics overlay counted every mesh again, edges too, each time
+   * it was drawn, also when the frame rate it shows changed (Viewport.tsx InfoOverlay read fps;
+   * 0.197-0.244 s with 4 million triangles, 1.1-1.8 s after a person's own edit), which round 13's first
+   * texts named. Round 13 counts a mesh once, when it changes (session.ts meshCounts), and draws the
+   * frame rate apart (Viewport.tsx FrameRate): neither an agent's move nor a person's made a long task
+   * then (R13), so no text names the overlay among what holds the editor.
    */
-  it("name the editor's thumbnail copy and statistics overlay among what holds its commands", () => {
+  it("name the editor's thumbnail copy among what holds its commands, and no recount by the statistics overlay", () => {
     const session = web('project/session.ts');
     expect(session).toContain('export const INDEX_UPDATE_MS = 3000;');
     expect(session).toContain('export const THUMBNAIL_RETRY_MS = 500;');
     expect(session).toContain('export const THUMBNAIL_WAIT_MS = 30_000;');
-    expect(session).toContain('const s = meshStats(o.mesh);');
+    expect(session).toContain('const countsOfMesh = new WeakMap<MeshData, MeshCounts>();');
+    expect(session).toContain('const c = meshCounts(o.mesh);');
+    expect(session).not.toContain('meshStats(');
     const viewport = web('ui/Viewport.tsx');
     expect(viewport).toContain('const stats = showStats ? s.sceneStats() : null;');
-    expect(viewport).toContain("<div>{fps.value ? `${fps.value} fps` : ''}</div>");
-    const stats =
-      "its statistics overlay counts every mesh again, which it does when the frame rate it shows changes as the viewport keeps drawing (0.19–0.25 s with 4 million triangles, 1.1–1.8 s after a person's own edit";
+    expect(viewport).toContain(
+      'return <div data-testid="stats-fps">{fps.value ? `${fps.value} fps` : \'\'}</div>;',
+    );
+    expect(R13.PERSON_LONG_TASK_MS.length).toBeGreaterThanOrEqual(16);
+    expect(R13.PERSON_LONG_TASK_MS.every((ms) => ms === 0)).toBe(true);
+    expect(Math.min(...R13.OLD_PERSON_LONG_TASK_MS)).toBeGreaterThan(150);
     const thumbnail =
       "while it copies the frame its viewport drew into the project's thumbnail (at most 0.1 s with 4 million triangles), once per change";
     expect(tools()).toContain(
-      `while ${stats} in that editor), and ${thumbnail}: 3 s after it, or, while the viewport has not drawn it yet, at the first of its tries every 0.5 s (for up to 30 s) after that (3.0–5.1 s after a person's own edit); the viewport's frames do not hold them up)`,
+      `for an agent's move of an object among 4 million triangles, and ${thumbnail}: 3 s after it, or, while the viewport has not drawn it yet, at the first of its tries every 0.5 s (for up to 30 s) after that (3.0–5.1 s after a person's own edit); the viewport's frames do not hold them up)`,
     );
     const timeout = editorTimeoutMessage('select', 10_000);
     expect(timeout).toContain(
-      `it is also busy while ${stats} in it), and ${thumbnail}, 3 s after it or, until the viewport has drawn it, at the first of its tries every 0.5 s after that, but not while it draws its other frames.`,
+      `object among 4 million triangles); it is also busy ${thumbnail}, 3 s after it or, until the viewport has drawn it, at the first of its tries every 0.5 s after that, but not while it draws its other frames.`,
     );
     expect(flat(mcp)).toContain(
       "The editor also copies the frame its viewport drew into the project's thumbnail, once per change, which " +
         'held it at most 0.1 s with 4 million triangles (0.07 s measured in round 12, the viewport idle): 3 s ' +
         'after the change, or, while its viewport has not drawn the change yet, at the first of its tries every ' +
         "0.5 s after that, for up to 30 s (3.0–5.1 s after a person's own edit in that editor, measured in " +
-        'rounds 12 and 13). Its statistics overlay counts every mesh again when the frame rate it shows changes ' +
-        'while the viewport keeps drawing, which held it 0.19–0.25 s with 4 million triangles, 1.1–1.8 s after ' +
-        "a person's own edit in that editor (measured in rounds 12 and 13).",
+        'rounds 12 and 13). Its statistics overlay counts a mesh once, when the mesh changes, and a new frame ' +
+        "rate redraws only the line that shows it: with 4 million triangles a person's move in that editor made " +
+        `no long task either (${R13.PERSON_LONG_TASK_MS.length} calm runs of round 13's LAST agent).`,
     );
     expect(flat(guide)).toContain(
       "once per change it also copies its viewport into the project's thumbnail, which took at most 0.1 s: 3 s " +
         'after the change or, while its viewport has not drawn the change, at one of its tries every 0.5 s ' +
-        "after that, for up to 30 s (3.0–5.1 s after a person's own edit); and when the frame rate its " +
-        'statistics overlay shows changes while its viewport keeps drawing, the overlay counts every mesh ' +
-        "again: 0.19–0.25 s with 4 million triangles, 1.1–1.8 s after a person's own edit)",
+        "after that, for up to 30 s (3.0–5.1 s after a person's own edit)).",
     );
+    for (const text of agentTexts())
+      expect(text).not.toMatch(/overlay counts every mesh|counts every mesh again/);
     for (const doc of [mcp, guide])
       expect(flat(doc)).not.toMatch(/3 s after a change (the editor|it) also copies/);
   });

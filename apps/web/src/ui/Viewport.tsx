@@ -258,6 +258,40 @@ export function Sidebar({ s }: { s: ProjectSession }) {
   );
 }
 
+/**
+ * The slow-frame notice of the info overlay: a component of its own, so that the time of each new
+ * slow frame redraws only this line.
+ */
+function SlowFrameNotice() {
+  const slow = slowFrameMs.value;
+  if (!(slow > 0)) return null;
+  return (
+    <div
+      class="viewport-slow"
+      data-testid="viewport-slow-frame"
+      title={
+        'The last frame took this long to draw. Without GPU acceleration (software WebGL) heavy ' +
+        'scenes are slow: the first frame in Material Preview or Rendered shading compiles the ' +
+        'shaders of every material and light combination, and while frames stay slow the view is ' +
+        'drawn without anti-aliasing. Solid shading is much faster; F12 or the path tracer renders ' +
+        'the final image.'
+      }
+    >
+      Slow viewport: {(slow / 1000).toFixed(slow < 10_000 ? 1 : 0)} s
+      {slowFrameCompiled.value ? ' for the last frame (compiling shaders)' : ' per frame'}
+    </div>
+  );
+}
+
+/**
+ * The frame rate line of the statistics overlay: a component of its own, so that a new frame rate
+ * redraws only this line, not the statistics (whose counts it would otherwise read again each time
+ * while the viewport keeps drawing).
+ */
+function FrameRate() {
+  return <div data-testid="stats-fps">{fps.value ? `${fps.value} fps` : ''}</div>;
+}
+
 /** Statistics/info overlay in the top-left corner (Blender style); hidden with the overlays. */
 export function InfoOverlay({ s }: { s: ProjectSession }) {
   void s.revision.value;
@@ -269,7 +303,6 @@ export function InfoOverlay({ s }: { s: ProjectSession }) {
   const stats = showStats ? s.sceneStats() : null;
   const mode = s.state.$mode.value;
   const sel = s.state.$meshSelection.value;
-  const slow = slowFrameMs.value;
   // one column: the info grows (slow-frame notice) without running into the statistics
   return (
     <div class="viewport-overlay viewport-corner">
@@ -278,22 +311,7 @@ export function InfoOverlay({ s }: { s: ProjectSession }) {
         <div>
           ({Math.round(frame)}) Scene Collection{active ? ` | ${active.name}` : ''}
         </div>
-        {slow > 0 && (
-          <div
-            class="viewport-slow"
-            data-testid="viewport-slow-frame"
-            title={
-              'The last frame took this long to draw. Without GPU acceleration (software WebGL) heavy ' +
-              'scenes are slow: the first frame in Material Preview or Rendered shading compiles the ' +
-              'shaders of every material and light combination, and while frames stay slow the view is ' +
-              'drawn without anti-aliasing. Solid shading is much faster; F12 or the path tracer renders ' +
-              'the final image.'
-            }
-          >
-            Slow viewport: {(slow / 1000).toFixed(slow < 10_000 ? 1 : 0)} s
-            {slowFrameCompiled.value ? ' for the last frame (compiling shaders)' : ' per frame'}
-          </div>
-        )}
+        <SlowFrameNotice />
       </div>
       {stats && (
         <div class="viewport-stats" data-testid="viewport-stats">
@@ -308,7 +326,7 @@ export function InfoOverlay({ s }: { s: ProjectSession }) {
           <div data-testid="stats-vertices">Vertices {stats.vertices.toLocaleString()}</div>
           <div>Faces {stats.faces.toLocaleString()}</div>
           <div data-testid="stats-triangles">Triangles {stats.triangles.toLocaleString()}</div>
-          <div>{fps.value ? `${fps.value} fps` : ''}</div>
+          <FrameRate />
         </div>
       )}
     </div>

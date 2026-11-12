@@ -25,6 +25,7 @@ import {
   IDENTITY,
   axisMatrix,
   eulToMat3,
+  invert,
   invertSafeOrtho,
   mat3ToCompatibleEul,
   mul,
@@ -549,6 +550,118 @@ describe('Rotate and Scale store what Blender’s store', () => {
     const got = rotationFromEuler(doc.getObject(id)!.rotation_euler);
     expect(maxDiff(got, expected)).toBeLessThan(1e-12);
     expect(doc.getObject(id)!.scale).toEqual([1, 2, 3]);
+  });
+
+  it('a move, rotation or scale in the LOCAL orientation is Blender’s, constrained to each object’s own axes', () => {
+    // Blender's LOCAL constraint (setLocalConstraint in transform_constraints.cc): with several
+    // objects each is moved, turned or scaled in its own axes, the axismtx of its TransData
+    // (transform_orientations_create_from_axis of its world matrix): applyObjectConstraintVec
+    // moves it by axismtx · value, applyObjectConstraintRot turns it about axismtx's axis,
+    // applyObjectConstraintSize scales it by axismtx · size · axismtx⁻¹, and ElementRotation /
+    // ElementResize store its channels from that; with one object, the active object's axes
+    // (setConstraint, applyAxisConstraintSize: spacemtx · size · spacemtx⁻¹).
+    const objs: Obj[] = [
+      { loc: [1, 2, 3], rot: [10 * deg, 20 * deg, 30 * deg], scale: [1, 2, 3], parent: null },
+      { loc: [-2, 1, 0.5], rot: [0, 0.4, -0.3], scale: [0.5, 1, 1.5], parent: null },
+      { loc: [4, -1, 2], rot: [0, 0, 90 * deg], scale: [1, 1, 1], parent: null },
+    ];
+    const make = () => {
+      const { doc, ctx, run } = setup();
+      const ids = objs.map((o, i) =>
+        doc.addObject({
+          type: 'EMPTY',
+          name: `O${i}`,
+          location: o.loc as Vec3,
+          rotation_euler: o.rot as Vec3,
+          scale: o.scale as Vec3,
+        }),
+      );
+      ctx.state.selectedIds = ids;
+      ctx.state.activeId = ids[0];
+      return { doc, ctx, run, ids };
+    };
+    const axes = (i: number) => axisMatrix(worldOf(objs, i).m);
+    const center = [0, 1, 2].map((k) => (objs[0].loc[k] + objs[1].loc[k] + objs[2].loc[k]) / 3);
+    const sized = (size: number[]) => IDENTITY.map((c, k) => c.map((v) => v * size[k]));
+    /** axis_angle_normalized_to_mat3 (math_rotation.cc), m[column][row] */
+    const axisAngle = (a: number[], angle: number): M3 => {
+      const [s, c] = [Math.sin(angle), Math.cos(angle)];
+      const ico = 1 - c;
+      const nsi = a.map((v) => v * s);
+      const [n01, n02, n12] = [a[0] * a[1] * ico, a[0] * a[2] * ico, a[1] * a[2] * ico];
+      return [
+        [a[0] * a[0] * ico + c, n01 + nsi[2], n02 - nsi[1]],
+        [n01 - nsi[2], a[1] * a[1] * ico + c, n12 + nsi[0]],
+        [n02 + nsi[1], n12 - nsi[0], a[2] * a[2] * ico + c],
+      ];
+    };
+
+    // Scale
+    const size = [2, 1, 0.5];
+    let { doc, run, ids } = make();
+    run('transform.resize', { value: size, orient_type: 'LOCAL' });
+    ids.forEach((id, i) => {
+      const ref = blender(objs, i, 'RESIZE', mul(axes(i), mul(sized(size), invert(axes(i))!)), center);
+      const o = doc.getObject(id)!;
+      expect(maxDiff(o.location, ref.loc), `O${i}`).toBeLessThan(1e-12);
+      expect(maxDiff(o.scale, ref.scale), `O${i}`).toBeLessThan(1e-12);
+      expect(o.rotation_euler).toEqual(objs[i].rot);
+      // each of its scales multiplied by the factor of its own axis
+      expect(
+        maxDiff(
+          o.scale,
+          objs[i].scale.map((v, k) => v * size[k]),
+        ),
+        `O${i}`,
+      ).toBeLessThan(1e-12);
+    });
+
+    // Rotate about each object's own Y axis
+    ({ doc, run, ids } = make());
+    run('transform.rotate', { value: 25 * deg, orient_axis: 'Y', orient_type: 'LOCAL' });
+    ids.forEach((id, i) => {
+      const ref = blender(objs, i, 'ROTATE', axisAngle(axes(i)[1], 25 * deg), center);
+      const o = doc.getObject(id)!;
+      expect(maxDiff(o.location, ref.loc), `O${i}`).toBeLessThan(1e-12);
+      expect(maxDiff(o.rotation_euler, ref.rot), `O${i}`).toBeLessThan(1e-12);
+    });
+
+    // Move along each object's own axes
+    const value = [1.5, -0.5, 0.25];
+    ({ doc, run, ids } = make());
+    run('transform.translate', { value, orient_type: 'LOCAL' });
+    ids.forEach((id, i) => {
+      const loc = mulV(axes(i), value).map((v, k) => objs[i].loc[k] + v);
+      expect(maxDiff(doc.getObject(id)!.location, loc), `O${i}`).toBeLessThan(1e-12);
+    });
+
+    // one object: the active object's axes, also for another object (Blender's setConstraint)
+    let ctx: OperatorContext;
+    ({ doc, ctx, run, ids } = make());
+    ctx.state.selectedIds = [ids[2]];
+    run('transform.translate', { value, orient_type: 'LOCAL' });
+    const along = mulV(axes(0), value).map((v, k) => objs[2].loc[k] + v);
+    expect(maxDiff(doc.getObject(ids[2])!.location, along)).toBeLessThan(1e-12);
+    ({ doc, ctx, run, ids } = make());
+    ctx.state.selectedIds = [ids[2]];
+    run('transform.resize', { value: size, orient_type: 'LOCAL', center: [0, 0, 0] });
+    const ref = blender(objs, 2, 'RESIZE', mul(axes(0), mul(sized(size), invert(axes(0))!)), [0, 0, 0]);
+    expect(maxDiff(doc.getObject(ids[2])!.scale, ref.scale)).toBeLessThan(1e-12);
+    expect(maxDiff(doc.getObject(ids[2])!.location, ref.loc)).toBeLessThan(1e-12);
+
+    // in Edit Mode the selected vertices are scaled along the edited object's axes: in its own
+    // space X doubles and Y and Z stay
+    ctx.state.selectedIds = [];
+    run('mesh.primitive_cube_add', { location: [1, -1, 2], rotation: [0.3, 0.5, 0.7], scale: [1, 3, 2] });
+    const cube = ctx.state.activeId!;
+    run('object.mode_set', { mode: 'EDIT' });
+    const mesh = () => doc.getMesh(doc.getObject(cube)!.data!)!;
+    const before = Array.from(mesh().positions);
+    const all = new Set(Array.from({ length: before.length / 3 }, (_, k) => k));
+    ctx.state.meshSelection = { verts: all, edges: new Set(), faces: new Set() };
+    run('transform.resize', { value: [2, 1, 1], orient_type: 'LOCAL' });
+    const scaled = before.map((v, k) => (k % 3 === 0 ? 2 * v : v));
+    expect(maxDiff(Array.from(mesh().positions), scaled)).toBeLessThan(1e-6);
   });
 
   it('auto keying keys the values a scale stores: the new scale and the rotation it keeps', () => {

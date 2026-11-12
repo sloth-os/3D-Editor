@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SceneDoc, SceneEvaluator, createOperatorRegistry, createEditorState } from '@3d-editor/core';
+import {
+  SceneDoc,
+  SceneEvaluator,
+  createCube,
+  createOperatorRegistry,
+  createEditorState,
+} from '@3d-editor/core';
 import { evaluateCached, evaluationStats, MAX_CACHED_EVALUATIONS } from '../../src/mcp/eval-cache';
 import { describeObject, summarizeScene } from '../../src/mcp/scene-summary';
 
@@ -77,5 +83,30 @@ describe('evaluation cache', () => {
     }
     // the cube has a modifier: the viewport may show other geometry, so both modes are evaluated
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('get_scene data users', () => {
+  it('counts the users of every data block once per call, not once per listed object', () => {
+    // regression: each listed object asked SceneDoc.dataUsers, which reads every object, so a
+    // get_scene of 5,000 listed objects among 10,000 read 50 million
+    const doc = SceneDoc.create({ name: 'Users', empty: true });
+    const shared = doc.addMesh('Shared', createCube({ size: 1 }));
+    const own = doc.addMesh('Own', createCube({ size: 1 }));
+    doc.transact(() => {
+      for (let i = 0; i < 40; i++) doc.addObject({ type: 'MESH', name: `Linked.${i}`, data: shared });
+      doc.addObject({ type: 'MESH', name: 'Single', data: own });
+    });
+    const perObject = vi.spyOn(SceneDoc.prototype, 'dataUsers');
+    const once = vi.spyOn(SceneDoc.prototype, 'dataUserCounts');
+    const s = summarizeScene(doc, { frame: 1 }) as unknown as {
+      objects: { name: string; data: { users: number } }[];
+    };
+    const users = new Map(s.objects.map((o) => [o.name, o.data.users]));
+    expect(users.size).toBe(41);
+    expect(users.get('Single')).toBe(1);
+    for (let i = 0; i < 40; i++) expect(users.get(`Linked.${i}`)).toBe(40);
+    expect(perObject).not.toHaveBeenCalled();
+    expect(once).toHaveBeenCalledTimes(1);
   });
 });

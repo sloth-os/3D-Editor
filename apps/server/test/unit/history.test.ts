@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { AgentHistory, historyKept, KEPT_CONTAINER_ITEM_BYTES } from '../../src/mcp/history';
+import { AgentHistory, historyKept, KEPT_CONTAINER_ITEM_BYTES, reachSearch } from '../../src/mcp/history';
 
 /*
  * Bounded undo histories of MCP agents (apps/server/src/mcp/history.ts). Yjs keeps every item a
@@ -473,6 +473,61 @@ describe('AgentHistory', () => {
     expect(tags()).toEqual([]);
   });
 
+  it('collects no container while something no history knows keeps an item below it', () => {
+    const doc = new Y.Doc();
+    const root = doc.getMap<any>('objects');
+    const A = { type: 'mcp', session: 'a' };
+    const B = { type: 'mcp', session: 'b' };
+    const other = { type: 'other' };
+    const ha = new AgentHistory(doc, [root], A, { maxSteps: 1 });
+    const hb = new AgentHistory(doc, [root], B, { maxSteps: 1 });
+    // an undo manager no agent history knows of (created after the histories: they see its changes
+    // first), whose step keeps version 1 below the object
+    const plain = new Y.UndoManager([root], { trackedOrigins: new Set([other]), captureTimeout: 0 });
+    const maintain = () => {
+      ha.maintain();
+      hb.maintain();
+    };
+    const obj = new Y.Map<any>();
+    const nested = new Y.Map<any>();
+    doc.transact(
+      () => {
+        root.set('object', obj);
+        obj.set('modifier', nested);
+        nested.set('count', 1);
+      },
+      { type: 'editor' },
+    );
+    const version1 = (nested._map.get('count') as Y.Item).id;
+    doc.transact(() => nested.set('count', 2), other);
+    doc.transact(() => nested.set('count', 3), A); // A's step keeps version 2
+    doc.transact(() => root.delete('object'), B);
+    maintain();
+    // B's next step drops the one that deleted the object: the object is kept for A's step
+    hb.undo.stopCapturing();
+    doc.transact(() => root.set('b', 1), B);
+    maintain();
+    const objectItem = obj._item!;
+    expect(objectItem.content).toBeInstanceOf(Y.ContentType);
+    // A's next step drops the step that reached the object: no history needs it any more, but the
+    // other undo manager keeps version 1 below it, which collecting the object would collect too
+    ha.undo.stopCapturing();
+    doc.transact(() => root.set('a', 1), A);
+    maintain();
+    expect(ha.undo.undoStack.length).toBe(1);
+    expect(objectItem.content).toBeInstanceOf(Y.ContentType);
+    const kept = Y.getItem(doc.store, version1);
+    expect(kept).toBeInstanceOf(Y.Item);
+    expect((kept as Y.Item).keep).toBe(true);
+    expect((kept as Y.Item).content).toBeInstanceOf(Y.ContentAny);
+    // once that undo manager lets it go and the histories end, nothing deleted is held
+    plain.clear();
+    ha.destroy();
+    hb.destroy();
+    expect(held(doc)).toEqual({ values: 0, bytes: 0, containers: 0 });
+    expect(root.toJSON()).toEqual({ a: 1, b: 1 });
+  });
+
   it('counts nothing as released when the document collects nothing (gc off)', () => {
     const doc = new Y.Doc({ gc: false });
     const mesh = doc.getMap<any>('meshes');
@@ -558,7 +613,7 @@ describe('AgentHistory', () => {
   /*
    * 60 random sessions of 200 steps, each run on two documents (AgentHistory and plain Yjs) and
    * compared after every step, which also counts the deleted values no step keeps: 0.84–0.90 s,
-   * 1.46–1.63 s under coverage on a 4-CPU machine. CI runners can be 2–3 times slower, so the test
+   * 1.46–1.84 s under coverage on a 4-CPU machine. CI runners can be 2–3 times slower, so the test
    * gets 15 s instead of the default 5 s.
    */
   it('never fails inside Yjs and keeps nothing once every history ended (1-3 agents, editors, random)', () => {
@@ -804,6 +859,28 @@ describe('AgentHistory: values written to one key one after another', () => {
     expect(historyKept(doc).bytes).toBe(sizes[2]);
   });
 
+  it('frees a version an operation wrote and replaced in one transaction while the step runs', () => {
+    // Yjs merges that version with the one from before the step into one deleted item: compactStep
+    // collects the part of it the step created, not only items the step created whole
+    const { doc, mesh, history, step, set } = setup();
+    step(() => set('vg', numbers(1)));
+    const during: number[] = [];
+    step(() => {
+      for (let i = 0; i < 5; i++) {
+        doc.transact(() => {
+          mesh.set('vg', numbers(100 + 2 * i));
+          mesh.set('vg', numbers(101 + 2 * i));
+        }, ORIGIN);
+        history.compactStep();
+        during.push(held(doc).values);
+      }
+    });
+    // only version 1, which undo needs
+    expect(during).toEqual([1, 1, 1, 1, 1]);
+    history.undo.undo();
+    expect(mesh.get('vg')).toEqual(numbers(1));
+  });
+
   it('counts what its redo steps keep, as what its undo steps keep', () => {
     const { doc, history, write } = writer({});
     write('vg', numbers(1));
@@ -817,6 +894,37 @@ describe('AgentHistory: values written to one key one after another', () => {
     expect(history.kept()).toEqual({ bytes: one, items: 1 });
     expect(historyKept(doc)).toEqual({ bytes: one, items: 1 });
     expect(history.stats().bytes).toBe(Math.round(one));
+  });
+
+  it('over maxBytes drops the furthest redo steps, but keeps the next redo when nothing is left to undo', () => {
+    // steps that create values keep nothing to undo; undoing them deletes the values, which their
+    // redo steps keep
+    const one = 2_000 * 8 + 96; // the history's estimate of one version
+    const { doc, mesh, history, write } = writer({ maxBytes: 2.5 * one });
+    write('a', numbers(1));
+    write('b', numbers(2));
+    write('c', numbers(3));
+    expect(history.undo.undoStack.length).toBe(3);
+    for (let u = 0; u < 3; u++) history.undo.undo();
+    history.maintain();
+    // the redo of c (the furthest) went: a and b fit
+    expect(history.undo.redoStack.length).toBe(2);
+    expect(held(doc).values).toBe(2);
+    expect(history.stats().bytes).toBeLessThanOrEqual(2.5 * one);
+    history.undo.redo();
+    history.undo.redo();
+    expect(mesh.get('a')).toEqual(numbers(1));
+    expect(mesh.get('b')).toEqual(numbers(2));
+    expect(history.undo.redo()).toBeNull();
+    expect(mesh.get('c')).toBeUndefined();
+    // a redo step alone over the budget is kept when there is nothing to undo, as the newest step is
+    const small = writer({ maxBytes: 0.5 * one });
+    small.write('d', numbers(4));
+    small.history.undo.undo();
+    small.history.maintain();
+    expect(small.history.undo.redoStack.length).toBe(1);
+    small.history.undo.redo();
+    expect(small.mesh.get('d')).toEqual(numbers(4));
   });
 
   it('measures a step again when it changes after it was measured', () => {
@@ -1139,5 +1247,45 @@ describe('AgentHistory: deleted objects that undo restored', () => {
     for (let i = 0; i < 3; i++) w.undo(0);
     expect(w.a.root.has('marker')).toBe(false);
     expect(w.a.root.has('o1')).toBe(false);
+  });
+
+  it('past its search budget counts the oldest steps as reaching them: kept until those are dropped', () => {
+    const budget = reachSearch.budget;
+    // two items for each of the three newest steps, and one of the step before: no more
+    reachSearch.budget = 7;
+    try {
+      const w = worlds([8]);
+      const doc = w.a.doc;
+      /** A step that adds two values under keys of their own (two items, which never merge). */
+      const mark = (i: number) => (root: Y.Map<any>) => {
+        root.set(`m${i}`, i);
+        root.set(`n${i}`, -i);
+      };
+      w.step(0, (root) => {
+        const o = new Y.Map<any>();
+        root.set('o', o);
+        o.set('name', 'Object');
+        o.set('location', [0, 0, 0]);
+      });
+      // a value below the object: undoing this step follows the link of the value's copy
+      w.step(0, (root) => (root.get('o') as Y.Map<any>).set('location', [1, 0, 0]));
+      for (let i = 1; i <= 4; i++) w.step(0, mark(i));
+      w.step(0, (root) => root.delete('o'));
+      w.undo(0); // a copy comes back; the original is kept for the steps that can reach it
+      expect(held(doc).containers).toBe(1);
+      // the three oldest steps are dropped: they were not searched and counted as reaching it
+      for (let i = 5; i <= 9; i++) w.step(0, mark(i));
+      expect(w.a.agents[0].um.undoStack.length).toBe(8);
+      expect(held(doc).containers).toBe(0);
+      // undo and redo of every step left give the reference's states (compared at each one)
+      for (let i = 0; i < 8; i++) w.undo(0);
+      expect(w.a.root.has('m2')).toBe(false);
+      expect(w.a.root.get('m1')).toBe(1);
+      expect((w.a.root.get('o') as Y.Map<any>).get('location')).toEqual([1, 0, 0]);
+      for (let i = 0; i < 8; i++) w.redo(0);
+      expect(w.a.root.get('n9')).toBe(-9);
+    } finally {
+      reachSearch.budget = budget;
+    }
   });
 });

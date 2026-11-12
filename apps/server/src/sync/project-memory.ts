@@ -5,7 +5,13 @@ import {
   SAVE_BYTES_PER_KEPT_BYTE,
   type SceneDoc,
 } from '@3d-editor/core';
-import { collectGarbage, freeHeapBytes, projectGrowthRefusal, serverHeapReserve } from '../render/memory';
+import {
+  collectGarbage,
+  freeHeapBytes,
+  historyAdviceFor,
+  projectGrowthRefusal,
+  serverHeapReserve,
+} from '../render/memory';
 import type { UpdateSize } from './update-size';
 
 /*
@@ -52,24 +58,28 @@ export function describeGrowth(size: UpdateSize): string {
 
 /**
  * The message of a sync client's change the server does not apply (`clause`: why the project
- * cannot take it, from {@link GrowthCheck}).
+ * cannot take it, from {@link GrowthCheck}; when it names what agents' undo histories keep, the
+ * message ends with when that is freed, render/memory.ts HISTORY_ADVICE).
  */
 export function refusedChangesMessage(size: UpdateSize, clause: string): string {
   return (
     `changes not applied on the server: they add ${describeGrowth(size)} to the project, and ${clause}. ` +
-    'Delete objects and meshes the project no longer needs, then Save (Ctrl+S) to send it to the server again'
+    'Delete objects and meshes the project no longer needs, then Save (Ctrl+S) to send it to the server again' +
+    historyAdviceFor(clause)
   );
 }
 
 /**
  * The message of a stored state that a room's save or refresh does not merge (Room.guarded):
- * another writer stored the project with more than it can take (`clause`, from {@link GrowthCheck}).
+ * another writer stored the project with more than it can take (`clause`, from {@link GrowthCheck};
+ * ends as {@link refusedChangesMessage} does when it names what agents' undo histories keep).
  */
 export function storedChangesMessage(size: UpdateSize, clause: string): string {
   return (
     `changes in storage not merged on the server: another writer stored the project with ${describeGrowth(size)} ` +
     `more, and ${clause}. This server saves the changes made here once storage holds a project it can take ` +
-    '(delete objects and meshes the project no longer needs where they were added, and save there)'
+    '(delete objects and meshes the project no longer needs where they were added, and save there)' +
+    historyAdviceFor(clause)
   );
 }
 

@@ -1,15 +1,17 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 import * as Y from 'yjs';
 import { signal } from '@preact/signals';
 import {
   SceneDoc,
   SceneEvaluator,
+  createGrid,
   decodeFloat32,
   defaultBone,
   defaultRigidBody,
   emptySelection,
   fcurveKey,
+  meshStats,
   rigidBodyCacheInfo,
   type MaterialData,
 } from '@3d-editor/core';
@@ -358,6 +360,59 @@ describe('Object Data tab: armatures', () => {
       { ...defaultBone('Y'), parent: 'X' },
     ];
     expect(boneTree(bones).map((t) => `${t.bone.name}${t.depth}`)).toEqual(['A0', 'B1', 'C2', 'X0', 'Y0']);
+  });
+});
+
+describe('Object Data tab: mesh statistics', () => {
+  const statsText = (m: Parameters<typeof meshStats>[0]) => {
+    const st = meshStats(m);
+    return `Vertices ${st.vertices.toLocaleString()} · Edges ${st.edges.toLocaleString()} · Faces ${st.faces.toLocaleString()} · Triangles ${st.triangles.toLocaleString()}`;
+  };
+
+  it('counts a mesh once: drawing the tab again after changes elsewhere reads the mesh no more', () => {
+    // regression: the tab counted every edge of the active mesh again on each redraw, which every
+    // change anywhere in the project causes (0.1–0.4 s per change for a million faces)
+    ok('mesh.primitive_grid_add', { name: 'Grid', x_subdivisions: 20, y_subdivisions: 30 });
+    select(s, 'Grid');
+    activePropertiesTab.value = 'data';
+    const meshId = s.doc.findObjectByName('Grid')!.data!;
+    const grid = s.doc.getMesh(meshId)!;
+    let reads = 0;
+    // the stored mesh, counting how often its faces are read
+    const watched = new Proxy(grid, {
+      get(target, key, receiver) {
+        if (key === 'faces') reads++;
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    });
+    const getMesh = s.doc.getMesh.bind(s.doc);
+    vi.spyOn(s.doc, 'getMesh').mockImplementation((id) => (id === meshId ? watched : getMesh(id)));
+    const drawn = vi.spyOn(s.doc, 'dataUsers');
+    const { container } = render(<Properties session={s} />);
+    expect(container.textContent).toContain(statsText(grid));
+    expect(container.textContent).toContain('Flat shaded');
+    const afterFirst = reads;
+    expect(afterFirst).toBeGreaterThan(0);
+    const draws = drawn.mock.calls.length;
+    for (let i = 0; i < 5; i++) act(() => void s.doc.addObject({ type: 'EMPTY', name: `Elsewhere.${i}` }));
+    // the tab was drawn again for each change, without reading the mesh again
+    expect(drawn.mock.calls.length).toBeGreaterThanOrEqual(draws + 5);
+    expect(reads).toBe(afterFirst);
+    expect(container.textContent).toContain(statsText(grid));
+  });
+
+  it('shows the counts of the new mesh once the mesh changes', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'data';
+    const meshId = s.doc.findObjectByName('Cube')!.data!;
+    const { container } = render(<Properties session={s} />);
+    expect(container.textContent).toContain('Vertices 8 · Edges 12 · Faces 6 · Triangles 12');
+    const grid = createGrid({ x_subdivisions: 3, y_subdivisions: 2 });
+    grid.faceSmooth = grid.faces.map(() => true);
+    act(() => s.doc.setMesh(meshId, grid));
+    expect(container.textContent).toContain(statsText(grid));
+    expect(container.textContent).toContain('Smooth shaded');
   });
 });
 

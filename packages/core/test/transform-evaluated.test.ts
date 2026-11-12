@@ -491,7 +491,7 @@ describe('LOCAL orientation rebuilds an axis the active object scales to 0 (B4)'
     expect(maxDiff(t.doc.getObject(a)!.location, [1 + Math.cos(30 * deg), 0.5, 0])).toBeLessThan(1e-12);
   });
 
-  it('R X 100° LOCAL turns both objects about the rebuilt axis, as Blender', () => {
+  it('R X 100° LOCAL turns each object about its own X axis, the active one about the rebuilt axis, as Blender', () => {
     const t = setup();
     const objs = [
       { loc: [1, 0, 0], rot: [0, 0, 30 * deg], scale: [0, 1, 1] },
@@ -508,10 +508,12 @@ describe('LOCAL orientation rebuilds an axis the active object scales to 0 (B4)'
     );
     t.select([ids[1], ids[0]], ids[0]);
     t.run('transform.rotate', { value: 100 * deg, orient_axis: 'X', orient_type: 'LOCAL' });
-    const axis: Vec3 = [Math.cos(30 * deg), Math.sin(30 * deg), 0];
+    // with several objects Blender's setLocalConstraint turns each about the X axis of its own
+    // td->axismtx, which transform_orientations_create_from_axis rebuilds where A scales X to 0
+    const axes: Vec3[] = [[Math.cos(30 * deg), Math.sin(30 * deg), 0], eulToMat3(objs[1].rot)[0] as Vec3];
     const center = [2, 0.5, 0];
     objs.forEach((o, i) => {
-      const ref = blenderTransform(o, null, 'ROTATE', axisAngle(axis, 100 * deg), center);
+      const ref = blenderTransform(o, null, 'ROTATE', axisAngle(axes[i], 100 * deg), center);
       const got = t.doc.getObject(ids[i])!;
       expect(maxDiff(got.location, ref.loc), `${'AB'[i]} location`).toBeLessThan(1e-12);
       expect(maxDiff(got.rotation_euler, ref.rot), `${'AB'[i]} rotation`).toBeLessThan(1e-12);

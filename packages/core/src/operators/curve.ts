@@ -538,9 +538,16 @@ function copyCurveAnimation(
       });
 }
 
-/** Removes a curve datablock that no object uses any more (and its animation curves). */
-function dropOrphanCurve(ctx: OperatorContext, curveId: string): void {
-  if (ctx.doc.dataUsers(curveId) > 0) return;
+/**
+ * Removes a curve datablock that no object uses any more (and its animation curves). `users`: the
+ * number of objects using each data block, when the operator counted them once (SceneDoc.dataUserCounts).
+ */
+function dropOrphanCurve(
+  ctx: OperatorContext,
+  curveId: string,
+  users: ReadonlyMap<string, number> | null,
+): void {
+  if ((users ? (users.get(curveId) ?? 0) : ctx.doc.dataUsers(curveId)) > 0) return;
   for (const fc of ctx.doc.listFCurves(curveId))
     if (fc.target_type === 'curve') ctx.doc.removeFCurve(fcurveKey(fc));
   for (const d of ctx.doc.listDrivers(curveId))
@@ -553,7 +560,9 @@ function dropOrphanCurve(ctx: OperatorContext, curveId: string): void {
  * geometry (surface, or the wire as loose edges when there is none; modifiers applied) into a mesh,
  * keeping name, transform and material slots. target CURVE turns text into a 2D curve of glyph
  * outlines (POLY splines) keeping its fill/extrude/bevel settings and their animation (the layout is
- * baked at the evaluated frame). Returns the converted object.
+ * baked at the evaluated frame). Returns the converted object. `users`: the number of objects using
+ * each data block, when the operator counted them once for many objects (SceneDoc.dataUserCounts);
+ * kept current here.
  */
 export function convertCurveObject(
   ctx: OperatorContext,
@@ -561,6 +570,7 @@ export function convertCurveObject(
   target: 'MESH' | 'CURVE',
   ev: EvaluatedScene,
   keepOriginal = false,
+  users: Map<string, number> | null = null,
 ): { object: string; name: string; type: 'MESH' | 'CURVE' } | null {
   if ((o.type !== 'CURVE' && o.type !== 'FONT') || !o.data) return null;
   const curveId = o.data;
@@ -588,7 +598,8 @@ export function convertCurveObject(
       id = ctx.doc.addObject({ ...rest, type: 'CURVE', name, data: newCurve });
     } else {
       ctx.doc.updateObject(o.id, { type: 'CURVE', data: newCurve });
-      dropOrphanCurve(ctx, curveId);
+      retarget(users, curveId, newCurve);
+      dropOrphanCurve(ctx, curveId, users);
     }
     return { object: id, name: ctx.doc.getObject(id)!.name, type: 'CURVE' };
   }
@@ -614,7 +625,8 @@ export function convertCurveObject(
     id = ctx.doc.addObject({ ...rest, type: 'MESH', name, data: meshId, modifiers: [] });
   } else {
     ctx.doc.updateObject(o.id, { type: 'MESH', data: meshId, modifiers: [] });
-    dropOrphanCurve(ctx, curveId);
+    retarget(users, curveId, meshId);
+    dropOrphanCurve(ctx, curveId, users);
   }
   return { object: id, name: ctx.doc.getObject(id)!.name, type: 'MESH' };
 }
@@ -622,16 +634,27 @@ export function convertCurveObject(
 // ------------------------------------------------------------------ object edits (used by object.ts)
 
 /**
- * Gives an object its own copy of shared curve data before its geometry changes (like meshes). The
- * copy keeps the data's animation curves and drivers.
+ * One object stopped using data block `from` for `to` (a new one): the counts of `users` (see
+ * convertCurveObject) follow.
  */
-function singleUserCurve(ctx: OperatorContext, o: ObjectData): string {
+function retarget(users: Map<string, number> | null, from: string, to: string): void {
+  if (!users) return;
+  users.set(from, (users.get(from) ?? 1) - 1);
+  users.set(to, (users.get(to) ?? 0) + 1);
+}
+
+/**
+ * Gives an object its own copy of shared curve data before its geometry changes (like meshes). The
+ * copy keeps the data's animation curves and drivers. `users`: as convertCurveObject takes them.
+ */
+function singleUserCurve(ctx: OperatorContext, o: ObjectData, users: Map<string, number> | null): string {
   const id = o.data!;
-  if (ctx.doc.dataUsers(id) <= 1) return id;
+  if ((users ? (users.get(id) ?? 0) : ctx.doc.dataUsers(id)) <= 1) return id;
   const { id: _id, ...fields } = ctx.doc.getCurve(id)!;
   const copy = ctx.doc.addCurve(JSON.parse(JSON.stringify(fields)) as Partial<CurveData>);
   copyCurveAnimation(ctx, id, copy);
   ctx.doc.updateObject(o.id, { data: copy });
+  retarget(users, id, copy);
   return copy;
 }
 
@@ -759,13 +782,14 @@ function isConformal(cols: number[][]): boolean {
  * the transform allows it (a warning is reported otherwise). Call checkCurveTransformApply first.
  * Returns false, with a warning and nothing changed, when the data cannot absorb `delta` after all
  * (a selected parent applied before pushed a rotation into a 2D curve or text): the caller then keeps
- * the object's transform.
+ * the object's transform. `users`: as convertCurveObject takes them.
  */
 export function applyCurveTransform(
   ctx: OperatorContext,
   o: ObjectData,
   delta: Mat4,
   properties: boolean,
+  users: Map<string, number> | null = null,
 ): boolean {
   const src = (o.type === 'CURVE' || o.type === 'FONT') && o.data ? ctx.doc.getCurve(o.data) : null;
   if (!src) return true;
@@ -774,7 +798,7 @@ export function applyCurveTransform(
     ctx.report('WARNING', `'${o.name}' keeps its transform: ${problem}`);
     return false;
   }
-  const curveId = singleUserCurve(ctx, o);
+  const curveId = singleUserCurve(ctx, o, users);
   const curve = ctx.doc.getCurve(curveId)!;
   const m = delta;
   if (o.type === 'FONT') {
@@ -920,7 +944,8 @@ function textCenter(curve: CurveData): Vec3 | null {
  * GEOMETRY_ORIGIN moves the geometry so that its centre sits at the origin. Curves shift their control
  * points (centre: MEDIAN of points and handles, or BOUNDS), text shifts offset_x/offset_y (centre of its
  * glyph bounds, like Blender). 2D curves and text keep the origin in their XY plane. Animated point and
- * offset channels follow; children keep their world transform.
+ * offset channels follow; children keep their world transform. `children` and `users`: as moveOrigin
+ * and convertCurveObject take them.
  */
 export function curveOriginSet(
   ctx: OperatorContext,
@@ -929,6 +954,8 @@ export function curveOriginSet(
   center: 'MEDIAN' | 'BOUNDS',
   before: FrameState = new FrameState(ctx.doc, ctx.state.frame),
   changed: Set<string> = new Set(),
+  children: ReadonlyMap<string | null, readonly string[]> | null = null,
+  users: Map<string, number> | null = null,
 ): void {
   if ((o.type !== 'CURVE' && o.type !== 'FONT') || !o.data) return;
   const src = ctx.doc.getCurve(o.data);
@@ -943,7 +970,7 @@ export function curveOriginSet(
         : splineCenter(src, center);
   if (!target || !target.every(Number.isFinite)) return;
   if (o.type === 'FONT' || src.dimensions === '2D') target[2] = 0;
-  const curveId = singleUserCurve(ctx, o);
+  const curveId = singleUserCurve(ctx, o, users);
   const curve = ctx.doc.getCurve(curveId)!;
   if (o.type === 'FONT') {
     ctx.doc.updateCurve(curveId, {
@@ -976,7 +1003,7 @@ export function curveOriginSet(
   }
   if (type === 'GEOMETRY_ORIGIN') return;
   // the origin moves onto the old centre, so nothing moves visually; children keep their world transform
-  moveOrigin(ctx, o.id, target, before, changed);
+  moveOrigin(ctx, o.id, target, before, changed, children);
 }
 
 /**

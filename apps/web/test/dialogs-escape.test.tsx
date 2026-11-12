@@ -80,12 +80,60 @@ it('Escape closes the Projects window (Ctrl+O), also after a click inside it', a
   expect(dialog.value).toBeNull();
 });
 
+it('an Escape pressed as soon as a window appears closes it', async () => {
+  // regression: the window's Escape handler was added by an effect, which runs after the next frame, so
+  // an Escape pressed right after the window was shown (an e2e test on a busy machine) left it open. A
+  // mutation observer runs after the window's elements are added and before any frame.
+  const { container } = render(<DialogHost />);
+  const shown = new Promise<boolean>((resolve) => {
+    const observer = new MutationObserver(() => {
+      if (!container.querySelector('[data-testid="projects-dialog"]')) return;
+      observer.disconnect();
+      escape();
+      resolve(dialog.value === null);
+    });
+    observer.observe(container, { childList: true, subtree: true });
+  });
+  // not in act(): its effects run as in the browser, after the next frame
+  openDialog('projects');
+  expect(await shown).toBe(true);
+  expect(dialog.value).toBeNull();
+});
+
 it('Escape in a text field of a window cancels the typing first, the next one closes the window', async () => {
   const { container } = render(<DialogHost />);
   await open('projects');
   const name = container.querySelector<HTMLInputElement>('input[placeholder="Project name"]')!;
   name.focus();
   fireEvent.input(name, { target: { value: 'Typed' } });
+  escape(name);
+  expect(dialog.value).toBe('projects');
+  expect(name.value).toBe('Untitled');
+  escape(name);
+  expect(dialog.value).toBeNull();
+});
+
+it('text typed as soon as a window appears stays, and Escape then cancels it', async () => {
+  // regression: the field copied the text it shows from its props in an effect, which runs after the
+  // next frame or, sooner, when the field renders again: text typed before then (an e2e test filling the
+  // name field right after Ctrl+O) was replaced, so the Escape meant to cancel it found nothing typed
+  // and closed the window
+  const { container } = render(<DialogHost />);
+  const typed = new Promise<HTMLInputElement>((resolve) => {
+    const observer = new MutationObserver(() => {
+      const name = container.querySelector<HTMLInputElement>('input[placeholder="Project name"]');
+      if (!name) return;
+      observer.disconnect();
+      name.focus();
+      fireEvent.input(name, { target: { value: 'Typed' } });
+      resolve(name);
+    });
+    observer.observe(container, { childList: true, subtree: true });
+  });
+  // not in act(): its effects run as in the browser
+  openDialog('projects');
+  const name = await typed;
+  expect(name.value).toBe('Typed');
   escape(name);
   expect(dialog.value).toBe('projects');
   expect(name.value).toBe('Untitled');
@@ -174,8 +222,8 @@ it('Escape stops a running Render Animation and keeps the window open; the next 
   escape();
   expect(dialog.value).toBe('render');
   await waitFor(() => expect(container.querySelector('[data-testid="render-animation-cancel"]')).toBeNull());
-  // the window's effects after that update run after the next frame (Preact: at most 100 ms later)
-  await new Promise((r) => setTimeout(r, 150));
+  // regression: the window took Escape again only after the next frame, as its handler was added by an
+  // effect; now the commit that shows the render stopped adds it
   expect(dialog.value).toBe('render');
   escape();
   expect(dialog.value).toBeNull();

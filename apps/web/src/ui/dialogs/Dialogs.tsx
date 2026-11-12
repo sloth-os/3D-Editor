@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { WebDAVClient, type ExportFormat } from '@3d-editor/core';
 import {
@@ -48,8 +48,10 @@ export function Modal(p: {
   const dismissible = p.dismissible !== false;
   // Escape closes the dialog wherever the focus is in it: on the window, after the fields in the dialog
   // (a text or number entry being typed in uses an Escape to cancel the typing and stops it) and after
-  // the render windows' own handler (an Escape that stops a running render keeps the window open)
-  useEffect(() => {
+  // the render windows' own handler (an Escape that stops a running render keeps the window open).
+  // Added in the commit that shows the window (or makes it dismissible again when a render stops), not
+  // after the next frame as an effect would: an Escape pressed as soon as the window appeared was lost.
+  useLayoutEffect(() => {
     if (!dismissible) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
@@ -494,9 +496,12 @@ function useTicker(active: boolean, ms = 250): void {
   }, [active, ms]);
 }
 
-/** Calls `onEscape` for the Escape key while mounted (before the dialog and editor keymaps). */
+/**
+ * Calls `onEscape` for the Escape key while mounted (before the dialog and editor keymaps), from the
+ * commit that mounts it on (as the Modal's own handler, so no Escape falls between the two).
+ */
 function useEscape(onEscape: () => boolean): void {
-  useEffect(() => {
+  useLayoutEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && onEscape()) {
         e.preventDefault();

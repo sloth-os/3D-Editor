@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useRef, useState } from 'preact/hooks';
 import { Fragment, type ComponentChildren } from 'preact';
 import {
   BONE_CONSTRAINT_LABELS,
@@ -14,6 +14,8 @@ import {
   type ConstraintData,
   type CurveData,
   type LightData,
+  type MeshData as MeshCoreData,
+  type MeshStats,
   type ObjectData,
   type PoseBone,
   type ShapeKeyData,
@@ -33,6 +35,7 @@ import {
   TextField,
   VectorField,
   RAD,
+  useEditedText,
 } from '../fields/fields';
 import { animState, animatedValue, setProp } from './prop-edit';
 import { animatedBlock } from './animated';
@@ -195,13 +198,43 @@ function withCurrent<T extends string>(options: { value: T; label: string }[], c
 
 // ------------------------------------------------------------------ mesh
 
+/** What the mesh panels count of a mesh. */
+interface MeshPanelCounts {
+  stats: MeshStats;
+  smoothFaces: number;
+  seams: number;
+  sharpEdges: number;
+}
+
+const panelCountsOfMesh = new WeakMap<MeshCoreData, MeshPanelCounts>();
+
+/**
+ * The counts the mesh panels show, counted once per mesh: the document gives the same mesh until its
+ * stored data changes (SceneDoc.getMesh), and no code changes one in place. The tab draws again on
+ * every change anywhere in the project, and counting the edges of a mesh with a million faces each
+ * time held the editor 0.1–0.4 s per change while the Object Data tab was open.
+ */
+export function meshPanelCounts(mesh: MeshCoreData): MeshPanelCounts {
+  let c = panelCountsOfMesh.get(mesh);
+  if (!c) {
+    const attrs = Object.values(mesh.edgeAttrs);
+    c = {
+      stats: meshStats(mesh),
+      smoothFaces: mesh.faceSmooth.reduce((n, smooth) => (smooth ? n + 1 : n), 0),
+      seams: attrs.filter((a) => a.seam).length,
+      sharpEdges: attrs.filter((a) => a.sharp).length,
+    };
+    panelCountsOfMesh.set(mesh, c);
+  }
+  return c;
+}
+
 function MeshData({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const block = s.doc.getMeshBlock(o.data!);
   const mesh = s.doc.getMesh(o.data!);
   if (!block || !mesh) return null;
-  const st = meshStats(mesh);
+  const { stats: st, smoothFaces, seams, sharpEdges } = meshPanelCounts(mesh);
   const users = s.doc.dataUsers(o.data!);
-  const smoothFaces = mesh.faceSmooth.filter(Boolean).length;
   return (
     <>
       <ContextLine icon="data" name={block.name} users={users} />
@@ -217,7 +250,7 @@ function MeshData({ s, o }: { s: ProjectSession; o: ObjectData }) {
         <div class="hint">
           {smoothFaces === 0
             ? 'Flat shaded'
-            : smoothFaces === mesh.faces.length
+            : smoothFaces === st.faces
               ? 'Smooth shaded'
               : `${smoothFaces} smooth faces`}
         </div>
@@ -238,8 +271,7 @@ function MeshData({ s, o }: { s: ProjectSession; o: ObjectData }) {
           UV map: {mesh.uvs ? 'yes' : 'none'} · Vertex colors: {mesh.colors ? 'yes' : 'none'}
         </div>
         <div class="hint">
-          Seams: {Object.values(mesh.edgeAttrs).filter((a) => a.seam).length} · Sharp edges:{' '}
-          {Object.values(mesh.edgeAttrs).filter((a) => a.sharp).length}
+          Seams: {seams} · Sharp edges: {sharpEdges}
         </div>
       </Panel>
     </>
@@ -951,13 +983,12 @@ function CurvePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
  * and leaves the field; leaving it any other way applies it.
  */
 export function TextBody({ value, onCommit }: { value: string; onCommit: (v: string) => boolean }) {
-  const [text, setText] = useState(value);
+  const [text, setText] = useEditedText(value);
   /**
    * Text this field applied or cancelled since it got the focus: the blur that follows Ctrl+Enter or
    * Escape must not apply it (again).
    */
   const settled = useRef<string | null>(null);
-  useEffect(() => setText(value), [value]);
   const commit = (t: string) => {
     if (t === value || t === settled.current) return;
     settled.current = t;

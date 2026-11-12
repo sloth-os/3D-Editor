@@ -89,11 +89,12 @@ Every example project follows the same loop:
    and materials, a `render_animation` contact sheet for motion.
 6. **Fix and repeat.** `undo` reverts your last tool call (a whole batch at once). Your history
    keeps the last 100 steps per project and at most 64 MB of replaced or deleted data (server
-   defaults), so undo soon after a change and rebuild rather than undo far back. What it keeps,
-   also the objects you deleted until their step is dropped, counts in the memory the server keeps
-   for the project until your session ends (with an agent id, 6 hours after your last session). An
-   `OUT_OF_MEMORY` refusal names it from 1 MB (`… MB of it kept by agents' undo histories`) and
-   says how it is freed.
+   defaults; each replaced value counts with 167 bytes more), so undo soon after a change and
+   rebuild rather than undo far back. What it keeps, also the objects you deleted until their step
+   is dropped, counts in the memory the server keeps for the project until your session ends (with
+   an agent id, 6 hours after your last session, or earlier when the server keeps more than 200
+   agent ids and yours is the least recently used without a session). An `OUT_OF_MEMORY` refusal
+   names it from 1 MB (`… MB of it kept by agents' undo histories`) and says how it is freed.
 7. **Final outputs**: the path-traced still, the animation, the export.
 
 A minimal script skeleton with `scripts/mcp.mjs`, close to what the example scripts use:
@@ -636,20 +637,20 @@ their final size instead of scaling small ones.
   is done, also one that compiles; the other commands wait while the editor's main thread is busy:
   during a screenshot, while it builds the materials after the viewport switched to `MATERIAL` or
   `RENDERED` for the first time, while it carries out a command (with 4 million triangles in `SOLID`
-  shading a `select` took 0.1–1.2 s; a `get_view` sent then answered at most 0.4 s after it, not
+  shading a `select` took at most 0.1 s; a `get_view` sent then answered at most 0.4 s after it, not
   waiting for the viewport's frames, when the server did not hold it up) and while it applies a
   change made elsewhere (a `get_view` sent while it applied another agent's move of an object among
   4 million triangles answered at most 0.4 s after it; once per change it also copies its viewport
   into the project's thumbnail, which took at most 0.1 s: 3 s after the change or, while its
   viewport has not drawn the change, at one of its tries every 0.5 s after that, for up to 30 s
-  (3.0–5.1 s after a person's own edit); and when the frame rate its statistics overlay shows
-  changes while its viewport keeps drawing, the overlay counts every mesh again: 0.19–0.25 s with 4
-  million triangles, 1.1–1.8 s after a person's own edit). The server holds up every request while
-  it saves a project, 1.5 s after a change (at least every 15 s while changes keep coming; 0.3–0.9 s
-  each time with 4 million triangles, then twice more, 0.7–1.2 s after it began, for at most 0.2 s
-  each), while it merges what storage holds of a project that an editor has open, once a minute
+  (3.0–5.1 s after a person's own edit)). The server holds up every request while it saves a
+  project, 1.5 s after a change (at least every 15 s while changes keep coming; 0.3–0.9 s each time
+  with 4 million triangles, then twice more, 0.7–1.2 s after it began, for at most 0.2 s each),
+  while it merges what storage holds of a project that an editor has open, once a minute
   (0.3–1.9 s), and while it sends a project to an editor that has no copy of it yet (0.2–1.7 s); a
-  request sent during such a hold waits for the rest of it. X-ray changes nothing in `MATERIAL` or
+  request sent during such a hold waits for the rest of it. A save after an agent deleted many
+  objects holds longer, as the agent's undo history keeps the deleted objects and the save carries
+  them (1.6–1.8 s after it deleted 10,000 linked cubes). X-ray changes nothing in `MATERIAL` or
   `RENDERED` shading outside Edit Mode. A screenshot of a scene of millions of triangles takes half
   a second or more in any shading (0.5–5.3 s per `SOLID` screenshot with 4 million), and several
   times as long for the first `WIREFRAME` screenshot or frame of such a scene, while the editor

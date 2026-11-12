@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { SceneDoc, encodePNG, exportScene, renderSceneSoftware } from '@3d-editor/core';
@@ -34,6 +34,7 @@ beforeAll(async () => {
 afterAll(async () => {
   await server.close();
   await server.cleanup();
+  await rm(publicDir, { recursive: true, force: true });
 });
 
 describe('PWA hosting', () => {

@@ -392,8 +392,10 @@ projects together have a limit too). Changes that browsers send are held against
   to the project, and the project's meshes, objects, keyframes and images would then take about 63
   MB of memory … Delete objects and meshes the project no longer needs, then Save (Ctrl+S) to send
   it to the server again"), logs `sync changes not applied: the project cannot take them` at `warn`,
-  and closes the connection with code 4507 (`OUT_OF_MEMORY_CLOSE_CODE`). The project's other
-  connections go on and get nothing of those changes.
+  and closes the connection with code 4507 (`OUT_OF_MEMORY_CLOSE_CODE`). When the reason names what
+  agents' undo histories keep (`… MB of it kept by agents' undo histories`), the message ends with
+  when that is freed, as the agents' refusals do. The project's other connections go on and get
+  nothing of those changes.
 - The browser keeps the project with its changes (in IndexedDB, in its other tabs, and in WebDAV
   when it saves there directly), says once why the server did not take them, shows
   `Too large for server` in the status bar (sync status `refused`, a red dot; the tooltip has the

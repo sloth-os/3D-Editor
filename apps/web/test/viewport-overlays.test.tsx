@@ -2,16 +2,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render } from '@testing-library/preact';
 import { signal } from '@preact/signals';
 import * as Y from 'yjs';
-import { SceneDoc, SceneEvaluator, type ObjectData } from '@3d-editor/core';
+import {
+  SceneDoc,
+  SceneEvaluator,
+  createGrid,
+  meshStats,
+  type MeshData,
+  type ObjectData,
+} from '@3d-editor/core';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
-import type { ProjectSession } from '../src/project/session';
+import { ProjectSession as Session, type ProjectSession } from '../src/project/session';
 import { ViewportEngine } from '../src/viewport/engine';
 import { CameraFrame, InfoOverlay, PeerCursors, Sidebar, ViewportHeader } from '../src/ui/Viewport';
 import { registry, viewport } from '../src/editor/editor';
 import { registerUiOperators } from '../src/editor/ui-operators';
 import { session as sessionSignal } from '../src/app/store';
 import { clonePose } from '../src/viewport/navigation';
-import { slowFrameCompiled, slowFrameMs } from '../src/telemetry/perf';
+import { fps, slowFrameCompiled, slowFrameMs } from '../src/telemetry/perf';
 
 /*
  * The viewport's Overlays toggle hides every overlay, like Blender: the object helpers (cameras,
@@ -276,6 +283,84 @@ describe('slow viewport notice', () => {
     });
     expect(q('viewport-info')).not.toBeNull();
     expect(q('viewport-slow-frame')).toBeNull();
+  });
+});
+
+describe('statistics overlay', () => {
+  /*
+   * The statistics are counted once per evaluated mesh: the overlay used to count every mesh of the
+   * scene again (with its edges, which it does not show) each time it was drawn, also for each new
+   * frame rate while the viewport kept drawing and after each selection, which held the editor
+   * 0.19–0.25 s per update with 4 million triangles.
+   */
+  afterEach(() => {
+    fps.value = 0;
+    slowFrameMs.value = 0;
+  });
+
+  it('a new frame rate or slow frame redraws only its own line, not the statistics', () => {
+    const s = session();
+    const stats = vi.fn(() => ({ objects: 4, vertices: 8, faces: 6, triangles: 12 }));
+    (s as unknown as { sceneStats: typeof stats }).sceneStats = stats;
+    const { container } = render(<InfoOverlay s={s} />);
+    const q = (id: string) => container.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+    const counted = stats.mock.calls.length;
+    expect(counted).toBeGreaterThan(0);
+    for (const rate of [24, 31, 17]) {
+      act(() => {
+        fps.value = rate;
+      });
+      expect(stats.mock.calls.length).toBe(counted);
+      expect(q('viewport-stats')!.textContent).toContain(`${rate} fps`);
+    }
+    act(() => {
+      slowFrameMs.value = 2_400;
+    });
+    expect(stats.mock.calls.length).toBe(counted);
+    expect(q('viewport-slow-frame')!.textContent).toBe('Slow viewport: 2.4 s per frame');
+    // a change of the scene draws the statistics again
+    act(() => {
+      s.doc.addObject({ name: 'Another', type: 'EMPTY' });
+    });
+    expect(stats.mock.calls.length).toBeGreaterThan(counted);
+  });
+
+  it('counts each evaluated mesh once: drawing the statistics again reads no mesh again', () => {
+    const grid = createGrid({ x_subdivisions: 20, y_subdivisions: 30 });
+    let reads = 0;
+    // a mesh that counts how often its faces are read
+    const watched = new Proxy(grid, {
+      get(target, key, receiver) {
+        if (key === 'faces') reads++;
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+    }) as MeshData;
+    const fake = {
+      state: { frame: 1, mode: 'OBJECT', activeId: null },
+      evaluator: {
+        evaluate: () => ({
+          objects: [
+            { mesh: watched, visible: true },
+            { mesh: watched, visible: true },
+            { mesh: null, visible: true },
+            { mesh: grid, visible: false },
+          ],
+        }),
+      },
+    };
+    const sceneStats = () => Session.prototype.sceneStats.call(fake as unknown as ProjectSession);
+    const st = meshStats(grid);
+    const expected = {
+      objects: 4,
+      vertices: 2 * st.vertices,
+      faces: 2 * st.faces,
+      triangles: 2 * st.triangles,
+    };
+    expect(sceneStats()).toEqual(expected);
+    const afterFirst = reads;
+    expect(afterFirst).toBeGreaterThan(0);
+    for (let i = 0; i < 5; i++) expect(sceneStats()).toEqual(expected);
+    expect(reads).toBe(afterFirst);
   });
 });
 

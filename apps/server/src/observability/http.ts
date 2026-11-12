@@ -68,7 +68,16 @@ export function registerHttpObservability(
         if (status >= 500) span.setStatus({ code: SpanStatusCode.ERROR });
         span.end();
       }
-      const level = status >= 500 ? 'error' : isQuietRoute(route) && status < 400 ? 'debug' : 'info';
+      // 507 (code OUT_OF_MEMORY) is the documented refusal of work the server cannot hold: an
+      // expected answer, not a server fault, so it is logged at warn like the refusal itself
+      const level =
+        status === 507
+          ? 'warn'
+          : status >= 500
+            ? 'error'
+            : isQuietRoute(route) && status < 400
+              ? 'debug'
+              : 'info';
       // The close event runs outside the request's async context: add the trace ids explicitly.
       const sc = span?.spanContext();
       request.log[level](

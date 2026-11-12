@@ -14,23 +14,28 @@
  * more than their longest time: made with {@link MARGIN_PERCENT} % from the runs of fewer agents,
  * they missed later agents' runs (docs/mcp.md, Live editors, says by how much). A range made that
  * way from all but one agent's runs held all the runs of the agent left out. The times of the scene
- * with 4 million triangles ({@link MILLIONS_SOLID_SECONDS}, {@link MILLIONS_SELECT_SECONDS}, the
- * last part of {@link BROWSER_RASTER_SECONDS}, the first WIREFRAME screenshot in docs/mcp.md) pool
- * round 10's runs only: on round 9's code the editor's statistics overlay (apps/web Viewport.tsx
- * InfoOverlay) counted the edges of every mesh each time it was updated, also after every slow
- * frame (core meshStats of that scene took 4.4–4.7 s in Node on round 9's code, 0.15–0.38 s on
- * round 10's), which held those steps up by seconds: measured the same way in round 10, round 9's
- * code took about 4 s for a SOLID screenshot and about 3 s for a select, round 10's about 1 s and
- * 0.2 s. A SOLID screenshot there pools screenshots sent at once after a select had answered, and a
- * select selects sent at once after a screenshot had answered: they wait for the frame the viewport
- * draws then. docs/mcp.md (Live editors) has the ranges, how they were made, and what was measured;
- * the editorTimeoutMessage doc comment (editor-commands.ts) what they mean. On the same machine
- * kept busy by other processes (four CPU-bound processes and other work, 1-minute load averages of
- * {@link BUSY_LOADS}), the same steps took longer: a browser editor's RASTER images most, so the
- * texts give two factors over the upper end of the ranges ({@link BUSY_FACTOR},
- * {@link BROWSER_BUSY_FACTOR}), and every text that gives a time says how it was made and how much
- * longer it took on a busy machine ({@link measured}, {@link measuredBrowserImages},
- * {@link measuredOnServer}, {@link measuredNote}).
+ * with 4 million triangles ({@link MILLIONS_SOLID_SECONDS}, the last part of {@link
+ * BROWSER_RASTER_SECONDS}, the first WIREFRAME screenshot in docs/mcp.md) pool round 10's runs
+ * only: on round 9's code the editor's statistics overlay (apps/web Viewport.tsx InfoOverlay)
+ * counted the edges of every mesh each time it was updated, also after every slow frame (core
+ * meshStats of that scene took 4.4–4.7 s in Node on round 9's code, 0.15–0.38 s on round 10's),
+ * which held those steps up by seconds: measured the same way in round 10, round 9's code took
+ * about 4 s for a SOLID screenshot and about 3 s for a select, round 10's about 1 s and 0.2 s. A
+ * select there ({@link MILLIONS_SELECT_SECONDS}) pools the 40 calm runs of round 13's LAST agent
+ * only (2026-11-12): until round 12 the overlay still counted every mesh, edges too, each time it
+ * was drawn, also when the frame rate it shows changed, and a select waited for that (0.18–0.31 s
+ * in that agent's runs of round 12's code, up to 1.12 s right after a screenshot); since round 13
+ * it counts a mesh once, when the mesh changes, without its edges (apps/web session.ts meshCounts),
+ * and draws the frame rate apart (Viewport.tsx FrameRate). A SOLID screenshot there pools
+ * screenshots sent at once after a select had answered, which wait for the frame the viewport draws
+ * then, and a select selects sent at once after a SOLID screenshot had answered. docs/mcp.md (Live
+ * editors) has the ranges, how they were made, and what was measured; the editorTimeoutMessage doc
+ * comment (editor-commands.ts) what they mean. On the same machine kept busy by other processes
+ * (four CPU-bound processes and other work, 1-minute load averages of {@link BUSY_LOADS}), the same
+ * steps took longer: a browser editor's RASTER images most, so the texts give two factors over the
+ * upper end of the ranges ({@link BUSY_FACTOR}, {@link BROWSER_BUSY_FACTOR}), and every text that
+ * gives a time says how it was made and how much longer it took on a busy machine ({@link
+ * measured}, {@link measuredBrowserImages}, {@link measuredOnServer}, {@link measuredNote}).
  */
 
 /** How much the ranges are widened on each side beyond the shortest and longest calm time (%). */
@@ -40,7 +45,8 @@ export const MARGIN_PERCENT = '25';
  * How much more than their longest calm time the ranges of a select and a SOLID screenshot with 4
  * million triangles run to (%): made with {@link MARGIN_PERCENT} % from the runs of fewer agents,
  * these ranges missed later agents' runs of them (requests sent as soon as the one before had
- * answered); their lower ends use {@link MARGIN_PERCENT} %.
+ * answered). The lower end of a SOLID screenshot's uses {@link MARGIN_PERCENT} %; a select's range
+ * is given as "at most", its lower end rounding to 0.
  */
 export const MILLIONS_MARGIN_PERCENT = '50';
 
@@ -100,11 +106,11 @@ export const MILLIONS_SOLID_SECONDS = '0.5–5.3 s';
 /**
  * A select (editor_command) in that scene, the viewport in SOLID shading: the editor carries it out
  * once its main thread is free (after a screenshot it is drawing; the viewport's frames do not hold it
- * up, apart from the first ones that build materials or wires), counting the edges of every mesh
- * again for the statistics overlay, also one sent as soon as a screenshot had answered. The upper end
- * is {@link MILLIONS_MARGIN_PERCENT} % above the longest time.
+ * up, apart from the first ones that build materials or wires), also one sent as soon as a SOLID
+ * screenshot had answered. The upper end is {@link MILLIONS_MARGIN_PERCENT} % above the longest
+ * time (0.024 s), rounded up to 0.1 s; the header says which runs.
  */
-export const MILLIONS_SELECT_SECONDS = '0.1–1.2 s';
+export const MILLIONS_SELECT_SECONDS = 'at most 0.1 s';
 
 /**
  * Grey clay rendered on the server (render_image with shading 'SOLID' rendered by the server's
@@ -130,17 +136,22 @@ export const BROWSER_RASTER_SECONDS =
 /*
  * What holds up an editor's commands besides the work of the commands themselves, with 4 million
  * triangles (two grids of 1000×1000 quads, a stored document of 134 MB, disk storage): the calm runs
- * of round 11's and round 12's TEXTS agents and verifiers (2026-11-11 and 2026-11-12), the server
- * probed with /healthz every 10 ms from a process of its own, the editor's main thread with its long
- * tasks. Each range is made as above ({@link MARGIN_PERCENT}); docs/mcp.md (Live editors) has the
- * measured values.
+ * of round 11's and round 12's TEXTS agents and verifiers (2026-11-11 and 2026-11-12; the editor
+ * applying an agent's move: round 13's LAST agent), the server probed with /healthz every 10 ms from a
+ * process of its own, the editor's main thread with its long tasks. Each range is made as above
+ * ({@link MARGIN_PERCENT}); docs/mcp.md (Live editors) has the measured values.
  */
 
 /**
  * The editor's main thread while it applies a change made elsewhere: another agent's move of one of
- * the grids (its long task right after the change, the viewport in SOLID shading).
+ * the grids, the viewport in SOLID shading. In the 16 calm runs of round 13's LAST agent
+ * (2026-11-12) it made no long task (one of 50 ms or more, the shortest the browser reports) within
+ * 3 s of the change: under 0.05 s, widened by {@link MARGIN_PERCENT} % and rounded up to 0.1 s. On
+ * round 12's code its long task right after the change took 0.17–0.25 s (round 12's TEXTS agents),
+ * most of it the statistics overlay counting every mesh again (a CPU profile of round 13's runs of
+ * that code sampled 0.14–0.36 s in its counting functions within 3 s of each move).
  */
-export const CHANGE_APPLY_SECONDS = '0.1–0.4 s';
+export const CHANGE_APPLY_SECONDS = 'at most 0.1 s';
 
 /**
  * The server holds up every request while it saves a project after a change (Room.save: it reads the

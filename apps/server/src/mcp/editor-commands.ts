@@ -187,12 +187,13 @@ export function describeLateRpcs(late: readonly LateRpc[], now = Date.now()): st
  * to SOLID says that it helps only when the viewport is not in SOLID shading.
  *
  * The times come from editor-costs.ts (its header says how they were measured and made: calm runs of
- * nine agents in headless Chromium with software WebGL, pooled, widened by MARGIN_PERCENT, the
- * longest select and SOLID screenshot with 4 million triangles by MILLIONS_MARGIN_PERCENT; on a
- * machine kept busy by other processes the same steps took up to BUSY_FACTOR times as long, which
- * the messages say with {@link measuredNote}). The first screenshot or viewport frame in MATERIAL
- * or RENDERED shading after the editor opened the project builds and compiles that shading's
- * materials ({@link FIRST_SHADING_SECONDS} for a scene of 81 objects and 71 materials, the scene of
+ * nine agents in headless Chromium with software WebGL, pooled (a select with 4 million triangles:
+ * one agent's runs of round 13's code), widened by MARGIN_PERCENT, the longest select and SOLID
+ * screenshot with 4 million triangles by MILLIONS_MARGIN_PERCENT; on a machine kept busy by other
+ * processes the same steps took up to BUSY_FACTOR times as long, which the messages say with
+ * {@link measuredNote}). The first screenshot or viewport frame in MATERIAL or RENDERED shading
+ * after the editor opened the project builds and compiles that shading's materials
+ * ({@link FIRST_SHADING_SECONDS} for a scene of 81 objects and 71 materials, the scene of
  * the measurements); the editor keeps them (apps/web scene-objects.ts ObjectView.materialSets), so
  * later screenshots in that shading compiled nothing (LATER_SECONDS), also after the viewport
  * switched to it, and SOLID or WIREFRAME ones took FAST_SECONDS. A screenshot is drawn with the
@@ -220,8 +221,8 @@ export function describeLateRpcs(late: readonly LateRpc[], now = Date.now()): st
  * soon as a select had answered waits for the frame the viewport draws then (a screenshot waits for
  * the frames in progress), and these ranges include it and selects sent as soon as a screenshot had
  * answered. Other commands do not wait for the viewport's frames, only for the work that holds the
- * editor's main thread: with 4 million triangles a select took {@link MILLIONS_SELECT_SECONDS}, as the
- * statistics overlay counts the edges of every mesh again (apps/web session.ts sceneStats), and
+ * editor's main thread: with 4 million triangles a select took {@link MILLIONS_SELECT_SECONDS} (the
+ * statistics overlay counts a mesh only when it changes: apps/web session.ts meshCounts), and
  * applying a change made elsewhere (another agent's move of an object) {@link CHANGE_APPLY_SECONDS}.
  * Every request, a command too, also waits while the server holds up its event loop (a project of
  * 4 million triangles): while it saves a project after a change ({@link SAVE_HOLD_SECONDS}, then twice
@@ -362,11 +363,9 @@ export function editorTimeoutMessage(
     'triangles, while it builds the wires of every mesh; with millions of triangles it is also busy while ' +
     `it carries out a command (with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}) ` +
     `and while it applies a change made elsewhere (${CHANGE_APPLY_SECONDS} for an agent's move of an ` +
-    'object among 4 million triangles); it is also busy while its statistics overlay counts every mesh again, ' +
-    'which it does when the frame rate it shows changes as the viewport keeps drawing (0.19–0.25 s with 4 ' +
-    "million triangles, 1.1–1.8 s after a person's own edit in it), and while it copies the frame its viewport " +
-    "drew into the project's thumbnail (at most 0.1 s with 4 million triangles), once per change, 3 s after it " +
-    'or, until the viewport has drawn it, at the first of its tries every 0.5 s after that, but not while it ' +
+    'object among 4 million triangles); it is also busy while it copies the frame its viewport drew into ' +
+    "the project's thumbnail (at most 0.1 s with 4 million triangles), once per change, 3 s after it or, " +
+    'until the viewport has drawn it, at the first of its tries every 0.5 s after that, but not while it ' +
     'draws its other frames. ' +
     (atMax
       ? `With timeout_ms at its maximum (${MAX_EDITOR_TIMEOUT_MS}), retry, or, ${toSolid}`

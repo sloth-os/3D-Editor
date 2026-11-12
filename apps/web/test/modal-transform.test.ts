@@ -847,8 +847,9 @@ describe('an axis key pressed again constrains in the active object’s axes (LO
    * Blender 4.2's transform_event_modal_constraint (transform.cc) moves on to the next of the
    * transform's orientation slots on each press of the constraint in use (the scene's orientation,
    * GLOBAL by default; then LOCAL; then none), and the operators it confirms store orient_type LOCAL
-   * with the value in those axes. The header names the orientation ("along local X"). Here Move and
-   * Rotate do so; Scale has the world's axes only, as transform.resize takes no orient_type.
+   * with the value in those axes. The header names the orientation ("along local X"). Move, Rotate
+   * and Scale do so here (transform.translate, transform.rotate and transform.resize with orient_type
+   * LOCAL).
    */
   /** An empty turned 20° about X, 40° about Y and 30° about Z: its own X axis, in the world. */
   const turned = (t: ReturnType<typeof setup>) => {
@@ -936,26 +937,59 @@ describe('an axis key pressed again constrains in the active object’s axes (LO
     expect(maxDiff(rotation(after.get(id)!), rotation(expected))).toBeLessThan(1e-12);
   });
 
-  it('S has the world’s axes only (transform.resize takes no orient_type): its second press removes the constraint', () => {
+  it('S X X 2 scales 2 along the object’s own X axis (transform.resize, orient_type LOCAL); a third press removes it', () => {
     const t = setup();
     const { id } = turned(t);
     const m = t.start('resize');
     t.type(m, 'X');
     expect(t.hud()).toContain('along global X');
     t.type(m, 'X');
-    expect(m.axis).toBeNull();
-    expect(t.hud()).not.toMatch(/along|locking/);
-    t.type(m, 'X2');
-    expect(t.hud()).toBe('Scale X: 2.0000  Y: 1.0000  Z: 1.0000  along global X  [2]');
+    expect(t.hud()).toContain('along local X');
+    t.type(m, '2');
+    expect(t.hud()).toBe('Scale X: 2.0000  Y: 1.0000  Z: 1.0000  along local X  [2]');
     const { preview, after, res } = t.confirm(m);
-    expect(res.params).toEqual({ value: [2, 1, 1], center: [1, 2, 3] });
-    expect(maxDiff(preview.get(id)!, after.get(id)!)).toBeLessThan(1e-12);
-    // also with the LOCAL transform orientation
+    expect(res).toEqual({
+      operator: 'transform.resize',
+      params: { value: [2, 1, 1], orient_type: 'LOCAL', center: [1, 2, 3] },
+    });
+    expect(preview.get(id)).toEqual(after.get(id));
+    // along its own X axis: the scale of X doubles, the rotation and the location stay
+    const o = t.doc.getObject(id)!;
+    expect(maxDiff(o.scale, [2, 1, 1])).toBeLessThan(1e-12);
+    expect(o.rotation_euler).toEqual([20 * deg, 40 * deg, 30 * deg]);
+    expect(o.location).toEqual([1, 2, 3]);
+    // a third press removes the constraint
+    const s = t.start('resize');
+    t.type(s, 'XXX');
+    expect(s.axis).toBeNull();
+    expect(t.hud()).not.toMatch(/along|locking/);
+    s.finish(false);
+  });
+
+  it('S Shift+Y Shift+Y 3 scales in the plane of the object’s own X and Z axes; with the LOCAL orientation S Y is local', () => {
+    const t = setup();
+    const { id } = turned(t);
+    const m = t.start('resize');
+    m.setAxis('Y', true);
+    m.setAxis('Y', true);
+    t.type(m, '3');
+    expect(t.hud()).toBe('Scale X: 3.0000  Y: 1.0000  Z: 3.0000  locking local Y  [3]');
+    const { preview, after, res } = t.confirm(m);
+    expect(res.params).toEqual({ value: [3, 1, 3], orient_type: 'LOCAL', center: [1, 2, 3] });
+    expect(preview.get(id)).toEqual(after.get(id));
+    expect(maxDiff(t.doc.getObject(id)!.scale, [3, 1, 3])).toBeLessThan(1e-12);
+    // the editor's transform orientation LOCAL: the first press is local, the second global
     t.state.transformOrientation = 'LOCAL';
     const s = t.start('resize');
     t.type(s, 'Y');
+    expect(t.hud()).toContain('along local Y');
+    t.type(s, 'Y');
     expect(t.hud()).toContain('along global Y');
-    s.finish(false);
+    t.type(s, '2');
+    expect(s.finish(true)).toEqual({
+      operator: 'transform.resize',
+      params: { value: [1, 2, 1], center: [1, 2, 3] },
+    });
   });
 
   it('G Shift+X Shift+X keeps a drag in the plane of the object’s own Y and Z axes (locking local X)', () => {
@@ -1123,5 +1157,63 @@ describe('an axis key pressed again constrains in the active object’s axes (LO
         before.map((_, i) => (i % 3 === 0 ? 1 : 0)),
       ),
     ).toBeLessThan(1e-6);
+  });
+
+  it('with several objects, G, R and S X X move, turn and scale each along its own axes: the preview is what the operator stores', () => {
+    // Blender's setLocalConstraint: several objects each in their own axes (A, the active one,
+    // turned 90° about Z, so its X is the world's Y; B not turned)
+    const scene = () => {
+      const t = setup();
+      const a = t.doc.addObject({ type: 'EMPTY', name: 'A', rotation_euler: [0, 0, 90 * deg] });
+      const b = t.doc.addObject({ type: 'EMPTY', name: 'B', location: [4, 0, 0] });
+      t.state.selectedIds = [a, b];
+      t.state.activeId = a;
+      return {
+        t,
+        a,
+        b,
+        names: new Map([
+          [a, 'A'],
+          [b, 'B'],
+        ]),
+      };
+    };
+    {
+      // S X X 2 about the median point (2, 0, 0): B doubles along the world's X, to (6, 0, 0)
+      const { t, a, b, names } = scene();
+      const m = t.start('resize');
+      t.type(m, 'XX2');
+      expect(t.hud()).toContain('along local X');
+      const { preview, after, res } = t.confirm(m);
+      expect(res.params).toEqual({ value: [2, 1, 1], orient_type: 'LOCAL', center: [2, 0, 0] });
+      expectSame(preview, after, names);
+      expect(maxDiff(t.doc.getObject(a)!.scale, [2, 1, 1])).toBeLessThan(1e-12);
+      expect(maxDiff(t.doc.getObject(a)!.location, [0, 0, 0])).toBeLessThan(1e-12);
+      expect(maxDiff(t.doc.getObject(b)!.scale, [2, 1, 1])).toBeLessThan(1e-12);
+      expect(maxDiff(t.doc.getObject(b)!.location, [6, 0, 0])).toBeLessThan(1e-12);
+    }
+    {
+      // G X X 1: A along the world's Y, B along the world's X
+      const { t, a, b, names } = scene();
+      const m = t.start('translate');
+      t.type(m, 'XX1');
+      const { preview, after } = t.confirm(m);
+      expectSame(preview, after, names);
+      expect(maxDiff(t.doc.getObject(a)!.location, [0, 1, 0])).toBeLessThan(1e-12);
+      expect(maxDiff(t.doc.getObject(b)!.location, [5, 0, 0])).toBeLessThan(1e-12);
+    }
+    {
+      // R X X 90 about (2, 0, 0): A about the world's Y axis, B about the world's X axis
+      const { t, a, b, names } = scene();
+      const m = t.start('rotate');
+      t.type(m, 'XX90');
+      const { preview, after } = t.confirm(m);
+      expectSame(preview, after, names);
+      const turnA = multiply4(axisAngle4([0, 1, 0], 90 * deg), axisAngle4([0, 0, 1], 90 * deg));
+      // A's origin, (−2, 0, 0) from the pivot, turned 90° about Y: (0, 0, 2) from it
+      expect(maxDiff(after.get(a)!, [...turnA.slice(0, 12), 2, 0, 2, 1])).toBeLessThan(1e-12);
+      const turnB = axisAngle4([1, 0, 0], 90 * deg);
+      expect(maxDiff(after.get(b)!, [...turnB.slice(0, 12), 4, 0, 0, 1])).toBeLessThan(1e-12);
+    }
   });
 });

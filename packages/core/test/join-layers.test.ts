@@ -338,6 +338,8 @@ describe('object.join keeps the vertex groups and shape keys of every joined mes
     t.doc.setShapeKeys(emptyActive, [t.key('OnlyE', [])]);
     const ea = t.doc.addObject({ type: 'MESH', name: 'E', data: emptyActive });
     Object.assign(t.ctx.state, { selectedIds: [ea, t.c], activeId: ea });
+    // and its estimate counts that key, written for the 3 joined vertices
+    expect(t.estimate('object.join')!.layers).toEqual({ kind: 'shape keys', bytes: 12 * 3 });
     t.run('object.join');
     const keys = t.keysOf(emptyActive);
     expect(keys.map((k) => k.name)).toEqual(['OnlyE']);
