@@ -355,7 +355,7 @@ describe('docs: error codes of refused render operators', () => {
     expect(flat(guide)).toContain('Renders and exports that ran out of memory carry this code too.');
     // the operator refusal the error tables quote, with the server's wording (render/memory.ts)
     const refusal = refusedOperatorMessage(
-      { estimate: { bytes: 1, faces: 1, lower: 'X', addedStoredBytes: 0 }, storedBytes: 0 } as never,
+      { estimate: { bytes: 1, faces: 2, lower: 'X', addedStoredBytes: 0 }, storedBytes: 0 } as never,
       1,
       1,
     ).replace(/\d+/g, '…');
@@ -866,8 +866,8 @@ describe('docs: browser editors', () => {
     for (const text of agentTexts()) expect(text).not.toContain('tenths of a second');
     expect(joined(source('mcp/tools.ts'))).toContain(
       'while it carries out a command: with 4 million triangles in SOLID shading a select took ' +
-        `\${MILLIONS_SELECT_SECONDS}, and while it applies a change made elsewhere: \${CHANGE_APPLY_SECONDS} for ` +
-        "an agent's move of an object among 4 million triangles; the viewport's frames do not hold them up)",
+        `\${MILLIONS_SELECT_SECONDS}, while it applies a change made elsewhere: \${CHANGE_APPLY_SECONDS} for ` +
+        "an agent's move of an object among 4 million triangles, while its statistics overlay counts every mesh again,",
     );
     for (const text of [doc, flat(guide), joined(source('mcp/tools.ts'))])
       expect(text).not.toMatch(
@@ -1056,9 +1056,10 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
         `project, widened by ${MARGIN_PERCENT} % and rounded up to 0.1 s); one sent while the editor applied an ` +
         `agent's move took at most ${getViewApply.upTo} too (${getViewApply.max} measured, in the calm runs of the ` +
         'TEXTS agents of rounds 11 and 12); an editor that was not busy answered a `get_view` within 0.1 s ' +
-        `(${(Math.max(...HOLDS.GET_VIEW_IDLE_MS) / 1000).toFixed(3)} s measured). 3 s after a change the editor ` +
-        "also copies the frame its viewport drew into the project's thumbnail, which held it at most " +
-        `${thumbnail.upTo} with 4 million triangles (${thumbnail.max} measured in round 12, the viewport idle).`,
+        `(${(Math.max(...HOLDS.GET_VIEW_IDLE_MS) / 1000).toFixed(3)} s measured). The editor also copies the ` +
+        "frame its viewport drew into the project's thumbnail, once per change, which held it at most " +
+        `${thumbnail.upTo} with 4 million triangles (${thumbnail.max} measured in round 12, the viewport idle): 3 s ` +
+        'after the change, or, while its viewport has not drawn the change yet, at the first of its tries every 0.5 s',
     );
     expect(
       Math.ceil((Math.max(...HOLDS.GET_VIEW_IDLE_MS) / 1000) * (1 + Number(MARGIN_PERCENT) / 100) * 10) / 10,
@@ -1070,9 +1071,9 @@ describe('docs: what a screenshot costs, and what it waits for', () => {
     expect(web('viewport/engine.ts')).toContain("const url = c.toDataURL('image/jpeg', 0.7);");
     expect(flat(guide)).toContain(
       "and while it applies a change made elsewhere (a `get_view` sent while it applied another agent's move " +
-        `of an object among 4 million triangles answered at most ${getViewApply.upTo} after it; 3 s after a ` +
-        "change it also copies its viewport into the project's thumbnail, which took at most " +
-        `${thumbnail.upTo}).`,
+        `of an object among 4 million triangles answered at most ${getViewApply.upTo} after it; once per change it ` +
+        "also copies its viewport into the project's thumbnail, which took at most " +
+        `${thumbnail.upTo}: 3 s after the change or,`,
     );
     expect(doc).not.toContain('one sent after it had answered took at most 0.2 s');
     expect(doc).not.toContain('in milliseconds, unless the server held it up');
@@ -1762,9 +1763,11 @@ describe('docs: browser path traces and the Render window', () => {
     expect(rasterRow).toContain(
       'the geometry the editor evaluates at the render settings (curve and text surfaces, modifier and shape key ' +
         "results, particle and collection instances) would not fit into its tab's JavaScript heap; the message " +
-        'says what to lower (the triangles, or the instances when the render builds no curve or text surface, ' +
-        'modifier or shape key result) and the advice to render on the server (`renderer: "software"`). ' +
-        'With `renderer: "auto"` the server renders the image, and `note` gives this reason',
+        'gives the heap the page is estimated to use',
+    );
+    expect(rasterRow).toContain(
+      '; then the advice to render on the server (`renderer: "software"`). With `renderer: "auto"` the server ' +
+        'renders the image, and `note` gives this reason',
     );
     expect(flat(mcp)).not.toContain('the message says what to lower (resolution, triangles)');
     expect(
@@ -1773,9 +1776,9 @@ describe('docs: browser path traces and the Render window', () => {
         '`browser render failed: Path tracing was not started: …`, `browser render failed: The RASTER render was not started: …`',
       ),
     ).toContain(
-      'lower what the message names (the triangles, or the instances when a `RASTER` render builds no curve or ' +
-        "text surface, modifier or shape key result; for a path trace that does not fit the tab's memory also the " +
-        'resolution), use `RASTER` where the message suggests it, or render on the server (`renderer: "software"`)',
+      'lower what the message names ("Lower the triangles (…)", or "(about … instances of …) … Lower the ' +
+        'instances (…)" when a `RASTER` render builds no other geometry; for a path trace over the tab\'s memory ' +
+        'also the resolution), use `RASTER` where suggested, or render on the server (`renderer: "software"`)',
     );
   });
 });
@@ -2027,11 +2030,12 @@ describe('docs: projects in storage that others share', () => {
         "WebDAV (<reason>). The project is saved in this browser.', or that it syncs once back online",
     );
     for (const text of agentTexts()) expect(text).not.toMatch(/shows the person a Saved message/);
-    // only a save to WebDAV stores a deleted project again (WebDAVSync.save); Save always connects
-    // to the server again (ProjectSession.flush), which closes the connection of a project it
-    // deleted within the hour (RoomManager's tombstones) unless storage holds it again
+    // only a save to WebDAV stores a deleted project again (WebDAVSync.save); Save connects to the
+    // server again (ProjectSession.flush), which closes the connection of a project it deleted within
+    // the hour (RoomManager's tombstones) unless storage holds it again; once per Save (round 13:
+    // not again after a refusal of the project's changes, which the server would only repeat)
     expect(web('project/session.ts')).toMatch(
-      /: \{ message: 'Saved in this browser', level: 'info' \};\s*this\.provider\?\.reconnect\(\);/,
+      /: \{ message: 'Saved in this browser', level: 'info' \};\s*if \(this\.provider\?\.status\.value !== 'refused'\) this\.provider\?\.reconnect\(\);/,
     );
     expect(source('sync/room-manager.ts')).toContain('const TOMBSTONE_TTL_MS = 60 * 60 * 1000;');
     const reconnect =
@@ -2726,8 +2730,8 @@ describe("docs: other areas' messages (round 12)", () => {
     // the texts that say what a browser editor does with an OUT_OF_MEMORY refusal name the exception
     const exception =
       'except when the project, or all the projects the server has open, would then need more than the server ' +
-      "keeps for them ('the project's … would then take about …' or 'the open projects' …'): the server refuses an " +
-      "editor's changes for the same reason";
+      "keeps for them ('the project's … would then take about …', or '… already take about …' for a project " +
+      "already past it, or 'the open projects' …'): the server refuses an editor's changes for the same reason";
     const tools = joined(source('mcp/tools.ts'));
     expect(tools).toContain(
       `and a browser editor that has the project open runs it in its own memory, ${exception}`,
@@ -2737,15 +2741,16 @@ describe("docs: other areas' messages (round 12)", () => {
     );
     expect(MCP_INSTRUCTIONS).toContain(
       'a browser editor runs it in its own memory, except when the project, or all the projects the server has ' +
-        'open, would then need more than the server keeps for them ("the project\'s … would then take about …" or ' +
-        '"the open projects\' …"): the server refuses an editor\'s changes for the same reason) or FAILED.',
+        'open, would then need more than the server keeps for them ("the project\'s … would then take about …", or ' +
+        '"… already take about …" for a project already past it, or "the open projects\' …"): the server refuses an ' +
+        "editor's changes for the same reason) or FAILED.",
     );
     expect(tools).toContain(
       "When the server's free heap is too small, the message also says how a browser editor that has the project " +
         'open runs the import in its own memory (editor_command run_operator with the file in base64); when the ' +
         'project, or all the projects the server has open, would then need more than the server keeps for them ' +
-        "('the project's … would then take about …' or 'the open projects' …'), it does not, as the server refuses " +
-        "that editor's changes for the same reason.",
+        "('the project's … would then take about …', or '… already take about …' for a project already past it, or " +
+        "'the open projects' …'), it does not, as the server refuses that editor's changes for the same reason.",
     );
     expect(row(mcp, '`OUT_OF_MEMORY`')).toContain(
       'and a browser editor that has the project open runs it in its own memory, except when the project, or all ' +
@@ -3003,6 +3008,250 @@ describe("docs: other areas' messages (round 12)", () => {
     );
     expect(file('../../../../packages/core/src/eval/evaluate.ts')).toContain(
       "physicsErrors.push({ source: 'rigidbody', message: (e as Error).message });",
+    );
+  });
+});
+
+describe('docs: round 13 (EDGE)', () => {
+  const MB = 1024 * 1024;
+  const tools = () => joined(source('mcp/tools.ts'));
+
+  /*
+   * add_modifier and update_modifier refuse an object of the wrong type on curve and text objects too
+   * (modifiers.ts resolveObjectParams, without the operator's prefix); mcp.md said so without quoting
+   * a message (round 12's BONE verifier, live/probe.log).
+   */
+  it('quote the refusals of add_modifier and update_modifier on curve and text objects', () => {
+    registerBuiltinModifiers();
+    const doc = flat(mcp);
+    const boolean = modifierObjectRefusal('BOOLEAN', 'object', { name: 'Path', type: 'CURVE' });
+    const curve = modifierObjectRefusal('CURVE', 'object', { name: 'Label', type: 'FONT' });
+    const shrinkwrap = modifierObjectRefusal('SHRINKWRAP', 'target', { name: 'Rig', type: 'ARMATURE' });
+    expect(boolean).toBe(
+      "Parameter 'object' of the Boolean modifier takes a mesh object; 'Path' is a curve object " +
+        '(object.convert with target MESH makes it one)',
+    );
+    expect(doc).toContain(
+      `On a text object, \`add_modifier\` and \`update_modifier\` alike refuse a Boolean whose object is the curve 'Path' with "${boolean}"; on a curve, a Curve modifier whose object is the text 'Label' with "${curve}" and a Shrinkwrap whose target is the armature 'Rig' with "${shrinkwrap}".`,
+    );
+  });
+
+  /*
+   * get_scene problems: the modifiers Blender disables come after the errors, within the cap of 40,
+   * as {source: 'modifier', object, modifier, disabled: true, message}, with viewport: true when only
+   * the viewport's evaluation has them (scene-summary.ts allProblems); one that only the render
+   * settings disable says that the viewport uses it (problemsOf), mirroring the viewport-only case.
+   */
+  it('describe the disabled entries of get_scene problems as scene-summary.ts makes them', () => {
+    const summary = joined(source('mcp/scene-summary.ts'));
+    expect(summary).toContain('const MAX_PROBLEMS = 40;');
+    expect(summary).toContain('if (i === undefined) out.push({ ...p, viewport: true });');
+    expect(summary).toContain('? `Modifier is disabled: ${disabled} in renders; the viewport uses it`');
+    expect(summary).toContain(': `Modifier is disabled: ${disabled} in the viewport; renders use it`,');
+    const doc = flat(mcp);
+    expect(doc).toContain(
+      'After the errors, within the same 40 entries, come the modifiers that Blender disables because they ' +
+        'can change nothing, which the evaluations leave out, as ' +
+        '`{source: "modifier", object, modifier, disabled: true, message}`, with `viewport: true` when only ' +
+        "the viewport's evaluation has the entry",
+    );
+    expect(doc).toContain(
+      'one that only the render settings disable, which the viewport uses (`levels` 2, `render_levels` 0), ' +
+        "has \"Modifier is disabled: the Subdivision Surface modifier 'Subdivision' has 0 render levels " +
+        '(render_levels), so it changes nothing in renders; the viewport uses it"',
+    );
+    expect(tools()).toContain(
+      "({source: 'modifier', object, modifier, disabled: true, message}, with `viewport: true` when only the " +
+        'viewport evaluation has the entry;',
+    );
+    expect(tools()).toContain(
+      "one that only the render settings disable, which the viewport uses, ends 'so it changes nothing in " +
+        "renders; the viewport uses it'); at most 40 entries in all, errors first",
+    );
+    expect(flat(guide)).toContain(
+      'as `{source: "modifier", object, modifier, disabled: true, message}` with the message "Modifier is ' +
+        'disabled: …" and `viewport: true` when only the viewport\'s evaluation has the entry (one that only ' +
+        'the viewport\'s settings disable ends "…; renders use it", one that only the render settings disable ' +
+        '"…; the viewport uses it"), at most 40 entries in all, errors first',
+    );
+  });
+
+  /*
+   * The RASTER refusal of a render that builds no geometry names its instances and says to lower them
+   * (render/memory.ts rasterRefusal): the rows quote both forms. The page's heap in these refusals is
+   * an estimate from its scene with a quarter more (pageHeapEstimate, PAGE_HEAP_BYTES), which round
+   * 12's messages gave as "the page uses X GB".
+   */
+  it('quote both forms of the RASTER refusal and give the heap of the page as an estimate', () => {
+    const memory = web('render/memory.ts');
+    expect(memory).toContain("'the page and the path traced renders running in it are estimated to use'");
+    expect(memory).toContain(": 'the page is estimated to use';");
+    expect(memory).not.toMatch(/'the page uses'|running in it use'/);
+    expect(memory).toContain(
+      '? `about ${triangleCount(needs.triangles)} triangles: curve and text surfaces, modifier and shape key results`',
+    );
+    expect(memory).toContain(
+      ': `about ${triangleCount(needs.instances ?? 0)} instances of objects, particles and collections, and no ` +',
+    );
+    expect(memory).toContain(
+      "const LOWER_TRIANGLES =\n  'the triangles (subdivision render levels, curve and text render resolution, objects in the scene)';",
+    );
+    const rasterRow = row(
+      mcp,
+      '`browser render failed: The RASTER render was not started: the geometry it evaluates at the render settings needs about … GB of JavaScript heap, …`',
+    );
+    expect(rasterRow).toContain(
+      'the message gives the heap the page is estimated to use (from its scene, with a quarter more: it can ' +
+        'exceed what the heap holds), what the geometry is and what to lower: "(about … triangles: curve and ' +
+        'text surfaces, modifier and shape key results) … Lower the triangles (subdivision render levels, curve ' +
+        'and text render resolution, objects in the scene)", or, when the render builds no curve or text ' +
+        'surface, modifier or shape key result, "(about … instances of objects, particles and collections, and ' +
+        'no curve or text surface, modifier or shape key result) … Lower the instances (particle counts, ' +
+        'instanced collections, objects in the scene)"',
+    );
+    expect(
+      row(
+        mcp,
+        '`browser render failed: Path tracing was not started: its render thread needs about … GB of JavaScript heap, more than the … GB the tab has left for it: …`',
+      ),
+    ).toContain(
+      'which is the share of the heap limit a render may fill less the heap the page (and the path traced ' +
+        'renders running in it) is estimated to use, from its scene with a quarter more',
+    );
+    expect(
+      row(
+        guide,
+        '`browser render failed: Path tracing was not started: …`, `browser render failed: The RASTER render was not started: …`',
+      ),
+    ).toContain(
+      '(the page\'s use is estimated): lower what the message names ("Lower the triangles (…)", or ' +
+        '"(about … instances of …) … Lower the instances (…)" when a `RASTER` render builds no other geometry;',
+    );
+    for (const doc of [mcp, guide]) expect(flat(doc)).not.toMatch(/the page uses \S+ GB/);
+  });
+
+  /*
+   * What holds an editor's commands besides the commands themselves: its thumbnail copy, which
+   * session.ts scheduleIndexUpdate makes 3 s after a change, or later when the viewport has not drawn
+   * the change (every 0.5 s, for up to 30 s: 4.25-5.07 s after a person's edit in round 12's TEXTS
+   * verifier runs), and its statistics overlay, which counts every mesh again whenever the overlay
+   * renders, also when the frame rate it shows changes (Viewport.tsx InfoOverlay reads fps; 0.197-0.244 s
+   * with 4 million triangles 1.1-1.8 s after a person's own edit, measured in round 12's TEXTS
+   * verifier runs and round 13). Round 12 said "3 s after a change" and named neither in
+   * editor_command's description or the timeout message.
+   */
+  it("name the editor's thumbnail copy and statistics overlay among what holds its commands", () => {
+    const session = web('project/session.ts');
+    expect(session).toContain('export const INDEX_UPDATE_MS = 3000;');
+    expect(session).toContain('export const THUMBNAIL_RETRY_MS = 500;');
+    expect(session).toContain('export const THUMBNAIL_WAIT_MS = 30_000;');
+    expect(session).toContain('const s = meshStats(o.mesh);');
+    const viewport = web('ui/Viewport.tsx');
+    expect(viewport).toContain('const stats = showStats ? s.sceneStats() : null;');
+    expect(viewport).toContain("<div>{fps.value ? `${fps.value} fps` : ''}</div>");
+    const stats =
+      "its statistics overlay counts every mesh again, which it does when the frame rate it shows changes as the viewport keeps drawing (0.19–0.25 s with 4 million triangles, 1.1–1.8 s after a person's own edit";
+    const thumbnail =
+      "while it copies the frame its viewport drew into the project's thumbnail (at most 0.1 s with 4 million triangles), once per change";
+    expect(tools()).toContain(
+      `while ${stats} in that editor), and ${thumbnail}: 3 s after it, or, while the viewport has not drawn it yet, at the first of its tries every 0.5 s (for up to 30 s) after that (3.0–5.1 s after a person's own edit); the viewport's frames do not hold them up)`,
+    );
+    const timeout = editorTimeoutMessage('select', 10_000);
+    expect(timeout).toContain(
+      `it is also busy while ${stats} in it), and ${thumbnail}, 3 s after it or, until the viewport has drawn it, at the first of its tries every 0.5 s after that, but not while it draws its other frames.`,
+    );
+    expect(flat(mcp)).toContain(
+      "The editor also copies the frame its viewport drew into the project's thumbnail, once per change, which " +
+        'held it at most 0.1 s with 4 million triangles (0.07 s measured in round 12, the viewport idle): 3 s ' +
+        'after the change, or, while its viewport has not drawn the change yet, at the first of its tries every ' +
+        "0.5 s after that, for up to 30 s (3.0–5.1 s after a person's own edit in that editor, measured in " +
+        'rounds 12 and 13). Its statistics overlay counts every mesh again when the frame rate it shows changes ' +
+        'while the viewport keeps drawing, which held it 0.19–0.25 s with 4 million triangles, 1.1–1.8 s after ' +
+        "a person's own edit in that editor (measured in rounds 12 and 13).",
+    );
+    expect(flat(guide)).toContain(
+      "once per change it also copies its viewport into the project's thumbnail, which took at most 0.1 s: 3 s " +
+        'after the change or, while its viewport has not drawn the change, at one of its tries every 0.5 s ' +
+        "after that, for up to 30 s (3.0–5.1 s after a person's own edit); and when the frame rate its " +
+        'statistics overlay shows changes while its viewport keeps drawing, the overlay counts every mesh ' +
+        "again: 0.19–0.25 s with 4 million triangles, 1.1–1.8 s after a person's own edit)",
+    );
+    for (const doc of [mcp, guide])
+      expect(flat(doc)).not.toMatch(/3 s after a change (the editor|it) also copies/);
+  });
+
+  /*
+   * A project already past what the server keeps for one gets the "already take about" form of the
+   * refusal (render/memory.ts projectLimitReason): the texts that name the exception of the browser
+   * editor quoted only the "would then take about" form.
+   */
+  it('quote both forms of the project-limit refusal where the browser editor exception is named', () => {
+    const refusal = storedMeshesMessage(
+      {
+        operator: 'mesh.subdivide',
+        estimate: { bytes: 1, faces: 0, addedStoredBytes: MB, lower: 'number_cuts' },
+        storedBytes: 1500 * MB,
+        saveBytes: 0,
+        objects: 3,
+      } as never,
+      2096 * MB,
+    );
+    expect(refusal).toMatch(
+      /^not run on the server: the project's [^.]* already take about [\d,]+ MB of memory/,
+    );
+    const quote = "'… already take about …' for a project already past it";
+    expect(tools().split(quote).length - 1).toBe(3);
+    expect(tools()).toContain(
+      `('the project's … would then take about …', or ${quote}, or 'the open projects' …')`,
+    );
+    expect(MCP_INSTRUCTIONS).toContain(
+      '("the project\'s … would then take about …", or "… already take about …" for a project already past ' +
+        'it, or "the open projects\' …")',
+    );
+  });
+
+  /*
+   * delete_project's description gives the lookup by name as mcp.md does (agent.ts resolveProjectId):
+   * round 12's TEXTS verifier found its "that had none then" clause pinned in mcp.md only.
+   */
+  it("give delete_project's lookup by name in its description as the docs do", () => {
+    const clause =
+      'then the project.json of each stored project that is new or changed since this server last read it, ' +
+      'that had none then, or that it read more than a minute ago), at most 5 s in all when this server has ' +
+      'loaded a project of that name';
+    expect(tools()).toContain(clause);
+    expect(flat(mcp)).toContain(clause.replace('project.json', '`project.json`'));
+  });
+
+  /*
+   * A stored project the server's heap cannot load answers REST requests with 507, its reason and
+   * code OUT_OF_MEMORY (api/projects.ts roomOr404); a sync update that neither the measure nor Yjs can
+   * read is refused with BAD_MESSAGE (sync/room.ts unmeasured).
+   */
+  it('give the REST answer for a stored project the server does not load, and what unreadable updates get', () => {
+    const reason = loadRefusal(
+      { id: 'p1', name: 'Huge' },
+      { objects: 10, keyframes: 0, imageBytes: 0, bytes: 900 * MB } as never,
+      { heapLimit: () => 2096 * MB, heapFree: () => 100 * MB, collect: () => undefined },
+    );
+    expect(reason).toMatch(/^project 'Huge' \(p1\) was not loaded on the server: /);
+    expect(source('api/projects.ts')).toContain(
+      "await reply.code(507).send({ error: err.message, code: 'OUT_OF_MEMORY' });",
+    );
+    expect(flat(mcp)).toContain(
+      'for a stored project the server does not load ' +
+        '`{"error": "project \'<name>\' (<id>) was not loaded on the server: …", "code": "OUT_OF_MEMORY"}`',
+    );
+    const sync = flat(read('storage-and-sync.md'));
+    expect(source('sync/room.ts')).toContain(
+      "? 'sync changes applied without the memory check: the measure could not read them'",
+    );
+    expect(sync).toContain(
+      'it is applied without the check and logged as ' +
+        '`sync changes applied without the memory check: the measure could not read them` at `warn`.',
+    );
+    expect(sync).toContain(
+      'is applied nowhere, and the connection gets a control error with code `BAD_MESSAGE`.',
     );
   });
 });

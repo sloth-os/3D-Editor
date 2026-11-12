@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import Fastify from 'fastify';
 import * as encoding from 'lib0/encoding';
 import * as Y from 'yjs';
 import * as syncProtocol from 'y-protocols/sync';
@@ -10,6 +11,8 @@ import {
   MemoryFileStore,
   OUT_OF_MEMORY_CLOSE_CODE,
   ProjectFileStore,
+  SAVE_BYTES_PER_IMAGE_BYTE,
+  SAVE_BYTES_PER_KEPT_BYTE,
   SceneDoc,
   createEditorState,
   createGrid,
@@ -27,11 +30,12 @@ import {
 import { Room, type RoomDeps, type SyncConnection } from '../../src/sync/room';
 import { RoomManager } from '../../src/sync/room-manager';
 import { ProjectMemoryError, loadNeed, type GrowthCheck } from '../../src/sync/project-memory';
-import { measureUpdate } from '../../src/sync/update-size';
+import { measureUpdate, yjsReadError } from '../../src/sync/update-size';
 import { otherOpenProjects } from '../../src/render/memory';
 import { ServerMetrics } from '../../src/observability/metrics';
 import { silentLog, type Log } from '../../src/observability/log';
 import type { Persistence } from '../../src/persistence';
+import { registerProjectRoutes } from '../../src/api/projects';
 
 /*
  * Changes a sync client sends that add to its project are asked about before they are applied
@@ -40,6 +44,22 @@ import type { Persistence } from '../../src/persistence';
  */
 
 const MB = 1024 * 1024;
+
+/** Makes measureUpdate throw, as a gap of the measure would: on an update that Yjs reads whole. */
+const measureGap = vi.hoisted(() => ({ on: false }));
+vi.mock('../../src/sync/update-size', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/sync/update-size')>();
+  return {
+    ...actual,
+    measureUpdate: (...args: Parameters<typeof actual.measureUpdate>) => {
+      if (measureGap.on) throw new Error('a gap of the measure (test)');
+      return actual.measureUpdate(...args);
+    },
+  };
+});
+afterEach(() => {
+  measureGap.on = false;
+});
 
 /** A browser editor's document: core operators run on it as in the browser. */
 function editor(name = 'P') {
@@ -354,6 +374,61 @@ describe('what an update adds to a project (measureUpdate)', () => {
     expect(chars).toBeLessThan(weights / 10);
   });
 
+  it('counts shape keys added to a mesh the project has, as core counts the project', () => {
+    const e = editor();
+    e.run('mesh.primitive_grid_add', { name: 'Grid', x_subdivisions: 30, y_subdivisions: 30 });
+    const meshId = e.scene.findObjectByName('Grid')!.data!;
+    const vertices = e.scene.meshCounts(meshId)!.vertices;
+    const server = copy(e.scene);
+    const before = model(server).kept;
+    const update = e.changes(() => {
+      for (const name of ['Basis', 'Smile', 'Frown']) e.run('object.shape_key_add', { object: 'Grid', name });
+    });
+    const size = measureUpdate(update, server);
+    Y.applyUpdate(server.ydoc, update);
+    // (core SHAPE_KEY_STORED_BYTES_PER_VERTEX: 16 bytes per vertex of each key)
+    expect(size.meshBytes).toBe(3 * 16 * vertices);
+    expect(size.kept).toBe(model(server).kept - before);
+  });
+
+  it('counts the bytes of new images, and a save of them', () => {
+    const e = editor();
+    const server = copy(e.scene);
+    const update = e.changes(() =>
+      e.scene.addImage({
+        name: 'Wood',
+        mime: 'image/png',
+        width: 512,
+        height: 512,
+        data: new Uint8Array(3 * MB),
+      }),
+    );
+    const size = measureUpdate(update, server);
+    expect(size.imageBytes).toBe(3 * MB);
+    expect(size.kept - size.objectsPart).toBe(3 * MB);
+    expect(size.saved).toBe(SAVE_BYTES_PER_KEPT_BYTE * size.objectsPart + SAVE_BYTES_PER_IMAGE_BYTE * 3 * MB);
+  });
+
+  it('reads past the skips of an update that lacks some changes of a client', () => {
+    const e = editor();
+    e.run('mesh.primitive_cube_add', { name: 'Cube' });
+    const server = copy(e.scene);
+    const cube = e.scene.findObjectByName('Cube')!.id;
+    const place = (count: number, y: number) =>
+      e.changes(() =>
+        e.run('object.array_place', { objects: ['Cube'], linked: true, count, offset: [0.1, y, 0] }),
+      );
+    const first = place(6, 0);
+    e.changes(() => e.scene.updateObject(cube, { location: [1, 2, 3] }));
+    const third = place(4, 1);
+    // (the merged update holds a skip where the changes it lacks were)
+    const merged = Y.mergeUpdates([first, third]);
+    expect(Y.decodeUpdate(merged).structs.some((s) => s instanceof Y.Skip)).toBe(true);
+    const size = measureUpdate(merged, server);
+    expect(size.objects).toBe(5 + 3);
+    expect(size.kept).toBe(8 * 11_000);
+  });
+
   it('takes no memory for the clock units that a few bytes of an update declare', () => {
     // one struct of `len` clock units: garbage-collected items, a skip, deleted content
     const crafted = (kind: 'gc' | 'skip' | 'deleted', len: number): Uint8Array => {
@@ -392,6 +467,100 @@ describe('what an update adds to a project (measureUpdate)', () => {
 
   it('throws on what is no update', () => {
     expect(() => measureUpdate(new Uint8Array([5, 1, 2, 3, 200, 200, 200]))).toThrow();
+  });
+
+  it('counts what replaces or deletes mesh data without a header, or an entry that is no datablock', () => {
+    // what the project has of them counts as nothing: reading it must not throw (an update the
+    // measure cannot read goes to Yjs without the check, see Room.unmeasured)
+    const scene = oddProject();
+    const server = copy(scene);
+    const replaced = updateOf(scene.ydoc, () => replaceOdd(scene));
+    const size = measureUpdate(replaced, server);
+    Y.applyUpdate(server.ydoc, replaced);
+    // the two grids, and the image
+    expect(size.meshBytes).toBe(storedMeshBytes(server));
+    expect(size.meshBytes).toBeGreaterThan(2 * 100_000);
+    expect(size.imageBytes).toBe(2 * MB);
+    const other = oddProject();
+    const removal = updateOf(other.ydoc, () =>
+      other.transact(() => {
+        other.map('meshes').delete('no-mesh');
+        other.map('images').delete('no-image');
+      }),
+    );
+    expect(measureUpdate(removal, copy(other))).toMatchObject({ meshBytes: 0, imageBytes: 0 });
+  });
+});
+
+/** The update `fn` makes of `doc`. */
+function updateOf(doc: Y.Doc, fn: () => void): Uint8Array {
+  const sv = Y.encodeStateVector(doc);
+  fn();
+  return Y.encodeStateAsUpdate(doc, sv);
+}
+
+/**
+ * A project whose cube's mesh data has no mesh header (4 bytes), with values that are no datablocks
+ * in the place of a mesh ('no-mesh') and an image ('no-image'): what a client can set.
+ */
+function oddProject(): SceneDoc {
+  const e = editor('Odd');
+  e.run('mesh.primitive_cube_add', { name: 'Cube' });
+  const meshes = e.scene.map('meshes');
+  e.scene.transact(() => {
+    (meshes.get(e.scene.findObjectByName('Cube')!.data!) as Y.Map<unknown>).set(
+      'data',
+      new Uint8Array([1, 2, 3, 4]),
+    );
+    meshes.set('no-mesh', 'a value that is no datablock');
+    e.scene.map('images').set('no-image', 7);
+  });
+  return e.scene;
+}
+
+/** Replaces what {@link oddProject} made odd: a grid in the cube's mesh and in 'no-mesh', an image of 2 MB. */
+function replaceOdd(scene: SceneDoc): void {
+  const meshes = scene.map('meshes');
+  const meshId = scene.findObjectByName('Cube')!.data!;
+  scene.transact(() => {
+    scene.setMesh(meshId, createGrid({ x_subdivisions: 50, y_subdivisions: 50 }));
+    const entry = new Y.Map<unknown>();
+    meshes.set('no-mesh', entry);
+    entry.set('data', (meshes.get(meshId) as Y.Map<unknown>).get('data'));
+    const image = new Y.Map<unknown>();
+    scene.map('images').set('no-image', image);
+    image.set('data', new Uint8Array(2 * MB));
+  });
+}
+
+describe('updates the measure cannot read (yjsReadError)', () => {
+  /** An update of `count` - 1 new linked cubes, the whole one and with its last byte dropped. */
+  function cubes(count: number) {
+    const e = editor();
+    e.run('mesh.primitive_cube_add', { name: 'Cube' });
+    const server = copy(e.scene);
+    const update = e.changes(() =>
+      e.run('object.array_place', { objects: ['Cube'], linked: true, count, offset: [0.1, 0, 0] }),
+    );
+    // (an update that deletes nothing ends with its empty delete set: one byte, 0)
+    expect(update[update.byteLength - 1]).toBe(0);
+    return { e, server, update, truncated: update.slice(0, update.byteLength - 1) };
+  }
+
+  it('says why Yjs cannot read an update, and nothing of one it reads, applying neither', () => {
+    const { server, update, truncated } = cubes(51);
+    expect(() => measureUpdate(truncated, server)).toThrow();
+    const state = Y.encodeStateVector(server.ydoc);
+    expect(yjsReadError(update)).toBeNull();
+    expect(yjsReadError(truncated)).toBe('Unexpected end of array');
+    expect(yjsReadError(update.slice(0, update.byteLength >> 1))).not.toBeNull();
+    expect(yjsReadError(new Uint8Array(0))).toBe('Unexpected end of array');
+    expect(Y.encodeStateVector(server.ydoc)).toEqual(state);
+    // Yjs itself adds the structs it read before it fails on the rest
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(server.ydoc));
+    expect(() => Y.applyUpdate(doc, truncated)).toThrow();
+    expect(new SceneDoc(doc).objectIds()).toHaveLength(51);
   });
 });
 
@@ -564,6 +733,95 @@ describe('changes of sync clients the project cannot take (Room)', () => {
     expect(room.scene.findObjectByName('More')).toBeNull();
     expect(a.ws.closed?.code).toBe(OUT_OF_MEMORY_CLOSE_CODE);
   });
+
+  it('answers an update it cannot read with BAD_MESSAGE, and applies none of it', () => {
+    const e = editor('Truncated');
+    e.run('mesh.primitive_cube_add', { name: 'Cube' });
+    let asked = 0;
+    const lines: string[] = [];
+    const log: Log = { ...silentLog, warn: (_o, msg) => void lines.push(msg ?? '') };
+    const { room, connect } = roomOf(
+      e.scene,
+      () => {
+        asked++;
+        return 'no room (test)';
+      },
+      log,
+    );
+    const a = connect();
+    const b = connect();
+    const bFrames = b.ws.syncFrames();
+    const update = e.changes(() =>
+      e.run('object.array_place', { objects: ['Cube'], linked: true, count: 51, offset: [0.1, 0, 0] }),
+    );
+    // its delete set (one byte, 0: it deletes nothing) dropped: Yjs would add its 50 objects, then fail
+    send(room, a.conn, updateFrame(update.slice(0, update.byteLength - 1)));
+    expect(a.ws.controls().filter((m) => m.kind === 'error')).toEqual([
+      {
+        kind: 'error',
+        code: 'BAD_MESSAGE',
+        message:
+          'could not process sync message: the update cannot be read (Unexpected end of array), so none of it ' +
+          'was applied',
+      },
+    ]);
+    expect(room.scene.objectIds()).toHaveLength(1);
+    expect(asked).toBe(0);
+    expect(b.ws.syncFrames()).toBe(bFrames);
+    expect(lines).toEqual([]);
+    // the connection stays: what it sends next is asked about as before
+    expect(a.ws.closed).toBeNull();
+    send(room, a.conn, updateFrame(update));
+    expect(asked).toBe(1);
+    expect(a.ws.closed?.code).toBe(OUT_OF_MEMORY_CLOSE_CODE);
+    expect(room.scene.objectIds()).toHaveLength(1);
+  });
+
+  it('applies an update the measure cannot read but Yjs reads, without the check, and says so', () => {
+    const e = editor('Gap');
+    e.run('mesh.primitive_cube_add', { name: 'Cube' });
+    let asked = 0;
+    const lines: string[] = [];
+    const log: Log = { ...silentLog, warn: (_o, msg) => void lines.push(msg ?? '') };
+    const { room, connect } = roomOf(
+      e.scene,
+      () => {
+        asked++;
+        return 'no room (test)';
+      },
+      log,
+    );
+    const a = connect();
+    measureGap.on = true;
+    send(
+      room,
+      a.conn,
+      updateFrame(
+        e.changes(() =>
+          e.run('object.array_place', { objects: ['Cube'], linked: true, count: 11, offset: [0.1, 0, 0] }),
+        ),
+      ),
+    );
+    expect(room.scene.objectIds()).toHaveLength(11);
+    expect(asked).toBe(0);
+    expect(a.ws.controls().filter((m) => m.kind === 'error')).toEqual([]);
+    expect(a.ws.closed).toBeNull();
+    expect(lines).toEqual(['sync changes applied without the memory check: the measure could not read them']);
+  });
+
+  it('asks about what replaces mesh data without a header, or an entry that is no datablock', () => {
+    const scene = oddProject();
+    let asked = 0;
+    const { room, connect } = roomOf(scene, () => {
+      asked++;
+      return 'no room (test)';
+    });
+    const a = connect();
+    send(room, a.conn, updateFrame(updateOf(scene.ydoc, () => replaceOdd(scene))));
+    expect(asked).toBe(1);
+    expect(a.ws.closed?.code).toBe(OUT_OF_MEMORY_CLOSE_CODE);
+    expect(room.scene.map('meshes').get('no-mesh')).toBe('a value that is no datablock');
+  });
 });
 
 /** A RoomManager over `fs` whose loads are held against a heap of `free` of `limit` bytes. */
@@ -650,6 +908,70 @@ describe('stored projects whose load would not fit (RoomManager)', () => {
     expect(lines).toContain('project not loaded: the server cannot hold it');
   });
 
+  it('answers REST requests for one with 507, its reason and code OUT_OF_MEMORY, without an error log', async () => {
+    const fs = new MemoryFileStore();
+    const { id } = await storedProject(fs, 100);
+    const { rooms, lines } = manager(fs, 258 * MB);
+    managers.push(rooms);
+    const logged: { level: number; msg?: string }[] = [];
+    const app = Fastify({
+      logger: { level: 'info', stream: { write: (line: string) => void logged.push(JSON.parse(line)) } },
+    });
+    registerProjectRoutes(app, rooms);
+    try {
+      for (const url of [`/api/projects/${id}`, `/api/projects/${id}/snapshot`]) {
+        const res = await app.inject({ method: 'GET', url });
+        expect(res.statusCode).toBe(507);
+        expect(res.json()).toEqual({
+          error: expect.stringMatching(
+            new RegExp(`^project 'Stored' \\(${id}\\) was not loaded on the server: `),
+          ),
+          code: 'OUT_OF_MEMORY',
+        });
+      }
+    } finally {
+      await app.close();
+    }
+    // (Fastify logs the errors a route throws at level 50, with their stack)
+    expect(logged.filter((l) => l.level >= 50)).toEqual([]);
+    expect(lines.filter((l) => l === 'project not loaded: the server cannot hold it')).toHaveLength(2);
+  });
+
+  it('does not load one whose stored document Yjs cannot read', async () => {
+    const fs = new MemoryFileStore();
+    const { id } = await storedProject(fs, 100);
+    const store = new ProjectFileStore(fs, '/');
+    const whole = (await store.loadDocument(id))!.update;
+    expect(whole[whole.byteLength - 1]).toBe(0);
+    await fs.write(store.docPath(id), whole.slice(0, whole.byteLength - 1));
+    const { rooms, lines } = manager(fs, 1024 * MB);
+    managers.push(rooms);
+    const err = await rooms.open(id).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    // (Yjs would add the structs of the 100 objects to a document, then fail on the rest)
+    expect((err as Error).message).toBe(
+      `could not load project ${id}: its stored document cannot be read (Unexpected end of array)`,
+    );
+    expect(rooms.get(id)).toBeUndefined();
+    expect(lines).toContain('project not loaded: its stored document cannot be read');
+  });
+
+  it('loads one whose stored document the measure cannot read but Yjs reads, without the check', async () => {
+    const fs = new MemoryFileStore();
+    const { id } = await storedProject(fs, 100);
+    // (2 MB free above the reserve: measured, it would not be loaded)
+    const { rooms, lines } = manager(fs, 258 * MB);
+    managers.push(rooms);
+    measureGap.on = true;
+    const room = await rooms.open(id);
+    expect(room?.scene.objectIds()).toHaveLength(100);
+    expect(lines).toContain(
+      'project loaded without the memory check: the measure could not read its stored document',
+    );
+  });
+
   it('loads one that fits, and counts it among the open projects', async () => {
     const fs = new MemoryFileStore();
     const { id, objectsPart } = await storedProject(fs, 100);
@@ -729,6 +1051,84 @@ describe('stored changes the project cannot take (Room saves and refreshes)', ()
     const stored = new SceneDoc(new Y.Doc());
     Y.applyUpdate(stored.ydoc, (await store.loadDocument(id))!.update);
     expect(stored.objectIds()).toHaveLength(10);
+  });
+
+  it('merges none of a stored state Yjs cannot read, and merges it once it is whole', async () => {
+    const fs = new MemoryFileStore();
+    const { id } = await storedProject(fs, 10);
+    const { rooms, lines } = manager(fs, 1024 * MB, 2048 * MB, undefined, () => null);
+    managers.push(rooms);
+    const room = (await rooms.open(id))!;
+    // another writer stores 20 more objects, without the last byte of the document
+    const store = new ProjectFileStore(fs, '/');
+    const other = new SceneDoc(new Y.Doc(), { type: 'other' });
+    Y.applyUpdate(other.ydoc, (await store.loadDocument(id))!.update);
+    const ctx = {
+      doc: other,
+      state: createEditorState(),
+      origin: { type: 'b' },
+      source: 'test',
+      report: () => undefined,
+    } as never;
+    createOperatorRegistry().run(ctx, 'object.array_place', {
+      objects: ['Cube'],
+      linked: true,
+      count: 21,
+      offset: [0, 0.1, 0],
+    });
+    const whole = Y.encodeStateAsUpdate(other.ydoc);
+    await fs.write(store.docPath(id), whole.slice(0, whole.byteLength - 1));
+    const updates: Uint8Array[] = [];
+    room.doc.on('update', (u: Uint8Array) => updates.push(u));
+    room.scene.updateObject(room.scene.objectIds()[0], { location: [2, 2, 2] });
+    const own = updates.length;
+    await room.flush();
+    // the save failed: nothing of the stored state was merged, and the room's change is kept
+    expect(updates).toHaveLength(own);
+    expect(room.scene.objectIds()).toHaveLength(10);
+    expect(room.hasUnsavedChanges).toBe(true);
+    expect(lines).toContain('saving project failed, will retry');
+    // the other writer stores it whole: merged, and the room's change saved
+    await fs.write(store.docPath(id), whole);
+    await room.flush();
+    expect(room.scene.objectIds()).toHaveLength(30);
+    expect(room.hasUnsavedChanges).toBe(false);
+  });
+
+  it('merges a stored state the measure cannot read but Yjs reads, without the check, and says so', async () => {
+    const fs = new MemoryFileStore();
+    const { id } = await storedProject(fs, 10);
+    let asked = 0;
+    const { rooms, lines } = manager(fs, 1024 * MB, 2048 * MB, undefined, () => {
+      asked++;
+      return 'it would not fit (test)';
+    });
+    managers.push(rooms);
+    const room = (await rooms.open(id))!;
+    const store = new ProjectFileStore(fs, '/');
+    const other = new SceneDoc(new Y.Doc(), { type: 'other' });
+    Y.applyUpdate(other.ydoc, (await store.loadDocument(id))!.update);
+    const ctx = {
+      doc: other,
+      state: createEditorState(),
+      origin: { type: 'b' },
+      source: 'test',
+      report: () => undefined,
+    } as never;
+    createOperatorRegistry().run(ctx, 'object.array_place', {
+      objects: ['Cube'],
+      linked: true,
+      count: 21,
+      offset: [0, 0.1, 0],
+    });
+    await store.syncDocument(id, other.ydoc);
+    measureGap.on = true;
+    await room.refresh();
+    expect(room.scene.objectIds()).toHaveLength(30);
+    expect(asked).toBe(0);
+    expect(lines).toContain(
+      'changes in storage merged without the memory check: the measure could not read them',
+    );
   });
 
   it('does not merge what another writer stored between its write and the read back of it', async () => {

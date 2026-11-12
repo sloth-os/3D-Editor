@@ -587,13 +587,28 @@ function settle(fs: FrameState): void {
  */
 export function shownWorld(fs: FrameState, id: string): Mat4 {
   const o = fs.byId.get(id);
-  const readsOthers =
-    !!o &&
-    (!!o.parent ||
-      !!o.constraints?.length ||
-      fs.doc.listDrivers().some((d) => !d.mute && animNode(d.target_type, d.target_id) === `chan:${id}`));
+  const readsOthers = !!o && (!!o.parent || !!o.constraints?.length || drivenChannels(fs).has(`chan:${id}`));
   if (readsOthers && readsCycle(relationsOf(fs), `object:${id}`)) settle(fs);
   return evaluatedWorld(fs, id);
+}
+
+/**
+ * The channels of objects (`chan:<id>`) an unmuted driver writes, listed once per frame state (the
+ * operators that read many objects where the scene shows them ask for each).
+ */
+const drivenOfState = new WeakMap<FrameState, ReadonlySet<string>>();
+function drivenChannels(fs: FrameState): ReadonlySet<string> {
+  let driven = drivenOfState.get(fs);
+  if (!driven) {
+    driven = new Set(
+      fs.doc
+        .listDrivers()
+        .filter((d) => !d.mute)
+        .map((d) => animNode(d.target_type, d.target_id)),
+    );
+    drivenOfState.set(fs, driven);
+  }
+  return driven;
 }
 
 /** An object's channels before and after an operator changed them (or left them as they were). */

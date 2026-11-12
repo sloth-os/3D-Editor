@@ -32,6 +32,7 @@ import {
 } from '@3d-editor/core';
 import {
   GC_MIN_INTERVAL_MS,
+  checkMainThreadRender,
   collectGarbage,
   decodeCheck,
   estimateRenderMemory,
@@ -40,7 +41,11 @@ import {
   maxProjectMeshBytes,
   meshJsonChars,
   operatorCheck,
+  refusedDecodeMessage,
+  refusedOperatorMessage,
+  refusedSimulationMessage,
   serverHeapReserve,
+  skippedModifierMessage,
   snapshotMeshChars,
   snapshotRefusal,
   storedMeshesMessage,
@@ -911,5 +916,95 @@ describe('get_scene problems', () => {
         message: "the Bevel modifier 'Bevel' has a width of 0, so it changes nothing",
       },
     ]);
+  });
+});
+
+describe('counts in the memory messages', () => {
+  const free = 10 * 1024 * 1024;
+  const limit = 1024 * 1024 * 1024;
+
+  it('are singular for one: 1 face, 1 new keyframe, 1 more frame, 1 triangle', () => {
+    const op = (faces: number, keyframes: number) =>
+      refusedOperatorMessage(
+        {
+          operator: 'mesh.subdivide',
+          estimate: { bytes: 900 * 1024 * 1024, faces, addedStoredBytes: 0, keyframes, lower: 'the cuts' },
+          storedBytes: 0,
+        },
+        free,
+        limit,
+      );
+    expect(op(1, 1)).toContain('for a mesh of about 1 face and 1 new keyframe, and ');
+    expect(op(2, 2)).toContain('for a mesh of about 2 faces and 2 new keyframes, and ');
+    expect(op(0, 1)).toContain('heap for 1 new keyframe, and ');
+    const modifier = (faces: number) =>
+      skippedModifierMessage(
+        {
+          type: 'SUBSURF',
+          label: 'Subdivision Surface',
+          estimate: {
+            result: { vertices: 4, faces, corners: 4 * faces },
+            bytes: 900 * 1024 * 1024,
+            lower: 'levels',
+          },
+        },
+        free,
+        limit,
+      );
+    expect(modifier(1)).toContain('for a result of about 1 face, and ');
+    expect(modifier(4)).toContain('for a result of about 4 faces, and ');
+    const decode = (faces: number) =>
+      refusedDecodeMessage(
+        {
+          layout: { vertices: 3, faces, corners: 3 * faces, uvs: false, colors: false },
+          bytes: 900 * 1024 * 1024,
+        },
+        free,
+        limit,
+      );
+    expect(decode(1)).toMatch(/^this mesh of 1 triangle was not loaded/);
+    expect(decode(2)).toMatch(/^this mesh of 2 triangles was not loaded/);
+    const simulation = (frames: number) =>
+      refusedSimulationMessage(
+        { bodies: { simulated: 1, kinematic: 0 }, frame: 2, frames, bytes: 900 * 1024 * 1024 },
+        free,
+        limit,
+      );
+    expect(simulation(1)).toContain(
+      'simulating 1 rigid body to frame 2 keeps 1 more frame of its pose, about',
+    );
+    expect(simulation(3)).toContain(
+      'simulating 1 rigid body to frame 2 keeps 3 more frames of its pose, about',
+    );
+    const bodies = (simulated: number, kinematic: number) =>
+      refusedSimulationMessage(
+        { bodies: { simulated, kinematic }, frame: 2, frames: 1, bytes: 900 * 1024 * 1024 },
+        free,
+        limit,
+      );
+    expect(bodies(1, 1)).toContain(
+      'simulating 2 rigid bodies to frame 2 keeps 1 more frame of their poses, about',
+    );
+    expect(bodies(0, 1)).toContain(
+      'simulating 1 rigid body to frame 2 keeps 1 more frame of its pose, about',
+    );
+    // a render of one triangle in the server's own process with no heap free
+    const doc = SceneDoc.create({ empty: true });
+    doc.addObject({
+      type: 'MESH',
+      name: 'Tri',
+      data: doc.addMesh('Tri', {
+        ...createGrid({ x_subdivisions: 1, y_subdivisions: 1 }),
+        faces: [[0, 1, 2]],
+      }),
+    });
+    expect(() =>
+      checkMainThreadRender(
+        doc,
+        () => 0,
+        () => undefined,
+      ),
+    ).toThrow(/\(about 1 triangle\)/);
+    doc.ydoc.destroy();
   });
 });

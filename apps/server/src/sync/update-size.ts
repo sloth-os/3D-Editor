@@ -1,4 +1,5 @@
 import * as decoding from 'lib0/decoding';
+import * as encoding from 'lib0/encoding';
 import * as Y from 'yjs';
 import {
   BLOCK_KINDS,
@@ -663,6 +664,32 @@ export function measureUpdate(update: Uint8Array, scene?: SceneDoc | null): Upda
 }
 
 /**
+ * Why Yjs's own reader cannot read all of `update` (update format v1: its structs, then its delete
+ * set), null when it reads it; nothing of it is applied. For an update that {@link measureUpdate}
+ * cannot read: Y.applyUpdate adds the structs it read to the document before it fails on the rest
+ * (a truncated delete set, say), so such an update must not reach it, while one Yjs reads whole is a
+ * gap of the measure. The structs are read one at a time and let go (Y.decodeUpdate keeps them all,
+ * about 530 bytes of heap per item): a first pass lists the update's clients, a second reads its
+ * structs and its delete set past a state vector beyond all of them, so that it writes nothing but
+ * the delete set.
+ */
+export function yjsReadError(update: Uint8Array): string | null {
+  try {
+    const { from } = Y.parseUpdateMeta(update);
+    const sv = encoding.createEncoder();
+    encoding.writeVarUint(sv, from.size);
+    for (const client of from.keys()) {
+      encoding.writeVarUint(sv, client);
+      encoding.writeVarUint(sv, Number.MAX_SAFE_INTEGER);
+    }
+    Y.diffUpdate(update, encoding.toUint8Array(sv));
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+/**
  * Attributes the items that refer to items read after them (another client's, later in the
  * update; Walk.pending): each takes the attribution of its origin or parent, which may be pending
  * itself: a chain of them is followed to its first known item once, and resolved from there back
@@ -738,16 +765,42 @@ function keyframesOf(scene: SceneDoc, key: string): number {
   return Array.isArray(k) ? k.length : 0;
 }
 
+/**
+ * What `read` reads of the project, 0 when reading it throws: an entry that is no datablock (a value
+ * a client set in the place of one) or mesh data too short for a mesh header holds nothing the
+ * measure counts, and a measure that throws would leave the update to Yjs without the check.
+ */
+function ofProject(read: () => number): number {
+  try {
+    return read();
+  } catch {
+    return 0;
+  }
+}
+
 /** Decoded bytes of the project's mesh `id` (0 when it has none). */
 function projectMeshBytes(scene: SceneDoc, id: string): number {
-  const c = scene.meshCounts(id);
-  return c ? decodedMeshBytes({ ...c, uvs: true, colors: false }) : 0;
+  return ofProject(() => {
+    const c = scene.meshCounts(id);
+    return c ? decodedMeshBytes({ ...c, uvs: true, colors: false }) : 0;
+  });
 }
 
 /** Bytes the shape keys of the project's mesh `id` keep (0 when it has none). */
 function projectShapeBytes(scene: SceneDoc, id: string): number {
-  const keys = (scene.map('meshes').get(id) as Y.Map<unknown> | undefined)?.get('shape_keys');
-  return shapeKeyBytes(keys);
+  return ofProject(() =>
+    shapeKeyBytes((scene.map('meshes').get(id) as Y.Map<unknown> | undefined)?.get('shape_keys')),
+  );
+}
+
+/** Bytes the vertex groups of the project's mesh `id` keep (core vertexGroupBytes; 0 when it has none). */
+function projectGroupBytes(scene: SceneDoc, id: string): number {
+  return ofProject(() => vertexGroupBytes(scene, id));
+}
+
+/** Bytes of the project's image `id` (0 when it has none). */
+function projectImageBytes(scene: SceneDoc, id: string): number {
+  return ofProject(() => scene.getImageBytes(id)?.byteLength ?? 0);
 }
 
 /** A JSON value (an F-curve's, a driver's): content of format JSON (2) or any (8). */
@@ -812,9 +865,9 @@ function total(walk: Walk, ds: DeleteSet): UpdateSize {
     if (b.kind === 'meshes') {
       if (b.data >= 0) mesh += b.data - (isNew || !scene ? 0 : projectMeshBytes(scene, b.key));
       if (b.shape >= 0) mesh += b.shape - (isNew || !scene ? 0 : projectShapeBytes(scene, b.key));
-      if (b.groups >= 0) mesh += b.groups - (isNew || !scene ? 0 : vertexGroupBytes(scene, b.key));
+      if (b.groups >= 0) mesh += b.groups - (isNew || !scene ? 0 : projectGroupBytes(scene, b.key));
     } else if (b.kind === 'images' && b.data >= 0) {
-      images += b.data - (isNew || !scene ? 0 : (scene.getImageBytes(b.key)?.byteLength ?? 0));
+      images += b.data - (isNew || !scene ? 0 : projectImageBytes(scene, b.key));
     }
   }
   let objectsPart =
@@ -889,12 +942,12 @@ function removedByUpdate(
           keyframes += keyframesOf(scene, key);
         } else if (kind === 'drivers') drivers++;
         else if (kind === 'objects') objects++;
-        else if (kind === 'images') imageBytes += scene.getImageBytes(key)?.byteLength ?? 0;
+        else if (kind === 'images') imageBytes += projectImageBytes(scene, key);
         else if (COUNTED.has(kind)) {
           datablocks[kind as CountedKind] = (datablocks[kind as CountedKind] ?? 0) + 1;
           if (kind === 'meshes')
             meshBytesRemoved +=
-              projectMeshBytes(scene, key) + projectShapeBytes(scene, key) + vertexGroupBytes(scene, key);
+              projectMeshBytes(scene, key) + projectShapeBytes(scene, key) + projectGroupBytes(scene, key);
         }
       }
     }

@@ -347,6 +347,24 @@ describe('an OBJ import', () => {
     expect(doc.listObjects()).toHaveLength(4);
     expect(Math.abs(added / counted - 1), `${added} added, ${counted} counted`).toBeLessThan(0.03);
   });
+
+  it('counts negative indices back from the `v` lines before each line (relative indices)', () => {
+    // a strip of 3,000 triangles written as a stream: each vertex, then the triangle of it and the two
+    // before it as `f -3 -2 -1`, the same words on every line naming other vertices each time
+    const lines = ['v 0 0 0', 'v 0 1 0'];
+    for (let i = 2; i < 3002; i++) lines.push(`v ${i >> 1} ${i & 1} 0`, 'f -3 -2 -1');
+    const bytes = new TextEncoder().encode(lines.join('\n') + '\n');
+    expect(objImportSize(bytesReader(bytes))).toEqual({
+      objects: 1,
+      vertices: 3002,
+      faces: 3000,
+      corners: 9000,
+    });
+    const { added, counted, doc } = addedAndCounted('import_scene.obj', file(bytes));
+    const [strip] = doc.listObjects();
+    expect(doc.meshCounts(strip.data!)).toMatchObject({ vertices: 3002, faces: 3000 });
+    expect(Math.abs(added / counted - 1), `${added} added, ${counted} counted`).toBeLessThan(0.03);
+  });
 });
 
 describe('the estimate of a glTF import with a large image', () => {

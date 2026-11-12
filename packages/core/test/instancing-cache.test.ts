@@ -345,6 +345,56 @@ describe('instancing caches across evaluators', () => {
     expect(ev.evaluate(1).instances).toHaveLength(500);
     expect(scatterCalls() - s0).toBe(1);
   });
+
+  it('leaves a modifier disabled by the type of its object out of the rest shape, as the evaluation does', () => {
+    // an Array whose start cap is a text is disabled (Blender's MOD_array.cc is_disabled), in the
+    // scene's evaluation and in the rest shape the particles are distributed on (a Subdivision Surface
+    // changes the topology, a shape key deforms the surface): they lie where they lie without it
+    const doc = SceneDoc.create({ empty: true });
+    const reg = createOperatorRegistry();
+    const ctx: OperatorContext = {
+      doc,
+      state: createEditorState(),
+      origin: doc.origin,
+      source: 'test',
+      report: () => {},
+    };
+    expect(reg.run(ctx, 'object.text_add', { body: 'Hi', location: [0, 0, 3] }).ok).toBe(true);
+    const label = ctx.state.activeId!;
+    const cube = meshObject(doc, 'Cube', createCube({ size: 0.1 }));
+    const grid = createGrid({ x_subdivisions: 10, y_subdivisions: 10, size: 10 });
+    const ground = meshObject(doc, 'Ground', grid);
+    // the shape key lifts the +X half (z += 5·x), stretching its faces
+    const target = grid.positions.slice();
+    for (let i = 0; i < target.length; i += 3) if (target[i] > 0) target[i + 2] += 5 * target[i];
+    doc.setShapeKeys(doc.getObject(ground)!.data!, [
+      {
+        name: 'Lift',
+        value: 0.5,
+        slider_min: 0,
+        slider_max: 1,
+        mute: false,
+        relative_key: '',
+        data: encodeFloat32(target),
+      },
+    ]);
+    const subsurf = { ...modifier('SUBSURF', { levels: 1, render_levels: 1 }), id: 'sub' };
+    // as an older document has it: the operators refuse a text as the start cap (INVALID_PARAMS)
+    const capped = { ...modifier('ARRAY', { count: 2, start_cap: label }), id: 'arr' };
+    const shown = (modifiers: ModifierData[]) => {
+      doc.updateObject(ground, {
+        modifiers,
+        particle_systems: [system({ instance_object: cube, count: 500, distribution: 'RANDOM' })],
+      });
+      const scene = new SceneEvaluator(doc).evaluate(1);
+      return { mesh: scene.byId.get(ground)!.mesh!, instances: scene.instances.map((i) => i.matrix) };
+    };
+    const without = shown([subsurf]);
+    const disabled = shown([subsurf, capped]);
+    expect(disabled.mesh.positions).toEqual(without.mesh.positions);
+    expect(disabled.instances).toHaveLength(500);
+    expect(disabled.instances).toEqual(without.instances);
+  });
 });
 
 describe('instancing operators and caches', () => {

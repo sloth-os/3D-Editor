@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { menuPath, newProject, outlinerNames, runFromPalette, statNumber } from './helpers';
+import { menuPath, newProject, outlinerNames, runFromPalette, setNumberField, statNumber } from './helpers';
 
 test.describe('editor', () => {
   test('creates a project with the default scene and adds objects from menus', async ({ page }) => {
@@ -28,7 +28,7 @@ test.describe('editor', () => {
     await page.keyboard.press('g');
     await page.keyboard.press('x');
     await page.keyboard.type('2');
-    await expect(page.getByTestId('hud')).toContainText('along X');
+    await expect(page.getByTestId('hud')).toContainText('along global X');
     await page.keyboard.press('Enter');
     await page.getByTestId('prop-tab-object').click();
     await expect(page.getByTestId('loc-0')).toContainText('2 m');
@@ -37,6 +37,57 @@ test.describe('editor', () => {
     await expect(page.getByTestId('loc-0')).toContainText('0 m');
     await page.keyboard.press('Control+Shift+z');
     await expect(page.getByTestId('loc-0')).toContainText('2 m');
+  });
+
+  test('G X X moves along the object’s own X axis (LOCAL); a third X removes the constraint', async ({
+    page,
+  }) => {
+    await newProject(page);
+    await page.getByTestId('outliner-Cube').click();
+    await page.getByTestId('prop-tab-object').click();
+    await setNumberField(page, 'rot-2', 90);
+    const vp = page.getByTestId('viewport');
+    await vp.hover();
+    await page.keyboard.press('g');
+    await page.keyboard.press('x');
+    await expect(page.getByTestId('hud')).toContainText('along global X');
+    await page.keyboard.press('x');
+    await expect(page.getByTestId('hud')).toContainText('along local X');
+    await page.keyboard.type('2');
+    await expect(page.getByTestId('hud')).toContainText('D: 2.0000 m  0.0000 m  0.0000 m');
+    await page.keyboard.press('Enter');
+    // the cube is turned 90° about Z: its own X axis is the world's Y axis
+    await expect(page.getByTestId('loc-1')).toContainText('2 m');
+    await expect(page.getByTestId('loc-0')).toContainText('0 m');
+    await vp.hover();
+    await page.keyboard.press('g');
+    for (let i = 0; i < 3; i++) await page.keyboard.press('x');
+    await expect(page.getByTestId('hud')).not.toContainText('along');
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('hud')).toHaveCount(0);
+    await expect(page.getByTestId('loc-1')).toContainText('2 m');
+  });
+
+  test('Esc closes the Projects window (Ctrl+O), also after a click inside it', async ({ page }) => {
+    await newProject(page);
+    const projects = page.getByTestId('projects-dialog');
+    await page.keyboard.press('Control+o');
+    await expect(projects).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(projects).toHaveCount(0);
+    await page.keyboard.press('Control+o');
+    // on the title, away from the close button
+    await projects.locator('.modal-header').click({ position: { x: 12, y: 10 } });
+    await page.keyboard.press('Escape');
+    await expect(projects).toHaveCount(0);
+    // in the name field Esc first cancels the typing, the next one closes the window
+    await page.keyboard.press('Control+o');
+    const name = projects.getByPlaceholder('Project name');
+    await name.fill('Typed');
+    await page.keyboard.press('Escape');
+    await expect(name).toHaveValue('Untitled');
+    await page.keyboard.press('Escape');
+    await expect(projects).toHaveCount(0);
   });
 
   test('edits properties by typing values and renames objects', async ({ page }) => {
@@ -94,8 +145,9 @@ test.describe('editor', () => {
     await expect(page.getByTestId('render-image')).toBeVisible({ timeout: 60_000 });
     const src = await page.getByTestId('render-image').getAttribute('src');
     expect(src?.startsWith('data:image/png;base64,')).toBe(true);
+    // Esc closes the window once the render is done, as a click outside it does
     await page.keyboard.press('Escape');
-    await page.locator('.modal .close').click();
+    await expect(page.getByTestId('render-dialog')).toHaveCount(0);
     await menuPath(page, ['File', 'Export', 'glTF 2.0 (.glb)']);
     const download = page.waitForEvent('download');
     await page.getByTestId('export-confirm').click();

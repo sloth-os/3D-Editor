@@ -4,6 +4,7 @@ import {
   SAVE_BYTES_PER_LAYER_BYTE,
   SHAPE_KEY_STORED_BYTES_PER_VERTEX,
   shapeKeyBytes,
+  shapeKeyCount,
   vertexGroupBytes,
 } from './memory-objects';
 
@@ -30,8 +31,15 @@ import {
  * | ARMATURE_NAME on 90,601 vertices, 100 bones                   | 34.9          | 219.7       | 6.29           |
  * | ARMATURE_ENVELOPE on 90,601 vertices, 100 bones               | 34.9          | 189.3       | 5.42           |
  * | shape_key_set, _add, _remove (160,801 vertices, 32 keys)      | 58.9–62.6     | 296.7–313.0 | 5.00–5.04      |
+ * | join of 3 × 10,201 vertices, 320 groups, 80 keys (2)          | 65.4          | 405.7–416.4 | 6.21–6.37      |
+ * | transform_apply on 10,201 vertices, 160 groups, 40 keys (3)   | 15.6          | 96.5        | 6.20           |
+ * | transform_apply on 40,401 vertices, 40 groups, 40 keys (3)    | 43.2          | 251.5–251.6 | 5.83           |
  *
  * (1) object.vertex_group_rename, _normalize_all, _assign, _normalize, _remove_from, _add and _remove.
+ * (2) Eleven runs; the joined mesh (19.6 MiB at the peak of the same join without groups and keys)
+ * included.
+ * (3) Two runs each; Apply Scale of an object whose mesh a second object uses: the copy of the mesh
+ * gets its groups and keys, then its keys are written again, scaled ({@link movedLayerWrites}).
  *
  * ARMATURE_AUTO also solves the bone heat of every vertex: 79.8–611.2 MiB at the peak on meshes of
  * 10,201 to 491,401 vertices with 4 to 100 bones, up to 1,373 bytes per vertex beyond what the table's
@@ -47,8 +55,10 @@ export const SHAPE_KEY_BYTES_PER_VERTEX = 12;
 /**
  * Peak per byte of the vertex groups (or shape keys) a mesh holds while an operator writes them, its
  * vertex groups before or after the change, whichever is more (see the table above): 5.0–5.2 measured on
- * 59–97 MiB, 5.4–6.3 on 35 MiB (the young generation's garbage counting more), rounded up so that every
- * run stays at least 10% below its estimate with {@link OPERATOR_FIXED_BYTES} (memory.ts) beside it.
+ * 59–97 MiB, 5.4–6.3 on 35 MiB (the young generation's garbage counting more), 6.2–6.4 for a join of
+ * 65 MiB with the joined mesh, 5.8–6.2 for Apply Scale's copies and moved keys of 16–43 MiB with the
+ * mesh, rounded up so that every run stays at least 10% below its estimate with
+ * {@link OPERATOR_FIXED_BYTES} (memory.ts) beside it.
  */
 export const LAYER_WRITE_BYTES_PER_BYTE = 7;
 
@@ -75,7 +85,7 @@ export const ENVELOPE_WEIGHTS_BYTES_PER_VERTEX = 160;
 export const HEAT_WEIGHTS_BYTES_PER_VERTEX = 2_000;
 
 /** Which layer of a mesh an operator writes, for messages. */
-export type LayerKind = 'vertex groups' | 'shape keys';
+export type LayerKind = 'vertex groups' | 'shape keys' | 'vertex groups and shape keys';
 
 /** What an operator that writes vertex groups or shape keys takes and adds. */
 export interface LayerWrites {
@@ -105,6 +115,18 @@ function groupNames(doc: SceneDoc, id: string): Set<string> {
     for (const g of groups) {
       const name = (g as { name?: unknown } | null)?.name;
       if (typeof name === 'string') out.add(name);
+    }
+  return out;
+}
+
+/** The names of stored mesh `id`'s shape keys, read in place (no copy of their positions). */
+function keyNames(doc: SceneDoc, id: string): string[] {
+  const keys = (doc.map('meshes').get(id) as { get(key: string): unknown } | undefined)?.get('shape_keys');
+  const out: string[] = [];
+  if (Array.isArray(keys))
+    for (const k of keys) {
+      const name = (k as { name?: unknown } | null)?.name;
+      if (typeof name === 'string') out.push(name);
     }
   return out;
 }
@@ -267,5 +289,96 @@ export function boneRenameWrites(
     meshes,
     decodes: false,
     lower: 'the vertex groups of the meshes the armature deforms',
+  };
+}
+
+/**
+ * object.transform_apply and object.origin_set (object.ts) on the meshes `meshes` (for each, the
+ * selected objects that use it and the copies the operator makes of it: memory.ts singleUserCopies):
+ * a copy gets the vertex groups and shape keys of its mesh, and the shape keys of the mesh of every
+ * selected object are written again, moved with its vertices (as Blender's BKE_mesh_transform and
+ * BKE_mesh_translate move every key block). The copies keep what they get. Null when they write none.
+ */
+export function movedLayerWrites(
+  doc: SceneDoc,
+  meshes: ReadonlyMap<string, { objects: number; copies: number }>,
+): LayerWrites | null {
+  let written = 0;
+  let copied = 0;
+  let stored = 0;
+  let verts = 0;
+  let groups = false;
+  let keys = false;
+  const ids: string[] = [];
+  for (const [id, { objects, copies }] of meshes) {
+    const g = vertexGroupBytes(doc, id);
+    const k = shapeKeyBytes(doc, id);
+    if (!k && !(copies && g)) continue;
+    const n = vertices(doc, id);
+    written += copies * (g + k) + objects * k;
+    copied += copies * (g + k);
+    stored += copies * (g + SHAPE_KEY_STORED_BYTES_PER_VERTEX * shapeKeyCount(doc, id) * n);
+    verts += (copies + (k ? objects : 0)) * n;
+    groups ||= copies > 0 && g > 0;
+    keys ||= k > 0;
+    ids.push(id);
+  }
+  if (!ids.length) return null;
+  const kind: LayerKind =
+    groups && keys ? 'vertex groups and shape keys' : keys ? 'shape keys' : 'vertex groups';
+  return {
+    bytes: LAYER_WRITE_BYTES_PER_BYTE * written + LAYER_OP_BYTES_PER_VERTEX * verts,
+    written,
+    kind,
+    stored,
+    save: SAVE_BYTES_PER_LAYER_BYTE * copied,
+    meshes: ids,
+    decodes: false,
+    lower: `the number or size of the selected meshes or the number of their ${kind}`,
+  };
+}
+
+/**
+ * object.join of the meshes `meshIds` (the active object's, `activeMesh`, and one per joined object: a
+ * mesh linked duplicates share counts for each), whose vertex groups and shape keys object.ts merges
+ * by name into the joined mesh as Blender's Join does: every group and key of any of them (the keys of
+ * a joined mesh without vertices left out) is written with a value per vertex of the joined mesh. The
+ * meshes `freed` (those the join replaces or removes) take their groups and keys with them. Null when
+ * no mesh has any.
+ */
+export function joinLayerWrites(
+  doc: SceneDoc,
+  meshIds: readonly string[],
+  freed: readonly string[],
+  activeMesh: string | null = null,
+): LayerWrites | null {
+  const groups = new Set<string>();
+  const keys = new Set<string>();
+  let verts = 0;
+  for (const id of meshIds) {
+    const n = vertices(doc, id);
+    verts += n;
+    for (const g of groupNames(doc, id)) groups.add(g);
+    if (n > 0 || id === activeMesh) for (const k of keyNames(doc, id)) keys.add(k);
+  }
+  if (!groups.size && !keys.size) return null;
+  const groupBytes = VERTEX_GROUP_BYTES_PER_VERTEX * groups.size * verts;
+  const written = groupBytes + SHAPE_KEY_BYTES_PER_VERTEX * keys.size * verts;
+  let freedBytes = 0;
+  let freedKept = 0;
+  for (const id of new Set(freed)) {
+    const g = vertexGroupBytes(doc, id);
+    freedBytes += g + shapeKeyBytes(doc, id);
+    freedKept += g + SHAPE_KEY_STORED_BYTES_PER_VERTEX * shapeKeyCount(doc, id) * vertices(doc, id);
+  }
+  return {
+    bytes: LAYER_WRITE_BYTES_PER_BYTE * written + LAYER_OP_BYTES_PER_VERTEX * verts,
+    written,
+    kind: !keys.size ? 'vertex groups' : !groups.size ? 'shape keys' : 'vertex groups and shape keys',
+    stored: Math.max(0, groupBytes + SHAPE_KEY_STORED_BYTES_PER_VERTEX * keys.size * verts - freedKept),
+    save: SAVE_BYTES_PER_LAYER_BYTE * Math.max(0, written - freedBytes),
+    meshes: [...new Set(meshIds)],
+    decodes: false,
+    lower: 'the number or size of the joined meshes or the number of their vertex groups and shape keys',
   };
 }

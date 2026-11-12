@@ -206,6 +206,96 @@ describe('bone constraint targets in the scene', () => {
     expect(thigh.matrix.every((x) => Number.isFinite(x))).toBe(true);
   });
 
+  it('names the cycle of an IK target on a bone of its own chain and solves toward where the target is before the solve', () => {
+    // as Blender: it reports the cycle and evaluates one of its relations with the values the target
+    // holds then (deg_builder_cycle.cc, deg_eval.cc), here the target on the unsolved Thigh, whatever
+    // the evaluation order (the target's name sorts before or after the rig's)
+    for (const name of ['A_Target', 'Z_Target']) {
+      const { ok, doc, rig } = leg();
+      const e = ok('object.empty_add', { name, location: [0.5, -0.5, 2.0] }).object;
+      ok('object.parent_to', { objects: [name], parent: 'Rig', type: 'BONE', bone: 'Thigh' });
+      ok('pose.ik_add', { object: 'Rig', bone: 'Shin', target: name, chain_count: 2 });
+      const ev = new SceneEvaluator(doc).evaluate(1);
+      expect(ev.byId.get(rig)!.pose!.errors).toContain(
+        `bone "Shin" constraint "IK": IK target '${name}' is part of a dependency cycle: ` +
+          `Rig [IK of bone 'Shin'] → ${name} [parent bone 'Thigh'] → Rig`,
+      );
+      // the chain reaches where the target was on the unsolved Thigh; the target then follows the
+      // solved Thigh away from it
+      const tail = boneWorld(ev, rig, 'Shin').tail;
+      expect(distance(tail, [0.5, -0.5, 2.0])).toBeLessThan(1e-4);
+      expect(distance(origin(ev.byId.get(e)!.worldMatrix), [0.5, -0.5, 2.0])).toBeGreaterThan(0.05);
+      // FrameState asked for the pose first solves the same chain
+      const fs = new FrameState(doc, 1);
+      const pose = fs.pose(rig)!;
+      expect(distance(transformPoint3(fs.world(rig)!, pose.bones.get('Shin')!.tail), tail)).toBeLessThan(
+        1e-9,
+      );
+    }
+  });
+
+  it('solves toward the target placed on the bones as evaluated before the chain: a constrained root, a posed thigh', () => {
+    // the target is read with its parent bone posed, under the Root as its Copy Rotation leaves it,
+    // which is where the scene shows it without the IK (whatever the evaluation order)
+    for (const name of ['A_Target', 'Z_Target']) {
+      const { ok, doc, rig } = leg();
+      ok('object.empty_add', { name: 'Turn', rotation: [0, 0.8, 0] });
+      ok('pose.constraint_add', { object: 'Rig', bone: 'Root', type: 'COPY_ROTATION', target: 'Turn' });
+      ok('pose.bone_transform_set', { object: 'Rig', bone: 'Thigh', rotation_euler: [0.4, 0, 0.2] });
+      const e = ok('object.empty_add', { name, location: [0.4, 1.8, 0.5] }).object;
+      ok('object.parent_to', { objects: [name], parent: 'Rig', type: 'BONE', bone: 'Thigh' });
+      const before = origin(new SceneEvaluator(doc).evaluate(1).byId.get(e)!.worldMatrix);
+      expect(distance(before, [0.4, 1.8, 0.5])).toBeLessThan(1e-9);
+      ok('pose.ik_add', { object: 'Rig', bone: 'Shin', target: name, chain_count: 2 });
+      const ev = new SceneEvaluator(doc).evaluate(1);
+      expect(ev.byId.get(rig)!.pose!.errors).toContain(
+        `bone "Shin" constraint "IK": IK target '${name}' is part of a dependency cycle: ` +
+          `Rig [IK of bone 'Shin'] → ${name} [parent bone 'Thigh'] → Rig`,
+      );
+      expect(distance(boneWorld(ev, rig, 'Shin').tail, before), name).toBeLessThan(1e-4);
+    }
+  });
+
+  it('names the cycle of an IK pole on a bone of its own chain and bends toward where the pole is before the solve', () => {
+    const scene = (cyclic: boolean) => {
+      const { ok, doc, rig } = leg();
+      ok('pose.bone_transform_set', { object: 'Rig', bone: 'Thigh', rotation_euler: [0.3, 0, 0.1] });
+      ok('object.empty_add', { name: 'T', location: [0.5, -0.3, 2.2] });
+      ok('object.empty_add', { name: 'P', location: [1.2, 0.8, 1.6] });
+      if (cyclic) ok('object.parent_to', { objects: ['P'], parent: 'Rig', type: 'BONE', bone: 'Thigh' });
+      ok('pose.ik_add', { object: 'Rig', bone: 'Shin', target: 'T', chain_count: 2, pole_target: 'P' });
+      return { doc, rig, ev: new SceneEvaluator(doc).evaluate(1) };
+    };
+    const free = scene(false);
+    const cyclic = scene(true);
+    expect(free.ev.byId.get(free.rig)!.pose!.errors).toEqual([]);
+    expect(cyclic.ev.byId.get(cyclic.rig)!.pose!.errors).toContain(
+      `bone "Shin" constraint "IK": pole target 'P' is part of a dependency cycle: ` +
+        `Rig [IK of bone 'Shin'] → P [parent bone 'Thigh'] → Rig`,
+    );
+    // the pole on the unsolved Thigh is where the free pole is: the chain bends the same way
+    for (const bone of ['Thigh', 'Shin'])
+      expect(
+        maxDiff(boneWorld(cyclic.ev, cyclic.rig, bone).tail, boneWorld(free.ev, free.rig, bone).tail),
+        bone,
+      ).toBeLessThan(1e-6);
+  });
+
+  it('names the cycle of a Copy Location target parented to the bone it moves and copies where the target is before', () => {
+    const { ok, doc, rig } = leg();
+    ok('pose.bone_transform_set', { object: 'Rig', bone: 'Root', rotation_euler: [0.2, 0, 0] });
+    const p = ok('object.empty_add', { name: 'P', location: [0.4, 0.3, 1.5] }).object;
+    ok('object.parent_to', { objects: ['P'], parent: 'Rig', type: 'BONE', bone: 'Root' });
+    const before = origin(new SceneEvaluator(doc).evaluate(1).byId.get(p)!.worldMatrix);
+    ok('pose.constraint_add', { object: 'Rig', bone: 'Root', type: 'COPY_LOCATION', target: 'P' });
+    const ev = new SceneEvaluator(doc).evaluate(1);
+    expect(ev.byId.get(rig)!.pose!.errors).toContain(
+      `bone "Root" constraint "Copy Location": target 'P' is part of a dependency cycle: ` +
+        `Rig [Copy Location of bone 'Root'] → P [parent bone 'Root'] → Rig`,
+    );
+    expect(distance(boneWorld(ev, rig, 'Root').head, before)).toBeLessThan(1e-9);
+  });
+
   it('evaluates WORLD space bone constraints in world space for rotated rigs', () => {
     const { ok, doc } = setup();
     const rig = ok('object.armature_add', { name: 'Rig', rotation: [0, 0, Math.PI / 2] }).object;

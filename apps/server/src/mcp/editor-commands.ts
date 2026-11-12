@@ -362,7 +362,12 @@ export function editorTimeoutMessage(
     'triangles, while it builds the wires of every mesh; with millions of triangles it is also busy while ' +
     `it carries out a command (with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}) ` +
     `and while it applies a change made elsewhere (${CHANGE_APPLY_SECONDS} for an agent's move of an ` +
-    'object among 4 million triangles), but not while it draws its other frames. ' +
+    'object among 4 million triangles); it is also busy while its statistics overlay counts every mesh again, ' +
+    'which it does when the frame rate it shows changes as the viewport keeps drawing (0.19–0.25 s with 4 ' +
+    "million triangles, 1.1–1.8 s after a person's own edit in it), and while it copies the frame its viewport " +
+    "drew into the project's thumbnail (at most 0.1 s with 4 million triangles), once per change, 3 s after it " +
+    'or, until the viewport has drawn it, at the first of its tries every 0.5 s after that, but not while it ' +
+    'draws its other frames. ' +
     (atMax
       ? `With timeout_ms at its maximum (${MAX_EDITOR_TIMEOUT_MS}), retry, or, ${toSolid}`
       : `Pass a larger timeout_ms (at most ${MAX_EDITOR_TIMEOUT_MS}), or, ${toSolid}`) +

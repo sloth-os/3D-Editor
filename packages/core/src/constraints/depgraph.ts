@@ -240,6 +240,34 @@ export class ConstraintDependencyGraph {
     return out;
   }
 
+  /**
+   * The relations by which object `fromId` reads object `toId` (the fewest), worded as cycle
+   * messages word them ("A_T [parent bone 'B2'] → Rig"); null when it does not read it (searching
+   * at most PATH_SEARCH_LIMIT objects). A pose evaluation names with it the dependency cycle of a
+   * bone constraint whose target reads the armature: relations inside poses are not in this graph.
+   */
+  relationPath(fromId: string, toId: string): string | null {
+    const from = this.index.get(fromId);
+    const to = this.index.get(toId);
+    if (from === undefined || to === undefined || from === to) return null;
+    const prev = new Map<number, { node: number; label: string }>([[from, { node: -1, label: '' }]]);
+    const queue = [from];
+    for (let i = 0; i < queue.length && !prev.has(to) && prev.size < PATH_SEARCH_LIMIT; i++)
+      for (const e of this.edges[queue[i]]) {
+        if (prev.has(e.to)) continue;
+        prev.set(e.to, { node: queue[i], label: e.label });
+        queue.push(e.to);
+      }
+    if (!prev.has(to)) return null;
+    const parts: string[] = [this.nameOf(to)];
+    for (let v = to; v !== from;) {
+      const p = prev.get(v)!;
+      parts.unshift(`${this.nameOf(p.node)} [${p.label}]`);
+      v = p.node;
+    }
+    return parts.join(' → ');
+  }
+
   private nameOf(node: number): string {
     return this.src.byId.get(this.ids[node])?.name ?? this.ids[node];
   }

@@ -3,6 +3,8 @@ import * as THREE from 'three';
 import {
   FrameState,
   SceneDoc,
+  axisAngle4,
+  multiply4,
   createEditorState,
   createConstraint,
   createFCurve,
@@ -84,11 +86,13 @@ function setup() {
     const r = reg.run(ctx, id, params);
     if (!r.ok) throw new Error(`${id} failed: ${r.error}`);
   };
-  const start = (kind: ModalKind) =>
-    new ModalTransform(engine as unknown as ViewportEngine, session as unknown as ProjectSession, kind, {
-      x: 420,
-      y: 280,
-    });
+  const start = (kind: ModalKind, mouse = { x: 420, y: 280 }) =>
+    new ModalTransform(
+      engine as unknown as ViewportEngine,
+      session as unknown as ProjectSession,
+      kind,
+      mouse,
+    );
   /** Types the keys (an axis, digits) into a running modal transform. */
   const type = (m: ModalTransform, keys: string) => {
     for (const k of keys) {
@@ -98,7 +102,7 @@ function setup() {
   };
   /**
    * Confirms the modal transform: the matrices its preview drew, then the world matrices the scene
-   * evaluates after the operator it returns ran, for the same objects.
+   * evaluates after the operator it returns (`res`) ran, for the same objects.
    */
   const confirm = (m: ModalTransform) => {
     const preview = new Map(engine.overrides ?? []);
@@ -106,9 +110,11 @@ function setup() {
     run(res.operator, res.params);
     const fs = new FrameState(doc, state.frame);
     const after = new Map([...preview.keys()].map((id) => [id, fs.world(id)!]));
-    return { preview, after };
+    return { preview, after, res };
   };
-  return { doc, state, engine, run, start, type, confirm };
+  /** The header the running modal transform shows. */
+  const hud = () => session.view.hud.value;
+  return { doc, state, engine, run, start, type, confirm, hud };
 }
 
 const maxDiff = (a: readonly number[], b: readonly number[]) =>
@@ -833,5 +839,289 @@ describe('the modal preview draws the matrices the scene evaluates after confirm
     // confirming stores what the preview showed (the mesh keeps 32-bit floats)
     const stored = world(shown(), doc.getMesh(doc.getObject(m)!.data!)!.positions);
     expect(maxDiff(stored, preview)).toBeLessThan(1e-6);
+  });
+});
+
+describe('an axis key pressed again constrains in the active object’s axes (LOCAL), a third time not at all', () => {
+  /*
+   * Blender 4.2's transform_event_modal_constraint (transform.cc) moves on to the next of the
+   * transform's orientation slots on each press of the constraint in use (the scene's orientation,
+   * GLOBAL by default; then LOCAL; then none), and the operators it confirms store orient_type LOCAL
+   * with the value in those axes. The header names the orientation ("along local X"). Here Move and
+   * Rotate do so; Scale has the world's axes only, as transform.resize takes no orient_type.
+   */
+  /** An empty turned 20° about X, 40° about Y and 30° about Z: its own X axis, in the world. */
+  const turned = (t: ReturnType<typeof setup>) => {
+    const id = t.doc.addObject({
+      type: 'EMPTY',
+      name: 'A',
+      location: [1, 2, 3],
+      rotation_euler: [20 * deg, 40 * deg, 30 * deg],
+    });
+    t.state.selectedIds = [id];
+    t.state.activeId = id;
+    const localX: Vec3 = [
+      Math.cos(40 * deg) * Math.cos(30 * deg),
+      Math.cos(40 * deg) * Math.sin(30 * deg),
+      -Math.sin(40 * deg),
+    ];
+    return { id, localX };
+  };
+  const rotation = (w: readonly number[]) => [0, 1, 2, 4, 5, 6, 8, 9, 10].map((i) => w[i]);
+
+  it('G X X 2 moves 2 along the object’s own X axis: the header, the preview and transform.translate agree', () => {
+    const t = setup();
+    const { id, localX } = turned(t);
+    const m = t.start('translate');
+    t.type(m, 'X');
+    expect(t.hud()).toContain('along global X');
+    t.type(m, 'X');
+    expect(t.hud()).toContain('along local X');
+    t.type(m, '2');
+    expect(t.hud()).toBe('D: 2.0000 m  0.0000 m  0.0000 m (2.0000 m)  along local X  [2]');
+    const { preview, after, res } = t.confirm(m);
+    expect(res).toEqual({
+      operator: 'transform.translate',
+      params: { value: [2, 0, 0], orient_type: 'LOCAL' },
+    });
+    // not one bit differs between what the preview drew and what the operator stored
+    expect(preview.get(id)).toEqual(after.get(id));
+    const location = t.doc.getObject(id)!.location;
+    expect(maxDiff(location, [1 + 2 * localX[0], 2 + 2 * localX[1], 3 + 2 * localX[2]])).toBeLessThan(1e-12);
+  });
+
+  it('a third press of the key removes the constraint; another axis constrains in the global orientation again', () => {
+    const t = setup();
+    turned(t);
+    const m = t.start('translate');
+    t.type(m, 'XXX');
+    expect(m.axis).toBeNull();
+    expect(t.hud()).not.toMatch(/along|locking/);
+    t.type(m, 'X');
+    expect(t.hud()).toContain('along global X');
+    t.type(m, 'Y');
+    expect(t.hud()).toContain('along global Y');
+    t.type(m, 'Y');
+    expect(t.hud()).toContain('along local Y');
+    t.type(m, 'Z');
+    expect(t.hud()).toContain('along global Z');
+    m.setAxis('Z', true);
+    expect(t.hud()).toContain('locking global Z');
+    m.setAxis('Z', true);
+    expect(t.hud()).toContain('locking local Z');
+    m.setAxis('Z', true);
+    expect(m.axis).toBeNull();
+    t.type(m, '2');
+    // without a constraint a typed value moves along the world's X axis
+    expect(m.finish(true)).toEqual({ operator: 'transform.translate', params: { value: [2, 0, 0] } });
+  });
+
+  it('R X X 30 turns 30° about the object’s own X axis (transform.rotate, orient_type LOCAL)', () => {
+    const t = setup();
+    const { id } = turned(t);
+    const before = t.doc.worldMatrix(id);
+    const m = t.start('rotate');
+    t.type(m, 'XX30');
+    expect(t.hud()).toBe('Rot: 30.00°  along local X  [30]');
+    const { preview, after, res } = t.confirm(m);
+    expect(res.params).toEqual({
+      value: 30 * deg,
+      orient_axis: 'X',
+      orient_type: 'LOCAL',
+      center: [1, 2, 3],
+    });
+    expect(preview.get(id)).toEqual(after.get(id));
+    // turning about the object's own X axis: its rotation followed by 30° about X
+    const expected = multiply4(before, axisAngle4([1, 0, 0], 30 * deg));
+    expect(maxDiff(rotation(after.get(id)!), rotation(expected))).toBeLessThan(1e-12);
+  });
+
+  it('S has the world’s axes only (transform.resize takes no orient_type): its second press removes the constraint', () => {
+    const t = setup();
+    const { id } = turned(t);
+    const m = t.start('resize');
+    t.type(m, 'X');
+    expect(t.hud()).toContain('along global X');
+    t.type(m, 'X');
+    expect(m.axis).toBeNull();
+    expect(t.hud()).not.toMatch(/along|locking/);
+    t.type(m, 'X2');
+    expect(t.hud()).toBe('Scale X: 2.0000  Y: 1.0000  Z: 1.0000  along global X  [2]');
+    const { preview, after, res } = t.confirm(m);
+    expect(res.params).toEqual({ value: [2, 1, 1], center: [1, 2, 3] });
+    expect(maxDiff(preview.get(id)!, after.get(id)!)).toBeLessThan(1e-12);
+    // also with the LOCAL transform orientation
+    t.state.transformOrientation = 'LOCAL';
+    const s = t.start('resize');
+    t.type(s, 'Y');
+    expect(t.hud()).toContain('along global Y');
+    s.finish(false);
+  });
+
+  it('G Shift+X Shift+X keeps a drag in the plane of the object’s own Y and Z axes (locking local X)', () => {
+    const t = setup();
+    const { id, localX } = turned(t);
+    const m = t.start('translate');
+    m.setAxis('X', true);
+    m.setAxis('X', true);
+    m.update({ x: 520, y: 240 }, { ctrl: false, shift: false });
+    expect(t.hud()).toContain('locking local X');
+    const start = t.doc.getObject(id)!.location;
+    const { preview, after, res } = t.confirm(m);
+    const value = res.params.value as number[];
+    expect(res.params.orient_type).toBe('LOCAL');
+    expect(value[0]).toBe(0);
+    expect(Math.hypot(value[1], value[2])).toBeGreaterThan(0.1);
+    expect(preview.get(id)).toEqual(after.get(id));
+    const moved = t.doc.getObject(id)!.location.map((v, i) => v - start[i]);
+    expect(Math.abs(moved[0] * localX[0] + moved[1] * localX[1] + moved[2] * localX[2])).toBeLessThan(1e-12);
+  });
+
+  it('locking local X of a sheared object drags in the plane through its own Y and Z axes', () => {
+    // a child turned 45° under a parent scaled 3 along Y has axes that are not perpendicular: the
+    // plane holds its Y and Z axes (Blender's constraint_plane_calc: their cross product is the
+    // normal), which is not the plane perpendicular to its X axis
+    const t = setup();
+    const parent = t.doc.addObject({
+      type: 'EMPTY',
+      name: 'P',
+      scale: [1, 3, 1],
+      rotation_euler: [0, 0, 30 * deg],
+    });
+    const id = t.doc.addObject({
+      type: 'EMPTY',
+      name: 'C',
+      location: [1, 0, 0],
+      rotation_euler: [0, 0, 45 * deg],
+      parent,
+    });
+    t.state.selectedIds = [id];
+    t.state.activeId = id;
+    const w = t.doc.worldMatrix(id);
+    const axis = (k: number) => new THREE.Vector3(w[k * 4], w[k * 4 + 1], w[k * 4 + 2]).normalize();
+    expect(Math.abs(axis(0).dot(axis(1)))).toBeGreaterThan(0.1);
+    const pivot = new THREE.Vector3(w[12], w[13], w[14]);
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(
+      new THREE.Vector3().crossVectors(axis(1), axis(2)).normalize(),
+      pivot,
+    );
+    const at = (x: number, y: number) => t.engine.rayAt(x, y).ray.intersectPlane(plane, new THREE.Vector3())!;
+    const expected = at(520, 240).sub(at(420, 280));
+    const m = t.start('translate');
+    m.setAxis('X', true);
+    m.setAxis('X', true);
+    m.update({ x: 520, y: 240 }, { ctrl: false, shift: false });
+    const { preview, after } = t.confirm(m);
+    expect(preview.get(id)).toEqual(after.get(id));
+    const moved = [12, 13, 14].map((i) => after.get(id)![i] - w[i]);
+    expect(maxDiff(moved, expected.toArray())).toBeLessThan(1e-9);
+  });
+
+  it('Ctrl snaps a move along the local axis to whole grid steps along that axis', () => {
+    const t = setup();
+    const { id, localX } = turned(t);
+    const m = t.start('translate');
+    t.type(m, 'XX');
+    m.update({ x: 560, y: 230 }, { ctrl: true, shift: false });
+    const { res } = t.confirm(m);
+    const value = res.params.value as number[];
+    // the view is 10 m away: the grid's step is 1 m
+    expect(value[0]).not.toBe(0);
+    expect(value).toEqual([Math.round(value[0]), 0, 0]);
+    const moved = t.doc.getObject(id)!.location.map((v, i) => v - [1, 2, 3][i]);
+    expect(
+      maxDiff(
+        moved,
+        localX.map((v) => v * value[0]),
+      ),
+    ).toBeLessThan(1e-12);
+  });
+
+  it('an axis drag that starts or ends over the pivot moves by the whole drag (a point at 0 along the axis counts)', () => {
+    // regression: the drag along the axis was skipped when the pointer's point on the axis, at the
+    // start or now, was the pivot itself (parameter 0). A front orthographic view: rays along +Y,
+    // 100 px per metre, the origin under the pointer at (420, 280).
+    const t = setup();
+    t.engine.rayAt = (x: number, y: number) =>
+      new THREE.Raycaster(
+        new THREE.Vector3((x - 420) / 100, -10, (280 - y) / 100),
+        new THREE.Vector3(0, 1, 0),
+      );
+    const id = t.doc.addObject({ type: 'EMPTY', name: 'A' });
+    t.state.selectedIds = [id];
+    t.state.activeId = id;
+    // starts over the pivot (the origin)
+    const m = t.start('translate');
+    t.type(m, 'X');
+    m.update({ x: 570, y: 300 }, { ctrl: false, shift: false });
+    expect(t.hud()).toBe('D: 1.5000 m  0.0000 m  0.0000 m (1.5000 m)  along global X');
+    const { preview, after, res } = t.confirm(m);
+    expect(res).toEqual({ operator: 'transform.translate', params: { value: [1.5, 0, 0] } });
+    expect(preview.get(id)).toEqual(after.get(id));
+    expect(t.doc.getObject(id)!.location).toEqual([1.5, 0, 0]);
+    // ends over the pivot (now at X 1.5, under x 570)
+    const back = t.start('translate', { x: 720, y: 280 });
+    t.type(back, 'X');
+    back.update({ x: 570, y: 250 }, { ctrl: false, shift: false });
+    expect(t.hud()).toBe('D: -1.5000 m  0.0000 m  0.0000 m (1.5000 m)  along global X');
+    t.confirm(back);
+    expect(t.doc.getObject(id)!.location).toEqual([0, 0, 0]);
+  });
+
+  it('a typed value with a plane constraint moves along the first axis the plane keeps (Blender’s constraintNumInput)', () => {
+    // regression: G Shift+X 2 moved 2 along X, the axis the plane leaves out
+    const t = setup();
+    const { id } = turned(t);
+    const m = t.start('translate');
+    m.setAxis('X', true);
+    t.type(m, '2');
+    expect(t.hud()).toBe('D: 0.0000 m  2.0000 m  0.0000 m (2.0000 m)  locking global X  [2]');
+    const { res } = t.confirm(m);
+    expect(res.params).toEqual({ value: [0, 2, 0] });
+    expect(maxDiff(t.doc.getObject(id)!.location, [1, 4, 3])).toBeLessThan(1e-12);
+  });
+
+  it('with the LOCAL transform orientation the first press is local, the second global', () => {
+    const t = setup();
+    const { id } = turned(t);
+    t.state.transformOrientation = 'LOCAL';
+    const m = t.start('translate');
+    t.type(m, 'X');
+    expect(t.hud()).toContain('along local X');
+    t.type(m, 'X');
+    expect(t.hud()).toContain('along global X');
+    t.type(m, '2');
+    const { res } = t.confirm(m);
+    expect(res.params).toEqual({ value: [2, 0, 0] });
+    expect(maxDiff(t.doc.getObject(id)!.location, [3, 2, 3])).toBeLessThan(1e-12);
+  });
+
+  it('in Edit Mode G X X 1 moves the selected vertices along the edited object’s own X axis', () => {
+    const t = setup();
+    t.run('mesh.primitive_cube_add', { location: [1, 2, 3], rotation: [0, 0, 90 * deg] });
+    const id = t.state.activeId!;
+    t.run('object.mode_set', { mode: 'EDIT' });
+    const doc = t.doc;
+    const positions = () => Array.from(doc.getMesh(doc.getObject(id)!.data!)!.positions);
+    const before = positions();
+    const m = t.start('translate');
+    t.type(m, 'XX1');
+    expect(t.hud()).toContain('along local X');
+    const preview = Array.from((t.engine.meshOverrides.get(id) as MeshData).positions);
+    const res = m.finish(true)!;
+    expect(res).toEqual({
+      operator: 'transform.translate',
+      params: { value: [1, 0, 0], orient_type: 'LOCAL' },
+    });
+    t.run(res.operator, res.params);
+    const after = positions();
+    expect(maxDiff(after, preview)).toBeLessThan(1e-6);
+    // the object is turned 90° about Z: its X axis is the world's Y, its local coordinates move by X 1
+    expect(
+      maxDiff(
+        after.map((v, i) => v - before[i]),
+        before.map((_, i) => (i % 3 === 0 ? 1 : 0)),
+      ),
+    ).toBeLessThan(1e-6);
   });
 });

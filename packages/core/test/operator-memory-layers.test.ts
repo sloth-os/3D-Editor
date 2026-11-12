@@ -220,6 +220,41 @@ describe('the vertex group and shape key operators', () => {
     expect(projectObjects(s.doc).layers).toBe(groups + g + 2 * k);
   });
 
+  it('take 64 bytes per vertex of the mesh beside 7 times the groups they write (the formula in numbers)', () => {
+    // a grid of 21 × 21 vertices: a second group of 4 bytes per vertex is written 7 times over, and what
+    // is left beside the 32 MiB of every operator is the lists of vertex indices and weights the
+    // operator builds, 64 bytes per vertex
+    const s = rigged(20, 3);
+    expect(s.vertices).toBe(441);
+    const rename = () =>
+      s.estimate('object.vertex_group_rename', { object: 'Grid', group: 'A', name: 'B' })!.bytes;
+    s.run('object.vertex_group_add', { object: 'Grid', name: 'A' });
+    const one = rename();
+    s.run('object.vertex_group_add', { object: 'Grid', name: 'C' });
+    expect(rename() - one).toBe(7 * 4 * 441);
+    expect(one - 32 * 1024 * 1024 - 7 * 4 * 441).toBe(64 * 441);
+  });
+
+  it('rename a bone: the groups of a mesh the armature deforms through its modifier alone follow it', () => {
+    // no parent: an Armature modifier names the armature (armature/edit.ts renameBone renames them)
+    const s = rigged(20, 3);
+    s.run('object.modifier_add', { object: 'Grid', type: 'ARMATURE', params: { object: 'Rig' } });
+    s.run('object.vertex_group_add', { object: 'Grid', name: 'Bone.001' });
+    s.run('object.vertex_group_add', { object: 'Grid', name: 'Other' });
+    expect(s.doc.getObject(s.grid.id)!.parent).toBeFalsy();
+    const groups = vertexGroupBytes(s.doc, s.grid.data!);
+    expect(groups).toBe(2 * VERTEX_GROUP_BYTES_PER_VERTEX * s.vertices);
+    expect(
+      s.estimate('armature.bone_update', { object: 'Rig', bone: 'Bone.001', name: 'Arm' }),
+    ).toMatchObject({
+      bytes:
+        OPERATOR_FIXED_BYTES + LAYER_WRITE_BYTES_PER_BYTE * groups + LAYER_OP_BYTES_PER_VERTEX * s.vertices,
+      layers: { kind: 'vertex groups', bytes: groups },
+    });
+    s.run('armature.bone_update', { object: 'Rig', bone: 'Bone.001', name: 'Arm' });
+    expect(s.doc.getVertexGroups(s.grid.data!).map((g) => g.name)).toEqual(['Arm', 'Other']);
+  });
+
   it('rename a bone: the groups of the meshes the armature deforms follow it', () => {
     const s = rigged(20, 3);
     expect(s.estimate('armature.bone_update', { object: 'Rig', bone: 'Bone.001', name: 'Arm' })).toBeNull();
@@ -293,11 +328,11 @@ describe('duplicating meshes with vertex groups and shape keys', () => {
 });
 
 /**
- * Runs object.parent_set with `type` in a child process (operator-memory-rss-child.ts) on a grid of
- * n × n quads parented to an armature of `bones` + 1 bones: its estimate and its peak resident memory
- * (bytes; -1 where the process cannot reset its peak, outside Linux).
+ * Runs a scenario of operator-memory-rss-child.ts (its arguments `args`) in a child process: the
+ * operator's estimate and its peak resident memory (bytes; -1 where the process cannot reset its peak,
+ * outside Linux).
  */
-function peak(n: number, bones: number, type: string) {
+function childPeak(...args: (string | number)[]) {
   const run = spawnSync(
     process.execPath,
     [
@@ -306,10 +341,7 @@ function peak(n: number, bones: number, type: string) {
       '--import',
       'tsx',
       path.join(here, 'operator-memory-rss-child.ts'),
-      'parent',
-      String(n),
-      String(bones),
-      type,
+      ...args.map(String),
     ],
     {
       encoding: 'utf8',
@@ -322,6 +354,9 @@ function peak(n: number, bones: number, type: string) {
   expect(line, run.stderr).toBeDefined();
   return JSON.parse(line!) as { estimate: number; written: number; peak: number };
 }
+
+/** object.parent_set with `type` of a grid of n × n quads to an armature of `bones` + 1 bones ({@link childPeak}). */
+const peak = (n: number, bones: number, type: string) => childPeak('parent', n, bones, type);
 
 describe('the estimates of vertex group writes hold', () => {
   it('above the peak resident memory of ARMATURE_NAME on 40,401 vertices with 121 bones (child process)', () => {
@@ -336,6 +371,28 @@ describe('the estimates of vertex group writes hold', () => {
   it('above the peak resident memory of ARMATURE_AUTO on 40,401 vertices with 5 bones (child process)', () => {
     // the bone heat of every vertex takes most of it
     const r = peak(200, 4, 'ARMATURE_AUTO');
+    if (r.peak < 0) return;
+    expect(r.estimate).toBeGreaterThanOrEqual(1.1 * r.peak);
+    expect(r.estimate).toBeLessThan(4 * r.peak);
+  }, 30_000);
+
+  it('above the peak resident memory of joining three meshes of 10,201 vertices with 160 vertex groups and 40 shape keys each (child process)', () => {
+    // half of the names in all three, half their own: 320 groups and 80 keys on the 30,603 vertices of
+    // the joined mesh, 65.4 MiB; the estimate came to 1.283–1.317 times the peak in eleven runs
+    const r = childPeak('join', 100, 160, 40);
+    expect(r.written).toBe((4 * 320 + 12 * 80) * 3 * 101 * 101);
+    if (r.peak < 0) return;
+    expect(r.estimate).toBeGreaterThanOrEqual(1.1 * r.peak);
+    expect(r.estimate).toBeLessThan(4 * r.peak);
+  }, 30_000);
+
+  it('above the peak resident memory of applying the scale of a linked duplicate of 10,201 vertices with 160 vertex groups and 40 shape keys (child process)', () => {
+    // the copy of the mesh gets its groups and keys, whose keys are then written again, scaled:
+    // 15.6 MiB, which peaked at 96.5 MiB (6.2 times) where the estimate is 156.5 MiB in two runs
+    const r = childPeak('apply', 100, 160, 40);
+    const groups = 4 * 160 * 101 * 101;
+    const keys = 12 * 40 * 101 * 101;
+    expect(r.written).toBe(groups + 2 * keys);
     if (r.peak < 0) return;
     expect(r.estimate).toBeGreaterThanOrEqual(1.1 * r.peak);
     expect(r.estimate).toBeLessThan(4 * r.peak);

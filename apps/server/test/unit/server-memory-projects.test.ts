@@ -289,7 +289,7 @@ describe('rigid body simulations in the server', () => {
     );
     const ev = new SceneEvaluator(doc).evaluate(200);
     expect(ev.errors.find((e) => e.source === 'rigidbody')?.message).toMatch(
-      /^not simulated on the server: simulating 1 rigid body to frame 200 keeps 199 more frames of their poses, about 1 MB, and the server's process has 256 MB of its 1,024 MB heap free/,
+      /^not simulated on the server: simulating 1 rigid body to frame 200 keeps 199 more frames of its pose, about 1 MB, and the server's process has 256 MB of its 1,024 MB heap free/,
     );
   });
 

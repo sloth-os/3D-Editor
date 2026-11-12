@@ -306,9 +306,9 @@ describe(`sync clients of a server process with a ${HEAP_MB} MB heap`, () => {
     expect(JSON.parse(rest.join('\n'))).toEqual({ code: 'OUT_OF_MEMORY' });
     const rest507 = await fetch(`${server.url}/api/projects/${stored.huge}`);
     expect(rest507.status).toBe(507);
-    expect(await rest507.json()).toMatchObject({
+    expect(await rest507.json()).toEqual({
+      error: expect.stringMatching(/^project 'Huge' \(.*\) was not loaded on the server: /),
       code: 'OUT_OF_MEMORY',
-      message: expect.stringMatching(/^project 'Huge' /),
     });
     const browser = client(stored.huge, 'Browser');
     await expect(browser.connect(15_000)).rejects.toThrow(`closed (${OUT_OF_MEMORY_CLOSE_CODE})`);

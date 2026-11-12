@@ -19,7 +19,7 @@ import { defineOperator, type OperatorRegistry } from './registry';
 import { activeObject, setSelection, vec3 } from './helpers';
 import { keyProperty, rekeyAnimated } from './anim';
 import { FrameState } from '../eval/frame-state';
-import { evaluatedWorld, moveOrigin } from './transform';
+import { moveOrigin, shownWorld } from './transform';
 
 /*
  * Curve and text operators (curve.*, object.text_add, font.*). Coordinates of spline points are
@@ -934,7 +934,7 @@ export function curveOriginSet(
   const src = ctx.doc.getCurve(o.data);
   if (!src) return;
   // where the scene shows the object (a bone or an animated or constrained parent included)
-  const world = evaluatedWorld(before, o.id);
+  const world = shownWorld(before, o.id);
   const target =
     type === 'ORIGIN_CURSOR'
       ? transformPoint3(invert4(world), ctx.state.cursorLocation)

@@ -84,6 +84,12 @@ export interface EvaluatedBone {
 export interface PoseEvaluation {
   /** Evaluates one bone and what it depends on (null for unknown bones). */
   bone(name: string): EvaluatedBone | null;
+  /**
+   * A bone as evaluated so far, evaluating nothing (null for unknown bones): its final matrix once
+   * evaluated, else its pose without its own constraints under its parent as evaluated so far, which
+   * a dependency cycle reads while the bone is being evaluated.
+   */
+  peek(name: string): { matrix: Mat4; length: number } | null;
   /** True while a bone of this pose is being evaluated (re-entrant calls see partial results). */
   readonly busy: boolean;
   /** Evaluates every bone (once) and returns the pose. */
@@ -372,6 +378,23 @@ class PoseEvaluator implements PoseEvaluation {
     return { matrix, length: node.length, cyclic: this.cycles !== cycles };
   }
 
+  peek(name: string): { matrix: Mat4; length: number } | null {
+    const node = this.nodes.get(name);
+    return node ? { matrix: this.peekMatrix(node), length: node.length } : null;
+  }
+
+  /**
+   * A bone as evaluated so far (see peek): its final matrix once evaluated, else its pose under its
+   * parent as evaluated so far, its own constraints left out (a constrained parent that is evaluated
+   * counts with its constraints).
+   */
+  private peekMatrix(node: Node): Mat4 {
+    if (this.state[node.index] === DONE) return this.final[node.index]!;
+    if (this.restPosition) return node.rest;
+    const frame = node.parent ? multiply4(this.peekMatrix(node.parent), node.offset) : node.rest;
+    return multiply4(frame, node.basis);
+  }
+
   /** Rest frame of a bone under its posed parent (LOCAL space basis). */
   private frameOf(node: Node): Mat4 {
     return node.parent ? multiply4(this.get(node.parent), node.offset) : node.rest;
@@ -381,9 +404,17 @@ class PoseEvaluator implements PoseEvaluation {
    * Resolves a constraint target in armature space: a bone of this armature (`target` is this
    * armature object, `ctx.armatureId`, and `subtarget` names the bone), a bone of another
    * armature object (`subtarget`, read with `ctx.getBoneMatrix`) or an object. Throws an error
-   * saying why when it is not available.
+   * saying why when it is not available. An object whose evaluation reads this pose (a dependency
+   * cycle: an IK target parented to a bone of its own chain) is used with the matrix it has so far
+   * (`ctx.getCycleTarget`), as Blender evaluates a cycle, and `cycle` reports the cycle (`closing`:
+   * the relation by which the pose reads the target, "IK of bone 'Shin'").
    */
-  resolveTarget(target: string | null | undefined, subtarget: string): BoneConstraintTarget {
+  resolveTarget(
+    target: string | null | undefined,
+    subtarget: string,
+    closing = '',
+    cycle: (message: string) => void = () => undefined,
+  ): BoneConstraintTarget {
     if (!target) throw new Error('no target set');
     if (this.ctx.armatureId !== undefined && target === this.ctx.armatureId) {
       if (!subtarget) return { matrix: identity4(), frame: null, length: 0 };
@@ -391,8 +422,15 @@ class PoseEvaluator implements PoseEvaluation {
       if (!node) throw new Error(`target bone "${subtarget}" not found`);
       return { matrix: this.get(node), frame: this.frameOf(node), length: node.length };
     }
-    const w = this.ctx.getWorldMatrix(target);
-    if (!w) throw new Error('target not found');
+    let w = this.ctx.getWorldMatrix(target);
+    if (!w) {
+      // Blender marks one relation of a cycle cyclic and evaluates with what the target has then
+      const inCycle = this.ctx.getCycleTarget?.(target, closing);
+      if (!inCycle) throw new Error('target not found');
+      if (!inCycle.matrix || subtarget) throw new Error(inCycle.message);
+      cycle(inCycle.message);
+      w = inCycle.matrix;
+    }
     if (!isFiniteMatrix(w)) throw new Error('target has an invalid transform');
     if (subtarget) {
       if (!this.ctx.getBoneMatrix)
@@ -409,10 +447,14 @@ class PoseEvaluator implements PoseEvaluation {
     for (const c of node.constraints) {
       if (c.type === 'IK') continue;
       try {
+        const label = `bone "${node.name}" constraint "${c.name}"`;
         const res = applyBoneConstraint(c, m, {
           frame,
           armatureMatrix: this.ctx.armatureMatrix,
-          target: (cc) => this.resolveTarget(cc.target, cc.subtarget ?? ''),
+          target: (cc) =>
+            this.resolveTarget(cc.target, cc.subtarget ?? '', `${c.name} of bone '${node.name}'`, (e) =>
+              this.error(`${label}: ${e}`),
+            ),
         });
         const influence = Math.min(1, finiteOr(c.influence, 0));
         const next = influence >= 1 ? res : blendMatrices(m, res, influence);
@@ -450,9 +492,12 @@ class PoseEvaluator implements PoseEvaluation {
     const chains: IkChain[] = [];
     for (const s of job.chains) {
       const label = `bone "${s.owner.name}" constraint "${s.constraint.name}"`;
+      const closing = `${s.constraint.name} of bone '${s.owner.name}'`;
       let t: BoneConstraintTarget;
       try {
-        t = this.resolveTarget(s.constraint.target, s.constraint.subtarget ?? '');
+        t = this.resolveTarget(s.constraint.target, s.constraint.subtarget ?? '', closing, (e) =>
+          this.error(`${label}: IK ${e}`),
+        );
       } catch (e) {
         this.error(`${label}: IK ${(e as Error).message}`);
         continue;
@@ -461,7 +506,11 @@ class PoseEvaluator implements PoseEvaluation {
       // a pole bone without a pole object is ignored (as in Blender)
       if (s.params.pole_target) {
         try {
-          pole = originOf(this.resolveTarget(s.params.pole_target, s.params.pole_subtarget).matrix);
+          pole = originOf(
+            this.resolveTarget(s.params.pole_target, s.params.pole_subtarget, closing, (e) =>
+              this.error(`${label}: pole ${e}`),
+            ).matrix,
+          );
         } catch (e) {
           this.error(`${label}: pole ${(e as Error).message}`);
         }

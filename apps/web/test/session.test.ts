@@ -600,6 +600,33 @@ describe('ProjectSession of a project whose changes the server did not take', ()
     await s.close(false);
   });
 
+  /*
+   * A server that cannot load the project says so before a room takes the connection (no hello),
+   * also to the connection of a Save: the browser said so each time.
+   */
+  it('says once that the server did not open a stored project, not again when it refuses a Save the same way', async () => {
+    withSyncServer();
+    toasts.value = [];
+    const why = "project 'Huge' (proj-huge-twice) was not loaded on the server: it would not fit (test)";
+    const refuseLoad = (socket: FakeSocket) => {
+      socket.open();
+      socket.receive(encodeJsonFrame(MSG_CONTROL, { kind: 'error', code: 'OUT_OF_MEMORY', message: why }));
+      socket.closedBy(4507);
+    };
+    const opening = ProjectSession.open('proj-huge-twice');
+    await vi.waitFor(() => expect(FakeSocket.created).toHaveLength(1));
+    refuseLoad(FakeSocket.created[0]);
+    const s = await opening;
+    await s.flush();
+    expect(FakeSocket.created).toHaveLength(2);
+    refuseLoad(FakeSocket.created[1]);
+    expect(s.provider?.status.value).toBe('refused');
+    expect(toasts.value.map((t) => t.message)).toEqual([
+      `The server did not open this project: ${why}. ${LOAD_REFUSED_NOTE}`,
+    ]);
+    await s.close(false);
+  });
+
   it('opens a project it has nothing of without waiting for a server that refused it', async () => {
     withSyncServer();
     ProjectSession.remoteWaitMs = 10_000;
@@ -674,6 +701,10 @@ describe('ProjectSession with WebDAV through the server, of changes the server d
     refuse(FakeSocket.created[1]);
     expect(await saving).toEqual({ message: notTaken, level: 'error' });
     expect(stored(dav).findObjectByName('Not taken')).toBeNull();
+    // one connection per Save: none again after this one was refused (the server measured the whole
+    // project again and refused it the same way, and the browser said so a second time)
+    expect(FakeSocket.created).toHaveLength(2);
+    expect(toasts.value).toHaveLength(2);
     // the person deletes what the server could not take: Save, the server takes it, then WebDAV
     s.doc.removeObject(s.doc.findObjectByName('Not taken')!.id);
     s.doc.addObject({ type: 'EMPTY', name: 'Small' });

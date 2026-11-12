@@ -136,7 +136,35 @@ server's replica (and the saved project) grow with its whole edit history. Each 
 most `MCP_UNDO_STEPS` steps (default 100) and `MCP_UNDO_MEMORY_MB` of replaced or deleted data
 (default 64 MB) per project, the newest step always included. Dropped steps, data created and
 deleted again within one step, and everything a history held when it ends (its session or agent id
-expired, the project was deleted or unloaded) are garbage-collected.
+expired, the project was deleted or unloaded) are garbage-collected; when the last history of a
+document ends, so is every item still kept in it.
+
+The values one client writes to one key one after another (an agent moving an object, renaming
+vertex groups, adding shape keys; mesh data is binary and never merges) are items that Yjs merges
+into one once they are deleted, and the merged item stays kept while any part of it is. The history
+therefore clears `keep` and collects in the same transaction, before Yjs merges at its end. Before
+it did, a dropped value merged with a kept one stayed: 200 writes of 5,000 numbers to one key, a
+step each, with 10 steps kept, left an encoded document of 3,998,618 bytes (about 20,050 without
+a history); it now holds 220,140 bytes, the value and the ten it replaced. An agent that renamed a
+vertex group of a grid of 251,001 vertices back and forth (64 groups, which every rename writes
+again: 97 MB per step) added 97 MB to the saved project with every rename, and the server passed
+3.8 GB of resident memory at the eighth; now the project stays at 209 MB over 20 renames and the
+server at 1,437 MB at most (default heap, disk persistence). What the histories keep counts in the
+server's memory checks, and in a save of the project, which carries it (see
+[Server render processes](#server-render-processes)).
+
+Undo and redo restore deleted items as copies and link each original to its copy; undoing a step
+follows these links to delete the latest copies of what it created, and redoing one to restore into
+the latest copy of a deleted parent. A deleted object (a nested map) is collected with everything
+below it, which leaves bare placeholders without links there, so the history keeps a deleted object
+whose fields have such links, their values collected, while a step of any agent that can follow a
+link into it is kept. No later step can, so it is collected once those steps are dropped, applied or
+cleared. An agent that deleted 1,000 linked cubes and undid it, six times, kept 6,021 deleted
+objects until the step that created the cubes was dropped, then none: the encoded document went
+from 4,691 to 1,298 KB and the heap from 88 to 64 MB (the history before kept them until the last
+history of the document ended). The memory checks count them at 280 bytes for each item they keep,
+the object and each of its fields (225–274 bytes measured after full garbage collections, over
+rounds of deleting 400 and 1,000 cubes and undoing it: 6.8–8.2 KB per cube).
 
 ## Scene evaluation
 
@@ -604,6 +632,20 @@ the event loop:
   `the project's meshes, objects, keyframes, images and rigid body cache`, gives its share in
   `(now … MB with … objects, … MB of it its rigid body cache)` and ends with
   `, or free its rigid body cache (rigidbody.cache_free)`.
+  What the agents' undo histories keep in a project (see [Undo](#undo): replaced or deleted data,
+  at most `MCP_UNDO_MEMORY_MB` per agent and project and always its newest step, freed when the
+  agent's session or agent id ends, and deleted objects kept for undo's links, 280 bytes per item)
+  counts with what it keeps, and a save of it six times its bytes and 1,000 bytes for each
+  replaced value it keeps (the second saves of projects whose histories kept 53 MB of vertex
+  groups, 53 MB of shape keys and 63 MB of meshes peaked at 3.1, 3.1 and 5.7 times those bytes of
+  resident memory; 100,000 and 200,000 replaced locations at 1,103 and 1,254 bytes of heap each;
+  the objects that two and five deletions of 1,000 cubes and undoing them left at 877 and 1,082
+  bytes of heap per item). From 1 MB the message gives its share,
+  `(now … MB with … objects, … MB of it kept by agents' undo histories)`, after the rigid body
+  cache's; its save clause adds
+  `, 6 times what agents' undo histories keep and 1,000 bytes for each replaced value they keep`
+  whenever they keep something, and an operator's refusal ends with when it is freed:
+  `. What agents' undo histories keep (the objects an agent deletes too) is freed when the agent's session ends (for an agent id, 6 hours after its last session) or its step is dropped: the oldest steps are, beyond MCP_UNDO_STEPS steps or MCP_UNDO_MEMORY_MB of what they keep, at that agent's next step`.
   The open projects share one heap: what all of them keep and the largest save among them are held
   against the heap less the reserve and the cached evaluations (1,310 MB with the default heap,
   `maxOpenProjectsBytes`), and an operator that would take them past it fails with
@@ -619,7 +661,8 @@ rigid body caches`, names a project's cache as `'…' (…) … MB (… MB of it
   of 1,310 MB), naming the others; in two runs of four rounds of a change in each project, their
   saves stalled `/healthz` for up to 8.2 and 8.4 s (polled every second through each run: 23 and 17
   of about 220 polls took over 1 s, none failed), `get_project` answered in 0.13 s at most, and the server stayed at
-  1,911 MB RSS at most. Saves of
+  1,911 MB RSS at most in the samples of those runs (its high-water mark was 1,962 MB in a later run
+  of three rounds and 1,970 MB in one of four). Saves of
   different projects still run at the same time while the check counts one: with a heap of
   2,144 MB (`--max-old-space-size=2096`) a sixth project took 5,001 cubes, and a change in each of
   the six stalled `/healthz` for 4–9.5 s (twice past its 10 s timeout).
@@ -723,7 +766,8 @@ rigid body caches`, names a project's cache as `'…' (…) … MB (… MB of it
   Before a simulation steps, the frames it still has to simulate are checked the same way. Frames
   that would take its project past what the server keeps for one are not stepped:
   `not simulated on the server: simulating … rigid bodies to frame … keeps … more frames of their poses, about … MB, and the project's meshes, objects, keyframes, images and rigid body cache would then take about … MB of memory (now … MB with … objects), and a save of it about … MB more for a moment (3 times what its objects, datablocks and keyframes take, 5 times its images): … MB in all, more than the … MB the server's process keeps for one project (half of its … MB heap less the … MB it keeps for its other work). Lower the rigid body world's frame range (rigidbody.world_set frame_end) or the number of rigid bodies to simulate it on the server (a browser editor simulates it itself), or delete objects and meshes the project no longer needs`
-  (`(now … MB with … objects, … MB of it its rigid body cache)` when it holds frames already); nor
+  (`(now … MB with … objects, … MB of it its rigid body cache)` when it holds frames already, and
+  the share of the agents' undo histories as above); nor
   frames that would take the open projects past what it keeps for all of them:
   `not simulated on the server: simulating … rigid bodies to frame … keeps … more frames of their poses, about … MB, and the open projects' meshes, objects, keyframes, images and rigid body caches would then take about … MB of memory, and the largest save among them about … MB more for a moment: … MB in all, more than the … MB the server's process keeps for all open projects (…). Other open projects take … MB of it: '…' (…) … MB (… MB of it its rigid body cache), …. Lower the rigid body world's frame range (rigidbody.world_set frame_end) or the number of rigid bodies to simulate it on the server (a browser editor simulates it itself), or delete objects and meshes the projects no longer need (a project nobody has open, no editor and no MCP session, is unloaded after ROOM_IDLE_TTL_SECONDS, default 3600 s), or free their rigid body caches (rigidbody.cache_free)`
   (the last advice only when another project holds a cache: the frames a project's own cache

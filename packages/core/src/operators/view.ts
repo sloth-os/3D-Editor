@@ -16,8 +16,8 @@ import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
 import {
-  evaluatedWorld,
   keyChannelChanges,
+  shownWorld,
   transformFrameState,
   transformRoots,
   type ChannelChange,
@@ -28,7 +28,8 @@ import { selectedObjects, vec3 } from './helpers';
  * The center of the selection as Blender's Cursor to Selected finds it (snap_curs_to_sel_ex), at
  * the frame of `fs`: in Object Mode the origins of all selected objects (a selected child of a
  * selected parent too) where the scene shows them, constraints applied (rigid bodies where the
- * simulation has them, with a frame state from transformFrameState); in Edit Mode the selected
+ * simulation has them, with a frame state from transformFrameState; an object that reads a
+ * dependency cycle as the viewport evaluates it, see shownWorld); in Edit Mode the selected
  * vertices. The center of their bounding box with the Bounding Box Center pivot point, else their
  * median. Null when nothing is selected.
  */
@@ -39,14 +40,14 @@ function selectionCenter(ctx: OperatorContext, fs: FrameState): Vec3 | null {
     const o = doc.getObject(state.activeId);
     const mesh = o?.data ? doc.getMesh(o.data) : null;
     if (!o || !mesh) return null;
-    const w = evaluatedWorld(fs, o.id);
+    const w = shownWorld(fs, o.id);
     const P = mesh.positions;
     pts = [...selectedVertexSet(mesh, state.meshSelection)]
       .filter((v) => v < vertexCount(mesh))
       .map((v) => transformPoint3(w, [P[v * 3], P[v * 3 + 1], P[v * 3 + 2]]));
   } else
     pts = selectedObjects(ctx).map((o) => {
-      const w = evaluatedWorld(fs, o.id);
+      const w = shownWorld(fs, o.id);
       return [w[12], w[13], w[14]] as Vec3;
     });
   if (!pts.length) return null;
@@ -144,7 +145,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
       execute(ctx) {
         const id = ctx.state.activeId;
         if (!id || !ctx.doc.getObject(id)) return;
-        const w = evaluatedWorld(transformFrameState(ctx.doc, ctx.state.frame), id);
+        const w = shownWorld(transformFrameState(ctx.doc, ctx.state.frame), id);
         ctx.state.cursorLocation = [w[12], w[13], w[14]];
       },
     }),
@@ -203,7 +204,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
           const center =
             ctx.state.pivotPoint === 'ACTIVE_ELEMENT' && active && ids.includes(active)
               ? (() => {
-                  const w = evaluatedWorld(fs, active);
+                  const w = shownWorld(fs, active);
                   return [w[12], w[13], w[14]] as Vec3;
                 })()
               : selectionCenter(ctx, fs);
@@ -212,7 +213,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
           for (const id of roots) offsets.set(id, d);
         } else
           for (const id of roots) {
-            const w = evaluatedWorld(fs, id);
+            const w = shownWorld(fs, id);
             offsets.set(id, [c[0] - w[12], c[1] - w[13], c[2] - w[14]]);
           }
         snapObjects(ctx, fs, offsets);
@@ -237,7 +238,7 @@ export function registerViewOperators(reg: OperatorRegistry): void {
         const g = p.grid_size;
         const offsets = new Map<string, Vec3>();
         for (const o of selectedObjects(ctx)) {
-          const w = evaluatedWorld(fs, o.id);
+          const w = shownWorld(fs, o.id);
           offsets.set(o.id, [0, 1, 2].map((k) => Math.round(w[12 + k] / g) * g - w[12 + k]) as Vec3);
         }
         snapObjects(ctx, fs, offsets);

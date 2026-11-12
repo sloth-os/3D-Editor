@@ -380,7 +380,13 @@ projects together have a limit too). Changes that browsers send are held against
   with other work. The measure takes memory by the structs of the update, not by the clock units
   they declare (a few bytes can declare a billion). Changes and deletions of what the project has
   are applied as before, also in a project already past its limit, so such a project can still be
-  edited and made smaller.
+  edited and made smaller. An update the measure cannot read goes on only when Yjs's own reader
+  reads all of it (without applying it): it is applied without the check and logged as
+  `sync changes applied without the memory check: the measure could not read them` at `warn`. One
+  that Yjs cannot read either (a truncated update, say: Yjs would add the structs it read before it
+  fails on the rest) is applied nowhere, and the connection gets a control error with code
+  `BAD_MESSAGE`. Stored documents that the server loads or merges are read the same way: one that
+  Yjs cannot read is not loaded, and a save or refresh that reads one fails and is tried again.
 - Changes the project cannot take are not applied: the server sends that connection an error with
   code `OUT_OF_MEMORY` (for example "changes not applied on the server: they add 5,999 new objects
   to the project, and the project's meshes, objects, keyframes and images would then take about 63
@@ -402,8 +408,9 @@ projects together have a limit too). Changes that browsers send are held against
   the server answers so, also in a page loaded again. So changes the server did not take reach
   neither its storage nor the other browsers; WebDAV's status shows `error` with "the server did not
   take this project's changes, so WebDAV through it gets them only once it does", and Save (Ctrl+S)
-  first connects again, then writes once the server took the project. A browser without live sync
-  (turned off in its preferences) writes as before.
+  first connects again, then writes once the server took the project; it connects once per Save, not
+  again after the write when the server refused the project's changes again. A browser without live
+  sync (turned off in its preferences) writes as before.
 - A stored project is loaded only when loading it and saving it once fits into the free heap, less
   what the server keeps for its other work (`apps/server/src/sync/project-memory.ts` `loadNeed`: 4.5
   times what its objects, datablocks and keyframes count, 6 times its images; measured: 451 MB for
@@ -411,9 +418,9 @@ projects together have a limit too). Changes that browsers send are held against
   '<name>' (<id>) was not loaded on the server: loading it and saving it would take about 709 MB of
   JavaScript heap for its 15,000 objects, … Open it again once the server has more heap free …, or
   start the server with a larger heap (NODE_OPTIONS=--max-old-space-size=<MB>)"), the REST API
-  answers 507 with that message, browsers get it and close code 4507 (the browser says "The server
-  did not open this project: <reason>", shows what it holds of the project and does not sync it with
-  the server until Save or a reload), and the server logs
+  answers 507 with `{"error": "<that message>", "code": "OUT_OF_MEMORY"}`, browsers get it and close
+  code 4507 (the browser says "The server did not open this project: <reason>", shows what it holds
+  of the project and does not sync it with the server until Save or a reload), and the server logs
   `project not loaded: the server cannot hold it` at `warn`.
 - A state another writer stored (a browser that saves what the server did not take to WebDAV
   directly, or without live sync; another server) is not merged into the project the server has open

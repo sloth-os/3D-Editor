@@ -89,7 +89,11 @@ Every example project follows the same loop:
    and materials, a `render_animation` contact sheet for motion.
 6. **Fix and repeat.** `undo` reverts your last tool call (a whole batch at once). Your history
    keeps the last 100 steps per project and at most 64 MB of replaced or deleted data (server
-   defaults), so undo soon after a change and rebuild rather than undo far back.
+   defaults), so undo soon after a change and rebuild rather than undo far back. What it keeps,
+   also the objects you deleted until their step is dropped, counts in the memory the server keeps
+   for the project until your session ends (with an agent id, 6 hours after your last session). An
+   `OUT_OF_MEMORY` refusal names it from 1 MB (`… MB of it kept by agents' undo histories`) and
+   says how it is freed.
 7. **Final outputs**: the path-traced still, the animation, the export.
 
 A minimal script skeleton with `scripts/mcp.mjs`, close to what the example scripts use:
@@ -635,30 +639,34 @@ their final size instead of scaling small ones.
   shading a `select` took 0.1–1.2 s; a `get_view` sent then answered at most 0.4 s after it, not
   waiting for the viewport's frames, when the server did not hold it up) and while it applies a
   change made elsewhere (a `get_view` sent while it applied another agent's move of an object among
-  4 million triangles answered at most 0.4 s after it; 3 s after a change it also copies its
-  viewport into the project's thumbnail, which took at most 0.1 s). The server holds up every
-  request while it saves a project, 1.5 s after a change (at least every 15 s while changes keep
-  coming; 0.3–0.9 s each time with 4 million triangles, then twice more, 0.7–1.2 s after it began,
-  for at most 0.2 s each), while it merges what storage holds of a project that an editor has open,
-  once a minute (0.3–1.9 s), and while it sends a project to an editor that has no copy of it yet
-  (0.2–1.7 s); a request sent during such a hold waits for the rest of it. X-ray changes nothing in
-  `MATERIAL` or `RENDERED` shading outside Edit Mode. A screenshot of a scene of millions of
-  triangles takes half a second or more in any shading (0.5–5.3 s per `SOLID` screenshot with 4
-  million), and several times as long for the first `WIREFRAME` screenshot or frame of such a scene,
-  while the editor builds the wires of every mesh. With the default `renderer: "auto"`,
-  `render_image` waits 15 s for such an editor's raster image and then renders on the server (`note`
-  says so); `renderer: "browser"` waits up to 55 s and then fails, saying what to do. For
-  `editor_command` raise `timeout_ms` (default 10000, at most 55000: both stay under the 60 s an MCP
-  client built on the TypeScript SDK waits by default) and take screenshots with `shading: "SOLID"`;
-  for a quick look use `render_image {shading: "SOLID"}`: grey clay, which renders on the server
-  while the editor is busy (right after a timeout) and when the scene's render engine is
-  `PATHTRACER` (1.1–4.0 s at 1280×720 for that scene, 1.2–7.4 s for 2 million triangles, 2.2–14 s
-  for 4 or 6 million); a scene that needs more memory than a server render has fails with "Rendering
-  failed: out of memory: …" (`OUT_OF_MEMORY`), and then only a screenshot with a larger `timeout_ms`
-  shows it. Make final images with `render_image`. These times are the ranges measured on a calm
-  machine with 4 CPUs, the editor in software WebGL (SwiftShader), widened by 25 % (the longest
-  `SOLID` screenshot with 4 million triangles by 50 %; [how](mcp.md#live-editors)); on a busy one
-  (load averages of 3–15) the same steps took up to 3.5 times as long.
+  4 million triangles answered at most 0.4 s after it; once per change it also copies its viewport
+  into the project's thumbnail, which took at most 0.1 s: 3 s after the change or, while its
+  viewport has not drawn the change, at one of its tries every 0.5 s after that, for up to 30 s
+  (3.0–5.1 s after a person's own edit); and when the frame rate its statistics overlay shows
+  changes while its viewport keeps drawing, the overlay counts every mesh again: 0.19–0.25 s with 4
+  million triangles, 1.1–1.8 s after a person's own edit). The server holds up every request while
+  it saves a project, 1.5 s after a change (at least every 15 s while changes keep coming; 0.3–0.9 s
+  each time with 4 million triangles, then twice more, 0.7–1.2 s after it began, for at most 0.2 s
+  each), while it merges what storage holds of a project that an editor has open, once a minute
+  (0.3–1.9 s), and while it sends a project to an editor that has no copy of it yet (0.2–1.7 s); a
+  request sent during such a hold waits for the rest of it. X-ray changes nothing in `MATERIAL` or
+  `RENDERED` shading outside Edit Mode. A screenshot of a scene of millions of triangles takes half
+  a second or more in any shading (0.5–5.3 s per `SOLID` screenshot with 4 million), and several
+  times as long for the first `WIREFRAME` screenshot or frame of such a scene, while the editor
+  builds the wires of every mesh. With the default `renderer: "auto"`, `render_image` waits 15 s for
+  such an editor's raster image and then renders on the server (`note` says so);
+  `renderer: "browser"` waits up to 55 s and then fails, saying what to do. For `editor_command`
+  raise `timeout_ms` (default 10000, at most 55000: both stay under the 60 s an MCP client built on
+  the TypeScript SDK waits by default) and take screenshots with `shading: "SOLID"`; for a quick
+  look use `render_image {shading: "SOLID"}`: grey clay, which renders on the server while the
+  editor is busy (right after a timeout) and when the scene's render engine is `PATHTRACER` (1.1–4.0
+  s at 1280×720 for that scene, 1.2–7.4 s for 2 million triangles, 2.2–14 s for 4 or 6 million); a
+  scene that needs more memory than a server render has fails with "Rendering failed: out of memory:
+  …" (`OUT_OF_MEMORY`), and then only a screenshot with a larger `timeout_ms` shows it. Make final
+  images with `render_image`. These times are the ranges measured on a calm machine with 4 CPUs, the
+  editor in software WebGL (SwiftShader), widened by 25 % (the longest `SOLID` screenshot with 4
+  million triangles by 50 %; [how](mcp.md#live-editors)); on a busy one (load averages of 3–15) the
+  same steps took up to 3.5 times as long.
 - An editor keeps drawing an image the server stopped waiting for, and its next renders and commands
   wait behind it; a screenshot that timed out still compiles what it needs and keeps it, so
   retrying it waits for the rest and compiles nothing again. Until it has finished,
@@ -796,7 +804,7 @@ The codes come from the kind of error, never from the wording of the message.
 | `editor_command '…' failed: the editor did not answer within timeout_ms = 10000 ms (at most 55000) …`                   | Slow editor (first `MATERIAL`/`RENDERED` screenshot, first `WIREFRAME` one of millions of triangles, or after a material edit that needs a new shader): retry with a larger `timeout_ms` (it keeps what it compiled); screenshots `shading: "SOLID"`; quick look: `render_image {shading: "SOLID"}` (on the server while the editor is busy and for a `PATHTRACER` scene; if that runs out of memory, retry the screenshot)   |
 | `editor_command '…' failed: the editor's connection to this project closed before it answered …`                        | Its page was closed or reloaded, it opened another project or lost its connection: whether it ran the command is unknown (`wm.read_homefile` gets its own message: the editor switched to the new project)                                                                                                                                                                                                                    |
 | `browser render failed: the editor did not finish the RASTER image within 55 s …`                                       | `renderer: "browser"` on a heavy scene: use `software` / `auto`, a smaller size or `shading: "SOLID"`                                                                                                                                                                                                                                                                                                                         |
-| `browser render failed: Path tracing was not started: …`, `browser render failed: The RASTER render was not started: …` | A `renderer: "browser"` render that would not fit into the editor tab's memory or JavaScript heap: lower what the message names (the triangles, or the instances when a `RASTER` render builds no curve or text surface, modifier or shape key result; for a path trace that does not fit the tab's memory also the resolution), use `RASTER` where the message suggests it, or render on the server (`renderer: "software"`) |
+| `browser render failed: Path tracing was not started: …`, `browser render failed: The RASTER render was not started: …` | A `renderer: "browser"` render that does not fit the editor tab's memory or heap (the page's use is estimated): lower what the message names ("Lower the triangles (…)", or "(about … instances of …) … Lower the instances (…)" when a `RASTER` render builds no other geometry; for a path trace over the tab's memory also the resolution), use `RASTER` where suggested, or render on the server (`renderer: "software"`) |
 | `Rendering failed: out of memory: the render process ran out of its 2096 MB JavaScript heap; …`                         | A server render needed more memory than its render process has (`OUT_OF_MEMORY`; the server keeps running): lower the render levels of Subdivision Surface modifiers or particle instances (hiding meshes from renders helps only without render processes: `… was not started: …`), or render in a browser editor (`renderer: "browser"`); `render_animation` and `export_scene` fail the same way with their own advice     |
 | `mesh.subdivide failed: not run on the server: it would need about … MB of JavaScript heap …`                           | An operator that would not fit into the server's free heap (`OUT_OF_MEMORY`): lower what the message names, if it names something, or run it in a browser editor that has the project open (`editor_command` `run_operator`; an import's message gives the call)                                                                                                                                                              |
 | `Nothing to undo in the history of this MCP session …`                                                                  | The session is new: send an agent id to undo across connections                                                                                                                                                                                                                                                                                                                                                               |
@@ -810,7 +818,10 @@ Problems that do not fail a call:
   problems, driver errors;
 - `get_scene` `problems`: every evaluation error in the scene, by object, then the modifiers that
   change nothing, which Blender disables (a Boolean without a mesh object, a Subdivision Surface
-  with 0 levels, …: "Modifier is disabled: …", `disabled: true`), at most 40 entries
+  with 0 levels, …), as `{source: "modifier", object, modifier, disabled: true, message}` with the
+  message "Modifier is disabled: …" and `viewport: true` when only the viewport's evaluation has the
+  entry (one that only the viewport's settings disable ends "…; renders use it", one that only the
+  render settings disable "…; the viewport uses it"), at most 40 entries in all, errors first
   (`problems_total` counts them all);
 - path-traced results with `time_limit_reached`, or animations with `truncated` and
   `undersampled_frames`;

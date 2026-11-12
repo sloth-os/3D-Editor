@@ -41,7 +41,7 @@ import {
   storedChangesMessage,
   type GrowthCheck,
 } from './project-memory';
-import { measureUpdate, type UpdateSize } from './update-size';
+import { measureUpdate, yjsReadError, type UpdateSize } from './update-size';
 
 /** Transaction origin of changes merged from storage (not re-persisted, still broadcast). */
 export const STORAGE_ORIGIN = Symbol('storage');
@@ -710,14 +710,17 @@ export class Room {
   /**
    * Why the room does not merge `stored`, the stored state a save or refresh read (null: it does):
    * it adds to the project what the project cannot take (RoomDeps.growthCheck, as for sync clients).
-   * A state the room last read or wrote itself is not measured again (storedPrint).
+   * A state the room last read or wrote itself is not measured again (storedPrint). A state the
+   * measure cannot read is merged only when Yjs reads all of it (see {@link unmeasured}): else the
+   * save or refresh fails with the reason, as one whose merge failed, and merges none of it.
    */
   private storedGrowthRefusal(stored: Uint8Array): string | null {
     if (this.storedPrint !== null && fingerprint(stored) === this.storedPrint) return null;
     let size: UpdateSize;
     try {
       size = measureUpdate(stored, this.scene);
-    } catch {
+    } catch (err) {
+      this.unmeasured(stored, err);
       return null;
     }
     if (!(size.kept > 0)) return null;
@@ -851,7 +854,7 @@ export class Room {
             { 'sync.room': this.id, 'sync.type': typeName, 'sync.bytes': data.byteLength },
             () => {
               // changes (sync step 2 and updates) the project cannot take are not applied
-              const refused = this.growthRefusal(decoding.clone(decoder));
+              const refused = this.growthRefusal(conn, decoding.clone(decoder));
               if (refused) {
                 this.refuse(conn, refused);
                 return;
@@ -911,21 +914,51 @@ export class Room {
    * 2 or an update; other messages change nothing), null when it applies them: they add objects,
    * datablocks, keyframes, geometry or images (sync/update-size.ts, in the terms the memory checks
    * count a project) that the project cannot take (RoomDeps.growthCheck). Changes and deletions of
-   * what the project has are applied as before, also in a project already past its limit (and so is
-   * a message the measure cannot read: Yjs decides as before).
+   * what the project has are applied as before, also in a project already past its limit. An update
+   * the measure cannot read is applied only when Yjs reads all of it (see {@link unmeasured}): else
+   * the message is answered with the control error BAD_MESSAGE (handleMessage) and applied nowhere.
    */
-  private growthRefusal(decoder: decoding.Decoder): { message: string; size: UpdateSize } | null {
+  private growthRefusal(
+    conn: SyncConnection,
+    decoder: decoding.Decoder,
+  ): { message: string; size: UpdateSize } | null {
     const kind = decoding.readVarUint(decoder);
     if (kind !== syncProtocol.messageYjsSyncStep2 && kind !== syncProtocol.messageYjsUpdate) return null;
+    const update = decoding.readVarUint8Array(decoder);
     let size: UpdateSize;
     try {
-      size = measureUpdate(decoding.readVarUint8Array(decoder), this.scene);
-    } catch {
+      size = measureUpdate(update, this.scene);
+    } catch (err) {
+      this.unmeasured(update, err, conn);
       return null;
     }
     if (!(size.kept > 0)) return null;
     const clause = (this.deps.growthCheck ?? growthCheck)(this.scene, size.kept, size.saved);
     return clause ? { message: refusedChangesMessage(size, clause), size } : null;
+  }
+
+  /**
+   * After the measure failed to read `update` (`err`): the update a sync client sent (`conn`), or
+   * the stored document a save or refresh read. Yjs's own reader decides (update-size.ts
+   * yjsReadError, which applies nothing): one that Yjs reads whole is a gap of the measure, applied
+   * as before without the check and logged as a warning; one that Yjs cannot read either throws (Yjs
+   * would add the structs it read before it fails on the rest), and the caller applies none of it: a
+   * sync message is answered with the control error BAD_MESSAGE, a save or refresh fails.
+   */
+  private unmeasured(update: Uint8Array, err: unknown, conn?: SyncConnection): void {
+    const unreadable = yjsReadError(update);
+    if (unreadable !== null)
+      throw new Error(
+        conn
+          ? `the update cannot be read (${unreadable}), so none of it was applied`
+          : `the stored document cannot be read (${unreadable}), so none of it was merged`,
+      );
+    this.deps.log.warn(
+      { project: this.id, conn: conn?.id, bytes: update.byteLength, err: errorMessage(err) },
+      conn
+        ? 'sync changes applied without the memory check: the measure could not read them'
+        : 'changes in storage merged without the memory check: the measure could not read them',
+    );
   }
 
   /**

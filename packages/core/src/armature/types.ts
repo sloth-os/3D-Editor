@@ -58,4 +58,13 @@ export interface PoseContext {
    * null when the object is not an armature, has no such bone or depends on this pose (cycle).
    */
   getBoneMatrix?(armatureObjectId: string, bone: string): { matrix: Mat4; length: number } | null;
+  /**
+   * Optional: for a constraint target `id` that exists but has no world matrix (`getWorldMatrix`
+   * gave null) because evaluating it reads this pose, a dependency cycle: the message naming the
+   * cycle ("target 'T' is part of a dependency cycle: Rig [<closing>] → T [parent bone 'B'] →
+   * Rig", `closing` the relation by which the pose reads the target) and the matrix the target has
+   * so far, which the constraint is evaluated with (null when it has none). Null for a target that
+   * is missing.
+   */
+  getCycleTarget?(id: string, closing: string): { message: string; matrix: Mat4 | null } | null;
 }

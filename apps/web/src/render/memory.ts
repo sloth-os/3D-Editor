@@ -884,13 +884,17 @@ export function refusalFigures(need: number, total: number, used: number, digits
 /**
  * Why `subject` (e.g. "its render thread") does not fit with `need` bytes of JavaScript heap: the
  * room a render has in the tab's heap is the share of its limit a render may fill ({@link
- * usableHeap}) less what the page, and the path traced renders running in it, use.
+ * usableHeap}) less what the page, and the path traced renders running in it, use. That use is an
+ * estimate ({@link TabMemory.heapUsed}: from the page's scene, with a quarter more; the renders'
+ * {@link renderMemory}), and the message says so: it can exceed what the heap holds.
  */
 function heapReason(subject: string, need: number, mem: TabMemory): string {
   const used = mem.heapUsed + mem.held.heap;
   const f = refusalFigures(need, usableHeap(mem.heapLimit), used, 2);
   const users =
-    mem.held.heap > 0 ? 'the page and the path traced renders running in it use' : 'the page uses';
+    mem.held.heap > 0
+      ? 'the page and the path traced renders running in it are estimated to use'
+      : 'the page is estimated to use';
   const share =
     `a render may fill ${f.total} GB of its ${gbText(mem.heapLimit, f.digits)} GB heap limit, the rest ` +
     "being kept free for V8's young generation and for the page to keep working";

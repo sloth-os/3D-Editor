@@ -427,6 +427,7 @@ export class FrameState {
         armatureId: id,
         getWorldMatrix: (t) => this.world(t),
         getBoneMatrix: (a, b) => this.boneMatrix(a, b),
+        getCycleTarget: (t, closing) => this.cycleTarget(id, t, closing),
       });
       this.poseEvals.set(id, ev);
     }
@@ -468,6 +469,56 @@ export class FrameState {
   /** Whether a bone is being evaluated or depends on one that is (a cycle through bone parenting). */
   private boneCycle(armatureId: string, bone: string): boolean {
     return !!this.poseEvaluation(armatureId)?.bone(bone)?.cyclic;
+  }
+
+  /**
+   * A constraint target `id` of a bone of armature `armatureId` that has no world matrix because
+   * evaluating it reads the pose (PoseContext.getCycleTarget): the message naming the dependency
+   * cycle, the relations from the target to the armature worded as the dependency graph words them
+   * (`closing`: the relation by which the pose reads the target), and the matrix the target has so
+   * far ({@link cycleWorld}). Null for a missing target.
+   */
+  private cycleTarget(
+    armatureId: string,
+    id: string,
+    closing: string,
+  ): { message: string; matrix: Mat4 | null } | null {
+    const o = this.object(id);
+    if (!o) return null;
+    const arm = this.object(armatureId)?.name ?? armatureId;
+    const path = dependencyGraph(this.over ? this.over.base : this).relationPath(id, armatureId);
+    return {
+      message:
+        `target '${o.name}' is part of a dependency cycle` +
+        (path ? `: ${arm} [${closing}] → ${path}` : ` through the pose of '${arm}'`),
+      matrix: this.cycleWorld(id, new Set()),
+    };
+  }
+
+  /**
+   * Where object `id` is as far as this frame state has evaluated the scene, for a target read
+   * while its own evaluation waits for the pose that reads it (Blender evaluates one relation of a
+   * dependency cycle with what the target holds then): its world matrix once evaluated, else its
+   * parent's (a parent bone as the pose has it so far: without its own constraints until it is
+   * evaluated, under its parent bones as evaluated so far, PoseEvaluation.peek) times its own
+   * transform, its constraints left out. Null for a missing object or a parent loop.
+   */
+  private cycleWorld(id: string, seen: Set<string>): Mat4 | null {
+    const base = this.fromBase(id);
+    if (base) return base.world(id) ?? base.cycleWorld(id, seen);
+    const done = this.worldM.get(id);
+    if (done) return done;
+    const o = this.object(id);
+    if (!o || seen.has(id)) return null;
+    seen.add(id);
+    const local = compose4(o.location, o.rotation_euler, o.scale);
+    if (!o.parent || o.parent === id || !this.object(o.parent)) return local;
+    const pw = this.cycleWorld(o.parent, seen);
+    if (!pw) return null;
+    const b =
+      o.parent_type === 'BONE' && o.parent_bone ? this.poseEvaluation(o.parent)?.peek(o.parent_bone) : null;
+    const parent = b ? multiply4(pw, multiply4(b.matrix, translation4([0, b.length, 0]))) : pw;
+    return multiply4(parent, local);
   }
 
   /** Path along the first spline of a CURVE object, with its world matrix. */

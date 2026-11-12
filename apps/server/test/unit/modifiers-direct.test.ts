@@ -195,6 +195,55 @@ describe('get_scene problems', () => {
     ]);
   });
 
+  it('say which evaluation uses a modifier that the settings of the other disable', () => {
+    const { p, add } = project();
+    // the viewport subdivides it (levels 2); renders do not (render_levels 0)
+    const r = add('mesh.primitive_cube_add', { name: 'R' });
+    addModifier(p, registry, r, 'SUBSURF', { params: { levels: 2, render_levels: 0 } });
+    // the same, hidden in the viewport: it changes nothing anywhere
+    const hv = add('mesh.primitive_cube_add', { name: 'HV' });
+    const hidden = addModifier(p, registry, hv, 'SUBSURF', {
+      params: { levels: 2, render_levels: 0 },
+    }).modifier!;
+    updateModifier(p, registry, p.scene.getObject(hv.id)!, hidden, { show_viewport: false });
+    // 0 viewport levels and render_levels 2, hidden in renders: it changes nothing anywhere either
+    const hr = add('mesh.primitive_cube_add', { name: 'HR' });
+    const off = addModifier(p, registry, hr, 'SUBSURF', {
+      params: { levels: 0, render_levels: 2 },
+    }).modifier!;
+    updateModifier(p, registry, p.scene.getObject(hr.id)!, off, { show_render: false });
+    const { problems } = summarizeScene(p.scene) as unknown as { problems: Record<string, unknown>[] };
+    const disabled = (levels: string, where = '') =>
+      `Modifier is disabled: the Subdivision Surface modifier 'Subdivision' has 0 ${levels}, so it changes nothing${where}`;
+    const remove = '; change it with update_modifier or remove it with remove_modifier';
+    const byObject = (a: Record<string, unknown>, b: Record<string, unknown>) =>
+      String(a.object).localeCompare(String(b.object));
+    expect([...problems].sort(byObject)).toEqual([
+      {
+        source: 'modifier',
+        object: 'HR',
+        modifier: 'Subdivision',
+        disabled: true,
+        message: disabled('viewport levels (levels)') + remove,
+        viewport: true,
+      },
+      {
+        source: 'modifier',
+        object: 'HV',
+        modifier: 'Subdivision',
+        disabled: true,
+        message: disabled('render levels (render_levels)') + remove,
+      },
+      {
+        source: 'modifier',
+        object: 'R',
+        modifier: 'Subdivision',
+        disabled: true,
+        message: disabled('render levels (render_levels)', ' in renders; the viewport uses it'),
+      },
+    ]);
+  });
+
   it('list the disabled modifiers after the errors, which the cap of the list keeps', () => {
     const { doc, p, add } = project();
     // 41 Booleans without an object (more than the 40 entries listed), then an error on an object

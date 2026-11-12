@@ -23,6 +23,8 @@ import {
   SHAPE_KEY_BYTES_PER_VERTEX,
   armatureParentWrites,
   boneRenameWrites,
+  joinLayerWrites,
+  movedLayerWrites,
   shapeKeyWrites,
   vertexGroupWrites,
   type LayerKind,
@@ -760,18 +762,29 @@ function meshPicks(objects: readonly ObjectData[]): Map<string, number> {
  * so a mesh used by u objects, k of them in `objects`, is copied min(k, u − 1) times.
  */
 function singleUserCopies(doc: SceneDoc, objects: readonly ObjectData[]): number {
-  const users = dataUsers(doc);
   let bytes = 0;
-  for (const [meshId, k] of meshPicks(objects))
-    bytes += Math.min(k, Math.max(0, (users.get(meshId) ?? 1) - 1)) * meshBytes(doc, meshId);
+  for (const [meshId, { copies }] of singleUserPicks(doc, objects)) bytes += copies * meshBytes(doc, meshId);
   return bytes;
+}
+
+/** For each mesh of `objects`, how many of them use it and how many copies of it singleUserCopies counts. */
+function singleUserPicks(
+  doc: SceneDoc,
+  objects: readonly ObjectData[],
+): Map<string, { objects: number; copies: number }> {
+  const users = dataUsers(doc);
+  const out = new Map<string, { objects: number; copies: number }>();
+  for (const [meshId, k] of meshPicks(objects))
+    out.set(meshId, { objects: k, copies: Math.min(k, Math.max(0, (users.get(meshId) ?? 1) - 1)) });
+  return out;
 }
 
 /**
  * Object Mode operators that copy or rewrite the meshes of the selected objects. `singleUser`: the
  * operator gives every selected object a mesh of its own before it rewrites it (object.transform_apply
- * and object.origin_set), so linked duplicates each count and their copies are added; the others
- * rewrite (shading) or copy (object.duplicate, `copies`) each mesh once.
+ * and object.origin_set), so linked duplicates each count and their copies are added, with the vertex
+ * groups and shape keys the copies get and the shape keys it moves (memory-layers.ts movedLayerWrites);
+ * the others rewrite (shading) or copy (object.duplicate, `copies`) each mesh once.
  */
 function objectMeshes(lower: string, opts: { copies?: boolean; singleUser?: boolean } = {}): Estimator {
   return (ctx) => {
@@ -781,6 +794,7 @@ function objectMeshes(lower: string, opts: { copies?: boolean; singleUser?: bool
     for (const o of objects) decoded += meshBytes(ctx.doc, o.data);
     const faces = facesOf(ctx, objects);
     const added = opts.copies ? decoded : opts.singleUser ? singleUserCopies(ctx.doc, objects) : 0;
+    const moved = opts.singleUser ? movedLayerWrites(ctx.doc, singleUserPicks(ctx.doc, objects)) : null;
     // the copies of meshes also get their vertex groups and shape keys (object.ts duplicate), each list
     // read and written again (memory-layers.ts), kept and saved as the project counts them
     let layers = 0;
@@ -794,6 +808,15 @@ function objectMeshes(lower: string, opts: { copies?: boolean; singleUser?: bool
             shapeKeyCount(ctx.doc, o.data!) *
             (ctx.doc.meshCounts(o.data!)?.vertices ?? 0);
       }
+    if (moved)
+      return {
+        bytes: OPERATOR_FIXED_BYTES + OBJECT_MESH_BYTES_PER_FACE * faces + decoded + added + moved.bytes,
+        faces,
+        addedStoredBytes: added + moved.stored,
+        addedSaveBytes: moved.save,
+        layers: { kind: moved.kind, bytes: moved.written },
+        lower: moved.lower,
+      };
     return {
       bytes:
         OPERATOR_FIXED_BYTES +
@@ -1616,7 +1639,8 @@ const meshFromData: Estimator = (_ctx, p) => {
 /**
  * object.join: copies of the meshes of the selected objects (linked duplicates each, as object.ts
  * joins them) appended into the active one, whose mesh then holds them all: the meshes only the
- * joined objects used go with them.
+ * joined objects used go with them. Their vertex groups and shape keys are merged by name into the
+ * joined mesh, every one written for all its vertices (memory-layers.ts joinLayerWrites).
  */
 const join: Estimator = (ctx) => {
   const objects = selectedMeshObjects(ctx);
@@ -1636,13 +1660,25 @@ const join: Estimator = (ctx) => {
   }
   const users = dataUsers(ctx.doc);
   let freed = 0;
+  const freedMeshes: string[] = [];
   for (const [meshId, k] of meshPicks(objects))
-    if (k >= (users.get(meshId) ?? 0)) freed += meshBytes(ctx.doc, meshId);
+    if (k >= (users.get(meshId) ?? 0)) {
+      freed += meshBytes(ctx.doc, meshId);
+      freedMeshes.push(meshId);
+    }
+  const layers = joinLayerWrites(
+    ctx.doc,
+    objects.filter((o) => ctx.doc.meshCounts(o.data!)).map((o) => o.data!),
+    freedMeshes,
+    active?.type === 'MESH' ? (active.data ?? null) : null,
+  );
   return {
-    bytes: OPERATOR_FIXED_BYTES + OBJECT_MESH_BYTES_PER_FACE * result.faces + 2 * decoded,
+    bytes:
+      OPERATOR_FIXED_BYTES + OBJECT_MESH_BYTES_PER_FACE * result.faces + 2 * decoded + (layers?.bytes ?? 0),
     faces: result.faces,
-    addedStoredBytes: Math.max(0, decodedMeshBytes(result) - freed),
-    lower: 'the number or size of the joined meshes',
+    addedStoredBytes: Math.max(0, decodedMeshBytes(result) - freed) + (layers?.stored ?? 0),
+    ...(layers ? { addedSaveBytes: layers.save, layers: { kind: layers.kind, bytes: layers.written } } : {}),
+    lower: layers?.lower ?? 'the number or size of the joined meshes',
   };
 };
 

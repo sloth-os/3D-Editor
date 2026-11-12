@@ -224,7 +224,11 @@ describe('editor command timeouts', () => {
    * answered within 0.14 s). It also waits while the editor applies a change made elsewhere, and
    * every request waits while the server holds up its event loop (a save and the two short holds
    * right after it, the minute's read, an editor opening the project): a timeout_ms of a few seconds
-   * can run out in these alone, which round 12's message did not name.
+   * can run out in these alone, which round 12's message did not name. Round 13 names the editor's
+   * own short holds too: its statistics overlay counting every mesh again when the frame rate it
+   * shows changes (Viewport.tsx InfoOverlay reads fps; session.ts sceneStats), measured 0.197-0.244 s
+   * with 4 million triangles 1.1-1.8 s after a person's own edit, and its thumbnail copy
+   * (session.ts scheduleIndexUpdate).
    */
   const viewport = (command: string) =>
     `'${command}' waits while the editor's main thread is busy, and while the server holds up every request: ` +
@@ -235,8 +239,12 @@ describe('editor command timeouts', () => {
     'materials, and with its first WIREFRAME frame of a scene with millions of triangles, while it builds ' +
     'the wires of every mesh; with millions of triangles it is also busy while it carries out a command ' +
     `(with 4 million in SOLID shading a select took ${MILLIONS_SELECT_SECONDS}) and while it applies a change ` +
-    `made elsewhere (${CHANGE_APPLY_SECONDS} for an agent's move of an object among 4 million triangles), but ` +
-    'not while it draws its other frames.';
+    `made elsewhere (${CHANGE_APPLY_SECONDS} for an agent's move of an object among 4 million triangles); it is ` +
+    'also busy while its statistics overlay counts every mesh again, which it does when the frame rate it shows ' +
+    "changes as the viewport keeps drawing (0.19–0.25 s with 4 million triangles, 1.1–1.8 s after a person's own " +
+    "edit in it), and while it copies the frame its viewport drew into the project's thumbnail (at most 0.1 s " +
+    'with 4 million triangles), once per change, 3 s after it or, until the viewport has drawn it, at the first ' +
+    'of its tries every 0.5 s after that, but not while it draws its other frames.';
   /**
    * The server cannot know the viewport's shading (the person can change it): switching to SOLID is
    * advised only for a viewport in another shading (a select of 4 million triangles in SOLID shading

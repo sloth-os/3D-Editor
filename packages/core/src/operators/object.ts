@@ -4,7 +4,15 @@ import { compose4, invert4, multiply4, translation4 } from '../math/mat4';
 import { transformPoint3 } from '../math/vec3';
 import { changedChannels, transformedChannels, transformTolerance } from '../doc/scene-doc';
 import { FrameState } from '../eval/frame-state';
-import type { EmptyDisplayType, LightData, LightType, ObjectData, ObjectType } from '../doc/types';
+import type {
+  EmptyDisplayType,
+  LightData,
+  LightType,
+  ObjectData,
+  ObjectType,
+  ShapeKeyData,
+  VertexGroupData,
+} from '../doc/types';
 import { ROOT_COLLECTION_ID } from '../doc/types';
 import { defaultCamera, defaultLight } from '../doc/defaults';
 import { cameraFields, cameraPatch, LIGHT_TYPES, lightFields, lightPatch } from './light-camera';
@@ -12,6 +20,7 @@ import type { MeshData } from '../mesh/types';
 import { appendMesh, cloneMesh, createMesh, edgeKey, meshBounds, vertexCount } from '../mesh/types';
 import { createPrimitive, type PrimitiveType } from '../mesh/primitives';
 import { buildTopology } from '../mesh/topology';
+import { decodeFloat32, encodeFloat32, vertexGroupWeights } from '../mesh/shape-keys';
 import { faceNormal } from '../mesh/normals';
 import { selectAllElements, selectionFromVerts } from '../mesh/selection';
 import { SceneEvaluator, type EvaluatedScene } from '../eval/evaluate';
@@ -31,10 +40,10 @@ import {
   vec3,
 } from './helpers';
 import {
-  evaluatedWorld,
   keepChildrenWorld,
   keyChannelChanges,
   moveOrigin,
+  shownWorld,
   transformRoots,
   transformStart,
   type ChannelChange,
@@ -53,7 +62,8 @@ import {
  * Parents object `id` to the object `parent` (null clears the parent; an object parent, so a bone
  * parent's bone no longer applies), keeping its world matrix when `keep`, from where the scene
  * shows it and the new parent at the frame of `fs`: under a bone or an animated, posed or
- * constrained parent too (SceneDoc.setParent).
+ * constrained parent too, and where one of them reads a dependency cycle (see shownWorld;
+ * SceneDoc.setParent).
  */
 function setParentAt(
   ctx: OperatorContext,
@@ -63,7 +73,7 @@ function setParentAt(
   keep: boolean,
 ): void {
   const evaluated = keep
-    ? { world: evaluatedWorld(fs, id), parentWorld: parent ? evaluatedWorld(fs, parent) : null }
+    ? { world: shownWorld(fs, id), parentWorld: parent ? shownWorld(fs, parent) : null }
     : undefined;
   ctx.doc.setParent(id, parent, keep, evaluated);
 }
@@ -78,6 +88,70 @@ function removeObjectAt(ctx: OperatorContext, fs: FrameState, id: string): void 
   const parent = o.parent && o.parent !== id && ctx.doc.getObject(o.parent) ? o.parent : null;
   for (const child of ctx.doc.childrenOf(id)) setParentAt(ctx, fs, child.id, parent, true);
   ctx.doc.removeObject(id);
+}
+
+/**
+ * A mesh object's part of a joined mesh (object.join): its first vertex there and its vertex count,
+ * its mesh's vertex groups and shape keys, and the matrix into the active object's space (null for
+ * the active object's own mesh).
+ */
+interface JoinedPart {
+  start: number;
+  count: number;
+  groups: VertexGroupData[];
+  keys: ShapeKeyData[];
+  toActive: Mat4 | null;
+}
+
+/**
+ * The vertex groups and shape keys of a joined mesh as Blender 4.2's Join merges them
+ * (ED_mesh_join_objects_exec and join_mesh_single in meshtools.cc): the groups of the active mesh,
+ * then those of the other meshes it lacks, by name, each part's weights going to the group of the
+ * same name (0 in the groups its mesh lacks); the shape keys of the active mesh, then those of the
+ * other meshes it lacks, by name, also when the active mesh has none, each part's positions taken
+ * from its key of the same name (moved into the active object's space) or, when its mesh lacks it,
+ * from its vertices in the joined mesh (`positions`, `total` vertices). A key the active mesh has
+ * keeps its settings; one another mesh brings takes that mesh's value and slider range but is not
+ * muted (BKE_keyblock_copy_settings copies no flags); every key takes the relative key it has in the
+ * last joined mesh that has it, the active mesh's when no other has it (meshtools.cc remaps
+ * `relative` for every key of each joined mesh). The keys of a joined mesh without vertices are left
+ * out, its groups are not (meshtools.cc merges another mesh's key blocks inside `if
+ * (mesh->verts_num)`, its vertex group names before it). Null when no mesh has any.
+ */
+function joinedLayers(
+  parts: readonly JoinedPart[],
+  positions: ArrayLike<number>,
+  total: number,
+): { groups: VertexGroupData[] | null; keys: ShapeKeyData[] | null } {
+  const weights = new Map<string, Float32Array>();
+  const keys = new Map<string, ShapeKeyData>();
+  for (const part of parts) {
+    for (const g of part.groups) if (!weights.has(g.name)) weights.set(g.name, new Float32Array(total));
+    if (part.toActive && part.count === 0) continue;
+    for (const k of part.keys)
+      if (!keys.has(k.name)) keys.set(k.name, part.toActive ? { ...k, mute: false } : k);
+      else if (part.toActive) keys.set(k.name, { ...keys.get(k.name)!, relative_key: k.relative_key });
+  }
+  for (const part of parts)
+    for (const g of part.groups) weights.get(g.name)!.set(vertexGroupWeights(g, part.count), part.start);
+  const joinedKey = (key: ShapeKeyData): ShapeKeyData => {
+    const out = new Float32Array(total * 3);
+    for (const part of parts) {
+      const own = part.keys.find((k) => k.name === key.name);
+      const data = own ? decodeFloat32(own.data) : null;
+      if (data && data.length === part.count * 3)
+        for (let i = 0; i < part.count; i++) {
+          const p: Vec3 = [data[i * 3], data[i * 3 + 1], data[i * 3 + 2]];
+          out.set(part.toActive ? transformPoint3(part.toActive, p) : p, (part.start + i) * 3);
+        }
+      else for (let i = part.start * 3; i < (part.start + part.count) * 3; i++) out[i] = positions[i];
+    }
+    return { ...key, data: encodeFloat32(out) };
+  };
+  return {
+    groups: weights.size ? [...weights].map(([name, w]) => ({ name, weights: encodeFloat32(w) })) : null,
+    keys: keys.size ? [...keys.values()].map(joinedKey) : null,
+  };
 }
 
 const placement = {
@@ -208,12 +282,43 @@ function refuseIncompleteGeometry(ctx: OperatorContext, ev: EvaluatedScene, targ
     );
 }
 
-function singleUserMesh(ctx: OperatorContext, o: ObjectData): string {
+/**
+ * The mesh of object `o`, made its own first when other objects use it too: a copy, with the vertex
+ * groups and shape keys of the mesh unless `layers` is false (as Blender's single-user copy keeps
+ * them: single_obdata_users copies the mesh with BKE_id_copy_ex(…, LIB_ID_COPY_DEFAULT …), whose
+ * LIB_ID_COPY_SHAPEKEY copies its key, and mesh_copy_data its vertex group names and weights).
+ */
+function singleUserMesh(ctx: OperatorContext, o: ObjectData, layers = true): string {
   if (!o.data) throw new OperatorError('Object has no data');
   if (ctx.doc.dataUsers(o.data) <= 1) return o.data;
   const copy = ctx.doc.addMesh(ctx.doc.getMeshBlock(o.data)?.name ?? o.name, ctx.doc.getMeshCopy(o.data)!);
+  if (layers) {
+    const groups = ctx.doc.getVertexGroups(o.data);
+    if (groups.length) ctx.doc.setVertexGroups(copy, groups);
+    const keys = ctx.doc.getShapeKeys(o.data);
+    if (keys.length) ctx.doc.setShapeKeys(copy, keys);
+  }
   ctx.doc.updateObject(o.id, { data: copy });
   return copy;
+}
+
+/**
+ * Moves every shape key of mesh `meshId` as an operator moved the mesh's vertices (`move`), so the
+ * keys keep their offsets from the moved mesh, as Blender's Apply Object Transform and Set Origin do
+ * (object_transform.cc: BKE_mesh_transform(mesh, mat, true) and BKE_mesh_translate(mesh, cent_neg,
+ * true), whose `do_keys` moves every key block of the mesh).
+ */
+function moveShapeKeys(ctx: OperatorContext, meshId: string, move: (p: Vec3) => Vec3): void {
+  const keys = ctx.doc.getShapeKeys(meshId);
+  if (!keys.length) return;
+  ctx.doc.setShapeKeys(
+    meshId,
+    keys.map((k) => {
+      const d = decodeFloat32(k.data);
+      for (let i = 0; i + 2 < d.length; i += 3) d.set(move([d[i], d[i + 1], d[i + 2]]), i);
+      return { ...k, data: encodeFloat32(d) };
+    }),
+  );
 }
 
 export function registerObjectOperators(reg: OperatorRegistry): void {
@@ -856,6 +961,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
               if (m.uvs) m.uvs = m.uvs.map((uv) => reversePairs(uv));
             }
             ctx.doc.setMesh(meshId, m);
+            moveShapeKeys(ctx, meshId, (q) => transformPoint3(delta, q));
           } else if (o.type === 'CURVE' || o.type === 'FONT') {
             // false (with a warning) when its data cannot take the transform: it stays on the object
             if (!applyCurveTransform(ctx, o, delta, p.properties)) continue;
@@ -914,7 +1020,7 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           const m = cloneMesh(ctx.doc.getMesh(meshId)!);
           const n = vertexCount(m);
           if (n === 0) continue;
-          const world = evaluatedWorld(before, o.id);
+          const world = shownWorld(before, o.id);
           let centerLocal: Vec3;
           if (p.center === 'BOUNDS') {
             const b = meshBounds(m)!;
@@ -924,17 +1030,20 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             for (let i = 0; i < n; i++)
               for (let k = 0; k < 3; k++) centerLocal[k] += m.positions[i * 3 + k] / n;
           }
-          if (p.type === 'GEOMETRY_ORIGIN') {
-            for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) m.positions[i * 3 + k] -= centerLocal[k];
+          const shift = (c: Vec3) => {
+            for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) m.positions[i * 3 + k] -= c[k];
             ctx.doc.setMesh(meshId, m);
+            moveShapeKeys(ctx, meshId, (q) => [q[0] - c[0], q[1] - c[1], q[2] - c[2]]);
+          };
+          if (p.type === 'GEOMETRY_ORIGIN') {
+            shift(centerLocal);
             continue;
           }
           const target: Vec3 =
             p.type === 'ORIGIN_CURSOR'
               ? transformPoint3(invert4(world), ctx.state.cursorLocation)
               : centerLocal;
-          for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) m.positions[i * 3 + k] -= target[k];
-          ctx.doc.setMesh(meshId, m);
+          shift(target);
           // the origin moves onto the old centre, so nothing moves visually
           moveOrigin(ctx, o.id, target, before, changed);
         }
@@ -1124,7 +1233,12 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'object.join',
       label: 'Join',
-      description: 'Join the selected mesh objects into the active one.',
+      description:
+        'Join the selected mesh objects into the active one. As in Blender, the joined mesh keeps the vertex ' +
+        'groups and shape keys of every joined mesh (not the keys of a mesh without vertices), merged by name: ' +
+        'vertices of a mesh without a group have weight 0 in it, and those of a mesh without a key keep their own ' +
+        'positions in it. An active object whose mesh other objects use too gets a mesh of its own first (Blender ' +
+        'joins into the shared mesh).',
       category: 'Object',
       schema: z.object({}),
       poll: (ctx) => {
@@ -1137,17 +1251,28 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
       },
       execute(ctx) {
         const active = activeObject(ctx)!;
-        const activeMeshId = singleUserMesh(ctx, active);
+        // a mesh other objects use too is copied for the joined mesh, whose groups and keys are
+        // written below from those of the mesh the active object had (`active.data`)
+        const activeMeshId = singleUserMesh(ctx, active, false);
         const out = cloneMesh(ctx.doc.getMesh(activeMeshId)!);
         // where the scene shows the objects (Blender joins with their evaluated matrices)
         const fs = new FrameState(ctx.doc, ctx.state.frame);
-        const inv = invert4(evaluatedWorld(fs, active.id));
+        const inv = invert4(shownWorld(fs, active.id));
         const slots = [...active.material_slots];
+        const parts: JoinedPart[] = [
+          {
+            start: 0,
+            count: vertexCount(out),
+            groups: ctx.doc.getVertexGroups(active.data!),
+            keys: ctx.doc.getShapeKeys(active.data!),
+            toActive: null,
+          },
+        ];
         for (const o of selectedObjects(ctx)) {
           if (o.id === active.id || o.type !== 'MESH' || !o.data) continue;
           const src = ctx.doc.getMesh(o.data);
           if (!src) continue;
-          const toActive: Mat4 = multiply4(inv, evaluatedWorld(fs, o.id));
+          const toActive: Mat4 = multiply4(inv, shownWorld(fs, o.id));
           // map material slots
           const slotMap = o.material_slots.map((mat) => {
             let i = slots.indexOf(mat);
@@ -1159,10 +1284,19 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
           });
           const remapped = cloneMesh(src);
           remapped.faceMaterials = remapped.faceMaterials.map((mi) => slotMap[mi] ?? 0);
-          appendMesh(out, remapped, (v) => transformPoint3(toActive, v));
+          parts.push({
+            start: appendMesh(out, remapped, (v) => transformPoint3(toActive, v)),
+            count: vertexCount(src),
+            groups: ctx.doc.getVertexGroups(o.data),
+            keys: ctx.doc.getShapeKeys(o.data),
+            toActive,
+          });
           removeObjectAt(ctx, fs, o.id);
         }
         ctx.doc.setMesh(activeMeshId, out);
+        const layers = joinedLayers(parts, out.positions, vertexCount(out));
+        if (layers.groups) ctx.doc.setVertexGroups(activeMeshId, layers.groups);
+        if (layers.keys) ctx.doc.setShapeKeys(activeMeshId, layers.keys);
         ctx.doc.updateObject(active.id, { material_slots: slots });
         setSelection(ctx, [active.id], active.id);
       },
@@ -1213,7 +1347,8 @@ export function registerObjectOperators(reg: OperatorRegistry): void {
             converted.push({ object: id, name: ctx.doc.getObject(id)!.name, type: 'MESH' });
             continue;
           }
-          const meshId = singleUserMesh(ctx, o);
+          // a copy of a mesh other objects use takes the baked geometry only, no vertex groups or shape keys
+          const meshId = singleUserMesh(ctx, o, false);
           ctx.doc.setMesh(meshId, cloneMesh(mesh));
           ctx.doc.updateObject(o.id, { modifiers: [] });
           converted.push({ object: o.id, name: o.name, type: 'MESH' });

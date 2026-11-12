@@ -524,6 +524,44 @@ describe('AgentSession project names', () => {
   });
 
   /*
+   * list_projects gives the names it read only to the projects that no lookup read again since it
+   * began: a lookup that read a new name while list_projects was reading the old one keeps it.
+   */
+  it('keeps a name a lookup read while list_projects read an older one', async () => {
+    /** Storage whose next read of a project.json reads at once and answers once `late` resolves. */
+    class LateInfoStore extends NamesStore {
+      late: Promise<void> | null = null;
+      override async read(path: string) {
+        const late = path.endsWith('/project.json') ? this.late : null;
+        if (late) this.late = null;
+        const read = await super.read(path);
+        if (late) await late;
+        return read;
+      }
+    }
+    const fs = new LateInfoStore();
+    fs.folderTag = '"1"';
+    const { rooms, store, session } = setup({ fs });
+    const agent = session();
+    const id = await storedOnly(store!, 'Old site');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    let release!: () => void;
+    fs.late = new Promise((resolve) => (release = resolve));
+    const listing = rooms.listProjects();
+    await vi.waitFor(() => expect(fs.late).toBeNull());
+    // another writer renames it, and a lookup reads the new name a second later
+    vi.setSystemTime(Date.now() + 1000);
+    await store!.saveInfo({ ...(await store!.loadInfo(id))!, name: 'New site' });
+    fs.folderTag = '"2"';
+    expect(await agent.findProject('New site')).toEqual({ id });
+    release();
+    expect((await listing).map((p) => p.name)).toEqual(['Old site']);
+    // the folder tells no change since: the name the lookup read is compared
+    expect(await agent.findProject('New site')).toEqual({ id });
+    await expect(agent.findProject('Old site')).rejects.toThrow("Project 'Old site' not found.");
+  });
+
+  /*
    * As in list_projects: a loaded project that nobody uses here and that storage no longer lists
    * (another writer deleted it) is read again, closed, and not found by its name.
    */
@@ -705,6 +743,36 @@ describe('AgentSession project names', () => {
     expect(fromNew.done).toBe(false);
     await vi.advanceTimersByTimeAsync(200);
     expect(fromNew).toEqual({ done: true, value: { id: made } });
+  });
+
+  /*
+   * While storage lists slowly, a name that a loaded project has waits for the new listing until the
+   * deadline; not at all while a read of that project that a request stopped waiting for goes on
+   * (Room.storageLate): the last listing answers at once.
+   */
+  it('does not wait for a slow listing while a read of the loaded project of that name is late', async () => {
+    const fs = new NamesStore();
+    const waitMs = 5000;
+    const { rooms, store, session } = setup({ fs, openReadWaitMs: waitMs });
+    const loaded = await rooms.createProject({ name: 'Harbour light', empty: true });
+    const stored = await storedOnly(store!, 'Harbour light');
+    fs.listDelayMs = 6000;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    // the first listing takes 6 s
+    const first = track(session().findProject('Harbour light'));
+    await vi.advanceTimersByTimeAsync(6001);
+    expect(first).toMatchObject({ done: true, value: { id: loaded.id } });
+    expect(loaded.storageLate).toBe(false);
+    let release!: () => void;
+    loaded.readIsLate(new Promise<void>((resolve) => (release = resolve)));
+    const second = track(failure(session().findProject('Harbour light')));
+    await vi.advanceTimersByTimeAsync(1);
+    expect(second).toEqual({
+      done: true,
+      value: `Several projects are named 'Harbour light': ${loaded.id}, ${stored}. Pass the project id instead. Storage took longer than 5 s to list its projects, so the projects in storage were compared as it listed them less than 1 s ago.`,
+    });
+    release();
+    await vi.advanceTimersByTimeAsync(6001);
   });
 
   /*

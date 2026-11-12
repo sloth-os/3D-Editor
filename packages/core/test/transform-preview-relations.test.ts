@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   FrameState,
   ObjectTransform,
@@ -843,6 +843,211 @@ describe('Edit Mode reads the edited object where the scene shows it, also on a 
       return k === 0 ? c[0] - y : k === 1 ? c[1] + x : v;
     });
     expect(maxRel(verts(), turned)).toBeLessThan(1e-6);
+  });
+});
+
+describe('the snap, parent, origin and join operators read objects on a dependency cycle where the viewport shows them', () => {
+  /** World position of the origin of `id`, as the viewport shows it. */
+  const shownAt = (doc: SceneDoc, id: string): Vec3 => {
+    const w = settled(new FrameState(doc, 1)).world(id)!;
+    return [w[12], w[13], w[14]];
+  };
+
+  /** World positions of the vertices of mesh object `id`, as the viewport shows them. */
+  const shownVertices = (doc: SceneDoc, id: string): number[] => {
+    const p = doc.getMesh(doc.getObject(id)!.data!)!.positions;
+    const w = settled(new FrameState(doc, 1)).world(id)!;
+    const out: number[] = [];
+    for (let i = 0; i < p.length; i += 3)
+      for (let k = 0; k < 3; k++)
+        out.push(w[k] * p[i] + w[4 + k] * p[i + 1] + w[8 + k] * p[i + 2] + w[12 + k]);
+    return out;
+  };
+
+  /** A cube 'M' parented to bone B0 of the pose cycle (it reads the cycle), with a child empty 'C'. */
+  function cubeOnCycle() {
+    const scene = poseCycleScene();
+    const ctx = context(scene.doc);
+    expect(reg.run(ctx, 'mesh.primitive_cube_add', { name: 'M', size: 0.2 }).ok).toBe(true);
+    const m = ctx.state.activeId!;
+    scene.doc.updateObject(m, {
+      parent: scene.rig,
+      parent_type: 'BONE',
+      parent_bone: 'B0',
+      location: [0.2, 0, 0.1],
+    });
+    const c = scene.doc.addObject({ type: 'EMPTY', name: 'C', parent: m, location: [0, 0.5, 0] });
+    expect(new FrameState(scene.doc, 1).world(m)).toBeNull();
+    return { ...scene, ctx, m, c };
+  }
+
+  it('puts the 3D cursor where the viewport shows the selected or active object', () => {
+    const { doc, x, shown } = poseCycleScene();
+    for (const op of ['view3d.snap_cursor_to_selected', 'view3d.snap_cursor_to_active']) {
+      const ctx = context(doc);
+      Object.assign(ctx.state, { selectedIds: [x], activeId: x });
+      expect(reg.run(ctx, op, {}).ok).toBe(true);
+      expect(maxRel(ctx.state.cursorLocation, [shown[12], shown[13], shown[14]]), op).toBeLessThan(1e-12);
+    }
+  });
+
+  it('puts the 3D cursor on the selected vertices where the viewport shows them', () => {
+    const { doc, ctx, m } = cubeOnCycle();
+    const verts = shownVertices(doc, m);
+    expect(reg.run(ctx, 'object.mode_set', { mode: 'EDIT' }).ok).toBe(true);
+    expect(reg.run(ctx, 'mesh.select_all', { action: 'SELECT' }).ok).toBe(true);
+    expect(reg.run(ctx, 'view3d.snap_cursor_to_selected', {}).ok).toBe(true);
+    const n = verts.length / 3;
+    const median = [0, 1, 2].map((k) => verts.reduce((s, v, i) => (i % 3 === k ? s + v / n : s), 0));
+    expect(maxRel(ctx.state.cursorLocation, median)).toBeLessThan(1e-6);
+  });
+
+  it('snaps the object to the cursor and to the grid from where the viewport shows it', () => {
+    for (const [op, params, expected] of [
+      ['view3d.snap_selected_to_cursor', {}, [1, 2, 3]],
+      ['view3d.snap_selected_to_cursor', { use_offset: true }, [1, 2, 3]],
+      ['view3d.snap_selected_to_grid', { grid_size: 0.5 }, null],
+    ] as const) {
+      const { doc, x, shown } = poseCycleScene();
+      const ctx = context(doc);
+      Object.assign(ctx.state, { selectedIds: [x], activeId: x, cursorLocation: [1, 2, 3] });
+      expect(reg.run(ctx, op, params).ok).toBe(true);
+      const grid = [shown[12], shown[13], shown[14]].map((v) => Math.round(v / 0.5) * 0.5);
+      expect(maxRel(shownAt(doc, x), expected ?? grid), op).toBeLessThan(1e-9);
+    }
+  });
+
+  it('keeps the transform of an object that reads the cycle, or of one parented to it, where the viewport shows it', () => {
+    // Clear Parent, Parent to an object, and an object parented to one that reads the cycle
+    for (const op of ['clear', 'set', 'to'] as const) {
+      const { doc, x, shown } = poseCycleScene();
+      const u = doc.addObject({
+        type: 'EMPTY',
+        name: 'U',
+        location: [3, -1, 2],
+        rotation_euler: [0, 0.4, 0],
+      });
+      const ctx = context(doc);
+      const keep = (id: string, before: Vec3) =>
+        expect(maxRel(shownAt(doc, id), before), op).toBeLessThan(1e-9);
+      if (op === 'clear') {
+        Object.assign(ctx.state, { selectedIds: [x], activeId: x });
+        expect(reg.run(ctx, 'object.parent_clear', { type: 'CLEAR_KEEP_TRANSFORM' }).ok).toBe(true);
+        keep(x, [shown[12], shown[13], shown[14]]);
+      } else if (op === 'set') {
+        Object.assign(ctx.state, { selectedIds: [x, u], activeId: u });
+        expect(reg.run(ctx, 'object.parent_set', { type: 'OBJECT' }).ok).toBe(true);
+        expect(doc.getObject(x)!.parent).toBe(u);
+        keep(x, [shown[12], shown[13], shown[14]]);
+      } else {
+        const before = shownAt(doc, u);
+        expect(reg.run(ctx, 'object.parent_to', { objects: ['U'], parent: 'X' }).ok).toBe(true);
+        keep(u, before);
+      }
+    }
+  });
+
+  it('sets the origin of a mesh that reads the cycle without moving its geometry or its child', () => {
+    const { doc, ctx, m, c } = cubeOnCycle();
+    const verts = shownVertices(doc, m);
+    const child = shownAt(doc, c);
+    Object.assign(ctx.state, { selectedIds: [m], activeId: m, cursorLocation: [0.5, -0.2, 1.1] });
+    expect(reg.run(ctx, 'object.origin_set', { type: 'ORIGIN_CURSOR' }).ok).toBe(true);
+    expect(maxRel(shownAt(doc, m), [0.5, -0.2, 1.1])).toBeLessThan(1e-6);
+    expect(maxRel(shownVertices(doc, m), verts)).toBeLessThan(1e-6);
+    expect(maxRel(shownAt(doc, c), child)).toBeLessThan(1e-9);
+  });
+
+  it('sets the origin of a curve that reads the cycle without moving its points', () => {
+    const { doc, rig } = poseCycleScene();
+    const ctx = context(doc);
+    const data = doc.addCurve({
+      splines: [
+        { ...defaultSpline('POLY'), points: [defaultSplinePoint([0, 0, 0]), defaultSplinePoint([1, 0, 0])] },
+      ],
+    });
+    const k = doc.addObject({
+      type: 'CURVE',
+      name: 'K',
+      data,
+      parent: rig,
+      parent_type: 'BONE',
+      parent_bone: 'B0',
+      location: [0.2, 0, 0.1],
+    });
+    expect(new FrameState(doc, 1).world(k)).toBeNull();
+    const points = () => {
+      const w = settled(new FrameState(doc, 1)).world(k)!;
+      return doc
+        .getCurve(data)!
+        .splines[0].points.flatMap(({ co: p }) =>
+          [0, 1, 2].map((j) => w[j] * p[0] + w[4 + j] * p[1] + w[8 + j] * p[2] + w[12 + j]),
+        );
+    };
+    const before = points();
+    Object.assign(ctx.state, { selectedIds: [k], activeId: k, cursorLocation: [0.5, -0.2, 1.1] });
+    expect(reg.run(ctx, 'object.origin_set', { type: 'ORIGIN_CURSOR' }).ok).toBe(true);
+    expect(maxRel(shownAt(doc, k), [0.5, -0.2, 1.1])).toBeLessThan(1e-9);
+    expect(maxRel(points(), before)).toBeLessThan(1e-9);
+  });
+
+  it('lists the drivers once for all the objects it reads, not once per object', () => {
+    // 50 selected objects that read nothing: each is checked for a driver of its channels
+    const { doc } = poseCycleScene();
+    const ids = Array.from({ length: 50 }, (_, i) =>
+      doc.addObject({ type: 'EMPTY', name: `E${i}`, location: [i, 0, 0] }),
+    );
+    const ctx = context(doc);
+    Object.assign(ctx.state, { selectedIds: ids, activeId: ids[0] });
+    const spy = vi.spyOn(doc, 'listDrivers');
+    expect(reg.run(ctx, 'view3d.snap_cursor_to_selected', {}).ok).toBe(true);
+    // the frame state reads them once, the check of the 50 objects once
+    expect(spy.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(ctx.state.cursorLocation).toEqual([24.5, 0, 0]);
+  });
+
+  it('joins a mesh that reads the cycle where the viewport shows it', () => {
+    const { doc, ctx, m } = cubeOnCycle();
+    const verts = shownVertices(doc, m);
+    expect(reg.run(ctx, 'mesh.primitive_cube_add', { name: 'A', size: 0.2, location: [3, 0, 0] }).ok).toBe(
+      true,
+    );
+    const a = ctx.state.activeId!;
+    Object.assign(ctx.state, { selectedIds: [m, a], activeId: a });
+    expect(reg.run(ctx, 'object.join', {}).ok).toBe(true);
+    // the active cube's 8 vertices, then the joined ones
+    expect(maxRel(shownVertices(doc, a).slice(24), verts)).toBeLessThan(1e-6);
+  });
+
+  it('joins into an active mesh that reads the cycle, the joined mesh staying where the viewport showed it', () => {
+    const { doc, ctx, m } = cubeOnCycle();
+    expect(reg.run(ctx, 'mesh.primitive_cube_add', { name: 'A', size: 0.2, location: [3, 0, 0] }).ok).toBe(
+      true,
+    );
+    const a = ctx.state.activeId!;
+    const own = shownVertices(doc, m);
+    const joined = shownVertices(doc, a);
+    Object.assign(ctx.state, { selectedIds: [m, a], activeId: m });
+    expect(reg.run(ctx, 'object.join', {}).ok).toBe(true);
+    expect(doc.getObject(a)).toBeNull();
+    // the active cube's 8 vertices where they were, then A's
+    expect(maxRel(shownVertices(doc, m), [...own, ...joined])).toBeLessThan(1e-6);
+  });
+
+  it('moves the selection by the offset of an active object that reads the cycle to the cursor (Active Element pivot)', () => {
+    const { doc, x, shown } = poseCycleScene();
+    const u = doc.addObject({ type: 'EMPTY', name: 'U', location: [4, 0, 0] });
+    const ctx = context(doc);
+    Object.assign(ctx.state, {
+      selectedIds: [u, x],
+      activeId: x,
+      cursorLocation: [1, 2, 3],
+      pivotPoint: 'ACTIVE_ELEMENT',
+    });
+    expect(reg.run(ctx, 'view3d.snap_selected_to_cursor', { use_offset: true }).ok).toBe(true);
+    // X, shown at the cursor; U moved as much
+    expect(maxRel(shownAt(doc, x), [1, 2, 3])).toBeLessThan(1e-9);
+    expect(maxRel(shownAt(doc, u), [4 + 1 - shown[12], 2 - shown[13], 3 - shown[14]])).toBeLessThan(1e-9);
   });
 });
 

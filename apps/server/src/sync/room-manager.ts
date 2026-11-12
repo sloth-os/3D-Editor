@@ -16,7 +16,7 @@ import { errorMessage, withSpan } from '../observability/tracing';
 import { trackOpenRoom } from '../render/memory';
 import { Room, STORAGE_ORIGIN, settlesBefore, type DeletionOutcome, type ProjectListing } from './room';
 import { ProjectMemoryError, loadRefusal, type GrowthCheck, type HeapProbe } from './project-memory';
-import { measureUpdate } from './update-size';
+import { measureUpdate, yjsReadError, type UpdateSize } from './update-size';
 
 export class StorageUnavailableError extends Error {
   constructor(message: string) {
@@ -471,15 +471,32 @@ export class RoomManager {
    * Throws a {@link ProjectMemoryError} (code OUT_OF_MEMORY) when loading the stored document
    * `update` of project `id`, and saving it once, would not fit into the server's free heap
    * (project-memory.ts loadRefusal), instead of letting the load end the server. A document the
-   * measure cannot read is loaded as before (Yjs decides).
+   * measure cannot read is loaded without the check (a warning) when Yjs reads all of it
+   * (update-size.ts yjsReadError); one that Yjs cannot read either is not loaded: an error, before
+   * Yjs adds the structs it read to a document and fails on the rest.
    */
   private checkLoad(id: string, update: Uint8Array, info: ProjectInfo | null): void {
-    let refused: string | null;
+    let size: UpdateSize;
     try {
-      refused = loadRefusal({ id, name: info?.name ?? id }, measureUpdate(update), this.opts.heap);
-    } catch {
+      size = measureUpdate(update);
+    } catch (err) {
+      const unreadable = yjsReadError(update);
+      if (unreadable !== null) {
+        this.opts.log.warn(
+          { project: id, err: unreadable },
+          'project not loaded: its stored document cannot be read',
+        );
+        throw new Error(`could not load project ${id}: its stored document cannot be read (${unreadable})`, {
+          cause: err,
+        });
+      }
+      this.opts.log.warn(
+        { project: id, bytes: update.byteLength, err: errorMessage(err) },
+        'project loaded without the memory check: the measure could not read its stored document',
+      );
       return;
     }
+    const refused = loadRefusal({ id, name: info?.name ?? id }, size, this.opts.heap);
     if (!refused) return;
     this.opts.log.warn({ project: id, err: refused }, 'project not loaded: the server cannot hold it');
     throw new ProjectMemoryError(refused);

@@ -42,11 +42,25 @@ export function Modal(p: {
   footer?: ComponentChildren;
   width?: string;
   testId?: string;
-  /** Close when the backdrop is clicked (default true; e.g. false while a render runs). */
+  /** Close when the backdrop is clicked or Escape is pressed (default true; e.g. false while a render runs). */
   dismissible?: boolean;
 }) {
+  const dismissible = p.dismissible !== false;
+  // Escape closes the dialog wherever the focus is in it: on the window, after the fields in the dialog
+  // (a text or number entry being typed in uses an Escape to cancel the typing and stops it) and after
+  // the render windows' own handler (an Escape that stops a running render keeps the window open)
+  useEffect(() => {
+    if (!dismissible) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+      e.preventDefault();
+      closeDialog();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [dismissible]);
   return (
-    <div class="modal-backdrop" onPointerDown={p.dismissible === false ? undefined : closeDialog}>
+    <div class="modal-backdrop" onPointerDown={dismissible ? closeDialog : undefined}>
       <div
         class="modal"
         style={{ width: p.width }}

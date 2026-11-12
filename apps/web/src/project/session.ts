@@ -649,12 +649,13 @@ export class ProjectSession {
    */
   async flush(): Promise<SaveReport> {
     // after a refusal for memory, the server takes the project again first (WebDAV through it waits
-    // for that); after a deletion, the save stores it again first (the server then opens it again)
+    // for that); after a deletion, the save stores it again first (the server then opens it again).
+    // One connection per Save: none again once the server refused it (it would only refuse it again)
     if (this.provider?.status.value === 'refused') this.provider.reconnect();
     const report: SaveReport = this.webdav
       ? await this.webdav.save()
       : { message: 'Saved in this browser', level: 'info' };
-    this.provider?.reconnect();
+    if (this.provider?.status.value !== 'refused') this.provider?.reconnect();
     return report;
   }
 

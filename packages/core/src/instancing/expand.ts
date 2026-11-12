@@ -753,6 +753,10 @@ class Expander {
             return d?.mesh ? { mesh: d.mesh, matrix: d.worldMatrix } : null;
           },
           getObjectMatrix: (id) => byId.get(id)?.worldMatrix ?? null,
+          // the types of the objects its modifiers name, as the scene's evaluation gives them
+          // (evaluate.ts): Blender's is_disabled leaves out the same modifiers here, an Array whose
+          // start cap is a text, a Boolean whose object is a curve, …
+          getObjectType: (id) => byId.get(id)?.type ?? null,
           vertexGroups: meshId ? doc.getVertexGroups(meshId) : undefined,
         }).mesh;
       } catch {

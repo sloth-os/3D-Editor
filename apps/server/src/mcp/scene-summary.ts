@@ -375,7 +375,8 @@ function sameProblem(p: unknown): string {
  * Blender's is_disabled leaves out (modifierDisabledMessage: a Boolean without a mesh object, a
  * Subdivision Surface with 0 levels, …), which changes nothing there. One that only the viewport's
  * settings disable (a Subdivision Surface with 0 levels and render_levels above 0, a common way to
- * keep the viewport light) is used by renders, so it is not one to remove.
+ * keep the viewport light) is used by renders, and one that only the render settings disable (0
+ * render_levels and levels above 0) is used by the viewport, so neither is one to remove.
  */
 function problemsOf(scene: SceneDoc, ev: EvaluatedScene, forRender: boolean): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = ev.errors.map((e) => describeProblem(scene, e));
@@ -400,18 +401,20 @@ function problemsOf(scene: SceneDoc, ev: EvaluatedScene, forRender: boolean): Re
       if (!isModifierEnabled(m, { forRender, editMode: false })) continue;
       const disabled = modifierDisabledMessage(m, disabledCtx);
       if (!disabled) continue;
-      const rendered =
-        !forRender &&
-        isModifierEnabled(m, { forRender: true, editMode: false }) &&
-        !modifierDisabledReason(m, { ...disabledCtx, forRender: true });
+      // the other evaluation runs it and its settings there do not disable it: not one to remove
+      const usedInOther =
+        isModifierEnabled(m, { forRender: !forRender, editMode: false }) &&
+        !modifierDisabledReason(m, { ...disabledCtx, forRender: !forRender });
       out.push({
         source: 'modifier',
         object: o.name,
         modifier: m.name,
         disabled: true,
-        message: rendered
-          ? `Modifier is disabled: ${disabled} in the viewport; renders use it`
-          : `Modifier is disabled: ${disabled}; change it with update_modifier or remove it with remove_modifier`,
+        message: !usedInOther
+          ? `Modifier is disabled: ${disabled}; change it with update_modifier or remove it with remove_modifier`
+          : forRender
+            ? `Modifier is disabled: ${disabled} in renders; the viewport uses it`
+            : `Modifier is disabled: ${disabled} in the viewport; renders use it`,
       });
     }
   }

@@ -2,11 +2,16 @@ import * as THREE from 'three';
 import {
   ObjectTransform,
   axisAngle4,
+  cross3,
+  identity4,
+  invert4,
   normalize3,
+  orientAxes,
   scaling4,
   selectedVertexSet,
   selectionPivot,
   shownWorld,
+  transformDirection3,
   transformFrameState,
   transformVertices,
   translation4,
@@ -19,6 +24,10 @@ import type { ProjectSession } from '../project/session';
 
 export type ModalKind = 'translate' | 'rotate' | 'resize';
 type Axis = 'X' | 'Y' | 'Z';
+/** The axes a constraint is in: the world's, or the active object's (Blender's LOCAL orientation). */
+export type ConstraintOrientation = 'GLOBAL' | 'LOCAL';
+
+const AXIS_INDEX: Record<Axis, 0 | 1 | 2> = { X: 0, Y: 1, Z: 2 };
 
 const AXES: Record<Axis, THREE.Vector3> = {
   X: new THREE.Vector3(1, 0, 0),
@@ -40,7 +49,8 @@ const MODES: Record<ModalKind, TransformMode> = {
 
 /**
  * Interactive G / R / S transform (Blender style): mouse-driven with axis/plane constraints
- * (X/Y/Z, Shift+X/Y/Z), typed numeric input, Ctrl snapping and Shift precision.
+ * (X/Y/Z, Shift+X/Y/Z; for a move or rotation pressed again in the active object's axes, see
+ * {@link setAxis}), typed numeric input, Ctrl snapping and Shift precision.
  * The preview is local only; confirming runs the equivalent core operator so the result is one
  * undo step that syncs to every device. The preview shows what confirming stores: every object the
  * transform can move is drawn with the world matrix the scene evaluates once the operator stored
@@ -57,6 +67,19 @@ export class ModalTransform {
   private last: { x: number; y: number };
   axis: Axis | null = null;
   planeExclude = false;
+  /**
+   * Blender's orientation slots of a transform (t->orient, set in initTransInfo,
+   * transform_generics.cc): the default and the scene's orientation (the editor's transform
+   * orientation), then the other one (LOCAL when the scene's is GLOBAL, else GLOBAL). The
+   * constraint is in the slot `orientSlot` (t->orient_curr), 0 while there is none (see setAxis).
+   * A scale has the world's axes only (see the constructor).
+   */
+  private readonly orientSlots: readonly ConstraintOrientation[];
+  private orientSlot = 0;
+  /** The LOCAL axes, as the operator confirming the transform reads them (read when first needed). */
+  private localAxesRead: Mat4 | null = null;
+  /** A move's value in the axes of its constraint's orientation (what transform.translate stores). */
+  private moveValue: Vec3 = [0, 0, 0];
   numeric = '';
   private angleAcc = 0;
   private lastAngle: number;
@@ -79,6 +102,14 @@ export class ModalTransform {
     mouse: { x: number; y: number },
   ) {
     const { doc, state } = session;
+    // the editor's orientations other than GLOBAL and LOCAL cannot be set (the operators take only
+    // those two): they count as GLOBAL
+    const scene: ConstraintOrientation = state.transformOrientation === 'LOCAL' ? 'LOCAL' : 'GLOBAL';
+    // a scale is confirmed by transform.resize, which scales along the world's axes only (it takes
+    // no orient_type, unlike Blender's Scale): its axis keys constrain along those, and a second
+    // press removes the constraint
+    this.orientSlots =
+      kind === 'resize' ? ['GLOBAL', 'GLOBAL'] : [scene, scene, scene === 'GLOBAL' ? 'LOCAL' : 'GLOBAL'];
     // what the operator reads when the transform is confirmed: the scene at the current frame, as
     // the viewport shows it (rigid bodies where the simulation has them)
     const fs = transformFrameState(doc, state.frame);
@@ -111,13 +142,56 @@ export class ModalTransform {
     return this.editBase ? this.editBase.verts.size === 0 : !this.objects?.targets.length;
   }
 
+  /** The orientation of the constraint's axes (that of the slot it is in; see {@link setAxis}). */
+  get orientation(): ConstraintOrientation {
+    return this.orientSlots[this.orientSlot];
+  }
+
+  /**
+   * An axis key (X, Y, Z; with Shift the plane without that axis), as Blender's
+   * transform_event_modal_constraint (transform.cc) takes it: the first press constrains in the
+   * scene's orientation (the editor's transform orientation, GLOBAL by default), the same key again
+   * in the next slot's (LOCAL after GLOBAL: the active object's axes, as transform.translate and
+   * transform.rotate take them with orient_type LOCAL), a third press removes the constraint;
+   * another axis or plane constrains in the scene's orientation again. A scale has no LOCAL slot
+   * (see orientSlots): its second press removes the constraint.
+   */
   setAxis(axis: Axis, exclude: boolean): void {
-    if (this.axis === axis && this.planeExclude === exclude) this.axis = null;
+    const same = this.axis === axis && this.planeExclude === exclude;
+    const slots = this.orientSlots.length;
+    this.orientSlot = this.orientSlot === 0 || this.axis === null || same ? (this.orientSlot + 1) % slots : 1;
+    if (this.orientSlot === 0) this.axis = null;
     else {
       this.axis = axis;
       this.planeExclude = exclude;
     }
     this.update(this.last, { ctrl: false, shift: false });
+  }
+
+  /** Whether the constraint is in the active object's axes (LOCAL). */
+  private get local(): boolean {
+    return this.axis !== null && this.orientation === 'LOCAL';
+  }
+
+  /**
+   * The axes of the LOCAL orientation (columns X, Y, Z) as transform.translate and transform.rotate
+   * read them for orient_type LOCAL when the transform is confirmed (orientationOf in core's
+   * transform.ts): the active object's (see orientAxes), the world's without an active object.
+   */
+  private get localAxes(): Mat4 {
+    if (!this.localAxesRead) {
+      const { doc, state } = this.session;
+      const active = state.activeId ? doc.getObject(state.activeId) : null;
+      this.localAxesRead = active
+        ? orientAxes(transformFrameState(doc, state.frame), active.id)
+        : identity4();
+    }
+    return this.localAxesRead;
+  }
+
+  /** The axes of the constraint's orientation, or null for the world's. */
+  private constraintAxes(): Mat4 | null {
+    return this.local ? this.localAxes : null;
   }
 
   typeKey(key: string): boolean {
@@ -130,8 +204,13 @@ export class ModalTransform {
     return true;
   }
 
+  /** The constraint's axis in world space (unit length; for a plane, the axis it leaves out). */
   private axisVec(): THREE.Vector3 | null {
-    return this.axis ? AXES[this.axis].clone() : null;
+    if (!this.axis) return null;
+    const o = this.constraintAxes();
+    if (!o) return AXES[this.axis].clone();
+    const k = AXIS_INDEX[this.axis] * 4;
+    return new THREE.Vector3(o[k], o[k + 1], o[k + 2]);
   }
 
   update(mouse: { x: number; y: number }, mods: { ctrl: boolean; shift: boolean }): void {
@@ -152,37 +231,59 @@ export class ModalTransform {
     this.preview();
   }
 
+  /**
+   * A move: its value in the axes of the constraint's orientation (the world's without a LOCAL
+   * constraint), which is what the header shows and what confirming stores, and the world offset
+   * the operator computes from it (transform.translate turns a LOCAL value into the world with the
+   * same axes).
+   */
   private computeTranslate(m: { x: number; y: number }, num: number | null, snap: boolean): Mat4 {
     const e = this.engine;
-    let delta = new THREE.Vector3();
+    const o = this.constraintAxes();
     const axis = this.axisVec();
+    const k = this.axis ? AXIS_INDEX[this.axis] : 0;
+    let value: Vec3 = [0, 0, 0];
     if (num !== null) {
-      delta = (axis && !this.planeExclude ? axis : AXES.X.clone()).multiplyScalar(num);
+      // a typed value moves along the constraint's axis or the first axis its plane keeps (Blender's
+      // constraintNumInput), along X without a constraint
+      value[this.axis && this.planeExclude ? (k === 0 ? 1 : 0) : k] = num;
     } else if (axis && !this.planeExclude) {
       const a = this.closestOnAxis(this.start, axis);
       const b = this.closestOnAxis(m, axis);
-      if (a && b) delta = axis.clone().multiplyScalar(b - a);
+      if (a !== null && b !== null) value[k] = b - a;
     } else if (axis && this.planeExclude) {
-      const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(axis, this.pivot);
+      // the plane through the pivot that holds the two other axes of the orientation
+      const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(this.planeNormal(), this.pivot);
       const p0 = e.rayAt(this.start.x, this.start.y).ray.intersectPlane(plane, new THREE.Vector3());
       const p1 = e.rayAt(m.x, m.y).ray.intersectPlane(plane, new THREE.Vector3());
-      if (p0 && p1) delta = p1.sub(p0);
+      if (p0 && p1) {
+        const d = p1.sub(p0);
+        value = o ? transformDirection3(invert4(o), [d.x, d.y, d.z]) : [d.x, d.y, d.z];
+        value[k] = 0;
+      }
     } else {
       const p0 = e.viewPlanePoint(this.start.x, this.start.y, this.pivot);
       const p1 = e.viewPlanePoint(m.x, m.y, this.pivot);
-      if (p0 && p1) delta = p1.sub(p0);
+      if (p0 && p1) value = p1.sub(p0).toArray();
     }
     if (snap && num === null) {
       // the grid's step in the view drawn (also during an animated view change)
       const inc = this.engine.shownPose.distance > 4 ? 1 : 0.1;
-      delta.set(
-        Math.round(delta.x / inc) * inc,
-        Math.round(delta.y / inc) * inc,
-        Math.round(delta.z / inc) * inc,
-      );
+      value = value.map((v) => Math.round(v / inc) * inc) as Vec3;
     }
-    this.summary = `D: ${delta.x.toFixed(4)} m  ${delta.y.toFixed(4)} m  ${delta.z.toFixed(4)} m (${delta.length().toFixed(4)} m)`;
-    return translation4([delta.x, delta.y, delta.z]);
+    this.moveValue = value;
+    const len = Math.hypot(...value);
+    this.summary = `D: ${value[0].toFixed(4)} m  ${value[1].toFixed(4)} m  ${value[2].toFixed(4)} m (${len.toFixed(4)} m)`;
+    return translation4(o ? transformDirection3(o, value) : value);
+  }
+
+  /** The normal of a plane constraint's plane: across the two axes of the orientation it keeps. */
+  private planeNormal(): THREE.Vector3 {
+    const k = AXIS_INDEX[this.axis ?? 'X'];
+    const o = this.constraintAxes();
+    if (!o) return AXES[this.axis ?? 'X'].clone();
+    const col = (i: number): Vec3 => [o[i * 4], o[i * 4 + 1], o[i * 4 + 2]];
+    return new THREE.Vector3(...normalize3(cross3(col((k + 1) % 3), col((k + 2) % 3))));
   }
 
   /** Parameter along an axis line through the pivot closest to the mouse ray. */
@@ -219,10 +320,16 @@ export class ModalTransform {
     if (this.axis && axis.dot(toViewer) < 0) angle = -angle;
     if (num !== null) angle = THREE.MathUtils.degToRad(num);
     else if (snap) angle = THREE.MathUtils.degToRad(Math.round(THREE.MathUtils.radToDeg(angle) / 5) * 5);
+    this.rotAngle = angle;
+    this.summary = `Rot: ${THREE.MathUtils.radToDeg(angle).toFixed(2)}°`;
+    if (this.local) {
+      // the axis transform.rotate takes for orient_type LOCAL and orient_axis: the column of the
+      // LOCAL axes as it is, so the preview shows exactly what confirming stores
+      this.rotAxis = [axis.x, axis.y, axis.z];
+      return axisAngle4(this.rotAxis, angle);
+    }
     axis = axis.normalize();
     this.rotAxis = [axis.x, axis.y, axis.z];
-    this.rotAngle = angle;
-    this.summary = `Rot: ${THREE.MathUtils.radToDeg(angle).toFixed(2)}°${this.axis ? ` along ${this.axis}` : ''}`;
     // the matrix transform.rotate builds from the parameters confirming passes (it normalizes the
     // axis again, which can change its last bits), so the preview shows exactly what it stores
     return axisAngle4(normalize3(this.rotAxis), angle);
@@ -237,7 +344,7 @@ export class ModalTransform {
     if (snap && num === null) f = Math.round(f * 10) / 10;
     let s: Vec3 = [f, f, f];
     if (this.axis) {
-      const i = { X: 0, Y: 1, Z: 2 }[this.axis];
+      const i = AXIS_INDEX[this.axis];
       s = this.planeExclude
         ? ([f, f, f].map((v, k) => (k === i ? 1 : v)) as Vec3)
         : ([1, 1, 1].map((v, k) => (k === i ? f : v)) as Vec3);
@@ -269,7 +376,10 @@ export class ModalTransform {
       // the channels confirming stores, and the world matrices the scene evaluates from them
       this.engine.setMatrixOverrides(this.previewMatrices());
     }
-    const constraint = this.axis ? `${this.planeExclude ? 'plane ⟂ ' : 'along '}${this.axis}` : '';
+    // Blender's header: "along global X", "along local X", "locking local X" (a plane constraint)
+    const constraint = this.axis
+      ? `${this.planeExclude ? 'locking' : 'along'} ${this.orientation.toLowerCase()} ${this.axis}`
+      : '';
     this.session.view.hud.value = `${this.summary}${constraint ? `  ${constraint}` : ''}${this.numeric ? `  [${this.numeric}]` : ''}`;
   }
 
@@ -294,14 +404,20 @@ export class ModalTransform {
     this.session.view.hud.value = null;
     if (!confirm) return null;
     const pivot: Vec3 = [this.pivot.x, this.pivot.y, this.pivot.z];
+    // a constraint in the active object's axes is stored as one: orient_type LOCAL, with the value
+    // (and the rotation's axis) in those axes, as Blender's operators store it
+    const local = this.local ? { orient_type: 'LOCAL' } : {};
     if (this.kind === 'translate') {
       const c = this.current;
-      return { operator: 'transform.translate', params: { value: [c[12], c[13], c[14]] } };
+      const value = this.local ? [...this.moveValue] : [c[12], c[13], c[14]];
+      return { operator: 'transform.translate', params: { value, ...local } };
     }
     if (this.kind === 'rotate')
       return {
         operator: 'transform.rotate',
-        params: { value: this.rotAngle, axis: this.rotAxis, center: pivot },
+        params: this.local
+          ? { value: this.rotAngle, orient_axis: this.axis, ...local, center: pivot }
+          : { value: this.rotAngle, axis: this.rotAxis, center: pivot },
       };
     return { operator: 'transform.resize', params: { value: this.scaleValue, center: pivot } };
   }

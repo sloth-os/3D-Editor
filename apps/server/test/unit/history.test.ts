@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { AgentHistory } from '../../src/mcp/history';
+import { AgentHistory, historyKept, KEPT_CONTAINER_ITEM_BYTES } from '../../src/mcp/history';
 
 /*
  * Bounded undo histories of MCP agents (apps/server/src/mcp/history.ts). Yjs keeps every item a
@@ -52,6 +52,73 @@ function retained(doc: Y.Doc): { items: number; bytes: number } {
 }
 
 const tagOf = (v: unknown) => (v instanceof Uint8Array ? v[0] : null);
+
+/** Size of a value as the test counts it (bytes of binary data, 8 per number, 1 per character). */
+const sizeOf = (v: unknown): number =>
+  v instanceof Uint8Array
+    ? v.byteLength
+    : Array.isArray(v)
+      ? v.reduce((t: number, x) => t + sizeOf(x), 0)
+      : v !== null && typeof v === 'object'
+        ? Object.values(v).reduce((t: number, x) => t + sizeOf(x), 0)
+        : typeof v === 'string'
+          ? v.length
+          : 8;
+
+/**
+ * Deleted values of any kind (JSON-like values, strings, binary data) whose content the document
+ * still holds, counted one by one (Yjs merges consecutive deleted values into one item), and the
+ * deleted containers it still holds.
+ */
+function held(doc: Y.Doc): { values: number; bytes: number; containers: number } {
+  let values = 0;
+  let bytes = 0;
+  let containers = 0;
+  for (const structs of doc.store.clients.values())
+    for (const s of structs) {
+      if (!(s instanceof Y.Item) || !s.deleted || s.content instanceof Y.ContentDeleted) continue;
+      if (s.content instanceof Y.ContentType) containers++;
+      else
+        for (const v of s.content.getContent()) {
+          values++;
+          bytes += sizeOf(v);
+        }
+    }
+  return { values, bytes, containers };
+}
+
+/**
+ * Deleted values the document holds although no live undo or redo step of `histories` needs them
+ * (after maintenance there must be none: what no step needs is collected).
+ */
+function orphans(doc: Y.Doc, histories: AgentHistory[]): number {
+  const live = Y.mergeDeleteSets(
+    histories.flatMap((h) => [...h.undo.undoStack, ...h.undo.redoStack].map((st) => st.deletions)),
+  );
+  let n = 0;
+  for (const structs of doc.store.clients.values())
+    for (const s of structs) {
+      if (!(s instanceof Y.Item) || !s.deleted) continue;
+      if (s.content instanceof Y.ContentDeleted || s.content instanceof Y.ContentType) continue;
+      for (let c = 0; c < s.length; c++) if (!Y.isDeleted(live, Y.createID(s.id.client, s.id.clock + c))) n++;
+    }
+  return n;
+}
+
+/** A value the fuzz tests write to `field`: binary data, a string, numbers, or groups with weights. */
+function fieldValue(field: string, tag: number): unknown {
+  if (field === 'data') return blob(tag, 64);
+  if (field === 'name') return `n${tag}`;
+  if (field === 'vg')
+    return [
+      { name: `g${tag}`, weights: blob(tag, 24) },
+      { name: 'h', weights: blob(tag + 1, 24) },
+    ];
+  return [tag, tag + 0.5, tag + 1];
+}
+
+/** A JSON-like value of `n` numbers (an agent's vertex group weights, a shape key …). */
+const numbers = (tag: number, n = 2_000) => Array.from({ length: n }, (_, k) => tag * 10_000 + k);
 
 describe('AgentHistory', () => {
   it('collects data created and deleted within one step; undo and redo still work', () => {
@@ -243,14 +310,14 @@ describe('AgentHistory', () => {
           const n = 1 + Math.floor(rnd() * 3);
           for (let k = 0; k < n; k++) {
             const key = pick(['o1', 'o2', 'o3']);
-            const field = pick(['data', 'name', 'loc']);
+            const field = pick(['data', 'name', 'loc', 'vg']);
             const kind = rnd();
             const tag = Math.floor(rnd() * 250);
             ops.push((d) => {
               const o = d.root.get(key);
               if (kind < 0.2) d.root.set(key, new Y.Map());
               else if (kind < 0.3) d.root.delete(key);
-              else if (o instanceof Y.Map) o.set(field, field === 'data' ? blob(tag, 64) : [tag, tag + 1]);
+              else if (o instanceof Y.Map) o.set(field, fieldValue(field, tag));
               else d.root.set(key, blob(tag, 32));
             });
           }
@@ -277,11 +344,14 @@ describe('AgentHistory', () => {
         expect(JSON.stringify(a.root.toJSON()), `seed ${seed} op ${i} (${choice})`).toBe(
           JSON.stringify(b.root.toJSON()),
         );
+        expect(orphans(a.doc, [a.history!]), `seed ${seed} op ${i} (${choice})`).toBe(0);
       }
       // the bounded history keeps no more replaced data than the reference
       expect(retained(a.doc).bytes).toBeLessThanOrEqual(retained(b.doc).bytes);
+      expect(held(a.doc).bytes).toBeLessThanOrEqual(held(b.doc).bytes);
       a.history!.destroy();
       expect(retained(a.doc).items).toBe(0);
+      expect(held(a.doc), `seed ${seed}`).toEqual({ values: 0, bytes: 0, containers: 0 });
     }
   });
 
@@ -315,7 +385,7 @@ describe('AgentHistory', () => {
         if (choice === 'edit')
           for (let k = 1 + Math.floor(rnd() * 3); k > 0; k--) {
             const key = pick(['o1', 'o2']);
-            const field = pick(['data', 'name']);
+            const field = pick(['data', 'name', 'vg']);
             const kind = rnd();
             const tag = Math.floor(rnd() * 250);
             ops.push((root) => {
@@ -325,8 +395,8 @@ describe('AgentHistory', () => {
               else if (o instanceof Y.Map) {
                 if (kind < 0.35) o.set('child', new Y.Map());
                 else if (o.get('child') instanceof Y.Map && kind < 0.55)
-                  o.get('child').set(field, blob(tag, 48));
-                else o.set(field, field === 'data' ? blob(tag, 64) : [tag]);
+                  o.get('child').set(field, fieldValue(field, tag));
+                else o.set(field, fieldValue(field, tag));
               } else root.set(key, blob(tag, 32));
             });
           }
@@ -350,8 +420,16 @@ describe('AgentHistory', () => {
         expect(JSON.stringify(a.root.toJSON()), `seed ${seed} op ${i} (${'AB'[who]} ${choice})`).toBe(
           JSON.stringify(b.root.toJSON()),
         );
+        expect(
+          orphans(
+            a.doc,
+            a.agents.map((ag) => ag.history!),
+          ),
+          `seed ${seed} op ${i}`,
+        ).toBe(0);
       }
       expect(retained(a.doc).bytes).toBeLessThanOrEqual(retained(b.doc).bytes);
+      expect(held(a.doc).bytes).toBeLessThanOrEqual(held(b.doc).bytes);
       // one agent's history ends: the other one's undo keeps working the same way
       a.agents[0].history!.destroy();
       b.agents[0].um.destroy();
@@ -393,6 +471,27 @@ describe('AgentHistory', () => {
     expect(tags()).toEqual([1]);
     hb.destroy();
     expect(tags()).toEqual([]);
+  });
+
+  it('counts nothing as released when the document collects nothing (gc off)', () => {
+    const doc = new Y.Doc({ gc: false });
+    const mesh = doc.getMap<any>('meshes');
+    const history = new AgentHistory(doc, [mesh], ORIGIN, { maxSteps: 2 });
+    for (let i = 1; i <= 5; i++) {
+      history.undo.stopCapturing();
+      doc.transact(() => mesh.set('data', blob(i)), ORIGIN);
+      history.maintain();
+    }
+    expect(history.stats()).toMatchObject({
+      steps: 2,
+      dropped_steps: 3,
+      released_items: 0,
+      released_bytes: 0,
+    });
+    // Yjs keeps the content of deleted items without gc
+    expect(retained(doc).items).toBe(4);
+    history.undo.undo();
+    expect(tagOf(mesh.get('data'))).toBe(4);
   });
 
   it('only tracks its own origin: other users’ changes are neither undone nor kept', () => {
@@ -458,8 +557,9 @@ describe('AgentHistory', () => {
 
   /*
    * 60 random sessions of 200 steps, each run on two documents (AgentHistory and plain Yjs) and
-   * compared after every step: 0.8–0.95 s, 1.1–1.3 s under coverage on an idle 4-CPU machine. CI
-   * runners can be 2–3 times slower, so the test gets 15 s instead of the default 5 s.
+   * compared after every step, which also counts the deleted values no step keeps: 0.84–0.90 s,
+   * 1.46–1.63 s under coverage on a 4-CPU machine. CI runners can be 2–3 times slower, so the test
+   * gets 15 s instead of the default 5 s.
    */
   it('never fails inside Yjs and keeps nothing once every history ended (1-3 agents, editors, random)', () => {
     for (let seed = 1; seed <= 60; seed++) {
@@ -494,7 +594,7 @@ describe('AgentHistory', () => {
         if (choice === 'edit' || choice === 'editor')
           for (let k = 1 + Math.floor(rnd() * 3); k > 0; k--) {
             const key = pick(['o1', 'o2', 'o3']);
-            const field = pick(['data', 'name']);
+            const field = pick(['data', 'name', 'loc', 'vg']);
             const kind = rnd();
             const tag = Math.floor(rnd() * 250);
             ops.push((root) => {
@@ -504,9 +604,9 @@ describe('AgentHistory', () => {
               else if (o instanceof Y.Map) {
                 if (kind < 0.35) o.set('child', new Y.Map());
                 else if (o.get('child') instanceof Y.Map && kind < 0.55)
-                  o.get('child').set(field, blob(tag, 48));
+                  o.get('child').set(field, fieldValue(field, tag));
                 else if (kind < 0.6) o.delete(field);
-                else o.set(field, field === 'data' ? blob(tag, 64) : [tag]);
+                else o.set(field, fieldValue(field, tag));
               } else root.set(key, blob(tag, 32));
             });
           }
@@ -546,9 +646,18 @@ describe('AgentHistory', () => {
           expect(JSON.stringify(a.root.toJSON()), `seed ${seed} op ${i} (${who} ${choice})`).toBe(
             JSON.stringify(b.root.toJSON()),
           );
+        expect(
+          orphans(
+            a.doc,
+            a.agents.map((ag) => ag.history!),
+          ),
+          `seed ${seed} op ${i} (${who} ${choice})`,
+        ).toBe(0);
       }
-      if (!referenceFailed)
+      if (!referenceFailed) {
         expect(retained(a.doc).bytes, `seed ${seed}`).toBeLessThanOrEqual(retained(b.doc).bytes);
+        expect(held(a.doc).bytes, `seed ${seed}`).toBeLessThanOrEqual(held(b.doc).bytes);
+      }
       // histories end one after the other; the others keep undoing without errors (their results
       // may differ from plain Yjs once the ended history's values are collected: Yjs then treats
       // them like an editor's changes, whose overwritten values it collects too)
@@ -561,6 +670,474 @@ describe('AgentHistory', () => {
         }
       }
       expect(retained(a.doc), `seed ${seed}`).toEqual({ items: 0, bytes: 0 });
+      expect(held(a.doc), `seed ${seed}`).toEqual({ values: 0, bytes: 0, containers: 0 });
     }
   }, 15_000);
+});
+
+/*
+ * Yjs merges the deleted values one client wrote to one map key one after another (an agent moving
+ * an object, renaming vertex groups, adding shape keys: JSON-like values) into one item, kept when
+ * any part of it is. The history collected nothing of them: its collection split such an item at a
+ * step's clock ranges, and the transaction's cleanup merged the parts back into the kept ones before
+ * Yjs's garbage collection ran (200 writes of 5,000 numbers to one key kept 4.0 MB with ten steps).
+ */
+describe('AgentHistory: values written to one key one after another', () => {
+  /** An agent writing JSON values to `key` of one object, a step per write (as MCP tools do). */
+  function writer(limits: { maxSteps?: number; maxBytes?: number }) {
+    const t = setup(limits);
+    const write = (key: string, value: unknown) => t.step(() => t.set(key, value));
+    return { ...t, write };
+  }
+
+  /** Encoded size of a document holding just `value` under one key (a version kept costs about that). */
+  function encodedValue(value: unknown): number {
+    const doc = new Y.Doc();
+    doc.getMap('meshes').set('vg', value);
+    return Y.encodeStateAsUpdate(doc).byteLength;
+  }
+
+  it('keeps only the versions its maxSteps steps need; undo and redo restore them exactly', () => {
+    const { doc, mesh, history, write } = writer({ maxSteps: 10 });
+    for (let i = 0; i < 120; i++) write('vg', numbers(i));
+    expect(history.undo.undoStack.length).toBe(10);
+    // the versions replaced by the last ten steps (109 … 118), no more
+    expect(held(doc)).toEqual({ values: 10, bytes: 10 * 2_000 * 8, containers: 0 });
+    expect(Y.encodeStateAsUpdate(doc).byteLength).toBeLessThan(12 * encodedValue(numbers(119)));
+    // what the history reports keeping is what the document holds (its estimate: 16 bytes per value more)
+    expect(history.stats().bytes).toBeGreaterThanOrEqual(held(doc).bytes);
+    expect(history.stats().bytes).toBeLessThan(held(doc).bytes * 1.01);
+    expect(historyKept(doc)).toEqual({ bytes: history.stats().bytes, items: 10 });
+    for (let u = 1; u <= 10; u++) {
+      expect(history.undo.undo()).not.toBeNull();
+      history.maintain();
+      expect(mesh.get('vg')).toEqual(numbers(119 - u));
+    }
+    expect(history.undo.undo()).toBeNull();
+    for (let r = 1; r <= 10; r++) {
+      history.undo.redo();
+      history.maintain();
+      expect(mesh.get('vg')).toEqual(numbers(109 + r));
+    }
+    // undo and redo collected what they replaced: still ten versions at most
+    expect(held(doc).values).toBeLessThanOrEqual(10);
+  });
+
+  it('keeps only the versions maxBytes allows (and always the newest step)', () => {
+    const one = 2_000 * 8 + 96; // the history's estimate of one version
+    const { doc, mesh, history, write } = writer({ maxBytes: 4.5 * one });
+    for (let i = 0; i < 60; i++) write('vg', numbers(i));
+    expect(history.undo.undoStack.length).toBe(4);
+    expect(held(doc).values).toBe(4);
+    expect(history.stats().bytes).toBeLessThanOrEqual(4.5 * one);
+    expect(Y.encodeStateAsUpdate(doc).byteLength).toBeLessThan(6 * encodedValue(numbers(59)));
+    for (let u = 1; u <= 4; u++) {
+      history.undo.undo();
+      history.maintain();
+      expect(mesh.get('vg')).toEqual(numbers(59 - u));
+    }
+    expect(history.undo.undo()).toBeNull();
+    for (let r = 1; r <= 4; r++) {
+      history.undo.redo();
+      history.maintain();
+      expect(mesh.get('vg')).toEqual(numbers(55 + r));
+    }
+    expect(history.undo.redo()).toBeNull();
+    // a step that replaces more than the budget is kept alone
+    write('big', numbers(1, 10_000));
+    write('big', numbers(2, 10_000));
+    write('big', numbers(3, 10));
+    expect(history.undo.undoStack.length).toBe(1);
+    history.undo.undo();
+    expect(mesh.get('big')).toEqual(numbers(2, 10_000));
+  });
+
+  it('collects the versions a step wrote and replaced itself, merged with the version before it', () => {
+    const { doc, mesh, history, step, set } = setup();
+    step(() => set('vg', numbers(1)));
+    // one step writing the same key 50 times (one transaction each, as a batch's operators do)
+    step(() => {
+      for (let i = 2; i <= 51; i++) set('vg', numbers(i));
+    });
+    // Yjs merged version 1 (needed to undo) with versions 2 … 50 (created and replaced by the step)
+    expect(held(doc).values).toBe(1);
+    expect(history.stats().bytes).toBeLessThan(2 * 2_000 * 8);
+    // one item kept (the placeholders of the versions collected count for nothing)
+    expect(historyKept(doc).items).toBe(1);
+    expect(Y.encodeStateAsUpdate(doc).byteLength).toBeLessThan(3 * encodedValue(numbers(51)));
+    history.undo.undo();
+    expect(mesh.get('vg')).toEqual(numbers(1));
+    history.undo.redo();
+    expect(mesh.get('vg')).toEqual(numbers(51));
+    // the same in one transaction
+    step(() =>
+      doc.transact(() => {
+        for (let i = 52; i <= 80; i++) mesh.set('vg', numbers(i));
+      }, ORIGIN),
+    );
+    expect(held(doc).values).toBe(2);
+    history.undo.undo();
+    expect(mesh.get('vg')).toEqual(numbers(51));
+  });
+
+  it('frees them while the step runs (compactStep) and counts what the step keeps as it grows', () => {
+    const { doc, history, step, set } = setup();
+    for (const k of ['a', 'b', 'c']) step(() => set(k, numbers(1)));
+    const sizes: number[] = [];
+    let most = 0;
+    step(() => {
+      for (let i = 2; i <= 30; i++) {
+        set(['a', 'b', 'c'][i % 3], numbers(i));
+        history.compactStep();
+        most = Math.max(most, held(doc).values);
+        sizes.push(history.kept().bytes);
+      }
+    });
+    // the three versions from before the step, and the three steps' own versions … at most one more
+    expect(most).toBeLessThanOrEqual(3 + 3);
+    // the step's size counts each version it replaced from before it, once, while it runs
+    const before = sizes[0] - (2_000 * 8 + 96);
+    expect(sizes.slice(0, 3).map((b) => Math.round((b - before) / (2_000 * 8 + 96)))).toEqual([1, 2, 3]);
+    expect(sizes.at(-1)).toBe(sizes[2]);
+    history.maintain();
+    expect(history.kept().bytes).toBe(sizes[2]);
+    expect(historyKept(doc).bytes).toBe(sizes[2]);
+  });
+
+  it('counts what its redo steps keep, as what its undo steps keep', () => {
+    const { doc, history, write } = writer({});
+    write('vg', numbers(1));
+    write('vg', numbers(2)); // keeps version 1
+    const one = history.kept().bytes;
+    expect(one).toBeGreaterThanOrEqual(2_000 * 8);
+    history.undo.undo();
+    history.maintain();
+    // version 1 is back; the redo step keeps version 2, the step left to undo nothing
+    expect(history.undo.redoStack.length).toBe(1);
+    expect(history.kept()).toEqual({ bytes: one, items: 1 });
+    expect(historyKept(doc)).toEqual({ bytes: one, items: 1 });
+    expect(history.stats().bytes).toBe(Math.round(one));
+  });
+
+  it('measures a step again when it changes after it was measured', () => {
+    const { history, step, set } = setup();
+    step(() => {
+      set('a', numbers(1));
+      set('b', numbers(1));
+    });
+    const um = history.undo;
+    um.stopCapturing();
+    um.captureTimeout = Number.POSITIVE_INFINITY;
+    set('a', numbers(2)); // replaces version 1 of a
+    history.maintain(); // measures the step while it runs
+    const one = history.kept().bytes;
+    set('b', numbers(2)); // the same step replaces version 1 of b
+    history.maintain();
+    um.captureTimeout = 0;
+    expect(um.undoStack.length).toBe(2);
+    expect(history.kept()).toEqual({ bytes: 2 * one, items: 2 });
+  });
+
+  it('two agents and a remote client: each undoes its own versions exactly, nothing else is held', () => {
+    const doc = new Y.Doc();
+    const root = doc.getMap<any>('meshes');
+    const remote = new Y.Doc();
+    doc.on('update', (u: Uint8Array, origin: unknown) => {
+      if (origin !== 'remote') Y.applyUpdate(remote, u, 'local');
+    });
+    remote.on('update', (u: Uint8Array, origin: unknown) => {
+      if (origin !== 'local') Y.applyUpdate(doc, u, 'remote');
+    });
+    const remoteRoot = remote.getMap<any>('meshes');
+    const agents = ['A', 'B'].map((name, n) => {
+      const origin = { type: 'mcp', session: name };
+      const history = new AgentHistory(doc, [root], origin, { maxSteps: 4 + n });
+      const write = (key: string, value: unknown) => {
+        history.undo.stopCapturing();
+        doc.transact(() => root.set(key, value), origin);
+        history.maintain();
+      };
+      return { origin, history, write };
+    });
+    const [a, b] = agents;
+    // runs of writes to one key (consecutive items Yjs merges), interleaved with the other writers
+    for (let round = 0; round < 6; round++) {
+      for (let i = 0; i < 5; i++) a.write('k1', numbers(round * 10 + i, 300));
+      for (let i = 0; i < 4; i++) b.write('k2', numbers(1_000 + round * 10 + i, 300));
+      remote.transact(() => remoteRoot.set('k3', numbers(2_000 + round, 300)));
+      a.write('k3', numbers(3_000 + round, 300));
+    }
+    // A keeps the versions of its last 4 steps, B those of its last 5; the remote client's own
+    // replaced versions are not kept by anyone
+    expect(held(doc).values).toBe(4 + 5);
+    expect(historyKept(doc).bytes).toBe(a.history.kept().bytes + b.history.kept().bytes);
+    // A's last steps: k3 (round 5), k1 54, 53, 52
+    a.history.undo.undo();
+    expect(root.get('k3')).toEqual(numbers(2_005, 300));
+    a.history.undo.undo();
+    expect(root.get('k1')).toEqual(numbers(53, 300));
+    a.history.undo.undo();
+    expect(root.get('k1')).toEqual(numbers(52, 300));
+    b.history.undo.undo();
+    expect(root.get('k2')).toEqual(numbers(1_052, 300));
+    a.history.undo.redo();
+    expect(root.get('k1')).toEqual(numbers(53, 300));
+    for (const ag of agents) ag.history.maintain();
+    expect(remoteRoot.toJSON()).toEqual(root.toJSON());
+    const replica = new Y.Doc();
+    Y.applyUpdate(replica, Y.encodeStateAsUpdate(doc));
+    expect(replica.getMap('meshes').toJSON()).toEqual(root.toJSON());
+    // the histories end: nothing is held any more
+    a.history.destroy();
+    b.history.destroy();
+    expect(held(doc)).toEqual({ values: 0, bytes: 0, containers: 0 });
+    expect(historyKept(doc).bytes).toBe(0);
+  });
+
+  it('frees every deleted container undo still needed when the last history of the document ends', () => {
+    const { doc, mesh, history, step } = setup();
+    const t = (fn: () => void) => step(() => doc.transact(fn, ORIGIN));
+    for (let round = 0; round < 3; round++) {
+      for (let i = 0; i < 10; i++)
+        t(() => {
+          const o = new Y.Map<any>();
+          mesh.set(`o${i}`, o);
+          o.set('location', [i, round, 0]);
+          o.set('name', `Object ${i}`);
+        });
+      t(() => {
+        for (let i = 0; i < 10; i++) mesh.delete(`o${i}`);
+      });
+      // undo restores copies of the objects; their originals keep links to them
+      history.undo.undo();
+      history.maintain();
+    }
+    expect(mesh.size).toBe(10);
+    const before = Y.encodeStateAsUpdate(doc).byteLength;
+    expect(held(doc).containers).toBeGreaterThan(0);
+    history.destroy();
+    expect(held(doc)).toEqual({ values: 0, bytes: 0, containers: 0 });
+    // the deleted objects' fields are placeholders now, merged: the state shrinks
+    expect(Y.encodeStateAsUpdate(doc).byteLength).toBeLessThan(before / 2);
+    expect((mesh.get('o3') as Y.Map<any>).get('location')).toEqual([3, 2, 0]);
+  });
+});
+
+/*
+ * Deleted objects (containers) that undo restored: their originals link to the copies, which undo and
+ * redo follow, so a collected container would end those links where they lead below it. The history
+ * kept such containers until the last history of the document ended, also after every step that could
+ * follow the links into them was dropped, and counted none of them.
+ */
+describe('AgentHistory: deleted objects that undo restored', () => {
+  /** The fields an object gets (`round` tells versions apart). */
+  const fields = (i: number, round: number): Record<string, unknown> => ({
+    name: `Object ${i}`,
+    location: [i, round, 0],
+    scale: [1, 1, 1],
+    hide: false,
+  });
+  const OBJECTS = 20;
+  /** Items a deleted object keeps: itself, its fields, and a nested map with two fields. */
+  const ITEMS = 1 + Object.keys(fields(0, 0)).length + 3;
+
+  /**
+   * Agents with the given maxSteps in one document, and the same agents with plain unbounded
+   * Y.UndoManagers that drop the same old steps without collecting anything (the reference); every
+   * action is applied to both and their states compared.
+   */
+  function worlds(maxSteps: number[]) {
+    const make = (bounded: boolean) => {
+      const doc = new Y.Doc();
+      doc.clientID = 9;
+      const root = doc.getMap<any>('objects');
+      const agents = maxSteps.map((steps, n) => {
+        const origin = { type: 'mcp', session: `a${n}` };
+        const history = bounded ? new AgentHistory(doc, [root], origin, { maxSteps: steps }) : null;
+        const um =
+          history?.undo ??
+          new Y.UndoManager([root], { trackedOrigins: new Set([origin]), captureTimeout: 0 });
+        return { origin, history, um, maxSteps: steps };
+      });
+      return { doc, root, agents };
+    };
+    const a = make(true);
+    const b = make(false);
+    const settle = () => {
+      for (const ag of a.agents) ag.history!.maintain();
+      for (const ag of b.agents) while (ag.um.undoStack.length > ag.maxSteps) ag.um.undoStack.shift();
+      expect(a.root.toJSON()).toEqual(b.root.toJSON());
+    };
+    /** Agent `n` changes the document: one step. */
+    const step = (n: number, fn: (root: Y.Map<any>) => void) => {
+      for (const w of [a, b]) {
+        w.agents[n].um.stopCapturing();
+        w.doc.transact(() => fn(w.root), w.agents[n].origin);
+      }
+      settle();
+    };
+    const undo = (n: number) => {
+      for (const w of [a, b]) w.agents[n].um.undo();
+      settle();
+    };
+    const redo = (n: number) => {
+      for (const w of [a, b]) w.agents[n].um.redo();
+      settle();
+    };
+    /** A change no agent tracks (an editor). */
+    const editor = (fn: (root: Y.Map<any>) => void) => {
+      for (const w of [a, b]) w.doc.transact(() => fn(w.root), { type: 'editor' });
+      settle();
+    };
+    return { a, b, step, undo, redo, editor };
+  }
+
+  const addObjects = (round: number) => (root: Y.Map<any>) => {
+    for (let i = 0; i < OBJECTS; i++) {
+      const o = new Y.Map<any>();
+      root.set(`o${i}`, o);
+      for (const [k, v] of Object.entries(fields(i, round))) o.set(k, v);
+      const nested = new Y.Map<any>();
+      o.set('modifier', nested);
+      nested.set('type', 'ARRAY');
+      nested.set('count', i);
+    }
+  };
+  const deleteObjects = (root: Y.Map<any>) => {
+    for (let i = 0; i < OBJECTS; i++) root.delete(`o${i}`);
+  };
+
+  it('frees them once the steps that could follow the links into them are dropped', () => {
+    const w = worlds([4]);
+    const doc = w.a.doc;
+    w.step(0, addObjects(0)); // undoing it deletes the objects' latest copies, through the links
+    for (let round = 1; round <= 2; round++) {
+      w.step(0, deleteObjects);
+      w.undo(0); // copies of the objects come back
+      w.step(0, (root) => root.set('marker', round)); // and the redo step is dropped
+    }
+    // the originals and the first copies, deleted (with their nested maps), with the placeholders of
+    // their fields
+    expect(held(doc).containers).toBe(2 * 2 * OBJECTS);
+    // counted with what the history keeps, though no step of it keeps them
+    const history = w.a.agents[0].history!;
+    expect(historyKept(doc).bytes - history.kept().bytes).toBe(
+      KEPT_CONTAINER_ITEM_BYTES * 2 * OBJECTS * ITEMS,
+    );
+    const before = Y.encodeStateAsUpdate(doc).byteLength;
+    // two more steps: the step that created the objects is dropped (4 steps kept)
+    w.step(0, (root) => root.set('marker', 3));
+    w.step(0, (root) => root.set('marker', 4));
+    expect(w.a.agents[0].um.undoStack.length).toBe(4);
+    expect(held(doc).containers).toBe(0);
+    expect(historyKept(doc).bytes).toBe(history.kept().bytes);
+    expect(Y.encodeStateAsUpdate(doc).byteLength).toBeLessThan(before - 1_000);
+    // undo and redo of every step left give the reference's states (compared at each one)
+    for (let i = 0; i < 4; i++) w.undo(0);
+    expect(w.a.root.has('marker')).toBe(false);
+    expect((w.a.root.get('o3') as Y.Map<any>).get('location')).toEqual([3, 0, 0]);
+    for (let i = 0; i < 4; i++) w.redo(0);
+    expect(w.a.root.get('marker')).toBe(4);
+  });
+
+  it('keeps them while the step that created them can still be undone: undo deletes the copies', () => {
+    const w = worlds([10]);
+    const doc = w.a.doc;
+    w.step(0, addObjects(0));
+    for (let round = 1; round <= 2; round++) {
+      w.step(0, deleteObjects);
+      w.undo(0);
+      w.step(0, (root) => root.set('marker', round));
+    }
+    for (let i = 0; i < 6; i++) w.step(0, (root) => root.set('other', i));
+    expect(held(doc).containers).toBe(2 * 2 * OBJECTS);
+    // back to before the objects were created: the latest copies are deleted (compared with the reference)
+    while (w.a.agents[0].um.undoStack.length) w.undo(0);
+    expect(w.a.root.has('o0')).toBe(false);
+    // the step that reached them was applied: they are freed; the latest copies are kept to redo it
+    expect(held(doc).containers).toBe(2 * OBJECTS);
+    while (w.a.agents[0].um.redoStack.length) w.redo(0);
+    expect((w.a.root.get('o7') as Y.Map<any>).get('location')).toEqual([7, 0, 0]);
+  });
+
+  it('frees them while another agent keeps steps that cannot reach them', () => {
+    const w = worlds([3, 100]);
+    const doc = w.a.doc;
+    // agent 1 works on something else, then waits
+    w.step(1, (root) => root.set('b', 1));
+    w.step(1, (root) => root.set('b', 2));
+    w.step(0, addObjects(0));
+    w.step(0, deleteObjects);
+    w.undo(0);
+    w.step(0, (root) => root.set('marker', 1));
+    expect(held(doc).containers).toBe(2 * OBJECTS);
+    for (let i = 2; i <= 4; i++) w.step(0, (root) => root.set('marker', i));
+    // agent 0's step that created the objects is dropped; agent 1's steps stay
+    expect(w.a.agents[1].um.undoStack.length).toBe(2);
+    expect(held(doc).containers).toBe(0);
+    w.undo(1);
+    w.undo(1);
+    expect(w.a.root.has('b')).toBe(false);
+    for (let i = 0; i < 3; i++) w.undo(0);
+    expect(w.a.root.get('marker')).toBe(1);
+  });
+
+  it('frees them when the history of the agent whose step could reach them ends', () => {
+    const w = worlds([10, 10]);
+    const doc = w.a.doc;
+    w.step(1, (root) => root.set('b', 1));
+    w.step(0, addObjects(0));
+    w.step(0, deleteObjects);
+    w.undo(0);
+    w.step(0, (root) => root.set('marker', 1));
+    expect(held(doc).containers).toBe(2 * OBJECTS); // the objects and their nested maps
+    w.a.agents[0].history!.destroy();
+    w.b.agents[0].um.destroy();
+    expect(held(doc).containers).toBe(0);
+    w.undo(1);
+    expect(w.a.root.has('b')).toBe(false);
+    expect(w.a.root.toJSON()).toEqual(w.b.root.toJSON());
+  });
+
+  it('keeps a deleted copy while a step can restore a value into it (its deleted parent links to it)', () => {
+    const w = worlds([2]);
+    const doc = w.a.doc;
+    w.step(0, (root) => {
+      const o = new Y.Map<any>();
+      root.set('o', o);
+      o.set('name', 'Object');
+      o.set('f', 1);
+    });
+    w.step(0, (root) => root.get('o').delete('f')); // keeps the value: undo restores it into the object
+    w.step(0, (root) => root.delete('o')); // the step that created the object is dropped (2 kept)
+    w.undo(0); // a copy of the object comes back, linked from the original
+    w.step(0, (root) => root.set('x', 1));
+    w.editor((root) => root.delete('o')); // someone deletes the copy
+    // undoing the field's deletion restores it into the original's latest copy: the deleted copy
+    // stays (collected, the undo would fail inside Yjs)
+    expect(held(doc).containers).toBeGreaterThanOrEqual(1);
+    w.undo(0);
+    w.undo(0);
+    expect(w.a.root.has('o')).toBe(false);
+    w.redo(0);
+    w.redo(0);
+    expect(w.a.root.get('x')).toBe(1);
+  });
+
+  it('frees restored objects an editor deleted once no step can reach them', () => {
+    const w = worlds([3]);
+    const doc = w.a.doc;
+    w.step(0, addObjects(0));
+    w.step(0, deleteObjects);
+    w.undo(0); // copies come back (Yjs keeps restored copies)
+    w.editor(deleteObjects); // someone else deletes them
+    // the originals and the copies: the step that created the objects can reach both
+    expect(held(doc).containers).toBe(2 * 2 * OBJECTS);
+    w.redo(0); // nothing left to delete: discarded
+    for (let i = 1; i <= 3; i++) w.step(0, (root) => root.set('marker', i));
+    expect(held(doc).containers).toBe(0);
+    for (let i = 0; i < 3; i++) w.undo(0);
+    expect(w.a.root.has('marker')).toBe(false);
+    expect(w.a.root.has('o1')).toBe(false);
+  });
 });

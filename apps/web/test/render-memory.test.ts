@@ -292,7 +292,7 @@ describe('memory of browser path traced renders', () => {
       // the page alone uses more than the share a render may fill: the tab has none left, and the
       // figures say so instead of a room of 0.00 GB "of that"
       await expect(job.result).rejects.toThrow(
-        /needs about 0\.03 GB of JavaScript heap, and the tab has none left for it: a render may fill 0\.37 GB of its 0\.50 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, and the page uses 0\.4\d GB \(about/,
+        /needs about 0\.03 GB of JavaScript heap, and the tab has none left for it: a render may fill 0\.37 GB of its 0\.50 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, and the page is estimated to use 0\.4\d GB \(about/,
       );
       expect(started).toEqual([]);
       // without the subdivided grids the page holds little: the browser's 631 MiB, ArrayBuffers
@@ -937,7 +937,7 @@ describe('memory of browser path traced renders', () => {
     const full = planRenderThreads(needs, 4, { ...roomy, heapUsed: 3.1e9 });
     expect(full.threads).toBe(0);
     expect(full.refusal).toMatch(
-      /its render thread needs about 0\.\d\d GB of JavaScript heap, more than the 0\.09 GB the tab has left for it: a render may fill 2\.98 GB of its 3\.50 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, and the page uses 2\.89 GB of that/,
+      /its render thread needs about 0\.\d\d GB of JavaScript heap, more than the 0\.09 GB the tab has left for it: a render may fill 2\.98 GB of its 3\.50 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, and the page is estimated to use 2\.89 GB of that/,
     );
     // ... the heap other path traced renders hold in it included
     const heap = renderMemory(needs, 1).heap;
@@ -949,7 +949,7 @@ describe('memory of browser path traced renders', () => {
     const held = planRenderThreads(needs, 1, { ...roomy, held: { total: 0, heap: others } });
     expect(held.threads).toBe(0);
     const figures = held.refusal!.match(
-      /more than the (\d\.\d+) GB the tab has left for it: a render may fill (\d\.\d+) GB of its \d\.\d+ GB heap limit, .*, and the page and the path traced renders running in it use (\d\.\d+) GB of that/,
+      /more than the (\d\.\d+) GB the tab has left for it: a render may fill (\d\.\d+) GB of its \d\.\d+ GB heap limit, .*, and the page and the path traced renders running in it are estimated to use (\d\.\d+) GB of that/,
     );
     expect(figures, held.refusal!).not.toBeNull();
     // one byte short: three decimals, the need rounded up, the share down and the use up, keep the
@@ -1579,7 +1579,7 @@ describe('RASTER renders on the page', () => {
     expect(rasterRefusal(needs, tab)).toBe(
       'The RASTER render was not started: the geometry it evaluates at the render settings needs about ' +
         "0.48 GB of JavaScript heap, more than the 0.33 GB the tab has left for it: a render may fill 0.35 GB of its 0.49 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, " +
-        'and the page uses 0.02 GB of that (about 4.3 million triangles: curve and text surfaces, modifier and ' +
+        'and the page is estimated to use 0.02 GB of that (about 4.3 million triangles: curve and text surfaces, modifier and ' +
         'shape key results), and running out of memory would end the tab. Lower the triangles (subdivision ' +
         'render levels, curve and text render resolution, objects in the scene).',
     );
@@ -1591,7 +1591,7 @@ describe('RASTER renders on the page', () => {
     const held = { ...tab, held: { total: 0, heap: room / 2 } };
     expect(rasterRefusal({ ...needs, heap: room / 2 }, held)).toBeNull();
     expect(rasterRefusal({ ...needs, heap: room / 2 + MB }, held)).toContain(
-      'and the page and the path traced renders running in it use',
+      'and the page and the path traced renders running in it are estimated to use',
     );
     // the modifier its evaluation would not run, by name
     expect(
@@ -1658,7 +1658,7 @@ describe('RASTER renders on the page', () => {
     expect(rasterRefusal(scattered, page)).toBe(
       'The RASTER render was not started: the geometry it evaluates at the render settings needs about ' +
         "0.001 GB of JavaScript heap, and the tab has none left for it: a render may fill 0.352 GB of its 0.485 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, " +
-        'and the page uses 0.353 GB (about 105 instances of objects, particles and collections, and no curve or ' +
+        'and the page is estimated to use 0.353 GB (about 105 instances of objects, particles and collections, and no curve or ' +
         'text surface, modifier or shape key result), and running out of memory would end the tab. Lower the ' +
         'instances (particle counts, instanced collections, objects in the scene).',
     );
@@ -1717,7 +1717,7 @@ describe('RASTER renders on the page', () => {
       const need = raster.heap + 2 * MB;
       const f = refusalFigures(need, usableHeap(limit), pageHeap, 2);
       expect(rasterRefusal({ ...raster, heap: need }, tab)).toContain(
-        `and the page uses ${f.used} GB of that`,
+        `and the page is estimated to use ${f.used} GB of that`,
       );
       // a path traced render counts it: room for its heap beside the page and the kept geometry, and
       // none with a byte more
@@ -1960,14 +1960,18 @@ describe('RASTER renders on the page', () => {
       const { pool, started } = recordingPool(2);
       await expect(
         startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1 }).result,
-      ).rejects.toThrow(/and the tab has none left for it: .*, and the page uses 0\.\d\d GB \(about/);
+      ).rejects.toThrow(
+        /and the tab has none left for it: .*, and the page is estimated to use 0\.\d\d GB \(about/,
+      );
       expect(started).toEqual([]);
       const r = await startPathTrace(pool, doc, { width: 24, height: 16, frame: 10, samples: 1 }).result;
       expect(r.samples).toBe(1);
       // the page holds the viewport's evaluation: at the frame the viewport shows where it is given
       await expect(
         startPathTrace(pool, doc, { width: 24, height: 16, frame: 10, pageFrame: 1, samples: 1 }).result,
-      ).rejects.toThrow(/and the tab has none left for it: .*, and the page uses 0\.\d\d GB \(about/);
+      ).rejects.toThrow(
+        /and the tab has none left for it: .*, and the page is estimated to use 0\.\d\d GB \(about/,
+      );
       const shown = startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, pageFrame: 10, samples: 1 });
       expect((await shown.result).samples).toBe(1);
       // what the page holds besides its scene counts too (the geometry the evaluator of RASTER
@@ -1983,7 +1987,7 @@ describe('RASTER renders on the page', () => {
           samples: 1,
         }).result,
       ).rejects.toThrow(
-        /^Path tracing was not started: its render thread needs about .*, and the page uses /,
+        /^Path tracing was not started: its render thread needs about .*, and the page is estimated to use /,
       );
     } finally {
       if (before) Object.defineProperty(performance, 'memory', before);

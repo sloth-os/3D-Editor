@@ -1592,6 +1592,67 @@ describe('heavy scenes in Rendered shading', () => {
     }
   });
 
+  it('labels the thumbnail it read back with the revision of the frame it read, not the latest one', () => {
+    // a change made while the GPU drew the frame read back: that thumbnail shows the document
+    // before the change, so the thumbnail of the change waits for a frame of it
+    const s = session();
+    const { e, gl } = engine(s);
+    const { fences, reads } = readbackContext(gl);
+    const { restore } = recordCopies();
+    let encoded = 0;
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockImplementation(
+      () => `data:image/jpeg;base64,${++encoded}`,
+    );
+    const done = () => {
+      for (const f of [...fences, ...fences.scenes]) f.done = true;
+    };
+    try {
+      frame(e);
+      expect(e.thumbnail()).toBeNull();
+      frame(e);
+      expect(reads).toHaveLength(1);
+      // the document changes before the GPU is done: the next turn of the loop finishes the read
+      // back of the frame before the change and draws one of the change
+      s.doc.addObject({ type: 'EMPTY', name: 'Marker' });
+      done();
+      frame(e);
+      expect(encoded).toBe(1);
+      expect(e.thumbnail()).toBeNull();
+      frame(e);
+      expect(reads).toHaveLength(2);
+      done();
+      frame(e);
+      expect(e.thumbnail()).toBe('data:image/jpeg;base64,2');
+    } finally {
+      restore();
+    }
+  });
+
+  it('deletes the buffer and fence of a read back still on its way when it is disposed', () => {
+    const s = session();
+    const { e, gl } = engine(s);
+    const { reads } = readbackContext(gl);
+    const ctx = gl.context as Record<string, (...args: unknown[]) => unknown>;
+    const created: unknown[] = [];
+    const deleted: [string, unknown][] = [];
+    const fenceSync = ctx.fenceSync;
+    ctx.fenceSync = (...args) => {
+      const f = fenceSync(...args);
+      created.push(f);
+      return f;
+    };
+    ctx.deleteSync = (f) => deleted.push(['sync', f]);
+    ctx.deleteBuffer = (b) => deleted.push(['buffer', b]);
+    frame(e);
+    expect(e.thumbnail()).toBeNull();
+    frame(e);
+    expect(reads).toHaveLength(1);
+    const fence = created.at(-1);
+    e.dispose();
+    expect(deleted).toContainEqual(['sync', fence]);
+    expect(deleted).toContainEqual(['buffer', { buffer: 0 }]);
+  });
+
   it('scales the pixels read back down into the thumbnail, the top row of the image first', () => {
     // WebGL reads rows from the bottom: 4 × 2 pixels, the bottom row red, the top row green, each
     // column brighter than the one on its left
@@ -3221,7 +3282,7 @@ describe('RASTER final renders and the heap of the tab', () => {
     const heap = YOUNG_GENERATION_BYTES + 50 * MB;
     const refusal =
       'The RASTER render was not started: the geometry it evaluates at the render settings needs about 0.06 GB ' +
-      "of JavaScript heap, more than the 0.03 GB the tab has left for it: a render may fill 0.05 GB of its 0.18 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, and the page uses 0.02 GB of that " +
+      "of JavaScript heap, more than the 0.03 GB the tab has left for it: a render may fill 0.05 GB of its 0.18 GB heap limit, the rest being kept free for V8's young generation and for the page to keep working, and the page is estimated to use 0.02 GB of that " +
       '(about 0.5 million triangles: curve and text surfaces, modifier and shape key results), and running out of ' +
       'memory would end the tab. Lower the triangles (subdivision render levels, curve and text render resolution, ' +
       'objects in the scene).';
@@ -3474,7 +3535,7 @@ describe('RASTER final renders and the heap of the tab', () => {
     expect(pageHeapEstimate(s.doc, 10)).toBeGreaterThan(300 * MB - YOUNG_GENERATION_BYTES);
     withHeap(300 * MB, () =>
       expect(() => e.renderPixels({ frame: 1 })).toThrow(
-        /and the tab has none left for it: .*, and the page uses 0\.\d+ GB \(about 32,768 triangles/,
+        /and the tab has none left for it: .*, and the page is estimated to use 0\.\d+ GB \(about 32,768 triangles/,
       ),
     );
     // a path traced render takes it at the viewport's frame too
@@ -3505,7 +3566,9 @@ describe('RASTER final renders and the heap of the tab', () => {
       // the room of the page alone, less one byte of what the running render holds
       const page = pageHeapEstimate(s.doc, 1);
       withHeap(YOUNG_GENERATION_BYTES + page + needs + held - 1, () =>
-        expect(() => e.renderPixels()).toThrow(/and the page and the path traced renders running in it use/),
+        expect(() => e.renderPixels()).toThrow(
+          /and the page and the path traced renders running in it are estimated to use/,
+        ),
       );
       job.cancel();
       await job.result;

@@ -469,15 +469,22 @@ describe('rigid body simulations', () => {
 
 /**
  * Runs `op` in a child process (--trace-gc; operator-memory-child.ts) on `n` objects of `mode`: its
- * estimate and the peak heap between the marks around the run (bytes).
+ * estimate and the peak heap between the marks around the run (bytes). `flags`: more V8 flags.
  */
-function peak(op: string, n: number, params: object, mode: 'cubes' | 'rigid' | 'baked' | 'keyed') {
+function peak(
+  op: string,
+  n: number,
+  params: object,
+  mode: 'cubes' | 'rigid' | 'baked' | 'keyed',
+  flags: string[] = [],
+) {
   const run = spawnSync(
     process.execPath,
     [
       '--expose-gc',
       '--trace-gc',
       '--max-old-space-size=4096',
+      ...flags,
       '--import',
       'tsx',
       path.join(here, 'operator-memory-child.ts'),
@@ -547,6 +554,13 @@ describe('the estimates of bakes hold', () => {
     const r = peak('anim.keyframes_insert_many', 100_000, { __between: true }, 'keyed');
     expect(r.estimate).toBeGreaterThanOrEqual(1.1 * r.peak);
     expect(r.estimate).toBeLessThan(r.peak * 3);
+    // where V8 collects varies from run to run (69.1–73.8 MiB in 17 runs on one machine); with
+    // --predictable it collects at the same points in every run, which peaked at 68.2 MiB (in all 10
+    // runs, Node 22.23.4): the estimate (89.2 MiB) is a quarter above that, so that it stays 10% above
+    // runs that peak up to 13% higher
+    const p = peak('anim.keyframes_insert_many', 100_000, { __between: true }, 'keyed', ['--predictable']);
+    expect(p.estimate).toBe(r.estimate);
+    expect(p.estimate).toBeGreaterThanOrEqual(1.25 * p.peak);
   }, 30_000);
 
   it('above the peak heap of a rigid body bake of 100 bodies over 200 frames (V8 GC trace in a child process)', () => {

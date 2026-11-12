@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { ExportFormat } from '@3d-editor/core';
 import type { RoomManager } from '../sync/room-manager';
 import { StorageUnavailableError } from '../sync/room-manager';
+import { ProjectMemoryError } from '../sync/project-memory';
 import {
   ProjectNameTakenError,
   freeProjectName,
@@ -139,7 +140,10 @@ export function registerProjectRoutes(
     for (const abort of rendering) abort.abort();
   });
 
-  /** Loads a project or replies 404/503. */
+  /**
+   * Loads a project or replies 404/503, or 507 with code OUT_OF_MEMORY for a stored project the
+   * server cannot load (RoomManager logged it: 'project not loaded: the server cannot hold it').
+   */
   async function roomOr404(id: string, reply: FastifyReply): Promise<Room | null> {
     try {
       const room = await rooms.open(id);
@@ -151,6 +155,10 @@ export function registerProjectRoutes(
     } catch (err) {
       if (err instanceof StorageUnavailableError) {
         await reply.code(503).send({ error: err.message });
+        return null;
+      }
+      if (err instanceof ProjectMemoryError) {
+        await reply.code(507).send({ error: err.message, code: 'OUT_OF_MEMORY' });
         return null;
       }
       throw err;

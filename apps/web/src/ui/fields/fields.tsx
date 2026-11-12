@@ -397,7 +397,11 @@ export function TextField(p: {
       }}
       onKeyDown={(e) => {
         if (e.key === 'Enter') commit();
-        if (e.key === 'Escape') setV(p.value);
+        if (e.key === 'Escape') {
+          // with no typing to cancel, Escape goes on to what holds the field (it closes a dialog)
+          if (v === p.value) return;
+          setV(p.value);
+        }
         e.stopPropagation();
       }}
       onBlur={commit}

@@ -8,6 +8,10 @@
 // cannot reset its peak resident memory, outside Linux).
 //   argv: parent <grid size n> <bones> <parent type>: object.parent_set of a grid of n × n quads to an
 //         armature of `bones` + 1 bones
+//         join <grid size n> <groups> <keys>: object.join of three grids of n × n quads, each with
+//         `groups` vertex groups and `keys` shape keys (the first half of each named alike in all three)
+//         apply <grid size n> <groups> <keys>: object.transform_apply (scale) of a grid of n × n quads
+//         with `groups` vertex groups and `keys` shape keys whose mesh a second object uses too
 //         image <MB>: import_scene.gltf of a GLB of one triangle whose material has a PNG of that size
 import { readFileSync, writeFileSync } from 'node:fs';
 import * as Y from 'yjs';
@@ -15,6 +19,7 @@ import * as encoding from 'lib0/encoding';
 import * as syncProtocol from 'y-protocols/sync';
 import { createEditorState, createOperatorRegistry, estimateOperator } from '../src/operators';
 import { SceneDoc } from '../src/doc/scene-doc';
+import { encodeFloat32 } from '../src/mesh/shape-keys';
 import { base64Encode } from '../src/util/json';
 
 const [scenario, ...args] = process.argv.slice(2);
@@ -101,6 +106,80 @@ if (scenario === 'parent') {
   state.activeId = rig.id;
   op = 'object.parent_set';
   params = { type: args[2] };
+} else if (scenario === 'join') {
+  const [n, groups, keys] = args.map(Number);
+  const grids: string[] = [];
+  for (let j = 0; j < 3; j++) {
+    const name = `Grid${j}`;
+    run('mesh.primitive_grid_add', {
+      name,
+      x_subdivisions: n,
+      y_subdivisions: n,
+      size: 10,
+      location: [12 * j, 0, 0],
+    });
+    const o = doc.listObjects().find((x) => x.name === name)!;
+    grids.push(o.id);
+    const positions = doc.getMesh(o.data!)!.positions;
+    const named = (i: number, count: number, prefix: string) =>
+      i < count / 2 ? `${prefix}${i}` : `${prefix}${i}.${j}`;
+    doc.setVertexGroups(
+      o.data!,
+      Array.from({ length: groups }, (_, g) => ({
+        name: named(g, groups, 'Group'),
+        weights: encodeFloat32(Array.from({ length: positions.length / 3 }, (_, i) => ((i + g) % 7) / 7)),
+      })),
+    );
+    doc.setShapeKeys(
+      o.data!,
+      Array.from({ length: keys }, (_, k) => ({
+        name: named(k, keys, 'Key'),
+        value: 0.5,
+        slider_min: 0,
+        slider_max: 1,
+        mute: false,
+        relative_key: '',
+        data: encodeFloat32(positions.map((p, i) => p + ((i + k) % 3) * 0.01)),
+      })),
+    );
+  }
+  state.selectedIds = grids;
+  state.activeId = grids[0];
+  undo.clear();
+  op = 'object.join';
+  params = {};
+} else if (scenario === 'apply') {
+  const [n, groups, keys] = args.map(Number);
+  run('mesh.primitive_grid_add', { name: 'Grid', x_subdivisions: n, y_subdivisions: n, size: 10 });
+  const o = doc.listObjects().find((x) => x.name === 'Grid')!;
+  doc.updateObject(o.id, { scale: [2, 2, 2] });
+  const positions = doc.getMesh(o.data!)!.positions;
+  doc.setVertexGroups(
+    o.data!,
+    Array.from({ length: groups }, (_, g) => ({
+      name: `Group${g}`,
+      weights: encodeFloat32(Array.from({ length: positions.length / 3 }, (_, i) => ((i + g) % 7) / 7)),
+    })),
+  );
+  doc.setShapeKeys(
+    o.data!,
+    Array.from({ length: keys }, (_, k) => ({
+      name: `Key${k}`,
+      value: 0.5,
+      slider_min: 0,
+      slider_max: 1,
+      mute: false,
+      relative_key: '',
+      data: encodeFloat32(positions.map((p, i) => p + ((i + k) % 3) * 0.01)),
+    })),
+  );
+  // a linked duplicate: the operator gives the grid a copy of the mesh first
+  doc.addObject({ type: 'MESH', name: 'Twin', data: o.data, location: [30, 0, 0] });
+  state.selectedIds = [o.id];
+  state.activeId = o.id;
+  undo.clear();
+  op = 'object.transform_apply';
+  params = { location: false, rotation: false, scale: true };
 } else if (scenario === 'image') {
   op = 'import_scene.gltf';
   params = { data_base64: base64Encode(imageGlb(Math.round(Number(args[0]) * 1024 * 1024))) };

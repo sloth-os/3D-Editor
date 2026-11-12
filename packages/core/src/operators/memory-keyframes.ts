@@ -97,9 +97,11 @@ export const BAKE_TRANSFORMS_MAX_FRAMES = 10_000;
 /**
  * Peak heap per keyframe anim.keyframes_insert_many adds, and per keyframe of the F-curve it adds them
  * to (merged with them, sorted and stored again): 100,000 keyframes into an empty curve peaked at
- * 31–45 MB, between the 100,000 keyframes of a curve at 64–73 MB (OPERATOR_FIXED_BYTES included; a
- * listener on the document's updates, as the server's, encodes the transaction's update); rounded up
- * so that both stay 10% below the estimate (51 and 89 MB).
+ * 31–45 MiB, between the 100,000 keyframes of a curve at 64–73.8 MiB (OPERATOR_FIXED_BYTES included;
+ * a listener on the document's updates, as the server's, encodes the transaction's update); rounded
+ * up so that both stay 10% below the estimate (51 and 89 MiB), and the second a quarter below it with
+ * V8's --predictable, whose collections fall at the same points in every run (68.2 MiB in every run
+ * with Node 22.23.4).
  */
 export const INSERT_MANY_BYTES_PER_KEYFRAME = 200;
 export const INSERT_MANY_REWRITE_BYTES = 400;

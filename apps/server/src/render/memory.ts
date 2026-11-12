@@ -34,6 +34,7 @@ import {
   type SimulationMemoryCheck,
   type SimulationMemoryRequest,
 } from '@3d-editor/core';
+import { historyKept } from '../mcp/history';
 import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
 
 /*
@@ -45,8 +46,9 @@ import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
  *   `operatorCheck` with its estimated peak heap (core operators/memory.ts). One that does not fit
  *   into the free heap, less the reserve, fails with code OUT_OF_MEMORY and says what
  *   to lower; so does one that adds meshes, objects or keyframes beyond what the server keeps for
- *   one project: its meshes decoded, its objects, datablocks and animation, and what a save of the
- *   project takes for a moment ({@link maxProjectMeshBytes}); and one that would take what all open
+ *   one project: its meshes decoded, its objects, datablocks and animation, what the agents' undo
+ *   histories keep in it ({@link heldByHistories}), and what a save of the project takes for a moment
+ *   ({@link maxProjectMeshBytes}); and one that would take what all open
  *   projects keep, with the largest save among them, past what the server keeps for all of them
  *   ({@link maxOpenProjectsBytes}; the projects are those the checks have seen, see
  *   {@link trackOpenProject}). {@link projectGrowthRefusal} asks the same of a change that does not
@@ -263,6 +265,10 @@ function fits(
 
 const n = (v: number): string => Math.round(v).toLocaleString('en-US');
 
+/** "1 face", "2 faces": a count and its noun, singular for 1 (as `n` rounds it). */
+const counted = (v: number, one: string, many = `${one}s`): string =>
+  `${n(v)} ${Math.round(v) === 1 ? one : many}`;
+
 const mb = (bytes: number): string => n(Math.max(0, bytes) / MB);
 
 /** Megabytes rounded up (a need): shown next to a limit rounded down, it never shows as equal to it. */
@@ -298,7 +304,7 @@ export function skippedModifierMessage(
   const e = req.estimate;
   return (
     `skipped on the server: this ${req.label} would need about ${n(e.bytes / MB)} MB of JavaScript heap for ` +
-    `a result of about ${n(e.result.faces)} faces, and ${heapClause(free, limit)}. Lower ${e.lower} to ` +
+    `a result of about ${counted(e.result.faces, 'face')}, and ${heapClause(free, limit)}. Lower ${e.lower} to ` +
     'evaluate it on the server (a browser editor evaluates it itself)'
   );
 }
@@ -372,15 +378,56 @@ export interface OpenProjectSize {
   /** Project id (the room's), '' when the document is not a room's. */
   id: string;
   name: string;
-  /** Heap it keeps: core projectStoredBytes (its meshes decoded, objects, datablocks, animation). */
+  /**
+   * Heap it keeps: core projectStoredBytes (its meshes decoded, objects, datablocks, animation), its
+   * rigid body cache and what the agents' undo histories keep in it.
+   */
   kept: number;
-  /** Heap a save of it takes for a moment beyond `kept` (core saveBytes of its objects' part). */
+  /**
+   * Heap a save of it takes for a moment beyond `kept` (core saveBytes of its objects' part, and of
+   * what the undo histories keep, {@link heldByHistories}).
+   */
   save: number;
   /**
    * Bytes its rigid body cache keeps (core rigidBodyCacheBytes), part of `kept`; absent when it holds
    * none. Not saved.
    */
   simulation?: number;
+  /**
+   * Bytes the agents' undo histories keep in it (mcp/history.ts historyKept), part of `kept`; absent
+   * when they keep none.
+   */
+  history?: number;
+}
+
+/**
+ * Heap a save of a project takes for a moment per byte the agents' undo histories keep in it (the
+ * content of the deleted items they keep, mcp/history.ts historyKept) and per item they keep: a save
+ * encodes the kept items with their content and decodes the stored state into the project's document
+ * and into a document of its own (core storage/project-store.ts syncDocument). Measured as the second
+ * save of a project against the same project without its history (agents' steps replaying the same
+ * changes): per byte kept 3.1 for vertex group weights, 3.1 for shape keys and 5.7 for meshes (53, 53
+ * and 63 MB kept; resident memory, the heap does not hold this binary data), rounded up as core
+ * SAVE_BYTES_PER_LAYER_BYTE; per item, the locations of objects that 100 moves of 1,000 and 2,000
+ * objects replaced (100,000 and 200,000 items of 152 bytes each counted): 1,103 and 1,254 bytes of
+ * heap at the peak of the save (before its garbage collections), of which {@link
+ * HISTORY_SAVE_BYTES_PER_BYTE} counts 912; rounded up.
+ */
+export const HISTORY_SAVE_BYTES_PER_BYTE = 6;
+export const HISTORY_SAVE_BYTES_PER_ITEM = 1_000;
+
+/**
+ * What the agents' undo histories keep in the document of `scene` (`kept`, bytes; core counts none of
+ * it) and what a save of the project takes for it for a moment besides (`save`). Each history keeps
+ * at most MCP_UNDO_MEMORY_MB of replaced or deleted data and its newest step, and frees it when its
+ * session (or agent id) ends (mcp/history.ts).
+ */
+export function heldByHistories(scene: SceneDoc): { kept: number; save: number } {
+  const h = historyKept(scene.ydoc);
+  return {
+    kept: h.bytes,
+    save: HISTORY_SAVE_BYTES_PER_BYTE * h.bytes + HISTORY_SAVE_BYTES_PER_ITEM * h.items,
+  };
 }
 
 interface TrackedProject {
@@ -451,20 +498,37 @@ function baseSize(t: TrackedProject): NonNullable<TrackedProject['size']> {
 }
 
 /**
- * What `scene` keeps and its save takes: counted once per version of its document, and the frames
- * its rigid body cache holds (they change with the frames evaluated, not with the document).
+ * What `scene` keeps and its save takes: counted once per version of its document, the frames its
+ * rigid body cache holds (they change with the frames evaluated, not with the document) and what the
+ * agents' undo histories keep (they change when the histories drop or collect steps).
  */
 function sizeOf(t: TrackedProject): OpenProjectSize {
-  const value = baseSize(t).value;
+  let value = baseSize(t).value;
   const simulation = rigidBodyCacheBytes(t.scene);
-  return simulation > 0 ? { ...value, kept: value.kept + simulation, simulation } : value;
+  if (simulation > 0) value = { ...value, kept: value.kept + simulation, simulation };
+  const history = heldByHistories(t.scene);
+  if (history.kept > 0)
+    value = {
+      ...value,
+      kept: value.kept + history.kept,
+      save: value.save + history.save,
+      history: history.kept,
+    };
+  return value;
 }
 
 /**
- * What the project of `scene` keeps (its rigid body cache included, `simulation`), what its save takes
- * and its objects: counted once per version of its document when it is an open project.
+ * What the project of `scene` keeps (its rigid body cache, `simulation`, and what the agents' undo
+ * histories keep, `history`, included), what its save takes and its objects: counted once per version
+ * of its document when it is an open project.
  */
-function projectSize(scene: SceneDoc): { stored: number; save: number; objects: number; simulation: number } {
+function projectSize(scene: SceneDoc): {
+  stored: number;
+  save: number;
+  objects: number;
+  simulation: number;
+  history: number;
+} {
   const t = openProjects.get(scene.ydoc);
   let stored: number;
   let save: number;
@@ -481,7 +545,14 @@ function projectSize(scene: SceneDoc): { stored: number; save: number; objects: 
     objects = project.objects;
   }
   const simulation = rigidBodyCacheBytes(scene);
-  return { stored: stored + simulation, save, objects, simulation };
+  const history = heldByHistories(scene);
+  return {
+    stored: stored + simulation + history.kept,
+    save: save + history.save,
+    objects,
+    simulation,
+    history: history.kept,
+  };
 }
 
 /** The open projects the checks count but `scene`, largest first. */
@@ -549,11 +620,12 @@ function builds(e: OperatorMemoryRequest['estimate']): string {
   const faces = !e.faces
     ? ''
     : meshes > 1
-      ? ` for ${n(meshes)} meshes of about ${n(e.faces)} faces in all`
-      : ` for a mesh of about ${n(e.faces)} faces`;
+      ? ` for ${n(meshes)} meshes of about ${counted(e.faces, 'face')} in all`
+      : ` for a mesh of about ${counted(e.faces, 'face')}`;
   const built = objects > 1 ? `${faces || ' for'}${faces ? ' and' : ''} ${n(objects)} new objects` : faces;
   const keys = e.keyframes ?? 0;
-  const withKeys = keys > 0 ? `${built || ' for'}${built ? ' and' : ''} ${n(keys)} new keyframes` : built;
+  const withKeys =
+    keys > 0 ? `${built || ' for'}${built ? ' and' : ''} ${counted(keys, 'new keyframe')}` : built;
   // vertex groups and shape keys an operator writes (core memory-layers.ts)
   const layers =
     e.layers && e.layers.bytes > 0 ? ` to write about ${mbUp(e.layers.bytes)} MB of ${e.layers.kind}` : '';
@@ -564,7 +636,7 @@ function builds(e: OperatorMemoryRequest['estimate']): string {
 function adds(e: OperatorMemoryRequest['estimate']): string {
   const parts: string[] = [];
   if ((e.objects ?? 0) > 1) parts.push(`${n(e.objects!)} new objects`);
-  if ((e.keyframes ?? 0) > 0) parts.push(`${n(e.keyframes!)} new keyframes`);
+  if ((e.keyframes ?? 0) > 0) parts.push(counted(e.keyframes!, 'new keyframe'));
   return parts.length ? ` with ${parts.join(' and ')}` : '';
 }
 
@@ -613,6 +685,8 @@ const projectNeed = (stored: number, save = 0): number => stored + Math.max(0, s
 interface ProjectRequest extends OperatorMemoryRequest {
   /** Bytes of the project's rigid body cache (core rigidBodyCacheBytes), part of storedBytes. */
   simulation?: number;
+  /** Bytes the agents' undo histories keep in the project ({@link heldByHistories}), part of storedBytes. */
+  history?: number;
   /** What it adds is (or holds) rigid body frames: a simulation, or a bake that simulates. */
   simulating?: boolean;
 }
@@ -633,25 +707,71 @@ const freeCacheAdvice = (held: boolean, projects = 1): string =>
     ? `, or free ${projects > 1 ? 'their rigid body caches' : 'its rigid body cache'} (rigidbody.cache_free)`
     : '';
 
-/** `req` with the rigid body cache of its project counted in what the project keeps. */
-function withRigidBodyCache(req: OperatorMemoryRequest): ProjectRequest {
-  const simulation = req.doc ? rigidBodyCacheBytes(req.doc) : 0;
-  return simulation > 0 ? { ...req, storedBytes: req.storedBytes + simulation, simulation } : req;
+/**
+ * `req` with what core does not count in what its project keeps: its rigid body cache, and what the
+ * agents' undo histories keep (with what a save of that takes).
+ */
+function withHeld(req: OperatorMemoryRequest): ProjectRequest {
+  if (!req.doc) return req;
+  let r: ProjectRequest = req;
+  const simulation = rigidBodyCacheBytes(req.doc);
+  if (simulation > 0) r = { ...r, storedBytes: r.storedBytes + simulation, simulation };
+  const history = heldByHistories(req.doc);
+  if (history.kept > 0)
+    r = {
+      ...r,
+      storedBytes: r.storedBytes + history.kept,
+      saveBytes: (r.saveBytes ?? 0) + history.save,
+      history: history.kept,
+    };
+  return r;
 }
 
 /**
- * "…, and a save of it about S MB more for a moment (…): T MB in all, " (', ' without a save); `layers`:
- * the save counts vertex groups or shape keys (core SAVE_BYTES_PER_LAYER_BYTE), named only then.
+ * The shares of what a project keeps that its refusals name, from 1 MB: "12 MB of it its rigid body
+ * cache", "70 MB of it kept by agents' undo histories".
  */
-function savingClause(kept: number, saved: number, layers = false): string {
+function heldShares(p: { simulation?: number; history?: number }): string[] {
+  const shares: string[] = [];
+  if ((p.simulation ?? 0) > 0) shares.push(`${mbUp(p.simulation!)} MB of it its rigid body cache`);
+  if ((p.history ?? 0) >= MB) shares.push(`${mbUp(p.history!)} MB of it kept by agents' undo histories`);
+  return shares;
+}
+
+/**
+ * The end of a refusal that names what agents' undo histories keep ({@link heldShares}): when the
+ * agents get it back (mcp/history.ts; deleting objects moves them into the deleting agent's
+ * history; a step is dropped at a later step of its agent, the newest step always kept; agent ids
+ * end 6 hours after their last session, mcp/hub.ts).
+ */
+export const HISTORY_ADVICE =
+  ". What agents' undo histories keep (the objects an agent deletes too) is freed when the agent's " +
+  'session ends (for an agent id, 6 hours after its last session) or its step is dropped: the oldest ' +
+  "steps are, beyond MCP_UNDO_STEPS steps or MCP_UNDO_MEMORY_MB of what they keep, at that agent's next step";
+
+/** {@link HISTORY_ADVICE} when one of `projects` names its undo histories' share (from 1 MB). */
+const historyAdvice = (...projects: readonly { history?: number }[]): string =>
+  projects.some((p) => (p.history ?? 0) >= MB) ? HISTORY_ADVICE : '';
+
+/**
+ * "…, and a save of it about S MB more for a moment (…): T MB in all, " (', ' without a save); `layers`:
+ * the save counts vertex groups or shape keys (core SAVE_BYTES_PER_LAYER_BYTE), named only then;
+ * `history`: the save counts what agents' undo histories keep ({@link HISTORY_SAVE_BYTES_PER_BYTE}),
+ * named only then.
+ */
+function savingClause(kept: number, saved: number, layers = false, history = false): string {
   if (!(saved > 0)) return ', ';
   const k = Math.ceil(kept / MB);
   const s = Math.ceil(saved / MB);
   const layerPart = layers ? `, ${n(SAVE_BYTES_PER_LAYER_BYTE)} times its vertex groups and shape keys` : '';
+  const historyPart = history
+    ? `, ${n(HISTORY_SAVE_BYTES_PER_BYTE)} times what agents' undo histories keep and ` +
+      `${n(HISTORY_SAVE_BYTES_PER_ITEM)} bytes for each replaced value they keep`
+    : '';
   return (
     `, and a save of it about ${n(s)} MB more for a moment (${n(SAVE_BYTES_PER_KEPT_BYTE)} times what its ` +
-    `objects, datablocks and keyframes take, ${n(SAVE_BYTES_PER_IMAGE_BYTE)} times its images${layerPart}): ` +
-    `${n(k + s)} MB in all, `
+    `objects, datablocks and keyframes take, ${n(SAVE_BYTES_PER_IMAGE_BYTE)} times its images${layerPart}` +
+    `${historyPart}): ${n(k + s)} MB in all, `
   );
 }
 
@@ -674,7 +794,8 @@ function projectLimitReason(req: ProjectRequest, limit: number): { reason: strin
   const what = `the project's ${contents(simulation > 0 || addsFrames(req))}`;
   const now =
     req.objects === undefined ? '' : ` with ${n(req.objects)} object${req.objects === 1 ? '' : 's'}`;
-  const cache = simulation > 0 ? `${mbUp(simulation)} MB of it its rigid body cache` : '';
+  const shares = heldShares(req).join(', ');
+  const history = (req.history ?? 0) > 0;
   const keeps =
     `more than the ${mbDown(max)} MB the server's process keeps for one project (half of its ${mb(limit)} MB heap ` +
     `less the ${mb(serverHeapReserve(limit))} MB it keeps for its other work)`;
@@ -683,15 +804,15 @@ function projectLimitReason(req: ProjectRequest, limit: number): { reason: strin
   if (projectNeed(req.storedBytes, save) > max)
     return {
       reason:
-        `${what} already take about ${mbUp(req.storedBytes)} MB of memory${now}${cache ? ` (${cache})` : ''}` +
-        `${savingClause(req.storedBytes, save, layers)}${keeps}`,
+        `${what} already take about ${mbUp(req.storedBytes)} MB of memory${now}${shares ? ` (${shares})` : ''}` +
+        `${savingClause(req.storedBytes, save, layers, history)}${keeps}`,
       already: true,
     };
   return {
     reason:
       `${what} would then take about ${mbUp(kept)} MB of memory${adds(e)} (now ${mb(req.storedBytes)} MB${now}` +
-      `${cache ? `, ${cache}` : ''})` +
-      `${savingClause(kept, save + (e.addedSaveBytes ?? 0), layers || (e.layers?.bytes ?? 0) > 0)}${keeps}`,
+      `${shares ? `, ${shares}` : ''})` +
+      `${savingClause(kept, save + (e.addedSaveBytes ?? 0), layers || (e.layers?.bytes ?? 0) > 0, history)}${keeps}`,
     already: false,
   };
 }
@@ -707,7 +828,7 @@ export function storedMeshesMessage(req: ProjectRequest, limit = heapLimitBytes(
     reason: projectLimitReason({ ...req, storedBytes: Infinity }, limit)!.reason,
     already: true,
   };
-  const free = freeCacheAdvice((req.simulation ?? 0) > 0);
+  const free = freeCacheAdvice((req.simulation ?? 0) > 0) + historyAdvice(req);
   if (r.already)
     return `not run on the server: ${r.reason}, and this operator would add to them. Delete objects and meshes the project no longer needs${free}`;
   const e = req.estimate;
@@ -745,13 +866,10 @@ function openProjectsReason(
   const max = maxOpenProjectsBytes(limit);
   const all = othersKept + kept;
   if (all + largestSave <= max) return null;
-  const named = others
-    .slice(0, NAMED_OPEN_PROJECTS)
-    .map(
-      (o) =>
-        `'${o.name}'${o.id ? ` (${o.id})` : ''} ${mbUp(o.kept)} MB` +
-        (o.simulation ? ` (${mbUp(o.simulation)} MB of it its rigid body cache)` : ''),
-    );
+  const named = others.slice(0, NAMED_OPEN_PROJECTS).map((o) => {
+    const shares = heldShares(o);
+    return `'${o.name}'${o.id ? ` (${o.id})` : ''} ${mbUp(o.kept)} MB${shares.length ? ` (${shares.join(', ')})` : ''}`;
+  });
   const rest = others.slice(NAMED_OPEN_PROJECTS);
   if (rest.length) named.push(`${n(rest.length)} more ${mbUp(rest.reduce((t, o) => t + o.kept, 0))} MB`);
   const a = Math.ceil(all / MB);
@@ -791,7 +909,8 @@ export function openProjectsMessage(
     `not run on the server: ${reason}. ` +
     (e.lower ? `Lower ${e.lower}, or delete ` : 'Delete ') +
     OPEN_PROJECTS_ADVICE +
-    freeCacheAdvice(heldRigidBodyCaches(req, others), 2)
+    freeCacheAdvice(heldRigidBodyCaches(req, others), 2) +
+    historyAdvice(req, ...others)
   );
 }
 
@@ -817,7 +936,7 @@ export function projectGrowthRefusal(
   trackOpenProject(scene);
   const limit = (opts.heapLimit ?? heapLimitBytes)();
   const project = projectObjects(scene);
-  const req = withRigidBodyCache({
+  const req = withHeld({
     operator: '',
     estimate: {
       bytes: 0,
@@ -838,7 +957,7 @@ export function projectGrowthRefusal(
 export function refusedDecodeMessage(req: MeshMemoryRequest, free: number, limit = heapLimitBytes()): string {
   const l = req.layout;
   return (
-    `this mesh of ${n(Math.max(0, l.corners - 2 * l.faces))} triangles was not loaded on the server: decoding it ` +
+    `this mesh of ${counted(Math.max(0, l.corners - 2 * l.faces), 'triangle')} was not loaded on the server: decoding it ` +
     `needs about ${mb(req.bytes)} MB of JavaScript heap, and ${heapClause(free, limit)} ` +
     '(the open projects keep their meshes decoded). Delete or simplify large meshes, or work on it in a browser ' +
     'editor that has the project open, which loads it in its own memory'
@@ -862,7 +981,7 @@ export function operatorCheck(
     const limit = heapLimit();
     trackOpenRoom(req.doc);
     if (e.addedStoredBytes > 0) {
-      const r = withRigidBodyCache(req);
+      const r = withHeld(req);
       if (projectLimitReason(r, limit)) return storedMeshesMessage(r, limit);
       const others = otherOpenProjects(req.doc);
       if (openProjectsReason(r, others, limit)) return openProjectsMessage(r, others, limit);
@@ -886,12 +1005,17 @@ export function decodeCheck(
   };
 }
 
-/** "not simulated on the server: simulating N rigid bodies to frame F keeps K more frames of their poses, about X MB". */
+/**
+ * "not simulated on the server: simulating N rigid bodies to frame F keeps K more frames of their poses, about X MB"
+ * ("1 rigid body … of its pose").
+ */
 function simulationClause(req: SimulationMemoryRequest): string {
   const bodies = req.bodies.simulated + req.bodies.kinematic;
+  const one = Math.round(bodies) === 1;
   return (
-    `not simulated on the server: simulating ${n(bodies)} rigid bod${bodies === 1 ? 'y' : 'ies'} to frame ` +
-    `${n(req.frame)} keeps ${n(req.frames)} more frames of their poses, about ${mbUp(req.bytes)} MB`
+    `not simulated on the server: simulating ${counted(bodies, 'rigid body', 'rigid bodies')} to frame ` +
+    `${n(req.frame)} keeps ${counted(req.frames, 'more frame')} of ${one ? 'its pose' : 'their poses'}, about ` +
+    `${mbUp(req.bytes)} MB`
   );
 }
 
@@ -923,13 +1047,15 @@ export function simulationLimitMessage(
   req: SimulationMemoryRequest,
   reason: string,
   others?: readonly OpenProjectSize[],
+  history = 0,
 ): string {
   const held = !!others?.some((o) => (o.simulation ?? 0) > 0);
   return (
     `${simulationClause(req)}, and ${reason}. ${SIMULATION_ADVICE}, or delete ` +
     (others
       ? `${OPEN_PROJECTS_ADVICE}${freeCacheAdvice(held, 2)}`
-      : 'objects and meshes the project no longer needs')
+      : 'objects and meshes the project no longer needs') +
+    historyAdvice({ history }, ...(others ?? []))
   );
 }
 
@@ -963,13 +1089,14 @@ export function simulationCheck(
         objects: p.objects,
         doc,
         simulation: p.simulation,
+        history: p.history,
         simulating: true,
       };
       const project = projectLimitReason(r, limit);
-      if (project) return simulationLimitMessage(req, project.reason);
+      if (project) return simulationLimitMessage(req, project.reason, undefined, p.history);
       const others = otherOpenProjects(doc);
       const all = openProjectsReason(r, others, limit);
-      if (all) return simulationLimitMessage(req, all, others);
+      if (all) return simulationLimitMessage(req, all, others, p.history);
     }
     const { ok, free } = fits(req.bytes, heapFree, collect, limit);
     return ok ? null : refusedSimulationMessage(req, free, limit);
@@ -1161,7 +1288,7 @@ export function checkMainThreadRender(
   const limit = Math.round(limitBytes / MB);
   throw new RenderOutOfMemoryError(
     `${OUT_OF_MEMORY_PREFIX}this ${what} was not started: it needs about ${Math.ceil(est.bytes / MB)} MB of JavaScript heap ` +
-      `(about ${est.triangles.toLocaleString('en-US')} triangles), and ${what}s run in the server's own process ` +
+      `(about ${counted(est.triangles, 'triangle')}), and ${what}s run in the server's own process ` +
       `(its render processes are off: RENDER_WORKERS=0, or they could not start), which has ` +
       `${Math.max(0, Math.floor(free / MB))} MB of its ${limit} MB heap free; running out of it would stop the server`,
     limit,
