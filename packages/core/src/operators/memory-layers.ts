@@ -40,6 +40,8 @@ import {
  * included.
  * (3) Two runs each; Apply Scale of an object whose mesh a second object uses: the copy of the mesh
  * gets its groups and keys, then its keys are written again, scaled ({@link movedLayerWrites}).
+ * The runs with 100 bones or 100 groups used the armature's first bone and a chain of 100 more: 101
+ * deforming bones and 101 groups (101 × 4 bytes × 251,001 vertices = 96.7 MiB).
  *
  * ARMATURE_AUTO also solves the bone heat of every vertex: 79.8–611.2 MiB at the peak on meshes of
  * 10,201 to 491,401 vertices with 4 to 100 bones, up to 1,373 bytes per vertex beyond what the table's

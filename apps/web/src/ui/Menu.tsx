@@ -133,19 +133,30 @@ export function MenuButton(p: { label: string; items: () => MenuItem[]; testId?:
 /** Host for popup menus requested via `wm.call_menu` (Shift+A, X, Shift+S, Z, RMB…). */
 export function PopupMenuHost() {
   const m = popupMenu.value;
+  const host = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!m) return;
-    const close = () => (popupMenu.value = null);
-    const t = setTimeout(() => window.addEventListener('pointerdown', close), 0);
+    // a press anywhere outside the menu (and its submenus) closes it, also on what stops the press for
+    // itself (a top-bar menu button or one of its items, a window): the listener runs in the capture
+    // phase. A menu left open stayed above a window opened from the top bar.
+    const close = (e: Event) => {
+      if (host.current?.contains(e.target as Node)) return;
+      popupMenu.value = null;
+    };
+    const t = setTimeout(() => window.addEventListener('pointerdown', close, true), 0);
     return () => {
       clearTimeout(t);
-      window.removeEventListener('pointerdown', close);
+      window.removeEventListener('pointerdown', close, true);
     };
   }, [m]);
   if (!m || !session.value) return null;
   const items = menuByName(m.name);
   if (!items.length) return null;
-  return <MenuList items={items} x={m.x - 20} y={m.y - 10} onClose={() => (popupMenu.value = null)} />;
+  return (
+    <div ref={host} style={{ display: 'contents' }}>
+      <MenuList items={items} x={m.x - 20} y={m.y - 10} onClose={() => (popupMenu.value = null)} />
+    </div>
+  );
 }
 
 /** F3 operator search. */

@@ -1,9 +1,10 @@
-import { useState } from 'preact/hooks';
+import { useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { ROOT_COLLECTION_ID, type CollectionData, type ObjectData } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
 import { run } from '../editor/editor';
 import { Icon, type IconName } from './icons';
+import { composing, useEditedText } from './fields/fields';
 import { activePropertiesTab, type PropertiesTabId } from './properties/Properties';
 import { validItems } from './properties/ConstraintsTab';
 
@@ -161,6 +162,53 @@ function badges(groups: SubGroup[]): { key: string; icon: IconName; tab: Propert
   );
 }
 
+/**
+ * The box that renames an object (double-click). What is typed is kept in the box's own state: the
+ * box showed the stored name, so every redraw of the outliner (any change to the project, by an agent
+ * or another person) put the stored name back over the typing, and selected it all again. A rename of
+ * this object while typing replaces the text, as in the other text fields. Enter renames (the operator
+ * refuses an empty name), Escape cancels, and leaving the box renames to a changed name that is not
+ * empty. The blur that browsers fire when they remove the focused box after Enter or Escape does
+ * nothing more.
+ */
+function RenameBox(p: {
+  name: string;
+  onRename: (name: string, enter: boolean) => void;
+  onCancel: () => void;
+}) {
+  const [text, setText] = useEditedText(p.name);
+  const box = useRef<HTMLInputElement>(null);
+  const done = useRef(false);
+  useLayoutEffect(() => box.current?.select(), []);
+  return (
+    <input
+      ref={box}
+      class="textfield"
+      autoFocus
+      value={text}
+      onInput={(e) => setText((e.target as HTMLInputElement).value)}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (composing(e) || done.current) return;
+        if (e.key === 'Enter') {
+          done.current = true;
+          p.onRename((e.target as HTMLInputElement).value, true);
+        }
+        if (e.key === 'Escape') {
+          done.current = true;
+          p.onCancel();
+        }
+      }}
+      onBlur={(e) => {
+        if (done.current) return;
+        done.current = true;
+        p.onRename((e.target as HTMLInputElement).value, false);
+      }}
+    />
+  );
+}
+
 /** Scene hierarchy: collections → objects → children, with visibility toggles, rename and drag-to-parent. */
 export function Outliner({ session }: { session: ProjectSession }) {
   void session.revision.value;
@@ -292,25 +340,13 @@ export function Outliner({ session }: { session: ProjectSession }) {
         </span>
         <Icon name={objectIcon(o)} size={14} />
         {renaming === o.id ? (
-          <input
-            class="textfield"
-            autoFocus
-            value={o.name}
-            onClick={(e) => e.stopPropagation()}
-            onKeyDown={(e) => {
-              e.stopPropagation();
-              if (e.key === 'Enter') {
-                run('object.rename', { object: o.id, name: (e.target as HTMLInputElement).value }, 'ui');
-                setRenaming(null);
-              }
-              if (e.key === 'Escape') setRenaming(null);
-            }}
-            onBlur={(e) => {
-              const v = (e.target as HTMLInputElement).value;
-              if (v && v !== o.name) run('object.rename', { object: o.id, name: v }, 'ui');
+          <RenameBox
+            name={o.name}
+            onRename={(name, enter) => {
+              if (enter || (name && name !== o.name)) run('object.rename', { object: o.id, name }, 'ui');
               setRenaming(null);
             }}
-            ref={(el) => el?.select()}
+            onCancel={() => setRenaming(null)}
           />
         ) : (
           <span class={`name ${o.hide_viewport ? 'hidden' : ''}`}>{o.name}</span>

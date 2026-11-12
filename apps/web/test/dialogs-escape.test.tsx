@@ -167,7 +167,27 @@ it('an Escape used before it reaches the window, or one that ends a composition,
   expect(dialog.value).toBe('about');
   fireEvent.keyDown(header, { key: 'Escape', isComposing: true });
   expect(dialog.value).toBe('about');
+  // Safari sends the key that ends a composition after it, with key code 229
+  fireEvent.keyDown(header, { key: 'Escape', keyCode: 229 });
+  expect(dialog.value).toBe('about');
   escape(header);
+  expect(dialog.value).toBeNull();
+});
+
+it('the repeats of a held Escape close no window: the press that cancelled the typing does', async () => {
+  // regression: the first press of a held Escape cancelled the typing, and its first repeat closed
+  // the window
+  const { container } = render(<DialogHost />);
+  await open('projects');
+  const name = container.querySelector<HTMLInputElement>('input[placeholder="Project name"]')!;
+  name.focus();
+  fireEvent.input(name, { target: { value: 'Typed' } });
+  escape(name);
+  expect(name.value).toBe('Untitled');
+  fireEvent.keyDown(name, { key: 'Escape', repeat: true });
+  fireEvent.keyDown(name, { key: 'Escape', repeat: true });
+  expect(dialog.value).toBe('projects');
+  escape(name);
   expect(dialog.value).toBeNull();
 });
 
@@ -225,6 +245,48 @@ it('Escape stops a running Render Animation and keeps the window open; the next 
   // regression: the window took Escape again only after the next frame, as its handler was added by an
   // effect; now the commit that shows the render stopped adds it
   expect(dialog.value).toBe('render');
+  // regression: the repeats of the held Escape that stopped the render closed the window, and the
+  // frames it kept were lost
+  fireEvent.keyDown(document.body, { key: 'Escape', repeat: true });
+  expect(dialog.value).toBe('render');
+  expect(container.querySelector('[data-testid="render-animation-cancelled"]')).not.toBeNull();
   escape();
   expect(dialog.value).toBeNull();
+});
+
+it('an Escape pressed in the commit that starts a render stops it', async () => {
+  // regression: the render window's own Escape handler was added by an effect, so an Escape pressed
+  // before the next frame found the old handler (no render yet) while the window, no longer
+  // dismissible, had removed its own: the Escape was lost and the whole animation rendered
+  const s = fakeSession();
+  sessionSignal.value = s;
+  s.doc.updateScene({ frame_start: 1, frame_end: 400 });
+  s.doc.updateRender({ engine: 'RASTER', resolution_x: 8, resolution_y: 8, resolution_percentage: 100 });
+  viewport.engine = {
+    renderPixels: (o: RenderImageOptions) => ({
+      width: o.width!,
+      height: o.height!,
+      data: new Uint8ClampedArray(o.width! * o.height! * 4),
+    }),
+  } as unknown as ViewportEngine;
+  const { container } = render(<DialogHost />);
+  await open('render', { animation: true });
+  const pressed = new Promise<void>((resolve) => {
+    // runs after the commit that shows the Cancel button, before any frame
+    const observer = new MutationObserver(() => {
+      if (!container.querySelector('[data-testid="render-animation-cancel"]')) return;
+      observer.disconnect();
+      escape();
+      resolve();
+    });
+    observer.observe(container, { childList: true, subtree: true, attributes: true });
+  });
+  // not in act(): its effects run as in the browser
+  container
+    .querySelector('[data-testid="render-animation-start"]')!
+    .dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await pressed;
+  await waitFor(() => expect(container.querySelector('[data-testid="render-animation-cancel"]')).toBeNull());
+  expect(dialog.value).toBe('render');
+  expect(container.querySelector('[data-testid="render-animation-cancelled"]')).not.toBeNull();
 });

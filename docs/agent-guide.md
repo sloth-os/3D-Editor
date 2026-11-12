@@ -648,26 +648,27 @@ their final size instead of scaling small ones.
   with 4 million triangles, then twice more, 0.7–1.2 s after it began, for at most 0.2 s each),
   while it merges what storage holds of a project that an editor has open, once a minute
   (0.3–1.9 s), and while it sends a project to an editor that has no copy of it yet (0.2–1.7 s); a
-  request sent during such a hold waits for the rest of it. A save after an agent deleted many
-  objects holds longer, as the agent's undo history keeps the deleted objects and the save carries
-  them (1.6–1.8 s after it deleted 10,000 linked cubes). X-ray changes nothing in `MATERIAL` or
-  `RENDERED` shading outside Edit Mode. A screenshot of a scene of millions of triangles takes half
-  a second or more in any shading (0.5–5.3 s per `SOLID` screenshot with 4 million), and several
-  times as long for the first `WIREFRAME` screenshot or frame of such a scene, while the editor
-  builds the wires of every mesh. With the default `renderer: "auto"`, `render_image` waits 15 s for
-  such an editor's raster image and then renders on the server (`note` says so);
-  `renderer: "browser"` waits up to 55 s and then fails, saying what to do. For `editor_command`
-  raise `timeout_ms` (default 10000, at most 55000: both stay under the 60 s an MCP client built on
-  the TypeScript SDK waits by default) and take screenshots with `shading: "SOLID"`; for a quick
-  look use `render_image {shading: "SOLID"}`: grey clay, which renders on the server while the
-  editor is busy (right after a timeout) and when the scene's render engine is `PATHTRACER` (1.1–4.0
-  s at 1280×720 for that scene, 1.2–7.4 s for 2 million triangles, 2.2–14 s for 4 or 6 million); a
-  scene that needs more memory than a server render has fails with "Rendering failed: out of memory:
-  …" (`OUT_OF_MEMORY`), and then only a screenshot with a larger `timeout_ms` shows it. Make final
-  images with `render_image`. These times are the ranges measured on a calm machine with 4 CPUs, the
-  editor in software WebGL (SwiftShader), widened by 25 % (the longest `SOLID` screenshot with 4
-  million triangles by 50 %; [how](mcp.md#live-editors)); on a busy one (load averages of 3–15) the
-  same steps took up to 3.5 times as long.
+  request sent during such a hold waits for the rest of it. Saves of a project with many objects
+  hold longer, as every save after the first merges the stored copy (0.7–0.8 s for the save after an
+  agent made 10,000 linked cubes), and an agent's undo history keeps the objects it deleted, which
+  the save carries too (1.6–1.8 s after it deleted the 10,000 cubes). X-ray changes nothing in
+  `MATERIAL` or `RENDERED` shading outside Edit Mode. A screenshot of a scene of millions of
+  triangles takes half a second or more in any shading (0.5–5.3 s per `SOLID` screenshot with 4
+  million), and several times as long for the first `WIREFRAME` screenshot or frame of such a scene,
+  while the editor builds the wires of every mesh. With the default `renderer: "auto"`,
+  `render_image` waits 15 s for such an editor's raster image and then renders on the server (`note`
+  says so); `renderer: "browser"` waits up to 55 s and then fails, saying what to do. For
+  `editor_command` raise `timeout_ms` (default 10000, at most 55000: both stay under the 60 s an MCP
+  client built on the TypeScript SDK waits by default) and take screenshots with `shading: "SOLID"`;
+  for a quick look use `render_image {shading: "SOLID"}`: grey clay, which renders on the server
+  while the editor is busy (right after a timeout) and when the scene's render engine is
+  `PATHTRACER` (1.1–4.0 s at 1280×720 for that scene, 1.2–7.4 s for 2 million triangles, 2.2–14 s
+  for 4 or 6 million); a scene that needs more memory than a server render has fails with "Rendering
+  failed: out of memory: …" (`OUT_OF_MEMORY`), and then only a screenshot with a larger `timeout_ms`
+  shows it. Make final images with `render_image`. These times are the ranges measured on a calm
+  machine with 4 CPUs, the editor in software WebGL (SwiftShader), widened by 25 % (the longest
+  `SOLID` screenshot with 4 million triangles by 50 %; [how](mcp.md#live-editors)); on a busy one
+  (load averages of 3–15) the same steps took up to 3.5 times as long.
 - An editor keeps drawing an image the server stopped waiting for, and its next renders and commands
   wait behind it; a screenshot that timed out still compiles what it needs and keeps it, so
   retrying it waits for the rest and compiles nothing again. Until it has finished,

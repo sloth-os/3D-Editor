@@ -946,6 +946,26 @@ interface SummaryContext {
    * (5,000 listed objects of 10,000 read 50 million).
    */
   users(dataId: string): number;
+  /**
+   * The F-curves and the drivers of a target (an object or a data block), as SceneDoc.listFCurves
+   * and listDrivers give them, from one read of all of them per context: listing them for each
+   * listed object read every F-curve and driver again, so get_scene on an animated scene took time
+   * in N² (5,000 listed objects of 10,000 cubes with 3 F-curves each took 21-27 s). Each call
+   * returns a new array.
+   */
+  fcurvesOf(id: string): FCurve[];
+  driversOf(id: string): DriverData[];
+}
+
+/** Items by the id of their target, each list in the order SceneDoc lists them. */
+function byTarget<T extends { target_id: string }>(items: T[]): Map<string, T[]> {
+  const out = new Map<string, T[]>();
+  for (const item of items) {
+    const list = out.get(item.target_id);
+    if (list) list.push(item);
+    else out.set(item.target_id, [item]);
+  }
+  return out;
 }
 
 /**
@@ -987,6 +1007,8 @@ function summaryContext(
       : null;
   let fs: FrameState | null = null;
   let users: Map<string, number> | null = null;
+  let fcurves: Map<string, FCurve[]> | null = null;
+  let drivers: Map<string, DriverData[]> | null = null;
   return {
     ev,
     problems: problemsByObject(scene, ev),
@@ -999,6 +1021,8 @@ function summaryContext(
       return fs.get<{ shape_keys: ShapeKeyData[] }>('mesh', meshId)?.shape_keys ?? scene.getShapeKeys(meshId);
     },
     users: (dataId) => (users ??= scene.dataUserCounts()).get(dataId) ?? 0,
+    fcurvesOf: (id) => [...((fcurves ??= byTarget(scene.listFCurves())).get(id) ?? [])],
+    driversOf: (id) => [...((drivers ??= byTarget(scene.listDrivers())).get(id) ?? [])],
   };
 }
 
@@ -1011,11 +1035,15 @@ export function summarizeObject(
   detailed = false,
 ) {
   const max = detailed ? OBJECT_LIST : SCENE_LIST;
-  const fcurves = scene.listFCurves(o.id);
-  if (o.data) fcurves.push(...scene.listFCurves(o.data));
+  // a listing reads every F-curve and driver once (the context's index); get_object reads only its
+  // object's, as building the index for one object costs more than it saves
+  const fcurvesOf = (id: string) => (ctx && !detailed ? ctx.fcurvesOf(id) : scene.listFCurves(id));
+  const driversOf = (id: string) => (ctx && !detailed ? ctx.driversOf(id) : scene.listDrivers(id));
+  const fcurves = fcurvesOf(o.id);
+  if (o.data) fcurves.push(...fcurvesOf(o.data));
   const animated = fcurves.map((f) => fcurveLabel(f, o.id));
-  const drivers = scene.listDrivers(o.id);
-  if (o.data) drivers.push(...scene.listDrivers(o.data));
+  const drivers = driversOf(o.id);
+  if (o.data) drivers.push(...driversOf(o.data));
   const constraintErrors = ev?.constraintErrors ?? [];
   const problems = (ctx?.problems.get(o.id) ?? []).map((e) => `${e.source.split(':')[0]}: ${e.message}`);
   const instances = ctx?.instances.byOwner.get(o.id) ?? 0;
@@ -1402,6 +1430,14 @@ function sceneSummary(scene: SceneDoc, opts: SceneSummaryOptions) {
       : {};
   const maxObjects = Math.max(1, opts.maxObjects ?? DEFAULT_MAX_OBJECTS);
   const listed = objects.slice(0, maxObjects);
+  // the members of every collection from one pass, in the objects' order (by name): filtering all
+  // objects for each collection took time in collections × objects (4 s with 10,000 of each)
+  const membersByCollection = new Map<string, string[]>();
+  for (const o of objects) {
+    const members = membersByCollection.get(o.collection);
+    if (members) members.push(o.name);
+    else membersByCollection.set(o.collection, [o.name]);
+  }
   const rigidBodies = objects.filter((o) => o.rigid_body).length;
   const drivers = scene.listDrivers().length;
   return {
@@ -1442,7 +1478,7 @@ function sceneSummary(scene: SceneDoc, opts: SceneSummaryOptions) {
       : {}),
     materials: materialSummary(scene, materialUsers),
     collections: scene.listCollections().map((c) => {
-      const members = objects.filter((o) => o.collection === c.id).map((o) => o.name);
+      const members = membersByCollection.get(c.id) ?? [];
       return {
         id: c.id,
         name: c.name,

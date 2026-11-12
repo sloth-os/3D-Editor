@@ -252,7 +252,7 @@ function MeshData({ s, o }: { s: ProjectSession; o: ObjectData }) {
             ? 'Flat shaded'
             : smoothFaces === st.faces
               ? 'Smooth shaded'
-              : `${smoothFaces} smooth faces`}
+              : `${smoothFaces} smooth face${smoothFaces === 1 ? '' : 's'}`}
         </div>
         <div style={{ display: 'flex', gap: '4px' }}>
           <button class="btn" onClick={() => run('object.shade_flat', {}, 'ui')}>

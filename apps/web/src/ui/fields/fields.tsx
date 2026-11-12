@@ -65,6 +65,13 @@ export function NumberField(p: NumberFieldProps) {
   const fromD = p.fromDisplay ?? ((v: number) => v);
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState('');
+  const entry = useRef<HTMLInputElement>(null);
+  // the text is selected once, when the entry opens: a ref callback written in place runs again on
+  // every render, and every typed key renders the field, so each key replaced what was typed before it
+  // ("1.5" typed key by key gave 5)
+  useLayoutEffect(() => {
+    if (editing) entry.current?.select();
+  }, [editing]);
   // whether the text entry is still open: Enter and Escape close it, so the blur that browsers fire
   // when they remove the focused input does not commit (or cancel into a commit) a second time
   const entryOpen = useRef(false);
@@ -139,15 +146,16 @@ export function NumberField(p: NumberFieldProps) {
           value={text}
           onInput={(e) => setText((e.target as HTMLInputElement).value)}
           onKeyDown={(e) => {
+            e.stopPropagation();
+            if (composing(e)) return;
             if (e.key === 'Enter') commit();
             if (e.key === 'Escape') {
               entryOpen.current = false;
               setEditing(false);
             }
-            e.stopPropagation();
           }}
           onBlur={commit}
-          ref={(el) => el?.select()}
+          ref={entry}
         />
       ) : (
         <>
@@ -356,11 +364,22 @@ export function ToggleGroup(p: {
 }
 
 /**
+ * A key that confirms or cancels an IME composition belongs to the composition, not to the field or
+ * window it is typed in: Chrome and Firefox mark it `isComposing`, Safari sends it after the
+ * composition ended, with key code 229.
+ */
+export function composing(e: KeyboardEvent): boolean {
+  return e.isComposing || e.keyCode === 229;
+}
+
+/**
  * The text a field edits: it starts as `value` and is set to it again whenever `value` changes (an
- * undo, an agent, an edit that failed). It is set in the commit that brings the new value: an effect
- * would run after the next frame, or sooner when the field renders again, and on a new field it
- * replaced what was typed in it before then (a name typed as soon as the Projects window appeared, so
- * the Escape meant to cancel the typing closed the window).
+ * undo, an agent, another person's edit, an edit the field committed). An edit the document refuses
+ * leaves `value` as it was, so the field keeps the refused text until Escape or the next change. The
+ * text is set in the commit that brings the new value: an effect would run after the next frame, or
+ * sooner when the field renders again, and on a new field it replaced what was typed in it before then
+ * (a name typed as soon as the Projects window appeared, so the Escape meant to cancel the typing
+ * closed the window).
  */
 export function useEditedText(value: string): [string, (text: string) => void] {
   const [text, setText] = useState(value);
@@ -408,6 +427,7 @@ export function TextField(p: {
         if (p.commitOnBlur === false) p.onChange((e.target as HTMLInputElement).value);
       }}
       onKeyDown={(e) => {
+        if (composing(e)) return e.stopPropagation();
         if (e.key === 'Enter') commit();
         if (e.key === 'Escape') {
           // with no typing to cancel, Escape goes on to what holds the field (it closes a dialog)

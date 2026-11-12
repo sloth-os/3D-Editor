@@ -46,15 +46,19 @@ export function Modal(p: {
   dismissible?: boolean;
 }) {
   const dismissible = p.dismissible !== false;
-  // Escape closes the dialog wherever the focus is in it: on the window, after the fields in the dialog
-  // (a text or number entry being typed in uses an Escape to cancel the typing and stops it) and after
-  // the render windows' own handler (an Escape that stops a running render keeps the window open).
-  // Added in the commit that shows the window (or makes it dismissible again when a render stops), not
-  // after the next frame as an effect would: an Escape pressed as soon as the window appeared was lost.
+  // Escape closes the dialog wherever the focus is in it. The handler is on the window, after those
+  // that use an Escape first and keep the window open: a text or number entry being typed in (it
+  // cancels the typing), a render window's own handler (it stops a running render) and the editor's
+  // keymap (it closes a popup menu or the operator search above the window). The repeats of a held
+  // Escape close nothing, as in the keymap: the press that cancelled the typing or stopped the render
+  // does not then close the window and the image it kept. Nor does an Escape that ends an IME
+  // composition (Safari sends it after the composition, with key code 229). The handler is added in
+  // the commit that shows the window (or makes it dismissible again when a render stops), not after
+  // the next frame as an effect would: an Escape pressed as soon as the window appeared was lost.
   useLayoutEffect(() => {
     if (!dismissible) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+      if (e.key !== 'Escape' || e.repeat || e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
       e.preventDefault();
       closeDialog();
     };

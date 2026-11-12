@@ -276,4 +276,31 @@ describe('operators that change many objects', () => {
       expect(few.childrenOf + few.dataUsers, operator).toBe(0);
     }
   });
+
+  it('count the users of every data value as dataUsers does, also values a malformed document holds', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const shared = doc.addMesh('Shared', createCube({ size: 1 }));
+    const own = doc.addMesh('Own', createCube({ size: 1 }));
+    doc.transact(() => {
+      for (let i = 0; i < 3; i++) doc.addObject({ type: 'MESH', name: `Linked.${i}`, data: shared });
+      doc.addObject({ type: 'MESH', name: 'Single', data: own });
+      doc.addObject({ type: 'EMPTY', name: 'Empty' });
+      doc.addObject({ type: 'MESH', name: 'Gone', data: 'no-such-mesh' });
+    });
+    // a client can write any value in an object's data (sync updates are not checked field by field)
+    const objects = doc.ydoc.getMap('objects');
+    doc.transact(() => {
+      for (const name of ['Odd.0', 'Odd.1']) {
+        const y = objects.get(doc.findObjectByName('Linked.0')!.id) as Y.Map<unknown>;
+        const copy = new Y.Map<unknown>();
+        for (const [k, v] of y.entries()) copy.set(k, k === 'name' ? name : k === 'data' ? 5 : v);
+        objects.set(`id-${name}`, copy);
+      }
+    });
+    const counts = doc.dataUserCounts();
+    for (const data of [shared, own, 'no-such-mesh', 5 as unknown as string, 'unused'])
+      expect(counts.get(data) ?? 0, String(data)).toBe(doc.dataUsers(data));
+    expect(counts.get(shared)).toBe(3);
+    expect(counts.get(5 as unknown as string)).toBe(2);
+  });
 });

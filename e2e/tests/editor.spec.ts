@@ -47,6 +47,36 @@ test.describe('editor', () => {
     await expect(page.getByTestId('loc-0')).toContainText('2 m');
   });
 
+  test('number entries and the outliner rename box keep every typed key; a press elsewhere closes a popup menu', async ({
+    page,
+  }) => {
+    await newProject(page);
+    await page.getByTestId('outliner-Cube').click();
+    await page.getByTestId('prop-tab-object').click();
+    // key by key, as a person types (the entry selected its text again after every key: 1.5 gave 5)
+    await page.getByTestId('loc-0').click();
+    await expect(page.locator('[data-testid=loc-0] input')).toBeFocused();
+    await page.keyboard.type('1.5', { delay: 20 });
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('loc-0')).toContainText('1.5 m');
+    await page.getByTestId('outliner-Cube').dblclick();
+    await expect(page.locator('[data-testid=outliner-Cube] input')).toBeFocused();
+    await page.keyboard.type('Crate', { delay: 20 });
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('outliner-Crate')).toBeVisible();
+    // a popup menu closes on a press on a top-bar menu (which keeps its presses for itself), so it is
+    // not left above the window opened from there; one Escape then closes the window
+    await page.getByTestId('viewport').hover();
+    await page.keyboard.press('Shift+A');
+    await expect(page.locator('.menu')).toHaveCount(1);
+    await page.getByTestId('menu-button-edit').click();
+    await page.locator('.menu .menu-item', { hasText: 'Preferences…' }).click();
+    await expect(page.getByTestId('preferences-dialog')).toBeVisible();
+    await expect(page.locator('.menu')).toHaveCount(0);
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('preferences-dialog')).toHaveCount(0);
+  });
+
   test('G X X moves along the object’s own X axis (LOCAL); a third X removes the constraint', async ({
     page,
   }) => {

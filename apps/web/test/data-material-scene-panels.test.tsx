@@ -8,6 +8,7 @@ import {
   createGrid,
   decodeFloat32,
   defaultBone,
+  edgeKey,
   defaultRigidBody,
   emptySelection,
   fcurveKey,
@@ -413,6 +414,32 @@ describe('Object Data tab: mesh statistics', () => {
     act(() => s.doc.setMesh(meshId, grid));
     expect(container.textContent).toContain(statsText(grid));
     expect(container.textContent).toContain('Smooth shaded');
+  });
+
+  it('shows partly smooth faces and the seams and sharp edges of the new mesh', () => {
+    // the counts the tab keeps per mesh: seams and sharp edges differ, so swapped counts show
+    localStorage.setItem('3d-editor:panel:Attributes', '1');
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'data';
+    const meshId = s.doc.findObjectByName('Cube')!.data!;
+    const { container } = render(<Properties session={s} />);
+    const hints = () => [...container.querySelectorAll('.hint')].map((h) => h.textContent);
+    expect(hints()).toContain('Seams: 0 · Sharp edges: 0');
+    const grid = createGrid({ x_subdivisions: 3, y_subdivisions: 2 });
+    grid.faceSmooth = grid.faces.map((_, i) => i < 2);
+    grid.edgeAttrs = {
+      [edgeKey(0, 1)]: { seam: true },
+      [edgeKey(1, 2)]: { sharp: true },
+      [edgeKey(2, 3)]: { sharp: true },
+    };
+    act(() => s.doc.setMesh(meshId, grid));
+    expect(hints()).toContain('2 smooth faces');
+    expect(hints()).toContain('Seams: 1 · Sharp edges: 2');
+    const one = createGrid({ x_subdivisions: 3, y_subdivisions: 2 });
+    one.faceSmooth = one.faces.map((_, i) => i === 0);
+    act(() => s.doc.setMesh(meshId, one));
+    expect(hints()).toContain('1 smooth face');
   });
 });
 

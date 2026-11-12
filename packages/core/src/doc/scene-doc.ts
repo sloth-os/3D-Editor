@@ -490,12 +490,14 @@ export class SceneDoc {
   /**
    * The number of objects using each data block ({@link dataUsers} of all of them), read once, for
    * operators that ask it for many objects; they keep it current as they give objects other data.
+   * Every value is counted as dataUsers compares it, also where a malformed document (written by a
+   * client) holds something other than an id; objects without data are left out.
    */
   dataUserCounts(): Map<string, number> {
     const out = new Map<string, number>();
     for (const y of this.map('objects').values()) {
-      const data = (y as Y.Map<any>).get('data') as unknown;
-      if (typeof data === 'string') out.set(data, (out.get(data) ?? 0) + 1);
+      const data = (y as Y.Map<any>).get('data') as string | null | undefined;
+      if (data !== undefined && data !== null) out.set(data, (out.get(data) ?? 0) + 1);
     }
     return out;
   }

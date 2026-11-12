@@ -190,19 +190,25 @@ function handle(map: Record<string, Handler>, key: string, e: KeyboardEvent): bo
 
 export function installKeymap(): () => void {
   const onKey = (e: KeyboardEvent) => {
+    // Escape closes a popup menu or the operator search first, wherever the focus is: also in a field
+    // of a window under it (one with nothing typed to cancel passes the Escape on). It is used up, so
+    // the window under the menu stays open. Not a held key's repeats, nor the Escape that ends an IME
+    // composition (Safari sends it after the composition, with key code 229).
+    if (e.key === 'Escape' && (paletteOpen.value || popupMenu.value)) {
+      if (e.repeat || e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
+      paletteOpen.value = false;
+      popupMenu.value = null;
+      e.preventDefault();
+      return;
+    }
     if (isTyping(e) || (e.repeat && !['ArrowLeft', 'ArrowRight'].includes(e.key))) return;
     // modal transform swallows keys
     if (viewport.interaction?.modal) {
       if (viewport.interaction.modalKey(e)) e.preventDefault();
       return;
     }
-    if (paletteOpen.value || popupMenu.value) {
-      if (e.key === 'Escape') {
-        paletteOpen.value = false;
-        popupMenu.value = null;
-      }
-      return;
-    }
+    // other keys do nothing while a popup menu or the search is open
+    if (paletteOpen.value || popupMenu.value) return;
     if (dialog.value) return;
     const key = combo(e);
     if (handle(GLOBAL, key, e)) {

@@ -150,12 +150,12 @@ therefore clears `keep` and collects in the same transaction, before Yjs merges 
 it did, a dropped value merged with a kept one stayed: 200 writes of 5,000 numbers to one key, a
 step each, with 10 steps kept, left an encoded document of 3,998,618 bytes (about 20,050 without
 a history); it now holds 220,140 bytes, the value and the ten it replaced. An agent that renamed a
-vertex group of a grid of 251,001 vertices back and forth (64 groups, which every rename writes
-again: 97 MB per step) added 97 MB to the saved project with every rename, and the server passed
-3.8 GB of resident memory at the eighth; now the project stays at 209 MB over 20 renames and the
-server peaked at 1,432–1,442 MB in three runs (default heap, disk persistence). What the histories
-keep counts in the server's memory checks, and in a save of the project, which carries it (see
-[Server render processes](#server-render-processes)).
+vertex group of a grid of 251,001 vertices back and forth (101 groups, which every rename writes
+again: 97 MB per step) added 97 MB to the saved project with every rename, and the server passed 3.8
+GB of resident memory at the eighth; now the project stays at 209 MB over 20 renames and the server
+peaked at 1,432–1,442 MB in three runs (default heap, disk persistence). What the histories keep
+counts in the server's memory checks, and in a save of the project, which carries it (see [Server
+render processes](#server-render-processes)).
 
 Undo and redo restore deleted items as copies and link each original to its copy; undoing a step
 follows these links to delete the latest copies of what it created, and redoing one to restore into

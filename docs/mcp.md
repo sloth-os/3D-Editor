@@ -1549,10 +1549,12 @@ a copy of it 0.2–1.7 s (0.33–1.31 s measured; the longest when no editor or 
 request sent during a hold waits for the rest of it: a `get_view` sent with no command running, the
 editor idle, answered at most 0.1 s after the hold had ended (0.014 s measured, widened like the
 ranges above), so it waited about as long as the rest of the hold (the longest, 0.68 s, in a hold of
-0.69 s). A save after an agent deleted many objects holds them longer, since the agent's undo
-history keeps the deleted objects and the save carries them: after an agent deleted 10,000 linked
-cubes, the save held them 1.6–1.8 s (two runs of round 13, with disk storage; the saves after
-creating the cubes 0.5–0.7 s).
+0.69 s). Saves of a project with many objects hold requests longer: every save after the first
+merges the stored copy into the open project and replays it in a document of its own, and an agent's
+undo history keeps the objects the agent deleted, which the save carries too. With 10,000 linked
+cubes on disk storage, the save after creating them held requests 0.7–0.8 s and the save after an
+agent deleted all of them 1.6–1.8 s (two runs of each, round 13; in-process runs put 0.2–0.6 s of
+that on the undo history).
 
 The editor finishes a command the server stopped waiting for, and keeps what a screenshot compiled:
 a first `RENDERED` screenshot that timed out after 3 s, retried at once, answered once the editor
