@@ -49,6 +49,12 @@ export function setProp(
   final = true,
 ): void {
   const key = `${kind}:${target}:${field}`;
+  // a datablock an agent (or another device) deleted meanwhile takes nothing: no preview that would
+  // write a stray entry, and no error toast at the end of the drag or typing
+  if (!hasTarget(s, kind, target)) {
+    if (drag?.key === key) drag = null;
+    return;
+  }
   if (!final) {
     if (!drag || drag.key !== key) drag = { key, original: readField(s, kind, target, field) };
     writeField(s, kind, target, field, value);
@@ -59,6 +65,12 @@ export function setProp(
     drag = null;
   }
   run('data.set_property', { kind, target: target ?? undefined, values: { [field]: value } }, 'ui');
+}
+
+/** Whether the datablock a field edits is stored (the scene, render settings and world always are). */
+function hasTarget(s: ProjectSession, kind: Kind, target: string | null): boolean {
+  if (kind === 'scene' || kind === 'render' || kind === 'world') return true;
+  return target !== null && !!s.doc.getBlock(kind, target);
 }
 
 export type FieldAnimState = FieldState | null;

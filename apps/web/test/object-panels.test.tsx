@@ -16,6 +16,7 @@ import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
 import { Properties, activePropertiesTab, availableTabs } from '../src/ui/properties/Properties';
 import { Outliner } from '../src/ui/Outliner';
+import { Sidebar } from '../src/ui/Viewport';
 import { layoutConstraintParams, constraintEnumLabel } from '../src/ui/properties/ConstraintsTab';
 import { channelLabel } from '../src/ui/properties/ObjectTab';
 import { removalLikeChromium, settle } from './removal';
@@ -985,11 +986,15 @@ describe('fields that outlive what they were typed for (another object shown, ro
     toasts.value = [];
   });
 
+  /** The name of the object the Properties editor shows. */
+  const shownName = (root: ParentNode) => (byTestId(root, 'object-name') as HTMLInputElement | null)?.value;
+
   it.each(browsers)(
-    '%s: a number typed for one object never goes to the object an agent shows instead',
+    '%s: a number being typed keeps its object shown when an agent makes another one active, and goes to it',
     async (_browser, removal) => {
-      // regression: the tab's fields were kept for the other object; the open entry then wrote the
-      // number typed for the Cube into the other object on Enter
+      // regression: the tab showed the other object at once: the entry was taken away under the
+      // typing (Firefox and Safari lost the number) or, kept for the other object, wrote the number
+      // typed for the Cube into it on Enter
       ok('mesh.primitive_cube_add', { name: 'Cube' });
       ok('object.empty_add', { name: 'Other', location: [3, 0, 0] });
       select(s, 'Cube');
@@ -999,23 +1004,28 @@ describe('fields that outlive what they were typed for (another object shown, ro
       const restore = removal();
       try {
         act(() => select(s, 'Other'));
-        expect(input.isConnected).toBe(false);
+        // the typing goes on in the Cube's field
+        expect(input.isConnected).toBe(true);
+        expect(document.activeElement).toBe(input);
+        expect(shownName(container)).toBe('Cube');
+        fireEvent.keyDown(input, { key: 'Enter' });
         await settle();
       } finally {
         restore();
       }
-      enterOnFocused(container);
+      expect(s.doc.findObjectByName('Cube')!.location[0]).toBe(-7);
       expect(s.doc.findObjectByName('Other')!.location).toEqual([3, 0, 0]);
-      // Chromium commits the entry as it goes away, to the object it was typed for
-      expect(s.doc.findObjectByName('Cube')!.location[0]).toBe(removal === removalLikeChromium ? -7 : 0);
+      // the entry is closed: the active object is shown
+      expect(shownName(container)).toBe('Other');
+      expect(errorToasts()).toEqual([]);
     },
   );
 
   it.each(browsers)(
-    '%s: text typed for one object is committed to it when an agent shows another one with the same value',
+    '%s: text typed for one object is committed to it when an agent makes another one with the same value active',
     async (_browser, removal) => {
-      // regression: the field kept the typed text for the other object (same value, so nothing reset
-      // it) and Enter wrote it into the other object's property
+      // regression: the field was kept for the other object with the typed text (same value, so
+      // nothing reset it) and Enter wrote it into the other object's property
       ok('mesh.primitive_cube_add', { name: 'Cube' });
       ok('mesh.primitive_cube_add', { name: 'B' });
       for (const name of ['Cube', 'B'])
@@ -1034,14 +1044,113 @@ describe('fields that outlive what they were typed for (another object shown, ro
       const restore = removal();
       try {
         act(() => select(s, 'B'));
+        expect(field.isConnected).toBe(true);
+        expect(shownName(container)).toBe('Cube');
+        fireEvent.keyDown(field, { key: 'Enter' });
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(s.doc.findObjectByName('B')!.custom_props).toEqual({ weight: 1 });
+      expect(s.doc.findObjectByName('Cube')!.custom_props).toEqual({ weight: 5 });
+      // the field keeps the keyboard focus after Enter, and with it the Cube; leaving it shows B
+      expect(shownName(container)).toBe('Cube');
+      act(() => field.blur());
+      await settle();
+      expect(shownName(container)).toBe('B');
+      expect((byTestId(container, 'custom-prop-weight') as HTMLInputElement).value).toBe('1');
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it('going from one text field of the kept object to another keeps it shown', async () => {
+    // as in a browser: the focus leaves the first field (focusout names the next one), the page's
+    // microtasks run, and only then does the next field get the focus
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.empty_add', { name: 'Other' });
+    ok('data.set_property', {
+      kind: 'objects',
+      target: s.doc.findObjectByName('Cube')!.id,
+      values: { custom_props: { weight: 1 } },
+    });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:Custom Properties', '1');
+    const { container } = render(<Properties session={s} />);
+    const name = byTestId(container, 'object-name') as HTMLInputElement;
+    name.focus();
+    fireEvent.input(name, { target: { value: 'Box' } });
+    act(() => select(s, 'Other'));
+    expect(shownName(container)).toBe('Box');
+    const weight = byTestId(container, 'custom-prop-weight') as HTMLInputElement;
+    // the focus leaves the name field (happy-dom's own blur and focusout name no next field: they
+    // are held back, and sent again as a browser sends them, with the page's microtasks between)
+    const hold = (e: Event) => e.stopImmediatePropagation();
+    container.addEventListener('blur', hold, true);
+    container.addEventListener('focusout', hold, true);
+    act(() => name.blur());
+    container.removeEventListener('blur', hold, true);
+    container.removeEventListener('focusout', hold, true);
+    act(() => void name.dispatchEvent(new FocusEvent('blur', { relatedTarget: weight })));
+    await settle();
+    act(() => void name.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: weight })));
+    await settle();
+    expect(weight.isConnected).toBe(true);
+    act(() => weight.focus());
+    expect(s.doc.findObjectByName('Box')).not.toBeNull();
+    expect(shownName(container)).toBe('Box');
+    fireEvent.input(weight, { target: { value: '4' } });
+    fireEvent.keyDown(weight, { key: 'Enter' });
+    expect(s.doc.findObjectByName('Box')!.custom_props).toEqual({ weight: 4 });
+    act(() => weight.blur());
+    await settle();
+    expect(shownName(container)).toBe('Other');
+  });
+
+  it('a field left before the next frame shows the active object', async () => {
+    // regression: what notices the focus leaving was set up a frame after the agent's change was
+    // drawn; a field left before then (with nothing typed, so nothing committed and drew the panel
+    // again) kept the other object shown until something else changed
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.empty_add', { name: 'Other' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    const { container } = render(<Properties session={s} />);
+    const name = byTestId(container, 'object-name') as HTMLInputElement;
+    name.focus();
+    // the agent's change is drawn as in the page, with no frame after it yet
+    select(s, 'Other');
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(shownName(container)).toBe('Cube');
+    name.blur();
+    await new Promise((r) => setTimeout(r, 200));
+    expect(shownName(container)).toBe('Other');
+  });
+
+  it.each(browsers)(
+    '%s: typing for an object an agent deletes shows the active object, writes nothing and shows no error',
+    async (_browser, removal) => {
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Other', location: [3, 0, 0] });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const input = typeInEntry(byTestId(container, 'loc-0')!, '-7');
+      act(() => select(s, 'Other'));
+      expect(shownName(container)).toBe('Cube');
+      const restore = removal();
+      try {
+        act(() => agent.run('object.delete', { objects: [s.doc.findObjectByName('Cube')!.id] }));
+        expect(input.isConnected).toBe(false);
         await settle();
       } finally {
         restore();
       }
       enterOnFocused(container);
-      expect(s.doc.findObjectByName('B')!.custom_props).toEqual({ weight: 1 });
-      expect(s.doc.findObjectByName('Cube')!.custom_props).toEqual({ weight: 5 });
-      expect((byTestId(container, 'custom-prop-weight') as HTMLInputElement).value).toBe('1');
+      expect(shownName(container)).toBe('Other');
+      expect(s.doc.findObjectByName('Other')!.location).toEqual([3, 0, 0]);
+      expect(errorToasts()).toEqual([]);
     },
   );
 
@@ -1189,9 +1298,10 @@ describe('fields that outlive what they were typed for (another object shown, ro
   );
 
   it.each(browsers)(
-    '%s: a driver expression typed when another object is shown is committed to its driver',
+    '%s: a driver expression being typed keeps its object shown when another one is made active',
     async (_browser, removal) => {
-      // regression: only Chromium committed it (through its blur), Firefox and Safari lost it
+      // regression: the tab showed the other object at once; only Chromium committed the expression
+      // (through its blur as the field went away), Firefox and Safari lost it
       const d = driven('a', ['a']);
       const { container } = render(<Properties session={s} />);
       const field = byTestId(container, 'driver-location-2-expression') as HTMLInputElement;
@@ -1200,15 +1310,31 @@ describe('fields that outlive what they were typed for (another object shown, ro
       const restore = removal();
       try {
         act(() => select(s, 'Ctrl'));
-        expect(field.isConnected).toBe(false);
+        expect(field.isConnected).toBe(true);
+        expect(shownName(container)).toBe('Cube');
+        act(() => field.blur());
         await settle();
       } finally {
         restore();
       }
       expect(s.doc.getDriver(d.key)!.expression).toBe('a * 3');
+      expect(shownName(container)).toBe('Ctrl');
       expect(errorToasts()).toEqual([]);
     },
   );
+
+  it('a driver expression left in a field that goes away is committed to its driver', async () => {
+    // Firefox and Safari send no blur to a field they take away: the text is committed as it goes
+    const d = driven('a', ['a']);
+    const { container, unmount } = render(<Properties session={s} />);
+    const field = byTestId(container, 'driver-location-2-expression') as HTMLInputElement;
+    field.focus();
+    fireEvent.input(field, { target: { value: 'a * 4' } });
+    unmount();
+    await settle();
+    expect(s.doc.getDriver(d.key)!.expression).toBe('a * 4');
+    expect(errorToasts()).toEqual([]);
+  });
 
   /** Cube's location[0] curve with F-curve modifiers; `ref` addresses it in anim.fmodifier_*. */
   function curveWith(modifiers: { type: string; params?: Record<string, unknown> }[]) {
@@ -1552,4 +1678,677 @@ describe('fields that outlive what they were typed for (another object shown, ro
     fireEvent.click(byTestId(container, 'bone-add')!);
     expect(byTestId(container, 'bone-name')).not.toBe(field);
   });
+});
+
+describe('settings typed for what an agent then removes or replaces (no error, nothing written elsewhere)', () => {
+  const browsers = [
+    ['Chromium', removalLikeChromium],
+    ['Firefox and Safari', () => () => {}],
+  ] as const;
+  const errorToasts = () => toasts.value.filter((t) => t.level === 'error').map((t) => t.message);
+  const enterOnFocused = (root: Element) => {
+    const el = document.activeElement;
+    if (el instanceof HTMLInputElement && el.isConnected && root.contains(el))
+      fireEvent.keyDown(el, { key: 'Enter' });
+  };
+  const typeInEntry = (el: HTMLElement, value: string): HTMLInputElement => {
+    fireEvent.pointerDown(el, { button: 0, clientX: 5, pointerId: 1 });
+    fireEvent.pointerUp(el, { button: 0, clientX: 5, pointerId: 1 });
+    const input = el.querySelector('input')!;
+    input.focus();
+    fireEvent.input(input, { target: { value } });
+    return input;
+  };
+  beforeEach(() => {
+    toasts.value = [];
+  });
+
+  /** A field of a tab typed into, the agent's removal, and what the document must then hold. */
+  interface Case {
+    name: string;
+    tab: string;
+    setup: () => void;
+    field: string;
+    /** A text field (committed as it goes away in every browser), not a number entry. */
+    text?: boolean;
+    remove: (agent: ReturnType<typeof peerReplica>) => void;
+    check: () => void;
+  }
+  const cube = () => s.doc.findObjectByName('Cube')!;
+  const rig = () => s.doc.findObjectByName('Rig')!;
+  const cases: Case[] = [
+    {
+      name: 'a modifier setting',
+      tab: 'modifiers',
+      setup: () => {
+        ok('mesh.primitive_cube_add', { name: 'Cube' });
+        ok('object.modifier_add', { object: 'Cube', type: 'SUBSURF' });
+        select(s, 'Cube');
+      },
+      field: 'mod-subsurf-levels',
+      remove: (agent) =>
+        agent.run('object.modifier_remove', { object: cube().id, modifier: cube().modifiers[0].id }),
+      check: () => expect(cube().modifiers).toEqual([]),
+    },
+    {
+      name: 'a material setting',
+      tab: 'material',
+      setup: () => {
+        ok('mesh.primitive_cube_add', { name: 'Cube' });
+        select(s, 'Cube');
+        ok('material.new', { name: 'Mat' });
+      },
+      field: 'material-roughness',
+      remove: (agent) => agent.run('material.delete', { material: 'Mat' }),
+      check: () => expect(s.doc.listMaterials().map((m) => m.name)).toEqual([]),
+    },
+    {
+      name: 'a procedural texture setting',
+      tab: 'material',
+      setup: () => {
+        ok('mesh.primitive_cube_add', { name: 'Cube' });
+        select(s, 'Cube');
+        ok('material.new', { name: 'Mat' });
+        ok('material.procedural_set', {
+          material: 'Mat',
+          channel: 'base_color',
+          procedural: { type: 'NOISE' },
+        });
+        localStorage.setItem('3d-editor:panel:material-textures', '1');
+      },
+      field: 'tex-base_color-ramp-low',
+      remove: (agent) =>
+        agent.run('material.procedural_set', { material: 'Mat', channel: 'base_color', procedural: null }),
+      // no texture is made for the one field typed
+      check: () => expect(s.doc.listMaterials()[0].textures?.base_color?.procedural ?? null).toBeNull(),
+    },
+    {
+      name: 'a pose bone channel',
+      tab: 'data',
+      setup: () => {
+        ok('object.armature_add', { name: 'Rig' });
+        select(s, 'Rig');
+      },
+      field: 'pose-location-0',
+      remove: (agent) => agent.run('armature.bone_remove', { object: rig().id, bones: ['Bone'] }),
+      check: () => expect(rig().pose?.bones?.Bone).toBeUndefined(),
+    },
+    {
+      name: 'a bone IK setting',
+      tab: 'data',
+      setup: () => {
+        ok('object.armature_add', { name: 'Rig' });
+        select(s, 'Rig');
+        localStorage.setItem('3d-editor:panel:bone-ik', '1');
+      },
+      field: 'pose-ik-stiffness-x',
+      remove: (agent) => agent.run('armature.bone_remove', { object: rig().id, bones: ['Bone'] }),
+      check: () => expect(rig().pose?.bones?.Bone).toBeUndefined(),
+    },
+    {
+      name: 'a bone constraint influence',
+      tab: 'data',
+      setup: () => {
+        ok('object.armature_add', { name: 'Rig' });
+        ok('pose.constraint_add', { object: 'Rig', bone: 'Bone', type: 'LIMIT_ROTATION' });
+        select(s, 'Rig');
+      },
+      field: 'bone-constraint-Limit Rotation-influence',
+      remove: (agent) => agent.run('pose.constraint_remove', { object: rig().id, bone: 'Bone', all: true }),
+      check: () => expect(rig().pose.bones.Bone.constraints ?? []).toEqual([]),
+    },
+    {
+      name: 'a light setting',
+      tab: 'data',
+      setup: () => {
+        ok('object.light_add', { name: 'Lamp', type: 'POINT' });
+        select(s, 'Lamp');
+      },
+      field: 'light-energy',
+      remove: (agent) => agent.run('object.delete', { objects: [s.doc.findObjectByName('Lamp')!.id] }),
+      check: () => expect(s.doc.listObjects()).toEqual([]),
+    },
+    {
+      name: 'a modifier text setting',
+      tab: 'modifiers',
+      setup: () => {
+        ok('mesh.primitive_cube_add', { name: 'Cube' });
+        ok('object.modifier_add', { object: 'Cube', type: 'ARMATURE' });
+        select(s, 'Cube');
+      },
+      field: 'mod-armature-vertex_group',
+      text: true,
+      remove: (agent) =>
+        agent.run('object.modifier_remove', { object: cube().id, modifier: cube().modifiers[0].id }),
+      check: () => expect(cube().modifiers).toEqual([]),
+    },
+    {
+      name: 'a rigid body setting',
+      tab: 'physics',
+      setup: () => {
+        ok('mesh.primitive_cube_add', { name: 'Cube' });
+        ok('rigidbody.object_add', { objects: ['Cube'] });
+        select(s, 'Cube');
+      },
+      field: 'rigidbody-mass',
+      remove: (agent) => agent.run('rigidbody.object_remove', { objects: [cube().id] }),
+      check: () => expect(cube().rigid_body ?? null).toBeNull(),
+    },
+  ];
+
+  for (const [browser, removal] of browsers)
+    it.each(cases.map((c) => [c.name, c] as const))(`${browser}: %s`, async (_name, c) => {
+      c.setup();
+      activePropertiesTab.value = c.tab as typeof activePropertiesTab.value;
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const el = byTestId(container, c.field);
+      expect(el, c.field).not.toBeNull();
+      let input: HTMLInputElement;
+      if (c.text) {
+        input = el as HTMLInputElement;
+        input.focus();
+        fireEvent.input(input, { target: { value: 'Typed' } });
+      } else input = typeInEntry(el!, '0.5');
+      const restore = removal();
+      try {
+        act(() => c.remove(agent));
+        expect(input.isConnected, c.field).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      c.check();
+      expect(errorToasts()).toEqual([]);
+    });
+});
+
+describe('fields that follow what they edit (agents switch objects, replace, remove or reassign it)', () => {
+  const browsers = [
+    ['Chromium', removalLikeChromium],
+    ['Firefox and Safari', () => () => {}],
+  ] as const;
+  const errorToasts = () => toasts.value.filter((t) => t.level === 'error').map((t) => t.message);
+  const enterOnFocused = (root: Element) => {
+    const el = document.activeElement;
+    if (el instanceof HTMLInputElement && el.isConnected && root.contains(el))
+      fireEvent.keyDown(el, { key: 'Enter' });
+  };
+  const typeInEntry = (el: HTMLElement, value: string): HTMLInputElement => {
+    fireEvent.pointerDown(el, { button: 0, clientX: 5, pointerId: 1 });
+    fireEvent.pointerUp(el, { button: 0, clientX: 5, pointerId: 1 });
+    const input = el.querySelector('input')!;
+    input.focus();
+    fireEvent.input(input, { target: { value } });
+    return input;
+  };
+  beforeEach(() => {
+    toasts.value = [];
+  });
+  const isChromium = (removal: unknown) => removal === removalLikeChromium;
+
+  it.each(browsers)(
+    '%s: a location typed in the N panel keeps its object shown when an agent makes another one active',
+    async (_browser, removal) => {
+      // regression: the panel showed the other object at once (Firefox and Safari lost the typing,
+      // a kept entry wrote it into the other object)
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Other', location: [3, 0, 0] });
+      select(s, 'Cube');
+      const { container } = render(<Sidebar s={s} />);
+      const input = typeInEntry(byTestId(container, 'loc-0')!, '-7');
+      const restore = removal();
+      try {
+        act(() => select(s, 'Other'));
+        expect(input.isConnected).toBe(true);
+        expect(document.activeElement).toBe(input);
+        fireEvent.keyDown(input, { key: 'Enter' });
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(s.doc.findObjectByName('Cube')!.location[0]).toBe(-7);
+      expect(s.doc.findObjectByName('Other')!.location).toEqual([3, 0, 0]);
+      // the entry is closed: the active object is shown
+      expect(byTestId(container, 'loc-0')!.textContent).toContain('3');
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  /** Cube with a driver on location[2] reading Ctrl's location (variables named as given). */
+  function driven(names: string[]) {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.empty_add', { name: 'Ctrl' });
+    const ctrl = s.doc.findObjectByName('Ctrl')!.id;
+    const variable = (name: string, path: string, index: number) => ({
+      name,
+      target_type: 'object',
+      target: ctrl,
+      path,
+      index,
+    });
+    ok('anim.driver_add', {
+      target_type: 'object',
+      target: 'Cube',
+      path: 'location',
+      index: 2,
+      expression: names.join(' + '),
+      variables: names.map((n, i) => variable(n, 'location', i)),
+    });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-drivers', '1');
+    const cube = s.doc.findObjectByName('Cube')!.id;
+    const key = fcurveKey({ target_type: 'object', target_id: cube, path: 'location', index: 2 });
+    const ref = { target_type: 'object', target: cube, path: 'location', index: 2 };
+    const listed = () => s.doc.getDriver(key)!.variables.map((v) => `${v.name}:${v.path}[${v.index}]`);
+    return { ref, variable, listed };
+  }
+
+  it.each(browsers)(
+    '%s: text typed for a driver variable an agent replaced by another one goes to neither',
+    async (_browser, removal) => {
+      // regression: the new variable took the replaced one's row (as many before as after) with the
+      // typed path, and Enter wrote it into the new variable
+      const d = driven(['a']);
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const path = byTestId(container, 'driver-location-2-var-0-path') as HTMLInputElement;
+      path.focus();
+      fireEvent.input(path, { target: { value: 'scale' } });
+      const restore = removal();
+      try {
+        act(() =>
+          agent.run('anim.driver_update', {
+            ...d.ref,
+            expression: 'c',
+            variables: [d.variable('c', 'location', 2)],
+          }),
+        );
+        expect(path.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(d.listed()).toEqual(['c:location[2]']);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  /** Cube's location[0] curve with F-curve modifiers. */
+  function curveWith(modifiers: { type: string; params?: Record<string, unknown> }[]) {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    const cube = s.doc.findObjectByName('Cube')!.id;
+    ok('anim.keyframe_insert_property', {
+      target_type: 'object',
+      target: 'Cube',
+      path: 'location',
+      index: 0,
+    });
+    const ref = { target_type: 'object', target: cube, path: 'location', index: 0 };
+    for (const m of modifiers) ok('anim.fmodifier_add', { ...ref, ...m });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-fcurves', '1');
+    const key = fcurveKey({ target_type: 'object', target_id: cube, path: 'location', index: 0 });
+    const mods = () => s.doc.getFCurve(key)!.modifiers ?? [];
+    return { ref, key, mods };
+  }
+  const envelope = (points: [number, number, number][]) => ({
+    control_points: points.map(([frame, min, max]) => ({ frame, min, max })),
+  });
+
+  it.each(browsers)(
+    '%s: a value typed for a control point an agent replaced by another one goes to neither',
+    async (_browser, removal) => {
+      const c = curveWith([{ type: 'ENVELOPE', params: envelope([[1, -1, 1]]) }]);
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const input = typeInEntry(byTestId(container, 'fcurve-location-0-mod-0-point-0-min')!, '-5');
+      const restore = removal();
+      try {
+        act(() =>
+          agent.run('anim.fmodifier_update', { ...c.ref, modifier_index: 0, params: envelope([[5, -2, 2]]) }),
+        );
+        expect(input.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(c.mods()[0].params.control_points).toEqual(envelope([[5, -2, 2]]).control_points);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it('a frame typed for a control point keeps its row and the keyboard focus', () => {
+    const c = curveWith([{ type: 'ENVELOPE', params: envelope([[1, -1, 1]]) }]);
+    const { container } = render(<Properties session={s} />);
+    const input = typeInEntry(byTestId(container, 'fcurve-location-0-mod-0-point-0-min')!, '-3');
+    fireEvent.keyDown(input, { key: 'Enter' });
+    const minField = byTestId(container, 'fcurve-location-0-mod-0-point-0-min');
+    const frame = typeInEntry(byTestId(container, 'fcurve-location-0-mod-0-point-0-frame')!, '4');
+    fireEvent.keyDown(frame, { key: 'Enter' });
+    expect(c.mods()[0].params.control_points).toEqual(envelope([[4, -3, 1]]).control_points);
+    // the row (with the min field) is the same
+    expect(byTestId(container, 'fcurve-location-0-mod-0-point-0-min')).toBe(minField);
+    const again = typeInEntry(byTestId(container, 'fcurve-location-0-mod-0-point-0-max')!, '6');
+    fireEvent.keyDown(again, { key: 'Enter' });
+    expect(c.mods()[0].params.control_points).toEqual(envelope([[4, -3, 6]]).control_points);
+  });
+
+  it('Add Control Point on a frame that has a point adds nothing (the point keeps its values)', () => {
+    // regression: the point of that frame was replaced by a new one (min -1, max 1)
+    const c = curveWith([{ type: 'ENVELOPE', params: envelope([[1, -3, 3]]) }]);
+    s.state.frame = 1;
+    const { container } = render(<Properties session={s} />);
+    fireEvent.click(byTestId(container, 'fcurve-location-0-mod-0-add-point')!);
+    expect(c.mods()[0].params.control_points).toEqual(envelope([[1, -3, 3]]).control_points);
+    s.state.frame = 7;
+    act(() => void 0);
+    fireEvent.click(byTestId(container, 'fcurve-location-0-mod-0-add-point')!);
+    expect(c.mods()[0].params.control_points).toEqual(
+      envelope([
+        [1, -3, 3],
+        [7, -1, 1],
+      ]).control_points,
+    );
+    expect(errorToasts()).toEqual([]);
+  });
+
+  it('a drag of an F-curve modifier setting undoes to its value before the drag when an agent removes a modifier before it meanwhile', () => {
+    // regression: the drag was keyed by the modifier's index: when it moved up, the drag started again
+    // from the dragged value, and undo went back to that instead of the value before the drag
+    const c = curveWith([
+      { type: 'NOISE', params: { strength: 1 } },
+      { type: 'NOISE', params: { strength: 2 } },
+    ]);
+    const agent = peerReplica(s);
+    const { container } = render(<Properties session={s} />);
+    dragNumber(byTestId(container, 'fcurve-location-0-mod-1-strength')!, 40, () =>
+      agent.run('anim.fmodifier_remove', { ...c.ref, modifier_index: 0 }),
+    );
+    const dragged = c.mods()[0].params.strength as number;
+    expect(c.mods()).toHaveLength(1);
+    expect(dragged).toBeGreaterThan(2);
+    act(() => void s.undo.undo());
+    expect(c.mods()[0].params.strength).toBe(2);
+  });
+
+  it('F-curve modifiers holding values no JSON can hold (bigints from another replica) are shown', () => {
+    const c = curveWith([{ type: 'NOISE', params: { strength: 1 } }]);
+    const fc = s.doc.getFCurve(c.key)!;
+    // a bigint is what no panel writes, but a replica (another client of the sync hub) can
+    const params = { strength: 1, seed: 5n } as unknown as Record<string, number>;
+    s.doc.setFCurve({ ...fc, modifiers: [{ ...fc.modifiers![0], params }] });
+    expect(typeof s.doc.getFCurve(c.key)!.modifiers![0].params.seed).toBe('bigint');
+    const { container } = render(<Properties session={s} />);
+    expect(byTestId(container, 'fcurve-location-0-mod-0-strength')).not.toBeNull();
+  });
+
+  it.each(browsers)(
+    '%s: a shape key value typed when an agent removes the key goes to no other key',
+    async (_browser, removal) => {
+      // regression: the key shown in its place (the next one) got the open entry and the typed value
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      for (const name of ['Basis', 'Smile', 'Frown']) ok('object.shape_key_add', { object: 'Cube', name });
+      const cube = s.doc.findObjectByName('Cube')!;
+      select(s, 'Cube');
+      activePropertiesTab.value = 'data';
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      fireEvent.click(byTestId(container, 'shape-key-Smile')!);
+      const input = typeInEntry(byTestId(container, 'shape-key-min')!, '-0.5');
+      const restore = removal();
+      try {
+        act(() => agent.run('object.shape_key_remove', { object: cube.id, key: 'Smile' }));
+        expect(input.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      const keys = s.doc.getShapeKeys(cube.data!);
+      expect(keys.map((k) => k.name)).toEqual(['Basis', 'Frown']);
+      expect(keys[1].slider_min).toBe(0);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it('a shape key renamed here keeps its fields and the keyboard focus', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    for (const name of ['Basis', 'Smile']) ok('object.shape_key_add', { object: 'Cube', name });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    fireEvent.click(byTestId(container, 'shape-key-Smile')!);
+    const name = byTestId(container, 'shape-key-name') as HTMLInputElement;
+    name.focus();
+    fireEvent.input(name, { target: { value: 'Grin' } });
+    fireEvent.keyDown(name, { key: 'Enter' });
+    expect(s.doc.getShapeKeys(s.doc.findObjectByName('Cube')!.data!).map((k) => k.name)).toEqual([
+      'Basis',
+      'Grin',
+    ]);
+    expect(byTestId(container, 'shape-key-name')).toBe(name);
+    expect(document.activeElement).toBe(name);
+  });
+
+  it.each(browsers)(
+    '%s: a spline setting typed when an agent removes a spline before it goes to its spline (or nowhere)',
+    async (_browser, removal) => {
+      // regression: the panel kept the index: the open entry was given the next spline, and the
+      // commit as it went away wrote the old spline's points into that spline
+      ok('curve.primitive_bezier_curve_add', { name: 'Wire' });
+      ok('curve.spline_add', {
+        object: 'Wire',
+        type: 'POLY',
+        points: [{ co: [0, 1, 0] }, { co: [1, 1, 0] }],
+      });
+      ok('curve.spline_add', {
+        object: 'Wire',
+        type: 'POLY',
+        points: [{ co: [0, 2, 0] }, { co: [1, 2, 0] }, { co: [2, 2, 0] }],
+      });
+      const wire = s.doc.findObjectByName('Wire')!;
+      select(s, 'Wire');
+      activePropertiesTab.value = 'data';
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      fireEvent.change(byTestId(container, 'spline-select')!, { target: { value: '1' } });
+      const input = typeInEntry(byTestId(container, 'spline-resolution')!, '7');
+      const restore = removal();
+      try {
+        // the agent reshapes the spline and removes one before it at once
+        act(() => {
+          agent.run('curve.spline_set_points', {
+            object: wire.id,
+            spline_index: 1,
+            type: 'POLY',
+            points: [{ co: [0, 5, 0] }, { co: [1, 5, 0] }],
+          });
+          agent.run('curve.spline_remove', { object: wire.id, spline_index: 0 });
+        });
+        expect(input.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      const splines = s.doc.getCurve(wire.data!)!.splines;
+      // the reshaped points stay (not the points the panel had rendered)
+      expect(splines.map((x) => x.points.map((p) => p.co[1]))).toEqual([
+        [5, 5],
+        [2, 2, 2],
+      ]);
+      expect(splines.map((x) => x.resolution_u)).toEqual([isChromium(removal) ? 7 : 0, 0]);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it('a spline setting keeps the points an agent gave the spline meanwhile', () => {
+    ok('curve.primitive_bezier_curve_add', { name: 'Wire' });
+    ok('curve.spline_add', { object: 'Wire', type: 'POLY', points: [{ co: [0, 1, 0] }, { co: [1, 1, 0] }] });
+    const wire = s.doc.findObjectByName('Wire')!;
+    select(s, 'Wire');
+    activePropertiesTab.value = 'data';
+    const agent = peerReplica(s);
+    const { container } = render(<Properties session={s} />);
+    fireEvent.change(byTestId(container, 'spline-select')!, { target: { value: '1' } });
+    const input = typeInEntry(byTestId(container, 'spline-resolution')!, '5');
+    act(() =>
+      agent.run('curve.spline_set_points', {
+        object: wire.id,
+        spline_index: 1,
+        points: [{ co: [0, 3, 0] }, { co: [1, 3, 0] }],
+      }),
+    );
+    expect(input.isConnected).toBe(true);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    const sp = s.doc.getCurve(wire.data!)!.splines[1];
+    expect(sp.points.map((p) => p.co[1])).toEqual([3, 3]);
+    expect(sp.resolution_u).toBe(5);
+  });
+
+  it.each(browsers)(
+    '%s: material settings typed when an agent puts another material in the slot never go to it',
+    async (_browser, removal) => {
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      select(s, 'Cube');
+      ok('material.new', { name: 'A' });
+      ok('material.new', { name: 'B', assign: false });
+      activePropertiesTab.value = 'material';
+      const mat = (name: string) => s.doc.listMaterials().find((m) => m.name === name)!;
+      const roughness = mat('B').roughness;
+      const ids = { a: mat('A').id, b: mat('B').id };
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const name = byTestId(container, 'material-name') as HTMLInputElement;
+      name.focus();
+      fireEvent.input(name, { target: { value: 'Renamed' } });
+      const input = typeInEntry(byTestId(container, 'material-roughness')!, '0.9');
+      const restore = removal();
+      try {
+        act(() =>
+          agent.run('object.material_assign', {
+            material: ids.b,
+            objects: [s.doc.findObjectByName('Cube')!.id],
+            slot: 0,
+          }),
+        );
+        expect(input.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      const b = s.doc.getMaterial(ids.b)!;
+      expect([b.name, b.roughness]).toEqual(['B', roughness]);
+      const a = s.doc.getMaterial(ids.a)!;
+      expect(a.roughness).toBe(isChromium(removal) ? 0.9 : roughness);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it.each(browsers)(
+    '%s: a material name typed when an agent puts another material in the slot goes to the material it was typed for',
+    async (_browser, removal) => {
+      // regression: the name field was kept for the other material and its typed text was lost
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      select(s, 'Cube');
+      ok('material.new', { name: 'A' });
+      ok('material.new', { name: 'B', assign: false });
+      activePropertiesTab.value = 'material';
+      const ids = Object.fromEntries(s.doc.listMaterials().map((m) => [m.name, m.id]));
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const name = byTestId(container, 'material-name') as HTMLInputElement;
+      name.focus();
+      fireEvent.input(name, { target: { value: 'Renamed' } });
+      const restore = removal();
+      try {
+        act(() =>
+          agent.run('object.material_assign', {
+            material: ids.B,
+            objects: [s.doc.findObjectByName('Cube')!.id],
+            slot: 0,
+          }),
+        );
+        expect(name.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(s.doc.getMaterial(ids.B)!.name).toBe('B');
+      expect(s.doc.getMaterial(ids.A)!.name).toBe('Renamed');
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it('the selected material preset and the grid scroll are kept when another object is shown', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('mesh.primitive_cube_add', { name: 'B' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'material';
+    localStorage.setItem('3d-editor:panel:material-presets', '1');
+    const { container } = render(<Properties session={s} />);
+    fireEvent.click(byTestId(container, 'material-preset-gold')!);
+    expect(byTestId(container, 'material-preset-gold')!.getAttribute('aria-selected')).toBe('true');
+    const grid = byTestId(container, 'material-presets')!;
+    grid.scrollTop = 40;
+    fireEvent.scroll(grid);
+    act(() => select(s, 'B'));
+    expect(byTestId(container, 'material-preset-gold')!.getAttribute('aria-selected')).toBe('true');
+    expect(byTestId(container, 'material-presets')!.scrollTop).toBe(40);
+  });
+
+  it.each(browsers)(
+    '%s: an Outliner name typed for an object an agent deletes is dropped without an error',
+    async (_browser, removal) => {
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      const agent = peerReplica(s);
+      const { container } = render(<Outliner session={s} />);
+      fireEvent.dblClick(byTestId(container, 'outliner-Cube')!);
+      const box = container.querySelector<HTMLInputElement>('.outliner-row input')!;
+      box.focus();
+      fireEvent.input(box, { target: { value: 'Typed' } });
+      const restore = removal();
+      try {
+        act(() => agent.run('object.delete', { objects: [s.doc.findObjectByName('Cube')!.id] }));
+        expect(box.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(s.doc.listObjects()).toEqual([]);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it.each(browsers)(
+    '%s: text typed for a text object an agent deletes is dropped without an error',
+    async (_browser, removal) => {
+      ok('object.text_add', { name: 'Label', body: 'Hi' });
+      select(s, 'Label');
+      activePropertiesTab.value = 'data';
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const body = byTestId(container, 'font-body') as HTMLTextAreaElement;
+      body.focus();
+      fireEvent.input(body, { target: { value: 'Typed' } });
+      const restore = removal();
+      try {
+        act(() => agent.run('object.delete', { objects: [s.doc.findObjectByName('Label')!.id] }));
+        expect(body.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(s.doc.listObjects()).toEqual([]);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
 });

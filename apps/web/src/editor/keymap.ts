@@ -188,8 +188,46 @@ function handle(map: Record<string, Handler>, key: string, e: KeyboardEvent): bo
   return r !== false;
 }
 
+/**
+ * How long after a key typed into a field that was then taken away the next keys still count as
+ * typing for it (each one extends it): a pause in typing, not a deliberate shortcut.
+ */
+export const TYPING_PAUSE_MS = 1500;
+
 export function installKeymap(): () => void {
+  // The field keys are being typed into, while the typing goes on. When it is taken away under the
+  // person's fingers (an agent made another object active, ran another operation, removed what it
+  // edits), the keys typed on reach the editor: they were meant for the field, not to play the
+  // animation (Space), undo (Ctrl+Z) or delete (X). Enter, Escape, Tab and pointer presses end the
+  // typing, so a shortcut pressed right after them works.
+  let typing: { field: EventTarget; at: number } | null = null;
+  const onTyped = (e: KeyboardEvent) => {
+    if (!isTyping(e)) return;
+    typing =
+      e.key === 'Enter' || e.key === 'Escape' || e.key === 'Tab'
+        ? null
+        : { field: e.target!, at: performance.now() };
+  };
+  const onPointer = () => {
+    typing = null;
+  };
+  /** Whether a key is typed on after the field it was typed into went away (see above). */
+  const typedForGoneField = (e: KeyboardEvent): boolean => {
+    if (!typing || isTyping(e) || (typing.field as Node).isConnected) return false;
+    const now = performance.now();
+    if (now - typing.at > TYPING_PAUSE_MS) {
+      typing = null;
+      return false;
+    }
+    typing =
+      e.key === 'Enter' || e.key === 'Escape' || e.key === 'Tab' ? null : { field: typing.field, at: now };
+    return true;
+  };
   const onKey = (e: KeyboardEvent) => {
+    if (typedForGoneField(e)) {
+      e.preventDefault();
+      return;
+    }
     // Escape closes a popup menu or the operator search first, wherever the focus is: also in a field
     // of a window under it (one with nothing typed to cancel passes the Escape on). It is used up, so
     // the window under the menu stays open. Not a held key's repeats, nor the Escape that ends an IME
@@ -242,8 +280,14 @@ export function installKeymap(): () => void {
     }
     if (handle(VIEWPORT_COMMON, key, e)) e.preventDefault();
   };
+  window.addEventListener('keydown', onTyped, true);
+  window.addEventListener('pointerdown', onPointer, true);
   window.addEventListener('keydown', onKey);
-  return () => window.removeEventListener('keydown', onKey);
+  return () => {
+    window.removeEventListener('keydown', onTyped, true);
+    window.removeEventListener('pointerdown', onPointer, true);
+    window.removeEventListener('keydown', onKey);
+  };
 }
 
 /** Shortcut reference shown in the Help dialog. */

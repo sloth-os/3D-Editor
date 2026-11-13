@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { useRef, useState } from 'preact/hooks';
+import { useLayoutEffect, useRef } from 'preact/hooks';
 import {
   MATERIAL_PRESETS,
   PROCEDURAL_TYPE_DOCS,
@@ -160,17 +160,20 @@ export function MaterialTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
         </Row>
         {m && (
           <Row label="Name">
-            <input
-              class="textfield"
+            {/* keyed by the material: a name typed for one material never goes to the next one an
+                agent assigns to the slot (a raw input kept its text and committed it there) */}
+            <TextField
+              key={m.id}
               value={m.name}
-              data-testid="material-name"
-              onChange={(e) => setProp(s, 'materials', m.id, 'name', (e.target as HTMLInputElement).value)}
+              testId="material-name"
+              ariaLabel="Material name"
+              onChange={(v) => v && setProp(s, 'materials', m.id, 'name', v)}
             />
           </Row>
         )}
       </Panel>
       <PresetPanel s={s} o={o} slot={active} m={m} />
-      {m && <PrincipledPanel s={s} m={m} />}
+      {m && <PrincipledPanel key={m.id} s={s} m={m} />}
     </>
   );
 }
@@ -329,11 +332,14 @@ function presetSwatch(id: string): string | null {
 }
 
 /**
- * What the preset browser searches for: kept when the panel is built again for another object (the
- * per-object tabs are, see Properties), so a preset can be applied to one object after another.
+ * The preset browser's search, chosen preset and scroll position: kept when the panel is built again
+ * for another object (the per-object tabs are, see Properties), so a preset can be applied to one
+ * object after another.
  */
 const presetQuery = signal('');
 const presetCategory = signal('ALL');
+const presetSelected = signal<string | null>(null);
+let presetScroll = 0;
 
 function PresetPanel({
   s,
@@ -348,7 +354,12 @@ function PresetPanel({
 }) {
   const query = presetQuery.value;
   const category = presetCategory.value;
-  const [selected, setSelected] = useState<string | null>(null);
+  const selected = presetSelected.value;
+  const setSelected = (id: string | null) => (presetSelected.value = id);
+  const grid = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (grid.current) grid.current.scrollTop = presetScroll;
+  }, []);
   void swatchVersion.value;
   const list = filterPresets(query, category);
   const sel = selected ? getMaterialPreset(selected) : undefined;
@@ -386,6 +397,8 @@ function PresetPanel({
         />
       </div>
       <div
+        ref={grid}
+        onScroll={(e) => (presetScroll = (e.currentTarget as HTMLElement).scrollTop)}
         role="listbox"
         aria-label="Material presets"
         data-testid="material-presets"
@@ -936,12 +949,16 @@ function ProceduralEditor(p: {
         const before = channelProcedural(s.doc.getMaterial(m.id), channel);
         return () => before && writeTexture((t) => restoreProcedural(t, before, field, value));
       },
-      () =>
-        run(
-          'material.procedural_set',
-          { material: m.id, channel, procedural: proceduralPatch(field, value) },
-          'ui',
-        ),
+      // a texture (or material) an agent removed meanwhile takes nothing: the edit would otherwise
+      // make a new texture from the one field, or end in an error toast
+      () => {
+        if (channelProcedural(s.doc.getMaterial(m.id), channel))
+          run(
+            'material.procedural_set',
+            { material: m.id, channel, procedural: proceduralPatch(field, value) },
+            'ui',
+          );
+      },
     );
   const grey = (v: number): Vec4 => [v, v, v, 1];
   const paramField = (spec: ProceduralParamSpec) => {

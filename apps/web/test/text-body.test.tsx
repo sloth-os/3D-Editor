@@ -144,4 +144,42 @@ describe('text body field', () => {
     fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true });
     expect(box.value).toBe('Hello');
   });
+
+  it('applies text left in it when it goes away without a blur (Firefox, Safari), once', async () => {
+    // regression: only a blur applied the text, and Firefox and Safari send none to a removed field
+    const commits: string[] = [];
+    const { container, unmount } = render(
+      <TextBody value="Hello" onCommit={(v) => (commits.push(v), true)} />,
+    );
+    const box = container.querySelector('textarea')!;
+    box.focus();
+    fireEvent.input(box, { target: { value: 'Typed' } });
+    unmount();
+    await act(async () => await Promise.resolve());
+    expect(commits).toEqual(['Typed']);
+  });
+
+  it('applies nothing as it goes away after Ctrl+Enter, after Escape, or with the stored text', async () => {
+    const commits: string[] = [];
+    const onCommit = (v: string) => (commits.push(v), true);
+    const goAway = async (keys: (box: HTMLTextAreaElement) => void) => {
+      const { container, unmount } = render(<TextBody value="Hello" onCommit={onCommit} />);
+      const box = container.querySelector('textarea')!;
+      box.focus();
+      keys(box);
+      unmount();
+      await act(async () => await Promise.resolve());
+    };
+    await goAway((box) => {
+      fireEvent.input(box, { target: { value: 'Applied' } });
+      fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true });
+    });
+    expect(commits).toEqual(['Applied']);
+    await goAway((box) => {
+      fireEvent.input(box, { target: { value: 'Cancelled' } });
+      fireEvent.keyDown(box, { key: 'Escape' });
+    });
+    await goAway((box) => fireEvent.input(box, { target: { value: 'Hello' } }));
+    expect(commits).toEqual(['Applied']);
+  });
 });

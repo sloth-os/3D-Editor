@@ -2,7 +2,7 @@ import { useRef } from 'preact/hooks';
 
 /**
  * Keys for the rows of a list whose items have no id of their own (driver variables, F-curve
- * modifiers, envelope control points), and where each row's item is now.
+ * modifiers, envelope control points, bones), and where each row's item is now.
  *
  * A row keeps its key while its item is edited or moves, and the key of a removed item goes to no
  * other item. A field that holds typed text so stays with its item when an agent or another person
@@ -17,6 +17,12 @@ export interface RowKeys {
    * as the row goes away (or through an earlier render) then writes nothing.
    */
   indexOf: (key: string) => number;
+  /**
+   * Tells that the item identified as `from` is now identified as `to` (renamed or otherwise
+   * edited here): its row keeps its key (and the keyboard focus) when the list renders next. Call
+   * it once the edit is made.
+   */
+  renamed: (from: string, to: string) => void;
 }
 
 /** A row as rendered: its item's identity, its kind, and its key. */
@@ -32,10 +38,11 @@ const ORDER_MATCH_LIMIT = 40_000;
 /**
  * The keys for a list of items (by `ids`, what identifies an unchanged item, and `kinds`, what an
  * edited one keeps), given the rows rendered before:
- * 1. unchanged items keep their keys, in the longest run that keeps their order;
+ * 1. unchanged items keep their keys: as many as keep their order, the ones nearest their old place
+ *    among equals (an item edited to equal its neighbour does not take the neighbour's key);
  * 2. unchanged items that moved keep theirs too;
  * 3. edited items take the key of a changed item between the same unchanged neighbours: of the same
- *    kind first, then the others in order when as many items changed as were left there;
+ *    kind first, then (with `inOrder`) the others in order when as many items changed as were left;
  * 4. other items are new: a fresh key each.
  */
 export function matchRowKeys(
@@ -43,6 +50,7 @@ export function matchRowKeys(
   ids: readonly string[],
   kinds: readonly string[] | null,
   fresh: () => string,
+  inOrder = true,
 ): string[] {
   const n = prev.length;
   const m = ids.length;
@@ -50,16 +58,24 @@ export function matchRowKeys(
   const used = Array.from({ length: n }, () => false);
   const anchors: [number, number][] = [];
   if (n && m && n * m <= ORDER_MATCH_LIMIT) {
-    // longest common subsequence of the identities: lcs[i][j] for prev[i..] and ids[j..]
-    const lcs = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
+    // best[i][j]: the best pairing of prev[i..] and ids[j..] that keeps the order. Each unchanged
+    // item is worth more than all moves together, so the most items keep their keys; among those
+    // pairings, the one moving items least
+    const worth = (Math.min(n, m) + 1) * (n + m) + 1;
+    const best = Array.from({ length: n + 1 }, () => new Float64Array(m + 1));
     for (let i = n - 1; i >= 0; i--)
-      for (let j = m - 1; j >= 0; j--)
-        lcs[i][j] = prev[i].id === ids[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+      for (let j = m - 1; j >= 0; j--) {
+        let v = Math.max(best[i + 1][j], best[i][j + 1]);
+        if (prev[i].id === ids[j]) v = Math.max(v, best[i + 1][j + 1] + worth - Math.abs(i - j));
+        best[i][j] = v;
+      }
     let i = 0;
     let j = 0;
     while (i < n && j < m) {
-      if (prev[i].id === ids[j]) anchors.push([i++, j++]);
-      else if (lcs[i + 1][j] >= lcs[i][j + 1]) i++;
+      const here = best[i][j];
+      if (prev[i].id === ids[j] && here === best[i + 1][j + 1] + worth - Math.abs(i - j))
+        anchors.push([i++, j++]);
+      else if (here === best[i + 1][j]) i++;
       else j++;
     }
   } else {
@@ -102,6 +118,7 @@ export function matchRowKeys(
         used[i] = true;
       }
     }
+    if (!inOrder) continue;
     const restOld = olds.filter((i) => !used[i]);
     const restNew = news.filter((j) => keys[j] === null);
     if (restOld.length !== restNew.length) continue;
@@ -113,21 +130,56 @@ export function matchRowKeys(
   return keys.map((k) => k ?? fresh());
 }
 
+/** How {@link useRowKeys} tells items apart. */
+export interface RowKeyOptions<T> {
+  /** What an edited item keeps (e.g. a modifier's type): an edited item keeps the row of its kind. */
+  kind?: (item: T) => string;
+  /**
+   * Whether items edited in place (as many between the same unchanged neighbours as were there
+   * before) keep their rows in order. Off for lists where others can replace an item in one change
+   * (a driver's variables, envelope points): there only the edits made here keep a row, through
+   * {@link RowKeys.renamed}, and a replaced item's row goes away with what was typed for it.
+   */
+  inOrder?: boolean;
+}
+
 /**
- * {@link RowKeys} for the items of a list, by what identifies an unchanged item (`id`) and what an
- * edited item keeps (`kind`, e.g. a modifier's type; without it, edited items are matched in order).
+ * {@link RowKeys} for the items of a list, by what identifies an unchanged item (`id`; with
+ * `inOrder` off, the identities must be unique, as names in a list are).
  */
 export function useRowKeys<T>(
   items: readonly T[],
   id: (item: T) => string,
-  kind?: (item: T) => string,
+  opts: RowKeyOptions<T> = {},
 ): RowKeys {
-  const state = useRef<{ rows: KeyedRow[]; next: number; at: Map<string, number> } | null>(null);
-  const st = (state.current ??= { rows: [], next: 0, at: new Map() });
+  const state = useRef<{
+    rows: KeyedRow[];
+    next: number;
+    at: Map<string, number>;
+    renames: Map<string, string>;
+  } | null>(null);
+  const st = (state.current ??= { rows: [], next: 0, at: new Map(), renames: new Map() });
   const ids = items.map(id);
-  const kinds = kind ? items.map(kind) : null;
-  const keys = matchRowKeys(st.rows, ids, kinds, () => `row${st.next++}`);
+  const kinds = opts.kind ? items.map(opts.kind) : null;
+  // the edits made here since the last render: the row of `from` is now the row of `to`
+  let prev = st.rows;
+  if (st.renames.size) {
+    const now = new Set(ids);
+    const renames = st.renames;
+    prev = prev.map((r) => {
+      const to = renames.get(r.id);
+      return to !== undefined && now.has(to) && !now.has(r.id) ? { ...r, id: to } : r;
+    });
+    st.renames = new Map();
+  }
+  const keys = matchRowKeys(prev, ids, kinds, () => `row${st.next++}`, opts.inOrder ?? true);
   st.rows = ids.map((x, j) => ({ id: x, kind: kinds?.[j] ?? '', key: keys[j] }));
   st.at = new Map(keys.map((k, j) => [k, j]));
-  return { keys, indexOf: (key) => st.at.get(key) ?? -1 };
+  return {
+    keys,
+    indexOf: (key) => st.at.get(key) ?? -1,
+    renamed: (from, to) => {
+      if (from !== to) st.renames.set(from, to);
+    },
+  };
 }

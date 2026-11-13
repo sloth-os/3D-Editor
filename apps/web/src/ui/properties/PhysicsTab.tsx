@@ -149,7 +149,11 @@ function RigidBodyPanels(p: {
         () => (s.doc.getObject(o.id)?.rigid_body as Record<string, unknown> | null | undefined)?.[k],
         (before) => writeSetting(k, before),
       ),
-      () => run('rigidbody.object_settings_set', { objects: [o.id], [k]: v }, 'ui'),
+      // a rigid body (or object) an agent removed meanwhile takes nothing (no error toast)
+      () => {
+        if (isRecord(s.doc.getObject(o.id)?.rigid_body))
+          run('rigidbody.object_settings_set', { objects: [o.id], [k]: v }, 'ui');
+      },
     );
   const form = (keys: string[]) => (
     <SchemaForm

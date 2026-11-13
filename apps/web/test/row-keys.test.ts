@@ -6,9 +6,9 @@ const rows = (ids: string[], kinds?: string[]): KeyedRow[] =>
   ids.map((id, i) => ({ id, kind: kinds?.[i] ?? '', key: `k${i}` }));
 
 /** The keys for the new ids; fresh keys are new0, new1, … */
-function match(prev: KeyedRow[], ids: string[], kinds: string[] | null = null): string[] {
+function match(prev: KeyedRow[], ids: string[], kinds: string[] | null = null, inOrder = true): string[] {
   let n = 0;
-  return matchRowKeys(prev, ids, kinds, () => `new${n++}`);
+  return matchRowKeys(prev, ids, kinds, () => `new${n++}`, inOrder);
 }
 
 describe('row keys that follow their items', () => {
@@ -66,6 +66,31 @@ describe('row keys that follow their items', () => {
     expect(keys[0]).toBe('k0');
     expect(keys[299]).toBe('k299');
     expect(new Set(keys).size).toBe(300);
+  });
+
+  it('an item edited to equal its neighbour keeps its key (the neighbour keeps its own)', () => {
+    // regression: the edited item took the key of the equal neighbour, so both rows were made anew
+    expect(match(rows(['a', 'b']), ['b', 'b'])).toEqual(['k0', 'k1']);
+    expect(match(rows(['a', 'b', 'c']), ['b', 'b', 'c'])).toEqual(['k0', 'k1', 'k2']);
+    expect(match(rows(['a', 'b']), ['a', 'a'])).toEqual(['k0', 'k1']);
+    expect(match(rows(['x', 'a', 'b']), ['x', 'b', 'b'], ['K', 'K', 'K'])).toEqual(['k0', 'k1', 'k2']);
+  });
+
+  it('among equal items, the ones nearest their old place keep the keys', () => {
+    // one of three equal items removed at the end: the first two keep theirs
+    expect(match(rows(['x', 'x', 'x']), ['x', 'x'])).toEqual(['k0', 'k1']);
+    // an item added in front of equal ones: they keep theirs
+    expect(match(rows(['x', 'x']), ['y', 'x', 'x'])).toEqual(['new0', 'k0', 'k1']);
+  });
+
+  it('without in-order pairing, an item another one replaced takes its key away', () => {
+    // a driver's variable replaced by another in one change: the new one gets a fresh row
+    expect(match(rows(['a']), ['c'], null, false)).toEqual(['new0']);
+    expect(match(rows(['a', 'b', 'c']), ['a', 'x', 'c'], null, false)).toEqual(['k0', 'new0', 'k2']);
+    // unchanged and moved items keep theirs
+    expect(match(rows(['a', 'b']), ['b', 'a'], null, false)).toEqual(['k1', 'k0']);
+    // kinds still pair edited items
+    expect(match(rows(['a', 'b'], ['P', 'Q']), ['a', 'y'], ['P', 'Q'], false)).toEqual(['k0', 'k1']);
   });
 
   it('keys stay unique', () => {

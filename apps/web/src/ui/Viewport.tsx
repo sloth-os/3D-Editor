@@ -20,6 +20,7 @@ import { Icon, type IconName } from './icons';
 import { RedoPanel } from './RedoPanel';
 import { Panel, Row, SelectField, NumberField, ColorField, Checkbox } from './fields/fields';
 import { TransformFields } from './properties/ObjectTab';
+import { useShownObject } from './properties/shown-object';
 import { NavGizmo } from './NavGizmo';
 import { importFiles } from '../io/import-export';
 import { fps, slowFrameCompiled, slowFrameMs } from '../telemetry/perf';
@@ -194,11 +195,13 @@ export function ViewportHeader({ s }: { s: ProjectSession }) {
 /** The viewport's sidebar (N): Transform, 3D Cursor, View. */
 export function Sidebar({ s }: { s: ProjectSession }) {
   void s.revision.value;
-  const id = s.state.$activeId.value;
-  const o = id ? s.doc.getObject(id) : null;
+  const box = useRef<HTMLDivElement>(null);
+  // the active object, or the one a field here is being typed into (see useShownObject)
+  const o = useShownObject(s, box);
   const st = s.state;
   return (
     <div
+      ref={box}
       class="sidebar-n"
       onPointerDown={(e) => e.stopPropagation()}
       // scroll the sidebar, not the view
@@ -207,7 +210,8 @@ export function Sidebar({ s }: { s: ProjectSession }) {
     >
       <Panel title="Transform" id="n-transform">
         {o && st.mode === 'OBJECT' ? (
-          <TransformFields s={s} o={o} />
+          // built anew for another object: a field never writes what was typed for one into another
+          <TransformFields key={o.id} s={s} o={o} />
         ) : (
           <div class="hint">
             {st.mode === 'EDIT' ? 'Edit-mode transforms: use G/R/S' : 'Nothing selected'}

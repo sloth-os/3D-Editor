@@ -1,4 +1,5 @@
 import { signal } from '@preact/signals';
+import { useRef } from 'preact/hooks';
 import type { ObjectData } from '@3d-editor/core';
 import { session as sessionSig } from '../../app/store';
 import type { ProjectSession } from '../../project/session';
@@ -11,6 +12,7 @@ import { PhysicsTab } from './PhysicsTab';
 import { ConstraintsTab } from './ConstraintsTab';
 import { DataTab } from './DataTab';
 import { MaterialTab } from './MaterialTab';
+import { useShownObject } from './shown-object';
 
 /** Tabs of the Properties editor, in Blender's order. */
 export type PropertiesTabId =
@@ -83,8 +85,9 @@ export function availableTabs(active: ObjectData | null): PropertiesTabId[] {
 
 export function Properties({ session }: { session: ProjectSession }) {
   void session.revision.value;
-  const activeId = session.state.$activeId.value;
-  const active = activeId ? session.doc.getObject(activeId) : null;
+  const content = useRef<HTMLDivElement>(null);
+  // the active object, or the one a field here is being typed into (see useShownObject)
+  const active = useShownObject(session, content);
   const tab = activePropertiesTab.value;
   const available = TABS.filter((t) => !t.available || t.available(active));
   // an unavailable tab falls back to Scene without forgetting the choice (it returns when the
@@ -108,14 +111,14 @@ export function Properties({ session }: { session: ProjectSession }) {
           </button>
         ))}
       </div>
-      <div class="prop-content" role="tabpanel" data-testid={`prop-content-${current}`}>
+      <div class="prop-content" ref={content} role="tabpanel" data-testid={`prop-content-${current}`}>
         {current === 'render' && <RenderTab s={session} />}
         {current === 'output' && <OutputTab s={session} />}
         {current === 'scene' && <SceneTab s={session} />}
         {current === 'world' && <WorldTab s={session} />}
         {/* the object's tabs are built anew for another object (an agent can make another one
-            active while the person types): a field never writes what was typed for one object
-            into the next, and text it holds is committed to its own object as it goes away */}
+            active): a field never writes what was typed for one object into the next, and text it
+            holds is committed to its own object as it goes away */}
         {current === 'object' && active && <ObjectTab key={active.id} s={session} o={active} />}
         {current === 'modifiers' && active && <ModifiersTab key={active.id} s={session} o={active} />}
         {current === 'particles' && active && <ParticlesTab key={active.id} s={session} o={active} />}

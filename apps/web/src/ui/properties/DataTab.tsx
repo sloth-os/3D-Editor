@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Fragment, type ComponentChildren } from 'preact';
 import {
   BONE_CONSTRAINT_LABELS,
@@ -450,6 +450,10 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
     activeShapeKeys.value[meshId],
   );
   const active: ShapeKeyData | null = activeIndex >= 0 ? keys[activeIndex] : null;
+  // the active key's fields are keyed by its row: a value or name typed for one key never goes to
+  // the key shown in its place after an agent removed or renamed it (the fields are made anew)
+  const keyRows = useRowKeys(keys, (k) => k.name, { inOrder: false });
+  const activeRow = active ? keyRows.keys[activeIndex] : '';
   const liveKeyNames = () => s.doc.getShapeKeys(meshId).map((k) => k.name);
   const select = (name: string) =>
     (activeShapeKeys.value = {
@@ -488,7 +492,11 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
           if (typeof before === 'number') write(before);
         };
       },
-      () => run('object.shape_key_set', { object: o.id, key: k.name, [field]: v }, 'ui'),
+      // a key an agent removed or renamed meanwhile takes nothing (no error toast)
+      () => {
+        if (s.doc.getShapeKeys(meshId).some((x) => x.name === k.name))
+          run('object.shape_key_set', { object: o.id, key: k.name, [field]: v }, 'ui');
+      },
     );
   };
   const add = (fromMix: boolean) => {
@@ -594,7 +602,7 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
         <div class="hint">The mesh itself is the Basis shape; Edit Mode edits the Basis.</div>
       )}
       {active && (
-        <>
+        <Fragment key={activeRow}>
           <Row label="Name">
             <TextField
               value={active.name}
@@ -607,7 +615,10 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
                 if (!liveKeyNames().includes(active.name)) return;
                 const r = runResult('object.shape_key_set', { object: o.id, key: active.name, name }, 'ui');
                 const renamed = (r?.result as { key?: string } | undefined)?.key;
-                if (r?.ok && renamed) select(renamed);
+                if (r?.ok && renamed) {
+                  keyRows.renamed(active.name, renamed);
+                  select(renamed);
+                }
               }}
             />
           </Row>
@@ -677,7 +688,7 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
               <Icon name="key" size={12} /> Insert Keyframe
             </button>
           </Row>
-        </>
+        </Fragment>
       )}
     </Panel>
   );
@@ -991,19 +1002,39 @@ function CurvePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
  */
 export function TextBody({ value, onCommit }: { value: string; onCommit: (v: string) => boolean }) {
   const [text, setText] = useEditedText(value);
+  const box = useRef<HTMLTextAreaElement>(null);
   /**
    * Text this field applied or cancelled since it got the focus: the blur that follows Ctrl+Enter or
    * Escape must not apply it (again).
    */
   const settled = useRef<string | null>(null);
+  const latest = useRef({ value, onCommit });
+  latest.current = { value, onCommit };
   const commit = (t: string) => {
     if (t === value || t === settled.current) return;
     settled.current = t;
     // a failed edit (reported in the Info log) shows the document's text again
     if (!onCommit(t)) setText(value);
   };
+  // Text typed and left in the field is applied when the field goes away, as leaving it does, once
+  // and after the removal: Chromium blurs a focused field it removes (that applies it), Firefox and
+  // Safari do not.
+  useEffect(
+    () => () => {
+      const el = box.current;
+      const q = latest.current;
+      if (!el) return;
+      queueMicrotask(() => {
+        if (el.value === q.value || el.value === settled.current) return;
+        settled.current = el.value;
+        q.onCommit(el.value);
+      });
+    },
+    [],
+  );
   return (
     <textarea
+      ref={box}
       class="textfield"
       aria-label="Text"
       data-testid="font-body"
@@ -1048,7 +1079,13 @@ function TextPanels(p: {
   return (
     <>
       <Panel title="Text" id="font-text">
-        <TextBody value={body} onCommit={(v) => run('font.text_set', { object: o.id, body: v }, 'ui')} />
+        <TextBody
+          value={body}
+          // a text object an agent deleted or converted meanwhile takes nothing (no error toast)
+          onCommit={(v) =>
+            p.s.doc.getObject(o.id)?.type === 'FONT' && run('font.text_set', { object: o.id, body: v }, 'ui')
+          }
+        />
         <div class="hint">
           {lines} line{lines === 1 ? '' : 's'} · {body.replace(/\n/g, '').length} characters · built-in
           sans-serif font
@@ -1185,8 +1222,23 @@ export function splinePointInput(pt: SplinePoint): Record<string, unknown> {
 
 const SPLINE_LABEL: Record<Spline['type'], string> = { POLY: 'Poly', BEZIER: 'Bezier', NURBS: 'NURBS' };
 
+/**
+ * What identifies an unchanged spline among the others of its curve (splines have no ids): its type
+ * and its control points. Settings (resolution, cyclic, smooth, ...) edit a spline without making it
+ * another one.
+ */
+function splineId(sp: Spline): string {
+  let h = 0;
+  for (const pt of sp.points) for (const v of pt.co) h = (Math.imul(h, 31) + Math.round(v * 1e4)) | 0;
+  return `${sp.type}:${sp.points.length}:${h}`;
+}
+
 function ActiveSplinePanel({ s, o, curve }: { s: ProjectSession; o: ObjectData; curve: CurveData }) {
   const splines = (Array.isArray(curve.splines) ? curve.splines : []).map((x) => sanitizeSpline(x));
+  // the fields are keyed by the spline they show: a value typed for one spline never goes to the one
+  // shown at its index after an agent removed or added splines (the fields are made anew), and
+  // commits find their spline where it is now
+  const splineRows = useRowKeys(splines, splineId, { kind: (x) => x.type });
   if (!splines.length)
     return (
       <Panel title="Active Spline" id="curve-active-spline">
@@ -1195,34 +1247,50 @@ function ActiveSplinePanel({ s, o, curve }: { s: ProjectSession; o: ObjectData; 
     );
   const index = Math.min(Math.max(0, activeSplines.value[curve.id] ?? 0), splines.length - 1);
   const sp = splines[index];
-  /** Changes spline settings through curve.spline_set_points (the points stay as they are). */
-  const update = (patch: Record<string, unknown>) =>
-    run(
-      'curve.spline_set_points',
-      { object: o.id, spline_index: index, points: sp.points.map(splinePointInput), ...patch },
-      'ui',
+  const activeKey = splineRows.keys[index];
+  /** The stored spline of these fields and its index now (null once an agent removed it). */
+  const live = (): { i: number; spline: Spline } | null => {
+    const i = splineRows.indexOf(activeKey);
+    const stored = i < 0 ? undefined : s.doc.getCurve(curve.id)?.splines?.[i];
+    return stored ? { i, spline: sanitizeSpline(stored) } : null;
+  };
+  /**
+   * Changes settings of this spline through curve.spline_set_points: its points as stored now stay
+   * as they are (not the points last rendered, which an agent may have changed since).
+   */
+  const update = (patch: Record<string, unknown>) => {
+    const cur = live();
+    return (
+      !!cur &&
+      run(
+        'curve.spline_set_points',
+        { object: o.id, spline_index: cur.i, points: cur.spline.points.map(splinePointInput), ...patch },
+        'ui',
+      )
     );
-  /** Sets the resolution of the active spline in the current spline list. */
+  };
+  /** Sets the resolution of this spline in the current spline list. */
   const writeResolution = (v: number) => {
     const cur = s.doc.getCurve(curve.id);
-    if (!cur || !Array.isArray(cur.splines) || !cur.splines[index]) return;
+    const at = live()?.i ?? -1;
+    if (!cur || !Array.isArray(cur.splines) || at < 0) return;
     s.doc.updateCurve(curve.id, {
-      splines: cur.splines.map((x, i) => (i === index ? { ...x, resolution_u: v } : x)),
+      splines: cur.splines.map((x, i) => (i === at ? { ...x, resolution_u: v } : x)),
     });
   };
   const setResolution = (v: number, final: boolean) =>
     dragEdit(
       s,
-      `spline:${curve.id}:${index}:resolution`,
+      `spline:${curve.id}:${activeKey}:resolution`,
       final,
       () => writeResolution(v),
       () => {
-        const before = s.doc.getCurve(curve.id)?.splines?.[index]?.resolution_u;
+        const before = live()?.spline.resolution_u;
         return () => {
           if (typeof before === 'number') writeResolution(before);
         };
       },
-      () => update({ resolution_u: v }),
+      () => void update({ resolution_u: v }),
     );
   const slots = o.material_slots;
   return (
@@ -1240,109 +1308,111 @@ function ActiveSplinePanel({ s, o, curve }: { s: ProjectSession; o: ObjectData; 
           />
         </Row>
       )}
-      <Row label="Type">
-        <EnumButtons
-          value={sp.type}
-          testId="spline-type"
-          options={[
-            { value: 'POLY', label: 'Poly' },
-            { value: 'BEZIER', label: 'Bezier' },
-            { value: 'NURBS', label: 'NURBS' },
-          ]}
-          onChange={(type) => update({ type })}
-        />
-      </Row>
-      <Row label="">
-        <Checkbox
-          value={sp.use_cyclic_u}
-          label="Cyclic"
-          testId="spline-cyclic"
-          onChange={(cyclic) =>
-            run('curve.cyclic_toggle', { object: o.id, spline_index: index, cyclic }, 'ui')
-          }
-        />
-      </Row>
-      <Row label="Resolution" title="Samples per segment (0 = the curve's resolution)">
-        <NumberField
-          value={sp.resolution_u}
-          integer
-          min={0}
-          max={1024}
-          testId="spline-resolution"
-          onChange={setResolution}
-        />
-      </Row>
-      {sp.type === 'NURBS' && (
-        <>
-          <Row label="Order" title="NURBS order (degree + 1)">
-            <NumberField
-              value={sp.order_u}
-              integer
-              min={2}
-              max={6}
-              testId="spline-order"
-              onChange={(v, f) => f && update({ order_u: v })}
-            />
-          </Row>
-          <Row label="">
-            <Checkbox
-              value={sp.use_endpoint_u}
-              label="Endpoint"
-              testId="spline-endpoint"
-              onChange={(v) => update({ use_endpoint_u: v })}
-            />
-          </Row>
-        </>
-      )}
-      <Row label="">
-        <Checkbox
-          value={sp.use_smooth}
-          label="Smooth"
-          testId="spline-smooth"
-          onChange={(v) => update({ use_smooth: v })}
-        />
-      </Row>
-      <Row label="Material" title="Material slot used by this spline's surface">
-        {slots.length ? (
-          <SelectField
-            value={String(sp.material_index)}
-            testId="spline-material"
-            options={withCurrent(
-              slots.map((id, i) => ({
-                value: String(i),
-                label: `${i}: ${id ? (s.doc.getMaterial(id)?.name ?? '(missing)') : '(empty)'}`,
-              })),
-              String(sp.material_index),
-            )}
-            onChange={(v) => update({ material_index: Number(v) })}
+      <Fragment key={activeKey}>
+        <Row label="Type">
+          <EnumButtons
+            value={sp.type}
+            testId="spline-type"
+            options={[
+              { value: 'POLY', label: 'Poly' },
+              { value: 'BEZIER', label: 'Bezier' },
+              { value: 'NURBS', label: 'NURBS' },
+            ]}
+            onChange={(type) => update({ type })}
           />
-        ) : (
-          <span class="hint">No material slots</span>
+        </Row>
+        <Row label="">
+          <Checkbox
+            value={sp.use_cyclic_u}
+            label="Cyclic"
+            testId="spline-cyclic"
+            onChange={(cyclic) =>
+              run('curve.cyclic_toggle', { object: o.id, spline_index: index, cyclic }, 'ui')
+            }
+          />
+        </Row>
+        <Row label="Resolution" title="Samples per segment (0 = the curve's resolution)">
+          <NumberField
+            value={sp.resolution_u}
+            integer
+            min={0}
+            max={1024}
+            testId="spline-resolution"
+            onChange={setResolution}
+          />
+        </Row>
+        {sp.type === 'NURBS' && (
+          <>
+            <Row label="Order" title="NURBS order (degree + 1)">
+              <NumberField
+                value={sp.order_u}
+                integer
+                min={2}
+                max={6}
+                testId="spline-order"
+                onChange={(v, f) => f && update({ order_u: v })}
+              />
+            </Row>
+            <Row label="">
+              <Checkbox
+                value={sp.use_endpoint_u}
+                label="Endpoint"
+                testId="spline-endpoint"
+                onChange={(v) => update({ use_endpoint_u: v })}
+              />
+            </Row>
+          </>
         )}
-      </Row>
-      <div style={BUTTON_ROW}>
-        <button
-          class="btn"
-          data-testid="spline-switch-direction"
-          title="Reverse the direction of the spline"
-          onClick={() => run('curve.switch_direction', { object: o.id, spline_index: index }, 'ui')}
-        >
-          Switch Direction
-        </button>
-        <button
-          class="btn"
-          data-testid="spline-remove"
-          disabled={splines.length < 2}
-          title={splines.length < 2 ? 'The only spline of the curve' : 'Delete this spline'}
-          onClick={() => {
-            if (run('curve.spline_remove', { object: o.id, spline_index: index }, 'ui'))
-              activeSplines.value = { ...activeSplines.value, [curve.id]: Math.max(0, index - 1) };
-          }}
-        >
-          Remove Spline
-        </button>
-      </div>
-      <div class="hint">{sp.points.length} control points</div>
+        <Row label="">
+          <Checkbox
+            value={sp.use_smooth}
+            label="Smooth"
+            testId="spline-smooth"
+            onChange={(v) => update({ use_smooth: v })}
+          />
+        </Row>
+        <Row label="Material" title="Material slot used by this spline's surface">
+          {slots.length ? (
+            <SelectField
+              value={String(sp.material_index)}
+              testId="spline-material"
+              options={withCurrent(
+                slots.map((id, i) => ({
+                  value: String(i),
+                  label: `${i}: ${id ? (s.doc.getMaterial(id)?.name ?? '(missing)') : '(empty)'}`,
+                })),
+                String(sp.material_index),
+              )}
+              onChange={(v) => update({ material_index: Number(v) })}
+            />
+          ) : (
+            <span class="hint">No material slots</span>
+          )}
+        </Row>
+        <div style={BUTTON_ROW}>
+          <button
+            class="btn"
+            data-testid="spline-switch-direction"
+            title="Reverse the direction of the spline"
+            onClick={() => run('curve.switch_direction', { object: o.id, spline_index: index }, 'ui')}
+          >
+            Switch Direction
+          </button>
+          <button
+            class="btn"
+            data-testid="spline-remove"
+            disabled={splines.length < 2}
+            title={splines.length < 2 ? 'The only spline of the curve' : 'Delete this spline'}
+            onClick={() => {
+              if (run('curve.spline_remove', { object: o.id, spline_index: index }, 'ui'))
+                activeSplines.value = { ...activeSplines.value, [curve.id]: Math.max(0, index - 1) };
+            }}
+          >
+            Remove Spline
+          </button>
+        </div>
+        <div class="hint">{sp.points.length} control points</div>
+      </Fragment>
     </Panel>
   );
 }
@@ -1400,9 +1470,9 @@ const boneLength = (b: BoneData) =>
 function ArmaturePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const arm = s.doc.getArmature(o.data!);
   const bones = arm && Array.isArray(arm.bones) ? arm.bones : [];
-  // the bone's panels are built anew for another bone, not when the bone is renamed (they keep the
-  // keyboard focus then): rows keep their keys through renames
-  const boneRows = useRowKeys(bones, (b) => String(b?.name));
+  // the bone's panels are built anew for another bone, not when the bone is renamed here (they keep
+  // the keyboard focus then)
+  const boneRows = useRowKeys(bones, (b) => String(b?.name), { inOrder: false });
   if (!arm) return <div class="empty-note">The armature data is missing.</div>;
   const ev = panelEvaluation(s);
   const tree = boneTree(bones);
@@ -1535,7 +1605,10 @@ function ArmaturePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
             armId={arm.id}
             bone={active}
             bones={bones}
-            onRename={select}
+            onRename={(name) => {
+              boneRows.renamed(active.name, name);
+              select(name);
+            }}
           />
         )}
       </Panel>
@@ -1631,6 +1704,7 @@ function BoneIkPanel({
   const flag = (k: IkField) => values[k] === true;
   const num = (k: IkField) => values[k] as number;
   const set = (patch: Partial<Record<IkField, boolean | number>>) =>
+    hasBone(s, o.id, bone.name) &&
     run('pose.ik_settings_set', { object: o.id, bone: bone.name, ...patch }, 'ui');
   /** Writes one IK field of this bone into the current pose (drag previews and their restore). */
   const writeField = (k: IkField, v: unknown) => {
@@ -1745,6 +1819,18 @@ function BoneIkPanel({
         );
       })}
     </Panel>
+  );
+}
+
+/**
+ * Whether the armature of object `objectId` still has a bone named `name`: a bone or pose field
+ * commits as it goes away, also after an agent removed or renamed the bone (or deleted the object),
+ * and then changes nothing (no error toast).
+ */
+function hasBone(s: ProjectSession, objectId: string, name: string): boolean {
+  const o = s.doc.getObject(objectId);
+  return (
+    o?.type === 'ARMATURE' && !!o.data && !!s.doc.getArmature(o.data)?.bones?.some((b) => b.name === name)
   );
 }
 
@@ -1898,7 +1984,10 @@ function PosePanel({
         const before = s.doc.getObject(o.id)?.pose?.bones?.[bone.name]?.[c] ?? defaultPoseBone()[c];
         return () => writeChannel(c, before);
       },
-      () => run('pose.bone_transform_set', { object: o.id, bone: bone.name, [c]: v }, 'ui'),
+      () => {
+        if (hasBone(s, o.id, bone.name))
+          run('pose.bone_transform_set', { object: o.id, bone: bone.name, [c]: v }, 'ui');
+      },
     );
   const constraints = (pb.constraints ?? []).filter((c): c is ConstraintData => !!c && typeof c === 'object');
   return (
@@ -1988,7 +2077,9 @@ function BoneConstraintBox({
   const label = BONE_CONSTRAINT_LABELS[c.type as BoneConstraintType] ?? humanize(c.type);
   const tid = `bone-constraint-${c.name}`;
   const target = c.target ? s.doc.getObject(c.target) : null;
+  // a constraint (or bone) an agent removed meanwhile takes nothing (no error toast)
   const update = (patch: Record<string, unknown>) =>
+    !!s.doc.getObject(o.id)?.pose?.bones?.[bone]?.constraints?.some((x) => x?.id === c.id) &&
     run('pose.constraint_set', { object: o.id, bone, constraint: c.id, ...patch }, 'ui');
   const influencePath = poseBonePath(bone, `constraints[${JSON.stringify(c.name)}].influence`);
   /** Sets this constraint's influence in the current pose (everything else stays as it is now). */

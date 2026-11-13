@@ -65,7 +65,11 @@ function setParam(
       () => storedModifier(s, o.id, mod.id)?.params?.[key],
       (before) => writeParam(s, o.id, mod.id, key, before),
     ),
-    () => run('object.modifier_set', { object: o.id, modifier: mod.id, params: { [key]: value } }, 'ui'),
+    // a modifier an agent removed meanwhile takes nothing (no error toast for it)
+    () => {
+      if (storedModifier(s, o.id, mod.id))
+        run('object.modifier_set', { object: o.id, modifier: mod.id, params: { [key]: value } }, 'ui');
+    },
   );
 }
 

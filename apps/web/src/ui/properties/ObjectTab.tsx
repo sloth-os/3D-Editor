@@ -1010,7 +1010,7 @@ function DriverBox(p: {
   const ref = { target_type: d.target_type, target: d.target_id, path: d.path, index: d.index };
   const update = (patch: Record<string, unknown>) => run('anim.driver_update', { ...ref, ...patch }, 'ui');
   const vars = Array.isArray(d.variables) ? d.variables : [];
-  const setVars = (next: DriverVariable[]) => update({ variables: next.map(variableInput) });
+  const setVars = (next: DriverVariable[]): boolean => update({ variables: next.map(variableInput) });
   /** The driver's variables as they are now (null when the driver is gone). */
   const varsNow = (): DriverVariable[] | null => {
     const now = s.doc.getDriver(key);
@@ -1022,16 +1022,18 @@ function DriverBox(p: {
    * agent or another person may have changed the variables (their changes stay; a variable they
    * removed or renamed is not written back).
    */
-  const editVar = (name: string, change: (v: DriverVariable) => DriverVariable | null) => {
+  const editVar = (name: string, change: (v: DriverVariable) => DriverVariable | null): boolean => {
     const now = varsNow();
     const i = now ? now.findIndex((x) => x.name === name) : -1;
-    if (!now || i < 0) return;
+    if (!now || i < 0) return false;
     const next = change(now[i]);
-    setVars(next ? now.map((x, j) => (j === i ? next : x)) : now.filter((_, j) => j !== i));
+    return setVars(next ? now.map((x, j) => (j === i ? next : x)) : now.filter((_, j) => j !== i));
   };
   const tid = `driver-${d.path}-${d.index}`;
-  // a row stays with its variable (names are unique in a driver) when others add or remove variables
-  const varRows = useRowKeys(vars, (v) => String(isRecord(v) ? v.name : ''));
+  // a row stays with its variable (names are unique in a driver) when others add or remove variables;
+  // a variable replaced by another one in one change (an agent's driver_update) takes its row and
+  // what was typed in it away; a rename made here keeps the row
+  const varRows = useRowKeys(vars, (v) => String(isRecord(v) ? v.name : ''), { inOrder: false });
   return (
     <div style={{ ...boxStyle, opacity: d.mute ? 0.6 : 1 }} data-testid={tid}>
       <div style={boxHeaderStyle}>
@@ -1093,7 +1095,10 @@ function DriverBox(p: {
           s={s}
           v={v}
           testId={`${tid}-var-${k}`}
-          onChange={(patch) => editVar(v.name, (x) => ({ ...x, ...patch }))}
+          onChange={(patch) => {
+            if (editVar(v.name, (x) => ({ ...x, ...patch })) && patch.name !== undefined)
+              varRows.renamed(v.name, patch.name);
+          }}
           onRemove={() => editVar(v.name, () => null)}
         />
       ))}
@@ -1282,11 +1287,7 @@ function ChannelBox(p: {
     !isObject && p.shared.length ? ` (also applies to the same channel of ${p.shared.join(', ')})` : '';
   const mods = Array.isArray(fc.modifiers) ? fc.modifiers : [];
   // a box stays with its modifier (an edited one keeps its type) when others add or remove modifiers
-  const modRows = useRowKeys(
-    mods,
-    (m) => JSON.stringify(m) ?? '',
-    (m) => (isRecord(m) ? String(m.type) : ''),
-  );
+  const modRows = useRowKeys(mods, contentId, { kind: (m) => (isRecord(m) ? String(m.type) : '') });
   return (
     <div style={boxStyle} data-testid={tid}>
       {/* the controls move below the name when both do not fit on one line */}
@@ -1340,10 +1341,10 @@ function ChannelBox(p: {
         isRecord(m) ? (
           <FModifierBox
             key={modRows.keys[i]}
+            rowKey={modRows.keys[i]}
             s={s}
             fc={fc}
             m={m}
-            index={i}
             at={() => modRows.indexOf(modRows.keys[i])}
             testId={`${tid}-mod-${i}`}
           />
@@ -1351,6 +1352,15 @@ function ChannelBox(p: {
       )}
     </div>
   );
+}
+
+/** What identifies a list item without an id by its content (any stored value, bigints too). */
+function contentId(item: unknown): string {
+  try {
+    return JSON.stringify(item, (_k, v: unknown) => (typeof v === 'bigint' ? `${v}n` : v)) ?? '';
+  } catch {
+    return '';
+  }
 }
 
 /** Blender's labels of F-curve modifier settings. */
@@ -1410,15 +1420,16 @@ function FModifierBox(p: {
   s: ProjectSession;
   fc: FCurve;
   m: FModifierData;
-  index: number;
   /**
    * Where the modifier is in the curve's stack now: others may have added or removed modifiers
    * before it since this box rendered, and -1 once it is gone (a field's commit as it goes away).
    */
   at: () => number;
+  /** The box's row (the same while the modifier is edited or moves). */
+  rowKey: string;
   testId: string;
 }) {
-  const { s, fc, m, index } = p;
+  const { s, fc, m } = p;
   const [open, setOpen] = useState(true);
   const info = FMODIFIER_TYPE_INFO.find((t) => t.type === m.type);
   const key = fcurveKey(fc);
@@ -1431,10 +1442,10 @@ function FModifierBox(p: {
     return { cur: cur as FCurve & { modifiers: FModifierData[] }, mod, i };
   };
   const params = (m.params ?? {}) as Record<string, unknown>;
-  const update = (patch: Record<string, unknown>) => {
+  const update = (patch: Record<string, unknown>): boolean => {
     const live = now();
-    if (!live) return;
-    run(
+    if (!live) return false;
+    return run(
       'anim.fmodifier_update',
       {
         target_type: fc.target_type,
@@ -1459,7 +1470,7 @@ function FModifierBox(p: {
   const setParam = (k: string, v: unknown, final: boolean) =>
     dragEdit(
       s,
-      `${key}:${index}:${k}`,
+      `${key}:${p.rowKey}:${k}`,
       final,
       () => writeParam(k, v),
       captureField(
@@ -1471,18 +1482,19 @@ function FModifierBox(p: {
   const coefficients = Array.isArray(params.coefficients) ? (params.coefficients as number[]) : [];
   type Point = { frame: number; min: number; max: number };
   const points = Array.isArray(params.control_points) ? (params.control_points as Point[]) : [];
-  // a row stays with its point (frames are unique in an envelope) when others add or remove points
-  const pointRows = useRowKeys(points, (pt) => String(isRecord(pt) ? pt.frame : ''));
+  // a row stays with its point (frames are unique in an envelope) when others add or remove points;
+  // a point another change replaces takes its row away, a frame changed here keeps the row
+  const pointRows = useRowKeys(points, (pt) => String(isRecord(pt) ? pt.frame : ''), { inOrder: false });
   /** Changes the control points as they are now: others may have edited, added or removed some. */
-  const editPoints = (change: (now: Point[]) => Point[] | null) => {
+  const editPoints = (change: (now: Point[]) => Point[] | null): boolean => {
     const live = now();
     const list = live?.mod.params?.control_points;
-    if (!live || !Array.isArray(list)) return;
+    if (!live || !Array.isArray(list)) return false;
     const next = change(list as Point[]);
-    if (next) update({ params: { control_points: next } });
+    return !!next && update({ params: { control_points: next } });
   };
   /** Changes (or removes, for null) the point of a row, where it is now (nothing when it is gone). */
-  const editPoint = (row: string, change: (pt: Point) => Point | null) =>
+  const editPoint = (row: string, change: (pt: Point) => Point | null): boolean =>
     editPoints((list) => {
       const k = pointRows.indexOf(row);
       if (k < 0 || k >= list.length) return null;
@@ -1570,9 +1582,15 @@ function FModifierBox(p: {
                           precision={f === 'frame' ? 0 : 3}
                           step={f === 'frame' ? 1 : 0.01}
                           testId={`${p.testId}-point-${k}-${f}`}
-                          onChange={(v, final) =>
-                            final && editPoint(pointRows.keys[k], (x) => ({ ...x, [f]: v }))
-                          }
+                          onChange={(v, final) => {
+                            if (!final) return;
+                            let from: unknown;
+                            const done = editPoint(pointRows.keys[k], (x) => {
+                              from = x.frame;
+                              return { ...x, [f]: v };
+                            });
+                            if (done && f === 'frame') pointRows.renamed(String(from), String(v));
+                          }}
                         />
                       </div>
                     ))}
@@ -1592,9 +1610,13 @@ function FModifierBox(p: {
                 <button
                   class="btn"
                   data-testid={`${p.testId}-add-point`}
-                  onClick={() =>
-                    editPoints((list) => [...list, { frame: Math.round(s.state.frame), min: -1, max: 1 }])
-                  }
+                  onClick={() => {
+                    // like Blender, nothing is added on a frame that has a point (it would replace it)
+                    const frame = Math.round(s.state.frame);
+                    editPoints((list) =>
+                      list.some((x) => x.frame === frame) ? null : [...list, { frame, min: -1, max: 1 }],
+                    );
+                  }}
                 >
                   <Icon name="plus" size={12} /> Add Control Point
                 </button>

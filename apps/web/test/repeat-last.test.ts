@@ -14,7 +14,7 @@ import {
 } from '../src/editor/runner';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import { registerUiOperators } from '../src/editor/ui-operators';
-import { installKeymap } from '../src/editor/keymap';
+import { TYPING_PAUSE_MS, installKeymap } from '../src/editor/keymap';
 import { EDIT_MENU } from '../src/editor/menus';
 import { ViewportInteraction } from '../src/viewport/interaction';
 import { ProjectSession } from '../src/project/session';
@@ -288,5 +288,74 @@ describe('Repeat Last (Shift+R)', () => {
     shiftR();
     expect(s.doc.listObjects().filter((o) => o.name.startsWith('Cube'))).toHaveLength(2);
     expect(s.doc.listObjects().filter((o) => o.name.startsWith('Ball'))).toHaveLength(1);
+  });
+});
+
+describe('keys typed on after the field they were typed into was taken away', () => {
+  /** A text field typed into, then taken away under the typing (an agent removed what it edits). */
+  function typeInRemovedField(): HTMLInputElement {
+    const field = document.createElement('input');
+    document.body.appendChild(field);
+    field.focus();
+    field.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }));
+    field.remove();
+    return field;
+  }
+  beforeEach(() => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('are not shortcuts while the typing goes on (X does not delete, Space does not play)', () => {
+    // regression: the letters typed on reached the viewport keymap: X deleted the selected objects
+    typeInRemovedField();
+    press('x');
+    press(' ');
+    press('x');
+    expect(names(s)).toEqual(['Cube']);
+    expect(s.view.playing.value).toBe(false);
+  });
+
+  it.each([['Enter'], ['Escape'], ['Tab']])('%s ends the typing: the next shortcut works', (key) => {
+    typeInRemovedField();
+    press(key);
+    press('x');
+    expect(names(s)).toEqual([]);
+  });
+
+  it('a click ends the typing', () => {
+    typeInRemovedField();
+    window.dispatchEvent(new Event('pointerdown'));
+    press('x');
+    expect(names(s)).toEqual([]);
+  });
+
+  it('a pause in the typing ends it', () => {
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    typeInRemovedField();
+    now += TYPING_PAUSE_MS - 1;
+    press('a');
+    // each key typed on extends the typing
+    now += TYPING_PAUSE_MS - 1;
+    press('x');
+    expect(names(s)).toEqual(['Cube']);
+    now += TYPING_PAUSE_MS + 1;
+    press('x');
+    expect(names(s)).toEqual([]);
+  });
+
+  it('keys after leaving a field that is still there are shortcuts', () => {
+    const field = document.createElement('input');
+    document.body.appendChild(field);
+    field.focus();
+    field.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }));
+    field.blur();
+    press('x');
+    expect(names(s)).toEqual([]);
+    field.remove();
   });
 });

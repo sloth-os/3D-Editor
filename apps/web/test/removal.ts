@@ -9,7 +9,10 @@ export function removalLikeChromium(): () => void {
   const removeChild = Node.prototype.removeChild;
   Node.prototype.removeChild = function <T extends Node>(this: Node, child: T): T {
     const active = document.activeElement;
-    if (active instanceof HTMLInputElement && child.contains(active)) {
+    if (
+      (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) &&
+      child.contains(active)
+    ) {
       active.dispatchEvent(new Event('change', { bubbles: true }));
       active.dispatchEvent(new FocusEvent('blur'));
     }

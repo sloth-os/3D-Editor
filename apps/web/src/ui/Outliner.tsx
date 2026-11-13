@@ -343,7 +343,10 @@ export function Outliner({ session }: { session: ProjectSession }) {
           <RenameBox
             name={o.name}
             onRename={(name, enter) => {
-              if (enter || (name && name !== o.name)) run('object.rename', { object: o.id, name }, 'ui');
+              // an object an agent deleted meanwhile takes nothing (Chromium blurs the removed box)
+              const stored = session.doc.getObject(o.id);
+              if (stored && (enter || (name && name !== stored.name)))
+                run('object.rename', { object: o.id, name }, 'ui');
               setRenaming(null);
             }}
             onCancel={() => setRenaming(null)}
