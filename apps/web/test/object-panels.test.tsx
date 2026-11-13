@@ -10,7 +10,7 @@ import {
   fcurveKey,
   type OperatorContext,
 } from '@3d-editor/core';
-import { session as sessionSignal } from '../src/app/store';
+import { session as sessionSignal, toasts } from '../src/app/store';
 import { registry, run, runResult } from '../src/editor/editor';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
@@ -955,5 +955,601 @@ describe('fields taken away while they hold typed text, as others edit what they
     fireEvent.blur(field);
     expect(s.doc.name).toBe('Bridge');
     expect(field.value).toBe('Bridge');
+  });
+});
+
+describe('fields that outlive what they were typed for (another object shown, rows that others change)', () => {
+  // the commit made as a field goes away comes from the field as it was (in Chromium through the
+  // change event and blur it sends then, in all browsers for text fields as their last props)
+  const browsers = [
+    ['Chromium', removalLikeChromium],
+    ['Firefox and Safari', () => () => {}],
+  ] as const;
+  const errorToasts = () => toasts.value.filter((t) => t.level === 'error').map((t) => t.message);
+  /** Presses Enter in the field that has the keyboard focus, as the person would after a change. */
+  const enterOnFocused = (root: Element) => {
+    const el = document.activeElement;
+    if (el instanceof HTMLInputElement && el.isConnected && root.contains(el))
+      fireEvent.keyDown(el, { key: 'Enter' });
+  };
+  /** Opens a number field's entry and types into it, without confirming. */
+  const typeInEntry = (el: HTMLElement, value: string): HTMLInputElement => {
+    fireEvent.pointerDown(el, { button: 0, clientX: 5, pointerId: 1 });
+    fireEvent.pointerUp(el, { button: 0, clientX: 5, pointerId: 1 });
+    const input = el.querySelector('input')!;
+    input.focus();
+    fireEvent.input(input, { target: { value } });
+    return input;
+  };
+  beforeEach(() => {
+    toasts.value = [];
+  });
+
+  it.each(browsers)(
+    '%s: a number typed for one object never goes to the object an agent shows instead',
+    async (_browser, removal) => {
+      // regression: the tab's fields were kept for the other object; the open entry then wrote the
+      // number typed for the Cube into the other object on Enter
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Other', location: [3, 0, 0] });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      const { container } = render(<Properties session={s} />);
+      const input = typeInEntry(byTestId(container, 'loc-0')!, '-7');
+      const restore = removal();
+      try {
+        act(() => select(s, 'Other'));
+        expect(input.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(s.doc.findObjectByName('Other')!.location).toEqual([3, 0, 0]);
+      // Chromium commits the entry as it goes away, to the object it was typed for
+      expect(s.doc.findObjectByName('Cube')!.location[0]).toBe(removal === removalLikeChromium ? -7 : 0);
+    },
+  );
+
+  it.each(browsers)(
+    '%s: text typed for one object is committed to it when an agent shows another one with the same value',
+    async (_browser, removal) => {
+      // regression: the field kept the typed text for the other object (same value, so nothing reset
+      // it) and Enter wrote it into the other object's property
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('mesh.primitive_cube_add', { name: 'B' });
+      for (const name of ['Cube', 'B'])
+        ok('data.set_property', {
+          kind: 'objects',
+          target: s.doc.findObjectByName(name)!.id,
+          values: { custom_props: { weight: 1 } },
+        });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      localStorage.setItem('3d-editor:panel:Custom Properties', '1');
+      const { container } = render(<Properties session={s} />);
+      const field = byTestId(container, 'custom-prop-weight') as HTMLInputElement;
+      field.focus();
+      fireEvent.input(field, { target: { value: '5' } });
+      const restore = removal();
+      try {
+        act(() => select(s, 'B'));
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(s.doc.findObjectByName('B')!.custom_props).toEqual({ weight: 1 });
+      expect(s.doc.findObjectByName('Cube')!.custom_props).toEqual({ weight: 5 });
+      expect((byTestId(container, 'custom-prop-weight') as HTMLInputElement).value).toBe('1');
+    },
+  );
+
+  it('the material preset search is kept when another object is shown', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('mesh.primitive_cube_add', { name: 'B' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'material';
+    localStorage.setItem('3d-editor:panel:material-presets', '1');
+    const { container } = render(<Properties session={s} />);
+    const shown = () => container.querySelectorAll('[data-testid="material-presets"] [role="option"]').length;
+    const all = shown();
+    const search = byTestId(container, 'material-preset-search') as HTMLInputElement;
+    fireEvent.input(search, { target: { value: 'gold' } });
+    const found = shown();
+    expect(found).toBeGreaterThan(0);
+    expect(found).toBeLessThan(all);
+    expect(byTestId(container, 'material-preset-gold')).not.toBeNull();
+    act(() => select(s, 'B'));
+    expect((byTestId(container, 'material-preset-search') as HTMLInputElement).value).toBe('gold');
+    expect(shown()).toBe(found);
+    fireEvent.input(byTestId(container, 'material-preset-search')!, { target: { value: '' } });
+    expect(shown()).toBe(all);
+  });
+
+  /** Cube with a driver on location[2] reading Ctrl's location (variables a, b, …). */
+  function driven(expression: string, names: string[]) {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.empty_add', { name: 'Ctrl' });
+    const ctrl = s.doc.findObjectByName('Ctrl')!.id;
+    const variable = (name: string, path: string, index: number) => ({
+      name,
+      target_type: 'object',
+      target: ctrl,
+      path,
+      index,
+    });
+    ok('anim.driver_add', {
+      target_type: 'object',
+      target: 'Cube',
+      path: 'location',
+      index: 2,
+      expression,
+      variables: names.map((n, i) => variable(n, 'location', i)),
+    });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-drivers', '1');
+    const cube = s.doc.findObjectByName('Cube')!.id;
+    const key = fcurveKey({ target_type: 'object', target_id: cube, path: 'location', index: 2 });
+    const ref = { target_type: 'object', target: cube, path: 'location', index: 2 };
+    const listed = () => s.doc.getDriver(key)!.variables.map((v) => `${v.name}:${v.path}[${v.index}]`);
+    return { cube, key, ref, variable, listed };
+  }
+
+  it.each(browsers)(
+    '%s: text typed for a driver variable never goes to the variable an agent moved into its row',
+    async (_browser, removal) => {
+      // regression: rows were keyed by position: after the agent removed the variable, its row
+      // showed the next one with the typed path (the same 'location' before), and Enter wrote it there
+      const d = driven('a + b', ['a', 'b']);
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const path = byTestId(container, 'driver-location-2-var-0-path') as HTMLInputElement;
+      path.focus();
+      fireEvent.input(path, { target: { value: 'scale' } });
+      const restore = removal();
+      try {
+        act(() =>
+          agent.run('anim.driver_update', {
+            ...d.ref,
+            expression: 'b',
+            variables: [d.variable('b', 'location', 1)],
+          }),
+        );
+        expect(path.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(d.listed()).toEqual(['b:location[1]']);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it('a driver variable row stays with its variable when an agent adds one before it', () => {
+    // regression: the row kept its position and the typed path went to the agent's new variable
+    const d = driven('a + b', ['a', 'b']);
+    const agent = peerReplica(s);
+    const { container } = render(<Properties session={s} />);
+    const path = byTestId(container, 'driver-location-2-var-0-path') as HTMLInputElement;
+    path.focus();
+    fireEvent.input(path, { target: { value: 'scale' } });
+    act(() =>
+      agent.run('anim.driver_update', {
+        ...d.ref,
+        expression: 'a + b + c',
+        variables: [
+          d.variable('c', 'location', 2),
+          d.variable('a', 'location', 0),
+          d.variable('b', 'location', 1),
+        ],
+      }),
+    );
+    expect(path.isConnected).toBe(true);
+    expect(path.value).toBe('scale');
+    fireEvent.keyDown(path, { key: 'Enter' });
+    expect(d.listed()).toEqual(['c:location[2]', 'a:scale[0]', 'b:location[1]']);
+  });
+
+  it('renaming a driver variable keeps its row and the keyboard focus', () => {
+    const d = driven('a', ['a', 'b']);
+    const { container } = render(<Properties session={s} />);
+    const name = byTestId(container, 'driver-location-2-var-1-name') as HTMLInputElement;
+    name.focus();
+    fireEvent.input(name, { target: { value: 'zz' } });
+    fireEvent.keyDown(name, { key: 'Enter' });
+    expect(d.listed()).toEqual(['a:location[0]', 'zz:location[1]']);
+    expect(byTestId(container, 'driver-location-2-var-1-name')).toBe(name);
+    expect(document.activeElement).toBe(name);
+  });
+
+  it.each(browsers)(
+    '%s: a driver expression typed when an agent removes the driver is dropped without an error',
+    async (_browser, removal) => {
+      // regression: Chromium committed it through the removed driver: "No driver on 'location' …"
+      const d = driven('a', ['a']);
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const field = byTestId(container, 'driver-location-2-expression') as HTMLInputElement;
+      field.focus();
+      fireEvent.input(field, { target: { value: 'a * 3' } });
+      const restore = removal();
+      try {
+        act(() => agent.run('anim.driver_remove', d.ref));
+        expect(field.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(s.doc.getDriver(d.key)).toBeNull();
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it.each(browsers)(
+    '%s: a driver expression typed when another object is shown is committed to its driver',
+    async (_browser, removal) => {
+      // regression: only Chromium committed it (through its blur), Firefox and Safari lost it
+      const d = driven('a', ['a']);
+      const { container } = render(<Properties session={s} />);
+      const field = byTestId(container, 'driver-location-2-expression') as HTMLInputElement;
+      field.focus();
+      fireEvent.input(field, { target: { value: 'a * 3' } });
+      const restore = removal();
+      try {
+        act(() => select(s, 'Ctrl'));
+        expect(field.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(s.doc.getDriver(d.key)!.expression).toBe('a * 3');
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  /** Cube's location[0] curve with F-curve modifiers; `ref` addresses it in anim.fmodifier_*. */
+  function curveWith(modifiers: { type: string; params?: Record<string, unknown> }[]) {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    const cube = s.doc.findObjectByName('Cube')!.id;
+    ok('anim.keyframe_insert_property', {
+      target_type: 'object',
+      target: 'Cube',
+      path: 'location',
+      index: 0,
+    });
+    const ref = { target_type: 'object', target: cube, path: 'location', index: 0 };
+    for (const m of modifiers) ok('anim.fmodifier_add', { ...ref, ...m });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-fcurves', '1');
+    const key = fcurveKey({ target_type: 'object', target_id: cube, path: 'location', index: 0 });
+    const mods = () => s.doc.getFCurve(key)!.modifiers ?? [];
+    return { cube, ref, mods };
+  }
+  const envelope = (points: [number, number, number][]) => ({
+    control_points: points.map(([frame, min, max]) => ({ frame, min, max })),
+  });
+
+  it.each(browsers)(
+    '%s: a control point an agent removed is not written back from its open entry',
+    async (_browser, removal) => {
+      // regression: Chromium's blur committed the panel's list as rendered: the removed point came
+      // back (and with it the old values of the others)
+      const c = curveWith([
+        {
+          type: 'ENVELOPE',
+          params: envelope([
+            [1, -1, 1],
+            [10, -2, 2],
+          ]),
+        },
+      ]);
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const input = typeInEntry(byTestId(container, 'fcurve-location-0-mod-0-point-1-min')!, '-5');
+      const restore = removal();
+      try {
+        act(() =>
+          agent.run('anim.fmodifier_update', {
+            ...c.ref,
+            modifier_index: 0,
+            params: envelope([[1, -0.5, 0.5]]),
+          }),
+        );
+        expect(input.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(c.mods()[0].params.control_points).toEqual(envelope([[1, -0.5, 0.5]]).control_points);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it.each(browsers)(
+    '%s: a value typed for a control point never goes to the point an agent moved into its row',
+    async (_browser, removal) => {
+      // regression: rows were keyed by position: the open entry of the first row was given the next
+      // point, and Enter wrote the frame typed for the removed point into it
+      const c = curveWith([
+        {
+          type: 'ENVELOPE',
+          params: envelope([
+            [1, -1, 1],
+            [10, -2, 2],
+          ]),
+        },
+      ]);
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      typeInEntry(byTestId(container, 'fcurve-location-0-mod-0-point-0-frame')!, '20');
+      const restore = removal();
+      try {
+        act(() =>
+          agent.run('anim.fmodifier_update', {
+            ...c.ref,
+            modifier_index: 0,
+            params: envelope([[10, -2, 2]]),
+          }),
+        );
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(c.mods()[0].params.control_points).toEqual(envelope([[10, -2, 2]]).control_points);
+    },
+  );
+
+  it('a control point edit goes to the point as it is now, keeping what an agent changed in the others', () => {
+    const c = curveWith([
+      {
+        type: 'ENVELOPE',
+        params: envelope([
+          [1, -1, 1],
+          [10, -2, 2],
+        ]),
+      },
+    ]);
+    const agent = peerReplica(s);
+    const { container } = render(<Properties session={s} />);
+    const input = typeInEntry(byTestId(container, 'fcurve-location-0-mod-0-point-1-min')!, '-5');
+    act(() =>
+      agent.run('anim.fmodifier_update', {
+        ...c.ref,
+        modifier_index: 0,
+        params: envelope([
+          [0, -3, 3],
+          [1, -0.5, 0.5],
+          [10, -2, 4],
+        ]),
+      }),
+    );
+    // the entry stays open on its point (now the third row)
+    expect(input.isConnected).toBe(true);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(c.mods()[0].params.control_points).toEqual(
+      envelope([
+        [0, -3, 3],
+        [1, -0.5, 0.5],
+        [10, -5, 4],
+      ]).control_points,
+    );
+    // removing and adding points work on the points as they are now too
+    act(() =>
+      agent.run('anim.fmodifier_update', {
+        ...c.ref,
+        modifier_index: 0,
+        params: envelope([
+          [0, -3, 3],
+          [10, -5, 4],
+        ]),
+      }),
+    );
+    fireEvent.click(byTestId(container, 'fcurve-location-0-mod-0-point-0-remove')!);
+    expect(c.mods()[0].params.control_points).toEqual(envelope([[10, -5, 4]]).control_points);
+  });
+
+  it.each(browsers)(
+    '%s: coefficients typed for a modifier an agent removed never go to the modifier moved into its place',
+    async (_browser, removal) => {
+      // regression: modifier boxes were keyed by position: the box showed the next modifier (with the
+      // same coefficients, so the typed text stayed) and Enter wrote the text into it
+      // the same coefficients (the typed text stayed in the reused field); modifiers that are the
+      // same in every way cannot be told apart, and either being removed leaves the same stack
+      const c = curveWith([
+        { type: 'GENERATOR', params: { coefficients: [0, 1] } },
+        { type: 'GENERATOR', params: { coefficients: [0, 1], use_additive: true } },
+      ]);
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const field = byTestId(container, 'fcurve-location-0-mod-0-coefficients') as HTMLInputElement;
+      field.focus();
+      fireEvent.input(field, { target: { value: '5, 6' } });
+      const restore = removal();
+      try {
+        act(() => agent.run('anim.fmodifier_remove', { ...c.ref, modifier_index: 0 }));
+        expect(field.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(c.mods().map((m) => [m.params.coefficients, m.params.use_additive])).toEqual([[[0, 1], true]]);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it.each(browsers)(
+    '%s: an envelope edit of a modifier an agent removed changes no other modifier',
+    async (_browser, removal) => {
+      // regression: Chromium's blur wrote the removed modifier's points into the modifier that moved
+      // to its index
+      const c = curveWith([
+        {
+          type: 'ENVELOPE',
+          params: envelope([
+            [1, -1, 1],
+            [10, -2, 2],
+          ]),
+        },
+        { type: 'ENVELOPE', params: envelope([[5, -3, 3]]) },
+      ]);
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      typeInEntry(byTestId(container, 'fcurve-location-0-mod-0-point-1-min')!, '-5');
+      const restore = removal();
+      try {
+        act(() => agent.run('anim.fmodifier_remove', { ...c.ref, modifier_index: 0 }));
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(c.mods().map((m) => m.params.control_points)).toEqual([envelope([[5, -3, 3]]).control_points]);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it('an envelope edit goes to its modifier where it is now, after an agent removed one before it', () => {
+    const c = curveWith([
+      { type: 'ENVELOPE', params: envelope([[1, -1, 1]]) },
+      { type: 'ENVELOPE', params: envelope([[5, -3, 3]]) },
+    ]);
+    const agent = peerReplica(s);
+    const { container } = render(<Properties session={s} />);
+    const input = typeInEntry(byTestId(container, 'fcurve-location-0-mod-1-point-0-min')!, '-7');
+    act(() => agent.run('anim.fmodifier_remove', { ...c.ref, modifier_index: 0 }));
+    expect(input.isConnected).toBe(true);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(c.mods().map((m) => m.params.control_points)).toEqual([envelope([[5, -7, 3]]).control_points]);
+  });
+
+  it.each(browsers)(
+    '%s: names typed for what an agent then deleted are dropped without an error',
+    async (_browser, removal) => {
+      // regression: the commit as the field went away renamed the deleted object, constraint, vertex
+      // group, particle system, shape key or bone, and failed with an error naming an internal id
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Other' });
+      const cube = s.doc.findObjectByName('Cube')!.id;
+      ok('object.constraint_add', { object: 'Cube', type: 'COPY_LOCATION', target: 'Other' });
+      ok('object.vertex_group_add', { object: 'Cube', name: 'Group' });
+      ok('object.particle_system_add', { object: 'Cube' });
+      const agent = peerReplica(s);
+      const cases: [string, string, string, () => void][] = [
+        [
+          'constraints',
+          'constraint-Copy Location-name',
+          'Grab',
+          () => {
+            const c = s.doc.getObject(cube)!.constraints[0];
+            agent.run('constraint.delete', { object: cube, constraint: c.id });
+          },
+        ],
+        [
+          'particles',
+          'psys-ParticleSystem-name',
+          'Pebbles',
+          () => {
+            const ps = s.doc.getObject(cube)!.particle_systems[0];
+            agent.run('object.particle_system_remove', { object: cube, particle_system: ps.id });
+          },
+        ],
+        [
+          'data',
+          'vgroup-name',
+          'Arm',
+          () => agent.run('object.vertex_group_remove', { object: cube, group: 'Group' }),
+        ],
+        ['object', 'object-name', 'Typed', () => agent.run('object.delete', { objects: [cube] })],
+      ];
+      select(s, 'Cube');
+      for (const [tab, testId, text, remove] of cases) {
+        activePropertiesTab.value = tab as typeof activePropertiesTab.value;
+        const { container, unmount } = render(<Properties session={s} />);
+        const field = byTestId(container, testId) as HTMLInputElement;
+        expect(field, testId).not.toBeNull();
+        field.focus();
+        fireEvent.input(field, { target: { value: text } });
+        const restore = removal();
+        try {
+          act(remove);
+          expect(field.isConnected, testId).toBe(false);
+          await settle();
+        } finally {
+          restore();
+        }
+        expect(errorToasts(), testId).toEqual([]);
+        unmount();
+      }
+    },
+  );
+
+  it.each(browsers)(
+    '%s: a shape key or bone name typed when an agent removes it is dropped without an error',
+    async (_browser, removal) => {
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      const cube = s.doc.findObjectByName('Cube')!.id;
+      ok('object.shape_key_add', { object: 'Cube', name: 'Basis' });
+      ok('object.shape_key_add', { object: 'Cube', name: 'Key 1' });
+      ok('object.armature_add', { name: 'Rig' });
+      const rig = s.doc.findObjectByName('Rig')!.id;
+      const agent = peerReplica(s);
+      activePropertiesTab.value = 'data';
+      select(s, 'Cube');
+      const first = render(<Properties session={s} />);
+      fireEvent.click(byTestId(first.container, 'shape-key-Key 1')!);
+      const key = byTestId(first.container, 'shape-key-name') as HTMLInputElement;
+      key.focus();
+      fireEvent.input(key, { target: { value: 'Smile' } });
+      let restore = removal();
+      try {
+        act(() => agent.run('object.shape_key_remove', { object: cube, all: true }));
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(errorToasts()).toEqual([]);
+      first.unmount();
+      select(s, 'Rig');
+      const second = render(<Properties session={s} />);
+      const bone = byTestId(second.container, 'bone-name') as HTMLInputElement;
+      bone.focus();
+      fireEvent.input(bone, { target: { value: 'Spine' } });
+      restore = removal();
+      try {
+        act(() => agent.run('object.delete', { objects: [rig] }));
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it('renaming a bone keeps its fields and the keyboard focus (Enter and Tab)', () => {
+    // regression: the bone's fields were keyed by its name: a rename rebuilt them and the focus went
+    // to the page
+    ok('object.armature_add', { name: 'Rig' });
+    select(s, 'Rig');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    const field = byTestId(container, 'bone-name') as HTMLInputElement;
+    field.focus();
+    fireEvent.input(field, { target: { value: 'Spine' } });
+    fireEvent.keyDown(field, { key: 'Enter' });
+    const rig = s.doc.findObjectByName('Rig')!;
+    expect(s.doc.getArmature(rig.data!)!.bones.map((b) => b.name)).toEqual(['Spine']);
+    expect(byTestId(container, 'bone-name')).toBe(field);
+    expect(document.activeElement).toBe(field);
+    expect(field.value).toBe('Spine');
+    // another bone gets its own fields
+    fireEvent.click(byTestId(container, 'bone-add')!);
+    expect(byTestId(container, 'bone-name')).not.toBe(field);
   });
 });

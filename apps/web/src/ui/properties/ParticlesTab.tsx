@@ -256,7 +256,9 @@ function SystemSettings(p: {
   const settings = normalizeParticleSettings(ps.settings).settings;
   const values = settings as unknown as Record<string, unknown>;
   const tid = `psys-${ps.name}`;
+  // a field commits as it goes away, also after an agent removed the system: nothing to change then
   const update = (patch: Record<string, unknown>) =>
+    storedSystem(s, o.id, ps.id) &&
     run('object.particle_system_update', { object: o.id, particle_system: ps.id, ...patch }, 'ui');
   const setSetting = (k: string, v: unknown, final: boolean) =>
     dragEdit(

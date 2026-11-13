@@ -57,9 +57,16 @@ export interface LastOperator {
   created: string[];
   /** Editor selection state captured right before the operator ran. */
   before: SelectionSnapshot;
+  /**
+   * Which operation this is: the same for its re-runs with adjusted parameters, new for any other
+   * run (also of the same operator). The Adjust Last Operation panel builds new fields for a new
+   * operation, so text typed for one never goes to the next.
+   */
+  serial: number;
 }
 
 export const lastOperator = signal<LastOperator | null>(null);
+let operationSerial = 0;
 
 /** One operator call of a {@link RepeatAction}. */
 export interface RepeatStep {
@@ -251,6 +258,7 @@ export function runOperator(
   if (res.ok && def?.redoable) {
     const existed = new Set(objectIds);
     const depth = session.undo.undoStack.length;
+    const adjusted = source === 'redo' ? lastOperator.peek() : null;
     lastOperator.value = {
       id,
       label: def.label,
@@ -260,6 +268,7 @@ export function runOperator(
       undoStep: depth > depthBefore,
       created: session.doc.objectIds().filter((o) => !existed.has(o)),
       before,
+      serial: adjusted?.id === id ? adjusted.serial : ++operationSerial,
     };
   } else if (res.ok && def && def.undo !== false && !def.uiOnly) {
     lastOperator.value = null;

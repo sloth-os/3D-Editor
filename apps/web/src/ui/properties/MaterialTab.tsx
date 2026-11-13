@@ -328,6 +328,13 @@ function presetSwatch(id: string): string | null {
   return null;
 }
 
+/**
+ * What the preset browser searches for: kept when the panel is built again for another object (the
+ * per-object tabs are, see Properties), so a preset can be applied to one object after another.
+ */
+const presetQuery = signal('');
+const presetCategory = signal('ALL');
+
 function PresetPanel({
   s,
   o,
@@ -339,8 +346,8 @@ function PresetPanel({
   slot: number;
   m: MaterialData | null;
 }) {
-  const [query, setQuery] = useState('');
-  const [category, setCategory] = useState('ALL');
+  const query = presetQuery.value;
+  const category = presetCategory.value;
   const [selected, setSelected] = useState<string | null>(null);
   void swatchVersion.value;
   const list = filterPresets(query, category);
@@ -364,7 +371,7 @@ function PresetPanel({
             commitOnBlur={false}
             ariaLabel="Search material presets"
             testId="material-preset-search"
-            onChange={setQuery}
+            onChange={(v) => (presetQuery.value = v)}
           />
         </div>
         <SelectField
@@ -375,7 +382,7 @@ function PresetPanel({
             { value: 'ALL', label: 'All' },
             ...categories.map((c) => ({ value: c, label: CATEGORY_LABELS[c] ?? c })),
           ]}
-          onChange={setCategory}
+          onChange={(v) => (presetCategory.value = v)}
         />
       </div>
       <div

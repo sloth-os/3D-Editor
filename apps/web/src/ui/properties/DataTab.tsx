@@ -39,6 +39,7 @@ import {
   composing,
 } from '../fields/fields';
 import { animState, animatedValue, setProp } from './prop-edit';
+import { useRowKeys } from '../fields/row-keys';
 import { animatedBlock } from './animated';
 import { run, runResult } from '../../editor/editor';
 import { Icon, type IconName } from '../icons';
@@ -364,6 +365,8 @@ function VertexGroupsPanel(p: { s: ProjectSession; o: ObjectData; meshId: string
               onChange={(v) => {
                 const name = v.trim();
                 if (!name || name === active.name) return;
+                // the commit as the field goes away can come after an agent removed the group
+                if (!s.doc.getVertexGroups(meshId).some((g) => g.name === active.name)) return;
                 const r = runResult(
                   'object.vertex_group_rename',
                   { object: o.id, group: active.name, name },
@@ -447,6 +450,7 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
     activeShapeKeys.value[meshId],
   );
   const active: ShapeKeyData | null = activeIndex >= 0 ? keys[activeIndex] : null;
+  const liveKeyNames = () => s.doc.getShapeKeys(meshId).map((k) => k.name);
   const select = (name: string) =>
     (activeShapeKeys.value = {
       ...activeShapeKeys.value,
@@ -599,6 +603,8 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
               onChange={(v) => {
                 const name = v.trim();
                 if (!name || name === active.name) return;
+                // the commit as the field goes away can come after an agent removed the key
+                if (!liveKeyNames().includes(active.name)) return;
                 const r = runResult('object.shape_key_set', { object: o.id, key: active.name, name }, 'ui');
                 const renamed = (r?.result as { key?: string } | undefined)?.key;
                 if (r?.ok && renamed) select(renamed);
@@ -1393,15 +1399,19 @@ const boneLength = (b: BoneData) =>
 
 function ArmaturePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const arm = s.doc.getArmature(o.data!);
+  const bones = arm && Array.isArray(arm.bones) ? arm.bones : [];
+  // the bone's panels are built anew for another bone, not when the bone is renamed (they keep the
+  // keyboard focus then): rows keep their keys through renames
+  const boneRows = useRowKeys(bones, (b) => String(b?.name));
   if (!arm) return <div class="empty-note">The armature data is missing.</div>;
   const ev = panelEvaluation(s);
-  const bones = Array.isArray(arm.bones) ? arm.bones : [];
   const tree = boneTree(bones);
   const chosen = activeEntryIndex(
     bones.map((b) => b.name),
     activeBones.value[o.id],
   );
   const active = (chosen >= 0 ? bones[chosen] : null) ?? tree[0]?.bone ?? null;
+  const activeRow = active ? boneRows.keys[bones.indexOf(active)] : '';
   const select = (name: string) =>
     (activeBones.value = {
       ...activeBones.value,
@@ -1519,7 +1529,7 @@ function ArmaturePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
         />
         {active && (
           <BoneFields
-            key={active.name}
+            key={activeRow}
             s={s}
             o={o}
             armId={arm.id}
@@ -1529,8 +1539,8 @@ function ArmaturePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
           />
         )}
       </Panel>
-      {active && <PosePanel key={active.name} s={s} o={o} bone={active} bones={bones} />}
-      {active && <BoneIkPanel key={`ik-${active.name}`} s={s} o={o} bone={active} bones={bones} />}
+      {active && <PosePanel key={activeRow} s={s} o={o} bone={active} bones={bones} />}
+      {active && <BoneIkPanel key={`ik-${activeRow}`} s={s} o={o} bone={active} bones={bones} />}
     </>
   );
 }
@@ -1747,8 +1757,11 @@ function BoneFields(p: {
   onRename: (name: string) => void;
 }) {
   const { s, o, armId, bone, bones } = p;
+  // a field commits as it goes away, also after an agent removed the bone: nothing to change then
   const update = (patch: Record<string, unknown>) =>
-    runResult('armature.bone_update', { object: o.id, bone: bone.name, ...patch }, 'ui');
+    s.doc.getArmature(armId)?.bones?.some((b) => b.name === bone.name)
+      ? runResult('armature.bone_update', { object: o.id, bone: bone.name, ...patch }, 'ui')
+      : null;
   /** Sets a rest field of this bone in the current bone list (other bones stay as they are now). */
   const writeRest = (field: 'head' | 'tail' | 'roll', v: Vec3 | number) => {
     const cur = s.doc.getArmature(armId);

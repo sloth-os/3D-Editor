@@ -1,4 +1,4 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import {
   ANIMATABLE,
   FMODIFIER_PARAM_SCHEMAS,
@@ -34,6 +34,7 @@ import {
   RAD,
   composing,
 } from '../fields/fields';
+import { useRowKeys } from '../fields/row-keys';
 import { PREVIEW_ORIGIN, animState, animatedValue, setProp } from './prop-edit';
 import { run } from '../../editor/editor';
 import { Icon } from '../icons';
@@ -288,7 +289,10 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
           <TextField
             value={o.name}
             testId="object-name"
-            onChange={(v) => v && run('object.rename', { object: o.id, name: v }, 'ui')}
+            // the commit as the field goes away can come after an agent deleted the object
+            onChange={(v) =>
+              v && s.doc.getObject(o.id) && run('object.rename', { object: o.id, name: v }, 'ui')
+            }
           />
         </Row>
       </Panel>
@@ -919,6 +923,11 @@ function ExpressionField(p: {
 }) {
   const [text, setText] = useState<string | null>(null);
   const [, rerender] = useState(0);
+  const box = useRef<HTMLInputElement>(null);
+  /** The text committed last: the commits as the field goes away must not commit it again. */
+  const committed = useRef<string | null>(null);
+  const latest = useRef(p);
+  latest.current = p;
   const shown = text ?? p.value;
   const problems = text === null ? [] : driverProblems({ expression: text, variables: p.variables });
   /**
@@ -928,22 +937,45 @@ function ExpressionField(p: {
    */
   const commit = (typed: string) => {
     try {
-      if (typed.trim() && typed !== p.value) p.onCommit(typed.trim());
+      if (typed.trim() && typed !== p.value && typed !== committed.current) {
+        committed.current = typed;
+        p.onCommit(typed.trim());
+      }
     } finally {
       setText(null);
       rerender((n) => n + 1);
     }
   };
+  // typed text is committed once when the field goes away (another object shown, the driver panel
+  // closed), as text fields do: Chromium blurs a focused input it removes, other browsers do not
+  useEffect(
+    () => () => {
+      const el = box.current;
+      const q = latest.current;
+      if (!el) return;
+      queueMicrotask(() => {
+        const typed = el.value;
+        if (!typed.trim() || typed === q.value || typed === committed.current) return;
+        committed.current = typed;
+        q.onCommit(typed.trim());
+      });
+    },
+    [],
+  );
   return (
     <>
       <input
+        ref={box}
         class="textfield"
         style={{ fontFamily: 'var(--mono)' }}
         value={shown}
         spellcheck={false}
         aria-label="Driver expression"
         data-testid={p.testId}
-        onInput={(e) => setText((e.target as HTMLInputElement).value)}
+        onInput={(e) => {
+          committed.current = null;
+          setText((e.target as HTMLInputElement).value);
+        }}
         onKeyDown={(e) => {
           e.stopPropagation();
           // the keys that confirm or cancel an IME composition belong to it
@@ -998,6 +1030,8 @@ function DriverBox(p: {
     setVars(next ? now.map((x, j) => (j === i ? next : x)) : now.filter((_, j) => j !== i));
   };
   const tid = `driver-${d.path}-${d.index}`;
+  // a row stays with its variable (names are unique in a driver) when others add or remove variables
+  const varRows = useRowKeys(vars, (v) => String(isRecord(v) ? v.name : ''));
   return (
     <div style={{ ...boxStyle, opacity: d.mute ? 0.6 : 1 }} data-testid={tid}>
       <div style={boxHeaderStyle}>
@@ -1043,7 +1077,8 @@ function DriverBox(p: {
           value={typeof d.expression === 'string' ? d.expression : ''}
           variables={vars}
           testId={`${tid}-expression`}
-          onCommit={(expression) => update({ expression })}
+          // the commit as the field goes away can come after an agent removed the driver
+          onCommit={(expression) => s.doc.getDriver(key) && update({ expression })}
         />
       </Row>
       <Row label="Value">
@@ -1054,7 +1089,7 @@ function DriverBox(p: {
       <ErrorList messages={errors} testId={`${tid}-error`} />
       {vars.map((v, k) => (
         <VariableEditor
-          key={k}
+          key={varRows.keys[k]}
           s={s}
           v={v}
           testId={`${tid}-var-${k}`}
@@ -1245,6 +1280,13 @@ function ChannelBox(p: {
   const tid = isObject ? `fcurve-${fc.path}-${fc.index}` : `fcurve-${fc.target_type}-${fc.path}-${fc.index}`;
   const sharedNote =
     !isObject && p.shared.length ? ` (also applies to the same channel of ${p.shared.join(', ')})` : '';
+  const mods = Array.isArray(fc.modifiers) ? fc.modifiers : [];
+  // a box stays with its modifier (an edited one keeps its type) when others add or remove modifiers
+  const modRows = useRowKeys(
+    mods,
+    (m) => JSON.stringify(m) ?? '',
+    (m) => (isRecord(m) ? String(m.type) : ''),
+  );
   return (
     <div style={boxStyle} data-testid={tid}>
       {/* the controls move below the name when both do not fit on one line */}
@@ -1294,9 +1336,17 @@ function ChannelBox(p: {
       {driver && !driver.mute && (
         <div class="hint">Driven: the driver overrides this curve and its modifiers.</div>
       )}
-      {(Array.isArray(fc.modifiers) ? fc.modifiers : []).map((m, i) =>
+      {mods.map((m, i) =>
         isRecord(m) ? (
-          <FModifierBox key={i} s={s} fc={fc} m={m} index={i} testId={`${tid}-mod-${i}`} />
+          <FModifierBox
+            key={modRows.keys[i]}
+            s={s}
+            fc={fc}
+            m={m}
+            index={i}
+            at={() => modRows.indexOf(modRows.keys[i])}
+            testId={`${tid}-mod-${i}`}
+          />
         ) : null,
       )}
     </div>
@@ -1356,29 +1406,55 @@ function fmodSchema(type: string): unknown {
   return schema;
 }
 
-function FModifierBox(p: { s: ProjectSession; fc: FCurve; m: FModifierData; index: number; testId: string }) {
+function FModifierBox(p: {
+  s: ProjectSession;
+  fc: FCurve;
+  m: FModifierData;
+  index: number;
+  /**
+   * Where the modifier is in the curve's stack now: others may have added or removed modifiers
+   * before it since this box rendered, and -1 once it is gone (a field's commit as it goes away).
+   */
+  at: () => number;
+  testId: string;
+}) {
   const { s, fc, m, index } = p;
   const [open, setOpen] = useState(true);
   const info = FMODIFIER_TYPE_INFO.find((t) => t.type === m.type);
-  const ref = {
-    target_type: fc.target_type,
-    target: fc.target_id,
-    path: fc.path,
-    index: fc.index,
-    modifier_index: index,
+  const key = fcurveKey(fc);
+  /** The modifier as it is now, and where it is (null when it is gone or now of another type). */
+  const now = (): { cur: FCurve & { modifiers: FModifierData[] }; mod: FModifierData; i: number } | null => {
+    const i = p.at();
+    const cur = i < 0 ? null : s.doc.getFCurve(key);
+    const mod = cur?.modifiers?.[i];
+    if (!cur?.modifiers || !isRecord(mod) || mod.type !== m.type) return null;
+    return { cur: cur as FCurve & { modifiers: FModifierData[] }, mod, i };
   };
   const params = (m.params ?? {}) as Record<string, unknown>;
-  const update = (patch: Record<string, unknown>) => run('anim.fmodifier_update', { ...ref, ...patch }, 'ui');
-  const key = fcurveKey(fc);
+  const update = (patch: Record<string, unknown>) => {
+    const live = now();
+    if (!live) return;
+    run(
+      'anim.fmodifier_update',
+      {
+        target_type: fc.target_type,
+        target: fc.target_id,
+        path: fc.path,
+        index: fc.index,
+        modifier_index: live.i,
+        ...patch,
+      },
+      'ui',
+    );
+  };
   /** Writes one parameter of this modifier into the current curve (nothing when it is gone). */
   const writeParam = (k: string, v: unknown) => {
-    const cur = s.doc.getFCurve(key);
-    const mod = cur?.modifiers?.[index];
-    if (!cur?.modifiers || !isRecord(mod) || mod.type !== m.type) return;
-    const modifiers = cur.modifiers.map((x, j) =>
-      j === index ? { ...x, params: withField(x.params, k, v) } : x,
+    const live = now();
+    if (!live) return;
+    const modifiers = live.cur.modifiers.map((x, j) =>
+      j === live.i ? { ...x, params: withField(x.params, k, v) } : x,
     );
-    s.doc.setFCurve({ ...cur, modifiers });
+    s.doc.setFCurve({ ...live.cur, modifiers });
   };
   const setParam = (k: string, v: unknown, final: boolean) =>
     dragEdit(
@@ -1387,16 +1463,32 @@ function FModifierBox(p: { s: ProjectSession; fc: FCurve; m: FModifierData; inde
       final,
       () => writeParam(k, v),
       captureField(
-        () => s.doc.getFCurve(key)?.modifiers?.[index]?.params?.[k],
+        () => now()?.mod.params?.[k],
         (before) => writeParam(k, before),
       ),
       () => update({ params: { [k]: v } }),
     );
   const coefficients = Array.isArray(params.coefficients) ? (params.coefficients as number[]) : [];
-  const points = Array.isArray(params.control_points)
-    ? (params.control_points as { frame: number; min: number; max: number }[])
-    : [];
-  const setPoints = (next: typeof points) => update({ params: { control_points: next } });
+  type Point = { frame: number; min: number; max: number };
+  const points = Array.isArray(params.control_points) ? (params.control_points as Point[]) : [];
+  // a row stays with its point (frames are unique in an envelope) when others add or remove points
+  const pointRows = useRowKeys(points, (pt) => String(isRecord(pt) ? pt.frame : ''));
+  /** Changes the control points as they are now: others may have edited, added or removed some. */
+  const editPoints = (change: (now: Point[]) => Point[] | null) => {
+    const live = now();
+    const list = live?.mod.params?.control_points;
+    if (!live || !Array.isArray(list)) return;
+    const next = change(list as Point[]);
+    if (next) update({ params: { control_points: next } });
+  };
+  /** Changes (or removes, for null) the point of a row, where it is now (nothing when it is gone). */
+  const editPoint = (row: string, change: (pt: Point) => Point | null) =>
+    editPoints((list) => {
+      const k = pointRows.indexOf(row);
+      if (k < 0 || k >= list.length) return null;
+      const next = change(list[k]);
+      return next ? list.map((x, j) => (j === k ? next : x)) : list.filter((_, j) => j !== k);
+    });
   return (
     <div style={{ ...boxStyle, background: 'transparent', opacity: m.mute ? 0.6 : 1 }} data-testid={p.testId}>
       <div style={{ ...boxHeaderStyle, cursor: 'pointer' }} onClick={() => setOpen(!open)}>
@@ -1420,7 +1512,21 @@ function FModifierBox(p: { s: ProjectSession; fc: FCurve; m: FModifierData; inde
             title="Remove modifier"
             aria-label="Remove modifier"
             data-testid={`${p.testId}-remove`}
-            onClick={() => run('anim.fmodifier_remove', ref, 'ui')}
+            onClick={() => {
+              const live = now();
+              if (!live) return;
+              run(
+                'anim.fmodifier_remove',
+                {
+                  target_type: fc.target_type,
+                  target: fc.target_id,
+                  path: fc.path,
+                  index: fc.index,
+                  modifier_index: live.i,
+                },
+                'ui',
+              );
+            }}
           >
             <Icon name="close" size={12} />
           </button>
@@ -1454,7 +1560,7 @@ function FModifierBox(p: { s: ProjectSession; fc: FCurve; m: FModifierData; inde
           {m.type === 'ENVELOPE' && (
             <>
               {points.map((pt, k) => (
-                <Row key={k} label={k === 0 ? 'Control Points' : ''}>
+                <Row key={pointRows.keys[k]} label={k === 0 ? 'Control Points' : ''}>
                   <div style={{ display: 'flex', gap: '2px' }}>
                     {(['frame', 'min', 'max'] as const).map((f) => (
                       <div key={f} style={{ flex: 1 }}>
@@ -1463,8 +1569,9 @@ function FModifierBox(p: { s: ProjectSession; fc: FCurve; m: FModifierData; inde
                           value={pt[f]}
                           precision={f === 'frame' ? 0 : 3}
                           step={f === 'frame' ? 1 : 0.01}
+                          testId={`${p.testId}-point-${k}-${f}`}
                           onChange={(v, final) =>
-                            final && setPoints(points.map((x, j) => (j === k ? { ...x, [f]: v } : x)))
+                            final && editPoint(pointRows.keys[k], (x) => ({ ...x, [f]: v }))
                           }
                         />
                       </div>
@@ -1473,7 +1580,8 @@ function FModifierBox(p: { s: ProjectSession; fc: FCurve; m: FModifierData; inde
                       class="btn flat icon"
                       title="Remove control point"
                       aria-label="Remove control point"
-                      onClick={() => setPoints(points.filter((_, j) => j !== k))}
+                      data-testid={`${p.testId}-point-${k}-remove`}
+                      onClick={() => editPoint(pointRows.keys[k], () => null)}
                     >
                       <Icon name="close" size={12} />
                     </button>
@@ -1485,7 +1593,7 @@ function FModifierBox(p: { s: ProjectSession; fc: FCurve; m: FModifierData; inde
                   class="btn"
                   data-testid={`${p.testId}-add-point`}
                   onClick={() =>
-                    setPoints([...points, { frame: Math.round(s.state.frame), min: -1, max: 1 }])
+                    editPoints((list) => [...list, { frame: Math.round(s.state.frame), min: -1, max: 1 }])
                   }
                 >
                   <Icon name="plus" size={12} /> Add Control Point

@@ -330,7 +330,10 @@ function ConstraintPanel(p: {
   };
   const error = constraintError(p.errors, c, index);
   const ref = { object: o.id, constraint: c.id };
-  const update = (patch: Record<string, unknown>) => run('constraint.update', { ...ref, ...patch }, 'ui');
+  // a field commits as it goes away, also after an agent removed the constraint: nothing to change
+  const update = (patch: Record<string, unknown>): boolean =>
+    !!s.doc.getObject(o.id)?.constraints?.some((x) => x.id === c.id) &&
+    run('constraint.update', { ...ref, ...patch }, 'ui');
   const tid = `constraint-${c.name}`;
   return (
     <div

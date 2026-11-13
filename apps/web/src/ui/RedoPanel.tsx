@@ -477,6 +477,9 @@ export function RedoPanel({ s }: { s: ProjectSession }) {
       {open && (
         <div class="panel-body">
           <SchemaForm
+            // new fields for each new operation: a field kept from the previous one (an agent's
+            // operation with the same parameter, run in this editor) would carry its typing over
+            key={last.serial}
             schema={paramSchema(last.id)}
             values={form.values}
             doc={s.doc}
@@ -490,8 +493,9 @@ export function RedoPanel({ s }: { s: ProjectSession }) {
               if (!final) return;
               // a field commits its text also when it goes away: after another operation replaced
               // this one (an agent's, run in this editor), the edit is not for the last one any more
-              if (lastOperator.value !== last) return;
-              const res = redoLast(s, registry, redoParams(s.doc, last, k, v));
+              const now = lastOperator.value;
+              if (now?.serial !== last.serial) return;
+              const res = redoLast(s, registry, redoParams(s.doc, now, k, v));
               if (res && !res.ok) setRejected((n) => n + 1);
             }}
           />

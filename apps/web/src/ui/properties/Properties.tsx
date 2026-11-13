@@ -113,13 +113,16 @@ export function Properties({ session }: { session: ProjectSession }) {
         {current === 'output' && <OutputTab s={session} />}
         {current === 'scene' && <SceneTab s={session} />}
         {current === 'world' && <WorldTab s={session} />}
-        {current === 'object' && active && <ObjectTab s={session} o={active} />}
-        {current === 'modifiers' && active && <ModifiersTab s={session} o={active} />}
-        {current === 'particles' && active && <ParticlesTab s={session} o={active} />}
-        {current === 'physics' && active && <PhysicsTab s={session} o={active} />}
-        {current === 'constraints' && active && <ConstraintsTab s={session} o={active} />}
-        {current === 'data' && active && <DataTab s={session} o={active} />}
-        {current === 'material' && active && <MaterialTab s={session} o={active} />}
+        {/* the object's tabs are built anew for another object (an agent can make another one
+            active while the person types): a field never writes what was typed for one object
+            into the next, and text it holds is committed to its own object as it goes away */}
+        {current === 'object' && active && <ObjectTab key={active.id} s={session} o={active} />}
+        {current === 'modifiers' && active && <ModifiersTab key={active.id} s={session} o={active} />}
+        {current === 'particles' && active && <ParticlesTab key={active.id} s={session} o={active} />}
+        {current === 'physics' && active && <PhysicsTab key={active.id} s={session} o={active} />}
+        {current === 'constraints' && active && <ConstraintsTab key={active.id} s={session} o={active} />}
+        {current === 'data' && active && <DataTab key={active.id} s={session} o={active} />}
+        {current === 'material' && active && <MaterialTab key={active.id} s={session} o={active} />}
       </div>
     </div>
   );

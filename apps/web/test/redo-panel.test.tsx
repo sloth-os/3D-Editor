@@ -2060,4 +2060,101 @@ describe('a field of the panel taken away while it holds typed text', () => {
       expect(s.doc.getCurve(title.data!)?.body).toBe('Hello');
     },
   );
+
+  const browsers = [
+    ['Chromium', removalLikeChromium],
+    ['Firefox and Safari', () => () => {}],
+  ] as const;
+  /** Presses Enter in the field that has the keyboard focus, as the person would after a change. */
+  const enterOnFocused = (root: Element) => {
+    const el = document.activeElement;
+    if (el instanceof HTMLInputElement && el.isConnected && root.contains(el))
+      fireEvent.keyDown(el, { key: 'Enter' });
+  };
+
+  it.each(browsers)(
+    '%s: text typed for an operation goes to neither it nor the next one of the same operator',
+    async (_b, removal) => {
+      // regression: the panel kept its fields for the next operation when it had the same parameter
+      // with the same value (an agent's Add Text after the person's), and the typed text, kept in the
+      // field, re-ran the agent's operation with it
+      toasts.value = [];
+      ok('object.text_add', { body: 'Hello', name: 'Title' });
+      const { container } = render(<RedoPanel s={s} />);
+      const body = container.querySelector<HTMLInputElement>('[data-testid="redo-body"]')!;
+      body.focus();
+      fireEvent.input(body, { target: { value: 'Typed' } });
+      const restore = removal();
+      try {
+        act(() => {
+          const r = runResult(
+            'object.text_add',
+            { body: 'Hello', name: 'Agent', location: [4, 0, 0] },
+            'mcp',
+          );
+          expect(r?.ok).toBe(true);
+        });
+        expect(body.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      const bodyOf = (name: string) => s.doc.getCurve(s.doc.findObjectByName(name)!.data!)?.body;
+      expect(bodyOf('Title')).toBe('Hello');
+      expect(bodyOf('Agent')).toBe('Hello');
+      expect(s.doc.findObjectByName('Agent')!.location).toEqual([4, 0, 0]);
+      expect(container.querySelector<HTMLInputElement>('[data-testid="redo-body"]')!.value).toBe('Hello');
+      expect(toasts.value.filter((t) => t.level === 'error')).toEqual([]);
+    },
+  );
+
+  it.each(browsers)(
+    '%s: a number typed for an operation is not applied to the next operation with that parameter',
+    async (_b, removal) => {
+      // regression: the open entry of Location X stayed open for the agent's Add UV Sphere, and Enter
+      // moved the agent's sphere
+      ok('mesh.primitive_cube_add', { name: 'Mine' });
+      const { container } = render(<RedoPanel s={s} />);
+      const x = container.querySelector<HTMLElement>('[data-testid="redo-location-0"]')!;
+      fireEvent.pointerDown(x, { button: 0, clientX: 5, pointerId: 1 });
+      fireEvent.pointerUp(x, { button: 0, clientX: 5, pointerId: 1 });
+      const entry = x.querySelector('input')!;
+      entry.focus();
+      fireEvent.input(entry, { target: { value: '2' } });
+      const restore = removal();
+      try {
+        act(() => {
+          const r = runResult('mesh.primitive_uv_sphere_add', { name: 'Sphere', location: [0, 5, 0] }, 'mcp');
+          expect(r?.ok).toBe(true);
+        });
+        expect(entry.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      enterOnFocused(container);
+      expect(s.doc.findObjectByName('Sphere')!.location).toEqual([0, 5, 0]);
+      expect(s.doc.findObjectByName('Mine')!.location).toEqual([0, 0, 0]);
+      expect(lastOperator.value?.id).toBe('mesh.primitive_uv_sphere_add');
+    },
+  );
+
+  it('an operation keeps its fields (and the keyboard focus) while it is adjusted', () => {
+    ok('object.text_add', { body: 'Hello', name: 'Title' });
+    const { container } = render(<RedoPanel s={s} />);
+    const body = container.querySelector<HTMLInputElement>('[data-testid="redo-body"]')!;
+    const serial = lastOperator.value!.serial;
+    body.focus();
+    fireEvent.input(body, { target: { value: 'Adjusted' } });
+    fireEvent.keyDown(body, { key: 'Enter' });
+    expect(s.doc.getCurve(s.doc.findObjectByName('Title')!.data!)?.body).toBe('Adjusted');
+    expect(lastOperator.value!.serial).toBe(serial);
+    expect(container.querySelector('[data-testid="redo-body"]')).toBe(body);
+    expect(document.activeElement).toBe(body);
+    // the same operator run again is another operation
+    act(() => void ok('object.text_add', { body: 'Hello', name: 'Second' }));
+    expect(lastOperator.value!.serial).not.toBe(serial);
+    expect(container.querySelector('[data-testid="redo-body"]')).not.toBe(body);
+  });
 });
