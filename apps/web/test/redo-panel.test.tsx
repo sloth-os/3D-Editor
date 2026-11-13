@@ -25,6 +25,7 @@ import { registerUiOperators } from '../src/editor/ui-operators';
 import { enableRedoPanelOperators } from '../src/editor/menus';
 import type { ProjectSession } from '../src/project/session';
 import { RedoPanel } from '../src/ui/RedoPanel';
+import { removalLikeChromium, settle } from './removal';
 
 /** A project session backed by a real document, evaluator, undo manager and operator registry. */
 function fakeSession(): ProjectSession {
@@ -2023,4 +2024,40 @@ describe('Adjust Last Operation while others edit the same objects (MCP agents, 
     expect(s.undo.undoStack.length).toBe(depth);
     expect(panelOffered(s)).toBe(true);
   });
+});
+
+describe('a field of the panel taken away while it holds typed text', () => {
+  // a field commits the text it holds also when it goes away (in Chromium through the change event
+  // and blur it sends then), with what the panel rendered
+  it.each([
+    ['Chromium', removalLikeChromium],
+    ['Firefox and Safari', () => () => {}],
+  ] as const)(
+    '%s: an operation another one replaced is not run again with the typed text',
+    async (_b, removal) => {
+      // regression: after an agent's operation replaced the panel's operation, the typed text was
+      // committed with the old operation's parameters: the agent's operation was undone, run again with
+      // them, refused (an error toast) and brought back
+      ok('object.text_add', { body: 'Hello', name: 'Title' });
+      const { container } = render(<RedoPanel s={s} />);
+      const body = container.querySelector<HTMLInputElement>('[data-testid="redo-body"]')!;
+      body.focus();
+      fireEvent.input(body, { target: { value: 'Typed' } });
+      const restore = removal();
+      try {
+        act(() => {
+          expect(runResult('mesh.primitive_cube_add', { name: 'AgentCube' }, 'mcp')?.ok).toBe(true);
+        });
+        expect(container.querySelector('[data-testid="redo-body"]')).toBeNull();
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(lastOperator.value?.id).toBe('mesh.primitive_cube_add');
+      expect(s.doc.findObjectByName('AgentCube')).not.toBeNull();
+      expect(toasts.value.filter((t) => t.level === 'error')).toEqual([]);
+      const title = s.doc.findObjectByName('Title')!;
+      expect(s.doc.getCurve(title.data!)?.body).toBe('Hello');
+    },
+  );
 });

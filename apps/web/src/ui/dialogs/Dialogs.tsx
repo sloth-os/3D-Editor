@@ -502,12 +502,15 @@ function useTicker(active: boolean, ms = 250): void {
 
 /**
  * Calls `onEscape` for the Escape key while mounted (before the dialog and editor keymaps), from the
- * commit that mounts it on (as the Modal's own handler, so no Escape falls between the two).
+ * commit that mounts it on (as the Modal's own handler, so no Escape falls between the two). Not for
+ * the Escape that cancels an IME composition in a field (Safari sends it after the composition, with
+ * key code 229): it runs before the field's own handler, as it listens in the capture phase.
  */
 function useEscape(onEscape: () => boolean): void {
   useLayoutEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && onEscape()) {
+      if (e.key !== 'Escape' || e.isComposing || e.keyCode === 229) return;
+      if (onEscape()) {
         e.preventDefault();
         e.stopPropagation();
       }

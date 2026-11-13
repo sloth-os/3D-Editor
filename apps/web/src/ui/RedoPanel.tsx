@@ -488,6 +488,9 @@ export function RedoPanel({ s }: { s: ProjectSession }) {
             testIdPrefix="redo"
             onChange={(k, v, final) => {
               if (!final) return;
+              // a field commits its text also when it goes away: after another operation replaced
+              // this one (an agent's, run in this editor), the edit is not for the last one any more
+              if (lastOperator.value !== last) return;
               const res = redoLast(s, registry, redoParams(s.doc, last, k, v));
               if (res && !res.ok) setRejected((n) => n + 1);
             }}

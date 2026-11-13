@@ -260,6 +260,16 @@ export function TransformFields({ s, o }: { s: ProjectSession; o: ObjectData }) 
 
 // ------------------------------------------------------------------ object tab
 
+/**
+ * The object's custom properties as they are now, when it still has `key`: a field commits its text
+ * also when it goes away, with the properties it rendered, after an agent or another person may have
+ * changed them (their changes stay; a property they removed is not written back).
+ */
+function customPropsNow(s: ProjectSession, id: string, key: string): ObjectData['custom_props'] | null {
+  const now = s.doc.getObject(id)?.custom_props;
+  return now && Object.hasOwn(now, key) ? now : null;
+}
+
 export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const objects = s.doc.listObjects().filter((x) => x.id !== o.id && !s.doc.isAncestor(o.id, x.id));
   const collections = s.doc.listCollections();
@@ -421,10 +431,13 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
             <div style={{ display: 'flex', gap: '4px' }}>
               <TextField
                 value={String(v)}
+                testId={`custom-prop-${k}`}
                 onChange={(nv) => {
+                  const now = customPropsNow(s, o.id, k);
+                  if (!now) return;
                   const num = Number(nv);
                   setProp(s, 'objects', o.id, 'custom_props', {
-                    ...o.custom_props,
+                    ...now,
                     [k]: nv !== '' && Number.isFinite(num) ? num : nv,
                   });
                 }}
@@ -433,7 +446,9 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
                 class="btn icon"
                 title="Remove"
                 onClick={() => {
-                  const { [k]: _drop, ...rest } = o.custom_props;
+                  const now = customPropsNow(s, o.id, k);
+                  if (!now) return;
+                  const { [k]: _drop, ...rest } = now;
                   setProp(s, 'objects', o.id, 'custom_props', rest);
                 }}
               >
@@ -903,12 +918,21 @@ function ExpressionField(p: {
   testId?: string;
 }) {
   const [text, setText] = useState<string | null>(null);
+  const [, rerender] = useState(0);
   const shown = text ?? p.value;
   const problems = text === null ? [] : driverProblems({ expression: text, variables: p.variables });
-  /** Commits the text in the input (a script can type and press Enter before the field renders it). */
+  /**
+   * Commits the text in the input (a script can type and press Enter before the field renders it),
+   * then shows the stored expression: also when the text was typed and committed in one go, which
+   * leaves `text` as it was rendered (null) and would render nothing.
+   */
   const commit = (typed: string) => {
-    if (typed.trim() && typed !== p.value) p.onCommit(typed.trim());
-    setText(null);
+    try {
+      if (typed.trim() && typed !== p.value) p.onCommit(typed.trim());
+    } finally {
+      setText(null);
+      rerender((n) => n + 1);
+    }
   };
   return (
     <>
@@ -955,6 +979,24 @@ function DriverBox(p: {
   const update = (patch: Record<string, unknown>) => run('anim.driver_update', { ...ref, ...patch }, 'ui');
   const vars = Array.isArray(d.variables) ? d.variables : [];
   const setVars = (next: DriverVariable[]) => update({ variables: next.map(variableInput) });
+  /** The driver's variables as they are now (null when the driver is gone). */
+  const varsNow = (): DriverVariable[] | null => {
+    const now = s.doc.getDriver(key);
+    return now ? (Array.isArray(now.variables) ? now.variables : []) : null;
+  };
+  /**
+   * Changes (or removes, for null) the variable named `name` as the driver is now, not as this panel
+   * rendered it: a field commits its text also when it goes away, with what it rendered, after an
+   * agent or another person may have changed the variables (their changes stay; a variable they
+   * removed or renamed is not written back).
+   */
+  const editVar = (name: string, change: (v: DriverVariable) => DriverVariable | null) => {
+    const now = varsNow();
+    const i = now ? now.findIndex((x) => x.name === name) : -1;
+    if (!now || i < 0) return;
+    const next = change(now[i]);
+    setVars(next ? now.map((x, j) => (j === i ? next : x)) : now.filter((_, j) => j !== i));
+  };
   const tid = `driver-${d.path}-${d.index}`;
   return (
     <div style={{ ...boxStyle, opacity: d.mute ? 0.6 : 1 }} data-testid={tid}>
@@ -1016,8 +1058,8 @@ function DriverBox(p: {
           s={s}
           v={v}
           testId={`${tid}-var-${k}`}
-          onChange={(nv) => setVars(vars.map((x, j) => (j === k ? nv : x)))}
-          onRemove={() => setVars(vars.filter((_, j) => j !== k))}
+          onChange={(patch) => editVar(v.name, (x) => ({ ...x, ...patch }))}
+          onRemove={() => editVar(v.name, () => null)}
         />
       ))}
       <div>
@@ -1025,11 +1067,13 @@ function DriverBox(p: {
           class="btn flat"
           data-testid={`${tid}-add-variable`}
           title="Add a variable reading a property of an object or datablock"
-          onClick={() =>
+          onClick={() => {
+            const now = varsNow();
+            if (!now) return;
             setVars([
-              ...vars,
+              ...now,
               {
-                name: freeVariableName(vars),
+                name: freeVariableName(now),
                 target_type: d.target_type,
                 target_id: defaultVariableTarget(s, d.target_type, d.target_id),
                 path:
@@ -1038,8 +1082,8 @@ function DriverBox(p: {
                     : (Object.keys(ANIMATABLE[d.target_type] ?? {})[0] ?? d.path),
                 index: 0,
               },
-            ])
-          }
+            ]);
+          }}
         >
           <Icon name="plus" size={12} /> Add Variable
         </button>
@@ -1052,7 +1096,8 @@ function VariableEditor(p: {
   s: ProjectSession;
   v: DriverVariable;
   testId: string;
-  onChange: (v: DriverVariable) => void;
+  /** The fields to change, applied to the variable as it is when they are committed. */
+  onChange: (patch: Partial<DriverVariable>) => void;
   onRemove: () => void;
 }) {
   const { s, v } = p;
@@ -1066,7 +1111,7 @@ function VariableEditor(p: {
             value={v.name}
             testId={`${p.testId}-name`}
             ariaLabel="Variable name"
-            onChange={(name) => name.trim() && p.onChange({ ...v, name: name.trim() })}
+            onChange={(name) => name.trim() && p.onChange({ name: name.trim() })}
           />
         </div>
         <SelectField
@@ -1076,7 +1121,6 @@ function VariableEditor(p: {
           options={VARIABLE_TYPES}
           onChange={(t) =>
             p.onChange({
-              ...v,
               target_type: t,
               target_id: defaultVariableTarget(s, t, v.target_id),
               path: Object.keys(ANIMATABLE[t] ?? {})[0] ?? v.path,
@@ -1105,7 +1149,7 @@ function VariableEditor(p: {
                 ? blocks
                 : [{ value: v.target_id, label: `${v.target_id} (missing)` }, ...blocks]
             }
-            onChange={(id) => p.onChange({ ...v, target_id: id })}
+            onChange={(id) => p.onChange({ target_id: id })}
           />
         </Row>
       )}
@@ -1118,7 +1162,7 @@ function VariableEditor(p: {
               testId={`${p.testId}-path`}
               title={`${v.path}[${v.index}]`}
               ariaLabel="Data path the variable reads"
-              onChange={(path) => path.trim() && p.onChange({ ...v, path: path.trim() })}
+              onChange={(path) => path.trim() && p.onChange({ path: path.trim() })}
             />
           </div>
           <div
@@ -1131,7 +1175,7 @@ function VariableEditor(p: {
               min={0}
               max={3}
               testId={`${p.testId}-index`}
-              onChange={(index, final) => final && p.onChange({ ...v, index })}
+              onChange={(index, final) => final && p.onChange({ index })}
             />
           </div>
         </div>

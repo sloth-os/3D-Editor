@@ -9,7 +9,7 @@ import {
   type WorldSettings,
 } from '@3d-editor/core';
 import type { ProjectSession } from '../../project/session';
-import { Checkbox, ColorField, NumberField, Panel, Row, SelectField, RAD } from '../fields/fields';
+import { Checkbox, ColorField, NumberField, Panel, Row, SelectField, RAD, TextField } from '../fields/fields';
 import { SchemaForm } from '../SchemaForm';
 import { animState, setProp } from './prop-edit';
 import { animatedBlock } from './animated';
@@ -411,13 +411,12 @@ export function SceneTab({ s }: { s: ProjectSession }) {
       <RigidBodyWorldPanels s={s} />
       <Panel title="Project">
         <Row label="Name">
-          <input
-            class="textfield"
+          <TextField
             value={s.doc.name}
-            data-testid="project-name"
-            onChange={(e) => {
-              const v = (e.target as HTMLInputElement).value.trim();
-              if (v) s.doc.setName(v);
+            testId="project-name"
+            onChange={(v) => {
+              const name = v.trim();
+              if (name) s.doc.setName(name);
             }}
           />
         </Row>

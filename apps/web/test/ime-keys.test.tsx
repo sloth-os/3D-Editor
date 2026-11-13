@@ -27,6 +27,11 @@ const imeEscape = [
   { key: 'Escape', isComposing: true, keyCode: 229 },
   { key: 'Escape', keyCode: 229 },
 ];
+/**
+ * The Enter (Go) key of Android's Gboard while the word typed last is still its composition: Chrome
+ * sends it as a real Enter (key code 13), marked isComposing. It ends the typing like any Enter.
+ */
+const gboardEnter = { key: 'Enter', keyCode: 13, isComposing: true };
 
 it('the operator search neither runs nor closes on the keys of a composition', async () => {
   if (!registry.has('wm.search_menu')) registerUiOperators(registry);
@@ -69,4 +74,29 @@ it('the text body keeps its typing on the keys of a composition', () => {
   expect(onCommit).not.toHaveBeenCalled();
   fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true });
   expect(onCommit).toHaveBeenCalledWith('Hello せかい');
+});
+
+it('the operator search runs the highlighted operator on the Enter of an Android keyboard', async () => {
+  // regression: the search ignored the Enter Gboard sends while the typed word is still its composition
+  if (!registry.has('wm.search_menu')) registerUiOperators(registry);
+  const { container } = render(<CommandPalette />);
+  await act(async () => {
+    paletteOpen.value = true;
+  });
+  const input = container.querySelector<HTMLInputElement>('[data-testid="palette-input"]')!;
+  fireEvent.input(input, { target: { value: 'cube' } });
+  fireEvent.keyDown(input, gboardEnter);
+  expect(paletteOpen.value).toBe(false);
+});
+
+it('the console runs the command on the Enter of an Android keyboard', () => {
+  // regression: the console ignored the Enter Gboard sends while the typed word is still its composition
+  const { container } = render(<Console />);
+  const input = container.querySelector<HTMLInputElement>('[data-testid="console-input"]')!;
+  const ran = () => infoLog.value.filter((l) => l.source === 'console' && l.message === '>>> 2 + 3').length;
+  const before = ran();
+  fireEvent.input(input, { target: { value: '2 + 3' } });
+  fireEvent.keyDown(input, gboardEnter);
+  expect(ran()).toBe(before + 1);
+  expect(input.value).toBe('');
 });

@@ -142,4 +142,31 @@ describe('IME composition', () => {
       window.removeEventListener('keydown', outside);
     }
   });
+
+  it('the Enter of an Android keyboard that still composes the typed word commits', () => {
+    // regression: Gboard keeps the word typed last as a composition, and Chrome sends its Enter (Go)
+    // as a real Enter (key code 13) marked isComposing: the fields ignored it
+    const gboardEnter = { key: 'Enter', keyCode: 13, isComposing: true };
+    const onChange = vi.fn();
+    const { getByTestId } = render(
+      <>
+        <TextField value="Cube" onChange={onChange} testId="tf" />
+        <NumberField value={1} onChange={onChange} testId="nf" />
+      </>,
+    );
+    const text = getByTestId('tf') as HTMLInputElement;
+    text.focus();
+    fireEvent.input(text, { target: { value: 'Crate' } });
+    fireEvent.keyDown(text, gboardEnter);
+    expect(onChange.mock.calls).toEqual([['Crate']]);
+
+    const nf = getByTestId('nf');
+    fireEvent.pointerDown(nf, { button: 0, clientX: 10, pointerId: 1 });
+    fireEvent.pointerUp(nf, { button: 0, clientX: 10, pointerId: 1 });
+    const entry = nf.querySelector('input')!;
+    fireEvent.input(entry, { target: { value: '3' } });
+    fireEvent.keyDown(entry, gboardEnter);
+    expect(nf.querySelector('input')).toBeNull();
+    expect(onChange.mock.calls[1]).toEqual([3, true]);
+  });
 });

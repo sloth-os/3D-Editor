@@ -5,6 +5,7 @@ import { closeDialog, dialog, openDialog } from '../src/app/store';
 import { prefs } from '../src/app/prefs';
 import { TextField } from '../src/ui/fields/fields';
 import { DialogHost } from '../src/ui/dialogs/Dialogs';
+import { removalLikeChromium, settle } from './removal';
 
 /*
  * What a text field commits and what it shows afterwards: the text in the input (also text a script
@@ -34,6 +35,27 @@ function NameField(p: { onCommit?: (v: string) => void }) {
 
 const field = (c: Element) => c.querySelector<HTMLInputElement>('[data-testid="name"]')!;
 
+/** The texts written into the input's value from now on (by Preact or by the field). */
+function valueWrites(el: HTMLInputElement): string[] {
+  const writes: string[] = [];
+  let proto: object | null = Object.getPrototypeOf(el);
+  let desc: PropertyDescriptor | undefined;
+  while (proto && !(desc = Object.getOwnPropertyDescriptor(proto, 'value')))
+    proto = Object.getPrototypeOf(proto);
+  const { get, set } = desc!;
+  Object.defineProperty(el, 'value', {
+    configurable: true,
+    get() {
+      return get!.call(this);
+    },
+    set(v: string) {
+      writes.push(v);
+      set!.call(this, v);
+    },
+  });
+  return writes;
+}
+
 describe('after a commit the field shows the stored value', () => {
   it('a refused edit shows the stored value again, after Enter and after leaving the field', () => {
     // regression: the field kept the refused text (an empty name) while the document kept 'Cube'
@@ -57,6 +79,47 @@ describe('after a commit the field shows the stored value', () => {
     fireEvent.input(input, { target: { value: 'Crate' } });
     fireEvent.blur(input);
     expect(input.value).toBe('Crate');
+  });
+
+  it('an edit stored as typed writes nothing into the input: its caret, selection and undo stay', () => {
+    // regression: after Enter the field wrote the old text and then the new one into the input, which
+    // moved the caret to the end, dropped the selection and emptied the input's own undo
+    const { container } = render(<NameField />);
+    const input = field(container);
+    input.focus();
+    fireEvent.input(input, { target: { value: 'Boxes' } });
+    const writes = valueWrites(input);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(writes).toEqual([]);
+    expect(input.value).toBe('Boxes');
+    // a normalized or refused edit writes the stored text, once
+    fireEvent.input(input, { target: { value: ' Crate ' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(writes).toEqual(['Crate']);
+    fireEvent.input(input, { target: { value: '' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(writes).toEqual(['Crate', 'Crate']);
+  });
+
+  it('a refused edit filled in and committed in one go (a script) shows the stored value', () => {
+    // regression: the field kept the refused text: the typing and the reset after the commit left
+    // its state as rendered, so nothing rendered
+    const { container } = render(<NameField />);
+    const input = field(container);
+    input.focus();
+    act(() => {
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.blur();
+    });
+    expect(input.value).toBe('Cube');
+    // filled in without focus, with input and change events
+    act(() => {
+      input.value = '  ';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    expect(input.value).toBe('Cube');
   });
 
   it('commits once: Enter, the change event and the blur that follow it commit nothing more', () => {
@@ -96,13 +159,14 @@ describe('text filled in by a script', () => {
     expect(onCommit.mock.calls).toEqual([['Scripted']]);
   });
 
-  it('commits text left in the field when the field goes away; cancelled or unchanged text is not', () => {
+  it('commits text left in the field when the field goes away; cancelled or unchanged text is not', async () => {
     const onCommit = vi.fn();
     const view = render(<NameField onCommit={onCommit} />);
     const input = field(view.container);
     input.value = 'Left';
     input.dispatchEvent(new Event('input', { bubbles: true }));
     view.unmount();
+    await settle();
     expect(onCommit.mock.calls).toEqual([['Left']]);
 
     onCommit.mockClear();
@@ -113,6 +177,7 @@ describe('text filled in by a script', () => {
     fireEvent.keyDown(box, { key: 'Escape' });
     expect(box.value).toBe('Cube');
     again.unmount();
+    await settle();
     expect(onCommit).not.toHaveBeenCalled();
   });
 
@@ -129,7 +194,7 @@ describe('text filled in by a script', () => {
     expect(input.value).toBe('Cube');
   });
 
-  it('a field that passes on every key (commitOnBlur off) passes each text once', () => {
+  it('a field that passes on every key (commitOnBlur off) passes each text once', async () => {
     const onChange = vi.fn();
     function Search() {
       const [q, setQ] = useState('');
@@ -155,10 +220,11 @@ describe('text filled in by a script', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     input.blur();
     view.unmount();
+    await settle();
     expect(onChange.mock.calls).toEqual([['me'], ['metal']]);
   });
 
-  it('a field that its own commit removes commits once', () => {
+  it('a field that its own commit removes commits once', async () => {
     const onCommit = vi.fn();
     function Removed() {
       const [shown, setShown] = useState(true);
@@ -178,7 +244,48 @@ describe('text filled in by a script', () => {
     fireEvent.input(input, { target: { value: 'Box' } });
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(container.querySelector('[data-testid="name"]')).toBeNull();
+    await settle();
     expect(onCommit.mock.calls).toEqual([['Box']]);
+  });
+
+  describe('a field taken away while it holds typed text', () => {
+    function Hidden(p: { onCommit: (v: string) => void; hide: { current: () => void } }) {
+      const [shown, setShown] = useState(true);
+      p.hide.current = () => setShown(false);
+      return <div>{shown && <TextField value="Cube" testId="name" onChange={p.onCommit} />}</div>;
+    }
+
+    it('commits the text once in Chromium, which sends a change event and a blur while removing it', async () => {
+      // regression: the commit when the field went away and the change event Chromium sends during
+      // the removal both committed the text (two renames, two error toasts when the object was gone)
+      const restore = removalLikeChromium();
+      try {
+        const onCommit = vi.fn();
+        const hide = { current: () => {} };
+        const { container } = render(<Hidden onCommit={onCommit} hide={hide} />);
+        const input = field(container);
+        input.focus();
+        fireEvent.input(input, { target: { value: 'Box' } });
+        act(() => hide.current());
+        expect(container.querySelector('[data-testid="name"]')).toBeNull();
+        await settle();
+        expect(onCommit.mock.calls).toEqual([['Box']]);
+      } finally {
+        restore();
+      }
+    });
+
+    it('commits the text once in browsers that send nothing while removing it (Firefox, Safari)', async () => {
+      const onCommit = vi.fn();
+      const hide = { current: () => {} };
+      const { container } = render(<Hidden onCommit={onCommit} hide={hide} />);
+      const input = field(container);
+      input.focus();
+      fireEvent.input(input, { target: { value: 'Box' } });
+      act(() => hide.current());
+      await settle();
+      expect(onCommit.mock.calls).toEqual([['Box']]);
+    });
   });
 });
 

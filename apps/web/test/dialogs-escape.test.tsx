@@ -254,6 +254,30 @@ it('Escape stops a running Render Animation and keeps the window open; the next 
   expect(dialog.value).toBeNull();
 });
 
+it('the Escape that cancels an IME composition does not stop a running render', async () => {
+  // regression: the render window's own Escape handler listens before the field typed in, and it
+  // stopped the render on the Escape that only cancelled a conversion
+  const s = fakeSession();
+  sessionSignal.value = s;
+  s.doc.updateScene({ frame_start: 1, frame_end: 120 });
+  s.doc.updateRender({ engine: 'RASTER', resolution_x: 8, resolution_y: 8, resolution_percentage: 100 });
+  viewport.engine = {
+    renderPixels: (o: RenderImageOptions) => ({
+      width: o.width!,
+      height: o.height!,
+      data: new Uint8ClampedArray(o.width! * o.height! * 4),
+    }),
+  } as unknown as ViewportEngine;
+  const { container } = render(<DialogHost />);
+  await open('render', { animation: true });
+  fireEvent.click(container.querySelector('[data-testid="render-animation-start"]')!);
+  fireEvent.keyDown(document.body, { key: 'Escape', isComposing: true, keyCode: 229 });
+  fireEvent.keyDown(document.body, { key: 'Escape', keyCode: 229 });
+  // the render runs to its end: it is not stopped
+  await waitFor(() => expect(container.querySelector('[data-testid="render-animation-cancel"]')).toBeNull());
+  expect(container.querySelector('[data-testid="render-animation-cancelled"]')).toBeNull();
+  expect(dialog.value).toBe('render');
+});
 it('an Escape pressed in the commit that starts a render stops it', async () => {
   // regression: the render window's own Escape handler was added by an effect, so an Escape pressed
   // before the next frame found the old handler (no render yet) while the window, no longer

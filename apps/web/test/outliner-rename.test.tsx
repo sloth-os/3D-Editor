@@ -118,6 +118,14 @@ it('leaving the box renames to a changed name; a key that ends an IME compositio
   expect(names()).toEqual(['Box', 'Light']);
 });
 
+it('the Enter of an Android keyboard that still composes the typed word renames', () => {
+  // regression: the box ignored the Enter Gboard sends while the typed word is still its composition
+  const { container } = render(<Outliner session={s} />);
+  const box = typeInRenameBox(container, 'Cube', 'Box');
+  fireEvent.keyDown(box, { key: 'Enter', keyCode: 13, isComposing: true });
+  expect(names()).toEqual(['Box', 'Light']);
+});
+
 it('a rename of the object while typing replaces the text, as in the other text fields', () => {
   const { container } = render(<Outliner session={s} />);
   const box = typeInRenameBox(container, 'Cube', 'Crate');

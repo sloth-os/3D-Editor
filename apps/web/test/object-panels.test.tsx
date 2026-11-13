@@ -18,6 +18,7 @@ import { Properties, activePropertiesTab, availableTabs } from '../src/ui/proper
 import { Outliner } from '../src/ui/Outliner';
 import { layoutConstraintParams, constraintEnumLabel } from '../src/ui/properties/ConstraintsTab';
 import { channelLabel } from '../src/ui/properties/ObjectTab';
+import { removalLikeChromium, settle } from './removal';
 
 /** A project session backed by a real document, evaluator, undo manager and operator registry. */
 function fakeSession(): ProjectSession {
@@ -437,6 +438,20 @@ describe('Drivers and F-curve modifiers in the Object tab', () => {
     expr.dispatchEvent(new Event('input', { bubbles: true }));
     expr.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     expect(s.doc.getDriver(key)?.expression).toBe('frame / 4');
+    // regression: the Enter of an Android keyboard that still composes the typed word (Gboard: key
+    // code 13, marked isComposing) was ignored
+    fireEvent.input(expr, { target: { value: 'frame / 8' } });
+    fireEvent.keyDown(expr, { key: 'Enter', keyCode: 13, isComposing: true });
+    expect(s.doc.getDriver(key)?.expression).toBe('frame / 8');
+    // regression: an invalid expression typed and committed in one go (a script) stayed in the field
+    // without its problems while the driver kept its expression
+    act(() => {
+      expr.value = 'frame *';
+      expr.dispatchEvent(new Event('input', { bubbles: true }));
+      expr.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    expect(s.doc.getDriver(key)?.expression).toBe('frame / 8');
+    expect(expr.value).toBe('frame / 8');
   });
 
   it('lists animated channels with extrapolation and F-curve modifiers', () => {
@@ -767,5 +782,178 @@ describe('text fields of the panels', () => {
     fireEvent.blur(name);
     expect(s.doc.findObjectByName('Crate')).not.toBeNull();
     expect(name.value).toBe('Crate');
+  });
+});
+
+describe('fields taken away while they hold typed text, as others edit what they show', () => {
+  // a field commits the text it holds also when it goes away (in Chromium through the change event
+  // and blur it sends then): with what it rendered, after an agent or another person changed it
+  const browsers = [
+    ['Chromium', removalLikeChromium],
+    ['Firefox and Safari', () => () => {}],
+  ] as const;
+
+  it.each(browsers)(
+    '%s: a driver variable an agent removed is not written back, and the agent keeps its other edits',
+    async (_browser, removal) => {
+      // regression: the typed name was committed with the variables the panel rendered, which brought
+      // the removed variable back and undid the agent's change of the other one
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Ctrl' });
+      const ctrl = s.doc.findObjectByName('Ctrl')!.id;
+      const variable = (name: string, path: string, index: number) => ({
+        name,
+        target_type: 'object',
+        target: ctrl,
+        path,
+        index,
+      });
+      ok('anim.driver_add', {
+        target_type: 'object',
+        target: 'Cube',
+        path: 'location',
+        index: 2,
+        expression: 'a + b',
+        variables: [variable('a', 'location', 0), variable('b', 'location', 1)],
+      });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      localStorage.setItem('3d-editor:panel:object-drivers', '1');
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const cube = s.doc.findObjectByName('Cube')!.id;
+      const key = fcurveKey({ target_type: 'object', target_id: cube, path: 'location', index: 2 });
+      const steps = s.undo.undoStack.length;
+      const name = byTestId(container, 'driver-location-2-var-1-name') as HTMLInputElement;
+      name.focus();
+      fireEvent.input(name, { target: { value: 'zz' } });
+      const restore = removal();
+      try {
+        act(() =>
+          agent.run('anim.driver_update', {
+            target_type: 'object',
+            target: cube,
+            path: 'location',
+            index: 2,
+            expression: 'a * 2',
+            variables: [variable('a', 'scale', 0)],
+          }),
+        );
+        expect(byTestId(container, 'driver-location-2-var-1-name')).toBeNull();
+        await settle();
+      } finally {
+        restore();
+      }
+      const d = s.doc.getDriver(key)!;
+      expect(d.expression).toBe('a * 2');
+      expect(d.variables.map((v) => `${v.name}:${v.path}[${v.index}]`)).toEqual(['a:scale[0]']);
+      expect(s.undo.undoStack.length).toBe(steps);
+    },
+  );
+
+  it('a variable renamed while an agent edits another one keeps the agent edit', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.empty_add', { name: 'Ctrl' });
+    const ctrl = s.doc.findObjectByName('Ctrl')!.id;
+    const variable = (name: string, path: string, index: number) => ({
+      name,
+      target_type: 'object',
+      target: ctrl,
+      path,
+      index,
+    });
+    ok('anim.driver_add', {
+      target_type: 'object',
+      target: 'Cube',
+      path: 'location',
+      index: 2,
+      // b is not in the expression: renaming a variable the expression uses is refused
+      expression: 'a',
+      variables: [variable('a', 'location', 0), variable('b', 'location', 1)],
+    });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-drivers', '1');
+    const agent = peerReplica(s);
+    const { container } = render(<Properties session={s} />);
+    const cube = s.doc.findObjectByName('Cube')!.id;
+    const key = fcurveKey({ target_type: 'object', target_id: cube, path: 'location', index: 2 });
+    const name = byTestId(container, 'driver-location-2-var-1-name') as HTMLInputElement;
+    name.focus();
+    fireEvent.input(name, { target: { value: 'zz' } });
+    act(() =>
+      agent.run('anim.driver_update', {
+        target_type: 'object',
+        target: cube,
+        path: 'location',
+        index: 2,
+        variables: [variable('a', 'scale', 0), variable('b', 'location', 1)],
+      }),
+    );
+    fireEvent.keyDown(name, { key: 'Enter' });
+    const d = s.doc.getDriver(key)!;
+    expect(d.variables.map((v) => `${v.name}:${v.path}[${v.index}]`)).toEqual([
+      'a:scale[0]',
+      'zz:location[1]',
+    ]);
+  });
+
+  it.each(browsers)(
+    '%s: a custom property an agent removed is not written back, and the agent keeps its other edits',
+    async (_browser, removal) => {
+      // regression: the typed value was committed with the properties the panel rendered, which
+      // brought the removed property back and undid the agent's change of the other one
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      const cube = s.doc.findObjectByName('Cube')!.id;
+      ok('data.set_property', {
+        kind: 'objects',
+        target: cube,
+        values: { custom_props: { k1: 1, k2: 'x' } },
+      });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      localStorage.setItem('3d-editor:panel:Custom Properties', '1');
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const steps = s.undo.undoStack.length;
+      const field = byTestId(container, 'custom-prop-k2') as HTMLInputElement;
+      field.focus();
+      fireEvent.input(field, { target: { value: 'typed' } });
+      const restore = removal();
+      try {
+        act(() =>
+          agent.run('data.set_property', {
+            kind: 'objects',
+            target: cube,
+            values: { custom_props: { k1: 100 } },
+          }),
+        );
+        expect(byTestId(container, 'custom-prop-k2')).toBeNull();
+        await settle();
+      } finally {
+        restore();
+      }
+      expect(s.doc.getObject(cube)!.custom_props).toEqual({ k1: 100 });
+      expect(s.undo.undoStack.length).toBe(steps);
+    },
+  );
+
+  it('the project name shows the stored name again when a rename is refused (an empty name)', () => {
+    // regression: the Scene tab's name field kept the empty text while the project kept its name
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'scene';
+    const { container } = render(<Properties session={s} />);
+    const stored = s.doc.name;
+    const field = byTestId(container, 'project-name') as HTMLInputElement;
+    field.focus();
+    fireEvent.input(field, { target: { value: '  ' } });
+    fireEvent.keyDown(field, { key: 'Enter' });
+    expect(s.doc.name).toBe(stored);
+    expect(field.value).toBe(stored);
+    fireEvent.input(field, { target: { value: ' Bridge ' } });
+    fireEvent.blur(field);
+    expect(s.doc.name).toBe('Bridge');
+    expect(field.value).toBe('Bridge');
   });
 });

@@ -366,11 +366,15 @@ export function ToggleGroup(p: {
 
 /**
  * A key that confirms or cancels an IME composition belongs to the composition, not to the field or
- * window it is typed in: Chrome and Firefox mark it `isComposing`, Safari sends it after the
- * composition ended, with key code 229.
+ * window it is typed in: Chrome and Firefox send it with key code 229 and mark it `isComposing`,
+ * Safari sends it after the composition ended, with key code 229. Not so the Enter (Go) key of an
+ * Android keyboard: Gboard keeps the word being typed as a composition, and Chrome sends its Enter
+ * as a real Enter (key code 13) while that composition is still open, so it is marked `isComposing`
+ * but ends the typing like any Enter.
  */
 export function composing(e: KeyboardEvent): boolean {
-  return e.isComposing || e.keyCode === 229;
+  if (e.keyCode === 229) return true;
+  return e.isComposing && !(e.key === 'Enter' && e.keyCode === 13);
 }
 
 /**
@@ -402,32 +406,53 @@ export function TextField(p: {
   const [v, setV] = useEditedText(p.value);
   const box = useRef<HTMLInputElement>(null);
   /**
-   * The text committed last: a blur right after Enter (e.g. when the commit renamed what the field
-   * shows and the field is removed while focused) must not commit it again with stale props.
+   * The text committed last: the change event and the blur after an Enter, and the change event and
+   * blur Chromium sends to a focused input it removes, must not commit it again (with stale props).
    */
   const committed = useRef<string | null>(null);
   const latest = useRef(p);
   latest.current = p;
+  /** A commit was made: show the stored value once the parent has rendered it. */
+  const showStored = useRef(false);
+  const [, rerender] = useState(0);
   /**
    * Commits the text in the input, not the rendered `v`: a script (a password manager) can fill the
-   * field and blur it before the field renders the new text. The field then shows the stored value
-   * again, as Blender's fields do: the new one, or the old one when the edit was refused or changed
-   * nothing (an empty name, a name that differs only in spaces, coefficients that do not parse).
+   * field and blur it before the field renders the new text.
    */
   const commit = (text: string) => {
     if (text === p.value || text === committed.current) return;
     committed.current = text;
-    p.onChange(text);
-    setV(p.value);
+    try {
+      p.onChange(text);
+    } finally {
+      showStored.current = true;
+      rerender((n) => n + 1);
+    }
   };
-  // text filled in without a change event or a blur (a password manager) and left in the field is
-  // committed when the field goes away, as a blur would
+  // After a commit the field shows the stored value, as Blender's fields do: the new one, or the old
+  // one when the edit was refused or changed (an empty name, a name that differs only in spaces,
+  // coefficients that do not parse). This runs once the parent has rendered what it stored, so an
+  // edit stored as typed writes nothing into the input: the caret, the selection and the input's own
+  // undo stay. (Resetting from the props of the commit wrote the old text and then the new one.)
+  useLayoutEffect(() => {
+    if (!showStored.current) return;
+    showStored.current = false;
+    if (box.current && box.current.value !== p.value) setV(p.value);
+  });
+  // Text filled in without a change event or a blur (a password manager) and left in the field is
+  // committed when the field goes away, as a blur would, once and after the removal: Chromium sends
+  // a change event and a blur to a focused input it removes (they commit it then), Firefox and Safari
+  // send neither.
   useEffect(
     () => () => {
       const el = box.current;
       const q = latest.current;
       if (!el || q.commitOnBlur === false) return;
-      if (el.value !== q.value && el.value !== committed.current) q.onChange(el.value);
+      queueMicrotask(() => {
+        if (el.value === q.value || el.value === committed.current) return;
+        committed.current = el.value;
+        q.onChange(el.value);
+      });
     },
     [],
   );
