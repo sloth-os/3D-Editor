@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+/data/
+apps/server/data/
+e2e/test-results/
+e2e/playwright-report/
+e2e/.cache/
+.vite/
+*.tsbuildinfo
+dev-dist/
+.vitest/

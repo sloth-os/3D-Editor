@@ -1,0 +1,76 @@
+# Quick start:            docker compose up -d                       → http://localhost:8080
+# With WebDAV storage:    docker compose --profile webdav up -d
+# With observability:     docker compose --profile observability up -d
+#                         Grafana http://localhost:3000 · Jaeger http://localhost:16686 · Prometheus http://localhost:9090
+services:
+  editor:
+    image: ghcr.io/sloth-os/3d-editor:latest
+    build: .
+    init: true
+    ports:
+      - '8080:8080'
+    environment:
+      # memory | disk | webdav (webdav is chosen automatically when WEBDAV_URL is set)
+      SYNC_PERSISTENCE: ${SYNC_PERSISTENCE:-disk}
+      # Uncomment to store projects in WebDAV (the browser reaches it through /dav on this server):
+      # WEBDAV_URL: http://webdav:80
+      # WEBDAV_USERNAME: editor
+      # WEBDAV_PASSWORD: change-me
+      # Protect the API, sync, WebDAV proxy and MCP endpoint with a shared token:
+      # AUTH_TOKEN: change-me
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      LOG_LEVEL: info
+    volumes:
+      - editor-data:/data
+    restart: unless-stopped
+
+  webdav:
+    profiles: [webdav]
+    image: rclone/rclone:1
+    command: serve webdav /data --addr :80 --user editor --pass change-me
+    volumes:
+      - webdav-data:/data
+    ports:
+      - '8081:80'
+
+  otel-collector:
+    profiles: [observability]
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    command: ['--config=/etc/otelcol/config.yaml']
+    volumes:
+      - ./deploy/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - '4317:4317'
+      - '4318:4318'
+
+  jaeger:
+    profiles: [observability]
+    image: jaegertracing/all-in-one:1.66.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+    ports:
+      - '16686:16686'
+
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:v3.2.1
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - '9090:9090'
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:11.5.2
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - '3000:3000'
+
+volumes:
+  editor-data:
+  webdav-data:
