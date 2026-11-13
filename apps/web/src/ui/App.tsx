@@ -243,7 +243,8 @@ function BottomArea({ s, initial }: { s: ProjectSession; initial: BottomEditor }
   );
 }
 
-const WORKSPACES: Workspace[] = ['Layout', 'Modeling', 'Shading', 'Animation', 'Scripting'];
+// Director: the director desk (shots, actors, assets); laid out like Layout for now
+const WORKSPACES: Workspace[] = ['Layout', 'Modeling', 'Shading', 'Animation', 'Scripting', 'Director'];
 
 function Editor({ s }: { s: ProjectSession }) {
   const ws = workspace.value;

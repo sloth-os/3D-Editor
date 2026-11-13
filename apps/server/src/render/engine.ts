@@ -100,7 +100,10 @@ function rigidBodyHost(doc: SceneDoc, evaluator: SceneEvaluator): RigidBodyHost 
   };
 }
 
-/** Converts frame options to the core software renderer options (engine always explicit). */
+/**
+ * Converts frame options to the core software renderer options (engine always explicit).
+ * `o.desk` (video export looks and passes) is not implemented yet and ignored.
+ */
 export function softwareOptions(o: FrameOptions): SoftwareRenderOptions {
   return {
     width: o.width,

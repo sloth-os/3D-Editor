@@ -290,7 +290,15 @@ export function registerUiOperators(reg: OperatorRegistry): void {
   const toggle = (
     id: string,
     label: string,
-    key: 'xray' | 'overlays' | 'sidebar' | 'toolbar' | 'showWireframe' | 'snapping',
+    key:
+      | 'xray'
+      | 'overlays'
+      | 'sidebar'
+      | 'toolbar'
+      | 'showWireframe'
+      | 'snapping'
+      | 'followShots'
+      | 'cameraGuides',
     description: string,
   ) =>
     reg.register(
@@ -333,6 +341,18 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     'Show wireframe on top of shaded objects.',
   );
   toggle('view3d.toggle_snapping', 'Snapping', 'snapping', 'Snap transforms to increments (Shift+Tab).');
+  toggle(
+    'view3d.toggle_follow_shots',
+    'Follow Shots',
+    'followShots',
+    'Look through the camera of the shot at the current frame (director desk).',
+  );
+  toggle(
+    'view3d.toggle_camera_guides',
+    'Camera Guides',
+    'cameraGuides',
+    'Show rule-of-thirds and action-safe guides over the camera view.',
+  );
   reg.register(
     defineOperator({
       id: 'view3d.toggle_shading',
@@ -581,6 +601,19 @@ export function registerUiOperators(reg: OperatorRegistry): void {
   );
   reg.register(
     defineOperator({
+      id: 'wm.export_video',
+      label: 'Export Video…',
+      description: 'Export the shots as video on the server (the Export Video window is coming soon).',
+      category: 'Render',
+      ...ui,
+      schema: z.object({}),
+      execute() {
+        toast('Export Video is coming soon', 'info');
+      },
+    }),
+  );
+  reg.register(
+    defineOperator({
       id: 'render.render',
       label: 'Render Image',
       description:
@@ -631,7 +664,9 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       description: 'Switch the workspace layout.',
       category: 'Window',
       ...ui,
-      schema: z.object({ name: z.enum(['Layout', 'Modeling', 'Shading', 'Animation', 'Scripting']) }),
+      schema: z.object({
+        name: z.enum(['Layout', 'Modeling', 'Shading', 'Animation', 'Scripting', 'Director']),
+      }),
       execute(_ctx, p) {
         workspace.value = p.name as Workspace;
         const v = session.value?.view;

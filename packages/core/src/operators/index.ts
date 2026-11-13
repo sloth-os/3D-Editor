@@ -19,6 +19,10 @@ import { registerSceneToolsOperators } from './scene-tools';
 import { registerPhysicsOperators } from './physics';
 import { registerDriverOperators } from './driver';
 import { registerLightCameraOperators } from './light-camera';
+import { registerDeskShotOperators } from './desk-shots';
+import { registerDeskActorOperators } from './desk-actors';
+import { registerDeskMotionOperators } from './desk-motion';
+import { registerStoreOperators } from './store';
 
 export * from './context';
 export * from './registry';
@@ -51,5 +55,9 @@ export function createOperatorRegistry(): OperatorRegistry {
   registerSceneToolsOperators(reg);
   registerPhysicsOperators(reg);
   registerDriverOperators(reg);
+  registerDeskShotOperators(reg);
+  registerDeskActorOperators(reg);
+  registerDeskMotionOperators(reg);
+  registerStoreOperators(reg);
   return reg;
 }

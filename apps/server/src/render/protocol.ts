@@ -70,6 +70,43 @@ export interface FrameOptions {
   background?: Vec4Tuple;
   /** The rigid body simulation at `frame`, computed once (threads simulate themselves without it). */
   physics?: PhysicsFrame;
+  /**
+   * Director desk frame options of video exports (SPEC §9): look, shadows, AO, MSAA and the extra
+   * passes. Not implemented yet: render processes ignore it.
+   */
+  desk?: DeskFrameOptions;
+}
+
+/** The images a video export renders per frame (`beauty` is the image itself). */
+export type PassName = 'beauty' | 'depth' | 'normal' | 'mask' | 'edges' | 'pose';
+
+/** Director desk frame options (SPEC §9 protocol). */
+export interface DeskFrameOptions {
+  look: 'material' | 'clay' | 'solid';
+  shadows: boolean;
+  ao: boolean;
+  msaa: boolean;
+  /** World box the sun's shadow map covers (default: fitted to the view). */
+  shadowFit?: { min: Vec3Tuple; max: Vec3Tuple };
+  passes: PassName[];
+  /** Depth pass distances mapped to 0 and 255, in metres. */
+  depthRange?: [number, number];
+  /** Mask pass colour per object id (others: background). */
+  objectPalette?: Record<string, [number, number, number]>;
+  /** Object ids whose screen boxes `ImageResult.meta.subjects` reports. */
+  subjects?: string[];
+  /** Actor (armature object) ids whose skeletons the pose pass draws. */
+  poseActors?: string[];
+  /** Objects drawn as screen-space lines (tether strings, at least 2 px wide). */
+  lines?: { object: string; width_px: number; color: [number, number, number] }[];
+}
+
+/** Camera and subject boxes of a rendered frame (computed in the render process). */
+export interface FrameMeta {
+  /** The camera's world matrix (column-major) and vertical field of view in radians. */
+  camera: { matrix: number[]; fovY: number };
+  /** Screen boxes of `DeskFrameOptions.subjects` in pixels (null: not in the frame). */
+  subjects: Record<string, { x: number; y: number; w: number; h: number; visible: boolean } | null>;
 }
 
 /** What a worker reports after preparing a path traced render (scene compiled, tracer built). */
@@ -103,6 +140,13 @@ export interface ImageResult {
   /** Path tracing statistics (absent for raster renders). */
   pathtrace?: { samples: number; requested: number; stopped: 'done' | 'time' | 'cancelled' };
   warnings?: string[];
+  /**
+   * The extra passes of `FrameOptions.desk.passes` (1 byte per pixel for depth, mask (palette
+   * index) and edges; RGB for normal and pose; beauty stays `data`).
+   */
+  passes?: Partial<Record<PassName, Uint8Array>>;
+  /** Camera and subject boxes (`FrameOptions.desk`). */
+  meta?: FrameMeta;
 }
 
 /**

@@ -8,17 +8,15 @@ import {
   type JSONRPCNotification,
   type RequestId,
 } from '@modelcontextprotocol/sdk/types.js';
-import type { OperatorRegistry } from '@3d-editor/core';
 import type { ServerConfig } from '../config';
 import type { ServerMetrics } from '../observability/metrics';
 import type { Log } from '../observability/log';
 import { errorMessage } from '../observability/tracing';
 import type { RoomManager } from '../sync/room-manager';
+import type { ServerServices } from '../services';
 import { AgentIdentity, AgentSession, ToolError, parseAgentId } from './agent';
 import { MCP_INSTRUCTIONS } from './instructions';
 import { registerResources, registerTools, type ToolContext } from './tools';
-import { sharedRenderer, type Renderer } from '../render';
-import { sharedRenderStore, type RenderStore } from '../render/store';
 import { resolveHistoryLimits, type HistoryLimits } from './history';
 
 export const MCP_PATH = '/mcp';
@@ -38,7 +36,12 @@ interface McpSession {
 
 export interface McpHubOptions {
   rooms: RoomManager;
-  registry: OperatorRegistry;
+  /**
+   * The server's services (services.ts): the operator registry, the renderer (the process-wide one
+   * unless the app was given another), the render store, video exports, the model store and the
+   * rideo bridge.
+   */
+  services: ServerServices;
   config: ServerConfig;
   metrics: ServerMetrics;
   log: Log;
@@ -60,10 +63,6 @@ export interface McpHubOptions {
   /** Limits of each agent's undo history per project (default: 100 steps, 64 MB). */
   history?: Partial<HistoryLimits>;
   maxSessions?: number;
-  /** Server-side renderer (default: the process-wide one, see `RENDER_WORKERS`). */
-  renderer?: Renderer;
-  /** Where render_animation keeps stored results (default: the process-wide store). */
-  renderStore?: RenderStore;
 }
 
 function rpcError(code: number, message: string) {
@@ -151,7 +150,7 @@ export class McpHub {
 
   /** Builds the MCP server of one session. */
   createServer(agent: AgentSession): McpServer {
-    const { rooms, registry, config, metrics, log } = this.opts;
+    const { rooms, services, config, metrics, log } = this.opts;
     const server = new McpServer(
       { name: '3d-editor', title: '3D Editor', version: config.version },
       { instructions: MCP_INSTRUCTIONS },
@@ -159,12 +158,15 @@ export class McpHub {
     const ctx: ToolContext = {
       agent,
       rooms,
-      registry,
+      registry: services.registry,
       config,
       metrics,
       log,
-      renderer: this.opts.renderer ?? sharedRenderer({ log }),
-      renderStore: this.opts.renderStore ?? sharedRenderStore(),
+      renderer: services.renderer,
+      renderStore: services.renderStore,
+      exports: services.exports,
+      store: services.store,
+      rideo: services.rideo,
       historyLimits: resolveHistoryLimits(this.opts.history),
     };
     registerTools(server, ctx);
@@ -308,7 +310,7 @@ export class McpHub {
         sessionId,
         {
           rooms: this.opts.rooms,
-          registry: this.opts.registry,
+          registry: this.opts.services.registry,
           log: this.opts.log,
           history: this.opts.history,
         },

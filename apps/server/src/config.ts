@@ -71,7 +71,60 @@ export interface ServerConfig {
   logLevel: LogLevel;
   corsOrigins: string[];
   version: string;
+  /**
+   * The ffmpeg executable of video exports (`FFMPEG_PATH`, default `ffmpeg` from the PATH; a value
+   * with a slash is a file path, resolved against the working directory).
+   */
+  ffmpegPath: string;
+  /** Where video exports are written (`EXPORT_DIR`, default `<DATA_DIR>/exports`). */
+  exportDir: string;
+  /** Most bytes all video exports may take on disk (`EXPORT_MAX_MB`, default 20480 MB). */
+  exportMaxBytes: number;
+  /** How long finished video exports are kept (`EXPORT_TTL_HOURS`, default 168 h). */
+  exportTtlMs: number;
+  /** Most video exports waiting to start (`EXPORT_MAX_QUEUED`, default 8; more answer QUEUE_FULL). */
+  exportMaxQueued: number;
+  /**
+   * The model store's providers, in search order (`STORE_PROVIDERS`, default builtin, khronos,
+   * polyhaven, sketchfab, polypizza, and catalog when STORE_CATALOG_URLS is set).
+   */
+  storeProviders: StoreProviderId[];
+  /** Sketchfab API token (`SKETCHFAB_TOKEN`): Sketchfab models download only with it. */
+  sketchfabToken: string | null;
+  /** Poly Pizza API key (`POLYPIZZA_API_KEY`): the provider answers only with it. */
+  polypizzaApiKey: string | null;
+  /** JSON model catalogs of the `catalog` provider (`STORE_CATALOG_URLS`, comma-separated). */
+  storeCatalogUrls: string[];
+  /** Where downloaded store models and thumbnails are cached (`MODEL_CACHE_DIR`, default `<DATA_DIR>/model-cache`). */
+  modelCacheDir: string;
+  /** Most bytes the model cache keeps, least recently used dropped first (`MODEL_CACHE_MAX_MB`, default 2048 MB). */
+  modelCacheMaxBytes: number;
+  /** Timeout of each request to a store provider (`STORE_FETCH_TIMEOUT_MS`, default 20000 ms). */
+  storeFetchTimeoutMs: number;
+  /** Base URL of the rideo server (`RIDEO_URL`, no trailing slash; null = the rideo bridge is off). */
+  rideoUrl: string | null;
+  /** Bearer token for the rideo server (`RIDEO_TOKEN`). */
+  rideoToken: string | null;
 }
+
+/** The model store providers the server knows (STORE_PROVIDERS picks and orders them). */
+export const STORE_PROVIDER_IDS = [
+  'builtin',
+  'khronos',
+  'polyhaven',
+  'sketchfab',
+  'polypizza',
+  'catalog',
+] as const;
+export type StoreProviderId = (typeof STORE_PROVIDER_IDS)[number];
+/** STORE_PROVIDERS when unset (catalog is added when STORE_CATALOG_URLS is set). */
+export const DEFAULT_STORE_PROVIDERS: readonly StoreProviderId[] = [
+  'builtin',
+  'khronos',
+  'polyhaven',
+  'sketchfab',
+  'polypizza',
+];
 
 export interface ConfigEnvironment {
   /** Directory of the running module/bundle (used to locate the default PUBLIC_DIR). */
@@ -130,6 +183,20 @@ const envSchema = z.object({
     .default('info'),
   CORS_ORIGINS: z.string().optional(),
   APP_VERSION: z.string().optional(),
+  FFMPEG_PATH: z.string().default('ffmpeg'),
+  EXPORT_DIR: z.string().optional(),
+  EXPORT_MAX_MB: z.coerce.number().positive().max(1_048_576).default(20480),
+  EXPORT_TTL_HOURS: z.coerce.number().positive().max(87_600).default(168),
+  EXPORT_MAX_QUEUED: z.coerce.number().int().min(1).max(1000).default(8),
+  STORE_PROVIDERS: z.string().optional(),
+  SKETCHFAB_TOKEN: z.string().optional(),
+  POLYPIZZA_API_KEY: z.string().optional(),
+  STORE_CATALOG_URLS: z.string().optional(),
+  MODEL_CACHE_DIR: z.string().optional(),
+  MODEL_CACHE_MAX_MB: z.coerce.number().min(0).max(1_048_576).default(2048),
+  STORE_FETCH_TIMEOUT_MS: z.coerce.number().int().min(100).max(600_000).default(20_000),
+  RIDEO_URL: httpUrl.optional(),
+  RIDEO_TOKEN: z.string().optional(),
 });
 
 /**
@@ -165,6 +232,42 @@ export function parseHeaderList(s: string | undefined): Record<string, string> {
     if (key) out[key] = value;
   }
   return out;
+}
+
+/** Splits a comma-separated setting into its trimmed, non-empty items. */
+function commaList(s: string | undefined): string[] {
+  return (s ?? '')
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The model store providers of STORE_PROVIDERS (known ids, in the given order, each once); unset:
+ * the defaults, plus catalog when catalog URLs are configured.
+ */
+export function parseStoreProviders(value: string | undefined, hasCatalogUrls: boolean): StoreProviderId[] {
+  if (value === undefined)
+    return hasCatalogUrls ? [...DEFAULT_STORE_PROVIDERS, 'catalog'] : [...DEFAULT_STORE_PROVIDERS];
+  const out: StoreProviderId[] = [];
+  for (const raw of commaList(value)) {
+    const id = raw.toLowerCase();
+    if (!(STORE_PROVIDER_IDS as readonly string[]).includes(id))
+      throw new Error(
+        `Invalid configuration: STORE_PROVIDERS: unknown provider '${raw}' (known: ${STORE_PROVIDER_IDS.join(', ')})`,
+      );
+    if (!out.includes(id as StoreProviderId)) out.push(id as StoreProviderId);
+  }
+  if (out.includes('catalog') && !hasCatalogUrls)
+    throw new Error(
+      'Invalid configuration: STORE_PROVIDERS lists catalog, which requires STORE_CATALOG_URLS',
+    );
+  return out;
+}
+
+/** The ffmpeg command: a name looked up on the PATH, or a file path (with a slash) made absolute. */
+export function resolveExecutable(value: string, cwd: string): string {
+  return /[\\/]/.test(value) ? path.resolve(cwd, value) : value;
 }
 
 function defaultModuleDir(): string {
@@ -233,11 +336,19 @@ export function loadConfig(
     .map((s) => s.trim().replace(/\/+$/, ''))
     .filter(Boolean);
 
+  const dataDir = path.resolve(cwd, e.DATA_DIR);
+  const storeCatalogUrls = commaList(e.STORE_CATALOG_URLS);
+  for (const url of storeCatalogUrls) {
+    if (!httpUrl.safeParse(url).success)
+      throw new Error(`Invalid configuration: STORE_CATALOG_URLS: expected http(s) URLs, got '${url}'`);
+  }
+  const storeProviders = parseStoreProviders(e.STORE_PROVIDERS, storeCatalogUrls.length > 0);
+
   return {
     port: e.PORT,
     host: e.HOST,
     publicDir,
-    dataDir: path.resolve(cwd, e.DATA_DIR),
+    dataDir,
     persistence,
     roomIdleTtlSeconds: e.ROOM_IDLE_TTL_SECONDS,
     persistDebounceMs: e.PERSIST_DEBOUNCE_MS,
@@ -261,5 +372,21 @@ export function loadConfig(
     logLevel: e.LOG_LEVEL,
     corsOrigins,
     version: e.APP_VERSION ?? PACKAGE_VERSION,
+    ffmpegPath: resolveExecutable(e.FFMPEG_PATH, cwd),
+    exportDir: e.EXPORT_DIR ? path.resolve(cwd, e.EXPORT_DIR) : path.join(dataDir, 'exports'),
+    exportMaxBytes: Math.round(e.EXPORT_MAX_MB * 1024 * 1024),
+    exportTtlMs: Math.round(e.EXPORT_TTL_HOURS * 3_600_000),
+    exportMaxQueued: e.EXPORT_MAX_QUEUED,
+    storeProviders,
+    sketchfabToken: e.SKETCHFAB_TOKEN ?? null,
+    polypizzaApiKey: e.POLYPIZZA_API_KEY ?? null,
+    storeCatalogUrls,
+    modelCacheDir: e.MODEL_CACHE_DIR
+      ? path.resolve(cwd, e.MODEL_CACHE_DIR)
+      : path.join(dataDir, 'model-cache'),
+    modelCacheMaxBytes: Math.round(e.MODEL_CACHE_MAX_MB * 1024 * 1024),
+    storeFetchTimeoutMs: e.STORE_FETCH_TIMEOUT_MS,
+    rideoUrl: e.RIDEO_URL ? e.RIDEO_URL.replace(/\/+$/, '') : null,
+    rideoToken: e.RIDEO_TOKEN ?? null,
   };
 }

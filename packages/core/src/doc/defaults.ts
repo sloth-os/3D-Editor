@@ -3,8 +3,10 @@ import type {
   BoneData,
   CameraData,
   CurveData,
+  DeskSettings,
   PoseBone,
   RigidBodyData,
+  ShotData,
   Spline,
   SplinePoint,
   CollectionData,
@@ -163,6 +165,10 @@ export function defaultRigidBody(type: RigidBodyData['type'] = 'ACTIVE'): RigidB
     collision_margin: 0.04,
     linear_damping: 0.04,
     angular_damping: 0.1,
+    start_frame: null,
+    initial_linear_velocity: [0, 0, 0],
+    initial_angular_velocity: [0, 0, 0],
+    inherit_velocity: true,
   };
 }
 
@@ -263,6 +269,47 @@ export function defaultSceneSettings(): SceneSettings {
       solver_iterations: 10,
       time_scale: 1,
     },
+    shots: [],
+    desk: defaultDeskSettings(),
+  };
+}
+
+/** Director's desk settings of a new scene: set size unknown, no clamp, solved for the render aspect. */
+export function defaultDeskSettings(): DeskSettings {
+  return {
+    set_width: 0,
+    set_depth: 0,
+    interior: false,
+    main_pair: null,
+    aspect: null,
+    max_shot_s: null,
+    min_shot_s: null,
+  };
+}
+
+/**
+ * A shot with every optional field unset (`id` from the caller: desk/shots.ts newShotId), over scene
+ * frames `frame_start`…`frame_end` (inclusive).
+ */
+export function defaultShot(id: string, name: string, frame_start = 1, frame_end = frame_start): ShotData {
+  return {
+    id,
+    name,
+    enabled: true,
+    camera: null,
+    frame_start,
+    frame_end: Math.max(frame_start, frame_end),
+    notes: '',
+    framing: null,
+    angle: null,
+    height: null,
+    move: null,
+    lens_mm: null,
+    subjects: [],
+    layout: [],
+    continuity: 'cut',
+    pre_roll: 0,
+    external: null,
   };
 }
 

@@ -377,6 +377,32 @@ export function insertManyWrites(
   );
 }
 
+/**
+ * `keys` keyframes an operator writes into `fcurves` F-curves without reading the channels first (the
+ * director's desk operators: camera moves, actor poses and gaits, launches, tethers; memory-desk.ts):
+ * per keyframe what an insert adds at the peak ({@link KEYFRAME_ADD_BYTES}), per F-curve what a bake
+ * builds before it stores it ({@link BAKE_FCURVE_BYTES}), and kept as new keyframes and new F-curves.
+ * `rewritten`: keyframes the channels already hold, copied and stored again
+ * ({@link KEYFRAME_REWRITE_BYTES}).
+ */
+export function newKeyframesWrites(
+  keys: number,
+  fcurves: number,
+  lower: string,
+  rewritten = 0,
+): KeyframeWrites {
+  const k = Math.max(0, Math.ceil(keys));
+  const f = Math.max(0, Math.ceil(fcurves));
+  return writes(
+    {
+      bytes: KEYFRAME_ADD_BYTES * k + BAKE_FCURVE_BYTES * f + KEYFRAME_REWRITE_BYTES * Math.max(0, rewritten),
+      keys: k,
+      stored: KEYFRAME_STORED_BYTES * k + FCURVE_STORED_BYTES * f,
+    },
+    lower,
+  );
+}
+
 /** Channels of each keying set of anim.keyframe_insert (Available: the object's own F-curves). */
 const KEYING_SETS: Readonly<Record<string, readonly string[]>> = {
   LocRotScale: TRANSFORM_PATHS,

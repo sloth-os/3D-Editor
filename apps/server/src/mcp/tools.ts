@@ -1,13 +1,7 @@
 import { z } from 'zod';
 import type { McpServer, ToolCallback } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
-import type {
-  CallToolResult,
-  ServerNotification,
-  ServerRequest,
-  ToolAnnotations,
-} from '@modelcontextprotocol/sdk/types.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import {
   base64Decode,
   base64Encode,
@@ -42,9 +36,6 @@ import {
   type SelectMode,
   type Vec3,
 } from '@3d-editor/core';
-import type { ServerConfig } from '../config';
-import type { ServerMetrics } from '../observability/metrics';
-import type { Log } from '../observability/log';
 import { errorMessage, withSpan } from '../observability/tracing';
 import type { RoomManager } from '../sync/room-manager';
 import { RpcError, type Room, type SyncConnection } from '../sync/room';
@@ -54,12 +45,32 @@ import { persistenceNote } from '../persistence';
 import {
   NotFoundError,
   ToolError,
+  codedErrorDetails,
   collectProjectNotes,
+  isServiceErrorCode,
   type AgentProject,
-  type AgentSession,
   type ErrorCode,
 } from './agent';
-import { BUDGET_BYTES_PER_ITEM, type HistoryLimits } from './history';
+import { BUDGET_BYTES_PER_ITEM } from './history';
+import {
+  DESTRUCTIVE,
+  EDIT,
+  READ_ONLY,
+  baseUrl,
+  color,
+  objectArg,
+  objectList,
+  projectArg,
+  vec3,
+  type ToolContext,
+  type ToolExtra,
+  type ToolHandler,
+  type ToolMeta,
+  type ToolOutput,
+} from './tool-kit';
+import { registerVideoTools } from './video-tools';
+import { registerStoreTools } from './store-tools';
+import { registerRideoTools } from './rideo-tools';
 import {
   DEFAULT_MAX_OBJECTS,
   MAX_DECIMALS,
@@ -133,14 +144,8 @@ import {
   listProjects,
   readBeforeAnswer,
 } from './project-storage';
-import {
-  isCancelled,
-  isOutOfMemory,
-  type AnimationOutput,
-  type FrameOptions,
-  type Renderer,
-} from '../render';
-import type { RenderStore, StoredFile } from '../render/store';
+import { isCancelled, isOutOfMemory, type AnimationOutput, type FrameOptions } from '../render';
+import type { StoredFile } from '../render/store';
 import {
   AUTO_BROWSER_RASTER_TIMEOUT_MS,
   BROWSER_PATHTRACE_EXTRA_MS,
@@ -168,43 +173,18 @@ import {
   seedArg,
 } from './rendering';
 
-export interface ToolContext {
-  agent: AgentSession;
-  rooms: RoomManager;
-  registry: OperatorRegistry;
-  config: ServerConfig;
-  metrics: ServerMetrics;
-  log: Log;
-  /** Server-side renderer (render processes). */
-  renderer: Renderer;
-  /** Stored render results (render_animation `store`). */
-  renderStore: RenderStore;
-  /** Limits of the agents' undo histories (for descriptions and notes). */
-  historyLimits: HistoryLimits;
-}
+// the context of the tools, shared with the feature modules' registrars (tool-kit.ts)
+export type { ToolContext } from './tool-kit';
 
 const formatMb = (bytes: number) => `${+(bytes / 1048576).toFixed(1)} MB`;
-
-type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
-type ToolOutput = CallToolResult | Record<string, unknown> | unknown[];
 
 const DEG2RAD = Math.PI / 180;
 const MAX_RENDER_SIZE = 2048;
 const MAX_EMBEDDED_EXPORT_BYTES = 20 * 1024 * 1024;
 
 // ------------------------------------------------------------------ shared schemas
+// (vec3, color, projectArg, objectArg and objectList are in tool-kit.ts)
 
-const vec3 = z.tuple([z.number(), z.number(), z.number()]);
-const vec4 = z.tuple([z.number(), z.number(), z.number(), z.number()]);
-const color = z.union([vec3, vec4]).describe('Linear RGB or RGBA, components 0..1');
-const projectArg = z
-  .string()
-  .min(1)
-  .describe(
-    'Project id or name (see list_projects): the exact name, or, when no project has it, the name in another letter case',
-  );
-const objectArg = z.string().min(1).describe('Object id or exact object name');
-const objectList = z.array(z.string().min(1)).min(1).describe('Object ids or exact names');
 const selectModeEnum = z.enum(['VERT', 'EDGE', 'FACE']);
 const meshSelectionShape = {
   verts: z.array(z.number().int().min(0)).optional().describe('Vertex indices'),
@@ -230,9 +210,7 @@ const selectModeArg = selectModeEnum
     'VERT selects the listed vertices with the vertices of the listed edges and faces; EDGE only the listed edges and FACE only the listed faces (other lists are refused). Default: inferred (faces alone → FACE, edges alone → EDGE, else VERT)',
   );
 
-const READ_ONLY: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
-const EDIT: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
-const DESTRUCTIVE: ToolAnnotations = { readOnlyHint: false, destructiveHint: true, openWorldHint: false };
+// (the annotations READ_ONLY, EDIT and DESTRUCTIVE are in tool-kit.ts)
 
 const ADD_OPERATORS: Record<string, string> = {
   cube: 'mesh.primitive_cube_add',
@@ -363,14 +341,6 @@ function withProjectNotes(out: ToolOutput, notes: string[]): CallToolResult {
   }
   if (typeof out === 'object' && out !== null && !Array.isArray(out)) return text({ ...out, project_note });
   return { content: [...text(out).content, own] };
-}
-
-/** Origin of the MCP request (used for editor/download links). */
-function baseUrl(extra: ToolExtra): string {
-  const url = extra.requestInfo?.url;
-  if (url) return url.origin;
-  const host = extra.requestInfo?.headers?.host;
-  return typeof host === 'string' ? `http://${host}` : '';
 }
 
 function editorUrl(extra: ToolExtra, projectId: string): string {
@@ -593,7 +563,9 @@ function errorCode(res: RunResult): ErrorCode {
  * else `fallback`. Decided by the error's class and code, never by its message.
  */
 function codeOf(err: unknown, fallback: ErrorCode): ErrorCode {
-  if (err instanceof ToolError || err instanceof OperatorError) return err.code ?? fallback;
+  if (err instanceof OperatorError) return err.code ?? fallback;
+  // a service's code (UNAVAILABLE …) is not an operator failure's kind
+  if (err instanceof ToolError) return err.code && !isServiceErrorCode(err.code) ? err.code : fallback;
   return fallback;
 }
 
@@ -711,16 +683,17 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   const { agent, rooms, registry, metrics, log, renderer, renderStore } = ctx;
 
   /**
-   * Registers a tool. Its arguments are strict: unknown or misspelled argument names (also inside
-   * nested argument objects) fail the call with suggestions and the valid names, and the input
-   * schema in tools/list is closed. `argsHint` is added to that error when an unknown argument is
-   * not a typo of a valid one (e.g. that operator parameters belong in `params`).
+   * Registers a tool (a tool-kit.ts ToolRegistrar: the feature modules register theirs with it).
+   * Its arguments are strict: unknown or misspelled argument names (also inside nested argument
+   * objects) fail the call with suggestions and the valid names, and the input schema in
+   * tools/list is closed. `argsHint` is added to that error when an unknown argument is not a typo
+   * of a valid one (e.g. that operator parameters belong in `params`).
    */
   function tool<S extends z.ZodRawShape>(
     name: string,
-    meta: { title: string; description: string; annotations?: ToolAnnotations; argsHint?: string },
+    meta: ToolMeta,
     shape: S,
-    handler: (args: z.output<z.ZodObject<S>>, extra: ToolExtra) => Promise<ToolOutput> | ToolOutput,
+    handler: ToolHandler<S>,
   ): void {
     const cb = async (args: z.output<z.ZodObject<S>>, extra: ToolExtra): Promise<CallToolResult> => {
       const end = metrics.mcpToolDuration.startTimer({ tool: name });
@@ -754,14 +727,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         return result;
       } catch (err) {
         metrics.mcpToolCalls.inc({ tool: name, status: 'error' });
-        // the out-of-memory errors of the rendering and export tools carry their code as JSON on
-        // the next line (like run_operator's failures); every other tool error stays one message
-        // (with a project_note, also that as JSON)
+        // the out-of-memory errors of the rendering and export tools, and the errors of the
+        // services with a code of their own (UNAVAILABLE, FFMPEG_UNAVAILABLE, NEEDS_KEY,
+        // NOT_DOWNLOADABLE, QUEUE_FULL, UPSTREAM: agent.ts codedErrorDetails), carry their code
+        // as JSON on the next line (like run_operator's failures); every other tool error stays
+        // one message (with a project_note, also that as JSON)
         if (err instanceof ToolError)
-          return withProjectNotes(
-            failure(err.message, err.code === 'OUT_OF_MEMORY' ? { code: err.code } : undefined),
-            notes,
-          );
+          return withProjectNotes(failure(err.message, codedErrorDetails(err.code)), notes);
         // a stored mesh the server's process has no memory to decode (get_mesh_data …), as the
         // operators that read it say it: code OUT_OF_MEMORY
         if (isMeshMemoryError(err))
@@ -3264,6 +3236,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       }
     },
   );
+
+  // ---------------------------------------------------------------- feature modules
+  // (their handlers read the services of ctx when they run: registration reads nothing of ctx)
+
+  registerVideoTools(tool, ctx);
+  registerStoreTools(tool, ctx);
+  registerRideoTools(tool, ctx);
 }
 
 /** `project://{id}/scene` resources (JSON scene description). */

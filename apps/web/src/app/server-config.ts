@@ -3,7 +3,18 @@ import { prefs } from './prefs';
 /** Shape of `GET /api/config` returned by the editor server. */
 export interface ServerConfig {
   version: string;
-  features: { sync: boolean; mcp: boolean; telemetry: boolean; webdavProxy: boolean };
+  features: {
+    sync: boolean;
+    mcp: boolean;
+    telemetry: boolean;
+    webdavProxy: boolean;
+    /** Video export (the server found ffmpeg); absent on older servers. */
+    videoExport?: boolean;
+    /** The model store (Asset Browser); absent on older servers. */
+    modelStore?: boolean;
+    /** The rideo bridge (RIDEO_URL is set); absent on older servers. */
+    rideo?: boolean;
+  };
   webdav: { url: string; basePath: string } | null;
   persistence: string;
 }

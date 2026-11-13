@@ -143,12 +143,35 @@ export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
     name: 'Rendering',
     aliases: ['Render'],
     description:
-      'Render with the render_image (stills: RASTER previews, PATHTRACER finals) and render_animation (contact sheets, GIF, APNG, PNG sequences) tools; render settings with set_scene_settings. These operators set up what renders show: cameras (lens, depth of field: camera.properties_set), lights (energy, area light shape and size: light.properties_set), tracking, sky and mist',
-    tools: ['render_image', 'render_animation', 'set_scene_settings', 'set_active_camera'],
+      'Render with the render_image (stills: RASTER previews, PATHTRACER finals) and render_animation (contact sheets, GIF, APNG, PNG sequences) tools, and the shots of the director desk as video files with export_video; render settings with set_scene_settings. These operators set up what renders show: cameras (lens, depth of field: camera.properties_set), lights (energy, area light shape and size: light.properties_set), tracking, sky and mist',
+    tools: ['render_image', 'render_animation', 'export_video', 'set_scene_settings', 'set_active_camera'],
     match: any(
       prefix('world.', 'light.', 'camera.'),
       ids('object.camera_add', 'object.light_add', 'object.track_set'),
     ),
+  },
+  {
+    name: 'Director',
+    aliases: ['Desk', 'Shots'],
+    description:
+      'The director desk: shots (a camera each, with framing, angle, height, lens, move and subjects, solved from the plan), continuity checks, the set (ground, sky and sun), actors and physics presets; export_video renders the shots as video files (export_status follows a job, cancel_export stops it, list_exports lists them)',
+    tools: ['export_video', 'export_status', 'cancel_export', 'list_exports'],
+    match: prefix('desk.'),
+  },
+  {
+    name: 'Actors',
+    aliases: ['Characters'],
+    description:
+      'Rigged mannequin people and animals of the director desk: add, pose, walk or run along paths, face, look at, hold props and ride',
+    match: prefix('desk.actor_'),
+  },
+  {
+    name: 'Model Store',
+    aliases: ['Store', 'Assets'],
+    description:
+      'Built-in and external models: store_search finds them (licence, author, size), store_add inserts one (downloaded and cached first when external) standing on the ground at a location and scaled to a size, with its licence and author recorded',
+    tools: ['store_search', 'store_add'],
+    match: prefix('store.'),
   },
 ];
 
@@ -309,6 +332,13 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
     use: 'export_scene',
     editor: "it opens the Export window on the person's screen",
   },
+  'wm.export_video': {
+    instead: 'To export the shots as video use export_video (export_status follows the job).',
+    use: 'export_video',
+    editor:
+      "it opens the Export Video window on the person's screen (until that window exists it only shows them " +
+      'a message that it is coming soon)',
+  },
   'wm.import': {
     instead: 'To import a file use import_model.',
     use: 'import_model',
@@ -403,6 +433,14 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
   'view3d.toggle_snapping': {
     editor: "it turns snapping on or off for the person's transforms in that editor",
   },
+  'view3d.toggle_follow_shots': {
+    editor:
+      'it turns Follow Shots on or off in that editor: its viewport then looks through the camera of the shot ' +
+      'at its current frame',
+  },
+  'view3d.toggle_camera_guides': {
+    editor: "it shows or hides the rule-of-thirds and action-safe guides over that editor's camera view",
+  },
   'view3d.toggle_shading': {
     editor:
       "it switches the shading of the person's viewport ({type: WIREFRAME, SOLID, MATERIAL or RENDERED}; " +
@@ -423,8 +461,8 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
   'wm.preferences': { editor: "it opens the Preferences window on the person's screen" },
   'screen.workspace_set': {
     editor:
-      "it switches the person's workspace layout ({name: Layout, Modeling, Shading, Animation or Scripting}; " +
-      'Shading also switches their viewport to Material Preview)',
+      "it switches the person's workspace layout ({name: Layout, Modeling, Shading, Animation, Scripting or " +
+      'Director}; Shading also switches their viewport to Material Preview)',
   },
 };
 

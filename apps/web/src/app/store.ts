@@ -7,7 +7,7 @@ export const serverChecked = signal(false);
 export const online = signal(typeof navigator === 'undefined' ? true : navigator.onLine);
 export const session = signal<ProjectSession | null>(null);
 
-export type Workspace = 'Layout' | 'Modeling' | 'Shading' | 'Animation' | 'Scripting';
+export type Workspace = 'Layout' | 'Modeling' | 'Shading' | 'Animation' | 'Scripting' | 'Director';
 export const workspace = signal<Workspace>('Layout');
 
 export type DialogKind = 'projects' | 'preferences' | 'export' | 'about' | 'shortcuts' | 'render' | null;

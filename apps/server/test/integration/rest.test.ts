@@ -83,7 +83,16 @@ describe('REST API', () => {
     const res = await api(server.url, '/api/config');
     expect(res.body).toEqual({
       version: expect.any(String),
-      features: { sync: true, mcp: true, telemetry: true, webdavProxy: false },
+      features: {
+        sync: true,
+        mcp: true,
+        telemetry: true,
+        webdavProxy: false,
+        // video export when the server found ffmpeg (FFMPEG_PATH); the rideo bridge with RIDEO_URL
+        videoExport: expect.any(Boolean),
+        modelStore: true,
+        rideo: false,
+      },
       webdav: null,
       persistence: 'memory',
     });

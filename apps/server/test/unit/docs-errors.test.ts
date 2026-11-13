@@ -585,7 +585,11 @@ describe('docs: error codes of refused render operators', () => {
     // (renders, exports, import_model's memory check) and a mesh the server could not decode
     expect(tools).toContain("throw new ToolError(`Import failed: ${refused}`, 'OUT_OF_MEMORY');");
     expect(tools).toContain(
-      "return withProjectNotes( failure(err.message, err.code === 'OUT_OF_MEMORY' ? { code: err.code } : undefined),",
+      'if (err instanceof ToolError) return withProjectNotes(failure(err.message, codedErrorDetails(err.code)), notes);',
+    );
+    // the code goes with OUT_OF_MEMORY and the codes of the server's services (UNAVAILABLE …) only
+    expect(joined(source('mcp/agent.ts'))).toContain(
+      "return code === 'OUT_OF_MEMORY' || isServiceErrorCode(code) ? { code } : undefined;",
     );
     expect(tools).toContain(
       'if (isMeshMemoryError(err)) return withProjectNotes(failure(`${name} failed: ${err.message}`, { code: err.code }), notes);',
@@ -2702,10 +2706,12 @@ describe("docs: other areas' messages (round 11)", () => {
    * the exact one (agent.ts matching); the argument's description said "exact project name".
    */
   it('say that a project argument also takes a name in another letter case', () => {
-    expect(source('mcp/tools.ts')).toContain(
+    // the argument every tool module shares (tool-kit.ts)
+    expect(source('mcp/tool-kit.ts')).toContain(
       "'Project id or name (see list_projects): the exact name, or, when no project has it, the name in another letter case'",
     );
-    expect(source('mcp/tools.ts')).not.toContain('exact project name');
+    for (const rel of ['mcp/tools.ts', 'mcp/tool-kit.ts'])
+      expect(source(rel), rel).not.toContain('exact project name');
     // round 12: the instructions and the conventions of mcp.md said "exact name" for projects too
     expect(MCP_INSTRUCTIONS).toContain(
       'objects, materials and projects can be referenced by id or exact name (a project also by its name in ' +

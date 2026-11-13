@@ -45,6 +45,28 @@ function vec3(v: unknown, fallback: Vec3): Vec3 {
     : [...fallback];
 }
 
+/** Largest |component| of a rigid body's initial linear (m/s) or angular (rad/s) velocity. */
+export const MAX_INITIAL_VELOCITY = 1000;
+
+/** Largest |start_frame| of a rigid body. */
+export const MAX_START_FRAME = 1_000_000;
+
+/** A finite vector with each component clamped to ±max (the zero vector when it is not one). */
+function clampedVec3(v: unknown, max: number): Vec3 {
+  const out = vec3(v, [0, 0, 0]);
+  return [
+    Math.min(max, Math.max(-max, out[0])),
+    Math.min(max, Math.max(-max, out[1])),
+    Math.min(max, Math.max(-max, out[2])),
+  ];
+}
+
+/** A rigid body's start frame: null (the world's frame_start) or an integer within ±MAX_START_FRAME. */
+function startFrame(v: unknown): number | null {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+  return Math.round(Math.min(MAX_START_FRAME, Math.max(-MAX_START_FRAME, v)));
+}
+
 /** Blender's rigid body world defaults. */
 export function defaultRigidBodyWorld(): RigidBodyWorld {
   return {
@@ -131,6 +153,10 @@ export function sanitizeRigidBody(rb: unknown): RigidBodyData | null {
     collision_margin: num(o.collision_margin, d.collision_margin, 0, 1),
     linear_damping: num(o.linear_damping, d.linear_damping, 0, 1),
     angular_damping: num(o.angular_damping, d.angular_damping, 0, 1),
+    start_frame: startFrame(o.start_frame),
+    initial_linear_velocity: clampedVec3(o.initial_linear_velocity, MAX_INITIAL_VELOCITY),
+    initial_angular_velocity: clampedVec3(o.initial_angular_velocity, MAX_INITIAL_VELOCITY),
+    inherit_velocity: bool(o.inherit_velocity, d.inherit_velocity),
   };
 }
 
