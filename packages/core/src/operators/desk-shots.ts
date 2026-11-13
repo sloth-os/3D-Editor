@@ -1,4 +1,15 @@
 import { z } from 'zod';
+import type { Vec3 } from '../math/types';
+import type {
+  DeskAngle,
+  DeskFacing,
+  DeskFraming,
+  DeskHeight,
+  DeskLayoutEntry,
+  DeskMove,
+  DeskSide,
+  ShotData,
+} from '../doc/types';
 import {
   DESK_ANGLES,
   DESK_CONTINUITIES,
@@ -11,6 +22,7 @@ import {
 import { ACTOR_KINDS } from '../desk/characters';
 import {
   MAX_PRE_ROLL,
+  MAX_SHOT_FRAME,
   MAX_SHOT_LAYOUT,
   MAX_SHOT_NAME,
   MAX_SHOT_NOTES,
@@ -19,10 +31,30 @@ import {
   MAX_SHOTS,
   SHOT_LENS_MAX,
   SHOT_LENS_MIN,
+  findShotIndex,
+  getShots,
+  newShotId,
+  setShots,
 } from '../desk/shots';
+import { DESK_PROPS } from '../desk/props';
+import { DeskScene, deskProp } from '../desk/layout';
+import { DEFAULT_FRAMING, FRAMING_TABLE, shotSpec, solveCamera } from '../desk/solver';
+import { crossesLine, lineOfAction, linePointsAt, mirrorPose, pairPoints } from '../desk/line';
+import {
+  addDeskCamera,
+  applyCameraMove,
+  cameraHolds,
+  prepareDeskCamera,
+  retimeCameraRange,
+  type CameraPose,
+} from '../desk/moves';
+import { planFit } from '../desk/plan';
+import { checkShots, type DeskIssue } from '../desk/checks';
+import { buildSet } from '../desk/set';
+import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
-import { pollObjectMode, vec3 } from './helpers';
+import { pollObjectMode, setSelection, vec3 } from './helpers';
 
 /*
  * Shot operators of the director's desk (DESK-CORE owns this module; spec §4–§7, §11):
@@ -38,8 +70,9 @@ import { pollObjectMode, vec3 } from './helpers';
  *   desk.import_rideo_blocking    a rideo clip's SceneBlocking as a scene and shots (phase 2)
  *   desk.export_rideo_blocking    the scene as a rideo SceneBlocking v1 (phase 2, read-only)
  *
- * Shots live in SceneSettings.shots and are read and written only through desk/shots.ts. FOUNDATION
- * wrote the ids, schemas and defaults; every operator throws until DESK-CORE implements it.
+ * Shots live in SceneSettings.shots and are read and written only through desk/shots.ts; the camera
+ * work is desk/solver.ts, line.ts, plan.ts and moves.ts, the checks desk/checks.ts, the set
+ * desk/set.ts. The rideo import and export (phase 2) throw until implemented.
  * Axes: Z up, the front is −Y (rideo +z), facings in degrees about +Z with 0 facing the front.
  */
 
@@ -127,6 +160,651 @@ const durationSchema = z
 const shotRef = z.string().describe('Shot id or exact name');
 const shotRefs = z.array(shotRef).describe('Shot ids or exact names (default: every enabled shot)');
 
+// ---------------------------------------------------------------- shared
+
+/** Default length of a new shot (seconds). */
+export const DEFAULT_SHOT_SECONDS = 5;
+
+const fpsOf = (ctx: OperatorContext): number => Math.max(1, ctx.doc.getScene().fps || 24);
+
+/** The object `ref` names (an id or an exact name), or NOT_FOUND. */
+function objectRef(ctx: OperatorContext, ref: string): string {
+  const id = (ctx.doc.getObject(ref) ?? ctx.doc.resolveObject(ref))?.id;
+  if (!id) throw new OperatorError(`Object '${ref}' not found`, 'NOT_FOUND');
+  return id;
+}
+
+/** The CAMERA object `ref` names; NOT_FOUND, or INVALID_PARAMS when it is not a camera. */
+function cameraRef(ctx: OperatorContext, ref: string): string {
+  const id = objectRef(ctx, ref);
+  if (ctx.doc.getObject(id)?.type !== 'CAMERA')
+    throw new OperatorError(`'${ref}' is not a camera object`, 'INVALID_PARAMS');
+  return id;
+}
+
+/** The index of the shot `ref` names (an id or an exact name) in `shots`, or NOT_FOUND. */
+function shotRefIndex(shots: readonly ShotData[], ref: string): number {
+  const i = findShotIndex(shots, ref);
+  if (i < 0) throw new OperatorError(`Shot '${ref}' not found`, 'NOT_FOUND');
+  return i;
+}
+
+interface LayoutParam {
+  subject: string;
+  side: DeskSide;
+  facing: DeskFacing;
+}
+
+/**
+ * Subjects and planned layout resolved to object ids (each once); a planned subject the subjects
+ * leave out is added to them. INVALID_PARAMS beyond MAX_SHOT_SUBJECTS.
+ */
+function castOf(
+  ctx: OperatorContext,
+  subjects: readonly string[] | undefined,
+  layout: readonly LayoutParam[] | undefined,
+  base: { subjects: string[]; layout: DeskLayoutEntry[] },
+): { subjects: string[]; layout: DeskLayoutEntry[] } {
+  const ids = subjects ? [...new Set(subjects.map((r) => objectRef(ctx, r)))] : [...base.subjects];
+  let plan = base.layout;
+  if (layout) {
+    const seen = new Set<string>();
+    plan = [];
+    for (const e of layout) {
+      const subject = objectRef(ctx, e.subject);
+      if (seen.has(subject)) continue;
+      seen.add(subject);
+      plan.push({ subject, side: e.side, facing: e.facing });
+    }
+  }
+  for (const e of plan) if (!ids.includes(e.subject)) ids.push(e.subject);
+  if (ids.length > MAX_SHOT_SUBJECTS)
+    throw new OperatorError(
+      `A shot has at most ${MAX_SHOT_SUBJECTS} subjects (${ids.length} given)`,
+      'INVALID_PARAMS',
+    );
+  return { subjects: ids, layout: plan };
+}
+
+/** "Shot <n>" not taken by a shot of `shots`. */
+function freeShotName(shots: readonly ShotData[]): string {
+  const taken = new Set(shots.map((s) => s.name));
+  for (let n = shots.length + 1; ; n++) if (!taken.has(`Shot ${n}`)) return `Shot ${n}`;
+}
+
+/** Makes the scene long enough for a shot ending at `frameEnd`. */
+function extendScene(ctx: OperatorContext, frameEnd: number): void {
+  if (frameEnd > ctx.doc.getScene().frame_end) ctx.doc.updateScene({ frame_end: frameEnd });
+}
+
+/** How many shots use each camera. */
+function cameraUse(shots: readonly ShotData[]): Map<string, number> {
+  const use = new Map<string, number>();
+  for (const s of shots) if (s.camera) use.set(s.camera, (use.get(s.camera) ?? 0) + 1);
+  return use;
+}
+
+/**
+ * Refuses a shot over [start, end] on camera `cameraId` that would overlap another shot using the
+ * same camera: a camera shows one view at a time, and keying one shot would replace the other's
+ * keys over the overlap.
+ */
+function refuseCameraOverlap(
+  shots: readonly ShotData[],
+  shot: Pick<ShotData, 'id' | 'name'>,
+  cameraId: string | null,
+  start: number,
+  end: number,
+  cameraName: string,
+): void {
+  if (!cameraId) return;
+  const other = shots.find(
+    (x) => x.id !== shot.id && x.camera === cameraId && x.frame_start <= end && x.frame_end >= start,
+  );
+  if (other)
+    throw new OperatorError(
+      `Shot '${shot.name}' (frames ${start}–${end}) would overlap shot '${other.name}' (frames ` +
+        `${other.frame_start}–${other.frame_end}), which shoots with the same camera '${cameraName}': a camera ` +
+        'shows one view at a time. Give one of them another camera or another range',
+      'INVALID_PARAMS',
+    );
+}
+
+/**
+ * Writes a shot's camera pose at its start (null: where the camera stands, its roll kept) and keys
+ * its move from there; the other shots on the camera keep their views.
+ */
+function poseShot(
+  ctx: OperatorContext,
+  shot: ShotData,
+  pose: CameraPose | null,
+  shared: boolean,
+  move: DeskMove | null,
+  scene?: DeskScene,
+) {
+  prepareDeskCamera(ctx.doc, shot.camera!, shot.id);
+  return applyCameraMove(ctx.doc, shot.camera!, move, {
+    frame_start: shot.frame_start,
+    frame_end: shot.frame_end,
+    seed: shot.id,
+    subject: shot.subjects[0],
+    subjects: shot.subjects,
+    start: pose ?? undefined,
+    scene,
+    keyed: shared,
+    holds: cameraHolds(getShots(ctx.doc), shot.camera!, shot.frame_start, shot.frame_end, shot.id),
+  });
+}
+
+/** What solving a shot came to. */
+export interface SolvedShot {
+  id: string;
+  name: string;
+  camera: string;
+  angle: DeskAngle;
+  /** The camera was added for the shot. */
+  created: boolean;
+  /** Mirrored back over the line. */
+  mirrored: boolean;
+  /** Refitted to the shot's planned layout. */
+  refit: boolean;
+  /** The camera agrees with the plan (true without one). */
+  agrees: boolean;
+  keyframes: number;
+}
+
+/**
+ * Solves the cameras of the shots `ids` (rideo's flow): each in cut order from its framing, angle,
+ * height, subjects and lens, on the side of the line set by the cameras placed before it (cameras for
+ * shots without one are added); then, with `enforce_line`, cameras of cuts that crossed the line are
+ * mirrored back; then, with `fit_plan`, each shot with a planned layout is fitted to it (the plan wins
+ * over the line); last each shot's move is keyed from its final pose. Writes the shots and cameras.
+ */
+export function solveShotCameras(
+  ctx: OperatorContext,
+  ids: readonly string[],
+  o: { enforce_line: boolean; fit_plan: boolean; keep_lens: boolean },
+): SolvedShot[] {
+  const doc = ctx.doc;
+  let shots = getShots(doc);
+  const targets = new Set(ids);
+  const created = new Set<string>();
+  // a camera for every target shot that has none
+  for (const s of shots) {
+    if (!targets.has(s.id) || s.camera) continue;
+    const framing = s.framing ?? DEFAULT_FRAMING;
+    s.camera = addDeskCamera(doc, {
+      name: s.name,
+      shotId: s.id,
+      lens: s.lens_mm ?? FRAMING_TABLE[framing].lens_mm,
+      at: ctx.state.cursorLocation,
+    });
+    created.add(s.id);
+    if (!doc.getScene().camera) doc.updateScene({ camera: s.camera });
+  }
+  if (created.size) shots = setShots(doc, shots);
+  const use = cameraUse(shots);
+  const order = shots.filter((s) => targets.has(s.id) && s.camera);
+  const index = (id: string) => shots.findIndex((s) => s.id === id);
+  const poses = new Map<string, CameraPose>();
+  const info = new Map<string, SolvedShot>();
+  const pending = new Set(order.map((s) => s.id));
+  for (const s of order) {
+    const scene = new DeskScene(doc);
+    // rideo's normalizeBlocking: the line of the shots placed so far and this one (whose camera does
+    // not count yet), so the first shot already keeps to the side facing the front of the set
+    const placed = shots
+      .filter((x) => (x.enabled && x.camera && !pending.has(x.id)) || x.id === s.id)
+      .map((x) => (x.id === s.id ? { ...x, camera: null } : x));
+    const line = lineOfAction(scene, placed);
+    const lens = o.keep_lens && s.lens_mm === null ? scene.camera(s.camera!, s.frame_start)?.lens : null;
+    const spec = shotSpec(scene, s, index(s.id), lens);
+    const cursor = ctx.state.cursorLocation;
+    const solved = solveCamera(scene, spec, s.frame_start, {
+      line: linePointsAt(scene, line, s.frame_start),
+      fallbackTarget: [cursor[0], cursor[1], cursor[2] + 1],
+    });
+    const pose = { position: solved.position, target: solved.target, lens: solved.lens_mm };
+    poses.set(s.id, pose);
+    poseShot(ctx, s, pose, (use.get(s.camera!) ?? 0) > 1, null, scene);
+    pending.delete(s.id);
+    info.set(s.id, {
+      id: s.id,
+      name: s.name,
+      camera: s.camera!,
+      angle: spec.angle,
+      created: created.has(s.id),
+      mirrored: false,
+      refit: false,
+      agrees: true,
+      keyframes: 0,
+    });
+  }
+  // the 180° line: cuts on the wrong side mirrored back (orbits cross it by design)
+  if (o.enforce_line) {
+    const scene = new DeskScene(doc);
+    const line = lineOfAction(
+      scene,
+      shots.filter((x) => x.enabled),
+    );
+    if (line)
+      for (const s of order) {
+        if (!crossesLine(scene, line, s)) continue;
+        const pts = pairPoints(scene, [line.a, line.b], s.frame_start)!;
+        const pose = mirrorPose(pts.a, pts.b, poses.get(s.id)!);
+        poses.set(s.id, pose);
+        poseShot(ctx, s, pose, (use.get(s.camera!) ?? 0) > 1, null, scene);
+        info.get(s.id)!.mirrored = true;
+      }
+  }
+  // the plan wins over the line
+  if (o.fit_plan) {
+    let changed = false;
+    for (const s of order) {
+      if (!s.layout.length) continue;
+      const scene = new DeskScene(doc);
+      const fit = planFit(scene, s, index(s.id), {
+        lens: o.keep_lens && s.lens_mm === null ? poses.get(s.id)?.lens : null,
+      });
+      if (!fit) continue;
+      const entry = info.get(s.id)!;
+      entry.agrees = fit.agreement.agrees;
+      if (!fit.spec || !fit.solved) continue;
+      const pose = { position: fit.solved.position, target: fit.solved.target, lens: fit.solved.lens_mm };
+      poses.set(s.id, pose);
+      poseShot(ctx, s, pose, (use.get(s.camera!) ?? 0) > 1, null, scene);
+      entry.refit = true;
+      entry.angle = fit.spec.angle;
+      const i = index(s.id);
+      shots[i] = { ...shots[i], angle: fit.spec.angle, subjects: fit.spec.subjects };
+      changed = true;
+    }
+    if (changed) shots = setShots(doc, shots);
+  }
+  // the moves, from each shot's final pose
+  const scene = new DeskScene(doc);
+  for (const s of order) {
+    const current = shots[index(s.id)];
+    const r = poseShot(ctx, current, poses.get(s.id)!, (use.get(s.camera!) ?? 0) > 1, current.move, scene);
+    info.get(s.id)!.keyframes = r.keyframes;
+  }
+  return order.map((s) => info.get(s.id)!);
+}
+
+/** Whether a shot's camera can be evaluated at its first frame (a move can be keyed from where it stands). */
+function cameraStands(doc: OperatorContext['doc'], shot: ShotData): boolean {
+  return !!shot.camera && !!new DeskScene(doc).camera(shot.camera, shot.frame_start);
+}
+
+function shotSummary(ctx: OperatorContext, s: ShotData) {
+  return {
+    id: s.id,
+    name: s.name,
+    camera: s.camera,
+    camera_name: s.camera ? (ctx.doc.getObject(s.camera)?.name ?? null) : null,
+    frame_start: s.frame_start,
+    frame_end: s.frame_end,
+  };
+}
+
+/** The issues of a check that concern `ids` (and the scene's own). */
+function issuesOf(ctx: OperatorContext, ids: readonly string[]): DeskIssue[] {
+  if (!ids.length) return [];
+  return checkShots(ctx.doc, { shots: ids }).issues;
+}
+
+// ---------------------------------------------------------------- operators
+
+interface ShotFields {
+  framing?: DeskFraming | null;
+  angle?: DeskAngle | null;
+  height?: DeskHeight | null;
+  move?: DeskMove | null;
+  lens_mm?: number | null;
+}
+
+interface ShotAddParams extends ShotFields {
+  name?: string;
+  camera?: string;
+  frame_start?: number;
+  frame_end?: number;
+  duration_s?: number;
+  subjects?: string[];
+  layout?: LayoutParam[];
+  notes?: string;
+  continuity: 'cut' | 'continuous';
+  pre_roll: number;
+  solve: boolean;
+  from_view?: { position: Vec3; target: Vec3; lens_mm: number };
+  index?: number;
+}
+
+function shotAdd(ctx: OperatorContext, p: ShotAddParams) {
+  const doc = ctx.doc;
+  const shots = getShots(doc);
+  if (shots.length >= MAX_SHOTS)
+    throw new OperatorError(`A scene holds at most ${MAX_SHOTS} shots`, 'FAILED');
+  const cast = castOf(ctx, p.subjects, p.layout, { subjects: [], layout: [] });
+  const scene = doc.getScene();
+  const lastEnd = shots.length ? Math.max(...shots.map((s) => s.frame_end)) : null;
+  const start = p.frame_start ?? (lastEnd === null ? scene.frame_start : lastEnd + 1) + p.pre_roll;
+  const end =
+    p.frame_end ?? start + Math.max(1, Math.round((p.duration_s ?? DEFAULT_SHOT_SECONDS) * fpsOf(ctx))) - 1;
+  if (end < start)
+    throw new OperatorError(`frame_end (${end}) must be at least frame_start (${start})`, 'INVALID_PARAMS');
+  if (Math.abs(start) > MAX_SHOT_FRAME || Math.abs(end) > MAX_SHOT_FRAME)
+    throw new OperatorError(`Shot frames must be within ±${MAX_SHOT_FRAME}`, 'INVALID_PARAMS');
+  const id = newShotId();
+  const name = p.name ?? freeShotName(shots);
+  const framing = p.framing ?? null;
+  let camera: string;
+  let added = false;
+  if (p.camera !== undefined) {
+    camera = cameraRef(ctx, p.camera);
+    refuseCameraOverlap(shots, { id, name }, camera, start, end, doc.getObject(camera)?.name ?? camera);
+  } else {
+    const lens = p.lens_mm ?? p.from_view?.lens_mm ?? FRAMING_TABLE[framing ?? DEFAULT_FRAMING].lens_mm;
+    camera = addDeskCamera(doc, { name, shotId: id, lens, at: ctx.state.cursorLocation });
+    added = true;
+    if (!scene.camera) doc.updateScene({ camera });
+  }
+  const shot: ShotData = {
+    id,
+    name,
+    enabled: true,
+    camera,
+    frame_start: start,
+    frame_end: end,
+    notes: p.notes ?? '',
+    framing,
+    angle: p.angle ?? null,
+    height: p.height ?? null,
+    move: p.move ?? null,
+    lens_mm: p.lens_mm ?? null,
+    subjects: cast.subjects,
+    layout: cast.layout,
+    continuity: p.continuity,
+    pre_roll: p.pre_roll,
+    external: null,
+  };
+  const at = Math.min(p.index ?? shots.length, shots.length);
+  shots.splice(at, 0, shot);
+  const stored = setShots(doc, shots);
+  extendScene(ctx, end);
+  const saved = stored.find((s) => s.id === id)!;
+  let solved = false;
+  if (p.from_view) {
+    poseShot(
+      ctx,
+      saved,
+      { position: [...p.from_view.position], target: [...p.from_view.target], lens: p.from_view.lens_mm },
+      (cameraUse(stored).get(camera) ?? 0) > 1,
+      saved.move,
+    );
+  } else if (p.solve && (saved.subjects.length || saved.framing)) {
+    solveShotCameras(ctx, [id], { enforce_line: false, fit_plan: true, keep_lens: false });
+    solved = true;
+  } else if (saved.move && cameraStands(doc, saved)) {
+    poseShot(ctx, saved, null, (cameraUse(stored).get(camera) ?? 0) > 1, saved.move);
+  }
+  if (added) setSelection(ctx, [camera], camera);
+  const final = getShots(doc).find((s) => s.id === id)!;
+  return { shot: shotSummary(ctx, final), solved };
+}
+
+interface ShotUpdateParams extends ShotFields {
+  shot: string;
+  name?: string;
+  enabled?: boolean;
+  camera?: string | null;
+  frame_start?: number;
+  frame_end?: number;
+  duration_s?: number;
+  subjects?: string[];
+  layout?: LayoutParam[];
+  notes?: string;
+  continuity?: 'cut' | 'continuous';
+  pre_roll?: number;
+  resolve?: boolean;
+}
+
+function shotUpdate(ctx: OperatorContext, p: ShotUpdateParams) {
+  const doc = ctx.doc;
+  const shots = getShots(doc);
+  const i = shotRefIndex(shots, p.shot);
+  const old = shots[i];
+  const s: ShotData = { ...old };
+  if (p.name !== undefined) s.name = p.name;
+  if (p.enabled !== undefined) s.enabled = p.enabled;
+  if (p.camera !== undefined) s.camera = p.camera === null ? null : cameraRef(ctx, p.camera);
+  if (p.notes !== undefined) s.notes = p.notes;
+  if (p.continuity !== undefined) s.continuity = p.continuity;
+  if (p.pre_roll !== undefined) s.pre_roll = p.pre_roll;
+  if (p.framing !== undefined) s.framing = p.framing;
+  if (p.angle !== undefined) s.angle = p.angle;
+  if (p.height !== undefined) s.height = p.height;
+  if (p.move !== undefined) s.move = p.move;
+  if (p.lens_mm !== undefined) s.lens_mm = p.lens_mm;
+  const cast = castOf(ctx, p.subjects, p.layout, { subjects: old.subjects, layout: old.layout });
+  s.subjects = cast.subjects;
+  s.layout = cast.layout;
+  // the range: a new start keeps the length unless an end or a duration is given
+  const start = p.frame_start ?? old.frame_start;
+  let end = old.frame_end + (start - old.frame_start);
+  if (p.duration_s !== undefined) end = start + Math.max(1, Math.round(p.duration_s * fpsOf(ctx))) - 1;
+  if (p.frame_end !== undefined) end = p.frame_end;
+  if (end < start)
+    throw new OperatorError(`frame_end (${end}) must be at least frame_start (${start})`, 'INVALID_PARAMS');
+  // a new range or camera may not overlap another shot on that camera (its keys would be replaced)
+  if (start !== old.frame_start || end !== old.frame_end || s.camera !== old.camera)
+    refuseCameraOverlap(
+      shots,
+      s,
+      s.camera,
+      start,
+      end,
+      s.camera ? (doc.getObject(s.camera)?.name ?? s.camera) : '',
+    );
+  s.frame_start = start;
+  s.frame_end = end;
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const specChanged = (['framing', 'angle', 'height', 'move', 'lens_mm', 'subjects', 'layout'] as const).some(
+    (k) => p[k] !== undefined && !same(s[k], old[k]),
+  );
+  const resolve = p.resolve ?? specChanged;
+  shots[i] = s;
+  const stored = setShots(doc, shots);
+  extendScene(ctx, end);
+  const saved = stored[i];
+  const rangeChanged = saved.frame_start !== old.frame_start || saved.frame_end !== old.frame_end;
+  let solved = false;
+  // the shot's keys follow it to its new range (a solve then replaces them there); the other shots
+  // on the camera keep their views
+  if (saved.camera && saved.camera === old.camera && rangeChanged)
+    retimeCameraRange(
+      doc,
+      saved.camera,
+      [old.frame_start, old.frame_end],
+      [saved.frame_start, saved.frame_end],
+      cameraHolds(stored, saved.camera, saved.frame_start, saved.frame_end, saved.id),
+    );
+  if (resolve) {
+    solveShotCameras(ctx, [saved.id], { enforce_line: true, fit_plan: true, keep_lens: false });
+    solved = true;
+  } else if (saved.camera) {
+    if (p.move !== undefined && saved.move !== old.move && cameraStands(doc, saved))
+      poseShot(ctx, saved, null, (cameraUse(stored).get(saved.camera) ?? 0) > 1, saved.move);
+  }
+  const final = getShots(doc).find((x) => x.id === saved.id)!;
+  return { shot: { ...shotSummary(ctx, final), enabled: final.enabled }, solved };
+}
+
+function shotRemove(ctx: OperatorContext, p: { shots: string[]; delete_cameras: boolean }) {
+  const doc = ctx.doc;
+  const shots = getShots(doc);
+  const remove = new Set(p.shots.map((ref) => shots[shotRefIndex(shots, ref)].id));
+  const removed = shots.filter((s) => remove.has(s.id));
+  const kept = shots.filter((s) => !remove.has(s.id));
+  setShots(doc, kept);
+  const deleted: string[] = [];
+  if (p.delete_cameras) {
+    const still = new Set(kept.map((s) => s.camera).filter((c): c is string => !!c));
+    for (const s of removed)
+      if (s.camera && !still.has(s.camera) && !deleted.includes(s.camera)) deleted.push(s.camera);
+    doc.removeObjects(deleted);
+    const gone = new Set(deleted);
+    setSelection(
+      ctx,
+      ctx.state.selectedIds.filter((id) => !gone.has(id)),
+      gone.has(ctx.state.activeId ?? '') ? null : ctx.state.activeId,
+    );
+  }
+  return { removed: removed.map((s) => ({ id: s.id, name: s.name })), deleted_cameras: deleted };
+}
+
+function shotMove(ctx: OperatorContext, p: { shot: string; index: number }) {
+  const shots = getShots(ctx.doc);
+  const i = shotRefIndex(shots, p.shot);
+  const [shot] = shots.splice(i, 1);
+  shots.splice(Math.min(p.index, shots.length), 0, shot);
+  const stored = setShots(ctx.doc, shots);
+  return { order: stored.map((s) => ({ id: s.id, name: s.name })) };
+}
+
+function shotSolve(
+  ctx: OperatorContext,
+  p: {
+    shots?: string[];
+    enforce_line: boolean;
+    fit_plan: boolean;
+    keep_lens: boolean;
+    only_missing: boolean;
+  },
+) {
+  const shots = getShots(ctx.doc);
+  let targets = p.shots?.length
+    ? p.shots.map((ref) => shots[shotRefIndex(shots, ref)])
+    : shots.filter((s) => s.enabled);
+  if (p.only_missing) targets = targets.filter((s) => !s.camera);
+  const ids = [...new Set(targets.map((s) => s.id))];
+  const solved = solveShotCameras(ctx, ids, p);
+  for (const s of solved)
+    if (!s.agrees)
+      ctx.report(
+        'WARNING',
+        `The camera of shot '${s.name}' disagrees with its planned layout (plan_mismatch)`,
+      );
+  return { shots: solved, issues: issuesOf(ctx, ids) };
+}
+
+function cameraMove(
+  ctx: OperatorContext,
+  p: {
+    camera?: string;
+    shot?: string;
+    move: DeskMove;
+    frame_start?: number;
+    frame_end?: number;
+    amount?: number;
+  },
+) {
+  const doc = ctx.doc;
+  const shots = getShots(doc);
+  const i = p.shot !== undefined ? shotRefIndex(shots, p.shot) : -1;
+  const shot = i >= 0 ? shots[i] : null;
+  const camera = p.camera !== undefined ? cameraRef(ctx, p.camera) : shot?.camera;
+  if (!camera)
+    throw new OperatorError(
+      shot
+        ? `Shot '${shot.name}' has no camera: give camera, or solve the shot first`
+        : 'Give camera or shot',
+      'INVALID_PARAMS',
+    );
+  const scene = doc.getScene();
+  const start = p.frame_start ?? shot?.frame_start ?? scene.frame_start;
+  const end = p.frame_end ?? shot?.frame_end ?? scene.frame_end;
+  if (end < start)
+    throw new OperatorError(`frame_end (${end}) must be at least frame_start (${start})`, 'INVALID_PARAMS');
+  const desk = new DeskScene(doc);
+  if (!desk.camera(camera, start))
+    throw new OperatorError(`Camera '${doc.getObject(camera)?.name}' cannot be evaluated`, 'FAILED');
+  const subjects = shot?.subjects ?? [];
+  const use = cameraUse(shots);
+  // from where the camera stands (its roll kept), looking at the shot's subjects; the other shots on
+  // the camera keep their views
+  const r = applyCameraMove(doc, camera, p.move, {
+    frame_start: start,
+    frame_end: end,
+    amount: p.amount,
+    seed: shot?.id ?? camera,
+    subject: subjects[0],
+    subjects,
+    scene: desk,
+    keyed: (use.get(camera) ?? 0) > 1,
+    holds: cameraHolds(shots, camera, start, end, shot?.id),
+  });
+  // the shot's move follows what its camera does over its range
+  if (
+    shot &&
+    shot.camera === camera &&
+    start === shot.frame_start &&
+    end === shot.frame_end &&
+    shot.move !== p.move
+  ) {
+    shots[i] = { ...shot, move: p.move };
+    setShots(doc, shots);
+  }
+  return {
+    camera,
+    camera_name: doc.getObject(camera)?.name ?? null,
+    move: p.move,
+    frame_start: start,
+    frame_end: end,
+    keyframes: r.keyframes,
+    end: r.end && { position: r.end.position, target: r.end.target, lens_mm: r.end.lens },
+  };
+}
+
+function setBuild(
+  ctx: OperatorContext,
+  p: {
+    width: number;
+    depth: number;
+    ground: string;
+    interior: boolean;
+    sun_azimuth_deg: number;
+    sun_elevation_deg: number;
+    sky: boolean;
+  },
+) {
+  const r = buildSet(ctx.doc, p);
+  // exactly one key light: say which other lights light the set too
+  const others = ctx.doc
+    .listObjects()
+    .filter(
+      (o) => o.type === 'LIGHT' && !o.hide_render && o.id !== r.sun && deskProp(o, DESK_PROPS.role) !== 'set',
+    );
+  if (others.length)
+    ctx.report(
+      'WARNING',
+      `${others.length === 1 ? 'A light' : `${others.length} lights`} besides the set's ${p.sky ? 'sky sun' : 'sun lamp'} light${
+        others.length === 1 ? 's' : ''
+      } the set: ${others
+        .slice(0, 5)
+        .map((o) => o.name)
+        .join(', ')} (hide them in renders for one key light)`,
+    );
+  const name = (id: string | null) => (id ? (ctx.doc.getObject(id)?.name ?? null) : null);
+  return {
+    ground: r.ground,
+    ground_name: name(r.ground),
+    walls: r.walls,
+    sun: r.sun,
+    sun_name: name(r.sun),
+    removed: r.removed,
+  };
+}
+
 export function registerDeskShotOperators(reg: OperatorRegistry): void {
   reg.register(
     defineOperator({
@@ -138,7 +816,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
         "(rideo's framing table: coverage, lens and look-at height per framing; angle and height around the " +
         'subjects; fitted to `layout` when given; the move keyed over the shot). The range defaults to ' +
         "duration_s (5 s) after the last shot's end and extends the scene's frame_end. Returns {shot: {id, name, " +
-        'camera, frame_start, frame_end}}.',
+        'camera, camera_name, frame_start, frame_end}, solved}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -198,7 +876,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
           .optional()
           .describe('Position in the cut, 0 = first (default: last)'),
       }),
-      execute: notImplemented('desk.shot_add'),
+      execute: (ctx, p) => shotAdd(ctx, p),
     }),
   );
 
@@ -242,7 +920,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
               'again when framing, angle, height, move, lens_mm, subjects or layout change)',
           ),
       }),
-      execute: notImplemented('desk.shot_update'),
+      execute: (ctx, p) => shotUpdate(ctx, p),
     }),
   );
 
@@ -259,7 +937,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
         shots: z.array(shotRef).min(1).describe('Shot ids or exact names'),
         delete_cameras: z.boolean().default(false).describe("Also delete the shots' cameras"),
       }),
-      execute: notImplemented('desk.shot_remove'),
+      execute: (ctx, p) => shotRemove(ctx, p),
     }),
   );
 
@@ -275,7 +953,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
         shot: shotRef,
         index: z.number().int().min(0).max(MAX_SHOTS).describe('New position, 0 = first'),
       }),
-      execute: notImplemented('desk.shot_move'),
+      execute: (ctx, p) => shotMove(ctx, p),
     }),
   );
 
@@ -306,7 +984,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
           .describe("Keep each camera's current lens instead of the framing's"),
         only_missing: z.boolean().default(false).describe('Solve only shots that have no camera yet'),
       }),
-      execute: notImplemented('desk.shot_solve'),
+      execute: (ctx, p) => shotSolve(ctx, p),
     }),
   );
 
@@ -322,7 +1000,11 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       category: 'Desk',
       undo: false,
       schema: z.object({ shots: shotRefs.optional() }),
-      execute: notImplemented('desk.check'),
+      execute: (ctx, p) => {
+        const shots = getShots(ctx.doc);
+        for (const ref of p.shots ?? []) shotRefIndex(shots, ref);
+        return checkShots(ctx.doc, { shots: p.shots });
+      },
     }),
   );
 
@@ -332,8 +1014,10 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       label: 'Build Set',
       description:
         "Build the set (rideo's set): a ground plane of width × depth coloured from the ground's name, a SKY world " +
-        'with the sun at the given azimuth and elevation (one key light), and walls when interior. Rebuilding ' +
-        'replaces the set it built before. Returns {ground, walls}.',
+        'with the sun at the given azimuth and elevation (one key light; without sky a STUDIO world and one SUN ' +
+        'lamp from there), and when interior four 3.2 m walls facing into the room (their backs culled, so a ' +
+        'camera outside sees in). Rebuilding replaces the set it built before. Returns {ground, walls, sun (the ' +
+        'lamp, without sky), removed}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -373,9 +1057,12 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
           .max(90)
           .default(40)
           .describe('Sun height above the horizon in degrees (rideo elevationDeg; default 40)'),
-        sky: z.boolean().default(true).describe('Use a SKY world lit by the sun'),
+        sky: z
+          .boolean()
+          .default(true)
+          .describe('true: a SKY world whose sun lights the set; false: a STUDIO world and one SUN lamp'),
       }),
-      execute: notImplemented('desk.set_build'),
+      execute: (ctx, p) => setBuild(ctx, p),
     }),
   );
 
@@ -412,7 +1099,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
           .optional()
           .describe("Strength of the move: 1 = the move library's distance or angle (default 1)"),
       }),
-      execute: notImplemented('desk.camera_move'),
+      execute: (ctx, p) => cameraMove(ctx, p),
     }),
   );
 

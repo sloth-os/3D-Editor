@@ -24,9 +24,9 @@ import {
 } from '../src/store';
 
 /*
- * The contracts FOUNDATION wrote for the workstreams (spec §8, §10): what is implemented now
- * (rideo's pose heights, the cast palette, isActor, the catalog lookup) and the stubs that fail
- * with "<name> is not implemented yet" until their owners implement them.
+ * The contracts FOUNDATION wrote for the workstreams (spec §8, §10): rideo's pose heights, the cast
+ * palette, isActor, the catalog lookup, and functions that work or fail with an OperatorError (a
+ * stub with "<name> is not implemented yet" until its owner implements it).
  */
 
 describe('characters contract', () => {
@@ -76,26 +76,27 @@ describe('characters contract', () => {
     expect([actor, rig, empty, 'missing'].map((id) => isActor(doc, id))).toEqual([true, false, false, false]);
   });
 
-  it('fails clearly until CHARACTERS and MOTION implement it', () => {
+  it('works or fails clearly (an OperatorError; FAILED until CHARACTERS and MOTION implement it)', () => {
     const doc = SceneDoc.create({ empty: true });
-    const fails = (f: () => unknown, name: string) => {
+    const settles = (f: () => unknown, name: string) => {
       try {
         f();
-        expect.unreachable(name);
       } catch (err) {
-        expect(err).toBeInstanceOf(OperatorError);
-        expect(err).toMatchObject({ code: 'FAILED', message: `${name} is not implemented yet` });
+        expect(err, name).toBeInstanceOf(OperatorError);
+        if ((err as Error).message.includes('not implemented yet'))
+          expect(err).toMatchObject({ code: 'FAILED', message: `${name} is not implemented yet` });
       }
     };
-    fails(() => createActor(doc, { kind: 'adult' }), 'createActor');
-    fails(() => deskPhysicsBake(doc, {}), 'deskPhysicsBake');
+    settles(() => createActor(doc, { kind: 'adult' }), 'createActor');
+    // nothing to bake in an empty scene
+    expect(() => deskPhysicsBake(doc, {})).toThrow(OperatorError);
   });
 });
 
 describe('store contract', () => {
-  it('looks built-in models up by id or store id and finds nothing until CATALOG fills it', () => {
-    expect(getCatalogEntry('oak_tree')).toBeNull();
-    expect(searchCatalog('tree')).toEqual([]);
+  it('looks built-in models up by id or store id', () => {
+    expect(getCatalogEntry('no_such_model')).toBeNull();
+    expect(searchCatalog('zzqqxx no such thing')).toEqual([]);
     const entry: CatalogEntry = {
       id: 'test_box',
       name: 'Test box',
@@ -139,6 +140,6 @@ describe('store contract', () => {
         files: {},
         main: 'y.glb',
       }),
-    ).toThrow('insertStoreFiles is not implemented yet');
+    ).toThrow(OperatorError);
   });
 });

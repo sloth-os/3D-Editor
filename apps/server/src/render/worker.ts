@@ -98,6 +98,8 @@ function handle(msg: WorkerRequest): WorkerResult {
       return engine.exportFile(msg.doc, msg.format, msg.options);
     case 'simulate':
       return engine.simulate(msg.doc, msg.frames);
+    case 'desk-shot':
+      return engine.deskShot(msg.doc, msg.options);
     case 'ping':
       return { ok: true };
     case 'test-allocate':

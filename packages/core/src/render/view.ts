@@ -137,6 +137,22 @@ export function viewFromSpec(spec: ViewSpec, aspect: number, bounds: Bounds | nu
   );
 }
 
+/**
+ * Orthographic view from `eye` along the unit direction `forward` (`up` picks the roll; any vector
+ * not parallel to `forward`), covering [left, right] × [bottom, top] of the view plane and the
+ * depths [near, far] along `forward` (either may be negative: behind `eye`). Shadow maps of suns.
+ */
+export function orthoView(
+  eye: Vec3,
+  forward: Vec3,
+  up: Vec3,
+  extent: { left: number; right: number; bottom: number; top: number; near: number; far: number },
+): RenderView {
+  const view = lookAt4(eye, [eye[0] + forward[0], eye[1] + forward[1], eye[2] + forward[2]], up);
+  const { left, right, bottom, top, near, far } = extent;
+  return finish(view, ortho4(left, right, bottom, top, near, far), [...eye] as Vec3, true, near, far);
+}
+
 /** View of a camera object (world matrix may contain scale; only position and orientation are used). */
 export function viewFromCamera(cam: CameraData, world: Mat4, aspect: number): RenderView {
   const eye: Vec3 = [world[12], world[13], world[14]];

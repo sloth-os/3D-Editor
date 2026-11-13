@@ -30,9 +30,12 @@ import {
   type SoftwareRenderOptions,
   type Vec3,
 } from '@3d-editor/core';
+import { deskShotInfo, renderDeskFrame } from './desk';
 import type {
   APNGInit,
   AutoViewResult,
+  DeskShotInfo,
+  DeskShotOptions,
   DocRef,
   EncodeOptions,
   EncodedResult,
@@ -89,6 +92,11 @@ function physicsMatrices(p: PhysicsFrame): Map<string, Mat4> | null {
   return out;
 }
 
+/** Whether evaluating the scene runs the rigid body simulation (as `SceneEvaluator` decides). */
+function simulatesRigidBodies(doc: SceneDoc): boolean {
+  return !!doc.getScene().rigidbody_world?.enabled && doc.listObjects().some((o) => o.rigid_body?.enabled);
+}
+
 /** The scene access the rigid body simulator needs (as `SceneEvaluator.evaluate` provides it). */
 function rigidBodyHost(doc: SceneDoc, evaluator: SceneEvaluator): RigidBodyHost {
   return {
@@ -101,8 +109,8 @@ function rigidBodyHost(doc: SceneDoc, evaluator: SceneEvaluator): RigidBodyHost 
 }
 
 /**
- * Converts frame options to the core software renderer options (engine always explicit).
- * `o.desk` (video export looks and passes) is not implemented yet and ignored.
+ * Converts frame options to the core software renderer options (engine always explicit). The desk
+ * options of video exports (`o.desk`) are added by desk.ts.
  */
 export function softwareOptions(o: FrameOptions): SoftwareRenderOptions {
   return {
@@ -248,6 +256,21 @@ export class RenderEngine {
     return { frames: out, ms: now() - t0 };
   }
 
+  /**
+   * Measures one shot of a video export (desk.ts deskShotInfo): its depth range and shadow box.
+   * The samples are evaluated without the rigid body simulation.
+   */
+  deskShot(ref: DocRef, options: DeskShotOptions): DeskShotInfo {
+    const entry = this.document(ref);
+    try {
+      return deskShotInfo(entry, options, (frame) => {
+        entry.physics = { frame, matrices: null };
+      });
+    } finally {
+      entry.physics = null;
+    }
+  }
+
   private evictDocuments(): void {
     while (this.docs.size > MAX_DOCUMENTS) {
       let oldest: string | null = null;
@@ -330,10 +353,31 @@ export class RenderEngine {
 
   /**
    * Renders a whole image on this thread (raster, or single-threaded path tracing); with `png`
-   * the PNG file is returned instead of the pixels.
+   * the PNG file is returned instead of the pixels. A video export frame (`options.desk`) also
+   * returns its passes and metadata (desk.ts).
    */
   image(ref: DocRef, options: FrameOptions, png = false): ImageResult {
-    const { doc, evaluator } = this.documentFor(ref, options);
+    const entry = this.documentFor(ref, options);
+    const { doc, evaluator } = entry;
+    if (options.desk)
+      return renderDeskFrame(
+        {
+          doc,
+          evaluator,
+          simulated: (frame) => {
+            if (!simulatesRigidBodies(doc)) return null;
+            try {
+              // the frame's shared matrices (FrameOptions.physics), else the thread's cached simulation
+              return evaluator.rigidBodies.evaluate(doc, frame, rigidBodyHost(doc, evaluator));
+            } catch {
+              return null;
+            }
+          },
+        },
+        { ...softwareOptions(options), frame: options.frame },
+        options.desk,
+        png,
+      );
     let last: PathTraceProgress | undefined;
     const onProgress = (p: PathTraceProgress) => {
       last = p;

@@ -1,5 +1,5 @@
 import type { ViewTransform } from '../../doc/types';
-import { linearToSrgb, linearToSrgbByte, srgbToLinear } from '../color';
+import { ditherThreshold, linearToSrgb, linearToSrgb255, linearToSrgbByte, srgbToLinear } from '../color';
 
 /*
  * Display transforms (Blender's colour-management "view transforms") for the path tracer's output:
@@ -298,7 +298,8 @@ export type DisplayBackground = readonly [number, number, number, number];
  * Converts a linear premultiplied RGBA film to RGBA8 for display: un-premultiplies covered pixels,
  * applies the exposure factor and the view transform, and composites an optional display-space
  * background behind uncovered parts (like the rasterizer's `background` option). STANDARD uses the
- * renderers' exact sRGB conversion.
+ * renderers' exact sRGB conversion. `dither` quantizes with an 8 × 8 ordered dither (less banding,
+ * the same pattern in every frame).
  */
 export function filmToRGBA8(
   linear: Float32Array,
@@ -307,7 +308,9 @@ export function filmToRGBA8(
   exposure = 1,
   view: ViewTransform = 'STANDARD',
   background: DisplayBackground | null = null,
+  dither = false,
 ): Uint8ClampedArray {
+  if (dither) return filmToRGBA8Dithered(linear, width, height, exposure, view, background);
   const out = new Uint8ClampedArray(width * height * 4);
   const d = new Float64Array(3);
   const vt = viewTransformOf(view);
@@ -340,5 +343,51 @@ export function filmToRGBA8(
     out[o + 1] = Math.round((d[1] * a + bg[1] * rest) * ia * 255);
     out[o + 2] = Math.round((d[2] * a + bg[2] * rest) * ia * 255);
   }
+  return out;
+}
+
+/** `filmToRGBA8` with ordered dithering: each channel is quantized as floor(v · 255 + threshold). */
+function filmToRGBA8Dithered(
+  linear: Float32Array,
+  width: number,
+  height: number,
+  exposure: number,
+  view: ViewTransform,
+  background: DisplayBackground | null,
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(width * height * 4);
+  const d = new Float64Array(3);
+  const vt = viewTransformOf(view);
+  const bgA = background ? Math.min(1, Math.max(0, Number.isFinite(background[3]) ? background[3] : 1)) : 0;
+  const bg = [0, 0, 0];
+  if (background)
+    for (let k = 0; k < 3; k++)
+      bg[k] = Math.min(1, Math.max(0, Number.isFinite(background[k]) ? background[k] : 0));
+  for (let y = 0; y < height; y++)
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const o = i * 4;
+      const raw = linear[o + 3];
+      const a = raw > 0 ? (raw < 1 ? raw : 1) : 0;
+      const rest = (1 - a) * bgA;
+      const total = a + rest;
+      out[o + 3] = Math.round(total * 255);
+      if (!(total > 0)) continue;
+      // (floor(v + t) as `ditherByte`; the clamped array clamps to 0..255 and maps NaN to 0)
+      const t = ditherThreshold(x, y);
+      const k = a > 0 ? exposure / a : 0;
+      if (vt === 'STANDARD' && rest === 0) {
+        out[o] = Math.floor(linearToSrgb255(linear[o] * k) + t);
+        out[o + 1] = Math.floor(linearToSrgb255(linear[o + 1] * k) + t);
+        out[o + 2] = Math.floor(linearToSrgb255(linear[o + 2] * k) + t);
+        continue;
+      }
+      if (a > 0) viewTransform(vt, linear[o] * k, linear[o + 1] * k, linear[o + 2] * k, d, true);
+      else d.fill(0);
+      const ia = 255 / total;
+      out[o] = Math.floor((d[0] * a + bg[0] * rest) * ia + t);
+      out[o + 1] = Math.floor((d[1] * a + bg[1] * rest) * ia + t);
+      out[o + 2] = Math.floor((d[2] * a + bg[2] * rest) * ia + t);
+    }
   return out;
 }

@@ -89,6 +89,12 @@ export class Body {
   awake = true;
   /** Seconds the body has been slower than the sleep thresholds. */
   sleepTime = 0;
+  /**
+   * A body that takes no part in the simulation yet (a delayed body long before its start frame,
+   * see simulation.ts): a still KINEMATIC body whose bounds overlap nothing, so the broad phase
+   * pairs it with no body and nothing collides with it.
+   */
+  dormant = false;
   // kinematic targets of the current frame (start and end pose)
   k0p: Vec3 = [0, 0, 0];
   k0q: Quat = [0, 0, 0, 1];
@@ -174,6 +180,12 @@ export class Body {
 
   /** World bounds fattened by `extra` (and by the distance travelled in dt for moving bodies). */
   updateBounds(extra: number, dt: number): void {
+    if (this.dormant) {
+      // empty bounds: the sweep and prune pairs it with nothing
+      this.minX = this.minY = this.minZ = Infinity;
+      this.maxX = this.maxY = this.maxZ = -Infinity;
+      return;
+    }
     const R = this.R;
     const cx = (this.localMin[0] + this.localMax[0]) / 2;
     const cy = (this.localMin[1] + this.localMax[1]) / 2;

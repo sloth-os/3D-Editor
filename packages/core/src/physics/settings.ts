@@ -174,3 +174,40 @@ export function motionMode(rb: RigidBodyData): MotionMode {
   if (rb.type === 'PASSIVE') return 'STATIC';
   return rb.enabled ? 'DYNAMIC' : 'FROZEN';
 }
+
+/**
+ * The start frame of a body that joins the simulation after the world's frame_start (an ACTIVE body
+ * that is not animated, with a start_frame after `frameStart`): it follows its animated transform up
+ * to and including that frame, as an animated body does, and the simulation moves it from the next
+ * one. Null for the other bodies: they start with the world (their initial velocities apply there).
+ */
+export function delayedStartFrame(rb: RigidBodyData, frameStart: number): number | null {
+  if (rb.type !== 'ACTIVE' || rb.kinematic || rb.start_frame === null) return null;
+  return rb.start_frame > frameStart ? rb.start_frame : null;
+}
+
+/**
+ * Animated steps a delayed body follows before its release (simulation.ts): it takes part in the
+ * simulation from its start frame − RELEASE_TRACKED_STEPS (placed at its animated pose there) and
+ * is dormant before. The last step gives the velocity it keeps (inherit_velocity); the one before
+ * shows whether that velocity is a jump of its animation rather than its motion.
+ */
+export const RELEASE_TRACKED_STEPS = 2;
+
+/**
+ * A release velocity that differs from the animated velocity one frame earlier by more than these
+ * accelerations (m/s², rad/s²; at least RELEASE_JUMP_MIN_* between the two frames) comes from a
+ * jump of the animated transform at the release (a release pose keyed for another motion of the
+ * holder), not from a hand's swing: the body keeps the earlier velocity instead (simulation.ts).
+ */
+export const RELEASE_MAX_ACCELERATION = 150;
+export const RELEASE_MAX_ANGULAR_ACCELERATION = 400;
+export const RELEASE_JUMP_MIN_LINEAR = 2;
+export const RELEASE_JUMP_MIN_ANGULAR = 4;
+
+/**
+ * Seconds the world runs on after frame_end for bodies released at or after it (their start_frame
+ * set after the world's range was chosen): until they have come to rest (asleep), at most this long
+ * after the last of those releases.
+ */
+export const LATE_RELEASE_RUN_SECONDS = 20;

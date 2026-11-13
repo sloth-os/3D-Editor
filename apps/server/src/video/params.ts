@@ -77,7 +77,9 @@ export const videoExportParamsShape = {
   quality: z
     .enum(['draft', 'standard', 'high'])
     .default('standard')
-    .describe('draft: fast, sun shadows only; standard: all shadows and ambient occlusion; high: finest'),
+    .describe(
+      'draft: fastest (1 sample, shadows, no ambient occlusion, CRF 28); standard: 2 samples, shadows and ambient occlusion (CRF 23); high: 4 samples up to 1280×720, else 2 (CRF 18, slower encoding)',
+    ),
   look: z
     .enum(['material', 'clay', 'solid'])
     .default('material')
@@ -100,3 +102,57 @@ export const videoExportParamsShape = {
 export const videoExportParamsSchema = strictArgObject(videoExportParamsShape);
 
 export type VideoExportParams = z.output<typeof videoExportParamsSchema>;
+
+export type ExportQuality = VideoExportParams['quality'];
+
+/** What each quality renders (SPEC §9); encoding: ffmpeg.ts QUALITY_ENCODING. */
+export interface QualityPreset {
+  /** RASTER anti-aliasing samples per axis. */
+  samples: number;
+  shadows: boolean;
+  ao: boolean;
+  msaa: boolean;
+}
+
+/**
+ * The render settings of a quality: draft 1 sample, shadows, no ambient occlusion; standard 2
+ * samples, shadows and ambient occlusion; high like standard with 4 samples at 1280×720 and below.
+ * Every quality shades once per pixel and triangle (MSAA style), which the renderer does at about
+ * the cost of one sample. (The renderer's shadow option covers sun and spot lights alike, so draft
+ * keeps the spot lights' shadows too.)
+ */
+export function qualityPreset(quality: ExportQuality, width: number, height: number): QualityPreset {
+  if (quality === 'draft') return { samples: 1, shadows: true, ao: false, msaa: true };
+  if (quality === 'high')
+    return { samples: width * height <= 1280 * 720 ? 4 : 2, shadows: true, ao: true, msaa: true };
+  return { samples: 2, shadows: true, ao: true, msaa: true };
+}
+
+/** Rounds to the nearest even number of at least 2. */
+function even(n: number): number {
+  return Math.max(2, 2 * Math.round(n / 2));
+}
+
+/**
+ * The export's frame size: the given width and height, else the render resolution times its
+ * percentage; one of them alone keeps the render aspect. Even, and at most 3840×2160 (larger
+ * sizes are scaled down keeping the aspect).
+ */
+export function exportSize(
+  render: { resolution_x: number; resolution_y: number; resolution_percentage: number },
+  width?: number,
+  height?: number,
+): { width: number; height: number } {
+  const pct = Math.max(1, render.resolution_percentage || 100) / 100;
+  const rx = Math.max(1, render.resolution_x || 1920) * pct;
+  const ry = Math.max(1, render.resolution_y || 1080) * pct;
+  let w = width ?? (height !== undefined ? (height * rx) / ry : rx);
+  let h = height ?? (width !== undefined ? (width * ry) / rx : ry);
+  const scale = Math.min(1, MAX_EXPORT_WIDTH / w, MAX_EXPORT_HEIGHT / h);
+  w *= scale;
+  h *= scale;
+  return {
+    width: Math.min(MAX_EXPORT_WIDTH, even(w)),
+    height: Math.min(MAX_EXPORT_HEIGHT, even(h)),
+  };
+}

@@ -1,12 +1,13 @@
 import { z } from 'zod';
 import { MAX_STORE_RESULTS, STORE_CATEGORIES } from '../store';
-import { EDIT, READ_ONLY, projectArg, vec3, type ToolContext, type ToolRegistrar } from './tool-kit';
+import { ToolError } from './agent';
+import { EDIT, READ_ONLY, baseUrl, projectArg, vec3, type ToolContext, type ToolRegistrar } from './tool-kit';
 
 /*
  * The model store tools (SPEC §10). The handlers read ctx.store when they run (registration reads
  * nothing of ctx). store_add inserts with the agent's own undo history: the store prepares the core
  * operator call (store.add for a built-in model, store.insert_files with the downloaded files for
- * an external one) and the agent runs it in its project.
+ * an external one) and the agent runs it in its project (one undo step, synced live).
  */
 
 const size = (what: string) =>
@@ -40,9 +41,20 @@ export function registerStoreTools(tool: ToolRegistrar, ctx: ToolContext): void 
         .max(MAX_STORE_RESULTS)
         .default(20)
         .describe(`Results per page (1–${MAX_STORE_RESULTS})`),
-      cursor: z.string().min(1).optional().describe('next_cursor of the previous page'),
+      cursor: z.string().min(1).max(4000).optional().describe('next_cursor of the previous page'),
     },
-    async (a, extra) => ({ ...(await ctx.store.search(a, { signal: extra.signal })) }),
+    async (a, extra) => {
+      const res = await ctx.store.search(a, { signal: extra.signal });
+      // the thumbnail routes as links on this server (they need the server's token like any route)
+      const origin = baseUrl(extra);
+      return {
+        ...res,
+        results: res.results.map((r) => ({
+          ...r,
+          thumbnail_url: r.thumbnail_url && origin ? `${origin}${r.thumbnail_url}` : r.thumbnail_url,
+        })),
+      };
+    },
   );
 
   tool(
@@ -58,13 +70,19 @@ export function registerStoreTools(tool: ToolRegistrar, ctx: ToolContext): void 
       model: z
         .string()
         .min(1)
-        .describe("Model id from store_search ('<provider>:<id>', e.g. 'builtin:oak_tree')"),
+        .max(500)
+        .describe("Model id from store_search ('<provider>:<id>', e.g. 'builtin:oak-tree')"),
       location: vec3.optional().describe('Where its base centre goes (default: the 3D cursor)'),
-      rotation_deg: z.number().optional().describe('Rotation about Z in degrees (models face −Y)'),
+      rotation_deg: z
+        .number()
+        .min(-3600)
+        .max(3600)
+        .optional()
+        .describe('Rotation about Z in degrees (models face −Y)'),
       height_m: size('Height'),
       width_m: size('Width (X)'),
       depth_m: size('Depth (Y)'),
-      name: z.string().min(1).max(200).optional().describe('Name of the root object'),
+      name: z.string().min(1).max(64).optional().describe('Name of the root object'),
       color: z
         .string()
         .regex(/^#[0-9a-fA-F]{6}$/, 'expected a colour as #rrggbb')
@@ -72,10 +90,19 @@ export function registerStoreTools(tool: ToolRegistrar, ctx: ToolContext): void 
         .describe('Main colour as #rrggbb (built-in models)'),
     },
     async ({ project, model, ...opts }, extra) => {
+      // the project first: an unknown project fails before anything is downloaded; its document is
+      // what the memory check counts before the model's files are read
+      const target = await ctx.agent.project(project);
+      const call = await ctx.store.prepareInsert(model, opts, { signal: extra.signal, doc: target.scene });
+      // again after the download (cached): the session may have let the project go meanwhile
       const p = await ctx.agent.project(project);
-      const call = await ctx.store.prepareInsert(model, opts, { signal: extra.signal });
-      const res = p.runOrThrow(call.operator, call.params);
-      return { result: res.result ?? null, entry: call.entry, warnings: res.reports.map((r) => r.message) };
+      const res = p.run(call.operator, call.params);
+      if (!res.ok) throw new ToolError(`${call.operator} failed: ${res.error ?? 'unknown error'}`, res.code);
+      return {
+        result: res.result ?? null,
+        entry: call.entry,
+        warnings: [...call.warnings, ...res.reports.filter((r) => r.level !== 'INFO').map((r) => r.message)],
+      };
     },
   );
 }

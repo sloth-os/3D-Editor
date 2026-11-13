@@ -6,6 +6,7 @@ import { stableStringify } from '../util/json';
 import {
   sanitizeRigidBody,
   sanitizeRigidBodyWorld,
+  simulatedFrameEnd,
   worldParams,
   type MotionMode,
   type WorldParams,
@@ -13,7 +14,12 @@ import {
 import type { AnimTargetType, CollisionShape, DriverData, FCurve } from '../doc/types';
 import { meshKey } from './mesh-key';
 import { clearCollisionShapeCache } from './shapes';
-import { checkSimulation, simulationCacheBytes, simulationOutsideHeapBytes } from './memory';
+import {
+  SIMULATION_BYTES_PER_KINEMATIC_FRAME,
+  checkSimulation,
+  simulationCacheBytes,
+  simulationOutsideHeapBytes,
+} from './memory';
 import {
   Simulation,
   compareBodyOrder,
@@ -38,7 +44,10 @@ export interface RigidBodyHost {
 /** State of a document's rigid body cache (see `rigidBodyCacheInfo`). */
 export interface RigidBodyCacheInfo {
   frame_start: number;
-  /** Last frame the simulation runs to (later frames hold its state). */
+  /**
+   * Last frame the simulation runs to (later frames hold its state): frame_end, or later while
+   * bodies released at or after it come to rest (see Simulation.runLimit).
+   */
   frame_end: number;
   /** Frames simulated so far (the cache holds frame_start … simulated_to). */
   simulated_to: number;
@@ -65,9 +74,11 @@ export interface RigidBodyCacheInfo {
  * inputs (mesh content, shape type, dynamics, exact scale) are unchanged (`shapeKey`), so an
  * edit does not rebuild a dense MESH collider. Animated (kinematic) bodies are compared frame
  * by frame against the transforms the cache was built with, up to the frame being evaluated; a
- * difference re-runs the simulation. That check is only repeated after edits that can change
- * those transforms (see `animationInputsKey`), so editing unrelated objects, materials or
- * meshes at a late frame does not re-evaluate every cached frame.
+ * difference re-runs the simulation. Bodies released at a start frame are compared on the few
+ * frames before it that drive them (Simulation.trackedAt). That check is only repeated after
+ * edits that can change those transforms (see `animationInputsKey`, a hash of their inputs up to
+ * the frames that matter), so editing unrelated objects, materials or meshes, or renaming the
+ * holder of a prop, at a late frame does not re-evaluate every cached frame.
  */
 
 interface CacheEntry {
@@ -109,13 +120,22 @@ function registerCache(key: object): void {
   if (typeof y.on === 'function') y.on('destroy', () => caches.delete(key));
 }
 
-/** Bytes the frames of `entry`'s simulation keep (physics/memory.ts), or only those outside the heap. */
+/**
+ * Bytes the frames of `entry`'s simulation keep (physics/memory.ts), or only those outside the heap.
+ * The animated transforms it recorded are counted as they were recorded: every frame for an animated
+ * body, the frames up to their start for delayed ones (a frame's record is longer than the heap keeps
+ * inside it, so they all live outside it).
+ */
 function entryBytes(entry: CacheEntry | undefined, outsideHeap: boolean): number {
   const sim = entry?.sim;
   if (!sim) return 0;
-  const bodies = { simulated: sim.outputs.length, kinematic: sim.kinematic.length };
+  const bodies = { simulated: sim.outputs.length, kinematic: 0 };
   const frames = sim.current - sim.frameStart;
-  return outsideHeap ? simulationOutsideHeapBytes(bodies, frames) : simulationCacheBytes(bodies, frames);
+  const records = SIMULATION_BYTES_PER_KINEMATIC_FRAME * sim.kinematicRecords;
+  return (
+    (outsideHeap ? simulationOutsideHeapBytes(bodies, frames) : simulationCacheBytes(bodies, frames)) +
+    records
+  );
 }
 
 /**
@@ -163,47 +183,191 @@ function changeToken(doc: SceneDoc): string | null {
   return `${t.version}:${getState(y.store, y.clientID)}:${deletions}`;
 }
 
+/** Words of a 64-bit float, for hashing numbers. */
+const F64 = new Float64Array(1);
+const U32 = new Uint32Array(F64.buffer);
+
 /**
- * Fingerprint of everything the unsimulated world matrices of the given objects can depend on at
- * any frame: the objects, their parents, every object mentioned in their constraints or armature
- * poses (constraint / bone constraint targets), the datablocks driver variables read, armature
- * and curve data (bone parents, follow-path curves), transitively, with the F-curves and drivers
- * of all of these. It over-approximates (any object id found in constraint or pose data counts),
- * so an unchanged key means unchanged transforms.
+ * A 64-bit hash (two 32-bit lanes with murmur3-style mixing) of a sequence of numbers and strings:
+ * the fingerprint of inputs too large to keep as text (the keys of a long walk), cheap to update.
  */
-export function animationInputsKey(doc: SceneDoc, ids: readonly string[]): string {
+class Hasher {
+  private a = 0x9e3779b9 | 0;
+  private b = 0x85ebca6b | 0;
+
+  word(k: number): void {
+    let x = Math.imul(k | 0, 0xcc9e2d51);
+    x = (x << 15) | (x >>> 17);
+    x = Math.imul(x, 0x1b873593);
+    this.a ^= x;
+    this.a = (this.a << 13) | (this.a >>> 19);
+    this.a = (Math.imul(this.a, 5) + 0xe6546b64) | 0;
+    let y = Math.imul((k | 0) ^ 0x5bd1e995, 0x2c1b3c6d);
+    y = (y << 17) | (y >>> 15);
+    y = Math.imul(y, 0x297a2d39);
+    this.b ^= y;
+    this.b = (this.b << 11) | (this.b >>> 21);
+    this.b = (Math.imul(this.b, 9) + 0x7fe0a2d5) | 0;
+  }
+
+  num(v: number): void {
+    F64[0] = v;
+    this.word(U32[0]);
+    this.word(U32[1]);
+  }
+
+  str(s: string): void {
+    this.word(s.length);
+    for (let i = 0; i < s.length; i++) this.word(s.charCodeAt(i));
+  }
+
+  digest(): string {
+    const fmix = (h: number) => {
+      h ^= h >>> 16;
+      h = Math.imul(h, 0x85ebca6b);
+      h ^= h >>> 13;
+      h = Math.imul(h, 0xc2b2ae35);
+      return (h ^ (h >>> 16)) >>> 0;
+    };
+    return fmix(this.a).toString(36) + '.' + fmix(this.b).toString(36);
+  }
+}
+
+/** Object fields that never change a world matrix (left out of `animationInputsKey`). */
+const NON_TRANSFORM_FIELDS = new Set<string>([
+  'name',
+  'collection',
+  'material_slots',
+  'hide_viewport',
+  'hide_render',
+  'hide_select',
+  'display_type',
+  'show_wire',
+  'show_in_front',
+  'color',
+  'empty_display_type',
+  'empty_display_size',
+  'custom_props',
+  'instance_type',
+  'instance_collection',
+  'particle_systems',
+  'rigid_body',
+]);
+
+/** F-curves or drivers stored in `map` by `<target_type>:<target_id>`, read without copying them. */
+function storedByTarget<T extends { target_type: AnimTargetType; target_id: string }>(
+  map: { values(): IterableIterator<unknown> },
+): Map<string, T[]> {
+  const out = new Map<string, T[]>();
+  for (const v of map.values()) {
+    const it = v as T;
+    if (!it || typeof it !== 'object') continue;
+    const k = `${it.target_type}:${it.target_id}`;
+    const l = out.get(k);
+    if (l) l.push(it);
+    else out.set(k, [it]);
+  }
+  return out;
+}
+
+/**
+ * Hashes the F-curves of one datablock as far as they decide its values at frames up to `until`:
+ * every key up to it and the two after it (the segment holding `until` and the automatic Bézier
+ * slope of its end, or the slope of a LINEAR extrapolation), all keys when the curve cycles, has
+ * modifiers or keys out of order.
+ */
+function hashCurves(h: Hasher, curves: readonly FCurve[], until: number): void {
+  const sorted = [...curves].sort((x, y) =>
+    x.path === y.path ? x.index - y.index : x.path < y.path ? -1 : 1,
+  );
+  h.word(sorted.length);
+  for (const fc of sorted) {
+    h.str(String(fc.path));
+    h.num(fc.index);
+    h.str(String(fc.extrapolation));
+    h.word(fc.mute ? 1 : 0);
+    const mods = fc.modifiers?.length ? stableStringify(fc.modifiers) : '';
+    h.str(mods);
+    const keys = Array.isArray(fc.keyframes) ? fc.keyframes : [];
+    let all = !Number.isFinite(until) || fc.extrapolation === 'CYCLIC' || mods !== '';
+    for (let i = 1; i < keys.length && !all; i++) if (!(keys[i].frame >= keys[i - 1].frame)) all = true;
+    let after = 0;
+    let n = 0;
+    for (const k of keys) {
+      if (!all && !(k.frame <= until) && ++after > 2) break;
+      h.num(k.frame);
+      h.num(k.value);
+      h.str(String(k.interpolation));
+      h.str(k.easing === undefined ? '' : String(k.easing));
+      n++;
+    }
+    h.word(n);
+  }
+}
+
+/**
+ * Fingerprint of everything the unsimulated world matrices of the given objects can depend on: the
+ * objects, their parents, every object mentioned in their constraints or armature poses
+ * (constraint / bone constraint targets), the datablocks driver variables read, armature and curve
+ * data (bone parents, follow-path curves), transitively, with the F-curves and drivers of all of
+ * these. It over-approximates (any object id found in constraint or pose data counts), so an
+ * unchanged key means unchanged transforms. Fields that never move an object (its name, materials,
+ * visibility, custom properties…) are left out, so editing them keeps the key. With `until`, only
+ * the frames up to `until.get(id)` matter for object `id` (a body released at its start frame): an
+ * input reached from such objects only is fingerprinted with the keys that decide those frames.
+ * The F-curves are hashed where they are stored, not copied: a long animation costs a pass over its
+ * keys, not a copy and a text of them per edit.
+ */
+export function animationInputsKey(
+  doc: SceneDoc,
+  ids: readonly string[],
+  until?: ReadonlyMap<string, number>,
+): string {
   if (!ids.length) return '';
   const objects = new Map(doc.listObjects().map((o) => [o.id, o]));
-  const group = <T extends { target_type: AnimTargetType; target_id: string }>(list: T[]) => {
-    const out = new Map<string, T[]>();
-    for (const it of list) {
-      const k = `${it.target_type}:${it.target_id}`;
-      const l = out.get(k);
-      if (l) l.push(it);
-      else out.set(k, [it]);
-    }
-    return out;
-  };
-  const fcurves = group<FCurve>(doc.listFCurves());
-  const drivers = group<DriverData>(doc.listDrivers());
-  const seen = new Set<string>();
-  const queue: string[] = [];
-  const visit = (key: string) => {
-    if (seen.has(key)) return;
-    seen.add(key);
-    queue.push(key);
-  };
-  const visitIdsIn = (v: unknown, depth = 0): void => {
+  const fcurves = storedByTarget<FCurve>(doc.map('fcurves'));
+  const drivers = storedByTarget<DriverData>(doc.map('drivers'));
+  const visitIdsIn = (v: unknown, out: string[], depth = 0): void => {
     if (depth > 32) return;
     if (typeof v === 'string') {
-      if (objects.has(v)) visit(`object:${v}`);
-    } else if (Array.isArray(v)) for (const x of v) visitIdsIn(x, depth + 1);
-    else if (v && typeof v === 'object') for (const x of Object.values(v)) visitIdsIn(x, depth + 1);
+      if (objects.has(v)) out.push(`object:${v}`);
+    } else if (Array.isArray(v)) for (const x of v) visitIdsIn(x, out, depth + 1);
+    else if (v && typeof v === 'object') for (const x of Object.values(v)) visitIdsIn(x, out, depth + 1);
   };
-  for (const id of ids) visit(`object:${id}`);
+  /** The inputs one input depends on (its parents, targets, data, driver variables). */
+  const dependencies = (key: string): string[] => {
+    const out: string[] = [];
+    if (key.startsWith('object:')) {
+      const o = objects.get(key.slice(7));
+      if (o) {
+        if (o.parent) out.push(`object:${o.parent}`);
+        visitIdsIn(o.constraints, out);
+        visitIdsIn(o.pose, out);
+        if (o.data && o.type === 'ARMATURE') out.push(`armature:${o.data}`);
+        if (o.data && o.type === 'CURVE') out.push(`curve:${o.data}`);
+      }
+    }
+    for (const d of drivers.get(key) ?? [])
+      for (const v of d.variables ?? []) out.push(`${v.target_type}:${v.target_id}`);
+    return out;
+  };
+  // every input reached, with the latest frame that matters for it (the bodies released latest first)
+  const limit = new Map<string, number>();
+  const roots = ids
+    .map((id) => ({ id, until: until?.get(id) ?? Infinity }))
+    .sort((a, b) => b.until - a.until);
+  for (const root of roots) {
+    const queue = [`object:${root.id}`];
+    while (queue.length) {
+      const key = queue.pop()!;
+      const seen = limit.get(key);
+      if (seen !== undefined && seen >= root.until) continue;
+      limit.set(key, root.until);
+      queue.push(...dependencies(key));
+    }
+  }
   const parts: string[] = [];
-  while (queue.length) {
-    const key = queue.pop()!;
+  for (const [key, last] of limit) {
     const sep = key.indexOf(':');
     const type = key.slice(0, sep);
     const id = key.slice(sep + 1);
@@ -211,13 +375,9 @@ export function animationInputsKey(doc: SceneDoc, ids: readonly string[]): strin
     switch (type) {
       case 'object': {
         const o = objects.get(id);
-        data = o ?? null;
-        if (!o) break;
-        if (o.parent) visit(`object:${o.parent}`);
-        visitIdsIn(o.constraints);
-        visitIdsIn(o.pose);
-        if (o.data && o.type === 'ARMATURE') visit(`armature:${o.data}`);
-        if (o.data && o.type === 'CURVE') visit(`curve:${o.data}`);
+        data = o
+          ? Object.fromEntries(Object.entries(o).filter(([field]) => !NON_TRANSFORM_FIELDS.has(field)))
+          : null;
         break;
       }
       case 'armature':
@@ -245,9 +405,10 @@ export function animationInputsKey(doc: SceneDoc, ids: readonly string[]): strin
         data = doc.getShapeKeys(id);
         break;
     }
-    const ds = drivers.get(key) ?? [];
-    for (const d of ds) for (const v of d.variables ?? []) visit(`${v.target_type}:${v.target_id}`);
-    parts.push(`${key}=${stableStringify([data, fcurves.get(key) ?? [], ds])}`);
+    const h = new Hasher();
+    h.str(stableStringify([data, drivers.get(key) ?? []]));
+    hashCurves(h, fcurves.get(key) ?? [], last);
+    parts.push(`${key}<${last}=${h.digest()}`);
   }
   return parts.sort().join('|');
 }
@@ -277,16 +438,25 @@ function collectInputs(
       mesh: host.meshOf(id),
     }))
     .sort(compareBodyOrder);
-  // the order of the parts records the solver order (bodies starting at the same pose: by name)
-  const parts = [stableStringify(params)];
+  // the order of the parts records the solver order (bodies starting at the same pose: by name);
+  // frame_end is left out: the frames before it do not depend on it (see Simulation.setFrameEnd)
+  const parts = [stableStringify({ ...params, frameEnd: null })];
   for (const { id, rb, mesh, matrix } of inputs)
     parts.push(id, stableStringify(rb), mesh ? meshKey(mesh) : '-', matrix ? matrix.join(',') : '-');
   return { inputs, signature: parts.join('|') };
 }
 
-/** `animationInputsKey` of a simulation's animated (kinematic) bodies ('' when it has none). */
+/**
+ * `animationInputsKey` of the bodies of a simulation that follow their animation at some frame (the
+ * animated ones at every frame, the delayed ones up to their start frame; '' when it has none).
+ */
 function kinematicKeyOf(doc: SceneDoc, sim: Simulation | null): string {
-  return animationInputsKey(doc, sim?.kinematic.map((b) => b.id) ?? []);
+  if (!sim) return '';
+  return animationInputsKey(
+    doc,
+    sim.tracked.map((b) => b.id),
+    sim.releaseFrames(),
+  );
 }
 
 /**
@@ -323,6 +493,19 @@ function validEntry(
       if (sim) registerCache(key);
     } else {
       entry.token = token;
+      if (
+        entry.sim &&
+        entry.sim.frameEnd !== simulatedFrameEnd(params) &&
+        !entry.sim.setFrameEnd(params)
+      ) {
+        // other bodies are released past the new end than past the old one: the run starts over
+        const sim = new Simulation(inputs, params, { reuse: entry.sim });
+        entry.sim = sim;
+        entry.shapeSource = sim;
+        entry.kinematicVerified = params.frameStart;
+        entry.kinematicKey = kinematicKeyOf(doc, sim);
+        return { entry, inputs };
+      }
       // the animation of kinematic bodies may have changed: re-check cached frames lazily
       const animation = kinematicKeyOf(doc, entry.sim);
       if (animation !== entry.kinematicKey) {
@@ -375,13 +558,14 @@ export class RigidBodySimulator {
     if (!sim) return null;
     this.lastIssues = sim.issues;
     if (sim.outputs.length === 0) return null;
-    const target = Math.min(frame, sim.frameEnd);
-    const need = Math.ceil(target);
-    if (sim.kinematic.length) {
-      // animation of kinematic bodies may have changed since these frames were simulated
-      const upTo = Math.min(need, sim.current);
+    // the frames up to the run's end (frame_end, or later while late releases settle: runLimit)
+    const targetOf = (s: Simulation) => Math.min(frame, s.endFrame() ?? s.runLimit);
+    if (sim.tracked.length) {
+      // animation of kinematic bodies may have changed since these frames were simulated (frames
+      // where no body followed its animation have nothing to check)
+      const upTo = Math.min(Math.ceil(targetOf(sim)), sim.current);
       for (let f = entry.kinematicVerified + 1; f <= upTo; f++) {
-        if (!sim.kinematicMatches(f, host.transformsAt(f))) {
+        if (sim.recordedAt(f) && !sim.kinematicMatches(f, host.transformsAt(f))) {
           inputs ??= collectInputs(doc, host, params).inputs;
           sim = entry.sim = new Simulation(inputs, params, { reuse: sim });
           entry.shapeSource = sim;
@@ -391,17 +575,25 @@ export class RigidBodySimulator {
         entry.kinematicVerified = f;
       }
     }
+    const target = targetOf(sim);
+    const need = Math.ceil(target);
     // a host that keeps its memory in bounds (the server) refuses frames whose cache does not fit
-    if (sim.current < need)
+    if (sim.current < need && !sim.ended) {
+      const frames = need - sim.current;
       checkSimulation(
-        { simulated: sim.outputs.length, kinematic: sim.kinematic.length },
+        {
+          simulated: sim.outputs.length,
+          kinematic: Math.ceil(sim.recordsBetween(sim.current + 1, need) / frames),
+        },
         need,
-        need - sim.current,
+        frames,
         doc,
       );
-    while (sim.current < need) sim.advance(sim.kinematic.length ? host.transformsAt(sim.current + 1) : null);
+    }
+    while (sim.current < need && !sim.ended)
+      sim.advance(sim.needsTransforms(sim.current + 1) ? host.transformsAt(sim.current + 1) : null);
     entry.kinematicVerified = Math.max(entry.kinematicVerified, need);
-    return sim.matrices(target);
+    return sim.matrices(Math.min(target, sim.endFrame() ?? Infinity));
   }
 
   /** Drops the simulation cache (of the document last evaluated); the next evaluation re-simulates. */
@@ -440,7 +632,7 @@ export function rigidBodyCacheInfo(doc: SceneDoc): RigidBodyCacheInfo | null {
   if (!sim) return null;
   return {
     frame_start: sim.frameStart,
-    frame_end: sim.frameEnd,
+    frame_end: sim.endFrame() ?? sim.runLimit,
     simulated_to: sim.current,
     active_bodies: sim.outputs.length,
     bodies: sim.bodies.length,

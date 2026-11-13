@@ -1,10 +1,22 @@
 import { z } from 'zod';
+import type { Vec3 } from '../math/types';
 import type { CollisionShape } from '../doc/types';
-import { DESK_PHYSICS_KINDS } from '../desk/physics';
+import {
+  DESK_PHYSICS_KINDS,
+  deskPhysicsBake,
+  deskPhysicsDrop,
+  deskPhysicsPush,
+  deskPhysicsSetup,
+  deskPhysicsThrow,
+  deskTetherFly,
+  deskVehicleDrive,
+  type DeskWorldRange,
+} from '../desk/physics';
 import { COLLISION_SHAPES } from '../physics/settings';
+import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
-import { pollObjectMode, vec3 } from './helpers';
+import { pollObjectMode, resolveObjectIds, setSelection, vec3 } from './helpers';
 
 /*
  * Physics presets of the director's desk (MOTION owns this module; spec §4):
@@ -18,15 +30,26 @@ import { pollObjectMode, vec3 } from './helpers';
  *   desk.vehicle_drive    drive a vehicle along a path, wheels spinning, steering (phase 2)
  *
  * Bodies start at their RigidBodyData.start_frame with initial velocities (doc/types.ts); the
- * library is desk/physics. FOUNDATION wrote the ids, schemas and defaults; every operator throws
- * until MOTION implements it.
+ * library is desk/physics. Object references are ids or exact names; results give ids and names.
  */
 
-function notImplemented(id: string): () => never {
-  return () => {
-    throw new OperatorError(`${id} is not implemented yet`, 'FAILED');
-  };
+/** Resolves one object reference (id or exact name) to its id. */
+function objectId(ctx: OperatorContext, ref: string): string {
+  return resolveObjectIds(ctx, [ref])[0];
 }
+
+/** An object as results name it. */
+function named(ctx: OperatorContext, id: string): { object: string; name: string } {
+  return { object: id, name: ctx.doc.getObject(id)?.name ?? id };
+}
+
+/** Reports a preset's warnings and returns the world range it left. */
+function finish(ctx: OperatorContext, r: { world?: DeskWorldRange | null; warnings: string[] }) {
+  for (const w of r.warnings) ctx.report('WARNING', w);
+  return r.world ?? null;
+}
+
+const round3 = (v: Vec3): Vec3 => v.map((x) => Math.round(x * 1000) / 1000) as Vec3;
 
 const objectRef = z.string().describe('Object id or exact name');
 const objectRefs = z.array(objectRef).min(1).describe('Object ids or exact names');
@@ -43,7 +66,8 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       description:
         'Give objects rigid bodies: active (falls and collides), passive (a static collider such as a floor or a ' +
         'wall) or animated (follows its keys and pushes active bodies), with a ground collider at z = 0 when ' +
-        'none is under them. The rigid body world covers only the frames the bodies need. Returns {bodies, ground}.',
+        'none is under them. The rigid body world covers only the frames the bodies need. Returns {bodies (with ' +
+        'their collision_shape), ground, world: {frame_start, frame_end, settled}}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -56,21 +80,49 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         shape: z
           .enum(COLLISION_SHAPES as [CollisionShape, ...CollisionShape[]])
           .optional()
-          .describe('Collision shape (default: CONVEX_HULL for active bodies, MESH for passive ones)'),
+          .describe(
+            'Collision shape (default: SPHERE for balls, BOX for other active and animated bodies, MESH for ' +
+              'passive ones; an existing body keeps its shape)',
+          ),
         mass: z.number().min(0.001).max(1e9).optional().describe('Mass in kg (default 1)'),
-        friction: z.number().min(0).max(100).optional().describe('Friction coefficient (default 0.5)'),
+        friction: z
+          .number()
+          .min(0)
+          .max(100)
+          .optional()
+          .describe('Friction coefficient (default 0.5, balls 0.6; the desk ground uses 1)'),
         restitution: z
           .number()
           .min(0)
           .max(10)
           .optional()
-          .describe('Bounciness: 0 none, 1 elastic (default 0)'),
+          .describe('Bounciness: 0 none, 1 elastic (default 0, balls 0.6)'),
         ground: z
           .boolean()
           .default(true)
           .describe('Add a passive ground collider at z = 0 when no collider is under the objects'),
       }),
-      execute: notImplemented('desk.physics_setup'),
+      execute(ctx, p) {
+        const ids = [...new Set(resolveObjectIds(ctx, p.objects))];
+        const r = deskPhysicsSetup(ctx.doc, ids, {
+          kind: p.kind,
+          shape: p.shape,
+          mass: p.mass,
+          friction: p.friction,
+          restitution: p.restitution,
+          ground: p.ground,
+        });
+        const world = finish(ctx, r);
+        setSelection(ctx, r.bodies);
+        return {
+          bodies: r.bodies.map((id) => ({
+            ...named(ctx, id),
+            collision_shape: ctx.doc.getObject(id)?.rigid_body?.collision_shape ?? null,
+          })),
+          ground: r.ground ? named(ctx, r.ground) : null,
+          world,
+        };
+      },
     }),
   );
 
@@ -80,7 +132,7 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       label: 'Drop',
       description:
         'Lift objects by `height` (default: where they are) and let them fall from `frame`: their rigid bodies start ' +
-        'there (start_frame), held at their keyed pose before. Returns the bodies.',
+        'there (start_frame), held at their keyed pose before. Returns {bodies, frame, world}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -94,7 +146,12 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
           .optional()
           .describe('Metres to lift them before the drop (default 0)'),
       }),
-      execute: notImplemented('desk.physics_drop'),
+      execute(ctx, p) {
+        const ids = [...new Set(resolveObjectIds(ctx, p.objects))];
+        const r = deskPhysicsDrop(ctx.doc, ids, { frame: p.frame, height: p.height });
+        const world = finish(ctx, r);
+        return { bodies: r.bodies.map((id) => named(ctx, id)), frame: p.frame, world };
+      },
     }),
   );
 
@@ -104,7 +161,8 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       label: 'Throw',
       description:
         'Release an object at `frame` with the launch velocity that lands it on `target` after flight_s seconds ' +
-        'under gravity (its rigid body starts there with that velocity and spin). Returns {velocity, landing_frame}.',
+        'under gravity (its rigid body starts there with that velocity and spin). Returns {body, velocity, ' +
+        'speed_mps, landing_frame, world}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -115,7 +173,24 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         flight_s: z.number().positive().max(60).default(1).describe('Seconds in the air'),
         spin: vec3.optional().describe('Spin in radians per second about world X, Y and Z (default none)'),
       }),
-      execute: notImplemented('desk.physics_throw'),
+      execute(ctx, p) {
+        const id = objectId(ctx, p.object);
+        const target: Vec3 | string = typeof p.target === 'string' ? objectId(ctx, p.target) : p.target;
+        if (target === id) throw new OperatorError('An object cannot be thrown at itself', 'INVALID_PARAMS');
+        const r = deskPhysicsThrow(ctx.doc, id, target, {
+          frame: p.frame,
+          flight_s: p.flight_s,
+          spin: p.spin,
+        });
+        const world = finish(ctx, r);
+        return {
+          body: named(ctx, r.body),
+          velocity: round3(r.velocity),
+          speed_mps: Math.round(Math.hypot(...r.velocity) * 1000) / 1000,
+          landing_frame: Math.round(r.landing_frame * 1000) / 1000,
+          world,
+        };
+      },
     }),
   );
 
@@ -125,7 +200,7 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       label: 'Push',
       description:
         'Push an object at `frame`: its rigid body starts there moving along `direction` at speed_mps. Returns ' +
-        '{velocity}.',
+        '{body, velocity, world}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -135,7 +210,15 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         speed_mps: z.number().min(0).max(1000).describe('Speed in m/s'),
         frame: frameSchema.describe('Frame of the push'),
       }),
-      execute: notImplemented('desk.physics_push'),
+      execute(ctx, p) {
+        const r = deskPhysicsPush(ctx.doc, objectId(ctx, p.object), {
+          direction: p.direction,
+          speed_mps: p.speed_mps,
+          frame: p.frame,
+        });
+        const world = finish(ctx, r);
+        return { body: named(ctx, r.body), velocity: round3(r.velocity), world };
+      },
     }),
   );
 
@@ -145,7 +228,8 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       label: 'Bake Physics',
       description:
         'Bake the simulation of rigid bodies to world-space keyframes over a frame range (default: the frames the ' +
-        'bodies need), so renders and exports need no simulation. Returns {objects, keyframes, frame_start, frame_end}.',
+        'bodies need), so renders and exports need no simulation; the rigid bodies and the hold constraints of ' +
+        'held props are removed. Returns {objects, keyframes, frame_start, frame_end, removed_constraints}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -154,7 +238,21 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         frame_end: frameSchema.optional().describe('Last frame to bake (default: the simulation end)'),
         objects: z.array(objectRef).optional().describe('Bodies to bake (default: every simulated body)'),
       }),
-      execute: notImplemented('desk.physics_bake'),
+      execute(ctx, p) {
+        const objects = p.objects?.length ? [...new Set(resolveObjectIds(ctx, p.objects))] : undefined;
+        const r = deskPhysicsBake(ctx.doc, { frame_start: p.frame_start, frame_end: p.frame_end, objects });
+        for (const w of r.warnings) ctx.report('WARNING', w);
+        return {
+          objects: r.objects.map((id) => named(ctx, id)),
+          keyframes: r.keyframes,
+          frame_start: r.frame_start,
+          frame_end: r.frame_end,
+          removed_constraints: Object.entries(r.removed_constraints).map(([id, names]) => ({
+            ...named(ctx, id),
+            constraints: names,
+          })),
+        };
+      },
     }),
   );
 
@@ -165,7 +263,8 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       description:
         "Fly a kite or balloon on a string tied to an anchor (an actor's hand bone, a post) in the wind (phase 2): " +
         'it rises over launch_frames to the end of the string, then sways, keyed on every frame, with a string ' +
-        'from the anchor and a tail that trails. Returns {flyer, string, tail, frame_end}.',
+        'from the anchor and a tail that trails. Returns {flyer, kind, string, tail, tail_objects, frame_start, ' +
+        'frame_end, seed, mean_elevation_deg, keyframes}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -193,12 +292,32 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
           .min(0)
           .max(100_000)
           .optional()
-          .describe('Frames it takes to rise to the end of the string (default: about 2 s)'),
+          .describe(
+            'Frames it takes to rise to the end of the string (default: the string paid out at 2.5 m/s, at ' +
+              'least 2 s; 0: on the whole string from the start)',
+          ),
         tail: z.boolean().default(true).describe('Add a tail that trails behind it'),
         string: z.boolean().default(true).describe('Add the string from the anchor'),
         seed: z.number().int().min(0).optional().describe('Seed of the gusts (default: from the flyer)'),
       }),
-      execute: notImplemented('desk.tether_fly'),
+      execute(ctx, p) {
+        const flyer = objectId(ctx, p.flyer);
+        const anchor = objectId(ctx, p.anchor);
+        const r = deskTetherFly(ctx.doc, { ...p, flyer, anchor });
+        for (const w of r.warnings) ctx.report('WARNING', w);
+        return {
+          flyer: named(ctx, r.flyer),
+          kind: r.kind,
+          string: r.string ? named(ctx, r.string) : null,
+          tail: r.tail ? named(ctx, r.tail) : null,
+          tail_objects: r.tail_objects.map((id) => named(ctx, id)),
+          frame_start: p.frame_start,
+          frame_end: r.frame_end,
+          seed: r.seed,
+          mean_elevation_deg: r.mean_elevation_deg,
+          keyframes: r.keyframes,
+        };
+      },
     }),
   );
 
@@ -209,7 +328,8 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       description:
         'Drive a vehicle (a store model with body, wheel.* and steer.* parts) along a path from frame_start (phase ' +
         '2): the vehicle keyed along the path, its wheels spinning with the distance and its front wheels steering ' +
-        'into the turns. Give speed_mps or frame_end. Returns {frame_end, length_m}.',
+        'into the turns. Give speed_mps or frame_end. Returns {vehicle, frame_start, frame_end, length_m, ' +
+        'speed_mps, wheels, steering, keyframes}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -224,7 +344,30 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         speed_mps: z.number().positive().max(100).optional().describe('Speed in m/s'),
         frame_end: frameSchema.optional().describe('Frame the drive ends (instead of speed_mps)'),
       }),
-      execute: notImplemented('desk.vehicle_drive'),
+      execute(ctx, p) {
+        if (p.speed_mps !== undefined && p.frame_end !== undefined)
+          throw new OperatorError('Give speed_mps or frame_end, not both', 'INVALID_PARAMS');
+        const vehicle = objectId(ctx, p.vehicle);
+        const r = deskVehicleDrive(ctx.doc, vehicle, p.points, {
+          frame_start: p.frame_start,
+          speed_mps: p.speed_mps,
+          frame_end: p.frame_end,
+        });
+        for (const w of r.warnings) ctx.report('WARNING', w);
+        return {
+          vehicle: named(ctx, vehicle),
+          frame_start: p.frame_start,
+          frame_end: r.frame_end,
+          length_m: Math.round(r.length_m * 1000) / 1000,
+          speed_mps: Math.round(r.speed_mps * 1000) / 1000,
+          wheels: r.wheels.map((w) => ({
+            ...named(ctx, w.id),
+            radius_m: Math.round(w.radius * 1000) / 1000,
+          })),
+          steering: r.steering.map((id) => named(ctx, id)),
+          keyframes: r.keyframes,
+        };
+      },
     }),
   );
 }

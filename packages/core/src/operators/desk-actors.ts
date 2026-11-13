@@ -1,8 +1,23 @@
 import { z } from 'zod';
-import { ACTOR_GAITS, ACTOR_KINDS, ACTOR_POSES } from '../desk/characters';
+import type { Vec3 } from '../math/types';
+import {
+  ACTOR_GAITS,
+  ACTOR_KINDS,
+  ACTOR_POSES,
+  BUILT_KINDS,
+  applyPose,
+  createActor,
+  faceTo,
+  isActor,
+  moveAlongPath,
+} from '../desk/characters';
+import { holdObject, lookAtObject, mountActor } from '../desk/characters/attach';
+import { actorPosition } from '../desk/characters/locomotion';
+import { FrameState } from '../eval/frame-state';
+import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
-import { pollObjectMode, vec3 } from './helpers';
+import { pollObjectMode, resolveObjectIds, setSelection, vec3 } from './helpers';
 
 /*
  * Actor operators of the director's desk (CHARACTERS owns this module; spec §4, §8):
@@ -15,16 +30,27 @@ import { pollObjectMode, vec3 } from './helpers';
  *   desk.actor_hold      take a prop in a hand (and release it)
  *   desk.actor_mount     ride a horse, pony, donkey or cow (and get off)
  *
- * The library is desk/characters. FOUNDATION wrote the ids, schemas and defaults; every operator
- * throws until CHARACTERS implements it. Facings are degrees about +Z, 0 facing the front (−Y), 90
- * facing +X (rideo's facingDeg).
+ * The library is desk/characters. Actors are named by id or exact name (a part names its actor).
+ * Facings are degrees about +Z, 0 facing the front (−Y), 90 facing +X (rideo's facingDeg).
  */
 
-function notImplemented(id: string): () => never {
-  return () => {
-    throw new OperatorError(`${id} is not implemented yet`, 'FAILED');
-  };
+/** An actor's armature object id (by id or exact name; a part resolves to its actor), or an error. */
+function actorId(ctx: OperatorContext, ref: string): string {
+  const id = resolveObjectIds(ctx, [ref])[0];
+  if (isActor(ctx.doc, id)) return id;
+  const o = ctx.doc.getObject(id);
+  const owner = o?.custom_props?.desk_actor;
+  if (typeof owner === 'string' && isActor(ctx.doc, owner)) return owner;
+  throw new OperatorError(
+    `'${o?.name ?? ref}' is not an actor (add one with desk.actor_add)`,
+    'INVALID_PARAMS',
+  );
 }
+
+const named = (ctx: OperatorContext, id: string) => ({ object: id, name: ctx.doc.getObject(id)?.name ?? id });
+
+/** The frame an operator acts at: the given one, else the current frame. */
+const frameOr = (ctx: OperatorContext, frame: number | undefined) => frame ?? ctx.state.frame;
 
 const actorRef = z.string().describe('Actor (its armature object) id or exact name');
 const poseEnum = z
@@ -49,8 +75,8 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
       label: 'Add Actor',
       description:
         'Add an actor: an ARMATURE with fixed bone names and a low-poly mesh part per bone in the actor colour ' +
-        '(darker joints, a nose so the facing reads), standing with its feet at `location`. Phase 1 builds adult, ' +
-        'man, woman, child, horse, pony and dog; the other kinds fail with a clear error until they are built. ' +
+        '(darker joints, a nose so the facing reads), standing with its feet at `location`. Built kinds: ' +
+        `${BUILT_KINDS.join(', ')}; the other kinds fail with a clear error until they are built. ` +
         'Returns {actor, parts, name}.',
       category: 'Desk',
       poll: pollObjectMode,
@@ -73,14 +99,30 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           .min(0.05)
           .max(8)
           .optional()
-          .describe('Standing height in metres (default per kind: adult 1.7, child 1.2, toddler 0.9 …)'),
+          .describe(
+            'Height in metres: people to the top of the head (adult 1.7, man 1.76, woman 1.64, child 1.2, ' +
+              'toddler 0.9, elder 1.65), animals at the withers / shoulder as they are measured (horse 1.6, ' +
+              'pony 1.2, dog 0.55)',
+          ),
         location: vec3.optional().describe('Where the feet stand, in metres (default: the 3D cursor)'),
         facing_deg: facingSchema
           .optional()
           .describe('Heading in degrees about +Z, 0 facing the front (−Y) (default 0)'),
         pose: poseEnum.optional().describe('Pose to start in (default stand)'),
       }),
-      execute: notImplemented('desk.actor_add'),
+      execute(ctx, p) {
+        const r = createActor(ctx.doc, {
+          kind: p.kind,
+          name: p.name,
+          color: p.color,
+          height_m: p.height_m,
+          location: (p.location ?? ctx.state.cursorLocation) as Vec3,
+          facing_deg: p.facing_deg,
+          pose: p.pose,
+        });
+        setSelection(ctx, [r.actor]);
+        return { actor: r.actor, parts: r.parts, name: r.name };
+      },
     }),
   );
 
@@ -107,7 +149,14 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           .optional()
           .describe('Frames the pose is held after `frame` (default: until the next key)'),
       }),
-      execute: notImplemented('desk.actor_pose'),
+      execute(ctx, p) {
+        const id = actorId(ctx, p.actor);
+        const frame = frameOr(ctx, p.frame);
+        applyPose(ctx.doc, id, p.pose, { frame, blend_frames: p.blend_frames, hold_frames: p.hold_frames });
+        const frames = [p.blend_frames > 0 ? frame - p.blend_frames : frame - 1, frame];
+        if (p.hold_frames) frames.push(frame + p.hold_frames);
+        return { ...named(ctx, id), pose: p.pose, frames };
+      },
     }),
   );
 
@@ -144,7 +193,18 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         face_path: z.boolean().default(true).describe('Turn to face along the path'),
         end_pose: poseEnum.optional().describe('Pose to blend into at the end (default stand)'),
       }),
-      execute: notImplemented('desk.actor_move'),
+      execute(ctx, p) {
+        const id = actorId(ctx, p.actor);
+        const r = moveAlongPath(ctx.doc, id, p.points as Vec3[], {
+          frame_start: p.frame_start,
+          speed_mps: p.speed_mps,
+          frame_end: p.frame_end,
+          gait: p.gait,
+          face_path: p.face_path,
+          end_pose: p.end_pose,
+        });
+        return { ...named(ctx, id), frame_end: r.frame_end, length_m: r.length_m };
+      },
     }),
   );
 
@@ -168,7 +228,32 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         frame: frameSchema.describe('Frame the turn ends'),
         turn_frames: z.number().int().min(0).max(1000).default(8).describe('Frames the turn takes'),
       }),
-      execute: notImplemented('desk.actor_face'),
+      execute(ctx, p) {
+        const id = actorId(ctx, p.actor);
+        if (p.facing_deg === undefined && p.target === undefined)
+          throw new OperatorError('Give facing_deg or target', 'INVALID_PARAMS');
+        let target: Vec3 | undefined;
+        if (typeof p.target === 'string') {
+          const t = resolveObjectIds(ctx, [p.target])[0];
+          if (t === id) throw new OperatorError('An actor cannot face itself', 'INVALID_PARAMS');
+          const m = new FrameState(ctx.doc, p.frame).world(t);
+          if (!m) throw new OperatorError(`'${p.target}' cannot be evaluated`, 'FAILED');
+          target = [m[12], m[13], m[14]];
+        } else if (p.target) target = p.target as Vec3;
+        faceTo(ctx.doc, id, {
+          facing_deg: target ? undefined : p.facing_deg,
+          target,
+          frame: p.frame,
+          turn_frames: p.turn_frames,
+        });
+        const m = new FrameState(ctx.doc, p.frame).world(id)!;
+        const facing = (Math.atan2(-m[4], m[5]) * 180) / Math.PI;
+        return {
+          ...named(ctx, id),
+          facing_deg: Math.round(facing * 1000) / 1000,
+          position: actorPosition(ctx.doc, id, p.frame),
+        };
+      },
     }),
   );
 
@@ -191,7 +276,16 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         frame: frameSchema.describe('Frame the look starts'),
         blend_frames: blendSchema.default(6),
       }),
-      execute: notImplemented('desk.actor_look_at'),
+      execute(ctx, p) {
+        const id = actorId(ctx, p.actor);
+        const target = p.target === null ? null : resolveObjectIds(ctx, [p.target])[0];
+        const r = lookAtObject(ctx.doc, id, target, { frame: p.frame, blend_frames: p.blend_frames });
+        return {
+          ...named(ctx, id),
+          target: target === null ? null : named(ctx, target),
+          constraint: r.constraint,
+        };
+      },
     }),
   );
 
@@ -213,7 +307,16 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         frame: frameSchema.describe('Frame the actor takes the prop'),
         release_frame: frameSchema.optional().describe('Frame the actor lets go (default: never)'),
       }),
-      execute: notImplemented('desk.actor_hold'),
+      execute(ctx, p) {
+        const id = actorId(ctx, p.actor);
+        const prop = resolveObjectIds(ctx, [p.prop])[0];
+        const r = holdObject(ctx.doc, id, prop, {
+          hand: p.hand,
+          frame: p.frame,
+          release_frame: p.release_frame,
+        });
+        return { ...named(ctx, id), prop: named(ctx, prop), constraint: r.constraint, bone: r.bone };
+      },
     }),
   );
 
@@ -233,7 +336,12 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         frame: frameSchema.describe('Frame the rider is in the saddle'),
         dismount_frame: frameSchema.optional().describe('Frame the rider gets off (default: never)'),
       }),
-      execute: notImplemented('desk.actor_mount'),
+      execute(ctx, p) {
+        const rider = actorId(ctx, p.rider);
+        const mountId = actorId(ctx, p.mount);
+        const r = mountActor(ctx.doc, rider, mountId, { frame: p.frame, dismount_frame: p.dismount_frame });
+        return { rider: named(ctx, rider), mount: named(ctx, mountId), constraint: r.constraint };
+      },
     }),
   );
 }

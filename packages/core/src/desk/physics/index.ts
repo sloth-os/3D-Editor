@@ -1,17 +1,18 @@
 import type { Vec3 } from '../../math/types';
 import type { SceneDoc } from '../../doc/scene-doc';
 import type { CollisionShape } from '../../doc/types';
-import { OperatorError } from '../../operators/context';
+import { deskBake, deskBakePlan, type DeskBakeResult } from './bake';
+import { deskDrop, deskPhysicsSetupBodies, deskPush, deskThrow, type DeskWorldRange } from './presets';
+import { tetherFly, type TetherResult } from './tether';
+import { vehicleDrive, type VehicleResult } from './vehicle';
 
 /*
- * Physics presets of the director's desk (MOTION owns this module and presets.ts, tether.ts,
- * vehicle.ts): the library behind the desk.physics_* operators (operators/desk-motion.ts). Bodies
- * start at their RigidBodyData.start_frame with initial velocities (doc/types.ts; the simulation
- * keeps a body kinematic until then), and the presets set the rigid body world's range to the
- * frames they need (frame_start = min(start_frame) − 1), never the whole scene range.
- *
- * FOUNDATION wrote the names and signatures; every function throws until MOTION implements it.
- * The names follow the operator ids:
+ * Physics presets of the director's desk (MOTION owns this module and presets.ts, bake.ts, tether.ts,
+ * vehicle.ts, common.ts, estimate.ts): the library behind the desk.physics_* operators
+ * (operators/desk-motion.ts). Bodies start at their RigidBodyData.start_frame with initial velocities
+ * (doc/types.ts; the simulation keeps a body animated until then, physics/simulation.ts), and the
+ * presets set the rigid body world's range to the frames they need (frame_start = min(start_frame) −
+ * 1, ending when the bodies have come to rest), never the whole scene range.
  *
  *   deskPhysicsSetup   desk.physics_setup   rigid bodies (+ a ground collider) on objects
  *   deskPhysicsDrop    desk.physics_drop    lift and release objects at a frame
@@ -20,7 +21,42 @@ import { OperatorError } from '../../operators/context';
  *   deskPhysicsBake    desk.physics_bake    simulated motion to world-space keyframes
  *   deskTetherFly      desk.tether_fly      a kite / balloon on a string from an anchor (phase 2)
  *   deskVehicleDrive   desk.vehicle_drive   a vehicle along a path, wheels spinning, steering (phase 2)
+ *
+ * Object references are ids (the operators resolve names). Every function changes the document and
+ * returns what it did, with warnings for the operator to report.
  */
+
+export {
+  DESK_BALL_SETTINGS,
+  DESK_SETTLE_FALLBACK_SECONDS,
+  DESK_SETTLE_MAX_SECONDS,
+  ballisticVelocity as deskBallisticVelocity,
+  flightCoefficients as deskFlightCoefficients,
+  guessShape as deskGuessShape,
+  isBallLike as deskIsBallLike,
+  updateDeskWorldRange,
+  type DeskWorldRange,
+} from './presets';
+export { DESK_BAKE_MAX_BODY_FRAMES, deskBakePlan, type DeskBakePlan, type DeskBakeResult } from './bake';
+export {
+  TETHER_MAX_FRAMES,
+  TETHER_MAX_OBJECT_FRAMES,
+  TETHER_STRING_RADIUS,
+  TETHER_TAIL_SEGMENTS,
+  seedFromName as deskTetherSeed,
+  windModel as deskWindModel,
+  type TetherResult,
+} from './tether';
+export {
+  VEHICLE_DEFAULT_MPS,
+  VEHICLE_EASE_SECONDS,
+  VEHICLE_MAX_FRAMES,
+  VEHICLE_MAX_STEER,
+  drivenDistance as deskDrivenDistance,
+  vehicleRig as deskVehicleRig,
+  type VehicleResult,
+  type VehicleWheel,
+} from './vehicle';
 
 /** How desk.physics_setup simulates objects: dynamic, static colliders, or animated colliders. */
 export const DESK_PHYSICS_KINDS = ['active', 'passive', 'animated'] as const;
@@ -62,69 +98,78 @@ export interface DeskTetherFlyOptions {
   seed?: number;
 }
 
-function notImplemented(name: string): never {
-  throw new OperatorError(`${name} is not implemented yet`, 'FAILED');
+/** What a preset did to the rigid body world, and what the operator reports. */
+interface PresetReport {
+  /** The rigid body world's range afterwards (null: the scene has no simulated body). */
+  world: DeskWorldRange | null;
+  warnings: string[];
 }
 
-/** Gives `objectIds` rigid bodies of `kind` (and a ground collider); returns the bodies and the ground. */
+/**
+ * Gives `objectIds` rigid bodies of `kind` (a model's root: its mesh part) and a ground collider under
+ * them; returns the bodies and the ground (null: none needed or asked for).
+ */
 export function deskPhysicsSetup(
-  _doc: SceneDoc,
-  _objectIds: readonly string[],
-  _o: DeskPhysicsSetupOptions,
-): { bodies: string[]; ground: string | null } {
-  return notImplemented('deskPhysicsSetup');
+  doc: SceneDoc,
+  objectIds: readonly string[],
+  o: DeskPhysicsSetupOptions,
+): { bodies: string[]; ground: string | null } & PresetReport {
+  return deskPhysicsSetupBodies(doc, objectIds, o);
 }
 
 /** Lifts `objectIds` by `height` (default: where they are) and releases them at `frame`. */
 export function deskPhysicsDrop(
-  _doc: SceneDoc,
-  _objectIds: readonly string[],
-  _o: { frame: number; height?: number },
-): { bodies: string[] } {
-  return notImplemented('deskPhysicsDrop');
+  doc: SceneDoc,
+  objectIds: readonly string[],
+  o: { frame: number; height?: number },
+): { bodies: string[] } & PresetReport {
+  return deskDrop(doc, objectIds, o);
 }
 
 /** Releases `objectId` at `frame` with the velocity that lands it on `target` (a point or an object) after flight_s. */
 export function deskPhysicsThrow(
-  _doc: SceneDoc,
-  _objectId: string,
-  _target: Vec3 | string,
-  _o: DeskThrowOptions,
-): { velocity: Vec3; landing_frame: number } {
-  return notImplemented('deskPhysicsThrow');
+  doc: SceneDoc,
+  objectId: string,
+  target: Vec3 | string,
+  o: DeskThrowOptions,
+): { body: string; velocity: Vec3; landing_frame: number } & PresetReport {
+  return deskThrow(doc, objectId, target, o);
 }
 
 /** Pushes `objectId` along `direction` at speed_mps from `frame`. */
 export function deskPhysicsPush(
-  _doc: SceneDoc,
-  _objectId: string,
-  _o: { direction: Vec3; speed_mps: number; frame: number },
-): { velocity: Vec3 } {
-  return notImplemented('deskPhysicsPush');
+  doc: SceneDoc,
+  objectId: string,
+  o: { direction: Vec3; speed_mps: number; frame: number },
+): { body: string; velocity: Vec3 } & PresetReport {
+  return deskPush(doc, objectId, o);
 }
 
 /** Bakes the simulation of `objects` (default: every simulated body) to world-space keyframes. */
 export function deskPhysicsBake(
-  _doc: SceneDoc,
-  _o: { frame_start?: number; frame_end?: number; objects?: readonly string[] },
-): { objects: string[]; keyframes: number; frame_start: number; frame_end: number } {
-  return notImplemented('deskPhysicsBake');
+  doc: SceneDoc,
+  o: { frame_start?: number; frame_end?: number; objects?: readonly string[] },
+): DeskBakeResult {
+  return deskBake(doc, deskBakePlan(doc, o));
 }
 
-/** Flies `flyer` on a string from `anchor` in the wind (phase 2). */
-export function deskTetherFly(
-  _doc: SceneDoc,
-  _o: DeskTetherFlyOptions,
-): { flyer: string; string: string | null; tail: string | null; frame_end: number } {
-  return notImplemented('deskTetherFly');
+/**
+ * Flies `flyer` on a string from `anchor` in the wind (phase 2): keys the flyer, its string and its
+ * tail on every frame of the flight (desk/physics/tether.ts).
+ */
+export function deskTetherFly(doc: SceneDoc, o: DeskTetherFlyOptions): TetherResult {
+  return tetherFly(doc, o);
 }
 
-/** Drives `vehicleId` through `points` (wheels spin, front wheels steer) (phase 2). */
+/**
+ * Drives `vehicleId` through `points` (wheels spin, front wheels steer) (phase 2): keys the vehicle,
+ * its wheels and its steering pivots on every frame of the drive (desk/physics/vehicle.ts).
+ */
 export function deskVehicleDrive(
-  _doc: SceneDoc,
-  _vehicleId: string,
-  _points: readonly Vec3[],
-  _o: { frame_start: number; speed_mps?: number; frame_end?: number },
-): { frame_end: number; length_m: number } {
-  return notImplemented('deskVehicleDrive');
+  doc: SceneDoc,
+  vehicleId: string,
+  points: readonly Vec3[],
+  o: { frame_start: number; speed_mps?: number; frame_end?: number },
+): VehicleResult {
+  return vehicleDrive(doc, vehicleId, points, o);
 }

@@ -21,6 +21,7 @@ import {
   isAnimatable,
   propertyLength,
   readChannel,
+  cameraForFrame,
   FrameState,
   OperatorError,
   BROWSER_UI_OPERATORS,
@@ -2624,7 +2625,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .max(MAX_RENDER_SIZE)
         .optional()
         .describe('Default: from the render resolution aspect ratio'),
-      camera: z.string().optional().describe('Camera object id or name'),
+      camera: z
+        .string()
+        .optional()
+        .describe(
+          "Camera object id or name, or 'shots': the camera of the director's-desk shot that covers the frame (the scene camera where none does)",
+        ),
       view: strictArgObject({
         position: vec3.describe('Eye position (world space, metres)'),
         target: vec3.describe('Point looked at (world space)'),
@@ -2686,13 +2692,14 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           MAX_RENDER_SIZE,
           Math.max(16, Math.round((width * rs.resolution_y) / Math.max(1, rs.resolution_x))),
         );
+      const frame = a.frame ?? p.state.frame;
       let cameraId: string | undefined;
-      if (a.camera) {
+      if (a.camera === 'shots') cameraId = cameraForFrame(p.scene, frame) ?? undefined;
+      else if (a.camera) {
         const cam = requireObject(p, a.camera);
         if (cam.type !== 'CAMERA') throw new ToolError(`'${cam.name}' is not a camera.`);
         cameraId = cam.id;
       }
-      const frame = a.frame ?? p.state.frame;
       const engine = a.engine ?? rs.engine;
       if (a.view?.lens !== undefined && a.view.fov_degrees !== undefined)
         throw new ToolError(
@@ -2941,7 +2948,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .max(MAX_ANIMATION_SIZE)
         .optional()
         .describe('Frame height in pixels (default: from width and the render aspect)'),
-      camera: z.string().optional().describe('Camera object id or name (default: the scene camera)'),
+      camera: z
+        .string()
+        .optional()
+        .describe(
+          "Camera object id or name (default: the scene camera), or 'shots': each frame through the camera of the director's-desk shot that covers it (the scene camera where none does)",
+        ),
       engine: engineArg,
       shading: z
         .enum(['SOLID', 'MATERIAL'])
@@ -2999,7 +3011,13 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           `Too many frames (${total}, at most ${MAX_RENDER_FRAMES}): shorten the range or raise frame_step.`,
         );
       let cameraId: string | undefined;
-      if (a.camera) {
+      let cameras: (string | undefined)[] | undefined;
+      if (a.camera === 'shots')
+        cameras = Array.from(
+          { length: total },
+          (_, i) => cameraForFrame(p.scene, start + i * a.frame_step) ?? undefined,
+        );
+      else if (a.camera) {
         const cam = requireObject(p, a.camera);
         if (cam.type !== 'CAMERA')
           throw new ToolError(`'${cam.name}' is a ${cam.type} object, not a camera.`);
@@ -3033,6 +3051,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
             denoise: a.denoise,
             seed: a.seed,
           },
+          cameras,
           frame_time_limit: a.frame_time_limit,
           time_limit: a.time_limit,
           animated_seed: a.animated_seed,

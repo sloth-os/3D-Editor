@@ -71,8 +71,8 @@ export interface FrameOptions {
   /** The rigid body simulation at `frame`, computed once (threads simulate themselves without it). */
   physics?: PhysicsFrame;
   /**
-   * Director desk frame options of video exports (SPEC §9): look, shadows, AO, MSAA and the extra
-   * passes. Not implemented yet: render processes ignore it.
+   * Director desk frame options of video exports (SPEC §9): look, shadows, AO, MSAA, the extra
+   * passes (`ImageResult.passes`) and the frame's metadata (`ImageResult.meta`). RASTER only.
    */
   desk?: DeskFrameOptions;
 }
@@ -89,16 +89,54 @@ export interface DeskFrameOptions {
   /** World box the sun's shadow map covers (default: fitted to the view). */
   shadowFit?: { min: Vec3Tuple; max: Vec3Tuple };
   passes: PassName[];
-  /** Depth pass distances mapped to 0 and 255, in metres. */
+  /**
+   * Depth pass distances (m): `[near, far]`; inverse depth between them maps to 255…0 (see
+   * passes.ts depthToBytes). Default: the camera's clipping range.
+   */
   depthRange?: [number, number];
-  /** Mask pass colour per object id (others: background). */
+  /**
+   * The job's mask palette: a colour (0–255 RGB) per object group, in palette order. The mask pass
+   * byte of a group is its 1-based position in the record's key order (at most 255 entries; 0 =
+   * nothing drawn). A drawn object belongs to the group of its nearest ancestor-or-self in the
+   * record, or to its actor's (desk_actor); an object of no group is 0.
+   */
   objectPalette?: Record<string, [number, number, number]>;
   /** Object ids whose screen boxes `ImageResult.meta.subjects` reports. */
   subjects?: string[];
   /** Actor (armature object) ids whose skeletons the pose pass draws. */
   poseActors?: string[];
-  /** Objects drawn as screen-space lines (tether strings, at least 2 px wide). */
+  /**
+   * Objects drawn as screen-space lines along their geometry (tether strings): at least 2 px wide,
+   * colour in display sRGB 0–1, into the beauty image and the mask, edges and pose passes.
+   */
   lines?: { object: string; width_px: number; color: [number, number, number] }[];
+}
+
+/** What a render process measures for one shot of a video export (request `desk-shot`). */
+export interface DeskShotOptions {
+  /** Scene frames of the shot to sample. */
+  frames: number[];
+  /** The shot's camera (object id or name). */
+  cameraId: string;
+  /** Output width / height. */
+  aspect: number;
+}
+
+/** The per-shot settings of a video export (answer to `desk-shot`). */
+export interface DeskShotInfo {
+  /**
+   * Depth pass range (m): the nearest and farthest distances from the camera to the scene's
+   * rendered bounds over the sampled frames, inside the camera's clipping range.
+   */
+  depthRange: [number, number];
+  /**
+   * The world box the sun's shadow map covers for the whole shot (stable shadows): the rendered
+   * bounds of the sampled frames without huge objects (grounds, sky domes), null when there is
+   * nothing else.
+   */
+  shadowFit: { min: Vec3Tuple; max: Vec3Tuple } | null;
+  /** Milliseconds spent. */
+  ms: number;
 }
 
 /** Camera and subject boxes of a rendered frame (computed in the render process). */
@@ -240,6 +278,8 @@ export type WorkerRequest =
   | { type: 'apng-finish'; id: number; job: number }
   /** Simulates the rigid body world up to the given frames and returns their matrices. */
   | { type: 'simulate'; id: number; doc: DocRef; frames: number[] }
+  /** Measures the per-shot settings of a video export (depth range, shadow box). */
+  | { type: 'desk-shot'; id: number; doc: DocRef; options: DeskShotOptions }
   /** Exports the document (glTF, OBJ, STL, PLY) off the event loop. */
   | { type: 'export'; id: number; doc: DocRef; format: ExportFormat; options: ExportJobOptions }
   /** Drops the cached documents (an idle thread frees its memory; no response). */
@@ -307,6 +347,7 @@ export type WorkerResult =
   | EncodedResult
   | SimulatedFrames
   | ExportedFile
+  | DeskShotInfo
   | { ok: true };
 
 /**

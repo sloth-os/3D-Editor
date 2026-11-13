@@ -24,8 +24,9 @@ import { base64Encode } from '../src/util/json';
 
 /*
  * The operators of the director's desk and the model store (spec §4): FOUNDATION registers every
- * id with its full schema, defaults and memory estimate, and an execute that fails with
- * "<id> is not implemented yet" (FAILED) until its workstream implements it.
+ * id with its full schema, defaults and memory estimate; each workstream implements its own (an
+ * operator not implemented yet fails with "<id> is not implemented yet", FAILED). The shot
+ * operators (DESK-CORE) are implemented and tested in desk-shot-operators.test.ts.
  */
 
 afterEach(() => setOperatorMemoryCheck(null));
@@ -62,6 +63,8 @@ const MOTION = [
 ];
 const STORE = ['store.add', 'store.search', 'store.insert_files'];
 const READ_ONLY = ['desk.check', 'desk.export_rideo_blocking', 'store.search'];
+/** The shot operators DESK-CORE implements (all but the phase-2 rideo import and export). */
+const SHOT_OPERATORS = SHOTS.filter((id) => !id.includes('rideo'));
 
 const OBJ = base64Encode(new TextEncoder().encode('v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n'));
 
@@ -255,11 +258,15 @@ describe('desk and store operators', () => {
       );
   });
 
-  it('fail with FAILED and "<id> is not implemented yet" until implemented', () => {
-    const { reg, ctx } = setup();
+  it('run with their sample parameters, or fail with an operator error (FAILED while not implemented)', () => {
     for (const [id, params] of Object.entries(SAMPLE)) {
+      const { reg, ctx } = setup();
       const res = reg.run(ctx, id, params);
-      expect(res, id).toMatchObject({ ok: false, code: 'FAILED', error: `${id} is not implemented yet` });
+      if (SHOT_OPERATORS.includes(id)) expect(res, `${id}: ${res.error}`).toMatchObject({ ok: true });
+      else if (!res.ok && res.error?.includes('not implemented yet'))
+        expect(res, id).toMatchObject({ code: 'FAILED', error: `${id} is not implemented yet` });
+      // a refusal names its reason with a code; anything else escaped the operator
+      else if (!res.ok) expect(res.code, `${id}: ${res.error}`).toBeTypeOf('string');
     }
   });
 
@@ -270,7 +277,10 @@ describe('desk and store operators', () => {
       ok: false,
       code: 'POLL_FAILED',
     });
-    expect(reg.run(ctx, 'store.search', {})).toMatchObject({ code: 'FAILED' });
+    expect(reg.run(ctx, 'desk.shot_add', {})).toMatchObject({ ok: false, code: 'POLL_FAILED' });
+    // read-only operators run in any mode
+    expect(reg.run(ctx, 'desk.check', {})).toMatchObject({ ok: true });
+    expect(reg.run(ctx, 'store.search', {}).code).not.toBe('POLL_FAILED');
   });
 });
 
@@ -357,7 +367,7 @@ describe('desk and store memory estimates', () => {
     });
     expect(asked[0].objects).toBe(DESK_ACTOR_MAX_OBJECTS);
     // operators without an estimate are not asked about
-    expect(t.reg.run(t.ctx, 'desk.shot_move', SAMPLE['desk.shot_move'])).toMatchObject({ code: 'FAILED' });
+    expect(t.reg.run(t.ctx, 'desk.shot_move', SAMPLE['desk.shot_move'])).toMatchObject({ ok: true });
     expect(asked).toHaveLength(1);
   });
 });

@@ -5,7 +5,7 @@ import type { SceneDoc } from '../doc/scene-doc';
 import type { MaterialData, WorldSettings } from '../doc/types';
 import type { MeshData } from '../mesh/types';
 import { meshBounds } from '../mesh/types';
-import { proceduralSurface } from '../material/surface';
+import { proceduralSurface, type ProceduralSurface } from '../material/surface';
 import { evaluatedOrco } from '../material/orco';
 import { prepareSky, sampleSkyModel, sampleSkyPixel, skyIrradianceSH, skySun, type SkyModel } from './sky';
 import {
@@ -21,7 +21,7 @@ import { SceneEvaluator, type EvaluatedScene } from '../eval/evaluate';
 import { evaluatedBounds } from '../io/common';
 import { renderItems, type RenderItem } from '../eval/renderables';
 import { sniffImageMime } from '../io/image-info';
-import { linearToSrgbByte, srgbToLinear } from './color';
+import { ditherThreshold, linearToSrgb255, linearToSrgbByte, srgbToLinear } from './color';
 import { decodePNG as decodePNGImpl, encodePNG as encodePNGImpl } from './png';
 import {
   LIGHT_AREA,
@@ -30,8 +30,10 @@ import {
   LIGHT_STRIDE,
   LIGHT_SUN,
   Rasterizer,
+  SHADE_DEPTH,
   SHADE_MATERIAL,
   SHADE_SOLID,
+  type PixelBuffers,
   type SampledTexture,
   type SurfaceMaterial,
   type WorldVertices,
@@ -45,6 +47,16 @@ import {
   type RenderView,
 } from './view';
 import type { RenderEngine } from '../doc/types';
+import { pooledFloat32, pooledUint32 } from './buffers';
+import {
+  buildSpotShadow,
+  buildSunShadow,
+  type DepthPass,
+  type ShadowCaster,
+  type ShadowMap,
+} from './shadows';
+import { ambientOcclusion, applyAmbientOcclusion } from './ao';
+import { drawLines, type ScreenLine } from './lines';
 import {
   filmToRGBA8,
   renderPathTracedImage,
@@ -80,7 +92,16 @@ import {
  */
 
 export { decodePNG } from './png';
-export { autoFrameView } from './view';
+export { autoFrameView, type RenderView } from './view';
+export * from './aov';
+export { releaseRenderBuffers } from './buffers';
+export {
+  SUN_SHADOW_MAP_SIZE,
+  SPOT_SHADOW_MAP_SIZE,
+  SHADOW_DISTANCE_SCALE,
+  fitSunShadow,
+  type SunShadowExtent,
+} from './shadows';
 // the STUDIO / IMAGE world as the renderers see it (the web viewport lights WebGL renders with it)
 export { environmentLighting, sampleEnvironmentBackground, type EnvironmentLighting } from './env-light';
 export * from './sky';
@@ -171,6 +192,85 @@ export interface SoftwareRenderOptions {
    * frame of an animation reuses its geometry and simulation caches.
    */
   evaluator?: SceneEvaluator;
+  // ------------------------------------------------------------------ RASTER quality (opt-in)
+  // Every option below defaults to off and leaves the image exactly as without it.
+  /**
+   * RASTER: shadows of sun and spot lights (shadow maps; point and area lights cast none). `true`
+   * shadows every sun and spot light (the SKY world's sun included); `'scene'` follows the scene's
+   * `render.use_shadows` and each light's `use_shadow` (the sky sun follows `use_shadows`). The
+   * camera-relative studio rig never casts shadows. Default false.
+   */
+  shadows?: boolean | 'scene';
+  /** RASTER: screen-space ambient occlusion of the ambient / environment light. Default false. */
+  ao?: boolean;
+  /**
+   * RASTER with `ao`: how far (metres) ambient occlusion reaches. Default `defaultAoRadius` of the
+   * drawn items: a quarter of their median size, 5–50 cm, from each item's rest shape and scale
+   * (not its rotation or deformation, so it holds still while things turn and walk), but it does
+   * follow what the scene holds: adding or hiding objects anywhere, in view or not, can change
+   * it. Pass one value for every frame of a shot (as `shadowFit`) so the occlusion cannot change
+   * within it.
+   */
+  aoRadius?: number;
+  /**
+   * RASTER: shade once per output pixel and triangle (coverage and depth stay per sample, MSAA
+   * style) instead of once per sample: about 2× faster at `samples` 2 (measured on a 720p set of
+   * 11k triangles), nearly the same image.
+   */
+  msaa?: boolean;
+  /**
+   * RASTER: how samples are averaged into a pixel. 'box' (default) averages linear values;
+   * 'tonemap' weights each sample by 1 / (1 + luminance) first (less aliasing on bright edges).
+   */
+  resolve?: SoftwareResolve;
+  /** RASTER: deterministic ordered dither before quantizing to 8 bits (less banding). */
+  dither?: boolean;
+  /**
+   * RASTER: surface look. 'material' (default) renders the materials; 'clay' renders every surface
+   * as the same matte mid grey under the scene's lights (no emission or textures; glass stays
+   * clear, alpha-clipped and alpha-blended surfaces keep their alpha);
+   * 'solid' is the SOLID studio shading (like `shading: 'SOLID'`).
+   */
+  look?: SoftwareLook;
+  /**
+   * RASTER: world-space box the sun shadow map covers (else fitted to what the view shows). Pass
+   * the same box for every frame of a shot so the map does not move (no shadow swimming).
+   */
+  shadowFit?: ShadowFitBox;
+  /** RASTER: extra per-pixel passes returned in `RenderedImage.aovs` (not box filtered). */
+  aovs?: SoftwareAovName[];
+  /**
+   * RASTER: world-space segments drawn as anti-aliased screen-space lines of at least `width_px`
+   * pixels over the image (strings, tethers), hidden where opaque geometry is in front.
+   */
+  lines?: ScreenLine[];
+}
+
+/** How a RASTER render averages its samples into pixels (`SoftwareRenderOptions.resolve`). */
+export type SoftwareResolve = 'box' | 'tonemap';
+/** Surface look of a RASTER render (`SoftwareRenderOptions.look`). */
+export type SoftwareLook = 'material' | 'clay' | 'solid';
+/** Per-pixel passes a RASTER render can return (`SoftwareRenderOptions.aovs`). */
+export type SoftwareAovName = 'depth' | 'normal' | 'object';
+/** World-space box a sun shadow map is fitted to (`SoftwareRenderOptions.shadowFit`). */
+export interface ShadowFitBox {
+  min: Vec3;
+  max: Vec3;
+}
+
+/**
+ * Per-pixel passes of a RASTER render (row-major, top row first, `width × height` pixels; one
+ * value per pixel, three for `normal`). Not filtered: each pixel takes the nearest covered sample.
+ */
+export interface RenderAovs {
+  /** Linear distance from the camera plane (view depth, metres); Infinity where nothing is drawn. */
+  depth?: Float32Array;
+  /** View-space unit normal (x right, y up, z towards the camera); 0,0,0 where nothing is drawn. */
+  normal?: Float32Array;
+  /** Index into `objectTable` (0 = nothing drawn). */
+  object?: Uint32Array;
+  /** Object ids by index; entry 0 is '' (background). Instances map to their source object's id. */
+  objectTable?: string[];
 }
 
 export interface RenderedImage {
@@ -178,6 +278,13 @@ export interface RenderedImage {
   height: number;
   /** RGBA8 pixels, row-major, top row first. */
   data: Uint8ClampedArray;
+  /** RASTER: the passes asked for with `SoftwareRenderOptions.aovs`. */
+  aovs?: RenderAovs;
+  /**
+   * RASTER with `aovs` or `lines`: the view the image was rendered with (project points onto it,
+   * draw more `drawLines` over the passes).
+   */
+  view?: RenderView;
 }
 
 /**
@@ -276,6 +383,55 @@ function surfaceFromMaterial(
   };
 }
 
+/** Base colour (linear) and roughness of the clay look. */
+const CLAY_ALBEDO = 0.5;
+const CLAY_ROUGHNESS = 0.85;
+
+/**
+ * A material in the clay look: uniform matte light grey, no emission, textures or vertex colours;
+ * alpha clipping and blending keep their alpha (textures and procedural alpha included) and glass
+ * stays clear glass.
+ */
+function claySurface(m: MaterialData | null, textures: TextureCache): SurfaceMaterial {
+  const s = surfaceFromMaterial(m, false, textures);
+  const glass = (s.transmission ?? 0) > 0;
+  const grey = glass ? 1 : CLAY_ALBEDO;
+  return {
+    ...s,
+    r: grey,
+    g: grey,
+    b: grey,
+    metallic: 0,
+    roughness: glass ? s.roughness : CLAY_ROUGHNESS,
+    er: 0,
+    eg: 0,
+    eb: 0,
+    emissionStrength: 0,
+    vertexColors: false,
+    tex: s.blend !== 0 ? s.tex : null,
+    alphaOnly: true,
+    procedural: s.procedural?.alpha ? alphaOnlyProcedural(s.procedural) : null,
+  };
+}
+
+/** The alpha channel of a procedural surface alone (its other channels give way to the clay). */
+function alphaOnlyProcedural(p: ProceduralSurface): ProceduralSurface {
+  const patternOf = { ...p.patternOf };
+  for (const k of Object.keys(patternOf) as (keyof typeof patternOf)[]) patternOf[k] = -1;
+  patternOf.alpha = 0;
+  return {
+    ...p,
+    base_color: null,
+    metallic: null,
+    roughness: null,
+    normal: null,
+    emission: null,
+    bump: 0,
+    patterns: [p.patterns[p.patternOf.alpha]],
+    patternOf,
+  };
+}
+
 /** The view of a software render (`renderSceneSoftware`'s camera precedence; exported for parallel renders). */
 export function resolveView(
   doc: SceneDoc,
@@ -314,10 +470,16 @@ function buildLights(
   skyLight: number[] | null = null,
   envLit = false,
   otherLight = false,
-): { data: Float64Array; count: number; studio: boolean } {
+  skyCaster: LightCaster | null = null,
+): { data: Float64Array; count: number; studio: boolean; casters: (LightCaster | null)[] } {
   const out: number[] = [];
+  // per packed light: how it casts shadows (`SoftwareRenderOptions.shadows`), or null
+  const casters: (LightCaster | null)[] = [];
   // a procedural sky lights the scene itself (its sun, when up): no studio rig
-  if (skyLight) out.push(...skyLight);
+  if (skyLight) {
+    out.push(...skyLight);
+    if (skyLight.length) casters.push(skyCaster);
+  }
   for (const o of scene.objects) {
     if (o.type !== 'LIGHT' || !o.light || !o.renderVisible) continue;
     const l = o.light;
@@ -351,9 +513,28 @@ function buildLights(
       (1 - cosHalf) * Math.min(1, Math.max(0, l.spot_blend)),
       radius * radius * 0.25,
     );
+    casters.push(
+      kind === LIGHT_SUN
+        ? {
+            kind: 'sun',
+            toLight: [-dir[0], -dir[1], -dir[2]],
+            angularRadius: Math.max(0, l.angle ?? DEFAULT_SUN_ANGLE) / 2,
+            use: l.use_shadow,
+          }
+        : kind === LIGHT_SPOT
+          ? {
+              kind: 'spot',
+              position: [M[12], M[13], M[14]],
+              direction: dir,
+              spotSize: l.spot_size,
+              radius: Math.max(0, l.shadow_soft_size),
+              use: l.use_shadow,
+            }
+          : null,
+    );
   }
   if (out.length || skyLight || envLit || otherLight)
-    return { data: new Float64Array(out), count: out.length / LIGHT_STRIDE, studio: false };
+    return { data: new Float64Array(out), count: out.length / LIGHT_STRIDE, studio: false, casters };
   // studio rig: key, fill and rim suns fixed relative to the camera (view-space directions → world)
   const rig: [number, number, number, number][] = [
     [-0.45, 0.6, 0.65, 2.0],
@@ -368,8 +549,15 @@ function buildLights(
     ]);
     out.push(LIGHT_SUN, 0, 0, 0, -toLight[0], -toLight[1], -toLight[2], e, e, e, 0, 0, 0);
   }
-  return { data: new Float64Array(out), count: rig.length, studio: true };
+  // (the camera-relative rig never casts shadows)
+  return { data: new Float64Array(out), count: rig.length, studio: true, casters: rig.map(() => null) };
 }
+
+/** A packed light's shadow caster and whether the light's own `use_shadow` is on. */
+type LightCaster = ShadowCaster & { use: boolean };
+
+/** Blender's default sun angle (angular diameter, 0.526°) for SUN lamps without one. */
+const DEFAULT_SUN_ANGLE = (0.526 * Math.PI) / 180;
 
 /**
  * Renders the scene on the CPU. Camera: `opts.view`, else `opts.cameraId`, else the scene camera,
@@ -411,9 +599,19 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
   }
   const W = width * k;
   const H = height * k;
-  const r = new Rasterizer(W, H, view);
+  const look = opts.look ?? 'material';
+  const solid = opts.shading === 'SOLID' || look === 'solid';
+  const clay = !solid && look === 'clay';
+  const aovNames = new Set(opts.aovs ?? []);
+  const lines = opts.lines?.length ? opts.lines : null;
+  // the sample buffers are reused from render to render (buffers.ts)
+  const r = new Rasterizer(W, H, view, {
+    color: pooledFloat32('main:color', W * H * 3),
+    cov: pooledFloat32('main:cov', W * H),
+    depth: pooledFloat32('main:depth', W * H),
+  });
   r.shadingBlock = k;
-  const solid = opts.shading === 'SOLID';
+  r.msaa = !!opts.msaa;
   r.mode = solid ? SHADE_SOLID : SHADE_MATERIAL;
   const world = scene.world;
   const ws = Math.max(0, world.strength ?? 1);
@@ -429,24 +627,30 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
         )
       : null;
   // emissive surfaces or a bright world light the scene themselves (no studio rig, like the path
-  // tracer, which samples emitters as lights)
+  // tracer, which samples emitters as lights; the clay look has no emission)
   const lumW = 0.2126 * world.color[0] + 0.7152 * world.color[1] + 0.0722 * world.color[2];
   const otherLight =
     lumW * ws >= 0.1 ||
-    meshes.some((o) =>
-      o.materials.some(
-        (m) =>
-          !!m &&
-          (m.emission_strength ?? 0) > 0 &&
-          (m.emission_color.some((c) => c > 0) || !!m.textures?.emission?.procedural),
-      ),
-    );
-  const lights = solid ? null : buildLights(scene, view, sky?.sunLight ?? null, !!env, otherLight);
+    (!clay &&
+      meshes.some((o) =>
+        o.materials.some(
+          (m) =>
+            !!m &&
+            (m.emission_strength ?? 0) > 0 &&
+            (m.emission_color.some((c) => c > 0) || !!m.textures?.emission?.procedural),
+        ),
+      ));
+  const lights = solid
+    ? null
+    : buildLights(scene, view, sky?.sunLight ?? null, !!env, otherLight, sky?.sunCaster ?? null);
+  /** Shadow maps of the packed lights (built below, before anything is shaded). */
+  let shadowMaps: (ShadowMap | null)[] | null = null;
   /** World lighting of a rasterizer (the main view and the reflection probe faces). */
   const light = (ras: Rasterizer) => {
     if (!lights) return;
     ras.lights = lights.data;
     ras.lightCount = lights.count;
+    ras.shadowMaps = shadowMaps;
     const boost = lights.studio ? 0.03 : 0;
     ras.ambient = env
       ? [0, 0, 0]
@@ -476,6 +680,11 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       : Math.hypot(m[12] - e[0], m[13] - e[1], m[14] - e[2]);
   };
   meshes.sort((a, b) => dist(a) - dist(b));
+  // the object pass's table: object ids (instances: their source object), sorted; 0 = nothing
+  const objectTable = aovNames.has('object')
+    ? ['', ...[...new Set(meshes.map((o) => o.object.id))].sort()]
+    : null;
+  const objectIndex = new Map(objectTable?.map((id, i) => [id, i]) ?? []);
   // materials and GENERATED texture spaces once per item (shared by the probe faces and the view)
   const texSpaces = new Map<MeshData, Bounds | null>();
   const draws = meshes.map((o) => {
@@ -492,6 +701,9 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
         b: 0.8 * Math.max(0, c[2]),
       };
       mats = [];
+    } else if (clay) {
+      mats = o.materials.map((m) => claySurface(m, textures));
+      fallback = claySurface(null, textures);
     } else {
       mats = o.materials.map((m) => surfaceFromMaterial(m, hasColors, textures));
       fallback = surfaceFromMaterial(null, hasColors);
@@ -506,20 +718,70 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
         : null;
       if (ts) texSpace = { min: ts.min, max: ts.max, orco };
     }
-    return { o, mesh, mats, fallback, texSpace };
+    return { o, mesh, mats, fallback, texSpace, objIndex: objectIndex.get(o.object.id) ?? 0 };
   });
-  // world-space vertices per item, shared by the main view and the reflection probe's faces
+  // world-space vertices per item, shared by the main view, the shadow maps and the probe's faces
   const worldCache = new Map<Mat4, WorldVertices>();
-  const drawAll = (ras: Rasterizer) => {
+  const drawItem = (ras: Rasterizer, d: (typeof draws)[number]) => {
+    ras.objectIndex = d.objIndex;
+    if (d.texSpace) ras.drawMesh(d.mesh, d.o.worldMatrix, d.mats, d.fallback, d.texSpace);
+    else ras.drawMesh(d.mesh, d.o.worldMatrix, d.mats, d.fallback);
+  };
+  const drawOpaque = (ras: Rasterizer) => {
     ras.bufferCache = RENDER_BUFFERS;
     ras.worldCache = worldCache;
-    for (const d of draws) {
-      if (d.texSpace) ras.drawMesh(d.mesh, d.o.worldMatrix, d.mats, d.fallback, d.texSpace);
-      else ras.drawMesh(d.mesh, d.o.worldMatrix, d.mats, d.fallback);
-    }
+    for (const d of draws) drawItem(ras, d);
+  };
+  const drawAll = (ras: Rasterizer) => {
+    drawOpaque(ras);
     // alpha-blended and glass surfaces last, back to front
     ras.flushTransparent();
   };
+  // shadow maps of the suns (the sky's included) and spot lights (`shadows`; never the studio rig)
+  const shadowMode = opts.shadows ?? false;
+  if (
+    lights &&
+    !lights.studio &&
+    (shadowMode === true || (shadowMode === 'scene' && scene.render.use_shadows !== false))
+  ) {
+    const depthPass =
+      (role: string): DepthPass =>
+      (v, w, h) => {
+        const ras = new Rasterizer(w, h, v, {
+          color: NO_SAMPLES,
+          cov: NO_SAMPLES,
+          depth: pooledFloat32(role, w * h),
+        });
+        ras.mode = SHADE_DEPTH;
+        ras.sortTriangles = false;
+        drawOpaque(ras);
+        return ras.depth;
+      };
+    let boxes: Bounds[] | null = null;
+    const maps = lights.casters.map((c, i) => {
+      if (!c || (shadowMode === 'scene' && !c.use)) return null;
+      if (c.kind === 'sun') {
+        boxes ??= draws.map((d) => itemBounds(d.mesh, d.o.worldMatrix)).filter((b): b is Bounds => !!b);
+        return buildSunShadow(c, view, boxes, opts.shadowFit ?? null, depthPass(`shadow:${i}`));
+      }
+      return buildSpotShadow(c, bounds, depthPass(`shadow:${i}`));
+    });
+    if (maps.some((m) => m)) shadowMaps = maps;
+    r.shadowMaps = shadowMaps;
+  }
+  // the nearest sample of every output pixel: AOV passes, ambient occlusion and line occlusion
+  const pixels: PixelBuffers | null =
+    aovNames.size || opts.ao || lines
+      ? {
+          width,
+          height,
+          key: pooledFloat32('pixels:key', width * height),
+          normal: pooledFloat32('pixels:normal', width * height * 3),
+          object: objectTable ? pooledUint32('pixels:object', width * height) : null,
+        }
+      : null;
+  r.pixels = pixels;
+  if (opts.ao) r.ambientShare = pooledUint32('main:ambient', W * H);
   // reflections of the lit scene in metals and glossy surfaces: a probe rendered in front of
   // what the camera looks at
   const probeAt =
@@ -539,7 +801,20 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       }
     });
   }
-  drawAll(r);
+  drawOpaque(r);
+  if (pixels && r.ambientShare) {
+    // ambient occlusion of the opaque surfaces, before the transparent ones are blended over them
+    const radius =
+      typeof opts.aoRadius === 'number' && opts.aoRadius > 0 && Number.isFinite(opts.aoRadius)
+        ? opts.aoRadius
+        : defaultAoRadius(meshes);
+    const ao = ambientOcclusion(pixels, view, radius);
+    applyAmbientOcclusion(r.color, r.ambientShare, ao, W, H, k);
+    r.ambientShare = null;
+  }
+  // lines are hidden by opaque surfaces only (seen through glass)
+  const lineDepth = lines && pixels ? linearDepths(pixels.key, view) : null;
+  r.flushTransparent();
 
   // ---------------------------------------------------------------- resolve (box filter, display)
   const exposure = Math.pow(2, scene.render.exposure ?? 0);
@@ -567,53 +842,133 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       : null;
   const skyPx = [0, 0, 0];
   const envPx = new Float64Array(3);
+  /** The world behind pixel (x, y) into `bg` (sky, studio or image background). */
+  const sampleBackground = (x: number, y: number) => {
+    if (!skyBg) return;
+    if (sky) {
+      const d = skyBg.dir(x, y);
+      sampleSkyPixel(sky.model, d[0], d[1], d[2], skyBg.pixelRadius, skyPx);
+      bg[0] = skyPx[0] * sky.scale;
+      bg[1] = skyPx[1] * sky.scale;
+      bg[2] = skyPx[2] * sky.scale;
+    } else if (env) {
+      // the full-resolution world (not the prefiltered lighting maps)
+      const d = skyBg.dir(x, y);
+      sampleEnvironmentBackground(env, d[0], d[1], d[2], envPx);
+      bg[0] = envPx[0];
+      bg[1] = envPx[1];
+      bg[2] = envPx[2];
+    }
+  };
   const out = new Uint8ClampedArray(width * height * 4);
   // Standard keeps the exact sRGB conversion and linear compositing of an explicit background; the
   // other view transforms go through a linear film and the path tracer's display conversion
   const standard = vt === 'STANDARD';
-  const film = standard ? null : new Float32Array(width * height * 4);
+  const film = standard ? null : pooledFloat32('film', width * height * 4);
   const explicitLin = explicit
     ? [srgbToLinear(explicit[0]), srgbToLinear(explicit[1]), srgbToLinear(explicit[2]), explicit[3]]
     : null;
   const inv = 1 / (k * k);
   const color = r.color;
   const cov = r.cov;
+  const tonemap = opts.resolve === 'tonemap';
+  const dither = !!opts.dither;
+  // what lies behind the uncovered part: the world (alpha 1), or nothing
+  const behind = !explicit && !transparent;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       let cr = 0;
       let cg = 0;
       let cb = 0;
       let cv = 0;
-      for (let sy = 0; sy < k; sy++) {
-        let s = (y * k + sy) * W + x * k;
-        for (let sx = 0; sx < k; sx++, s++) {
-          cr += color[s * 3];
-          cg += color[s * 3 + 1];
-          cb += color[s * 3 + 2];
-          cv += cov[s];
+      if (tonemap) {
+        // a pixel whose samples all hold one opaque colour (msaa interiors) needs no weights
+        const s0 = y * k * W + x * k;
+        cr = color[s0 * 3];
+        cg = color[s0 * 3 + 1];
+        cb = color[s0 * 3 + 2];
+        cv = 1;
+        let uniform = true;
+        for (let sy = 0; sy < k && uniform; sy++) {
+          let s = (y * k + sy) * W + x * k;
+          for (let sx = 0; sx < k; sx++, s++)
+            if (cov[s] !== 1 || color[s * 3] !== cr || color[s * 3 + 1] !== cg || color[s * 3 + 2] !== cb) {
+              uniform = false;
+              break;
+            }
         }
-      }
-      cv *= inv;
-      cr *= inv;
-      cg *= inv;
-      cb *= inv;
-      if (skyBg && sky && cv < 1) {
-        const d = skyBg.dir(x, y);
-        sampleSkyPixel(sky.model, d[0], d[1], d[2], skyBg.pixelRadius, skyPx);
-        bg[0] = skyPx[0] * sky.scale;
-        bg[1] = skyPx[1] * sky.scale;
-        bg[2] = skyPx[2] * sky.scale;
-      } else if (skyBg && env && cv < 1) {
-        // the full-resolution world (not the prefiltered lighting maps)
-        const d = skyBg.dir(x, y);
-        sampleEnvironmentBackground(env, d[0], d[1], d[2], envPx);
-        bg[0] = envPx[0];
-        bg[1] = envPx[1];
-        bg[2] = envPx[2];
+        if (!uniform) {
+          // each sample weighted by 1 / (1 + luminance) of its exposed colour (over the world when
+          // the world shows): a bright sample can no longer dominate its pixel, so bright edges
+          // alias less (the weights are undone by the average of the weighted samples). The
+          // weights choose the colour only: with nothing behind (Film > Transparent, an explicit
+          // background) alpha stays the samples' plain coverage, as in the box resolve
+          cr = 0;
+          cg = 0;
+          cb = 0;
+          cv = 0;
+          let cover = 0;
+          for (let sy = 0; sy < k; sy++) {
+            let s = (y * k + sy) * W + x * k;
+            for (let sx = 0; sx < k; sx++, s++) cover += cov[s];
+          }
+          if (behind && cover < k * k) sampleBackground(x, y);
+          let wsum = 0;
+          for (let sy = 0; sy < k; sy++) {
+            let s = (y * k + sy) * W + x * k;
+            for (let sx = 0; sx < k; sx++, s++) {
+              let a = cov[s];
+              let sr = color[s * 3];
+              let sg = color[s * 3 + 1];
+              let sb = color[s * 3 + 2];
+              if (behind) {
+                sr += bg[0] * (1 - a);
+                sg += bg[1] * (1 - a);
+                sb += bg[2] * (1 - a);
+                a = 1;
+              }
+              const w = 1 / (1 + Math.max(0, 0.2126 * sr + 0.7152 * sg + 0.0722 * sb) * exposure);
+              cr += sr * w;
+              cg += sg * w;
+              cb += sb * w;
+              cv += a * w;
+              wsum += w;
+            }
+          }
+          if (behind) {
+            const iw = 1 / wsum;
+            cr *= iw;
+            cg *= iw;
+            cb *= iw;
+            cv = 1;
+          } else {
+            // the covered samples' weighted colour (Σ c·w / Σ a·w, c premultiplied by a), times
+            // their plain coverage: premultiplied by the coverage the box resolve gives
+            const a = cover * inv;
+            const s = cv > 0 ? a / cv : 0;
+            cr *= s;
+            cg *= s;
+            cb *= s;
+            cv = a;
+          }
+        }
+      } else {
+        for (let sy = 0; sy < k; sy++) {
+          let s = (y * k + sy) * W + x * k;
+          for (let sx = 0; sx < k; sx++, s++) {
+            cr += color[s * 3];
+            cg += color[s * 3 + 1];
+            cb += color[s * 3 + 2];
+            cv += cov[s];
+          }
+        }
+        cv *= inv;
+        cr *= inv;
+        cg *= inv;
+        cb *= inv;
+        if (cv < 1) sampleBackground(x, y);
       }
       const o = (y * width + x) * 4;
-      // what lies behind the uncovered part: the world (alpha 1), or nothing
-      const behind = !explicit && !transparent;
       if (film) {
         film[o] = cr + (behind ? bg[0] * (1 - cv) : 0);
         film[o + 1] = cg + (behind ? bg[1] * (1 - cv) : 0);
@@ -639,15 +994,141 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       const a = cv + rest;
       if (a > 0) {
         const ia = 1 / a;
-        out[o] = linearToSrgbByte((cr * exposure + br * rest) * ia);
-        out[o + 1] = linearToSrgbByte((cg * exposure + bgG * rest) * ia);
-        out[o + 2] = linearToSrgbByte((cb * exposure + bb * rest) * ia);
+        if (dither) {
+          // (as `ditherByte`: the clamped array clamps to 0..255)
+          const t = ditherThreshold(x, y);
+          out[o] = Math.floor(linearToSrgb255((cr * exposure + br * rest) * ia) + t);
+          out[o + 1] = Math.floor(linearToSrgb255((cg * exposure + bgG * rest) * ia) + t);
+          out[o + 2] = Math.floor(linearToSrgb255((cb * exposure + bb * rest) * ia) + t);
+        } else {
+          out[o] = linearToSrgbByte((cr * exposure + br * rest) * ia);
+          out[o + 1] = linearToSrgbByte((cg * exposure + bgG * rest) * ia);
+          out[o + 2] = linearToSrgbByte((cb * exposure + bb * rest) * ia);
+        }
       }
       out[o + 3] = Math.round(a * 255);
     }
   }
-  if (film) return { width, height, data: filmToRGBA8(film, width, height, exposure, vt, explicit) };
-  return { width, height, data: out };
+  const data = film ? filmToRGBA8(film, width, height, exposure, vt, explicit, dither) : out;
+  const image: RenderedImage = { width, height, data };
+  if (lines && lineDepth) drawLines(data, width, height, lines, view, { depth: lineDepth });
+  if (pixels && aovNames.size) image.aovs = renderAovs(pixels, view, aovNames, objectTable);
+  if (aovNames.size || lines) image.view = view;
+  return image;
+}
+
+/** Empty colour and coverage buffers of depth-only rasterizers (shadow maps). */
+const NO_SAMPLES = new Float32Array(0);
+
+/** World-space bounds of a mesh under a matrix (the exact box around its transformed bounds). */
+function itemBounds(mesh: MeshData, M: Mat4): Bounds | null {
+  const b = meshBounds(mesh);
+  if (!b) return null;
+  const c = [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, (b.min[2] + b.max[2]) / 2];
+  const h = [(b.max[0] - b.min[0]) / 2, (b.max[1] - b.min[1]) / 2, (b.max[2] - b.min[2]) / 2];
+  const min: Vec3 = [0, 0, 0];
+  const max: Vec3 = [0, 0, 0];
+  for (let i = 0; i < 3; i++) {
+    const mid = M[i] * c[0] + M[4 + i] * c[1] + M[8 + i] * c[2] + M[12 + i];
+    const r = Math.abs(M[i]) * h[0] + Math.abs(M[4 + i]) * h[1] + Math.abs(M[8 + i]) * h[2];
+    min[i] = mid - r;
+    max[i] = mid + r;
+  }
+  return Number.isFinite(min[0] + min[1] + min[2] + max[0] + max[1] + max[2]) ? { min, max } : null;
+}
+
+/** Share of the median item size that ambient occlusion reaches, and its bounds in metres. */
+const AO_RADIUS_SHARE = 0.25;
+const AO_RADIUS_MIN = 0.05;
+const AO_RADIUS_MAX = 0.5;
+
+/** Extents (x, y, z) of meshes' own bounds, kept while a mesh is alive (meshes are immutable). */
+const MESH_EXTENTS = new WeakMap<MeshData, Vec3 | null>();
+
+function meshExtents(mesh: MeshData): Vec3 | null {
+  let e = MESH_EXTENTS.get(mesh);
+  if (e === undefined) {
+    const b = meshBounds(mesh);
+    e = b ? [b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]] : null;
+    MESH_EXTENTS.set(mesh, e);
+  }
+  return e;
+}
+
+/**
+ * The reach of ambient occlusion `renderSceneSoftware` uses when `aoRadius` is not given: a
+ * quarter of the median size of the items drawn (renderable meshes and instances), between 5 and
+ * 50 cm — contact shadows of human-scale sets, finer ones on a tabletop. An item's size is the
+ * diagonal of its rest shape's own bounds (the mesh before modifiers) stretched by its world
+ * scale: turning, moving or deforming things never changes it, adding, hiding or scaling them does.
+ */
+export function defaultAoRadius(items: readonly RenderItem[]): number {
+  const sizes: number[] = [];
+  for (const o of items) {
+    const e = meshExtents(o.object.baseMesh ?? o.mesh);
+    if (!e) continue;
+    const M = o.worldMatrix;
+    // the length of each local axis in the world (rotation-free scale)
+    const sx = Math.hypot(M[0], M[1], M[2]);
+    const sy = Math.hypot(M[4], M[5], M[6]);
+    const sz = Math.hypot(M[8], M[9], M[10]);
+    const s = Math.hypot(e[0] * sx, e[1] * sy, e[2] * sz);
+    if (s > 0 && Number.isFinite(s)) sizes.push(s);
+  }
+  if (!sizes.length) return AO_RADIUS_MAX;
+  sizes.sort((a, b) => a - b);
+  return Math.min(AO_RADIUS_MAX, Math.max(AO_RADIUS_MIN, sizes[sizes.length >> 1] * AO_RADIUS_SHARE));
+}
+
+/** Distances from the camera plane of the pixels' nearest samples (Infinity where nothing is drawn). */
+function linearDepths(key: Float32Array, view: RenderView): Float32Array {
+  const out = new Float32Array(key.length);
+  const n = view.near;
+  const f = view.far;
+  for (let i = 0; i < key.length; i++) {
+    const k = key[i];
+    out[i] = !(k > 0) ? Infinity : view.ortho ? ((1 - k) * (f - n) + f + n) / 2 : 1 / k;
+  }
+  return out;
+}
+
+/** The AOV passes asked for, from the nearest sample of every pixel (see `RenderAovs`). */
+function renderAovs(
+  pixels: PixelBuffers,
+  view: RenderView,
+  names: ReadonlySet<SoftwareAovName>,
+  objectTable: string[] | null,
+): RenderAovs {
+  const aovs: RenderAovs = {};
+  if (names.has('depth')) aovs.depth = linearDepths(pixels.key, view);
+  if (names.has('normal')) {
+    const n = pixels.key.length;
+    const out = new Float32Array(n * 3);
+    const R = view.right;
+    const U = view.up;
+    const F = view.forward;
+    const src = pixels.normal;
+    for (let i = 0; i < n; i++) {
+      if (!(pixels.key[i] > 0)) continue;
+      const x = src[i * 3];
+      const y = src[i * 3 + 1];
+      const z = src[i * 3 + 2];
+      // view space: x right, y up, z towards the camera
+      const vx = x * R[0] + y * R[1] + z * R[2];
+      const vy = x * U[0] + y * U[1] + z * U[2];
+      const vz = -(x * F[0] + y * F[1] + z * F[2]);
+      const l = Math.hypot(vx, vy, vz) || 1;
+      out[i * 3] = vx / l;
+      out[i * 3 + 1] = vy / l;
+      out[i * 3 + 2] = vz / l;
+    }
+    aovs.normal = out;
+  }
+  if (names.has('object') && pixels.object && objectTable) {
+    aovs.object = Uint32Array.from(pixels.object);
+    aovs.objectTable = objectTable;
+  }
+  return aovs;
 }
 
 function clamp01(v: number): number {
@@ -786,7 +1267,7 @@ function reflectionProbe(
 function skySetup(
   world: WorldSettings,
   strength: number,
-): { model: SkyModel; sh: Float64Array; scale: number; sunLight: number[] } {
+): { model: SkyModel; sh: Float64Array; scale: number; sunLight: number[]; sunCaster: LightCaster } {
   const es = world.environment_strength;
   const scale = strength * (typeof es === 'number' && Number.isFinite(es) ? Math.max(0, es) : 1);
   const sun = skySun(world);
@@ -796,7 +1277,15 @@ function skySetup(
     sun.visible && scale > 0
       ? [LIGHT_SUN, 0, 0, 0, -d[0], -d[1], -d[2], e[0] * scale, e[1] * scale, e[2] * scale, 0, 0, 0]
       : [];
-  return { model: prepareSky(world), sh: skyIrradianceSH(world), scale, sunLight };
+  // the sky's sun is the key light of outdoor scenes: it casts shadows like a SUN lamp (it has no
+  // use_shadow of its own: `shadows: 'scene'` follows the render setting alone)
+  const sunCaster: LightCaster = {
+    kind: 'sun',
+    toLight: [d[0], d[1], d[2]],
+    angularRadius: sun.angularRadius,
+    use: true,
+  };
+  return { model: prepareSky(world), sh: skyIrradianceSH(world), scale, sunLight, sunCaster };
 }
 
 /** GENERATED texture space (bounds) of a base mesh, cached per mesh for one render. */

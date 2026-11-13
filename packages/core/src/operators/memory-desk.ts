@@ -1,23 +1,25 @@
 import type { SceneDoc } from '../doc/scene-doc';
 import type { ShotData } from '../doc/types';
 import { MAX_SHOT_FRAME, findShotIndex, getShots } from '../desk/shots';
-import { sanitizeRigidBody, sanitizeRigidBodyWorld } from '../physics/settings';
+import { cameraMoveKeys, isDeskMove } from '../desk/moves';
+import { lookKeyBound, moveKeyBound } from '../desk/characters/estimate';
+import { getCatalogEntry } from '../store/catalog';
+import {
+  deskBakeEstimate,
+  deskReleaseEstimate,
+  deskTetherEstimate,
+  deskVehicleEstimate,
+} from '../desk/physics/estimate';
 import type { OperatorContext } from './context';
 import {
   OPERATOR_FIXED_BYTES,
   decodedFaces,
   keyframeEstimate,
-  refObjects,
   withObjects,
   type Estimator,
   type OperatorEstimate,
 } from './memory-base';
-import {
-  frameSamplingBytes,
-  newKeyframesWrites,
-  rigidBodyBakeWrites,
-  type KeyframeWrites,
-} from './memory-keyframes';
+import { frameSamplingBytes, newKeyframesWrites, type KeyframeWrites } from './memory-keyframes';
 import type { NewObjects } from './memory-objects';
 
 /*
@@ -76,9 +78,6 @@ export const DESK_MAX_MATERIALS = 4;
 /** Channels a shot's camera keys at most: location, rotation, the lens and the focus distance. */
 export const DESK_CAMERA_CHANNELS = 8;
 
-/** Keyframes per channel of a camera move that is not keyed on every frame (an orbit keys 8 points or more). */
-export const DESK_MOVE_KEYS = 16;
-
 /** Frames a check, a solve or an export of the blocking evaluates per shot: its first, middle and last. */
 export const DESK_FRAMES_PER_SHOT = 3;
 
@@ -91,7 +90,7 @@ export const DESK_TETHER_CHANNELS = 6 * (DESK_TETHER_MAX_OBJECTS + 1);
 /** Channels a drive keys on every frame: the vehicle's location and rotation, the wheels' spin and steering. */
 export const DESK_VEHICLE_CHANNELS = 6 + 4 + 2;
 
-/** Objects desk.set_build adds at most: the ground, the sun lamp and four walls. */
+/** Objects desk.set_build adds at most: the ground, four walls and (without a sky) the sun lamp. */
 export const DESK_SET_MAX_OBJECTS = 6;
 
 /** Moves that key the camera on every frame of the shot (they follow its first subject). */
@@ -175,17 +174,12 @@ function keysOf(doc: SceneDoc, ids: Iterable<string | null | undefined>): number
 }
 
 /**
- * Keyframes of a shot's camera over `frames` frames: a key at both ends of each channel, a move's
- * keys, and a key on every frame for the moves that follow a subject.
+ * Keyframes of a shot's camera over `frames` frames as desk/moves.ts keys them (cameraMoveKeys): the
+ * start pose and the hold at the end of its channels and the move's own keys, every frame for the
+ * moves that follow a subject; `amount` scales an orbit's arc and so its keys.
  */
-function cameraKeys(move: unknown, frames: number): number {
-  const perChannel =
-    typeof move !== 'string' || move === 'locked_off'
-      ? 2
-      : PER_FRAME_MOVES.has(move)
-        ? frames + 1
-        : DESK_MOVE_KEYS;
-  return DESK_CAMERA_CHANNELS * perChannel;
+function cameraKeys(move: unknown, frames: number, amount?: unknown): number {
+  return cameraMoveKeys(isDeskMove(move) ? move : null, frames, num(amount, 1)).keys;
 }
 
 /** Frames a solve evaluates for a shot of `frames` frames: three, and each frame of a move that follows a subject. */
@@ -261,6 +255,17 @@ const SOLVE_LOWER = 'the number of shots (shots), or their moves that key every 
 const IMPORT_LOWER = 'the number of shots, cast members and props of the blocking';
 
 /** A shot's camera keyed over its range (desk.shot_add, desk.shot_update, desk.camera_move). */
+/**
+ * Keys that hold the views of the other shots on camera `camera` while a shot (`except`) or a range
+ * is keyed on it (desk/moves.ts cameraHolds): at most every channel at each one's first and last
+ * frame.
+ */
+function holdKeys(doc: SceneDoc, camera: string | null | undefined, except?: string | null): number {
+  if (!camera) return 0;
+  const others = getShots(doc).filter((s) => s.camera === camera && s.id !== except).length;
+  return 2 * DESK_CAMERA_CHANNELS * others;
+}
+
 function shotCamera(
   ctx: OperatorContext,
   move: unknown,
@@ -268,10 +273,12 @@ function shotCamera(
   camera: string | null | undefined,
   solve: boolean,
   lower: string,
+  amount?: unknown,
+  except?: string | null,
 ): DeskCost {
   return {
     keys: newKeyframesWrites(
-      cameraKeys(move, frames),
+      cameraKeys(move, frames, amount) + holdKeys(ctx.doc, camera, except),
       DESK_CAMERA_CHANNELS,
       lower,
       keysOf(ctx.doc, [camera]),
@@ -315,6 +322,8 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
         camera,
         p.resolve !== false,
         SHOT_LOWER,
+        undefined,
+        shot?.id,
       ),
     );
   },
@@ -327,7 +336,7 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
     let cameras = 0;
     for (const s of shots) {
       const n = clampFrames(s.frame_end - s.frame_start + 1);
-      keys += cameraKeys(s.move, n);
+      keys += cameraKeys(s.move, n) + holdKeys(ctx.doc, s.camera, s.id);
       frames += solveFrames(s.move, n);
       if (!s.camera) cameras++;
     }
@@ -353,18 +362,18 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
       DESK_FRAMES_PER_SHOT * targetShots(ctx.doc, p.shots).length,
       'the number of shots checked (shots)',
     ),
-  /** The ground, the sun and (interior) four walls. */
-  'desk.set_build': (_ctx, p) =>
-    deskEstimate({
-      adds:
-        p.interior === true
-          ? {
-              objects: DESK_SET_MAX_OBJECTS,
-              datablocks: { meshes: DESK_SET_MAX_OBJECTS - 1, lights: 1, materials: 2 },
-            }
-          : { objects: 2, datablocks: { meshes: 1, lights: 1, materials: 1 } },
+  /** The ground (two materials), four walls (one material) when interior, a sun lamp without a sky. */
+  'desk.set_build': (_ctx, p) => {
+    const walls = p.interior === true ? 4 : 0;
+    const lamp = p.sky === false ? 1 : 0;
+    return deskEstimate({
+      adds: {
+        objects: 1 + walls + lamp,
+        datablocks: { meshes: 1 + walls, lights: lamp, materials: 2 + (walls ? 1 : 0) },
+      },
       lower: '',
-    }),
+    });
+  },
   /** The camera keyed over the range (the shot's, else the scene's). */
   'desk.camera_move': (ctx, p) => {
     const shot = storedShot(ctx.doc, p.shot);
@@ -382,6 +391,8 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
         camera,
         typeof p.move === 'string' && PER_FRAME_MOVES.has(p.move),
         'the frame range (frame_start to frame_end), or a move that does not key every frame',
+        p.amount,
+        shot?.id,
       ),
     );
   },
@@ -450,14 +461,10 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
 const POSE_LOWER = "the actor's animation (a pose rewrites the actor's keyframes)";
 
 export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
-  /** An armature and its parts (and the pose's keys). */
-  'desk.actor_add': (_ctx, p) =>
+  /** An armature and its parts, posed unkeyed (no keys). */
+  'desk.actor_add': () =>
     deskEstimate({
       faces: DESK_ACTOR_MAX_FACES,
-      keys:
-        p.pose !== undefined
-          ? newKeyframesWrites(DESK_ACTOR_MAX_CHANNELS, DESK_ACTOR_MAX_CHANNELS, '')
-          : null,
       adds: {
         objects: DESK_ACTOR_MAX_OBJECTS,
         datablocks: { meshes: DESK_ACTOR_MAX_OBJECTS - 1, armatures: 1, materials: DESK_MAX_MATERIALS },
@@ -475,21 +482,27 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
       ),
       lower: POSE_LOWER,
     }),
-  /** A gait keyed on every channel for every cycle of the move, blended in and out. */
+  /**
+   * The gait's channels keyed on every cycle of the move as the move times it (desk/characters/
+   * estimate.ts: on its grid, and once more in each grid step a leg swings through) and the end pose
+   * on every channel; for an object that is not an actor (the move fails), a gait keyed
+   * DESK_GAIT_KEYS_PER_SECOND times a second over the path.
+   */
   'desk.actor_move': (ctx, p) => {
     const actor = objectId(ctx, p.actor);
-    const frames = pathFrames(ctx, p, actor);
-    const perChannel =
-      Math.min(frames + 1, Math.ceil((DESK_GAIT_KEYS_PER_SECOND * frames) / fps(ctx.doc))) +
-      2 * DESK_POSE_KEYS;
-    const lower = 'the length of the move (frame_end, a higher speed_mps or a shorter path)';
+    const lower = 'the length of the move (a shorter path walks fewer gait cycles)';
+    const bound = actor ? moveKeyBound(ctx.doc, actor, p) : null;
+    let keys: number;
+    if (bound) keys = bound.keys + 2 * DESK_ACTOR_MAX_CHANNELS;
+    else {
+      const frames = pathFrames(ctx, p, actor);
+      const perChannel =
+        Math.min(frames + 1, Math.ceil((DESK_GAIT_KEYS_PER_SECOND * frames) / fps(ctx.doc))) +
+        2 * DESK_POSE_KEYS;
+      keys = DESK_ACTOR_MAX_CHANNELS * perChannel;
+    }
     return deskEstimate({
-      keys: newKeyframesWrites(
-        DESK_ACTOR_MAX_CHANNELS * perChannel,
-        DESK_ACTOR_MAX_CHANNELS,
-        lower,
-        keysOf(ctx.doc, [actor]),
-      ),
+      keys: newKeyframesWrites(keys, DESK_ACTOR_MAX_CHANNELS, lower, keysOf(ctx.doc, [actor])),
       lower,
     });
   },
@@ -499,8 +512,11 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
       keys: newKeyframesWrites(12, 4, POSE_LOWER, keysOf(ctx.doc, [objectId(ctx, p.actor)])),
       lower: POSE_LOWER,
     }),
-  /** A head constraint with its influence keyed. */
-  'desk.actor_look_at': () => deskEstimate({ keys: newKeyframesWrites(4, 1, ''), lower: '' }),
+  /** Neck and head constraints with their influence ramped, and the actor's other looks ramped out. */
+  'desk.actor_look_at': (ctx, p) => {
+    const keys = lookKeyBound(ctx.doc, objectId(ctx, p.actor));
+    return deskEstimate({ keys: newKeyframesWrites(keys, keys / 2, ''), lower: '' });
+  },
   /** A CHILD_OF constraint on the prop (influence keyed) and its visual transform keyed at the release. */
   'desk.actor_hold': (ctx, p) =>
     deskEstimate({
@@ -512,107 +528,123 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
       ),
       lower: "the prop's animation",
     }),
-  /** The rider's CHILD_OF on the saddle (influence keyed) and the ride pose. */
-  'desk.actor_mount': (ctx, p) =>
-    deskEstimate({
+  /**
+   * The rider's CHILD_OF on the saddle (influence keyed), its transform and the ride pose keyed; at a
+   * dismount, its transform and the stand pose keyed again.
+   */
+  'desk.actor_mount': (ctx, p) => {
+    const poses = DESK_POSE_KEYS + (p.dismount_frame !== undefined ? 2 : 0);
+    return deskEstimate({
       keys: newKeyframesWrites(
-        DESK_ACTOR_MAX_CHANNELS * DESK_POSE_KEYS + 4,
-        DESK_ACTOR_MAX_CHANNELS + 1,
+        DESK_ACTOR_MAX_CHANNELS * poses + 4 + 6 * 3,
+        DESK_ACTOR_MAX_CHANNELS + 1 + 6,
         POSE_LOWER,
         keysOf(ctx.doc, [objectId(ctx, p.rider)]),
       ),
       lower: POSE_LOWER,
-    }),
+    });
+  },
 };
 
 // ---------------------------------------------------------------- physics (MOTION)
 
-const BODY_LOWER = 'the number of objects (objects)';
-
-/** Keys held before a release on each object (a lift, a hold before a throw): location and rotation. */
-function releaseKeys(ctx: OperatorContext, ids: (string | null)[]): DeskCost {
-  const n = ids.filter(Boolean).length;
-  return {
-    keys: n ? newKeyframesWrites(12 * n, 6 * n, BODY_LOWER, keysOf(ctx.doc, ids)) : null,
-    lower: BODY_LOWER,
-  };
-}
-
+/** desk/physics/estimate.ts counts what each preset keys, simulates and adds. */
 export const DESK_MOTION_ESTIMATES: Readonly<Record<string, Estimator>> = {
-  /** Rigid body settings (a few hundred bytes each), and a ground collider. */
-  'desk.physics_setup': (_ctx, p) =>
-    p.ground === false ? null : deskEstimate({ adds: { objects: 1, datablocks: { meshes: 1 } }, lower: '' }),
-  'desk.physics_drop': (ctx, p) =>
-    deskEstimate(
-      releaseKeys(
-        ctx,
-        refObjects(ctx, p.objects).map((o) => o.id),
-      ),
-    ),
-  'desk.physics_throw': (ctx, p) => deskEstimate(releaseKeys(ctx, [objectId(ctx, p.object)])),
-  'desk.physics_push': (ctx, p) => deskEstimate(releaseKeys(ctx, [objectId(ctx, p.object)])),
-  /** A bake of the simulation to keyframes (memory-keyframes.ts rigidBodyBakeWrites; the world's range by default). */
-  'desk.physics_bake': (ctx, p) => {
-    const world = sanitizeRigidBodyWorld(ctx.doc.getScene().rigidbody_world);
-    const objects =
-      Array.isArray(p.objects) && p.objects.length
-        ? refObjects(ctx, p.objects)
-        : ctx.doc.listObjects().filter((o) => sanitizeRigidBody(o.rigid_body)?.type === 'ACTIVE');
-    return keyframeEstimate(
-      rigidBodyBakeWrites(ctx.doc, objects, {
-        start: num(p.frame_start, world.frame_start),
-        end: num(p.frame_end, world.frame_end),
-        step: 1,
-      }),
-    );
-  },
-  /** The flyer, its string and tail keyed on every frame, the anchor sampled on every frame. */
-  'desk.tether_fly': (ctx, p) => {
-    const frames = clampFrames(num(p.frame_end, 0) - num(p.frame_start, 0) + 1 + num(p.launch_frames, 0));
-    const added = (p.string === false ? 0 : 1) + (p.tail === false ? 0 : DESK_TETHER_MAX_OBJECTS - 1);
-    const lower = 'the frame range (frame_start to frame_end)';
-    return deskEstimate({
-      keys: newKeyframesWrites(
-        DESK_TETHER_CHANNELS * (frames + 1),
-        DESK_TETHER_CHANNELS,
-        lower,
-        keysOf(ctx.doc, [objectId(ctx, p.flyer)]),
-      ),
-      extra: frameSamplingBytes(ctx.doc, frames),
-      adds: added ? { objects: added, datablocks: { meshes: added } } : undefined,
-      lower,
-    });
-  },
-  /** The vehicle, its wheels' spin and steering keyed on every frame of the drive. */
-  'desk.vehicle_drive': (ctx, p) => {
-    const vehicle = objectId(ctx, p.vehicle);
-    const frames = pathFrames(ctx, p, vehicle);
-    const lower = 'the length of the drive (frame_end, a higher speed_mps or a shorter path)';
-    return deskEstimate({
-      keys: newKeyframesWrites(
-        DESK_VEHICLE_CHANNELS * (frames + 1),
-        DESK_VEHICLE_CHANNELS,
-        lower,
-        keysOf(ctx.doc, [vehicle]),
-      ),
-      lower,
-    });
-  },
+  /** Rigid bodies, a ground collider, and the simulation of the world until they have come to rest. */
+  'desk.physics_setup': (ctx, p) => deskReleaseEstimate(ctx, 'setup', p),
+  /** The bodies released at `frame` and simulated until they rest; a lift rewrites their location keys. */
+  'desk.physics_drop': (ctx, p) => deskReleaseEstimate(ctx, 'drop', p),
+  'desk.physics_throw': (ctx, p) => deskReleaseEstimate(ctx, 'throw', p),
+  'desk.physics_push': (ctx, p) => deskReleaseEstimate(ctx, 'push', p),
+  /** Location and rotation keyed on every frame of each baked body (from its release or hold). */
+  'desk.physics_bake': (ctx, p) => deskBakeEstimate(ctx, p),
+  /** The flyer, its string and its tail keyed on every frame of the flight. */
+  'desk.tether_fly': (ctx, p) => deskTetherEstimate(ctx, p),
+  /** The vehicle, its wheels' spin and its steering keyed on every frame of the drive. */
+  'desk.vehicle_drive': (ctx, p) => deskVehicleEstimate(ctx, p),
 };
 
 // ---------------------------------------------------------------- store (CATALOG)
 
+/**
+ * Margin on a built-in model's declared triangles (those of its default parameters, within ±30% of
+ * what it builds: the catalog tests check it).
+ */
+export const STORE_TRIANGLES_MARGIN = 1.5;
+
+/**
+ * Growth of a model with parameters (seats, floors, lengths, steps…) over its default triangles that
+ * its estimate allows, up to STORE_MODEL_MAX_FACES: the largest parameter ranges are about 8× their
+ * default (a 50 m fence of 6 m by default).
+ */
+export const STORE_PARAMS_GROWTH = 10;
+
+/**
+ * Growth over their default triangles of the models whose parameters grow them more than
+ * STORE_PARAMS_GROWTH at their schema maximums, measured: a 500 m road of six lanes has 105 times
+ * the triangles of the 10 m two-lane default, a 500 m by 10 m sidewalk 48 times its 10 m by 2 m one.
+ * The store estimate test builds every model with parameters at its maximums (every value of its
+ * other parameters) against its estimate, so a model that grows more fails it until it is listed.
+ */
+export const STORE_PARAMS_GROWTH_BY_MODEL: Readonly<Record<string, number>> = {
+  road: 120,
+  sidewalk: 60,
+};
+
+/** Faces a built-in model is estimated at, at least (small models: what the build takes regardless). */
+export const STORE_MODEL_MIN_FACES = 1_000;
+
+/** Materials a built-in model adds at most (a flower bed: 11). */
+export const STORE_MODEL_MAX_MATERIALS = 12;
+
+/**
+ * Faces store.add of a model is estimated at: its declared triangles with their margins (the growth
+ * its parameters allow, `growth` for a model of STORE_PARAMS_GROWTH_BY_MODEL), bounded.
+ */
+export function storeModelFaces(triangles: number, parametric: boolean, growth = STORE_PARAMS_GROWTH): number {
+  const t = Number.isFinite(triangles) && triangles > 0 ? triangles : STORE_MODEL_MAX_FACES;
+  const faces = Math.ceil(t * STORE_TRIANGLES_MARGIN * (parametric ? growth : 1));
+  return Math.min(STORE_MODEL_MAX_FACES, Math.max(STORE_MODEL_MIN_FACES, faces));
+}
+
 export const STORE_ESTIMATES: Readonly<Record<string, Estimator>> = {
-  /** A built-in model: its root and parts (store.insert_files: memory.ts, as an import). */
-  'store.add': () =>
-    deskEstimate({
-      faces: STORE_MODEL_MAX_FACES,
+  /**
+   * A built-in model: its root and parts from its catalog entry's triangles (the parts it has are
+   * known once built: STORE_MODEL_MAX_OBJECTS); a person or animal as desk.actor_add counts an actor.
+   * An unknown model is refused before anything is built (store.insert_files: memory.ts, an import).
+   */
+  'store.add': (_ctx, p) => {
+    const entry = typeof p.model === 'string' ? getCatalogEntry(p.model) : null;
+    if (!entry) return null;
+    if (entry.rig === 'actor') {
+      const params = p.params && typeof p.params === 'object' ? (p.params as Record<string, unknown>) : {};
+      return deskEstimate({
+        faces: DESK_ACTOR_MAX_FACES,
+        keys:
+          params.pose !== undefined
+            ? newKeyframesWrites(DESK_ACTOR_MAX_CHANNELS, DESK_ACTOR_MAX_CHANNELS, '')
+            : null,
+        adds: {
+          objects: DESK_ACTOR_MAX_OBJECTS,
+          datablocks: { meshes: DESK_ACTOR_MAX_OBJECTS - 1, armatures: 1, materials: DESK_MAX_MATERIALS },
+        },
+        lower: '',
+      });
+    }
+    const parametric = !!entry.params;
+    return deskEstimate({
+      faces: storeModelFaces(
+        entry.triangles,
+        parametric,
+        STORE_PARAMS_GROWTH_BY_MODEL[entry.id] ?? STORE_PARAMS_GROWTH,
+      ),
       adds: {
         objects: STORE_MODEL_MAX_OBJECTS,
-        datablocks: { meshes: STORE_MODEL_MAX_OBJECTS - 1, materials: DESK_MAX_MATERIALS },
+        datablocks: { meshes: STORE_MODEL_MAX_OBJECTS - 1, materials: STORE_MODEL_MAX_MATERIALS },
       },
-      lower: "the model's size parameters (params)",
-    }),
+      lower: parametric ? "the model's size parameters (params)" : '',
+    });
+  },
 };
 
 /** Desk and store operators without an estimate, and why (see memory.ts UNESTIMATED_OPERATORS). */
