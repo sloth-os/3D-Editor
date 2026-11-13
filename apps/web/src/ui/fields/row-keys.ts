@@ -42,8 +42,11 @@ const ORDER_MATCH_LIMIT = 40_000;
  *    among equals (an item edited to equal its neighbour does not take the neighbour's key);
  * 2. unchanged items that moved keep theirs too;
  * 3. edited items take the key of a changed item between the same unchanged neighbours: of the same
- *    kind first, then (with `inOrder`) the others in order when as many items changed as were left;
+ *    kind when as many items of that kind changed as were left, then (with `inOrder`) the others in
+ *    order when as many items changed as were left;
  * 4. other items are new: a fresh key each.
+ * Equal items fewer than before (one of two equal items removed) all get fresh keys: which one was
+ * removed is not known, and the key of one must not go to the other (with what was typed for it).
  */
 export function matchRowKeys(
   prev: readonly KeyedRow[],
@@ -56,6 +59,16 @@ export function matchRowKeys(
   const m = ids.length;
   const keys: (string | null)[] = Array.from({ length: m }, () => null);
   const used = Array.from({ length: n }, () => false);
+  // equal items fewer than before: none of them keeps a key (their old rows are used up, the items
+  // get fresh keys)
+  const before = new Map<string, number>();
+  for (const r of prev) before.set(r.id, (before.get(r.id) ?? 0) + 1);
+  const after = new Map<string, number>();
+  for (const id of ids) after.set(id, (after.get(id) ?? 0) + 1);
+  const fewer = (id: string) => (before.get(id) ?? 0) > (after.get(id) ?? 0) && after.has(id);
+  for (let i = 0; i < n; i++) if (fewer(prev[i].id)) used[i] = true;
+  const fresh_ = ids.map(fewer);
+  const same = (i: number, j: number) => prev[i].id === ids[j] && !fresh_[j];
   const anchors: [number, number][] = [];
   if (n && m && n * m <= ORDER_MATCH_LIMIT) {
     // best[i][j]: the best pairing of prev[i..] and ids[j..] that keeps the order. Each unchanged
@@ -66,20 +79,19 @@ export function matchRowKeys(
     for (let i = n - 1; i >= 0; i--)
       for (let j = m - 1; j >= 0; j--) {
         let v = Math.max(best[i + 1][j], best[i][j + 1]);
-        if (prev[i].id === ids[j]) v = Math.max(v, best[i + 1][j + 1] + worth - Math.abs(i - j));
+        if (same(i, j)) v = Math.max(v, best[i + 1][j + 1] + worth - Math.abs(i - j));
         best[i][j] = v;
       }
     let i = 0;
     let j = 0;
     while (i < n && j < m) {
       const here = best[i][j];
-      if (prev[i].id === ids[j] && here === best[i + 1][j + 1] + worth - Math.abs(i - j))
-        anchors.push([i++, j++]);
+      if (same(i, j) && here === best[i + 1][j + 1] + worth - Math.abs(i - j)) anchors.push([i++, j++]);
       else if (here === best[i + 1][j]) i++;
       else j++;
     }
   } else {
-    for (let j = 0; j < Math.min(n, m); j++) if (prev[j].id === ids[j]) anchors.push([j, j]);
+    for (let j = 0; j < Math.min(n, m); j++) if (same(j, j)) anchors.push([j, j]);
   }
   for (const [i, j] of anchors) {
     keys[j] = prev[i].key;
@@ -93,6 +105,7 @@ export function matchRowKeys(
     if (list) list.push(i);
     else unusedById.set(prev[i].id, [i]);
   }
+  // (equal items fewer than before find none: their old rows are used up)
   for (let j = 0; j < m; j++) {
     if (keys[j] !== null) continue;
     const i = unusedById.get(ids[j])?.shift();
@@ -108,14 +121,30 @@ export function matchRowKeys(
     const olds: number[] = [];
     for (let i = i0 + 1; i < i1; i++) if (!used[i]) olds.push(i);
     const news: number[] = [];
-    for (let j = j0 + 1; j < j1; j++) if (keys[j] === null) news.push(j);
+    for (let j = j0 + 1; j < j1; j++) if (keys[j] === null && !fresh_[j]) news.push(j);
     if (!olds.length || !news.length) continue;
     if (kinds) {
+      // in order within each kind, when as many of the kind changed as were left (else which is
+      // which is not known)
+      const oldOf = new Map<string, number[]>();
+      for (const i of olds) {
+        const list = oldOf.get(prev[i].kind);
+        if (list) list.push(i);
+        else oldOf.set(prev[i].kind, [i]);
+      }
+      const newOf = new Map<string, number[]>();
       for (const j of news) {
-        const i = olds.find((x) => !used[x] && prev[x].kind === kinds[j]);
-        if (i === undefined) continue;
-        keys[j] = prev[i].key;
-        used[i] = true;
+        const list = newOf.get(kinds[j]);
+        if (list) list.push(j);
+        else newOf.set(kinds[j], [j]);
+      }
+      for (const [kind, js] of newOf) {
+        const is = oldOf.get(kind);
+        if (!is || is.length !== js.length) continue;
+        js.forEach((j, k) => {
+          keys[j] = prev[is[k]].key;
+          used[is[k]] = true;
+        });
       }
     }
     if (!inOrder) continue;

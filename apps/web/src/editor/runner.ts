@@ -540,19 +540,68 @@ function recordUnchanged(undo: Y.UndoManager): void {
   if (recordingUnchanged.has(undo)) return;
   recordingUnchanged.add(undo);
   const record = (e: { stackItem: StackItem; type: 'undo' | 'redo' }) => {
-    if (e.type !== 'undo') return;
-    try {
-      recordUnchangedWrites(undo.doc, e.stackItem);
-    } catch (err) {
-      // it runs inside the step's transaction, whose changes are made: never fail that. Without a
-      // record every entry the step set counts as changed (see changedByOthers)
-      e.stackItem.meta.delete(UNCHANGED_WRITES);
-      console.error('[runner] could not record the unchanged writes of an undo step', err);
-    }
+    if (e.type === 'undo') recordSafely(undo.doc, e.stackItem);
   };
   undo.on('stack-item-added', record);
   // a transaction merged into the last step (only with a capture timeout): record the whole step anew
   undo.on('stack-item-updated', record);
+}
+
+function recordSafely(doc: Y.Doc, step: StackItem): void {
+  try {
+    recordUnchangedWrites(doc, step);
+  } catch (err) {
+    // it runs inside the step's transaction, whose changes are made: never fail that. Without a
+    // record every entry the step set counts as changed (see changedByOthers)
+    step.meta.delete(UNCHANGED_WRITES);
+    console.error('[runner] could not record the unchanged writes of an undo step', err);
+  }
+}
+
+/**
+ * Takes `extra`, a step taken out of the history, into `step`, the history's last step: undoing
+ * `step` then undoes both. A slider drag's live values so become part of the operation that stores
+ * the value the drag ends with (one step), and the value from before the drag is what that step
+ * replaced: undoing it brings back that value itself, so an earlier step that set it can be undone
+ * next (Yjs gives up on a value replaced by changes no step of the history holds).
+ */
+export function foldStep(undo: Y.UndoManager, step: StackItem, extra: StackItem): void {
+  step.insertions = Y.mergeDeleteSets([extra.insertions, step.insertions]);
+  step.deletions = Y.mergeDeleteSets([extra.deletions, step.deletions]);
+  if (recordingUnchanged.has(undo)) recordSafely(undo.doc, step);
+}
+
+/**
+ * Undoes `step`, a step taken out of the history, on its own: when undoing a step changes nothing,
+ * Yjs undoes the one before it instead, so the history's steps are put aside meanwhile. Leaves
+ * nothing to redo.
+ */
+export function undoAlone(undo: Y.UndoManager, step: StackItem): void {
+  const steps = undo.undoStack;
+  const redo = undo.redoStack.length;
+  undo.undoStack = [step];
+  try {
+    undo.undo();
+  } finally {
+    undo.undoStack = steps;
+    undo.redoStack.splice(redo);
+  }
+}
+
+/**
+ * Whether `step` replaced values that were written after the document was at `state` (a state
+ * vector), other than its own: what another device, an MCP agent or another step wrote while the
+ * step's changes were being made.
+ */
+export function replacedNewer(step: StackItem, state: Map<number, number>): boolean {
+  for (const [client, ranges] of step.deletions.clients) {
+    const since = state.get(client) ?? 0;
+    for (const { clock, len } of ranges) {
+      const from = Math.max(clock, since);
+      if (from < clock + len && !coveredBy(step.insertions, client, from, clock + len)) return true;
+    }
+  }
+  return false;
 }
 
 /**

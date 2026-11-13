@@ -1,4 +1,4 @@
-import { signal } from '@preact/signals';
+import { signal, type Signal } from '@preact/signals';
 import { useLayoutEffect, useRef } from 'preact/hooks';
 import {
   MATERIAL_PRESETS,
@@ -332,14 +332,25 @@ function presetSwatch(id: string): string | null {
 }
 
 /**
- * The preset browser's search, chosen preset and scroll position: kept when the panel is built again
- * for another object (the per-object tabs are, see Properties), so a preset can be applied to one
- * object after another.
+ * The preset browser's search, category, chosen preset and scroll position in a project: kept when
+ * the panel is built again for another object (the per-object tabs are, see Properties), so a preset
+ * can be applied to one object after another; another project opens with its own.
  */
-const presetQuery = signal('');
-const presetCategory = signal('ALL');
-const presetSelected = signal<string | null>(null);
-let presetScroll = 0;
+interface PresetBrowser {
+  query: Signal<string>;
+  category: Signal<string>;
+  selected: Signal<string | null>;
+  scroll: number;
+}
+const presetBrowsers = new WeakMap<ProjectSession, PresetBrowser>();
+function presetBrowser(s: ProjectSession): PresetBrowser {
+  let b = presetBrowsers.get(s);
+  if (!b) {
+    b = { query: signal(''), category: signal('ALL'), selected: signal(null), scroll: 0 };
+    presetBrowsers.set(s, b);
+  }
+  return b;
+}
 
 function PresetPanel({
   s,
@@ -352,13 +363,14 @@ function PresetPanel({
   slot: number;
   m: MaterialData | null;
 }) {
-  const query = presetQuery.value;
-  const category = presetCategory.value;
-  const selected = presetSelected.value;
-  const setSelected = (id: string | null) => (presetSelected.value = id);
+  const browser = presetBrowser(s);
+  const query = browser.query.value;
+  const category = browser.category.value;
+  const selected = browser.selected.value;
+  const setSelected = (id: string | null) => (browser.selected.value = id);
   const grid = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
-    if (grid.current) grid.current.scrollTop = presetScroll;
+    if (grid.current) grid.current.scrollTop = browser.scroll;
   }, []);
   void swatchVersion.value;
   const list = filterPresets(query, category);
@@ -371,7 +383,6 @@ function PresetPanel({
         : run('material.preset_apply', { preset: id, objects: [o.id], slot, mode: 'NEW' }, 'ui');
     if (ok) setSelected(id);
   };
-  void s;
   return (
     <Panel title="Presets" id="material-presets" defaultOpen={!m}>
       <div style={{ display: 'flex', gap: '4px' }}>
@@ -382,7 +393,7 @@ function PresetPanel({
             commitOnBlur={false}
             ariaLabel="Search material presets"
             testId="material-preset-search"
-            onChange={(v) => (presetQuery.value = v)}
+            onChange={(v) => (browser.query.value = v)}
           />
         </div>
         <SelectField
@@ -393,12 +404,12 @@ function PresetPanel({
             { value: 'ALL', label: 'All' },
             ...categories.map((c) => ({ value: c, label: CATEGORY_LABELS[c] ?? c })),
           ]}
-          onChange={(v) => (presetCategory.value = v)}
+          onChange={(v) => (browser.category.value = v)}
         />
       </div>
       <div
         ref={grid}
-        onScroll={(e) => (presetScroll = (e.currentTarget as HTMLElement).scrollTop)}
+        onScroll={(e) => (browser.scroll = (e.currentTarget as HTMLElement).scrollTop)}
         role="listbox"
         aria-label="Material presets"
         data-testid="material-presets"
@@ -683,6 +694,9 @@ async function loadChannelImage(
 ) {
   try {
     const info = await readImage(f);
+    // a material an agent deleted while the file was chosen or read takes nothing: no image is
+    // stored for no material, and no error names it
+    if (!s.doc.getMaterial(m.id)) return;
     if (info.bytes.length > 8 * 1024 * 1024) throw new Error('Image larger than 8 MB');
     s.doc.transact(() => {
       const imageId = s.doc.addImage({

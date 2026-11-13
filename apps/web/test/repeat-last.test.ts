@@ -348,14 +348,38 @@ describe('keys typed on after the field they were typed into was taken away', ()
     expect(names(s)).toEqual([]);
   });
 
-  it('keys after leaving a field that is still there are shortcuts', () => {
+  it('are not shortcuts after the field lost the focus to no element, staying in the page', () => {
+    // regression: an agent reordered the list the field is in; Chromium took the focus from the field
+    // it moved, which stayed in the page, and the keys typed on played the animation and deleted
     const field = document.createElement('input');
     document.body.appendChild(field);
-    field.focus();
-    field.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }));
-    field.blur();
-    press('x');
-    expect(names(s)).toEqual([]);
-    field.remove();
+    try {
+      field.focus();
+      field.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }));
+      field.blur();
+      expect(field.isConnected).toBe(true);
+      press(' ');
+      press('x');
+      expect(names(s)).toEqual(['Cube']);
+      expect(s.view.playing.value).toBe(false);
+    } finally {
+      field.remove();
+    }
+  });
+
+  it('keys after the page moves the focus on from the field to another element are shortcuts', () => {
+    const field = document.createElement('input');
+    const item = document.createElement('button');
+    document.body.append(field, item);
+    try {
+      field.focus();
+      field.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', code: 'KeyA', bubbles: true }));
+      item.focus();
+      press('x');
+      expect(names(s)).toEqual([]);
+    } finally {
+      field.remove();
+      item.remove();
+    }
   });
 });

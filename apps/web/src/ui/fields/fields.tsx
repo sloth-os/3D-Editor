@@ -68,14 +68,30 @@ export function NumberField(p: NumberFieldProps) {
   const entry = useRef<HTMLInputElement>(null);
   // the text is selected once, when the entry opens: a ref callback written in place runs again on
   // every render, and every typed key renders the field, so each key replaced what was typed before it
-  // ("1.5" typed key by key gave 5)
+  // ("1.5" typed key by key gave 5). The entry takes the focus itself: browsers focus an inserted
+  // element marked autofocus once a page at most, and select() need not focus it
   useLayoutEffect(() => {
-    if (editing) entry.current?.select();
+    if (!editing) return;
+    entry.current?.focus({ preventScroll: true });
+    entry.current?.select();
   }, [editing]);
   // whether the text entry is still open: Enter and Escape close it, so the blur that browsers fire
   // when they remove the focused input does not commit (or cancel into a commit) a second time
   const entryOpen = useRef(false);
-  const drag = useRef<{ x: number; start: number; moved: boolean; id: number } | null>(null);
+  const drag = useRef<{ x: number; start: number; moved: boolean; id: number; value: number } | null>(null);
+  // a drag whose field is taken away (an agent replaced what it shows) ends as a release would, on the
+  // value it reached and for what the field showed then: else it stays open, and the next drag of the
+  // field went on with it (one undo step for both)
+  const latest = useRef(p);
+  latest.current = p;
+  useEffect(
+    () => () => {
+      const d = drag.current;
+      drag.current = null;
+      if (d?.moved) latest.current.onChange(d.value, true);
+    },
+    [],
+  );
   const precision = p.precision ?? (p.integer ? 0 : 3);
   const step = p.step ?? (p.integer ? 1 : 0.01);
   const clamp = (v: number) => {
@@ -90,7 +106,13 @@ export function NumberField(p: NumberFieldProps) {
   const onDown = (e: PointerEvent) => {
     if (editing || e.button !== 0) return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    drag.current = { x: e.clientX, start: unset ? 0 : display, moved: false, id: e.pointerId };
+    drag.current = {
+      x: e.clientX,
+      start: unset ? 0 : display,
+      moved: false,
+      id: e.pointerId,
+      value: p.value,
+    };
   };
   const onMove = (e: PointerEvent) => {
     const d = drag.current;
@@ -101,7 +123,8 @@ export function NumberField(p: NumberFieldProps) {
     const speed = e.shiftKey ? step * 0.1 : step;
     let v = d.start + dx * speed;
     if (e.ctrlKey) v = Math.round(v / (step * 10)) * (step * 10);
-    p.onChange(clamp(fromD(v)), false);
+    d.value = clamp(fromD(v));
+    p.onChange(d.value, false);
   };
   const onUp = (e: PointerEvent) => {
     const d = drag.current;

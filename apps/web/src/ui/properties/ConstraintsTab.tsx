@@ -16,6 +16,7 @@ import { Icon } from '../icons';
 import { run } from '../../editor/editor';
 import { constraintAddItems, type MenuItem } from '../../editor/menus';
 import { animState } from './prop-edit';
+import { readableBones } from './bones';
 import {
   ErrorList,
   boneOptions,
@@ -411,7 +412,7 @@ function ConstraintBody(p: {
   const target = c.target ? s.doc.getObject(c.target) : null;
   const bones =
     target?.type === 'ARMATURE' && target.data
-      ? (s.doc.getArmature(target.data)?.bones.map((b) => b.name) ?? [])
+      ? readableBones(s.doc.getArmature(target.data)).map((b) => b.name)
       : [];
   const candidates = s.doc
     .listObjects()

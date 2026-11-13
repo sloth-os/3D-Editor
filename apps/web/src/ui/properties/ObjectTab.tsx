@@ -35,11 +35,15 @@ import {
   composing,
 } from '../fields/fields';
 import { useRowKeys } from '../fields/row-keys';
-import { PREVIEW_ORIGIN, animState, animatedValue, setProp } from './prop-edit';
+import { animState, animatedValue, dragEdit, setProp } from './prop-edit';
 import { run } from '../../editor/editor';
 import { Icon } from '../icons';
 import { MenuButton } from '../Menu';
 import { SchemaForm } from '../SchemaForm';
+import { readableBones } from './bones';
+
+// the slider drag helper the other tabs use (see prop-edit.ts)
+export { dragEdit };
 
 // ------------------------------------------------------------------ shared panel helpers
 
@@ -91,39 +95,6 @@ export function ErrorList({ messages, testId }: { messages: string[]; testId?: s
       ))}
     </div>
   );
-}
-
-let dragState: { key: string; restore: () => void } | null = null;
-
-/**
- * Live preview of a value being dragged in a field: while `final` is false, `preview` writes the
- * value outside undo (synced to peers, like {@link setProp}); the final value restores the state
- * captured before the drag (`capture` returns the restore function) and runs `commit`, normally an
- * operator, so the whole drag is a single undo step.
- *
- * The restore must put back only the dragged field, written into the document state as it is at
- * release time (see {@link captureField}): a drag lasts seconds, and other devices or MCP agents
- * may change other entries of the same list (constraints, particle systems, keyframes) meanwhile.
- */
-export function dragEdit(
-  s: ProjectSession,
-  key: string,
-  final: boolean,
-  preview: () => void,
-  capture: () => () => void,
-  commit: () => void,
-): void {
-  if (!final) {
-    if (!dragState || dragState.key !== key) dragState = { key, restore: capture() };
-    s.doc.transact(preview, PREVIEW_ORIGIN);
-    return;
-  }
-  if (dragState?.key === key) {
-    const restore = dragState.restore;
-    dragState = null;
-    s.doc.transact(restore, PREVIEW_ORIGIN);
-  }
-  commit();
 }
 
 /**
@@ -277,7 +248,7 @@ export function ObjectTab({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const parent = o.parent ? s.doc.getObject(o.parent) : null;
   const parentBones =
     parent?.type === 'ARMATURE' && parent.data
-      ? (s.doc.getArmature(parent.data)?.bones.map((b) => b.name) ?? [])
+      ? readableBones(s.doc.getArmature(parent.data)).map((b) => b.name)
       : [];
   return (
     <>
@@ -1009,12 +980,16 @@ function DriverBox(p: {
   const value = evaluatedChannel(ev, d.target_type, d.target_id, d.path, d.index);
   const ref = { target_type: d.target_type, target: d.target_id, path: d.path, index: d.index };
   const update = (patch: Record<string, unknown>) => run('anim.driver_update', { ...ref, ...patch }, 'ui');
-  const vars = Array.isArray(d.variables) ? d.variables : [];
+  // the variables that can be shown and edited: a stored item that is no variable (from a damaged or
+  // foreign file) is listed by the errors above and dropped when the variables are next written
+  const readable = (list: unknown): DriverVariable[] =>
+    Array.isArray(list) ? (list.filter(isRecord) as unknown as DriverVariable[]) : [];
+  const vars = readable(d.variables);
   const setVars = (next: DriverVariable[]): boolean => update({ variables: next.map(variableInput) });
   /** The driver's variables as they are now (null when the driver is gone). */
   const varsNow = (): DriverVariable[] | null => {
     const now = s.doc.getDriver(key);
-    return now ? (Array.isArray(now.variables) ? now.variables : []) : null;
+    return now ? readable(now.variables) : null;
   };
   /**
    * Changes (or removes, for null) the variable named `name` as the driver is now, not as this panel
@@ -1491,7 +1466,9 @@ function FModifierBox(p: {
     const list = live?.mod.params?.control_points;
     if (!live || !Array.isArray(list)) return false;
     const next = change(list as Point[]);
-    return !!next && update({ params: { control_points: next } });
+    // items that are no points (from a damaged or foreign file) are left out: the operator takes
+    // points only
+    return !!next && update({ params: { control_points: next.filter(isRecord) } });
   };
   /** Changes (or removes, for null) the point of a row, where it is now (nothing when it is gone). */
   const editPoint = (row: string, change: (pt: Point) => Point | null): boolean =>
@@ -1571,42 +1548,49 @@ function FModifierBox(p: {
           )}
           {m.type === 'ENVELOPE' && (
             <>
-              {points.map((pt, k) => (
-                <Row key={pointRows.keys[k]} label={k === 0 ? 'Control Points' : ''}>
-                  <div style={{ display: 'flex', gap: '2px' }}>
-                    {(['frame', 'min', 'max'] as const).map((f) => (
-                      <div key={f} style={{ flex: 1 }}>
-                        <NumberField
-                          label={f === 'frame' ? 'Fr' : f === 'min' ? 'Min' : 'Max'}
-                          value={pt[f]}
-                          precision={f === 'frame' ? 0 : 3}
-                          step={f === 'frame' ? 1 : 0.01}
-                          testId={`${p.testId}-point-${k}-${f}`}
-                          onChange={(v, final) => {
-                            if (!final) return;
-                            let from: unknown;
-                            const done = editPoint(pointRows.keys[k], (x) => {
-                              from = x.frame;
-                              return { ...x, [f]: v };
-                            });
-                            if (done && f === 'frame') pointRows.renamed(String(from), String(v));
-                          }}
-                        />
-                      </div>
-                    ))}
-                    <button
-                      class="btn flat icon"
-                      title="Remove control point"
-                      aria-label="Remove control point"
-                      data-testid={`${p.testId}-point-${k}-remove`}
-                      onClick={() => editPoint(pointRows.keys[k], () => null)}
-                    >
-                      <Icon name="close" size={12} />
-                    </button>
-                  </div>
-                </Row>
-              ))}
-              <Row label={points.length ? '' : 'Control Points'}>
+              {points.map((pt, k) =>
+                // an item that is no point (from a damaged or foreign file) has no row; the others
+                // keep their place in the list
+                !isRecord(pt) ? null : (
+                  <Row
+                    key={pointRows.keys[k]}
+                    label={k === points.findIndex(isRecord) ? 'Control Points' : ''}
+                  >
+                    <div style={{ display: 'flex', gap: '2px' }}>
+                      {(['frame', 'min', 'max'] as const).map((f) => (
+                        <div key={f} style={{ flex: 1 }}>
+                          <NumberField
+                            label={f === 'frame' ? 'Fr' : f === 'min' ? 'Min' : 'Max'}
+                            value={pt[f]}
+                            precision={f === 'frame' ? 0 : 3}
+                            step={f === 'frame' ? 1 : 0.01}
+                            testId={`${p.testId}-point-${k}-${f}`}
+                            onChange={(v, final) => {
+                              if (!final) return;
+                              let from: unknown;
+                              const done = editPoint(pointRows.keys[k], (x) => {
+                                from = x.frame;
+                                return { ...x, [f]: v };
+                              });
+                              if (done && f === 'frame') pointRows.renamed(String(from), String(v));
+                            }}
+                          />
+                        </div>
+                      ))}
+                      <button
+                        class="btn flat icon"
+                        title="Remove control point"
+                        aria-label="Remove control point"
+                        data-testid={`${p.testId}-point-${k}-remove`}
+                        onClick={() => editPoint(pointRows.keys[k], () => null)}
+                      >
+                        <Icon name="close" size={12} />
+                      </button>
+                    </div>
+                  </Row>
+                ),
+              )}
+              <Row label={points.some(isRecord) ? '' : 'Control Points'}>
                 <button
                   class="btn"
                   data-testid={`${p.testId}-add-point`}
@@ -1614,7 +1598,9 @@ function FModifierBox(p: {
                     // like Blender, nothing is added on a frame that has a point (it would replace it)
                     const frame = Math.round(s.state.frame);
                     editPoints((list) =>
-                      list.some((x) => x.frame === frame) ? null : [...list, { frame, min: -1, max: 1 }],
+                      list.some((x) => isRecord(x) && x.frame === frame)
+                        ? null
+                        : [...list, { frame, min: -1, max: 1 }],
                     );
                   }}
                 >

@@ -2,6 +2,7 @@ import { CONSTRAINT_TYPES, ROOT_COLLECTION_ID, type ConstraintCategory } from '@
 import { session } from '../app/store';
 import { registry } from './editor';
 import { lastRepeat } from './runner';
+import { readableBones } from '../ui/properties/bones';
 
 export interface MenuItem {
   label?: string;
@@ -386,7 +387,7 @@ export const PARENT_SET_MENU = (): MenuItem[] => {
     set('Object (Without Inverse)', { type: 'OBJECT', keep_transform: false }),
   ];
   if (active?.type === 'ARMATURE') {
-    const bones = (active.data ? s!.doc.getArmature(active.data)?.bones : null) ?? [];
+    const bones = active.data ? readableBones(s!.doc.getArmature(active.data)) : [];
     items.push(
       sep,
       set('Armature Deform', { type: 'ARMATURE' }),

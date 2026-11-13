@@ -52,9 +52,19 @@ describe('row keys that follow their items', () => {
     expect(match(rows(['a', 'b']), ['b', 'c'])).toEqual(['k1', 'new0']);
   });
 
-  it('duplicates keep their keys in order', () => {
-    expect(match(rows(['x', 'x', 'y']), ['x', 'y'])).toEqual(['k0', 'k2']);
-    expect(match(rows(['x', 'y', 'x']), ['y', 'x'])).toEqual(['k1', 'k2']);
+  it('equal items keep their keys in order while as many are left', () => {
+    expect(match(rows(['x', 'x', 'y']), ['x', 'x', 'y'])).toEqual(['k0', 'k1', 'k2']);
+    expect(match(rows(['x', 'x', 'y']), ['x', 'x'])).toEqual(['k0', 'k1']);
+  });
+
+  it('equal items fewer than before all get fresh keys', () => {
+    // regression: one of two splines with the same points (but other settings) was removed, and the
+    // one left took the removed one's key, with the setting typed for it
+    expect(match(rows(['x', 'x', 'y']), ['x', 'y'])).toEqual(['new0', 'k2']);
+    expect(match(rows(['x', 'y', 'x']), ['y', 'x'])).toEqual(['k1', 'new0']);
+    expect(match(rows(['x', 'x'], ['K', 'K']), ['x'], ['K'])).toEqual(['new0']);
+    // nor does an edited item of their kind take one of their keys
+    expect(match(rows(['x', 'x', 'y'], ['K', 'K', 'K']), ['x', 'z'], ['K', 'K'])).toEqual(['new0', 'k2']);
   });
 
   it('long lists match unchanged items in place and edited ones by kind', () => {
@@ -77,10 +87,39 @@ describe('row keys that follow their items', () => {
   });
 
   it('among equal items, the ones nearest their old place keep the keys', () => {
-    // one of three equal items removed at the end: the first two keep theirs
-    expect(match(rows(['x', 'x', 'x']), ['x', 'x'])).toEqual(['k0', 'k1']);
+    // an equal item added at the end: the first two keep theirs
+    expect(match(rows(['x', 'x']), ['x', 'x', 'x'])).toEqual(['k0', 'k1', 'new0']);
     // an item added in front of equal ones: they keep theirs
     expect(match(rows(['x', 'x']), ['y', 'x', 'x'])).toEqual(['new0', 'k0', 'k1']);
+  });
+
+  it('edited items are paired by kind only when as many of the kind changed as were left', () => {
+    // regression: one item removed and another of its kind edited in one change: the edited one took
+    // the removed one's key (and the text typed for the removed one went into it)
+    expect(match(rows(['a', 'b'], ['K', 'K']), ['b2'], ['K'])).toEqual(['new0']);
+    // and the other way round (an undo restores the removed one and the edit): no key is given away
+    expect(match(rows(['b2'], ['K']), ['a', 'b'], ['K', 'K'])).toEqual(['new0', 'new1']);
+    // as many on each side: paired in order
+    expect(match(rows(['a', 'b', 'c'], ['K', 'K', 'L']), ['a2', 'b2'], ['K', 'K'])).toEqual(['k0', 'k1']);
+  });
+
+  it('pairing edited items by kind takes time in proportion to the list', () => {
+    // regression: each edited item looked for its old row from the start of the gap (quadratic);
+    // every spline of a big curve changes when the curve is transformed
+    const n = 60_000;
+    const prev = rows(
+      Array.from({ length: n }, (_, i) => `a${i}`),
+      Array.from({ length: n }, () => 'POLY'),
+    );
+    const ids = Array.from({ length: n }, (_, i) => `b${i}`);
+    const kinds = Array.from({ length: n }, () => 'POLY');
+    const t0 = performance.now();
+    const keys = match(prev, ids, kinds);
+    const ms = performance.now() - t0;
+    expect(keys[0]).toBe('k0');
+    expect(keys[n - 1]).toBe(`k${n - 1}`);
+    // linear: tens of milliseconds; the quadratic search took seconds
+    expect(ms).toBeLessThan(1500);
   });
 
   it('without in-order pairing, an item another one replaced takes its key away', () => {

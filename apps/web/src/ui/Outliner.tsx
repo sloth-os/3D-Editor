@@ -244,6 +244,16 @@ export function Outliner({ session }: { session: ProjectSession }) {
   };
   const isOpen = (id: string, byDefault: boolean) => byDefault !== collapsed.has(id);
 
+  /**
+   * The object row the last press in the list began on, and where it was in the list then. A rename
+   * the press commits (the name box left) can re-sort the list under the pointer: the browser then
+   * sends the click to the list, not to the row pressed (see the list's onClick). Every press in the
+   * list starts afresh: a press that ended in no click on the list (released elsewhere, a drag to
+   * parent, a click an eye or a twisty keeps) is no press of a later click.
+   */
+  const pressed = useRef<{ o: ObjectData; row: Element; at: number } | null>(null);
+  const placeOf = (row: Element) => (row.parentElement ? [...row.parentElement.children].indexOf(row) : -1);
+
   const select = (o: ObjectData, e: MouseEvent) => {
     if (st.mode !== 'OBJECT' && o.id !== st.activeId) run('object.mode_set', { mode: 'OBJECT' }, 'ui');
     if (e.ctrlKey || e.shiftKey) {
@@ -327,6 +337,10 @@ export function Outliner({ session }: { session: ProjectSession }) {
           const id = e.dataTransfer?.getData('text/x-object');
           if (id && id !== o.id) run('object.parent_to', { objects: [id], parent: o.id }, 'ui');
         }}
+        onMouseDown={(e) => {
+          const row = e.currentTarget as Element;
+          pressed.current = e.button === 0 ? { o, row, at: placeOf(row) } : null;
+        }}
         onClick={(e) => select(o, e)}
         onDblClick={() => setRenaming(o.id)}
       >
@@ -343,9 +357,11 @@ export function Outliner({ session }: { session: ProjectSession }) {
           <RenameBox
             name={o.name}
             onRename={(name, enter) => {
-              // an object an agent deleted meanwhile takes nothing (Chromium blurs the removed box)
-              const stored = session.doc.getObject(o.id);
-              if (stored && (enter || (name && name !== stored.name)))
+              // an object an agent deleted meanwhile takes nothing (Chromium blurs the removed box).
+              // Leaving the box renames to a name typed in it: the box drawn last showed the object's
+              // name then (an agent's rename that also took the row away, out of a filter or into a
+              // closed collection, drew it no more and is not undone with the name it showed)
+              if (session.doc.getObject(o.id) && (enter || (name && name !== o.name)))
                 run('object.rename', { object: o.id, name }, 'ui');
               setRenaming(null);
             }}
@@ -490,7 +506,23 @@ export function Outliner({ session }: { session: ProjectSession }) {
           onInput={(e) => setFilter((e.target as HTMLInputElement).value)}
         />
       </div>
-      <div data-testid="outliner">{rows}</div>
+      <div
+        data-testid="outliner"
+        // before the row's own handler, which records a press on it
+        onMouseDownCapture={() => {
+          pressed.current = null;
+        }}
+        onClick={(e) => {
+          // a click that reached the list itself: the row pressed moved away from under the pointer
+          // before the release (else the click is the row's, or the press and release were on two
+          // rows, which is no click on either)
+          const p = pressed.current;
+          if (p && e.target === e.currentTarget && p.row.isConnected && placeOf(p.row) !== p.at)
+            if (session.doc.getObject(p.o.id)) select(p.o, e);
+        }}
+      >
+        {rows}
+      </div>
       {objects.length === 0 && <div class="empty-note">Empty scene — press Shift+A to add objects</div>}
     </div>
   );

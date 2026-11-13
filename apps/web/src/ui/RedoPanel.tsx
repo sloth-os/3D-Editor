@@ -26,6 +26,7 @@ import { isRecord } from './properties/ObjectTab';
 import { ikSettingValues, shapeKeyPath } from './properties/DataTab';
 import { constraintPath } from './properties/ConstraintsTab';
 import { animatedValue } from './properties/prop-edit';
+import { readableBones } from './properties/bones';
 
 type Params = Record<string, unknown>;
 
@@ -107,7 +108,7 @@ export type WorldAt = ((id: string) => Mat4) | null;
 
 /** Bone names of an armature object (empty for other objects). */
 function boneNames(doc: SceneDoc, o: ObjectData | null): string[] {
-  return o?.type === 'ARMATURE' && o.data ? (doc.getArmature(o.data)?.bones.map((b) => b.name) ?? []) : [];
+  return o?.type === 'ARMATURE' && o.data ? readableBones(doc.getArmature(o.data)).map((b) => b.name) : [];
 }
 
 /** The constraint type (and owner) an object constraint operation works with. */
@@ -198,7 +199,7 @@ function keptValues(
     }
     case 'armature.bone_update': {
       const o = editedObject(doc, last, params);
-      const bones = o?.type === 'ARMATURE' && o.data ? (doc.getArmature(o.data)?.bones ?? []) : [];
+      const bones = o?.type === 'ARMATURE' && o.data ? readableBones(doc.getArmature(o.data)) : [];
       const named = (n: unknown) => bones.find((b) => b.name === n);
       // under the name the run reports (a rename in the same call makes the name unique); without
       // a report, the bone asked for or the one renamed to the new name

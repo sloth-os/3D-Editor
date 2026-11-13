@@ -351,6 +351,21 @@ describe('Adjust Last Operation only offers values the operator accepts', () => 
     expect(optionLabels(field(root, 'redo-target'))).toEqual(['— none —', 'Rig']);
   });
 
+  it('Add Constraint: the bones of an armature whose list holds items that are none (an old or foreign file)', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.armature_add', { name: 'Rig', bone_name: 'Hand' });
+    select(s, 'Cube');
+    ok('object.constraint_add', { type: 'COPY_LOCATION', target: 'Rig' });
+    // the damaged list comes from elsewhere (a file another program wrote, synced in): no step of
+    // this session
+    const agent = agentReplica(s);
+    const arm = agent.doc.getArmature(agent.doc.findObjectByName('Rig')!.data!)!;
+    agent.doc.updateArmature(arm.id, { bones: [null, ...arm.bones, 'junk'] as unknown as typeof arm.bones });
+    const root = panel();
+    expect(optionLabels(field(root, 'redo-subtarget'))).toEqual(['— none —', 'Hand']);
+    expect(optionLabels(field(root, 'redo-target'))).toEqual(['— none —', 'Rig']);
+  });
+
   it('Set Constraint Properties: hides the constraint id, shows the current target and filters it', () => {
     ok('mesh.primitive_cube_add', { name: 'Cube' });
     ok('object.light_add', { name: 'Light' });

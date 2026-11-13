@@ -197,9 +197,10 @@ export const TYPING_PAUSE_MS = 1500;
 export function installKeymap(): () => void {
   // The field keys are being typed into, while the typing goes on. When it is taken away under the
   // person's fingers (an agent made another object active, ran another operation, removed what it
-  // edits), the keys typed on reach the editor: they were meant for the field, not to play the
-  // animation (Space), undo (Ctrl+Z) or delete (X). Enter, Escape, Tab and pointer presses end the
-  // typing, so a shortcut pressed right after them works.
+  // edits, or reordered the list it is in: Chromium takes the focus from a field that moves), the keys
+  // typed on reach the editor: they were meant for the field, not to play the animation (Space), undo
+  // (Ctrl+Z) or delete (X). Enter, Escape, Tab and pointer presses end the typing, so a shortcut
+  // pressed right after them works.
   let typing: { field: EventTarget; at: number } | null = null;
   const onTyped = (e: KeyboardEvent) => {
     if (!isTyping(e)) return;
@@ -211,9 +212,17 @@ export function installKeymap(): () => void {
   const onPointer = () => {
     typing = null;
   };
+  /**
+   * Whether the field typed into lost the keyboard focus to no element: it was taken out of the page,
+   * or moved or hidden in it. (A focus the page moves on to another element, a menu item, is not that.)
+   */
+  const lostFocus = (field: EventTarget): boolean => {
+    const focus = document.activeElement;
+    return !(field as Node).isConnected || !focus || focus === document.body;
+  };
   /** Whether a key is typed on after the field it was typed into went away (see above). */
   const typedForGoneField = (e: KeyboardEvent): boolean => {
-    if (!typing || isTyping(e) || (typing.field as Node).isConnected) return false;
+    if (!typing || isTyping(e) || !lostFocus(typing.field)) return false;
     const now = performance.now();
     if (now - typing.at > TYPING_PAUSE_MS) {
       typing = null;

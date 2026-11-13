@@ -40,6 +40,7 @@ import {
 } from '../fields/fields';
 import { animState, animatedValue, setProp } from './prop-edit';
 import { useRowKeys } from '../fields/row-keys';
+import { readableBones } from './bones';
 import { animatedBlock } from './animated';
 import { run, runResult } from '../../editor/editor';
 import { Icon, type IconName } from '../icons';
@@ -102,6 +103,16 @@ const activeBones = signal<Record<string, ActiveEntry>>({});
 const activeSplines = signal<Record<string, number>>({});
 /** Weight used by Assign in Edit Mode (Blender's tool setting vertex_group_weight). */
 const vertexGroupWeight = signal(1);
+
+/**
+ * Whether the object of a panel is still there with this type and data: a field commits as it goes
+ * away, also after an agent deleted the object (its data living on in a linked duplicate) or
+ * converted it to another type. The operators are addressed by the object: nothing to change then.
+ */
+const stillHas = (s: ProjectSession, o: ObjectData, dataId: string | undefined): boolean => {
+  const now = s.doc.getObject(o.id);
+  return !!now && now.type === o.type && now.data === dataId;
+};
 
 const SUBHEAD = { margin: '6px 0 2px', fontWeight: 600, color: 'var(--text-dim)' } as const;
 const LIST_STYLE = {
@@ -303,6 +314,11 @@ function VertexGroupsPanel(p: { s: ProjectSession; o: ObjectData; meshId: string
     ),
   );
   const active = groups[index] ?? null;
+  // the fields of the active group are built anew for another group (an agent removed or renamed
+  // the active one: a name typed for it never goes to the group shown in its place), not when the
+  // group is renamed here (they keep the keyboard focus then)
+  const groupRows = useRowKeys(groups, (g) => g.name, { inOrder: false });
+  const activeRow = active ? groupRows.keys[index] : '';
   const select = (name: string) =>
     (activeVertexGroups.value = {
       ...activeVertexGroups.value,
@@ -356,7 +372,7 @@ function VertexGroupsPanel(p: { s: ProjectSession; o: ObjectData; meshId: string
         }
       />
       {active && (
-        <>
+        <Fragment key={activeRow}>
           <Row label="Name">
             <TextField
               value={active.name}
@@ -366,14 +382,21 @@ function VertexGroupsPanel(p: { s: ProjectSession; o: ObjectData; meshId: string
                 const name = v.trim();
                 if (!name || name === active.name) return;
                 // the commit as the field goes away can come after an agent removed the group
-                if (!s.doc.getVertexGroups(meshId).some((g) => g.name === active.name)) return;
+                if (
+                  !stillHas(s, o, meshId) ||
+                  !s.doc.getVertexGroups(meshId).some((g) => g.name === active.name)
+                )
+                  return;
                 const r = runResult(
                   'object.vertex_group_rename',
                   { object: o.id, group: active.name, name },
                   'ui',
                 );
                 const renamed = (r?.result as { group?: string } | undefined)?.group;
-                if (r?.ok) select(renamed ?? name);
+                if (r?.ok) {
+                  groupRows.renamed(active.name, renamed ?? name);
+                  select(renamed ?? name);
+                }
               }}
             />
           </Row>
@@ -419,7 +442,7 @@ function VertexGroupsPanel(p: { s: ProjectSession; o: ObjectData; meshId: string
           ) : (
             <div class="hint">Assign selected vertices with a weight in Edit Mode (Tab).</div>
           )}
-        </>
+        </Fragment>
       )}
       {groups.length > 0 && (
         <div style={BUTTON_ROW}>
@@ -494,7 +517,7 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
       },
       // a key an agent removed or renamed meanwhile takes nothing (no error toast)
       () => {
-        if (s.doc.getShapeKeys(meshId).some((x) => x.name === k.name))
+        if (stillHas(s, o, meshId) && s.doc.getShapeKeys(meshId).some((x) => x.name === k.name))
           run('object.shape_key_set', { object: o.id, key: k.name, [field]: v }, 'ui');
       },
     );
@@ -612,7 +635,7 @@ function ShapeKeysPanel({ s, o, meshId }: { s: ProjectSession; o: ObjectData; me
                 const name = v.trim();
                 if (!name || name === active.name) return;
                 // the commit as the field goes away can come after an agent removed the key
-                if (!liveKeyNames().includes(active.name)) return;
+                if (!stillHas(s, o, meshId) || !liveKeyNames().includes(active.name)) return;
                 const r = runResult('object.shape_key_set', { object: o.id, key: active.name, name }, 'ui');
                 const renamed = (r?.result as { key?: string } | undefined)?.key;
                 if (r?.ok && renamed) {
@@ -761,6 +784,7 @@ function CurvePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
         return () => s.doc.updateCurve(curve.id, { [field]: before } as Partial<CurveData>);
       },
       () => {
+        if (!stillHas(s, o, curve.id)) return;
         const op = curveFieldOperator(o.id, field, value);
         run(op.id, op.params, 'ui');
       },
@@ -1251,7 +1275,7 @@ function ActiveSplinePanel({ s, o, curve }: { s: ProjectSession; o: ObjectData; 
   /** The stored spline of these fields and its index now (null once an agent removed it). */
   const live = (): { i: number; spline: Spline } | null => {
     const i = splineRows.indexOf(activeKey);
-    const stored = i < 0 ? undefined : s.doc.getCurve(curve.id)?.splines?.[i];
+    const stored = i < 0 || !stillHas(s, o, curve.id) ? undefined : s.doc.getCurve(curve.id)?.splines?.[i];
     return stored ? { i, spline: sanitizeSpline(stored) } : null;
   };
   /**
@@ -1469,7 +1493,7 @@ const boneLength = (b: BoneData) =>
 
 function ArmaturePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
   const arm = s.doc.getArmature(o.data!);
-  const bones = arm && Array.isArray(arm.bones) ? arm.bones : [];
+  const bones = readableBones(arm);
   // the bone's panels are built anew for another bone, not when the bone is renamed here (they keep
   // the keyboard focus then)
   const boneRows = useRowKeys(bones, (b) => String(b?.name), { inOrder: false });
@@ -1486,7 +1510,7 @@ function ArmaturePanels({ s, o }: { s: ProjectSession; o: ObjectData }) {
     (activeBones.value = {
       ...activeBones.value,
       [o.id]: entryOf(
-        (s.doc.getArmature(o.data!)?.bones ?? []).map((b) => b.name),
+        readableBones(s.doc.getArmature(o.data!)).map((b) => b.name),
         name,
       ),
     });
@@ -1830,7 +1854,9 @@ function BoneIkPanel({
 function hasBone(s: ProjectSession, objectId: string, name: string): boolean {
   const o = s.doc.getObject(objectId);
   return (
-    o?.type === 'ARMATURE' && !!o.data && !!s.doc.getArmature(o.data)?.bones?.some((b) => b.name === name)
+    o?.type === 'ARMATURE' &&
+    !!o.data &&
+    readableBones(s.doc.getArmature(o.data)).some((b) => b.name === name)
   );
 }
 
@@ -1845,7 +1871,7 @@ function BoneFields(p: {
   const { s, o, armId, bone, bones } = p;
   // a field commits as it goes away, also after an agent removed the bone: nothing to change then
   const update = (patch: Record<string, unknown>) =>
-    s.doc.getArmature(armId)?.bones?.some((b) => b.name === bone.name)
+    stillHas(s, o, armId) && readableBones(s.doc.getArmature(armId)).some((b) => b.name === bone.name)
       ? runResult('armature.bone_update', { object: o.id, bone: bone.name, ...patch }, 'ui')
       : null;
   /** Sets a rest field of this bone in the current bone list (other bones stay as they are now). */
@@ -1853,7 +1879,7 @@ function BoneFields(p: {
     const cur = s.doc.getArmature(armId);
     if (!cur || !Array.isArray(cur.bones)) return;
     s.doc.updateArmature(armId, {
-      bones: cur.bones.map((b) => (b.name === bone.name ? { ...b, [field]: v } : b)),
+      bones: cur.bones.map((b) => (b?.name === bone.name ? { ...b, [field]: v } : b)),
     });
   };
   const setRest = (field: 'head' | 'tail' | 'roll', v: Vec3 | number, final: boolean) =>
@@ -1863,7 +1889,7 @@ function BoneFields(p: {
       final,
       () => writeRest(field, v),
       () => {
-        const before = s.doc.getArmature(armId)?.bones?.find((b) => b.name === bone.name)?.[field];
+        const before = readableBones(s.doc.getArmature(armId)).find((b) => b.name === bone.name)?.[field];
         return () => {
           if (before !== undefined) writeRest(field, before);
         };
@@ -2177,7 +2203,7 @@ function AddIkForm({
   const targetObj = target ? s.doc.getObject(target) : o;
   const targetBones =
     targetObj?.type === 'ARMATURE' && targetObj.data
-      ? (target ? (s.doc.getArmature(targetObj.data)?.bones ?? []) : bones)
+      ? (target ? readableBones(s.doc.getArmature(targetObj.data)) : bones)
           .map((b) => b.name)
           .filter((n) => target || n !== bone.name)
       : [];

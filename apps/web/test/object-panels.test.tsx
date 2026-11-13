@@ -12,6 +12,7 @@ import {
 } from '@3d-editor/core';
 import { session as sessionSignal, toasts } from '../src/app/store';
 import { registry, run, runResult } from '../src/editor/editor';
+import { PARENT_SET_MENU } from '../src/editor/menus';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
 import { Properties, activePropertiesTab, availableTabs } from '../src/ui/properties/Properties';
@@ -19,6 +20,7 @@ import { Outliner } from '../src/ui/Outliner';
 import { Sidebar } from '../src/ui/Viewport';
 import { layoutConstraintParams, constraintEnumLabel } from '../src/ui/properties/ConstraintsTab';
 import { channelLabel } from '../src/ui/properties/ObjectTab';
+import { PRESS_GRACE_MS } from '../src/ui/properties/shown-object';
 import { removalLikeChromium, settle } from './removal';
 
 /** A project session backed by a real document, evaluator, undo manager and operator registry. */
@@ -89,7 +91,11 @@ function dragNumber(el: HTMLElement, dx: number, during?: () => void): void {
  * A second replica of the project (another device or an MCP agent) synced both ways like the sync
  * hub; `run` executes an operator there, outside this session's undo history.
  */
-function peerReplica(s: ProjectSession): { run: (id: string, params: Record<string, unknown>) => void } {
+function peerReplica(s: ProjectSession): {
+  run: (id: string, params: Record<string, unknown>) => void;
+  /** The peer's own selection (operators such as object.convert work on it). */
+  state: OperatorContext['state'];
+} {
   const peer = SceneDoc.fromUpdate(s.doc.encodeState(), { type: 'agent' });
   s.doc.ydoc.on('update', (u: Uint8Array, origin: unknown) => {
     if (origin !== 'from-peer') Y.applyUpdate(peer.ydoc, u, 'from-main');
@@ -109,6 +115,7 @@ function peerReplica(s: ProjectSession): { run: (id: string, params: Record<stri
       const r = registry.run(ctx, id, params);
       if (!r.ok) throw new Error(`${id} failed on the peer: ${r.error}`);
     },
+    state: ctx.state,
   };
 }
 
@@ -575,6 +582,124 @@ describe('malformed stored data', () => {
     const outliner = render(<Outliner session={s} />);
     expect(byTestId(outliner.container, 'outl-badge-Cube-constraints')).not.toBeNull();
   });
+
+  // lists of an old or foreign file whose items are not all records: the panels show (and add to)
+  // the items that are, instead of the tab failing to draw
+  it('shows and adds to the variables of a driver whose list holds items that are none', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.empty_add', { name: 'Ctrl' });
+    const ctrl = s.doc.findObjectByName('Ctrl')!.id;
+    ok('anim.driver_add', {
+      target_type: 'object',
+      target: 'Cube',
+      path: 'location',
+      index: 2,
+      expression: 'a',
+      variables: [{ name: 'a', target_type: 'object', target: ctrl, path: 'location', index: 0 }],
+    });
+    const cube = s.doc.findObjectByName('Cube')!.id;
+    const key = fcurveKey({ target_type: 'object', target_id: cube, path: 'location', index: 2 });
+    const d = s.doc.getDriver(key)!;
+    s.doc.setDriver({ ...d, variables: [null, ...d.variables, 'junk'] as unknown as typeof d.variables });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-drivers', '1');
+    const { container } = render(<Properties session={s} />);
+    expect(byTestId(container, 'driver-location-2-var-0')).not.toBeNull();
+    expect(byTestId(container, 'driver-location-2-var-1')).toBeNull();
+    fireEvent.click(byTestId(container, 'driver-location-2-add-variable')!);
+    expect(s.doc.getDriver(key)!.variables.map((v) => v.name)).toEqual(['a', 'var']);
+  });
+
+  it('shows and adds to the control points of an envelope whose list holds items that are none', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    const cube = s.doc.findObjectByName('Cube')!.id;
+    ok('anim.keyframe_insert_property', {
+      target_type: 'object',
+      target: 'Cube',
+      path: 'location',
+      index: 0,
+    });
+    ok('anim.fmodifier_add', {
+      target_type: 'object',
+      target: cube,
+      path: 'location',
+      index: 0,
+      type: 'ENVELOPE',
+    });
+    const key = fcurveKey({ target_type: 'object', target_id: cube, path: 'location', index: 0 });
+    const setPoints = (points: unknown[]) => {
+      const fc = s.doc.getFCurve(key)!;
+      const m = fc.modifiers![0];
+      const params = { ...m.params, control_points: points } as unknown as typeof m.params;
+      s.doc.setFCurve({ ...fc, modifiers: [{ ...m, params }] });
+    };
+    const points = () => s.doc.getFCurve(key)!.modifiers![0].params.control_points as unknown as unknown[];
+    setPoints([null, 7]);
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-fcurves', '1');
+    const { container } = render(<Properties session={s} />);
+    const labels = () =>
+      byTestId(container, 'fcurve-location-0-mod-0')!.textContent!.split('Control Points').length - 1;
+    // no point: the list's label is on its Add row
+    expect(byTestId(container, 'fcurve-location-0-mod-0-point-0-min')).toBeNull();
+    expect(labels()).toBe(1);
+    act(() => {
+      s.state.frame = 5;
+    });
+    fireEvent.click(byTestId(container, 'fcurve-location-0-mod-0-add-point')!);
+    expect(points().filter((p) => p !== null && typeof p === 'object')).toEqual([
+      { frame: 5, min: -1, max: 1 },
+    ]);
+    // a point behind the items that are none: its row has the label, and adding on its frame adds nothing
+    act(() => setPoints([null, { frame: 5, min: -1, max: 1 }, 7]));
+    expect(byTestId(container, 'fcurve-location-0-mod-0-point-1-min')).not.toBeNull();
+    expect(labels()).toBe(1);
+    fireEvent.click(byTestId(container, 'fcurve-location-0-mod-0-add-point')!);
+    expect(points().filter((p) => p !== null && typeof p === 'object')).toEqual([
+      { frame: 5, min: -1, max: 1 },
+    ]);
+  });
+
+  it('shows the bones of an armature whose list holds items that are none, in its panels and pickers', () => {
+    ok('object.armature_add', { name: 'Rig' });
+    ok('armature.bone_add', { object: 'Rig', name: 'Hand', head: [0, 0, 1], tail: [0, 0, 2] });
+    ok('object.armature_add', { name: 'Other', location: [3, 0, 0] });
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.parent_to', { objects: ['Cube'], parent: 'Rig', type: 'BONE', bone: 'Bone' });
+    ok('object.constraint_add', { object: 'Cube', type: 'COPY_LOCATION', target: 'Rig', subtarget: 'Bone' });
+    for (const name of ['Rig', 'Other']) {
+      const arm = s.doc.getArmature(s.doc.findObjectByName(name)!.data!)!;
+      s.doc.updateArmature(arm.id, { bones: [null, ...arm.bones, 'junk'] as unknown as typeof arm.bones });
+    }
+    select(s, 'Rig');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    expect((byTestId(container, 'bone-name') as HTMLInputElement).value).toBe('Bone');
+    const options = (id: string) =>
+      [...(byTestId(container, id) as HTMLSelectElement).options].map((o) => o.value).filter(Boolean);
+    // a bone chosen in the list
+    fireEvent.click(byTestId(container, 'bone-Hand')!);
+    expect((byTestId(container, 'bone-name') as HTMLInputElement).value).toBe('Hand');
+    // the bones of another armature as the target of an IK chain
+    fireEvent.change(byTestId(container, 'pose-ik-target')!, {
+      target: { value: s.doc.findObjectByName('Other')!.id },
+    });
+    expect(options('pose-ik-bone')).toEqual(['Bone']);
+    const boneMenu = PARENT_SET_MENU().find((i) => i.label === 'Bone')?.submenu;
+    const boneItems = typeof boneMenu === 'function' ? boneMenu() : boneMenu;
+    expect(boneItems?.map((i) => i.label)).toEqual(['Bone', 'Hand']);
+    act(() => {
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+    });
+    expect(options('object-parent-bone')).toEqual(['Bone', 'Hand']);
+    act(() => {
+      activePropertiesTab.value = 'constraints';
+    });
+    expect(options('constraint-Copy Location-bone')).toEqual(['Bone', 'Hand']);
+  });
 });
 
 describe('registry wiring', () => {
@@ -676,6 +801,176 @@ describe('slider drags next to concurrent edits (other devices, MCP agents)', ()
     )!;
     expect(fc.keyframes.map((k) => k.frame)).toEqual([1, 20]);
     expect(fc.modifiers?.[0].params.strength).toBeCloseTo(2);
+  });
+});
+
+describe('a slider drag whose field is taken away', () => {
+  it('ends on the value it reached, for what it was dragging, as its own undo step', async () => {
+    // regression: an agent put another material in the slot during a Roughness drag; the rebuilt
+    // panel took the field away, the drag never ended, and the next drag of the field went on with
+    // it (one undo step for both gestures)
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    ok('material.new', { name: 'A' });
+    ok('material.new', { name: 'B', assign: false });
+    activePropertiesTab.value = 'material';
+    const mat = (name: string) => s.doc.listMaterials().find((m) => m.name === name)!;
+    const ids = { a: mat('A').id, b: mat('B').id };
+    const before = { a: mat('A').roughness, b: mat('B').roughness };
+    const agent = peerReplica(s);
+    const cube = () => s.doc.findObjectByName('Cube')!.id;
+    const { container } = render(<Properties session={s} />);
+    const depth = s.undo.undoStack.length;
+    const field = () => byTestId(container, 'material-roughness')!;
+    fireEvent.pointerDown(field(), { button: 0, clientX: 100, pointerId: 1 });
+    fireEvent.pointerMove(field(), { clientX: 120, pointerId: 1 });
+    const reached = mat('A').roughness;
+    expect(reached).toBeCloseTo(before.a + 0.2);
+    act(() => agent.run('object.material_assign', { material: ids.b, objects: [cube()], slot: 0 }));
+    // the rest of the gesture reaches the field now there (Material B's), which has no drag
+    fireEvent.pointerMove(field(), { clientX: 140, pointerId: 1 });
+    fireEvent.pointerUp(field(), { clientX: 140, pointerId: 1 });
+    await settle();
+    expect(mat('A').roughness).toBeCloseTo(reached);
+    expect(mat('B').roughness).toBe(before.b);
+    expect(s.undo.undoStack.length).toBe(depth + 1);
+    // Material A comes back, and a new drag of the field is a gesture (and an undo step) of its own
+    act(() => agent.run('object.material_assign', { material: ids.a, objects: [cube()], slot: 0 }));
+    dragNumber(field(), 20);
+    expect(mat('A').roughness).toBeCloseTo(reached + 0.2);
+    expect(s.undo.undoStack.length).toBe(depth + 2);
+    act(() => void s.undo.undo());
+    expect(mat('A').roughness).toBeCloseTo(reached);
+    act(() => void s.undo.undo());
+    expect(mat('A').roughness).toBe(before.a);
+  });
+});
+
+describe('a press on a slider whose field is taken away before any drag', () => {
+  it('writes nothing and leaves no undo step', async () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    ok('material.new', { name: 'A' });
+    ok('material.new', { name: 'B', assign: false });
+    activePropertiesTab.value = 'material';
+    const mat = (name: string) => s.doc.listMaterials().find((m) => m.name === name)!;
+    const before = mat('A').roughness;
+    const agent = peerReplica(s);
+    const { container } = render(<Properties session={s} />);
+    const depth = s.undo.undoStack.length;
+    fireEvent.pointerDown(byTestId(container, 'material-roughness')!, {
+      button: 0,
+      clientX: 100,
+      pointerId: 1,
+    });
+    act(() =>
+      agent.run('object.material_assign', {
+        material: mat('B').id,
+        objects: [s.doc.findObjectByName('Cube')!.id],
+        slot: 0,
+      }),
+    );
+    await settle();
+    expect(mat('A').roughness).toBe(before);
+    expect(s.undo.undoStack.length).toBe(depth);
+  });
+});
+
+describe('undo of slider drags', () => {
+  // regression: a drag's live values were written as if by someone else, so undo could not take the
+  // field back past an earlier change of it: the step was skipped and Ctrl+Z undid an older one
+  // instead (deleting the object), leaving the field as the first drag left it
+  const cubeX = () => s.doc.findObjectByName('Cube')?.location[0];
+
+  it('two drags of one field are undone one at a time', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    const { container } = render(<Properties session={s} />);
+    const depth = s.undo.undoStack.length;
+    dragNumber(byTestId(container, 'loc-0')!, 50);
+    const first = cubeX();
+    dragNumber(byTestId(container, 'loc-0')!, 50);
+    expect(cubeX()).toBeGreaterThan(first!);
+    expect(s.undo.undoStack.length).toBe(depth + 2);
+    act(() => void s.undo.undo());
+    expect(cubeX()).toBe(first);
+    act(() => void s.undo.undo());
+    expect(cubeX()).toBe(0);
+    expect(s.undo.undoStack.length).toBe(depth);
+    // and back again
+    act(() => void s.undo.redo());
+    act(() => void s.undo.redo());
+    expect(cubeX()).toBeGreaterThan(first!);
+  });
+
+  it('a typed value and then a drag of the same field are undone one at a time', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    const { container } = render(<Properties session={s} />);
+    typeNumber(byTestId(container, 'loc-0')!, '2');
+    dragNumber(byTestId(container, 'loc-0')!, 50);
+    expect(cubeX()).toBeGreaterThan(2);
+    act(() => void s.undo.undo());
+    expect(cubeX()).toBe(2);
+    act(() => void s.undo.undo());
+    expect(cubeX()).toBe(0);
+  });
+
+  it('two constraint drags are undone one at a time', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.empty_add', { name: 'Target', location: [0, 5, 0] });
+    ok('object.constraint_add', { object: 'Cube', type: 'TRACK_TO', target: 'Target' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'constraints';
+    const { container } = render(<Properties session={s} />);
+    const influence = () => s.doc.findObjectByName('Cube')?.constraints[0]?.influence;
+    const depth = s.undo.undoStack.length;
+    dragNumber(byTestId(container, 'constraint-Track To-influence')!, -20);
+    const first = influence();
+    dragNumber(byTestId(container, 'constraint-Track To-influence')!, -20);
+    expect(influence()).toBeLessThan(first!);
+    act(() => void s.undo.undo());
+    expect(influence()).toBe(first);
+    act(() => void s.undo.undo());
+    expect(influence()).toBe(1);
+    expect(s.undo.undoStack.length).toBe(depth);
+    expect(s.doc.findObjectByName('Target')).not.toBeNull();
+  });
+
+  it('a drag of a light an agent deletes meanwhile leaves no step', () => {
+    ok('object.light_add', { name: 'Lamp', type: 'POINT' });
+    select(s, 'Lamp');
+    activePropertiesTab.value = 'data';
+    const agent = peerReplica(s);
+    const { container } = render(<Properties session={s} />);
+    const depth = s.undo.undoStack.length;
+    dragNumber(byTestId(container, 'light-energy')!, 50, () =>
+      agent.run('object.delete', { objects: [s.doc.findObjectByName('Lamp')!.id] }),
+    );
+    expect(s.doc.listObjects()).toEqual([]);
+    // the live values went with the light: no step that undoes nothing (Yjs would undo the step
+    // before it on that Ctrl+Z)
+    expect(s.undo.undoStack.length).toBe(depth);
+  });
+
+  it('a drag of a modifier an agent removes meanwhile leaves no step and undoes nothing else', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    ok('object.modifier_add', { object: 'Cube', type: 'SUBSURF' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'modifiers';
+    const agent = peerReplica(s);
+    const { container } = render(<Properties session={s} />);
+    const cube = () => s.doc.findObjectByName('Cube');
+    const depth = s.undo.undoStack.length;
+    dragNumber(byTestId(container, 'mod-subsurf-render_levels')!, 30, () =>
+      agent.run('object.modifier_remove', { object: cube()!.id, modifier: cube()!.modifiers[0].id }),
+    );
+    expect(cube()!.modifiers).toEqual([]);
+    expect(s.undo.undoStack.length).toBe(depth);
+    // the live values' step, undone at the release, changed nothing: no earlier step undone instead
+    expect(cube()).not.toBeNull();
   });
 });
 
@@ -1125,6 +1420,283 @@ describe('fields that outlive what they were typed for (another object shown, ro
     name.blur();
     await new Promise((r) => setTimeout(r, 200));
     expect(shownName(container)).toBe('Other');
+  });
+
+  describe('a panel held for the person working in it while an agent makes another object active', () => {
+    /**
+     * Moves the focus from one element to another (or to none) in the order browsers use: no element
+     * has the focus while the element left gets its change event (when its text changed), then its
+     * blur and focusout, which name the next element; the page's microtasks run between them.
+     * (happy-dom's own blur and focusout name no next element: they are held back.)
+     */
+    const moveFocus = async (from: HTMLElement, to: HTMLElement | null, changed: boolean) => {
+      const hold = (e: Event) => e.stopImmediatePropagation();
+      document.addEventListener('blur', hold, true);
+      document.addEventListener('focusout', hold, true);
+      act(() => from.blur());
+      document.removeEventListener('blur', hold, true);
+      document.removeEventListener('focusout', hold, true);
+      if (changed) {
+        act(() => void from.dispatchEvent(new Event('change', { bubbles: true })));
+        await settle();
+      }
+      act(() => void from.dispatchEvent(new FocusEvent('blur', { relatedTarget: to })));
+      await settle();
+      act(() => void from.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: to })));
+      await settle();
+      if (to?.isConnected) act(() => to.focus());
+    };
+    const wait = (ms: number) => act(async () => await new Promise((r) => setTimeout(r, ms)));
+    const press = (el: HTMLElement) => fireEvent.pointerDown(el, { button: 0, clientX: 5, pointerId: 1 });
+    const release = (el: HTMLElement) => fireEvent.pointerUp(el, { button: 0, clientX: 5, pointerId: 1 });
+    const box = () => s.doc.findObjectByName('Box');
+    const other = () => s.doc.findObjectByName('Other')!;
+    /** The Cube's Object tab with "Box" typed into its name, held as an agent makes Other active. */
+    function typedThenAgentSelects() {
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Other', location: [3, 0, 0] });
+      ok('data.set_property', {
+        kind: 'objects',
+        target: s.doc.findObjectByName('Cube')!.id,
+        values: { custom_props: { weight: 1 } },
+      });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      localStorage.setItem('3d-editor:panel:Custom Properties', '1');
+      const { container } = render(<Properties session={s} />);
+      const name = byTestId(container, 'object-name') as HTMLInputElement;
+      name.focus();
+      fireEvent.input(name, { target: { value: 'Box' } });
+      act(() => select(s, 'Other'));
+      expect(shownName(container)).toBe('Box');
+      return { container, name };
+    }
+
+    it('going on to another text field of it keeps it, also when the change event comes first', async () => {
+      // regression: browsers send the field left its change event while no element has the focus; the
+      // rename it commits drew the panel for the active object, which took the next field away (and
+      // the keys typed on reached the editor)
+      const { container, name } = typedThenAgentSelects();
+      const weight = byTestId(container, 'custom-prop-weight') as HTMLInputElement;
+      await moveFocus(name, weight, true);
+      expect(box()).not.toBeNull();
+      expect(weight.isConnected).toBe(true);
+      expect(document.activeElement).toBe(weight);
+      expect(shownName(container)).toBe('Box');
+      fireEvent.input(weight, { target: { value: '4' } });
+      fireEvent.keyDown(weight, { key: 'Enter' });
+      expect(box()!.custom_props).toEqual({ weight: 4 });
+      expect(other().custom_props?.weight).toBeUndefined();
+      // the focus leaving the panel shows the active object
+      await moveFocus(weight, null, false);
+      expect(shownName(container)).toBe('Other');
+    });
+
+    it('Tab from a number entry of it to a text field keeps it (the entry closes as the focus leaves it)', async () => {
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Other', location: [3, 0, 0] });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      const { container } = render(<Properties session={s} />);
+      const input = typeInEntry(byTestId(container, 'loc-0')!, '-7');
+      act(() => select(s, 'Other'));
+      const name = byTestId(container, 'object-name') as HTMLInputElement;
+      await moveFocus(input, name, false);
+      // the entry's blur committed the number and closed the entry
+      expect(input.isConnected).toBe(false);
+      expect(s.doc.findObjectByName('Cube')!.location).toEqual([-7, 0, 0]);
+      expect(name.isConnected).toBe(true);
+      expect(document.activeElement).toBe(name);
+      fireEvent.input(name, { target: { value: 'Box' } });
+      fireEvent.keyDown(name, { key: 'Enter' });
+      expect(box()!.location).toEqual([-7, 0, 0]);
+      expect(other().location).toEqual([3, 0, 0]);
+    });
+
+    it('a click on a checkbox of it sets the held object, and the active object is shown after it', async () => {
+      // regression: the press moved the focus out of the text field and the panel was drawn for the
+      // active object under the pointer: the click was lost, or went to the other object
+      const { container, name } = typedThenAgentSelects();
+      const label = () =>
+        [...container.querySelectorAll<HTMLElement>('.checkbox')].find((el) =>
+          el.textContent?.includes('Show in Viewports'),
+        )!;
+      // the label takes no focus: none has it after the press
+      press(label());
+      await moveFocus(name, null, true);
+      release(label());
+      fireEvent.click(label());
+      expect(box()!.hide_viewport).toBe(true);
+      expect(other().hide_viewport).toBeFalsy();
+      expect(shownName(container)).toBe('Box');
+      await wait(PRESS_GRACE_MS + 50);
+      expect(shownName(container)).toBe('Other');
+    });
+
+    it('a click on a number field of it opens the entry for the held object', async () => {
+      const { container, name } = typedThenAgentSelects();
+      press(byTestId(container, 'loc-1')!);
+      await moveFocus(name, null, true);
+      release(byTestId(container, 'loc-1')!);
+      const entry = byTestId(container, 'loc-1')!.querySelector('input')!;
+      act(() => entry.focus());
+      fireEvent.input(entry, { target: { value: '5' } });
+      fireEvent.keyDown(entry, { key: 'Enter' });
+      await settle();
+      expect(box()!.location).toEqual([0, 5, 0]);
+      expect(other().location).toEqual([3, 0, 0]);
+      // the entry closed: the active object is shown at once
+      expect(shownName(container)).toBe('Other');
+    });
+
+    it('a button of it that takes the focus keeps it until the focus leaves the panel', async () => {
+      const { container, name } = typedThenAgentSelects();
+      const key = byTestId(container, 'key-location')!;
+      press(key);
+      await moveFocus(name, key, true);
+      release(key);
+      fireEvent.click(key);
+      const keyed = (id: string) =>
+        !!s.doc.getFCurve(fcurveKey({ target_type: 'object', target_id: id, path: 'location', index: 0 }));
+      expect(keyed(box()!.id)).toBe(true);
+      expect(keyed(other().id)).toBe(false);
+      await wait(PRESS_GRACE_MS + 50);
+      expect(shownName(container)).toBe('Box');
+      await moveFocus(key, null, false);
+      expect(shownName(container)).toBe('Other');
+    });
+
+    it('a slider drag an agent makes another object active during ends on its object, as one undo step', async () => {
+      // regression: the panel was drawn for the active object under the pointer: the drag stopped
+      // with its live value left in the document and no undo step
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Other', location: [3, 0, 0] });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      const { container } = render(<Properties session={s} />);
+      const depth = s.undo.undoStack.length;
+      const field = () => byTestId(container, 'loc-0')!;
+      fireEvent.pointerDown(field(), { button: 0, clientX: 100, pointerId: 1 });
+      fireEvent.pointerMove(field(), { clientX: 120, pointerId: 1 });
+      act(() => select(s, 'Other'));
+      fireEvent.pointerMove(field(), { clientX: 140, pointerId: 1 });
+      fireEvent.pointerUp(field(), { clientX: 140, pointerId: 1 });
+      const cube = () => s.doc.findObjectByName('Cube')!;
+      expect(cube().location[0]).toBeCloseTo(0.4);
+      expect(other().location).toEqual([3, 0, 0]);
+      expect(s.undo.undoStack.length).toBe(depth + 1);
+      await wait(PRESS_GRACE_MS + 50);
+      expect(shownName(container)).toBe('Other');
+      act(() => void s.undo.undo());
+      expect(cube().location).toEqual([0, 0, 0]);
+    });
+
+    it('a double click on a material preset of it applies the preset to the held material', async () => {
+      // regression: the first press moved the focus out of the preset search, and the second click
+      // landed on the tab drawn for the active object: the preset was applied to its material
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('mesh.primitive_cube_add', { name: 'B' });
+      select(s, 'Cube');
+      ok('material.new', { name: 'CubeMat' });
+      select(s, 'B');
+      ok('material.new', { name: 'BMat' });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'material';
+      localStorage.setItem('3d-editor:panel:material-presets', '1');
+      const { container } = render(<Properties session={s} />);
+      const search = byTestId(container, 'material-preset-search') as HTMLInputElement;
+      search.focus();
+      fireEvent.input(search, { target: { value: 'gold' } });
+      act(() => select(s, 'B'));
+      // Safari and Firefox on macOS give a pressed button no focus
+      const tile = () => byTestId(container, 'material-preset-gold')!;
+      press(tile());
+      await moveFocus(search, null, false);
+      release(tile());
+      fireEvent.click(tile());
+      await wait(150);
+      press(tile());
+      release(tile());
+      fireEvent.click(tile());
+      fireEvent.dblClick(tile());
+      const metallic = (name: string) => s.doc.listMaterials().find((m) => m.name === name)!.metallic;
+      expect(metallic('CubeMat')).toBe(1);
+      expect(metallic('BMat')).toBe(0);
+    });
+
+    it('the window losing the focus keeps it (the field keeps the focus)', async () => {
+      const { container, name } = typedThenAgentSelects();
+      act(() => void name.dispatchEvent(new FocusEvent('blur', { relatedTarget: null })));
+      act(() => void name.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: null })));
+      await settle();
+      expect(document.activeElement).toBe(name);
+      expect(name.isConnected).toBe(true);
+      expect(shownName(container)).toBe('Box');
+    });
+
+    it('the window losing the focus while a button of it has the focus keeps it', async () => {
+      // no typing holds the object then, only the focus staying in the panel (the window gives it
+      // back to the button)
+      const { container, name } = typedThenAgentSelects();
+      const key = byTestId(container, 'key-location')!;
+      await moveFocus(name, key, true);
+      expect(document.activeElement).toBe(key);
+      expect(shownName(container)).toBe('Box');
+      act(() => void key.dispatchEvent(new FocusEvent('blur', { relatedTarget: null })));
+      act(() => void key.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: null })));
+      await settle();
+      expect(document.activeElement).toBe(key);
+      expect(shownName(container)).toBe('Box');
+      // the focus leaving the panel shows the active object
+      await moveFocus(key, null, false);
+      expect(shownName(container)).toBe('Other');
+    });
+
+    it('the focus going on outside the panel shows the active object', async () => {
+      const { container, name } = typedThenAgentSelects();
+      const outside = document.body.appendChild(document.createElement('button'));
+      try {
+        await moveFocus(name, outside, true);
+        expect(box()).not.toBeNull();
+        expect(shownName(container)).toBe('Other');
+      } finally {
+        outside.remove();
+      }
+    });
+
+    it('a press released outside the window ends as the window loses the focus', async () => {
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Other', location: [3, 0, 0] });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      const { container } = render(<Properties session={s} />);
+      // a press where nothing takes the focus, released outside the window: no release reaches the page
+      press(container.querySelector<HTMLElement>('.prop-context')!);
+      act(() => select(s, 'Other'));
+      expect(shownName(container)).toBe('Cube');
+      act(() => void window.dispatchEvent(new Event('blur')));
+      await wait(PRESS_GRACE_MS + 50);
+      expect(shownName(container)).toBe('Other');
+    });
+
+    it('a button of it that keeps the focus after its click does not hold it', async () => {
+      // the focus on a button or checkbox is no typing: once the press is over, the panel follows the
+      // object an agent makes active
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      ok('object.empty_add', { name: 'Other', location: [3, 0, 0] });
+      select(s, 'Cube');
+      activePropertiesTab.value = 'object';
+      const { container } = render(<Properties session={s} />);
+      const key = byTestId(container, 'key-location')!;
+      press(key);
+      act(() => key.focus());
+      release(key);
+      fireEvent.click(key);
+      await wait(PRESS_GRACE_MS + 50);
+      expect(document.activeElement).toBe(key);
+      act(() => select(s, 'Other'));
+      expect(shownName(container)).toBe('Other');
+    });
   });
 
   it.each(browsers)(
@@ -1711,11 +2283,30 @@ describe('settings typed for what an agent then removes or replaces (no error, n
     field: string;
     /** A text field (committed as it goes away in every browser), not a number entry. */
     text?: boolean;
+    /** What the person does in the tab before typing (choosing the row whose field is typed). */
+    prepare?: (container: HTMLElement) => void;
     remove: (agent: ReturnType<typeof peerReplica>) => void;
     check: () => void;
   }
   const cube = () => s.doc.findObjectByName('Cube')!;
   const rig = () => s.doc.findObjectByName('Rig')!;
+  const wire = () => s.doc.findObjectByName('Wire')!;
+  /** A linked duplicate of the object (sharing its data, which outlives the object), the object shown. */
+  const linkedDuplicate = (name: string) => {
+    select(s, name);
+    ok('object.duplicate', { linked: true });
+    select(s, name);
+  };
+  /** The data of the object left, the linked duplicate. */
+  const keptData = () => s.doc.listObjects()[0].data!;
+  /** The stored resolution of the first spline of the curve object left (of a CURVE type). */
+  const resolution = () => {
+    const curve = s.doc.listObjects().find((o) => o.type === 'CURVE')!;
+    return s.doc.getCurve(curve.data!)!.splines[0].resolution_u;
+  };
+  let resolutionBefore: number | undefined;
+  const deleteShown = (name: string) => (agent: ReturnType<typeof peerReplica>) =>
+    agent.run('object.delete', { objects: [s.doc.findObjectByName(name)!.id] });
   const cases: Case[] = [
     {
       name: 'a modifier setting',
@@ -1834,6 +2425,117 @@ describe('settings typed for what an agent then removes or replaces (no error, n
       remove: (agent) => agent.run('rigidbody.object_remove', { objects: [cube().id] }),
       check: () => expect(cube().rigid_body ?? null).toBeNull(),
     },
+    // the object an agent deletes, its data kept by a linked duplicate: the operators are addressed
+    // by the object, so the commit as the field goes away has nothing to change
+    {
+      name: 'a shape key value of a mesh a linked duplicate keeps',
+      tab: 'data',
+      setup: () => {
+        ok('mesh.primitive_cube_add', { name: 'Cube' });
+        for (const name of ['Basis', 'Smile']) ok('object.shape_key_add', { object: 'Cube', name });
+        linkedDuplicate('Cube');
+      },
+      prepare: (c) => fireEvent.click(byTestId(c, 'shape-key-Smile')!),
+      field: 'shape-key-value',
+      remove: deleteShown('Cube'),
+      check: () =>
+        expect(s.doc.getShapeKeys(keptData()).map((k) => [k.name, k.value])).toEqual([
+          ['Basis', 0],
+          ['Smile', 0],
+        ]),
+    },
+    {
+      name: 'a shape key name of a mesh a linked duplicate keeps',
+      tab: 'data',
+      setup: () => {
+        ok('mesh.primitive_cube_add', { name: 'Cube' });
+        for (const name of ['Basis', 'Smile']) ok('object.shape_key_add', { object: 'Cube', name });
+        linkedDuplicate('Cube');
+      },
+      prepare: (c) => fireEvent.click(byTestId(c, 'shape-key-Smile')!),
+      field: 'shape-key-name',
+      text: true,
+      remove: deleteShown('Cube'),
+      check: () => expect(s.doc.getShapeKeys(keptData()).map((k) => k.name)).toEqual(['Basis', 'Smile']),
+    },
+    {
+      name: 'a vertex group name of a mesh a linked duplicate keeps',
+      tab: 'data',
+      setup: () => {
+        ok('mesh.primitive_cube_add', { name: 'Cube' });
+        ok('object.vertex_group_add', { object: 'Cube', name: 'Group' });
+        linkedDuplicate('Cube');
+      },
+      field: 'vgroup-name',
+      text: true,
+      remove: deleteShown('Cube'),
+      check: () => expect(s.doc.getVertexGroups(keptData()).map((g) => g.name)).toEqual(['Group']),
+    },
+    {
+      name: 'a spline resolution of a curve a linked duplicate keeps',
+      tab: 'data',
+      setup: () => {
+        ok('curve.primitive_bezier_curve_add', { name: 'Wire' });
+        linkedDuplicate('Wire');
+        resolutionBefore = resolution();
+      },
+      field: 'spline-resolution',
+      remove: deleteShown('Wire'),
+      check: () => expect(resolution()).toBe(resolutionBefore),
+    },
+    {
+      name: 'a bone name of an armature a linked duplicate keeps',
+      tab: 'data',
+      setup: () => {
+        ok('object.armature_add', { name: 'Rig' });
+        linkedDuplicate('Rig');
+      },
+      field: 'bone-name',
+      text: true,
+      remove: deleteShown('Rig'),
+      check: () => expect(s.doc.getArmature(keptData())!.bones.map((b) => b.name)).toEqual(['Bone']),
+    },
+    {
+      name: 'a spline resolution of a curve (kept by a linked duplicate) an agent converts to a mesh',
+      tab: 'data',
+      setup: () => {
+        ok('curve.primitive_bezier_curve_add', { name: 'Wire' });
+        linkedDuplicate('Wire');
+        resolutionBefore = resolution();
+      },
+      field: 'spline-resolution',
+      remove: (agent) => {
+        agent.state.selectedIds = [wire().id];
+        agent.state.activeId = wire().id;
+        agent.run('object.convert', { target: 'MESH' });
+      },
+      check: () => {
+        expect(wire().type).toBe('MESH');
+        expect(resolution()).toBe(resolutionBefore);
+      },
+    },
+    {
+      name: 'a curve setting of a curve object an agent deletes',
+      tab: 'data',
+      setup: () => {
+        ok('curve.primitive_bezier_curve_add', { name: 'Wire' });
+        select(s, 'Wire');
+      },
+      field: 'curve-extrude',
+      remove: deleteShown('Wire'),
+      check: () => expect(s.doc.listObjects()).toEqual([]),
+    },
+    {
+      name: 'a text setting of a text object an agent deletes',
+      tab: 'data',
+      setup: () => {
+        ok('object.text_add', { body: 'Hello', name: 'Title' });
+        select(s, 'Title');
+      },
+      field: 'font-size',
+      remove: deleteShown('Title'),
+      check: () => expect(s.doc.listObjects()).toEqual([]),
+    },
   ];
 
   for (const [browser, removal] of browsers)
@@ -1842,6 +2544,7 @@ describe('settings typed for what an agent then removes or replaces (no error, n
       activePropertiesTab.value = c.tab as typeof activePropertiesTab.value;
       const agent = peerReplica(s);
       const { container } = render(<Properties session={s} />);
+      c.prepare?.(container as HTMLElement);
       const el = byTestId(container, c.field);
       expect(el, c.field).not.toBeNull();
       let input: HTMLInputElement;
@@ -2137,6 +2840,133 @@ describe('fields that follow what they edit (agents switch objects, replace, rem
   });
 
   it.each(browsers)(
+    '%s: a vertex group name typed when an agent removes the group goes to no other group',
+    async (_browser, removal) => {
+      // regression: the name field stayed (with the keyboard focus) and showed the next group: the
+      // keys typed on and Enter renamed that group
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      for (const name of ['Arm', 'Leg']) ok('object.vertex_group_add', { object: 'Cube', name });
+      const cube = s.doc.findObjectByName('Cube')!;
+      select(s, 'Cube');
+      activePropertiesTab.value = 'data';
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      fireEvent.click(byTestId(container, 'vgroup-Arm')!);
+      const name = byTestId(container, 'vgroup-name') as HTMLInputElement;
+      name.focus();
+      fireEvent.input(name, { target: { value: 'ArmLeft' } });
+      const restore = removal();
+      try {
+        act(() => agent.run('object.vertex_group_remove', { object: cube.id, group: 'Arm' }));
+        expect(name.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      // the person types on and presses Enter where the keyboard focus is
+      const focused = document.activeElement;
+      if (focused instanceof HTMLInputElement && container.contains(focused)) {
+        fireEvent.input(focused, { target: { value: `${focused.value}_x` } });
+        fireEvent.keyDown(focused, { key: 'Enter' });
+      }
+      expect(s.doc.getVertexGroups(cube.data!).map((g) => g.name)).toEqual(['Leg']);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it.each(browsers)(
+    '%s: a vertex group name typed when an agent renames the group goes nowhere',
+    async (_browser, removal) => {
+      // the field is made anew for the renamed group (as for a shape key): what was typed for the
+      // name the group had is not committed over the agent's name
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      for (const name of ['Arm', 'Leg']) ok('object.vertex_group_add', { object: 'Cube', name });
+      const cube = s.doc.findObjectByName('Cube')!;
+      select(s, 'Cube');
+      activePropertiesTab.value = 'data';
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      fireEvent.click(byTestId(container, 'vgroup-Arm')!);
+      const name = byTestId(container, 'vgroup-name') as HTMLInputElement;
+      name.focus();
+      fireEvent.input(name, { target: { value: 'ArmLeft' } });
+      const restore = removal();
+      try {
+        act(() => agent.run('object.vertex_group_rename', { object: cube.id, group: 'Arm', name: 'Arms' }));
+        expect(name.isConnected).toBe(false);
+        await settle();
+      } finally {
+        restore();
+      }
+      const focused = document.activeElement;
+      if (focused instanceof HTMLInputElement && container.contains(focused)) {
+        fireEvent.input(focused, { target: { value: `${focused.value}_x` } });
+        fireEvent.keyDown(focused, { key: 'Enter' });
+      }
+      expect(s.doc.getVertexGroups(cube.data!).map((g) => g.name)).toEqual(['Arms', 'Leg']);
+      expect(errorToasts()).toEqual([]);
+    },
+  );
+
+  it('a vertex group renamed here keeps its fields and the keyboard focus', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    for (const name of ['Arm', 'Leg']) ok('object.vertex_group_add', { object: 'Cube', name });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'data';
+    const { container } = render(<Properties session={s} />);
+    fireEvent.click(byTestId(container, 'vgroup-Arm')!);
+    const name = byTestId(container, 'vgroup-name') as HTMLInputElement;
+    name.focus();
+    fireEvent.input(name, { target: { value: 'Arms' } });
+    fireEvent.keyDown(name, { key: 'Enter' });
+    expect(s.doc.getVertexGroups(s.doc.findObjectByName('Cube')!.data!).map((g) => g.name)).toEqual([
+      'Arms',
+      'Leg',
+    ]);
+    expect(byTestId(container, 'vgroup-name')).toBe(name);
+    expect(document.activeElement).toBe(name);
+  });
+
+  it('an image chosen for a texture of a material an agent deleted meanwhile is stored nowhere', async () => {
+    // regression: the image was stored (for no material, synced and saved) and an error named the
+    // material's id
+    const g = globalThis as unknown as { createImageBitmap?: unknown };
+    const had = g.createImageBitmap;
+    g.createImageBitmap = async () => ({ width: 4, height: 4, close() {} });
+    try {
+      ok('mesh.primitive_cube_add', { name: 'Cube' });
+      select(s, 'Cube');
+      ok('material.new', { name: 'Mat' });
+      localStorage.setItem('3d-editor:panel:material-textures', '1');
+      activePropertiesTab.value = 'material';
+      const agent = peerReplica(s);
+      const { container } = render(<Properties session={s} />);
+      const choose = async (input: HTMLInputElement) => {
+        const bytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+        const file = new File([bytes], 'wood.png', { type: 'image/png' });
+        Object.defineProperty(input, 'files', { value: [file], configurable: true });
+        fireEvent.change(input);
+        for (let i = 0; i < 10; i++) await act(async () => await new Promise((r) => setTimeout(r, 1)));
+      };
+      // the file dialog is open while the agent deletes the material
+      const input = byTestId(container, 'tex-base_color-file') as HTMLInputElement;
+      act(() => agent.run('material.delete', { material: 'Mat' }));
+      await choose(input);
+      expect(s.doc.listImages()).toEqual([]);
+      expect(errorToasts()).toEqual([]);
+      // a material that is there gets the image
+      act(() => void ok('material.new', { name: 'Wood' }));
+      await choose(byTestId(container, 'tex-base_color-file') as HTMLInputElement);
+      const images = s.doc.listImages();
+      expect(images.map((i) => i.name)).toEqual(['wood.png']);
+      const wood = s.doc.listMaterials().find((m) => m.name === 'Wood')!;
+      expect(wood.textures?.base_color?.image).toBe(images[0].id);
+    } finally {
+      g.createImageBitmap = had;
+    }
+  });
+
+  it.each(browsers)(
     '%s: a spline setting typed when an agent removes a spline before it goes to its spline (or nowhere)',
     async (_browser, removal) => {
       // regression: the panel kept the index: the open entry was given the next spline, and the
@@ -2287,6 +3117,27 @@ describe('fields that follow what they edit (agents switch objects, replace, rem
       expect(errorToasts()).toEqual([]);
     },
   );
+
+  it('another project in the page opens the preset browser with nothing chosen or searched', () => {
+    // regression: the chosen preset (with its Apply button) and the search were the page's, not
+    // the project's
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'material';
+    localStorage.setItem('3d-editor:panel:material-presets', '1');
+    const first = render(<Properties session={s} />);
+    fireEvent.click(byTestId(first.container, 'material-preset-gold')!);
+    fireEvent.input(byTestId(first.container, 'material-preset-search')!, { target: { value: 'gold' } });
+    expect(byTestId(first.container, 'material-preset-gold')!.getAttribute('aria-selected')).toBe('true');
+    first.unmount();
+    s = fakeSession();
+    sessionSignal.value = s;
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    const { container } = render(<Properties session={s} />);
+    expect(byTestId(container, 'material-preset-gold')!.getAttribute('aria-selected')).toBe('false');
+    expect((byTestId(container, 'material-preset-search') as HTMLInputElement).value).toBe('');
+  });
 
   it('the selected material preset and the grid scroll are kept when another object is shown', () => {
     ok('mesh.primitive_cube_add', { name: 'Cube' });
