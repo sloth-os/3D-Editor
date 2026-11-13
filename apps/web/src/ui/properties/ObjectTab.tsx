@@ -32,6 +32,7 @@ import {
   TextField,
   VectorField,
   RAD,
+  composing,
 } from '../fields/fields';
 import { PREVIEW_ORIGIN, animState, animatedValue, setProp } from './prop-edit';
 import { run } from '../../editor/editor';
@@ -904,8 +905,9 @@ function ExpressionField(p: {
   const [text, setText] = useState<string | null>(null);
   const shown = text ?? p.value;
   const problems = text === null ? [] : driverProblems({ expression: text, variables: p.variables });
-  const commit = () => {
-    if (text !== null && text.trim() && text !== p.value) p.onCommit(text.trim());
+  /** Commits the text in the input (a script can type and press Enter before the field renders it). */
+  const commit = (typed: string) => {
+    if (typed.trim() && typed !== p.value) p.onCommit(typed.trim());
     setText(null);
   };
   return (
@@ -920,10 +922,16 @@ function ExpressionField(p: {
         onInput={(e) => setText((e.target as HTMLInputElement).value)}
         onKeyDown={(e) => {
           e.stopPropagation();
-          if (e.key === 'Enter') commit();
-          if (e.key === 'Escape') setText(null);
+          // the keys that confirm or cancel an IME composition belong to it
+          if (composing(e)) return;
+          const el = e.currentTarget as HTMLInputElement;
+          if (e.key === 'Enter') commit(el.value);
+          if (e.key === 'Escape') {
+            el.value = p.value;
+            setText(null);
+          }
         }}
-        onBlur={commit}
+        onBlur={(e) => commit((e.currentTarget as HTMLInputElement).value)}
       />
       {problems.length > 0 && <ErrorList messages={problems.slice(0, 2)} />}
     </>

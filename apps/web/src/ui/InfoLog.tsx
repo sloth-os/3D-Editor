@@ -5,6 +5,7 @@ import { session } from '../app/store';
 import * as core from '@3d-editor/core';
 import { telemetry } from '../telemetry/telemetry';
 import { fps, frameTimeMs } from '../telemetry/perf';
+import { composing } from './fields/fields';
 
 export function InfoLog() {
   const lines = infoLog.value;
@@ -98,6 +99,8 @@ export function Console() {
           onInput={(e) => setInput((e.target as HTMLInputElement).value)}
           onKeyDown={(e) => {
             e.stopPropagation();
+            // the keys that confirm or cancel an IME composition belong to it
+            if (composing(e)) return;
             if (e.key === 'Enter') exec();
             if (e.key === 'ArrowUp' && history.length) {
               const i = hIndex < 0 ? history.length - 1 : Math.max(0, hIndex - 1);

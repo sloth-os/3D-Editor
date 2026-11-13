@@ -36,6 +36,7 @@ import {
   VectorField,
   RAD,
   useEditedText,
+  composing,
 } from '../fields/fields';
 import { animState, animatedValue, setProp } from './prop-edit';
 import { animatedBlock } from './animated';
@@ -1008,6 +1009,8 @@ export function TextBody({ value, onCommit }: { value: string; onCommit: (v: str
       onFocus={() => (settled.current = null)}
       onBlur={(e) => commit((e.currentTarget as HTMLTextAreaElement).value)}
       onKeyDown={(e) => {
+        // the keys that confirm or cancel an IME composition belong to it
+        if (composing(e)) return e.stopPropagation();
         const el = e.currentTarget as HTMLTextAreaElement;
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
           e.preventDefault();

@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { Icon } from '../icons';
 
@@ -119,10 +119,11 @@ export function NumberField(p: NumberFieldProps) {
       entryOpen.current = true;
     }
   };
-  const commit = () => {
+  /** Commits the text in the entry (a script can type and press Enter before the field renders it). */
+  const commit = (typed: string) => {
     if (!entryOpen.current) return;
     entryOpen.current = false;
-    const v = evalExpression(text);
+    const v = evalExpression(typed);
     setEditing(false);
     if (v !== null) p.onChange(clamp(fromD(v)), true);
   };
@@ -148,13 +149,13 @@ export function NumberField(p: NumberFieldProps) {
           onKeyDown={(e) => {
             e.stopPropagation();
             if (composing(e)) return;
-            if (e.key === 'Enter') commit();
+            if (e.key === 'Enter') commit((e.currentTarget as HTMLInputElement).value);
             if (e.key === 'Escape') {
               entryOpen.current = false;
               setEditing(false);
             }
           }}
-          onBlur={commit}
+          onBlur={(e) => commit((e.currentTarget as HTMLInputElement).value)}
           ref={entry}
         />
       ) : (
@@ -374,12 +375,10 @@ export function composing(e: KeyboardEvent): boolean {
 
 /**
  * The text a field edits: it starts as `value` and is set to it again whenever `value` changes (an
- * undo, an agent, another person's edit, an edit the field committed). An edit the document refuses
- * leaves `value` as it was, so the field keeps the refused text until Escape or the next change. The
- * text is set in the commit that brings the new value: an effect would run after the next frame, or
- * sooner when the field renders again, and on a new field it replaced what was typed in it before then
- * (a name typed as soon as the Projects window appeared, so the Escape meant to cancel the typing
- * closed the window).
+ * undo, an agent, another person's edit, an edit the field committed). The text is set in the commit
+ * that brings the new value: an effect would run after the next frame, or sooner when the field
+ * renders again, and on a new field it replaced what was typed in it before then (a name typed as soon
+ * as the Projects window appeared, so the Escape meant to cancel the typing closed the window).
  */
 export function useEditedText(value: string): [string, (text: string) => void] {
   const [text, setText] = useState(value);
@@ -401,18 +400,40 @@ export function TextField(p: {
   ariaLabel?: string;
 }) {
   const [v, setV] = useEditedText(p.value);
+  const box = useRef<HTMLInputElement>(null);
   /**
    * The text committed last: a blur right after Enter (e.g. when the commit renamed what the field
    * shows and the field is removed while focused) must not commit it again with stale props.
    */
   const committed = useRef<string | null>(null);
-  const commit = () => {
-    if (v === p.value || v === committed.current) return;
-    committed.current = v;
-    p.onChange(v);
+  const latest = useRef(p);
+  latest.current = p;
+  /**
+   * Commits the text in the input, not the rendered `v`: a script (a password manager) can fill the
+   * field and blur it before the field renders the new text. The field then shows the stored value
+   * again, as Blender's fields do: the new one, or the old one when the edit was refused or changed
+   * nothing (an empty name, a name that differs only in spaces, coefficients that do not parse).
+   */
+  const commit = (text: string) => {
+    if (text === p.value || text === committed.current) return;
+    committed.current = text;
+    p.onChange(text);
+    setV(p.value);
   };
+  // text filled in without a change event or a blur (a password manager) and left in the field is
+  // committed when the field goes away, as a blur would
+  useEffect(
+    () => () => {
+      const el = box.current;
+      const q = latest.current;
+      if (!el || q.commitOnBlur === false) return;
+      if (el.value !== q.value && el.value !== committed.current) q.onChange(el.value);
+    },
+    [],
+  );
   return (
     <input
+      ref={box}
       class="textfield"
       type={p.type ?? 'text'}
       value={v}
@@ -422,21 +443,30 @@ export function TextField(p: {
       aria-label={p.ariaLabel}
       data-testid={p.testId}
       onInput={(e) => {
+        const text = (e.target as HTMLInputElement).value;
         committed.current = null;
-        setV((e.target as HTMLInputElement).value);
-        if (p.commitOnBlur === false) p.onChange((e.target as HTMLInputElement).value);
+        setV(text);
+        if (p.commitOnBlur === false) {
+          committed.current = text;
+          p.onChange(text);
+        }
       }}
       onKeyDown={(e) => {
         if (composing(e)) return e.stopPropagation();
-        if (e.key === 'Enter') commit();
+        const el = e.currentTarget as HTMLInputElement;
+        if (e.key === 'Enter') commit(el.value);
         if (e.key === 'Escape') {
           // with no typing to cancel, Escape goes on to what holds the field (it closes a dialog)
-          if (v === p.value) return;
+          if (el.value === p.value) return;
+          el.value = p.value;
           setV(p.value);
         }
         e.stopPropagation();
       }}
-      onBlur={commit}
+      // the change event commits a value filled in without focus or blur (Firefox and Safari fill
+      // saved passwords so)
+      onChange={(e) => commit((e.currentTarget as HTMLInputElement).value)}
+      onBlur={(e) => commit((e.currentTarget as HTMLInputElement).value)}
     />
   );
 }

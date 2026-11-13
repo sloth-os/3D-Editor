@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { run, registry, canRun, popupMenu, paletteOpen } from '../editor/editor';
 import { availableItems, menuByName, type MenuItem } from '../editor/menus';
 import { session } from '../app/store';
+import { composing } from './fields/fields';
 
 function resolve(items: MenuItem['submenu']): MenuItem[] {
   if (!items) return [];
@@ -199,6 +200,8 @@ export function CommandPalette() {
           }}
           onKeyDown={(e) => {
             e.stopPropagation();
+            // the keys that confirm or cancel an IME composition belong to it
+            if (composing(e)) return;
             if (e.key === 'Escape') close();
             if (e.key === 'ArrowDown') setHover((h) => Math.min(results.length - 1, h + 1));
             if (e.key === 'ArrowUp') setHover((h) => Math.max(0, h - 1));

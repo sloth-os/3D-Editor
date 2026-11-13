@@ -73,6 +73,20 @@ describe('typing key by key', () => {
     expect(onChange.mock.calls).toEqual([[1.5, true]]);
   });
 
+  it('commits the text a script typed and confirmed before the entry rendered it', () => {
+    // regression: Enter committed the text the entry had rendered (the old value)
+    const onChange = vi.fn();
+    const { getByTestId } = render(<NumberField value={0} onChange={onChange} testId="nf" />);
+    const el = getByTestId('nf');
+    fireEvent.pointerDown(el, { button: 0, clientX: 10, pointerId: 1 });
+    fireEvent.pointerUp(el, { button: 0, clientX: 10, pointerId: 1 });
+    const input = el.querySelector('input')!;
+    input.value = '7';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(onChange.mock.calls).toEqual([[7, true]]);
+  });
+
   it('keeps the typed keys of a number entry when the field renders for another reason', () => {
     const onChange = vi.fn();
     const { getByTestId, rerender } = render(<NumberField value={0} onChange={onChange} testId="nf" />);

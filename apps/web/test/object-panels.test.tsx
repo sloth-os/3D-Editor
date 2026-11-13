@@ -407,6 +407,38 @@ describe('Drivers and F-curve modifiers in the Object tab', () => {
     expect(s.doc.getDriver(key)).toBeNull();
   });
 
+  it('the expression field leaves composition keys to the IME and commits text typed before it renders', () => {
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    ok('anim.driver_add', {
+      target_type: 'object',
+      target: 'Cube',
+      path: 'location',
+      index: 2,
+      expression: '0',
+    });
+    activePropertiesTab.value = 'object';
+    localStorage.setItem('3d-editor:panel:object-drivers', '1');
+    const { container } = render(<Properties session={s} />);
+    const cube = s.doc.findObjectByName('Cube')!;
+    const key = fcurveKey({ target_type: 'object', target_id: cube.id, path: 'location', index: 2 });
+    const expr = byTestId(container, 'driver-location-2-expression') as HTMLInputElement;
+    // regression: the Enter that ends an IME conversion committed the expression typed so far
+    fireEvent.input(expr, { target: { value: 'frame / 2' } });
+    fireEvent.keyDown(expr, { key: 'Enter', isComposing: true, keyCode: 229 });
+    fireEvent.keyDown(expr, { key: 'Enter', keyCode: 229 });
+    fireEvent.keyDown(expr, { key: 'Escape', keyCode: 229 });
+    expect(s.doc.getDriver(key)?.expression).toBe('0');
+    expect(expr.value).toBe('frame / 2');
+    fireEvent.keyDown(expr, { key: 'Enter' });
+    expect(s.doc.getDriver(key)?.expression).toBe('frame / 2');
+    // regression: a script that types and presses Enter before the field renders committed nothing
+    expr.value = 'frame / 4';
+    expr.dispatchEvent(new Event('input', { bubbles: true }));
+    expr.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(s.doc.getDriver(key)?.expression).toBe('frame / 4');
+  });
+
   it('lists animated channels with extrapolation and F-curve modifiers', () => {
     ok('mesh.primitive_cube_add', { name: 'Cube' });
     select(s, 'Cube');
@@ -715,5 +747,25 @@ describe('review regressions', () => {
         .closest('.prop-row')
         ?.querySelector('label')?.textContent,
     ).toBe('Limit Z');
+  });
+});
+
+describe('text fields of the panels', () => {
+  it('show the stored name again when a rename is refused (an empty name)', () => {
+    // regression: the name field kept the empty text while the object kept its name
+    ok('mesh.primitive_cube_add', { name: 'Cube' });
+    select(s, 'Cube');
+    activePropertiesTab.value = 'object';
+    const { container } = render(<Properties session={s} />);
+    const name = byTestId(container, 'object-name') as HTMLInputElement;
+    name.focus();
+    fireEvent.input(name, { target: { value: '' } });
+    fireEvent.keyDown(name, { key: 'Enter' });
+    expect(s.doc.findObjectByName('Cube')).not.toBeNull();
+    expect(name.value).toBe('Cube');
+    fireEvent.input(name, { target: { value: 'Crate' } });
+    fireEvent.blur(name);
+    expect(s.doc.findObjectByName('Crate')).not.toBeNull();
+    expect(name.value).toBe('Crate');
   });
 });
