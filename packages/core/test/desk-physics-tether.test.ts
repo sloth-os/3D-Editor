@@ -119,6 +119,79 @@ describe('desk.tether_fly', () => {
     expect(originOf(m.get(t.kite)!)).toEqual([0.5, 0, 1.3]);
   });
 
+  it('hides the string before the flight on every axis: no dot for the export to draw where the hand will be', () => {
+    const t = kiteScene();
+    // the hand walks in from 5 m away until the flight starts at 100
+    t.doc.setFCurve({
+      target_type: 'object',
+      target_id: t.hand,
+      path: 'location',
+      index: 0,
+      keyframes: [
+        { frame: 1, value: -5, interpolation: 'LINEAR' },
+        { frame: 100, value: 0, interpolation: 'LINEAR' },
+      ],
+      extrapolation: 'CONSTANT',
+      mute: false,
+    });
+    const r = t.run('desk.tether_fly', { ...FLY, frame_start: 100, frame_end: 200 });
+    const string = t.doc.getObject(r.string.object)!;
+    const positions = t.doc.getMesh(string.data!)!.positions;
+    /** The diagonal of the string's world-space bounds (the video export draws no string under 1e-6 m). */
+    const extent = (f: number) => {
+      const [m] = flight(t.doc, [string.id], [f]);
+      const w = m.get(string.id)!;
+      const lo = [Infinity, Infinity, Infinity];
+      const hi = [-Infinity, -Infinity, -Infinity];
+      for (let i = 0; i + 2 < positions.length; i += 3) {
+        const p = transformPoint(w, [positions[i], positions[i + 1], positions[i + 2]]);
+        for (let k = 0; k < 3; k++) {
+          lo[k] = Math.min(lo[k], p[k]);
+          hi[k] = Math.max(hi[k], p[k]);
+        }
+      }
+      return Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+    };
+    for (const f of [1, 50, 99]) expect(extent(f), `frame ${f}`).toBeLessThan(1e-6);
+    // from the flight's first frame: hand to kite
+    expect(extent(100)).toBeGreaterThan(0.3);
+    expect(extent(200)).toBeGreaterThan(5);
+  });
+
+  it('starts a flight with launch_frames 0 already up: on the taut string, in the wind', () => {
+    const t = kiteScene();
+    t.run('desk.tether_fly', { ...FLY, frame_start: 1, frame_end: 240, launch_frames: 0 });
+    const frames = [1, 2, 12, 24, 48, 96, 144, 240];
+    const states = flight(t.doc, [t.kite, t.hand], frames);
+    states.forEach((m, i) => {
+      const k = originOf(m.get(t.kite)!);
+      const a = originOf(m.get(t.hand)!);
+      const d = dist(k, a);
+      // the whole string out, 30–65° up and downwind (+X), from the first frame on
+      expect(d, `frame ${frames[i]}`).toBeGreaterThan(19.5);
+      const elevation = (Math.asin((k[2] - a[2]) / d) * 180) / Math.PI;
+      expect(elevation, `frame ${frames[i]}`).toBeGreaterThan(30);
+      expect(elevation, `frame ${frames[i]}`).toBeLessThan(65);
+      expect(k[0] - a[0], `frame ${frames[i]}`).toBeGreaterThan(5);
+    });
+    // a balloon: up on its string from the first frame
+    const b = deskScene();
+    const balloon = b.ball('Red Balloon', [0.3, 0, 1.5], 0.3);
+    const hand = b.empty('Hand', [0, 0, 1.2]);
+    b.run('desk.tether_fly', {
+      flyer: 'Red Balloon',
+      anchor: 'Hand',
+      length_m: 3,
+      wind_dir_deg: 0,
+      wind_mps: 1,
+      frame_start: 1,
+      frame_end: 48,
+      launch_frames: 0,
+    });
+    for (const [m] of [1, 12, 48].map((f) => flight(b.doc, [balloon, hand], [f])))
+      expect(originOf(m.get(balloon)!)[2] - originOf(m.get(hand)!)[2]).toBeGreaterThan(2.5);
+  });
+
   it('flies the same flight for the same seed and another for another seed', () => {
     const keys = (seed?: number) => {
       const t = kiteScene();

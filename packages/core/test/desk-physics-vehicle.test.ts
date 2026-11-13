@@ -98,6 +98,81 @@ describe('desk.vehicle_drive', () => {
     expect(steer(5)).toBe(0);
   });
 
+  it('steers left into a left turn and right into a right one, by atan(wheelbase × curvature)', () => {
+    const s = deskScene();
+    const car = syntheticCar(s);
+    // a quarter circle of 10 m to the left (its centre at +X: the car faces −Y), then one to the right
+    const points: [number, number, number][] = [];
+    for (let deg = 10; deg <= 90; deg += 10) {
+      const a = (deg * Math.PI) / 180;
+      points.push([10 - 10 * Math.cos(a), -10 * Math.sin(a), 0]);
+    }
+    for (let deg = 10; deg <= 90; deg += 10) {
+      const a = (deg * Math.PI) / 180;
+      points.push([10 + 10 * Math.sin(a), -20 + 10 * Math.cos(a), 0]);
+    }
+    const r = s.run('desk.vehicle_drive', { vehicle: 'Car', points, frame_start: 1, speed_mps: 4 });
+    const ev = new SceneEvaluator(s.doc);
+    const arc = (10 * Math.PI) / 2;
+    // the wheelbase of the synthetic car is 2.6 m: atan(2.6 / 10) = 14.6° in the middle of each turn
+    const ackermann = Math.atan(2.6 / 10);
+    let travelled = 0;
+    let prev = originOf(worldAt(s.doc, car.root, 1, ev));
+    let left = 0;
+    let right = 0;
+    for (let f = 2; f <= r.frame_end; f++) {
+      const at = originOf(worldAt(s.doc, car.root, f, ev));
+      travelled += dist(at, prev);
+      prev = at;
+      const steer = channelsAt(s.doc, car['steer.FL'], f).rotation_euler[2];
+      // the middle half of each turn
+      if (travelled > arc * 0.25 && travelled < arc * 0.75) {
+        expect(steer, `frame ${f}`).toBeCloseTo(ackermann, 1);
+        left++;
+      } else if (travelled > arc * 1.25 && travelled < arc * 1.75) {
+        expect(steer, `frame ${f}`).toBeCloseTo(-ackermann, 1);
+        right++;
+      }
+    }
+    expect(left).toBeGreaterThan(10);
+    expect(right).toBeGreaterThan(10);
+  });
+
+  it('rolls every wheel along its own way without slipping on a curve: the inner wheels turn less', () => {
+    const s = deskScene();
+    const car = syntheticCar(s);
+    // a half circle of 5 m to the left
+    const points: [number, number, number][] = [];
+    for (let deg = 15; deg <= 180; deg += 15) {
+      const a = (deg * Math.PI) / 180;
+      points.push([5 - 5 * Math.cos(a), -5 * Math.sin(a), 0]);
+    }
+    const r = s.run('desk.vehicle_drive', { vehicle: 'Car', points, frame_start: 1, speed_mps: 4 });
+    const ev = new SceneEvaluator(s.doc);
+    const wheels = ['wheel.FL', 'wheel.FR', 'wheel.BL', 'wheel.BR'];
+    for (const f of [40, 60, 80])
+      for (const w of wheels) {
+        const w0 = worldAt(s.doc, car[w], f, ev);
+        const w1 = worldAt(s.doc, car[w], f + 0.05, ev);
+        // the material point of the tyre on the ground, a twentieth of a frame later
+        const ground = [w0[12], w0[13], w0[14] - R];
+        const local = invertApply(w0, ground);
+        const moved = [0, 1, 2].map(
+          (k) => w1[k] * local[0] + w1[4 + k] * local[1] + w1[8 + k] * local[2] + w1[12 + k],
+        );
+        // along the way the wheel rolls (across its axle, on the ground)
+        const axle = [w0[0], w0[1], 0];
+        const rolling = [-axle[1], axle[0]].map((v) => v / Math.hypot(axle[0], axle[1]));
+        const slip = Math.abs((moved[0] - ground[0]) * rolling[0] + (moved[1] - ground[1]) * rolling[1]);
+        const hub = dist(originOf(w1), originOf(w0));
+        expect(slip, `${w} frame ${f}`).toBeLessThan(hub / 20);
+      }
+    // over the turn, the inner (left) wheels turn about (5 − 0.85) / (5 + 0.85) as far as the outer ones
+    const spin = (w: string) => Math.abs(channelsAt(s.doc, car[w], r.frame_end).rotation_euler[0]);
+    expect(spin('wheel.BL') / spin('wheel.BR')).toBeLessThan(0.85);
+    expect(spin('wheel.FL') / spin('wheel.FR')).toBeLessThan(0.9);
+  });
+
   it('ends at frame_end when given one, and refuses both speed_mps and frame_end', () => {
     const s = deskScene();
     const car = syntheticCar(s);

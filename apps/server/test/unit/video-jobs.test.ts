@@ -5,6 +5,7 @@ import * as Y from 'yjs';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { setDeskSettings, type SceneDoc } from '@3d-editor/core';
 import { ToolError } from '../../src/mcp/agent';
+import { sharedProcessError } from '../../src/render/pool';
 import { clearFfmpegChecks } from '../../src/video/ffmpeg';
 import { MAX_PROCESS_DEATHS } from '../../src/video/exporter';
 import { VideoExports, type ExportJob } from '../../src/video';
@@ -15,6 +16,7 @@ import { makeFakeFfmpeg, type FakeFfmpeg } from '../helpers/video-fake-ffmpeg';
 import {
   exportScene,
   fakeContext,
+  killedError,
   makeFakeRenderer,
   type FakeRenderer,
 } from '../helpers/video-fake-renderer';
@@ -786,5 +788,30 @@ describe('render processes that die during an export', { timeout: 30_000 }, () =
     const failed = await exportWith(always);
     expect(failed.job.status).toBe('failed');
     expect(always.stats.deaths).toBe(MAX_PROCESS_DEATHS);
+  });
+
+  it('does not count against a frame the processes another render ended while the frame waited in them', async () => {
+    // another long render shares the processes: its requests end them (out of memory) while a frame,
+    // a shot's measurement and the contact sheet of the export wait behind them, more often than
+    // MAX_PROCESS_DEATHS — the export's work was not the cause and is done again each time
+    const times = MAX_PROCESS_DEATHS + 1;
+    const renderer = makeFakeRenderer({ threads: 1 });
+    const count = { frame: 0, shot: 0, sheet: 0 };
+    const shared = () => sharedProcessError(killedError());
+    renderer.kill = (req) => {
+      if (frameIs(5)(req) && count.frame++ < times) return shared();
+      if (req.type === 'desk-shot' && count.shot++ < times) return shared();
+      if (req.type === 'encode' && count.sheet++ < times) return shared();
+      return false;
+    };
+    const { job, jobDir } = await exportWith(renderer);
+    expect(job.error).toBeNull();
+    expect(job.status).toBe('done');
+    expect(renderer.stats.deaths).toBe(3 * times);
+    expect((await writtenFrames(jobDir)).flat()).toEqual(Array.from({ length: 24 }, (_, i) => i + 1));
+    expect(job.files.map((f) => f.name)).toContain('contact-sheet.png');
+    expect(
+      job.warnings.some((w) => w.startsWith(`${3 * times} render processes stopped during the export`)),
+    ).toBe(true);
   });
 });

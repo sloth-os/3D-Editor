@@ -100,7 +100,13 @@ function boxGltf(
   w: number,
   h: number,
   d: number,
-  extra: { nodes?: object[]; roots?: number[]; cameras?: object[]; lights?: object[]; children?: number[] } = {},
+  extra: {
+    nodes?: object[];
+    roots?: number[];
+    cameras?: object[];
+    lights?: object[];
+    children?: number[];
+  } = {},
 ): string {
   const P: number[] = [];
   for (let i = 0; i < 8; i++) P.push(i & 4 ? w / 2 : -w / 2, i & 2 ? h : 0, i & 1 ? d / 2 : -d / 2);
@@ -122,7 +128,10 @@ function boxGltf(
     asset: { version: '2.0' },
     scene: 0,
     scenes: [{ nodes: extra.roots ?? [0, ...extraNodes.map((_, i) => i + 1)] }],
-    nodes: [{ mesh: 0, name: 'Body', ...(extra.children ? { children: extra.children } : {}) }, ...extraNodes],
+    nodes: [
+      { mesh: 0, name: 'Body', ...(extra.children ? { children: extra.children } : {}) },
+      ...extraNodes,
+    ],
     meshes: [{ primitives: [{ attributes: { POSITION: 0 }, indices: 1 }] }],
     ...(extra.cameras ? { cameras: extra.cameras } : {}),
     ...(extra.lights
@@ -132,14 +141,23 @@ function boxGltf(
         }
       : {}),
     accessors: [
-      { bufferView: 0, componentType: 5126, count: 8, type: 'VEC3', min: [-w / 2, 0, -d / 2], max: [w / 2, h, d / 2] },
+      {
+        bufferView: 0,
+        componentType: 5126,
+        count: 8,
+        type: 'VEC3',
+        min: [-w / 2, 0, -d / 2],
+        max: [w / 2, h, d / 2],
+      },
       { bufferView: 1, componentType: 5123, count: 36, type: 'SCALAR' },
     ],
     bufferViews: [
       { buffer: 0, byteOffset: 0, byteLength: 96 },
       { buffer: 0, byteOffset: 96, byteLength: 72 },
     ],
-    buffers: [{ uri: `data:application/octet-stream;base64,${base64Encode(bin)}`, byteLength: bin.byteLength }],
+    buffers: [
+      { uri: `data:application/octet-stream;base64,${base64Encode(bin)}`, byteLength: bin.byteLength },
+    ],
   });
 }
 
@@ -491,7 +509,12 @@ describe('store.insert_files', () => {
     ]);
     expect(t.reports.filter((r) => r.level === 'WARNING').map((r) => r.message)).toEqual(fox.result.warnings);
     // no category: the built-in model its name is tells its kind (an armchair is furniture)
-    const chair = t.run('store.insert_files', { entry: unsized('Armchair'), format: 'gltf', files, main: 'fox.gltf' });
+    const chair = t.run('store.insert_files', {
+      entry: unsized('Armchair'),
+      format: 'gltf',
+      files,
+      main: 'fox.gltf',
+    });
     close(chair.result.dimensions_m, [1.5, 0.4, 0.8]);
     expect(chair.result.warnings[0]).toMatch(/\(usual for furniture: 0\.2–4 m\): read as centimetres/);
     // a size asked for wins, without a warning
@@ -576,7 +599,11 @@ describe('store.insert_files', () => {
       'Left out what the file brings besides the model: ShowcaseCam (camera), Lamp (light) (the scene keeps its own camera and lights)',
     ]);
     // a scene camera of its own is kept
-    const cam = t.doc.addObject({ type: 'CAMERA', name: 'Shot 1', data: t.doc.addCamera({ name: 'Shot 1' }) });
+    const cam = t.doc.addObject({
+      type: 'CAMERA',
+      name: 'Shot 1',
+      data: t.doc.addCamera({ name: 'Shot 1' }),
+    });
     t.doc.updateScene({ camera: cam });
     expect(
       t.run('store.insert_files', {

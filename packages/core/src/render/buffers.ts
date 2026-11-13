@@ -46,3 +46,10 @@ export function pooledBufferCount(): number {
   for (const ref of pool.values()) if (ref.deref()) n++;
   return n;
 }
+
+/** Bytes of the pooled buffers still alive (tests, `estimateRenderBufferBytes`). */
+export function pooledBufferBytes(): number {
+  let n = 0;
+  for (const ref of pool.values()) n += ref.deref()?.byteLength ?? 0;
+  return n;
+}

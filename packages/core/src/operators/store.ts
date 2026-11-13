@@ -142,7 +142,10 @@ export function registerStoreOperators(reg: OperatorRegistry): void {
           .string()
           .regex(/^#[0-9a-fA-F]{6}$/)
           .optional()
-          .describe("Main colour '#rrggbb' (default: the model's own)"),
+          .describe(
+            "Main colour '#rrggbb' (default: the model's own); a model whose search result says " +
+              'recolorable: false keeps its colours and warns',
+          ),
         params: z
           .record(z.string(), z.unknown())
           .optional()
@@ -216,9 +219,12 @@ export function registerStoreOperators(reg: OperatorRegistry): void {
       label: 'Insert Model Files',
       description:
         "Import a downloaded store model's files (glb, gltf with its buffers and textures, or obj with its mtl and " +
-        'textures) as one undo step: wrapped in an EMPTY root, scaled to the size given (else its real size), ' +
-        'origin at the base centre, put on the ground, with its licence and attribution recorded as custom ' +
-        'properties. Returns {root, objects, warnings}.',
+        'textures) as one undo step: wrapped in an EMPTY root, scaled to the size given, else to the dimensions_m ' +
+        'of its entry, else kept at the size of its file when that is believable for its category (ten times ' +
+        'off or more: read as centimetres, inches or millimetres, or scaled to the usual size of its category, ' +
+        'with a warning), origin at the base centre, put on the ground, with its licence and attribution ' +
+        'recorded as custom properties. Cameras and lights the file brings are left out (a warning names ' +
+        'them). Returns {root, objects, dimensions_m, warnings}.',
       category: 'Store',
       poll: pollObjectMode,
       schema: z.object({

@@ -8,6 +8,8 @@ import type { Renderer } from '../render';
 import type { RenderLease, RenderRequest, RenderThread } from '../render/pool';
 import { stringLineWidth } from '../render/passes';
 import {
+  INTERRUPTED_PREFIX,
+  RenderOutOfMemoryError,
   isCancelled,
   type DeskFrameOptions,
   type DeskShotInfo,
@@ -60,7 +62,7 @@ import type { ExportFile, ExportProgress } from './index';
  * A render process that dies (the system's out-of-memory killer, a crash) does not end the export:
  * its frame is rendered again on another leased thread, or, when none is left, on a new lease once
  * the pool has started new processes. Only a frame (or a shot's measurement, or the contact sheet)
- * that took down MAX_PROCESS_DEATHS render processes fails the export.
+ * that took down MAX_PROCESS_DEATHS render processes itself fails the export.
  */
 
 /** Frames of one lease at most (SPEC: per shot, or at most 200 frames / 2 minutes). */
@@ -71,9 +73,23 @@ export const MAX_BYTES_AHEAD = 256 * 1024 * 1024;
 /**
  * Render processes one frame (or one shot's measurement, or the contact sheet) may take down
  * before the export fails with the error of the last one: a frame that always ends its process
- * (out of memory) must not restart processes for ever.
+ * (out of memory) must not restart processes for ever. Deaths it did not cause do not count (see
+ * {@link notTheCause}).
  */
 export const MAX_PROCESS_DEATHS = 3;
+
+/**
+ * Whether a request whose render process died was not the cause: it waited in the process behind
+ * the request of another render that ended it (two long renders share the render processes; see
+ * pool.ts sharedProcessError), or the pool stopped the process itself (it is closing). Such a
+ * request runs again without counting against its MAX_PROCESS_DEATHS.
+ */
+export function notTheCause(err: Error): boolean {
+  if (err instanceof RenderOutOfMemoryError) return err.reason === 'shared';
+  // the error of a crash (not out of memory) of another render's request
+  if (err.message.startsWith(INTERRUPTED_PREFIX)) return true;
+  return isCancelled(err);
+}
 
 export interface ExportEnvironment {
   renderer: Renderer;
@@ -299,8 +315,8 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
       /** Records a render process that died; false once `key` took down MAX_PROCESS_DEATHS of them. */
       const died = (key: number, err: Error): boolean => {
         processDeaths.push(err);
-        // a process the pool stopped (it is closing) was not ended by this frame
-        if (isCancelled(err)) return true;
+        // another render's request (or the pool) ended the process this frame waited in
+        if (notTheCause(err)) return true;
         const n = (deathsOf.get(key) ?? 0) + 1;
         deathsOf.set(key, n);
         return n < MAX_PROCESS_DEATHS;
@@ -538,7 +554,7 @@ export function deathsWarning(deaths: readonly Error[]): string {
 
 /**
  * Encodes the contact sheet (first and middle frame of each shot, labelled shot-frame) on a render
- * thread; again on a new one when its render process died (at most MAX_PROCESS_DEATHS times).
+ * thread; again on a new one when its render process died (until it took down MAX_PROCESS_DEATHS).
  */
 async function encodeContactSheet(
   renderer: Renderer,
@@ -548,7 +564,9 @@ async function encodeContactSheet(
   deaths: Error[],
 ): Promise<Uint8Array> {
   const pairs = Math.max(1, Math.round(Math.sqrt(tiles.length / 2)));
-  for (let tries = 1; ; tries++) {
+  /** Render processes the encoding took down. */
+  let caused = 0;
+  for (;;) {
     const lease = await renderer.pool.lease(1, signal, { interactive: true });
     const thread = lease.threads[0];
     try {
@@ -564,8 +582,11 @@ async function encodeContactSheet(
       });
       return res.data;
     } catch (err) {
-      if (signal.aborted || thread.alive || tries >= MAX_PROCESS_DEATHS) throw err;
-      deaths.push(asError(err));
+      // an error of the encoding itself (its process lives on) would come again: give up
+      if (signal.aborted || thread.alive) throw err;
+      const e = asError(err);
+      if (!notTheCause(e) && ++caused >= MAX_PROCESS_DEATHS) throw err;
+      deaths.push(e);
     } finally {
       lease.release();
     }

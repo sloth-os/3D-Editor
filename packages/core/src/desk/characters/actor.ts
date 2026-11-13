@@ -154,7 +154,12 @@ export function keyPose(
   if (!arm) throw new OperatorError(`Actor '${meta.name}' has no armature data`, 'FAILED');
   const target = posedBones(kind, arm, blueprintFor(kind, meta.height), pose);
   if (o.frame === undefined) {
-    doc.updateObject(meta.id, { pose: { bones: target } });
+    // the bones keep their constraints (looks, holds)
+    const old = doc.getObject(meta.id)?.pose.bones ?? {};
+    const bones: Record<string, PoseBone> = {};
+    for (const [name, pb] of Object.entries(target))
+      bones[name] = old[name]?.constraints?.length ? { ...pb, constraints: old[name].constraints } : pb;
+    doc.updateObject(meta.id, { pose: { bones } });
     return { frames: [] };
   }
   const frame = o.frame;

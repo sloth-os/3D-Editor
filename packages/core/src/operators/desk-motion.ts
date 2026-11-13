@@ -229,7 +229,8 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       description:
         'Bake the simulation of rigid bodies to world-space keyframes over a frame range (default: the frames the ' +
         'bodies need), so renders and exports need no simulation; the rigid bodies and the hold constraints of ' +
-        'held props are removed. Returns {objects, keyframes, frame_start, frame_end, removed_constraints}.',
+        'held props are removed, and a body with a parent is unparented (its world motion keyed). Returns ' +
+        '{objects, keyframes, frame_start, frame_end, removed_constraints}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -294,7 +295,7 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
           .optional()
           .describe(
             'Frames it takes to rise to the end of the string (default: the string paid out at 2.5 m/s, at ' +
-              'least 2 s; 0: on the whole string from the start)',
+              'least 2 s; 0: already flying on the whole string at frame_start, where the wind holds it)',
           ),
         tail: z.boolean().default(true).describe('Add a tail that trails behind it'),
         string: z.boolean().default(true).describe('Add the string from the anchor'),

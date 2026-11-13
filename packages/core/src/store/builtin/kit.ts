@@ -780,7 +780,14 @@ export const MATS = {
   // half opaque with a slight cool tint, so that it reads against a light background in RASTER
   glass: { name: 'Clear Glass', color: '#dce8ee', roughness: 0.03, transmission: 1, ior: 1.45, alpha: 0.5 },
   /** The lip and foot of drinking glasses: a brighter, near-opaque edge that outlines them. */
-  glassEdge: { name: 'Glass Edge', color: '#f4f8fa', roughness: 0.05, transmission: 0.5, ior: 1.45, alpha: 0.85 },
+  glassEdge: {
+    name: 'Glass Edge',
+    color: '#f4f8fa',
+    roughness: 0.05,
+    transmission: 0.5,
+    ior: 1.45,
+    alpha: 0.85,
+  },
   linen: { name: 'Linen', color: '#efede6', roughness: 0.95, sheen: 0.4 },
   paper: { name: 'Paper', color: '#f3efe2', roughness: 0.85 },
   cardboard: { name: 'Cardboard', color: '#b88a5a', roughness: 0.9 },

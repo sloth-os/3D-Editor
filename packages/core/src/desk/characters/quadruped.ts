@@ -28,17 +28,37 @@ import {
  * species — root, hips, spine, chest, neck, head, tail.1..3, upper_leg / lower_leg / foot per leg
  * (FL, FR, BL, BR) and a `saddle` on rideable kinds. Sizes are fractions of the height at the
  * withers H (the height animals are measured by). Front legs bend at the knee (the cannon folds
- * back), hind legs at the hock (it points back). Horses and ponies wear a saddle (accent colour),
- * hooves and manes are dark, eyes light so the head's facing reads.
+ * back), hind legs at the hock (it points back). The rideable kinds (horse, pony, donkey, cow) wear
+ * a saddle (accent colour); hooves, manes, ears and antlers are dark, eyes light so the head's
+ * facing reads. Each species is a preset of the same parameters (BUILDS) with its own ears, head,
+ * tail and extras (horns, antlers, a black face).
  */
 
-export type QuadrupedKind = 'horse' | 'pony' | 'dog';
+export type QuadrupedKind =
+  'horse' | 'pony' | 'donkey' | 'cow' | 'dog' | 'small_dog' | 'cat' | 'sheep' | 'pig' | 'deer' | 'bear';
 
 /** Legs of a quadruped: front/back × left/right. */
 export const LEGS = ['FL', 'FR', 'BL', 'BR'] as const;
 export type Leg = (typeof LEGS)[number];
 export const legSide = (leg: Leg): 1 | -1 => (leg[1] === 'L' ? 1 : -1);
 export const isFront = (leg: Leg): boolean => leg[0] === 'F';
+
+/** Tail shapes: per segment the angle above the horizontal backwards (degrees) and radius (fraction of H). */
+const TAILS = {
+  /** a horse's hair, hanging further down each segment (dark) */
+  hair: { angles: [-30, -62, -82], radii: [0.06, 0.07, 0.06], dark: [true, true, true], flat: 0.55 },
+  /** a dog's, rising in a curve */
+  up: { angles: [38, 22, 2], radii: [0.065, 0.05, 0.03], dark: [false, false, false], flat: 1 },
+  /** a cat's, held up and curling forward at the tip */
+  raised: { angles: [50, 78, 128], radii: [0.06, 0.055, 0.05], dark: [false, false, false], flat: 1 },
+  /** a short stub (deer, sheep, bears) */
+  stub: { angles: [30, 10, -10], radii: [0.06, 0.05, 0.035], dark: [false, false, false], flat: 0.8 },
+  /** a pig's, curled */
+  curl: { angles: [40, -50, -150], radii: [0.025, 0.022, 0.02], dark: [false, false, false], flat: 1 },
+  /** cattle and donkeys: a thin hanging tail ending in a dark tuft */
+  tuft: { angles: [-55, -80, -88], radii: [0.025, 0.02, 0.045], dark: [false, false, true], flat: 0.8 },
+} as const;
+type TailShape = keyof typeof TAILS;
 
 interface QuadBuild {
   /** Default height at the withers (m). */
@@ -72,17 +92,30 @@ interface QuadBuild {
   headAngle: number;
   headR: number;
   muzzleR: number;
-  ears: 'up' | 'floppy';
+  /**
+   * Ears: pricked up, wide (big flat ears up and out, deer), hanging, sticking out sideways
+   * (cattle, sheep) or round (bears).
+   */
+  ears: 'up' | 'wide' | 'floppy' | 'side' | 'round';
   earLen: number;
   earR: number;
-  /** Head shape: a long tapering horse head, or a dog's skull with a stop and a short muzzle. */
-  snout: 'long' | 'short';
+  /** Two short horns beside the ears (cattle). */
+  horns?: boolean;
+  /** Branched antlers (a stag). */
+  antlers?: boolean;
+  /** A dark face and dark legs below the knees and hocks (a black-faced sheep). */
+  darkPoints?: boolean;
+  /**
+   * Head shape: a long tapering horse head, a dog's skull with a stop and a short muzzle, or a
+   * pig's head ending in a flat disc.
+   */
+  snout: 'long' | 'short' | 'pig';
   /** Heights of the leg roots inside the body (the legs swing from there). */
   frontRootZ: number;
   hindRootZ: number;
-  /** Tail: total length and droop; 'hair' is a horse tail. */
+  /** Tail: total length and shape (TAILS). */
   tailLen: number;
-  tail: 'hair' | 'up';
+  tail: TailShape;
   feet: 'hoof' | 'paw';
   mane: boolean;
   saddle: boolean;
@@ -127,69 +160,322 @@ const HORSE: QuadBuild = {
   saddle: true,
 };
 
+const PONY: QuadBuild = {
+  ...HORSE,
+  height: 1.2,
+  barrelZ: 0.7,
+  barrelR: 0.245,
+  barrelW: 0.22,
+  bodyFront: -0.48,
+  bodyRear: 0.5,
+  elbowZ: 0.56,
+  kneeZ: 0.3,
+  hipZ: 0.6,
+  hockZ: 0.33,
+  legR: 0.075,
+  cannonR: 0.04,
+  neckLen: 0.5,
+  neckAngle: 48,
+  neckR0: 0.17,
+  neckR1: 0.09,
+  headLen: 0.42,
+  headR: 0.1,
+  muzzleR: 0.065,
+  earLen: 0.1,
+  tailLen: 0.6,
+};
+
+const DOG: QuadBuild = {
+  height: 0.55,
+  barrelZ: 0.72,
+  barrelR: 0.19,
+  barrelW: 0.16,
+  bodyFront: -0.52,
+  bodyRear: 0.52,
+  legX: 0.11,
+  frontY: -0.36,
+  backY: 0.4,
+  elbowZ: 0.55,
+  kneeZ: 0.3,
+  hipZ: 0.62,
+  hockZ: 0.26,
+  hockBack: 0.1,
+  fetlockZ: 0.08,
+  legR: 0.06,
+  cannonR: 0.04,
+  neckLen: 0.24,
+  neckAngle: 52,
+  neckR0: 0.125,
+  neckR1: 0.095,
+  headLen: 0.4,
+  headAngle: 6,
+  headR: 0.125,
+  muzzleR: 0.068,
+  ears: 'up',
+  earLen: 0.13,
+  earR: 0.04,
+  snout: 'short',
+  frontRootZ: 0.82,
+  hindRootZ: 0.84,
+  tailLen: 0.45,
+  tail: 'up',
+  feet: 'paw',
+  mane: false,
+  saddle: false,
+};
+
 const BUILDS: Record<QuadrupedKind, QuadBuild> = {
   horse: HORSE,
-  pony: {
-    ...HORSE,
-    height: 1.2,
-    barrelZ: 0.7,
-    barrelR: 0.245,
-    barrelW: 0.22,
-    bodyFront: -0.48,
-    bodyRear: 0.5,
-    elbowZ: 0.56,
-    kneeZ: 0.3,
-    hipZ: 0.6,
-    hockZ: 0.33,
-    legR: 0.075,
-    cannonR: 0.04,
-    neckLen: 0.5,
-    neckAngle: 48,
-    neckR0: 0.17,
-    neckR1: 0.09,
-    headLen: 0.42,
-    headR: 0.1,
-    muzzleR: 0.065,
-    earLen: 0.1,
-    tailLen: 0.6,
+  pony: PONY,
+  dog: DOG,
+  donkey: {
+    ...PONY,
+    height: 1.1,
+    legR: 0.062,
+    cannonR: 0.03,
+    neckLen: 0.46,
+    neckAngle: 42,
+    neckR0: 0.16,
+    neckR1: 0.085,
+    headLen: 0.48,
+    headAngle: 55,
+    headR: 0.105,
+    muzzleR: 0.072,
+    earLen: 0.25,
+    earR: 0.04,
+    tailLen: 0.55,
+    tail: 'tuft',
   },
-  dog: {
-    height: 0.55,
-    barrelZ: 0.72,
-    barrelR: 0.19,
-    barrelW: 0.16,
+  cow: {
+    ...HORSE,
+    height: 1.4,
+    barrelZ: 0.66,
+    barrelR: 0.3,
+    barrelW: 0.27,
+    bodyFront: -0.6,
+    bodyRear: 0.62,
+    legX: 0.13,
+    frontY: -0.42,
+    backY: 0.45,
+    elbowZ: 0.5,
+    kneeZ: 0.27,
+    hipZ: 0.56,
+    hockZ: 0.32,
+    hockBack: 0.06,
+    fetlockZ: 0.08,
+    legR: 0.072,
+    cannonR: 0.04,
+    neckLen: 0.3,
+    neckAngle: 22,
+    neckR0: 0.19,
+    neckR1: 0.13,
+    headLen: 0.4,
+    headAngle: 62,
+    headR: 0.115,
+    muzzleR: 0.09,
+    ears: 'side',
+    earLen: 0.13,
+    earR: 0.045,
+    horns: true,
+    frontRootZ: 0.8,
+    hindRootZ: 0.82,
+    tailLen: 0.62,
+    tail: 'tuft',
+    mane: false,
+  },
+  small_dog: {
+    ...DOG,
+    height: 0.3,
+    barrelZ: 0.7,
+    barrelR: 0.22,
+    barrelW: 0.19,
+    bodyFront: -0.56,
+    bodyRear: 0.56,
+    elbowZ: 0.5,
+    kneeZ: 0.28,
+    hipZ: 0.56,
+    hockZ: 0.26,
+    legR: 0.08,
+    cannonR: 0.05,
+    neckLen: 0.26,
+    neckR0: 0.15,
+    neckR1: 0.12,
+    headLen: 0.46,
+    headR: 0.17,
+    muzzleR: 0.075,
+    ears: 'floppy',
+    earLen: 0.2,
+    earR: 0.07,
+    tailLen: 0.42,
+  },
+  cat: {
+    ...DOG,
+    height: 0.25,
+    barrelZ: 0.7,
+    barrelR: 0.22,
+    barrelW: 0.18,
+    bodyFront: -0.62,
+    bodyRear: 0.62,
+    legX: 0.1,
+    frontY: -0.44,
+    backY: 0.46,
+    elbowZ: 0.55,
+    kneeZ: 0.3,
+    hipZ: 0.62,
+    hockZ: 0.28,
+    hockBack: 0.1,
+    legR: 0.06,
+    cannonR: 0.04,
+    neckLen: 0.24,
+    neckAngle: 48,
+    neckR0: 0.13,
+    neckR1: 0.11,
+    headLen: 0.24,
+    headAngle: 8,
+    headR: 0.19,
+    muzzleR: 0.075,
+    ears: 'up',
+    earLen: 0.13,
+    earR: 0.075,
+    tailLen: 0.85,
+    tail: 'raised',
+  },
+  sheep: {
+    ...HORSE,
+    height: 0.75,
+    barrelZ: 0.7,
+    barrelR: 0.31,
+    barrelW: 0.29,
     bodyFront: -0.52,
     bodyRear: 0.52,
     legX: 0.11,
     frontY: -0.36,
     backY: 0.4,
-    elbowZ: 0.55,
-    kneeZ: 0.3,
-    hipZ: 0.62,
-    hockZ: 0.26,
-    hockBack: 0.1,
+    elbowZ: 0.46,
+    kneeZ: 0.26,
+    hipZ: 0.52,
+    hockZ: 0.3,
+    hockBack: 0.08,
     fetlockZ: 0.08,
-    legR: 0.06,
-    cannonR: 0.04,
-    neckLen: 0.24,
-    neckAngle: 52,
-    neckR0: 0.125,
-    neckR1: 0.095,
-    headLen: 0.4,
-    headAngle: 6,
-    headR: 0.125,
-    muzzleR: 0.068,
-    ears: 'up',
-    earLen: 0.13,
+    legR: 0.055,
+    cannonR: 0.034,
+    neckLen: 0.28,
+    neckAngle: 42,
+    neckR0: 0.17,
+    neckR1: 0.12,
+    headLen: 0.32,
+    headAngle: 50,
+    headR: 0.11,
+    muzzleR: 0.07,
+    ears: 'side',
+    earLen: 0.12,
     earR: 0.04,
-    snout: 'short',
-    frontRootZ: 0.82,
-    hindRootZ: 0.84,
-    tailLen: 0.45,
-    tail: 'up',
-    feet: 'paw',
+    darkPoints: true,
+    frontRootZ: 0.8,
+    hindRootZ: 0.82,
+    tailLen: 0.16,
+    tail: 'stub',
     mane: false,
     saddle: false,
+  },
+  pig: {
+    ...HORSE,
+    height: 0.65,
+    barrelZ: 0.66,
+    barrelR: 0.3,
+    barrelW: 0.27,
+    bodyFront: -0.6,
+    bodyRear: 0.58,
+    legX: 0.12,
+    frontY: -0.4,
+    backY: 0.42,
+    elbowZ: 0.4,
+    kneeZ: 0.22,
+    hipZ: 0.46,
+    hockZ: 0.24,
+    hockBack: 0.05,
+    fetlockZ: 0.07,
+    legR: 0.07,
+    cannonR: 0.045,
+    neckLen: 0.18,
+    neckAngle: 18,
+    neckR0: 0.22,
+    neckR1: 0.18,
+    headLen: 0.42,
+    headAngle: 22,
+    headR: 0.16,
+    muzzleR: 0.1,
+    ears: 'floppy',
+    earLen: 0.15,
+    earR: 0.05,
+    snout: 'pig',
+    frontRootZ: 0.78,
+    hindRootZ: 0.8,
+    tailLen: 0.16,
+    tail: 'curl',
+    mane: false,
+    saddle: false,
+  },
+  deer: {
+    ...HORSE,
+    height: 1.0,
+    barrelR: 0.2,
+    barrelW: 0.16,
+    bodyFront: -0.48,
+    bodyRear: 0.48,
+    legR: 0.05,
+    cannonR: 0.022,
+    neckLen: 0.44,
+    neckAngle: 56,
+    neckR0: 0.11,
+    neckR1: 0.07,
+    headLen: 0.32,
+    headAngle: 42,
+    headR: 0.085,
+    muzzleR: 0.045,
+    ears: 'wide',
+    earLen: 0.15,
+    earR: 0.05,
+    antlers: true,
+    tailLen: 0.14,
+    tail: 'stub',
+    mane: false,
+    saddle: false,
+  },
+  bear: {
+    ...DOG,
+    height: 1.05,
+    barrelZ: 0.66,
+    barrelR: 0.3,
+    barrelW: 0.27,
+    bodyFront: -0.62,
+    bodyRear: 0.58,
+    legX: 0.14,
+    frontY: -0.42,
+    backY: 0.42,
+    elbowZ: 0.42,
+    kneeZ: 0.22,
+    hipZ: 0.5,
+    hockZ: 0.2,
+    hockBack: 0.04,
+    fetlockZ: 0.08,
+    legR: 0.1,
+    cannonR: 0.07,
+    neckLen: 0.24,
+    neckAngle: 25,
+    neckR0: 0.2,
+    neckR1: 0.16,
+    headLen: 0.36,
+    headAngle: 15,
+    headR: 0.15,
+    muzzleR: 0.08,
+    ears: 'round',
+    earLen: 0.07,
+    earR: 0.055,
+    frontRootZ: 0.8,
+    hindRootZ: 0.82,
+    tailLen: 0.08,
+    tail: 'stub',
   },
 };
 
@@ -222,9 +508,9 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
   const ha = P.headAngle * DEG;
   const headTip = vadd(neckTop, v(0, -s(P.headLen) * Math.cos(ha), -s(P.headLen) * Math.sin(ha)));
   const tailBase = v(0, rear - s(0.02), bz + s(P.barrelR * 0.55));
+  const tailShape = TAILS[P.tail];
   const tailDir = (k: number): Vec3 => {
-    // hair tails hang (droop more each segment); 'up' tails rise then curl back down a little
-    const ang = P.tail === 'hair' ? [-30, -62, -82][k] : [25, 10, -15][k];
+    const ang = tailShape.angles[k];
     const len = s(P.tailLen) / 3;
     return v(0, len * Math.cos(ang * DEG), len * Math.sin(ang * DEG));
   };
@@ -365,29 +651,40 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
         const hr = s(P.headR);
         const mr = s(P.muzzleR);
         const secs: Section[] =
-          P.snout === 'long'
+          P.snout === 'pig'
             ? [
-                { t: -0.35 * hr, rx: 0, rz: 0 },
-                { t: -0.15 * hr, rx: 0.75 * hr, rz: 0.8 * hr },
-                { t: 0.15 * len, rx: 0.95 * hr, rz: 1.05 * hr, oz: 0.12 * hr },
-                { t: 0.35 * len, rx: 0.8 * hr, rz: 0.95 * hr, oz: 0.06 * hr },
-                { t: 0.65 * len, rx: 0.95 * mr, rz: 1.1 * mr },
-                { t: 0.92 * len, rx: mr, rz: 1.05 * mr, oz: 0.05 * mr },
-                { t: len, rx: 0.75 * mr, rz: 0.85 * mr, oz: 0.05 * mr },
-                { t: len + 0.35 * mr, rx: 0, rz: 0, oz: 0.05 * mr },
+                // a round head running straight into a broad snout ending in a flat disc
+                { t: -0.45 * hr, rx: 0, rz: 0 },
+                { t: -0.25 * hr, rx: 0.8 * hr, rz: 0.8 * hr },
+                { t: 0.15 * len, rx: hr, rz: hr, oz: -0.05 * hr },
+                { t: 0.45 * len, rx: 0.85 * hr, rz: 0.85 * hr, oz: 0.05 * hr },
+                { t: 0.8 * len, rx: 1.05 * mr, rz: mr, oz: 0.12 * hr },
+                { t: len, rx: 1.1 * mr, rz: 1.05 * mr, oz: 0.12 * hr },
+                { t: len + 0.02 * mr, rx: 0, rz: 0, oz: 0.12 * hr },
               ]
-            : [
-                // a round skull, a stop, then a narrower muzzle set lower
-                { t: -0.45 * hr, rx: 0, rz: 0, oz: -0.1 * hr },
-                { t: -0.25 * hr, rx: 0.78 * hr, rz: 0.8 * hr, oz: -0.1 * hr },
-                { t: 0.12 * len, rx: hr, rz: hr, oz: -0.08 * hr },
-                { t: 0.36 * len, rx: 0.9 * hr, rz: 0.92 * hr, oz: 0 },
-                { t: 0.5 * len, rx: 1.05 * mr, rz: 1.2 * mr, oz: 0.3 * hr },
-                { t: 0.85 * len, rx: mr, rz: 1.05 * mr, oz: 0.34 * hr },
-                { t: len, rx: 0.8 * mr, rz: 0.85 * mr, oz: 0.34 * hr },
-                { t: len + 0.3 * mr, rx: 0, rz: 0, oz: 0.34 * hr },
-              ];
-        loft(b, f, secs, 12, MAT_BODY);
+            : P.snout === 'long'
+              ? [
+                  { t: -0.35 * hr, rx: 0, rz: 0 },
+                  { t: -0.15 * hr, rx: 0.75 * hr, rz: 0.8 * hr },
+                  { t: 0.15 * len, rx: 0.95 * hr, rz: 1.05 * hr, oz: 0.12 * hr },
+                  { t: 0.35 * len, rx: 0.8 * hr, rz: 0.95 * hr, oz: 0.06 * hr },
+                  { t: 0.65 * len, rx: 0.95 * mr, rz: 1.1 * mr },
+                  { t: 0.92 * len, rx: mr, rz: 1.05 * mr, oz: 0.05 * mr },
+                  { t: len, rx: 0.75 * mr, rz: 0.85 * mr, oz: 0.05 * mr },
+                  { t: len + 0.35 * mr, rx: 0, rz: 0, oz: 0.05 * mr },
+                ]
+              : [
+                  // a round skull, a stop, then a narrower muzzle set lower
+                  { t: -0.45 * hr, rx: 0, rz: 0, oz: -0.1 * hr },
+                  { t: -0.25 * hr, rx: 0.78 * hr, rz: 0.8 * hr, oz: -0.1 * hr },
+                  { t: 0.12 * len, rx: hr, rz: hr, oz: -0.08 * hr },
+                  { t: 0.36 * len, rx: 0.9 * hr, rz: 0.92 * hr, oz: 0 },
+                  { t: 0.5 * len, rx: 1.05 * mr, rz: 1.2 * mr, oz: 0.3 * hr },
+                  { t: 0.85 * len, rx: mr, rz: 1.05 * mr, oz: 0.34 * hr },
+                  { t: len, rx: 0.8 * mr, rz: 0.85 * mr, oz: 0.34 * hr },
+                  { t: len + 0.3 * mr, rx: 0, rz: 0, oz: 0.34 * hr },
+                ];
+        loft(b, f, secs, 12, P.darkPoints ? MAT_DARK : MAT_BODY);
         const along = (t: number, side: number, up: number) =>
           vadd(vadd(vadd(neckTop, vscale(f.u, t)), vscale(f.x, side)), vscale(f.z, -up));
         for (const sd of [1, -1]) {
@@ -403,13 +700,65 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
               rings: 1,
               sx: 0.6,
             });
+          } else if (P.ears === 'wide') {
+            // big flat ears turned forward, standing up and out
+            const tip = vadd(
+              earBase,
+              vadd(vscale(f.z, -0.75 * s(P.earLen)), vscale(f.x, sd * 0.65 * s(P.earLen))),
+            );
+            capsule(b, earBase, tip, 0.6 * s(P.earR), s(P.earR), MAT_DARK, {
+              segs: 8,
+              rings: 1,
+              sx: 0.35,
+              cap1: 1.4,
+              side: f.u,
+            });
+          } else if (P.ears === 'side') {
+            // flaps sticking out sideways and a little down (cattle, sheep)
+            const tip = vadd(earBase, vadd(vscale(f.x, sd * s(P.earLen)), vscale(f.z, 0.35 * s(P.earLen))));
+            capsule(b, earBase, tip, s(P.earR), 0.7 * s(P.earR), MAT_DARK, {
+              segs: 8,
+              rings: 1,
+              sz: 0.4,
+              side: f.u,
+            });
+          } else if (P.ears === 'round') {
+            ball(b, vadd(earBase, vscale(f.z, -0.4 * s(P.earR))), s(P.earR), MAT_DARK, 1);
           } else {
             // floppy ears hang beside the head
             const tip = vadd(
               earBase,
               vadd(vscale(f.x, sd * s(0.05)), vadd(vscale(f.z, s(P.earLen)), vscale(f.u, s(0.02)))),
             );
-            capsule(b, earBase, tip, s(0.035), s(0.03), MAT_DARK, { segs: 8, rings: 1, sz: 0.35, side: f.u });
+            capsule(b, earBase, tip, s(P.earR), 0.85 * s(P.earR), MAT_DARK, {
+              segs: 8,
+              rings: 1,
+              sz: 0.35,
+              side: f.u,
+            });
+          }
+          if (P.horns) {
+            // short light horns curving out and up between the ears
+            const base = along(-0.15 * hr, sd * 0.35 * hr, 0.85 * hr);
+            const tip = vadd(base, vadd(vscale(f.x, sd * 0.09 * H), vscale(f.z, -0.05 * H)));
+            capsule(b, base, tip, 0.025 * H, 0.008 * H, MAT_LIGHT, { segs: 6, rings: 1 });
+          }
+          if (P.antlers) {
+            // a beam rising up, out and back from between the ears, two tines pointing forward
+            // (character space: +Z up, +Y back)
+            const base = along(0.05 * hr, sd * 0.35 * hr, 0.8 * hr);
+            const p1 = vadd(base, v(sd * s(0.05), s(0.02), s(0.12)));
+            const p2 = vadd(p1, v(sd * s(0.05), s(0.05), s(0.11)));
+            const p3 = vadd(p2, v(-sd * s(0.01), s(0.03), s(0.1)));
+            const r0 = s(0.016);
+            capsule(b, base, p1, r0, 0.85 * r0, MAT_DARK, { segs: 6, rings: 1 });
+            capsule(b, p1, p2, 0.85 * r0, 0.7 * r0, MAT_DARK, { segs: 6, rings: 1 });
+            capsule(b, p2, p3, 0.7 * r0, 0.35 * r0, MAT_DARK, { segs: 6, rings: 1 });
+            for (const [from, tine] of [
+              [p1, v(sd * s(0.01), -s(0.08), s(0.06))],
+              [p2, v(sd * s(0.02), -s(0.06), s(0.08))],
+            ] as const)
+              capsule(b, from, vadd(from, tine), 0.6 * r0, 0.3 * r0, MAT_DARK, { segs: 6, rings: 1 });
           }
           // nostrils
           if (P.snout === 'long')
@@ -418,31 +767,29 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
         if (P.snout === 'short') {
           // a dark nose at the tip of the muzzle
           ball(b, along(len + 0.15 * mr, 0, -0.34 * hr + 0.45 * mr), 0.42 * mr, MAT_DARK, 1);
+        } else if (P.snout === 'pig') {
+          // the snout's flat disc with two nostrils
+          const disc = along(len + 0.03 * mr, 0, -0.12 * hr);
+          ellipsoid(b, disc, v(0.9 * mr, 0.9 * mr, 0.9 * mr), MAT_LIGHT, 1);
+          for (const sd of [1, -1])
+            ball(b, along(len + 0.1 * mr, sd * 0.35 * mr, -0.12 * hr), 0.2 * mr, MAT_DARK, 1);
         }
       },
     },
   ];
-  const tailR = P.tail === 'hair' ? [0.06, 0.07, 0.06] : [0.05, 0.04, 0.025];
   const tailPts = [tailBase, tail1, tail2, tail3];
   for (let k = 0; k < 3; k++) {
     const a = tailPts[k];
     const c = tailPts[k + 1];
+    const r = s(tailShape.radii[k]);
     parts.push({
       bone: `tail.${k + 1}`,
       build: (b) =>
-        capsule(
-          b,
-          a,
-          c,
-          s(tailR[k]),
-          s(tailR[k] * (k === 2 ? 0.5 : 0.95)),
-          P.tail === 'hair' ? MAT_DARK : MAT_BODY,
-          {
-            segs: 8,
-            rings: 2,
-            sx: P.tail === 'hair' ? 0.55 : 1,
-          },
-        ),
+        capsule(b, a, c, r, r * (k === 2 ? 0.5 : 0.95), tailShape.dark[k] ? MAT_DARK : MAT_BODY, {
+          segs: 8,
+          rings: 2,
+          sx: tailShape.flat,
+        }),
     });
   }
   for (const leg of LEGS) {
@@ -454,13 +801,17 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
       {
         bone: `upper_leg.${leg}`,
         build: (b) => {
-          // the leg grows out of the body: a thick top tapering to the knee / hock
+          // the leg grows out of the body: thick where it leaves the body, then narrowing fast
+          // (r falls as (1 − t)^p, not linearly) to a slim forearm or gaskin above the knee / hock
           const top = vadd(j.vis, v(0, 0, s(fr ? 0.1 : 0.12)));
-          capsule(b, top, j.mid, upR * (fr ? 1.3 : 1.5), loR * 1.25, MAT_BODY, {
+          const r0 = upR * (fr ? 1.3 : 1.5);
+          const r1 = loR * 1.25;
+          const p = fr ? 1.6 : 2;
+          capsule(b, top, j.mid, r0, r1, MAT_BODY, {
             sz: fr ? 1.15 : 1.4,
-            rings: 3,
+            rings: 4,
             side: v(1, 0, 0),
-            bulge: (t) => 0.1 * Math.sin(Math.PI * t),
+            bulge: (t) => (r1 + (r0 - r1) * (1 - t) ** p) / (r0 + (r1 - r0) * t) - 1,
           });
           ball(b, j.mid, loR * 1.4, MAT_DARK, 1);
         },
@@ -468,7 +819,7 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
       {
         bone: `lower_leg.${leg}`,
         build: (b) => {
-          capsule(b, j.mid, j.low, loR * 1.1, loR, MAT_BODY, { rings: 2, segs: 8 });
+          capsule(b, j.mid, j.low, loR * 1.1, loR, P.darkPoints ? MAT_DARK : MAT_BODY, { rings: 2, segs: 8 });
           ball(b, j.low, loR * 1.25, MAT_DARK, 1);
         },
       },
@@ -477,7 +828,10 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
         build: (b) => {
           if (P.feet === 'hoof') {
             const hoofTop = vlerp(j.low, j.tip, 0.55);
-            capsule(b, j.low, hoofTop, loR, loR * 1.05, MAT_BODY, { rings: 1, segs: 8 });
+            capsule(b, j.low, hoofTop, loR, loR * 1.05, P.darkPoints ? MAT_DARK : MAT_BODY, {
+              rings: 1,
+              segs: 8,
+            });
             // a hoof: a short dark cone standing on the floor
             const f = frameAlong(
               v(j.tip[0], j.tip[1] + s(0.012), 0),
@@ -578,7 +932,14 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
     vadd(vadd(vadd(neckTop, vscale(f.u, t)), vscale(f.x, side)), vscale(f.z, -up));
   const hr = s(P.headR);
   const len = s(P.headLen);
-  const earTop = P.ears === 'up' ? s(P.earLen) : 0;
+  const earTop =
+    P.ears === 'up'
+      ? s(P.earLen)
+      : P.ears === 'wide'
+        ? 0.75 * s(P.earLen)
+        : P.ears === 'round'
+          ? 0.6 * s(P.earR)
+          : 0;
   const short = P.snout === 'short';
   const eyeT = short ? 0.3 * len : 0.2 * len;
   return {
@@ -588,7 +949,7 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
     parts,
     probes,
     head: {
-      nose: along(len + 0.35 * s(P.muzzleR), 0, short ? -0.34 * hr : 0),
+      nose: along(len + 0.35 * s(P.muzzleR), 0, short ? -0.34 * hr : P.snout === 'pig' ? -0.12 * hr : 0),
       eyeL: along(eyeT, 0.9 * hr, 0.35 * hr),
       eyeR: along(eyeT, -0.9 * hr, 0.35 * hr),
       earL: along(-0.05 * hr, 0.55 * hr, 0.75 * hr),
@@ -604,5 +965,6 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
       ]),
     ),
     accent: P.saddle,
+    barrel: { halfWidth: W, halfHeight: R, z: bz },
   };
 }

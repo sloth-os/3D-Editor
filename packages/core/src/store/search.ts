@@ -254,8 +254,7 @@ export function rankCatalog(
 ): { entry: CatalogEntry; score: number }[] {
   const pool = opts.category ? BUILTIN_CATALOG.filter((e) => e.category === opts.category) : BUILTIN_CATALOG;
   const words = searchWords(query).filter((w) => !STOP_WORDS.has(w));
-  if (!words.length)
-    return query.trim() ? [] : [...pool].sort(byName).map((entry) => ({ entry, score: 0 }));
+  if (!words.length) return query.trim() ? [] : [...pool].sort(byName).map((entry) => ({ entry, score: 0 }));
   const out: { entry: CatalogEntry; score: number }[] = [];
   for (const entry of pool) {
     const score = entryScore(entry, words);

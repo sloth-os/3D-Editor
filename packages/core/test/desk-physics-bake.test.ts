@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Mat4 } from '../src/math/types';
 import { SceneEvaluator } from '../src/eval/evaluate';
 import { createConstraint } from '../src/constraints/catalogue';
-import { newRigidBody } from '../src/physics/settings';
+import { RELEASE_TRACKED_STEPS, newRigidBody } from '../src/physics/settings';
 import { DESK_BAKE_MAX_BODY_FRAMES, deskBakePlan } from '../src/desk/physics';
 import { deskScene, originOf } from './desk-physics-helpers';
 
@@ -14,6 +14,25 @@ import { deskScene, originOf } from './desk-physics-helpers';
  */
 
 const range = (a: number, b: number) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
+
+/** Keys channel `path[index]` of object `id` (linear). */
+function key(
+  doc: ReturnType<typeof deskScene>['doc'],
+  id: string,
+  path: string,
+  index: number,
+  keys: [number, number][],
+) {
+  doc.setFCurve({
+    target_type: 'object',
+    target_id: id,
+    path,
+    index,
+    keyframes: keys.map(([frame, value]) => ({ frame, value, interpolation: 'LINEAR' as const })),
+    extrapolation: 'CONSTANT',
+    mute: false,
+  });
+}
 
 /** World matrices of `ids` at `frames`, evaluated in order. */
 function worlds(doc: ReturnType<typeof deskScene>['doc'], ids: string[], frames: number[]) {
@@ -49,12 +68,14 @@ describe('desk.physics_bake', () => {
     const live = worlds(s.doc, [a, b], frames);
     const r = s.run('desk.physics_bake', {});
     expect(r.objects.map((o: { object: string }) => o.object).sort()).toEqual([a, b].sort());
-    expect(r.frame_start).toBe(11);
+    // the world starts where the release is tracked (its last animated steps give its velocity)
+    const first = 12 - RELEASE_TRACKED_STEPS;
+    expect(r.frame_start).toBe(first);
     expect(r.frame_end).toBe(range0.frame_end);
     for (const id of [a, b]) {
       const o = s.doc.getObject(id)!;
       expect(o.rigid_body).toBeNull();
-      expect(o.custom_props?.rigid_body_baked).toBe(`frames 11-${range0.frame_end} step 1`);
+      expect(o.custom_props?.rigid_body_baked).toBe(`frames ${first}-${range0.frame_end} step 1`);
     }
     expectSameMotion(live, worlds(s.doc, [a, b], frames), frames);
     // redundant keys dropped: a body at rest keeps no key per frame
@@ -140,12 +161,64 @@ describe('desk.physics_bake', () => {
     expect(originOf(live.get(prop)![9])[0]).toBeCloseTo(0.9, 6);
     expect(originOf(live.get(prop)![35])[0]).toBeGreaterThan(2.9 + 0.5);
     const plan = deskBakePlan(s.doc, {});
-    expect(plan.bodies).toEqual([{ id: prop, from: 1, holds: ['Hold'] }]);
+    expect(plan.bodies).toEqual([{ id: prop, from: 1, holds: ['Hold'], unparent: false }]);
     const r = s.run('desk.physics_bake', {});
     expect(r.removed_constraints).toEqual([{ object: prop, name: 'Prop', constraints: ['Hold'] }]);
     expect(s.doc.getObject(prop)!.constraints).toEqual([]);
     expect(s.doc.listFCurves().some((fc) => fc.path.startsWith('constraints['))).toBe(false);
     expectSameMotion(live, worlds(s.doc, [prop], frames), frames);
+  });
+
+  it('writes world-space keys for a body under an animated parent, and clears the parent', () => {
+    const s = deskScene();
+    // an arm turning and moving until frame 120 carries the box until it lets it go at 30
+    const arm = s.empty('Arm', [0, 0, 2]);
+    key(s.doc, arm, 'rotation_euler', 2, [
+      [1, 0],
+      [120, 6],
+    ]);
+    key(s.doc, arm, 'location', 0, [
+      [1, 0],
+      [120, 3],
+    ]);
+    const box = s.box('Box', [0.8, 0, 0], 0.4, { parent: arm, rotation_euler: [0.3, 0.1, 0] });
+    s.run('desk.physics_drop', { objects: ['Box'], frame: 30 });
+    const end = s.doc.getScene().rigidbody_world.frame_end;
+    // the arm still moves long after the world has ended
+    expect(end + 20).toBeLessThan(120);
+    const frames = range(1, 130);
+    const live = worlds(s.doc, [box], frames);
+    // keyed from the arm's first move (frame 1), not from the world's start
+    expect(deskBakePlan(s.doc, {}).bodies).toEqual([{ id: box, from: 1, holds: [], unparent: true }]);
+    s.run('desk.physics_bake', {});
+    expect(s.doc.getObject(box)!.parent).toBeNull();
+    expect(s.warnings.some((w) => w.includes("'Box' was unparented from 'Arm'"))).toBe(true);
+    // carried, released, at rest: and still at rest while the arm moves on
+    expectSameMotion(live, worlds(s.doc, [box], frames), frames);
+  });
+
+  it('keys the scale of a part under a non-uniformly scaled root: a spinning body is not distorted', () => {
+    const s = deskScene();
+    // a store model: an EMPTY root sized by width and height, its mesh part a child
+    const root = s.empty('Crate', [0, 0, 1.2], { scale: [1.6, 1, 0.6] });
+    const part = s.box('Crate body', [0, 0, 0.2], 0.4, { parent: root });
+    s.run('desk.physics_throw', {
+      object: 'Crate',
+      target: [2, 0, 1],
+      frame: 10,
+      flight_s: 0.8,
+      spin: [3, 5, 1],
+    });
+    const end = s.doc.getScene().rigidbody_world.frame_end;
+    const frames = range(1, end + 20);
+    const live = worlds(s.doc, [part], frames);
+    const r = s.run('desk.physics_bake', {});
+    expect(s.doc.getObject(part)!.parent).toBeNull();
+    for (let i = 0; i < 3; i++)
+      expect(s.doc.getFCurve(`object:${part}:scale:${i}`), `scale ${i}`).toBeTruthy();
+    expect(r.keyframes).toBeGreaterThan(0);
+    // every entry of the matrix (rotation and scale, not only the origin)
+    expectSameMotion(live, worlds(s.doc, [part], frames), frames);
   });
 
   it('refuses a bake over the budget, naming what to lower', () => {

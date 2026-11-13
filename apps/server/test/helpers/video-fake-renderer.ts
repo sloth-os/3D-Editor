@@ -53,9 +53,10 @@ export interface FakeRenderer {
   failFrame: { frame: number; error: Error } | null;
   /**
    * Ends the render process of the thread a request is sent to when this answers true (its call
-   * fails like one of a process killed by the system, and later calls to the thread fail at once).
+   * fails like one of a process killed by the system) or an error (its call fails with it); later
+   * calls to the thread fail at once.
    */
-  kill: ((req: RenderRequest, thread: number) => boolean) | null;
+  kill: ((req: RenderRequest, thread: number) => boolean | Error) | null;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -150,10 +151,11 @@ export function makeFakeRenderer(
       release() {},
       async call(req: RenderRequest): Promise<unknown> {
         if (!t.alive) throw killedError();
-        if (fake.kill?.(req, t.id)) {
+        const killed = fake.kill?.(req, t.id);
+        if (killed) {
           t.alive = false;
           stats.deaths++;
-          throw killedError();
+          throw killed instanceof Error ? killed : killedError();
         }
         return answer(req);
       },

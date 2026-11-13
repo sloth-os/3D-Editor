@@ -10,6 +10,7 @@ import {
   type Vec3,
 } from '../src';
 import { ditherByte, ditherThreshold, linearToSrgb, linearToSrgb255 } from '../src/render/color';
+import { filmRowsToRGBA8 } from '../src/render/pathtrace/display';
 import {
   boxOverGround,
   imageHash,
@@ -17,6 +18,7 @@ import {
   luma,
   mixedScene,
   projectToPixel,
+  seeded,
 } from './render-desk-helpers';
 
 const rgbAt = (img: RenderedImage, p: [number, number]) => {
@@ -298,6 +300,38 @@ describe('dithering', () => {
         expect(Math.abs(plain[1] - exact)).toBeGreaterThan(0.1);
       }
     }
+  });
+
+  it('converts a film a band of rows at a time exactly as the whole film at once', () => {
+    // the rasterizer converts its display film a row at a time (no image-sized film)
+    const W = 37;
+    const H = 23;
+    const rnd = seeded(7);
+    const film = new Float32Array(W * H * 4);
+    for (let i = 0; i < W * H; i++) {
+      // empty, partly covered and covered pixels, some brighter than white
+      const a = i % 5 === 0 ? 0 : i % 5 === 1 ? 0.4 : 1;
+      film[i * 4] = rnd() * 3 * a;
+      film[i * 4 + 1] = rnd() * a;
+      film[i * 4 + 2] = rnd() * 0.5 * a;
+      film[i * 4 + 3] = a;
+    }
+    const backgrounds: ([number, number, number, number] | null)[] = [null, [0.2, 0.4, 0.6, 0.5]];
+    for (const vt of ['STANDARD', 'AGX'] as const)
+      for (const background of backgrounds)
+        for (const dither of [false, true]) {
+          const whole = filmToRGBA8(film, W, H, 1.5, vt, background, dither);
+          for (const band of [1, 3]) {
+            const out = new Uint8ClampedArray(W * H * 4);
+            for (let y0 = 0; y0 < H; y0 += band) {
+              const rows = Math.min(band, H - y0);
+              const rowsFilm = film.slice(y0 * W * 4, (y0 + rows) * W * 4);
+              filmRowsToRGBA8(rowsFilm, W, y0, rows, out, 1.5, vt, background, dither);
+            }
+            const what = `${vt} ${background ? 'background' : 'none'} dither ${dither} band ${band}`;
+            expect(out.every((v, i) => v === whole[i]), what).toBe(true);
+          }
+        }
   });
 
   it('renders deterministically, within one step of the undithered image', () => {

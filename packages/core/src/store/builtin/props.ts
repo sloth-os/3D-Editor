@@ -958,9 +958,17 @@ function woodenCrate(): ModelGeometry {
   addBox(b, [-w / 2 + 0.012, -d / 2 + 0.012, 0.004], [w / 2 - 0.012, d / 2 - 0.012, 0.018], { mat: 1 });
   return {
     parts: [
-      part('crate', b, [{ ...MATS.pine, tint: true }, { name: 'Pine Dark', color: '#9a7449', roughness: 0.65 }], {
-        sharpAngle: SHARP,
-      }),
+      part(
+        'crate',
+        b,
+        [
+          { ...MATS.pine, tint: true },
+          { name: 'Pine Dark', color: '#9a7449', roughness: 0.65 },
+        ],
+        {
+          sharpAngle: SHARP,
+        },
+      ),
     ],
   };
 }
@@ -1431,7 +1439,11 @@ function ladder(): ModelGeometry {
   const tp = front(1, 1);
   addBox(b, [-tp[0] - 0.02, tp[1] - 0.04, h - 0.02], [tp[0] + 0.02, spread * 0.12, h + 0.01], { mat: 2 });
   return {
-    parts: [part('ladder', b, [{ ...MATS.steel, tint: true }, MATS.rubber, MATS.greyPlastic], { sharpAngle: SHARP })],
+    parts: [
+      part('ladder', b, [{ ...MATS.steel, tint: true }, MATS.rubber, MATS.greyPlastic], {
+        sharpAngle: SHARP,
+      }),
+    ],
   };
 }
 

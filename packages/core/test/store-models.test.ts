@@ -5,6 +5,7 @@ import { createEditorState, type OperatorContext } from '../src/operators/contex
 import { createOperatorRegistry } from '../src/operators';
 import type { RunResult } from '../src/operators/registry';
 import { FrameState } from '../src/eval/frame-state';
+import { renderSceneSoftware } from '../src/render';
 import { estimateOperator } from '../src/operators/memory';
 import { STORE_MODEL_MAX_OBJECTS, STORE_MODEL_MAX_MATERIALS } from '../src/operators/memory-desk';
 import { STORE_CATEGORIES, type CatalogEntry } from '../src/store';
@@ -162,6 +163,25 @@ describe('store.add', () => {
     expect(measure(t.doc, both.objects).size[2]).toBeCloseTo(h, 3);
   });
 
+  it('reports the size of a tiny or a huge model as built, to six significant digits', () => {
+    const t = setup();
+    for (const [model, height_m] of [
+      ['mug', 1e-6],
+      ['mug', 0.00123],
+      ['sofa', 9876.5],
+    ] as const) {
+      const r = t.run('store.add', { model, height_m });
+      expect(r.ok, r.error).toBe(true);
+      const built = measure(t.doc, r.result.objects).size;
+      const reported = r.result.dimensions_m as number[];
+      expect(reported[2]).toBeCloseTo(height_m, 9);
+      for (let k = 0; k < 3; k++) {
+        expect(reported[k], `${model} ${height_m} axis ${k}`).toBeGreaterThan(0);
+        expect(Math.abs(reported[k] - built[k]) / built[k]).toBeLessThan(1e-5);
+      }
+    }
+  });
+
   it('turns the model about Z by rotation_deg (its front from −Y to +X at 90°)', () => {
     const t = setup();
     const r = t.run('store.add', { model: 'sofa', rotation_deg: 90, location: [0, 0, 0] }).result;
@@ -274,5 +294,51 @@ describe('store.add', () => {
     const t = setup();
     t.ctx.state.mode = 'EDIT';
     expect(t.run('store.add', { model: 'sofa' })).toMatchObject({ ok: false, code: 'POLL_FAILED' });
+  });
+});
+
+describe('the wine glass', () => {
+  it('reads in RASTER renders against light and dark backgrounds, not as a faint smudge', () => {
+    // the glass alone, the same glass in opaque black (its silhouette) and nothing, from the front
+    const empty = setup().doc;
+    const glass = setup();
+    expect(glass.run('store.add', { model: 'wine_glass', location: [0, 0, 0] }).ok).toBe(true);
+    const shape = setup();
+    const black = shape.doc.addMaterial({ name: 'Silhouette', base_color: [0, 0, 0, 1], roughness: 1 });
+    for (const id of shape.run('store.add', { model: 'wine_glass', location: [0, 0, 0] }).result.objects) {
+      const o = shape.doc.getObject(id)!;
+      if (o.type === 'MESH')
+        shape.doc.updateObject(id, { material_slots: o.material_slots.map(() => black) });
+    }
+    const view = {
+      position: [0, -0.6, 0.12] as Vec3,
+      target: [0, 0, 0.1] as Vec3,
+      fovY: (25 * Math.PI) / 180,
+    };
+    for (const background of [
+      [0.85, 0.86, 0.88, 1],
+      [0.35, 0.36, 0.38, 1],
+    ] as const) {
+      const shot = (doc: SceneDoc) =>
+        renderSceneSoftware(doc, { width: 48, height: 64, view, background: [...background], samples: 1 })
+          .data;
+      const bare = shot(empty);
+      /** Pixels whose colour the model changes by more than 8% of the range. */
+      const changed = (img: ArrayLike<number>) => {
+        let n = 0;
+        for (let i = 0; i < img.length; i += 4) {
+          const d =
+            Math.abs(img[i] - bare[i]) +
+            Math.abs(img[i + 1] - bare[i + 1]) +
+            Math.abs(img[i + 2] - bare[i + 2]);
+          if (d / 3 / 255 > 0.08) n++;
+        }
+        return n;
+      };
+      const silhouette = changed(shot(shape.doc));
+      expect(silhouette).toBeGreaterThan(300);
+      // most of the glass shows (a 0.35-alpha clear glass without wine changed under a fifth of it)
+      expect(changed(shot(glass.doc)) / silhouette, `background ${background[0]}`).toBeGreaterThan(0.4);
+    }
   });
 });

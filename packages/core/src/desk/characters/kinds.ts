@@ -30,7 +30,15 @@ export const BUILT_KINDS: readonly ActorKind[] = [
   'elder',
   'horse',
   'pony',
+  'donkey',
+  'cow',
   'dog',
+  'small_dog',
+  'cat',
+  'sheep',
+  'pig',
+  'deer',
+  'bear',
 ];
 
 export function isActorKind(k: string): k is ActorKind {
@@ -123,18 +131,25 @@ export function posedBones(
 }
 
 /**
- * The neck angle (degrees, raised > 0) of a grazing quadruped pose at which the tip of the muzzle
- * is just above the ground (a twentieth of the actor's height), bisected; the lowest angle tried
- * when the neck is too short.
+ * The neck angle (degrees, raised > 0) of a grazing quadruped pose at which the lowest point of the
+ * head (the muzzle, or the jaw of a long head held steeply) is just above the ground (3% of the
+ * actor's height), bisected; the lowest angle tried when the neck is too short.
  */
 function grazingNeck(arm: ArmatureData, bp: Blueprint, spec: AnimalPoseSpec): number {
   const surface = partSurfaces(bp);
-  const muzzle = [{ bone: 'head', point: bp.head.nose, radius: 0 }];
-  const clearance = 0.05 * bp.height;
-  // the muzzle's height above the lowest point of the body, less the clearance (falls as the neck lowers)
+  const isHead = (p: { bone: string }) => p.bone === 'head';
+  const head = [...bp.probes.filter(isHead), { bone: 'head', point: bp.head.nose, radius: 0 }];
+  const headSurface = surface.filter(isHead);
+  const body = bp.probes.filter((p) => !isHead(p));
+  const bodySurface = surface.filter((p) => !isHead(p));
+  const clearance = 0.03 * bp.height;
+  // the head's height above the lowest point of the rest of the body, less the clearance (falls
+  // as the neck lowers)
   const above = (neck: number) => {
     const bones = poseBones(arm, animalRotations({ ...spec, neck }).rot, [0, 0, 0]);
-    return lowestPoint(arm, bones, muzzle) - lowestPoint(arm, bones, bp.probes, surface) - clearance;
+    return (
+      lowestPoint(arm, bones, head, headSurface) - lowestPoint(arm, bones, body, bodySurface) - clearance
+    );
   };
   // the muzzle keeps falling until the neck points about 105° below its rest angle
   let hi = 0;

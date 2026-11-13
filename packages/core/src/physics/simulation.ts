@@ -34,16 +34,16 @@ import { composeRigid, decomposeRigid, isFiniteVec, mat3ToQuat, quatToMat3, sler
  * PASSIVE body with "Animated" on, does). There it is placed at its animated pose, and it follows
  * its animated / parented / constrained transform as an animated (KINEMATIC) body up to and
  * including its start frame; then it is released into its own motion mode with the velocity of its
- * last animated step (when inherit_velocity) plus its initial velocities. When that velocity is a
- * jump of the animation at the release rather than a motion (RELEASE_MAX_ACCELERATION), the body
- * keeps the velocity of the step before and a warning names it. Its transforms are recorded and
- * verified on those few frames only, so a release late in a long world costs a few evaluations of
- * the scene, not one per frame before it. `matrices` leaves it out up to its start frame, so the
- * scene shows its own transform until the simulation takes over. A body released at or after the
- * world's frame_end keeps the world running until it has come to rest (`runLimit`), and a start
- * frame before the world's start is reported. Bodies that start with the world (start_frame null or
- * not after frame_start) get their initial velocities at frame_start; without start frames and
- * velocities a run is exactly what it was before they existed.
+ * last animated step (when inherit_velocity) plus its initial velocities. When its last two animated
+ * steps differ by more than a hand could change its velocity (RELEASE_MAX_ACCELERATION), one of them
+ * is a jump of the animation rather than a motion: the body keeps the slower one and a warning names
+ * the jump. Its transforms are recorded and verified on those few frames only, so a release late in
+ * a long world costs a few evaluations of the scene, not one per frame before it. `matrices` leaves
+ * it out up to its start frame, so the scene shows its own transform until the simulation takes
+ * over. A body released at or after the world's frame_end keeps the world running until it has come
+ * to rest (`runLimit`), and a start frame before the world's start is reported. Bodies that start
+ * with the world (start_frame null or not after frame_start) get their initial velocities at
+ * frame_start; without start frames and velocities a run is exactly what it was before they existed.
  */
 
 /** A delayed body and what it becomes at its start frame. */
@@ -221,9 +221,7 @@ export class Simulation {
     this.bodies = bodies;
     this.pending.sort((a, b) => a.frame - b.frame || a.body.index - b.body.index);
     this.delayed = bodies.filter((b) => this.releases.has(b));
-    this.outputs = bodies.filter(
-      (b) => b.mode === 'DYNAMIC' || b.mode === 'FROZEN' || this.releases.has(b),
-    );
+    this.outputs = bodies.filter((b) => b.mode === 'DYNAMIC' || b.mode === 'FROZEN' || this.releases.has(b));
     this.kinematic = bodies.filter((b) => b.mode === 'KINEMATIC' && !this.releases.has(b));
     this.tracked = bodies.filter((b) => b.mode === 'KINEMATIC');
     this.world = new PhysicsWorld(bodies, {
@@ -405,16 +403,21 @@ export class Simulation {
   }
 
   /**
-   * The velocities a body inherits at its release: those of its last animated step, or of the step
-   * before where the last one changes them faster than a hand could (RELEASE_MAX_ACCELERATION): its
-   * animated transform jumps at the release (a release pose keyed for another motion of the holder),
-   * which would launch it. A warning names the jump.
+   * The velocities a body inherits at its release: those of its last animated step, unless its last
+   * two steps differ by more than a hand could change them in a frame (RELEASE_MAX_ACCELERATION): then
+   * its animated transform jumps there (a release pose keyed for another motion of the holder, or a
+   * hold let go a frame early), and the slower of the two steps is the hand's motion while the faster
+   * one is the jump that would launch it. It keeps the slower one, and a warning names the jump.
    */
   private withoutJump(r: Release, linear: Vec3, angular: Vec3): [Vec3, Vec3] {
     const before = r.before!;
     const frameTime = this.dt * this.substeps;
     if (!(frameTime > 0)) return [linear, angular];
-    const dv = speed([linear[0] - before.linear[0], linear[1] - before.linear[1], linear[2] - before.linear[2]]);
+    const dv = speed([
+      linear[0] - before.linear[0],
+      linear[1] - before.linear[1],
+      linear[2] - before.linear[2],
+    ]);
     const dw = speed([
       angular[0] - before.angular[0],
       angular[1] - before.angular[1],
@@ -423,19 +426,26 @@ export class Simulation {
     const linearJump = dv > Math.max(RELEASE_JUMP_MIN_LINEAR, RELEASE_MAX_ACCELERATION * frameTime);
     const angularJump = dw > Math.max(RELEASE_JUMP_MIN_ANGULAR, RELEASE_MAX_ANGULAR_ACCELERATION * frameTime);
     if (!linearJump && !angularJump) return [linear, angular];
+    const slower = (a: Readonly<Vec3>, b: Readonly<Vec3>): Vec3 =>
+      [...(speed(a) <= speed(b) ? a : b)] as Vec3;
+    const keptLinear = linearJump ? slower(before.linear, linear) : linear;
+    const keptAngular = angularJump ? slower(before.angular, angular) : angular;
     const what = [
-      linearJump ? `${fmt(speed(linear))} m/s where it moved at ${fmt(speed(before.linear))} m/s` : '',
-      angularJump ? `${fmt(speed(angular))} rad/s where it turned at ${fmt(speed(before.angular))} rad/s` : '',
+      linearJump
+        ? `${fmt(speed(before.linear))} then ${fmt(speed(linear))} m/s (kept ${fmt(speed(keptLinear))})`
+        : '',
+      angularJump
+        ? `${fmt(speed(before.angular))} then ${fmt(speed(angular))} rad/s (kept ${fmt(speed(keptAngular))})`
+        : '',
     ].filter(Boolean);
     this.issue(
       r.body.id,
       'WARNING',
-      `its animated transform jumps at its release (frame ${r.frame}): its last animated step gives ` +
-        `${what.join(' and ')} one frame earlier, so it is released with the velocity of that earlier step; ` +
-        'key its release pose where it is held then (desk.actor_hold again after changing the holder) or move ' +
-        'its start_frame',
+      `its animated transform jumps at its release (frame ${r.frame}): its last two animated steps move it at ` +
+        `${what.join(' and ')}, so it is released with the slower one; key its release pose where it is held ` +
+        'then (desk.actor_hold again after changing the holder) or move its start_frame',
     );
-    return [linearJump ? [...before.linear] : linear, angularJump ? [...before.angular] : angular];
+    return [keptLinear, keptAngular];
   }
 
   private issue(objectId: string, level: RigidBodyIssue['level'], message: string): void {
@@ -518,7 +528,12 @@ export class Simulation {
         [body.vx, body.vy, body.vz] = rb.initial_linear_velocity;
         [body.wx, body.wy, body.wz] = rb.initial_angular_velocity;
       }
-      if (rb.type === 'ACTIVE' && !rb.kinematic && rb.start_frame !== null && rb.start_frame < this.frameStart)
+      if (
+        rb.type === 'ACTIVE' &&
+        !rb.kinematic &&
+        rb.start_frame !== null &&
+        rb.start_frame < this.frameStart
+      )
         this.early.push({ id, start: rb.start_frame });
     }
     return body;

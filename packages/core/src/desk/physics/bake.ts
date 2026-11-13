@@ -146,7 +146,7 @@ export function deskBakePlan(
   const warnings: string[] = [];
   const params = worldParams(scene);
   const start = o.frame_start ?? world.frame_start;
-  const end = o.frame_end ?? simulationEnd(doc, params);
+  const end = o.frame_end ?? deskSimulationEnd(doc, params);
   if (end < start)
     throw new OperatorError(`frame_end (${end}) must not be before frame_start (${start})`, 'INVALID_PARAMS');
   let targets: ObjectData[];
@@ -201,7 +201,7 @@ export function deskBakePlan(
  * The last frame the simulation can run to: frame_end, or later when bodies are released at or after
  * it (they keep the world running until they rest, physics/simulation.ts runLimit).
  */
-function simulationEnd(doc: SceneDoc, params: ReturnType<typeof worldParams>): number {
+export function deskSimulationEnd(doc: SceneDoc, params: ReturnType<typeof worldParams>): number {
   const end = simulatedFrameEnd(params);
   let last = -Infinity;
   for (const ob of doc.listObjects()) {

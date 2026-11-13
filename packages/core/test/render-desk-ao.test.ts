@@ -11,7 +11,7 @@ import {
   type Vec3,
 } from '../src';
 import { invert4 } from '../src/math/mat4';
-import { AO_TAPS, ambientOcclusion, applyAmbientOcclusion } from '../src/render/ao';
+import { AO_HALF_RES_PIXELS, AO_TAPS, ambientOcclusion, applyAmbientOcclusion } from '../src/render/ao';
 import type { PixelBuffers } from '../src/render/raster';
 import { viewFromSpec, type RenderView } from '../src/render/view';
 import {
@@ -27,19 +27,22 @@ const deg = (d: number) => (d * Math.PI) / 180;
 
 // ------------------------------------------------------------------------------ synthetic buffers
 
-/** A plane n·p = c with its (unit) normal facing the camera side. */
+/** A plane n·p = c with its (unit) normal facing the camera side; `within`: the part of it drawn. */
 interface Plane {
   n: Vec3;
   c: number;
+  within?: (p: Vec3) => boolean;
 }
 
 /**
  * Nearest-sample buffers of a view looking at `planes` (each pixel: the nearest plane its centre
- * ray hits in front of the camera), as the rasterizer fills `Rasterizer.pixels`.
+ * ray hits in front of the camera), as the rasterizer fills `Rasterizer.pixels`; `object` holds the
+ * index + 1 of the plane each pixel shows.
  */
 function planeBuffers(view: RenderView, w: number, h: number, planes: readonly Plane[]): PixelBuffers {
   const key = new Float32Array(w * h);
   const normal = new Float32Array(w * h * 3);
+  const object = new Uint32Array(w * h);
   const inv = invert4(view.viewProj);
   const un = (x: number, y: number, z: number): Vec3 => {
     const cw = inv[3] * x + inv[7] * y + inv[11] * z + inv[15];
@@ -57,23 +60,25 @@ function planeBuffers(view: RenderView, w: number, h: number, planes: readonly P
       const b = un(nx, ny, 1);
       const d: Vec3 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
       let best = Infinity;
-      let bestN: Vec3 | null = null;
-      for (const pl of planes) {
+      let hit = -1;
+      for (let k = 0; k < planes.length; k++) {
+        const pl = planes[k];
         const den = pl.n[0] * d[0] + pl.n[1] * d[1] + pl.n[2] * d[2];
         if (Math.abs(den) < 1e-12) continue;
         const t = (pl.c - (pl.n[0] * a[0] + pl.n[1] * a[1] + pl.n[2] * a[2])) / den;
-        if (t > 0 && t < best) {
-          best = t;
-          bestN = pl.n;
-        }
+        if (!(t > 0 && t < best)) continue;
+        if (pl.within && !pl.within([a[0] + d[0] * t, a[1] + d[1] * t, a[2] + d[2] * t])) continue;
+        best = t;
+        hit = k;
       }
-      if (!bestN) continue;
+      if (hit < 0) continue;
       const p: Vec3 = [a[0] + d[0] * best, a[1] + d[1] * best, a[2] + d[2] * best];
       const p0 = j * w + i;
       key[p0] = 1 / planarDepth(view, p);
-      normal.set(bestN, p0 * 3);
+      normal.set(planes[hit].n, p0 * 3);
+      object[p0] = hit + 1;
     }
-  return { width: w, height: h, key, normal, object: null };
+  return { width: w, height: h, key, normal, object };
 }
 
 describe('ambientOcclusion (screen space)', () => {
@@ -120,6 +125,93 @@ describe('ambientOcclusion (screen space)', () => {
     for (const v of ao) {
       expect(v).toBeGreaterThanOrEqual(0);
       expect(v).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it('large images: taps on every other pixel, then each pixel takes the occlusion at its own depth', () => {
+    expect(AO_HALF_RES_PIXELS).toBeLessThanOrEqual(1920 * 1080);
+    expect(AO_HALF_RES_PIXELS).toBeGreaterThan(1280 * 720);
+    // the corner behind a card floating in front of it, open itself (0.35 m above the floor, 1.2 m
+    // before the wall, both beyond the 0.3 m reach): the card hides part of the corner, which shows
+    // beside it
+    const w = 384;
+    const h = 288;
+    const v = viewFromSpec(
+      { position: [0, -3, 1.2], target: [0, 0, 0.3], up: [0, 0, 1], fovY: deg(50) },
+      w / h,
+      { min: [-4, -4, 0], max: [4, 0, 3] },
+    );
+    const card: Plane = {
+      n: [0, -1, 0],
+      c: 1.2,
+      within: (p) => Math.abs(p[0]) <= 0.3 && p[2] >= 0.35 && p[2] <= 0.75,
+    };
+    const pix = planeBuffers(v, w, h, [floor, wall, card]);
+    const full = Float32Array.from(ambientOcclusion(pix, v, 0.3, undefined, false));
+    const half = Float32Array.from(ambientOcclusion(pix, v, 0.3, undefined, true));
+    const ao = (img: Float32Array, p: Vec3) => {
+      const px = projectToPixel(v, p, w, h)!;
+      return img[px[1] * w + px[0]];
+    };
+    // the card's pixels, its silhouette against the occluded corner included, stay open: each takes
+    // the grid pixels at its own depth, never the corner's behind it
+    let cardPixels = 0;
+    for (let i = 0; i < w * h; i++) {
+      if (pix.object![i] !== 3) continue;
+      cardPixels++;
+      expect(half[i]).toBe(1);
+      expect(full[i]).toBe(1);
+    }
+    expect(cardPixels).toBeGreaterThan(3000);
+    // the corner beside the card is occluded about as much as at full resolution
+    for (const p of [
+      [-0.6, -0.05, 0],
+      [0.6, -0.05, 0],
+      [-1, -0.04, 0],
+      [1, 0, 0.05],
+      [-0.6, 0, 0.06],
+    ] as Vec3[]) {
+      expect(ao(half, p), `corner at ${p}`).toBeLessThan(0.9);
+      expect(Math.abs(ao(half, p) - ao(full, p)), `corner at ${p}`).toBeLessThan(0.06);
+    }
+    // beyond the reach (0.3 m), open at both resolutions; the same on average everywhere
+    for (const p of [
+      [-1, -0.5, 0],
+      [1, -0.6, 0],
+      [0.9, 0, 0.45],
+    ] as Vec3[]) {
+      expect(ao(full, p), `open at ${p}`).toBe(1);
+      expect(ao(half, p), `open at ${p}`).toBe(1);
+    }
+    let diff = 0;
+    for (let i = 0; i < w * h; i++) diff += Math.abs(half[i] - full[i]);
+    expect(diff / (w * h)).toBeLessThan(0.005);
+    // by default from AO_HALF_RES_PIXELS output pixels on (empty pixels stay at 1): the corner at
+    // that size, and with its last row cut off
+    const bw = 1600;
+    const bh = AO_HALF_RES_PIXELS / bw;
+    const bv = viewFromSpec(
+      { position: [0, -3, 1.2], target: [0, 0, 0.3], up: [0, 0, 1], fovY: deg(50) },
+      bw / bh,
+      { min: [-4, -4, 0], max: [4, 0, 3] },
+    );
+    const big = planeBuffers(bv, bw, bh, [floor, wall]);
+    big.key.fill(0, 0, bw * 40);
+    const same = (x: Float32Array, y: Float32Array) => x.length === y.length && x.every((q, i) => q === y[i]);
+    for (const rows of [bh, bh - 1]) {
+      const pix: PixelBuffers = {
+        width: bw,
+        height: rows,
+        key: big.key.subarray(0, bw * rows),
+        normal: big.normal.subarray(0, bw * rows * 3),
+        object: null,
+      };
+      const auto = Float32Array.from(ambientOcclusion(pix, bv, 0.3));
+      const halfRes = Float32Array.from(ambientOcclusion(pix, bv, 0.3, undefined, true));
+      const fullRes = Float32Array.from(ambientOcclusion(pix, bv, 0.3, undefined, false));
+      expect(same(auto, bw * rows >= AO_HALF_RES_PIXELS ? halfRes : fullRes), `${rows} rows`).toBe(true);
+      expect(same(halfRes, fullRes)).toBe(false);
+      expect(auto.subarray(0, bw * 40).every((x) => x === 1)).toBe(true);
     }
   });
 

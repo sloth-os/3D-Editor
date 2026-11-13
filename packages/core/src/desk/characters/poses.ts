@@ -10,11 +10,13 @@ import { LEGS, isFront, type Leg } from './quadruped';
  * Pose library (spec §8). Humanoid poses are written in joint angles (degrees) as rideo writes
  * its POSES (packages/shared/src/blocking/render.ts): per side [left, right] hip flexion forward,
  * knee flexion, shoulder flexion forward (`arm`), shoulder abduction (`armOut`), elbow flexion and
- * a forward torso `lean`; rideo's 10 poses keep its joint values. Each converts to bone-local
- * euler rotations (rig.ts: local X bends forward/back, Z sideways, Y twists), then the pose is
- * grounded: the hips move up or down so the lowest ground probe (feet, knees, seat, back, head)
- * touches z = 0, as rideo puts "the lowest foot or knee on the floor". Quadruped poses are written
- * per leg the same way.
+ * a forward torso `lean`; rideo's 10 poses keep its joint values (ankles, wrists and heads added),
+ * except that the wave raises the arm sideways rather than forward (the hand above the head either
+ * way) and the figure lies on its back with its head behind its mark, as rideo draws it. Each
+ * converts to bone-local euler rotations (rig.ts: local X bends forward/back, Z sideways, Y
+ * twists), then the pose is grounded: the hips move up or down so the lowest ground probe (feet,
+ * knees, seat, back, head) touches z = 0, as rideo puts "the lowest foot or knee on the floor".
+ * Quadruped poses are written per leg the same way.
  */
 
 type Pair = [number, number];
@@ -33,7 +35,7 @@ export interface HumanPoseSpec {
   elbow?: Pair;
   wrist?: Pair;
   shrug?: Pair;
-  /** Pelvis: forward tilt of the whole body above and below the hips, sideways roll, turn. */
+  /** Pelvis: backward tilt (+) of the whole body about the hips (90 lies on the back), sideways roll, turn. */
   pelvis?: number;
   pelvisRoll?: number;
   pelvisTurn?: number;
@@ -95,7 +97,9 @@ export const HUMAN_POSE_SPECS: Record<string, HumanPoseSpec> = {
     elbow: [20, 20],
     lean: 4,
   },
-  lie: { pelvis: -90, armOut: [12, 12], elbow: [5, 5], ankle: [20, 20], head: 8 },
+  // on its back, face up, the head behind the mark and the feet towards the facing (rideo draws a
+  // lying figure that way: its up axis along −facing, its front up)
+  lie: { pelvis: 90, armOut: [12, 12], elbow: [5, 5], ankle: [20, 20] },
   reach: { arm: [0, 85], armOut: [8, 4], elbow: [8, 5], lean: 6, shrug: [0, 6] },
   point: { arm: [0, 80], armOut: [8, 18], elbow: [8, 0], wrist: [0, -5], headTurn: -12 },
   wave: { arm: [0, 20], armOut: [8, 125], armTwist: [0, -40], elbow: [8, 45], headTilt: 4 },
@@ -287,21 +291,32 @@ export const ANIMAL_POSE_SPECS: Record<string, AnimalPoseSpec> = {
   look_up: { neck: 18, head: 26, tail: [12, 0, 0] },
 };
 
-/** Kinds whose own build calls for another version of a pose (a dog lies with its front legs out). */
-export const ANIMAL_KIND_POSE_SPECS: Readonly<Record<string, Readonly<Record<string, AnimalPoseSpec>>>> = {
-  dog: {
-    lie: {
-      legs: {
-        FL: { upper: 62, lower: -28, foot: -6, abd: 3 },
-        FR: { upper: 58, lower: -30, foot: -6, abd: 3 },
-        BL: FOLDED_BACK,
-        BR: FOLDED_BACK,
-      },
-      neck: 4,
-      head: -4,
-      tail: [-25, -5, 0],
-    },
+/** Dogs, cats and bears lie with their front legs stretched out in front. */
+const PAW_LIE: AnimalPoseSpec = {
+  legs: {
+    FL: { upper: 62, lower: -28, foot: -6, abd: 3 },
+    FR: { upper: 58, lower: -30, foot: -6, abd: 3 },
+    BL: FOLDED_BACK,
+    BR: FOLDED_BACK,
   },
+  neck: 4,
+  head: -4,
+  tail: [-25, -5, 0],
+};
+
+/**
+ * Kinds whose own build calls for another version of a pose: a dog lies with its front legs out; a
+ * cat, whose tail stands up at rest, lowers it to sit, lie and gallop (curled round its side).
+ */
+export const ANIMAL_KIND_POSE_SPECS: Readonly<Record<string, Readonly<Record<string, AnimalPoseSpec>>>> = {
+  dog: { lie: PAW_LIE },
+  small_dog: { lie: PAW_LIE },
+  cat: {
+    lie: { ...PAW_LIE, tail: [-80, -20, 0], tailSide: 45 },
+    sit: { ...ANIMAL_POSE_SPECS.sit, tail: [-80, -25, 10], tailSide: 50 },
+    gallop: { ...ANIMAL_POSE_SPECS.gallop, tail: [-55, -30, -25] },
+  },
+  bear: { lie: PAW_LIE },
 };
 
 /** A quadruped pose of a kind: its own version if it has one, else the family's. */

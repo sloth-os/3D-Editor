@@ -198,7 +198,7 @@ export const RELEASE_TRACKED_STEPS = 2;
  * A release velocity that differs from the animated velocity one frame earlier by more than these
  * accelerations (m/s², rad/s²; at least RELEASE_JUMP_MIN_* between the two frames) comes from a
  * jump of the animated transform at the release (a release pose keyed for another motion of the
- * holder), not from a hand's swing: the body keeps the earlier velocity instead (simulation.ts).
+ * holder), not from a hand's swing: the body keeps the slower of the two velocities (simulation.ts).
  */
 export const RELEASE_MAX_ACCELERATION = 150;
 export const RELEASE_MAX_ANGULAR_ACCELERATION = 400;

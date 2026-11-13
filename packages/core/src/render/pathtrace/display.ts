@@ -310,84 +310,78 @@ export function filmToRGBA8(
   background: DisplayBackground | null = null,
   dither = false,
 ): Uint8ClampedArray {
-  if (dither) return filmToRGBA8Dithered(linear, width, height, exposure, view, background);
   const out = new Uint8ClampedArray(width * height * 4);
-  const d = new Float64Array(3);
-  const vt = viewTransformOf(view);
-  const bgA = background ? Math.min(1, Math.max(0, Number.isFinite(background[3]) ? background[3] : 1)) : 0;
-  const bg = [0, 0, 0];
-  if (background)
-    for (let k = 0; k < 3; k++)
-      bg[k] = Math.min(1, Math.max(0, Number.isFinite(background[k]) ? background[k] : 0));
-  for (let i = 0; i < width * height; i++) {
-    const o = i * 4;
-    const raw = linear[o + 3];
-    const a = raw > 0 ? (raw < 1 ? raw : 1) : 0;
-    const rest = (1 - a) * bgA;
-    const total = a + rest;
-    out[o + 3] = Math.round(total * 255);
-    if (!(total > 0)) continue;
-    const k = a > 0 ? exposure / a : 0;
-    if (vt === 'STANDARD' && rest === 0) {
-      // exactly the rasterizer's conversion
-      out[o] = linearToSrgbByte(linear[o] * k);
-      out[o + 1] = linearToSrgbByte(linear[o + 1] * k);
-      out[o + 2] = linearToSrgbByte(linear[o + 2] * k);
-      continue;
-    }
-    if (a > 0) viewTransform(vt, linear[o] * k, linear[o + 1] * k, linear[o + 2] * k, d, true);
-    else d.fill(0);
-    // over the display-space background (straight alpha out)
-    const ia = 1 / total;
-    out[o] = Math.round((d[0] * a + bg[0] * rest) * ia * 255);
-    out[o + 1] = Math.round((d[1] * a + bg[1] * rest) * ia * 255);
-    out[o + 2] = Math.round((d[2] * a + bg[2] * rest) * ia * 255);
-  }
+  filmRowsToRGBA8(linear, width, 0, height, out, exposure, view, background, dither);
   return out;
 }
 
-/** `filmToRGBA8` with ordered dithering: each channel is quantized as floor(v · 255 + threshold). */
-function filmToRGBA8Dithered(
+/** View-transformed colour of the pixel being converted (`filmRowsToRGBA8`). */
+const DISPLAY = new Float64Array(3);
+
+/**
+ * `filmToRGBA8` of `rows` rows of the image from row `y0` on: `linear` holds those rows (from its
+ * start), `out` is the whole image (`width` wide). Converts a film a band at a time, so a renderer
+ * needs no film the size of the image.
+ */
+export function filmRowsToRGBA8(
   linear: Float32Array,
   width: number,
-  height: number,
-  exposure: number,
-  view: ViewTransform,
-  background: DisplayBackground | null,
-): Uint8ClampedArray {
-  const out = new Uint8ClampedArray(width * height * 4);
-  const d = new Float64Array(3);
+  y0: number,
+  rows: number,
+  out: Uint8ClampedArray,
+  exposure = 1,
+  view: ViewTransform = 'STANDARD',
+  background: DisplayBackground | null = null,
+  dither = false,
+): void {
+  const d = DISPLAY;
   const vt = viewTransformOf(view);
   const bgA = background ? Math.min(1, Math.max(0, Number.isFinite(background[3]) ? background[3] : 1)) : 0;
   const bg = [0, 0, 0];
   if (background)
     for (let k = 0; k < 3; k++)
       bg[k] = Math.min(1, Math.max(0, Number.isFinite(background[k]) ? background[k] : 0));
-  for (let y = 0; y < height; y++)
+  for (let y = 0; y < rows; y++)
     for (let x = 0; x < width; x++) {
-      const i = y * width + x;
-      const o = i * 4;
+      const o = (y * width + x) * 4;
+      const p = ((y0 + y) * width + x) * 4;
       const raw = linear[o + 3];
       const a = raw > 0 ? (raw < 1 ? raw : 1) : 0;
       const rest = (1 - a) * bgA;
       const total = a + rest;
-      out[o + 3] = Math.round(total * 255);
+      out[p + 3] = Math.round(total * 255);
       if (!(total > 0)) continue;
-      // (floor(v + t) as `ditherByte`; the clamped array clamps to 0..255 and maps NaN to 0)
-      const t = ditherThreshold(x, y);
       const k = a > 0 ? exposure / a : 0;
+      if (dither) {
+        // (floor(v + t) as `ditherByte`; the clamped array clamps to 0..255 and maps NaN to 0)
+        const t = ditherThreshold(x, y0 + y);
+        if (vt === 'STANDARD' && rest === 0) {
+          out[p] = Math.floor(linearToSrgb255(linear[o] * k) + t);
+          out[p + 1] = Math.floor(linearToSrgb255(linear[o + 1] * k) + t);
+          out[p + 2] = Math.floor(linearToSrgb255(linear[o + 2] * k) + t);
+          continue;
+        }
+        if (a > 0) viewTransform(vt, linear[o] * k, linear[o + 1] * k, linear[o + 2] * k, d, true);
+        else d.fill(0);
+        const ia = 255 / total;
+        out[p] = Math.floor((d[0] * a + bg[0] * rest) * ia + t);
+        out[p + 1] = Math.floor((d[1] * a + bg[1] * rest) * ia + t);
+        out[p + 2] = Math.floor((d[2] * a + bg[2] * rest) * ia + t);
+        continue;
+      }
       if (vt === 'STANDARD' && rest === 0) {
-        out[o] = Math.floor(linearToSrgb255(linear[o] * k) + t);
-        out[o + 1] = Math.floor(linearToSrgb255(linear[o + 1] * k) + t);
-        out[o + 2] = Math.floor(linearToSrgb255(linear[o + 2] * k) + t);
+        // exactly the rasterizer's conversion
+        out[p] = linearToSrgbByte(linear[o] * k);
+        out[p + 1] = linearToSrgbByte(linear[o + 1] * k);
+        out[p + 2] = linearToSrgbByte(linear[o + 2] * k);
         continue;
       }
       if (a > 0) viewTransform(vt, linear[o] * k, linear[o + 1] * k, linear[o + 2] * k, d, true);
       else d.fill(0);
-      const ia = 255 / total;
-      out[o] = Math.floor((d[0] * a + bg[0] * rest) * ia + t);
-      out[o + 1] = Math.floor((d[1] * a + bg[1] * rest) * ia + t);
-      out[o + 2] = Math.floor((d[2] * a + bg[2] * rest) * ia + t);
+      // over the display-space background (straight alpha out)
+      const ia = 1 / total;
+      out[p] = Math.round((d[0] * a + bg[0] * rest) * ia * 255);
+      out[p + 1] = Math.round((d[1] * a + bg[1] * rest) * ia * 255);
+      out[p + 2] = Math.round((d[2] * a + bg[2] * rest) * ia * 255);
     }
-  return out;
 }

@@ -102,7 +102,8 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           .describe(
             'Height in metres: people to the top of the head (adult 1.7, man 1.76, woman 1.64, child 1.2, ' +
               'toddler 0.9, elder 1.65), animals at the withers / shoulder as they are measured (horse 1.6, ' +
-              'pony 1.2, dog 0.55)',
+              'pony 1.2, donkey 1.1, cow 1.4, dog 0.55, small_dog 0.3, cat 0.25, sheep 0.75, pig 0.65, ' +
+              'deer 1.0, bear 1.05)',
           ),
         location: vec3.optional().describe('Where the feet stand, in metres (default: the 3D cursor)'),
         facing_deg: facingSchema
@@ -167,7 +168,8 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
       description:
         "Move an actor along a path from where it stands at frame_start: the armature object's location and heading " +
         'keyed along the path, and a gait keyed for every cycle (stride = speed / cadence, so the feet do not ' +
-        'slide). Give speed_mps or frame_end. Returns {frame_end, length_m}.',
+        'slide). Give speed_mps or frame_end. Returns {frame_end, length_m}: the arrival frame and the distance ' +
+        'walked (corners rounded).',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,

@@ -49,21 +49,23 @@ import {
 import type { RenderEngine } from '../doc/types';
 import { pooledFloat32, pooledUint32 } from './buffers';
 import {
+  SPOT_SHADOW_MAP_SIZE,
+  SUN_SHADOW_MAP_SIZE,
   buildSpotShadow,
   buildSunShadow,
   type DepthPass,
   type ShadowCaster,
   type ShadowMap,
 } from './shadows';
-import { ambientOcclusion, applyAmbientOcclusion } from './ao';
+import { aoBufferBytes, ambientOcclusion, applyAmbientOcclusion, linearDepths } from './ao';
 import { drawLines, type ScreenLine } from './lines';
 import {
-  filmToRGBA8,
   renderPathTracedImage,
   viewCameraData,
   viewTransformOf,
   type PathTraceProgress,
 } from './pathtrace';
+import { filmRowsToRGBA8 } from './pathtrace/display';
 
 /*
  * CPU software renderer used when no browser (WebGL) is available — e.g. MCP agents asking the
@@ -88,7 +90,7 @@ import {
  * leaves the background transparent. Transparent surfaces (blend_method BLEND,
  * transmission) are drawn after the opaque ones, sorted back to front and blended per sample
  * (glass lets the scene behind it through, tinted, with its reflections on top; no refraction).
- * No shadows.
+ * Shadows, ambient occlusion, MSAA-style shading, passes and lines are opt-in (`SoftwareRenderOptions`).
  */
 
 export { decodePNG } from './png';
@@ -569,9 +571,7 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
   if (!(width >= 1 && height >= 1)) throw new Error('Render width and height must be at least 1');
   if (width * height > MAX_PIXELS)
     throw new Error(`Render size ${width}×${height} exceeds the ${MAX_PIXELS} pixel limit`);
-  let k: number = opts.samples ?? 2;
-  k = k >= 4 ? 4 : k >= 2 ? 2 : 1;
-  while (k > 1 && width * height * k * k > MAX_SAMPLES) k = k === 4 ? 2 : 1;
+  const k = supersampling(width, height, opts.samples);
   const frame = opts.frame ?? doc.getScene().frame_start;
   const scene = (opts.evaluator ?? new SceneEvaluator(doc)).evaluate(frame, { forRender: true });
   const aspect = width / height;
@@ -802,18 +802,22 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
     });
   }
   drawOpaque(r);
-  if (pixels && r.ambientShare) {
+  // how far the opaque surface each pixel shows lies (once for ambient occlusion and lines; lines
+  // are hidden by opaque surfaces only: seen through glass)
+  const opaqueDepth =
+    pixels && (r.ambientShare || lines)
+      ? linearDepths(pixels.key, view, pooledFloat32('pixels:depth', width * height))
+      : null;
+  if (pixels && opaqueDepth && r.ambientShare) {
     // ambient occlusion of the opaque surfaces, before the transparent ones are blended over them
     const radius =
       typeof opts.aoRadius === 'number' && opts.aoRadius > 0 && Number.isFinite(opts.aoRadius)
         ? opts.aoRadius
         : defaultAoRadius(meshes);
-    const ao = ambientOcclusion(pixels, view, radius);
+    const ao = ambientOcclusion(pixels, view, radius, opaqueDepth);
     applyAmbientOcclusion(r.color, r.ambientShare, ao, W, H, k);
     r.ambientShare = null;
   }
-  // lines are hidden by opaque surfaces only (seen through glass)
-  const lineDepth = lines && pixels ? linearDepths(pixels.key, view) : null;
   r.flushTransparent();
 
   // ---------------------------------------------------------------- resolve (box filter, display)
@@ -860,11 +864,12 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       bg[2] = envPx[2];
     }
   };
-  const out = new Uint8ClampedArray(width * height * 4);
   // Standard keeps the exact sRGB conversion and linear compositing of an explicit background; the
-  // other view transforms go through a linear film and the path tracer's display conversion
+  // other view transforms go through a linear film, a row at a time (no image-sized film), and the
+  // path tracer's display conversion
   const standard = vt === 'STANDARD';
-  const film = standard ? null : pooledFloat32('film', width * height * 4);
+  const film = standard ? null : pooledFloat32('film', width * 4);
+  const out = new Uint8ClampedArray(width * height * 4);
   const explicitLin = explicit
     ? [srgbToLinear(explicit[0]), srgbToLinear(explicit[1]), srgbToLinear(explicit[2]), explicit[3]]
     : null;
@@ -968,14 +973,15 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
         cb *= inv;
         if (cv < 1) sampleBackground(x, y);
       }
-      const o = (y * width + x) * 4;
       if (film) {
-        film[o] = cr + (behind ? bg[0] * (1 - cv) : 0);
-        film[o + 1] = cg + (behind ? bg[1] * (1 - cv) : 0);
-        film[o + 2] = cb + (behind ? bg[2] * (1 - cv) : 0);
-        film[o + 3] = behind ? 1 : cv;
+        const f = x * 4;
+        film[f] = cr + (behind ? bg[0] * (1 - cv) : 0);
+        film[f + 1] = cg + (behind ? bg[1] * (1 - cv) : 0);
+        film[f + 2] = cb + (behind ? bg[2] * (1 - cv) : 0);
+        film[f + 3] = behind ? 1 : cv;
         continue;
       }
+      const o = (y * width + x) * 4;
       let rest = 0;
       let br = 0;
       let bgG = 0;
@@ -1008,13 +1014,90 @@ export function renderSceneSoftware(doc: SceneDoc, opts: SoftwareRenderOptions):
       }
       out[o + 3] = Math.round(a * 255);
     }
+    if (film) filmRowsToRGBA8(film, width, y, 1, out, exposure, vt, explicit, dither);
   }
-  const data = film ? filmToRGBA8(film, width, height, exposure, vt, explicit, dither) : out;
+  const data = out;
   const image: RenderedImage = { width, height, data };
-  if (lines && lineDepth) drawLines(data, width, height, lines, view, { depth: lineDepth });
+  if (lines && opaqueDepth) drawLines(data, width, height, lines, view, { depth: opaqueDepth });
   if (pixels && aovNames.size) image.aovs = renderAovs(pixels, view, aovNames, objectTable);
   if (aovNames.size || lines) image.view = view;
   return image;
+}
+
+/** What `estimateRenderBufferBytes` reads of a render's options. */
+export type RenderBufferOptions = Pick<
+  SoftwareRenderOptions,
+  'width' | 'height' | 'samples' | 'shading' | 'look' | 'shadows' | 'ao' | 'aovs' | 'lines'
+>;
+
+/** Bytes of a sun's shadow map (its longer side 2048 texels) and of a spot light's. */
+const SUN_MAP_BYTES = SUN_SHADOW_MAP_SIZE * SUN_SHADOW_MAP_SIZE * 4;
+const SPOT_MAP_BYTES = SPOT_SHADOW_MAP_SIZE * SPOT_SHADOW_MAP_SIZE * 4;
+
+/**
+ * Upper bound of the memory outside the JavaScript heap (typed-array buffers) that a RASTER
+ * `renderSceneSoftware` with these options holds when it returns: the working buffers it keeps for
+ * the next render (buffers.ts; `releaseRenderBuffers` frees them) and the image and passes it
+ * returns. Not counted: the meshes' render buffers and world-space vertices (about proportional to
+ * the triangles drawn) and a few small helper renders. With `doc`, the shadow maps follow its suns,
+ * spot lights and SKY world and the display film its view transform; without, one sun map and a
+ * film are counted (the desk's SKY sun and AgX). Measured, about 330 MB at 1920 × 1080 with 2 × 2
+ * samples, shadows, ambient occlusion, lines and the three passes, 750 MB at 3840 × 2160 (1 sample
+ * per pixel there): `MAX_SAMPLES` caps the samples, not this.
+ */
+export function estimateRenderBufferBytes(opts: RenderBufferOptions, doc?: SceneDoc): number {
+  const width = Math.round(opts.width);
+  const height = Math.round(opts.height);
+  if (!(width >= 1 && height >= 1)) return 0;
+  const k = supersampling(width, height, opts.samples);
+  const n = width * height;
+  const samples = n * k * k;
+  const solid = opts.shading === 'SOLID' || opts.look === 'solid';
+  const aovs = new Set(opts.aovs ?? []);
+  const lines = !!opts.lines?.length;
+  const ao = !!opts.ao;
+  // samples: colour, coverage, depth; the ambient share of each with ambient occlusion
+  let bytes = samples * (12 + 4 + 4) + (ao ? samples * 4 : 0);
+  // every pixel's nearest sample: depth key, normal, object index
+  if (aovs.size || ao || lines) bytes += n * (4 + 12) + (aovs.has('object') ? n * 4 : 0);
+  // the opaque surfaces' distances; the occlusion's working buffers
+  if (ao || lines) bytes += n * 4;
+  if (ao) bytes += aoBufferBytes(width, height);
+  // one row of display film for view transforms other than Standard
+  const vt = solid ? 'STANDARD' : doc ? viewTransformOf(doc.getRender().view_transform) : 'AGX';
+  if (vt !== 'STANDARD') bytes += width * 16;
+  if (!solid) bytes += shadowMapBytes(opts.shadows ?? false, doc);
+  // returned: the RGBA8 image and the passes
+  bytes += n * 4;
+  if (aovs.has('depth')) bytes += n * 4;
+  if (aovs.has('normal')) bytes += n * 12;
+  if (aovs.has('object')) bytes += n * 4;
+  return bytes;
+}
+
+/** Bytes of the shadow maps a render with `shadows` builds (at most; see `estimateRenderBufferBytes`). */
+function shadowMapBytes(shadows: boolean | 'scene', doc: SceneDoc | undefined): number {
+  if (!shadows) return 0;
+  if (!doc) return SUN_MAP_BYTES;
+  const scene = shadows === 'scene';
+  if (scene && doc.getRender().use_shadows === false) return 0;
+  let bytes = doc.getWorld().environment === 'SKY' ? SUN_MAP_BYTES : 0;
+  for (const o of doc.listObjects()) {
+    if (o.type !== 'LIGHT' || !o.data || o.hide_render) continue;
+    const light = doc.getLight(o.data);
+    if (!light || (scene && !light.use_shadow)) continue;
+    if (light.type === 'SUN') bytes += SUN_MAP_BYTES;
+    else if (light.type === 'SPOT') bytes += SPOT_MAP_BYTES;
+  }
+  return bytes;
+}
+
+/** Samples per pixel side of a RASTER render: `samples` as 1, 2 or 4, less when the buffer would be too large. */
+function supersampling(width: number, height: number, samples: number | undefined): number {
+  let k = samples ?? 2;
+  k = k >= 4 ? 4 : k >= 2 ? 2 : 1;
+  while (k > 1 && width * height * k * k > MAX_SAMPLES) k = k === 4 ? 2 : 1;
+  return k;
 }
 
 /** Empty colour and coverage buffers of depth-only rasterizers (shadow maps). */
@@ -1080,18 +1163,6 @@ export function defaultAoRadius(items: readonly RenderItem[]): number {
   return Math.min(AO_RADIUS_MAX, Math.max(AO_RADIUS_MIN, sizes[sizes.length >> 1] * AO_RADIUS_SHARE));
 }
 
-/** Distances from the camera plane of the pixels' nearest samples (Infinity where nothing is drawn). */
-function linearDepths(key: Float32Array, view: RenderView): Float32Array {
-  const out = new Float32Array(key.length);
-  const n = view.near;
-  const f = view.far;
-  for (let i = 0; i < key.length; i++) {
-    const k = key[i];
-    out[i] = !(k > 0) ? Infinity : view.ortho ? ((1 - k) * (f - n) + f + n) / 2 : 1 / k;
-  }
-  return out;
-}
-
 /** The AOV passes asked for, from the nearest sample of every pixel (see `RenderAovs`). */
 function renderAovs(
   pixels: PixelBuffers,
@@ -1117,7 +1188,7 @@ function renderAovs(
       const vx = x * R[0] + y * R[1] + z * R[2];
       const vy = x * U[0] + y * U[1] + z * U[2];
       const vz = -(x * F[0] + y * F[1] + z * F[2]);
-      const l = Math.hypot(vx, vy, vz) || 1;
+      const l = Math.sqrt(vx * vx + vy * vy + vz * vz) || 1;
       out[i * 3] = vx / l;
       out[i * 3 + 1] = vy / l;
       out[i * 3 + 2] = vz / l;

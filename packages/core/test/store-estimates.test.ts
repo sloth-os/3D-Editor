@@ -56,7 +56,10 @@ function maximumParams(e: CatalogEntry): Record<string, unknown>[] {
     else if (Array.isArray(v.enum)) values = v.enum;
     else if (v.type === 'boolean') values = [true, false];
     else continue;
-    expect(values.every((x) => x !== undefined), `${e.id}.${k} has a maximum`).toBe(true);
+    expect(
+      values.every((x) => x !== undefined),
+      `${e.id}.${k} has a maximum`,
+    ).toBe(true);
     out = out.flatMap((p) => values.map((x) => ({ ...p, [k]: x })));
   }
   return out;
@@ -116,7 +119,9 @@ describe('store.add estimate', () => {
         expect(r.ok, `${e.id} ${JSON.stringify(params)}: ${r.error}`).toBe(true);
         const built = triangles(t.doc, r.result.objects);
         const e2 = t.estimate('store.add', { model: e.id, params })!;
-        expect(e2.faces, `${e.id} ${JSON.stringify(params)}: ${built} triangles`).toBeGreaterThanOrEqual(built);
+        expect(e2.faces, `${e.id} ${JSON.stringify(params)}: ${built} triangles`).toBeGreaterThanOrEqual(
+          built,
+        );
       }
     }
     // the roads grow most: a six-lane 500 m road is a hundred times its default

@@ -17,13 +17,13 @@ import {
 import { rigidBodyCacheBytes } from '../../physics/rigid-body';
 import {
   MAX_SIMULATED_FRAMES,
+  RELEASE_TRACKED_STEPS,
   motionMode,
   sanitizeRigidBody,
   sanitizeRigidBodyWorld,
-  simulatedFrameEnd,
   worldParams,
 } from '../../physics/settings';
-import { deskBakePlan } from './bake';
+import { deskBakePlan, deskSimulationEnd } from './bake';
 import { DESK_SETTLE_MAX_SECONDS } from './presets';
 import { TETHER_MAX_FRAMES, TETHER_TAIL_SEGMENTS } from './tether';
 import { VEHICLE_DEFAULT_MPS, VEHICLE_EASE_SECONDS, VEHICLE_MAX_FRAMES, vehiclePath } from './vehicle';
@@ -32,13 +32,15 @@ import { VEHICLE_DEFAULT_MPS, VEHICLE_EASE_SECONDS, VEHICLE_MAX_FRAMES, vehicleP
  * Memory estimates of the desk's motion presets (operators/desk-motion.ts), counted from the document
  * and the parameters without running them; operators/memory-desk.ts DESK_MOTION_ESTIMATES calls them.
  * Upper bounds of what the presets do:
- *  - a release (desk.physics_setup, _drop, _throw, _push) simulates the rigid body world from the
- *    first release − 1 until its bodies have come to rest, at most DESK_SETTLE_MAX_SECONDS after the
- *    last release and the animated colliders' last move (presets.ts updateDeskWorldRange); the
- *    document's cache keeps those frames (physics/memory.ts) and the matrices a body records before
- *    its release; a drop with a height rewrites the lifted location keys;
- *  - a bake keys the location and rotation of each body on every frame from its release (or the start
- *    of its hold) to the end (bake.ts deskBakePlan), stepping the world where its cache has no frames;
+ *  - a release (desk.physics_setup, _drop, _throw, _push) simulates the rigid body world from
+ *    RELEASE_TRACKED_STEPS frames before the first release until its bodies have come to rest, at most
+ *    DESK_SETTLE_MAX_SECONDS after the last release and the animated colliders' last move (presets.ts
+ *    updateDeskWorldRange); the document's cache keeps those frames (physics/memory.ts) and the
+ *    matrices a body records on the frames before its release; a drop with a height rewrites the
+ *    lifted location keys;
+ *  - a bake keys the location and rotation (and the scale of a body that loses its parent) of each body
+ *    on every frame from its release (or the start of its hold) to the end (bake.ts deskBakePlan),
+ *    stepping the world where its cache has no frames;
  *  - a flight keys the flyer, its string (location, rotation and scale) and its tail on every frame;
  *  - a drive keys the vehicle, the spin of each wheel and the turn of each steering pivot on every
  *    frame of its path.
@@ -162,14 +164,19 @@ export function deskSettleSimulation(
   }
   if (!simulated) return { frames: 0, bodies: 0, bytes: 0, read: 0 };
   const fps = worldParams(scene).fps;
-  const frameStart = Math.min(...starts.map((s) => s - 1), withWorld ? world.frame_start : Infinity);
+  const frameStart = Math.min(
+    ...starts.map((s) => s - RELEASE_TRACKED_STEPS),
+    withWorld ? world.frame_start : Infinity,
+  );
   const lastStart = Math.max(...starts, withWorld ? frameStart + 1 : -Infinity);
   const moving = Math.max(lastStart + 1, kinematic ? objectKeys(doc, new Set()).last : -Infinity);
   const cap = Math.min(frameStart + MAX_SIMULATED_FRAMES, moving + Math.ceil(DESK_SETTLE_MAX_SECONDS * fps));
   const frames = Math.max(0, cap - frameStart);
-  // a body follows (and records) the matrix of its animation on every frame before its release
+  // a body follows (and records) the matrix of its animation on the RELEASE_TRACKED_STEPS frames before
+  // its release and at it (physics/simulation.ts), dormant before
   let delayed = 0;
-  for (const s of starts) delayed += Math.max(0, Math.min(s, cap) - frameStart);
+  for (const s of starts)
+    delayed += Math.max(0, Math.min(s, cap) - Math.max(frameStart + 1, s - RELEASE_TRACKED_STEPS) + 1);
   return {
     frames,
     bodies: simulated,
@@ -231,8 +238,9 @@ export function deskReleaseEstimate(
 }
 
 /**
- * desk.physics_bake: six keyframes per baked body and frame (from its release or hold to the end; the
- * bake drops the redundant ones, which cannot be known before), the keys those bodies hold rewritten,
+ * desk.physics_bake: six keyframes per baked body and frame, nine for a body that loses its parent
+ * (from its release, hold or parent's motion to the end; the bake drops the redundant ones, which
+ * cannot be known before), the keys those bodies hold rewritten,
  * and the world stepped over the range (as if nothing were cached: a cache made stale by an edit is
  * simulated again). Null when the bake fails by itself (bake.ts deskBakePlan refuses it: no world, a
  * bad range, over the DESK_BAKE_MAX_BODY_FRAMES budget).
@@ -253,9 +261,16 @@ export function deskBakeEstimate(ctx: OperatorContext, p: Record<string, unknown
   }
   if (!plan.bodies.length) return null;
   const ids = new Set(plan.bodies.map((b) => b.id));
-  const keys = newKeyframesWrites(6 * plan.body_frames, 6 * ids.size, BAKE_LOWER, objectKeys(doc, ids).keys);
+  // location and rotation, and the scale of a body that loses its parent (world-space keys)
+  const channels = (b: (typeof plan.bodies)[number]) => (b.unparent ? 9 : 6);
+  const keys = newKeyframesWrites(
+    plan.bodies.reduce((n, b) => n + channels(b) * (plan.frame_end - b.from + 1), 0),
+    plan.bodies.reduce((n, b) => n + channels(b), 0),
+    BAKE_LOWER,
+    objectKeys(doc, ids).keys,
+  );
   const params = worldParams(doc.getScene());
-  const stepped = Math.max(0, Math.min(plan.frame_end, simulatedFrameEnd(params)) - params.frameStart);
+  const stepped = Math.max(0, Math.min(plan.frame_end, deskSimulationEnd(doc, params)) - params.frameStart);
   const bodies = documentSimulationBodies(doc);
   const simulation = simulationCacheBytes(bodies, stepped);
   return keyframeEstimate({

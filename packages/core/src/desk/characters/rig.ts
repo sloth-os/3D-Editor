@@ -88,6 +88,12 @@ export interface Blueprint {
   points: Record<string, { bone: string; point: Vec3 }>;
   /** Whether a part uses the accent material (saddles). */
   accent: boolean;
+  /**
+   * Quadrupeds: the barrel (the body under the saddle) as an elliptical cylinder along Y, character
+   * space at rest: half its width (X) and height (Z) and the height of its axis. A rider's legs go
+   * round it.
+   */
+  barrel?: { halfWidth: number; halfHeight: number; z: number };
 }
 
 // ---------------------------------------------------------------- vectors

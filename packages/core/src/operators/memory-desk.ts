@@ -2,7 +2,7 @@ import type { SceneDoc } from '../doc/scene-doc';
 import type { ShotData } from '../doc/types';
 import { MAX_SHOT_FRAME, findShotIndex, getShots } from '../desk/shots';
 import { cameraMoveKeys, isDeskMove } from '../desk/moves';
-import { lookKeyBound, moveKeyBound } from '../desk/characters/estimate';
+import { attachedTo, lookKeyBound, moveKeyBound } from '../desk/characters/estimate';
 import { getCatalogEntry } from '../store/catalog';
 import {
   deskBakeEstimate,
@@ -460,6 +460,16 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
 
 const POSE_LOWER = "the actor's animation (a pose rewrites the actor's keyframes)";
 
+/**
+ * Keyframes an actor operator copies and stores again: the actor's own, and those of the objects
+ * attached to it (props it holds, riders) whose releases and dismounts it keys again at their frames.
+ */
+const actorKeys = (ctx: OperatorContext, actor: string | null): number =>
+  keysOf(ctx.doc, [actor, ...attachedTo(ctx.doc, actor)]);
+
+/** Keys of a hold: the CHILD_OF influence (3), the prop's transform at the grab and the release (2 × 9), the arm's carrying posture (2 bones × 4). */
+const DESK_HOLD_KEYS = 3 + 2 * 9 + 2 * 4;
+
 export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
   /** An armature and its parts, posed unkeyed (no keys). */
   'desk.actor_add': () =>
@@ -478,7 +488,7 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
         DESK_ACTOR_MAX_CHANNELS * (DESK_POSE_KEYS + (p.hold_frames !== undefined ? 1 : 0)),
         DESK_ACTOR_MAX_CHANNELS,
         POSE_LOWER,
-        keysOf(ctx.doc, [objectId(ctx, p.actor)]),
+        actorKeys(ctx, objectId(ctx, p.actor)),
       ),
       lower: POSE_LOWER,
     }),
@@ -502,29 +512,37 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
       keys = DESK_ACTOR_MAX_CHANNELS * perChannel;
     }
     return deskEstimate({
-      keys: newKeyframesWrites(keys, DESK_ACTOR_MAX_CHANNELS, lower, keysOf(ctx.doc, [actor])),
+      keys: newKeyframesWrites(keys, DESK_ACTOR_MAX_CHANNELS, lower, actorKeys(ctx, actor)),
       lower,
     });
   },
   /** A turn: the armature object's rotation keyed before and after it. */
   'desk.actor_face': (ctx, p) =>
     deskEstimate({
-      keys: newKeyframesWrites(12, 4, POSE_LOWER, keysOf(ctx.doc, [objectId(ctx, p.actor)])),
+      keys: newKeyframesWrites(12, 4, POSE_LOWER, actorKeys(ctx, objectId(ctx, p.actor))),
       lower: POSE_LOWER,
     }),
   /** Neck and head constraints with their influence ramped, and the actor's other looks ramped out. */
   'desk.actor_look_at': (ctx, p) => {
-    const keys = lookKeyBound(ctx.doc, objectId(ctx, p.actor));
-    return deskEstimate({ keys: newKeyframesWrites(keys, keys / 2, ''), lower: '' });
+    const actor = objectId(ctx, p.actor);
+    const keys = lookKeyBound(ctx.doc, actor);
+    return deskEstimate({
+      keys: newKeyframesWrites(keys, keys / 2, '', keysOf(ctx.doc, attachedTo(ctx.doc, actor))),
+      lower: '',
+    });
   },
-  /** A CHILD_OF constraint on the prop (influence keyed) and its visual transform keyed at the release. */
+  /**
+   * A CHILD_OF constraint on the prop (influence keyed), its transform keyed at the grab and its
+   * visual transform at the release, and the arm's carrying posture (two bone constraints, their
+   * influence keyed).
+   */
   'desk.actor_hold': (ctx, p) =>
     deskEstimate({
       keys: newKeyframesWrites(
-        4 + 2 * 9,
-        1 + 9,
+        DESK_HOLD_KEYS,
+        1 + 9 + 2,
         "the prop's animation",
-        keysOf(ctx.doc, [objectId(ctx, p.prop)]),
+        keysOf(ctx.doc, [objectId(ctx, p.prop)]) + actorKeys(ctx, objectId(ctx, p.actor)),
       ),
       lower: "the prop's animation",
     }),
@@ -539,7 +557,7 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
         DESK_ACTOR_MAX_CHANNELS * poses + 4 + 6 * 3,
         DESK_ACTOR_MAX_CHANNELS + 1 + 6,
         POSE_LOWER,
-        keysOf(ctx.doc, [objectId(ctx, p.rider)]),
+        actorKeys(ctx, objectId(ctx, p.rider)),
       ),
       lower: POSE_LOWER,
     });
@@ -601,7 +619,11 @@ export const STORE_MODEL_MAX_MATERIALS = 12;
  * Faces store.add of a model is estimated at: its declared triangles with their margins (the growth
  * its parameters allow, `growth` for a model of STORE_PARAMS_GROWTH_BY_MODEL), bounded.
  */
-export function storeModelFaces(triangles: number, parametric: boolean, growth = STORE_PARAMS_GROWTH): number {
+export function storeModelFaces(
+  triangles: number,
+  parametric: boolean,
+  growth = STORE_PARAMS_GROWTH,
+): number {
   const t = Number.isFinite(triangles) && triangles > 0 ? triangles : STORE_MODEL_MAX_FACES;
   const faces = Math.ceil(t * STORE_TRIANGLES_MARGIN * (parametric ? growth : 1));
   return Math.min(STORE_MODEL_MAX_FACES, Math.max(STORE_MODEL_MIN_FACES, faces));

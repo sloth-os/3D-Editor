@@ -12,7 +12,8 @@ import { vehicleDrive, type VehicleResult } from './vehicle';
  * (operators/desk-motion.ts). Bodies start at their RigidBodyData.start_frame with initial velocities
  * (doc/types.ts; the simulation keeps a body animated until then, physics/simulation.ts), and the
  * presets set the rigid body world's range to the frames they need (frame_start = min(start_frame) −
- * 1, ending when the bodies have come to rest), never the whole scene range.
+ * RELEASE_TRACKED_STEPS, ending when the bodies have come to rest), never the whole scene range; a
+ * start_frame set later past that range keeps the world running until its body rests.
  *
  *   deskPhysicsSetup   desk.physics_setup   rigid bodies (+ a ground collider) on objects
  *   deskPhysicsDrop    desk.physics_drop    lift and release objects at a frame

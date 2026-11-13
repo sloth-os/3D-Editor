@@ -4,7 +4,7 @@ import type { FrameState } from '../../eval/frame-state';
 import { OperatorError } from '../../operators/context';
 import { DESK_PROPS } from '../props';
 import { buildActor, keyPose } from './actor';
-import { holdObject, lookAtObject, mountActor, refreshDismounts } from './attach';
+import { holdObject, lookAtObject, mountActor, refreshDismounts, refreshReleases } from './attach';
 import { keypointsOf, measureActor } from './keypoints';
 import { actorPosition, moveActor, turnActor, yawOf } from './locomotion';
 import type { ActorInfo, ActorKeypoints, CreateActorOptions } from './types';
@@ -74,12 +74,19 @@ export function applyPose(
   o?: { frame?: number; blend_frames?: number; hold_frames?: number },
 ): void {
   keyPose(doc, actorId, pose, o);
+  refreshAttached(doc, actorId);
+}
+
+/** Keys again what depends on where an actor's bones are: its riders' dismounts and its props' releases. */
+function refreshAttached(doc: SceneDoc, actorId: string): void {
   refreshDismounts(doc, actorId);
+  refreshReleases(doc, actorId);
 }
 
 /**
  * Keys the actor walking (running, trotting, galloping) from where it stands at frame_start through
- * `points`, at speed_mps or arriving at frame_end; returns the arrival frame and the path length.
+ * `points`, at speed_mps or arriving at frame_end; returns the arrival frame and the length walked
+ * (the path from where it stands, its corners rounded over a step or two).
  */
 export function moveAlongPath(
   doc: SceneDoc,
@@ -95,7 +102,7 @@ export function moveAlongPath(
   },
 ): { frame_end: number; length_m: number } {
   const r = moveActor(doc, actorId, points, o);
-  refreshDismounts(doc, actorId);
+  refreshAttached(doc, actorId);
   return { frame_end: r.frame_end, length_m: r.length_m };
 }
 
@@ -118,7 +125,7 @@ export function faceTo(
     yaw = (o.facing_deg * Math.PI) / 180;
   else throw new OperatorError('Give facing_deg or target', 'INVALID_PARAMS');
   turnActor(doc, actorId, { yaw, frame: o.frame, turnFrames });
-  refreshDismounts(doc, actorId);
+  refreshAttached(doc, actorId);
 }
 
 /** Keys the actor's head looking at object `target` (null: straight ahead again) from `frame`. */
@@ -129,9 +136,15 @@ export function lookAt(
   o: { frame: number; blend_frames?: number },
 ): void {
   lookAtObject(doc, actorId, target, o);
+  refreshReleases(doc, actorId);
 }
 
-/** Makes the actor hold `propId` in a hand from `frame` (CHILD_OF on the hand bone) until release_frame. */
+/**
+ * Makes the actor hold `propId` from `frame` until release_frame: a CHILD_OF on the hand bone (an
+ * animal's head), influence 0 → 1 at the grab with its inverse set there so the prop sits in the
+ * hand, 1 → 0 at the release where its visual transform is keyed. A person carries it in front of
+ * the body: the holding arm takes a carrying posture while it holds.
+ */
 export function holdProp(
   doc: SceneDoc,
   actorId: string,
@@ -139,6 +152,7 @@ export function holdProp(
   o: { hand?: 'right' | 'left'; frame: number; release_frame?: number },
 ): void {
   holdObject(doc, actorId, propId, o);
+  refreshReleases(doc, actorId);
 }
 
 /** Seats `riderId` on `mountId`'s saddle in the 'ride' pose from `frame` until dismount_frame. */
@@ -149,4 +163,5 @@ export function mount(
   o: { frame: number; dismount_frame?: number },
 ): void {
   mountActor(doc, riderId, mountId, o);
+  refreshReleases(doc, riderId);
 }

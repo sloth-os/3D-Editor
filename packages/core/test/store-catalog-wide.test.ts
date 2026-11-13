@@ -75,7 +75,8 @@ describe('every built-in model', () => {
       // an actor's materials are its own (named after it); the others are the catalog's
       if (e.rig === 'actor') continue;
       for (const m of t.doc.listMaterials()) {
-        if (/\.\d{3,}$/.test(m.name)) problems.push(`${e.id}: two definitions of '${m.name.replace(/\.\d+$/, '')}'`);
+        if (/\.\d{3,}$/.test(m.name))
+          problems.push(`${e.id}: two definitions of '${m.name.replace(/\.\d+$/, '')}'`);
         const defs = byName.get(m.name) ?? new Map<string, string[]>();
         byName.set(m.name, defs);
         const def = definition(m);
@@ -83,7 +84,8 @@ describe('every built-in model', () => {
       }
     }
     for (const [name, defs] of byName)
-      if (defs.size > 1) problems.push(`${name}: ${[...defs.values()].map((ids) => ids.join(',')).join(' / ')}`);
+      if (defs.size > 1)
+        problems.push(`${name}: ${[...defs.values()].map((ids) => ids.join(',')).join(' / ')}`);
     expect(problems).toEqual([]);
   });
 
@@ -107,7 +109,12 @@ describe('every built-in model', () => {
       });
       const warned = (r.result.warnings as string[]).includes(colorIgnored(e.id));
       const reported = t.reports.some((w) => w.level === 'WARNING' && w.message === colorIgnored(e.id));
-      if (recoloured === warned || warned !== reported || takesColor(e) !== recoloured || r.result.entry.recolorable !== recoloured)
+      if (
+        recoloured === warned ||
+        warned !== reported ||
+        takesColor(e) !== recoloured ||
+        r.result.entry.recolorable !== recoloured
+      )
         problems.push(
           `${e.id}: recoloured ${recoloured}, warned ${warned}, reported ${reported}, recolorable ${r.result.entry.recolorable}`,
         );
@@ -144,7 +151,8 @@ describe('materials of built-in models', () => {
       ['barn', 'desk'],
     ]) {
       const t = setup();
-      for (const id of order) expect(coloursOf(t, t.run({ model: id }).result.objects), order.join(' then ')).toEqual(alone[id]);
+      for (const id of order)
+        expect(coloursOf(t, t.run({ model: id }).result.objects), order.join(' then ')).toEqual(alone[id]);
     }
   });
 
@@ -164,13 +172,11 @@ describe('materials of built-in models', () => {
     expect(top(desk.objects)).toBe(oak);
     expect(t.doc.getMaterial(oak)!.base_color.slice(0, 3)).toEqual(hexToLinear('#a97e52'));
     const barn = t.run({ model: 'barn' }).result;
-    const barnMaterials = new Set(
-      barn.objects.flatMap((id: string) => t.doc.getObject(id)!.material_slots),
-    );
+    const barnMaterials = new Set(barn.objects.flatMap((id: string) => t.doc.getObject(id)!.material_slots));
     expect(barnMaterials.has(userPaint)).toBe(false);
-    expect([...barnMaterials].some((id) => t.doc.getMaterial(id as string)?.name === 'Outdoor White Paint.001')).toBe(
-      true,
-    );
+    expect(
+      [...barnMaterials].some((id) => t.doc.getMaterial(id as string)?.name === 'Outdoor White Paint.001'),
+    ).toBe(true);
     // the user's materials are untouched
     expect(t.doc.getMaterial(userOak)!.base_color).toEqual([0.8, 0, 0, 1]);
     // someone edits the store's oak: the tables already added follow, a new one keeps its own oak

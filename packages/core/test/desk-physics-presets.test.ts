@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import type { Vec3 } from '../src/math/types';
 import { SceneEvaluator } from '../src/eval/evaluate';
-import { sanitizeRigidBody, sanitizeRigidBodyWorld } from '../src/physics/settings';
-import { deskBallisticVelocity, deskFlightCoefficients } from '../src/desk/physics';
+import {
+  RELEASE_TRACKED_STEPS,
+  newRigidBody,
+  sanitizeRigidBody,
+  sanitizeRigidBodyWorld,
+} from '../src/physics/settings';
+import { deskBallisticVelocity, deskFlightCoefficients, deskIsBallLike } from '../src/desk/physics';
 import { channelsAt, deskScene, dist, originOf, worldAt } from './desk-physics-helpers';
 
 /*
@@ -45,6 +50,43 @@ describe('desk.physics_setup', () => {
     expect(s.doc.listObjects().filter((o) => o.custom_props?.desk_role === 'set')).toHaveLength(1);
   });
 
+  it('gives SPHERE bodies to balls only: not to things named after balls or marble columns', () => {
+    const s = deskScene();
+    const isBall = (name: string, label?: string) =>
+      deskIsBallLike(
+        s.doc,
+        s.doc.getObject(s.box(name, [0, 0, 1], 0.5, label ? { custom_props: { desk_label: label } } : {}))!,
+      );
+    for (const name of [
+      'Football',
+      'Beach ball',
+      'SoccerBall.001',
+      'tennis_ball',
+      'Glass marble',
+      'Globe',
+      'Sphere',
+    ])
+      expect(isBall(name), name).toBe(true);
+    for (const name of [
+      'Football goal',
+      'Baseball bat',
+      'Ballpoint pen',
+      'Ball gown',
+      'Marble column',
+      'Pinball machine',
+    ])
+      expect(isBall(name), name).toBe(false);
+    expect(isBall('Prop', 'basketball hoop')).toBe(false);
+    expect(isBall('Prop', 'bowling ball')).toBe(true);
+    // catalog models: the marble column (tagged 'marble') is a box, the tennis ball (tagged 'ball') a sphere
+    const column = s.run('store.add', { model: 'column', location: [4, 0, 0] }).root as string;
+    const ball = s.run('store.add', { model: 'tennis_ball', location: [8, 0, 1] }).root as string;
+    const shapes = s
+      .run('desk.physics_setup', { objects: [column, ball] })
+      .bodies.map((b: { collision_shape: string }) => b.collision_shape);
+    expect(shapes).toEqual(['BOX', 'SPHERE']);
+  });
+
   it('makes a flat set floor the ground collider instead of adding one', () => {
     const s = deskScene();
     const floor = s.plane('Floor', 30, { custom_props: { desk_role: 'set' } });
@@ -71,6 +113,84 @@ describe('desk.physics_setup', () => {
   });
 });
 
+describe('the ground of a release', () => {
+  /** A set floor without a body (as desk.set_build makes it), a passive table on it and a mug on the table. */
+  function tableScene(setSize: number, mugX: number) {
+    const s = deskScene();
+    const floor = s.plane('Set floor', setSize, { custom_props: { desk_role: 'set' } });
+    const table = s.box('Table', [0, 0, 0.375], 1, { scale: [1.6, 0.9, 0.75] });
+    s.run('desk.physics_setup', { objects: ['Table'], kind: 'passive' });
+    const mug = s.box('Mug', [mugX, 0, 0.8], 0.1);
+    return { s, floor, table, mug };
+  }
+
+  it('is the floor, not the table a prop stands on: a mug pushed off the table lands on the set floor', () => {
+    const { s, floor, mug } = tableScene(30, 0.6);
+    const r = s.run('desk.physics_push', { object: 'Mug', direction: [1, 0, 0], speed_mps: 2, frame: 20 });
+    // the set's floor became the static ground (no second plane over it)
+    expect(sanitizeRigidBody(s.doc.getObject(floor)!.rigid_body)).toMatchObject({ type: 'PASSIVE' });
+    expect(s.doc.listObjects().filter((o) => o.custom_props?.desk_role === 'set')).toHaveLength(1);
+    expect(r.world.settled).toBe(true);
+    // off the table's edge (x 0.8), resting on the floor (a 0.1 m box)
+    const end = originOf(worldAt(s.doc, mug, r.world.frame_end));
+    expect(end[0]).toBeGreaterThan(0.8);
+    expect(end[2]).toBeCloseTo(0.05, 2);
+  });
+
+  it('keeps a set floor the bodies come down beyond, naming where they fall off its edge', () => {
+    // a 4 m set: the mug flies off the table at x 1.6 and comes down past the floor's edge at x 2
+    const { s, floor } = tableScene(4, 0.6);
+    s.doc.updateObject(s.doc.resolveObject('Table')!.id, { location: [1, 0, 0.375] });
+    s.doc.updateObject(s.doc.resolveObject('Mug')!.id, { location: [1.6, 0, 0.8] });
+    s.run('desk.physics_push', { object: 'Mug', direction: [1, 0, 0], speed_mps: 3, frame: 20 });
+    expect(sanitizeRigidBody(s.doc.getObject(floor)!.rigid_body)).toMatchObject({ type: 'PASSIVE' });
+    // no plane at z = 0 added under (and through) the set's floor
+    expect(s.doc.listObjects().map((o) => o.name)).not.toContain('Ground');
+    expect(
+      s.warnings.some((w) => w.includes("'Set floor' is the ground") && w.includes('beyond its edge')),
+    ).toBe(true);
+  });
+
+  it('is added for bodies that already had one: thrown, dropped and pushed props come to rest', () => {
+    for (const [op, params] of [
+      ['desk.physics_throw', { object: 'Ball', target: [4, 0, 1], frame: 10, flight_s: 1 }],
+      ['desk.physics_drop', { objects: ['Ball'], frame: 10, height: 1 }],
+      ['desk.physics_push', { object: 'Ball', direction: [1, 0, 0], speed_mps: 2, frame: 10 }],
+    ] as const) {
+      const s = deskScene();
+      // a body from rigidbody.object_add (or an actor, a rideo import): no ground yet
+      const ball = s.ball('Ball', [0, 0, 1.5], 0.11, { rigid_body: newRigidBody('ACTIVE') });
+      const r = s.run(op, params);
+      const ground = s.doc.listObjects().find((o) => o.custom_props?.desk_role === 'set');
+      expect(ground, op).toBeDefined();
+      expect(sanitizeRigidBody(ground!.rigid_body), op).toMatchObject({ type: 'PASSIVE' });
+      expect(r.world.settled, op).toBe(true);
+      expect(originOf(worldAt(s.doc, ball, r.world.frame_end))[2], op).toBeCloseTo(0.11, 1);
+    }
+  });
+
+  it('names the bodies still moving when the settling stops, and how to slow a rolling ball down', () => {
+    for (const [op, params, fell] of [
+      // rolls on along the ground
+      ['desk.physics_push', { object: 'Ball', direction: [1, 0, 0], speed_mps: 3, frame: 10 }, false],
+      // caught in the air, comes down after it and rolls off the ground's edge
+      ['desk.physics_throw', { object: 'Ball', target: [5, 3, 2.5], frame: 10, flight_s: 1 }, true],
+    ] as const) {
+      const s = deskScene();
+      // a ball body of rigidbody.object_add: Blender's damping, so it rolls on
+      s.ball('Ball', [0, 0, 1.4], 0.1, {
+        rigid_body: { ...newRigidBody('ACTIVE'), collision_shape: 'SPHERE' },
+      });
+      const r = s.run(op, params);
+      expect(r.world.settled, op).toBe(false);
+      const warning = s.warnings.find((w) => w.startsWith('some bodies are still moving'));
+      expect(warning, op).toContain("'Ball'");
+      expect(warning, op).toContain('angular_damping');
+      expect(warning!.includes('fallen off the ground'), op).toBe(fell);
+    }
+  });
+});
+
 describe('desk.physics_drop', () => {
   it('lifts the objects, holds them until the frame and lets them fall and settle', () => {
     const s = deskScene();
@@ -78,10 +198,10 @@ describe('desk.physics_drop', () => {
     const r = s.run('desk.physics_drop', { objects: ['Crate'], frame: 30, height: 2 });
     expect(body(s, crate)).toMatchObject({ start_frame: 30, inherit_velocity: true });
     expect(s.doc.getObject(crate)!.location).toEqual([0, 0, 3]);
-    // the world runs from the frame before the release until the crate has come to rest
-    expect(r.world.frame_start).toBe(29);
+    // the world runs from the frames that track the release until the crate has come to rest
+    expect(r.world.frame_start).toBe(30 - RELEASE_TRACKED_STEPS);
     expect(r.world.settled).toBe(true);
-    expect(r.world.frame_end).toBeLessThan(29 + 5 * 24);
+    expect(r.world.frame_end).toBeLessThan(30 + 5 * 24);
     const ev = new SceneEvaluator(s.doc);
     for (const f of [1, 15, 30]) expect(originOf(worldAt(s.doc, crate, f, ev))[2]).toBeCloseTo(3, 9);
     expect(originOf(worldAt(s.doc, crate, 35, ev))[2]).toBeLessThan(3);
@@ -115,12 +235,12 @@ describe('desk.physics_drop', () => {
     s.doc.updateScene({ frame_start: 1, frame_end: 5000 });
     s.box('Crate', [0, 0, 1]);
     const r = s.run('desk.physics_drop', { objects: ['Crate'], frame: 4000 });
-    expect(r.world.frame_start).toBe(3999);
+    expect(r.world.frame_start).toBe(4000 - RELEASE_TRACKED_STEPS);
     expect(r.world.frame_end).toBeLessThan(4100);
     // a second, earlier release moves the start back and keeps both settled
     s.box('Crate 2', [3, 0, 1]);
     const again = s.run('desk.physics_drop', { objects: ['Crate 2'], frame: 100 });
-    expect(again.world.frame_start).toBe(99);
+    expect(again.world.frame_start).toBe(100 - RELEASE_TRACKED_STEPS);
     expect(again.world.frame_end).toBeGreaterThanOrEqual(4000);
   });
 });

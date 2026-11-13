@@ -16,9 +16,11 @@ import {
   BUILT_KINDS,
   HUMANOID_BONES,
   HUMAN_POSES,
+  HUMANOID_KINDS,
   OPENPOSE18_KEYPOINTS,
   QUADRUPED_BONES,
   QUADRUPED_KEYPOINTS,
+  RIDEABLE_KINDS,
   actorInfo,
   actorKeypoints,
   applyPose,
@@ -36,7 +38,8 @@ import { moveTiming, gaitDef } from '../src/desk/characters/gait';
  */
 
 const HUMANS: ActorKind[] = ['adult', 'man', 'woman', 'child', 'toddler', 'elder'];
-const ANIMALS: ActorKind[] = ['horse', 'pony', 'dog'];
+/** Every built quadruped. */
+const ANIMALS: ActorKind[] = BUILT_KINDS.filter((k) => !HUMANOID_KINDS.includes(k));
 
 function scene() {
   return SceneDoc.create({ empty: true });
@@ -100,11 +103,12 @@ function code(fn: () => unknown): string | undefined {
 }
 
 describe('desk actors: build', () => {
-  it('builds the kinds of phase 1 and refuses the others with the built list', () => {
+  it('builds every kind but the birds and refuses those with the built list', () => {
     for (const k of ['adult', 'man', 'woman', 'child', 'horse', 'pony', 'dog'] as ActorKind[])
       expect(BUILT_KINDS).toContain(k);
     const unbuilt = ACTOR_KINDS.filter((k) => !BUILT_KINDS.includes(k));
-    expect(unbuilt.length).toBeGreaterThan(0);
+    expect(unbuilt).toEqual(['duck', 'bird']);
+    expect(ANIMALS).toHaveLength(11);
     for (const k of unbuilt) {
       const doc = scene();
       let err: unknown;
@@ -143,15 +147,22 @@ describe('desk actors: build', () => {
     }
   });
 
-  it('quadrupeds have the fixed bones; horses and ponies a saddle, dogs none', () => {
+  it('quadrupeds have the fixed bones; the mounts a saddle, the others none', () => {
+    expect([...RIDEABLE_KINDS].sort()).toEqual(['cow', 'donkey', 'horse', 'pony']);
     for (const kind of ANIMALS) {
       const { doc, actor: id, parts } = actor(kind);
       const bones = doc.getArmature(doc.getObject(id)!.data!)!.bones.map((b) => b.name);
-      const want = QUADRUPED_BONES.filter((b) => b !== 'saddle' || kind !== 'dog');
+      const want = QUADRUPED_BONES.filter((b) => b !== 'saddle' || RIDEABLE_KINDS.includes(kind));
       expect([...bones].sort(), kind).toEqual([...want].sort());
       let tris = 0;
-      for (const p of parts)
-        for (const f of doc.getMesh(doc.getObject(p)!.data!)!.faces) tris += f.length - 2;
+      const parented = new Set<string>();
+      for (const p of parts) {
+        const o = doc.getObject(p)!;
+        expect(o.parent_type, kind).toBe('BONE');
+        parented.add(o.parent_bone);
+        for (const f of doc.getMesh(o.data!)!.faces) tris += f.length - 2;
+      }
+      expect([...parented].sort(), kind).toEqual(bones.filter((b) => b !== 'root').sort());
       expect(tris, kind).toBeLessThan(6000);
     }
   });
@@ -238,7 +249,7 @@ describe('desk actors: build', () => {
 
 describe('desk actors: poses', () => {
   it('every pose of every built kind stands on the ground (jump and ride above it)', () => {
-    for (const kind of ['adult', 'child', 'elder', 'horse', 'dog'] as ActorKind[]) {
+    for (const kind of BUILT_KINDS) {
       const poses: readonly string[] = HUMANS.includes(kind) ? HUMAN_POSES : ANIMAL_POSES;
       for (const pose of poses) {
         const { doc, actor: id } = actor(kind, { pose });
@@ -307,6 +318,13 @@ describe('desk actors: poses', () => {
     const up = at('look_up');
     expect(up.nose[2] - up.r_eye[2]).toBeGreaterThan(stand.nose[2] - stand.r_eye[2]);
     expect(at('sit_ground').r_hip[2]).toBeLessThan(0.25 * 1.7);
+    // lying on the back as rideo draws it: the head behind the mark (+Y, the facing is −Y), the
+    // feet towards the facing, the face up
+    const lie = at('lie');
+    expect(lie.nose[1]).toBeGreaterThan(0.4);
+    expect(lie.r_ankle[1]).toBeLessThan(-0.6);
+    expect(lie.nose[2]).toBeGreaterThan(lie.r_ear[2] + 0.06);
+    expect(Math.abs(lie.r_hip[2] - lie.r_ankle[2])).toBeLessThan(0.05);
   });
 
   it('quadruped poses: grazing, looking up, sitting and lying', () => {
@@ -502,9 +520,9 @@ describe('desk actors: operators and estimates', () => {
     const info = actorInfo(new FrameState(doc, 1), doc, res.actor);
     expect(Math.hypot(info.feet[0] - 4, info.feet[1] - 5)).toBeLessThan(0.1);
     // an unbuilt kind and a non-actor are refused with a clear message
-    const cat = reg.run(ctx, 'desk.actor_add', { kind: 'cat' });
-    expect(cat.ok).toBe(false);
-    expect(cat.error).toMatch(/adult/);
+    const duck = reg.run(ctx, 'desk.actor_add', { kind: 'duck' });
+    expect(duck.ok).toBe(false);
+    expect(duck.error).toMatch(/adult/);
     const cube = doc.addObject({
       type: 'MESH',
       name: 'Cube',

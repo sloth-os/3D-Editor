@@ -334,7 +334,7 @@ export function insertStoreFiles(doc: SceneDoc, o: InsertStoreFilesOptions): Ins
   const have = Math.max(...natural);
   const want = o.entry.dimensions_m ? Math.max(...o.entry.dimensions_m) : 0;
   const { range, kind } = sizeRangeOf(o.entry);
-  let scale: Vec3 = [1, 1, 1];
+  let scale: Vec3;
   if (asked) scale = sizeScale(natural, o, warnings);
   else if (want > 0 && Number.isFinite(want) && have > 1e-9) {
     scale = [want / have, want / have, want / have];

@@ -101,3 +101,29 @@ export function lookKeyBound(doc: SceneDoc, actorId: string | null): number {
     for (const c of bones[bone]?.constraints ?? []) if (c.type === 'DAMPED_TRACK') looks++;
   return 4 + 2 * looks;
 }
+
+/**
+ * Objects whose release or dismount keys follow `actorId`'s bones (a CHILD_OF on the actor: the props
+ * it holds, its riders): every move, turn, pose, look, hold and ride of the actor keys them again.
+ */
+export function attachedTo(doc: SceneDoc, actorId: string | null): string[] {
+  if (!actorId) return [];
+  const out: string[] = [];
+  for (const [id, y] of doc.map('objects').entries()) {
+    if (id === actorId) continue;
+    const list = (y as { get(key: string): unknown }).get('constraints');
+    if (!Array.isArray(list)) continue;
+    if (
+      list.some(
+        (c) => !!c && (c as ConstraintLike).type === 'CHILD_OF' && (c as ConstraintLike).target === actorId,
+      )
+    )
+      out.push(id);
+  }
+  return out;
+}
+
+interface ConstraintLike {
+  type?: unknown;
+  target?: unknown;
+}

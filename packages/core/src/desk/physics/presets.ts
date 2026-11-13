@@ -24,6 +24,7 @@ import {
   directionIn,
   originOf,
   parentMatrix,
+  round,
   sceneSampler,
   worldBounds,
 } from './common';
@@ -321,7 +322,9 @@ const floorLike = (o: ObjectData, b: { min: Vec3; max: Vec3 }): boolean =>
  * A passive floor under the bodies `ids` (at `frame`) and the points `extra` (where they land), or
  * null when none is needed: an existing static floor under all of them (see `floorLike`: tables and
  * other raised colliders do not count), else the desk set's flat ground given a static body, else a
- * new ground plane at z = 0 (desk_role 'set') covering them. The ground's friction and restitution
+ * new ground plane at z = 0 (desk_role 'set') covering them. A floor that is under the bodies but not
+ * under every point they land on stays the floor (a second plane at z = 0 over it would show through
+ * it), with a warning naming where they would fall off its edge. The ground's friction and restitution
  * are 1, so that the props' own values decide (a contact uses the product of both bodies' values).
  */
 export function ensureGround(
@@ -331,7 +334,8 @@ export function ensureGround(
   frame: number,
   warnings: string[],
 ): string | null {
-  const feet = footprints(doc, ids, frame, extra);
+  const bodyFeet = footprints(doc, ids, frame, []);
+  const feet = [...bodyFeet, ...footprints(doc, [], frame, extra)];
   if (!feet.length) return null;
   const fs = sceneSampler(doc).at(frame);
   const boundsOf = (o: ObjectData) => {
@@ -354,16 +358,28 @@ export function ensureGround(
   const covering = floors.find((c) => feet.every((f) => under(c.b, f)));
   if (covering) return covering.id;
   if (feet.every((f) => floors.some((c) => under(c.b, f)))) return null;
+  const makeFloor = (id: string) => {
+    setBody(doc, id, { ...newRigidBody('PASSIVE'), collision_shape: 'MESH', friction: 1, restitution: 1 });
+    warnings.push(`'${doc.getObject(id)!.name}' became the static ground collider`);
+  };
   const set = sets.find((s) => feet.every((f) => under(s.b, f)));
   if (set) {
-    setBody(doc, set.id, {
-      ...newRigidBody('PASSIVE'),
-      collision_shape: 'MESH',
-      friction: 1,
-      restitution: 1,
-    });
-    warnings.push(`'${doc.getObject(set.id)!.name}' became the static ground collider`);
+    makeFloor(set.id);
     return set.id;
+  }
+  // a floor under the bodies whose edge some of them come down beyond: kept, and named
+  const coversBodies = (b: { min: Vec3; max: Vec3 }) =>
+    bodyFeet.length > 0 && bodyFeet.every((f) => under(b, f));
+  const floor = floors.find((c) => coversBodies(c.b)) ?? sets.find((s) => coversBodies(s.b));
+  if (floor) {
+    if (!floors.includes(floor)) makeFloor(floor.id);
+    const off = feet.filter((f) => !under(floor.b, f));
+    warnings.push(
+      `'${doc.getObject(floor.id)!.name}' is the ground, but the bodies come down beyond its edge (at ` +
+        `${off.map((f) => `${round(f.x, 2)}, ${round(f.y, 2)}`).join('; ')}) and fall from there: make the ground ` +
+        'larger (desk.set_build width and depth) or give a smaller speed or flight',
+    );
+    return floor.id;
   }
   // a new ground plane under everything, at least the desk set's size
   const xs = feet.map((f) => f.x);
@@ -462,20 +478,45 @@ function turnBetween(a: Readonly<Mat4>, b: Readonly<Mat4>): number {
 }
 
 /**
- * Whether every simulated body is at rest: asleep, or moved less than SETTLE_DISTANCE and turned less
- * than SETTLE_ANGLE between the matrices `before` and `now` (a window apart).
+ * The simulated bodies that are not at rest: not asleep, and moved at least SETTLE_DISTANCE or turned
+ * at least SETTLE_ANGLE between the matrices `before` and `now` (a window apart).
  */
-function atRest(doc: SceneDoc, now: Map<string, Mat4> | null, before: Map<string, Mat4> | null): boolean {
+function stillMoving(
+  doc: SceneDoc,
+  now: Map<string, Mat4> | null,
+  before: Map<string, Mat4> | null,
+): { id: string; at: Mat4 | null }[] {
   const info = rigidBodyCacheInfo(doc);
-  if (!info) return true;
-  return info.objects.every((b) => {
-    if (b.motion !== 'DYNAMIC' || b.sleeping) return true;
-    const m = now?.get(b.object);
+  if (!info) return [];
+  const out: { id: string; at: Mat4 | null }[] = [];
+  for (const b of info.objects) {
+    if (b.motion !== 'DYNAMIC' || b.sleeping) continue;
+    const m = now?.get(b.object) ?? null;
     const p = before?.get(b.object);
-    if (!m || !p) return false;
-    const moved = Math.hypot(m[12] - p[12], m[13] - p[13], m[14] - p[14]);
-    return moved < SETTLE_DISTANCE && turnBetween(m, p) < SETTLE_ANGLE;
+    if (m && p) {
+      const moved = Math.hypot(m[12] - p[12], m[13] - p[13], m[14] - p[14]);
+      if (moved < SETTLE_DISTANCE && turnBetween(m, p) < SETTLE_ANGLE) continue;
+    }
+    out.push({ id: b.object, at: m });
+  }
+  return out;
+}
+
+/** Whether every simulated body is at rest (see `stillMoving`). */
+function atRest(doc: SceneDoc, now: Map<string, Mat4> | null, before: Map<string, Mat4> | null): boolean {
+  return stillMoving(doc, now, before).length === 0;
+}
+
+/**
+ * The bodies still moving where the settling stops, named (at most 5), each that fell far under the
+ * ground with its height: what the warning about an unsettled world names.
+ */
+function movingNames(doc: SceneDoc, moving: readonly { id: string; at: Mat4 | null }[]): string {
+  const named = moving.slice(0, 5).map(({ id, at }) => {
+    const name = `'${doc.getObject(id)?.name ?? id}'`;
+    return at && at[14] < -1 ? `${name}, fallen off the ground to z ${round(at[14], 1)}` : name;
   });
+  return named.join('; ') + (moving.length > 5 ? ` and ${moving.length - 5} more` : '');
 }
 
 /** The rigid body world's range after a preset (see {@link updateDeskWorldRange}). */
@@ -552,15 +593,21 @@ export function updateDeskWorldRange(doc: SceneDoc, warnings: string[]): DeskWor
         `ends ${DESK_SETTLE_FALLBACK_SECONDS} s after the last release, at frame ${end}`,
     );
   }
-  if (!settled && end === cap)
+  if (!settled && end === cap) {
+    const unsettled =
+      history.length > window ? stillMoving(doc, history[history.length - 1], history[0]) : [];
+    const which = unsettled.length ? ` (${movingNames(doc, unsettled)})` : '';
     warnings.push(
       cap === frameStart + MAX_SIMULATED_FRAMES
-        ? `some bodies are still moving at frame ${cap}, the ${MAX_SIMULATED_FRAMES}-frame limit of a simulation: ` +
-            'the simulation holds their state from there'
-        : `some bodies are still moving at frame ${cap}, ${DESK_SETTLE_MAX_SECONDS} s after the last release and ` +
-            "the animated colliders' last move: the simulation holds their state from there (extend it with " +
-            'rigidbody.world_set frame_end)',
+        ? `some bodies are still moving at frame ${cap}${which}, the ${MAX_SIMULATED_FRAMES}-frame limit of a ` +
+            'simulation: the simulation holds their state from there'
+        : `some bodies are still moving at frame ${cap}${which}, ${DESK_SETTLE_MAX_SECONDS} s after the last ` +
+            "release and the animated colliders' last move: the simulation holds their state from there (extend " +
+            'it with rigidbody.world_set frame_end, or slow them down with rigidbody.object_settings_set: a ball ' +
+            `rolls on unless its angular_damping is high, ${DESK_BALL_SETTINGS.angular_damping} for the balls the ` +
+            'presets set up)',
     );
+  }
   doc.updateScene({
     rigidbody_world: { ...sanitizeRigidBodyWorld(doc.getScene().rigidbody_world), frame_end: end },
   });

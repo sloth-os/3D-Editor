@@ -197,9 +197,7 @@ function table(): ModelGeometry {
 
 function roundTable(): ModelGeometry {
   return {
-    parts: [
-      generatedPart('table', generateTable({ shape: 'ROUND', width: 1.0 }), [tinted(WOOD), WOOD_DARK]),
-    ],
+    parts: [generatedPart('table', generateTable({ shape: 'ROUND', width: 1.0 }), [tinted(WOOD), WOOD_DARK])],
   };
 }
 
@@ -524,9 +522,7 @@ function tvStand(): ModelGeometry {
     for (const sy of [-1, 1])
       addLeg(b, sx * (w / 2 - 0.06), sy * (d / 2 - 0.05), 0, z0, 0.025, 0.035, { mat: 2 });
   return {
-    parts: [
-      part('stand', b, [tinted(MATS.walnut), MATS.whitePaint, MATS.blackMetal], { sharpAngle: SHARP }),
-    ],
+    parts: [part('stand', b, [tinted(MATS.walnut), MATS.whitePaint, MATS.blackMetal], { sharpAngle: SHARP })],
   };
 }
 

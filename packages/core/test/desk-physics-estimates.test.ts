@@ -3,7 +3,7 @@ import { DESK_MOTION_ESTIMATES } from '../src/operators/memory-desk';
 import { describe, expect, it } from 'vitest';
 import { OPERATOR_ESTIMATES, OPERATOR_FIXED_BYTES, estimateOperator } from '../src/operators';
 import { rigidBodyCacheBytes } from '../src/physics/rigid-body';
-import { newRigidBody } from '../src/physics/settings';
+import { RELEASE_TRACKED_STEPS, newRigidBody } from '../src/physics/settings';
 import {
   DESK_SETTLE_BYTES_PER_BODY_FRAME,
   deskSettleSimulation,
@@ -49,9 +49,10 @@ describe('desk motion memory estimates', () => {
     expect(two.bytes).toBeGreaterThan(one.bytes);
     expect(two.simulationBytes!).toBeGreaterThan(one.simulationBytes!);
     expect(one.objects).toBe(1);
-    // the world steps from the frame before the release (99) until 20 s after the bodies' first move (101)
+    // the world steps from the frames that track the release (98, 99) until 20 s after the bodies'
+    // first move (101)
     const sim = deskSettleSimulation(s.doc, { count: 2, kind: 'active', start: 100 });
-    expect(sim.frames).toBe(2 + Math.ceil(DESK_SETTLE_MAX_SECONDS * 24));
+    expect(sim.frames).toBe(1 + RELEASE_TRACKED_STEPS + Math.ceil(DESK_SETTLE_MAX_SECONDS * 24));
     expect(sim.bodies).toBe(2);
     expect(two.bytes).toBeGreaterThanOrEqual(
       OPERATOR_FIXED_BYTES + DESK_SETTLE_BYTES_PER_BODY_FRAME * 2 * sim.frames,
@@ -116,6 +117,20 @@ describe('desk motion memory estimates', () => {
     });
     for (let i = 0; i < 101; i++) s.box(`More ${i}`, [i, 5, 1], 0.5, { rigid_body: newRigidBody('ACTIVE') });
     expect(estimateOperator('desk.physics_bake', s.ctx, {})).toBeNull();
+  });
+
+  it('count nine keys per frame for a body the bake unparents (its world scale too)', () => {
+    const s = deskScene();
+    const root = s.empty('Crate', [0, 0, 1], { scale: [1.6, 1, 0.6] });
+    s.box('Crate body', [0, 0, 0.2], 0.4, { parent: root });
+    s.box('Loose', [3, 0, 1]);
+    s.run('desk.physics_drop', { objects: ['Crate', 'Loose'], frame: 10 });
+    const world = s.doc.getScene().rigidbody_world;
+    const frames = world.frame_end - world.frame_start + 1;
+    const e = estimateOperator('desk.physics_bake', s.ctx, {})!;
+    // the part: location, rotation and scale; the loose box: location and rotation
+    expect(e.keyframes).toBe((9 + 6) * frames);
+    expect(s.run('desk.physics_bake', {}).keyframes).toBeLessThanOrEqual(e.keyframes!);
   });
 
   it('count every channel of a flight on every frame, and the objects it adds', () => {

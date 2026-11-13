@@ -9,6 +9,7 @@ import { OperatorError } from '../src/operators/context';
 import { createEditorState, createOperatorRegistry, type OperatorContext } from '../src/operators';
 import {
   actorInfo,
+  applyPose,
   createActor,
   faceTo,
   holdProp,
@@ -17,7 +18,7 @@ import {
   moveAlongPath,
   type ActorKind,
 } from '../src/desk/characters';
-import { blueprintFor } from '../src/desk/characters/kinds';
+import { blueprintFor, defaultHeight } from '../src/desk/characters/kinds';
 import { restMatrices } from '../src/desk/characters/rig';
 
 /*
@@ -124,7 +125,9 @@ describe('desk actors: moves', () => {
       ],
       { frame_start: 1 },
     );
-    expect(r.length_m).toBeCloseTo(7, 6);
+    // the length walked: the polyline's 7 m less what rounding its corner saves (a few cm)
+    expect(r.length_m).toBeLessThan(7);
+    expect(r.length_m).toBeGreaterThan(6.7);
     const end = position(doc, a.actor, r.frame_end);
     expect(Math.hypot(end[0] - 3, end[1] - 4)).toBeLessThan(0.01);
     // along the last segment (+Y is 180° from the front −Y)
@@ -285,6 +288,61 @@ describe('desk actors: holds and rides', () => {
     expect(dist(position(doc, cup, 90), dropped)).toBeLessThan(1e-9);
     expect(code(() => holdProp(doc, a.actor, a.actor, { frame: 5 }))).toBe('INVALID_PARAMS');
     expect(code(() => holdProp(doc, a.actor, cup, { frame: 50, release_frame: 40 }))).toBe('INVALID_PARAMS');
+  });
+
+  it('carries a held prop in front of the body; a later walk moves where it is let go', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const a = createActor(doc, { kind: 'woman', location: [0, 0, 0], facing_deg: 90 });
+    const box = ball(doc, 'Box', [0.35, -0.35, 0.85], 0.16);
+    holdProp(doc, a.actor, box, { frame: 10, release_frame: 80 });
+    // the walk is keyed after the hold: the release is keyed again where the walk takes the hand
+    moveAlongPath(doc, a.actor, [[5, 0, 0]], { frame_start: 20 });
+    // carried in front of the body (facing +X), below the chest, through the walk
+    for (const f of [10, 40, 60, 79]) {
+      const p = position(doc, box, f);
+      const i = actorInfo(new FrameState(doc, f), doc, a.actor);
+      expect(p[0] - i.chest[0], `frame ${f}`).toBeGreaterThan(0.2);
+      expect(Math.abs(p[1] - i.chest[1]), `frame ${f}`).toBeLessThan(0.2);
+      expect(p[2], `frame ${f}`).toBeGreaterThan(0.6);
+      expect(p[2], `frame ${f}`).toBeLessThan(i.chest[2]);
+    }
+    // the arms are posed by keyed constraints: on through the hold, blended off after the release
+    const arm = doc.getObject(a.actor)!.pose.bones['forearm.R'].constraints ?? [];
+    expect(arm.map((c) => c.name)).toEqual(['Hold Box']);
+    // let go where the walk took it (no jump), and it stays there
+    const dropped = position(doc, box, 80);
+    expect(dropped[0]).toBeGreaterThan(2.5);
+    expect(dist(position(doc, box, 79.99), dropped)).toBeLessThan(0.01);
+    expect(dist(position(doc, box, 100), dropped)).toBeLessThan(1e-9);
+    // an unkeyed pose keeps the hold's constraints (and the release where it was)
+    applyPose(doc, a.actor, 'wave');
+    expect(doc.getObject(a.actor)!.pose.bones['forearm.R'].constraints?.map((c) => c.name)).toEqual([
+      'Hold Box',
+    ]);
+    expect(dist(position(doc, box, 100), dropped)).toBeLessThan(1e-6);
+  });
+
+  it("a rider's legs go round the barrel of every mount, a child's too", () => {
+    for (const kind of ['horse', 'pony', 'donkey', 'cow'] as ActorKind[])
+      for (const riderKind of ['man', 'child'] as ActorKind[]) {
+        const doc = SceneDoc.create({ empty: true });
+        const m = createActor(doc, { kind, location: [0, 0, 0] });
+        const r = createActor(doc, { kind: riderKind, location: [3, 0, 0] });
+        mount(doc, r.actor, m.actor, { frame: 1 });
+        const fs = new FrameState(doc, 1);
+        const barrel = blueprintFor(kind, defaultHeight(kind)).barrel!;
+        const toMount = invert4(fs.world(m.actor)!);
+        // knees and ankles outside the barrel's elliptical section (the mount's X is across it)
+        for (const bone of ['shin.L', 'shin.R', 'foot.L', 'foot.R']) {
+          const b = fs.boneMatrix(r.actor, bone)!.matrix;
+          const p = transformPoint3(toMount, [b[12], b[13], b[14]]);
+          const e = (p[0] / barrel.halfWidth) ** 2 + ((p[2] - barrel.z) / barrel.halfHeight) ** 2;
+          expect(e, `${riderKind} on a ${kind}: ${bone}`).toBeGreaterThan(1.15);
+        }
+        // both feet off the ground, the rider above the saddle
+        const info = actorInfo(fs, doc, r.actor);
+        expect(info.bounds.min[2], `${riderKind} on a ${kind}`).toBeGreaterThan(0.3);
+      }
   });
 
   it('a rider stays on the saddle while the mount walks, and gets off beside it', () => {

@@ -155,6 +155,8 @@ const GUARD = 64;
  */
 const PROC_VALUES = 13;
 const INV_PI = 1 / Math.PI;
+/** Stand-in for buffers a rasterizer does not have (keeps the hot loops' types fixed). */
+const NO_FLOATS = new Float32Array(0);
 /** Angular radius of a sun lamp's disc for its highlight (Blender's default sun angle 0.526°). */
 const SUN_ANGULAR_RADIUS = 0.00459;
 /** Meshes with more triangles are drawn from a coarse proxy by helper renders (`lodCells`). */
@@ -897,6 +899,11 @@ export class Rasterizer {
     this.trackAmbient = amb !== null;
     const pix = this.pixels;
     const pixW = pix ? pix.width : 0;
+    // (the opaque pass records each pixel's nearest sample inline: a call per sample costs more)
+    const pixKey = pix ? pix.key : null;
+    const pixNormal = pix ? pix.normal : NO_FLOATS;
+    const pixObject = pix ? pix.object : null;
+    const objIndex = this.objectIndex;
     const shadowed = this.shadowMaps !== null;
     // top-left fill rule: a sample exactly on an edge shared by two triangles belongs to one of
     // them only (blended surfaces must not be drawn twice along their triangulation diagonals)
@@ -1196,7 +1203,17 @@ export class Rasterizer {
         color[row * 3 + 2] = b;
         cov[row] = 1;
         if (amb) amb[row] = packed >= 0 ? packed : packAmbient(ar, ag, ab, r, g, b);
-        if (pix) this.coverPixel(pix, pixRow + slot, z, nx, ny, nz);
+        if (pixKey !== null) {
+          // as `coverPixel`
+          const p = pixRow + slot;
+          if (z > pixKey[p]) {
+            pixKey[p] = z;
+            pixNormal[p * 3] = nx;
+            pixNormal[p * 3 + 1] = ny;
+            pixNormal[p * 3 + 2] = nz;
+            if (pixObject !== null) pixObject[p] = objIndex;
+          }
+        }
       }
     }
   }

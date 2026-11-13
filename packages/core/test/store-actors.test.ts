@@ -154,7 +154,9 @@ describe('store.add of an actor', () => {
     const r = t.run({ model: 'builtin:horse' });
     expect(r.ok, r.error).toBe(true);
     expect(t.doc.getObject(r.result.root)!.location).toEqual([3, -1, 0]);
-    expect(t.doc.getObject(r.result.root)!.custom_props[DESK_PROPS.heightM]).toBe(defaultActorHeight('horse'));
+    expect(t.doc.getObject(r.result.root)!.custom_props[DESK_PROPS.heightM]).toBe(
+      defaultActorHeight('horse'),
+    );
     near(r.result.dimensions_m, getCatalogEntry('horse')!.dimensions_m, 1e-4);
   });
 
@@ -195,7 +197,9 @@ describe('store.add of an actor', () => {
     const r = t.run({ model: 'horse', height_m: 2, width_m: 3, depth_m: 1, scale: 4 });
     expect(r.ok, r.error).toBe(true);
     expect(r.result.dimensions_m[2]).toBeCloseTo(2, 3);
-    expect(r.result.warnings).toEqual(["'horse' keeps its proportions: height_m sets its size, width_m and depth_m ignored"]);
+    expect(r.result.warnings).toEqual([
+      "'horse' keeps its proportions: height_m sets its size, width_m and depth_m ignored",
+    ]);
     expect(t.reports.filter((x) => x.level === 'WARNING').map((x) => x.message)).toEqual(r.result.warnings);
   });
 

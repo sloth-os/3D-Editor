@@ -255,9 +255,9 @@ const NON_TRANSFORM_FIELDS = new Set<string>([
 ]);
 
 /** F-curves or drivers stored in `map` by `<target_type>:<target_id>`, read without copying them. */
-function storedByTarget<T extends { target_type: AnimTargetType; target_id: string }>(
-  map: { values(): IterableIterator<unknown> },
-): Map<string, T[]> {
+function storedByTarget<T extends { target_type: AnimTargetType; target_id: string }>(map: {
+  values(): IterableIterator<unknown>;
+}): Map<string, T[]> {
   const out = new Map<string, T[]>();
   for (const v of map.values()) {
     const it = v as T;
@@ -312,7 +312,8 @@ function hashCurves(h: Hasher, curves: readonly FCurve[], until: number): void {
  * data (bone parents, follow-path curves), transitively, with the F-curves and drivers of all of
  * these. It over-approximates (any object id found in constraint or pose data counts), so an
  * unchanged key means unchanged transforms. Fields that never move an object (its name, materials,
- * visibility, custom properties…) are left out, so editing them keeps the key. With `until`, only
+ * visibility, custom properties…) are left out, so editing them keeps the key, except on objects a
+ * driver variable reads (a driver can turn any of their numbers into a transform). With `until`, only
  * the frames up to `until.get(id)` matter for object `id` (a body released at its start frame): an
  * input reached from such objects only is fingerprinted with the keys that decide those frames.
  * The F-curves are hashed where they are stored, not copied: a long animation costs a pass over its
@@ -334,6 +335,11 @@ export function animationInputsKey(
     } else if (Array.isArray(v)) for (const x of v) visitIdsIn(x, out, depth + 1);
     else if (v && typeof v === 'object') for (const x of Object.values(v)) visitIdsIn(x, out, depth + 1);
   };
+  /**
+   * Inputs a driver variable reads: any of their numeric or boolean fields (an object's color, its
+   * custom properties, its visibility) can drive a transform, so they are fingerprinted in full.
+   */
+  const read = new Set<string>();
   /** The inputs one input depends on (its parents, targets, data, driver variables). */
   const dependencies = (key: string): string[] => {
     const out: string[] = [];
@@ -348,7 +354,11 @@ export function animationInputsKey(
       }
     }
     for (const d of drivers.get(key) ?? [])
-      for (const v of d.variables ?? []) out.push(`${v.target_type}:${v.target_id}`);
+      for (const v of d.variables ?? []) {
+        const input = `${v.target_type}:${v.target_id}`;
+        read.add(input);
+        out.push(input);
+      }
     return out;
   };
   // every input reached, with the latest frame that matters for it (the bodies released latest first)
@@ -375,9 +385,11 @@ export function animationInputsKey(
     switch (type) {
       case 'object': {
         const o = objects.get(id);
-        data = o
-          ? Object.fromEntries(Object.entries(o).filter(([field]) => !NON_TRANSFORM_FIELDS.has(field)))
-          : null;
+        // a driver reads numbers and booleans (never a name): all of those of an object it reads count
+        const counts = read.has(key)
+          ? (field: string) => field !== 'name'
+          : (field: string) => !NON_TRANSFORM_FIELDS.has(field);
+        data = o ? Object.fromEntries(Object.entries(o).filter(([field]) => counts(field))) : null;
         break;
       }
       case 'armature':
@@ -493,11 +505,7 @@ function validEntry(
       if (sim) registerCache(key);
     } else {
       entry.token = token;
-      if (
-        entry.sim &&
-        entry.sim.frameEnd !== simulatedFrameEnd(params) &&
-        !entry.sim.setFrameEnd(params)
-      ) {
+      if (entry.sim && entry.sim.frameEnd !== simulatedFrameEnd(params) && !entry.sim.setFrameEnd(params)) {
         // other bodies are released past the new end than past the old one: the run starts over
         const sim = new Simulation(inputs, params, { reuse: entry.sim });
         entry.sim = sim;

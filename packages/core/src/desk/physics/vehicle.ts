@@ -22,9 +22,12 @@ import {
  * wheels `wheel.FL/FR/BL/BR` spinning about their local X with their origin at the hub, the front
  * wheels under `steer.FL/FR` pivots) driven along a smooth path through the points from where it
  * stands. The root is keyed on every frame along the path, facing along it (its front is −Y) and
- * pitched with its slope; each wheel turns by the distance driven over its radius (from its bounds);
- * the steering pivots turn toward the path's curvature ahead (Ackermann: atan(wheelbase · curvature),
- * at most ±35°, eased at 120°/s). The drive speeds up and slows down over up to 1.5 s at its ends.
+ * pitched with its slope; each wheel turns by the distance its own hub rolls (along the way it points,
+ * steered or not) over its radius (from its bounds), so on a curve the inner wheels turn less than the
+ * outer ones; the steering pivots turn toward the path's curvature ahead (Ackermann: atan(wheelbase ·
+ * curvature), at most ±35°, eased at 120°/s). The drive speeds up and slows down over up to 1.5 s at
+ * its ends. The root (not the rear axle) follows the path, so on a tight curve the wheels still slide
+ * a little sideways.
  */
 
 /** Largest steering angle (rad). */
@@ -42,6 +45,22 @@ const PATH_SAMPLES = 48;
 
 const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const len = (a: Vec3): number => Math.hypot(a[0], a[1], a[2]);
+const unit = (a: Vec3): Vec3 => {
+  const l = len(a);
+  return l > 1e-12 ? [a[0] / l, a[1] / l, a[2] / l] : [0, 0, 0];
+};
+
+/** `v` turned by `angle` (rad) about the unit axis `k` (Rodrigues). */
+function turned(v: Vec3, k: Vec3, angle: number): Vec3 {
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  const kv = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+  return [
+    v[0] * c + (k[1] * v[2] - k[2] * v[1]) * s + k[0] * kv * (1 - c),
+    v[1] * c + (k[2] * v[0] - k[0] * v[2]) * s + k[1] * kv * (1 - c),
+    v[2] * c + (k[0] * v[1] - k[1] * v[0]) * s + k[2] * kv * (1 - c),
+  ];
+}
 
 /** A smooth path sampled densely by arc length (centripetal Catmull–Rom through the points). */
 interface SampledPath {
@@ -207,6 +226,10 @@ export interface VehicleWheel {
   /** +1 when the wheel's local X points along the vehicle's +X (it turns forward with a positive angle), −1 when mirrored. */
   sign: number;
   front: boolean;
+  /** Where its hub is in the vehicle root's space (the point whose travel turns it). */
+  hub: Vec3;
+  /** Whether a steer.* pivot above it turns it (it rolls where the steering points). */
+  steered: boolean;
 }
 
 /** The wheels of a vehicle model (wheel.* parts) with their radii, and its steering pivots (steer.*). */
@@ -233,7 +256,23 @@ export function vehicleRig(
     if (!(radius > 1e-4)) continue;
     const inRoot = multiply4(toRoot, world);
     const front = /^f/i.test(m[1]) || /front/i.test(m[1]);
-    wheels.push({ id: part.id, radius, sign: inRoot[0] >= 0 ? 1 : -1, front });
+    let steered = false;
+    for (
+      let up = part.parent ? doc.getObject(part.parent) : null, n = 0;
+      up && up.id !== root.id && n < 64;
+      n++
+    ) {
+      if (/^steer[._]/i.test(baseName(up.name))) steered = true;
+      up = up.parent ? doc.getObject(up.parent) : null;
+    }
+    wheels.push({
+      id: part.id,
+      radius,
+      sign: inRoot[0] >= 0 ? 1 : -1,
+      front,
+      hub: [inRoot[12], inRoot[13], inRoot[14]],
+      steered,
+    });
     centres.push({ front, y: inRoot[13] });
   }
   const steering = parts.filter((p) => /^steer[._]/i.test(baseName(p.name)));
@@ -344,6 +383,10 @@ export function vehicleDrive(
   const restSpin = new Map(rig.wheels.map((w) => [w.id, doc.getObject(w.id)!.rotation_euler[0]]));
   const restSteer = new Map(rig.steering.map((p) => [p.id, p.rotation_euler[2]]));
   let delta = 0;
+  // each wheel's own distance rolled, where its hub was and the way it rolled at the previous frame
+  const rolled = new Map(
+    rig.wheels.map((w) => [w.id, { distance: 0, hub: null as Vec3 | null, way: [0, 0, 0] as Vec3 }]),
+  );
   for (let i = 0; i < frames; i++) {
     const f = o.frame_start + i;
     const t = i / fps;
@@ -363,11 +406,6 @@ export function vehicleDrive(
     rootSamples.frames.push(f);
     rootSamples.location.push(keys.location);
     rootSamples.rotation.push(keys.rotation_euler);
-    for (const w of rig.wheels) {
-      const s = spin.get(w.id)!;
-      s.frames.push(f);
-      s.values.push(restSpin.get(w.id)! + (w.sign * d) / w.radius);
-    }
     // steering toward the curvature half a wheelbase ahead, eased
     const target = Math.max(
       -VEHICLE_MAX_STEER,
@@ -379,6 +417,29 @@ export function vehicleDrive(
       const s = steer.get(p.id)!;
       s.frames.push(f);
       s.values.push(restSteer.get(p.id)! + delta);
+    }
+    // each wheel turns by the distance its own hub travels the way it rolls (its front, −Y, turned by the
+    // steering above it): on a curve the inner wheels roll less than the outer ones, none of them slides
+    const front = unit([-world[4], -world[5], -world[6]]);
+    const up = unit([world[8], world[9], world[10]]);
+    for (const w of rig.wheels) {
+      const r = rolled.get(w.id)!;
+      const hub: Vec3 = [
+        world[0] * w.hub[0] + world[4] * w.hub[1] + world[8] * w.hub[2] + world[12],
+        world[1] * w.hub[0] + world[5] * w.hub[1] + world[9] * w.hub[2] + world[13],
+        world[2] * w.hub[0] + world[6] * w.hub[1] + world[10] * w.hub[2] + world[14],
+      ];
+      const way = w.steered && rig.steering.length ? turned(front, up, delta) : front;
+      if (r.hub) {
+        const along = unit([r.way[0] + way[0], r.way[1] + way[1], r.way[2] + way[2]]);
+        const moved = sub(hub, r.hub);
+        r.distance += moved[0] * along[0] + moved[1] * along[1] + moved[2] * along[2];
+      }
+      r.hub = hub;
+      r.way = way;
+      const s = spin.get(w.id)!;
+      s.frames.push(f);
+      s.values.push(restSpin.get(w.id)! + (w.sign * r.distance) / w.radius);
     }
   }
   // before the drive everything keeps its own transform

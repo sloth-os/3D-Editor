@@ -28,13 +28,14 @@ import {
  * 'string_point' empty, else its origin) driven by the wind, gravity and, for a kite, aerodynamic
  * lift and drag, for a balloon buoyancy and drag. The string is inextensible: the flyer is never
  * farther from the anchor than its length, which pays out from the hand over launch_frames (the flyer
- * tugging a kite up when the wind alone climbs slower). The ground stops it: no corner of its bounds
- * goes below z = 0. The wind is steady with seeded gusts and lulls, so the same seed flies the same
- * flight. A kite settles where lift and drag balance its weight and the string's pull, 35–60° above
- * the horizon in a steady wind, and dips in the lulls; it faces the anchor (its front, −Y, along the
- * string), nose up. A tail of 4–6 damped segments trails from its bottom (the model's own 'tail'
+ * tugging a kite up when the wind alone climbs slower; with launch_frames 0 it is already flying on
+ * the whole string at frame_start, where the mean wind holds it). The ground stops it: no corner of
+ * its bounds goes below z = 0. The wind is steady with seeded gusts and lulls, so the same seed flies
+ * the same flight. A kite settles where lift and drag balance its weight and the string's pull, 35–60°
+ * above the horizon in a steady wind, and dips in the lulls; it faces the anchor (its front, −Y, along
+ * the string), nose up. A tail of 4–6 damped segments trails from its bottom (the model's own 'tail'
  * parts when it has them) and a thin string object (desk_role 'string', a cylinder along its local +Z
- * from the anchor to the bridle) is keyed to join them.
+ * from the anchor to the bridle) is keyed to join them; before the flight both shrink to a point.
  */
 
 /** Air density (kg/m³). */
@@ -73,6 +74,12 @@ export const TETHER_MAX_OBJECT_FRAMES = 2_000_000;
 export const TETHER_TAIL_SEGMENTS = 5;
 /** Radius of the string object (m): thin, the renderers draw strings as lines at least 2 px wide. */
 export const TETHER_STRING_RADIUS = 0.0015;
+/**
+ * Scale of the string and a new tail on all three axes before the flight: they shrink to a point
+ * (the 1 m string mesh to 1e-8 m), under the micrometre below which the export's string overlay
+ * (apps/server render/passes.ts stringPolyline) draws nothing, so no dot shows where the hand will be.
+ */
+export const TETHER_HIDDEN_SCALE = 1e-8;
 
 /** Custom properties that tie the objects a flight adds to their flyer (so a second flight reuses them). */
 const STRING_OF = 'desk_string_to';
@@ -339,6 +346,22 @@ function flyerShape(doc: SceneDoc, fs: FrameState, flyer: ObjectData): FlyerShap
   };
 }
 
+/**
+ * Elevation (rad) at which a flyer rests on its taut string in a steady wind of `mps` m/s: where the
+ * string's pull balances the air and its weight. A kite: tan θ = (lift − weight) / drag; a balloon: its
+ * buoyancy (lift − weight) over its drag, straight up in a calm. Null when the wind cannot hold it up.
+ */
+function steadyElevation(shape: FlyerShape, mps: number): number | null {
+  const air = 0.5 * AIR * shape.area * mps * mps;
+  const weight = 9.81 * shape.mass;
+  if (shape.kind === 'kite') {
+    const up = air * KITE_CL - weight;
+    return up > 0 ? Math.atan2(up, air * KITE_CD) : null;
+  }
+  const up = shape.lift - weight;
+  return up > 0 ? Math.atan2(up, air * BALLOON_CD) : null;
+}
+
 /** Rotation columns of a kite whose front (−Y) faces along `toAnchor`, nose up, rolled by `roll`. */
 function kiteAxes(toAnchor: Vec3, roll: number): [Vec3, Vec3, Vec3] {
   const y = mul(norm(toAnchor, [0, 1, 0]), -1);
@@ -590,6 +613,11 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
   let p = transform(flyerWorld0, shape.bridle);
   const startDistance = len(sub(p, a0));
   if (startDistance > L) p = add(a0, mul(sub(p, a0), L / startDistance));
+  // launch_frames 0: already flying at frame_start (a flight going on from an earlier shot), where the
+  // mean wind holds it on the taut string, downwind of the anchor; one the wind cannot hold up starts
+  // where it is
+  const steady = launchFrames === 0 ? steadyElevation(shape, o.wind_mps) : null;
+  if (steady !== null) p = add(a0, mul(add(mul(downwind, Math.cos(steady)), [0, 0, Math.sin(steady)]), L));
   p[2] = Math.max(p[2], clearanceAt(p, a0, 0));
   const lineStart = Math.min(L, Math.max(len(sub(p, a0)), 0.3));
   let v: Vec3 = [0, 0, 0];
@@ -782,14 +810,10 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
       const props = { ...previous.string!.custom_props, [STRING_FROM]: anchorObject.id };
       doc.updateObject(stringId, { custom_props: props, parent: null, constraints: [] });
     }
-    // hidden (a tenth of a millimetre long) before the flight
+    // hidden before the flight: shrunk to a point on every axis (TETHER_HIDDEN_SCALE)
     const before = o.frame_start - 1;
-    keys += writeChannel(doc, stringId, 'scale', 2, [before], [1e-4], {
-      interpolation: 'CONSTANT',
-      replace: [-Infinity, before],
-    });
-    for (let k3 = 0; k3 < 2; k3++)
-      keys += writeChannel(doc, stringId, 'scale', k3, [before], [1], {
+    for (let k3 = 0; k3 < 3; k3++)
+      keys += writeChannel(doc, stringId, 'scale', k3, [before], [TETHER_HIDDEN_SCALE], {
         interpolation: 'CONSTANT',
         replace: [-Infinity, before],
       });
@@ -865,12 +889,20 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
           s.rotation.push(t.rotation_euler);
         }
         keys += keyTransforms(doc, id, s, { replace: [-Infinity, Infinity] });
-        // hidden before the flight (a tenth of a millimetre), like the string
+        // hidden before the flight, like the string
         for (let k3 = 0; k3 < 3; k3++)
-          keys += writeChannel(doc, id, 'scale', k3, [o.frame_start - 1, o.frame_start], [1e-4, 1], {
-            interpolation: 'CONSTANT',
-            replace: [-Infinity, Infinity],
-          });
+          keys += writeChannel(
+            doc,
+            id,
+            'scale',
+            k3,
+            [o.frame_start - 1, o.frame_start],
+            [TETHER_HIDDEN_SCALE, 1],
+            {
+              interpolation: 'CONSTANT',
+              replace: [-Infinity, Infinity],
+            },
+          );
         tailObjects.push(id);
       }
       // segments of an earlier, longer tail are not needed any more

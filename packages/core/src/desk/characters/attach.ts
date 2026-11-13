@@ -1,8 +1,9 @@
 import type { Mat4, Vec3 } from '../../math/types';
-import { compose4, invert4, multiply4 } from '../../math/mat4';
-import { transformDirection3, transformPoint3 } from '../../math/vec3';
-import type { ConstraintData, ObjectData, PoseBone } from '../../doc/types';
+import { compose4, identity4, invert4, multiply4 } from '../../math/mat4';
+import { normalize3, sub3, transformDirection3, transformPoint3 } from '../../math/vec3';
+import type { ArmatureData, ConstraintData, ObjectData, PoseBone } from '../../doc/types';
 import { fcurveKey, type SceneDoc } from '../../doc/scene-doc';
+import { computePose } from '../../armature/pose';
 import { createConstraint } from '../../constraints/catalogue';
 import { axisLengths, matrixToCompatibleEuler } from '../../constraints/math';
 import { FrameState } from '../../eval/frame-state';
@@ -11,11 +12,12 @@ import { OperatorError } from '../../operators/context';
 import { uniqueName } from '../../util/names';
 import { DESK_PROPS } from '../props';
 import { keyPose } from './actor';
+import { legFrame, legRigs, solveLeg, type LegSolution } from './gait';
 import { blueprintFor, isHumanoidKind, requireBuiltKind } from './kinds';
 import { KeyWriter, bonePath } from './keys';
 import { humanoidStoop } from './mannequin';
-import { HUMAN_POSE_SPECS, groundedPose, humanRotations } from './poses';
-import { DEG, actorParts, requireActor, type ActorMeta } from './rig';
+import { HUMAN_POSE_SPECS, groundedPose, humanRotations, poseBones, type HumanPoseSpec } from './poses';
+import { DEG, actorParts, requireActor, rotEuler, type ActorMeta } from './rig';
 import { yawOf } from './locomotion';
 
 /*
@@ -217,10 +219,107 @@ function keyChannels(w: KeyWriter, id: string, frame: number, t: Channels, scale
   if (scale) w.key3(id, 'scale', frame, t.scale, 'CONSTANT');
 }
 
+const HOLD_PREFIX = 'Hold ';
+
 /**
- * The actor takes `propId` at `frame`: the prop moves into the hand (its middle against the palm,
- * keeping its orientation; animals take it in the mouth) and follows the hand until release_frame,
- * where it stays as it was seen. Returns the CHILD_OF constraint's name and the bone.
+ * The carrying posture of a holding arm (joint angles as poses.ts writes them): the upper arm a
+ * little forward and out, the forearm forward at the waist and turned slightly in, so what the hand
+ * holds is carried in front of the body (where rideo draws a held prop) instead of against the leg.
+ * LIMIT_ROTATION constraints on the upper arm and forearm (min = max, the bone's local rotation)
+ * force it over whatever the arm is keyed to do, their influence keyed with the hold.
+ */
+const HOLD_ARM: HumanPoseSpec = { arm: [16, 16], armOut: [10, 10], armTwist: [20, 20], elbow: [80, 80] };
+
+/** Frames the arm takes to come up into the carrying posture before the grab and to go down after the release. */
+export const HOLD_BLEND = 6;
+
+/** Offset (frames) before a release at which the held transform is read. */
+const RELEASE_EPS = 1e-3;
+
+/**
+ * Adds the carrying posture's constraints to one arm of a humanoid actor (named `Hold <prop>`),
+ * their influence keyed in `w`: up over HOLD_BLEND frames before `frame`, down after `release`.
+ */
+function holdArm(
+  doc: SceneDoc,
+  meta: ActorMeta,
+  side: 'L' | 'R',
+  propName: string,
+  frame: number,
+  release: number | undefined,
+  w: KeyWriter,
+): void {
+  const kind = requireBuiltKind(meta.kind);
+  if (!isHumanoidKind(kind)) return;
+  const { rot } = humanRotations(HOLD_ARM, humanoidStoop(kind), meta.height);
+  const obj = doc.getObject(meta.id)!;
+  const bones: Record<string, PoseBone> = { ...obj.pose.bones };
+  const arm = [`upper_arm.${side}`, `forearm.${side}`];
+  const taken = arm.flatMap((b) => (bones[b]?.constraints ?? []).map((c) => c.name));
+  const name = uniqueName(`${HOLD_PREFIX}${propName}`, taken);
+  for (const bone of arm) {
+    const pb = bones[bone];
+    const e = rot[bone];
+    if (!pb || !e) continue;
+    const c = createConstraint('LIMIT_ROTATION', {
+      name,
+      influence: 0,
+      show_expanded: false,
+      params: {
+        use_limit_x: true,
+        use_limit_y: true,
+        use_limit_z: true,
+        min_x: e[0],
+        max_x: e[0],
+        min_y: e[1],
+        max_y: e[1],
+        min_z: e[2],
+        max_z: e[2],
+        owner_space: 'LOCAL',
+      },
+    });
+    bones[bone] = { ...pb, constraints: [...(pb.constraints ?? []), c] };
+    const path = boneInfluence(bone, name);
+    w.clear(meta.id, path, 0, frame - HOLD_BLEND - 1, (release ?? frame) + HOLD_BLEND);
+    w.key(meta.id, path, 0, frame - HOLD_BLEND, 0);
+    w.key(meta.id, path, 0, frame, 1);
+    if (release !== undefined) {
+      w.key(meta.id, path, 0, release, 1);
+      w.key(meta.id, path, 0, release + HOLD_BLEND, 0);
+    }
+  }
+  doc.updateObject(meta.id, { pose: { ...obj.pose, bones } });
+}
+
+/**
+ * Keys a held object's own transform at `frame`, its release, where it is seen then: the CHILD_OF
+ * result (bone · inverse · its world transform as held) as its new local transform, so it stays
+ * there (or falls from there) once the constraint lets go.
+ */
+function keyRelease(
+  w: KeyWriter,
+  doc: SceneDoc,
+  propId: string,
+  actorId: string,
+  bone: string,
+  inverse: Readonly<Mat4>,
+  frame: number,
+): void {
+  const held = new FrameState(doc, frame - RELEASE_EPS);
+  const fr = new FrameState(doc, frame);
+  const b = fr.boneMatrix(actorId, bone);
+  if (!b) return;
+  const parent = fr.parent(propId);
+  const visual = multiply4(multiply4(b.matrix, inverse as Mat4), multiply4(parent, held.local(propId)));
+  const old = held.get<ObjectData>('object', propId)?.rotation_euler ?? [0, 0, 0];
+  keyChannels(w, propId, frame, channelsOf(multiply4(invert4(parent), visual), old));
+}
+
+/**
+ * The actor takes `propId` at `frame`: a person's arm comes up into a carrying posture (HOLD_ARM)
+ * and the prop moves into that hand (its middle against the palm, keeping its orientation; animals
+ * take it in the mouth), then follows the hand until release_frame, where it stays as it was seen
+ * and the arm goes down again. Returns the CHILD_OF constraint's name and the bone.
  */
 export function holdObject(
   doc: SceneDoc,
@@ -238,19 +337,25 @@ export function holdObject(
     throw new OperatorError(`'${prop.name}' is a parent of the actor and cannot be held`, 'INVALID_PARAMS');
   if (o.release_frame !== undefined && !(o.release_frame > o.frame))
     throw new OperatorError('release_frame must be after frame', 'INVALID_PARAMS');
-  const bone = human ? (o.hand === 'left' ? 'hand.L' : 'hand.R') : 'head';
+  const side = o.hand === 'left' ? 'L' : 'R';
+  const bone = human ? `hand.${side}` : 'head';
+  if (human) {
+    const wa = new KeyWriter();
+    holdArm(doc, meta, side, prop.name, o.frame, o.release_frame, wa);
+    wa.commit(doc);
+  }
   const fs = new FrameState(doc, o.frame);
   const hand = boneWorld(fs, meta.id, bone);
   const own = multiply4(fs.parent(prop.id), fs.local(prop.id));
   const seen = fs.world(prop.id) ?? own;
-  // the grip: on the palm side of the hand's middle (the palm of a hanging hand faces the body:
-  // +X, the character's left, for the right hand) or between an animal's jaws
-  const side = o.hand === 'left' ? -1 : 1;
+  // the grip: on the palm side of the hand's middle (the palm of a hanging or carrying hand faces
+  // the body: +X, the character's left, for the right hand) or between an animal's jaws
+  const sign = side === 'L' ? -1 : 1;
   const grip = transformPoint3(
     hand.matrix,
-    human ? [side * 0.012 * meta.height, 0.55 * hand.length, 0] : [0, 0.85 * hand.length, 0.03 * meta.height],
+    human ? [sign * 0.012 * meta.height, 0.55 * hand.length, 0] : [0, 0.85 * hand.length, 0.03 * meta.height],
   );
-  const palm = transformDirection3(hand.matrix, human ? [side, 0, 0] : [0, 0, 1]);
+  const palm = transformDirection3(hand.matrix, human ? [sign, 0, 0] : [0, 0, 1]);
   const desired = seen.slice() as Mat4;
   const box = subtreeBounds(doc, fs, prop.id);
   if (box) {
@@ -263,7 +368,7 @@ export function holdObject(
   const inverse = multiply4(multiply4(invert4(hand.matrix), desired), invert4(own));
   const list = [...(prop.constraints ?? [])];
   const name = uniqueName(
-    `Hold ${meta.name}`,
+    `${HOLD_PREFIX}${meta.name}`,
     list.map((x) => x.name),
   );
   list.push(
@@ -287,22 +392,47 @@ export function holdObject(
   const end = o.release_frame ?? o.frame;
   for (const p of ['location', 'rotation_euler', 'scale']) w.clear3(prop.id, p, o.frame - 1, end);
   keyChannels(w, prop.id, o.frame, local);
-  if (o.release_frame !== undefined) {
-    w.key(prop.id, ip, 0, o.release_frame, 0, 'CONSTANT');
-    // released where it is seen at that frame
-    const fr = new FrameState(doc, o.release_frame);
-    const handR = boneWorld(fr, meta.id, bone);
-    const parentR = fr.parent(prop.id);
-    const ownR = multiply4(parentR, compose4(local.location, local.rotation, local.scale));
-    const visual = multiply4(multiply4(handR.matrix, inverse), ownR);
-    keyChannels(w, prop.id, o.release_frame, channelsOf(multiply4(invert4(parentR), visual), local.rotation));
-  }
+  if (o.release_frame !== undefined) w.key(prop.id, ip, 0, o.release_frame, 0, 'CONSTANT');
   w.commit(doc);
+  if (o.release_frame !== undefined) {
+    // released where it is seen at that frame
+    const wr = new KeyWriter();
+    keyRelease(wr, doc, prop.id, meta.id, bone, inverse, o.release_frame);
+    wr.commit(doc);
+  }
   // a rigid body starts its dynamics at the release (MOTION's delayed bodies follow their
   // animated and constrained transform until their start_frame)
   if (o.release_frame !== undefined && prop.rigid_body)
     doc.updateObject(prop.id, { rigid_body: { ...prop.rigid_body, start_frame: o.release_frame } });
   return { constraint: name, bone };
+}
+
+/**
+ * Keys again where the objects `actorId` holds are let go, from its bones as animated now: a move,
+ * turn, pose or look keyed after a hold would otherwise leave a released prop where the hand was
+ * before. Every 1 → 0 step of the influence of a hold (a CHILD_OF on the actor named 'Hold …') is a
+ * release. Called after each move, turn, pose, look and ride (index.ts).
+ */
+export function refreshReleases(doc: SceneDoc, actorId: string): void {
+  const w = new KeyWriter();
+  for (const [id, y] of doc.map('objects').entries()) {
+    const list = (y as { get(key: string): unknown }).get('constraints');
+    if (id === actorId || !Array.isArray(list)) continue;
+    for (const c of list as ConstraintData[]) {
+      if (c.type !== 'CHILD_OF' || c.target !== actorId || !c.subtarget || !c.name.startsWith(HOLD_PREFIX))
+        continue;
+      const inverse = (c.params as { inverse_matrix?: unknown }).inverse_matrix;
+      if (!Array.isArray(inverse) || inverse.length !== 16) continue;
+      const fc = doc.getFCurve(
+        fcurveKey({ target_type: 'object', target_id: id, path: objectInfluence(c.name), index: 0 }),
+      );
+      const keys = [...(fc?.keyframes ?? [])].sort((a, b) => a.frame - b.frame);
+      for (let i = 1; i < keys.length; i++)
+        if (keys[i - 1].value >= 0.5 && keys[i].value < 0.5)
+          keyRelease(w, doc, id, actorId, c.subtarget, inverse as Mat4, keys[i].frame);
+    }
+  }
+  w.commit(doc);
 }
 
 // ---------------------------------------------------------------- ride
@@ -316,34 +446,89 @@ function mountGirth(doc: SceneDoc, mount: ActorMeta): number {
   return b ? Math.max(Math.abs(b.min[0]), Math.abs(b.max[0])) : 0.2 * mount.height;
 }
 
+/** The point under a rider's pelvis that sits on the saddle's head (character space at rest). */
+function riderSeat(arm: ArmatureData, height: number): Vec3 {
+  const hips = arm.bones.find((b) => b.name === 'hips');
+  return [0, 0.02 * height, (hips?.head[2] ?? 0.53 * height) - 0.075 * height];
+}
+
+/** A mount's barrel as a rider's legs go round it: half its width and height, and how far its axis is below the saddle's head. */
+interface Barrel {
+  halfWidth: number;
+  halfHeight: number;
+  drop: number;
+}
+
+function mountBarrel(doc: SceneDoc, mount: ActorMeta): Barrel {
+  const b = blueprintFor(requireBuiltKind(mount.kind), mount.height).barrel;
+  const saddle = doc.getArmature(mount.armature)?.bones.find((x) => x.name === 'saddle');
+  if (!b || !saddle) {
+    const g = mountGirth(doc, mount);
+    return { halfWidth: g, halfHeight: g, drop: g };
+  }
+  return { halfWidth: b.halfWidth, halfHeight: b.halfHeight, drop: saddle.head[2] - b.z };
+}
+
 /**
- * The ride pose of a rider whose mount's barrel is `girth` wide (half): the 'ride' pose with each
- * thigh swung out first (so the knees clear the barrel), then forward.
+ * The ride pose of a rider on a mount whose barrel is `barrel` (`k`: the mount's scale over the
+ * rider's): the 'ride' pose's back and arms, and each leg solved (the gait's two-bone leg IK) so the
+ * ankle hangs just outside the barrel's widest part under the hip, the knee turned out until it
+ * clears the barrel and the foot level in the stirrup.
  */
-function ridePose(doc: SceneDoc, rider: ActorMeta, girth: number): Record<string, PoseBone> {
+function ridePose(doc: SceneDoc, rider: ActorMeta, barrel: Barrel, k: number): Record<string, PoseBone> {
   const kind = requireBuiltKind(rider.kind);
   if (!isHumanoidKind(kind))
     throw new OperatorError(`The rider must be a person (got a ${kind})`, 'INVALID_PARAMS');
   const bp = blueprintFor(kind, rider.height);
   const arm = doc.getArmature(rider.armature);
   if (!arm) throw new OperatorError(`Actor '${rider.name}' has no armature data`, 'FAILED');
-  const thigh = arm.bones.find((b) => b.name === 'thigh.L');
-  const hipX = thigh ? Math.abs(thigh.head[0]) : 0.09 * rider.height;
-  const len = thigh
-    ? Math.hypot(thigh.tail[0] - thigh.head[0], thigh.tail[1] - thigh.head[1], thigh.tail[2] - thigh.head[2])
-    : 0.25 * rider.height;
-  const spread = Math.asin(Math.max(0.12, Math.min(0.92, (girth + 0.04 * rider.height - hipX) / len)));
-  const spec = HUMAN_POSE_SPECS.ride;
-  const { rot } = humanRotations(spec, humanoidStoop(kind), rider.height);
-  for (const s of ['L', 'R'] as const) {
-    const out = s === 'L' ? -1 : 1;
-    const hip = (spec.hip?.[0] ?? 60) * DEG;
-    // R = Rx(−hip) · Rz(out · spread): swing out about the back axis, then forward
-    const m = multiply4(
-      compose4([0, 0, 0], [-hip, 0, 0], [1, 1, 1]),
-      compose4([0, 0, 0], [0, 0, out * spread], [1, 1, 1]),
-    );
-    rot[`thigh.${s}`] = matrixToCompatibleEuler(m, [-hip, 0, 0]);
+  const h = rider.height;
+  const { rot } = humanRotations(HUMAN_POSE_SPECS.ride, humanoidStoop(kind), h);
+  // the barrel in the rider's character space: an ellipse across, its axis below the seat
+  const seat = riderSeat(arm, h);
+  const W = barrel.halfWidth * k;
+  const R = barrel.halfHeight * k;
+  const zc = seat[2] - barrel.drop * k;
+  const halfWidthAt = (z: number) => {
+    const t = (z - zc) / R;
+    return Math.abs(t) >= 1 ? 0 : W * Math.sqrt(1 - t * t);
+  };
+  const pose = computePose(arm, poseBones(arm, rot, [0, 0, 0]), {
+    frame: 0,
+    armatureMatrix: identity4(),
+    getWorldMatrix: () => null,
+  });
+  const limb = 0.04 * h;
+  for (const leg of legRigs(arm, 'humanoid')) {
+    const parent = pose.bones.get(leg.parent)?.matrix;
+    if (!parent) continue;
+    const frame = legFrame(leg, parent);
+    // the ankle on the barrel's side (a limb's thickness off it), a little below its widest line,
+    // or as low on it as a short leg (a child on a horse) reaches: never through the barrel
+    const hip: Vec3 = [frame[12], frame[13], frame[14]];
+    const reach = 0.97 * (leg.L1 + leg.L2);
+    const onSide = (phi: number): Vec3 => [
+      leg.side * (W + limb) * Math.sin(phi),
+      seat[1] + 0.03 * h,
+      zc + (R + limb) * Math.cos(phi),
+    ];
+    let phi = Math.acos(Math.max(-1, Math.min(1, (-0.2 * R) / (R + limb))));
+    while (phi > 0.3 && Math.hypot(...sub3(onSide(phi), hip)) > reach) phi -= 2 * DEG;
+    const ankle = onSide(phi);
+    let sol: LegSolution | null = null;
+    for (let out = 10; out <= 50; out += 5) {
+      const a = out * DEG;
+      const heading: Vec3 = [leg.side * Math.sin(a), -Math.cos(a), 0];
+      const foot = normalize3([leg.side * Math.sin(a), -Math.cos(a), 0.08]);
+      sol = solveLeg(leg, frame, ankle, foot, heading, null);
+      const knee = transformPoint3(multiply4(frame, rotEuler(sol.upper)), [0, leg.L1, 0]);
+      if (Math.abs(knee[0]) >= halfWidthAt(knee[2]) + limb) break;
+    }
+    if (!sol) continue;
+    rot[leg.upper] = sol.upper;
+    rot[leg.lower] = sol.lower;
+    rot[leg.foot] = sol.foot;
+    if (leg.toe) rot[leg.toe] = sol.toe;
   }
   return groundedPose(arm, bp.probes, rot, [0, 0, 0], 'none');
 }
@@ -367,7 +552,7 @@ export function mountActor(
     throw new OperatorError(`The rider must be a person (got a ${rider.kind})`, 'INVALID_PARAMS');
   if (isHumanoidKind(mk) || !doc.getArmature(mount.armature)?.bones.some((b) => b.name === 'saddle'))
     throw new OperatorError(
-      `'${mount.name}' (${mk}) has no saddle bone: riders mount horses and ponies`,
+      `'${mount.name}' (${mk}) has no saddle bone: riders mount horses, ponies, donkeys and cows`,
       'INVALID_PARAMS',
     );
   if (doc.isAncestor(rider.id, mount.id))
@@ -383,13 +568,16 @@ export function mountActor(
   const girth = mountGirth(doc, mount);
   const riderObj = doc.getObject(rider.id)!;
   const live = fs.get<ObjectData>('object', rider.id)?.pose?.bones ?? riderObj.pose.bones;
-  writeRidePose(doc, rider.id, live, ridePose(doc, rider, girth), o.frame);
+  // the mount's size relative to the rider's (object scales)
+  const mountScale = axisLengths(fs.world(mount.id) ?? identity4())[0];
+  const riderScale = axisLengths(fs.world(rider.id) ?? identity4())[0];
+  const k = mountScale > 1e-9 && riderScale > 1e-9 ? mountScale / riderScale : 1;
+  writeRidePose(doc, rider.id, live, ridePose(doc, rider, mountBarrel(doc, mount), k), o.frame);
 
   // the seat (under the pelvis, character space) on the saddle's head, facing the mount's way
-  const hips = doc.getArmature(rider.armature)!.bones.find((b) => b.name === 'hips');
-  const seat: Vec3 = [0, 0.02 * rider.height, (hips?.head[2] ?? 0.53 * rider.height) - 0.075 * rider.height];
+  const seat = riderSeat(doc.getArmature(rider.armature)!, rider.height);
   const yaw = yawOf(transformDirection3(saddle.matrix, [0, 1, 0]));
-  const s = transformPoint3(compose4([0, 0, 0], [0, 0, yaw], [1, 1, 1]), seat);
+  const s = transformPoint3(compose4([0, 0, 0], [0, 0, yaw], riderObj.scale), seat);
   const worldR = compose4(
     [saddle.matrix[12] - s[0], saddle.matrix[13] - s[1], saddle.matrix[14] - s[2]],
     [0, 0, yaw],
