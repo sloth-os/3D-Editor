@@ -337,7 +337,7 @@ describe('browser export (in process)', () => {
 
     // the manifest: the server's fields, the files as written, the browser's own block
     expect(manifest).toMatchObject({
-      version: 1,
+      version: 2,
       project: { id: 'p1', name: 'Kite Day' },
       created_at: '2026-11-14T10:00:00.000Z',
       fps: 24,

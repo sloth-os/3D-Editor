@@ -312,7 +312,7 @@ describe('VideoExports', { timeout: 30_000 }, () => {
     expect(await stat(path.join(dirOf, 'snapshot.ybin')).catch(() => null)).toBeNull();
     const manifest = JSON.parse(await readFile(path.join(dirOf, 'manifest.json'), 'utf8'));
     expect(manifest).toMatchObject({
-      version: 1,
+      version: 2,
       frames: 24,
       width: 32,
       height: 18,
