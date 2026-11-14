@@ -31,6 +31,10 @@ _Bottom area → Diagnostics_ shows the live numbers and recent spans in the app
     `persistence_duration_seconds{op}`, `http_requests_total`, `http_request_duration_seconds`,
     `mcp_sessions`, `mcp_tool_calls_total{tool,status}`, `mcp_tool_duration_seconds{tool}`,
     `telemetry_payloads_total`, `telemetry_forward_failures_total`, plus Node.js runtime metrics
+  - video export, model store and rideo: `video_exports_total{status}`,
+    `video_export_frames_total`, `video_export_seconds`, `video_exports_active`,
+    `store_searches_total{provider,status}`, `store_downloads_total{provider,status}`,
+    `store_download_bytes_total`, `rideo_requests_total{op,status}`
   - aggregated from browsers: `editor_operator_executions_total{operator,source,status}`,
     `editor_operator_duration_seconds{operator}`, `editor_client_spans_total`,
     `editor_client_logs_total{severity}`, `editor_fps`, `editor_frame_time_seconds`,

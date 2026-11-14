@@ -290,7 +290,15 @@ export function registerUiOperators(reg: OperatorRegistry): void {
   const toggle = (
     id: string,
     label: string,
-    key: 'xray' | 'overlays' | 'sidebar' | 'toolbar' | 'showWireframe' | 'snapping',
+    key:
+      | 'xray'
+      | 'overlays'
+      | 'sidebar'
+      | 'toolbar'
+      | 'showWireframe'
+      | 'snapping'
+      | 'followShots'
+      | 'cameraGuides',
     description: string,
   ) =>
     reg.register(
@@ -333,6 +341,21 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     'Show wireframe on top of shaded objects.',
   );
   toggle('view3d.toggle_snapping', 'Snapping', 'snapping', 'Snap transforms to increments (Shift+Tab).');
+  toggle(
+    'view3d.toggle_follow_shots',
+    'Follow Shots',
+    'followShots',
+    'Look through the cameras of the shots (director desk): in camera view the viewport shows the camera ' +
+      'of the first enabled shot in cut order that covers the current frame (the shot picked on the ' +
+      'sequence strip while it covers it), the scene camera between shots; F12 renders through the same ' +
+      "camera and Render Animation through the camera of each frame's shot.",
+  );
+  toggle(
+    'view3d.toggle_camera_guides',
+    'Camera Guides',
+    'cameraGuides',
+    'Show rule-of-thirds lines and the action-safe frame (93% of the picture) over the camera view.',
+  );
   reg.register(
     defineOperator({
       id: 'view3d.toggle_shading',
@@ -581,6 +604,21 @@ export function registerUiOperators(reg: OperatorRegistry): void {
   );
   reg.register(
     defineOperator({
+      id: 'wm.export_video',
+      label: 'Export Video…',
+      description:
+        'Open the Export Video window: render the shots of the director desk as video files on the ' +
+        'server (Ctrl+Shift+F12).',
+      category: 'Render',
+      ...ui,
+      schema: z.object({}),
+      execute() {
+        openDialog('export-video');
+      },
+    }),
+  );
+  reg.register(
+    defineOperator({
       id: 'render.render',
       label: 'Render Image',
       description:
@@ -631,7 +669,9 @@ export function registerUiOperators(reg: OperatorRegistry): void {
       description: 'Switch the workspace layout.',
       category: 'Window',
       ...ui,
-      schema: z.object({ name: z.enum(['Layout', 'Modeling', 'Shading', 'Animation', 'Scripting']) }),
+      schema: z.object({
+        name: z.enum(['Layout', 'Modeling', 'Shading', 'Animation', 'Scripting', 'Director']),
+      }),
       execute(_ctx, p) {
         workspace.value = p.name as Workspace;
         const v = session.value?.view;

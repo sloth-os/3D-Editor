@@ -163,6 +163,21 @@ export interface RigidBodyData {
   collision_margin: number;
   linear_damping: number;
   angular_damping: number;
+  /**
+   * Frame at which an ACTIVE body starts to be simulated (null = the rigid body world's
+   * frame_start): before it the body follows its animated / parented / constrained transform, as
+   * an Animated (kinematic) body does (a held or thrown prop). An integer within ±1e6.
+   */
+  start_frame: number | null;
+  /** Velocity (m/s, world space) the body gets when its simulation starts, each component ±1000. */
+  initial_linear_velocity: Vec3;
+  /** Angular velocity (rad/s, world space) the body gets when its simulation starts, each ±1000. */
+  initial_angular_velocity: Vec3;
+  /**
+   * Whether the body also keeps the velocity its animated transform had at start_frame (a prop
+   * released from a moving hand), added to the initial velocities.
+   */
+  inherit_velocity: boolean;
 }
 
 export type SplineType = 'POLY' | 'BEZIER' | 'NURBS';
@@ -478,6 +493,150 @@ export interface SceneSettings {
   use_gravity: boolean;
   gravity: Vec3;
   rigidbody_world: RigidBodyWorld;
+  /**
+   * Director's desk: the shots of the cut, in cut order. Read and write them only through
+   * desk/shots.ts (getShots / setShots), which sanitizes them against the document; the whole array
+   * is one last-writer-wins value.
+   */
+  shots: ShotData[];
+  /** Director's desk settings (desk/shots.ts getDeskSettings / setDeskSettings). */
+  desk: DeskSettings;
+}
+
+/*
+ * Director's desk (shots, cameras and their planned screen layout). The enums mirror rideo's
+ * lowercase strings; each list is the source of its union type, so the two never disagree.
+ */
+
+/** Shot framing (rideo `camera.framing`). */
+export const DESK_FRAMINGS = [
+  'extreme_wide',
+  'wide',
+  'medium',
+  'medium_close',
+  'close_up',
+  'extreme_close_up',
+  'over_shoulder',
+  'pov',
+  'insert',
+] as const;
+export type DeskFraming = (typeof DESK_FRAMINGS)[number];
+
+/** Camera angle around the subjects (rideo CameraSpec `angle`). */
+export const DESK_ANGLES = [
+  'front',
+  'three_quarter_left',
+  'three_quarter_right',
+  'profile_left',
+  'profile_right',
+  'back',
+  'over_shoulder',
+  'pov',
+] as const;
+export type DeskAngle = (typeof DESK_ANGLES)[number];
+
+/** Camera height (rideo CameraSpec `height`). */
+export const DESK_HEIGHTS = ['eye', 'low', 'high', 'overhead'] as const;
+export type DeskHeight = (typeof DESK_HEIGHTS)[number];
+
+/** Camera moves: rideo's move library ids (`camera.move`). */
+export const DESK_MOVES = [
+  'locked_off',
+  'push_in',
+  'pull_out',
+  'dolly_left',
+  'dolly_right',
+  'pan_left',
+  'pan_right',
+  'tilt_up',
+  'tilt_down',
+  'tracking_follow',
+  'steadicam_walk',
+  'orbit_left',
+  'orbit_right',
+  'crane_up',
+  'crane_down',
+  'whip_pan',
+  'handheld',
+  'dolly_zoom',
+  'drone_flyover',
+  'rack_focus',
+] as const;
+export type DeskMove = (typeof DESK_MOVES)[number];
+
+/** Where a subject is on screen (frame thirds). */
+export const DESK_SIDES = ['left', 'centre', 'right'] as const;
+export type DeskSide = (typeof DESK_SIDES)[number];
+
+/** Which way a subject faces on screen. */
+export const DESK_FACINGS = ['left', 'right', 'camera', 'away'] as const;
+export type DeskFacing = (typeof DESK_FACINGS)[number];
+
+/** How a shot follows the shot before it in the cut. */
+export const DESK_CONTINUITIES = ['cut', 'continuous'] as const;
+export type DeskContinuity = (typeof DESK_CONTINUITIES)[number];
+
+/** One subject's planned place on screen (rideo PlannedPlacement); `subject` is an object id. */
+export interface DeskLayoutEntry {
+  subject: string;
+  side: DeskSide;
+  facing: DeskFacing;
+}
+
+/** Where a shot came from outside the editor (a rideo clip's shot), for round trips. */
+export interface ShotExternalRef {
+  source: 'rideo';
+  project: string | null;
+  clip: string | null;
+  shot: string | null;
+  index: number | null;
+}
+
+/** One shot of the cut: a camera over a range of scene frames, with what it should show. */
+export interface ShotData {
+  /** 16 base62 characters, like object ids. */
+  id: string;
+  /** At most 64 characters. */
+  name: string;
+  /** Disabled shots are skipped by the cut (sequence timing, exports, cameraForFrame). */
+  enabled: boolean;
+  /** CAMERA object id (null: none yet). */
+  camera: string | null;
+  /** Scene frames, inclusive; frame_end ≥ frame_start. */
+  frame_start: number;
+  frame_end: number;
+  /** At most 2000 characters. */
+  notes: string;
+  framing: DeskFraming | null;
+  angle: DeskAngle | null;
+  height: DeskHeight | null;
+  move: DeskMove | null;
+  /** Lens focal length the shot asks for, 8–800 mm (null: the framing's default). */
+  lens_mm: number | null;
+  /** Object ids of the shot's subjects (at most 16). */
+  subjects: string[];
+  /** Planned screen layout (at most 16 entries, one per subject); [] = none. */
+  layout: DeskLayoutEntry[];
+  /** 'continuous': the action continues from the previous shot (no jump of marks between them). */
+  continuity: DeskContinuity;
+  /** Frames before frame_start that are simulated / animated but never exported (≥ 0). */
+  pre_roll: number;
+  external: ShotExternalRef | null;
+}
+
+/** Director's desk settings of a scene. */
+export interface DeskSettings {
+  /** Size of the set in metres (0 = unknown). */
+  set_width: number;
+  set_depth: number;
+  interior: boolean;
+  /** The two actors (object ids) whose line of action is the 180° line (null = chosen automatically). */
+  main_pair: [string, string] | null;
+  /** Width / height the shots were solved for (null = the render resolution's). */
+  aspect: number | null;
+  /** Longest / shortest take the video model makes, seconds (rideo's clamp; null = no clamp). */
+  max_shot_s: number | null;
+  min_shot_s: number | null;
 }
 
 export interface RigidBodyWorld {

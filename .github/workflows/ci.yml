@@ -40,12 +40,17 @@ jobs:
     name: Integration tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      # the video export and rideo tests run instead of skipping when ffmpeg is missing
+      FFMPEG_REQUIRED: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: npm ci --no-audit --no-fund
       - run: npm run test:integration
 
@@ -53,12 +58,17 @@ jobs:
     name: End-to-end tests (Playwright)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # the Export Video spec runs instead of skipping when the server finds no ffmpeg
+      FFMPEG_REQUIRED: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: npm ci --no-audit --no-fund
       - name: Install Playwright browser
         run: npx playwright install --with-deps chromium

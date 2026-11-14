@@ -27,7 +27,6 @@ import {
   movedLayerWrites,
   shapeKeyWrites,
   vertexGroupWrites,
-  type LayerKind,
   type LayerWrites,
   type ShapeKeyChange,
   type VertexGroupChange,
@@ -38,8 +37,25 @@ import {
   insertManyWrites,
   keyframeInsertWrites,
   rigidBodyBakeWrites,
-  type KeyframeWrites,
 } from './memory-keyframes';
+import {
+  OPERATOR_FIXED_BYTES,
+  decodedFaces,
+  keyframeEstimate,
+  oneObject,
+  refObjects,
+  withObjects,
+  type Estimator,
+  type OperatorEstimate,
+} from './memory-base';
+import {
+  DESK_ACTOR_ESTIMATES,
+  DESK_BOUNDED_GROWTH_PARAMETERS,
+  DESK_MOTION_ESTIMATES,
+  DESK_SHOT_ESTIMATES,
+  DESK_UNESTIMATED_OPERATORS,
+  STORE_ESTIMATES,
+} from './memory-desk';
 import { isGLB } from '../io/glb';
 import { sanitizeRigidBodyWorld } from '../physics/settings';
 import {
@@ -73,6 +89,23 @@ import {
   type NewObjects,
 } from './memory-objects';
 
+export {
+  OPERATOR_FIXED_BYTES,
+  keyframeEstimate,
+  oneObject,
+  refObjects,
+  withObjects,
+  type Estimator,
+  type OperatorEstimate,
+} from './memory-base';
+export {
+  DESK_ACTOR_ESTIMATES,
+  DESK_BOUNDED_GROWTH_PARAMETERS,
+  DESK_MOTION_ESTIMATES,
+  DESK_SHOT_ESTIMATES,
+  DESK_UNESTIMATED_OPERATORS,
+  STORE_ESTIMATES,
+} from './memory-desk';
 export { GENERATOR_LOWER, ISOSURFACE_FACES_PER_CELL, generatorFaces } from './memory-generators';
 export {
   BAKE_BYTES_PER_OBJECT_FRAME,
@@ -81,9 +114,11 @@ export {
   BAKE_HEAP_BYTES,
   BAKE_TRANSFORMS_MAX_FRAMES,
   DRIVER_ADD_BYTES,
+  FRAME_STATE_BYTES_PER_CONSTRAINT,
   FRAME_STATE_BYTES_PER_DRIVER,
   FRAME_STATE_BYTES_PER_KEYFRAME,
   FRAME_STATE_BYTES_PER_OBJECT,
+  FRAME_STATE_BYTES_PER_POSE_BONE,
   INSERT_MANY_BYTES_PER_KEYFRAME,
   INSERT_MANY_REWRITE_BYTES,
   KEYFRAME_COPY_BYTES,
@@ -94,8 +129,13 @@ export {
   KEYFRAME_REWRITE_BYTES,
   RIGID_BODY_BAKE_BYTES,
   RIGID_BODY_BAKE_BYTES_PER_BODY_FRAME,
+  bakeTransformsWrites,
   frameSamplingBytes,
   frameStateBytes,
+  insertManyWrites,
+  keyframeInsertWrites,
+  newKeyframesWrites,
+  rigidBodyBakeWrites,
   type KeyframeWrites,
 } from './memory-keyframes';
 export {
@@ -186,48 +226,6 @@ export {
  * every operator is one of the two.
  */
 
-/** The estimated memory of one operator run. */
-export interface OperatorEstimate {
-  /**
-   * JavaScript heap the run takes at its peak beyond what is in use before it (bytes), the decoded
-   * size of the geometry it stores included.
-   */
-  bytes: number;
-  /** Faces of the mesh(es) it builds or edits, for messages (0: none). */
-  faces: number;
-  /**
-   * Heap the document keeps of what it adds (0 when it adds nothing): the decoded size of the
-   * meshes it adds, and its new objects and datablocks (memory-objects.ts).
-   */
-  addedStoredBytes: number;
-  /**
-   * Heap a save of the project takes for a moment for what it adds, beyond addedStoredBytes
-   * (memory-objects.ts saveBytes of its new objects, datablocks and keyframes; 0 or absent: none).
-   */
-  addedSaveBytes?: number;
-  /** Objects it adds (for messages; 0 or absent: none). */
-  objects?: number;
-  /** Keyframes it adds at most (for messages; 0 or absent: none). */
-  keyframes?: number;
-  /**
-   * Bytes of rigid body frames it simulates that the document's cache keeps afterwards (physics/
-   * memory.ts; part of addedStoredBytes, not saved; 0 or absent: none).
-   */
-  simulationBytes?: number;
-  /** Meshes it builds when more than one (an import; for messages, with `faces` their faces in all). */
-  meshes?: number;
-  /**
-   * The vertex groups or shape keys of meshes it writes (memory-layers.ts; for messages: their kind and
-   * bytes, the more of before and after); absent: none.
-   */
-  layers?: { kind: LayerKind; bytes: number };
-  /**
-   * What to lower for a smaller result, completing "Lower …" (e.g. "number_cuts"); empty when the
-   * operator adds next to nothing (a cube).
-   */
-  lower: string;
-}
-
 /** What an {@link OperatorMemoryCheck} is asked before an operator runs. */
 export interface OperatorMemoryRequest {
   /** Operator id, e.g. "mesh.subdivide". */
@@ -256,16 +254,7 @@ export interface OperatorMemoryRequest {
 /** Returns null to run the operator, or why it is not run (it then fails with code OUT_OF_MEMORY). */
 export type OperatorMemoryCheck = (req: OperatorMemoryRequest) => string | null;
 
-type Estimator = (ctx: OperatorContext, params: Record<string, unknown>) => OperatorEstimate | null;
-
 // ---------------------------------------------------------------- measured constants
-
-/**
- * Garbage an operator's run leaves in V8's young generation before a scavenge collects it, part of
- * every peak measured with --trace-gc (bytes): what small runs show beyond their per-face cost.
- * Every estimate includes it.
- */
-export const OPERATOR_FIXED_BYTES = 32 * 1024 * 1024;
 
 /**
  * Peak heap per face of the edited mesh of Edit Mode operators that do not add faces, beyond
@@ -482,45 +471,7 @@ function storedLayout(doc: SceneDoc, meshId: string | null | undefined): MeshLay
   return c ? { vertices: c.vertices, faces: c.faces, corners: c.corners, uvs: true, colors: false } : null;
 }
 
-/** Decoded bytes of a mesh of `faces` faces of `cornersPerFace` corners with UVs (vertices ≈ faces). */
-function decodedFaces(faces: number, cornersPerFace = 4): number {
-  return decodedMeshBytes({
-    vertices: faces,
-    faces,
-    corners: faces * cornersPerFace,
-    uvs: true,
-    colors: false,
-  });
-}
-
 const EMPTY: MeshLayout = { vertices: 0, faces: 0, corners: 0, uvs: false, colors: false };
-
-/**
- * `e` with the objects and datablocks an operator adds (memory-objects.ts): their peak heap on top
- * of its own, and what the document keeps of them added to what it stores. An operator with no
- * estimate of its own gets the young generation's garbage (OPERATOR_FIXED_BYTES) and these, and
- * `lower` (also when `e` has nothing to lower).
- */
-function withObjects(e: OperatorEstimate | null, a: NewObjects, lower = ''): OperatorEstimate | null {
-  const datablocks = Object.values(a.datablocks ?? {}).reduce((n, k) => n + (k ?? 0), 0);
-  if (!(a.objects > 0) && !(datablocks > 0)) return e;
-  const { peak, stored } = newObjectsBytes(a);
-  return {
-    ...e,
-    bytes: (e?.bytes ?? OPERATOR_FIXED_BYTES) + peak,
-    faces: e?.faces ?? 0,
-    addedStoredBytes: (e?.addedStoredBytes ?? 0) + stored,
-    addedSaveBytes: (e?.addedSaveBytes ?? 0) + saveBytes(stored),
-    objects: (e?.objects ?? 0) + Math.max(0, a.objects),
-    lower: e?.lower || lower,
-  };
-}
-
-/** One new object (and its datablock of `kind`, if any): the add operators. */
-const oneObject =
-  (kind: CountedKind | null, lower = ''): Estimator =>
-  () =>
-    withObjects(null, { objects: 1, datablocks: kind ? { [kind]: 1 } : {} }, lower);
 
 /** The mesh edited in Edit Mode and the sizes of its selection, or null outside mesh Edit Mode. */
 interface EditGeometry {
@@ -1329,6 +1280,39 @@ const importOperator =
   };
 
 /**
+ * store.insert_files, an import of a downloaded store model: its main file as the import_* operator
+ * of its format counts it ({@link importEstimate}); the other files it names (buffers, textures,
+ * material files) counted as embedded images are (IMPORT_BYTES_PER_IMAGE_BYTE at the peak, kept by
+ * the project and copied by a save), which errs on the safe side for buffers; and the EMPTY root the
+ * model is wrapped in.
+ */
+const storeInsertFiles: Estimator = (_ctx, p) => {
+  const files =
+    p.files && typeof p.files === 'object' && !Array.isArray(p.files)
+      ? (p.files as Record<string, unknown>)
+      : {};
+  const main = String(p.main ?? '');
+  const data = files[main];
+  const file = base64Reader(typeof data === 'string' ? data : '');
+  const format = String(p.format ?? 'glb');
+  const e = importEstimate(format === 'gltf' && isGLB(file.read(0, 4)) ? 'glb' : format, file);
+  let companions = 0;
+  for (const [path, v] of Object.entries(files))
+    if (path !== main && typeof v === 'string') companions += base64Reader(v).byteLength;
+  const images = IMPORT_BYTES_PER_IMAGE_BYTE * companions;
+  return withObjects(
+    {
+      ...e,
+      bytes: e.bytes + images,
+      addedStoredBytes: e.addedStoredBytes + companions,
+      addedSaveBytes: (e.addedSaveBytes ?? 0) + SAVE_BYTES_PER_IMAGE_BYTE * companions,
+      lower: images > e.bytes - OPERATOR_FIXED_BYTES ? IMPORT_LOWER.images : e.lower,
+    },
+    { objects: 1 },
+  );
+};
+
+/**
  * export_*: the faces the file holds: the objects shown in renders (or the selected ones), their
  * modifiers applied when apply_modifiers is on (render settings), curves and text by their surfaces,
  * and the particle and collection instances these objects generate, each written as a mesh of its
@@ -1701,41 +1685,6 @@ const modeSet: Estimator = (ctx, p) => {
   return editModeEstimate(ctx.doc, o.data);
 };
 
-/**
- * An operator that writes keyframes (memory-keyframes.ts); null when it fails by itself. The rigid body
- * frames a bake simulates count with what the project keeps (its cache holds them), not saved.
- */
-function keyframeEstimate(w: KeyframeWrites | null): OperatorEstimate | null {
-  if (!w) return null;
-  const simulation = w.simulation ?? 0;
-  return {
-    bytes: OPERATOR_FIXED_BYTES + w.bytes,
-    faces: 0,
-    addedStoredBytes: w.stored + simulation,
-    addedSaveBytes: w.save,
-    keyframes: w.keys,
-    ...(simulation > 0 ? { simulationBytes: simulation } : {}),
-    lower: w.lower,
-  };
-}
-
-/**
- * The objects `refs` names (ids or names, each once; unknown ones left out: the operator reports
- * them itself), or the selected objects without any.
- */
-function refObjects(ctx: OperatorContext, refs: unknown): ObjectData[] {
-  const list = Array.isArray(refs) && refs.length ? refs.map(String) : ctx.state.selectedIds;
-  const seen = new Set<string>();
-  const out: ObjectData[] = [];
-  for (const r of list) {
-    const o = ctx.doc.getObject(r) ?? ctx.doc.resolveObject(r);
-    if (!o || seen.has(o.id)) continue;
-    seen.add(o.id);
-    out.push(o);
-  }
-  return out;
-}
-
 /** anim.bake_transforms (memory-keyframes.ts bakeTransformsWrites). */
 const bakeTransforms: Estimator = (ctx, p) => {
   const scene = ctx.doc.getScene();
@@ -2092,6 +2041,12 @@ export const OPERATOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
       'wheel',
     ].map((k) => [`object.generate_${k}`, generator(k)]),
   ),
+  // the director's desk and the model store (memory-desk.ts); store.insert_files is an import
+  ...DESK_SHOT_ESTIMATES,
+  ...DESK_ACTOR_ESTIMATES,
+  ...DESK_MOTION_ESTIMATES,
+  ...STORE_ESTIMATES,
+  'store.insert_files': storeInsertFiles,
 };
 
 /** Operators sharing one reason (see {@link UNESTIMATED_OPERATORS}). */
@@ -2271,6 +2226,8 @@ export const UNESTIMATED_OPERATORS: readonly { match: string; reason: string }[]
     'render.render_animation',
     'render.render_software',
   ]),
+  // the director's desk and the model store (memory-desk.ts)
+  ...DESK_UNESTIMATED_OPERATORS,
 ];
 
 /**
@@ -2376,7 +2333,7 @@ export const BOUNDED_GROWTH_PARAMETERS: Readonly<Record<string, string>> = (() =
     out[`render.render_animation.${param}`] = render;
   for (const param of ['width', 'height', 'samples', 'frame'])
     out[`render.render_software.${param}`] = render;
-  return out;
+  return { ...out, ...DESK_BOUNDED_GROWTH_PARAMETERS };
 })();
 
 /** Why operator `id` has no estimate (null when it has one or is not listed). */

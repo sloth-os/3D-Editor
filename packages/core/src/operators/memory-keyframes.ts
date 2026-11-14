@@ -27,24 +27,25 @@ import {
  *
  * | run                                                  | keyframes   | peak (MB) | estimate (MB) |
  * | ---------------------------------------------------- | ----------- | --------- | ------------- |
- * | anim.bake_transforms, 100 objects × 1,000 frames     | 900,000     | 180–204   | 428           |
- * | 1,000 objects × 100 frames                           | 900,000     | 171–175   | 455           |
- * | 10,000 objects × 10 frames                           | 900,000     | 420–438   | 725           |
- * | 100 objects × 3,000 frames                           | 2,700,000   | 332–430   | 1,045         |
- * | location only, 100 objects × 3,000 frames            | 900,000     | 309–320   | 734           |
- * | location only, 1,000 objects × 300 frames            | 900,000     | 327–356   | 787           |
- * | rigidbody.bake_to_keyframes, 100 bodies × 200 frames | ≤ 120,000   | 149–155   | 215           |
- * | 100 bodies × 500 frames                              | ≤ 300,000   | 148–149   | 295           |
- * | 400 bodies × 500 frames                              | ≤ 1,200,000 | 233–294   | 684           |
- * | 100 bodies × 5,000 frames                            | ≤ 3,000,000 | 376–384   | 1,028         |
+ * | anim.bake_transforms, 100 objects × 1,000 frames     | 900,000     | 135–178   | 380           |
+ * | 1,000 objects × 100 frames                           | 900,000     | 202–205   | 407           |
+ * | 10,000 objects × 10 frames                           | 900,000     | 370–372   | 678           |
+ * | 100 objects × 3,000 frames                           | 2,700,000   | 337–472   | 1,045         |
+ * | location only, 100 objects × 3,000 frames            | 900,000     | 312–316   | 734           |
+ * | location only, 1,000 objects × 300 frames            | 900,000     | 338       | 769           |
+ * | rigidbody.bake_to_keyframes, 100 bodies × 200 frames | ≤ 120,000   | 106–135   | 205           |
+ * | 100 bodies × 500 frames                              | ≤ 300,000   | 142–174   | 269           |
+ * | 400 bodies × 500 frames                              | ≤ 1,200,000 | 258–263   | 594           |
+ * | 100 bodies × 5,000 frames                            | ≤ 3,000,000 | 356–383   | 997           |
  * | anim.keyframes_insert_many, 100,000 keyframes        | 100,000     | 31–45     | 51            |
  * | 100,000 between the 100,000 keyframes of a curve     | 100,000     | 64–73     | 89            |
  * | anim.keyframe_insert, 10,000 objects (LocRotScale)   | 90,000      | 129–133   | 150           |
  * | anim.keyframe_insert into 900 curves of 1,000 keys   | 900         | 147–154   | 188           |
  *
- * The bakes sample every frame with a frame state of its own (eval/frame-state.ts), which copies every
- * object, F-curve and driver of the document; in a document that already holds keyframes, those copies
- * are most of what a bake takes ({@link frameSamplingBytes}): the second table.
+ * The bakes sample every frame with a frame state of its own (eval/frame-state.ts), which leaves what
+ * it evaluated as garbage ({@link frameSamplingBytes}); the frame states of a document share one
+ * reading of its objects, F-curves and drivers (eval/frame-input.ts), so that garbage does not grow
+ * with the keyframes the document holds: the second table.
  */
 
 /** Peak heap per keyframe an operator adds: 93–172 bytes measured (see the table above), rounded up. */
@@ -107,37 +108,48 @@ export const INSERT_MANY_BYTES_PER_KEYFRAME = 200;
 export const INSERT_MANY_REWRITE_BYTES = 400;
 
 /**
- * Heap a frame state keeps while a bake samples one frame (eval/frame-state.ts copies every object,
- * F-curve and driver of the document, and keeps the objects evaluated at the frame): per keyframe of
- * the document 80–84 bytes measured (90,000 to 900,000 keyframes in 900 to 2,754 F-curves), per object
- * 1.1 KB, per driver 0.6 KB (1,024 objects with a driver each); rounded up.
+ * Heap a sampled frame takes per keyframe of the document: none. The frame states of a document read
+ * its objects, F-curves and drivers once per document state and share them (eval/frame-input.ts), and
+ * a frame finds its keys by binary search; every frame state copied every F-curve before (80–84 bytes
+ * per keyframe measured).
  */
-export const FRAME_STATE_BYTES_PER_KEYFRAME = 100;
-export const FRAME_STATE_BYTES_PER_OBJECT = 1_500;
+export const FRAME_STATE_BYTES_PER_KEYFRAME = 0;
+
+/**
+ * Heap the frame states of a sampled frame leave per object, bone of an armature object (each is
+ * posed), constraint (of an object or a pose bone) and driver of the document: their copies of what
+ * they evaluate, with its matrices and poses, garbage once the frame is sampled. Measured as the peak
+ * of sampling alone (--trace-gc; a frame state per frame reading every object's matrices, as a bake
+ * does; nothing kept), per object and frame: 0.69–1.18 KB for 100 to 5,000 linked cubes, 1.42 KB keyed
+ * on 9 channels, 1.57 KB with a constraint each, 1.41–1.48 KB with a driver each, 3.69 KB for 8
+ * walking actors (175 objects, 175 bones); rounded up per term, but for the keyed cubes, whose bakes'
+ * estimates hold their peaks with 1 KB (the tables above).
+ */
+export const FRAME_STATE_BYTES_PER_OBJECT = 1_000;
+export const FRAME_STATE_BYTES_PER_POSE_BONE = 3_000;
+export const FRAME_STATE_BYTES_PER_CONSTRAINT = 600;
 export const FRAME_STATE_BYTES_PER_DRIVER = 1_000;
 
 /**
- * The frames' copies (FRAME_STATE_BYTES_PER_*) live long enough for V8 to move them into its old
- * generation, where they pile up as garbage until a full collection, which V8 starts when the heap has
- * grown to about this many times what it keeps. Measured with --trace-gc, the copies of one sampled
- * frame times the frames, or this many times what the heap kept while they were made (the document,
- * one frame's copies and the process's own, {@link BAKE_HEAP_BYTES}), whichever is less, held every peak
- * of the table below.
+ * The frame states' garbage (FRAME_STATE_BYTES_PER_*) can live long enough for V8 to move it into its
+ * old generation, where it piles up until a full collection, which V8 starts when the heap has grown to
+ * about this many times what it keeps. Measured with --trace-gc, the garbage of one sampled frame times
+ * the frames, or this many times what the heap kept meanwhile (the document, one frame's garbage and
+ * the process's own, {@link BAKE_HEAP_BYTES}), whichever is less, held every peak of the table below
+ * (and of the first one). When every frame state copied every F-curve, these bakes peaked at 82 MB
+ * (the first row) to 915 MB (the last), and the last took 412 s instead of 3.3 s.
  *
- * | bake (anim.bake_transforms; heaps of 2 to 3.5 GB) | keyframes in the document | peak (MB) | estimate (MB) |
- * | ------------------------------------------------- | ------------------------- | --------- | ------------- |
- * | 1 object × 30 frames, 101 objects                 | 27,000                    | 82        | 114           |
- * | 1 object × 300 frames, 11 objects                 | 2,700                     | 84        | 115           |
- * | 1 object × 300 frames, 13 objects                 | 3,240                     | 98        | 131           |
- * | 1 object × 300 frames, 51 objects                 | 13,500                    | 172–191   | 304           |
- * | 1 object × 300 frames, 101 objects                | 27,000                    | 198–201   | 318           |
- * | 1 object × 1,000 frames, 101 objects              | 27,000                    | 204       | 320           |
- * | 1 object × 300 frames, 101 objects                | 270,000                   | 393–399   | 522           |
- * | 100 objects × 300 frames again (a re-bake)        | 270,000                   | 414       | 646           |
- * | 100 objects × 1,000 frames again (a re-bake)      | 900,000                   | 915       | 1,458         |
- *
- * The copies also take time: about 0.35 µs per keyframe of the document per sampled frame (the last
- * re-bake took 412 s), which this does not bound.
+ * | bake (anim.bake_transforms; heap of 4 GB)    | keyframes in the document | peak (MB) | estimate (MB) |
+ * | -------------------------------------------- | ------------------------- | --------- | ------------- |
+ * | 1 object × 30 frames, 101 objects            | 27,000                    | 16        | 35            |
+ * | 1 object × 300 frames, 11 objects            | 2,700                     | 17        | 36            |
+ * | 1 object × 300 frames, 13 objects            | 3,240                     | 17        | 37            |
+ * | 1 object × 300 frames, 51 objects            | 13,500                    | 27        | 47            |
+ * | 1 object × 300 frames, 101 objects           | 27,000                    | 38        | 62            |
+ * | 1 object × 1,000 frames, 101 objects         | 27,000                    | 93        | 131           |
+ * | 1 object × 300 frames, 101 objects           | 270,000                   | 38        | 62            |
+ * | 100 objects × 300 frames again (a re-bake)   | 270,000                   | 84–85     | 185           |
+ * | 100 objects × 1,000 frames again (a re-bake) | 900,000                   | 250–252   | 535           |
  */
 export const BAKE_GARBAGE_GROWTH = 4;
 
@@ -147,24 +159,41 @@ export const BAKE_GARBAGE_GROWTH = 4;
  */
 export const BAKE_HEAP_BYTES = 64 * 1024 * 1024;
 
+/** A stored datablock: a Y.Map of its fields (SceneDoc.createBlock), read in place. */
+type StoredBlock = { get(key: string): unknown };
+
 /**
- * Heap one frame state of `doc` keeps while a frame is sampled: its copies of the document's objects,
- * F-curves (their keyframes) and drivers (FRAME_STATE_BYTES_PER_*). Counted without reading them: a
- * pass over the document's maps.
+ * Heap one frame state of `doc` leaves while a frame is sampled: what it evaluates of the document's
+ * objects, the bones of their armatures (every bone is posed, eval/frame-state.ts), their constraints
+ * and the bones', and its drivers (FRAME_STATE_BYTES_PER_*), whatever the document's keyframes.
+ * Counted without copying: a pass over the stored objects, whose fields are read in place.
  */
 export function frameStateBytes(doc: SceneDoc): number {
-  let keys = 0;
-  for (const v of doc.map('fcurves').values()) {
-    const k = (v as { keyframes?: unknown } | null)?.keyframes;
-    if (Array.isArray(k)) keys += k.length;
-  }
   let drivers = 0;
   for (const item of doc.map('drivers')._map.values()) if (!item.deleted) drivers++;
+  const armatures = doc.map('armatures');
   let objects = 0;
-  for (const item of doc.map('objects')._map.values()) if (!item.deleted) objects++;
+  let bones = 0;
+  let constraints = 0;
+  for (const v of doc.map('objects').values()) {
+    objects++;
+    const y = v as StoredBlock;
+    const own = y.get('constraints');
+    if (Array.isArray(own)) constraints += own.length;
+    if (y.get('type') !== 'ARMATURE') continue;
+    const data = y.get('data');
+    const arm = typeof data === 'string' ? (armatures.get(data) as StoredBlock | undefined) : undefined;
+    const armBones = arm?.get('bones');
+    if (Array.isArray(armBones)) bones += armBones.length;
+    const pose = y.get('pose') as Partial<ObjectData['pose']> | null | undefined;
+    if (pose?.bones && typeof pose.bones === 'object')
+      for (const b of Object.values(pose.bones))
+        if (Array.isArray(b?.constraints)) constraints += b.constraints.length;
+  }
   return (
-    FRAME_STATE_BYTES_PER_KEYFRAME * keys +
     FRAME_STATE_BYTES_PER_OBJECT * objects +
+    FRAME_STATE_BYTES_PER_POSE_BONE * bones +
+    FRAME_STATE_BYTES_PER_CONSTRAINT * constraints +
     FRAME_STATE_BYTES_PER_DRIVER * drivers
   );
 }
@@ -374,6 +403,32 @@ export function insertManyWrites(
       stored: KEYFRAME_STORED_BYTES * keys + (fc ? 0 : FCURVE_STORED_BYTES),
     },
     'the number of frames and values',
+  );
+}
+
+/**
+ * `keys` keyframes an operator writes into `fcurves` F-curves without reading the channels first (the
+ * director's desk operators: camera moves, actor poses and gaits, launches, tethers; memory-desk.ts):
+ * per keyframe what an insert adds at the peak ({@link KEYFRAME_ADD_BYTES}), per F-curve what a bake
+ * builds before it stores it ({@link BAKE_FCURVE_BYTES}), and kept as new keyframes and new F-curves.
+ * `rewritten`: keyframes the channels already hold, copied and stored again
+ * ({@link KEYFRAME_REWRITE_BYTES}).
+ */
+export function newKeyframesWrites(
+  keys: number,
+  fcurves: number,
+  lower: string,
+  rewritten = 0,
+): KeyframeWrites {
+  const k = Math.max(0, Math.ceil(keys));
+  const f = Math.max(0, Math.ceil(fcurves));
+  return writes(
+    {
+      bytes: KEYFRAME_ADD_BYTES * k + BAKE_FCURVE_BYTES * f + KEYFRAME_REWRITE_BYTES * Math.max(0, rewritten),
+      keys: k,
+      stored: KEYFRAME_STORED_BYTES * k + FCURVE_STORED_BYTES * f,
+    },
+    lower,
   );
 }
 

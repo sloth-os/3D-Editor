@@ -32,7 +32,9 @@ import {
  * watchdog thread ends a busy one within a second when the server was killed (worker.ts).
  *
  * Renders lease threads, in two kinds:
- * - Long renders (path traced images, animations) lease every render thread (`size` processes).
+ * - Long renders (path traced images, animations) lease every render thread (`size` processes);
+ *   a video export leases as many as its memory allows (`lease(max)`), and the pool starts only
+ *   the processes the waiting long renders lease, not all `size` of them.
  *   Up to two of them run at once and share the threads: a thread works through the tasks (bands
  *   of rows, frames) of both in turn, so a second long render does not wait minutes for the first.
  *   Further long renders wait, first come first served.
@@ -62,6 +64,13 @@ export interface RenderThread {
   call<T extends WorkerResult>(req: RenderRequest): Promise<T>;
   /** Frees what a job keeps on the thread: a prepared path tracer, an APNG encoder (fire and forget). */
   release(job: number): void;
+  /**
+   * Drops the renderer's pooled working buffers in the render process, after the requests sent
+   * before (fire and forget; see `release-buffers` in protocol.ts), and with `documents` its cached
+   * documents too (`clear`, as an idle process does): a video export ends with it. Render processes
+   * only (the main thread of single-thread mode runs no video exports).
+   */
+  releaseBuffers?(o?: { documents?: boolean }): void;
   /** Requests sent and not answered yet. */
   readonly pending: number;
   readonly alive: boolean;
@@ -134,6 +143,16 @@ export const MAX_SHARED_RENDERS = 2;
  * heap), and one more for every render process a path traced render sends it to.
  */
 export const DOC_PART_BYTES = 8 * 1024 * 1024;
+
+/**
+ * glibc's malloc mmap threshold in render processes (MALLOC_MMAP_THRESHOLD_ unless the environment
+ * sets one): blocks of 1 MiB and more, the renderer's working buffers and the frames it returns, are
+ * mapped on their own and go back to the system when freed. Measured on 1280×720 export frames
+ * (beauty, depth, pose; six runs each): a render process at 170–178 MB 1.5 s after release-buffers
+ * instead of 187–353 MB, for the same CPU time per frame on average (759 against 757 ms), up to
+ * about 35 ms of it more in page faults when a collection dropped the pooled buffers between frames.
+ */
+export const RENDER_MMAP_THRESHOLD_BYTES = 1024 * 1024;
 
 /** Default number of render processes: the CPU cores, at most 8. */
 export function defaultRenderThreads(): number {
@@ -303,6 +322,15 @@ export class ProcessThread implements RenderThread {
     const env = { ...process.env };
     if (opts.heapLimitMb && env.NODE_OPTIONS)
       env.NODE_OPTIONS = env.NODE_OPTIONS.replace(heapFlags, '').replace(/\s+/g, ' ').trim();
+    // glibc's malloc raises its mmap threshold to the size of the largest block freed (up to 32
+    // MiB), so the renderer's working buffers of a 720p frame end up in its heap, and freeing them
+    // (release-buffers, clear) returned nothing to the system; a fixed threshold of 1 MiB maps each
+    // of them on its own, and unmaps it when it is freed (musl ignores the variable)
+    if (
+      env.MALLOC_MMAP_THRESHOLD_ === undefined &&
+      !/glibc\.malloc\.mmap_threshold/.test(env.GLIBC_TUNABLES ?? '')
+    )
+      env.MALLOC_MMAP_THRESHOLD_ = String(RENDER_MMAP_THRESHOLD_BYTES);
     this.child = fork(fileURLToPath(entry), [], {
       execArgv: [
         '--expose-gc',
@@ -374,6 +402,11 @@ export class ProcessThread implements RenderThread {
 
   release(job: number): void {
     if (!this.failure) this.tell({ type: 'release', job });
+  }
+
+  releaseBuffers(o: { documents?: boolean } = {}): void {
+    if (o.documents) this.clearCaches();
+    else if (!this.failure) this.tell({ type: 'release-buffers' });
   }
 
   /** Drops the process's cached documents (fire and forget). */
@@ -674,10 +707,16 @@ class MainThread implements RenderThread {
         return this.engine.autoView(req.doc, req.frames, req.aspect, req.camera, req.budgetMs);
       case 'simulate':
         return this.engine.simulate(req.doc, req.frames);
+      case 'desk-shot':
+        return this.engine.deskShot(req.doc, req.options);
       case 'export':
         return this.engine.exportFile(req.doc, req.format, req.options);
       case 'ping':
         return { ok: true };
+      case 'memory': {
+        const m = process.memoryUsage();
+        return { rss: m.rss, heapUsed: m.heapUsed, external: m.external, arrayBuffers: m.arrayBuffers };
+      }
       case 'test-allocate':
       case 'test-busy':
         throw new Error(`'${req.type}' is a test request for render processes`);
@@ -759,6 +798,23 @@ export class RenderPool {
   /** Live render processes (started lazily, stopped when idle). */
   get running(): number {
     return this.workers.size;
+  }
+
+  /**
+   * Live render processes of long renders (started or starting; not the one kept for interactive
+   * renders): the ones a long lease of that many gets without starting another (video/exporter.ts
+   * asks them what they hold).
+   */
+  get runningLong(): number {
+    let n = 0;
+    for (const t of this.workers) if (t.role === 'bulk') n++;
+    return n;
+  }
+
+  /** Whether the render process kept for interactive renders runs (started or starting). */
+  get runningInteractive(): boolean {
+    for (const t of this.workers) if (t.role === 'interactive') return true;
+    return false;
   }
 
   /** Long renders holding threads right now (at most MAX_SHARED_RENDERS). */
@@ -863,25 +919,23 @@ export class RenderPool {
     if (this.mode === 'main-thread') return this.main ? [this.main] : null;
     const want = Math.min(max, this.size);
     const usable: RenderThread[] = [];
-    let coming = 0;
-    for (const t of this.workers) {
-      if (t.role !== 'bulk') continue;
-      if (this.booting.has(t) || this.draining.has(t)) coming++;
-      else if (t.alive) usable.push(t);
-    }
-    // threads starting up (or finishing cancelled work) will be there in a moment: wait for them
-    // when they are wanted, and for the threads still to be started
-    if (usable.length < want && (coming > 0 || usable.length + coming < this.size)) return null;
-    if (!usable.length) return null;
+    for (const t of this.workers)
+      if (t.role === 'bulk' && t.alive && !this.booting.has(t) && !this.draining.has(t)) usable.push(t);
+    // fewer than wanted: the ones starting up (or finishing cancelled work) will be there in a
+    // moment, and ensureThreads starts the rest this lease needs (as many as the waiting long
+    // renders lease, not every render thread): wait for them
+    if (!usable.length || usable.length < want) return null;
     // free threads first, then the ones with fewer renders on them
     usable.sort((a, b) => (this.holders.get(a) ?? 0) - (this.holders.get(b) ?? 0));
     return usable.slice(0, want);
   }
 
   /**
-   * Starts the render processes waiting renders need: every render thread for a long render, the
-   * process kept for interactive renders (and idle render threads when several wait). Returns true
-   * when threads became available at once (main thread fallback).
+   * Starts the render processes waiting renders need: as many render threads as the long renders
+   * waiting lease (each its `max`, at most every render thread: an export that the memory allows
+   * one process starts one, not RENDER_WORKERS), the process kept for interactive renders (and
+   * idle render threads when several wait). Returns true when threads became available at once
+   * (main thread fallback).
    */
   private ensureThreads(): boolean {
     if (this.closed) return false;
@@ -892,8 +946,12 @@ export class RenderPool {
         if (t.role === 'bulk') bulk++;
         else interactive++;
       }
-      const quickWaiting = this.waiters.filter((w) => w.interactive).length;
-      let target = this.waiters.length > quickWaiting ? this.size : bulk;
+      let quickWaiting = 0;
+      let longWant = 0;
+      for (const w of this.waiters)
+        if (w.interactive) quickWaiting++;
+        else longWant = Math.max(longWant, Math.min(w.max, this.size));
+      let target = Math.max(bulk, longWant);
       if (quickWaiting) {
         if (!interactive) this.spawn('interactive');
         // more quick renders than threads that are free or about to be: idle render threads help

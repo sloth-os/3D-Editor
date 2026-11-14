@@ -61,6 +61,10 @@ describe('rigidbody.object_add / object_remove', () => {
       collision_margin: 0.04,
       linear_damping: 0.04,
       angular_damping: 0.1,
+      start_frame: null,
+      initial_linear_velocity: [0, 0, 0],
+      initial_angular_velocity: [0, 0, 0],
+      inherit_velocity: true,
     });
     expect(r.result).toMatchObject({
       created: 1,
@@ -104,6 +108,7 @@ describe('rigidbody.object_add / object_remove', () => {
 
   it('keeps the settings of existing bodies, switching type (and Dynamic on for ACTIVE)', () => {
     const t = setup();
+    // stored before rigid bodies had start frames and initial velocities: the defaults fill them in
     t.doc.updateObject(t.box, {
       rigid_body: {
         type: 'PASSIVE',
@@ -116,7 +121,7 @@ describe('rigidbody.object_add / object_remove', () => {
         collision_margin: 0.01,
         linear_damping: 0.2,
         angular_damping: 0.3,
-      },
+      } as unknown as RigidBodyData,
     });
     const r = t.run('rigidbody.object_add', { objects: ['Box'], type: 'ACTIVE', restitution: 0.6 });
     expect(r.result.created).toBe(0);
@@ -131,6 +136,10 @@ describe('rigidbody.object_add / object_remove', () => {
       collision_margin: 0.01,
       linear_damping: 0.2,
       angular_damping: 0.3,
+      start_frame: null,
+      initial_linear_velocity: [0, 0, 0],
+      initial_angular_velocity: [0, 0, 0],
+      inherit_velocity: true,
     });
   });
 

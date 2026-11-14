@@ -144,6 +144,11 @@ export interface RenderAnimationRequest {
   fps?: number;
   /** Shared frame options (engine explicit). */
   base: Omit<FrameOptions, 'frame' | 'time_limit' | 'width' | 'height'>;
+  /**
+   * A camera per rendered frame (frame_start, frame_start + frame_step, …; undefined entries use
+   * `base.cameraId`): the shot cameras of camera 'shots'.
+   */
+  cameras?: readonly (string | undefined)[];
   /** PATHTRACER: time budget per frame (seconds). */
   frame_time_limit?: number;
   /** Total time budget (seconds, 0 = none). */
@@ -514,6 +519,7 @@ export class Renderer {
             height,
             fps,
             base: req.base,
+            cameras: req.cameras,
             frameTimeLimit: req.frame_time_limit,
             timeLimit: req.time_limit,
             animatedSeed: req.animated_seed,

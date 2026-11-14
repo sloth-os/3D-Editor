@@ -15,6 +15,7 @@ import { errorMessage, withSpan, withSpanSync } from '../observability/tracing';
 import { RenderRequestError, isCancelled, isOutOfMemory, sharedRenderer, type Renderer } from '../render';
 import { sharedRenderStore, type RenderStore } from '../render/store';
 import { snapshotRefusal } from '../render/memory';
+import { badRequest } from './errors';
 
 export const EXPORT_FORMATS = ['glb', 'gltf', 'obj', 'stl', 'ply'] as const;
 
@@ -74,14 +75,6 @@ export interface ProjectRouteOptions {
 /** True for errors thrown by core functions that other packages have not implemented yet. */
 export function isNotImplemented(err: unknown): boolean {
   return err instanceof Error && /not implemented/i.test(err.message);
-}
-
-function badRequest(reply: FastifyReply, error: z.ZodError | string) {
-  const message =
-    typeof error === 'string'
-      ? error
-      : error.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`).join('; ');
-  return reply.code(400).send({ error: message });
 }
 
 /**

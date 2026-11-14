@@ -2,7 +2,8 @@
 #
 # Multi-arch image for the 3D editor (PWA + sync/MCP server).
 # Build stages run on the build host's native platform; the output is platform independent
-# JavaScript, so only the tiny runtime stage is instantiated per target architecture.
+# JavaScript, so only the runtime stage (Node.js on Alpine, ffmpeg and the built files) is
+# instantiated per target architecture.
 
 ARG NODE_VERSION=22
 
@@ -49,7 +50,13 @@ ENV NODE_ENV=production \
     DATA_DIR=/data \
     APP_VERSION=${APP_VERSION}
 WORKDIR /app
-# The runtime stage only copies files (no RUN), so building for arm64/armv7 needs no emulation.
+# ffmpeg encodes the server's video exports (docs/video-export.md). Alpine's package pulls in about
+# 100 libraries (x264, x265, libvpx, aom, dav1d, vulkan …): about 130 MB more image. Build with
+# --build-arg WITH_FFMPEG=0 for an image without video export (features.videoExport is then false
+# and exports answer FFMPEG_UNAVAILABLE). This is the runtime stage's only RUN: building for
+# arm64/armv7 runs it under emulation (QEMU, set up by the Docker workflow); the rest only copies.
+ARG WITH_FFMPEG=1
+RUN if [ "$WITH_FFMPEG" = 1 ]; then apk add --no-cache ffmpeg; fi
 # The server handles SIGTERM/SIGINT itself (graceful shutdown), so no init process is required.
 COPY --from=build --chown=node:node /out/data /data
 COPY --from=deps --chown=node:node /src/node_modules ./node_modules

@@ -13,6 +13,7 @@ import {
   type EnvironmentLighting,
 } from './env-light';
 import type { RenderView } from './view';
+import { shadowVisibility, type ShadowMap } from './shadows';
 
 /*
  * Z-buffered triangle rasterizer with perspective-correct attribute interpolation.
@@ -22,11 +23,48 @@ import type { RenderView } from './view';
  * - Clipping happens in homogeneous clip space against the near plane and a guard band.
  * - Depth is stored as 1/w for perspective views (uniform relative precision, independent of the
  *   near plane) and as 1 − z_ndc for orthographic ones; larger is closer.
- * - Shading is forward, per sample; supersampling and resolve happen in the caller.
+ * - Shading is forward, per sample (or with `msaa` once per output pixel and triangle, coverage
+ *   and depth staying per sample); supersampling and resolve happen in the caller.
+ * - Opt-in extras for the caller: shadow maps per light (`shadowMaps`), the ambient share of every
+ *   sample for ambient occlusion (`ambientShare`) and the nearest covered sample of every output
+ *   pixel (`pixels`: depth, normal, object) for AOV passes; a depth-only mode renders shadow maps.
  */
 
 export const SHADE_MATERIAL = 0;
 export const SHADE_SOLID = 1;
+/**
+ * Depth only (shadow maps): opaque and alpha-clipped surfaces write depth, nothing is shaded, glass
+ * and alpha-blended surfaces are skipped (they cast no shadow).
+ */
+export const SHADE_DEPTH = 2;
+
+/**
+ * The nearest covered sample of every output pixel (`Rasterizer.pixels`): its depth key (as the
+ * depth buffer's, 0 = nothing), world-space unit normal (3 per pixel) and object index.
+ */
+export interface PixelBuffers {
+  width: number;
+  height: number;
+  key: Float32Array;
+  normal: Float32Array;
+  object: Uint32Array | null;
+}
+
+/**
+ * Shading cache values per output pixel (msaa): rgb, transmittance rgb, ambient rgb, normal xyz and
+ * the packed ambient share (-1 when not tracked).
+ */
+const SHADE_VALUES = 13;
+
+/**
+ * Packs a sample's ambient share (ambient radiance / its colour, per channel, 0..1) into 3 × 10 bits.
+ */
+function packAmbient(ar: number, ag: number, ab: number, r: number, g: number, b: number): number {
+  const qr = r > 0 && ar > 0 ? (ar >= r ? 1023 : Math.round((ar / r) * 1023)) : 0;
+  const qg = g > 0 && ag > 0 ? (ag >= g ? 1023 : Math.round((ag / g) * 1023)) : 0;
+  const qb = b > 0 && ab > 0 ? (ab >= b ? 1023 : Math.round((ab / b) * 1023)) : 0;
+  return qr | (qg << 10) | (qb << 20);
+}
 
 /** Per material-slot surface parameters (linear colors). */
 export interface SurfaceMaterial {
@@ -66,6 +104,8 @@ export interface SurfaceMaterial {
   transmission?: number;
   /** Index of refraction (dielectric Fresnel reflectance F0 = ((ior − 1) / (ior + 1))², default 1.5). */
   ior?: number;
+  /** The texture only gives alpha (its colour is ignored: the clay look keeps alpha clipping). */
+  alphaOnly?: boolean;
 }
 
 /** Per-object state the shading of a deferred (transparent) triangle needs. */
@@ -115,6 +155,8 @@ const GUARD = 64;
  */
 const PROC_VALUES = 13;
 const INV_PI = 1 / Math.PI;
+/** Stand-in for buffers a rasterizer does not have (keeps the hot loops' types fixed). */
+const NO_FLOATS = new Float32Array(0);
 /** Angular radius of a sun lamp's disc for its highlight (Blender's default sun angle 0.526°). */
 const SUN_ANGULAR_RADIUS = 0.00459;
 /** Meshes with more triangles are drawn from a coarse proxy by helper renders (`lodCells`). */
@@ -195,12 +237,57 @@ export class Rasterizer {
    */
   cullBackFaces = false;
   /**
+   * Shade once per output pixel (`shadingBlock` × `shadingBlock` samples) and triangle, like MSAA:
+   * coverage, depth, alpha and the wireframe stay per sample, the shaded colour is shared by the
+   * triangle's samples in the pixel (the first one covered is shaded).
+   */
+  msaa = false;
+  /** Shadow maps of the packed lights, in the same order (null entries: no shadow). */
+  shadowMaps: (ShadowMap | null)[] | null = null;
+  /**
+   * Per sample (opaque pass): the share of its colour that is ambient / environment light (diffuse
+   * and reflected), packed 3 × 10 bits (see `packAmbient`), for ambient occlusion.
+   */
+  ambientShare: Uint32Array | null = null;
+  /** The nearest covered sample of every output pixel (AOV passes); null: not tracked. */
+  pixels: PixelBuffers | null = null;
+  /** Blended samples at least this opaque count as covering their pixel in `pixels`. */
+  pixelsBlendAlpha = 0.5;
+  /** Object index `pixels.object` records for the surfaces of the next `drawMesh` calls. */
+  objectIndex = 0;
+  /**
    * Transparent triangles (alpha blend, transmission) waiting for `flushTransparent`: VS numbers
    * per vertex, three vertices per triangle, with their material, facing, wire flags and object.
    */
   private tVerts = new Float64Array(VS * 3 * 64);
   private tCount = 0;
-  private tInfo: { mat: SurfaceMaterial; back: boolean; wire: number; state: ObjectState | null }[] = [];
+  private tInfo: {
+    mat: SurfaceMaterial;
+    back: boolean;
+    wire: number;
+    state: ObjectState | null;
+    gx: number;
+    gy: number;
+    gz: number;
+    obj: number;
+  }[] = [];
+  /** Unit face normal (world, on the viewer's side) of the triangle being filled (shadow lookups). */
+  private faceNx = 0;
+  private faceNy = 0;
+  private faceNz = 1;
+  /** Pixel or sample being shaded (shadow filter rotation). */
+  private shadeX = 0;
+  private shadeY = 0;
+  /** Shading cache of `msaa` per output-pixel column: triangle serial, block row and values. */
+  private shTri = new Int32Array(0);
+  private shRow = new Int32Array(0);
+  private shVal = new Float64Array(0);
+  private shSerial = 0;
+  /** Compute the ambient part of shaded colours (`outAR`..): set while `ambientShare` is. */
+  private trackAmbient = false;
+  private outAR = 0;
+  private outAG = 0;
+  private outAB = 0;
   /** Object state of the mesh being drawn (procedural texture coordinates). */
   private curState: ObjectState | null = null;
   /** Set while `flushTransparent` draws: blend instead of overwriting, no depth writes. */
@@ -260,15 +347,27 @@ export class Rasterizer {
   private readonly zMin: number;
   private readonly solidL: Float64Array;
 
+  /**
+   * `buffers` are zeroed sample buffers to draw into (reused between renders) instead of new ones;
+   * a depth-only rasterizer (SHADE_DEPTH) may pass empty `color` and `cov` arrays.
+   */
   constructor(
     readonly width: number,
     readonly height: number,
     readonly view: RenderView,
+    buffers?: { color: Float32Array; cov: Float32Array; depth: Float32Array },
   ) {
     const n = width * height;
-    this.color = new Float32Array(n * 3);
-    this.cov = new Float32Array(n);
-    this.depth = new Float32Array(n);
+    if (buffers) {
+      if (buffers.depth.length !== n) throw new Error('Rasterizer: depth buffer of the wrong size');
+      this.color = buffers.color;
+      this.cov = buffers.cov;
+      this.depth = buffers.depth;
+    } else {
+      this.color = new Float32Array(n * 3);
+      this.cov = new Float32Array(n);
+      this.depth = new Float32Array(n);
+    }
     this.zMin = view.ortho ? 0 : 1 / view.far;
     // SOLID studio lights fixed relative to the view (key, fill, rim): world-space direction + weight
     const toWorld = (x: number, y: number, z: number): number[] => {
@@ -305,6 +404,14 @@ export class Rasterizer {
   ): void {
     if (!mesh.faces.length || this.offscreen(mesh, world)) return;
     const procedural = materials.some((m) => m?.procedural);
+    if (this.msaa && this.mode !== SHADE_DEPTH) {
+      const cols = Math.ceil(this.width / Math.max(1, this.shadingBlock | 0)) + 1;
+      if (this.shTri.length < cols) {
+        this.shTri = new Int32Array(cols);
+        this.shRow = new Int32Array(cols);
+        this.shVal = new Float64Array(cols * SHADE_VALUES);
+      }
+    }
     if (procedural) {
       const cols = Math.ceil(this.width / Math.max(1, this.shadingBlock | 0)) + 1;
       if (this.procTri.length < cols) {
@@ -354,7 +461,12 @@ export class Rasterizer {
     // undeformed object-space position per render vertex (GENERATED procedural coordinates; only
     // material shading reads them), shared by the rasterizers of one render like `ws`
     let og: Float64Array | null = null;
-    if (procedural && this.mode === SHADE_MATERIAL) {
+    // (depth passes evaluate procedural textures only for the alpha of alpha-clipped materials)
+    if (
+      procedural &&
+      (this.mode === SHADE_MATERIAL ||
+        (this.mode === SHADE_DEPTH && materials.some((m) => !!m?.procedural && m.blend === 1)))
+    ) {
       const orco = texSpace?.orco && texSpace.orco.length === mesh.positions.length ? texSpace.orco : null;
       if (ws.og && ws.ogSource === orco) og = ws.og;
       else {
@@ -479,6 +591,15 @@ export class Rasterizer {
         : -(fx * fwd[0] + fy * fwd[1] + fz * fwd[2]);
       const back = facing < 0 !== mirrored;
       if (back && (mat.cull || this.cullBackFaces)) continue;
+      // glass and alpha-blended surfaces cast no shadow
+      if (this.mode === SHADE_DEPTH && (mat.blend === 2 || (mat.transmission ?? 0) > 0)) continue;
+      if (this.shadowMaps !== null) {
+        // the face normal on the viewer's side (shadow lookups: normal offset, receiver plane)
+        const s = (facing < 0 ? -1 : 1) / (Math.sqrt(fx * fx + fy * fy + fz * fz) || 1);
+        this.faceNx = fx * s;
+        this.faceNy = fy * s;
+        this.faceNz = fz * s;
+      }
       const wire = edges ? edges[t] : 0;
       // alpha-blended and transmissive surfaces wait for the sorted transparent pass
       const deferred = this.mode === SHADE_MATERIAL && (mat.blend === 2 || (mat.transmission ?? 0) > 0);
@@ -515,7 +636,16 @@ export class Rasterizer {
     this.tVerts.set(S.subarray(a * VS, a * VS + VS), o);
     this.tVerts.set(S.subarray(b * VS, b * VS + VS), o + VS);
     this.tVerts.set(S.subarray(c * VS, c * VS + VS), o + 2 * VS);
-    this.tInfo.push({ mat, back, wire, state: this.curState });
+    this.tInfo.push({
+      mat,
+      back,
+      wire,
+      state: this.curState,
+      gx: this.faceNx,
+      gy: this.faceNy,
+      gz: this.faceNz,
+      obj: this.objectIndex,
+    });
     this.tCount++;
   }
 
@@ -539,7 +669,12 @@ export class Rasterizer {
     for (let t = 0; t < n; t++) order[t] = t;
     order.sort((a, b) => keys[a] - keys[b] || a - b);
     const S = this.scr;
-    const saved = { invWorld: this.invWorld, texMin: this.texMin, texSize: this.texSize };
+    const saved = {
+      invWorld: this.invWorld,
+      texMin: this.texMin,
+      texSize: this.texSize,
+      obj: this.objectIndex,
+    };
     this.blendPass = true;
     try {
       for (let k = 0; k < n; k++) {
@@ -551,6 +686,10 @@ export class Rasterizer {
           this.texMin = info.state.texMin;
           this.texSize = info.state.texSize;
         }
+        this.faceNx = info.gx;
+        this.faceNy = info.gy;
+        this.faceNz = info.gz;
+        this.objectIndex = info.obj;
         this.fill(0, 1, 2, info.mat, info.back, info.wire);
       }
     } finally {
@@ -558,6 +697,7 @@ export class Rasterizer {
       this.invWorld = saved.invWorld;
       this.texMin = saved.texMin;
       this.texSize = saved.texSize;
+      this.objectIndex = saved.obj;
       this.tCount = 0;
       this.tInfo = [];
     }
@@ -733,8 +873,11 @@ export class Rasterizer {
     const flip = back ? -1 : 1;
     const zMin = this.zMin;
     const blend = mat.blend;
-    const tex = this.mode === SHADE_MATERIAL ? mat.tex : null;
-    const proc = this.mode === SHADE_MATERIAL ? (mat.procedural ?? null) : null;
+    const depthOnly = this.mode === SHADE_DEPTH;
+    // depth passes read textures only for the alpha of alpha-clipped surfaces
+    const textured = this.mode === SHADE_MATERIAL || (depthOnly && blend === 1);
+    const tex = textured ? mat.tex : null;
+    const proc = textured ? (mat.procedural ?? null) : null;
     const serial = proc ? (this.triSerial = (this.triSerial + 1) | 0) : 0;
     // barycentric increments per pixel row (neighbour pixels for the procedural bump)
     const b0 = (x2 - x1) * inv;
@@ -743,6 +886,25 @@ export class Rasterizer {
     const depth = this.depth;
     const color = this.color;
     const cov = this.cov;
+    const blk = this.shadingBlock;
+    // msaa: one shaded colour per output pixel and triangle (see `msaa`)
+    const msaa = this.msaa && !depthOnly;
+    const shSerial = msaa ? (this.shSerial = (this.shSerial + 1) | 0) : 0;
+    const shTri = this.shTri;
+    const shRow = this.shRow;
+    const sv = this.shVal;
+    // the samples' alpha decides their coverage (clip, or blend in the transparent pass)
+    const needAlpha = blend === 1 || (blend === 2 && this.blendPass);
+    const amb = this.blendPass ? null : this.ambientShare;
+    this.trackAmbient = amb !== null;
+    const pix = this.pixels;
+    const pixW = pix ? pix.width : 0;
+    // (the opaque pass records each pixel's nearest sample inline: a call per sample costs more)
+    const pixKey = pix ? pix.key : null;
+    const pixNormal = pix ? pix.normal : NO_FLOATS;
+    const pixObject = pix ? pix.object : null;
+    const objIndex = this.objectIndex;
+    const shadowed = this.shadowMaps !== null;
     // top-left fill rule: a sample exactly on an edge shared by two triangles belongs to one of
     // them only (blended surfaces must not be drawn twice along their triangulation diagonals)
     const e0 = a0 > 0 || (a0 === 0 && b0 > 0) ? -1e-7 : 1e-7;
@@ -755,39 +917,23 @@ export class Rasterizer {
       let w1 = ((x0 - x2) * (cy - y2) - (y0 - y2) * (cx0 - x2)) * inv;
       let w2 = ((x1 - x0) * (cy - y0) - (y1 - y0) * (cx0 - x0)) * inv;
       let row = py * W + minX;
+      // output pixel row of these samples (procedural and msaa caches, pixel buffers)
+      const rowBlk = blk > 1 ? (py / blk) | 0 : py;
+      const pixRow = rowBlk * pixW;
       for (let px = minX; px <= maxX; px++, row++, w0 += a0, w1 += a1, w2 += a2) {
         if (w0 < e0 || w1 < e1 || w2 < e2) continue;
         const z = w0 * z0 + w1 * z1 + w2 * z2;
         if (z <= depth[row] || z < zMin) continue;
-        // perspective-correct weights
-        let l0 = w0 * q0;
-        let l1 = w1 * q1;
-        let l2 = w2 * q2;
-        const s = 1 / (l0 + l1 + l2);
-        l0 *= s;
-        l1 *= s;
-        l2 *= s;
+        // output pixel column of this sample
+        const slot = blk > 1 ? (px / blk) | 0 : px;
+        const hit = msaa && shTri[slot] === shSerial && shRow[slot] === rowBlk;
+        let l0 = 0;
+        let l1 = 0;
+        let l2 = 0;
         let cr = 1;
         let cg = 1;
         let cb = 1;
         let ca = 1;
-        if (mat.vertexColors) {
-          cr = l0 * S[oa + 10] + l1 * S[ob + 10] + l2 * S[oc + 10];
-          cg = l0 * S[oa + 11] + l1 * S[ob + 11] + l2 * S[oc + 11];
-          cb = l0 * S[oa + 12] + l1 * S[ob + 12] + l2 * S[oc + 12];
-          ca = l0 * S[oa + 13] + l1 * S[ob + 13] + l2 * S[oc + 13];
-        }
-        if (tex) {
-          const u =
-            (l0 * S[oa + 14] + l1 * S[ob + 14] + l2 * S[oc + 14]) * mat.texScale[0] + mat.texOffset[0];
-          const v =
-            (l0 * S[oa + 15] + l1 * S[ob + 15] + l2 * S[oc + 15]) * mat.texScale[1] + mat.texOffset[1];
-          this.sample(tex, u, v);
-          cr *= this.texR;
-          cg *= this.texG;
-          cb *= this.texB;
-          ca *= this.texA;
-        }
         // procedural channels override the material values; they are evaluated once per output
         // pixel and triangle (cached per output-pixel column) and shared by its samples
         let sm = mat;
@@ -796,31 +942,59 @@ export class Rasterizer {
         let bb = mat.b;
         const pv = this.procVal;
         let po = 0;
-        if (proc) {
-          const blk = this.shadingBlock;
-          const slot = blk > 1 ? (px / blk) | 0 : px;
-          const rowBlk = blk > 1 ? (py / blk) | 0 : py;
-          po = slot * PROC_VALUES;
-          if (this.procTri[slot] !== serial || this.procRow[slot] !== rowBlk) {
-            this.procTri[slot] = serial;
-            this.procRow[slot] = rowBlk;
-            this.shadeProcedural(proc, mat, l0, l1, l2, oa, ob, oc, po);
+        // (a depth pass of an opaque surface, or a shaded colour from the msaa cache, needs none
+        // of the interpolated attributes unless the sample's alpha decides its coverage)
+        if (needAlpha || !(hit || depthOnly)) {
+          // perspective-correct weights
+          l0 = w0 * q0;
+          l1 = w1 * q1;
+          l2 = w2 * q2;
+          const s = 1 / (l0 + l1 + l2);
+          l0 *= s;
+          l1 *= s;
+          l2 *= s;
+          if (mat.vertexColors) {
+            cr = l0 * S[oa + 10] + l1 * S[ob + 10] + l2 * S[oc + 10];
+            cg = l0 * S[oa + 11] + l1 * S[ob + 11] + l2 * S[oc + 11];
+            cb = l0 * S[oa + 12] + l1 * S[ob + 12] + l2 * S[oc + 12];
+            ca = l0 * S[oa + 13] + l1 * S[ob + 13] + l2 * S[oc + 13];
           }
-          br = pv[po];
-          bg = pv[po + 1];
-          bb = pv[po + 2];
-          ca *= pv[po + 3];
-          const pm = this.pm;
-          pm.metallic = pv[po + 4];
-          pm.roughness = pv[po + 5];
-          pm.er = pv[po + 6];
-          pm.eg = pv[po + 7];
-          pm.eb = pv[po + 8];
-          // (glass stays glass: without these a transmissive material with a procedural texture
-          // was shaded as an opaque diffuse surface)
-          pm.transmission = mat.transmission;
-          pm.ior = mat.ior;
-          sm = pm;
+          if (tex) {
+            const u =
+              (l0 * S[oa + 14] + l1 * S[ob + 14] + l2 * S[oc + 14]) * mat.texScale[0] + mat.texOffset[0];
+            const v =
+              (l0 * S[oa + 15] + l1 * S[ob + 15] + l2 * S[oc + 15]) * mat.texScale[1] + mat.texOffset[1];
+            this.sample(tex, u, v);
+            if (!mat.alphaOnly) {
+              cr *= this.texR;
+              cg *= this.texG;
+              cb *= this.texB;
+            }
+            ca *= this.texA;
+          }
+          if (proc) {
+            po = slot * PROC_VALUES;
+            if (this.procTri[slot] !== serial || this.procRow[slot] !== rowBlk) {
+              this.procTri[slot] = serial;
+              this.procRow[slot] = rowBlk;
+              this.shadeProcedural(proc, mat, l0, l1, l2, oa, ob, oc, po);
+            }
+            br = pv[po];
+            bg = pv[po + 1];
+            bb = pv[po + 2];
+            ca *= pv[po + 3];
+            const pm = this.pm;
+            pm.metallic = pv[po + 4];
+            pm.roughness = pv[po + 5];
+            pm.er = pv[po + 6];
+            pm.eg = pv[po + 7];
+            pm.eb = pv[po + 8];
+            // (glass stays glass: without these a transmissive material with a procedural texture
+            // was shaded as an opaque diffuse surface)
+            pm.transmission = mat.transmission;
+            pm.ior = mat.ior;
+            sm = pm;
+          }
         }
         // coverage: alpha clip (binary) or, in the transparent pass, alpha blending
         let a = 1;
@@ -832,78 +1006,169 @@ export class Rasterizer {
           if (a > 1) a = 1;
         }
         if (!this.blendPass) depth[row] = z;
-        let nx = (l0 * S[oa + 4] + l1 * S[ob + 4] + l2 * S[oc + 4]) * flip;
-        let ny = (l0 * S[oa + 5] + l1 * S[ob + 5] + l2 * S[oc + 5]) * flip;
-        let nz = (l0 * S[oa + 6] + l1 * S[ob + 6] + l2 * S[oc + 6]) * flip;
-        const nl = 1 / (Math.sqrt(nx * nx + ny * ny + nz * nz) || 1);
-        nx *= nl;
-        ny *= nl;
-        nz *= nl;
-        const wx = l0 * S[oa + 7] + l1 * S[ob + 7] + l2 * S[oc + 7];
-        const wy = l0 * S[oa + 8] + l1 * S[ob + 8] + l2 * S[oc + 8];
-        const wz = l0 * S[oa + 9] + l1 * S[ob + 9] + l2 * S[oc + 9];
-        if (proc?.normal && proc.bump !== 0) {
-          if (pv[po + 9] === pv[po + 9]) {
-            // bumped normal of this pixel's first sample (not NaN)
-            nx = pv[po + 9];
-            ny = pv[po + 10];
-            nz = pv[po + 11];
-          } else {
-            // offsets to the neighbour pixels (like the shader's dFdx/dFdy), then Mikkelsen bump
-            const pn = this.pn;
-            pn[0] = nx;
-            pn[1] = ny;
-            pn[2] = nz;
-            this.coordAt(proc.normal, l0, l1, l2, oa, ob, oc, this.pc);
-            if (
-              this.neighbour(proc.normal, w0 + a0, w1 + a1, w2 + a2, q0, q1, q2, oa, ob, oc, wx, wy, wz, 0) &&
-              this.neighbour(proc.normal, w0 + b0, w1 + b1, w2 + b2, q0, q1, q2, oa, ob, oc, wx, wy, wz, 1)
-            ) {
-              const h0 = pv[po + 12];
-              bumpNormal(proc.normal, proc.bump, this.pc, this.pcx, this.pcy, this.ppx, this.ppy, pn, pn, h0);
-              nx = pn[0];
-              ny = pn[1];
-              nz = pn[2];
-            }
-            pv[po + 9] = nx;
-            pv[po + 10] = ny;
-            pv[po + 11] = nz;
-          }
-        }
-        if (this.mode === SHADE_SOLID) this.shadeSolid(mat, nx, ny, nz);
-        else this.shadeMaterial(sm, nx, ny, nz, wx, wy, wz, br * cr, bg * cg, bb * cb);
-        let r = this.outR;
-        let g = this.outG;
-        let b = this.outB;
-        // glass (transparent pass): the share of what is behind it that it lets through, per
-        // channel: base colour × (1 − Fresnel) × transmission
+        if (depthOnly) continue;
+        let r: number;
+        let g: number;
+        let b: number;
+        // glass (transparent pass): the share of what is behind it that it lets through
         let tr = 0;
         let tg = 0;
         let tb = 0;
-        const trans = mat.transmission ?? 0;
-        if (this.blendPass && trans > 0 && this.mode === SHADE_MATERIAL) {
-          const ior = mat.ior ?? 1.5;
-          const f = (ior - 1) / (ior + 1);
-          const f0 = f * f;
-          const cv = 1 - (this.outNdv > 0 ? this.outNdv : 0);
-          const cv2 = cv * cv;
-          const k = trans * (1 - sm.metallic) * (1 - (f0 + (1 - f0) * cv2 * cv2 * cv));
-          tr = k * Math.min(1, br * cr);
-          tg = k * Math.min(1, bg * cg);
-          tb = k * Math.min(1, bb * cb);
-        }
-        if (this.mistDensity > 0 && this.mode === SHADE_MATERIAL) {
-          // FogExp2 over the planar view depth (as three.js scene fog); the mist colour fills in
-          // only for the part of the view that ends here, not for what glass lets through (that
-          // is misted by its own depth, so the mist behind glass matches the mist around it)
-          const e = this.view.eye;
-          const f = this.view.forward;
-          const k = this.mistDensity * ((wx - e[0]) * f[0] + (wy - e[1]) * f[1] + (wz - e[2]) * f[2]);
-          const m = 1 - Math.exp(-k * k);
-          const mc = this.mistColor;
-          r += (mc[0] * (1 - tr) - r) * m;
-          g += (mc[1] * (1 - tg) - g) * m;
-          b += (mc[2] * (1 - tb) - b) * m;
+        // ambient / environment part of the colour (ambient occlusion)
+        let ar = 0;
+        let ag = 0;
+        let ab = 0;
+        // their packed share of the colour (see `packAmbient`), when known (cached)
+        let packed = -1;
+        let nx: number;
+        let ny: number;
+        let nz: number;
+        if (hit) {
+          const o = slot * SHADE_VALUES;
+          r = sv[o];
+          g = sv[o + 1];
+          b = sv[o + 2];
+          tr = sv[o + 3];
+          tg = sv[o + 4];
+          tb = sv[o + 5];
+          ar = sv[o + 6];
+          ag = sv[o + 7];
+          ab = sv[o + 8];
+          nx = sv[o + 9];
+          ny = sv[o + 10];
+          nz = sv[o + 11];
+          packed = sv[o + 12];
+        } else {
+          nx = (l0 * S[oa + 4] + l1 * S[ob + 4] + l2 * S[oc + 4]) * flip;
+          ny = (l0 * S[oa + 5] + l1 * S[ob + 5] + l2 * S[oc + 5]) * flip;
+          nz = (l0 * S[oa + 6] + l1 * S[ob + 6] + l2 * S[oc + 6]) * flip;
+          const nl = 1 / (Math.sqrt(nx * nx + ny * ny + nz * nz) || 1);
+          nx *= nl;
+          ny *= nl;
+          nz *= nl;
+          const wx = l0 * S[oa + 7] + l1 * S[ob + 7] + l2 * S[oc + 7];
+          const wy = l0 * S[oa + 8] + l1 * S[ob + 8] + l2 * S[oc + 8];
+          const wz = l0 * S[oa + 9] + l1 * S[ob + 9] + l2 * S[oc + 9];
+          if (proc?.normal && proc.bump !== 0) {
+            if (pv[po + 9] === pv[po + 9]) {
+              // bumped normal of this pixel's first sample (not NaN)
+              nx = pv[po + 9];
+              ny = pv[po + 10];
+              nz = pv[po + 11];
+            } else {
+              // offsets to the neighbour pixels (like the shader's dFdx/dFdy), then Mikkelsen bump
+              const pn = this.pn;
+              pn[0] = nx;
+              pn[1] = ny;
+              pn[2] = nz;
+              this.coordAt(proc.normal, l0, l1, l2, oa, ob, oc, this.pc);
+              if (
+                this.neighbour(
+                  proc.normal,
+                  w0 + a0,
+                  w1 + a1,
+                  w2 + a2,
+                  q0,
+                  q1,
+                  q2,
+                  oa,
+                  ob,
+                  oc,
+                  wx,
+                  wy,
+                  wz,
+                  0,
+                ) &&
+                this.neighbour(proc.normal, w0 + b0, w1 + b1, w2 + b2, q0, q1, q2, oa, ob, oc, wx, wy, wz, 1)
+              ) {
+                const h0 = pv[po + 12];
+                bumpNormal(
+                  proc.normal,
+                  proc.bump,
+                  this.pc,
+                  this.pcx,
+                  this.pcy,
+                  this.ppx,
+                  this.ppy,
+                  pn,
+                  pn,
+                  h0,
+                );
+                nx = pn[0];
+                ny = pn[1];
+                nz = pn[2];
+              }
+              pv[po + 9] = nx;
+              pv[po + 10] = ny;
+              pv[po + 11] = nz;
+            }
+          }
+          if (shadowed) {
+            // the shadow filter's rotation: per sample, or per pixel when shading per pixel
+            this.shadeX = msaa ? slot : px;
+            this.shadeY = msaa ? rowBlk : py;
+          }
+          if (this.mode === SHADE_SOLID) this.shadeSolid(mat, nx, ny, nz);
+          else this.shadeMaterial(sm, nx, ny, nz, wx, wy, wz, br * cr, bg * cg, bb * cb);
+          r = this.outR;
+          g = this.outG;
+          b = this.outB;
+          if (amb) {
+            ar = this.outAR;
+            ag = this.outAG;
+            ab = this.outAB;
+          }
+          // glass (transparent pass): the share of what is behind it that it lets through, per
+          // channel: base colour × (1 − Fresnel) × transmission
+          const trans = mat.transmission ?? 0;
+          if (this.blendPass && trans > 0 && this.mode === SHADE_MATERIAL) {
+            const ior = mat.ior ?? 1.5;
+            const f = (ior - 1) / (ior + 1);
+            const f0 = f * f;
+            const cv = 1 - (this.outNdv > 0 ? this.outNdv : 0);
+            const cv2 = cv * cv;
+            const k = trans * (1 - sm.metallic) * (1 - (f0 + (1 - f0) * cv2 * cv2 * cv));
+            tr = k * Math.min(1, br * cr);
+            tg = k * Math.min(1, bg * cg);
+            tb = k * Math.min(1, bb * cb);
+          }
+          if (this.mistDensity > 0 && this.mode === SHADE_MATERIAL) {
+            // FogExp2 over the planar view depth (as three.js scene fog); the mist colour fills in
+            // only for the part of the view that ends here, not for what glass lets through (that
+            // is misted by its own depth, so the mist behind glass matches the mist around it)
+            const e = this.view.eye;
+            const f = this.view.forward;
+            const k = this.mistDensity * ((wx - e[0]) * f[0] + (wy - e[1]) * f[1] + (wz - e[2]) * f[2]);
+            const m = 1 - Math.exp(-k * k);
+            const mc = this.mistColor;
+            r += (mc[0] * (1 - tr) - r) * m;
+            g += (mc[1] * (1 - tg) - g) * m;
+            b += (mc[2] * (1 - tb) - b) * m;
+            if (amb) {
+              ar *= 1 - m;
+              ag *= 1 - m;
+              ab *= 1 - m;
+            }
+          }
+          if (msaa) {
+            const o = slot * SHADE_VALUES;
+            sv[o] = r;
+            sv[o + 1] = g;
+            sv[o + 2] = b;
+            sv[o + 3] = tr;
+            sv[o + 4] = tg;
+            sv[o + 5] = tb;
+            sv[o + 6] = ar;
+            sv[o + 7] = ag;
+            sv[o + 8] = ab;
+            sv[o + 9] = nx;
+            sv[o + 10] = ny;
+            sv[o + 11] = nz;
+            if (amb) packed = packAmbient(ar, ag, ab, r, g, b);
+            sv[o + 12] = packed;
+            shTri[slot] = shSerial;
+            shRow[slot] = rowBlk;
+          }
         }
         if (wire) {
           let d = Infinity;
@@ -915,6 +1180,10 @@ export class Rasterizer {
             r += (wc[0] - r) * k;
             g += (wc[1] - g) * k;
             b += (wc[2] - b) * k;
+            ar *= 1 - k;
+            ag *= 1 - k;
+            ab *= 1 - k;
+            packed = -1;
           }
         }
         if (this.blendPass) {
@@ -926,14 +1195,40 @@ export class Rasterizer {
           color[o3 + 2] = a * b + color[o3 + 2] * (1 - a + a * tb);
           const opacity = a * (1 - (0.2126 * tr + 0.7152 * tg + 0.0722 * tb));
           cov[row] = opacity + cov[row] * (1 - opacity);
+          if (pix && a >= this.pixelsBlendAlpha) this.coverPixel(pix, pixRow + slot, z, nx, ny, nz);
           continue;
         }
         color[row * 3] = r;
         color[row * 3 + 1] = g;
         color[row * 3 + 2] = b;
         cov[row] = 1;
+        if (amb) amb[row] = packed >= 0 ? packed : packAmbient(ar, ag, ab, r, g, b);
+        if (pixKey !== null) {
+          // as `coverPixel`
+          const p = pixRow + slot;
+          if (z > pixKey[p]) {
+            pixKey[p] = z;
+            pixNormal[p * 3] = nx;
+            pixNormal[p * 3 + 1] = ny;
+            pixNormal[p * 3 + 2] = nz;
+            if (pixObject !== null) pixObject[p] = objIndex;
+          }
+        }
       }
     }
+  }
+
+  /**
+   * Records a sample as its output pixel's nearest one when it is (the depth key only grows: over
+   * all writes, the largest key is the one the depth buffer finally holds for some sample).
+   */
+  private coverPixel(pix: PixelBuffers, p: number, z: number, nx: number, ny: number, nz: number): void {
+    if (!(z > pix.key[p])) return;
+    pix.key[p] = z;
+    pix.normal[p * 3] = nx;
+    pix.normal[p * 3 + 1] = ny;
+    pix.normal[p * 3 + 2] = nz;
+    if (pix.object) pix.object[p] = this.objectIndex;
   }
 
   /** Texture coordinate of a procedural channel at perspective-correct barycentrics l0..l2. */
@@ -1201,6 +1496,13 @@ export class Rasterizer {
       g = amb[1] * dg + m.eg;
       b = amb[2] * db + m.eb;
     }
+    // the ambient / environment part (ambient occlusion darkens it): diffuse so far, reflections next
+    const track = this.trackAmbient;
+    if (track) {
+      this.outAR = r - m.er;
+      this.outAG = g - m.eg;
+      this.outAB = b - m.eb;
+    }
     const sp = this.skyTmp2;
     const probe = this.probe ?? this.env;
     if (probe) {
@@ -1212,6 +1514,11 @@ export class Rasterizer {
       r += sp[0] * (f0r * ab[0] + ab[1]);
       g += sp[1] * (f0g * ab[0] + ab[1]);
       b += sp[2] * (f0b * ab[0] + ab[1]);
+      if (track) {
+        this.outAR += sp[0] * (f0r * ab[0] + ab[1]);
+        this.outAG += sp[1] * (f0g * ab[0] + ab[1]);
+        this.outAB += sp[2] * (f0b * ab[0] + ab[1]);
+      }
     } else if (sky) {
       // the sky in the mirror direction, blurred towards the irradiance with roughness
       sampleSkyModel(sky.model, rx, ry, rz, false, sp);
@@ -1220,11 +1527,22 @@ export class Rasterizer {
       r += k * (sp[0] + t * (d[0] - sp[0])) * f0r;
       g += k * (sp[1] + t * (d[1] - sp[1])) * f0g;
       b += k * (sp[2] + t * (d[2] - sp[2])) * f0b;
+      if (track) {
+        this.outAR += k * (sp[0] + t * (d[0] - sp[0])) * f0r;
+        this.outAG += k * (sp[1] + t * (d[1] - sp[1])) * f0g;
+        this.outAB += k * (sp[2] + t * (d[2] - sp[2])) * f0b;
+      }
     } else {
       r += amb[0] * f0r;
       g += amb[1] * f0g;
       b += amb[2] * f0b;
+      if (track) {
+        this.outAR += amb[0] * f0r;
+        this.outAG += amb[1] * f0g;
+        this.outAB += amb[2] * f0b;
+      }
     }
+    const maps = this.shadowMaps;
     const L = this.lights;
     // GGX microfacet specular (the path tracer's principled BSDF): α = roughness², Smith
     // height-correlated visibility, Schlick Fresnel
@@ -1300,6 +1618,28 @@ export class Rasterizer {
       }
       const ndl = nx * lx + ny * ly + nz * lz;
       if (ndl <= 0) continue;
+      // the light's shadow map: how much of it reaches this point
+      let vis = 1;
+      if (maps !== null) {
+        const map = maps[i];
+        if (map) {
+          vis = shadowVisibility(
+            map,
+            px,
+            py,
+            pz,
+            this.faceNx,
+            this.faceNy,
+            this.faceNz,
+            nx,
+            ny,
+            nz,
+            this.shadeX,
+            this.shadeY,
+          );
+          if (vis <= 0) continue;
+        }
+      }
       let sr = 0;
       let sg = 0;
       let sb = 0;
@@ -1349,7 +1689,8 @@ export class Rasterizer {
           sb = (f0b + (1 - f0b) * fw) * k;
         }
       }
-      const k = e * ndl;
+      // (× 1 when unshadowed: the same value as without shadows)
+      const k = e * ndl * vis;
       r += L[o + 7] * k * (dr * INV_PI + sr);
       g += L[o + 8] * k * (dg * INV_PI + sg);
       b += L[o + 9] * k * (db * INV_PI + sb);
@@ -1383,6 +1724,12 @@ export class Rasterizer {
     this.outR = m.r * diff + spec;
     this.outG = m.g * diff + spec;
     this.outB = m.b * diff + spec;
+    if (this.trackAmbient) {
+      // the hemisphere light is the ambient part (ambient occlusion darkens it)
+      this.outAR = m.r * hemi;
+      this.outAG = m.g * hemi;
+      this.outAB = m.b * hemi;
+    }
   }
 }
 

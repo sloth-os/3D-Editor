@@ -22,11 +22,12 @@ Contents:
 11. [Rigging](#rigging)
 12. [Physics](#physics)
 13. [Generators, layout and scattering](#generators-layout-and-scattering)
-14. [Render budgets](#render-budgets)
-15. [Exporting](#exporting)
-16. [Common errors and how to read them](#common-errors-and-how-to-read-them)
-17. [Example projects](#example-projects)
-18. [What the editor does not have](#what-the-editor-does-not-have)
+14. [Directing shots for AI video](#directing-shots-for-ai-video)
+15. [Render budgets](#render-budgets)
+16. [Exporting](#exporting)
+17. [Common errors and how to read them](#common-errors-and-how-to-read-them)
+18. [Example projects](#example-projects)
+19. [What the editor does not have](#what-the-editor-does-not-have)
 
 ## Before you start
 
@@ -571,6 +572,68 @@ their final size instead of scaling small ones.
   turns instances into objects; `object.particle_system_add` / `_update` expose every particle
   setting.
 
+## Directing shots for AI video
+
+The director's desk ([director-desk.md](director-desk.md)) stages a scene for an AI video model and
+renders one reference clip per shot. Its `desk.*` operators run through `run_operator` and `batch`
+(`list_operators {category: "Director"}` lists them); the video export, the model store and rideo
+have tools of their own. A session goes like this:
+
+1. **Set**: `desk.set_build {width, depth, ground, sun_azimuth_deg, sun_elevation_deg}` lays a
+   ground plane and a SKY world whose sun is the one key light (`interior: true` adds walls).
+2. **Cast**: `desk.actor_add {kind, name, location, facing_deg}` for people (`adult`, `man`,
+   `woman`, `child`, `toddler`, `elder`) and animals (`horse`, `pony`, `donkey`, `cow`, `dog`,
+   `small_dog`, `cat`, `sheep`, `pig`, `deer`, `bear`); `facing_deg` 0 faces the front (−Y), 90
+   faces +X.
+3. **Props**: `store_search {query}`, then `store_add {project, model, location, height_m}`:
+   built-in models are built at once, external ones are downloaded first and keep their licence;
+   `store.add {model}` through `run_operator` adds built-in models too.
+4. **Action**: `desk.actor_move {actor, points, frame_start, speed_mps}` (or `frame_end`),
+   `desk.actor_pose {actor, pose, frame}`, `desk.actor_face`, `desk.actor_look_at`,
+   `desk.actor_hold {actor, prop, frame, release_frame}`, `desk.actor_mount {rider, mount, frame}`;
+   `desk.tether_fly {flyer, anchor, anchor_bone: "hand.R", length_m, wind_dir_deg, wind_mps, frame_start, frame_end}`
+   for kites and balloons; `desk.physics_throw`, `desk.physics_drop` or `desk.physics_push`, then
+   `desk.physics_bake`. Keep actors off water: `desk.actor_move` warns where a path crosses a lake,
+   pond or stream (the metres along the path), `desk.actor_add` and `store.add` where an actor is
+   put down on one; route the move around it with more points (or raise them onto a bridge's deck).
+   A swimmer or a wader belongs in the water: give it `in_water: true` (`desk.actor_add` for every
+   frame, `desk.actor_move` for the frames of the swim), and neither the warnings nor `desk.check`
+   take it for walking on water; a rower parented to her boat stands on the boat. A body that
+   reaches water floats there once baked (the presets warn where it does; `desk.physics_bake` lists
+   it in `floats`, `water: 'ignore'` keys it as simulated); re-aim the throw to keep it on land.
+5. **Shots**: one `desk.shot_add {name, framing, angle, height, subjects, layout, move, duration_s}`
+   per shot, in cut order. Each gets a camera named after it, solved from the description, kept in
+   frame over the shot and on one side of the 180° line; `desk.shot_solve {}` solves them all again
+   after the action changed.
+6. **Check**: `desk.check {}` returns the issues (errors `line_crossed`, `subject_out_of_frame`,
+   `camera_inside`, `missing_camera`, `tether_detached`, `walks_on_water`; warnings such as
+   `plan_mismatch`, `jump_cut`, `subject_revealed` and `body_in_water`) and each shot's blocking
+   line. Fix the errors, then look at the cut with
+   `render_animation {camera: "shots", format: "CONTACT_SHEET", frame_step: 24}`.
+7. **Export**: `export_video {project, quality: "draft"}` returns at once with an export id; call
+   `export_status {export, wait_s: 50}` until `status` is `done`, then fetch the files by their
+   `url` (with the server's token when it has one).
+
+- Each desk operator is one undo step and returns ids and names in `result`; a solve reports what it
+  gave up per shot (`widened`, `effective_framing`, `out_of_frame`, `gave_up`, `occluded`) and warns
+  in `reports`.
+- Actors move as objects: locomotion keys the armature object's location and heading, never the
+  `root` bone, so `get_object` on the actor gives where it stands.
+- A pose holds until the next one (`hold_frames` only keys where the hold ends): key `stand` or
+  `idle` after a gesture to end it, and `desk.actor_look_at {actor, target: null, frame}` to end a
+  look.
+- A kite's string is an object of its own; the video export draws it at least 2 px wide. `after`
+  decides what the kite does after its flight: `hold`, `hide` or `land`.
+- Speed: a 1280 × 720 export of 48 frames took 16 s at `draft` and 20 s at `standard` on 4 render
+  processes, and 720 frames at 640 × 360 `draft` with three passes 65–80 s
+  ([video-export.md](video-export.md#quality-presets-and-speed)). Check the cut with contact sheets
+  first.
+- `duck` and `bird` are not built yet; `desk.actor_add` refuses them and lists the built kinds.
+- For a clip of the AI video studio rideo, `rideo_import` builds the scene from its blocking; after
+  the steps above, `export_video {project, preset: "rideo"}` makes the clips rideo takes (draft clay
+  clips with the beauty, depth and pose passes) and `rideo_push {project, export, rideo}` sends them
+  back ([rideo.md](rideo.md)).
+
 ## Render budgets
 
 | Purpose                        | Typical settings (ranges the example scripts used while this guide was written)                        |
@@ -939,8 +1002,9 @@ Compared with Blender, these are missing; plan around them rather than searching
   object constraints to the 16 types listed above.
 - **Rendering**: a CPU path tracer and rasterizers; no GPU path tracing, volumes, subsurface
   scattering, glass (refractive) caustics, motion blur, render passes or light linking. The
-  denoiser is a simple filter, so very low sample counts stay blotchy. Animations come out as GIF,
-  APNG, PNG sequences or contact sheets, not video files.
+  denoiser is a simple filter, so very low sample counts stay blotchy. `render_animation` makes
+  GIF, APNG, PNG sequences or contact sheets; video files (H.264 or VP9, rasterized) come from
+  `export_video`.
 - **Text and UVs**: one built-in font without text boxes or word wrap; UV unwrapping is
   projection-based (Smart UV Project, cube, cylinder, sphere), without angle-based unwrapping.
 - **Images**: no operator loads image textures through MCP.

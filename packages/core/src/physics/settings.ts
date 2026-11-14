@@ -45,6 +45,28 @@ function vec3(v: unknown, fallback: Vec3): Vec3 {
     : [...fallback];
 }
 
+/** Largest |component| of a rigid body's initial linear (m/s) or angular (rad/s) velocity. */
+export const MAX_INITIAL_VELOCITY = 1000;
+
+/** Largest |start_frame| of a rigid body. */
+export const MAX_START_FRAME = 1_000_000;
+
+/** A finite vector with each component clamped to ±max (the zero vector when it is not one). */
+function clampedVec3(v: unknown, max: number): Vec3 {
+  const out = vec3(v, [0, 0, 0]);
+  return [
+    Math.min(max, Math.max(-max, out[0])),
+    Math.min(max, Math.max(-max, out[1])),
+    Math.min(max, Math.max(-max, out[2])),
+  ];
+}
+
+/** A rigid body's start frame: null (the world's frame_start) or an integer within ±MAX_START_FRAME. */
+function startFrame(v: unknown): number | null {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+  return Math.round(Math.min(MAX_START_FRAME, Math.max(-MAX_START_FRAME, v)));
+}
+
 /** Blender's rigid body world defaults. */
 export function defaultRigidBodyWorld(): RigidBodyWorld {
   return {
@@ -131,6 +153,10 @@ export function sanitizeRigidBody(rb: unknown): RigidBodyData | null {
     collision_margin: num(o.collision_margin, d.collision_margin, 0, 1),
     linear_damping: num(o.linear_damping, d.linear_damping, 0, 1),
     angular_damping: num(o.angular_damping, d.angular_damping, 0, 1),
+    start_frame: startFrame(o.start_frame),
+    initial_linear_velocity: clampedVec3(o.initial_linear_velocity, MAX_INITIAL_VELOCITY),
+    initial_angular_velocity: clampedVec3(o.initial_angular_velocity, MAX_INITIAL_VELOCITY),
+    inherit_velocity: bool(o.inherit_velocity, d.inherit_velocity),
   };
 }
 
@@ -148,3 +174,40 @@ export function motionMode(rb: RigidBodyData): MotionMode {
   if (rb.type === 'PASSIVE') return 'STATIC';
   return rb.enabled ? 'DYNAMIC' : 'FROZEN';
 }
+
+/**
+ * The start frame of a body that joins the simulation after the world's frame_start (an ACTIVE body
+ * that is not animated, with a start_frame after `frameStart`): it follows its animated transform up
+ * to and including that frame, as an animated body does, and the simulation moves it from the next
+ * one. Null for the other bodies: they start with the world (their initial velocities apply there).
+ */
+export function delayedStartFrame(rb: RigidBodyData, frameStart: number): number | null {
+  if (rb.type !== 'ACTIVE' || rb.kinematic || rb.start_frame === null) return null;
+  return rb.start_frame > frameStart ? rb.start_frame : null;
+}
+
+/**
+ * Animated steps a delayed body follows before its release (simulation.ts): it takes part in the
+ * simulation from its start frame − RELEASE_TRACKED_STEPS (placed at its animated pose there) and
+ * is dormant before. The last step gives the velocity it keeps (inherit_velocity); the one before
+ * shows whether that velocity is a jump of its animation rather than its motion.
+ */
+export const RELEASE_TRACKED_STEPS = 2;
+
+/**
+ * A release velocity that differs from the animated velocity one frame earlier by more than these
+ * accelerations (m/s², rad/s²; at least RELEASE_JUMP_MIN_* between the two frames) comes from a
+ * jump of the animated transform at the release (a release pose keyed for another motion of the
+ * holder), not from a hand's swing: the body keeps the slower of the two velocities (simulation.ts).
+ */
+export const RELEASE_MAX_ACCELERATION = 150;
+export const RELEASE_MAX_ANGULAR_ACCELERATION = 400;
+export const RELEASE_JUMP_MIN_LINEAR = 2;
+export const RELEASE_JUMP_MIN_ANGULAR = 4;
+
+/**
+ * Seconds the world runs on after frame_end for bodies released at or after it (their start_frame
+ * set after the world's range was chosen): until they have come to rest (asleep), at most this long
+ * after the last of those releases.
+ */
+export const LATE_RELEASE_RUN_SECONDS = 20;

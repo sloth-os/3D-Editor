@@ -35,6 +35,11 @@ export interface AnimationJob {
   fps: number;
   /** Options shared by every frame (frame, view and time_limit are set per frame). */
   base: Omit<FrameOptions, 'frame' | 'time_limit' | 'width' | 'height'>;
+  /**
+   * A camera per frame (aligned with `frames`; undefined: `base.cameraId`, else the automatic
+   * view), e.g. the shot cameras of render_animation camera 'shots'.
+   */
+  cameras?: readonly (string | undefined)[];
   /** PATHTRACER: sampling time budget per frame in seconds (0 / unset = none). */
   frameTimeLimit?: number;
   /** Wall-clock budget of the whole render in seconds (0 / unset = none); see core renderAnimation. */
@@ -113,9 +118,10 @@ export async function renderAnimationParallel(
   const left = () => budgetMs - (now() - t0);
   const expired = () => budgetMs > 0 && left() <= 0;
 
-  // one automatic view for every frame when there is no camera (as core renderAnimation)
+  const cameraOf = (i: number): string | undefined => job.cameras?.[i] ?? job.base.cameraId;
+  // one automatic view for every frame without a camera (as core renderAnimation)
   let view: AutoViewResult = null;
-  if (!job.base.cameraId && !job.base.view)
+  if (!job.base.view && job.frames.some((_, i) => !cameraOf(i)))
     view = await abortable(
       threads[0].call<AutoViewResult>({
         type: 'auto-view',
@@ -154,7 +160,8 @@ export async function renderAnimationParallel(
         width: job.width,
         height: job.height,
         frame,
-        view: view ?? job.base.view,
+        cameraId: cameraOf(i),
+        view: cameraOf(i) ? job.base.view : (view ?? job.base.view),
         time_limit: timeLimit,
         seed: job.animatedSeed ? seed + Math.round(frame) : seed,
         ...(physics?.has(frame) ? { physics: physics.get(frame) } : {}),

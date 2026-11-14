@@ -1,6 +1,13 @@
 import { defineConfig } from 'vitest/config';
 import preact from '@preact/preset-vite';
 
+/**
+ * The frame states of a document share what they read of it until it changes (core
+ * eval/frame-input.ts): frozen in every test run, so that code writing into an evaluated object's
+ * arrays, poses or constraints throws in its tests instead of changing later frames.
+ */
+const FREEZE_EVALUATION_INPUT = { EVAL_FREEZE_INPUT: '1' };
+
 export default defineConfig({
   test: {
     projects: [
@@ -14,6 +21,7 @@ export default defineConfig({
           // under coverage instrumentation they can take several times longer than locally
           testTimeout: 30_000,
           hookTimeout: 30_000,
+          env: FREEZE_EVALUATION_INPUT,
         },
       },
       {
@@ -22,6 +30,7 @@ export default defineConfig({
           root: './apps/server',
           include: ['test/unit/**/*.test.ts'],
           environment: 'node',
+          env: FREEZE_EVALUATION_INPUT,
         },
       },
       {
@@ -43,6 +52,7 @@ export default defineConfig({
           include: ['test/**/*.test.{ts,tsx}'],
           environment: 'happy-dom',
           setupFiles: ['./test/setup.ts'],
+          env: FREEZE_EVALUATION_INPUT,
         },
       },
     ],

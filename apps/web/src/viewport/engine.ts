@@ -13,12 +13,14 @@ import {
   meshBounds,
   orthoHalfExtents,
   transformPoint3,
+  type EvaluatedObject,
   type EvaluatedScene,
   type MeshData,
   type RenderEngine,
   type Vec3,
 } from '@3d-editor/core';
 import type { ProjectSession } from '../project/session';
+import { followedCameraId, shotPin } from './follow-shots';
 import {
   INSTANCE_BYTES,
   RASTER_BYTES_PER_TRIANGLE,
@@ -674,6 +676,9 @@ export class ViewportEngine {
       effect(() => {
         void st.$cursorLocation.value;
         void v.cameraView.value;
+        // the camera the camera view looks through (viewCamera)
+        void v.followShots.value;
+        void shotPin(v).value;
         this.requestRender();
       }),
       effect(() => {
@@ -1229,10 +1234,31 @@ export class ViewportEngine {
 
   // ------------------------------------------------------------------ cameras & render
 
-  /** The camera of the frames drawn: the scene camera's view, else the viewport's (as last drawn). */
+  /**
+   * The camera of the frames drawn: in the camera view the view of {@link viewCamera}, else the
+   * viewport's (as last drawn).
+   */
   get camera(): THREE.PerspectiveCamera | THREE.OrthographicCamera {
-    if (this.session.view.cameraView.value && this.ev?.activeCamera?.camera) return this.updateSceneCamera();
+    const shown = this.session.view.cameraView.value ? this.viewCamera() : null;
+    if (shown) return this.updateSceneCamera(shown);
     return this.shownPose.ortho ? this.orthoCam : this.perspCam;
+  }
+
+  /**
+   * The evaluated camera object the camera view looks through: the scene camera, or with Follow
+   * Shots (view3d.toggle_follow_shots) the camera of the shot at the current frame, the shot the
+   * sequence strip pinned first (follow-shots.ts); null without one.
+   */
+  viewCamera(): EvaluatedObject | null {
+    const ev = this.ev;
+    if (!ev) return null;
+    const v = this.session.view;
+    if (v.followShots.value) {
+      const id = followedCameraId(this.session.doc, this.session.state.frame, shotPin(v).value);
+      const shot = id ? ev.byId.get(id) : null;
+      if (shot?.camera) return shot;
+    }
+    return ev.activeCamera?.camera ? ev.activeCamera : null;
   }
 
   /**
@@ -1263,9 +1289,8 @@ export class ViewportEngine {
     return lerpPose(a.from, a.to, k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2);
   }
 
-  /** Viewport camera matching the active scene camera (frame fitted into the viewport). */
-  private updateSceneCamera(): THREE.PerspectiveCamera | THREE.OrthographicCamera {
-    const camObj = this.ev!.activeCamera!;
+  /** Viewport camera matching a scene camera, `camObj` (frame fitted into the viewport). */
+  private updateSceneCamera(camObj: EvaluatedObject): THREE.PerspectiveCamera | THREE.OrthographicCamera {
     const cam = camObj.camera!;
     const render = this.ev!.render;
     const renderAspect = render.resolution_x / Math.max(1, render.resolution_y);
@@ -1322,7 +1347,7 @@ export class ViewportEngine {
     const v = this.session.view;
     const aspect = this.width / Math.max(1, this.height);
     const pose = (this.shown = this.framePose(now));
-    if (!(v.cameraView.value && this.ev?.activeCamera?.camera)) {
+    if (!(v.cameraView.value && this.viewCamera())) {
       applyPoseToCamera(pose, pose.ortho ? this.orthoCam : this.perspCam, aspect);
     }
     const cam = this.camera;
@@ -1584,9 +1609,11 @@ export class ViewportEngine {
 
   /**
    * The camera object a render without an explicit view shows (see {@link rendersCamera}): the
-   * requested camera, else the scene camera; null when it shows the viewport's view. Read from the
-   * document as it is now, not from the viewport's last evaluation. A requested object that is not a
-   * camera is an error.
+   * requested camera, else with Follow Shots the camera of the shot at the render's frame (the shot
+   * the sequence strip pinned first when the render is of the current frame, as the camera view
+   * shows it; follow-shots.ts), else the scene camera; null when it shows the viewport's view. Read
+   * from the document as it is now, not from the viewport's last evaluation. A requested object that
+   * is not a camera is an error.
    */
   private renderCameraId(opts: RenderImageOptions): string | null {
     if (!this.rendersCamera(opts)) return null;
@@ -1603,6 +1630,14 @@ export class ViewportEngine {
         );
       }
       return opts.cameraId;
+    }
+    const view = this.session.view;
+    if (view.followShots.peek()) {
+      const atFrame = typeof opts.frame === 'number' && Number.isFinite(opts.frame);
+      const frame = atFrame ? opts.frame! : this.session.state.frame;
+      // a frame of Render Animation follows the cut as cameraForFrame has it: the pin is the view's
+      const shot = followedCameraId(doc, frame, atFrame ? null : shotPin(view).peek());
+      if (isCamera(shot)) return shot;
     }
     const sceneCamera = doc.getScene().camera;
     return isCamera(sceneCamera) ? sceneCamera : null;

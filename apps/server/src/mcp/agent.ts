@@ -28,14 +28,52 @@ import { listForName } from './project-storage';
 export type ErrorCode = OperatorError['code'];
 
 /**
+ * Kinds of failure of the server's services, which no operator reports (so they are codes of
+ * {@link ToolError} only, never of core OperatorError): a service that is not available
+ * (UNAVAILABLE: not implemented yet, not configured, or the server renders on its main thread),
+ * video export without ffmpeg (FFMPEG_UNAVAILABLE), a model store provider that needs an API key
+ * the server does not have (NEEDS_KEY), a model whose licence or provider does not allow
+ * downloading it (NOT_DOWNLOADABLE), a full export queue (QUEUE_FULL) and an outside service (a
+ * model provider, rideo) that failed or did not answer (UPSTREAM).
+ */
+export type ServiceErrorCode =
+  'UNAVAILABLE' | 'FFMPEG_UNAVAILABLE' | 'NEEDS_KEY' | 'NOT_DOWNLOADABLE' | 'QUEUE_FULL' | 'UPSTREAM';
+
+/** The code of a {@link ToolError}: an operator failure's kind or a service's. */
+export type ToolErrorCode = ErrorCode | ServiceErrorCode;
+
+/** Every {@link ServiceErrorCode}. */
+export const SERVICE_ERROR_CODES: readonly ServiceErrorCode[] = [
+  'UNAVAILABLE',
+  'FFMPEG_UNAVAILABLE',
+  'NEEDS_KEY',
+  'NOT_DOWNLOADABLE',
+  'QUEUE_FULL',
+  'UPSTREAM',
+];
+
+export function isServiceErrorCode(code: unknown): code is ServiceErrorCode {
+  return SERVICE_ERROR_CODES.includes(code as ServiceErrorCode);
+}
+
+/**
+ * The JSON a tool's failure carries on the line after its message: `{code}` for OUT_OF_MEMORY and
+ * the service codes, which agents branch on (retry later, configure a key, lower a size); the
+ * message of every other failure stays a line of its own.
+ */
+export function codedErrorDetails(code: ToolErrorCode | undefined): { code: ToolErrorCode } | undefined {
+  return code === 'OUT_OF_MEMORY' || isServiceErrorCode(code) ? { code } : undefined;
+}
+
+/**
  * Errors with a message meant for the agent (returned as `isError` tool results). `code` is the
  * kind of failure where the thrower knows it (a selection that cannot be applied: POLL_FAILED;
- * unknown things: {@link NotFoundError}).
+ * unknown things: {@link NotFoundError}; a service's: {@link ServiceErrorCode}).
  */
 export class ToolError extends Error {
   constructor(
     message: string,
-    readonly code?: ErrorCode,
+    readonly code?: ToolErrorCode,
   ) {
     super(message);
     this.name = 'ToolError';

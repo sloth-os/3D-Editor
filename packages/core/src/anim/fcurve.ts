@@ -7,7 +7,12 @@ import { applyFModifiers } from './fmodifiers';
  * curves never overshoot neighbouring key values.
  */
 
-function sortedKeys(fc: FCurve): Keyframe[] {
+/**
+ * The keyframes of `fc` in frame order: `fc.keyframes` itself when they are (as SceneDoc stores
+ * them), else a sorted copy. Checking the order reads every key: callers evaluating a curve at many
+ * frames find them once and pass them to {@link evaluateFCurve}.
+ */
+export function sortedKeyframes(fc: FCurve): Keyframe[] {
   const k = fc.keyframes;
   for (let i = 1; i < k.length; i++)
     if (k[i].frame < k[i - 1].frame) return [...k].sort((a, b) => a.frame - b.frame);
@@ -63,16 +68,22 @@ function easeValue(t: number, easing: Easing | undefined): number {
 
 /**
  * Evaluates a curve at a (possibly fractional) frame: keyframes, extrapolation (CYCLIC repeats
- * the keyed range) and F-curve modifiers. Returns undefined for curves without keyframes.
+ * the keyed range) and F-curve modifiers. Returns undefined for curves without keyframes. `keys`:
+ * the curve's keyframes in frame order (sortedKeyframes(fc)) when the caller has found them already,
+ * to evaluate a curve at many frames: the segment is found by binary search, so a frame then costs
+ * O(log n) in the keys instead of the O(n) check of their order, with the same result.
  */
-export function evaluateFCurve(fc: FCurve, frame: number): number | undefined {
-  const keys = sortedKeys(fc);
+export function evaluateFCurve(
+  fc: FCurve,
+  frame: number,
+  keys: Keyframe[] = sortedKeyframes(fc),
+): number | undefined {
   if (keys.length === 0) return undefined;
   const cycle = fc.extrapolation === 'CYCLIC' ? cycleTime(keys) : undefined;
   const v = evaluateKeys(fc, keys, cycle ? cycle(frame) : frame);
   // time modifiers (STEPPED, LIMITS x) resample the unmodified curve at another frame; value
   // modifiers see the cycled time, so they repeat with the keys (Blender's Cycles modifier)
-  const sample = (t: number) => evaluateFCurve({ ...fc, keyframes: keys, modifiers: [] }, t) ?? v;
+  const sample = (t: number) => evaluateFCurve({ ...fc, keyframes: keys, modifiers: [] }, t, keys) ?? v;
   return fc.modifiers?.length ? applyFModifiers(fc.modifiers, frame, v, sample, cycle) : v;
 }
 

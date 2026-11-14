@@ -238,6 +238,8 @@ export class BucketedHistogram<T extends string = string> {
 }
 
 const SECONDS_BUCKETS = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30];
+/** Long jobs (video exports): 1 s to 2 h. */
+const LONG_SECONDS_BUCKETS = [1, 5, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600, 7200];
 const BYTES_BUCKETS = [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216];
 /** Browser telemetry histogram bounds (milliseconds) used by the web client; converted to seconds. */
 const BROWSER_MS_BOUNDS = [1, 2, 5, 10, 16, 33, 50, 100, 250, 500, 1000, 2500, 5000];
@@ -381,6 +383,16 @@ export class ServerMetrics {
   readonly mcpToolCalls: CounterMetric<'tool' | 'status'>;
   readonly mcpToolDuration: HistogramMetric<'tool'>;
   readonly mcpSessions: GaugeMetric;
+  /** Video exports that ended, by status (done, failed, cancelled). */
+  readonly videoExports: CounterMetric<'status'>;
+  readonly videoExportFrames: CounterMetric;
+  readonly videoExportDuration: HistogramMetric;
+  /** Video exports queued or running. */
+  readonly videoExportsActive: GaugeMetric;
+  readonly storeSearches: CounterMetric<'provider' | 'status'>;
+  readonly storeDownloads: CounterMetric<'provider' | 'status'>;
+  readonly storeDownloadBytes: CounterMetric;
+  readonly rideoRequests: CounterMetric<'op' | 'status'>;
   readonly client: ClientMetrics;
   private readonly mirrored: Mirrorable[];
 
@@ -444,6 +456,40 @@ export class ServerMetrics {
       's',
     );
     this.mcpSessions = new GaugeMetric(r, 'mcp_sessions', 'Open MCP sessions');
+    this.videoExports = new CounterMetric(r, 'video_exports_total', 'Video exports that ended, by status', [
+      'status',
+    ]);
+    this.videoExportFrames = new CounterMetric(
+      r,
+      'video_export_frames_total',
+      'Frames rendered by video exports',
+    );
+    this.videoExportDuration = new HistogramMetric<string>(
+      r,
+      'video_export_seconds',
+      'Video export duration from start to end',
+      LONG_SECONDS_BUCKETS,
+      [],
+      's',
+    );
+    this.videoExportsActive = new GaugeMetric(r, 'video_exports_active', 'Video exports queued or running');
+    this.storeSearches = new CounterMetric(r, 'store_searches_total', 'Model store provider searches', [
+      'provider',
+      'status',
+    ]);
+    this.storeDownloads = new CounterMetric(r, 'store_downloads_total', 'Model store downloads', [
+      'provider',
+      'status',
+    ]);
+    this.storeDownloadBytes = new CounterMetric(
+      r,
+      'store_download_bytes_total',
+      'Bytes the model store downloaded',
+    );
+    this.rideoRequests = new CounterMetric(r, 'rideo_requests_total', 'Requests to the rideo server', [
+      'op',
+      'status',
+    ]);
     this.client = new ClientMetrics(r);
     this.mirrored = [
       this.syncConnections,
@@ -458,6 +504,14 @@ export class ServerMetrics {
       this.mcpToolCalls,
       this.mcpToolDuration,
       this.mcpSessions,
+      this.videoExports,
+      this.videoExportFrames,
+      this.videoExportDuration,
+      this.videoExportsActive,
+      this.storeSearches,
+      this.storeDownloads,
+      this.storeDownloadBytes,
+      this.rideoRequests,
     ];
   }
 

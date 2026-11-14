@@ -142,6 +142,93 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ SHUTDOWN_TIMEOUT_SECONDS: '0' }, noFiles)).toThrow(/SHUTDOWN_TIMEOUT_SECONDS/);
   });
 
+  it('applies the defaults of video export, the model store and the rideo bridge', () => {
+    const c = loadConfig({}, noFiles);
+    expect(c.ffmpegPath).toBe('ffmpeg');
+    expect(c.exportDir).toBe(path.resolve('/srv/app', 'data', 'exports'));
+    expect(c.exportMaxBytes).toBe(20480 * 1024 * 1024);
+    expect(c.exportTtlMs).toBe(168 * 3_600_000);
+    expect(c.exportMaxQueued).toBe(8);
+    expect(c.storeProviders).toEqual(['builtin', 'khronos', 'polyhaven', 'sketchfab', 'polypizza']);
+    expect(c.sketchfabToken).toBeNull();
+    expect(c.polypizzaApiKey).toBeNull();
+    expect(c.storeCatalogUrls).toEqual([]);
+    expect(c.modelCacheDir).toBe(path.resolve('/srv/app', 'data', 'model-cache'));
+    expect(c.modelCacheMaxBytes).toBe(2048 * 1024 * 1024);
+    expect(c.storeFetchTimeoutMs).toBe(20_000);
+    expect(c.rideoUrl).toBeNull();
+    expect(c.rideoToken).toBeNull();
+    // the export and cache folders follow DATA_DIR
+    const d = loadConfig({ DATA_DIR: '/var/lib/editor' }, noFiles);
+    expect(d.exportDir).toBe(path.resolve('/var/lib/editor', 'exports'));
+    expect(d.modelCacheDir).toBe(path.resolve('/var/lib/editor', 'model-cache'));
+  });
+
+  it('parses the settings of video export, the model store and the rideo bridge', () => {
+    const c = loadConfig(
+      {
+        FFMPEG_PATH: 'bin/ffmpeg',
+        EXPORT_DIR: 'out/videos',
+        EXPORT_MAX_MB: '512',
+        EXPORT_TTL_HOURS: '1.5',
+        EXPORT_MAX_QUEUED: '2',
+        STORE_PROVIDERS: 'PolyHaven, builtin,polyhaven ,catalog',
+        SKETCHFAB_TOKEN: 'sk',
+        POLYPIZZA_API_KEY: 'pp',
+        STORE_CATALOG_URLS: 'https://a.example/catalog.json, http://b.example/models.json',
+        MODEL_CACHE_DIR: '/cache/models',
+        MODEL_CACHE_MAX_MB: '0',
+        STORE_FETCH_TIMEOUT_MS: '5000',
+        RIDEO_URL: 'https://rideo.example/api/',
+        RIDEO_TOKEN: 'rt',
+      },
+      noFiles,
+    );
+    // a path with a slash is a file (made absolute); a bare name is looked up on the PATH
+    expect(c.ffmpegPath).toBe(path.resolve('/srv/app', 'bin/ffmpeg'));
+    expect(loadConfig({ FFMPEG_PATH: 'ffmpeg6' }, noFiles).ffmpegPath).toBe('ffmpeg6');
+    expect(c.exportDir).toBe(path.resolve('/srv/app', 'out/videos'));
+    expect(c.exportMaxBytes).toBe(512 * 1024 * 1024);
+    expect(c.exportTtlMs).toBe(5_400_000);
+    expect(c.exportMaxQueued).toBe(2);
+    // known ids in the given order, each once, letter case ignored
+    expect(c.storeProviders).toEqual(['polyhaven', 'builtin', 'catalog']);
+    expect(c.sketchfabToken).toBe('sk');
+    expect(c.polypizzaApiKey).toBe('pp');
+    expect(c.storeCatalogUrls).toEqual(['https://a.example/catalog.json', 'http://b.example/models.json']);
+    expect(c.modelCacheDir).toBe('/cache/models');
+    expect(c.modelCacheMaxBytes).toBe(0);
+    expect(c.storeFetchTimeoutMs).toBe(5000);
+    expect(c.rideoUrl).toBe('https://rideo.example/api');
+    expect(c.rideoToken).toBe('rt');
+    // catalog URLs without STORE_PROVIDERS add the catalog provider to the defaults
+    expect(loadConfig({ STORE_CATALOG_URLS: 'https://a.example/c.json' }, noFiles).storeProviders).toEqual([
+      'builtin',
+      'khronos',
+      'polyhaven',
+      'sketchfab',
+      'polypizza',
+      'catalog',
+    ]);
+  });
+
+  it('rejects invalid settings of video export, the model store and the rideo bridge', () => {
+    expect(() => loadConfig({ EXPORT_MAX_MB: '0' }, noFiles)).toThrow(/EXPORT_MAX_MB/);
+    expect(() => loadConfig({ EXPORT_TTL_HOURS: '-1' }, noFiles)).toThrow(/EXPORT_TTL_HOURS/);
+    expect(() => loadConfig({ EXPORT_MAX_QUEUED: '1.5' }, noFiles)).toThrow(/EXPORT_MAX_QUEUED/);
+    expect(() => loadConfig({ MODEL_CACHE_MAX_MB: '-5' }, noFiles)).toThrow(/MODEL_CACHE_MAX_MB/);
+    expect(() => loadConfig({ STORE_FETCH_TIMEOUT_MS: '50' }, noFiles)).toThrow(/STORE_FETCH_TIMEOUT_MS/);
+    expect(() => loadConfig({ STORE_FETCH_TIMEOUT_MS: '600001' }, noFiles)).toThrow(/STORE_FETCH_TIMEOUT_MS/);
+    expect(() => loadConfig({ RIDEO_URL: 'ftp://rideo' }, noFiles)).toThrow(/RIDEO_URL/);
+    expect(() => loadConfig({ STORE_PROVIDERS: 'builtin,turbosquid' }, noFiles)).toThrow(
+      /STORE_PROVIDERS: unknown provider 'turbosquid' \(known: builtin, khronos, polyhaven, sketchfab, polypizza, catalog\)/,
+    );
+    expect(() => loadConfig({ STORE_PROVIDERS: 'builtin,catalog' }, noFiles)).toThrow(/STORE_CATALOG_URLS/);
+    expect(() => loadConfig({ STORE_CATALOG_URLS: 'https://a.example/c.json,file:///etc' }, noFiles)).toThrow(
+      /STORE_CATALOG_URLS/,
+    );
+  });
+
   it('finds the public directory next to the bundle, then apps/web/dist', () => {
     const moduleDir = '/app/dist';
     const cands = publicDirCandidates(moduleDir, '/repo');

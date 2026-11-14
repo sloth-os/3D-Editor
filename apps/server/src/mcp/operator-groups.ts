@@ -143,12 +143,35 @@ export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
     name: 'Rendering',
     aliases: ['Render'],
     description:
-      'Render with the render_image (stills: RASTER previews, PATHTRACER finals) and render_animation (contact sheets, GIF, APNG, PNG sequences) tools; render settings with set_scene_settings. These operators set up what renders show: cameras (lens, depth of field: camera.properties_set), lights (energy, area light shape and size: light.properties_set), tracking, sky and mist',
-    tools: ['render_image', 'render_animation', 'set_scene_settings', 'set_active_camera'],
+      'Render with the render_image (stills: RASTER previews, PATHTRACER finals) and render_animation (contact sheets, GIF, APNG, PNG sequences) tools, and the shots of the director desk as video files with export_video; render settings with set_scene_settings. These operators set up what renders show: cameras (lens, depth of field: camera.properties_set), lights (energy, area light shape and size: light.properties_set), tracking, sky and mist',
+    tools: ['render_image', 'render_animation', 'export_video', 'set_scene_settings', 'set_active_camera'],
     match: any(
       prefix('world.', 'light.', 'camera.'),
       ids('object.camera_add', 'object.light_add', 'object.track_set'),
     ),
+  },
+  {
+    name: 'Director',
+    aliases: ['Desk', 'Shots'],
+    description:
+      "The director's desk, previs for AI video: shots (a camera each, with framing, angle, height, lens, move, subjects and planned screen layout, solved like rideo's solver and kept on one side of the 180° line), continuity checks, the set (ground, sky and sun), actors, physics presets (drop, throw, push, bake), kites and balloons on strings, vehicles, and rideo's blocking in and out. export_video renders the shots as video files (export_status follows a job, cancel_export stops it, list_exports lists them); rideo_import and rideo_push exchange clips with a rideo server",
+    tools: ['export_video', 'export_status', 'cancel_export', 'list_exports', 'rideo_import', 'rideo_push'],
+    match: prefix('desk.'),
+  },
+  {
+    name: 'Actors',
+    aliases: ['Characters'],
+    description:
+      "Rigged mannequin people (adult, man, woman, child, toddler, elder) and animals (horse, pony, donkey, cow, dog, small_dog, cat, sheep, pig, deer, bear) of the director's desk: add, pose (gestures over the legs they have), walk, run, trot or gallop along paths, face, look at, hold props and ride the four mounts",
+    match: prefix('desk.actor_'),
+  },
+  {
+    name: 'Model Store',
+    aliases: ['Store', 'Assets'],
+    description:
+      "Built-in and external models: store_search finds them (licence, author, size, a built-in model's own parameters), store_add inserts one (downloaded and cached first when external) standing on the ground at a location and scaled to a size, a built-in one built with the params given, with its licence and author recorded",
+    tools: ['store_search', 'store_add'],
+    match: prefix('store.'),
   },
 ];
 
@@ -309,6 +332,11 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
     use: 'export_scene',
     editor: "it opens the Export window on the person's screen",
   },
+  'wm.export_video': {
+    instead: 'To export the shots as video use export_video (export_status follows the job).',
+    use: 'export_video',
+    editor: "it opens the Export Video window on the person's screen",
+  },
   'wm.import': {
     instead: 'To import a file use import_model.',
     use: 'import_model',
@@ -403,6 +431,15 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
   'view3d.toggle_snapping': {
     editor: "it turns snapping on or off for the person's transforms in that editor",
   },
+  'view3d.toggle_follow_shots': {
+    editor:
+      'it turns Follow Shots on or off in that editor: its camera view, F12 and Render Animation (also renders ' +
+      'an agent asks of that editor) then look through the camera of the shot at the frame, and a shot pinned on ' +
+      'its Sequence strip wins at the current frame',
+  },
+  'view3d.toggle_camera_guides': {
+    editor: "it shows or hides the rule-of-thirds and action-safe guides over that editor's camera view",
+  },
   'view3d.toggle_shading': {
     editor:
       "it switches the shading of the person's viewport ({type: WIREFRAME, SOLID, MATERIAL or RENDERED}; " +
@@ -423,8 +460,8 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
   'wm.preferences': { editor: "it opens the Preferences window on the person's screen" },
   'screen.workspace_set': {
     editor:
-      "it switches the person's workspace layout ({name: Layout, Modeling, Shading, Animation or Scripting}; " +
-      'Shading also switches their viewport to Material Preview)',
+      "it switches the person's workspace layout ({name: Layout, Modeling, Shading, Animation, Scripting or " +
+      'Director}; Shading also switches their viewport to Material Preview)',
   },
 };
 

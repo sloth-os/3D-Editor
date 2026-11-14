@@ -155,6 +155,10 @@ export class ViewState {
   /** Status text shown in the viewport header during modal operations. */
   readonly hud = signal<string | null>(null);
   readonly viewLabel = signal('User Perspective');
+  /** Director desk: the viewport looks through the camera of the shot at the current frame. */
+  readonly followShots = signal(false);
+  /** Director desk: thirds and action-safe guides over the camera view. */
+  readonly cameraGuides = signal(false);
 }
 
 export function sig<T>(s: Signal<T>): T {

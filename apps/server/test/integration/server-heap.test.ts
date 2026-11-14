@@ -618,15 +618,17 @@ describe(`server process with a ${HEAP_MB} MB heap`, () => {
 
   it('refuses a REST snapshot that would run its heap out, and keeps answering', async () => {
     const { id } = await ok('create_project', { name: 'Snapshot', empty: true });
-    // three grids of 291,600 faces: about 207 MB decoded, within what the server keeps for one
-    // project; their copy and JSON need about as much again
-    for (let i = 0; i < 3; i++)
+    // six grids of 145,924 faces: about 207 MB decoded, within what the server keeps for one
+    // project; their copy and JSON need about as much again. Six half-size grids rather than three
+    // whole ones: building a grid of 291,600 faces needs about 212 MB of the heap at its peak,
+    // which the third of them no longer had (by a megabyte) with the server's own code grown
+    for (let i = 0; i < 6; i++)
       await ok('run_operator', {
         project: id,
         operator: 'mesh.primitive_grid_add',
-        params: { x_subdivisions: 540, y_subdivisions: 540, location: [3 * i, 0, 0] },
+        params: { x_subdivisions: 382, y_subdivisions: 382, location: [3 * i, 0, 0] },
       });
-    expect((await ok('get_scene', { project: id })).counts.faces).toBe(3 * 291_600);
+    expect((await ok('get_scene', { project: id })).counts.faces).toBe(6 * 382 * 382);
     const res = await fetch(`${server.url}/api/projects/${id}/snapshot`).catch((err: unknown) => {
       throw new Error(
         `the snapshot got no answer (${String(err)}); the server's output:\n${server.output().slice(-1500)}`,

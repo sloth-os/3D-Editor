@@ -8,6 +8,7 @@ import {
   createGrid,
   createOperatorRegistry,
   estimateOperator,
+  frameInputCacheBytes,
   freeRigidBodyCache,
   projectObjects,
   rigidBodyCacheBytes,
@@ -359,12 +360,16 @@ describe('rigid body simulations in the server', () => {
     new SceneEvaluator(c).evaluate(100);
     const cache = simulationCacheBytes({ simulated: 3, kinematic: 0 }, 99);
     expect(rigidBodyCacheBytes(c)).toBe(cache);
+    // and the objects every frame state of Gamma reads, kept until it changes (core frameInputCacheBytes)
+    const input = frameInputCacheBytes(c);
+    expect(input).toBeGreaterThan(0);
     expect(otherOpenProjects(a).find((p) => p.id === 'p-c')).toEqual({
       id: 'p-c',
       name: 'Gamma',
-      kept: sizes(c).stored + cache,
+      kept: sizes(c).stored + cache + input,
       save: sizes(c).save,
       simulation: cache,
+      evaluation: input,
     });
     // a simulation of Gamma the project could keep, but not with Alpha and Beta open
     const req = {
@@ -375,7 +380,7 @@ describe('rigid body simulations in the server', () => {
       doc: c,
     };
     const kept = sizes(a).stored + sizes(b).stored;
-    const all = kept + sizes(c).stored + cache + req.bytes;
+    const all = kept + sizes(c).stored + cache + input + req.bytes;
     const save = Math.max(sizes(a).save, sizes(b).save, sizes(c).save);
     expect(check(req)).toBe(
       `not simulated on the server: simulating 10 rigid bodies to frame 5,000 keeps 4,999 more frames of their ` +
@@ -395,7 +400,7 @@ describe('rigid body simulations in the server', () => {
     const d = roomWithBodies('p-d', 'Delta', 10, 5000);
     const other = check({ ...req, doc: d });
     expect(other).toContain(
-      `'Gamma' (p-c) ${up(sizes(c).stored + cache)} MB (${up(cache)} MB of it its rigid body cache)`,
+      `'Gamma' (p-c) ${up(sizes(c).stored + cache + input)} MB (${up(cache)} MB of it its rigid body cache)`,
     );
     expect(other).toMatch(/default 3600 s\), or free their rigid body caches \(rigidbody\.cache_free\)$/);
     // alone, an operator of Gamma counts its cache with what the project keeps, and says it can be freed
@@ -406,7 +411,7 @@ describe('rigid body simulations in the server', () => {
     const r = ops(request(c, added));
     expect(r).toContain(
       `the project's meshes, objects, keyframes, images and rigid body cache would then take about ` +
-        `${up(sizes(c).stored + cache + added)} MB of memory (now ${n((sizes(c).stored + cache) / MB)} MB with 3 ` +
+        `${up(sizes(c).stored + cache + input + added)} MB of memory (now ${n((sizes(c).stored + cache + input) / MB)} MB with 3 ` +
         `objects, ${up(cache)} MB of it its rigid body cache)`,
     );
     expect(r).toMatch(

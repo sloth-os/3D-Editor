@@ -71,6 +71,7 @@ const GLOBAL: Record<string, Handler> = {
   F3: () => run('wm.search_menu', {}, 'hotkey'),
   F12: () => run('render.render', {}, 'hotkey'),
   'Ctrl+F12': () => run('render.render', { animation: true }, 'hotkey'),
+  'Ctrl+Shift+F12': () => run('wm.export_video', {}, 'hotkey'),
   F1: () => openDialog('shortcuts'),
   'Shift+R': () => run('screen.repeat_last', {}, 'hotkey'),
   Space: () => run('screen.animation_play', {}, 'hotkey'),
@@ -335,6 +336,6 @@ export const SHORTCUT_HELP: [string, string][] = [
   ],
   [
     'General',
-    'Ctrl+Z undo · Ctrl+Shift+Z redo · F3 search · F12 render · Ctrl+F12 render animation · Ctrl+S save · Shift+R repeat last · N sidebar · T toolbar',
+    'Ctrl+Z undo · Ctrl+Shift+Z redo · F3 search · F12 render · Ctrl+F12 render animation · Ctrl+Shift+F12 export video · Ctrl+S save · Shift+R repeat last · N sidebar · T toolbar',
   ],
 ];

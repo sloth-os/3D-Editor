@@ -12,6 +12,9 @@ import { Viewport } from './Viewport';
 import { DopeSheet } from './DopeSheet';
 import { UVEditor } from './UVEditor';
 import { DialogHost, ProjectList } from './dialogs/Dialogs';
+import { DirectorPanel } from './director/DirectorPanel';
+import { SequenceStrip } from './director/SequenceStrip';
+import { AssetBrowser } from './assets/AssetBrowser';
 import { hoveredArea, run } from '../editor/editor';
 import { createProject } from '../project/manager';
 import { Icon } from './icons';
@@ -204,46 +207,159 @@ function Area(p: {
   );
 }
 
-type BottomEditor = 'timeline' | 'dopesheet' | 'uv' | 'info' | 'console' | 'diagnostics';
+export type BottomEditor =
+  'timeline' | 'sequence' | 'shots' | 'assets' | 'dopesheet' | 'uv' | 'info' | 'console' | 'diagnostics';
 
-function BottomArea({ s, initial }: { s: ProjectSession; initial: BottomEditor }) {
-  const [ed, setEd] = useState<BottomEditor>(initial);
-  useEffect(() => setEd(initial), [initial]);
-  const tabs: { id: BottomEditor; label: string }[] = [
-    { id: 'timeline', label: 'Timeline' },
-    { id: 'dopesheet', label: 'Dope Sheet' },
-    { id: 'uv', label: 'UV Editor' },
-    { id: 'info', label: 'Info' },
-    { id: 'console', label: 'Console' },
-    { id: 'diagnostics', label: 'Diagnostics' },
-  ];
+/**
+ * Narrow screens (phones, tablets held upright): the right column is hidden (styles.css
+ * .hide-mobile) and the Director panel is the bottom area's "Shots" tab (director.css).
+ */
+export const NARROW_SCREEN = '(max-width: 760px)';
+
+/** Whether the window is narrow ({@link NARROW_SCREEN}), followed as it is resized or turned. */
+export function useNarrowScreen(): boolean {
+  const query = () => (typeof window.matchMedia === 'function' ? window.matchMedia(NARROW_SCREEN) : null);
+  const [narrow, setNarrow] = useState(() => !!query()?.matches);
+  useEffect(() => {
+    const mq = query();
+    if (!mq) return;
+    const update = () => setNarrow(mq.matches);
+    update();
+    mq.addEventListener('change', update);
+    return () => mq.removeEventListener('change', update);
+  }, []);
+  return narrow;
+}
+
+/**
+ * The share of the window's height the bottom area takes on a narrow screen while it shows the
+ * Shots or Assets tab (the Director panel with its shot inspector, the Asset Browser): the 150 px it
+ * opens with hold the shot list's header and two rows.
+ */
+export const NARROW_PANEL_SHARE = 0.55;
+
+/** Tabs that open the bottom area to {@link NARROW_PANEL_SHARE} of the window on narrow screens. */
+const PANEL_TABS: ReadonlySet<BottomEditor> = new Set(['shots', 'assets']);
+
+/**
+ * Tabs of the bottom area. "Shots" (the Director panel) is shown on narrow screens only, where the
+ * right column is hidden; the header scrolls sideways when the tabs do not fit.
+ */
+const BOTTOM_TABS: { id: BottomEditor; label: string; mobileOnly?: boolean }[] = [
+  { id: 'timeline', label: 'Timeline' },
+  { id: 'sequence', label: 'Sequence' },
+  { id: 'shots', label: 'Shots', mobileOnly: true },
+  { id: 'assets', label: 'Assets' },
+  { id: 'dopesheet', label: 'Dope Sheet' },
+  { id: 'uv', label: 'UV Editor' },
+  { id: 'info', label: 'Info' },
+  { id: 'console', label: 'Console' },
+  { id: 'diagnostics', label: 'Diagnostics' },
+];
+
+function BottomArea({
+  s,
+  tab,
+  onTab,
+}: {
+  s: ProjectSession;
+  tab: BottomEditor;
+  onTab: (tab: BottomEditor) => void;
+}) {
   return (
     <div class="column" style={{ height: '100%' }}>
-      <div class="area-header" style={{ height: '24px' }}>
-        {tabs.map((t) => (
+      <div class="area-header" style={{ height: '24px', overflowX: 'auto', scrollbarWidth: 'none' }}>
+        {BOTTOM_TABS.map((t) => (
           <button
             key={t.id}
-            class={`menu-button ${ed === t.id ? 'open' : ''}`}
+            class={`menu-button ${tab === t.id ? 'open' : ''} ${t.mobileOnly ? 'director-mobile-only' : ''}`}
+            style={{ flex: 'none' }}
             data-testid={`bottom-tab-${t.id}`}
-            onClick={() => setEd(t.id)}
+            onClick={() => onTab(t.id)}
           >
             {t.label}
           </button>
         ))}
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
-        {ed === 'timeline' && <Timeline session={s} />}
-        {ed === 'dopesheet' && <DopeSheet session={s} />}
-        {ed === 'uv' && <UVEditor session={s} />}
-        {ed === 'info' && <InfoLog />}
-        {ed === 'console' && <Console />}
-        {ed === 'diagnostics' && <Diagnostics />}
+        {tab === 'timeline' && <Timeline session={s} />}
+        {tab === 'sequence' && <SequenceStrip s={s} />}
+        {tab === 'shots' && <DirectorPanel s={s} />}
+        {tab === 'assets' && <AssetBrowser session={s} />}
+        {tab === 'dopesheet' && <DopeSheet session={s} />}
+        {tab === 'uv' && <UVEditor session={s} />}
+        {tab === 'info' && <InfoLog />}
+        {tab === 'console' && <Console />}
+        {tab === 'diagnostics' && <Diagnostics />}
       </div>
     </div>
   );
 }
 
-const WORKSPACES: Workspace[] = ['Layout', 'Modeling', 'Shading', 'Animation', 'Scripting'];
+/** The window's inner height; while `active`, the caller renders again when it changes. */
+function useWindowHeight(active: boolean): number {
+  const [, setHeight] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    const update = () => setHeight(window.innerHeight);
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, [active]);
+  return window.innerHeight;
+}
+
+/**
+ * The area under the viewport: its splitter and its tabs (BottomArea), opening on the workspace's
+ * tab (`initial`), `size` pixels tall (the height dragged to, at least `minHeight`).
+ *
+ * On a narrow screen ({@link NARROW_SCREEN}) the Shots and Assets tabs open it to
+ * {@link NARROW_PANEL_SHARE} of the window (a height of their own once dragged), so that the shot
+ * inspector shows under the shot list; and the phone-only Shots tab gives way to the workspace's tab
+ * once the window is wide (a tablet turned, a window widened): its tab button is hidden then, and
+ * the Director panel belongs in the right column.
+ */
+export function BottomPane(p: {
+  s: ProjectSession;
+  initial: BottomEditor;
+  size: number;
+  setSize: (height: number) => void;
+  minHeight?: number;
+}) {
+  const { initial } = p;
+  const narrow = useNarrowScreen();
+  const [tab, setTab] = useState<BottomEditor>(initial);
+  useEffect(() => setTab(initial), [initial]);
+  useEffect(() => {
+    if (!narrow && tab === 'shots') setTab(initial);
+  }, [narrow, tab, initial]);
+  const panel = narrow && PANEL_TABS.has(tab);
+  // 0: NARROW_PANEL_SHARE of the window
+  const [panelSize, setPanelSize] = usePersistentSize('bottom-narrow-panel', 0);
+  const windowH = useWindowHeight(panel && !panelSize);
+  const height = panel
+    ? panelSize || Math.round(windowH * NARROW_PANEL_SHARE)
+    : Math.max(p.size, p.minHeight ?? 0);
+  return (
+    <>
+      <Splitter
+        dir="h"
+        onDrag={(d) => {
+          if (panel) setPanelSize(Math.max(60, Math.min(window.innerHeight - 120, height - d)));
+          else p.setSize(Math.max(60, Math.min(window.innerHeight - 200, p.size - d)));
+        }}
+      />
+      <Area
+        kind={initial === 'console' ? 'console' : 'timeline'}
+        style={{ height: `${height}px`, flex: 'none' }}
+      >
+        <BottomArea s={p.s} tab={tab} onTab={setTab} />
+      </Area>
+    </>
+  );
+}
+
+// Director: the director's desk (shots, actors, assets in the right column, the sequence below)
+const WORKSPACES: Workspace[] = ['Layout', 'Modeling', 'Shading', 'Animation', 'Scripting', 'Director'];
 
 function Editor({ s }: { s: ProjectSession }) {
   const ws = workspace.value;
@@ -251,27 +367,26 @@ function Editor({ s }: { s: ProjectSession }) {
   const [outlinerH, setOutlinerH] = usePersistentSize('outliner', 230);
   const [bottomH, setBottomH] = usePersistentSize('bottom', 150);
   const bottomEditor: BottomEditor =
-    ws === 'Scripting' ? 'console' : ws === 'Animation' ? 'dopesheet' : ws === 'Shading' ? 'uv' : 'timeline';
-  const showBottom = true;
-  const bottom = ws === 'Animation' || ws === 'Scripting' ? Math.max(bottomH, 260) : bottomH;
+    ws === 'Scripting'
+      ? 'console'
+      : ws === 'Animation'
+        ? 'dopesheet'
+        : ws === 'Shading'
+          ? 'uv'
+          : ws === 'Director'
+            ? 'sequence'
+            : 'timeline';
   return (
     <div class="main">
       <div class="column" style={{ flex: 1 }}>
         <Viewport session={s} />
-        {showBottom && (
-          <>
-            <Splitter
-              dir="h"
-              onDrag={(d) => setBottomH(Math.max(60, Math.min(window.innerHeight - 200, bottomH - d)))}
-            />
-            <Area
-              kind={bottomEditor === 'console' ? 'console' : 'timeline'}
-              style={{ height: `${bottom}px`, flex: 'none' }}
-            >
-              <BottomArea s={s} initial={bottomEditor} />
-            </Area>
-          </>
-        )}
+        <BottomPane
+          s={s}
+          initial={bottomEditor}
+          size={bottomH}
+          setSize={setBottomH}
+          minHeight={ws === 'Animation' || ws === 'Scripting' ? 260 : 0}
+        />
       </div>
       <Splitter
         dir="v"
@@ -313,7 +428,7 @@ function Editor({ s }: { s: ProjectSession }) {
           onDrag={(d) => setOutlinerH(Math.max(80, Math.min(window.innerHeight - 200, outlinerH + d)))}
         />
         <Area kind="properties" style={{ flex: '1' }}>
-          <Properties session={s} />
+          {ws === 'Director' ? <DirectorPanel s={s} /> : <Properties session={s} />}
         </Area>
       </div>
     </div>
@@ -375,6 +490,8 @@ export function App() {
               <button
                 key={w}
                 class={ws === w ? 'active' : ''}
+                aria-pressed={ws === w}
+                data-testid={`workspace-${w.toLowerCase()}`}
                 onClick={() => run('screen.workspace_set', { name: w }, 'ui')}
               >
                 {w}

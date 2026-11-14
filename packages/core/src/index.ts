@@ -17,3 +17,5 @@ export * from './armature';
 export * from './instancing';
 export * from './physics';
 export * from './material';
+export * from './desk';
+export * from './store';

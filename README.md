@@ -15,7 +15,7 @@ editor can be improved from real usage.
 > **Scope, honestly.** Blender is the product of three decades of work. This project implements a
 > broad subset of its modeling, rigging, animation, simulation and rendering features (listed area
 > by area in [docs/features.md](docs/features.md)) on an architecture where every action is an
-> operator in one registry: about 260 operators, shared by menus, hotkeys, the JavaScript console
+> operator in one registry: about 290 operators, shared by menus, hotkeys, the JavaScript console
 > and MCP agents. Several areas are simpler than in Blender: bones are posed from the Properties
 > editor or by operators (there is no interactive Pose Mode, and no Edit Mode for curves or
 > armatures in the viewport), particle systems are static scatters, physics covers rigid bodies
@@ -28,12 +28,12 @@ editor can be improved from real usage.
 
 - **Blender-style interface** – 3D viewport with header menus, toolbar (T), sidebar (N) and
   navigation gizmo; outliner with rows for modifiers, constraints, particle systems and rigid
-  bodies; a Properties editor with Blender's tabs (Render, Output, Scene, World, Object,
-  Modifiers, Particles, Physics, Object Constraints, Object Data, Material); timeline, dope sheet,
-  UV editor, info log and JavaScript console; Layout, Modeling, Shading, Animation and Scripting
-  workspaces; Blender's keymap (G/R/S with axis constraints and numeric input, Tab, Shift+A,
-  Ctrl+P, Shift+Ctrl+C, I, F12, numpad views…), F3 operator search, _Adjust Last Operation_ and
-  _Repeat Last_ (Shift+R).
+  bodies; a Properties editor with Blender's tabs (Render, Output, Scene, World, Object, Modifiers,
+  Particles, Physics, Object Constraints, Object Data, Material); timeline, dope sheet, UV editor,
+  info log and JavaScript console; Layout, Modeling, Shading, Animation, Scripting and Director
+  workspaces; Blender's keymap (G/R/S with axis constraints and numeric input, Tab, Shift+A, Ctrl+P,
+  Shift+Ctrl+C, I, F12, numpad views…), F3 operator search, _Adjust Last Operation_ and _Repeat
+  Last_ (Shift+R).
 - **Modeling** – mesh primitives and 21 procedural generators (terrain, rock, tree, bush, grass,
   building, stairs, fence, column, arch, table, chair, gear, spring, wheel, pipe…); Edit Mode
   with vertex/edge/face selection and mesh tools (extrude, inset, bevel, loop cut, subdivide,
@@ -74,18 +74,39 @@ editor can be improved from real usage.
   writes the hierarchy, materials (procedural textures baked to images), cameras, lights,
   instances and the animation sampled per frame, with skins and morph targets.
   <!-- re-check: gltf-export (matched packages/core/src/io/gltf-export.ts on 2026-11-06) -->
+- **Director's desk** – previs for AI video: a set with a sky sun, rigged mannequin actors (people
+  and eleven animals) that walk, run, sit, gesture, hold props and ride, physics presets (drop,
+  throw, push, bake), kites and balloons on strings in seeded wind, vehicles with turning wheels,
+  and shots (a camera and a range of frames each) solved from a shot description (framing, angle,
+  height, lens, planned screen layout), with 20 camera moves and continuity checks (the 180° line,
+  subjects out of frame, jump cuts…); a Director workspace with a shot list, an inspector, an actor
+  panel and a sequence strip. See [docs/director-desk.md](docs/director-desk.md).
+- **Video export** – the server renders the shots (or a frame range) with shadows and ambient
+  occlusion and encodes them with ffmpeg: an H.264 sequence, one frame-exact clip per shot,
+  posters, a contact sheet, depth, normal, mask, edge and pose passes, and a manifest with camera
+  and subject tracks, as background jobs (MCP, REST and Render › Export Video…). See
+  [docs/video-export.md](docs/video-export.md).
+- **Model store** – 170 original procedural models (furniture, props, food, nature, buildings,
+  street, sports, vehicles, people and animals) and, through the server, the Khronos glTF samples,
+  Poly Haven, Sketchfab, Poly Pizza and your own JSON catalogs: searched lazily, downloaded and
+  cached on insert, scaled to real size on the ground, with their licence recorded; an Asset
+  Browser with drag and drop. See [docs/model-store.md](docs/model-store.md).
+- **rideo bridge** – imports a clip of the AI video studio rideo as a staged project and sends the
+  shots' clips back as reference videos with the same blocking and camera moves. See
+  [docs/rideo.md](docs/rideo.md).
 - **Offline PWA** – installable, works without a network after the first visit.
 - **Storage** – browser (IndexedDB) by default; WebDAV when configured (on the server or in the
   browser), with CRDT merge-saving so concurrent devices never overwrite each other.
 - **Real-time collaboration** – every change syncs to all devices with the project open (Yjs
   CRDT over WebSockets, plus BroadcastChannel between tabs); presence avatars, remote selections,
   "follow" another user's view; per-user undo.
-- **AI agents (MCP)** – a `/mcp` Streamable HTTP endpoint with 36 tools to manage projects,
-  inspect scenes (`get_scene`, `get_object` and `get_mesh_data` report evaluated values and
-  evaluation problems, `get_instances` where scattered instances are), run any operator
-  (`run_operator`, or `batch` for many in one undo step), edit meshes,
-  set materials, modifiers, keyframes and scene settings, import and export files, render images
-  or animations (`render_image`, `render_animation` with contact sheets, GIF and APNG) and drive
+- **AI agents (MCP)** – a `/mcp` Streamable HTTP endpoint with 44 tools to manage projects, inspect
+  scenes (`get_scene`, `get_object` and `get_mesh_data` report evaluated values and evaluation
+  problems, `get_instances` where scattered instances are), run any operator (`run_operator`, or
+  `batch` for many in one undo step), edit meshes, set materials, modifiers, keyframes and scene
+  settings, import and export files, render images or animations (`render_image`, `render_animation`
+  with contact sheets, GIF and APNG), export videos (`export_video`), insert store models
+  (`store_search`, `store_add`), exchange clips with rideo (`rideo_import`, `rideo_push`) and drive
   the live editor UI. [`scripts/mcp.mjs`](scripts/mcp.mjs) is a small CLI and module client. See
   [docs/mcp.md](docs/mcp.md) and the [guide for AI agents](docs/agent-guide.md).
 - **Observability** – browser and server OpenTelemetry traces/metrics/logs, Prometheus
@@ -124,7 +145,10 @@ docker run -d -p 8080:8080 -v editor-data:/data ghcr.io/sloth-os/3d-editor:lates
 ```
 
 Open http://localhost:8080. Images are published for `linux/amd64`, `linux/arm64` and
-`linux/arm/v7`. The image stores projects on disk in `/data`.
+`linux/arm/v7`. The image stores projects on disk in `/data` and includes ffmpeg for video
+exports, which adds about 130 MB to it (Alpine's ffmpeg and about 100 libraries). An image without
+video export builds with `docker build --build-arg WITH_FFMPEG=0 .`; its `/api/config` then
+reports `features.videoExport: false` and exports are refused with `FFMPEG_UNAVAILABLE`.
 
 [`docker-compose.yml`](docker-compose.yml) adds an optional WebDAV server and an observability
 stack (OpenTelemetry Collector, Jaeger, Prometheus, Grafana). To store projects in the bundled
@@ -174,6 +198,17 @@ npm run dev            # terminal 2, http://localhost:5173
 | `RENDER_WORKERS`                                   | CPU cores, at most 8                                                                                | Render processes for server-side path tracing, animation renders and exports (one more starts on demand for quick raster renders and exports); `0` renders in the server's own process. Each keeps its own copy of the scene, so this also bounds memory |
 | `RENDER_WORKER_NICE`                               | `10`                                                                                                | CPU priority (nice value 0–19) of the render processes on Linux, so the server's own process (HTTP, sync, MCP, health checks) and its garbage collector get the CPU first; `0` keeps the server's priority. No effect on macOS or Windows                |
 | `RENDER_WORKER_MEMORY_MB`                          | Node's default (2096 MB with 16 GB of memory)                                                       | JavaScript heap limit of each render process in MB (at least 64). A render or export that needs more fails with code `OUT_OF_MEMORY` (REST: status 507); the server keeps running and starts a new render process for the next one                       |
+| `FFMPEG_PATH`                                      | `ffmpeg`                                                                                            | The ffmpeg program of video exports: a name on the `PATH` or a file path. Without it the server has no video export                                                                                                                                      |
+| `EXPORT_DIR`                                       | `<DATA_DIR>/exports`                                                                                | Where video exports are written                                                                                                                                                                                                                          |
+| `EXPORT_MAX_MB`, `EXPORT_TTL_HOURS`                | `20480`, `168`                                                                                      | Disk space all video exports may take, in MB, and how many hours finished exports are kept                                                                                                                                                               |
+| `EXPORT_MAX_QUEUED`                                | `8`                                                                                                 | Video exports that may wait to start; more are refused with code `QUEUE_FULL`                                                                                                                                                                            |
+| `STORE_PROVIDERS`                                  | `builtin,khronos,polyhaven,sketchfab,polypizza` (and `catalog` with catalog URLs)                   | Model store providers, in search order                                                                                                                                                                                                                   |
+| `SKETCHFAB_TOKEN`, `POLYPIZZA_API_KEY`             | –                                                                                                   | Keys of the Sketchfab (needed for downloads) and Poly Pizza model store providers                                                                                                                                                                        |
+| `STORE_CATALOG_URLS`                               | –                                                                                                   | Comma-separated URLs of JSON model catalogs (the `catalog` provider)                                                                                                                                                                                     |
+| `MODEL_CACHE_DIR`, `MODEL_CACHE_MAX_MB`            | `<DATA_DIR>/model-cache`, `2048`                                                                    | Cache of downloaded store models and thumbnails, and its size in MB (the least recently used are dropped first)                                                                                                                                          |
+| `STORE_FETCH_TIMEOUT_MS`                           | `20000`                                                                                             | Timeout of each request to a model store provider                                                                                                                                                                                                        |
+| `RIDEO_URL`, `RIDEO_TOKEN`                         | –                                                                                                   | A rideo server for the rideo bridge, and its bearer token                                                                                                                                                                                                |
+| `NODE_USE_ENV_PROXY`                               | –                                                                                                   | `1` behind a proxy (Node.js 22.21 or later, as in the Docker image): every outgoing request (model store, rideo, WebDAV, OTLP) then goes through `HTTP_PROXY` / `HTTPS_PROXY`; list hosts to reach directly (`RIDEO_URL`, `WEBDAV_URL`) in `NO_PROXY`    |
 | `TELEMETRY_ENABLED`                                | `true`                                                                                              | Accept browser telemetry at `/otlp/v1/*`                                                                                                                                                                                                                 |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`                      | –                                                                                                   | Export server and browser telemetry to an OTLP/HTTP collector                                                                                                                                                                                            |
 | `OTEL_EXPORTER_OTLP_HEADERS`                       | –                                                                                                   | Extra headers for OTLP requests (`key1=value1,key2=value2`)                                                                                                                                                                                              |
@@ -192,7 +227,7 @@ calls), and the Vite dev server proxies to `EDITOR_SERVER_URL` (default `http://
 npm run test:unit         # core, web and server unit tests (Vitest)
 npm run test:coverage     # the same with coverage
 npm run test:integration  # server + real WebSocket clients + real MCP client + real WebDAV server
-npm run test:e2e          # Playwright: 31 tests in 14 specs; production builds (`npm run build` first), Chromium, WebDAV, MCP
+npm run test:e2e          # Playwright: 46 tests in 17 specs; production builds (`npm run build` first), Chromium, WebDAV, MCP
 npm run test:all          # unit, integration and e2e
 npm run lint && npm run format:check && npm run typecheck
 ```
@@ -209,6 +244,8 @@ images to GHCR on `main` and version tags.
 - [Storage, offline and sync](docs/storage-and-sync.md)
 - [MCP / AI agents](docs/mcp.md)
 - [Building projects through MCP: a guide for AI agents](docs/agent-guide.md)
+- [The director's desk](docs/director-desk.md), [video export](docs/video-export.md),
+  [model store](docs/model-store.md) and [rideo integration](docs/rideo.md)
 - [Observability](docs/observability.md)
 - [Example projects](examples/README.md)
 

@@ -52,6 +52,8 @@ const OBJECT_REF_TYPES: Record<string, readonly string[]> = {
   bevel_object: ['CURVE'],
 };
 const ANGLE_KEYS = /angle|rotation|spot_size/;
+/** The choice of an enum dropdown that stands for null (no enum value looks like it). */
+const ENUM_NULL = '<null>';
 
 /**
  * Whether a numeric parameter is an angle (stored in radians, shown in degrees): parameters whose
@@ -199,25 +201,44 @@ export function SchemaForm(p: {
           );
         }
         if (s.enum) {
-          const options = s.enum.map((e) => ({ value: String(e), label: enumText(key, e) }));
+          // an optional enum without default that was left out is not one of its values (the
+          // operator does without it): '— not set —', which leaves it out again; null, where the
+          // schema allows it, is '— none —'
+          const unset = !required.has(key) && s.default === undefined;
+          const nullable = isNullable(raw);
+          // (`value` has turned a given null into the default)
+          const current =
+            p.values[key] === null && nullable
+              ? ENUM_NULL
+              : value === undefined || value === null
+                ? unset
+                  ? ''
+                  : String(s.enum[0])
+                : String(value);
+          const options = [
+            ...(unset ? [{ value: '', label: p.emptyLabels?.[key] ?? '— not set —' }] : []),
+            ...(nullable ? [{ value: ENUM_NULL, label: '— none —' }] : []),
+            ...s.enum.map((e) => ({ value: String(e), label: enumText(key, e) })),
+          ];
+          const pick = (v: string) => (v === '' ? undefined : v === ENUM_NULL ? null : v);
           return (
             <Row key={key} label={label} title={s.description}>
               {p.expandEnums?.includes(key) ? (
                 <EnumButtons
-                  value={String(value ?? s.enum[0])}
+                  value={current}
                   testId={tid}
                   title={s.description}
                   compact
-                  options={options}
+                  options={options.filter((o) => o.value !== '' && o.value !== ENUM_NULL)}
                   onChange={(v) => p.onChange(key, v, true)}
                 />
               ) : (
                 <SelectField
-                  value={String(value ?? s.enum[0])}
+                  value={current}
                   testId={tid}
                   title={s.description}
                   options={options}
-                  onChange={(v) => p.onChange(key, v, true)}
+                  onChange={(v) => p.onChange(key, pick(v), true)}
                 />
               )}
             </Row>
