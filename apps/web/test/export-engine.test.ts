@@ -3,11 +3,12 @@ import * as Y from 'yjs';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { SceneDoc, newShotId, setDeskSettings, setShots } from '@3d-editor/core';
-import { runBrowserExport, type EngineOptions } from '../src/export/engine';
+import { keepAwake, runBrowserExport, type EngineOptions, type WakeLockEnv } from '../src/export/engine';
 import type { VideoEncoderFactory, VideoEncoderLike, VideoFrameFactory } from '../src/export/encode';
 import { MemoryStore, type ExportStore } from '../src/export/store';
 import { BrowserExportError } from '../src/export/support';
 import { inProcessWorkerFactory } from '../src/export/workers';
+import type { ExportWorkerResponse } from '../src/export/protocol';
 import { mp4Info, readPng, readZip } from './export-files';
 
 /*
@@ -197,6 +198,49 @@ const PARAMS = {
   passes: ['beauty', 'mask'],
   match_model_duration: true,
 };
+
+/**
+ * A page's screen wake lock and visibility: the browser lets every lock go when the page is hidden
+ * and refuses one to a hidden page.
+ */
+function wakeLockPage(visible = true) {
+  const listeners = new Set<() => void>();
+  const locks: { released: boolean; release(): Promise<void> }[] = [];
+  let refusals = 0;
+  const doc = {
+    visibilityState: visible ? 'visible' : 'hidden',
+    addEventListener: (_type: 'visibilitychange', l: () => void) => void listeners.add(l),
+    removeEventListener: (_type: 'visibilitychange', l: () => void) => void listeners.delete(l),
+  };
+  const env: WakeLockEnv = {
+    wakeLock: {
+      request: async () => {
+        if (doc.visibilityState !== 'visible') {
+          refusals++;
+          throw Object.assign(new Error('the page is not visible'), { name: 'NotAllowedError' });
+        }
+        const lock = {
+          released: false,
+          release: async () => {
+            lock.released = true;
+          },
+        };
+        locks.push(lock);
+        return lock;
+      },
+    },
+    document: doc,
+  };
+  const show = (on: boolean) => {
+    doc.visibilityState = on ? 'visible' : 'hidden';
+    if (!on) for (const l of locks) l.released = true;
+    for (const l of [...listeners]) l();
+  };
+  const held = () => locks.filter((l) => !l.released).length;
+  return { env, locks, show, held, listeners, refusals: () => refusals };
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 0));
 
 const hex = (b: Uint8Array) => bytesToHex(sha256(b));
 const bytes = async (blob: Blob) => new Uint8Array(await blob.arrayBuffer());
@@ -393,6 +437,84 @@ describe('browser export (in process)', () => {
     await expect(run).rejects.toMatchObject({ name: 'BrowserExportError', code: 'CANCELLED' });
     expect(e.stores[0].disposed).toBe(true);
     expect(e.encoders.every((x) => x.closed)).toBe(true);
+  });
+
+  it('fails, rather than hangs, when a render worker cannot post a frame', async () => {
+    const { update } = project();
+    let frames = 0;
+    const e = engine({
+      workers: inProcessWorkerFactory(
+        async () => JPEG,
+        (r: ExportWorkerResponse) => {
+          // the browser could not clone the third frame's answer (V8: out of memory)
+          if (r.ok && 'video' in (r.result as object) && ++frames === 3)
+            throw Object.assign(new Error('Data cannot be cloned, out of memory.'), {
+              name: 'DataCloneError',
+            });
+        },
+      ),
+    });
+    const err = (await runBrowserExport({ update, params: PARAMS }, {}, e.opts).catch(
+      (x: unknown) => x,
+    )) as BrowserExportError;
+    expect(err).toBeInstanceOf(BrowserExportError);
+    expect(err.code).toBe('FAILED');
+    expect(err.message).toBe(
+      'the render worker could not send its answer to the page (DataCloneError: Data cannot be cloned, out of memory.)',
+    );
+    expect(e.stores[0].disposed).toBe(true);
+  });
+
+  it('keeps the screen on while it runs: asked again when the page is shown after a tab switch, let go at the end', async () => {
+    const { update } = project();
+    const page = wakeLockPage();
+    const e = engine({ wakeLock: page.env });
+    let heldWhileHidden = -1;
+    const heldAfter: number[] = [];
+    await runBrowserExport(
+      { update, params: PARAMS },
+      {
+        onProgress: (p) => {
+          if (p.phase !== 'render') return;
+          if (p.done === 3) {
+            page.show(false);
+            heldWhileHidden = page.held();
+          }
+          if (p.done === 6) page.show(true);
+          if (p.done === 9) heldAfter.push(page.held());
+        },
+      },
+      e.opts,
+    );
+    expect(heldWhileHidden).toBe(0);
+    // the lock asked for again once the page was shown, and held until the export ended
+    expect(page.locks).toHaveLength(2);
+    expect(heldAfter).toEqual([1]);
+    expect(page.held()).toBe(0);
+    expect(page.listeners.size).toBe(0);
+  });
+
+  it('asks for the wake lock once a hidden page is shown, again after a refusal, and never after the release', async () => {
+    const page = wakeLockPage(false);
+    const release = keepAwake(page.env);
+    await settle();
+    expect(page.locks).toHaveLength(0);
+    page.show(true);
+    await settle();
+    expect(page.held()).toBe(1);
+    // shown again while the lock is held: no second one
+    page.show(true);
+    await settle();
+    expect(page.locks).toHaveLength(1);
+    release();
+    await settle();
+    expect(page.held()).toBe(0);
+    page.show(false);
+    page.show(true);
+    await settle();
+    expect(page.locks).toHaveLength(1);
+    // without Screen Wake Lock: nothing to do
+    expect(() => keepAwake({})()).not.toThrow();
   });
 
   it('refuses up front what the tab cannot hold, with the figures', async () => {

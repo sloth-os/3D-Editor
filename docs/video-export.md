@@ -57,12 +57,15 @@ update; later edits never reach the export) and hands it to the export engine
 Files go to the browser's Origin Private File System (a directory per export, written as the
 export goes, so long sequences and frame archives do not stay in memory) where the browser has it,
 else stay in memory. Every file's SHA-256 is computed while it is written. Cancel stops the workers
-and the encoders and deletes what the export wrote. The screen is kept on while it runs (Screen
-Wake Lock, where the browser allows it). The window then lists the files as download links with a
-preview of the sequence, and **Download all (.zip)** saves them as one ZIP archive (stored: the
-videos and PNGs are compressed already). The files stay until the next export on this device, or
-until the tab closes (a later export deletes the files of closed tabs). An export goes on when the
-window is closed, as long as the tab stays open.
+and the encoders and deletes what the export wrote. A render worker that stops, or one whose answer
+cannot reach the page (the browser could not copy it, most likely for want of memory), fails the
+export with that reason: the export never waits for an answer that cannot come. The screen is kept
+on while it runs (Screen Wake Lock, where the browser allows it: the browser lets the lock go while
+the tab is hidden, and the export asks for it again each time the tab is shown). The window then
+lists the files as download links with a preview of the sequence, and **Download all (.zip)** saves
+them as one ZIP archive (stored: the videos and PNGs are compressed already). The files stay until
+the next export on this device, or until the tab closes (a later export deletes the files of closed
+tabs). An export goes on when the window is closed, as long as the tab stays open.
 
 **Requirements**: a secure page (HTTPS, or `localhost`; browsers offer WebCodecs and the Origin
 Private File System only there), Web Workers, and a WebCodecs `VideoEncoder` that encodes H.264 at

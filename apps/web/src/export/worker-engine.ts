@@ -299,6 +299,59 @@ export class ExportWorkerEngine {
   }
 }
 
+/** What the request loop needs of a render worker's global scope (a stand-in in process and in tests). */
+export interface ExportWorkerScope {
+  onmessage: ((e: MessageEvent<ExportWorkerRequest>) => void) | null;
+  postMessage(message: ExportWorkerResponse, transfer: Transferable[]): void;
+}
+
+/** Throws `err` outside any promise chain: in a worker, the page sees it as the Worker's `error` event. */
+const throwOutside = (err: Error): void => {
+  setTimeout(() => {
+    throw err;
+  });
+};
+
+/**
+ * Answers the page's requests one at a time, in order (export.worker.ts; the in-process stand-in
+ * runs the same loop). A reply that cannot be posted (it cannot be cloned, or the browser ran out of
+ * memory serializing it) fails its request with that error instead, and the loop goes on serving
+ * the next requests; when not even the error can be posted, it is thrown outside the loop
+ * (`raise`), which the page sees as the worker's `error` event and fails every request it waits
+ * for: no request is left without an answer.
+ */
+export function serveExportRequests(
+  scope: ExportWorkerScope,
+  engine: ExportWorkerEngine,
+  raise: (err: Error) => void = throwOutside,
+): void {
+  let queue: Promise<void> = Promise.resolve();
+  scope.onmessage = (e) => {
+    const msg = e.data;
+    queue = queue
+      .then(async () => {
+        const { response, transfer } = await engine.handle(msg);
+        try {
+          scope.postMessage(response, transfer);
+        } catch (err) {
+          const why = err instanceof Error ? err : new Error(String(err));
+          scope.postMessage(
+            {
+              id: msg.id,
+              ok: false,
+              error: {
+                message: `the render worker could not send its answer to the page (${why.name}: ${why.message})`,
+                name: why.name,
+              },
+            },
+            [],
+          );
+        }
+      })
+      .catch((err: unknown) => raise(err instanceof Error ? err : new Error(String(err))));
+  };
+}
+
 function done(
   id: number,
   result: ExportWorkerResponse extends infer R

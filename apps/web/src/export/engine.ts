@@ -120,6 +120,8 @@ export interface EngineOptions {
   now?: () => Date;
   /** The raw pass digests and metadata of every rendered frame (the parity check with core in Node). */
   digests?: (shot: string, k: number, digests: Record<string, string>, meta: FrameMeta | null) => void;
+  /** The screen wake lock and the page's visibility (default: the page's; see keepAwake). */
+  wakeLock?: WakeLockEnv;
 }
 
 /** A finished export as the engine returns it (index.ts gives it its public shape). */
@@ -220,17 +222,73 @@ async function defaultStore(id: string): Promise<ExportStore> {
   return new MemoryStore();
 }
 
-/** Keeps the screen on while the export runs (where the browser allows it); returns the release. */
-async function keepAwake(): Promise<() => void> {
-  try {
-    const nav = navigator as Navigator & {
-      wakeLock?: { request(type: 'screen'): Promise<{ release(): Promise<void> }> };
-    };
-    const lock = await nav.wakeLock?.request('screen');
-    return () => void lock?.release().catch(() => undefined);
-  } catch {
-    return () => {};
-  }
+/** A screen wake lock the browser granted (WakeLockSentinel). */
+export interface WakeLockSentinelLike {
+  /** True once the lock was let go (by `release`, or by the browser when the page was hidden). */
+  readonly released?: boolean;
+  release(): Promise<void>;
+}
+
+/** What keeping the screen on needs of the page (navigator.wakeLock and the document; fakes in tests). */
+export interface WakeLockEnv {
+  wakeLock?: { request(type: 'screen'): Promise<WakeLockSentinelLike> };
+  document?: {
+    readonly visibilityState: string;
+    addEventListener(type: 'visibilitychange', listener: () => void): void;
+    removeEventListener(type: 'visibilitychange', listener: () => void): void;
+  };
+}
+
+function pageWakeLockEnv(): WakeLockEnv {
+  const nav = (globalThis as { navigator?: { wakeLock?: WakeLockEnv['wakeLock'] } }).navigator;
+  return {
+    wakeLock: nav?.wakeLock,
+    document: typeof document === 'undefined' ? undefined : document,
+  };
+}
+
+/**
+ * Keeps the screen on while the export runs (Screen Wake Lock, where the browser allows it): the
+ * browser lets the lock go whenever the page is hidden, so it is asked for again each time the page
+ * is shown (and first when it is shown, for an export started in a hidden page). Returns the
+ * release, which lets the lock go and stops asking.
+ */
+export function keepAwake(env: WakeLockEnv = pageWakeLockEnv()): () => void {
+  const { wakeLock, document: doc } = env;
+  if (!wakeLock || typeof wakeLock.request !== 'function') return () => {};
+  let lock: WakeLockSentinelLike | null = null;
+  let asking = false;
+  let stopped = false;
+  const ask = async () => {
+    if (stopped || asking || (doc && doc.visibilityState !== 'visible')) return;
+    if (lock && lock.released === false) return;
+    asking = true;
+    try {
+      const next = await wakeLock.request('screen');
+      if (stopped) {
+        await next.release().catch(() => undefined);
+        return;
+      }
+      // the lock let go when the page was hidden (releasing it again does nothing)
+      const old = lock;
+      lock = next;
+      if (old) await old.release().catch(() => undefined);
+    } catch {
+      // refused (a hidden page, the permissions policy, a battery saver): asked again when shown
+    } finally {
+      asking = false;
+    }
+  };
+  const onVisibility = () => void ask();
+  doc?.addEventListener('visibilitychange', onVisibility);
+  void ask();
+  return () => {
+    stopped = true;
+    doc?.removeEventListener('visibilitychange', onVisibility);
+    const held = lock;
+    lock = null;
+    void held?.release().catch(() => undefined);
+  };
 }
 
 /** Runs one browser export; throws a BrowserExportError (after deleting its partial files) when it fails or is cancelled. */
@@ -278,7 +336,7 @@ export async function runBrowserExport(
   const encoders: StreamEncoder[] = [];
   const muxers: StreamMuxer[] = [];
   const pendingFiles: { abort(): Promise<void> }[] = [];
-  const release = await keepAwake();
+  const release = keepAwake(opts.wakeLock);
   try {
     if (opfsAvailable() && !opts.store) await sweepExportDirectories();
     store = await (opts.store ?? defaultStore)(id);
