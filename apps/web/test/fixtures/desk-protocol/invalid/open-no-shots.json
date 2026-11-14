@@ -1,0 +1,47 @@
+{
+  "type": "open",
+  "scene": {
+    "id": "clp_0123456789abcdef",
+    "name": "Kite Day: the meadow",
+    "fps": 24,
+    "width": 1280,
+    "height": 720,
+    "set": {
+      "description": "A wide green meadow on a breezy afternoon, a pond on the left, an oak tree behind.",
+      "interior": false,
+      "timeOfDay": "afternoon"
+    },
+    "cast": [
+      {
+        "id": "chr_0123456789mira",
+        "name": "Mira",
+        "description": "A girl of 8 in a yellow raincoat.",
+        "kind": "child",
+        "heightM": 1.28
+      },
+      {
+        "id": "chr_0123456789pipd",
+        "name": "Pip",
+        "description": "A golden retriever puppy.",
+        "kind": "dog",
+        "heightM": null
+      }
+    ],
+    "elements": [
+      {
+        "id": "ele_0123456789mead",
+        "name": "The meadow",
+        "description": "Long grass, wild flowers.",
+        "kind": "location"
+      },
+      {
+        "id": "ele_0123456789kite",
+        "name": "Red kite",
+        "description": "A red diamond kite with a long tail.",
+        "kind": "prop"
+      }
+    ],
+    "shots": []
+  },
+  "state": null
+}

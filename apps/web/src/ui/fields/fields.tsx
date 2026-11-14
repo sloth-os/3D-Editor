@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { Icon } from '../icons';
+import { readStorage, writeStorage } from '../../app/safe-storage';
 
 function fmt(v: number, precision: number, unit?: string): string {
   if (!Number.isFinite(v)) return String(v);
@@ -548,7 +549,7 @@ export function Panel(p: {
 }) {
   const key = `3d-editor:panel:${p.id ?? p.title}`;
   const [open, setOpen] = useState(() => {
-    const s = localStorage.getItem(key);
+    const s = readStorage(key);
     return s === null ? p.defaultOpen !== false : s === '1';
   });
   return (
@@ -557,7 +558,7 @@ export function Panel(p: {
         class="panel-header"
         onClick={() => {
           setOpen(!open);
-          localStorage.setItem(key, open ? '0' : '1');
+          writeStorage(key, open ? '0' : '1');
         }}
       >
         <span class="chev">{open ? '▾' : '▸'}</span>

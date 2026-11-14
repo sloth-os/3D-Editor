@@ -1,0 +1,5 @@
+{
+  "type": "error",
+  "code": "state_unreadable",
+  "message": "The saved desk state belongs to another scene; the scene was staged again."
+}

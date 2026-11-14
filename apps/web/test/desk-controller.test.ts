@@ -1,0 +1,466 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SceneBrief, ShotResultMeta } from '@3d-editor/core';
+import {
+  DeskController,
+  PROGRESS_INTERVAL_MS,
+  READY_CHECK_MS,
+  STATE_MIN_INTERVAL_MS,
+  STATE_QUIET_MS,
+  resolveOptions,
+  type ControllerDeps,
+  type SceneWorkspace,
+} from '../src/embed/controller';
+import { DeskExportError, type DeskExportOutcome } from '../src/embed/export';
+import { deskMessageProblems, type DeskMessage } from '../src/embed/protocol';
+import { StateTooLarge } from '../src/embed/state';
+import type { OpenOutcome } from '../src/embed/workspace';
+
+/*
+ * The desk's side of the protocol once connected (embed/controller.ts), with a fake scene and a
+ * fake export and fake timers: ready within 2 s, one open (opened, then a state), the states after
+ * edits (2 s after the last, at most one per 5 s), save, export (progress about ten a second, the
+ * result with its files transferred, the shots left out named after it, busy, not_open, cancel),
+ * Send, the host's ack, Done and Close, and the errors the contract names. Every message sent
+ * validates against the protocol's schemas.
+ */
+
+const SHOT_A = 'sht_a';
+const SHOT_B = 'sht_b';
+const brief = {
+  id: 'clp_1',
+  name: 'Scene',
+  fps: 24,
+  width: 320,
+  height: 180,
+  shots: [
+    { id: SHOT_A, durationSec: 0.5 },
+    { id: SHOT_B, durationSec: 1 },
+  ],
+} as unknown as SceneBrief;
+
+const metaOf = (shotId: string): ShotResultMeta =>
+  ({
+    shotId,
+    deskShotId: `d-${shotId}`,
+    frames: shotId === SHOT_A ? 12 : 24,
+    durationSec: 0,
+    camera: { lensMm: 35, move: null },
+    line: 'line',
+    moves: null,
+    planAgrees: null,
+    issues: [],
+  }) as ShotResultMeta;
+
+const outcome: OpenOutcome = { source: 'brief', changes: null, unreadable: null, plan: 'stage', stageMs: 5, persistent: true };
+
+function fakeWorkspace(over: Partial<SceneWorkspace> = {}) {
+  const edits = new Set<() => void>();
+  const ws = {
+    open: vi.fn(async () => outcome),
+    encodeState: vi.fn(async () => ({
+      state: { format: '3d-editor.desk-state' as const, version: 1 as const, data: new ArrayBuffer(16) },
+      shots: 2,
+    })),
+    onEdit: (cb: () => void) => {
+      edits.add(cb);
+      return () => edits.delete(cb);
+    },
+    snapshot: () => new Uint8Array([1, 2, 3]),
+    stagedShots: () => [SHOT_A, SHOT_B],
+    lengthMismatches: () => [],
+    changes: () => null,
+    updateFromBrief: vi.fn(async () => null),
+    results: vi.fn(async (_u: Uint8Array, shots?: string[]) => (shots ?? [SHOT_A, SHOT_B]).map(metaOf)),
+    projectId: 'desk-0123',
+    ...over,
+  };
+  return { ws, edit: () => edits.forEach((cb) => cb()) };
+}
+
+function setup(o: { workspace?: Partial<SceneWorkspace>; support?: ControllerDeps['exportSupport']; runExport?: ControllerDeps['runExport'] } = {}) {
+  const sent: { message: DeskMessage; transfer?: Transferable[]; at: number }[] = [];
+  const { ws, edit } = fakeWorkspace(o.workspace);
+  const c = new DeskController({
+    send: (message, transfer) => {
+      sent.push({ message, transfer, at: Date.now() });
+      return true;
+    },
+    workspace: ws,
+    exportSupport: o.support ?? (async () => ({ available: true, reason: null })),
+    runExport: o.runExport,
+    deskVersion: '1.2.3',
+    log: () => {},
+  });
+  const ofType = (t: DeskMessage['type']) => sent.map((s) => s.message).filter((m) => m.type === t) as any[];
+  return { c, ws, edit, sent, ofType };
+}
+
+const flush = async () => {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+};
+
+async function opened(t: ReturnType<typeof setup>, options?: object) {
+  await t.c.connected('https://host.example');
+  t.c.message({ type: 'open', scene: brief, state: null, ...(options ? { options } : {}) } as never);
+  await vi.waitFor(() => expect(t.ofType('state')).toHaveLength(1));
+}
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe('the desk controller', () => {
+  it('answers the connect with ready, and validates what it sends', async () => {
+    const t = setup();
+    await t.c.connected('https://host.example');
+    expect(t.ofType('ready')).toEqual([
+      {
+        type: 'ready',
+        deskVersion: '1.2.3',
+        protocol: 1,
+        capabilities: {
+          export: { available: true, reason: null, container: 'mp4', videoCodec: 'avc1', modes: ['motion', 'pose', 'camera'] },
+          offline: true,
+        },
+      },
+    ]);
+    expect(t.c.status.value).toBe('connected');
+    for (const s of t.sent) expect(deskMessageProblems(s.message)).toBeNull();
+  });
+
+  it('says why it cannot export, and answers within 2 s when the encoder check is slow', async () => {
+    const no = setup({ support: async () => ({ available: false, reason: 'No H.264 encoder here.' }) });
+    await no.c.connected('https://h.example');
+    expect(no.ofType('ready')[0].capabilities.export).toMatchObject({ available: false, reason: 'No H.264 encoder here.' });
+
+    const slow = setup({ support: () => new Promise(() => {}) });
+    const ready = slow.c.connected('https://h.example');
+    await vi.advanceTimersByTimeAsync(READY_CHECK_MS);
+    await ready;
+    expect(READY_CHECK_MS).toBeLessThan(2000);
+    const r = slow.ofType('ready')[0];
+    // happy-dom has no VideoEncoder: not available, with a reason
+    expect(r.capabilities.export.available).toBe(false);
+    expect(typeof r.capabilities.export.reason).toBe('string');
+    expect(deskMessageProblems(r)).toBeNull();
+  });
+
+  it('opens once: opened, then a state; a second open is busy', async () => {
+    const t = setup();
+    await opened(t, { hostName: 'rideo', modes: ['pose', 'camera'], defaultMode: 'pose', readOnly: false });
+    expect(t.ws.open).toHaveBeenCalledWith({ hostOrigin: 'https://host.example', brief, state: null });
+    const types = t.sent.map((s) => s.message.type);
+    expect(types).toEqual(['ready', 'opened', 'state']);
+    expect(t.ofType('opened')[0]).toEqual({ type: 'opened', sceneId: 'clp_1', source: 'brief', changes: null });
+    const state = t.sent[2];
+    expect(state.message).toMatchObject({ type: 'state', sceneId: 'clp_1', shots: 2 });
+    expect(state.message).not.toHaveProperty('id');
+    expect(state.transfer).toHaveLength(1);
+    expect(t.c.options.value).toEqual({ hostName: 'rideo', modes: ['pose', 'camera'], defaultMode: 'pose', readOnly: false });
+    expect(t.c.mode.value).toBe('pose');
+    t.c.message({ type: 'open', scene: brief, state: null } as never);
+    expect(t.ofType('error')).toEqual([expect.objectContaining({ code: 'busy' })]);
+    expect(t.ofType('error')[0]).not.toHaveProperty('id');
+  });
+
+  it('reports a state it did not apply before opened, without an id', async () => {
+    const t = setup({ workspace: { open: vi.fn(async () => ({ ...outcome, unreadable: 'the desk state belongs to scene x' })) } });
+    await opened(t);
+    expect(t.sent.map((s) => s.message.type)).toEqual(['ready', 'error', 'opened', 'state']);
+    expect(t.ofType('error')[0]).toMatchObject({ code: 'state_unreadable' });
+    expect(t.ofType('error')[0]).not.toHaveProperty('id');
+    expect(t.c.notice.value?.level).toBe('warning');
+  });
+
+  it('answers an open it cannot stage with invalid_scene and takes another', async () => {
+    let fail = true;
+    const t = setup({
+      workspace: {
+        open: vi.fn(async () => {
+          if (fail) throw new Error('no shots to stage');
+          return outcome;
+        }),
+      },
+    });
+    await t.c.connected('https://h.example');
+    t.c.message({ type: 'open', scene: brief, state: null } as never);
+    await vi.waitFor(() => expect(t.ofType('error')).toHaveLength(1));
+    expect(t.ofType('error')[0]).toMatchObject({ code: 'invalid_scene', message: expect.stringContaining('no shots to stage') });
+    expect(t.c.status.value).toBe('connected');
+    fail = false;
+    t.c.message({ type: 'open', scene: brief, state: null } as never);
+    await vi.waitFor(() => expect(t.ofType('opened')).toHaveLength(1));
+  });
+
+  it('answers requests before the scene is open with not_open', async () => {
+    const t = setup();
+    await t.c.connected('https://h.example');
+    t.c.message({ type: 'export', id: 'e-1' } as never);
+    t.c.message({ type: 'save', id: 's-1' } as never);
+    expect(t.ofType('error').map((e) => [e.id, e.code])).toEqual([
+      ['e-1', 'not_open'],
+      ['s-1', 'not_open'],
+    ]);
+  });
+
+  it('sends a state 2 s after the last edit, at most one every 5 s, and in answer to save', async () => {
+    const t = setup();
+    await opened(t);
+    const t0 = Date.now();
+    t.edit();
+    expect(t.c.dirty.value).toBe(true);
+    // the first state went out just now: the next waits for the 5 s spacing
+    await vi.advanceTimersByTimeAsync(STATE_QUIET_MS);
+    expect(t.ofType('state')).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(STATE_MIN_INTERVAL_MS);
+    expect(t.ofType('state')).toHaveLength(2);
+    expect(t.c.dirty.value).toBe(false);
+    // edits every second: one state 2 s after they stop, never two within 5 s
+    for (let i = 0; i < 8; i++) {
+      t.edit();
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    await vi.advanceTimersByTimeAsync(STATE_QUIET_MS + STATE_MIN_INTERVAL_MS);
+    const states = t.sent.filter((s) => s.message.type === 'state');
+    for (let i = 1; i < states.length; i++) expect(states[i].at - states[i - 1].at).toBeGreaterThanOrEqual(STATE_MIN_INTERVAL_MS);
+    const last = states.at(-1)!.at;
+    expect(last - t0).toBeGreaterThanOrEqual(8000 + STATE_QUIET_MS - 1000);
+    // save: a state with its id, now
+    t.c.message({ type: 'save', id: 'save-1' } as never);
+    await flush();
+    expect(t.ofType('state').at(-1)).toMatchObject({ id: 'save-1', sceneId: 'clp_1' });
+  });
+
+  it('answers a state too large for the host with out_of_memory', async () => {
+    const t = setup({ workspace: { encodeState: vi.fn(async () => Promise.reject(new StateTooLarge(70 * 1024 * 1024))) } });
+    await t.c.connected('https://h.example');
+    t.c.message({ type: 'open', scene: brief, state: null } as never);
+    await vi.waitFor(() => expect(t.ofType('opened')).toHaveLength(1));
+    await flush();
+    expect(t.ofType('error')[0]).toMatchObject({ code: 'out_of_memory' });
+    t.c.message({ type: 'save', id: 'save-2' } as never);
+    await flush();
+    expect(t.ofType('error')[1]).toMatchObject({ code: 'out_of_memory', id: 'save-2' });
+    expect(t.c.dirty.value).toBe(true);
+  });
+
+  it('exports: progress about ten a second, the result with its files transferred, the shots left out after it', async () => {
+    const release = vi.fn(async () => {});
+    let progressCalls = 0;
+    const runExport = vi.fn(async (req: any, hooks: any): Promise<DeskExportOutcome> => {
+      // 50 progress calls 10 ms apart: about 5 messages
+      for (let i = 0; i < 50; i++) {
+        hooks.onProgress({ phase: 'render', done: i, total: 36, shotId: SHOT_A });
+        progressCalls++;
+        await vi.advanceTimersByTimeAsync(10);
+      }
+      const data = new ArrayBuffer(4);
+      return {
+        shots: req.shots.slice(0, 1).map((m: ShotResultMeta) => ({
+          shotId: m.shotId,
+          frames: m.frames,
+          durationSec: m.frames / 24,
+          references: { camera: `${m.shotId}.camera.mp4` },
+          still: null,
+          camera: m.camera,
+          line: m.line,
+          moves: null,
+          planAgrees: null,
+          issues: [],
+        })),
+        files: [{ name: `${SHOT_A}.camera.mp4`, mime: 'video/mp4', data }],
+        failures: [{ shotId: SHOT_B, code: 'out_of_memory', message: `${SHOT_B}: no memory` }],
+        release,
+      };
+    });
+    const t = setup({ runExport });
+    await opened(t, { modes: ['camera'] });
+    t.c.message({ type: 'export', id: 'exp-1', shots: [SHOT_A, SHOT_B], still: false } as never);
+    await vi.waitFor(() => expect(t.ofType('result')).toHaveLength(1));
+    await flush();
+    expect(runExport.mock.calls[0][0]).toMatchObject({ modes: ['camera'], still: false, hostName: 'the host' });
+    const progress = t.ofType('progress');
+    expect(progressCalls).toBe(50);
+    expect(progress.length).toBeGreaterThanOrEqual(4);
+    expect(progress.length).toBeLessThanOrEqual(8);
+    expect(progress.every((p) => p.id === 'exp-1')).toBe(true);
+    const types = t.sent.map((s) => s.message.type);
+    const iResult = types.indexOf('result');
+    expect(types.slice(iResult)).toEqual(['result', 'error']);
+    const result = t.sent[iResult];
+    expect(result.message).toMatchObject({ id: 'exp-1', sceneId: 'clp_1', fps: 24, width: 320, height: 180 });
+    expect(result.transfer).toEqual([(result.message as any).files[0].data]);
+    expect(t.ofType('error').at(-1)).toMatchObject({ id: 'exp-1', code: 'out_of_memory', message: expect.stringContaining(SHOT_B) });
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(t.c.exportRun.value).toBeNull();
+    for (const s of t.sent) expect(deskMessageProblems(s.message), s.message.type).toBeNull();
+  });
+
+  it('runs one export at a time, refuses unknown shots and too large scenes, and cancels', async () => {
+    let finish: (() => void) | null = null;
+    const runExport = vi.fn(
+      (_req: any, hooks: any) =>
+        new Promise<DeskExportOutcome>((resolve, reject) => {
+          hooks.signal.addEventListener('abort', () => reject(new DeskExportError('cancelled', 'The export was cancelled.')));
+          finish = () => resolve({ shots: [], files: [], failures: [], release: async () => {} });
+        }),
+    );
+    const t = setup({ runExport });
+    await opened(t);
+    t.c.message({ type: 'export', id: 'x-0', shots: ['sht_unknown'] } as never);
+    expect(t.ofType('error').at(-1)).toMatchObject({ id: 'x-0', code: 'bad_message' });
+    t.c.message({ type: 'export', id: 'x-1' } as never);
+    await vi.waitFor(() => expect(runExport).toHaveBeenCalledTimes(1));
+    t.c.message({ type: 'export', id: 'x-2' } as never);
+    expect(t.ofType('error').at(-1)).toMatchObject({ id: 'x-2', code: 'busy' });
+    expect(await t.c.sendToHost()).toBeNull();
+    // a cancel of another export is ignored; of this one ends it with cancelled
+    t.c.message({ type: 'cancel', id: 'x-9' } as never);
+    expect(t.c.exportRun.value?.id).toBe('x-1');
+    t.c.message({ type: 'cancel', id: 'x-1' } as never);
+    await vi.waitFor(() => expect(t.ofType('error').at(-1)).toMatchObject({ id: 'x-1', code: 'cancelled' }));
+    expect(t.c.exportRun.value).toBeNull();
+    expect(finish).not.toBeNull();
+
+    const big = setup({ runExport });
+    await big.c.connected('https://h.example');
+    big.c.message({ type: 'open', scene: { ...brief, width: 4096, height: 2304 }, state: null } as never);
+    await vi.waitFor(() => expect(big.ofType('state')).toHaveLength(1));
+    big.c.message({ type: 'export', id: 'big-1' } as never);
+    await vi.waitFor(() => expect(big.ofType('error')).toHaveLength(1));
+    expect(big.ofType('error')[0]).toMatchObject({ id: 'big-1', code: 'export_unavailable', message: expect.stringContaining('3840 × 2160') });
+
+    const none = setup({ runExport, support: async () => ({ available: false, reason: 'No encoder.' }) });
+    await opened(none);
+    none.c.message({ type: 'export', id: 'n-1' } as never);
+    await vi.waitFor(() => expect(none.ofType('error')).toHaveLength(1));
+    expect(none.ofType('error')[0]).toMatchObject({ id: 'n-1', code: 'export_unavailable', message: 'No encoder.' });
+  });
+
+  it("exports the brief's shots in brief order: one not staged yet is left out and named, one the brief dropped is not exported", async () => {
+    const SHOT_C = 'sht_c';
+    const SHOT_OLD = 'sht_old';
+    const later = { ...brief, shots: [...brief.shots, { id: SHOT_C, durationSec: 1 }] } as unknown as SceneBrief;
+    const runExport = vi.fn(async (req: any): Promise<DeskExportOutcome> => ({
+      shots: req.shots.map((m: ShotResultMeta) => ({
+        shotId: m.shotId,
+        frames: m.frames,
+        durationSec: m.frames / 24,
+        references: { camera: `${m.shotId}.camera.mp4` },
+        still: null,
+        camera: m.camera,
+        line: m.line,
+        moves: null,
+        planAgrees: null,
+        issues: [],
+      })),
+      files: req.shots.map((m: ShotResultMeta) => ({ name: `${m.shotId}.camera.mp4`, mime: 'video/mp4', data: new ArrayBuffer(4) })),
+      failures: [],
+      release: async () => {},
+    }));
+    // the staging has A and B and a shot the later brief dropped; C is new in the brief
+    const t = setup({ runExport, workspace: { stagedShots: () => [SHOT_A, SHOT_B] } });
+    await t.c.connected('https://host.example');
+    t.c.message({ type: 'open', scene: later, state: null } as never);
+    await vi.waitFor(() => expect(t.ofType('state')).toHaveLength(1));
+
+    t.c.message({ type: 'export', id: 'all-1', still: false } as never);
+    await vi.waitFor(() => expect(t.ofType('result')).toHaveLength(1));
+    await flush();
+    expect(t.ws.results).toHaveBeenLastCalledWith(expect.any(Uint8Array), [SHOT_A, SHOT_B]);
+    expect(t.ofType('result')[0].shots.map((s: { shotId: string }) => s.shotId)).toEqual([SHOT_A, SHOT_B]);
+    const types = t.sent.map((s) => s.message.type);
+    expect(types.slice(types.indexOf('result'))).toEqual(['result', 'error']);
+    expect(t.ofType('error').at(-1)).toMatchObject({ id: 'all-1', code: 'export_failed', message: expect.stringContaining(SHOT_C) });
+
+    // asked in another order: the result keeps the brief's; an id that is no shot of the brief is refused
+    t.c.message({ type: 'export', id: 'two-1', shots: [SHOT_B, SHOT_A] } as never);
+    await vi.waitFor(() => expect(t.ofType('result')).toHaveLength(2));
+    expect(t.ws.results).toHaveBeenLastCalledWith(expect.any(Uint8Array), [SHOT_A, SHOT_B]);
+    t.c.message({ type: 'export', id: 'old-1', shots: [SHOT_A, SHOT_OLD] } as never);
+    expect(t.ofType('error').at(-1)).toMatchObject({ id: 'old-1', code: 'bad_message', message: expect.stringContaining(SHOT_OLD) });
+
+    // only the new shot asked: nothing to render, the export fails naming it
+    t.c.message({ type: 'export', id: 'new-1', shots: [SHOT_C] } as never);
+    await vi.waitFor(() => expect(t.ofType('error').at(-1)).toMatchObject({ id: 'new-1', code: 'export_failed' }));
+    expect(t.ofType('error').at(-1).message).toContain(SHOT_C);
+    expect(runExport).toHaveBeenCalledTimes(2);
+    for (const s of t.sent) expect(deskMessageProblems(s.message), s.message.type).toBeNull();
+  });
+
+  it("Send exports every mode the host takes, with stills, as desk-<n>", async () => {
+    const runExport = vi.fn(async (): Promise<DeskExportOutcome> => ({ shots: [], files: [], failures: [], release: async () => {} }));
+    const t = setup({ runExport });
+    await opened(t, { hostName: 'rideo', modes: ['pose', 'motion'] });
+    expect(await t.c.sendToHost()).toBe('desk-1');
+    expect(runExport.mock.calls[0][0]).toMatchObject({ modes: ['motion', 'pose'], still: true, hostName: 'rideo' });
+    expect(await t.c.sendToHost()).toBe('desk-2');
+    expect(t.ofType('result').map((r) => r.id)).toEqual(['desk-1', 'desk-2']);
+  });
+
+  it("shows the host's answer to a result", async () => {
+    const t = setup();
+    await opened(t, { hostName: 'rideo' });
+    t.c.message({
+      type: 'result-ack',
+      id: 'desk-1',
+      ok: false,
+      shots: [
+        { shotId: SHOT_A, ok: true },
+        { shotId: SHOT_B, ok: false, error: 'too short' },
+      ],
+    } as never);
+    expect(t.c.ack.value).toMatchObject({ id: 'desk-1', ok: false, message: 'rideo refused the result.', refused: [{ shotId: SHOT_B, error: 'too short' }] });
+  });
+
+  it('Done sends a last state, then close done; Close sends close cancel (a state first when edits wait)', async () => {
+    const done = setup();
+    await opened(done);
+    await done.c.done();
+    expect(done.sent.map((s) => s.message.type).slice(-2)).toEqual(['state', 'close']);
+    expect(done.ofType('close')).toEqual([{ type: 'close', reason: 'done' }]);
+    expect(done.c.status.value).toBe('closed');
+    done.c.reopen();
+    expect(done.c.status.value).toBe('open');
+
+    const close = setup();
+    await opened(close);
+    await close.c.close();
+    expect(close.sent.map((s) => s.message.type)).toEqual(['ready', 'opened', 'state', 'close']);
+    expect(close.ofType('close')).toEqual([{ type: 'close', reason: 'cancel' }]);
+
+    const dirty = setup();
+    await opened(dirty);
+    dirty.edit();
+    await dirty.c.close();
+    expect(dirty.sent.map((s) => s.message.type).slice(-2)).toEqual(['state', 'close']);
+  });
+
+  it('updates the shots to the brief unless read-only', async () => {
+    const t = setup({ workspace: { updateFromBrief: vi.fn(async () => null) } });
+    await opened(t, { readOnly: true });
+    await t.c.updateShots();
+    expect(t.ws.updateFromBrief).not.toHaveBeenCalled();
+    const rw = setup();
+    await opened(rw);
+    rw.c.changes.value = { added: ['x'], removed: [], retimed: [], recast: [], cast: { added: [], removed: [] } };
+    await rw.c.updateShots();
+    expect(rw.ws.updateFromBrief).toHaveBeenCalledTimes(1);
+    expect(rw.c.changes.value).toBeNull();
+  });
+
+  it('takes the contract defaults for options', () => {
+    expect(resolveOptions(undefined)).toEqual({ hostName: 'the host', modes: ['camera'], defaultMode: 'camera', readOnly: false });
+    expect(resolveOptions({ modes: ['camera', 'motion'], defaultMode: 'pose' })).toEqual({
+      hostName: 'the host',
+      modes: ['motion', 'camera'],
+      defaultMode: 'motion',
+      readOnly: false,
+    });
+    expect(resolveOptions({ hostName: '  rideo ' }).hostName).toBe('rideo');
+    expect(PROGRESS_INTERVAL_MS).toBe(100);
+  });
+});

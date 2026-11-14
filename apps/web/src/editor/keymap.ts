@@ -195,7 +195,12 @@ function handle(map: Record<string, Handler>, key: string, e: KeyboardEvent): bo
  */
 export const TYPING_PAUSE_MS = 1500;
 
-export function installKeymap(): () => void {
+/**
+ * Installs the window-level keymap. `ignore`: key combinations (as combo() names them, e.g.
+ * 'Ctrl+N', 'F3') the page leaves alone: the embeddable desk ignores the keys that open chrome it
+ * hides (embed/guards.ts DESK_IGNORED_KEYS).
+ */
+export function installKeymap(opts: { ignore?: ReadonlySet<string> } = {}): () => void {
   // The field keys are being typed into, while the typing goes on. When it is taken away under the
   // person's fingers (an agent made another object active, ran another operation, removed what it
   // edits, or reordered the list it is in: Chromium takes the focus from a field that moves), the keys
@@ -259,6 +264,7 @@ export function installKeymap(): () => void {
     if (paletteOpen.value || popupMenu.value) return;
     if (dialog.value) return;
     const key = combo(e);
+    if (opts.ignore?.has(key)) return;
     if (handle(GLOBAL, key, e)) {
       e.preventDefault();
       return;

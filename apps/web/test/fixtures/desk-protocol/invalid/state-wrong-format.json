@@ -1,0 +1,12 @@
+{
+  "type": "state",
+  "sceneId": "clp_0123456789abcdef",
+  "state": {
+    "format": "yjs",
+    "version": 1,
+    "data": {
+      "$bytes": "eA=="
+    }
+  },
+  "shots": 1
+}

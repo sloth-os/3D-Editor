@@ -1,5 +1,6 @@
 import { signal, effect } from '@preact/signals';
 import { colorForName } from '@3d-editor/core';
+import { isDeskRuntime } from './runtime';
 
 export type StorageMode = 'auto' | 'browser' | 'webdav';
 
@@ -49,7 +50,23 @@ export function defaultPreferences(): Preferences {
   };
 }
 
+/**
+ * The embeddable desk's preferences (desk.html): the defaults with storage in the browser only, no
+ * sync and no telemetry. It neither reads nor writes the editor's preferences (KEY): it is another
+ * application on the same origin, and a host's desk must not change how the editor syncs.
+ */
+export function deskPreferences(): Preferences {
+  const d = defaultPreferences();
+  return {
+    ...d,
+    storage: { ...d.storage, mode: 'browser' },
+    sync: { ...d.sync, enabled: false },
+    telemetry: false,
+  };
+}
+
 function load(): Preferences {
+  if (isDeskRuntime()) return deskPreferences();
   const d = defaultPreferences();
   try {
     const raw = localStorage.getItem(KEY);
@@ -70,6 +87,8 @@ function load(): Preferences {
 export const prefs = signal<Preferences>(load());
 
 effect(() => {
+  // the desk keeps its preferences for the page's life only (see deskPreferences)
+  if (isDeskRuntime()) return;
   try {
     localStorage.setItem(KEY, JSON.stringify(prefs.value));
   } catch {

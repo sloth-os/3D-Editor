@@ -1,0 +1,36 @@
+{
+  "type": "result",
+  "id": "desk-1",
+  "sceneId": "clp_0123456789abcdef",
+  "fps": 24,
+  "width": 1280,
+  "height": 720,
+  "shots": [
+    {
+      "shotId": "sht_0123456789bbbb",
+      "frames": 60,
+      "durationSec": 2.5,
+      "references": {
+        "camera": "sht_0123456789bbbb.camera.mp4"
+      },
+      "still": null,
+      "camera": {
+        "lensMm": 85,
+        "move": "push_in"
+      },
+      "line": "Mira is in the centre, facing the camera.",
+      "moves": null,
+      "planAgrees": null,
+      "issues": []
+    }
+  ],
+  "files": [
+    {
+      "name": "sht_0123456789bbbb.camera.mp4",
+      "mime": "video/mp4",
+      "data": {
+        "$bytes": "AAAAHGZ0eXBpc29t"
+      }
+    }
+  ]
+}

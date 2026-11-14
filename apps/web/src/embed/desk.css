@@ -1,0 +1,232 @@
+/* The embeddable desk (desk.html): its header, banners, overlays and phone layout, in the editor's look. */
+
+.desk-app {
+  position: relative;
+}
+.desk-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 2px 8px;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.desk-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+.desk-title .logo {
+  flex: none;
+}
+.desk-scene {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.desk-pill {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--bg-panel);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.desk-pill.warn {
+  color: var(--warn);
+}
+.desk-pill.lock {
+  color: var(--select-active);
+}
+.desk-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+.desk-actions .btn {
+  white-space: nowrap;
+}
+.desk-mode {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+  margin-right: 4px;
+}
+.desk-mode select {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  height: 22px;
+}
+.desk-export {
+  padding: 3px 8px 4px;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.desk-export-text {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-dim);
+}
+.desk-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-input-dark);
+  overflow: hidden;
+  margin-top: 3px;
+}
+.desk-bar > div {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+.desk-bar.indeterminate > div {
+  width: 30%;
+  animation: desk-slide 1.2s linear infinite;
+}
+@keyframes desk-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+.desk-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--bg-panel-header);
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  flex: none;
+}
+.desk-banner.ok {
+  border-left-color: var(--ok);
+}
+.desk-banner.warn {
+  border-left-color: var(--warn);
+}
+.desk-banner.err {
+  border-left-color: var(--danger);
+}
+.desk-banner > span:nth-child(2) {
+  flex: 1;
+  min-width: 0;
+}
+.desk-banner-actions {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+.desk-refused {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.desk-main {
+  min-height: 0;
+}
+.desk-side {
+  background: var(--bg-area);
+}
+.desk-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+}
+.desk-work,
+.desk-modal-back {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 1500;
+}
+.desk-work-box,
+.desk-modal {
+  width: min(440px, calc(100% - 32px));
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.desk-work-time {
+  color: var(--text-faint);
+}
+.desk-modal h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.desk-modal p {
+  margin: 0;
+  color: var(--text-dim);
+}
+.desk-modal ul {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 40vh;
+  overflow: auto;
+}
+.desk-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.desk-sample {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 4px 8px;
+  background: #2d2a1f;
+  color: var(--key);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.desk-sample a {
+  color: var(--text);
+}
+.desk-standalone a.btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* phones (the editor's phone layout starts at 760 px): the header keeps its buttons on one line */
+@media (max-width: 760px) {
+  .hide-narrow {
+    display: none !important;
+  }
+  .desk-header {
+    padding: 2px 6px;
+    gap: 4px;
+  }
+  .desk-actions .btn {
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+  .desk-banner {
+    flex-wrap: wrap;
+  }
+}

@@ -25,8 +25,10 @@ import {
   type ProjectSession,
 } from '../project/session';
 import { pwaUpdate, applyPwaUpdate } from '../pwa/register';
+import { readStorage, writeStorage } from '../app/safe-storage';
+import { isDeskRuntime } from '../app/runtime';
 
-function Splitter({ dir, onDrag }: { dir: 'v' | 'h'; onDrag: (delta: number) => void }) {
+export function Splitter({ dir, onDrag }: { dir: 'v' | 'h'; onDrag: (delta: number) => void }) {
   const [dragging, setDragging] = useState(false);
   const last = useRef(0);
   return (
@@ -48,13 +50,18 @@ function Splitter({ dir, onDrag }: { dir: 'v' | 'h'; onDrag: (delta: number) => 
   );
 }
 
-function usePersistentSize(key: string, initial: number): [number, (v: number) => void] {
-  const [v, setV] = useState(() => Number(localStorage.getItem(`3d-editor:size:${key}`)) || initial);
+/**
+ * A size the person dragged to, kept in the browser (never failing where storage is blocked; the
+ * desk keeps its own sizes, apart from the editor's).
+ */
+export function usePersistentSize(key: string, initial: number): [number, (v: number) => void] {
+  const storageKey = `${isDeskRuntime() ? '3d-editor:desk:size' : '3d-editor:size'}:${key}`;
+  const [v, setV] = useState(() => Number(readStorage(storageKey)) || initial);
   return [
     v,
     (n: number) => {
       setV(n);
-      localStorage.setItem(`3d-editor:size:${key}`, String(Math.round(n)));
+      writeStorage(storageKey, String(Math.round(n)));
     },
   ];
 }
@@ -181,7 +188,7 @@ function StatusBar() {
   );
 }
 
-function Toasts() {
+export function Toasts() {
   return (
     <div class="toasts">
       {toasts.value.map((t) => (
@@ -193,7 +200,7 @@ function Toasts() {
   );
 }
 
-function Area(p: {
+export function Area(p: {
   kind: 'outliner' | 'properties' | 'timeline' | 'console' | 'other';
   style?: Record<string, string>;
   children: ComponentChildren;
@@ -261,15 +268,19 @@ function BottomArea({
   s,
   tab,
   onTab,
+  tabs,
 }: {
   s: ProjectSession;
   tab: BottomEditor;
   onTab: (tab: BottomEditor) => void;
+  /** The tabs offered (default: all of them); the desk offers fewer. */
+  tabs?: readonly BottomEditor[];
 }) {
+  const shown = tabs ? BOTTOM_TABS.filter((t) => tabs.includes(t.id)) : BOTTOM_TABS;
   return (
     <div class="column" style={{ height: '100%' }}>
       <div class="area-header" style={{ height: '24px', overflowX: 'auto', scrollbarWidth: 'none' }}>
-        {BOTTOM_TABS.map((t) => (
+        {shown.map((t) => (
           <button
             key={t.id}
             class={`menu-button ${tab === t.id ? 'open' : ''} ${t.mobileOnly ? 'director-mobile-only' : ''}`}
@@ -324,6 +335,8 @@ export function BottomPane(p: {
   size: number;
   setSize: (height: number) => void;
   minHeight?: number;
+  /** The tabs offered (default: all); `initial` must be one of them. */
+  tabs?: readonly BottomEditor[];
 }) {
   const { initial } = p;
   const narrow = useNarrowScreen();
@@ -352,7 +365,7 @@ export function BottomPane(p: {
         kind={initial === 'console' ? 'console' : 'timeline'}
         style={{ height: `${height}px`, flex: 'none' }}
       >
-        <BottomArea s={p.s} tab={tab} onTab={setTab} />
+        <BottomArea s={p.s} tab={tab} onTab={setTab} tabs={p.tabs} />
       </Area>
     </>
   );

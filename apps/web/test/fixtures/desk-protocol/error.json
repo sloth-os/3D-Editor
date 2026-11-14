@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "id": "exp-1",
+  "code": "export_failed",
+  "message": "sht_0123456789bbbb: the encoder stopped (out of memory)."
+}

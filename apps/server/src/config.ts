@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { deskEmbedSettings, type DeskEmbedSettings } from './desk-embed';
 import { PACKAGE_VERSION } from './version';
 
 export const LOG_LEVELS = ['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'] as const;
@@ -101,6 +102,12 @@ export interface ServerConfig {
   modelCacheMaxBytes: number;
   /** Timeout of each request to a store provider (`STORE_FETCH_TIMEOUT_MS`, default 20000 ms). */
   storeFetchTimeoutMs: number;
+  /**
+   * Headers of the embeddable desk page (desk.html) and the built assets: its
+   * Cross-Origin-Embedder-Policy (`DESK_EMBED_COEP`, default require-corp) and the origins that may
+   * frame it (`DESK_EMBED_ORIGINS`, comma-separated, default `*`). docs/embedding.md.
+   */
+  deskEmbed: DeskEmbedSettings;
 }
 
 /** The model store providers the server knows (STORE_PROVIDERS picks and orders them). */
@@ -191,6 +198,9 @@ const envSchema = z.object({
   MODEL_CACHE_DIR: z.string().optional(),
   MODEL_CACHE_MAX_MB: z.coerce.number().min(0).max(1_048_576).default(2048),
   STORE_FETCH_TIMEOUT_MS: z.coerce.number().int().min(100).max(600_000).default(20_000),
+  // checked by deskEmbedSettings (desk-embed.ts)
+  DESK_EMBED_COEP: z.string().default('require-corp'),
+  DESK_EMBED_ORIGINS: z.string().default('*'),
 });
 
 /**
@@ -337,6 +347,10 @@ export function loadConfig(
       throw new Error(`Invalid configuration: STORE_CATALOG_URLS: expected http(s) URLs, got '${url}'`);
   }
   const storeProviders = parseStoreProviders(e.STORE_PROVIDERS, storeCatalogUrls.length > 0);
+  const deskEmbed = deskEmbedSettings({
+    DESK_EMBED_COEP: e.DESK_EMBED_COEP,
+    DESK_EMBED_ORIGINS: e.DESK_EMBED_ORIGINS,
+  });
 
   return {
     port: e.PORT,
@@ -380,5 +394,6 @@ export function loadConfig(
       : path.join(dataDir, 'model-cache'),
     modelCacheMaxBytes: Math.round(e.MODEL_CACHE_MAX_MB * 1024 * 1024),
     storeFetchTimeoutMs: e.STORE_FETCH_TIMEOUT_MS,
+    deskEmbed,
   };
 }

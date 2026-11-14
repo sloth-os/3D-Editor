@@ -223,7 +223,7 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
     mcp.register(app);
   }
 
-  const serving = await registerStatic(app, config.publicDir);
+  const serving = await registerStatic(app, config.publicDir, config.deskEmbed);
   if (!serving) log.info({ publicDir: config.publicDir }, 'no PWA build found: serving the API only');
 
   app.addHook('preClose', async () => {
