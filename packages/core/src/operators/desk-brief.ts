@@ -1,8 +1,7 @@
 import { z } from 'zod';
-import { stageBriefIn, type StageBriefReport } from '../desk/brief/stage';
+import { MAX_BRIEF_PRE_ROLL, stageBriefIn, type StageBriefReport } from '../desk/brief/stage';
 import { updateFromBriefIn } from '../desk/brief/update';
 import { shotResults, type ShotResultMeta } from '../desk/brief/results';
-import { MAX_PRE_ROLL } from '../desk/shots';
 import type { OperatorContext } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
 import { pollObjectMode } from './helpers';
@@ -53,9 +52,11 @@ export function registerDeskBriefOperators(reg: OperatorRegistry): void {
           .number()
           .int()
           .min(0)
-          .max(MAX_PRE_ROLL)
+          .max(MAX_BRIEF_PRE_ROLL)
           .default(12)
-          .describe('Frames of the gap before a cut where marks jump (animated, never exported)'),
+          .describe(
+            'Frames of the gap before a cut where a rider gets on or off a mount between two shots (animated, never exported)',
+          ),
       }),
       execute: (ctx, p) =>
         reportWarnings(ctx, stageBriefIn(ctx, p.brief, { preRollFrames: p.pre_roll_frames })),

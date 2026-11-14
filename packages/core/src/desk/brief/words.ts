@@ -41,21 +41,33 @@ export function sunOf(time: TimeOfDay | null): { azimuthDeg: number; elevationDe
 
 // ---------------------------------------------------------------- interiors
 
-/** Words that say a place is indoors. */
+/**
+ * Words that say a place is indoors. "flat" counts only as a noun (a flat in town, not a flat field),
+ * "bar" not after "sand" or "candy"; "lift" and "store" are left out (a ski lift, a store front).
+ */
 const INDOORS =
-  /\b(?:indoors?|inside|interior|room|bedroom|kitchen|bathroom|living room|lounge|hallway|hall|corridor|office|classroom|library|studio|attic|cellar|basement|garage|shop|store|cafe|caf|restaurant|bar|pub|church|chapel|museum|gallery|theatre|theater|cinema|gym|warehouse|factory|hospital|ward|lobby|apartment|flat|cabin interior|staircase|stairwell|elevator|lift|dining room|nursery|playroom|workshop|barn interior|tent interior)\b/;
+  /\b(?:indoors?|inside|interior|room|bedroom|kitchen|bathroom|living room|lounge|hallway|hall|corridor|office|classroom|library|studio|attic|cellar|basement|garage|shop|cafe|caf|restaurant|(?<!sand |candy |chocolate |crow)bar|pub|church|chapel|museum|gallery|theatre|theater|cinema|gym|warehouse|factory|hospital|ward|lobby|apartment|flat(?=\s*(?:$|[,.;:!?)]|(?:in|on|at|of|with|where|above|below|near|by|and|that|which)\b))|cabin interior|staircase|stairwell|elevator|dining room|nursery|playroom|workshop|barn interior|tent interior)\b/g;
 /** Words that say a place is outdoors (they win over a room named as being nearby). */
 const OUTDOORS =
-  /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?)\b/;
+  /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|car park|parking lot)\b/g;
 
 /**
  * Whether a place is an interior by its words: "indoors", "inside" or a room's name make it one unless
  * outdoor words come first ("a meadow behind the house's kitchen"); null when the words say neither.
+ * An indoor word with an outdoor one right after it names where that outdoor place is or whose it is
+ * ("deep inside the forest", "the cafe terrace", "the factory yard"): it says nothing of a room.
  */
 export function interiorFromWords(text: string): boolean | null {
   const t = plainText(text);
-  const inside = INDOORS.exec(t);
-  const outside = OUTDOORS.exec(t);
+  const outdoors = [...t.matchAll(OUTDOORS)];
+  const nearOutdoor = (end: number) =>
+    outdoors.some(
+      (o) =>
+        o.index >= end &&
+        /^\W*(?:(?:the|a|an|of|its|their)\W+)?(?:[a-z'-]+\W+)?$/.test(t.slice(end, o.index)),
+    );
+  const inside = [...t.matchAll(INDOORS)].find((m) => !nearOutdoor(m.index + m[0].length));
+  const outside = outdoors[0];
   if (inside && outside) return inside.index < outside.index;
   if (inside) return true;
   if (outside) return false;
@@ -303,6 +315,116 @@ export function standInKind(text: string): { kind: ActorKind; word: string } | n
     if (m && (!best || m.index < best.at)) best = { at: m.index, kind, word: m[0] };
   }
   return best && { kind: best.kind, word: best.word };
+}
+
+/** A plural or singular animal word as one animal ("ducks" → "duck", "geese" → "goose", "foxes" → "fox"). */
+export function singularAnimal(word: string): string {
+  const w = word.toLowerCase();
+  const irregular: Readonly<Record<string, string>> = {
+    geese: 'goose',
+    mice: 'mouse',
+    wolves: 'wolf',
+    bunnies: 'bunny',
+    hippopotami: 'hippopotamus',
+    'guinea pigs': 'guinea pig',
+  };
+  if (irregular[w]) return irregular[w];
+  if (/(?:ss|us)$/.test(w)) return w;
+  if (/(?:x|ch|ss)es$/.test(w) || /(?:buffalo|rhinoceros|lioness|ostrich)es$/.test(w)) return w.slice(0, -2);
+  if (/ies$/.test(w)) return `${w.slice(0, -3)}y`;
+  return w.endsWith('s') ? w.slice(0, -1) : w;
+}
+
+/**
+ * Nouns that name a person: named before any animal, they make a cast member one ("A farmer with a
+ * goat", rideo's "Mira: 8 girl, slim; …"). Not before "'s" ("the farmer's duck" is a duck).
+ */
+const PERSON_NOUN =
+  /\b(?:girls?|boys?|m[ae]n|wom[ae]n|lad(?:y|ies)|gentlem[ae]n|child(?:ren)?|bab(?:y|ies)|toddlers?|teen(?:ager)?s?|persons?|people|adults?|guys?|kings?|queens?|princes?|princess(?:es)?|knights?|witch(?:es)?|wizards?|pirates?|cowboys?|cowgirls?|mother|father|mum|mom|dad|grand(?:ma|pa|mother|father)|granny|aunt|uncle|sister|brother|son|daughter|wife|husband|farmers?|(?:zoo|shop|inn|bee|game)?keepers?|shepherd(?:ess)?s?|hunters?|vets?|veterinarians?|owners?|trainers?|riders?|jockeys?|teachers?|students?|pupils?|doctors?|nurses?|chefs?|cooks?|bakers?|pilots?|sailors?|soldiers?|officers?|police|detectives?|scientists?|explorers?|rangers?|gardeners?|builders?|drivers?|captains?|miners?|clowns?|guards?|servants?|maids?|butlers?|waiters?|waitress(?:es)?|singers?|dancers?|artists?|painters?|writers?|poets?|musicians?|mayors?|priests?|nuns?|monks?|[a-z]+(?:man|woman|men|women))\b(?!'s\b)/;
+
+/** Words after which an animal is something a member has, does, wears or is with, not what it is. */
+const NOT_ITSELF =
+  /\b(?:who|whom|whose|which|that|with|without|in|on|at|by|for|from|to|of|near|like|after|behind|beside|under|wearing|wears?|dressed|carr(?:y|ies|ying)|hold(?:s|ing)?|feed(?:s|ing)?|loves?|likes?|has|have|keeps?|owns?|tends?|watch(?:es|ing)?|chas(?:es|ing)|rides?|riding|his|her|their|its|my|your|our)\b/;
+
+/**
+ * Words that make the word before them a modifier: a thing it is the shape or print of ("a bird
+ * tattoo", "rabbit ears", "a fox-fur hat") or a person or thing it names ("a horse trainer", "a dog
+ * walker", "a duck feather").
+ */
+const MODIFIED =
+  /^[\s-]+(?!(?:under|over|after|ever|never|other|rather|either|neither|whether|together|for|nor|near|deer)\b)(?:[a-z]+(?:er|or|ist|man|woman|men|women)s?|costumes?|tattoos?|prints?|patterns?|ears|tails?|masks?|hats?|onesies?|suits?|slippers?|toys?|plush(?:ies)?|shaped|logos?|badges?|fur|pendants?|kites?|t-?shirts?|shirts?|pyjamas|pajamas|puppets?|figurines?|statues?|drawings?|lady|ladies|boys?|girls?)\b/;
+
+/** Words that make the next word a toy or an image ("a teddy bear", "a wooden horse"). */
+const TOY_BEFORE =
+  /\b(?:teddy|toy|rocking|stuffed|plush|hobby|cuddly|wooden|paper|cardboard|origami|inflatable|plastic|china|porcelain)\s+$/;
+
+/** `text` with the words a modifier makes something else (see MODIFIED, TOY_BEFORE) blanked, same length. */
+function blankModifiers(text: string): string {
+  return text.replace(/[a-z]+/g, (w, at: number) =>
+    MODIFIED.test(text.slice(at + w.length)) || TOY_BEFORE.test(text.slice(0, at)) ? ' '.repeat(w.length) : w,
+  );
+}
+
+/**
+ * What one sentence of a cast member's own words makes it: an animal (a built kind, or a stand-in for
+ * one the desk has no figure for) named before any person and before any word that makes the animal
+ * something the member has, does or wears; 'person' when a person is named first; null when it says
+ * neither.
+ */
+function sentenceKind(sentence: string): AnimalWords | 'person' | null {
+  const t = blankModifiers(plainText(sentence));
+  const person = PERSON_NOUN.exec(t);
+  const breaker = NOT_ITSELF.exec(t);
+  const head = t.slice(0, Math.min(person?.index ?? t.length, breaker?.index ?? t.length));
+  let stand: { at: number; kind: ActorKind; word: string } | null = null;
+  for (const [re, kind] of STAND_INS) {
+    const m = re.exec(head);
+    if (m && (!stand || m.index < stand.at)) stand = { at: m.index, kind, word: m[0] };
+  }
+  const built = speciesOf({ name: stand ? head.slice(0, stand.at) : head, summary: '', identity: undefined });
+  if (built) return { kind: built, builtIn: true, word: built.replace(/_/g, ' ') };
+  if (stand) return { kind: stand.kind, builtIn: false, word: singularAnimal(stand.word) };
+  return person ? 'person' : null;
+}
+
+/** An animal a cast member's words make it: a built kind, or the built kind standing in for one the desk has no figure of. */
+export interface AnimalWords {
+  kind: ActorKind;
+  /** Whether the desk has a figure of it (else `kind` stands in for `word`). */
+  builtIn: boolean;
+  /** The animal as the words name it, singular ("duck"). */
+  word: string;
+}
+
+/**
+ * The animal a cast member is by its own words, or null for a person (the actor kind of a member
+ * without a kind hint, before what the shots say: who rides and holds what). The words read are the
+ * description's first sentence (after rideo's "Name:" opening its identity line) and, when that says
+ * neither a person nor an animal, the next sentence; then the name ("Duck"). In each, an animal counts
+ * only when named before any person and before any word that makes it something the member has, does,
+ * wears or is with: "A white duck" and "Pip: 3 male, small; golden fur. A golden retriever puppy." are
+ * animals; "A farmer with a goat", "Mira: 8 girl, slim; a small bird tattoo …", "A girl in a rabbit
+ * costume", "wearing a fox-fur hat" and "Deep in love with birds" are not.
+ */
+export function animalOf(name: string, description: string): AnimalWords | null {
+  const own = plainText(name).trim();
+  const sentences = description
+    .split(/[.!?\n]+/)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .slice(0, 2);
+  if (sentences.length && own) {
+    const first = plainText(sentences[0]);
+    if (first.startsWith(own) && /^\s*:/.test(first.slice(own.length)))
+      sentences[0] = first.slice(own.length).replace(/^\s*:\s*/, '');
+  }
+  for (const sentence of sentences) {
+    const k = sentenceKind(sentence);
+    if (k === 'person') return null;
+    if (k) return k;
+  }
+  const k = own ? sentenceKind(own) : null;
+  return k && k !== 'person' ? k : null;
 }
 
 /** What a cast member's kind hint says: a built kind, "a person" (the words say which), or nothing the desk knows. */

@@ -28,8 +28,10 @@ import { SceneBriefSchema, briefProblems, type BriefChanges, type SceneBrief } f
 /*
  * stageBrief: a host's SceneBrief (schema.ts) staged in an empty project, in one transaction (one
  * undo step): the scene's frame rate and render size, the set, the cast as actors, the props, a
- * shot per brief shot (round(durationSec × fps) frames, at least one, back to back; the host's ids
- * kept as the shots' external reference, source 'host', and as the actors' character ids), each
+ * shot per brief shot (round(durationSec × fps) frames, at least one, in brief order from the scene's
+ * first frame; a cut where a rider gets on or off a mount between two shots gets a pre-roll before
+ * it, `preRollFrames` long, where the import animates the change; the host's ids kept as the shots'
+ * external reference, source 'host', and as the actors' character ids), each
  * camera solved from its framing and fitted to its planned layout, the actors not cast in a shot
  * hidden in it, and the desk's checks run. plan.ts decides what the brief's words leave open; the
  * SceneBlocking import (desk/rideo/import.ts) is the staging engine. A record of the brief is kept
@@ -207,6 +209,9 @@ export function recordOf(
   };
 }
 
+/** The longest pre-roll a staging puts before a cut: the SceneBlocking import's limit (rideo/schema.ts preRollFrames). */
+export const MAX_BRIEF_PRE_ROLL = 1000;
+
 /**
  * Stages brief `raw` in `ctx.doc` inside the caller's transaction (desk.stage_brief's execute; see
  * stageBrief). INVALID_PARAMS for a brief that does not validate, or a document already staged
@@ -218,6 +223,12 @@ export function stageBriefIn(
   opts: { preRollFrames?: number } = {},
 ): StageBriefReport {
   const brief = parseBrief(raw);
+  const pre = opts.preRollFrames;
+  if (pre !== undefined && !(Number.isInteger(pre) && pre >= 0 && pre <= MAX_BRIEF_PRE_ROLL))
+    throw new OperatorError(
+      `the pre-roll must be a whole number of frames from 0 to ${MAX_BRIEF_PRE_ROLL} (got ${pre})`,
+      'INVALID_PARAMS',
+    );
   const doc = ctx.doc;
   const staged = readBriefRecord(doc);
   if (staged)
@@ -275,10 +286,11 @@ export function stageBriefIn(
 
 /**
  * Stages a host's SceneBrief in an empty project, in one transaction (one undo step): see the module
- * comment. `preRollFrames`: the gap the SceneBlocking import puts before a cut where marks jump
- * (a brief has no marks: unused unless the staging is updated with some). Throws an OperatorError
- * (INVALID_PARAMS) for a brief that does not validate, or a project that has shots or is staged from
- * a brief already (updateFromBrief updates that). Runs in a web worker: no DOM, no Node API.
+ * comment. `preRollFrames` (0 to MAX_BRIEF_PRE_ROLL, default 12): the gap the SceneBlocking import
+ * puts before a cut where marks jump: in a brief, where a rider gets on or off a mount between two
+ * shots (its shots' words say who rides whom). Throws an OperatorError (INVALID_PARAMS) for a brief
+ * that does not validate, a pre-roll out of range, or a project that has shots or is staged from a
+ * brief already (updateFromBrief updates that). Runs in a web worker: no DOM, no Node API.
  */
 export function stageBrief(
   doc: SceneDoc,

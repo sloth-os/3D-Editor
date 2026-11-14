@@ -1,15 +1,16 @@
 import { z } from 'zod';
 import type { ActorKind } from '../characters/types';
 import {
+  actsAsPerson,
   flyerKind,
+  humanKindOf,
   isHumanoid,
   isRideable,
   holdersByText,
-  inferActorKind,
   modelFor,
   plainText,
   ridersByText,
-  speciesOf,
+  type KindEvidence,
 } from '../rideo/rules';
 import { openingMarks } from '../rideo/import';
 import {
@@ -21,15 +22,16 @@ import {
 import type { BriefShot, SceneBrief } from './schema';
 import {
   WATER_SIZES,
+  animalOf,
   framingFromWords,
   groundFromWords,
   interiorFromWords,
   movementOf,
   personKind,
   readKindHint,
-  standInKind,
   sunOf,
   waterFromWords,
+  type AnimalWords,
 } from './words';
 
 /*
@@ -193,11 +195,14 @@ export function castKinds(
         `${c.name}'s kind '${c.kind}' is not one the desk builds: the kind is read from the words instead`,
       );
   }
+  // the animal each member's own words make it (null: a person), read once
+  const animals = new Map(brief.cast.map((c) => [c.id, animalOf(c.name, c.description)]));
   // who rides whom by the shots' words, before the kinds (as the SceneBlocking import reads them):
   // a ridden animal stays one, an animal that rides is a person
-  const firstPass = (c: SceneBrief['cast'][number]): ActorKind =>
-    fixed.get(c.id)?.kind ??
-    inferActorKind(words(c), { holds: false, personPose: false, ridden: true, rides: false }).kind;
+  const firstPass = (c: SceneBrief['cast'][number]): ActorKind => {
+    const animal = animals.get(c.id);
+    return fixed.get(c.id)?.kind ?? (animal?.builtIn ? animal.kind : humanKindOf(words(c)));
+  };
   const byId = new Map(brief.cast.map((c) => [c.id, c]));
   const riders = new Set<string>();
   const ridden = new Set<string>();
@@ -223,30 +228,44 @@ export function castKinds(
       kinds.set(c.id, f);
       continue;
     }
-    const ev = {
+    const ev: KindEvidence = {
       holds: evidence.holders.has(c.id),
       personPose: false,
       ridden: ridden.has(c.id),
       rides: riders.has(c.id),
     };
-    if (speciesOf(words(c))) {
-      kinds.set(c.id, inferActorKind(words(c), ev));
-      continue;
-    }
-    // an animal the desk has no figure for, unless its words make it a person
-    const stand = standInKind(`${c.name}. ${c.description.split(/[.!?\n]/)[0] ?? ''}`);
-    const asPerson = inferActorKind(words(c), ev);
-    if (stand && !ev.holds && !ev.rides) {
-      kinds.set(c.id, {
-        kind: stand.kind,
-        reason: `a ${stand.word} staged as a ${stand.kind} (no ${stand.word} figure)`,
-      });
+    const kind = kindOfAnimal(animals.get(c.id) ?? null, words(c), ev);
+    kinds.set(c.id, kind);
+    const stand = animals.get(c.id);
+    if (stand && !stand.builtIn && kind.kind === stand.kind)
       warnings.push(
         `${c.name} is a ${stand.word}: the desk has no ${stand.word} figure, so a ${stand.kind} of its size stands in`,
       );
-    } else kinds.set(c.id, asPerson);
   }
   return { kinds, warnings };
+}
+
+/**
+ * The kind of a member without a hint whose own words make it `animal` (null: a person), as the
+ * SceneBlocking import reads rideo's cast: a ridden animal stays one; one that rides, holds a prop or
+ * acts as a person (talks, dresses) is a person; an animal the desk has no figure for stands in as
+ * the built kind nearest its size.
+ */
+function kindOfAnimal(
+  animal: AnimalWords | null,
+  c: { name: string; summary: string; identity: undefined },
+  ev: KindEvidence,
+): BriefCastPlan {
+  if (!animal) return { kind: humanKindOf(c), reason: 'a person' };
+  // a built kind by its name ("a small_dog", as the import says it), else the animal's word
+  const what = animal.builtIn ? animal.kind : animal.word;
+  if (animal.builtIn && ev.ridden) return { kind: animal.kind, reason: `a ${what} another character rides` };
+  if (ev.rides) return { kind: humanKindOf(c), reason: `a ${what} that rides: a person` };
+  if (ev.holds) return { kind: humanKindOf(c), reason: `a ${what} that holds a prop: a person` };
+  if (actsAsPerson(c)) return { kind: humanKindOf(c), reason: `a ${what} that acts as a person` };
+  return animal.builtIn
+    ? { kind: animal.kind, reason: `a ${what}` }
+    : { kind: animal.kind, reason: `a ${what} staged as a ${animal.kind} (no ${what} figure)` };
 }
 
 /** A spot beside `mark` at distance `d` on the side `k` tries (right, left, behind, front), and the next ring out. */
