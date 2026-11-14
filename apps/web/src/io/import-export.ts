@@ -1,6 +1,7 @@
-import { base64Encode, detectFormat, exportScene, importFile, type ExportFormat } from '@3d-editor/core';
+import { base64Encode, detectFormat, exportScene, type ExportFormat } from '@3d-editor/core';
 import { session, toast } from '../app/store';
 import { runResult } from '../editor/editor';
+import { pageGuard } from '../editor/page-guard';
 import { telemetry } from '../telemetry/telemetry';
 
 /** Lets the user pick model files and imports them through the import operators (undoable). */
@@ -23,26 +24,38 @@ const IMPORT_OPS: Record<string, string> = {
   ply: 'import_mesh.ply',
 };
 
+/**
+ * Imports model files (a drop on the viewport, the file picker, files opened through the OS) through
+ * the import operators only: what refuses them (their Object Mode check, a page that refuses every
+ * change to the scene, such as the read-only embeddable desk) refuses the import, and says why.
+ * Nothing writes the document past the operator. A file the page refuses is not even read.
+ */
 export async function importFiles(files: File[]): Promise<void> {
-  const s = session.value;
-  if (!s) return;
+  if (!session.value) return;
+  // what the page refuses, said once for all the files it refuses it for
+  const told = new Set<string>();
   for (const file of files) {
     const fmt = detectFormat(file.name);
     if (!fmt) {
       toast(`Unsupported file type: ${file.name}`, 'error');
       continue;
     }
+    const op = IMPORT_OPS[fmt];
     const span = telemetry.startSpan(`import ${fmt}`, { 'file.format': fmt, 'file.size': file.size });
     try {
+      const refused = pageGuard.refusal(op);
+      if (refused !== null) {
+        if (!told.has(refused)) toast(refused, 'error');
+        told.add(refused);
+        span.setError(refused);
+        continue;
+      }
       const bytes = new Uint8Array(await file.arrayBuffer());
       const name = file.name.replace(/\.[^.]+$/, '');
-      const res = runResult(IMPORT_OPS[fmt], { data_base64: base64Encode(bytes), name }, 'ui');
+      const res = runResult(op, { data_base64: base64Encode(bytes), name }, 'ui');
       if (!res?.ok) {
-        // fall back to the library function (e.g. operator not registered yet)
-        const r = s.doc.transact(() => importFile(s.doc, fmt, bytes, { name }));
-        s.state.selectedIds = r.objects;
-        s.state.activeId = r.objects[r.objects.length - 1] ?? null;
-        for (const w of r.warnings) toast(w, 'warning');
+        span.setError(res?.error ?? 'no project open');
+        continue;
       }
       toast(`Imported ${file.name}`);
       span.setOk();

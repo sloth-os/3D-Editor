@@ -196,11 +196,26 @@ function handle(map: Record<string, Handler>, key: string, e: KeyboardEvent): bo
 export const TYPING_PAUSE_MS = 1500;
 
 /**
+ * Keys of the editor whose browser default acts on the page itself: Save Page As (Ctrl/Cmd+S) and
+ * the file chooser whose file the tab opens in place of the page (Ctrl/Cmd+O). A page that ignores
+ * them (the embeddable desk: it has no Save or Open) still keeps them from the browser, wherever the
+ * focus is.
+ */
+export const KEPT_FROM_BROWSER: ReadonlySet<string> = new Set(['Ctrl+S', 'Ctrl+O']);
+
+/**
  * Installs the window-level keymap. `ignore`: key combinations (as combo() names them, e.g.
  * 'Ctrl+N', 'F3') the page leaves alone: the embeddable desk ignores the keys that open chrome it
- * hides (embed/guards.ts DESK_IGNORED_KEYS).
+ * hides (embed/guards.ts DESK_IGNORED_KEYS). The browser keeps what it does with them, except for
+ * those of KEPT_FROM_BROWSER, which do nothing at all.
  */
 export function installKeymap(opts: { ignore?: ReadonlySet<string> } = {}): () => void {
+  // in the capture phase, before any field: fields stop many of the keys typed into them, and the
+  // listener below leaves keys typed into a field alone, so it would not keep a Ctrl+S typed into one
+  const kept = [...KEPT_FROM_BROWSER].filter((k) => opts.ignore?.has(k));
+  const onKept = (e: KeyboardEvent) => {
+    if (kept.includes(combo(e))) e.preventDefault();
+  };
   // The field keys are being typed into, while the typing goes on. When it is taken away under the
   // person's fingers (an agent made another object active, ran another operation, removed what it
   // edits, or reordered the list it is in: Chromium takes the focus from a field that moves), the keys
@@ -296,10 +311,12 @@ export function installKeymap(opts: { ignore?: ReadonlySet<string> } = {}): () =
     }
     if (handle(VIEWPORT_COMMON, key, e)) e.preventDefault();
   };
+  if (kept.length) window.addEventListener('keydown', onKept, true);
   window.addEventListener('keydown', onTyped, true);
   window.addEventListener('pointerdown', onPointer, true);
   window.addEventListener('keydown', onKey);
   return () => {
+    if (kept.length) window.removeEventListener('keydown', onKept, true);
     window.removeEventListener('keydown', onTyped, true);
     window.removeEventListener('pointerdown', onPointer, true);
     window.removeEventListener('keydown', onKey);
