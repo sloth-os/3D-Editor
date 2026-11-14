@@ -31,8 +31,9 @@ import { WATER_CLEARANCE_M } from '../src/desk/brief/plan';
  * fixture staged (Mira, a child, and Pip, a dog, over 72 and 60 frames at 24 fps, cameras by framing,
  * the afternoon sun, the kite in Mira's hand, the pond on the left clear of the cast), generic host
  * ids, kinds the desk cannot build, the time of day, the words of the set, how a later brief differs,
- * an update that keeps what was done by hand, the shot results, the schema against every fixture
- * scene, and that all of it runs without DOM or Node APIs (a web worker).
+ * an update that keeps what was done by hand, the shot results and the schema against every fixture
+ * scene. desk-brief-worker.test.ts runs all of it as the desk's staging worker loads it (no DOM, no
+ * Node API).
  */
 
 const FIXTURES = new URL('./fixtures/desk-embed/', import.meta.url);
@@ -541,56 +542,5 @@ describe('SceneBriefSchema', () => {
     const duration = briefOf();
     duration.shots[0].durationSec = 0;
     expect(ok(duration)).toBe(false);
-  });
-});
-
-describe('worker safety', () => {
-  const NODE = ['process', 'Buffer', 'setImmediate', 'global', 'require', '__dirname'];
-  const DOM = ['window', 'document', 'self', 'localStorage', 'XMLHttpRequest', 'fetch', 'HTMLElement'];
-
-  /** Runs `fn` with Node and DOM globals replaced by getters that record each read. */
-  function trapped(fn: () => void): string[] {
-    const read: string[] = [];
-    const saved: [string, PropertyDescriptor | undefined][] = [];
-    for (const name of [...NODE, ...DOM]) {
-      const d = Object.getOwnPropertyDescriptor(globalThis, name);
-      if (d && !d.configurable) continue;
-      saved.push([name, d]);
-      Object.defineProperty(globalThis, name, {
-        configurable: true,
-        get() {
-          read.push(name);
-          return undefined;
-        },
-      });
-    }
-    try {
-      fn();
-    } finally {
-      for (const [name, d] of saved)
-        if (d) Object.defineProperty(globalThis, name, d);
-        else delete (globalThis as Record<string, unknown>)[name];
-    }
-    return read;
-  }
-
-  it('stages, updates and reports without reading a DOM or Node global', () => {
-    const doc = newDoc();
-    const read = trapped(() => {
-      stageBrief(doc, openScene());
-      briefChanges(doc, addedAndRetimed());
-      updateFromBrief(doc, addedAndRetimed());
-      shotResults(doc);
-    });
-    expect(read).toEqual([]);
-    expect(getShots(doc)).toHaveLength(3);
-  });
-
-  it('imports no Node module and names no DOM API', () => {
-    const dir = new URL('../src/desk/brief/', import.meta.url);
-    for (const f of readdirSync(dir)) {
-      const text = readFileSync(new URL(f, dir), 'utf8');
-      expect(text, f).not.toMatch(/from 'node:|require\(|\bdocument\.|\bwindow\.|\bprocess\./);
-    }
   });
 });
