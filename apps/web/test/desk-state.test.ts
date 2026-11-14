@@ -100,10 +100,14 @@ describe('the desk state', () => {
       const state = await encodeDeskState(update, header(), { compress });
       const b = bytesOf(state);
       const cut = b.slice(0, b.length - 5);
-      await expect(decodeDeskState({ ...state, data: cut.buffer }, 'clp_1')).rejects.toBeInstanceOf(StateUnreadable);
+      await expect(decodeDeskState({ ...state, data: cut.buffer }, 'clp_1')).rejects.toBeInstanceOf(
+        StateUnreadable,
+      );
       const bad = b.slice();
       for (let i = b.length - 20; i < b.length - 2; i++) bad[i] ^= 0x5a;
-      await expect(decodeDeskState({ ...state, data: bad.buffer }, 'clp_1')).rejects.toBeInstanceOf(StateUnreadable);
+      await expect(decodeDeskState({ ...state, data: bad.buffer }, 'clp_1')).rejects.toBeInstanceOf(
+        StateUnreadable,
+      );
     }
     // a payload that is not a Yjs document
     const junk = await encodeDeskState(new Uint8Array([200, 1, 2, 3, 4, 5]), header(), { compress: false });
@@ -112,9 +116,9 @@ describe('the desk state', () => {
     const noLineage = await encodeDeskState(update, header({ lineage: '' }), { compress: false });
     await expect(decodeDeskState(noLineage, 'clp_1')).rejects.toThrow(/scene or lineage/);
     // fewer bytes than the prefix
-    await expect(decodeDeskState({ format: '3d-editor.desk-state', version: 1, data: new ArrayBuffer(3) }, 'clp_1')).rejects.toBeInstanceOf(
-      StateUnreadable,
-    );
+    await expect(
+      decodeDeskState({ format: '3d-editor.desk-state', version: 1, data: new ArrayBuffer(3) }, 'clp_1'),
+    ).rejects.toBeInstanceOf(StateUnreadable);
   });
 
   it('keeps to 64 MiB both ways', async () => {
@@ -124,7 +128,10 @@ describe('the desk state', () => {
     expect((err as StateTooLarge).bytes).toBeGreaterThan(MAX_STATE_BYTES);
     expect((err as Error).message).toMatch(/64 MiB/);
     await expect(
-      decodeDeskState({ format: '3d-editor.desk-state', version: 1, data: new ArrayBuffer(MAX_STATE_BYTES + 1) }, 'clp_1'),
+      decodeDeskState(
+        { format: '3d-editor.desk-state', version: 1, data: new ArrayBuffer(MAX_STATE_BYTES + 1) },
+        'clp_1',
+      ),
     ).rejects.toThrow(/over 64 MiB/);
   });
 

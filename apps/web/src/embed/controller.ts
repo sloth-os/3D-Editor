@@ -66,7 +66,11 @@ export interface ControllerDeps {
   send(message: DeskMessage, transfer?: Transferable[]): boolean;
   workspace: SceneWorkspace;
   /** Whether this browser can export at a size and rate (export/index.ts browserExportSupport). */
-  exportSupport(o: { width: number; height: number; fps: number }): Promise<{ available: boolean; reason: string | null }>;
+  exportSupport(o: {
+    width: number;
+    height: number;
+    fps: number;
+  }): Promise<{ available: boolean; reason: string | null }>;
   /** Runs an export (export.ts runDeskExport by default). */
   runExport?: typeof runDeskExport;
   deskVersion: string;
@@ -169,8 +173,7 @@ export class DeskController {
   constructor(private readonly deps: ControllerDeps) {
     this.timers = deps.timers ?? realTimers;
     this.log =
-      deps.log ??
-      ((level, message) => (level === 'info' ? console.info : console.warn)(`[desk] ${message}`));
+      deps.log ?? ((level, message) => (level === 'info' ? console.info : console.warn)(`[desk] ${message}`));
   }
 
   private error(code: ErrorCode, message: string, id?: string): void {
@@ -198,7 +201,8 @@ export class DeskController {
     // checks again at its real size
     const g = globalThis as { VideoEncoder?: unknown; Worker?: unknown; isSecureContext?: boolean };
     const export_ = check ?? {
-      available: typeof g.VideoEncoder === 'function' && typeof g.Worker === 'function' && g.isSecureContext !== false,
+      available:
+        typeof g.VideoEncoder === 'function' && typeof g.Worker === 'function' && g.isSecureContext !== false,
       reason: null,
     };
     this.deps.send({
@@ -299,15 +303,18 @@ export class DeskController {
     if (this.stateTimer !== null) return;
     const now = this.timers.now();
     const at = Math.max(this.lastChangeAt + STATE_QUIET_MS, this.lastSentAt + STATE_MIN_INTERVAL_MS);
-    this.stateTimer = this.timers.setTimeout(() => {
-      this.stateTimer = null;
-      const t = this.timers.now();
-      if (t - this.lastChangeAt < STATE_QUIET_MS || t - this.lastSentAt < STATE_MIN_INTERVAL_MS) {
-        this.scheduleState();
-        return;
-      }
-      void this.sendState();
-    }, Math.max(0, at - now));
+    this.stateTimer = this.timers.setTimeout(
+      () => {
+        this.stateTimer = null;
+        const t = this.timers.now();
+        if (t - this.lastChangeAt < STATE_QUIET_MS || t - this.lastSentAt < STATE_MIN_INTERVAL_MS) {
+          this.scheduleState();
+          return;
+        }
+        void this.sendState();
+      },
+      Math.max(0, at - now),
+    );
   }
 
   /** Sends the scene's state (in answer to save `id` when given). */
@@ -349,7 +356,10 @@ export class DeskController {
       this.changes.value = await this.deps.workspace.updateFromBrief();
       this.tell('info', 'The shots were updated to the brief (Ctrl+Z undoes it).');
     } catch (err) {
-      this.tell('error', `The shots could not be updated: ${err instanceof Error ? err.message : String(err)}`);
+      this.tell(
+        'error',
+        `The shots could not be updated: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       this.updating.value = false;
     }
@@ -358,11 +368,14 @@ export class DeskController {
   // ---------------------------------------------------------------- export
 
   private async hostExport(m: ExportMessage): Promise<void> {
-    if (this.status.peek() !== 'open') return this.error('not_open', 'No scene is open yet: send open first.', m.id);
+    if (this.status.peek() !== 'open')
+      return this.error('not_open', 'No scene is open yet: send open first.', m.id);
     if (this.exportRun.peek() || this.updating.peek())
       return this.error(
         'busy',
-        this.exportRun.peek() ? 'The desk is exporting already: one export at a time.' : 'The desk is updating its shots.',
+        this.exportRun.peek()
+          ? 'The desk is exporting already: one export at a time.'
+          : 'The desk is updating its shots.',
         m.id,
       );
     const plan = this.exportShots(m.shots);
@@ -385,7 +398,11 @@ export class DeskController {
    * which the export leaves out and names in errors; `unknown` asked ids that are no shots of the
    * brief (the request is refused).
    */
-  private exportShots(asked?: readonly string[]): { shots: string[]; notStaged: string[]; unknown: string[] } {
+  private exportShots(asked?: readonly string[]): {
+    shots: string[];
+    notStaged: string[];
+    unknown: string[];
+  } {
     const briefIds = (this.brief.peek()?.shots ?? []).map((s) => s.id);
     const staged = new Set(this.deps.workspace.stagedShots());
     const wanted = asked ? new Set(asked) : null;
@@ -480,7 +497,11 @@ export class DeskController {
     try {
       const size = exportSizeProblem(brief.width, brief.height);
       if (size) return fail('export_unavailable', size);
-      const support = await this.deps.exportSupport({ width: brief.width, height: brief.height, fps: brief.fps });
+      const support = await this.deps.exportSupport({
+        width: brief.width,
+        height: brief.height,
+        fps: brief.fps,
+      });
       if (!support.available)
         return fail('export_unavailable', support.reason ?? 'This browser cannot encode the clips.');
       this.progress({ id: o.id, phase: 'prepare', done: 0, total: 1 });
@@ -515,13 +536,19 @@ export class DeskController {
         files: outcome.files,
       };
       const count = outcome.shots.length;
-      this.deps.send(message, outcome.files.map((f) => f.data));
+      this.deps.send(
+        message,
+        outcome.files.map((f) => f.data),
+      );
       // the shots left out, each named in an error after the result (the result never waits for them)
       for (const f of outcome.failures) this.error(f.code, f.message, o.id);
       for (const m of notStaged) this.error('export_failed', m, o.id);
       const left = [...outcome.failures.map((f) => f.message), ...notStaged];
       if (left.length)
-        this.tell('warning', `Sent ${count} shot${count === 1 ? '' : 's'}; ${left.length} left out: ${left.join(' ')}`);
+        this.tell(
+          'warning',
+          `Sent ${count} shot${count === 1 ? '' : 's'}; ${left.length} left out: ${left.join(' ')}`,
+        );
       else this.tell('info', `Sent ${count} shot${count === 1 ? '' : 's'} to ${options.hostName}.`);
     } catch (err) {
       this.stopProgress();
@@ -539,11 +566,17 @@ export class DeskController {
   }
 
   private showAck(m: ResultAckMessage): void {
-    const refused = (m.shots ?? []).filter((s) => !s.ok).map((s) => ({ shotId: s.shotId, error: s.error ?? 'refused' }));
+    const refused = (m.shots ?? [])
+      .filter((s) => !s.ok)
+      .map((s) => ({ shotId: s.shotId, error: s.error ?? 'refused' }));
     this.ack.value = {
       id: m.id,
       ok: m.ok,
-      message: m.message ?? (m.ok ? `${this.options.peek().hostName} took the result.` : `${this.options.peek().hostName} refused the result.`),
+      message:
+        m.message ??
+        (m.ok
+          ? `${this.options.peek().hostName} took the result.`
+          : `${this.options.peek().hostName} refused the result.`),
       refused,
       at: this.timers.now(),
     };

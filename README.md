@@ -98,6 +98,12 @@ editor can be improved from real usage.
   move, blocking line, plan check, issues) for the host's prompts. See
   [docs/director-desk.md](docs/director-desk.md#staging-from-a-brief) and
   [docs/embedding.md](docs/embedding.md).
+- **Embeddable desk** – `desk.html`, the Director workspace for another web application to frame
+  (such as the AI video studio rideo): the host sends a brief over the desk embed protocol, the
+  person stages and directs it, and **Send** renders every shot's reference clips in the browser
+  and hands them to the host with the scene's state to keep. No server, no account, offline once
+  loaded; each host's scenes kept apart in the browser; headers for cross-origin isolated hosts
+  (`DESK_EMBED_ORIGINS`, `DESK_EMBED_COEP`). See [docs/embedding.md](docs/embedding.md).
 - **Offline PWA** – installable, works without a network after the first visit.
 - **Storage** – browser (IndexedDB) by default; WebDAV when configured (on the server or in the
   browser), with CRDT merge-saving so concurrent devices never overwrite each other.

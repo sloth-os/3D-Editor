@@ -30,7 +30,7 @@ renderers and the importers/exporters are isomorphic (no DOM, no Node APIs).
 | Package         | Purpose                                                                                                                                                                                                                                                                                         |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `packages/core` | Isomorphic TypeScript: math, mesh kernel, document model, operators, modifiers, curves and text, constraints, armatures, instancing, physics, materials, animation, scene evaluation, generators, CPU rasterizer and path tracer, import/export, sync protocol, WebDAV client and project store |
-| `apps/web`      | The PWA: Preact UI, three.js viewport, interaction, browser render workers, persistence, sync, telemetry, service worker                                                                                                                                                                        |
+| `apps/web`      | The PWA: Preact UI, three.js viewport, interaction, browser render workers, persistence, sync, telemetry, service worker, the embeddable desk page (`desk.html`)                                                                                                                                |
 | `apps/server`   | Fastify server: hosts the PWA, real-time sync hub, MCP endpoint, REST API, render processes, WebDAV proxy, telemetry ingestion, Prometheus metrics                                                                                                                                              |
 | `e2e`           | Playwright tests against the production builds, a real WebDAV server and real MCP clients                                                                                                                                                                                                       |
 | `scripts`       | `mcp.mjs`, a small MCP client (CLI and module) used by the [example projects](../examples)                                                                                                                                                                                                      |
@@ -72,6 +72,7 @@ renderers and the importers/exporters are isomorphic (no DOM, no Node APIs).
 | Physics presets: start frames, drop, throw, push, bake, kites and balloons, vehicles                                                                                                  | `packages/core/src/desk/physics`                              |
 | Built-in model catalog, catalog search, store inserts, framing of the built-in thumbnails                                                                                             | `packages/core/src/store`                                     |
 | Director workspace, Asset Browser, Export Video window, Follow Shots                                                                                                                  | `apps/web/src/ui/director`, `ui/assets`, `viewport`           |
+| Embeddable desk: its page, the host protocol and bridge, the desk state, the staging worker, its export                                                                               | `apps/web/src/embed`, `apps/server/src/desk-embed.ts`         |
 | Video export of server and browser: parameters, plan, desk frames, passes, frame loop, manifest, estimates                                                                            | `packages/core/src/export`                                    |
 | Browser video export: render workers, WebCodecs encoders, MP4/WebM muxing, files, memory plan                                                                                         | `apps/web/src/export`                                         |
 | Built-in thumbnails in the browser: thumbnail workers, queue, IndexedDB cache                                                                                                         | `apps/web/src/assets/thumbnails`                              |
@@ -917,6 +918,34 @@ errors carry the codes `INVALID_PARAMS` and `NOT_FOUND`, which each exporter map
   sequence and the clip of their shot without encoding again (`mux.ts`), and writes the files to
   the Origin Private File System or memory with their SHA-256 (`store.ts`). The Export Video window
   uses it by default and the server as a second choice ([video-export.md](video-export.md)).
+
+## Embeddable desk
+
+`desk.html` is the web app's second page (a second Vite input; [embedding.md](embedding.md)): the
+Director workspace for another application's frame. Its entry, `apps/web/src/embed/main.tsx`,
+shares the editor's modules but none of its start-up: `data-runtime="desk"` on the page's root
+element (`app/runtime.ts`) tells the shared modules before any of them runs, so the preferences
+are the desk's own (never `3d-editor:prefs:v1`), and nothing asks for `/api/config` or starts
+telemetry, RPC, live sync, WebDAV or the server probe. The pieces, each tested on its own:
+
+- `protocol.ts`: the zod schemas of every message of the frozen protocol, checked against the
+  contract's fixtures; `bridge.ts`: `hello`, the one `connect` from the parent, then the port;
+  `controller.ts`: what the desk answers and when (states after edits, progress, Send, Done).
+- `workspace.ts`: a `ProjectSession` per host origin and scene (IndexedDB, or memory where the
+  browser blocks storage), opened by the merge rule of `state.ts` (the desk state's container and
+  lineage). `staging-engine.ts` runs core's `stageBrief`, `updateFromBrief`, `shotResults` and the
+  checks on a document made from a snapshot, in `stage.worker.ts`, and answers with a Yjs diff
+  that the page applies (`staging.ts` is the worker's client).
+- `export.ts`: one run of the browser export engine per shot (preset `reference`), its files
+  renamed for the host and checked for the shot's frames; `guards.ts`: the operators the desk
+  hides, and in a read-only open every operator that changes the scene, refused in the
+  registry's poll.
+
+The server and the Vite dev and preview servers share `apps/server/src/desk-embed.ts` (no
+imports): `DESK_EMBED_COEP` and `DESK_EMBED_ORIGINS` become the page's COEP, CORP and CSP
+`frame-ancestors` and the built files' COEP and CORP, and `/desk` maps to `desk.html`, never to
+the editor's `index.html`. The PWA's service worker precaches `desk.html` and serves it (also at
+`/desk`, with any query) from its cache; the build drops the web app manifest's link from it.
 
 ## Server
 

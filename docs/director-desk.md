@@ -522,6 +522,13 @@ server has ffmpeg (`features.videoExport` in `/api/config`) and holds the projec
 offers it too. A browser that cannot export (no secure page, no WebCodecs H.264 encoder) is told
 why. See [video-export.md](video-export.md).
 
+**Embedded in a host** (`desk.html`): the same Director workspace, focused, in another web
+application's frame. The host's brief is staged in the browser (in a worker), the person directs
+it, **Update shots** brings the staging up to a later brief as one undo step, and **Send to …**
+renders every shot's reference clips in the browser and hands them to the host, which also keeps
+the scene's state; Done and Close end the session. Opened on its own, the page offers a sample
+scene. See [embedding.md](embedding.md).
+
 ## Over MCP
 
 Agents reach every desk operator with `run_operator` / `batch`

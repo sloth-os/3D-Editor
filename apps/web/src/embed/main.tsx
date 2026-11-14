@@ -83,7 +83,9 @@ function shotsNow() {
 
 /** A small scripting hook for the end-to-end tests and measurements (window.__desk). */
 function exposeHook(c: DeskController): void {
-  Object.assign(window, { __desk: { controller: c, workspace: scene, run: runResult, timings, shots: shotsNow } });
+  Object.assign(window, {
+    __desk: { controller: c, workspace: scene, run: runResult, timings, shots: shotsNow },
+  });
 }
 
 function Embedded({ c }: { c: DeskController }) {

@@ -270,13 +270,7 @@ export const DESK_MESSAGE_SCHEMAS = {
 } as const;
 export type DeskMessageType = keyof typeof DESK_MESSAGE_SCHEMAS;
 export type DeskMessage =
-  | ReadyMessage
-  | OpenedMessage
-  | StateMessage
-  | ProgressMessage
-  | ResultMessage
-  | ErrorMessage
-  | CloseMessage;
+  ReadyMessage | OpenedMessage | StateMessage | ProgressMessage | ResultMessage | ErrorMessage | CloseMessage;
 
 // ---------------------------------------------------------------- reading a host's message
 
@@ -341,7 +335,12 @@ export function parseHostMessage(data: unknown): ParsedHostMessage {
     type: known,
     problems: why,
     reply: id.success
-      ? { type: 'error', id: id.data, code: 'bad_message', message: `The ${known} message is not valid: ${why}` }
+      ? {
+          type: 'error',
+          id: id.data,
+          code: 'bad_message',
+          message: `The ${known} message is not valid: ${why}`,
+        }
       : null,
   };
 }

@@ -97,7 +97,10 @@ describe('reading a host message', () => {
     expect(parseHostMessage(null)).toEqual({ kind: 'unknown', type: null });
     expect(parseHostMessage('open')).toEqual({ kind: 'unknown', type: null });
     expect(parseHostMessage({ id: 'x' })).toEqual({ kind: 'unknown', type: null });
-    expect(parseHostMessage({ type: 'frobnicate', id: 'x' })).toEqual({ kind: 'unknown', type: 'frobnicate' });
+    expect(parseHostMessage({ type: 'frobnicate', id: 'x' })).toEqual({
+      kind: 'unknown',
+      type: 'frobnicate',
+    });
     // the desk's own types are not the host's
     expect(parseHostMessage({ type: 'ready' })).toEqual({ kind: 'unknown', type: 'ready' });
   });
@@ -105,15 +108,27 @@ describe('reading a host message', () => {
   it('answers a known type that does not validate with bad_message when it has an id', () => {
     const bad = parseHostMessage(load(INVALID, 'export-unknown-mode.json'));
     expect(bad).toMatchObject({ kind: 'invalid', type: 'export' });
-    expect(bad.kind === 'invalid' && bad.reply).toMatchObject({ type: 'error', code: 'bad_message', id: 'exp-3' });
+    expect(bad.kind === 'invalid' && bad.reply).toMatchObject({
+      type: 'error',
+      code: 'bad_message',
+      id: 'exp-3',
+    });
     // no id (or not a valid one): nothing to answer
     expect(parseHostMessage({ type: 'save' })).toMatchObject({ kind: 'invalid', reply: null });
     expect(parseHostMessage({ type: 'save', id: '' })).toMatchObject({ kind: 'invalid', reply: null });
-    expect(parseHostMessage({ type: 'cancel', id: 'x'.repeat(65) })).toMatchObject({ kind: 'invalid', reply: null });
+    expect(parseHostMessage({ type: 'cancel', id: 'x'.repeat(65) })).toMatchObject({
+      kind: 'invalid',
+      reply: null,
+    });
   });
 
   it('answers an open whose scene is not a brief with invalid_scene, without an id', () => {
-    for (const f of ['open-bad-id.json', 'open-no-shots.json', 'open-odd-width.json', 'open-unknown-cast.json']) {
+    for (const f of [
+      'open-bad-id.json',
+      'open-no-shots.json',
+      'open-odd-width.json',
+      'open-unknown-cast.json',
+    ]) {
       const r = parseHostMessage(load(INVALID, f));
       expect(r.kind, f).toBe('invalid');
       if (r.kind !== 'invalid') continue;
@@ -132,11 +147,15 @@ describe('reading a host message', () => {
       { type: 'open', state: null },
     ]) {
       const r = parseHostMessage(m);
-      expect(r).toMatchObject({ kind: 'invalid', type: 'open', reply: { type: 'error', code: 'bad_message' } });
+      expect(r).toMatchObject({
+        kind: 'invalid',
+        type: 'open',
+        reply: { type: 'error', code: 'bad_message' },
+      });
     }
   });
 
-  it("takes a given state of any format (the desk decides whether it reads it), as a buffer or a view", () => {
+  it('takes a given state of any format (the desk decides whether it reads it), as a buffer or a view', () => {
     const open = load(DIR, 'open-with-state.json');
     const view = { ...open, state: { format: 'other', version: 9, data: new Uint8Array([1, 2, 3]) } };
     expect(parseHostMessage(view).kind).toBe('ok');
@@ -147,8 +166,10 @@ describe('reading a host message', () => {
 
 describe('protocol helpers', () => {
   it('ids follow the contract pattern', () => {
-    for (const ok of ['a', 'sht_0123456789aaaa', 'A.b:c-d_e', '0'.repeat(100)]) expect(ID_PATTERN.test(ok), ok).toBe(true);
-    for (const bad of ['', '_a', '-a', 'a b', 'a/b', '0'.repeat(101), 'é']) expect(ID_PATTERN.test(bad), bad).toBe(false);
+    for (const ok of ['a', 'sht_0123456789aaaa', 'A.b:c-d_e', '0'.repeat(100)])
+      expect(ID_PATTERN.test(ok), ok).toBe(true);
+    for (const bad of ['', '_a', '-a', 'a b', 'a/b', '0'.repeat(101), 'é'])
+      expect(ID_PATTERN.test(bad), bad).toBe(false);
   });
 
   it('counts a shot in frames as hosts do', () => {

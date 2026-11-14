@@ -116,7 +116,8 @@ async function waitFor(page: Page, type: string, count = 1, timeout = 60_000): P
     ([t, n]) =>
       (window as any).host
         .messages()
-        .filter((r: Rec) => !r.bad && !r.sibling && !r.extra && r.message?.type === t).length >= (n as number),
+        .filter((r: Rec) => !r.bad && !r.sibling && !r.extra && r.message?.type === t).length >=
+      (n as number),
     [type, count] as const,
     { timeout, polling: 100 },
   );
@@ -188,7 +189,10 @@ function networkLog(context: BrowserContext) {
 // ---------------------------------------------------------------- the main flow
 
 test.describe('the embeddable desk', () => {
-  test('a host on another site: handshake, open, state, export, ack, save and Done', async ({ page, context }) => {
+  test('a host on another site: handshake, open, state, export, ack, save and Done', async ({
+    page,
+    context,
+  }) => {
     test.setTimeout(480_000);
     const net = networkLog(context);
     const t0 = Date.now();
@@ -197,7 +201,12 @@ test.describe('the embeddable desk', () => {
     const readyMs = Date.now() - t0;
     expect(ready.protocol).toBe(1);
     expect(typeof ready.deskVersion).toBe('string');
-    expect(ready.capabilities.export).toMatchObject({ available: true, reason: null, container: 'mp4', videoCodec: 'avc1' });
+    expect(ready.capabilities.export).toMatchObject({
+      available: true,
+      reason: null,
+      container: 'mp4',
+      videoCodec: 'avc1',
+    });
     expect(ready.capabilities.offline).toBe(true);
     // the desk posted nothing on window but its hello, from its origin
     const posted = await page.evaluate(() => (window as any).host.windowMessages());
@@ -216,7 +225,11 @@ test.describe('the embeddable desk', () => {
     const openMs = Date.now() - tOpen;
     expect(opened).toEqual({ type: 'opened', sceneId: EXAMPLE.id, source: 'brief', changes: null });
     const [state] = await waitFor(page, 'state', 1);
-    expect(state).toMatchObject({ sceneId: EXAMPLE.id, shots: 2, state: { format: '3d-editor.desk-state', version: 1 } });
+    expect(state).toMatchObject({
+      sceneId: EXAMPLE.id,
+      shots: 2,
+      state: { format: '3d-editor.desk-state', version: 1 },
+    });
     expect(state.id).toBeUndefined();
     await expect(frame.getByTestId('desk-scene-name')).toHaveText(EXAMPLE.name);
     await expect(frame.getByTestId('desk-source')).toHaveAttribute('data-source', 'brief');
@@ -363,7 +376,12 @@ test.describe('the embeddable desk', () => {
     await openHost(b);
     await waitFor(b, 'ready');
     const tState = Date.now();
-    await send(b, { type: 'open', scene: EXAMPLE, state: { format: hostState.format, version: 1, data: { $bytes: hostState.$bytes } }, options: OPTIONS });
+    await send(b, {
+      type: 'open',
+      scene: EXAMPLE,
+      state: { format: hostState.format, version: 1, data: { $bytes: hostState.$bytes } },
+      options: OPTIONS,
+    });
     const [fromState] = await waitFor(b, 'opened', 1, 60_000);
     const fromStateMs = Date.now() - tState;
     expect(fromState).toEqual({ type: 'opened', sceneId: EXAMPLE.id, source: 'state', changes: null });
@@ -393,7 +411,12 @@ test.describe('the embeddable desk', () => {
     });
     await b.evaluate(() => (window as any).host.mount());
     await waitFor(b, 'ready', 2);
-    await send(b, { type: 'open', scene: changed, state: { format: hostState.format, version: 1, data: { $bytes: hostState.$bytes } }, options: OPTIONS });
+    await send(b, {
+      type: 'open',
+      scene: changed,
+      state: { format: hostState.format, version: 1, data: { $bytes: hostState.$bytes } },
+      options: OPTIONS,
+    });
     const opened = await waitFor(b, 'opened', 2, 60_000);
     expect(opened[1]).toEqual(fixture('opened-changed.json'));
     frame = await deskFrame(b);
@@ -411,7 +434,9 @@ test.describe('the embeddable desk', () => {
     expect(afterUpdate.at(-1).id).toBeUndefined();
     // one undo step takes it back
     await frame.evaluate(() => (window as any).__desk.run('ed.undo'));
-    expect(await frame.evaluate(() => (window as any).__desk.shots().map((x: any) => x.frames))).toEqual([72, 60]);
+    expect(await frame.evaluate(() => (window as any).__desk.shots().map((x: any) => x.frames))).toEqual([
+      72, 60,
+    ]);
     await expectValidMessages(b);
     console.log(`[desk-embed] opened from the host's state in a browser without a copy in ${fromStateMs} ms`);
     await second.close();
@@ -436,7 +461,9 @@ test.describe('the embeddable desk', () => {
     // a connect from another frame of the page (not the desk's parent), a second connect from the
     // parent, an unknown type and a save without its id: nothing answers
     await page.evaluate(() => (window as any).host.connectFromSibling());
-    await page.evaluate(() => (window as any).host.postToDesk({ protocol: '3d-desk', type: 'connect', version: 1 }, true));
+    await page.evaluate(() =>
+      (window as any).host.postToDesk({ protocol: '3d-desk', type: 'connect', version: 1 }, true),
+    );
     await page.evaluate(() => (window as any).host.postToDesk({ protocol: 'other', type: 'hello' }));
     await send(page, { type: 'frobnicate', id: 'x-1' });
     await send(page, { type: 'save' });
@@ -483,13 +510,24 @@ test.describe('the embeddable desk', () => {
     test.setTimeout(240_000);
     await openHost(page);
     await waitFor(page, 'ready');
-    await send(page, { type: 'open', scene: smallBrief(), state: null, options: { hostName: 'rideo', modes: ['camera'] } });
+    await send(page, {
+      type: 'open',
+      scene: smallBrief(),
+      state: null,
+      options: { hostName: 'rideo', modes: ['camera'] },
+    });
     await waitFor(page, 'opened', 1, 120_000);
     const states = (await waitFor(page, 'state')).length;
     const frame = await deskFrame(page);
-    const shotB = await frame.evaluate((id) => (window as any).__desk.shots().find((x: any) => x.host === id).id, SHOT_B);
+    const shotB = await frame.evaluate(
+      (id) => (window as any).__desk.shots().find((x: any) => x.host === id).id,
+      SHOT_B,
+    );
     const tEdit = Date.now();
-    const r = await frame.evaluate((id) => (window as any).__desk.run('desk.shot_update', { shot: id, duration_s: 1 }), shotB);
+    const r = await frame.evaluate(
+      (id) => (window as any).__desk.run('desk.shot_update', { shot: id, duration_s: 1 }),
+      shotB,
+    );
     expect(r.ok, r.error).toBe(true);
     // the edit goes to the host as a state about 2 s later
     const after = await waitFor(page, 'state', states + 1, 15_000);
@@ -507,7 +545,9 @@ test.describe('the embeddable desk', () => {
       [SHOT_B, 24],
     ]);
     expect(result.shots[0].issues.filter((i: any) => i.code === 'brief_length')).toEqual([]);
-    expect(result.shots[1].issues.find((i: any) => i.code === 'brief_length')).toMatchObject({ severity: 'error' });
+    expect(result.shots[1].issues.find((i: any) => i.code === 'brief_length')).toMatchObject({
+      severity: 'error',
+    });
     expect(result.files.map((f: any) => f.name).sort()).toEqual(
       [`${SHOT_A}.camera.mp4`, `${SHOT_A}.still.png`, `${SHOT_B}.camera.mp4`, `${SHOT_B}.still.png`].sort(),
     );
@@ -524,11 +564,19 @@ test.describe('the embeddable desk', () => {
     const frame = await deskFrame(page);
     await expect(frame.getByTestId('desk-read-only')).toBeVisible();
     await expect(frame.getByTestId('desk-send')).toContainText('Send to the host');
-    const shotB = await frame.evaluate((id) => (window as any).__desk.shots().find((x: any) => x.host === id).id, SHOT_B);
-    const r = await frame.evaluate((id) => (window as any).__desk.run('desk.shot_update', { shot: id, duration_s: 1 }), shotB);
+    const shotB = await frame.evaluate(
+      (id) => (window as any).__desk.shots().find((x: any) => x.host === id).id,
+      SHOT_B,
+    );
+    const r = await frame.evaluate(
+      (id) => (window as any).__desk.run('desk.shot_update', { shot: id, duration_s: 1 }),
+      shotB,
+    );
     expect(r.ok).toBe(false);
     expect(r.error).toContain('read-only');
-    expect(await frame.evaluate(() => (window as any).__desk.shots().map((x: any) => x.frames))).toEqual([12, 12]);
+    expect(await frame.evaluate(() => (window as any).__desk.shots().map((x: any) => x.frames))).toEqual([
+      12, 12,
+    ]);
     // the editor's keys for the chrome the desk hides do nothing
     await frame.getByTestId('viewport').hover();
     for (const key of ['F3', 'Control+o', 'Control+n', 'Control+,', 'F1']) await page.keyboard.press(key);
@@ -542,7 +590,10 @@ test.describe('the embeddable desk', () => {
     await expectValidMessages(page);
   });
 
-  test('offline: the desk loads from its cache, stages and exports with no network', async ({ page, context }) => {
+  test('offline: the desk loads from its cache, stages and exports with no network', async ({
+    page,
+    context,
+  }) => {
     test.setTimeout(240_000);
     await openHost(page);
     await waitFor(page, 'ready');
@@ -579,7 +630,14 @@ test.describe('the embeddable desk', () => {
     await send(page, { type: 'open', scene: smallBrief(), state: null, options: OPTIONS });
     await waitFor(page, 'opened', 1, 120_000);
     const frame = await deskFrame(page);
-    for (const id of ['desk-scene-name', 'desk-send', 'desk-done', 'desk-close', 'viewport', 'bottom-tab-shots'])
+    for (const id of [
+      'desk-scene-name',
+      'desk-send',
+      'desk-done',
+      'desk-close',
+      'viewport',
+      'bottom-tab-shots',
+    ])
       await expect(frame.getByTestId(id)).toBeVisible();
     await expect(frame.getByTestId('director-panel')).toBeHidden();
     for (const id of ['desk-send', 'desk-done', 'desk-close']) {

@@ -64,7 +64,7 @@ export class StagingClient {
 
   private ensure(): WorkerLike | null {
     if (this.worker) return this.worker;
-    let w: WorkerLike | null = null;
+    let w: WorkerLike | null;
     try {
       w = this.factory();
     } catch {

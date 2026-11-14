@@ -14,7 +14,12 @@ import {
   type ExportEngine,
 } from '../src/embed/export';
 import { BrowserExportError } from '../src/export';
-import type { BrowserExportFile, BrowserExportProgress, BrowserExportRequest, BrowserExportResult } from '../src/export/types';
+import type {
+  BrowserExportFile,
+  BrowserExportProgress,
+  BrowserExportRequest,
+  BrowserExportResult,
+} from '../src/export/types';
 import { deskMessageProblems, type Mode } from '../src/embed/protocol';
 
 /*
@@ -96,7 +101,8 @@ function fakeEngine(of: Record<string, Behaviour> = {}) {
       const files = p.passes.map((pass) =>
         file({ name: `shot.${pass}.mp4`, pass, shot, frames: how === 'short' ? frames - 1 : frames }),
       );
-      if (req.stills && how !== 'nostill') files.push(file({ name: 'shot.still.png', kind: 'still', shot, mime: 'image/png' }));
+      if (req.stills && how !== 'nostill')
+        files.push(file({ name: 'shot.still.png', kind: 'still', shot, mime: 'image/png' }));
       files.push(file({ name: 'manifest.json', kind: 'manifest', mime: 'application/json' }));
       return { id: `exp-${shot}`, files, manifest: {}, shots: [], warnings: [] } as BrowserExportResult;
     },
@@ -122,7 +128,13 @@ describe('the desk export', () => {
   it('maps modes to passes and asks the engine for the reference preset of one shot', () => {
     expect(MODE_PASS).toEqual({ motion: 'beauty', pose: 'pose', camera: 'depth' });
     expect(passesFor(['camera', 'motion'])).toEqual(['beauty', 'depth']);
-    const params = shotExportParams({ deskShotId: 'd1', modes: ['camera', 'pose'], width: 320, height: 180, fps: 24 });
+    const params = shotExportParams({
+      deskShotId: 'd1',
+      modes: ['camera', 'pose'],
+      width: 320,
+      height: 180,
+      fps: 24,
+    });
     expect(params).toMatchObject({ preset: 'reference', shots: ['d1'], passes: ['pose', 'depth'] });
     // core's schema (the engine's) takes it
     expect(videoExportParamsSchema.safeParse(params).success).toBe(true);
@@ -151,7 +163,16 @@ describe('the desk export', () => {
     expect(out.shots[0].references).toEqual({ pose: `${SHOT_A}.pose.mp4`, camera: `${SHOT_A}.camera.mp4` });
     expect(out.shots[0].still).toBe(`${SHOT_A}.still.png`);
     // the result validates as the contract's
-    const message = { type: 'result' as const, id: 'e', sceneId: 'clp_1', fps: 24, width: 320, height: 180, shots: out.shots, files: out.files };
+    const message = {
+      type: 'result' as const,
+      id: 'e',
+      sceneId: 'clp_1',
+      fps: 24,
+      width: 320,
+      height: 180,
+      shots: out.shots,
+      files: out.files,
+    };
     expect(deskMessageProblems(message)).toBeNull();
     // progress: prepare, then the frames of all shots in the host's ids, the files, finish
     expect(progress[0]).toEqual({ phase: 'prepare', done: 0, total: 2 });
@@ -160,7 +181,11 @@ describe('the desk export', () => {
     expect(render.map((p) => p.done)).toEqual([...render.map((p) => p.done)].sort((a, b) => a - b));
     expect(render.at(-1)).toEqual({ phase: 'render', done: 36, total: 36, shotId: SHOT_B });
     expect(new Set(render.map((p) => p.shotId))).toEqual(new Set([SHOT_A, SHOT_B]));
-    expect(progress.filter((p) => p.phase === 'encode').at(-1)).toEqual({ phase: 'encode', done: 6, total: 6 });
+    expect(progress.filter((p) => p.phase === 'encode').at(-1)).toEqual({
+      phase: 'encode',
+      done: 6,
+      total: 6,
+    });
     expect(progress.at(-1)?.phase).toBe('finish');
     // the engine's files stay until the result is sent
     expect(released).toEqual([]);
@@ -185,7 +210,10 @@ describe('the desk export', () => {
     ] as const) {
       const { engine, released } = fakeEngine({ d1: how });
       const out = await runDeskExport(request(), {}, engine);
-      expect(out.shots.map((s) => s.shotId), how).toEqual([SHOT_B]);
+      expect(
+        out.shots.map((s) => s.shotId),
+        how,
+      ).toEqual([SHOT_B]);
       expect(out.failures).toEqual([{ shotId: SHOT_A, code, message: expect.stringContaining(SHOT_A) }]);
       expect(out.files.every((f) => f.name.startsWith(SHOT_B))).toBe(true);
       await out.release();
@@ -209,7 +237,9 @@ describe('the desk export', () => {
       expect((err as Error).message).toContain(SHOT_B);
     }
     const { engine } = fakeEngine();
-    await expect(runDeskExport(request({ shots: [] }), {}, engine)).rejects.toMatchObject({ code: 'export_failed' });
+    await expect(runDeskExport(request({ shots: [] }), {}, engine)).rejects.toMatchObject({
+      code: 'export_failed',
+    });
   });
 
   it('is cancelled by its signal, and releases what it made', async () => {
@@ -242,7 +272,13 @@ describe('the desk export', () => {
   it('reports a shot of the brief made longer in the desk with that issue', async () => {
     const { engine } = fakeEngine();
     const long = [meta(SHOT_A, 'd1', 12), meta(SHOT_B, 'd2', 24)];
-    const b = { ...brief, shots: [{ id: SHOT_A, durationSec: 0.5 }, { id: SHOT_B, durationSec: 0.5 }] } as unknown as SceneBrief;
+    const b = {
+      ...brief,
+      shots: [
+        { id: SHOT_A, durationSec: 0.5 },
+        { id: SHOT_B, durationSec: 0.5 },
+      ],
+    } as unknown as SceneBrief;
     const out = await runDeskExport(request({ brief: b, shots: long }), {}, engine);
     expect(out.shots[0].issues).toEqual([]);
     expect(out.shots[1].issues.map((i) => i.code)).toEqual(['brief_length']);
@@ -268,7 +304,15 @@ describe('the desk export', () => {
 describe('a failing progress listener', () => {
   it('does not fail the export', async () => {
     const { engine } = fakeEngine();
-    const out = await runDeskExport(request(), { onProgress: vi.fn(() => { throw new Error('listener'); }) }, engine);
+    const out = await runDeskExport(
+      request(),
+      {
+        onProgress: vi.fn(() => {
+          throw new Error('listener');
+        }),
+      },
+      engine,
+    );
     expect(out.shots).toHaveLength(2);
   });
 });

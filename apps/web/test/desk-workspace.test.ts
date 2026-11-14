@@ -80,7 +80,13 @@ describe('the desk workspace', () => {
     const host = origin();
     const ws = workspace();
     const r = await ws.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
-    expect(r).toMatchObject({ source: 'brief', changes: null, unreadable: null, plan: 'stage', persistent: true });
+    expect(r).toMatchObject({
+      source: 'brief',
+      changes: null,
+      unreadable: null,
+      plan: 'stage',
+      persistent: true,
+    });
     expect(r.stageMs).toBeGreaterThanOrEqual(0);
     expect(session.value).toBe(ws.session);
     expect(ws.projectId).toBe(deskProjectId(host, EXAMPLE().id));
@@ -163,7 +169,7 @@ describe('the desk workspace', () => {
     expect(hostShots(back)).toEqual([SHOT_A, SHOT_B]);
   });
 
-  it("does not apply a state it cannot read, says why, and opens as without one", async () => {
+  it('does not apply a state it cannot read, says why, and opens as without one', async () => {
     const other = { ...EXAMPLE(), id: 'clp_other0000000001' };
     const state = await stateOf(origin(), other);
     const ws = workspace();
@@ -192,7 +198,9 @@ describe('the desk workspace', () => {
     // the staging stays until the person updates
     expect(hostShots(ws)).toEqual([SHOT_A, SHOT_B]);
     expect(ws.stagedShots()).toEqual([SHOT_A, SHOT_B]);
-    expect(ws.lengthMismatches().map((m) => [m.shotId, m.deskFrames, m.briefFrames])).toEqual([[SHOT_B, 60, 84]]);
+    expect(ws.lengthMismatches().map((m) => [m.shotId, m.deskFrames, m.briefFrames])).toEqual([
+      [SHOT_B, 60, 84],
+    ]);
     const left = await ws.updateFromBrief();
     expect(left).toBeNull();
     expect(hostShots(ws)).toEqual([SHOT_A, SHOT_B, SHOT_C]);

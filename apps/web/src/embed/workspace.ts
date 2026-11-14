@@ -131,7 +131,10 @@ export class DeskWorkspace {
   }
 
   private async stage(s: ProjectSession, brief: SceneBrief): Promise<number> {
-    this.onWork({ label: `Staging ${brief.shots.length} shot${brief.shots.length === 1 ? '' : 's'}…`, startedAt: Date.now() });
+    this.onWork({
+      label: `Staging ${brief.shots.length} shot${brief.shots.length === 1 ? '' : 's'}…`,
+      startedAt: Date.now(),
+    });
     try {
       const r = await this.staging.stage(Y.encodeStateAsUpdate(s.doc.ydoc), brief, newLineage(), GENERATOR);
       Y.applyUpdate(s.doc.ydoc, r.diff, s.storageOrigin);
@@ -159,7 +162,8 @@ export class DeskWorkspace {
       try {
         decoded = await decodeDeskState(o.state, brief.id);
       } catch (err) {
-        unreadable = err instanceof StateUnreadable ? err.message : `the desk state does not read (${String(err)})`;
+        unreadable =
+          err instanceof StateUnreadable ? err.message : `the desk state does not read (${String(err)})`;
       }
     }
     this.onWork({ label: 'Opening the scene…', startedAt: Date.now() });
@@ -180,7 +184,7 @@ export class DeskWorkspace {
         Y.applyUpdate(s.doc.ydoc, decoded.update, s.storageOrigin);
         if (!this.stagedHere(s, brief.id)) {
           // a state that says it is this scene's but holds no staging of it: as unreadable
-          unreadable = "the desk state holds no staging of this scene";
+          unreadable = 'the desk state holds no staging of this scene';
           s = await this.resetSession(s, id, persist);
           plan = 'stage';
         }

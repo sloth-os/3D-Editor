@@ -95,7 +95,10 @@ export function gzipAvailable(): boolean {
   return typeof CompressionStream === 'function' && typeof DecompressionStream === 'function';
 }
 
-async function streamThrough(bytes: Uint8Array, stream: { readable: ReadableStream; writable: WritableStream }) {
+async function streamThrough(
+  bytes: Uint8Array,
+  stream: { readable: ReadableStream; writable: WritableStream },
+) {
   const writer = stream.writable.getWriter();
   // a failure (bytes that do not unpack) rejects the read below; the writer's side is let go
   writer
@@ -155,23 +158,36 @@ function isHeader(v: unknown): v is StateHeader {
 }
 
 /** The header of a state's data, without its payload; throws StateUnreadable. */
-export function readStateHeader(bytes: Uint8Array): { header: StateHeader; codec: Codec; payload: Uint8Array } {
+export function readStateHeader(bytes: Uint8Array): {
+  header: StateHeader;
+  codec: Codec;
+  payload: Uint8Array;
+} {
   if (bytes.length < PREFIX_BYTES || STATE_MAGIC.some((b, i) => bytes[i] !== b))
     throw new StateUnreadable('the desk state is not one this desk wrote');
   if (bytes[8] !== CONTAINER_VERSION)
-    throw new StateUnreadable(`the desk state's container is version ${bytes[8]}, this desk reads ${CONTAINER_VERSION}`);
-  if (bytes[9] !== 0 && bytes[9] !== 1) throw new StateUnreadable('the desk state is compressed in an unknown way');
+    throw new StateUnreadable(
+      `the desk state's container is version ${bytes[8]}, this desk reads ${CONTAINER_VERSION}`,
+    );
+  if (bytes[9] !== 0 && bytes[9] !== 1)
+    throw new StateUnreadable('the desk state is compressed in an unknown way');
   const headerLength = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(12, true);
   if (headerLength > MAX_HEADER_BYTES || PREFIX_BYTES + headerLength > bytes.length)
     throw new StateUnreadable('the desk state is cut short');
   let header: unknown;
   try {
-    header = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(16, 16 + headerLength)));
+    header = JSON.parse(
+      new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(16, 16 + headerLength)),
+    );
   } catch {
     throw new StateUnreadable("the desk state's header does not read");
   }
   if (!isHeader(header)) throw new StateUnreadable("the desk state's header lacks its scene or lineage");
-  return { header, codec: bytes[9] === 1 ? 'gzip' : null, payload: bytes.subarray(PREFIX_BYTES + headerLength) };
+  return {
+    header,
+    codec: bytes[9] === 1 ? 'gzip' : null,
+    payload: bytes.subarray(PREFIX_BYTES + headerLength),
+  };
 }
 
 /**
@@ -186,7 +202,9 @@ export async function decodeDeskState(
   if (state.format !== DESK_STATE_FORMAT)
     throw new StateUnreadable(`the desk state's format is '${state.format}', not '${DESK_STATE_FORMAT}'`);
   if (state.version !== DESK_STATE_VERSION)
-    throw new StateUnreadable(`the desk state is version ${state.version}; this desk reads ${DESK_STATE_VERSION}`);
+    throw new StateUnreadable(
+      `the desk state is version ${state.version}; this desk reads ${DESK_STATE_VERSION}`,
+    );
   const bytes = stateBytes(state);
   if (bytes.length > MAX_STATE_BYTES) throw new StateUnreadable('the desk state is over 64 MiB');
   const { header, codec, payload } = readStateHeader(bytes);
@@ -194,7 +212,8 @@ export async function decodeDeskState(
     throw new StateUnreadable(`the desk state belongs to scene '${header.sceneId}', not '${sceneId}'`);
   let update: Uint8Array;
   if (codec === 'gzip') {
-    if (!gzipAvailable()) throw new StateUnreadable('this browser cannot unpack the desk state (no gzip streams)');
+    if (!gzipAvailable())
+      throw new StateUnreadable('this browser cannot unpack the desk state (no gzip streams)');
     try {
       update = await gunzip(payload, header.updateBytes);
     } catch (err) {
@@ -234,6 +253,7 @@ export function restorePlan(
   state: { lineage: string } | null,
   local: { staged: boolean; lineage: string | null },
 ): RestorePlan {
-  if (state) return local.staged && local.lineage !== null && local.lineage === state.lineage ? 'merge' : 'replace';
+  if (state)
+    return local.staged && local.lineage !== null && local.lineage === state.lineage ? 'merge' : 'replace';
   return local.staged ? 'local' : 'stage';
 }

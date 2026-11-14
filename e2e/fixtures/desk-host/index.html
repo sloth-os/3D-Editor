@@ -86,7 +86,8 @@
         if (s.version !== 1) {
           // first a version the desk does not speak, then 1
           const bad = connect(s.frame, s.version, false);
-          bad.onmessage = (ev) => s.messages.push({ at: performance.now(), message: plain(ev.data), bad: true });
+          bad.onmessage = (ev) =>
+            s.messages.push({ at: performance.now(), message: plain(ev.data), bad: true });
           s.version = 1;
         }
         connect(s.frame, 1);
@@ -170,7 +171,8 @@
         },
         messages: () => s.messages,
         windowMessages: () => s.windowMessages,
-        state: () => (s.state ? { format: s.state.format, version: s.state.version, $bytes: b64(s.state.data) } : null),
+        state: () =>
+          s.state ? { format: s.state.format, version: s.state.version, $bytes: b64(s.state.data) } : null,
         fileNames: () => [...s.files.keys()],
         file: (name) => (s.files.has(name) ? b64(s.files.get(name)) : null),
         fileSizes: () => Object.fromEntries([...s.files].map(([n, d]) => [n, d.byteLength])),

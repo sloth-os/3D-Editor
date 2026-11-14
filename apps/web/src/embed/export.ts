@@ -259,8 +259,18 @@ export async function runDeskExport(
             onProgress: (p) => {
               if (p.phase !== 'render' && !rendering) return;
               rendering = true;
-              const inShot = p.phase === 'render' ? Math.min(p.done, meta.frames) : p.phase === 'prepare' ? 0 : meta.frames;
-              progress({ phase: 'render', done: framesBefore + inShot, total: totalFrames, shotId: meta.shotId });
+              const inShot =
+                p.phase === 'render'
+                  ? Math.min(p.done, meta.frames)
+                  : p.phase === 'prepare'
+                    ? 0
+                    : meta.frames;
+              progress({
+                phase: 'render',
+                done: framesBefore + inShot,
+                total: totalFrames,
+                shotId: meta.shotId,
+              });
             },
           },
         );

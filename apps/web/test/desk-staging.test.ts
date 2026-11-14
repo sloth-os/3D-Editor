@@ -24,7 +24,17 @@ const SHOT_B = 'sht_0123456789bbbb';
 function changedBrief(): SceneBrief {
   const b = EXAMPLE();
   b.shots[1].durationSec = 3.5;
-  b.shots.push({ ...b.shots[1], id: 'sht_0123456789cccc', index: 2, durationSec: 2, castIds: ['chr_0123456789pipd'], elementIds: [], layout: [], move: null, framing: 'medium' });
+  b.shots.push({
+    ...b.shots[1],
+    id: 'sht_0123456789cccc',
+    index: 2,
+    durationSec: 2,
+    castIds: ['chr_0123456789pipd'],
+    elementIds: [],
+    layout: [],
+    move: null,
+    framing: 'medium',
+  });
   return b;
 }
 
@@ -69,7 +79,11 @@ describe('the staging engine', () => {
     expect(u.summary.shots).toBe(3);
     expect(getShots(doc).map((s) => s.frame_end - s.frame_start + 1)).toEqual([72, 84, 48]);
     // in the order asked (the controller asks in brief order)
-    const res = runStaging({ kind: 'results', update: Y.encodeStateAsUpdate(doc.ydoc), shots: [SHOT_B, SHOT_A] });
+    const res = runStaging({
+      kind: 'results',
+      update: Y.encodeStateAsUpdate(doc.ydoc),
+      shots: [SHOT_B, SHOT_A],
+    });
     if (!res.ok || res.kind !== 'results') throw new Error(JSON.stringify(res));
     expect(res.results.map((x) => [x.shotId, x.frames])).toEqual([
       [SHOT_B, 84],
@@ -91,7 +105,11 @@ describe('the staging engine', () => {
 
   it('words a check summary as desk.check does', () => {
     expect(checkSummary(2, [])).toMatch(/^2 shots/);
-    const s = checkSummary(1, [{ severity: 'error' } as never, { severity: 'warning' } as never, { severity: 'warning' } as never]);
+    const s = checkSummary(1, [
+      { severity: 'error' } as never,
+      { severity: 'warning' } as never,
+      { severity: 'warning' } as never,
+    ]);
     expect(s).toMatch(/1 error/);
     expect(s).toMatch(/2 warnings/);
   });
@@ -116,7 +134,10 @@ describe('the staging client', () => {
         terminate: vi.fn(),
         postMessage(m: { id: number; request: never }) {
           w.posted++;
-          setTimeout(() => w.onmessage?.({ data: { id: m.id, reply: runStaging(m.request) } } as MessageEvent), 0);
+          setTimeout(
+            () => w.onmessage?.({ data: { id: m.id, reply: runStaging(m.request) } } as MessageEvent),
+            0,
+          );
         },
         die() {
           w.onerror?.({ message: 'boom', preventDefault() {} } as ErrorEvent);

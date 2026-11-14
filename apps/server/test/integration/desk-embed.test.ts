@@ -74,11 +74,18 @@ describe('the desk page', () => {
   });
 
   it('follows DESK_EMBED_COEP and DESK_EMBED_ORIGINS', async () => {
-    const s = await serve({ DESK_EMBED_COEP: 'credentialless', DESK_EMBED_ORIGINS: 'https://rideo.example, https://*.example.org' });
+    const s = await serve({
+      DESK_EMBED_COEP: 'credentialless',
+      DESK_EMBED_ORIGINS: 'https://rideo.example, https://*.example.org',
+    });
     const res = await get(s, '/desk.html');
     expect(res.headers.get('cross-origin-embedder-policy')).toBe('credentialless');
-    expect(res.headers.get('content-security-policy')).toBe('frame-ancestors https://rideo.example https://*.example.org');
-    expect((await get(s, '/assets/desk-1a2b3c.js')).headers.get('cross-origin-embedder-policy')).toBe('credentialless');
+    expect(res.headers.get('content-security-policy')).toBe(
+      'frame-ancestors https://rideo.example https://*.example.org',
+    );
+    expect((await get(s, '/assets/desk-1a2b3c.js')).headers.get('cross-origin-embedder-policy')).toBe(
+      'credentialless',
+    );
     const off = await serve({ DESK_EMBED_COEP: 'off' });
     const page = await get(off, '/desk.html');
     expect(page.headers.get('cross-origin-embedder-policy')).toBeNull();

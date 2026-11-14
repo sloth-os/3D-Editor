@@ -73,8 +73,7 @@ export async function registerStatic(
     if (!isPage || isReservedPath(pathname) || pathname.startsWith('/assets/'))
       return notFound(reply, request.url);
     // the desk's clean URL (/desk): the desk page, never the editor's index.html
-    if (isDeskPagePath(pathname))
-      return hasDesk ? reply.sendFile('desk.html') : notFound(reply, request.url);
+    if (isDeskPagePath(pathname)) return hasDesk ? reply.sendFile('desk.html') : notFound(reply, request.url);
     return reply.header('cache-control', 'no-cache').sendFile('index.html');
   });
   return true;

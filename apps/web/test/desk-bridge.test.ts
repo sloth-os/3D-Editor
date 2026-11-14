@@ -31,9 +31,12 @@ class FakePort implements PortLike {
 }
 
 function setup(opts: { framed?: boolean } = {}) {
-  const parent = { posted: [] as { message: any; origin: string }[], postMessage(m: unknown, o: string) {
-    this.posted.push({ message: m, origin: o });
-  } };
+  const parent = {
+    posted: [] as { message: any; origin: string }[],
+    postMessage(m: unknown, o: string) {
+      this.posted.push({ message: m, origin: o });
+    },
+  };
   const listeners = new Set<(e: MessageEvent) => void>();
   const win: any = {
     addEventListener: (_t: string, l: (e: MessageEvent) => void) => listeners.add(l),
@@ -43,13 +46,15 @@ function setup(opts: { framed?: boolean } = {}) {
   const dispatch = (e: Partial<MessageEvent> & { data: unknown }) => {
     for (const l of [...listeners]) l(e as MessageEvent);
   };
-  const handler: BridgeHandler & { connected: ReturnType<typeof vi.fn>; message: ReturnType<typeof vi.fn> } = {
-    connected: vi.fn(),
-    message: vi.fn(),
+  const handler = {
+    connected: vi.fn<BridgeHandler['connected']>(),
+    message: vi.fn<BridgeHandler['message']>(),
   };
   const log = { info: vi.fn(), warn: vi.fn() };
   const bridge = new DeskBridge(win, handler, log);
-  const connect = (o: { version?: number; source?: unknown; origin?: string; port?: FakePort | null; data?: unknown } = {}) => {
+  const connect = (
+    o: { version?: number; source?: unknown; origin?: string; port?: FakePort | null; data?: unknown } = {},
+  ) => {
     const port = o.port === undefined ? new FakePort() : o.port;
     dispatch({
       data: o.data ?? { protocol: '3d-desk', type: 'connect', version: o.version ?? 1 },
@@ -67,7 +72,9 @@ describe('the desk bridge', () => {
     const t = setup();
     expect(t.bridge.framed).toBe(true);
     expect(t.bridge.start()).toBe(true);
-    expect(t.parent.posted).toEqual([{ message: { protocol: '3d-desk', type: 'hello', versions: [1] }, origin: '*' }]);
+    expect(t.parent.posted).toEqual([
+      { message: { protocol: '3d-desk', type: 'hello', versions: [1] }, origin: '*' },
+    ]);
     expect(t.bridge.start()).toBe(false);
     expect(t.parent.posted).toHaveLength(1);
 
@@ -101,7 +108,11 @@ describe('the desk bridge', () => {
     t.connect({ port: null });
     t.connect({ origin: 'null' });
     t.connect({ origin: 'file://' });
-    t.dispatch({ data: 'connect', source: t.parent as unknown as MessageEventSource, origin: 'https://h.example' });
+    t.dispatch({
+      data: 'connect',
+      source: t.parent as unknown as MessageEventSource,
+      origin: 'https://h.example',
+    });
     expect(t.handler.connected).not.toHaveBeenCalled();
     // then a valid one works
     t.connect();
@@ -144,7 +155,12 @@ describe('the desk bridge', () => {
     t.bridge.start();
     const port = t.connect()!;
     const data = new ArrayBuffer(4);
-    const state = { type: 'state', sceneId: 's', shots: 1, state: { format: '3d-editor.desk-state', version: 1, data } } as const;
+    const state = {
+      type: 'state',
+      sceneId: 's',
+      shots: 1,
+      state: { format: '3d-editor.desk-state', version: 1, data },
+    } as const;
     expect(t.bridge.send(state, [data])).toBe(true);
     expect(port.posted[0]).toEqual({ message: state, transfer: [data] });
     expect(t.log.warn).not.toHaveBeenCalled();
@@ -167,6 +183,7 @@ describe('the desk bridge', () => {
   it('takes http(s) origins as host origins', () => {
     expect(isHostOrigin('https://rideo.example')).toBe(true);
     expect(isHostOrigin('http://localhost:5173')).toBe(true);
-    for (const o of ['null', '', 'file://', 'https://a.example/', 'chrome-extension://abc', 42]) expect(isHostOrigin(o)).toBe(false);
+    for (const o of ['null', '', 'file://', 'https://a.example/', 'chrome-extension://abc', 42])
+      expect(isHostOrigin(o)).toBe(false);
   });
 });

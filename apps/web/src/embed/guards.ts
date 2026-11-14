@@ -1,12 +1,12 @@
 import type { OperatorContext, OperatorRegistry } from '@3d-editor/core';
 
 /*
- * What the embedded desk does not run (docs/embedding.md, "Read-only and focus"): the operators of
- * the editor chrome it hides (new and open project, preferences, search, share, workspaces, the
- * render and export windows, import), and, in a read-only open, every operator that changes the
- * scene. The registry's poll refuses them, so menus grey them out and every way of running them
- * (keys, buttons, menus, the viewport's tools) fails with the reason: the operators themselves are
- * off, not only their buttons.
+ * What the embedded desk does not run (docs/embedding.md, "Starting" and "Read-only"): the
+ * operators of the editor chrome it hides (new and open project, preferences, search, share,
+ * workspaces, the render and export windows, import), and, in a read-only open, every operator
+ * that changes the scene. The registry's poll refuses them, so menus grey them out and every way
+ * of running them (keys, buttons, menus, the viewport's tools) fails with the reason: the
+ * operators themselves are off, not only their buttons.
  */
 
 /** Operators of chrome the desk hides: never run in the desk. */

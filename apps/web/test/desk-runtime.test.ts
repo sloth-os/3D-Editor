@@ -62,7 +62,11 @@ describe('the desk guards', () => {
     readOnly = true;
     expect(reg.poll(ctx, 'object.translate')).toMatch(/read-only/);
     const doc = { transact: (fn: () => void) => fn() };
-    const r = reg.run({ doc, report: () => {}, state: { mode: 'OBJECT' }, source: 'ui' } as never, 'object.translate', {});
+    const r = reg.run(
+      { doc, report: () => {}, state: { mode: 'OBJECT' }, source: 'ui' } as never,
+      'object.translate',
+      {},
+    );
     expect(r).toMatchObject({ ok: false, code: 'POLL_FAILED' });
     expect(r.error).toMatch(/read-only/);
     undo();
@@ -81,7 +85,8 @@ describe('the keymap of the desk', () => {
   it('leaves the ignored keys alone', async () => {
     const { installKeymap } = await import('../src/editor/keymap');
     const { toasts } = await import('../src/app/store');
-    const press = (init: KeyboardEventInit) => window.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, ...init }));
+    const press = (init: KeyboardEventInit) =>
+      window.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, ...init }));
     // without a project, a key that runs an operator says so in a toast
     const plain = installKeymap();
     const before = toasts.value.length;
@@ -106,7 +111,10 @@ describe('the desk runtime', () => {
   });
 
   it("neither reads nor writes the editor's preferences", async () => {
-    localStorage.setItem('3d-editor:prefs:v1', JSON.stringify({ telemetry: true, sync: { enabled: true, serverUrl: 'https://x' } }));
+    localStorage.setItem(
+      '3d-editor:prefs:v1',
+      JSON.stringify({ telemetry: true, sync: { enabled: true, serverUrl: 'https://x' } }),
+    );
     document.documentElement.dataset.runtime = 'desk';
     vi.resetModules();
     const { prefs, updatePrefs } = await import('../src/app/prefs');

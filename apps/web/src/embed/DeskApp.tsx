@@ -14,7 +14,7 @@ import type { LengthMismatch, WorkProgress } from './workspace';
 import './desk.css';
 
 /*
- * The desk's page (docs/embedding.md, "The desk"): the Director workspace of the editor, focused —
+ * The desk's page (docs/embedding.md, "Starting"): the Director workspace of the editor, focused —
  * the viewport through the shot cameras, the shot list and inspector with each shot's issues, the
  * sequence strip, the timeline and playback, the staging tools and the Asset Browser — under a
  * compact header: the scene's name, where it came from and whether the host has its latest state,
@@ -125,7 +125,8 @@ function ChangesBanner({ c }: { c: DeskController }) {
     <div class="desk-banner" data-testid="desk-changes" role="status">
       <Icon name="info" size={13} />
       <span>
-        The brief changed since this scene was staged: <b data-testid="desk-changes-text">{changesText(changes)}</b>.
+        The brief changed since this scene was staged:{' '}
+        <b data-testid="desk-changes-text">{changesText(changes)}</b>.
         {readOnly ? ' The scene is read-only here.' : ' Your staging stays until you update.'}
       </span>
       <span class="desk-banner-actions">
@@ -140,7 +141,11 @@ function ChangesBanner({ c }: { c: DeskController }) {
             Update shots
           </button>
         )}
-        <button class="btn flat" onClick={() => setHidden(changes)} title="Hide this until the brief changes again">
+        <button
+          class="btn flat"
+          onClick={() => setHidden(changes)}
+          title="Hide this until the brief changes again"
+        >
           Not now
         </button>
       </span>
@@ -179,7 +184,10 @@ function NoticeLine({ c }: { c: DeskController }) {
   const n = c.notice.value;
   if (!n) return null;
   return (
-    <div class={`desk-banner ${n.level === 'error' ? 'err' : n.level === 'warning' ? 'warn' : ''}`} data-testid="desk-notice">
+    <div
+      class={`desk-banner ${n.level === 'error' ? 'err' : n.level === 'warning' ? 'warn' : ''}`}
+      data-testid="desk-notice"
+    >
       <Icon name={n.level === 'info' ? 'info' : 'warning'} size={13} />
       <span>{n.message}</span>
       <span class="desk-banner-actions">
@@ -192,7 +200,12 @@ function NoticeLine({ c }: { c: DeskController }) {
 }
 
 /** Asks before a Send whose clips the host refuses (shots retimed in the desk); never confirm(). */
-function SendCheck(p: { mismatches: LengthMismatch[]; host: string; onSend: () => void; onCancel: () => void }) {
+function SendCheck(p: {
+  mismatches: LengthMismatch[];
+  host: string;
+  onSend: () => void;
+  onCancel: () => void;
+}) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -208,8 +221,8 @@ function SendCheck(p: { mismatches: LengthMismatch[]; host: string; onSend: () =
       <div class="desk-modal" role="dialog" aria-modal="true" aria-label="Shots of another length">
         <h3>{plural(p.mismatches.length, 'shot')} differ from the brief</h3>
         <p>
-          {p.host} takes a clip only when it has the shot's length in the brief. These shots were made longer or
-          shorter here, so {p.host} will refuse their clips:
+          {p.host} takes a clip only when it has the shot's length in the brief. These shots were made longer
+          or shorter here, so {p.host} will refuse their clips:
         </p>
         <ul>
           {p.mismatches.map((m) => (
@@ -232,11 +245,7 @@ function SendCheck(p: { mismatches: LengthMismatch[]; host: string; onSend: () =
   );
 }
 
-function DeskHeader(p: {
-  c: DeskController;
-  lengthMismatches: () => LengthMismatch[];
-  closedNote?: string;
-}) {
+function DeskHeader(p: { c: DeskController; lengthMismatches: () => LengthMismatch[]; closedNote?: string }) {
   const { c } = p;
   const brief = c.brief.value;
   const options = c.options.value;
@@ -342,7 +351,10 @@ function DeskEditor({ s }: { s: ProjectSession }) {
         <Viewport session={s} />
         <BottomPane s={s} initial="sequence" size={bottomH} setSize={setBottomH} tabs={DESK_BOTTOM_TABS} />
       </div>
-      <Splitter dir="v" onDrag={(d) => setRightW(Math.max(240, Math.min(window.innerWidth - 300, rightW - d)))} />
+      <Splitter
+        dir="v"
+        onDrag={(d) => setRightW(Math.max(240, Math.min(window.innerWidth - 300, rightW - d)))}
+      />
       <div class="column hide-mobile desk-side" style={{ width: `${rightW}px`, flex: 'none' }}>
         <DirectorPanel s={s} />
       </div>
@@ -361,7 +373,9 @@ function WorkOverlay({ work }: { work: WorkProgress | null }) {
         <div class="desk-bar indeterminate">
           <div />
         </div>
-        <div class="desk-work-time">{secs} s · the page stays responsive: the work runs in the background</div>
+        <div class="desk-work-time">
+          {secs} s · the page stays responsive: the work runs in the background
+        </div>
       </div>
     </div>
   );
@@ -423,9 +437,10 @@ export function StandalonePage({ onTry }: { onTry: () => void }) {
           <img src="/icons/icon.svg" width={28} height={28} alt="" /> 3D director&rsquo;s desk
         </h1>
         <p class="tagline">
-          This page is the 3D-Editor&rsquo;s director&rsquo;s desk for other applications. A host application, such as
-          rideo, opens it in a frame and sends it a scene in words; the desk stages it in 3D, renders each shot&rsquo;s
-          reference clips in this browser and sends them back. Opened on its own it has no scene to show.
+          This page is the 3D-Editor&rsquo;s director&rsquo;s desk for other applications. A host application,
+          such as rideo, opens it in a frame and sends it a scene in words; the desk stages it in 3D, renders
+          each shot&rsquo;s reference clips in this browser and sends them back. Opened on its own it has no
+          scene to show.
         </p>
         <div class="actions">
           <button class="btn primary" data-testid="desk-try-sample" onClick={onTry}>
@@ -436,8 +451,8 @@ export function StandalonePage({ onTry }: { onTry: () => void }) {
           </a>
         </div>
         <p class="tagline">
-          The sample stages the protocol&rsquo;s example brief (a girl and her puppy with a kite in a meadow) in this
-          browser, with no host and no server: it works offline once the page has loaded.
+          The sample stages the protocol&rsquo;s example brief (a girl and her puppy with a kite in a meadow)
+          in this browser, with no host and no server: it works offline once the page has loaded.
         </p>
       </div>
     </div>

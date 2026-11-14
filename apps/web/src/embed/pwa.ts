@@ -8,7 +8,8 @@
 
 /** Registers the service worker; resolves with whether this page is (or will be) served offline. */
 export async function registerDeskServiceWorker(): Promise<boolean> {
-  if (import.meta.env.DEV || typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return false;
+  if (import.meta.env.DEV || typeof navigator === 'undefined' || !('serviceWorker' in navigator))
+    return false;
   try {
     await navigator.serviceWorker.register('/sw.js', { scope: '/', type: 'classic' });
     return true;
