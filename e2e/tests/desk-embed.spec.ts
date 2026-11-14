@@ -665,8 +665,9 @@ test.describe('the embeddable desk', () => {
     expect(await frame.evaluate(() => (window as any).__desk.shots().map((x: any) => x.frames))).toEqual([
       12, 12,
     ]);
-    // the editor's keys for the chrome the desk hides do nothing
-    await frame.getByTestId('viewport').hover();
+    // the editor's keys for the chrome the desk hides do nothing (a click gives the frame the
+    // keyboard: keys go to the focused frame)
+    await frame.getByTestId('viewport').click();
     for (const key of ['F3', 'Control+o', 'Control+n', 'Control+,', 'F1']) await page.keyboard.press(key);
     await expect(frame.locator('.palette')).toHaveCount(0);
     await expect(frame.locator('.dialog')).toHaveCount(0);
