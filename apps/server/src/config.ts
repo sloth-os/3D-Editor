@@ -101,10 +101,6 @@ export interface ServerConfig {
   modelCacheMaxBytes: number;
   /** Timeout of each request to a store provider (`STORE_FETCH_TIMEOUT_MS`, default 20000 ms). */
   storeFetchTimeoutMs: number;
-  /** Base URL of the rideo server (`RIDEO_URL`, no trailing slash; null = the rideo bridge is off). */
-  rideoUrl: string | null;
-  /** Bearer token for the rideo server (`RIDEO_TOKEN`). */
-  rideoToken: string | null;
 }
 
 /** The model store providers the server knows (STORE_PROVIDERS picks and orders them). */
@@ -195,8 +191,6 @@ const envSchema = z.object({
   MODEL_CACHE_DIR: z.string().optional(),
   MODEL_CACHE_MAX_MB: z.coerce.number().min(0).max(1_048_576).default(2048),
   STORE_FETCH_TIMEOUT_MS: z.coerce.number().int().min(100).max(600_000).default(20_000),
-  RIDEO_URL: httpUrl.optional(),
-  RIDEO_TOKEN: z.string().optional(),
 });
 
 /**
@@ -386,7 +380,5 @@ export function loadConfig(
       : path.join(dataDir, 'model-cache'),
     modelCacheMaxBytes: Math.round(e.MODEL_CACHE_MAX_MB * 1024 * 1024),
     storeFetchTimeoutMs: e.STORE_FETCH_TIMEOUT_MS,
-    rideoUrl: e.RIDEO_URL ? e.RIDEO_URL.replace(/\/+$/, '') : null,
-    rideoToken: e.RIDEO_TOKEN ?? null,
   };
 }

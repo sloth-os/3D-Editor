@@ -13,9 +13,11 @@
   },
   "dependencies": {
     "@3d-editor/core": "0.1.0",
+    "@noble/hashes": "2.4.0",
     "@preact/signals": "2.11.4",
     "idb": "8.0.4",
     "lib0": "0.2.119",
+    "mediabunny": "1.61.0",
     "preact": "10.29.8",
     "three": "0.187.0",
     "web-vitals": "6.2.3",

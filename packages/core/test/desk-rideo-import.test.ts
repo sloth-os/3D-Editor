@@ -301,9 +301,7 @@ describe('rideo import: a dialogue in shot / reverse shot', () => {
 
   it('reports the boards rideo drew before this staging', () => {
     expect(r.boards).toEqual([{ shot: 'Shot 1', rideo_shot: DIALOGUE_SHOTS[0], state: 'approved' }]);
-    expect(r.warnings.join('\n')).toMatch(
-      /1 shot board\(s\) were drawn in rideo before this staging \(Shot 1\)/,
-    );
+    expect(r.warnings.join('\n')).toMatch(/1 shot board\(s\) were drawn before this staging \(Shot 1\)/);
     expect(r.issues).toEqual([]);
   });
 });
@@ -531,7 +529,7 @@ describe('rideo import: states, re-import and the operator', () => {
     const r = importClip(doc, clip);
     expect(r.shots[0]).toMatchObject({ camera_from: 'refit', agrees: true });
     expect(r.warnings).toContain(
-      "Shot 1: rideo's camera disagreed with the shot's planned layout; refitted (back)",
+      "Shot 1: the blocked camera disagreed with the shot's planned layout; refitted (back)",
     );
     // seen from behind them: Maya (rideo x −0.9) is now on the right of the frame
     const v = view(doc, r.shots[0].camera, 1);
@@ -646,7 +644,7 @@ describe('rideo import: states, re-import and the operator', () => {
     const doc = SceneDoc.create({ empty: true });
     expect(() => importClip(doc, { ...dialogueClip(), shots: [] })).toThrow(/the clip has no shots/);
     expect(() => importClip(doc, { ...dialogueClip(), blocking: { actors: [{ id: 'a1' }] } })).toThrow(
-      /not a rideo SceneBlocking v1/,
+      /not a SceneBlocking v1/,
     );
     expect(doc.listObjects()).toHaveLength(0);
   });

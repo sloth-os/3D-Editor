@@ -15,5 +15,6 @@ export * from './plan';
 export * from './checks';
 export * from './set';
 export * from './rideo';
+export * from './brief';
 export * from './characters';
 export * from './physics';

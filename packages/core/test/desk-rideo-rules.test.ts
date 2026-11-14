@@ -95,27 +95,31 @@ describe('rideo SceneBlocking v1 schema', () => {
   it('refuses what rideo refuses', () => {
     const base = dialogueBlocking();
     const bad: [string, unknown][] = [
-      ['an id that is not rideo’s', { ...base, actors: [{ ...base.actors![0], characterId: 'maya' }] }],
+      ['an id with a space', { ...base, actors: [{ ...base.actors![0], characterId: 'maya smith' }] }],
       ['a lens under 8 mm', { ...base, shots: { s: { camera: { ...cam(), lensMm: 4 } } } }],
       ['a colour name', { ...base, actors: [{ ...base.actors![0], color: 'orange' }] }],
       ['an unknown pose', { ...base, actors: [{ ...base.actors![0], pose: 'dance' }] }],
       ['a sun under 2°', { ...base, set: { ...base.set, sun: { azimuthDeg: 0, elevationDeg: 1 } } }],
-      ['nine actors', { ...base, actors: Array.from({ length: 9 }, (_, i) => actor(i)) }],
+      ['seventeen actors', { ...base, actors: Array.from({ length: 17 }, (_, i) => actor(i)) }],
       ['a coordinate beyond 500 m', { ...base, props: [{ id: 'p', x: 600, z: 0 }] }],
       ['version 2', { ...base, version: 2 }],
     ];
     for (const [what, value] of bad)
       expect(RideoSceneBlockingSchema.safeParse(value).success, what).toBe(false);
-    expect(() => parseRideoBlocking({ actors: 'none' })).toThrow(/not a rideo SceneBlocking v1: actors/);
+    expect(() => parseRideoBlocking({ actors: 'none' })).toThrow(/not a SceneBlocking v1: actors/);
     // rideo's draft has no updatedAt of its own: the import accepts it without one
     const { updatedAt: _, ...draft } = base;
     expect(parseRideoBlocking(draft).actors).toHaveLength(2);
   });
 
   it("keeps rideo's ids, moves and poses", () => {
+    // rideo's ids, and any other host's (the desk embed protocol's Id pattern)
     expect(RIDEO_ID_PATTERN.test('chr_maya0000001a')).toBe(true);
-    expect(isRideoId('chr_short')).toBe(false);
-    expect(isRideoId('CHR_MAYA0000001A')).toBe(false);
+    expect(isRideoId('chr_short')).toBe(true);
+    expect(isRideoId('proj:42.shot-7')).toBe(true);
+    expect(isRideoId('-leading-dash')).toBe(false);
+    expect(isRideoId('a b')).toBe(false);
+    expect(isRideoId('x'.repeat(101))).toBe(false);
     expect(RIDEO_CAMERA_MOVE_IDS).toEqual(DESK_MOVES);
     expect(RIDEO_CAMERA_MOVE_IDS).toHaveLength(20);
     for (const m of RIDEO_BLOCKING_MOVES.filter((x) => x !== 'none'))

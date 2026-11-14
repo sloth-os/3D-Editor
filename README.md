@@ -81,19 +81,23 @@ editor can be improved from real usage.
   height, lens, planned screen layout), with 20 camera moves and continuity checks (the 180° line,
   subjects out of frame, jump cuts…); a Director workspace with a shot list, an inspector, an actor
   panel and a sequence strip. See [docs/director-desk.md](docs/director-desk.md).
-- **Video export** – the server renders the shots (or a frame range) with shadows and ambient
-  occlusion and encodes them with ffmpeg: an H.264 sequence, one frame-exact clip per shot,
-  posters, a contact sheet, depth, normal, mask, edge and pose passes, and a manifest with camera
-  and subject tracks, as background jobs (MCP, REST and Render › Export Video…). See
-  [docs/video-export.md](docs/video-export.md).
+- **Video export** – the shots (or a frame range) rendered with shadows and ambient occlusion: an
+  H.264 sequence, one frame-exact clip per shot, posters, a contact sheet, depth, normal, mask,
+  edge and pose passes, and a manifest with camera and subject tracks. Render › Export Video…
+  exports on your device (render workers and WebCodecs in the browser, no server needed, offline
+  too); the server exports with ffmpeg as background jobs (MCP, REST, and the window's second
+  choice). See [docs/video-export.md](docs/video-export.md).
 - **Model store** – 170 original procedural models (furniture, props, food, nature, buildings,
   street, sports, vehicles, people and animals) and, through the server, the Khronos glTF samples,
   Poly Haven, Sketchfab, Poly Pizza and your own JSON catalogs: searched lazily, downloaded and
   cached on insert, scaled to real size on the ground, with their licence recorded; an Asset
   Browser with drag and drop. See [docs/model-store.md](docs/model-store.md).
-- **rideo bridge** – imports a clip of the AI video studio rideo as a staged project and sends the
-  shots' clips back as reference videos with the same blocking and camera moves. See
-  [docs/rideo.md](docs/rideo.md).
+- **Staging from a brief** – a host's scene told in words (the cast, the props and the shots of the
+  desk embed protocol's `SceneBrief`) staged as a project with its set, actors, props and solved
+  cameras, brought up to later briefs while keeping hand edits, with per-shot results (frames, lens,
+  move, blocking line, plan check, issues) for the host's prompts. See
+  [docs/director-desk.md](docs/director-desk.md#staging-from-a-brief) and
+  [docs/embedding.md](docs/embedding.md).
 - **Offline PWA** – installable, works without a network after the first visit.
 - **Storage** – browser (IndexedDB) by default; WebDAV when configured (on the server or in the
   browser), with CRDT merge-saving so concurrent devices never overwrite each other.
@@ -106,9 +110,10 @@ editor can be improved from real usage.
   `batch` for many in one undo step), edit meshes, set materials, modifiers, keyframes and scene
   settings, import and export files, render images or animations (`render_image`, `render_animation`
   with contact sheets, GIF and APNG), export videos (`export_video`), insert store models
-  (`store_search`, `store_add`), exchange clips with rideo (`rideo_import`, `rideo_push`) and drive
-  the live editor UI. [`scripts/mcp.mjs`](scripts/mcp.mjs) is a small CLI and module client. See
-  [docs/mcp.md](docs/mcp.md) and the [guide for AI agents](docs/agent-guide.md).
+  (`store_search`, `store_add`), stage a host's scene brief (`desk_stage_brief`,
+  `desk_shot_results`) and drive the live editor UI. [`scripts/mcp.mjs`](scripts/mcp.mjs) is a small
+  CLI and module client. See [docs/mcp.md](docs/mcp.md) and the
+  [guide for AI agents](docs/agent-guide.md).
 - **Observability** – browser and server OpenTelemetry traces/metrics/logs, Prometheus
   `/metrics`, structured logs, health checks, and a Grafana dashboard. See
   [docs/observability.md](docs/observability.md).
@@ -145,10 +150,11 @@ docker run -d -p 8080:8080 -v editor-data:/data ghcr.io/sloth-os/3d-editor:lates
 ```
 
 Open http://localhost:8080. Images are published for `linux/amd64`, `linux/arm64` and
-`linux/arm/v7`. The image stores projects on disk in `/data` and includes ffmpeg for video
-exports, which adds about 130 MB to it (Alpine's ffmpeg and about 100 libraries). An image without
-video export builds with `docker build --build-arg WITH_FFMPEG=0 .`; its `/api/config` then
-reports `features.videoExport: false` and exports are refused with `FFMPEG_UNAVAILABLE`.
+`linux/arm/v7`. The image stores projects on disk in `/data` and includes ffmpeg for the server's
+video exports, which adds about 130 MB to it (Alpine's ffmpeg and about 100 libraries). An image
+without them builds with `docker build --build-arg WITH_FFMPEG=0 .`; its `/api/config` then
+reports `features.videoExport: false` and the server refuses exports with `FFMPEG_UNAVAILABLE`
+(browsers still export on their device).
 
 [`docker-compose.yml`](docker-compose.yml) adds an optional WebDAV server and an observability
 stack (OpenTelemetry Collector, Jaeger, Prometheus, Grafana). To store projects in the bundled
@@ -207,8 +213,7 @@ npm run dev            # terminal 2, http://localhost:5173
 | `STORE_CATALOG_URLS`                               | –                                                                                                   | Comma-separated URLs of JSON model catalogs (the `catalog` provider)                                                                                                                                                                                     |
 | `MODEL_CACHE_DIR`, `MODEL_CACHE_MAX_MB`            | `<DATA_DIR>/model-cache`, `2048`                                                                    | Cache of downloaded store models and thumbnails, and its size in MB (the least recently used are dropped first)                                                                                                                                          |
 | `STORE_FETCH_TIMEOUT_MS`                           | `20000`                                                                                             | Timeout of each request to a model store provider                                                                                                                                                                                                        |
-| `RIDEO_URL`, `RIDEO_TOKEN`                         | –                                                                                                   | A rideo server for the rideo bridge, and its bearer token                                                                                                                                                                                                |
-| `NODE_USE_ENV_PROXY`                               | –                                                                                                   | `1` behind a proxy (Node.js 22.21 or later, as in the Docker image): every outgoing request (model store, rideo, WebDAV, OTLP) then goes through `HTTP_PROXY` / `HTTPS_PROXY`; list hosts to reach directly (`RIDEO_URL`, `WEBDAV_URL`) in `NO_PROXY`    |
+| `NODE_USE_ENV_PROXY`                               | –                                                                                                   | `1` behind a proxy (Node.js 22.21 or later, as in the Docker image): every outgoing request (model store, WebDAV, OTLP) then goes through `HTTP_PROXY` / `HTTPS_PROXY`; list hosts to reach directly (`WEBDAV_URL`, the OTLP collector) in `NO_PROXY`    |
 | `TELEMETRY_ENABLED`                                | `true`                                                                                              | Accept browser telemetry at `/otlp/v1/*`                                                                                                                                                                                                                 |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`                      | –                                                                                                   | Export server and browser telemetry to an OTLP/HTTP collector                                                                                                                                                                                            |
 | `OTEL_EXPORTER_OTLP_HEADERS`                       | –                                                                                                   | Extra headers for OTLP requests (`key1=value1,key2=value2`)                                                                                                                                                                                              |
@@ -245,7 +250,7 @@ images to GHCR on `main` and version tags.
 - [MCP / AI agents](docs/mcp.md)
 - [Building projects through MCP: a guide for AI agents](docs/agent-guide.md)
 - [The director's desk](docs/director-desk.md), [video export](docs/video-export.md),
-  [model store](docs/model-store.md) and [rideo integration](docs/rideo.md)
+  [model store](docs/model-store.md) and [embedding the desk](docs/embedding.md)
 - [Observability](docs/observability.md)
 - [Example projects](examples/README.md)
 

@@ -576,8 +576,8 @@ their final size instead of scaling small ones.
 
 The director's desk ([director-desk.md](director-desk.md)) stages a scene for an AI video model and
 renders one reference clip per shot. Its `desk.*` operators run through `run_operator` and `batch`
-(`list_operators {category: "Director"}` lists them); the video export, the model store and rideo
-have tools of their own. A session goes like this:
+(`list_operators {category: "Director"}` lists them); the video export, the model store and a
+host's scene brief have tools of their own. A session goes like this:
 
 1. **Set**: `desk.set_build {width, depth, ground, sun_azimuth_deg, sun_elevation_deg}` lays a
    ground plane and a SKY world whose sun is the one key light (`interior: true` adds walls).
@@ -629,10 +629,16 @@ have tools of their own. A session goes like this:
   ([video-export.md](video-export.md#quality-presets-and-speed)). Check the cut with contact sheets
   first.
 - `duck` and `bird` are not built yet; `desk.actor_add` refuses them and lists the built kinds.
-- For a clip of the AI video studio rideo, `rideo_import` builds the scene from its blocking; after
-  the steps above, `export_video {project, preset: "rideo"}` makes the clips rideo takes (draft clay
-  clips with the beauty, depth and pose passes) and `rideo_push {project, export, rideo}` sends them
-  back ([rideo.md](rideo.md)).
+- For a scene a host describes in words (a `SceneBrief` of the desk embed protocol,
+  [embedding.md](embedding.md)), `desk_stage_brief {brief}` does steps 1–3 and 5 in one undo step: a
+  new project named after the brief with the set, the cast standing on their planned sides, the
+  props and a solved camera per brief shot, the host's shot ids kept; its result lists the warnings
+  and the check's issues per shot. Add the action with step 4 (then `desk.shot_solve {}`), read each
+  shot's line, moves, lens and plan with `desk_shot_results {project}`, and render the references
+  with `export_video {project, preset: "reference"}` (draft clay clips with the beauty, depth and
+  pose passes). A later brief of the same scene goes to `desk_stage_brief {project, brief}` again:
+  it updates the staging and keeps what did not change
+  ([director-desk.md](director-desk.md#staging-from-a-brief)).
 
 ## Render budgets
 

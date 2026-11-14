@@ -32,7 +32,7 @@ import {
 } from '../../src/video/memory';
 import { planExport } from '../../src/video/plan';
 import { qualityPreset, videoExportParamsSchema } from '../../src/video/params';
-import { resultBytes, streamsFor } from '../../src/video/passes';
+import { resultBytes, streamsFor } from '@3d-editor/core';
 import { makeFakeFfmpeg, type FakeFfmpeg } from '../helpers/video-fake-ffmpeg';
 import {
   exportScene,

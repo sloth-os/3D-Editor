@@ -75,12 +75,12 @@ import { pollObjectMode, setSelection, vec3 } from './helpers';
  *   desk.check                    continuity checks, blocking lines and layouts (read-only)
  *   desk.set_build                ground, sky and sun (and interior walls) of the set
  *   desk.camera_move              key a camera move over a shot or a range
- *   desk.import_rideo_blocking    a rideo clip's SceneBlocking as a scene and shots
- *   desk.export_rideo_blocking    the scene as a rideo SceneBlocking v1 (read-only)
+ *   desk.import_rideo_blocking    a SceneBlocking v1 document (with its shots) as a scene and shots
+ *   desk.export_rideo_blocking    the scene as a SceneBlocking v1 document (read-only)
  *
  * Shots live in SceneSettings.shots and are read and written only through desk/shots.ts; the camera
  * work is desk/solver.ts, line.ts, plan.ts and moves.ts, the checks desk/checks.ts, the set
- * desk/set.ts, the rideo import and export desk/rideo/.
+ * desk/set.ts, the SceneBlocking import and export desk/rideo/ (staging from a brief: desk/brief/).
  * Axes: Z up, the front is −Y (rideo +z), facings in degrees about +Z with 0 facing the front.
  */
 
@@ -1288,10 +1288,10 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
   reg.register(
     defineOperator({
       id: 'desk.import_rideo_blocking',
-      label: 'Import rideo Blocking',
+      label: 'Import SceneBlocking',
       description:
-        "Build the scene from a rideo clip's blocking (spec §11): the frame rate and resolution from the " +
-        'project settings; shots in rideo order, each round(duration_s × fps) frames, a pre-roll gap before cuts ' +
+        "Build the scene from a clip's SceneBlocking v1 (the blocking JSON format rideo defined; spec §11): the " +
+        'frame rate and resolution from the settings; shots in index order, each round(duration_s × fps) frames, a pre-roll gap before cuts ' +
         'where marks jump; actors keyed at each shot start from their marks (walks to toX/toZ); cameras imported as ' +
         'they are (only shots without one are solved; the line is never enforced on import) and fitted to the ' +
         'planned layout; props as store models (kites and balloons on tethers), landmarks as primitives. Updates a ' +
@@ -1301,10 +1301,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       schema: z.object({
         blocking: z
           .record(z.string(), z.unknown())
-          .describe(
-            "rideo SceneBlocking v1 (the blocking route's draft, else its blocking): set, actors, props, shots " +
-              '(validated by the importer)',
-          ),
+          .describe('SceneBlocking v1: set, actors, props, shots (validated by the importer)'),
         shots: z
           .array(
             z.object({
@@ -1419,13 +1416,13 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
           })
           .nullish()
           .describe(
-            "The video model's duration limits (desk min/max_shot_s; rideo clamps durations to them)",
+            "The video model's duration limits (desk min/max_shot_s; the video model clamps durations to them)",
           ),
         state: z
           .enum(['missing', 'incomplete', 'ready'])
           .nullish()
           .describe(
-            "rideo's blocking state: 'missing' places the cast from the shots' planned layouts and solves every camera",
+            "The blocking's state: 'missing' places the cast from the shots' planned layouts and solves every camera",
           ),
         cast_overrides: z
           .record(z.string(), z.enum(ACTOR_KINDS))
@@ -1461,9 +1458,9 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
   reg.register(
     defineOperator({
       id: 'desk.export_rideo_blocking',
-      label: 'Export rideo Blocking',
+      label: 'Export SceneBlocking',
       description:
-        "The scene as a rideo SceneBlocking v1 (read-only): opening marks at the first shot's start, " +
+        "The scene as a SceneBlocking v1 document (read-only): opening marks at the first shot's start, " +
         'per-shot marks and walk targets, cameras and their end placement, landmark and prop footprints, riders on ' +
         "their mount's mark. Returns {blocking}.",
       category: 'Desk',

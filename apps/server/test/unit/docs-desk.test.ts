@@ -1,47 +1,33 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { readFileSync, readdirSync } from 'node:fs';
+import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { transformSync } from 'esbuild';
-import Fastify, { type FastifyInstance } from 'fastify';
-import { afterEach, describe, expect, it } from 'vitest';
-import { BUILTIN_CATALOG, STORE_CATEGORIES, createOperatorRegistry } from '@3d-editor/core';
-import { registerRideoRoutes, rideoTargetSchema } from '../../src/api/rideo';
+import { describe, expect, it } from 'vitest';
+import { BUILTIN_CATALOG, STORE_CATEGORIES } from '@3d-editor/core';
 import { SERVICE_ERROR_CODES, codedErrorDetails } from '../../src/mcp/agent';
-import {
-  MAX_ACTIVE_PREVIS,
-  MAX_PREVIS_JOBS,
-  MAX_PREVIS_WAIT_S,
-  RideoBridge,
-  type PrevisJob,
-} from '../../src/rideo';
-import { MAX_PUSH_BYTES } from '../../src/rideo/push';
-import { defaultMode, type ShotFeatures } from '../../src/rideo/shots';
-import type { ServerServices, ServiceContext } from '../../src/services';
 import { insertReply } from '../../src/store';
 import { VideoExports } from '../../src/video';
 import { clearFfmpegChecks, ffmpegUnavailable, hasFfmpeg, requireFfmpeg } from '../../src/video/ffmpeg';
 import {
+  EXPORT_PRESET_ALIASES,
   EXPORT_PRESET_PARAMS,
   MAX_EXPORT_HEIGHT,
   MAX_EXPORT_WAIT_S,
   MAX_EXPORT_WIDTH,
-  RIDEO_PASSES,
+  REFERENCE_PASSES,
   videoExportParamsSchema,
 } from '../../src/video/params';
 import { MAX_EXPORT_FRAMES } from '../../src/video/plan';
-import { RideoMock, kiteFixture } from '../helpers/rideo-mock';
 import { makeFakeFfmpeg } from '../helpers/video-fake-ffmpeg';
 import { exportScene, fakeContext, makeFakeRenderer } from '../helpers/video-fake-renderer';
 
 /*
- * The director's desk docs (docs/rideo.md, video-export.md, model-store.md, director-desk.md) and
- * the README's environment table against the code: the previs snippet run against a stub editor,
- * the previs route's answers, the argument names of the calls, the default reference modes, what
- * features.videoExport checks, the export messages and what cancel deletes, the code line of the
- * service errors, the proxy variable, the Docker image's ffmpeg, the env defaults, the built-in
- * catalog, the limits, and the Markdown the formatter does not check (*.md is prettier-ignored).
+ * The director's desk docs (video-export.md, model-store.md, director-desk.md) and the README's
+ * environment table against the code: what features.videoExport checks, the export messages and
+ * what cancel deletes, the code line of the service errors, the proxy variable, the Docker image's
+ * ffmpeg, the env defaults, the built-in catalog, the limits, and the Markdown the formatter does not
+ * check (*.md is prettier-ignored).
  */
 
 const file = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
@@ -54,13 +40,11 @@ const source = (rel: string) => file(`../../src/${rel}`);
 const flat = (s: string) => s.replace(/\s+/g, ' ');
 
 const readme = repo('README.md');
-const rideo = read('rideo.md');
 const videoExport = read('video-export.md');
 const modelStore = read('model-store.md');
 const directorDesk = read('director-desk.md');
 const mcp = read('mcp.md');
 const NEW_DOCS = {
-  'rideo.md': rideo,
   'video-export.md': videoExport,
   'model-store.md': modelStore,
   'director-desk.md': directorDesk,
@@ -125,325 +109,6 @@ function row(doc: string, first: string): string[] {
   expect(hit, first).toBeDefined();
   return hit!;
 }
-
-// ---------------------------------------------------------------- rideo.md, recipe 2
-
-/** The TypeScript snippet of recipe 2, compiled. */
-const SNIPPET = (() => {
-  const ts = /```ts\n([\s\S]*?)```/.exec(section(rideo, '## Recipe 2: one REST call'))?.[1] ?? '';
-  return { ts, js: ts ? transformSync(ts, { loader: 'ts', format: 'esm' }).code : '' };
-})();
-const EDITOR = /const EDITOR = '([^']+)'/.exec(SNIPPET.ts)?.[1] ?? '';
-
-interface StubCall {
-  method: string;
-  url: string;
-  body: unknown;
-}
-
-/**
- * Runs the snippet against `answer` (the editor's server), with a clock that moves `stepMs` each
- * time it is read. More than 50 requests is a runaway loop: the stub then throws.
- */
-async function runSnippet(answer: (call: StubCall, n: number) => Response, stepMs = 0) {
-  const calls: StubCall[] = [];
-  const fetchStub = async (url: string, init?: RequestInit) => {
-    const call = {
-      method: init?.method ?? 'GET',
-      url,
-      body: typeof init?.body === 'string' ? JSON.parse(init.body) : null,
-    };
-    calls.push(call);
-    if (calls.length > 50) throw new Error(`runaway: ${calls.length} requests`);
-    return answer(call, calls.length);
-  };
-  let now = 1_000_000;
-  const clock = { now: () => (now += stepMs) };
-  const logged: unknown[][] = [];
-  const consoleStub = { log: (...args: unknown[]) => logged.push(args) };
-  const AsyncFunction = Object.getPrototypeOf(async () => undefined).constructor as new (
-    ...args: string[]
-  ) => (...values: unknown[]) => Promise<void>;
-  const run = new AsyncFunction('fetch', 'process', 'console', 'Date', SNIPPET.js);
-  const error = await run(fetchStub, { env: { EDITOR_TOKEN: 'token' } }, consoleStub, clock).then(
-    () => null,
-    (err: unknown) => (err instanceof Error ? err : new Error(String(err))),
-  );
-  return { calls, logged, error };
-}
-
-const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
-const job = (status: string) => ({ id: 'job1', status, error: null, push: null, warnings: [] });
-
-describe('docs/rideo.md: the previs snippet of recipe 2', () => {
-  it('compiles and follows a job to its end, asking for camera references', async () => {
-    expect(SNIPPET.js).not.toBe('');
-    const statuses = ['exporting', 'pushing', 'done'];
-    const { calls, logged, error } = await runSnippet((call, n) =>
-      call.method === 'POST' ? json(job('importing'), 202) : json(job(statuses[n - 2])),
-    );
-    expect(error).toBeNull();
-    expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([
-      `POST ${EDITOR}/api/rideo/previs`,
-      ...statuses.map(() => `GET ${EDITOR}/api/rideo/previs/job1?wait=${MAX_PREVIS_WAIT_S}`),
-    ]);
-    // the body is a previs request the route accepts, with camera references (see below)
-    expect(calls[0].body).toMatchObject({ rideo: { project: expect.any(String), clip: expect.any(String) } });
-    expect(calls[0].body).toMatchObject({ push: { mode: 'camera' } });
-    expect(logged[0][0]).toBe('done');
-  });
-
-  it('stops on a job the server no longer has (404) instead of polling on', async () => {
-    const { calls, error } = await runSnippet((call) =>
-      call.method === 'POST'
-        ? json(job('importing'), 202)
-        : json(
-            {
-              error: "Previs job 'job1' not found (the server keeps the last 100 previs jobs)",
-              code: 'NOT_FOUND',
-            },
-            404,
-          ),
-    );
-    expect(error?.message).toMatch(/^previs job1: 404 /);
-    expect(calls).toHaveLength(2);
-  });
-
-  it('stops on a refused previs and on a job that never ends', async () => {
-    const refused = await runSnippet(() => json({ error: 'busy', code: 'QUEUE_FULL' }, 409));
-    expect(refused.error?.message).toMatch(/^previs refused: 409 /);
-    expect(refused.calls).toHaveLength(1);
-    // a clock that moves half an hour per read: the deadline (hours) ends the loop
-    const stuck = await runSnippet(
-      (call) => (call.method === 'POST' ? json(job('importing'), 202) : json(job('exporting'))),
-      30 * 60_000,
-    );
-    expect(stuck.error?.message).toMatch(/^previs job1: still exporting after \d+ ms$/);
-    expect(stuck.calls.length).toBeLessThan(20);
-  });
-});
-
-// ---------------------------------------------------------------- rideo.md, what POST refuses
-
-/** A real bridge behind the real routes; rideo is `fetch`. */
-type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-
-async function previsServer(o: { rideoUrl: string | null; rideoToken?: string | null; fetch: FetchLike }) {
-  // the bridge keeps its previs jobs in DATA_DIR
-  const dataDir = await mkdtemp(path.join(tmpdir(), 'docs-desk-previs-'));
-  dataDirs.push(dataDir);
-  const bridge = new RideoBridge({
-    config: {
-      rideoUrl: o.rideoUrl,
-      rideoToken: o.rideoToken ?? null,
-      dataDir,
-      ffmpegPath: 'ffmpeg',
-    },
-    fetch: o.fetch,
-    services: { registry: createOperatorRegistry(), exports: {} },
-    rooms: {
-      open: async () => {
-        throw new Error('no project');
-      },
-      listProjects: async () => [],
-    },
-  } as unknown as ServiceContext);
-  const app = Fastify();
-  registerRideoRoutes(app, { rideo: bridge } as unknown as ServerServices);
-  await app.ready();
-  return { app, bridge };
-}
-
-let servers: { app: FastifyInstance; bridge: RideoBridge }[] = [];
-const dataDirs: string[] = [];
-afterEach(async () => {
-  for (const s of servers) {
-    await s.bridge.close();
-    await s.app.close();
-  }
-  servers = [];
-  for (const d of dataDirs.splice(0)) await rm(d, { recursive: true, force: true });
-});
-
-async function serve(o: Parameters<typeof previsServer>[0]) {
-  const s = await previsServer(o);
-  servers.push(s);
-  return s.app;
-}
-
-const post = (app: FastifyInstance, payload: object) =>
-  app.inject({ method: 'POST', url: '/api/rideo/previs', payload });
-
-/** Follows a job until it ends (each GET waits up to 5 s for a change). */
-async function settle(app: FastifyInstance, id: string): Promise<PrevisJob> {
-  for (let i = 0; i < 20; i++) {
-    const res = await app.inject({ method: 'GET', url: `/api/rideo/previs/${id}?wait=5` });
-    expect(res.statusCode).toBe(200);
-    const j = res.json() as PrevisJob;
-    if (['done', 'failed', 'cancelled'].includes(j.status)) return j;
-  }
-  throw new Error(`previs ${id} did not end`);
-}
-
-describe("docs/rideo.md: the previs route's answers", () => {
-  const fx = kiteFixture();
-  const target = { project: fx.ids.project, clip: fx.ids.clip };
-
-  it('POST refuses at once only with the codes the table lists; GET says when a job is gone', async () => {
-    const refusals = new Set<string>();
-    const refused = async (app: FastifyInstance, payload: object) => {
-      const res = await post(app, payload);
-      expect(res.statusCode, JSON.stringify(payload)).not.toBe(202);
-      refusals.add(`${res.statusCode} ${(res.json() as { code: string }).code}`);
-    };
-    const mock = new RideoMock(null);
-    mock.add(fx.data);
-    const app = await serve({ rideoUrl: 'http://rideo.local', fetch: mock.fetch });
-    await refused(app, { rideo: target, export: { width: 161 } });
-    await refused(app, { rideo: { ...target, url: 'ftp://rideo.local' } });
-    await refused(await serve({ rideoUrl: null, fetch: mock.fetch }), { rideo: target });
-    // four jobs whose rideo never answers, then a fifth
-    const hanging: FetchLike = (_input, init) =>
-      new Promise((_resolve, reject) =>
-        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }),
-      );
-    const busy = await serve({ rideoUrl: 'http://rideo.local', fetch: hanging });
-    for (let i = 0; i < MAX_ACTIVE_PREVIS; i++)
-      expect((await post(busy, { rideo: target })).statusCode).toBe(202);
-    await refused(busy, { rideo: target });
-    expect([...refusals].sort()).toEqual(['400 INVALID_PARAMS', '409 QUEUE_FULL', '503 UNAVAILABLE']);
-
-    const failure = section(rideo, '## Recipe 2: one REST call');
-    const table = tables(failure).find((t) => t.header[0] === 'Status');
-    expect(table).toBeDefined();
-    const documented = table!.rows.map((r) => `${r[0]} ${r[1].replace(/`/g, '')}`);
-    expect(documented.sort()).toEqual([...refusals].sort());
-    // the codes of rideo's own failures are the MCP tools', never the route's
-    expect(failure).not.toMatch(/UPSTREAM|NEEDS_KEY/);
-    expect(flat(failure)).toContain("Everything else ends the job later with `status: 'failed'`");
-
-    const gone = await app.inject({ method: 'GET', url: '/api/rideo/previs/nope' });
-    expect(gone.statusCode).toBe(404);
-    expect(gone.json()).toMatchObject({ code: 'NOT_FOUND' });
-    expect(flat(failure)).toContain(
-      '`GET /api/rideo/previs/:job` answers 404 `NOT_FOUND` for a job the server does not have',
-    );
-    const tooLong = await app.inject({
-      method: 'GET',
-      url: `/api/rideo/previs/nope?wait=${MAX_PREVIS_WAIT_S + 1}`,
-    });
-    expect(tooLong.statusCode).toBe(400);
-    expect(flat(failure)).toContain(`A \`wait\` over ${MAX_PREVIS_WAIT_S} answers 400.`);
-  });
-
-  it('starts the job (202) when rideo fails, refuses the token or lacks the clip; the job ends failed, without a code', async () => {
-    const down = await serve({
-      rideoUrl: 'http://rideo.local',
-      fetch: async () => new Response('bad gateway', { status: 502 }),
-    });
-    const strict = new RideoMock('right');
-    strict.add(fx.data);
-    const refusing = await serve({
-      rideoUrl: 'http://rideo.local',
-      rideoToken: 'wrong',
-      fetch: strict.fetch,
-    });
-    const open = new RideoMock(null);
-    open.add(fx.data);
-    const lacking = await serve({ rideoUrl: 'http://rideo.local', fetch: open.fetch });
-    for (const [app, rideoTarget] of [
-      [down, target],
-      [refusing, target],
-      [lacking, { ...target, clip: 'clp_0000000000' }],
-    ] as const) {
-      const res = await post(app, { rideo: rideoTarget });
-      expect(res.statusCode).toBe(202);
-      const ended = await settle(app, (res.json() as PrevisJob).id);
-      expect(ended.status).toBe('failed');
-      expect(ended.error).toEqual(expect.any(String));
-      // the docs say a job carries no code; a job that gains one must be documented
-      const codeFields = Object.keys(ended).filter((k) => /code/.test(k));
-      const failure = flat(section(rideo, '## Recipe 2: one REST call'));
-      if (codeFields.length === 0) expect(failure).toContain('(a job has no code)');
-      else for (const k of codeFields) expect(failure).toContain(`\`${k}\``);
-    }
-  });
-});
-
-// ---------------------------------------------------------------- rideo.md, recipe 1 and the modes
-
-/**
- * rideo's MCP tools the docs call, with their arguments as rideo declares them
- * (packages/server/src/mcp/server.ts of rideo; checked against it below when a checkout is found).
- */
-const RIDEO_TOOLS: Record<string, string[]> = { blocking_get: ['projectId', 'clipId'] };
-const RIDEO_REPO =
-  process.env.RIDEO_REPO ?? fileURLToPath(new URL('../../../../../sloth-os/rideo', import.meta.url));
-const RIDEO_MCP = path.join(RIDEO_REPO, 'packages/server/src/mcp/server.ts');
-
-describe('docs/rideo.md: the calls of recipe 1', () => {
-  it("call rideo's tools with the arguments rideo declares, and the editor's with rideo: {project, clip}", () => {
-    const calls = [...rideo.matchAll(/\*\*rideo\*\* `(\w+) \{([^}]*)\}`/g)];
-    expect(calls.length).toBeGreaterThan(0);
-    for (const [, tool, args] of calls) {
-      expect(RIDEO_TOOLS[tool], tool).toBeDefined();
-      expect(
-        args.split(',').map((a) => a.trim()),
-        tool,
-      ).toEqual(RIDEO_TOOLS[tool]);
-    }
-    expect(rideoTargetSchema.safeParse({ project: 'prj_0123456789', clip: 'clp_0123456789' }).success).toBe(
-      true,
-    );
-    expect(
-      rideoTargetSchema.safeParse({ projectId: 'prj_0123456789', clipId: 'clp_0123456789' }).success,
-    ).toBe(false);
-    expect(flat(rideo)).toContain("the editor's tools take them as `rideo: {project, clip}`");
-  });
-
-  it.skipIf(!existsSync(RIDEO_MCP))("match rideo's own tool declarations", () => {
-    const server = readFileSync(RIDEO_MCP, 'utf8');
-    for (const [tool, args] of Object.entries(RIDEO_TOOLS)) {
-      const decl = new RegExp(`tool\\(\\s*'${tool}',[\\s\\S]*?\\n\\s*\\{([^}]*)\\},`).exec(server);
-      expect(decl, tool).not.toBeNull();
-      const declared = [...decl![1].matchAll(/(\w+):/g)].map((m) => m[1]);
-      expect(declared, tool).toEqual(args);
-    }
-  });
-
-  it("say the bridge's default modes, and ask for camera references until rideo has measured the others", () => {
-    const features = (f: Partial<ShotFeatures>): ShotFeatures => ({
-      camera_move: false,
-      physics: false,
-      tether: false,
-      held: false,
-      characters: false,
-      found: [],
-      ...f,
-    });
-    // the defaults the docs give: camera when the first frame cannot follow, motion, pose, else camera
-    expect(defaultMode(features({ tether: true, characters: true }), false)).toBe('camera');
-    expect(defaultMode(features({ tether: true, characters: true }), true)).toBe('motion');
-    expect(defaultMode(features({ characters: true }), true)).toBe('pose');
-    expect(defaultMode(features({ camera_move: true }), true)).toBe('camera');
-    expect(row(rideo, '`mode`')[1]).toBe(
-      "per shot: `camera` when rideo's first frame cannot follow our staging, else `motion` for props in motion, `pose` for actors, else `camera`",
-    );
-    const measure = flat(section(rideo, '## What rideo should measure first'));
-    expect(measure).toContain(
-      'a `motion` reference when props move in it and a `pose` reference when it shows actors',
-    );
-    // a kite shot with an actor would get an unmeasured motion reference: the recipes ask for camera
-    if (defaultMode(features({ tether: true, characters: true }), true) !== 'camera') {
-      expect(measure).toContain('ask for `camera` (the most conservative) as the recipes above do');
-      expect(flat(section(rideo, '## Recipe 1: an agent with both MCP servers'))).toContain(
-        "`rideo_push {project, export, rideo: {project, clip}, mode: 'camera'}`",
-      );
-      expect(SNIPPET.ts).toContain("push: { mode: 'camera' }");
-    }
-  });
-});
 
 // ---------------------------------------------------------------- video-export.md
 
@@ -551,27 +216,23 @@ describe('docs/video-export.md', () => {
     for (const doc of [videoExport, mcp]) expect(flat(doc)).not.toContain('a finished one is kept');
   });
 
-  it("say what preset 'rideo' sets, as the code sets it, and recipe 1 exports with it", () => {
-    const p = EXPORT_PRESET_PARAMS.rideo;
+  it("say what preset 'reference' sets, as the code sets it, and that its former name still works", () => {
+    const p = EXPORT_PRESET_PARAMS.reference;
     expect(p.outputs).toEqual({ sequence: false, clips: true, posters: false, contact_sheet: false });
+    expect(EXPORT_PRESET_ALIASES).toEqual({ rideo: 'reference' });
     const code = (s: string) => `\`${s}\``;
-    const passes = `${RIDEO_PASSES.slice(0, -1).map(code).join(', ')} and ${code(RIDEO_PASSES.at(-1)!)}`;
+    const passes = `${REFERENCE_PASSES.slice(0, -1).map(code).join(', ')} and ${code(REFERENCE_PASSES.at(-1)!)}`;
     expect(row(videoExport, '`preset`')[2]).toBe(
-      '`rideo`: the clips `rideo_push` sends (below); the parameters given win over it',
+      '`reference`: reference clips for a video model (below); the parameters given win over it',
     );
-    expect(flat(section(videoExport, '## Parameters'))).toContain(
-      `Preset \`rideo\` makes the clips [\`rideo_push\`](rideo.md) sends: quality \`${p.quality}\`, look ` +
+    const params = flat(section(videoExport, '## Parameters'));
+    expect(params).toContain(
+      `Preset \`reference\` makes reference clips for a video model: quality \`${p.quality}\`, look ` +
         `\`${p.look}\` and clips only (no sequence, posters or contact sheet), with the passes ${passes}, ` +
         'one for each reference mode (`motion`, `camera` and `pose`), at the render resolution at 100 %',
     );
-    const recipe = flat(section(rideo, '## Recipe 1: an agent with both MCP servers'));
-    expect(recipe).toContain(
-      "**editor** `export_video {project, preset: 'rideo'}`: draft clips in the clay look",
-    );
-    expect(recipe).not.toContain('passes:');
-    // the push never sends another pass in place of the mode's
-    expect(row(rideo, '`pass`')[1]).toContain('a shot whose export has no clip of it fails');
-    expect(flat(rideo)).not.toContain('always beauty');
+    expect(params).toContain('Its former name `rideo` is still accepted (and stored as `reference`).');
+    expect(videoExportParamsSchema.parse({ preset: 'rideo' }).preset).toBe('reference');
   });
 
   it('give the limits of the code', () => {
@@ -598,10 +259,10 @@ describe('docs/video-export.md', () => {
 
 // ---------------------------------------------------------------- mcp.md, errors
 
-describe('docs/mcp.md: the code line of the video, store and rideo tools', () => {
+describe('docs/mcp.md: the code line of the video and store tools', () => {
   it('names the codes that carry it, and the codes that do not', () => {
     const doc = flat(mcp);
-    const start = doc.indexOf('The video export, model store and rideo tools fail with codes of their own');
+    const start = doc.indexOf('The video export and model store tools fail with codes of their own');
     expect(start).toBeGreaterThanOrEqual(0);
     const paragraph = doc.slice(start, doc.indexOf(' | ', start));
     const listed = paragraph.slice(
@@ -690,8 +351,11 @@ describe('README.md: the environment variables', () => {
       expect(proxyRow).toContain('Node.js 22.21 or later');
       expect(proxySection).toContain('Node.js 22.21 and later read');
     }
-    for (const text of [proxyRow, proxySection])
-      for (const name of ['RIDEO_URL', 'WEBDAV_URL', 'NO_PROXY']) expect(text, name).toContain(name);
+    for (const text of [proxyRow, proxySection]) {
+      for (const name of ['WEBDAV_URL', 'NO_PROXY']) expect(text, name).toContain(name);
+      // the server calls no rideo (the bridge is retired): nothing of it to keep off the proxy
+      expect(text).not.toMatch(/rideo/i);
+    }
   });
 
   it('say how to build an image without ffmpeg, and the Dockerfile builds one', () => {
@@ -756,34 +420,6 @@ describe('docs/model-store.md: the built-in models', () => {
     );
     expect(counts.length).toBeGreaterThanOrEqual(4);
     for (const n of counts) expect(n).toBe(BUILTIN_CATALOG.length);
-  });
-});
-
-// ---------------------------------------------------------------- rideo.md and mcp.md limits
-
-describe('docs/rideo.md and docs/mcp.md: the limits of the bridge', () => {
-  it('give the limits of rideo/index.ts and push.ts', () => {
-    const words: Record<number, string> = {
-      2: 'two',
-      3: 'three',
-      4: 'four',
-      5: 'five',
-      6: 'six',
-      8: 'eight',
-    };
-    const pushMb = MAX_PUSH_BYTES / 1048576;
-    const doc = flat(rideo);
-    expect(doc).toContain(`(the last ${MAX_PREVIS_JOBS}, at most ${MAX_ACTIVE_PREVIS} running)`);
-    expect(row(rideo, '409')[2]).toBe(`${words[MAX_ACTIVE_PREVIS]} previs jobs already run`);
-    expect(doc).toContain(`(waits up to ${MAX_PREVIS_WAIT_S} s for it to change)`);
-    expect(doc).toContain(`at most ${pushMb} MB`);
-    expect(doc).toContain(`the push refuses clips over ${pushMb} MB`);
-    expect(row(mcp, '`rideo_push`, previs jobs')[1]).toBe(
-      `Clips of at most ${pushMb} MB; ${MAX_ACTIVE_PREVIS} previs jobs at once, the last ${MAX_PREVIS_JOBS} kept (in \`DATA_DIR\`)`,
-    );
-    expect(row(mcp, '`GET /api/rideo/previs/:job`')[1]).toBe(
-      `The previs job (\`?wait=\` 0–${MAX_PREVIS_WAIT_S} s)`,
-    );
   });
 });
 

@@ -1,17 +1,143 @@
 # Video export
 
-The server renders the shots of the [director's desk](director-desk.md) (or a plain frame range)
-in its render processes and encodes them with ffmpeg: one H.264 MP4 of the whole sequence, one
-frame-exact clip per shot, posters, a labelled contact sheet, control passes (depth, normals,
-object mask, edges, pose skeletons) and a `manifest.json` that says what every frame shows. An
-export is a background job: start it, follow it, download the files.
+The shots of the [director's desk](director-desk.md) (or a plain frame range) rendered with
+shadows and ambient occlusion and encoded as one H.264 MP4 of the whole sequence, one frame-exact
+clip per shot, posters, a labelled contact sheet, control passes (depth, normals, object mask,
+edges, pose skeletons) and a `manifest.json` that says what every frame shows. Two exporters make
+them with the same code (`packages/core/src/export`: the plan, the frames, the passes, the
+manifest):
 
-Contents: [requirements](#requirements) · [parameters](#parameters) ·
-[quality presets and speed](#quality-presets-and-speed) · [outputs](#outputs) ·
-[the manifest](#the-manifest) · [jobs](#jobs) · [memory](#memory) · [REST](#rest) ·
-[MCP](#mcp) · [troubleshooting](#troubleshooting)
+- **the browser** ([browser export](#browser-export)): the editor renders the project in render
+  workers on the device it runs on and encodes it with WebCodecs, with no server at all. The
+  Export Video window does this by default;
+- **the editor server**: its render processes and ffmpeg, as a background job (start it, follow
+  it, download the files): the rest of this page. The Export Video window offers it as a second
+  choice where the server can export the project.
+
+Contents: [browser export](#browser-export) · [requirements](#requirements) ·
+[parameters](#parameters) · [quality presets and speed](#quality-presets-and-speed) ·
+[outputs](#outputs) · [the manifest](#the-manifest) · [jobs](#jobs) · [memory](#memory) ·
+[REST](#rest) · [MCP](#mcp) · [troubleshooting](#troubleshooting)
+
+## Browser export
+
+Render › Export Video… (Ctrl+Shift+F12) exports on this device by default, with the same
+[parameters](#parameters) as the server (one schema checks both). It needs no editor server: a
+project kept only in the browser exports as well, offline too (the PWA caches the render worker).
+
+**How it works.** When Export is pressed the window takes a snapshot of the project (a Yjs state
+update; later edits never reach the export) and hands it to the export engine
+(`apps/web/src/export`):
+
+1. A first render worker (a module Web Worker) applies the snapshot and plans the export (core's
+   `planExport`: shots, size, frames). The tab's memory then decides how many more start (one per
+   core, at most 8; [memory](#memory-in-the-browser)), each applying the snapshot once.
+2. Per shot, the first worker measures it (depth range, shadow box, occlusion reach); per segment
+   of at most 200 frames it simulates the rigid bodies once for every worker. The segment's frames
+   are rendered ahead on every worker and written in order (core's `renderInOrder`, as on the
+   server), a padded shot holding its last frame (`match_model_duration`).
+3. Each worker renders a frame with core's `renderExportFrame`, the function the server's render
+   processes call, and converts it for the page: 8-bit I420 in BT.709 limited range for each video
+   stream (each chroma sample the average of its 2 × 2 pixels; what the server's ffmpeg makes with
+   `scale=out_color_matrix=bt709:out_range=tv`), a PNG frame for the lossless passes, the posters
+   (an RGB PNG and a JPEG), the stills and the contact sheet tiles.
+4. The page encodes every video stream with one WebCodecs `VideoEncoder`: H.264 High, else Main,
+   else Constrained Baseline, at the lowest level from 3.0 that holds the size, rate and bit rate
+   (`latencyMode: 'quality'`), the frames tagged BT.709 limited range (the encoder writes it in the
+   stream's VUI), a key frame at every shot start and at least every round(2 × fps) frames, and at
+   most 4 frames queued in the encoder. Its chunks are muxed (mediabunny) into the sequence and
+   into the clip of their shot without encoding again, each clip starting on the key frame of its
+   shot start; every MP4 has its index (`moov`) before the media and an `nclx` colour box saying
+   BT.709 limited range.
+5. The first worker makes the contact sheet and the manifest (core's `contactSheet`,
+   `buildManifest`), the others having stopped once the frames were rendered.
+
+Files go to the browser's Origin Private File System (a directory per export, written as the
+export goes, so long sequences and frame archives do not stay in memory) where the browser has it,
+else stay in memory. Every file's SHA-256 is computed while it is written. Cancel stops the workers
+and the encoders and deletes what the export wrote. The screen is kept on while it runs (Screen
+Wake Lock, where the browser allows it). The window then lists the files as download links with a
+preview of the sequence, and **Download all (.zip)** saves them as one ZIP archive (stored: the
+videos and PNGs are compressed already). The files stay until the next export on this device, or
+until the tab closes (a later export deletes the files of closed tabs). An export goes on when the
+window is closed, as long as the tab stays open.
+
+**Requirements**: a secure page (HTTPS, or `localhost`; browsers offer WebCodecs and the Origin
+Private File System only there), Web Workers, and a WebCodecs `VideoEncoder` that encodes H.264 at
+the export's size and rate (current Chrome, Edge, Firefox and Safari do). The window asks the
+browser first (`VideoEncoder.isConfigSupported`) and, when it cannot export, says why and offers
+the server where it can export the project. VP9 is encoded where the browser has a VP9 encoder,
+else the videos are H.264 MP4 with a warning, as on a server without libvpx.
+
+**What differs from the server's export**:
+
+- **The frames are the same**, rendered by the same core code. The end-to-end test
+  (`e2e/tests/browser-export.spec.ts`) exports in headless Chromium and checks every frame's raw
+  passes against core rendering the same snapshot in Node, byte for byte. One caveat: V8 versions
+  round some Math functions (`sin`, `cos`, `tan`, `exp`, `log`, `pow`, `atan2`, `acos`)
+  differently in the last bit (Chrome 153 against Node 22: 54 of 2,000 sines differ), so a pixel
+  whose value lands on a rounding edge can differ by one step, and the camera tracks of the
+  manifest by about 1e-15.
+- **The encoder bytes differ**: the browser's H.264 encoder (OpenH264 in Chrome on Linux, the
+  platform's elsewhere) runs at a bit rate instead of x264's constant quality: per pixel and frame
+  0.05 (`draft`), 0.09 (`standard`) or 0.15 (`high`) bits at 1280 × 720, more per pixel for
+  smaller frames and fewer for larger ones (by the fourth root of the pixel ratio, between half and
+  twice), at least 150 kbit/s. The frames and their timing are the same, the sizes are not. VP9
+  runs in quantizer mode at the server's CRF values (40, 33, 28) where the browser has it.
+- **The lossless passes are PNG frames**: `sequence.mask.zip` and `sequence.edges.zip` (stored ZIP
+  archives of `frame-000001.png` …, one per output frame) instead of the server's lossless
+  Matroska files. Mask frames are indexed PNGs whose palette is the export's `mask_palette` (the
+  index of a pixel is its object's palette index), edge frames 8-bit grey.
+- **Stills** on request (`stills` of the engine's API, not offered in the window): the beauty image
+  of each shot's first frame as an RGB PNG (`<shot>.still.png`, kind `still`), rendered with the
+  beauty pass whatever passes the export has.
+- **The manifest** has the server's fields, with these additions: files of kind `frames` (the PNG
+  archives, with their `pass`) and `still`, and an `exporter` object: `kind` (`browser`),
+  `video_codec` (the codec string, such as `avc1.64001f`), `bitrate` (bit/s; null in VP9 quantizer
+  mode), `vp9_quantizer` and `render_workers`. The project's id is the one the page gives (the
+  editor's project id).
+
+**Speed**, measured in headless Chromium 153 on a 4-core machine shared with other work (load 2–5),
+exporting the over-the-shoulder shot of the
+[worked example](director-desk.md#worked-example-a-kite-on-a-hill) (2 s, 48 frames) at 1280 × 720
+on 4 render workers:
+
+| Quality    | Look       | Time        | Frames/s | Per frame and worker | The 2 s clip |
+| ---------- | ---------- | ----------- | -------- | -------------------- | ------------ |
+| `draft`    | `clay`     | 15.2–16.5 s | 3.2–3.5  | 1.1–1.25 s           | 79–82 KiB    |
+| `standard` | `material` | 24.2 s      | 2.1      | 1.9 s                | 95 KiB       |
+
+(Three runs of the first row, one of the second; the server's render processes take about as long:
+[quality presets and speed](#quality-presets-and-speed).)
+
+### Memory in the browser
+
+The page and its render workers share one renderer process, and running out of memory ends the
+whole tab, so the export starts as many render workers as the tab's memory holds and refuses at
+once, with the figures, when not even one fits (code `OUT_OF_MEMORY`). A render worker counts its
+base (32 MiB), the snapshot's scene in its heap and the renderer's working buffers at the export's
+size and passes (core's estimates, as for the server's render processes), the frame in flight and
+128 MiB of slack; the page its video encoders (an estimate: 16 MiB and 24 bytes per pixel each),
+the frames rendered ahead (two per worker, at most 128 MiB), each shot's clips until they are
+finished, and every file when the browser has no Origin Private File System. All of it must fit
+the memory a render may use in the tab (half the device memory the browser reports, at most 4 GB;
+8 GB is assumed where it reports none), and the scenes the JavaScript heaps (85 % of the tab's heap
+limit). With fewer workers than cores the export adds a warning.
+
+### The engine's API
+
+`apps/web/src/export/index.ts` is what a page that embeds the desk calls:
+
+- `browserExportSupport({width, height, fps})`: `{available, reason}`;
+- `startBrowserExport({update, params, stills?, project?}, {onProgress?, signal?})`: the files
+  (kind, pass, shot, MIME type, size, SHA-256, frames, duration and a `blob()`), the manifest, the
+  shots and the warnings; it rejects with a `BrowserExportError` whose `code` is `INVALID_PARAMS`,
+  `NOT_FOUND`, `UNSUPPORTED`, `OUT_OF_MEMORY`, `CANCELLED` or `FAILED`;
+- `zipExport(result)`: one ZIP Blob of all the files; `releaseBrowserExport(result)` deletes them.
 
 ## Requirements
+
+Of the server's export (the [browser's](#browser-export) are above):
 
 - **ffmpeg with libx264** on the server. The server runs `FFMPEG_PATH -version` (default `ffmpeg`,
   looked up on the `PATH`; a value with a slash is a file path) once at startup; `/api/config`
@@ -23,7 +149,8 @@ Contents: [requirements](#requirements) · [parameters](#parameters) ·
   as H.264.
 - **The Docker image ships ffmpeg** (Alpine's package, with libx264 and libvpx), so
   `docker run … ghcr.io/sloth-os/3d-editor` exports out of the box. An image built with
-  `--build-arg WITH_FFMPEG=0` leaves it out (about 130 MB smaller) and has no video export.
+  `--build-arg WITH_FFMPEG=0` leaves it out (about 130 MB smaller): its server exports nothing,
+  the browsers it serves still export on their device.
 - **Render processes**: a server run with `RENDER_WORKERS=0` (rendering on its main thread) refuses
   exports with `UNAVAILABLE`.
 - **Disk**: exports are written to `EXPORT_DIR` (default `<DATA_DIR>/exports`); see
@@ -45,7 +172,7 @@ One schema serves the MCP tool `export_video` (with `project`) and the body of
 
 | Parameter                  | Default                        | Meaning                                                                                                        |
 | -------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| `preset`                   | –                              | `rideo`: the clips `rideo_push` sends (below); the parameters given win over it                                |
+| `preset`                   | –                              | `reference`: reference clips for a video model (below); the parameters given win over it                       |
 | `shots`                    | every enabled shot             | Shot ids or names in cut order, or `'all'`; a scene without shots exports its frame range                      |
 | `frame_start`, `frame_end` | the scene's range              | Scene frames (inclusive) of an export without shots                                                            |
 | `camera`                   | the scene camera               | The camera of an export without shots                                                                          |
@@ -61,11 +188,11 @@ One schema serves the MCP tool `export_video` (with `project`) and the body of
 
 At most 100,000 output frames per export.
 
-Preset `rideo` makes the clips [`rideo_push`](rideo.md) sends: quality `draft`, look `clay` and
+Preset `reference` makes reference clips for a video model: quality `draft`, look `clay` and
 clips only (no sequence, posters or contact sheet), with the passes `beauty`, `depth` and `pose`,
-one for each reference mode (`motion`, `camera` and `pose`), at the render resolution at 100 %
-(`rideo_import` sets it to rideo's) and the scene's fps (rideo's too). The parameters given win over
-the preset, `outputs` key by key.
+one for each reference mode (`motion`, `camera` and `pose`), at the render resolution at 100 % and
+the scene's fps. The parameters given win over the preset, `outputs` key by key. Its former name
+`rideo` is still accepted (and stored as `reference`).
 
 ## Quality presets and speed
 
@@ -131,30 +258,33 @@ keyframes, so they are frame-exact (the tests check every clip's frame count and
 
 Strings (a kite's, anything with `desk_role: 'string'`) are drawn as screen-space lines at least 2
 px wide in the beauty, mask, edge and pose passes, hidden behind opaque objects. Objects hidden by
-their scale (a kite after `after: 'hide'`, the actors and props a rideo import hides in shots they
-are not in) draw nothing in any pass: no skeleton, no string line, no mask colour. What tells them
-is their geometry, which a hide key shrinks to under a micrometre across (a string to under a
-micrometre thick), so a store model shown at a tiny scale (one in micrometres made 1 m tall is shown
-at 1e-6) is drawn, boxed and measured as any other.
+their scale (a kite after `after: 'hide'`, the actors and props a staged brief or a rideo import
+hides in shots they are not in) draw nothing in any pass: no skeleton, no string line, no mask
+colour. What tells them is their geometry, which a hide key shrinks to under a micrometre across
+(a string to under a micrometre thick), so a store model shown at a tiny scale (one in micrometres
+made 1 m tall is shown at 1e-6) is drawn, boxed and measured as any other.
 
 ## The manifest
 
-`manifest.json` (version 1) describes the export from the snapshot it rendered:
+`manifest.json` (version 2) describes the export from the snapshot it rendered:
 
 - top level: `version`, `project {id, name}`, `created_at`, `fps`, `width`, `height`, `aspect`,
   `frames`, `duration_s`, `codec`, `color` (bt709, limited), `look`, `quality`, `passes`, `files`,
   `credits` (every store model in the scene: `object`, `name`, `store_id`, `license`, `author`,
   `source_url`), `issues` (`desk.check`'s), `warnings`, `mask_palette` and `shots`;
-- per shot: `id`, `name`, `index`, `external` (the rideo clip and shot it came from),
+- per shot: `id`, `name`, `index`, `external` (where the shot came from: the host scene and shot of
+  a staged brief, or the rideo clip and shot of an imported one),
   `camera {object, name, lens_mm, sensor_mm: 36}`, `framing`, `angle`, `height`, `move`, `notes`,
   `scene_frames`, `output_frames`, `timecode_in` and `timecode_out` (HH:MM:SS:FF, the out point the
   frame after the shot, as in edit decision lists), `duration_s`, `files` (by pass, and the
-  posters), `blocking_line` (rideo's sentence for the shot's first frame), `moves_line`, `subjects`
-  (`object`, `name`, `role`, `color`, `character_id`, `element_id`), `camera_track` (every output
-  frame: `frame`, `position`, `rotation_quat` [x, y, z, w], `fov_deg`), `subject_tracks` (by rideo
-  character id or object id: `frame`, `x`, `y`, `w`, `h` in output pixels from the top left,
-  `visible`, and `hidden: true` with a zero box while the subject is hidden by its scale) and
-  `rideo {clip, shot, camera_move, layout, moves}`.
+  posters), `blocking_line` (who stands where for the shot's first frame, in words), `moves_line`,
+  `subjects` (`object`, `name`, `role`, `color`, `character_id`, `element_id`), `camera_track`
+  (every output frame: `frame`, `position`, `rotation_quat` [x, y, z, w], `fov_deg`),
+  `subject_tracks` (by the host's character id, else the object id: `frame`, `x`, `y`, `w`, `h` in
+  output pixels from the top left, `visible`, and `hidden: true` with a zero box while the subject
+  is hidden by its scale) and `host {scene, shot, camera_move, layout, moves}` (what a host's
+  prompts read: its scene and shot, the camera move, the planned layout and the moves; version 1
+  named this block `rideo` and its `scene` field `clip`).
 
 Coordinates are the editor's (metres, Z up; [conventions](director-desk.md#coordinates)).
 
@@ -239,13 +369,16 @@ curl -sS -o sequence.mp4 "http://localhost:8080/api/projects/$ID/video-exports/$
 
 `render_image` and `render_animation` take `camera: 'shots'` to look through the camera of the
 shot that covers each frame (the scene camera where none does): a quick check of the cut before an
-export. In the editor, Render › Export Video… (Ctrl+Shift+F12) runs the same jobs
+export. In the editor, Render › Export Video… (Ctrl+Shift+F12) exports on the device by default
+([browser export](#browser-export)); its Server choice runs these jobs
 ([director-desk.md](director-desk.md#in-the-editor)).
 
 ## Troubleshooting
 
 | Symptom                                                                                 | Cause and remedy                                                                                                                                                                                        |
 | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| the Export Video window says this browser cannot export                                 | open the editor over HTTPS or on localhost, use a current browser with WebCodecs, or lower the size or frame rate its H.264 encoder refused; or choose Server where the window offers it                |
+| a browser export refused at start: running out of memory would end the tab              | the tab's memory holds no render worker for this scene at this size: lower the resolution, the passes or the scene's triangles, or export on the server                                                 |
 | `features.videoExport: false`; `FFMPEG_UNAVAILABLE` "is not installed on the server"    | ffmpeg was not found, or `FFMPEG_PATH` does not run it: install it (Debian/Ubuntu `apt-get install ffmpeg`, Alpine `apk add ffmpeg`) or set `FFMPEG_PATH`, then restart                                 |
 | `FFMPEG_UNAVAILABLE` "has no libx264 encoder" although `features.videoExport` is `true` | this ffmpeg runs but was built without libx264 (the flag only checks that ffmpeg runs): install one with it (the Debian/Ubuntu and Alpine packages have it) or point `FFMPEG_PATH` to one, then restart |
 | `UNAVAILABLE` "needs render processes"                                                  | `RENDER_WORKERS=0`: set it to 1 or more                                                                                                                                                                 |
@@ -258,5 +391,5 @@ export. In the editor, Render › Export Video… (Ctrl+Shift+F12) runs the same
 | a kite's string runs from where the hand was                                            | the anchor actor moved, posed or mounted after `desk.tether_fly`: `desk.check` reports `tether_detached` with the frames; fly the kite again after the anchor's last move                               |
 | an actor walks on water, or a body rolls on it                                          | `desk.check` reports `walks_on_water` (route the walk around it, or give a swimmer `in_water: true`) and `body_in_water` (re-aim the throw, or release it again and bake with `{water: 'float'}`)       |
 | a kite's string missing                                                                 | strings come from `desk.tether_fly` (or objects with `desk_role: 'string'`); a string is hidden before its flight starts                                                                                |
-| the clip has a different length than rideo expects                                      | rideo asks its model for `clamp(duration)`: set the desk's take limits and export with `match_model_duration: true`                                                                                     |
+| the clip has a different length than the host expects                                   | a host such as rideo asks its video model for `clamp(duration)`: set the desk's take limits and export with `match_model_duration: true`                                                                |
 | exports disappear                                                                       | finished exports are deleted after `EXPORT_TTL_HOURS` and beyond `EXPORT_MAX_MB`                                                                                                                        |

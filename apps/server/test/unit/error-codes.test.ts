@@ -8,12 +8,10 @@ import { registerTools, type ToolContext } from '../../src/mcp/tools';
 import { SERVICE_ERROR_STATUS, errorStatus, restErrorReply, sendRestError } from '../../src/api/errors';
 import { registerVideoExportRoutes } from '../../src/api/video-exports';
 import { registerStoreRoutes } from '../../src/api/store';
-import { registerRideoRoutes } from '../../src/api/rideo';
 import { ServerMetrics } from '../../src/observability/metrics';
 import { silentLog } from '../../src/observability/log';
 import { VideoExports } from '../../src/video';
 import { ModelStore } from '../../src/store';
-import { RideoBridge } from '../../src/rideo';
 import type { ServerServices, ServiceContext } from '../../src/services';
 
 /*
@@ -89,13 +87,11 @@ describe('REST status of the error codes', () => {
     const services = {
       exports: new VideoExports(ctx),
       store: new ModelStore(ctx),
-      rideo: new RideoBridge(ctx),
     } as unknown as ServerServices;
     const app = Fastify({ logger: false });
     apps.push(app);
     registerVideoExportRoutes(app, services);
     registerStoreRoutes(app, services);
-    registerRideoRoutes(app, services);
     const VIDEO = 'Video export is not available yet on this server.';
     const STORE = 'The model store is not available yet on this server.';
     const unavailable = async (

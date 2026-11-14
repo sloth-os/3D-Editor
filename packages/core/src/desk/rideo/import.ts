@@ -43,6 +43,7 @@ import {
 } from './rules';
 import {
   RIDEO_BLOCKING_PALETTE,
+  RIDEO_MAX_ACTORS,
   RideoImportInputSchema,
   RideoSceneBlockingSchema,
   rideoLandmarkColor,
@@ -59,8 +60,11 @@ import {
 } from './schema';
 
 /*
- * desk.import_rideo_blocking (spec §11 "Import semantics"): a rideo clip's SceneBlocking as a scene,
- * its actors, props, landmarks and set, and a shot per rideo shot.
+ * desk.import_rideo_blocking (spec §11 "Import semantics"): a clip's SceneBlocking v1 (the blocking
+ * format rideo defined, ./schema.ts) as a scene, its actors, props, landmarks and set, and a shot per
+ * shot of the clip; also the staging engine of desk/brief stageBrief (source 'host'), which hands it a
+ * blocking of the set and props only (state 'missing': the cast placed from the planned layouts).
+ * "rideo" below is the format's: its coordinates, poses, landmarks and moves.
  *
  * Timeline. Shots in rideo's index order, each round(durationSec × fps) frames long, one after the
  * other; a cut where marks jump (someone stands elsewhere, a rider gets on or off) opens with a
@@ -279,7 +283,7 @@ function subtree(doc: SceneDoc, id: string): string[] {
 }
 
 /** Removes objects with everything below them. */
-function removeTrees(doc: SceneDoc, ids: readonly string[]): void {
+export function removeTrees(doc: SceneDoc, ids: readonly string[]): void {
   const all = new Set<string>();
   for (const id of ids) if (doc.getObject(id)) for (const x of subtree(doc, id)) all.add(x);
   doc.removeObjects([...all]);
@@ -466,7 +470,7 @@ export function parseRideoBlocking(raw: unknown): RideoSceneBlocking {
   const r = RideoSceneBlockingSchema.safeParse(withDate);
   if (!r.success)
     throw new OperatorError(
-      `blocking is not a rideo SceneBlocking v1: ${r.error.issues
+      `blocking is not a SceneBlocking v1: ${r.error.issues
         .slice(0, 5)
         .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
         .join('; ')}`,
@@ -487,7 +491,7 @@ export function importRideoBlocking(
   const parsed = RideoImportInputSchema.safeParse(raw);
   if (!parsed.success)
     throw new OperatorError(
-      `rideo import: ${parsed.error.issues
+      `blocking import: ${parsed.error.issues
         .slice(0, 5)
         .map((i) => `${i.path.join('.')}: ${i.message}`)
         .join('; ')}`,
@@ -499,7 +503,9 @@ export function importRideoBlocking(
   const doc = ctx.doc;
   const warnings: string[] = [];
   const clip = input.clip ?? null;
-  if (!input.shots.length) throw new OperatorError('rideo import: the clip has no shots', 'INVALID_PARAMS');
+  const source = input.source;
+  if (!input.shots.length)
+    throw new OperatorError('blocking import: the clip has no shots', 'INVALID_PARAMS');
 
   // ------------------------------------------------------------ settings
   const scene = doc.getScene();
@@ -516,7 +522,7 @@ export function importRideoBlocking(
       const m = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(ar.trim());
       if (m && Math.abs(Number(m[1]) / Number(m[2]) - aspect) > 0.02)
         warnings.push(
-          `rideo's aspect ratio ${ar} differs from its resolution ${width}×${height}: the desk follows the resolution, as rideo's blocking does`,
+          `the settings' aspect ratio ${ar} differs from their resolution ${width}×${height}: the desk follows the resolution, as a SceneBlocking does`,
         );
     }
   }
@@ -557,18 +563,23 @@ export function importRideoBlocking(
   // opening marks: the blocking's (missing state: placed from the shots' planned layouts)
   const opening = new Map<string, RideoBlockingMark>();
   if (missing) {
-    for (const [id, mark] of layoutMarks(ordered, cast)) opening.set(id, mark);
-    warnings.push(
-      "rideo has no blocking for this clip (state 'missing'): the cast stands where the shots' planned layouts put them and every camera is solved",
-    );
+    for (const [id, mark] of openingMarks(ordered, cast)) opening.set(id, mark);
+    // a brief never has positions: saying so would be noise there
+    if (source === 'rideo')
+      warnings.push(
+        "the clip has no blocking (state 'missing'): the cast stands where the shots' planned layouts put them and every camera is solved",
+      );
   } else if (input.state === 'incomplete')
-    warnings.push("rideo's blocking of this clip is incomplete: its draft (completed by rideo) is imported");
+    warnings.push("the clip's blocking is incomplete: its draft (completed by its source) is imported");
   cast.forEach((id, i) => {
     if (opening.has(id)) return;
     const a = blockActor.get(id);
+    const at = a
+      ? { x: a.x, z: a.z }
+      : freeRowSpot(opening.values(), (i - (cast.length - 1) / 2) * LAYOUT_SPACING_M);
     opening.set(id, {
-      x: a?.x ?? (i - (cast.length - 1) / 2) * 1.2,
-      z: a?.z ?? 0,
+      x: at.x,
+      z: at.z,
       facingDeg: a?.facingDeg ?? 0,
       pose: a?.pose ?? 'stand',
       toX: null,
@@ -708,16 +719,16 @@ export function importRideoBlocking(
     for (const sh of oldShots)
       if (
         sh.camera &&
-        sh.external?.source === 'rideo' &&
+        sh.external?.source === source &&
         (!clip || !sh.external.clip || sh.external.clip === clip)
       )
         check(doc.getObject(sh.camera) ?? undefined, `the camera of shot '${sh.name}'`);
     if (changed.length)
       warnings.push(
         `${changed.join(', ')} ${changed.length > 1 ? 'were' : 'was'} changed in the desk since the last import ` +
-          "(keys, poses, holds, mounts, flights or a camera): this import rebuilt them from rideo's blocking, so " +
-          "those changes are gone. Stage them again, or before importing again write the desk's blocking to " +
-          'rideo (rideo_push writes it), so that the clip carries them',
+          "(keys, poses, holds, mounts, flights or a camera): this import rebuilt them from the clip's blocking, " +
+          "so those changes are gone. Stage them again, or before importing again export the desk's blocking " +
+          '(desk.export_rideo_blocking) and import that, so that the clip carries them',
       );
   }
 
@@ -945,7 +956,7 @@ export function importRideoBlocking(
   if (update)
     for (const s of oldShots)
       if (
-        s.external?.source === 'rideo' &&
+        s.external?.source === source &&
         s.external.shot &&
         (!clip || !s.external.clip || s.external.clip === clip)
       )
@@ -990,7 +1001,7 @@ export function importRideoBlocking(
       continuity: p.input.continuity,
       pre_roll: p.preRoll,
       external: {
-        source: 'rideo',
+        source,
         project: input.project ?? null,
         clip,
         shot: p.input.id,
@@ -1003,8 +1014,7 @@ export function importRideoBlocking(
   const disabled: RideoImportResult['disabled_shots'] = [];
   for (const s of oldShots) {
     if (importedIds.has(s.id)) continue;
-    const fromClip =
-      s.external?.source === 'rideo' && (!clip || !s.external.clip || s.external.clip === clip);
+    const fromClip = s.external?.source === source && (!clip || !s.external.clip || s.external.clip === clip);
     if (update && fromClip && s.enabled) {
       disabled.push({ id: s.id, name: s.name, rideo_shot: s.external?.shot ?? null });
       shotsOut.push({ ...s, enabled: false });
@@ -1139,7 +1149,7 @@ export function importRideoBlocking(
       from.set(p.id, 'refit');
       agrees.set(p.id, true);
       warnings.push(
-        `${p.name}: rideo's camera disagreed with the shot's planned layout; refitted (${fit.spec.angle})`,
+        `${p.name}: the blocked camera disagreed with the shot's planned layout; refitted (${fit.spec.angle})`,
       );
     } else {
       agrees.set(p.id, false);
@@ -1172,11 +1182,11 @@ export function importRideoBlocking(
   }
   if (boards.length)
     warnings.push(
-      `${boards.length} shot board(s) were drawn in rideo before this staging (${boards
+      `${boards.length} shot board(s) were drawn before this staging (${boards
         .map((b) => b.shot)
         .join(
           ', ',
-        )}): redraw them from the desk's camera views, or push those shots' references in 'camera' mode`,
+        )}): redraw them from the desk's camera views, or send those shots' references in 'camera' mode`,
     );
 
   // the cameras placed as rideo blocked them keep rideo's placement, for the export to give back
@@ -1222,17 +1232,21 @@ export function importRideoBlocking(
 
 // ---------------------------------------------------------------- the missing state
 
+/** How far apart (m) the planned sides put the cast, and the rows behind each other on a side. */
+export const LAYOUT_SPACING_M = 1.2;
+
 /**
- * Opening marks of a clip rideo has not blocked: each character on the side of the frame the first
- * shot that plans it puts it (left −1.2 m, centre 0, right +1.2 m, front to back in order), facing
- * the way it is planned to face a front camera; the others in a row, as rideo's emptyBlocking.
+ * Opening marks of a clip without blocking: each character on the side of the frame the first shot
+ * that plans it puts it (left −1.2 m, centre 0, right +1.2 m, front to back in order), facing the way
+ * it is planned to face a front camera. The others have none here: the import stands them in a row
+ * (as rideo's emptyBlocking).
  */
-function layoutMarks(
-  shots: readonly RideoShotInput[],
+export function layoutMarks(
+  shots: readonly Pick<RideoShotInput, 'layout'>[],
   cast: readonly string[],
 ): Map<string, RideoBlockingMark> {
   const out = new Map<string, RideoBlockingMark>();
-  const sideX = { left: -1.2, centre: 0, right: 1.2 } as const;
+  const sideX = { left: -LAYOUT_SPACING_M, centre: 0, right: LAYOUT_SPACING_M } as const;
   const facingDeg = { camera: 0, away: 180, left: 270, right: 90 } as const;
   const used = new Map<string, number>();
   for (const s of shots)
@@ -1242,7 +1256,7 @@ function layoutMarks(
       used.set(e.side, n + 1);
       out.set(e.characterId, {
         x: sideX[e.side],
-        z: -n * 1.2,
+        z: -n * LAYOUT_SPACING_M,
         facingDeg: facingDeg[e.facing],
         pose: 'stand',
         toX: null,
@@ -1252,18 +1266,55 @@ function layoutMarks(
   return out;
 }
 
+/**
+ * Opening marks of a clip without blocking, for every character of `cast` (in cast order): where the
+ * shots' planned layouts put them (layoutMarks), the others on free spots of the front row.
+ */
+export function openingMarks(
+  shots: readonly Pick<RideoShotInput, 'layout'>[],
+  cast: readonly string[],
+): Map<string, RideoBlockingMark> {
+  const out = layoutMarks(shots, cast);
+  cast.forEach((id, i) => {
+    if (out.has(id)) return;
+    const at = freeRowSpot(out.values(), (i - (cast.length - 1) / 2) * LAYOUT_SPACING_M);
+    out.set(id, { x: at.x, z: at.z, facingDeg: 0, pose: 'stand', toX: null, toZ: null });
+  });
+  return out;
+}
+
+/**
+ * A spot on the front row (z = 0) for a character without a mark: x `preferred`, else the nearest
+ * spot 1.2 m steps away (right first) that no mark taken holds (rideo's OVERLAP_M: two figures closer
+ * than 0.35 m stand in the same place).
+ */
+export function freeRowSpot(taken: Iterable<RideoBlockingMark>, preferred: number): { x: number; z: number } {
+  const marks = [...taken];
+  const free = (x: number) => marks.every((m) => Math.hypot(m.x - x, m.z) >= LAYOUT_SPACING_M / 2);
+  for (let k = 0; k <= 2 * RIDEO_MAX_ACTORS + marks.length; k++) {
+    const step = Math.ceil(k / 2) * (k % 2 ? 1 : -1);
+    const x = preferred + step * LAYOUT_SPACING_M;
+    if (free(x)) return { x, z: 0 };
+  }
+  return { x: preferred, z: 0 };
+}
+
 // ---------------------------------------------------------------- moves
 
 /**
  * The move a shot is keyed with and rideo prompts: its camera.move, else (rideo sets it so when the
  * blocking is saved) the move its blocked camera's end amounts to, else its planned movement's.
  */
-function shotMove(s: RideoShotInput, camera: RideoBlockingCamera | null, warnings: string[]): DeskMove {
+export function shotMove(
+  s: RideoShotInput,
+  camera: RideoBlockingCamera | null,
+  warnings: string[],
+): DeskMove {
   if (s.camera.move) {
     const said = camera?.end ? cameraMoveOf(placementOf(camera), placementOf(camera.end)) : null;
     if (said && said !== s.camera.move)
       warnings.push(
-        `shot ${s.index + 1}: rideo's camera move is ${s.camera.move} but its blocked camera's end is a ${said}: ${s.camera.move} is keyed (the export writes its end back)`,
+        `shot ${s.index + 1}: its camera move is ${s.camera.move} but its blocked camera's end is a ${said}: ${s.camera.move} is keyed (the export writes its end back)`,
       );
     return s.camera.move;
   }
@@ -1283,7 +1334,7 @@ function shotMove(s: RideoShotInput, camera: RideoBlockingCamera | null, warning
     if (Math.abs(side) > 1e-3) return side > 0 ? 'pan_right' : 'pan_left';
   }
   if (s.camera.movement === 'pan' && !panDirectionSaid(shotText(s)))
-    warnings.push(`shot ${s.index + 1}: rideo plans a pan without a direction; keyed as ${move}`);
+    warnings.push(`shot ${s.index + 1}: its movement is a pan without a direction; keyed as ${move}`);
   return move;
 }
 
@@ -1526,8 +1577,19 @@ function rideSpans(plans: readonly ShotPlan[]): { rider: string; mount: string; 
   return out.sort((a, b) => a.from - b.from);
 }
 
+/** What the span helpers read of a shot: its key frame, its end, its cast and words, its blocked camera. */
+export interface SpanShot {
+  keyFrame: number;
+  frameEnd: number;
+  camera: RideoBlockingCamera | null;
+  input: Pick<RideoShotInput, 'characterIds' | 'description' | 'action'>;
+}
+
 /** Consecutive shots (by plan index) whose cast includes `characterId`. */
-function holderSpans(plans: readonly ShotPlan[], characterId: string): { from: number; to: number }[] {
+export function holderSpans(
+  plans: readonly Pick<SpanShot, 'input'>[],
+  characterId: string,
+): { from: number; to: number }[] {
   const out: { from: number; to: number }[] = [];
   plans.forEach((p, i) => {
     if (!p.input.characterIds.includes(characterId)) return;
@@ -1539,9 +1601,9 @@ function holderSpans(plans: readonly ShotPlan[], characterId: string): { from: n
 }
 
 /** The frame spans a held prop is hidden in: before its first holder span, between spans, after the last. */
-function hiddenSpans(
+export function hiddenSpans(
   spans: readonly { from: number; to: number }[],
-  plans: readonly ShotPlan[],
+  plans: readonly Pick<SpanShot, 'keyFrame'>[],
   timelineStart: number,
 ): { from: number; to: number | null }[] {
   if (!spans.length) return [{ from: timelineStart, to: null }];
@@ -1667,7 +1729,7 @@ function animateActors(
 // ---------------------------------------------------------------- props
 
 /** The string and tail objects desk.tether_fly made for a flyer. */
-function tetherPartsOf(doc: SceneDoc, flyer: string): string[] {
+export function tetherPartsOf(doc: SceneDoc, flyer: string): string[] {
   return doc
     .listObjects()
     .filter((o) => o.custom_props?.desk_string_to === flyer || o.custom_props?.desk_tail_of === flyer)
@@ -1688,7 +1750,7 @@ function keepable(doc: SceneDoc, old: ObjectData | undefined, build: string): ol
  * cleared of its animation and of the import's holds, which the import keys anew, and put back on
  * its mark.
  */
-function buildProp(
+export function buildProp(
   doc: SceneDoc,
   p: RideoBlockingProp,
   elementName: string,
@@ -1764,7 +1826,7 @@ function buildProp(
  * (its footprint centred on the mark); an earlier import's landmark built the same way is kept (with
  * what was added to it since) and put on its mark.
  */
-function buildLandmark(
+export function buildLandmark(
   doc: SceneDoc,
   l: RideoBlockingLandmark,
   elementName: string | null,
@@ -1921,14 +1983,14 @@ function markCastInWater(
  * of those shots' camera (turned a little, so the string is seen), a kite is already up unless the
  * shot's text says it is launched.
  */
-function flyProp(
+export function flyProp(
   doc: SceneDoc,
   root: string,
-  holder: ActorPlan,
+  holder: Pick<ActorPlan, 'id' | 'kind'>,
   kind: 'kite' | 'balloon',
   spans: readonly { from: number; to: number }[],
-  plans: readonly ShotPlan[],
-  p: RideoBlockingProp,
+  plans: readonly SpanShot[],
+  p: Pick<RideoBlockingProp, 'id' | 'size'>,
 ): { frame_start: number; frame_end: number; string: string | null; tail: string[]; warnings: string[] } {
   const first = plans[spans[0].from];
   const last = plans[spans[spans.length - 1].to];

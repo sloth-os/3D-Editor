@@ -51,7 +51,7 @@ export interface ExportFile {
   pass?: PassName;
   /** The shot's id (clips, posters; 'range' for an export of a frame range, the manifest's shot id). */
   shot?: string;
-  /** The shot's id in rideo (imported shots). */
+  /** The shot's id where it came from (the host's, for a shot staged from a brief or imported). */
   external_shot?: string;
   bytes: number;
   frames?: number;
@@ -72,12 +72,6 @@ export interface ExportProgress {
   eta_s: number | null;
   /** The shot being rendered (id), or null. */
   shot: string | null;
-}
-
-/** Results of pushing an export's clips to rideo (rideo_push). */
-export interface ExportPush {
-  status: 'running' | 'done' | 'failed';
-  shots: { rideo_shot: string; resource: string | null; error: string | null }[];
 }
 
 /** An export job (persisted as `<EXPORT_DIR>/<project>/<job>/job.json`). */
@@ -102,7 +96,6 @@ export interface ExportJob {
   render?: ExportRenderInfo;
   warnings: string[];
   files: ExportFile[];
-  push?: ExportPush;
 }
 
 /** Options of {@link VideoExports} (tests). */
@@ -266,8 +259,8 @@ export class VideoExports {
    */
   async start(project: string, given: VideoExportInput): Promise<ExportJob> {
     const store = await this.ready();
-    // callers in code (the rideo bridge) get the same validation and defaults as MCP and REST, and
-    // a preset sets what export_video's arguments left out (its schema applies no defaults)
+    // callers in code get the same validation and defaults as MCP and REST, and a preset sets what
+    // export_video's arguments left out (its schema applies no defaults)
     const parsedParams = videoExportParamsSchema.safeParse(given);
     if (!parsedParams.success)
       throw new ToolError(

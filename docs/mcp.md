@@ -17,7 +17,7 @@ Contents:
 - [Conventions](#conventions)
 - [Tools](#tools): projects, inspection, operators, objects, materials, modifiers, mesh editing,
   animation and settings, undo, files, rendering, live editors, the director's desk (video
-  export, model store, rideo), resources
+  export, model store, staging a host's brief), resources
 - [Errors](#errors) and [limits](#limits)
 - [REST endpoints](#rest-endpoints)
 - [`scripts/mcp.mjs`](#scriptsmcpmjs-cli-and-module)
@@ -195,13 +195,13 @@ for long renders. The server's own waits for a browser editor outside path traci
 | Live editors     | `get_connected_clients`, `editor_command`                                                            |
 | Video export     | `export_video`, `export_status`, `cancel_export`, `list_exports`                                     |
 | Model store      | `store_search`, `store_add`                                                                          |
-| rideo            | `rideo_import`, `rideo_push`                                                                         |
+| Briefs           | `desk_stage_brief`, `desk_shot_results`                                                              |
 
 Every tool that changes the document is **one undo step** (`batch` included; `delete_project`
 cannot be undone). Read-only tools (`list_*`, `get_*`, `export_scene`, `render_image`,
-`render_animation`, `export_status`, `store_search`) change nothing and carry `readOnlyHint`;
-`delete_project` and `delete_objects` carry `destructiveHint`, and so do `cancel_export`, which can
-delete an export's files, and `rideo_push`, which writes to a rideo clip.
+`render_animation`, `export_status`, `store_search`, `desk_shot_results`) change nothing and carry
+`readOnlyHint`; `delete_project` and `delete_objects` carry `destructiveHint`, and so does
+`cancel_export`, which can delete an export's files.
 
 Results are JSON text, except where noted (images, embedded files). Failures are tool results with
 `isError: true`; see [Errors](#errors).
@@ -1650,20 +1650,21 @@ sends a progress notification every 5 s to requests with a progress token.
 
 The director's desk ([director-desk.md](director-desk.md)) is previs for AI video: actors, props,
 physics presets and shots (a camera and a range of scene frames each, solved from a shot
-description), with continuity checks. Its 24 `desk.*` operators and the 3 `store.*` operators run
+description), with continuity checks. Its 27 `desk.*` operators and the 3 `store.*` operators run
 through `run_operator` and `batch` like any other (`list_operators {category: "Director"}`, or
-`Actors`, `Model Store`), each one undo step; `desk.check` and `desk.export_rideo_blocking` change
-nothing. The errors `desk.check` reports are `line_crossed`, `subject_out_of_frame`,
-`camera_inside`, `missing_camera`, `tether_detached` and `walks_on_water`: fix them before exporting
-the shots. A kite is flown with `desk.tether_fly` after its anchor actor's moves, poses and mounts,
-since its string starts where the hand is then; `tether_detached` reports a string left behind, so
-fly it again. The tools below do the work that runs in the background or reaches other servers.
+`Actors`, `Model Store`), each one undo step; `desk.check`, `desk.shot_results` and
+`desk.export_rideo_blocking` change nothing. The errors `desk.check` reports are `line_crossed`,
+`subject_out_of_frame`, `camera_inside`, `missing_camera`, `tether_detached` and `walks_on_water`:
+fix them before exporting the shots. A kite is flown with `desk.tether_fly` after its anchor actor's
+moves, poses and mounts, since its string starts where the hand is then; `tether_detached` reports a
+string left behind, so fly it again. The tools below do the work that runs in the background,
+reaches other servers or takes a host's brief.
 
 #### Video export
 
 | Tool            | Arguments                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Returns                                                                                                                                                                                                                                                                                         |
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `export_video`  | `project`, `preset` (`rideo`: the clips `rideo_push` sends; the arguments given win), `shots` (every enabled shot), `frame_start`, `frame_end`, `camera` (without shots), `outputs` `{sequence, clips, posters, contact_sheet}`, `width`, `height` (render resolution × percentage; even, at most 3840 × 2160), `fps`, `quality` (`draft` / `standard` / `high`), `look` (`material` / `clay` / `solid`), `passes` (`beauty`, `depth`, `normal`, `mask`, `edges`, `pose`), `codec` (`h264` / `vp9`), `match_model_duration`, `label` | `{export, status, frames_total, estimate_s}` at once                                                                                                                                                                                                                                            |
+| `export_video`  | `project`, `preset` (`reference`: reference clips, alias `rideo`; the arguments win), `shots` (every enabled shot), `frame_start`, `frame_end`, `camera` (without shots), `outputs` `{sequence, clips, posters, contact_sheet}`, `width`, `height` (render resolution × percentage; even, at most 3840 × 2160), `fps`, `quality` (`draft` / `standard` / `high`), `look` (`material` / `clay` / `solid`), `passes` (`beauty`, `depth`, `normal`, `mask`, `edges`, `pose`), `codec` (`h264` / `vp9`), `match_model_duration`, `label` | `{export, status, frames_total, estimate_s}` at once                                                                                                                                                                                                                                            |
 | `export_status` | `export`, `wait_s` (0–50: waits for the export to finish or change status)                                                                                                                                                                                                                                                                                                                                                                                                                                                           | The job: `status` (`queued`, `running`, `encoding`, `done`, `failed`, `cancelled`), `progress {frames_done, frames_total, fraction, fps, eta_s, shot}`, `render`, `warnings`, `error`, `error_code`, `files` (`name`, `kind`, `pass`, `shot`, `bytes`, `frames`, `duration_s`, `url`, `sha256`) |
 | `cancel_export` | `export`, `delete_files` (false)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | The job as it was: a queued or running one is cancelled, a finished one left as it is; `delete_files` deletes any job and its files, a finished one too                                                                                                                                         |
 | `list_exports`  | `project` (default: every project)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | The jobs, newest first                                                                                                                                                                                                                                                                          |
@@ -1672,12 +1673,13 @@ An export renders a snapshot of the project taken when it was asked for (later e
 in the render processes and encodes it with ffmpeg: an MP4 of the whole sequence, a frame-exact clip
 per shot, posters, a contact sheet, the passes asked for and `manifest.json`. One export renders at
 a time; the others wait (at most `EXPORT_MAX_QUEUED`). `export_status` with `wait_s` returns when
-the job changes status, so call it in a loop. `preset: 'rideo'` makes what `rideo_push` sends: draft
-clips in the clay look with the beauty, depth and pose passes at the render resolution at 100 %
-(rideo's after `rideo_import`), without the sequence, posters or contact sheet. The `url` of each
-file is a REST path (`GET /api/projects/:id/video-exports/:export/files/<name>`, with `AUTH_TOKEN`
-when one is set). Without ffmpeg the server refuses with `FFMPEG_UNAVAILABLE`; parameters, quality
-presets, measured speeds and the manifest are in [video-export.md](video-export.md).
+the job changes status, so call it in a loop. `preset: 'reference'` makes reference clips for a
+video model (`'rideo'` is its former name): draft clips in the clay look with the beauty, depth and
+pose passes at the render resolution at 100 %, without the sequence, posters or contact sheet. The
+`url` of each file is a REST path (`GET /api/projects/:id/video-exports/:export/files/<name>`, with
+`AUTH_TOKEN` when one is set). Without ffmpeg the server refuses with `FFMPEG_UNAVAILABLE`;
+parameters, quality presets, measured speeds and the manifest are in
+[video-export.md](video-export.md).
 
 #### Model store
 
@@ -1693,21 +1695,23 @@ on the ground, with its licence and author on the root. A model whose licence or
 the download fails with `NOT_DOWNLOADABLE`, a provider without its key with `NEEDS_KEY`. See
 [model-store.md](model-store.md).
 
-#### rideo
+#### Briefs
 
-| Tool           | Arguments                                                                                                                                                                                                                                       | Returns                                                                                                                                                                      |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `rideo_import` | `rideo {url, token, project, clip}`, `project` (default: named after the clip), `cast_overrides`, `use_store_models`, `model_limits {min_s, max_s}`                                                                                             | Our project, our shot id per rideo shot, `issues`, `rideo_issues`, `blocking_state`, `boards_to_redraw`, `warnings`; one undo step                                           |
-| `rideo_push`   | `project`, `export` (made with `export_video {preset: 'rideo'}`), `rideo {url, token, project, clip}`, `shots`, `mode` (`motion` / `pose` / `camera`), `pass` (per mode: `motion` beauty, `pose` pose, `camera` depth), `write_blocking` (true) | Per shot the rideo resource and mode or the error; `blocking` (written, rideo's state, lines that differ, `plan_mismatch`), `stale`, `moves`, `boards_to_redraw`, `warnings` |
+| Tool                | Arguments                                                                                                | Returns                                                                                                                                                                                                                                                                                                                            |
+| ------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `desk_stage_brief`  | `brief` (a host's SceneBrief, validated whole), `project` (default: a new project named after the brief) | `project {id, name}`, `action` (`staged` or `updated`), `scene_id`, `hash`, `shots` (per brief shot the desk shot, its frames and camera), `cast` (actor, kind and why), `props` (and who holds them), `changes` (an update's `BriefChanges`, else null), `solved`, `warnings`, `issues` (with the host's shot ids); one undo step |
+| `desk_shot_results` | `project`, `shots` (the host's shot ids; default every staged shot)                                      | Per shot `shotId`, `deskShotId`, `frames`, `durationSec`, `camera {lensMm, move}`, `line`, `moves`, `planAgrees`, `issues` (errors and warnings)                                                                                                                                                                                   |
 
-`rideo_import` reads a clip of the AI video studio rideo (`RIDEO_URL` and `RIDEO_TOKEN` by default;
-a call that names another server brings its own token) and builds or updates a project from it:
-importing again rebuilds the actors, props, landmarks and shot cameras it imported from rideo's
-blocking, and its warnings name those changed in the desk since the last import (push first, or
-stage them again). `rideo_push` writes the project's blocking to the clip and sends a finished
-export's clips as the shots' reference videos: each shot its clip of the pass its mode sends, or the
-shot fails (export with `export_video {project, preset: 'rideo'}`, which has every pass the modes
-send). The recipes are in [rideo.md](rideo.md).
+`desk_stage_brief` stages a host's scene brief (the desk embed protocol's `SceneBrief`:
+[embedding.md](embedding.md)) in a new project, or in the one `project` names when it has no shots,
+as described in [director-desk.md](director-desk.md#staging-from-a-brief): the set and its sun, the
+cast as actors, the props, a shot per brief shot with its camera solved. Called again with a later
+brief of the same scene on that project, it updates the staging instead and keeps what did not
+change, cameras and actors moved by hand included. A brief that does not validate, a project staged
+from another scene, one holding shots of its own, or a new project's name that another project has
+are refused (`INVALID_PARAMS`). `desk_shot_results` reports each staged shot as the contract's
+`ShotResult` without its files; render the references with
+`export_video {project, preset: 'reference'}`.
 
 ### Resources
 
@@ -1732,14 +1736,13 @@ projects than all adds `project_note` (see [Projects](#projects)) to the JSON af
 as JSON of its own after a plain message. A message never spans lines: line breaks in the names it
 quotes are written as `\n`, `\r` or `\u2028`, as in JSON.
 
-The video export, model store and rideo tools fail with codes of their own, written as JSON
-`{"code": …}` on the line after the message: `UNAVAILABLE` (not set up on this server: no render
-processes, no rideo server), `FFMPEG_UNAVAILABLE` (no ffmpeg with libx264), `NEEDS_KEY` (a provider
-or rideo needs a key or token), `NOT_DOWNLOADABLE` (the licence or provider does not allow the
-download), `QUEUE_FULL` (`EXPORT_MAX_QUEUED` exports already wait) and `UPSTREAM` (a model provider
-or rideo failed or did not answer). Their `OUT_OF_MEMORY` failures carry that line too; their
-unknown projects, exports, shots and models (`NOT_FOUND`) and invalid arguments (`INVALID_PARAMS`)
-are plain messages without it.
+The video export and model store tools fail with codes of their own, written as JSON `{"code": …}`
+on the line after the message: `UNAVAILABLE` (not set up on this server: no render processes),
+`FFMPEG_UNAVAILABLE` (no ffmpeg with libx264), `NEEDS_KEY` (a provider needs a key),
+`NOT_DOWNLOADABLE` (the licence or provider does not allow the download), `QUEUE_FULL`
+(`EXPORT_MAX_QUEUED` exports already wait) and `UPSTREAM` (a model provider failed or did not
+answer). Their `OUT_OF_MEMORY` failures carry that line too; their unknown projects, exports, shots
+and models (`NOT_FOUND`) and invalid arguments (`INVALID_PARAMS`) are plain messages without it.
 
 | Message (abridged)                                                                                                                                                                    | Cause                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1837,7 +1840,6 @@ driver) and the `problems` list of `get_scene`.
 | `export_video`                             | Even sizes up to 3840 × 2160, 120 fps and 100,000 frames; one export renders at a time and `EXPORT_MAX_QUEUED` (8) may wait; `export_status` waits up to 50 s                                                                       |
 | Video exports on disk                      | `EXPORT_MAX_MB` (20480) in all, each kept `EXPORT_TTL_HOURS` (168) after it ends                                                                                                                                                    |
 | `store_search` / `store_add`               | 50 results a page, providers answer within 5 s; 200 MB and 512 files per downloaded model                                                                                                                                           |
-| `rideo_push`, previs jobs                  | Clips of at most 256 MB; 4 previs jobs at once, the last 100 kept (in `DATA_DIR`)                                                                                                                                                   |
 
 ## REST endpoints
 
@@ -1862,8 +1864,6 @@ The same server offers plain HTTP endpoints under `/api` (protected by `AUTH_TOK
 | `GET /api/store/search`                       | `query`, `category`, `providers` (comma-separated), `limit` (1–50), `cursor`                                                                |
 | `GET /api/store/models/:model`                | One model (`?download=1` downloads its files and lists them); `…/thumbnail`, `…/files/<path>`                                               |
 | `POST /api/projects/:id/store`                | Insert a store model (the arguments of `store_add` without `project`); `{result, entry, warnings}`                                          |
-| `POST /api/rideo/previs`                      | Import a rideo clip, export it as a draft and push its clips, as one job (202)                                                              |
-| `GET /api/rideo/previs/:job`                  | The previs job (`?wait=` 0–50 s)                                                                                                            |
 
 Project names are unique ignoring letter case, as for the MCP tools: `POST` and `PATCH` answer 409
 with the error, the holder's `id` and all matching `ids` when another project has the name.
@@ -1900,11 +1900,11 @@ and 503 with `{"error": "render failed: interrupted: …", "code": "INTERRUPTED"
 `Retry-After: 1` when another render that shared its render process ran it out of memory (run it
 again); 501 when a format or engine is not available in the build; 500 for other failures.
 
-The video export, model store and rideo routes answer failures as `{error, code}`: 503 for
+The video export and model store routes answer failures as `{error, code}`: 503 for
 `UNAVAILABLE`, `FFMPEG_UNAVAILABLE` and `UPSTREAM`, 409 for `QUEUE_FULL` and `NOT_DOWNLOADABLE`, 400
-for `NEEDS_KEY` and invalid parameters, 404 for unknown projects, shots, exports, models and jobs,
-507 for `OUT_OF_MEMORY`; [video-export.md](video-export.md), [model-store.md](model-store.md) and
-[rideo.md](rideo.md) describe them.
+for `NEEDS_KEY` and invalid parameters, 404 for unknown projects, shots, exports and models, 507 for
+`OUT_OF_MEMORY`; [video-export.md](video-export.md) and [model-store.md](model-store.md) describe
+them.
 
 ## `scripts/mcp.mjs` (CLI and module)
 

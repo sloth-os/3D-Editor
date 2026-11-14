@@ -3,26 +3,34 @@ import { DESK_MOVES, type DeskMove } from '../../doc/types';
 import { ACTOR_KINDS } from '../characters/types';
 
 /*
- * rideo's SceneBlocking v1 (rideo packages/shared/src/schemas/blocking.ts, zod 4) mirrored field for
- * field, with the defaults and ranges rideo validates with, so that what the desk exports is what
- * rideo's `PUT …/clips/:clipId/blocking` accepts and what rideo stores parses here. rideo's
- * coordinates: metres, y up, the floor at y = 0, x to the right, z towards the audience; a facing of
- * 0° looks at the audience (+z), 90° to the right (+x). The editor's axes are rideo (x, −z, y).
+ * SceneBlocking v1: a scene's blocking as JSON (the set, the cast's marks per shot, props, landmarks
+ * and blocked cameras), the format rideo defined for its blocking documents, which the desk keeps as
+ * its own interchange format for agents that hold such JSON (desk.import_rideo_blocking reads it,
+ * desk.export_rideo_blocking writes it). Field for field as rideo had it, with its defaults; ids are
+ * any host's (HOST_ID_PATTERN, the embed contract's Id) and the lists may be as long as a SceneBrief's
+ * (16 characters, 64 props and landmarks). Coordinates: metres, y up, the floor at y = 0, x to the
+ * right, z towards the audience; a facing of 0° looks at the audience (+z), 90° to the right (+x). The
+ * editor's axes are (x, −z, y).
  *
  * Then the shared rules the import and export follow (markFor, POSE_HEIGHT, the cast palette,
  * landmark colours) and the input of the import: the clip's shots, the cast, the elements, the
- * project settings and the video model's duration limits, in rideo's own field names.
+ * project settings and the video model's duration limits, in the format's own field names.
  */
 
-// ---------------------------------------------------------------- ids (rideo packages/shared/src/ids.ts)
+// ---------------------------------------------------------------- ids
 
-/** rideo ids: a 3-letter prefix, '_', 10–32 lower-case base32 characters ('chr_…', 'sht_…', 'ele_…'). */
-export const RIDEO_ID_PATTERN = /^[a-z]{3}_[0-9a-z]{10,32}$/;
-export const RideoIdSchema = z.string().regex(RIDEO_ID_PATTERN, 'invalid id');
+/**
+ * A host's ids (characters, elements, shots, scenes): 1–100 characters, a letter or digit first, then
+ * letters, digits and `_ . : -` (the embed contract's Id; rideo's 'chr_…', 'sht_…', 'ele_…' are such ids).
+ */
+export const HOST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$/;
+/** The ids a SceneBlocking names its characters and elements by: {@link HOST_ID_PATTERN}. */
+export const RIDEO_ID_PATTERN = HOST_ID_PATTERN;
+export const RideoIdSchema = z.string().regex(HOST_ID_PATTERN, 'invalid id');
 export const RideoIsoDateSchema = z.string().min(10);
 
-/** Whether `v` is a rideo id. */
-export const isRideoId = (v: unknown): v is string => typeof v === 'string' && RIDEO_ID_PATTERN.test(v);
+/** Whether `v` is a host id ({@link HOST_ID_PATTERN}). */
+export const isRideoId = (v: unknown): v is string => typeof v === 'string' && HOST_ID_PATTERN.test(v);
 
 // ---------------------------------------------------------------- SceneBlocking v1
 
@@ -178,7 +186,7 @@ export const RideoBlockingSetSchema = z.object({
       elevationDeg: z.number().min(2).max(90).default(40),
     })
     .default({ azimuthDeg: 135, elevationDeg: 40 }),
-  landmarks: z.array(RideoBlockingLandmarkSchema).max(24).default([]),
+  landmarks: z.array(RideoBlockingLandmarkSchema).max(64).default([]),
 });
 export type RideoBlockingSet = z.infer<typeof RideoBlockingSetSchema>;
 
@@ -195,17 +203,17 @@ export const RideoSceneBlockingSchema = z.object({
     sun: { azimuthDeg: 135, elevationDeg: 40 },
     landmarks: [],
   }),
-  actors: z.array(RideoBlockingActorSchema).max(8).default([]),
-  props: z.array(RideoBlockingPropSchema).max(16).default([]),
+  actors: z.array(RideoBlockingActorSchema).max(16).default([]),
+  props: z.array(RideoBlockingPropSchema).max(64).default([]),
   /** By shot id. */
   shots: z.record(z.string(), RideoBlockingShotSchema).default({}),
 });
 export type RideoSceneBlocking = z.infer<typeof RideoSceneBlockingSchema>;
 
-/** rideo's limits on a blocking's lists. */
-export const RIDEO_MAX_ACTORS = 8;
-export const RIDEO_MAX_PROPS = 16;
-export const RIDEO_MAX_LANDMARKS = 24;
+/** The limits on a blocking's lists (a SceneBrief's: 16 characters, 64 elements). */
+export const RIDEO_MAX_ACTORS = 16;
+export const RIDEO_MAX_PROPS = 64;
+export const RIDEO_MAX_LANDMARKS = 64;
 
 // ---------------------------------------------------------------- shared rules (rideo blocking/index.ts)
 
@@ -401,5 +409,10 @@ export const RideoImportInputSchema = z.object({
   preRollFrames: z.number().int().min(0).max(1000).default(12),
   /** Update a scene imported from the same clip in place (false: add everything anew). */
   update: z.boolean().default(true),
+  /**
+   * Where the clip comes from, kept as its shots' external source: 'rideo' for a SceneBlocking v1
+   * clip, 'host' for a SceneBrief an embedding host gave (desk/brief stageBrief).
+   */
+  source: z.enum(['rideo', 'host']).default('rideo'),
 });
 export type RideoImportInput = z.infer<typeof RideoImportInputSchema>;

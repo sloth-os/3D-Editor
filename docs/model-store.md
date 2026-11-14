@@ -172,8 +172,8 @@ Built-in models are built by `store.add`; external ones are downloaded and inser
    `dimensions_m`, else keeps the file's size when it is believable for the model's category; a
    model ten times off or more is read as centimetres, inches or millimetres, or scaled to the usual
    size of its category, with a warning naming the size measured and the scale applied. The scale is
-   the root's, so a model in micrometres made 1 m tall is shown at 1e-6; the desk, video export and
-   rideo push go by the size it is shown at, so it is drawn, framed and checked as any other;
+   the root's, so a model in micrometres made 1 m tall is shown at 1e-6; the desk and the video
+   export go by the size it is shown at, so it is drawn, framed and checked as any other;
 4. stands it on the ground at `location` (default the 3D cursor), turned by `rotation_deg` about Z;
 5. records the licence and attribution on the root.
 
@@ -231,12 +231,12 @@ CA in `NODE_EXTRA_CA_CERTS` when it intercepts TLS):
 
 ```bash
 NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://proxy:3128 \
-  NO_PROXY=localhost,127.0.0.1,rideo.internal,dav.internal npm start
+  NO_PROXY=localhost,127.0.0.1,dav.internal,otel.internal npm start
 ```
 
-The variable applies to every outgoing request of the server, not only the store's: rideo
-(`RIDEO_URL`), WebDAV storage (`WEBDAV_URL`) and the OTLP export (`OTEL_EXPORTER_OTLP_ENDPOINT`)
-go through the proxy too, so list the hosts the server reaches directly in `NO_PROXY` (above,
-`rideo.internal` and `dav.internal` stand for yours). Node prints a warning that its proxy agent
-is experimental; the store works the same. Without it, the external providers report `error` (the
-built-in models keep working).
+The variable applies to every outgoing request of the server, not only the store's: WebDAV
+storage (`WEBDAV_URL`) and the OTLP export (`OTEL_EXPORTER_OTLP_ENDPOINT`) go through the proxy
+too, so list the hosts the server reaches directly in `NO_PROXY` (above, `dav.internal` and
+`otel.internal` stand for yours). Node prints a warning that its proxy agent is experimental; the
+store works the same. Without it, the external providers report `error` (the built-in models keep
+working).

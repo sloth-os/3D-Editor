@@ -16,7 +16,6 @@ import { registerSystemRoutes } from './api/system';
 import { registerOtlpRoutes } from './api/otlp';
 import { registerVideoExportRoutes } from './api/video-exports';
 import { registerStoreRoutes } from './api/store';
-import { registerRideoRoutes } from './api/rideo';
 import { closeServerServices, createServerServices, type ServerServices } from './services';
 import { hasFfmpeg } from './video/ffmpeg';
 import { registerDavProxy, registerWebDAVMethods, WEBDAV_EXTRA_METHODS } from './dav/proxy';
@@ -43,7 +42,7 @@ export interface AppOptions {
   keepaliveMs?: number;
   /** fetch used for telemetry forwarding and WebDAV persistence (tests). */
   fetch?: typeof fetch;
-  /** fetch used by the model store's providers and the rideo bridge (tests; default: the global fetch). */
+  /** fetch used by the model store's providers (tests; default: the global fetch). */
   serviceFetch?: typeof fetch;
   /** Disable Node default process metrics (tests creating many apps). */
   defaultMetrics?: boolean;
@@ -185,7 +184,6 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
   registerProjectRoutes(app, rooms);
   registerVideoExportRoutes(app, services);
   registerStoreRoutes(app, services);
-  registerRideoRoutes(app, services);
   app.get('/sync/:projectId', async (_request, reply) =>
     reply
       .code(426)
@@ -230,8 +228,8 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
 
   app.addHook('preClose', async () => {
     shuttingDown = true;
-    // export jobs and their ffmpeg processes, downloads and rideo requests stop before the
-    // projects are saved and closed
+    // export jobs and their ffmpeg processes and model downloads stop before the projects are
+    // saved and closed
     await Promise.allSettled([mcp?.close(), sync.close(), closeServerServices(services)]);
   });
   app.addHook('onClose', async () => {

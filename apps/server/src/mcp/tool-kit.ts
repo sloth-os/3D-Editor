@@ -15,7 +15,6 @@ import type { Renderer } from '../render';
 import type { RenderStore } from '../render/store';
 import type { VideoExports } from '../video';
 import type { ModelStore } from '../store';
-import type { RideoBridge } from '../rideo';
 import type { AgentSession } from './agent';
 import type { HistoryLimits } from './history';
 
@@ -23,7 +22,7 @@ import type { HistoryLimits } from './history';
  * What the MCP tools of every module share: the context they run in, the type of the registrar
  * that adds a tool (tools.ts `tool()`), the argument schemas used by many tools and the
  * annotations. tools.ts registers the editor's tools and hands its registrar to the feature
- * modules (video-tools.ts, store-tools.ts, rideo-tools.ts), which register theirs with it.
+ * modules (video-tools.ts, store-tools.ts, brief-tools.ts), which register theirs with it.
  *
  * Registration must not read the context's members: a test registers every tool with a context
  * that holds only `historyLimits` (docs-history.test.ts). Handlers read `ctx` when they run.
@@ -46,8 +45,6 @@ export interface ToolContext {
   exports: VideoExports;
   /** The model store (store_search, store_add). */
   store: ModelStore;
-  /** The bridge to a rideo server (rideo_import, rideo_push). */
-  rideo: RideoBridge;
   /** Limits of the agents' undo histories (for descriptions and notes). */
   historyLimits: HistoryLimits;
 }

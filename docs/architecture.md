@@ -67,14 +67,15 @@ renderers and the importers/exporters are isomorphic (no DOM, no Node APIs).
 | MCP tools, instructions, scene summaries, operator groups, editor commands, bounded undo histories                                                                                    | `apps/server/src/mcp`                                         |
 | Render processes (renders and exports), their CPU priority, the server's memory checks                                                                                                | `apps/server/src/render`                                      |
 | REST API, WebDAV proxy, observability                                                                                                                                                 | `apps/server/src/api`, `dav`, `observability`                 |
-| Director's desk: shots and their timing, camera solver, plan fitting, the 180° line, camera moves, continuity checks, set builder, rideo blocking import and export                   | `packages/core/src/desk`                                      |
+| Director's desk: shots and their timing, camera solver, plan fitting, the 180° line, camera moves, continuity checks, set builder, brief staging, SceneBlocking import and export     | `packages/core/src/desk`                                      |
 | Actors: mannequin rigs, poses, gaits, locomotion, holding and riding, keypoints                                                                                                       | `packages/core/src/desk/characters`                           |
 | Physics presets: start frames, drop, throw, push, bake, kites and balloons, vehicles                                                                                                  | `packages/core/src/desk/physics`                              |
 | Built-in model catalog, catalog search, store inserts                                                                                                                                 | `packages/core/src/store`                                     |
 | Director workspace, Asset Browser, Export Video window, Follow Shots                                                                                                                  | `apps/web/src/ui/director`, `ui/assets`, `viewport`           |
-| Video export jobs: plan, frame loop, ffmpeg, passes, manifest, memory                                                                                                                 | `apps/server/src/video`                                       |
+| Video export of server and browser: parameters, plan, desk frames, passes, frame loop, manifest, estimates                                                                            | `packages/core/src/export`                                    |
+| Browser video export: render workers, WebCodecs encoders, MP4/WebM muxing, files, memory plan                                                                                         | `apps/web/src/export`                                         |
+| Video export jobs: queue, render processes, ffmpeg encoders, memory                                                                                                                   | `apps/server/src/video`                                       |
 | Model store: providers, search, downloads, cache, thumbnails                                                                                                                          | `apps/server/src/store`                                       |
-| rideo bridge: client, import, push, previs jobs                                                                                                                                       | `apps/server/src/rideo`                                       |
 
 ## Document model
 
@@ -877,6 +878,32 @@ Rigid bodies gained a start frame (`start_frame`, `initial_*_velocity`, `inherit
 it a body follows its animation, parent or constraints, and from it it is simulated with the
 velocity it had.
 
+## Video export
+
+Two exporters write the same files from the same code. `packages/core/src/export` holds what
+they share, free of Node and the DOM: the parameters and presets (one zod schema for the MCP tool,
+the REST body and the browser), the plan (shots, size, frames, padding), the desk frame
+(`renderDeskFrame`: beauty and passes from one RASTER evaluation, the subject boxes and camera of
+the metadata), the render document of a snapshot (`createExportRenderDocument`,
+`measureDeskShot`, `simulateRigidBodies`, `renderExportFrame`), the passes and their palette, the
+ordered frame loop (`renderInOrder`: frames rendered ahead on every thread within a count and a
+byte cap, written in order, a thread's death handled), the manifest and the memory estimates. Its
+errors carry the codes `INVALID_PARAMS` and `NOT_FOUND`, which each exporter maps to its own.
+
+- **The server** (`apps/server/src/video`, [server](#server)) leases render processes, which run
+  `renderExportFrame` on the snapshot, and pipes each stream's raw frames into an ffmpeg process.
+- **The browser** (`apps/web/src/export`) runs the same functions in module Web Workers
+  (`export.worker.ts`; one per core that the tab's memory holds, at most 8), each holding the
+  snapshot (a Yjs update applied once). The first worker plans, measures the shots, simulates
+  the rigid bodies once per segment for every worker, and makes the contact sheet and the
+  manifest; every worker converts its frames for the page (I420 in BT.709 limited range for
+  video, PNG for the lossless passes, posters, stills and tiles). The page (`engine.ts`) runs
+  `renderInOrder` over the workers, encodes each stream with one WebCodecs `VideoEncoder`
+  (`encode.ts`; key frames at every shot start), muxes the chunks with mediabunny into the
+  sequence and the clip of their shot without encoding again (`mux.ts`), and writes the files to
+  the Origin Private File System or memory with their SHA-256 (`store.ts`). The Export Video window
+  uses it by default and the server as a second choice ([video-export.md](video-export.md)).
+
 ## Server
 
 - **Sync rooms** (`apps/server/src/sync`): one room per open project holds a server-side replica of
@@ -895,28 +922,30 @@ velocity it had.
   Scene summaries (`scene-summary.ts`) report evaluated values next to stored ones. See
   [mcp.md](mcp.md).
 - **REST API** (`apps/server/src/api`): project listing and management, snapshots, exports,
-  `render.png` and stored renders, video exports, the model store, rideo previs jobs,
-  `/api/config`, `/healthz`, `/readyz`, `/metrics`. Service failures answer `{error, code}`
+  `render.png` and stored renders, video exports, the model store, `/api/config`, `/healthz`,
+  `/readyz`, `/metrics`. Service failures answer `{error, code}`
   (`api/errors.ts`).
 - **Video export** (`apps/server/src/video`): background jobs, one rendering at a time (first
   come, first served, at most `EXPORT_MAX_QUEUED` waiting), each on a snapshot of the project
   taken when it was asked for and stored next to its `job.json` in `EXPORT_DIR`. A job measures
   each shot (depth range, shadow box, ambient occlusion reach), decides from the memory available
   how many render processes it leases (`video/memory.ts`), renders segments of at most 200 frames
-  (beauty and passes from one RASTER evaluation per frame, `render/desk.ts`), writes the frames in
-  order into one ffmpeg process per stream, cuts the clips by stream copy at the keyframes forced
-  at every shot start, and writes posters, the contact sheet and `manifest.json`
-  ([video-export.md](video-export.md)).
+  (beauty and passes from one RASTER evaluation per frame, core's `export/desk-frame.ts`), writes
+  the frames in order into one ffmpeg process per stream, cuts the clips by stream copy at the
+  keyframes forced at every shot start, and writes posters, the contact sheet and `manifest.json`
+  ([video-export.md](video-export.md), [video export](#video-export) below).
 - **Model store** (`apps/server/src/store`): provider adapters (built-in, Khronos, Poly Haven,
   Sketchfab, Poly Pizza, JSON catalogs) searched in parallel and merged with an opaque cursor;
   lazily fetched indexes cached for 24 hours; downloads through a guarded fetch (public hosts
   only), checked and kept in a least-recently-used disk cache; inserts run the core operators
   `store.add` and `store.insert_files` in the project ([model-store.md](model-store.md)).
-- **rideo bridge** (`apps/server/src/rideo`): a client of rideo's REST API, the import
-  (`desk.import_rideo_blocking` from rideo's documents), the push (blocking written back, clips
-  uploaded once per content, shots patched) and the previs jobs, each kept in
-  `DATA_DIR/rideo-previs` as it changes so that its status answers after a restart
-  ([rideo.md](rideo.md)).
+- **Brief tools** (`apps/server/src/mcp/brief-tools.ts`): `desk_stage_brief` and `desk_shot_results`
+  give agents what the embedded desk does in the browser with a host's scene brief: they run the
+  core operators `desk.stage_brief`, `desk.update_from_brief` and `desk.shot_results`
+  (`packages/core/src/desk/brief`, pure, so the same code runs in a web worker) in the agent's
+  project, each change one undo step. The server talks to no host: a brief comes in as a tool
+  argument, and the references go out through `export_video`
+  ([director-desk.md](director-desk.md#staging-from-a-brief), [embedding.md](embedding.md)).
 
 ## Persistence & sync
 

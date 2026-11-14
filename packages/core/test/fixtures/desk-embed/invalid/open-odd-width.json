@@ -1,0 +1,89 @@
+{
+  "type": "open",
+  "scene": {
+    "id": "clp_0123456789abcdef",
+    "name": "Kite Day: the meadow",
+    "fps": 24,
+    "width": 1281,
+    "height": 720,
+    "set": {
+      "description": "A wide green meadow on a breezy afternoon, a pond on the left, an oak tree behind.",
+      "interior": false,
+      "timeOfDay": "afternoon"
+    },
+    "cast": [
+      {
+        "id": "chr_0123456789mira",
+        "name": "Mira",
+        "description": "A girl of 8 in a yellow raincoat.",
+        "kind": "child",
+        "heightM": 1.28
+      },
+      {
+        "id": "chr_0123456789pipd",
+        "name": "Pip",
+        "description": "A golden retriever puppy.",
+        "kind": "dog",
+        "heightM": null
+      }
+    ],
+    "elements": [
+      {
+        "id": "ele_0123456789mead",
+        "name": "The meadow",
+        "description": "Long grass, wild flowers.",
+        "kind": "location"
+      },
+      {
+        "id": "ele_0123456789kite",
+        "name": "Red kite",
+        "description": "A red diamond kite with a long tail.",
+        "kind": "prop"
+      }
+    ],
+    "shots": [
+      {
+        "id": "sht_0123456789aaaa",
+        "index": 0,
+        "durationSec": 3,
+        "description": "Wide: Mira runs across the meadow with the kite, Pip chasing.",
+        "action": "Mira runs left to right.",
+        "castIds": ["chr_0123456789mira", "chr_0123456789pipd"],
+        "elementIds": ["ele_0123456789mead", "ele_0123456789kite"],
+        "framing": "wide",
+        "movement": "tracking",
+        "move": null,
+        "lensMm": null,
+        "continuity": "cut",
+        "layout": [
+          {
+            "castId": "chr_0123456789mira",
+            "side": "left",
+            "facing": "right"
+          },
+          {
+            "castId": "chr_0123456789pipd",
+            "side": "right",
+            "facing": "left"
+          }
+        ]
+      },
+      {
+        "id": "sht_0123456789bbbb",
+        "index": 1,
+        "durationSec": 2.5,
+        "description": "Close-up: Mira looks up at the kite.",
+        "action": "",
+        "castIds": ["chr_0123456789mira"],
+        "elementIds": [],
+        "framing": "close_up",
+        "movement": "static",
+        "move": "push_in",
+        "lensMm": 85,
+        "continuity": "cut",
+        "layout": []
+      }
+    ]
+  },
+  "state": null
+}

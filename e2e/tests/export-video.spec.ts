@@ -2,10 +2,12 @@ import { test, expect, type Page } from '@playwright/test';
 import { PLAIN, callJson, mcpConnect, mcpEndSession, menuPath, openProject, setNumberField } from './helpers';
 
 /*
- * The Export Video window against the real server: a scene with two shots exported as a 160×90
- * draft; the window follows the job and lists its files, whose MP4 links the server serves.
- * Skipped when the server found no ffmpeg (features.videoExport false), unless FFMPEG_REQUIRED=1
- * (CI installs ffmpeg for the e2e job): then a missing ffmpeg fails the test.
+ * The Export Video window's server export against the real server (the window exports on this
+ * device by default: browser-export.spec.ts; the server is the second choice where it can export
+ * the project): a scene with two shots exported as a 160×90 draft; the window follows the job and
+ * lists its files, whose MP4 links the server serves. Skipped when the server found no ffmpeg
+ * (features.videoExport false), unless FFMPEG_REQUIRED=1 (CI installs ffmpeg for the e2e job): then
+ * a missing ffmpeg fails the test.
  */
 
 /** Saves a screenshot when E2E_SCREENSHOT_DIR is set (visual checks outside CI). */
@@ -42,6 +44,10 @@ test.describe('Export Video', () => {
     await menuPath(page, ['Render', 'Export Video…']);
     const dialog = page.getByTestId('export-video-dialog');
     await expect(dialog).toBeVisible();
+    // this device is the default; the server holds the project and has ffmpeg: it is offered
+    await expect(page.getByTestId('export-video-where-device')).toHaveAttribute('aria-pressed', 'true');
+    await page.getByTestId('export-video-where-server').click();
+    await expect(page.getByTestId('export-video-where-server')).toHaveAttribute('aria-pressed', 'true');
     await expect(page.getByTestId('export-video-shots-all')).toHaveAttribute('aria-pressed', 'true');
     await page.getByTestId('export-video-resolution').selectOption('custom');
     await setNumberField(page, 'export-video-width', 160);

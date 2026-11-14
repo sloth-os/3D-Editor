@@ -1,0 +1,15 @@
+{
+  "type": "opened",
+  "sceneId": "clp_0123456789abcdef",
+  "source": "state",
+  "changes": {
+    "added": ["sht_0123456789cccc"],
+    "removed": [],
+    "retimed": ["sht_0123456789bbbb"],
+    "recast": [],
+    "cast": {
+      "added": [],
+      "removed": []
+    }
+  }
+}

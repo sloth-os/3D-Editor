@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # the video export and rideo tests run instead of skipping when ffmpeg is missing
+      # the video export tests run instead of skipping when ffmpeg is missing
       FFMPEG_REQUIRED: '1'
     steps:
       - uses: actions/checkout@v4

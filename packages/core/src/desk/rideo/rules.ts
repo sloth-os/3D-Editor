@@ -459,6 +459,76 @@ export function ridingDenied(
 /** A person's mark this close to a mount's (m) seats them on it (rideo's riders stand beside their ponies). */
 export const MOUNT_DISTANCE_M = 0.6;
 
+// ---------------------------------------------------------------- holding
+
+/*
+ * Who holds what by a shot's words, read like riding: the subject of a holding word (a character of
+ * the shot named before it, or after it when it opens the sentence: "Holding the kite, Mira runs")
+ * holds the prop it names right after it, through determiners and adjectives only ("carries the big
+ * red box", "runs across the meadow with the kite", "a girl with a balloon"). A word that is denied
+ * or not yet done ("never carries", "wants to hold") says nothing, nor does one whose object is not a
+ * prop of the shot ("walks with Pip").
+ */
+
+/** Holding words: their subject holds the prop they name. */
+const HOLDS =
+  /\b(?:holds?|holding|held|carr(?:y|ies|ying|ied)|grips?|gripping|gripped|clutch(?:es|ing|ed)?|cradl(?:e|es|ing|ed)|brandish(?:es|ing|ed)?|wields?|wielding|wielded|flies|flying|flew|fly|tows?|towing|towed|tugs? (?:at|on)|tugging (?:at|on)|picks? up|picking up|picked up|lifts?|lifting|lifted|raises?|raising|raised|grabs?|grabbing|grabbed|takes?|taking|took|swings?|swinging|swung|waves?|waving|waved|with)\b/g;
+
+/**
+ * Who holds which prop by a shot's text (see above): pairs of a character of `cast` and a prop of
+ * `props` (named by its name or one of its `words`, plurals included), each prop held by the first
+ * character the text says holds it.
+ */
+export function holdersByText(
+  text: string,
+  cast: readonly { id: string; name: string }[],
+  props: readonly { id: string; name: string; words?: readonly string[] }[],
+): { holder: string; prop: string }[] {
+  const out: { holder: string; prop: string }[] = [];
+  if (!cast.length || !props.length) return out;
+  const named = (p: (typeof props)[number]) =>
+    [p.name, ...(p.words ?? [])].map((w) => plainText(w).trim()).filter((w) => w.length >= 2);
+  const held = new Set<string>();
+  for (const s of sentences(plainText(text))) {
+    const who = mentions(s, cast);
+    const things: Mention[] = [];
+    for (const p of props)
+      for (const w of named(p)) {
+        const re = new RegExp(`\\b${escapeRe(w)}(?:s|es)?\\b`, 'g');
+        for (let m = re.exec(s); m; m = re.exec(s))
+          things.push({ id: p.id, at: m.index, end: m.index + m[0].length, possessive: false });
+      }
+    things.sort((a, b) => a.at - b.at || b.end - a.end);
+    HOLDS.lastIndex = 0;
+    for (let v = HOLDS.exec(s); v; v = HOLDS.exec(s)) {
+      const lead = s.slice(0, v.index);
+      if (NOT_NOW.test(lead)) continue;
+      const end = v.index + v[0].length;
+      // the prop it names: the first one after it in its clause, through two words at most that are
+      // not prepositions ("the big red box", not "past the box")
+      const rest = s.slice(end);
+      const stop = CLAUSE_END.exec(rest);
+      const clauseEnd = end + (stop ? stop.index : rest.length);
+      const object = things.find((t) => {
+        if (t.at < end || t.at >= clauseEnd) return false;
+        const gap = s.slice(end, t.at).trim();
+        const words = gap ? gap.split(/\s+/) : [];
+        return words.length <= 3 && !words.some((x) => NOT_OBJECT.test(x));
+      });
+      if (!object || held.has(object.id)) continue;
+      // the subject: the character named last before the word (after it when it opens the sentence)
+      const before = who.filter((m) => m.end <= v!.index && !m.possessive);
+      let subject: Mention | null = before.length ? before[before.length - 1] : null;
+      if (!subject && /^\s*(?:\w+ly\s+)?$/.test(lead))
+        subject = who.find((m) => m.at >= object.end && !m.possessive) ?? null;
+      if (!subject) continue;
+      out.push({ holder: subject.id, prop: object.id });
+      held.add(object.id);
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- camera moves
 
 const PANS = /\bpan(?:s|ned|ning)?\b/;

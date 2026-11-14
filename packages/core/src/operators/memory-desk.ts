@@ -454,7 +454,37 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
   /** Reads the scene at the first and last frame of every enabled shot. */
   'desk.export_rideo_blocking': (ctx) =>
     sampling(ctx.doc, 2 * targetShots(ctx.doc, null).length, 'the number of shots'),
+  /** A brief's staging: what its import of the set, cast, props and shots adds (the import's estimate). */
+  'desk.stage_brief': (ctx, p) =>
+    DESK_SHOT_ESTIMATES['desk.import_rideo_blocking'](ctx, briefAsImport(p.brief)),
+  /** An update restages at most the whole brief: the same bound as staging it. */
+  'desk.update_from_brief': (ctx, p) =>
+    DESK_SHOT_ESTIMATES['desk.import_rideo_blocking'](ctx, briefAsImport(p.brief)),
+  /** Reads the scene at the first and last frame of every enabled shot (the checks sample a few more). */
+  'desk.shot_results': (ctx) =>
+    sampling(ctx.doc, (DESK_FRAMES_PER_SHOT + 2) * targetShots(ctx.doc, null).length, 'the number of shots'),
 };
+
+/**
+ * A brief (desk/brief: the desk embed protocol's SceneBrief, unvalidated) as the parameters
+ * desk.import_rideo_blocking's estimate reads: its props, cast and shots (durations, moves), the fps.
+ */
+function briefAsImport(raw: unknown): Record<string, unknown> {
+  const b = record(raw);
+  const list = (v: unknown) => (Array.isArray(v) ? v.map(record) : []);
+  return {
+    blocking: {
+      props: list(b.elements)
+        .filter((e) => e.kind !== 'location')
+        .map((e) => ({ label: String(e.name ?? '') })),
+      set: { landmarks: [{}] },
+    },
+    characters: list(b.cast),
+    shots: list(b.shots).map((s) => ({ duration_s: s.durationSec, move: s.move ?? 'push_in' })),
+    settings: { fps: b.fps },
+    pre_roll_frames: 0,
+  };
+}
 
 // ---------------------------------------------------------------- actors (CHARACTERS)
 

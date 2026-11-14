@@ -71,7 +71,7 @@ import {
 } from './tool-kit';
 import { registerVideoTools } from './video-tools';
 import { registerStoreTools } from './store-tools';
-import { registerRideoTools } from './rideo-tools';
+import { registerBriefTools } from './brief-tools';
 import {
   AUTO_KEYFRAMES,
   DEFAULT_KEYFRAME_PAGE,
@@ -3289,7 +3289,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
 
   registerVideoTools(tool, ctx);
   registerStoreTools(tool, ctx);
-  registerRideoTools(tool, ctx);
+  registerBriefTools(tool, ctx);
 }
 
 /** `project://{id}/scene` resources (JSON scene description). */
