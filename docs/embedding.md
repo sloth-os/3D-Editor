@@ -202,7 +202,9 @@ type ErrorCode = 'bad_message' | 'unsupported_version' | 'invalid_scene' | 'busy
 - The desk accepts a brief with any `Id`s the pattern allows; it keeps the host's ids on its shots
   and actors so results name the host's shots.
 - A `state` from another scene id (or a format or version the desk does not read) is not applied:
-  the desk stages the brief and reports `error` `state_unreadable` (without an `id`).
+  the desk reports `error` `state_unreadable` (without an `id`) and opens as without a state, from
+  its local copy of the scene where it has one, else by staging the brief (the contract says the
+  brief is staged: [Readings](#readings-of-the-contract)).
 - `result.shots` lists the shots of the export (all the brief's shots when the export named none)
   in brief order; a shot the desk could not render is left out and reported in an `error`
   `export_failed` with its id in the message (other shots still come back).
@@ -374,17 +376,20 @@ for the build. In development the desk registers no service worker: it works onl
 
 ### Starting
 
-`desk.html` loads its own entry (`apps/web/src/embed/main.tsx`), not the editor's. It never asks
-a server for its configuration (`/api/config`) and starts none of what the editor starts from
-it: no telemetry, no server RPC, no live sync, no server WebDAV, no server probe, no launch queue
-or file handlers. It keeps everything in the browser's IndexedDB, and neither reads nor writes the
-editor's preferences (`3d-editor:prefs:v1`): its own are the defaults with storage in the
-browser, no sync and no telemetry, for the page's life. Where the browser blocks storage it keeps
-the scene in memory (the host's state is the copy that counts) and nothing fails. It registers
-the service worker itself, starts its staging worker with the page, and posts `hello` at the
-page's `load` event. After the page has loaded it sends nothing to any server, and its own files
-come from the service worker's cache (on the first visit under a host site the service worker
-fetches them once, in the background, as it installs).
+`desk.html` loads its own entry (`apps/web/src/embed/main.tsx`), not the editor's. It never asks a
+server for its configuration (`/api/config`) and starts none of what the editor starts from it: no
+telemetry, no server RPC, no live sync, no server WebDAV, no server probe, no launch queue or file
+handlers. It keeps everything in the browser's IndexedDB, and neither reads nor writes the editor's
+preferences (`3d-editor:prefs:v1`): its own are the defaults with storage in the browser, no sync
+and no telemetry, for the page's life. Where the browser blocks storage it keeps the scene in memory
+(the host's state is the copy that counts) and nothing fails. Where storage works at first but fails
+as a scene opens (its database does not open, does not answer within 10 s, or refuses a write) it
+keeps that scene in memory too and says so: it reads the local copy where it can but writes nothing,
+and opening never hangs on storage. It registers the service worker itself, starts
+its staging worker with the page, and posts `hello` at the page's `load` event. After the page has
+loaded it sends nothing to any server, and its own files come from the service worker's cache (on
+the first visit under a host site the service worker fetches them once, in the background, as it
+installs).
 
 Inside the frame the desk is the editor's Director workspace, focused: the viewport looking
 through the shot cameras, the shot list and inspector with each shot's issues, the sequence strip,
@@ -410,6 +415,15 @@ document in the database `3d-editor-project-<id>`, an entry in the local project
 storage partition of the host's site. Where the desk's storage is the editor's own (the sample, or
 a host on the same site as the desk) its projects show in the editor's project list too.
 
+One desk of a browser has a scene open at a time: while a scene is open, its desk holds a Web Lock
+(`navigator.locks`) named `3d-editor-desk:` followed by the scene's local id. A second desk opening
+the same scene of the same host (another tab, window or frame under the same host site) waits for
+it, saying "This scene is open in another tab or window of this browser. The desk opens it here as
+soon as it is closed there.", and opens the scene once the first lets go of it: when that desk's
+page goes away or opens another scene (after Done or Close a desk keeps its scene, as the person
+may go back to it). It never clears the database under the first. A Close ends the wait. Browsers
+without Web Locks do not let desks wait for each other.
+
 ### The desk state
 
 `state.data` is opaque to the host, at most 64 MiB. The desk writes a container of its own there
@@ -422,18 +436,37 @@ a host on the same site as the desk) its projects show in the editor's project l
 | 9       | the payload's compression: `0` none, `1` gzip                                                         |
 | 10–11   | `0`                                                                                                   |
 | 12–15   | the header's length in bytes (unsigned 32-bit, little-endian)                                         |
-| header  | UTF-8 JSON: `sceneId`, `lineage`, `shots`, `savedAt`, `deskVersion`, `updateBytes`                    |
+| header  | UTF-8 JSON of at most 64 KiB: `sceneId`, `lineage`, `shots`, `deskVersion`, `updateBytes`, in order   |
 | payload | the scene's Yjs document (`Y.encodeStateAsUpdate`), gzipped where the browser has `CompressionStream` |
 
 The header reads without unpacking the payload, so another scene's state is recognized at once.
 `lineage` names the staging the document comes from: a random id written into the document when
-the desk stages a brief from scratch, and kept by every copy and state made from it.
+the desk stages a brief from scratch, and kept by every copy and state made from it. A header
+written with a `savedAt` (as earlier desks wrote it) still reads; the desk ignores keys it does
+not know.
+
+`updateBytes` is the document's length unpacked, at most 256 MiB. The desk unpacks a gzipped
+payload a piece at a time and stops as soon as it gives more than the header says, so a state
+never takes more memory than its header claims, and refuses a header that claims more than
+256 MiB before it unpacks anything. Every desk reads both payloads: where the browser has no
+`DecompressionStream` it unpacks gzip with a script (fflate), checking its CRC-32 and length.
+
+An unchanged scene gives the same bytes. The header holds no time and keeps its keys in one order,
+and the gzip header's time is 0 and its system byte 255. While the scene still holds what the
+state the host gave held (a state that replaced the local copy, or was merged into a copy that had
+nothing more), or what the last state the desk sent held, the desk sends exactly those bytes
+again, whatever another browser's gzip would make of the document. A host that compares states by
+their bytes (a digest) stores one copy of a scene that was only looked at.
 
 A state the desk does not read is not applied: another `format` or `version`, data that is not
-this container or is cut short, another scene's state, a payload that does not unpack or is no
-document, or a document with no staging of the scene. The desk then opens as without a state (its
-local copy, else the brief), tells the person why, and sends `error` `state_unreadable` without an
-`id`, before `opened`.
+this container or is cut short, a header over 64 KiB or one claiming more than 256 MiB, another
+scene's state, a payload that does not unpack, unpacks to more than its header says or is no
+document, or a document with no staging of the scene or with another `lineage` than its header's.
+The desk checks all of this before it chooses how to open, so a state it does not read never
+replaces or clears the local copy. It opens as without a state (its local copy, else the brief),
+tells the person why, and sends `error` `state_unreadable` without an `id`, before `opened`. It
+then sends no `state` on its own: the host keeps the state it has until the person edits the
+scene, presses **Done**, or the host sends `save` ([Readings](#readings-of-the-contract)).
 
 The desk sends `state` after `opened`, 2 s after the last edit (at most one every 5 s while edits
 go on), on **Done**, before **Close** when edits have not been sent, and at once in answer to
@@ -460,11 +493,17 @@ written for another reason is answered the same way with `export_failed`
 Staging runs core's `stageBrief` in a module worker (`apps/web/src/embed/stage.worker.ts`) on a
 copy of the document and applies the result as one change that undo does not track (the staging
 is where the scene starts); the page stays responsive and shows the work. Then come `opened` and a
-first `state`, so the host's copy is current from the start. A brief that validates but cannot be
-staged is answered with `error` `invalid_scene` without an `id`; it does not count as the
-connection's `open`, and the host may send another. **Close** while the scene opens cancels the
-open: `close` goes at once and nothing after it (no `opened`, no `state`); the desk lets go of the
-scene and takes a later `open`, as it does after a Close before any `open`.
+first `state`, so the host's copy is current from the start (`opened` alone after a state the desk
+did not read). A brief that validates but cannot be staged is answered with `error` `invalid_scene`
+without an `id`; it does not count as the connection's `open`, and the host may send another.
+**Close** while the scene opens cancels the open: `close` goes at once and nothing after it (no
+`opened`, no `state`); the desk lets go of the scene and takes a later `open`, as it does after a
+Close before any `open`.
+
+The shot list shows the staging's checks at once (their issues), and once the scene is open,
+whatever it opened from, the desk runs the full checks in the background (each shot's blocking
+line and layout too), as it does again after **Update shots**. A check is of the scene as it was
+when the check was asked for: an edit made while it runs shows it as out of date.
 
 ### A later brief: changes and Update shots
 
@@ -585,7 +624,9 @@ server, so it is a quick check of a deployment, offline too.
 
 From the contract: a brief has at most 200 shots, 16 cast members and 64 elements, each shot at
 most 600 s; a state at most 64 MiB. From the desk: an export at most 3840 × 2160 (3840 pixels
-wide, 2160 high), with a result the tab can hold at once, and one at a time.
+wide, 2160 high), with a result the tab can hold at once, and one at a time; a state's header at
+most 64 KiB and its document at most 256 MiB unpacked; 10 s for the scene's storage to answer
+before the desk keeps the scene in memory.
 
 Measured in headless Chromium on a 4-core machine with 15 GB of memory and software WebGL, the
 desk served by the production server and embedded by a cross-origin isolated host on another site
@@ -620,7 +661,9 @@ brief's size and frame rate, and the Origin Private File System (without it the 
 memory). `ready.capabilities.export` says what the browser can do for 1280 × 720 at 24 fps, since
 `ready` comes before the brief, with the reason in words when it cannot; each export checks again
 at the brief's size and rate. With `CompressionStream` the state is gzipped; a browser without it
-writes the state uncompressed and cannot read a gzipped one (`state_unreadable`).
+writes the state uncompressed. Every desk reads both: a gzipped state with `DecompressionStream`,
+or where there is none with a script (fflate). Web Locks keep one desk per scene in a browser;
+without them desks do not wait for each other.
 
 ## Readings of the contract
 
@@ -670,6 +713,17 @@ Where the contract leaves room, the desk takes the most robust reading:
   `not_open`; after Done or Close of an open scene the desk still answers `save`.
 - **Close while the scene opens** cancels the open: nothing follows `close`, and a later `open` is
   taken (one sent before the cancelled open let go of its scene waits for it).
+- **A state the desk does not read** (another scene, format or version, or one that does not
+  unpack or holds no staging of the scene). The contract has the brief staged; the desk opens its
+  local copy of the scene where it has one (`source` `local`: work the host never got is not
+  lost), else stages the brief (`source` `brief`), and sends `state_unreadable` without an `id`
+  either way.
+- **No first `state` after a state the desk does not read.** The contract has a first `state`
+  follow `opened`; after a state it could not read the desk sends none until the person edits the
+  scene, presses Done, or the host sends `save`, so that a browser that cannot read the host's
+  state never replaces it just by opening the scene.
+- **A scene open in another desk of the browser.** `opened` comes once that desk lets go of the
+  scene (the desk shows why it waits), not as soon as the scene is staged; a Close ends the wait.
 - **Requests before `ready`** wait until `ready` is out, then are handled in order.
 - **Lists.** The contract bounds no list: `export.shots: []` names no shot (every shot of the brief,
   as when it is missing), `export.modes: []` asks for the open's, and a repeated mode counts once,
@@ -712,7 +766,8 @@ A host should check, besides its own logic, that it:
 
 - accepts `hello` only from the frame's window and the desk's origin, and gives up after 15 s;
 - stores `state` as it comes and gives it back unchanged in the next `open` (a state of another
-  scene is answered with `state_unreadable` and the brief staged anew);
+  scene is answered with `state_unreadable`, and the desk opens its own copy of the scene, else
+  stages the brief; a scene that did not change comes back as the same bytes);
 - shows `opened.changes` or leaves them to the desk, and takes `state` messages at any time;
 - matches a `result` and the `error`s that follow it by `id`, takes files only of the shots in
   `result.shots`, and answers with `result-ack`;

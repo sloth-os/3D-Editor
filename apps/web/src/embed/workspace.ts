@@ -168,6 +168,9 @@ function browserLocks(): SceneLocks | null {
 /** How long the scene's database may take to open (or clear) before the desk keeps it in memory. */
 export const STORAGE_TIMEOUT_MS = 10_000;
 
+/** The scene's Web Lock is named this followed by its local id (deskProjectId). */
+export const SCENE_LOCK_PREFIX = '3d-editor-desk:';
+
 /** What the desk shows while another desk of this browser has the scene open. */
 export const OTHER_DESK_WAIT =
   'This scene is open in another tab or window of this browser. The desk opens it here as soon as it is closed there.';
@@ -337,7 +340,7 @@ export class DeskWorkspace {
   private async lockScene(id: string): Promise<() => void> {
     const locks = this.locks;
     if (!locks) return () => {};
-    const name = `3d-editor-desk:${id}`;
+    const name = `${SCENE_LOCK_PREFIX}${id}`;
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
     const take = (options: { ifAvailable?: boolean; signal?: AbortSignal }) =>

@@ -1,12 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
+import { Gunzip } from 'fflate';
 import * as Y from 'yjs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { SceneDoc, type SceneBrief } from '@3d-editor/core';
 import { MAX_STATE_BYTES } from '../src/embed/protocol';
 import { runStaging } from '../src/embed/staging-engine';
 import {
+  MAX_HEADER_BYTES,
   MAX_UPDATE_BYTES,
   STATE_HEADER_KEYS,
   STATE_MAGIC,
@@ -276,6 +278,12 @@ describe('the desk state', () => {
     // a header that says more than 256 MiB is refused before anything is unpacked
     const says = container({ ...header(), updateBytes: MAX_UPDATE_BYTES + 1 }, new Uint8Array(32), 1);
     await expect(decodeDeskState(says, SCENE)).rejects.toThrow(/over the 256 MiB a state may hold/);
+    // a header over 64 KiB is not read, though it is JSON and the state otherwise a good one
+    const head = { ...header(), updateBytes: staged.length };
+    const fits = container({ ...head, pad: 'x'.repeat(MAX_HEADER_BYTES - 200) }, staged, 0);
+    expect((await decodeDeskState(fits, SCENE)).header.sceneId).toBe(SCENE);
+    const long = container({ ...head, pad: 'x'.repeat(MAX_HEADER_BYTES) }, staged, 0);
+    await expect(decodeDeskState(long, SCENE)).rejects.toThrow(/header is over 64 KiB/);
   });
 
   it('stops unpacking a gzip bomb once it passes what the header says', async () => {
@@ -305,9 +313,53 @@ describe('the desk state', () => {
     await expect(decodeDeskState(state, SCENE)).rejects.toThrow(/unpacks to more than it says/);
     expect(unpacked).toBeGreaterThan(1024 * 1024);
     expect(unpacked).toBeLessThan(24 * 1024 * 1024);
+    // a DecompressionStream as the Compression Streams spec has it: each write unpacked and queued
+    // in full before the write settles (Node's waits for the reader): only small writes stop early
+    let queued = 0;
+    class WholeWrites {
+      readonly readable: ReadableStream<Uint8Array>;
+      readonly writable: WritableStream<BufferSource>;
+      constructor() {
+        let g: Gunzip;
+        const ts = new TransformStream<BufferSource, Uint8Array>({
+          start(c) {
+            g = new Gunzip((d) => {
+              queued += d.length;
+              c.enqueue(d);
+            });
+          },
+          transform(chunk) {
+            g.push(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk as ArrayBuffer));
+          },
+          flush() {
+            g.push(new Uint8Array(0), true);
+          },
+        });
+        this.readable = ts.readable;
+        this.writable = ts.writable;
+      }
+    }
+    vi.stubGlobal('DecompressionStream', WholeWrites);
+    await expect(decodeDeskState(state, SCENE)).rejects.toThrow(/unpacks to more than it says/);
+    expect(queued).toBeGreaterThan(1024 * 1024);
+    expect(queued).toBeLessThan(24 * 1024 * 1024);
     // the same with the JS unpacking (no DecompressionStream)
     vi.stubGlobal('DecompressionStream', undefined);
     await expect(decodeDeskState(state, SCENE)).rejects.toThrow(/unpacks to more than it says/);
+  });
+
+  it('is described in docs/embedding.md as it reads and writes', () => {
+    const raw = readFileSync(resolve(__dirname, '../../../docs/embedding.md'), 'utf8');
+    const doc = raw.replace(/\s+/g, ' ');
+    // the container table's header row: the keys state.ts writes, in its order
+    const row = raw.split('\n').find((l) => l.startsWith('| header '))!;
+    expect([...row.matchAll(/`(\w+)`/g)].map((m) => m[1])).toEqual([...STATE_HEADER_KEYS]);
+    expect(doc).toContain(`UTF-8 JSON of at most ${MAX_HEADER_BYTES / 1024} KiB`);
+    expect(doc).toContain(`unpacked, at most ${MAX_UPDATE_BYTES / 1024 / 1024} MiB`);
+    expect(doc).toContain('An unchanged scene gives the same bytes.');
+    expect(doc).toContain("the gzip header's time is 0 and its system byte 255");
+    expect(doc).toContain('it unpacks gzip with a script (fflate)');
+    expect(doc).not.toContain('cannot read a gzipped one');
   });
 
   it('names a staging by its lineage', () => {

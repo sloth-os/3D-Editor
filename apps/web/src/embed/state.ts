@@ -312,8 +312,9 @@ export function readStateHeader(bytes: Uint8Array): {
   if (bytes[9] !== 0 && bytes[9] !== 1)
     throw new StateUnreadable('the desk state is compressed in an unknown way');
   const headerLength = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(12, true);
-  if (headerLength > MAX_HEADER_BYTES || PREFIX_BYTES + headerLength > bytes.length)
-    throw new StateUnreadable('the desk state is cut short');
+  if (headerLength > MAX_HEADER_BYTES)
+    throw new StateUnreadable(`the desk state's header is over ${MAX_HEADER_BYTES / 1024} KiB`);
+  if (PREFIX_BYTES + headerLength > bytes.length) throw new StateUnreadable('the desk state is cut short');
   let header: unknown;
   try {
     header = JSON.parse(

@@ -11,6 +11,8 @@ import { decodeDeskState, encodeDeskState, readLineage } from '../src/embed/stat
 import {
   DeskWorkspace,
   OTHER_DESK_WAIT,
+  SCENE_LOCK_PREFIX,
+  STORAGE_TIMEOUT_MS,
   deskProjectId,
   type SceneLocks,
   type WorkProgress,
@@ -61,6 +63,8 @@ function changedBrief(): SceneBrief {
 
 /** Web Locks as one browser partition has them: one holder per name, the others wait in turn. */
 class FakeLocks implements SceneLocks {
+  /** The names asked for, in order. */
+  readonly names: string[] = [];
   private readonly held = new Set<string>();
   private readonly waiting = new Map<string, (() => void)[]>();
 
@@ -69,6 +73,7 @@ class FakeLocks implements SceneLocks {
     options: { ifAvailable?: boolean; signal?: AbortSignal },
     callback: (lock: unknown) => Promise<void> | void,
   ): Promise<unknown> {
+    this.names.push(name);
     if (this.held.has(name)) {
       if (options.ifAvailable) return callback(null);
       await new Promise<void>((resolve, reject) => {
@@ -384,6 +389,8 @@ describe('the desk workspace', () => {
     await vi.waitFor(() => expect(work.some((w) => w?.label === OTHER_DESK_WAIT)).toBe(true));
     await new Promise((r) => setTimeout(r, 50));
     expect(opened).toBe(false);
+    // the lock is the scene's, named after its local project
+    expect(locks.names.at(-1)).toBe(`${SCENE_LOCK_PREFIX}${deskProjectId(host, EXAMPLE().id)}`);
     // the first desk's scene still works: its edits reach its listener and are kept
     let edits = 0;
     first.onEdit(() => edits++);
@@ -430,6 +437,29 @@ describe('the desk workspace', () => {
     expect(getShots(b.doc).every((x) => lined.has(x.id))).toBe(true);
   });
 
+  it('shows the checks of an update as out of date when the scene changed while the worker ran', async () => {
+    const host = origin();
+    await stateOf(host);
+    const ws = workspace();
+    await ws.open({ hostOrigin: host, brief: changedBrief(), state: null });
+    await ws.backgroundCheck;
+    const s = ws.session!;
+    // an edit lands while the worker updates the scene
+    const update = ws.staging.update.bind(ws.staging);
+    vi.spyOn(ws.staging, 'update').mockImplementation(async (u, b) => {
+      const r = await update(u, b);
+      edit(ws, 'meanwhile', 1);
+      return r;
+    });
+    await ws.updateFromBrief();
+    // the worker's checks are of the scene without that edit: stamped as older than the scene
+    expect(lastCheck.value!.session).toBe(s);
+    expect(lastCheck.value!.revision).toBeLessThan(s.revision.peek());
+    // the full check that follows is of the scene as it is
+    await ws.backgroundCheck;
+    expect(lastCheck.value!.revision).toBe(s.revision.peek());
+  });
+
   it('lists how a later brief differs and updates the shots to it in one undo step', async () => {
     const host = origin();
     const state = await stateOf(host);
@@ -466,6 +496,16 @@ describe('the desk workspace', () => {
     stop();
     edit(ws, 'x', 2);
     expect(edits).toBe(1);
+  });
+
+  it('is described in docs/embedding.md as it behaves', () => {
+    const doc = readFileSync(resolve(__dirname, '../../../docs/embedding.md'), 'utf8').replace(/\s+/g, ' ');
+    expect(doc).toContain(`does not answer within ${STORAGE_TIMEOUT_MS / 1000} s`);
+    expect(doc).toContain(`named \`${SCENE_LOCK_PREFIX}\` followed by the scene's local id`);
+    expect(doc).toContain(`"${OTHER_DESK_WAIT}"`);
+    // the reading of an unreadable state: the local copy, else the brief; no first state
+    expect(doc).toContain('opens its local copy of the scene where it has one (`source` `local`');
+    expect(doc).toContain('**No first `state` after a state the desk does not read.**');
   });
 });
 
@@ -514,17 +554,20 @@ async function controllerWith(ws: DeskWorkspace) {
 describe('the desk workspace with the controller', () => {
   it('sends no state on its own after one it could not read, until an edit', async () => {
     const ws = workspace();
+    const encode = vi.spyOn(ws, 'encodeState');
     const { c, timers, ofType } = await controllerWith(ws);
     c.message({
       type: 'open',
       scene: EXAMPLE(),
       state: { format: '3d-editor.desk-state', version: 1, data: new Uint8Array([1, 2, 3]).buffer },
     });
-    await vi.waitFor(() => expect(c.status.value).toBe('open'));
+    await vi.waitFor(() => expect(ofType('opened')).toHaveLength(1));
     expect(ofType('error')).toMatchObject([{ code: 'state_unreadable' }]);
-    expect(ofType('opened')).toHaveLength(1);
+    // no state is even written (a first state would be, right after opened)
+    expect(encode).not.toHaveBeenCalled();
     await new Promise((r) => setTimeout(r, 20));
     expect(ofType('state')).toHaveLength(0);
+    expect(encode).not.toHaveBeenCalled();
     // an edit sends one (after the quiet time)
     edit(ws, 'x', 1);
     timers.advance(5000);
