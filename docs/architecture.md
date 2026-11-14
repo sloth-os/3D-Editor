@@ -7,7 +7,7 @@
 │  F3, console     undo manager      y-indexeddb (always)    three.js viewport    │
 │                  (own changes)     WebDAV merge-sync (opt)                      │
 │                                    SyncProvider (WebSocket + BroadcastChannel)  │
-│  render workers (Web Workers): path tracing, APNG/GIF encoding                  │
+│  render workers (Web Workers): path tracing, APNG/GIF encoding, thumbnails      │
 │  telemetry ──────────────────┐                                                  │
 └──────────────────────────────┼───────────────────┬──────────────────────────────┘
                                │ OTLP/JSON         │ binary Yjs protocol + RPC
@@ -70,10 +70,11 @@ renderers and the importers/exporters are isomorphic (no DOM, no Node APIs).
 | Director's desk: shots and their timing, camera solver, plan fitting, the 180° line, camera moves, continuity checks, set builder, brief staging, SceneBlocking import and export     | `packages/core/src/desk`                                      |
 | Actors: mannequin rigs, poses, gaits, locomotion, holding and riding, keypoints                                                                                                       | `packages/core/src/desk/characters`                           |
 | Physics presets: start frames, drop, throw, push, bake, kites and balloons, vehicles                                                                                                  | `packages/core/src/desk/physics`                              |
-| Built-in model catalog, catalog search, store inserts                                                                                                                                 | `packages/core/src/store`                                     |
+| Built-in model catalog, catalog search, store inserts, framing of the built-in thumbnails                                                                                             | `packages/core/src/store`                                     |
 | Director workspace, Asset Browser, Export Video window, Follow Shots                                                                                                                  | `apps/web/src/ui/director`, `ui/assets`, `viewport`           |
 | Video export of server and browser: parameters, plan, desk frames, passes, frame loop, manifest, estimates                                                                            | `packages/core/src/export`                                    |
 | Browser video export: render workers, WebCodecs encoders, MP4/WebM muxing, files, memory plan                                                                                         | `apps/web/src/export`                                         |
+| Built-in thumbnails in the browser: thumbnail workers, queue, IndexedDB cache                                                                                                         | `apps/web/src/assets/thumbnails`                              |
 | Video export jobs: queue, render processes, ffmpeg encoders, memory                                                                                                                   | `apps/server/src/video`                                       |
 | Model store: providers, search, downloads, cache, thumbnails                                                                                                                          | `apps/server/src/store`                                       |
 
@@ -356,6 +357,19 @@ Canceling keeps the samples or frames finished so far. The editor's RPC handler 
 workers when a request asks for `engine: PATHTRACER`: the server's MCP `render_image` sends such
 requests with `renderer: browser` (with `renderer: auto` it path traces on the server and sends only
 raster renders to browsers).
+
+### Thumbnail workers
+
+The Asset Browser renders the thumbnails of the built-in models in the browser
+(`apps/web/src/assets/thumbnails`), with core's `renderBuiltinThumbnailPng`
+(`packages/core/src/store/thumbnail.ts`), the code the server's store renders them with, so a model
+is the same PNG wherever it is made. One module worker renders them, two from four cores up, one
+thumbnail at a time each; they start on first use and stop after 30 seconds without work or when the
+page goes away. A queue on the page puts the cards in view first and drops a card's request when it
+scrolls away before its turn. The PNGs are kept in an IndexedDB database of their own under the
+build of the worker (the hash in its file name), the model, its parameters and the size, within
+16 MiB, the least recently used going first. [model-store.md](model-store.md#thumbnails) has the
+details and measurements.
 
 ### Server render processes
 

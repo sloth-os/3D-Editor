@@ -8,8 +8,8 @@ model libraries; nothing is downloaded before a model is inserted.
 Contents: [providers](#providers) · [built-in models](#built-in-models) ·
 [custom catalogs](#custom-catalogs) · [configuration](#configuration) ·
 [search, lazy loading and the cache](#search-lazy-loading-and-the-cache) ·
-[licences and attribution](#licences-and-attribution) · [inserting](#inserting) · [REST](#rest) ·
-[MCP](#mcp) · [behind a proxy](#behind-a-proxy)
+[thumbnails](#thumbnails) · [licences and attribution](#licences-and-attribution) ·
+[inserting](#inserting) · [REST](#rest) · [MCP](#mcp) · [behind a proxy](#behind-a-proxy)
 
 ## Providers
 
@@ -135,9 +135,10 @@ file. Format, version 1:
 - **Indexes** (Khronos' model list, Poly Haven's assets) are fetched the first time they are
   needed and cached for 24 hours in memory and on disk; when a refresh is slow the older copy
   answers.
-- **Nothing is downloaded before an insert** (or a request for a model's files). Thumbnails are
-  proxied and cached; built-in thumbnails are rendered by the server the first time they are asked
-  for (256 × 256, clay look, transparent background) and then served from the cache.
+- **Nothing is downloaded before an insert** (or a request for a model's files). Thumbnails of the
+  other providers' models are proxied and cached. The server renders a built-in model's thumbnail
+  the first time its route is asked for it and serves it from the cache after that; the Asset
+  Browser makes the built-in thumbnails itself and never asks for them ([thumbnails](#thumbnails)).
 - **Downloads** are checked (sizes, checksums the provider gives, the GLB header, images that are
   images), at most 200 MB and 512 files per model, archives unpacked, and stored in the cache under
   `MODEL_CACHE_MAX_MB` (least recently used first; a model in use stays).
@@ -147,7 +148,51 @@ file. Format, version 1:
 
 Measured through an outbound proxy: a cold search for "chair" over five providers took 0.9 s and
 the same search warm 0.1 s; inserting Khronos' SheenChair (a 4.1 MB GLB) 1.2 s, and again from the
-cache 0.6 s; a built-in thumbnail 0.2–0.6 s the first time and 2–5 ms from the cache.
+cache 0.6 s; a built-in thumbnail from the server's route 0.2–0.6 s the first time and 2–5 ms from
+its cache.
+
+## Thumbnails
+
+The Asset Browser renders the thumbnails of the built-in models in the browser, with a server or
+without one (the static build, the embedded desk, offline), and never asks a server for them. The
+other providers' thumbnails come from the server, which proxies and caches them.
+
+- **The server's image.** A built-in thumbnail is the model as `store.add` builds it, seen from in
+  front, 35° towards +X and 20° above, through a 30° lens, its bounding box filling 86 % of the
+  frame; rendered by core's RASTER renderer in the clay look (shadows and ambient occlusion) with 2
+  samples, 256 × 256 on a transparent background, and encoded by core's PNG encoder
+  (`packages/core/src/store/thumbnail.ts`). The server's `GET /api/store/models/:model/thumbnail`
+  runs the same code, so for the same model and size the two are the same PNG, byte for byte (the
+  unit and e2e tests compare them).
+- **Workers.** One module worker renders them, or two on machines with four cores or more, each one
+  thumbnail at a time, so the page and its viewport keep the other cores. They start with the first
+  thumbnail, stop after 30 s without one and at once when the page goes away (`pagehide`); a
+  thumbnail they were making then is made when the page comes back. Where Web Workers cannot
+  start, the page renders the thumbnails itself, one per event loop turn.
+- **Only what is seen.** A card asks for its thumbnail once it comes within the list's height of
+  the view; the cards in view go first, then the others in the order they asked. A card that leaves
+  that band before its thumbnail started takes its request back.
+- **Cache.** The PNGs are kept in IndexedDB (the database `3d-editor-thumbnails`), across reloads
+  and offline, under a key of the app's version, the build of the thumbnail worker (the hash in its
+  file name), the model, its parameters and the size. The thumbnails of other builds are dropped
+  when the cache opens, and beyond 16 MiB or 4000 thumbnails the least recently used go first (the
+  170 built-in thumbnails take 1.3 MB). The last 400 shown also stay in the page's memory. Where
+  IndexedDB cannot be used (storage blocked, a sandboxed frame) they are kept for the page only;
+  under the development server (`vite dev`) every page load is a build of its own.
+- **On the card**, the category's icon stands in, with a light sweep while the thumbnail is made
+  (none with reduced motion). A thumbnail that cannot be made shows a warning badge with the reason
+  in its tooltip; one whose worker crashed is made again when the card comes near the view again. A
+  model this page's catalog does not know (a server newer than the page) gets the server's
+  thumbnail.
+
+Measured in headless Chromium on 4 cores shared with other test runs (a load average up to 9), the
+viewport drawn with software WebGL on the same cores: a thumbnail took 35–39 ms in a worker (median;
+57–67 ms at the 90th percentile), the first one 0.5–0.8 s with the worker's start; the 170 built-in
+thumbnails took 7.3–7.8 s in one worker and 4.9–6.6 s in two. Opening the Asset Browser with an
+empty cache, the 8 cards in view showed their thumbnails 1.3–2.0 s after the click on its tab;
+scrolling through the whole catalog a screen at a time, a screen was complete after 0.17–0.22 s
+(median). After a reload, from the cache: the first view 0.12–0.24 s after the click, each further
+screen 5–9 ms (median).
 
 ## Licences and attribution
 

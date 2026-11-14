@@ -152,6 +152,40 @@
 .asset-thumb img.loaded {
   opacity: 1;
 }
+/* a thumbnail being made (or read): a light sweeping over the category icon */
+.asset-thumb.pending::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 30%, rgba(255, 255, 255, 0.07) 50%, transparent 70%);
+  background-size: 250% 100%;
+  animation: asset-thumb-sweep 1.4s linear infinite;
+  pointer-events: none;
+}
+@keyframes asset-thumb-sweep {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -150% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .asset-thumb.pending::after {
+    animation: none;
+  }
+}
+/* a thumbnail that could not be made: the icon stays, with a warning (the reason as tooltip) */
+.asset-thumb.failed {
+  color: #8a6a4a;
+}
+.asset-thumb-error {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  color: var(--warn);
+}
 .asset-progress {
   position: absolute;
   left: 0;

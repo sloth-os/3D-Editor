@@ -3,7 +3,7 @@ import { signal } from '@preact/signals';
 import { STORE_CATEGORIES, type StoreCategory, type StoreResult } from '@3d-editor/core';
 import type { ProjectSession } from '../../project/session';
 import { serverConfig } from '../../app/store';
-import { storeThumbnailUrl, type StoreProviderStatus } from '../../io/store-client';
+import type { StoreProviderStatus } from '../../io/store-client';
 import { Icon } from '../icons';
 import { CategoryIcon } from './category-icons';
 import { licenceLabel, licenceTone, licenceTooltip, providerBadge } from './badges';
@@ -11,17 +11,20 @@ import { insertBlocker, insertStoreModel, insertsInFlight } from './insert';
 import { setAssetDragData } from './drop';
 import { AssetSearch, localBackend, serverBackend, type AssetQuery, type ProviderChoice } from './search';
 import { VisibilityWatcher } from './visibility';
+import { thumbnailMadeHere, useCardThumbnail, type CardWatchers } from './thumbnail';
 import './assets.css';
 
 /*
  * The Asset Browser (SPEC §13): searches the model store and inserts models into the scene. It
  * shows in the Director workspace's right column and in the bottom area's 'assets' tab (both
  * mounted by App.tsx). Search words (debounced), a provider choice with each provider's state (ok /
- * needs key / offline), category chips, and a grid of cards: thumbnail (fetched once the card comes
- * into view), name, provider and licence badge (its credit as the tooltip). The grid pages on with
- * the search cursor as it is scrolled. A card's Add inserts the model at the 3D cursor; dragging it
- * into the viewport inserts it where it is dropped (drop.ts). Without the editor server only the
- * built-in models are offered (searched in this browser, without thumbnails).
+ * needs key / offline), category chips, and a grid of cards: thumbnail, name, provider and licence
+ * badge (its credit as the tooltip). A built-in model's thumbnail is made in this browser (a worker,
+ * then this browser's cache) once its card comes near the visible part of the list, the cards on
+ * screen first (thumbnail.ts); another provider's comes from the editor server's store. The grid
+ * pages on with the search cursor as it is scrolled. A card's Add inserts the model at the 3D
+ * cursor; dragging it into the viewport inserts it where it is dropped (drop.ts). Without the editor
+ * server only the built-in models are offered (searched in this browser), with their thumbnails.
  */
 
 /** Props of the Asset Browser: mounted in the Director right column and the 'assets' bottom tab. */
@@ -63,11 +66,11 @@ function storeOnServer(): boolean {
 export const SHORT_BROWSER_PX = 300;
 
 /**
- * How far above and below the visible part of the results a card already counts as visible (its
- * thumbnail is fetched): one height of the results box, the next screenful, whatever the layout. A
- * fixed margin would cover every card of a page in a short box (the bottom area's is about 70 px
- * tall), and the server, which renders thumbnails one at a time, would make the cards on screen wait
- * behind the others.
+ * How far above and below the visible part of the results a card already counts as near (its
+ * thumbnail is asked for): one height of the results box, the next screenful, whatever the layout.
+ * A fixed margin would cover every card of a page in a short box (the bottom area's is about 70 px
+ * tall), and the cards on screen would wait behind the others for the thumbnail workers (or the
+ * server's store, for other providers' thumbnails).
  */
 export const THUMBNAIL_MARGIN = '100% 0px';
 
@@ -97,8 +100,17 @@ export function AssetBrowser({ compact }: AssetBrowserProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const short = useShort(rootRef);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const watcherRef = useRef<VisibilityWatcher | null>(null);
-  const watcher = () => (watcherRef.current ??= new VisibilityWatcher(scrollRef.current, THUMBNAIL_MARGIN));
+  const nearRef = useRef<VisibilityWatcher | null>(null);
+  const viewRef = useRef<VisibilityWatcher | null>(null);
+  const watcher = () => (nearRef.current ??= new VisibilityWatcher(scrollRef.current, THUMBNAIL_MARGIN));
+  // the cards' watchers: near the visible part of the list (thumbnails asked for), and on screen
+  const watchers = useMemo<CardWatchers>(
+    () => ({
+      near: watcher,
+      view: () => (viewRef.current ??= new VisibilityWatcher(scrollRef.current, '0px')),
+    }),
+    [],
+  );
 
   // a new search object (the server came or went): ask it about its providers and search again
   useEffect(() => {
@@ -109,8 +121,10 @@ export function AssetBrowser({ compact }: AssetBrowserProps) {
   }, [search, remote]);
   useEffect(
     () => () => {
-      watcherRef.current?.disconnect();
-      watcherRef.current = null;
+      nearRef.current?.disconnect();
+      nearRef.current = null;
+      viewRef.current?.disconnect();
+      viewRef.current = null;
     },
     [],
   );
@@ -221,8 +235,8 @@ export function AssetBrowser({ compact }: AssetBrowserProps) {
                 key={r.id}
                 result={r}
                 providerName={names.get(r.provider) ?? r.provider}
-                thumbnails={remote}
-                watcher={watcher}
+                serverThumbnails={remote}
+                watchers={watchers}
               />
             ))}
           </div>
@@ -306,24 +320,20 @@ function Sentinel({ watcher, onVisible }: { watcher: () => VisibilityWatcher; on
 function AssetCard({
   result: r,
   providerName,
-  thumbnails,
-  watcher,
+  serverThumbnails,
+  watchers,
 }: {
   result: StoreResult;
   providerName: string;
-  thumbnails: boolean;
-  watcher: () => VisibilityWatcher;
+  /** Whether the editor server's store serves other providers' thumbnails. */
+  serverThumbnails: boolean;
+  watchers: CardWatchers;
 }) {
-  const src = thumbnails ? storeThumbnailUrl(r) : null;
-  const [visible, setVisible] = useState(false);
-  const [loaded, setLoaded] = useState(false);
-  const [failed, setFailed] = useState(false);
-  const showImg = !!src && !failed;
   const thumbRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!src || !thumbRef.current) return;
-    return watcher().watch(thumbRef.current, () => setVisible(true));
-  }, [src]);
+  const thumb = useCardThumbnail(r, thumbRef, watchers, serverThumbnails);
+  const shown = thumb.status === 'ready';
+  const waiting = thumb.status === 'pending' || thumb.status === 'loading';
+  const failedHere = thumb.status === 'failed' && thumbnailMadeHere(r) && thumb.source !== 'server';
   const progress = insertsInFlight.value.get(r.id) ?? null;
   const blocker = insertBlocker(r);
   const add = () => void insertStoreModel(r);
@@ -350,21 +360,34 @@ function AssetCard({
         if (e.key === 'Enter' && e.target === e.currentTarget) add();
       }}
     >
-      <div class="asset-thumb" ref={thumbRef}>
-        {/* the category's icon until the thumbnail is there (servers render some on first request) */}
-        {!(showImg && loaded) && <CategoryIcon category={r.category} size={34} />}
-        {showImg && (
+      <div
+        class={`asset-thumb${waiting ? ' pending' : ''}${failedHere ? ' failed' : ''}`}
+        ref={thumbRef}
+        data-testid={`asset-thumb-box-${r.id}`}
+        data-thumb-state={thumb.status}
+        data-thumb-source={thumb.source ?? undefined}
+        aria-busy={waiting}
+        title={failedHere ? `The thumbnail could not be made: ${thumb.error ?? 'unknown error'}` : undefined}
+      >
+        {/* the category's icon until the thumbnail is there (made here, or fetched from the server) */}
+        {!shown && <CategoryIcon category={r.category} size={34} />}
+        {thumb.available && thumb.status !== 'failed' && (
           <img
-            class={loaded ? 'loaded' : undefined}
-            src={visible ? src : undefined}
+            class={shown ? 'loaded' : undefined}
+            src={thumb.src ?? undefined}
             loading="lazy"
             decoding="async"
             alt=""
             draggable={false}
             data-testid={`asset-thumb-${r.id}`}
-            onLoad={() => setLoaded(true)}
-            onError={() => setFailed(true)}
+            onLoad={thumb.onLoad}
+            onError={thumb.onError}
           />
+        )}
+        {failedHere && (
+          <span class="asset-thumb-error" data-testid={`asset-thumb-error-${r.id}`}>
+            <Icon name="warning" size={12} />
+          </span>
         )}
         {progress && (
           <div
