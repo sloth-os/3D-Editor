@@ -94,7 +94,11 @@ describe('encoder command lines', () => {
     expect(after(args, '-force_key_frames')).toBe('expr:eq(n,0)+eq(n,12)');
     expect(after(args, '-preset')).toBe(QUALITY_ENCODING.standard.preset);
     expect(after(args, '-crf')).toBe('23');
-    expect(after(args, '-vf')).toBe('scale=out_color_matrix=bt709:out_range=tv,format=yuv420p');
+    // the frames carry the BT.709 tags (ffmpeg 7.1 and later take the encoder's from the frames)
+    expect(after(args, '-vf')).toBe(
+      'scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,' +
+        'setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709',
+    );
     expect(after(args, '-colorspace')).toBe('bt709');
     expect(after(args, '-color_primaries')).toBe('bt709');
     expect(after(args, '-color_trc')).toBe('bt709');

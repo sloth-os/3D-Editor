@@ -218,9 +218,14 @@ export function encoderArgs(s: EncodeSettings): string[] {
     '-dn',
   ];
   const keys = ['-g', String(gop), '-force_key_frames', keyframeExpression(s.keyframes)];
+  // The frames carry the BT.709 tags themselves (setparams): ffmpeg 7.1 and later give the encoder
+  // the colour properties of the frames it receives, and raw frames have no primaries or transfer,
+  // so the encoder options alone left them unset there (ffmpeg 8 tagged only matrix and range).
+  // The options stay for older versions, which take them from the encoder instead.
   const bt709 = [
     '-vf',
-    'scale=out_color_matrix=bt709:out_range=tv,format=yuv420p',
+    'scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,' +
+      'setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709',
     '-color_range',
     'tv',
     '-colorspace',
