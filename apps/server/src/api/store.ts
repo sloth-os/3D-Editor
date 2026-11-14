@@ -48,6 +48,8 @@ const insertBody = strictArgObject({
     .string()
     .regex(/^#[0-9a-fA-F]{6}$/, 'expected a colour as #rrggbb')
     .optional(),
+  /** A built-in model's own parameters (checked by the model's schema). */
+  params: z.record(z.string().min(1).max(64), z.unknown()).optional(),
 });
 
 /**

@@ -6,7 +6,9 @@ import { findShotIndex, getDeskSettings, getShots, shotOutputFrames } from './sh
 import { DESK_PROPS } from './props';
 import { DeskScene, deskProp, inPicture, projectPoint, v3sub, type CameraView } from './layout';
 import { crossesLine, lineOfAction, pairPoints } from './line';
-import { inFrameSamples, shotSamples, shotSpec, unframedSubjects } from './solver';
+import { TURNING_MOVES, inFrameSamples, shotSamples, shotSpec, unframedSubjects } from './solver';
+import { occlusionsThrough } from './moves';
+import { tetherDetachments } from './physics/tether';
 import {
   alignLayoutToPlan,
   layoutView,
@@ -21,8 +23,15 @@ import {
  * blockingIssues (line_crossed, subject_out_of_frame, camera_inside, outside_set, plan_mismatch,
  * absent_in_frame, actors_overlap, screen_direction) on the evaluated scene, at each shot's first
  * frame unless said otherwise, and add the desk's own: missing_camera, jump_cut, empty_shot,
- * duration_clamped, physics_unbaked and shot_gap. The blocking line and the moves sentence are
- * rideo's, word for word, with the scene's object names.
+ * duration_clamped, physics_unbaked, shot_gap, subject_revealed (a subject a pan or a tilt brings
+ * into the frame by its last frame), subject_hidden (a subject put away by a hide key
+ * where the shot should show it), occluded_subject (a subject hidden behind an actor the shot
+ * does not frame, the solver's own test) and tether_detached (a kite's string left behind when
+ * its anchor moved after desk.tether_fly keyed the flight). Objects put away by a hide key
+ * (hide.ts) at a frame are nowhere in it: they leave no frame, stand nowhere and hide nothing. A
+ * rider and the mount she sits on move as one: they make no line (line.ts) and cross the frame as
+ * one. The blocking line and the moves sentence are rideo's, word for word, with the scene's object
+ * names.
  */
 
 export const DESK_ISSUE_CODES = [
@@ -34,6 +43,10 @@ export const DESK_ISSUE_CODES = [
   'screen_direction',
   'jump_cut',
   'absent_in_frame',
+  'subject_hidden',
+  'subject_revealed',
+  'occluded_subject',
+  'tether_detached',
   'actors_overlap',
   'outside_set',
   'empty_shot',
@@ -51,10 +64,14 @@ export const DESK_ISSUE_SEVERITY: Readonly<Record<DeskIssueCode, DeskIssueSeveri
   subject_out_of_frame: 'error',
   camera_inside: 'error',
   missing_camera: 'error',
+  tether_detached: 'error',
   plan_mismatch: 'warning',
   screen_direction: 'warning',
   jump_cut: 'warning',
   absent_in_frame: 'warning',
+  subject_hidden: 'warning',
+  subject_revealed: 'warning',
+  occluded_subject: 'warning',
   actors_overlap: 'warning',
   outside_set: 'warning',
   empty_shot: 'warning',
@@ -192,6 +209,23 @@ export function blockingMoves(doc: SceneDoc, shot: ShotData, scene = new DeskSce
 
 const shotLabel = (s: ShotData): string => `'${s.name}'`;
 
+/** 'frame 3' or 'frames 3, 25, 48'. */
+const framesWord = (frames: readonly number[]): string =>
+  `frame${frames.length > 1 ? 's' : ''} ${frames.join(', ')}`;
+
+/** The most frames of a shot tether_detached samples (about four a second, fewer in long shots). */
+const DETACH_SAMPLES = 48;
+
+/** The frames of a shot where tether_detached looks for strings left behind by their anchor. */
+function detachSamples(s: ShotData, fps: number): number[] {
+  const span = s.frame_end - s.frame_start;
+  const step = Math.max(1, Math.round(fps / 4), Math.ceil(span / (DETACH_SAMPLES - 1)));
+  const frames: number[] = [];
+  for (let f = s.frame_start; f < s.frame_end; f += step) frames.push(f);
+  frames.push(s.frame_end);
+  return frames;
+}
+
 function issue(code: DeskIssueCode, shot: string | null, objects: string[], message: string): DeskIssue {
   return {
     code,
@@ -216,7 +250,7 @@ function screenSize(scene: DeskScene, view: CameraView, subjects: readonly strin
   let size = 0;
   for (const id of subjects) {
     const s = scene.subject(id, frame);
-    if (!s) continue;
+    if (!s || s.hidden) continue;
     const top = projectPoint(view, s.head);
     const bottom = projectPoint(view, s.feet);
     if (Number.isFinite(top.y) && Number.isFinite(bottom.y))
@@ -225,9 +259,12 @@ function screenSize(scene: DeskScene, view: CameraView, subjects: readonly strin
   return size;
 }
 
-/** The centre of the subjects' feet at `frame` (null when none is there). */
+/** The centre of the subjects' feet at `frame` (null when none is there, or shown). */
 function centroid(scene: DeskScene, subjects: readonly string[], frame: number): Vec3 | null {
-  const pts = subjects.map((id) => scene.subject(id, frame)?.feet).filter((p): p is Vec3 => !!p);
+  const pts = subjects
+    .map((id) => scene.subject(id, frame))
+    .filter((s): s is NonNullable<typeof s> => !!s && !s.hidden)
+    .map((s) => s.feet);
   if (!pts.length) return null;
   const c: Vec3 = [0, 0, 0];
   for (const p of pts) for (let k = 0; k < 3; k++) c[k] += p[k] / pts.length;
@@ -240,7 +277,7 @@ function crossing(scene: DeskScene, shot: ShotData, id: string): -1 | 0 | 1 {
   const view = scene.camera(shot.camera, shot.frame_start);
   const a = scene.subject(id, shot.frame_start);
   const b = scene.subject(id, shot.frame_end);
-  if (!view || !a || !b || shot.frame_end === shot.frame_start) return 0;
+  if (!view || !a || !b || a.hidden || b.hidden || shot.frame_end === shot.frame_start) return 0;
   const pa = projectPoint(view, a.chest);
   const pb = projectPoint(view, b.chest);
   return Number.isFinite(pa.x) && Number.isFinite(pb.x) && Math.abs(pb.x - pa.x) > 0.15
@@ -316,7 +353,7 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
       for (const id of s.subjects) {
         if (!scene.isActor(id)) continue;
         const sub = scene.subject(id, frame);
-        if (sub && (Math.abs(sub.feet[0]) > halfW || Math.abs(sub.feet[1]) > halfD))
+        if (sub && !sub.hidden && (Math.abs(sub.feet[0]) > halfW || Math.abs(sub.feet[1]) > halfD))
           issues.push(
             issue('outside_set', s.id, [id], `${name(id)} stands outside the set in shot ${shotLabel(s)}`),
           );
@@ -327,10 +364,12 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
       for (let j = i + 1; j < here.length; j++) {
         const a = scene.subject(here[i], frame);
         const b = scene.subject(here[j], frame);
-        // a rider above its mount does not stand in its place
+        // a rider above its mount does not stand in its place; one put away stands nowhere
         if (
           a &&
           b &&
+          !a.hidden &&
+          !b.hidden &&
           Math.hypot(a.feet[0] - b.feet[0], a.feet[1] - b.feet[1]) < OVERLAP_M &&
           Math.abs(a.feet[2] - b.feet[2]) < 0.5
         )
@@ -343,6 +382,21 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
             ),
           );
       }
+    // a kite's string left behind where its anchor was when desk.tether_fly keyed the flight
+    for (const d of tetherDetachments(doc, detachSamples(s, fps))) {
+      const first = d.frames[0];
+      const last = d.frames[d.frames.length - 1];
+      const tied = d.bone ? `${name(d.anchor)}'s ${d.bone}` : name(d.anchor);
+      issues.push(
+        issue(
+          'tether_detached',
+          s.id,
+          [d.string, d.flyer, d.anchor],
+          `The string of ${name(d.flyer)} is not tied to ${tied} in shot ${shotLabel(s)} (${last > first ? `frames ${first}–${last}` : `frame ${first}`}, up to ${d.gap.toFixed(2)} m away): ` +
+            `${name(d.anchor)} moved after desk.tether_fly keyed the flight. Run desk.tether_fly again (the same options) after the anchor's moves, so that the string follows`,
+        ),
+      );
+    }
     if (!s.camera) {
       issues.push(issue('missing_camera', s.id, [], `Shot ${shotLabel(s)} has no camera`));
       lines.push({ shot: s.id, line: '' });
@@ -370,25 +424,67 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
     // the shot with, its own or their defaults: the shoulder, a viewer, an insert's cast), at its
     // first, middle and last frames (its first only for moves that turn away; the solver keeps the
     // subjects in frame over the same frames)
+    // a subject put away by a hide key at such a frame is not in the picture by design or by
+    // mistake: said as hidden (subject_hidden), not as out of frame
     const unframed = unframedSubjects(scene, s.subjects, shotSpec(scene, s, all.indexOf(s)));
     const frames = inFrameSamples(s);
+    // a pan or a tilt may also bring a subject in (a reveal): one out of frame at its first frame and
+    // in it at its last is revealed (a warning), not out of frame
+    const turning = !!s.move && TURNING_MOVES.has(s.move) && s.frame_end > s.frame_start;
+    const inFrameAt = (id: string, f: number): boolean | null => {
+      const v = scene.camera(cam, f);
+      const sub = scene.subject(id, f);
+      if (!v || !sub || sub.hidden) return null;
+      const p = projectPoint(v, sub.actor ? sub.eyes : sub.center);
+      return Number.isFinite(p.x) && Math.abs(p.x) <= 1 && p.y >= -1 && p.y <= 1.15;
+    };
     for (const id of s.subjects) {
       if (unframed.has(id)) continue;
       const out: number[] = [];
+      const hidden: number[] = [];
       for (const f of frames) {
         const v = scene.camera(cam, f);
         const sub = scene.subject(id, f);
         if (!v || !sub) continue;
-        const p = projectPoint(v, sub.actor ? sub.eyes : sub.center);
-        if (!(Number.isFinite(p.x) && Math.abs(p.x) <= 1 && p.y >= -1 && p.y <= 1.15)) out.push(f);
+        if (sub.hidden) {
+          hidden.push(f);
+          continue;
+        }
+        if (!inFrameAt(id, f)) out.push(f);
       }
+      if (turning && out.length) {
+        if (inFrameAt(id, s.frame_end)) {
+          issues.push(
+            issue(
+              'subject_revealed',
+              s.id,
+              [id],
+              `${name(id)} comes into the frame of shot ${shotLabel(s)} only as its ${s.move} ends (out of it at ` +
+                `${framesWord(out)}, in it at frame ${s.frame_end}): the move reveals it; frame it from the start ` +
+                'if it should be seen throughout',
+            ),
+          );
+          out.length = 0;
+        } else out.push(s.frame_end);
+      }
+      if (hidden.length)
+        issues.push(
+          issue(
+            'subject_hidden',
+            s.id,
+            [id],
+            `${name(id)} is hidden in shot ${shotLabel(s)} (${framesWord(hidden)}): it is scaled to nothing there ` +
+              "(put away: desk.tether_fly's after 'hide', or an actor the rideo import hides in shots it is not " +
+              "cast in), so the shot does not show it; take it out of the shot's subjects, or show it again",
+          ),
+        );
       if (out.length)
         issues.push(
           issue(
             'subject_out_of_frame',
             s.id,
             [id],
-            `${name(id)} is not in the frame of shot ${shotLabel(s)} (frame${out.length > 1 ? 's' : ''} ${out.join(', ')})`,
+            `${name(id)} is not in the frame of shot ${shotLabel(s)} (${framesWord(out)})`,
           ),
         );
     }
@@ -428,7 +524,8 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
         const o = scene.objects.get(id);
         if (!o || o.hide_render) continue;
         const sub = scene.subject(id, frame);
-        if (sub && inPicture(projectPoint(view, sub.chest), 0.9))
+        // one put away by a hide key there (an actor the rideo import hides) shows nowhere
+        if (sub && !sub.hidden && inPicture(projectPoint(view, sub.chest), 0.9))
           issues.push(
             issue(
               'absent_in_frame',
@@ -438,6 +535,28 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
             ),
           );
       }
+    // subjects hidden behind an actor the shot does not frame, through the camera as keyed, at the
+    // same frames (the solver's test: moves.ts shotOcclusions)
+    for (const o of occlusionsThrough(
+      scene,
+      s.subjects,
+      frames,
+      frames.map((f) => scene.camera(cam, f)),
+    )) {
+      const by = o.by.join(' and ');
+      const what = o.frames.length
+        ? `${o.name} (${framesWord(o.frames)}${o.body_frames.length ? `; the body only at ${framesWord(o.body_frames)}` : ''})`
+        : `The body of ${o.name} (${framesWord(o.body_frames)})`;
+      issues.push(
+        issue(
+          'occluded_subject',
+          s.id,
+          [o.subject, ...o.by_ids],
+          `${what} is hidden behind ${by}, who ${o.by.length > 1 ? 'are' : 'is'} not in shot ${shotLabel(s)}: ` +
+            `restage, add ${by} to its subjects, or choose another angle or height`,
+        ),
+      );
+    }
   }
 
   // between consecutive shots of the cut
@@ -445,8 +564,12 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
     const prev = cut[i - 1];
     const s = cut[i];
     if (!isChecked.has(s.id)) continue;
-    if (s.continuity !== 'continuous')
-      for (const id of s.subjects.filter((c) => prev.subjects.includes(c) && scene.isActor(c))) {
+    if (s.continuity !== 'continuous') {
+      const shared = s.subjects.filter((c) => prev.subjects.includes(c) && scene.isActor(c));
+      for (const id of shared) {
+        // a rider crosses the frame with the mount she sits on: the pair is judged once, by the mount
+        const mount = scene.mountOf(id, prev.frame_start) ?? scene.mountOf(id, s.frame_start);
+        if (mount && shared.includes(mount)) continue;
         const a = crossing(scene, prev, id);
         const b = crossing(scene, s, id);
         if (a !== 0 && b !== 0 && a !== b)
@@ -459,6 +582,7 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
             ),
           );
       }
+    }
     const jump = jumpCut(scene, prev, s);
     if (jump)
       issues.push(

@@ -12,7 +12,9 @@ import { layoutView, planAgreement } from './plan';
  * action, the side of it the scene's cameras keep to (set by the first shot that frames both), and
  * the mirroring of cut cameras that crossed it. Orbits cross it by design and are left alone; a
  * shot's planned layout wins over the line (desk.shot_solve fits plans after enforcing the line).
- * Pair positions are read at each shot's first frame (rideo: the shot's marks).
+ * Pair positions are read at each shot's first frame (rideo: the shot's marks). A rider and the
+ * mount she sits on (desk.actor_mount) move as one, their marks a few centimetres apart: they make
+ * no line, so a shot where they ride counts neither towards the main pair nor for its line.
  */
 
 /** The scene's line: its main pair (actor ids) and the side of their line the cameras stay on. */
@@ -35,11 +37,13 @@ const inCut = (shots: readonly ShotData[]) => shots.filter((s) => s.enabled);
 /**
  * rideo's mainPair over shots: the two actors sharing the most shots (in cut order; the pair first
  * seen wins ties), else, with singles only, the two seen most. `isActor` picks a shot's actors out of
- * its subjects.
+ * its subjects; `apart` (default: always) says whether two of them are a pair in a shot (a rider and
+ * her mount are not).
  */
-export function mainPairOf(
-  shots: readonly Pick<ShotData, 'subjects'>[],
+export function mainPairOf<S extends Pick<ShotData, 'subjects'>>(
+  shots: readonly S[],
   isActor: (id: string) => boolean,
+  apart: (a: string, b: string, shot: S) => boolean = () => true,
 ): [string, string] | null {
   const order: string[] = [];
   const together = new Map<string, number>();
@@ -53,6 +57,7 @@ export function mainPairOf(
     for (let i = 0; i < cast.length; i++)
       for (let j = i + 1; j < cast.length; j++) {
         const [x, y] = [cast[i], cast[j]];
+        if (!apart(x, y, s)) continue;
         const key = order.indexOf(x) <= order.indexOf(y) ? `${x}|${y}` : `${y}|${x}`;
         together.set(key, (together.get(key) ?? 0) + 1);
       }
@@ -69,6 +74,12 @@ export function mainPairOf(
   return seen.length >= 2 ? [seen[0], seen[1]] : null;
 }
 
+/** Whether two actors are a pair in a shot: neither rides the other at its first frame. */
+const apartIn =
+  (scene: DeskScene) =>
+  (a: string, b: string, shot: Pick<ShotData, 'frame_start'>): boolean =>
+    !scene.rideTogether(a, b, shot.frame_start);
+
 /**
  * The two actors whose line of action is the 180° line: desk.main_pair when it names two actors,
  * else the pair sharing the most enabled shots (rideo's mainPair).
@@ -76,7 +87,7 @@ export function mainPairOf(
 export function mainPair(doc: SceneDoc, scene = new DeskScene(doc)): [string, string] | null {
   const set = getDeskSettings(doc).main_pair;
   if (set && scene.isActor(set[0]) && scene.isActor(set[1])) return [set[0], set[1]];
-  return mainPairOf(inCut(getShots(doc)), (id) => scene.isActor(id));
+  return mainPairOf(inCut(getShots(doc)), (id) => scene.isActor(id), apartIn(scene));
 }
 
 /** The floor points of the pair at `frame`, or null when one of them is gone. */
@@ -101,15 +112,16 @@ export function lineOfAction(scene: DeskScene, shots?: readonly ShotData[]): Lin
   const doc = scene.doc;
   const ordered = shots ?? inCut(getShots(doc));
   const set = getDeskSettings(doc).main_pair;
+  const apart = apartIn(scene);
   const pair: [string, string] | null =
     set && scene.isActor(set[0]) && scene.isActor(set[1])
       ? [set[0], set[1]]
-      : mainPairOf(ordered, (id) => scene.isActor(id));
+      : mainPairOf(ordered, (id) => scene.isActor(id), apart);
   if (!pair) return null;
   const both = ordered.filter((s) => pair.every((id) => s.subjects.includes(id)));
   const either = ordered.filter((s) => pair.some((id) => s.subjects.includes(id)));
   for (const s of [...both, ...either]) {
-    if (!s.camera) continue;
+    if (!s.camera || !apart(pair[0], pair[1], s)) continue;
     const view = scene.camera(s.camera, s.frame_start);
     const pts = pairPoints(scene, pair, s.frame_start);
     if (!view || !pts) continue;
@@ -124,9 +136,12 @@ export function lineOfAction(scene: DeskScene, shots?: readonly ShotData[]): Lin
   return { a: pair[0], b: pair[1], side: (front || 1) as 1 | -1 };
 }
 
-/** The line's floor points at `frame` with its side, for the solver; null when the pair is gone. */
+/**
+ * The line's floor points at `frame` with its side, for the solver; null when the pair is gone, or
+ * one of them rides the other then (no line between them).
+ */
 export function linePointsAt(scene: DeskScene, line: LineOfAction | null, frame: number): LinePoints | null {
-  if (!line) return null;
+  if (!line || scene.rideTogether(line.a, line.b, frame)) return null;
   const pts = pairPoints(scene, [line.a, line.b], frame);
   return pts ? { ...pts, side: line.side } : null;
 }
@@ -134,11 +149,12 @@ export function linePointsAt(scene: DeskScene, line: LineOfAction | null, frame:
 /**
  * Whether the camera of `shot` stands on the wrong side of the line at its first frame (rideo's
  * line_crossed): a cut (not an orbit) framing one of the pair, its camera off the line on the other
- * side.
+ * side. Never while one of the pair rides the other (no line between them).
  */
 export function crossesLine(scene: DeskScene, line: LineOfAction | null, shot: ShotData): boolean {
   if (!line || !shot.camera || crossesByDesign(shot)) return false;
   if (!shot.subjects.includes(line.a) && !shot.subjects.includes(line.b)) return false;
+  if (scene.rideTogether(line.a, line.b, shot.frame_start)) return false;
   const pts = pairPoints(scene, [line.a, line.b], shot.frame_start);
   const view = scene.camera(shot.camera, shot.frame_start);
   if (!pts || !view) return false;

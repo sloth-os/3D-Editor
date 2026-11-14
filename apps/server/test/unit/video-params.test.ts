@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import { SceneDoc, newShotId, setDeskSettings, setShots } from '@3d-editor/core';
 import { ToolError } from '../../src/mcp/agent';
+import { DEFAULT_PASS } from '../../src/rideo/shots';
 import {
+  EXPORT_PRESET_PARAMS,
   MAX_EXPORT_WAIT_S,
+  RIDEO_PASSES,
   exportSize,
+  exportVideoArgsShape,
   qualityPreset,
   videoExportParamsSchema,
   type VideoExportParams,
@@ -94,6 +99,58 @@ describe('export parameters', () => {
     expect(MAX_EXPORT_WAIT_S).toBeLessThan(60);
   });
 
+  it("applies preset 'rideo' where the parameters leave it out: what rideo_push sends", () => {
+    expect(params({ preset: 'rideo' })).toMatchObject({
+      preset: 'rideo',
+      quality: 'draft',
+      look: 'clay',
+      outputs: { sequence: false, clips: true, posters: false, contact_sheet: false },
+      passes: ['beauty', 'depth', 'pose'],
+      codec: 'h264',
+    });
+    // the parameters given win, outputs key by key
+    expect(
+      params({
+        preset: 'rideo',
+        quality: 'standard',
+        look: 'material',
+        passes: ['beauty'],
+        outputs: { posters: true },
+      }),
+    ).toMatchObject({
+      quality: 'standard',
+      look: 'material',
+      passes: ['beauty'],
+      outputs: { sequence: false, clips: true, posters: true, contact_sheet: false },
+    });
+    // parsing again (start() re-parses what MCP and REST parsed) changes nothing
+    const once = params({ preset: 'rideo', outputs: { sequence: true } });
+    expect(params(once as unknown as Record<string, unknown>)).toEqual(once);
+    expect(videoExportParamsSchema.safeParse({ preset: 'previs' }).success).toBe(false);
+    expect(videoExportParamsSchema.safeParse({ preset: 'constructor' }).success).toBe(false);
+    // without a preset, the defaults as before
+    expect(params({}).preset).toBeUndefined();
+  });
+
+  it("renders with preset 'rideo' every pass a reference mode of rideo_push sends", () => {
+    expect([...RIDEO_PASSES].sort()).toEqual([...new Set(Object.values(DEFAULT_PASS))].sort());
+    expect(EXPORT_PRESET_PARAMS.rideo.passes).toBe(RIDEO_PASSES);
+  });
+
+  it("leaves to the export what export_video's arguments leave out, for the preset to set", () => {
+    // the tool's schema has no defaults for what a preset sets (the MCP SDK would fill them in)
+    const args = z.object(exportVideoArgsShape);
+    expect(args.parse({ preset: 'rideo' })).not.toHaveProperty('quality');
+    expect(args.parse({ preset: 'rideo' })).not.toHaveProperty('look');
+    expect(args.parse({ preset: 'rideo' })).not.toHaveProperty('passes');
+    expect(params(args.parse({ preset: 'rideo' }))).toMatchObject({ quality: 'draft', look: 'clay' });
+    expect(params(args.parse({}))).toMatchObject({
+      quality: 'standard',
+      look: 'material',
+      passes: ['beauty'],
+    });
+  });
+
   it('maps qualities to render settings', () => {
     expect(qualityPreset('draft', 1280, 720)).toEqual({ samples: 1, shadows: true, ao: false, msaa: true });
     expect(qualityPreset('standard', 1280, 720)).toEqual({ samples: 2, shadows: true, ao: true, msaa: true });
@@ -168,6 +225,18 @@ describe('export plan', () => {
     // a shot without a camera of its own uses the scene camera
     const sceneCam = sceneWithShots([{ name: 'A', frame_start: 1, frame_end: 10, camera: null }]);
     expect(planExport(sceneCam.doc, params()).shots[0].camera).toBe(sceneCam.cam);
+  });
+
+  it("sizes a preset 'rideo' export at the render resolution at 100 % (rideo's, after rideo_import)", () => {
+    const { doc } = sceneWithShots([{ name: 'Wide', frame_start: 1, frame_end: 24 }]);
+    // the scene renders at 50 %: 960×540 by default, rideo's 1920×1080 with the preset
+    expect(planExport(doc, params())).toMatchObject({ width: 960, height: 540 });
+    expect(planExport(doc, params({ preset: 'rideo' }))).toMatchObject({ width: 1920, height: 1080 });
+    // a size given wins
+    expect(planExport(doc, params({ preset: 'rideo', width: 640 }))).toMatchObject({
+      width: 640,
+      height: 360,
+    });
   });
 
   it('exports a frame range without shots', () => {

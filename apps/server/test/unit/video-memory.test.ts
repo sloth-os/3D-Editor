@@ -266,56 +266,84 @@ describe('export memory estimates', () => {
   it('fits as many render processes as the memory left holds, at most RENDER_WORKERS', () => {
     const base = {
       capacity: 4,
-      starting: 0,
       processBytes: 500 * MiB,
       ffmpegBytes: GiB,
       serverBytes: 512 * MiB,
     };
-    // plenty: every one
+    const B = RENDER_PROCESS_BASE_BYTES;
+    // a process the pool starts for the export: its base and the estimate
+    const P = 500 * MiB + B;
+    // plenty: every one, each started for the export
     expect(planRenderProcesses({ ...base, available: 64 * GiB })).toEqual({
       processes: 4,
       reserved: 1536 * MiB,
       reused: 0,
+      started: 4,
     });
-    // 1.5 GB left after the reserve: 3 processes of 500 MB
-    expect(planRenderProcesses({ ...base, available: 3 * GiB }).processes).toBe(3);
-    expect(planRenderProcesses({ ...base, available: 1536 * MiB + 999 * MiB }).processes).toBe(1);
-    // not even one
-    expect(planRenderProcesses({ ...base, available: 1536 * MiB + 499 * MiB }).processes).toBe(0);
+    // 3 started processes' worth left after the reserve
+    expect(planRenderProcesses({ ...base, available: 1536 * MiB + 3 * P }).processes).toBe(3);
+    expect(planRenderProcesses({ ...base, available: 1536 * MiB + 2 * P - 1 }).processes).toBe(1);
+    // not even one: a started process needs its base too
+    expect(planRenderProcesses({ ...base, available: 1536 * MiB + P - 1 }).processes).toBe(0);
+    expect(planRenderProcesses({ ...base, available: 1536 * MiB + P })).toMatchObject({
+      processes: 1,
+      started: 1,
+    });
     expect(planRenderProcesses({ ...base, available: 0 }).processes).toBe(0);
-    // processes the pool still has to start take their base memory first
-    const cold = planRenderProcesses({ ...base, starting: 3, available: 3 * GiB });
-    expect(cold.reserved).toBe(1536 * MiB + 3 * RENDER_PROCESS_BASE_BYTES);
-    expect(cold.processes).toBe(2);
+    // the processes it does not lease take nothing: the pool starts only what a lease takes (it
+    // used to start all RENDER_WORKERS, whose bases left room for one process here, not two)
+    expect(planRenderProcesses({ ...base, available: 1536 * MiB + 2 * P })).toMatchObject({
+      processes: 2,
+      reserved: 1536 * MiB,
+    });
+    // another process the export may start (the contact sheet's interactive one) keeps its base
+    const other = planRenderProcesses({ ...base, otherStarting: 1, available: 1536 * MiB + 2 * P });
+    expect(other.reserved).toBe(1536 * MiB + B);
+    expect(other.processes).toBe(1);
     // RENDER_WORKERS 1, 2
-    expect(planRenderProcesses({ ...base, capacity: 1, starting: 1, available: 64 * GiB }).processes).toBe(1);
+    expect(planRenderProcesses({ ...base, capacity: 1, available: 64 * GiB }).processes).toBe(1);
     expect(planRenderProcesses({ ...base, capacity: 2, available: 64 * GiB }).processes).toBe(2);
   });
 
   it('lets running render processes reuse what they hold, in the order the pool leases them', () => {
     const base = {
       capacity: 4,
-      starting: 0,
       processBytes: 500 * MiB,
       ffmpegBytes: GiB,
       serverBytes: 512 * MiB,
     };
-    // 600 MB left: two processes holding 400 MB each need 100 MB each, a third one 500 MB more
+    const B = RENDER_PROCESS_BASE_BYTES;
+    // two running processes holding 400 MB each need 100 MB each and no base
     const warm = planRenderProcesses({
       ...base,
-      available: 1536 * MiB + 600 * MiB,
-      reuse: [400 * MiB, 400 * MiB, 0, 0],
+      available: 1536 * MiB + 200 * MiB,
+      reuse: [400 * MiB, 400 * MiB],
     });
-    expect(warm).toEqual({ processes: 2, reserved: 1536 * MiB, reused: 800 * MiB });
-    // the same memory without what they hold: one
-    expect(planRenderProcesses({ ...base, available: 1536 * MiB + 600 * MiB }).processes).toBe(1);
+    expect(warm).toEqual({ processes: 2, reserved: 1536 * MiB, reused: 800 * MiB, started: 0 });
+    // a third one is started for the export: its base and all 500 MB
+    const third = { ...base, reuse: [400 * MiB, 400 * MiB] };
+    expect(
+      planRenderProcesses({ ...third, available: 1536 * MiB + 200 * MiB + 500 * MiB + B - 1 }).processes,
+    ).toBe(2);
+    expect(planRenderProcesses({ ...third, available: 1536 * MiB + 200 * MiB + 500 * MiB + B })).toEqual({
+      processes: 3,
+      reserved: 1536 * MiB,
+      reused: 800 * MiB,
+      started: 1,
+    });
+    // running processes that hold nothing need the estimate, not their base again
+    expect(
+      planRenderProcesses({ ...base, available: 1536 * MiB + 1000 * MiB, reuse: [0, 0] }).processes,
+    ).toBe(2);
+    expect(planRenderProcesses({ ...base, available: 1536 * MiB + 1000 * MiB }).processes).toBe(1);
     // what a process holds counts up to what it needs, never as memory for another
     expect(planRenderProcesses({ ...base, available: 1536 * MiB, reuse: [4 * GiB] })).toEqual({
       processes: 1,
       reserved: 1536 * MiB,
       reused: 500 * MiB,
+      started: 0,
     });
-    // the pool leases its processes in order: a cold one first takes its whole estimate
+    // the pool leases its processes in order: a running one that holds nothing first takes its whole estimate
     expect(
       planRenderProcesses({ ...base, available: 1536 * MiB + 500 * MiB, reuse: [0, 500 * MiB, 500 * MiB] })
         .processes,
@@ -324,6 +352,10 @@ describe('export memory estimates', () => {
       planRenderProcesses({ ...base, available: 1536 * MiB + 400 * MiB, reuse: [0, 500 * MiB, 500 * MiB] })
         .processes,
     ).toBe(0);
+    // an unreadable amount counts as nothing held
+    expect(
+      planRenderProcesses({ ...base, available: 1536 * MiB + 500 * MiB, reuse: [Number.NaN] }).processes,
+    ).toBe(1);
   });
 
   it('counts what a running process holds above its base, up to what an export needs but its scene', () => {
@@ -337,7 +369,7 @@ describe('export memory estimates', () => {
     expect(reusableBytes(Number.NaN, e)).toBe(238 * MiB);
   });
 
-  it('decides with the processes still to start, the running ones and the contact sheet', () => {
+  it('decides with the processes it starts, the running ones and the contact sheet', () => {
     const passes = ['beauty', 'depth'] as const;
     const needs = exportNeeds({
       snapshot: doc,
@@ -354,31 +386,31 @@ describe('export memory estimates', () => {
     });
     const T = needs.process.total;
     const R = needs.ffmpeg + needs.server;
+    const B = RENDER_PROCESS_BASE_BYTES;
     const machine = (available: number): MachineMemory => ({ available, source: 'meminfo' });
-    // a cold pool: both bases, and one for the interactive process the contact sheet may start
-    const cold = exportMemory(needs, {
-      notStarted: 2,
-      interactive: true,
-      machine: machine(R + 3 * RENDER_PROCESS_BASE_BYTES + 2 * T),
-    });
-    expect(cold).toMatchObject({ processes: 2, starting: 3 * RENDER_PROCESS_BASE_BYTES, reuse: [] });
-    expect(
-      exportMemory(needs, { notStarted: 2, machine: machine(R + 2 * RENDER_PROCESS_BASE_BYTES + 2 * T - 1) })
-        .processes,
-    ).toBe(1);
+    // a cold pool: both processes started with their bases, one more for the interactive process
+    // the contact sheet may start
+    const cold = exportMemory(needs, { interactive: true, machine: machine(R + 3 * B + 2 * T) });
+    expect(cold).toMatchObject({ processes: 2, starting: 3 * B, reuse: [] });
+    expect(exportMemory(needs, { machine: machine(R + 2 * B + 2 * T - 1) }).processes).toBe(1);
+    // memory for one: only its base is started (not RENDER_WORKERS bases)
+    expect(exportMemory(needs, { machine: machine(R + B + T) })).toMatchObject({ processes: 1, starting: B });
     // running processes: no base to start, what they hold above theirs is reused
     const held = 100 * MiB;
     const warm = exportMemory(needs, {
-      notStarted: 0,
-      warm: [RENDER_PROCESS_BASE_BYTES + held, RENDER_PROCESS_BASE_BYTES + held],
+      warm: [B + held, B + held],
       machine: machine(R + 2 * (T - held)),
     });
     expect(warm).toMatchObject({ processes: 2, starting: 0, reuse: [held, held] });
-    expect(exportMemory(needs, { notStarted: 0, machine: machine(R + 2 * (T - held)) }).processes).toBe(1);
+    // the same memory for a cold pool: each process needs its base and all of the estimate
+    expect(exportMemory(needs, { machine: machine(R + B + T + (T - held)) }).processes).toBe(1);
+    // one running, one started for the export
+    expect(exportMemory(needs, { warm: [B + held], machine: machine(R + (T - held) + B + T) })).toMatchObject(
+      { processes: 2, starting: B, reuse: [held] },
+    );
     // more running processes than RENDER_WORKERS: only RENDER_WORKERS are leased
     expect(
-      exportMemory(needs, { notStarted: 0, warm: [Infinity, Infinity, Infinity], machine: machine(64 * GiB) })
-        .reuse,
+      exportMemory(needs, { warm: [Infinity, Infinity, Infinity], machine: machine(64 * GiB) }).reuse,
     ).toHaveLength(2);
   });
 
@@ -398,38 +430,33 @@ describe('export memory estimates', () => {
       capacity: 2,
       maxBytesAhead: MAX_BYTES_AHEAD,
     });
-    const m = exportMemory(needs, { notStarted: 2, machine });
+    const B = RENDER_PROCESS_BASE_BYTES;
+    const m = exportMemory(needs, { machine });
     expect(m.processes).toBe(0);
     expect(m.encoders).toBe(4);
-    expect(m.starting).toBe(2 * RENDER_PROCESS_BASE_BYTES);
+    // what the first process it would lease needs: started for it, with its base
+    expect(m.starting).toBe(B);
     const msg = outOfMemoryMessage(m, 1920, 1080);
     const mb = (b: number) => Math.round(b / MiB);
     expect(msg).toContain(
-      `it needs about ${mb(m.process.total + m.ffmpeg + m.server + m.starting)} MB (a render process ${mb(m.process.total)} MB at 1920×1080`,
+      `it needs about ${mb(m.process.total + m.ffmpeg + m.server + B)} MB (a render process ${mb(m.process.total)} MB at 1920×1080`,
     );
     expect(msg).toContain(`ffmpeg's 4 encoders ${mb(m.ffmpeg)} MB`);
+    expect(msg).toContain(`the server and starting render processes ${mb(m.server + B)} MB`);
     expect(msg).toContain('the machine has 300 MB available');
     expect(msg).toContain("export a smaller size (width and height), fewer passes or quality 'draft'");
-    // the pool starts every render process for an export: fewer of them leave more for one
-    expect(msg).toContain(
-      'run the server with fewer render processes (RENDER_WORKERS, now 2: it starts all of them for an export, about 128 MB each before they render)',
-    );
+    // the pool starts only the processes an export leases: fewer RENDER_WORKERS would not help
+    expect(msg).not.toContain('RENDER_WORKERS');
     expect(msg).not.toContain('held by a running one');
-    // a running process holding part of it: the need is what it does not hold
-    const warm = exportMemory(needs, {
-      notStarted: 0,
-      warm: [RENDER_PROCESS_BASE_BYTES + 64 * MiB],
-      machine,
-    });
+    // the interactive process the contact sheet may start keeps its base too
+    expect(exportMemory(needs, { interactive: true, machine }).starting).toBe(2 * B);
+    // a running process holding part of it: the need is what it does not hold, and no base
+    const warm = exportMemory(needs, { warm: [B + 64 * MiB], machine });
+    expect(warm.starting).toBe(0);
     expect(outOfMemoryMessage(warm, 1920, 1080)).toContain(
       `it needs about ${mb(warm.process.total - 64 * MiB + warm.ffmpeg + warm.server)} MB`,
     );
     expect(outOfMemoryMessage(warm, 1920, 1080)).toContain('64 MB of it held by a running one already');
-    expect(outOfMemoryMessage(warm, 1920, 1080)).not.toContain('RENDER_WORKERS');
-    // one render process: nothing to lower
-    expect(
-      outOfMemoryMessage(exportMemory({ ...needs, capacity: 1 }, { notStarted: 1, machine }), 1920, 1080),
-    ).not.toContain('RENDER_WORKERS');
     expect(renderInfo(m)).toEqual({
       processes: 0,
       render_workers: 2,
@@ -586,9 +613,10 @@ describe('exports and the machine memory', { timeout: 30_000 }, () => {
   it('renders on fewer render processes when memory is short, and says so', async () => {
     const p = params({ passes: ['beauty', 'depth'] });
     const n = needsOf(exportScene({ shots: 2, frames: 6 }).doc, p, 4);
-    // the bases of the 4 render processes and of the interactive one (contact sheet) first
+    // the base of the interactive one (contact sheet) first, then two and a half render processes
+    // started with their bases
     const memory: MemoryReader = () => ({
-      available: kept(n) + 5 * B + 2.5 * n.process.total,
+      available: kept(n) + B + 2 * (B + n.process.total) + 0.5 * n.process.total,
       source: 'cgroup',
     });
     const { exports, seen, renderer } = await service({ threads: 4, memory });
@@ -604,6 +632,8 @@ describe('exports and the machine memory', { timeout: 30_000 }, () => {
     const threads = new Set(seen.events.filter((e) => e.startsWith('image:')).map((e) => e.split(':')[1]));
     expect(threads.size).toBe(2);
     expect(renderer.stats.images).toHaveLength(12);
+    // and the pool started those 2 only
+    expect(renderer.renderer.pool.running).toBe(2);
     await exports.close();
   });
 
@@ -676,10 +706,10 @@ describe('exports and the machine memory', { timeout: 30_000 }, () => {
     const run = async (contact_sheet: boolean) => {
       const p = params({ passes: ['beauty'], outputs: { contact_sheet } });
       const n = needsOf(exportScene({ shots: 2, frames: 6 }).doc, p, 2);
-      // two bases, one more for the interactive process, and one and a half render processes
+      // the interactive process's base, and two render processes started with theirs but for 1 MiB
       const { exports } = await service({
         threads: 2,
-        memory: () => ({ available: kept(n) + 3 * B + 1.5 * n.process.total, source: 'meminfo' }),
+        memory: () => ({ available: kept(n) + B + 2 * (B + n.process.total) - MiB, source: 'meminfo' }),
       });
       const q = await exports.start('p1', p);
       const job = await until(() => exports.status(q.id, { waitS: 5 }), settled);
@@ -701,7 +731,10 @@ describe('exports and the machine memory', { timeout: 30_000 }, () => {
       await exports.close();
       return q.progress.eta_s!;
     };
-    const one = await eta(() => ({ available: kept(n) + 4 * B + 1.5 * n.process.total, source: 'meminfo' }));
+    const one = await eta(() => ({
+      available: kept(n) + B + 1.5 * n.process.total,
+      source: 'meminfo',
+    }));
     const four = await eta(plenty);
     // 12 frames of 1920×1080 on one render process, against four: about four times as long
     expect(four).toBeGreaterThan(2);
@@ -770,8 +803,17 @@ describe('the memory decision with running render processes', () => {
   const T = n.process.total;
   const machine = (available: number): MachineMemory => ({ available, source: 'meminfo' });
 
-  /** A pool of 2 running render processes, each `rss`, `busy` ones with work of another render. */
-  function pool(o: { rss: number; others?: number; busy?: number[]; running?: number }) {
+  /**
+   * A pool of 2 running render processes of long renders, each `rss`, `busy` ones with work of
+   * another render (`interactive`: the process kept for interactive renders runs too).
+   */
+  function pool(o: {
+    rss: number;
+    others?: number;
+    busy?: number[];
+    running?: number;
+    interactive?: boolean;
+  }) {
     const calls: number[] = [];
     let leases = 0;
     const threads = [1, 2].map((id) => ({
@@ -786,14 +828,19 @@ describe('the memory decision with running render processes', () => {
         return { rss: o.rss, heapUsed: 0, external: 0, arrayBuffers: 0 };
       },
     }));
+    const running = o.running ?? 2;
     const fakePool = {
       mode: 'processes',
       capacity: 2,
-      running: o.running ?? 2,
+      running: running + (o.interactive ? 1 : 0),
+      runningLong: running,
+      runningInteractive: !!o.interactive,
       activeLongRenders: 1 + (o.others ?? 0),
-      async lease() {
+      async lease(max: number) {
         leases++;
-        return { threads, release() {} };
+        // the running processes only: asking them must not start another
+        expect(max).toBe(running);
+        return { threads: threads.slice(0, max), release() {} };
       },
     } as unknown as Renderer['pool'];
     return { pool: fakePool, calls, leases: () => leases };
@@ -830,7 +877,7 @@ describe('the memory decision with running render processes', () => {
     ).toBe(2);
     // nothing runs: the plan of a cold pool (both bases and the interactive one kept)
     const idle = pool({ rss: B + 100 * MiB, running: 0 });
-    const cold = exportMemory(n, { notStarted: 2, interactive: true, machine: machine(tight + 3 * B) });
+    const cold = exportMemory(n, { interactive: true, machine: machine(tight + 3 * B) });
     expect(cold.processes).toBe(1);
     expect(
       (await decideMemory(idle.pool, n, { read: read(tight + 3 * B), contactSheet: true, signal })).processes,
@@ -844,8 +891,21 @@ describe('the memory decision with running render processes', () => {
     expect(fits.leases() + idle.leases() + none.leases()).toBe(0);
   });
 
+  it('asks only the running processes: none is started to be asked', async () => {
+    // RENDER_WORKERS 4, two of them running: the probe leases those two (the pool would start the
+    // others for a lease of four), and the export starts the others only when they fit
+    const n4 = needsOf(doc, p, 4);
+    const f = pool({ rss: B + 100 * MiB });
+    // room for the two running ones less what they hold, not for a third started one
+    const room = kept(n4) + B + 2 * (n4.process.total - 100 * MiB) + n4.process.total;
+    const m = await decideMemory(f.pool, n4, { read: read(room), contactSheet: true, signal });
+    expect(f.leases()).toBe(1);
+    expect(f.calls).toEqual([1, 2]);
+    expect(m).toMatchObject({ processes: 2, reuse: [100 * MiB, 100 * MiB], starting: B });
+  });
+
   it('keeps the interactive base only while the interactive process does not run', async () => {
-    const without = pool({ rss: B + 100 * MiB, running: 3 });
+    const without = pool({ rss: B + 100 * MiB, interactive: true });
     const m = await decideMemory(without.pool, n, {
       read: read(tight - B),
       contactSheet: true,

@@ -4,6 +4,7 @@ import type { SceneDoc } from '../../doc/scene-doc';
 import type { ObjectData } from '../../doc/types';
 import type { FrameState } from '../../eval/frame-state';
 import { OperatorError } from '../../operators/context';
+import { getCatalogEntry } from '../../store/catalog';
 import {
   baseName,
   channelsFor,
@@ -232,6 +233,22 @@ export interface VehicleWheel {
   steered: boolean;
 }
 
+/** Words that make a vehicle a boat: it has no wheels to turn (its name, label or store entry says so). */
+const BOAT_WORDS = /\b(boat|rowboat|sailboat|ship|yacht|canoe|kayak|dinghy|raft|ferry|watercraft)\b/i;
+
+/** Whether a vehicle model is a boat: its name, its desk label or its store entry's name and tags say so. */
+function isBoat(root: ObjectData): boolean {
+  const words = [root.name];
+  for (const key of ['desk_label', 'store_id'] as const) {
+    const v = root.custom_props?.[key];
+    if (typeof v !== 'string') continue;
+    words.push(v);
+    const entry = key === 'store_id' ? getCatalogEntry(v) : null;
+    if (entry) words.push(entry.name, ...entry.tags);
+  }
+  return BOAT_WORDS.test(words.join(' '));
+}
+
 /** The wheels of a vehicle model (wheel.* parts) with their radii, and its steering pivots (steer.*). */
 export function vehicleRig(
   doc: SceneDoc,
@@ -369,7 +386,8 @@ export function vehicleDrive(
   const cruise = path.length / (duration - ease);
 
   const rig = vehicleRig(doc, fs0, root);
-  if (!rig.wheels.length) warnings.push(`'${root.name}' has no wheel.* parts: only the vehicle moves`);
+  if (!rig.wheels.length && !isBoat(root))
+    warnings.push(`'${root.name}' has no wheel.* parts: only the vehicle moves`);
   if (!rig.steering.length && rig.wheels.some((w) => w.front))
     warnings.push(`'${root.name}' has no steer.* pivots: its front wheels do not steer`);
   const rootScale = [...root.scale] as Vec3;

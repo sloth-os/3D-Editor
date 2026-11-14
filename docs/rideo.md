@@ -55,18 +55,22 @@ editor and back without any change to rideo:
    our shot id for each rideo shot, the issues found and warnings (no blocking yet, rideo's desk
    view off, storyboard frames to redraw). One undo step. An agent that already has the blocking
    and the clip documents can run `desk.import_rideo_blocking` itself instead.
-3. **editor**: refine the staging with the desk operators (`desk.actor_move`, `desk.tether_fly`,
-   `desk.physics_throw` …), then `desk.shot_solve {only_missing: true}` and `desk.check`. Fix
+3. **editor**: refine the staging with the desk operators (`desk.actor_move`, `desk.tether_fly`
+   after the anchor's moves, `desk.physics_throw` …), then `desk.shot_solve {only_missing: true}`
+   and `desk.check`. A later `rideo_import` rebuilds the imported actors, props and cameras from
+   rideo's blocking (its warnings name those changed here since): push first. Fix
    `line_crossed`, `subject_out_of_frame` and `plan_mismatch`;
    `render_animation {camera: 'shots', format: 'CONTACT_SHEET'}` shows the cut.
-4. **editor**
-   `export_video {project, quality: 'draft', look: 'clay', outputs: {sequence: false, clips: true, posters: false, contact_sheet: false}, passes: ['beauty', 'depth', 'pose']}`
-   at rideo's fps and size (the import set them as the scene's), then
-   `export_status {export, wait_s: 50}` until it is done.
+4. **editor** `export_video {project, preset: 'rideo'}`: draft clips in the clay look with the
+   beauty, depth and pose passes (one for each reference mode), without the sequence, posters or
+   contact sheet, at rideo's fps and size (the import set them as the scene's fps and render
+   resolution), then `export_status {export, wait_s: 50}` until it is done.
 5. **editor** `rideo_push {project, export, rideo: {project, clip}, mode: 'camera'}`: writes our
-   blocking to the clip, then uploads each chosen shot's clip and sets its `motionReference` and
-   camera move. It returns, per shot, the rideo resource and mode or the error, the blocking lines
-   that differ, the boards to redraw and the shots whose staging changed since the export.
+   blocking to the clip, then uploads each chosen shot's clip of the pass its mode sends (`motion`
+   beauty, `pose` pose, `camera` depth) and sets its `motionReference` and camera move. A shot whose
+   export has no clip of that pass fails, naming the export to make: no other pass is sent in its
+   place. It returns, per shot, the rideo resource and mode or the error, the blocking lines that
+   differ, the boards to redraw and the shots whose staging changed since the export.
    `mode: 'camera'` keeps every shot on a camera reference until rideo has measured the others
    ([below](#what-rideo-should-measure-first)); leave it out to get the default per shot.
 6. **rideo**: redraw the boards the push listed (their first frame was drawn before our staging),
@@ -84,17 +88,17 @@ clip rideo does not have fails with a plain message.
 | `export`         | a finished export of the project                                                                                                           |
 | `shots`          | the shots with physics, tethers, held or thrown props or a camera move (our ids or names, or rideo shot ids)                               |
 | `mode`           | per shot: `camera` when rideo's first frame cannot follow our staging, else `motion` for props in motion, `pose` for actors, else `camera` |
-| `pass`           | per mode: `motion` beauty, `pose` the pose pass, `camera` depth                                                                            |
+| `pass`           | per mode: `motion` beauty, `pose` the pose pass, `camera` depth; a shot whose export has no clip of it fails                               |
 | `write_blocking` | true: write our blocking first (an approved clip refuses it, and the push stops there)                                                     |
 
-What the push checks before it uploads: each clip has exactly `round(durationSec × fps)` frames
-of the rideo shot, at rideo's fps and size, H.264 MP4, at most 256 MB; a clip whose camera or
-frame range changed in the project since the export is refused, changed walks turn the shot into
-a camera reference. It never replaces a `performance` reference, uploads a clip only once per
-content (it remembers uploads per rideo clip under `DATA_DIR/rideo-push`, and uploads again when
-rideo no longer has the resource), retries 429 and 503, and stops on a refused token (401/403).
-Every other shot of the clip gets our camera move too, so no shot keeps a move our staging no
-longer has.
+What the push checks before it uploads: the export has the shot's clip of the pass its mode sends
+(it never sends another pass in its place), each clip has exactly `round(durationSec × fps)` frames
+of the rideo shot, at rideo's fps and size, H.264 MP4, at most 256 MB; a clip whose camera or frame
+range changed in the project since the export is refused, changed walks turn the shot into a camera
+reference. It never replaces a `performance` reference, uploads a clip only once per content (it
+remembers uploads per rideo clip under `DATA_DIR/rideo-push`, and uploads again when rideo no longer
+has the resource), retries 429 and 503, and stops on a refused token (401/403). Every other shot of
+the clip gets our camera move too, so no shot keeps a move our staging no longer has.
 
 ## Recipe 2: one REST call
 
@@ -108,7 +112,7 @@ const headers = { authorization: `Bearer ${process.env.EDITOR_TOKEN}`, 'content-
 
 interface PrevisJob {
   id: string;
-  status: 'importing' | 'exporting' | 'pushing' | 'done' | 'failed' | 'cancelled';
+  status: 'importing' | 'exporting' | 'pushing' | 'done' | 'failed';
   project: string | null;
   export: string | null;
   export_status: { status: string; progress: { frames_done: number; frames_total: number } } | null;
@@ -131,10 +135,10 @@ async function previs(project: string, clip: string): Promise<PrevisJob> {
   let job = (await started.json()) as PrevisJob;
   const id = job.id;
   const deadline = Date.now() + DEADLINE_MS;
-  while (!['done', 'failed', 'cancelled'].includes(job.status)) {
+  while (!['done', 'failed'].includes(job.status)) {
     if (Date.now() > deadline) throw new Error(`previs ${id}: still ${job.status} after ${DEADLINE_MS} ms`);
     const res = await fetch(`${EDITOR}/api/rideo/previs/${id}?wait=50`, { headers });
-    // 404 after the editor's server restarted: it lost the job (jobs live in its memory)
+    // 404 for a job the editor's server no longer keeps (it keeps the last 100)
     if (!res.ok) throw new Error(`previs ${id}: ${res.status} ${await res.text()}`);
     job = (await res.json()) as PrevisJob;
   }
@@ -147,10 +151,11 @@ console.log(job.status, job.error, job.push?.status, job.push?.boards_to_redraw,
 
 The body takes `rideo` (required), `project` (our project; default: one named after the clip),
 `export` (export parameters over the previs defaults), `push` (`shots`, `mode`, `pass`,
-`write_blocking`), `cast_overrides` (actor kind by rideo character id, e.g. `{"chr_…": "pony"}`)
-and `model_limits` (`{min_s, max_s}`, default: rideo's). The previs defaults: quality `draft`,
-look `clay`, clips only, rideo's fps and size, and only the passes the chosen modes need (always
-beauty, so a shot whose mode changes at push time still has a clip). The push writes the blocking
+`write_blocking`), `cast_overrides` (actor kind by rideo character id, e.g. `{"chr_…": "pony"}`) and
+`model_limits` (`{min_s, max_s}`, default: rideo's). The previs export is `export_video`'s preset
+`rideo` (quality `draft`, look `clay`, clips only) at rideo's fps and size, with beauty and the
+passes the chosen modes send (depth too when the modes are left to the push, which makes a shot a
+camera reference when rideo's first frame cannot follow our staging). The push writes the blocking
 from a copy of the project taken when the export starts.
 
 `POST` answers 202 with the job as soon as it has started, before it talks to rideo. It refuses
@@ -160,15 +165,18 @@ at once, with `{error, code}`, only what no job can do:
 | ------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 400    | `INVALID_PARAMS` | export parameters the export refuses, or a `rideo.url` that is not an http(s) URL; a body that is not a previs request answers 400 with `{error}` alone |
 | 409    | `QUEUE_FULL`     | four previs jobs already run                                                                                                                            |
-| 503    | `UNAVAILABLE`    | no rideo server: `RIDEO_URL` is not set and the body names no `rideo.url`                                                                               |
+| 503    | `UNAVAILABLE`    | no rideo server: `RIDEO_URL` is not set and the body names no `rideo.url`; or the server is shutting down                                               |
 
 Everything else ends the job later with `status: 'failed'` and the reason in `error` (a job has no
 code): a rideo that is down or does not answer, a token rideo refuses (another `rideo.url` needs
 its own `rideo.token`), a project or clip rideo does not have, a full export queue, a failed
-export or push. A shutdown of the editor's server ends a running job `cancelled`.
-`GET /api/rideo/previs/:job` answers 404 `NOT_FOUND` for a job the server does not have: previs
-jobs live in the server's memory, so after a restart it knows none of the earlier ones; start the
-previs again. A `wait` over 50 answers 400.
+export or push. The server keeps each job in `DATA_DIR/rideo-previs` as it changes, so its status
+still answers after a restart; a job that was running when the server stopped cannot go on and
+ends failed, its `error` saying how the server stopped and how far the job got, e.g. "server
+restarted while the previs's export … rendered: start the previs again" ("server shut down …"
+after a clean stop; a job stopped while it pushed says to push its export again with
+`rideo_push`). `GET /api/rideo/previs/:job` answers 404 `NOT_FOUND` for a job the server does not
+have: it keeps the last 100. A `wait` over 50 answers 400.
 
 ## What each output is for
 
@@ -179,6 +187,10 @@ previs again. A `wait` over 50 answers 400.
 | `depth` pass                        | `camera`   | the camera move and the layout of the set without the actors' look: the safe choice when the first frame may not match           |
 | `blocking_line` in `manifest.json`  | –          | the sentence rideo's prompts carry for the shot; the push compares it with rideo's own                                           |
 | `rideo.camera_move` in the manifest | –          | the move the push sends with the reference, so rideo prompts the move the clip shows                                             |
+
+Each shot gets the output of its mode and no other: a beauty clip sent as a `pose` or `camera`
+reference would carry the look, colours and light those references leave to the model. A shot whose
+export lacks it fails; preset `rideo` exports all three.
 
 ## The agreement principle
 
@@ -228,13 +240,13 @@ reference.
   limits (`model_limits`, default: rideo's `/api/config`): shots outside them get a
   `duration_clamped` warning, and an export with `match_model_duration: true` pads or trims each
   clip to what the model will make.
-- **Inline size**: rideo sends a reference inline, base64 in the video request, so keep clips
-  small: draft quality (CRF 28) and the clay look. A draft 1280 × 720 clip measured 16.6 KB for
-  2 s (36.5 KB at `standard`); the push refuses clips over 256 MB.
+- **Inline size**: rideo sends a reference inline, base64 in the video request, so keep clips small:
+  draft quality (CRF 28) and the clay look, as preset `rideo` exports them. A draft 1280 × 720 clip
+  measured 16.6 KB for 2 s (36.5 KB at `standard`); the push refuses clips over 256 MB.
 - **Resolution**: an odd rideo resolution is refused by the export (sizes must be even).
-- **Previs jobs** are kept in the server's memory (the last 100, at most 4 running); a restart
-  loses them (their ids then answer 404), and a shutdown in the middle cancels one. Exports and
-  their files stay on disk.
+- **Previs jobs** are kept in `DATA_DIR/rideo-previs` (the last 100, at most 4 running) and answer
+  after a restart, but one running when the server stops cannot go on: it ends failed, to be
+  started again. Exports and their files stay on disk.
 - **Pushes** are recorded in `rideo-push.json` next to the export, not in the export's `job.json`.
 - **Reading rideo's text**: the import infers each character's kind (humanoid by default, animals
   for mounts and pets) and who rides whom from English words in names and summaries, without

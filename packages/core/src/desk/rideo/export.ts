@@ -13,7 +13,7 @@ import { GROUND_COLORS } from '../set';
 import { viewTarget } from '../moves';
 import { blueprintFor, posedBones, posesOf, requireBuiltKind } from '../characters/kinds';
 import { footprint, restSize, type PartsOf } from './footprint';
-import { RIDEO_PROPS, type RideoOffstage } from './import';
+import { RIDEO_PROPS, motionDigest, rideoHeightRatio, type RideoOffstage } from './import';
 import { rideoPose } from './rules';
 import {
   RIDEO_BLOCKING_PALETTE,
@@ -353,7 +353,8 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
   const actors: RideoSceneBlocking['actors'] = exported.map((a, i) => {
     const m = markAt(a, frame0);
     const color = prop(a, DESK_PROPS.color);
-    const h = Number(a.custom_props?.[DESK_PROPS.heightM]);
+    // the desk sizes an animal by its withers, rideo's mannequins by their top
+    const h = Number(a.custom_props?.[DESK_PROPS.heightM]) * heightRatioOf(prop(a, DESK_PROPS.kind));
     return {
       id: uniqueId(prop(a, RIDEO_PROPS.id), 'a', taken),
       characterId: characterOf.get(a.id)!,
@@ -529,8 +530,41 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
   return { blocking: r.data, shots: exportedShots, warnings };
 }
 
-/** A shot's camera as rideo blocks it: its start, its lens (36 mm wide sensor) and its end. */
+/** rideoHeightRatio of an actor kind as stored (1 for a kind the desk does not build). */
+function heightRatioOf(kind: string): number {
+  try {
+    return rideoHeightRatio(requireBuiltKind(kind));
+  } catch {
+    return 1;
+  }
+}
+
+/**
+ * rideo's own blocked camera of a shot, as the import placed it (RIDEO_PROPS.camera), while the
+ * camera is as the import left it (RIDEO_PROPS.motion); null once it was moved, keyed or solved again.
+ */
+function importedCamera(doc: SceneDoc, s: ShotData): RideoBlockingShot['camera'] | null {
+  const o = s.camera ? doc.getObject(s.camera) : null;
+  const text = o?.custom_props?.[RIDEO_PROPS.camera];
+  const recorded = o?.custom_props?.[RIDEO_PROPS.motion];
+  if (!o || typeof text !== 'string' || typeof recorded !== 'string') return null;
+  if (s.external?.source !== 'rideo' || !s.external.shot) return null;
+  if (motionDigest(doc, o.id) !== recorded) return null;
+  try {
+    const kept = JSON.parse(text) as { shot?: unknown; camera?: RideoBlockingShot['camera'] };
+    return kept.shot === s.external.shot && kept.camera ? kept.camera : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A shot's camera as rideo blocks it: its start, its lens (36 mm wide sensor) and its end; rideo's
+ * own placement while the camera is as a rideo import placed it (importedCamera).
+ */
 function cameraOf(scene: DeskScene, s: ShotData): RideoBlockingShot['camera'] | null {
+  const imported = importedCamera(scene.doc, s);
+  if (imported) return imported;
   const a = scene.camera(s.camera!, s.frame_start);
   if (!a) return null;
   const b = scene.camera(s.camera!, s.frame_end);

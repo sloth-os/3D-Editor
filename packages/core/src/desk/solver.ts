@@ -512,12 +512,13 @@ export function placeCamera(
   const lensMm = clamp(Math.round(spec.lens_mm), 8, 800);
   const tanH = DESK_SENSOR_WIDTH_MM / 2 / Math.max(1, lensMm);
   const tanV = tanH / Math.max(0.1, scene.aspect);
-  // the subjects at `frame`, and where a camera fitted to the samples sees them at the others
+  // the subjects at `frame`, and where a camera fitted to the samples sees them at the others (those
+  // put away by a hide key at a frame left out there: nothing of them shows)
   const frames = [frame, ...new Set((o.over ?? []).filter((f) => f !== frame))];
   const sets = frames.map((f, i) => {
     const measured = spec.subjects
       .map((id) => scene.subject(id, f))
-      .filter((s): s is NonNullable<typeof s> => !!s);
+      .filter((s): s is NonNullable<typeof s> => !!s && !s.hidden);
     const map = i > 0 && o.follow ? (p: Readonly<Vec3>) => o.follow!(p, f) : null;
     const actors = measured.filter((s) => s.actor);
     const props = measured.filter((s) => !s.actor);

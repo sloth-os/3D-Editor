@@ -1,6 +1,8 @@
 import type { SceneDoc } from '../doc/scene-doc';
 import { MeshMemoryError } from '../mesh/memory';
 import {
+  RELEASE_TRACKED_STEPS,
+  delayedStartFrame,
   motionMode,
   sanitizeRigidBody,
   sanitizeRigidBodyWorld,
@@ -101,9 +103,30 @@ export function documentSimulationBodies(doc: SceneDoc): SimulationBodies {
 }
 
 /**
+ * Matrices a simulation of `doc` from `frameStart` records for its delayed bodies (an ACTIVE body
+ * with a start_frame after frameStart, settings.ts delayedStartFrame) once it has simulated to
+ * `frame`: each follows its animated transform, and records it (SIMULATION_BYTES_PER_KINEMATIC_FRAME),
+ * on the frames from RELEASE_TRACKED_STEPS before its start to its start (simulation.ts), dormant
+ * before; rigid-body.ts rigidBodyCacheBytes counts the same records once they are made.
+ */
+export function delayedBodyRecords(doc: SceneDoc, frameStart: number, frame: number): number {
+  let records = 0;
+  for (const o of doc.listObjects()) {
+    if (o.type !== 'MESH') continue;
+    const rb = sanitizeRigidBody(o.rigid_body);
+    const start = rb ? delayedStartFrame(rb, frameStart) : null;
+    if (start === null) continue;
+    const from = Math.max(frameStart + 1, start - RELEASE_TRACKED_STEPS);
+    records += Math.max(0, Math.min(frame, start) - from + 1);
+  }
+  return records;
+}
+
+/**
  * Bytes the simulation of `doc` keeps once it has simulated to `frame` from the world's frame_start
- * (0 when the world is disabled or nothing is simulated at that frame): an upper bound, as if
- * nothing were cached yet.
+ * (0 when the world is disabled or nothing is simulated at that frame): its frames
+ * ({@link simulationCacheBytes}) and the matrices its delayed bodies follow before their start
+ * ({@link delayedBodyRecords}); an upper bound, as if nothing were cached yet.
  */
 export function documentSimulationBytes(doc: SceneDoc, frame: number): number {
   const scene = doc.getScene();
@@ -112,7 +135,11 @@ export function documentSimulationBytes(doc: SceneDoc, frame: number): number {
   const bodies = documentSimulationBodies(doc);
   if (!bodies.simulated) return 0;
   const frames = Math.ceil(Math.min(frame, simulatedFrameEnd(params))) - params.frameStart;
-  return simulationCacheBytes(bodies, frames);
+  return (
+    simulationCacheBytes(bodies, frames) +
+    SIMULATION_BYTES_PER_KINEMATIC_FRAME *
+      delayedBodyRecords(doc, params.frameStart, params.frameStart + frames)
+  );
 }
 
 /** What a {@link SimulationMemoryCheck} is asked before a simulation steps. */

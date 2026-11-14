@@ -3,6 +3,7 @@
  * the 180° line, camera moves, continuity checks, the set, actors and physics presets. Every
  * workstream adds exports to its own modules; this barrel only lists the modules.
  */
+export * from './hide';
 export * from './props';
 export * from './shots';
 export * from './solver';

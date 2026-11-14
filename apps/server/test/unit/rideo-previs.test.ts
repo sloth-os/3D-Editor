@@ -1,5 +1,8 @@
 import Fastify, { type FastifyInstance } from 'fastify';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import {
   SceneDoc,
   createCube,
@@ -118,9 +121,11 @@ describe('what a previs exports', () => {
   it('the shots with props in motion or a camera move, with beauty and the passes of their modes', async () => {
     const { docs } = await rideoDocs();
     const { doc, ids, map } = imported(docs);
+    // motion (beauty) and pose, and depth: rideo's answer to the blocking can still make a shot's
+    // reference a camera reference at push time, and the push sends no other pass in its place
     expect(previsPlan(doc, docs, map, undefined)).toEqual({
       shots: [ids[0], ids[1]],
-      passes: ['beauty', 'pose'],
+      passes: ['beauty', 'depth', 'pose'],
       warnings: [],
     });
     // with rideo's desk off every reference is a camera reference: depth
@@ -134,10 +139,12 @@ describe('what a previs exports', () => {
     const { doc, ids, map } = imported(docs);
     expect(previsPlan(doc, docs, map, { shots: ['shot 3', fx.ids.s1, ids[2]] })).toEqual({
       shots: [ids[2], ids[0]],
-      passes: ['beauty', 'pose'],
+      passes: ['beauty', 'pose', 'depth'],
       warnings: [],
     });
+    // a mode or a pass asked for is the one the push sends: nothing else is needed
     expect(previsPlan(doc, docs, map, { mode: 'camera' }).passes).toEqual(['beauty', 'depth']);
+    expect(previsPlan(doc, docs, map, { mode: 'pose' }).passes).toEqual(['beauty', 'pose']);
     expect(previsPlan(doc, docs, map, { pass: 'normal' }).passes).toEqual(['beauty', 'normal']);
     expect(() => previsPlan(doc, docs, map, { shots: ['Shot 9'] })).toThrow(
       "push.shots: no shot 'Shot 9' in the imported project",
@@ -148,6 +155,7 @@ describe('what a previs exports', () => {
     const { docs } = await rideoDocs();
     const plan = { shots: ['a', 'b'], passes: ['beauty', 'pose'] as ('beauty' | 'pose')[], warnings: [] };
     expect(previsExportParams(docs, plan, undefined)).toEqual({
+      preset: 'rideo',
       shots: ['a', 'b'],
       quality: 'draft',
       look: 'clay',
@@ -202,11 +210,13 @@ describe('a previs job', () => {
         return exportJob('done');
       },
     };
+    // the bridge keeps its previs jobs in DATA_DIR
+    const dataDir = await mkdtemp(path.join(os.tmpdir(), 'rideo-previs-'));
     const bridge = new RideoBridge({
       config: {
         rideoUrl: 'http://rideo.local',
         rideoToken: null,
-        dataDir: '/nonexistent',
+        dataDir,
         ffmpegPath: 'ffmpeg',
       },
       fetch: mock.fetch,
@@ -219,6 +229,11 @@ describe('a previs job', () => {
         listProjects: async () => [],
       },
     } as unknown as ServiceContext);
+    onTestFinished(async () => {
+      // its last writes end before the folder goes
+      await bridge.close();
+      await rm(dataDir, { recursive: true, force: true });
+    });
     const pushed: { doc: SceneDoc; moves: Record<string, string | null> }[] = [];
     vi.spyOn(bridge, 'push').mockImplementation(async (runner) => {
       pushed.push({ doc: runner.doc, moves: exportBlockingOf(runner).moves ?? {} });

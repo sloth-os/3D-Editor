@@ -75,6 +75,19 @@ export function ikSettingsOf(
   problem: (message: string) => void = () => {},
 ): IkBoneSettings | null {
   if (!pb || typeof pb !== 'object') return null;
+  // most pose bones set none of them (the evaluator asks for every bone on every evaluation)
+  if (
+    pb.lock_ik_x !== true &&
+    pb.lock_ik_y !== true &&
+    pb.lock_ik_z !== true &&
+    pb.use_ik_limit_x !== true &&
+    pb.use_ik_limit_y !== true &&
+    pb.use_ik_limit_z !== true &&
+    pb.ik_stiffness_x == null &&
+    pb.ik_stiffness_y == null &&
+    pb.ik_stiffness_z == null
+  )
+    return null;
   const num = (key: keyof PoseBoneIkFields, def: number, lo: number, hi: number): number => {
     const v = pb[key];
     if (v === undefined || v === null) return def;

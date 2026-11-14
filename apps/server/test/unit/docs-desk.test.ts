@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,12 +19,15 @@ import {
 import { MAX_PUSH_BYTES } from '../../src/rideo/push';
 import { defaultMode, type ShotFeatures } from '../../src/rideo/shots';
 import type { ServerServices, ServiceContext } from '../../src/services';
+import { insertReply } from '../../src/store';
 import { VideoExports } from '../../src/video';
 import { clearFfmpegChecks, ffmpegUnavailable, hasFfmpeg, requireFfmpeg } from '../../src/video/ffmpeg';
 import {
+  EXPORT_PRESET_PARAMS,
   MAX_EXPORT_HEIGHT,
   MAX_EXPORT_WAIT_S,
   MAX_EXPORT_WIDTH,
+  RIDEO_PASSES,
   videoExportParamsSchema,
 } from '../../src/video/params';
 import { MAX_EXPORT_FRAMES } from '../../src/video/plan';
@@ -191,13 +194,13 @@ describe('docs/rideo.md: the previs snippet of recipe 2', () => {
     expect(logged[0][0]).toBe('done');
   });
 
-  it('stops on a job the server does not have (404 after a restart) instead of polling on', async () => {
+  it('stops on a job the server no longer has (404) instead of polling on', async () => {
     const { calls, error } = await runSnippet((call) =>
       call.method === 'POST'
         ? json(job('importing'), 202)
         : json(
             {
-              error: "Previs job 'job1' not found (jobs are kept until the server restarts)",
+              error: "Previs job 'job1' not found (the server keeps the last 100 previs jobs)",
               code: 'NOT_FOUND',
             },
             404,
@@ -227,11 +230,14 @@ describe('docs/rideo.md: the previs snippet of recipe 2', () => {
 type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
 async function previsServer(o: { rideoUrl: string | null; rideoToken?: string | null; fetch: FetchLike }) {
+  // the bridge keeps its previs jobs in DATA_DIR
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'docs-desk-previs-'));
+  dataDirs.push(dataDir);
   const bridge = new RideoBridge({
     config: {
       rideoUrl: o.rideoUrl,
       rideoToken: o.rideoToken ?? null,
-      dataDir: '/nonexistent',
+      dataDir,
       ffmpegPath: 'ffmpeg',
     },
     fetch: o.fetch,
@@ -250,12 +256,14 @@ async function previsServer(o: { rideoUrl: string | null; rideoToken?: string | 
 }
 
 let servers: { app: FastifyInstance; bridge: RideoBridge }[] = [];
+const dataDirs: string[] = [];
 afterEach(async () => {
   for (const s of servers) {
     await s.bridge.close();
     await s.app.close();
   }
   servers = [];
+  for (const d of dataDirs.splice(0)) await rm(d, { recursive: true, force: true });
 });
 
 async function serve(o: Parameters<typeof previsServer>[0]) {
@@ -543,6 +551,29 @@ describe('docs/video-export.md', () => {
     for (const doc of [videoExport, mcp]) expect(flat(doc)).not.toContain('a finished one is kept');
   });
 
+  it("say what preset 'rideo' sets, as the code sets it, and recipe 1 exports with it", () => {
+    const p = EXPORT_PRESET_PARAMS.rideo;
+    expect(p.outputs).toEqual({ sequence: false, clips: true, posters: false, contact_sheet: false });
+    const code = (s: string) => `\`${s}\``;
+    const passes = `${RIDEO_PASSES.slice(0, -1).map(code).join(', ')} and ${code(RIDEO_PASSES.at(-1)!)}`;
+    expect(row(videoExport, '`preset`')[2]).toBe(
+      '`rideo`: the clips `rideo_push` sends (below); the parameters given win over it',
+    );
+    expect(flat(section(videoExport, '## Parameters'))).toContain(
+      `Preset \`rideo\` makes the clips [\`rideo_push\`](rideo.md) sends: quality \`${p.quality}\`, look ` +
+        `\`${p.look}\` and clips only (no sequence, posters or contact sheet), with the passes ${passes}, ` +
+        'one for each reference mode (`motion`, `camera` and `pose`), at the render resolution at 100 %',
+    );
+    const recipe = flat(section(rideo, '## Recipe 1: an agent with both MCP servers'));
+    expect(recipe).toContain(
+      "**editor** `export_video {project, preset: 'rideo'}`: draft clips in the clay look",
+    );
+    expect(recipe).not.toContain('passes:');
+    // the push never sends another pass in place of the mode's
+    expect(row(rideo, '`pass`')[1]).toContain('a shot whose export has no clip of it fails');
+    expect(flat(rideo)).not.toContain('always beauty');
+  });
+
   it('give the limits of the code', () => {
     const doc = flat(videoExport);
     expect(doc).toContain(`At most ${MAX_EXPORT_FRAMES.toLocaleString('en-US')} output frames per export.`);
@@ -678,6 +709,34 @@ describe('README.md: the environment variables', () => {
   });
 });
 
+describe('docs/model-store.md: what an insert answers', () => {
+  it('names the keys of the entry the reply gives once, with its thumbnail per transport', () => {
+    const entry = {
+      id: 'khronos:DeskLamp',
+      provider: 'khronos',
+      name: 'Desk Lamp',
+      category: 'furniture' as const,
+      tags: ['lamp'],
+      thumbnail_url: '/api/store/models/khronos:DeskLamp/thumbnail',
+      license: { spdx: 'CC-BY-4.0', url: null, attribution: 'Someone' },
+      author: 'Someone',
+      source_url: 'https://example.org/lamp',
+      dimensions_m: [0.3, 0.3, 0.5] as [number, number, number],
+      triangles: 1200,
+      formats: ['gltf' as const],
+      downloadable: true,
+    };
+    const reply = insertReply({ root: 'r', entry, warnings: ['w'] }, entry, []);
+    const text = flat(modelStore);
+    const start = text.indexOf('An insert answers `{result, entry, warnings}`, each once:');
+    expect(start).toBeGreaterThanOrEqual(0);
+    const paragraph = text.slice(start, text.indexOf('## ', start));
+    expect(Object.keys(reply)).toEqual(['result', 'entry', 'warnings']);
+    for (const key of Object.keys(reply.entry)) expect(paragraph, key).toContain(`\`${key}\``);
+    expect(paragraph).toContain("from `store_add` a link on the server as in `store_search`'s results");
+  });
+});
+
 describe('docs/model-store.md: the built-in models', () => {
   it('lists the catalog per category, and its size wherever the docs give it', () => {
     let total = 0;
@@ -720,7 +779,7 @@ describe('docs/rideo.md and docs/mcp.md: the limits of the bridge', () => {
     expect(doc).toContain(`at most ${pushMb} MB`);
     expect(doc).toContain(`the push refuses clips over ${pushMb} MB`);
     expect(row(mcp, '`rideo_push`, previs jobs')[1]).toBe(
-      `Clips of at most ${pushMb} MB; ${MAX_ACTIVE_PREVIS} previs jobs at once, the last ${MAX_PREVIS_JOBS} kept in memory`,
+      `Clips of at most ${pushMb} MB; ${MAX_ACTIVE_PREVIS} previs jobs at once, the last ${MAX_PREVIS_JOBS} kept (in \`DATA_DIR\`)`,
     );
     expect(row(mcp, '`GET /api/rideo/previs/:job`')[1]).toBe(
       `The previs job (\`?wait=\` 0–${MAX_PREVIS_WAIT_S} s)`,

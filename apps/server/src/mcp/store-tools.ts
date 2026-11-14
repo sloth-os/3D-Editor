@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { MAX_STORE_RESULTS, STORE_CATEGORIES } from '../store';
+import { MAX_STORE_RESULTS, STORE_CATEGORIES, insertReply } from '../store';
 import { ToolError } from './agent';
 import { EDIT, READ_ONLY, baseUrl, projectArg, vec3, type ToolContext, type ToolRegistrar } from './tool-kit';
 
@@ -62,7 +62,7 @@ export function registerStoreTools(tool: ToolRegistrar, ctx: ToolContext): void 
     {
       title: 'Add store model',
       description:
-        "Insert a store model (an id from store_search) into the project as one undo step: wrapped in an EMPTY root with its origin at the base centre, standing on the ground at location (default: the 3D cursor), turned by rotation_deg about Z and scaled to height_m, width_m or depth_m when given; its licence and author are recorded on the root. External models are downloaded (and cached) first: NOT_DOWNLOADABLE when the licence or provider does not allow it, NEEDS_KEY when the server lacks the provider's key.",
+        "Insert a store model (an id from store_search) into the project as one undo step: wrapped in an EMPTY root with its origin at the base centre, standing on the ground at location (default: the 3D cursor), turned by rotation_deg about Z and scaled to height_m, width_m or depth_m when given; its licence and author are recorded on the root. params builds a built-in model with its own parameters (store_search lists them). External models are downloaded (and cached) first: NOT_DOWNLOADABLE when the licence or provider does not allow it, NEEDS_KEY when the server lacks the provider's key.",
       annotations: { ...EDIT, openWorldHint: true },
     },
     {
@@ -88,6 +88,12 @@ export function registerStoreTools(tool: ToolRegistrar, ctx: ToolContext): void 
         .regex(/^#[0-9a-fA-F]{6}$/, 'expected a colour as #rrggbb')
         .optional()
         .describe('Main colour as #rrggbb (built-in models)'),
+      params: z
+        .record(z.string().min(1).max(64), z.unknown())
+        .optional()
+        .describe(
+          "The model's own parameters (built-in models; its store_search result lists them as JSON schema, e.g. {seats: 2} for builtin:sofa)",
+        ),
     },
     async ({ project, model, ...opts }, extra) => {
       // the project first: an unknown project fails before anything is downloaded; its document is
@@ -98,11 +104,13 @@ export function registerStoreTools(tool: ToolRegistrar, ctx: ToolContext): void 
       const p = await ctx.agent.project(project);
       const res = p.run(call.operator, call.params);
       if (!res.ok) throw new ToolError(`${call.operator} failed: ${res.error ?? 'unknown error'}`, res.code);
-      return {
-        result: res.result ?? null,
-        entry: call.entry,
-        warnings: [...call.warnings, ...res.reports.filter((r) => r.level !== 'INFO').map((r) => r.message)],
-      };
+      // the operator's result once (without the catalog entry and warnings core's store.add repeats),
+      // the model's credit with its thumbnail as a link on this server, like store_search's
+      const warnings = [
+        ...call.warnings,
+        ...res.reports.filter((r) => r.level !== 'INFO').map((r) => r.message),
+      ];
+      return { ...insertReply(res.result, call.entry, warnings, baseUrl(extra)) };
     },
   );
 }

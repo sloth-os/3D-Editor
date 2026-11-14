@@ -33,6 +33,8 @@ let server: TestServer;
 let client: Client;
 let projectId = '';
 let exportId = '';
+/** The previs job of POST /api/rideo/previs as it ended. */
+let previsJob: any = null;
 
 type ToolResult = { content: { type: string; text?: string }[]; isError?: boolean };
 
@@ -283,6 +285,7 @@ describe.skipIf(!run)('rideo bridge end to end', { timeout: 300_000 }, () => {
     });
     expect(ex.params.passes).toContain('beauty');
     expect((await api(server.url, '/api/rideo/previs/nope')).status).toBe(404);
+    previsJob = job;
   });
 
   it('RIDEO_TOKEN goes to RIDEO_URL only: another rideo server gets the token passed or none', async () => {
@@ -301,5 +304,22 @@ describe.skipIf(!run)('rideo bridge end to end', { timeout: 300_000 }, () => {
     } finally {
       await other.close();
     }
+  });
+
+  it('a server restarted on the same DATA_DIR answers the previs job as it ended', async () => {
+    expect(previsJob?.status).toBe('done');
+    await client.close();
+    await server.close();
+    server = await startServer({ DATA_DIR: server.dataDir, RIDEO_URL: `${mock.url}/`, RIDEO_TOKEN: TOKEN });
+    client = new Client({ name: 'rideo-bridge-test', version: '1.0.0' });
+    await client.connect(new StreamableHTTPClientTransport(new URL(`${server.url}/mcp`)));
+    const again = await api(server.url, `/api/rideo/previs/${previsJob.id}`);
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual(previsJob);
+    expect(again.body).toMatchObject({
+      status: 'done',
+      export: expect.any(String),
+      push: { status: 'done' },
+    });
   });
 });

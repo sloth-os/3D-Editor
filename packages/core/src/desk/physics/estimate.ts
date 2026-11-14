@@ -11,6 +11,7 @@ import {
 import { FRAME_STATE_BYTES_PER_OBJECT, newKeyframesWrites } from '../../operators/memory-keyframes';
 import {
   SIMULATION_BYTES_PER_KINEMATIC_FRAME,
+  delayedBodyRecords,
   documentSimulationBodies,
   simulationCacheBytes,
 } from '../../physics/memory';
@@ -282,7 +283,10 @@ export function deskBakeEstimate(ctx: OperatorContext, p: Record<string, unknown
   const params = worldParams(doc.getScene());
   const stepped = Math.max(0, Math.min(plan.frame_end, deskSimulationEnd(doc, params)) - params.frameStart);
   const bodies = documentSimulationBodies(doc);
-  const simulation = simulationCacheBytes(bodies, stepped);
+  const simulation =
+    simulationCacheBytes(bodies, stepped) +
+    SIMULATION_BYTES_PER_KINEMATIC_FRAME *
+      delayedBodyRecords(doc, params.frameStart, params.frameStart + stepped);
   return keyframeEstimate({
     ...keys,
     bytes:

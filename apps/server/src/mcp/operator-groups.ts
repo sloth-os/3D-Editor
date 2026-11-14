@@ -169,7 +169,7 @@ export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
     name: 'Model Store',
     aliases: ['Store', 'Assets'],
     description:
-      'Built-in and external models: store_search finds them (licence, author, size), store_add inserts one (downloaded and cached first when external) standing on the ground at a location and scaled to a size, with its licence and author recorded',
+      "Built-in and external models: store_search finds them (licence, author, size, a built-in model's own parameters), store_add inserts one (downloaded and cached first when external) standing on the ground at a location and scaled to a size, a built-in one built with the params given, with its licence and author recorded",
     tools: ['store_search', 'store_add'],
     match: prefix('store.'),
   },

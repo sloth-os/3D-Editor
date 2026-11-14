@@ -12,6 +12,7 @@ import {
 } from '@3d-editor/core';
 import { NotFoundError } from '../../src/mcp/agent';
 import { registerTools, type ToolContext } from '../../src/mcp/tools';
+import { insertReply } from '../../src/store';
 import { ServerMetrics } from '../../src/observability/metrics';
 import { silentLog } from '../../src/observability/log';
 import {
@@ -121,6 +122,51 @@ async function call(name: string, args: Record<string, unknown>) {
   return { isError: !!res.isError, text, body };
 }
 
+describe('insertReply', () => {
+  const entry = {
+    id: 'khronos:DeskLamp',
+    provider: 'khronos',
+    name: 'Desk Lamp',
+    category: 'furniture' as const,
+    tags: ['lamp'],
+    thumbnail_url: '/api/store/models/khronos:DeskLamp/thumbnail',
+    license: { spdx: 'CC-BY-4.0', url: null, attribution: 'Someone' },
+    author: 'Someone',
+    source_url: 'https://example.org/lamp',
+    dimensions_m: [0.3, 0.3, 0.5] as [number, number, number],
+    triangles: 1200,
+    formats: ['gltf' as const],
+    downloadable: true,
+  };
+
+  it("makes the thumbnail a link on the request's origin, as store_search does, and keeps no copies", () => {
+    const result = { root: 'r', name: 'Lamp', objects: ['r'], entry: { id: 'x' }, warnings: ['w'] };
+    const reply = insertReply(result, entry, ['w'], 'http://127.0.0.1:8417');
+    expect(reply.result).toEqual({ root: 'r', name: 'Lamp', objects: ['r'] });
+    expect(reply.entry).toEqual({
+      id: 'khronos:DeskLamp',
+      provider: 'khronos',
+      name: 'Desk Lamp',
+      license: { spdx: 'CC-BY-4.0', url: null, attribution: 'Someone' },
+      author: 'Someone',
+      source_url: 'https://example.org/lamp',
+      thumbnail_url: 'http://127.0.0.1:8417/api/store/models/khronos:DeskLamp/thumbnail',
+    });
+    expect(reply.warnings).toEqual(['w']);
+    // without an origin (REST, an in-memory client) the route stays relative; a model without a
+    // thumbnail keeps null, and an absolute URL is kept as it is
+    expect(insertReply(result, entry, []).entry.thumbnail_url).toBe(entry.thumbnail_url);
+    expect(
+      insertReply(result, { ...entry, thumbnail_url: null }, [], 'http://h').entry.thumbnail_url,
+    ).toBeNull();
+    expect(
+      insertReply(result, { ...entry, thumbnail_url: 'https://cdn.example/t.jpg' }, [], 'http://h').entry
+        .thumbnail_url,
+    ).toBe('https://cdn.example/t.jpg');
+    expect(insertReply(null, entry, []).result).toBeNull();
+  });
+});
+
 describe('store_search', () => {
   it('searches the providers and reports each', async () => {
     const r = await call('store_search', { query: 'lamp', providers: ['khronos', 'sketchfab'], limit: 5 });
@@ -153,6 +199,65 @@ describe('store_add', () => {
     expect(doc.getObject(r.body.result.root)?.location).toEqual([1, 0, 0]);
     expect(r.body.entry.id).toBe(`builtin:${builtin.id}`);
     expect(r.body.warnings).toEqual([]);
+  });
+
+  it('replies with the result, the model and the warnings once each', async () => {
+    // a colour on a model without a recolourable material: core's store.add warns (and reports it)
+    const r = await call('store_add', { project: 'p1', model: 'builtin:watermelon', color: '#ff0000' });
+    expect(r.isError).toBe(false);
+    expect(Object.keys(r.body).sort()).toEqual(['entry', 'result', 'warnings']);
+    // core's store.add also returns its catalog entry and its warnings: left out of the result
+    expect(Object.keys(r.body.result).sort()).toEqual(['dimensions_m', 'name', 'names', 'objects', 'root']);
+    expect(r.body.warnings).toEqual(["'watermelon' has no recolourable material; color ignored"]);
+    // the model as a credit: no description, synonyms, tags or parameters (store_search has them)
+    expect(r.body.entry).toEqual({
+      id: 'builtin:watermelon',
+      provider: 'builtin',
+      name: 'Watermelon',
+      license: {
+        spdx: 'CC0-1.0',
+        url: 'https://creativecommons.org/publicdomain/zero/1.0/',
+        attribution: '3D Editor built-in',
+      },
+      author: '3D Editor built-in',
+      source_url: null,
+      // no HTTP request behind an in-memory call: the route stays relative (store_search's too)
+      thumbnail_url: '/api/store/models/builtin:watermelon/thumbnail',
+    });
+    expect(r.text.match(/recolourable/g)).toHaveLength(1);
+  });
+
+  it('builds a built-in model with its own parameters, refused before the operator runs when wrong', async () => {
+    const r = await call('store_add', { project: 'p1', model: 'builtin:house', params: { floors: 3 } });
+    expect(r.isError).toBe(false);
+    expect(runs).toEqual(['store.add']);
+    // three storeys of 2.8 m instead of the default two
+    expect(r.body.result.dimensions_m[2]).toBeCloseTo(11.71, 2);
+    const wrong = await call('store_add', { project: 'p1', model: 'builtin:house', params: { floors: 9 } });
+    expect(wrong.isError).toBe(true);
+    // one line, as every INVALID_PARAMS failure (no code line: agents fix the arguments)
+    expect(wrong.text).toMatch(
+      /^Invalid params for builtin:house: floors: .*It takes: floors \(integer 1–4[^\n]*$/,
+    );
+    const external = await call('store_add', {
+      project: 'p1',
+      model: 'khronos:DeskLamp',
+      params: { floors: 3 },
+    });
+    expect(external.text).toMatch(/^khronos:DeskLamp takes no params/);
+    expect(runs).toEqual(['store.add']);
+    expect((await call('store_add', { project: 'p1', model: 'builtin:house', params: [3] })).isError).toBe(
+      true,
+    );
+  });
+
+  it("lists params in its input schema as an object of the model's own parameters", async () => {
+    const { tools } = await client.listTools();
+    const add = tools.find((x) => x.name === 'store_add')!;
+    expect(add.inputSchema.properties?.params).toMatchObject({ type: 'object' });
+    expect(add.description).toContain(
+      'params builds a built-in model with its own parameters (store_search lists them)',
+    );
   });
 
   it('downloads an external model and inserts its files', async () => {

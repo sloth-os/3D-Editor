@@ -220,6 +220,34 @@ describe('desk.vehicle_drive', () => {
     expect(dist(originOf(worldAt(s.doc, crate, r.frame_end)), [0, -5, 0.25])).toBeLessThan(1e-6);
   });
 
+  it('drives a boat without the wheel warning: it has none to turn', () => {
+    for (const model of ['rowboat', 'sailboat']) {
+      const s = deskScene();
+      s.run('store.add', { model, name: 'Boat' });
+      const r = s.run('desk.vehicle_drive', {
+        vehicle: 'Boat',
+        points: [[0, -8, 0]],
+        frame_start: 1,
+        speed_mps: 2,
+      });
+      expect(r.wheels, model).toEqual([]);
+      expect(
+        s.warnings.filter((w) => /wheel/.test(w)),
+        model,
+      ).toEqual([]);
+    }
+    // a boat by its name alone
+    const s = deskScene();
+    s.box('Old Canoe', [0, 0, 0.2]);
+    s.run('desk.vehicle_drive', {
+      vehicle: 'Old Canoe',
+      points: [[0, -5, 0.2]],
+      frame_start: 1,
+      speed_mps: 2,
+    });
+    expect(s.warnings.filter((w) => /wheel/.test(w))).toEqual([]);
+  });
+
   it('speeds up and slows down over the ease time, cruising between', () => {
     const d = (t: number) => deskDrivenDistance(t, 10, 40, 1.5);
     expect(d(0)).toBe(0);

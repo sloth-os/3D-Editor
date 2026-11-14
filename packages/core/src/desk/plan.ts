@@ -99,8 +99,9 @@ const thirdOf = (x: number): DeskSide => (x < -LAYOUT_THIRD ? 'left' : x > LAYOU
 
 /**
  * What camera `view` shows of shot `shot` at `frame` (rideo's shotLayout). Moves are measured to the
- * shot's last frame through the same view. Null without a view. `subjectsOnly`: the subjects alone
- * (no landmarks behind them, no light), all a plan is judged on.
+ * shot's last frame through the same view. A subject put away by a hide key at `frame` (hidden) is
+ * out of frame, and says nothing of where it goes. Null without a view. `subjectsOnly`: the subjects
+ * alone (no landmarks behind them, no light), all a plan is judged on.
  */
 export function layoutView(
   scene: DeskScene,
@@ -112,9 +113,11 @@ export function layoutView(
   if (!view) return null;
   const end = Math.max(frame, shot.frame_end);
   const subjects: ShotLayoutEntry[] = [];
+  const hidden = new Set<string>();
   for (const id of shot.subjects) {
     const s = scene.subject(id, frame);
     if (!s) continue;
+    if (s.hidden) hidden.add(id);
     // the head in a close shot, the body in a wider one: whichever of them the picture shows
     const chest = projectPoint(view, s.chest);
     const eyes = projectPoint(view, s.eyes);
@@ -131,9 +134,9 @@ export function layoutView(
       turn = sideFacing;
     } else facing = sideFacing;
     let to: ShotLayoutEntry['to'] = null;
-    if (end > frame) {
+    if (end > frame && !s.hidden) {
       const later = scene.subject(id, end);
-      if (later && Math.hypot(later.feet[0] - s.feet[0], later.feet[1] - s.feet[1]) > 0.05) {
+      if (later && !later.hidden && Math.hypot(later.feet[0] - s.feet[0], later.feet[1] - s.feet[1]) > 0.05) {
         const q = projectPoint(view, later.chest);
         const dd = Number.isFinite(q.x) ? q.depth - p.depth : 0;
         to = {
@@ -149,7 +152,7 @@ export function layoutView(
       x: p.x,
       y: p.y,
       depth: p.depth,
-      in_frame: inPicture(p, 1.05),
+      in_frame: !s.hidden && inPicture(p, 1.05),
       side: Number.isFinite(p.x) ? thirdOf(p.x) : 'centre',
       facing,
       turn,
@@ -165,7 +168,13 @@ export function layoutView(
   const visible = people.filter((c) => c.in_frame);
   const nearest = Math.min(Number.POSITIVE_INFINITY, ...visible.map((c) => c.depth));
   for (const c of subjects)
-    if (!c.in_frame && Number.isFinite(c.x) && Math.abs(c.x) < 1.9 && c.depth < 0.7 * nearest)
+    if (
+      !c.in_frame &&
+      !hidden.has(c.subject) &&
+      Number.isFinite(c.x) &&
+      Math.abs(c.x) < 1.9 &&
+      c.depth < 0.7 * nearest
+    )
       c.edge = c.x < 0 ? 'left' : 'right';
   if (visible.length >= 2) {
     const depths = visible.map((c) => c.depth).sort((a, b) => a - b);

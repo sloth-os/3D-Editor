@@ -19,7 +19,12 @@ import {
   type ExportRenderInfo,
   type MemoryReader,
 } from './memory';
-import { qualityPreset, videoExportParamsSchema, type VideoExportParams } from './params';
+import {
+  qualityPreset,
+  videoExportParamsSchema,
+  type VideoExportInput,
+  type VideoExportParams,
+} from './params';
 import { planExport, type ExportPlan } from './plan';
 
 /*
@@ -259,9 +264,10 @@ export class VideoExports {
    * QUEUE_FULL when EXPORT_MAX_QUEUED jobs already wait (exports asked for at the same time
    * included).
    */
-  async start(project: string, given: VideoExportParams): Promise<ExportJob> {
+  async start(project: string, given: VideoExportInput): Promise<ExportJob> {
     const store = await this.ready();
-    // callers in code (the rideo bridge) get the same validation and defaults as MCP and REST
+    // callers in code (the rideo bridge) get the same validation and defaults as MCP and REST, and
+    // a preset sets what export_video's arguments left out (its schema applies no defaults)
     const parsedParams = videoExportParamsSchema.safeParse(given);
     if (!parsedParams.success)
       throw new ToolError(
@@ -282,14 +288,19 @@ export class VideoExports {
     // encoded in the same tick is that very state.
     const plan: ExportPlan = planExport(room.scene, params);
     // the render processes it would get if it started now (the run decides again when it starts)
-    const memory = this.startMemory(
-      exportNeedsOf(room.scene, plan, params, exportCodec(params.codec, encoders), renderer.pool.capacity),
+    const needs = exportNeedsOf(
+      room.scene,
+      plan,
+      params,
+      exportCodec(params.codec, encoders),
+      renderer.pool.capacity,
     );
-    // (the message quotes what a render process that holds nothing yet needs: the processes were
-    // not asked what they hold, they were counted as holding all they could)
+    const memory = this.startMemory(needs);
+    // (the message quotes what a render process started for it needs: the processes were not
+    // asked what they hold, they were counted as holding all they could)
     if (memory.processes < 1 && !this.running)
       throw new ToolError(
-        outOfMemoryMessage({ ...memory, reuse: [] }, plan.width, plan.height),
+        outOfMemoryMessage(exportMemory(needs, { machine: memory.machine }), plan.width, plan.height),
         'OUT_OF_MEMORY',
       );
     // the jobs ahead of this one: running, waiting, and being started by concurrent requests (they
@@ -461,10 +472,11 @@ export class VideoExports {
 
   /**
    * The memory decision of an export asked for now, as its run would make it if it started at once
-   * (exporter.ts `decideMemory`), but without asking the render processes: each one running is
-   * counted as holding all an export could reuse of it, and the ffmpeg encoders of an export that
-   * runs now as freed (they end with it). So it fits at least as many render processes as the run
-   * will: an export it refuses, with no export running, would be refused by its run too.
+   * (exporter.ts `decideMemory`), but without asking the render processes: each one running (the
+   * one kept for interactive renders too) is counted as a render process of the export holding all
+   * it could reuse, no base is kept for the contact sheet's, and the ffmpeg encoders of an export
+   * that runs now count as freed (they end with it). So it fits at least as many render processes
+   * as the run will: an export it refuses, with no export running, would be refused by its run too.
    */
   private startMemory(needs: ExportNeeds): ExportMemory {
     const pool = this.ctx.services.renderer.pool;
@@ -473,7 +485,6 @@ export class VideoExports {
     const ahead = this.running ? this.jobs.get(this.running.id)?.render : undefined;
     const freed = (ahead?.ffmpeg_mb ?? 0) * MiB;
     return exportMemory(needs, {
-      notStarted: needs.capacity - running,
       warm: Array.from({ length: running }, () => Infinity),
       machine: freed ? { ...machine, available: machine.available + freed } : machine,
     });

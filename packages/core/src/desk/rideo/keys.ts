@@ -1,6 +1,7 @@
 import type { FCurve, Interpolation, Keyframe } from '../../doc/types';
 import { fcurveKey, type SceneDoc } from '../../doc/scene-doc';
 import { createFCurve, evaluateFCurve } from '../../anim/fcurve';
+import { HIDE_SCALE, hiddenScale } from '../hide';
 
 /*
  * Keyframe writing of the rideo import: single keys on object channels, keys removed from a frame on
@@ -9,8 +10,11 @@ import { createFCurve, evaluateFCurve } from '../../anim/fcurve';
  * keys set aside while later shots are keyed (KeyArchive).
  */
 
-/** Scale of an object hidden for a span of frames: shrunk to a point (desk.tether_fly's TETHER_HIDDEN_SCALE). */
-export const HIDDEN_SCALE = 1e-8;
+/**
+ * Share of its shown scale an object hidden for a span of frames is keyed to: shrunk to a point
+ * (hide.ts HIDE_SCALE, as desk.tether_fly's TETHER_HIDDEN_SCALE).
+ */
+export const HIDDEN_SCALE = HIDE_SCALE;
 
 const SAME_FRAME = 1e-3;
 
@@ -84,10 +88,11 @@ export function clearAnimation(doc: SceneDoc, target: string): void {
 
 /**
  * Hides an object over the spans given (inclusive frames) by keying its scale to a point there
- * (CONSTANT, the keys the spans cover replaced) and, after each span, back to `restore` — or, with
- * 'keep', to the keys the channel already has from the frame after the span (a string keyed on every
- * frame of its flight). The frame before a span keeps the value it had, so that nothing before the
- * span is hidden by the curve's constant extrapolation. A span with no end hides it for good.
+ * (hiddenScale of the scale it is shown at: `restore`, else its stored scale; CONSTANT, the keys the
+ * spans cover replaced) and, after each span, back to `restore` — or, with 'keep', to the keys the
+ * channel already has from the frame after the span (a string keyed on every frame of its flight).
+ * The frame before a span keeps the value it had, so that nothing before the span is hidden by the
+ * curve's constant extrapolation. A span with no end hides it for good.
  */
 export function hideSpans(
   doc: SceneDoc,
@@ -97,13 +102,14 @@ export function hideSpans(
 ): number {
   let keys = 0;
   const stored = doc.getObject(target)?.scale ?? [1, 1, 1];
+  const shown = restore === 'keep' ? stored : restore;
   for (const span of spans)
     for (let i = 0; i < 3; i++) {
       const fc = doc.getFCurve(fcurveKey(ref(target, 'scale', i)));
       const before = (fc ? evaluateFCurve(fc, span.from - 1) : undefined) ?? stored[i];
       const list: Keyframe[] = [
         { frame: span.from - 1, value: before, interpolation: 'CONSTANT' },
-        { frame: span.from, value: HIDDEN_SCALE, interpolation: 'CONSTANT' },
+        { frame: span.from, value: hiddenScale(shown[i]), interpolation: 'CONSTANT' },
       ];
       let to = span.to === null ? Infinity : span.to;
       if (span.to !== null && restore !== 'keep') {

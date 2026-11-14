@@ -213,8 +213,39 @@ describe('POST /api/projects/:id/store', () => {
     const body = r.json();
     expect(body.entry.id).toBe('khronos:DeskLamp');
     expect(doc.getObject(body.result.root)?.name).toBe('Lamp');
+    // the reply of store_add: the model once, as a credit, its thumbnail the route REST search gives
+    expect(Object.keys(body.entry).sort()).toEqual([
+      'author',
+      'id',
+      'license',
+      'name',
+      'provider',
+      'source_url',
+      'thumbnail_url',
+    ]);
+    expect(body.entry.thumbnail_url).toBe('/api/store/models/khronos:DeskLamp/thumbnail');
+    expect(body.result).not.toHaveProperty('warnings');
     const b = await post('p1', { model: `builtin:${builtin.id}`, color: '#336699' });
     expect(b.statusCode).toBe(200);
+    // core's store.add returns its catalog entry too: the reply carries it once, at the top
+    expect(b.json().result).not.toHaveProperty('entry');
+    expect(b.json().entry).not.toHaveProperty('description');
+  });
+
+  it("builds a built-in model with its own parameters, checked by the model's schema", async () => {
+    const r = await post('p1', { model: 'builtin:sofa', params: { seats: 2 } });
+    expect(r.statusCode).toBe(200);
+    const three = await post('p1', { model: 'builtin:sofa' });
+    // two seats make a shorter sofa than the default three
+    expect(r.json().result.dimensions_m[0]).toBeLessThan(three.json().result.dimensions_m[0] - 0.3);
+    const wrong = await post('p1', { model: 'builtin:sofa', params: { seats: 9 } });
+    expect(wrong.statusCode).toBe(400);
+    expect(wrong.json()).toMatchObject({
+      code: 'INVALID_PARAMS',
+      error: expect.stringContaining('It takes: seats (integer 1–5, default 3)'),
+    });
+    expect((await post('p1', { model: 'builtin:sofa', params: 'seats=2' })).statusCode).toBe(400);
+    expect(doc.listObjects().filter((o) => o.parent === null)).toHaveLength(2);
   });
 
   it('checks the body and answers the codes', async () => {

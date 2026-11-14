@@ -55,6 +55,7 @@ import {
   MAX_THUMBNAIL_BYTES,
   type ModelProvider,
   type ProviderDetails,
+  type ProviderModel,
   type ProviderEnv,
   type ProviderPage,
 } from './providers/types';
@@ -82,8 +83,11 @@ export type StoreFormat = StoreResult['formats'][number];
 /** Most results of one search page (store_search `limit`, REST `?limit=`). */
 export const MAX_STORE_RESULTS = 50;
 
-/** A model as search lists it (core StoreResult; thumbnail_url is the store's thumbnail route). */
-export type StoreModel = StoreResult;
+/**
+ * A model as search lists it (core StoreResult; thumbnail_url is the store's thumbnail route; a
+ * built-in model that takes parameters lists them as `params`, JSON schema properties).
+ */
+export type StoreModel = ProviderModel;
 
 /** One model with what its provider says beyond the search result. */
 export interface StoreModelDetails extends StoreModel {
@@ -140,6 +144,11 @@ export interface StoreInsertOptions {
   name?: string;
   /** Main colour as #rrggbb (built-in models). */
   color?: string;
+  /**
+   * The model's own parameters (built-in models: store.add `params`, as its search result lists
+   * them), checked by the model's schema before anything is inserted.
+   */
+  params?: Record<string, unknown>;
 }
 
 /**
@@ -155,11 +164,59 @@ export interface StoreInsertCall {
   warnings: string[];
 }
 
+/** The model an insert's reply credits: the search result's id, name, licence and source. */
+export interface StoreInsertEntry {
+  id: string;
+  provider: string;
+  name: string;
+  license: StoreModel['license'];
+  author: string | null;
+  source_url: string | null;
+  /** The thumbnail route (absolute in store_add's reply, like store_search's). */
+  thumbnail_url: string | null;
+}
+
 export interface StoreInsertResult {
-  /** What the operator returned: the root object (an EMPTY wrapping the model), its objects … */
-  result: unknown;
-  entry: StoreModel;
+  /**
+   * What the operator returned: the root object (an EMPTY wrapping the model), its name, its
+   * objects and their names, its dimensions_m (its entry and warnings are the reply's own fields).
+   */
+  result: Record<string, unknown> | null;
+  entry: StoreInsertEntry;
+  /** The store's notes (what the licence asks …) and the operator's warnings. */
   warnings: string[];
+}
+
+/**
+ * The reply of an insert (store_add, REST): the operator's result without what the reply carries
+ * once (core's store.add returns its catalog entry and its warnings too, which it also reports), the
+ * entry as the model's credit, and the warnings. `origin` makes the thumbnail route absolute.
+ */
+export function insertReply(
+  result: unknown,
+  entry: StoreModel,
+  warnings: readonly string[],
+  origin = '',
+): StoreInsertResult {
+  let rest: Record<string, unknown> | null = null;
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const { entry: _entry, warnings: _warnings, ...own } = result as Record<string, unknown>;
+    rest = own;
+  }
+  const thumb = entry.thumbnail_url;
+  return {
+    result: rest,
+    entry: {
+      id: entry.id,
+      provider: entry.provider,
+      name: entry.name,
+      license: entry.license,
+      author: entry.author,
+      source_url: entry.source_url,
+      thumbnail_url: thumb && origin && thumb.startsWith('/') ? `${origin}${thumb}` : thumb,
+    },
+    warnings: [...warnings],
+  };
 }
 
 /** A file the store serves (thumbnails, cached model files). */
@@ -317,7 +374,7 @@ export function thumbnailPath(id: string): string {
 }
 
 /** `model` with the store's thumbnail route as its thumbnail (when it has one). */
-function proxied(model: StoreResult): StoreResult {
+function proxied<M extends StoreResult>(model: M): M {
   const has = model.provider === BUILTIN_PROVIDER || !!model.thumbnail_url;
   return { ...model, thumbnail_url: has ? thumbnailPath(model.id) : null };
 }
@@ -861,6 +918,18 @@ export class ModelStore {
     const placement: Record<string, unknown> = {};
     for (const k of ['location', 'rotation_deg', 'height_m', 'width_m', 'depth_m', 'name'] as const)
       if (opts[k] !== undefined) placement[k] = opts[k];
+    // a model's own parameters are checked by its schema first (an external model takes none:
+    // refused before anything is downloaded)
+    const params = opts.params && Object.keys(opts.params).length ? opts.params : undefined;
+    if (params) {
+      if (!provider.checkParams)
+        throw new ToolError(
+          `${details.model.id} takes no params: only built-in models take parameters of their own ` +
+            `(got ${Object.keys(params).join(', ')})`,
+          'INVALID_PARAMS',
+        );
+      provider.checkParams(local, params);
+    }
     const note = licenseNote(details.model.license.spdx);
     if (note)
       warnings.push(`${details.model.id}: ${note} (recorded on the root object and in video export credits)`);
@@ -871,6 +940,7 @@ export class ModelStore {
           model: details.model.id,
           ...placement,
           ...(opts.color !== undefined ? { color: opts.color } : {}),
+          ...(params ? { params } : {}),
         },
         entry,
         warnings,
@@ -981,11 +1051,11 @@ export class ModelStore {
     );
     if (!res.ok)
       throw new ToolError(`${prepared.operator} failed: ${res.error ?? 'unknown error'}`, res.code);
-    return {
-      result: res.result ?? null,
-      entry: prepared.entry,
-      warnings: [...prepared.warnings, ...reports.filter((r) => r.level !== 'INFO').map((r) => r.message)],
-    };
+    // the thumbnail route stays relative, as the REST search gives it
+    return insertReply(res.result, prepared.entry, [
+      ...prepared.warnings,
+      ...reports.filter((r) => r.level !== 'INFO').map((r) => r.message),
+    ]);
   }
 
   private async openRoom(project: string) {

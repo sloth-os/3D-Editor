@@ -112,7 +112,7 @@ export function registerRideoTools(tool: ToolRegistrar, ctx: ToolContext): void 
     {
       title: 'Push export to rideo',
       description:
-        "Send a finished export's clips to rideo as reference videos of the shots they were imported from. First writes the project's blocking to the rideo clip (write_blocking; refused for an approved clip), then per shot (default: physics, tethers, held props or a camera move) checks frames, fps and size against the rideo shot, uploads the clip (once per content) and sets motionReference with the camera move. Default mode: camera when rideo's first frame cannot follow our staging, else motion for props in motion, pose for actors; never replaces a 'performance' reference.",
+        "Send the clips of an export made with export_video {preset: 'rideo'} as reference videos of their rideo shots. First writes our blocking to the rideo clip (write_blocking; refused for an approved clip), then per shot (default: physics, tethers, held props or a camera move) checks frames, fps and size, uploads its clip of the mode's pass (motion beauty, pose pose, camera depth; none: the shot fails) and sets motionReference with the camera move. Mode: camera when rideo's first frame cannot follow our staging, else motion (props in motion) or pose (actors); a 'performance' reference stays.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
     {
@@ -132,7 +132,9 @@ export function registerRideoTools(tool: ToolRegistrar, ctx: ToolContext): void 
       pass: z
         .enum(PASS_NAMES)
         .optional()
-        .describe('Pass to send (default per mode: motion beauty, pose pose, camera depth; else beauty)'),
+        .describe(
+          "Pass to send for every shot (default per mode: motion beauty, pose pose, camera depth; the export's clip of it, or the shot fails)",
+        ),
       write_blocking: z
         .boolean()
         .default(true)

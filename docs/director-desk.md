@@ -177,7 +177,8 @@ lose a subject during the shot.
   subject (its eyes, or its body below them) steps up to 20° aside or 1 m up to see past them.
   Subjects still hidden are listed in the result (`occluded`, with the frames and who hides them),
   and a warning (`occluded_subject`) suggests restaging, adding the bystander to the subjects or
-  another angle or height.
+  another angle or height; `desk.check` runs the same test through the camera as keyed. A rider's
+  mount does not hide her, nor she it.
 
 `desk.shot_add` with `from_view: {position, target, lens_mm}` places the camera at a view (the
 viewport's, in the editor) instead of solving it.
@@ -211,11 +212,22 @@ shot also uses keeps that shot's first and last view.
 
 `desk.check {shots?}` changes nothing and returns `{issues, lines, layouts, summary}`:
 
-| Severity | Codes                                                                                                                                            |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| error    | `line_crossed`, `subject_out_of_frame` (at the shot's first, middle and last frame), `camera_inside` (water exempt), `missing_camera`            |
-| warning  | `plan_mismatch`, `screen_direction`, `jump_cut`, `absent_in_frame`, `actors_overlap` (< 0.35 m), `outside_set`, `empty_shot`, `duration_clamped` |
-| info     | `physics_unbaked`, `shot_gap`                                                                                                                    |
+| Severity | Codes                                                                                                                                                                                                                                       |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| error    | `line_crossed`, `subject_out_of_frame` (at the shot's first, middle and last frame; a pan's or tilt's first and last), `camera_inside` (water exempt), `missing_camera`, `tether_detached` (a kite's string left over 5 cm from its anchor) |
+| warning  | `plan_mismatch`, `screen_direction`, `jump_cut`, `absent_in_frame`, `subject_hidden`, `subject_revealed` (brought in by a pan or tilt), `occluded_subject`, `actors_overlap` (< 0.35 m), `outside_set`, `empty_shot`, `duration_clamped`    |
+| info     | `physics_unbaked`, `shot_gap`                                                                                                                                                                                                               |
+
+Objects put away by a hide key (scaled to nothing: `after: 'hide'` of `desk.tether_fly`, the actors
+and props a rideo import hides) are nowhere at the frames they are hidden: a subject hidden at a
+frame the check samples is `subject_hidden`, not `subject_out_of_frame`, a hidden bystander is never
+`absent_in_frame` and hides nobody, and the solver frames the subjects shown at each frame.
+`occluded_subject` is a subject hidden behind an actor the shot does not frame (see above). A pan
+or a tilt turns away from its subjects by design, so only its first frame must frame them; one it
+brings into the frame by its last frame instead is `subject_revealed`, and one in the frame at
+neither is `subject_out_of_frame`. A rider and the mount she sits on move as one: they are never
+the pair of the 180° line where she rides, and cross the frame once, as the mount
+(`screen_direction`).
 
 `lines` gives each shot's blocking line in rideo's own sentence format, which is what rideo puts
 into its prompts, e.g. "Blocking: Ada is left of frame, facing right. Light: the sun is ahead of
@@ -255,7 +267,16 @@ and dips in the lulls. It rises over `launch_frames` (default: the string paid o
 least 2 s; 0 starts already flying). The string is an object of its own (`desk_role: 'string'`),
 drawn by the video export as a line at least 2 px wide, so it never vanishes at a distance. After
 `frame_end`, `after` decides: `hold` leaves the kite where the flight ends, `hide` hides kite, tail
-and string, and `land` brings a kite down within 1.5 s to lie on the ground downwind.
+and string, and `land` brings a kite down to lie on the ground downwind (1.6 times as long as a
+stone dropped from its height takes, at least 1.5 s). A kite can fly again: each flight keys only
+its own frames and reuses the string and the tail, one flown over an earlier flight replaces it from
+its `frame_start` on, and between two flights kite, string and tail stay as the earlier one left
+them. The flight keys the string where the anchor is at each of its frames, so fly the kite after
+the anchor's own moves: an anchor walked, posed, mounted or handed a prop afterwards leaves the
+string behind. `desk.check` reports a string more than 5 cm from its anchor (`tether_detached`),
+and `desk.actor_move`, `desk.actor_pose`, `desk.actor_face`, `desk.actor_hold` and
+`desk.actor_mount` warn when they leave one behind; `desk.tether_fly` again with the same options
+ties it back on.
 
 ### Vehicles
 
@@ -453,6 +474,9 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   angles are degrees about +Z: `facing_deg` 0 faces the front (−Y), 90 faces +X, −90 faces −X.
 - rideo: metres, y up, x right, z toward the audience. **rideo (x, y, z) → editor (x, −z, y)**, and
   rideo's `facingDeg` is the editor's `facing_deg` (0 toward the audience, 90 to the right).
+- Heights: rideo's `heightM` is the top of its figure, the desk's `height_m` a person's height but
+  an animal's withers: the rideo import and export convert an animal's (a pony drawn 1.3 m tall in
+  rideo has its withers about 0.98 m up), a person's is the same number.
 - The sun: rideo's azimuth and elevation are the same numbers in `desk.set_build`
   (`sun_azimuth_deg`: 0 in front of the set, 90 to its right, 180 behind it). The SKY world gets
   `sun_rotation = rad(azimuth) + π` and `sun_elevation = rad(elevation)`.
@@ -466,16 +490,19 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   over the barrel, and short-necked animals (dogs, cats, sheep, pigs, bears) cannot graze from the
   ground.
 - **Hiding is by scale**: `hide_render` cannot be keyed, so a kite after `after: 'hide'`, and the
-  actors and props a rideo import hides in shots they are not in, are scaled to 1e-8 for those
-  frames. They are sub-pixel in every render, but still objects of the scene (the video export's
-  pose pass does not skip them yet).
+  actors and props a rideo import hides in shots they are not in, are scaled to 1e-8 of the scale
+  they are shown at for those frames. They are sub-pixel in every render, but still objects of the
+  scene (the video export draws nothing of them in any pass, and its subject tracks say `hidden`).
+  `desk.check` and the solver tell a hidden object by its size (under a micrometre across), so a
+  store model in very large units shown a few centimetres across is not hidden; the export reads
+  the world scale alone, and takes such a model shown at under 1e-7 of its units for hidden.
 - **Holding**: there is no reach before a grab: the prop glides into the hand over 6 frames. A
   released prop without a rigid body stays where it was let go.
 - **Gaits** key about 17 keys per channel per cycle on the legs (fewer keys let planted feet slide),
   so long walks make long F-curves.
-- **Tethers**: one flight per flyer (a later flight takes over the string and the generated tail);
-  the string is straight, without sag; kite and tail collide with the ground at z = 0 only, not
-  with terrain or props; a landing takes a fixed 1.5 s whatever the height.
+- **Tethers**: the string is straight, without sag; kite and tail collide with the ground at z = 0
+  only, not with terrain or props. A flight flown before a later one already keyed leaves that one
+  as it was flown: it starts where the kite was then, so fly the later flights again.
 - **Physics**: balls are recognized by name or store tag (other round objects need
   `shape: 'SPHERE'`); there is no rolling resistance (the presets give balls an angular damping of
   0.9, a ball with Blender's default 0.1 rolls on); water is not a collider. A body carried by a
@@ -490,10 +517,12 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   other shots on the same camera.
 - **rideo import**: the kind of each character and who rides whom are read from English text only,
   without following pronouns across sentences; hand-made keys on imported actors and props are
-  replaced on re-import (user objects, shots, physics and materials are kept). Importing a long
-  clip takes seconds (about 5 s for 20 shots with 6 actors when it was measured).
-- **rideo bridge**: tested against a mock of rideo's routes, not a running rideo; previs jobs live
-  in the server's memory (100 kept, 4 at once) and are lost when it restarts. See
-  [rideo.md](rideo.md#limits).
+  replaced on re-import (user objects, shots, physics and materials are kept), and the re-import's
+  warnings name the actors, props, landmarks and shot cameras changed in the desk since the last
+  import, so stage them after the last import, or write the blocking to rideo first. Importing a
+  long clip takes seconds (about 5 s for 20 shots with 6 actors when it was measured).
+- **rideo bridge**: tested against a mock of rideo's routes, not a running rideo; previs jobs (100
+  kept, 4 at once) are kept in `DATA_DIR` across restarts, but one running when the server stops
+  ends failed and must be started again. See [rideo.md](rideo.md#limits).
 - **Real video models**: whether the references improve rideo's takes is not measured yet
   ([rideo.md](rideo.md#what-rideo-should-measure-first)).

@@ -316,7 +316,10 @@ export function viewTarget(
   subjects: readonly string[],
   frame: number,
 ): Vec3 {
-  const centres = subjects.map((id) => scene.subject(id, frame)?.chest).filter((p): p is Vec3 => !!p);
+  const centres = subjects
+    .map((id) => scene.subject(id, frame))
+    .filter((s): s is NonNullable<typeof s> => !!s && !s.hidden)
+    .map((s) => s.chest);
   let depth = 5;
   if (centres.length) {
     const c = v3mul(centres.reduce(v3add, [0, 0, 0] as Vec3), 1 / centres.length);
@@ -945,7 +948,7 @@ export function applyCameraMove(
       const forward = v3norm(v3sub(start.target, from));
       const depths = (o.subjects ?? [])
         .map((id) => scene.subject(id, fs))
-        .filter((s): s is NonNullable<typeof s> => !!s)
+        .filter((s): s is NonNullable<typeof s> => !!s && !s.hidden)
         .map((s) => v3dot(v3sub(s.chest, from), forward))
         .filter((d) => d > 0.05);
       const toTarget = v3len(v3sub(start.target, start.position));
@@ -1182,8 +1185,9 @@ function keepPoints(
     const map = (p: Readonly<Vec3>): Vec3 => (sample > 0 && follow ? follow(p, frame) : [p[0], p[1], p[2]]);
     for (const id of spec.subjects) {
       if (left.has(id)) continue;
+      // one put away at the sample (a hide key) shows nothing to keep in frame (desk.check's subject_hidden)
       const s = scene.subject(id, frame);
-      if (!s) continue;
+      if (!s || s.hidden) continue;
       const put = (p: Readonly<Vec3>, check: FrameBox | null, keep: FrameBox, checked = false) =>
         out.push({ subject: id, p: map(p), sample, checked, check, keep });
       if (!s.actor) {
@@ -1596,14 +1600,14 @@ function affineOf(map: (p: Readonly<Vec3>) => Vec3): Mat4 {
  * camera sees them in from its start (`map`: a following move's map of the frame, else none): a
  * rigged actor by its body parts (their meshes' boxes, as posed), an actor without a rig by a column
  * OCCLUDER_RADIUS_M around its chest from its feet to the top of its head. Actors hidden from
- * renders, or scaled away, hide nothing.
+ * renders, or scaled away (put away by a hide key, or too small to hide anyone), hide nothing.
  */
 function occluders(scene: DeskScene, others: readonly string[], frame: number, map: Mat4 | null): Occluder[] {
   const unmap = map ? invert4(map) : null;
   const out: Occluder[] = [];
   for (const id of others) {
     const s = scene.subject(id, frame);
-    if (!s || s.height < 0.3) continue;
+    if (!s || s.hidden || s.height < 0.3) continue;
     const boxes = s.posed ? scene.bodyBoxes(id, frame) : [];
     if (!boxes.length) {
       const r = OCCLUDER_RADIUS_M;
@@ -1651,14 +1655,23 @@ const transformPoint = (m: Readonly<Mat4>, p: Readonly<Vec3>): Vec3 => [
   m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
 ];
 
+/** The actors of the scene that are not among `subjects` and show in renders: who may stand in the way. */
+function bystanders(scene: DeskScene, subjects: readonly string[]): string[] {
+  const cast = new Set(subjects);
+  return [...scene.objects.values()]
+    .filter((o) => !cast.has(o.id) && !o.hide_render && scene.isActor(o.id))
+    .map((o) => o.id);
+}
+
 /**
  * The subjects of a shot hidden from a camera at `pose` (through the shot's move) behind actors the
  * shot does not frame, at the frames desk.check samples (occluded_subject): the line from the camera
  * to a subject's eyes (a prop's middle) passes through such an actor's body (its posed body parts, a
  * column for an actor without a rig), or, its eyes showing, the line to its chest or its hips does
- * (its body is hidden). Only points the frame shows count. A camera widened over its shot or fitted around a group can end up behind a bystander
- * (Kite Day S11: Ada's back covering Ben's body and the melon). Actors hidden from renders, or
- * scaled away, hide nothing.
+ * (its body is hidden). Only points the frame shows count. A camera widened over its shot or fitted
+ * around a group can end up behind a bystander (Kite Day S11: Ada's back covering Ben's body and the
+ * melon). Actors hidden from renders, or scaled away, hide nothing; a rider's mount does not hide her
+ * (nor she it); a subject put away at a frame is hidden behind nobody there.
  */
 export function shotOcclusions(
   scene: DeskScene,
@@ -1666,31 +1679,61 @@ export function shotOcclusions(
   span: ShotSpan,
   pose: CameraPose,
 ): Occlusion[] {
-  const cast = new Set(spec.subjects);
-  const others = [...scene.objects.values()]
-    .filter((o) => !cast.has(o.id) && !o.hide_render && scene.isActor(o.id))
-    .map((o) => o.id);
-  if (!others.length) return [];
+  if (!bystanders(scene, spec.subjects).length) return [];
   const f = shotFrame(scene, { ...spec, lens_mm: pose.lens }, span);
-  const views = f.views(pose.position, pose.target);
+  return occlusionsThrough(scene, spec.subjects, f.frames, f.views(pose.position, pose.target), f.follow).map(
+    ({ by_ids: _, ...o }) => o,
+  );
+}
+
+/** An occlusion with the ids of who hides the subject (occlusionsThrough). */
+export interface OcclusionBy extends Occlusion {
+  by_ids: string[];
+}
+
+/**
+ * The subjects (of `subjects`) hidden behind actors not among them, seen through `views` (one per
+ * frame of `frames`; null where there is no camera): shotOcclusions's rule at those frames. `follow`:
+ * how a following move maps the frames after the first into the space its camera sees them in from
+ * its start (the views being the start's); none for views of the camera where it stands at each
+ * frame (desk.check reads the keyed camera).
+ */
+export function occlusionsThrough(
+  scene: DeskScene,
+  subjects: readonly string[],
+  frames: readonly number[],
+  views: readonly (CameraView | null)[],
+  follow: FollowMap | null = null,
+): OcclusionBy[] {
+  const others = bystanders(scene, subjects);
+  if (!others.length) return [];
   const found = new Map<string, { by: Set<string>; frames: Set<number>; body: Set<number> }>();
-  f.frames.forEach((frame, sample) => {
-    const follow = sample > 0 && f.follow ? f.follow : null;
-    const map = follow
-      ? (p: Readonly<Vec3>) => follow(p, frame)
-      : (p: Readonly<Vec3>): Vec3 => [p[0], p[1], p[2]];
-    const bodies = occluders(scene, others, frame, follow ? affineOf(map) : null);
-    if (!bodies.length) return;
+  frames.forEach((frame, sample) => {
     const view = views[sample];
-    // who hides a point the frame shows (one out of it is subject_out_of_frame's matter, or not shown)
-    const blockers = (p: Readonly<Vec3>): string[] => {
-      const q = map(p);
-      if (excess(view, q, CHECKED_FRAME) > 1) return [];
-      return [...new Set(bodies.filter((b) => sightBlocked(view.position, q, b)).map((b) => b.id))];
+    if (!view) return;
+    const mapped = sample > 0 && follow ? follow : null;
+    const map = mapped
+      ? (p: Readonly<Vec3>) => mapped(p, frame)
+      : (p: Readonly<Vec3>): Vec3 => [p[0], p[1], p[2]];
+    const bodies = occluders(scene, others, frame, mapped ? affineOf(map) : null);
+    if (!bodies.length) return;
+    const mounts = new Map<string, string | null>();
+    const mountOf = (id: string): string | null => {
+      if (!mounts.has(id)) mounts.set(id, scene.mountOf(id, frame));
+      return mounts.get(id)!;
     };
-    for (const id of spec.subjects) {
+    for (const id of subjects) {
       const s = scene.subject(id, frame);
-      if (!s) continue;
+      if (!s || s.hidden) continue;
+      // a rider sits on her mount (and a mount carries its rider): neither hides the other
+      const theirs = bodies.filter((b) => b.id !== mountOf(id) && mountOf(b.id) !== id);
+      if (!theirs.length) continue;
+      // who hides a point the frame shows (one out of it is subject_out_of_frame's matter, or not shown)
+      const blockers = (p: Readonly<Vec3>): string[] => {
+        const q = map(p);
+        if (excess(view, q, CHECKED_FRAME) > 1) return [];
+        return [...new Set(theirs.filter((b) => sightBlocked(view.position, q, b)).map((b) => b.id))];
+      };
       let by = blockers(s.actor ? s.eyes : s.center);
       const face = by.length > 0;
       // its eyes show: its body, at its chest and its hips
@@ -1702,19 +1745,26 @@ export function shotOcclusions(
         frames: new Set<number>(),
         body: new Set<number>(),
       };
-      for (const b of by) entry.by.add(scene.name(b));
+      for (const b of by) entry.by.add(b);
       (face ? entry.frames : entry.body).add(frame);
       found.set(id, entry);
     }
   });
   const sorted = (s: Set<number>) => [...s].sort((a, b) => a - b);
-  return [...found].map(([id, e]) => ({
-    subject: id,
-    name: scene.name(id),
-    by: [...e.by].sort(),
-    frames: sorted(e.frames),
-    body_frames: sorted(e.body),
-  }));
+  return [...found].map(([id, e]) => {
+    // who hides it by name (in name order), and their ids in the same order
+    const by = [...e.by]
+      .map((b) => ({ id: b, name: scene.name(b) }))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return {
+      subject: id,
+      name: scene.name(id),
+      by: by.map((b) => b.name),
+      by_ids: by.map((b) => b.id),
+      frames: sorted(e.frames),
+      body_frames: sorted(e.body),
+    };
+  });
 }
 
 /** Turns about its aim (degrees, each side in turn) a camera a bystander blocks tries, then rises (m). */

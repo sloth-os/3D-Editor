@@ -35,13 +35,16 @@ import {
  *     and rideo's plan_mismatch issues are read (rideo then leaves the line and the camera view out
  *     of that shot's prompts);
  *  2. the clip document is read again, and each chosen shot (default: shots with physics, tethers,
- *     held props or a camera move; never one with a 'performance' reference) gets its mode and pass,
- *     its clip is checked against the CURRENT rideo shot (frames = round(durationSec × fps), the
- *     project's fps and size, H.264 MP4) and against the project (a shot whose camera changed since
- *     the export is refused: the blocking written is the project's), uploaded with its probe and a
- *     JPEG poster (unless this very clip, by sha256, went up to the same rideo clip before, from this
- *     export or another) and set as the shot's motionReference together with the camera move we
- *     rendered (with the shot's whole camera: see RideoCameraPatch);
+ *     held props or a camera move; never one with a 'performance' reference) gets its mode and pass
+ *     (an export without the clip of that pass fails the shot: another pass, such as a coloured
+ *     beauty clip where a depth or pose reference belongs, would carry what the reference leaves to
+ *     the model; export_video's preset 'rideo' renders every pass a mode sends), its clip is checked
+ *     against the CURRENT rideo shot (frames = round(durationSec × fps), the project's fps and size,
+ *     H.264 MP4) and against the project (a shot whose camera changed since the export is refused:
+ *     the blocking written is the project's), uploaded with its probe and a JPEG poster (unless this
+ *     very clip, by sha256, went up to the same rideo clip before, from this export or another) and
+ *     set as the shot's motionReference together with the camera move we rendered (with the shot's
+ *     whole camera: see RideoCameraPatch);
  *  3. the other shots of the clip get our camera move too (rideo sets a blocked move only on a shot
  *     that has none), so that none keeps a move the staging no longer has.
  * What went up is remembered in rideo-push.json next to the export (the VideoExports service has no
@@ -425,6 +428,12 @@ export function stagingChanges(
   return { camera, moves };
 }
 
+/**
+ * The export call that makes every clip a push may send: the passes of all three modes (motion
+ * beauty in the clay look, pose, depth) at rideo's size and fps.
+ */
+const presetExportCall = (project: string) => `export_video {project: '${project}', preset: 'rideo'}`;
+
 /** The clip of a shot and pass among an export's files. */
 function clipOf(files: readonly ExportFile[], shot: string, pass: PassName): ExportFile | null {
   return files.find((f) => f.kind === 'clip' && f.shot === shot && f.pass === pass) ?? null;
@@ -718,6 +727,8 @@ export async function pushExport(env: PushEnvironment, p: PushParams): Promise<P
   };
   const resolution = project.settings.resolution;
   let fatal: string | null = null;
+  /** The passes of the shots that failed for want of the clip their mode sends. */
+  const missingPasses = new Set<PassName>();
   /** rideo shots whose camera.move this push set (with a reference or after them). */
   const moveSet = new Set<string>();
 
@@ -786,22 +797,23 @@ export async function pushExport(env: PushEnvironment, p: PushParams): Promise<P
     r.why = whyMode(mode, features, mismatch, !!p.mode);
     if (p.mode && mismatch && mode !== 'camera')
       r.warnings.push(`mode '${mode}' as asked, although ${mismatch}`);
-    let pass: PassName = p.pass ?? DEFAULT_PASS[mode];
-    let file = clipOf(job.files, ms.id, pass);
-    if (!file && pass !== 'beauty') {
-      const beauty = clipOf(job.files, ms.id, 'beauty');
-      if (beauty) {
-        r.warnings.push(`the export has no ${pass} clip of this shot: the beauty clip was pushed instead`);
-        pass = 'beauty';
-        file = beauty;
-      }
-    }
+    const pass: PassName = p.pass ?? DEFAULT_PASS[mode];
     r.pass = pass;
+    // the clip of the mode's pass, never another in its place: a beauty clip sent as a camera or
+    // pose reference would carry the look, colours and lighting the reference is meant to leave out
+    const file = clipOf(job.files, ms.id, pass);
     if (!file) {
       r.status = 'failed';
-      r.error = `the export has no ${pass} clip of this shot (export it with outputs.clips and passes ['${pass}'])`;
+      r.error = p.pass
+        ? `the export has no ${pass} clip of this shot (pass '${pass}' as asked): export it with outputs.clips and passes ['${pass}'], then push that export`
+        : `the export has no ${pass} clip of this shot, the pass a '${mode}' reference sends: ${presetExportCall(ours)}, then push that export`;
+      if (!p.pass) missingPasses.add(pass);
       continue;
     }
+    if (pass === 'beauty' && manifest.look && manifest.look !== 'clay')
+      r.warnings.push(
+        `the beauty clip is in the '${manifest.look}' look, which the video model may copy: rideo's references are clay renders that leave the look to the model (${presetExportCall(ours)})`,
+      );
     r.file = file.name;
     r.sha256 = file.sha256;
     try {
@@ -982,6 +994,12 @@ export async function pushExport(env: PushEnvironment, p: PushParams): Promise<P
         )}): a changed camera refuses the clip, changed walks make it a camera reference; export them again to push their new staging`,
     );
 
+  if (missingPasses.size) {
+    const n = result.shots.filter((s) => s.status === 'failed' && s.pass && missingPasses.has(s.pass)).length;
+    warn(
+      `${n} shot(s) were not pushed: the export has no clip of the pass their reference mode sends (${[...missingPasses].join(', ')}). Export them with ${presetExportCall(ours)} and push that export`,
+    );
+  }
   const tried = result.shots.filter((s) => s.status !== 'skipped' || s.error?.startsWith('not tried'));
   const failed = result.shots.filter((s) => s.status === 'failed').length;
   result.status = fatal || (failed > 0 && failed === tried.length) ? 'failed' : failed ? 'partial' : 'done';

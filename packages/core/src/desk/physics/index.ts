@@ -59,7 +59,10 @@ export {
   tetherLandFramesMax,
   tetherLandSeconds,
   windModel as deskWindModel,
+  TETHER_DETACH_M,
+  tetherDetachments as deskTetherDetachments,
   type TetherAfter,
+  type TetherDetachment,
   type TetherResult,
 } from './tether';
 export {

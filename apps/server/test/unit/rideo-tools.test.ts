@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { MCP_INSTRUCTIONS } from '../../src/mcp/instructions';
 import { registerTools, type ToolContext } from '../../src/mcp/tools';
 
 /*
@@ -68,6 +69,28 @@ describe('rideo tools', () => {
       );
       expect((push.inputSchema as Schema).required!.sort()).toEqual(['export', 'project', 'rideo']);
     });
+  });
+
+  it("tell agents which export rideo_push sends: export_video's preset 'rideo'", async () => {
+    await withClient(async (client) => {
+      const { tools } = await client.listTools();
+      const push = tools.find((t) => t.name === 'rideo_push')!;
+      const exportVideo = tools.find((t) => t.name === 'export_video')!;
+      expect(push.description).toContain("an export made with export_video {preset: 'rideo'}");
+      // the push sends a shot's clip of its mode's pass or fails the shot (never another pass)
+      expect(push.description).toContain('motion beauty, pose pose, camera depth; none: the shot fails');
+      expect(exportVideo.description).toContain("preset 'rideo' makes the clips rideo_push sends");
+      expect(exportVideo.description!.length).toBeLessThanOrEqual(600);
+      const preset = (exportVideo.inputSchema as { properties: Record<string, { enum?: string[] }> })
+        .properties.preset;
+      expect(preset.enum).toEqual(['rideo']);
+    });
+    expect(MCP_INSTRUCTIONS).toContain(
+      "rideo_push sends the clips of an export made with export_video {preset: 'rideo'}",
+    );
+    expect(MCP_INSTRUCTIONS).toContain(
+      "then export_video {preset: 'rideo'} → export_status until done → rideo_push {project, export, rideo}",
+    );
   });
 
   it('refuse malformed rideo ids and unknown arguments before anything runs', async () => {

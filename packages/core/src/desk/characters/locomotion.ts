@@ -3,7 +3,7 @@ import { compose4, identity4, invert4, multiply4 } from '../../math/mat4';
 import { transformDirection3, transformPoint3 } from '../../math/vec3';
 import type { Interpolation, ObjectData, PoseBone } from '../../doc/types';
 import type { SceneDoc } from '../../doc/scene-doc';
-import { computePose } from '../../armature/pose';
+import { computePose, createPoseEvaluation } from '../../armature/pose';
 import type { ArmaturePose } from '../../armature/types';
 import { compatibleEuler } from '../../constraints/math';
 import { FrameState } from '../../eval/frame-state';
@@ -449,7 +449,8 @@ function footIn(pose: ArmaturePose, leg: LegRig): { end: Vec3; dir: Vec3; toeDir
 /**
  * One move of moveActor (a path without corners that turn back), or, with `turnTo` (a world
  * heading, radians), a turn on the spot from frame_start to frame_end stepped as a move's first turn
- * is; null when the actor does not stand on its feet then (the caller turns it whole).
+ * is; null when the actor does not stand on its feet then (the caller turns it whole). `atStart` is
+ * a frame state of the document as it is at frame_start when the caller has one (else one is made).
  */
 function moveSegment(
   doc: SceneDoc,
@@ -457,6 +458,7 @@ function moveSegment(
   points: readonly Vec3[],
   o: MoveOptions,
   turnTo: number | null = null,
+  atStart: FrameState | null = null,
 ): MoveResult | null {
   const meta = requireActor(doc, actorId);
   const kind = requireBuiltKind(meta.kind) as ActorKind;
@@ -486,7 +488,7 @@ function moveSegment(
   const f0 = o.frame_start;
 
   // where and how the actor stands at frame_start
-  const fs0 = new FrameState(doc, f0);
+  const fs0 = atStart?.frame === f0 ? atStart : new FrameState(doc, f0);
   const obj0 = fs0.get<ObjectData>('object', meta.id);
   const world0 = fs0.world(meta.id);
   if (!obj0 || !world0) throw new OperatorError(`Actor '${meta.name}' cannot be evaluated`, 'FAILED');
@@ -840,12 +842,13 @@ function moveSegment(
     return bones;
   };
   const reachNeed = (st: KeyState, drop: number): number => {
-    const pose = computePose(arm, bonesFor(st.bodyRot, hipsAt(st.t, drop)), evalCtx);
+    // only the bones that carry the legs are evaluated (the pose of the rest is not needed here)
+    const pose = createPoseEvaluation(arm, bonesFor(st.bodyRot, hipsAt(st.t, drop)), evalCtx);
     let need = 0;
     for (const leg of legs) {
       const foot = st.feet.get(leg.id)!;
-      const parent = pose.bones.get(leg.parent);
-      if (!foot.planted || !parent) continue;
+      const parent = foot.planted ? pose.bone(leg.parent) : null;
+      if (!parent) continue;
       const M = legFrame(leg, multiply4(st.objM, parent.matrix));
       const reach = 0.995 * (leg.L1 + leg.L2);
       const dx = foot.end[0] - M[12];
@@ -1312,12 +1315,15 @@ export function moveActor(
   o: MoveOptions,
 ): MoveResult {
   const meta = requireActor(doc, actorId);
-  const whole = () => moveSegment(doc, actorId, points, o)!;
+  // the frame state of frame_start, shared with the first move (nothing is keyed before it)
+  let fs: FrameState | null = null;
+  const whole = () => moveSegment(doc, actorId, points, o, null, fs)!;
   if (!Number.isFinite(o.frame_start) || points.some((p) => p.length !== 3 || !p.every(Number.isFinite)))
     return whole();
   const kind = requireBuiltKind(meta.kind) as ActorKind;
   const family = isHumanoidKind(kind) ? 'humanoid' : 'quadruped';
-  const world = new FrameState(doc, o.frame_start).world(meta.id);
+  fs = new FrameState(doc, o.frame_start);
+  const world = fs.world(meta.id);
   if (!world || !points.length) return whole();
   const parts = splitAtSharpCorners([[world[12], world[13], world[14]], ...points]);
   if (parts.length < 2) return whole();
@@ -1339,13 +1345,20 @@ export function moveActor(
   for (let k = 0; k < parts.length; k++) {
     const end = k === parts.length - 1;
     const timed = end && o.frame_end !== undefined && o.frame_end > frame + 1;
-    const r = moveSegment(doc, actorId, parts[k].slice(1), {
-      ...o,
-      frame_start: frame,
-      frame_end: timed ? o.frame_end : undefined,
-      speed_mps: timed ? undefined : speed,
-      end_pose: end ? o.end_pose : 'stand',
-    })!;
+    const r = moveSegment(
+      doc,
+      actorId,
+      parts[k].slice(1),
+      {
+        ...o,
+        frame_start: frame,
+        frame_end: timed ? o.frame_end : undefined,
+        speed_mps: timed ? undefined : speed,
+        end_pose: end ? o.end_pose : 'stand',
+      },
+      null,
+      k === 0 ? fs : null,
+    )!;
     length += r.length_m;
     keys += r.keys;
     frame = r.frame_settled;

@@ -246,6 +246,50 @@ describe('prepareInsert', () => {
       'color applies to built-in models only: the model keeps its materials',
     ]);
   });
+
+  /** The ToolError an insert is refused with. */
+  async function refusal(s: Awaited<ReturnType<typeof store>>['store'], model: string, params: object) {
+    try {
+      await s.prepareInsert(model, { params: params as Record<string, unknown> });
+    } catch (err) {
+      if (err instanceof ToolError) return err;
+      throw err;
+    }
+    throw new Error(`${model} was not refused`);
+  }
+
+  it("passes a built-in model's own parameters to store.add once its schema took them", async () => {
+    const { store: s } = await store();
+    const call = await s.prepareInsert('builtin:house', { params: { floors: 3 }, height_m: 9 });
+    expect(call).toMatchObject({
+      operator: 'store.add',
+      params: { model: 'builtin:house', height_m: 9, params: { floors: 3 } },
+    });
+    // none given: the model's defaults (store.add without params)
+    expect((await s.prepareInsert('builtin:house', { params: {} })).params).not.toHaveProperty('params');
+    const big = await refusal(s, 'builtin:house', { floors: 9 });
+    expect(big.code).toBe('INVALID_PARAMS');
+    expect(big.message).toMatch(/^Invalid params for builtin:house: floors: .*4/);
+    expect(big.message).toContain('It takes: floors (integer 1–4, default 2): Storeys');
+    expect((await refusal(s, 'builtin:house', { flors: 3 })).message).toMatch(/flors/);
+    expect((await refusal(s, 'builtin:house', { floors: 'three' })).code).toBe('INVALID_PARAMS');
+    const plain = BUILTIN_CATALOG.find((e) => !e.params && e.rig === null)!;
+    expect((await refusal(s, `builtin:${plain.id}`, { seats: 2 })).message).toBe(
+      `builtin:${plain.id} takes no params (got seats)`,
+    );
+  });
+
+  it('refuses params for an external model before downloading it', async () => {
+    const { store: s, f } = await store();
+    const err = await refusal(s, 'khronos:DeskLamp', { seats: 2 });
+    expect(err.code).toBe('INVALID_PARAMS');
+    expect(err.message).toBe(
+      'khronos:DeskLamp takes no params: only built-in models take parameters of their own (got seats)',
+    );
+    expect(f.count(`${KHRONOS}DeskLamp/glTF/DeskLamp.gltf`)).toBe(0);
+    // empty params are no params
+    expect((await s.prepareInsert('khronos:DeskLamp', { params: {} })).operator).toBe('store.insert_files');
+  });
 });
 
 describe('the memory an insert takes (asked before the files are read)', () => {

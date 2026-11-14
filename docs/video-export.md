@@ -45,6 +45,7 @@ One schema serves the MCP tool `export_video` (with `project`) and the body of
 
 | Parameter                  | Default                        | Meaning                                                                                                        |
 | -------------------------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `preset`                   | –                              | `rideo`: the clips `rideo_push` sends (below); the parameters given win over it                                |
 | `shots`                    | every enabled shot             | Shot ids or names in cut order, or `'all'`; a scene without shots exports its frame range                      |
 | `frame_start`, `frame_end` | the scene's range              | Scene frames (inclusive) of an export without shots                                                            |
 | `camera`                   | the scene camera               | The camera of an export without shots                                                                          |
@@ -59,6 +60,12 @@ One schema serves the MCP tool `export_video` (with `project`) and the body of
 | `label`                    | –                              | A name for the export (200 characters)                                                                         |
 
 At most 100,000 output frames per export.
+
+Preset `rideo` makes the clips [`rideo_push`](rideo.md) sends: quality `draft`, look `clay` and
+clips only (no sequence, posters or contact sheet), with the passes `beauty`, `depth` and `pose`,
+one for each reference mode (`motion`, `camera` and `pose`), at the render resolution at 100 %
+(`rideo_import` sets it to rideo's) and the scene's fps (rideo's too). The parameters given win over
+the preset, `outputs` key by key.
 
 ## Quality presets and speed
 
@@ -123,7 +130,9 @@ keyframes, so they are frame-exact (the tests check every clip's frame count and
   OpenPose colours.
 
 Strings (a kite's, anything with `desk_role: 'string'`) are drawn as screen-space lines at least
-2 px wide in the beauty, mask, edge and pose passes, hidden behind opaque objects.
+2 px wide in the beauty, mask, edge and pose passes, hidden behind opaque objects. Objects hidden
+by their scale (a kite after `after: 'hide'`, the actors and props a rideo import hides in shots
+they are not in) draw nothing in any pass: no skeleton, no string line, no mask colour.
 
 ## The manifest
 
@@ -141,7 +150,8 @@ Strings (a kite's, anything with `desk_role: 'string'`) are drawn as screen-spac
   (`object`, `name`, `role`, `color`, `character_id`, `element_id`), `camera_track` (every output
   frame: `frame`, `position`, `rotation_quat` [x, y, z, w], `fov_deg`), `subject_tracks` (by rideo
   character id or object id: `frame`, `x`, `y`, `w`, `h` in output pixels from the top left,
-  `visible`) and `rideo {clip, shot, camera_move, layout, moves}`.
+  `visible`, and `hidden: true` with a zero box while the subject is hidden by its scale) and
+  `rideo {clip, shot, camera_move, layout, moves}`.
 
 Coordinates are the editor's (metres, Z up; [conventions](director-desk.md#coordinates)).
 
@@ -178,12 +188,13 @@ Coordinates are the editor's (metres, Z up; [conventions](director-desk.md#coord
 
 Before an export starts rendering, the server decides how many render processes it can use: the
 memory available (Linux `MemAvailable`, or the container's cgroup limit minus its use when that is
-lower) less what ffmpeg needs for the streams, the server's own share and the base memory of
-render processes not started yet, divided by what one render process needs at this size and with
-these passes (processes already running count what they hold). With fewer than `RENDER_WORKERS`
-it renders on fewer and adds a warning; when not even one fits, `export_video` is refused at once
-with `OUT_OF_MEMORY` (the message says what the export needs and what to change: a smaller size,
-fewer passes, fewer render processes). The decision is in the job's `render` field.
+lower) less what ffmpeg needs for the streams and the server's own share, divided by what one
+render process needs at this size and with these passes (a process already running needs only
+what it does not hold yet; one the export starts adds its base, about 128 MiB). The server starts
+only the render processes the export renders on: with fewer than `RENDER_WORKERS` it renders on
+fewer, starts no others and adds a warning; when not even one fits, `export_video` is refused at
+once with `OUT_OF_MEMORY` (the message says what the export needs and what to change: a smaller
+size, fewer passes or quality `draft`). The decision is in the job's `render` field.
 
 Each pass is its own encoder stream (mask and edges two), so passes multiply ffmpeg's memory:
 one 1080p `standard` x264 stream measured about 535 MiB. A render process needed about 400 MB at
@@ -236,7 +247,7 @@ export. In the editor, Render › Export Video… (Ctrl+Shift+F12) runs the same
 | `FFMPEG_UNAVAILABLE` "has no libx264 encoder" although `features.videoExport` is `true` | this ffmpeg runs but was built without libx264 (the flag only checks that ffmpeg runs): install one with it (the Debian/Ubuntu and Alpine packages have it) or point `FFMPEG_PATH` to one, then restart |
 | `UNAVAILABLE` "needs render processes"                                                  | `RENDER_WORKERS=0`: set it to 1 or more                                                                                                                                                                 |
 | `QUEUE_FULL` (409)                                                                      | `EXPORT_MAX_QUEUED` exports already wait: wait for one, cancel one, or raise the setting                                                                                                                |
-| `OUT_OF_MEMORY` at start, or a "memory:" warning                                        | not enough memory for the render processes and ffmpeg: a smaller size, fewer passes, fewer `RENDER_WORKERS`, or free memory on the server                                                               |
+| `OUT_OF_MEMORY` at start, or a "memory:" warning                                        | not enough memory for the render processes and ffmpeg: a smaller size, fewer passes, quality `draft`, or free memory on the server                                                                      |
 | failed "server shut down while the export ran"                                          | the server was stopped (SIGTERM, Ctrl+C) during the export: start the export again                                                                                                                      |
 | failed "server restarted while the export ran"                                          | the server ended without a shutdown (a crash, `kill -9`) during the export: start the export again                                                                                                      |
 | failed "the export grew larger than EXPORT_MAX_MB"                                      | export fewer frames, a smaller size or fewer passes, or raise `EXPORT_MAX_MB`                                                                                                                           |

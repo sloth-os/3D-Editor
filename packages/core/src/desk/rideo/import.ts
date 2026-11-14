@@ -21,6 +21,7 @@ import { applyPose, createActor, holdProp, isActor, mount, moveAlongPath } from 
 import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
 import { defaultActorHeight } from '../characters';
 import { deskTetherFly } from '../physics';
+import { measureActorKind } from '../../store/builtin/actors';
 import { docParts, footprint } from './footprint';
 import { KeyArchive, clearAnimation, hideSpans, replaceKeys, setKey, truncateMotion } from './keys';
 import {
@@ -116,6 +117,18 @@ export const RIDEO_PROPS = {
    * that character is one of the offstage actors (the desk has no hold of theirs to read).
    */
   heldBy: 'desk_rideo_held_by',
+  /**
+   * A digest of what the import left an actor, prop, landmark or shot camera doing (motionDigest):
+   * a re-import, which rebuilds them from rideo's blocking, says which were changed in the desk since.
+   */
+  motion: 'desk_rideo_motion',
+  /**
+   * rideo's blocked camera of a shot (JSON {shot, camera}: its rideo shot id and RideoBlockingCamera),
+   * on a camera the import placed as rideo blocked it: the export writes it back as it was while the
+   * camera is as the import left it (RIDEO_PROPS.motion), so that a round trip keeps rideo's targets
+   * (the desk keys a move between them; recomputed targets would move its middle).
+   */
+  camera: 'desk_rideo_camera',
 } as const;
 
 /** What RIDEO_PROPS.offstage holds: rideo's actors in no shot and their marks by rideo shot id. */
@@ -289,6 +302,76 @@ function importedBy(
     if (!out.has(k)) out.set(k, o);
   }
   return out;
+}
+
+/**
+ * rideo's height of a character (its mannequin's top: heightM) over the desk's height of its kind
+ * (createActor's height_m: a person's height, an animal's withers): 1 for people, the built kind's
+ * top over its withers for animals (a pony's head is about a third above its withers). The import
+ * divides rideo's heights by it, the export multiplies the desk's by it.
+ */
+export function rideoHeightRatio(kind: ActorKind): number {
+  if (isHumanoid(kind)) return 1;
+  try {
+    const m = measureActorKind(kind);
+    const r = m.size[2] / m.height;
+    return Number.isFinite(r) && r > 0 ? r : 1;
+  } catch {
+    return 1;
+  }
+}
+
+/** A short digest of a text (two 32-bit FNV-style lanes and its length). */
+function digestOf(text: string): string {
+  let a = 0x811c9dc5;
+  let b = 0x9747b28c;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193);
+    b = Math.imul(b ^ c, 0x5bd1e995) ^ (b >>> 15);
+  }
+  return `${(a >>> 0).toString(16)}.${(b >>> 0).toString(16)}.${text.length}`;
+}
+
+/**
+ * A digest of what an object does (RIDEO_PROPS.motion): the placement, constraints, pose and
+ * animation (its own curves and its data's) of it and of everything parented below it, and a
+ * camera's lens. Equal digests: nothing of it was changed.
+ */
+export function motionDigest(doc: SceneDoc, root: string): string {
+  const parts: unknown[] = [];
+  for (const id of subtree(doc, root)) {
+    const o = doc.getObject(id);
+    if (!o) continue;
+    const curves = [...doc.listFCurves(id), ...(o.data ? doc.listFCurves(o.data) : [])]
+      .map((fc) => [fcurveKey(fc), fc.keyframes, fc.extrapolation, fc.mute, fc.modifiers ?? null] as const)
+      .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+    const camera = o.type === 'CAMERA' && o.data ? doc.getCamera(o.data) : null;
+    parts.push([
+      id,
+      o.parent,
+      o.parent_bone,
+      o.location,
+      o.rotation_euler,
+      o.scale,
+      o.constraints,
+      o.pose ?? null,
+      curves,
+      camera,
+    ]);
+  }
+  return digestOf(JSON.stringify(parts));
+}
+
+/** Records on each of `ids` what the import left it doing (RIDEO_PROPS.motion). */
+function recordMotion(doc: SceneDoc, ids: Iterable<string>): void {
+  for (const id of new Set(ids)) {
+    const o = doc.getObject(id);
+    if (o)
+      doc.updateObject(id, {
+        custom_props: { ...o.custom_props, [RIDEO_PROPS.motion]: motionDigest(doc, id) },
+      });
+  }
 }
 
 /** Removes the hold and ride constraints the import put on objects (and their influence curves). */
@@ -603,6 +686,35 @@ export function importRideoBlocking(
   const oldLandmarks = update ? importedBy(doc, 'landmark', (o) => prop(o, RIDEO_PROPS.id), clip) : new Map();
   const oldShots = getShots(doc);
   const removed: string[] = [];
+  // what was changed in the desk since the last import (keys, poses, holds, mounts, flights, a
+  // camera solved again): the import rebuilds them from rideo's blocking, so their changes are lost
+  if (update) {
+    const changed: string[] = [];
+    const seen = new Set<string>();
+    const check = (o: ObjectData | undefined, label: string) => {
+      if (!o || seen.has(o.id)) return;
+      seen.add(o.id);
+      const recorded = prop(doc.getObject(o.id), RIDEO_PROPS.motion);
+      if (recorded && motionDigest(doc, o.id) !== recorded) changed.push(label);
+    };
+    for (const o of oldActors.values()) check(o, `'${o.name}'`);
+    for (const o of oldProps.values()) check(o as ObjectData, `'${(o as ObjectData).name}'`);
+    for (const o of oldLandmarks.values()) check(o as ObjectData, `'${(o as ObjectData).name}'`);
+    for (const sh of oldShots)
+      if (
+        sh.camera &&
+        sh.external?.source === 'rideo' &&
+        (!clip || !sh.external.clip || sh.external.clip === clip)
+      )
+        check(doc.getObject(sh.camera) ?? undefined, `the camera of shot '${sh.name}'`);
+    if (changed.length)
+      warnings.push(
+        `${changed.join(', ')} ${changed.length > 1 ? 'were' : 'was'} changed in the desk since the last import ` +
+          "(keys, poses, holds, mounts, flights or a camera): this import rebuilt them from rideo's blocking, so " +
+          "those changes are gone. Stage them again, or before importing again write the desk's blocking to " +
+          'rideo (rideo_push writes it), so that the clip carries them',
+      );
+  }
 
   // ------------------------------------------------------------ the set
   const set = blocking.set;
@@ -666,10 +778,11 @@ export function importRideoBlocking(
     const b = blockActor.get(id);
     const c = characters.get(id);
     const humanoid = isHumanoid(kind);
-    // people: rideo's height (the draft's, from the identity); animals: theirs when rideo has one
+    // people: rideo's height (the draft's, from the identity); animals: theirs when rideo has one,
+    // their mannequin's top in rideo, made the withers the desk sizes an animal by
     let h = b?.heightM ?? c?.heightM ?? null;
     if (!humanoid && (h === null || Math.abs(h - 1.7) < 1e-6)) h = c?.heightM ?? null;
-    const heightM = h && h > 0 ? h : defaultActorHeight(kind);
+    const heightM = h && h > 0 ? h / rideoHeightRatio(kind) : defaultActorHeight(kind);
     const color = (b?.color ?? ACTOR_PALETTE[i % ACTOR_PALETTE.length]).toLowerCase();
     const first = markOf(ordered[0].id, id);
     const old = oldActors.get(id);
@@ -1052,6 +1165,27 @@ export function importRideoBlocking(
         )}): redraw them from the desk's camera views, or push those shots' references in 'camera' mode`,
     );
 
+  // the cameras placed as rideo blocked them keep rideo's placement, for the export to give back
+  for (const p of plans) {
+    const cam = getShots(doc).find((sh) => sh.id === p.id)?.camera;
+    const o = cam ? doc.getObject(cam) : null;
+    if (!o) continue;
+    const kept = { ...o.custom_props };
+    delete kept[RIDEO_PROPS.camera];
+    if (p.camera && from.get(p.id) === 'blocking')
+      kept[RIDEO_PROPS.camera] = JSON.stringify({ shot: p.input.id, camera: p.camera });
+    doc.updateObject(o.id, { custom_props: kept });
+  }
+  // what the import leaves each of its objects doing, for a later import to tell changes by
+  recordMotion(doc, [
+    ...[...actors.values()].map((a) => a.id),
+    ...[...props.values()].map((p) => p.root),
+    ...landmarkOut.map((l) => l.id),
+    ...getShots(doc)
+      .filter((sh) => sh.camera && plans.some((p) => p.id === sh.id))
+      .map((sh) => sh.camera!),
+  ]);
+
   const issues = checkShots(doc, { shots: plans.map((p) => p.id) }).issues;
   return {
     state: input.state ?? null,
@@ -1190,7 +1324,6 @@ function placeCamera(doc: SceneDoc, shot: ShotData, p: ShotPlan): void {
       frame_start: shot.frame_start,
       frame_end: shot.frame_end,
       seed: shot.id,
-      subject: shot.subjects[0],
       subjects: shot.subjects,
       start: { position: start.position, target: start.target, lens: c.lensMm },
     });
@@ -1438,7 +1571,9 @@ function keyMark(doc: SceneDoc, a: ActorPlan, m: RideoBlockingMark, frame: numbe
   }
   setKey(doc, a.id, 'rotation_euler', 2, frame - 1, yawBefore);
   setKey(doc, a.id, 'rotation_euler', 2, frame, nearAngle(rad(m.facingDeg), yawBefore));
-  applyPose(doc, a.id, editorPose(m.pose, a.kind), { frame, blend_frames: 0 });
+  // a mark is the whole body's pose: never layered over the pose it had before (a seated mark
+  // after a standing one, or a gesture after a seated one, must not keep the other's legs)
+  applyPose(doc, a.id, editorPose(m.pose, a.kind), { frame, blend_frames: 0, layer: 'full' });
 }
 
 /**
@@ -1481,7 +1616,11 @@ function animateActors(
           if (i === 0) {
             for (let k = 0; k < 3; k++) setKey(doc, a.id, 'location', k, p.keyFrame, floor(m.x, m.z)[k]);
             setKey(doc, a.id, 'rotation_euler', 2, p.keyFrame, rad(m.facingDeg));
-            applyPose(doc, a.id, editorPose(m.pose, a.kind), { frame: p.keyFrame, blend_frames: 0 });
+            applyPose(doc, a.id, editorPose(m.pose, a.kind), {
+              frame: p.keyFrame,
+              blend_frames: 0,
+              layer: 'full',
+            });
           } else keyMark(doc, a, m, p.keyFrame, true);
         }
         // the walk: the mark's own, else (a mount carrying someone) its rider's
@@ -1706,8 +1845,8 @@ function buildLandmark(
 /**
  * Flies a held kite or balloon from its holder's right hand (a quadruped's head) over the shots the
  * holder is in, as one flight from the first such shot's key frame to the last such shot's end, put
- * away after it (after: 'hide'; a later flight of the same flyer would replace this one's string and
- * tail keys, so shots between are hidden by the caller instead): the wind blows away from the first
+ * away after it (after: 'hide'; the caller hides it in the shots between that the holder is not in, so
+ * it is still up, flying on, when the holder is seen again): the wind blows away from the first
  * of those shots' camera (turned a little, so the string is seen), a kite is already up unless the
  * shot's text says it is launched.
  */

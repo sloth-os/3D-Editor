@@ -119,6 +119,33 @@ describe('video export tools', { timeout: 30_000 }, () => {
     expect((await call('list_exports', {})).body.exports).toHaveLength(1);
   });
 
+  it("applies preset 'rideo' where the arguments leave a parameter out (the clips rideo_push sends)", async () => {
+    await connect();
+    renderer.delayMs = 20;
+    const paramsOf = async (args: Record<string, unknown>) => {
+      const start = await call('export_video', { project: 'p1', width: 32, height: 18, ...args });
+      expect(start.isError, start.text).toBe(false);
+      return (await call('export_status', { export: start.body.export })).body.params;
+    };
+    expect(await paramsOf({ preset: 'rideo' })).toMatchObject({
+      preset: 'rideo',
+      quality: 'draft',
+      look: 'clay',
+      passes: ['beauty', 'depth', 'pose'],
+      outputs: { sequence: false, clips: true, posters: false, contact_sheet: false },
+    });
+    // what the call gives wins, the defaults it leaves out are the preset's
+    expect(
+      await paramsOf({ preset: 'rideo', quality: 'standard', look: 'material', passes: ['depth'] }),
+    ).toMatchObject({ quality: 'standard', look: 'material', passes: ['depth'] });
+    // without a preset, the defaults as before (every output: no outputs given)
+    const plain = await paramsOf({});
+    expect(plain).toMatchObject({ quality: 'standard', look: 'material', passes: ['beauty'] });
+    expect(plain).not.toHaveProperty('preset');
+    expect(plain).not.toHaveProperty('outputs');
+    expect((await call('export_video', { project: 'p1', preset: 'previs' })).isError).toBe(true);
+  });
+
   it('cancels a queued export and deletes it with its files', async () => {
     await connect();
     renderer.delayMs = 50;

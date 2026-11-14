@@ -23,7 +23,9 @@ import { resultBytes, type StreamSpec } from './passes';
  * available: their base, and what earlier renders left them (heap the allocator keeps, released
  * buffers V8 has not given back). An export reuses that memory instead of taking it anew, so each
  * running process it leases needs only what it does not hold yet (`reusableBytes`); counting the
- * whole estimate again for it refused the second of two identical exports.
+ * whole estimate again for it refused the second of two identical exports. The pool starts only
+ * the processes an export leases (render/pool.ts), so each one it starts takes its base
+ * (RENDER_PROCESS_BASE_BYTES) on top of the estimate, and processes it does not lease take nothing.
  */
 
 const MiB = 1024 * 1024;
@@ -270,44 +272,54 @@ export function ffmpegBytes(
 export interface RenderProcessPlan {
   /** Render processes to lease: 0 when not even one fits, else 1 … capacity. */
   processes: number;
-  /** Memory kept for ffmpeg, the server and the base of every render process still to start. */
+  /** Memory kept for ffmpeg, the server and the other render processes to start (`otherStarting`). */
   reserved: number;
   /** What the leased running processes hold already and reuse (bytes, counted off what they need). */
   reused: number;
+  /** Leased processes the pool starts for the export (each takes RENDER_PROCESS_BASE_BYTES first). */
+  started: number;
 }
 
 /**
- * How many render processes fit: the available memory less what ffmpeg and the server take and the
- * base memory of the render processes still to start (the pool starts all `capacity` of them for a
- * long render, whatever it leases), against what each leased process adds. A running process adds
- * only what it does not hold yet: `reuse[i]`, what the i-th one the pool would lease (the pool
- * leases its processes in a fixed order, the longest running first) holds of `processBytes`
- * already. Running processes the export does not lease keep what they hold.
+ * How many render processes fit: the available memory less what ffmpeg and the server take (and
+ * the base of `otherStarting` processes the export may start besides, the interactive one), against
+ * what each process the export leases adds, in the order the pool leases them (the running ones
+ * first, the longest running first; the pool starts the others, and only those, for the lease). A
+ * running process adds only what it does not hold yet: `reuse[i]`, what the i-th running one holds
+ * of `processBytes` already; a process the pool starts takes its base (RENDER_PROCESS_BASE_BYTES)
+ * and all of `processBytes`. Running processes the export does not lease keep what they hold.
  */
 export function planRenderProcesses(o: {
   available: number;
   capacity: number;
-  /** Render processes the pool still has to start (each takes RENDER_PROCESS_BASE_BYTES first). */
-  starting: number;
   /** What each running process holds already of `processBytes`, in the order the pool leases them. */
   reuse?: readonly number[];
+  /** Other render processes the export may start (each takes RENDER_PROCESS_BASE_BYTES). */
+  otherStarting?: number;
   processBytes: number;
   ffmpegBytes: number;
   serverBytes: number;
 }): RenderProcessPlan {
-  const reserved = o.ffmpegBytes + o.serverBytes + Math.max(0, o.starting) * RENDER_PROCESS_BASE_BYTES;
+  const reserved =
+    o.ffmpegBytes + o.serverBytes + Math.max(0, o.otherStarting ?? 0) * RENDER_PROCESS_BASE_BYTES;
   const free = o.available - reserved;
+  const running = o.reuse?.length ?? 0;
   let need = 0;
   let reused = 0;
   let processes = 0;
+  let started = 0;
   for (let i = 0; i < o.capacity; i++) {
-    const held = Math.min(o.processBytes, Math.max(0, o.reuse?.[i] ?? 0));
-    if (need + o.processBytes - held > free) break;
-    need += o.processBytes - held;
+    const runs = i < running;
+    const r = runs ? o.reuse![i] : 0;
+    const held = r > 0 ? Math.min(o.processBytes, r) : 0;
+    const cost = o.processBytes - held + (runs ? 0 : RENDER_PROCESS_BASE_BYTES);
+    if (need + cost > free) break;
+    need += cost;
     reused += held;
     processes++;
+    if (!runs) started++;
   }
-  return { processes, reserved, reused };
+  return { processes, reserved, reused, started };
 }
 
 /**
@@ -386,8 +398,9 @@ export interface ExportMemory extends ExportNeeds {
   /** Render processes to lease (0: not even one fits). */
   processes: number;
   /**
-   * Base memory of the render processes still to start: the pool's processes not running, and the
-   * interactive one the contact sheet may start.
+   * Base memory of the render processes the export starts: the ones it leases that do not run yet
+   * (when not even one fits: of the first one it would lease), and the interactive one the contact
+   * sheet may start.
    */
   starting: number;
   /** What each running render process holds already of `process`, in the order the pool leases them. */
@@ -397,30 +410,32 @@ export interface ExportMemory extends ExportNeeds {
 
 /**
  * Decides how many render processes an export renders on (see the module comment), with the
- * machine's memory now and the pool's state: `notStarted` render processes still to start, the
- * resident memory (RSS) of the running ones in the order the pool leases them (`warm`; Infinity:
- * holds all it needs but the scene), and whether to keep an interactive render process's base for
- * the contact sheet (`interactive`).
+ * machine's memory now and the pool's state: the resident memory (RSS) of the running render
+ * processes of long renders in the order the pool leases them (`warm`; Infinity: holds all it
+ * needs but the scene; the processes after them are started for the export, each with its base),
+ * and whether to keep an interactive render process's base for the contact sheet (`interactive`).
  */
 export function exportMemory(
   needs: ExportNeeds,
-  o: { notStarted: number; warm?: readonly number[]; interactive?: boolean; machine: MachineMemory },
+  o: { warm?: readonly number[]; interactive?: boolean; machine: MachineMemory },
 ): ExportMemory {
   const reuse = (o.warm ?? []).slice(0, needs.capacity).map((rss) => reusableBytes(rss, needs.process));
-  const starting = Math.max(0, Math.min(needs.capacity, o.notStarted)) + (o.interactive ? 1 : 0);
+  const interactive = o.interactive ? 1 : 0;
   const plan = planRenderProcesses({
     available: o.machine.available,
     capacity: needs.capacity,
-    starting,
     reuse,
+    otherStarting: interactive,
     processBytes: needs.process.total,
     ffmpegBytes: needs.ffmpeg,
     serverBytes: needs.server,
   });
+  // not even one: what the first process the export would lease needs (its base, when not running)
+  const started = plan.processes > 0 ? plan.started : reuse.length ? 0 : 1;
   return {
     ...needs,
     processes: plan.processes,
-    starting: starting * RENDER_PROCESS_BASE_BYTES,
+    starting: (started + interactive) * RENDER_PROCESS_BASE_BYTES,
     reuse,
     machine: o.machine,
   };
@@ -440,24 +455,21 @@ export function renderInfo(m: ExportMemory): ExportRenderInfo {
 
 const ADVICE = "export a smaller size (width and height), fewer passes or quality 'draft'";
 
-/** The OUT_OF_MEMORY error of an export not even one render process fits for. */
+/**
+ * The OUT_OF_MEMORY error of an export not even one render process fits for. It renders on one
+ * render process at least, and the pool starts no other for it: fewer render processes
+ * (RENDER_WORKERS) would not help, so the message does not suggest them.
+ */
 export function outOfMemoryMessage(m: ExportMemory, width: number, height: number): string {
   const held = m.reuse[0] ?? 0;
   const need = m.process.total - held + m.ffmpeg + m.server + m.starting;
-  // the pool starts every render process for an export, whatever the export leases (each about
-  // RENDER_PROCESS_BASE_BYTES before it renders): fewer of them leave more for one
-  const workers =
-    m.capacity > 1 && m.starting > 0
-      ? `, run the server with fewer render processes (RENDER_WORKERS, now ${m.capacity}: it starts ` +
-        `all of them for an export, about ${toMB(RENDER_PROCESS_BASE_BYTES)} MB each before they render)`
-      : '';
   return (
     `Not enough memory for this video export: it needs about ${toMB(need)} MB (a render process ` +
     `${toMB(m.process.total)} MB at ${width}×${height}: render buffers ${toMB(m.process.buffers)} MB, ` +
     `scene ${toMB(m.process.scene)} MB${held > 0 ? `, ${toMB(held)} MB of it held by a running one already` : ''}; ` +
     `ffmpeg's ${m.encoders} ${m.encoders === 1 ? 'encoder' : 'encoders'} ` +
     `${toMB(m.ffmpeg)} MB; the server and starting render processes ${toMB(m.server + m.starting)} MB), ` +
-    `and the machine has ${toMB(m.machine.available)} MB available: ${ADVICE}${workers}, or free memory ` +
+    `and the machine has ${toMB(m.machine.available)} MB available: ${ADVICE}, or free memory ` +
     'on the server.'
   );
 }

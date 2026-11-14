@@ -621,8 +621,10 @@ have tools of their own. A session goes like this:
   ([video-export.md](video-export.md#quality-presets-and-speed)). Check the cut with contact sheets
   first.
 - `duck` and `bird` are not built yet; `desk.actor_add` refuses them and lists the built kinds.
-- For a clip of the AI video studio rideo, `rideo_import` builds the scene from its blocking and
-  `rideo_push` sends the clips back ([rideo.md](rideo.md)).
+- For a clip of the AI video studio rideo, `rideo_import` builds the scene from its blocking; after
+  the steps above, `export_video {project, preset: "rideo"}` makes the clips rideo takes (draft clay
+  clips with the beauty, depth and pose passes) and `rideo_push {project, export, rideo}` sends them
+  back ([rideo.md](rideo.md)).
 
 ## Render budgets
 

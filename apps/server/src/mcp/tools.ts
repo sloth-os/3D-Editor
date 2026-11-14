@@ -73,8 +73,12 @@ import { registerVideoTools } from './video-tools';
 import { registerStoreTools } from './store-tools';
 import { registerRideoTools } from './rideo-tools';
 import {
+  AUTO_KEYFRAMES,
+  DEFAULT_KEYFRAME_PAGE,
   DEFAULT_MAX_OBJECTS,
+  KEYFRAME_LISTINGS,
   MAX_DECIMALS,
+  MAX_KEYFRAME_PAGE,
   OBJECT_DECIMALS,
   SCENE_DECIMALS,
   describeObject,
@@ -933,8 +937,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'get_object',
     {
       title: 'Get object',
-      description:
-        'Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; `stored` / `stored_value` / `stored_influence` / `stored_params` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds of the render geometry (wire curves: their wire), parent (and parent bone) and children, data (mesh statistics base and evaluated = what renders show (render settings of the modifiers: SUBSURF render_levels, SCREW render_steps, show_render), plus evaluated_viewport when the viewport shows other geometry; shape keys with values, vertex groups with assigned vertex counts; every curve shape setting (fill_mode, bevel_mode/depth/resolution/object, bevel_factor, extrude, offset, use_fill_caps, twist_mode, resolution_u, render_resolution_u, path settings) and the spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts (instance transforms: get_instances), rigid body settings, drivers with variables, animation curves (keyframes, extrapolation, F-curve modifiers, including the object data), custom properties, visibility and evaluation problems. The mesh statistics in data (data.evaluated, or the base counts when nothing changes the mesh) are those of the object itself, also when it is hidden from renders (hide_render: get_scene then counts it in counts.not_rendered, not in counts.evaluated). Numbers are rounded to `decimals` (default 6 = 1 µm, so sub-millimetre parts such as labels, engravings and fine bevels read back as they were made). Vertex positions and faces: get_mesh_data. Evaluations are cached per document state and frame: checking many objects or frames is cheap.',
+      description: `Detailed description of one object at a frame, with the EVALUATED values at that frame (keyframes, drivers, F-curve modifiers applied; \`stored\` / \`stored_value\` / \`stored_influence\` / \`stored_params\` give the document values where animation overrides them): local transform, world_location and world_transform (the final world location / rotation / scale after parents, constraints and physics), world bounds of the render geometry (wire curves: their wire), parent (and parent bone) and children, data (mesh statistics base and evaluated = what renders show (render settings of the modifiers: SUBSURF render_levels, SCREW render_steps, show_render), plus evaluated_viewport when the viewport shows other geometry; shape keys with values, vertex groups with assigned vertex counts; every curve shape setting (fill_mode, bevel_mode/depth/resolution/object, bevel_factor, extrude, offset, use_fill_caps, twist_mode, resolution_u, render_resolution_u, path settings) and the spline points; text body and layout; armature bones with rest head/tail and posed world positions, pose channels and bone constraints; light / camera datablock name and id with every setting incl. depth of field), full material properties per slot, modifier stack with parameters, constraints with parameters and errors, particle systems with settings and instance counts (instance transforms: get_instances), rigid body settings, drivers with variables, animation curves (extrapolation, F-curve modifiers, including the object data; a channel with at most ${AUTO_KEYFRAMES} keys lists them, a longer one, such as a walk keyed at every step or a baked simulation, gives keyframe_count, first_frame, last_frame and value_at_frame: keyframes 'full' lists every channel's keys, keyframe_offset and keyframe_limit page them, 'summary' summarizes every channel, 'none' leaves them out), custom properties, visibility and evaluation problems. The mesh statistics in data (data.evaluated, or the base counts when nothing changes the mesh) are those of the object itself, also when it is hidden from renders (hide_render: get_scene then counts it in counts.not_rendered, not in counts.evaluated). Numbers are rounded to \`decimals\` (default 6 = 1 µm, so sub-millimetre parts such as labels, engravings and fine bevels read back as they were made). Vertex positions and faces: get_mesh_data. Evaluations are cached per document state and frame: checking many objects or frames is cheap.`,
       annotations: READ_ONLY,
     },
     {
@@ -948,10 +951,35 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         .max(MAX_DECIMALS)
         .default(OBJECT_DECIMALS)
         .describe(`Rounding of the numbers (default ${OBJECT_DECIMALS}: 1 µm)`),
+      keyframes: z
+        .enum(KEYFRAME_LISTINGS)
+        .default('auto')
+        .describe(
+          `Keys of the animation channels: auto lists those of channels with at most ${AUTO_KEYFRAMES} keys and summarizes longer ones (keyframe_count, first_frame, last_frame, value_at_frame); full lists every channel's keys (a page: keyframe_offset, keyframe_limit); summary summarizes every channel; none leaves the channels out (animation_channels counts them)`,
+        ),
+      keyframe_offset: z
+        .number()
+        .int()
+        .min(0)
+        .default(0)
+        .describe(
+          "First key listed per channel with keyframes 'full' (keyframe_next_offset gives the next page)",
+        ),
+      keyframe_limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_KEYFRAME_PAGE)
+        .default(DEFAULT_KEYFRAME_PAGE)
+        .describe(`Keys listed per channel with keyframes 'full' (default ${DEFAULT_KEYFRAME_PAGE})`),
     },
-    async ({ project, object, frame, decimals }) => {
+    async ({ project, object, frame, decimals, keyframes, keyframe_offset, keyframe_limit }) => {
       const p = await agent.project(project);
-      return describeObject(p.scene, requireObject(p, object), frame ?? p.state.frame, decimals);
+      return describeObject(p.scene, requireObject(p, object), frame ?? p.state.frame, decimals, {
+        keyframes,
+        offset: keyframe_offset,
+        limit: keyframe_limit,
+      });
     },
   );
 

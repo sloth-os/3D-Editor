@@ -9,6 +9,14 @@ import type { ModelCache } from '../cache';
  * their pages), downloads what their plans list (download.ts) and caches everything (cache.ts).
  */
 
+/**
+ * A model as a search lists it: the store result, and for a built-in model that takes parameters
+ * its own (store.add `params`) as JSON schema properties.
+ */
+export interface ProviderModel extends StoreResult {
+  params?: Record<string, unknown>;
+}
+
 /** Details of a model beyond its search result. */
 export interface ProviderDetails {
   model: StoreResult;
@@ -51,7 +59,7 @@ export interface ProviderQuery {
 }
 
 export interface ProviderHit {
-  model: StoreResult;
+  model: ProviderModel;
   /** relevance.ts score (merging across providers). */
   score: number;
   /** The offset that continues after this hit. */
@@ -124,6 +132,12 @@ export interface ModelProvider {
   thumbnail(id: string, env: ProviderEnv): Promise<ThumbnailSource | null>;
   /** How to download it (NOT_DOWNLOADABLE / NEEDS_KEY when it cannot be). */
   plan(id: string, env: ProviderEnv): Promise<DownloadPlan>;
+  /**
+   * Checks a model's own parameters (store.add `params`) by the model's schema: INVALID_PARAMS
+   * saying what is wrong and which parameters the model takes. Providers without it have models
+   * that take none (built by code: the built-in models only).
+   */
+  checkParams?(id: string, params: Record<string, unknown>): void;
 }
 
 /** 24 hours: how long provider indexes and API answers are reused. */

@@ -23,8 +23,9 @@ import type { RoomManager } from '../../src/sync/room-manager';
  * service context around it (config, rooms, log) for VideoExports. Its render processes can be made
  * to die on chosen requests (`kill`), like the system's out-of-memory killer ends one: the request
  * fails, the thread is dead from then on, and the next lease gets a new thread in its place (the
- * pool starts a replacement process). Like the real pool, it starts its processes with the first
- * long lease (`running` counts them from then on), and they answer `memory` with what `rss` says.
+ * pool starts a replacement process). Like the real pool, it starts the processes a long lease takes
+ * (the first `max` of them; `running` counts them from then on), and they answer `memory` with what
+ * `rss` says.
  */
 
 export interface FakeRendererStats {
@@ -67,7 +68,7 @@ export interface FakeRenderer {
   kill: ((req: RenderRequest, thread: number) => boolean | Error) | null;
   /** Resident memory a thread reports (`memory`; default 128 MiB, a render process's base). */
   rss: (thread: number) => number;
-  /** The threads started and alive (the pool's `running`; none before the first long lease). */
+  /** The threads started and alive (the pool's `running`: those long leases took). */
   started(): RenderThread[];
 }
 
@@ -133,11 +134,11 @@ export function makeFakeRenderer(
     failFrame: null,
     kill: null,
     rss: () => 128 * 1024 * 1024,
-    started: () => (started ? threads.filter((t) => t.alive) : []),
+    started: () => threads.slice(0, started).filter((t) => t.alive),
   };
   let current = -1;
-  /** The pool started its processes (the first long lease). */
-  let started = false;
+  /** How many of its processes the pool started (the most a long lease took). */
+  let started = 0;
   /** Long leases not released yet. */
   let longLeases = 0;
   const answer = async (req: RenderRequest, thread: number): Promise<unknown> => {
@@ -197,10 +198,15 @@ export function makeFakeRenderer(
     pool: {
       mode: opts.mode ?? 'processes',
       capacity: threads.length,
-      /** Live render processes (started by the first long lease, as the real pool does). */
+      /** Live render processes (started by the long leases that took them, as the real pool does). */
       get running() {
         return fake.started().length;
       },
+      get runningLong() {
+        return fake.started().length;
+      },
+      /** No process is kept for interactive renders (they get the first thread). */
+      runningInteractive: false,
       /** Long leases held now. */
       get activeLongRenders() {
         return longLeases;
@@ -219,7 +225,7 @@ export function makeFakeRenderer(
           return thread();
         });
         if (!o.interactive) {
-          started = true;
+          started = Math.max(started, Math.min(threads.length, Math.max(1, max)));
           longLeases++;
           stats.leases++;
           stats.leaseFrames.push(0);

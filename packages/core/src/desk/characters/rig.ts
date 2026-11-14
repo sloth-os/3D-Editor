@@ -403,8 +403,7 @@ export function requireActor(doc: SceneDoc, ref: string): ActorMeta {
 /** Part objects of an actor (BONE-parented children carrying desk_actor), by bone name. */
 export function actorParts(doc: SceneDoc, actorId: string): Map<string, string> {
   const out = new Map<string, string>();
-  const children = doc.childrenIndex().get(actorId) ?? [];
-  for (const id of children) {
+  for (const id of doc.childIds(actorId)) {
     const o = doc.getObject(id);
     if (o && o.custom_props?.[DESK_PROPS.actor] === actorId && o.parent_type === 'BONE')
       out.set(o.parent_bone, id);

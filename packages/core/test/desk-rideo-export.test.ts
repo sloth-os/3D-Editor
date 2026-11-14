@@ -415,3 +415,59 @@ describe('rideo export: scenes not made by the import', () => {
     expect(JSON.stringify(doc.listObjects())).toBe(before);
   });
 });
+
+describe('rideo export: cameras rideo blocked', () => {
+  /** The kite clip with a blocked push-in on its first shot: a far target at its start, a near one at its end. */
+  function pushIn(): ImportInput {
+    const clip = kiteClip();
+    const blocking = clip.blocking as RideoSceneBlocking;
+    blocking.shots[KITE_SHOTS[0]].camera = {
+      x: 0.3,
+      y: 1.6,
+      z: 6,
+      targetX: -1,
+      targetY: 1,
+      targetZ: -20,
+      lensMm: 35,
+      end: { x: 0.1, y: 1.4, z: 3, targetX: 0.6, targetY: 1, targetZ: 0 },
+    };
+    clip.shots![0].camera = { framing: 'wide', movement: 'dolly_in' };
+    return clip;
+  }
+
+  it("gives rideo's own placement back, so a push-in keeps its middle through a round trip", () => {
+    const clip = pushIn();
+    const trip = roundTrip(clip);
+    // rideo's targets as they were: the desk keys its move between them, recomputed targets (on the
+    // same aim, at other distances) would turn the middle of the move
+    expect(trip.first.x.blocking.shots[KITE_SHOTS[0]].camera).toEqual(
+      (clip.blocking as RideoSceneBlocking).shots[KITE_SHOTS[0]].camera,
+    );
+    const a = trip.first.r.shots[0];
+    const b = trip.second.r.shots[0];
+    expect([a.move, b.move]).toEqual(['push_in', 'push_in']);
+    for (let f = a.frame_start; f <= a.frame_end; f += 8) {
+      const wa = new FrameState(trip.first.doc, f).world(a.camera)!;
+      const wb = new FrameState(trip.second.doc, f).world(b.camera)!;
+      const aim = (w: readonly number[]) => unit([-w[8], -w[9], -w[10]]);
+      const cos = aim(wa).reduce((s, v, i) => s + v * aim(wb)[i], 0);
+      expect((Math.acos(Math.min(1, cos)) * 180) / Math.PI, `aim at frame ${f}`).toBeLessThan(1e-3);
+      expect(dist([wa[12], wa[13], wa[14]], [wb[12], wb[13], wb[14]]), `position at ${f}`).toBeLessThan(1e-6);
+    }
+  });
+
+  it('writes the camera as the desk has it once it was moved, keyed or solved again', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const r = importClip(doc, pushIn());
+    const cam = r.shots[0].camera;
+    // the camera's move shifted 2 m along x (its location keys)
+    const fc = doc.listFCurves(cam).find((c) => c.path === 'location' && c.index === 0)!;
+    doc.setFCurve({ ...fc, keyframes: fc.keyframes.map((k) => ({ ...k, value: k.value + 2 })) });
+    const x = exportRideoBlocking(doc, { now: NOW });
+    const exported = x.blocking.shots[KITE_SHOTS[0]].camera!;
+    // the camera where it now starts (2 m further along x, rideo's x too), aimed as it is: not
+    // rideo's placement, which it left
+    expect(exported.x).toBeCloseTo(2.3, 3);
+    expect(exported.targetZ).not.toBe(-20);
+  });
+});

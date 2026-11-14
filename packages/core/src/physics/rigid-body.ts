@@ -123,8 +123,8 @@ function registerCache(key: object): void {
 /**
  * Bytes the frames of `entry`'s simulation keep (physics/memory.ts), or only those outside the heap.
  * The animated transforms it recorded are counted as they were recorded: every frame for an animated
- * body, the frames up to their start for delayed ones (a frame's record is longer than the heap keeps
- * inside it, so they all live outside it).
+ * body, the frames a delayed one follows its animation up to its start (RELEASE_TRACKED_STEPS before
+ * it and at it; a frame's record is longer than the heap keeps inside it, so they all live outside it).
  */
 function entryBytes(entry: CacheEntry | undefined, outsideHeap: boolean): number {
   const sim = entry?.sim;

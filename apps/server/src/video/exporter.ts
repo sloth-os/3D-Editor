@@ -602,15 +602,16 @@ export function exportNeedsOf(
 
 /**
  * How many render processes an export renders on (memory.ts), decided before ffmpeg or any render
- * starts. First as if no render process ran: every one still to start, nothing held (exact for an
- * idle pool; with processes running, their memory then counts twice, which errs on the safe side).
- * When that holds fewer than RENDER_WORKERS while render processes run, and what they could hold
- * would change it, every render process of the pool is leased (the pool starts the missing ones,
- * as it would for the export's first segment) and asked what it holds (`memory`), and the machine's
- * memory read again: each process the export leases needs only what it does not hold yet, in the
- * order the pool leases them. Processes that work for another render at the same time hold memory
- * of that render: nothing of theirs counts then. The contact sheet may start the interactive
- * render process at the end: its base is kept when it does not run.
+ * starts. First as if no render process ran: every one it leases started for it with its base,
+ * nothing held (exact for an idle pool; with processes running, their memory then counts twice,
+ * which errs on the safe side). When that holds fewer than RENDER_WORKERS while render processes
+ * of long renders run, and what they could hold would change it, the running ones are leased (no
+ * other is started: the pool starts only what a lease takes) and asked what they hold (`memory`),
+ * and the machine's memory read again: each running process the export leases needs only what it
+ * does not hold yet, each further one its base and the whole estimate, in the order the pool
+ * leases them. Processes that work for another render at the same time hold memory of that
+ * render: nothing of theirs counts then. The contact sheet may start the interactive render
+ * process at the end: its base is kept unless it runs.
  */
 export async function decideMemory(
   pool: Renderer['pool'],
@@ -618,17 +619,17 @@ export async function decideMemory(
   o: { read: MemoryReader; contactSheet: boolean; signal: AbortSignal },
 ): Promise<ExportMemory> {
   const capacity = needs.capacity;
-  const cold = exportMemory(needs, { notStarted: capacity, interactive: o.contactSheet, machine: o.read() });
-  const running = Math.min(capacity, Math.max(0, pool.running || 0));
+  const cold = exportMemory(needs, { interactive: o.contactSheet, machine: o.read() });
+  const running = Math.min(capacity, Math.max(0, pool.runningLong || 0));
   if (cold.processes >= capacity || running === 0) return cold;
   // the most the running processes could hold: whether asking them can change anything
   const best = exportMemory(needs, {
-    notStarted: capacity - running,
     warm: Array.from({ length: running }, () => Infinity),
+    interactive: o.contactSheet && !pool.runningInteractive,
     machine: cold.machine,
   });
   if (best.processes <= cold.processes) return cold;
-  const lease = await pool.lease(capacity, o.signal);
+  const lease = await pool.lease(running, o.signal);
   try {
     if (lease.threads.some((t) => t.kind === 'main')) throw mainThreadError();
     // another long render shares the processes (this lease is one): their memory is partly its own
@@ -644,10 +645,8 @@ export async function decideMemory(
       ),
     );
     return exportMemory(needs, {
-      notStarted: capacity - lease.threads.length,
       warm: rss,
-      // every render process of long renders runs now: one more is the interactive one
-      interactive: o.contactSheet && (pool.running || 0) <= lease.threads.length,
+      interactive: o.contactSheet && !pool.runningInteractive,
       machine: o.read(),
     });
   } finally {

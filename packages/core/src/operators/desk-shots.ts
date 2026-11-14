@@ -75,20 +75,14 @@ import { pollObjectMode, setSelection, vec3 } from './helpers';
  *   desk.check                    continuity checks, blocking lines and layouts (read-only)
  *   desk.set_build                ground, sky and sun (and interior walls) of the set
  *   desk.camera_move              key a camera move over a shot or a range
- *   desk.import_rideo_blocking    a rideo clip's SceneBlocking as a scene and shots (phase 2)
- *   desk.export_rideo_blocking    the scene as a rideo SceneBlocking v1 (phase 2, read-only)
+ *   desk.import_rideo_blocking    a rideo clip's SceneBlocking as a scene and shots
+ *   desk.export_rideo_blocking    the scene as a rideo SceneBlocking v1 (read-only)
  *
  * Shots live in SceneSettings.shots and are read and written only through desk/shots.ts; the camera
  * work is desk/solver.ts, line.ts, plan.ts and moves.ts, the checks desk/checks.ts, the set
- * desk/set.ts. The rideo import and export (phase 2) throw until implemented.
+ * desk/set.ts, the rideo import and export desk/rideo/.
  * Axes: Z up, the front is −Y (rideo +z), facings in degrees about +Z with 0 facing the front.
  */
-
-function notImplemented(id: string): () => never {
-  return () => {
-    throw new OperatorError(`${id} is not implemented yet`, 'FAILED');
-  };
-}
 
 const framingEnum = z
   .enum(DESK_FRAMINGS)
@@ -1177,9 +1171,10 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       label: 'Check Shots',
       description:
         'Continuity checks of the shots (read-only): line_crossed, subject_out_of_frame, camera_inside, ' +
-        'missing_camera (errors); plan_mismatch, screen_direction, jump_cut, absent_in_frame, actors_overlap, ' +
-        'outside_set, empty_shot, duration_clamped (warnings); physics_unbaked, shot_gap (info). Returns {issues, ' +
-        "lines: [{shot, line}] (rideo's blocking sentence), layouts: [{shot, layout}], summary}.",
+        'missing_camera (errors); plan_mismatch, screen_direction, jump_cut, absent_in_frame, subject_hidden (a ' +
+        'subject scaled to nothing by a hide key), occluded_subject (a subject behind an actor the shot does not ' +
+        'frame), actors_overlap, outside_set, empty_shot, duration_clamped (warnings); physics_unbaked, shot_gap ' +
+        "(info). Returns {issues, lines: [{shot, line}] (rideo's blocking sentence), layouts: [{shot, layout}], summary}.",
       category: 'Desk',
       undo: false,
       schema: z.object({ shots: shotRefs.optional() }),
@@ -1291,7 +1286,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       id: 'desk.import_rideo_blocking',
       label: 'Import rideo Blocking',
       description:
-        "Build the scene from a rideo clip's blocking (phase 2; spec §11): the frame rate and resolution from the " +
+        "Build the scene from a rideo clip's blocking (spec §11): the frame rate and resolution from the " +
         'project settings; shots in rideo order, each round(duration_s × fps) frames, a pre-roll gap before cuts ' +
         'where marks jump; actors keyed at each shot start from their marks (walks to toX/toZ); cameras imported as ' +
         'they are (only shots without one are solved; the line is never enforced on import) and fitted to the ' +
@@ -1464,7 +1459,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       id: 'desk.export_rideo_blocking',
       label: 'Export rideo Blocking',
       description:
-        "The scene as a rideo SceneBlocking v1 (phase 2, read-only): opening marks at the first shot's start, " +
+        "The scene as a rideo SceneBlocking v1 (read-only): opening marks at the first shot's start, " +
         'per-shot marks and walk targets, cameras and their end placement, landmark and prop footprints, riders on ' +
         "their mount's mark. Returns {blocking}.",
       category: 'Desk',

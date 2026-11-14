@@ -1,7 +1,9 @@
 import type { Mat4, Quat, Vec3 } from '../../math/types';
 import { compose4, invert4, multiply4 } from '../../math/mat4';
 import { fcurveKey, type SceneDoc } from '../../doc/scene-doc';
-import type { ObjectData } from '../../doc/types';
+import type { FCurve, Keyframe, ObjectData } from '../../doc/types';
+import { evaluateFCurve } from '../../anim/fcurve';
+import { HIDDEN_SCALE_EPS, HIDE_SCALE, hiddenByScale, hiddenScale } from '../hide';
 import { createCube, createCylinder } from '../../mesh/primitives';
 import type { MeshData } from '../../mesh/types';
 import type { FrameState } from '../../eval/frame-state';
@@ -76,11 +78,14 @@ export const TETHER_TAIL_SEGMENTS = 5;
 /** Radius of the string object (m): thin, the renderers draw strings as lines at least 2 px wide. */
 export const TETHER_STRING_RADIUS = 0.0015;
 /**
- * Scale of the string and a new tail on all three axes before the flight: they shrink to a point
- * (the 1 m string mesh to 1e-8 m), under the micrometre below which the export's string overlay
- * (apps/server render/passes.ts stringPolyline) draws nothing, so no dot shows where the hand will be.
+ * Share of its shown scale an object a flight hides is keyed to on every axis (hide.ts HIDE_SCALE:
+ * hiddenScale(shown)), and the scale of the string and a new tail before their first flight: they
+ * shrink to a point (the 1 m string mesh to 1e-8 m), under the micrometre below which the export's
+ * string overlay (apps/server render/passes.ts stringPolyline) draws nothing, so no dot shows where
+ * the hand will be. A flyer shown at a tiny scale (a store model in very large units) shrinks as
+ * much as any other.
  */
-export const TETHER_HIDDEN_SCALE = 1e-8;
+export const TETHER_HIDDEN_SCALE = HIDE_SCALE;
 
 /** What a flight does with its flyer after frame_end: stays, is hidden, or comes down. */
 export const TETHER_AFTER = ['hold', 'hide', 'land'] as const;
@@ -141,8 +146,20 @@ export const TETHER_TAIL_SETTLE_SECONDS = 1.5;
 const LAND_REACH = 0.8;
 /** Height of a landed kite's lowest corner above the ground (m). */
 const LANDED_CLEARANCE = 0.005;
-/** Custom property of a flyer a flight hid (after: 'hide'): the first hidden frame (a later flight shows it again). */
-const HIDDEN_FROM = 'desk_tether_hidden_from';
+/**
+ * Custom property of a flyer: the frames each of its flights keys, one 'lo:hi' span per flight in
+ * frame order (lo = frame_start − 1, the key that holds what was there before it; hi = its last key,
+ * frame_end + 1 when it hid the flyer), followed by 'h' when the flight hid the flyer (after: 'hide')
+ * and 's' when the flyer was keyed shown at its start (an earlier flight had hidden it), and by
+ * '@anchor' or '@anchor/bone' (URI-encoded: the anchor object's id and the bone the string is tied
+ * to). A flight flown over an earlier one replaces that one's keys from its own start on; flights
+ * apart keep theirs.
+ */
+const FLIGHTS = 'desk_tether_flights';
+/** The property an earlier version kept on a flyer it hid (FLIGHTS replaces it): removed when flown. */
+const LEGACY_HIDDEN_FROM = 'desk_tether_hidden_from';
+/** Tolerance of key frames (anim/fcurve.ts insertKeyframe). */
+const KEY_EPS = 1e-3;
 
 /** Custom properties that tie the objects a flight adds to their flyer (so a second flight reuses them). */
 const STRING_OF = 'desk_string_to';
@@ -333,7 +350,7 @@ interface FlyerShape {
   kind: 'kite' | 'balloon';
   /** Where the string is tied, in the flyer's object space. */
   bridle: Vec3;
-  /** Corners of the flyer's bounds (with its parts), in its object space: what the ground stops. */
+  /** Corners of the flyer's body (its parts but its own tail), in its object space: what the ground stops. */
   corners: Vec3[];
   /**
    * Corners of its main part's bounds (the mesh of largest area, its sail), in its object space: what
@@ -361,9 +378,10 @@ const boxCorners = (b: { min: Vec3; max: Vec3 }): Vec3[] => {
 };
 
 /**
- * Object-space bounds of a flyer and its mesh parts (in the flyer's object space), and those of its
- * main part: the mesh whose bounds have the largest area (its two largest extents; its tail parts left
- * out), or null without meshes.
+ * Object-space bounds of a flyer's body, the flyer and its mesh parts (in the flyer's object space)
+ * without its own tail (tail… parts and what hangs from them trail apart: a kite does not stand on
+ * them; with them only when nothing else has a mesh), and those of its main part: the body's mesh
+ * whose bounds have the largest area (its two largest extents). Null without meshes.
  */
 function flyerBounds(
   doc: SceneDoc,
@@ -374,7 +392,19 @@ function flyerBounds(
   const min: Vec3 = [Infinity, Infinity, Infinity];
   const max: Vec3 = [-Infinity, -Infinity, -Infinity];
   let main: { min: Vec3; max: Vec3; area: number } | null = null;
-  for (const o of [flyer, ...descendants(doc, flyer.id)]) {
+  // the flyer's body: its own tail (tail… parts and what hangs from them) trails apart, simulated
+  const parts = [flyer, ...descendants(doc, flyer.id)];
+  const byId = new Map(parts.map((o) => [o.id, o]));
+  const tail = new Set<string>();
+  for (const o of parts)
+    for (let up: ObjectData | undefined = o; up && up.id !== flyer.id; up = byId.get(up.parent ?? ''))
+      if (/^tail/i.test(baseName(up.name))) {
+        tail.add(o.id);
+        break;
+      }
+  const meshes = parts.filter((o) => o.type === 'MESH');
+  const body = meshes.some((o) => !tail.has(o.id)) ? parts.filter((o) => !tail.has(o.id)) : parts;
+  for (const o of body) {
     const b = o.type === 'MESH' ? localBounds(doc, o) : null;
     const w = fs.world(o.id);
     if (!b || !w) continue;
@@ -394,7 +424,7 @@ function flyerBounds(
     }
     const ext = [0, 1, 2].map((k) => hi[k] - lo[k]).sort((x, y) => y - x);
     const area = ext[0] * ext[1];
-    if (!/^tail/i.test(baseName(o.name)) && (!main || area > main.area)) main = { min: lo, max: hi, area };
+    if (!main || area > main.area) main = { min: lo, max: hi, area };
   }
   if (!Number.isFinite(min[0])) return null;
   return { min, max, main: main ?? { min, max } };
@@ -627,42 +657,230 @@ function previousParts(doc: SceneDoc, flyer: string): { string: ObjectData | nul
   return { string, tail: tail.sort(naturally) };
 }
 
+/** A flight of a flyer, as its FLIGHTS property records it. */
+interface Flight {
+  /** frame_start − 1: the key that holds what was there before the flight. */
+  lo: number;
+  /** The flight's last key (frame_end + 1 when it hid the flyer). */
+  hi: number;
+  /** It hid the flyer after it (after: 'hide'): the scale keys at hi − 1 and hi. */
+  hid: boolean;
+  /** The flyer was keyed shown at its start (lo + 1), an earlier flight having hidden it. */
+  showed: boolean;
+  /** The anchor object's id and the bone the string is tied to (unknown for flights of earlier versions). */
+  anchor?: string;
+  bone?: string;
+}
+
+/** `text` decoded from a FLIGHTS entry (undefined when it is not valid URI encoding). */
+function decoded(text: string | undefined): string | undefined {
+  if (text === undefined || text === '') return undefined;
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The flights a flyer's FLIGHTS property records, in frame order (malformed entries skipped). */
+function flightsOf(flyer: ObjectData): Flight[] {
+  const text = flyer.custom_props?.[FLIGHTS];
+  if (typeof text !== 'string') return [];
+  const flights: Flight[] = [];
+  for (const entry of text.split(/\s+/)) {
+    const m = /^(-?\d+(?:\.\d+)?):(-?\d+(?:\.\d+)?)([hs]*)(?:@([^/\s]+)(?:\/(\S+))?)?$/.exec(entry);
+    if (!m || !(Number(m[2]) >= Number(m[1]))) continue;
+    const anchor = decoded(m[4]);
+    flights.push({
+      lo: Number(m[1]),
+      hi: Number(m[2]),
+      hid: m[3].includes('h'),
+      showed: m[3].includes('s'),
+      ...(anchor ? { anchor, ...(decoded(m[5]) ? { bone: decoded(m[5]) } : {}) } : {}),
+    });
+  }
+  return flights.sort((a, b) => a.lo - b.lo);
+}
+
+/** The FLIGHTS property text of `flights`. */
+const flightsText = (flights: readonly Flight[]): string =>
+  flights
+    .map(
+      (f) =>
+        `${f.lo}:${f.hi}${f.hid ? 'h' : ''}${f.showed ? 's' : ''}` +
+        (f.anchor ? `@${encodeURIComponent(f.anchor)}${f.bone ? `/${encodeURIComponent(f.bone)}` : ''}` : ''),
+    )
+    .join(' ');
+
 /**
- * Makes the flyer of an earlier flight that hid it (after: 'hide', the HIDDEN_FROM property) shown
- * again for a flight from `frameStart`: its hiding keys go when they are not before the flight (a
- * flight flown again), else it is shown again from `frameStart` (a later flight), hidden in between.
- * Returns how to put things back when the flight fails, or null when nothing changed.
+ * A string farther than this (m) from the point its flight ties it to is detached: the anchor moved
+ * after the flight was keyed (desk.check's tether_detached; desk.actor_move and the other operators
+ * that key an actor warn about it).
  */
-function showFlyer(doc: SceneDoc, flyer: ObjectData, frameStart: number): (() => void) | null {
-  const hiddenFrom = flyer.custom_props?.[HIDDEN_FROM];
-  if (typeof hiddenFrom !== 'number' || !Number.isFinite(hiddenFrom)) return null;
+export const TETHER_DETACH_M = 0.05;
+
+/** A string of desk.tether_fly found detached from its anchor at some of the frames sampled. */
+export interface TetherDetachment {
+  string: string;
+  flyer: string;
+  /** The anchor object (id) and bone the flight governing those frames tied the string to. */
+  anchor: string;
+  bone?: string;
+  /** The frames sampled where the string starts more than TETHER_DETACH_M from that point. */
+  frames: number[];
+  /** The largest distance found (m). */
+  gap: number;
+}
+
+/**
+ * The strings of the scene's desk.tether_fly flights that start more than TETHER_DETACH_M away from
+ * the point their flight ties them to (the anchor's origin, or the middle of its bone) at any of
+ * `frames`. A flight keys its string at the anchor point of each of its frames, and the string holds
+ * where it was left after them: when the anchor moves later (desk.actor_move, a pose, a mount, a
+ * prop it holds), the string stays behind, tied to nothing. Frames where a string is hidden (before
+ * its first flight, put away after one) are not checked; `anchor` limits the check to the strings
+ * tied to that object. Flights of earlier versions, which did not record their anchor, are checked
+ * against the string's last anchor (any bone of an armature).
+ */
+export function tetherDetachments(
+  doc: SceneDoc,
+  frames: Iterable<number>,
+  o: { anchor?: string } = {},
+): TetherDetachment[] {
+  // the strings, their flyers' flights and the anchor each flight tied them to
+  const strings: { id: string; flyer: string; flights: Flight[]; anchors: (string | undefined)[] }[] = [];
+  for (const s of doc.listObjects()) {
+    const flyer = s.custom_props?.[STRING_OF];
+    const flyerObject = typeof flyer === 'string' ? doc.getObject(flyer) : null;
+    if (!flyerObject) continue;
+    const last = s.custom_props?.[STRING_FROM];
+    const flights = flightsOf(flyerObject);
+    const anchors = flights.map((f) => f.anchor ?? (typeof last === 'string' ? last : undefined));
+    if (o.anchor === undefined || anchors.includes(o.anchor))
+      strings.push({ id: s.id, flyer: flyerObject.id, flights, anchors });
+  }
+  if (!strings.length) return [];
+  const sampled = [...new Set([...frames].map(Math.round))].sort((a, b) => a - b);
+  const sampler = sceneSampler(doc);
+  const states = new Map<number, FrameState>();
+  const at = (f: number): FrameState => {
+    let fs = states.get(f);
+    if (!fs) states.set(f, (fs = sampler.at(f)));
+    return fs;
+  };
+  const out: TetherDetachment[] = [];
+  for (const s of strings) {
+    const found = new Map<string, TetherDetachment>();
+    for (const f of sampled) {
+      // the flight governing the frame: the last to start at or before it (a flight keys from lo + 1)
+      let n = -1;
+      for (let i = 0; i < s.flights.length; i++) if (s.flights[i].lo < f) n = i;
+      if (n < 0) continue;
+      const flight = s.flights[n];
+      const anchor = s.anchors[n];
+      if (!anchor || (o.anchor !== undefined && anchor !== o.anchor)) continue;
+      const anchorObject = doc.getObject(anchor);
+      if (!anchorObject) continue;
+      const fs = at(f);
+      const w = fs.world(s.id);
+      if (!w || hiddenByScale(w)) continue;
+      const start = originOf(w);
+      let gap = Infinity;
+      if (flight.anchor === undefined && anchorObject.type === 'ARMATURE') {
+        // a flight of an earlier version: tied to one of the armature's bones, which it did not record
+        for (const bone of fs.pose(anchor)?.bones.keys() ?? []) {
+          const p = anchorPoint(fs, anchor, bone);
+          if (p) gap = Math.min(gap, len(sub(start, p)));
+        }
+      } else {
+        const p = anchorPoint(fs, anchor, flight.bone);
+        if (p) gap = len(sub(start, p));
+      }
+      if (!(gap > TETHER_DETACH_M) || !Number.isFinite(gap)) continue;
+      const key = `${anchor}/${flight.bone ?? ''}`;
+      const d = found.get(key);
+      if (d) {
+        d.frames.push(f);
+        d.gap = Math.max(d.gap, gap);
+      } else
+        found.set(key, {
+          string: s.id,
+          flyer: s.flyer,
+          anchor,
+          ...(flight.bone ? { bone: flight.bone } : {}),
+          frames: [f],
+          gap,
+        });
+    }
+    out.push(...found.values());
+  }
+  return out;
+}
+
+/** The frames a flight keys (see Flight): `keyed` frames from frame_start, and frame_end + 1 unless it holds. */
+function flightSpan(o: TetherOptions, keyed: number, after: TetherAfter): { lo: number; hi: number } {
+  const last = o.frame_start + keyed - 1;
+  return { lo: o.frame_start - 1, hi: after === 'hold' ? last : Math.max(last, o.frame_end + 1) };
+}
+
+/**
+ * Keyframes of scale channel `fc` shown at `frame` when they hide it there (a scale under
+ * HIDDEN_SCALE_EPS): a CONSTANT key there with the value it was last shown at before (`rest` when
+ * never). Null when it is shown there already.
+ */
+function shownAt(fc: FCurve, keyframes: readonly Keyframe[], frame: number, rest: number): Keyframe[] | null {
+  const sorted = [...keyframes].sort((a, b) => a.frame - b.frame);
+  const v = evaluateFCurve({ ...fc, keyframes: sorted }, frame, sorted);
+  if (v === undefined || Math.abs(v) >= HIDDEN_SCALE_EPS) return null;
+  let value = rest;
+  for (const k of sorted)
+    if (k.frame < frame - KEY_EPS && Math.abs(k.value) >= HIDDEN_SCALE_EPS) value = k.value;
+  const kept = sorted.filter((k) => Math.abs(k.frame - frame) >= KEY_EPS);
+  return [...kept, { frame, value, interpolation: 'CONSTANT' as const }].sort((a, b) => a.frame - b.frame);
+}
+
+/**
+ * Makes the flyer shown at `frameStart` for a flight from there (the flight samples its pose there):
+ * the scale keys with which the flights it is flown over (`over`) hid it or showed it again go where
+ * they are not before the flight, and a flyer an earlier flight hid is keyed shown from frameStart
+ * (CONSTANT, at the scale it had before it was hidden). Returns how to put its scale back when the
+ * flight fails, and whether it keyed it shown.
+ */
+function showFlyer(
+  doc: SceneDoc,
+  flyer: ObjectData,
+  over: readonly Flight[],
+  frameStart: number,
+): { restore: () => void; showed: boolean } {
   const saved = [0, 1, 2].map((i) => doc.getFCurve(fcurveKey(scaleRef(flyer.id, i))) ?? null);
-  const props = flyer.custom_props;
+  const drop: number[] = [];
+  for (const f of over) {
+    if (f.hid && f.hi >= frameStart) drop.push(f.hi - 1, f.hi);
+    if (f.showed && f.lo + 1 >= frameStart) drop.push(f.lo + 1);
+  }
+  let showed = false;
   for (let i = 0; i < 3; i++) {
     const fc = saved[i];
     if (!fc) continue;
-    const at = (f: number) => fc.keyframes.find((k) => Math.abs(k.frame - f) < 1e-3);
-    if (hiddenFrom >= frameStart) {
-      const keyframes = fc.keyframes.filter((k) => k !== at(hiddenFrom - 1) && k !== at(hiddenFrom));
-      if (keyframes.length) doc.setFCurve({ ...fc, keyframes });
-      else doc.removeFCurve(fcurveKey(fc));
-    } else {
-      const shown = at(hiddenFrom - 1)?.value ?? flyer.scale[i];
-      const keyframes = fc.keyframes.filter((k) => Math.abs(k.frame - frameStart) >= 1e-3);
-      keyframes.push({ frame: frameStart, value: shown, interpolation: 'CONSTANT' });
-      doc.setFCurve({ ...fc, keyframes: keyframes.sort((a, b) => a.frame - b.frame) });
+    let keyframes = fc.keyframes.filter((k) => !drop.some((d) => Math.abs(k.frame - d) < KEY_EPS));
+    const shown = shownAt(fc, keyframes, frameStart, flyer.scale[i]);
+    if (shown) {
+      keyframes = shown;
+      showed = true;
     }
+    if (keyframes.length === fc.keyframes.length && !shown) continue;
+    if (keyframes.length) doc.setFCurve({ ...fc, keyframes });
+    else doc.removeFCurve(fcurveKey(fc));
   }
-  const rest = { ...props };
-  delete rest[HIDDEN_FROM];
-  doc.updateObject(flyer.id, { custom_props: rest });
-  return () => {
-    for (let i = 0; i < 3; i++) {
-      const fc = saved[i];
-      if (fc) doc.setFCurve(fc);
-      else doc.removeFCurve(fcurveKey(scaleRef(flyer.id, i)));
-    }
-    doc.updateObject(flyer.id, { custom_props: props });
+  return {
+    showed,
+    restore: () => {
+      for (let i = 0; i < 3; i++) {
+        const fc = saved[i];
+        if (fc) doc.setFCurve(fc);
+        else doc.removeFCurve(fcurveKey(scaleRef(flyer.id, i)));
+      }
+    },
   };
 }
 
@@ -671,22 +889,16 @@ const scaleRef = (id: string, index: number) =>
   ({ target_type: 'object', target_id: id, path: 'scale', index }) as const;
 
 /**
- * Keys object `id` hidden (TETHER_HIDDEN_SCALE on every axis, its sign kept) from frame `from` on,
- * shown as `shown` up to it: a CONSTANT step, so no frame between shows it shrinking. Later keys of the
- * scale (an agent's own) are kept. Returns the keys written.
+ * Keys object `id` hidden (hiddenScale: TETHER_HIDDEN_SCALE times its shown scale on every axis, its
+ * sign kept) from frame `from` on, shown as `shown` up to it: a CONSTANT step, so no frame between
+ * shows it shrinking. Later keys of the scale (an agent's own) are kept. Returns the keys written.
  */
 function hideFrom(doc: SceneDoc, id: string, from: number, shown: Readonly<Vec3>): number {
   let keys = 0;
   for (let i = 0; i < 3; i++) {
-    keys += writeChannel(
-      doc,
-      id,
-      'scale',
-      i,
-      [from - 1, from],
-      [shown[i], (shown[i] < 0 ? -1 : 1) * TETHER_HIDDEN_SCALE],
-      { interpolation: 'CONSTANT' },
-    );
+    keys += writeChannel(doc, id, 'scale', i, [from - 1, from], [shown[i], hiddenScale(shown[i])], {
+      interpolation: 'CONSTANT',
+    });
   }
   return keys;
 }
@@ -698,8 +910,11 @@ function hideFrom(doc: SceneDoc, id: string, from: number, shown: Readonly<Vec3>
  * leaves them where the flight ends; 'hide' hides the flyer (its parts and own tail with it), the
  * string and the tail from frame_end + 1 by their keyed scale (TETHER_HIDDEN_SCALE: renders, the
  * viewport and the video export's string overlay show nothing of them); 'land' brings a kite down
- * over TETHER_LAND_SECONDS (a nose-dive toward the anchor, its tail trailing downwind) to lie flat on
- * the ground, the string hidden from frame_end + 1.
+ * (tetherLandSeconds: longer from higher up; a nose-dive toward the anchor, its tail trailing
+ * downwind) to lie flat on the ground, the string hidden from frame_end + 1. A flyer flies several
+ * flights (its FLIGHTS property): each keys only its own frames, so an earlier flight's string and
+ * tail keep theirs; one flown over an earlier one replaces that one from its own start on; between
+ * two, the flyer, its string and its tail stay as the earlier one left them (hidden after 'hide').
  */
 export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
   const warnings: string[] = [];
@@ -708,6 +923,7 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
   if (!flyer) throw new OperatorError(`Object '${o.flyer}' not found`, 'NOT_FOUND');
   if (!anchorObject) throw new OperatorError(`Object '${o.anchor}' not found`, 'NOT_FOUND');
   if (o.flyer === o.anchor) throw new OperatorError('The flyer cannot be its own anchor', 'INVALID_PARAMS');
+  refusePartFlyer(doc, flyer);
   if (o.anchor_bone && anchorObject.type !== 'ARMATURE')
     throw new OperatorError(
       `anchor_bone needs an armature anchor ('${anchorObject.name}' is ${anchorObject.type})`,
@@ -761,8 +977,13 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
     );
   if (o.anchor_bone && !sceneSampler(doc).at(o.frame_start).boneMatrix(anchorObject.id, o.anchor_bone))
     throw new OperatorError(`Bone '${o.anchor_bone}' not found in '${anchorObject.name}'`, 'NOT_FOUND');
-  // a flyer an earlier flight hid is shown for this one (put back when the flight fails)
-  const restore = showFlyer(doc, flyer, o.frame_start);
+  // the flyer's earlier flights this one is flown over (it keys at most `total` frames: a landing
+  // takes as long as its height asks); a flyer an earlier flight hid is shown for this one (put back
+  // when the flight fails)
+  const flights = flightsOf(flyer);
+  const reach = flightSpan(o, total, after);
+  const over = flights.filter((f) => f.lo <= reach.hi && f.hi >= reach.lo);
+  const shown = showFlyer(doc, flyer, over, o.frame_start);
   try {
     return fly(doc, o, {
       flyer: doc.getObject(flyer.id)!,
@@ -773,10 +994,43 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
       settleFrames,
       fps,
       warnings,
+      flights,
+      over,
+      showed: shown.showed,
     });
   } catch (e) {
-    restore?.();
+    shown.restore();
     throw e;
+  }
+}
+
+/**
+ * Refuses a flyer that is a part of something bigger: of a store model (an ancestor carries the
+ * model's store_id: flying its sail alone would leave the spars and the model's own tail standing
+ * on the ground, a second kite) or of an actor (its body parts).
+ */
+function refusePartFlyer(doc: SceneDoc, flyer: ObjectData): void {
+  const actor = flyer.custom_props?.desk_actor;
+  if (typeof actor === 'string' && actor && actor !== flyer.id) {
+    const owner = doc.getObject(actor);
+    throw new OperatorError(
+      `'${flyer.name}' is a body part of the actor '${owner?.name ?? actor}': fly a prop (a kite or a balloon) instead`,
+      'INVALID_PARAMS',
+    );
+  }
+  if (typeof flyer.custom_props?.store_id === 'string') return;
+  const seen = new Set<string>([flyer.id]);
+  for (let id = flyer.parent; id && !seen.has(id);) {
+    seen.add(id);
+    const o = doc.getObject(id);
+    if (!o) break;
+    if (typeof o.custom_props?.store_id === 'string')
+      throw new OperatorError(
+        `'${flyer.name}' is part of the model '${o.name}': fly the model's root ('${o.name}'), so that ` +
+          'all of it flies (its sail, spars and tail together)',
+        'INVALID_PARAMS',
+      );
+    id = o.parent;
   }
 }
 
@@ -809,6 +1063,11 @@ function fly(
     settleFrames: number;
     fps: number;
     warnings: string[];
+    /** The flyer's flights before this one (its FLIGHTS property), and those this one is flown over. */
+    flights: readonly Flight[];
+    over: readonly Flight[];
+    /** showFlyer keyed the flyer shown at frame_start (an earlier flight had hidden it). */
+    showed: boolean;
   },
 ): TetherResult {
   const { flyer, anchorObject, after, frames, settleFrames, fps, warnings } = c;
@@ -1113,22 +1372,37 @@ function fly(
   if (maxStretch > 1e-6)
     warnings.push(`the string stretched by ${maxStretch.toFixed(4)} m (anchor moving faster than the flyer)`);
 
-  // ---- write: the flyer keeps its own transform before the flight
-  holdBefore(doc, flyer.id, o.frame_start, sampler.at(o.frame_start - 1));
+  // ---- write. The flight keys its span (flightSpan). The flights it is flown over lose their keys
+  // from its start on (up to a later flight it is not flown over); flights apart keep theirs.
+  const span = flightSpan(o, total, after);
+  const later = c.flights.filter((f) => !c.over.includes(f) && f.lo > span.lo);
+  const nextLo = Math.min(Infinity, ...later.map((f) => f.lo));
+  const clear: [number, number] = [
+    span.lo,
+    Math.min(Math.max(span.hi, ...c.over.map((f) => f.hi)), nextLo - 1),
+  ];
+  // the scene just before the flight, as it was before the flight keyed anything
+  const before = sampler.at(o.frame_start - 1);
+  const hiddenFrom = after === 'hide' ? o.frame_end + 1 : null;
+  /**
+   * The objects the flight keys and their channels it owns (a later flight's keys before it hold what
+   * they are left at): the flyer's scale is not the flight's (its hiding is keyed apart).
+   */
+  const TRANSFORM = ['location', 'rotation_euler'] as const;
+  const ALL = ['location', 'rotation_euler', 'scale'] as const;
+  const keyed: { id: string; paths: readonly ChannelPath[] }[] = [{ id: flyer.id, paths: TRANSFORM }];
+
+  // the flyer does what it did up to the flight (its own animation, or what an earlier flight left)
+  holdAt(doc, flyer.id, o.frame_start - 1, before, clear);
   for (const con of doc.getObject(flyer.id)!.constraints)
     if (!con.mute && silenceConstraintFrom(doc, flyer.id, con.name, o.frame_start))
       warnings.push(`'${flyer.name}': constraint '${con.name}' no longer acts from frame ${o.frame_start}`);
   // every frame keyed (no clean-up: dropping a nearly equal key could let the string stretch)
   let keys = keyTransforms(doc, flyer.id, flyerSamples);
-  const hiddenFrom = after === 'hide' ? o.frame_end + 1 : null;
   if (hiddenFrom !== null) {
-    // the flyer, its parts and its own tail parts with it, hidden from there; remembered so that a
-    // later flight shows it again (showFlyer)
+    // the flyer, its parts and its own tail parts with it, hidden from there (until a later flight)
     const shown = sceneSampler(doc).at(o.frame_end).byId.get(flyer.id)?.scale ?? flyer.scale;
     keys += hideFrom(doc, flyer.id, hiddenFrom, shown);
-    doc.updateObject(flyer.id, {
-      custom_props: { ...doc.getObject(flyer.id)!.custom_props, [HIDDEN_FROM]: hiddenFrom },
-    });
   }
 
   const previous = previousParts(doc, flyer.id);
@@ -1147,14 +1421,8 @@ function fly(
       const props = { ...previous.string!.custom_props, [STRING_FROM]: anchorObject.id };
       doc.updateObject(stringId, { custom_props: props, parent: null, constraints: [] });
     }
-    // hidden before the flight: shrunk to a point on every axis (TETHER_HIDDEN_SCALE)
-    const before = o.frame_start - 1;
-    for (let k3 = 0; k3 < 3; k3++)
-      keys += writeChannel(doc, stringId, 'scale', k3, [before], [TETHER_HIDDEN_SCALE], {
-        interpolation: 'CONSTANT',
-        replace: [-Infinity, before],
-      });
-    keys += keyTransforms(doc, stringId, stringSamples, { replace: [o.frame_start, Infinity] });
+    keyed.push({ id: stringId, paths: ALL });
+    keys += keyTransforms(doc, stringId, stringSamples, { replace: clear });
     for (let k3 = 0; k3 < 3; k3++)
       keys += writeChannel(
         doc,
@@ -1163,89 +1431,127 @@ function fly(
         k3,
         stringSamples.frames,
         stringSamples.scale.map((sc) => sc[k3]),
-        { replace: [o.frame_start, Infinity] },
+        { replace: clear },
       );
+    // before the flight: what an earlier flight left, else shrunk to a point on every axis
+    keys += keyBefore(doc, stringId, o.frame_start - 1, before, clear[0]);
     // hidden after the flight too, when the flyer is put away or comes down (let go)
     if (after !== 'hold') keys += hideFrom(doc, stringId, o.frame_end + 1, stringSamples.scale[frames - 1]);
+  } else if (previous.string) {
+    // an earlier flight's string: not on this one
+    keyed.push({ id: previous.string.id, paths: ALL });
+    keys += hideThrough(doc, previous.string.id, o.frame_start, before, clear);
   }
 
   const tailObjects: string[] = [];
-  if (segments) {
-    if (ownTail) {
-      // the model's own tail parts, keyed relative to their parents (which may be keyed tail parts too)
-      const parts = shape.tailParts.slice(1);
-      const worlds = new Map<string, Mat4[]>(parts.map((part, n) => [part.id, tailWorlds[n]]));
-      for (const [n, part] of parts.entries()) {
-        const s = transformSamples();
-        let rot: Vec3 = [...part.rotation_euler];
-        for (let i = 0; i < total; i++) {
-          const parent = part.parent
-            ? keyedParentWorld(
-                part.parent,
-                i,
-                worlds,
-                flyer.id,
-                flyerSamples,
-                flyerParents,
-                flyer.scale,
-                sampler,
-                o.frame_start,
-              )
-            : null;
-          const t = channelsFor(tailWorlds[n][i], parent, part.scale, rot);
-          rot = t.rotation_euler;
-          s.frames.push(o.frame_start + i);
-          s.location.push(t.location);
-          s.rotation.push(t.rotation_euler);
-        }
-        holdBefore(doc, part.id, o.frame_start, sampler.at(o.frame_start - 1));
-        keys += keyTransforms(doc, part.id, s);
-        tailObjects.push(part.id);
+  if (segments && ownTail) {
+    // the model's own tail parts, keyed relative to their parents (which may be keyed tail parts too)
+    const parts = shape.tailParts.slice(1);
+    const worlds = new Map<string, Mat4[]>(parts.map((part, n) => [part.id, tailWorlds[n]]));
+    for (const [n, part] of parts.entries()) {
+      const s = transformSamples();
+      let rot: Vec3 = [...part.rotation_euler];
+      for (let i = 0; i < total; i++) {
+        const parent = part.parent
+          ? keyedParentWorld(
+              part.parent,
+              i,
+              worlds,
+              flyer.id,
+              flyerSamples,
+              flyerParents,
+              flyer.scale,
+              sampler,
+              o.frame_start,
+            )
+          : null;
+        const t = channelsFor(tailWorlds[n][i], parent, part.scale, rot);
+        rot = t.rotation_euler;
+        s.frames.push(o.frame_start + i);
+        s.location.push(t.location);
+        s.rotation.push(t.rotation_euler);
       }
-    } else {
-      const segment = tailLengths[0];
-      for (let n = 0; n < segments; n++) {
-        let id = previous.tail[n]?.id;
-        if (!id) {
-          const mesh = doc.addMesh(
-            `${flyer.name} Tail`,
-            ribbonMesh(segment * 0.9, Math.max(0.02, 0.06 * shape.size)),
-          );
-          id = doc.addObject({
-            type: 'MESH',
-            name: `${flyer.name} Tail ${n + 1}`,
-            data: mesh,
-            custom_props: { desk_role: 'prop', [TAIL_OF]: flyer.id },
-          });
-        }
-        const s = transformSamples();
-        let rot: Vec3 = [0, 0, 0];
-        for (let i = 0; i < total; i++) {
-          const t = channelsFor(tailWorlds[n][i], null, [1, 1, 1], rot);
-          rot = t.rotation_euler;
-          s.frames.push(o.frame_start + i);
-          s.location.push(t.location);
-          s.rotation.push(t.rotation_euler);
-        }
-        keys += keyTransforms(doc, id, s, { replace: [-Infinity, Infinity] });
-        // hidden before the flight, like the string (and after it when the flyer is put away)
-        const shownFrames = [o.frame_start - 1, o.frame_start];
-        const shownScale = [TETHER_HIDDEN_SCALE, 1];
-        if (hiddenFrom !== null) {
-          shownFrames.push(hiddenFrom - 1, hiddenFrom);
-          shownScale.push(1, TETHER_HIDDEN_SCALE);
-        }
-        for (let k3 = 0; k3 < 3; k3++)
-          keys += writeChannel(doc, id, 'scale', k3, shownFrames, shownScale, {
-            interpolation: 'CONSTANT',
-            replace: [-Infinity, Infinity],
-          });
-        tailObjects.push(id);
+      holdAt(doc, part.id, o.frame_start - 1, before, clear);
+      keys += keyTransforms(doc, part.id, s);
+      tailObjects.push(part.id);
+      keyed.push({ id: part.id, paths: TRANSFORM });
+    }
+  } else if (segments) {
+    const segment = tailLengths[0];
+    for (let n = 0; n < segments; n++) {
+      let id = previous.tail[n]?.id;
+      if (!id) {
+        const mesh = doc.addMesh(
+          `${flyer.name} Tail`,
+          ribbonMesh(segment * 0.9, Math.max(0.02, 0.06 * shape.size)),
+        );
+        id = doc.addObject({
+          type: 'MESH',
+          name: `${flyer.name} Tail ${n + 1}`,
+          data: mesh,
+          custom_props: { desk_role: 'prop', [TAIL_OF]: flyer.id },
+        });
       }
-      // segments of an earlier, longer tail are not needed any more
-      for (const extra of previous.tail.slice(segments)) doc.removeObject(extra.id);
+      const s = transformSamples();
+      let rot: Vec3 = [0, 0, 0];
+      for (let i = 0; i < total; i++) {
+        const t = channelsFor(tailWorlds[n][i], null, [1, 1, 1], rot);
+        rot = t.rotation_euler;
+        s.frames.push(o.frame_start + i);
+        s.location.push(t.location);
+        s.rotation.push(t.rotation_euler);
+      }
+      keys += keyTransforms(doc, id, s, { replace: clear });
+      // shown from the flight's first frame (before it like the string), hidden after it when the
+      // flyer is put away
+      const shownFrames = [o.frame_start];
+      const shownScale = [1];
+      if (hiddenFrom !== null) {
+        shownFrames.push(hiddenFrom - 1, hiddenFrom);
+        shownScale.push(1, hiddenScale(1));
+      }
+      for (let k3 = 0; k3 < 3; k3++)
+        keys += writeChannel(doc, id, 'scale', k3, shownFrames, shownScale, {
+          interpolation: 'CONSTANT',
+          replace: clear,
+        });
+      keys += keyBefore(doc, id, o.frame_start - 1, before, clear[0]);
+      tailObjects.push(id);
+      keyed.push({ id, paths: ALL });
     }
   }
+  // an earlier flight's tail segments this one does not key (it flies without that tail): hidden
+  for (const extra of previous.tail.slice(segments && !ownTail ? segments : 0)) {
+    keyed.push({ id: extra.id, paths: ALL });
+    keys += hideThrough(doc, extra.id, o.frame_start, before, clear);
+  }
+
+  // a later flight (flown before this one) starts from what this one leaves: its keys before it hold
+  // that, and a flyer this one hid is shown again for it
+  const next = later.find((f) => f.lo === nextLo);
+  const nextShown = !!next && hiddenFrom !== null && showFrom(doc, flyer, next.lo + 1);
+  if (next) for (const { id, paths } of keyed) holdUntil(doc, id, paths, next.lo);
+  // the flights the flyer has flown now; one flown over keeps its keys before this one, and a step
+  // hiding the flyer just before it
+  const flown = c.flights.flatMap((f): Flight[] => {
+    if (!c.over.includes(f)) return [f === next && nextShown ? { ...f, showed: true } : f];
+    if (f.lo >= span.lo) return [];
+    return [f.hid && f.hi === span.lo ? f : { ...f, hi: span.lo - 1, hid: false }];
+  });
+  flown.push({
+    ...span,
+    hid: hiddenFrom !== null,
+    showed: c.showed,
+    anchor: anchorObject.id,
+    ...(o.anchor_bone ? { bone: o.anchor_bone } : {}),
+  });
+  const props: ObjectData['custom_props'] = {
+    ...doc.getObject(flyer.id)!.custom_props,
+    [FLIGHTS]: flightsText(flown.sort((a, b) => a.lo - b.lo)),
+  };
+  delete props[LEGACY_HIDDEN_FROM];
+  doc.updateObject(flyer.id, { custom_props: props });
+
   const mean = elevations.length ? elevations.reduce((s, e) => s + e, 0) / elevations.length : 0;
   return {
     flyer: flyer.id,
@@ -1469,17 +1775,99 @@ function keyedParentWorld(
   return sampler.at(frameStart + i).world(parent);
 }
 
+/** The F-curve of object `id`'s channel `path`[`index`], if keyed. */
+const channelCurve = (doc: SceneDoc, id: string, path: string, index: number): FCurve | null =>
+  doc.getFCurve(fcurveKey({ target_type: 'object', target_id: id, path, index })) ?? null;
+
 /**
- * Keeps object `id`'s transform before `frame` as it was: a key one frame before, CONSTANT, with the
- * values its channels hold there, on each channel without a key before `frame`.
+ * Keeps object `id`'s transform up to `frame` as it was before the flight (`fs`: the scene there): a
+ * CONSTANT key at `frame` on each location and rotation channel with the value it held there. The
+ * channel's keys in `clear` (from `frame` on: the frames the flight takes over) go.
  */
-function holdBefore(doc: SceneDoc, id: string, frame: number, fs: FrameState): void {
-  const animated = fs.byId.get(id);
-  if (!animated) return;
+function holdAt(doc: SceneDoc, id: string, frame: number, fs: FrameState, clear: [number, number]): void {
+  const was = fs.byId.get(id);
+  if (!was) return;
   for (const path of ['location', 'rotation_euler'] as const)
+    for (let i = 0; i < 3; i++)
+      writeChannel(doc, id, path, i, [frame], [was[path][i]], { interpolation: 'CONSTANT', replace: clear });
+}
+
+/**
+ * The key before a flight (CONSTANT, at `frame`) on each channel of object `id`, a string or a tail
+ * segment the flight keys: a channel with keys before `lo` (an earlier flight's) holds the value it had
+ * at `frame` before the flight (`fs`); one without has none before the flight, so its scale is shrunk
+ * to a point (TETHER_HIDDEN_SCALE) and its other channels get no key. Returns the keys written.
+ */
+function keyBefore(doc: SceneDoc, id: string, frame: number, fs: FrameState, lo: number): number {
+  const was = fs.byId.get(id);
+  let keys = 0;
+  for (const path of ['location', 'rotation_euler', 'scale'] as const)
     for (let i = 0; i < 3; i++) {
-      const fc = doc.getFCurve(`object:${id}:${path}:${i}`);
-      if (fc?.keyframes.some((k) => k.frame < frame - 1e-3)) continue;
-      writeChannel(doc, id, path, i, [frame - 1], [animated[path][i]], { interpolation: 'CONSTANT' });
+      const earlier =
+        !!was && !!channelCurve(doc, id, path, i)?.keyframes.some((k) => k.frame < lo - KEY_EPS);
+      if (!earlier && path !== 'scale') continue;
+      const value = was && earlier ? was[path][i] : TETHER_HIDDEN_SCALE;
+      keys += writeChannel(doc, id, path, i, [frame], [value], { interpolation: 'CONSTANT' });
     }
+  return keys;
+}
+
+/**
+ * Hides object `id` (an earlier flight's string or tail segment a flight does not key) from `frame`
+ * through the frames `clear` gives the flight, where it was just before it (`fs`); before it, it keeps
+ * what was there (keyBefore). Returns the keys written.
+ */
+function hideThrough(
+  doc: SceneDoc,
+  id: string,
+  frame: number,
+  fs: FrameState,
+  clear: [number, number],
+): number {
+  const was = fs.byId.get(id);
+  let keys = 0;
+  if (was)
+    for (const path of ['location', 'rotation_euler', 'scale'] as const)
+      for (let i = 0; i < 3; i++) {
+        const value = path === 'scale' ? hiddenScale(was.scale[i]) : was[path][i];
+        keys += writeChannel(doc, id, path, i, [frame], [value], {
+          interpolation: 'CONSTANT',
+          replace: clear,
+        });
+      }
+  return keys + keyBefore(doc, id, frame - 1, fs, clear[0]);
+}
+
+/** A transform channel a flight keys. */
+type ChannelPath = 'location' | 'rotation_euler' | 'scale';
+
+/**
+ * Keys object `id`'s channels `paths` at `frame` (the key before a later flight, CONSTANT) to the
+ * values the keys before it leave there: what a flight leaves holds until the later one starts.
+ * Channels without keys before `frame` are left as they are.
+ */
+function holdUntil(doc: SceneDoc, id: string, paths: readonly ChannelPath[], frame: number): void {
+  for (const path of paths)
+    for (let i = 0; i < 3; i++) {
+      const fc = channelCurve(doc, id, path, i);
+      const earlier = fc ? fc.keyframes.filter((k) => k.frame < frame - KEY_EPS) : [];
+      if (!fc || !earlier.length) continue;
+      const v = evaluateFCurve({ ...fc, keyframes: earlier }, frame);
+      const at = fc.keyframes.find((k) => Math.abs(k.frame - frame) < KEY_EPS);
+      if (v === undefined || (at?.value === v && at.interpolation === 'CONSTANT')) continue;
+      writeChannel(doc, id, path, i, [frame], [v], { interpolation: 'CONSTANT' });
+    }
+}
+
+/** Keys the flyer shown from `frame` where its scale keys hide it there (see shownAt). True when it did. */
+function showFrom(doc: SceneDoc, flyer: ObjectData, frame: number): boolean {
+  let showed = false;
+  for (let i = 0; i < 3; i++) {
+    const fc = channelCurve(doc, flyer.id, 'scale', i);
+    const keyframes = fc ? shownAt(fc, fc.keyframes, frame, flyer.scale[i]) : null;
+    if (!fc || !keyframes) continue;
+    doc.setFCurve({ ...fc, keyframes });
+    showed = true;
+  }
+  return showed;
 }

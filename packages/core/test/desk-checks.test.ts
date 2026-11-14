@@ -137,7 +137,13 @@ describe("rideo's blockingIssues", () => {
         subjects: [B],
       },
     ]);
-    const { issues, summary } = checkShots(doc);
+    const { issues: all, summary } = checkShots(doc);
+    // rideo's issues; the desk adds its own occluded_subject: Cy stands 14 cm in front of Ben
+    const issues = all.filter((i) => i.code !== 'occluded_subject');
+    expect(all.filter((i) => i.code === 'occluded_subject').map((i) => [i.shot, i.objects])).toEqual([
+      [s.S1.id, [B, C]],
+      [s.S4.id, [B, C]],
+    ]);
     const got = issues.map((i) => ({ code: i.code, shot: i.shot, objects: i.objects, severity: i.severity }));
     const shed = doc.findObjectByName('shed')!.id;
     // rideo: camera_inside s1, absent_in_frame s1 Cy, line_crossed s2, outside_set s2 Ada, plan_mismatch s3,
@@ -169,7 +175,7 @@ describe("rideo's blockingIssues", () => {
     expect(message('actors_overlap', s.S3.id)).toBe("Ben and Cy stand in the same place in shot 'S3'");
     expect(message('absent_in_frame', s.S1.id)).toBe("Cy is not in shot 'S1' but stands in its frame");
     expect(summary).toBe(
-      '4 shots checked: 2 errors, 6 warnings, 0 info (camera_inside, absent_in_frame, outside_set, line_crossed, actors_overlap, plan_mismatch)',
+      '4 shots checked: 2 errors, 8 warnings, 0 info (camera_inside, absent_in_frame, occluded_subject, outside_set, line_crossed, actors_overlap, plan_mismatch)',
     );
     // checking some shots reports theirs only (the line is still the scene's)
     expect(codes(checkShots(doc, { shots: ['S2'] }).issues)).toEqual(['line_crossed', 'outside_set']);
@@ -212,6 +218,7 @@ describe("rideo's blockingIssues", () => {
       'line_crossed',
       'missing_camera',
       'subject_out_of_frame',
+      'tether_detached',
     ]);
     expect(DESK_ISSUE_CODES.filter((c) => DESK_ISSUE_SEVERITY[c] === 'info').sort()).toEqual([
       'physics_unbaked',

@@ -5,6 +5,7 @@ import {
   constraintTargets,
   decodeFloat32,
   decompose4,
+  evaluateFCurve,
   isMeshMemoryError,
   isModifierEnabled,
   meshStats,
@@ -12,6 +13,7 @@ import {
   modifierDisabledReason,
   modifierObjectParams,
   normalizeParticleSettings,
+  sortedKeyframes,
   transformPoint3,
   type ConstraintData,
   type CurveData,
@@ -1493,14 +1495,106 @@ function sceneSummary(scene: SceneDoc, opts: SceneSummaryOptions) {
 }
 
 /**
- * Detailed description of one object (`get_object`), its numbers rounded to `decimals` (0–6,
- * default OBJECT_DECIMALS = 1 µm, so sub-millimetre parts read back as they were made).
+ * How get_object lists the keys of an object's animation channels: `auto` lists the keys of the
+ * channels that have few (AUTO_KEYFRAMES) and summarizes the others (keyframe_count, first_frame,
+ * last_frame, value_at_frame); `summary` summarizes every channel; `full` lists every channel's
+ * keys, a page of them (keyframe_offset, keyframe_limit); `none` leaves the channels out.
  */
-export function describeObject(scene: SceneDoc, o: ObjectData, frame?: number, decimals = OBJECT_DECIMALS) {
-  return withDecimals(decimals, () => objectDescription(scene, o, frame));
+export const KEYFRAME_LISTINGS = ['auto', 'summary', 'full', 'none'] as const;
+export type KeyframeListing = (typeof KEYFRAME_LISTINGS)[number];
+/**
+ * Most keys a channel may have for keyframes 'auto' to list them: what is keyed by hand. A desk
+ * actor's walk keys its channels at every step (36–38 channels, thousands of keys) and a baked
+ * tether or simulation at every frame: listing those made one get_object 100–200 KB.
+ */
+export const AUTO_KEYFRAMES = 20;
+/** Keys listed per channel with keyframes 'full' by default, and at most. */
+export const DEFAULT_KEYFRAME_PAGE = 100;
+export const MAX_KEYFRAME_PAGE = 1000;
+
+/** How get_object lists the animation channels' keys (see {@link KEYFRAME_LISTINGS}). */
+export interface KeyframeOptions {
+  keyframes?: KeyframeListing;
+  /** First key listed per channel (keyframes 'full'). */
+  offset?: number;
+  /** Keys listed per channel (keyframes 'full'). */
+  limit?: number;
 }
 
-function objectDescription(scene: SceneDoc, o: ObjectData, frame?: number) {
+/**
+ * Detailed description of one object (`get_object`), its numbers rounded to `decimals` (0–6,
+ * default OBJECT_DECIMALS = 1 µm, so sub-millimetre parts read back as they were made), its
+ * animation channels listed as `keys` asks (default: keys of the channels keyed by hand, the
+ * others summarized).
+ */
+export function describeObject(
+  scene: SceneDoc,
+  o: ObjectData,
+  frame?: number,
+  decimals = OBJECT_DECIMALS,
+  keys: KeyframeOptions = {},
+) {
+  return withDecimals(decimals, () => objectDescription(scene, o, frame, keys));
+}
+
+/**
+ * The animation channels of an object (its own and its data's F-curves) at `frame`, their keys
+ * listed or summarized as `keys` asks, with what tells the agent how to see the rest.
+ */
+function animationListing(o: ObjectData, fcurves: FCurve[], frame: number, keys: KeyframeOptions) {
+  const mode = keys.keyframes ?? 'auto';
+  if (mode === 'none') return { animation_channels: fcurves.length };
+  const offset = Math.max(0, Math.floor(keys.offset ?? 0));
+  const limit = Math.max(1, Math.min(MAX_KEYFRAME_PAGE, Math.floor(keys.limit ?? DEFAULT_KEYFRAME_PAGE)));
+  let summarized = 0;
+  let more = false;
+  const animation = fcurves.slice(0, OBJECT_LIST).map((f) => {
+    const sorted = sortedKeyframes(f);
+    const head = {
+      ...(f.target_id === o.id ? {} : { target_type: f.target_type }),
+      path: f.path,
+      index: f.index,
+      ...(f.extrapolation !== 'CONSTANT' ? { extrapolation: f.extrapolation } : {}),
+      ...(f.mute ? { mute: true } : {}),
+      ...(f.modifiers?.length ? { modifiers: f.modifiers.map((m) => ({ type: m.type, ...m.params })) } : {}),
+      keyframe_count: sorted.length,
+    };
+    const list = mode === 'full' || (mode === 'auto' && sorted.length <= AUTO_KEYFRAMES);
+    if (list) {
+      const page = mode === 'full' ? sorted.slice(offset, offset + limit) : sorted;
+      if (mode === 'full' && sorted.length > offset + limit) more = true;
+      return {
+        ...head,
+        keyframes: page.map((k) => ({
+          frame: k.frame,
+          value: round(k.value),
+          interpolation: k.interpolation,
+        })),
+      };
+    }
+    summarized++;
+    const value = evaluateFCurve(f, frame, sorted);
+    return {
+      ...head,
+      ...(sorted.length
+        ? { first_frame: sorted[0].frame, last_frame: sorted[sorted.length - 1].frame }
+        : { first_frame: null, last_frame: null }),
+      value_at_frame: value === undefined ? null : round(value),
+    };
+  });
+  return {
+    animation,
+    ...(fcurves.length > OBJECT_LIST ? { animation_total: fcurves.length } : {}),
+    ...(summarized && mode === 'auto'
+      ? {
+          animation_note: `${summarized} channel(s) with more than ${AUTO_KEYFRAMES} keys are summarized (keyframe_count, first_frame, last_frame, value_at_frame): keyframes 'full' lists their keys (keyframe_offset and keyframe_limit page them)`,
+        }
+      : {}),
+    ...(more ? { keyframe_next_offset: offset + limit } : {}),
+  };
+}
+
+function objectDescription(scene: SceneDoc, o: ObjectData, frame: number | undefined, keys: KeyframeOptions) {
   const both = evaluateBoth(scene, frame);
   const ev = both.ev;
   const e = ev.byId.get(o.id);
@@ -1556,20 +1650,6 @@ function objectDescription(scene: SceneDoc, o: ObjectData, frame?: number) {
       color: o.color,
     },
     visibility: { hide_viewport: o.hide_viewport, hide_render: o.hide_render, hide_select: o.hide_select },
-    animation: fcurves.slice(0, OBJECT_LIST).map((f) => ({
-      ...(f.target_id === o.id ? {} : { target_type: f.target_type }),
-      path: f.path,
-      index: f.index,
-      ...(f.extrapolation !== 'CONSTANT' ? { extrapolation: f.extrapolation } : {}),
-      ...(f.mute ? { mute: true } : {}),
-      ...(f.modifiers?.length ? { modifiers: f.modifiers.map((m) => ({ type: m.type, ...m.params })) } : {}),
-      keyframe_count: f.keyframes.length,
-      keyframes: f.keyframes.slice(0, 100).map((k) => ({
-        frame: k.frame,
-        value: round(k.value),
-        interpolation: k.interpolation,
-      })),
-    })),
-    ...(fcurves.length > OBJECT_LIST ? { animation_total: fcurves.length } : {}),
+    ...animationListing(o, fcurves, ev.frame, keys),
   };
 }

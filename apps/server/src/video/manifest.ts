@@ -41,6 +41,11 @@ export interface SubjectTrackEntry {
   w: number;
   h: number;
   visible: boolean;
+  /**
+   * Present (true) on frames the subject is hidden by its scale (the hide keys of desk.tether_fly
+   * after: 'hide' and of the rideo import): its box is empty and `visible` false.
+   */
+  hidden?: true;
 }
 
 /** What the frames of one shot reported (filled while the frames are written, in order). */
@@ -62,10 +67,13 @@ export class ShotTracks {
     for (const [id, box] of Object.entries(meta.subjects)) {
       let list = this.subjects.get(id);
       if (!list) this.subjects.set(id, (list = []));
+      const f = round(frame, 4);
       list.push(
-        box
-          ? { frame: round(frame, 4), x: box.x, y: box.y, w: box.w, h: box.h, visible: box.visible }
-          : { frame: round(frame, 4), x: 0, y: 0, w: 0, h: 0, visible: false },
+        !box
+          ? { frame: f, x: 0, y: 0, w: 0, h: 0, visible: false }
+          : box.hidden
+            ? { frame: f, x: 0, y: 0, w: 0, h: 0, visible: false, hidden: true }
+            : { frame: f, x: box.x, y: box.y, w: box.w, h: box.h, visible: box.visible },
       );
     }
   }

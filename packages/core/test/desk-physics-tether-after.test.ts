@@ -11,7 +11,9 @@ import { deskScene, dist, kiteMesh, originOf, transformPoint } from './desk-phys
  * (their keyed scale shrinks them to nothing: renders, the viewport and the export's string overlay
  * draw none of them), a later flight showing the flyer again; 'land' brings a kite down (slower than a
  * dropped stone: 1.6 times a free fall's time, at least 1.5 s) to lie flat on the ground downwind of
- * the anchor, its tail lying after it and its string hidden.
+ * the anchor, its tail lying after it and its string hidden. A flyer flies several flights: each keys
+ * its own frames (one flown over an earlier one replaces that one from its start on), and between two
+ * the flyer, its string and its tail stay as the earlier one left them.
  */
 
 type Scene = ReturnType<typeof deskScene>;
@@ -27,6 +29,9 @@ const ANCHOR: Vec3 = [0, 0, 1.2];
 /** The wind blows toward +X. */
 const FLY = { flyer: 'Kite', anchor: 'Hand', length_m: 20, wind_dir_deg: 90, wind_mps: 6 } as const;
 const FPS = 24;
+
+/** A FLIGHTS property's spans and flags, without the anchor each flight records ('@…'). */
+const spans = (text: unknown): string => String(text).replace(/@\S+/g, '');
 
 function kiteScene(): Scene & { kite: string } {
   const s = deskScene();
@@ -138,21 +143,20 @@ describe('desk.tether_fly after the flight', () => {
       props: structuredClone(t.doc.getObject(t.kite)!.custom_props),
     };
     expect(before.scales).toHaveLength(3);
-    expect(before.props?.desk_tether_hidden_from).toBe(121);
-    // a document that fails the first read after the flight has shown the kite again (its hiding
-    // keys and property changed for the flight), as any failure inside the flight would
+    // the flight's frames, and that it hid the kite after them
+    expect(spans(before.props?.desk_tether_flights)).toBe('0:121h');
+    // a document that fails the first read after the flight has shown the kite again (keyed its
+    // scale shown from the flight's start), as any failure inside the flight would
     let shown = false;
     let failed = false;
     const doc = t.doc;
     const failing = new Proxy(doc, {
       get(target, key) {
         const v: unknown = Reflect.get(target, key, target);
-        if (key === 'updateObject')
-          return (id: string, patch: Parameters<typeof doc.updateObject>[1]) => {
-            const r = doc.updateObject(id, patch);
-            if (id === t.kite && patch.custom_props && !('desk_tether_hidden_from' in patch.custom_props))
-              shown = true;
-            return r;
+        if (key === 'setFCurve')
+          return (fc: Parameters<typeof doc.setFCurve>[0]) => {
+            doc.setFCurve(fc);
+            if (fc.target_id === t.kite && fc.path === 'scale') shown = true;
           };
         if (key === 'getObject')
           return (id: string) => {
@@ -177,14 +181,15 @@ describe('desk.tether_fly after the flight', () => {
   it('shows a hidden kite again for a later flight; flying the same range again replaces the hiding', () => {
     const t = kiteScene();
     t.run('desk.tether_fly', { ...FLY, frame_start: 1, frame_end: 120, after: 'hide' });
-    expect(t.doc.getObject(t.kite)!.custom_props?.desk_tether_hidden_from).toBe(121);
+    expect(spans(t.doc.getObject(t.kite)!.custom_props?.desk_tether_flights)).toBe('0:121h');
     // a later flight: hidden between the two, shown again from the second on
     t.run('desk.tether_fly', { ...FLY, frame_start: 200, frame_end: 300 });
     const scale = (s: Scene & { kite: string }, f: number) => drawnScale(worldAt(s, s.kite, f));
     expect(scale(t, 120)).toBeCloseTo(1, 6);
     for (const f of [121, 199]) expect(scale(t, f), `frame ${f}`).toBeLessThan(1e-6);
     for (const f of [200, 300, 500]) expect(scale(t, f), `frame ${f}`).toBeCloseTo(1, 6);
-    expect(t.doc.getObject(t.kite)!.custom_props?.desk_tether_hidden_from).toBeUndefined();
+    // both flights kept, the second keyed the kite shown at its start
+    expect(spans(t.doc.getObject(t.kite)!.custom_props?.desk_tether_flights)).toBe('0:121h 199:300s');
 
     // flown again over the same range: the new flight's `after` decides
     const u = kiteScene();
@@ -303,5 +308,105 @@ describe('desk.tether_fly after the flight', () => {
     expect(drawnScale(worldAt(b, balloon, 48))).toBeCloseTo(1, 6);
     expect(drawnScale(worldAt(b, balloon, 49))).toBeLessThan(1e-6);
     expect(meshBounds(b, r.string.object, 49).diagonal).toBeLessThan(1e-6);
+  });
+});
+
+describe('desk.tether_fly: several flights of one flyer', () => {
+  /** Whether each of `ids` is drawn at `frame` (not scaled to nothing by a hide key). */
+  const shown = (t: Scene, ids: string[], frame: number): boolean[] =>
+    ids.map((id) => drawnScale(worldAt(t, id, frame)) > 1e-3);
+  /** The kite's flights as its FLIGHTS property records them (their spans and flags; the anchor of each apart). */
+  const flightsOf = (t: Scene & { kite: string }) => {
+    const text = String(t.doc.getObject(t.kite)!.custom_props?.desk_tether_flights);
+    // every flight records the anchor its string is tied to (the hand, by id)
+    const hand = t.doc.listObjects().find((o) => o.name === 'Hand')!.id;
+    for (const entry of text.split(' ')) expect(entry.split('@')[1]).toBe(encodeURIComponent(hand));
+    return text.replace(/@\S+/g, '');
+  };
+
+  it("keeps an earlier flight's string and tail when the kite flies again later (after: 'hide' between)", () => {
+    const t = kiteScene();
+    const a = t.run('desk.tether_fly', { ...FLY, frame_start: 1, frame_end: 120, after: 'hide' });
+    const parts = [a.string.object as string, ...ids(a.tail_objects)];
+    const everything = [t.kite, ...parts];
+    const during = [1, 60, 120];
+    const first = during.map((f) => everything.map((id) => worldAt(t, id, f)));
+    const b = t.run('desk.tether_fly', { ...FLY, frame_start: 200, frame_end: 300, after: 'hide', seed: 5 });
+    // the same string and tail fly again
+    expect([b.string.object, ...ids(b.tail_objects)]).toEqual(parts);
+    // the first flight is where it was
+    during.forEach((f, i) => everything.forEach((id, j) => expect(worldAt(t, id, f)).toEqual(first[i][j])));
+    const all = (v: boolean) => everything.map(() => v);
+    for (const f of [1, 60, 120, 200, 250, 300])
+      expect(shown(t, everything, f), `frame ${f}`).toEqual(all(true));
+    for (const f of [121, 160, 199, 301, 1000])
+      expect(shown(t, everything, f), `frame ${f}`).toEqual(all(false));
+    // before the first flight only the kite was there
+    expect(shown(t, everything, 0)).toEqual([true, ...parts.map(() => false)]);
+    // the second flight's string joins the hand to the kite
+    for (const f of [200, 250, 300]) {
+      const w = worldAt(t, parts[0], f);
+      expect(dist(originOf(w), ANCHOR), `frame ${f}`).toBeLessThan(1e-6);
+      expect(dist(transformPoint(w, [0, 0, 1]), originOf(worldAt(t, t.kite, f))), `frame ${f}`).toBeLessThan(
+        1e-3,
+      );
+    }
+    expect(flightsOf(t)).toBe('0:121h 199:301hs');
+  });
+
+  it('keeps a later flight flown first, and leaves it what an earlier flight flown after it ends with', () => {
+    const t = kiteScene();
+    const b = t.run('desk.tether_fly', { ...FLY, frame_start: 200, frame_end: 300 });
+    const everything = [t.kite, b.string.object as string, ...ids(b.tail_objects)];
+    const second = [200, 250, 300].map((f) => everything.map((id) => worldAt(t, id, f)));
+    // an earlier flight that puts the kite away: hidden until the later flight, which shows it again
+    t.run('desk.tether_fly', { ...FLY, frame_start: 1, frame_end: 120, after: 'hide' });
+    [200, 250, 300].forEach((f, i) =>
+      everything.forEach((id, j) => expect(worldAt(t, id, f)).toEqual(second[i][j])),
+    );
+    for (const f of [60, 200])
+      expect(shown(t, everything, f), `frame ${f}`).toEqual(everything.map(() => true));
+    for (const f of [121, 199])
+      expect(shown(t, everything, f), `frame ${f}`).toEqual(everything.map(() => false));
+    expect(flightsOf(t)).toBe('0:121h 199:300s');
+    // flown again holding the kite after it: all of it stays where that flight ends until the later one
+    t.run('desk.tether_fly', { ...FLY, frame_start: 1, frame_end: 120 });
+    for (const f of [121, 160, 199]) {
+      expect(shown(t, everything, f), `frame ${f}`).toEqual(everything.map(() => true));
+      for (const id of everything) expect(worldAt(t, id, f), `frame ${f}`).toEqual(worldAt(t, id, 120));
+    }
+    [200, 250, 300].forEach((f, i) =>
+      everything.forEach((id, j) => expect(worldAt(t, id, f)).toEqual(second[i][j])),
+    );
+    expect(flightsOf(t)).toBe('0:120 199:300s');
+  });
+
+  it('replaces all of an earlier flight flown again over a shorter range', () => {
+    const t = kiteScene();
+    const a = t.run('desk.tether_fly', { ...FLY, frame_start: 1, frame_end: 120, after: 'hide' });
+    const everything = [t.kite, a.string.object as string, ...ids(a.tail_objects)];
+    t.run('desk.tether_fly', { ...FLY, frame_start: 1, frame_end: 100, seed: 9 });
+    // nothing of the first flight after the second ends: all of it stays where the second leaves it
+    for (const f of [101, 120, 121, 400]) {
+      expect(shown(t, everything, f), `frame ${f}`).toEqual(everything.map(() => true));
+      for (const id of everything) expect(worldAt(t, id, f), `frame ${f}`).toEqual(worldAt(t, id, 100));
+    }
+    expect(flightsOf(t)).toBe('0:100');
+  });
+
+  it("hides an earlier flight's tail through a later flight without one", () => {
+    const t = kiteScene();
+    const a = t.run('desk.tether_fly', { ...FLY, frame_start: 1, frame_end: 120 });
+    const tail = ids(a.tail_objects);
+    const held = tail.map((id) => worldAt(t, id, 120));
+    const b = t.run('desk.tether_fly', { ...FLY, frame_start: 200, frame_end: 300, tail: false });
+    expect(b.tail_objects).toEqual([]);
+    for (const f of [60, 150, 199]) expect(shown(t, tail, f), `frame ${f}`).toEqual(tail.map(() => true));
+    tail.forEach((id, i) => expect(worldAt(t, id, 199)).toEqual(held[i]));
+    // the kite and its string, flown again, hold where the first flight left them until the second
+    for (const id of [t.kite, a.string.object as string])
+      for (const f of [150, 199]) expect(worldAt(t, id, f), `frame ${f}`).toEqual(worldAt(t, id, 120));
+    for (const f of [200, 250, 300, 400])
+      expect(shown(t, tail, f), `frame ${f}`).toEqual(tail.map(() => false));
   });
 });

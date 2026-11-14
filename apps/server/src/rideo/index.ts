@@ -22,6 +22,7 @@ import {
   type RideoClipDocs,
   type RideoImportResult,
 } from './import';
+import { PREVIS_DIR, PrevisStore } from './previs-store';
 import { ffprobePath, posterJpeg, probeClip } from './probe';
 import {
   fileResources,
@@ -37,7 +38,8 @@ import { DEFAULT_PASS, defaultMode, needsReference, shotFeatures, type Reference
  * The bridge to a rideo server (SPEC §11): rideo_import reads a rideo clip and builds or updates a
  * project from it (desk.import_rideo_blocking, one undo step); rideo_push writes the project's
  * staging back to rideo and sends an export's clips as the shots' reference videos; POST
- * /api/rideo/previs does both around a draft export as one server-side job. RIDEO_URL and RIDEO_TOKEN
+ * /api/rideo/previs does both around a draft export as one server-side job, kept in DATA_DIR
+ * (previs-store.ts) so that its status still answers after a restart. RIDEO_URL and RIDEO_TOKEN
  * name the default rideo server; a call may name another (its own token: the configured token only
  * ever goes to RIDEO_URL).
  */
@@ -108,7 +110,7 @@ export interface PrevisRequest {
   model_limits?: ModelLimits;
 }
 
-export type PrevisStatus = 'importing' | 'exporting' | 'pushing' | 'done' | 'failed' | 'cancelled';
+export type PrevisStatus = 'importing' | 'exporting' | 'pushing' | 'done' | 'failed';
 
 /** A previs job (GET /api/rideo/previs/:job). */
 export interface PrevisJob {
@@ -127,7 +129,7 @@ export interface PrevisJob {
   warnings: string[];
 }
 
-/** Most previs jobs kept (finished ones beyond it are forgotten, oldest first). */
+/** Most previs jobs kept (finished ones beyond it are forgotten and deleted, oldest first). */
 export const MAX_PREVIS_JOBS = 100;
 /** Most previs jobs running at once (their exports queue like any other). */
 export const MAX_ACTIVE_PREVIS = 4;
@@ -137,6 +139,23 @@ export const MAX_PREVIS_WAIT_S = 50;
 const PREVIS_ORIGIN = { type: 'rideo-previs' };
 const nowIso = () => new Date().toISOString();
 const copy = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+
+/**
+ * Why a previs job that was running ended when the server stopped: 'shut down' (a clean stop,
+ * SIGTERM or Ctrl+C) or 'restarted' (found running at the next start: a crash, kill -9, a power
+ * cut). What it says to do depends on how far the job got.
+ */
+export function interruptedError(
+  job: Pick<PrevisJob, 'status' | 'export'>,
+  how: 'shut down' | 'restarted',
+): string {
+  const exp = job.export ? ` ${job.export}` : '';
+  if (job.status === 'pushing')
+    return `server ${how} while the previs pushed export${exp} to rideo: push it again with rideo_push, or start the previs again`;
+  if (job.status === 'exporting')
+    return `server ${how} while the previs's export${exp} rendered: start the previs again`;
+  return `server ${how} while the previs imported the clip: start the previs again`;
+}
 
 /** desk.export_rideo_blocking run in a project: our blocking, what it left out and each shot's move. */
 export function exportBlockingOf(runner: ProjectRunner): OurBlocking {
@@ -251,8 +270,13 @@ export class RideoBridge {
   private readonly pushes = new Map<string, Promise<unknown>>();
   private readonly previsJobs = new Map<string, PrevisJob>();
   private readonly waiters = new Map<string, Set<() => void>>();
+  private previsStoreInstance: PrevisStore | null = null;
+  private previsLoading: Promise<void> | null = null;
 
-  constructor(protected readonly ctx: ServiceContext) {}
+  constructor(protected readonly ctx: ServiceContext) {
+    // the previs jobs of an earlier run are read back soon after the server starts
+    if (ctx?.config?.dataDir) setImmediate(() => void this.loadPrevis());
+  }
 
   /** Whether a rideo server is configured (RIDEO_URL). */
   get configured(): boolean {
@@ -356,8 +380,62 @@ export class RideoBridge {
 
   // ---------------------------------------------------------------- previs
 
+  /** Where the previs jobs are kept (DATA_DIR/rideo-previs; none without a configuration). */
+  private get previsStore(): PrevisStore | null {
+    const dir = this.ctx?.config?.dataDir;
+    if (!dir) return null;
+    return (this.previsStoreInstance ??= new PrevisStore(path.join(dir, PREVIS_DIR), this.ctx.log));
+  }
+
+  /**
+   * Reads the previs jobs of earlier runs once. A job that was still running cannot go on (its
+   * import, export and push ran in the old process): it ends failed, 'server restarted while …'.
+   */
+  private loadPrevis(): Promise<void> {
+    return (this.previsLoading ??= (async () => {
+      const store = this.previsStore;
+      if (!store) return;
+      const jobs = await store.loadAll();
+      jobs.sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
+      for (const job of jobs) {
+        if (this.previsJobs.has(job.id)) continue;
+        // a status this server does not know (a file written by hand) would count as running forever
+        if (!PREVIS_STATUSES.has(job.status)) {
+          this.ctx.log?.warn({ job: job.id, status: job.status }, 'rideo previs job not readable: skipped');
+          continue;
+        }
+        this.previsJobs.set(job.id, job);
+        if (!job.finished_at) {
+          const running = !previsFinished(job.status);
+          await this.endPrevis(job, 'restarted');
+          if (running) this.ctx.log?.warn({ job: job.id }, 'rideo previs failed: server restarted');
+        }
+      }
+      this.forgetOldPrevis();
+    })().catch((err: unknown) => {
+      this.ctx.log?.warn({ err: errorMessage(err) }, 'rideo previs jobs not read');
+    }));
+  }
+
+  /**
+   * Ends a job the server cannot finish (it shuts down, or it found the job running when it
+   * started): failed, with what to do next, saved. A job that had already ended keeps its status.
+   */
+  private endPrevis(job: PrevisJob, how: 'shut down' | 'restarted'): Promise<void> {
+    if (job.finished_at) return Promise.resolve();
+    if (!previsFinished(job.status)) {
+      job.error = interruptedError(job, how);
+      job.status = 'failed';
+    }
+    job.finished_at = nowIso();
+    return this.previsStore?.save(job) ?? Promise.resolve();
+  }
+
   /** Starts a previs job: import, draft export, push (POST /api/rideo/previs). */
   async startPrevis(req: PrevisRequest): Promise<PrevisJob> {
+    await this.loadPrevis();
+    if (this.closing.signal.aborted)
+      throw new ToolError('The server is shutting down: no new previs jobs.', 'UNAVAILABLE');
     const active = [...this.previsJobs.values()].filter((j) => !previsFinished(j.status)).length;
     if (active >= MAX_ACTIVE_PREVIS)
       throw new ToolError(
@@ -391,15 +469,20 @@ export class RideoBridge {
     };
     this.previsJobs.set(job.id, job);
     this.forgetOldPrevis();
+    // on disk before its id is answered: a server that stops at once still knows the job
+    await this.previsStore?.save(job);
     void this.runPrevis(job, req);
     return copy(job);
   }
 
   /** A previs job, after waiting up to `waitS` seconds for it to change (NOT_FOUND when unknown). */
   async previsStatus(id: string, opts: { waitS?: number; signal?: AbortSignal } = {}): Promise<PrevisJob> {
+    await this.loadPrevis();
     const job = this.previsJobs.get(id);
     if (!job)
-      throw new NotFoundError(`Previs job '${id}' not found (jobs are kept until the server restarts)`);
+      throw new NotFoundError(
+        `Previs job '${id}' not found (the server keeps the last ${MAX_PREVIS_JOBS} previs jobs)`,
+      );
     const waitS = Math.max(0, Math.min(MAX_PREVIS_WAIT_S, opts.waitS ?? 0));
     if (waitS > 0 && !previsFinished(job.status)) await this.waitChange(id, waitS * 1000, opts.signal);
     return copy(job);
@@ -410,13 +493,22 @@ export class RideoBridge {
     const exports = this.ctx.services.exports;
     const log = this.ctx.log;
     const set = (patch: Partial<PrevisJob>) => {
+      // a job that ended changes no more (a shutdown ends a running one at once: close())
+      if (job.finished_at) return;
       Object.assign(job, patch);
+      void this.previsStore?.save(job);
       this.notify(job.id);
     };
     let snapshot: (ProjectRunner & { destroy(): void }) | null = null;
+    // after each wait: a server shutting down ended the job (close()), so it stops here
+    const goOn = () => {
+      if (signal.aborted) throw new ToolError('the server shut down during the previs', 'UNAVAILABLE');
+    };
     try {
       const { docs, url } = await this.readClip(req.rideo, signal);
+      goOn();
       const target = await importTarget(this.roomAccess(), req.project, docs);
+      goOn();
       set({ project: target.runner.id, project_name: target.name });
       const imported = this.importClip(target, docs, {
         url,
@@ -426,12 +518,15 @@ export class RideoBridge {
       });
       set({ import: imported });
       const plan = previsPlan(target.runner.doc, docs, imported.shots, req.push, planMismatchOf(imported));
-      job.warnings.push(...plan.warnings);
+      set({ warnings: [...job.warnings, ...plan.warnings] });
       if (!plan.shots.length) {
-        job.warnings.push(
-          'no shot needs a reference (no physics, tether, held prop or camera move): nothing was exported; pass push.shots to choose some',
-        );
-        set({ status: 'done' });
+        set({
+          status: 'done',
+          warnings: [
+            ...job.warnings,
+            'no shot needs a reference (no physics, tether, held prop or camera move): nothing was exported; pass push.shots to choose some',
+          ],
+        });
         return;
       }
       set({ status: 'exporting' });
@@ -443,7 +538,7 @@ export class RideoBridge {
       set({ export: started.id, export_status: exportStatusOf(started) });
       let st = started;
       while (!finished(st.status)) {
-        if (signal.aborted) throw new ToolError('the server shut down during the previs', 'UNAVAILABLE');
+        goOn();
         st = await exports.status(started.id, {
           project: target.runner.id,
           waitS: MAX_PREVIS_WAIT_S,
@@ -451,6 +546,7 @@ export class RideoBridge {
         });
         set({ export_status: exportStatusOf(st) });
       }
+      goOn();
       if (st.status !== 'done')
         throw new ToolError(`the export ${st.status}${st.error ? `: ${st.error}` : ''}`, 'FAILED');
       set({ status: 'pushing' });
@@ -475,8 +571,11 @@ export class RideoBridge {
             : null,
       });
     } catch (err) {
-      set({ status: signal.aborted ? 'cancelled' : 'failed', error: errorMessage(err) });
-      log?.warn({ job: job.id, err: errorMessage(err) }, 'rideo previs failed');
+      // after a shutdown the job has ended already (close()); anything else is its own failure
+      if (!signal.aborted) {
+        set({ status: 'failed', error: errorMessage(err) });
+        log?.warn({ job: job.id, err: errorMessage(err) }, 'rideo previs failed');
+      }
     } finally {
       snapshot?.destroy();
       set({ finished_at: nowIso() });
@@ -515,7 +614,10 @@ export class RideoBridge {
     const all = [...this.previsJobs.values()].sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
     for (const j of all) {
       if (this.previsJobs.size <= MAX_PREVIS_JOBS) break;
-      if (previsFinished(j.status)) this.previsJobs.delete(j.id);
+      if (previsFinished(j.status) && j.finished_at) {
+        this.previsJobs.delete(j.id);
+        void this.previsStore?.remove(j.id);
+      }
     }
   }
 
@@ -544,15 +646,33 @@ export class RideoBridge {
     });
   }
 
-  /** Stops requests in flight and running previs jobs (server shutdown). */
+  /**
+   * Stops requests in flight and running previs jobs (server shutdown): each running job ends
+   * failed ('server shut down while …') at once, and is saved before this resolves; status
+   * requests waiting on a job answer.
+   */
   async close(): Promise<void> {
     this.closing.abort();
+    const ended = [...this.previsJobs.values()]
+      .filter((j) => !j.finished_at)
+      .map((j) => this.endPrevis(j, 'shut down'));
     for (const set of this.waiters.values()) for (const w of set) w();
     this.waiters.clear();
+    // the jobs of the earlier run are read back (and those it left running saved as failed) first
+    await this.loadPrevis();
+    await Promise.all(ended);
+    await this.previsStoreInstance?.flush();
   }
 }
 
-const previsFinished = (s: PrevisStatus) => s === 'done' || s === 'failed' || s === 'cancelled';
+const previsFinished = (s: PrevisStatus) => s === 'done' || s === 'failed';
+const PREVIS_STATUSES = new Set<string>([
+  'importing',
+  'exporting',
+  'pushing',
+  'done',
+  'failed',
+] satisfies PrevisStatus[]);
 
 /**
  * The rideo shots whose camera the import found at odds with their planned layout (the desk's
@@ -582,8 +702,10 @@ export interface PrevisPlan {
 
 /**
  * The shots a previs pushes (as given, else those with props in motion or a camera move) and the
- * passes their default modes need; beauty is always rendered, so a shot whose mode turns out
- * different at push time (rideo's line differs) still has a clip.
+ * passes the push will send: the pass asked for, else that of the mode asked for, else that of each
+ * shot's default mode plus depth, because a shot whose first frame cannot follow our staging (as
+ * rideo's answer to the blocking may show only at push time) gets a camera reference, and the push
+ * sends no other pass in place of a missing one. Beauty is always rendered: the clip people watch.
  */
 export function previsPlan(
   doc: SceneDoc,
@@ -617,18 +739,26 @@ export function previsPlan(
     const s = shots.find((x) => x.id === id);
     const rs = s?.external?.shot ? rideoShots.get(s.external.shot) : undefined;
     if (!s || !rs) continue;
+    if (push?.pass) {
+      passes.add(push.pass);
+      continue;
+    }
     const mode =
       push?.mode ??
       defaultMode(
         shotFeatures(doc, s, aspect),
         firstFrameMismatch(docs.project, rs, new Set(), planMismatch) === null,
       );
-    passes.add(push?.pass ?? DEFAULT_PASS[mode]);
+    passes.add(DEFAULT_PASS[mode]);
+    if (!push?.mode) passes.add(DEFAULT_PASS.camera);
   }
   return { shots: [...new Set(chosen)], passes: [...passes], warnings };
 }
 
-/** The export of a previs: draft, clay, clips only, at rideo's fps and size, over which `given` goes. */
+/**
+ * The export of a previs: export_video's preset 'rideo' (draft, clay, clips only) with the passes
+ * the plan needs, at rideo's fps and size, over which `given` goes.
+ */
 export function previsExportParams(
   docs: RideoClipDocs,
   plan: PrevisPlan,
@@ -637,10 +767,8 @@ export function previsExportParams(
   const { fps, resolution } = docs.project.settings;
   const title = docs.clip.title || docs.clip.id;
   return videoExportParamsSchema.parse({
+    preset: 'rideo',
     shots: plan.shots,
-    quality: 'draft',
-    look: 'clay',
-    outputs: { sequence: false, clips: true, posters: false, contact_sheet: false },
     passes: plan.passes,
     fps,
     width: resolution.width,

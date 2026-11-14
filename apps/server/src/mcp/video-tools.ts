@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { ExportJob } from '../video';
-import { MAX_EXPORT_WAIT_S, videoExportParamsShape } from '../video/params';
+import { MAX_EXPORT_WAIT_S, exportVideoArgsShape } from '../video/params';
 import {
   DESTRUCTIVE,
   EDIT,
@@ -33,10 +33,10 @@ export function registerVideoTools(tool: ToolRegistrar, ctx: ToolContext): void 
     {
       title: 'Export video',
       description:
-        "Start a video export of the project's shots (or of its frame range) on the server: rendered in the background and encoded with ffmpeg into an MP4 of the whole sequence, one frame-exact clip per shot, posters, a contact sheet, a manifest and optional control passes (depth, normal, mask, edges, pose). Returns at once with the export id, frames_total and estimate_s: follow it with export_status (wait_s waits), stop it with cancel_export. Fails with FFMPEG_UNAVAILABLE without ffmpeg and QUEUE_FULL when too many exports wait.",
+        "Start a video export of the project's shots (or of its frame range) on the server: rendered in the background and encoded with ffmpeg into an MP4 of the whole sequence, one frame-exact clip per shot, posters, a contact sheet, a manifest and optional control passes (depth, normal, mask, edges, pose). preset 'rideo' makes the clips rideo_push sends. Returns at once with the export id, frames_total and estimate_s: follow it with export_status (wait_s waits), stop it with cancel_export. Fails with FFMPEG_UNAVAILABLE without ffmpeg and QUEUE_FULL when too many exports wait.",
       annotations: EDIT,
     },
-    { project: projectArg, ...videoExportParamsShape },
+    { project: projectArg, ...exportVideoArgsShape },
     async ({ project, ...params }) => {
       const id = await ctx.agent.resolveProjectId(project);
       const job = await ctx.exports.start(id, params);

@@ -167,8 +167,15 @@ export interface ProcessMemory {
 export interface FrameMeta {
   /** The camera's world matrix (column-major) and vertical field of view in radians. */
   camera: { matrix: number[]; fovY: number };
-  /** Screen boxes of `DeskFrameOptions.subjects` in pixels (null: not in the frame). */
-  subjects: Record<string, { x: number; y: number; w: number; h: number; visible: boolean } | null>;
+  /**
+   * Screen boxes of `DeskFrameOptions.subjects` in pixels (null: not in the frame). A subject hidden
+   * by its scale at the frame (core `hiddenByScale`, as hide keys shrink it) has an empty box with
+   * `hidden: true` (never a collapsed point).
+   */
+  subjects: Record<
+    string,
+    { x: number; y: number; w: number; h: number; visible: boolean; hidden?: true } | null
+  >;
 }
 
 /** What a worker reports after preparing a path traced render (scene compiled, tracer built). */

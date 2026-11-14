@@ -32,7 +32,9 @@ import {
  * watchdog thread ends a busy one within a second when the server was killed (worker.ts).
  *
  * Renders lease threads, in two kinds:
- * - Long renders (path traced images, animations) lease every render thread (`size` processes).
+ * - Long renders (path traced images, animations) lease every render thread (`size` processes);
+ *   a video export leases as many as its memory allows (`lease(max)`), and the pool starts only
+ *   the processes the waiting long renders lease, not all `size` of them.
  *   Up to two of them run at once and share the threads: a thread works through the tasks (bands
  *   of rows, frames) of both in turn, so a second long render does not wait minutes for the first.
  *   Further long renders wait, first come first served.
@@ -798,6 +800,23 @@ export class RenderPool {
     return this.workers.size;
   }
 
+  /**
+   * Live render processes of long renders (started or starting; not the one kept for interactive
+   * renders): the ones a long lease of that many gets without starting another (video/exporter.ts
+   * asks them what they hold).
+   */
+  get runningLong(): number {
+    let n = 0;
+    for (const t of this.workers) if (t.role === 'bulk') n++;
+    return n;
+  }
+
+  /** Whether the render process kept for interactive renders runs (started or starting). */
+  get runningInteractive(): boolean {
+    for (const t of this.workers) if (t.role === 'interactive') return true;
+    return false;
+  }
+
   /** Long renders holding threads right now (at most MAX_SHARED_RENDERS). */
   get activeLongRenders(): number {
     return this.shared;
@@ -900,25 +919,23 @@ export class RenderPool {
     if (this.mode === 'main-thread') return this.main ? [this.main] : null;
     const want = Math.min(max, this.size);
     const usable: RenderThread[] = [];
-    let coming = 0;
-    for (const t of this.workers) {
-      if (t.role !== 'bulk') continue;
-      if (this.booting.has(t) || this.draining.has(t)) coming++;
-      else if (t.alive) usable.push(t);
-    }
-    // threads starting up (or finishing cancelled work) will be there in a moment: wait for them
-    // when they are wanted, and for the threads still to be started
-    if (usable.length < want && (coming > 0 || usable.length + coming < this.size)) return null;
-    if (!usable.length) return null;
+    for (const t of this.workers)
+      if (t.role === 'bulk' && t.alive && !this.booting.has(t) && !this.draining.has(t)) usable.push(t);
+    // fewer than wanted: the ones starting up (or finishing cancelled work) will be there in a
+    // moment, and ensureThreads starts the rest this lease needs (as many as the waiting long
+    // renders lease, not every render thread): wait for them
+    if (!usable.length || usable.length < want) return null;
     // free threads first, then the ones with fewer renders on them
     usable.sort((a, b) => (this.holders.get(a) ?? 0) - (this.holders.get(b) ?? 0));
     return usable.slice(0, want);
   }
 
   /**
-   * Starts the render processes waiting renders need: every render thread for a long render, the
-   * process kept for interactive renders (and idle render threads when several wait). Returns true
-   * when threads became available at once (main thread fallback).
+   * Starts the render processes waiting renders need: as many render threads as the long renders
+   * waiting lease (each its `max`, at most every render thread: an export that the memory allows
+   * one process starts one, not RENDER_WORKERS), the process kept for interactive renders (and
+   * idle render threads when several wait). Returns true when threads became available at once
+   * (main thread fallback).
    */
   private ensureThreads(): boolean {
     if (this.closed) return false;
@@ -929,8 +946,12 @@ export class RenderPool {
         if (t.role === 'bulk') bulk++;
         else interactive++;
       }
-      const quickWaiting = this.waiters.filter((w) => w.interactive).length;
-      let target = this.waiters.length > quickWaiting ? this.size : bulk;
+      let quickWaiting = 0;
+      let longWant = 0;
+      for (const w of this.waiters)
+        if (w.interactive) quickWaiting++;
+        else longWant = Math.max(longWant, Math.min(w.max, this.size));
+      let target = Math.max(bulk, longWant);
       if (quickWaiting) {
         if (!interactive) this.spawn('interactive');
         // more quick renders than threads that are free or about to be: idle render threads help

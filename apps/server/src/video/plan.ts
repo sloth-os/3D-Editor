@@ -102,7 +102,13 @@ export function planExport(doc: SceneDoc, params: VideoExportParams): ExportPlan
   const scene = doc.getScene();
   const sceneFps = scene.fps > 0 && Number.isFinite(scene.fps) ? scene.fps : 24;
   const fps = params.fps ?? sceneFps;
-  const { width, height } = exportSize(doc.getRender(), params.width, params.height);
+  // preset 'rideo': rideo's frame size, which rideo_import sets as the render resolution (at 100 %)
+  const render = doc.getRender();
+  const { width, height } = exportSize(
+    params.preset === 'rideo' ? { ...render, resolution_percentage: 100 } : render,
+    params.width,
+    params.height,
+  );
   const sceneCamera = cameraObject(doc, scene.camera);
   const all = getShots(doc);
   const rangeMode =

@@ -12,7 +12,7 @@ import {
   rigidBodyCacheInfo,
   type RigidBodyHost,
 } from '../src/physics/rigid-body';
-import { SIMULATION_BYTES_PER_KINEMATIC_FRAME } from '../src/physics/memory';
+import { SIMULATION_BYTES_PER_KINEMATIC_FRAME, documentSimulationBytes } from '../src/physics/memory';
 import { RELEASE_TRACKED_STEPS, delayedStartFrame, newRigidBody } from '../src/physics/settings';
 import { G, loc, physicsScene, range, rb, simulate } from './physics-helpers';
 
@@ -225,6 +225,33 @@ describe('a rigid body with a start frame', () => {
     expect(scene(50) - scene(null)).toBe(SIMULATION_BYTES_PER_KINEMATIC_FRAME * (RELEASE_TRACKED_STEPS + 1));
     // however late the release
     expect(scene(90)).toBe(scene(50));
+  });
+
+  it('estimates the matrices a delayed body records before its release as its cache counts them', () => {
+    /** The estimate before simulating (to frame 100 and to 40), and the cache after simulating to 100. */
+    const run = (start: number | null) => {
+      const s = physicsScene();
+      s.ground();
+      s.add('Box', s.cube(0.5), rb('ACTIVE', { start_frame: start }), { location: [0, 0, 1] });
+      s.add('Ball', s.cube(0.3), rb('ACTIVE', { start_frame: start === null ? null : start + 1 }), {
+        location: [2, 0, 1],
+      });
+      s.setWorld({ frame_start: 1, frame_end: 100 });
+      const estimate = documentSimulationBytes(s.doc, 100);
+      const early = documentSimulationBytes(s.doc, 40);
+      simulate(s.doc, range(1, 100));
+      return { estimate, early, cache: rigidBodyCacheBytes(s.doc) };
+    };
+    const none = run(null);
+    expect(none.estimate).toBe(none.cache);
+    for (const start of [2, 3, 50, 99]) {
+      const r = run(start);
+      // what the cache keeps once simulated, however near frame_start the releases are
+      expect(r.estimate, `start ${start}`).toBe(r.cache);
+      expect(r.estimate, `start ${start}`).toBeGreaterThan(none.estimate);
+    }
+    // to a frame before the releases: none of their records yet
+    expect(run(50).early).toBe(none.early);
   });
 
   it('reads the scene on a few frames for a release late in a long world, cold and after edits of its holder', () => {

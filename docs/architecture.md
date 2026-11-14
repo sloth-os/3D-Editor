@@ -433,8 +433,11 @@ the event loop:
   text and instances are not counted. A grid of 2,000,012 triangles with one level of Subdivision
   Surface for renders is refused in 0.3 s (about 3,281 MB); the modifier check below also applies
   there.
-- **Leasing.** Long renders (path-traced stills, animations) lease all render processes; up to two
-  of them share the processes, which alternate between their tasks, and further ones wait in order.
+- **Leasing.** Long renders (path-traced stills, animations) lease all render processes, a video
+  export as many as its memory allows (`video/memory.ts`); up to two of them share the processes,
+  which alternate between their tasks, and further ones wait in order. The pool starts only the
+  processes the waiting long renders lease (an export the memory allows one process starts one,
+  not `RENDER_WORKERS`).
   Quick raster renders lease one free process (the extra process or an idle one) and never wait for
   long renders; so do exports (MCP `export_scene` and the REST export), since a glTF export samples
   the animation frame by frame and bakes procedural textures, which takes seconds for large
@@ -911,7 +914,9 @@ velocity it had.
   `store.add` and `store.insert_files` in the project ([model-store.md](model-store.md)).
 - **rideo bridge** (`apps/server/src/rideo`): a client of rideo's REST API, the import
   (`desk.import_rideo_blocking` from rideo's documents), the push (blocking written back, clips
-  uploaded once per content, shots patched) and the previs jobs ([rideo.md](rideo.md)).
+  uploaded once per content, shots patched) and the previs jobs, each kept in
+  `DATA_DIR/rideo-previs` as it changes so that its status answers after a restart
+  ([rideo.md](rideo.md)).
 
 ## Persistence & sync
 

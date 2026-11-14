@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
-import type { StoreResult } from '@3d-editor/core';
 import { ToolError } from '../mcp/agent';
-import type { ProviderPage } from './providers/types';
+import type { ProviderModel, ProviderPage } from './providers/types';
 
 /*
  * Merging the pages of several providers into one page, and the opaque cursor of the next page.
@@ -74,9 +73,9 @@ export function mergePages(
   pages: ReadonlyMap<string, ProviderPage>,
   offsets: CursorOffsets,
   limit: number,
-): { results: StoreResult[]; offsets: CursorOffsets } {
+): { results: ProviderModel[]; offsets: CursorOffsets } {
   const taken = new Map<string, number>();
-  const results: StoreResult[] = [];
+  const results: ProviderModel[] = [];
   const seen = new Set<string>();
   while (results.length < limit) {
     let best: string | null = null;

@@ -423,12 +423,13 @@ describe('rideo keyframe helpers', () => {
         { from: 30, to: null },
       ],
     );
-    expect(at(doc, id, 'scale', 0, 1)).toBe(HIDDEN_SCALE);
-    expect(at(doc, id, 'scale', 2, 9)).toBe(HIDDEN_SCALE);
+    // shrunk to HIDDEN_SCALE of the scale it is shown at (2 here), shown again at that scale
+    expect(at(doc, id, 'scale', 0, 1)).toBe(2 * HIDDEN_SCALE);
+    expect(at(doc, id, 'scale', 2, 9)).toBe(2 * HIDDEN_SCALE);
     expect(at(doc, id, 'scale', 1, 10)).toBe(2);
     expect(at(doc, id, 'scale', 0, 29)).toBe(2);
-    expect(at(doc, id, 'scale', 0, 30)).toBe(HIDDEN_SCALE);
-    expect(at(doc, id, 'scale', 0, 1000)).toBe(HIDDEN_SCALE);
+    expect(at(doc, id, 'scale', 0, 30)).toBe(2 * HIDDEN_SCALE);
+    expect(at(doc, id, 'scale', 0, 1000)).toBe(2 * HIDDEN_SCALE);
     // the frames before a first span stay shown (no constant extrapolation of the hidden key)
     const other = cube();
     hideSpans(other.doc, other.id, [1, 1, 1], [{ from: 20, to: 30 }]);

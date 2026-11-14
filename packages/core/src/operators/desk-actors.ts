@@ -15,6 +15,7 @@ import {
 import { keyPose } from '../desk/characters/actor';
 import { holdObject, lookAtObject, mountActor } from '../desk/characters/attach';
 import { actorPosition } from '../desk/characters/locomotion';
+import { tetherDetachments } from '../desk/physics/tether';
 import { FrameState } from '../eval/frame-state';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
@@ -53,6 +54,40 @@ const named = (ctx: OperatorContext, id: string) => ({ object: id, name: ctx.doc
 
 /** The frame an operator acts at: the given one, else the current frame. */
 const frameOr = (ctx: OperatorContext, frame: number | undefined) => frame ?? ctx.state.frame;
+
+/** The most frames warnLeftStrings samples (about four a second, fewer in long scenes). */
+const LEFT_STRING_SAMPLES = 400;
+
+/**
+ * Warns about the strings of desk.tether_fly flights tied to `actor` that an edit of it from frame
+ * `from` on left behind: a flight keys its string where the anchor was at each of its frames, so an
+ * anchor moved, posed, mounted or given a prop afterwards no longer holds the string. Flying it
+ * again after the edit (the same options) ties it back on.
+ */
+function warnLeftStrings(ctx: OperatorContext, actor: string, from: number): void {
+  const scene = ctx.doc.getScene();
+  const end = Math.max(scene.frame_end, from);
+  const step = Math.max(
+    1,
+    Math.round(Math.max(1, scene.fps || 24) / 4),
+    Math.ceil((end - from) / (LEFT_STRING_SAMPLES - 1)),
+  );
+  const frames: number[] = [];
+  for (let f = from; f < end; f += step) frames.push(f);
+  frames.push(end);
+  const name = (id: string) => ctx.doc.getObject(id)?.name ?? id;
+  for (const d of tetherDetachments(ctx.doc, frames, { anchor: actor })) {
+    const first = d.frames[0];
+    const last = d.frames[d.frames.length - 1];
+    ctx.report(
+      'WARNING',
+      `The string of '${name(d.flyer)}' (desk.tether_fly) is no longer tied to ` +
+        `${d.bone ? `${name(actor)}'s ${d.bone}` : `'${name(actor)}'`}: it stays where the flight left it ` +
+        `(${last > first ? `frames ${first}–${last}` : `frame ${first}`}, up to ${d.gap.toFixed(2)} m away). ` +
+        'Run desk.tether_fly again (the same options) after this edit, so that the string follows',
+    );
+  }
+}
 
 const actorRef = z.string().describe('Actor (its armature object) id or exact name');
 const poseEnum = z
@@ -184,6 +219,7 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         refreshAttached(ctx.doc, id);
         // a part the gesture would put into the ground (a lying actor's head tipped back) is held back
         if (r.warning) ctx.report('WARNING', r.warning);
+        warnLeftStrings(ctx, id, Math.min(...r.frames, frame - p.blend_frames));
         return { ...named(ctx, id), pose: p.pose, frames: r.frames, layer: r.layer, held_back: r.held };
       },
     }),
@@ -233,6 +269,7 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           face_path: p.face_path,
           end_pose: p.end_pose,
         });
+        warnLeftStrings(ctx, id, p.frame_start);
         return { ...named(ctx, id), frame_end: r.frame_end, length_m: r.length_m };
       },
     }),
@@ -276,6 +313,7 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           frame: p.frame,
           turn_frames: p.turn_frames,
         });
+        warnLeftStrings(ctx, id, p.frame - p.turn_frames);
         const m = new FrameState(ctx.doc, p.frame).world(id)!;
         const facing = (Math.atan2(-m[4], m[5]) * 180) / Math.PI;
         return {
@@ -348,6 +386,7 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         });
         refreshAttached(ctx.doc, id);
         for (const w of r.warnings) ctx.report('WARNING', w);
+        warnLeftStrings(ctx, id, p.frame);
         return {
           ...named(ctx, id),
           prop: named(ctx, prop),
@@ -380,6 +419,7 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         const mountId = actorId(ctx, p.mount);
         const r = mountActor(ctx.doc, rider, mountId, { frame: p.frame, dismount_frame: p.dismount_frame });
         refreshAttached(ctx.doc, rider);
+        warnLeftStrings(ctx, rider, p.frame);
         return { rider: named(ctx, rider), mount: named(ctx, mountId), constraint: r.constraint };
       },
     }),

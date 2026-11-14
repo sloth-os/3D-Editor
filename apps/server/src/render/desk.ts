@@ -7,6 +7,7 @@ import {
   edgesToBytes,
   encodePNG,
   evaluatedBounds,
+  hiddenByScale,
   normalToRGB,
   renderItems,
   renderSceneSoftware,
@@ -50,6 +51,12 @@ import type {
  * and the per-pixel passes the export asked for; the passes, the strings drawn as lines, the actors'
  * skeletons, the camera and the subjects' screen boxes are computed here from the same evaluation,
  * so the server's event loop only writes bytes to ffmpeg.
+ *
+ * Objects hidden by their scale (core `hiddenByScale`: the scale-1e-8 keys of desk.tether_fly's
+ * after: 'hide' and of the rideo import, which also collapse their children) are not in the frame:
+ * no skeleton, no string line, no subject box (the subject reads `hidden`), and they count in none of
+ * a shot's measurements. Their collapsed triangles cover no pixel (the rasterizer drops them), so
+ * the per-pixel passes have none of them either.
  */
 
 /** Objects larger than this (m, horizontally) are grounds or sky domes: left out of shadow boxes. */
@@ -100,10 +107,13 @@ class Ancestry {
   }
 }
 
-/** World-space points of the polyline a string object runs along at this frame (none: empty). */
+/**
+ * World-space points of the polyline a string object runs along at this frame (none: empty, also
+ * when the string is hidden by its scale: a long one would still leave a dot of its line width).
+ */
 export function stringPoints(scene: EvaluatedScene, objectId: string): Vec3[] {
   const o = scene.byId.get(objectId);
-  if (!o || !o.renderVisible) return [];
+  if (!o || !o.renderVisible || hiddenByScale(o.worldMatrix)) return [];
   const local = o.mesh && o.mesh.positions.length >= 6 ? o.mesh.positions : o.lines;
   if (!local || local.length < 6) return [];
   return stringPolyline(worldPositions(local, o.worldMatrix));
@@ -185,6 +195,12 @@ export function deskAovs(passes: ReadonlySet<PassName>, strings: boolean): Softw
 }
 
 const toByte = (c: number): number => Math.max(0, Math.min(255, Math.round(c * 255)));
+
+/** Whether object `id` is hidden by its scale at the evaluated frame (unknown objects are not). */
+function hiddenObject(scene: EvaluatedScene, id: string): boolean {
+  const o = scene.byId.get(id);
+  return !!o && hiddenByScale(o.worldMatrix);
+}
 
 /**
  * Renders one desk frame: the beauty image (`data`, when asked for or for `png`), the passes and the
@@ -323,7 +339,9 @@ export function renderDeskFrame(
   }
   if (passes.has('pose')) {
     const rgb = new Uint8Array(n * 3);
-    const actors = desk.poseActors ?? [];
+    // an actor shrunk to a point by a hide key (and its parts with it) has no skeleton to draw: its
+    // keypoints would all fall on one point, a blot of joint colours where nobody stands
+    const actors = (desk.poseActors ?? []).filter((id) => !hiddenObject(scene, id));
     if (actors.length) {
       let fs: FrameState | null = null;
       for (const actor of actors) {
@@ -355,17 +373,28 @@ export function renderDeskFrame(
   if (subjects.length) {
     const ancestry = new Ancestry(scene);
     const builders = new Map(subjects.map((s) => [s, new ScreenBoxBuilder(proj)]));
-    const any = new Set<string>();
+    const shown = new Set<string>();
+    const hidden = new Set<string>();
     for (const item of drawn) {
       const mine = ancestry.ofItem(item).filter((a) => builders.has(a));
       if (!mine.length) continue;
+      // a part hidden by its scale is not seen: its collapsed vertices would make a 1 px box
+      if (hiddenByScale(item.worldMatrix)) {
+        for (const s of mine) hidden.add(s);
+        continue;
+      }
       const world = worldPositions(item.mesh.positions, item.worldMatrix);
       for (const s of mine) {
         builders.get(s)!.add(world);
-        any.add(s);
+        shown.add(s);
       }
     }
-    for (const s of subjects) meta.subjects[s] = any.has(s) ? builders.get(s)!.box() : null;
+    for (const s of subjects)
+      meta.subjects[s] = shown.has(s)
+        ? builders.get(s)!.box()
+        : hidden.has(s) || hiddenObject(scene, s)
+          ? { x: 0, y: 0, w: 0, h: 0, visible: false, hidden: true }
+          : null;
   }
 
   const result: ImageResult = { width: img?.width ?? width, height: img?.height ?? height, meta };
@@ -389,9 +418,9 @@ export function sampleShotFrames(frames: readonly number[], max = MAX_SHOT_SAMPL
  * frames (the nearest and farthest surface the camera sees, with margins), else from the rendered
  * bounds; the shadow box from the bounds of everything but huge objects, widened by the shadows'
  * reach; the ambient occlusion reach of the whole shot from what its first frame draws (core
- * `defaultAoRadius`, as the renderer would choose for that frame). The rigid body simulation is not
- * run for these samples (bodies at their animated places; the occlusion reach depends on sizes
- * only).
+ * `defaultAoRadius`, as the renderer would choose for that frame). Objects hidden by their scale
+ * count in none of these. The rigid body simulation is not run for these samples (bodies at their
+ * animated places; the occlusion reach depends on sizes only).
  */
 export function deskShotInfo(
   d: Pick<DeskDocument, 'doc' | 'evaluator'>,
@@ -417,8 +446,12 @@ export function deskShotInfo(
     clipStart = Math.max(1e-6, cam.camera.clip_start);
     clipEnd = Math.max(clipStart * 1.001, cam.camera.clip_end);
     const eye: Vec3 = [cam.worldMatrix[12], cam.worldMatrix[13], cam.worldMatrix[14]];
-    // what the renderer draws (renderSceneSoftware's items: render-visible meshes with faces)
-    const drawn = renderItems(scene, { forRender: true }).filter((item) => item.mesh.faces.length > 0);
+    // what the renderer draws (renderSceneSoftware's items: render-visible meshes with faces), but
+    // for what hide keys shrank to a point: it is not seen, and a kite put away high above the set
+    // would stretch the shadow box, or its tiny size shorten the occlusion reach
+    const drawn = renderItems(scene, { forRender: true }).filter(
+      (item) => item.mesh.faces.length > 0 && !hiddenByScale(item.worldMatrix),
+    );
     // the first sampled frame is the shot's first: one reach for every frame of the shot
     aoRadius ??= defaultAoRadius(drawn);
     for (const item of drawn) {

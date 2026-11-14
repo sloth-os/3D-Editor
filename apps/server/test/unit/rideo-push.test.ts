@@ -422,20 +422,50 @@ describe('rideo_push: default selection, modes and what rideo receives', () => {
     expect(h.mock.patches.map((p) => p.body.motionReference.mode)).toEqual(['camera', 'camera']);
   });
 
-  it('sends the beauty clip, with a warning, when the export lacks the pass of the mode', async () => {
+  it("fails a shot whose export lacks the clip of its mode's pass, and names the export to make", async () => {
+    // an export of beauty clips only (export_video's defaults): shot 2 is a pose reference
     const h = await harness({ passes: ['beauty'] });
     const r = await pushExport(h.env, h.params());
     expect(statuses(r).slice(0, 2)).toEqual([
       [h.rideoShots[0], 'pushed', 'motion', 'beauty'],
-      [h.rideoShots[1], 'pushed', 'pose', 'beauty'],
+      [h.rideoShots[1], 'failed', 'pose', 'pose'],
     ]);
-    expect(r.shots[1].warnings).toEqual([
-      'the export has no pose clip of this shot: the beauty clip was pushed instead',
-    ]);
-    expect(h.mock.uploads[1].file!.filename).toBe('shot-02-beauty.mp4');
+    // nothing in its place: a beauty clip set as a pose reference would carry what it is meant to leave out
+    expect(r.shots[1]).toMatchObject({
+      file: null,
+      resource: null,
+      error:
+        "the export has no pose clip of this shot, the pass a 'pose' reference sends: export_video {project: 'ours', preset: 'rideo'}, then push that export",
+    });
+    expect(h.mock.uploads.map((u) => u.file!.filename)).toEqual(['shot-01-beauty.mp4']);
+    expect(h.mock.patches.map((p) => p.shot)).toEqual([h.rideoShots[0]]);
+    expect(r.status).toBe('partial');
+    expect(r.warnings).toContain(
+      "1 shot(s) were not pushed: the export has no clip of the pass their reference mode sends (pose). Export them with export_video {project: 'ours', preset: 'rideo'} and push that export",
+    );
   });
 
-  it('fails a shot whose pass and beauty clip are both missing', async () => {
+  it("pushes nothing and reports failed when every shot's pass is missing (camera references of a beauty export)", async () => {
+    // rideo words every line otherwise: every reference is a camera reference, which sends depth
+    const h = await harness({ passes: ['beauty'] });
+    h.mock.setLines(
+      h.fx.ids.clip,
+      Object.fromEntries(h.rideoShots.map((s) => [s, `Blocking: ${s} elsewhere.`])),
+    );
+    const r = await pushExport(h.env, h.params());
+    expect(statuses(r).slice(0, 2)).toEqual([
+      [h.rideoShots[0], 'failed', 'camera', 'depth'],
+      [h.rideoShots[1], 'failed', 'camera', 'depth'],
+    ]);
+    expect(r.status).toBe('failed');
+    expect(h.mock.uploads).toHaveLength(0);
+    expect(h.mock.patches.filter((p) => p.body.motionReference)).toHaveLength(0);
+    expect(r.warnings).toContain(
+      "2 shot(s) were not pushed: the export has no clip of the pass their reference mode sends (depth). Export them with export_video {project: 'ours', preset: 'rideo'} and push that export",
+    );
+  });
+
+  it('fails a shot whose export lacks the pass asked for', async () => {
     const h = await harness({ passes: ['depth'] });
     const r = await pushExport(h.env, h.params({ shots: ['Shot 1'] }));
     expect(r.status).toBe('failed');
@@ -443,9 +473,31 @@ describe('rideo_push: default selection, modes and what rideo receives', () => {
       status: 'failed',
       pass: 'beauty',
       error:
-        "the export has no beauty clip of this shot (export it with outputs.clips and passes ['beauty'])",
+        "the export has no beauty clip of this shot, the pass a 'motion' reference sends: export_video {project: 'ours', preset: 'rideo'}, then push that export",
     });
+    const asked = await pushExport(h.env, h.params({ shots: ['Shot 1'], pass: 'normal' }));
+    expect(asked.shots[0]).toMatchObject({
+      status: 'failed',
+      pass: 'normal',
+      error:
+        "the export has no normal clip of this shot (pass 'normal' as asked): export it with outputs.clips and passes ['normal'], then push that export",
+    });
+    // a pass asked for that is missing is no reason to suggest the preset
+    expect(asked.warnings.join('\n')).not.toMatch(/preset/);
     expect(h.mock.uploads).toHaveLength(0);
+  });
+
+  it('warns when a beauty clip is not a clay render', async () => {
+    const h = await harness();
+    await h.writeManifest({ ...h.manifest, look: 'material' });
+    const r = await pushExport(h.env, h.params({ shots: ['Shot 1'] }));
+    expect(r.shots[0]).toMatchObject({ status: 'pushed', pass: 'beauty' });
+    expect(r.shots[0].warnings).toEqual([
+      "the beauty clip is in the 'material' look, which the video model may copy: rideo's references are clay renders that leave the look to the model (export_video {project: 'ours', preset: 'rideo'})",
+    ]);
+    // a depth or pose pass has no look
+    const pose = await pushExport(h.env, h.params({ shots: ['Shot 2'] }));
+    expect(pose.shots[0]).toMatchObject({ status: 'pushed', pass: 'pose', warnings: [] });
   });
 
   it("never replaces a 'performance' reference", async () => {

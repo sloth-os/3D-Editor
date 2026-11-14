@@ -109,6 +109,187 @@ function ownEntry<T>(rec: Readonly<Record<string, T>> | null | undefined, key: s
   return rec !== null && typeof rec === 'object' && Object.hasOwn(rec, key) ? rec[key] : undefined;
 }
 
+/** `v` as a vector: its first three numbers when they are finite, else `fallback` (reported unless `v` is absent). */
+function readVec(v: unknown, fallback: Vec3, what: string, error: (message: string) => void): Vec3 {
+  if (v === undefined || v === null) return [fallback[0], fallback[1], fallback[2]];
+  if (Array.isArray(v) && v.length >= 3) {
+    const [x, y, z] = v as unknown[];
+    if (
+      typeof x === 'number' &&
+      Number.isFinite(x) &&
+      typeof y === 'number' &&
+      Number.isFinite(y) &&
+      typeof z === 'number' &&
+      Number.isFinite(z)
+    )
+      return [x, y, z];
+  }
+  error(`${what} is not a valid vector; using [${fallback.join(', ')}]`);
+  return [fallback[0], fallback[1], fallback[2]];
+}
+
+/** A bone's rest frame, from the armature alone (see {@link Skeleton}). */
+interface RestBone {
+  /** The bone's position in the armature's `bones`. */
+  source: number;
+  name: string;
+  /** Its parent's position in the skeleton (parents first), −1 for a root. */
+  parent: number;
+  connected: boolean;
+  /** Effective rest head (the parent's tail for connected bones) and tail. */
+  head: Vec3;
+  tail: Vec3;
+  length: number;
+  rest: Mat4;
+  /** parentRest⁻¹ · rest (rest for roots). */
+  offset: Mat4;
+  /** Problems with the bone's own data, reported before those of its pose. */
+  errors: string[];
+}
+
+/**
+ * What a pose evaluation takes from the armature alone: its bones in parents-first order (depth
+ * first, bones in their stored order) with their rest frames, and the problems found with them
+ * (missing parents and parent cycles are dropped: the bone becomes a root). It is the same for
+ * every pose of an armature whose bones are unchanged, so it is kept per armature object (see
+ * {@link skeletonOf}); its arrays are shared by the evaluations that use it and never handed out.
+ */
+interface Skeleton {
+  bones: RestBone[];
+  /** Problems with the bones as a whole (names, parents), reported first. */
+  errors: string[];
+}
+
+function buildSkeleton(arm: ArmatureData): Skeleton {
+  const errors: string[] = [];
+  const stored = Array.isArray(arm.bones) ? arm.bones : [];
+  const list: { b: BoneData; source: number }[] = [];
+  const byName = new Map<string, BoneData>();
+  stored.forEach((b, source) => {
+    if (!b || typeof b.name !== 'string' || !b.name) {
+      errors.push('a bone without a name was ignored');
+      return;
+    }
+    if (byName.has(b.name)) {
+      errors.push(`duplicate bone name "${b.name}" ignored`);
+      return;
+    }
+    byName.set(b.name, b);
+    list.push({ b, source });
+  });
+  // parents: missing parents and cycles are dropped (the bone becomes a root)
+  const parentOf = new Map<string, string | null>();
+  for (const { b } of list) {
+    let p = typeof b.parent === 'string' && b.parent ? b.parent : null;
+    if (p === b.name || (p && !byName.has(p))) {
+      errors.push(`bone "${b.name}": parent "${p}" not found`);
+      p = null;
+    }
+    parentOf.set(b.name, p);
+  }
+  for (const { b } of list) {
+    const seen = new Set<string>();
+    let cur = parentOf.get(b.name) ?? null;
+    while (cur && !seen.has(cur)) {
+      if (cur === b.name) {
+        errors.push(`bone "${b.name}": parent cycle broken`);
+        parentOf.set(b.name, null);
+        break;
+      }
+      seen.add(cur);
+      cur = parentOf.get(cur) ?? null;
+    }
+  }
+  // parents-first order (depth first, bones in their stored order)
+  const children = new Map<string, { b: BoneData; source: number }[]>();
+  const roots: { b: BoneData; source: number }[] = [];
+  for (const e of list) {
+    const p = parentOf.get(e.b.name);
+    if (p) {
+      const c = children.get(p);
+      if (c) c.push(e);
+      else children.set(p, [e]);
+    } else roots.push(e);
+  }
+  const bones: RestBone[] = [];
+  const stack = [...roots].reverse().map((e) => ({ ...e, parent: -1 }));
+  while (stack.length) {
+    const { b, source, parent: pi } = stack.pop()!;
+    const parent = pi >= 0 ? bones[pi] : null;
+    const name = b.name;
+    const errs: string[] = [];
+    const report = (m: string) => errs.push(m);
+    const connected = !!b.use_connect && !!parent;
+    const head = connected
+      ? ([...parent!.tail] as Vec3)
+      : readVec(b.head, [0, 0, 0], `bone "${name}" head`, report);
+    const tail = readVec(b.tail, [0, 0, 1], `bone "${name}" tail`, report);
+    const fallbackDir: Vec3 = parent ? [parent.rest[4], parent.rest[5], parent.rest[6]] : [0, 1, 0];
+    const { matrix: rest, length } = boneRestMatrix(head, tail, finiteOr(b.roll, 0), fallbackDir);
+    if (!(length > 1e-9)) errs.push(`bone "${name}" has zero length`);
+    const offset = parent ? multiply4(invertRigid(parent.rest), rest) : rest;
+    const index = bones.length;
+    bones.push({ source, name, parent: pi, connected, head, tail, length, rest, offset, errors: errs });
+    const kids = children.get(name) ?? [];
+    for (let i = kids.length - 1; i >= 0; i--) stack.push({ ...kids[i], parent: index });
+  }
+  return { bones, errors };
+}
+
+/** The values of the bones of `arm` a skeleton is built from, in a fixed order (see forEachSkeletonInput). */
+function skeletonInputs(arm: ArmatureData): unknown[] {
+  const out: unknown[] = [];
+  forEachSkeletonInput(arm, (v) => {
+    out.push(v);
+    return true;
+  });
+  return out;
+}
+
+/**
+ * Calls `visit` with each value of the bones of `arm` a skeleton is built from (buildSkeleton reads
+ * these and nothing else), in a fixed order, while it returns true; false when it stopped early.
+ */
+function forEachSkeletonInput(arm: ArmatureData, visit: (v: unknown) => boolean): boolean {
+  const stored: unknown = arm.bones;
+  if (!Array.isArray(stored)) return visit(stored === undefined ? undefined : null);
+  if (!visit(stored.length)) return false;
+  for (const b of stored as (BoneData | null | undefined)[]) {
+    if (!b || typeof b !== 'object') {
+      if (!visit(b)) return false;
+      continue;
+    }
+    if (!visit(b.name) || !visit(b.parent) || !visit(b.use_connect) || !visit(b.roll)) return false;
+    for (const v of [b.head, b.tail] as unknown[]) {
+      if (!Array.isArray(v)) {
+        if (!visit(v)) return false;
+      } else if (!visit(v.length) || !visit(v[0]) || !visit(v[1]) || !visit(v[2])) return false;
+    }
+  }
+  return true;
+}
+
+/** Skeletons by armature object, with the values they were built from (see {@link skeletonOf}). */
+const skeletons = new WeakMap<ArmatureData, { inputs: unknown[]; skeleton: Skeleton }>();
+
+/**
+ * The skeleton of `arm`: built once per armature object and kept while its bones hold the values it
+ * was built from (checked value by value at every evaluation, so a bone changed in place builds it
+ * again), as the many poses of one armature a move computes share it.
+ */
+function skeletonOf(arm: ArmatureData): Skeleton {
+  if (typeof arm !== 'object' || arm === null) return buildSkeleton(arm);
+  const hit = skeletons.get(arm);
+  if (hit) {
+    let i = 0;
+    const same = forEachSkeletonInput(arm, (v) => Object.is(v, hit.inputs[i++]));
+    if (same && i === hit.inputs.length) return hit.skeleton;
+  }
+  const skeleton = buildSkeleton(arm);
+  skeletons.set(arm, { inputs: skeletonInputs(arm), skeleton });
+  return skeleton;
+}
+
 class PoseEvaluator implements PoseEvaluation {
   readonly errors: string[] = [];
   private readonly errorSet = new Set<string>();
@@ -157,87 +338,25 @@ class PoseEvaluator implements PoseEvaluation {
   }
 
   private vec(v: unknown, fallback: Vec3, what: string): Vec3 {
-    if (v === undefined || v === null) return [fallback[0], fallback[1], fallback[2]];
-    if (
-      Array.isArray(v) &&
-      v.length >= 3 &&
-      v.slice(0, 3).every((x) => typeof x === 'number' && Number.isFinite(x))
-    )
-      return [v[0], v[1], v[2]];
-    this.error(`${what} is not a valid vector; using [${fallback.join(', ')}]`);
-    return [fallback[0], fallback[1], fallback[2]];
+    return readVec(v, fallback, what, (m) => this.error(m));
   }
 
   private build(arm: ArmatureData, pose: Record<string, PoseBone>): void {
-    const list: BoneData[] = [];
-    const byName = new Map<string, BoneData>();
-    for (const b of Array.isArray(arm.bones) ? arm.bones : []) {
-      if (!b || typeof b.name !== 'string' || !b.name) {
-        this.error('a bone without a name was ignored');
-        continue;
-      }
-      if (byName.has(b.name)) {
-        this.error(`duplicate bone name "${b.name}" ignored`);
-        continue;
-      }
-      byName.set(b.name, b);
-      list.push(b);
-    }
-    // parents: missing parents and cycles are dropped (the bone becomes a root)
-    const parentOf = new Map<string, string | null>();
-    for (const b of list) {
-      let p = typeof b.parent === 'string' && b.parent ? b.parent : null;
-      if (p === b.name || (p && !byName.has(p))) {
-        this.error(`bone "${b.name}": parent "${p}" not found`);
-        p = null;
-      }
-      parentOf.set(b.name, p);
-    }
-    for (const b of list) {
-      const seen = new Set<string>();
-      let cur = parentOf.get(b.name) ?? null;
-      while (cur && !seen.has(cur)) {
-        if (cur === b.name) {
-          this.error(`bone "${b.name}": parent cycle broken`);
-          parentOf.set(b.name, null);
-          break;
-        }
-        seen.add(cur);
-        cur = parentOf.get(cur) ?? null;
-      }
-    }
-    // parents-first order (depth first, bones in their stored order)
-    const children = new Map<string, BoneData[]>();
-    const roots: BoneData[] = [];
-    for (const b of list) {
-      const p = parentOf.get(b.name);
-      if (p) {
-        const c = children.get(p);
-        if (c) c.push(b);
-        else children.set(p, [b]);
-      } else roots.push(b);
-    }
-    const stack = [...roots].reverse().map((b) => ({ b, parent: null as Node | null }));
-    while (stack.length) {
-      const { b, parent } = stack.pop()!;
-      const node = this.makeNode(b, parent, ownEntry(pose, b.name));
-      this.nodes.set(b.name, node);
+    const skeleton = skeletonOf(arm);
+    for (const e of skeleton.errors) this.error(e);
+    const stored = Array.isArray(arm.bones) ? arm.bones : [];
+    for (const r of skeleton.bones) {
+      for (const e of r.errors) this.error(e);
+      const parent = r.parent >= 0 ? this.order[r.parent] : null;
+      const node = this.makeNode(r, stored[r.source], parent, ownEntry(pose, r.name));
+      this.nodes.set(r.name, node);
       this.order.push(node);
-      const kids = children.get(b.name) ?? [];
-      for (let i = kids.length - 1; i >= 0; i--) stack.push({ b: kids[i], parent: node });
     }
   }
 
-  private makeNode(b: BoneData, parent: Node | null, pb: PoseBone | undefined): Node {
-    const name = b.name;
-    const connected = !!b.use_connect && !!parent;
-    const head = connected ? ([...parent!.tail] as Vec3) : this.vec(b.head, [0, 0, 0], `bone "${name}" head`);
-    const tail = this.vec(b.tail, [0, 0, 1], `bone "${name}" tail`);
-    const fallbackDir: Vec3 = parent ? [parent.rest[4], parent.rest[5], parent.rest[6]] : [0, 1, 0];
-    const { matrix: rest, length } = boneRestMatrix(head, tail, finiteOr(b.roll, 0), fallbackDir);
-    if (!(length > 1e-9)) this.error(`bone "${name}" has zero length`);
-    const offset = parent ? multiply4(invertRigid(parent.rest), rest) : rest;
-    const loc = connected ? [0, 0, 0] : this.vec(pb?.location, [0, 0, 0], `pose bone "${name}" location`);
+  private makeNode(r: RestBone, b: BoneData, parent: Node | null, pb: PoseBone | undefined): Node {
+    const name = r.name;
+    const loc = r.connected ? [0, 0, 0] : this.vec(pb?.location, [0, 0, 0], `pose bone "${name}" location`);
     const rot = this.vec(pb?.rotation_euler, [0, 0, 0], `pose bone "${name}" rotation_euler`);
     const scl = this.vec(pb?.scale, [1, 1, 1], `pose bone "${name}" scale`);
     const constraints: ConstraintData[] = [];
@@ -253,11 +372,11 @@ class PoseEvaluator implements PoseEvaluation {
       name,
       bone: b,
       parent,
-      head,
-      tail,
-      length,
-      rest,
-      offset,
+      head: r.head,
+      tail: r.tail,
+      length: r.length,
+      rest: r.rest,
+      offset: r.offset,
       basis: compose4(loc as Vec3, rot, scl),
       constraints,
       ik: ikSettingsOf(pb, (m) => this.error(`pose bone "${name}": ${m}`)),
@@ -324,7 +443,7 @@ class PoseEvaluator implements PoseEvaluation {
     const cached = this.plainM[node.index];
     if (cached) return cached;
     const m = this.restPosition
-      ? node.rest
+      ? node.rest.slice()
       : multiply4(node.parent ? multiply4(this.plain(node.parent), node.offset) : node.rest, node.basis);
     this.plainM[node.index] = m;
     return m;
@@ -341,7 +460,7 @@ class PoseEvaluator implements PoseEvaluation {
     }
     if (this.restPosition) {
       this.state[node.index] = DONE;
-      return (this.final[node.index] = node.rest);
+      return (this.final[node.index] = node.rest.slice());
     }
     this.depth++;
     try {
@@ -390,7 +509,7 @@ class PoseEvaluator implements PoseEvaluation {
    */
   private peekMatrix(node: Node): Mat4 {
     if (this.state[node.index] === DONE) return this.final[node.index]!;
-    if (this.restPosition) return node.rest;
+    if (this.restPosition) return node.rest.slice();
     const frame = node.parent ? multiply4(this.peekMatrix(node.parent), node.offset) : node.rest;
     return multiply4(frame, node.basis);
   }
@@ -550,13 +669,13 @@ class PoseEvaluator implements PoseEvaluation {
       bones.set(n.name, {
         name: n.name,
         parent: n.parent?.name ?? null,
-        rest: n.rest,
+        rest: n.rest.slice(),
         matrix: m,
         length: n.length,
         head: originOf(m),
         tail: tailOf(m, n.length),
-        restHead: n.head,
-        restTail: n.tail,
+        restHead: [n.head[0], n.head[1], n.head[2]],
+        restTail: [n.tail[0], n.tail[1], n.tail[2]],
         deform: b.use_deform !== false,
         envelope: {
           distance: Math.max(0, finiteOr(b.envelope_distance, 0.25)),

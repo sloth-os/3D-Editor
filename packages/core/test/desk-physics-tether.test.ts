@@ -276,6 +276,27 @@ describe('desk.tether_fly', () => {
     expect(t.doc.listObjects()).toHaveLength(count);
   });
 
+  it('measures a store kite without its own tail: in a calm it lies on its sail, not standing on its tail', () => {
+    const s = deskScene();
+    const kite = s.run('store.add', { model: 'diamond_kite', location: [0.6, 0, 0.05], name: 'Kite' });
+    s.empty('Hand', [0, 0, 1.2]);
+    s.run('desk.tether_fly', { ...FLY, wind_mps: 0, frame_start: 1, frame_end: 120 });
+    const lowest = (name: string) => {
+      const id = (kite.objects as string[]).find((o) => s.doc.getObject(o)!.name === name)!;
+      const [m] = flight(s.doc, [id], [120]);
+      const w = m.get(id)!;
+      const positions = s.doc.getMesh(s.doc.getObject(id)!.data!)!.positions;
+      let low = Infinity;
+      for (let i = 0; i + 2 < positions.length; i += 3)
+        low = Math.min(low, transformPoint(w, [positions[i], positions[i + 1], positions[i + 2]])[2]);
+      return low;
+    };
+    // the sail and its spars come down to the ground (the 1.3 m tail hanging under them is no stilt)
+    expect(lowest('sail')).toBeGreaterThan(-1e-6);
+    expect(lowest('sail')).toBeLessThan(0.05);
+    expect(lowest('spars')).toBeLessThan(0.05);
+  });
+
   it('refuses an anchor bone on an object that is not an armature, and a reversed range', () => {
     const t = kiteScene();
     expect(

@@ -272,8 +272,9 @@ describe('rideo import: a dialogue in shot / reverse shot', () => {
     });
     const base = doc.getObject(cup)!.scale;
     for (const f of [10, 100, 150, 300]) near(scaleAt(doc, cup, f), base, 1e-9, `cup shown at ${f}`);
+    // hidden: shrunk to RIDEO_HIDDEN_SCALE of the scale it is shown at
     for (const f of [200, 264, 400])
-      expect(scaleAt(doc, cup, f)[0], `cup hidden at ${f}`).toBe(RIDEO_HIDDEN_SCALE);
+      expect(scaleAt(doc, cup, f)[0], `cup hidden at ${f}`).toBe(base[0] * RIDEO_HIDDEN_SCALE);
     const hand = new FrameState(doc, 40).boneMatrix(leo, 'hand.R')!.matrix;
     near(originAt(doc, cup, 40), [hand[12], hand[13], hand[14]], 0.25, 'cup in the hand');
   });
@@ -474,7 +475,7 @@ describe('rideo import: a kite on a windy hill', () => {
       expect(Math.hypot(at[0] - hand[12], at[1] - hand[13], at[2] - hand[14])).toBeLessThan(7.2 + 0.6);
     }
     for (const f of [100, 156]) {
-      expect(scaleAt(doc, kite, f)[0], `kite hidden at ${f}`).toBe(RIDEO_HIDDEN_SCALE);
+      expect(scaleAt(doc, kite, f)[0], `kite hidden at ${f}`).toBe(base[0] * RIDEO_HIDDEN_SCALE);
       expect(scaleAt(doc, string, f)[0], `string hidden at ${f}`).toBeLessThan(1e-6);
     }
     // after Sam's last shot the flight puts it away
@@ -609,7 +610,7 @@ describe('rideo import: states, re-import and the operator', () => {
     expect(second.props.map((p) => [p.id, p.created])).toEqual([[cup, false]]);
     expect(doc.getObject(cup)!.rigid_body?.type).toBe('ACTIVE');
     expect(second.holds).toEqual(first.holds);
-    expect(scaleAt(doc, cup, 200)[0]).toBe(RIDEO_HIDDEN_SCALE);
+    expect(scaleAt(doc, cup, 200)[0]).toBe(doc.getObject(cup)!.scale[0] * RIDEO_HIDDEN_SCALE);
     const leo = actorOf(second, LEO);
     const hand = new FrameState(doc, 40).boneMatrix(leo, 'hand.R')!.matrix;
     near(originAt(doc, cup, 40), [hand[12], hand[13], hand[14]], 0.25, 'cup in the hand');

@@ -761,4 +761,36 @@ describe('builtin', () => {
     expect(await codeOf(p.plan('chair-a', env))).toBe('INVALID_PARAMS');
     expect(await p.thumbnail('chair-a', env)).toBeNull();
   });
+
+  it('lists the parameters of the models that take any in their search results', async () => {
+    const { env } = envOf({});
+    const p: ModelProvider = new BuiltinProvider(catalog);
+    const page = await p.search(query('chair', { limit: 3 }), env);
+    expect(page.hits[0].model.params).toMatchObject({ legs: { type: 'integer', description: 'Legs' } });
+    expect(page.hits[1].model).not.toHaveProperty('params');
+  });
+
+  it("checks a model's own parameters by its schema (strict), naming what it takes", () => {
+    const p = new BuiltinProvider(catalog);
+    const refusal = (id: string, params: Record<string, unknown>) => {
+      try {
+        p.checkParams(id, params);
+      } catch (err) {
+        expect(err).toBeInstanceOf(ToolError);
+        expect((err as ToolError).code).toBe('INVALID_PARAMS');
+        return (err as ToolError).message;
+      }
+      return null;
+    };
+    expect(refusal('chair-a', { legs: 3 })).toBeNull();
+    // the schema decides what is required (the catalog's models give every parameter a default)
+    expect(refusal('chair-a', {})).toMatch(/^Invalid params for builtin:chair-a: legs: /);
+    expect(refusal('chair-a', { legs: 2.5 })).toMatch(
+      /^Invalid params for builtin:chair-a: legs: .+\. It takes: legs \(integer\): Legs$/,
+    );
+    expect(refusal('chair-a', { legs: 3, colour: 'red' })).toMatch(/colour/);
+    expect(refusal('chair-b', { legs: 3 })).toBe('builtin:chair-b takes no params (got legs)');
+    expect(refusal('chair-b', {})).toBeNull();
+    expect(() => p.checkParams('nope', {})).toThrow(/No built-in model 'nope'/);
+  });
 });

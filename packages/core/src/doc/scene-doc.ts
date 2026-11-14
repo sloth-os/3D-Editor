@@ -458,9 +458,23 @@ export class SceneDoc {
     });
   }
 
-  /** Objects whose `parent` is `id` (or root objects when id is null). */
+  /** Objects whose `parent` is `id` (or root objects when id is null), by name as listObjects orders them. */
   childrenOf(id: string | null): ObjectData[] {
-    return this.listObjects().filter((o) => o.parent === id);
+    return this.childIds(id).map((c) => this.getObject(c)!);
+  }
+
+  /**
+   * The ids of the objects whose `parent` is `id` (null: the root objects), by name as
+   * {@link listObjects} orders them. Reads two stored fields of each object, not the objects: the
+   * desk looks up an actor's parts for every frame it measures it at.
+   */
+  childIds(id: string | null): string[] {
+    const rows: { id: string; name: string }[] = [];
+    for (const [key, y] of this.map('objects').entries()) {
+      const m = y as Y.Map<any>;
+      if ((m.get('parent') ?? null) === id) rows.push({ id: key, name: String(m.get('name') ?? '') });
+    }
+    return rows.sort((a, b) => a.name.localeCompare(b.name)).map((r) => r.id);
   }
 
   /** Number of objects using a data block. */
@@ -478,11 +492,18 @@ export class SceneDoc {
    * moment it was read.
    */
   childrenIndex(): Map<string | null, string[]> {
+    // the parent and name of each object, not copies of the objects (see childIds)
+    const rows: { id: string; parent: string | null; name: string }[] = [];
+    for (const [key, y] of this.map('objects').entries()) {
+      const m = y as Y.Map<any>;
+      rows.push({ id: key, parent: m.get('parent') ?? null, name: String(m.get('name') ?? '') });
+    }
+    rows.sort((a, b) => a.name.localeCompare(b.name));
     const out = new Map<string | null, string[]>();
-    for (const o of this.listObjects()) {
-      const list = out.get(o.parent);
-      if (list) list.push(o.id);
-      else out.set(o.parent, [o.id]);
+    for (const r of rows) {
+      const list = out.get(r.parent);
+      if (list) list.push(r.id);
+      else out.set(r.parent, [r.id]);
     }
     return out;
   }

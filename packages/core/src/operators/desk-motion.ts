@@ -14,6 +14,7 @@ import {
   deskVehicleDrive,
   type DeskWorldRange,
 } from '../desk/physics';
+import { attachSpans } from '../desk/characters/attach';
 import { COLLISION_SHAPES } from '../physics/settings';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
@@ -28,8 +29,8 @@ import { pollObjectMode, resolveObjectIds, setSelection, vec3 } from './helpers'
  *   desk.physics_throw    launch an object to land on a point or object after flight_s
  *   desk.physics_push     push an object along a direction at a frame
  *   desk.physics_bake     bake the simulation to keyframes
- *   desk.tether_fly       fly a kite or balloon on a string from an anchor (phase 2)
- *   desk.vehicle_drive    drive a vehicle along a path, wheels spinning, steering (phase 2)
+ *   desk.tether_fly       fly a kite or balloon on a string from an anchor
+ *   desk.vehicle_drive    drive a vehicle along a path, wheels spinning, steering
  *
  * Bodies start at their RigidBodyData.start_frame with initial velocities (doc/types.ts); the
  * library is desk/physics. Object references are ids or exact names; results give ids and names.
@@ -38,6 +39,22 @@ import { pollObjectMode, resolveObjectIds, setSelection, vec3 } from './helpers'
 /** Resolves one object reference (id or exact name) to its id. */
 function objectId(ctx: OperatorContext, ref: string): string {
   return resolveObjectIds(ctx, [ref])[0];
+}
+
+/**
+ * The actor holding `id` (or the store model it is part of) at `frame` by a desk.actor_hold, and
+ * where it lets go (Infinity: never); null when nobody holds it then.
+ */
+function holderAt(
+  ctx: OperatorContext,
+  id: string,
+  frame: number,
+): { actor: string; bone: string; release: number } | null {
+  for (const x of new Set([id, deskModelRoot(ctx.doc, id)?.id ?? id]))
+    for (const s of attachSpans(ctx.doc, x, 'Hold '))
+      if (s.constraint.target && s.grab <= frame + 1e-3 && frame <= s.release + 1e-3)
+        return { actor: s.constraint.target, bone: s.constraint.subtarget, release: s.release };
+  return null;
 }
 
 /** An object as results name it. */
@@ -185,7 +202,8 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         'Release an object at `frame` with the launch velocity that lands it on `target` after flight_s seconds ' +
         'under gravity (its rigid body starts there with that velocity and spin). ' +
         MODEL_NOTE +
-        ' Returns {body, velocity, speed_mps, landing_frame, world}.',
+        ' Returns {body, thrown_by, velocity, speed_mps, landing_frame, world}: thrown_by, the actor holding it ' +
+        'at `frame` (desk.actor_hold), whose throw it does not key (pose it first).',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -206,8 +224,27 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
           spin: p.spin,
         });
         const world = finish(ctx, r);
+        // thrown from a hand: the throw is the arm's, which the preset does not key
+        const holder = holderAt(ctx, id, p.frame);
+        if (holder) {
+          const actor = ctx.doc.getObject(holder.actor)?.name ?? holder.actor;
+          const thing = ctx.doc.getObject(id)?.name ?? id;
+          const letGo =
+            holder.release > p.frame + 1e-3
+              ? ` ${actor} holds it on ${Number.isFinite(holder.release) ? `until frame ${holder.release}` : 'for good'}: ` +
+                `let go at the throw (desk.actor_hold release_frame: ${p.frame}) so that the arm comes down.`
+              : '';
+          ctx.report(
+            'WARNING',
+            `'${thing}' leaves ${actor}'s ${holder.bone || 'hand'} at frame ${p.frame}, but nothing keys the throw: ` +
+              `unless ${actor} already throws there, pose it (desk.actor_pose {actor: '${actor}', pose: 'throw', ` +
+              `frame: ${p.frame}, layer: 'upper'}) and run desk.physics_throw again, so that it leaves from the ` +
+              `throwing hand.${letGo}`,
+          );
+        }
         return {
           body: bodyNamed(ctx, r.body),
+          thrown_by: holder ? named(ctx, holder.actor) : null,
           velocity: round3(r.velocity),
           speed_mps: Math.round(Math.hypot(...r.velocity) * 1000) / 1000,
           landing_frame: Math.round(r.landing_frame * 1000) / 1000,
@@ -296,7 +333,7 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       id: 'desk.tether_fly',
       label: 'Fly on a String',
       description:
-        "Fly a kite or balloon on a string tied to an anchor (an actor's hand bone, a post) in the wind (phase 2): " +
+        "Fly a kite or balloon on a string tied to an anchor (an actor's hand bone, a post) in the wind: " +
         'it rises over launch_frames to the end of the string, then sways, keyed on every frame, with a string ' +
         'from the anchor and a tail that trails. After frame_end (`after`) it stays where the flight ends, is ' +
         'hidden with its tail and string, or (a kite) comes down to lie on the ground. Returns {flyer, kind, ' +
@@ -343,7 +380,9 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
             "After frame_end: 'hold' leaves the flyer, its tail and string where the flight ends; 'hide' hides them " +
               'from frame_end + 1 on (their keyed scale shrinks them to nothing: renders, the viewport and the ' +
               "video export show none of them; a later flight shows the flyer again); 'land' brings a kite down " +
-              'within 1.5 s to lie on the ground downwind of the anchor, its string hidden (not for balloons)',
+              '(1.6 times as long as a stone dropped from its height, at least 1.5 s) to lie on the ground ' +
+              'downwind of the anchor, its string hidden (not for balloons). Flights of the same flyer over other ' +
+              'frames keep their keys; one flown over an earlier one replaces it from its frame_start on',
           ),
       }),
       execute(ctx, p) {
@@ -375,8 +414,8 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       id: 'desk.vehicle_drive',
       label: 'Drive Vehicle',
       description:
-        'Drive a vehicle (a store model with body, wheel.* and steer.* parts) along a path from frame_start (phase ' +
-        '2): the vehicle keyed along the path, its wheels spinning with the distance and its front wheels steering ' +
+        'Drive a vehicle (a store model with body, wheel.* and steer.* parts) along a path from frame_start: the ' +
+        'vehicle keyed along the path, its wheels spinning with the distance and its front wheels steering ' +
         'into the turns. Give speed_mps or frame_end. Returns {vehicle, frame_start, frame_end, length_m, ' +
         'speed_mps, wheels, steering, keyframes}.',
       category: 'Desk',

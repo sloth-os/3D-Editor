@@ -10,6 +10,8 @@ import { RigidBodySimulator } from '../physics/rigid-body';
 import { sanitizeRigidBodyWorld } from '../physics/settings';
 import { sunDirection } from '../render/sky';
 import { HUMANOID_KINDS, actorInfo, isActor, type ActorKind } from './characters';
+import { RIDE_PREFIX } from './characters/rig';
+import { collapsedBox, hiddenByScale, maybeCollapsed } from './hide';
 import { DESK_PROPS } from './props';
 import { getDeskSettings } from './shots';
 
@@ -302,6 +304,13 @@ export interface DeskSubject {
    * its flight). It is measured where it is, as every prop is: its feet are the bottom of its bounds.
    */
   airborne: boolean;
+  /**
+   * Put away at this frame: its world matrix collapsed by a hide key (hide.ts hiddenByScale; a kite
+   * after desk.tether_fly's after: 'hide', an actor the rideo import hides in shots it is not cast
+   * in), so nothing of it shows. Its points are where it was put away; the solver and the checks
+   * leave it out at such frames.
+   */
+  hidden: boolean;
 }
 
 /** A camera at one frame: its basis (no roll for the desk's cameras) and the tangents of its half field of view. */
@@ -548,15 +557,41 @@ export class DeskScene {
   }
 
   /**
+   * Whether object `id` is put away at `frame` by a hide key (its own or its parents'): its world
+   * matrix may be collapsed (hide.ts maybeCollapsed) and its geometry, as {@link bounds} gathers it,
+   * is less than a micrometre across (collapsedBox), which tells a store model in very large units
+   * shown a few centimetres across, at a tiny world scale, from one put away. Without geometry, its
+   * world matrix alone decides (hiddenByScale).
+   */
+  hidden(id: string, frame: number): boolean {
+    if (this.shared(id)) return this.reading.hidden(id, frame);
+    const world = this.world(id, frame);
+    if (!maybeCollapsed(world)) return false;
+    const box = emptyBox();
+    this.eachMesh(id, frame, (local, m) => growByCorners(box, local, m));
+    return boxEmpty(box) ? hiddenByScale(world) : collapsedBox(box);
+  }
+
+  /**
+   * The objects of `ids` that are here (not gone) and, while any of them is, shown at `frame` (not
+   * put away by a hide key): a group a camera follows or frames leaves its hidden members out.
+   */
+  private shownOf(ids: readonly string[], frame: number): string[] {
+    const here = ids.filter((id) => this.objects.has(id));
+    const shown = here.filter((id) => !this.hidden(id, frame));
+    return shown.length ? shown : here;
+  }
+
+  /**
    * Where a group of objects is at `frame` (the point following moves follow): across the floor the
    * mean of their origins (a ball rolling ahead of a dog pulls the camera along); in height the mean
    * of its actors' origins when it has actors, else of all of them, so a prop never lifts or drops
    * the camera that follows actors (a bouncing ball, a carried basket, a kite: they move it across
-   * the floor only). One object's is its origin. Ids of objects that are gone are left out; null for
-   * none.
+   * the floor only). One object's is its origin. Ids of objects that are gone are left out, and those
+   * put away at `frame` (hidden) while others are shown; null for none.
    */
   groupCentre(ids: readonly string[], frame: number): Vec3 | null {
-    const here = ids.filter((id) => this.objects.has(id));
+    const here = this.shownOf(ids, frame);
     if (here.length === 1) return this.origin(here[0], frame);
     if (!here.length) return null;
     const actors = here.filter((id) => this.isActor(id));
@@ -578,7 +613,8 @@ export class DeskScene {
    * facing of its actors (their mean; the first one's when they face every way at once), so a prop's
    * spin never turns the camera; a group without actors heads where it travels from HEADING_WINDOW_S
    * before `frame` to as long after it (within `span`), else where it travels over the span, else
-   * nowhere new (−Y: the camera does not turn). Ids of objects that are gone are left out.
+   * nowhere new (−Y: the camera does not turn). Ids of objects that are gone are left out, and actors
+   * put away at `frame` (hidden) while others are shown.
    */
   groupHeading(
     ids: readonly string[],
@@ -586,7 +622,10 @@ export class DeskScene {
     span: { frame_start: number; frame_end: number },
   ): Vec3 {
     const here = ids.filter((id) => this.objects.has(id));
-    const actors = here.filter((id) => this.isActor(id));
+    const actors = this.shownOf(
+      here.filter((id) => this.isActor(id)),
+      frame,
+    );
     if (actors.length) {
       if (actors.length === 1) return this.facing(actors[0], frame);
       const sum = actors.map((id) => this.facing(id, frame)).reduce(v3add, [0, 0, 0] as Vec3);
@@ -621,6 +660,30 @@ export class DeskScene {
       this.childList = map;
     }
     return this.childList.get(id) ?? [];
+  }
+
+  /**
+   * The actor that actor `id` rides at `frame`: the target of a 'Ride …' CHILD_OF on it (CHARACTERS'
+   * desk.actor_mount seats a rider on its mount's saddle) holding it then (unmuted, influence at
+   * least ½), or null.
+   */
+  mountOf(id: string, frame: number): string | null {
+    if (this.shared(id)) return this.reading.mountOf(id, frame);
+    const rides = (cs: ObjectData['constraints'] | undefined) =>
+      (cs ?? []).filter((c) => c.type === 'CHILD_OF' && c.name.startsWith(RIDE_PREFIX) && !!c.target);
+    const o = this.objects.get(id);
+    if (!rides(o?.constraints).length) return null;
+    // the influence of a ride is keyed (it seats and dismounts): read as evaluated at the frame
+    const evaluated = this.frameState(frame).get<ObjectData>('object', id) ?? o;
+    const ride = rides(evaluated?.constraints).find(
+      (c) => !c.mute && (c.influence ?? 1) >= 0.5 && this.objects.has(c.target!),
+    );
+    return ride ? ride.target! : null;
+  }
+
+  /** Whether one of actors `a` and `b` rides the other at `frame` (a rider and her mount move as one). */
+  rideTogether(a: string, b: string, frame: number): boolean {
+    return this.mountOf(a, frame) === b || this.mountOf(b, frame) === a;
   }
 
   /** Whether object `id` is an actor (desk_role 'actor'; armatures built by CHARACTERS and stand-ins). */
@@ -807,6 +870,7 @@ export class DeskScene {
     const o = this.objects.get(id);
     if (!o) return null;
     const actor = deskProp(o, DESK_PROPS.role) === 'actor';
+    const hidden = this.hidden(id, frame);
     if (actor && isActor(this.doc, id)) {
       try {
         const info = actorInfo(this.frameState(frame), this.doc, id);
@@ -836,6 +900,7 @@ export class DeskScene {
             animal,
             extent: animal ? this.extentAlong(id, frame, facing, bounds) : null,
             airborne: false,
+            hidden,
           };
         }
       } catch {
@@ -868,6 +933,7 @@ export class DeskScene {
         animal,
         extent: animal ? this.extentAlong(id, frame, facing, bounds) : null,
         airborne: false,
+        hidden,
       };
     }
     const height = Math.max(0, bounds.max[2] - bounds.min[2]);
@@ -888,6 +954,7 @@ export class DeskScene {
       animal: false,
       extent: null,
       airborne: feet[2] - this.floorUnder(id, feet, frame) > AIRBORNE_M,
+      hidden,
     };
   }
 

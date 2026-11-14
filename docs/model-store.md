@@ -59,8 +59,11 @@ with an EMPTY root and named parts, the origin at the base centre and the front 
   where `desk.tether_fly` ties the string.
 - `color` recolours a model's main material; the few models in natural colours (watermelons, the
   campfire) keep them and warn (`recolorable: false` in their search result). Some models take
-  parameters (`params`: a sofa's seats, a bed's size, a TV's inches …); `store.search` lists each
-  model's parameters as JSON schema.
+  parameters (`params`: a sofa's seats, a bed's size, a TV's inches …); their search results
+  (`store_search`, `store.search`) list them as JSON schema, and `store_add` and the REST insert
+  take them as `params` (e.g. `{floors: 3}` for `builtin:house`), checked by the model's schema
+  before anything is inserted: `INVALID_PARAMS` says what is wrong and what the model takes. An
+  external model takes none.
 - Every model is 48–4,700 triangles and builds in 1–50 ms; search matches names, ids, synonyms
   ("couch" finds the sofa, "telly" the TV), tags and categories, with plurals and accents.
 
@@ -184,14 +187,14 @@ Where an insert runs decides whose undo history it is in:
 
 ## REST
 
-| Endpoint                                    | Purpose                                                                                                         |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `GET /api/store/providers`                  | The providers and their state                                                                                   |
-| `GET /api/store/search`                     | `query`, `category`, `providers` (comma-separated ids), `limit` (1–50, default 20), `cursor`                    |
-| `GET /api/store/models/:model`              | One model; with `?download=1` its files are downloaded (cached) and listed                                      |
-| `GET /api/store/models/:model/thumbnail`    | Its thumbnail (cached, ETag)                                                                                    |
-| `GET /api/store/models/:model/files/<path>` | One of its files from the cache (empty path: the main file), ETag; the Asset Browser inserts from these         |
-| `POST /api/projects/:id/store`              | Insert: `{model, location, rotation_deg, height_m, width_m, depth_m, name, color}`; `{result, entry, warnings}` |
+| Endpoint                                    | Purpose                                                                                                                 |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/store/providers`                  | The providers and their state                                                                                           |
+| `GET /api/store/search`                     | `query`, `category`, `providers` (comma-separated ids), `limit` (1–50, default 20), `cursor`                            |
+| `GET /api/store/models/:model`              | One model; with `?download=1` its files are downloaded (cached) and listed                                              |
+| `GET /api/store/models/:model/thumbnail`    | Its thumbnail (cached, ETag)                                                                                            |
+| `GET /api/store/models/:model/files/<path>` | One of its files from the cache (empty path: the main file), ETag; the Asset Browser inserts from these                 |
+| `POST /api/projects/:id/store`              | Insert: `{model, location, rotation_deg, height_m, width_m, depth_m, name, color, params}`; `{result, entry, warnings}` |
 
 Failures answer `{error, code}`: 400 `NEEDS_KEY` and `INVALID_PARAMS`, 404 `NOT_FOUND`, 409
 `NOT_DOWNLOADABLE`, 503 `UPSTREAM` (a provider failed) and `UNAVAILABLE`, 507 `OUT_OF_MEMORY`; a
@@ -199,15 +202,22 @@ request whose client went away answers 499.
 
 ## MCP
 
-| Tool           | Arguments                                                                                         | Returns                                    |
-| -------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `store_search` | `query`, `category`, `providers`, `limit` (1–50, default 20), `cursor`                            | `{results, providers, next_cursor}`        |
-| `store_add`    | `project`, `model`, `location`, `rotation_deg`, `height_m`, `width_m`, `depth_m`, `name`, `color` | `{result, entry, warnings}`, one undo step |
+| Tool           | Arguments                                                                                                   | Returns                                    |
+| -------------- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `store_search` | `query`, `category`, `providers`, `limit` (1–50, default 20), `cursor`                                      | `{results, providers, next_cursor}`        |
+| `store_add`    | `project`, `model`, `location`, `rotation_deg`, `height_m`, `width_m`, `depth_m`, `name`, `color`, `params` | `{result, entry, warnings}`, one undo step |
 
 A result gives `id`, `provider`, `name`, `category`, `tags`, `thumbnail_url`,
 `license {spdx, url, attribution}`, `author`, `source_url`, `dimensions_m`, `triangles`, `formats`,
-`downloadable` and `needs_key`. The core operators `store.search` and `store.add` (built-in models
-only) and `store.insert_files` are also there for `run_operator` and `batch`.
+`downloadable` and `needs_key`, and for a built-in model that takes parameters of its own, `params`
+(their JSON schema, as `store_add` takes them). The core operators `store.search` and `store.add`
+(built-in models only) and `store.insert_files` are also there for `run_operator` and `batch`.
+
+An insert answers `{result, entry, warnings}`, each once: `result` is what it made (`root`,
+`objects`, `names`, `name`, `dimensions_m`), `entry` the model in short (`id`, `provider`, `name`,
+`license`, `author`, `source_url`, `thumbnail_url`: from `store_add` a link on the server as in
+`store_search`'s results, over REST the route's path) and `warnings` what it could not do, such as a
+colour for a model without a material to recolour.
 
 ## Behind a proxy
 

@@ -90,6 +90,8 @@ describe('model store in the server', () => {
       height_m: 0.6,
     });
     expect(added.entry.id).toBe('khronos:DeskLamp');
+    // the thumbnail as a link on this server, as store_search gives it
+    expect(added.entry.thumbnail_url).toBe(`${server.url}/api/store/models/khronos:DeskLamp/thumbnail`);
     const scene = await ok('get_scene', { project });
     const names = JSON.stringify(scene);
     expect(names).toContain(added.result.name);
