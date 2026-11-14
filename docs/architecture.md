@@ -939,7 +939,9 @@ telemetry, RPC, live sync, WebDAV or the server probe. The pieces, each tested o
 - `export.ts`: one run of the browser export engine per shot (preset `reference`), its files
   renamed for the host and checked for the shot's frames; `guards.ts`: the operators the desk
   hides, and in a read-only open every operator that changes the scene, refused in the
-  registry's poll.
+  registry's poll and told to the editor's UI through `editor/page-guard.ts` (menus grey them
+  out, a slider drag writes no live value, a dropped model file is refused unread; the editor
+  refuses nothing there), and the keys of the chrome it hides, which its keymap ignores.
 
 The server and the Vite dev and preview servers share `apps/server/src/desk-embed.ts` (no
 imports): `DESK_EMBED_COEP` and `DESK_EMBED_ORIGINS` become the page's COEP, CORP and CSP

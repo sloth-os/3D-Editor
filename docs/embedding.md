@@ -385,9 +385,14 @@ through the shot cameras, the shot list and inspector with each shot's issues, t
 the timeline and playback, the staging tools and the Asset Browser with the built-in models, under
 a compact header: the scene's name, where it was opened from and whether the host has its latest
 state, the brief's changes with **Update shots**, **Send to …** (the host's name), **Done** and
-**Close**, and an export's progress with **Cancel**. It has no menus, workspaces, project list,
-presence, share or update button, Console, Diagnostics, UV editor, Dope Sheet or Properties editor,
-and their keys do nothing. When the scene opens the desk looks through the first shot's camera.
+**Close**, and an export's progress with **Cancel**. It has no top-bar menus, workspaces, project
+list, presence, share or update button, Console, Diagnostics, UV editor, Dope Sheet or Properties
+editor; the viewport's menus grey out what it hides (Import…). The desk ignores their keys:
+Ctrl/Cmd+S and Ctrl/Cmd+O do nothing at all (not the browser's Save Page or Open File either), and
+the others keep what the browser does with them (F3 finds in the page). Which panels are open, and
+their sizes, it keeps under its own keys of the browser's storage (`3d-editor:desk:panel:*`,
+`3d-editor:desk:size:*`), never the editor's. When the scene opens the desk looks through the first
+shot's camera.
 
 ### Projects per host and scene
 
@@ -516,8 +521,11 @@ it is closed and waits for the host to remove the frame; **Back to the desk** re
 ### Read-only
 
 `options.readOnly: true` opens the scene to look at, play and export: every operator that changes
-the scene is refused in the operator registry's own check, so no key, button or panel can run one;
-the header says **Read-only**, and Update shots is not offered. Send, Done and Close work as usual.
+the scene is refused in the operator registry's own check, so no key, button or panel can run one,
+and nothing writes the scene past it: a model file dropped on the viewport is refused before it is
+read, a value dragged in a field (the viewport's sidebar) is not written while it moves, and the
+menus grey out what is refused, with the reason. The header says **Read-only**, and Update shots is
+not offered. Send, Done and Close work as usual.
 
 ### Offline
 
