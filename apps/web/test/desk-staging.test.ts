@@ -78,7 +78,7 @@ describe('the staging engine', () => {
     Y.applyUpdate(doc.ydoc, u.diff);
     expect(u.summary.shots).toBe(3);
     expect(getShots(doc).map((s) => s.frame_end - s.frame_start + 1)).toEqual([72, 84, 48]);
-    // in the order asked (the controller asks in brief order)
+    // in brief order, whatever order they are asked in
     const res = runStaging({
       kind: 'results',
       update: Y.encodeStateAsUpdate(doc.ydoc),
@@ -86,8 +86,8 @@ describe('the staging engine', () => {
     });
     if (!res.ok || res.kind !== 'results') throw new Error(JSON.stringify(res));
     expect(res.results.map((x) => [x.shotId, x.frames])).toEqual([
-      [SHOT_B, 84],
       [SHOT_A, 72],
+      [SHOT_B, 84],
     ]);
     const all = runStaging({ kind: 'results', update: Y.encodeStateAsUpdate(doc.ydoc) });
     expect(all.ok && all.kind === 'results' && all.results.length).toBe(3);

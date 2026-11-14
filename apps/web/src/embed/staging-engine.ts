@@ -75,7 +75,11 @@ export function checkSummary(shots: number, issues: readonly DeskIssue[]): strin
   return `${shots} shot${shots === 1 ? '' : 's'} checked: ${e} error${e === 1 ? '' : 's'}, ${w} warning${w === 1 ? '' : 's'}, ${n} info (${codes})`;
 }
 
-/** The checks staging ran, as desk.check reports them (desk shot ids; staging keeps no objects). */
+/**
+ * The checks staging ran, as desk.check reports them (desk shot ids; staging keeps no objects), shown
+ * at once: their issues only, without blocking lines or layouts. The workspace runs the full check
+ * (a `check` request) right after it applies the staging or the update.
+ */
 export function checkFromReport(report: StageBriefReport): DeskCheckResult {
   const desk = new Map(report.shots.map((s) => [s.shotId, s.deskShotId]));
   const issues: DeskIssue[] = report.issues.map((i: BriefIssue) => ({

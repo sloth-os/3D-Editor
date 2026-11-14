@@ -1,18 +1,34 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import * as Y from 'yjs';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getShots, type SceneBrief } from '@3d-editor/core';
 import { session } from '../src/app/store';
+import { DeskController } from '../src/embed/controller';
+import type { DeskMessage } from '../src/embed/protocol';
 import { StagingClient } from '../src/embed/staging';
 import { decodeDeskState, encodeDeskState, readLineage } from '../src/embed/state';
-import { DeskWorkspace, deskProjectId } from '../src/embed/workspace';
+import {
+  DeskWorkspace,
+  OTHER_DESK_WAIT,
+  deskProjectId,
+  type SceneLocks,
+  type WorkProgress,
+  type WorkspaceOptions,
+} from '../src/embed/workspace';
+import { localIndex } from '../src/project/local-index';
+import { lastCheck } from '../src/ui/director/state';
 
 /*
  * The desk's scene (embed/workspace.ts) in this browser's IndexedDB (fake-indexeddb): a project per
  * host origin and scene, staged from the brief, reopened from the local copy, restored from a host's
  * state (merged with a copy of the same staging, else replacing it), a state it does not read
- * reported and the brief staged instead, the brief's changes and Update shots as one undo step.
+ * reported without touching the local copy, the same state bytes while the scene does not change
+ * (the very bytes it opened from), gzip read without DecompressionStream, storage that fails after
+ * the probe (memory, a notice, no hang), one desk per host and scene (a second waits for the
+ * scene's lock), the checks stamped with the revision they checked (and the full check after staging
+ * and Update shots), the brief's changes and Update shots as one undo step; and with the real
+ * controller: no state sent on its own after one it could not read.
  */
 
 const fixture = (name: string) =>
@@ -43,28 +59,69 @@ function changedBrief(): SceneBrief {
   return b;
 }
 
+/** Web Locks as one browser partition has them: one holder per name, the others wait in turn. */
+class FakeLocks implements SceneLocks {
+  private readonly held = new Set<string>();
+  private readonly waiting = new Map<string, (() => void)[]>();
+
+  async request(
+    name: string,
+    options: { ifAvailable?: boolean; signal?: AbortSignal },
+    callback: (lock: unknown) => Promise<void> | void,
+  ): Promise<unknown> {
+    if (this.held.has(name)) {
+      if (options.ifAvailable) return callback(null);
+      await new Promise<void>((resolve, reject) => {
+        const list = this.waiting.get(name) ?? [];
+        this.waiting.set(name, list);
+        list.push(resolve);
+        options.signal?.addEventListener('abort', () => {
+          list.splice(list.indexOf(resolve), 1);
+          reject(new DOMException('The lock request was aborted', 'AbortError'));
+        });
+      });
+    }
+    this.held.add(name);
+    try {
+      return await callback({ name });
+    } finally {
+      this.held.delete(name);
+      this.waiting.get(name)?.shift()?.();
+    }
+  }
+}
+
 let n = 0;
 /** A host origin of its own per test (its projects do not meet another test's). */
 const origin = () => `https://host-${++n}-${Date.now()}.example`;
 
+const locks = new FakeLocks();
 const open: DeskWorkspace[] = [];
-function workspace(): DeskWorkspace {
-  const ws = new DeskWorkspace(new StagingClient(() => null));
+function workspace(opts: WorkspaceOptions = {}, onWork?: (w: WorkProgress | null) => void): DeskWorkspace {
+  const ws = new DeskWorkspace(new StagingClient(() => null), onWork, { locks, ...opts });
   open.push(ws);
   return ws;
 }
 afterEach(() => {
   for (const ws of open.splice(0)) ws.close();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 const hostShots = (ws: DeskWorkspace) => getShots(ws.session!.doc).map((s) => s.external?.shot ?? null);
 const frames = (ws: DeskWorkspace) => getShots(ws.session!.doc).map((s) => s.frame_end - s.frame_start + 1);
+const bytes = (s: { data: ArrayBuffer }) => new Uint8Array(s.data);
+const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
+const edit = (ws: DeskWorkspace, key: string, value: unknown) =>
+  ws.session!.doc.transact(() => ws.session!.doc.map('meta').set(key, value));
 
 /** Opens `brief` for `host` in a new workspace, then closes it; its state. */
 async function stateOf(host: string, brief = EXAMPLE()) {
   const ws = workspace();
   await ws.open({ hostOrigin: host, brief, state: null });
-  return (await ws.encodeState()).state;
+  const { state } = await ws.encodeState();
+  ws.close();
+  return state;
 }
 
 describe('the desk workspace', () => {
@@ -86,6 +143,7 @@ describe('the desk workspace', () => {
       unreadable: null,
       plan: 'stage',
       persistent: true,
+      notice: null,
     });
     expect(r.stageMs).toBeGreaterThanOrEqual(0);
     expect(session.value).toBe(ws.session);
@@ -126,23 +184,20 @@ describe('the desk workspace', () => {
     const host = origin();
     const ws = workspace();
     await ws.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
-    const s = ws.session!;
     const state = (await ws.encodeState()).state;
     // an edit only the state will carry (made on a copy of the document from the state)
-    const { update } = await decodeDeskState(state, EXAMPLE().id);
+    const { header, update } = await decodeDeskState(state, EXAMPLE().id);
     const other = new Y.Doc();
     Y.applyUpdate(other, update);
     other.getMap('meta').set('from_state', 'yes');
-    const header = (await decodeDeskState(state, EXAMPLE().id)).header;
     const merged = await encodeDeskState(Y.encodeStateAsUpdate(other), {
       sceneId: header.sceneId,
       lineage: header.lineage,
       shots: header.shots,
-      savedAt: header.savedAt,
       deskVersion: header.deskVersion,
     });
     // an edit only the local copy has
-    s.doc.transact(() => s.doc.map('meta').set('from_here', 'yes'));
+    edit(ws, 'from_here', 'yes');
     ws.close();
     const back = workspace();
     const r = await back.open({ hostOrigin: host, brief: EXAMPLE(), state: merged });
@@ -156,7 +211,7 @@ describe('the desk workspace', () => {
     const host = origin();
     const ws = workspace();
     await ws.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
-    ws.session!.doc.transact(() => ws.session!.doc.map('meta').set('local_only', 'yes'));
+    edit(ws, 'local_only', 'yes');
     const localLineage = readLineage(ws.session!.doc);
     ws.close();
     // a state of the same scene from another staging (another host's desk staged it again)
@@ -169,9 +224,10 @@ describe('the desk workspace', () => {
     expect(hostShots(back)).toEqual([SHOT_A, SHOT_B]);
   });
 
-  it('does not apply a state it cannot read, says why, and opens as without one', async () => {
+  it('does not apply a state it cannot read, says why, and opens as without one: the local copy, else the brief', async () => {
     const other = { ...EXAMPLE(), id: 'clp_other0000000001' };
     const state = await stateOf(origin(), other);
+    // no copy here: the brief is staged
     const ws = workspace();
     const r = await ws.open({ hostOrigin: origin(), brief: EXAMPLE(), state });
     expect(r.source).toBe('brief');
@@ -185,6 +241,193 @@ describe('the desk workspace', () => {
     });
     expect(g.source).toBe('brief');
     expect(g.unreadable).toBeTruthy();
+    // a copy here: the copy, as it was
+    const host = origin();
+    const first = workspace();
+    await first.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    edit(first, 'work', 'kept');
+    const lineage = readLineage(first.session!.doc);
+    first.close();
+    const back = workspace();
+    const b = await back.open({ hostOrigin: host, brief: EXAMPLE(), state });
+    expect(b).toMatchObject({ source: 'local', plan: 'local' });
+    expect(b.unreadable).toMatch(/belongs to scene 'clp_other0000000001'/);
+    expect(back.session!.doc.map('meta').get('work')).toBe('kept');
+    expect(readLineage(back.session!.doc)).toBe(lineage);
+  });
+
+  it('never deletes the local copy for a state of the scene that holds no staging', async () => {
+    const host = origin();
+    const ws = workspace();
+    await ws.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    edit(ws, 'hand_edit', 'precious');
+    const lineage = readLineage(ws.session!.doc);
+    ws.close();
+    // structurally fine (magic, scene, lineage, sizes, a Yjs document) but no staging in it
+    const empty = await encodeDeskState(Y.encodeStateAsUpdate(new Y.Doc()), {
+      sceneId: EXAMPLE().id,
+      lineage: 'not-the-local-one',
+      shots: 0,
+      deskVersion: 'test',
+    });
+    const back = workspace();
+    const r = await back.open({ hostOrigin: host, brief: EXAMPLE(), state: empty });
+    expect(r).toMatchObject({ source: 'local', plan: 'local' });
+    expect(r.unreadable).toMatch(/holds no staging of this scene/);
+    expect(back.session!.doc.map('meta').get('hand_edit')).toBe('precious');
+    expect(readLineage(back.session!.doc)).toBe(lineage);
+  });
+
+  it('sends the same state bytes while the scene does not change', async () => {
+    const ws = workspace();
+    await ws.open({ hostOrigin: origin(), brief: EXAMPLE(), state: null });
+    const a = bytes((await ws.encodeState()).state);
+    const b = bytes((await ws.encodeState()).state);
+    expect(same(a, b)).toBe(true);
+    edit(ws, 'x', 1);
+    const c = bytes((await ws.encodeState()).state);
+    expect(same(a, c)).toBe(false);
+    expect(same(c, bytes((await ws.encodeState()).state))).toBe(true);
+  });
+
+  it('gives back the very bytes it opened from while nothing changes, and new ones with local work', async () => {
+    const host = origin();
+    const given = await stateOf(host);
+    const original = bytes(given).slice();
+    // another browser (no copy): the state replaces nothing
+    const other = workspace();
+    expect((await other.open({ hostOrigin: origin(), brief: EXAMPLE(), state: given })).plan).toBe('replace');
+    expect(same(bytes((await other.encodeState()).state), original)).toBe(true);
+    // the same browser (a copy of the same staging, nothing more in it): merged, the same bytes
+    const back = workspace();
+    expect((await back.open({ hostOrigin: host, brief: EXAMPLE(), state: given })).plan).toBe('merge');
+    expect(same(bytes((await back.encodeState()).state), original)).toBe(true);
+    // an edit: new bytes
+    edit(back, 'x', 1);
+    expect(same(bytes((await back.encodeState()).state), original)).toBe(false);
+    back.close();
+    // the copy now has work the state lacks: the merge sends new bytes holding it
+    const again = workspace();
+    expect((await again.open({ hostOrigin: host, brief: EXAMPLE(), state: given })).plan).toBe('merge');
+    const out = (await again.encodeState()).state;
+    expect(same(bytes(out), original)).toBe(false);
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, (await decodeDeskState(out, EXAMPLE().id)).update);
+    expect(doc.getMap('meta').get('x')).toBe(1);
+  });
+
+  it('gives back a state another browser wrote uncompressed as it is', async () => {
+    vi.stubGlobal('CompressionStream', undefined);
+    const plain = await stateOf(origin());
+    vi.unstubAllGlobals();
+    expect(bytes(plain)[9]).toBe(0);
+    const ws = workspace();
+    await ws.open({ hostOrigin: origin(), brief: EXAMPLE(), state: plain });
+    const out = bytes((await ws.encodeState()).state);
+    expect(out[9]).toBe(0);
+    expect(same(out, bytes(plain))).toBe(true);
+  });
+
+  it('opens a gzipped state where the browser has no DecompressionStream', async () => {
+    const state = await stateOf(origin());
+    expect(bytes(state)[9]).toBe(1);
+    vi.stubGlobal('DecompressionStream', undefined);
+    const ws = workspace();
+    const r = await ws.open({ hostOrigin: origin(), brief: EXAMPLE(), state });
+    expect(r).toMatchObject({ source: 'state', plan: 'replace', unreadable: null });
+    expect(hostShots(ws)).toEqual([SHOT_A, SHOT_B]);
+  });
+
+  it("keeps the scene in memory, with a notice, when the project's database does not answer", async () => {
+    const realOpen = indexedDB.open.bind(indexedDB);
+    // the probe database opens; the scene's never answers
+    vi.spyOn(indexedDB, 'open').mockImplementation((name: string, version?: number) =>
+      name.startsWith('3d-editor-project-desk-') ? ({} as IDBOpenDBRequest) : realOpen(name, version),
+    );
+    const ws = workspace({ storageTimeoutMs: 150 });
+    const r = await ws.open({ hostOrigin: origin(), brief: EXAMPLE(), state: null });
+    expect(r).toMatchObject({ source: 'brief', plan: 'stage', persistent: false });
+    expect(r.notice).toMatch(/did not answer within 1 s.*memory only/);
+    expect(hostShots(ws)).toEqual([SHOT_A, SHOT_B]);
+  });
+
+  it('keeps the scene in memory, with its local copy read, when storage refuses writes', async () => {
+    const host = origin();
+    const first = workspace();
+    await first.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    edit(first, 'work', 'kept');
+    first.close();
+    // the quota is used up: the local project list refuses the write
+    vi.spyOn(localIndex, 'put').mockRejectedValue(
+      new DOMException('The quota has been exceeded.', 'QuotaExceededError'),
+    );
+    const ws = workspace();
+    const r = await ws.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    expect(r).toMatchObject({ source: 'local', plan: 'local', persistent: false });
+    expect(r.notice).toMatch(/quota has been exceeded/);
+    expect(ws.session!.doc.map('meta').get('work')).toBe('kept');
+  });
+
+  it('lets a second desk on the same host and scene wait for the first, which goes on working', async () => {
+    const host = origin();
+    const first = workspace();
+    await first.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    // a state of another staging: the second desk would replace (delete) the first one's copy
+    const elsewhere = await stateOf(origin());
+    const work: (WorkProgress | null)[] = [];
+    const second = workspace({}, (w) => work.push(w));
+    let opened = false;
+    const opening = second.open({ hostOrigin: host, brief: EXAMPLE(), state: elsewhere }).then((r) => {
+      opened = true;
+      return r;
+    });
+    await vi.waitFor(() => expect(work.some((w) => w?.label === OTHER_DESK_WAIT)).toBe(true));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(opened).toBe(false);
+    // the first desk's scene still works: its edits reach its listener and are kept
+    let edits = 0;
+    first.onEdit(() => edits++);
+    expect(() => edit(first, 'still', 'here')).not.toThrow();
+    expect(() => edit(first, 'still', 'there')).not.toThrow();
+    expect(edits).toBe(2);
+    first.close();
+    // then the second opens it
+    const r = await opening;
+    expect(r).toMatchObject({ source: 'state', plan: 'replace' });
+    expect(work.at(-1)).toBeNull();
+    // a desk that closes while it waits stops waiting
+    const third = workspace();
+    const waiting = third.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    await new Promise((r) => setTimeout(r, 20));
+    third.close();
+    await expect(waiting).rejects.toThrow(/abort/i);
+  });
+
+  it('stamps a background check with the revision it checked, and shows the blocking line after staging and Update shots', async () => {
+    const host = origin();
+    const ws = workspace();
+    await ws.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    const s = ws.session!;
+    // right after staging: the staging's issues, then the full check with each shot's blocking line
+    await ws.backgroundCheck;
+    expect(lastCheck.value!.session).toBe(s);
+    expect(lastCheck.value!.revision).toBe(s.revision.peek());
+    expect(lastCheck.value!.result.lines.some((l) => l.line)).toBe(true);
+    ws.close();
+    // reopened from the local copy, an edit made while the check runs shows it as out of date
+    const back = workspace();
+    await back.open({ hostOrigin: host, brief: changedBrief(), state: null });
+    const b = back.session!;
+    edit(back, 'meanwhile', 1);
+    await back.backgroundCheck;
+    expect(lastCheck.value!.session).toBe(b);
+    expect(lastCheck.value!.revision).toBeLessThan(b.revision.peek());
+    // Update shots: the worker's issues at once, the full check (lines of every shot) after
+    await back.updateFromBrief();
+    await back.backgroundCheck;
+    expect(lastCheck.value!.revision).toBe(b.revision.peek());
+    const lined = new Set(lastCheck.value!.result.lines.filter((l) => l.line).map((l) => l.shot));
+    expect(getShots(b.doc).every((x) => lined.has(x.id))).toBe(true);
   });
 
   it('lists how a later brief differs and updates the shots to it in one undo step', async () => {
@@ -218,10 +461,98 @@ describe('the desk workspace', () => {
     await ws.open({ hostOrigin: origin(), brief: EXAMPLE(), state: null });
     let edits = 0;
     const stop = ws.onEdit(() => edits++);
-    ws.session!.doc.transact(() => ws.session!.doc.map('meta').set('x', 1));
+    edit(ws, 'x', 1);
     expect(edits).toBe(1);
     stop();
-    ws.session!.doc.transact(() => ws.session!.doc.map('meta').set('x', 2));
+    edit(ws, 'x', 2);
     expect(edits).toBe(1);
+  });
+});
+
+/** Timers the test moves on by hand (the controller's state schedule). */
+function handTimers() {
+  let now = 0;
+  let seq = 0;
+  const due = new Map<number, { at: number; fn: () => void }>();
+  return {
+    now: () => now,
+    setTimeout: (fn: () => void, ms: number) => {
+      due.set(++seq, { at: now + ms, fn });
+      return seq;
+    },
+    clearTimeout: (h: unknown) => void due.delete(h as number),
+    advance(ms: number) {
+      now += ms;
+      for (const [id, t] of [...due].sort((a, b) => a[1].at - b[1].at))
+        if (t.at <= now) {
+          due.delete(id);
+          t.fn();
+        }
+    },
+  };
+}
+
+/** The real controller over a real workspace: what it sends. */
+async function controllerWith(ws: DeskWorkspace) {
+  const sent: DeskMessage[] = [];
+  const timers = handTimers();
+  const c = new DeskController({
+    send: (m) => {
+      sent.push(m);
+      return true;
+    },
+    workspace: ws,
+    exportSupport: () => Promise.resolve({ available: false, reason: 'not in this test' }),
+    deskVersion: 'test',
+    timers,
+    log: () => {},
+  });
+  await c.connected('https://host.example');
+  return { c, sent, timers, ofType: (t: DeskMessage['type']) => sent.filter((m) => m.type === t) };
+}
+
+describe('the desk workspace with the controller', () => {
+  it('sends no state on its own after one it could not read, until an edit', async () => {
+    const ws = workspace();
+    const { c, timers, ofType } = await controllerWith(ws);
+    c.message({
+      type: 'open',
+      scene: EXAMPLE(),
+      state: { format: '3d-editor.desk-state', version: 1, data: new Uint8Array([1, 2, 3]).buffer },
+    });
+    await vi.waitFor(() => expect(c.status.value).toBe('open'));
+    expect(ofType('error')).toMatchObject([{ code: 'state_unreadable' }]);
+    expect(ofType('opened')).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(ofType('state')).toHaveLength(0);
+    // an edit sends one (after the quiet time)
+    edit(ws, 'x', 1);
+    timers.advance(5000);
+    await vi.waitFor(() => expect(ofType('state')).toHaveLength(1));
+    c.dispose();
+  });
+
+  it("sends the host's own bytes as the first state when it opened from them unchanged", async () => {
+    const given = await stateOf(origin());
+    const original = bytes(given).slice();
+    const ws = workspace();
+    const { c, ofType } = await controllerWith(ws);
+    c.message({ type: 'open', scene: EXAMPLE(), state: given });
+    await vi.waitFor(() => expect(ofType('state')).toHaveLength(1));
+    const first = ofType('state')[0] as Extract<DeskMessage, { type: 'state' }>;
+    expect(same(new Uint8Array(first.state.data), original)).toBe(true);
+    c.dispose();
+  });
+
+  it('tells the person when storage failed and the scene is in memory only', async () => {
+    vi.spyOn(localIndex, 'put').mockRejectedValue(
+      new DOMException('The quota has been exceeded.', 'QuotaExceededError'),
+    );
+    const ws = workspace();
+    const { c } = await controllerWith(ws);
+    c.message({ type: 'open', scene: EXAMPLE(), state: null });
+    await vi.waitFor(() => expect(c.status.value).toBe('open'));
+    expect(c.notice.value?.message).toMatch(/memory only/);
+    c.dispose();
   });
 });

@@ -1,5 +1,6 @@
 import * as Y from 'yjs';
-import type { SceneDoc } from '@3d-editor/core';
+import { Gunzip } from 'fflate';
+import { SceneDoc, briefRecord } from '@3d-editor/core';
 import {
   DESK_STATE_FORMAT,
   DESK_STATE_VERSION,
@@ -19,14 +20,25 @@ import {
  *   byte  9      compression of the payload: 0 none, 1 gzip
  *   bytes 10–11  0
  *   bytes 12–15  header length (uint32, little-endian)
- *   header       UTF-8 JSON: {sceneId, lineage, shots, savedAt, deskVersion, updateBytes}
+ *   header       UTF-8 JSON: {sceneId, lineage, shots, deskVersion, updateBytes}
  *   payload      the scene's Yjs document (Y.encodeStateAsUpdate), gzipped where the browser has
  *                CompressionStream
  *
- * The header is read without the payload, so a state of another scene or lineage is recognized
- * before it is unpacked. `lineage` names the staging the document comes from (written into the
- * document when the brief is staged): the desk merges a state with its local copy only when both
- * have the same lineage (they are the same Yjs history); otherwise the state replaces the copy.
+ * - The header is read without the payload, so a state of another scene is recognized before it
+ *   is unpacked. `lineage` names the staging the document comes from (written into the document
+ *   when the brief is staged): the desk merges a state with its local copy only when both have the
+ *   same lineage (they are the same Yjs history); otherwise the state replaces the copy.
+ * - The same document gives the same bytes: the header holds no time and its keys come in one
+ *   order, and the gzip header's time, level and system bytes are written as zeros and "unknown"
+ *   (a host that de-duplicates states by their digest stores nothing new for an unchanged scene;
+ *   the workspace also sends the very bytes it opened from, or sent last, while nothing changed).
+ * - Every desk reads what any desk writes: a gzipped payload unpacks with DecompressionStream, or
+ *   with fflate where the browser has none (it then writes its own states uncompressed).
+ * - Unpacking is bounded: the payload goes in small slices and the output is counted as it comes;
+ *   past the header's `updateBytes` (itself at most 256 MiB) it stops and the state does not read,
+ *   so a small state cannot make the page unpack, or hold, more than that.
+ * - A state reads only when its document holds a staging of its scene (a probe document is made
+ *   from it before anything touches the local copy).
  */
 
 /** The container's first bytes. */
@@ -34,7 +46,15 @@ export const STATE_MAGIC = new Uint8Array([0x33, 0x44, 0x44, 0x45, 0x53, 0x4b, 0
 export const CONTAINER_VERSION = 1;
 const PREFIX_BYTES = 16;
 /** Largest header (JSON) a state may have. */
-const MAX_HEADER_BYTES = 64 * 1024;
+export const MAX_HEADER_BYTES = 64 * 1024;
+/** Largest document (the Yjs update, unpacked) a state may hold: 256 MiB. */
+export const MAX_UPDATE_BYTES = 256 * 1024 * 1024;
+/** Packed bytes handed to DecompressionStream at a time (each write unpacks in full: ≤ ~16 MiB). */
+const INFLATE_SLICE = 16 * 1024;
+/** Packed bytes handed to the JS inflate at a time (≤ ~4 MiB of output per push). */
+const JS_INFLATE_SLICE = 4 * 1024;
+/** The header's keys, in the order the desk writes them. */
+export const STATE_HEADER_KEYS = ['sceneId', 'lineage', 'shots', 'deskVersion', 'updateBytes'] as const;
 
 /** The document's meta key holding the lineage of its staging. */
 export const LINEAGE_KEY = 'desk_lineage';
@@ -46,7 +66,7 @@ export interface StateHeader {
   lineage: string;
   /** Shots of the document. */
   shots: number;
-  savedAt: string;
+  /** The desk that wrote the state (a state of an older desk may also carry `savedAt`: not read). */
   deskVersion: string;
   /** Bytes of the Yjs update before compression. */
   updateBytes: number;
@@ -60,11 +80,21 @@ export class StateUnreadable extends Error {
   }
 }
 
-/** Why a state cannot be written: its data would be over 64 MiB. */
+const mib = (bytes: number) => (bytes / 1024 / 1024).toFixed(1);
+
+/**
+ * Why a state cannot be written: its data would be over 64 MiB, or the scene's document over the
+ * 256 MiB a state may unpack to.
+ */
 export class StateTooLarge extends Error {
-  constructor(readonly bytes: number) {
+  constructor(
+    readonly bytes: number,
+    readonly limit: number = MAX_STATE_BYTES,
+  ) {
     super(
-      `The desk state would be ${(bytes / 1024 / 1024).toFixed(1)} MiB, over the ${MAX_STATE_BYTES / 1024 / 1024} MiB a state may have`,
+      limit === MAX_STATE_BYTES
+        ? `The desk state would be ${mib(bytes)} MiB, over the ${MAX_STATE_BYTES / 1024 / 1024} MiB a state may have`
+        : `The scene's document is ${mib(bytes)} MiB, over the ${limit / 1024 / 1024} MiB a desk state may hold`,
     );
     this.name = 'StateTooLarge';
   }
@@ -90,47 +120,157 @@ export function newLineage(): string {
 
 type Codec = 'gzip' | null;
 
-/** Whether this browser compresses with gzip streams. */
-export function gzipAvailable(): boolean {
-  return typeof CompressionStream === 'function' && typeof DecompressionStream === 'function';
-}
-
-async function streamThrough(
-  bytes: Uint8Array,
-  stream: { readable: ReadableStream; writable: WritableStream },
-) {
-  const writer = stream.writable.getWriter();
-  // a failure (bytes that do not unpack) rejects the read below; the writer's side is let go
-  writer
-    .write(bytes)
-    .then(() => writer.close())
-    .catch(() => undefined);
-  const out = await new Response(stream.readable).arrayBuffer();
-  return new Uint8Array(out);
+/** Whether this browser writes gzipped states (CompressionStream). Every desk reads them. */
+export function compressesStates(): boolean {
+  return typeof CompressionStream === 'function';
 }
 
 async function gzip(bytes: Uint8Array): Promise<Uint8Array> {
-  return streamThrough(bytes, new CompressionStream('gzip'));
-}
-
-async function gunzip(bytes: Uint8Array, limit: number): Promise<Uint8Array> {
-  const out = await streamThrough(bytes, new DecompressionStream('gzip'));
-  if (out.length > limit) throw new StateUnreadable('the desk state unpacks to more than it says');
+  const cs = new CompressionStream('gzip');
+  const writer = cs.writable.getWriter();
+  // a failure rejects the read below; the writer's side is let go
+  writer
+    .write(bytes as Uint8Array<ArrayBuffer>)
+    .then(() => writer.close())
+    .catch(() => undefined);
+  const out = new Uint8Array(await new Response(cs.readable).arrayBuffer());
+  // the same bytes on every system: no time (4–7), no level hint (8), system "unknown" (9); only
+  // a header without optional fields (FLG 0, as CompressionStream writes it) is touched
+  if (out.length >= 10 && out[3] === 0) {
+    out.fill(0, 4, 9);
+    out[9] = 255;
+  }
   return out;
 }
 
+/** The unpacked bytes of a payload as they come, refused once they pass `limit`. */
+class Unpacked {
+  readonly chunks: Uint8Array[] = [];
+  total = 0;
+
+  constructor(private readonly limit: number) {}
+
+  add(chunk: Uint8Array): void {
+    this.total += chunk.length;
+    if (this.total > this.limit) throw new StateUnreadable('the desk state unpacks to more than it says');
+    this.chunks.push(chunk);
+  }
+
+  bytes(): Uint8Array {
+    if (this.chunks.length === 1) return this.chunks[0];
+    const out = new Uint8Array(this.total);
+    let at = 0;
+    for (const c of this.chunks) {
+      out.set(c, at);
+      at += c.length;
+    }
+    return out;
+  }
+}
+
+/** Unpacks with DecompressionStream: written in slices, read and counted as it comes. */
+async function gunzipStream(payload: Uint8Array, out: Unpacked): Promise<void> {
+  const ds = new DecompressionStream('gzip');
+  const writer = ds.writable.getWriter();
+  const reader = ds.readable.getReader();
+  // one write unpacks in full before the next goes in (the stream waits for the reads below)
+  const feed = (async () => {
+    for (let at = 0; at < payload.length; at += INFLATE_SLICE) {
+      await writer.ready;
+      await writer.write(payload.subarray(at, at + INFLATE_SLICE) as Uint8Array<ArrayBuffer>);
+    }
+    await writer.close();
+  })();
+  feed.catch(() => undefined);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      out.add(value as Uint8Array);
+    }
+    await feed;
+  } catch (err) {
+    await reader.cancel().catch(() => undefined);
+    await writer.abort().catch(() => undefined);
+    if (err instanceof StateUnreadable) throw err;
+    throw new StateUnreadable('the desk state does not unpack');
+  }
+}
+
+let crcTable: Uint32Array | null = null;
+
+/** CRC-32 (gzip's) of `chunks`. */
+function crc32(chunks: readonly Uint8Array[]): number {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c >>> 0;
+    }
+  }
+  const t = crcTable;
+  let crc = 0xffffffff;
+  for (const d of chunks) for (let i = 0; i < d.length; i++) crc = t[(crc ^ d[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 /**
- * Packs a document's update into a desk state (gzipped where the browser can). Throws
- * StateTooLarge when the data would be over 64 MiB.
+ * Unpacks with fflate where the browser has no DecompressionStream: pushed in slices and counted
+ * as it comes; one gzip member only, its CRC-32 and size checked (fflate's stream does not).
+ */
+function gunzipJs(payload: Uint8Array, out: Unpacked): void {
+  // a gzip member has a 10-byte header and an 8-byte trailer at least
+  if (payload.length < 18) throw new StateUnreadable('the desk state does not unpack');
+  let members = 1;
+  const g = new Gunzip((chunk) => out.add(chunk));
+  g.onmember = () => members++;
+  try {
+    for (let at = 0; at < payload.length; at += JS_INFLATE_SLICE) {
+      const end = Math.min(payload.length, at + JS_INFLATE_SLICE);
+      g.push(payload.subarray(at, end), end === payload.length);
+    }
+  } catch (err) {
+    if (err instanceof StateUnreadable) throw err;
+    throw new StateUnreadable('the desk state does not unpack');
+  }
+  const t = payload.subarray(payload.length - 8);
+  const crc = (t[0] | (t[1] << 8) | (t[2] << 16) | (t[3] << 24)) >>> 0;
+  const size = (t[4] | (t[5] << 8) | (t[6] << 16) | (t[7] << 24)) >>> 0;
+  if (members > 1 || size !== out.total >>> 0 || crc !== crc32(out.chunks))
+    throw new StateUnreadable('the desk state does not unpack');
+}
+
+/** A gzipped payload unpacked to at most `limit` bytes (StateUnreadable past it, or for bad data). */
+async function gunzip(payload: Uint8Array, limit: number): Promise<Uint8Array> {
+  const out = new Unpacked(limit);
+  if (typeof DecompressionStream === 'function') await gunzipStream(payload, out);
+  else gunzipJs(payload, out);
+  return out.bytes();
+}
+
+/**
+ * Packs a document's update into a desk state (gzipped where the browser can): the same update and
+ * header give the same bytes. Throws StateTooLarge when the update is over 256 MiB or the data
+ * would be over 64 MiB.
  */
 export async function encodeDeskState(
   update: Uint8Array,
   header: Omit<StateHeader, 'updateBytes'>,
   opts: { compress?: boolean } = {},
 ): Promise<DeskState> {
-  const codec: Codec = opts.compress === false || !gzipAvailable() ? null : 'gzip';
+  if (update.length > MAX_UPDATE_BYTES) throw new StateTooLarge(update.length, MAX_UPDATE_BYTES);
+  const codec: Codec = opts.compress === false || !compressesStates() ? null : 'gzip';
   const payload = codec === 'gzip' ? await gzip(update) : update;
-  const headerBytes = new TextEncoder().encode(JSON.stringify({ ...header, updateBytes: update.length }));
+  // the header's keys in one order (STATE_HEADER_KEYS), and nothing else
+  const h: StateHeader = {
+    sceneId: header.sceneId,
+    lineage: header.lineage,
+    shots: header.shots,
+    deskVersion: header.deskVersion,
+    updateBytes: update.length,
+  };
+  const headerBytes = new TextEncoder().encode(JSON.stringify(h));
   const total = PREFIX_BYTES + headerBytes.length + payload.length;
   if (total > MAX_STATE_BYTES) throw new StateTooLarge(total);
   const out = new Uint8Array(total);
@@ -183,6 +323,10 @@ export function readStateHeader(bytes: Uint8Array): {
     throw new StateUnreadable("the desk state's header does not read");
   }
   if (!isHeader(header)) throw new StateUnreadable("the desk state's header lacks its scene or lineage");
+  if (header.updateBytes > MAX_UPDATE_BYTES)
+    throw new StateUnreadable(
+      `the desk state says it unpacks to ${mib(header.updateBytes)} MiB, over the ${MAX_UPDATE_BYTES / 1024 / 1024} MiB a state may hold`,
+    );
   return {
     header,
     codec: bytes[9] === 1 ? 'gzip' : null,
@@ -190,15 +334,24 @@ export function readStateHeader(bytes: Uint8Array): {
   };
 }
 
+/** A state read for a scene (decodeDeskState). */
+export interface DecodedState {
+  header: StateHeader;
+  /** The scene's document (a Yjs update). */
+  update: Uint8Array;
+  /** The lineage of the document's staging. */
+  lineage: string;
+  /** What the document holds (its state vector and deletions), to tell whether another equals it. */
+  snapshot: Y.Snapshot;
+}
+
 /**
  * A state a host gave back, read for scene `sceneId`: its header and the document's update. Throws
  * StateUnreadable (with the reason) for another format or version, data this desk did not write,
- * another scene's state, or one whose update does not read.
+ * another scene's state, one that does not unpack (or unpacks to more than it says), one whose
+ * update does not read, or one whose document holds no staging of the scene.
  */
-export async function decodeDeskState(
-  state: GivenState,
-  sceneId: string,
-): Promise<{ header: StateHeader; update: Uint8Array }> {
+export async function decodeDeskState(state: GivenState, sceneId: string): Promise<DecodedState> {
   if (state.format !== DESK_STATE_FORMAT)
     throw new StateUnreadable(`the desk state's format is '${state.format}', not '${DESK_STATE_FORMAT}'`);
   if (state.version !== DESK_STATE_VERSION)
@@ -211,26 +364,30 @@ export async function decodeDeskState(
   if (header.sceneId !== sceneId)
     throw new StateUnreadable(`the desk state belongs to scene '${header.sceneId}', not '${sceneId}'`);
   let update: Uint8Array;
-  if (codec === 'gzip') {
-    if (!gzipAvailable())
-      throw new StateUnreadable('this browser cannot unpack the desk state (no gzip streams)');
-    try {
-      update = await gunzip(payload, header.updateBytes);
-    } catch (err) {
-      if (err instanceof StateUnreadable) throw err;
-      throw new StateUnreadable('the desk state does not unpack');
-    }
-  } else update = payload.slice();
+  if (codec === 'gzip') update = await gunzip(payload, header.updateBytes);
+  else if (payload.length > header.updateBytes)
+    throw new StateUnreadable('the desk state unpacks to more than it says');
+  else update = payload.slice();
   if (update.length !== header.updateBytes) throw new StateUnreadable('the desk state is cut short');
-  // the update must read as a Yjs document of this scene before it touches the local copy
+  // the update must read as a document holding a staging of this scene before it touches the
+  // local copy
+  let probe: SceneDoc;
   try {
-    const probe = new Y.Doc();
-    Y.applyUpdate(probe, update);
-    probe.destroy();
+    probe = SceneDoc.fromUpdate(update);
   } catch {
     throw new StateUnreadable("the desk state's scene does not read");
   }
-  return { header, update };
+  try {
+    if (briefRecord(probe)?.sceneId !== sceneId)
+      throw new StateUnreadable('the desk state holds no staging of this scene');
+    const lineage = readLineage(probe);
+    if (lineage !== null && lineage !== header.lineage)
+      throw new StateUnreadable("the desk state's header does not match its scene");
+    return { header, update, lineage: lineage ?? header.lineage, snapshot: Y.snapshot(probe.ydoc) };
+  } finally {
+    probe.destroy();
+    probe.ydoc.destroy();
+  }
 }
 
 /** How the desk opens a scene from a host's state and its local copy (docs/embedding.md: the merge rule). */
